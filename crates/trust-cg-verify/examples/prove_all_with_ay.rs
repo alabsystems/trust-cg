@@ -1,8 +1,15 @@
 // Discharge the lowering-proof database FORMALLY via the ay SMT solver (not the
-// statistical/sampling lane). Run with the ay binary on the solver path:
+// statistical/sampling lane). The solver is the one AY the identity rule admits
+// (`trust_cg_verify::ay_identity`): the `bin/ay` of the Trust toolchain that
+// builds this example, identified by the SHA-256 of its bytes recorded at build
+// time. No PATH, home directory or source checkout is consulted, and
+// `AY_SOLVER_PATH` can only name another copy of those exact bytes. To run a
+// different AY build, build with the Trust toolchain that ships it:
 //
-//   AY_SOLVER_PATH=~/ay/target/release/ay \
-//     cargo run -p trust-cg-verify --release --example prove_all_with_ay
+//   targo --unverified run -p trust-cg-verify --release --example prove_all_with_ay
+//
+// The admitted AY is printed first, so the counts below name the solver that
+// produced them.
 //
 // Prints, per category, how many obligations ay proved (Verified = UNSAT of the
 // negated equivalence = correct for ALL inputs), timed out, or refuted.
@@ -15,6 +22,7 @@
 use trust_cg_verify::ay_bridge::{AYConfig, AYResult, verify_all_with_ay_structural};
 
 fn main() {
+    println!("solver: {}", trust_cg_verify::ay_bridge::solver_info());
     let config = AYConfig::default();
     let results = verify_all_with_ay_structural(&config);
 

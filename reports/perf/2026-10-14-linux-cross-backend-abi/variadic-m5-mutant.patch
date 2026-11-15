@@ -1,0 +1,15 @@
+diff --git a/crates/rustc-codegen-trust-cg/src/variadic.rs b/crates/rustc-codegen-trust-cg/src/variadic.rs
+--- a/crates/rustc-codegen-trust-cg/src/variadic.rs
++++ b/crates/rustc-codegen-trust-cg/src/variadic.rs
+@@ -148,7 +148,10 @@ pub(super) fn call<'tcx>(
+         arg_starts.push((inputs.len() + offset, declared.len()));
+         declared.push(rust_ty_to_trust_ir_ty(ctx.tcx, ty)?);
+     }
+-    ctx.check_signature_placement(call_source, &declared, fixed.sret, &arg_starts)?;
++    // MUTANT M5 (never committed): the whole call is judged only when it passes an anonymous argument.
++    if !types.is_empty() {
++        ctx.check_signature_placement(call_source, &declared, fixed.sret, &arg_starts)?;
++    }
+     let (mut values, mut reloads) =
+         lower_call_args_from_inputs(ctx, body, block, inputs, &args[..inputs.len()], (source, 0))?;
+     // The anonymous tail against the CALL-SITE `FnAbi`, whose argument

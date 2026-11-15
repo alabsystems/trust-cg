@@ -13,6 +13,12 @@
 //! materialized constant defined in a *dominating* block, not just the same
 //! block.
 //!
+//! The rewrite replaces the `OrrRR` in place, so `ror` reads `x` at the OR,
+//! not at the shifts. The machine IR is not SSA (phi-copies and full unrolls
+//! redefine a register within one block), so the width-`W` arm requires that
+//! no def of `x` lies between the earlier shift and the OR, and that each
+//! register shift amount resolves to the def that reaches its own shift.
+//!
 //! # Sub-width (u32-carried-in-Gpr64) constant-rotate arm
 //!
 //! The width-`W` arm above only fires when `lsl + lsr == REGISTER width`. A
@@ -47,7 +53,7 @@
 //! `Uxtw` root (directly, or through one `AndRI(_, 0xffffffff)`) and bails on
 //! anything else (fail-closed).
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -105,6 +111,17 @@ struct ConstantDef {
 
 type UniqueConstantDefs = HashMap<VReg, Option<ConstantDef>>;
 
+/// The latest def of a vreg seen so far in the block being scanned.
+#[derive(Clone, Copy, Debug)]
+struct InBlockDef {
+    inst: InstId,
+    /// The defining instruction's index in the block.
+    pos: usize,
+}
+
+/// vreg -> its latest def before the scan position, in the current block.
+type InBlockDefs = HashMap<VReg, InBlockDef>;
+
 fn rotate_idiom_pass_id() -> PassId {
     PassId::new("rotate-idiom")
 }
@@ -129,9 +146,9 @@ fn run_rotate_idiom(
     let dominating_constants = dom.map(|_| collect_unique_materialized_constants(func));
 
     for block_id in func.block_order.clone() {
-        let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_map: InBlockDefs = HashMap::default();
         let block = func.block(block_id);
-        for &inst_id in block.insts.clone().iter() {
+        for (pos, &inst_id) in block.insts.clone().iter().enumerate() {
             let result = match func.inst(inst_id).opcode {
                 AArch64Opcode::OrrRR => peephole_rotate_or(
                     func.inst(inst_id),
@@ -149,7 +166,7 @@ fn run_rotate_idiom(
 
             match result {
                 None => {
-                    record_value_def(&mut def_map, inst_id, func.inst(inst_id));
+                    record_value_def(&mut def_map, inst_id, pos, func.inst(inst_id));
                 }
                 Some(mut new_inst) => {
                     let orig_inst = func.inst(inst_id);
@@ -164,7 +181,7 @@ fn run_rotate_idiom(
                         provenance.record_in_place_transform(inst_id, rotate_idiom_pass_id());
                     }
                     changed = true;
-                    record_value_def(&mut def_map, inst_id, func.inst(inst_id));
+                    record_value_def(&mut def_map, inst_id, pos, func.inst(inst_id));
                 }
             }
         }
@@ -174,7 +191,7 @@ fn run_rotate_idiom(
 }
 
 fn collect_unique_materialized_constants(func: &MachFunction) -> UniqueConstantDefs {
-    let mut constants: UniqueConstantDefs = HashMap::new();
+    let mut constants: UniqueConstantDefs = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
@@ -210,24 +227,24 @@ fn simple_materialized_constant(inst: &MachInst) -> Option<i64> {
     }
 }
 
-fn record_value_def(def_map: &mut HashMap<VReg, InstId>, inst_id: InstId, inst: &MachInst) {
-    for_each_inst_def(inst, |dst| {
-        def_map.insert(dst, inst_id);
+fn record_value_def(def_map: &mut InBlockDefs, inst: InstId, pos: usize, mach: &MachInst) {
+    for_each_inst_def(mach, |dst| {
+        def_map.insert(dst, InBlockDef { inst, pos });
     });
 }
 
 fn lookup_def<'a>(
     vreg: VReg,
     func: &'a MachFunction,
-    def_map: &HashMap<VReg, InstId>,
+    def_map: &InBlockDefs,
 ) -> Option<&'a MachInst> {
-    def_map.get(&vreg).map(|&id| func.inst(id))
+    def_map.get(&vreg).map(|def| func.inst(def.inst))
 }
 
 fn peephole_rotate_or(
     inst: &MachInst,
     func: &MachFunction,
-    def_map: &HashMap<VReg, InstId>,
+    def_map: &InBlockDefs,
     current_block: BlockId,
     dom: Option<&DomTree>,
     dominating_constants: Option<&UniqueConstantDefs>,
@@ -235,8 +252,8 @@ fn peephole_rotate_or(
     if inst.operands.len() < 3 {
         return None;
     }
-    let lhs_def = lookup_def_operand(&inst.operands[1], func, def_map);
-    let rhs_def = lookup_def_operand(&inst.operands[2], func, def_map);
+    let lhs_def = lookup_def_site(&inst.operands[1], func, def_map);
+    let rhs_def = lookup_def_site(&inst.operands[2], func, def_map);
     if let (Some(lhs), Some(rhs)) = (lhs_def, rhs_def) {
         return try_rotate_shift_pair(
             inst,
@@ -264,23 +281,25 @@ fn peephole_rotate_or(
     None
 }
 
-fn lookup_def_operand<'a>(
+/// The in-block def of a vreg operand and that def's position in the block.
+fn lookup_def_site<'a>(
     operand: &MachOperand,
     func: &'a MachFunction,
-    def_map: &HashMap<VReg, InstId>,
-) -> Option<&'a MachInst> {
-    operand
-        .as_vreg()
-        .and_then(|vreg| lookup_def(vreg, func, def_map))
+    def_map: &InBlockDefs,
+) -> Option<(&'a MachInst, usize)> {
+    let def = def_map.get(&operand.as_vreg()?)?;
+    Some((func.inst(def.inst), def.pos))
 }
 
+/// `lsl` and `lsr` are the in-block defs of the `OrrRR` operands, each with
+/// its position in the block.
 #[allow(clippy::too_many_arguments)]
 fn try_rotate_shift_pair(
     outer: &MachInst,
-    lsl: &MachInst,
-    lsr: &MachInst,
+    (lsl, lsl_pos): (&MachInst, usize),
+    (lsr, lsr_pos): (&MachInst, usize),
     func: &MachFunction,
-    def_map: &HashMap<VReg, InstId>,
+    def_map: &InBlockDefs,
     current_block: BlockId,
     dom: Option<&DomTree>,
     dominating_constants: Option<&UniqueConstantDefs>,
@@ -297,11 +316,38 @@ fn try_rotate_shift_pair(
     if !same_register_operand(src, &lsr.operands[1]) {
         return None;
     }
+    // The `RorRI` replaces the `OrrRR`, so it reads `src` at the OR. Both
+    // shifts and the OR then see one value only when no def of `src` lies at
+    // or after the earlier shift: `def_map` holds the latest in-block def
+    // before the OR, and a source with no in-block def is unchanged across
+    // the block prefix. The def map tracks vregs only, so a physical or
+    // special source declines.
+    let src_vreg = src.as_vreg()?;
+    if def_map
+        .get(&src_vreg)
+        .is_some_and(|def| def.pos >= lsl_pos.min(lsr_pos))
+    {
+        return None;
+    }
     let width = register_width(src).or_else(|| register_width(&outer.operands[0]))?;
-    let lsl_shift =
-        constant_shift_amount(lsl, func, def_map, current_block, dom, dominating_constants)?;
-    let lsr_shift =
-        constant_shift_amount(lsr, func, def_map, current_block, dom, dominating_constants)?;
+    let lsl_shift = constant_shift_amount(
+        lsl,
+        lsl_pos,
+        func,
+        def_map,
+        current_block,
+        dom,
+        dominating_constants,
+    )?;
+    let lsr_shift = constant_shift_amount(
+        lsr,
+        lsr_pos,
+        func,
+        def_map,
+        current_block,
+        dom,
+        dominating_constants,
+    )?;
     if !(1..width).contains(&lsl_shift) || !(1..width).contains(&lsr_shift) {
         return None;
     }
@@ -342,7 +388,7 @@ fn try_rotate_shift_pair(
 fn peephole_subwidth_rotate_retype(
     inst: &MachInst,
     func: &MachFunction,
-    def_map: &HashMap<VReg, InstId>,
+    def_map: &InBlockDefs,
 ) -> Option<MachInst> {
     const MASK32: i64 = 0xffff_ffff;
     // Anchor: `MovR(d32: Gpr32, m: Gpr64)` — the truncating retype.
@@ -465,10 +511,15 @@ fn count_linked_defs(func: &MachFunction, v: VReg) -> usize {
     defs
 }
 
+/// The constant amount `shift_inst` (at `shift_pos` in the current block)
+/// shifts by. `def_map` is the in-block def map at the `OrrRR`, so an in-block
+/// amount def counts only when it precedes the shift: a later def before the
+/// OR is not the value the shift read.
 fn constant_shift_amount(
     shift_inst: &MachInst,
+    shift_pos: usize,
     func: &MachFunction,
-    def_map: &HashMap<VReg, InstId>,
+    def_map: &InBlockDefs,
     current_block: BlockId,
     dom: Option<&DomTree>,
     dominating_constants: Option<&UniqueConstantDefs>,
@@ -477,8 +528,11 @@ fn constant_shift_amount(
         return Some(imm);
     }
     let amount_vreg = shift_inst.operands[2].as_vreg()?;
-    if let Some(def) = lookup_def(amount_vreg, func, def_map) {
-        return simple_materialized_constant(def);
+    if let Some(def) = def_map.get(&amount_vreg) {
+        if def.pos >= shift_pos {
+            return None;
+        }
+        return simple_materialized_constant(func.inst(def.inst));
     }
     let dom = dom?;
     let constant_def = dominating_constants?
@@ -740,6 +794,120 @@ mod tests {
         let (mut func, _) = single_block_func(insts);
         let mut pass = RotateIdiom;
         assert!(!pass.run(&mut func));
+    }
+
+    fn shift(opcode: AArch64Opcode, dst: u32, src: u32, amount: MachOperand) -> MachInst {
+        MachInst::new(opcode, vec![vreg(dst), vreg(src), amount])
+    }
+
+    fn copy(dst: u32, src: u32) -> MachInst {
+        MachInst::new(AArch64Opcode::MovR, vec![vreg(dst), vreg(src)])
+    }
+
+    fn or(dst: u32, lhs: u32, rhs: u32) -> MachInst {
+        MachInst::new(AArch64Opcode::OrrRR, vec![vreg(dst), vreg(lhs), vreg(rhs)])
+    }
+
+    /// The merged block of a fully unrolled loop whose exit ORs the last
+    /// iteration's shifts: a carried copy redefines the shift source `v3`
+    /// between the shifts and the `OrrRR`. A `RorRI v3` at the OR would rotate
+    /// the redefined `v3`.
+    #[test]
+    fn source_redefined_between_the_shifts_and_the_or_not_rewritten() {
+        let (mut func, entry) = single_block_func(vec![
+            shift(AArch64Opcode::LslRI, 11, 3, MachOperand::Imm(13)),
+            shift(AArch64Opcode::LsrRI, 12, 3, MachOperand::Imm(51)),
+            MachInst::new(AArch64Opcode::AddRR, vec![vreg(13), vreg(3), vreg(1)]),
+            copy(3, 13),
+            or(14, 11, 12),
+        ]);
+        let mut pass = RotateIdiom;
+        assert!(!pass.run(&mut func));
+        assert_eq!(
+            func.inst(func.block(entry).insts[4]).opcode,
+            AArch64Opcode::OrrRR
+        );
+    }
+
+    /// The two shifts read different values of `v0`: not a rotate at all.
+    #[test]
+    fn source_redefined_between_the_two_shifts_not_rewritten() {
+        let (mut func, _) = single_block_func(vec![
+            shift(AArch64Opcode::LslRI, 1, 0, MachOperand::Imm(20)),
+            copy(0, 9),
+            shift(AArch64Opcode::LsrRI, 2, 0, MachOperand::Imm(44)),
+            or(3, 1, 2),
+        ]);
+        let mut pass = RotateIdiom;
+        assert!(!pass.run(&mut func));
+    }
+
+    /// A shift that writes its own source: the OR operand is the shifted value,
+    /// so `v0` at the OR is no longer what either shift read.
+    #[test]
+    fn shift_writing_its_own_source_not_rewritten() {
+        let (mut func, _) = single_block_func(vec![
+            shift(AArch64Opcode::LsrRI, 2, 0, MachOperand::Imm(44)),
+            shift(AArch64Opcode::LslRI, 0, 0, MachOperand::Imm(20)),
+            or(3, 0, 2),
+        ]);
+        let mut pass = RotateIdiom;
+        assert!(!pass.run(&mut func));
+    }
+
+    /// A redefinition BEFORE both shifts is the value both read and the value
+    /// the OR sees: still a rotate.
+    #[test]
+    fn source_redefined_before_both_shifts_still_rewritten() {
+        let (mut func, entry) = single_block_func(vec![
+            copy(0, 9),
+            shift(AArch64Opcode::LslRI, 1, 0, MachOperand::Imm(20)),
+            shift(AArch64Opcode::LsrRI, 2, 0, MachOperand::Imm(44)),
+            or(3, 1, 2),
+        ]);
+        let mut pass = RotateIdiom;
+        assert!(pass.run(&mut func));
+        let after = func.inst(func.block(entry).insts[3]);
+        assert_eq!(after.opcode, AArch64Opcode::RorRI);
+        assert_eq!(after.operands[1], vreg(0));
+    }
+
+    /// A register shift amount reads its def at the shift. The `LslRR` shifts
+    /// by 30; the later `MovI 20` before the OR is not its amount, and taking
+    /// it would pass `20 + 44 == 64` for a `30 + 44` pair.
+    #[test]
+    fn shift_amount_redefined_after_its_shift_not_rewritten() {
+        let mov = |dst: u32, value: i64| {
+            MachInst::new(
+                AArch64Opcode::MovI,
+                vec![vreg(dst), MachOperand::Imm(value)],
+            )
+        };
+        let (mut func, _) = single_block_func(vec![
+            mov(5, 30),
+            shift(AArch64Opcode::LslRR, 1, 0, vreg(5)),
+            mov(5, 20),
+            shift(AArch64Opcode::LsrRI, 2, 0, MachOperand::Imm(44)),
+            or(3, 1, 2),
+        ]);
+        let mut pass = RotateIdiom;
+        assert!(!pass.run(&mut func));
+    }
+
+    /// The register-amount control: the amount def precedes its shift.
+    #[test]
+    fn register_shift_amount_defined_before_its_shift_rewritten() {
+        let (mut func, entry) = single_block_func(vec![
+            MachInst::new(AArch64Opcode::MovI, vec![vreg(5), MachOperand::Imm(20)]),
+            shift(AArch64Opcode::LslRR, 1, 0, vreg(5)),
+            shift(AArch64Opcode::LsrRI, 2, 0, MachOperand::Imm(44)),
+            or(3, 1, 2),
+        ]);
+        let mut pass = RotateIdiom;
+        assert!(pass.run(&mut func));
+        let after = func.inst(func.block(entry).insts[3]);
+        assert_eq!(after.opcode, AArch64Opcode::RorRI);
+        assert_eq!(after.operands[2], MachOperand::Imm(44));
     }
 
     #[test]

@@ -1,0 +1,234 @@
+{
+  "name": "call_unwind_boundary",
+  "functions": [
+    {
+      "id": 0,
+      "name": "identity",
+      "ty": 0,
+      "entry": 2,
+      "blocks": [
+        {
+          "id": 2,
+          "params": [
+            [
+              4,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "all_call_shapes",
+      "ty": 1,
+      "entry": 11,
+      "blocks": [
+        {
+          "id": 11,
+          "params": [
+            [
+              20,
+              {
+                "Func": 0
+              }
+            ],
+            [
+              21,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    21
+                  ]
+                }
+              },
+              "results": [
+                22
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CallCannotUnwind": {
+                  "callee": 0,
+                  "args": [
+                    22
+                  ]
+                }
+              },
+              "results": [
+                23
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CallIndirect": {
+                  "callee": 20,
+                  "sig": 0,
+                  "args": [
+                    23
+                  ],
+                  "calling_conv": "C"
+                }
+              },
+              "results": [
+                24
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CallIndirectCannotUnwind": {
+                  "callee": 20,
+                  "sig": 0,
+                  "args": [
+                    24
+                  ],
+                  "calling_conv": "Fast"
+                }
+              },
+              "results": [
+                25
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    25
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "U64"
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        {
+          "Func": 0
+        },
+        "U64"
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "aapcs64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

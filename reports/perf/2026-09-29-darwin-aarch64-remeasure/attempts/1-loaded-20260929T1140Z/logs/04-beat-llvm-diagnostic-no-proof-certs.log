@@ -1,0 +1,2 @@
+beat-llvm: WARNING: this host mixes core types (sysctl hw.nperflevels 2) and the lanes are not pinned; scheduler placement alone can move a ratio (reports/perf/run_scaling.sh measured ~1.4x). Use --pin-core on Linux; the affinity policy is recorded either way.
+beat-llvm: FATAL: 1-min load 11.51 > threshold 8.0 (ncpu/2): machine is LOADED. Refusing (contract section 8). Use --allow-loaded to run anyway; the row will be stamped LOADED and is NOT evidence.

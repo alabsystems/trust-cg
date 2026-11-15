@@ -63,7 +63,7 @@ fn build_v128_roundtrip_module() -> TrustIrModule {
 
     fb.ret(vec![lane0]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 type FuzzFn = extern "C" fn(i64, i64) -> i64;
@@ -86,7 +86,7 @@ fn compile_and_run(
     };
     config.opt_level = opt;
 
-    let compiler = Compiler::new(config);
+    let compiler = Compiler::new(config).with_codegen_license(permit_unlicensed());
     let externs: HashMap<String, *const u8> = HashMap::new();
     let result = compiler
         .compile_module_to_jit(module, &externs)
@@ -153,4 +153,13 @@ fn v128_load_store_returns_first_lane_all_opt_levels_both_allocators() {
             );
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

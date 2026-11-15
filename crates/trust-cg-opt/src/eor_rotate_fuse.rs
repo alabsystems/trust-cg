@@ -50,7 +50,7 @@
 //! byte-verified against clang. Runs AFTER `rotate_idiom` (which creates the
 //! `RorRI`) in the pipeline.
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
     AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap, VReg,
@@ -132,45 +132,41 @@ fn run_eor_rotate_fuse(
         // order because we populate this as we walk), and entries are
         // INVALIDATED when any later instruction redefines the vreg, so a map
         // hit is the true reaching definition at the consumer.
-        let mut ror_defs: HashMap<VReg, ProducerDef> = HashMap::new();
+        let mut ror_defs: HashMap<VReg, ProducerDef> = HashMap::default();
         // Most recent in-block def position of EVERY vreg (any opcode). Guards
         // the folded SOURCE operand: moving its read down to the consumer is
         // only sound if no intervening instruction redefined it.
-        let mut last_def_pos: HashMap<VReg, usize> = HashMap::new();
+        let mut last_def_pos: HashMap<VReg, usize> = HashMap::default();
 
         for (pos, inst_id) in func.block(block_id).insts.clone().into_iter().enumerate() {
             let opcode = func.inst(inst_id).opcode;
-            match opcode {
-                AArch64Opcode::EorRR => {
-                    let result = try_fuse_eor(
-                        func.inst(inst_id),
-                        func,
-                        &ror_defs,
-                        &read_counts,
-                        &last_def_pos,
-                    );
-                    if let Some((ror_id, fused)) = result {
-                        // Rewrite the EOR in place, preserving proof/source_loc.
-                        let orig = func.inst(inst_id);
-                        let mut new_inst = fused;
-                        new_inst.proof = orig.proof;
-                        if new_inst.source_loc.is_none() {
-                            new_inst.source_loc = orig.source_loc;
-                        }
-                        *func.inst_mut(inst_id) = new_inst;
-                        // Delete the now-dead RorRI (single-use, consumed).
-                        *func.inst_mut(ror_id) = MachInst::new(AArch64Opcode::Nop, vec![]);
-                        if let Some(provenance) = provenance.as_deref_mut() {
-                            provenance
-                                .record_in_place_transform(inst_id, eor_rotate_fuse_pass_id());
-                            provenance.record_in_place_transform(ror_id, eor_rotate_fuse_pass_id());
-                        }
-                        // The rewritten EOR no longer defines/uses via the RorRI;
-                        // its dst def-map entry (if any) is unchanged.
-                        changed = true;
+            if opcode == AArch64Opcode::EorRR {
+                let result = try_fuse_eor(
+                    func.inst(inst_id),
+                    func,
+                    &ror_defs,
+                    &read_counts,
+                    &last_def_pos,
+                );
+                if let Some((ror_id, fused)) = result {
+                    // Rewrite the EOR in place, preserving proof/source_loc.
+                    let orig = func.inst(inst_id);
+                    let mut new_inst = fused;
+                    new_inst.proof = orig.proof;
+                    if new_inst.source_loc.is_none() {
+                        new_inst.source_loc = orig.source_loc;
                     }
+                    *func.inst_mut(inst_id) = new_inst;
+                    // Delete the now-dead RorRI (single-use, consumed).
+                    *func.inst_mut(ror_id) = MachInst::new(AArch64Opcode::Nop, vec![]);
+                    if let Some(provenance) = provenance.as_deref_mut() {
+                        provenance.record_in_place_transform(inst_id, eor_rotate_fuse_pass_id());
+                        provenance.record_in_place_transform(ror_id, eor_rotate_fuse_pass_id());
+                    }
+                    // The rewritten EOR no longer defines/uses via the RorRI;
+                    // its dst def-map entry (if any) is unchanged.
+                    changed = true;
                 }
-                _ => {}
             }
 
             // Record this instruction's defs (AFTER matching — an instruction
@@ -193,10 +189,10 @@ fn run_eor_rotate_fuse(
                 ror_defs.remove(&v);
                 last_def_pos.insert(v, pos);
             }
-            if func.inst(inst_id).opcode == AArch64Opcode::RorRI {
-                if let Some(MachOperand::VReg(dst)) = func.inst(inst_id).operands.first() {
-                    ror_defs.insert(*dst, ProducerDef { inst: inst_id, pos });
-                }
+            if func.inst(inst_id).opcode == AArch64Opcode::RorRI
+                && let Some(MachOperand::VReg(dst)) = func.inst(inst_id).operands.first()
+            {
+                ror_defs.insert(*dst, ProducerDef { inst: inst_id, pos });
             }
         }
     }
@@ -211,7 +207,7 @@ fn run_eor_rotate_fuse(
 /// `read_counts[t] == 1` means the only reader of `t` is the candidate `EorRR`,
 /// so folding it and deleting its `RorRI` def is safe.
 fn count_vreg_reads(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);

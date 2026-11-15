@@ -97,9 +97,10 @@ fn windows_x64_typed_compiler_jit_is_supported_route_for_non_empty_input() {
     let answer = fb.iconst(Ty::I64, 42);
     fb.ret(vec![answer]);
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Compiler::for_host().compile_module_to_jit should be the Windows typed JIT route");
 
@@ -112,4 +113,14 @@ fn windows_x64_typed_compiler_jit_is_supported_route_for_non_empty_input() {
     };
 
     assert_eq!(typed_answer(), 42);
+}
+
+/// This file's typed module is hand-built and carries no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compile states `Permit` explicitly, so the test
+/// never fails because it was silently refused. The file runs only on an
+/// x86-64 Windows host, so a Darwin AArch64 landing never sees it.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

@@ -6,25 +6,19 @@
 // Reference: RISC-V Unprivileged ISA Specification (Volume 1, Version 20191213)
 // Reference: RISC-V ELF psABI Specification (LP64D calling convention)
 
-//! Minimal RISC-V instruction selector — ITEM 2 production wiring.
+//! Bounded integer/pointer RISC-V instruction selection.
 //!
-//! # Scope and soundness contract (READ FIRST)
+//! # Scope and soundness contract
 //!
-//! This is the SMALLEST SOUND increment that makes proof-driven bounds-check
-//! elimination reachable through `Compiler::compile` for `Target::Riscv64`. It is
-//! NOT a full trust_ir -> RISC-V instruction selector and does not pretend to be:
-//! the RISC-V backend's register allocator
-//! ([`crate::riscv::pipeline::RiscVRegAssignment`]) is a naive first-appearance
-//! linear map with NO liveness, NO spilling, and NO SSA/block-param handling, and
-//! [`crate::riscv::pipeline::RiscVPipeline`] is single-function only (no
-//! cross-function call relocations). Those two structural gaps — not opcode
-//! coverage — bound what a SOUND selector may accept.
+//! This selector feeds the RISC-V pipeline through `Compiler::compile` for
+//! `Target::Riscv64`. The pipeline implements CFG liveness, linear-scan
+//! allocation with spilling, frames and multi-function ELF emission with
+//! direct-call relocations. It remains bounded by the supported opcode and
+//! ABI shapes below; indirect/variadic calls and non-entry block parameters
+//! are refused. Native implementation does not establish certified output.
 //!
-//! So this selector is **fail-closed by construction**: it accepts ONLY the narrow
-//! class of functions the existing RISC-V pipeline can compile correctly, and
-//! returns [`RiscVIselError`] for everything else. It NEVER silently drops an
-//! instruction, NEVER approximates an unhandled opcode, and NEVER emits code it
-//! cannot prove the downstream pipeline handles. The accepted class is:
+//! Unsupported ABI or opcode shapes return [`RiscVIselError`]. The accepted
+//! class is:
 //!
 //! * **Multiple basic blocks** with structured control flow (`Jump`, `Brif`,
 //!   `Icmp`, `Trap`). The phase-1 register allocator runs real live-in/live-out
@@ -34,24 +28,24 @@
 //!   passing into explicit `Copy` instructions in predecessor/edge-split blocks,
 //!   so only the ENTRY block's params (the formal arguments) are bound to
 //!   `a0..a7`; a NON-entry block carrying params is rejected fail-closed (the
-//!   selector has no block-param register-passing logic). `Switch` is likewise
-//!   rejected fail-closed (a dropped case would be a silent miscompile).
+//!   selector has no block-param register-passing logic). An entry block that
+//!   a branch targets gets its formal-argument copies in a block of its own
+//!   laid out first, and an edge into it writes its parameters' registers.
+//!   `Switch` is likewise rejected fail-closed (a dropped case would be a
+//!   silent miscompile).
 //! * Integer-only params/returns passed in `a0..a7` (no stack args, no FP/vector,
 //!   no aggregates by value). At most 8 params, at most 1 return.
-//! * A straight-line body over a small, explicitly-enumerated opcode set:
-//!   `Iconst`, `Copy`, `Iadd`/`Isub`/`Imul`, `Band`/`Bor`/`Bxor`,
-//!   `Ishl`/`Ushr`/`Sshr`, integer `Load`/`Store`, `ArrayGep`/`StructGep`,
-//!   the proof-only `GuardBoundsCheck` carrier, and `Return`.
-//!   ANY other opcode (calls, branches, FP, atomics, vector, ...) is rejected.
+//! * A body over an explicitly enumerated integer/pointer opcode set:
+//!   constants/copies, integer arithmetic/logic/shifts, integer loads/stores,
+//!   address projections, supported direct calls, control flow and `Return`,
+//!   plus the proof-only `GuardBoundsCheck` carrier. Unsupported opcodes,
+//!   including FP, atomics and vector operations, are rejected.
 //!
-//! The ONLY behavior-relevant thing this path does differently from "keep every
-//! guard" is route `GuardBoundsCheck` through the SHARED Certified-Elimination
-//! Kernel via the existing [`emit_riscv_bounds_check_carrier`] +
-//! [`RiscVProofGuardElimination`] (run by the caller, fail-closed re-check). A
-//! KEPT carrier expands to a real `BGEU+EBREAK` runtime check, byte-identical to
-//! the gate-off path; an ELIMINATED carrier is removed only under kernel
-//! authorization. The decision surface is entirely in the proven shared kernel —
-//! this file only does selection plumbing.
+//! `GuardBoundsCheck` routes through the shared Certified-Elimination Kernel
+//! via [`emit_riscv_bounds_check_carrier`] and [`RiscVProofGuardElimination`],
+//! rechecked by the caller. A retained carrier expands to a `BGEU+EBREAK`
+//! runtime check; an eliminated carrier requires kernel authorization. This
+//! bounded authorization does not certify the whole selector or pipeline.
 
 use std::collections::HashMap;
 
@@ -60,7 +54,9 @@ use trust_cg_ir::riscv_ops::RiscVOpcode;
 use trust_cg_ir::riscv_regs::{self, RISCV_ARG_GPRS};
 
 use trust_cg_lower::function::{Function as LirFunction, Signature as LirSignature};
-use trust_cg_lower::instructions::{Block as LirBlock, Instruction, IntCC, Opcode, Value};
+use trust_cg_lower::instructions::{
+    Block as LirBlock, DirectCallBinding, Instruction, IntCC, Opcode, Value,
+};
 use trust_cg_lower::types::Type;
 
 use crate::riscv::pipeline::{
@@ -108,8 +104,9 @@ pub fn function_is_minimally_selectable(func: &LirFunction) -> bool {
 
 /// Lower a LIR [`Function`] to a [`RiscVISelFunction`], or fail closed.
 ///
-/// On success, the returned function has exactly one block (the entry block) with
-/// the selected instruction stream, ABI argument moves prepended, and any
+/// On success, the returned function holds the selected instruction stream with
+/// the ABI argument moves at the top of its first block (the entry block, or a
+/// block of their own ahead of an entry block that a branch targets), and any
 /// `GuardBoundsCheck` lowered to the proof-only carrier with its discharged
 /// obligation recorded in `guard_obligations` (so the kernel-gated pass can
 /// authorize elimination). On any unhandled shape/opcode it returns
@@ -156,6 +153,34 @@ pub fn select_function(func: &LirFunction) -> Result<RiscVISelFunction, RiscVIse
     // ISel function's own `block_order` in this layout order, which is the final
     // code layout the pipeline encodes and resolves branch offsets over.
     let layout = func.layout_order();
+
+    // trust-ir admits a branch to the entry block, so the entry block can head
+    // a loop. The formal-argument copies out of a0..a7 must run once per call,
+    // as must the frame prologue the pipeline puts at the top of the first
+    // block of `block_order`. A re-entered entry block therefore gets both in
+    // a fresh block laid out first that ends in a jump to it; the entry block
+    // is then an ordinary loop header whose parameters hold the formals on the
+    // first trip and a back edge's copies after that. A function whose entry
+    // block is not a branch target is selected exactly as before.
+    let formal_block = if func.entry_block_is_branch_target() {
+        let id = func
+            .blocks
+            .keys()
+            .map(|b| b.0)
+            .max()
+            .map_or(Some(0), |max| max.checked_add(1))
+            .ok_or_else(|| {
+                RiscVIselError::Unsupported(format!(
+                    "function `{}` has no free block id for its formal-argument block",
+                    func.name
+                ))
+            })?;
+        let block = LirBlock(id);
+        out.ensure_block(block);
+        block
+    } else {
+        entry
+    };
     for &b in &layout {
         out.ensure_block(b);
     }
@@ -167,6 +192,52 @@ pub fn select_function(func: &LirFunction) -> Result<RiscVISelFunction, RiscVIse
     // into one, so the body is uniform over vregs.
     let mut vmap: HashMap<Value, VReg> = HashMap::new();
 
+    // Bind the entry block's params (the formal arguments) to a0..a7 via a Copy
+    // (ADDI vN, aK, 0). This mirrors x86's `lower_formal_arguments`. ONLY the
+    // entry block's params are ABI args; binding any other block's params to
+    // a0..a7 would clobber the arg registers.
+    for (i, (param_value, param_ty)) in func.blocks[&entry].params.iter().enumerate() {
+        if i >= RISCV_ARG_GPRS.len() {
+            return Err(RiscVIselError::Unsupported(format!(
+                "function `{}` has more than {} integer params",
+                func.name,
+                RISCV_ARG_GPRS.len()
+            )));
+        }
+        if !is_register_passable(param_ty) {
+            return Err(RiscVIselError::Unsupported(format!(
+                "function `{}` param {i} type {param_ty:?} is not a single-GPR ABI slot",
+                func.name
+            )));
+        }
+        let dst = out.fresh_vreg(RegClass::Gpr64);
+        out.push_inst(
+            formal_block,
+            RiscVISelInst::new(
+                RiscVOpcode::Addi,
+                vec![
+                    RiscVISelOperand::VReg(dst),
+                    RiscVISelOperand::PReg(RISCV_ARG_GPRS[i]),
+                    RiscVISelOperand::Imm(0),
+                ],
+            ),
+        );
+        vmap.insert(*param_value, dst);
+    }
+    if formal_block != entry {
+        out.push_inst(
+            formal_block,
+            RiscVISelInst::new(
+                RiscVOpcode::Jal,
+                vec![
+                    RiscVISelOperand::PReg(riscv_regs::ZERO),
+                    RiscVISelOperand::Block(entry),
+                ],
+            ),
+        );
+        add_successor(&mut out, formal_block, entry);
+    }
+
     for &b in &layout {
         let block = func.blocks.get(&b).ok_or_else(|| {
             RiscVIselError::Unsupported(format!(
@@ -175,41 +246,7 @@ pub fn select_function(func: &LirFunction) -> Result<RiscVISelFunction, RiscVIse
             ))
         })?;
 
-        if b == entry {
-            // Bind the entry block's params (the formal arguments) to a0..a7 via
-            // a Copy (ADDI vN, aK, 0). This mirrors x86's
-            // `lower_formal_arguments`. ONLY the entry block's params are ABI
-            // args; binding any other block's params to a0..a7 would clobber the
-            // arg registers.
-            for (i, (param_value, param_ty)) in block.params.iter().enumerate() {
-                if i >= RISCV_ARG_GPRS.len() {
-                    return Err(RiscVIselError::Unsupported(format!(
-                        "function `{}` has more than {} integer params",
-                        func.name,
-                        RISCV_ARG_GPRS.len()
-                    )));
-                }
-                if !is_register_passable(param_ty) {
-                    return Err(RiscVIselError::Unsupported(format!(
-                        "function `{}` param {i} type {param_ty:?} is not a single-GPR ABI slot",
-                        func.name
-                    )));
-                }
-                let dst = out.fresh_vreg(RegClass::Gpr64);
-                out.push_inst(
-                    entry,
-                    RiscVISelInst::new(
-                        RiscVOpcode::Addi,
-                        vec![
-                            RiscVISelOperand::VReg(dst),
-                            RiscVISelOperand::PReg(RISCV_ARG_GPRS[i]),
-                            RiscVISelOperand::Imm(0),
-                        ],
-                    ),
-                );
-                vmap.insert(*param_value, dst);
-            }
-        } else if !block.params.is_empty() {
+        if b != entry && !block.params.is_empty() {
             // A NON-entry block carrying params would require block-param /
             // PHI-style value passing at edges. The adapter is supposed to have
             // pre-lowered that into predecessor `Copy` instructions, so a
@@ -357,7 +394,16 @@ fn select_instruction(
             expect_args(inst, 1, "Copy")?;
             let src = use_value(inst.args[0], vmap)?;
             let dst = inst_one_result(inst, "Copy")?;
-            let d = def_value(dst, out, vmap);
+            // The adapter lowers a branch argument to a Copy into the target
+            // block's parameter. Only the entry block may carry parameters here,
+            // and its formals are bound before any block is selected, so a
+            // destination that already has a register is an entry parameter
+            // written by a back edge: write the register the entry block reads
+            // it from rather than rebinding the value to a fresh one.
+            let d = match vmap.get(&dst) {
+                Some(&param) => param,
+                None => def_value(dst, out, vmap),
+            };
             out.push_inst(
                 block,
                 RiscVISelInst::new(
@@ -480,6 +526,13 @@ fn select_instruction(
         // completeness and are still fail-closed for non-integer types.
         Opcode::Load { ty, .. } => {
             expect_args(inst, 1, "Load")?;
+            // An aggregate is its address in LIR, never a one-register load
+            // (`Type::whole_aggregate_memory_access_refusal`). Named before the
+            // generic non-integer refusal in `load_opcode` so the diagnosis
+            // states the contract.
+            if let Some(refusal) = ty.whole_aggregate_memory_access_refusal(false, false) {
+                return Err(RiscVIselError::UnsupportedOpcode(refusal));
+            }
             let ptr = use_value(inst.args[0], vmap)?;
             let dst = inst_one_result(inst, "Load")?;
             let op = load_opcode(ty)?;
@@ -501,6 +554,9 @@ fn select_instruction(
         // Store: mem[ptr + 0] = value. ISel store operand order is [src, base, off].
         Opcode::Store { ty, .. } => {
             expect_args(inst, 2, "Store")?;
+            if let Some(refusal) = ty.whole_aggregate_memory_access_refusal(true, false) {
+                return Err(RiscVIselError::UnsupportedOpcode(refusal));
+            }
             let value = use_value(inst.args[0], vmap)?;
             let ptr = use_value(inst.args[1], vmap)?;
             let op = store_opcode(ty)?;
@@ -674,7 +730,31 @@ fn select_instruction(
         // fail-closed-REJECTED with a clear typed error rather than emitting a
         // wrong/zero target. Indirect (CallIndirect), variadic (CallVariadic), and
         // exception-throwing (Invoke) calls remain rejected by the catch-all below.
-        Opcode::Call { name } => select_self_call(inst, block, name, func_name, out, vmap),
+        Opcode::Call {
+            name,
+            binding: DirectCallBinding::Interposable | DirectCallBinding::ExactModuleFunction { .. },
+        } => select_self_call(inst, block, name, func_name, out, vmap),
+        Opcode::Call {
+            binding:
+                DirectCallBinding::DeclaredExternalFunction { .. }
+                | DirectCallBinding::NativeDependency { .. },
+            ..
+        } => Err(RiscVIselError::UnsupportedOpcode(format!(
+            "native dependency call {:?} requires the future closed Core fixup pipeline",
+            inst.opcode
+        ))),
+
+        // Volatile accesses are not selected on this path at all: every one is
+        // refused, with the same text as the catch-all below, except that an
+        // aggregate-typed one is named with the contract the Load/Store arms
+        // above and the native selectors state.
+        Opcode::VolatileLoad { ty, .. } | Opcode::VolatileStore { ty, .. } => {
+            let store = matches!(inst.opcode, Opcode::VolatileStore { .. });
+            Err(RiscVIselError::UnsupportedOpcode(
+                ty.whole_aggregate_memory_access_refusal(store, true)
+                    .unwrap_or_else(|| format!("{:?}", inst.opcode)),
+            ))
+        }
 
         // Anything else is rejected fail-closed. This is the soundness backstop:
         // a new opcode added upstream cannot silently slip through as a NOP.
@@ -773,8 +853,9 @@ fn select_self_call(
     }
 
     if is_self_call {
-        // The self-call target is the entry block (block_order[0]);
-        // `select_function` records the entry first.
+        // The self-call target is the machine entry, block_order[0]: the
+        // entry block, or the formal-argument block `select_function` lays out
+        // ahead of an entry block that a branch targets.
         let entry = out.block_order.first().copied().ok_or_else(|| {
             RiscVIselError::Unsupported(format!(
                 "self-call in `{func_name}` has no entry block to target"
@@ -1373,8 +1454,10 @@ mod tests {
         let kept = select_function(&func).expect("selectable");
         let kept_bytes = riscv_compile_to_bytes(&kept).expect("compile kept");
         let kept_ebreaks = kept_bytes
-            .chunks_exact(4)
-            .filter(|w| *w == EBREAK_WORD.to_le_bytes())
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|w| **w == EBREAK_WORD.to_le_bytes())
             .count();
         assert!(kept_ebreaks >= 1, "kept carrier expands to an EBREAK trap");
 
@@ -1391,8 +1474,10 @@ mod tests {
         pass.run_on_function(&mut eliminated);
         let elim_bytes = riscv_compile_to_bytes(&eliminated).expect("compile eliminated");
         let elim_ebreaks = elim_bytes
-            .chunks_exact(4)
-            .filter(|w| *w == EBREAK_WORD.to_le_bytes())
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|w| **w == EBREAK_WORD.to_le_bytes())
             .count();
         assert_eq!(elim_ebreaks, 0, "eliminated carrier leaves no EBREAK trap");
     }
@@ -1506,6 +1591,7 @@ mod tests {
         block.instructions.push(Instruction {
             opcode: Opcode::Call {
                 name: "ext".to_string(),
+                binding: Default::default(),
             },
             args: vec![Value(0)],
             results: vec![Value(1)],
@@ -1769,6 +1855,147 @@ mod tests {
         );
     }
 
+    /// A single-block function `(addr: I64, value: I64)` whose one body
+    /// instruction is a Load (result discarded) or Store of `opcode`.
+    fn memory_access_func(opcode: Opcode) -> LirFunction {
+        let (args, results) = match opcode {
+            Opcode::Load { .. } | Opcode::VolatileLoad { .. } => (vec![Value(0)], vec![Value(2)]),
+            _ => (vec![Value(1), Value(0)], vec![]),
+        };
+        single_inst_func(
+            "memory_access",
+            vec![Type::I64, Type::I64],
+            Instruction {
+                opcode,
+                args,
+                results,
+            },
+        )
+    }
+
+    /// A whole-aggregate Load/Store/VolatileLoad/VolatileStore is refused with
+    /// the shared contract text — never selected as one `ld`/`sd`, which
+    /// would move only part of a 16-byte `Struct([I64, I64])` or write past a
+    /// 3-byte `Array(I8, 3)` / 4-byte `Struct([I32])`.
+    #[test]
+    fn whole_aggregate_load_and_store_are_refused_with_the_contract() {
+        for ty in [
+            Type::Struct(vec![Type::I64, Type::I64]),
+            Type::Array(Box::new(Type::I8), 3),
+            Type::Struct(vec![Type::I32]),
+        ] {
+            for (store, volatile) in [(false, false), (true, false), (false, true), (true, true)] {
+                let opcode = match (store, volatile) {
+                    (false, false) => Opcode::Load {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    (true, false) => Opcode::Store {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    (false, true) => Opcode::VolatileLoad {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    (true, true) => Opcode::VolatileStore {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                };
+                let expected = ty
+                    .whole_aggregate_memory_access_refusal(store, volatile)
+                    .expect("an aggregate type has a refusal");
+                for contract in [
+                    "an aggregate value is its address in LIR",
+                    "one register-width access",
+                    "copy its bytes with Memcpy",
+                ] {
+                    assert!(expected.contains(contract), "{expected}");
+                }
+                assert_eq!(
+                    select_function(&memory_access_func(opcode.clone())).err(),
+                    Some(RiscVIselError::UnsupportedOpcode(expected)),
+                    "{opcode:?}"
+                );
+            }
+        }
+    }
+
+    /// The aggregate gate leaves every other width where it was: integer
+    /// loads/stores select their width-exact `l*`/`s*`, and the widths this
+    /// minimal selector has never lowered (`I128`, `V128`, `F64`, every volatile
+    /// access) keep their pre-existing refusals rather than the aggregate one.
+    #[test]
+    fn non_aggregate_loads_and_stores_keep_their_selection_or_refusal() {
+        for (ty, load_op, store_op) in [
+            (Type::I8, RiscVOpcode::Lb, RiscVOpcode::Sb),
+            (Type::I16, RiscVOpcode::Lh, RiscVOpcode::Sh),
+            (Type::I32, RiscVOpcode::Lw, RiscVOpcode::Sw),
+            (Type::I64, RiscVOpcode::Ld, RiscVOpcode::Sd),
+        ] {
+            for (opcode, expected_op) in [
+                (
+                    Opcode::Load {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    load_op,
+                ),
+                (
+                    Opcode::Store {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    store_op,
+                ),
+            ] {
+                let isel = select_function(&memory_access_func(opcode.clone()))
+                    .unwrap_or_else(|err| panic!("{opcode:?}: {err}"));
+                let ops: Vec<RiscVOpcode> = isel.blocks[&LirBlock(0)]
+                    .insts
+                    .iter()
+                    .map(|inst| inst.opcode)
+                    .filter(|op| *op == expected_op)
+                    .collect();
+                assert_eq!(ops, vec![expected_op], "{opcode:?}");
+            }
+        }
+
+        for ty in [Type::I128, Type::V128, Type::F64] {
+            for (opcode, generic) in [
+                (
+                    Opcode::Load {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    format!("Load of non-integer type {ty:?}"),
+                ),
+                (
+                    Opcode::Store {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    format!("Store of non-integer type {ty:?}"),
+                ),
+            ] {
+                assert_eq!(
+                    select_function(&memory_access_func(opcode.clone())).err(),
+                    Some(RiscVIselError::UnsupportedOpcode(generic)),
+                    "{opcode:?}"
+                );
+            }
+        }
+        let volatile = Opcode::VolatileLoad {
+            ty: Type::I64,
+            align: None,
+        };
+        assert_eq!(
+            select_function(&memory_access_func(volatile.clone())).err(),
+            Some(RiscVIselError::UnsupportedOpcode(format!("{volatile:?}")))
+        );
+    }
+
     // =======================================================================
     // Multi-block control flow (phase 2)
     // =======================================================================
@@ -1810,8 +2037,10 @@ mod tests {
 
     fn words(bytes: &[u8]) -> Vec<u32> {
         bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect()
     }
 
@@ -2034,6 +2263,7 @@ mod tests {
         rec_block.instructions.push(Instruction {
             opcode: Opcode::Call {
                 name: "sum_to_n".to_string(), // SELF-call.
+                binding: Default::default(),
             },
             args: vec![Value(3)],
             results: vec![Value(4)],

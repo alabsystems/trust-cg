@@ -11,7 +11,6 @@
 //
 // Reference: ARM Architecture Reference Manual (DDI 0487), Sections C7.2
 //   (SIMD and Floating-point Instructions, alphabetical listing)
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! AArch64 NEON SIMD instruction semantics encoded as [`SmtExpr`] formulas.
 //!
@@ -322,6 +321,19 @@ pub fn encode_neon_umaxv(vn: &SmtExpr, arr: VectorArrangement) -> SmtExpr {
         max_lane = SmtExpr::ite(lane.clone().bvugt(max_lane.clone()), lane, max_lane);
     }
     max_lane
+}
+
+/// Encode `ADDP Dd, Vn.2D` -- NEON scalar pairwise add, the horizontal reduce
+/// of the two doubleword lanes: `Dd = Vn.D[0] + Vn.D[1]` (modular, wraps at
+/// 2^64). The result is the 64-bit scalar; writing `Dd` zeroes bits [127:64]
+/// of `Qd` (the scalar-register write every AArch64 SIMD&FP scalar form has).
+///
+/// ADDP (scalar) is architecturally defined only for `.2D` (`size = 11`); every
+/// other size is reserved, so there is no arrangement parameter.
+///
+/// Reference: ARM DDI 0487, C7.2.5 ADDP (scalar).
+pub fn encode_neon_addp_scalar_2d(vn: &SmtExpr) -> SmtExpr {
+    lane_extract(vn, VectorArrangement::D2, 0).bvadd(lane_extract(vn, VectorArrangement::D2, 1))
 }
 
 /// Encode `CMGT.<T> Vd, Vn, Vm` -- NEON per-lane signed greater-than comparison.
@@ -1138,6 +1150,24 @@ pub fn neon_ldp_q_post_word(offset_bytes: i64, rt2: u8, rn: u8, rt: u8) -> u32 {
 pub fn neon_stp_q_post_word(offset_bytes: i64, rt2: u8, rn: u8, rt: u8) -> u32 {
     let imm7 = ((offset_bytes / 16) as i32 as u32) & 0x7F;
     0xAC80_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | (rt as u32)
+}
+
+/// Bit-layout mirror of codegen `encode_ld1_post_imm` / `encode_st1_post_imm`:
+/// LD1/ST1 (multiple structures, one register), immediate post-index.
+/// `0 Q 0011001 L 0 11111 0111 size Rn Rt`: `Rm = 11111` selects the immediate
+/// (transfer-size) post-index, `opcode = 0111` one register, `size` the element
+/// size of the arrangement. Pinned against the real encoders by
+/// `trust-cg-codegen/tests/neon_post_index_word_mirror_pin.rs`; the word-bound
+/// memory-effect decomposition (`aarch64_memory_effect`) carries this word.
+pub fn neon_ld1_st1_post_word(load: bool, q: bool, size: u8, rn: u8, rt: u8) -> u32 {
+    (u32::from(q) << 30)
+        | (0b001_1001 << 23)
+        | (u32::from(load) << 22)
+        | (0b1_1111 << 16)
+        | (0b0111 << 12)
+        | ((u32::from(size) & 0b11) << 10)
+        | ((u32::from(rn) & 31) << 5)
+        | (u32::from(rt) & 31)
 }
 
 /// MACHINE side of the Q-PAIR post-index writeback: DECODE `imm7` out of the

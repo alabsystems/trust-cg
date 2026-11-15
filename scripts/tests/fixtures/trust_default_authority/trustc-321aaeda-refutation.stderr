@@ -1,0 +1,53 @@
+
+=== Trust Verification Report (trust_default_refutation) ===
+
+note: Trust verification: 0 proved, 2 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+ --> refutation.rs:1:1
+  |
+1 | pub fn divide(x: i32, y: i32) -> i32 { x / y }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: [divzero] FAILED (ay-in-process); counterexample: _3 = true, x = 0, y = 0
+  = note: [overflow:div] FAILED (ay-in-process); counterexample: _3 = false, _4 = true, _5 = true, _6 = true, x = -2147483648, y = -1
+
+error: Trust Level 0 safety verification incomplete for `trust_default_refutation::divide`: 2 obligation(s) were not proved
+ --> refutation.rs:1:1
+  |
+1 | pub fn divide(x: i32, y: i32) -> i32 { x / y }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
+  = note: Level 0 summary: 2 failed, 0 unknown or timed out, 0 runtime-checked, 0 skipped
+  = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=2, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+  = help: guidance — must hold: the divisor must be provably non-zero at the operation. | fix: guard with `if d != 0` (or use `NonZero*`/`checked_div`) and handle the zero case before dividing.
+  = help: guidance — must hold: the `Div` result must fit in its integer type. | fix: use `checked_*`/`saturating_*`/`try_into` and handle the overflow case, or constrain the operands with a precondition.
+
+error: Trust strict verification failed for `trust_default_refutation::divide`: 2 obligation(s) were not fully verified
+ --> refutation.rs:1:1
+  |
+1 | pub fn divide(x: i32, y: i32) -> i32 { x / y }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: summary: 0 trusted, 0 certified, 2 failed, 0 unknown, 0 runtime-checked, 0 skipped out of 2
+  = note: failed obligations, including declared contract panics, are refutations and are not permitted under strict verification; select -Ztrust-policy=advisory to record contract-panic conditional evidence
+  = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+  = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because an obligation row carries a refuted verdict (even if the aggregate summary reports it differently)
+  = note: --- native verifier detail (15 line(s) below; engine internals, not required to act on this error) ---
+  = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=2, timed_out=0, unsupported=0, skipped=0, insufficient_strength=0
+  = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=7 bundle_digest=sha256:cedf5bab99a86fa6f31c75ee66023c039f0421b69fddd0e0fd55863d9239b7d5 requests=3
+  = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:14de33c5f90bb021baafd5f4ffdb0de8692bbc9055cefcebc2c929fbbbd41b9f
+  = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=1 proof_obligations=[1] request_digest=sha256:85fcd1d013ebb1b77885cc6e0fd80d675f943119d41194188c3c3ad55d183894
+  = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=2 proof_obligations=[2] request_digest=sha256:d8c4bd93882147d7da394475e59a406c47c4ea9f9b4cb8482ae9f398a83dc85c
+  = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.9.0+native-trust-ir-bundle obligations=3 elapsed_ms=3 worker_threads=unbounded
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:arithmetic_safety:0`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-0-proof-0, function=divide, kind=ArithmeticSafety, relations=1, clauses=1
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:arithmetic_safety:0`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-0-proof-0
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:arithmetic_safety:0`: native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-0-proof-0; refusing to emit proof evidence
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:arithmetic_safety:1`: constructed typed trust_mc ChcVc from trust-verifier-api data: obligation=trust_ir-native-trust_mc-request-1-proof-1, function=divide, kind=ArithmeticSafety, relations=1, clauses=1
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:arithmetic_safety:1`: native trust_mc typed CHC/PDR full-verification runner selected PdrProof for obligation trust_ir-native-trust_mc-request-1-proof-1
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:arithmetic_safety:1`: native trust_mc typed CHC/PDR full-verification runner refuted obligation trust_ir-native-trust_mc-request-1-proof-1; refusing to emit proof evidence
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+  = note: native full verifier evidence `vc:trust_default_refutation__divide:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+
+error: aborting due to 2 previous errors
+

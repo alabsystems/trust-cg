@@ -241,13 +241,30 @@ fn lit_index(lit: i32) -> usize {
     if lit > 0 { 2 * v } else { 2 * v + 1 }
 }
 
-pub fn random_3sat(num_vars: usize, num_clauses: usize, seed: u64) -> Vec<Vec<i32>> {
+/// Generate three distinct signed variable literals per clause.
+/// A nonempty formula needs at least three variables representable as i32
+/// literals. Reject impossible shapes before sampling or allocation.
+pub fn random_3sat(
+    num_vars: usize,
+    num_clauses: usize,
+    seed: u64,
+) -> anyhow::Result<Vec<Vec<i32>>> {
+    if num_clauses == 0 {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        (3..=i32::MAX as usize).contains(&num_vars),
+        "random 3-SAT requires 3..=i32::MAX variables, got {num_vars}"
+    );
     let mut state = if seed == 0 {
         0x9E37_79B9_7F4A_7C15
     } else {
         seed
     };
-    let mut clauses = Vec::with_capacity(num_clauses);
+    let mut clauses = Vec::new();
+    clauses.try_reserve(num_clauses).map_err(|error| {
+        anyhow::anyhow!("cannot allocate {num_clauses} random 3-SAT clauses: {error}")
+    })?;
 
     for _ in 0..num_clauses {
         let mut clause = Vec::with_capacity(3);
@@ -264,7 +281,7 @@ pub fn random_3sat(num_vars: usize, num_clauses: usize, seed: u64) -> Vec<Vec<i3
         clauses.push(clause);
     }
 
-    clauses
+    Ok(clauses)
 }
 
 fn xorshift64(state: &mut u64) -> u64 {
@@ -330,7 +347,7 @@ mod tests {
 
     #[test]
     fn random_3sat_shape() {
-        let clauses = random_3sat(50, 200, 0xCAFE_F00D);
+        let clauses = random_3sat(50, 200, 0xCAFE_F00D).unwrap();
         assert_eq!(clauses.len(), 200);
         for c in &clauses {
             assert_eq!(c.len(), 3);
@@ -339,5 +356,16 @@ mod tests {
                 assert!((1..=50).contains(&v));
             }
         }
+    }
+
+    #[test]
+    fn random_3sat_rejects_impossible_domains_and_capacities() {
+        for variables in [0, 1, 2, i32::MAX as usize + 1, usize::MAX] {
+            assert!(random_3sat(variables, 1, 42).is_err());
+        }
+        assert!(random_3sat(3, usize::MAX, 42).is_err());
+        assert!(random_3sat(0, 0, 42).unwrap().is_empty());
+        let clauses = random_3sat(3, 8, 42).unwrap();
+        assert!(clauses.iter().all(|clause| clause.len() == 3));
     }
 }

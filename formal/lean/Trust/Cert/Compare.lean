@@ -371,6 +371,7 @@ theorem sltReadback
     `valueLeg` is supplied by an §4/§5/§6 `bv_decide` cert (via §7's read-back bridge); the other
     legs are the regalloc / carrier / memory validator outputs. -/
 structure CmpSite (lay : Layout) (step : LoweredStep) (s s' : SrcState) where
+  entryReady : ∀ m, R lay s m → step.entry m
   /-- VALUE leg: discharged by `lowerCmp_correct` / `icmp_*_correct` / `clamp*_correct`. -/
   valueLeg   : ∀ m, R lay s m → ∀ v, Live s' v →
                  denoteLoc (step.exec m) (lay.asgn v) (lay.kind v) = s'.env v
@@ -392,6 +393,7 @@ structure CmpSite (lay : Layout) (step : LoweredStep) (s s' : SrcState) where
 def CmpSite.toInstrCert
     {lay : Layout} {step : LoweredStep} {s s' : SrcState}
     (site : CmpSite lay step s s') : InstrCert lay step s s' where
+  entryReady := site.entryReady
   value     := site.valueLeg
   clobber   := site.clobberLeg
   carrierOk := site.carrierLeg

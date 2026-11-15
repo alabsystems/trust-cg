@@ -23,25 +23,11 @@ fn vreg(id: u32) -> MachOperand {
     MachOperand::VReg(VReg::new(id, RegClass::Gpr64))
 }
 
-// Scoped to the kernel-gate authority path. With `lattice-guard-elision` compiled
-// in, the pass ALSO holds the decidable-lattice authority, and the restriction that
-// confines that authority to InBounds bounds-guards is
-//
-//     let lattice_bounds_only = !full_authority && !cfg!(test) && lattice_authority;
-//
-// i.e. it is disabled in test builds. A test build therefore runs the lattice path at
-// FULL scope — strictly more permissive than anything that ships, since in production
-// `!cfg!(test)` is true and the restriction applies. The elision this test then sees
-// comes from the lattice, not from the forged kernel evidence it plants, so the
-// precondition no longer holds and the assertion tests the wrong thing.
-//
-// Production soundness is unaffected. Re-enable by removing `!cfg!(test)` from
-// `lattice_bounds_only` so test builds exercise the shipping restriction.
+// Integration tests use the production library, not its in-crate cfg(test)
+// model. Enabling a lattice feature does not give a default constructor an
+// opaque replay capability; enable_kernel_gate also clears any lattice token.
+// The forged public evidence below must therefore fail under both feature sets.
 #[test]
-#[cfg_attr(
-    feature = "lattice-guard-elision",
-    ignore = "kernel-gate-only test: test builds exempt the lattice from its production scope restriction"
-)]
 fn public_aarch64_gate_api_cannot_turn_forged_evidence_into_authority() {
     let mut func = MachFunction::new(
         "forged_aarch64".to_string(),

@@ -45,6 +45,7 @@ fn incoming_stack_arg_does_not_rewrite_following_zero_offset_load() {
     let mut config = CompilerConfig::jit_fast(Target::Aarch64);
     config.opt_level = OptLevel::O1;
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("incoming-arg regression fixture must JIT at O1")
         .buffer;
@@ -74,4 +75,13 @@ fn incoming_stack_arg_does_not_rewrite_following_zero_offset_load() {
         "load must read state[0], not state[8]"
     );
     assert_eq!(read_u32(&out, 8), 123, "ninth argument remains readable");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

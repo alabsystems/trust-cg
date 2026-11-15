@@ -151,7 +151,11 @@ write any address outside `S ∪ A`. That includes address `0`.
   check. `Load`/`Store` lower to a bare `local.get` of the pointer followed by
   `i32.load` / `i32.store` with a memarg offset of `0` (`lower.rs:1324-1343`),
   verified in the case-B bytes as `28 02 00` and `36 02 00`. There is no base,
-  no limit, and no comparison.
+  no limit, and no comparison. In the working tree the scalar `Load`/`Store`
+  still use offset `0`, while struct fields, enum tags and lanes, the high
+  half of a 128-bit value, sret slots and parameter / return lanes are
+  reached through a NONZERO memarg offset (`lower/value.rs` `emit_load` /
+  `emit_store`) — equally unchecked against any region.
 - **NOT ENFORCED (host obligation)** — GEP address arithmetic is wrapping
   32-bit arithmetic: `base + index × sizeof(pointee)` via `i32.mul` /
   `i32.add`, plus a constant field offset for a struct GEP
@@ -195,7 +199,44 @@ so the frame occupies `[SP_new, SP_old)` — low-inclusive, high-exclusive,
 immediately below its caller's frame. The epilogue restores `SP := saved`
 (`lower.rs:1480-1487`, verified as `20 03 24 00`).
 
-**Frame internals.** Every `Alloca` is assigned a byte offset `off` with
+A function with no `Alloca`, home, staging or call-scratch slot has no frame
+at all (`compute_frame` leaves it `None`): it emits no prologue, epilogue,
+stack-pointer update or stack guard, touches no stack byte, and the
+frame-bounds guard has nothing to check in it. At O1 and above the trust-ir
+mid-end's store forwarding, dead-slot removal and scalar replacement
+(`crates/trust-cg-irmid`) remove the slots they prove unobservable, so more
+functions are frameless; `F = 0` contributes nothing to the bound below.
+The mid-end's inliner splices a callee's body, its `Alloca`s included, into
+its caller, so the callee's slots become the caller's for the whole
+activation; it never splices an allocating callee into a block on a cycle of
+the caller, nor one with an `Alloca` on a cycle of its own, so a spliced
+`Alloca` runs at most once per activation and gets a fixed offset (never the
+per-execution carving below). Because the slot is
+held on every path of the activation, it never splices an allocating callee
+into a caller on a cycle of direct calls (each recursion level would hold
+it), and the slots spliced into one caller total at most 1024 bytes
+(`MAX_SPLICED_SLOT_BYTES`, which also bounds the per-level growth of a
+recursion through calls the module does not show). A chain that went
+through the callee's frame now holds one frame instead of two, and a caller
+that inlines several callees holds all their slots at once (the stack
+high-water mark can rise, by at most that bound per activation, where a
+caller calls deeply while holding them).
+The mid-end's argument promotion passes a caller's slot to a clone of the
+callee as values and takes the bytes the callee writes back as results; the
+clone allocates its own copy of those bytes (at most 64 per promoted
+parameter) in its entry block, so the copy runs once per activation of the
+clone, gets a fixed offset in the clone's frame, and lives only while the
+clone runs; the caller's slot, whose only escape was the call, is usually
+removed by scalar replacement, and so is the clone's copy.
+The mid-end's full unrolling copies no loop that executes an `Alloca`
+(policy: each copy would take its own fixed slot where the loop's one
+`Alloca` keeps one), so it adds no frame bytes; the arrays it lets scalar
+replacement remove take frame bytes away.
+
+**Frame internals.** Every `Alloca` that runs at most once per activation —
+or whose earlier pointers provably cannot be observed after it runs again
+(`lower/captures.rs`, asking the capture analysis in
+`crates/trust-cg-irmid/src/escape.rs`) — is assigned a byte offset `off` with
 `0 ≤ off < F` and `off ≡ 0 (mod 8)`, and `F = align_up(total, 8)`
 (`lower.rs:666-701`, specifically `align_up(offset, 8)` at `lower.rs:679` and
 `frame_size = align_up(offset, 8)` at `lower.rs:694`). The 8-byte slot
@@ -203,7 +244,14 @@ alignment is a cleanliness choice, not a correctness requirement — the code
 says so (`lower.rs:676-677`) because wasm's non-atomic accesses do not trap on
 misalignment. An alloca's address is `frame_base + off` (`lower.rs:1250-1264`),
 computed with `i32.add`. There are **no negative offsets and no red zone**:
-the frame is entirely within `[frame_base, frame_base + F)`.
+the frame is entirely within `[frame_base, frame_base + F)`. Any other
+`Alloca` (one in a loop whose earlier pointer may still be read) is carved from
+the shadow stack at each execution, `SP := (SP − size) & −align`, and released
+by the epilogue's restore; it is still below the caller's `SP`. After the
+allocas the frame holds the home slots of memory-carried values, which share
+bytes when their live ranges never overlap (`lower/storage.rs`), and one
+transient region shared by every edge-staging, call-scratch and 128-bit
+division-scratch site.
 
 **The bound that holds.** For a call chain with frame sizes `F₁ … Fₙ` entered
 at base `B`, every stack byte the island touches lies in
@@ -212,10 +260,11 @@ property of the emitted code.
 
 **The bounds that do not hold, and are not checked:**
 
-- **NOT ENFORCED (host obligation)** — `ΣFᵢ ≤ R`. The prologue contains no
-  comparison against any limit. There is no stack-limit global, no guard, and
-  no trap. When the chain is deeper than the reserve, the frames simply
-  continue downward into whatever is below `B − R`.
+- **NOT ENFORCED (host obligation)** — `ΣFᵢ ≤ R`. An island's prologue
+  contains no comparison against any limit. There is no stack-limit global,
+  no guard, and no trap (the Policy O floor check below is against the
+  module's own static data, not a reserve). When the chain is deeper than the
+  reserve, the frames simply continue downward into whatever is below `B − R`.
 - **NOT ENFORCED (host obligation)** — recursion depth. The lowering imposes
   no depth limit, so `ΣFᵢ` is unbounded for any island with a cycle in its
   call graph.
@@ -228,12 +277,21 @@ property of the emitted code.
   make the module's declared alignment false, cost performance on engines that
   split unaligned accesses, and pre-break any future atomic or SIMD access,
   which *would* trap. Report it as a violated invariant, not as corruption.
-- Under Policy O only, stack overflow is caught *accidentally*: `i32.sub`
-  wraps, so an `SP` driven below zero becomes a huge unsigned address and the
-  engine's bounds check traps on the first access. That safety net exists only
-  because the island's stack region is the whole memory. **Under Policy I the
-  net is gone** — below `B − R` there is more valid host memory, and the
-  island writes into it without a trap.
+- Under Policy O the module's static data sits at the bottom of the memory
+  it owns and the stack grows down toward it. When the module HAS static
+  data, every prologue and every per-execution `Alloca` checks the new `SP`
+  against the end of that data (and against a wrapped subtraction) and
+  executes `unreachable` instead of writing below it. Every `SP` the module
+  publishes is therefore at or above that floor or followed immediately by
+  `unreachable`, and no frame byte is written below it. A trap leaves behind
+  either a lowered `SP` still at or above the floor (later frames run with
+  less stack and are still checked) or one below it (every later framed call
+  traps). When the module has NO static data there is no check, and overflow
+  is caught only *accidentally*: `i32.sub` wraps, so an `SP` driven below
+  zero becomes a huge unsigned address and the engine's bounds check traps on
+  the first access. **Under Policy I there is no check and no such net** —
+  below `B − R` there is more valid host memory, and the island writes into it
+  without a trap.
 
 **Recommended host mitigation, stated honestly.** A host MAY place a canary
 word at `B − R − 4` and check it after each call. That **detects** overflow
@@ -252,7 +310,7 @@ linear memory, so a true guard page is not available.
 | `S` disjoint from host allocations | **host** | **no** |
 | argument window in-bounds and live | **host** | **no** |
 | pointer non-null | **host** | **no** |
-| frame internals within `[base, base+F)` | trust-cg (`lower.rs:666-701`) | n/a — static |
+| frame internals within `[base, base+F)` | trust-cg (`lower.rs:666-701`); every constant-offset access through the frame base re-checked on the emitted body, refused otherwise (`frame_bounds.rs`, working tree) | n/a — static |
 | stride = element size for in-bounds GEP | trust-cg, proved (`wasm_memory_proofs.rs:110-116`) | n/a — static |
 | shadow-stack frame offset arithmetic | **nobody yet** | see `wasm_memory_proofs.rs:31-34` |
 
@@ -415,8 +473,12 @@ the host's own behaviour into the island's claimed surface. An island that
 declares function imports MUST list them in its manifest with their exact
 signatures. Parameters and results are scalars only — `i32`/`i64`/`f32`/`f64`
 — which the type mapping already enforces: non-scalar types are refused at
-`valtype_of` (`lower.rs:115-126`), and by-value aggregates in signatures are
-refused at type mapping by design (`target.rs:44-47`).
+`valtype_of`, and a by-value aggregate crosses as the `i32` address of its
+bytes (or its one scalar member), by the WebAssembly Basic C ABI
+(`lower/abi.rs`). A module whose `TargetInfo.struct_passing` is
+`Unclassified` is refused once an aggregate crosses a call edge by value, and
+`AlwaysMemory` is refused outright (`reject_unconsumed_target_abi_surface`);
+`wasm32_target_info` stamps `NativeC`, the classification the lane applies.
 
 ### 4.2 Forbidden imports
 
@@ -478,6 +540,15 @@ names are caught, if at all, downstream at the reference validator rather than
 fail-closed at lowering. An island MUST declare its exported name set in its
 manifest.
 
+*Working tree:* the closed lowering now decides its export set
+(`closed_function_exports` in `lower.rs`). Two externally visible exports of
+one name — two definitions, or a definition and the memory export or a growth
+shim — are refused (`[TCG-WASM-EXPORT]`). A module-local (internal/private)
+definition is exported under its name unless another definition or export
+uses that name, in which case it is left unexported; nothing outside the
+module may name it, and calls inside the module name functions by index.
+Reserved prefixes are still not checked.
+
 ---
 
 ## 5. What this does to the claim
@@ -497,8 +568,28 @@ This is the section the design doc demands. It is meant to be quoted.
   independent implementation of the spec
   (`crates/trust-cg-codegen/tests/wasm_module_validation.rs`);
 - the fail-closed accepted-input perimeter: wasm32 target pin, calling
-  convention, multi-result calls, EH instructions, irreducible CFGs, all
-  refused by name at both public entries (`lower.rs:308-453`, `lower.rs:1720-1727`);
+  convention, multi-result calls, EH instructions and integer unary ops at a
+  non-integer type (`not bool`), all refused by name at both public entries
+  (`require_wasm32_target_info`, `reject_unsupported_call_contract`,
+  `reject_unwired_eh_instructions`, `reject_non_integer_scalar_unops` in
+  `lower.rs`);
+- the native admission, applied by every module, object and single-function
+  entry before any surface or body is looked at (`admit_for_codegen`):
+  trust-ir's codegen admission (`trust_cg_lower::validate_codegen_prerequisites`,
+  which no policy widens), then the codegen license under the caller's
+  `CodegenLicensePolicy` (the `*_license` entries; the default policy
+  elsewhere). The body constructs the native instruction translator refuses
+  (`RegionHavocStore`, a marked `Undef`, an `Undef` outside the native
+  scalar carrier set, a non-array `ArraySplat`, a pointer op at a non-pointer
+  type or with a result arity other than one, and a `PtrMetadata` /
+  `PtrFromParts` whose metadata type is not the pointer's metadata at 32-bit
+  pointers) are refused by name as well (`reject_unmodeled_body_constructs`). Every module row of trust-ir's
+  must-refuse corpus is driven through both lanes by both
+  `must_refuse_corpus` targets (trust-cg-codegen in process, trust-cg-cli
+  through the binary), with exact known-accepted tables. *Working tree:* irreducible CFGs are no longer refused;
+  `Lowering::build` selects a dispatch loop over a label local
+  (`Lowering::emit_dispatch`) for them, whose bytes the CFG structural
+  checker validates like any other;
 - frame layout arithmetic — offsets, slot alignment, frame size, downward
   growth, and epilogue restoration on normal return (`lower.rs:666-720`,
   `lower.rs:1480-1487`);

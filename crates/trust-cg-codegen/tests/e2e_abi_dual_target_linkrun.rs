@@ -283,8 +283,19 @@ fn compile_for(target: Target, module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .unwrap_or_else(|e| panic!("{:?} compile failed: {:?}", target, e));
@@ -375,11 +386,14 @@ fn link_and_run(
 /// return value is a sensitive function of every formal-arg load.
 fn build_sum8_i64_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("sum8_i64_test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64; 8],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 8],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum8_i64", ft, BlockId::new(0));
 
     // Params: v0..v7
@@ -409,7 +423,9 @@ fn build_sum8_i64_module() -> TrustIrModule {
         params,
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -431,21 +447,24 @@ fn build_sum8_i64_module() -> TrustIrModule {
 ///   return t3
 fn build_sum6i_3d_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("sum6i_3d_test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::F64,
-            Ty::F64,
-            Ty::F64,
-        ],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::F64,
+                Ty::F64,
+                Ty::F64,
+            ],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum6i_3d", ft, BlockId::new(0));
 
     let params: Vec<(ValueId, Ty)> = vec![
@@ -513,7 +532,9 @@ fn build_sum6i_3d_module() -> TrustIrModule {
         params,
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -522,11 +543,14 @@ fn build_sum6i_3d_module() -> TrustIrModule {
 /// itself is broken and the more complex failures would be misleading.
 fn build_const_sentinel_module(name: &str, value: i64) -> TrustIrModule {
     let mut module = TrustIrModule::new("const_sentinel");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -542,7 +566,9 @@ fn build_const_sentinel_module(name: &str, value: i64) -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -765,4 +791,13 @@ int main(void) {
         "x86_64 stdout should contain 210.875, got: {}",
         stdout
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

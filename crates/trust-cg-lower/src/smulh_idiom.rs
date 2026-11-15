@@ -38,7 +38,7 @@
 //!   only by the idiom's `SShr`, we also skip that producer; otherwise it is
 //!   left in place for its other consumers.
 
-use std::collections::{HashMap, HashSet};
+use trust_cg_ir::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::instructions::{Instruction, Opcode, Value};
 use crate::types::Type;
@@ -100,7 +100,7 @@ pub fn detect_smulh_idioms(
     instructions: &[Instruction],
     cross_block_use_counts: Option<&HashMap<Value, usize>>,
 ) -> SmulhAnalysis {
-    let mut def_site: HashMap<Value, usize> = HashMap::new();
+    let mut def_site: HashMap<Value, usize> = HashMap::default();
     for (i, inst) in instructions.iter().enumerate() {
         if inst.results.len() == 1 {
             def_site.insert(inst.results[0], i);
@@ -118,7 +118,7 @@ pub fn detect_smulh_idioms(
     let use_count: &HashMap<Value, usize> = match cross_block_use_counts {
         Some(total) => total,
         None => {
-            let mut local: HashMap<Value, usize> = HashMap::new();
+            let mut local: HashMap<Value, usize> = HashMap::default();
             for inst in instructions {
                 for arg in &inst.args {
                     *local.entry(*arg).or_insert(0) += 1;

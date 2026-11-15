@@ -75,7 +75,10 @@ pub fn observe_carrier_births(func: &MachFunction) -> GuardObservation {
 }
 
 /// True iff shadow logging is enabled via `TRUST_CG_GUARD_SHADOW` (non-empty, not "0").
-fn shadow_logging_enabled() -> bool {
+///
+/// Deliberately NOT memoized: it is read once per compiled function, which is
+/// cheap, and an in-process flip must be observed by the next compile.
+pub fn shadow_logging_enabled() -> bool {
     std::env::var("TRUST_CG_GUARD_SHADOW")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
@@ -103,12 +106,19 @@ pub fn reconcile(observation: GuardObservation, func_after_opt: &MachFunction) -
 
 /// Reconcile the snapshot, run the shadow kernel, and check conservation. Never fails the compile
 /// in S1 (shadow only); all output is gated behind `TRUST_CG_GUARD_SHADOW`.
+///
+/// The gate is checked FIRST. `reconcile` is a second whole-function walk plus a
+/// `HashSet` and per-site ledger mutation whose only observable product is the
+/// `eprintln!`s below — this function returns `()` and every branch it feeds is
+/// a print — so with shadow logging off the reconciliation was pure waste on
+/// every AArch64 compile. Direct callers that want the ledger keep calling
+/// [`reconcile`], which is unchanged.
 pub fn finalize_and_observe(observation: GuardObservation, func_after_opt: &MachFunction) {
-    let ledger = reconcile(observation, func_after_opt);
-
     if !shadow_logging_enabled() {
         return;
     }
+
+    let ledger = reconcile(observation, func_after_opt);
 
     // Shadow kernel: what would the (evidence-free) kernel decide for each site? In S1 this is
     // always Keep — the audit signal that evidence threading (S3) is still pending.

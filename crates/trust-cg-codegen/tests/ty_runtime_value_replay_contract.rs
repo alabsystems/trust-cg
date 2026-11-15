@@ -165,7 +165,7 @@ fn runtime_reducer_evidence_summary() -> TyReducerEvidenceCoverageSummary {
 
 fn runtime_reducer_evidence_row(reducer_family: &str) -> TyReducerEvidenceRow {
     TyReducerEvidenceRow {
-        command: format!("cargo test -p trust-cg-codegen --test {reducer_family}"),
+        command: format!("scripts/trust_cargo.sh test -p trust-cg-codegen --test {reducer_family}"),
         target_tuple: "aarch64-apple-darwin".to_owned(),
         trust_cg_revision: "trust-cg-test-revision".to_owned(),
         opt_level: "O1/O3".to_owned(),

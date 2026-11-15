@@ -1,0 +1,299 @@
+{
+  "name": "tensor_map_reduce_view",
+  "functions": [
+    {
+      "id": 0,
+      "name": "mrv",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Tensor": [
+                  "I32",
+                  2
+                ]
+              }
+            ],
+            [
+              1,
+              {
+                "Tensor": [
+                  "I32",
+                  2
+                ]
+              }
+            ],
+            [
+              2,
+              "Usize"
+            ],
+            [
+              3,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "TensorMap": {
+                  "ty": {
+                    "Tensor": [
+                      "I32",
+                      2
+                    ]
+                  },
+                  "args": [
+                    0,
+                    1,
+                    4
+                  ],
+                  "body": [
+                    {
+                      "BinOp": {
+                        "op": "Add",
+                        "ty": "I32",
+                        "lhs": 0,
+                        "rhs": 1
+                      }
+                    },
+                    {
+                      "UnOp": {
+                        "op": "Neg",
+                        "ty": "I32",
+                        "operand": 3
+                      }
+                    },
+                    {
+                      "ICmp": {
+                        "op": "Sgt",
+                        "ty": "I32",
+                        "lhs": 4,
+                        "rhs": 2
+                      }
+                    },
+                    {
+                      "Select": {
+                        "ty": "I32",
+                        "cond": 5,
+                        "then_lane": 4,
+                        "else_lane": 2
+                      }
+                    },
+                    {
+                      "Cast": {
+                        "op": "Trunc",
+                        "src_ty": "I32",
+                        "dst_ty": "I8",
+                        "operand": 6
+                      }
+                    },
+                    {
+                      "Cast": {
+                        "op": "SExt",
+                        "src_ty": "I8",
+                        "dst_ty": "I32",
+                        "operand": 7
+                      }
+                    }
+                  ]
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "TensorReduce": {
+                  "ty": {
+                    "Tensor": [
+                      "I32",
+                      1
+                    ]
+                  },
+                  "src": 5,
+                  "op": "Add",
+                  "axes": [
+                    1
+                  ],
+                  "order": "RowMajor"
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "TensorView": {
+                  "ty": {
+                    "Tensor": [
+                      "I32",
+                      1
+                    ]
+                  },
+                  "src": 6,
+                  "params": [
+                    2
+                  ],
+                  "exprs": [
+                    {
+                      "SrcExtent": 0
+                    },
+                    {
+                      "Param": 0
+                    },
+                    {
+                      "Add": [
+                        0,
+                        1
+                      ]
+                    },
+                    {
+                      "Coord": 0
+                    },
+                    {
+                      "Sub": [
+                        3,
+                        1
+                      ]
+                    }
+                  ],
+                  "shape": [
+                    2
+                  ],
+                  "index": [
+                    4
+                  ],
+                  "fill": 3
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    7
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "Tensor": [
+            "I32",
+            2
+          ]
+        },
+        {
+          "Tensor": [
+            "I32",
+            2
+          ]
+        },
+        "Usize",
+        "I32"
+      ],
+      "returns": [
+        {
+          "Tensor": [
+            "I32",
+            1
+          ]
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "Unclassified"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

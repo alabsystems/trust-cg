@@ -27,6 +27,8 @@ pub enum NeonEncodeError {
     RegisterOutOfRange { reg: u8 },
     #[error("invalid arrangement size {0}")]
     InvalidSize(u8),
+    #[error("invalid DUP arrangement: Q={q}, element size {element_size} bytes")]
+    InvalidDupArrangement { q: u32, element_size: u8 },
     #[error("invalid lane index {lane} for arrangement")]
     InvalidLane { lane: u8 },
     #[error("immediate {0:#X} out of range for MOVI")]
@@ -1160,6 +1162,7 @@ pub fn encode_dup_element(
 ) -> Result<u32, NeonEncodeError> {
     check_reg(rn)?;
     check_reg(rd)?;
+    check_dup_arrangement(q, elem)?;
 
     let imm5 = match elem {
         ElementSize::B => ((lane as u32) << 1) | 0b1,
@@ -1190,6 +1193,7 @@ pub fn encode_dup_general(
 ) -> Result<u32, NeonEncodeError> {
     check_reg(rn)?;
     check_reg(rd)?;
+    check_dup_arrangement(q, elem)?;
 
     let imm5: u32 = match elem {
         ElementSize::B => 0b00001,
@@ -1204,6 +1208,19 @@ pub fn encode_dup_general(
         | (1 << 10)
         | ((rn as u32) << 5)
         | (rd as u32))
+}
+
+/// DUP has seven vector arrangements: byte/halfword/word lanes at either
+/// width, and doubleword lanes only at Q=1. Scalar lane moves use a different
+/// encoding; a 1D destination is not a vector DUP.
+fn check_dup_arrangement(q: u32, elem: ElementSize) -> Result<(), NeonEncodeError> {
+    if q > 1 || (q == 0 && elem == ElementSize::D) {
+        return Err(NeonEncodeError::InvalidDupArrangement {
+            q,
+            element_size: elem as u8,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,7 +1544,7 @@ pub fn encode_ldp_q_post_imm(offset: i64, rt2: u8, rn: u8, rt: u8) -> Result<u32
         return Err(NeonEncodeError::LdpDuplicateDest(rt));
     }
     // Range-check the i64 quotient BEFORE narrowing (mirrors the fail-closed
-    // scaled_pair_imm7 guards in encode.rs): a `& 0x7F` mask on an unchecked
+    // pair_memory_descriptor guard in encode.rs): a `& 0x7F` mask on an unchecked
     // value would silently truncate an out-of-range offset into a DIFFERENT
     // in-range one — a silent miscompile, not an error.
     if offset % 16 != 0 {
@@ -2732,6 +2749,39 @@ mod tests {
     }
 
     // === DUP ===
+
+    #[test]
+    fn test_dup_arrangement_domain_and_assembler_words() {
+        for q in [0, 1, 2, u32::MAX] {
+            for elem in [
+                ElementSize::B,
+                ElementSize::H,
+                ElementSize::S,
+                ElementSize::D,
+            ] {
+                let valid = q <= 1 && !(q == 0 && elem == ElementSize::D);
+                assert_eq!(encode_dup_element(q, elem, 0, 1, 0).is_ok(), valid);
+                assert_eq!(encode_dup_general(q, elem, 1, 0).is_ok(), valid);
+                if valid {
+                    // Lane selection addresses the full source vector, even
+                    // when the destination is a 64-bit vector.
+                    let lanes = 16 / elem as u8;
+                    assert!(encode_dup_element(q, elem, lanes - 1, 1, 0).is_ok());
+                    assert!(encode_dup_element(q, elem, lanes, 1, 0).is_err());
+                }
+            }
+        }
+        // Independently assembled with clang -target arm64-apple-macos and
+        // inspected with otool: DUP v0.8b/v0.16b/v0.2d from v1[0] or w1/x1.
+        for (q, elem, element_word, general_word) in [
+            (0, ElementSize::B, 0x0e01_0420, 0x0e01_0c20),
+            (1, ElementSize::B, 0x4e01_0420, 0x4e01_0c20),
+            (1, ElementSize::D, 0x4e08_0420, 0x4e08_0c20),
+        ] {
+            assert_eq!(encode_dup_element(q, elem, 0, 1, 0).unwrap(), element_word);
+            assert_eq!(encode_dup_general(q, elem, 1, 0).unwrap(), general_word);
+        }
+    }
 
     #[test]
     fn test_dup_element_s() {

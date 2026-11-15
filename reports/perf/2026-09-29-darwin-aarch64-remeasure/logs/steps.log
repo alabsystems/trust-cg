@@ -1,0 +1,37 @@
+=== 01-beat-llvm-evidence-warm-cold: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --retain-dir $HOME/trust-cg/.claude/worktrees/agent-workflow/reports/perf/2026-09-29-darwin-aarch64-remeasure
+01-beat-llvm-evidence-warm-cold	exit=0	wall_s=102.6
+evidence results: benchmarks/beat-llvm/results/80b0e03aa609-20260929T120733Z.json
+=== 02-perf-ratchet-require-current: python3 scripts/check_perf_ratchet.py --require-current benchmarks/beat-llvm/results/80b0e03aa609-20260929T120733Z.json
+02-perf-ratchet-require-current	exit=3	wall_s=0.8
+=== 03-check-gates-evidence: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/80b0e03aa609-20260929T120733Z.json
+03-check-gates-evidence	exit=2	wall_s=0.0
+=== 04-beat-llvm-diagnostic-no-proof-certs: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --bridge-cg-arg no-proof-certs --retain-dir $HOME/trust-cg/.claude/worktrees/agent-workflow/reports/perf/2026-09-29-darwin-aarch64-remeasure/diagnostic-no-proof-certs
+04-beat-llvm-diagnostic-no-proof-certs	exit=0	wall_s=255.5
+diagnostic results: benchmarks/beat-llvm/results/80b0e03aa609-20260929T132350Z.json
+=== 05-check-gates-diagnostic: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/80b0e03aa609-20260929T132350Z.json
+05-check-gates-diagnostic	exit=2	wall_s=0.0
+stopped by operator 2026-09-29T13:54:59Z while waiting for quiet before 06; the remaining steps ran in later invocations (README)
+=== 01-beat-llvm-evidence-warm-cold: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --retain-dir $HOME/trust-cg/.claude/worktrees/agent-workflow/reports/perf/2026-09-29-darwin-aarch64-remeasure
+01-beat-llvm-evidence-warm-cold	exit=0	wall_s=101.5
+evidence results: benchmarks/beat-llvm/results/80b0e03aa609-20260929T141257Z.json
+=== 02-perf-ratchet-require-current: python3 scripts/check_perf_ratchet.py --require-current benchmarks/beat-llvm/results/80b0e03aa609-20260929T141257Z.json
+02-perf-ratchet-require-current	exit=0	wall_s=0.4
+=== 03-check-gates-evidence: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/80b0e03aa609-20260929T141257Z.json
+03-check-gates-evidence	exit=0	wall_s=0.0
+campaign done 2026-09-29T14:12:59Z
+=== 06-scale-gate-rss: python3 benchmarks/beat-llvm/scale_gate.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --rss
+06-scale-gate-rss	exit=0	wall_s=40.1
+=== 07-compile-scaling: python3 benchmarks/compile-scaling/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --out-dir $SCRATCH/darwin-remeasure-wf228801/compile-scaling-work
+07-compile-scaling	exit=0	wall_s=36.3
+campaign done 2026-09-29T14:14:18Z
+=== 08-compile-time-canary: bash scripts/compile_time_canary.sh --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc
+08-compile-time-canary	exit=1	wall_s=2.0
+=== 09-determinism-sentinel: bash scripts/compile_determinism_sentinel.sh 5 --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc
+09-determinism-sentinel	exit=2	wall_s=10.8
+campaign done 2026-09-29T14:14:33Z
+=== 11-scale-gate-large-xlarge-repeat: python3 benchmarks/beat-llvm/scale_gate.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --sizes large xlarge --rss
+11-scale-gate-large-xlarge-repeat	exit=0	wall_s=32.0
+=== 12-beat-llvm-diagnostic-no-proof-certs-repeat: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --bridge-cg-arg no-proof-certs --retain-dir $HOME/trust-cg/.claude/worktrees/agent-workflow/reports/perf/2026-09-29-darwin-aarch64-remeasure/diagnostic-no-proof-certs
+12-beat-llvm-diagnostic-no-proof-certs-repeat	exit=0	wall_s=249.3
+diagnostic repeat results: benchmarks/beat-llvm/results/80b0e03aa609-dirty-20260929T142117Z.json
+campaign done 2026-09-29T14:21:19Z

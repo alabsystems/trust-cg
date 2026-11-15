@@ -20,9 +20,10 @@
 //!
 //! Reference: LLVM `RegAllocGreedy.cpp` — call-crossing interval handling.
 
+use crate::AllocError;
 use crate::liveness::LiveInterval;
 use crate::machine_types::{
-    InstFlags, InstId, MachFunction, MachInst, MachOperand, PReg, RegClass, StackSlotId, VReg,
+    InstFlags, InstId, MachFunction, MachInst, MachOperand, PReg, RegClass, VReg,
 };
 use crate::spill::{PSEUDO_SPILL_LOAD, PSEUDO_SPILL_STORE};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,73 +45,43 @@ pub struct CallCrossing {
 /// volatile register class. This intentionally includes non-allocatable IP/LR
 /// registers because the pipeline also uses this set as call implicit defs.
 pub fn aarch64_caller_saved_regs() -> BTreeSet<PReg> {
-    let mut regs = BTreeSet::new();
-    // GPR call-clobbered: X0-X18 plus X30 / W0-W18 plus W30.
-    // X16/X17 are used by indirect-call lowering as IP scratch registers, X18
-    // is the platform register, and BL/BLR writes LR (X30).
-    for i in 0u16..=18 {
-        regs.insert(PReg::new(i));
-    }
-    regs.insert(PReg::new(30));
-    for i in 32u16..=50 {
-        regs.insert(PReg::new(i));
-    }
-    regs.insert(PReg::new(62));
-
-    // FPR caller-saved: V/D/S/H 0-7 and 16-31.
-    for i in 64u16..=71 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 80u16..=95 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 96u16..=103 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 112u16..=127 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 128u16..=135 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 144u16..=159 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 165u16..=172 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 181u16..=196 {
-        regs.insert(PReg::new(i));
-    }
-    regs
+    aarch64_saved_regs(false)
 }
 
 /// AArch64 callee-saved registers that regalloc may allocate.
 ///
-/// The local AArch64 model treats V8-V15 as callee-saved and also exposes
-/// the D/S aliases separately, so include each encoded class.
+/// The local model classifies V8-V15 by their preserved low 64 bits; Fpr128
+/// allocation independently excludes those registers because their upper bits
+/// are volatile. Include each scalar alias encoded by this allocator.
 pub fn aarch64_callee_saved_regs() -> BTreeSet<PReg> {
-    let mut regs = BTreeSet::new();
-    // GPR callee-saved: X19-X28 / W19-W28.
-    for i in 19u16..=28 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 51u16..=60 {
-        regs.insert(PReg::new(i));
-    }
+    aarch64_saved_regs(true)
+}
 
-    // FPR callee-saved: V/D/S/H 8-15.
-    for i in 72u16..=79 {
-        regs.insert(PReg::new(i));
+fn aarch64_saved_regs(callee: bool) -> BTreeSet<PReg> {
+    let mut regs = BTreeSet::new();
+    for index in 0u8..=30 {
+        // FP is reserved in this allocator; the architectural model still
+        // classifies it, but neither allocatable set includes its aliases.
+        if index == 29 {
+            continue;
+        }
+        let upper = crate::trust_cg_aarch64_gpr_before30(index, 1, 0);
+        let flag = crate::trust_cg_aarch64_gpr_before19(index, 0, upper);
+        if (flag == 1) == callee {
+            for base in [0u16, 32] {
+                regs.insert(PReg::new(base + u16::from(index)));
+            }
+        }
     }
-    for i in 104u16..=111 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 136u16..=143 {
-        regs.insert(PReg::new(i));
-    }
-    for i in 173u16..=180 {
-        regs.insert(PReg::new(i));
+    for index in 0u8..32 {
+        let upper = crate::trust_cg_aarch64_fpr_before16(index, 1, 0);
+        let flag = crate::trust_cg_aarch64_fpr_before8(index, 0, upper);
+        if (flag == 1) == callee {
+            // V/D/S/H encodings of the same architectural register.
+            for base in [64u16, 96, 128, 165] {
+                regs.insert(PReg::new(base + u16::from(index)));
+            }
+        }
     }
     regs
 }
@@ -133,39 +104,74 @@ pub fn find_call_crossings_in<'a>(
     intervals: impl IntoIterator<Item = &'a LiveInterval> + Clone,
     inst_numbering: &BTreeMap<InstId, u32>,
 ) -> Vec<CallCrossing> {
-    let mut crossings = Vec::new();
-
+    // Every numbered call, in block and instruction order: the order the
+    // crossings are reported in.
+    let mut calls: Vec<(u32, InstId)> = Vec::new();
     for block in &func.blocks {
         for &inst_id in &block.insts {
             let inst = &func.insts[inst_id.0 as usize];
             if !inst.flags.is_call() {
                 continue;
             }
+            if let Some(&call_idx) = inst_numbering.get(&inst_id) {
+                calls.push((call_idx, inst_id));
+            }
+        }
+    }
+    if calls.is_empty() {
+        return Vec::new();
+    }
 
-            let call_idx = match inst_numbering.get(&inst_id) {
-                Some(&idx) => idx,
-                None => continue,
-            };
+    // Call positions in ascending order, each with its report ordinal. Asking
+    // every interval about every call is quadratic in a function's call count
+    // (a straight-line block of `c` calls has `O(c)` intervals); walking each
+    // interval's ranges over the sorted positions visits only the calls it is
+    // live across. Pushing in interval order keeps each `live_across` list in
+    // the sequence's order, exactly as the per-call scan built it.
+    let mut positions: Vec<(u32, usize)> = calls
+        .iter()
+        .enumerate()
+        .map(|(ordinal, &(call_idx, _))| (call_idx, ordinal))
+        .collect();
+    positions.sort_unstable();
+    let call_points: Vec<u32> = positions.iter().map(|&(call_idx, _)| call_idx).collect();
 
-            // Find all intervals that are live at this call.
-            let mut live_across = Vec::new();
-            for interval in intervals.clone() {
-                if interval.is_live_at(call_idx) {
-                    live_across.push(interval.vreg);
+    let mut live_across: Vec<Vec<VReg>> = vec![Vec::new(); calls.len()];
+    for interval in intervals {
+        if interval.has_ordered_ranges() {
+            for range in &interval.ranges {
+                let first = call_points.partition_point(|&pos| pos < range.start);
+                crate::scan_work::charge(1);
+                for &(call_idx, ordinal) in &positions[first..] {
+                    crate::scan_work::charge(1);
+                    if call_idx >= range.end {
+                        break;
+                    }
+                    live_across[ordinal].push(interval.vreg);
                 }
             }
-
-            if !live_across.is_empty() {
-                crossings.push(CallCrossing {
-                    call_inst_idx: call_idx,
-                    call_inst_id: inst_id,
-                    live_across,
-                });
+        } else {
+            // Outside the ranges invariant, keep the literal per-call question.
+            for (ordinal, &(call_idx, _)) in calls.iter().enumerate() {
+                if interval.is_live_at(call_idx) {
+                    live_across[ordinal].push(interval.vreg);
+                }
             }
         }
     }
 
-    crossings
+    calls
+        .into_iter()
+        .zip(live_across)
+        .filter(|(_, live_across)| !live_across.is_empty())
+        .map(
+            |((call_inst_idx, call_inst_id), live_across)| CallCrossing {
+                call_inst_idx,
+                call_inst_id,
+                live_across,
+            },
+        )
+        .collect()
 }
 
 /// Insert save/restore code around calls for VRegs assigned to caller-saved
@@ -175,14 +181,18 @@ pub fn find_call_crossings_in<'a>(
 /// 1. Check which live-across VRegs are assigned to caller-saved registers.
 /// 2. For those VRegs, insert a store before the call and a load after.
 ///
-/// Returns the number of save/restore pairs inserted.
+/// Returns the number of save/restore pairs inserted. Slot-ID exhaustion
+/// returns an error without changing instructions, counters, or slot metadata.
+/// This public helper is not called by the current allocation pipeline, which
+/// enforces call-clobber constraints through reservations and spill allocation.
 pub fn insert_call_save_restore(
     func: &mut MachFunction,
     crossings: &[CallCrossing],
     allocation: &BTreeMap<VReg, PReg>,
     caller_saved: &BTreeSet<PReg>,
-) -> u32 {
+) -> Result<u32, AllocError> {
     let mut pairs_inserted = 0u32;
+    let mut slots = func.stack_slot_allocation_plan();
 
     // Build a plan first, then apply (to avoid mutating while iterating).
     // Plan entry: (block_idx, inst_pos_in_block, saves_before, restores_after).
@@ -208,11 +218,10 @@ pub fn insert_call_save_restore(
                         && caller_saved.contains(&preg)
                     {
                         // Need to save before and restore after.
-                        let slot = StackSlotId(func.next_stack_slot);
-                        func.next_stack_slot += 1;
-                        let size = reg_class_size(vreg.class);
-                        func.stack_slots
-                            .insert(slot, crate::machine_types::StackSlot::new(size, size));
+                        let size = vreg.class.size_bytes();
+                        let slot = slots
+                            .allocate(size, size)
+                            .ok_or(AllocError::StackSlotExhausted)?;
 
                         // Store before call.
                         saves.push(MachInst {
@@ -236,6 +245,8 @@ pub fn insert_call_save_restore(
                             tied_operands: vec![],
                         });
 
+                        // Every pair consumes a distinct checked slot ID; the
+                        // total cannot exceed the u32::MAX allocatable IDs.
                         pairs_inserted += 1;
                     }
                 }
@@ -251,6 +262,7 @@ pub fn insert_call_save_restore(
     // Apply plans in reverse order to maintain position validity.
     plans.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
 
+    slots.commit(func);
     for (block_idx, pos, saves, restores) in plans {
         let block = &mut func.blocks[block_idx];
 
@@ -269,7 +281,7 @@ pub fn insert_call_save_restore(
         }
     }
 
-    pairs_inserted
+    Ok(pairs_inserted)
 }
 
 /// Compute register allocation hints for call-crossing intervals.
@@ -308,27 +320,190 @@ pub fn compute_call_crossing_hints(
     hints
 }
 
-fn reg_class_size(class: RegClass) -> u32 {
-    match class {
-        RegClass::Gpr32 | RegClass::Fpr32 => 4,
-        RegClass::Gpr64 | RegClass::Fpr64 => 8,
-        RegClass::Fpr128 => 16,
-        // Smaller FPR classes: use their natural size
-        RegClass::Fpr16 => 2,
-        RegClass::Fpr8 => 1,
-        RegClass::System => 4,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::liveness::LiveInterval;
+    use crate::liveness::{LiveInterval, LiveRange};
     use crate::machine_types::{
         BlockId, InstFlags, InstId, MachBlock, MachFunction, MachInst, MachOperand, PReg, RegClass,
-        VReg,
+        StackSlotId, VReg,
     };
     use std::collections::BTreeMap;
+
+    fn slot_boundary_call_function(next_stack_slot: u32) -> MachFunction {
+        MachFunction {
+            name: "slot_boundary_call".into(),
+            insts: vec![MachInst {
+                opcode: 0xCA,
+                defs: vec![],
+                uses: vec![],
+                implicit_defs: vec![],
+                implicit_uses: vec![],
+                flags: InstFlags::IS_CALL,
+                tied_operands: vec![],
+            }],
+            blocks: vec![MachBlock {
+                insts: vec![InstId(0)],
+                preds: vec![],
+                succs: vec![],
+                loop_depth: 0,
+            }],
+            block_order: vec![BlockId(0)],
+            entry_block: BlockId(0),
+            next_vreg: 2,
+            next_stack_slot,
+            stack_slots: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn slot_boundary_call_save_exhaustion_preserves_function() {
+        let mut func = slot_boundary_call_function(u32::MAX - 1);
+        let before = format!("{func:?}");
+        let crossings = [CallCrossing {
+            call_inst_idx: 0,
+            call_inst_id: InstId(0),
+            live_across: vec![vreg(0), vreg(1)],
+        }];
+        let allocation = BTreeMap::from([(vreg(0), PReg::new(0)), (vreg(1), PReg::new(1))]);
+        assert!(matches!(
+            insert_call_save_restore(
+                &mut func,
+                &crossings,
+                &allocation,
+                &aarch64_caller_saved_regs()
+            ),
+            Err(AllocError::StackSlotExhausted)
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn slot_boundary_call_save_does_not_overwrite_existing_slot() {
+        let mut func = slot_boundary_call_function(0);
+        func.stack_slots.insert(
+            StackSlotId(0),
+            crate::machine_types::RegAllocStackSlot::new(32, 32),
+        );
+        let original_slot = format!("{:?}", func.stack_slots[&StackSlotId(0)]);
+        let crossings = [CallCrossing {
+            call_inst_idx: 0,
+            call_inst_id: InstId(0),
+            live_across: vec![vreg(0)],
+        }];
+        let allocation = BTreeMap::from([(vreg(0), PReg::new(0))]);
+        insert_call_save_restore(
+            &mut func,
+            &crossings,
+            &allocation,
+            &aarch64_caller_saved_regs(),
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", func.stack_slots[&StackSlotId(0)]),
+            original_slot
+        );
+        assert_eq!(func.stack_slots.len(), 2);
+    }
+
+    #[test]
+    fn slot_boundary_call_save_last_slot_emits_matching_pair() {
+        let mut func = slot_boundary_call_function(u32::MAX - 1);
+        let crossings = [CallCrossing {
+            call_inst_idx: 0,
+            call_inst_id: InstId(0),
+            live_across: vec![vreg(0), vreg(0)],
+        }];
+        let allocation = BTreeMap::from([(vreg(0), PReg::new(0))]);
+        assert_eq!(
+            insert_call_save_restore(
+                &mut func,
+                &crossings,
+                &allocation,
+                &aarch64_caller_saved_regs()
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(func.next_stack_slot, u32::MAX);
+        let slot = StackSlotId(u32::MAX - 1);
+        let insts: Vec<_> = func.blocks[0]
+            .insts
+            .iter()
+            .map(|id| &func.insts[id.0 as usize])
+            .collect();
+        assert_eq!(
+            insts.iter().map(|inst| inst.opcode).collect::<Vec<_>>(),
+            [PSEUDO_SPILL_STORE, 0xCA, PSEUDO_SPILL_LOAD]
+        );
+        assert_eq!(
+            insts[0].uses,
+            [MachOperand::VReg(vreg(0)), MachOperand::StackSlot(slot)]
+        );
+        assert_eq!(insts[2].defs, [MachOperand::VReg(vreg(0))]);
+        assert_eq!(insts[2].uses, [MachOperand::StackSlot(slot)]);
+        assert_eq!(func.stack_slots[&slot].size, 8);
+    }
+
+    #[test]
+    fn slot_boundary_later_call_exhaustion_discards_earlier_plan() {
+        let mut func = slot_boundary_call_function(u32::MAX - 1);
+        func.insts.push(func.insts[0].clone());
+        func.blocks[0].insts.push(InstId(1));
+        let before = format!("{func:?}");
+        let crossings = [
+            CallCrossing {
+                call_inst_idx: 0,
+                call_inst_id: InstId(0),
+                live_across: vec![vreg(0)],
+            },
+            CallCrossing {
+                call_inst_idx: 1,
+                call_inst_id: InstId(1),
+                live_across: vec![vreg(0)],
+            },
+        ];
+        let allocation = BTreeMap::from([(vreg(0), PReg::new(0))]);
+        assert!(matches!(
+            insert_call_save_restore(
+                &mut func,
+                &crossings,
+                &allocation,
+                &aarch64_caller_saved_regs()
+            ),
+            Err(AllocError::StackSlotExhausted)
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn slot_boundary_no_call_saves_succeeds_at_capacity() {
+        let mut func = slot_boundary_call_function(u32::MAX);
+        let before = format!("{func:?}");
+        let crossings = [CallCrossing {
+            call_inst_idx: 0,
+            call_inst_id: InstId(0),
+            live_across: vec![vreg(0), vreg(1)],
+        }];
+        // v0 is callee-saved; v1 has no physical assignment (spilled).
+        let allocation = BTreeMap::from([(vreg(0), PReg::new(19))]);
+        assert_eq!(
+            insert_call_save_restore(
+                &mut func,
+                &crossings,
+                &allocation,
+                &aarch64_caller_saved_regs()
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            insert_call_save_restore(&mut func, &[], &allocation, &aarch64_caller_saved_regs())
+                .unwrap(),
+            0
+        );
+        assert_eq!(format!("{func:?}"), before);
+    }
 
     fn vreg(id: u32) -> VReg {
         VReg {
@@ -538,7 +713,7 @@ mod tests {
         // And the full 128-bit value is preserved by the around-call save path:
         // an Fpr128 spill/save slot is 16 bytes (the full Q register).
         assert_eq!(
-            reg_class_size(RegClass::Fpr128),
+            RegClass::Fpr128.size_bytes(),
             16,
             "Fpr128 around-call save must cover the full 128 bits"
         );
@@ -803,7 +978,8 @@ mod tests {
         allocation.insert(vreg(0), PReg::new(19));
 
         let caller_saved = aarch64_caller_saved_regs();
-        let pairs = insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved);
+        let pairs =
+            insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved).unwrap();
 
         assert_eq!(
             pairs, 0,
@@ -870,7 +1046,8 @@ mod tests {
         allocation.insert(vreg(0), PReg::new(0));
 
         let caller_saved = aarch64_caller_saved_regs();
-        let pairs = insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved);
+        let pairs =
+            insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved).unwrap();
 
         assert_eq!(pairs, 1, "caller-saved register needs save/restore");
 
@@ -946,7 +1123,8 @@ mod tests {
         allocation.insert(vreg(0), PReg::new(0));
 
         let caller_saved = aarch64_caller_saved_regs();
-        let pairs = insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved);
+        let pairs =
+            insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved).unwrap();
 
         assert_eq!(pairs, 1, "duplicate live-across entries share one pair");
         assert_eq!(func.stack_slots.len(), 1, "one temporary stack slot");
@@ -1026,7 +1204,8 @@ mod tests {
         allocation.insert(v0, PReg::new(165)); // H0 is caller-saved.
 
         let caller_saved = aarch64_caller_saved_regs();
-        let pairs = insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved);
+        let pairs =
+            insert_call_save_restore(&mut func, &crossings, &allocation, &caller_saved).unwrap();
 
         assert_eq!(pairs, 1, "caller-saved H register needs save/restore");
         let slot = func
@@ -1108,5 +1287,210 @@ mod tests {
 
         let hints = compute_call_crossing_hints(&crossings, &callee_saved, &allocatable);
         assert_eq!(hints.len(), 1, "should have one hint entry for v0");
+    }
+    /// The per-call scan `find_call_crossings_in` used before it walked
+    /// interval ranges over sorted call positions: the differential oracle.
+    fn find_call_crossings_reference<'a>(
+        func: &MachFunction,
+        intervals: impl IntoIterator<Item = &'a LiveInterval> + Clone,
+        inst_numbering: &BTreeMap<InstId, u32>,
+    ) -> Vec<(u32, InstId, Vec<VReg>)> {
+        let mut crossings = Vec::new();
+        for block in &func.blocks {
+            for &inst_id in &block.insts {
+                let inst = &func.insts[inst_id.0 as usize];
+                if !inst.flags.is_call() {
+                    continue;
+                }
+                let Some(&call_idx) = inst_numbering.get(&inst_id) else {
+                    continue;
+                };
+                let live_across: Vec<VReg> = intervals
+                    .clone()
+                    .into_iter()
+                    .filter(|interval| interval.is_live_at(call_idx))
+                    .map(|interval| interval.vreg)
+                    .collect();
+                if !live_across.is_empty() {
+                    crossings.push((call_idx, inst_id, live_across));
+                }
+            }
+        }
+        crossings
+    }
+
+    #[test]
+    fn find_call_crossings_matches_per_call_scan() {
+        let mut state = 0x2b7e_1516_28ae_d2a6u64;
+        let mut next = move |limit: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % limit
+        };
+        let mut crossings_seen = 0usize;
+        let mut discriminating = 0usize;
+        for case in 0..300 {
+            let inst_count = 1 + next(120) as usize;
+            let insts: Vec<MachInst> = (0..inst_count)
+                .map(|_| MachInst {
+                    opcode: 1,
+                    defs: vec![],
+                    uses: vec![],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: if next(3) == 0 {
+                        InstFlags::IS_CALL
+                    } else {
+                        InstFlags::default()
+                    },
+                    tied_operands: vec![],
+                })
+                .collect();
+            // Two blocks, the second listed first in `blocks`, so report order
+            // (block list order) differs from numbering order.
+            let split = inst_count / 2;
+            let first: Vec<InstId> = (0..split as u32).map(InstId).collect();
+            let second: Vec<InstId> = (split as u32..inst_count as u32).map(InstId).collect();
+            let block = |insts: Vec<InstId>| MachBlock {
+                insts,
+                preds: Vec::new(),
+                succs: Vec::new(),
+                loop_depth: 0,
+            };
+            let func = MachFunction {
+                name: "crossings".into(),
+                insts,
+                blocks: vec![block(second), block(first)],
+                block_order: vec![BlockId(1), BlockId(0)],
+                entry_block: BlockId(1),
+                next_vreg: 0,
+                next_stack_slot: 0,
+                stack_slots: BTreeMap::new(),
+            };
+            // Leave some instructions unnumbered.
+            let numbering: BTreeMap<InstId, u32> = (0..inst_count as u32)
+                .filter(|_| next(10) != 0)
+                .map(|i| (InstId(i), i))
+                .collect();
+
+            let mut intervals: Vec<LiveInterval> = (0..next(40) as u32)
+                .map(|id| {
+                    let mut interval = LiveInterval::new(vreg(id));
+                    for _ in 0..1 + next(4) {
+                        let start = next(inst_count as u64 + 4) as u32;
+                        interval.add_range(start, start + 1 + next(30) as u32);
+                    }
+                    interval
+                })
+                .collect();
+            if case % 5 == 0 {
+                // Ranges outside the invariant take the literal fallback.
+                let mut unordered = LiveInterval::new(vreg(1000));
+                unordered.ranges = vec![LiveRange::new(40, 60), LiveRange::new(2, 30)];
+                intervals.push(unordered);
+            }
+
+            let (fast, units) = crate::scan_work::measure(|| {
+                find_call_crossings_in(&func, &intervals, &numbering)
+                    .into_iter()
+                    .map(|c| (c.call_inst_idx, c.call_inst_id, c.live_across))
+                    .collect::<Vec<(u32, InstId, Vec<VReg>)>>()
+            });
+            let reference = find_call_crossings_reference(&func, &intervals, &numbering);
+            assert_eq!(fast, reference, "call crossings differ in case {case}");
+            crossings_seen += fast.len();
+
+            // Work accounting: an ordered interval costs one search per range,
+            // one unit per call it is live across and at most one past each
+            // range's end; an unordered one keeps the per-call `is_live_at`.
+            // The per-call scan charges `intervals * calls`, so every case
+            // where that exceeds the bound tells the two apart.
+            let calls = numbering
+                .keys()
+                .filter(|id| func.insts[id.0 as usize].flags.is_call())
+                .count() as u64;
+            let pushes: u64 = fast.iter().map(|(_, _, live)| live.len() as u64).sum();
+            let bound: u64 = pushes
+                + intervals
+                    .iter()
+                    .map(|interval| {
+                        if interval.has_ordered_ranges() {
+                            2 * interval.ranges.len() as u64
+                        } else {
+                            calls
+                        }
+                    })
+                    .sum::<u64>();
+            assert!(
+                units <= bound,
+                "case {case}: {units} units charged, range walk bound {bound}"
+            );
+            if intervals.len() as u64 * calls > bound {
+                discriminating += 1;
+            }
+        }
+        assert!(
+            crossings_seen > 1000,
+            "crossings exercised: {crossings_seen}"
+        );
+        assert!(
+            discriminating > 100,
+            "cases where the per-call scan exceeds the bound: {discriminating}"
+        );
+    }
+
+    /// One straight-line block of `c` calls, each value live across one call:
+    /// the range walk visits `O(c)` (interval, call) pairs. The per-call scan
+    /// asks every interval about every call, `O(c^2)`, and fails this bound
+    /// (see `crate::scan_work`).
+    #[test]
+    fn find_call_crossings_cost_grows_linearly() {
+        crate::scan_work::assert_near_linear("find_call_crossings_in", 128, |calls| {
+            let insts: Vec<MachInst> = (0..2 * calls)
+                .map(|idx| MachInst {
+                    opcode: 1,
+                    defs: vec![],
+                    uses: vec![],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    flags: if idx % 2 == 1 {
+                        InstFlags::IS_CALL
+                    } else {
+                        InstFlags::default()
+                    },
+                    tied_operands: vec![],
+                })
+                .collect();
+            let func = MachFunction {
+                name: "call_block".into(),
+                blocks: vec![MachBlock {
+                    insts: (0..insts.len() as u32).map(InstId).collect(),
+                    preds: Vec::new(),
+                    succs: Vec::new(),
+                    loop_depth: 0,
+                }],
+                insts,
+                block_order: vec![BlockId(0)],
+                entry_block: BlockId(0),
+                next_vreg: 0,
+                next_stack_slot: 0,
+                stack_slots: BTreeMap::new(),
+            };
+            let numbering: BTreeMap<InstId, u32> =
+                (0..2 * calls as u32).map(|i| (InstId(i), i)).collect();
+            // Value `i` is defined before call `i` and dies before call `i + 1`.
+            let intervals: Vec<LiveInterval> = (0..calls as u32)
+                .map(|i| {
+                    let mut interval = LiveInterval::new(vreg(i));
+                    interval.add_range(2 * i, 2 * i + 3);
+                    interval
+                })
+                .collect();
+            let (crossings, units) =
+                crate::scan_work::measure(|| find_call_crossings_in(&func, &intervals, &numbering));
+            assert_eq!(crossings.len(), calls);
+            units
+        });
     }
 }

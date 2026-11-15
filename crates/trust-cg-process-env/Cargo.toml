@@ -17,5 +17,9 @@ homepage.workspace = true
 [lints]
 workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[dependencies]
+sha2 = "0.10"
+
+# `private_fs` (Unix) and the macOS memory probe in `resource_budget`.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

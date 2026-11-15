@@ -4,11 +4,6 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use std::path::PathBuf;
-// Only the `#[cfg(unix)]` fake-lean5 script helper reads the clock (to name a
-// temp dir); on non-unix hosts these tests are gated out, so keep the import
-// unix-only to stay clean under `-D warnings`.
-#[cfg(unix)]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -255,16 +250,25 @@ fn read_request_with_fake_lean5(
     request
 }
 
+/// First argument every fake Lean5 answers by exiting 0 before its body runs,
+/// so [`fake_lean5_script`] can start it once without running its body.
+#[cfg(unix)]
+const WARM_ARGUMENT: &str = "--trust-cg-fixture-warm";
+
 #[cfg(unix)]
 fn fake_lean5_script(name: &str, body: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("trust-cg-fake-lean5-{name}-{nanos}"));
-    std::fs::create_dir_all(&dir).expect("fake Lean5 temp dir should be created");
+    // Removed when this test process exits (the request names the script).
+    let dir = process_scratch::process_scoped(&format!("trust-cg-fake-lean5-{name}-"));
     let path = dir.join("lean5");
-    std::fs::write(&path, body).expect("fake Lean5 script should be written");
+    let (interpreter, rest) = body
+        .split_once('\n')
+        .filter(|(interpreter, _)| interpreter.starts_with("#!"))
+        .expect("a fake Lean5 starts with its #! line");
+    std::fs::write(
+        &path,
+        format!("{interpreter}\ntest \"$1\" = {WARM_ARGUMENT} && exit 0\n{rest}"),
+    )
+    .expect("fake Lean5 script should be written");
     let mut perms = std::fs::metadata(&path)
         .expect("fake Lean5 script metadata should exist")
         .permissions();
@@ -286,19 +290,46 @@ fn fake_lean5_script(name: &str, body: &str) -> PathBuf {
     // passing 6 of 6 under `--test-threads=1`, surfacing as an unrelated-looking
     // assertion — `lean5-unavailable` instead of the fake's version string,
     // because a spawn failure falls back to the default version metadata.
-    // `spawn` reports the exec failure itself, so the probe never has to let the
-    // script RUN — two of these fixtures `sleep 2` to exercise the timeout path,
-    // and waiting on them here would add that to every run.
+    //
+    // The probe is also the fake's FIRST start, and it runs to its exit. macOS
+    // assesses a newly created executable on its first `exec`, inside the
+    // child, after `spawn` has already returned (0.17-6.0 s for a fresh script
+    // at load average 32-38, 2026-09-30; 4 ms for every later start). A probe
+    // killed right after `spawn` left all of that to the version probe of the
+    // request under test, inside its 5-10 s limit. The warm-up argument makes
+    // the fake exit before its body runs, so no fixture's `sleep` is waited on
+    // here.
     for attempt in 0..100 {
-        match std::process::Command::new(&path)
-            .arg("--version")
+        let mut command = std::process::Command::new(&path);
+        command
+            .arg(WARM_ARGUMENT)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
+            .stderr(std::process::Stdio::null());
+        match command.spawn() {
             Ok(mut child) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // Stopped after 120 s, a hang guard (the product's first-start
+                // allowance): the fake's own deadline then pays the rest.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while child
+                    .try_wait()
+                    .expect("poll the fake Lean5 warm-up start")
+                    .is_none()
+                {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        eprintln!("the warm-up start of {path:?} was stopped after 120 s");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let status = child
+                    .wait()
+                    .expect("the fake Lean5 warm-up start is reaped");
+                assert!(
+                    status.success() || std::time::Instant::now() >= deadline,
+                    "warming {path:?} failed: {status}"
+                );
                 break;
             }
             Err(err) if err.raw_os_error() == Some(ETXTBSY) && attempt < 99 => {
@@ -310,10 +341,8 @@ fn fake_lean5_script(name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// `ETXTBSY` is 26 on Linux and macOS alike; spelled out so the test needs no
-/// libc dependency.
 #[cfg(unix)]
-const ETXTBSY: i32 = 26;
+const ETXTBSY: i32 = libc::ETXTBSY;
 
 #[test]
 fn placeholder_transport_fixture_verifies_and_records_replay_metadata() {
@@ -763,6 +792,101 @@ exit 2
     assert!(!report.result.is_verified());
 }
 
+#[cfg(unix)]
+#[test]
+fn semantic_mode_rejects_late_sorry_after_a_successful_direct_child_exit() {
+    let fake = fake_lean5_script(
+        "late-sorry",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "Lean5 fake 1.0.0"
+  exit 0
+fi
+if [ "$1" = "check" ]; then
+  (sleep 0.1; echo "warning: declaration uses explicit sorry" >&2) &
+  exit 0
+fi
+exit 2
+"#,
+    );
+    let request = read_request_with_fake_lean5("lean5_pass_checker_semantic_request.json", &fake);
+    let report = check_lean5_pass_certificate(&request);
+    assert!(
+        matches!(report.result, Lean5CheckerResult::Failed { ref reason }
+        if reason.contains("explicit sorry trust debt")),
+        "{:?}",
+        report.result
+    );
+    assert!(report.lean5.observed);
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_mode_rejects_unclosed_output_instead_of_accepting_exit_zero() {
+    let fake = fake_lean5_script(
+        "unclosed-output",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "Lean5 fake 1.0.0"
+  exit 0
+fi
+if [ "$1" = "check" ]; then
+  (sleep 10; echo "late child output") &
+  exit 0
+fi
+exit 2
+"#,
+    );
+    let mut request =
+        read_request_with_fake_lean5("lean5_pass_checker_semantic_request.json", &fake);
+    // This public entry point runs a version probe first using the same limit.
+    // Give discovery headroom under parallel test load while leaving the
+    // inherited writer alive beyond the replay deadline. The low-level capture
+    // controls separately exercise the one-second inherited-pipe deadline.
+    request.policy.timeout_ms = 5000;
+    // Pin the banner so failure during discovery cannot masquerade as the
+    // intended semantic replay timeout with unobserved default metadata.
+    request.policy.expected_lean_version = Some("Lean5 fake 1.0.0".into());
+    let start = std::time::Instant::now();
+    let report = check_lean5_pass_certificate(&request);
+    assert_eq!(
+        report.result,
+        Lean5CheckerResult::Timeout { timeout_ms: 5000 },
+        "{report:?}"
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(8));
+    assert!(report.lean5.observed);
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_mode_checks_sorry_at_the_end_of_large_stderr() {
+    let fake = fake_lean5_script(
+        "large-sorry",
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "Lean5 fake 1.0.0"
+  exit 0
+fi
+if [ "$1" = "check" ]; then
+  dd if=/dev/zero bs=131072 count=1 1>&2 2>/dev/null
+  echo "warning: declaration uses explicit sorry" >&2
+  exit 0
+fi
+exit 2
+"#,
+    );
+    let request = read_request_with_fake_lean5("lean5_pass_checker_semantic_request.json", &fake);
+    let report = check_lean5_pass_certificate(&request);
+    assert!(
+        matches!(report.result, Lean5CheckerResult::Failed { ref reason }
+        if reason.contains("explicit sorry trust debt")),
+        "{:?}",
+        report.result
+    );
+    assert!(report.lean5.observed);
+}
+
 #[test]
 fn gamma_vnncomp_demo_available_pass_entries_verify() {
     for (idx, label) in [(0u64, "const-fold"), (1, "dce"), (2, "bn-relu")] {
@@ -1010,3 +1134,6 @@ fn certified_pass_chain_rejects_tampered_verified_report_summary() {
         }
     );
 }
+
+#[path = "support/process_scratch.rs"]
+mod process_scratch;

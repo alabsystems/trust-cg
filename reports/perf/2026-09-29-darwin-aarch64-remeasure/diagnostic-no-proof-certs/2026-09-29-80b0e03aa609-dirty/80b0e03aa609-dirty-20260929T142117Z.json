@@ -1,0 +1,3160 @@
+{
+ "schema": "trust-cg-bench-v1",
+ "provenance": {
+  "schema": "trust-cg-bench-v1",
+  "harness": "benchmarks/beat-llvm/run.py",
+  "timestamp_utc": "2026-09-29T14:17:09+00:00",
+  "git_sha": "80b0e03aa6091fdf517fb3e74940fb3cec799ca3",
+  "git_dirty": true,
+  "git_diff_sha256": "991541c5c8e17634383f6510715578b1f83c243adbf585c810f961c488e977cf",
+  "untracked_count": 1,
+  "dylib_path": "$HOME/trust-cg/.claude/worktrees/agent-workflow/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib",
+  "dylib_sha256": "b638dc7adfdc82cb605e8bd822c41b75c12da0978231963aaeeeec5e3240d318",
+  "dylib_mtime": "2026-09-29T09:18:53+00:00",
+  "rustc_version": "rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)",
+  "rustc_path": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc",
+  "driver": {
+   "schema": "trust-cg-trust-toolchain-v1",
+   "selection": "explicit-driver",
+   "requested_driver": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc",
+   "compiler": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc",
+   "targo": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo",
+   "sysroot": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192",
+   "host": "aarch64-apple-darwin",
+   "commit": "321aaeda75478038420d97830f14724c33c8dc39",
+   "release": "1.99.0-dev",
+   "version": "rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)",
+   "targo_version": "targo 1.99.0-dev (321aaeda7 2026-09-17) (targo 0.1.0)",
+   "lane": "unverified",
+   "lane_label": "diagnostic: explicit unverified Trust lane (-Ztrust-verify=off for direct compiles, targo --unverified for builds); no Trust-verified compilation claim",
+   "compiler_flags": [
+    "-Ztrust-verify=off"
+   ],
+   "bridge_pin": {
+    "path": "$HOME/trust-cg/.claude/worktrees/agent-workflow/crates/rustc-codegen-trust-cg/rust-toolchain.toml",
+    "channel": "trust",
+    "sha256": "3261c2a5c636aaa1f7d68aa4bc7d510f7a9677a2cd21da76e4b65caa77ba4780"
+   }
+  },
+  "target": "aarch64-apple-darwin",
+  "target_selection": "driver host",
+  "host_arch": "arm64",
+  "host_model": "Apple M4 Max",
+  "host_model_source": "sysctl machdep.cpu.brand_string",
+  "host_name": "m110-macbook-M4-Max-48GB-1TB.local",
+  "machine_model": "Mac16,5",
+  "legacy_host_model": "Mac16,5",
+  "cpu_features": [
+   "arm.AdvSIMD",
+   "arm.AdvSIMD_HPFPCvt",
+   "arm.FEAT_AES",
+   "arm.FEAT_AFP",
+   "arm.FEAT_BF16",
+   "arm.FEAT_BTI",
+   "arm.FEAT_CRC32",
+   "arm.FEAT_CSV2",
+   "arm.FEAT_CSV3",
+   "arm.FEAT_DIT",
+   "arm.FEAT_DPB",
+   "arm.FEAT_DPB2",
+   "arm.FEAT_DotProd",
+   "arm.FEAT_ECV",
+   "arm.FEAT_FCMA",
+   "arm.FEAT_FHM",
+   "arm.FEAT_FP16",
+   "arm.FEAT_FPAC",
+   "arm.FEAT_FPACCOMBINE",
+   "arm.FEAT_FRINTTS",
+   "arm.FEAT_FlagM",
+   "arm.FEAT_FlagM2",
+   "arm.FEAT_I8MM",
+   "arm.FEAT_JSCVT",
+   "arm.FEAT_LRCPC",
+   "arm.FEAT_LRCPC2",
+   "arm.FEAT_LSE",
+   "arm.FEAT_LSE2",
+   "arm.FEAT_PACIMP",
+   "arm.FEAT_PAuth",
+   "arm.FEAT_PAuth2",
+   "arm.FEAT_PMULL",
+   "arm.FEAT_RDM",
+   "arm.FEAT_RPRES",
+   "arm.FEAT_SB",
+   "arm.FEAT_SHA1",
+   "arm.FEAT_SHA256",
+   "arm.FEAT_SHA3",
+   "arm.FEAT_SHA512",
+   "arm.FEAT_SME",
+   "arm.FEAT_SME2",
+   "arm.FEAT_SME_F64F64",
+   "arm.FEAT_SME_I16I64",
+   "arm.FEAT_WFxT",
+   "arm.FP_SyncExceptions",
+   "arm.SME_B16F32",
+   "arm.SME_BI32I32",
+   "arm.SME_F16F32",
+   "arm.SME_F32F32",
+   "arm.SME_I16I32",
+   "arm.SME_I8I32",
+   "arm64",
+   "armv8_1_atomics",
+   "armv8_2_fhm",
+   "armv8_2_sha3",
+   "armv8_2_sha512",
+   "armv8_3_compnum",
+   "armv8_crc32",
+   "armv8_gpi",
+   "floatingpoint",
+   "neon",
+   "neon_fp16",
+   "neon_hpfp",
+   "ucnormal_mem"
+  ],
+  "cpu_features_source": "sysctl hw.optional / machdep.cpu",
+  "cpu_features_sha256": "8109e26100af753c673ddc26c96e39495d05c26d9da560724815fba35df70f5c",
+  "cpu_policy": {
+   "target_cpu": "default",
+   "target_feature": "default",
+   "lane_parity": false,
+   "bridge_extra_flags": [
+    "-Zcodegen-backend=$HOME/trust-cg/.claude/worktrees/agent-workflow/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib",
+    "-Ztrust-ir-cg-args=no-proof-certs"
+   ],
+   "llvm_only_flags": [],
+   "source": "derived from each lane's compile command",
+   "statement": "LANE COMMANDS DIFFER beyond -Zcodegen-backend (see the flag lists). No -C target-cpu / -C target-feature is passed: the LLVM lane compiles for the target's default CPU (llvm_default_target_cpu); the trust-cg lane selects instructions by its own per-target ISA profile (AArch64: AArch64IsaProfile::for_aot_target in crates/trust-cg-codegen/src/target.rs).",
+   "llvm_default_target_cpu": null,
+   "llvm_default_target_features": [
+    "aes",
+    "crc",
+    "dit",
+    "dotprod",
+    "dpb",
+    "dpb2",
+    "fcma",
+    "fhm",
+    "flagm",
+    "flagm2",
+    "fp16",
+    "frintts",
+    "jsconv",
+    "lor",
+    "lse",
+    "lse2",
+    "neon",
+    "paca",
+    "pacg",
+    "pan",
+    "pmuv3",
+    "ras",
+    "rcpc",
+    "rcpc2",
+    "rdm",
+    "sb",
+    "sha2",
+    "sha3",
+    "ssbs",
+    "v8.1a",
+    "v8.2a",
+    "v8.3a",
+    "v8.4a",
+    "vh"
+   ]
+  },
+  "affinity": {
+   "policy": "none",
+   "core": null,
+   "method": null,
+   "selection": null,
+   "cpu_capacity": null,
+   "heterogeneous": true,
+   "topology_source": "sysctl hw.nperflevels 2"
+  },
+  "rss_sampling": {
+   "method": "getrusage(RUSAGE_CHILDREN).ru_maxrss read by a single-child Python wrapper (benchmarks/beat-llvm/peak_rss.py) after the child is reaped, normalised to bytes; the largest single process in the measured tree, not a sum",
+   "ru_maxrss_unit": "bytes",
+   "reported_unit": "bytes",
+   "peak_rss_bytes": "the compiled program: one dedicated run per lane, outside the timed loop",
+   "compile_peak_rss_bytes": "the compiler: the largest single process of the rustc invocation (rustc or its cc/ld link step), one dedicated compile per lane, outside the timed loop",
+   "gate": "contract/gates.json version 2: R1 (fails if any program's bridge reading exceeds max(its LLVM -O3 reading, the floor) by more than 5%; passes only when every program's comparison is resolved; otherwise unmeasured) and R2 (compiler peak-RSS geomean <= 1.00x LLVM -O2, no floor-bound compiler reading); the program-RSS geomean is reported, not gated",
+   "floor_rule": "every reading is at least sampler_floor_bytes and one above it is the process's peak; a comparison is resolved only when both readings are above 2x sampler_floor_bytes",
+   "cross_check": {
+    "command": "python -c 'x = b\"\\x01\" * (64 << 20)'",
+    "allocation_bytes": 67108864,
+    "rusage_bytes": 82427904,
+    "rusage_covers_allocation": true,
+    "time_wrapper": "/usr/bin/time -l",
+    "time_wrapper_present": true,
+    "time_wrapper_bytes": 82395136,
+    "relative_difference": 0.0004,
+    "agree": true,
+    "floor_command": "/usr/bin/true",
+    "sampler_floor_bytes": 1261568,
+    "time_wrapper_floor_bytes": 1261568
+   }
+  },
+  "ncpu": 16,
+  "loadavg_before": 3.29,
+  "loadavg_after": 2.99,
+  "load_threshold": 8.0,
+  "load_threshold_overridden": false,
+  "dylib_build_command": "cd crates/rustc-codegen-trust-cg && CARGO_TARGET_DIR=target-bridge RUSTC=$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo --unverified build --release",
+  "cc_version": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "cc_path": "/usr/bin/cc",
+  "linker_version": "@(#)PROGRAM:ld PROJECT:ld-27037.1",
+  "os": "Darwin 25.6.0 arm64",
+  "aggregation": "median-of-N per program (compile N=3, run N=5 after 1 warmup); raw samples retained per program as times_s",
+  "corpus_manifest_sha256": "25c1bd79b6efb728e0d307e60b22f283d636e1decc6f2bf86d9dd6232e368a40",
+  "dylib_stale_override": false,
+  "quiet": true,
+  "load_status": "QUIET",
+  "runaway_processes": [],
+  "tcg_env": {},
+  "bridge_cg_args": [
+   "no-proof-certs"
+  ],
+  "proof_checker_degraded": [],
+  "proof_checker": {
+   "tool": "clean",
+   "candidates": [
+    {
+     "path": "$HOME/Library/Application Support/aterm/pkg/store/clean/8606/bin/clean",
+     "route": "aterm-packaged",
+     "sha256": "9c594e838ff7e73815977c2d675238828f82417e77986abfe38d75b8ab060e16",
+     "runs": true,
+     "probe": "--version",
+     "returncode": 0,
+     "version": "clean 0.9.0"
+    },
+    {
+     "path": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/clean",
+     "route": "toolchain-sysroot",
+     "sha256": "53937293d4bc49d6ccd4aa57b7739f3a02b27aa478f1c6e295f2ab9f0394e822",
+     "runs": true,
+     "probe": "--version",
+     "returncode": 0,
+     "version": "clean 0.9.0"
+    }
+   ],
+   "order": "aterm-packaged (PATH <prefix>/bin), then the driver's sysroot bin/clean"
+  },
+  "cache": {
+   "mode": "warm",
+   "dir": "$HOME/.cache/trust-cg/proof-cache",
+   "verdict_count": 0,
+   "fingerprint_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "cert_store": {
+    "dir": "$HOME/.cache/trust-cg/alethe-certs",
+    "cert_count": 1410,
+    "fingerprint_sha256": "c1b9372ce2e004c73e931d5e12e39bd477c60476968c87e786d91cd1b205dd6f",
+    "cert_count_after": 1410
+   },
+   "verdict_count_after": 0
+  },
+  "n_compile": 3,
+  "n_run": 5,
+  "warmup_runs": 1,
+  "missing_required_provenance": [],
+  "provenance_complete": true
+ },
+ "headline_eligible": false,
+ "ineligible_reasons": [
+  "source tree has tracked edits",
+  "non-default backend knobs ['no-proof-certs'] (diagnostic lane)"
+ ],
+ "programs": {
+  "b1_mispredict": {
+   "source": "benchmarks/beat-llvm/progs/b1_mispredict.rs",
+   "category": "branch",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.299,
+      0.297,
+      0.295
+     ],
+     "median_s": 0.297,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.307,
+      0.307,
+      0.308
+     ],
+     "median_s": 0.307,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.306,
+      0.314,
+      0.314
+     ],
+     "median_s": 0.314,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.396,
+      0.395,
+      0.422
+     ],
+     "median_s": 0.396,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.549,
+      1.309,
+      1.174
+     ],
+     "median_s": 1.309,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 44,
+     "nondet_exit": null,
+     "times_s": [
+      0.196126,
+      0.196501,
+      0.196664,
+      0.195982,
+      0.196924
+     ],
+     "median_s": 0.196501,
+     "rel_spread": 0.0048
+    },
+    "bridge": {
+     "exit": 44,
+     "nondet_exit": null,
+     "times_s": [
+      0.199831,
+      0.200729,
+      0.199405,
+      0.199841,
+      0.199807
+     ],
+     "median_s": 0.199831,
+     "rel_spread": 0.0066
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463752,
+    "bridge": 465080
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 143425536,
+    "llvm_o3": 143785984,
+    "bridge": 172556288
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 44,
+      "wall_s": 0.241822
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 44,
+      "wall_s": 0.238553
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 143425536,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.352031
+     },
+     "llvm_o3": {
+      "bytes": 143785984,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.350077
+     },
+     "bridge": {
+      "bytes": 172556288,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.45605
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 1.0169464786438747,
+    "compile_warm_vs_llvm_o0": 1.3333333333333335,
+    "compile_warm_vs_llvm_o2": 1.2899022801302933,
+    "compile_warm_vs_llvm_o3": 1.2611464968152868,
+    "compile_cold_vs_llvm_o0": 4.407407407407407,
+    "compile_cold_vs_llvm_o2": 4.263843648208469,
+    "compile_cold_vs_llvm_o3": 4.1687898089171975,
+    "size_vs_llvm_o3": 1.002863599510083,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.2031071510166782,
+    "compile_rss_vs_llvm_o3": 1.200091157702826
+   }
+  },
+  "h1_vec_push_sum": {
+   "source": "benchmarks/beat-llvm/progs/h1_vec_push_sum.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.304,
+      0.309,
+      0.319
+     ],
+     "median_s": 0.309,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.329,
+      0.329,
+      0.333
+     ],
+     "median_s": 0.329,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.323,
+      0.321,
+      0.326
+     ],
+     "median_s": 0.323,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.391,
+      0.407,
+      0.44
+     ],
+     "median_s": 0.407,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.321,
+      1.464,
+      1.217
+     ],
+     "median_s": 1.321,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 60,
+     "nondet_exit": null,
+     "times_s": [
+      0.009781,
+      0.01004,
+      0.009833,
+      0.009719,
+      0.009512
+     ],
+     "median_s": 0.009781,
+     "rel_spread": 0.054
+    },
+    "bridge": {
+     "exit": 60,
+     "nondet_exit": null,
+     "times_s": [
+      0.009906,
+      0.009986,
+      0.010172,
+      0.009674,
+      0.009744
+     ],
+     "median_s": 0.009906,
+     "rel_spread": 0.0503
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 464104,
+    "bridge": 465048
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 6193152,
+    "bridge": 6193152
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 148029440,
+    "llvm_o3": 148094976,
+    "bridge": 176242688
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 6193152,
+      "status": "ok",
+      "returncode": 60,
+      "wall_s": 0.019947
+     },
+     "bridge": {
+      "bytes": 6193152,
+      "status": "ok",
+      "returncode": 60,
+      "wall_s": 0.019785
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 148029440,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.344717
+     },
+     "llvm_o3": {
+      "bytes": 148094976,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.349582
+     },
+     "bridge": {
+      "bytes": 176242688,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.457983
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 1.0127798793579388,
+    "compile_warm_vs_llvm_o0": 1.3171521035598706,
+    "compile_warm_vs_llvm_o2": 1.2370820668693008,
+    "compile_warm_vs_llvm_o3": 1.2600619195046439,
+    "compile_cold_vs_llvm_o0": 4.275080906148867,
+    "compile_cold_vs_llvm_o2": 4.015197568389057,
+    "compile_cold_vs_llvm_o3": 4.089783281733746,
+    "size_vs_llvm_o3": 1.0020340268560495,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1905921416712784,
+    "compile_rss_vs_llvm_o3": 1.190065272707158
+   }
+  },
+  "h2_vec_grow": {
+   "source": "benchmarks/beat-llvm/progs/h2_vec_grow.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.32,
+      0.317,
+      0.319
+     ],
+     "median_s": 0.319,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.333,
+      0.335,
+      0.33
+     ],
+     "median_s": 0.333,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.335,
+      0.329,
+      0.326
+     ],
+     "median_s": 0.329,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.439,
+      0.401,
+      0.39
+     ],
+     "median_s": 0.401,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.188,
+      1.273,
+      1.224
+     ],
+     "median_s": 1.224,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 66,
+     "nondet_exit": null,
+     "times_s": [
+      0.01484,
+      0.014536,
+      0.014848,
+      0.01423,
+      0.014374
+     ],
+     "median_s": 0.014536,
+     "rel_spread": 0.0425
+    },
+    "bridge": {
+     "exit": 66,
+     "nondet_exit": null,
+     "times_s": [
+      0.014401,
+      0.014501,
+      0.014552,
+      0.014323,
+      0.014476
+     ],
+     "median_s": 0.014476,
+     "rel_spread": 0.0158
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 464064,
+    "bridge": 464960
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 51789824,
+    "bridge": 51789824
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 148045824,
+    "llvm_o3": 147963904,
+    "bridge": 177127424
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 51789824,
+      "status": "ok",
+      "returncode": 66,
+      "wall_s": 0.019742
+     },
+     "bridge": {
+      "bytes": 51789824,
+      "status": "ok",
+      "returncode": 66,
+      "wall_s": 0.01974
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 148045824,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.351846
+     },
+     "llvm_o3": {
+      "bytes": 147963904,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.347789
+     },
+     "bridge": {
+      "bytes": 177127424,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.458581
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9958723170060538,
+    "compile_warm_vs_llvm_o0": 1.2570532915360502,
+    "compile_warm_vs_llvm_o2": 1.2042042042042043,
+    "compile_warm_vs_llvm_o3": 1.2188449848024316,
+    "compile_cold_vs_llvm_o0": 3.8369905956112853,
+    "compile_cold_vs_llvm_o2": 3.6756756756756754,
+    "compile_cold_vs_llvm_o3": 3.7203647416413372,
+    "size_vs_llvm_o3": 1.0019307681699077,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1964364763169544,
+    "compile_rss_vs_llvm_o3": 1.1970988816299413
+   }
+  },
+  "h3_box_leak": {
+   "source": "benchmarks/beat-llvm/progs/h3_box_leak.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.319,
+      0.316,
+      0.318
+     ],
+     "median_s": 0.318,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.331,
+      0.337,
+      0.339
+     ],
+     "median_s": 0.337,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.333,
+      0.334,
+      0.335
+     ],
+     "median_s": 0.334,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.41,
+      0.412,
+      0.419
+     ],
+     "median_s": 0.412,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.248,
+      1.294,
+      1.275
+     ],
+     "median_s": 1.275,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 76,
+     "nondet_exit": null,
+     "times_s": [
+      0.01931,
+      0.019289,
+      0.019647,
+      0.019296,
+      0.019514
+     ],
+     "median_s": 0.01931,
+     "rel_spread": 0.0185
+    },
+    "bridge": {
+     "exit": 76,
+     "nondet_exit": null,
+     "times_s": [
+      0.021079,
+      0.02338,
+      0.021495,
+      0.022322,
+      0.020943
+     ],
+     "median_s": 0.021495,
+     "rel_spread": 0.1134
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 464080,
+    "bridge": 464960
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 39895040,
+    "bridge": 39895040
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 148537344,
+    "llvm_o3": 148422656,
+    "bridge": 176734208
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 39895040,
+      "status": "ok",
+      "returncode": 76,
+      "wall_s": 0.019876
+     },
+     "bridge": {
+      "bytes": 39895040,
+      "status": "ok",
+      "returncode": 76,
+      "wall_s": 0.039843
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 148537344,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.34562
+     },
+     "llvm_o3": {
+      "bytes": 148422656,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.348612
+     },
+     "bridge": {
+      "bytes": 176734208,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.460803
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 1.11315380631797,
+    "compile_warm_vs_llvm_o0": 1.2955974842767295,
+    "compile_warm_vs_llvm_o2": 1.2225519287833826,
+    "compile_warm_vs_llvm_o3": 1.2335329341317365,
+    "compile_cold_vs_llvm_o0": 4.009433962264151,
+    "compile_cold_vs_llvm_o2": 3.783382789317507,
+    "compile_cold_vs_llvm_o3": 3.8173652694610776,
+    "size_vs_llvm_o3": 1.0018962247888294,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1898301345687183,
+    "compile_rss_vs_llvm_o3": 1.1907495308532952
+   }
+  },
+  "h4_vec_dropper": {
+   "source": "benchmarks/beat-llvm/progs/h4_vec_dropper.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.316,
+      0.314
+     ],
+     "median_s": 0.314,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.335,
+      0.337,
+      0.33
+     ],
+     "median_s": 0.335,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.328,
+      0.375,
+      0.43
+     ],
+     "median_s": 0.375,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      1.108,
+      0.452,
+      0.466
+     ],
+     "median_s": 0.466,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.711,
+      1.851,
+      1.817
+     ],
+     "median_s": 1.817,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 68,
+     "nondet_exit": null,
+     "times_s": [
+      0.017688,
+      0.018186,
+      0.017837,
+      0.017748,
+      0.018146
+     ],
+     "median_s": 0.017837,
+     "rel_spread": 0.0279
+    },
+    "bridge": {
+     "exit": 68,
+     "nondet_exit": null,
+     "times_s": [
+      0.015063,
+      0.015338,
+      0.015199,
+      0.015119,
+      0.015012
+     ],
+     "median_s": 0.015119,
+     "rel_spread": 0.0216
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 464104,
+    "bridge": 465032
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1720320,
+    "bridge": 1736704
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 148914176,
+    "llvm_o3": 148406272,
+    "bridge": 176898048
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1720320,
+      "status": "ok",
+      "returncode": 68,
+      "wall_s": 0.018604
+     },
+     "bridge": {
+      "bytes": 1736704,
+      "status": "ok",
+      "returncode": 68,
+      "wall_s": 0.019974
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 148914176,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.350397
+     },
+     "llvm_o3": {
+      "bytes": 148406272,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.347953
+     },
+     "bridge": {
+      "bytes": 176898048,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.450423
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.8476201154902732,
+    "compile_warm_vs_llvm_o0": 1.4840764331210192,
+    "compile_warm_vs_llvm_o2": 1.391044776119403,
+    "compile_warm_vs_llvm_o3": 1.2426666666666668,
+    "compile_cold_vs_llvm_o0": 5.786624203821656,
+    "compile_cold_vs_llvm_o2": 5.423880597014925,
+    "compile_cold_vs_llvm_o3": 4.8453333333333335,
+    "size_vs_llvm_o3": 1.001999551824591,
+    "rss_vs_llvm_o3": 1.0095238095238095,
+    "compile_rss_vs_llvm_o2": 1.1879194630872483,
+    "compile_rss_vs_llvm_o3": 1.191984985648046
+   }
+  },
+  "m1_call_chain": {
+   "source": "benchmarks/beat-llvm/progs/m1_call_chain.rs",
+   "category": "multifn",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.31,
+      0.311
+     ],
+     "median_s": 0.311,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.32,
+      0.318,
+      0.319
+     ],
+     "median_s": 0.319,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.321,
+      0.323,
+      0.325
+     ],
+     "median_s": 0.323,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.389,
+      0.379,
+      0.4
+     ],
+     "median_s": 0.389,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.255,
+      1.251,
+      1.189
+     ],
+     "median_s": 1.251,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 61,
+     "nondet_exit": null,
+     "times_s": [
+      0.101637,
+      0.101882,
+      0.101592,
+      0.101914,
+      0.101733
+     ],
+     "median_s": 0.101733,
+     "rel_spread": 0.0032
+    },
+    "bridge": {
+     "exit": 61,
+     "nondet_exit": null,
+     "times_s": [
+      0.09568,
+      0.09566,
+      0.09528,
+      0.094964,
+      0.095022
+     ],
+     "median_s": 0.09528,
+     "rel_spread": 0.0075
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463736,
+    "bridge": 464984
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1540096
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 142245888,
+    "llvm_o3": 142950400,
+    "bridge": 171098112
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 61,
+      "wall_s": 0.131485
+     },
+     "bridge": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 61,
+      "wall_s": 0.130532
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 142245888,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.3436
+     },
+     "llvm_o3": {
+      "bytes": 142950400,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.33793
+     },
+     "bridge": {
+      "bytes": 171098112,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.402354
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9365692548140722,
+    "compile_warm_vs_llvm_o0": 1.2508038585209003,
+    "compile_warm_vs_llvm_o2": 1.219435736677116,
+    "compile_warm_vs_llvm_o3": 1.2043343653250773,
+    "compile_cold_vs_llvm_o0": 4.022508038585209,
+    "compile_cold_vs_llvm_o2": 3.921630094043887,
+    "compile_cold_vs_llvm_o3": 3.8730650154798756,
+    "size_vs_llvm_o3": 1.0026911863646557,
+    "rss_vs_llvm_o3": 0.9894736842105263,
+    "compile_rss_vs_llvm_o2": 1.2028334485141672,
+    "compile_rss_vs_llvm_o3": 1.1969054441260745
+   }
+  },
+  "m2_call_heavy": {
+   "source": "benchmarks/beat-llvm/progs/m2_call_heavy.rs",
+   "category": "multifn",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.318,
+      0.316,
+      0.315
+     ],
+     "median_s": 0.316,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.315,
+      0.314,
+      0.315
+     ],
+     "median_s": 0.315,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.313,
+      0.313
+     ],
+     "median_s": 0.313,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.382,
+      0.391,
+      0.4
+     ],
+     "median_s": 0.391,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.188,
+      1.182,
+      1.207
+     ],
+     "median_s": 1.188,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 26,
+     "nondet_exit": null,
+     "times_s": [
+      0.066077,
+      0.066368,
+      0.066273,
+      0.066363,
+      0.065883
+     ],
+     "median_s": 0.066273,
+     "rel_spread": 0.0073
+    },
+    "bridge": {
+     "exit": 26,
+     "nondet_exit": null,
+     "times_s": [
+      0.064806,
+      0.064223,
+      0.064553,
+      0.064637,
+      0.064608
+     ],
+     "median_s": 0.064608,
+     "rel_spread": 0.009
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463864,
+    "bridge": 465016
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 142442496,
+    "llvm_o3": 142786560,
+    "bridge": 170295296
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 26,
+      "wall_s": 0.071051
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 26,
+      "wall_s": 0.071669
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 142442496,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.340484
+     },
+     "llvm_o3": {
+      "bytes": 142786560,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.332279
+     },
+     "bridge": {
+      "bytes": 170295296,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.391217
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9748766465981622,
+    "compile_warm_vs_llvm_o0": 1.2373417721518987,
+    "compile_warm_vs_llvm_o2": 1.2412698412698413,
+    "compile_warm_vs_llvm_o3": 1.2492012779552717,
+    "compile_cold_vs_llvm_o0": 3.7594936708860756,
+    "compile_cold_vs_llvm_o2": 3.7714285714285714,
+    "compile_cold_vs_llvm_o3": 3.7955271565495208,
+    "size_vs_llvm_o3": 1.002483486539158,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.195537152058891,
+    "compile_rss_vs_llvm_o3": 1.1926563396442915
+   }
+  },
+  "p1_xorshift": {
+   "source": "benchmarks/beat-llvm/progs/p1_xorshift.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.306,
+      0.306,
+      0.306
+     ],
+     "median_s": 0.306,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.316,
+      0.315,
+      0.316
+     ],
+     "median_s": 0.316,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.318,
+      0.317,
+      0.316
+     ],
+     "median_s": 0.317,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.375,
+      0.367,
+      0.373
+     ],
+     "median_s": 0.373,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.165,
+      1.139,
+      1.124
+     ],
+     "median_s": 1.139,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      13,
+      13,
+      13
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 41,
+     "nondet_exit": null,
+     "times_s": [
+      0.618456,
+      0.6134,
+      0.596082,
+      0.590763,
+      0.590611
+     ],
+     "median_s": 0.596082,
+     "rel_spread": 0.0467
+    },
+    "bridge": {
+     "exit": 41,
+     "nondet_exit": null,
+     "times_s": [
+      0.595141,
+      0.597175,
+      0.596295,
+      0.594537,
+      0.593123
+     ],
+     "median_s": 0.595141,
+     "rel_spread": 0.0068
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463728,
+    "bridge": 464960
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1540096,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 141901824,
+    "llvm_o3": 141852672,
+    "bridge": 170229760
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 41,
+      "wall_s": 0.600039
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 41,
+      "wall_s": 0.615638
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 141901824,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.346563
+     },
+     "llvm_o3": {
+      "bytes": 141852672,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.337615
+     },
+     "bridge": {
+      "bytes": 170229760,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.403615
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9984213581352902,
+    "compile_warm_vs_llvm_o0": 1.2189542483660132,
+    "compile_warm_vs_llvm_o2": 1.1803797468354431,
+    "compile_warm_vs_llvm_o3": 1.1766561514195584,
+    "compile_cold_vs_llvm_o0": 3.7222222222222223,
+    "compile_cold_vs_llvm_o2": 3.6044303797468356,
+    "compile_cold_vs_llvm_o3": 3.593059936908517,
+    "size_vs_llvm_o3": 1.0026567298071283,
+    "rss_vs_llvm_o3": 1.0106382978723405,
+    "compile_rss_vs_llvm_o2": 1.199630527652696,
+    "compile_rss_vs_llvm_o3": 1.2000462000462
+   }
+  },
+  "p2_collatz": {
+   "source": "benchmarks/beat-llvm/progs/p2_collatz.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.299,
+      0.3,
+      0.302
+     ],
+     "median_s": 0.3,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.308,
+      0.309,
+      0.309
+     ],
+     "median_s": 0.309,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.31,
+      0.309,
+      0.322
+     ],
+     "median_s": 0.31,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.369,
+      0.377,
+      0.367
+     ],
+     "median_s": 0.369,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.133,
+      1.121,
+      1.113
+     ],
+     "median_s": 1.121,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      13,
+      13,
+      13
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 88,
+     "nondet_exit": null,
+     "times_s": [
+      0.213698,
+      0.214244,
+      0.214309,
+      0.212467,
+      0.213417
+     ],
+     "median_s": 0.213698,
+     "rel_spread": 0.0086
+    },
+    "bridge": {
+     "exit": 88,
+     "nondet_exit": null,
+     "times_s": [
+      0.213104,
+      0.211837,
+      0.214603,
+      0.213704,
+      0.211581
+     ],
+     "median_s": 0.213104,
+     "rel_spread": 0.0142
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463728,
+    "bridge": 464944
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 141754368,
+    "llvm_o3": 141950976,
+    "bridge": 169820160
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 88,
+      "wall_s": 0.239397
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 88,
+      "wall_s": 0.230318
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 141754368,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.338438
+     },
+     "llvm_o3": {
+      "bytes": 141950976,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.347014
+     },
+     "bridge": {
+      "bytes": 169820160,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.399358
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9972203764190586,
+    "compile_warm_vs_llvm_o0": 1.23,
+    "compile_warm_vs_llvm_o2": 1.1941747572815533,
+    "compile_warm_vs_llvm_o3": 1.1903225806451614,
+    "compile_cold_vs_llvm_o0": 3.736666666666667,
+    "compile_cold_vs_llvm_o2": 3.627831715210356,
+    "compile_cold_vs_llvm_o3": 3.6161290322580646,
+    "size_vs_llvm_o3": 1.0026222268226201,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.197988904299584,
+    "compile_rss_vs_llvm_o3": 1.1963296398891967
+   }
+  },
+  "p3_gcd": {
+   "source": "benchmarks/beat-llvm/progs/p3_gcd.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.299,
+      0.3,
+      0.299
+     ],
+     "median_s": 0.299,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.309,
+      0.308,
+      0.308
+     ],
+     "median_s": 0.308,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.308,
+      0.309,
+      0.307
+     ],
+     "median_s": 0.308,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.386,
+      0.362,
+      0.374
+     ],
+     "median_s": 0.374,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.254,
+      1.474,
+      1.165
+     ],
+     "median_s": 1.254,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      14,
+      14,
+      14
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 104,
+     "nondet_exit": null,
+     "times_s": [
+      0.373683,
+      0.371701,
+      0.36812,
+      0.370056,
+      0.369176
+     ],
+     "median_s": 0.370056,
+     "rel_spread": 0.015
+    },
+    "bridge": {
+     "exit": 104,
+     "nondet_exit": null,
+     "times_s": [
+      0.36779,
+      0.369804,
+      0.369628,
+      0.367319,
+      0.367967
+     ],
+     "median_s": 0.367967,
+     "rel_spread": 0.0068
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463696,
+    "bridge": 464880
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1540096,
+    "bridge": 1540096
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 142884864,
+    "llvm_o3": 142852096,
+    "bridge": 170426368
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 104,
+      "wall_s": 0.400536
+     },
+     "bridge": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 104,
+      "wall_s": 0.393074
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 142884864,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.346292
+     },
+     "llvm_o3": {
+      "bytes": 142852096,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.35218
+     },
+     "bridge": {
+      "bytes": 170426368,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.396769
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9943549084462892,
+    "compile_warm_vs_llvm_o0": 1.2508361204013378,
+    "compile_warm_vs_llvm_o2": 1.2142857142857142,
+    "compile_warm_vs_llvm_o3": 1.2142857142857142,
+    "compile_cold_vs_llvm_o0": 4.193979933110368,
+    "compile_cold_vs_llvm_o2": 4.071428571428571,
+    "compile_cold_vs_llvm_o3": 4.071428571428571,
+    "size_vs_llvm_o3": 1.0025533970532419,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1927531246416696,
+    "compile_rss_vs_llvm_o3": 1.193026723248079
+   }
+  },
+  "p4_matmul": {
+   "source": "benchmarks/beat-llvm/progs/p4_matmul.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.311,
+      0.309,
+      0.31
+     ],
+     "median_s": 0.31,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.324,
+      0.326,
+      0.326
+     ],
+     "median_s": 0.326,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.326,
+      0.326,
+      0.327
+     ],
+     "median_s": 0.326,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.388,
+      0.383,
+      0.39
+     ],
+     "median_s": 0.388,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.31,
+      1.248,
+      1.25
+     ],
+     "median_s": 1.25,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15,
+      15,
+      15
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 111,
+     "nondet_exit": null,
+     "times_s": [
+      0.030821,
+      0.030691,
+      0.030637,
+      0.030614,
+      0.030521
+     ],
+     "median_s": 0.030637,
+     "rel_spread": 0.0098
+    },
+    "bridge": {
+     "exit": 111,
+     "nondet_exit": null,
+     "times_s": [
+      0.030729,
+      0.030703,
+      0.030766,
+      0.030661,
+      0.030707
+     ],
+     "median_s": 0.030707,
+     "rel_spread": 0.0034
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463712,
+    "bridge": 464992
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1540096,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 144146432,
+    "llvm_o3": 144211968,
+    "bridge": 173899776
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 111,
+      "wall_s": 0.03978
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 111,
+      "wall_s": 0.038075
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 144146432,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.35142
+     },
+     "llvm_o3": {
+      "bytes": 144211968,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.348309
+     },
+     "bridge": {
+      "bytes": 173899776,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.450016
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 1.0022848190096942,
+    "compile_warm_vs_llvm_o0": 1.2516129032258065,
+    "compile_warm_vs_llvm_o2": 1.1901840490797546,
+    "compile_warm_vs_llvm_o3": 1.1901840490797546,
+    "compile_cold_vs_llvm_o0": 4.032258064516129,
+    "compile_cold_vs_llvm_o2": 3.834355828220859,
+    "compile_cold_vs_llvm_o3": 3.834355828220859,
+    "size_vs_llvm_o3": 1.002760334000414,
+    "rss_vs_llvm_o3": 1.0106382978723405,
+    "compile_rss_vs_llvm_o2": 1.2064105478517846,
+    "compile_rss_vs_llvm_o3": 1.2058623040218133
+   }
+  },
+  "p5_struct_acc": {
+   "source": "benchmarks/beat-llvm/progs/p5_struct_acc.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.308,
+      0.308,
+      0.307
+     ],
+     "median_s": 0.308,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.316,
+      0.315,
+      0.315
+     ],
+     "median_s": 0.315,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.316,
+      0.318,
+      0.319
+     ],
+     "median_s": 0.318,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.377,
+      0.373,
+      0.372
+     ],
+     "median_s": 0.373,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.204,
+      1.188,
+      1.182
+     ],
+     "median_s": 1.188,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      13,
+      13,
+      13
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 87,
+     "nondet_exit": null,
+     "times_s": [
+      0.681583,
+      0.681981,
+      0.681982,
+      0.680596,
+      0.682786
+     ],
+     "median_s": 0.681981,
+     "rel_spread": 0.0032
+    },
+    "bridge": {
+     "exit": 87,
+     "nondet_exit": null,
+     "times_s": [
+      0.682047,
+      0.678977,
+      0.679501,
+      0.679578,
+      0.680537
+     ],
+     "median_s": 0.679578,
+     "rel_spread": 0.0045
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463752,
+    "bridge": 465016
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 144097280,
+    "llvm_o3": 143949824,
+    "bridge": 172392448
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 87,
+      "wall_s": 0.73234
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 87,
+      "wall_s": 0.733128
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 144097280,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.352999
+     },
+     "llvm_o3": {
+      "bytes": 143949824,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.352292
+     },
+     "bridge": {
+      "bytes": 172392448,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.383723
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9964764414257876,
+    "compile_warm_vs_llvm_o0": 1.2110389610389611,
+    "compile_warm_vs_llvm_o2": 1.1841269841269841,
+    "compile_warm_vs_llvm_o3": 1.1729559748427674,
+    "compile_cold_vs_llvm_o0": 3.857142857142857,
+    "compile_cold_vs_llvm_o2": 3.7714285714285714,
+    "compile_cold_vs_llvm_o3": 3.735849056603773,
+    "size_vs_llvm_o3": 1.0027255947144162,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1963615690733371,
+    "compile_rss_vs_llvm_o3": 1.197587070339176
+   }
+  },
+  "p6_branch_match": {
+   "source": "benchmarks/beat-llvm/progs/p6_branch_match.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.31,
+      0.308,
+      0.307
+     ],
+     "median_s": 0.308,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.316,
+      0.316,
+      0.315
+     ],
+     "median_s": 0.316,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.316,
+      0.317,
+      0.316
+     ],
+     "median_s": 0.316,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.391,
+      0.39,
+      0.405
+     ],
+     "median_s": 0.391,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.38,
+      1.294,
+      1.313
+     ],
+     "median_s": 1.313,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      17,
+      17,
+      17
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 62,
+     "nondet_exit": null,
+     "times_s": [
+      1.651832,
+      1.651772,
+      1.651358,
+      1.646543,
+      1.648848
+     ],
+     "median_s": 1.651358,
+     "rel_spread": 0.0032
+    },
+    "bridge": {
+     "exit": 62,
+     "nondet_exit": null,
+     "times_s": [
+      1.742046,
+      1.737552,
+      1.724458,
+      1.717954,
+      1.716896
+     ],
+     "median_s": 1.724458,
+     "rel_spread": 0.0146
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463752,
+    "bridge": 465048
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1540096,
+    "bridge": 1540096
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 144015360,
+    "llvm_o3": 144162816,
+    "bridge": 172785664
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 62,
+      "wall_s": 1.649886
+     },
+     "bridge": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 62,
+      "wall_s": 1.773336
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 144015360,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.350887
+     },
+     "llvm_o3": {
+      "bytes": 144162816,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.346947
+     },
+     "bridge": {
+      "bytes": 172785664,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.449574
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 1.044266597551833,
+    "compile_warm_vs_llvm_o0": 1.2694805194805197,
+    "compile_warm_vs_llvm_o2": 1.2373417721518987,
+    "compile_warm_vs_llvm_o3": 1.2373417721518987,
+    "compile_cold_vs_llvm_o0": 4.262987012987013,
+    "compile_cold_vs_llvm_o2": 4.15506329113924,
+    "compile_cold_vs_llvm_o3": 4.15506329113924,
+    "size_vs_llvm_o3": 1.0027945971122496,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1997724687144482,
+    "compile_rss_vs_llvm_o3": 1.1985452892374133
+   }
+  },
+  "p7_sieve": {
+   "source": "benchmarks/beat-llvm/progs/p7_sieve.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.306,
+      0.307,
+      0.307
+     ],
+     "median_s": 0.307,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.323,
+      0.323,
+      0.321
+     ],
+     "median_s": 0.323,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.345,
+      0.347,
+      0.346
+     ],
+     "median_s": 0.346,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.37,
+      0.399,
+      0.409
+     ],
+     "median_s": 0.399,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.219,
+      1.185,
+      1.208
+     ],
+     "median_s": 1.208,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      14,
+      14,
+      14
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 72,
+     "nondet_exit": null,
+     "times_s": [
+      0.022018,
+      0.021819,
+      0.022102,
+      0.022058,
+      0.022069
+     ],
+     "median_s": 0.022058,
+     "rel_spread": 0.0128
+    },
+    "bridge": {
+     "exit": 72,
+     "nondet_exit": null,
+     "times_s": [
+      0.017749,
+      0.01774,
+      0.017691,
+      0.017711,
+      0.017559
+     ],
+     "median_s": 0.017711,
+     "rel_spread": 0.0107
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 480224,
+    "bridge": 464976
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1572864,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 142966784,
+    "llvm_o3": 144474112,
+    "bridge": 172130304
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1572864,
+      "status": "ok",
+      "returncode": 72,
+      "wall_s": 0.039802
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 72,
+      "wall_s": 0.019698
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 142966784,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.350856
+     },
+     "llvm_o3": {
+      "bytes": 144474112,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.348713
+     },
+     "bridge": {
+      "bytes": 172130304,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.403743
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.8029286426693263,
+    "compile_warm_vs_llvm_o0": 1.2996742671009773,
+    "compile_warm_vs_llvm_o2": 1.2352941176470589,
+    "compile_warm_vs_llvm_o3": 1.1531791907514453,
+    "compile_cold_vs_llvm_o0": 3.9348534201954397,
+    "compile_cold_vs_llvm_o2": 3.7399380804953557,
+    "compile_cold_vs_llvm_o3": 3.4913294797687864,
+    "size_vs_llvm_o3": 0.9682481508629306,
+    "rss_vs_llvm_o3": 0.9895833333333334,
+    "compile_rss_vs_llvm_o2": 1.2039880815952326,
+    "compile_rss_vs_llvm_o3": 1.1914266273531413
+   }
+  },
+  "p8_closure_nest": {
+   "source": "benchmarks/beat-llvm/progs/p8_closure_nest.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.307,
+      0.306,
+      0.307
+     ],
+     "median_s": 0.307,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.314,
+      0.315,
+      0.314
+     ],
+     "median_s": 0.314,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.315,
+      0.315,
+      0.314
+     ],
+     "median_s": 0.315,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.394,
+      0.385,
+      0.386
+     ],
+     "median_s": 0.386,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.214,
+      1.194,
+      1.174
+     ],
+     "median_s": 1.194,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      14,
+      14,
+      14
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 46,
+     "nondet_exit": null,
+     "times_s": [
+      0.203853,
+      0.204559,
+      0.203573,
+      0.202243,
+      0.204338
+     ],
+     "median_s": 0.203853,
+     "rel_spread": 0.0114
+    },
+    "bridge": {
+     "exit": 46,
+     "nondet_exit": null,
+     "times_s": [
+      0.200661,
+      0.203181,
+      0.201936,
+      0.202473,
+      0.201654
+     ],
+     "median_s": 0.201936,
+     "rel_spread": 0.0125
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463752,
+    "bridge": 465048
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1540096,
+    "bridge": 1540096
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 142983168,
+    "llvm_o3": 142917632,
+    "bridge": 170983424
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 46,
+      "wall_s": 0.233469
+     },
+     "bridge": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 46,
+      "wall_s": 0.241876
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 142983168,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.34459
+     },
+     "llvm_o3": {
+      "bytes": 142917632,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.347165
+     },
+     "bridge": {
+      "bytes": 170983424,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.401374
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.990596164883519,
+    "compile_warm_vs_llvm_o0": 1.2573289902280131,
+    "compile_warm_vs_llvm_o2": 1.2292993630573248,
+    "compile_warm_vs_llvm_o3": 1.2253968253968255,
+    "compile_cold_vs_llvm_o0": 3.8892508143322475,
+    "compile_cold_vs_llvm_o2": 3.8025477707006368,
+    "compile_cold_vs_llvm_o3": 3.7904761904761903,
+    "size_vs_llvm_o3": 1.0027945971122496,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1958290363240518,
+    "compile_rss_vs_llvm_o3": 1.1963773930987045
+   }
+  },
+  "v1_saxpy": {
+   "source": "benchmarks/beat-llvm/progs/v1_saxpy.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.307,
+      0.307,
+      0.306
+     ],
+     "median_s": 0.307,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.319,
+      0.318,
+      0.317
+     ],
+     "median_s": 0.318,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.318,
+      0.318,
+      0.317
+     ],
+     "median_s": 0.318,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.406,
+      0.413,
+      0.424
+     ],
+     "median_s": 0.413,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.298,
+      1.219,
+      1.232
+     ],
+     "median_s": 1.232,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16,
+      16,
+      16
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 118,
+     "nondet_exit": null,
+     "times_s": [
+      0.053622,
+      0.05367,
+      0.0536,
+      0.053679,
+      0.053735
+     ],
+     "median_s": 0.05367,
+     "rel_spread": 0.0025
+    },
+    "bridge": {
+     "exit": 118,
+     "nondet_exit": null,
+     "times_s": [
+      0.039833,
+      0.0397,
+      0.039758,
+      0.039695,
+      0.039662
+     ],
+     "median_s": 0.0397,
+     "rel_spread": 0.0043
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463712,
+    "bridge": 464976
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1556480
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 144064512,
+    "llvm_o3": 144048128,
+    "bridge": 172867584
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 118,
+      "wall_s": 0.076813
+     },
+     "bridge": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 118,
+      "wall_s": 0.073738
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 144064512,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.347967
+     },
+     "llvm_o3": {
+      "bytes": 144048128,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.349188
+     },
+     "bridge": {
+      "bytes": 172867584,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.40083
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.7397056083473076,
+    "compile_warm_vs_llvm_o0": 1.3452768729641693,
+    "compile_warm_vs_llvm_o2": 1.2987421383647797,
+    "compile_warm_vs_llvm_o3": 1.2987421383647797,
+    "compile_cold_vs_llvm_o0": 4.013029315960912,
+    "compile_cold_vs_llvm_o2": 3.8742138364779874,
+    "compile_cold_vs_llvm_o3": 3.8742138364779874,
+    "size_vs_llvm_o3": 1.002725829825409,
+    "rss_vs_llvm_o3": 1.0,
+    "compile_rss_vs_llvm_o2": 1.1999317639031049,
+    "compile_rss_vs_llvm_o3": 1.2000682438580528
+   }
+  },
+  "v2_memfill": {
+   "source": "benchmarks/beat-llvm/progs/v2_memfill.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.307,
+      0.306,
+      0.305
+     ],
+     "median_s": 0.306,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.314,
+      0.314,
+      0.313
+     ],
+     "median_s": 0.314,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.315,
+      0.313,
+      0.314
+     ],
+     "median_s": 0.314,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.381,
+      0.393,
+      0.4
+     ],
+     "median_s": 0.393,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.275,
+      1.233,
+      1.305
+     ],
+     "median_s": 1.275,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      17,
+      17,
+      17
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 44,
+     "nondet_exit": null,
+     "times_s": [
+      0.008904,
+      0.008803,
+      0.008783,
+      0.0088,
+      0.008908
+     ],
+     "median_s": 0.008803,
+     "rel_spread": 0.0142
+    },
+    "bridge": {
+     "exit": 44,
+     "nondet_exit": null,
+     "times_s": [
+      0.008751,
+      0.008864,
+      0.008786,
+      0.00874,
+      0.008781
+     ],
+     "median_s": 0.008781,
+     "rel_spread": 0.0141
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463760,
+    "bridge": 465024
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1540096
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 143720448,
+    "llvm_o3": 143720448,
+    "bridge": 171704320
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 44,
+      "wall_s": 0.009849
+     },
+     "bridge": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 44,
+      "wall_s": 0.009699
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 143720448,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.344689
+     },
+     "llvm_o3": {
+      "bytes": 143720448,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.347579
+     },
+     "bridge": {
+      "bytes": 171704320,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.449827
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.9975008519822788,
+    "compile_warm_vs_llvm_o0": 1.2843137254901962,
+    "compile_warm_vs_llvm_o2": 1.2515923566878981,
+    "compile_warm_vs_llvm_o3": 1.2515923566878981,
+    "compile_cold_vs_llvm_o0": 4.166666666666666,
+    "compile_cold_vs_llvm_o2": 4.060509554140127,
+    "compile_cold_vs_llvm_o3": 4.060509554140127,
+    "size_vs_llvm_o3": 1.0027255476970847,
+    "rss_vs_llvm_o3": 0.9894736842105263,
+    "compile_rss_vs_llvm_o2": 1.1947104423164614,
+    "compile_rss_vs_llvm_o3": 1.1947104423164614
+   }
+  },
+  "v3_popcount": {
+   "source": "benchmarks/beat-llvm/progs/v3_popcount.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "MATCH",
+   "reason": "",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.308,
+      0.307,
+      0.306
+     ],
+     "median_s": 0.307,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.317,
+      0.318,
+      0.317
+     ],
+     "median_s": 0.317,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.317,
+      0.317,
+      0.316
+     ],
+     "median_s": 0.317,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": true,
+     "times_s": [
+      0.404,
+      0.394,
+      0.418
+     ],
+     "median_s": 0.404,
+     "err": ""
+    },
+    "bridge_cold": {
+     "ok": true,
+     "times_s": [
+      1.363,
+      1.31,
+      1.284
+     ],
+     "median_s": 1.31,
+     "err": "",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      18,
+      18,
+      18
+     ]
+    }
+   },
+   "run": {
+    "llvm_o3": {
+     "exit": 38,
+     "nondet_exit": null,
+     "times_s": [
+      0.006491,
+      0.006415,
+      0.00648,
+      0.006297,
+      0.006368
+     ],
+     "median_s": 0.006415,
+     "rel_spread": 0.0302
+    },
+    "bridge": {
+     "exit": 38,
+     "nondet_exit": null,
+     "times_s": [
+      0.013087,
+      0.005559,
+      0.004707,
+      0.004765,
+      0.004702
+     ],
+     "median_s": 0.004765,
+     "rel_spread": 1.7597
+    }
+   },
+   "size_bytes": {
+    "llvm_o3": 463728,
+    "bridge": 465040
+   },
+   "peak_rss_bytes": {
+    "llvm_o3": 1556480,
+    "bridge": 1540096
+   },
+   "compile_peak_rss_bytes": {
+    "llvm_o2": 143917056,
+    "llvm_o3": 143949824,
+    "bridge": 172376064
+   },
+   "rss_samples": {
+    "program": {
+     "llvm_o3": {
+      "bytes": 1556480,
+      "status": "ok",
+      "returncode": 38,
+      "wall_s": 0.009783
+     },
+     "bridge": {
+      "bytes": 1540096,
+      "status": "ok",
+      "returncode": 38,
+      "wall_s": 0.009792
+     }
+    },
+    "compiler": {
+     "llvm_o2": {
+      "bytes": 143917056,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.345796
+     },
+     "llvm_o3": {
+      "bytes": 143949824,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.347224
+     },
+     "bridge": {
+      "bytes": 172376064,
+      "status": "ok",
+      "returncode": 0,
+      "wall_s": 0.454369
+     }
+    }
+   },
+   "ratios": {
+    "runtime_vs_llvm_o3": 0.7427903351519876,
+    "compile_warm_vs_llvm_o0": 1.3159609120521174,
+    "compile_warm_vs_llvm_o2": 1.274447949526814,
+    "compile_warm_vs_llvm_o3": 1.274447949526814,
+    "compile_cold_vs_llvm_o0": 4.267100977198697,
+    "compile_cold_vs_llvm_o2": 4.132492113564669,
+    "compile_cold_vs_llvm_o3": 4.132492113564669,
+    "size_vs_llvm_o3": 1.0028292447296692,
+    "rss_vs_llvm_o3": 0.9894736842105263,
+    "compile_rss_vs_llvm_o2": 1.1977459016393444,
+    "compile_rss_vs_llvm_o3": 1.1974732529023446
+   }
+  }
+ },
+ "aggregates": {
+  "total_programs": 18,
+  "match_count": 18,
+  "incomplete_count": 0,
+  "mismatch_count": 0,
+  "nondet_failclosed_count": 0,
+  "nondet_candidate_count": 0,
+  "coverage_pct": 100.0,
+  "runtime_geomean_vs_llvm_o3": 0.9500687795077993,
+  "runtime_worst_vs_llvm_o3": 1.11315380631797,
+  "scalar_runtime_geomean_vs_llvm_o3": 1.0033911099785753,
+  "vectorizable_worst_runtime_vs_llvm_o3": 1.0022848190096942,
+  "by_category": {
+   "branch": {
+    "total": 1,
+    "match": 1,
+    "incomplete": 0,
+    "mismatch": 0,
+    "coverage_pct": 100.0,
+    "runtime_geomean_vs_llvm_o3": 1.0169464786438747
+   },
+   "heap": {
+    "total": 4,
+    "match": 4,
+    "incomplete": 0,
+    "mismatch": 0,
+    "coverage_pct": 100.0,
+    "runtime_geomean_vs_llvm_o3": 0.9876857519542559
+   },
+   "multifn": {
+    "total": 2,
+    "match": 2,
+    "incomplete": 0,
+    "mismatch": 0,
+    "coverage_pct": 100.0,
+    "runtime_geomean_vs_llvm_o3": 0.9555310012972276
+   },
+   "scalar": {
+    "total": 6,
+    "match": 6,
+    "incomplete": 0,
+    "mismatch": 0,
+    "coverage_pct": 100.0,
+    "runtime_geomean_vs_llvm_o3": 1.0033911099785753
+   },
+   "vectorizable": {
+    "total": 5,
+    "match": 5,
+    "incomplete": 0,
+    "mismatch": 0,
+    "coverage_pct": 100.0,
+    "runtime_geomean_vs_llvm_o3": 0.8489875211783605
+   }
+  },
+  "compile_warm_geomean_vs_llvm_o0": 1.282476578684674,
+  "compile_cold_geomean_vs_llvm_o0": 4.099880971209735,
+  "compile_warm_geomean_vs_llvm_o2": 1.237677919311009,
+  "compile_cold_geomean_vs_llvm_o2": 3.9566665264748697,
+  "compile_warm_geomean_vs_llvm_o3": 1.2246934200208959,
+  "compile_cold_geomean_vs_llvm_o3": 3.915157073245853,
+  "ratio_missing": {},
+  "runtime_geomean_reliable_only": 0.9650877576406093,
+  "runtime_reliable_program_count": 10,
+  "runtime_reliable_criteria": {
+   "min_llvm_median_s": 0.05,
+   "max_rel_spread": 0.25
+  },
+  "resource_measurement_complete": true,
+  "resource_missing": [],
+  "rss_sampler_floor_bytes": 1261568,
+  "rss_floor_bound_bytes": 2523136,
+  "size_geomean_vs_llvm_o3": 1.0005982145109293,
+  "size_worst_vs_llvm_o3": 1.002863599510083,
+  "rss_geomean_vs_llvm_o3": 0.9993571697459958,
+  "compile_rss_geomean_vs_llvm_o2": 1.1972887181310095,
+  "compile_rss_geomean_vs_llvm_o3": 1.1961604049651575,
+  "program_rss_floor_bound_count": 15,
+  "program_rss_resolved_loss_count": null,
+  "program_rss_resolved_losses": [],
+  "compile_rss_floor_bound_count": 0
+ },
+ "retention": {
+  "dir": "reports/perf/2026-09-29-darwin-aarch64-remeasure/diagnostic-no-proof-certs/2026-09-29-80b0e03aa609-dirty",
+  "harness_option": "--retain-dir"
+ }
+}

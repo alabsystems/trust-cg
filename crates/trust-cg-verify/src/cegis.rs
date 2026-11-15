@@ -17,7 +17,6 @@
 //
 // Reference: Sasnauskas et al. "Souper: A Synthesizing Superoptimizer"
 //            (arXiv:1711.04422, 2017)
-//            designs/2026-04-13-superoptimization.md
 
 //! Counter-Example Guided Inductive Synthesis (CEGIS) loop.
 //!
@@ -157,7 +156,25 @@ pub enum CegisResult {
     Error(String),
 }
 
+/// The prefix [`CegisLoop::verify`] puts on [`CegisResult::Error`] when AY
+/// answered `unknown`; the rest of the message is AY's reason exactly as the
+/// bridge kept it.
+pub const SOLVER_UNKNOWN_PREFIX: &str = "solver returned unknown: ";
+
 impl CegisResult {
+    /// AY's own `unknown` reason when this is the [`CegisResult::Error`]
+    /// [`CegisLoop::verify`] minted from an [`AYResult::Unknown`]; `None` for
+    /// every other result (including a solver that could not run at all).
+    pub fn solver_unknown_reason(&self) -> Option<&str> {
+        match self {
+            CegisResult::Error(message) => message.strip_prefix(SOLVER_UNKNOWN_PREFIX),
+            CegisResult::Equivalent { .. }
+            | CegisResult::NotEquivalent { .. }
+            | CegisResult::Timeout
+            | CegisResult::MaxIterationsReached { .. } => None,
+        }
+    }
+
     /// Returns true if the result proves equivalence.
     pub fn is_equivalent(&self) -> bool {
         matches!(self, CegisResult::Equivalent { .. })
@@ -380,7 +397,7 @@ impl CegisLoop {
                     return CegisResult::Timeout;
                 }
                 AYResult::Unknown(msg) => {
-                    return CegisResult::Error(format!("solver returned unknown: {}", msg));
+                    return CegisResult::Error(format!("{SOLVER_UNKNOWN_PREFIX}{msg}"));
                 }
                 AYResult::Error(msg) => {
                     return CegisResult::Error(msg);
@@ -676,18 +693,15 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        // If solver is available, should be Equivalent
-        // If not available, may be Error (acceptable in test environment)
-        match &result {
-            CegisResult::Equivalent { iterations, .. } => {
-                assert_eq!(*iterations, 1);
-            }
-            CegisResult::Error(_) => {
-                // No solver available -- acceptable in CI
-            }
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
+        let check = crate::formal_gap::assert_cegis_equivalent(
+            "test_cegis_verify_identical_expressions",
+            &result,
+        );
+        if check == crate::formal_gap::CegisCheck::Proved {
+            assert!(matches!(
+                result,
+                CegisResult::Equivalent { iterations: 1, .. }
+            ));
         }
     }
 
@@ -741,11 +755,13 @@ mod tests {
                 let t = target.try_eval(&counterexample.values).unwrap();
                 assert_ne!(s, t, "Counterexample should distinguish expressions");
             }
-            CegisResult::Error(_) => {
-                // No solver available -- acceptable
-            }
+            // A `sat` needs no proof checker, but it does need AY.
+            CegisResult::Error(_)
+                if !crate::formal_gap::proof_authority_present(
+                    "test_cegis_verify_different_via_solver",
+                ) => {}
             other => {
-                panic!("Expected NotEquivalent or Error, got {:?}", other);
+                panic!("Expected a solver counterexample, got {:?}", other);
             }
         }
     }
@@ -761,13 +777,7 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        match &result {
-            CegisResult::Equivalent { .. } => {} // Good
-            CegisResult::Error(_) => {}          // No solver
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
-        }
+        crate::formal_gap::assert_cegis_equivalent("test_cegis_verify_commutativity", &result);
     }
 
     #[test]
@@ -794,9 +804,12 @@ mod tests {
         // depending on the specific values. Just check it is NotEquivalent.
         match &result {
             CegisResult::NotEquivalent { .. } => {} // Expected
-            CegisResult::Error(_) => {}             // No solver
+            CegisResult::Error(_)
+                if !crate::formal_gap::proof_authority_present(
+                    "test_cegis_counterexample_accumulation",
+                ) => {}
             other => {
-                panic!("Expected NotEquivalent or Error, got {:?}", other);
+                panic!("Expected NotEquivalent, got {:?}", other);
             }
         }
 
@@ -972,20 +985,11 @@ mod tests {
             &obligation.inputs,
         );
 
-        match &result {
-            CegisResult::Equivalent { .. } => {
-                // Correct: iadd is correctly lowered to ADD
-            }
-            CegisResult::Error(_) => {
-                // No solver available
-            }
-            other => {
-                panic!(
-                    "Expected Equivalent or Error for iadd proof, got {:?}",
-                    other
-                );
-            }
-        }
+        // Correct: iadd is correctly lowered to ADD.
+        crate::formal_gap::assert_cegis_equivalent(
+            "test_cegis_with_existing_proof_obligation",
+            &result,
+        );
     }
 
     #[test]
@@ -1036,13 +1040,7 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        match &result {
-            CegisResult::Equivalent { .. } => {} // Good
-            CegisResult::Error(_) => {}          // No solver
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
-        }
+        crate::formal_gap::assert_cegis_equivalent("test_cegis_peephole_double_negation", &result);
     }
 
     #[test]
@@ -1057,13 +1055,10 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        match &result {
-            CegisResult::Equivalent { .. } => {} // Good
-            CegisResult::Error(_) => {}          // No solver
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
-        }
+        crate::formal_gap::assert_cegis_equivalent(
+            "test_cegis_peephole_strength_reduction",
+            &result,
+        );
     }
 
     #[test]
@@ -1078,13 +1073,7 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        match &result {
-            CegisResult::Equivalent { .. } => {} // Good
-            CegisResult::Error(_) => {}          // No solver
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
-        }
+        crate::formal_gap::assert_cegis_equivalent("test_cegis_peephole_xor_self", &result);
     }
 
     #[test]
@@ -1099,13 +1088,7 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        match &result {
-            CegisResult::Equivalent { .. } => {} // Good
-            CegisResult::Error(_) => {}          // No solver
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
-        }
+        crate::formal_gap::assert_cegis_equivalent("test_cegis_peephole_and_self", &result);
     }
 
     #[test]
@@ -1120,13 +1103,7 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        match &result {
-            CegisResult::Equivalent { .. } => {} // Good
-            CegisResult::Error(_) => {}          // No solver
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
-        }
+        crate::formal_gap::assert_cegis_equivalent("test_cegis_peephole_or_zero", &result);
     }
 
     #[test]
@@ -1141,12 +1118,6 @@ mod tests {
 
         let result = cegis.verify(&source, &target, &vars);
 
-        match &result {
-            CegisResult::Equivalent { .. } => {} // Good
-            CegisResult::Error(_) => {}          // No solver
-            other => {
-                panic!("Expected Equivalent or Error, got {:?}", other);
-            }
-        }
+        crate::formal_gap::assert_cegis_equivalent("test_cegis_peephole_sub_self", &result);
     }
 }

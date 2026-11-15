@@ -1,0 +1,1091 @@
+{
+  "name": "assert_kind",
+  "functions": [
+    {
+      "id": 0,
+      "name": "bounds",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Usize"
+            ],
+            [
+              1,
+              "Usize"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ult",
+                  "ty": "Usize",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 2,
+                  "kind": {
+                    "BoundsCheck": {
+                      "index": 0,
+                      "len": 1
+                    }
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "misaligned",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Usize"
+            ],
+            [
+              1,
+              "Usize"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ult",
+                  "ty": "Usize",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 2,
+                  "kind": {
+                    "MisalignedPtr": {
+                      "required": 1,
+                      "found": 0
+                    }
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 2,
+      "name": "divide",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U32"
+            ],
+            [
+              1,
+              "U32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U32",
+                  "lhs": 1,
+                  "rhs": 2
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 3,
+                  "kind": "DivByZero"
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "UDiv",
+                  "ty": "U32",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 3,
+      "name": "remainder",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U32"
+            ],
+            [
+              1,
+              "U32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U32",
+                  "lhs": 1,
+                  "rhs": 2
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 3,
+                  "kind": "RemByZero"
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "URem",
+                  "ty": "U32",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 4,
+      "name": "null",
+      "ty": 4,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Usize"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Usize",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "Usize",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 2,
+                  "kind": "NullPtr"
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 5,
+      "name": "overflow",
+      "ty": 5,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U8"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 2,
+                  "kind": {
+                    "Overflow": "Add"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 3
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 4,
+                  "kind": {
+                    "Overflow": "Sub"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 2
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 6,
+                  "kind": {
+                    "Overflow": "Mul"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 3
+                  }
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 7
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 8,
+                  "kind": {
+                    "Overflow": "Div"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 4
+                  }
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 9
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 10,
+                  "kind": {
+                    "Overflow": "Rem"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 5
+                  }
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 11
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 12,
+                  "kind": {
+                    "Overflow": "Shl"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 6
+                  }
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 13
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 14,
+                  "kind": {
+                    "Overflow": "Shr"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U8",
+                  "value": {
+                    "Int": 7
+                  }
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "U8",
+                  "lhs": 0,
+                  "rhs": 15
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 16,
+                  "kind": {
+                    "Overflow": "Neg"
+                  }
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 6,
+      "name": "legacy",
+      "ty": 6,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Assert": {
+                  "cond": 0,
+                  "kind": "Unspecified"
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Usize",
+        "Usize"
+      ],
+      "returns": [
+        "Usize"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "Usize",
+        "Usize"
+      ],
+      "returns": [
+        "Usize"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U32",
+        "U32"
+      ],
+      "returns": [
+        "U32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U32",
+        "U32"
+      ],
+      "returns": [
+        "U32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "Usize"
+      ],
+      "returns": [
+        "Usize"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U8"
+      ],
+      "returns": [
+        "U8"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "Bool"
+      ],
+      "returns": [
+        "Bool"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

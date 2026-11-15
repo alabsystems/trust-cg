@@ -193,7 +193,8 @@ fn const_func(id: u32, name: &str, ft: trust_ir::FuncTyId) -> TrustIrFunction {
 }
 
 /// A module with one const function and one immutable byte global of the given
-/// linkage. The global's initializer is a raw byte aggregate.
+/// linkage. The global is a `[u8; N]` array whose initializer is its raw bytes
+/// (WS7.3: trust-ir refuses a byte aggregate at a scalar type).
 fn module_with_global(
     module_name: &str,
     func_name: &str,
@@ -202,15 +203,26 @@ fn module_with_global(
     linkage: Linkage,
 ) -> TrustIrModule {
     let mut module = TrustIrModule::new(module_name);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    module.add_function(const_func(0, func_name, ft));
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    module
+        .try_add_function(const_func(0, func_name, ft))
+        .expect("Module::try_add_function: test fixture");
+    let byte = module
+        .add_type(Ty::U8)
+        .expect("Module::add_type: test fixture");
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: global_name.to_string(),
-        ty: Ty::I32,
+        ty: Ty::Array(byte, bytes.len() as u64),
         mutable: false,
         initializer: Some(Constant::Aggregate(
             bytes.iter().map(|b| Constant::Int(*b as i128)).collect(),
@@ -234,8 +246,19 @@ fn compile_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -268,6 +291,10 @@ fn weak_object_global_emits_n_weak_def_x86() {
             is_import: false,
             is_weak: true,
             align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
         },
         ObjectGlobal {
             name: "STRONGG".to_string(),
@@ -279,6 +306,10 @@ fn weak_object_global_emits_n_weak_def_x86() {
             is_import: false,
             is_weak: false,
             align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
         },
     ];
 
@@ -498,4 +529,13 @@ fn two_weak_defs_coalesce_link_x86() {
     );
 
     cleanup(&dir);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

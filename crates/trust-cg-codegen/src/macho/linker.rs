@@ -6,21 +6,47 @@
 //! Minimal Mach-O linker for Trust Codegen-generated object files.
 //!
 //! Reads Mach-O MH_OBJECT (.o) files, resolves symbols across objects, applies
-//! relocations (BRANCH26, PAGE21, PAGEOFF12), and emits a Mach-O MH_EXECUTE
-//! binary.
+//! relocations (branches, page addresses, GOT and TLV-pointer loads, absolute
+//! pointers, and subtractor pairs), and emits an ad-hoc-signed Mach-O
+//! MH_EXECUTE ([`link`], [`link_with_dylibs`]) or MH_DYLIB ([`link_dylib`])
+//! image whose pointers dyld slides or binds through chained fixups.
 //!
-//! This is an MVP linker for the Trust Codegen pipeline. It handles the common case of
-//! linking a small number of .o files into a static executable for AArch64 macOS.
+//! This is a limited AArch64 macOS linker, not a general system-linker
+//! replacement. Layout reserves dynamic stubs, GOT slots and TLV pointer slots
+//! before resolving addresses, then places aligned zero-fill storage after
+//! file-backed data. Executables use dyld, including when no external dylib
+//! symbols are imported. A dylib exports its external, non-private
+//! definitions through the exports trie and binds its own references to its
+//! strong definitions directly (no interposition, no re-exports). A dylib's
+//! default-visibility weak definitions are exported `[weak-def]` and every
+//! reference to one binds through dyld's weak-definition lookup, so dyld
+//! coalesces them with an earlier image's definition of the same name. An
+//! executable exports nothing, so its own weak definitions are resolved
+//! statically and take no part in that coalescing. The symbol table stays
+//! empty, and `S_ATTR_DEBUG` input (`__LD,__compact_unwind`, `__DWARF`) is
+//! not loaded, so images carry no unwind or debug tables.
 //!
-//! # Layout of emitted MH_EXECUTE
+//! # Layout of emitted images
+//!
+//! A dylib has the same segments without `__PAGEZERO`, based at 0.
 //!
 //! ```text
-//! __PAGEZERO  vmaddr=0x0            vmsize=0x1_0000_0000  (no file data)
-//! __TEXT      vmaddr=0x1_0000_0000  (rx) contains __text
-//! __DATA      vmaddr=aligned after __TEXT  (rw) contains __data
+//! __PAGEZERO    vmaddr=0x0            vmsize=0x1_0000_0000  (no file data)
+//! __TEXT        vmaddr=0x1_0000_0000  (rx) headers, __text, optional __stubs
+//! __DATA_CONST  optional (rw, SG_READ_ONLY) __got, __thread_ptrs, __const
+//!               (input `__DATA,__const` and `__DATA_CONST` data; dyld makes
+//!               the segment read-only once its fixups are applied)
+//! __DATA        optional (rw) __data, __thread_vars, __thread_data,
+//!               zero-fill __thread_bss, then other zero-fill storage
+//! __LINKEDIT    (r) chained fixups, exports trie and code signature
 //! ```
+//!
+//! GOT and TLV pointer slots are never relaxed into direct addressing: every
+//! `ARM64_RELOC_GOT_LOAD_*`/`ARM64_RELOC_TLVP_LOAD_*` pair keeps its `LDR` and
+//! loads a slot that dyld binds (imports) or rebases (image definitions).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::constants::*;
 use super::reloc::{AArch64RelocKind, Relocation, decode_relocation};
@@ -50,6 +76,22 @@ const MH_PIE: u32 = 0x0020_0000;
 
 /// Standard flags for modern Darwin MH_EXECUTE output.
 const MH_EXECUTE_FLAGS: u32 = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
+
+/// Dynamic shared library file type.
+const MH_DYLIB: u32 = 0x6;
+
+/// The dylib re-exports no other dylib.
+const MH_NO_REEXPORTED_DYLIBS: u32 = 0x0010_0000;
+
+/// Standard flags for MH_DYLIB output (dylibs are never PIE-flagged).
+const MH_DYLIB_FLAGS: u32 = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_NO_REEXPORTED_DYLIBS;
+
+/// LC_ID_DYLIB load command type (a dylib's own install name).
+const LC_ID_DYLIB: u32 = 0x0D;
+
+/// Exports-trie terminal flags: a regular symbol or a TLV descriptor.
+const EXPORT_SYMBOL_FLAGS_KIND_REGULAR: u64 = 0x00;
+const EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL: u64 = 0x01;
 
 /// LC_MAIN load command type (entry point for executables).
 const LC_MAIN: u32 = 0x8000_0028;
@@ -103,6 +145,64 @@ const N_NO_DEAD_STRIP: u16 = 0x0020;
 
 /// Section type mask (lower 8 bits of section flags).
 const SECTION_TYPE_MASK: u32 = 0x0000_00FF;
+
+/// The image contains thread-local variable descriptors; dyld initializes
+/// `__thread_vars` only when this header flag is set.
+const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
+
+/// dyld makes this segment read-only after applying its fixups (`__DATA_CONST`).
+const SG_READ_ONLY: u32 = 0x10;
+
+/// Header flag: the image exports weak definitions dyld may coalesce.
+const MH_WEAK_DEFINES: u32 = 0x0000_8000;
+
+/// Header flag: the image binds references through dyld's weak-definition
+/// lookup.
+const MH_BINDS_TO_WEAK: u32 = 0x0001_0000;
+
+/// Exports-trie flag: a weak definition dyld may coalesce.
+const EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION: u64 = 0x04;
+
+/// `BIND_SPECIAL_DYLIB_WEAK_LOOKUP` (-3) in a chained import's 8-bit
+/// library-ordinal field: dyld binds the first definition of the name in load
+/// order, preferring a strong one, among images with `MH_WEAK_DEFINES`.
+const BIND_SPECIAL_DYLIB_WEAK_LOOKUP_ORDINAL: u32 = 0xFD;
+
+/// Section attribute: debug content that the static linker does not load.
+const S_ATTR_DEBUG: u32 = 0x0200_0000;
+
+/// Zero-fill section type used for large (>4 GiB capable) zero-fill storage.
+const S_GB_ZEROFILL: u32 = 0x0C;
+
+// Section types whose meaning depends on linker processing this linker does
+// not implement (indirect symbol tables, initializers, interposing, DTrace).
+// Concatenating them as plain data would silently drop that meaning.
+const S_LAZY_SYMBOL_POINTERS: u32 = 0x07;
+const S_MOD_INIT_FUNC_POINTERS: u32 = 0x09;
+const S_MOD_TERM_FUNC_POINTERS: u32 = 0x0A;
+const S_INTERPOSING: u32 = 0x0D;
+const S_DTRACE_DOF: u32 = 0x0F;
+const S_LAZY_DYLIB_SYMBOL_POINTERS: u32 = 0x10;
+const S_THREAD_LOCAL_INIT_FUNCTION_POINTERS: u32 = 0x15;
+const S_INIT_FUNC_OFFSETS: u32 = 0x16;
+
+/// Darwin TLV descriptor `{thunk, key, offset}` size and field offsets.
+const TLV_DESCRIPTOR_SIZE: u64 = 24;
+const TLV_DESCRIPTOR_KEY_OFFSET: u64 = 8;
+const TLV_DESCRIPTOR_OFFSET_FIELD: u64 = 16;
+
+/// The dyld thunk every TLV descriptor binds before dyld installs its getter.
+const TLV_BOOTSTRAP_SYMBOL: &str = "__tlv_bootstrap";
+
+/// dyld copies TLV templates into malloc'd storage, which guarantees 16-byte
+/// alignment; stricter template alignment cannot be honored per thread.
+const TLS_TEMPLATE_MAX_ALIGNMENT: u64 = 16;
+
+/// `dyld_chained_ptr_64_rebase.target` holds a 36-bit unslid vmaddr.
+const DYLD_CHAINED_PTR_64_TARGET_LIMIT: u64 = 1 << 36;
+
+/// `dyld_chained_ptr_64_bind.ordinal` holds a 24-bit import ordinal.
+const DYLD_CHAINED_PTR_64_BIND_ORDINAL_LIMIT: usize = 1 << 24;
 
 /// dyld_chained_fixups_header size before 8-byte payload alignment.
 const DYLD_CHAINED_FIXUPS_HEADER_SIZE: u32 = 28;
@@ -168,6 +268,15 @@ struct LinkeditPayload {
 /// Errors that can occur during linking.
 #[derive(Debug, Error)]
 pub enum LinkerError {
+    #[error("Mach-O layout overflow while computing {0}")]
+    LayoutOverflow(&'static str),
+
+    #[error("section '{section}' has unrepresentable alignment exponent {exponent}")]
+    InvalidAlignment { section: String, exponent: u32 },
+
+    #[error("could not reserve linked image storage: {0}")]
+    ImageAllocation(#[source] std::collections::TryReserveError),
+
     /// The input data is too short to contain a valid Mach-O header.
     #[error("data too short: need at least {expected} bytes, got {actual}")]
     TooShort { expected: usize, actual: usize },
@@ -204,6 +313,79 @@ pub enum LinkerError {
     #[error("unsupported relocation type: {0:?}")]
     UnsupportedRelocation(AArch64RelocKind),
 
+    /// `ARM64_RELOC_UNSIGNED` with `r_pcrel=1`. It is not a valid arm64
+    /// Mach-O relocation (the platform linker rejects it as unsupported);
+    /// pc-relative data differences are `SUBTRACTOR`/`UNSIGNED` pairs.
+    #[error(
+        "pc-relative ARM64_RELOC_UNSIGNED at offset {offset:#x} is not a valid arm64 Mach-O relocation; use a SUBTRACTOR/UNSIGNED pair"
+    )]
+    PcRelativeUnsigned { offset: u32 },
+
+    /// The instruction at a relocation site is not the form its kind patches.
+    #[error(
+        "relocation {kind:?} at offset {offset:#x} does not name a matching instruction ({instruction:#010x})"
+    )]
+    RelocationInstructionMismatch {
+        kind: AArch64RelocKind,
+        offset: u32,
+        instruction: u32,
+    },
+
+    /// An absolute pointer to an image address needs a slide fixup that the
+    /// relocation site cannot carry (a 32-bit field or a `__TEXT` location).
+    #[error("absolute pointer at {section}+{offset:#x} cannot be slid by dyld: {detail}")]
+    UnslidablePointer {
+        section: String,
+        offset: u32,
+        detail: &'static str,
+    },
+
+    /// A PC-relative or difference relocation names a symbol that lives in a
+    /// dylib. Only branches (via stubs), GOT/TLV slots and 64-bit data
+    /// pointers (dyld binds) may name an import.
+    #[error("relocation {kind:?} cannot address dylib import '{symbol}' directly")]
+    DirectImportReference {
+        kind: AArch64RelocKind,
+        symbol: String,
+    },
+
+    /// A thread-local variable is referenced through a non-TLV relocation, a
+    /// TLVP relocation names a non-TLV symbol, or a descriptor is malformed.
+    #[error("thread-local variable misuse: {0}")]
+    ThreadLocal(String),
+
+    /// A relocation targets a section that is not loaded into the image.
+    #[error("relocation targets unloaded debug section '{0}'")]
+    UnloadedSectionReference(String),
+
+    /// An input section type needs linker processing that is not implemented.
+    #[error("unsupported input section type {section_type:#x} for section '{section}'")]
+    UnsupportedSectionType { section: String, section_type: u32 },
+
+    /// A direct page reference names a dylib weak definition that dyld may
+    /// coalesce with another image's: the patched instruction would keep this
+    /// image's copy. Such a definition must be addressed through the GOT.
+    #[error(
+        "relocation {kind:?} addresses coalescable weak definition '{symbol}' directly; \
+         dyld may bind it to another image's definition, so it must be reached through the GOT"
+    )]
+    DirectWeakDefinitionReference {
+        kind: AArch64RelocKind,
+        symbol: String,
+    },
+
+    /// A dylib would export a symbol whose cross-image meaning this linker
+    /// does not implement.
+    #[error("dylib cannot export '{symbol}': {detail}")]
+    UnsupportedDylibExport {
+        symbol: String,
+        detail: &'static str,
+    },
+
+    /// A dyld chained fixup cannot be represented as DYLD_CHAINED_PTR_64.
+    #[error("unrepresentable chained fixup at {address:#x}: {detail}")]
+    ChainedFixup { address: u64, detail: String },
+
     /// A relocation sequence is malformed.
     #[error("malformed relocation sequence: {0}")]
     MalformedRelocation(String),
@@ -239,6 +421,18 @@ pub enum LinkerError {
         first_obj: usize,
         second_obj: usize,
     },
+
+    /// The emitted image's ad-hoc code signature failed the independent
+    /// verifier ([`super::codesign::verify_ad_hoc_signature`]). No image is
+    /// returned: Apple Silicon kills arm64 code whose signature is missing or
+    /// invalid.
+    #[error("emitted image failed its ad-hoc code-signature self-check: {0}")]
+    CodeSignatureSelfCheck(#[source] super::codesign::CodeSignatureError),
+
+    /// The emitted image's signature verifies but is not the one this linker
+    /// writes.
+    #[error("emitted image's code signature departs from the linker contract: {0}")]
+    CodeSignatureContract(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -272,9 +466,14 @@ impl ParsedSection {
         self.flags & SECTION_TYPE_MASK
     }
 
-    /// Returns true if this is a zerofill section (__bss).
+    /// Returns true for every zero-fill section type (`S_ZEROFILL`,
+    /// `S_GB_ZEROFILL` and the thread-local `S_THREAD_LOCAL_ZEROFILL`). These
+    /// have no file bytes; their size is [`Self::vmsize`].
     pub fn is_zerofill(&self) -> bool {
-        self.section_type() == S_ZEROFILL
+        matches!(
+            self.section_type(),
+            S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+        )
     }
 
     /// Returns the effective size of this section in virtual memory.
@@ -288,18 +487,256 @@ impl ParsedSection {
     }
 }
 
+/// A symbol name that shares its bytes with the other names read from the
+/// same string-table run.
+///
+/// A Mach-O string table may tail-merge names (`_S1_A` is the tail of
+/// `_S2_S1_A`), and any number of symbols may name one string. A copy per
+/// symbol therefore costs memory quadratic in the input. The parser instead
+/// keeps each referenced run (the bytes up to a terminator) once, and every
+/// name is a tail of its run, so all names together cost the string table's
+/// size plus a fixed amount per symbol. Cloning bumps a reference count.
+#[derive(Clone)]
+pub struct SymbolName {
+    run: Arc<str>,
+    start: usize,
+}
+
+impl SymbolName {
+    /// The name `run[start..]`, which must start on a character boundary.
+    fn tail_of(run: &Arc<str>, start: usize) -> Self {
+        debug_assert!(run.is_char_boundary(start));
+        Self {
+            run: Arc::clone(run),
+            start,
+        }
+    }
+
+    /// The name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.run[self.start..]
+    }
+}
+
+impl std::ops::Deref for SymbolName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for SymbolName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for SymbolName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for SymbolName {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SymbolName {}
+
+impl std::hash::Hash for SymbolName {
+    // Hashes exactly as `str` does, as `Borrow<str>` requires.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialOrd for SymbolName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SymbolName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialEq<str> for SymbolName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SymbolName {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for SymbolName {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl PartialEq<SymbolName> for str {
+    fn eq(&self, other: &SymbolName) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<SymbolName> for &str {
+    fn eq(&self, other: &SymbolName) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<SymbolName> for String {
+    fn eq(&self, other: &SymbolName) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl std::fmt::Display for SymbolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Debug for SymbolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl From<&str> for SymbolName {
+    fn from(name: &str) -> Self {
+        Self {
+            run: Arc::from(name),
+            start: 0,
+        }
+    }
+}
+
+impl From<String> for SymbolName {
+    fn from(name: String) -> Self {
+        Self {
+            run: Arc::from(name),
+            start: 0,
+        }
+    }
+}
+
+impl From<&String> for SymbolName {
+    fn from(name: &String) -> Self {
+        Self::from(name.as_str())
+    }
+}
+
+impl From<SymbolName> for String {
+    fn from(name: SymbolName) -> Self {
+        name.as_str().to_owned()
+    }
+}
+
+/// One LC_SYMTAB string table's names, read without copying or rescanning
+/// shared bytes: the terminators are found once, and each referenced run is
+/// checked once and kept once (`SymbolName`).
+struct StringTableNames<'a> {
+    strings: &'a [u8],
+    /// Offsets of every NUL byte, ascending.
+    terminators: Vec<u32>,
+    /// For each referenced run (by terminator index): the start of its
+    /// longest UTF-8 tail within the run, and that tail.
+    runs: HashMap<usize, (usize, Arc<str>)>,
+}
+
+impl<'a> StringTableNames<'a> {
+    fn new(strings: &'a [u8]) -> Self {
+        let terminators = strings
+            .iter()
+            .enumerate()
+            .filter(|&(_, &byte)| byte == 0)
+            // The table's size is a u32 field, so every offset fits.
+            .map(|(offset, _)| offset as u32)
+            .collect();
+        Self {
+            strings,
+            terminators,
+            runs: HashMap::new(),
+        }
+    }
+
+    /// The name at string index `strx`: the bytes from `strx` to the next
+    /// NUL, which must be UTF-8.
+    fn name(&mut self, strx: usize) -> Result<SymbolName, &'static str> {
+        if strx > self.strings.len() {
+            return Err("symbol name lies outside the string table");
+        }
+        let index = self
+            .terminators
+            .partition_point(|&terminator| (terminator as usize) < strx);
+        let end = *self
+            .terminators
+            .get(index)
+            .ok_or("symbol name has no terminator inside the string table")?
+            as usize;
+        let run_start = match index {
+            0 => 0,
+            _ => self.terminators[index - 1] as usize + 1,
+        };
+        let strings = self.strings;
+        let (valid_from, tail) = self
+            .runs
+            .entry(index)
+            .or_insert_with(|| longest_utf8_tail(&strings[run_start..end]));
+        // A tail of the run is UTF-8 exactly when it starts inside the run's
+        // longest UTF-8 tail, on a character boundary.
+        let start = (strx - run_start)
+            .checked_sub(*valid_from)
+            .filter(|&start| tail.is_char_boundary(start))
+            .ok_or("symbol name is not UTF-8")?;
+        Ok(SymbolName::tail_of(tail, start))
+    }
+}
+
+/// The start of the longest suffix of `run` that is UTF-8, and that suffix.
+/// Linear in `run`: no suffix starting at or before an invalid sequence is
+/// UTF-8, so the scan resumes after each one.
+fn longest_utf8_tail(run: &[u8]) -> (usize, Arc<str>) {
+    let mut from = 0;
+    loop {
+        match std::str::from_utf8(&run[from..]) {
+            Ok(tail) => return (from, Arc::from(tail)),
+            // A sequence cut off by the end of the run leaves only the
+            // empty tail.
+            Err(error) => {
+                from = match error.error_len() {
+                    Some(length) => from + error.valid_up_to() + length,
+                    None => run.len(),
+                };
+            }
+        }
+    }
+}
+
 /// A parsed symbol from a Mach-O object file.
 #[derive(Debug, Clone)]
 pub struct ParsedSymbol {
-    /// Symbol name from the string table.
-    pub name: String,
+    /// Symbol name from the string table, sharing its bytes with the other
+    /// names of the same string-table run.
+    pub name: SymbolName,
     /// n_type field from nlist_64.
     pub n_type: u8,
     /// Section number (1-based, 0 = undefined).
     pub section: u8,
     /// n_desc field.
     pub desc: u16,
-    /// Symbol value (address/offset).
+    /// Raw n_value: an address in the input object's section address space.
     pub value: u64,
 }
 
@@ -374,6 +811,7 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
 }
 
 /// Read a NUL-terminated string from a byte slice starting at `off`.
+#[cfg(test)]
 fn read_cstring(data: &[u8], off: usize) -> String {
     let mut end = off;
     while end < data.len() && data[end] != 0 {
@@ -434,6 +872,11 @@ impl MachOParser {
         let lc_start = hdr_size;
         let lc_end = lc_start + sizeofcmds as usize;
         let mut offset = lc_start;
+        // File bytes owned by all sections, and by all relocation tables.
+        let mut section_file_bytes = 0usize;
+        let mut relocation_table_bytes = 0usize;
+        // Whether an LC_SYMTAB has been read.
+        let mut seen_symtab = false;
 
         for _ in 0..ncmds {
             if offset + 8 > lc_end || offset + 8 > data.len() {
@@ -443,7 +886,9 @@ impl MachOParser {
             let cmd = read_u32(data, offset);
             let cmdsize = read_u32(data, offset + 4) as usize;
 
-            if cmdsize < 8 || offset + cmdsize > data.len() {
+            // A command must also end inside the `sizeofcmds` area it was
+            // found in, or its body would be read from section data.
+            if cmdsize < 8 || offset + cmdsize > data.len() || offset + cmdsize > lc_end {
                 return Err(LinkerError::LoadCommandOverflow { offset });
             }
 
@@ -467,14 +912,28 @@ impl MachOParser {
                         return Err(LinkerError::LoadCommandOverflow { offset });
                     }
                     let nsects = read_u32(data, offset + 64);
+                    // Every section_64 header lies inside this command. They
+                    // used to be read up to the end of the input, so a
+                    // command whose `nsects` overran its `cmdsize` took later
+                    // load commands (or section data) as section headers.
+                    let headers_fit = (nsects as usize)
+                        .checked_mul(SECTION_64_SIZE as usize)
+                        .and_then(|size| size.checked_add(SEGMENT_COMMAND_64_SIZE as usize))
+                        .is_some_and(|size| size <= cmdsize);
+                    if !headers_fit {
+                        return Err(LinkerError::MalformedInput {
+                            file: "LC_SEGMENT_64".into(),
+                            detail: format!(
+                                "{nsects} section headers do not fit in the command's \
+                                 {cmdsize}-byte cmdsize"
+                            ),
+                        });
+                    }
 
                     // Parse each section_64 header.
                     let mut sec_offset = offset + SEGMENT_COMMAND_64_SIZE as usize;
                     for _ in 0..nsects {
                         let sec_size = SECTION_64_SIZE as usize;
-                        if sec_offset + sec_size > data.len() {
-                            return Err(LinkerError::LoadCommandOverflow { offset: sec_offset });
-                        }
 
                         let sec_name = read_name16(data, sec_offset);
                         let seg_name = read_name16(data, sec_offset + 16);
@@ -486,56 +945,95 @@ impl MachOParser {
                         let sec_nreloc = read_u32(data, sec_offset + 60);
                         let sec_flags = read_u32(data, sec_offset + 64);
 
-                        // Read section data. FINDING #4 (section-data arm): both
-                        // `sec_data_size` and `sec_file_offset` are attacker-controlled
-                        // (u64/u32 read from the object), so `sec_file_offset +
-                        // sec_data_size` can overflow usize (panic in debug / wrap in
-                        // release, defeating the `<= len` guard), and the zero-fill else
-                        // branch `vec![0u8; sec_data_size]` can be an allocation bomb
-                        // (~18 EB for sec_data_size = u64::MAX). Use checked arithmetic
-                        // and reject a section whose size exceeds the whole object,
-                        // returning the advertised typed error rather than panicking.
-                        let sec_data = match sec_file_offset.checked_add(sec_data_size) {
-                            Some(end) if sec_data_size > 0 && end <= data.len() => {
-                                data[sec_file_offset..end].to_vec()
+                        // Read section data. Zero-fill sections own no file
+                        // bytes: their offset field is conventionally 0, so
+                        // reading `size` bytes there would copy the Mach-O header
+                        // into the section. Keep them empty and carry the size in
+                        // `vmsize` without allocating it. Every other section's
+                        // bytes must lie inside the input: one that ran past the
+                        // end used to be silently zero-filled (a truncated
+                        // `__text` parsed as zeros), and each section could copy
+                        // or zero-fill up to the whole input, so memory grew with
+                        // the square of the input. Distinct sections own disjoint
+                        // file bytes, so together they cannot exceed the input.
+                        // Offset and size are attacker-controlled (u32/u64), so
+                        // every sum is checked.
+                        let zerofill_type = matches!(
+                            sec_flags & SECTION_TYPE_MASK,
+                            S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+                        );
+                        let malformed = |detail: String| LinkerError::MalformedInput {
+                            file: "LC_SEGMENT_64".into(),
+                            detail: format!("section {sec_name}: {detail}"),
+                        };
+                        let sec_data = if zerofill_type || sec_data_size == 0 {
+                            Vec::new()
+                        } else {
+                            let bytes = sec_file_offset
+                                .checked_add(sec_data_size)
+                                .and_then(|end| data.get(sec_file_offset..end))
+                                .ok_or_else(|| {
+                                    malformed(format!(
+                                        "{sec_data_size} bytes of file data at offset \
+                                         {sec_file_offset} run past the end of the \
+                                         {}-byte input",
+                                        data.len()
+                                    ))
+                                })?;
+                            section_file_bytes += sec_data_size;
+                            if section_file_bytes > data.len() {
+                                return Err(malformed(format!(
+                                    "sections claim {section_file_bytes} bytes of file \
+                                     data, more than the {}-byte input",
+                                    data.len()
+                                )));
                             }
-                            _ => {
-                                // Zero-fill (BSS-style) or out-of-file section. Cap the
-                                // allocation: a section claiming more bytes than the
-                                // entire object is malformed -> fail closed.
-                                if sec_data_size > data.len() {
-                                    return Err(LinkerError::LoadCommandOverflow {
-                                        offset: sec_offset,
-                                    });
-                                }
-                                vec![0u8; sec_data_size]
-                            }
+                            bytes.to_vec()
                         };
 
-                        // Read relocations for this section.
-                        let mut relocations = Vec::new();
+                        // Read relocations for this section. Validate the whole
+                        // table range before walking the attacker-supplied count,
+                        // as LC_SYMTAB does: an entry past the input used to be
+                        // skipped, so a truncated table silently lost relocations
+                        // and a count near u32::MAX spun over billions of
+                        // nonexistent entries (a 327-byte input took 10 s under
+                        // the fuzz_macho_fixup libFuzzer target). A section with
+                        // no relocations carries no meaningful table offset.
+                        // Tables of distinct sections are disjoint too, so all of
+                        // them together fit in the input.
                         let reloc_size = RELOCATION_INFO_SIZE as usize;
-                        for r in 0..sec_nreloc as usize {
-                            let roff = sec_reloff + r * reloc_size;
-                            if roff + reloc_size <= data.len() {
-                                let reloc_bytes: [u8; 8] = [
-                                    data[roff],
-                                    data[roff + 1],
-                                    data[roff + 2],
-                                    data[roff + 3],
-                                    data[roff + 4],
-                                    data[roff + 5],
-                                    data[roff + 6],
-                                    data[roff + 7],
-                                ];
-                                match decode_relocation(&reloc_bytes) {
-                                    Ok(reloc) => relocations.push(reloc),
-                                    Err(e) => {
-                                        return Err(LinkerError::RelocDecode {
-                                            section: sec_name.clone(),
-                                            detail: e.to_string(),
-                                        });
-                                    }
+                        let reloc_table: &[u8] = if sec_nreloc == 0 {
+                            &[]
+                        } else {
+                            let table = (sec_nreloc as usize)
+                                .checked_mul(reloc_size)
+                                .and_then(|size| sec_reloff.checked_add(size))
+                                .and_then(|end| data.get(sec_reloff..end))
+                                .ok_or_else(|| {
+                                    malformed(format!(
+                                        "relocation table of {sec_nreloc} entries at offset \
+                                         {sec_reloff} exceeds input"
+                                    ))
+                                })?;
+                            relocation_table_bytes += table.len();
+                            if relocation_table_bytes > data.len() {
+                                return Err(malformed(format!(
+                                    "relocation tables total {relocation_table_bytes} bytes, \
+                                     more than the {}-byte input",
+                                    data.len()
+                                )));
+                            }
+                            table
+                        };
+                        let mut relocations = Vec::with_capacity(sec_nreloc as usize);
+                        for reloc_bytes in reloc_table.as_chunks::<8>().0 {
+                            match decode_relocation(reloc_bytes) {
+                                Ok(reloc) => relocations.push(reloc),
+                                Err(e) => {
+                                    return Err(LinkerError::RelocDecode {
+                                        section: sec_name.clone(),
+                                        detail: e.to_string(),
+                                    });
                                 }
                             }
                         }
@@ -574,32 +1072,47 @@ impl MachOParser {
                     let symoff = read_u32(data, offset + 8) as usize;
                     let nsyms = read_u32(data, offset + 12) as usize;
                     let stroff = read_u32(data, offset + 16) as usize;
-                    let _strsize = read_u32(data, offset + 20) as usize;
-
-                    let nlist_size = NLIST_64_SIZE as usize;
-                    for i in 0..nsyms {
-                        let sym_off = symoff + i * nlist_size;
-                        if sym_off + nlist_size <= data.len() {
-                            let nlist_bytes: [u8; 16] = data[sym_off..sym_off + 16]
-                                .try_into()
-                                .expect("nlist_64 slice");
-                            let nlist = NList64::decode(&nlist_bytes);
-
-                            // Read the symbol name from the string table.
-                            let name = if (stroff + nlist.strx as usize) < data.len() {
-                                read_cstring(data, stroff + nlist.strx as usize)
-                            } else {
-                                String::new()
-                            };
-
-                            symbols.push(ParsedSymbol {
-                                name,
-                                n_type: nlist.typ,
-                                section: nlist.sect,
-                                desc: nlist.desc,
-                                value: nlist.value,
-                            });
-                        }
+                    let strsize = read_u32(data, offset + 20) as usize;
+                    let malformed = |detail: &str| LinkerError::MalformedInput {
+                        file: "LC_SYMTAB".into(),
+                        detail: detail.into(),
+                    };
+                    // Validate complete ranges before walking the attacker-
+                    // supplied count. Truncated tables must not silently lose
+                    // symbols or spin over billions of nonexistent entries.
+                    let sym_end = nsyms
+                        .checked_mul(NLIST_64_SIZE as usize)
+                        .and_then(|size| symoff.checked_add(size))
+                        .ok_or_else(|| malformed("symbol table range overflow"))?;
+                    let table = data
+                        .get(symoff..sym_end)
+                        .ok_or_else(|| malformed("symbol table exceeds input"))?;
+                    let str_end = stroff
+                        .checked_add(strsize)
+                        .ok_or_else(|| malformed("string table range overflow"))?;
+                    let strings = data
+                        .get(stroff..str_end)
+                        .ok_or_else(|| malformed("string table exceeds input"))?;
+                    // An object has one symbol table. Each LC_SYMTAB indexes
+                    // its whole string table once, so a command list repeating
+                    // it would cost time quadratic in the input.
+                    if seen_symtab {
+                        return Err(malformed("more than one LC_SYMTAB"));
+                    }
+                    seen_symtab = true;
+                    let mut names = StringTableNames::new(strings);
+                    for nlist_bytes in table.as_chunks::<16>().0 {
+                        let nlist = NList64::decode(nlist_bytes);
+                        // Lossy decoding could merge distinct byte names into
+                        // one symbol identity. This linker admits UTF-8 names.
+                        let name = names.name(nlist.strx as usize).map_err(malformed)?;
+                        symbols.push(ParsedSymbol {
+                            name,
+                            n_type: nlist.typ,
+                            section: nlist.sect,
+                            desc: nlist.desc,
+                            value: nlist.value,
+                        });
                     }
                 }
                 _ => {
@@ -640,7 +1153,7 @@ pub struct ResolvedSymbol {
 /// Resolves symbols across multiple parsed object files.
 pub struct SymbolResolver {
     /// Map from symbol name to its definition.
-    defined: HashMap<String, ResolvedSymbol>,
+    defined: HashMap<SymbolName, ResolvedSymbol>,
     /// Map from (object index, symbol table index) to defined symbol address.
     ///
     /// Mach-O `r_extern=1` relocations name a symbol table index. That symbol
@@ -648,9 +1161,10 @@ pub struct SymbolResolver {
     /// of being published through the global name map.
     defined_by_index: HashMap<(usize, usize), u64>,
     /// List of (object_index, symbol_index, name) for undefined references.
-    undefined: Vec<(usize, usize, String)>,
-    /// Set of symbol names that are weak references (can remain unresolved).
-    weak_refs: HashSet<String>,
+    undefined: Vec<(usize, usize, SymbolName)>,
+    /// Names with at least one strong undefined reference. A weak reference in
+    /// another object must never make these required definitions optional.
+    strong_refs: HashSet<SymbolName>,
 }
 
 impl SymbolResolver {
@@ -660,7 +1174,7 @@ impl SymbolResolver {
             defined: HashMap::new(),
             defined_by_index: HashMap::new(),
             undefined: Vec::new(),
-            weak_refs: HashSet::new(),
+            strong_refs: HashSet::new(),
         }
     }
 
@@ -679,13 +1193,24 @@ impl SymbolResolver {
     ) -> Result<(), LinkerError> {
         for (sym_idx, sym) in obj.symbols.iter().enumerate() {
             if sym.is_defined() {
-                let sec_idx = (sym.section as usize).saturating_sub(1);
-                let base = if sec_idx < section_addrs.len() {
-                    section_addrs[sec_idx]
-                } else {
-                    0
+                let invalid = || LinkerError::MalformedInput {
+                    file: format!("object {obj_index}"),
+                    detail: format!(
+                        "symbol '{}' has an invalid section or section-relative value",
+                        sym.name
+                    ),
                 };
-                let address = base + sym.value;
+                let sec_idx = usize::from(sym.section)
+                    .checked_sub(1)
+                    .ok_or_else(invalid)?;
+                let section = obj.sections.get(sec_idx).ok_or_else(invalid)?;
+                let base = section_addrs.get(sec_idx).ok_or_else(invalid)?;
+                let offset = sym
+                    .value
+                    .checked_sub(section.addr)
+                    .filter(|offset| *offset <= section.effective_size())
+                    .ok_or_else(invalid)?;
+                let address = layout_add(*base, offset, "symbol address")?;
                 self.defined_by_index.insert((obj_index, sym_idx), address);
 
                 if !sym.is_external() {
@@ -712,7 +1237,7 @@ impl SymbolResolver {
                     } else {
                         // Both strong - duplicate symbol error.
                         return Err(LinkerError::DuplicateSymbolDetailed {
-                            name: sym.name.clone(),
+                            name: sym.name.to_string(),
                             first_obj: existing.object_index,
                             second_obj: obj_index,
                         });
@@ -729,9 +1254,10 @@ impl SymbolResolver {
                     );
                 }
             } else if sym.is_undefined() && sym.is_external() {
-                // Track weak references separately.
-                if sym.is_weak_ref() {
-                    self.weak_refs.insert(sym.name.clone());
+                // Null resolution is allowed only when every reference to
+                // this name is weak, independent of object order.
+                if !sym.is_weak_ref() {
+                    self.strong_refs.insert(sym.name.clone());
                 }
                 self.undefined.push((obj_index, sym_idx, sym.name.clone()));
             }
@@ -758,17 +1284,17 @@ impl SymbolResolver {
 
         // Copy all defined symbols.
         for (name, sym) in &self.defined {
-            result.insert(name.clone(), sym.address);
+            result.insert(name.to_string(), sym.address);
         }
 
         // Verify all undefined symbols have definitions.
         for (_obj_idx, _sym_idx, name) in &self.undefined {
-            if !result.contains_key(name) {
-                if self.weak_refs.contains(name) {
-                    // Weak references resolve to 0 if not defined.
-                    result.insert(name.clone(), 0);
+            if !result.contains_key(name.as_str()) {
+                if !self.strong_refs.contains(name) {
+                    // Exclusively weak references resolve to 0 if not defined.
+                    result.insert(name.to_string(), 0);
                 } else {
-                    return Err(LinkerError::UndefinedSymbol(name.clone()));
+                    return Err(LinkerError::UndefinedSymbol(name.to_string()));
                 }
             }
         }
@@ -789,24 +1315,335 @@ impl Default for SymbolResolver {
 }
 
 // ---------------------------------------------------------------------------
-// Section layout
+// Section classification and layout
 // ---------------------------------------------------------------------------
+
+/// Where an input section is placed in the linked image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionClass {
+    /// `__TEXT` input (code, literals, `__eh_frame`), mapped into `__TEXT,__text`.
+    Text,
+    /// Other file-backed input, merged into `__DATA,__data`.
+    Data,
+    /// `__DATA,__const` and `__DATA_CONST` input: data written only by dyld's
+    /// fixups, merged into `__DATA_CONST,__const`, which dyld makes read-only
+    /// once the fixups are applied (the Mach-O equivalent of ELF RELRO).
+    ConstData,
+    /// `S_THREAD_LOCAL_VARIABLES` descriptors, merged into `__DATA,__thread_vars`.
+    ThreadVars,
+    /// `S_THREAD_LOCAL_REGULAR` initial-value templates (`__DATA,__thread_data`).
+    ThreadData,
+    /// `S_THREAD_LOCAL_ZEROFILL` zero templates (`__DATA,__thread_bss`).
+    ThreadBss,
+    /// Ordinary zero-fill storage, placed after every file-backed byte.
+    ZeroFill,
+    /// `S_ATTR_DEBUG` input (`__LD,__compact_unwind`, `__DWARF`): not loaded.
+    Debug,
+}
+
+impl SectionClass {
+    /// TLV descriptors and templates: only TLV-aware relocations may name them.
+    fn is_thread_local(self) -> bool {
+        matches!(self, Self::ThreadVars | Self::ThreadData | Self::ThreadBss)
+    }
+}
+
+fn section_label(section: &ParsedSection) -> String {
+    format!("{},{}", section.segment, section.name)
+}
+
+/// Classify one input section, rejecting section types whose meaning this
+/// linker would otherwise drop.
+fn classify_section(
+    object_index: usize,
+    section: &ParsedSection,
+) -> Result<SectionClass, LinkerError> {
+    let section_type = section.section_type();
+    if matches!(
+        section_type,
+        S_NON_LAZY_SYMBOL_POINTERS
+            | S_LAZY_SYMBOL_POINTERS
+            | S_SYMBOL_STUBS
+            | S_MOD_INIT_FUNC_POINTERS
+            | S_MOD_TERM_FUNC_POINTERS
+            | S_INTERPOSING
+            | S_DTRACE_DOF
+            | S_LAZY_DYLIB_SYMBOL_POINTERS
+            | S_THREAD_LOCAL_VARIABLE_POINTERS
+            | S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
+            | S_INIT_FUNC_OFFSETS
+    ) {
+        return Err(LinkerError::UnsupportedSectionType {
+            section: section_label(section),
+            section_type,
+        });
+    }
+    if section.flags & S_ATTR_DEBUG != 0 {
+        return Ok(SectionClass::Debug);
+    }
+    let zerofill = section.is_zerofill();
+    if zerofill
+        && (section.segment == "__TEXT"
+            || !section.data.is_empty()
+            || !section.relocations.is_empty())
+    {
+        return Err(LinkerError::MalformedInput {
+            file: format!("object {object_index}"),
+            detail: format!(
+                "zerofill section '{}' must be non-text with no file bytes or relocations",
+                section.name
+            ),
+        });
+    }
+    let thread_local = matches!(
+        section_type,
+        S_THREAD_LOCAL_REGULAR | S_THREAD_LOCAL_ZEROFILL | S_THREAD_LOCAL_VARIABLES
+    );
+    if section.segment == "__TEXT" {
+        if thread_local {
+            return Err(LinkerError::ThreadLocal(format!(
+                "object {object_index}: thread-local section '{}' must not be placed in __TEXT",
+                section_label(section)
+            )));
+        }
+        return Ok(SectionClass::Text);
+    }
+    let read_only_after_fixups = section.segment == "__DATA_CONST"
+        || (section.segment == "__DATA" && section.name == "__const");
+    if read_only_after_fixups && (thread_local || zerofill) {
+        return Err(LinkerError::MalformedInput {
+            file: format!("object {object_index}"),
+            detail: format!(
+                "section '{}' is read-only after fixups and cannot hold thread-local or zero-fill storage",
+                section_label(section)
+            ),
+        });
+    }
+    Ok(match section_type {
+        S_THREAD_LOCAL_VARIABLES => SectionClass::ThreadVars,
+        S_THREAD_LOCAL_REGULAR => SectionClass::ThreadData,
+        S_THREAD_LOCAL_ZEROFILL => SectionClass::ThreadBss,
+        _ if zerofill => SectionClass::ZeroFill,
+        _ if read_only_after_fixups => SectionClass::ConstData,
+        _ => SectionClass::Data,
+    })
+}
+
+fn classify_objects(objects: &[ParsedObject]) -> Result<Vec<Vec<SectionClass>>, LinkerError> {
+    objects
+        .iter()
+        .enumerate()
+        .map(|(object_index, object)| {
+            object
+                .sections
+                .iter()
+                .map(|section| classify_section(object_index, section))
+                .collect()
+        })
+        .collect()
+}
+
+/// Which optional segments, sections and synthesized slots an image has.
+///
+/// Presence depends only on sizes and slot counts, never on absolute
+/// addresses, so the load-command size (and therefore the mapped text base)
+/// can be fixed before any address is assigned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ImageShape {
+    stubs: usize,
+    got: usize,
+    tlv_pointers: usize,
+    const_data: bool,
+    data: bool,
+    thread_vars: bool,
+    thread_data: bool,
+    thread_bss: bool,
+}
+
+impl ImageShape {
+    fn new(
+        objects: &[ParsedObject],
+        classes: &[Vec<SectionClass>],
+        stubs: usize,
+        got: usize,
+        tlv_pointers: usize,
+    ) -> Self {
+        let class_has_bytes = |wanted: fn(SectionClass) -> bool| {
+            objects.iter().zip(classes).any(|(object, classes)| {
+                object
+                    .sections
+                    .iter()
+                    .zip(classes)
+                    .any(|(section, class)| wanted(*class) && section.effective_size() > 0)
+            })
+        };
+        Self {
+            stubs,
+            got,
+            tlv_pointers,
+            const_data: class_has_bytes(|class| class == SectionClass::ConstData),
+            data: class_has_bytes(|class| {
+                matches!(
+                    class,
+                    SectionClass::Data
+                        | SectionClass::ThreadVars
+                        | SectionClass::ThreadData
+                        | SectionClass::ThreadBss
+                        | SectionClass::ZeroFill
+                )
+            }),
+            thread_vars: class_has_bytes(|class| class == SectionClass::ThreadVars),
+            thread_data: class_has_bytes(|class| class == SectionClass::ThreadData),
+            thread_bss: class_has_bytes(|class| class == SectionClass::ThreadBss),
+        }
+    }
+
+    fn has_const(&self) -> bool {
+        self.got > 0 || self.tlv_pointers > 0 || self.const_data
+    }
+
+    fn text_nsects(&self) -> u32 {
+        1 + u32::from(self.stubs > 0)
+    }
+
+    fn const_nsects(&self) -> u32 {
+        u32::from(self.got > 0) + u32::from(self.tlv_pointers > 0) + u32::from(self.const_data)
+    }
+
+    fn data_nsects(&self) -> u32 {
+        if !self.data {
+            return 0;
+        }
+        1 + u32::from(self.thread_vars) + u32::from(self.thread_data) + u32::from(self.thread_bss)
+    }
+}
+
+/// The Mach-O file type an image link produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageKind<'a> {
+    /// `MH_EXECUTE` at `DEFAULT_BASE_ADDR` behind `__PAGEZERO`, entered
+    /// through `LC_MAIN`, with an empty exports trie.
+    Executable,
+    /// `MH_DYLIB` at base 0 named by `LC_ID_DYLIB`, exporting its external,
+    /// non-private definitions through the exports trie.
+    Dylib { install_name: &'a str },
+}
+
+impl ImageKind<'_> {
+    /// The unslid address of the Mach-O header.
+    fn base(self) -> u64 {
+        match self {
+            Self::Executable => DEFAULT_BASE_ADDR,
+            Self::Dylib { .. } => 0,
+        }
+    }
+
+    fn filetype(self) -> u32 {
+        match self {
+            Self::Executable => MH_EXECUTE,
+            Self::Dylib { .. } => MH_DYLIB,
+        }
+    }
+
+    fn header_flags(self) -> u32 {
+        match self {
+            Self::Executable => MH_EXECUTE_FLAGS,
+            Self::Dylib { .. } => MH_DYLIB_FLAGS,
+        }
+    }
+
+    /// Segment index of the first data segment (after `[__PAGEZERO,] __TEXT`).
+    fn first_data_segment(self) -> usize {
+        match self {
+            Self::Executable => 2,
+            Self::Dylib { .. } => 1,
+        }
+    }
+
+    /// Code-directory `execSegFlags`: only the main executable is marked.
+    fn exec_seg_flags(self) -> u64 {
+        match self {
+            Self::Executable => CS_EXECSEG_MAIN_BINARY,
+            Self::Dylib { .. } => 0,
+        }
+    }
+
+    /// Count and bytes of every load command except `__TEXT`, the data
+    /// segments, `__LINKEDIT` and `LC_LOAD_DYLIB`: build version, UUID, the
+    /// three linkedit-data commands, symtab and dysymtab, plus `__PAGEZERO`,
+    /// `LC_MAIN` and `LC_LOAD_DYLINKER` (executables) or `LC_ID_DYLIB` (dylibs).
+    fn fixed_commands(self) -> (u32, u64) {
+        let common = u64::from(
+            BUILD_VERSION_COMMAND_SIZE
+                + UUID_COMMAND_SIZE
+                + 3 * LINKEDIT_DATA_COMMAND_SIZE
+                + SYMTAB_COMMAND_SIZE
+                + DYSYMTAB_COMMAND_SIZE,
+        );
+        match self {
+            Self::Executable => (
+                10,
+                common
+                    + u64::from(SEGMENT_COMMAND_64_SIZE + LC_MAIN_SIZE + dylinker_command_size()),
+            ),
+            Self::Dylib { install_name } => (8, common + id_dylib_command_size(install_name)),
+        }
+    }
+}
+
+fn id_dylib_command_size(install_name: &str) -> u64 {
+    align_to(
+        u64::from(LC_LOAD_DYLIB_HEADER_SIZE) + install_name.len() as u64 + 1,
+        8,
+    )
+}
+
+/// Addresses planned for one image before symbol resolution.
+#[derive(Debug, Clone)]
+struct ImageLayout {
+    section_addrs: Vec<Vec<u64>>,
+    /// First text-content address (after the mapped headers).
+    text_vmaddr: u64,
+    stubs_addr: u64,
+    text_end: u64,
+    const_vmaddr: u64,
+    got_addr: u64,
+    tlv_pointers_addr: u64,
+    /// End of the TLV pointer slots. `__DATA_CONST,__const` may start later
+    /// when its inputs need more than 8-byte alignment.
+    tlv_pointers_end: u64,
+    /// `__DATA_CONST,__const`: placed after the TLV pointer slots.
+    const_data: (u64, u64),
+    const_end: u64,
+    data_vmaddr: u64,
+    regular_end: u64,
+    thread_vars: (u64, u64),
+    thread_data: (u64, u64),
+    data_file_end: u64,
+    thread_bss: (u64, u64),
+    data_end: u64,
+    /// Start of the contiguous TLV template image (`__thread_data` then
+    /// `__thread_bss`); descriptor offsets are relative to it.
+    tls_base: Option<u64>,
+    tls_alignment: u64,
+}
 
 /// Result of laying out sections across multiple objects.
 #[derive(Debug, Clone)]
 pub struct LayoutResult {
     /// Base addresses for each section, in order: all sections from obj 0,
-    /// then all sections from obj 1, etc.
+    /// then all sections from obj 1, etc. Unloaded `S_ATTR_DEBUG` sections
+    /// have no image address and report 0.
     pub section_addrs: Vec<Vec<u64>>,
     /// Total size of the __TEXT segment content.
     pub text_size: u64,
-    /// Total size of the __DATA segment content.
+    /// Virtual size of __DATA, including alignment gaps and zero-fill storage.
     pub data_size: u64,
-    /// File offset where __TEXT segment data starts.
-    pub text_file_offset: u64,
-    /// File offset where __DATA segment data starts.
-    pub data_file_offset: u64,
-    /// Virtual address of __TEXT segment.
+    /// File-backed __DATA bytes, excluding zero-fill storage.
+    pub data_file_size: u64,
+    /// Offset of reserved dynamic-link stubs within the text content.
+    pub stubs_offset: u64,
+    /// Virtual address where text content begins, after the mapped headers.
     pub text_vmaddr: u64,
     /// Virtual address of __DATA segment.
     pub data_vmaddr: u64,
@@ -814,94 +1651,254 @@ pub struct LayoutResult {
 
 /// Assign final virtual addresses to sections from multiple objects.
 ///
-/// Handles zerofill (BSS) sections: they occupy virtual address space but not
-/// file space. BSS sections are placed after regular data sections in the
-/// __DATA segment's virtual address space.
-pub fn lay_out_sections(objects: &[ParsedObject], base_addr: u64) -> LayoutResult {
-    let mut text_offset: u64 = 0;
-    let mut data_offset: u64 = 0;
-    let mut bss_offset: u64 = 0;
-
-    let mut section_addrs: Vec<Vec<u64>> = Vec::new();
-
-    // First pass: compute sizes and assign addresses for regular sections.
-    // BSS sections are deferred to a second pass (they go after regular data).
-    for obj in objects {
-        let mut addrs = Vec::new();
-        for sec in &obj.sections {
-            let is_text = sec.segment == "__TEXT";
-            let alignment = 1u64 << sec.align;
-
-            if is_text {
-                // Align text_offset.
-                let misalign = text_offset % alignment;
-                if misalign != 0 {
-                    text_offset += alignment - misalign;
-                }
-                addrs.push(base_addr + text_offset);
-                text_offset += sec.data.len() as u64;
-            } else if sec.is_zerofill() {
-                // Zerofill (BSS) - placeholder, will be fixed up in second pass.
-                addrs.push(bss_offset);
-                let misalign = bss_offset % alignment;
-                if misalign != 0 {
-                    bss_offset += alignment - misalign;
-                    // Re-store with aligned offset.
-                    *addrs.last_mut().unwrap() = bss_offset;
-                }
-                bss_offset += sec.effective_size();
-            } else {
-                // Regular __DATA section.
-                let misalign = data_offset % alignment;
-                if misalign != 0 {
-                    data_offset += alignment - misalign;
-                }
-                // Data address will be computed after we know total text size.
-                // Store as a relative offset for now.
-                addrs.push(data_offset);
-                data_offset += sec.data.len() as u64;
-            }
-        }
-        section_addrs.push(addrs);
-    }
-
-    // Align text_size to page boundary.
-    let text_size = text_offset;
-    let text_size_aligned = align_to(text_size, PAGE_SIZE);
-
-    let data_vmaddr = base_addr + text_size_aligned;
-
-    // Fix up data and BSS section addresses.
-    // BSS sections are placed after regular data sections in virtual space.
-    let bss_base = data_vmaddr + data_offset;
-    for (obj_idx, obj) in objects.iter().enumerate() {
-        for (sec_idx, sec) in obj.sections.iter().enumerate() {
-            if sec.segment == "__TEXT" {
-                // Already has absolute addresses from the first pass.
-            } else if sec.is_zerofill() {
-                // BSS sections: relative offset was stored; add bss_base.
-                section_addrs[obj_idx][sec_idx] += bss_base;
-            } else {
-                // Regular data sections: add data_vmaddr.
-                section_addrs[obj_idx][sec_idx] += data_vmaddr;
-            }
-        }
-    }
-
-    // Total data segment VM size includes both regular data and BSS.
-    let total_data_vmsize = data_offset + bss_offset;
-
-    // Compute file offsets. For the MVP, we'll compute these during emission.
-    // The text file offset comes after all load commands.
-    LayoutResult {
-        section_addrs,
-        text_size,
-        data_size: total_data_vmsize,
-        text_file_offset: 0, // Will be set during emission.
-        data_file_offset: 0, // Will be set during emission.
+/// Zero-fill sections occupy virtual address space but not file space and are
+/// placed after every file-backed byte of `__DATA`. Thread-local templates are
+/// kept contiguous (`__thread_data` then `__thread_bss`). No stubs or GOT/TLV
+/// slots are reserved; the image linker plans those before calling the same
+/// layout.
+pub fn lay_out_sections(
+    objects: &[ParsedObject],
+    base_addr: u64,
+) -> Result<LayoutResult, LinkerError> {
+    let classes = classify_objects(objects)?;
+    let shape = ImageShape::new(objects, &classes, 0, 0, 0);
+    let layout = plan_layout(objects, &classes, &shape, base_addr)?;
+    Ok(LayoutResult {
+        text_size: layout.text_end - base_addr,
+        data_size: layout.data_end - layout.data_vmaddr,
+        data_file_size: layout.data_file_end - layout.data_vmaddr,
+        stubs_offset: layout.stubs_addr - base_addr,
         text_vmaddr: base_addr,
-        data_vmaddr,
+        data_vmaddr: layout.data_vmaddr,
+        section_addrs: layout.section_addrs,
+    })
+}
+
+fn layout_add(left: u64, right: u64, context: &'static str) -> Result<u64, LinkerError> {
+    left.checked_add(right)
+        .ok_or(LinkerError::LayoutOverflow(context))
+}
+
+fn checked_align_to(value: u64, alignment: u64) -> Result<u64, LinkerError> {
+    let padding = (alignment - value % alignment) % alignment;
+    layout_add(value, padding, "aligned address")
+}
+
+fn section_alignment(section: &ParsedSection) -> Result<u64, LinkerError> {
+    1u64.checked_shl(section.align)
+        .ok_or_else(|| LinkerError::InvalidAlignment {
+            section: section.name.clone(),
+            exponent: section.align,
+        })
+}
+
+/// Place every input section of `class` at `cursor`, returning the occupied
+/// `(start, end)` range. An absent output section (no bytes) assigns its
+/// zero-size inputs the cursor without alignment, so it cannot move later
+/// addresses or create an unplanned segment.
+#[allow(clippy::too_many_arguments)]
+fn place_class(
+    objects: &[ParsedObject],
+    classes: &[Vec<SectionClass>],
+    class: SectionClass,
+    present: bool,
+    minimum_alignment: u64,
+    cursor: &mut u64,
+    section_addrs: &mut [Vec<u64>],
+    context: &'static str,
+) -> Result<(u64, u64), LinkerError> {
+    let mut start = None;
+    for (object_index, object) in objects.iter().enumerate() {
+        for (section_index, section) in object.sections.iter().enumerate() {
+            if classes[object_index][section_index] != class {
+                continue;
+            }
+            if present {
+                let alignment = section_alignment(section)?.max(minimum_alignment);
+                *cursor = checked_align_to(*cursor, alignment)?;
+            }
+            start.get_or_insert(*cursor);
+            section_addrs[object_index][section_index] = *cursor;
+            *cursor = layout_add(*cursor, section.effective_size(), context)?;
+        }
     }
+    Ok((start.unwrap_or(*cursor), *cursor))
+}
+
+/// Plan every occupied byte before resolving symbols. Stubs extend text; the
+/// GOT and TLV pointer slots and then read-only-after-fixup data form
+/// `__DATA_CONST`; `__DATA` holds regular data,
+/// TLV descriptors, the contiguous TLV template image, then zero-fill storage.
+/// Alignment applies to absolute addresses, not offsets from an unaligned base.
+fn plan_layout(
+    objects: &[ParsedObject],
+    classes: &[Vec<SectionClass>],
+    shape: &ImageShape,
+    base_addr: u64,
+) -> Result<ImageLayout, LinkerError> {
+    let slot_extent = |count: usize, width: u64, context| {
+        u64::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(width))
+            .ok_or(LinkerError::LayoutOverflow(context))
+    };
+    let stub_size = slot_extent(shape.stubs, u64::from(STUB_SIZE), "stub extent")?;
+    let got_size = slot_extent(shape.got, 8, "GOT extent")?;
+    let tlv_size = slot_extent(shape.tlv_pointers, 8, "TLV pointer extent")?;
+    let mut section_addrs: Vec<Vec<u64>> = objects
+        .iter()
+        .map(|object| vec![0; object.sections.len()])
+        .collect();
+
+    let mut cursor = base_addr;
+    place_class(
+        objects,
+        classes,
+        SectionClass::Text,
+        true,
+        1,
+        &mut cursor,
+        &mut section_addrs,
+        "text extent",
+    )?;
+    if shape.stubs > 0 {
+        cursor = checked_align_to(cursor, 4)?;
+    }
+    let stubs_addr = cursor;
+    let text_end = layout_add(cursor, stub_size, "text plus stubs")?;
+
+    let const_vmaddr = checked_align_to(text_end, PAGE_SIZE)?;
+    let got_addr = const_vmaddr;
+    let tlv_pointers_addr = layout_add(got_addr, got_size, "GOT extent")?;
+    let tlv_pointers_end = layout_add(tlv_pointers_addr, tlv_size, "TLV pointer extent")?;
+    cursor = tlv_pointers_end;
+    // Relocated constants carry pointer fixups; keep each pointer-aligned.
+    let const_data = place_class(
+        objects,
+        classes,
+        SectionClass::ConstData,
+        shape.const_data,
+        8,
+        &mut cursor,
+        &mut section_addrs,
+        "read-only-after-fixup data extent",
+    )?;
+    let const_end = cursor;
+    let data_vmaddr = if shape.has_const() {
+        checked_align_to(const_end, PAGE_SIZE)?
+    } else {
+        const_vmaddr
+    };
+
+    cursor = data_vmaddr;
+    place_class(
+        objects,
+        classes,
+        SectionClass::Data,
+        shape.data,
+        1,
+        &mut cursor,
+        &mut section_addrs,
+        "data extent",
+    )?;
+    let regular_end = cursor;
+    // Descriptors carry pointer fixups; keep each one pointer-aligned.
+    let thread_vars = place_class(
+        objects,
+        classes,
+        SectionClass::ThreadVars,
+        shape.thread_vars,
+        8,
+        &mut cursor,
+        &mut section_addrs,
+        "TLV descriptor extent",
+    )?;
+
+    let mut tls_alignment = 1;
+    for (object, classes) in objects.iter().zip(classes) {
+        for (section, class) in object.sections.iter().zip(classes) {
+            if matches!(class, SectionClass::ThreadData | SectionClass::ThreadBss)
+                && section.effective_size() > 0
+            {
+                tls_alignment = tls_alignment.max(section_alignment(section)?);
+            }
+        }
+    }
+    if tls_alignment > TLS_TEMPLATE_MAX_ALIGNMENT {
+        return Err(LinkerError::ThreadLocal(format!(
+            "thread-local template alignment {tls_alignment} exceeds the {TLS_TEMPLATE_MAX_ALIGNMENT}-byte alignment of dyld's per-thread copies"
+        )));
+    }
+    if shape.thread_data || shape.thread_bss {
+        cursor = checked_align_to(cursor, tls_alignment)?;
+    }
+    let thread_data = place_class(
+        objects,
+        classes,
+        SectionClass::ThreadData,
+        shape.thread_data,
+        1,
+        &mut cursor,
+        &mut section_addrs,
+        "TLV template extent",
+    )?;
+    let data_file_end = cursor;
+    let thread_bss = place_class(
+        objects,
+        classes,
+        SectionClass::ThreadBss,
+        shape.thread_bss,
+        1,
+        &mut cursor,
+        &mut section_addrs,
+        "TLV zero-fill extent",
+    )?;
+    place_class(
+        objects,
+        classes,
+        SectionClass::ZeroFill,
+        shape.data,
+        1,
+        &mut cursor,
+        &mut section_addrs,
+        "BSS extent",
+    )?;
+    let data_end = cursor;
+    // dyld copies each thread's template from the first emitted TLV template
+    // section, so descriptor offsets are relative to that section's start. An
+    // empty input section placed first may be aligned beyond `tls_alignment`
+    // and start the section after the aligned cursor.
+    let tls_base = if shape.thread_data {
+        Some(thread_data.0)
+    } else if shape.thread_bss {
+        Some(thread_bss.0)
+    } else {
+        None
+    };
+    // Emission rounds the VM extent to complete pages. Reject that overflow
+    // here too, including a huge BSS which needs no corresponding allocation.
+    checked_align_to(data_end, PAGE_SIZE)?;
+    Ok(ImageLayout {
+        section_addrs,
+        text_vmaddr: base_addr,
+        stubs_addr,
+        text_end,
+        const_vmaddr,
+        got_addr,
+        tlv_pointers_addr,
+        tlv_pointers_end,
+        const_data,
+        const_end,
+        data_vmaddr,
+        regular_end,
+        thread_vars,
+        thread_data,
+        data_file_end,
+        thread_bss,
+        data_end,
+        tls_base,
+        tls_alignment,
+    })
 }
 
 /// Align `value` up to the next multiple of `alignment`.
@@ -934,17 +1931,16 @@ fn write_be_u64(buf: &mut Vec<u8>, value: u64) {
     buf.extend_from_slice(&value.to_be_bytes());
 }
 
-fn code_signature_block_count(code_limit: u64) -> u32 {
-    let count = if code_limit == 0 {
-        0
-    } else {
-        code_limit.div_ceil(CODE_SIGNATURE_BLOCK_SIZE)
-    };
-    assert!(
-        count <= u32::MAX as u64,
-        "code signature block count exceeds CodeDirectory range"
-    );
-    count as u32
+/// Number of 4 KiB code-signing blocks covering `code_limit` bytes. The
+/// CodeDirectory's 32-bit `codeLimit` field bounds the signed prefix; this
+/// linker does not write `codeLimit64`, so a larger image is refused.
+fn code_signature_block_count(code_limit: u64) -> Result<u32, LinkerError> {
+    if code_limit > u64::from(u32::MAX) {
+        return Err(LinkerError::LayoutOverflow(
+            "code signature codeLimit (images over 4 GiB need codeLimit64)",
+        ));
+    }
+    Ok(code_limit.div_ceil(CODE_SIGNATURE_BLOCK_SIZE) as u32)
 }
 
 fn code_signature_headers_size() -> usize {
@@ -954,33 +1950,29 @@ fn code_signature_headers_size() -> usize {
     ) as usize
 }
 
-fn code_signature_size(code_limit: u64) -> u32 {
-    let size = code_signature_headers_size()
-        + code_signature_block_count(code_limit) as usize * CODE_SIGNATURE_HASH_SIZE;
-    assert!(
-        size <= u32::MAX as usize,
-        "code signature size exceeds linkedit_data_command range"
-    );
-    size as u32
+fn code_signature_size(code_limit: u64) -> Result<u32, LinkerError> {
+    let size = code_signature_headers_size() as u64
+        + u64::from(code_signature_block_count(code_limit)?) * CODE_SIGNATURE_HASH_SIZE as u64;
+    u32::try_from(size).map_err(|_| LinkerError::LayoutOverflow("code signature size"))
 }
 
 fn build_ad_hoc_code_signature(
     file_prefix: &[u8],
     text_file_offset: u64,
     text_file_size: u64,
-) -> Vec<u8> {
+    exec_seg_flags: u64,
+) -> Result<Vec<u8>, LinkerError> {
     let code_limit = file_prefix.len() as u64;
-    assert!(
-        code_limit <= u32::MAX as u64,
-        "CodeDirectory codeLimit64 is not wired for large executables yet"
-    );
-
-    let block_count = code_signature_block_count(code_limit);
+    let block_count = code_signature_block_count(code_limit)?;
     let all_headers_size = code_signature_headers_size();
     let hash_offset = all_headers_size - CS_BLOB_HEADERS_SIZE;
     let code_directory_length = hash_offset + block_count as usize * CODE_SIGNATURE_HASH_SIZE;
     let signature_size = CS_BLOB_HEADERS_SIZE + code_directory_length;
-    assert_eq!(signature_size, code_signature_size(code_limit) as usize);
+    if signature_size != code_signature_size(code_limit)? as usize {
+        return Err(LinkerError::CodeSignatureContract(format!(
+            "signature of {signature_size} bytes disagrees with its reserved size"
+        )));
+    }
 
     let mut buf = Vec::with_capacity(signature_size);
 
@@ -1012,7 +2004,7 @@ fn build_ad_hoc_code_signature(
     write_be_u64(&mut buf, 0); // codeLimit64
     write_be_u64(&mut buf, text_file_offset);
     write_be_u64(&mut buf, text_file_size);
-    write_be_u64(&mut buf, CS_EXECSEG_MAIN_BINARY);
+    write_be_u64(&mut buf, exec_seg_flags);
     debug_assert_eq!(buf.len(), CS_FIXED_HEADERS_SIZE);
 
     buf.extend_from_slice(CODE_SIGNATURE_IDENTIFIER);
@@ -1025,10 +2017,66 @@ fn build_ad_hoc_code_signature(
     }
 
     debug_assert_eq!(buf.len(), signature_size);
-    buf
+    Ok(buf)
+}
+
+/// Run the independent verifier over a finished image and hold it to this
+/// linker's signature contract: an ad-hoc, linker-signed SHA-256
+/// CodeDirectory over 4 KiB pages with the `trust-cg` identifier, no special
+/// slots or alternate CodeDirectories, an executable segment that is exactly
+/// the `__TEXT` file range, and the main-binary flag exactly when the image is
+/// an executable. Standalone output never requests the hardened
+/// runtime or carries entitlements; such a program must be re-signed with
+/// `codesign`.
+fn self_check_code_signature(
+    image: &[u8],
+    text_segment_filesize: u64,
+    exec_seg_flags: u64,
+) -> Result<(), LinkerError> {
+    let signature = super::codesign::verify_ad_hoc_signature(image)
+        .map_err(LinkerError::CodeSignatureSelfCheck)?;
+    let directory = &signature.code_directory;
+    let exec_segment = directory
+        .exec_segment
+        .map(|segment| (segment.base, segment.limit, segment.flags));
+    let departures = [
+        (directory.flags != CS_ADHOC | CS_LINKER_SIGNED, "flags"),
+        (
+            directory.page_size != CODE_SIGNATURE_BLOCK_SIZE,
+            "page size",
+        ),
+        (
+            directory.identifier.as_bytes() != CODE_SIGNATURE_IDENTIFIER,
+            "identifier",
+        ),
+        (directory.special_slots != 0, "special slots"),
+        (
+            exec_segment != Some((0, text_segment_filesize, exec_seg_flags)),
+            "executable segment",
+        ),
+        (
+            !signature.alternate_code_directories.is_empty(),
+            "alternate CodeDirectories",
+        ),
+    ];
+    match departures.iter().find(|(departs, _)| *departs) {
+        Some((_, field)) => Err(LinkerError::CodeSignatureContract(format!(
+            "unexpected {field} in {directory:?}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    // Reuse the crate's existing SHA-256 implementation without allocating a
+    // padded copy of the input. CodeDirectory validation below keeps a separate
+    // scalar implementation as its independent test oracle.
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).into()
+}
+
+#[cfg(test)]
+fn reference_sha256_digest(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -1056,7 +2104,7 @@ fn sha256_digest(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let base = i * 4;
@@ -1137,7 +2185,7 @@ fn write_lc_linkedit_data(buf: &mut Vec<u8>, cmd: u32, dataoff: u64, datasize: u
 
 fn write_import_entry(buf: &mut Vec<u8>, lib_ordinal: u32, name_offset: u32) {
     assert!(
-        lib_ordinal <= 0xF0,
+        lib_ordinal <= 0xF0 || lib_ordinal == BIND_SPECIAL_DYLIB_WEAK_LOOKUP_ORDINAL,
         "dylib ordinal exceeds compact import format"
     );
     assert!(
@@ -1184,7 +2232,7 @@ fn write_chained_fixup_segment_info(buf: &mut Vec<u8>, segment: &ChainedFixupSeg
 
 fn build_chained_fixups_payload(
     segment_count: usize,
-    fixup_segment: Option<&ChainedFixupSegmentInfo>,
+    fixup_segments: &[ChainedFixupSegmentInfo],
     import_symbols: &[String],
     import_ordinals: &[u32],
 ) -> Vec<u8> {
@@ -1214,7 +2262,7 @@ fn build_chained_fixups_payload(
     }
     pad_vec_to_alignment(&mut buf, 8);
 
-    if let Some(segment) = fixup_segment {
+    for segment in fixup_segments {
         assert!(
             segment.segment_index < segment_count,
             "chained-fixups segment index out of range"
@@ -1249,13 +2297,14 @@ fn build_chained_fixups_payload(
 fn build_linkedit_payload(
     linkedit_file_offset: u64,
     segment_count: usize,
-    fixup_segment: Option<&ChainedFixupSegmentInfo>,
+    fixup_segments: &[ChainedFixupSegmentInfo],
     import_symbols: &[String],
     import_ordinals: &[u32],
-) -> LinkeditPayload {
+    exports_trie: &[u8],
+) -> Result<LinkeditPayload, LinkerError> {
     let fixups = build_chained_fixups_payload(
         segment_count,
-        fixup_segment,
+        fixup_segments,
         import_symbols,
         import_ordinals,
     );
@@ -1264,8 +2313,8 @@ fn build_linkedit_payload(
     pad_vec_to_alignment(&mut data, 8);
 
     let exports_offset = linkedit_file_offset + data.len() as u64;
-    let exports_size = EMPTY_EXPORTS_TRIE.len() as u32;
-    data.extend_from_slice(EMPTY_EXPORTS_TRIE);
+    let exports_size = exports_trie.len() as u32;
+    data.extend_from_slice(exports_trie);
     pad_vec_to_alignment(&mut data, 8);
 
     let code_signature_offset = align_to(
@@ -1275,9 +2324,9 @@ fn build_linkedit_payload(
     let code_signature_padding =
         (code_signature_offset - (linkedit_file_offset + data.len() as u64)) as usize;
     data.resize(data.len() + code_signature_padding, 0);
-    let code_signature_size = code_signature_size(code_signature_offset);
+    let code_signature_size = code_signature_size(code_signature_offset)?;
 
-    LinkeditPayload {
+    Ok(LinkeditPayload {
         data,
         fixups_offset: linkedit_file_offset,
         fixups_size,
@@ -1285,14 +2334,6 @@ fn build_linkedit_payload(
         exports_size,
         code_signature_offset,
         code_signature_size,
-    }
-}
-
-fn has_file_backed_data_sections(objects: &[ParsedObject]) -> bool {
-    objects.iter().any(|obj| {
-        obj.sections
-            .iter()
-            .any(|sec| sec.segment != "__TEXT" && !sec.data.is_empty())
     })
 }
 
@@ -1302,69 +2343,126 @@ fn dylib_command_size(dylib: &DylibEntry) -> u32 {
     align_to(raw_size as u64, 8) as u32
 }
 
-fn executable_load_command_size(
-    has_data: bool,
-    text_nsects: u32,
-    data_nsects: u32,
-    dylib_cmd_sizes: &[u32],
-) -> u32 {
-    let pagezero_seg_size = SEGMENT_COMMAND_64_SIZE;
-    let text_seg_size = SEGMENT_COMMAND_64_SIZE + text_nsects * SECTION_64_SIZE;
-    let data_seg_size = if has_data {
-        SEGMENT_COMMAND_64_SIZE + data_nsects * SECTION_64_SIZE
-    } else {
-        0
-    };
-    let linkedit_seg_size = SEGMENT_COMMAND_64_SIZE;
-    let total_dylib_size: u32 = dylib_cmd_sizes.iter().sum();
+/// The largest optional-section shape, used to bound load-command sizes before
+/// the real shape is known.
+const MAXIMAL_IMAGE_SHAPE: ImageShape = ImageShape {
+    stubs: 1,
+    got: 1,
+    tlv_pointers: 1,
+    const_data: true,
+    data: true,
+    thread_vars: true,
+    thread_data: true,
+    thread_bss: true,
+};
 
-    pagezero_seg_size
-        + text_seg_size
-        + data_seg_size
-        + linkedit_seg_size
-        + BUILD_VERSION_COMMAND_SIZE
-        + UUID_COMMAND_SIZE
-        + LC_MAIN_SIZE
-        + LINKEDIT_DATA_COMMAND_SIZE
-        + LINKEDIT_DATA_COMMAND_SIZE
-        + LINKEDIT_DATA_COMMAND_SIZE
-        + SYMTAB_COMMAND_SIZE
-        + DYSYMTAB_COMMAND_SIZE
-        + dylinker_command_size()
-        + total_dylib_size
+/// Admit the compact import representation before the infallible encoders.
+/// Library ordinals are eight bits (0xF1..0xFF are reserved), symbol-name
+/// offsets are 23 bits, and bind ordinals are 24 bits.
+fn validate_dylib_imports(
+    needed_dylibs: &[&DylibEntry],
+    symbols: &[String],
+) -> Result<(), LinkerError> {
+    validate_import_table(needed_dylibs, symbols, |_| false)
+}
+
+/// [`validate_dylib_imports`] where `weak_lookup` names the imports bound
+/// through dyld's weak-definition lookup, which no needed dylib provides.
+fn validate_import_table(
+    needed_dylibs: &[&DylibEntry],
+    symbols: &[String],
+    weak_lookup: impl Fn(&str) -> bool,
+) -> Result<(), LinkerError> {
+    if needed_dylibs.len() > 0xF0 || symbols.len() > DYLD_CHAINED_PTR_64_BIND_ORDINAL_LIMIT {
+        return Err(LinkerError::LayoutOverflow("compact dylib import count"));
+    }
+    let invalid_name = || LinkerError::MalformedInput {
+        file: "dynamic imports".into(),
+        detail: "dylib and symbol names must be nonempty and contain no NUL".into(),
+    };
+    let mut command_size = u64::from(image_load_command_size(
+        ImageKind::Executable,
+        &MAXIMAL_IMAGE_SHAPE,
+        &[],
+    )?);
+    for dylib in needed_dylibs {
+        if dylib.install_name.is_empty() || dylib.install_name.as_bytes().contains(&0) {
+            return Err(invalid_name());
+        }
+        let size = layout_add(
+            dylib.install_name.len() as u64,
+            u64::from(LC_LOAD_DYLIB_HEADER_SIZE) + 1,
+            "dylib command",
+        )?;
+        command_size = layout_add(command_size, checked_align_to(size, 8)?, "load commands")?;
+    }
+    if command_size > u64::from(u32::MAX) {
+        return Err(LinkerError::LayoutOverflow("load command size"));
+    }
+    let mut name_offset = 0u64;
+    for symbol in symbols {
+        if symbol.is_empty() || symbol.as_bytes().contains(&0) {
+            return Err(invalid_name());
+        }
+        if name_offset >= 1 << 23 {
+            return Err(LinkerError::LayoutOverflow("compact import name offset"));
+        }
+        name_offset = layout_add(
+            name_offset,
+            layout_add(symbol.len() as u64, 1, "import name")?,
+            "import name table",
+        )?;
+        if name_offset > u64::from(u32::MAX) {
+            return Err(LinkerError::LayoutOverflow("import name table size"));
+        }
+        if !weak_lookup(symbol)
+            && !needed_dylibs
+                .iter()
+                .any(|dylib| dylib.symbols.contains(symbol))
+        {
+            return Err(LinkerError::UndefinedSymbol(symbol.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Total `sizeofcmds` for a `kind` image of `shape` loading `dylib_cmd_sizes`.
+fn image_load_command_size(
+    kind: ImageKind<'_>,
+    shape: &ImageShape,
+    dylib_cmd_sizes: &[u32],
+) -> Result<u32, LinkerError> {
+    let segment = |nsects: u32| u64::from(SEGMENT_COMMAND_64_SIZE + nsects * SECTION_64_SIZE);
+    let mut size = segment(shape.text_nsects())
+        + segment(0) // __LINKEDIT
+        + kind.fixed_commands().1;
+    if shape.has_const() {
+        size += segment(shape.const_nsects());
+    }
+    if shape.data {
+        size += segment(shape.data_nsects());
+    }
+    for &dylib in dylib_cmd_sizes {
+        size = layout_add(size, u64::from(dylib), "load commands")?;
+    }
+    u32::try_from(size).map_err(|_| LinkerError::LayoutOverflow("load command size"))
 }
 
 fn executable_text_file_offset_from_lc_size(total_lc_size: u32) -> u64 {
     align_to(MACH_HEADER_64_SIZE as u64 + total_lc_size as u64, PAGE_SIZE)
 }
 
+/// Text-content file offset of a dylib-free image with one optional `__DATA`.
+#[cfg(test)]
 fn plain_executable_text_file_offset(has_data: bool) -> u64 {
-    executable_text_file_offset_from_lc_size(executable_load_command_size(
-        has_data,
-        1,
-        if has_data { 1 } else { 0 },
-        &[],
-    ))
-}
-
-fn dylib_executable_text_file_offset(
-    has_data: bool,
-    has_stubs: bool,
-    needed_dylibs: &[&DylibEntry],
-) -> u64 {
-    let text_nsects = if has_stubs { 2 } else { 1 };
-    let data_nsects = if has_stubs { 2 } else { 1 };
-    let dylib_cmd_sizes: Vec<u32> = needed_dylibs
-        .iter()
-        .map(|dylib| dylib_command_size(dylib))
-        .collect();
-
-    executable_text_file_offset_from_lc_size(executable_load_command_size(
-        has_data,
-        text_nsects,
-        data_nsects,
-        &dylib_cmd_sizes,
-    ))
+    let shape = ImageShape {
+        data: has_data,
+        ..ImageShape::default()
+    };
+    executable_text_file_offset_from_lc_size(
+        image_load_command_size(ImageKind::Executable, &shape, &[])
+            .expect("fixed plain load commands fit"),
+    )
 }
 
 fn dylib_ordinal_for_symbol(needed_dylibs: &[&DylibEntry], symbol: &str) -> u32 {
@@ -1375,49 +2473,116 @@ fn dylib_ordinal_for_symbol(needed_dylibs: &[&DylibEntry], symbol: &str) -> u32 
         .expect("dylib symbol must be provided by a loaded dylib")
 }
 
-fn encode_chained_ptr_64_bind(import_ordinal: u32, next: u16) -> u64 {
-    assert!(
-        import_ordinal < (1 << 24),
-        "chained bind import ordinal exceeds DYLD_CHAINED_PTR_64 range"
-    );
-    (import_ordinal as u64) | ((next as u64) << 51) | (1u64 << 63)
+// ---------------------------------------------------------------------------
+// Chained fixups
+// ---------------------------------------------------------------------------
+
+/// What dyld stores in one 64-bit pointer slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerFixupKind {
+    /// Slide an image address (DYLD_CHAINED_PTR_64 rebase of an unslid vmaddr).
+    Rebase { target: u64 },
+    /// Bind an import (index into the chained-fixups import table) plus addend.
+    Bind { import: usize, addend: u8 },
 }
 
-fn encode_got_chained_binds(
-    data: &mut [u8],
-    got_offset: u64,
-    import_count: usize,
-) -> Vec<(u16, u16)> {
-    let mut page_starts = Vec::new();
+/// A pointer slot at an absolute (unslid) image address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointerFixup {
+    address: u64,
+    kind: PointerFixupKind,
+}
 
-    for index in 0..import_count {
-        let slot_offset = got_offset + index as u64 * 8;
-        let slot_end = slot_offset as usize + 8;
-        assert!(
-            slot_end <= data.len(),
-            "GOT chained bind slot exceeds __DATA bounds"
-        );
-
-        let page_index = slot_offset / PAGE_SIZE;
-        assert!(
-            page_index <= u16::MAX as u64,
-            "GOT chained bind page index exceeds dyld format range"
-        );
-        if index == 0 || (slot_offset - 8) / PAGE_SIZE != page_index {
-            page_starts.push((page_index as u16, (slot_offset % PAGE_SIZE) as u16));
-        }
-
-        let next_slot_offset = slot_offset + 8;
-        let next = if index + 1 < import_count && next_slot_offset / PAGE_SIZE == page_index {
-            2
-        } else {
-            0
-        };
-        let encoded = encode_chained_ptr_64_bind(index as u32, next);
-        data[slot_offset as usize..slot_end].copy_from_slice(&encoded.to_le_bytes());
+/// Encode one segment's pointer fixups as DYLD_CHAINED_PTR_64 chains in
+/// `bytes` (the segment's file-backed content starting at `segment_vmaddr`).
+/// Each fixup must be 8-byte aligned inside the file-backed bytes; fixups on
+/// one 16 KiB page form one chain with 4-byte-stride `next` deltas.
+fn encode_segment_chains(
+    segment_index: usize,
+    segment_vmaddr: u64,
+    image_base: u64,
+    bytes: &mut [u8],
+    fixups: &mut [PointerFixup],
+) -> Result<Option<ChainedFixupSegmentInfo>, LinkerError> {
+    if fixups.is_empty() {
+        return Ok(None);
     }
-
-    page_starts
+    fixups.sort_by_key(|fixup| fixup.address);
+    let fail = |address: u64, detail: String| LinkerError::ChainedFixup { address, detail };
+    let mut page_starts: Vec<(u16, u16)> = Vec::new();
+    for index in 0..fixups.len() {
+        let fixup = fixups[index];
+        if !fixup.address.is_multiple_of(8) {
+            return Err(fail(
+                fixup.address,
+                "pointer slot is not 8-byte aligned".into(),
+            ));
+        }
+        let offset = fixup
+            .address
+            .checked_sub(segment_vmaddr)
+            .filter(|offset| {
+                offset
+                    .checked_add(8)
+                    .is_some_and(|end| end <= bytes.len() as u64)
+            })
+            .ok_or_else(|| {
+                fail(
+                    fixup.address,
+                    "pointer slot is outside its segment's file-backed bytes".into(),
+                )
+            })?;
+        let page = offset / PAGE_SIZE;
+        if page >= u64::from(u16::MAX) {
+            return Err(LinkerError::LayoutOverflow(
+                "compact chained-fixup import/page fields",
+            ));
+        }
+        let previous_page = index
+            .checked_sub(1)
+            .map(|previous| (fixups[previous].address - segment_vmaddr) / PAGE_SIZE);
+        if previous_page == Some(page) {
+            if fixup.address - fixups[index - 1].address < 8 {
+                return Err(fail(fixup.address, "pointer slots overlap".into()));
+            }
+        } else {
+            page_starts.push((page as u16, (offset % PAGE_SIZE) as u16));
+        }
+        // Slots on the same page chain with 4-byte strides; the largest
+        // in-page delta (16376 bytes) fits the 12-bit field.
+        let next = fixups
+            .get(index + 1)
+            .filter(|next| (next.address - segment_vmaddr) / PAGE_SIZE == page)
+            .map_or(0, |next| (next.address - fixup.address) / 4);
+        debug_assert!(next < 1 << 12);
+        let raw = match fixup.kind {
+            PointerFixupKind::Rebase { target } => {
+                if target >= DYLD_CHAINED_PTR_64_TARGET_LIMIT {
+                    return Err(fail(
+                        fixup.address,
+                        format!("rebase target {target:#x} exceeds the 36-bit vmaddr field"),
+                    ));
+                }
+                target | (next << 51)
+            }
+            PointerFixupKind::Bind { import, addend } => {
+                if import >= DYLD_CHAINED_PTR_64_BIND_ORDINAL_LIMIT {
+                    return Err(fail(
+                        fixup.address,
+                        format!("import ordinal {import} exceeds the 24-bit bind field"),
+                    ));
+                }
+                import as u64 | (u64::from(addend) << 24) | (next << 51) | (1 << 63)
+            }
+        };
+        let start = offset as usize;
+        bytes[start..start + 8].copy_from_slice(&raw.to_le_bytes());
+    }
+    Ok(Some(ChainedFixupSegmentInfo {
+        segment_index,
+        segment_offset: segment_vmaddr - image_base,
+        page_starts,
+    }))
 }
 
 /// Compute the size of the LC_LOAD_DYLINKER load command (8-byte aligned).
@@ -1480,43 +2645,6 @@ fn update_uuid_bytes(lo: &mut u64, hi: &mut u64, bytes: &[u8]) {
     update_uuid_hashes(lo, hi, bytes);
 }
 
-fn deterministic_executable_uuid(
-    text_data: &[u8],
-    data_data: &[u8],
-    text_vmaddr: u64,
-    data_vmaddr: u64,
-    entry_offset: u64,
-    stubs_offset: u64,
-    needed_dylibs: &[&DylibEntry],
-    dylib_symbols: &[String],
-) -> [u8; 16] {
-    let mut lo = 0xCBF2_9CE4_8422_2325u64;
-    let mut hi = 0x8422_2325_CBF2_9CE4u64;
-
-    update_uuid_bytes(&mut lo, &mut hi, b"trust-cg-macho-executable-v1");
-    update_uuid_u64(&mut lo, &mut hi, text_vmaddr);
-    update_uuid_u64(&mut lo, &mut hi, data_vmaddr);
-    update_uuid_u64(&mut lo, &mut hi, entry_offset);
-    update_uuid_u64(&mut lo, &mut hi, stubs_offset);
-    update_uuid_bytes(&mut lo, &mut hi, text_data);
-    update_uuid_bytes(&mut lo, &mut hi, data_data);
-
-    update_uuid_u64(&mut lo, &mut hi, needed_dylibs.len() as u64);
-    for dylib in needed_dylibs {
-        update_uuid_bytes(&mut lo, &mut hi, dylib.install_name.as_bytes());
-    }
-
-    update_uuid_u64(&mut lo, &mut hi, dylib_symbols.len() as u64);
-    for symbol in dylib_symbols {
-        update_uuid_bytes(&mut lo, &mut hi, symbol.as_bytes());
-    }
-
-    let mut uuid = [0u8; 16];
-    uuid[..8].copy_from_slice(&lo.to_le_bytes());
-    uuid[8..].copy_from_slice(&hi.to_le_bytes());
-    uuid
-}
-
 fn write_lc_uuid(buf: &mut Vec<u8>, uuid: [u8; 16]) {
     buf.extend_from_slice(&LC_UUID.to_le_bytes());
     buf.extend_from_slice(&UUID_COMMAND_SIZE.to_le_bytes());
@@ -1537,6 +2665,294 @@ fn write_empty_lc_dysymtab(buf: &mut Vec<u8>) {
 
 const RELOC32_PATCH_OOB_DETAIL: &str = "32-bit relocation patch offset out of bounds";
 const RELOC64_PATCH_OOB_DETAIL: &str = "64-bit relocation patch offset out of bounds";
+
+/// One relocation operation after pairing each `ARM64_RELOC_ADDEND` and
+/// `ARM64_RELOC_SUBTRACTOR` record with the relocation it modifies.
+#[derive(Debug, Clone, Copy)]
+enum RelocOp<'r> {
+    /// A relocation plus the addend of a preceding `ARM64_RELOC_ADDEND`.
+    Single { reloc: &'r Relocation, addend: i64 },
+    /// `minuend - subtrahend` from a `SUBTRACTOR`/`UNSIGNED` pair.
+    Difference {
+        subtrahend: &'r Relocation,
+        minuend: &'r Relocation,
+    },
+}
+
+/// Pair modifier records with their partner relocation. `ARM64_RELOC_ADDEND`
+/// must be a non-extern, non-pc-relative 32-bit record immediately preceding a
+/// `BRANCH26`, `PAGE21` or `PAGEOFF12` at the same offset; its `r_symbolnum`
+/// is a signed 24-bit addend. A `SUBTRACTOR` must be followed by a matching
+/// absolute `UNSIGNED`.
+fn relocation_ops(relocations: &[Relocation]) -> Result<Vec<RelocOp<'_>>, LinkerError> {
+    let mut ops = Vec::with_capacity(relocations.len());
+    let mut index = 0usize;
+    while index < relocations.len() {
+        let reloc = &relocations[index];
+        match reloc.kind {
+            AArch64RelocKind::Subtractor => {
+                let Some(unsigned) = relocations.get(index + 1) else {
+                    return Err(LinkerError::MalformedRelocation(
+                        "ARM64_RELOC_SUBTRACTOR must be followed by ARM64_RELOC_UNSIGNED".into(),
+                    ));
+                };
+                if unsigned.kind != AArch64RelocKind::Unsigned
+                    || unsigned.offset != reloc.offset
+                    || unsigned.length != reloc.length
+                {
+                    return Err(LinkerError::MalformedRelocation(
+                        "ARM64_RELOC_SUBTRACTOR must be followed by matching ARM64_RELOC_UNSIGNED"
+                            .into(),
+                    ));
+                }
+                if unsigned.pc_relative {
+                    return Err(LinkerError::PcRelativeUnsigned {
+                        offset: unsigned.offset,
+                    });
+                }
+                if reloc.pc_relative || !matches!(reloc.length, 2 | 3) {
+                    return Err(LinkerError::MalformedRelocation(
+                        "ARM64_RELOC_SUBTRACTOR must name an absolute 32- or 64-bit field".into(),
+                    ));
+                }
+                ops.push(RelocOp::Difference {
+                    subtrahend: reloc,
+                    minuend: unsigned,
+                });
+                index += 2;
+            }
+            AArch64RelocKind::Addend => {
+                if reloc.is_extern || reloc.pc_relative || reloc.length != 2 {
+                    return Err(LinkerError::MalformedRelocation(
+                        "ARM64_RELOC_ADDEND must be a non-extern, non-pc-relative 32-bit record"
+                            .into(),
+                    ));
+                }
+                let partner = relocations.get(index + 1).filter(|next| {
+                    next.offset == reloc.offset
+                        && matches!(
+                            next.kind,
+                            AArch64RelocKind::Branch26
+                                | AArch64RelocKind::Page21
+                                | AArch64RelocKind::Pageoff12
+                        )
+                });
+                let Some(partner) = partner else {
+                    return Err(LinkerError::MalformedRelocation(
+                        "ARM64_RELOC_ADDEND must immediately precede a BRANCH26, PAGE21 or \
+                         PAGEOFF12 relocation at the same offset"
+                            .into(),
+                    ));
+                };
+                let addend = i64::from(((reloc.symbol_index << 8) as i32) >> 8);
+                ops.push(RelocOp::Single {
+                    reloc: partner,
+                    addend,
+                });
+                index += 2;
+            }
+            _ => {
+                ops.push(RelocOp::Single { reloc, addend: 0 });
+                index += 1;
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// Check the `r_pcrel`/`r_length`/`r_extern` shape each kind requires.
+fn validate_relocation_shape(reloc: &Relocation) -> Result<(), LinkerError> {
+    use AArch64RelocKind as K;
+    let malformed = |detail: &str| {
+        LinkerError::MalformedRelocation(format!(
+            "{:?} at offset {:#x}: {detail}",
+            reloc.kind, reloc.offset
+        ))
+    };
+    match reloc.kind {
+        K::Branch26 | K::Page21 | K::GotLoadPage21 | K::TlvpLoadPage21 => {
+            if !reloc.pc_relative || reloc.length != 2 {
+                return Err(malformed("must be a pc-relative 32-bit instruction field"));
+            }
+        }
+        K::Pageoff12 | K::GotLoadPageoff12 | K::TlvpLoadPageoff12 => {
+            if reloc.pc_relative || reloc.length != 2 {
+                return Err(malformed(
+                    "must be a non-pc-relative 32-bit instruction field",
+                ));
+            }
+        }
+        K::PointerToGot => {
+            // A 64-bit absolute pointer-to-GOT would need a rebased GOT
+            // address; only the pc-relative 32-bit form is implemented.
+            if !reloc.pc_relative || reloc.length != 2 {
+                return Err(LinkerError::UnsupportedRelocation(K::PointerToGot));
+            }
+        }
+        K::Unsigned => {
+            if reloc.pc_relative {
+                return Err(LinkerError::PcRelativeUnsigned {
+                    offset: reloc.offset,
+                });
+            }
+            if !matches!(reloc.length, 2 | 3) {
+                return Err(malformed("must be a 32- or 64-bit field"));
+            }
+        }
+        K::Subtractor | K::Addend => {
+            return Err(malformed("must be paired with the relocation it modifies"));
+        }
+        other => return Err(LinkerError::UnsupportedRelocation(other)),
+    }
+    if matches!(
+        reloc.kind,
+        K::GotLoadPage21
+            | K::GotLoadPageoff12
+            | K::TlvpLoadPage21
+            | K::TlvpLoadPageoff12
+            | K::PointerToGot
+    ) && !reloc.is_extern
+    {
+        return Err(malformed("must name a symbol (r_extern=1)"));
+    }
+    Ok(())
+}
+
+fn read_instruction(
+    data: &[u8],
+    offset: usize,
+    kind: AArch64RelocKind,
+) -> Result<u32, LinkerError> {
+    let bytes = offset
+        .checked_add(4)
+        .and_then(|end| data.get(offset..end))
+        .ok_or_else(|| LinkerError::RelocationOverflow {
+            detail: match kind {
+                AArch64RelocKind::Branch26 => "BRANCH26 patch offset out of bounds".into(),
+                AArch64RelocKind::Page21 => "PAGE21 patch offset out of bounds".into(),
+                AArch64RelocKind::Pageoff12 => "PAGEOFF12 patch offset out of bounds".into(),
+                other => format!("{other:?} patch offset out of bounds"),
+            },
+        })?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn instruction_mismatch(kind: AArch64RelocKind, offset: usize, instruction: u32) -> LinkerError {
+    LinkerError::RelocationInstructionMismatch {
+        kind,
+        offset: offset as u32,
+        instruction,
+    }
+}
+
+/// Offset a resolved address by a signed addend inside the u64 domain.
+fn offset_address(address: u64, addend: i64) -> Result<u64, LinkerError> {
+    u64::try_from(i128::from(address) + i128::from(addend)).map_err(|_| {
+        LinkerError::RelocationOverflow {
+            detail: format!("target {address:#x} plus addend {addend} leaves the address space"),
+        }
+    })
+}
+
+/// Access scale of an instruction a `PAGEOFF12` may patch: ADD (immediate,
+/// unshifted) is byte-granular; a load/store (unsigned immediate), including
+/// SIMD&FP and PRFM, scales by its access size (16 for Q registers).
+fn pageoff12_scale(instruction: u32) -> Option<u64> {
+    if instruction & 0x7FC0_0000 == 0x1100_0000 {
+        return Some(1);
+    }
+    if instruction & 0x3B00_0000 == 0x3900_0000 {
+        let size = instruction >> 30;
+        let vector = (instruction >> 26) & 1 == 1;
+        let opc = (instruction >> 22) & 3;
+        return Some(if vector && size == 0 && opc >= 2 {
+            16
+        } else {
+            1 << size
+        });
+    }
+    None
+}
+
+/// Patch a B/BL imm26 with `target - pc`.
+fn patch_branch26(data: &mut [u8], offset: usize, pc: u64, target: u64) -> Result<(), LinkerError> {
+    let kind = AArch64RelocKind::Branch26;
+    let instruction = read_instruction(data, offset, kind)?;
+    if instruction & 0x7C00_0000 != 0x1400_0000 {
+        return Err(instruction_mismatch(kind, offset, instruction));
+    }
+    let displacement = i128::from(target) - i128::from(pc);
+    if displacement % 4 != 0 {
+        return Err(LinkerError::RelocationOverflow {
+            detail: format!("BRANCH26 displacement {displacement:#x} is not word-aligned"),
+        });
+    }
+    let imm26 = displacement >> 2;
+    if !(-(1i128 << 25)..(1i128 << 25)).contains(&imm26) {
+        return Err(LinkerError::RelocationOverflow {
+            detail: format!("BRANCH26 displacement {displacement:#x} out of +/-128MiB range"),
+        });
+    }
+    let patched = (instruction & !0x03FF_FFFF) | ((imm26 as u32) & 0x03FF_FFFF);
+    data[offset..offset + 4].copy_from_slice(&patched.to_le_bytes());
+    Ok(())
+}
+
+/// Patch an ADRP with the page delta from `pc` to `target`.
+fn patch_page21(
+    data: &mut [u8],
+    offset: usize,
+    pc: u64,
+    target: u64,
+    kind: AArch64RelocKind,
+) -> Result<(), LinkerError> {
+    let instruction = read_instruction(data, offset, kind)?;
+    if instruction & 0x9F00_0000 != 0x9000_0000 {
+        return Err(instruction_mismatch(kind, offset, instruction));
+    }
+    let page_delta = (i128::from(target & !0xFFF) - i128::from(pc & !0xFFF)) >> 12;
+    if !(-(1i128 << 20)..(1i128 << 20)).contains(&page_delta) {
+        return Err(LinkerError::RelocationOverflow {
+            detail: format!("PAGE21 page delta {page_delta:#x} out of +/-4GiB range"),
+        });
+    }
+    let imm21 = (page_delta as u32) & 0x001F_FFFF;
+    let patched = (instruction & !((0x7FFFF << 5) | (0x3 << 29)))
+        | (((imm21 >> 2) & 0x7FFFF) << 5)
+        | ((imm21 & 0x3) << 29);
+    data[offset..offset + 4].copy_from_slice(&patched.to_le_bytes());
+    Ok(())
+}
+
+/// Patch the imm12 page offset of `target`. `PAGEOFF12` accepts ADD
+/// (immediate) and scaled loads/stores; the GOT/TLVP forms accept only the
+/// 64-bit `LDR Xt, [Xn, #imm]` that loads their slot. A target offset that the
+/// access size cannot represent is refused instead of truncated.
+fn patch_pageoff12(
+    data: &mut [u8],
+    offset: usize,
+    target: u64,
+    kind: AArch64RelocKind,
+) -> Result<(), LinkerError> {
+    let instruction = read_instruction(data, offset, kind)?;
+    let scale = match kind {
+        AArch64RelocKind::Pageoff12 => pageoff12_scale(instruction),
+        _ => (instruction & 0xFFC0_0000 == 0xF940_0000).then_some(8),
+    }
+    .ok_or_else(|| instruction_mismatch(kind, offset, instruction))?;
+    let page_offset = target & 0xFFF;
+    if !page_offset.is_multiple_of(scale) {
+        return Err(LinkerError::RelocationOverflow {
+            detail: format!(
+                "{kind:?} target {target:#x} is not aligned to its {scale}-byte access"
+            ),
+        });
+    }
+    let imm12 = (page_offset / scale) as u32;
+    let patched = (instruction & !(0xFFF << 10)) | ((imm12 & 0xFFF) << 10);
+    data[offset..offset + 4].copy_from_slice(&patched.to_le_bytes());
+    Ok(())
+}
 
 /// Apply relocations to mutable section data.
 pub struct RelocationApplicator;
@@ -1579,6 +2995,12 @@ impl RelocationApplicator {
 
     /// Apply relocations with an object-local symbol-index address map.
     ///
+    /// This is relocation arithmetic only. `ARM64_RELOC_UNSIGNED` writes the
+    /// link-time value without recording the dyld rebase/bind an image needs,
+    /// and the GOT/TLVP/`POINTER_TO_GOT` kinds, which need linker-planned
+    /// slots, return [`LinkerError::UnsupportedRelocation`]; [`link`] and
+    /// [`link_with_dylibs`] apply both.
+    ///
     /// `section_addrs` is the per-object mapped-base table (0-based section
     /// index -> virtual base address) used to resolve section-relative
     /// (`is_extern == false`) relocations to the referenced section's mapped
@@ -1592,83 +3014,61 @@ impl RelocationApplicator {
         local_symbol_addrs: &HashMap<usize, u64>,
         section_addrs: &[u64],
     ) -> Result<(), LinkerError> {
-        let mut idx = 0usize;
-        while idx < relocations.len() {
-            let reloc = &relocations[idx];
-            if reloc.kind == AArch64RelocKind::Subtractor {
-                let Some(unsigned) = relocations.get(idx + 1) else {
-                    return Err(LinkerError::MalformedRelocation(
-                        "ARM64_RELOC_SUBTRACTOR must be followed by ARM64_RELOC_UNSIGNED".into(),
-                    ));
-                };
-                if unsigned.kind != AArch64RelocKind::Unsigned
-                    || unsigned.offset != reloc.offset
-                    || unsigned.length != reloc.length
-                {
-                    return Err(LinkerError::MalformedRelocation(
-                        "ARM64_RELOC_SUBTRACTOR must be followed by matching ARM64_RELOC_UNSIGNED"
-                            .into(),
-                    ));
-                }
-
-                let subtrahend = Self::target_addr(
-                    reloc,
-                    symbols,
-                    symbol_addrs,
-                    local_symbol_addrs,
-                    section_addrs,
-                )?;
-                let target_addr = Self::target_addr(
-                    unsigned,
-                    symbols,
-                    symbol_addrs,
-                    local_symbol_addrs,
-                    section_addrs,
-                )?;
-                let patch_offset = reloc.offset as usize;
-                Self::apply_subtractor_pair(
-                    section_data,
-                    patch_offset,
-                    target_addr,
-                    subtrahend,
-                    reloc.length,
-                )?;
-                idx += 2;
-                continue;
-            }
-
-            let target_addr = Self::target_addr(
+        let target = |reloc: &Relocation| {
+            Self::target_addr(
                 reloc,
                 symbols,
                 symbol_addrs,
                 local_symbol_addrs,
                 section_addrs,
-            )?;
-
-            let pc = section_addr + reloc.offset as u64;
-            let patch_offset = reloc.offset as usize;
-
-            match reloc.kind {
-                AArch64RelocKind::Branch26 => {
-                    Self::apply_branch26(section_data, patch_offset, pc, target_addr)?;
+            )
+        };
+        for op in relocation_ops(relocations)? {
+            match op {
+                RelocOp::Difference {
+                    subtrahend,
+                    minuend,
+                } => {
+                    let subtrahend_addr = target(subtrahend)?;
+                    let target_addr = target(minuend)?;
+                    Self::apply_subtractor_pair(
+                        section_data,
+                        subtrahend.offset as usize,
+                        target_addr,
+                        subtrahend_addr,
+                        subtrahend.length,
+                    )?;
                 }
-                AArch64RelocKind::Page21 => {
-                    Self::apply_page21(section_data, patch_offset, pc, target_addr)?;
-                }
-                AArch64RelocKind::Pageoff12 => {
-                    Self::apply_pageoff12(section_data, patch_offset, target_addr)?;
-                }
-                AArch64RelocKind::Unsigned => {
-                    Self::apply_unsigned(section_data, patch_offset, pc, target_addr, reloc)?;
-                }
-                AArch64RelocKind::PointerToGot => {
-                    Self::apply_pointer_to_got(section_data, patch_offset, pc, target_addr, reloc)?;
-                }
-                other => {
-                    return Err(LinkerError::UnsupportedRelocation(other));
+                RelocOp::Single { reloc, addend } => {
+                    validate_relocation_shape(reloc)?;
+                    let target_addr = offset_address(target(reloc)?, addend)?;
+                    let pc = layout_add(section_addr, u64::from(reloc.offset), "relocation site")?;
+                    let patch_offset = reloc.offset as usize;
+                    match reloc.kind {
+                        AArch64RelocKind::Branch26 => {
+                            patch_branch26(section_data, patch_offset, pc, target_addr)?;
+                        }
+                        AArch64RelocKind::Page21 => {
+                            patch_page21(section_data, patch_offset, pc, target_addr, reloc.kind)?;
+                        }
+                        AArch64RelocKind::Pageoff12 => {
+                            patch_pageoff12(section_data, patch_offset, target_addr, reloc.kind)?;
+                        }
+                        AArch64RelocKind::Unsigned => {
+                            let value =
+                                Self::read_signed_addend(section_data, patch_offset, reloc.length)?
+                                    + i128::from(target_addr);
+                            Self::write_sized_value(
+                                section_data,
+                                patch_offset,
+                                reloc.length,
+                                value,
+                            )?;
+                        }
+                        other => return Err(LinkerError::UnsupportedRelocation(other)),
+                    }
                 }
             }
-            idx += 1;
         }
         Ok(())
     }
@@ -1683,9 +3083,8 @@ impl RelocationApplicator {
         if !reloc.is_extern {
             // Section-relative relocation: r_symbolnum is a 1-based SECTION
             // ORDINAL (per the Mach-O ABI), NOT an address. Resolve it to the
-            // referenced section's mapped base address. The inline / preceding
-            // ARM64_RELOC_ADDEND addend is applied by the per-kind handlers
-            // (apply_unsigned/apply_branch26/...), so return ONLY the base here.
+            // referenced section's mapped base address. Inline and
+            // ARM64_RELOC_ADDEND addends are applied by the caller.
             let ordinal = reloc.symbol_index;
             if ordinal == 0 || (ordinal as usize) > section_addrs.len() {
                 return Err(LinkerError::MalformedRelocation(format!(
@@ -1714,195 +3113,9 @@ impl RelocationApplicator {
             )));
         }
         symbol_addrs
-            .get(&sym.name)
+            .get(sym.name.as_str())
             .copied()
-            .ok_or_else(|| LinkerError::UndefinedSymbol(sym.name.clone()))
-    }
-
-    /// Apply ARM64_RELOC_BRANCH26.
-    ///
-    /// B/BL instructions encode a signed 26-bit word offset in bits [25:0].
-    /// The actual byte displacement is imm26 << 2.
-    fn apply_branch26(
-        data: &mut [u8],
-        offset: usize,
-        pc: u64,
-        target: u64,
-    ) -> Result<(), LinkerError> {
-        if offset + 4 > data.len() {
-            return Err(LinkerError::RelocationOverflow {
-                detail: "BRANCH26 patch offset out of bounds".into(),
-            });
-        }
-
-        let displacement = target as i64 - pc as i64;
-        let imm26 = displacement >> 2;
-
-        // Check range: signed 26-bit = +/- 128 MiB.
-        if !(-(1 << 25)..(1 << 25)).contains(&imm26) {
-            return Err(LinkerError::RelocationOverflow {
-                detail: format!(
-                    "BRANCH26 displacement {:#x} out of +/-128MiB range",
-                    displacement
-                ),
-            });
-        }
-
-        let mut inst = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
-
-        // Clear existing imm26 field and set new value.
-        inst = (inst & !0x03FF_FFFF) | ((imm26 as u32) & 0x03FF_FFFF);
-
-        let bytes = inst.to_le_bytes();
-        data[offset..offset + 4].copy_from_slice(&bytes);
-
-        Ok(())
-    }
-
-    /// Apply ARM64_RELOC_PAGE21.
-    ///
-    /// ADRP encodes a signed 21-bit page offset. The page delta is:
-    ///   (target_page - pc_page) >> 12
-    /// where page = addr & ~0xFFF.
-    ///
-    /// ADRP encoding: immhi[23:5] in bits [23:5], immlo[1:0] in bits [30:29].
-    fn apply_page21(
-        data: &mut [u8],
-        offset: usize,
-        pc: u64,
-        target: u64,
-    ) -> Result<(), LinkerError> {
-        if offset + 4 > data.len() {
-            return Err(LinkerError::RelocationOverflow {
-                detail: "PAGE21 patch offset out of bounds".into(),
-            });
-        }
-
-        let pc_page = pc & !0xFFF;
-        let target_page = target & !0xFFF;
-        let page_delta = (target_page as i64 - pc_page as i64) >> 12;
-
-        // Check range: signed 21-bit = +/- 4 GiB.
-        if !(-(1 << 20)..(1 << 20)).contains(&page_delta) {
-            return Err(LinkerError::RelocationOverflow {
-                detail: format!("PAGE21 page delta {:#x} out of +/-4GiB range", page_delta),
-            });
-        }
-
-        let imm21 = (page_delta as u32) & 0x001F_FFFF;
-        let immlo = imm21 & 0x3;
-        let immhi = (imm21 >> 2) & 0x7FFFF;
-
-        let mut inst = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
-
-        // Clear immhi (bits 23:5) and immlo (bits 30:29), then set.
-        inst &= !(0x7FFFF << 5); // Clear immhi
-        inst &= !(0x3 << 29); // Clear immlo
-        inst |= immhi << 5;
-        inst |= immlo << 29;
-
-        let bytes = inst.to_le_bytes();
-        data[offset..offset + 4].copy_from_slice(&bytes);
-
-        Ok(())
-    }
-
-    /// Apply ARM64_RELOC_PAGEOFF12.
-    ///
-    /// ADD/LDR instructions encode a 12-bit page offset in bits [21:10].
-    /// The offset is target & 0xFFF.
-    fn apply_pageoff12(data: &mut [u8], offset: usize, target: u64) -> Result<(), LinkerError> {
-        if offset + 4 > data.len() {
-            return Err(LinkerError::RelocationOverflow {
-                detail: "PAGEOFF12 patch offset out of bounds".into(),
-            });
-        }
-
-        let page_offset = (target & 0xFFF) as u32;
-
-        let mut inst = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
-
-        // Determine if this is a load/store (needs scaling) or ADD (no scaling).
-        // LDR/STR instructions have bit 27 = 1 and bit 26 = 0 (load/store class).
-        // ADD has opc = 0b00x at bits [30:29] and op=0 at bit [30].
-        let is_load_store = (inst >> 27) & 0x1 == 1 && (inst >> 24) & 0x3 == 0x1;
-
-        let imm12 = if is_load_store {
-            // For load/store, the offset is scaled by the access size.
-            // size field is bits [31:30]: 00=1B, 01=2B, 10=4B, 11=8B
-            let size = (inst >> 30) & 0x3;
-            let scale = 1u32 << size;
-            page_offset / scale
-        } else {
-            // For ADD, the immediate is unscaled.
-            page_offset
-        };
-
-        // Clear imm12 field (bits 21:10) and set new value.
-        inst = (inst & !(0xFFF << 10)) | ((imm12 & 0xFFF) << 10);
-
-        let bytes = inst.to_le_bytes();
-        data[offset..offset + 4].copy_from_slice(&bytes);
-
-        Ok(())
-    }
-
-    /// Apply ARM64_RELOC_UNSIGNED.
-    ///
-    /// Supports absolute pointer relocations. Darwin AArch64 PC-relative
-    /// `__eh_frame` values are emitted as SUBTRACTOR+UNSIGNED pairs.
-    fn apply_unsigned(
-        data: &mut [u8],
-        offset: usize,
-        _pc: u64,
-        target: u64,
-        reloc: &Relocation,
-    ) -> Result<(), LinkerError> {
-        if reloc.pc_relative {
-            return Err(LinkerError::UnsupportedRelocation(
-                AArch64RelocKind::Unsigned,
-            ));
-        }
-
-        let value = Self::read_signed_addend(data, offset, reloc.length)?
-            .checked_add(target as i128)
-            .ok_or_else(|| LinkerError::RelocationOverflow {
-                detail: format!("UNSIGNED target {target:#x} plus addend overflowed"),
-            })?;
-        Self::write_sized_value(data, offset, reloc.length, value)
-    }
-
-    fn apply_pointer_to_got(
-        data: &mut [u8],
-        offset: usize,
-        pc: u64,
-        target: u64,
-        reloc: &Relocation,
-    ) -> Result<(), LinkerError> {
-        if !reloc.pc_relative || reloc.length != 2 {
-            return Err(LinkerError::UnsupportedRelocation(
-                AArch64RelocKind::PointerToGot,
-            ));
-        }
-
-        let addend = Self::read_signed_addend(data, offset, reloc.length)?;
-        let value = target as i128 + addend - pc as i128;
-        Self::write_sized_value(data, offset, reloc.length, value)
+            .ok_or_else(|| LinkerError::UndefinedSymbol(sym.name.to_string()))
     }
 
     fn apply_subtractor_pair(
@@ -1988,8 +3201,1251 @@ impl RelocationApplicator {
 }
 
 // ---------------------------------------------------------------------------
+// Image symbols, imports and synthesized slots
+// ---------------------------------------------------------------------------
+
+/// Symbol identity of a GOT or TLV pointer slot. Global names share one slot
+/// across objects; local definitions stay object-scoped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SlotKey {
+    Global(SymbolName),
+    Local { object: usize, symbol: usize },
+}
+
+/// What a relocation's symbol resolves to in the image being linked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelocTarget {
+    /// A definition inside this image.
+    Defined { address: u64, class: SectionClass },
+    /// A dylib's exported weak definition, which dyld may coalesce with
+    /// another image's: pointers to it bind through the weak-lookup import
+    /// `import`, and only image-relative differences use `address`.
+    Coalesced {
+        import: usize,
+        address: u64,
+        class: SectionClass,
+    },
+    /// A dylib import (index into the chained-fixups import table).
+    Import(usize),
+    /// An exclusively weak reference with no definition or provider.
+    Null,
+}
+
+/// Dylib imports in object symbol-table order, with their library ordinals.
+struct ImportTable<'c> {
+    names: Vec<String>,
+    index: HashMap<String, usize>,
+    ordinals: Vec<u32>,
+    dylibs: Vec<&'c DylibEntry>,
+    /// Weak-lookup imports for a dylib's coalescable weak definitions.
+    coalesced: HashMap<String, usize>,
+}
+
+impl<'c> ImportTable<'c> {
+    /// Every undefined name a configured dylib provides becomes an import;
+    /// a strong reference nobody provides is an undefined-symbol error.
+    fn collect(resolver: &SymbolResolver, config: &'c DylibConfig) -> Result<Self, LinkerError> {
+        let (_, names) = resolver.resolve_with_dylibs(config, 0)?;
+        let dylibs: Vec<&DylibEntry> = config
+            .needed_dylibs(&names)
+            .into_iter()
+            .map(|index| &config.dylibs[index])
+            .collect();
+        validate_dylib_imports(&dylibs, &names)?;
+        let ordinals = names
+            .iter()
+            .map(|name| dylib_ordinal_for_symbol(&dylibs, name))
+            .collect();
+        let index = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index))
+            .collect();
+        Ok(Self {
+            names,
+            index,
+            ordinals,
+            dylibs,
+            coalesced: HashMap::new(),
+        })
+    }
+
+    /// Append one weak-lookup import per coalescable weak definition, in name
+    /// order, after the dylib imports, and re-admit the combined table into
+    /// the compact import format.
+    fn add_coalesced(&mut self, names: &[String]) -> Result<(), LinkerError> {
+        for name in names {
+            let import = self.names.len();
+            self.names.push(name.clone());
+            self.ordinals.push(BIND_SPECIAL_DYLIB_WEAK_LOOKUP_ORDINAL);
+            self.coalesced.insert(name.clone(), import);
+        }
+        validate_import_table(&self.dylibs, &self.names, |symbol| {
+            self.coalesced.contains_key(symbol)
+        })
+    }
+}
+
+/// Relocation-target resolution over one planned layout.
+struct ImageSymbols<'a> {
+    objects: &'a [ParsedObject],
+    classes: &'a [Vec<SectionClass>],
+    section_addrs: &'a [Vec<u64>],
+    resolver: &'a SymbolResolver,
+    locals: Vec<HashMap<usize, u64>>,
+    imports: &'a ImportTable<'a>,
+}
+
+impl<'a> ImageSymbols<'a> {
+    fn new(
+        objects: &'a [ParsedObject],
+        classes: &'a [Vec<SectionClass>],
+        section_addrs: &'a [Vec<u64>],
+        resolver: &'a SymbolResolver,
+        imports: &'a ImportTable<'a>,
+    ) -> Self {
+        let locals = (0..objects.len())
+            .map(|object| resolver.object_symbol_addrs(object))
+            .collect();
+        Self {
+            objects,
+            classes,
+            section_addrs,
+            resolver,
+            locals,
+            imports,
+        }
+    }
+
+    fn defined(
+        &self,
+        object: usize,
+        section: usize,
+        address: u64,
+    ) -> Result<RelocTarget, LinkerError> {
+        let class = self.classes[object][section];
+        if class == SectionClass::Debug {
+            return Err(LinkerError::UnloadedSectionReference(section_label(
+                &self.objects[object].sections[section],
+            )));
+        }
+        Ok(RelocTarget::Defined { address, class })
+    }
+
+    /// Resolve a global name that some relocation already named validly.
+    fn resolve_global(&self, name: &str) -> Result<RelocTarget, LinkerError> {
+        if let Some(definition) = self.resolver.defined.get(name) {
+            let target = self.defined(
+                definition.object_index,
+                definition.section_index,
+                definition.address,
+            )?;
+            if let (Some(&import), RelocTarget::Defined { address, class }) =
+                (self.imports.coalesced.get(name), target)
+            {
+                return Ok(RelocTarget::Coalesced {
+                    import,
+                    address,
+                    class,
+                });
+            }
+            return Ok(target);
+        }
+        if let Some(&import) = self.imports.index.get(name) {
+            return Ok(RelocTarget::Import(import));
+        }
+        let referenced = self
+            .resolver
+            .undefined
+            .iter()
+            .any(|(_, _, undefined)| undefined == name);
+        if referenced && !self.resolver.strong_refs.contains(name) {
+            return Ok(RelocTarget::Null);
+        }
+        Err(LinkerError::UndefinedSymbol(name.to_owned()))
+    }
+
+    /// Resolve a relocation's target and, for symbol relocations, its slot key.
+    fn resolve(
+        &self,
+        object: usize,
+        reloc: &Relocation,
+    ) -> Result<(RelocTarget, Option<SlotKey>), LinkerError> {
+        let parsed = &self.objects[object];
+        if !reloc.is_extern {
+            let ordinal = reloc.symbol_index as usize;
+            let section = ordinal
+                .checked_sub(1)
+                .filter(|section| *section < parsed.sections.len())
+                .ok_or_else(|| {
+                    LinkerError::MalformedRelocation(format!(
+                        "section ordinal {ordinal} out of range (have {} sections)",
+                        parsed.sections.len()
+                    ))
+                })?;
+            let address = self.section_addrs[object][section];
+            return Ok((self.defined(object, section, address)?, None));
+        }
+        let symbol_index = reloc.symbol_index as usize;
+        let symbol = parsed.symbols.get(symbol_index).ok_or_else(|| {
+            LinkerError::MalformedRelocation(format!(
+                "symbol index {} out of range",
+                reloc.symbol_index
+            ))
+        })?;
+        if symbol.is_defined() && !symbol.is_external() {
+            let address = self.locals[object].get(&symbol_index).copied().ok_or_else(|| {
+                LinkerError::MalformedRelocation(format!(
+                    "local defined symbol '{}' at index {symbol_index} has no object-local resolved address",
+                    symbol.name
+                ))
+            })?;
+            let target = self.defined(object, usize::from(symbol.section) - 1, address)?;
+            return Ok((
+                target,
+                Some(SlotKey::Local {
+                    object,
+                    symbol: symbol_index,
+                }),
+            ));
+        }
+        if !symbol.is_defined() && !(symbol.is_undefined() && symbol.is_external()) {
+            // Absolute, indirect and prebound symbols are not linkable here.
+            return Err(LinkerError::UndefinedSymbol(symbol.name.to_string()));
+        }
+        let target = self.resolve_global(&symbol.name)?;
+        Ok((target, Some(SlotKey::Global(symbol.name.clone()))))
+    }
+
+    fn resolve_key(&self, key: &SlotKey) -> Result<RelocTarget, LinkerError> {
+        match key {
+            SlotKey::Global(name) => self.resolve_global(name),
+            &SlotKey::Local { object, symbol } => {
+                let parsed = &self.objects[object].symbols[symbol];
+                let address = self.locals[object].get(&symbol).copied().ok_or_else(|| {
+                    LinkerError::MalformedRelocation(format!(
+                        "local slot symbol '{}' has no resolved address",
+                        parsed.name
+                    ))
+                })?;
+                self.defined(object, usize::from(parsed.section) - 1, address)
+            }
+        }
+    }
+
+    fn import_name(&self, import: usize) -> &str {
+        &self.imports.names[import]
+    }
+}
+
+/// Stubs, GOT slots and TLV pointer slots an image needs, in slot order.
+#[derive(Debug, Clone, Default)]
+struct SlotPlan {
+    /// Imports called through `__stubs` (import-table indices).
+    stubs: Vec<usize>,
+    /// GOT slots: every stubbed import first (in stub order), then the other
+    /// `GOT_LOAD`/`POINTER_TO_GOT` targets in first-reference order.
+    got: Vec<SlotKey>,
+    /// `__thread_ptrs` slots in first-reference order.
+    tlv_pointers: Vec<SlotKey>,
+}
+
+/// Collect the stubs and GOT/TLV slots named by every loaded section. Shape
+/// errors are reported here, before any address is planned.
+fn plan_slots(symbols: &ImageSymbols<'_>) -> Result<SlotPlan, LinkerError> {
+    let mut stubbed = vec![false; symbols.imports.names.len()];
+    let mut got_refs = Vec::new();
+    let mut got_seen = HashSet::new();
+    let mut tlv_pointers = Vec::new();
+    let mut tlv_seen = HashSet::new();
+    for (object_index, object) in symbols.objects.iter().enumerate() {
+        for (section_index, section) in object.sections.iter().enumerate() {
+            if matches!(
+                symbols.classes[object_index][section_index],
+                SectionClass::Debug | SectionClass::ThreadVars
+            ) {
+                continue;
+            }
+            for op in relocation_ops(&section.relocations)? {
+                let RelocOp::Single { reloc, .. } = op else {
+                    continue;
+                };
+                validate_relocation_shape(reloc)?;
+                match reloc.kind {
+                    AArch64RelocKind::Branch26 => {
+                        if let (
+                            RelocTarget::Import(import) | RelocTarget::Coalesced { import, .. },
+                            _,
+                        ) = symbols.resolve(object_index, reloc)?
+                        {
+                            stubbed[import] = true;
+                        }
+                    }
+                    AArch64RelocKind::GotLoadPage21
+                    | AArch64RelocKind::GotLoadPageoff12
+                    | AArch64RelocKind::PointerToGot => {
+                        let (_, key) = symbols.resolve(object_index, reloc)?;
+                        let key = key.ok_or_else(|| {
+                            LinkerError::MalformedRelocation(
+                                "GOT relocation names no symbol".into(),
+                            )
+                        })?;
+                        if got_seen.insert(key.clone()) {
+                            got_refs.push(key);
+                        }
+                    }
+                    AArch64RelocKind::TlvpLoadPage21 | AArch64RelocKind::TlvpLoadPageoff12 => {
+                        let (_, key) = symbols.resolve(object_index, reloc)?;
+                        let key = key.ok_or_else(|| {
+                            LinkerError::MalformedRelocation(
+                                "TLVP relocation names no symbol".into(),
+                            )
+                        })?;
+                        if tlv_seen.insert(key.clone()) {
+                            tlv_pointers.push(key);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let stubs: Vec<usize> = stubbed
+        .iter()
+        .enumerate()
+        .filter_map(|(import, stubbed)| stubbed.then_some(import))
+        .collect();
+    let mut got: Vec<SlotKey> = stubs
+        .iter()
+        .map(|&import| SlotKey::Global(symbols.imports.names[import].as_str().into()))
+        .collect();
+    let stub_keys: HashSet<SlotKey> = got.iter().cloned().collect();
+    got.extend(got_refs.into_iter().filter(|key| !stub_keys.contains(key)));
+    Ok(SlotPlan {
+        stubs,
+        got,
+        tlv_pointers,
+    })
+}
+
+/// Applies one image's relocations against its final layout, recording every
+/// pointer that dyld must rebase or bind.
+struct ImageRelocator<'a> {
+    symbols: &'a ImageSymbols<'a>,
+    layout: &'a ImageLayout,
+    got: HashMap<SlotKey, u64>,
+    tlv_pointers: HashMap<SlotKey, u64>,
+    stubs: HashMap<usize, u64>,
+}
+
+impl ImageRelocator<'_> {
+    fn apply_section(
+        &self,
+        object: usize,
+        section_index: usize,
+        bytes: &mut [u8],
+        address: u64,
+        fixups: &mut Vec<PointerFixup>,
+    ) -> Result<(), LinkerError> {
+        let section = &self.symbols.objects[object].sections[section_index];
+        let class = self.symbols.classes[object][section_index];
+        if class == SectionClass::ThreadVars {
+            return self.apply_thread_vars(object, section, bytes, address, fixups);
+        }
+        for op in relocation_ops(&section.relocations)? {
+            match op {
+                RelocOp::Difference {
+                    subtrahend,
+                    minuend,
+                } => {
+                    let subtrahend_addr = self.difference_operand(object, subtrahend)?;
+                    let minuend_addr = self.difference_operand(object, minuend)?;
+                    RelocationApplicator::apply_subtractor_pair(
+                        bytes,
+                        subtrahend.offset as usize,
+                        minuend_addr,
+                        subtrahend_addr,
+                        subtrahend.length,
+                    )?;
+                }
+                RelocOp::Single { reloc, addend } => self.apply_single(
+                    object, section, class, reloc, addend, bytes, address, fixups,
+                )?,
+            }
+        }
+        Ok(())
+    }
+
+    /// A symbol difference is image-relative: no fixup, no imports, no TLVs.
+    fn difference_operand(&self, object: usize, reloc: &Relocation) -> Result<u64, LinkerError> {
+        match self.symbols.resolve(object, reloc)?.0 {
+            RelocTarget::Defined { class, .. } if class.is_thread_local() => {
+                Err(LinkerError::ThreadLocal(format!(
+                    "a symbol difference at offset {:#x} names a thread-local variable",
+                    reloc.offset
+                )))
+            }
+            RelocTarget::Coalesced { class, .. } if class.is_thread_local() => {
+                Err(LinkerError::ThreadLocal(format!(
+                    "a symbol difference at offset {:#x} names a thread-local variable",
+                    reloc.offset
+                )))
+            }
+            // An image-relative difference (unwind/FDE ranges) describes this
+            // image's own copy, whichever copy dyld binds pointers to.
+            RelocTarget::Defined { address, .. } | RelocTarget::Coalesced { address, .. } => {
+                Ok(address)
+            }
+            RelocTarget::Import(import) => Err(LinkerError::DirectImportReference {
+                kind: reloc.kind,
+                symbol: self.symbols.import_name(import).to_owned(),
+            }),
+            RelocTarget::Null => Ok(0),
+        }
+    }
+
+    fn slot(
+        &self,
+        slots: &HashMap<SlotKey, u64>,
+        key: Option<SlotKey>,
+        kind: AArch64RelocKind,
+    ) -> Result<u64, LinkerError> {
+        key.and_then(|key| slots.get(&key).copied()).ok_or_else(|| {
+            LinkerError::MalformedRelocation(format!("{kind:?} relocation has no planned slot"))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_single(
+        &self,
+        object: usize,
+        section: &ParsedSection,
+        class: SectionClass,
+        reloc: &Relocation,
+        addend: i64,
+        bytes: &mut [u8],
+        address: u64,
+        fixups: &mut Vec<PointerFixup>,
+    ) -> Result<(), LinkerError> {
+        use AArch64RelocKind as K;
+        validate_relocation_shape(reloc)?;
+        let offset = reloc.offset as usize;
+        let pc = layout_add(address, u64::from(reloc.offset), "relocation site")?;
+        let (target, key) = self.symbols.resolve(object, reloc)?;
+        let tlvp = matches!(reloc.kind, K::TlvpLoadPage21 | K::TlvpLoadPageoff12);
+        let site = || {
+            format!(
+                "{:?} at {}+{:#x}",
+                reloc.kind,
+                section_label(section),
+                reloc.offset
+            )
+        };
+        match target {
+            RelocTarget::Defined { class, .. } | RelocTarget::Coalesced { class, .. }
+                if class.is_thread_local() && !tlvp =>
+            {
+                return Err(LinkerError::ThreadLocal(format!(
+                    "{} names a thread-local variable or template; only ARM64_RELOC_TLVP_LOAD_* may address one",
+                    site()
+                )));
+            }
+            RelocTarget::Defined { class, .. } if tlvp && class != SectionClass::ThreadVars => {
+                return Err(LinkerError::ThreadLocal(format!(
+                    "{} names a symbol outside __thread_vars",
+                    site()
+                )));
+            }
+            RelocTarget::Null if tlvp => {
+                return Err(LinkerError::ThreadLocal(format!(
+                    "{} names an undefined weak thread-local variable",
+                    site()
+                )));
+            }
+            _ => {}
+        }
+        let direct = |target: RelocTarget| match target {
+            RelocTarget::Defined { address, .. } => Ok(address),
+            RelocTarget::Coalesced { import, .. } => {
+                Err(LinkerError::DirectWeakDefinitionReference {
+                    kind: reloc.kind,
+                    symbol: self.symbols.import_name(import).to_owned(),
+                })
+            }
+            RelocTarget::Import(import) => Err(LinkerError::DirectImportReference {
+                kind: reloc.kind,
+                symbol: self.symbols.import_name(import).to_owned(),
+            }),
+            RelocTarget::Null => Ok(0),
+        };
+        match reloc.kind {
+            K::Branch26 => {
+                let destination = match target {
+                    RelocTarget::Import(import) | RelocTarget::Coalesced { import, .. } => {
+                        *self.stubs.get(&import).ok_or_else(|| {
+                            LinkerError::MalformedRelocation(
+                                "branch to an import or coalescable weak definition has no stub"
+                                    .into(),
+                            )
+                        })?
+                    }
+                    other => direct(other)?,
+                };
+                patch_branch26(bytes, offset, pc, offset_address(destination, addend)?)
+            }
+            K::Page21 => {
+                let destination = offset_address(direct(target)?, addend)?;
+                patch_page21(bytes, offset, pc, destination, reloc.kind)
+            }
+            K::Pageoff12 => {
+                let destination = offset_address(direct(target)?, addend)?;
+                patch_pageoff12(bytes, offset, destination, reloc.kind)
+            }
+            K::GotLoadPage21 => patch_page21(
+                bytes,
+                offset,
+                pc,
+                self.slot(&self.got, key, reloc.kind)?,
+                reloc.kind,
+            ),
+            K::GotLoadPageoff12 => patch_pageoff12(
+                bytes,
+                offset,
+                self.slot(&self.got, key, reloc.kind)?,
+                reloc.kind,
+            ),
+            K::PointerToGot => {
+                let slot = self.slot(&self.got, key, reloc.kind)?;
+                let inline = RelocationApplicator::read_signed_addend(bytes, offset, 2)?;
+                RelocationApplicator::write_sized_value(
+                    bytes,
+                    offset,
+                    2,
+                    i128::from(slot) + inline - i128::from(pc),
+                )
+            }
+            K::TlvpLoadPage21 => patch_page21(
+                bytes,
+                offset,
+                pc,
+                self.slot(&self.tlv_pointers, key, reloc.kind)?,
+                reloc.kind,
+            ),
+            K::TlvpLoadPageoff12 => patch_pageoff12(
+                bytes,
+                offset,
+                self.slot(&self.tlv_pointers, key, reloc.kind)?,
+                reloc.kind,
+            ),
+            K::Unsigned => self.apply_pointer(section, class, reloc, target, bytes, pc, fixups),
+            other => Err(LinkerError::UnsupportedRelocation(other)),
+        }
+    }
+
+    /// An absolute `UNSIGNED` pointer. Image addresses become rebases and
+    /// imports become binds; both need a 64-bit data slot.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_pointer(
+        &self,
+        section: &ParsedSection,
+        class: SectionClass,
+        reloc: &Relocation,
+        target: RelocTarget,
+        bytes: &mut [u8],
+        pc: u64,
+        fixups: &mut Vec<PointerFixup>,
+    ) -> Result<(), LinkerError> {
+        let offset = reloc.offset as usize;
+        let inline = RelocationApplicator::read_signed_addend(bytes, offset, reloc.length)?;
+        let unslidable = |detail| LinkerError::UnslidablePointer {
+            section: section_label(section),
+            offset: reloc.offset,
+            detail,
+        };
+        let kind = match target {
+            // An exclusively weak reference stays null plus its addend.
+            RelocTarget::Null => {
+                return RelocationApplicator::write_sized_value(
+                    bytes,
+                    offset,
+                    reloc.length,
+                    inline,
+                );
+            }
+            _ if class == SectionClass::Text => {
+                return Err(unslidable(
+                    "__TEXT carries no dyld fixups; absolute pointers must live in a data section",
+                ));
+            }
+            _ if reloc.length != 3 => {
+                return Err(unslidable(
+                    "a 32-bit field cannot hold a slid 64-bit image address",
+                ));
+            }
+            RelocTarget::Defined { address, .. } => {
+                let value = u64::try_from(i128::from(address) + inline).map_err(|_| {
+                    LinkerError::RelocationOverflow {
+                        detail: format!("UNSIGNED target {address:#x} plus addend overflowed"),
+                    }
+                })?;
+                RelocationApplicator::write_sized_value(bytes, offset, 3, i128::from(value))?;
+                PointerFixupKind::Rebase { target: value }
+            }
+            RelocTarget::Import(import) | RelocTarget::Coalesced { import, .. } => {
+                let addend = u8::try_from(inline).map_err(|_| LinkerError::ChainedFixup {
+                    address: pc,
+                    detail: format!(
+                        "bind of '{}' carries addend {inline}, outside the 0..=255 bind field",
+                        self.symbols.import_name(import)
+                    ),
+                })?;
+                RelocationApplicator::write_sized_value(bytes, offset, 3, 0)?;
+                PointerFixupKind::Bind { import, addend }
+            }
+        };
+        fixups.push(PointerFixup { address: pc, kind });
+        Ok(())
+    }
+
+    /// Resolve `__thread_vars` descriptors `{thunk, key, offset}`: the thunk
+    /// binds `__tlv_bootstrap`, the key stays zero for dyld, and the offset
+    /// becomes the template's position in the contiguous TLV template image.
+    fn apply_thread_vars(
+        &self,
+        object: usize,
+        section: &ParsedSection,
+        bytes: &mut [u8],
+        address: u64,
+        fixups: &mut Vec<PointerFixup>,
+    ) -> Result<(), LinkerError> {
+        let malformed = |detail: String| {
+            LinkerError::ThreadLocal(format!(
+                "object {object} {}: {detail}",
+                section_label(section)
+            ))
+        };
+        if !(bytes.len() as u64).is_multiple_of(TLV_DESCRIPTOR_SIZE) {
+            return Err(malformed(
+                "size is not a whole number of 24-byte TLV descriptors".into(),
+            ));
+        }
+        let count = bytes.len() / TLV_DESCRIPTOR_SIZE as usize;
+        let mut thunks = vec![false; count];
+        let mut templates = vec![false; count];
+        for op in relocation_ops(&section.relocations)? {
+            let reloc = match op {
+                RelocOp::Single { reloc, addend: 0 }
+                    if reloc.kind == AArch64RelocKind::Unsigned
+                        && !reloc.pc_relative
+                        && reloc.length == 3 =>
+                {
+                    reloc
+                }
+                _ => {
+                    return Err(malformed(
+                        "descriptors accept only absolute 64-bit ARM64_RELOC_UNSIGNED relocations"
+                            .into(),
+                    ));
+                }
+            };
+            let field = u64::from(reloc.offset);
+            let descriptor = (field / TLV_DESCRIPTOR_SIZE) as usize;
+            if descriptor >= count {
+                return Err(malformed(format!(
+                    "relocation at {field:#x} lies outside the descriptor table"
+                )));
+            }
+            let slot_address = layout_add(address, field, "TLV descriptor slot")?;
+            let (target, _) = self.symbols.resolve(object, reloc)?;
+            let inline = RelocationApplicator::read_signed_addend(bytes, reloc.offset as usize, 3)?;
+            match field % TLV_DESCRIPTOR_SIZE {
+                0 => {
+                    let bootstrap = match target {
+                        RelocTarget::Import(import)
+                            if self.symbols.import_name(import) == TLV_BOOTSTRAP_SYMBOL
+                                && inline == 0 =>
+                        {
+                            import
+                        }
+                        _ => {
+                            return Err(malformed(format!(
+                                "descriptor {descriptor} thunk must bind dylib symbol {TLV_BOOTSTRAP_SYMBOL} with no addend"
+                            )));
+                        }
+                    };
+                    if std::mem::replace(&mut thunks[descriptor], true) {
+                        return Err(malformed(format!(
+                            "descriptor {descriptor} has two thunk relocations"
+                        )));
+                    }
+                    RelocationApplicator::write_sized_value(bytes, reloc.offset as usize, 3, 0)?;
+                    fixups.push(PointerFixup {
+                        address: slot_address,
+                        kind: PointerFixupKind::Bind {
+                            import: bootstrap,
+                            addend: 0,
+                        },
+                    });
+                }
+                TLV_DESCRIPTOR_OFFSET_FIELD => {
+                    let template_address = match target {
+                        RelocTarget::Defined {
+                            address,
+                            class: SectionClass::ThreadData | SectionClass::ThreadBss,
+                        } => address,
+                        _ => {
+                            return Err(malformed(format!(
+                                "descriptor {descriptor} offset must name a __thread_data/__thread_bss template"
+                            )));
+                        }
+                    };
+                    let base = self
+                        .layout
+                        .tls_base
+                        .ok_or_else(|| malformed("the image has no TLV template".into()))?;
+                    let image_size = self.layout.thread_bss.1 - base;
+                    let template_offset = i128::from(template_address) + inline - i128::from(base);
+                    if !(0..=i128::from(image_size)).contains(&template_offset) {
+                        return Err(malformed(format!(
+                            "descriptor {descriptor} template offset {template_offset} lies outside the {image_size}-byte TLV template image"
+                        )));
+                    }
+                    if std::mem::replace(&mut templates[descriptor], true) {
+                        return Err(malformed(format!(
+                            "descriptor {descriptor} has two template relocations"
+                        )));
+                    }
+                    RelocationApplicator::write_sized_value(
+                        bytes,
+                        reloc.offset as usize,
+                        3,
+                        template_offset,
+                    )?;
+                }
+                _ => {
+                    return Err(malformed(format!(
+                        "relocation at {field:#x} is not a descriptor thunk or offset word"
+                    )));
+                }
+            }
+        }
+        for descriptor in 0..count {
+            if !thunks[descriptor] || !templates[descriptor] {
+                return Err(malformed(format!(
+                    "descriptor {descriptor} lacks its {TLV_BOOTSTRAP_SYMBOL} thunk or template-offset relocation"
+                )));
+            }
+            let key =
+                descriptor * TLV_DESCRIPTOR_SIZE as usize + TLV_DESCRIPTOR_KEY_OFFSET as usize;
+            if bytes[key..key + 8].iter().any(|&byte| byte != 0) {
+                return Err(malformed(format!(
+                    "descriptor {descriptor} key word must be zero"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Executable emission
 // ---------------------------------------------------------------------------
+
+/// One section header of the linked image (absolute address).
+#[derive(Debug, Clone)]
+struct OutputSection {
+    sectname: &'static [u8],
+    addr: u64,
+    size: u64,
+    align: u32,
+    flags: u32,
+}
+
+impl OutputSection {
+    fn is_zerofill(&self) -> bool {
+        matches!(
+            self.flags & SECTION_TYPE_MASK,
+            S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+        )
+    }
+}
+
+/// A segment after `__TEXT` (`__DATA_CONST` or `__DATA`).
+#[derive(Debug, Clone)]
+struct OutputSegment {
+    name: &'static [u8],
+    vmaddr: u64,
+    /// File-backed content starting at `vmaddr`.
+    bytes: Vec<u8>,
+    /// Virtual extent from `vmaddr`, including trailing zero-fill.
+    virtual_size: u64,
+    flags: u32,
+    sections: Vec<OutputSection>,
+    fixups: Vec<PointerFixup>,
+}
+
+/// Everything the emitter writes, fully planned.
+struct ImagePlan<'a> {
+    kind: ImageKind<'a>,
+    /// `__TEXT` segment base (the Mach-O header's address).
+    text_vmaddr: u64,
+    /// Text content, starting at the first text section's address.
+    text: Vec<u8>,
+    text_sections: Vec<OutputSection>,
+    /// `LC_MAIN` entry offset; executables only.
+    entry_offset: Option<u64>,
+    stubs_offset: u64,
+    segments: Vec<OutputSegment>,
+    dylibs: &'a [&'a DylibEntry],
+    imports: &'a [String],
+    import_ordinals: &'a [u32],
+    exports_trie: Vec<u8>,
+    /// Flags added to the kind's standard header flags.
+    header_flags: u32,
+}
+
+/// Checked file/virtual extents of one planned image. Zero-fill contributes
+/// to virtual extent only. Every address is validated before a payload is
+/// allocated or narrowed to a Mach-O 32-bit file offset.
+struct ExecutableLayout {
+    text_file_offset: u64,
+    text_segment_filesize: u64,
+    /// `(fileoff, filesize, vmsize)` of each segment after `__TEXT`.
+    segments: Vec<(u64, u64, u64)>,
+    linkedit_file_offset: u64,
+    linkedit_vmaddr: u64,
+}
+
+impl ExecutableLayout {
+    /// `segments` lists `(vmaddr, file_size, virtual_size)` in address order.
+    /// An executable needs an entry inside its text and a base outside
+    /// `__PAGEZERO`; a dylib has neither.
+    fn new(
+        kind: ImageKind<'_>,
+        text_size: u64,
+        text_vmaddr: u64,
+        entry_offset: Option<u64>,
+        total_lc_size: u32,
+        segments: &[(u64, u64, u64)],
+    ) -> Result<Self, LinkerError> {
+        let text_file_offset = executable_text_file_offset_from_lc_size(total_lc_size);
+        let text_segment_filesize = layout_add(
+            text_file_offset,
+            checked_align_to(text_size, PAGE_SIZE)?,
+            "text file extent",
+        )?;
+        layout_add(text_vmaddr, text_file_offset, "text content address")?;
+        let text_end = layout_add(text_vmaddr, text_segment_filesize, "text segment end")?;
+        let malformed = || {
+            LinkerError::MalformedInput {
+            file: "executable layout".into(),
+            detail: "segments must be page-aligned, non-overlapping, outside __PAGEZERO, and cover their file bytes".into(),
+        }
+        };
+        if text_vmaddr < kind.base() || !text_vmaddr.is_multiple_of(PAGE_SIZE) {
+            return Err(malformed());
+        }
+        let mut file_cursor = text_segment_filesize;
+        let mut vm_cursor = text_end;
+        let mut extents = Vec::with_capacity(segments.len());
+        for &(vmaddr, file_size, virtual_size) in segments {
+            if virtual_size == 0
+                || file_size > virtual_size
+                || vmaddr < vm_cursor
+                || !vmaddr.is_multiple_of(PAGE_SIZE)
+            {
+                return Err(malformed());
+            }
+            let filesize = checked_align_to(file_size, PAGE_SIZE)?;
+            let vmsize = checked_align_to(virtual_size, PAGE_SIZE)?;
+            extents.push((file_cursor, filesize, vmsize));
+            file_cursor = layout_add(file_cursor, filesize, "data file extent")?;
+            vm_cursor = layout_add(vmaddr, vmsize, "data virtual extent")?;
+        }
+        match (kind, entry_offset) {
+            (ImageKind::Executable, Some(entry))
+                if entry >= text_file_offset && entry - text_file_offset < text_size => {}
+            (ImageKind::Dylib { .. }, None) => {}
+            _ => return Err(LinkerError::NoEntryPoint),
+        }
+        if file_cursor > u64::from(u32::MAX) {
+            return Err(LinkerError::LayoutOverflow("Mach-O file offsets"));
+        }
+        Ok(Self {
+            text_file_offset,
+            text_segment_filesize,
+            segments: extents,
+            linkedit_file_offset: file_cursor,
+            linkedit_vmaddr: vm_cursor,
+        })
+    }
+
+    /// Validate the last segment and reserve the complete image fallibly.
+    fn reserve_image(&self, linkedit_filesize: u64) -> Result<Vec<u8>, LinkerError> {
+        layout_add(
+            self.linkedit_vmaddr,
+            checked_align_to(linkedit_filesize, PAGE_SIZE)?,
+            "linkedit virtual extent",
+        )?;
+        let total = layout_add(
+            self.linkedit_file_offset,
+            linkedit_filesize,
+            "executable file extent",
+        )?;
+        if total > u64::from(u32::MAX) {
+            return Err(LinkerError::LayoutOverflow("Mach-O file offsets"));
+        }
+        let capacity = usize::try_from(total)
+            .map_err(|_| LinkerError::LayoutOverflow("image allocation size"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(LinkerError::ImageAllocation)?;
+        Ok(bytes)
+    }
+}
+
+fn deterministic_image_uuid(plan: &ImagePlan<'_>) -> [u8; 16] {
+    let mut lo = 0xCBF2_9CE4_8422_2325u64;
+    let mut hi = 0x8422_2325_CBF2_9CE4u64;
+
+    update_uuid_bytes(&mut lo, &mut hi, b"trust-cg-macho-image-v2");
+    update_uuid_u64(&mut lo, &mut hi, u64::from(plan.kind.filetype()));
+    if let ImageKind::Dylib { install_name } = plan.kind {
+        update_uuid_bytes(&mut lo, &mut hi, install_name.as_bytes());
+    }
+    update_uuid_u64(&mut lo, &mut hi, plan.text_vmaddr);
+    update_uuid_u64(&mut lo, &mut hi, plan.entry_offset.unwrap_or(u64::MAX));
+    update_uuid_bytes(&mut lo, &mut hi, &plan.exports_trie);
+    update_uuid_u64(&mut lo, &mut hi, plan.stubs_offset);
+    update_uuid_u64(&mut lo, &mut hi, u64::from(plan.header_flags));
+    update_uuid_bytes(&mut lo, &mut hi, &plan.text);
+    update_uuid_u64(&mut lo, &mut hi, plan.segments.len() as u64);
+    for segment in &plan.segments {
+        update_uuid_bytes(&mut lo, &mut hi, segment.name);
+        update_uuid_u64(&mut lo, &mut hi, segment.vmaddr);
+        update_uuid_u64(&mut lo, &mut hi, segment.virtual_size);
+        update_uuid_u64(&mut lo, &mut hi, u64::from(segment.flags));
+        // Hashed after chain encoding, so every fixup is covered.
+        update_uuid_bytes(&mut lo, &mut hi, &segment.bytes);
+    }
+    update_uuid_u64(&mut lo, &mut hi, plan.dylibs.len() as u64);
+    for dylib in plan.dylibs {
+        update_uuid_bytes(&mut lo, &mut hi, dylib.install_name.as_bytes());
+    }
+    update_uuid_u64(&mut lo, &mut hi, plan.imports.len() as u64);
+    for symbol in plan.imports {
+        update_uuid_bytes(&mut lo, &mut hi, symbol.as_bytes());
+    }
+
+    let mut uuid = [0u8; 16];
+    uuid[..8].copy_from_slice(&lo.to_le_bytes());
+    uuid[8..].copy_from_slice(&hi.to_le_bytes());
+    uuid
+}
+
+/// Load-command bytes for a plan's actual section counts.
+fn plan_load_command_size(
+    plan: &ImagePlan<'_>,
+    dylib_cmd_sizes: &[u32],
+) -> Result<u32, LinkerError> {
+    let mut size = u64::from(SEGMENT_COMMAND_64_SIZE) // __LINKEDIT
+        + plan.kind.fixed_commands().1;
+    let segment = |nsects: usize| {
+        u64::from(SEGMENT_COMMAND_64_SIZE) + nsects as u64 * u64::from(SECTION_64_SIZE)
+    };
+    size += segment(plan.text_sections.len());
+    for output in &plan.segments {
+        size = layout_add(size, segment(output.sections.len()), "load commands")?;
+    }
+    for &dylib in dylib_cmd_sizes {
+        size = layout_add(size, u64::from(dylib), "load commands")?;
+    }
+    u32::try_from(size).map_err(|_| LinkerError::LayoutOverflow("load command size"))
+}
+
+/// Emit a planned MH_EXECUTE or MH_DYLIB: header, load commands, segment
+/// content, chained fixups, the exports trie and an ad-hoc code signature.
+fn emit_image(mut plan: ImagePlan<'_>) -> Result<Vec<u8>, LinkerError> {
+    let dylib_cmd_sizes: Vec<u32> = plan
+        .dylibs
+        .iter()
+        .map(|dylib| dylib_command_size(dylib))
+        .collect();
+    let total_lc_size = plan_load_command_size(&plan, &dylib_cmd_sizes)?;
+    let extents: Vec<(u64, u64, u64)> = plan
+        .segments
+        .iter()
+        .map(|segment| {
+            (
+                segment.vmaddr,
+                segment.bytes.len() as u64,
+                segment.virtual_size,
+            )
+        })
+        .collect();
+    let base = plan.text_vmaddr;
+    let layout = ExecutableLayout::new(
+        plan.kind,
+        plan.text.len() as u64,
+        base,
+        plan.entry_offset,
+        total_lc_size,
+        &extents,
+    )?;
+    let text_section_vmaddr = base + layout.text_file_offset;
+    if plan
+        .text_sections
+        .first()
+        .is_none_or(|section| section.addr != text_section_vmaddr)
+    {
+        return Err(LinkerError::MalformedInput {
+            file: "executable layout".into(),
+            detail: "planned text addresses disagree with the load-command size".into(),
+        });
+    }
+
+    // Segment indices: [__PAGEZERO,] __TEXT, the data segments, __LINKEDIT.
+    let first_data_segment = plan.kind.first_data_segment();
+    let mut fixup_segments = Vec::new();
+    for (index, segment) in plan.segments.iter_mut().enumerate() {
+        if let Some(info) = encode_segment_chains(
+            first_data_segment + index,
+            segment.vmaddr,
+            base,
+            &mut segment.bytes,
+            &mut segment.fixups,
+        )? {
+            fixup_segments.push(info);
+        }
+    }
+    let segment_count = first_data_segment + plan.segments.len() + 1;
+    // __TEXT, data segments and __LINKEDIT, the kind's fixed commands, dylibs.
+    let ncmds =
+        plan.segments.len() as u32 + 2 + plan.kind.fixed_commands().0 + plan.dylibs.len() as u32;
+    let linkedit_payload = build_linkedit_payload(
+        layout.linkedit_file_offset,
+        segment_count,
+        &fixup_segments,
+        plan.imports,
+        plan.import_ordinals,
+        &plan.exports_trie,
+    )?;
+    let linkedit_filesize =
+        linkedit_payload.data.len() as u64 + linkedit_payload.code_signature_size as u64;
+    let linkedit_vmsize = align_to(linkedit_filesize, PAGE_SIZE);
+    let total_file_size = layout.linkedit_file_offset + linkedit_filesize;
+    let mut buf = layout.reserve_image(linkedit_filesize)?;
+
+    // --- Header ---
+    buf.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+    buf.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
+    buf.extend_from_slice(&CPU_SUBTYPE_ARM64_ALL.to_le_bytes());
+    buf.extend_from_slice(&plan.kind.filetype().to_le_bytes());
+    buf.extend_from_slice(&ncmds.to_le_bytes());
+    buf.extend_from_slice(&total_lc_size.to_le_bytes());
+    buf.extend_from_slice(&(plan.kind.header_flags() | plan.header_flags).to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+    // --- __PAGEZERO (executables only) ---
+    if plan.kind == ImageKind::Executable {
+        ExecutableEmitter::write_segment(
+            &mut buf,
+            b"__PAGEZERO",
+            0,
+            DEFAULT_BASE_ADDR,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    }
+
+    // --- __TEXT (maps the header and load commands from file offset 0) ---
+    ExecutableEmitter::write_segment(
+        &mut buf,
+        b"__TEXT",
+        base,
+        layout.text_segment_filesize,
+        0,
+        layout.text_segment_filesize,
+        VM_PROT_READ | VM_PROT_EXECUTE,
+        VM_PROT_READ | VM_PROT_EXECUTE,
+        plan.text_sections.len() as u32,
+        0,
+    );
+    for section in &plan.text_sections {
+        ExecutableEmitter::write_section_header(
+            &mut buf,
+            section.sectname,
+            b"__TEXT",
+            section.addr,
+            section.size,
+            (section.addr - base) as u32,
+            section.align,
+            0,
+            0,
+            section.flags,
+        );
+    }
+
+    // --- __DATA_CONST / __DATA ---
+    for (segment, &(fileoff, filesize, vmsize)) in plan.segments.iter().zip(&layout.segments) {
+        ExecutableEmitter::write_segment(
+            &mut buf,
+            segment.name,
+            segment.vmaddr,
+            vmsize,
+            fileoff,
+            filesize,
+            VM_PROT_READ | VM_PROT_WRITE,
+            VM_PROT_READ | VM_PROT_WRITE,
+            segment.sections.len() as u32,
+            segment.flags,
+        );
+        for section in &segment.sections {
+            let offset = if section.is_zerofill() {
+                0
+            } else {
+                (fileoff + (section.addr - segment.vmaddr)) as u32
+            };
+            ExecutableEmitter::write_section_header(
+                &mut buf,
+                section.sectname,
+                segment.name,
+                section.addr,
+                section.size,
+                offset,
+                section.align,
+                0,
+                0,
+                section.flags,
+            );
+        }
+    }
+
+    // --- __LINKEDIT ---
+    ExecutableEmitter::write_segment(
+        &mut buf,
+        b"__LINKEDIT",
+        layout.linkedit_vmaddr,
+        linkedit_vmsize,
+        layout.linkedit_file_offset,
+        linkedit_filesize,
+        VM_PROT_READ,
+        VM_PROT_READ,
+        0,
+        0,
+    );
+
+    write_lc_build_version(&mut buf);
+    write_lc_uuid(&mut buf, deterministic_image_uuid(&plan));
+
+    match (plan.kind, plan.entry_offset) {
+        (ImageKind::Executable, Some(entry_offset)) => {
+            // --- LC_MAIN ---
+            buf.extend_from_slice(&LC_MAIN.to_le_bytes());
+            buf.extend_from_slice(&LC_MAIN_SIZE.to_le_bytes());
+            buf.extend_from_slice(&entry_offset.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes()); // stacksize (0 = default)
+        }
+        (ImageKind::Dylib { install_name }, None) => {
+            // --- LC_ID_DYLIB ---
+            write_dylib_command(&mut buf, LC_ID_DYLIB, 1, install_name);
+        }
+        _ => return Err(LinkerError::NoEntryPoint),
+    }
+
+    write_lc_linkedit_data(
+        &mut buf,
+        LC_DYLD_CHAINED_FIXUPS,
+        linkedit_payload.fixups_offset,
+        linkedit_payload.fixups_size,
+    );
+    write_lc_linkedit_data(
+        &mut buf,
+        LC_DYLD_EXPORTS_TRIE,
+        linkedit_payload.exports_offset,
+        linkedit_payload.exports_size,
+    );
+    write_lc_linkedit_data(
+        &mut buf,
+        LC_CODE_SIGNATURE,
+        linkedit_payload.code_signature_offset,
+        linkedit_payload.code_signature_size,
+    );
+
+    // --- LC_SYMTAB / LC_DYSYMTAB (empty, for format compliance) ---
+    buf.extend_from_slice(&LC_SYMTAB.to_le_bytes());
+    buf.extend_from_slice(&SYMTAB_COMMAND_SIZE.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 16]); // symoff, nsyms, stroff, strsize
+    write_empty_lc_dysymtab(&mut buf);
+
+    if plan.kind == ImageKind::Executable {
+        write_lc_load_dylinker(&mut buf);
+    }
+
+    // --- LC_LOAD_DYLIB commands ---
+    for dylib in plan.dylibs {
+        write_dylib_command(&mut buf, LC_LOAD_DYLIB, 2, &dylib.install_name);
+    }
+    debug_assert_eq!(
+        buf.len() as u64,
+        MACH_HEADER_64_SIZE as u64 + u64::from(total_lc_size)
+    );
+
+    // --- Segment content ---
+    buf.resize(layout.text_file_offset as usize, 0);
+    buf.extend_from_slice(&plan.text);
+    buf.resize(layout.text_segment_filesize as usize, 0);
+    for (segment, &(fileoff, filesize, _)) in plan.segments.iter().zip(&layout.segments) {
+        debug_assert_eq!(buf.len() as u64, fileoff);
+        buf.extend_from_slice(&segment.bytes);
+        buf.resize((fileoff + filesize) as usize, 0);
+    }
+
+    // --- __LINKEDIT payloads ---
+    debug_assert_eq!(buf.len() as u64, layout.linkedit_file_offset);
+    buf.extend_from_slice(&linkedit_payload.data);
+    debug_assert_eq!(buf.len() as u64, linkedit_payload.code_signature_offset);
+    let code_signature = build_ad_hoc_code_signature(
+        &buf,
+        0,
+        layout.text_segment_filesize,
+        plan.kind.exec_seg_flags(),
+    )?;
+    debug_assert_eq!(
+        code_signature.len() as u32,
+        linkedit_payload.code_signature_size
+    );
+    buf.extend_from_slice(&code_signature);
+    buf.resize(total_file_size as usize, 0);
+    self_check_code_signature(
+        &buf,
+        layout.text_segment_filesize,
+        plan.kind.exec_seg_flags(),
+    )?;
+    Ok(buf)
+}
+
+/// Append a `dylib_command` (`LC_LOAD_DYLIB` or `LC_ID_DYLIB`) naming
+/// `install_name`, version 1.0.0, padded to 8 bytes.
+fn write_dylib_command(buf: &mut Vec<u8>, cmd: u32, timestamp: u32, install_name: &str) {
+    let cmd_size = id_dylib_command_size(install_name) as u32;
+    buf.extend_from_slice(&cmd.to_le_bytes());
+    buf.extend_from_slice(&cmd_size.to_le_bytes());
+    buf.extend_from_slice(&LC_LOAD_DYLIB_HEADER_SIZE.to_le_bytes()); // name.offset
+    buf.extend_from_slice(&timestamp.to_le_bytes());
+    buf.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // current_version 1.0.0
+    buf.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // compatibility_version 1.0.0
+    let name_bytes = install_name.as_bytes();
+    buf.extend_from_slice(name_bytes);
+    buf.push(0);
+    let written = LC_LOAD_DYLIB_HEADER_SIZE as usize + name_bytes.len() + 1;
+    buf.extend(std::iter::repeat_n(0, cmd_size as usize - written));
+}
 
 /// Emits a Mach-O MH_EXECUTE binary from linked sections.
 pub struct ExecutableEmitter;
@@ -1997,254 +4453,95 @@ pub struct ExecutableEmitter;
 impl ExecutableEmitter {
     /// Emit a complete MH_EXECUTE Mach-O file.
     ///
-    /// - `text_sections`: concatenated, relocated __TEXT section data.
-    /// - `data_sections`: concatenated, relocated __DATA section data.
+    /// - `text_data`: concatenated, relocated __TEXT section data.
+    /// - `data_data`: concatenated, relocated __DATA section data.
     /// - `text_vmaddr`: virtual address of the __TEXT segment.
     /// - `data_vmaddr`: virtual address of the __DATA segment.
     /// - `entry_offset`: offset of _main within the __TEXT segment (from text_vmaddr).
+    ///
+    /// The data carries no dyld fixups, so it must not contain image pointers.
     pub fn emit(
         text_data: &[u8],
         data_data: &[u8],
         text_vmaddr: u64,
         data_vmaddr: u64,
         entry_offset: u64,
-    ) -> Vec<u8> {
-        // Compute sizes.
-        let text_size = text_data.len() as u64;
-        let data_size = data_data.len() as u64;
-        let text_size_aligned = align_to(text_size, PAGE_SIZE);
-        let data_size_aligned = if data_size > 0 {
-            align_to(data_size, PAGE_SIZE)
-        } else {
-            0
-        };
-
-        let has_data = !data_data.is_empty();
-        let segment_count = if has_data { 4 } else { 3 };
-        // __PAGEZERO + __TEXT [+ __DATA] + __LINKEDIT + LC_BUILD_VERSION +
-        // LC_UUID + LC_MAIN + LC_DYLD_CHAINED_FIXUPS + LC_DYLD_EXPORTS_TRIE +
-        // LC_CODE_SIGNATURE + LC_SYMTAB + LC_DYSYMTAB + LC_LOAD_DYLINKER.
-        let ncmds: u32 = if has_data { 13 } else { 12 };
-
-        let total_lc_size =
-            executable_load_command_size(has_data, 1, if has_data { 1 } else { 0 }, &[]);
-
-        // __TEXT is file-backed from offset 0 so the Mach-O header and load
-        // commands are mapped. The __text section stays page-aligned inside it.
-        let text_file_offset = executable_text_file_offset_from_lc_size(total_lc_size);
-        let text_segment_filesize = text_file_offset + text_size_aligned;
-        let text_segment_vmsize = align_to(text_segment_filesize, PAGE_SIZE);
-        let text_section_vmaddr = text_vmaddr + text_file_offset;
-        let data_file_offset = text_segment_filesize;
-        let linkedit_file_offset = if has_data {
-            data_file_offset + data_size_aligned
-        } else {
-            text_segment_filesize
-        };
-        let linkedit_vmaddr = if has_data {
-            data_vmaddr + data_size_aligned
-        } else {
-            text_vmaddr + text_segment_vmsize
-        };
-        let linkedit_payload =
-            build_linkedit_payload(linkedit_file_offset, segment_count, None, &[], &[]);
-        let linkedit_filesize =
-            linkedit_payload.data.len() as u64 + linkedit_payload.code_signature_size as u64;
-        let linkedit_vmsize = align_to(linkedit_filesize, PAGE_SIZE);
-
-        let total_file_size = linkedit_file_offset + linkedit_filesize;
-
-        let mut buf = Vec::with_capacity(total_file_size as usize);
-
-        // --- Header ---
-        buf.extend_from_slice(&MH_MAGIC_64.to_le_bytes()); // magic
-        buf.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes()); // cputype
-        buf.extend_from_slice(&CPU_SUBTYPE_ARM64_ALL.to_le_bytes()); // cpusubtype
-        buf.extend_from_slice(&MH_EXECUTE.to_le_bytes()); // filetype
-        buf.extend_from_slice(&ncmds.to_le_bytes()); // ncmds
-        buf.extend_from_slice(&total_lc_size.to_le_bytes()); // sizeofcmds
-        buf.extend_from_slice(&(MH_EXECUTE_FLAGS).to_le_bytes()); // flags
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
-
-        // --- __PAGEZERO segment ---
-        Self::write_segment(
-            &mut buf,
-            b"__PAGEZERO",
-            0,                 // vmaddr
-            DEFAULT_BASE_ADDR, // vmsize = 4GB
-            0,                 // fileoff
-            0,                 // filesize
-            0,                 // maxprot
-            0,                 // initprot
-            0,                 // nsects
-            0,                 // flags
-        );
-
-        // --- __TEXT segment ---
-        Self::write_segment(
-            &mut buf,
-            b"__TEXT",
-            text_vmaddr,
-            text_segment_vmsize,
-            0,
-            text_segment_filesize,
-            VM_PROT_READ | VM_PROT_EXECUTE,
-            VM_PROT_READ | VM_PROT_EXECUTE,
-            1, // 1 section
-            0,
-        );
-
-        // __text section header
-        Self::write_section_header(
-            &mut buf,
-            b"__text",
-            b"__TEXT",
-            text_section_vmaddr,
-            text_size,
-            text_file_offset as u32,
-            2, // align = 2^2 = 4
-            0, // reloff
-            0, // nreloc
-            S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
-        );
-
-        // --- __DATA segment (if needed) ---
-        if has_data {
-            let data_seg_vmsize = data_size_aligned;
-            Self::write_segment(
-                &mut buf,
-                b"__DATA",
-                data_vmaddr,
-                data_seg_vmsize,
-                data_file_offset,
-                data_size_aligned,
-                VM_PROT_READ | VM_PROT_WRITE,
-                VM_PROT_READ | VM_PROT_WRITE,
-                1,
-                0,
-            );
-
-            // __data section header
-            Self::write_section_header(
-                &mut buf,
-                b"__data",
-                b"__DATA",
-                data_vmaddr,
-                data_size,
-                data_file_offset as u32,
-                3, // align = 2^3 = 8
-                0,
-                0,
-                S_REGULAR,
-            );
-        }
-
-        // --- __LINKEDIT segment ---
-        Self::write_segment(
-            &mut buf,
-            b"__LINKEDIT",
-            linkedit_vmaddr,
-            linkedit_vmsize,
-            linkedit_file_offset,
-            linkedit_filesize,
-            VM_PROT_READ,
-            VM_PROT_READ,
-            0,
-            0,
-        );
-
-        // --- LC_BUILD_VERSION ---
-        write_lc_build_version(&mut buf);
-
-        // --- LC_UUID ---
-        let uuid = deterministic_executable_uuid(
+    ) -> Result<Vec<u8>, LinkerError> {
+        Self::emit_with_virtual_data(
             text_data,
             data_data,
             text_vmaddr,
             data_vmaddr,
             entry_offset,
-            0,
+            data_data.len() as u64,
+        )
+    }
+
+    /// The layout may reserve a zero-fill tail larger than the file payload.
+    fn emit_with_virtual_data(
+        text_data: &[u8],
+        data_data: &[u8],
+        text_vmaddr: u64,
+        data_vmaddr: u64,
+        entry_offset: u64,
+        data_virtual_size: u64,
+    ) -> Result<Vec<u8>, LinkerError> {
+        let has_data = data_virtual_size > 0;
+        if !has_data && !data_data.is_empty() {
+            return Err(LinkerError::MalformedInput {
+                file: "executable layout".into(),
+                detail: "file-backed data needs a virtual data extent".into(),
+            });
+        }
+        let shape = ImageShape {
+            data: has_data,
+            ..ImageShape::default()
+        };
+        let text_file_offset = executable_text_file_offset_from_lc_size(image_load_command_size(
+            ImageKind::Executable,
+            &shape,
             &[],
-            &[],
-        );
-        write_lc_uuid(&mut buf, uuid);
-
-        // --- LC_MAIN ---
-        buf.extend_from_slice(&LC_MAIN.to_le_bytes()); // cmd
-        buf.extend_from_slice(&LC_MAIN_SIZE.to_le_bytes()); // cmdsize
-        buf.extend_from_slice(&entry_offset.to_le_bytes()); // entryoff
-        buf.extend_from_slice(&0u64.to_le_bytes()); // stacksize (0 = default)
-
-        // --- LC_DYLD_CHAINED_FIXUPS / LC_DYLD_EXPORTS_TRIE ---
-        write_lc_linkedit_data(
-            &mut buf,
-            LC_DYLD_CHAINED_FIXUPS,
-            linkedit_payload.fixups_offset,
-            linkedit_payload.fixups_size,
-        );
-        write_lc_linkedit_data(
-            &mut buf,
-            LC_DYLD_EXPORTS_TRIE,
-            linkedit_payload.exports_offset,
-            linkedit_payload.exports_size,
-        );
-        write_lc_linkedit_data(
-            &mut buf,
-            LC_CODE_SIGNATURE,
-            linkedit_payload.code_signature_offset,
-            linkedit_payload.code_signature_size,
-        );
-
-        // --- LC_SYMTAB (empty, for format compliance) ---
-        buf.extend_from_slice(&LC_SYMTAB.to_le_bytes());
-        buf.extend_from_slice(&SYMTAB_COMMAND_SIZE.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // symoff
-        buf.extend_from_slice(&0u32.to_le_bytes()); // nsyms
-        buf.extend_from_slice(&0u32.to_le_bytes()); // stroff
-        buf.extend_from_slice(&0u32.to_le_bytes()); // strsize
-
-        // --- LC_DYSYMTAB (empty, matching the empty LC_SYMTAB) ---
-        write_empty_lc_dysymtab(&mut buf);
-
-        // --- LC_LOAD_DYLINKER (tells macOS kernel to use /usr/lib/dyld) ---
-        write_lc_load_dylinker(&mut buf);
-
-        // --- Pad to text_file_offset ---
-        while (buf.len() as u64) < text_file_offset {
-            buf.push(0);
-        }
-
-        // --- Write text data ---
-        buf.extend_from_slice(text_data);
-        while (buf.len() as u64) < text_file_offset + text_size_aligned {
-            buf.push(0);
-        }
-
-        // --- Write data data ---
-        if has_data {
-            buf.extend_from_slice(data_data);
-            while (buf.len() as u64) < linkedit_file_offset {
-                buf.push(0);
-            }
-        }
-
-        // --- Write __LINKEDIT payloads ---
-        while (buf.len() as u64) < linkedit_file_offset {
-            buf.push(0);
-        }
-        buf.extend_from_slice(&linkedit_payload.data);
-        debug_assert_eq!(buf.len() as u64, linkedit_payload.code_signature_offset);
-        let code_signature = build_ad_hoc_code_signature(&buf, 0, text_segment_filesize);
-        debug_assert_eq!(
-            code_signature.len() as u32,
-            linkedit_payload.code_signature_size
-        );
-        buf.extend_from_slice(&code_signature);
-        while (buf.len() as u64) < total_file_size {
-            buf.push(0);
-        }
-
-        buf
+        )?);
+        let text_addr = layout_add(text_vmaddr, text_file_offset, "text content address")?;
+        let segments = if has_data {
+            vec![OutputSegment {
+                name: b"__DATA",
+                vmaddr: data_vmaddr,
+                bytes: data_data.to_vec(),
+                virtual_size: data_virtual_size,
+                flags: 0,
+                sections: vec![OutputSection {
+                    sectname: b"__data",
+                    addr: data_vmaddr,
+                    size: data_data.len() as u64,
+                    align: 3,
+                    flags: S_REGULAR,
+                }],
+                fixups: Vec::new(),
+            }]
+        } else {
+            Vec::new()
+        };
+        emit_image(ImagePlan {
+            kind: ImageKind::Executable,
+            text_vmaddr,
+            text: text_data.to_vec(),
+            text_sections: vec![OutputSection {
+                sectname: b"__text",
+                addr: text_addr,
+                size: text_data.len() as u64,
+                align: 2,
+                flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+            }],
+            entry_offset: Some(entry_offset),
+            stubs_offset: 0,
+            segments,
+            dylibs: &[],
+            imports: &[],
+            import_ordinals: &[],
+            exports_trie: EMPTY_EXPORTS_TRIE.to_vec(),
+            header_flags: 0,
+        })
     }
 
     /// Write a segment_command_64 to the buffer.
@@ -2299,7 +4596,13 @@ impl ExecutableEmitter {
         buf.extend_from_slice(&nreloc.to_le_bytes());
         buf.extend_from_slice(&flags.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // reserved1
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        // S_SYMBOL_STUBS uses reserved2 for the instruction-stub byte size.
+        let reserved2 = if flags & SECTION_TYPE_MASK == S_SYMBOL_STUBS {
+            STUB_SIZE
+        } else {
+            0
+        };
+        buf.extend_from_slice(&reserved2.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // reserved3
     }
 }
@@ -2310,67 +4613,70 @@ impl ExecutableEmitter {
 
 /// Perform basic dead code stripping by removing unreferenced sections.
 ///
-/// This is a conservative implementation: a section is kept if it contains a
-/// symbol that is transitively referenced from the entry point. Sections in
-/// __DATA segments are always kept (conservative: data may be referenced by
-/// address without a relocation). Symbols with N_NO_DEAD_STRIP are also kept.
+/// This is conservative: retain the entry point, all relocation targets (even
+/// from otherwise dead sections), non-__TEXT sections, and N_NO_DEAD_STRIP
+/// definitions. Both symbol-index and local section-ordinal relocations are
+/// remapped alongside the surviving symbols. ADDEND payloads are not indices.
 ///
 /// Returns a filtered set of objects with unreferenced __TEXT sections removed.
-pub fn dead_strip_sections(objects: &[ParsedObject], entry_symbol: &str) -> Vec<ParsedObject> {
-    // Phase 1: Collect all initially referenced symbols.
-    let mut referenced_symbols: HashSet<String> = HashSet::new();
-    referenced_symbols.insert(entry_symbol.to_string());
-
-    // Walk all sections and collect extern relocation targets from ALL sections
-    // (initial seed: everything that is referenced from anywhere, then we prune).
-    for obj in objects {
+/// Invalid symbol/section references return an error rather than becoming a
+/// different valid reference after filtering.
+pub fn dead_strip_sections(
+    objects: &[ParsedObject],
+    entry_symbol: &str,
+) -> Result<Vec<ParsedObject>, LinkerError> {
+    // Seed from every relocation, so no iterative name closure is necessary.
+    // Local section references remain object-scoped; names conservatively
+    // retain all matching definitions across objects.
+    let mut referenced_symbols: HashSet<SymbolName> = HashSet::new();
+    referenced_symbols.insert(entry_symbol.into());
+    let mut referenced_sections = Vec::with_capacity(objects.len());
+    for (object_index, obj) in objects.iter().enumerate() {
+        if obj.sections.len() > usize::from(u8::MAX)
+            || obj.symbols.iter().any(|sym| {
+                usize::from(sym.section) > obj.sections.len()
+                    || (sym.is_defined() && sym.section == 0)
+            })
+        {
+            return Err(LinkerError::MalformedInput {
+                file: format!("object {object_index}"),
+                detail: "dead stripping requires representable, valid symbol section ordinals"
+                    .into(),
+            });
+        }
+        let mut section_targets = HashSet::new();
         for sec in &obj.sections {
             for reloc in &sec.relocations {
+                if reloc.kind == AArch64RelocKind::Addend {
+                    continue;
+                }
                 if reloc.is_extern {
-                    let sym_idx = reloc.symbol_index as usize;
-                    if sym_idx < obj.symbols.len() {
-                        referenced_symbols.insert(obj.symbols[sym_idx].name.clone());
+                    let sym = obj.symbols.get(reloc.symbol_index as usize).ok_or_else(|| {
+                        LinkerError::MalformedRelocation(format!(
+                            "object {object_index}: symbol index {} out of range during dead stripping",
+                            reloc.symbol_index
+                        ))
+                    })?;
+                    referenced_symbols.insert(sym.name.clone());
+                } else {
+                    let ordinal = reloc.symbol_index as usize;
+                    if ordinal == 0 || ordinal > obj.sections.len() {
+                        return Err(LinkerError::MalformedRelocation(format!(
+                            "object {object_index}: section ordinal {ordinal} out of range during dead stripping"
+                        )));
                     }
+                    section_targets.insert(ordinal - 1);
                 }
             }
         }
+        referenced_sections.push(section_targets);
     }
 
-    // Phase 2: Iteratively compute transitive closure of referenced symbols.
-    // A section is live if it defines a referenced symbol. If live, all symbols
-    // referenced by its relocations are also referenced.
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for obj in objects {
-            for (sec_idx, sec) in obj.sections.iter().enumerate() {
-                let sec_ordinal = (sec_idx + 1) as u8;
-                let section_referenced = obj.symbols.iter().any(|sym| {
-                    sym.section == sec_ordinal && referenced_symbols.contains(&sym.name)
-                });
-
-                if section_referenced {
-                    for reloc in &sec.relocations {
-                        if reloc.is_extern {
-                            let sym_idx = reloc.symbol_index as usize;
-                            if sym_idx < obj.symbols.len() {
-                                let name = &obj.symbols[sym_idx].name;
-                                if !referenced_symbols.contains(name) {
-                                    referenced_symbols.insert(name.clone());
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Phase 3: Filter out unreferenced __TEXT sections.
+    // Filter sections and symbols, retaining both old-to-new index maps.
     objects
         .iter()
-        .map(|obj| {
+        .zip(&referenced_sections)
+        .map(|(obj, section_targets)| {
             // While filtering, build an old 1-based ordinal -> new 1-based
             // ordinal map. Kept sections are renumbered sequentially; stripped
             // sections map to None. This keeps each surviving symbol's `section`
@@ -2395,7 +4701,11 @@ pub fn dead_strip_sections(objects: &[ParsedObject], entry_symbol: &str) -> Vec<
                 // referenced by address).
                 let is_data = sec.segment != "__TEXT";
 
-                if has_referenced_sym || has_no_dead_strip || is_data {
+                if has_referenced_sym
+                    || has_no_dead_strip
+                    || is_data
+                    || section_targets.contains(&sec_idx)
+                {
                     sections.push(sec.clone());
                     ordinal_map.push(Some(sections.len() as u8));
                 } else {
@@ -2406,38 +4716,60 @@ pub fn dead_strip_sections(objects: &[ParsedObject], entry_symbol: &str) -> Vec<
             // Remap each kept symbol's section ordinal to its new index. Drop a
             // symbol whose defining section was stripped (it can no longer be
             // located); undefined symbols (section == 0) pass through unchanged.
-            let symbols: Vec<ParsedSymbol> = obj
-                .symbols
-                .iter()
-                .filter_map(|sym| {
-                    if sym.section == 0 {
-                        // Undefined symbol: no section ordinal to remap.
-                        return Some(sym.clone());
-                    }
-                    match ordinal_map
-                        .get((sym.section - 1) as usize)
-                        .copied()
-                        .flatten()
-                    {
-                        Some(new_ordinal) => {
-                            let mut s = sym.clone();
-                            s.section = new_ordinal;
-                            Some(s)
-                        }
-                        // Defining section was stripped: drop the symbol so no
-                        // surviving symbol carries a stale ordinal.
-                        None => None,
-                    }
-                })
-                .collect();
+            let mut symbols = Vec::new();
+            let mut symbol_map = Vec::with_capacity(obj.symbols.len());
+            for sym in &obj.symbols {
+                let new_ordinal = if sym.section == 0 {
+                    Some(0)
+                } else {
+                    ordinal_map[usize::from(sym.section) - 1]
+                };
+                if let Some(section) = new_ordinal {
+                    let index = u32::try_from(symbols.len())
+                        .map_err(|_| LinkerError::LayoutOverflow("stripped symbol index"))?;
+                    symbol_map.push(Some(index));
+                    let mut symbol = sym.clone();
+                    symbol.section = section;
+                    symbols.push(symbol);
+                } else {
+                    symbol_map.push(None);
+                }
+            }
 
-            ParsedObject {
+            for section in &mut sections {
+                for reloc in &mut section.relocations {
+                    if reloc.kind == AArch64RelocKind::Addend {
+                        continue;
+                    }
+                    let remapped = if reloc.is_extern {
+                        symbol_map
+                            .get(reloc.symbol_index as usize)
+                            .copied()
+                            .flatten()
+                    } else {
+                        reloc
+                            .symbol_index
+                            .checked_sub(1)
+                            .and_then(|index| ordinal_map.get(index as usize))
+                            .copied()
+                            .flatten()
+                            .map(u32::from)
+                    };
+                    reloc.symbol_index = remapped.ok_or_else(|| {
+                        LinkerError::MalformedRelocation(
+                            "live relocation target was removed during dead stripping".into(),
+                        )
+                    })?;
+                }
+            }
+
+            Ok(ParsedObject {
                 cputype: obj.cputype,
                 cpusubtype: obj.cpusubtype,
                 flags: obj.flags,
                 sections,
                 symbols,
-            }
+            })
         })
         .collect()
 }
@@ -2446,79 +4778,765 @@ pub fn dead_strip_sections(objects: &[ParsedObject], entry_symbol: &str) -> Vec<
 // High-level link API
 // ---------------------------------------------------------------------------
 
+fn append_at(output: &mut Vec<u8>, offset: u64, bytes: &[u8]) -> Result<(), LinkerError> {
+    let end = layout_add(offset, bytes.len() as u64, "file-backed section end")?;
+    // Mach-O section and linkedit payload offsets are u32 fields. Diagnose an
+    // unrepresentable image before a large alignment gap causes allocation.
+    u32::try_from(end).map_err(|_| LinkerError::LayoutOverflow("file offset domain"))?;
+    let offset =
+        usize::try_from(offset).map_err(|_| LinkerError::LayoutOverflow("host file offset"))?;
+    let end = usize::try_from(end).map_err(|_| LinkerError::LayoutOverflow("host image length"))?;
+    let extra = end
+        .checked_sub(output.len())
+        .filter(|_| offset >= output.len())
+        .ok_or(LinkerError::LayoutOverflow("overlapping section placement"))?;
+    output
+        .try_reserve(extra)
+        .map_err(LinkerError::ImageAllocation)?;
+    output.resize(offset, 0);
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
 /// Link multiple parsed object files into an executable.
+///
+/// No dylib is loaded, so every strong undefined symbol is an error. GOT
+/// slots for image definitions are rebased; thread-local variables need
+/// `__tlv_bootstrap` from libSystem and therefore [`link_with_dylibs`].
 ///
 /// Returns the raw bytes of a Mach-O MH_EXECUTE file.
 pub fn link(objects: &[ParsedObject]) -> Result<Vec<u8>, LinkerError> {
-    // 1. Lay out sections.
-    let text_file_offset =
-        plain_executable_text_file_offset(has_file_backed_data_sections(objects));
-    let layout = lay_out_sections(objects, DEFAULT_BASE_ADDR + text_file_offset);
+    link_image(objects, &DylibConfig::new(), ImageKind::Executable).map(|placed| placed.image)
+}
 
-    // 2. Resolve symbols.
-    let mut resolver = SymbolResolver::new();
-    for (obj_idx, obj) in objects.iter().enumerate() {
-        resolver.add_object(obj_idx, obj, &layout.section_addrs[obj_idx])?;
+/// Link multiple parsed object files into an `MH_DYLIB` identified by
+/// `install_name` (its `LC_ID_DYLIB`).
+///
+/// Relocations, imports, GOT/TLV slots and chained fixups follow
+/// [`link_with_dylibs`]; the image is based at 0 and has no entry point.
+/// Every external, non-private definition is exported through the exports
+/// trie (TLV descriptors as thread-local exports), and references inside the
+/// dylib bind directly to its own definitions (two-level namespace, no
+/// interposition). Weak exports, which need dyld weak-definition coalescing,
+/// are refused.
+pub fn link_dylib(
+    objects: &[ParsedObject],
+    dylib_config: &DylibConfig,
+    install_name: &str,
+) -> Result<Vec<u8>, LinkerError> {
+    link_dylib_placed(objects, dylib_config, install_name).map(|placed| placed.image)
+}
+
+// ---------------------------------------------------------------------------
+// Exports trie
+// ---------------------------------------------------------------------------
+
+/// One exported symbol: its name, `EXPORT_SYMBOL_FLAGS_*` and image offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportEntry {
+    name: String,
+    flags: u64,
+    offset: u64,
+}
+
+fn push_uleb128(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte);
+            return;
+        }
+        buf.push(byte | 0x80);
     }
-    let symbol_addrs = resolver.resolve()?;
+}
 
-    // 3. Build concatenated section data and apply relocations.
-    let mut text_data = Vec::new();
-    let mut data_data = Vec::new();
+fn uleb128_len(value: u64) -> u64 {
+    let mut len = 1;
+    let mut rest = value >> 7;
+    while rest != 0 {
+        len += 1;
+        rest >>= 7;
+    }
+    len
+}
 
-    for (obj_idx, obj) in objects.iter().enumerate() {
-        let local_symbol_addrs = resolver.object_symbol_addrs(obj_idx);
-        for (sec_idx, sec) in obj.sections.iter().enumerate() {
-            let sec_addr = layout.section_addrs[obj_idx][sec_idx];
-            let mut sec_data = sec.data.clone();
+#[derive(Debug, Default)]
+struct TrieNode {
+    terminal: Option<(u64, u64)>,
+    edges: Vec<(Vec<u8>, usize)>,
+    offset: u64,
+}
 
-            // Apply relocations.
-            if !sec.relocations.is_empty() {
-                RelocationApplicator::apply_with_local_symbols(
-                    &mut sec_data,
-                    sec_addr,
-                    &sec.relocations,
-                    &obj.symbols,
-                    &symbol_addrs,
-                    &local_symbol_addrs,
-                    &layout.section_addrs[obj_idx],
-                )?;
-            }
-
-            if sec.segment == "__TEXT" {
-                // Pad to alignment.
-                let alignment = 1usize << sec.align;
-                let misalign = text_data.len() % alignment;
-                if misalign != 0 {
-                    text_data.resize(text_data.len() + alignment - misalign, 0);
-                }
-                text_data.extend_from_slice(&sec_data);
-            } else {
-                let alignment = 1usize << sec.align;
-                let misalign = data_data.len() % alignment;
-                if misalign != 0 {
-                    data_data.resize(data_data.len() + alignment - misalign, 0);
-                }
-                data_data.extend_from_slice(&sec_data);
+impl TrieNode {
+    fn terminal_bytes(&self) -> u64 {
+        match self.terminal {
+            None => 1,
+            Some((flags, offset)) => {
+                let info = uleb128_len(flags) + uleb128_len(offset);
+                uleb128_len(info) + info
             }
         }
     }
+}
 
-    // 4. Find _main entry point.
-    let entry_addr = symbol_addrs.get("_main").ok_or(LinkerError::NoEntryPoint)?;
-    let entry_offset = entry_addr - DEFAULT_BASE_ADDR;
+/// Insert `entries` (sorted, unique suffixes) below `node` as a radix tree:
+/// an empty suffix makes the node terminal; the rest share one edge per
+/// first byte, labeled with the group's longest common prefix.
+fn build_trie_node(nodes: &mut Vec<TrieNode>, node: usize, entries: &[(&[u8], (u64, u64))]) {
+    let mut rest = entries;
+    if let Some((suffix, info)) = rest.first()
+        && suffix.is_empty()
+    {
+        nodes[node].terminal = Some(*info);
+        rest = &rest[1..];
+    }
+    let mut start = 0;
+    while start < rest.len() {
+        let first = rest[start].0[0];
+        let end = start
+            + rest[start..]
+                .iter()
+                .take_while(|(suffix, _)| suffix[0] == first)
+                .count();
+        let group = &rest[start..end];
+        let prefix = group[1..]
+            .iter()
+            .fold(group[0].0.len(), |prefix, (suffix, _)| {
+                prefix.min(
+                    group[0]
+                        .0
+                        .iter()
+                        .zip(suffix.iter())
+                        .take_while(|(left, right)| left == right)
+                        .count(),
+                )
+            });
+        let child = nodes.len();
+        nodes.push(TrieNode::default());
+        nodes[node]
+            .edges
+            .push((group[0].0[..prefix].to_vec(), child));
+        let suffixes: Vec<_> = group
+            .iter()
+            .map(|(suffix, info)| (&suffix[prefix..], *info))
+            .collect();
+        build_trie_node(nodes, child, &suffixes);
+        start = end;
+    }
+}
 
-    // 5. Emit executable.
-    let text_size_aligned = align_to(text_data.len() as u64, PAGE_SIZE);
-    let data_vmaddr = DEFAULT_BASE_ADDR + text_file_offset + text_size_aligned;
+/// Serialize the dyld exports trie for `exports` (unique names). Node offsets
+/// are ULEB128-encoded in their parents, so they are iterated to a fixed
+/// point in preorder before the bytes are written.
+fn build_exports_trie(exports: &[ExportEntry]) -> Result<Vec<u8>, LinkerError> {
+    let mut sorted: Vec<&ExportEntry> = exports.iter().collect();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    if sorted.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(LinkerError::MalformedInput {
+            file: "exports trie".into(),
+            detail: "duplicate exported symbol".into(),
+        });
+    }
+    let entries: Vec<(&[u8], (u64, u64))> = sorted
+        .iter()
+        .map(|entry| (entry.name.as_bytes(), (entry.flags, entry.offset)))
+        .collect();
+    let mut nodes = vec![TrieNode::default()];
+    build_trie_node(&mut nodes, 0, &entries);
+    if nodes
+        .iter()
+        .any(|node| node.edges.len() > usize::from(u8::MAX))
+    {
+        return Err(LinkerError::LayoutOverflow("exports trie child count"));
+    }
+    let mut order = Vec::with_capacity(nodes.len());
+    let mut stack = vec![0usize];
+    while let Some(node) = stack.pop() {
+        order.push(node);
+        stack.extend(nodes[node].edges.iter().rev().map(|(_, child)| *child));
+    }
+    loop {
+        let mut offset = 0u64;
+        let mut changed = false;
+        for &node in &order {
+            if nodes[node].offset != offset {
+                nodes[node].offset = offset;
+                changed = true;
+            }
+            let edges: u64 = nodes[node]
+                .edges
+                .iter()
+                .map(|(label, child)| label.len() as u64 + 1 + uleb128_len(nodes[*child].offset))
+                .sum();
+            offset = layout_add(
+                offset,
+                nodes[node].terminal_bytes() + 1 + edges,
+                "exports trie",
+            )?;
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut trie = Vec::new();
+    for &node in &order {
+        debug_assert_eq!(trie.len() as u64, nodes[node].offset);
+        match nodes[node].terminal {
+            None => trie.push(0),
+            Some((flags, offset)) => {
+                push_uleb128(&mut trie, uleb128_len(flags) + uleb128_len(offset));
+                push_uleb128(&mut trie, flags);
+                push_uleb128(&mut trie, offset);
+            }
+        }
+        trie.push(nodes[node].edges.len() as u8);
+        for (label, child) in &nodes[node].edges {
+            trie.extend_from_slice(label);
+            trie.push(0);
+            push_uleb128(&mut trie, nodes[*child].offset);
+        }
+    }
+    Ok(trie)
+}
 
-    Ok(ExecutableEmitter::emit(
-        &text_data,
-        &data_data,
-        DEFAULT_BASE_ADDR,
-        data_vmaddr,
+/// The default-visibility (non-private) weak definitions a dylib exports,
+/// sorted by name: every reference to one binds through dyld's weak lookup.
+fn coalescable_weak_definitions(
+    objects: &[ParsedObject],
+    resolver: &SymbolResolver,
+) -> Vec<String> {
+    let mut names: Vec<String> = resolver
+        .defined
+        .iter()
+        .filter(|(name, definition)| {
+            definition.is_weak
+                && !objects[definition.object_index]
+                    .symbols
+                    .iter()
+                    .any(|symbol| {
+                        &symbol.name == *name
+                            && symbol.is_defined()
+                            && symbol.is_external()
+                            && symbol.n_type & N_PEXT != 0
+                    })
+        })
+        .map(|(name, _)| name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The external, non-private definitions a dylib exports, as image offsets.
+fn collect_dylib_exports(
+    objects: &[ParsedObject],
+    classes: &[Vec<SectionClass>],
+    resolver: &SymbolResolver,
+    base: u64,
+) -> Result<Vec<ExportEntry>, LinkerError> {
+    let mut names: Vec<&SymbolName> = resolver.defined.keys().collect();
+    names.sort();
+    let mut exports = Vec::new();
+    for name in names {
+        let definition = &resolver.defined[name];
+        let private = objects[definition.object_index]
+            .symbols
+            .iter()
+            .find(|symbol| &symbol.name == name && symbol.is_defined() && symbol.is_external())
+            .is_some_and(|symbol| symbol.n_type & N_PEXT != 0);
+        if private {
+            continue;
+        }
+        let refuse = |detail| LinkerError::UnsupportedDylibExport {
+            symbol: name.to_string(),
+            detail,
+        };
+        let flags = match classes[definition.object_index][definition.section_index] {
+            SectionClass::Debug => {
+                return Err(refuse("it is defined in an unloaded debug section"));
+            }
+            SectionClass::ThreadData | SectionClass::ThreadBss => {
+                return Err(refuse(
+                    "a thread-local template is not a variable; export its TLV descriptor",
+                ));
+            }
+            SectionClass::ThreadVars if definition.is_weak => {
+                return Err(refuse(
+                    "a weak thread-local descriptor needs weak TLV coalescing, which this linker does not emit",
+                ));
+            }
+            SectionClass::ThreadVars => EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL,
+            _ if definition.is_weak => {
+                EXPORT_SYMBOL_FLAGS_KIND_REGULAR | EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+            }
+            _ => EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+        };
+        exports.push(ExportEntry {
+            name: name.to_string(),
+            flags,
+            offset: definition.address - base,
+        });
+    }
+    Ok(exports)
+}
+
+/// Refuse, before relocated bytes are allocated, any pointer slot whose page
+/// index cannot be expressed in the 16-bit chained-fixup page fields.
+fn check_fixup_pages(
+    objects: &[ParsedObject],
+    classes: &[Vec<SectionClass>],
+    layout: &ImageLayout,
+    shape: &ImageShape,
+) -> Result<(), LinkerError> {
+    let overflow = || LinkerError::LayoutOverflow("compact chained-fixup import/page fields");
+    let page_limit = u64::from(u16::MAX);
+    if shape.has_const() && (layout.const_end - layout.const_vmaddr) / PAGE_SIZE >= page_limit {
+        return Err(overflow());
+    }
+    for ((object, classes), addresses) in objects.iter().zip(classes).zip(&layout.section_addrs) {
+        for ((section, class), &address) in object.sections.iter().zip(classes).zip(addresses) {
+            let segment_vmaddr = match class {
+                SectionClass::Data | SectionClass::ThreadVars | SectionClass::ThreadData => {
+                    layout.data_vmaddr
+                }
+                SectionClass::ConstData => layout.const_vmaddr,
+                _ => continue,
+            };
+            for op in relocation_ops(&section.relocations)? {
+                if let RelocOp::Single { reloc, .. } = op
+                    && reloc.kind == AArch64RelocKind::Unsigned
+                {
+                    let slot = layout_add(address, u64::from(reloc.offset), "relocation site")?;
+                    if (slot - segment_vmaddr) / PAGE_SIZE >= page_limit {
+                        return Err(overflow());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The shared image linker behind [`link`], [`link_with_dylibs`] and
+/// [`link_dylib`].
+fn link_image(
+    objects: &[ParsedObject],
+    config: &DylibConfig,
+    kind: ImageKind<'_>,
+) -> Result<PlacedImage, LinkerError> {
+    let classes = classify_objects(objects)?;
+    let base = kind.base();
+
+    // 1. Name-level prepass at provisional addresses: symbol identities,
+    // imports, stubs and GOT/TLV slots. Their counts fix the load commands,
+    // and therefore the mapped text base, before any final address exists.
+    let provisional_shape = ImageShape::new(objects, &classes, 0, 0, 0);
+    let provisional = plan_layout(objects, &classes, &provisional_shape, base)?;
+    let mut prepass = SymbolResolver::new();
+    for (index, object) in objects.iter().enumerate() {
+        prepass.add_object(index, object, &provisional.section_addrs[index])?;
+    }
+    let mut imports = ImportTable::collect(&prepass, config)?;
+    // Only a dylib exports its weak definitions for dyld to coalesce; an
+    // executable resolves its own weak definitions statically. The set is
+    // name-level, so the prepass resolver fixes it before any address.
+    let coalesced = match kind {
+        ImageKind::Dylib { .. } => coalescable_weak_definitions(objects, &prepass),
+        ImageKind::Executable => Vec::new(),
+    };
+    imports.add_coalesced(&coalesced)?;
+    let slots = plan_slots(&ImageSymbols::new(
+        objects,
+        &classes,
+        &provisional.section_addrs,
+        &prepass,
+        &imports,
+    ))?;
+    let shape = ImageShape::new(
+        objects,
+        &classes,
+        slots.stubs.len(),
+        slots.got.len(),
+        slots.tlv_pointers.len(),
+    );
+    let dylib_cmd_sizes: Vec<u32> = imports
+        .dylibs
+        .iter()
+        .map(|dylib| dylib_command_size(dylib))
+        .collect();
+    let text_file_offset = executable_text_file_offset_from_lc_size(image_load_command_size(
+        kind,
+        &shape,
+        &dylib_cmd_sizes,
+    )?);
+    let text_vmaddr = layout_add(base, text_file_offset, "text content address")?;
+
+    // 2. Final layout and symbol resolution.
+    let layout = plan_layout(objects, &classes, &shape, text_vmaddr)?;
+    let mut resolver = SymbolResolver::new();
+    for (index, object) in objects.iter().enumerate() {
+        resolver.add_object(index, object, &layout.section_addrs[index])?;
+    }
+    let (entry_offset, exports_trie) = match kind {
+        ImageKind::Executable => {
+            let entry_addr = resolver
+                .defined
+                .get("_main")
+                .map(|symbol| symbol.address)
+                .ok_or(LinkerError::NoEntryPoint)?;
+            let entry_offset = entry_addr
+                .checked_sub(base)
+                .ok_or(LinkerError::NoEntryPoint)?;
+            (Some(entry_offset), EMPTY_EXPORTS_TRIE.to_vec())
+        }
+        ImageKind::Dylib { .. } => (
+            None,
+            build_exports_trie(&collect_dylib_exports(objects, &classes, &resolver, base)?)?,
+        ),
+    };
+    check_fixup_pages(objects, &classes, &layout, &shape)?;
+    let symbols = ImageSymbols::new(
+        objects,
+        &classes,
+        &layout.section_addrs,
+        &resolver,
+        &imports,
+    );
+    let slot_addresses = |base: u64, keys: &[SlotKey]| -> HashMap<SlotKey, u64> {
+        keys.iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), base + index as u64 * 8))
+            .collect()
+    };
+    let relocator = ImageRelocator {
+        symbols: &symbols,
+        layout: &layout,
+        got: slot_addresses(layout.got_addr, &slots.got),
+        tlv_pointers: slot_addresses(layout.tlv_pointers_addr, &slots.tlv_pointers),
+        stubs: slots
+            .stubs
+            .iter()
+            .enumerate()
+            .map(|(index, &import)| {
+                (
+                    import,
+                    layout.stubs_addr + index as u64 * u64::from(STUB_SIZE),
+                )
+            })
+            .collect(),
+    };
+
+    // 3. Relocate every loaded section at its planned address.
+    let mut text = Vec::new();
+    let mut data_pieces = Vec::new();
+    let mut data_fixups = Vec::new();
+    let mut const_pieces = Vec::new();
+    let mut const_data_fixups = Vec::new();
+    for (object_index, object) in objects.iter().enumerate() {
+        for (section_index, section) in object.sections.iter().enumerate() {
+            let class = classes[object_index][section_index];
+            if matches!(
+                class,
+                SectionClass::Debug | SectionClass::ThreadBss | SectionClass::ZeroFill
+            ) {
+                continue;
+            }
+            let address = layout.section_addrs[object_index][section_index];
+            let mut bytes = section.data.clone();
+            let fixups = if class == SectionClass::ConstData {
+                &mut const_data_fixups
+            } else {
+                &mut data_fixups
+            };
+            relocator.apply_section(object_index, section_index, &mut bytes, address, fixups)?;
+            match class {
+                SectionClass::Text => {
+                    append_at(&mut text, address - layout.text_vmaddr, &bytes)?;
+                }
+                SectionClass::ConstData => const_pieces.push((address, bytes)),
+                _ => data_pieces.push((address, bytes)),
+            }
+        }
+    }
+    // Data classes are placed class by class, not in input order; copy them
+    // in address order so the append-only image builder sees rising offsets.
+    data_pieces.sort_by_key(|(address, _)| *address);
+    let mut data = Vec::new();
+    for (address, bytes) in &data_pieces {
+        append_at(&mut data, address - layout.data_vmaddr, bytes)?;
+    }
+    drop(data_pieces);
+    // Stubs load their own GOT slot: stubbed imports occupy the first slots.
+    if !slots.stubs.is_empty() {
+        let stubs = generate_stubs(slots.stubs.len(), layout.stubs_addr, layout.got_addr)?;
+        append_at(&mut text, layout.stubs_addr - layout.text_vmaddr, &stubs)?;
+    }
+    append_at(&mut text, layout.text_end - layout.text_vmaddr, &[])?;
+    if shape.data {
+        append_at(&mut data, layout.data_file_end - layout.data_vmaddr, &[])?;
+    } else if !data.is_empty() || !data_fixups.is_empty() {
+        return Err(LinkerError::MalformedInput {
+            file: "executable layout".into(),
+            detail: "data bytes were produced for an image planned without __DATA".into(),
+        });
+    }
+
+    // 4. GOT and TLV pointer slots: binds for imports, rebases for image
+    // definitions, zero for exclusively weak references.
+    let const_size = usize::try_from(layout.const_end - layout.const_vmaddr)
+        .map_err(|_| LinkerError::LayoutOverflow("GOT extent"))?;
+    let mut const_bytes = Vec::new();
+    const_bytes
+        .try_reserve_exact(const_size)
+        .map_err(LinkerError::ImageAllocation)?;
+    const_bytes.resize(const_size, 0);
+    for (address, bytes) in &const_pieces {
+        let start = usize::try_from(address - layout.const_vmaddr)
+            .map_err(|_| LinkerError::LayoutOverflow("read-only-after-fixup data offset"))?;
+        const_bytes
+            .get_mut(start..start + bytes.len())
+            .ok_or(LinkerError::LayoutOverflow(
+                "read-only-after-fixup data extent",
+            ))?
+            .copy_from_slice(bytes);
+    }
+    drop(const_pieces);
+    let mut const_fixups = const_data_fixups;
+    for (index, key) in slots.got.iter().enumerate() {
+        let address = layout.got_addr + index as u64 * 8;
+        match symbols.resolve_key(key)? {
+            RelocTarget::Defined { class, .. } if class.is_thread_local() => {
+                return Err(LinkerError::ThreadLocal(format!(
+                    "GOT slot {key:?} names a thread-local variable"
+                )));
+            }
+            RelocTarget::Coalesced { class, .. } if class.is_thread_local() => {
+                return Err(LinkerError::ThreadLocal(format!(
+                    "GOT slot {key:?} names a thread-local variable"
+                )));
+            }
+            RelocTarget::Defined {
+                address: target, ..
+            } => const_fixups.push(PointerFixup {
+                address,
+                kind: PointerFixupKind::Rebase { target },
+            }),
+            RelocTarget::Import(import) | RelocTarget::Coalesced { import, .. } => const_fixups
+                .push(PointerFixup {
+                    address,
+                    kind: PointerFixupKind::Bind { import, addend: 0 },
+                }),
+            RelocTarget::Null => {}
+        }
+    }
+    for (index, key) in slots.tlv_pointers.iter().enumerate() {
+        let address = layout.tlv_pointers_addr + index as u64 * 8;
+        let kind = match symbols.resolve_key(key)? {
+            RelocTarget::Defined {
+                address: target,
+                class: SectionClass::ThreadVars,
+            } => PointerFixupKind::Rebase { target },
+            RelocTarget::Import(import) => PointerFixupKind::Bind { import, addend: 0 },
+            _ => {
+                return Err(LinkerError::ThreadLocal(format!(
+                    "TLV pointer slot {key:?} does not name a TLV descriptor"
+                )));
+            }
+        };
+        const_fixups.push(PointerFixup { address, kind });
+    }
+
+    // 5. Assemble segments and emit.
+    let mut text_sections = vec![OutputSection {
+        sectname: b"__text",
+        addr: layout.text_vmaddr,
+        size: if slots.stubs.is_empty() {
+            layout.text_end
+        } else {
+            layout.stubs_addr
+        } - layout.text_vmaddr,
+        align: 2,
+        flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+    }];
+    if !slots.stubs.is_empty() {
+        text_sections.push(OutputSection {
+            sectname: b"__stubs",
+            addr: layout.stubs_addr,
+            size: layout.text_end - layout.stubs_addr,
+            align: 2,
+            flags: S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
+        });
+    }
+    let alignment_exponent = |alignment: u64| alignment.trailing_zeros();
+    let mut segments = Vec::new();
+    if shape.has_const() {
+        let mut sections = Vec::new();
+        if shape.got > 0 {
+            sections.push(OutputSection {
+                sectname: b"__got",
+                addr: layout.got_addr,
+                size: layout.tlv_pointers_addr - layout.got_addr,
+                align: 3,
+                flags: S_NON_LAZY_SYMBOL_POINTERS,
+            });
+        }
+        if shape.tlv_pointers > 0 {
+            sections.push(OutputSection {
+                sectname: b"__thread_ptrs",
+                addr: layout.tlv_pointers_addr,
+                size: layout.tlv_pointers_end - layout.tlv_pointers_addr,
+                align: 3,
+                flags: S_THREAD_LOCAL_VARIABLE_POINTERS,
+            });
+        }
+        if shape.const_data {
+            sections.push(OutputSection {
+                sectname: b"__const",
+                addr: layout.const_data.0,
+                size: layout.const_data.1 - layout.const_data.0,
+                align: 3,
+                flags: S_REGULAR,
+            });
+        }
+        segments.push(OutputSegment {
+            name: b"__DATA_CONST",
+            vmaddr: layout.const_vmaddr,
+            virtual_size: layout.const_end - layout.const_vmaddr,
+            bytes: const_bytes,
+            flags: SG_READ_ONLY,
+            sections,
+            fixups: const_fixups,
+        });
+    }
+    if shape.data {
+        let mut sections = vec![OutputSection {
+            sectname: b"__data",
+            addr: layout.data_vmaddr,
+            size: layout.regular_end - layout.data_vmaddr,
+            align: 3,
+            flags: S_REGULAR,
+        }];
+        let ranges = [
+            (
+                shape.thread_vars,
+                b"__thread_vars" as &'static [u8],
+                layout.thread_vars,
+                3,
+                S_THREAD_LOCAL_VARIABLES,
+            ),
+            (
+                shape.thread_data,
+                b"__thread_data",
+                layout.thread_data,
+                alignment_exponent(layout.tls_alignment),
+                S_THREAD_LOCAL_REGULAR,
+            ),
+            (
+                shape.thread_bss,
+                b"__thread_bss",
+                layout.thread_bss,
+                alignment_exponent(layout.tls_alignment),
+                S_THREAD_LOCAL_ZEROFILL,
+            ),
+        ];
+        for (present, sectname, (start, end), align, flags) in ranges {
+            if present {
+                sections.push(OutputSection {
+                    sectname,
+                    addr: start,
+                    size: end - start,
+                    align,
+                    flags,
+                });
+            }
+        }
+        segments.push(OutputSegment {
+            name: b"__DATA",
+            vmaddr: layout.data_vmaddr,
+            virtual_size: layout.data_end - layout.data_vmaddr,
+            bytes: data,
+            flags: 0,
+            sections,
+            fixups: data_fixups,
+        });
+    }
+    let section_addresses = layout
+        .section_addrs
+        .iter()
+        .zip(&classes)
+        .map(|(addresses, classes)| {
+            addresses
+                .iter()
+                .zip(classes)
+                .map(|(&address, &class)| (class != SectionClass::Debug).then_some(address))
+                .collect()
+        })
+        .collect();
+    let image = emit_image(ImagePlan {
+        kind,
+        text_vmaddr: base,
+        text,
+        text_sections,
         entry_offset,
-    ))
+        stubs_offset: layout.stubs_addr - layout.text_vmaddr,
+        segments,
+        dylibs: &imports.dylibs,
+        imports: &imports.names,
+        import_ordinals: &imports.ordinals,
+        exports_trie,
+        header_flags: (if shape.thread_vars {
+            MH_HAS_TLV_DESCRIPTORS
+        } else {
+            0
+        }) | (if coalesced.is_empty() {
+            0
+        } else {
+            MH_WEAK_DEFINES | MH_BINDS_TO_WEAK
+        }),
+    })?;
+    Ok(PlacedImage {
+        image,
+        section_addresses,
+    })
+}
+
+/// A standalone link's image and where it placed every input section.
+///
+/// The placement is what [`super::linked_image::AtomPlacement::SectionAddresses`]
+/// takes: the image carries no symbol table, so the linked-image replay
+/// needs the linker's section addresses, which it checks against the
+/// image's content, exports and entry point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedImage {
+    /// The Mach-O image bytes ([`link_with_dylibs`] and [`link_dylib`]
+    /// return exactly these).
+    pub image: Vec<u8>,
+    /// Per object and section, in input order: the section's image address,
+    /// or `None` for a section this linker does not load (`S_ATTR_DEBUG`).
+    pub section_addresses: Vec<Vec<Option<u64>>>,
+}
+
+/// [`link_with_dylibs`], also returning where each input section was placed.
+pub fn link_with_dylibs_placed(
+    objects: &[ParsedObject],
+    dylib_config: &DylibConfig,
+) -> Result<PlacedImage, LinkerError> {
+    link_image(objects, dylib_config, ImageKind::Executable)
+}
+
+/// [`link_dylib`], also returning where each input section was placed.
+pub fn link_dylib_placed(
+    objects: &[ParsedObject],
+    dylib_config: &DylibConfig,
+    install_name: &str,
+) -> Result<PlacedImage, LinkerError> {
+    if install_name.is_empty() || install_name.as_bytes().contains(&0) {
+        return Err(LinkerError::MalformedInput {
+            file: "dylib install name".into(),
+            detail: "an install name must be nonempty and contain no NUL".into(),
+        });
+    }
+    link_image(objects, dylib_config, ImageKind::Dylib { install_name })
 }
 
 // ---------------------------------------------------------------------------
@@ -2576,6 +5594,8 @@ impl DylibConfig {
             "___stack_chk_fail",
             "___stack_chk_guard",
             "_atexit",
+            // dyld's TLV bootstrap thunk, bound by every `__thread_vars` descriptor.
+            TLV_BOOTSTRAP_SYMBOL,
         ] {
             symbols.insert(sym.to_string());
         }
@@ -2620,7 +5640,9 @@ impl Default for DylibConfig {
 }
 
 /// Resolve all undefined symbols, allowing dylib symbols to remain unresolved
-/// in the object graph (they will be resolved via stubs at runtime).
+/// in the object graph. This name-level helper assigns every dylib symbol a
+/// provisional stub address; the image linker uses only its import list and
+/// allocates stubs for branch targets alone.
 impl SymbolResolver {
     /// Resolve symbols with dylib support. Symbols in the dylib config
     /// are assigned addresses in the stub region rather than requiring
@@ -2635,28 +5657,30 @@ impl SymbolResolver {
 
         // Copy all defined symbols.
         for (name, sym) in &self.defined {
-            result.insert(name.clone(), sym.address);
+            result.insert(name.to_string(), sym.address);
         }
 
         // Process undefined symbols.
         let mut stub_offset = 0u64;
         for (_obj_idx, _sym_idx, name) in &self.undefined {
+            let name = name.as_str();
             if result.contains_key(name) {
                 continue;
             }
             if dylib_config.is_dylib_symbol(name) {
                 // Assign a stub address for this dylib symbol.
-                let stub_addr = stub_base_addr + stub_offset;
-                result.insert(name.clone(), stub_addr);
-                if !dylib_symbols.contains(name) {
-                    dylib_symbols.push(name.clone());
-                    stub_offset += STUB_SIZE as u64;
+                let stub_addr = layout_add(stub_base_addr, stub_offset, "import stub address")?;
+                result.insert(name.to_owned(), stub_addr);
+                if !dylib_symbols.iter().any(|symbol| symbol == name) {
+                    dylib_symbols.push(name.to_owned());
+                    stub_offset =
+                        layout_add(stub_offset, u64::from(STUB_SIZE), "import stub offset")?;
                 }
-            } else if self.weak_refs.contains(name) {
-                // Weak references resolve to 0 if not in any dylib.
-                result.insert(name.clone(), 0);
+            } else if !self.strong_refs.contains(name) {
+                // Only exclusively weak references may remain unresolved.
+                result.insert(name.to_owned(), 0);
             } else {
-                return Err(LinkerError::UndefinedSymbol(name.clone()));
+                return Err(LinkerError::UndefinedSymbol(name.to_owned()));
             }
         }
 
@@ -2666,162 +5690,19 @@ impl SymbolResolver {
 
 /// Link multiple parsed object files into an executable with dylib support.
 ///
-/// This is the dylib-aware version of `link()`. It handles:
-/// - Multi-file linking (any number of .o files)
-/// - External dylib symbol resolution via stubs
-/// - LC_LOAD_DYLIB emission for required dylibs
-/// - GOT entries for indirect symbol access
+/// Every undefined symbol a configured dylib provides becomes a chained-fixups
+/// import. Branches to an import go through `__stubs`; `GOT_LOAD`,
+/// `POINTER_TO_GOT` and `TLVP_LOAD` relocations load `__DATA_CONST` slots that
+/// dyld binds (imports) or rebases (image definitions); 64-bit data pointers
+/// are bound or rebased in place. PC-relative or difference relocations that
+/// name an import are refused.
 ///
 /// Returns the raw bytes of a Mach-O MH_EXECUTE file.
 pub fn link_with_dylibs(
     objects: &[ParsedObject],
     dylib_config: &DylibConfig,
 ) -> Result<Vec<u8>, LinkerError> {
-    // 1. Do a name-only dylib resolution prepass to compute the final load
-    // command size. The mapped __TEXT code base depends on that size.
-    let prepass_layout = lay_out_sections(objects, DEFAULT_BASE_ADDR);
-    let mut prepass_resolver = SymbolResolver::new();
-    for (obj_idx, obj) in objects.iter().enumerate() {
-        prepass_resolver.add_object(obj_idx, obj, &prepass_layout.section_addrs[obj_idx])?;
-    }
-    let (_prepass_symbol_addrs, prepass_dylib_symbols) =
-        prepass_resolver.resolve_with_dylibs(dylib_config, DEFAULT_BASE_ADDR)?;
-    let prepass_has_stubs = !prepass_dylib_symbols.is_empty();
-    let prepass_needed_dylib_indices = dylib_config.needed_dylibs(&prepass_dylib_symbols);
-    let prepass_needed_dylibs: Vec<&DylibEntry> = prepass_needed_dylib_indices
-        .iter()
-        .map(|&i| &dylib_config.dylibs[i])
-        .collect();
-    let text_file_offset = dylib_executable_text_file_offset(
-        has_file_backed_data_sections(objects) || prepass_has_stubs,
-        prepass_has_stubs,
-        &prepass_needed_dylibs,
-    );
-
-    // 2. Lay out sections at their mapped __TEXT addresses.
-    let layout = lay_out_sections(objects, DEFAULT_BASE_ADDR + text_file_offset);
-
-    // 3. Resolve symbols with final mapped addresses.
-    let mut resolver = SymbolResolver::new();
-    for (obj_idx, obj) in objects.iter().enumerate() {
-        resolver.add_object(obj_idx, obj, &layout.section_addrs[obj_idx])?;
-    }
-
-    // Compute text data size to figure out where stubs go.
-    let mut text_size_estimate: u64 = 0;
-    for obj in objects {
-        for sec in &obj.sections {
-            if sec.segment == "__TEXT" {
-                let alignment = 1u64 << sec.align;
-                let misalign = text_size_estimate % alignment;
-                if misalign != 0 {
-                    text_size_estimate += alignment - misalign;
-                }
-                text_size_estimate += sec.data.len() as u64;
-            }
-        }
-    }
-
-    // Stubs go at the end of the __TEXT segment content, 4-byte aligned.
-    let stubs_offset_in_text = align_to(text_size_estimate, 4);
-    let stub_base_addr = DEFAULT_BASE_ADDR + text_file_offset + stubs_offset_in_text;
-
-    // Resolve with dylib support.
-    let (symbol_addrs, dylib_symbols) =
-        resolver.resolve_with_dylibs(dylib_config, stub_base_addr)?;
-    debug_assert_eq!(prepass_dylib_symbols, dylib_symbols);
-
-    let has_dylib_symbols = !dylib_symbols.is_empty();
-
-    // 4. Build concatenated section data and apply relocations.
-    let mut text_data = Vec::new();
-    let mut data_data = Vec::new();
-
-    for (obj_idx, obj) in objects.iter().enumerate() {
-        let local_symbol_addrs = resolver.object_symbol_addrs(obj_idx);
-        for (sec_idx, sec) in obj.sections.iter().enumerate() {
-            let sec_addr = layout.section_addrs[obj_idx][sec_idx];
-            let mut sec_data = sec.data.clone();
-
-            if !sec.relocations.is_empty() {
-                RelocationApplicator::apply_with_local_symbols(
-                    &mut sec_data,
-                    sec_addr,
-                    &sec.relocations,
-                    &obj.symbols,
-                    &symbol_addrs,
-                    &local_symbol_addrs,
-                    &layout.section_addrs[obj_idx],
-                )?;
-            }
-
-            if sec.segment == "__TEXT" {
-                let alignment = 1usize << sec.align;
-                let misalign = text_data.len() % alignment;
-                if misalign != 0 {
-                    text_data.resize(text_data.len() + alignment - misalign, 0);
-                }
-                text_data.extend_from_slice(&sec_data);
-            } else {
-                let alignment = 1usize << sec.align;
-                let misalign = data_data.len() % alignment;
-                if misalign != 0 {
-                    data_data.resize(data_data.len() + alignment - misalign, 0);
-                }
-                data_data.extend_from_slice(&sec_data);
-            }
-        }
-    }
-
-    // 5. Generate stub code for dylib symbols.
-    // Each stub is: ADRP Xip0, _got_slot@PAGE; LDR Xip0, [Xip0, _got_slot@PAGEOFF]; BR Xip0
-    // We use placeholder stubs that the dynamic linker patches via the GOT.
-    let stubs_data = generate_stubs(&dylib_symbols, stub_base_addr, &layout, &text_data);
-
-    // Pad text_data to stub alignment, then append stubs.
-    let stubs_padding = stubs_offset_in_text as usize - text_data.len();
-    text_data.resize(text_data.len() + stubs_padding, 0);
-    text_data.extend_from_slice(&stubs_data);
-
-    // 6. Generate GOT entries (8 bytes each, in __DATA segment).
-    // Each GOT entry will hold the runtime address of a dylib symbol.
-    let got_data: Vec<u8> = vec![0u8; dylib_symbols.len() * 8];
-
-    // Append GOT to data section.
-    if has_dylib_symbols {
-        let alignment = 8usize;
-        let misalign = data_data.len() % alignment;
-        if misalign != 0 {
-            data_data.resize(data_data.len() + alignment - misalign, 0);
-        }
-        data_data.extend_from_slice(&got_data);
-    }
-
-    // 7. Find _main entry point.
-    let entry_addr = symbol_addrs.get("_main").ok_or(LinkerError::NoEntryPoint)?;
-    let entry_offset = entry_addr - DEFAULT_BASE_ADDR;
-
-    // 8. Emit executable with dylib support.
-    let text_size_aligned = align_to(text_data.len() as u64, PAGE_SIZE);
-    let data_vmaddr = DEFAULT_BASE_ADDR + text_file_offset + text_size_aligned;
-
-    // Determine which dylibs are needed.
-    let needed_dylib_indices = dylib_config.needed_dylibs(&dylib_symbols);
-    let needed_dylibs: Vec<&DylibEntry> = needed_dylib_indices
-        .iter()
-        .map(|&i| &dylib_config.dylibs[i])
-        .collect();
-
-    Ok(emit_executable_with_dylibs(
-        &text_data,
-        &data_data,
-        DEFAULT_BASE_ADDR,
-        data_vmaddr,
-        entry_offset,
-        &needed_dylibs,
-        &dylib_symbols,
-        stubs_offset_in_text,
-    ))
+    link_image(objects, dylib_config, ImageKind::Executable).map(|placed| placed.image)
 }
 
 /// Generate stub instructions for dylib symbols.
@@ -2834,20 +5715,33 @@ pub fn link_with_dylibs(
 ///   BR    X16
 /// ```
 fn generate_stubs(
-    _dylib_symbols: &[String],
-    _stub_base_addr: u64,
-    _layout: &LayoutResult,
-    _text_data: &[u8],
-) -> Vec<u8> {
-    let num_stubs = _dylib_symbols.len();
-    let mut stubs = Vec::with_capacity(num_stubs * STUB_SIZE as usize);
-
-    for _i in 0..num_stubs {
-        // Generate: ADRP X16, #0; LDR X16, [X16]; BR X16
-        // These are placeholder encodings. The GOT address will be patched
-        // by the dynamic linker at load time.
-        let adrp_x16 = 0x9000_0010u32; // ADRP X16, #0
-        let ldr_x16 = 0xF940_0210u32; // LDR X16, [X16, #0]
+    num_stubs: usize,
+    stub_base_addr: u64,
+    got_base_addr: u64,
+) -> Result<Vec<u8>, LinkerError> {
+    let length = num_stubs
+        .checked_mul(STUB_SIZE as usize)
+        .ok_or(LinkerError::LayoutOverflow("stub bytes"))?;
+    let mut stubs = Vec::new();
+    stubs
+        .try_reserve(length)
+        .map_err(LinkerError::ImageAllocation)?;
+    for index in 0..num_stubs {
+        let pc = layout_add(
+            stub_base_addr,
+            index as u64 * u64::from(STUB_SIZE),
+            "stub PC",
+        )?;
+        let got = layout_add(got_base_addr, index as u64 * 8, "GOT entry")?;
+        let page_delta = (i128::from(got & !0xfff) - i128::from(pc & !0xfff)) >> 12;
+        if !(-(1i128 << 20)..(1i128 << 20)).contains(&page_delta) || got % 8 != 0 {
+            return Err(LinkerError::RelocationOverflow {
+                detail: "stub cannot address its aligned GOT entry".to_string(),
+            });
+        }
+        let immediate = (page_delta as u32) & 0x1f_ffff;
+        let adrp_x16 = 0x9000_0010u32 | ((immediate & 3) << 29) | ((immediate >> 2) << 5);
+        let ldr_x16 = 0xF940_0210u32 | (((got & 0xfff) as u32 / 8) << 10);
         let br_x16 = 0xD61F_0200u32; // BR X16
 
         stubs.extend_from_slice(&adrp_x16.to_le_bytes());
@@ -2855,367 +5749,18 @@ fn generate_stubs(
         stubs.extend_from_slice(&br_x16.to_le_bytes());
     }
 
-    stubs
-}
-
-/// Emit a Mach-O executable with LC_LOAD_DYLIB commands.
-#[allow(clippy::too_many_arguments)]
-fn emit_executable_with_dylibs(
-    text_data: &[u8],
-    data_data: &[u8],
-    text_vmaddr: u64,
-    data_vmaddr: u64,
-    entry_offset: u64,
-    needed_dylibs: &[&DylibEntry],
-    dylib_symbols: &[String],
-    stubs_offset: u64,
-) -> Vec<u8> {
-    let text_size = text_data.len() as u64;
-    let mut data_bytes = data_data.to_vec();
-    let data_size = data_bytes.len() as u64;
-    let text_size_aligned = align_to(text_size, PAGE_SIZE);
-    let data_size_aligned = if data_size > 0 {
-        align_to(data_size, PAGE_SIZE)
-    } else {
-        0
-    };
-
-    let has_data = !data_data.is_empty();
-    let has_stubs = !dylib_symbols.is_empty();
-
-    let num_dylib_cmds = needed_dylibs.len() as u32;
-    let segment_count = if has_data { 4 } else { 3 };
-    // __PAGEZERO + __TEXT + [__DATA] + __LINKEDIT + LC_BUILD_VERSION +
-    // LC_UUID + LC_MAIN + LC_DYLD_CHAINED_FIXUPS + LC_DYLD_EXPORTS_TRIE +
-    // LC_CODE_SIGNATURE + LC_SYMTAB + LC_DYSYMTAB + LC_LOAD_DYLINKER +
-    // N * LC_LOAD_DYLIB.
-    let base_cmds: u32 = if has_data { 13 } else { 12 };
-    let ncmds = base_cmds + num_dylib_cmds;
-
-    let got_size = (dylib_symbols.len() as u64) * 8;
-    let got_offset_in_data = has_stubs.then_some(data_size - got_size);
-    let import_ordinals: Vec<u32> = dylib_symbols
-        .iter()
-        .map(|symbol| dylib_ordinal_for_symbol(needed_dylibs, symbol))
-        .collect();
-    let got_page_starts = got_offset_in_data
-        .map(|offset| encode_got_chained_binds(&mut data_bytes, offset, dylib_symbols.len()));
-    let fixup_segment = got_page_starts.map(|page_starts| ChainedFixupSegmentInfo {
-        segment_index: 2,
-        segment_offset: data_vmaddr - text_vmaddr,
-        page_starts,
-    });
-
-    // Compute load command sizes.
-    // __TEXT segment: __text section + optional __stubs section
-    let text_nsects: u32 = if has_stubs { 2 } else { 1 };
-    let data_nsects: u32 = if has_stubs { 2 } else { 1 };
-
-    // Compute each LC_LOAD_DYLIB size (must be 8-byte aligned).
-    let dylib_cmd_sizes: Vec<u32> = needed_dylibs
-        .iter()
-        .map(|dylib| dylib_command_size(dylib))
-        .collect();
-    let total_lc_size =
-        executable_load_command_size(has_data, text_nsects, data_nsects, &dylib_cmd_sizes);
-
-    let text_file_offset = executable_text_file_offset_from_lc_size(total_lc_size);
-    let text_segment_filesize = text_file_offset + text_size_aligned;
-    let text_segment_vmsize = align_to(text_segment_filesize, PAGE_SIZE);
-    let text_section_vmaddr = text_vmaddr + text_file_offset;
-    let data_file_offset = text_segment_filesize;
-    let linkedit_file_offset = if has_data {
-        data_file_offset + data_size_aligned
-    } else {
-        text_segment_filesize
-    };
-    let linkedit_vmaddr = if has_data {
-        data_vmaddr + data_size_aligned
-    } else {
-        text_vmaddr + text_segment_vmsize
-    };
-    let linkedit_payload = build_linkedit_payload(
-        linkedit_file_offset,
-        segment_count,
-        fixup_segment.as_ref(),
-        dylib_symbols,
-        &import_ordinals,
-    );
-    let linkedit_filesize =
-        linkedit_payload.data.len() as u64 + linkedit_payload.code_signature_size as u64;
-    let linkedit_vmsize = align_to(linkedit_filesize, PAGE_SIZE);
-
-    let total_file_size = linkedit_file_offset + linkedit_filesize;
-
-    let mut buf = Vec::with_capacity(total_file_size as usize);
-
-    // --- Header ---
-    buf.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
-    buf.extend_from_slice(&CPU_TYPE_ARM64.to_le_bytes());
-    buf.extend_from_slice(&CPU_SUBTYPE_ARM64_ALL.to_le_bytes());
-    buf.extend_from_slice(&MH_EXECUTE.to_le_bytes());
-    buf.extend_from_slice(&ncmds.to_le_bytes());
-    buf.extend_from_slice(&total_lc_size.to_le_bytes());
-    buf.extend_from_slice(&MH_EXECUTE_FLAGS.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
-
-    // --- __PAGEZERO segment ---
-    ExecutableEmitter::write_segment(
-        &mut buf,
-        b"__PAGEZERO",
-        0,
-        DEFAULT_BASE_ADDR,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-
-    // --- __TEXT segment ---
-    ExecutableEmitter::write_segment(
-        &mut buf,
-        b"__TEXT",
-        text_vmaddr,
-        text_segment_vmsize,
-        0,
-        text_segment_filesize,
-        VM_PROT_READ | VM_PROT_EXECUTE,
-        VM_PROT_READ | VM_PROT_EXECUTE,
-        text_nsects,
-        0,
-    );
-
-    // __text section header
-    let text_section_size = if has_stubs { stubs_offset } else { text_size };
-    ExecutableEmitter::write_section_header(
-        &mut buf,
-        b"__text",
-        b"__TEXT",
-        text_section_vmaddr,
-        text_section_size,
-        text_file_offset as u32,
-        2,
-        0,
-        0,
-        S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
-    );
-
-    // __stubs section header (if dylib symbols present)
-    if has_stubs {
-        let stubs_vmaddr = text_section_vmaddr + stubs_offset;
-        let stubs_size = (dylib_symbols.len() as u64) * (STUB_SIZE as u64);
-        let stubs_file_offset = text_file_offset + stubs_offset;
-
-        ExecutableEmitter::write_section_header(
-            &mut buf,
-            b"__stubs",
-            b"__TEXT",
-            stubs_vmaddr,
-            stubs_size,
-            stubs_file_offset as u32,
-            2, // 4-byte aligned
-            0,
-            0,
-            S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
-        );
-    }
-
-    // --- __DATA segment (if needed) ---
-    if has_data {
-        let data_seg_vmsize = data_size_aligned;
-        let data_nsects: u32 = if has_stubs { 2 } else { 1 };
-        ExecutableEmitter::write_segment(
-            &mut buf,
-            b"__DATA",
-            data_vmaddr,
-            data_seg_vmsize,
-            data_file_offset,
-            data_size_aligned,
-            VM_PROT_READ | VM_PROT_WRITE,
-            VM_PROT_READ | VM_PROT_WRITE,
-            data_nsects,
-            0,
-        );
-
-        // __data section header
-        let user_data_size = if has_stubs {
-            data_size - (dylib_symbols.len() as u64 * 8)
-        } else {
-            data_size
-        };
-        ExecutableEmitter::write_section_header(
-            &mut buf,
-            b"__data",
-            b"__DATA",
-            data_vmaddr,
-            user_data_size,
-            data_file_offset as u32,
-            3,
-            0,
-            0,
-            S_REGULAR,
-        );
-
-        // __got section header (if dylib symbols present)
-        if has_stubs {
-            let got_size = (dylib_symbols.len() as u64) * 8;
-            let got_offset_in_data = data_size - got_size;
-            let got_vmaddr = data_vmaddr + got_offset_in_data;
-            let got_file_offset = data_file_offset + got_offset_in_data;
-
-            ExecutableEmitter::write_section_header(
-                &mut buf,
-                b"__got",
-                b"__DATA",
-                got_vmaddr,
-                got_size,
-                got_file_offset as u32,
-                3, // 8-byte aligned
-                0,
-                0,
-                S_NON_LAZY_SYMBOL_POINTERS,
-            );
-        }
-    }
-
-    // --- __LINKEDIT segment ---
-    ExecutableEmitter::write_segment(
-        &mut buf,
-        b"__LINKEDIT",
-        linkedit_vmaddr,
-        linkedit_vmsize,
-        linkedit_file_offset,
-        linkedit_filesize,
-        VM_PROT_READ,
-        VM_PROT_READ,
-        0,
-        0,
-    );
-
-    // --- LC_BUILD_VERSION ---
-    write_lc_build_version(&mut buf);
-
-    // --- LC_UUID ---
-    let uuid = deterministic_executable_uuid(
-        text_data,
-        &data_bytes,
-        text_vmaddr,
-        data_vmaddr,
-        entry_offset,
-        stubs_offset,
-        needed_dylibs,
-        dylib_symbols,
-    );
-    write_lc_uuid(&mut buf, uuid);
-
-    // --- LC_MAIN ---
-    buf.extend_from_slice(&LC_MAIN.to_le_bytes());
-    buf.extend_from_slice(&LC_MAIN_SIZE.to_le_bytes());
-    buf.extend_from_slice(&entry_offset.to_le_bytes());
-    buf.extend_from_slice(&0u64.to_le_bytes()); // stacksize
-
-    // --- LC_DYLD_CHAINED_FIXUPS / LC_DYLD_EXPORTS_TRIE ---
-    write_lc_linkedit_data(
-        &mut buf,
-        LC_DYLD_CHAINED_FIXUPS,
-        linkedit_payload.fixups_offset,
-        linkedit_payload.fixups_size,
-    );
-    write_lc_linkedit_data(
-        &mut buf,
-        LC_DYLD_EXPORTS_TRIE,
-        linkedit_payload.exports_offset,
-        linkedit_payload.exports_size,
-    );
-    write_lc_linkedit_data(
-        &mut buf,
-        LC_CODE_SIGNATURE,
-        linkedit_payload.code_signature_offset,
-        linkedit_payload.code_signature_size,
-    );
-
-    // --- LC_SYMTAB (empty) ---
-    buf.extend_from_slice(&LC_SYMTAB.to_le_bytes());
-    buf.extend_from_slice(&SYMTAB_COMMAND_SIZE.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // symoff
-    buf.extend_from_slice(&0u32.to_le_bytes()); // nsyms
-    buf.extend_from_slice(&0u32.to_le_bytes()); // stroff
-    buf.extend_from_slice(&0u32.to_le_bytes()); // strsize
-
-    // --- LC_DYSYMTAB (empty, matching the empty LC_SYMTAB) ---
-    write_empty_lc_dysymtab(&mut buf);
-
-    // --- LC_LOAD_DYLINKER (tells macOS kernel to use /usr/lib/dyld) ---
-    write_lc_load_dylinker(&mut buf);
-
-    // --- LC_LOAD_DYLIB commands ---
-    for (idx, dylib) in needed_dylibs.iter().enumerate() {
-        let cmd_size = dylib_cmd_sizes[idx];
-
-        buf.extend_from_slice(&LC_LOAD_DYLIB.to_le_bytes()); // cmd
-        buf.extend_from_slice(&cmd_size.to_le_bytes()); // cmdsize
-        // name offset: starts after the fixed dylib_command fields.
-        buf.extend_from_slice(&LC_LOAD_DYLIB_HEADER_SIZE.to_le_bytes()); // name.offset
-        buf.extend_from_slice(&2u32.to_le_bytes()); // timestamp (conventional: 2)
-        // current_version: encode as 1.0.0 = 0x00010000
-        buf.extend_from_slice(&0x0001_0000u32.to_le_bytes());
-        // compatibility_version: 1.0.0
-        buf.extend_from_slice(&0x0001_0000u32.to_le_bytes());
-
-        // Name string (NUL-terminated, padded to alignment).
-        let name_bytes = dylib.install_name.as_bytes();
-        buf.extend_from_slice(name_bytes);
-        buf.push(0); // NUL terminator
-
-        // Pad to cmd_size.
-        let written = LC_LOAD_DYLIB_HEADER_SIZE as usize + name_bytes.len() + 1;
-        let padding = cmd_size as usize - written;
-        buf.extend(std::iter::repeat_n(0, padding));
-    }
-
-    // --- Pad to text_file_offset ---
-    while (buf.len() as u64) < text_file_offset {
-        buf.push(0);
-    }
-
-    // --- Write text data ---
-    buf.extend_from_slice(text_data);
-    while (buf.len() as u64) < text_file_offset + text_size_aligned {
-        buf.push(0);
-    }
-
-    // --- Write data ---
-    if has_data {
-        buf.extend_from_slice(&data_bytes);
-        while (buf.len() as u64) < linkedit_file_offset {
-            buf.push(0);
-        }
-    }
-
-    // --- Write __LINKEDIT payloads ---
-    while (buf.len() as u64) < linkedit_file_offset {
-        buf.push(0);
-    }
-    buf.extend_from_slice(&linkedit_payload.data);
-    debug_assert_eq!(buf.len() as u64, linkedit_payload.code_signature_offset);
-    let code_signature = build_ad_hoc_code_signature(&buf, 0, text_segment_filesize);
-    debug_assert_eq!(
-        code_signature.len() as u32,
-        linkedit_payload.code_signature_size
-    );
-    buf.extend_from_slice(&code_signature);
-    while (buf.len() as u64) < total_file_size {
-        buf.push(0);
-    }
-
-    buf
+    Ok(stubs)
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// The integration tests' executable runner, whose deadline excludes the time
+// macOS holds a freshly linked executable before its first instruction.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[path = "../../tests/common/rosetta.rs"]
+mod native_process;
 
 #[cfg(test)]
 mod tests {
@@ -3469,13 +6014,97 @@ mod tests {
         );
     }
 
+    /// One pointer slot decoded from the chained fixups, independently of the
+    /// encoder: `(unslid address, meaning)`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum DecodedFixup {
+        Rebase(u64),
+        Bind { symbol: String, addend: u8 },
+    }
+
+    /// Walk every DYLD_CHAINED_PTR_64 chain following `<mach-o/fixup-chains.h>`:
+    /// starts-in-image, per-segment page starts, 4-byte-stride `next` deltas,
+    /// 36-bit rebase vmaddrs and 24-bit import ordinals.
+    fn decode_chained_fixups(exe: &[u8]) -> Vec<(u64, DecodedFixup)> {
+        let commands = walk_load_commands(exe);
+        let segments = segment_commands(exe, &commands);
+        let image_base = single_segment(&segments, "__TEXT").vmaddr;
+        let payload =
+            linkedit_data_command(exe, single_load_command(&commands, LC_DYLD_CHAINED_FIXUPS));
+        let start = payload.dataoff as usize;
+        let starts = start + rd_u32(exe, start + 4) as usize;
+        let imports_offset = start + rd_u32(exe, start + 8) as usize;
+        let symbols_offset = start + rd_u32(exe, start + 12) as usize;
+        let imports_count = rd_u32(exe, start + 16) as usize;
+        assert_eq!(rd_u32(exe, starts) as usize, segments.len());
+        let mut decoded = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let info = rd_u32(exe, starts + 4 + index * 4) as usize;
+            if info == 0 {
+                continue;
+            }
+            let seg = starts + info;
+            assert_eq!(
+                u16::from_le_bytes([exe[seg + 4], exe[seg + 5]]),
+                PAGE_SIZE as u16
+            );
+            assert_eq!(
+                u16::from_le_bytes([exe[seg + 6], exe[seg + 7]]),
+                DYLD_CHAINED_PTR_64
+            );
+            assert_eq!(rd_u64(exe, seg + 8), segment.vmaddr - image_base);
+            assert_eq!(rd_u32(exe, seg + 16), 0, "max_valid_pointer");
+            let page_count = u16::from_le_bytes([exe[seg + 20], exe[seg + 21]]) as u64;
+            assert!(page_count * PAGE_SIZE <= segment.vmsize);
+            let mut chains = 0;
+            for page in 0..page_count {
+                let entry = seg + 22 + page as usize * 2;
+                let page_start = u16::from_le_bytes([exe[entry], exe[entry + 1]]);
+                if page_start == DYLD_CHAINED_PTR_START_NONE {
+                    continue;
+                }
+                chains += 1;
+                let mut offset = page * PAGE_SIZE + u64::from(page_start);
+                loop {
+                    assert!(offset + 8 <= segment.filesize, "chain leaves file bytes");
+                    assert_eq!(offset / PAGE_SIZE, page, "chain leaves its page");
+                    let raw = rd_u64(exe, (segment.fileoff + offset) as usize);
+                    let next = (raw >> 51) & 0xFFF;
+                    let address = segment.vmaddr + offset;
+                    if raw >> 63 == 1 {
+                        assert_eq!((raw >> 32) & 0x7FFFF, 0, "bind reserved bits");
+                        let ordinal = (raw & 0xFF_FFFF) as usize;
+                        assert!(ordinal < imports_count, "bind ordinal out of range");
+                        let entry = rd_u32(exe, imports_offset + ordinal * 4);
+                        let symbol = read_cstring(exe, symbols_offset + (entry >> 9) as usize);
+                        decoded.push((
+                            address,
+                            DecodedFixup::Bind {
+                                symbol,
+                                addend: ((raw >> 24) & 0xFF) as u8,
+                            },
+                        ));
+                    } else {
+                        assert_eq!((raw >> 44) & 0x7F, 0, "rebase reserved bits");
+                        let target = (raw & ((1 << 36) - 1)) | (((raw >> 36) & 0xFF) << 56);
+                        decoded.push((address, DecodedFixup::Rebase(target)));
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    offset += next * 4;
+                }
+            }
+            assert!(chains > 0, "a segment starts entry must name a chain");
+        }
+        decoded
+    }
+
     fn assert_chained_fixups_payload(
         exe: &[u8],
         command: &LinkeditDataCommand,
         expected_segment_count: u32,
         expected_imports: &[&str],
-        data_segment: Option<&SegmentCommand>,
-        text_segment: &SegmentCommand,
     ) {
         assert_eq!(
             command.dataoff % 8,
@@ -3504,35 +6133,14 @@ mod tests {
         let starts_table_size = align_to(4 + segment_count as u64 * 4, 8) as usize;
         assert!(starts_offset + starts_table_size <= size);
 
-        if expected_imports.is_empty() {
-            for idx in 0..segment_count as usize {
-                assert_eq!(
-                    rd_u32(exe, starts + 4 + idx * 4),
-                    0,
-                    "segment without fixups should have no starts entry"
+        // Every chain decodes, and binds name only the listed imports.
+        for (address, fixup) in decode_chained_fixups(exe) {
+            if let DecodedFixup::Bind { symbol, .. } = fixup {
+                assert!(
+                    expected_imports.contains(&symbol.as_str()),
+                    "unexpected bind of {symbol} at {address:#x}"
                 );
             }
-        } else {
-            let data_seg_info_offset = rd_u32(exe, starts + 4 + 2 * 4) as usize;
-            assert_ne!(data_seg_info_offset, 0, "__DATA should have chained starts");
-            let data_seg = data_segment.expect("__DATA segment expected for imports");
-            let seg_start = starts + data_seg_info_offset;
-            let seg_size = rd_u32(exe, seg_start) as usize;
-            assert!(seg_size >= 24, "segment starts info too small");
-            assert!(data_seg_info_offset + seg_size <= size - starts_offset);
-            assert_eq!(rd_u32(exe, seg_start + 4) as u16, PAGE_SIZE as u16);
-            assert_eq!(rd_u32(exe, seg_start + 6) as u16, DYLD_CHAINED_PTR_64);
-            assert_eq!(
-                rd_u64(exe, seg_start + 8),
-                data_seg.vmaddr - text_segment.vmaddr
-            );
-            assert_eq!(rd_u32(exe, seg_start + 16), 0);
-            let page_count = rd_u32(exe, seg_start + 20) as u16;
-            assert!(page_count > 0);
-            assert_ne!(
-                rd_u32(exe, seg_start + 22) as u16,
-                DYLD_CHAINED_PTR_START_NONE
-            );
         }
 
         assert!(imports_offset <= symbols_offset);
@@ -3593,7 +6201,10 @@ mod tests {
         let n_code_slots = rd_be_u32(exe, code_dir + 28);
         let code_limit = rd_be_u32(exe, code_dir + 32) as u64;
         assert_eq!(n_special_slots, 0);
-        assert_eq!(n_code_slots, code_signature_block_count(command.dataoff));
+        assert_eq!(
+            n_code_slots,
+            code_signature_block_count(command.dataoff).unwrap()
+        );
         assert_eq!(code_limit, command.dataoff);
         assert_eq!(exe[code_dir + 36], CODE_SIGNATURE_HASH_SIZE as u8);
         assert_eq!(exe[code_dir + 37], CS_HASHTYPE_SHA256);
@@ -3624,7 +6235,7 @@ mod tests {
             let block_start = slot * CODE_SIGNATURE_BLOCK_SIZE as usize;
             let block_end =
                 ((slot as u64 + 1) * CODE_SIGNATURE_BLOCK_SIZE).min(command.dataoff) as usize;
-            let expected = sha256_digest(&exe[block_start..block_end]);
+            let expected = reference_sha256_digest(&exe[block_start..block_end]);
             let actual_start = hashes_start + slot * CODE_SIGNATURE_HASH_SIZE;
             assert_eq!(
                 &exe[actual_start..actual_start + CODE_SIGNATURE_HASH_SIZE],
@@ -3639,7 +6250,6 @@ mod tests {
         let segments = segment_commands(exe, &commands);
         let linkedit = single_segment(&segments, "__LINKEDIT");
         let text = single_segment(&segments, "__TEXT");
-        let data = segments.iter().find(|seg| seg.name == "__DATA");
         assert_eq!(
             segments.last().map(|seg| seg.name.as_str()),
             Some("__LINKEDIT")
@@ -3665,14 +6275,7 @@ mod tests {
             exports.dataoff + exports.datasize as u64 <= code_signature.dataoff,
             "code signature should follow dyld linkedit payloads"
         );
-        assert_chained_fixups_payload(
-            exe,
-            &fixups,
-            segments.len() as u32,
-            expected_imports,
-            data,
-            text,
-        );
+        assert_chained_fixups_payload(exe, &fixups, segments.len() as u32, expected_imports);
         assert_exports_trie_payload(exe, &exports);
         assert_code_signature_payload(exe, &code_signature, text);
     }
@@ -3704,6 +6307,33 @@ mod tests {
     // =======================================================================
     // Parser tests
     // =======================================================================
+
+    #[test]
+    fn signature_hash_matches_known_vectors_and_independent_padding_oracle() {
+        for (input, expected) in [
+            (
+                b"".as_slice(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc".as_slice(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        ] {
+            let digest = sha256_digest(input);
+            let encoded: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(encoded, expected);
+            assert_eq!(digest, reference_sha256_digest(input));
+        }
+        for len in [1, 55, 56, 63, 64, 65, 119, 120, 127, 128, 4095, 4096, 16384] {
+            let input: Vec<u8> = (0..len).map(|index| (index * 37) as u8).collect();
+            assert_eq!(
+                sha256_digest(&input),
+                reference_sha256_digest(&input),
+                "CodeDirectory hash changed at input length {len}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_round_trip() {
@@ -3906,8 +6536,386 @@ mod tests {
         let data = mk_object_with_one_lc(1, &lc);
         let err = MachOParser::parse(&data).unwrap_err();
         assert!(
-            matches!(err, LinkerError::LoadCommandOverflow { .. }),
-            "expected LoadCommandOverflow for an oversized section, got {err:?}"
+            matches!(&err, LinkerError::MalformedInput { detail, .. }
+                if detail.contains("run past the end of the")),
+            "expected the oversized section to be refused, got {err:?}"
+        );
+    }
+
+    /// One LC_SEGMENT_64 carrying the given section_64 headers (as
+    /// `(size, file offset, flags)`), followed by `tail` after the commands.
+    #[cfg(test)]
+    fn mk_object_with_sections(sections: &[(u64, u32, u32)], tail: &[u8]) -> Vec<u8> {
+        let mut seg = vec![0u8; SEGMENT_COMMAND_64_SIZE as usize];
+        seg[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        let cmdsize = SEGMENT_COMMAND_64_SIZE + SECTION_64_SIZE * sections.len() as u32;
+        seg[4..8].copy_from_slice(&cmdsize.to_le_bytes());
+        seg[64..68].copy_from_slice(&(sections.len() as u32).to_le_bytes());
+        for &(size, offset, flags) in sections {
+            let mut sec = vec![0u8; SECTION_64_SIZE as usize];
+            sec[0..6].copy_from_slice(b"__data");
+            sec[16..22].copy_from_slice(b"__DATA");
+            sec[40..48].copy_from_slice(&size.to_le_bytes());
+            sec[48..52].copy_from_slice(&offset.to_le_bytes());
+            sec[64..68].copy_from_slice(&flags.to_le_bytes());
+            seg.extend_from_slice(&sec);
+        }
+        let mut data = mk_object_with_one_lc(1, &seg);
+        data.extend_from_slice(tail);
+        data
+    }
+
+    /// A regular section whose file data runs past the end of the input is
+    /// refused. The parser used to zero-fill it: a truncated 16-byte `__data`
+    /// parsed as 16 zero bytes. A zero-fill section still owns no file bytes.
+    #[test]
+    fn test_parse_section_data_past_the_input_is_refused_not_zero_filled() {
+        let data_offset = 32 + SEGMENT_COMMAND_64_SIZE + SECTION_64_SIZE;
+        let whole = mk_object_with_sections(&[(16, data_offset, 0)], &[0xAB; 16]);
+        let parsed = MachOParser::parse(&whole).expect("in-bounds section data parses");
+        assert_eq!(parsed.sections[0].data, vec![0xAB; 16]);
+
+        let truncated = mk_object_with_sections(&[(16, data_offset, 0)], &[0xAB; 4]);
+        let err = MachOParser::parse(&truncated).unwrap_err();
+        assert!(
+            matches!(&err, LinkerError::MalformedInput { detail, .. }
+                if detail.contains("16 bytes of file data") && detail.contains("run past the end")),
+            "expected the truncated section to be refused, got {err:?}"
+        );
+
+        let bss = mk_object_with_sections(&[(1 << 20, 0, S_ZEROFILL)], &[]);
+        let parsed = MachOParser::parse(&bss).expect("a zero-fill section owns no file bytes");
+        assert!(parsed.sections[0].data.is_empty());
+        assert_eq!(parsed.sections[0].vmsize, 1 << 20);
+    }
+
+    /// Sections together cannot own more file bytes than the input. Before,
+    /// every section could copy (or zero-fill) up to the whole input, so the
+    /// memory a crafted input cost grew with the square of its length.
+    #[test]
+    fn test_parse_sections_claiming_more_bytes_than_the_input_are_refused() {
+        let data_offset = 32 + SEGMENT_COMMAND_64_SIZE + 4 * SECTION_64_SIZE;
+        let shared = [(200, data_offset, 0); 4];
+        let data = mk_object_with_sections(&shared, &[0x11; 200]);
+        assert!(data.len() < 4 * 200);
+        let err = MachOParser::parse(&data).unwrap_err();
+        assert!(
+            matches!(&err, LinkerError::MalformedInput { detail, .. }
+                if detail.contains("sections claim") && detail.contains("more than the")),
+            "expected sections claiming 800 bytes of a {}-byte input to be refused, got {err:?}",
+            data.len()
+        );
+    }
+
+    /// Section headers lie inside their LC_SEGMENT_64. A command whose
+    /// `nsects` overruns its `cmdsize` used to take the next load command as a
+    /// section header.
+    #[test]
+    fn test_parse_section_headers_beyond_the_segment_cmdsize_are_refused() {
+        let mut seg = vec![0u8; SEGMENT_COMMAND_64_SIZE as usize];
+        seg[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        seg[4..8].copy_from_slice(&SEGMENT_COMMAND_64_SIZE.to_le_bytes());
+        seg[64..68].copy_from_slice(&1u32.to_le_bytes()); // nsects = 1, no room for it
+        let mut sym = vec![0u8; SYMTAB_COMMAND_SIZE as usize];
+        sym[0..4].copy_from_slice(&LC_SYMTAB.to_le_bytes());
+        sym[4..8].copy_from_slice(&SYMTAB_COMMAND_SIZE.to_le_bytes());
+        let mut lc = seg;
+        lc.extend_from_slice(&sym);
+        let mut data = mk_object_with_one_lc(2, &lc);
+        data.extend_from_slice(&[0u8; 80]);
+        let err = MachOParser::parse(&data).unwrap_err();
+        assert!(
+            matches!(&err, LinkerError::MalformedInput { detail, .. }
+                if detail.contains("section headers do not fit")),
+            "expected the overrunning section header to be refused, got {err:?}"
+        );
+    }
+
+    /// One LC_SYMTAB whose symbols name the string indices `strx` of the
+    /// string table `strings`. Each nlist is 16 bytes; the string table
+    /// follows the symbols.
+    #[cfg(test)]
+    fn mk_object_with_symbol_names(strx: &[u32], strings: &[u8]) -> Vec<u8> {
+        let nsyms = strx.len() as u32;
+        let symoff = 32 + SYMTAB_COMMAND_SIZE;
+        let stroff = symoff + nsyms * 16;
+        let mut sym = vec![0u8; SYMTAB_COMMAND_SIZE as usize];
+        sym[0..4].copy_from_slice(&LC_SYMTAB.to_le_bytes());
+        sym[4..8].copy_from_slice(&SYMTAB_COMMAND_SIZE.to_le_bytes());
+        sym[8..12].copy_from_slice(&symoff.to_le_bytes());
+        sym[12..16].copy_from_slice(&nsyms.to_le_bytes());
+        sym[16..20].copy_from_slice(&stroff.to_le_bytes());
+        sym[20..24].copy_from_slice(&(strings.len() as u32).to_le_bytes());
+        let mut data = mk_object_with_one_lc(1, &sym);
+        for index in strx {
+            let mut nlist = [0u8; 16];
+            nlist[0..4].copy_from_slice(&index.to_le_bytes());
+            nlist[4] = 0x0f; // N_SECT | N_EXT
+            data.extend_from_slice(&nlist);
+        }
+        data.extend_from_slice(strings);
+        data
+    }
+
+    /// Whether every symbol name is a tail of the first one's bytes: one
+    /// shared allocation, not a copy per symbol.
+    #[cfg(test)]
+    fn names_share_storage(symbols: &[ParsedSymbol]) -> bool {
+        let longest = symbols
+            .iter()
+            .max_by_key(|symbol| symbol.name.len())
+            .expect("at least one symbol");
+        let range = longest.name.as_bytes().as_ptr_range();
+        symbols.iter().all(|symbol| {
+            let end = symbol.name.as_bytes().as_ptr_range().end;
+            symbol.name.is_empty() || (range.contains(&symbol.name.as_ptr()) && end == range.end)
+        })
+    }
+
+    /// Many symbols naming one long string, or tails of it, parse without a
+    /// copy per symbol. Each name used to be scanned and copied separately:
+    /// 4095 symbols sharing a 256 KiB name copied 1.07 GB. A later bound
+    /// refused such inputs, and with them valid tail-merged objects.
+    #[test]
+    fn test_parse_symbols_sharing_one_long_name_share_its_bytes() {
+        let long = 256 * 1024;
+        let mut strings = vec![0u8];
+        strings.extend(std::iter::repeat_n(b'a', long));
+        strings.push(0);
+        // The same string 4095 times, then 4095 distinct tails of it.
+        let same = vec![1u32; 4095];
+        let tails: Vec<u32> = (1..=4095).collect();
+        for strx in [same, tails] {
+            let data = mk_object_with_symbol_names(&strx, &strings);
+            let parsed = MachOParser::parse(&data).expect("shared names parse");
+            assert_eq!(parsed.symbols.len(), strx.len());
+            for (symbol, index) in parsed.symbols.iter().zip(&strx) {
+                assert_eq!(symbol.name.len(), long + 1 - *index as usize);
+            }
+            // Every name is a tail of the first symbol's, which is all `a`s.
+            assert!(parsed.symbols[0].name.bytes().all(|byte| byte == b'a'));
+            assert!(names_share_storage(&parsed.symbols));
+        }
+    }
+
+    /// Tail-merged names parse to their own tails of one run.
+    #[test]
+    fn test_parse_tail_merged_names() {
+        let strings = b"\0_foo_bar\0baz\0";
+        let data = mk_object_with_symbol_names(&[1, 5, 8, 9, 0, 10], strings);
+        let parsed = MachOParser::parse(&data).expect("tail-merged names parse");
+        let names: Vec<&str> = parsed
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(names, ["_foo_bar", "_bar", "r", "", "", "baz"]);
+        assert!(names_share_storage(&parsed.symbols[..4]));
+    }
+
+    /// rustc tail-merges the Mach-O string table: this arm64 object's 42
+    /// symbols name 2,937 bytes (terminators included) from a 168-byte table
+    /// in a 1,272-byte object. It must parse, every name intact.
+    #[test]
+    fn test_parse_rustc_tail_merged_object() {
+        let data = include_bytes!("../../tests/fixtures/macho_tail_merged/tail_merged.macho");
+        assert_eq!(data.len(), 1272);
+        let parsed = MachOParser::parse(data).expect("rustc's tail-merged object parses");
+        assert_eq!(parsed.symbols.len(), 42);
+        let chain = |n: usize| {
+            let mut name = String::from("_");
+            for k in (1..=n).rev() {
+                name.push_str(&format!("S{k}_"));
+            }
+            name.push('A');
+            name
+        };
+        let mut names: Vec<String> = parsed
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.to_string())
+            .collect();
+        names.sort();
+        let mut expected: Vec<String> = (0..=39).map(chain).collect();
+        expected.extend(["ltmp0".to_string(), "ltmp1".to_string()]);
+        expected.sort();
+        assert_eq!(names, expected);
+        let total: usize = parsed
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.len() + 1)
+            .sum();
+        assert_eq!(total, 2937);
+        let global: Vec<ParsedSymbol> = parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name.starts_with('_'))
+            .cloned()
+            .collect();
+        assert_eq!(global.len(), 40);
+        assert!(names_share_storage(&global));
+    }
+
+    /// A name is UTF-8 exactly as before names were shared: a valid tail of
+    /// a run with invalid bytes earlier parses, and a name that is not UTF-8
+    /// (invalid bytes, or starting inside a character) is refused.
+    #[test]
+    fn test_parse_symbol_name_utf8_is_checked_per_name() {
+        let strings = b"\0\xffab\0x\xc3\xa9\0\xe0\xa0\0";
+        let parsed = MachOParser::parse(&mk_object_with_symbol_names(&[2, 5, 6, 11], strings))
+            .expect("UTF-8 tails parse");
+        let names: Vec<&str> = parsed
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(names, ["ab", "x\u{e9}", "\u{e9}", ""]);
+        for strx in [1u32, 7, 9, 10] {
+            let err =
+                MachOParser::parse(&mk_object_with_symbol_names(&[strx], strings)).unwrap_err();
+            assert!(
+                matches!(&err, LinkerError::MalformedInput { detail, .. }
+                    if detail.contains("symbol name is not UTF-8")),
+                "strx {strx}: expected a UTF-8 refusal, got {err:?}"
+            );
+        }
+    }
+
+    /// Only one LC_SYMTAB is read: each indexes its whole string table, so a
+    /// command list repeating it would cost time quadratic in the input.
+    #[test]
+    fn test_parse_second_symtab_is_refused() {
+        let one = mk_object_with_symbol_names(&[1], b"\0_a\0");
+        let parsed = MachOParser::parse(&one).expect("one LC_SYMTAB parses");
+        assert_eq!(parsed.symbols[0].name, "_a");
+        // The same command twice, both naming one symbol and string table.
+        let size = SYMTAB_COMMAND_SIZE;
+        let symoff = 32 + 2 * size;
+        let mut command = vec![0u8; size as usize];
+        command[0..4].copy_from_slice(&LC_SYMTAB.to_le_bytes());
+        command[4..8].copy_from_slice(&size.to_le_bytes());
+        command[8..12].copy_from_slice(&symoff.to_le_bytes());
+        command[12..16].copy_from_slice(&1u32.to_le_bytes());
+        command[16..20].copy_from_slice(&(symoff + 16).to_le_bytes());
+        command[20..24].copy_from_slice(&4u32.to_le_bytes());
+        let mut data = mk_object_with_one_lc(2, &[command.clone(), command].concat());
+        let mut nlist = [0u8; 16];
+        nlist[0..4].copy_from_slice(&1u32.to_le_bytes());
+        nlist[4] = 0x0f;
+        data.extend_from_slice(&nlist);
+        data.extend_from_slice(b"\0_a\0");
+        let err = MachOParser::parse(&data).unwrap_err();
+        assert!(
+            matches!(&err, LinkerError::MalformedInput { detail, .. }
+                if detail.contains("more than one LC_SYMTAB")),
+            "expected the second LC_SYMTAB to be refused, got {err:?}"
+        );
+    }
+
+    /// A load command must end inside the `sizeofcmds` area.
+    #[test]
+    fn test_parse_load_command_past_sizeofcmds_is_refused() {
+        let mut sym = vec![0u8; SYMTAB_COMMAND_SIZE as usize];
+        sym[0..4].copy_from_slice(&LC_SYMTAB.to_le_bytes());
+        sym[4..8].copy_from_slice(&SYMTAB_COMMAND_SIZE.to_le_bytes());
+        let mut data = mk_object_with_one_lc(1, &sym);
+        data[20..24].copy_from_slice(&16u32.to_le_bytes()); // sizeofcmds = 16 < cmdsize 24
+        let err = MachOParser::parse(&data).unwrap_err();
+        assert!(
+            matches!(err, LinkerError::LoadCommandOverflow { offset: 32 }),
+            "expected the command past sizeofcmds to be refused, got {err:?}"
+        );
+    }
+
+    /// One LC_SEGMENT_64 with a single `__TEXT,__text` section whose
+    /// relocation table is `nreloc` entries at `reloff`, followed by `tail`.
+    #[cfg(test)]
+    fn mk_object_with_relocation_table(reloff: u32, nreloc: u32, tail: &[u8]) -> Vec<u8> {
+        let mut seg = vec![0u8; SEGMENT_COMMAND_64_SIZE as usize];
+        seg[0..4].copy_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        let cmdsize = SEGMENT_COMMAND_64_SIZE + SECTION_64_SIZE;
+        seg[4..8].copy_from_slice(&cmdsize.to_le_bytes());
+        seg[64..68].copy_from_slice(&1u32.to_le_bytes()); // nsects = 1
+        let mut sec = vec![0u8; SECTION_64_SIZE as usize];
+        sec[0..6].copy_from_slice(b"__text");
+        sec[16..22].copy_from_slice(b"__TEXT");
+        sec[56..60].copy_from_slice(&reloff.to_le_bytes());
+        sec[60..64].copy_from_slice(&nreloc.to_le_bytes());
+        let mut lc = seg;
+        lc.extend_from_slice(&sec);
+        let mut data = mk_object_with_one_lc(1, &lc);
+        data.extend_from_slice(tail);
+        data
+    }
+
+    /// A relocation table that runs past the input is refused. The parser used
+    /// to skip the missing entries, returning the section with fewer
+    /// relocations than it declares, and to walk every one of a count near
+    /// u32::MAX (L13-P7 fuzz lane: 10 s on a 327-byte fuzz_macho_fixup input).
+    #[test]
+    fn test_parse_relocation_table_beyond_input_is_refused() {
+        // A valid ARM64_RELOC_UNSIGNED entry (r_address 0, r_symbolnum 0,
+        // r_length 3, not pc-relative, not extern).
+        let entry: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0x06];
+        let reloff = 32 + SEGMENT_COMMAND_64_SIZE + SECTION_64_SIZE;
+        let complete = mk_object_with_relocation_table(reloff, 1, &entry);
+        let parsed = MachOParser::parse(&complete).expect("one in-bounds relocation parses");
+        assert_eq!(parsed.sections[0].relocations.len(), 1);
+
+        for (label, nreloc) in [("truncated", 2), ("near u32::MAX", u32::MAX)] {
+            let data = mk_object_with_relocation_table(reloff, nreloc, &entry);
+            let err = MachOParser::parse(&data).unwrap_err();
+            assert!(
+                matches!(&err, LinkerError::MalformedInput { detail, .. }
+                    if detail.contains("relocation table") && detail.contains("exceeds input")),
+                "{label}: expected the relocation table to be refused, got {err:?}"
+            );
+        }
+        // No relocations: the table offset is not consulted.
+        let empty = mk_object_with_relocation_table(u32::MAX, 0, &[]);
+        let parsed = MachOParser::parse(&empty).expect("a section without relocations parses");
+        assert!(parsed.sections[0].relocations.is_empty());
+    }
+
+    /// The fuzz lane's slow unit (fuzz_macho_fixup, seed 20260924, source
+    /// e26b6e17d): section relocation counts of 0x2d2d2d32 and more over a
+    /// 327-byte input, which took 10 s to walk. It must be refused, not walked.
+    /// Since section headers must fit in their command, its first segment
+    /// (nsects 488447261 in a 91-byte command) is refused before any section.
+    #[test]
+    fn test_parse_fuzz_slow_unit_relocation_counts_are_refused() {
+        const SLOW_UNIT: [u8; 327] = [
+            0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01, 0xff, 0xff, 0x00, 0x42, 0x01, 0x00,
+            0x00, 0x00, 0xfa, 0x1c, 0xfe, 0xf4, 0xff, 0xff, 0xfe, 0x00, 0x00, 0xff, 0xbd, 0x5d,
+            0x01, 0x00, 0x00, 0x42, 0x19, 0x00, 0x00, 0x00, 0x5b, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x02, 0x00, 0x00, 0x00, 0x2e, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x2d, 0x2d, 0x2c, 0x2d, 0x32, 0x2d, 0x2d, 0x2d, 0x2d, 0x00, 0x00, 0x28, 0x1d,
+            0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d,
+            0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x3a, 0x1c, 0xfe, 0xf4, 0xff, 0xff, 0xfe,
+            0x00, 0x00, 0xff, 0xbd, 0x5d, 0x01, 0x00, 0x00, 0x42, 0x19, 0x00, 0x00, 0x00, 0x5b,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x02, 0x00,
+            0x00, 0x00, 0x2e, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2d, 0x2d, 0x2d, 0x2d, 0x32, 0x2d, 0x2d, 0x2d,
+            0x1d, 0x00, 0x00, 0x28, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d,
+            0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d,
+            0x1d, 0x1d, 0xff, 0x5d, 0xbd, 0xff, 0xbd, 0x5d, 0x01, 0x00, 0x00, 0x42, 0x02, 0x00,
+            0x00, 0x00, 0x2e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x5b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d,
+            0xff, 0x5d, 0xbd, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0xff, 0xbd, 0x5d, 0x01, 0x00,
+            0x00, 0x42, 0x02, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x1d, 0x1d, 0x1d, 0xff, 0x5d, 0xbd,
+            0xff, 0xbd, 0x5d, 0x01, 0x00, 0x00, 0x42, 0x02, 0x00, 0x00, 0x00, 0x2e, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5b, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0xff, 0x1d, 0x1d, 0x1d, 0x1d, 0x1d, 0xff, 0x5d, 0xbd, 0xff, 0xff,
+            0xff, 0xfe, 0x00, 0x00, 0xff, 0xbd, 0x5d, 0x01, 0x00, 0x00, 0x42, 0x02, 0x00, 0x2f,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let err = MachOParser::parse(&SLOW_UNIT).unwrap_err();
+        assert!(
+            matches!(&err, LinkerError::MalformedInput { detail, .. }
+                if detail.contains("section headers do not fit")
+                    || detail.contains("relocation table")),
+            "expected the slow unit to be refused, got {err:?}"
         );
     }
 
@@ -3961,7 +6969,7 @@ mod tests {
         let obj2 = MachOParser::parse(&obj2_bytes).unwrap();
 
         let objects = vec![obj1, obj2];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
 
         let mut resolver = SymbolResolver::new();
         resolver
@@ -3986,7 +6994,7 @@ mod tests {
         let obj = MachOParser::parse(&obj_bytes).unwrap();
 
         let objects = vec![obj];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
 
         let mut resolver = SymbolResolver::new();
         resolver
@@ -4010,7 +7018,7 @@ mod tests {
         let obj2 = MachOParser::parse(&writer2.write().unwrap()).unwrap();
 
         let objects = vec![obj1, obj2];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
         let mut resolver = SymbolResolver::new();
         resolver
             .add_object(0, &objects[0], &layout.section_addrs[0])
@@ -4058,7 +7066,7 @@ mod tests {
         let obj = MachOParser::parse(&obj_bytes).unwrap();
 
         let objects = vec![obj];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
 
         // Text section starts at base.
         assert_eq!(layout.section_addrs[0][0], DEFAULT_BASE_ADDR);
@@ -4562,7 +7570,8 @@ mod tests {
             DEFAULT_BASE_ADDR,
             DEFAULT_BASE_ADDR + PAGE_SIZE,
             text_file_offset,
-        );
+        )
+        .unwrap();
 
         // Verify header.
         assert_eq!(rd_u32(&exe, 0), MH_MAGIC_64);
@@ -4599,7 +7608,8 @@ mod tests {
             DEFAULT_BASE_ADDR,
             data_vmaddr,
             text_file_offset,
-        );
+        )
+        .unwrap();
 
         assert_eq!(rd_u32(&exe, 0), MH_MAGIC_64);
         assert_eq!(rd_u32(&exe, 12), MH_EXECUTE);
@@ -4688,7 +7698,19 @@ mod tests {
 
         assert_build_version_command(&exe, single_load_command(&commands, LC_BUILD_VERSION));
         assert_empty_dysymtab_command(&exe, single_load_command(&commands, LC_DYSYMTAB));
-        let expected_entryoff = dylib_executable_text_file_offset(true, true, &[&config.dylibs[0]]);
+        let shape = ImageShape {
+            stubs: 1,
+            got: 1,
+            ..ImageShape::default()
+        };
+        let expected_entryoff = executable_text_file_offset_from_lc_size(
+            image_load_command_size(
+                ImageKind::Executable,
+                &shape,
+                &[dylib_command_size(&config.dylibs[0])],
+            )
+            .unwrap(),
+        );
         assert_mapped_text_layout(&exe, expected_entryoff);
         assert_dyld_linkedit_payloads(&exe, &["_exit"]);
 
@@ -5043,11 +8065,7 @@ mod tests {
         }
         assert!(found_dylib_cmd, "LC_LOAD_DYLIB should be present");
 
-        // Verify stubs are in the text segment (ADRP X16 = 0x90000010).
-        let has_stub = exe
-            .windows(4)
-            .any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == 0x9000_0010);
-        assert!(has_stub, "stub ADRP X16 instruction should be present");
+        assert_stubs_address_got(&exe);
     }
 
     #[test]
@@ -5200,7 +8218,7 @@ mod tests {
 
         // Link should succeed (strong overrides weak).
         let objects = vec![obj1, obj2];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
         let mut resolver = SymbolResolver::new();
         resolver
             .add_object(0, &objects[0], &layout.section_addrs[0])
@@ -5275,7 +8293,7 @@ mod tests {
         };
 
         let objects = vec![obj1, obj2];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
         let mut resolver = SymbolResolver::new();
         resolver
             .add_object(0, &objects[0], &layout.section_addrs[0])
@@ -5339,7 +8357,7 @@ mod tests {
         };
 
         let objects = vec![obj1, obj2];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
         let mut resolver = SymbolResolver::new();
         resolver
             .add_object(0, &objects[0], &layout.section_addrs[0])
@@ -5388,7 +8406,7 @@ mod tests {
         };
 
         let objects = vec![obj];
-        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&objects, DEFAULT_BASE_ADDR).unwrap();
         let mut resolver = SymbolResolver::new();
         resolver
             .add_object(0, &objects[0], &layout.section_addrs[0])
@@ -5402,6 +8420,60 @@ mod tests {
     // =======================================================================
     // Dead code stripping tests
     // =======================================================================
+
+    #[test]
+    fn mixed_weak_and_strong_references_require_a_definition_in_either_order() {
+        let reference = |weak| ParsedObject {
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            flags: 0,
+            sections: vec![],
+            symbols: vec![ParsedSymbol {
+                name: "_optional_func".into(),
+                n_type: N_UNDF | N_EXT,
+                section: 0,
+                desc: if weak { N_WEAK_REF } else { 0 },
+                value: 0,
+            }],
+        };
+        for references in [[true, false], [false, true], [true, true]] {
+            let mut resolver = SymbolResolver::new();
+            for (index, weak) in references.into_iter().enumerate() {
+                resolver.add_object(index, &reference(weak), &[]).unwrap();
+            }
+            let plain = resolver.resolve();
+            let dynamic = resolver.resolve_with_dylibs(&DylibConfig::new(), DEFAULT_BASE_ADDR);
+            if references.contains(&false) {
+                assert!(matches!(
+                    plain,
+                    Err(LinkerError::UndefinedSymbol(ref name)) if name == "_optional_func"
+                ));
+                assert!(matches!(
+                    dynamic,
+                    Err(LinkerError::UndefinedSymbol(ref name)) if name == "_optional_func"
+                ));
+            } else {
+                assert_eq!(plain.unwrap()["_optional_func"], 0);
+                let (addresses, imports) = dynamic.unwrap();
+                assert_eq!(addresses["_optional_func"], 0);
+                assert!(imports.is_empty());
+            }
+
+            // A real provider satisfies either kind of reference; duplicate
+            // references must still allocate exactly one dynamic stub.
+            let config = DylibConfig {
+                dylibs: vec![DylibEntry {
+                    install_name: "/test/provider.dylib".into(),
+                    symbols: HashSet::from(["_optional_func".into()]),
+                }],
+            };
+            let (addresses, imports) = resolver
+                .resolve_with_dylibs(&config, DEFAULT_BASE_ADDR)
+                .unwrap();
+            assert_eq!(addresses["_optional_func"], DEFAULT_BASE_ADDR);
+            assert_eq!(imports, ["_optional_func"]);
+        }
+    }
 
     #[test]
     fn test_dead_strip_basic() {
@@ -5470,7 +8542,7 @@ mod tests {
             ],
         };
 
-        let stripped = dead_strip_sections(&[obj], "_main");
+        let stripped = dead_strip_sections(&[obj], "_main").unwrap();
         assert_eq!(stripped.len(), 1);
         // _unused's section should be removed (it was the third section).
         // We should have 2 sections left: _main's and _helper's.
@@ -5551,7 +8623,7 @@ mod tests {
             ],
         };
 
-        let stripped = dead_strip_sections(&[obj], "_main");
+        let stripped = dead_strip_sections(&[obj], "_main").unwrap();
         assert_eq!(stripped.len(), 1);
         // The middle (dead) section is removed; _main + _helper sections remain.
         assert_eq!(stripped[0].sections.len(), 2);
@@ -5569,6 +8641,13 @@ mod tests {
         assert!(
             syms.iter()
                 .all(|s| (s.section as usize) <= stripped[0].sections.len())
+        );
+        let relocation = &stripped[0].sections[0].relocations[0];
+        assert_eq!(
+            syms.get(relocation.symbol_index as usize)
+                .map(|s| s.name.as_str()),
+            Some("_helper"),
+            "stripping a preceding symbol must remap external relocation indices too"
         );
     }
 
@@ -5610,9 +8689,108 @@ mod tests {
             }],
         };
 
-        let stripped = dead_strip_sections(&[obj], "_main");
+        let stripped = dead_strip_sections(&[obj], "_main").unwrap();
         // Both sections should be kept (data is always preserved).
         assert_eq!(stripped[0].sections.len(), 2);
+    }
+
+    fn dead_strip_relocation_fixture() -> ParsedObject {
+        ParsedObject {
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            flags: 0,
+            sections: [0x9400_0000u32, 0xD65F_03C0, 0xD65F_03C0]
+                .into_iter()
+                .enumerate()
+                .map(|(index, instruction)| ParsedSection {
+                    name: format!("__text_{index}"),
+                    segment: "__TEXT".into(),
+                    data: instruction.to_le_bytes().to_vec(),
+                    addr: index as u64 * 4,
+                    align: 2,
+                    flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS,
+                    relocations: if index == 0 {
+                        vec![Relocation::branch26(0, 2)]
+                    } else {
+                        vec![]
+                    },
+                    vmsize: 4,
+                })
+                .collect(),
+            symbols: ["_main", "_dead", "_helper"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| ParsedSymbol {
+                    name: name.into(),
+                    n_type: N_SECT | N_EXT,
+                    section: index as u8 + 1,
+                    desc: 0,
+                    value: index as u64 * 4,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn dead_strip_remaps_symbol_and_local_section_targets_through_linking() {
+        for local in [false, true] {
+            let mut object = dead_strip_relocation_fixture();
+            if local {
+                object.sections[0].relocations[0].is_extern = false;
+                object.sections[0].relocations[0].symbol_index = 3;
+                // A section-ordinal relocation needs no symbol at its target.
+                object.symbols.pop();
+            }
+            let stripped = dead_strip_sections(&[object], "_main").unwrap();
+            assert_eq!(stripped[0].sections.len(), 2);
+            assert_eq!(stripped[0].sections[1].name, "__text_2");
+            assert_eq!(
+                stripped[0].sections[0].relocations[0].symbol_index,
+                if local { 2 } else { 1 }
+            );
+            let executable = link(&stripped).expect("stripped references remain linkable");
+            let sections = section_commands(&executable, &walk_load_commands(&executable));
+            let text = sections.iter().find(|s| s.name == "__text").unwrap();
+            assert_eq!(text.size, 8);
+            assert_eq!(rd_u32(&executable, text.offset as usize), 0x9400_0001);
+            assert_eq!(rd_u32(&executable, text.offset as usize + 4), 0xD65F_03C0);
+        }
+    }
+
+    #[test]
+    fn dead_strip_preserves_addend_payloads_and_rejects_invalid_indices() {
+        let mut object = dead_strip_relocation_fixture();
+        let mut addend = Relocation::branch26(0, 0x00FF_FFFF);
+        addend.kind = AArch64RelocKind::Addend;
+        addend.is_extern = false;
+        object.sections[0].relocations.insert(0, addend.clone());
+        let stripped = dead_strip_sections(&[object], "_main").unwrap();
+        let retained = &stripped[0].sections[0].relocations[0];
+        assert_eq!(retained.kind, AArch64RelocKind::Addend);
+        assert_eq!(retained.symbol_index, addend.symbol_index);
+        assert_eq!(retained.is_extern, addend.is_extern);
+
+        for (external, index) in [(true, 3), (true, u32::MAX), (false, 0), (false, 4)] {
+            let mut object = dead_strip_relocation_fixture();
+            object.sections[0].relocations[0].is_extern = external;
+            object.sections[0].relocations[0].symbol_index = index;
+            assert!(matches!(
+                dead_strip_sections(&[object], "_main"),
+                Err(LinkerError::MalformedRelocation(_))
+            ));
+        }
+        let mut object = dead_strip_relocation_fixture();
+        object.symbols[0].section = 4;
+        assert!(matches!(
+            dead_strip_sections(&[object], "_main"),
+            Err(LinkerError::MalformedInput { .. })
+        ));
+        let mut object = dead_strip_relocation_fixture();
+        object.sections.resize(256, object.sections[0].clone());
+        assert!(matches!(
+            dead_strip_sections(&[object], "_main"),
+            Err(LinkerError::MalformedInput { .. })
+        ));
     }
 
     // =======================================================================
@@ -5667,7 +8845,7 @@ mod tests {
             }],
         };
 
-        let layout = lay_out_sections(&[obj], DEFAULT_BASE_ADDR);
+        let layout = lay_out_sections(&[obj], DEFAULT_BASE_ADDR).unwrap();
 
         // Text section at base.
         assert_eq!(layout.section_addrs[0][0], DEFAULT_BASE_ADDR);
@@ -5678,6 +8856,469 @@ mod tests {
         // BSS section after data.
         let bss_addr = layout.section_addrs[0][2];
         assert!(bss_addr >= data_vmaddr + 8, "BSS should be after data");
+    }
+
+    fn object_with_bss(data: Vec<u8>, bss_size: u64) -> ParsedObject {
+        ParsedObject {
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            flags: 0,
+            sections: vec![
+                ParsedSection {
+                    name: "__text".into(),
+                    segment: "__TEXT".into(),
+                    data: [0x52800000u32, 0xD65F03C0]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect(),
+                    addr: 0,
+                    align: 2,
+                    flags: S_REGULAR | S_ATTR_PURE_INSTRUCTIONS,
+                    relocations: vec![],
+                    vmsize: 8,
+                },
+                ParsedSection {
+                    name: "__data".into(),
+                    segment: "__DATA".into(),
+                    vmsize: data.len() as u64,
+                    data,
+                    addr: 0,
+                    align: 0,
+                    flags: S_REGULAR,
+                    relocations: vec![],
+                },
+                ParsedSection {
+                    name: "__bss".into(),
+                    segment: "__DATA".into(),
+                    data: vec![],
+                    addr: 0,
+                    align: 4,
+                    flags: S_ZEROFILL,
+                    relocations: vec![],
+                    vmsize: bss_size,
+                },
+            ],
+            symbols: ["_main", "_data", "_zero"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| ParsedSymbol {
+                    name: name.into(),
+                    n_type: N_SECT | N_EXT,
+                    section: index as u8 + 1,
+                    desc: 0,
+                    value: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_stubs_address_got(executable: &[u8]) {
+        let commands = walk_load_commands(executable);
+        let sections = section_commands(executable, &commands);
+        let stubs = single_section(&sections, "__TEXT", "__stubs");
+        let got = single_section(&sections, "__DATA_CONST", "__got");
+        for index in 0..stubs.size / u64::from(STUB_SIZE) {
+            let offset = stubs.offset as usize + index as usize * STUB_SIZE as usize;
+            let adrp = rd_u32(executable, offset);
+            let ldr = rd_u32(executable, offset + 4);
+            assert_eq!(adrp & 0x9f00_001f, 0x9000_0010);
+            assert_eq!(ldr & !(0xfff << 10), 0xF940_0210);
+            assert_eq!(rd_u32(executable, offset + 8), 0xD61F_0200);
+            let immediate = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3);
+            let signed_pages = (i64::from(immediate) << 43) >> 43;
+            let pc_page = (stubs.addr + index * u64::from(STUB_SIZE)) & !0xfff;
+            let address = i128::from(pc_page)
+                + i128::from(signed_pages) * 4096
+                + i128::from((ldr >> 10) & 0xfff) * 8;
+            assert_eq!(
+                address,
+                i128::from(got.addr + index * 8),
+                "stub must load its own GOT slot"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_rejects_alignment_and_virtual_address_overflow() {
+        let object = object_with_bss(vec![1], 16);
+        for exponent in [64, u32::MAX] {
+            let mut malformed = object.clone();
+            malformed.sections[0].align = exponent;
+            assert!(matches!(
+                lay_out_sections(&[malformed], DEFAULT_BASE_ADDR),
+                Err(LinkerError::InvalidAlignment { .. })
+            ));
+        }
+        assert!(matches!(
+            lay_out_sections(std::slice::from_ref(&object), u64::MAX),
+            Err(LinkerError::LayoutOverflow(_))
+        ));
+        let huge_bss = object_with_bss(vec![], u64::MAX);
+        assert!(matches!(
+            lay_out_sections(&[huge_bss], DEFAULT_BASE_ADDR),
+            Err(LinkerError::LayoutOverflow(_))
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_truncated_symbol_tables_and_out_of_table_names() {
+        let mut writer = MachOWriter::new();
+        writer.add_text_section(&0xD65F03C0u32.to_le_bytes());
+        writer.add_symbol("_main", 1, 0, true).unwrap();
+        let original = writer.write().unwrap();
+        let commands = walk_load_commands(&original);
+        let command = single_load_command(&commands, LC_SYMTAB);
+        let symoff = rd_u32(&original, command.offset + 8) as usize;
+        let stroff = rd_u32(&original, command.offset + 16) as usize;
+        let strsize = rd_u32(&original, command.offset + 20);
+        let name_offset = rd_u32(&original, symoff) as usize;
+        let mut cases = Vec::new();
+        let mut truncated_symbols = original.clone();
+        patch_u32(&mut truncated_symbols, command.offset + 12, u32::MAX);
+        cases.push(truncated_symbols);
+        let mut truncated_strings = original.clone();
+        patch_u32(&mut truncated_strings, command.offset + 20, u32::MAX);
+        cases.push(truncated_strings);
+        let mut out_of_table = original.clone();
+        patch_u32(&mut out_of_table, symoff, strsize);
+        out_of_table.extend_from_slice(b"not-in-string-table\0");
+        cases.push(out_of_table);
+        let mut missing_terminator = original.clone();
+        patch_u32(
+            &mut missing_terminator,
+            command.offset + 20,
+            (name_offset + 5) as u32,
+        );
+        cases.push(missing_terminator);
+        let mut invalid_utf8 = original;
+        invalid_utf8[stroff + name_offset] = 0xff;
+        cases.push(invalid_utf8);
+        for (index, bytes) in cases.into_iter().enumerate() {
+            assert!(
+                matches!(
+                    MachOParser::parse(&bytes),
+                    Err(LinkerError::MalformedInput { .. })
+                ),
+                "case {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn bss_alignment_uses_the_absolute_base_after_all_file_backed_data() {
+        let first = object_with_bss(vec![1], 17);
+        let second = object_with_bss(vec![2, 3], 8);
+        let layout = lay_out_sections(&[first, second], DEFAULT_BASE_ADDR + 1).unwrap();
+        assert_eq!(layout.section_addrs[0][0] % 4, 0);
+        assert_eq!(layout.section_addrs[0][2] % 16, 0);
+        assert_eq!(layout.section_addrs[1][2] % 16, 0);
+        assert!(layout.section_addrs[0][2] >= layout.section_addrs[1][1] + 2);
+        assert!(layout.section_addrs[1][2] >= layout.section_addrs[0][2] + 17);
+        assert_eq!(layout.data_file_size, 3);
+    }
+
+    #[test]
+    fn executable_emitter_rejects_overflow_overlaps_and_invalid_entry_points() {
+        let text = 0xD65F03C0u32.to_le_bytes();
+        let offset = plain_executable_text_file_offset(true);
+        let data_addr = DEFAULT_BASE_ADDR + offset + PAGE_SIZE;
+        for (text_addr, data_addr, entry) in [
+            (u64::MAX, data_addr, offset),
+            (DEFAULT_BASE_ADDR, u64::MAX, offset),
+            (DEFAULT_BASE_ADDR, DEFAULT_BASE_ADDR + offset, offset),
+            (DEFAULT_BASE_ADDR + 1, data_addr, offset),
+            (0, data_addr, offset),
+            (DEFAULT_BASE_ADDR, data_addr, 0),
+            (DEFAULT_BASE_ADDR, data_addr, offset + text.len() as u64),
+        ] {
+            assert!(ExecutableEmitter::emit(&text, &[1], text_addr, data_addr, entry).is_err());
+        }
+        assert!(
+            ExecutableEmitter::emit_with_virtual_data(
+                &text,
+                &[1],
+                DEFAULT_BASE_ADDR,
+                data_addr,
+                offset,
+                u64::MAX
+            )
+            .is_err()
+        );
+        assert!(
+            ExecutableEmitter::emit_with_virtual_data(
+                &text,
+                &[1],
+                DEFAULT_BASE_ADDR,
+                data_addr,
+                offset,
+                0
+            )
+            .is_err()
+        );
+        let lc_size = image_load_command_size(
+            ImageKind::Executable,
+            &ImageShape {
+                data: true,
+                ..ImageShape::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let executable = ImageKind::Executable;
+        assert!(
+            ExecutableLayout::new(
+                executable,
+                u64::from(u32::MAX),
+                DEFAULT_BASE_ADDR,
+                Some(offset),
+                lc_size,
+                &[(DEFAULT_BASE_ADDR * 3, 1, 1)],
+            )
+            .is_err()
+        );
+        let layout = ExecutableLayout::new(
+            executable,
+            4,
+            DEFAULT_BASE_ADDR,
+            Some(offset),
+            lc_size,
+            &[(data_addr, 1, 1)],
+        )
+        .unwrap();
+        assert!(layout.reserve_image(u64::from(u32::MAX)).is_err());
+        // A later segment may not overlap an earlier one.
+        assert!(
+            ExecutableLayout::new(
+                executable,
+                4,
+                DEFAULT_BASE_ADDR,
+                Some(offset),
+                lc_size,
+                &[(data_addr, 1, PAGE_SIZE * 2), (data_addr + PAGE_SIZE, 1, 1)],
+            )
+            .is_err()
+        );
+        // Executables need an entry; dylibs may not carry one, and only a
+        // dylib may be based inside the first 4 GiB.
+        let dylib = ImageKind::Dylib {
+            install_name: "@rpath/libx.dylib",
+        };
+        assert!(
+            ExecutableLayout::new(executable, 4, DEFAULT_BASE_ADDR, None, lc_size, &[]).is_err()
+        );
+        assert!(ExecutableLayout::new(dylib, 4, 0, Some(offset), lc_size, &[]).is_err());
+        assert!(ExecutableLayout::new(executable, 4, 0, Some(offset), lc_size, &[]).is_err());
+        assert!(ExecutableLayout::new(dylib, 4, 0, None, lc_size, &[]).is_ok());
+    }
+
+    #[test]
+    fn dylib_link_rejects_unrepresentable_import_metadata_before_emission() {
+        let mut object = object_with_bss(vec![7], 8);
+        object.symbols.push(ParsedSymbol {
+            name: "_exit".into(),
+            n_type: N_UNDF | N_EXT,
+            section: 0,
+            desc: 0,
+            value: 0,
+        });
+        let entry = DylibConfig::with_libsystem().dylibs.remove(0);
+        let too_many = DylibConfig {
+            dylibs: vec![entry.clone(); 0xF1],
+        };
+        assert!(matches!(
+            link_with_dylibs(std::slice::from_ref(&object), &too_many),
+            Err(LinkerError::LayoutOverflow("compact dylib import count"))
+        ));
+        let mut invalid_name = DylibConfig {
+            dylibs: vec![entry],
+        };
+        invalid_name.dylibs[0].install_name.push('\0');
+        assert!(matches!(
+            link_with_dylibs(std::slice::from_ref(&object), &invalid_name),
+            Err(LinkerError::MalformedInput { .. })
+        ));
+        // A small payload with a large alignment gap places a rebased pointer
+        // beyond the u16 page-count field. The page admission runs before
+        // relocated bytes exist, so no multi-gigabyte allocation is needed.
+        object.sections[1].data = vec![0; 8];
+        object.sections[1].vmsize = 8;
+        object.sections[1].align = 31;
+        object.sections[1]
+            .relocations
+            .push(Relocation::unsigned_ptr(0, 1));
+        assert!(matches!(
+            link_with_dylibs(&[object], &DylibConfig::with_libsystem()),
+            Err(LinkerError::LayoutOverflow(
+                "compact chained-fixup import/page fields"
+            ))
+        ));
+    }
+
+    #[test]
+    fn executable_uuid_includes_zero_fill_extent() {
+        let first = link(&[object_with_bss(vec![7], PAGE_SIZE)]).unwrap();
+        let second = link(&[object_with_bss(vec![7], PAGE_SIZE * 2)]).unwrap();
+        let first_commands = walk_load_commands(&first);
+        let second_commands = walk_load_commands(&second);
+        assert_ne!(
+            load_command_uuid(&first, single_load_command(&first_commands, LC_UUID)),
+            load_command_uuid(&second, single_load_command(&second_commands, LC_UUID))
+        );
+    }
+
+    #[test]
+    fn executable_reserves_bss_virtual_pages_without_file_backing() {
+        for data in [vec![], vec![7]] {
+            let object = object_with_bss(data, PAGE_SIZE * 3);
+            let layout = lay_out_sections(
+                std::slice::from_ref(&object),
+                DEFAULT_BASE_ADDR + plain_executable_text_file_offset(true),
+            )
+            .unwrap();
+            let exe = link(&[object]).unwrap();
+            let commands = walk_load_commands(&exe);
+            let segments = segment_commands(&exe, &commands);
+            let data = single_segment(&segments, "__DATA");
+            let linkedit = single_segment(&segments, "__LINKEDIT");
+            assert_eq!(data.vmaddr, layout.data_vmaddr);
+            assert!(data.vmaddr + data.vmsize >= layout.section_addrs[0][2] + PAGE_SIZE * 3);
+            assert!(data.filesize < data.vmsize);
+            assert!(linkedit.vmaddr >= data.vmaddr + data.vmsize);
+            assert_dyld_linkedit_payloads(&exe, &[]);
+        }
+    }
+
+    #[test]
+    fn imported_stubs_crossing_a_page_do_not_stale_data_relocations() {
+        let mut object = object_with_bss(vec![0xa5], PAGE_SIZE * 2);
+        // ADRP x8, _data@PAGE; ADD x8, x8, _data@PAGEOFF at the end of one full
+        // text page, so the planned stub pushes __DATA a page further out.
+        object.sections[0].data.resize(PAGE_SIZE as usize, 0);
+        object.sections[0].data[8..16].copy_from_slice(
+            &[0x9000_0008u32, 0x9100_0108]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        object.sections[0].relocations.extend([
+            Relocation::page21(8, 1),
+            Relocation::pageoff12(12, 1),
+            Relocation::branch26(4, 3),
+        ]);
+        object.sections[0].data[4..8].copy_from_slice(&0x9400_0000u32.to_le_bytes());
+        object.symbols.push(ParsedSymbol {
+            name: "_exit".into(),
+            n_type: N_UNDF | N_EXT,
+            section: 0,
+            desc: 0,
+            value: 0,
+        });
+        let config = DylibConfig::with_libsystem();
+        let exe = link_with_dylibs(&[object], &config).unwrap();
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let segments = segment_commands(&exe, &commands);
+        let text = single_section(&sections, "__TEXT", "__text");
+        let data = single_segment(&segments, "__DATA");
+        let data_const = single_segment(&segments, "__DATA_CONST");
+        let got = single_section(&sections, "__DATA_CONST", "__got");
+        assert_eq!(data_const.vmaddr, text.addr + PAGE_SIZE * 2);
+        assert_eq!(data.vmaddr, data_const.vmaddr + PAGE_SIZE);
+        let adrp = rd_u32(&exe, text.offset as usize + 8);
+        let add = rd_u32(&exe, text.offset as usize + 12);
+        let pages = (i64::from((((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3)) << 43) >> 43;
+        let address = (((text.addr + 8) & !0xfff) as i64 + pages * 4096) as u64
+            + u64::from((add >> 10) & 0xfff);
+        assert_eq!(
+            address, data.vmaddr,
+            "ADRP/ADD must reach the shifted __data"
+        );
+        assert_eq!(exe[data.fileoff as usize], 0xa5);
+        assert_eq!(got.addr, data_const.vmaddr);
+        assert!(data.vmsize > data.filesize);
+        assert_stubs_address_got(&exe);
+        assert_dyld_linkedit_payloads(&exe, &["_exit"]);
+        assert_eq!(
+            decode_chained_fixups(&exe),
+            [(
+                got.addr,
+                DecodedFixup::Bind {
+                    symbol: "_exit".into(),
+                    addend: 0
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn symbol_resolution_rebases_input_section_addresses_and_rejects_invalid_values() {
+        let mut object = object_with_bss(vec![1, 2, 3, 4], 16);
+        object.sections[1].addr = 0x80;
+        object.symbols[1].value = 0x82;
+        let layout = lay_out_sections(std::slice::from_ref(&object), DEFAULT_BASE_ADDR).unwrap();
+        let mut resolver = SymbolResolver::new();
+        resolver
+            .add_object(0, &object, &layout.section_addrs[0])
+            .unwrap();
+        assert_eq!(resolver.lookup("_data"), Some(layout.data_vmaddr + 2));
+        for value in [0x7f, 0x85, u64::MAX] {
+            object.symbols[1].value = value;
+            assert!(
+                SymbolResolver::new()
+                    .add_object(0, &object, &layout.section_addrs[0])
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn native_dylib_executable_reads_and_writes_distant_zero_fill_memory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        for write_value in [None, Some(73u32)] {
+            let mut object = object_with_bss(vec![7], PAGE_SIZE * 3);
+            object.symbols[2].value = PAGE_SIZE * 2;
+            let mut words = vec![0x9000_0008u32, 0x9100_0108, 0xB940_0100]; // ADRP; ADD; LDR w0
+            if let Some(value) = write_value {
+                words.extend([0x5280_0009 | (value << 5), 0xB900_0109, 0xB940_0100]);
+            }
+            words.push(0x9400_0000); // BL _exit
+            object.sections[0].relocations = vec![
+                Relocation::page21(0, 2),
+                Relocation::pageoff12(4, 2),
+                Relocation::branch26((words.len() as u32 - 1) * 4, 3),
+            ];
+            object.sections[0].data = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            object.symbols.push(ParsedSymbol {
+                name: "_exit".into(),
+                n_type: N_UNDF | N_EXT,
+                section: 0,
+                desc: 0,
+                value: 0,
+            });
+            let executable = link_with_dylibs(&[object], &DylibConfig::with_libsystem()).unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("zero-fill-executable");
+            std::fs::write(&path, executable).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let run = super::native_process::run_executable_with_timeout(
+                &path,
+                super::native_process::exec_timeout(Duration::from_secs(10)),
+            )
+            .unwrap();
+            assert!(
+                !run.timed_out,
+                "linked executable did not terminate: {:?}",
+                run.output
+            );
+            assert_eq!(
+                run.output.status.code(),
+                Some(write_value.unwrap_or(0) as i32),
+                "{:?}",
+                run.output
+            );
+        }
     }
 
     #[test]
@@ -5752,5 +9393,1587 @@ mod tests {
             value: 0,
         };
         assert!(no_dead_strip.is_no_dead_strip());
+    }
+
+    // =======================================================================
+    // GOT, TLV pointer and chained-fixup image tests
+    // =======================================================================
+
+    const ADRP_X8: u32 = 0x9000_0008;
+    const LDR_X8_X8: u32 = 0xF940_0108;
+    const ADD_X8_X8: u32 = 0x9100_0108;
+    const RET: u32 = 0xD65F_03C0;
+
+    fn words(instructions: &[u32]) -> Vec<u8> {
+        instructions
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+    }
+
+    fn input_section(
+        name: &str,
+        segment: &str,
+        data: Vec<u8>,
+        align: u32,
+        flags: u32,
+        relocations: Vec<Relocation>,
+    ) -> ParsedSection {
+        ParsedSection {
+            name: name.into(),
+            segment: segment.into(),
+            vmsize: data.len() as u64,
+            data,
+            addr: 0,
+            align,
+            flags,
+            relocations,
+        }
+    }
+
+    fn text_section(instructions: &[u32], relocations: Vec<Relocation>) -> ParsedSection {
+        input_section(
+            "__text",
+            "__TEXT",
+            words(instructions),
+            2,
+            S_REGULAR | S_ATTR_PURE_INSTRUCTIONS,
+            relocations,
+        )
+    }
+
+    fn zerofill_section(name: &str, size: u64, align: u32, flags: u32) -> ParsedSection {
+        ParsedSection {
+            name: name.into(),
+            segment: "__DATA".into(),
+            data: vec![],
+            addr: 0,
+            align,
+            flags,
+            relocations: vec![],
+            vmsize: size,
+        }
+    }
+
+    fn defined_symbol(name: &str, section: u8, value: u64, external: bool) -> ParsedSymbol {
+        ParsedSymbol {
+            name: name.into(),
+            n_type: N_SECT | if external { N_EXT } else { 0 },
+            section,
+            desc: 0,
+            value,
+        }
+    }
+
+    fn undefined_symbol(name: &str, weak: bool) -> ParsedSymbol {
+        ParsedSymbol {
+            name: name.into(),
+            n_type: N_UNDF | N_EXT,
+            section: 0,
+            desc: if weak { N_WEAK_REF } else { 0 },
+            value: 0,
+        }
+    }
+
+    fn parsed(sections: Vec<ParsedSection>, symbols: Vec<ParsedSymbol>) -> ParsedObject {
+        ParsedObject {
+            cputype: CPU_TYPE_ARM64,
+            cpusubtype: CPU_SUBTYPE_ARM64_ALL,
+            flags: 0,
+            sections,
+            symbols,
+        }
+    }
+
+    fn with_relocation(mut reloc: Relocation, edit: impl FnOnce(&mut Relocation)) -> Relocation {
+        edit(&mut reloc);
+        reloc
+    }
+
+    fn provider(symbols: &[&str]) -> DylibConfig {
+        DylibConfig {
+            dylibs: vec![DylibEntry {
+                install_name: "/usr/lib/libSystem.B.dylib".into(),
+                symbols: symbols.iter().map(|symbol| symbol.to_string()).collect(),
+            }],
+        }
+    }
+
+    fn section_flags(exe: &[u8], segment: &str, name: &str) -> u32 {
+        let commands = walk_load_commands(exe);
+        for command in commands
+            .iter()
+            .filter(|command| command.cmd == LC_SEGMENT_64)
+        {
+            for index in 0..rd_u32(exe, command.offset + 64) as usize {
+                let header = command.offset + SEGMENT_COMMAND_64_SIZE as usize + index * 80;
+                if read_name16(exe, header) == name && read_name16(exe, header + 16) == segment {
+                    return rd_u32(exe, header + 64);
+                }
+            }
+        }
+        panic!("missing {segment},{name}");
+    }
+
+    fn segment_flags(exe: &[u8], name: &str) -> u32 {
+        let commands = walk_load_commands(exe);
+        let command = commands
+            .iter()
+            .find(|command| {
+                command.cmd == LC_SEGMENT_64 && read_name16(exe, command.offset + 8) == name
+            })
+            .expect("segment");
+        rd_u32(exe, command.offset + 68)
+    }
+
+    fn file_offset_of(exe: &[u8], address: u64) -> usize {
+        let commands = walk_load_commands(exe);
+        let segment = segment_commands(exe, &commands)
+            .into_iter()
+            .find(|segment| (segment.vmaddr..segment.vmaddr + segment.filesize).contains(&address))
+            .expect("address is file-backed");
+        (segment.fileoff + address - segment.vmaddr) as usize
+    }
+
+    /// `ADRP Xd` + `LDR/ADD` decoded to the address they form.
+    fn page_pair_target(exe: &[u8], adrp_address: u64, second_address: u64, scale: u64) -> u64 {
+        let adrp = rd_u32(exe, file_offset_of(exe, adrp_address));
+        let second = rd_u32(exe, file_offset_of(exe, second_address));
+        assert_eq!(adrp & 0x9F00_0000, 0x9000_0000);
+        let immediate = (((adrp >> 5) & 0x7FFFF) << 2) | ((adrp >> 29) & 3);
+        let pages = (i64::from(immediate) << 43) >> 43;
+        let page = ((adrp_address & !0xFFF) as i64 + pages * 4096) as u64;
+        page + u64::from((second >> 10) & 0xFFF) * scale
+    }
+
+    fn text_addr(exe: &[u8]) -> u64 {
+        let commands = walk_load_commands(exe);
+        single_section(&section_commands(exe, &commands), "__TEXT", "__text").addr
+    }
+
+    #[test]
+    fn got_load_of_a_local_definition_is_a_rebased_slot_and_keeps_its_ldr() {
+        let object = parsed(
+            vec![
+                text_section(
+                    &[ADRP_X8, LDR_X8_X8, RET],
+                    vec![
+                        Relocation::got_load_page21(0, 1),
+                        Relocation::got_load_pageoff12(4, 1),
+                    ],
+                ),
+                input_section(
+                    "__data",
+                    "__DATA",
+                    7u64.to_le_bytes().to_vec(),
+                    3,
+                    S_REGULAR,
+                    vec![],
+                ),
+            ],
+            vec![
+                defined_symbol("_main", 1, 0, true),
+                defined_symbol("_counter", 2, 0, false),
+            ],
+        );
+        let exe = link(&[object]).unwrap();
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let got = single_section(&sections, "__DATA_CONST", "__got");
+        let data = single_section(&sections, "__DATA", "__data");
+        assert_eq!(got.size, 8);
+        assert_eq!(
+            section_flags(&exe, "__DATA_CONST", "__got") & SECTION_TYPE_MASK,
+            S_NON_LAZY_SYMBOL_POINTERS
+        );
+        assert_eq!(segment_flags(&exe, "__DATA_CONST"), SG_READ_ONLY);
+        assert_eq!(
+            decode_chained_fixups(&exe),
+            [(got.addr, DecodedFixup::Rebase(data.addr))]
+        );
+        let text = text_addr(&exe);
+        assert_eq!(page_pair_target(&exe, text, text + 4, 8), got.addr);
+        let ldr = rd_u32(&exe, file_offset_of(&exe, text + 4));
+        assert_eq!(ldr & 0xFFC0_0000, 0xF940_0000, "no GOT relaxation to ADD");
+        assert_dyld_linkedit_payloads(&exe, &[]);
+    }
+
+    #[test]
+    fn got_slots_deduplicate_bind_imports_null_weak_references_and_feed_pointer_to_got() {
+        let object = parsed(
+            vec![text_section(
+                &[
+                    ADRP_X8, LDR_X8_X8, ADRP_X8, LDR_X8_X8, ADRP_X8, LDR_X8_X8, RET, 0,
+                ],
+                vec![
+                    Relocation::got_load_page21(0, 1),
+                    Relocation::got_load_pageoff12(4, 1),
+                    Relocation::got_load_page21(8, 1),
+                    Relocation::got_load_pageoff12(12, 1),
+                    Relocation::got_load_page21(16, 2),
+                    Relocation::got_load_pageoff12(20, 2),
+                    Relocation::pointer_to_got_pcrel(28, 1),
+                ],
+            )],
+            vec![
+                defined_symbol("_main", 1, 0, true),
+                undefined_symbol("_imported", false),
+                undefined_symbol("_weak_missing", true),
+            ],
+        );
+        let exe = link_with_dylibs(&[object], &provider(&["_imported"])).unwrap();
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        assert!(
+            !sections.iter().any(|section| section.name == "__stubs"),
+            "GOT-only imports need no stub"
+        );
+        let got = single_section(&sections, "__DATA_CONST", "__got");
+        assert_eq!(got.size, 16, "one slot per distinct target");
+        let text = text_addr(&exe);
+        assert_eq!(page_pair_target(&exe, text, text + 4, 8), got.addr);
+        assert_eq!(page_pair_target(&exe, text + 8, text + 12, 8), got.addr);
+        assert_eq!(
+            page_pair_target(&exe, text + 16, text + 20, 8),
+            got.addr + 8
+        );
+        assert_eq!(
+            decode_chained_fixups(&exe),
+            [(
+                got.addr,
+                DecodedFixup::Bind {
+                    symbol: "_imported".into(),
+                    addend: 0
+                }
+            )]
+        );
+        assert_eq!(
+            rd_u64(&exe, file_offset_of(&exe, got.addr + 8)),
+            0,
+            "weak null slot"
+        );
+        let delta = rd_u32(&exe, file_offset_of(&exe, text + 28)) as i32;
+        assert_eq!(
+            i128::from(text + 28) + i128::from(delta),
+            i128::from(got.addr)
+        );
+        assert_dyld_linkedit_payloads(&exe, &["_imported"]);
+    }
+
+    fn pointer_object(
+        relocations: Vec<Relocation>,
+        data: Vec<u8>,
+        text_relocations: Vec<Relocation>,
+    ) -> ParsedObject {
+        parsed(
+            vec![
+                text_section(&[RET, 0, 0, 0], text_relocations),
+                input_section("__data", "__DATA", data, 3, S_REGULAR, relocations),
+            ],
+            vec![
+                defined_symbol("_main", 1, 0, true),
+                undefined_symbol("_imported", false),
+                undefined_symbol("_weak_missing", true),
+                defined_symbol("_data", 2, 0, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn data_pointers_rebase_definitions_bind_imports_and_keep_weak_nulls() {
+        let mut data = vec![0u8; 32];
+        data[0..8].copy_from_slice(&4u64.to_le_bytes());
+        data[8..16].copy_from_slice(&16u64.to_le_bytes());
+        data[16..24].copy_from_slice(&3u64.to_le_bytes());
+        let object = pointer_object(
+            vec![
+                Relocation::unsigned_ptr(0, 0),
+                Relocation::unsigned_ptr(8, 1),
+                Relocation::unsigned_ptr(16, 2),
+                // Section-relative pointer to this data section.
+                with_relocation(Relocation::unsigned_ptr(24, 2), |reloc| {
+                    reloc.is_extern = false
+                }),
+            ],
+            data,
+            vec![],
+        );
+        let exe = link_with_dylibs(&[object], &provider(&["_imported"])).unwrap();
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let data = single_section(&sections, "__DATA", "__data");
+        let text = text_addr(&exe);
+        assert_eq!(
+            decode_chained_fixups(&exe),
+            [
+                (data.addr, DecodedFixup::Rebase(text + 4)),
+                (
+                    data.addr + 8,
+                    DecodedFixup::Bind {
+                        symbol: "_imported".into(),
+                        addend: 16
+                    }
+                ),
+                (data.addr + 24, DecodedFixup::Rebase(data.addr)),
+            ]
+        );
+        assert_eq!(rd_u64(&exe, file_offset_of(&exe, data.addr + 16)), 3);
+        assert_dyld_linkedit_payloads(&exe, &["_imported"]);
+    }
+
+    #[test]
+    fn unslidable_or_direct_import_pointers_are_refused_by_name() {
+        let config = provider(&["_imported"]);
+        let link_one = |object: ParsedObject| link_with_dylibs(&[object], &config).unwrap_err();
+
+        let narrow = pointer_object(vec![Relocation::unsigned_word(0, 0)], vec![0; 8], vec![]);
+        assert!(matches!(
+            link_one(narrow),
+            LinkerError::UnslidablePointer { .. }
+        ));
+        let mut in_text = pointer_object(vec![], vec![0; 8], vec![Relocation::unsigned_ptr(8, 3)]);
+        in_text.sections[0].data = vec![0; 16];
+        assert!(matches!(
+            link_one(in_text),
+            LinkerError::UnslidablePointer { .. }
+        ));
+        let mut wide_addend = vec![0u8; 8];
+        wide_addend.copy_from_slice(&300u64.to_le_bytes());
+        let addend = pointer_object(vec![Relocation::unsigned_ptr(0, 1)], wide_addend, vec![]);
+        assert!(matches!(link_one(addend), LinkerError::ChainedFixup { .. }));
+        let misaligned = pointer_object(vec![Relocation::unsigned_ptr(4, 0)], vec![0; 16], vec![]);
+        assert!(matches!(
+            link_one(misaligned),
+            LinkerError::ChainedFixup { .. }
+        ));
+        let difference = pointer_object(
+            vec![
+                Relocation::subtractor(0, 1, 3),
+                Relocation::unsigned_ptr(0, 0),
+            ],
+            vec![0; 8],
+            vec![],
+        );
+        assert!(matches!(
+            link_one(difference),
+            LinkerError::DirectImportReference {
+                kind: AArch64RelocKind::Subtractor,
+                ..
+            }
+        ));
+        let mut page = pointer_object(vec![], vec![0; 8], vec![Relocation::page21(0, 1)]);
+        page.sections[0].data = words(&[ADRP_X8]);
+        assert!(matches!(
+            link_one(page),
+            LinkerError::DirectImportReference { kind: AArch64RelocKind::Page21, ref symbol } if symbol == "_imported"
+        ));
+        let pc_relative = pointer_object(
+            vec![with_relocation(Relocation::unsigned_ptr(0, 0), |reloc| {
+                reloc.pc_relative = true
+            })],
+            vec![0; 8],
+            vec![],
+        );
+        assert!(matches!(
+            link_one(pc_relative),
+            LinkerError::PcRelativeUnsigned { offset: 0 }
+        ));
+    }
+
+    /// One object defining a TLV `name` with a template in `template` and a
+    /// `_reader` (when `reader`) that loads it through TLVP relocations.
+    fn tlv_object(name: &str, template: ParsedSection, reader: bool) -> ParsedObject {
+        let text = if reader {
+            text_section(
+                &[ADRP_X8, LDR_X8_X8, RET],
+                vec![
+                    Relocation::tlvp_load_page21(0, 1),
+                    Relocation::tlvp_load_pageoff12(4, 1),
+                ],
+            )
+        } else {
+            text_section(&[RET], vec![])
+        };
+        let vars = input_section(
+            "__thread_vars",
+            "__DATA",
+            vec![0; 24],
+            3,
+            S_THREAD_LOCAL_VARIABLES,
+            vec![
+                Relocation::unsigned_ptr(0, 3),
+                Relocation::unsigned_ptr(16, 2),
+            ],
+        );
+        parsed(
+            vec![text, vars, template],
+            vec![
+                defined_symbol(if reader { "_main" } else { "_other" }, 1, 0, true),
+                defined_symbol(&format!("_{name}"), 2, 0, true),
+                defined_symbol(&format!("_{name}$tlv$init"), 3, 0, false),
+                undefined_symbol(TLV_BOOTSTRAP_SYMBOL, false),
+            ],
+        )
+    }
+
+    #[test]
+    fn tlv_descriptors_bind_the_bootstrap_and_offset_templates_across_objects() {
+        let first = tlv_object(
+            "first",
+            input_section(
+                "__thread_data",
+                "__DATA",
+                11u64.to_le_bytes().to_vec(),
+                3,
+                S_THREAD_LOCAL_REGULAR,
+                vec![],
+            ),
+            true,
+        );
+        let second = tlv_object(
+            "second",
+            zerofill_section("__thread_bss", 16, 4, S_THREAD_LOCAL_ZEROFILL),
+            false,
+        );
+        let exe = link_with_dylibs(&[first, second], &DylibConfig::with_libsystem()).unwrap();
+        assert_ne!(rd_u32(&exe, 24) & MH_HAS_TLV_DESCRIPTORS, 0);
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let pointers = single_section(&sections, "__DATA_CONST", "__thread_ptrs");
+        let vars = single_section(&sections, "__DATA", "__thread_vars");
+        let data = single_section(&sections, "__DATA", "__thread_data");
+        let bss = single_section(&sections, "__DATA", "__thread_bss");
+        assert_eq!(
+            section_flags(&exe, "__DATA_CONST", "__thread_ptrs"),
+            S_THREAD_LOCAL_VARIABLE_POINTERS
+        );
+        assert_eq!(
+            section_flags(&exe, "__DATA", "__thread_vars"),
+            S_THREAD_LOCAL_VARIABLES
+        );
+        assert_eq!(
+            section_flags(&exe, "__DATA", "__thread_data"),
+            S_THREAD_LOCAL_REGULAR
+        );
+        assert_eq!(
+            section_flags(&exe, "__DATA", "__thread_bss"),
+            S_THREAD_LOCAL_ZEROFILL
+        );
+        assert_eq!(bss.offset, 0, "zero-fill template has no file bytes");
+        assert_eq!(vars.size, 48);
+        assert_eq!((data.size, bss.size), (8, 16));
+        assert_eq!(
+            bss.addr,
+            data.addr + 16,
+            "templates stay contiguous, 16-aligned"
+        );
+        let text = text_addr(&exe);
+        assert_eq!(page_pair_target(&exe, text, text + 4, 8), pointers.addr);
+        let bind = |address| {
+            (
+                address,
+                DecodedFixup::Bind {
+                    symbol: TLV_BOOTSTRAP_SYMBOL.into(),
+                    addend: 0,
+                },
+            )
+        };
+        assert_eq!(
+            decode_chained_fixups(&exe),
+            [
+                (pointers.addr, DecodedFixup::Rebase(vars.addr)),
+                bind(vars.addr),
+                bind(vars.addr + 24),
+            ]
+        );
+        let offset_word =
+            |descriptor: u64| rd_u64(&exe, file_offset_of(&exe, vars.addr + descriptor * 24 + 16));
+        assert_eq!(offset_word(0), 0);
+        assert_eq!(offset_word(1), bss.addr - data.addr);
+        assert_eq!(rd_u64(&exe, file_offset_of(&exe, vars.addr + 8)), 0, "key");
+        assert_eq!(rd_u64(&exe, file_offset_of(&exe, data.addr)), 11);
+        assert_dyld_linkedit_payloads(&exe, &[TLV_BOOTSTRAP_SYMBOL]);
+    }
+
+    #[test]
+    fn empty_overaligned_leading_tls_template_does_not_shift_descriptor_offsets() {
+        // An empty `__thread_data` input placed first, aligned beyond every
+        // non-empty template, starts the emitted section past the aligned
+        // cursor. dyld copies templates from that section start, so the
+        // descriptor offset must stay relative to it.
+        let empty = parsed(
+            vec![
+                text_section(&[RET], vec![]),
+                input_section(
+                    "__thread_data",
+                    "__DATA",
+                    vec![],
+                    5,
+                    S_THREAD_LOCAL_REGULAR,
+                    vec![],
+                ),
+            ],
+            vec![defined_symbol("_other", 1, 0, true)],
+        );
+        let reader = tlv_object(
+            "value",
+            input_section(
+                "__thread_data",
+                "__DATA",
+                11u64.to_le_bytes().to_vec(),
+                3,
+                S_THREAD_LOCAL_REGULAR,
+                vec![],
+            ),
+            true,
+        );
+        let exe = link_with_dylibs(&[empty, reader], &DylibConfig::with_libsystem()).unwrap();
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let vars = single_section(&sections, "__DATA", "__thread_vars");
+        let data = single_section(&sections, "__DATA", "__thread_data");
+        assert_eq!(data.addr % 32, 0, "the empty input keeps its alignment");
+        assert_ne!(
+            data.addr,
+            align_to(vars.addr + vars.size, 8),
+            "control: the section starts past the template-aligned cursor"
+        );
+        assert_eq!(data.size, 8);
+        assert_eq!(rd_u64(&exe, file_offset_of(&exe, data.addr)), 11);
+        assert_eq!(
+            rd_u64(&exe, file_offset_of(&exe, vars.addr + 16)),
+            0,
+            "the only template starts the emitted __thread_data"
+        );
+    }
+
+    #[test]
+    fn tlvp_load_of_a_dylib_thread_local_binds_its_pointer_slot() {
+        // An executable that only imports a thread-local has no descriptors
+        // of its own: dyld binds the `__thread_ptrs` slot to the provider's
+        // descriptor, and the LDR is kept.
+        let object = parsed(
+            vec![text_section(
+                &[ADRP_X8, LDR_X8_X8, RET],
+                vec![
+                    Relocation::tlvp_load_page21(0, 1),
+                    Relocation::tlvp_load_pageoff12(4, 1),
+                ],
+            )],
+            vec![
+                defined_symbol("_main", 1, 0, true),
+                undefined_symbol("_provided_tls", false),
+            ],
+        );
+        let exe = link_with_dylibs(&[object], &provider(&["_provided_tls"])).unwrap();
+        assert_eq!(rd_u32(&exe, 24) & MH_HAS_TLV_DESCRIPTORS, 0);
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let pointers = single_section(&sections, "__DATA_CONST", "__thread_ptrs");
+        assert_eq!(pointers.size, 8);
+        assert_eq!(
+            decode_chained_fixups(&exe),
+            [(
+                pointers.addr,
+                DecodedFixup::Bind {
+                    symbol: "_provided_tls".into(),
+                    addend: 0,
+                },
+            )]
+        );
+        let text = text_addr(&exe);
+        assert_eq!(page_pair_target(&exe, text, text + 4, 8), pointers.addr);
+        let ldr = rd_u32(&exe, file_offset_of(&exe, text + 4));
+        assert_eq!(ldr & 0xFFC0_0000, 0xF940_0000, "no TLVP relaxation");
+        assert_dyld_linkedit_payloads(&exe, &["_provided_tls"]);
+    }
+
+    #[test]
+    fn over_aligned_read_only_after_fixup_data_does_not_widen_thread_pointers() {
+        // One TLV pointer slot ends 8 bytes into the page; a 16-byte-aligned
+        // `__DATA,__const` input then starts 16 bytes in. The alignment gap
+        // belongs to neither section: `__thread_ptrs` keeps exactly its slot.
+        let object = parsed(
+            vec![
+                text_section(
+                    &[ADRP_X8, LDR_X8_X8, RET],
+                    vec![
+                        Relocation::tlvp_load_page21(0, 1),
+                        Relocation::tlvp_load_pageoff12(4, 1),
+                    ],
+                ),
+                input_section("__const", "__DATA", vec![0x5A; 16], 4, S_REGULAR, vec![]),
+            ],
+            vec![
+                defined_symbol("_main", 1, 0, true),
+                undefined_symbol("_provided_tls", false),
+                defined_symbol("_table", 2, 0, true),
+            ],
+        );
+        let exe = link_with_dylibs(&[object], &provider(&["_provided_tls"])).unwrap();
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let pointers = single_section(&sections, "__DATA_CONST", "__thread_ptrs");
+        let constant = single_section(&sections, "__DATA_CONST", "__const");
+        assert_eq!(pointers.size, 8);
+        assert_eq!(constant.addr, pointers.addr + 16);
+        assert_eq!(constant.size, 16);
+        assert_eq!(
+            rd_u64(&exe, file_offset_of(&exe, constant.addr)),
+            0x5A5A_5A5A_5A5A_5A5A
+        );
+    }
+
+    #[test]
+    fn malformed_tlv_descriptors_and_references_are_refused_by_name() {
+        let config = DylibConfig::with_libsystem();
+        let template = || {
+            input_section(
+                "__thread_data",
+                "__DATA",
+                vec![0; 8],
+                3,
+                S_THREAD_LOCAL_REGULAR,
+                vec![],
+            )
+        };
+        let refused = |object: ParsedObject| {
+            let error = link_with_dylibs(&[object], &config).unwrap_err();
+            assert!(matches!(error, LinkerError::ThreadLocal(_)), "{error:?}");
+        };
+        let mut short = tlv_object("v", template(), true);
+        short.sections[1].data.truncate(20);
+        refused(short);
+        let mut keyed = tlv_object("v", template(), true);
+        keyed.sections[1].data[8] = 1;
+        refused(keyed);
+        let mut regular_template = tlv_object("v", template(), true);
+        regular_template.sections[2].flags = S_REGULAR;
+        refused(regular_template);
+        let mut missing_thunk = tlv_object("v", template(), true);
+        missing_thunk.sections[1].relocations.remove(0);
+        refused(missing_thunk);
+        let mut wrong_thunk = tlv_object("v", template(), true);
+        wrong_thunk.symbols[3].name = "_exit".into();
+        refused(wrong_thunk);
+        let mut aligned = tlv_object("v", template(), true);
+        aligned.sections[2].align = 5;
+        refused(aligned);
+        let mut in_text = tlv_object("v", template(), true);
+        in_text.sections[2].segment = "__TEXT".into();
+        refused(in_text);
+        // GOT loads and direct page references may not name a TLV.
+        let mut got = tlv_object("v", template(), true);
+        got.sections[0].relocations = vec![
+            Relocation::got_load_page21(0, 1),
+            Relocation::got_load_pageoff12(4, 1),
+        ];
+        refused(got);
+        let mut template_reference = tlv_object("v", template(), true);
+        template_reference.sections[0].relocations = vec![Relocation::page21(0, 2)];
+        refused(template_reference);
+        // A TLVP load of an undefined weak variable would call a null thunk.
+        let mut weak = tlv_object("v", template(), true);
+        weak.symbols.push(undefined_symbol("_missing", true));
+        weak.sections[0].relocations = vec![
+            Relocation::tlvp_load_page21(0, 4),
+            Relocation::tlvp_load_pageoff12(4, 4),
+        ];
+        refused(weak);
+        // TLVP loads keep their 64-bit LDR; an ADD is not relaxed or accepted.
+        let mut add = tlv_object("v", template(), true);
+        add.sections[0].data[4..8].copy_from_slice(&ADD_X8_X8.to_le_bytes());
+        assert!(matches!(
+            link_with_dylibs(&[add], &config),
+            Err(LinkerError::RelocationInstructionMismatch {
+                kind: AArch64RelocKind::TlvpLoadPageoff12,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn addend_pairs_offset_page_references_and_malformed_pairs_are_refused() {
+        let addend = |value: i32| {
+            with_relocation(
+                Relocation::page21(0, (value as u32) & 0x00FF_FFFF),
+                |reloc| {
+                    reloc.kind = AArch64RelocKind::Addend;
+                    reloc.is_extern = false;
+                    reloc.pc_relative = false;
+                },
+            )
+        };
+        let mut addend_at_4 = addend(8);
+        addend_at_4.offset = 4;
+        let object = pointer_object(
+            vec![],
+            vec![0; 16],
+            vec![
+                addend(8),
+                Relocation::page21(0, 3),
+                addend_at_4,
+                Relocation::pageoff12(4, 3),
+            ],
+        );
+        let mut object = object;
+        object.sections[0].data = words(&[ADRP_X8, ADD_X8_X8, RET]);
+        let exe =
+            link_with_dylibs(std::slice::from_ref(&object), &provider(&["_imported"])).unwrap();
+        let commands = walk_load_commands(&exe);
+        let data = single_section(&section_commands(&exe, &commands), "__DATA", "__data").addr;
+        let text = text_addr(&exe);
+        assert_eq!(page_pair_target(&exe, text, text + 4, 1), data + 8);
+
+        for relocations in [
+            vec![addend(8)],
+            vec![addend(8), Relocation::got_load_page21(0, 3)],
+            vec![
+                with_relocation(addend(8), |reloc| reloc.is_extern = true),
+                Relocation::page21(0, 3),
+            ],
+        ] {
+            let mut malformed = object.clone();
+            malformed.sections[0].relocations = relocations;
+            assert!(matches!(
+                link_with_dylibs(&[malformed], &provider(&["_imported"])),
+                Err(LinkerError::MalformedRelocation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn pageoff12_scales_by_access_size_and_refuses_truncation() {
+        let symbols = vec![undefined_symbol("_target", false)];
+        let patch = |instruction: u32, target: u64| {
+            let mut data = instruction.to_le_bytes().to_vec();
+            let addresses = HashMap::from([("_target".to_string(), target)]);
+            RelocationApplicator::apply(
+                &mut data,
+                DEFAULT_BASE_ADDR,
+                &[Relocation::pageoff12(0, 0)],
+                &symbols,
+                &addresses,
+                &[],
+            )
+            .map(|()| (u32::from_le_bytes(data[..4].try_into().unwrap()) >> 10) & 0xFFF)
+        };
+        let base = DEFAULT_BASE_ADDR + 0x4000;
+        assert_eq!(
+            patch(0x3DC0_0100, base + 0x30).unwrap(),
+            3,
+            "LDR Q scales by 16"
+        );
+        assert_eq!(
+            patch(0xB940_0108, base + 0x34).unwrap(),
+            13,
+            "LDR W scales by 4"
+        );
+        assert_eq!(
+            patch(0x3940_0108, base + 0x35).unwrap(),
+            0x35,
+            "LDRB is byte-scaled"
+        );
+        assert_eq!(
+            patch(0xF900_0108, base + 0x38).unwrap(),
+            7,
+            "STR X scales by 8"
+        );
+        assert_eq!(patch(ADD_X8_X8, base + 0x35).unwrap(), 0x35);
+        assert!(matches!(
+            patch(0x3DC0_0100, base + 0x38),
+            Err(LinkerError::RelocationOverflow { .. })
+        ));
+        assert!(matches!(
+            patch(0xD280_0000, base),
+            Err(LinkerError::RelocationInstructionMismatch { .. })
+        ));
+        // The low-level applicator has no GOT/TLV slots and refuses those kinds.
+        let mut data = LDR_X8_X8.to_le_bytes().to_vec();
+        assert!(matches!(
+            RelocationApplicator::apply(
+                &mut data,
+                DEFAULT_BASE_ADDR,
+                &[Relocation::got_load_pageoff12(0, 0)],
+                &symbols,
+                &HashMap::from([("_target".to_string(), base)]),
+                &[],
+            ),
+            Err(LinkerError::UnsupportedRelocation(
+                AArch64RelocKind::GotLoadPageoff12
+            ))
+        ));
+    }
+
+    #[test]
+    fn parser_keeps_zerofill_sections_out_of_the_file() {
+        let mut writer = MachOWriter::new();
+        writer.add_text_section(&RET.to_le_bytes());
+        writer.add_custom_section(
+            b"__thread_bss",
+            b"__DATA",
+            &[0xAA; 16],
+            3,
+            S_THREAD_LOCAL_ZEROFILL,
+        );
+        writer.add_custom_section(b"__bss", b"__DATA", &[0xBB; 32], 4, S_ZEROFILL);
+        writer.add_symbol("_main", 1, 0, true).unwrap();
+        let mut bytes = writer.write().unwrap();
+        // Zero-fill sections conventionally name file offset 0 (the header)
+        // and may be larger than the whole object.
+        let commands = walk_load_commands(&bytes);
+        let segment = commands
+            .iter()
+            .find(|command| command.cmd == LC_SEGMENT_64)
+            .unwrap();
+        for index in 0..rd_u32(&bytes, segment.offset + 64) as usize {
+            let header = segment.offset + SEGMENT_COMMAND_64_SIZE as usize + index * 80;
+            if read_name16(&bytes, header) == "__bss" {
+                patch_u32(&mut bytes, header + 48, 0);
+                bytes[header + 40..header + 48].copy_from_slice(&(1u64 << 20).to_le_bytes());
+            } else if read_name16(&bytes, header) == "__thread_bss" {
+                patch_u32(&mut bytes, header + 48, 0);
+            }
+        }
+        let object = MachOParser::parse(&bytes).unwrap();
+        let tbss = object
+            .sections
+            .iter()
+            .find(|section| section.name == "__thread_bss")
+            .unwrap();
+        let bss = object
+            .sections
+            .iter()
+            .find(|section| section.name == "__bss")
+            .unwrap();
+        assert!(
+            tbss.data.is_empty() && bss.data.is_empty(),
+            "no header bytes"
+        );
+        assert!(tbss.is_zerofill() && bss.is_zerofill());
+        assert_eq!((tbss.effective_size(), bss.effective_size()), (16, 1 << 20));
+    }
+
+    #[test]
+    fn debug_sections_are_not_loaded_and_references_into_them_fail() {
+        let unwind = input_section(
+            "__compact_unwind",
+            "__LD",
+            vec![0; 32],
+            3,
+            S_REGULAR | S_ATTR_DEBUG,
+            vec![with_relocation(Relocation::unsigned_ptr(0, 1), |reloc| {
+                reloc.is_extern = false
+            })],
+        );
+        let object = parsed(
+            vec![text_section(&[RET], vec![]), unwind.clone()],
+            vec![
+                defined_symbol("_main", 1, 0, true),
+                defined_symbol("ltmp1", 2, 0, false),
+            ],
+        );
+        let exe = link(std::slice::from_ref(&object)).unwrap();
+        let commands = walk_load_commands(&exe);
+        assert!(
+            !segment_commands(&exe, &commands)
+                .iter()
+                .any(|segment| segment.name == "__DATA"),
+            "debug input is not loaded"
+        );
+        assert!(decode_chained_fixups(&exe).is_empty());
+        let mut referencing = object;
+        referencing.sections[0] = text_section(&[ADRP_X8, RET], vec![Relocation::page21(0, 1)]);
+        assert!(matches!(
+            link(&[referencing]),
+            Err(LinkerError::UnloadedSectionReference(ref section)) if section == "__LD,__compact_unwind"
+        ));
+    }
+
+    #[test]
+    fn section_types_needing_unimplemented_linker_work_are_refused() {
+        for section_type in [
+            S_MOD_INIT_FUNC_POINTERS,
+            S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
+            S_LAZY_SYMBOL_POINTERS,
+        ] {
+            let object = parsed(
+                vec![
+                    text_section(&[RET], vec![]),
+                    input_section("__special", "__DATA", vec![0; 8], 3, section_type, vec![]),
+                ],
+                vec![defined_symbol("_main", 1, 0, true)],
+            );
+            assert!(matches!(
+                link(&[object]),
+                Err(LinkerError::UnsupportedSectionType { section_type: found, .. }) if found == section_type
+            ));
+        }
+    }
+
+    #[test]
+    fn chained_fixups_chain_within_pages_and_restart_on_each_page() {
+        let size = PAGE_SIZE as usize * 2 + 64;
+        let pointers = [
+            0u32,
+            8,
+            4096,
+            PAGE_SIZE as u32 + 16,
+            PAGE_SIZE as u32 * 2 + 8,
+        ];
+        let object = pointer_object(
+            pointers
+                .iter()
+                .map(|&offset| Relocation::unsigned_ptr(offset, 3))
+                .collect(),
+            vec![0; size],
+            vec![],
+        );
+        let exe = link_with_dylibs(&[object], &provider(&["_imported"])).unwrap();
+        let commands = walk_load_commands(&exe);
+        let data = single_section(&section_commands(&exe, &commands), "__DATA", "__data").addr;
+        let decoded = decode_chained_fixups(&exe);
+        assert_eq!(
+            decoded,
+            pointers
+                .iter()
+                .map(|&offset| (data + u64::from(offset), DecodedFixup::Rebase(data)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn chain_encoder_rejects_unrepresentable_fixups() {
+        let encode = |fixups: &mut [PointerFixup], bytes: usize| {
+            let mut data = vec![0; bytes];
+            encode_segment_chains(
+                3,
+                DEFAULT_BASE_ADDR + PAGE_SIZE,
+                DEFAULT_BASE_ADDR,
+                &mut data,
+                fixups,
+            )
+        };
+        let base = DEFAULT_BASE_ADDR + PAGE_SIZE;
+        let rebase = |address, target| PointerFixup {
+            address,
+            kind: PointerFixupKind::Rebase { target },
+        };
+        for (mut fixups, bytes) in [
+            (vec![rebase(base, DYLD_CHAINED_PTR_64_TARGET_LIMIT)], 8),
+            (
+                vec![PointerFixup {
+                    address: base,
+                    kind: PointerFixupKind::Bind {
+                        import: DYLD_CHAINED_PTR_64_BIND_ORDINAL_LIMIT,
+                        addend: 0,
+                    },
+                }],
+                8,
+            ),
+            (vec![rebase(base + 4, base)], 16),
+            (vec![rebase(base + 8, base)], 8),
+            (vec![rebase(base - 8, base)], 8),
+        ] {
+            assert!(matches!(
+                encode(&mut fixups, bytes),
+                Err(LinkerError::ChainedFixup { .. })
+            ));
+        }
+        let mut duplicate = [rebase(base, base), rebase(base, base)];
+        assert!(encode(&mut duplicate, 8).is_err());
+        let mut ok = [rebase(base + 8, base), rebase(base, base + 8)];
+        let info = encode(&mut ok, 16).unwrap().unwrap();
+        assert_eq!(info.segment_index, 3);
+        assert_eq!(info.segment_offset, PAGE_SIZE);
+        assert_eq!(info.page_starts, [(0, 0)]);
+    }
+
+    // =======================================================================
+    // MH_DYLIB output and exports trie
+    // =======================================================================
+
+    fn read_uleb128(bytes: &[u8], cursor: &mut usize) -> u64 {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[*cursor];
+            *cursor += 1;
+            value |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    /// Walk an exports trie the way dyld does: every root-to-terminal path
+    /// spells one exported name.
+    fn walk_exports_trie(trie: &[u8]) -> Vec<(String, u64, u64)> {
+        let mut found = Vec::new();
+        let mut pending = vec![(0usize, Vec::new())];
+        let mut visited = 0;
+        while let Some((node, prefix)) = pending.pop() {
+            visited += 1;
+            assert!(visited <= trie.len(), "trie cycles");
+            let mut cursor = node;
+            let terminal_size = read_uleb128(trie, &mut cursor) as usize;
+            let children_at = cursor + terminal_size;
+            if terminal_size != 0 {
+                let flags = read_uleb128(trie, &mut cursor);
+                let address = read_uleb128(trie, &mut cursor);
+                assert_eq!(cursor, children_at, "terminal size covers its payload");
+                found.push((String::from_utf8(prefix.clone()).unwrap(), flags, address));
+            }
+            cursor = children_at;
+            let children = trie[cursor];
+            cursor += 1;
+            for _ in 0..children {
+                let end = cursor + trie[cursor..].iter().position(|&byte| byte == 0).unwrap();
+                let mut name = prefix.clone();
+                name.extend_from_slice(&trie[cursor..end]);
+                cursor = end + 1;
+                let child = read_uleb128(trie, &mut cursor) as usize;
+                assert!(child < trie.len() && child != node);
+                pending.push((child, name));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn exports_trie_round_trips_through_an_independent_walker() {
+        assert_eq!(build_exports_trie(&[]).unwrap(), EMPTY_EXPORTS_TRIE);
+        // Shared prefixes, a name that is a prefix of another, and offsets
+        // wide enough that child offsets need multi-byte ULEB128 fixpoints.
+        let mut exports: Vec<ExportEntry> = [
+            "_a", "_ab", "_abc", "_abd", "_b", "_cg_add", "_cg_tls", "_zz",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, name)| ExportEntry {
+            name: (*name).into(),
+            flags: if name.ends_with("tls") {
+                EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL
+            } else {
+                EXPORT_SYMBOL_FLAGS_KIND_REGULAR
+            },
+            offset: 0x4000 + (index as u64) * 0x1_0000_0001,
+        })
+        .collect();
+        for index in 0..300 {
+            exports.push(ExportEntry {
+                name: format!("_many_{index:03}_{}", "x".repeat(index % 7)),
+                flags: 0,
+                offset: index as u64 * 24,
+            });
+        }
+        let trie = build_exports_trie(&exports).unwrap();
+        let mut expected: Vec<_> = exports
+            .iter()
+            .map(|export| (export.name.clone(), export.flags, export.offset))
+            .collect();
+        expected.sort();
+        assert_eq!(walk_exports_trie(&trie), expected);
+        let mut duplicate = exports[..2].to_vec();
+        duplicate[1].name = duplicate[0].name.clone();
+        assert!(build_exports_trie(&duplicate).is_err());
+    }
+
+    fn dylib_object() -> ParsedObject {
+        let mut object = tlv_object(
+            "tls_value",
+            input_section(
+                "__thread_data",
+                "__DATA",
+                9u64.to_le_bytes().to_vec(),
+                3,
+                S_THREAD_LOCAL_REGULAR,
+                vec![],
+            ),
+            true,
+        );
+        // Section 4: exported data holding a pointer to its own text.
+        object.sections.push(input_section(
+            "__data",
+            "__DATA",
+            vec![0; 8],
+            3,
+            S_REGULAR,
+            vec![Relocation::unsigned_ptr(0, 0)],
+        ));
+        object.symbols[0].name = "_reader".into();
+        object.symbols.extend([
+            defined_symbol("_value", 4, 0, true),
+            ParsedSymbol {
+                name: "_hidden".into(),
+                n_type: N_SECT | N_EXT | N_PEXT,
+                section: 1,
+                desc: 0,
+                value: 4,
+            },
+            defined_symbol("_local", 1, 8, false),
+        ]);
+        object
+    }
+
+    #[test]
+    fn dylib_images_are_based_at_zero_named_by_id_and_export_their_definitions() {
+        let install_name = "@executable_path/libtrust.dylib";
+        let dylib = link_dylib(
+            &[dylib_object()],
+            &DylibConfig::with_libsystem(),
+            install_name,
+        )
+        .unwrap();
+        assert_eq!(rd_u32(&dylib, 12), MH_DYLIB);
+        assert_eq!(rd_u32(&dylib, 24), MH_DYLIB_FLAGS | MH_HAS_TLV_DESCRIPTORS);
+        let commands = walk_load_commands(&dylib);
+        for absent in [LC_MAIN, LC_LOAD_DYLINKER] {
+            assert_eq!(count_load_command(&commands, absent), 0);
+        }
+        let id = single_load_command(&commands, LC_ID_DYLIB);
+        assert_eq!(
+            read_cstring(&dylib, id.offset + rd_u32(&dylib, id.offset + 8) as usize),
+            install_name
+        );
+        let segments = segment_commands(&dylib, &commands);
+        assert_eq!(segments[0].name, "__TEXT");
+        assert_eq!((segments[0].vmaddr, segments[0].fileoff), (0, 0));
+        let sections = section_commands(&dylib, &commands);
+        let text = single_section(&sections, "__TEXT", "__text");
+        let vars = single_section(&sections, "__DATA", "__thread_vars");
+        let data = single_section(&sections, "__DATA", "__data");
+        let pointers = single_section(&sections, "__DATA_CONST", "__thread_ptrs");
+        // Rebase targets are image offsets from base 0.
+        let fixups = decode_chained_fixups(&dylib);
+        assert!(fixups.contains(&(data.addr, DecodedFixup::Rebase(text.addr))));
+        assert!(fixups.contains(&(pointers.addr, DecodedFixup::Rebase(vars.addr))));
+        let exports_command =
+            linkedit_data_command(&dylib, single_load_command(&commands, LC_DYLD_EXPORTS_TRIE));
+        let start = exports_command.dataoff as usize;
+        let exports = walk_exports_trie(&dylib[start..start + exports_command.datasize as usize]);
+        assert_eq!(
+            exports,
+            [
+                (
+                    "_reader".to_string(),
+                    EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+                    text.addr
+                ),
+                (
+                    "_tls_value".to_string(),
+                    EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL,
+                    vars.addr
+                ),
+                (
+                    "_value".to_string(),
+                    EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+                    data.addr
+                ),
+            ],
+            "private-extern and local symbols stay unexported"
+        );
+        // Only the main executable's code directory claims MAIN_BINARY.
+        let signature =
+            linkedit_data_command(&dylib, single_load_command(&commands, LC_CODE_SIGNATURE));
+        let code_directory = signature.dataoff as usize + CS_BLOB_HEADERS_SIZE;
+        assert_eq!(rd_be_u64(&dylib, code_directory + 80), 0);
+        let again = link_dylib(
+            &[dylib_object()],
+            &DylibConfig::with_libsystem(),
+            install_name,
+        )
+        .unwrap();
+        assert_eq!(dylib, again, "dylib output is deterministic");
+    }
+
+    #[test]
+    fn dylib_refuses_weak_thread_locals_templates_and_malformed_install_names() {
+        let mut weak = dylib_object();
+        weak.symbols[1].desc = N_WEAK_DEF;
+        assert!(matches!(
+            link_dylib(&[weak], &DylibConfig::with_libsystem(), "@rpath/libx.dylib"),
+            Err(LinkerError::UnsupportedDylibExport { ref symbol, .. }) if symbol == "_tls_value"
+        ));
+        let mut template = dylib_object();
+        template.symbols[2].n_type |= N_EXT;
+        assert!(matches!(
+            link_dylib(
+                &[template],
+                &DylibConfig::with_libsystem(),
+                "@rpath/libx.dylib"
+            ),
+            Err(LinkerError::UnsupportedDylibExport { .. })
+        ));
+        for name in ["", "bad\0name"] {
+            assert!(matches!(
+                link_dylib(&[dylib_object()], &DylibConfig::with_libsystem(), name),
+                Err(LinkerError::MalformedInput { .. })
+            ));
+        }
+    }
+
+    const BL: u32 = 0x9400_0000;
+    const MOVZ_X0_1: u32 = 0xD280_0020;
+
+    /// `_entry` calls `_weak_fn` (a weak definition later in `__text`) and
+    /// loads `_weak_data`'s GOT slot; `__DATA,__const` points at `_weak_data`
+    /// and at `_strong_data`. `_hidden_weak` is weak but private extern.
+    fn weak_object() -> ParsedObject {
+        let text = text_section(
+            &[BL, ADRP_X8, LDR_X8_X8, RET, MOVZ_X0_1, RET],
+            vec![
+                Relocation::branch26(0, 1),
+                Relocation::got_load_page21(4, 2),
+                Relocation::got_load_pageoff12(8, 2),
+            ],
+        );
+        let data = input_section("__data", "__DATA", vec![7; 24], 3, S_REGULAR, vec![]);
+        let constant = input_section(
+            "__const",
+            "__DATA",
+            vec![0; 16],
+            3,
+            S_REGULAR,
+            vec![
+                Relocation::unsigned_ptr(0, 2),
+                Relocation::unsigned_ptr(8, 3),
+            ],
+        );
+        let weak = |mut symbol: ParsedSymbol| {
+            symbol.desc = N_WEAK_DEF;
+            symbol
+        };
+        let mut hidden_weak = weak(defined_symbol("_hidden_weak", 2, 16, true));
+        hidden_weak.n_type |= N_PEXT;
+        parsed(
+            vec![text, data, constant],
+            vec![
+                defined_symbol("_entry", 1, 0, true),
+                weak(defined_symbol("_weak_fn", 1, 16, true)),
+                weak(defined_symbol("_weak_data", 2, 0, true)),
+                defined_symbol("_strong_data", 2, 8, true),
+                hidden_weak,
+            ],
+        )
+    }
+
+    fn main_object() -> ParsedObject {
+        parsed(
+            vec![text_section(&[RET], vec![])],
+            vec![defined_symbol("_main", 1, 0, true)],
+        )
+    }
+
+    fn import_ordinals(image: &[u8]) -> Vec<(String, u32)> {
+        let commands = walk_load_commands(image);
+        let payload = linkedit_data_command(
+            image,
+            single_load_command(&commands, LC_DYLD_CHAINED_FIXUPS),
+        );
+        let start = payload.dataoff as usize;
+        let imports = start + rd_u32(image, start + 8) as usize;
+        let symbols = start + rd_u32(image, start + 12) as usize;
+        (0..rd_u32(image, start + 16) as usize)
+            .map(|index| {
+                let entry = rd_u32(image, imports + index * 4);
+                assert_eq!((entry >> 8) & 1, 0, "no weak-import bit");
+                (
+                    read_cstring(image, symbols + (entry >> 9) as usize),
+                    entry & 0xFF,
+                )
+            })
+            .collect()
+    }
+
+    fn branch_target(image: &[u8], text: &SectionCommand, offset: u64) -> u64 {
+        let word = rd_u32(image, text.offset as usize + offset as usize);
+        assert_eq!(word & 0xFC00_0000, BL, "BL expected");
+        let delta = ((i64::from(word & 0x03FF_FFFF) << 38) >> 36) as u64;
+        (text.addr + offset).wrapping_add(delta)
+    }
+
+    #[test]
+    fn dylib_weak_definitions_are_exported_weak_and_bound_through_weak_lookup() {
+        let dylib = link_dylib(
+            &[weak_object()],
+            &DylibConfig::with_libsystem(),
+            "@rpath/libweak.dylib",
+        )
+        .unwrap();
+        assert_eq!(
+            rd_u32(&dylib, 24),
+            MH_DYLIB_FLAGS | MH_WEAK_DEFINES | MH_BINDS_TO_WEAK
+        );
+        let commands = walk_load_commands(&dylib);
+        let sections = section_commands(&dylib, &commands);
+        let text = single_section(&sections, "__TEXT", "__text");
+        let stubs = single_section(&sections, "__TEXT", "__stubs");
+        let got = single_section(&sections, "__DATA_CONST", "__got");
+        let constant = single_section(&sections, "__DATA_CONST", "__const");
+        let data = single_section(&sections, "__DATA", "__data");
+        assert_eq!(
+            section_flags(&dylib, "__DATA_CONST", "__const"),
+            S_REGULAR,
+            "relocated constants keep S_REGULAR in the read-only segment"
+        );
+        // The call goes through the stub, never straight to this image's copy.
+        assert_eq!(branch_target(&dylib, text, 0), stubs.addr);
+        assert_eq!(stubs.size, u64::from(STUB_SIZE));
+        let fixups = decode_chained_fixups(&dylib);
+        let bind = |symbol: &str| DecodedFixup::Bind {
+            symbol: symbol.into(),
+            addend: 0,
+        };
+        assert!(fixups.contains(&(got.addr, bind("_weak_fn"))), "{fixups:?}");
+        assert!(
+            fixups.contains(&(got.addr + 8, bind("_weak_data"))),
+            "{fixups:?}"
+        );
+        assert!(
+            fixups.contains(&(constant.addr, bind("_weak_data"))),
+            "{fixups:?}"
+        );
+        assert!(
+            fixups.contains(&(constant.addr + 8, DecodedFixup::Rebase(data.addr + 8))),
+            "{fixups:?}"
+        );
+        assert_eq!(
+            import_ordinals(&dylib),
+            [
+                (
+                    "_weak_data".to_string(),
+                    BIND_SPECIAL_DYLIB_WEAK_LOOKUP_ORDINAL
+                ),
+                (
+                    "_weak_fn".to_string(),
+                    BIND_SPECIAL_DYLIB_WEAK_LOOKUP_ORDINAL
+                ),
+            ]
+        );
+        let exports_command =
+            linkedit_data_command(&dylib, single_load_command(&commands, LC_DYLD_EXPORTS_TRIE));
+        let start = exports_command.dataoff as usize;
+        let exports = walk_exports_trie(&dylib[start..start + exports_command.datasize as usize]);
+        let weak = EXPORT_SYMBOL_FLAGS_KIND_REGULAR | EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
+        assert_eq!(
+            exports,
+            [
+                (
+                    "_entry".to_string(),
+                    EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+                    text.addr
+                ),
+                (
+                    "_strong_data".to_string(),
+                    EXPORT_SYMBOL_FLAGS_KIND_REGULAR,
+                    data.addr + 8
+                ),
+                ("_weak_data".to_string(), weak, data.addr),
+                ("_weak_fn".to_string(), weak, text.addr + 16),
+            ],
+            "hidden weak definitions stay unexported"
+        );
+    }
+
+    #[test]
+    fn executables_resolve_their_weak_definitions_statically() {
+        let exe = link_with_dylibs(
+            &[weak_object(), main_object()],
+            &DylibConfig::with_libsystem(),
+        )
+        .unwrap();
+        assert_eq!(rd_u32(&exe, 24) & (MH_WEAK_DEFINES | MH_BINDS_TO_WEAK), 0);
+        let commands = walk_load_commands(&exe);
+        let sections = section_commands(&exe, &commands);
+        let text = single_section(&sections, "__TEXT", "__text");
+        let got = single_section(&sections, "__DATA_CONST", "__got");
+        let data = single_section(&sections, "__DATA", "__data");
+        let constant = single_section(&sections, "__DATA_CONST", "__const");
+        assert_eq!(branch_target(&exe, text, 0), text.addr + 16);
+        let fixups = decode_chained_fixups(&exe);
+        assert!(fixups.contains(&(got.addr, DecodedFixup::Rebase(data.addr))));
+        assert!(fixups.contains(&(constant.addr, DecodedFixup::Rebase(data.addr))));
+        assert!(
+            import_ordinals(&exe)
+                .iter()
+                .all(|(_, ordinal)| *ordinal == 1)
+        );
+    }
+
+    #[test]
+    fn direct_page_references_to_coalescable_weak_definitions_are_refused_in_dylibs() {
+        let mut object = weak_object();
+        object.sections[0].relocations = vec![
+            Relocation::branch26(0, 1),
+            Relocation::page21(4, 2),
+            Relocation::pageoff12(8, 2),
+        ];
+        object.sections[0].data = words(&[BL, ADRP_X8, ADD_X8_X8, RET, MOVZ_X0_1, RET]);
+        assert!(matches!(
+            link_dylib(&[object.clone()], &DylibConfig::with_libsystem(), "@rpath/l.dylib"),
+            Err(LinkerError::DirectWeakDefinitionReference { ref symbol, .. })
+                if symbol == "_weak_data"
+        ));
+        // A hidden weak definition is not coalesced, so it may be direct.
+        object.sections[0].relocations[1].symbol_index = 4;
+        object.sections[0].relocations[2].symbol_index = 4;
+        link_dylib(
+            &[object.clone()],
+            &DylibConfig::with_libsystem(),
+            "@rpath/l.dylib",
+        )
+        .expect("hidden weak definitions bind directly");
+        // An executable resolves weak definitions statically.
+        link_with_dylibs(&[object, main_object()], &DylibConfig::with_libsystem())
+            .expect("executables keep direct weak references");
+    }
+
+    #[test]
+    fn read_only_after_fixup_input_rejects_thread_local_and_zero_fill_storage() {
+        for section in [
+            zerofill_section("__const", 16, 3, S_ZEROFILL),
+            input_section(
+                "__x",
+                "__DATA_CONST",
+                vec![0; 8],
+                3,
+                S_THREAD_LOCAL_REGULAR,
+                vec![],
+            ),
+        ] {
+            let mut section = section;
+            if section.name == "__const" {
+                section.segment = "__DATA".into();
+            }
+            let object = parsed(
+                vec![text_section(&[RET], vec![]), section],
+                vec![defined_symbol("_main", 1, 0, true)],
+            );
+            assert!(matches!(
+                link(&[object]),
+                Err(LinkerError::MalformedInput { ref detail, .. })
+                    if detail.contains("read-only after fixups")
+            ));
+        }
+    }
+
+    fn signed_ret_executable() -> Vec<u8> {
+        let mut writer = MachOWriter::new();
+        writer.add_text_section(&0xD65F03C0u32.to_le_bytes());
+        writer.add_symbol("_main", 1, 0, true).unwrap();
+        let obj = MachOParser::parse(&writer.write().unwrap()).unwrap();
+        link(&[obj]).unwrap()
+    }
+
+    #[test]
+    fn signature_self_check_refuses_tampered_or_off_contract_images() {
+        let exe = signed_ret_executable();
+        let text_size = crate::macho::codesign::verify_ad_hoc_signature(&exe)
+            .unwrap()
+            .code_directory
+            .exec_segment
+            .unwrap()
+            .limit;
+        assert_eq!(text_size % PAGE_SIZE, 0);
+        self_check_code_signature(&exe, text_size, CS_EXECSEG_MAIN_BINARY).unwrap();
+
+        // A changed byte after signing fails the independent verifier.
+        let mut tampered = exe.clone();
+        let last_text_page = 0x4000 - 1;
+        tampered[last_text_page] ^= 0xFF;
+        assert!(matches!(
+            self_check_code_signature(&tampered, text_size, CS_EXECSEG_MAIN_BINARY),
+            Err(LinkerError::CodeSignatureSelfCheck(
+                crate::macho::codesign::CodeSignatureError::CodePageHashMismatch {
+                    slot: 0,
+                    page: 3
+                }
+            ))
+        ));
+
+        // A valid signature with the wrong main-binary marking, or an
+        // executable segment other than the whole __TEXT range, departs from
+        // the contract.
+        for (size, flags) in [(text_size, 0), (8, CS_EXECSEG_MAIN_BINARY)] {
+            let error = self_check_code_signature(&exe, size, flags).unwrap_err();
+            assert!(
+                matches!(error, LinkerError::CodeSignatureContract(ref detail) if detail.contains("executable segment")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_signature_sizes_refuse_images_beyond_the_32_bit_code_limit() {
+        assert_eq!(code_signature_block_count(0).unwrap(), 0);
+        assert_eq!(code_signature_block_count(1).unwrap(), 1);
+        assert_eq!(code_signature_block_count(4096).unwrap(), 1);
+        assert_eq!(code_signature_block_count(4097).unwrap(), 2);
+        let largest = u64::from(u32::MAX);
+        assert_eq!(
+            code_signature_block_count(largest).unwrap(),
+            largest.div_ceil(4096) as u32
+        );
+        for over in [largest + 1, u64::MAX] {
+            assert!(matches!(
+                code_signature_block_count(over),
+                Err(LinkerError::LayoutOverflow(_))
+            ));
+            assert!(matches!(
+                code_signature_size(over),
+                Err(LinkerError::LayoutOverflow(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn signature_contract_names_each_departure_from_the_linker_signature() {
+        use crate::macho::codesign::test_support::{CodeDirectorySpec, resign};
+        let exe = signed_ret_executable();
+        let text_size = crate::macho::codesign::verify_ad_hoc_signature(&exe)
+            .unwrap()
+            .code_directory
+            .exec_segment
+            .unwrap()
+            .limit;
+        let own = CodeDirectorySpec::linker_like();
+        self_check_code_signature(
+            &resign(&exe, std::slice::from_ref(&own)),
+            text_size,
+            CS_EXECSEG_MAIN_BINARY,
+        )
+        .unwrap();
+        let variant = |edit: &dyn Fn(&mut CodeDirectorySpec)| {
+            let mut spec = own.clone();
+            edit(&mut spec);
+            vec![spec]
+        };
+        let alternate = CodeDirectorySpec {
+            slot: crate::macho::codesign::CSSLOT_ALTERNATE_CODEDIRECTORIES,
+            ..own.clone()
+        };
+        // Each signature verifies independently; only the contract refuses it.
+        for (directories, field) in [
+            (variant(&|cd| cd.flags = CS_ADHOC), "flags"),
+            (
+                variant(&|cd| cd.flags = CS_ADHOC | CS_LINKER_SIGNED | 0x0001_0000),
+                "flags",
+            ),
+            (variant(&|cd| cd.page_shift = 14), "page size"),
+            (variant(&|cd| cd.identifier = "trust-cG"), "identifier"),
+            (vec![own.clone(), alternate], "alternate CodeDirectories"),
+        ] {
+            let image = resign(&exe, &directories);
+            crate::macho::codesign::verify_ad_hoc_signature(&image).unwrap();
+            let error =
+                self_check_code_signature(&image, text_size, CS_EXECSEG_MAIN_BINARY).unwrap_err();
+            assert!(
+                matches!(error, LinkerError::CodeSignatureContract(ref detail) if detail.starts_with(&format!("unexpected {field} "))),
+                "{field}: {error}"
+            );
+        }
     }
 }

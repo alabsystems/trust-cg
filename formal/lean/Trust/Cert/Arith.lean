@@ -217,6 +217,7 @@ theorem lowerAddNarrow_correct (w : Nat) (h : w ≤ 64) (ra rb : BitVec 64) :
   rw [BitVec.setWidth_add _ _ h]
 
 structure BinOpI128Site (lay : Layout) (step : LoweredStep) (s s' : SrcState) where
+  entryReady : ∀ m, R lay s m → step.entry m
   valueLeg  : ∀ m, R lay s m → ∀ v, Live s' v →
                 denoteLoc (step.exec m) (lay.asgn v) (lay.kind v) = s'.env v
   clobberLeg : ∀ m, R lay s m → Preserves (clobberOf step) m (step.exec m)
@@ -227,6 +228,7 @@ structure BinOpI128Site (lay : Layout) (step : LoweredStep) (s s' : SrcState) wh
 def BinOpI128Site.toInstrCert
     {lay : Layout} {step : LoweredStep} {s s' : SrcState}
     (site : BinOpI128Site lay step s s') : InstrCert lay step s s' where
+  entryReady := site.entryReady
   value     := site.valueLeg
   clobber   := site.clobberLeg
   carrierOk := site.carrierLeg

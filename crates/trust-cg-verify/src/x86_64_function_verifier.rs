@@ -4,9 +4,10 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
 // Provides verify_x86_64_function(): given an X86ISelFunction, walk every
-// instruction, map each X86Opcode to a proof obligation from the
-// ProofDatabase, run the proof, and produce a FunctionVerificationReport
-// with per-instruction results.
+// instruction, discharge the obligation reconstructed from that instruction's
+// opcode and operands, and produce a FunctionVerificationReport with
+// per-instruction results. Registry theorems selected by name are never
+// instruction credit.
 //
 // Mirror of [`crate::function_verifier`] (AArch64). The two paths share
 // the same [`InstructionVerificationResult`] cert shape so downstream
@@ -17,11 +18,15 @@
 
 //! x86-64 function-level verification pipeline.
 //!
-//! [`verify_x86_64_function`] walks an [`X86ISelFunction`] and verifies
-//! each instruction against its corresponding x86-64 lowering proof
-//! obligation from [`ProofDatabase`]. Produces a
-//! [`FunctionVerificationReport`] (shared with the AArch64 path) so the
-//! public proof-certificate API in `trust-cg-codegen` stays target-agnostic.
+//! [`verify_x86_64_function`] walks an [`X86ISelFunction`] and credits an
+//! instruction only with an obligation reconstructed from its emitted opcode
+//! and operands and discharged completely. A registry theorem selected by a
+//! name query ([`X86FunctionVerifier::opcode_to_proof_query`] and the sequence
+//! recognizers) is about a representative width and form, so it is reported
+//! as `Unverified`, and a sampled discharge is reported as `Unverified`.
+//! Produces a [`FunctionVerificationReport`] (shared with the AArch64 path) so
+//! the public proof-certificate API in `trust-cg-codegen` stays
+//! target-agnostic.
 //!
 //! # Example
 //!
@@ -42,7 +47,8 @@ use trust_cg_ir::{X86CondCode, X86Opcode};
 use trust_cg_lower::x86_64_isel::{X86ISelFunction, X86ISelInst, X86ISelOperand, X86ProofOrigin};
 
 use crate::function_verifier::{
-    FunctionVerificationReport, InstructionOpcode, InstructionReport, InstructionVerificationResult,
+    FunctionVerificationPreconditionFailure, FunctionVerificationReport, InstructionOpcode,
+    InstructionReport, InstructionVerificationResult,
 };
 use crate::lowering_proof::{MachineSideProvenance, ProofObligation, VerificationConfig};
 use crate::proof_database::{
@@ -57,6 +63,103 @@ use crate::provenance_xcheck::{
 use crate::smt::SmtExpr;
 use crate::verify::VerificationResult;
 use crate::x86_64_semantics::X86OperandSize;
+use crate::x86_source_bound_body::X86_BODY_NEEDS_REPLAY;
+
+/// The verdict every value row of a bound x86-64 body receives from the
+/// replay outcome of its whole-body theorem.
+///
+/// - `Valid` (an AY proof that Clean/Carcara independently accepted) credits
+///   Formal under the theorem's name.
+/// - `Invalid` (a refutation) fails every covered row with the counterexample.
+/// - `None` (no independently checked proof) leaves them `Unverified`
+///   ([`X86_BODY_NEEDS_REPLAY`]). Live replay reports every inconclusive
+///   outcome this way: an AY `unknown`, a timeout or error, an UNSAT whose
+///   proof was not certified or not accepted, and a refused or unavailable
+///   replay (`verdict_db::live_formal_outcome`). This matches what the
+///   AArch64 frame and ALU owners' rows receive for the same outcomes.
+/// - `Unknown` is not produced by live replay today; if a replay path ever
+///   returns it, the rows fail closed.
+///
+/// Slice 21 (ruling OD-200): an `Invalid` verdict of an FP-abstract theorem
+/// (`fp_abstract`: [`crate::x86_source_bound_body::SourceBoundX86Body::
+/// is_fp_abstract`]) is no refutation: the theorem abstracts every rounding
+/// operation (its pairings claim operand patterns equal, its results are
+/// free inputs), so a satisfying model may differ from every IEEE 754 run.
+/// Its rows are left `Unverified` ([`X86_BODY_FP_ABSTRACT_SAT`]), uncredited
+/// and not failed; only a concrete replay of the model could make it a
+/// counterexample, and none is run.
+pub(crate) fn x86_body_row_result(
+    obligation: &ProofObligation,
+    verdict: Option<VerificationResult>,
+    fp_abstract: bool,
+) -> InstructionVerificationResult {
+    let proof_name = obligation.name.clone();
+    match verdict {
+        Some(VerificationResult::Invalid { .. }) if fp_abstract => {
+            InstructionVerificationResult::Unverified {
+                reason: X86_BODY_FP_ABSTRACT_SAT.into(),
+            }
+        }
+        Some(VerificationResult::Valid) => InstructionVerificationResult::Verified {
+            proof_name,
+            category: ProofCategory::X8664Lowering,
+            strength: crate::verify::VerificationStrength::Formal,
+            degenerate: obligation.is_degenerate(),
+        },
+        Some(VerificationResult::Invalid { counterexample }) => {
+            InstructionVerificationResult::Failed {
+                proof_name,
+                detail: counterexample,
+            }
+        }
+        Some(VerificationResult::Unknown { reason }) => InstructionVerificationResult::Failed {
+            proof_name,
+            detail: format!("Unknown: {reason}"),
+        },
+        None => InstructionVerificationResult::Unverified {
+            reason: X86_BODY_NEEDS_REPLAY.into(),
+        },
+    }
+}
+
+/// Slice 21 (ruling OD-200): the rows of an FP-abstract theorem whose
+/// negation AY satisfied: uncredited, never refuted.
+pub(crate) const X86_BODY_FP_ABSTRACT_SAT: &str = "source-bound x86 body theorem abstracts its \
+     rounding operations (FP leaves): a satisfying model is no counterexample (OD-200)";
+
+/// Slice 23 (OD-206, OD-200's verdict rule): the reason an x86-64 body
+/// obligation's generalization over its arithmetic leaves did not credit it
+/// when AY satisfied its negation. A model may give a leaf a value its
+/// operation never computes, so it is no counterexample: the exact replay's
+/// outcome stands (`function_request::x86_generalized_verdict`), and no row
+/// is ever failed by a generalization.
+pub(crate) const X86_BODY_GENERALIZED_SAT: &str = "the generalization over arithmetic leaves is \
+     satisfiable: a model may give a leaf a value its operation never computes, so it is no \
+     counterexample (OD-200's rule); the exact outcome stands";
+
+/// Opt-in trace text only. Classification and promotion consume the original
+/// typed verdict, never this explanation (including text that says `Valid`).
+/// Slice 21 (OD-200): the `Invalid` verdict of an FP-abstract theorem
+/// (`fp_abstract`) reads `Unknown (FP abstraction)`, never `refuted`.
+fn x86_body_replay_trace(
+    verdict: &Option<VerificationResult>,
+    explanation: Option<&str>,
+    fp_abstract: bool,
+) -> String {
+    let outcome = match verdict {
+        Some(VerificationResult::Valid) => "Valid".to_owned(),
+        Some(VerificationResult::Invalid { .. }) if fp_abstract => {
+            "Unknown (FP abstraction: a satisfying model is no counterexample)".to_owned()
+        }
+        Some(VerificationResult::Invalid { .. }) => "Invalid (refuted)".to_owned(),
+        Some(VerificationResult::Unknown { reason }) => format!("Unknown ({reason})"),
+        None => "none (no independently checked proof)".to_owned(),
+    };
+    match explanation {
+        Some(why) => format!("{outcome}; reason={why}"),
+        None => outcome,
+    }
+}
 
 // ===========================================================================
 // Phase-2 operand reconstruction (x86-64 ALU) — task #66 (mirror of AArch64/RISC-V)
@@ -108,7 +211,7 @@ use crate::x86_64_semantics::X86OperandSize;
 
 /// SOURCE operand-schema arity of a reconstructed x86-64 ALU instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum X86AluArity {
+pub(crate) enum X86AluArity {
     /// `[dst, src1, src2]` / `[dst, src1, imm]` / `[dst, src1]` (RR shift, count
     /// in CL) — two value-producing source slots (the second may be implicit CL).
     Binary,
@@ -132,7 +235,7 @@ impl X86AluArity {
 /// `trust_cg_lower::instructions::Opcode` is `Clone + PartialEq` but not
 /// `Copy`/`Eq`, so this enum mirrors those bounds.
 #[derive(Debug, Clone, PartialEq)]
-enum X86SourceOp {
+pub(crate) enum X86SourceOp {
     /// Binary trust_ir arithmetic (`encode_trust_ir_binop`): Iadd/Isub/Imul.
     /// Machine side is the matching x86 ADD/SUB/IMUL encoder.
     Binary(trust_cg_lower::instructions::Opcode),
@@ -416,6 +519,83 @@ enum X86SourceOp {
         op: trust_cg_lower::instructions::Opcode,
     },
 
+    // --- NARROW (8/16-bit) LOCK CMPXCHG — implicit AL/AX accumulator ---
+    /// `Cmpxchg8`/`Cmpxchg16`: the `LOCK CMPXCHG r/m{8,16}, r{8,16}` forms
+    /// `select_cmpxchg` emits for `AtomicU8`/`AtomicU16` (and the signed
+    /// siblings) `compare_exchange`. Operand shape `[src_reg(Gpr32),
+    /// MemAddr{base, disp}]`; the comparand and the result live in the IMPLICIT
+    /// accumulator, which for these two opcodes is the PARTIAL register AL/AX.
+    ///
+    /// The `width_bits` here is the TABLE's claim. The machine side is built
+    /// from `inst.opcode` in its own match and the two must agree, so a
+    /// table-vs-emission mismatch fails closed.
+    ///
+    /// * SOURCE  = [`crate::trust_ir_semantics::encode_trust_ir_cmpxchg`], a
+    ///   transcription of the pinned trust-ir reference interpreter's
+    ///   `Inst::CmpXchg` arm over three w-bit VALUE leaves — no register, no
+    ///   flag, no address;
+    /// * MACHINE = [`crate::x86_64_semantics::encode_lock_cmpxchg_narrow`], an
+    ///   SDM transcription over the FULL 64-bit RAX, the FULL 32-bit source
+    ///   carrier and a byte-addressable memory array at the effective address
+    ///   the machine side computes (`encode_lea_base_disp`), while every
+    ///   read-back is taken at the SOURCE address — see
+    ///   [`CmpxchgNarrowPrestate::machine_ea`] for why that is a FRAME and not
+    ///   an independence claim.
+    ///
+    /// The joint obligation is ONE `64 + 2w + 9`-bit concat of six facets:
+    /// `RAX[63:w]` preserved (the partial-write frame), returns-old in AL/AX,
+    /// the conditional store, the ADJACENT memory cell untouched (which pins
+    /// the exact store width), a WINDOWED FRAME PROBE byte anywhere in
+    /// `[ea-128, ea+127]` untouched, and `ZF == success`.
+    ///
+    /// Two fresh DIRTY leaves — `recon_rax_hi` (RAX[63:w]) and `recon_src_hi`
+    /// (the source carrier above w bits) — are what make the width load-bearing:
+    /// any machine model that reads or writes more than w bits of either
+    /// diverges. `expected` is parameterised as `sel_bit ? old ^ delta : old`
+    /// so roughly half the samples take the SUCCESS branch; with free leaves
+    /// the success branch is hit about 1 in 2^w times and a never-storing model
+    /// would pass. That parameterisation is ONTO all `(old, expected)` pairs
+    /// (take `sel_bit = 1`, `delta = old ^ expected`), so it costs no
+    /// generality. `sel_bit` is `recon_sel[15]`, NOT a 1-bit leaf: the sweep's
+    /// random points freeze every input's LOW bit when the input count is even,
+    /// which made the 1-bit selector CONSTANT over all 100,000 random samples.
+    ///
+    /// Refutations (see the `cmpxchg_narrow_*` controls in
+    /// `tests/reconstruction_x86.rs`): a zero-extending or 32-bit-write RAX
+    /// merge, the wrong machine width in either direction, the Gpr32
+    /// register-class trap, an unconditional store, a suppressed store, a
+    /// returns-desired variant, a missing failure load, a backwards or
+    /// wide-compare ZF, the wrong flag bit, swapped comparand/stored roles, the
+    /// wrong source byte, a store whose byte order disagrees with the model's
+    /// load order, a rogue store elsewhere in the +/-128-byte window and a wrong
+    /// effective address ALL refute.
+    CmpxchgNarrow {
+        /// 8 or 16 — the architectural operand width, which for these two
+        /// opcodes lives ONLY in the opcode (operand 0 is a `Gpr32` carrier for
+        /// both).
+        width_bits: u32,
+    },
+
+    // --- The 128-bit atomic-load pseudo: 4 zeroing XORs + LOCK CMPXCHG16B ---
+    /// `AtomicLoadCmpxchg16b`: `XOR EAX,EAX; XOR EDX,EDX; XOR EBX,EBX;
+    /// XOR ECX,ECX; LOCK CMPXCHG16B m128`, the 128-bit atomic LOAD. Operand
+    /// shape `[MemAddr { base, disp }]`; the INCOMING RAX, RDX, RBX and RCX are
+    /// fresh leaves the pseudo must not depend on.
+    ///
+    /// * MACHINE = [`crate::x86_64_semantics::encode_atomic_load_cmpxchg16b`]:
+    ///   the four SDM XOR transcriptions feeding the SDM CMPXCHG16B
+    ///   transcription, over a byte-addressable memory array at the machine
+    ///   effective address — the zeroing is part of the modeled instruction;
+    /// * SOURCE  = the trust-ir `AtomicLoad` (read 16 bytes, memory unchanged).
+    ///
+    /// The bare [`crate::x86_64_semantics::encode_lock_cmpxchg16b`] it ends in
+    /// is ALSO obligated at general inputs against the pinned trust-ir
+    /// `CmpXchg` at 128 bits, so the transcription keeps teeth on the branches a
+    /// zero comparand never exercises. Eleven facet equalities
+    /// ([`x86_cmpxchg16b_facets`]); see [`reconstruct_x86_cmpxchg16b`] for what
+    /// is NOT claimed.
+    AtomicLoadCmpxchg16b,
+
     // --- IN-PLACE increment/decrement over a symbolic pre-value ---
     /// In-place `Inc`/`Dec` (`dst = pre +/- 1`). The SOURCE side is the trust_ir
     /// `Iadd`/`Isub` of a FRESH symbolic pre-value leaf with `1`; the MACHINE side
@@ -489,7 +669,7 @@ enum X86SourceOp {
 /// Returns `None` for every NON-reconstructable opcode, so the caller leaves
 /// those on their existing path unchanged. Wildcard-free over the reconstructable
 /// arms; falls through to `None` for the rest.
-fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArity)> {
+pub(crate) fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArity)> {
     use crate::smt::VectorArrangement as VA;
     use X86Opcode as O;
     use trust_cg_lower::instructions::{IntCC, Opcode};
@@ -680,8 +860,75 @@ fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArit
         O::Divpd => Some((pack_fp(Opcode::Fdiv, 64), X86AluArity::Binary)),
 
         // ---- MEMORY loads: width fixed by the opcode (8/16/32/64; FP 32/64) ----
+        // VOLATILE memory MOVs. The VALUE of a volatile access is the value of
+        // the plain access — it moves the same bytes between the same places,
+        // and the encoder emits them through the SAME arm
+        // (`MovRM | VolatileMovRM`), so the bytes are identical. What makes
+        // them volatile is not a different value but a constraint on the
+        // COMPILER: the access must be emitted exactly once, at that width, in
+        // that order. That is a whole-function property no per-instruction
+        // obligation can state, and it is carried by `x86_volatile_trace`,
+        // enforced per compile at the selection (VOL-2) and optimizer (VOL-1)
+        // boundaries. Their ADDRESS is carried by `x86_addressing_proofs`.
+        //
+        // Mapping them here gives the value facet the same reconstruction the
+        // plain forms get. It does NOT credit the rows on its own: the coverage
+        // gate's `x86_volatile_joint_audit_row` requires this reconstruction to
+        // discharge (the VALUE leg) AND the address credit AND the trace
+        // obligation, which is what closes the observation/ordering boundary.
+        O::VolatileMovRM8 => Some((X86SourceOp::MemLoad { load_bits: 8 }, X86AluArity::Unary)),
+        O::VolatileMovRM16 => Some((X86SourceOp::MemLoad { load_bits: 16 }, X86AluArity::Unary)),
+        O::VolatileMovRM32 => Some((X86SourceOp::MemLoad { load_bits: 32 }, X86AluArity::Unary)),
+        O::VolatileMovRM => Some((X86SourceOp::MemLoad { load_bits: 64 }, X86AluArity::Unary)),
+        O::VolatileMovMR8 => Some((X86SourceOp::MemStore { store_bits: 8 }, X86AluArity::Binary)),
+        O::VolatileMovMR16 => Some((
+            X86SourceOp::MemStore { store_bits: 16 },
+            X86AluArity::Binary,
+        )),
+        O::VolatileMovMR32 => Some((
+            X86SourceOp::MemStore { store_bits: 32 },
+            X86AluArity::Binary,
+        )),
+        O::VolatileMovMR => Some((
+            X86SourceOp::MemStore { store_bits: 64 },
+            X86AluArity::Binary,
+        )),
+        O::VolatileMovssRM => Some((X86SourceOp::MemLoad { load_bits: 32 }, X86AluArity::Unary)),
+        O::VolatileMovsdRM => Some((X86SourceOp::MemLoad { load_bits: 64 }, X86AluArity::Unary)),
+        O::VolatileMovssMR => Some((
+            X86SourceOp::MemStore { store_bits: 32 },
+            X86AluArity::Binary,
+        )),
+        O::VolatileMovsdMR => Some((
+            X86SourceOp::MemStore { store_bits: 64 },
+            X86AluArity::Binary,
+        )),
+        O::VolatileMovdquRM | O::VolatileMovdqaRM => Some((
+            X86SourceOp::V128MemLoad {
+                aligned: matches!(opcode, O::VolatileMovdqaRM),
+            },
+            X86AluArity::Unary,
+        )),
+        O::VolatileMovdquMR | O::VolatileMovdqaMR => Some((
+            X86SourceOp::V128MemStore {
+                aligned: matches!(opcode, O::VolatileMovdqaMR),
+            },
+            X86AluArity::Binary,
+        )),
         O::MovRM8 => Some((X86SourceOp::MemLoad { load_bits: 8 }, X86AluArity::Unary)),
         O::MovRM16 => Some((X86SourceOp::MemLoad { load_bits: 16 }, X86AluArity::Unary)),
+        // The zero-extending loads `movzx r32, m8/m16` (`0F B6`/`0F B7`): the
+        // MemLoad model IS a zero-filled load of `load_bits` into the
+        // destination width, which for these opcodes is the hardware's whole
+        // register write (bits `load_bits..` zero), not a carrier convention.
+        // The bytes are tied to that reading by the address lane's
+        // destination-write facet (`x86_addressing_proofs`).
+        O::MovzxRM8 | O::MovzxRM8Sib | O::VolatileMovzxRM8 => {
+            Some((X86SourceOp::MemLoad { load_bits: 8 }, X86AluArity::Unary))
+        }
+        O::MovzxRM16 | O::VolatileMovzxRM16 => {
+            Some((X86SourceOp::MemLoad { load_bits: 16 }, X86AluArity::Unary))
+        }
         O::MovRM32 => Some((X86SourceOp::MemLoad { load_bits: 32 }, X86AluArity::Unary)),
         O::MovRM => Some((X86SourceOp::MemLoad { load_bits: 64 }, X86AluArity::Unary)),
         // Scaled-index 64-bit LOAD `mov r64, [base+index*scale+disp]`. Same
@@ -765,6 +1012,22 @@ fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArit
             X86SourceOp::V128MemStore { aligned: true },
             X86AluArity::Binary,
         )),
+        // Scaled-index MOVDQU: the SAME V128 obligations as the plain-MemAddr
+        // forms above. Only the effective-address SHAPE differs, and the EA is
+        // reconstructed by the shared `x86_reconstruct_effective_address` that
+        // already proves every other SIB opcode (SOURCE = trust_ir address
+        // chain, MACHINE = the INDEPENDENT x86 encoder) — so a wrong
+        // base/index/scale/disp REFUTES exactly as it does for MovRMSib.
+        // `aligned: false` is forced by the opcode: MOVDQU makes no alignment
+        // claim, and no SIB sibling exists for the aligned MOVDQA family.
+        O::MovdquRMSib => Some((
+            X86SourceOp::V128MemLoad { aligned: false },
+            X86AluArity::Unary,
+        )),
+        O::MovdquMRSib => Some((
+            X86SourceOp::V128MemStore { aligned: false },
+            X86AluArity::Binary,
+        )),
 
         // ---- LOW-QWORD PACK: the [K;2] register-form broadcast builder ----
         O::Punpcklqdq => Some((X86SourceOp::PackLowQwords, X86AluArity::Binary)),
@@ -804,6 +1067,25 @@ fn x86_opcode_to_source_op(opcode: X86Opcode) -> Option<(X86SourceOp, X86AluArit
             X86SourceOp::MemRmw { op: Opcode::Iadd },
             X86AluArity::Binary,
         )),
+
+        // ---- NARROW LOCK CMPXCHG (implicit AL/AX accumulator) ----
+        // The width lives ONLY in the opcode: `reg_class_for_type` maps BOTH I8
+        // and I16 to Gpr32, so operand 0's class cannot disambiguate them. The
+        // machine encoder is re-derived from `inst.opcode` inside the
+        // reconstructor and must agree with the width claimed here.
+        O::Cmpxchg8 => Some((
+            X86SourceOp::CmpxchgNarrow { width_bits: 8 },
+            X86AluArity::Binary,
+        )),
+        O::Cmpxchg16 => Some((
+            X86SourceOp::CmpxchgNarrow { width_bits: 16 },
+            X86AluArity::Binary,
+        )),
+
+        // ---- The 128-bit atomic-load pseudo (zeroing XORs + CMPXCHG16B) ----
+        // The only operand is the memory operand; the machine side is rebuilt
+        // from the REAL opcode inside the reconstructor.
+        O::AtomicLoadCmpxchg16b => Some((X86SourceOp::AtomicLoadCmpxchg16b, X86AluArity::Unary)),
 
         // ---- IN-PLACE increment / decrement ----
         O::Inc => Some((
@@ -936,13 +1218,23 @@ fn x86_emitted_op_class(inst: &X86ISelInst) -> Option<OpClass> {
         }),
         X86SourceOp::Division { .. } => Some(OpClass::IntDiv),
         X86SourceOp::CondMove => Some(OpClass::Select),
+        // A narrow LOCK CMPXCHG has a DEFINITE atomic class: `classify_lir_opcode`
+        // maps `Opcode::CmpXchg` to `OpClass::Atomic`, and no non-atomic LIR
+        // instruction may legitimately lower to one. Reporting it (rather than
+        // the `None` exemption the memory-movement glue takes) is what makes a
+        // CMPXCHG stamped from, say, an `Iadd` a TV-2 mismatch.
+        X86SourceOp::CmpxchgNarrow { .. } => Some(OpClass::Atomic),
+        // The CMPXCHG16B load pseudo is emitted only for an atomic LIR source
+        // (`AtomicLoad` I128), which `classify_lir_opcode` maps to
+        // `OpClass::Atomic`.
+        X86SourceOp::AtomicLoadCmpxchg16b => Some(OpClass::Atomic),
     }
 }
 
 /// Width in bits of a register-bearing [`X86ISelOperand`]. Returns `None` for a
 /// non-register operand (immediate/symbol/memory/etc. — the caller treats an
 /// immediate slot separately, and anything else fails the reconstruction closed).
-fn x86_operand_reg_width_bits(op: &X86ISelOperand) -> Option<u32> {
+pub(crate) fn x86_operand_reg_width_bits(op: &X86ISelOperand) -> Option<u32> {
     match op {
         X86ISelOperand::VReg(v) => Some(v.class.size_bits()),
         X86ISelOperand::PReg(p) => {
@@ -973,7 +1265,7 @@ fn x86_width_to_operand_size(width: u32) -> X86OperandSize {
 /// non-FP / non-VReg operand (a post-regalloc XMM `PReg` is 128-bit and does NOT
 /// carry the scalar-lane width, so it fails closed — the ISel-level
 /// reconstruction operates on VRegs whose class is `Fpr32`/`Fpr64`).
-fn x86_fp_scalar_width(op: &X86ISelOperand) -> Option<u32> {
+pub(crate) fn x86_fp_scalar_width(op: &X86ISelOperand) -> Option<u32> {
     match op {
         X86ISelOperand::VReg(v) => match v.class {
             RegClass::Fpr32 => Some(32),
@@ -1188,6 +1480,26 @@ pub fn reconstruct_alu_obligation(inst: &X86ISelInst) -> Option<ProofObligation>
                 return None;
             }
             return reconstruct_x86_mem_rmw(inst, op, from_opcode);
+        }
+        X86SourceOp::CmpxchgNarrow { width_bits } => {
+            // A proof-origin instance would carry a STRONGER origin proof;
+            // fail closed here so the verifier routes to
+            // `proof_origin_to_proof_query` rather than silently crediting the
+            // weaker single-thread data-flow reconstruction. (`select_cmpxchg`
+            // stamps no origin today, so this is a guard against a future one.)
+            if inst.proof_origin.is_some() {
+                return None;
+            }
+            return reconstruct_x86_cmpxchg_narrow(inst, *width_bits, from_opcode);
+        }
+        X86SourceOp::AtomicLoadCmpxchg16b => {
+            // Same guard as the narrow CMPXCHG: a proof-origin instance would
+            // carry a stronger origin proof. `select_atomic_load_i128` stamps
+            // none today.
+            if inst.proof_origin.is_some() {
+                return None;
+            }
+            return reconstruct_x86_cmpxchg16b(inst, from_opcode);
         }
         X86SourceOp::RotlVar => {
             return reconstruct_x86_rotl_var(inst, from_opcode);
@@ -2183,6 +2495,960 @@ fn reconstruct_x86_mem_rmw(
         machine_side_provenance: MachineSideProvenance::Reconstructed {
             from_opcode,
             arity: 2,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// NARROW (8/16-bit) LOCK CMPXCHG reconstruction
+// ---------------------------------------------------------------------------
+
+/// The shared PRE-STATE of a narrow-`CMPXCHG` reconstruction: the fresh
+/// symbolic leaves, the two independently built effective addresses, and the
+/// seeded memory. This is INPUT to both sides of the obligation, never
+/// semantics — the source side is computed from the w-bit value leaves alone
+/// and the machine side from the registers/memory/address alone.
+///
+/// Public so the negative controls in `tests/reconstruction_x86.rs` can take
+/// the REAL prestate, mutate exactly ONE field of the real machine effect, and
+/// re-assemble the obligation with [`x86_cmpxchg_narrow_sides`]. A control that
+/// rebuilt the prestate itself would be testing a different instruction.
+#[derive(Debug, Clone)]
+pub struct CmpxchgNarrowPrestate {
+    /// trust_ir effective address (`encode_trust_ir_binop` composition).
+    pub ir_ea: SmtExpr,
+    /// x86 effective address (`encode_lea_*`) over the same operands.
+    ///
+    /// NOT an independence pillar for the form this row covers. For
+    /// `MemAddr { base, disp }` — the ONLY shape the prestate accepts —
+    /// `encode_trust_ir_binop(Iadd)` is `lhs.bvadd(rhs)` and
+    /// `encode_lea_base_disp` is `base.bvadd(bv_const(disp))`, so the two are
+    /// the SAME `SmtExpr` node by construction and comparing them would be a
+    /// vacuous `X == X`. They are NOT compared. What the two names buy is a
+    /// FRAME: every load-back in [`x86_cmpxchg_narrow_sides`] is taken at
+    /// `ir_ea` while the machine effect is built at `machine_ea`, so a machine
+    /// model that computes a DIFFERENT address reads and writes somewhere the
+    /// obligation is not looking and refutes (controls NC14a/NC14b). The
+    /// address BYTES (ModR/M + displacement) are pinned by ENC-3's independent
+    /// decoder, not here.
+    pub machine_ea: SmtExpr,
+    /// Memory seeded with `old` at `ir_ea`, `neighbor` at `ir_ea + w/8`, and
+    /// `probe_val` at `probe_ea`.
+    pub mem0: SmtExpr,
+    /// The full 64-bit RAX before the instruction: `concat(rax_hi, expected)`.
+    pub rax_pre: SmtExpr,
+    /// The full 32-bit source carrier: `concat(src_hi, desired)`.
+    pub src_reg: SmtExpr,
+    /// The w-bit value in the cell before the instruction.
+    pub old: SmtExpr,
+    /// The w-bit comparand, parameterised as `sel_bit ? old ^ delta : old`,
+    /// where `sel_bit` is `recon_sel[15]` (see the prestate builder for why the
+    /// selector is the TOP bit of a 16-bit leaf and never a 1-bit leaf).
+    pub expected: SmtExpr,
+    /// The w-bit value to install on success.
+    pub desired: SmtExpr,
+    /// The DIRTY upper bits of RAX (64 - w bits).
+    pub rax_hi: SmtExpr,
+    /// The w-bit value in the ADJACENT cell at `ir_ea + w/8`.
+    pub neighbor: SmtExpr,
+    /// The address of the WINDOWED FRAME PROBE:
+    /// `ir_ea + sext(recon_probe_off[15:8])` — the TOP byte of a 16-bit leaf,
+    /// read as a signed offset, so the probe ranges over
+    /// `[ir_ea - 128, ir_ea + 127]`. A precondition excludes the two modeled
+    /// cells `[ir_ea, ir_ea + 2*(w/8))`, so on every admitted sample the probe
+    /// byte names memory the instruction must NOT disturb.
+    pub probe_ea: SmtExpr,
+    /// The single byte seeded at [`Self::probe_ea`]. It appears VERBATIM on the
+    /// source side and as `load(mem_after, probe_ea)` on the machine side, so
+    /// any extra store inside the +/-128-byte window refutes.
+    pub probe_val: SmtExpr,
+    /// Declared SMT input leaves, in declaration order.
+    pub inputs: Vec<(String, u32)>,
+    /// The two-cell no-wrap precondition.
+    pub preconditions: Vec<SmtExpr>,
+}
+
+/// Build the shared pre-state for a narrow `LOCK CMPXCHG` at width `w` from the
+/// REAL emitted instruction, or `None` (fail closed) for any shape this model
+/// does not cover.
+///
+/// Fail-closed shape checks — each leaves the instruction Unverified rather
+/// than credited:
+/// * exactly two operands;
+/// * operand 0 is a 32-bit register (the `Gpr32` carrier ISel selects for both
+///   i8 and i16) that does NOT overlap RAX — the model treats the accumulator
+///   and the source as independent leaves, so an aliased source would be a
+///   different instruction;
+/// * operand 1 is a plain `MemAddr`. `SibMemAddr` is REJECTED: the encoder
+///   (`x86_64/encode.rs`) reads only base and displacement for these opcodes
+///   and would silently drop an index;
+/// * the address base does not overlap RAX, for the same reason as the source.
+///
+/// # Reach of the RAX-alias check, stated exactly
+///
+/// The alias check can only fire on a `PReg` operand. Both representative
+/// instances and every instruction `select_cmpxchg` actually emits carry
+/// `VReg`s, whose physical assignment is not visible here, so on the shapes
+/// that EARN the credit the accumulator-independence assumption is asserted,
+/// not checked, by THIS function. It is not unchecked in the pipeline: the
+/// encoder hard-errors (`X86EncodeError::InvalidOperands`,
+/// `x86_64/encode.rs`) when the narrowed source or the base overlaps AL/AX, so
+/// an aliased narrow CAS never reaches bytes — `x86_encoding_gate.rs`'s
+/// `narrow_cas_encoder_refuses_an_accumulator_aliased_operand` pins that
+/// refusal against the LIVE encoder rather than leaving it a claim in a
+/// comment. What the `PReg` arm adds is fail-closed behaviour for a post-RA
+/// or hand-built instruction that names RAX directly.
+pub fn x86_cmpxchg_narrow_prestate(inst: &X86ISelInst, w: u32) -> Option<CmpxchgNarrowPrestate> {
+    use trust_cg_ir::x86_64_regs::{RAX, x86_regs_overlap};
+
+    if !(w == 8 || w == 16) {
+        return None;
+    }
+    if inst.operands.len() != 2 {
+        return None;
+    }
+
+    // Operand 0: the SOURCE register, a 32-bit carrier that must not alias RAX.
+    let src_op = &inst.operands[0];
+    if x86_operand_reg_width_bits(src_op)? != 32 {
+        return None;
+    }
+    if let X86ISelOperand::PReg(p) = src_op
+        && x86_regs_overlap(*p, RAX)
+    {
+        return None;
+    }
+
+    // Operand 1: a PLAIN `[base + disp]` memory operand only.
+    let X86ISelOperand::MemAddr { base, .. } = &inst.operands[1] else {
+        return None;
+    };
+    if let X86ISelOperand::PReg(p) = base.as_ref()
+        && x86_regs_overlap(*p, RAX)
+    {
+        return None;
+    }
+
+    let (ir_ea, machine_ea, mut inputs) = x86_reconstruct_effective_address(&inst.operands[1])?;
+
+    let size_bytes = w / 8;
+    // WHY THE BRANCH SELECTOR AND THE PROBE OFFSET ARE THE TOP BYTE OF A WIDE
+    // LEAF AND NEVER A NARROW LEAF OF THEIR OWN.
+    //
+    // The default discharge is a statistical sweep whose random points come
+    // from `fill_env_multi`: one LCG step per input per sample, each input
+    // taking the LOW `width` bits of the state. A sub-stream that advances by
+    // `inputs.len()` steps per sample therefore has a FROZEN low bit whenever
+    // `inputs.len()` is EVEN — the increment of the induced low-bit map is
+    // `inputs.len() * c mod 2 == 0`. MEASURED on this obligation's own input
+    // list: a 1-bit `recon_sel` leaf took the value 1 in 100,000 of 100,000
+    // random samples, and an 8-bit offset leaf reached 128 of its 256 values.
+    // (It is not a property of this row: any obligation with an even input
+    // count has it, and it costs another low bit for every extra factor of 2.)
+    //
+    // Bits 8..15 of a 16-bit leaf are unaffected — measured to reach all 256
+    // values at every input count tried — so both facets that MUST sweep their
+    // whole domain read the TOP byte. `cmpxchg_narrow_branch_selector_is_swept_
+    // by_random_points` and `cmpxchg_narrow_every_probe_offset_in_the_window_
+    // refutes` pin the result rather than this reasoning.
+    let old = SmtExpr::var("recon_old", w);
+    let delta = SmtExpr::var("recon_delta", w);
+    let sel = SmtExpr::var("recon_sel", 16);
+    let sel_bit = sel.extract(15, 15);
+    let desired = SmtExpr::var("recon_desired", w);
+    let src_hi = SmtExpr::var("recon_src_hi", 32 - w);
+    let rax_hi = SmtExpr::var("recon_rax_hi", 64 - w);
+    let neighbor = SmtExpr::var("recon_neighbor", w);
+    let probe_off = SmtExpr::var("recon_probe_off", 16).extract(15, 8);
+    let probe_val = SmtExpr::var("recon_probe_val", 8);
+    inputs.extend([
+        ("recon_old".to_string(), w),
+        ("recon_delta".to_string(), w),
+        ("recon_sel".to_string(), 16),
+        ("recon_desired".to_string(), w),
+        ("recon_src_hi".to_string(), 32 - w),
+        ("recon_rax_hi".to_string(), 64 - w),
+        ("recon_neighbor".to_string(), w),
+        ("recon_probe_off".to_string(), 16),
+        ("recon_probe_val".to_string(), 8),
+    ]);
+
+    // BRANCH PARAMETERISATION (load-bearing for refutation power, NOT for
+    // generality). With a free `expected` leaf the SUCCESS branch is sampled
+    // about once in 2^w points — at w=16 roughly 1.5 times in 100k — so a
+    // machine model that NEVER stores would sweep clean. The selector splits
+    // the samples about evenly. It is ONTO all `(old, expected)` pairs: take
+    // `sel_bit = 1` and `delta = old ^ expected`.
+    let expected = SmtExpr::ite(
+        sel_bit.eq_expr(SmtExpr::bv_const(1, 1)),
+        old.clone().bvxor(delta),
+        old.clone(),
+    );
+
+    // Two-cell memory image: the CAS cell, then its neighbour, then the
+    // WINDOWED FRAME PROBE byte. The probe is what turns "the adjacent cell is
+    // untouched" (a WIDTH facet) into a real frame facet: it names one byte
+    // anywhere in `[ir_ea - 128, ir_ea + 127]` outside the two modeled cells
+    // and requires it to survive. A machine model that performs the correct CAS
+    // and ALSO stores at, say, `ir_ea + 64` now refutes, which the two-cell
+    // read-back alone could not see.
+    let adjacent_ea = ir_ea
+        .clone()
+        .bvadd(SmtExpr::bv_const(u64::from(size_bytes), 64));
+    let probe_ea = ir_ea.clone().bvadd(probe_off.sign_ext(56));
+    let mem0 = crate::memory_proofs::zeroed_memory();
+    let mem0 = crate::memory_proofs::encode_store_le(&mem0, &ir_ea, &old, size_bytes);
+    let mem0 = crate::memory_proofs::encode_store_le(&mem0, &adjacent_ea, &neighbor, size_bytes);
+    let mem0 = crate::memory_proofs::encode_store_le(&mem0, &probe_ea, &probe_val, 1);
+
+    // The DIRTY carriers. `rax_pre` is the accumulator with arbitrary junk above
+    // AL/AX; `src_reg` is the Gpr32 carrier with arbitrary junk above the low w
+    // bits. `carrier_hygiene` already treats the result carrier as `Top`, so
+    // this is the backend's real convention, not a pessimisation.
+    let rax_pre = rax_hi.clone().concat(expected.clone());
+    let src_reg = src_hi.concat(desired.clone());
+
+    // The two-cell window must not wrap the address space.
+    let max_start = u64::MAX - (2 * u64::from(size_bytes)) + 1;
+    // The frame probe must name a byte OUTSIDE the two modeled cells, else a
+    // faithful model would legitimately change it and the frame claim would be
+    // false. `NOT(ir_ea <=u probe_ea <=u ir_ea + 2*size - 1)`. Only 2 or 4 of
+    // the 256 offsets are excluded, so the sample loss is negligible and the
+    // vacuity guard in `verify_by_evaluation` can never fire on it. The bound is
+    // the INCLUSIVE last byte: at the largest admitted start (`max_start`) the
+    // exclusive end `ir_ea + 2*size` wraps to 0, which made `probe_ea <u end`
+    // false for EVERY probe and admitted a probe seeded over the cells
+    // (`cmpxchg_narrow_probe_precondition_holds_at_the_wrap_boundary`).
+    let two_cells_last = ir_ea
+        .clone()
+        .bvadd(SmtExpr::bv_const(2 * u64::from(size_bytes) - 1, 64));
+    let probe_inside_the_cells = SmtExpr::bvuge(probe_ea.clone(), ir_ea.clone())
+        .and_expr(SmtExpr::bvule(probe_ea.clone(), two_cells_last));
+    let preconditions = vec![
+        SmtExpr::bvuge(SmtExpr::bv_const(max_start, 64), ir_ea.clone()),
+        probe_inside_the_cells.not_expr(),
+    ];
+
+    Some(CmpxchgNarrowPrestate {
+        ir_ea,
+        machine_ea,
+        mem0,
+        rax_pre,
+        src_reg,
+        old,
+        expected,
+        desired,
+        rax_hi,
+        neighbor,
+        probe_ea,
+        probe_val,
+        inputs,
+        preconditions,
+    })
+}
+
+/// Assemble the `(source, machine)` pair of a narrow-`CMPXCHG` obligation from a
+/// pre-state and a machine effect.
+///
+/// Both sides are ONE `64 + 2w + 9`-bit concat, facets from high bits to low:
+///
+/// | bits | facet |
+/// |---|---|
+/// | 64-w | `RAX[63:w]` PRESERVED across the partial-register write |
+/// | w    | returns-old in AL/AX |
+/// | w    | the conditional store |
+/// | w    | the ADJACENT cell untouched (pins the store WIDTH) |
+/// | 8    | the WINDOWED FRAME PROBE byte untouched (pins "nothing ELSE in
+///          `[ea-128, ea+127]` is written") |
+/// | 1    | `ZF == success` |
+///
+/// The source side reads `effect` NOWHERE: it is built from the pre-state's
+/// w-bit value leaves through [`crate::trust_ir_semantics::encode_trust_ir_cmpxchg`],
+/// plus the three frame terms (`rax_hi`, `neighbor`, `probe_val`) that state
+/// what the instruction must NOT disturb. Every memory load-back is taken at
+/// the SOURCE address `ir_ea`, so a machine effective address that differs
+/// stores somewhere else and refutes.
+///
+/// The memory BYTE ORDER is NOT pinned here. `encode_store_le` / `encode_load_le`
+/// are the crate-wide little-endian memory primitives, shared by the seeding,
+/// the machine model and this read-back; flipping ALL of them together cancels
+/// out. What the byte-order control (`cmpxchg_narrow_store_byte_order_refutes`)
+/// establishes is narrower and true: a store whose byte order disagrees with
+/// the model's own load order refutes. Little-endianness itself is trust base,
+/// exactly as the SDM transcription is.
+pub fn x86_cmpxchg_narrow_sides(
+    pre: &CmpxchgNarrowPrestate,
+    w: u32,
+    effect: &crate::x86_64_semantics::X86CmpxchgNarrowEffect,
+) -> (SmtExpr, SmtExpr) {
+    use crate::trust_ir_semantics::encode_trust_ir_cmpxchg;
+
+    let size_bytes = w / 8;
+    let source =
+        encode_trust_ir_cmpxchg(pre.old.clone(), pre.expected.clone(), pre.desired.clone());
+
+    // SOURCE: rax_hi ++ loaded ++ stored ++ neighbor ++ probe ++ success
+    let src_side = pre
+        .rax_hi
+        .clone()
+        .concat(source.loaded)
+        .concat(source.stored)
+        .concat(pre.neighbor.clone())
+        .concat(pre.probe_val.clone())
+        .concat(SmtExpr::ite(
+            source.success,
+            SmtExpr::bv_const(1, 1),
+            SmtExpr::bv_const(0, 1),
+        ));
+
+    // MACHINE: RAX_after ++ [ir_ea] ++ [ir_ea + w/8] ++ [probe_ea] ++ ZF
+    let adjacent_ea = pre
+        .ir_ea
+        .clone()
+        .bvadd(SmtExpr::bv_const(u64::from(size_bytes), 64));
+    let cell_after =
+        crate::memory_proofs::encode_load_le(&effect.mem_after, &pre.ir_ea, size_bytes);
+    let neighbor_after =
+        crate::memory_proofs::encode_load_le(&effect.mem_after, &adjacent_ea, size_bytes);
+    let probe_after = crate::memory_proofs::encode_load_le(&effect.mem_after, &pre.probe_ea, 1);
+    let machine_side = effect
+        .rax_after
+        .clone()
+        .concat(cell_after)
+        .concat(neighbor_after)
+        .concat(probe_after)
+        .concat(SmtExpr::ite(
+            effect.flags.zf.clone(),
+            SmtExpr::bv_const(1, 1),
+            SmtExpr::bv_const(0, 1),
+        ));
+
+    (src_side, machine_side)
+}
+
+/// Reconstruct a NARROW (8/16-bit) `LOCK CMPXCHG` from the real emitted
+/// instruction.
+///
+/// `table_width` is the width [`x86_opcode_to_source_op`] claims; the machine
+/// width is re-derived from `inst.opcode` in its OWN match below. If the two
+/// disagree the reconstruction fails closed — a table edit alone can never
+/// re-point the machine model at a different width.
+///
+/// # What this credit does NOT claim
+///
+/// 1. **Not atomicity.** LOCK serialization, cross-thread ordering, weak or
+///    spurious failure and the legality of the `(success, failure)` ordering
+///    pair are outside this obligation. They remain the same Intel-SDM
+///    architectural axiom, and the same upstream isel/adapter check, that the
+///    atomic load, store, RMW and MFENCE rows already rest on. What is
+///    obligated is single-thread conditional data flow only.
+/// 2. **THIS obligation says nothing about BYTES; a different lane does.** The
+///    machine side is keyed on the `X86Opcode` enum value and the ISel
+///    operands, so on its own it cannot tell `0F B0` from `0F B1` — and for
+///    these two opcodes the width distinction is PURELY an encoding fact. That
+///    gap is closed where every other credited x86 row closes it, not here:
+///    `trust-cg-codegen`'s ENC-3 decode-check now COVERS `Cmpxchg8`/`Cmpxchg16`
+///    (they were `Allowlisted(NARROW_CMPXCHG)` until this repair). Its
+///    independent SDM decoder derives the operand width from the emitted bytes
+///    — `0F B0` is 8, `66 0F B1` is 16, a bare `0F B1` is 32 — and fails the
+///    compile closed on any disagreement with the opcode the pipeline recorded,
+///    as it does on a missing `F0 LOCK` prefix or a dropped forced REX that
+///    would turn SIL into AH. ENC-2's offline llvm-objdump differential
+///    (`encode_objdump_differential_x86.rs`) carries 72 narrow-CAS vectors and
+///    is that decoder's external anchor. So the opcode-to-bytes link exists and
+///    is fail-closed per compile; what is still true is that THIS SMT
+///    obligation does not state it.
+/// 3. **It does not bind the implicit accumulator.** `recon_rax_hi` and the
+///    comparand are fresh leaves. Nothing here shows that the preceding
+///    `MovRR32 EAX, expected` put the source `expected` into RAX, or that the
+///    following `MovRR32 dst, EAX` reads the result. Those are separately
+///    credited `CopyGpr` instructions plus the post-RA dataflow model of RAX.
+///    This is exactly the `Division` reconstruction's limitation, and the same
+///    exact-operand-identity deferral to TV-3.
+/// 4. **The source WIDTH comes from the opcode table**, as it does for every
+///    reconstructed row. The gate has only an opcode, so the claim is: IF an
+///    `I{w}` `CmpXchg` is lowered to `Cmpxchg{w}` with these operands, THEN the
+///    instruction computes it. Nothing here ties `w` to the LIR type.
+/// 5. **The `RAX[63:w]`-preserved facet is a machine-model fidelity / frame
+///    facet.** Its source side is the SDM frame condition, not a trust-ir
+///    semantic — trust-ir has no notion of carrier high bits. It is included
+///    because the partial AL/AX write is the width-specific hazard, and it is
+///    what justifies `carrier_hygiene` treating the result carrier as `Top`. No
+///    emitted consumer depends on those bits today.
+///    5b. **The memory frame is WINDOWED, not universal.** `mem_after` is never
+///    compared as a whole array — the evaluator compares bitvectors, so the
+///    machine side reads back the CAS cell, the adjacent cell and ONE probe
+///    byte at `ea + sext(recon_probe_off)`, an 8-bit signed offset. That covers
+///    every byte in `[ea - 128, ea + 127]` outside the two modeled cells, and
+///    under the default 100k-sample statistical discharge each offset is drawn
+///    ~390 times, so a rogue store anywhere in that window refutes. A store
+///    FARTHER than 128 bytes from the effective address, or to a register
+///    other than RAX and RFLAGS, is NOT claimed by this obligation. (The
+///    register frame is TV-5 / `post_ra_dataflow`'s; the flag frame is
+///    `x86_writes_flags`'.)
+///    5c. **The memory BYTE ORDER is trust base, not a result.** The seeding, the
+///    machine model's load/store and the read-back all go through the same
+///    crate-wide `encode_store_le` / `encode_load_le`, so flipping the WHOLE
+///    memory model to big-endian cancels and would still discharge. The
+///    byte-order control refutes a store whose byte order disagrees with the
+///    model's own load order — which is what it is named for, and all it
+///    claims.
+/// 6. **Only ZF is obligated.** CF/PF/AF/SF/OF are modeled as clobbered by the
+///    post-RA flag model. No emitted code reads any CMPXCHG flag; the adapter
+///    re-derives success with its own `Icmp`, which carries its own obligation.
+/// 7. **The default discharge is `Statistical` evaluation**, and the input
+///    domain is ~177 bits at w=8 — accepted regression evidence, not a formal
+///    proof, exactly as every other reconstructed row.
+/// 8. **Only the plain `[base+disp]` memory form is covered.** The register
+///    form and SIB forms return `None` and stay Unverified.
+/// 9. **The two-cell window carries a no-wrap precondition.** A CAS whose cell
+///    straddles the 2^64 boundary is not claimed.
+fn reconstruct_x86_cmpxchg_narrow(
+    inst: &X86ISelInst,
+    table_width: u32,
+    from_opcode: String,
+) -> Option<ProofObligation> {
+    use crate::x86_64_semantics::encode_lock_cmpxchg_narrow;
+
+    // MACHINE width, re-derived from the REAL emitted opcode. A disagreement
+    // with the table's claim fails closed.
+    let machine_width = match inst.opcode {
+        X86Opcode::Cmpxchg8 => 8u32,
+        X86Opcode::Cmpxchg16 => 16u32,
+        _ => return None,
+    };
+    if machine_width != table_width {
+        return None;
+    }
+
+    let pre = x86_cmpxchg_narrow_prestate(inst, machine_width)?;
+    let effect = encode_lock_cmpxchg_narrow(
+        machine_width,
+        &pre.mem0,
+        &pre.machine_ea,
+        &pre.rax_pre,
+        &pre.src_reg,
+    );
+    let (trust_ir_expr, machine_expr) = x86_cmpxchg_narrow_sides(&pre, machine_width, &effect);
+
+    // NON-DEGENERACY IS A PRECONDITION OF THE CREDIT, NOT A PROPERTY OF SOME
+    // TEST ELSEWHERE. `reconstruction_discharges_valid` — the gate's credit
+    // rule — asks only for `is_reconstructed() && Valid`, which a vacuous
+    // `X == X` satisfies: replacing this function's two sides with one
+    // expression twice would keep both rows GREEN at 173/199 while the
+    // obligation proved nothing. It is checked HERE rather than in the shared
+    // credit rule because for a COMMUTATIVE reconstructed ALU row
+    // (`bvadd == bvadd`) structural identity is legitimate — both sides are
+    // independently derived and happen to coincide. For this row it never is:
+    // the source side is a pure `ite`/`eq` over three w-bit value leaves and
+    // the machine side is an extract/concat tree over 64-bit RAX, a 32-bit
+    // carrier and an `Array(BV64, BV8)`, so coincidence means someone deleted
+    // a side. Fail CLOSED: the rows go back to RED and the ratio pins fail.
+    if trust_ir_expr == machine_expr {
+        return None;
+    }
+
+    Some(ProofObligation {
+        name: format!(
+            "RECONSTRUCTED x86_64 CmpXchg_I{machine_width} -> {:?} (AL/AX returns-old + \
+             RAX[63:{machine_width}] preserved + conditional store + adjacent cell + frame probe \
+             + ZF, real-EA, real-operand)",
+            inst.opcode
+        ),
+        trust_ir_expr,
+        aarch64_expr: machine_expr,
+        inputs: pre.inputs,
+        preconditions: pre.preconditions,
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+        machine_side_provenance: MachineSideProvenance::Reconstructed {
+            from_opcode,
+            arity: 2,
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The 128-bit atomic-load pseudo (zeroing XORs + LOCK CMPXCHG16B) reconstruction
+// ---------------------------------------------------------------------------
+
+/// The shared PRE-STATE of the CMPXCHG16B atomic-load pseudo's reconstruction:
+/// the fresh symbolic leaves (incoming registers included), the two effective
+/// addresses and the two seeded memories.
+/// Input to both sides of every facet, never semantics.
+///
+/// Public so negative controls can take the REAL prestate, mutate ONE field of
+/// the REAL machine effect and re-assemble the facets with
+/// [`x86_cmpxchg16b_facets`].
+///
+/// Every 128-bit value is a `concat` of two 64-bit leaves: the default
+/// sampler draws a leaf from a 64-bit state, so a 128-bit leaf would have a
+/// constant-zero high half, and a 128-bit `Var` evaluates to the 64-bit value
+/// variant, which never compares equal to a 128-bit one.
+#[derive(Debug, Clone)]
+pub struct Cmpxchg16bPrestate {
+    /// trust_ir effective address (`encode_trust_ir_binop` composition).
+    pub ir_ea: SmtExpr,
+    /// x86 effective address (`encode_lea_base_disp`). For the `[base+disp]`
+    /// form it is the SAME node as `ir_ea` (see
+    /// [`CmpxchgNarrowPrestate::machine_ea`]): what it buys is a FRAME — every
+    /// read-back is taken at `ir_ea`, so a machine model at another address
+    /// refutes.
+    pub machine_ea: SmtExpr,
+    /// Memory of the GENERAL instance: `old` at `ir_ea`, `below` at `ir_ea-8`,
+    /// `above` at `ir_ea+16`, `probe_val` at `probe_ea`.
+    pub mem0: SmtExpr,
+    /// Memory of the ZERO-COMPARAND LOAD instance: `old_load` at `ir_ea`, the
+    /// same neighbours and probe byte.
+    pub mem0_load: SmtExpr,
+    /// The 16 bytes at `ir_ea` before the CAS (`recon_old_hi:recon_old_lo`).
+    pub old: SmtExpr,
+    /// The comparand: `sel ? old ^ delta : old` (`sel` = `recon_sel[15]`), so
+    /// about half the samples take the SUCCESS branch. Onto every
+    /// `(old, expected)` pair (`sel = 1`, `delta = old ^ expected`).
+    pub expected: SmtExpr,
+    /// The replacement (`recon_desired_hi:recon_desired_lo`).
+    pub desired: SmtExpr,
+    /// The 16 bytes at `ir_ea` before the LOAD pseudo:
+    /// `zsel[15] ? 0 : (zsel[14] ? upper(rdx_in):upper(rax_in) : old)`. About
+    /// half the samples hit a cell equal to the ZERO comparand the pseudo sets
+    /// up (the CMPXCHG16B then STORES `RCX:RBX`), and about a quarter a cell
+    /// built from the INCOMING `RDX:RAX` — the value a model that skipped or
+    /// NARROWED a zeroing would compare against, and then overwrite.
+    /// `upper(v)` is `v` itself or `v` with its low 32, 16 or 8 bits cleared
+    /// (`zsel[11:10]` picks for RAX, `zsel[9:8]` for RDX; `00` keeps `v`): a
+    /// zeroing that clears only the low bits of RAX or RDX (a
+    /// non-zero-extending `XOR EAX,EAX` transcription, an `XOR AX,AX` or an
+    /// `XOR AL,AL`) leaves exactly that comparand, and without these cells the
+    /// load facets could not refute it.
+    pub old_load: SmtExpr,
+    /// Incoming RAX (before the pseudo's `XOR EAX,EAX`): `zsel[13] ? 0 :
+    /// recon_rax_in`, so a cell equal to the comparand a model skipping only
+    /// ONE of the RAX/RDX zeroings would use is reached too.
+    pub rax_in: SmtExpr,
+    /// Incoming RDX: `zsel[12] ? 0 : recon_rdx_in`.
+    pub rdx_in: SmtExpr,
+    /// Incoming RBX (`recon_rbx_in`), stored by a model that skips its zeroing.
+    pub rbx_in: SmtExpr,
+    /// Incoming RCX (`recon_rcx_in`), stored by a model that skips its zeroing.
+    pub rcx_in: SmtExpr,
+    /// The qword at `ir_ea - 8`, which neither instance may disturb.
+    pub below: SmtExpr,
+    /// The qword at `ir_ea + 16`, which neither instance may disturb.
+    pub above: SmtExpr,
+    /// `ir_ea + sext(recon_probe_off[15:8])`: one byte anywhere in
+    /// `[ir_ea - 128, ir_ea + 127]` outside the modeled 32-byte window.
+    pub probe_ea: SmtExpr,
+    /// The byte seeded at `probe_ea`.
+    pub probe_val: SmtExpr,
+    /// Declared SMT input leaves, in declaration order (17 — an ODD count, so
+    /// the sampler's per-leaf low bit is not frozen).
+    pub inputs: Vec<(String, u32)>,
+    /// The 32-byte window does not wrap; the probe lies outside it.
+    pub preconditions: Vec<SmtExpr>,
+}
+
+/// Build the shared pre-state of the CMPXCHG16B atomic-load pseudo's
+/// reconstruction from the REAL emitted instruction, or `None` (fail closed)
+/// for any shape this model does not cover: not `AtomicLoadCmpxchg16b`; not
+/// exactly one operand; not a plain `[base + disp]` operand (the encoder
+/// refuses an index); or a `PReg` base that overlaps one of the four zeroed
+/// registers (the pseudo would zero its own base; the encoder refuses such a
+/// base too).
+pub fn x86_cmpxchg16b_prestate(inst: &X86ISelInst) -> Option<Cmpxchg16bPrestate> {
+    use crate::memory_proofs::{encode_store_le, zeroed_memory};
+    use trust_cg_ir::x86_64_regs::{RBX, RCX, x86_regs_overlap};
+
+    if inst.opcode != X86Opcode::AtomicLoadCmpxchg16b || inst.operands.len() != 1 {
+        return None;
+    }
+    let X86ISelOperand::MemAddr { base, .. } = &inst.operands[0] else {
+        return None;
+    };
+    if let X86ISelOperand::PReg(p) = base.as_ref()
+        && [RAX, RDX, RBX, RCX]
+            .into_iter()
+            .any(|fixed| x86_regs_overlap(*p, fixed))
+    {
+        return None;
+    }
+    let (ir_ea, machine_ea, mut inputs) = x86_reconstruct_effective_address(&inst.operands[0])?;
+
+    // Branch selectors are the TOP bit of a 16-bit leaf, never a 1-bit leaf
+    // (the sampler freezes low bits; see `x86_cmpxchg_narrow_prestate`).
+    let old_lo = SmtExpr::var("recon_old_lo", 64);
+    let old_hi = SmtExpr::var("recon_old_hi", 64);
+    let delta_lo = SmtExpr::var("recon_delta_lo", 64);
+    let delta_hi = SmtExpr::var("recon_delta_hi", 64);
+    let sel = SmtExpr::var("recon_sel", 16);
+    let zsel = SmtExpr::var("recon_zsel", 16);
+    let desired_lo = SmtExpr::var("recon_desired_lo", 64);
+    let desired_hi = SmtExpr::var("recon_desired_hi", 64);
+    let below = SmtExpr::var("recon_below", 64);
+    let above = SmtExpr::var("recon_above", 64);
+    let probe_off = SmtExpr::var("recon_probe_off", 16).extract(15, 8);
+    let probe_val = SmtExpr::var("recon_probe_val", 8);
+    // The INCOMING values of the four registers the pseudo zeroes. The machine
+    // side receives them and must not depend on them.
+    let rax_in_leaf = SmtExpr::var("recon_rax_in", 64);
+    let rdx_in_leaf = SmtExpr::var("recon_rdx_in", 64);
+    let rbx_in = SmtExpr::var("recon_rbx_in", 64);
+    let rcx_in = SmtExpr::var("recon_rcx_in", 64);
+    inputs.extend([
+        ("recon_old_lo".to_string(), 64),
+        ("recon_old_hi".to_string(), 64),
+        ("recon_delta_lo".to_string(), 64),
+        ("recon_delta_hi".to_string(), 64),
+        ("recon_sel".to_string(), 16),
+        ("recon_zsel".to_string(), 16),
+        ("recon_desired_lo".to_string(), 64),
+        ("recon_desired_hi".to_string(), 64),
+        ("recon_below".to_string(), 64),
+        ("recon_above".to_string(), 64),
+        ("recon_probe_off".to_string(), 16),
+        ("recon_probe_val".to_string(), 8),
+        ("recon_rax_in".to_string(), 64),
+        ("recon_rdx_in".to_string(), 64),
+        ("recon_rbx_in".to_string(), 64),
+        ("recon_rcx_in".to_string(), 64),
+    ]);
+
+    let bit_set = |leaf: &SmtExpr, bit: u32| {
+        leaf.clone()
+            .extract(bit, bit)
+            .eq_expr(SmtExpr::bv_const(1, 1))
+    };
+    let old = old_hi.concat(old_lo);
+    let expected = SmtExpr::ite(
+        bit_set(&sel, 15),
+        old.clone().bvxor(delta_hi.concat(delta_lo)),
+        old.clone(),
+    );
+    let desired = desired_hi.concat(desired_lo);
+    // Selectors are bits of the TOP byte of `recon_zsel`, which the sampler
+    // sweeps fully (`x86_cmpxchg_narrow_prestate`).
+    let rax_in = SmtExpr::ite(bit_set(&zsel, 13), SmtExpr::bv_const(0, 64), rax_in_leaf);
+    let rdx_in = SmtExpr::ite(bit_set(&zsel, 12), SmtExpr::bv_const(0, 64), rdx_in_leaf);
+    // The comparand a NARROWED zeroing leaves: the incoming value with only its
+    // low 32, 16 or 8 bits cleared (`hi:lo` selector bits; `00` = the whole
+    // incoming value, the comparand of a SKIPPED zeroing). Seeding the cell with
+    // it is what lets a partial-width RAX/RDX zeroing refute: the CMPXCHG16B then
+    // succeeds and overwrites the cell with `RCX:RBX`.
+    let upper_bits_only = |value: &SmtExpr, hi: u32, lo: u32| {
+        let clear_low = |bits: u32| {
+            value
+                .clone()
+                .bvand(SmtExpr::bv_const(!((1u64 << bits) - 1), 64))
+        };
+        SmtExpr::ite(
+            bit_set(&zsel, hi),
+            SmtExpr::ite(bit_set(&zsel, lo), clear_low(32), clear_low(16)),
+            SmtExpr::ite(bit_set(&zsel, lo), clear_low(8), value.clone()),
+        )
+    };
+    let old_load = SmtExpr::ite(
+        bit_set(&zsel, 15),
+        SmtExpr::bv_const(0, 128),
+        SmtExpr::ite(
+            bit_set(&zsel, 14),
+            upper_bits_only(&rdx_in, 9, 8).concat(upper_bits_only(&rax_in, 11, 10)),
+            old.clone(),
+        ),
+    );
+
+    let below_ea = ir_ea.clone().bvadd(SmtExpr::bv_const((-8i64) as u64, 64));
+    let above_ea = ir_ea.clone().bvadd(SmtExpr::bv_const(16, 64));
+    let window_last = ir_ea.clone().bvadd(SmtExpr::bv_const(23, 64));
+    let probe_ea = ir_ea.clone().bvadd(probe_off.sign_ext(56));
+    let seed = |cell: &SmtExpr| {
+        let mem = zeroed_memory();
+        let mem = encode_store_le(&mem, &ir_ea, cell, 16);
+        let mem = encode_store_le(&mem, &below_ea, &below, 8);
+        let mem = encode_store_le(&mem, &above_ea, &above, 8);
+        encode_store_le(&mem, &probe_ea, &probe_val, 1)
+    };
+    let mem0 = seed(&old);
+    let mem0_load = seed(&old_load);
+
+    // Inclusive last byte, not the exclusive end: at the largest admitted start
+    // (`ir_ea = 2^64 - 24`, reached by a zero base at displacement -24) the end
+    // `ir_ea + 24` wraps to 0, which made `probe_ea <u end` false for EVERY
+    // probe and admitted one seeded over the lower neighbour.
+    let probe_inside_the_window = probe_ea
+        .clone()
+        .bvuge(below_ea.clone())
+        .and_expr(probe_ea.clone().bvule(window_last));
+    let preconditions = vec![
+        // [ir_ea - 8, ir_ea + 24) does not wrap the address space.
+        ir_ea.clone().bvuge(SmtExpr::bv_const(8, 64)),
+        SmtExpr::bv_const(u64::MAX - 23, 64).bvuge(ir_ea.clone()),
+        // The frame probe names a byte OUTSIDE the modeled window.
+        probe_inside_the_window.not_expr(),
+    ];
+
+    Some(Cmpxchg16bPrestate {
+        ir_ea,
+        machine_ea,
+        mem0,
+        mem0_load,
+        old,
+        expected,
+        desired,
+        old_load,
+        rax_in,
+        rdx_in,
+        rbx_in,
+        rcx_in,
+        below,
+        above,
+        probe_ea,
+        probe_val,
+        inputs,
+        preconditions,
+    })
+}
+
+/// One facet of a CMPXCHG16B obligation: `(label, source, machine)`.
+pub type Cmpxchg16bFacet = (&'static str, SmtExpr, SmtExpr);
+
+/// The eleven facets of the CMPXCHG16B atomic-load pseudo's obligation, from a
+/// pre-state and two machine effects: `cas`, the bare `LOCK CMPXCHG16B`
+/// transcription over `mem0` with RDX:RAX = `expected` and RCX:RBX =
+/// `desired` (transcription fidelity at general inputs); and `load`, the WHOLE
+/// pseudo — four zeroing XORs, then the CMPXCHG16B — over `mem0_load` and the
+/// incoming `rax_in`/`rdx_in`/`rbx_in`/`rcx_in`.
+///
+/// Every SOURCE side reads no machine effect: the CAS facets come from
+/// [`crate::trust_ir_semantics::encode_trust_ir_cmpxchg`] over the 128-bit
+/// value leaves, the LOAD facets from the trust-ir `AtomicLoad` semantics (a
+/// 16-byte little-endian read of the cell; memory unchanged), and the frame
+/// facets are the seeded neighbour/probe values. Every MACHINE read-back is at
+/// the SOURCE address.
+pub fn x86_cmpxchg16b_facets(
+    pre: &Cmpxchg16bPrestate,
+    cas: &crate::x86_64_semantics::X86Cmpxchg16bEffect,
+    load: &crate::x86_64_semantics::X86Cmpxchg16bEffect,
+) -> Vec<Cmpxchg16bFacet> {
+    use crate::memory_proofs::encode_load_le;
+    use crate::trust_ir_semantics::encode_trust_ir_cmpxchg;
+
+    let bit = |b: SmtExpr| SmtExpr::ite(b, SmtExpr::bv_const(1, 1), SmtExpr::bv_const(0, 1));
+    let below_ea = pre
+        .ir_ea
+        .clone()
+        .bvadd(SmtExpr::bv_const((-8i64) as u64, 64));
+    let above_ea = pre.ir_ea.clone().bvadd(SmtExpr::bv_const(16, 64));
+    let source =
+        encode_trust_ir_cmpxchg(pre.old.clone(), pre.expected.clone(), pre.desired.clone());
+    // trust-ir AtomicLoad I128: the 16 bytes at the pointer; memory unchanged.
+    let atomic_load = encode_load_le(&pre.mem0_load, &pre.ir_ea, 16);
+
+    vec![
+        (
+            "cas.returns_old",
+            source.loaded,
+            cas.rdx_after.clone().concat(cas.rax_after.clone()),
+        ),
+        (
+            "cas.conditional_store",
+            source.stored,
+            encode_load_le(&cas.mem_after, &pre.ir_ea, 16),
+        ),
+        (
+            "cas.zf_is_success",
+            bit(source.success),
+            bit(cas.zf.clone()),
+        ),
+        (
+            "cas.below_untouched",
+            pre.below.clone(),
+            encode_load_le(&cas.mem_after, &below_ea, 8),
+        ),
+        (
+            "cas.above_untouched",
+            pre.above.clone(),
+            encode_load_le(&cas.mem_after, &above_ea, 8),
+        ),
+        (
+            "cas.frame_probe",
+            pre.probe_val.clone(),
+            encode_load_le(&cas.mem_after, &pre.probe_ea, 1),
+        ),
+        (
+            "load.returns_value",
+            atomic_load,
+            load.rdx_after.clone().concat(load.rax_after.clone()),
+        ),
+        (
+            "load.cell_unchanged",
+            pre.old_load.clone(),
+            encode_load_le(&load.mem_after, &pre.ir_ea, 16),
+        ),
+        (
+            "load.below_untouched",
+            pre.below.clone(),
+            encode_load_le(&load.mem_after, &below_ea, 8),
+        ),
+        (
+            "load.above_untouched",
+            pre.above.clone(),
+            encode_load_le(&load.mem_after, &above_ea, 8),
+        ),
+        (
+            "load.frame_probe",
+            pre.probe_val.clone(),
+            encode_load_le(&load.mem_after, &pre.probe_ea, 1),
+        ),
+    ]
+}
+
+/// Assemble facets into the `(source, machine)` pair of one obligation: the
+/// SOURCE side is the all-ones `n`-bit constant, the MACHINE side the `concat`
+/// of the `n` facet-equality bits (first facet in the most significant bit),
+/// so a counterexample names exactly the facets that failed.
+///
+/// A conjunction rather than one joint `concat` of the facet VALUES because the
+/// default evaluator's bit-vectors stop at 128 bits: the joint value would be
+/// 128 + 128 + 1 + 64 + 64 + 8 (CAS) + 128 + 128 + 64 + 64 + 8 (load) = 785
+/// bits, and every facet above 64 bits must still be compared whole. Equality
+/// of two 128-bit values IS supported, exactly.
+pub fn x86_cmpxchg16b_sides(facets: &[Cmpxchg16bFacet]) -> (SmtExpr, SmtExpr) {
+    let n = facets.len() as u32;
+    let mut machine: Option<SmtExpr> = None;
+    for (_, source, machine_side) in facets {
+        let equal = SmtExpr::ite(
+            source.clone().eq_expr(machine_side.clone()),
+            SmtExpr::bv_const(1, 1),
+            SmtExpr::bv_const(0, 1),
+        );
+        machine = Some(match machine {
+            None => equal,
+            Some(acc) => acc.concat(equal),
+        });
+    }
+    let all_ones = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    (
+        SmtExpr::bv_const(all_ones, n),
+        machine.unwrap_or_else(|| SmtExpr::bv_const(0, 1)),
+    )
+}
+
+/// Reconstruct the 128-bit atomic-load pseudo (`AtomicLoadCmpxchg16b`: four
+/// zeroing XORs, then `LOCK CMPXCHG16B`) from the real emitted instruction.
+///
+/// # What IS obligated
+///
+/// The ZERO-COMPARAND PRECONDITION. The machine side of the load facets is the
+/// whole pseudo over the INCOMING register values, so what is shown is that
+/// the expansion — zeroing included — is the trust-ir `AtomicLoad` whatever
+/// RAX/RDX/RBX/RCX held before it. A model without one of the XORs refutes
+/// (it compares against, or stores, an incoming value; the prestate seeds
+/// cells equal to those values), and so does a model whose zeroing clears only
+/// the low 32, 16 or 8 bits of any of the four (the prestate also seeds cells
+/// equal to the upper-bits-only comparand; see
+/// [`Cmpxchg16bPrestate::old_load`]). That is a statement about the MODEL.
+/// That the emitted bytes are the four bare zero-extending `XOR r32,r32` is
+/// ENC-3's per-compile decode check (item 2 below), not this obligation. No
+/// separate instruction carries a zero, so no pass can remove one without
+/// changing this opcode.
+///
+/// # What this credit does NOT claim
+///
+/// 1. **Not atomicity.** LOCK serialization, cross-thread ordering and the
+///    ordering the trust-ir instruction carries are the Intel-SDM axiom the
+///    other atomic rows rest on; single-thread data flow only.
+/// 2. **Not bytes.** Keyed on the `X86Opcode` value. The byte link — the
+///    four `31 /r` zeroings and `F0 REX.W 0F C7 /1`, whose 16-byte width exists
+///    ONLY in REX.W — is ENC-3's decode check, which decodes all five
+///    instructions and fails the compile closed on a dropped, retargeted or
+///    narrowed (`30 /r`, `66 31 /r`) XOR, a dropped REX.W or LOCK, a wrong
+///    `/reg` extension or a register-form ModR/M. The `x86_encoding_gate`
+///    target (`cmpxchg16b_per_compile_decode_check_rejects_every_zeroing_drift`)
+///    runs that check, and `reconstruction_x86` the reconstruction, as
+///    `scripts/soundness_check.sh` gates.
+/// 3. **Not the read-back binding.** That the two copies after the pseudo
+///    read RAX as the low and RDX as the high limb is the separately credited
+///    copies plus the post-RA dataflow model of the fixed registers (the
+///    `Idiv`/narrow-CMPXCHG limitation). RBX and RCX end at 0; their clobber is
+///    the register frame's (TV-5, `add_x86_fixed_implicit_operands`), not a
+///    facet.
+/// 4. **Not alignment or availability.** The #GP on a misaligned operand and
+///    the #UD without CX16 are out of the model; alignment is the type's,
+///    availability the function's `cmpxchg16b` claim (adapter floor).
+/// 5. **Only ZF of the flags**, and only for the bare-transcription facets;
+///    TV-5 models every flag but ZF as clobbered.
+/// 6. **The memory frame is WINDOWED**: the 16-byte cell, the qwords on either
+///    side and one probe byte in `[ea-128, ea+127]`; a store farther away is not
+///    claimed. Byte order is the crate-wide little-endian trust base.
+/// 7. **The default discharge is `Statistical` evaluation**, accepted regression
+///    evidence, not a formal proof — exactly as every other reconstructed row.
+/// 8. **Only `[base + disp]`.** Any other operand shape returns `None`.
+/// 9. **Not the address.** `ir_ea` and `machine_ea` are built from the same
+///    operand, so no address error refutes here (the teeth audit measures this
+///    semantically); the ADDRESS facet is the byte-level
+///    `x86_addressing_proofs` lane's.
+/// 10. **Not the LIR operation.** This takes only the `X86ISelInst`; its source
+///     side is FIXED to trust-ir `AtomicLoad I128` (and `CmpXchg I128` for the
+///     bare-transcription facets). The only tie from the emitted pseudo back to
+///     the LIR instruction it was selected for is TV-2's op CLASS
+///     (`x86_emitted_op_class` -> `OpClass::Atomic`), which `AtomicLoad`,
+///     `AtomicStore`, `AtomicRmw`, `CmpXchg` and `Fence` all share, so an ISel
+///     defect that stamped this pseudo for a 128-bit store, RMW or CAS would pass
+///     TV-2 and this obligation would still discharge. Today no selector does:
+///     `select_atomic_store`, `select_atomic_rmw` and `select_cmpxchg` refuse
+///     `I128` (pinned in trust-cg-lower by
+///     `test_only_an_i128_atomic_load_selects_the_cmpxchg16b_pseudo`), and under
+///     E0.2 no Formal credit is granted without the TV-1 operand binding, which
+///     this row does not have. The narrow CMPXCHG credit states its analogue as
+///     the tie from `w` to the LIR type.
+fn reconstruct_x86_cmpxchg16b(inst: &X86ISelInst, from_opcode: String) -> Option<ProofObligation> {
+    use crate::x86_64_semantics::{encode_atomic_load_cmpxchg16b, encode_lock_cmpxchg16b};
+
+    let pre = x86_cmpxchg16b_prestate(inst)?;
+    let cas = encode_lock_cmpxchg16b(
+        &pre.mem0,
+        &pre.machine_ea,
+        &pre.expected.clone().extract(63, 0),
+        &pre.expected.clone().extract(127, 64),
+        &pre.desired.clone().extract(63, 0),
+        &pre.desired.clone().extract(127, 64),
+    );
+    let load = encode_atomic_load_cmpxchg16b(
+        &pre.mem0_load,
+        &pre.machine_ea,
+        &pre.rax_in,
+        &pre.rdx_in,
+        &pre.rbx_in,
+        &pre.rcx_in,
+    );
+    let facets = x86_cmpxchg16b_facets(&pre, &cas, &load);
+
+    // NON-DEGENERACY IS A PRECONDITION OF THE CREDIT (see the narrow CMPXCHG):
+    // every facet's source is a trust-ir value / seeded leaf and its machine
+    // side an SDM read-back, so a facet whose two sides are ONE expression
+    // means a side was deleted. Fail closed.
+    if facets.iter().any(|(_, source, machine)| source == machine) {
+        return None;
+    }
+    let (trust_ir_expr, machine_expr) = x86_cmpxchg16b_sides(&facets);
+
+    Some(ProofObligation {
+        name: format!(
+            "RECONSTRUCTED x86_64 AtomicLoad_I128 + CmpXchg_I128 -> {:?} (zeroing XORs + \
+             LOCK CMPXCHG16B over arbitrary incoming RAX/RDX/RBX/RCX: returned value + \
+             unchanged cell; bare CMPXCHG16B returns-old + conditional store + ZF; \
+             neighbour qwords + frame probe, real-EA, real-operand)",
+            inst.opcode
+        ),
+        trust_ir_expr,
+        aarch64_expr: machine_expr,
+        inputs: pre.inputs,
+        preconditions: pre.preconditions,
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+        machine_side_provenance: MachineSideProvenance::Reconstructed {
+            from_opcode,
+            arity: 1,
         },
     })
 }
@@ -3832,6 +5098,7 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
                     | X86Opcode::MovsdRMSib
                     | X86Opcode::MovssRMSib
                     | X86Opcode::MovRM8Sib
+                    | X86Opcode::MovzxRM8Sib
             ) {
                 // The SIB loads share the SibMemAddr operand shape; only the
                 // destination register class differs (GPR64 / GPR32 / XMM-f64 /
@@ -3841,7 +5108,7 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
                     // 8-bit SIB load's dest VReg is a 32-bit GPR exactly as
                     // MovRM8's is; the LOAD WIDTH is fixed by the opcode, not by
                     // the register class.
-                    X86Opcode::MovRM32Sib | X86Opcode::MovRM8Sib => r32(0),
+                    X86Opcode::MovRM32Sib | X86Opcode::MovRM8Sib | X86Opcode::MovzxRM8Sib => r32(0),
                     X86Opcode::MovsdRMSib => xd(0),
                     X86Opcode::MovssRMSib => xs(0),
                     _ => r64(0),
@@ -3859,15 +5126,22 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
                     ],
                 ));
             }
-            let dst = if matches!(opcode, X86Opcode::MovssRM) {
+            // A VOLATILE load takes the destination class of its byte-identical
+            // plain sibling: the x86 ISel gives both `reg_class_for_type(ty)`
+            // (I64 -> Gpr64, F32 -> Fpr32, F64 -> Fpr64). Before this arm named
+            // them, `VolatileMovRM`/`VolatileMovsdRM` fell to the Gpr32 default,
+            // a 64-bit load into a 32-bit register that the reconstruction
+            // refuses, and `VolatileMovssRM` got a GPR where the real instruction
+            // has an XMM register.
+            let dst = if matches!(opcode, X86Opcode::MovssRM | X86Opcode::VolatileMovssRM) {
                 xs(0)
-            } else if matches!(opcode, X86Opcode::MovsdRM) {
+            } else if matches!(opcode, X86Opcode::MovsdRM | X86Opcode::VolatileMovsdRM) {
                 xd(0)
-            } else if matches!(opcode, X86Opcode::MovRM) {
+            } else if matches!(opcode, X86Opcode::MovRM | X86Opcode::VolatileMovRM) {
                 r64(0)
             } else {
-                // MovRM8/16/32: the dest VReg is a 32-bit GPR (reg_class_for_type
-                // maps I8/I16/I32 -> Gpr32).
+                // MovRM8/16/32 and their volatile forms: the dest VReg is a
+                // 32-bit GPR (reg_class_for_type maps I8/I16/I32 -> Gpr32).
                 r32(0)
             };
             vec![
@@ -3906,11 +5180,14 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
                     ],
                 ));
             }
-            let value = if matches!(opcode, X86Opcode::MovssMR) {
+            // As for the loads, a VOLATILE store takes the value class of its
+            // plain sibling; `VolatileMovMR`/`VolatileMovssMR`/`VolatileMovsdMR`
+            // used to fall to the Gpr32 default.
+            let value = if matches!(opcode, X86Opcode::MovssMR | X86Opcode::VolatileMovssMR) {
                 xs(1)
-            } else if matches!(opcode, X86Opcode::MovsdMR) {
+            } else if matches!(opcode, X86Opcode::MovsdMR | X86Opcode::VolatileMovsdMR) {
                 xd(1)
-            } else if matches!(opcode, X86Opcode::MovMR) {
+            } else if matches!(opcode, X86Opcode::MovMR | X86Opcode::VolatileMovMR) {
                 r64(1)
             } else {
                 r32(1)
@@ -3930,6 +5207,23 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
         //      refutes — see the reconstruction_x86 packed-move refutation tests). --
         X86SourceOp::V128MemLoad { .. } => {
             let x128 = |id: u32| X86ISelOperand::VReg(VReg::new(id, RegClass::Fpr128));
+            // MovdquRMSib is the SIB member of the family: its representative
+            // must carry a SibMemAddr (the pipeline's SIB-opcode integrity guard
+            // rejects a MemAddr-shaped one), mirroring the MovRMSib MemLoad case.
+            if matches!(opcode, X86Opcode::MovdquRMSib) {
+                return Some(X86ISelInst::new(
+                    opcode,
+                    vec![
+                        x128(0),
+                        X86ISelOperand::SibMemAddr {
+                            base: Box::new(r64(1)),
+                            index: Box::new(r64(2)),
+                            scale: 1,
+                            disp: 0,
+                        },
+                    ],
+                ));
+            }
             vec![
                 x128(0),
                 X86ISelOperand::MemAddr {
@@ -3941,6 +5235,20 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
         // ---- PACKED 128-bit XMM STORE: [MemAddr{base, disp}, value_xmm128]. ----
         X86SourceOp::V128MemStore { .. } => {
             let x128 = |id: u32| X86ISelOperand::VReg(VReg::new(id, RegClass::Fpr128));
+            if matches!(opcode, X86Opcode::MovdquMRSib) {
+                return Some(X86ISelInst::new(
+                    opcode,
+                    vec![
+                        X86ISelOperand::SibMemAddr {
+                            base: Box::new(r64(0)),
+                            index: Box::new(r64(1)),
+                            scale: 1,
+                            disp: 0,
+                        },
+                        x128(2),
+                    ],
+                ));
+            }
             vec![
                 X86ISelOperand::MemAddr {
                     base: Box::new(r64(0)),
@@ -4006,6 +5314,29 @@ pub fn representative_reconstructable_inst(opcode: X86Opcode) -> Option<X86ISelI
                 r64(1),
             ]
         }
+
+        // ---- NARROW LOCK CMPXCHG: [src_reg(Gpr32), MemAddr{base, disp}].
+        //      `select_cmpxchg` carries the i8/i16 source in a Gpr32 VReg for
+        //      BOTH widths, and always emits a plain `[base+0]` operand. The
+        //      accumulator (AL/AX) is implicit and is modeled as fresh leaves.
+        //      `representative_reconstructable_insts` additionally requires a
+        //      NEGATIVE displacement to discharge, exercising the sign handling
+        //      in the effective-address half. ----
+        X86SourceOp::CmpxchgNarrow { .. } => vec![
+            r32(0),
+            X86ISelOperand::MemAddr {
+                base: Box::new(r64(1)),
+                disp: 0,
+            },
+        ],
+
+        // ---- LOCK CMPXCHG16B: [MemAddr{base, disp}] only; the four data
+        //      registers are implicit. `representative_reconstructable_insts`
+        //      additionally requires a NEGATIVE displacement to discharge. ----
+        X86SourceOp::AtomicLoadCmpxchg16b => vec![X86ISelOperand::MemAddr {
+            base: Box::new(r64(0)),
+            disp: 0,
+        }],
 
         // ---- IN-PLACE Inc/Dec: [dst] (read-modify-write of one register). ----
         X86SourceOp::InPlaceIncDec { .. } => vec![r64(0)],
@@ -4098,6 +5429,48 @@ fn representative_reconstructable_insts(opcode: X86Opcode) -> Vec<X86ISelInst> {
             .map(|cc| X86ISelInst::new(opcode, vec![reg(0), reg(1), X86ISelOperand::CondCode(cc)]))
             .collect()
         }
+        // The narrow LOCK CMPXCHG forms must discharge at BOTH a zero and a
+        // NEGATIVE displacement. The two-cell memory window is addressed off the
+        // reconstructed effective address, so a sign-handling bug in the
+        // displacement half of `encode_lea_base_disp` would put the neighbour
+        // check at the wrong place; requiring disp = -24 exercises it.
+        X86Opcode::Cmpxchg8 | X86Opcode::Cmpxchg16 => {
+            let r32 = |id: u32| X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr32));
+            let r64 = |id: u32| X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr64));
+            [0i32, -24]
+                .into_iter()
+                .map(|disp| {
+                    X86ISelInst::new(
+                        opcode,
+                        vec![
+                            r32(0),
+                            X86ISelOperand::MemAddr {
+                                base: Box::new(r64(1)),
+                                disp,
+                            },
+                        ],
+                    )
+                })
+                .collect()
+        }
+        // CMPXCHG16B, like the narrow forms: a zero AND a NEGATIVE displacement,
+        // so the 32-byte window around the cell is addressed off a
+        // sign-extended displacement too.
+        X86Opcode::AtomicLoadCmpxchg16b => {
+            let r64 = |id: u32| X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr64));
+            [0i32, -24]
+                .into_iter()
+                .map(|disp| {
+                    X86ISelInst::new(
+                        opcode,
+                        vec![X86ISelOperand::MemAddr {
+                            base: Box::new(r64(0)),
+                            disp,
+                        }],
+                    )
+                })
+                .collect()
+        }
         _ => representative_reconstructable_inst(opcode)
             .into_iter()
             .collect(),
@@ -4105,16 +5478,39 @@ fn representative_reconstructable_insts(opcode: X86Opcode) -> Vec<X86ISelInst> {
 }
 
 /// Does the representative reconstructed obligation(s) for `opcode` discharge
-/// `Valid` under `config`? Used by the COVERAGE GATE to CREDIT a reconstructable
-/// x86-64 opcode as covered. Mirrors
+/// `Valid` under `config`? Used by the COVERAGE GATE to mark a reconstructable
+/// x86-64 opcode as covered in its inventory, and by codegen's peephole rewrite
+/// admission (`admit_x86_reconstructed_opcode`), which only admits a rewrite
+/// whose emitted instruction is then verified on its own. Mirrors
 /// `function_verifier::reconstruction_discharges_valid`.
 ///
 /// Returns `false` (NOT covered) for any opcode that is not reconstructable, has
 /// no representative instance, fails to reconstruct, is not tagged Reconstructed,
-/// or whose reconstructed obligation does not discharge `Valid` — the exact dual
-/// `is_reconstructed() && Valid` criterion the per-instruction walk uses. For the
+/// or whose reconstructed obligation does not discharge `Valid` for its
+/// synthesized representative instance(s), where a sampled sweep counts as
+/// `Valid`. That is NOT the per-instruction walk's credit rule: since E0.2 the
+/// walk credits an emitted instruction only from its own obligation with a
+/// complete (exhaustive or formal) discharge, and reports a sampled discharge
+/// as unverified. A `true` here is never instruction credit. For the
 /// mode-polymorphic round opcodes EVERY emitted mode must discharge (see
 /// [`representative_reconstructable_insts`]).
+///
+/// # NON-DEGENERACY IS NOT PART OF THIS RULE, AND CANNOT BE
+///
+/// `is_reconstructed() && Valid` is satisfied by a vacuous `X == X`, so a
+/// reconstructor that returned one expression twice would be CREDITED here.
+/// This rule cannot demand [`ProofObligation::is_genuinely_proven`] across the
+/// board: for a COMMUTATIVE reconstructed ALU row the two sides are
+/// independently derived and legitimately coincide (`bvadd == bvadd`), and
+/// requiring distinctness would turn honest rows RED.
+///
+/// Degeneracy is therefore a question each reconstructor answers for ITSELF,
+/// knowing whether its two sides can legitimately coincide. Where the answer is
+/// "never" the reconstructor must FAIL CLOSED rather than leave the property to
+/// a test — see [`reconstruct_x86_cmpxchg_narrow`], where a source side of
+/// `ite`/`eq` over three value leaves cannot equal a machine side of
+/// extract/concat over RAX, a 32-bit carrier and a memory array. A reconstructor
+/// that has never been asked this question is the gap to look at first.
 pub fn reconstruction_discharges_valid(opcode: X86Opcode, config: &VerificationConfig) -> bool {
     let insts = representative_reconstructable_insts(opcode);
     if insts.is_empty() {
@@ -4150,21 +5546,12 @@ const PREPASS_PAR_MIN_INSTS: usize = 16;
 /// verifies multiple functions concurrently: nested pre-passes interleave on
 /// the same workers instead of constructing a second full-width set of 32 MiB
 /// stacks. Pool construction failure retains the serial walk below.
-
-/// The pre-pass pool IF fanning out `item_count` instructions is worthwhile.
 ///
-/// BENCH-8: `None` (serial walk) when the opt-in reconstructed-obligation
-/// LIVE solver route is armed — a fanned-out STAGE-2 discharge could
-/// otherwise spawn z3 from multiple pool workers at once. This mirrors the
-/// cert-lane posture in trust-cg-codegen (`compile_x86_64` keeps the
-/// per-function lane serial when the route is armed); the default posture
-/// (route OFF, or a solver-absent host such as the rustc bridge) is
-/// unaffected.
+/// The pre-pass pool IF fanning out `item_count` instructions is worthwhile.
+/// Reconstructed discharge is evaluation-only until exact source binding
+/// exists, so stage 2 cannot spawn a live solver.
 fn verifier_prepass_pool_for_items(item_count: usize) -> Option<&'static rayon::ThreadPool> {
     if item_count < PREPASS_PAR_MIN_INSTS {
-        return None;
-    }
-    if crate::verdict_db::reconstructed_live_solver_enabled() {
         return None;
     }
     crate::resource_limits::proof_verifier_parallel_pool()
@@ -4175,11 +5562,12 @@ fn verifier_prepass_pool_for_items(item_count: usize) -> Option<&'static rayon::
 // ---------------------------------------------------------------------------
 
 /// CT-8 STAGE-1 output: one instruction's BASE-verdict plan, with obligation
-/// CONSTRUCTION (pure, cheap) split from obligation DISCHARGE (the sweep /
-/// tier-0 / DB work behind [`X86DischargeKey`]).
+/// CONSTRUCTION (pure, cheap) split from obligation DISCHARGE (the evaluation
+/// sweep behind [`X86DischargeKey`]).
 enum X86BaseVerdictPlan {
-    /// The verdict needs no discharge at all: trap-skips, pseudos, and
-    /// opcodes with no proof mapping.
+    /// The verdict needs no discharge at all: trap-skips, pseudos, opcodes
+    /// with no proof mapping, and instructions whose only candidate evidence
+    /// is a registry theorem selected by name (withdrawn credit).
     Ready(InstructionVerificationResult),
     /// The verdict is the discharge of `key` — computed once per DISTINCT
     /// key in STAGE 2, reused by every instruction that maps to it in
@@ -4187,36 +5575,34 @@ enum X86BaseVerdictPlan {
     Discharge(X86DischargeKey),
 }
 
-/// CT-8: CONTENT key of one BASE-verdict discharge.
+/// CT-8: CONTENT key of one BASE-verdict discharge: the RECONSTRUCTED
+/// `instance` obligation (PHASE-2, task #66) and its PARAMETRIC `canonical`
+/// form (see `lowering_proof::discharge_reconstructed_obligation`).
 ///
 /// [`X86FunctionVerifier::discharge_key_verdict`] is a deterministic pure
 /// function of `(&self, key)` — the key carries EVERYTHING the discharge
 /// depends on besides the shared immutable verifier state (the
-/// [`ProofDatabase`], the [`VerificationConfig`], the process-wide
-/// compute-once verdict memo, and the committed tier-0 verdict DB) — so equal
-/// keys are GUARANTEED equal verdicts and the STAGE-2 dedupe may discharge
-/// each distinct key exactly once. `Eq`/`Hash` are structural (via
+/// [`VerificationConfig`] and the process-wide compute-once verdict memo) — so
+/// equal keys are GUARANTEED equal verdicts and the STAGE-2 dedupe may
+/// discharge each distinct key exactly once. `Eq`/`Hash` are structural (via
 /// [`ProofObligation`]'s content-complete derives — the PROOF-2 memo-key
 /// discipline): two keys differing anywhere in content occupy distinct
 /// entries, so the dedupe can never conflate different obligations.
 #[derive(PartialEq, Eq, Hash)]
-enum X86DischargeKey {
-    /// Static-DB path ([`X86FunctionVerifier::resolve_db_proof`]): resolve
-    /// `(category, query)` against the immutable [`ProofDatabase`] and
-    /// discharge the found row (or report Unverified on no match).
-    Db {
-        category: ProofCategory,
-        query: String,
-    },
-    /// Reconstruction path (PHASE-2, task #66): discharge the RECONSTRUCTED
-    /// `instance` obligation, preferring its PARAMETRIC `canonical` form for
-    /// the tier-0 lookup (see
-    /// `lowering_proof::discharge_reconstructed_obligation`). Boxed: the
-    /// obligations are large relative to the `Db` arm.
-    Recon {
-        instance: Box<ProofObligation>,
-        canonical: Box<ProofObligation>,
-    },
+struct X86DischargeKey {
+    instance: Box<ProofObligation>,
+    canonical: Box<ProofObligation>,
+    /// TV-1 EXTENDED: the checked exact source/operand binding for the
+    /// instruction this key came from, when it has one.
+    ///
+    /// Part of the KEY, not a side channel: a bound and an unbound instruction
+    /// can produce byte-identical obligation content, and they must not share a
+    /// deduped verdict — the bound one may earn `Formal` and the unbound one
+    /// must not. Carrying only the SCHEMA (not the source coordinates) keeps one
+    /// key per distinct obligation shape, so the stage-2 "each distinct key
+    /// discharged exactly once" dedupe still collapses a whole function's
+    /// identical rows into one discharge.
+    binding: Option<crate::x86_source_operand_binding::ExactSourceOperandBinding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4232,9 +5618,9 @@ pub struct X86FunctionVerifier {
 impl X86FunctionVerifier {
     /// The proof categories this verifier can ever consult.
     ///
-    /// Every `X86DischargeKey::Db` this verifier builds carries
-    /// `ProofCategory::X8664Lowering` (see `x86_base_verdict_plan` and
-    /// `resolve_db_proof`), so the other ~1300 obligations in a full
+    /// The only registry reads left are the bitfield recognizer's
+    /// registration guard (`has_registered_x86_proof`), all in
+    /// `ProofCategory::X8664Lowering`, so the other ~1300 obligations in a full
     /// `ProofDatabase` were constructed and never read. Building only these
     /// cuts the bridge's compile memory materially: `ProofDatabase::new()`
     /// materializes 1841 `SmtExpr` trees and is the bulk of the gap against
@@ -4264,12 +5650,14 @@ impl X86FunctionVerifier {
         }
     }
 
-    /// Map an x86-64 opcode to a proof search substring.
+    /// Map an x86-64 opcode to a registry search substring.
     ///
-    /// Returns `Some(name_substring)` for opcodes covered by
-    /// [`crate::x86_64_lowering_proofs::all_x86_64_proofs`], or `None`
+    /// Returns `Some(name_substring)` for opcodes that name a theorem family
+    /// in [`crate::x86_64_lowering_proofs::all_x86_64_proofs`], or `None`
     /// for opcodes that have no registered lowering proof (e.g. `Jmp`,
-    /// `Push`, `Pop`).
+    /// `Push`, `Pop`). This is an inventory and diagnostic surface only: the
+    /// verifier never credits an instruction with the theorem a substring
+    /// selects (see below: one query deliberately matches both widths).
     ///
     /// The substring is matched (case-sensitive) against the proof
     /// obligation `name` field, which follows the canonical form
@@ -4534,9 +5922,13 @@ impl X86FunctionVerifier {
             Movsx => Some("Sextend_I32_to_I64"),
 
             // MovRI: its only mapped proof was the degenerate "MOV r,imm
-            // materializes constant" const==const X==X (retracted in #62). No
-            // value-proof; FailClosedAllowlisted in classify_x86. (MovRR/MovRR32
-            // keep their GENUINE bit-identity Copy proofs.)
+            // materializes constant" const==const X==X (retracted in #62), and
+            // that stays retracted: there is NO static-DB value proof to map. It
+            // is `EmittableNeedsProof` in classify_x86 (IN the denominator, not
+            // allowlisted) and is credited by a different path entirely —
+            // `x86_encoding_proofs`, an independent SDM-derived decode of the
+            // real emitted bytes. (MovRR/MovRR32 keep their GENUINE bit-identity
+            // Copy proofs.)
             MovRI => None,
             MovRR => Some("Copy_I64 -> MOV r64,r64 preserves bits"),
             MovRR32 => Some("Copy_I32 -> MOV r32,r32 preserves bits"),
@@ -4606,8 +5998,12 @@ impl X86FunctionVerifier {
 
     fn proof_origin_to_proof_query(inst: &X86ISelInst) -> Option<&'static str> {
         match (inst.proof_origin, inst.opcode) {
-            (Some(X86ProofOrigin::AtomicLoad), X86Opcode::MovRM8) => Some("AtomicLoad_I8"),
-            (Some(X86ProofOrigin::AtomicLoad), X86Opcode::MovRM16) => Some("AtomicLoad_I16"),
+            (Some(X86ProofOrigin::AtomicLoad), X86Opcode::MovRM8 | X86Opcode::MovzxRM8) => {
+                Some("AtomicLoad_I8")
+            }
+            (Some(X86ProofOrigin::AtomicLoad), X86Opcode::MovRM16 | X86Opcode::MovzxRM16) => {
+                Some("AtomicLoad_I16")
+            }
             (Some(X86ProofOrigin::AtomicLoad), X86Opcode::MovRM32) => Some("AtomicLoad_I32"),
             (Some(X86ProofOrigin::AtomicLoad), X86Opcode::MovRM) => Some("AtomicLoad_I64"),
             (Some(X86ProofOrigin::AtomicStore), X86Opcode::MovMR8) => Some("AtomicStore_I8"),
@@ -5208,6 +6604,14 @@ impl X86FunctionVerifier {
             // both widths (see `x86_width_polymorphic_proofs`), so no facet ships
             // unproven. If the width cannot be resolved, stay Unverified (fail
             // closed) rather than guess a width.
+            //
+            // THIS ARM MATCHES `Cmpxchg` ONLY. `Cmpxchg8`/`Cmpxchg16` also carry
+            // a Gpr32 operand 0, so `atomic_rmw_cas_loop_generic_width` would
+            // answer "I32" for a BYTE compare-and-swap — binding it to a
+            // DOUBLEWORD theorem. They are credited by the
+            // `X86SourceOp::CmpxchgNarrow` reconstruction, which runs FIRST in
+            // `base_instruction_plan`, and must never reach this table; see
+            // `narrow_cmpxchg_never_binds_the_wide_cmpxchg_proofs`.
             X86Opcode::Cmpxchg => {
                 let width = Self::atomic_rmw_cas_loop_generic_width(inst)?;
                 Some(format!("Cmpxchg_{width} returns old value"))
@@ -5487,11 +6891,26 @@ impl X86FunctionVerifier {
         }
     }
 
-    fn trap_skip_reason(opcode: X86Opcode) -> Option<&'static str> {
+    /// The `Skipped` reason for an x86-64 trap instruction. A trap has no value
+    /// semantics to prove; `UD2` is the architecturally fixed `unreachable`
+    /// terminator. Public so a certificate builder can key an exemption on this
+    /// exact disposition rather than on the opcode alone.
+    pub fn trap_skip_reason(opcode: X86Opcode) -> Option<&'static str> {
         match opcode {
             X86Opcode::Ud2 => Some("x86-64 trap instruction"),
             _ => None,
         }
+    }
+
+    /// The `Unverified` reason for an opcode with no proof mapping at all:
+    /// neither a reconstructable operand form, nor a width-polymorphic query,
+    /// nor a static-DB query. Control transfers (`CALL`/`JMP`/`RET`) reach this
+    /// disposition BY DESIGN — their per-instruction theorem would be the
+    /// `target == target` tautology, and the CFG edge and the relocation carry
+    /// the evidence instead. Public so a certificate builder compares against
+    /// the exact string this verifier emits instead of re-spelling it.
+    pub fn no_proof_mapping_reason(opcode: X86Opcode) -> String {
+        format!("no proof mapping for x86-64 opcode {:?}", opcode)
     }
 
     /// PHASE-2 OPERAND RECONSTRUCTION (x86-64, task #66), CONSTRUCTION half:
@@ -5504,27 +6923,33 @@ impl X86FunctionVerifier {
     ///
     /// `None` when the opcode is NOT reconstructable, or the instruction has
     /// no reconstructable operand shape (e.g. a structural 2-address
-    /// AddRI/RSP cleanup, or a memory-form operand). The caller falls
-    /// through to the existing DB-substring path unchanged.
+    /// AddRI/RSP cleanup, or a memory-form operand). Such an instruction has
+    /// no instruction-built obligation and is never credited.
     ///
     /// The discharge half is [`Self::discharge_reconstructed`]; its credit
     /// rule keys on [`ProofObligation::is_reconstructed`], never on a
     /// `name.contains` lookup — the binding is a typed exhaustive opcode
     /// match plus a typed positional operand schema (anti-f81e45b; asserted
     /// by `tests/reconstruction_x86.rs`).
-    fn reconstruct_discharge_key(&self, inst: &X86ISelInst) -> Option<X86DischargeKey> {
+    fn reconstruct_discharge_key(
+        &self,
+        inst: &X86ISelInst,
+        binding: Option<crate::x86_source_operand_binding::ExactSourceOperandBinding>,
+    ) -> Option<X86DischargeKey> {
         // Not a reconstructable opcode at all -> leave on the existing path.
         x86_opcode_to_source_op(inst.opcode)?;
         // Reconstructable opcode but no reconstructable operand shape -> fall through.
         let instance = reconstruct_alu_obligation(inst)?;
-        // PROOF-5 / TV-9 (B2): the `canonical` obligation frees the immediate
-        // for the immediate-baked RI families so one parametric tier-0 row
-        // covers the whole width family; for every immediate-free family the
-        // canonical form is byte-identical to the instance.
+        // The `canonical` obligation frees the immediate for RI families so
+        // one exact theorem/query covers the width family. It is retained for
+        // artifact identity; per-instruction Formal credit comes only from an
+        // exact source-op/type/operand binding (`binding`), and then over the
+        // INSTANCE obligation, never over this parametric form.
         let canonical = canonical_reconstruct_obligation(inst).unwrap_or_else(|| instance.clone());
-        Some(X86DischargeKey::Recon {
+        Some(X86DischargeKey {
             instance: Box::new(instance),
             canonical: Box::new(canonical),
+            binding,
         })
     }
 
@@ -5532,138 +6957,117 @@ impl X86FunctionVerifier {
     /// [`Self::reconstruct_discharge_key`]).
     ///
     /// - `Verified { degenerate: false, .. }` when the reconstructed
-    ///   obligation discharges `Valid`. Credited (`degenerate: false`)
-    ///   because its provenance is `Reconstructed` — the machine side came
-    ///   from the REAL instruction, so a wrong opcode/wiring would have
-    ///   refuted, even though a *correct* commutative lowering reconstructs
-    ///   to `bvadd == bvadd`.
+    ///   obligation discharges `Valid` with complete (`Exhaustive`) evidence.
+    ///   Credited (`degenerate: false`) because its provenance is
+    ///   `Reconstructed` — the machine side came from the REAL instruction,
+    ///   so a wrong opcode/wiring would have refuted, even though a *correct*
+    ///   commutative lowering reconstructs to `bvadd == bvadd`.
+    /// - `Unverified { .. }` when it discharges only by sampling: statistical
+    ///   evidence is reported, never credited.
     /// - `Failed { .. }` when the reconstructed obligation REFUTES (wrong
     ///   isel opcode/wiring). This is the content of the mechanism.
     ///
-    /// PROOF-5 / TV-9 (B2): prefers a PARAMETRIC/tier-0 candidate after live
-    /// solver revalidation (or a live fallback verdict on a miss) and credits
-    /// it `Formal` (SolverProven) instead of the 100k-sample Statistical sweep;
-    /// a tier-0 miss with a solver present routes to the live solver (refute →
-    /// fail closed; inconclusive → statistical fallback); a solver-absent
-    /// host keeps the honest Statistical label. Crediting is MONOTONE — never
-    /// weaker than the previous sweep.
+    /// WITHOUT an exact source/operand binding the result remains
+    /// Exhaustive/Statistical even when the canonical theorem has a tier-0 or
+    /// portable proof: target reconstruction alone does not bind the inferred
+    /// source operation and fresh operands to the actual lowering input.
+    ///
+    /// WITH one (`binding`, produced only by
+    /// [`crate::x86_source_operand_binding::bind_exact_source_operands`] or its
+    /// formal-argument sibling, and only for an instruction whose TV-2
+    /// cross-check passed under `Enforce`), the INSTANCE obligation is routed
+    /// through the same registry discharge the static database uses and may
+    /// answer `Formal`. The strength recorded is whatever that route actually
+    /// achieved — an inconclusive or unavailable solver falls back to the
+    /// unbound tier rather than claiming anything.
     fn discharge_reconstructed(
         &self,
         instance: &ProofObligation,
         canonical: &ProofObligation,
+        binding: Option<&crate::x86_source_operand_binding::ExactSourceOperandBinding>,
     ) -> InstructionVerificationResult {
-        let (vresult, strength) = crate::lowering_proof::discharge_reconstructed_obligation(
-            instance,
-            canonical,
-            &self.config,
+        // TV-1 EXTENDED: only a checked exact source/operand binding can reach
+        // the route that may answer `Formal`. Without one this is byte-for-byte
+        // the pre-existing discharge, so an unbound reconstruction keeps its
+        // Exhaustive/Statistical strength and upstream's credit rule keeps
+        // refusing it.
+        let (vresult, strength) = match binding {
+            Some(binding) => {
+                crate::lowering_proof::discharge_reconstructed_obligation_with_exact_source_binding(
+                    instance,
+                    canonical,
+                    &self.config,
+                    binding,
+                )
+            }
+            None => crate::lowering_proof::discharge_reconstructed_obligation(
+                instance,
+                canonical,
+                &self.config,
+            ),
+        };
+        debug_assert!(
+            instance.is_reconstructed(),
+            "reconstruct_alu_obligation must tag Reconstructed provenance"
         );
-        match vresult {
-            VerificationResult::Valid => {
-                debug_assert!(
-                    instance.is_reconstructed(),
-                    "reconstruct_alu_obligation must tag Reconstructed provenance"
-                );
+        // WHETHER this discharge is credit is decided in exactly one place for
+        // every ISA — `from_discharge` — and the binding does not get its own
+        // credit rule: sampling stays uncredited whether it was bound or not,
+        // and only `Exhaustive`/`Formal` may credit.
+        let result = InstructionVerificationResult::from_discharge(
+            &instance.name,
+            ProofCategory::X8664Lowering,
+            vresult,
+            strength,
+            // Credited: a reconstructed obligation is the genuine
+            // (non-degenerate) credit even when structurally X==X.
+            !instance.is_reconstructed(),
+        );
+        // Name the BINDING in the published certificate, not only the
+        // obligation, and only on a CREDITED row. A reconstructed register copy
+        // is structurally `X == X`, so its solver half is trivially true and ALL
+        // of its refutation power lives in the operand binding; a certificate
+        // that said only "Formal" would read as "a solver proved something
+        // non-trivial". The schema token says exactly what was checked, so a
+        // reader can tell a bound credit from an unbound one and which schema
+        // earned it. Refusal strings are left exactly as `from_discharge`
+        // renders them, so a gate that matches on them is unaffected.
+        match (result, binding) {
+            (
                 InstructionVerificationResult::Verified {
-                    proof_name: instance.name.clone(),
-                    category: ProofCategory::X8664Lowering,
+                    proof_name,
+                    category,
                     strength,
-                    // Credited: a reconstructed obligation is the genuine
-                    // (non-degenerate) credit even when structurally X==X.
-                    degenerate: !instance.is_reconstructed(),
-                }
-            }
-            VerificationResult::Invalid { counterexample } => {
-                InstructionVerificationResult::Failed {
-                    proof_name: instance.name.clone(),
-                    detail: counterexample,
-                }
-            }
-            VerificationResult::Unknown { reason } => InstructionVerificationResult::Failed {
-                proof_name: instance.name.clone(),
-                detail: format!("Unknown: {reason}"),
+                    degenerate,
+                },
+                Some(binding),
+            ) => InstructionVerificationResult::Verified {
+                proof_name: format!("{proof_name} [source-bound: {}]", binding.schema().as_str()),
+                category,
+                strength,
+                degenerate,
             },
+            (result, _) => result,
         }
     }
 
     /// CT-8 STAGE-2 kernel: discharge ONE distinct [`X86DischargeKey`].
     ///
     /// PURITY/DETERMINISM: a deterministic pure function of `(&self, key)` —
-    /// `Db` resolves against the immutable [`ProofDatabase`] and discharges
-    /// through the process-wide compute-once verdict memo / tier-0 verdict
-    /// DB; `Recon` discharges the key's own obligations the same way. No
-    /// verifier state is mutated, so a key's verdict is IDENTICAL no matter
-    /// which worker computes it, how many times, or in what order — the
-    /// STAGE-2 dedupe (each distinct key discharged exactly once, the
-    /// verdict cloned to every instruction that maps to it) is therefore
-    /// result-identical to the fused per-instruction walk. FAILED verdicts
-    /// flow through unchanged (and stay memoized fail-closed in the eval
-    /// memo).
+    /// the key's own obligations discharge through the process-wide
+    /// compute-once verdict memo. No verifier state is mutated, so a key's
+    /// verdict is IDENTICAL no matter which worker computes it, how many times,
+    /// or in what order — the STAGE-2 dedupe (each distinct key discharged
+    /// exactly once, the verdict cloned to every instruction that maps to it)
+    /// is therefore result-identical to the fused per-instruction walk. FAILED
+    /// verdicts flow through unchanged (and stay memoized fail-closed in the
+    /// eval memo).
+    ///
+    /// The TV-1-EXTENDED binding is carried IN the key, so purity holds over it
+    /// too: a bound and an unbound instruction with byte-identical obligation
+    /// content occupy DISTINCT keys and cannot share a verdict.
     fn discharge_key_verdict(&self, key: &X86DischargeKey) -> InstructionVerificationResult {
-        match key {
-            X86DischargeKey::Db { category, query } => self.resolve_db_proof(*category, query),
-            X86DischargeKey::Recon {
-                instance,
-                canonical,
-            } => self.discharge_reconstructed(instance, canonical),
-        }
-    }
-
-    /// Resolve a static-DB proof by `(category, query)` and discharge it. Shared
-    /// by the sequence-recognizer branch and the generic opcode-level branch of
-    /// [`Self::verify`]. The x86 verifier matches case-SENSITIVELY
-    /// (`name.contains`); STRICT proven-honesty (task #61) is applied at the TALLY
-    /// via the `degenerate` flag — a degenerate X==X proof is recorded as a binding
-    /// but credited ZERO in the genuine counts.
-    fn resolve_db_proof(
-        &self,
-        category: ProofCategory,
-        query: &str,
-    ) -> InstructionVerificationResult {
-        let candidates = self.db.by_category(category);
-        let proof = candidates
-            .iter()
-            .find(|p| p.obligation.name.contains(query));
-
-        match proof {
-            Some(cp) => {
-                // PROOF-4 B1: prefer a tier-0 candidate after live revalidation
-                // over the statistical sweep for >8-bit registry obligations
-                // (stronger). A miss keeps the existing sweep, so no
-                // program that compiled before can regress. `strength` reflects
-                // reality — `Formal` on a tier-0 hit, else the sweep's strength.
-                let (vresult, strength) = crate::lowering_proof::discharge_registry_obligation(
-                    &cp.obligation,
-                    &self.config,
-                );
-                match vresult {
-                    VerificationResult::Valid => InstructionVerificationResult::Verified {
-                        proof_name: cp.obligation.name.clone(),
-                        category,
-                        strength,
-                        degenerate: cp.obligation.is_degenerate(),
-                    },
-                    VerificationResult::Invalid { counterexample } => {
-                        InstructionVerificationResult::Failed {
-                            proof_name: cp.obligation.name.clone(),
-                            detail: counterexample,
-                        }
-                    }
-                    VerificationResult::Unknown { reason } => {
-                        InstructionVerificationResult::Failed {
-                            proof_name: cp.obligation.name.clone(),
-                            detail: format!("Unknown: {}", reason),
-                        }
-                    }
-                }
-            }
-            None => InstructionVerificationResult::Unverified {
-                reason: format!(
-                    "no x86-64 proof matching '{}' in category {}",
-                    query,
-                    category.name()
-                ),
-            },
-        }
+        self.discharge_reconstructed(&key.instance, &key.canonical, key.binding.as_ref())
     }
 
     /// Verify every instruction in an x86-64 ISel function.
@@ -5676,11 +7080,283 @@ impl X86FunctionVerifier {
     /// ([`crate::carrier_hygiene::check_function`]) over the same function and
     /// FAILS CLOSED on any violation — see [`Self::apply_carrier_hygiene`].
     ///
-    /// This entry point has NO replayed LIR function, so the TV-2 provenance
-    /// cross-check cannot run here; the compiler cert path uses
-    /// [`Self::verify_with_lir_source`] instead.
+    /// This is explicitly a source-less diagnostic entry point: TV-2
+    /// provenance checking is Off because no LIR source was supplied. The
+    /// instruction-proof configuration and carrier-hygiene checks still run.
+    /// It does not establish enforced source checking or source binding; the
+    /// compiler certificate path uses [`Self::verify_with_lir_source`] instead.
     pub fn verify(&self, func: &X86ISelFunction) -> FunctionVerificationReport {
-        self.verify_with_lir_source(func, None)
+        self.verify_with_lir_source_and_mode(func, None, ProvenanceXCheckMode::Off)
+    }
+
+    pub fn capture_request(&self) -> crate::FunctionVerificationRequest {
+        self.capture_request_with_mode(ProvenanceXCheckMode::Off)
+    }
+
+    pub fn capture_request_with_mode(
+        &self,
+        mode: ProvenanceXCheckMode,
+    ) -> crate::FunctionVerificationRequest {
+        crate::FunctionVerificationRequest::capture(self.config.clone(), mode)
+    }
+
+    /// The x86-64 System V ABI envelope of one function's FINAL bytes
+    /// (`crate::x86_source_bound_envelope`): recognition, the Rust refusal
+    /// walk, and, under an enforcing request whose configuration replays
+    /// source-bound obligations, a serial replay of the envelope theorem's
+    /// parts that stops at the first part without a Valid replay. The report
+    /// is assembled by `x86_source_bound_envelope::envelope_report`: only a
+    /// Valid replay of EVERY part (an AY proof Clean accepted, each) is
+    /// credit, and the report carries a reusable identity only when every
+    /// such replay was bound to the request's authority. `TCG_REFINE_SOLVER=0`
+    /// and tier-0 recording refuse replay (the verdict is then `None`, and the
+    /// part's `detail` says why).
+    pub fn verify_abi_envelope(
+        &self,
+        lir: &trust_cg_lower::Function,
+        function_name: &str,
+        code: &[u8],
+        manifest: &[u8],
+        abi: Option<crate::X86SourceBoundAbi>,
+        request: &crate::FunctionVerificationRequest,
+    ) -> crate::x86_source_bound_envelope::X86EnvelopeReport {
+        use crate::x86_source_bound_envelope::{
+            X86EnvelopeOutcome, X86EnvelopeRefusal, X86EnvelopeReport, X86EnvelopeUnsupported,
+            source_bound_x86_envelope,
+        };
+        let input =
+            crate::function_request::x86_envelope_input(lir, function_name, code, manifest, abi);
+        let refused = |outcome| X86EnvelopeReport::new(function_name, outcome, input, None);
+        if !request.config_matches(&self.config) {
+            return refused(X86EnvelopeOutcome::Unsupported(
+                X86EnvelopeUnsupported::Construction(
+                    "the verification request was captured under another configuration".into(),
+                ),
+            ));
+        }
+        let trace = crate::diag::x86_body_trace_enabled();
+        let owner = match source_bound_x86_envelope(lir, function_name, code, manifest, abi) {
+            Ok(owner) => owner,
+            Err(refusal) => {
+                if trace {
+                    eprintln!("[TCG-X86-BODY-TRACE] fn={function_name} envelope {refusal}");
+                }
+                return refused(match refusal {
+                    X86EnvelopeRefusal::Unsupported(reason) => {
+                        X86EnvelopeOutcome::Unsupported(reason)
+                    }
+                    X86EnvelopeRefusal::Mismatch(mismatch) => {
+                        X86EnvelopeOutcome::Mismatch(mismatch)
+                    }
+                });
+            }
+        };
+        let context = crate::function_request::FunctionDischargeContext::new(request);
+        let replay = request.mode() == ProvenanceXCheckMode::Enforce
+            && self.config.replays_source_bound_obligations();
+        let verdicts = if replay {
+            context.x86_envelope(&owner)
+        } else {
+            let why = "replay not requested: the request does not enforce provenance, \
+                       or its configuration does not replay source-bound obligations";
+            vec![(None, Some(why.to_owned())); owner.parts().len()]
+        };
+        let report = crate::x86_source_bound_envelope::envelope_report(
+            function_name,
+            &owner,
+            input,
+            verdicts,
+            context.replays_bound(),
+            request,
+        );
+        if trace {
+            let (proven, total) = match report.outcome() {
+                X86EnvelopeOutcome::Built { parts, .. } => (
+                    parts
+                        .iter()
+                        .filter(|part| matches!(part.verdict, Some(VerificationResult::Valid)))
+                        .count(),
+                    parts.len(),
+                ),
+                _ => (0, 0),
+            };
+            eprintln!(
+                "[TCG-X86-BODY-TRACE] fn={function_name} envelope={} parts={total} valid={proven} replay={replay}",
+                owner.statement().name,
+            );
+        }
+        report
+    }
+
+    /// Legacy request entry point: no calling convention is supplied, so the
+    /// source-bound body owner never applies and the report is today's.
+    pub fn verify_with_request(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        request: &crate::FunctionVerificationRequest,
+    ) -> crate::CapturedFunctionVerificationReport {
+        let context = crate::function_request::FunctionDischargeContext::new(request);
+        self.verify_request_in_context(func, lir_source, None, None, request, &context)
+    }
+
+    /// [`Self::verify_with_request`] with the calling convention the compiler
+    /// selected and the definitions of the module the function belongs to
+    /// (OD-210, OD-216: the module's own and its link unit's). Both are bound
+    /// into the report's input digest.
+    ///
+    /// Every public entry point that takes a calling convention, and so lets
+    /// the body owner apply, takes the module's definitions by reference: a
+    /// compile cannot name no module (OD-210, amended). The forms that name none
+    /// (`X86RoutineDefinition::Unnamed`, which refuses every theorem that
+    /// trusts a runtime routine) are test-only.
+    pub fn verify_with_request_and_abi(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: &crate::X86ModuleDefinitions,
+        request: &crate::FunctionVerificationRequest,
+    ) -> crate::CapturedFunctionVerificationReport {
+        let context = crate::function_request::FunctionDischargeContext::new(request);
+        self.verify_request_in_context(func, lir_source, abi, Some(module), request, &context)
+    }
+
+    /// Tests only: [`Self::verify_with_request_for_export_in_module`] naming
+    /// no module (OD-210, `X86RoutineDefinition::Unnamed`: a theorem that
+    /// would trust a runtime routine's contract is refused; every other one
+    /// is the same). No compile may name no module (OD-210, amended).
+    #[cfg(test)]
+    pub(crate) fn verify_with_request_for_export(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        request: &crate::FunctionVerificationRequest,
+    ) -> (
+        crate::CapturedFunctionVerificationReport,
+        Vec<crate::SourceBoundArithmeticObligation>,
+    ) {
+        self.verify_with_request_for_export_in(func, lir_source, abi, None, request)
+    }
+
+    /// [`Self::verify_with_request_and_abi`] of a function of the module whose
+    /// definitions are `module` (OD-210, OD-216), retaining the replayed
+    /// whole-body theorem for every value row it finally credits. Exports
+    /// leave only an enforced, failure-free report with a promotable
+    /// inventory.
+    pub fn verify_with_request_for_export_in_module(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: &crate::X86ModuleDefinitions,
+        request: &crate::FunctionVerificationRequest,
+    ) -> (
+        crate::CapturedFunctionVerificationReport,
+        Vec<crate::SourceBoundArithmeticObligation>,
+    ) {
+        self.verify_with_request_for_export_in(func, lir_source, abi, Some(module), request)
+    }
+
+    fn verify_with_request_for_export_in(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: Option<&crate::X86ModuleDefinitions>,
+        request: &crate::FunctionVerificationRequest,
+    ) -> (
+        crate::CapturedFunctionVerificationReport,
+        Vec<crate::SourceBoundArithmeticObligation>,
+    ) {
+        let context = crate::function_request::FunctionDischargeContext::for_export(request);
+        let report =
+            self.verify_request_in_context(func, lir_source, abi, module, request, &context);
+        let exports = context.take_exports(&report);
+        (report, exports)
+    }
+
+    /// The certificate lane's form of [`Self::verify_with_request_for_export_in_module`]:
+    /// the same report and the same exports, for a caller that keeps no
+    /// receipt. The verifier-input digest binds only exports, so it is
+    /// computed only when a replayed body theorem was retained for some row;
+    /// otherwise there is nothing to export and nothing for it to bind.
+    pub fn verify_for_certificates(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: &crate::X86ModuleDefinitions,
+        request: &crate::FunctionVerificationRequest,
+    ) -> (
+        FunctionVerificationReport,
+        Vec<crate::SourceBoundArithmeticObligation>,
+    ) {
+        let module = Some(module);
+        let context = crate::function_request::FunctionDischargeContext::for_export(request);
+        let report =
+            self.verify_report_in_context(func, lir_source, abi, module, request, &context);
+        if !context.retained_any() {
+            return (report, Vec::new());
+        }
+        let captured = crate::CapturedFunctionVerificationReport::finish(
+            report,
+            crate::function_request::x86_input(func, lir_source, abi, module),
+            1,
+            &context,
+        );
+        let exports = context.take_exports(&captured);
+        (captured.report().clone(), exports)
+    }
+
+    fn verify_request_in_context(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: Option<&crate::X86ModuleDefinitions>,
+        request: &crate::FunctionVerificationRequest,
+        context: &crate::function_request::FunctionDischargeContext<'_>,
+    ) -> crate::CapturedFunctionVerificationReport {
+        let report = self.verify_report_in_context(func, lir_source, abi, module, request, context);
+        crate::CapturedFunctionVerificationReport::finish(
+            report,
+            crate::function_request::x86_input(func, lir_source, abi, module),
+            1,
+            context,
+        )
+    }
+
+    fn verify_report_in_context(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: Option<&crate::X86ModuleDefinitions>,
+        request: &crate::FunctionVerificationRequest,
+        context: &crate::function_request::FunctionDischargeContext<'_>,
+    ) -> FunctionVerificationReport {
+        if !request.config_matches(&self.config) {
+            FunctionVerificationReport {
+                function_name: func.name.clone(),
+                precondition_failure: Some(
+                    FunctionVerificationPreconditionFailure::VerificationRequestConfigMismatch,
+                ),
+                instructions: Vec::new(),
+            }
+        } else {
+            request.with_policy(|| {
+                self.verify_with_context(
+                    func,
+                    lir_source,
+                    abi,
+                    module,
+                    request.mode(),
+                    Some(context),
+                )
+            })
+        }
     }
 
     /// [`Self::verify`], plus the TV-2 lowering-provenance cross-check when
@@ -5727,6 +7403,7 @@ impl X86FunctionVerifier {
         &self,
         insts: &[X86ISelInst],
         block_inst_idx: usize,
+        binding: Option<crate::x86_source_operand_binding::ExactSourceOperandBinding>,
     ) -> X86BaseVerdictPlan {
         let inst = &insts[block_inst_idx];
         if let Some(reason) = Self::trap_skip_reason(inst.opcode) {
@@ -5768,8 +7445,15 @@ impl X86FunctionVerifier {
                         .map(|q| (ProofCategory::X8664Lowering, q))
                 })
         {
-            X86BaseVerdictPlan::Discharge(X86DischargeKey::Db { category, query })
-        } else if let Some(key) = self.reconstruct_discharge_key(inst) {
+            // SUBSTRING / REPRESENTATIVE CREDIT IS WITHDRAWN. The recognizer
+            // still claims the instruction (so a MOVZX inside a recognized
+            // window is not credited as a standalone extend below), but the
+            // whole-sequence theorem is selected by name and is not built from
+            // these operands. Nothing is discharged.
+            X86BaseVerdictPlan::Ready(InstructionVerificationResult::withdrawn_registry_credit(
+                &query, category,
+            ))
+        } else if let Some(key) = self.reconstruct_discharge_key(inst, binding) {
             // PHASE-2 OPERAND RECONSTRUCTION (x86-64, task #66).
             //
             // The reconstructable ALU/bitwise/shift/extend opcodes with a
@@ -5785,7 +7469,7 @@ impl X86FunctionVerifier {
             // reconstructable operand shape (a structural 2-address
             // AddRI/RSP cleanup, a memory-form operand, the width-
             // polymorphic ImulRRI which keeps its both-widths gate, etc.);
-            // the existing DB-substring path below then runs unchanged.
+            // such an instruction has no instruction-built obligation.
             X86BaseVerdictPlan::Discharge(key)
         } else if let Some((category, query)) =
             // A STANDALONE width-polymorphic MOVSX/MOVZX/IMUL disambiguates
@@ -5803,10 +7487,14 @@ impl X86FunctionVerifier {
                         .map(|q| (ProofCategory::X8664Lowering, q))
                 })
         {
-            X86BaseVerdictPlan::Discharge(X86DischargeKey::Db { category, query })
+            // Withdrawn credit, as above: the query names a representative
+            // theorem (e.g. `Iadd_I` matches the I32 row for a 64-bit ADD).
+            X86BaseVerdictPlan::Ready(InstructionVerificationResult::withdrawn_registry_credit(
+                &query, category,
+            ))
         } else {
             X86BaseVerdictPlan::Ready(InstructionVerificationResult::Unverified {
-                reason: format!("no proof mapping for x86-64 opcode {:?}", inst.opcode),
+                reason: Self::no_proof_mapping_reason(inst.opcode),
             })
         }
     }
@@ -5820,39 +7508,333 @@ impl X86FunctionVerifier {
         &self,
         insts: &[X86ISelInst],
         block_inst_idx: usize,
+        binding: Option<crate::x86_source_operand_binding::ExactSourceOperandBinding>,
     ) -> InstructionVerificationResult {
-        match self.base_instruction_plan(insts, block_inst_idx) {
+        match self.base_instruction_plan(insts, block_inst_idx, binding) {
             X86BaseVerdictPlan::Ready(result) => result,
             X86BaseVerdictPlan::Discharge(key) => self.discharge_key_verdict(&key),
         }
     }
 
-    /// Mode-explicit body of [`Self::verify_with_lir_source`] (tests inject
-    /// the mode directly to stay independent of ambient env vars).
-    fn verify_with_lir_source_and_mode(
+    /// Mode-explicit body of [`Self::verify_with_lir_source`]. Compiler and
+    /// cache callers should prefer this entry point after capturing policy
+    /// once, so a cache fingerprint and its verifier discharge cannot observe
+    /// different ambient environment values.
+    /// Enforce requires a present, name-matched LIR source before instruction
+    /// verification begins. This prerequisite is not exact operand binding.
+    pub fn verify_with_lir_source_and_mode(
         &self,
         func: &X86ISelFunction,
         lir_source: Option<&trust_cg_lower::Function>,
         xcheck_mode: ProvenanceXCheckMode,
     ) -> FunctionVerificationReport {
-        // TV-2: index the replayed LIR function. A name mismatch means the
-        // caller mis-zipped functions — loudly report and run without the
-        // cross-check rather than judging stamps against the wrong spec.
+        self.verify_with_context(func, lir_source, None, None, xcheck_mode, None)
+    }
+
+    /// [`Self::verify_with_lir_source_and_mode`] with the calling convention
+    /// the compiler selected, which lets the source-bound body owner apply,
+    /// for a function of the module whose definitions are `module` (OD-210,
+    /// OD-216). Without a captured request, a proof-promotion verifier
+    /// captures a fresh one for the body replay.
+    pub fn verify_with_lir_source_abi_and_mode_in_module(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: &crate::X86ModuleDefinitions,
+        xcheck_mode: ProvenanceXCheckMode,
+    ) -> FunctionVerificationReport {
+        self.verify_with_context(func, lir_source, abi, Some(module), xcheck_mode, None)
+    }
+
+    /// Tests only: [`Self::verify_with_lir_source_abi_and_mode_in_module`]
+    /// naming no module (OD-210, `X86RoutineDefinition::Unnamed`: a theorem
+    /// that would trust a runtime routine's contract is refused). No compile
+    /// may name no module (OD-210, amended).
+    #[cfg(test)]
+    pub(crate) fn verify_with_lir_source_abi_and_mode(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        xcheck_mode: ProvenanceXCheckMode,
+    ) -> FunctionVerificationReport {
+        self.verify_with_context(func, lir_source, abi, None, xcheck_mode, None)
+    }
+
+    /// The x86-64 source-bound body arm, run before the per-instruction
+    /// pre-pass. Returns the precondition failure for an enforced mismatch,
+    /// or the owner and the verdict its credited rows receive.
+    ///
+    /// Classification needs `xcheck != Off` and a name-matched LIR source.
+    /// Replay needs Enforce and the proof-promotion replay policy. The row
+    /// verdict is [`x86_body_row_result`]: only `Valid` credits Formal, a
+    /// refutation fails every covered row, and no independently checked proof
+    /// (including an inconclusive solve) leaves them `Unverified`.
+    fn source_bound_x86_body<'a>(
+        &self,
+        func: &'a X86ISelFunction,
+        lir_source: Option<&'a trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: Option<&crate::X86ModuleDefinitions>,
+        xcheck_mode: ProvenanceXCheckMode,
+        context: Option<&crate::function_request::FunctionDischargeContext<'_>>,
+    ) -> Result<
+        Option<(
+            crate::x86_source_bound_body::SourceBoundX86Body<'a>,
+            InstructionVerificationResult,
+        )>,
+        FunctionVerificationPreconditionFailure,
+    > {
+        use crate::x86_source_bound_body::{X86BodyRefusal, source_bound_x86_body_in_module};
+        let Some(source) = lir_source else {
+            return Ok(None);
+        };
+        if xcheck_mode == ProvenanceXCheckMode::Off || source.name != func.name {
+            return Ok(None);
+        }
+        // Diagnostic only (`x86-body-trace`): one line per classified pair.
+        let trace = crate::diag::x86_body_trace_enabled();
+        let owner = match source_bound_x86_body_in_module(source, func, abi, module) {
+            Ok(owner) => owner,
+            Err(refusal) => {
+                if trace {
+                    eprintln!("[TCG-X86-BODY-TRACE] fn={} {refusal}", func.name);
+                }
+                return match refusal {
+                    X86BodyRefusal::Mismatch(mismatch) => {
+                        if xcheck_mode == ProvenanceXCheckMode::Enforce {
+                            return Err(
+                                FunctionVerificationPreconditionFailure::SourceBoundX86BodyMismatch(
+                                    mismatch,
+                                ),
+                            );
+                        }
+                        eprintln!(
+                            "[TCG-SOURCE-BOUND-X86-MISMATCH-WARN] arch=x86_64 fn={} erroneous \
+                             supported target (not rejected in warn mode): {mismatch}",
+                            func.name
+                        );
+                        Ok(None)
+                    }
+                    X86BodyRefusal::Unsupported(_) => Ok(None),
+                };
+            }
+        };
+        if xcheck_mode != ProvenanceXCheckMode::Enforce
+            || !self.config.replays_source_bound_obligations()
+        {
+            return Ok(None);
+        }
+        let (verdict, explanation) = match context {
+            Some(context) => {
+                if trace {
+                    context.x86_body_explained(&owner)
+                } else {
+                    (context.x86_body(&owner), None)
+                }
+            }
+            None => {
+                let request = self.capture_request_with_mode(xcheck_mode);
+                let context = crate::function_request::FunctionDischargeContext::new(&request);
+                if trace {
+                    context.x86_body_explained(&owner)
+                } else {
+                    (context.x86_body(&owner), None)
+                }
+            }
+        };
+        if trace {
+            let outcome =
+                x86_body_replay_trace(&verdict, explanation.as_deref(), owner.is_fp_abstract());
+            // Slice 24a (OD-226): a theorem stated over the merged-chain
+            // quotient names its chains on a line of its own, BEFORE the
+            // parts line (the census parsers read the line after `stated in
+            // parts` and attribute a root by its last trace line).
+            if let Some((chains, absorbed)) = owner.merged_chains() {
+                eprintln!(
+                    "[TCG-X86-BODY-TRACE] fn={} merged chains={chains} absorbed={absorbed}",
+                    func.name
+                );
+            }
+            // Slice 24c (OD-228): a theorem stated over segments names them
+            // on a line of its own, after the chains and BEFORE the parts
+            // line, for the same reason.
+            if let Some((segments, members, kinds)) = owner.segments() {
+                eprintln!(
+                    "[TCG-X86-BODY-TRACE] fn={} segments={segments} members={members} \
+                     kinds={kinds}",
+                    func.name
+                );
+            }
+            // OD-233: a theorem stated in parts that defines cut inputs
+            // counts them on a line of its own, after the segments and
+            // BEFORE the parts line.
+            let (bytes, items) = owner.defined_cut_inputs();
+            if bytes + items > 0 {
+                eprintln!(
+                    "[TCG-X86-BODY-TRACE] fn={} defined cut inputs bytes={bytes} items={items}",
+                    func.name
+                );
+            }
+            // Slice 16: a theorem stated in parts names its part count on a
+            // line of its own (the census parsers read the next line as is).
+            if owner.is_stated_in_parts() {
+                eprintln!(
+                    "[TCG-X86-BODY-TRACE] fn={} stated in parts={}",
+                    func.name,
+                    owner.parts().len()
+                );
+            }
+            eprintln!(
+                "[TCG-X86-BODY-TRACE] fn={} bound rows={} replay={outcome}",
+                func.name,
+                owner.bound_rows().len()
+            );
+        }
+        // Diagnostic only (`x86-body-dump=DIR`): the query of a body theorem
+        // that did not replay Valid, rendered exactly as the replay renders
+        // it (same configuration), so the gap can be replayed outside the
+        // compiler. After an AY `and_pos` publication refusal the replay also
+        // retries the same assertions split into separate top-level asserts
+        // (`ay_bridge::split_assert_conjuncts` of these bytes). Never affects
+        // the verdict.
+        if !matches!(verdict, Some(VerificationResult::Valid))
+            && let Some(dir) = crate::diag::x86_body_dump_dir()
+        {
+            let name: String = func
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .take(200)
+                .collect();
+            // Slice 16: a theorem stated in parts is replayed part by part;
+            // each part's query is dumped (`<name>.part<k>.smt2`).
+            let queries: Vec<(String, String)> = if owner.is_stated_in_parts() {
+                owner
+                    .parts()
+                    .iter()
+                    .enumerate()
+                    .map(|(k, part)| {
+                        (
+                            format!("{name}.part{}.smt2", k + 1),
+                            crate::ay_bridge::generate_smt2_query_raw(
+                                part,
+                                &crate::verdict_db::live_source_bound_config(),
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                vec![(
+                    format!("{name}.smt2"),
+                    crate::ay_bridge::generate_smt2_query_raw(
+                        owner.obligation(),
+                        &crate::verdict_db::live_source_bound_config(),
+                    ),
+                )]
+            };
+            if let Err(error) = std::fs::create_dir_all(&dir).and_then(|()| {
+                queries
+                    .iter()
+                    .try_for_each(|(file, query)| std::fs::write(dir.join(file), query))
+            }) {
+                eprintln!(
+                    "[TCG-X86-BODY-TRACE] fn={} could not write the query dump: {error}",
+                    func.name
+                );
+            }
+        }
+        let result = x86_body_row_result(owner.obligation(), verdict, owner.is_fp_abstract());
+        Ok(Some((owner, result)))
+    }
+
+    fn verify_with_context(
+        &self,
+        func: &X86ISelFunction,
+        lir_source: Option<&trust_cg_lower::Function>,
+        abi: Option<crate::X86SourceBoundAbi>,
+        module: Option<&crate::X86ModuleDefinitions>,
+        xcheck_mode: ProvenanceXCheckMode,
+        context: Option<&crate::function_request::FunctionDischargeContext<'_>>,
+    ) -> FunctionVerificationReport {
+        // A missing or mis-zipped source cannot silently turn Enforce into a
+        // source-less diagnostic walk, including when the machine is empty.
+        let source_pairing_failure = if xcheck_mode == ProvenanceXCheckMode::Enforce {
+            match lir_source {
+                None => Some(FunctionVerificationPreconditionFailure::MissingLirSource),
+                Some(lir) if lir.name != func.name => Some(
+                    FunctionVerificationPreconditionFailure::LirSourceNameMismatch {
+                        source_function: lir.name.clone(),
+                    },
+                ),
+                Some(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(failure) = source_pairing_failure {
+            return FunctionVerificationReport {
+                function_name: func.name.clone(),
+                precondition_failure: Some(failure),
+                instructions: Vec::new(),
+            };
+        }
+        // Classify the complete source/body pair before any instruction can
+        // earn credit, and replay its theorem once, serially, before the
+        // pre-pass. A recognized body that disagrees with its admitted source
+        // is rejected by name under Enforce.
+        let bound_body =
+            match self.source_bound_x86_body(func, lir_source, abi, module, xcheck_mode, context) {
+                Ok(bound) => bound,
+                Err(failure) => {
+                    return FunctionVerificationReport {
+                        function_name: func.name.clone(),
+                        precondition_failure: Some(failure),
+                        instructions: Vec::new(),
+                    };
+                }
+            };
+        let bound_verdict = |ordinal: usize| {
+            bound_body
+                .as_ref()
+                .filter(|(owner, _)| owner.covers(ordinal))
+                .map(|(_, result)| result.clone())
+        };
+        // Warn and Off retain their diagnostic behavior; neither can supply
+        // the authority of an enforced source check.
         let lir_index: Option<LirSourceIndex> = match xcheck_mode {
             ProvenanceXCheckMode::Off => None,
             _ => lir_source.and_then(|lir| {
                 if lir.name == func.name {
                     Some(LirSourceIndex::build(lir))
-                } else {
+                } else if xcheck_mode == ProvenanceXCheckMode::Warn {
                     eprintln!(
                         "[TCG-PROVENANCE-XCHECK-WARN] arch=x86_64 fn={} replayed LIR function \
                          name mismatch (got `{}`): provenance cross-check skipped",
                         func.name, lir.name
                     );
                     None
+                } else {
+                    None
                 }
             }),
         };
+        // The replayed LIR function's DECLARED signature, available only when
+        // the same name-guarded pairing that produced `lir_index` held. The
+        // formal-argument binding re-derives parameter locations from it.
+        let lir_signature: Option<&trust_cg_lower::function::Signature> = lir_index
+            .as_ref()
+            .and(lir_source)
+            .filter(|lir| lir.name == func.name)
+            .map(|lir| &lir.signature);
+
         let mut attributed_count: usize = 0;
         let mut synthetic_count: usize = 0;
         let mut mismatch_count: usize = 0;
@@ -5900,15 +7882,135 @@ impl X86FunctionVerifier {
             .filter_map(|block_id| func.blocks.get(block_id))
             .flat_map(|block| (0..block.insts.len()).map(move |i| (block.insts.as_slice(), i)))
             .collect();
+
+        // TV-2 + TV-1-EXTENDED PRE-PASS (sequential, cheap, walk order).
+        //
+        // `flat` enumerates (block, inst) in exactly the walk order of the
+        // report loop below, so slot `i` here is that loop's `i`-th
+        // instruction. Two things are computed per instruction:
+        //
+        //   * the TV-2 cross-check outcome, computed ONCE here and consumed by
+        //     the sequential loop (which still records the hit and applies the
+        //     Enforce demotion at the same point, in the same order, so the
+        //     diagnostic stream is unchanged);
+        //   * the TV-1-EXTENDED exact source/operand binding, which needs the
+        //     LIR source and so cannot live in `base_instruction_plan` (that
+        //     function sees only the machine instruction window).
+        //
+        // ORDERING IS LOAD-BEARING: the binding is computed only for an
+        // instruction whose cross-check PASSED, and only in `Enforce` mode. The
+        // TV-2 check runs AFTER discharge in the report loop, so a binding
+        // granted to an instruction the cross-check later marks `Failed` would
+        // be a Formal credit for a misattributed emission. Requiring the check
+        // here makes that unreachable; requiring `Enforce` makes the whole
+        // function fail closed on any mismatch rather than merely warning.
+        let crosschecks: Vec<(
+            Option<provenance_xcheck::ProvenanceMismatch>,
+            Option<crate::x86_source_operand_binding::ExactSourceOperandBinding>,
+        )> = match lir_index.as_ref() {
+            None => vec![(None, None); flat.len()],
+            Some(index) => flat
+                .iter()
+                .map(|&(insts, i)| {
+                    let inst = &insts[i];
+                    let mismatch = provenance_xcheck::cross_check_inst(
+                        &inst.lowering_provenance,
+                        x86_emitted_op_class(inst),
+                        &format!("{:?}", inst.opcode),
+                        index,
+                    );
+                    let binding = match (&mismatch, xcheck_mode) {
+                        (None, ProvenanceXCheckMode::Enforce) => match inst
+                            .lowering_provenance
+                            .source_id()
+                        {
+                            // Source-attributed: bind to the identified source
+                            // instruction's exact operands.
+                            Some(source_id) => index.get(source_id).and_then(|source| {
+                                crate::x86_source_operand_binding::bind_exact_source_operands(
+                                    inst,
+                                    source_id,
+                                    source,
+                                    func.source_operand_bindings(),
+                                )
+                                .or_else(|| {
+                                    // TV-1 EXTENDED, ABI half: a RETURN move is
+                                    // stamped with its `Return`, so the source
+                                    // end is a recorded operand, but the
+                                    // destination is an ABI register no operand
+                                    // determines. That half needs the replayed
+                                    // SIGNATURE, so it has its own binder rather
+                                    // than a looser copy schema.
+                                    lir_signature.and_then(|signature| {
+                                        crate::x86_source_operand_binding::bind_return_abi_operands(
+                                            inst,
+                                            source_id,
+                                            source,
+                                            signature,
+                                            func.source_operand_bindings(),
+                                            func.return_abi_bindings(),
+                                        )
+                                    })
+                                })
+                            }),
+                            // Synthetic: the ONE synthetic class whose operands
+                            // are fully determined by declared input is the
+                            // formal-argument ABI move, and it must SAY it is
+                            // one. `Unattributed` (a pass-created or
+                            // pass-rebuilt instruction) is deliberately excluded
+                            // even when its operands happen to match a recorded
+                            // formal-argument move: the stamp is what says the
+                            // instruction is still the entry ABI copy selection
+                            // emitted, and nothing else here can tell.
+                            None => {
+                                let is_formal_argument_move = matches!(
+                                    inst.lowering_provenance,
+                                    trust_cg_ir::provenance::LoweringProvenance::Synthetic {
+                                        reason:
+                                            trust_cg_ir::provenance::SyntheticReason::FormalArguments
+                                    }
+                                );
+                                lir_signature.filter(|_| is_formal_argument_move).and_then(
+                                    |signature| {
+                                        crate::x86_source_operand_binding::bind_formal_argument_operands(
+                                            inst,
+                                            signature,
+                                            func.formal_argument_bindings(),
+                                        )
+                                    },
+                                )
+                            }
+                        },
+                        _ => None,
+                    };
+                    (mismatch, binding)
+                })
+                .collect(),
+        };
+        // The verifier pre-pass may steal Stage-2 discharge tasks onto workers
+        // other than the large-stack root worker. Transfer the same immutable
+        // override snapshot into every discharge explicitly so proof/cache/
+        // solver policy cannot disappear at this nested parallel boundary.
+        let discharge_environment =
+            trust_cg_process_env::EnvOverrideSnapshot::capture_current_thread();
         let base_results: Vec<InstructionVerificationResult> = if let Some(pool) =
             verifier_prepass_pool_for_items(flat.len())
         {
             pool.install(|| {
                 use rayon::prelude::*;
-                // STAGE 1: per-instruction obligation descriptors.
+                // STAGE 1: per-instruction obligation descriptors. Rows the
+                // replayed body theorem covers are Ready with its verdict:
+                // they are never sampled and never reach a solver here.
                 let plans: Vec<X86BaseVerdictPlan> = flat
                     .par_iter()
-                    .map(|&(insts, i)| self.base_instruction_plan(insts, i))
+                    .zip(crosschecks.par_iter())
+                    .enumerate()
+                    .map(
+                        |(ordinal, (&(insts, i), (_, binding)))| match bound_verdict(ordinal) {
+                            Some(result) => X86BaseVerdictPlan::Ready(result),
+                            None => self.base_instruction_plan(insts, i, *binding),
+                        },
+                    )
                     .collect();
                 // STAGE 2a (serial, cheap): the distinct key set in
                 // first-occurrence order + each plan's slot binding.
@@ -5932,7 +8034,7 @@ impl X86FunctionVerifier {
                 let discharged: Vec<InstructionVerificationResult> = distinct
                     .par_iter()
                     .with_max_len(1)
-                    .map(|key| self.discharge_key_verdict(key))
+                    .map(|key| discharge_environment.run(|| self.discharge_key_verdict(key)))
                     .collect();
                 // STAGE 3: assemble (indexed, order-stable).
                 plans
@@ -5949,7 +8051,12 @@ impl X86FunctionVerifier {
             })
         } else {
             flat.iter()
-                .map(|&(insts, i)| self.base_instruction_result(insts, i))
+                .zip(crosschecks.iter())
+                .enumerate()
+                .map(|(ordinal, (&(insts, i), (_, binding)))| {
+                    bound_verdict(ordinal)
+                        .unwrap_or_else(|| self.base_instruction_result(insts, i, *binding))
+                })
                 .collect()
         };
         let mut base_results = base_results.into_iter();
@@ -5967,31 +8074,26 @@ impl X86FunctionVerifier {
                 // replayed LIR function. Runs for EVERY stamped instruction
                 // (including Skipped pseudos/trap carriers — a misattributed
                 // stamp is a misattribution regardless of the proof verdict).
-                let result = if let Some(index) = lir_index.as_ref() {
+                let result = if lir_index.is_some() {
                     if inst.lowering_provenance.is_source_attributed() {
                         attributed_count += 1;
                     } else {
                         synthetic_count += 1;
                     }
-                    match provenance_xcheck::cross_check_inst(
-                        &inst.lowering_provenance,
-                        x86_emitted_op_class(inst),
-                        &format!("{:?}", inst.opcode),
-                        index,
-                    ) {
+                    match crosschecks[inst_idx].0.as_ref() {
                         Some(mismatch) => {
                             mismatch_count += 1;
                             provenance_xcheck::record_provenance_xcheck_hit(
                                 "x86_64",
                                 &func.name,
                                 inst_idx,
-                                &mismatch,
+                                mismatch,
                                 xcheck_mode,
                             );
                             if xcheck_mode == ProvenanceXCheckMode::Enforce {
                                 InstructionVerificationResult::Failed {
                                     proof_name: "provenance-crosscheck (TV-2)".to_string(),
-                                    detail: mismatch.detail,
+                                    detail: mismatch.detail.clone(),
                                 }
                             } else {
                                 result
@@ -6002,6 +8104,15 @@ impl X86FunctionVerifier {
                 } else {
                     result
                 };
+
+                provenance_xcheck::trace_instruction_row(
+                    "x86_64",
+                    &func.name,
+                    inst_idx,
+                    &format!("{:?}", inst.opcode),
+                    &inst.lowering_provenance,
+                    &result.trace_label(),
+                );
 
                 instructions.push(InstructionReport {
                     inst_index: inst_idx,
@@ -6025,8 +8136,29 @@ impl X86FunctionVerifier {
 
         Self::apply_carrier_hygiene(func, &mut instructions, &inst_locations);
 
+        // Retain the replayed body theorem only for rows whose FINAL result,
+        // after TV-2 and carrier hygiene, is still its Formal verdict.
+        if let (Some((owner, _)), Some(context)) = (bound_body.as_ref(), context) {
+            for row in &instructions {
+                let still_formal = owner.covers(row.inst_index)
+                    && matches!(
+                        &row.result,
+                        InstructionVerificationResult::Verified {
+                            proof_name,
+                            strength: crate::verify::VerificationStrength::Formal,
+                            degenerate: false,
+                            ..
+                        } if *proof_name == owner.obligation().name
+                    );
+                if still_formal {
+                    context.retain_x86_body(row.inst_index, owner);
+                }
+            }
+        }
+
         FunctionVerificationReport {
             function_name: func.name.clone(),
+            precondition_failure: None,
             instructions,
         }
     }
@@ -6135,6 +8267,10 @@ pub fn verify_x86_64_function(func: &X86ISelFunction) -> FunctionVerificationRep
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "x86_body_replay_diagnostic_tests.rs"]
+mod replay_diagnostic_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6355,17 +8491,79 @@ mod tests {
         assert_eq!(report.coverage_percent(), 100.0);
     }
 
-    #[test]
-    fn addrr_is_verified() {
-        let func = make_func_with_opcodes(&[X86Opcode::AddRR]);
-        let report = verify_x86_64_function(&func);
-        assert_eq!(report.total(), 1);
+    /// E0.2 inverse: an operand-less instruction has no instruction-built
+    /// obligation. Its only candidate is the registry theorem its query names
+    /// (for ADD, `Iadd_I` matches the I32 row whatever the width), which is
+    /// reported, never credited, and never discharged.
+    fn assert_x86_withdrawn_registry_credit(opcode: X86Opcode, expected_query: &str) {
         assert_eq!(
-            report.verified_count(),
-            1,
-            "AddRR should match Iadd_I proof; report was {}",
-            report
+            X86FunctionVerifier::opcode_to_proof_query(opcode),
+            Some(expected_query),
+            "{opcode:?}: the retired mapping still names its query (diagnostic only)"
         );
+        let report = verify_x86_64_function(&make_func_with_opcodes(&[opcode]));
+        assert_eq!(report.total(), 1);
+        assert_eq!(report.verified_count(), 0, "{opcode:?}: {report}");
+        assert_eq!(
+            report.registry_name_lookup_count(),
+            1,
+            "{opcode:?}: {report}"
+        );
+        match &report.instructions[0].result {
+            InstructionVerificationResult::Unverified { reason } => {
+                assert!(
+                    reason
+                        .starts_with(crate::function_verifier::REGISTRY_NAME_LOOKUP_IS_NOT_CREDIT),
+                    "{opcode:?}: {reason}"
+                );
+                assert!(reason.contains(&format!("`{expected_query}`")), "{reason}");
+            }
+            other => panic!("{opcode:?}: expected withdrawn registry credit, got {other:?}"),
+        }
+        assert!(!report.emitted_opcode_inventory().is_promotable());
+    }
+
+    #[test]
+    fn operand_less_addrr_is_not_verified() {
+        assert_x86_withdrawn_registry_credit(X86Opcode::AddRR, "Iadd_I");
+    }
+
+    /// The x86-64 equivalent of an operand-less `LdrRI`: a memory load with no
+    /// operands, for which `MovRM` names the I64 `Load` registry theorem.
+    #[test]
+    fn operand_less_movrm_load_is_not_verified() {
+        for (opcode, query) in [
+            (X86Opcode::MovRM8, "Load_I8 -> MOV r8,[r64+disp32]"),
+            (X86Opcode::MovRM16, "Load_I16 -> MOV r16,[r64+disp32]"),
+            (X86Opcode::MovRM32, "Load_I32 -> MOV r32,[r64+disp32]"),
+            (X86Opcode::MovRM, "Load_I64 -> MOV r64,[r64+disp32]"),
+            (X86Opcode::MovMR, "Store_I64 -> MOV [r64+disp32],r64"),
+        ] {
+            assert_x86_withdrawn_registry_credit(opcode, query);
+        }
+    }
+
+    /// E0.2, statistical inverse on x86-64: a real 64-bit `ADD r64,r64`
+    /// reconstructs from its operands but discharges only by sampling, so it
+    /// is reported with its sample count and never verified or promoted.
+    #[test]
+    fn sampled_64_bit_add_is_reported_not_verified() {
+        let add = X86ISelInst::new(X86Opcode::AddRR, vec![gpr64(0), gpr64(1), gpr64(2)]);
+        assert!(
+            reconstruct_alu_obligation(&add).is_some(),
+            "the instance reconstructs"
+        );
+        let report = verify_x86_64_function(&make_func_with_insts(vec![add]));
+        assert_eq!(report.verified_count(), 0, "{report}");
+        assert_eq!(report.sampled_uncredited_count(), 1, "{report}");
+        match &report.instructions[0].result {
+            InstructionVerificationResult::Unverified { reason } => assert!(
+                reason.starts_with(crate::function_verifier::STATISTICAL_EVIDENCE_IS_NOT_CREDIT),
+                "{reason}"
+            ),
+            other => panic!("sampled evidence must not be credited: {other:?}"),
+        }
+        assert!(!report.emitted_opcode_inventory().is_promotable());
     }
 
     #[test]
@@ -6403,17 +8601,18 @@ mod tests {
     #[test]
     fn mixed_ops_get_counted_correctly() {
         let func = make_func_with_opcodes(&[
-            X86Opcode::AddRR, // verified (Iadd_I)
-            X86Opcode::SubRR, // verified (Isub_I)
+            X86Opcode::AddRR, // registry candidate (Iadd_I): unverified (E0.2)
+            X86Opcode::SubRR, // registry candidate (Isub_I): unverified (E0.2)
             X86Opcode::Nop,   // skipped
             X86Opcode::Ud2,   // skipped trap
             X86Opcode::Ret,   // unverified (#62: RET control-transfer X==X retracted)
         ]);
         let report = verify_x86_64_function(&func);
         assert_eq!(report.total(), 5);
-        assert_eq!(report.verified_count(), 2);
+        assert_eq!(report.verified_count(), 0);
         assert_eq!(report.skipped_count(), 2);
-        assert_eq!(report.unverified_count(), 1);
+        assert_eq!(report.unverified_count(), 3);
+        assert_eq!(report.registry_name_lookup_count(), 2);
     }
 
     // ----------------------------------------------------------------------
@@ -6784,7 +8983,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_load_store_fence_opcodes_verify_with_registered_proofs() {
+    fn atomic_load_store_fence_opcodes_name_registered_theorems_but_are_uncredited() {
         let inst_queries = [
             (
                 X86ISelInst::new(X86Opcode::MovRM8, vec![])
@@ -6842,49 +9041,31 @@ mod tests {
         let report = verify_x86_64_function(&func);
 
         assert_eq!(report.total(), inst_queries.len());
+        // E0.2: each origin-tagged load/store/fence still names its registered
+        // x86-64 theorem, which is reported and never credited.
+        assert_eq!(report.verified_count(), 0, "report was {report}");
         assert_eq!(
-            report.verified_count(),
+            report.registry_name_lookup_count(),
             inst_queries.len(),
-            "atomic load/store opcodes should all verify; report was {report}"
-        );
-        assert_eq!(
-            report.unverified_count(),
-            0,
-            "atomic load/store opcodes should not report stale gaps; report was {report}"
+            "atomic load/store opcodes should all name their theorems; report was {report}"
         );
 
         for (idx, (inst, query)) in inst_queries.iter().enumerate() {
-            match &report.instructions[idx].result {
-                InstructionVerificationResult::Verified {
-                    proof_name,
-                    category,
-                    ..
-                } => {
-                    assert!(
-                        matches!(*category, ProofCategory::X8664Lowering),
-                        "{:?} should verify against an x86-64 lowering proof",
-                        inst.opcode
-                    );
-                    assert!(
-                        proof_name.contains(query),
-                        "{:?} verified with unexpected proof {proof_name:?}",
-                        inst.opcode
-                    );
-                }
-                result => panic!(
-                    "registered atomic proof query {query:?} for {:?} should verify; got {result:?}",
-                    inst.opcode
-                ),
-            }
+            let theorem = x86_withdrawn_theorem(&report.instructions[idx].result);
+            assert!(
+                theorem.contains(query),
+                "{:?} named unexpected theorem {theorem:?}",
+                inst.opcode
+            );
         }
     }
 
-    /// An emitted adjacent i128 carry-chain pair (`ADD lo; ADC hi` GPR64) must
-    /// bind the WHOLE-value composition proof (`Iadd_I128 -> ADD lo; ADC hi`) on
-    /// BOTH members and discharge it — proving the wiring genuinely COVERS the
-    /// 128-bit add (not just compiles). Mirrors `select_i128_add`'s emission.
+    /// An emitted adjacent i128 carry-chain pair (`ADD lo; ADC hi` GPR64) names
+    /// the WHOLE-value composition theorem (`Iadd_I128 -> ADD lo; ADC hi`) on
+    /// BOTH members. Mirrors `select_i128_add`'s emission. E0.2: the named
+    /// theorem is reported, never credited.
     #[test]
-    fn i128_add_adc_pair_binds_composition_proof_and_verifies() {
+    fn i128_add_adc_pair_names_composition_theorem_but_is_uncredited() {
         // dst_lo = lo_a + lo_b ; dst_hi = hi_a + hi_b + CF
         let insts = vec![
             X86ISelInst::new(X86Opcode::AddRR, vec![gpr64(0), gpr64(1), gpr64(2)]),
@@ -6892,46 +9073,31 @@ mod tests {
         ];
         let report = verify_x86_64_function(&make_func_with_insts(insts));
         assert_eq!(report.total(), 2);
-        assert_eq!(
-            report.verified_count(),
-            2,
-            "both ADD and ADC of an i128 pair must verify; report was {report}"
-        );
+        assert_eq!(report.verified_count(), 0, "report was {report}");
         for inst_report in &report.instructions {
-            match &inst_report.result {
-                InstructionVerificationResult::Verified {
-                    proof_name,
-                    category,
-                    ..
-                } => {
-                    assert!(matches!(*category, ProofCategory::X8664Lowering));
-                    assert!(
-                        proof_name.contains("Iadd_I128 -> ADD lo; ADC hi"),
-                        "i128 carry-chain member bound unexpected proof {proof_name:?}"
-                    );
-                }
-                result => panic!("i128 ADD+ADC pair member should verify; got {result:?}"),
-            }
+            let theorem = x86_withdrawn_theorem(&inst_report.result);
+            assert!(
+                theorem.contains("Iadd_I128 -> ADD lo; ADC hi"),
+                "i128 carry-chain member named unexpected theorem {theorem:?}"
+            );
         }
     }
 
     /// Same as above for the i128 SUB+SBB carry-chain pair.
     #[test]
-    fn i128_sub_sbb_pair_binds_composition_proof_and_verifies() {
+    fn i128_sub_sbb_pair_names_composition_theorem_but_is_uncredited() {
         let insts = vec![
             X86ISelInst::new(X86Opcode::SubRR, vec![gpr64(0), gpr64(1), gpr64(2)]),
             X86ISelInst::new(X86Opcode::SbbRR, vec![gpr64(3), gpr64(4), gpr64(5)]),
         ];
         let report = verify_x86_64_function(&make_func_with_insts(insts));
-        assert_eq!(report.verified_count(), 2, "report was {report}");
+        assert_eq!(report.verified_count(), 0, "report was {report}");
         for inst_report in &report.instructions {
-            match &inst_report.result {
-                InstructionVerificationResult::Verified { proof_name, .. } => assert!(
-                    proof_name.contains("Isub_I128 -> SUB lo; SBB hi"),
-                    "i128 carry-chain member bound unexpected proof {proof_name:?}"
-                ),
-                result => panic!("i128 SUB+SBB pair member should verify; got {result:?}"),
-            }
+            let theorem = x86_withdrawn_theorem(&inst_report.result);
+            assert!(
+                theorem.contains("Isub_I128 -> SUB lo; SBB hi"),
+                "i128 carry-chain member named unexpected theorem {theorem:?}"
+            );
         }
     }
 
@@ -6961,7 +9127,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_mov_memory_opcodes_bind_memory_proofs_never_atomic_ones() {
+    fn ordinary_mov_memory_opcodes_bind_memory_queries_never_atomic_ones() {
         let opcodes = [
             X86Opcode::MovRM8,
             X86Opcode::MovRM16,
@@ -6975,29 +9141,32 @@ mod tests {
         ];
         let report = verify_x86_64_function(&make_func_with_opcodes(&opcodes));
         assert_eq!(report.total(), opcodes.len());
-        // Plain (origin-less) loads/stores bind the Load_/Store_ effective-
-        // address memory proofs; Mfence still requires fence provenance.
+        // Plain (origin-less) loads/stores name the Load_/Store_ effective-
+        // address memory theorems (E0.2: not credited); Mfence still requires
+        // fence provenance to name anything.
+        assert_eq!(report.verified_count(), 0, "report was {report}");
         assert_eq!(
-            report.verified_count(),
+            report.registry_name_lookup_count(),
             opcodes.len() - 1,
-            "plain loads/stores should bind their memory proofs; report was {report}"
+            "plain loads/stores should name their memory theorems; report was {report}"
         );
-        assert_eq!(
-            report.unverified_count(),
-            1,
-            "MFENCE without fence proof-origin must stay unverified; report was {report}"
+        assert!(
+            matches!(
+                &report.instructions[opcodes.len() - 1].result,
+                InstructionVerificationResult::Unverified { reason }
+                    if reason.starts_with("no proof mapping")
+            ),
+            "MFENCE without fence proof-origin must name nothing; report was {report}"
         );
         // The original safety property, preserved: a generic MOV must NEVER
-        // silently bind an ATOMIC proof without proof-origin metadata.
-        for inst_report in &report.instructions {
-            if let InstructionVerificationResult::Verified { proof_name, .. } = &inst_report.result
-            {
-                assert!(
-                    !proof_name.contains("Atomic") && !proof_name.contains("Fence"),
-                    "origin-less {} must not bind an atomic/fence proof; bound {proof_name}",
-                    inst_report.opcode
-                );
-            }
+        // silently select an ATOMIC theorem without proof-origin metadata.
+        for inst_report in &report.instructions[..opcodes.len() - 1] {
+            let theorem = x86_withdrawn_theorem(&inst_report.result);
+            assert!(
+                !theorem.contains("Atomic") && !theorem.contains("Fence"),
+                "origin-less {} must not name an atomic/fence theorem; named {theorem}",
+                inst_report.opcode
+            );
         }
     }
 
@@ -7198,7 +9367,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_rmw_cas_loop_opcodes_verify_with_registered_proofs() {
+    fn atomic_rmw_cas_loop_opcodes_name_registered_theorems_but_are_uncredited() {
         let func = make_func_with_insts(vec![
             atomic_rmw_cas_loop_inst(X86Opcode::AtomicRmwCasLoop, 0, RegClass::Gpr64),
             atomic_rmw_cas_loop_inst(X86Opcode::AtomicRmwCasLoop8, 5, RegClass::Gpr32),
@@ -7206,12 +9375,17 @@ mod tests {
         ]);
         let report = verify_x86_64_function(&func);
         assert_eq!(report.total(), 3);
+        // E0.2: generic, byte and word pseudos each still name an
+        // AtomicRmwCasLoop theorem, which is reported and never credited.
+        assert_eq!(report.verified_count(), 0, "report was {report}");
         assert_eq!(
-            report.verified_count(),
+            report.registry_name_lookup_count(),
             3,
-            "AtomicRmwCasLoop proofs should cover generic, byte, and word pseudos; report was {report}"
+            "report was {report}"
         );
-        assert_eq!(report.unverified_count(), 0);
+        for inst_report in &report.instructions {
+            assert!(x86_withdrawn_theorem(&inst_report.result).contains("AtomicRmwCasLoop"));
+        }
     }
 
     #[test]
@@ -7330,7 +9504,7 @@ mod tests {
     }
 
     #[test]
-    fn movrr_and_leasib_instructions_verify_with_registered_proofs() {
+    fn movrr_and_leasib_instructions_are_uncredited() {
         let func = make_func_with_insts(vec![
             X86ISelInst::new(X86Opcode::MovRR, vec![]),
             X86ISelInst::new(X86Opcode::MovRR32, vec![]),
@@ -7341,7 +9515,6 @@ mod tests {
                     X86ISelOperand::SibMemAddr {
                         base: Box::new(gpr64(1)),
                         index: Box::new(gpr64(2)),
-                        // #62: only the no-scale/no-disp SIB-LEA keeps a GENUINE proof.
                         scale: 1,
                         disp: 0,
                     },
@@ -7351,16 +9524,17 @@ mod tests {
         let report = verify_x86_64_function(&func);
 
         assert_eq!(report.total(), 3);
-        assert_eq!(
-            report.verified_count(),
-            3,
-            "MOVRR copies and the no-scale/no-disp LEASIB opcode should have registered proofs; report was {report}"
-        );
-        assert_eq!(report.unverified_count(), 0);
+        // E0.2: the operand-less copies name their registry copy theorems and
+        // the no-scale/no-disp SIB-LEA reconstructs but is sampled; none is
+        // credited.
+        assert_eq!(report.verified_count(), 0, "report was {report}");
+        assert!(x86_withdrawn_theorem(&report.instructions[0].result).contains("Copy_I64"));
+        assert!(x86_withdrawn_theorem(&report.instructions[1].result).contains("Copy_I32"));
+        assert_eq!(report.sampled_uncredited_count(), 1, "report was {report}");
     }
 
     #[test]
-    fn lea_shapes_are_reconstruction_verified_with_real_ea_operands() {
+    fn lea_shapes_reconstruct_with_real_ea_operands_but_are_uncredited() {
         let func = make_func_with_insts(vec![
             X86ISelInst::new(
                 X86Opcode::Lea,
@@ -7392,44 +9566,33 @@ mod tests {
         let report = verify_x86_64_function(&func);
 
         assert_eq!(report.total(), 3);
-        // The plain LEA [base+disp] and the scaled/displaced SIB-LEA are now
+        // The plain LEA [base+disp] and the scaled/displaced SIB-LEA are
         // RECONSTRUCTED: the machine side is rebuilt from the real EA encoder over
         // fresh symbolic base/index, and a wrong scale/disp refutes (see the
-        // inject-wrong-scale/disp refutation tests). The retracted degenerate X==X
-        // EA "proofs" are no longer relied on. All three verify (LeaRip via its
-        // genuine RIP-relative SIGNED symbol-address proof).
-        assert_eq!(report.verified_count(), 3, "report was {report}");
-        assert_eq!(report.unverified_count(), 0, "report was {report}");
-        match &report.instructions[0].result {
-            InstructionVerificationResult::Verified { proof_name, .. } => assert!(
-                proof_name.contains("RECONSTRUCTED x86_64 EffectiveAddress")
-                    && proof_name.contains("base+disp"),
-                "plain LEA [base+disp] must be reconstruction-verified; bound {proof_name}"
-            ),
-            other => panic!("plain LEA [base+disp] should reconstruct-verify; got {other:?}"),
+        // inject-wrong-scale/disp refutation tests). E0.2: their 64-bit discharge
+        // is sampled, so reported, not credited; LeaRip names its RIP-relative
+        // SIGNED symbol-address theorem, which is not credit either.
+        assert_eq!(report.verified_count(), 0, "report was {report}");
+        assert_eq!(report.sampled_uncredited_count(), 2, "report was {report}");
+        for (idx, shape) in [(0, "base+disp"), (1, "base+index*scale+disp")] {
+            match &report.instructions[idx].result {
+                InstructionVerificationResult::Unverified { reason } => assert!(
+                    reason.contains("RECONSTRUCTED x86_64 EffectiveAddress")
+                        && reason.contains(shape),
+                    "LEA {shape} must reconstruct from its real EA operands; got {reason}"
+                ),
+                other => panic!("LEA {shape} should be a sampled reconstruction; got {other:?}"),
+            }
         }
-        match &report.instructions[1].result {
-            InstructionVerificationResult::Verified { proof_name, .. } => assert!(
-                proof_name.contains("RECONSTRUCTED x86_64 EffectiveAddress")
-                    && proof_name.contains("base+index*scale+disp"),
-                "scaled/displaced SIB LEA must be reconstruction-verified; bound {proof_name}"
-            ),
-            other => panic!("scaled SIB LEA should reconstruct-verify; got {other:?}"),
-        }
-        // LeaRip is PROVEN-promotable: it composes the per-instruction RIP-relative
-        // effective address with the proven SIGNED relocation displacement to
-        // materialize the in-module symbol address S + A.
-        match &report.instructions[2].result {
-            InstructionVerificationResult::Verified { proof_name, .. } => assert!(
-                proof_name.contains("LeaRip Symbol -> RIP_next + SIGNED disp32 == S + A"),
-                "LeaRip should bind its RIP-relative SIGNED symbol-address proof; bound {proof_name}"
-            ),
-            other => panic!("LeaRip should verify (RIP-relative proof registered); got {other:?}"),
-        }
+        let theorem = x86_withdrawn_theorem(&report.instructions[2].result);
+        assert!(
+            theorem.contains("LeaRip Symbol -> RIP_next + SIGNED disp32 == S + A"),
+            "LeaRip should name its RIP-relative SIGNED symbol-address theorem; named {theorem}"
+        );
     }
 
     #[test]
-    fn movriprel_symbol_verifies_with_registered_got_load_proof() {
+    fn movriprel_symbol_names_registered_got_load_theorem_but_is_uncredited() {
         let func = make_func_with_insts(vec![X86ISelInst::new(
             X86Opcode::MovRipRel,
             vec![
@@ -7440,14 +9603,12 @@ mod tests {
         let report = verify_x86_64_function(&func);
 
         assert_eq!(report.total(), 1);
-        assert_eq!(report.verified_count(), 1, "report was {report}");
-        match &report.instructions[0].result {
-            InstructionVerificationResult::Verified { proof_name, .. } => assert!(
-                proof_name.contains("MovRipRel Symbol -> RIP_next + GOT_LOAD disp32 == G + A"),
-                "MovRipRel should bind its RIP-relative GOT_LOAD proof; bound {proof_name}"
-            ),
-            other => panic!("MovRipRel should verify (GOT_LOAD proof registered); got {other:?}"),
-        }
+        assert_eq!(report.verified_count(), 0, "report was {report}");
+        let theorem = x86_withdrawn_theorem(&report.instructions[0].result);
+        assert!(
+            theorem.contains("MovRipRel Symbol -> RIP_next + GOT_LOAD disp32 == G + A"),
+            "MovRipRel should name its RIP-relative GOT_LOAD theorem; named {theorem}"
+        );
     }
 
     #[test]
@@ -7471,7 +9632,7 @@ mod tests {
     }
 
     #[test]
-    fn fcmp_and_remainder_sequences_verify_with_registered_proofs() {
+    fn fcmp_and_remainder_sequences_name_registered_theorems_but_are_uncredited() {
         let func = make_func_with_insts(
             fcmp_f64_ge_sequence()
                 .into_iter()
@@ -7480,34 +9641,30 @@ mod tests {
                 .collect(),
         );
         let report = verify_x86_64_function(&func);
+        // E0.2: every sequence member still names its whole-sequence theorem,
+        // which is reported and never credited.
+        assert_eq!(report.verified_count(), 0, "report was {report}");
         assert_eq!(
-            report.unverified_count(),
-            0,
-            "FP compare and remainder sequences should have registered proofs; report was {report}"
-        );
-        assert_eq!(
-            report.verified_count(),
+            report.registry_name_lookup_count(),
             report.total(),
-            "all emitted sequence instructions should be covered; report was {report}"
+            "every emitted sequence instruction must name its registered theorem; report was {report}"
         );
 
-        for idx in 3..7 {
-            match &report.instructions[idx].result {
-                InstructionVerificationResult::Verified { proof_name, .. } => assert!(
-                    proof_name.contains("Urem_I32"),
-                    "division sequence index {idx} should use Urem_I32 proof, got {proof_name}"
-                ),
-                other => panic!("division sequence index {idx} should verify, got {other:?}"),
-            }
+        for (offset, instruction) in report.instructions[3..7].iter().enumerate() {
+            let idx = 3 + offset;
+            let theorem = x86_withdrawn_theorem(&instruction.result);
+            assert!(
+                theorem.contains("Urem_I32"),
+                "division sequence index {idx} should name the Urem_I32 theorem, got {theorem}"
+            );
         }
-        for idx in 7..11 {
-            match &report.instructions[idx].result {
-                InstructionVerificationResult::Verified { proof_name, .. } => assert!(
-                    proof_name.contains("Srem_I64"),
-                    "division sequence index {idx} should use Srem_I64 proof, got {proof_name}"
-                ),
-                other => panic!("division sequence index {idx} should verify, got {other:?}"),
-            }
+        for (offset, instruction) in report.instructions[7..11].iter().enumerate() {
+            let idx = 7 + offset;
+            let theorem = x86_withdrawn_theorem(&instruction.result);
+            assert!(
+                theorem.contains("Srem_I64"),
+                "division sequence index {idx} should name the Srem_I64 theorem, got {theorem}"
+            );
         }
     }
 
@@ -7521,6 +9678,50 @@ mod tests {
             } => (proof_name.clone(), *category),
             other => panic!("{:?} should verify; got {other:?}", inst.opcode),
         }
+    }
+
+    /// The refusal reason of a single sampled (uncredited, E0.2) instance.
+    fn single_inst_sampled_reason(inst: X86ISelInst) -> String {
+        let report = verify_x86_64_function(&make_func_with_insts(vec![inst.clone()]));
+        match &report.instructions[0].result {
+            InstructionVerificationResult::Unverified { reason }
+                if reason
+                    .starts_with(crate::function_verifier::STATISTICAL_EVIDENCE_IS_NOT_CREDIT) =>
+            {
+                reason.clone()
+            }
+            other => panic!(
+                "{:?} should be a sampled, uncredited instance; got {other:?}",
+                inst.opcode
+            ),
+        }
+    }
+
+    /// The X8664Lowering theorem a withdrawn registry refusal names: the first
+    /// registered name containing the reported query (case-sensitive), as the
+    /// withdrawn arm selected it. Diagnostic only; never credit (E0.2).
+    fn x86_withdrawn_theorem(result: &InstructionVerificationResult) -> String {
+        let InstructionVerificationResult::Unverified { reason } = result else {
+            panic!("expected withdrawn registry credit, got {result:?}");
+        };
+        assert!(
+            reason.starts_with(crate::function_verifier::REGISTRY_NAME_LOOKUP_IS_NOT_CREDIT),
+            "{reason}"
+        );
+        let (_, rest) = reason
+            .split_once("query `")
+            .expect("refusal names its query");
+        let (query, _) = rest
+            .split_once("` in ")
+            .expect("refusal names its category");
+        ProofDatabase::for_categories(&[ProofCategory::X8664Lowering])
+            .by_category(ProofCategory::X8664Lowering)
+            .iter()
+            .find(|p| p.obligation.name.contains(query))
+            .unwrap_or_else(|| panic!("query `{query}` must still name a theorem"))
+            .obligation
+            .name
+            .clone()
     }
 
     /// SOUNDNESS REGRESSION (reviewer scenario): the byte/word MOVSX/MOVZX
@@ -7575,33 +9776,32 @@ mod tests {
     }
 
     /// SOUNDNESS REGRESSION (reviewer scenario): the GEP path emits 3-operand
-    /// IMUL with a Gpr64 destination (IMUL r64). ImulRRI is now RECONSTRUCTED
-    /// from the real operands: the reconstruction reads the dst register width, so
+    /// IMUL with a Gpr64 destination (IMUL r64). ImulRRI is RECONSTRUCTED from
+    /// the real operands: the reconstruction reads the dst register width, so
     /// the obligation is genuinely width-correct (a 64-bit IMUL-imm bug would
-    /// refute against the 64-bit source `Imul`). The bound proof is the
-    /// width-tagged reconstruction, NOT the degenerate `Imul_I*_Imm` DB proof.
+    /// refute against the 64-bit source `Imul`), NOT the degenerate
+    /// `Imul_I*_Imm` DB proof. E0.2: both widths discharge only by sampling, so
+    /// the width-tagged reconstruction is reported, never credited.
     #[test]
-    fn imul_rri_binds_width_correct_proof_by_dst_class() {
-        let (i64_name, category) = single_inst_proof(X86ISelInst::new(
+    fn imul_rri_reconstructs_width_correct_obligation_by_dst_class() {
+        let i64_reason = single_inst_sampled_reason(X86ISelInst::new(
             X86Opcode::ImulRRI,
             vec![gpr64(0), gpr64(1), X86ISelOperand::Imm(42)],
         ));
-        assert_eq!(category, ProofCategory::X8664Lowering);
         assert!(
-            i64_name.contains("RECONSTRUCTED")
-                && i64_name.contains("Imul_64")
-                && i64_name.contains("ImulRRI"),
-            "ImulRRI with Gpr64 dst (the GEP path) must bind the width-64 reconstruction, \
-             got {i64_name}"
+            i64_reason.contains("RECONSTRUCTED")
+                && i64_reason.contains("Imul_64")
+                && i64_reason.contains("ImulRRI"),
+            "ImulRRI with Gpr64 dst (the GEP path) must reconstruct at width 64, got {i64_reason}"
         );
 
-        let (i32_name, _) = single_inst_proof(X86ISelInst::new(
+        let i32_reason = single_inst_sampled_reason(X86ISelInst::new(
             X86Opcode::ImulRRI,
             vec![gpr32(0), gpr32(1), X86ISelOperand::Imm(42)],
         ));
         assert!(
-            i32_name.contains("RECONSTRUCTED") && i32_name.contains("Imul_32"),
-            "ImulRRI with Gpr32 dst must bind the width-32 reconstruction, got {i32_name}"
+            i32_reason.contains("RECONSTRUCTED") && i32_reason.contains("Imul_32"),
+            "ImulRRI with Gpr32 dst must reconstruct at width 32, got {i32_reason}"
         );
     }
 
@@ -7743,13 +9943,114 @@ mod tests {
     }
 
     fn tv2_provenance_failure(report: &FunctionVerificationReport) -> bool {
-        report.instructions.iter().any(|r| {
-            matches!(
-                &r.result,
-                InstructionVerificationResult::Failed { proof_name, .. }
-                    if proof_name == "provenance-crosscheck (TV-2)"
-            )
-        })
+        report.precondition_failure.is_some()
+            || report.instructions.iter().any(|r| {
+                matches!(
+                    &r.result,
+                    InstructionVerificationResult::Failed { proof_name, .. }
+                        if proof_name == "provenance-crosscheck (TV-2)"
+                )
+            })
+    }
+
+    #[test]
+    fn tv2_x86_enforce_rejects_absent_and_mispaired_sources_including_empty() {
+        let lir = tv2_lir_function();
+        let mut wrong_lir = lir.clone();
+        wrong_lir.name = "wrong_source".to_string();
+        let verifier = X86FunctionVerifier::new();
+        for func in [
+            make_func_with_insts(vec![]),
+            make_func_with_insts(vec![tv2_add_rr_with_stamp(tv2_stamp(&lir, 0, 1))]),
+            make_func_with_opcodes(&[X86Opcode::Nop]),
+        ] {
+            for (source, expected) in [
+                (
+                    None,
+                    FunctionVerificationPreconditionFailure::MissingLirSource,
+                ),
+                (
+                    Some(&wrong_lir),
+                    FunctionVerificationPreconditionFailure::LirSourceNameMismatch {
+                        source_function: wrong_lir.name.clone(),
+                    },
+                ),
+            ] {
+                let report = verifier.verify_with_lir_source_and_mode(
+                    &func,
+                    source,
+                    ProvenanceXCheckMode::Enforce,
+                );
+                assert_eq!(report.precondition_failure.as_ref(), Some(&expected));
+                assert!(report.has_failures());
+                assert!(!report.all_verified());
+                assert!(!report.all_genuinely_verified());
+                assert_eq!(report.total(), 0);
+                assert_eq!(report.failed_count(), 0);
+                assert_eq!(report.genuinely_verified_count(), 0);
+                assert_eq!(report.coverage_percent(), 0.0);
+                assert_eq!(report.genuine_coverage_percent(), 0.0);
+                let inventory = report.emitted_opcode_inventory();
+                assert!(inventory.entries.is_empty());
+                assert!(!inventory.is_promotable());
+                assert_eq!(inventory.precondition_failure.as_ref(), Some(&expected));
+                assert!(inventory.promotion_rejection_reason().is_some());
+                assert!(report.to_string().contains("Function precondition FAILED"));
+            }
+        }
+    }
+
+    #[test]
+    fn tv2_x86_warn_and_off_preserve_diagnostic_source_pairing_behavior() {
+        let lir = tv2_lir_function();
+        let mut wrong_lir = lir.clone();
+        wrong_lir.name = "wrong_source".to_string();
+        let verifier = X86FunctionVerifier::with_config(VerificationConfig::with_sample_count(16));
+        for func in [
+            make_func_with_insts(vec![]),
+            make_func_with_insts(vec![tv2_add_rr_with_stamp(tv2_stamp(&lir, 0, 1))]),
+        ] {
+            let baseline = verifier.verify_with_lir_source_and_mode(
+                &func,
+                Some(&lir),
+                ProvenanceXCheckMode::Enforce,
+            );
+            assert!(!baseline.has_failures());
+            for mode in [ProvenanceXCheckMode::Warn, ProvenanceXCheckMode::Off] {
+                for source in [None, Some(&wrong_lir), Some(&lir)] {
+                    let report = verifier.verify_with_lir_source_and_mode(&func, source, mode);
+                    assert!(report.precondition_failure.is_none());
+                    assert!(!report.has_failures());
+                    assert_eq!(
+                        format!("{:?}", report.instructions),
+                        format!("{:?}", baseline.instructions),
+                        "diagnostic mode {mode:?} must retain its instruction results"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tv2_x86_enforce_with_exact_source_keeps_empty_and_nonempty_walks() {
+        let lir = tv2_lir_function();
+        let verifier = X86FunctionVerifier::with_config(VerificationConfig::with_sample_count(16));
+        for (func, expected_count) in [
+            (make_func_with_insts(vec![]), 0),
+            (
+                make_func_with_insts(vec![tv2_add_rr_with_stamp(tv2_stamp(&lir, 0, 1))]),
+                1,
+            ),
+        ] {
+            let report = verifier.verify_with_lir_source_and_mode(
+                &func,
+                Some(&lir),
+                ProvenanceXCheckMode::Enforce,
+            );
+            assert!(report.precondition_failure.is_none());
+            assert!(!tv2_provenance_failure(&report));
+            assert_eq!(report.total(), expected_count);
+        }
     }
 
     /// PINNED TV-2 REFUTATION (gate rollout protocol step c): an `IMUL` whose
@@ -7859,6 +10160,255 @@ mod tests {
         assert!(tv2_provenance_failure(&report));
     }
 
+    // -----------------------------------------------------------------
+    // TV-1 EXTENDED: the copy family's source-opcode check, end to end
+    // -----------------------------------------------------------------
+
+    /// One LIR block holding `inst` plus a value-less `Return`, over a signature
+    /// with no parameters (so no `FormalArguments` ABI glue is emitted and the
+    /// only attributed emission is the one under test).
+    fn copy_control_lir(inst: Instruction) -> trust_cg_lower::Function {
+        let mut lir = trust_cg_lower::Function::new(
+            "copy_control",
+            Signature {
+                params: vec![],
+                returns: vec![],
+            },
+        );
+        let block = Block(0);
+        lir.block_order.push(block);
+        lir.blocks.insert(
+            block,
+            trust_cg_lower::function::BasicBlock {
+                params: vec![],
+                instructions: vec![
+                    inst,
+                    Instruction {
+                        opcode: LirOpcode::Return,
+                        args: vec![],
+                        results: vec![],
+                    },
+                ],
+                source_locs: vec![],
+            },
+        );
+        lir
+    }
+
+    /// Select `lir` with the REAL x86 selector, with `seeds` pre-defined as
+    /// `Gpr32` virtual registers, so the returned function carries the operand
+    /// bindings ISel itself records.
+    fn selected_copy_control(lir: &trust_cg_lower::Function, seeds: &[Value]) -> X86ISelFunction {
+        use trust_cg_lower::x86_64_isel::X86InstructionSelector;
+        let mut isel = X86InstructionSelector::new("copy_control".into(), lir.signature.clone());
+        isel.ensure_block(Block(0));
+        for value in seeds {
+            let vreg = isel.new_vreg(RegClass::Gpr32);
+            isel.define_value(*value, X86ISelOperand::VReg(vreg), Type::I32);
+        }
+        isel.select_block(Block(0), &lir.blocks[&Block(0)].instructions)
+            .expect("the control function must select");
+        isel.finalize()
+    }
+
+    /// Every published `proof_name` in a report.
+    fn proof_names(report: &FunctionVerificationReport) -> Vec<String> {
+        report
+            .instructions
+            .iter()
+            .map(|row| match &row.result {
+                InstructionVerificationResult::Verified { proof_name, .. }
+                | InstructionVerificationResult::Failed { proof_name, .. } => proof_name.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// The binding a real-selector instruction earns, read from the binder
+    /// itself over the SAME inputs the verifier pre-pass hands it: the emitted
+    /// instruction, its TV-1 stamp, the replayed source instruction at that
+    /// stamp, and the operand correspondences ISel recorded.
+    ///
+    /// Read HERE rather than off the published certificate because a
+    /// `[source-bound: …]` token appears only on a CREDITED row, and after
+    /// upstream's E0.5 deletion of the live checked-solve-on-miss lane a bound
+    /// reconstruction with no committed portable certificate or tier-0 row for
+    /// its obligation has no way to reach `Formal` in-process. The certificate
+    /// therefore stopped being able to witness the binding on this host; the
+    /// binder's answer did not change, and it is what these two controls are
+    /// about.
+    fn binding_for_stamped_inst(
+        func: &X86ISelFunction,
+        lir: &trust_cg_lower::Function,
+        source_id: SourceInstId,
+        opcode: X86Opcode,
+    ) -> Option<crate::x86_source_operand_binding::ExactSourceOperandBinding> {
+        let index = LirSourceIndex::build(lir);
+        let source = index.get(source_id).expect("the stamp must resolve");
+        let inst = func
+            .blocks
+            .values()
+            .flat_map(|block| block.insts.iter())
+            .find(|inst| {
+                inst.lowering_provenance.source_id() == Some(source_id) && inst.opcode == opcode
+            })
+            .expect("the stamped instruction must be present");
+        crate::x86_source_operand_binding::bind_exact_source_operands(
+            inst,
+            source_id,
+            source,
+            func.source_operand_bindings(),
+        )
+    }
+
+    /// POSITIVE CONTROL for the negative control below: a faithful `Copy`
+    /// selected by the real selector DOES earn a binding, and it is the
+    /// result-defining-copy schema. Without this the refusal next door could
+    /// pass because the harness never reaches the binder at all.
+    ///
+    /// WHAT THIS NO LONGER ASSERTS, and why. It used to read the schema off the
+    /// published certificate, which required the row to be CREDITED. Upstream's
+    /// E0.2/E0.5 withdrawal deleted `lowering_proof::try_formal_on_miss`, the
+    /// only lane that could discharge a freshly reconstructed obligation
+    /// `Formal` in-process; what survives is a portable DRAT certificate replay
+    /// and a tier-0 revalidation, and this control's obligation has neither
+    /// committed. MEASURED on the merged tree, the row is therefore
+    /// `Unverified` with upstream's honest sampling reason, so the certificate
+    /// can no longer witness the binding at all. The BINDING is unchanged and is
+    /// asserted directly; the credit that used to follow from it is a separate
+    /// fact and is not asserted here, because on this host it is not true.
+    #[test]
+    fn x86_faithful_copy_earns_the_result_defining_copy_schema() {
+        let lir = copy_control_lir(Instruction {
+            opcode: LirOpcode::Copy,
+            args: vec![Value(1)],
+            results: vec![Value(3)],
+        });
+        let func = selected_copy_control(&lir, &[Value(1)]);
+        let report = X86FunctionVerifier::with_config(VerificationConfig::for_proof_promotion())
+            .verify_with_lir_source_and_mode(&func, Some(&lir), ProvenanceXCheckMode::Enforce);
+        assert!(
+            !tv2_provenance_failure(&report),
+            "the faithful control must pass TV-2: {:?}",
+            report.instructions
+        );
+        let binding = binding_for_stamped_inst(
+            &func,
+            &lir,
+            SourceInstId { block: 0, index: 0 },
+            X86Opcode::MovRR32,
+        );
+        assert_eq!(
+            binding.map(|binding| binding.schema()),
+            Some(crate::x86_source_operand_binding::X86OperandBindingSchema::ResultDefiningCopy),
+            "a faithful Copy must earn the result-defining-copy schema"
+        );
+        // The row's PUBLISHED status on this host, pinned so a future lane that
+        // credits it shows up here as a failure to be re-examined rather than
+        // as a silent change of meaning. Upstream's own E0.2 tests pin the
+        // refusal the same way.
+        let names = proof_names(&report);
+        assert!(
+            !names.iter().any(|name| name.contains("[source-bound: ")),
+            "no lane credits a bound reconstruction on this host, so no \
+             certificate may name one: {names:?}"
+        );
+    }
+
+    /// END-TO-END NEGATIVE CONTROL (TV-1 EXTENDED, copy family): a machine `MOV`
+    /// that REPLACES its source instruction's computation must earn no binding,
+    /// and therefore no `Formal` credit.
+    ///
+    /// Built to be non-vacuous, and each of those properties is asserted rather
+    /// than assumed:
+    ///
+    /// * the function comes out of the REAL selector, so the operand bindings
+    ///   are the ones ISel records for the `Isub` — `σ(a)` and `σ(dst)`;
+    /// * the emitted `SubRR` is then replaced by a `MovRR32` that KEEPS the
+    ///   Isub's TV-1 stamp and the destination/first-source operands, which is
+    ///   exactly the shape an operands-only copy schema bound;
+    /// * TV-2 must still PASS on it — a move has no definite op class, so the
+    ///   op-class cross-check has nothing to compare — which is why this hole
+    ///   was not already closed;
+    /// * the reconstructed obligation is `X == X`, so a solver cannot refute it
+    ///   either.
+    ///
+    /// The source-opcode check in `bind_copy` is the only thing left, and the
+    /// row must stay on its honest sampling tier with no `[source-bound: …]` in
+    /// the published certificate.
+    #[test]
+    fn x86_mov_stamped_from_an_isub_earns_no_source_binding() {
+        let lir = copy_control_lir(Instruction {
+            opcode: LirOpcode::Isub,
+            args: vec![Value(1), Value(2)],
+            results: vec![Value(3)],
+        });
+        let mut func = selected_copy_control(&lir, &[Value(1), Value(2)]);
+
+        // Replace the emitted SUB with a MOV that keeps its stamp, destination
+        // and first source operand.
+        let source_id = SourceInstId { block: 0, index: 0 };
+        let block = func.blocks.get_mut(&Block(0)).expect("block 0");
+        let position = block
+            .insts
+            .iter()
+            .position(|inst| {
+                inst.lowering_provenance.source_id() == Some(source_id)
+                    && inst.opcode == X86Opcode::SubRR
+            })
+            .expect("the Isub must lower to one SubRR");
+        let stamp = block.insts[position].lowering_provenance;
+        let operands = block.insts[position].operands.clone();
+        assert_eq!(operands.len(), 3, "SubRR is [dst, src1, src2]");
+        let mut mov = X86ISelInst::new(
+            X86Opcode::MovRR32,
+            vec![operands[0].clone(), operands[1].clone()],
+        );
+        mov.lowering_provenance = stamp;
+        block.insts[position] = mov;
+
+        let report = X86FunctionVerifier::with_config(VerificationConfig::for_proof_promotion())
+            .verify_with_lir_source_and_mode(&func, Some(&lir), ProvenanceXCheckMode::Enforce);
+        // NON-VACUITY: the binding runs only for an instruction whose TV-2
+        // cross-check passed under Enforce. If TV-2 rejected the swap this test
+        // would prove nothing about `bind_copy`.
+        assert!(
+            !tv2_provenance_failure(&report),
+            "TV-2 cannot catch a MOV stamped from an Isub (a move has no op \
+             class); if it now does, this control needs rebuilding: {:?}",
+            report.instructions
+        );
+        // Asserted AT THE BINDER, so this control cannot pass vacuously through
+        // a harness that never reaches it, and does not depend on whether a
+        // bound row could be credited (see the positive control above).
+        assert_eq!(
+            binding_for_stamped_inst(&func, &lir, source_id, X86Opcode::MovRR32),
+            None,
+            "a MOV that deleted its source instruction's subtraction must earn \
+             no operand binding"
+        );
+        let names = proof_names(&report);
+        assert!(
+            !names.iter().any(|name| name.contains("[source-bound:")),
+            "a MOV that deleted its source instruction's subtraction must earn \
+             no operand binding: {names:?}"
+        );
+        for row in &report.instructions {
+            if let InstructionVerificationResult::Verified {
+                proof_name,
+                strength,
+                ..
+            } = &row.result
+                && proof_name.starts_with("RECONSTRUCTED x86_64")
+            {
+                assert!(
+                    !matches!(strength, crate::verify::VerificationStrength::Formal),
+                    "unbound reconstruction {proof_name} must not be Formal"
+                );
+            }
+        }
+    }
+
     /// Synthetic/Unattributed instructions (pass-created, prologue/ABI glue)
     /// are exempt from the cross-check by contract.
     #[test]
@@ -7877,13 +10427,831 @@ mod tests {
         assert!(!tv2_provenance_failure(&report));
     }
 
-    /// Without a replayed LIR function the cross-check cannot run and plain
-    /// `verify` behaves exactly as before (no verdict change).
+    // -----------------------------------------------------------------
+    // NARROW LOCK CMPXCHG: the BINDING traps
+    // -----------------------------------------------------------------
+
+    /// The narrow forms must NEVER reach the 32/64-bit `Cmpxchg_I{32,64}`
+    /// static-DB proofs. Operand 0 is a `Gpr32` for BOTH i8 and i16, so the
+    /// register-class width helper would happily answer "I32" — binding a BYTE
+    /// compare-and-swap to a DOUBLEWORD theorem. That is the degenerate-green
+    /// route for this row, and this test closes it.
     #[test]
-    fn tv2_no_lir_source_means_no_crosscheck() {
+    fn narrow_cmpxchg_never_binds_the_wide_cmpxchg_proofs() {
+        for op in [X86Opcode::Cmpxchg8, X86Opcode::Cmpxchg16] {
+            let inst = X86ISelInst::new(
+                op,
+                vec![
+                    X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr32)),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64))),
+                        disp: 0,
+                    },
+                ],
+            );
+            if let Some(query) = X86FunctionVerifier::instruction_to_proof_query(&inst) {
+                assert!(
+                    !query.contains("Cmpxchg_I32") && !query.contains("Cmpxchg_I64"),
+                    "{op:?} must never bind a wide CMPXCHG proof, got {query}"
+                );
+            }
+            assert!(
+                crate::coverage_gate::x86_width_polymorphic_proofs(op).is_none(),
+                "{op:?} must not be credited through the width-polymorphic DB path"
+            );
+            // The reconstruction path is what credits it, and the machine width
+            // comes from the OPCODE.
+            let ob = reconstruct_alu_obligation(&inst)
+                .unwrap_or_else(|| panic!("{op:?} must reconstruct"));
+            let expect = if op == X86Opcode::Cmpxchg8 { 8 } else { 16 };
+            assert!(
+                ob.name.contains(&format!("CmpXchg_I{expect}")),
+                "{op:?} must reconstruct at width {expect}, got {}",
+                ob.name
+            );
+        }
+    }
+
+    /// END-TO-END: the REAL four-instruction window `select_cmpxchg` emits for
+    /// `AtomicU8::compare_exchange` reaches the narrow CAS's real-operand,
+    /// real-EA reconstruction. That obligation discharges only by sampling, so
+    /// since E0.2 the CAS is reported with its obligation and sample count and
+    /// is NOT credited: proof-required compilation of an atomic byte/halfword
+    /// CAS fails closed until a complete route exists (a disclosed capability
+    /// loss, not a regression hidden by this test).
+    #[test]
+    fn narrow_cmpxchg_window_reconstructs_end_to_end_but_sampling_is_not_credited() {
+        use trust_cg_ir::x86_64_regs::EAX;
+
+        for (op, expect_w) in [(X86Opcode::Cmpxchg8, 8u32), (X86Opcode::Cmpxchg16, 16u32)] {
+            let desired = X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr32));
+            let src = X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr32));
+            let addr = X86ISelOperand::VReg(VReg::new(2, RegClass::Gpr64));
+            let dst = X86ISelOperand::VReg(VReg::new(3, RegClass::Gpr32));
+            // Exactly the window asserted by
+            // `x86_64_isel::tests::test_select_cmpxchg_i8_i16_emits_narrow_cmpxchg`.
+            let insts = vec![
+                X86ISelInst::new(X86Opcode::MovRR32, vec![desired.clone(), src.clone()]),
+                X86ISelInst::new(
+                    X86Opcode::MovRR32,
+                    vec![X86ISelOperand::PReg(EAX), src.clone()],
+                ),
+                X86ISelInst::new(
+                    op,
+                    vec![
+                        desired,
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(addr),
+                            disp: 0,
+                        },
+                    ],
+                ),
+                X86ISelInst::new(X86Opcode::MovRR32, vec![dst, X86ISelOperand::PReg(EAX)]),
+            ];
+            let report = verify_x86_64_function(&make_func_with_insts(insts));
+            let cas = &report.instructions[2];
+            match &cas.result {
+                InstructionVerificationResult::Unverified { reason } => {
+                    assert!(
+                        reason.starts_with(
+                            crate::function_verifier::STATISTICAL_EVIDENCE_IS_NOT_CREDIT
+                        ),
+                        "{op:?}: {reason}"
+                    );
+                    assert!(
+                        reason.contains(&format!("RECONSTRUCTED x86_64 CmpXchg_I{expect_w} -> "))
+                            && reason.contains("real-EA, real-operand"),
+                        "{op:?} reached an unexpected obligation: {reason}"
+                    );
+                }
+                result => panic!("{op:?} must reach its sampled reconstruction; got {result:?}"),
+            }
+            assert!(!cas.result.is_verified(), "{op:?} report was {report}");
+        }
+    }
+
+    /// A narrow CAS reports a DEFINITE `Atomic` emitted class. The TV-2
+    /// compatibility matrix must admit it under an atomic LIR source (else
+    /// every real `AtomicU8::compare_exchange` would fail the cross-check — a
+    /// COMPLETENESS regression), and must reject it under a non-atomic one.
+    #[test]
+    fn tv2_narrow_cmpxchg_class_binding() {
+        use crate::provenance_xcheck::OpClass;
+
+        let cas = X86ISelInst::new(
+            X86Opcode::Cmpxchg8,
+            vec![
+                X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr32)),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64))),
+                    disp: 0,
+                },
+            ],
+        );
+        assert_eq!(x86_emitted_op_class(&cas), Some(OpClass::Atomic));
+
+        let mut lir = tv2_lir_function();
+        lir.blocks.get_mut(&Block(0)).unwrap().instructions.insert(
+            0,
+            Instruction {
+                opcode: LirOpcode::CmpXchg {
+                    ty: Type::I8,
+                    success: trust_cg_lower::instructions::AtomicOrdering::SeqCst,
+                    failure: trust_cg_lower::instructions::AtomicOrdering::SeqCst,
+                },
+                args: vec![Value(0), Value(0), Value(1)],
+                results: vec![Value(5), Value(6)],
+            },
+        );
+
+        // Stamped from the ATOMIC source: admitted.
+        let mut ok = cas.clone();
+        ok.lowering_provenance = tv2_stamp(&lir, 0, 0);
+        let report = X86FunctionVerifier::new().verify_with_lir_source_and_mode(
+            &make_func_with_insts(vec![ok]),
+            Some(&lir),
+            ProvenanceXCheckMode::Enforce,
+        );
+        assert!(
+            !tv2_provenance_failure(&report),
+            "a narrow CAS stamped from CmpXchg must pass TV-2"
+        );
+
+        // Stamped from the Iadd (index 2 after the insert): REJECTED.
+        let mut bad = cas;
+        bad.lowering_provenance = tv2_stamp(&lir, 0, 2);
+        let report = X86FunctionVerifier::new().verify_with_lir_source_and_mode(
+            &make_func_with_insts(vec![bad]),
+            Some(&lir),
+            ProvenanceXCheckMode::Enforce,
+        );
+        assert!(
+            tv2_provenance_failure(&report),
+            "a narrow CAS stamped from a non-atomic source must FAIL TV-2"
+        );
+    }
+
+    /// Plain `verify` is explicitly source-less diagnostic verification, not
+    /// an Enforce request. Its instruction-verification behavior is retained.
+    #[test]
+    fn tv2_source_less_verify_is_explicitly_diagnostic() {
         let lir = tv2_lir_function();
         let func = make_func_with_insts(vec![tv2_add_rr_with_stamp(tv2_stamp(&lir, 0, 2))]);
         let report = X86FunctionVerifier::new().verify(&func);
         assert!(!tv2_provenance_failure(&report));
+        assert_eq!(report.total(), 1);
+    }
+}
+
+/// Whether the shared effective-address reconstruction is DEGENERATE: whether
+/// it builds its "source" and "machine" halves into the SAME SMT tree.
+///
+/// This is not a style question. Every `EmittableNeedsProof` classification in
+/// `coverage_gate` that rests on this helper states, in those words, that
+/// "SOURCE = the trust_ir address chain, MACHINE = the INDEPENDENT x86 encoder"
+/// and that "a wrong base/index/scale/disp REFUTES". Both halves are built HERE
+/// from the same `X86ISelOperand` — the MACHINE operand — so neither claim can
+/// be true unless the two encoders disagree structurally. They do not:
+/// `encode_trust_ir_binop(Iadd) == bvadd == encode_lea_base_disp` and
+/// `encode_trust_ir_binop(Imul) == bvmul`, so the halves are literally equal
+/// and the obligation is `X == X`.
+///
+/// Exposed (crate-internal, test-only) so the coverage gate's own tests can
+/// assert the honest classification rather than the claimed one.
+#[doc(hidden)]
+pub fn x86_effective_address_halves_are_identical(addr: &X86ISelOperand) -> Option<bool> {
+    let (ir_ea, machine_ea, _) = x86_reconstruct_effective_address(addr)?;
+    Some(ir_ea == machine_ea)
+}
+
+#[cfg(test)]
+mod effective_address_independence {
+    use super::*;
+    use trust_cg_ir::X86PReg;
+    use trust_cg_lower::x86_64_isel::X86ISelOperand;
+
+    fn sib(base: u16, index: u16, scale: u8, disp: i32) -> X86ISelOperand {
+        X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::PReg(X86PReg::new(base))),
+            index: Box::new(X86ISelOperand::PReg(X86PReg::new(index))),
+            scale,
+            disp,
+        }
+    }
+
+    /// THE FINDING. The two halves of every SIB effective address are the SAME
+    /// SMT tree, so the obligation built from them is satisfied by syntactic
+    /// identity and refutes nothing.
+    #[test]
+    fn sib_effective_address_source_and_machine_halves_are_the_same_tree() {
+        let degenerate = x86_effective_address_halves_are_identical(&sib(0, 1, 8, 16))
+            .expect("a PReg-based SibMemAddr is a modeled shape");
+        assert!(
+            degenerate,
+            "the SIB effective-address halves now differ — if this is a real repair, the \
+             coverage_gate classifications that cite `x86_reconstruct_effective_address` may be \
+             re-stated as independent; until then they may not be"
+        );
+    }
+
+    /// The plain `[base+disp]` form is degenerate the same way.
+    #[test]
+    fn plain_effective_address_source_and_machine_halves_are_the_same_tree() {
+        let addr = X86ISelOperand::MemAddr {
+            base: Box::new(X86ISelOperand::PReg(X86PReg::new(0))),
+            disp: 24,
+        };
+        assert!(
+            x86_effective_address_halves_are_identical(&addr)
+                .expect("a PReg-based MemAddr is a modeled shape"),
+            "the plain effective-address halves now differ"
+        );
+    }
+
+    /// The consequence, stated as the gate states it: a WRONG base/index/scale
+    /// does NOT refute. Two addresses that denote different memory produce
+    /// obligations that are BOTH trivially valid, because each one compares a
+    /// tree against itself.
+    #[test]
+    fn a_wrong_base_index_or_scale_does_not_refute() {
+        // Swapped base/index, and a wrong scale: genuinely different addresses.
+        for (label, addr) in [
+            ("base/index swapped", sib(1, 0, 8, 16)),
+            ("scale 8 -> 4", sib(0, 1, 4, 16)),
+            ("disp 16 -> 32", sib(0, 1, 8, 32)),
+        ] {
+            assert!(
+                x86_effective_address_halves_are_identical(&addr)
+                    .unwrap_or_else(|| panic!("{label}: modeled shape")),
+                "{label}: the halves differ, so this address CAN be refuted"
+            );
+        }
+    }
+}
+
+/// TEETH AUDIT. For a representative instance of `opcode`, does the
+/// reconstructed obligation have ANY discriminating power?
+///
+/// `is_genuinely_proven` (structural inequality) is the WRONG instrument for
+/// this question and over-fires: a correct commutative ALU reconstruction
+/// legitimately produces `bvadd == bvadd`, because its two sides come from
+/// genuinely different places (the mapping table's source op vs. the real
+/// machine opcode's encoder) and coincide only BECAUSE the mapping is right. A
+/// wrong mapping makes them differ, so that obligation has teeth even though
+/// this instance is structurally equal.
+///
+/// The question that separates the two cases is whether any perturbation of the
+/// verifier's OWN inputs can make the halves differ. This probe answers it for
+/// the two inputs a memory reconstruction has:
+///
+/// * the ADDRESSING OPERAND — perturbed by rewriting base/index/scale/disp;
+/// * the SOURCE OP the mapping table supplies — perturbed by asking for a
+///   different `X86SourceOp` than `opcode_to_proof_query` returns.
+///
+/// A row that survives BOTH is degenerate BY CONSTRUCTION: no input makes its
+/// halves differ, so discharging `Valid` is a statement about nothing.
+///
+/// # "Differ" means SEMANTICALLY
+///
+/// A perturbed address REFUTES only if the obligation rebuilt from the
+/// perturbed operand is `Invalid` under the default evaluator. Structural
+/// inequality of the rebuilt halves is NOT refutation, and using it was the
+/// defect this function had: a reconstruction whose two sides are different
+/// TREES for every operand — the CMPXCHG rows, whose source side is a value
+/// concat (`Cmpxchg8`/`Cmpxchg16`) or an all-ones facet constant
+/// (`AtomicLoadCmpxchg16b`) — passed for "address teeth" although the rebuilt
+/// obligation is `Valid` at every address, because the source side's address
+/// and the machine side's address are both derived from the one perturbed
+/// operand. Those rows are now reported toothless, as every reconstruction that
+/// builds both halves from the emitted operand must be: a row can earn address
+/// teeth here only by taking its SOURCE-side address from somewhere other than
+/// the operand under test.
+#[doc(hidden)]
+pub fn x86_reconstruction_teeth(opcode: X86Opcode) -> Option<X86ReconstructionTeeth> {
+    let insts = representative_reconstructable_insts(opcode);
+    let inst = insts.first()?;
+    let base = reconstruct_alu_obligation(inst)?;
+
+    // (1) Perturb the ADDRESSING OPERAND. Rewrite every memory operand into a
+    //     genuinely different address, rebuild the obligation, and ask whether
+    //     it REFUTES.
+    let mut operand_refutes = false;
+    let mut separates_structurally = false;
+    for variant in perturbed_address_variants(inst) {
+        let Some(o) = reconstruct_alu_obligation(&variant) else {
+            continue;
+        };
+        if o.trust_ir_expr == o.aarch64_expr {
+            // `X == X`: Valid by identity, nothing to evaluate.
+            continue;
+        }
+        separates_structurally = true;
+        if perturbed_obligation_refutes(&o) {
+            operand_refutes = true;
+            break;
+        }
+    }
+
+    Some(X86ReconstructionTeeth {
+        instance_is_structurally_equal: base.trust_ir_expr == base.aarch64_expr,
+        operand_perturbation_can_refute: operand_refutes,
+        perturbed_halves_differ_structurally: separates_structurally,
+    })
+}
+
+/// Whether a perturbed-operand obligation REFUTES: `Invalid` under the default
+/// evaluator (the discharge the coverage gate credits with). `Valid` — or any
+/// verdict that is not a counterexample — is not a refutation.
+#[doc(hidden)]
+pub fn perturbed_obligation_refutes(obligation: &ProofObligation) -> bool {
+    matches!(
+        crate::lowering_proof::verify_by_evaluation(obligation),
+        VerificationResult::Invalid { .. }
+    )
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86ReconstructionTeeth {
+    /// Whether THIS representative instance is `X == X`.
+    pub instance_is_structurally_equal: bool,
+    /// Whether SOME perturbation of the addressing operand yields an obligation
+    /// that REFUTES (evaluates `Invalid`). False means no address error of any
+    /// kind can be refuted through this reconstruction.
+    pub operand_perturbation_can_refute: bool,
+    /// Whether SOME perturbation yields halves that are different TREES. This
+    /// is the old, structural criterion, kept so the audit can name the rows
+    /// where it and the semantic one disagree: different trees that still
+    /// discharge `Valid` are not teeth.
+    pub perturbed_halves_differ_structurally: bool,
+}
+
+/// Rewrite each memory operand of `inst` into a genuinely different address:
+/// a different base, a different index, a base/index swap, a different scale
+/// and a different displacement.
+fn perturbed_address_variants(inst: &X86ISelInst) -> Vec<X86ISelInst> {
+    let mut out = Vec::new();
+    for (position, operand) in inst.operands.iter().enumerate() {
+        let rewrites: Vec<X86ISelOperand> = match operand {
+            X86ISelOperand::MemAddr { base, disp } => vec![
+                X86ISelOperand::MemAddr {
+                    base: base.clone(),
+                    disp: disp.wrapping_add(64),
+                },
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::PReg(trust_cg_ir::X86PReg::new(11))),
+                    disp: *disp,
+                },
+            ],
+            X86ISelOperand::SibMemAddr {
+                base,
+                index,
+                scale,
+                disp,
+            } => vec![
+                // base/index SWAPPED
+                X86ISelOperand::SibMemAddr {
+                    base: index.clone(),
+                    index: base.clone(),
+                    scale: *scale,
+                    disp: *disp,
+                },
+                // different scale
+                X86ISelOperand::SibMemAddr {
+                    base: base.clone(),
+                    index: index.clone(),
+                    scale: if *scale == 8 { 2 } else { 8 },
+                    disp: *disp,
+                },
+                // different displacement
+                X86ISelOperand::SibMemAddr {
+                    base: base.clone(),
+                    index: index.clone(),
+                    scale: *scale,
+                    disp: disp.wrapping_add(64),
+                },
+                // different base register
+                X86ISelOperand::SibMemAddr {
+                    base: Box::new(X86ISelOperand::PReg(trust_cg_ir::X86PReg::new(11))),
+                    index: index.clone(),
+                    scale: *scale,
+                    disp: *disp,
+                },
+            ],
+            _ => Vec::new(),
+        };
+        for rewrite in rewrites {
+            let mut variant = inst.clone();
+            variant.operands[position] = rewrite;
+            out.push(variant);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod reconstruction_teeth_audit {
+    use super::*;
+
+    /// Every x86 opcode the coverage gate credits through reconstruction,
+    /// partitioned by whether ANY address perturbation can refute it.
+    ///
+    /// This is the honest measurement behind the claim that the
+    /// `x86_reconstruct_effective_address` family overstates what it proves.
+    /// It prints the partition so the numbers in `coverage_gate`'s
+    /// classification comments can be checked against it, and it asserts the
+    /// consequence that matters: every credited memory opcode the shared
+    /// reconstruction cannot defend gets its ADDRESS from the byte-level lane
+    /// instead, which routes it, has captured encodings of it, and discharges.
+    #[test]
+    fn report_which_credited_opcodes_have_no_address_teeth() {
+        let mut toothless: Vec<String> = Vec::new();
+        let mut has_teeth: Vec<String> = Vec::new();
+        let mut structural_only: Vec<String> = Vec::new();
+        let mut toothless_outside_address_lane: Vec<String> = Vec::new();
+        let mut no_memory_operand: usize = 0;
+
+        for &opcode in crate::coverage_gate::ALL_X86_OPCODES {
+            if !classify_x86_for_test(opcode) {
+                continue;
+            }
+            let Some(teeth) = x86_reconstruction_teeth(opcode) else {
+                continue;
+            };
+            let touches_memory = representative_reconstructable_insts(opcode)
+                .first()
+                .map(|inst| {
+                    inst.operands.iter().any(|o| {
+                        matches!(
+                            o,
+                            X86ISelOperand::MemAddr { .. } | X86ISelOperand::SibMemAddr { .. }
+                        )
+                    })
+                })
+                .unwrap_or(false);
+            if !touches_memory {
+                no_memory_operand += 1;
+                continue;
+            }
+            if teeth.perturbed_halves_differ_structurally && !teeth.operand_perturbation_can_refute
+            {
+                structural_only.push(format!("{opcode:?}"));
+            }
+            if teeth.operand_perturbation_can_refute {
+                has_teeth.push(format!("{opcode:?}"));
+            } else {
+                toothless.push(format!("{opcode:?}"));
+                // Carried by the byte-level lane only if the coverage gate
+                // ROUTES the row there AND the lane's captured corpus holds
+                // real encodings of this opcode. Routing alone is a name on a
+                // list; the encodings are what the lane's controls refute on.
+                let prefix = format!("{opcode:?} ");
+                let captured = crate::x86_addressing_proofs::EMITTED_X86_MEM_MOV
+                    .iter()
+                    .filter(|entry| entry.label.starts_with(&prefix))
+                    .count();
+                if !crate::coverage_gate::x86_opcode_has_address_credit(opcode) || captured == 0 {
+                    toothless_outside_address_lane.push(format!(
+                        "{opcode:?} (routed: {}, captured encodings: {captured})",
+                        crate::coverage_gate::x86_opcode_has_address_credit(opcode)
+                    ));
+                }
+            }
+        }
+
+        toothless.sort();
+        has_teeth.sort();
+        structural_only.sort();
+        toothless_outside_address_lane.sort();
+        println!("=== x86 reconstruction ADDRESS-teeth audit ===");
+        println!(
+            "memory opcodes where SOME address error refutes ({}):",
+            has_teeth.len()
+        );
+        for o in &has_teeth {
+            println!("    {o}");
+        }
+        println!(
+            "memory opcodes where NO address error refutes ({}):",
+            toothless.len()
+        );
+        for o in &toothless {
+            println!("    {o}");
+        }
+        println!("(non-memory reconstructable opcodes skipped: {no_memory_operand})");
+        println!(
+            "toothless opcodes the byte-level address lane does NOT carry ({}): \
+             {toothless_outside_address_lane:?}",
+            toothless_outside_address_lane.len()
+        );
+
+        // THE FINDING, pinned exactly: NO memory reconstruction can refute an
+        // address error.
+        //
+        // Every one of them builds its source-side address and its machine-side
+        // address from the same emitted operand
+        // (`x86_reconstruct_effective_address`), so the obligation rebuilt at a
+        // perturbed operand is exactly as Valid as the original — wrong base,
+        // wrong index, base/index swap, wrong scale, wrong displacement alike.
+        //
+        // Until this audit asked SEMANTICALLY, it recorded `Cmpxchg8`/`Cmpxchg16`
+        // (and then `AtomicLoadCmpxchg16b`) as having address teeth, because it
+        // asked only whether the perturbed halves were different TREES. For those
+        // rows they are different trees at EVERY operand — a value concat, or an
+        // all-ones facet constant against a concat of facet-equality bits — so
+        // the structural test was true by construction and refuted nothing. Their
+        // neighbour and probe leaves are FRAME facets (a machine model that
+        // writes elsewhere refutes), not address facets. The three rows' ADDRESS
+        // now comes from the byte-level lane, like every other memory row.
+        assert!(
+            has_teeth.is_empty(),
+            "a memory opcode's reconstruction now REFUTES a perturbed address: {has_teeth:?}. \
+             That is only possible if its SOURCE-side address no longer derives from the \
+             emitted operand; if that is a real repair, restate the coverage_gate comments for \
+             it and pin it here by name."
+        );
+        // The rows where the old structural criterion and the semantic one
+        // disagree — perturbed halves that are different trees yet still
+        // discharge Valid — pinned by name, so the vacuity stays on record.
+        assert_eq!(
+            structural_only,
+            vec![
+                "AtomicLoadCmpxchg16b".to_string(),
+                "Cmpxchg16".to_string(),
+                "Cmpxchg8".to_string()
+            ],
+            "the rows whose perturbed halves differ structurally but never refute changed"
+        );
+
+        // THE CONSEQUENCE, enforced per opcode.
+        //
+        // A credited memory opcode the shared reconstruction cannot defend is
+        // only honest if its ADDRESS comes from somewhere else. That somewhere
+        // is `crate::x86_addressing_proofs`, which decodes the REAL emitted
+        // ModR/M+SIB bytes with a decoder that shares no code with the encoder.
+        // Each toothless opcode must be ROUTED there
+        // (`coverage_gate::x86_opcode_has_address_credit`, which the gate
+        // consults before any reconstruction) and must have captured encodings
+        // in its corpus; the lane itself must discharge, which it does only
+        // when every intent and byte control refutes on every captured
+        // encoding. That losing the lane costs exactly its rows is pinned
+        // separately by `x86_address_credit_is_live_counted_and_has_teeth`. A
+        // toothless opcode that fails any of this is credited on an address
+        // obligation no address error can refute: give it address teeth or
+        // withdraw its credit, never add a name to the lane without encodings.
+        assert!(
+            toothless_outside_address_lane.is_empty(),
+            "credited memory opcodes with NO address teeth anywhere — the shared reconstruction \
+             cannot refute an address error for them and the byte-level address lane does not \
+             carry them: {toothless_outside_address_lane:?}"
+        );
+        if let Err(reason) = crate::x86_addressing_proofs::mem_mov_address_credit() {
+            panic!(
+                "the byte-level address lane carrying the {} toothless opcodes does not \
+                 discharge: {reason}",
+                toothless.len()
+            );
+        }
+
+        // The toothless set itself, pinned by NAME so that a change says which
+        // row moved. Three cohorts, with their provenance:
+        //   * the 37 plain forms this audit found in f001a11e8: the memory MOV
+        //     load/store families and their SIB forms, Lea/LeaSib, and the
+        //     Add/Sub/Cmp/Imul/Xor memory ALU forms. e2275815a moved the address
+        //     of the 35 access forms to the byte-level lane, and f74b4561c moved
+        //     Lea/LeaSib;
+        //   * the 16 VOLATILE forms. They are not rows that LOST teeth. Before
+        //     88de9e199 `x86_opcode_to_source_op` had no arm for them, so they
+        //     did not reconstruct and this audit never saw them. 88de9e199 gave
+        //     them the MemLoad/MemStore mapping of their byte-identical plain
+        //     siblings, and they reconstruct toothless in exactly the way those
+        //     siblings do. The same commit put all sixteen in the byte-level
+        //     lane, which the assertion above checks per opcode. (Until their
+        //     representative instances took their plain siblings' register
+        //     classes, VolatileMovRM and VolatileMovsdRM did not reconstruct and
+        //     this cohort read 14; `volatile_representatives_use_the_isel_register_class`
+        //     pins that repair.)
+        //   * the 3 COMPARE-EXCHANGE forms. `Cmpxchg8`/`Cmpxchg16` were counted
+        //     as having teeth by the structural criterion, which their
+        //     value-concat source side satisfied at every operand; the semantic
+        //     criterion shows they refute no address error, and
+        //     `AtomicLoadCmpxchg16b` (the 128-bit atomic-load pseudo) is the
+        //     same. All three are in the byte-level lane, with captured
+        //     `F0 [66] [REX] 0F B0/B1 /r` and `F0 REX.W 0F C7 /1` encodings.
+        //   * the 5 ZERO-EXTENDING loads (`movzx r32, m8/m16`: `MovzxRM8`,
+        //     `MovzxRM16`, `MovzxRM8Sib` and the two volatile twins), new
+        //     opcodes that map to the same MemLoad reconstruction as the narrow
+        //     MOV loads and so are toothless the same way. They arrived in the
+        //     byte-level lane with captured `[REX] 0F B6/B7 /r` encodings, which
+        //     also carry their destination-write facet.
+        const COMPARE_EXCHANGE_TOOTHLESS: [&str; 3] =
+            ["AtomicLoadCmpxchg16b", "Cmpxchg16", "Cmpxchg8"];
+        const ZERO_EXTENDING_TOOTHLESS: [&str; 5] = [
+            "MovzxRM16",
+            "MovzxRM8",
+            "MovzxRM8Sib",
+            "VolatileMovzxRM16",
+            "VolatileMovzxRM8",
+        ];
+        const PLAIN_TOOTHLESS: [&str; 37] = [
+            "AddMR",
+            "AddMRSib",
+            "AddRM",
+            "CmpRM",
+            "ImulRM",
+            "ImulRMSib",
+            "Lea",
+            "LeaSib",
+            "MovMR",
+            "MovMR16",
+            "MovMR32",
+            "MovMR32Sib",
+            "MovMR8",
+            "MovMR8Sib",
+            "MovMRSib",
+            "MovRM",
+            "MovRM16",
+            "MovRM32",
+            "MovRM32Sib",
+            "MovRM8",
+            "MovRM8Sib",
+            "MovRMSib",
+            "MovdqaMR",
+            "MovdqaRM",
+            "MovdquMR",
+            "MovdquMRSib",
+            "MovdquRM",
+            "MovdquRMSib",
+            "MovsdMR",
+            "MovsdRM",
+            "MovsdRMSib",
+            "MovssMR",
+            "MovssRM",
+            "MovssRMSib",
+            "SubRM",
+            "XorMR",
+            "XorMRSib",
+        ];
+        const VOLATILE_TOOTHLESS: [&str; 16] = [
+            "VolatileMovMR",
+            "VolatileMovMR16",
+            "VolatileMovMR32",
+            "VolatileMovMR8",
+            "VolatileMovRM",
+            "VolatileMovRM16",
+            "VolatileMovRM32",
+            "VolatileMovRM8",
+            "VolatileMovdqaMR",
+            "VolatileMovdqaRM",
+            "VolatileMovdquMR",
+            "VolatileMovdquRM",
+            "VolatileMovsdMR",
+            "VolatileMovsdRM",
+            "VolatileMovssMR",
+            "VolatileMovssRM",
+        ];
+        let mut expected: Vec<String> = PLAIN_TOOTHLESS
+            .iter()
+            .chain(VOLATILE_TOOTHLESS.iter())
+            .chain(COMPARE_EXCHANGE_TOOTHLESS.iter())
+            .chain(ZERO_EXTENDING_TOOTHLESS.iter())
+            .map(|name| (*name).to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            toothless, expected,
+            "the toothless set changed. A row that LEFT gained address teeth in the shared \
+             reconstruction or stopped reconstructing; a row that JOINED reconstructs through a \
+             path that cannot refute an address error, and it may be pinned here only once the \
+             assertion above shows the byte-level address lane carries it"
+        );
+    }
+
+    /// The compare-exchange rows' old "address teeth" were structural only.
+    ///
+    /// For each of them the obligation rebuilt at a perturbed operand has
+    /// halves that are different TREES (the old criterion counted that as
+    /// teeth) and still discharges `Valid` (so it refutes no address error).
+    /// And the semantic criterion is not blind: pair the ORIGINAL source side
+    /// of a plain load with a machine side rebuilt at a different displacement
+    /// — the situation real address teeth would detect — and it refutes.
+    #[test]
+    fn compare_exchange_address_teeth_were_structural_only() {
+        use trust_cg_ir::regs::VReg;
+
+        for opcode in [
+            X86Opcode::Cmpxchg8,
+            X86Opcode::Cmpxchg16,
+            X86Opcode::AtomicLoadCmpxchg16b,
+        ] {
+            let teeth = x86_reconstruction_teeth(opcode)
+                .unwrap_or_else(|| panic!("{opcode:?} must reconstruct"));
+            assert!(
+                teeth.perturbed_halves_differ_structurally,
+                "{opcode:?}: the perturbed halves are different trees — the shape the old \
+                 structural criterion credited as address teeth"
+            );
+            assert!(
+                !teeth.operand_perturbation_can_refute,
+                "{opcode:?}: an obligation rebuilt at a perturbed address must still discharge \
+                 Valid — both of its addresses come from the one perturbed operand"
+            );
+        }
+
+        // Power control: a genuinely different address on ONE side refutes.
+        let load = |disp: i32| {
+            X86ISelInst::new(
+                X86Opcode::MovRM,
+                vec![
+                    X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64)),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr64))),
+                        disp,
+                    },
+                ],
+            )
+        };
+        let original = reconstruct_alu_obligation(&load(16)).expect("MovRM reconstructs");
+        let moved = reconstruct_alu_obligation(&load(80)).expect("MovRM reconstructs");
+        assert!(
+            !perturbed_obligation_refutes(&original),
+            "the original obligation is Valid"
+        );
+        let mixed = ProofObligation {
+            aarch64_expr: moved.aarch64_expr.clone(),
+            ..original
+        };
+        assert!(
+            perturbed_obligation_refutes(&mixed),
+            "a machine side 64 bytes away from its source side must REFUTE, or the semantic \
+             criterion could never see address teeth at all"
+        );
+    }
+
+    /// Every VOLATILE memory access has a representative instance with the
+    /// register class the x86 ISel gives it, and that instance reconstructs.
+    ///
+    /// The ISel picks the volatile opcode from the access type and allocates
+    /// the register with `reg_class_for_type`, exactly as for the plain
+    /// sibling (I8/I16/I32 -> Gpr32, I64 -> Gpr64, F32 -> Fpr32, F64 -> Fpr64,
+    /// V128 -> Fpr128). The expected class here is derived from
+    /// `x86_volatile_trace::volatile_access_of_opcode`, which reads the width
+    /// and register file from the opcode, not from the representative table
+    /// under test. A representative the reconstruction refuses drops its
+    /// opcode out of the teeth audit without a word: `VolatileMovRM` and
+    /// `VolatileMovsdRM` had a Gpr32 destination for a 64-bit load and were
+    /// missing from it for that reason.
+    #[test]
+    fn volatile_representatives_use_the_isel_register_class() {
+        use crate::x86_volatile_trace::{
+            AccessClass, RECOGNISED_VOLATILE_OPCODES, volatile_access_of_opcode,
+        };
+
+        let mut wrong: Vec<String> = Vec::new();
+        for &opcode in RECOGNISED_VOLATILE_OPCODES {
+            let access = volatile_access_of_opcode(opcode)
+                .unwrap_or_else(|| panic!("{opcode:?} is recognised but has no access"));
+            let expected = match (access.class, access.width_bits) {
+                (AccessClass::Gpr, 8 | 16 | 32) => RegClass::Gpr32,
+                (AccessClass::Gpr, 64) => RegClass::Gpr64,
+                (AccessClass::Fp, 32) => RegClass::Fpr32,
+                (AccessClass::Fp, 64) => RegClass::Fpr64,
+                (AccessClass::V128, 128) => RegClass::Fpr128,
+                (class, bits) => panic!("{opcode:?}: no ISel register class for {class:?}{bits}"),
+            };
+            let Some(inst) = representative_reconstructable_inst(opcode) else {
+                wrong.push(format!("{opcode:?}: no representative instance"));
+                continue;
+            };
+            let classes: Vec<RegClass> = inst
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    X86ISelOperand::VReg(vreg) => Some(vreg.class),
+                    _ => None,
+                })
+                .collect();
+            if classes != vec![expected] {
+                wrong.push(format!(
+                    "{opcode:?}: data register classes {classes:?}, ISel gives {expected:?}"
+                ));
+            }
+            if reconstruct_alu_obligation(&inst).is_none() {
+                wrong.push(format!("{opcode:?}: representative does not reconstruct"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "volatile representative instances disagree with the ISel: {wrong:?}"
+        );
+    }
+
+    /// Reachability helper: whether the coverage gate treats `opcode` as
+    /// emitted value/effect debt that a reconstruction may credit.
+    fn classify_x86_for_test(opcode: X86Opcode) -> bool {
+        matches!(
+            crate::coverage_gate::classify_x86(opcode),
+            crate::coverage_gate::OpcodeClass::EmittableNeedsProof
+        )
     }
 }

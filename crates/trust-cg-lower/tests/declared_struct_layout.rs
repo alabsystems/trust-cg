@@ -23,8 +23,8 @@
 //!                  extra_keys: [u64; 2] }                 pad@24, size 32    extra@16, size 32
 //! #[repr(C)] struct CMixed { a: u8, b: u64, c: u16 }    a@0 b@8 c@16        IDENTICAL
 //! #[repr(packed)] struct P { a: u8, b: u64 }            a@0 b@1, size 9     packed authority
-//! #[repr(packed(2))] struct P2 { a: u8, b: u64, c: u16 } a@10 b@0 c@8       STILL OPEN
-//! #[repr(C)] struct OuterC { h: u8, inner: P }          h@0 inner@1, 10/1   STILL OPEN
+//! #[repr(packed(2))] struct P2 { a: u8, b: u64, c: u16 } a@10 b@0 c@8       REFUSED (packed)
+//! #[repr(C)] struct OuterC { h: u8, inner: P }          h@0 inner@1, 10/1   REFUSED (totals)
 //! ```
 //!
 //! Every test below reads the EMITTED opcode stream out of the public
@@ -41,13 +41,23 @@
 //!   struct whose declared offsets are what the recomputation already produced.
 //!   Those keep the `StructGep` encoding, so nothing about the 952-of-6,051
 //!   corpus structs that record no layout moves.
-//! * **Declined, and named** — a declared layout the byte path cannot honour:
-//!   incoherent producer data, a field whose emitted image runs off the end or
-//!   into a sibling, totals that diverge from the recomputation, and every
-//!   `#[repr(packed(N))]` struct. Those keep the recomputation and stay counted
-//!   by [`trust_cg_lower::layout_refusal`].
+//! * **Refused, and named (WS7.8, F-031)** — a COMPLETE declared layout the
+//!   byte path cannot honour: incoherent producer data, a field whose emitted
+//!   image runs off the end or into a sibling, totals that diverge from the
+//!   recomputation, and a `#[repr(packed(N))]` struct that authority P lays out
+//!   differently. These used to keep the recomputation SILENTLY — a different
+//!   layout than rustc's, with no diagnostic. Lowering now fails with
+//!   `AdapterError::DeclaredStructLayoutNotEmittable`, naming the gate. A
+//!   packed struct that authority P lays out exactly as declared still
+//!   compiles; nothing is overridden there.
+//! * **Refused where it is held by value** — a function that reserves
+//!   storage for, passes, or moves a value CONTAINING such a struct (the
+//!   `Alloca` slot, the ABI classifier and SSA moves read the natural-C
+//!   carrier, not rustc's size) is refused even if it never addresses a field;
+//!   one that only passes a pointer to it still lowers.
 
-use trust_cg_lower::adapter::translate_function;
+use trust_cg_lower::adapter::AdapterError;
+use trust_cg_lower::declared_layout::DeclaredLayoutGate;
 use trust_cg_lower::instructions::Opcode;
 use trust_cg_lower::types::Type;
 use trust_ir::{
@@ -95,6 +105,7 @@ fn sdef(
     totals: Option<(u64, u64)>,
 ) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields,
@@ -118,6 +129,15 @@ const AHASHER: u32 = 6;
 const ARR_OF_IDS: u32 = 7;
 const INCOHERENT: u32 = 8;
 const FIELD_OFF_THE_END: u32 = 9;
+const MIXED: u32 = 10;
+const OVER_ALIGNED: u32 = 11;
+const PACKED_OUTER_ARR: u32 = 12;
+const C07_OVERLAP: u32 = 13;
+
+/// `types` table index of `P2` (the reordered packed struct).
+const TY_P2: u32 = 2;
+/// `types` table index of `Mixed` (the reorder the totals gate refuses).
+const TY_MIXED: u32 = 3;
 
 /// Every fixture, with the rustc measurement that justifies its numbers.
 fn structs() -> Vec<StructDef> {
@@ -167,8 +187,8 @@ fn structs() -> Vec<StructDef> {
             Some((9, 1)),
         ),
         // rustc: a@10 b@0 c@8, size 12 align 2 — `packed(N>1)` without
-        // `repr(C)` REORDERS. STILL OPEN: packed keeps authority P, which is
-        // declaration-ordered (a@0 b@2 c@10).
+        // `repr(C)` REORDERS. Authority P is declaration-ordered (a@0 b@2
+        // c@10), so it cannot reproduce this: REFUSED at the packed gate.
         sdef(
             PACKED2_REORDERED,
             "P2",
@@ -176,9 +196,9 @@ fn structs() -> Vec<StructDef> {
             vec![f("a", Ty::U8, 10), f("b", Ty::U64, 0), f("c", Ty::U16, 8)],
             Some((12, 2)),
         ),
-        // rustc: h@0 inner@1, size 10 align 1. STILL OPEN: the recomputation
-        // sizes this 24/8 because the interior `P` is measured natural-C, so
-        // the totals gate declines it.
+        // rustc: h@0 inner@1, size 10 align 1. The recomputation sizes this
+        // 24/8 because the interior `P` is measured natural-C, so it is
+        // REFUSED at the totals gate.
         sdef(
             OUTER_C,
             "OuterC",
@@ -230,38 +250,113 @@ fn structs() -> Vec<StructDef> {
             vec![f("a", Ty::U64, 0), f("b", Ty::U64, 16)],
             Some((16, 8)),
         ),
+        // rustc: `Mixed { a: u8, b: u64, c: u16 }` is a@10 b@0 c@8, size 16
+        // align 8. Recomputed: a@0 b@8 c@16, size 24 — every field moves AND
+        // the object grows, so the totals gate declines it.
+        sdef(
+            MIXED,
+            "Mixed",
+            StructRepr::Rust,
+            vec![f("a", Ty::U8, 10), f("b", Ty::U64, 0), f("c", Ty::U16, 8)],
+            Some((16, 8)),
+        ),
+        // rustc: `#[repr(align(16))] struct Over { a: u8 }` is size 16 align
+        // 16. Recomputed: 1/1.
+        sdef(
+            OVER_ALIGNED,
+            "Over",
+            StructRepr::Rust,
+            vec![f("a", Ty::U8, 0)],
+            Some((16, 16)),
+        ),
+        // `#[repr(packed)] { arr: [P2; 2], t: u8 }` with NO declared layout, so
+        // authority P lays it out — and has to measure `[P2; 2]` to place `t`.
+        // rustc: arr@0 t@24, size 25. Measuring the array needs `P2`'s layout,
+        // which is refused, so nothing about this struct can be placed.
+        sdef(
+            PACKED_OUTER_ARR,
+            "PackedOuterArr",
+            StructRepr::Packed(1),
+            vec![
+                f_none("arr", Ty::Array(trust_ir::TyId::new(TY_P2), 2)),
+                f_none("t", Ty::U8),
+            ],
+            None,
+        ),
+        // The proof program's `verify/c07_union_and_struct_overlap` repro
+        // (`tests/repro.rs`, `pair_module(_, 0, 8)`): `#[repr(C)] Pair { a:
+        // u32@0, b: f32@0 }`, size 8 align 4. Both fields claim bytes 0..4 —
+        // no struct rustc mints (the trust-ir validator half of F-031, WS2.3,
+        // refuses it upstream). The totals equal natural C's, so only the
+        // overlap gate catches it, and trust-cg used to lay it out natural-C
+        // (`a@0 b@4`) without a word.
+        sdef(
+            C07_OVERLAP,
+            "Pair",
+            StructRepr::C,
+            vec![f("a", Ty::U32, 0), f("b", Ty::F32, 0)],
+            Some((8, 4)),
+        ),
     ]
 }
 
 /// The module `types` table: entry 0 is `u64` (the `AHasher` array element),
-/// entry 1 is `TypeCheckId` (the `ArrOfIds` array element).
+/// entry 1 is `TypeCheckId` (the `ArrOfIds` array element), entry 2 is `P2`
+/// and entry 3 is `Mixed` (arrays of refused structs).
 fn types_table() -> Vec<Ty> {
-    vec![Ty::U64, st(TYPE_CHECK_ID)]
+    vec![Ty::U64, st(TYPE_CHECK_ID), st(PACKED2_REORDERED), st(MIXED)]
 }
 
 fn module_with_body(params: Vec<(ValueId, Ty)>, body: Vec<InstrNode>) -> TrustIrModule {
     let mut module = TrustIrModule::new("declared_layout");
     module.structs = structs();
     module.types = types_table();
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: params.iter().map(|(_, t)| t.clone()).collect(),
-        returns: vec![],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: params.iter().map(|(_, t)| t.clone()).collect(),
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "k", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
         params,
         body,
     }];
-    module.add_function(func);
     module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
+    module
+}
+
+/// Lowering must FAIL with the named WS7.8 refusal for struct `id` at `gate`
+/// — not "any error", and not a lowering that silently recomputed.
+fn assert_refused(module: &TrustIrModule, id: u32, gate: DeclaredLayoutGate) {
+    let func = module.functions.first().expect("one function");
+    match trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed()) {
+        Err(AdapterError::DeclaredStructLayoutNotEmittable {
+            struct_id,
+            gate: failed,
+            ..
+        }) => {
+            assert_eq!(struct_id, id, "the refusal must name the struct");
+            assert_eq!(failed, gate, "the refusal must name the gate");
+        }
+        Err(other) => panic!("expected DeclaredStructLayoutNotEmittable at `{gate}`, got {other}"),
+        Ok(_) => panic!(
+            "struct {id} carries a complete declared layout the byte path cannot emit; \
+             lowering it must be refused at the `{gate}` gate, not recomputed"
+        ),
+    }
 }
 
 fn opcodes(module: &TrustIrModule) -> Vec<Opcode> {
     let func = module.functions.first().expect("one function");
     let (lir_func, _proofs) =
-        translate_function(func, module).expect("adapter must lower the fixture");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter must lower the fixture");
     let entry = lir_func.entry_block;
     lir_func.blocks[&entry]
         .instructions
@@ -380,8 +475,10 @@ fn an_array_field_rustc_rotates_to_the_front_is_addressed_at_zero() {
 /// the `Arc` pointer.
 #[test]
 fn writing_a_reordered_field_uses_rustcs_offset() {
+    // The VALUE form (WS7.1): the base is a `TypeCheckId` value, not a pointer
+    // — the store form is invalid trust-ir and refused by name.
     let module = module_with_body(
-        vec![(v(0), Ty::Ptr), (v(1), Ty::U64)],
+        vec![(v(0), st(TYPE_CHECK_ID)), (v(1), Ty::U64)],
         vec![
             InstrNode::new(Inst::InsertField {
                 ty: st(TYPE_CHECK_ID),
@@ -394,7 +491,9 @@ fn writing_a_reordered_field_uses_rustcs_offset() {
         ],
     );
     let ops = opcodes(&module);
-    assert_eq!(iconsts(&ops), vec![8]);
+    // 32 = the declared extent the result's private copy receives from the
+    // base; 8 = rustc's offset of `expr_hash`, where the field is written.
+    assert_eq!(iconsts(&ops), vec![32, 8]);
     assert!(struct_geps(&ops).is_empty(), "{ops:?}");
     assert!(
         ops.iter()
@@ -437,37 +536,45 @@ fn an_aggregate_constant_writes_each_field_at_rustcs_offset() {
     assert!(struct_geps(&ops).is_empty(), "{ops:?}");
 }
 
-/// The multi-index `GEP` path: `&arr[i].expr_hash`. The array strides by the
-/// element's size and the field step must then use rustc's offset.
+/// Array indexing and field projection are distinct TrustIR operations.
+/// `arr[i].expr_hash` first strides the whole element, then ExtractField
+/// uses the producer's declared field offset.
 #[test]
-fn a_multi_index_gep_into_an_array_element_uses_rustcs_field_offset() {
+fn a_field_of_an_indexed_array_element_uses_rustcs_field_offset() {
     let module = module_with_body(
         vec![(v(0), Ty::Ptr), (v(1), Ty::I64)],
         vec![
-            InstrNode::new(Inst::Const {
-                ty: Ty::I64,
-                value: Constant::Int(0),
-            })
-            .with_result(v(2)),
             InstrNode::new(Inst::GEP {
                 pointee_ty: st(TYPE_CHECK_ID),
                 base: v(0),
-                indices: vec![v(1), v(2)],
+                indices: vec![v(1)],
                 inbounds: false,
             })
+            .with_result(v(2)),
+            InstrNode::new(Inst::Load {
+                ty: st(TYPE_CHECK_ID),
+                ptr: v(2),
+                volatile: false,
+                align: None,
+            })
             .with_result(v(3)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::U64,
+                aggregate: v(3),
+                field: 0,
+            })
+            .with_result(v(4)),
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     );
     let ops = opcodes(&module);
     assert!(
-        ops.iter()
-            .any(|o| matches!(o, Opcode::ArrayGep { elem_ty } if elem_ty.bytes() == 32)),
-        "the element stride is `size_of::<TypeCheckId>()` = 32: {ops:?}"
+        iconsts(&ops).contains(&32),
+        "array element stride must be 32: {ops:?}"
     );
     assert!(
         iconsts(&ops).contains(&8),
-        "the field step must be rustc's `expr_hash@8`: {ops:?}"
+        "expr_hash must be loaded at offset 8: {ops:?}"
     );
     assert!(struct_geps(&ops).is_empty(), "{ops:?}");
 }
@@ -552,61 +659,78 @@ fn a_packed_struct_still_uses_the_packed_authority() {
     }
 }
 
-/// STILL OPEN, measured and named. `#[repr(packed(2))] { a: u8, b: u64,
-/// c: u16 }` is `a@10 b@0 c@8` in rustc — `packed(N)` with `N > 1` and no
-/// `repr(C)` REORDERS — and authority P is a declaration-ordered walk that
-/// structurally cannot express that. Closing it means letting the declared
-/// layout into the packed lane, which needs the packed size split resolved
-/// first.
+/// REFUSED (WS7.8; was "STILL OPEN" and silently mis-addressed).
+/// `#[repr(packed(2))] { a: u8, b: u64, c: u16 }` is `a@10 b@0 c@8` in rustc —
+/// `packed(N)` with `N > 1` and no `repr(C)` REORDERS — and authority P is a
+/// declaration-ordered walk (`a@0 b@2 c@10`) that structurally cannot express
+/// that. Every field used to be read at P's address; lowering now refuses.
 #[test]
-fn packed_n_above_one_still_does_not_reorder() {
-    for (index, authority_p, rustc) in [(0u32, 0i64, 10i64), (1, 2, 0), (2, 10, 8)] {
+fn a_reordered_packed_struct_is_refused_not_misaddressed() {
+    for index in 0..3u32 {
         let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(PACKED2_REORDERED), index));
-        assert_ne!(authority_p, rustc, "the divergence is real");
-        assert_eq!(
-            iconsts(&opcodes(&module)),
-            vec![authority_p],
-            "field {index}: authority P says {authority_p}, rustc says {rustc} — STILL OPEN"
-        );
+        assert_refused(&module, PACKED2_REORDERED, DeclaredLayoutGate::Packed);
     }
 }
 
-/// STILL OPEN, measured and named. `#[repr(C)] OuterC { h: u8, inner: P }` is
-/// 10 bytes with `inner@1` in rustc, because `P`'s own alignment is 1. The
-/// recomputation measures the interior `P` natural-C and sizes the container
-/// 24/8, so the declared totals diverge and the totals gate declines the whole
-/// layout — including its `inner@1`.
+/// REFUSED (WS7.8; was "STILL OPEN" and silently recomputed).
+/// `#[repr(C)] OuterC { h: u8, inner: P }` is 10 bytes with `inner@1` in
+/// rustc, because `P`'s own alignment is 1. The recomputation measures the
+/// interior `P` natural-C and sizes the container 24/8 with `inner@8`, so the
+/// declared totals diverge — and reading `inner` at 8 is reading rustc's
+/// bytes 8.. of a 10-byte object.
 #[test]
-fn a_non_packed_struct_containing_a_packed_one_is_still_recomputed() {
+fn a_non_packed_struct_containing_a_packed_one_is_refused() {
     let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(OUTER_C), 1));
-    let ops = opcodes(&module);
-    assert_eq!(
-        struct_geps(&ops),
-        vec![1],
-        "rustc says `inner@1`; the recomputation says 8 and still wins here: {ops:?}"
-    );
+    assert_refused(&module, OUTER_C, DeclaredLayoutGate::Totals);
 }
 
-/// INCOHERENT producer data is declined rather than emitted. A `u64` at offset
-/// 4 in a non-packed struct is not a layout rustc mints; emitting it would turn
-/// a wrong-address defect into an undeclared unaligned access.
+/// REFUSED. INCOHERENT producer data: a `u64` at offset 4 in a non-packed
+/// struct is not a layout rustc mints; emitting it would turn a wrong-address
+/// defect into an undeclared unaligned access, and recomputing it would
+/// silently address `b` at 8.
 #[test]
-fn an_incoherently_aligned_declared_offset_is_declined() {
+fn an_incoherently_aligned_declared_offset_is_refused() {
     let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(INCOHERENT), 1));
-    let ops = opcodes(&module);
-    assert_eq!(struct_geps(&ops), vec![1], "{ops:?}");
-    assert!(iconsts(&ops).is_empty(), "{ops:?}");
+    assert_refused(&module, INCOHERENT, DeclaredLayoutGate::FieldAlignment);
 }
 
-/// A declared offset whose field's emitted image runs off the end of the
-/// declared object is declined — honouring it would be an out-of-bounds write,
-/// not a fix.
+/// REFUSED. A declared offset whose field's emitted image runs off the end of
+/// the declared object — honouring it would be an out-of-bounds write, and
+/// recomputing it would silently address `b` at 8.
 #[test]
-fn a_declared_offset_that_runs_off_the_end_is_declined() {
+fn a_declared_offset_that_runs_off_the_end_is_refused() {
     let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(FIELD_OFF_THE_END), 1));
-    let ops = opcodes(&module);
-    assert_eq!(struct_geps(&ops), vec![1], "{ops:?}");
-    assert!(iconsts(&ops).is_empty(), "{ops:?}");
+    assert_refused(&module, FIELD_OFF_THE_END, DeclaredLayoutGate::Containment);
+}
+
+/// ADVERSARIAL — the reorder case. `Mixed` is `a@10 b@0 c@8`, 16/8, in rustc
+/// and `a@0 b@8 c@16`, 24/8, recomputed. Every field access is refused; none
+/// is emitted at a recomputed address.
+#[test]
+fn the_mixed_reorder_is_refused_at_every_field() {
+    for index in 0..3u32 {
+        let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(MIXED), index));
+        assert_refused(&module, MIXED, DeclaredLayoutGate::Totals);
+    }
+}
+
+/// ADVERSARIAL — `#[repr(align(16))]`. rustc says 16/16, the recomputation
+/// 1/1: the field address even agrees (`a@0`), but the object the byte path
+/// would copy, stride and pass is a different object. Refused.
+#[test]
+fn a_repr_align_16_struct_is_refused() {
+    let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(OVER_ALIGNED), 0));
+    assert_refused(&module, OVER_ALIGNED, DeclaredLayoutGate::Totals);
+}
+
+/// The refusal is scoped to the struct that carries the unemittable layout: a
+/// function in the SAME module that addresses only an agreeing struct still
+/// lowers, at rustc's offset.
+#[test]
+fn an_agreeing_struct_beside_a_refused_one_still_lowers() {
+    let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(TYPE_CHECK_ID), 0));
+    assert!(module.structs.iter().any(|s| s.id == StructId::new(MIXED)));
+    assert_eq!(iconsts(&opcodes(&module)), vec![8]);
 }
 
 /// The recomputation is still reachable and still correct for the shapes it
@@ -618,4 +742,370 @@ fn the_recomputation_itself_is_unchanged() {
     assert_eq!(natural.offset_of(3), Some(24));
     assert_eq!(natural.bytes(), 32);
     assert_eq!(natural.align(), 8);
+}
+
+// ---------------------------------------------------------------------------
+// REFUSED THROUGH AN ARRAY — the element's refusal is not swallowed
+// ---------------------------------------------------------------------------
+//
+// An array's extent and stride are its ELEMENT's authoritative ones. When the
+// element struct's complete declared layout is refused, the array has no
+// authoritative extent either; answering with the natural-C carrier instead
+// is the very silent recomputation WS7.8 removes — one level down.
+
+fn load(ty: Ty) -> Vec<InstrNode> {
+    vec![
+        InstrNode::new(Inst::Load {
+            ty,
+            ptr: v(0),
+            volatile: false,
+            align: None,
+        })
+        .with_result(v(1)),
+        InstrNode::new(Inst::Return { values: vec![] }),
+    ]
+}
+
+/// A by-value copy of `[Mixed; 2]`. rustc sizes it 32 (`Mixed` is 16/8); the
+/// natural-C carrier is 48. Copying 48 bytes out of (or into) rustc's 32-byte
+/// object is an out-of-bounds access, so the copy must be refused with
+/// `Mixed`'s own reason, never lengthed at the recomputation.
+#[test]
+fn a_by_value_copy_of_an_array_of_a_refused_struct_is_refused() {
+    let module = module_with_body(
+        vec![(v(0), Ty::Ptr)],
+        load(Ty::Array(trust_ir::TyId::new(TY_MIXED), 2)),
+    );
+    assert_refused(&module, MIXED, DeclaredLayoutGate::Totals);
+}
+
+/// POSITIVE TWIN: the same by-value copy of an array of an EMITTABLE declared
+/// struct still lowers.
+#[test]
+fn a_by_value_copy_of_an_array_of_an_emittable_struct_still_lowers() {
+    let module = module_with_body(
+        vec![(v(0), Ty::Ptr)],
+        load(Ty::Array(trust_ir::TyId::new(1), 2)),
+    );
+    let ops = opcodes(&module);
+    assert!(
+        iconsts(&ops).contains(&64),
+        "`[TypeCheckId; 2]` is copied at its 64-byte extent: {ops:?}"
+    );
+}
+
+/// A single-index `GEP` stepping over whole `[Mixed; 2]` values (`&arrs[i]`).
+/// Its stride is the array's extent — `Mixed`'s refused one times two — so it
+/// must be refused rather than stride by the 48-byte recomputation.
+#[test]
+fn a_gep_striding_over_an_array_of_a_refused_struct_is_refused() {
+    let module = module_with_body(
+        vec![(v(0), Ty::Ptr), (v(1), Ty::I64)],
+        vec![
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::Array(trust_ir::TyId::new(TY_MIXED), 2),
+                base: v(0),
+                indices: vec![v(1)],
+                inbounds: false,
+            })
+            .with_result(v(2)),
+            InstrNode::new(Inst::Return { values: vec![] }),
+        ],
+    );
+    assert_refused(&module, MIXED, DeclaredLayoutGate::Totals);
+}
+
+/// A packed struct with NO declared layout of its own — authority P, the named
+/// fallback — around `[P2; 2]`. To place `t`, the packed walk measures the
+/// array, which means measuring `P2`, whose complete declared layout is
+/// refused. Before WS7.8 the walk used `P2`'s packed size (12, stride 12,
+/// `t@24` — rustc's answer); swallowing the new refusal would have silently
+/// switched it to the natural-C carrier (`t@48`), a NEW wrong address for a
+/// field that never touches `P2`. The refusal must surface instead.
+#[test]
+fn a_packed_walk_over_an_array_of_a_refused_struct_is_refused() {
+    let module = module_with_body(vec![(v(0), Ty::Ptr)], extract(st(PACKED_OUTER_ARR), 1));
+    assert_refused(&module, PACKED2_REORDERED, DeclaredLayoutGate::Packed);
+}
+
+// ---------------------------------------------------------------------------
+// REFUSED WHERE IT IS HELD BY VALUE — the consumers that never ask for a layout
+// ---------------------------------------------------------------------------
+//
+// The stack slot, the heap request and the ABI classifier size a value from
+// its natural-C carrier. For an emittable declared layout that is rustc's size
+// (the totals gate). For a refused one it is not, so a function that reserves
+// storage for, or holds a value of, such a struct is refused before any of
+// those consumers runs — even when no field of it is ever addressed.
+
+/// `Over` is `#[repr(align(16))] { a: u8 }`: 16/16 in rustc, 1/1 on the
+/// carrier. An `Alloca` of it would reserve ONE byte for an object rustc-
+/// compiled callees write sixteen of. No field is addressed here, so before
+/// the by-value preflight this compiled silently.
+#[test]
+fn an_unaddressed_alloca_of_a_refused_struct_is_refused() {
+    let module = module_with_body(
+        vec![],
+        vec![
+            InstrNode::new(Inst::Alloca {
+                ty: st(OVER_ALIGNED),
+                count: None,
+                align: None,
+            })
+            .with_result(v(0)),
+            InstrNode::new(Inst::Return { values: vec![] }),
+        ],
+    );
+    assert_refused(&module, OVER_ALIGNED, DeclaredLayoutGate::Totals);
+}
+
+/// A BY-VALUE parameter of a refused struct: the ABI classifier would pass
+/// `Mixed` as the 24-byte recomputation where every rustc-compiled caller
+/// passes 16 bytes. Refused, although the body never touches it.
+#[test]
+fn a_by_value_parameter_of_a_refused_struct_is_refused() {
+    let module = module_with_body(
+        vec![(v(0), st(MIXED))],
+        vec![InstrNode::new(Inst::Return { values: vec![] })],
+    );
+    assert_refused(&module, MIXED, DeclaredLayoutGate::Totals);
+}
+
+/// A refused struct held INSIDE another by-value shape — here a tuple — is the
+/// same hazard one level down: the tuple's carrier embeds the recomputation.
+#[test]
+fn a_tuple_containing_a_refused_struct_is_refused() {
+    let module = module_with_body(
+        vec![(v(0), Ty::Ptr)],
+        load(Ty::Tuple(vec![Ty::U8, st(OVER_ALIGNED)])),
+    );
+    assert_refused(&module, OVER_ALIGNED, DeclaredLayoutGate::Totals);
+}
+
+/// POSITIVE TWIN — the preflight stops at every pointer. A function that only
+/// passes the ADDRESS of a refused struct (as a typed `&Mixed` here) assumes
+/// nothing about its layout, and still lowers.
+#[test]
+fn a_function_that_only_passes_a_pointer_to_a_refused_struct_still_lowers() {
+    let module = module_with_body(
+        vec![(v(0), Ty::Ref(Box::new(st(MIXED))))],
+        vec![InstrNode::new(Inst::Return { values: vec![] })],
+    );
+    let func = module.functions.first().expect("one function");
+    trust_cg_lower::translate_function_with_license(func, &module, &permit_unlicensed())
+        .expect("a pointer to a refused struct is not a use of it");
+}
+
+/// Proof-program row `verify.c07` (trust-cg lens, F-031), ported whole: the
+/// repro's own program — `alloca Pair`, store an aggregate constant, load it
+/// back, read field `b` — is REFUSED at the `overlap` gate, naming `Pair`,
+/// rather than compiled at the natural-C layout the c07 source read recorded
+/// as the silent fallback.
+#[test]
+fn verify_c07_struct_overlap_is_refused_not_laid_out_as_natural_c() {
+    let pair = st(C07_OVERLAP);
+    let module = module_with_body(
+        vec![],
+        vec![
+            InstrNode::new(Inst::Alloca {
+                ty: pair.clone(),
+                count: None,
+                align: None,
+            })
+            .with_result(v(0)),
+            InstrNode::new(Inst::Const {
+                ty: pair.clone(),
+                value: Constant::Aggregate(vec![Constant::Int(7), Constant::Float(1.5)]),
+            })
+            .with_result(v(1)),
+            InstrNode::new(Inst::Store {
+                ty: pair.clone(),
+                ptr: v(0),
+                value: v(1),
+                volatile: false,
+                align: None,
+            }),
+            InstrNode::new(Inst::Load {
+                ty: pair.clone(),
+                ptr: v(0),
+                volatile: false,
+                align: None,
+            })
+            .with_result(v(2)),
+            InstrNode::new(Inst::ExtractField {
+                ty: pair,
+                aggregate: v(2),
+                field: 1,
+            })
+            .with_result(v(3)),
+            InstrNode::new(Inst::Return { values: vec![] }),
+        ],
+    );
+    assert_refused(&module, C07_OVERLAP, DeclaredLayoutGate::Overlap);
+}
+
+// ---------------------------------------------------------------------------
+// REFUSED AT A CALL EDGE — the callee's signature is an ABI use (review)
+// ---------------------------------------------------------------------------
+//
+// A constructed aggregate is carried by ADDRESS, so a call may hand a
+// `Ptr`-typed value to a by-value struct parameter; the ABI classifier then
+// reads the CALLEE's declared parameter type. None of the caller's own SSA
+// types names the struct, so only the callee signature reveals the use.
+
+/// `module_with_body` plus a body-less callee `ext` (`FuncId(1)`) of the given
+/// signature.
+fn with_callee(mut module: TrustIrModule, params: Vec<Ty>, returns: Vec<Ty>) -> TrustIrModule {
+    let fty = module
+        .add_func_type(FuncTy {
+            params,
+            returns,
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    module
+        .try_add_function(TrustIrFunction::declaration(
+            FuncId::new(1),
+            "ext",
+            fty,
+            trust_ir::FunctionSummary::default(),
+        ))
+        .expect("Module::try_add_function: test fixture");
+    module
+}
+
+/// `k(p: Ptr) { ext(p) }` where `ext` takes a `Mixed` BY VALUE. The caller's
+/// types are all `Ptr`, but the call argument is typed from `ext`'s signature
+/// — the 24-byte natural carrier `Struct([I8, I64, I16])` — and classified as
+/// such, where the rustc-compiled `ext` expects rustc's 16-byte `Mixed` (two
+/// registers on AArch64, not an indirect copy). Before this review the
+/// preflight never looked at the callee and the call lowered silently.
+#[test]
+fn a_call_passing_an_address_as_a_by_value_refused_struct_is_refused() {
+    let module = with_callee(
+        module_with_body(
+            vec![(v(0), Ty::Ptr)],
+            vec![
+                InstrNode::new(Inst::Call {
+                    callee: FuncId::new(1),
+                    args: vec![v(0)],
+                }),
+                InstrNode::new(Inst::Return { values: vec![] }),
+            ],
+        ),
+        vec![st(MIXED)],
+        vec![],
+    );
+    assert_refused(&module, MIXED, DeclaredLayoutGate::Totals);
+}
+
+/// The same edge through a function POINTER: the `CallIndirect` signature is
+/// what the classifier reads.
+#[test]
+fn a_call_indirect_whose_signature_holds_a_refused_struct_is_refused() {
+    let mut module = module_with_body(vec![(v(0), Ty::Ptr), (v(1), Ty::Ptr)], vec![]);
+    let sig = module
+        .add_func_type(FuncTy {
+            params: vec![st(OVER_ALIGNED)],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    module.functions[0].blocks[0].body = vec![
+        InstrNode::new(Inst::CallIndirect {
+            callee: v(0),
+            sig,
+            args: vec![v(1)],
+            calling_conv: trust_ir::CallingConv::C,
+        }),
+        InstrNode::new(Inst::Return { values: vec![] }),
+    ];
+    assert_refused(&module, OVER_ALIGNED, DeclaredLayoutGate::Totals);
+}
+
+/// POSITIVE TWIN: a callee that takes the refused struct by REFERENCE is not a
+/// by-value use; the call still lowers.
+#[test]
+fn a_call_passing_a_reference_to_a_refused_struct_still_lowers() {
+    let module = with_callee(
+        module_with_body(
+            vec![(v(0), Ty::Ref(Box::new(st(MIXED))))],
+            vec![
+                InstrNode::new(Inst::Call {
+                    callee: FuncId::new(1),
+                    args: vec![v(0)],
+                }),
+                InstrNode::new(Inst::Return { values: vec![] }),
+            ],
+        ),
+        vec![Ty::Ref(Box::new(st(MIXED)))],
+        vec![],
+    );
+    let func = module.functions.first().expect("one function");
+    trust_cg_lower::translate_function_with_license(func, &module, &permit_unlicensed())
+        .expect("a reference parameter is not a by-value use");
+}
+
+/// A refused struct inside an ENUM payload is held by value too: loading the
+/// enum copies the payload at the natural carrier.
+#[test]
+fn an_enum_whose_payload_holds_a_refused_struct_is_refused() {
+    let mut module = module_with_body(
+        vec![(v(0), Ty::Ptr)],
+        load(Ty::Enum(trust_ir::EnumId::new(0))),
+    );
+    module.enums.push(trust_ir::EnumDef::new(
+        trust_ir::EnumId::new(0),
+        "HoldsOver",
+        vec![
+            trust_ir::EnumVariant {
+                name: "None".to_string(),
+                fields: vec![],
+                field_names: vec![],
+            },
+            trust_ir::EnumVariant {
+                name: "Some".to_string(),
+                fields: vec![st(OVER_ALIGNED)],
+                field_names: vec![],
+            },
+        ],
+    ));
+    assert_refused(&module, OVER_ALIGNED, DeclaredLayoutGate::Totals);
+}
+
+/// LEGITIMATE, NOT REFUSED: a complete rustc layout with zero-sized fields — a
+/// field-less `PhantomData`-like struct (0/1) and a `()` — parked at the END
+/// of the object (`offset == size`), which rustc does. Containment admits a
+/// zero-sized image at the end, and no image is compared for overlap.
+#[test]
+fn a_complete_layout_with_zero_sized_fields_at_the_end_still_lowers() {
+    let mut module = module_with_body(vec![(v(0), Ty::Ptr)], vec![]);
+    module
+        .structs
+        .push(sdef(20, "Phantom", StructRepr::Rust, vec![], Some((0, 1))));
+    module.structs.push(sdef(
+        21,
+        "WithZst",
+        StructRepr::Rust,
+        vec![f("a", Ty::U32, 0), f("p", st(20), 4), f("u", Ty::Unit, 4)],
+        Some((4, 4)),
+    ));
+    module.functions[0].blocks[0].body = extract(st(21), 0);
+    let ops = opcodes(&module);
+    assert!(!ops.is_empty());
+    module.functions[0].blocks[0].body = load(st(21));
+    let func = module.functions.first().expect("one function");
+    trust_cg_lower::translate_function_with_license(func, &module, &permit_unlicensed())
+        .expect("a by-value copy of it lowers too");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

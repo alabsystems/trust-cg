@@ -30,13 +30,15 @@
       source heap and the machine heap AGREE off-frame (the incoming `memAgree`), the loaded value
       equals the source value.  A load writes NO memory, so `memAgree` transports verbatim.
 
-  WHAT IS HONESTLY STUBBED (each `sorry` is one-lined and classified at its site):
+  MODEL PREMISES AND SCOPE:
     * The connection from the abstract `srcStep` of a load/store to the concrete (addr, width,
       value) it touches is the SOURCE SEMANTICS, owned by `Semantics.Source` — we take it as a
       structured hypothesis (`LoadShape`/`StoreShape`), NOT a `sorry` that assumes the conclusion.
-    * A couple of `readBytes`/`writeBytes` width-generic identities are genuinely-large LE byte
-      inductions; they are `sorry`-marked `mechanical` and NEVER smuggle the simulation conclusion
-      (the conclusion is `forward_sim`, derived from `cert_reestablishes_R`, fully assembled here).
+    * The scalar encoder round-trip covers byte counts through eight, the width of its
+      64-bit input. The width-generic memory round-trip requires distinct byte addresses.
+      Byte-store framing and memory-read agreement are proved below by induction.
+    * Load framing requires both halves of every live register pair to avoid the destination;
+      carrier preservation requires the loaded byte width to fit the source integer width.
 
   CORRECTION (verifier): `StoreShape.hnoalias` was widened from a `k < 8` to a `k < 16` byte
   footprint.  The store `value` leg reads back a SPILLED i128 over 16 bytes, so the i128-spill
@@ -50,6 +52,7 @@ import Trust.Model
 import Trust.Cert.Obligation
 import Trust.Sim.Match
 import Trust.Model.Encoder
+import Trust.Model.Memory
 
 namespace Trust
 namespace Sim
@@ -87,7 +90,12 @@ theorem writeBytes_outside
     (mem : BitVec 64 → BitVec 8) (a : BitVec 64) (v : BitVec 64) (n : Nat) (q : BitVec 64)
     (hout : OutsideRange a n q) :
     writeBytes mem a v n q = mem q := by
-  sorry  -- mechanical: induct over the `List.range n` fold; each guarded update misses `q` by `hout`.
+  induction n with
+  | zero => simp [writeBytes]
+  | succ n ih =>
+      have hn := hout n (Nat.lt_succ_self n)
+      have hprev : OutsideRange a n q := fun k hk => hout k (by omega)
+      simpa [writeBytes, List.range_succ, hn] using ih hprev
 
 /-- `read_write_disjoint` (LE-byte form): reading `len` bytes at `b`, after a `writeBytes` to a
     DISJOINT range `[a, a+n)`, sees the OLD memory.  This is the FRAME leg for the store case: any
@@ -98,30 +106,55 @@ theorem read_write_disjoint
     (b : BitVec 64) (len : Nat)
     (hdisj : ∀ k, k < len → OutsideRange a n (b + BitVec.ofNat 64 k)) :
     readBytes { m with mem := writeBytes m.mem a v n } b len = readBytes m b len := by
-  sorry  -- mechanical: induct on `len`; each byte is `writeBytes_outside` under `hdisj`.
+  apply Trust.readLE_congr
+  intro k hk
+  exact writeBytes_outside m.mem a v n _ (hdisj k hk)
 
-/-- `read_write_same`: reading the `n` bytes you JUST wrote returns the (truncated-to-`8*n`) value
-    written.  This is the VALUE leg for the store case (the stored bytes ARE the source value) and
-    the load-of-own-store leg.
-    classification: mechanical — `readBytes`/`writeBytes` agree byte-for-byte on `[a,a+n)`; the LE
-    reassembly of the split bytes is the inverse of the LE split, a finite BitVec identity.
-    NOTE (verifier): this statement is wrap-fragile (a base `a` near 2^64-1 makes the LE reassembly
-    alias) — but it is OFF the live forward-sim path (load uses `readBytes_src_eq_mach`, store-frame
-    uses `read_write_disjoint`/`writeBytes_inRange_indep`, both wrap-robust); only the §7 width-1
-    validation anchor references it. -/
+/-- Narrowing before a logical right shift preserves every retained result bit. -/
+private theorem narrow_shift {w i j : Nat} (x : BitVec w) (shift : Nat) (h : j + shift ≤ i) :
+    ((x.setWidth i) >>> shift).setWidth j = (x >>> shift).setWidth j := by
+  ext k hk
+  simp only [BitVec.getElem_setWidth, BitVec.getLsbD_ushiftRight, BitVec.getLsbD_setWidth]
+  simp [show shift + k < i by omega]
+
+/-- The encoder's scalar byte-store fold agrees with the width-generic memory
+    model for every byte count through eight. Each case is kernel-checked over
+    arbitrary values, addresses and initial bytes. -/
+private theorem writeBytes_eq_writeLE
+    (m : MachState) (a : BitVec 64) (v : BitVec 64) (n : Nat) (hn : n ≤ 8) :
+    writeBytes m.mem a v n = (writeLE m a n (v.truncate (8 * n))).mem := by
+  have cases : n = 0 ∨ n = 1 ∨ n = 2 ∨ n = 3 ∨ n = 4 ∨ n = 5 ∨ n = 6 ∨ n = 7 ∨ n = 8 := by omega
+  rcases cases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    funext q <;>
+    simp only [writeBytes, writeLE, MachState.writeByte, List.range_succ,
+      List.range_zero, List.foldl_append, List.foldl_cons, List.foldl_nil] <;>
+    simp [BitVec.add_assoc, BitVec.truncate, BitVec.ushiftRight_eq',
+      narrow_shift, BitVec.shiftRight_add]
+
 theorem read_write_same
-    (m : MachState) (a : BitVec 64) (v : BitVec 64) (n : Nat) :
+    (m : MachState) (a : BitVec 64) (v : BitVec 64) (n : Nat) (hn : n ≤ 8) :
     readBytes { m with mem := writeBytes m.mem a v n } a n = v.truncate (8 * n) := by
-  sorry  -- mechanical: byte-wise `writeBytes` hits `[a,a+n)`; LE split/join round-trips to `v`.
+  have hmem := writeBytes_eq_writeLE m a v n hn
+  have hread : readLE { m with mem := writeBytes m.mem a v n } a n =
+      readLE (writeLE m a n (v.truncate (8 * n))) a n := by
+    apply readLE_congr
+    intro k _
+    exact congrFun hmem (a + BitVec.ofNat 64 k)
+  change readLE { m with mem := writeBytes m.mem a v n } a n = _
+  rw [hread]
+  exact Trust.read_write_same m a n (v.truncate (8 * n)) (by omega)
+
 
 /-- `readBytes` depends only on the `.mem` field: two states with equal memory read equal bytes.
     Used to bridge a `storeExec`/`loadExec` state literal (which also touches rip) to the bare
-    `{m with mem := …}` shape the byte-store axioms above are stated over.
+    `{m with mem := …}` shape the byte-store lemmas above are stated over.
     classification: mechanical — induction on `n`; each byte is the `.mem` equality applied. -/
 theorem readBytes_mem_congr
     (m m' : MachState) (a : BitVec 64) (n : Nat) (hmem : m.mem = m'.mem) :
     readBytes m a n = readBytes m' a n := by
-  sorry  -- mechanical: induct on `n`; each byte `m.mem _ = m'.mem _` by `hmem`.
+  apply Trust.readLE_congr
+  intro k _
+  exact congrFun hmem (a + BitVec.ofNat 64 k)
 
 /-! ###########################################################################################
     ## 2.  `agreeOn_write` — THE memory non-interference proof (conjunct (3) for STORE).
@@ -155,7 +188,19 @@ theorem writeBytes_inRange_indep
     (mem₁ mem₂ : BitVec 64 → BitVec 8) (a : BitVec 64) (v : BitVec 64) (n : Nat) (q : BitVec 64)
     (hin : ¬ OutsideRange a n q) :
     writeBytes mem₁ a v n q = writeBytes mem₂ a v n q := by
-  sorry  -- mechanical: in-range, the last matching fold step writes `(v>>>8k).truncate 8` over either base.
+  induction n with
+  | zero => exact False.elim (hin (by intro k hk; omega))
+  | succ n ih =>
+      by_cases hlast : q = a + BitVec.ofNat 64 n
+      · simp [writeBytes, List.range_succ, hlast]
+      · have hprev : ¬ OutsideRange a n q := by
+          intro hout
+          apply hin
+          intro k hk
+          by_cases heq : k = n
+          · simpa [heq] using hlast
+          · exact hout k (by omega)
+        simpa [writeBytes, List.range_succ, hlast] using ih hprev
 
 /-- THE memory-non-interference proof for a STORE.  Given off-frame agreement before the store
     (`hagree`), and that the destination heap range stays within the off-frame region in BOTH heaps
@@ -269,7 +314,17 @@ theorem readBytes_src_eq_mach
     (sm : SrcMem) (m : MachState) (a : BitVec 64) (n : Nat)
     (hagree : ∀ k, k < n → sm (a + BitVec.ofNat 64 k) = m.mem (a + BitVec.ofNat 64 k)) :
     readBytes_src sm a n = readBytes m a n := by
-  sorry  -- mechanical: induct on `n`; head byte by `hagree 0`, tail by IH at `a+1`.
+  induction n generalizing a with
+  | zero => rfl
+  | succ n ih =>
+      have h0 : sm a = m.mem a := by
+        simpa using hagree 0 (Nat.succ_pos n)
+      have htail : readBytes_src sm (a + 1) n = readBytes m (a + 1) n := by
+        apply ih
+        intro k hk
+        rw [Trust.addr_step a k]
+        exact hagree (k + 1) (by omega)
+      simp only [readBytes_src, readBytes, h0, htail]
 
 /-! ###########################################################################################
     ## 4.  STORE: building the `InstrCert`.
@@ -438,11 +493,13 @@ theorem store_pc_leg
     already proven. -/
 def store_instrCert
     {lay : Layout} {step : LoweredStep} {s s' : SrcState}
+    (hentry : ∀ m, R lay s m → step.entry m)
     (sh : StoreShape lay s s') (len : Nat)
     (hexec : ∀ m, step.exec m = storeExec sh.addr sh.storedVal sh.n len m)
     (hcover : ∀ q, ¬ (clobberOf step).frame q → OutsideRange sh.addr sh.n q)
     (hpc : ∀ m, R lay s m → m.rip + BitVec.ofNat 64 len = lay.entryAddr (lay.lowerOf s'.pc)) :
     InstrCert lay step s s' where
+  entryReady := hentry
   value     := fun m hR v hv => by
     rw [hexec m]; exact store_value_leg sh len hR v hv
   clobber   := fun m hR => by
@@ -543,7 +600,8 @@ theorem load_value_other
     {lay : Layout} {s s' : SrcState} {m : MachState}
     (ld : LoadShape lay s s') (len : Nat) (hR : R lay s m)
     (v : VName) (hv' : Live s' v) (hne : v ≠ ld.vDst)
-    (hdistinct : ∀ r, lay.asgn v = Loc.reg r → r ≠ ld.rDst) :
+    (hdistinct : ∀ r, lay.asgn v = Loc.reg r → r ≠ ld.rDst)
+    (hpair : ∀ lo hi, lay.asgn v = Loc.pair lo hi → lo ≠ ld.rDst ∧ hi ≠ ld.rDst) :
     denoteLoc (loadExec ld.addr ld.rDst ld.n len m) (lay.asgn v) (lay.kind v) = s'.env v := by
   obtain ⟨hvLive, hEnv⟩ := ld.envOther v hv' hne
   rw [hEnv]
@@ -560,12 +618,11 @@ theorem load_value_other
       | f64     => rw [hasgn, hkind] at hold; simp only [denoteLoc, loadExec_other _ _ _ _ _ r hrne] at hold ⊢; exact hold
       | f32     => rw [hasgn, hkind] at hold; simp only [denoteLoc, loadExec_other _ _ _ _ _ r hrne] at hold ⊢; exact hold
   | pair lo hi =>
-      -- an i128 pair: its lo/hi regs must both differ from `rDst` (regalloc distinctness).
-      -- classification: mechanical — same `loadExec_other` frame applied to `lo` (and `hi` for the
-      -- full i128), needing the pair-distinctness fact analogous to `hdistinct`.  NOTE: like the
-      -- store i128-spill case, completing this would require LoadShape/`hother` to range over pair
-      -- registers (lo AND hi), not just `Loc.reg` — currently `hdistinct`/`hother` only cover `.reg`.
-      sorry  -- mechanical (needs pair-distinctness): frame `lo`/`hi` against `rDst` then `hold`.
+      obtain ⟨hlo, hhi⟩ := hpair lo hi hasgn
+      cases hkind : lay.kind v <;>
+        rw [hasgn, hkind] at hold <;>
+        simpa only [denoteLoc, loadExec_other _ _ _ _ _ lo hlo,
+          loadExec_other _ _ _ _ _ hi hhi] using hold
   | xmm x =>
       cases hkind : lay.kind v with
       | int w h => rw [hasgn, hkind] at hold; simpa only [denote_int_xmm, loadExec_xmms] using hold
@@ -623,17 +680,18 @@ theorem load_clobber_leg
 theorem load_carrier_leg
     {lay : Layout} {s s' : SrcState} {m : MachState}
     (ld : LoadShape lay s s') (len : Nat) (hR : R lay s m)
+    (hwidth : 8 * ld.n ≤ ld.w)
     (hother : ∀ v, Live s' v → v ≠ ld.vDst → ∀ r, lay.asgn v = Loc.reg r → r ≠ ld.rDst) :
     WidthFaithful lay s' (loadExec ld.addr ld.rDst ld.n len m) := by
   intro v hv'
   by_cases hvd : v = ld.vDst
-  · -- the loaded value: its register is the zero-extended read, so the low-`w`/setWidth round-trip
-    -- holds (clean upper bits).  classification: mechanical — the `setWidth 64 ∘ setWidth 64`
-    -- round-trip of a `w`-bit value, the same shape as `carrier_movzx8_widthFaithful`.
+  · -- The byte-read width fits the source carrier, so neither projection loses a value bit.
     subst hvd
     rw [ld.hkind, ld.hasgn]
     simp only [loadExec_dst]
-    sorry  -- mechanical: `(zext read) = ((zext read).truncate w).setWidth 64` round-trip (w ≤ 64).
+    simp only [BitVec.truncate]
+    rw [BitVec.setWidth_setWidth_of_le _ ld.hw]
+    rw [BitVec.setWidth_setWidth (by omega)]
   · -- an unchanged narrow reg: frame it (its reg ≠ rDst) and transport the incoming carrier.
     obtain ⟨hvLive, _⟩ := ld.envOther v hv' hvd
     have hold := hR.carrier v hvLive
@@ -647,28 +705,50 @@ theorem load_carrier_leg
             simp only [hk, ha] at hold ⊢
             simpa only [loadExec_other _ _ _ _ _ r hrne] using hold
 
+/-- A two-byte value need not fit an eight-bit carrier. The generic load
+    carrier theorem therefore requires its explicit byte-width premise. -/
+theorem load_carrier_overwide_counterexample :
+    (256#16).setWidth 64 ≠ (((256#16).setWidth 64).truncate 8).setWidth 64 := by
+  decide
+
+/-- A live pair whose low register is overwritten by a load changes value.
+    Distinctness for only `Loc.reg` assignments cannot frame this pair. -/
+theorem load_pair_low_clobber
+    (m : MachState) (addr : BitVec 64) (lo hi : GPR) (len : Nat)
+    (hold : m.regs lo = 0) (hbyte : m.mem addr = 1) :
+    denoteLoc (loadExec addr lo 1 len m) (.pair lo hi) (.int 64 (by omega)) ≠
+      denoteLoc m (.pair lo hi) (.int 64 (by omega)) := by
+  simp [denoteLoc, loadExec_dst, readBytes, hbyte, hold]
+
 /-- Assemble the LOAD `InstrCert`.  Legs are the proven lemmas above; `step.exec = loadExec …`
     (`hexec`), the read range is off-frame (`haddrOff`), result reg is in the clobber set (`hin`),
-    OTHER live regs are distinct from `rDst` (`hother`), and the CFG successor is `rip+len`
+    OTHER live regs and both pair halves are distinct from `rDst` (`hother`, `hpairs`),
+    the read width fits the carrier (`hwidth`), and the CFG successor is `rip+len`
     (`hpc`).  NO `sorry` here — pure assembly. -/
 def load_instrCert
     {lay : Layout} {step : LoweredStep} {s s' : SrcState}
+    (hentry : ∀ m, R lay s m → step.entry m)
     (ld : LoadShape lay s s') (len : Nat)
     (hexec : ∀ m, step.exec m = loadExec ld.addr ld.rDst ld.n len m)
     (haddrOff : ∀ k, k < ld.n → lay.nonFrame (ld.addr + BitVec.ofNat 64 k))
     (hin : (clobberOf step).gprs ld.rDst)
     (hother : ∀ v, Live s' v → v ≠ ld.vDst → ∀ r, lay.asgn v = Loc.reg r → r ≠ ld.rDst)
+    (hpairs : ∀ v, Live s' v → v ≠ ld.vDst → ∀ lo hi,
+      lay.asgn v = Loc.pair lo hi → lo ≠ ld.rDst ∧ hi ≠ ld.rDst)
+    (hwidth : 8 * ld.n ≤ ld.w)
     (hpc : ∀ m, R lay s m → m.rip + BitVec.ofNat 64 len = lay.entryAddr (lay.lowerOf s'.pc)) :
     InstrCert lay step s s' where
+  entryReady := hentry
   value     := fun m hR v hv => by
     rw [hexec m]
     by_cases hvd : v = ld.vDst
     · subst hvd; exact load_value_dst ld len hR haddrOff
-    · exact load_value_other ld len hR v hv hvd (fun r ha => hother v hv hvd r ha)
+    · exact load_value_other ld len hR v hv hvd
+        (fun r ha => hother v hv hvd r ha) (hpairs v hv hvd)
   clobber   := fun m hR => by
     rw [hexec m]; exact load_clobber_leg hin
   carrierOk := fun m hR => by
-    rw [hexec m]; exact load_carrier_leg ld len hR hother
+    rw [hexec m]; exact load_carrier_leg ld len hR hwidth hother
   memOk     := fun m hR => by
     rw [hexec m]; exact load_mem_leg ld len hR
   pcOk      := fun m hR => by
@@ -695,27 +775,32 @@ def load_instrCert
     `step.event` (a heap store is `.tau` in the model unless its target is MMIO). -/
 theorem forwardSim_store
     {lay : Layout} {step : LoweredStep} {s s' : SrcState} {m : MachState}
+    (hentry : ∀ m, R lay s m → step.entry m)
     (sh : StoreShape lay s s') (len : Nat)
     (hexec : ∀ m, step.exec m = storeExec sh.addr sh.storedVal sh.n len m)
     (hcover : ∀ q, ¬ (clobberOf step).frame q → OutsideRange sh.addr sh.n q)
     (hpc : ∀ m, R lay s m → m.rip + BitVec.ofNat 64 len = lay.entryAddr (lay.lowerOf s'.pc))
     (hR : R lay s m) :
     ∃ m', x86StepPlus m step.event m' ∧ R lay s' m' :=
-  matchStep_exists (store_instrCert sh len hexec hcover hpc) hR
+  matchStep_exists (store_instrCert hentry sh len hexec hcover hpc) hR
 
 /-- FORWARD-SIM, LOAD case.  Symmetric to the store case.  The observable is `step.event` (a heap
     load is `.tau`). -/
 theorem forwardSim_load
     {lay : Layout} {step : LoweredStep} {s s' : SrcState} {m : MachState}
+    (hentry : ∀ m, R lay s m → step.entry m)
     (ld : LoadShape lay s s') (len : Nat)
     (hexec : ∀ m, step.exec m = loadExec ld.addr ld.rDst ld.n len m)
     (haddrOff : ∀ k, k < ld.n → lay.nonFrame (ld.addr + BitVec.ofNat 64 k))
     (hin : (clobberOf step).gprs ld.rDst)
     (hother : ∀ v, Live s' v → v ≠ ld.vDst → ∀ r, lay.asgn v = Loc.reg r → r ≠ ld.rDst)
+    (hpairs : ∀ v, Live s' v → v ≠ ld.vDst → ∀ lo hi,
+      lay.asgn v = Loc.pair lo hi → lo ≠ ld.rDst ∧ hi ≠ ld.rDst)
+    (hwidth : 8 * ld.n ≤ ld.w)
     (hpc : ∀ m, R lay s m → m.rip + BitVec.ofNat 64 len = lay.entryAddr (lay.lowerOf s'.pc))
     (hR : R lay s m) :
     ∃ m', x86StepPlus m step.event m' ∧ R lay s' m' :=
-  matchStep_exists (load_instrCert ld len hexec haddrOff hin hother hpc) hR
+  matchStep_exists (load_instrCert hentry ld len hexec haddrOff hin hother hpairs hwidth hpc) hR
 
 /-! ###########################################################################################
     ## 7.  Worked `bv_decide` validation: the load carrier round-trip at the concrete widths.
@@ -723,8 +808,8 @@ theorem forwardSim_load
     To pin that the carrier-faithfulness leg of a LOAD is a real, kernel-checked BitVec fact (not a
     hand-wave), here are the `setWidth`/`truncate` zero-extension round-trips at the four load widths
     (1/2/4/8 bytes → 8/16/32/64-bit carriers), discharged by `bv_decide`.  These are exactly the
-    `vDst` carrier obligations the `load_carrier_leg` `sorry` defers to the generic `n`; at the
-    CONCRETE widths the backend actually emits, they are fully proven here.
+    `vDst` carrier obligations established generically by `load_carrier_leg` under its explicit
+    load-width premise; the concrete cases below retain independent validation anchors.
     ######################################################################################### -/
 
 /-- A zero-extended 8-bit load is width-faithful at carrier width 8: the loaded reg equals the

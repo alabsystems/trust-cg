@@ -27,7 +27,7 @@ use trust_cg_ir::{
     AArch64Opcode, MachFunction, MachInst, MachOperand, RegClass, Signature, Type, VReg,
 };
 use trust_cg_opt::{CacheBackend, CacheKey, InMemoryCache, MachinePass};
-use trust_cg_verify::cegis_pass::MachOperandBlob;
+use trust_cg_verify::cegis_pass::{MachInstBlob, MachOperandBlob, ProvenRewrite, RegClassBlob};
 use trust_cg_verify::{CegisCacheEntry, CegisSuperoptConfig, CegisSuperoptPass, RewriteLayer};
 
 #[derive(Default)]
@@ -413,51 +413,134 @@ fn trace_cache_hit_path_still_emits_event_issue_492() {
     );
 }
 
+/// The cache projection (`MachInstBlob`) of a replacement body, for the
+/// operand kinds CEGIS replacements use.
+fn blob_of(inst: &MachInst) -> MachInstBlob {
+    MachInstBlob {
+        opcode: format!("{:?}", inst.opcode),
+        operands: inst
+            .operands
+            .iter()
+            .map(|operand| match operand {
+                MachOperand::VReg(vreg) => MachOperandBlob::VReg {
+                    id: vreg.id,
+                    class: vreg.class.into(),
+                },
+                MachOperand::Imm(imm) => MachOperandBlob::Imm(*imm),
+                other => panic!("unexpected replacement operand {other:?}"),
+            })
+            .collect(),
+    }
+}
+
+/// Cold run on `layer_a_func` through `cache`, returning the recorded entry
+/// and the committed function.
+fn cold_layer_a_entry(cache: &Arc<RecordingCache>) -> (CegisCacheEntry, MachFunction) {
+    let mut pass_cold = CegisSuperoptPass::new(make_config(Some(cache.clone()), None));
+    let mut func_cold = layer_a_func();
+    assert!(pass_cold.run(&mut func_cold));
+    (cache.last_entry(), func_cold)
+}
+
 #[test]
 fn cache_entry_records_and_replays_serialized_replacement_body_issue_492() {
-    // This pins the remaining #492 cache-entry AC: a proven rewrite records
-    // its serialized replacement body and the hot path consumes that body
-    // directly. The synthetic replacement mutation below distinguishes blob
-    // replay from the old matcher reconstruction path.
+    // #492 made a cache entry a self-describing rewrite plan: each proven
+    // rewrite records its layer, the window it consumes and its serialized
+    // replacement body, and the hot path replays that plan without CEGIS,
+    // counting a cache hit and exactly the rewrites it applied (the #491
+    // failure was a hit that skipped the recorded mutation and credited
+    // phantom counts). This pins that a VALID recorded body is replayed byte
+    // for byte on a solver-free hit and leaves the function the cold run
+    // committed. `..._tampered_twin_...` below pins the other half: a body
+    // the matcher does not rebuild is never applied.
     let cache = Arc::new(RecordingCache::default());
-    let cfg_cold = make_config(Some(cache.clone()), None);
-
-    let mut pass_cold = CegisSuperoptPass::new(cfg_cold);
-    let mut func_cold = layer_a_func();
-    let committed_cold = pass_cold.run(&mut func_cold);
-    assert!(committed_cold);
-
-    let mut entry = cache.last_entry();
+    let (entry, func_cold) = cold_layer_a_entry(&cache);
     assert_eq!(entry.version, CegisCacheEntry::VERSION);
     assert_eq!(entry.proven_rewrites.len(), 1);
-    let rewrite = &mut entry.proven_rewrites[0];
+    let rewrite = &entry.proven_rewrites[0];
     assert_eq!(rewrite.layer, RewriteLayer::A);
     assert_eq!(rewrite.window_len, 1);
     assert_eq!(rewrite.replacement.len(), 1);
-    assert_eq!(rewrite.replacement[0].opcode, "Movz");
-    assert!(
-        matches!(
-            rewrite.replacement[0].operands.last(),
-            Some(MachOperandBlob::Imm(0))
-        ),
-        "cold cache entry must serialize the replacement operands"
+    let recorded = &rewrite.replacement[0];
+    let mul_dst = layer_a_func().insts[rewrite.inst_index as usize].operands[0].clone();
+    assert_eq!(
+        *recorded,
+        blob_of(&MachInst::new(
+            AArch64Opcode::Movz,
+            vec![mul_dst, MachOperand::Imm(0)]
+        )),
+        "cold cache entry must serialize the replacement opcode and operands"
     );
+    assert!(matches!(
+        recorded.operands[0],
+        MachOperandBlob::VReg {
+            class: RegClassBlob::Gpr32,
+            ..
+        }
+    ));
 
-    *rewrite
+    let mut pass_hot = CegisSuperoptPass::new(make_config(Some(cache.clone()), None));
+    let mut func_hot = layer_a_func();
+    assert!(pass_hot.run(&mut func_hot));
+    let stats = pass_hot.stats();
+    assert_eq!((stats.cache_hits, stats.cache_misses), (1, 0));
+    assert_eq!((stats.cache_stale, stats.cache_puts), (0, 0));
+    assert_eq!(stats.solver_calls, 0, "a hit replays without CEGIS");
+    assert_eq!(stats.layer_a_committed, 1);
+
+    let replayed = &func_hot.insts[rewrite.inst_index as usize];
+    assert_eq!(replayed.opcode, AArch64Opcode::Movz);
+    assert_eq!(
+        CegisCacheEntry {
+            proven_rewrites: vec![ProvenRewrite {
+                replacement: vec![blob_of(replayed)],
+                ..rewrite.clone()
+            }],
+            ..entry.clone()
+        }
+        .encode()
+        .expect("encode the replayed plan"),
+        entry.encode().expect("encode the recorded plan"),
+        "the replayed body is the recorded body, byte for byte"
+    );
+    assert_eq!(format!("{func_hot:?}"), format!("{func_cold:?}"));
+}
+
+#[test]
+fn cache_entry_tampered_twin_is_refused_as_stale_issue_492() {
+    // The same entry with its recorded `Movz` immediate overwritten (0 ->
+    // 123) in the cache, as anyone who can write the cache root could. The
+    // entry still decodes, but the matcher rebuilds `Movz dst, #0`, so the
+    // plan is stale: nothing is replayed, the function is searched again,
+    // the correct body is committed and the entry is rewritten.
+    let cache = Arc::new(RecordingCache::default());
+    let (honest, func_cold) = cold_layer_a_entry(&cache);
+    let mut tampered = honest.clone();
+    *tampered.proven_rewrites[0]
         .replacement
         .get_mut(0)
         .and_then(|inst| inst.operands.get_mut(1))
         .expect("replacement immediate operand") = MachOperandBlob::Imm(123);
-    cache.replace_all_with_entry(&entry);
+    cache.replace_all_with_entry(&tampered);
+    assert_eq!(cache.last_entry(), tampered);
 
-    let cfg_hot = make_config(Some(cache), None);
-    let mut pass_hot = CegisSuperoptPass::new(cfg_hot);
+    let mut pass_hot = CegisSuperoptPass::new(make_config(Some(cache.clone()), None));
     let mut func_hot = layer_a_func();
     assert!(pass_hot.run(&mut func_hot));
-    assert_eq!(pass_hot.stats().cache_hits, 1);
-    assert_eq!(pass_hot.stats().cache_misses, 0);
+    let stats = pass_hot.stats();
+    assert_eq!(stats.cache_hits, 0, "a tampered body is never a hit");
+    assert_eq!(
+        (stats.cache_stale, stats.cache_misses, stats.cache_puts),
+        (1, 1, 1)
+    );
+    assert_eq!(stats.layer_a_committed, 1);
 
-    let replayed = &func_hot.insts[2];
-    assert_eq!(replayed.opcode, AArch64Opcode::Movz);
-    assert_eq!(replayed.operands[1], MachOperand::Imm(123));
+    let target = honest.proven_rewrites[0].inst_index as usize;
+    assert_eq!(func_hot.insts[target].operands[1], MachOperand::Imm(0));
+    assert_eq!(format!("{func_hot:?}"), format!("{func_cold:?}"));
+    assert_eq!(
+        cache.last_entry(),
+        honest,
+        "the fresh search rewrites the entry"
+    );
 }

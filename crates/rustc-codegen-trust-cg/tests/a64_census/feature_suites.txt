@@ -1,0 +1,172 @@
+# AArch64 bridge feature-suite census, read by tests/bridge_feature_suites_aarch64.rs.
+#
+# One line per cell (a harvested x86 feature-suite program at -O0 or -O3) that
+# does NOT build and match LLVM natively:
+#   <lane> <suite>/<table>_<row> O<opt> <code>
+# proofs-off <code>: the backend's refusal (the first [TCG-*] code, joined by
+#   `/` to the code its first failing function's reason carries), or
+#   PANIC-MESSAGE: both runs panic at the same location with the same exit
+#   status and stdout, but the backend's panic message text differs (an output
+#   divergence the backend does not lower, never a match).
+# llvm UNBUILDABLE: LLVM itself cannot build the harvested program (it needs a
+#   crate or preamble its suite supplies some other way).
+# oracle exit-<n>: LLVM's exit code differs from the suite's pinned checksum.
+#
+# Every cell not listed must build and match LLVM (exit status, stdout, stderr
+# with std's per-process thread id removed); any other divergence is a
+# miscompile and is never listed. A listed cell that starts to build and match
+# fails the test until its line is removed. Measured 2026-10-01, again
+# 2026-10-06 (after merging origin/main 530a9319a), and held unchanged on
+# 2026-10-07 (after merging origin/main caed91de9, with the stricter
+# [TCG-CLOSURE-DROP] check) on aarch64-apple-darwin (Apple M4 Max, Trust
+# package 9192). 2026-10-09: the four `t20_3_arg` rows (`dyn Fn` /
+# `&mut dyn FnMut` with three arguments, [TCG-ARG-ABI] before) build and match
+# LLVM since the bridge's per-signature argument placement and untupled
+# rust-call declarations landed, and their lines are removed. Later on
+# 2026-10-09 (main 4f5020306), 22 cells' first refusal is [TCG-RET-ABI] where
+# it was [TCG-IR-LOWER]: the call preflight now refuses their return ABI
+# before IR lowering is reached. The same cells drift without any other
+# change, and their lines carry the new code. `m103_nested_collect_x86`'s
+# `t0_vec_tuple` builds and matches LLVM at -O0 and -O3 on that main, and its
+# two lines are removed.
+# Re-measured 2026-10-07 on integrate/upstream-fixes-next (the hunt fix
+# branches): m103 t0_vec_ref matches (for_each runs its closure's drop glue,
+# port2/r2n5-closure-drop), and m100 cells refuse with the more specific
+# [TCG-ITER-UNMODELED] reason. Re-measured 2026-10-13 after merging origin/main
+# 7c60cee46 into that branch: 1403 of the 1538 cells match (main's 1401 plus
+# the two `t0_vec_ref` cells), no panic message differs, and the two m100
+# `t19_flat_map` -O3 cells refuse with main's bare code again.
+# 2026-10-15: five -O3 cells build and match LLVM on main d48c64065, before
+# and after the WS7.3 conformance fix, and their lines are removed:
+# iter_adapters_x86's t0_for_each_enumerate, t0_for_each_filter_count and
+# t0_for_each_zip, and m127_to_vec_o3_x86's t0_i8_loop_sum and t0_u64_sum_len.
+llvm panic_unwind_raise_x86/t1_tc_diverging_rlib O0 UNBUILDABLE
+llvm panic_unwind_raise_x86/t1_tc_diverging_rlib O3 UNBUILDABLE
+llvm panic_unwind_raise_x86/t1_tc_ret_guard O0 UNBUILDABLE
+llvm panic_unwind_raise_x86/t1_tc_ret_guard O3 UNBUILDABLE
+llvm panic_unwind_raise_x86/t1_tc_ret_ok O0 UNBUILDABLE
+llvm panic_unwind_raise_x86/t1_tc_ret_ok O3 UNBUILDABLE
+llvm panic_unwind_raise_x86/t1_tc_ret_panics O0 UNBUILDABLE
+llvm panic_unwind_raise_x86/t1_tc_ret_panics O3 UNBUILDABLE
+proofs-off iter_adapters_x86/t0_enumerate_filter_index_lane O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_enumerate_filter_map_index_lane O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_enumerate_filter_map_index_lane O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_enumerate_filter_map_value_lane O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_enumerate_filter_map_value_lane O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_enumerate_filter_value_lane O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_enumerate_map_while_both_lanes O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_enumerate_map_while_both_lanes O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_enumerate_scan_state_and_both_lanes O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_enumerate_scan_state_and_both_lanes O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_iter_mut_for_each O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_iter_mut_stateful O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_map_while_all_pass O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_all_pass O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_count O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_count O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_first_fail O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_first_fail O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_range O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_range O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_sum O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_map_while_sum O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off iter_adapters_x86/t0_min_by_reference_item O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_str_bytes_position O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_str_bytes_sum O3 TCG-MIR-UNSUPPORTED
+proofs-off iter_adapters_x86/t0_zip_filter_both_lanes O3 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t10_by_ref___take_2__sum___alone O0 TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED
+proofs-off m100_str_memcpy_x86/t10_by_ref___take_2__sum___alone O3 TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED
+proofs-off m100_str_memcpy_x86/t10_by_ref___take_2__sum___then_it_sum____the_P0_repro_ O0 TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED
+proofs-off m100_str_memcpy_x86/t10_by_ref___take_2__sum___then_it_sum____the_P0_repro_ O3 TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED
+proofs-off m100_str_memcpy_x86/t19_MODELED_bounded_flat_map_sum__must_still_lower_at__O0_ O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off m100_str_memcpy_x86/t19_MODELED_bounded_flat_map_sum__must_still_lower_at__O0_ O3 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t19_flat_map_any__unmodeled_consumer_ O0 TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED
+proofs-off m100_str_memcpy_x86/t19_flat_map_any__unmodeled_consumer_ O3 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t19_flat_map_position_result_captured_by_ref__the_SIGILL_repro_ O0 TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED
+proofs-off m100_str_memcpy_x86/t19_flat_map_position_result_captured_by_ref__the_SIGILL_repro_ O3 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t20_enumerate_any__SIGILL_repro_ O0 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t20_enumerate_find_map__the_SIGILL_repro_ O0 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t5_extend_tuple_element O0 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t5_extend_tuple_element O3 TCG-MIR-UNSUPPORTED
+proofs-off m100_str_memcpy_x86/t6_to_lowercase___len__ O0 TCG-MIR-UNSUPPORTED/TCG-STR-CASE
+proofs-off m100_str_memcpy_x86/t6_to_lowercase___len__ O3 TCG-MIR-UNSUPPORTED/TCG-STR-CASE
+proofs-off m100_str_memcpy_x86/t6_to_uppercase___content O0 TCG-MIR-UNSUPPORTED/TCG-STR-CASE
+proofs-off m100_str_memcpy_x86/t6_to_uppercase___content O3 TCG-MIR-UNSUPPORTED/TCG-STR-CASE
+proofs-off m100_str_memcpy_x86/t6_to_uppercase___len__ O0 TCG-MIR-UNSUPPORTED/TCG-STR-CASE
+proofs-off m100_str_memcpy_x86/t6_to_uppercase___len__ O3 TCG-MIR-UNSUPPORTED/TCG-STR-CASE
+proofs-off m100_str_memcpy_x86/t9_f64_parse_in_a_loop O0 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
+proofs-off m100_str_memcpy_x86/t9_f64_parse_in_a_loop O3 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
+proofs-off m100_str_memcpy_x86/t9_f64_parse_via_if_let_Ok__the_P0_repro_ O0 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
+proofs-off m100_str_memcpy_x86/t9_f64_parse_via_if_let_Ok__the_P0_repro_ O3 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
+proofs-off m100_str_memcpy_x86/t9_f64_parse_via_unwrap_or O0 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
+proofs-off m100_str_memcpy_x86/t9_f64_parse_via_unwrap_or O3 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
+proofs-off m101_o3_gaps_x86/t1_or_insert_with_const O3 TCG-MIR-UNSUPPORTED/TCG-MAP-ENTRY-USE
+proofs-off m103_nested_collect_x86/t0_vec_i128 O0 TCG-MIR-UNSUPPORTED
+proofs-off m103_nested_collect_x86/t0_vec_i128 O3 TCG-MIR-UNSUPPORTED
+proofs-off m103_nested_collect_x86/t0_vec_string O0 TCG-MIR-UNSUPPORTED
+proofs-off m103_nested_collect_x86/t0_vec_string O3 TCG-MIR-UNSUPPORTED
+proofs-off m122_to_vec_string_from_x86/t0_float_slice_contains_partial_eq O3 TCG-MIR-UNSUPPORTED
+proofs-off m127_to_vec_o3_x86/t0_i64_sum_cap O3 TCG-MIR-UNSUPPORTED/TCG-IR-LOWER
+proofs-off m127_to_vec_o3_x86/t1_box_element O0 TCG-MIR-UNSUPPORTED
+proofs-off m127_to_vec_o3_x86/t1_box_element O3 TCG-MIR-UNSUPPORTED
+proofs-off m127_to_vec_o3_x86/t1_string_element O0 TCG-MIR-UNSUPPORTED/TCG-COLLECTION-IMAGE
+proofs-off m127_to_vec_o3_x86/t1_string_element O3 TCG-MIR-UNSUPPORTED/TCG-COLLECTION-IMAGE
+proofs-off m127_to_vec_o3_x86/t1_tuple_element O0 TCG-MIR-UNSUPPORTED
+proofs-off m139_flatmap_bounded_x86/t0_count_basic O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off m139_flatmap_bounded_x86/t0_count_basic O3 TCG-MIR-UNSUPPORTED
+proofs-off m139_flatmap_bounded_x86/t0_fold_order_sensitive O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off m139_flatmap_bounded_x86/t0_fold_order_sensitive O3 TCG-MIR-UNSUPPORTED
+proofs-off m139_flatmap_bounded_x86/t0_sum_empty_inner O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off m139_flatmap_bounded_x86/t0_sum_empty_inner O3 TCG-MIR-UNSUPPORTED
+proofs-off m139_flatmap_bounded_x86/t0_sum_empty_outer O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off m139_flatmap_bounded_x86/t0_sum_empty_outer O3 TCG-MIR-UNSUPPORTED
+proofs-off m139_flatmap_bounded_x86/t0_sum_single_outer_multi_inner O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off m139_flatmap_bounded_x86/t0_sum_single_outer_multi_inner O3 TCG-MIR-UNSUPPORTED
+proofs-off m140_println_x86/t1_dbg O0 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
+proofs-off m140_println_x86/t1_dbg O3 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
+proofs-off m140_println_x86/t1_hexfmt O0 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
+proofs-off m140_println_x86/t1_hexfmt O3 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
+proofs-off m140_println_x86/t1_pad O0 TCG-MIR-UNSUPPORTED
+proofs-off m140_println_x86/t1_pad O3 TCG-MIR-UNSUPPORTED
+proofs-off m90_format_x86/t1_branch_varying_str O0 TCG-MIR-UNSUPPORTED/TCG-FMT-RTSTR
+proofs-off m90_format_x86/t1_branch_varying_str O3 TCG-MIR-UNSUPPORTED/TCG-FMT-RTSTR
+proofs-off m90_format_x86/t1_debug_tuple O0 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
+proofs-off m90_format_x86/t1_debug_tuple O3 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
+proofs-off m98_vec_collect_sort_x86/t0_i64_sort_presorted O3 TCG-MIR-UNSUPPORTED
+proofs-off m98_vec_collect_sort_x86/t0_u8_sort_unsigned O3 TCG-MIR-UNSUPPORTED
+proofs-off m99_iter_adapters_x86/t0_enumerate_take_count O3 TCG-MIR-UNSUPPORTED
+proofs-off m99_iter_adapters_x86/t0_skip_take_step_sum O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t0_step3_sum O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t0_step_count O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t0_step_filter_sum O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t0_step_sum O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t0_step_take_sum O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t1_captured_stepby O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t1_direct_next O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t1_signed_range O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t1_slice O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t1_unsigned_size_hint O0 TCG-MIR-UNSUPPORTED/TCG-STEPBY-METHOD
+proofs-off m99_iter_adapters_x86/t1_unsigned_size_hint O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t2_rev_over_take O0 TCG-MIR-UNSUPPORTED
+proofs-off m99_iter_adapters_x86/t2_step_by_runtime O0 TCG-MIR-UNSUPPORTED
+proofs-off m99_iter_adapters_x86/t2_step_by_runtime O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t2_step_by_size_hint O0 TCG-MIR-UNSUPPORTED/TCG-STEPBY-METHOD
+proofs-off m99_iter_adapters_x86/t2_step_by_size_hint O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t2_zip_map_dot O0 TCG-MIR-UNSUPPORTED
+proofs-off m99_iter_adapters_x86/t2_zip_map_dot O3 TCG-MIR-UNSUPPORTED
+proofs-off m99_iter_adapters_x86/t3_usize_stepby_fold O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t3_usize_stepby_sum O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off m99_iter_adapters_x86/t4_usize_stepby_sum_o0 O3 TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL
+proofs-off std_breadth_x86/t0_multilatch_dispatch O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_bool_readback O3 TCG-MIR-UNSUPPORTED/TCG-IR-LOWER
+proofs-off vec_x86/t0_vec_char_literal O3 TCG-MIR-UNSUPPORTED/TCG-IR-LOWER
+proofs-off vec_x86/t0_vec_char_to_vec_extend O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_drain_suffix O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_drain_suffix_iter O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_drain_suffix_reuse O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_extend_array O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_extend_array_realloc O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_extend_from_within O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_extend_from_within_realloc O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_extend_iter_filter O3 TCG-MIR-UNSUPPORTED
+proofs-off vec_x86/t0_vec_extend_iter_map O3 TCG-MIR-UNSUPPORTED

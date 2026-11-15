@@ -11,10 +11,14 @@
 // `trust-cg-lower/src/x86_64_isel.rs`), exactly as the AArch64 backend does.
 //
 // TRUST ASSUMPTION: like every libcall, the correctness of i128 division rests
-// on the EXTERNAL compiler-rt implementation of those four symbols. It is NOT
-// covered by an SMT lowering proof; it is verified by DIFFERENTIAL execution
-// against clang's `__int128` / `unsigned __int128` operators below, whose
-// runtime resolves the same compiler-rt symbols at link time.
+// on the EXTERNAL implementation of those four symbols the link binds. This
+// differential is evidence for the LOWERING only (the argument and result
+// placement): it compares the backend's object with clang's `__int128` /
+// `unsigned __int128` operators, and both sides link the same routine, so it
+// says nothing about the routine's values. Those are tested (never proved)
+// against an independent bit-serial reference by trust-cg-verify's
+// `slice22::the_i128_division_routines_match_an_independent_reference` and the
+// slice-22 report's `native/run_diff.sh` (ruling OD-202).
 //
 // These use the AOT Mach-O path (`x86_64_differential_test`): the produced
 // object is linked with `cc -arch x86_64`, which links in compiler-rt and

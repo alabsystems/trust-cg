@@ -79,15 +79,16 @@ pub enum FixupError {
         addend: i64,
     },
 
-    /// An ELF-only fixup kind (`ElfTlsleAddTprelHi12` / `ElfTlsleAddTprelLo12Nc` /
-    /// `ElfTlsieAdrGottprelPage21` / `ElfTlsieLd64GottprelLo12Nc`)
+    /// An ELF-only fixup kind (see [`AArch64RelocKind::is_elf_only`]: the
+    /// TLSLE/TLSIE/TLSDESC carriers and the fused `ElfLdst*` lo12 memory
+    /// carriers)
     /// reached Mach-O relocation conversion. These kinds have no Mach-O
     /// `relocation_info` r_type (their discriminants are outside 0..=11) and
     /// may only be consumed by the ELF emitter's `aarch64_elf_reloc_kind`
     /// mapping; converting one here would serialize a malformed/foreign
     /// r_type. Fail closed instead.
     #[error(
-        "ELF-only fixup kind {kind:?} at offset {offset:#x} cannot be emitted          as a Mach-O relocation (ELF TLS local-exec/initial-exec fixups are only          valid for ELF object emission)"
+        "ELF-only fixup kind {kind:?} at offset {offset:#x} cannot be emitted          as a Mach-O relocation (ELF-only TLS and lo12 memory-access fixups are only          valid for ELF object emission)"
     )]
     ElfOnlyFixupKind {
         /// The ELF-only relocation kind that reached Mach-O conversion.
@@ -132,6 +133,12 @@ pub enum FixupTarget {
     /// table is built. The module-level emitter resolves this to a `Symbol(u32)`
     /// after all functions have been laid out and symbols assigned indices.
     NamedSymbol(String),
+
+    /// A validated exact in-module function call, retained separately from an
+    /// interposable named symbol. JIT resolution must bypass explicit extern
+    /// overrides; object emission must find a definition in this module or
+    /// fail closed. The name is a backend lookup key, not proof authority.
+    ExactNamedSymbol(String),
 }
 
 /// A pending fixup that will be resolved after layout.
@@ -191,6 +198,17 @@ impl Fixup {
             kind: AArch64RelocKind::Branch26,
             tls_model: None,
             target: FixupTarget::NamedSymbol(symbol_name),
+            addend: 0,
+        }
+    }
+
+    /// Create a branch fixup that must resolve to an in-module function.
+    pub fn branch_exact_sym(offset: u32, symbol_name: String) -> Self {
+        Self {
+            offset,
+            kind: AArch64RelocKind::Branch26,
+            tls_model: None,
+            target: FixupTarget::ExactNamedSymbol(symbol_name),
             addend: 0,
         }
     }
@@ -354,12 +372,34 @@ impl FixupList {
     where
         F: Fn(&str) -> Option<u32>,
     {
+        self.resolve_named_symbols_with_exact(&lookup, &lookup)
+    }
+
+    /// Resolve ordinary and exact named targets through separate namespaces.
+    ///
+    /// Object formats commonly decorate source names (Mach-O prefixes `_`, for
+    /// example).  An exact module-function edge must resolve by the raw module
+    /// identity, while an ordinary call must resolve by the platform ABI name.
+    /// Sharing one alias-filled map lets a raw name such as `_foo` collide with
+    /// the decorated spelling of `foo`; keeping the callbacks separate makes
+    /// that class of order-dependent misbinding structurally impossible.
+    pub fn resolve_named_symbols_with_exact<F, G>(
+        &mut self,
+        lookup_named: F,
+        lookup_exact: G,
+    ) -> Result<(), FixupError>
+    where
+        F: Fn(&str) -> Option<u32>,
+        G: Fn(&str) -> Option<u32>,
+    {
         for fixup in &mut self.fixups {
-            if let FixupTarget::NamedSymbol(ref name) = fixup.target {
-                let index = lookup(name)
-                    .ok_or_else(|| FixupError::UnresolvedSymbol { name: name.clone() })?;
-                fixup.target = FixupTarget::Symbol(index);
-            }
+            let (name, index) = match &fixup.target {
+                FixupTarget::NamedSymbol(name) => (name, lookup_named(name)),
+                FixupTarget::ExactNamedSymbol(name) => (name, lookup_exact(name)),
+                _ => continue,
+            };
+            let index = index.ok_or_else(|| FixupError::UnresolvedSymbol { name: name.clone() })?;
+            fixup.target = FixupTarget::Symbol(index);
         }
         Ok(())
     }
@@ -393,13 +433,7 @@ impl FixupList {
             }
             // ELF-only kinds (discriminants outside the Mach-O r_type range
             // 0..=11) must never serialize into Mach-O relocation records.
-            if matches!(
-                fixup.kind,
-                AArch64RelocKind::ElfTlsleAddTprelHi12
-                    | AArch64RelocKind::ElfTlsleAddTprelLo12Nc
-                    | AArch64RelocKind::ElfTlsieAdrGottprelPage21
-                    | AArch64RelocKind::ElfTlsieLd64GottprelLo12Nc
-            ) {
+            if fixup.kind.is_elf_only() {
                 return Err(FixupError::ElfOnlyFixupKind {
                     kind: fixup.kind,
                     offset: fixup.offset,
@@ -409,7 +443,7 @@ impl FixupList {
                 FixupTarget::Symbol(idx) => (*idx, true),
                 FixupTarget::Section(ordinal) => (*ordinal, false),
                 FixupTarget::SymbolPlusOffset { symbol_index, .. } => (*symbol_index, true),
-                FixupTarget::NamedSymbol(name) => {
+                FixupTarget::NamedSymbol(name) | FixupTarget::ExactNamedSymbol(name) => {
                     return Err(FixupError::UnresolvedNamedSymbolAtOffset {
                         offset: fixup.offset,
                         name: name.clone(),

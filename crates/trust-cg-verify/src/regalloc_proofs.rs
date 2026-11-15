@@ -2814,14 +2814,34 @@ mod tests {
         );
     }
 
+    // Three Greedy RA proofs are unreachable by the sweep's uniform draws and
+    // edge battery; only its precondition-directed trials (the preconditions'
+    // own constants, an earlier input's value) compare points for them. Their
+    // tests assert that directed evidence and also check the claim at explicit
+    // witnesses. Sampled evidence is statistical; a formal claim comes from the
+    // strict AY gate.
+
+    /// `overlap == 1` and `same_class == 1` on two 64-bit inputs: uniform draws
+    /// hit either at 2^-64, and the multi-input edge battery never sets both
+    /// inputs to 1 in the same combination.
     #[test]
     fn test_greedy_no_interference() {
-        let obligation = proof_greedy_no_interference();
-        let result = verify_by_evaluation(&obligation);
-        assert!(
-            matches!(result, VerificationResult::Valid),
-            "greedy no interference proof failed: {:?}",
-            result
+        crate::lowering_proof::assert_directed_sampling_holds_at(
+            &proof_greedy_no_interference(),
+            &[
+                &[
+                    ("reg_a", 0),
+                    ("reg_b", 1),
+                    ("overlap", 1),
+                    ("same_class", 1),
+                ],
+                &[
+                    ("reg_a", 19),
+                    ("reg_b", u64::MAX),
+                    ("overlap", 1),
+                    ("same_class", 1),
+                ],
+            ],
         );
     }
 
@@ -2836,14 +2856,16 @@ mod tests {
         );
     }
 
+    /// `is_fixed == 1` and `assigned_preg == fixed_preg`: equalities uniform
+    /// 64-bit draws never satisfy together, and no edge combination does.
     #[test]
     fn test_greedy_fixed_register_respect() {
-        let obligation = proof_greedy_fixed_register_respect();
-        let result = verify_by_evaluation(&obligation);
-        assert!(
-            matches!(result, VerificationResult::Valid),
-            "greedy fixed register respect proof failed: {:?}",
-            result
+        crate::lowering_proof::assert_directed_sampling_holds_at(
+            &proof_greedy_fixed_register_respect(),
+            &[
+                &[("fixed_preg", 0), ("assigned_preg", 0), ("is_fixed", 1)],
+                &[("fixed_preg", 30), ("assigned_preg", 30), ("is_fixed", 1)],
+            ],
         );
     }
 
@@ -2871,14 +2893,34 @@ mod tests {
         );
     }
 
+    /// Both offsets 8-aligned: `offset_a` and `offset_b` are consecutive draws
+    /// of the sweep's power-of-two-modulus LCG, whose successive outputs
+    /// alternate in parity, so no uniform sample has both even; no edge
+    /// combination aligns both either.
     #[test]
     fn test_greedy_stack_offset_correctness() {
-        let obligation = proof_greedy_stack_offset_correctness();
-        let result = verify_by_evaluation(&obligation);
-        assert!(
-            matches!(result, VerificationResult::Valid),
-            "greedy stack offset correctness proof failed: {:?}",
-            result
+        crate::lowering_proof::assert_directed_sampling_holds_at(
+            &proof_greedy_stack_offset_correctness(),
+            &[
+                &[
+                    ("val_a", 0x1111),
+                    ("val_b", 0x2222),
+                    ("offset_a", 0),
+                    ("offset_b", 8),
+                ],
+                &[
+                    ("val_a", u64::MAX),
+                    ("val_b", 0),
+                    ("offset_a", 0x40),
+                    ("offset_b", 0x38),
+                ],
+                &[
+                    ("val_a", 7),
+                    ("val_b", 7),
+                    ("offset_a", u64::MAX - 7),
+                    ("offset_b", 0),
+                ],
+            ],
         );
     }
 
@@ -2943,6 +2985,9 @@ mod tests {
 
     // --- Phase 3 Aggregator ---
 
+    /// Every Phase 3 proof is `Valid` by evaluation, the three that only the
+    /// directed trials reach included (the per-proof tests above pin that
+    /// evidence).
     #[test]
     fn test_all_greedy_regalloc_proofs() {
         let proofs = all_greedy_regalloc_proofs();

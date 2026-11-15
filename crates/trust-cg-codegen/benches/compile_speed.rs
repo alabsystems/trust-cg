@@ -10,7 +10,7 @@
 //   - Full pipeline end-to-end (trust_ir -> .o via Compiler API)
 //   - Parallel vs serial compilation comparison
 //
-// Run with: cargo bench -p trust-cg-codegen --bench compile_speed
+// Run with: scripts/trust_cargo.sh bench -p trust-cg-codegen --bench compile_speed
 //
 // Part of #315 — Compilation speed benchmarks
 
@@ -58,7 +58,7 @@ fn build_small_module() -> trust_ir::Module {
     let result = fb.add(Ty::I64, diff, c42);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Build a medium module: 3 functions each with ~10 operations.
@@ -130,7 +130,7 @@ fn build_medium_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Build a large module: 5 functions each with ~20 operations.
@@ -298,7 +298,7 @@ fn build_large_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Build an xlarge module: 10 functions, each with ~15 operations.
@@ -335,7 +335,7 @@ fn build_xlarge_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Build a stress-test module: 20 functions, each with ~12 operations.
@@ -370,7 +370,7 @@ fn build_stress_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Build the xxh3 main-loop primitive module (Part of #343).
@@ -438,7 +438,7 @@ fn build_xxh3_main_loop_module() -> trust_ir::Module {
     fb.ret(vec![exit_acc]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -499,16 +499,31 @@ fn bench_isel(module: &trust_ir::Module, name: &'static str) -> ISelResult {
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let _ = trust_cg_lower::translate_module(module);
+        let _ = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+            module,
+            trust_cg_lower::GuardCarrierArch::default(),
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
+        );
     }
 
     let iters = determine_iters(&|| {
-        let _ = trust_cg_lower::translate_module(module);
+        let _ = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+            module,
+            trust_cg_lower::GuardCarrierArch::default(),
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
+        );
     });
 
     let start = Instant::now();
     for _ in 0..iters {
-        let _ = trust_cg_lower::translate_module(module);
+        let _ = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+            module,
+            trust_cg_lower::GuardCarrierArch::default(),
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
+        );
     }
     let duration = start.elapsed();
 
@@ -538,7 +553,13 @@ fn bench_optimization(
     opt_level: OptOptLevel,
 ) -> OptResult {
     // First translate to get LIR functions
-    let lir_funcs = trust_cg_lower::translate_module(module).expect("translate_module failed");
+    let lir_funcs = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
+    .expect("translate_module failed");
 
     // Run ISel to get post-ISel IR functions (before optimization).
     let ir_funcs_fresh: Vec<_> = lir_funcs
@@ -550,6 +571,7 @@ fn bench_optimization(
                 returns: lir_func.signature.returns.clone(),
             };
             let mut isel = InstructionSelector::new(lir_func.name.clone(), sig.clone());
+            isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
             isel.set_stack_slots(lir_func.stack_slots.clone());
             isel.seed_value_types(&lir_func.value_types);
             isel.seed_pure_callees(&lir_func.pure_callees);
@@ -642,7 +664,13 @@ struct RegAllocResult {
 
 fn bench_regalloc(module: &trust_ir::Module, name: &'static str) -> RegAllocResult {
     // Translate and run ISel + opt to get functions ready for regalloc
-    let lir_funcs = trust_cg_lower::translate_module(module).expect("translate_module failed");
+    let lir_funcs = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
+    .expect("translate_module failed");
 
     let ir_funcs_for_ra: Vec<_> = lir_funcs
         .iter()
@@ -653,6 +681,7 @@ fn bench_regalloc(module: &trust_ir::Module, name: &'static str) -> RegAllocResu
                 returns: lir_func.signature.returns.clone(),
             };
             let mut isel = InstructionSelector::new(lir_func.name.clone(), sig.clone());
+            isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
             isel.set_stack_slots(lir_func.stack_slots.clone());
             isel.seed_value_types(&lir_func.value_types);
             isel.seed_pure_callees(&lir_func.pure_callees);
@@ -766,9 +795,19 @@ fn bench_e2e(module: &trust_ir::Module, name: &'static str, parallel: bool) -> E
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
     };
-    let compiler = Compiler::new(config);
+    let compiler = Compiler::new(config).with_codegen_license(permit_unlicensed());
 
     // Warmup
     let mut code_size = 0;
@@ -1023,4 +1062,13 @@ fn main() {
     ];
 
     print_report(&isel_results, &opt_results, &regalloc_results, &e2e_results);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its lowerings state `Permit` explicitly, so none of
+/// them passes (or is refused) because the license silently refused it.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -27,14 +27,16 @@ impl DialectOpId {
     }
 }
 
-/// SSA value identifier, scoped to a single [`DialectFunction`].
+/// SSA value identifier, scoped to one [`DialectFunction`](crate::module::DialectFunction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ValueId(pub u32);
 
-/// Arena index of a [`DialectOp`] within a [`DialectFunction`].
+/// Arena index of a [`DialectOp`](crate::op::DialectOp) within a
+/// [`DialectFunction`](crate::module::DialectFunction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OpId(pub u32);
 
-/// Arena index of a [`DialectBlock`] within a [`DialectFunction`].
+/// Identity of a [`DialectBlock`](crate::module::DialectBlock) within a
+/// [`DialectFunction`](crate::module::DialectFunction), not necessarily its vector position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockId(pub u32);

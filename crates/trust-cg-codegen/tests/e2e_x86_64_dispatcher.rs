@@ -14,10 +14,12 @@
 // dispatch must produce distinct object bytes. Host-default x86-64 public AOT
 // is OS-aware, while Mach-O-specific checks request an explicit Darwin target.
 
+#[path = "common/fresh_dir.rs"]
+mod fresh_dir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
 
@@ -28,6 +30,7 @@ use trust_cg_codegen::macho::constants as macho_consts;
 use trust_cg_codegen::macho::linker::MachOParser;
 use trust_cg_codegen::pipeline::{OptLevel, PipelineError};
 use trust_cg_codegen::target::{Target, TargetSpec};
+use trust_cg_codegen::x86_64::X86PipelineError;
 
 use trust_ir::{
     BinOp, Block as TrustIrBlock, BlockId, Constant, FuncId, FuncTy, FuncTyId,
@@ -45,11 +48,14 @@ use trust_ir::{
 /// target changes between test variants.
 fn build_add_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test_x86_dispatch");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -67,7 +73,9 @@ fn build_add_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -78,11 +86,14 @@ fn build_add_module() -> TrustIrModule {
 fn build_caller_callee_const_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test_x86_call");
 
-    let ft_void_i64 = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_void_i64 = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut callee = TrustIrFunction::new(FuncId::new(0), "callee", ft_void_i64, BlockId::new(0));
     callee.blocks = vec![TrustIrBlock {
@@ -99,7 +110,9 @@ fn build_caller_callee_const_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(callee);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
 
     let mut caller = TrustIrFunction::new(FuncId::new(1), "caller", ft_void_i64, BlockId::new(0));
     caller.blocks = vec![TrustIrBlock {
@@ -116,7 +129,9 @@ fn build_caller_callee_const_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(caller);
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -232,18 +247,18 @@ fn assert_x86_64_coff_object(bytes: &[u8], context: &str) {
 }
 
 fn assert_windows_coff_unwind_fail_closed(err: CompileError) {
+    // The x86-64 refusal is carried typed: it is an unwind-layer refusal
+    // (`WindowsCoffUnwindMetadataRequired`), not an object-format one.
+    let rendered = err.to_string();
     match err {
-        CompileError::Pipeline(PipelineError::TargetObjectUnsupported {
-            target,
-            format,
-            reason,
-        }) => {
-            assert_eq!(target, "x86_64-pc-windows-msvc");
-            assert_eq!(format, "COFF");
+        CompileError::Pipeline(PipelineError::X86(
+            X86PipelineError::WindowsCoffUnwindMetadataRequired { reason, .. },
+        )) => {
             assert!(
-                reason.contains(".pdata/.xdata unwind metadata"),
-                "Windows COFF fail-closed diagnostic should name missing unwind metadata, got {reason}"
+                rendered.contains("COFF") && rendered.contains(".pdata/.xdata unwind metadata"),
+                "Windows COFF fail-closed diagnostic should name missing unwind metadata, got {rendered}"
             );
+            assert!(!reason.is_empty(), "unwind refusal must carry its reason");
         }
         other => panic!("expected typed Windows COFF unwind rejection, got {other:?}"),
     }
@@ -304,6 +319,7 @@ fn x86_64_darwin_target_spec() -> TargetSpec {
 
 fn x86_64_darwin_compiler(config: CompilerConfig) -> Compiler {
     Compiler::new_for_target_spec(config, x86_64_darwin_target_spec())
+        .with_codegen_license(permit_unlicensed())
 }
 
 fn read_name16(bytes: &[u8], offset: usize) -> String {
@@ -514,6 +530,7 @@ fn compile_aarch64_darwin_module(module: &TrustIrModule) -> Vec<u8> {
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
     )
+    .with_codegen_license(permit_unlicensed())
     .compile(module)
     .unwrap_or_else(|err| panic!("aarch64 Darwin caller/callee compile failed: {err:?}"))
     .object_code
@@ -530,19 +547,8 @@ fn compile_x86_64_macho_module(module: &TrustIrModule) -> Vec<u8> {
     .object_code
 }
 
-fn temp_test_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "trust_cg_e2e_x86_64_dispatcher_{}_{}_{}",
-        name,
-        std::process::id(),
-        nanos
-    ));
-    fs::create_dir_all(&dir).expect("create temporary test directory");
-    dir
+fn temp_test_dir(name: &str) -> fresh_dir::ScratchDir {
+    fresh_dir::create(&format!("trust_cg_e2e_x86_64_dispatcher_{name}_"))
 }
 
 fn link_x86_64(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> PathBuf {
@@ -635,7 +641,8 @@ fn dispatcher_x86_64_produces_host_native_object_or_l27_fail_closed() {
         opt_level: OptLevel::O0,
         target: Target::X86_64,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
 
     let Some(result) = expect_host_x86_64_public_aot_result(compiler.compile(&module)) else {
         return;
@@ -671,7 +678,8 @@ fn dispatcher_aarch64_still_produces_arm64_host_native_object() {
         opt_level: OptLevel::O0,
         target: Target::Aarch64,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
 
     let result = compiler
         .compile(&module)
@@ -768,7 +776,9 @@ fn dispatcher_x86_64_multi_function_module_compiles() {
             }),
         ],
     }];
-    module.add_function(sub_func);
+    module
+        .try_add_function(sub_func)
+        .expect("Module::try_add_function: test fixture");
 
     let compiler = x86_64_darwin_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
@@ -871,9 +881,13 @@ fn dispatcher_x86_64_emit_proofs_returns_populated_certs() {
             // x86-64 lowering registry; accept either. (Soundness is still
             // pinned by the `Some(proofs)` and non-empty checks above; this only
             // corrects the provenance string match.)
+            // The I64 `add` is also inside the x86-64 source-bound body lane,
+            // whose replayed whole-body theorem is the third x86-64 family.
             let has_x86_cert = certs.iter().any(|c| {
                 c.rule_name.starts_with("x86_64:")
                     || c.rule_name.starts_with("RECONSTRUCTED x86_64 ")
+                    || c.rule_name
+                        == trust_cg_verify::x86_source_bound_body::X86_BODY_OBLIGATION_NAME
             });
             assert!(
                 has_x86_cert,
@@ -1035,6 +1049,7 @@ fn dispatcher_x86_64_cross_function_call_links_and_runs() {
             target: Target::X86_64,
             ..CompilerConfig::default()
         })
+        .with_codegen_license(permit_unlicensed())
         .compile(&module)
         .expect("host-native x86_64 caller/callee compile")
         .object_code
@@ -1183,4 +1198,13 @@ fn dispatcher_dual_target_cross_function_call_relocations() {
         0xE8,
         "x86-64 branch relocation should target a CALL rel32 displacement"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

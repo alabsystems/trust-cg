@@ -32,6 +32,9 @@
 //! so the presence of `UD2` (0F 0B) in the emitted object is "guard kept" and its
 //! absence "guard eliminated" (these tiny functions emit no other UD2).
 
+#[path = "common/admission_expect.rs"]
+mod admission_expect;
+
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
 use trust_cg_codegen::target::{Target, TargetSpec};
@@ -61,11 +64,14 @@ enum ProbeBinding {
 /// plain integer `Inst::Const` bound, annotated `InBounds` (+ optionally `ProofRef`).
 fn build_probe_module(name: &str, binding: ProbeBinding) -> Module {
     let mut module = Module::new("guard_bounds_probe_x86");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
 
     let idx = ValueId::new(0);
@@ -109,7 +115,9 @@ fn build_probe_module(name: &str, binding: ProbeBinding) -> Module {
             InstrNode::new(Inst::Return { values: vec![idx] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -122,11 +130,34 @@ fn compile_x86_object(module: &Module) -> Result<Vec<u8>, String> {
             ..CompilerConfig::default()
         },
         spec,
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|artifact| artifact.object_code)
         .map_err(|e| format!("{e:?}"))
+}
+
+/// The object of `module`, or `None` when trust-ir itself refuses the module
+/// (a `Discharged` row with no certificate, a `ProofRef` the obligation table
+/// cannot resolve, a result-less compare, ...). Since WS7.3 every ingestion
+/// entry refuses what trust-ir's codegen admission refuses, so such a probe
+/// is refused by that finding before any object exists: no guard can be
+/// eliminated. That refusal is asserted here; trust-ir judges the module under
+/// the policy [`compile_x86_object`] states.
+fn compiled_unless_refused(module: &Module, what: &str) -> Option<Vec<u8>> {
+    match admission_expect::first_finding(module, &permit_unlicensed()) {
+        Some((variant, _)) => {
+            let error = compile_x86_object(module)
+                .expect_err("trust-ir refuses the module, so must trust-cg");
+            assert!(
+                error.contains(&variant),
+                "{what}: refused, but not by trust-ir's `{variant}`: {error}"
+            );
+            None
+        }
+        None => Some(compile_x86_object(module).unwrap_or_else(|error| panic!("{what}: {error}"))),
+    }
 }
 
 /// Count `UD2` (`0F 0B`) occurrences in raw object bytes — the surviving-carrier
@@ -144,7 +175,9 @@ fn probe_with_public_discharged_status_keeps_guard() {
         "probe_discharged",
         ProbeBinding::ProofRef(ProofStatus::Discharged),
     );
-    let obj = compile_x86_object(&module).expect("discharged probe must compile");
+    let Some(obj) = compiled_unless_refused(&module, "discharged probe must compile") else {
+        return;
+    };
     assert!(
         ud2_count(&obj) >= 1,
         "public Discharged status must not eliminate the runtime bounds-check guard"
@@ -160,7 +193,10 @@ fn probe_with_pending_obligation_keeps_guard() {
         "probe_pending",
         ProbeBinding::ProofRef(ProofStatus::Pending),
     );
-    let obj = compile_x86_object(&module).expect("pending probe must compile (guard kept)");
+    let Some(obj) = compiled_unless_refused(&module, "pending probe must compile (guard kept)")
+    else {
+        return;
+    };
     assert!(
         ud2_count(&obj) >= 1,
         "a probe carrier bound to a PENDING (undischarged) obligation must be KEPT \
@@ -173,7 +209,11 @@ fn probe_with_pending_obligation_keeps_guard() {
 #[test]
 fn probe_with_failed_obligation_keeps_guard() {
     let module = build_probe_module("probe_failed", ProbeBinding::ProofRef(ProofStatus::Failed));
-    let obj = compile_x86_object(&module).expect("failed-status probe must compile (guard kept)");
+    let Some(obj) =
+        compiled_unless_refused(&module, "failed-status probe must compile (guard kept)")
+    else {
+        return;
+    };
     assert!(
         ud2_count(&obj) >= 1,
         "a probe carrier bound to a FAILED obligation must be KEPT and expanded to a \
@@ -193,7 +233,10 @@ fn probe_with_failed_obligation_keeps_guard() {
 #[test]
 fn probe_without_proof_ref_is_never_synthesized_discharged() {
     let module = build_probe_module("probe_no_proofref", ProbeBinding::NoProofRef);
-    let obj = compile_x86_object(&module).expect("unbound probe must compile (guard kept)");
+    let Some(obj) = compiled_unless_refused(&module, "unbound probe must compile (guard kept)")
+    else {
+        return;
+    };
     assert!(
         ud2_count(&obj) >= 1,
         "NEVER-SYNTHESIZE VIOLATION: a frontend bounds probe with no ProofRef was \
@@ -210,11 +253,14 @@ fn probe_without_proof_ref_is_never_synthesized_discharged() {
 /// the carrier still expands to the real runtime check whenever it is kept.
 fn build_resultless_probe_module(name: &str, binding: ProbeBinding) -> Module {
     let mut module = Module::new("guard_bounds_probe_x86");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
     let idx = ValueId::new(0);
     let bound = ValueId::new(1);
@@ -251,7 +297,9 @@ fn build_resultless_probe_module(name: &str, binding: ProbeBinding) -> Module {
             InstrNode::new(Inst::Return { values: vec![idx] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -264,7 +312,10 @@ fn resultless_probe_with_public_discharged_status_keeps_guard() {
         "rl_probe_discharged",
         ProbeBinding::ProofRef(ProofStatus::Discharged),
     );
-    let obj = compile_x86_object(&module).expect("result-less discharged probe must compile");
+    let Some(obj) = compiled_unless_refused(&module, "result-less discharged probe must compile")
+    else {
+        return;
+    };
     assert!(
         ud2_count(&obj) >= 1,
         "public Discharged status must not eliminate a result-less runtime guard"
@@ -280,7 +331,10 @@ fn resultless_probe_with_pending_obligation_keeps_guard() {
         "rl_probe_pending",
         ProbeBinding::ProofRef(ProofStatus::Pending),
     );
-    let obj = compile_x86_object(&module).expect("result-less pending probe must compile");
+    let Some(obj) = compiled_unless_refused(&module, "result-less pending probe must compile")
+    else {
+        return;
+    };
     assert!(
         ud2_count(&obj) >= 1,
         "PROOF-ONLY CONTRACT VIOLATION: a result-less probe with a PENDING \
@@ -293,7 +347,10 @@ fn resultless_probe_with_pending_obligation_keeps_guard() {
 #[test]
 fn resultless_probe_without_proof_ref_keeps_guard() {
     let module = build_resultless_probe_module("rl_probe_no_proofref", ProbeBinding::NoProofRef);
-    let obj = compile_x86_object(&module).expect("unbound result-less probe must compile");
+    let Some(obj) = compiled_unless_refused(&module, "unbound result-less probe must compile")
+    else {
+        return;
+    };
     assert!(
         ud2_count(&obj) >= 1,
         "NEVER-SYNTHESIZE VIOLATION (result-less leg): a result-less probe with no \
@@ -314,11 +371,14 @@ fn resultless_probe_without_proof_ref_keeps_guard() {
 #[test]
 fn probe_with_non_constant_bound_retains_runtime_check() {
     let mut module = Module::new("guard_bounds_probe_x86");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "probe_dyn_bound", ft, BlockId::new(0));
     let idx = ValueId::new(0);
     let dyn_bound = ValueId::new(1);
@@ -338,7 +398,9 @@ fn probe_with_non_constant_bound_retains_runtime_check() {
             InstrNode::new(Inst::Return { values: vec![idx] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let obj = compile_x86_object(&module)
         .expect("a dynamic-bound InBounds probe is a supported shape and must compile");
@@ -355,11 +417,14 @@ fn probe_with_non_constant_bound_retains_runtime_check() {
 #[test]
 fn probe_with_wrong_compare_op_fails_closed() {
     let mut module = Module::new("guard_bounds_probe_x86");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "probe_wrong_op", ft, BlockId::new(0));
     let idx = ValueId::new(0);
     let bound = ValueId::new(1);
@@ -384,7 +449,9 @@ fn probe_with_wrong_compare_op_fails_closed() {
             InstrNode::new(Inst::Return { values: vec![idx] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let result = compile_x86_object(&module);
     assert!(
@@ -399,11 +466,14 @@ fn probe_with_wrong_compare_op_fails_closed() {
 #[test]
 fn plain_icmp_without_inbounds_is_not_a_probe() {
     let mut module = Module::new("guard_bounds_probe_x86");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "plain_icmp", ft, BlockId::new(0));
     let idx = ValueId::new(0);
     let bound = ValueId::new(1);
@@ -427,7 +497,9 @@ fn plain_icmp_without_inbounds_is_not_a_probe() {
             InstrNode::new(Inst::Return { values: vec![idx] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let obj = compile_x86_object(&module).expect("plain icmp must compile");
     assert_eq!(
@@ -435,4 +507,13 @@ fn plain_icmp_without_inbounds_is_not_a_probe() {
         0,
         "a plain Ult compare without InBounds must not grow a bounds-check carrier"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

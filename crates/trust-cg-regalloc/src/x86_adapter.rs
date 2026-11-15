@@ -304,15 +304,9 @@ pub fn is_two_address_opcode(opcode: u16) -> bool {
 // AllocConfig factory
 // ===========================================================================
 
-/// x86-64 copy-coalescing tuning, honoring the `TCG_NO_X86_COALESCE_TUNING`
-/// kill switch (set it to any value to fall back to the empty default tuning,
-/// disabling the kill-at-def loop-carried latch merges for A/B measurement).
+/// x86-64 copy-coalescing tuning.
 fn x86_64_coalesce_tuning() -> crate::coalesce::CoalesceTuning {
-    if std::env::var_os("TCG_NO_X86_COALESCE_TUNING").is_some() {
-        crate::coalesce::CoalesceTuning::default()
-    } else {
-        crate::coalesce::CoalesceTuning::x86_64()
-    }
+    crate::coalesce::CoalesceTuning::x86_64()
 }
 
 /// Create an [`AllocConfig`] for x86-64 using the linear scan allocator.

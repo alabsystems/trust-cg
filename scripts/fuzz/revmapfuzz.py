@@ -120,7 +120,7 @@ def run(fn):
         results = {}
         for o in ("O0", "O3"):
             obj = os.path.join(d, f"{o}.o")
-            r = subprocess.run([TCG, "--format=text", "--target", "aarch64", f"-{o}",
+            r = subprocess.run([TCG, "--format=text", "--permit-unlicensed", "--target", "aarch64", f"-{o}",
                                 "-c", tf, "-o", obj], capture_output=True, text=True)
             if r.returncode != 0:
                 return ("COMPILE_ERR", r.stderr[:200])

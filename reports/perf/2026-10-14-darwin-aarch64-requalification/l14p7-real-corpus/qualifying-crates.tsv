@@ -1,0 +1,608 @@
+name	version	verdict	in_manifest	detail
+addr2line	0.25.1	excluded: crate requires dependencies ['gimli']	no	crate requires dependencies ['gimli']
+adler2	2.0.1	qualifies: default features	yes	
+aes	0.9.2	excluded: crate requires dependencies ['cipher', 'cpubits', 'cpufeatures']	no	crate requires dependencies ['cipher', 'cpubits', 'cpufeatures']
+ahash	0.8.12	excluded: crate has a build script	no	crate has a build script
+aho-corasick	1.1.5	qualifies: no default features	yes	feature 'dep:memchr' enables an optional dependency
+allocator-api2	0.2.21	qualifies: default features	no	
+android_system_properties	0.1.6	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+annotate-snippets	0.11.5	excluded: crate requires dependencies ['anstyle', 'unicode-width']	no	crate requires dependencies ['anstyle', 'unicode-width']
+annotate-snippets	0.12.16	excluded: crate requires dependencies ['anstyle', 'unicode-width']	no	crate requires dependencies ['anstyle', 'unicode-width']
+anstream	0.6.21	excluded: crate requires dependencies ['anstyle', 'anstyle-parse', 'colorchoice', 'is_terminal_polyfill', 'utf8parse']	no	crate requires dependencies ['anstyle', 'anstyle-parse', 'colorchoice', 'is_terminal_polyfill', 'utf8parse']
+anstream	1.0.0	excluded: crate requires dependencies ['anstyle', 'anstyle-parse', 'colorchoice', 'is_terminal_polyfill', 'utf8parse']	no	crate requires dependencies ['anstyle', 'anstyle-parse', 'colorchoice', 'is_terminal_polyfill', 'utf8parse']
+anstyle	1.0.14	qualifies: default features	no	
+anstyle-lossy	1.1.5	excluded: crate requires dependencies ['anstyle']	no	crate requires dependencies ['anstyle']
+anstyle-parse	0.2.7	qualifies: no default features	no	feature 'dep:utf8parse' enables an optional dependency
+anstyle-parse	1.0.0	qualifies: no default features	no	feature 'dep:utf8parse' enables an optional dependency
+anstyle-query	1.1.5	qualifies: default features	no	
+anstyle-svg	0.1.12	excluded: crate requires dependencies ['anstyle', 'anstyle-lossy', 'anstyle-parse', 'html-escape', 'unicode-width']	no	crate requires dependencies ['anstyle', 'anstyle-lossy', 'anstyle-parse', 'html-escape', 'unicode-width']
+anstyle-wincon	3.0.11	excluded: crate requires dependencies ['anstyle']	no	crate requires dependencies ['anstyle']
+anyhow	1.0.104	excluded: crate has a build script	no	crate has a build script
+ar_archive_writer	0.5.3	excluded: crate requires dependencies ['object']	no	crate requires dependencies ['object']
+arrayvec	0.7.8	qualifies: default features	yes	
+askama	0.16.0	excluded: crate requires dependencies ['itoa']	no	crate requires dependencies ['itoa']
+askama_derive	0.16.0	excluded: crate requires dependencies ['memchr', 'parser', 'proc-macro2', 'quote', 'rustc-hash', 'syn']	no	crate requires dependencies ['memchr', 'parser', 'proc-macro2', 'quote', 'rustc-hash', 'syn']
+askama_macros	0.16.0	excluded: proc-macro	no	
+askama_parser	0.16.0	excluded: crate requires dependencies ['rustc-hash', 'unicode-ident', 'winnow']	no	crate requires dependencies ['rustc-hash', 'unicode-ident', 'winnow']
+assert_cmd	2.2.2	excluded: crate has a build script	no	crate has a build script
+autocfg	1.5.1	qualifies: default features	no	
+az	1.3.0	qualifies: default features	no	
+backtrace	0.3.76	excluded: crate requires dependencies ['cfg-if', 'rustc-demangle']	no	crate requires dependencies ['cfg-if', 'rustc-demangle']
+base64	0.21.7	qualifies: default features	no	
+base64ct	1.8.3	qualifies: default features	no	
+basic-toml	0.1.10	excluded: crate requires dependencies ['serde']	no	crate requires dependencies ['serde']
+beef	0.5.2	qualifies: default features	no	
+bincode	1.3.3	excluded: crate requires dependencies ['serde']	no	crate requires dependencies ['serde']
+bincode	2.0.1	excluded: crate requires dependencies ['unty']	no	crate requires dependencies ['unty']
+bincode_derive	2.0.1	excluded: proc-macro	no	
+bit-set	0.8.0	excluded: crate requires dependencies ['bit-vec']	no	crate requires dependencies ['bit-vec']
+bit-vec	0.8.0	qualifies: default features	no	
+bitflags	1.3.2	qualifies: default features	no	
+bitflags	2.13.1	qualifies: default features	yes	
+blake3	1.8.7	excluded: crate has a build script	no	crate has a build script
+block-buffer	0.10.4	excluded: crate requires dependencies ['generic-array']	no	crate requires dependencies ['generic-array']
+block-buffer	0.12.1	excluded: crate requires dependencies ['hybrid-array']	no	crate requires dependencies ['hybrid-array']
+block2	0.6.2	excluded: crate requires dependencies ['objc2']	no	crate requires dependencies ['objc2']
+bstr	1.13.1	excluded: crate requires dependencies ['memchr']	no	crate requires dependencies ['memchr']
+bumpalo	3.20.3	qualifies: default features	no	
+bytecheck	0.8.2	excluded: archive not in the registry cache	no	
+bytecheck_derive	0.8.2	excluded: archive not in the registry cache	no	
+bytecount	0.6.9	qualifies: default features	no	
+bytemuck	1.25.2	qualifies: default features	no	
+bytemuck_derive	1.12.0	excluded: proc-macro	no	
+bytes	1.12.1	qualifies: default features	no	
+camino	1.2.5	excluded: crate has a build script	no	crate has a build script
+capstone	0.14.0	excluded: crate requires dependencies ['capstone-sys', 'static_assertions']	no	crate requires dependencies ['capstone-sys', 'static_assertions']
+capstone-sys	0.18.0	excluded: crate has a build script	no	crate has a build script
+cargo-manifest	0.19.1	excluded: crate requires dependencies ['serde', 'thiserror', 'toml']	no	crate requires dependencies ['serde', 'thiserror', 'toml']
+cargo-platform	0.1.9	excluded: crate requires dependencies ['serde']	no	crate requires dependencies ['serde']
+cargo-platform	0.2.0	excluded: crate requires dependencies ['serde']	no	crate requires dependencies ['serde']
+cargo-platform	0.3.1	excluded: crate requires dependencies ['serde']	no	crate requires dependencies ['serde']
+cargo-util-schemas	0.8.2	excluded: crate requires dependencies ['semver', 'serde', 'serde-untagged', 'serde-value', 'thiserror', 'toml', 'unicode-xid', 'url']	no	crate requires dependencies ['semver', 'serde', 'serde-untagged', 'serde-value', 'thiserror', 'toml', 'unicode-xid', 'url']
+cargo_metadata	0.18.1	excluded: crate requires dependencies ['camino', 'cargo-platform', 'semver', 'serde', 'serde_json', 'thiserror']	no	crate requires dependencies ['camino', 'cargo-platform', 'semver', 'serde', 'serde_json', 'thiserror']
+cargo_metadata	0.19.2	excluded: crate requires dependencies ['camino', 'cargo-platform', 'semver', 'serde', 'serde_json', 'thiserror']	no	crate requires dependencies ['camino', 'cargo-platform', 'semver', 'serde', 'serde_json', 'thiserror']
+cargo_metadata	0.21.0	excluded: crate requires dependencies ['camino', 'cargo-platform', 'cargo-util-schemas', 'semver', 'serde', 'serde_json', 'thiserror']	no	crate requires dependencies ['camino', 'cargo-platform', 'cargo-util-schemas', 'semver', 'serde', 'serde_json', 'thiserror']
+cargo_metadata	0.23.1	excluded: crate requires dependencies ['camino', 'cargo-platform', 'semver', 'serde', 'serde_json', 'thiserror']	no	crate requires dependencies ['camino', 'cargo-platform', 'semver', 'serde', 'serde_json', 'thiserror']
+cc	1.2.60	excluded: crate requires dependencies ['find-msvc-tools', 'shlex']	no	crate requires dependencies ['find-msvc-tools', 'shlex']
+cfg-if	1.0.4	qualifies: default features	no	
+cfg_aliases	0.2.2	qualifies: default features	no	
+chacha20	0.10.1	excluded: crate requires dependencies ['cfg-if', 'cpufeatures']	no	crate requires dependencies ['cfg-if', 'cpufeatures']
+chrono	0.4.45	excluded: crate requires dependencies ['num-traits']	no	crate requires dependencies ['num-traits']
+chrono-tz	0.10.4	excluded: crate has a build script	no	crate has a build script
+cipher	0.5.2	excluded: crate requires dependencies ['common', 'inout']	no	crate requires dependencies ['common', 'inout']
+clap	4.6.6	excluded: crate requires dependencies ['clap_builder']	no	crate requires dependencies ['clap_builder']
+clap-cargo	0.12.0	excluded: crate requires dependencies ['anstyle']	no	crate requires dependencies ['anstyle']
+clap_builder	4.6.6	excluded: crate requires dependencies ['anstyle', 'clap_lex']	no	crate requires dependencies ['anstyle', 'clap_lex']
+clap_derive	4.6.4	excluded: proc-macro	no	
+clap_lex	1.1.0	qualifies: default features	no	
+cmake	0.1.58	excluded: crate requires dependencies ['cc']	no	crate requires dependencies ['cc']
+cobs	0.3.0	excluded: crate requires dependencies ['thiserror']	no	crate requires dependencies ['thiserror']
+codespan-reporting	0.13.1	excluded: crate requires dependencies ['unicode-width']	no	crate requires dependencies ['unicode-width']
+color-eyre	0.6.5	excluded: crate requires dependencies ['backtrace', 'eyre', 'indenter', 'once_cell', 'owo-colors']	no	crate requires dependencies ['backtrace', 'eyre', 'indenter', 'once_cell', 'owo-colors']
+color-print	0.3.7	excluded: crate requires dependencies ['color-print-proc-macro']	no	crate requires dependencies ['color-print-proc-macro']
+color-print-proc-macro	0.3.7	excluded: proc-macro	no	
+color-spantrace	0.3.0	excluded: crate has a build script	no	crate has a build script
+colorchoice	1.0.5	qualifies: default features	no	
+colored	3.1.1	qualifies: default features	no	
+comma	1.0.0	qualifies: default features	no	
+console	0.16.4	qualifies: no default features	no	feature 'dep:libc' enables an optional dependency
+const-oid	0.10.2	qualifies: default features	no	
+const-oid	0.9.6	qualifies: default features	no	
+constant_time_eq	0.4.2	qualifies: default features	no	
+constant_time_eq	0.5.0	qualifies: default features	no	
+core-foundation-sys	0.8.7	qualifies: default features	no	
+cpubits	0.1.1	qualifies: default features	no	
+cpufeatures	0.2.17	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+cpufeatures	0.3.0	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+crc32fast	1.5.1	excluded: crate has a build script	no	crate has a build script
+crossbeam	0.8.4	excluded: crate requires dependencies ['crossbeam-utils']	no	crate requires dependencies ['crossbeam-utils']
+crossbeam-channel	0.5.16	excluded: crate requires dependencies ['crossbeam-utils']	no	crate requires dependencies ['crossbeam-utils']
+crossbeam-deque	0.8.7	excluded: crate has a build script	no	crate has a build script
+crossbeam-epoch	0.9.20	excluded: crate has a build script	no	crate has a build script
+crossbeam-queue	0.3.13	excluded: crate requires dependencies ['crossbeam-utils']	no	crate requires dependencies ['crossbeam-utils']
+crossbeam-utils	0.8.22	excluded: crate has a build script	no	crate has a build script
+crypto-common	0.1.7	excluded: crate requires dependencies ['generic-array', 'typenum']	no	crate requires dependencies ['generic-array', 'typenum']
+crypto-common	0.2.2	excluded: crate requires dependencies ['hybrid-array']	no	crate requires dependencies ['hybrid-array']
+ctrlc	3.5.2	excluded: crate requires dependencies ['dispatch2', 'nix']	no	crate requires dependencies ['dispatch2', 'nix']
+curl	0.4.50	excluded: crate has a build script	no	crate has a build script
+curl-sys	0.4.90+curl-8.21.0	excluded: crate has a build script	no	crate has a build script
+curve25519-dalek	4.1.3	excluded: crate has a build script	no	crate has a build script
+curve25519-dalek-derive	0.1.1	excluded: proc-macro	no	
+cxx	1.0.199	excluded: crate has a build script	no	crate has a build script
+cxx-build	1.0.199	excluded: crate requires dependencies ['cc', 'codespan-reporting', 'indexmap', 'proc-macro2', 'quote', 'scratch', 'syn']	no	crate requires dependencies ['cc', 'codespan-reporting', 'indexmap', 'proc-macro2', 'quote', 'scratch', 'syn']
+cxxbridge-cmd	1.0.199	excluded: archive not in the registry cache	no	
+cxxbridge-flags	1.0.199	qualifies: default features	no	
+cxxbridge-macro	1.0.199	excluded: proc-macro	no	
+darling	0.20.11	excluded: crate requires dependencies ['darling_core', 'darling_macro']	no	crate requires dependencies ['darling_core', 'darling_macro']
+darling	0.21.3	excluded: crate requires dependencies ['darling_core', 'darling_macro']	no	crate requires dependencies ['darling_core', 'darling_macro']
+darling_core	0.20.11	excluded: crate requires dependencies ['fnv', 'ident_case', 'proc-macro2', 'quote', 'syn']	no	crate requires dependencies ['fnv', 'ident_case', 'proc-macro2', 'quote', 'syn']
+darling_core	0.21.3	excluded: crate requires dependencies ['fnv', 'ident_case', 'proc-macro2', 'quote', 'syn']	no	crate requires dependencies ['fnv', 'ident_case', 'proc-macro2', 'quote', 'syn']
+darling_macro	0.20.11	excluded: proc-macro	no	
+darling_macro	0.21.3	excluded: proc-macro	no	
+datafrog	2.0.1	qualifies: default features	no	
+defmt	1.1.1	excluded: crate has a build script	no	crate has a build script
+defmt-macros	1.1.1	excluded: proc-macro	no	
+defmt-parser	1.0.0	excluded: crate requires dependencies ['thiserror']	no	crate requires dependencies ['thiserror']
+der	0.7.10	qualifies: default features	no	
+derive-where	1.6.1	excluded: proc-macro	no	
+derive_builder	0.20.2	excluded: crate requires dependencies ['derive_builder_macro']	no	crate requires dependencies ['derive_builder_macro']
+derive_builder_core	0.20.2	excluded: crate requires dependencies ['darling', 'proc-macro2', 'quote', 'syn']	no	crate requires dependencies ['darling', 'proc-macro2', 'quote', 'syn']
+derive_builder_macro	0.20.2	excluded: proc-macro	no	
+derive_setters	0.1.9	excluded: proc-macro	no	
+diff	0.1.13	qualifies: default features	no	
+difflib	0.4.0	qualifies: default features	no	
+digest	0.10.7	excluded: crate requires dependencies ['crypto-common']	no	crate requires dependencies ['crypto-common']
+digest	0.11.3	excluded: crate requires dependencies ['common']	no	crate requires dependencies ['common']
+directories	6.0.0	excluded: crate requires dependencies ['dirs-sys']	no	crate requires dependencies ['dirs-sys']
+dirs	6.0.0	excluded: crate requires dependencies ['dirs-sys']	no	crate requires dependencies ['dirs-sys']
+dirs-sys	0.5.0	excluded: crate requires dependencies ['libc', 'option-ext', 'redox_users']	no	crate requires dependencies ['libc', 'option-ext', 'redox_users']
+dispatch2	0.3.1	excluded: crate requires dependencies ['bitflags']	no	crate requires dependencies ['bitflags']
+displaydoc	0.2.7	excluded: proc-macro	no	
+dissimilar	1.0.11	qualifies: default features	no	
+dyn-clone	1.0.20	qualifies: default features	no	
+ed25519	2.2.3	excluded: crate requires dependencies ['signature']	no	crate requires dependencies ['signature']
+ed25519-dalek	2.2.0	excluded: crate requires dependencies ['curve25519-dalek', 'ed25519', 'sha2', 'subtle']	no	crate requires dependencies ['curve25519-dalek', 'ed25519', 'sha2', 'subtle']
+either	1.18.0	qualifies: default features	yes	
+elsa	1.11.2	excluded: crate requires dependencies ['stable_deref_trait']	no	crate requires dependencies ['stable_deref_trait']
+embedded-io	0.4.0	qualifies: default features	no	
+embedded-io	0.6.1	qualifies: default features	no	
+ena	0.14.4	excluded: crate requires dependencies ['log']	no	crate requires dependencies ['log']
+encode_unicode	1.0.0	qualifies: default features	no	
+env_filter	2.0.0	excluded: crate requires dependencies ['log']	no	crate requires dependencies ['log']
+env_logger	0.11.11	excluded: crate requires dependencies ['env_filter', 'log']	no	crate requires dependencies ['env_filter', 'log']
+equivalent	1.0.2	qualifies: default features	no	
+erased-serde	0.4.10	excluded: crate has a build script	no	crate has a build script
+errno	0.3.14	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+expect-test	1.5.1	excluded: crate requires dependencies ['dissimilar', 'once_cell']	no	crate requires dependencies ['dissimilar', 'once_cell']
+eyre	0.6.14	excluded: crate has a build script	no	crate has a build script
+fallible-iterator	0.3.0	qualifies: default features	no	
+fastrand	2.5.0	qualifies: default features	yes	
+fiat-crypto	0.2.9	qualifies: default features	no	
+filetime	0.2.29	excluded: crate requires dependencies ['cfg-if', 'libc']	no	crate requires dependencies ['cfg-if', 'libc']
+find-msvc-tools	0.1.11	qualifies: default features	no	
+fixedbitset	0.5.7	qualifies: default features	no	
+flate2	1.1.9	excluded: crate requires dependencies ['miniz_oxide']	no	crate requires dependencies ['miniz_oxide']
+fluent-bundle	0.16.0	excluded: crate requires dependencies ['fluent-langneg', 'fluent-syntax', 'intl-memoizer', 'intl_pluralrules', 'rustc-hash', 'self_cell', 'smallvec', 'unic-langid']	no	crate requires dependencies ['fluent-langneg', 'fluent-syntax', 'intl-memoizer', 'intl_pluralrules', 'rustc-hash', 'self_cell', 'smallvec', 'unic-langid']
+fluent-langneg	0.13.1	excluded: crate requires dependencies ['unic-langid']	no	crate requires dependencies ['unic-langid']
+fluent-syntax	0.12.0	excluded: crate requires dependencies ['memchr', 'thiserror']	no	crate requires dependencies ['memchr', 'thiserror']
+fnv	1.0.7	qualifies: default features	yes	
+foldhash	0.1.5	qualifies: default features	no	
+foldhash	0.2.0	qualifies: default features	yes	
+form_urlencoded	1.2.2	excluded: crate requires dependencies ['percent-encoding']	no	crate requires dependencies ['percent-encoding']
+fs-err	2.11.0	excluded: crate has a build script	no	crate has a build script
+fs2	0.4.3	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+fs_extra	1.3.0	qualifies: default features	no	
+futures-core	0.3.34	qualifies: default features	no	
+futures-task	0.3.34	qualifies: default features	no	
+futures-util	0.3.34	excluded: crate requires dependencies ['futures-core', 'futures-task', 'pin-project-lite']	no	crate requires dependencies ['futures-core', 'futures-task', 'pin-project-lite']
+generic-array	0.14.7	excluded: crate has a build script	no	crate has a build script
+getopts	0.2.24	qualifies: no default features	no	feature 'dep:unicode-width' enables an optional dependency
+getrandom	0.2.17	excluded: crate requires dependencies ['cfg-if', 'libc', 'wasi']	no	crate requires dependencies ['cfg-if', 'libc', 'wasi']
+getrandom	0.3.3	excluded: crate has a build script	no	crate has a build script
+getrandom	0.4.3	excluded: crate has a build script	no	crate has a build script
+gimli	0.31.1	qualifies: no default features	no	feature 'dep:indexmap' enables an optional dependency
+gimli	0.32.3	qualifies: no default features	no	feature 'dep:indexmap' enables an optional dependency
+git2	0.20.4	excluded: crate requires dependencies ['bitflags', 'libc', 'libgit2-sys', 'log', 'url']	no	crate requires dependencies ['bitflags', 'libc', 'libgit2-sys', 'log', 'url']
+glob	0.3.4	qualifies: default features	yes	
+globset	0.4.20	excluded: crate requires dependencies ['aho-corasick', 'bstr', 'regex-automata', 'regex-syntax']	no	crate requires dependencies ['aho-corasick', 'bstr', 'regex-automata', 'regex-syntax']
+gmp-mpfr-sys	1.7.1	excluded: crate has a build script	no	crate has a build script
+gsgdt	0.1.2	excluded: crate requires dependencies ['serde']	no	crate requires dependencies ['serde']
+hashbrown	0.15.5	qualifies: no default features	yes	feature 'equivalent' enables an optional dependency
+hashbrown	0.17.1	qualifies: no default features	no	feature 'equivalent' enables an optional dependency
+heck	0.5.0	qualifies: default features	yes	
+hermit-abi	0.5.2	qualifies: default features	no	
+hex	0.4.3	qualifies: default features	yes	
+hmac	0.12.1	excluded: crate requires dependencies ['digest']	no	crate requires dependencies ['digest']
+home	0.5.12	qualifies: default features	no	
+html-escape	0.2.15	qualifies: default features	no	
+html5ever	0.39.0	excluded: crate requires dependencies ['log', 'markup5ever']	no	crate requires dependencies ['log', 'markup5ever']
+httparse	1.10.1	excluded: crate has a build script	no	crate has a build script
+humansize	2.1.3	excluded: crate requires dependencies ['libm']	no	crate requires dependencies ['libm']
+humantime	2.4.0	qualifies: default features	no	
+hybrid-array	0.4.14	excluded: crate requires dependencies ['typenum']	no	crate requires dependencies ['typenum']
+iana-time-zone	0.1.65	excluded: crate requires dependencies ['android_system_properties', 'core-foundation-sys', 'iana-time-zone-haiku', 'js-sys', 'log', 'wasm-bindgen']	no	crate requires dependencies ['android_system_properties', 'core-foundation-sys', 'iana-time-zone-haiku', 'js-sys', 'log', 'wasm-bindgen']
+iana-time-zone-haiku	0.1.2	excluded: crate has a build script	no	crate has a build script
+icu_collections	2.3.0	excluded: crate requires dependencies ['displaydoc', 'potential_utf', 'utf8_iter', 'yoke', 'zerofrom', 'zerovec']	no	crate requires dependencies ['displaydoc', 'potential_utf', 'utf8_iter', 'yoke', 'zerofrom', 'zerovec']
+icu_list	2.3.0	excluded: crate requires dependencies ['icu_provider', 'regex-automata', 'writeable', 'zerovec']	no	crate requires dependencies ['icu_provider', 'regex-automata', 'writeable', 'zerovec']
+icu_locale	2.3.1	excluded: crate requires dependencies ['icu_collections', 'icu_locale_core', 'icu_locale_fallback', 'icu_provider', 'tinystr', 'zerovec']	no	crate requires dependencies ['icu_collections', 'icu_locale_core', 'icu_locale_fallback', 'icu_provider', 'tinystr', 'zerovec']
+icu_locale_core	2.3.0	excluded: crate requires dependencies ['displaydoc', 'litemap', 'tinystr', 'writeable']	no	crate requires dependencies ['displaydoc', 'litemap', 'tinystr', 'writeable']
+icu_locale_data	2.3.0	excluded: crate has a build script	no	crate has a build script
+icu_locale_fallback	2.3.0	excluded: crate requires dependencies ['icu_locale_core', 'icu_provider', 'potential_utf', 'tinystr', 'zerovec']	no	crate requires dependencies ['icu_locale_core', 'icu_provider', 'potential_utf', 'tinystr', 'zerovec']
+icu_locale_fallback_data	2.3.0	excluded: crate has a build script	no	crate has a build script
+icu_normalizer	2.3.0	excluded: crate requires dependencies ['icu_collections', 'icu_provider', 'smallvec', 'zerovec']	no	crate requires dependencies ['icu_collections', 'icu_provider', 'smallvec', 'zerovec']
+icu_normalizer_data	2.3.0	excluded: crate has a build script	no	crate has a build script
+icu_properties	2.3.0	excluded: crate requires dependencies ['displaydoc', 'icu_collections', 'icu_locale_core', 'icu_provider', 'zerotrie', 'zerovec']	no	crate requires dependencies ['displaydoc', 'icu_collections', 'icu_locale_core', 'icu_provider', 'zerotrie', 'zerovec']
+icu_properties_data	2.3.0	excluded: crate has a build script	no	crate has a build script
+icu_provider	2.3.1	excluded: crate requires dependencies ['displaydoc', 'icu_locale_core', 'yoke', 'zerofrom', 'zerovec']	no	crate requires dependencies ['displaydoc', 'icu_locale_core', 'yoke', 'zerofrom', 'zerovec']
+id-arena	2.3.0	qualifies: default features	no	
+ident_case	1.0.1	qualifies: default features	no	
+idna	1.1.0	excluded: crate requires dependencies ['idna_adapter', 'smallvec', 'utf8_iter']	no	crate requires dependencies ['idna_adapter', 'smallvec', 'utf8_iter']
+idna_adapter	1.2.2	excluded: crate requires dependencies ['icu_normalizer', 'icu_properties']	no	crate requires dependencies ['icu_normalizer', 'icu_properties']
+ignore	0.4.33	excluded: crate requires dependencies ['crossbeam-deque', 'globset', 'log', 'memchr', 'regex-automata', 'same-file', 'walkdir']	no	crate requires dependencies ['crossbeam-deque', 'globset', 'log', 'memchr', 'regex-automata', 'same-file', 'walkdir']
+indenter	0.3.4	qualifies: default features	no	
+indexmap	2.14.0	excluded: crate requires dependencies ['equivalent', 'hashbrown']	no	crate requires dependencies ['equivalent', 'hashbrown']
+indicatif	0.18.6	excluded: crate requires dependencies ['console', 'portable-atomic', 'unit-prefix']	no	crate requires dependencies ['console', 'portable-atomic', 'unit-prefix']
+indoc	1.0.9	excluded: proc-macro	no	
+inout	0.2.2	excluded: crate requires dependencies ['hybrid-array']	no	crate requires dependencies ['hybrid-array']
+intl-memoizer	0.5.3	excluded: crate requires dependencies ['type-map', 'unic-langid']	no	crate requires dependencies ['type-map', 'unic-langid']
+intl_pluralrules	7.0.2	excluded: crate requires dependencies ['unic-langid']	no	crate requires dependencies ['unic-langid']
+inventory	0.3.24	excluded: crate requires dependencies ['rustversion']	no	crate requires dependencies ['rustversion']
+ipc-channel	0.22.0	excluded: crate requires dependencies ['crossbeam-channel', 'libc', 'mio', 'postcard', 'rand', 'rustc-hash', 'serde_core', 'tempfile', 'thiserror', 'uuid']	no	crate requires dependencies ['crossbeam-channel', 'libc', 'mio', 'postcard', 'rand', 'rustc-hash', 'serde_core', 'tempfile', 'thiserror', 'uuid']
+is_terminal_polyfill	1.70.2	qualifies: default features	no	
+itertools	0.12.1	excluded: crate requires dependencies ['either']	no	crate requires dependencies ['either']
+itertools	0.15.0	excluded: crate requires dependencies ['either']	no	crate requires dependencies ['either']
+itoa	1.0.18	qualifies: default features	yes	
+jiff	0.2.35	excluded: crate requires dependencies ['jcore', 'jiff-static', 'portable-atomic', 'portable-atomic-util']	no	crate requires dependencies ['jcore', 'jiff-static', 'portable-atomic', 'portable-atomic-util']
+jiff-core	0.1.0	qualifies: default features	no	
+jiff-static	0.2.35	excluded: proc-macro	no	
+jobserver	0.1.35	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+js-sys	0.3.104	excluded: crate requires dependencies ['cfg-if', 'wasm-bindgen']	no	crate requires dependencies ['cfg-if', 'wasm-bindgen']
+jsonpath-rust	1.0.10	excluded: archive not in the registry cache	no	
+lazy_static	1.5.0	qualifies: default features	no	
+leb128	0.2.7	qualifies: default features	no	
+leb128fmt	0.1.0	qualifies: default features	no	
+levenshtein	1.0.5	qualifies: default features	no	
+lexopt	0.3.2	qualifies: default features	no	
+libc	0.2.189	excluded: crate has a build script	no	crate has a build script
+libffi	5.2.0	excluded: crate requires dependencies ['libc', 'libffi-sys']	no	crate requires dependencies ['libc', 'libffi-sys']
+libffi-sys	4.2.1	excluded: crate has a build script	no	crate has a build script
+libgit2-sys	0.18.8+1.9.7	excluded: archive not in the registry cache	no	
+libloading	0.8.9	excluded: crate requires dependencies ['cfg-if']	no	crate requires dependencies ['cfg-if']
+libloading	0.9.0	excluded: crate requires dependencies ['cfg-if']	no	crate requires dependencies ['cfg-if']
+libm	0.2.16	excluded: crate has a build script	no	crate has a build script
+libredox	0.1.20	excluded: archive not in the registry cache	no	
+libz-sys	1.1.29	excluded: crate has a build script	no	crate has a build script
+link-cplusplus	1.0.12	excluded: crate has a build script	no	crate has a build script
+linux-raw-sys	0.12.1	qualifies: default features	no	
+litemap	0.8.3	qualifies: default features	no	
+lock_api	0.4.14	excluded: crate requires dependencies ['scopeguard']	no	crate requires dependencies ['scopeguard']
+log	0.4.34	qualifies: default features	no	
+logos	0.15.1	qualifies: no default features	no	feature 'logos-derive' enables an optional dependency
+logos-codegen	0.15.1	excluded: crate has a build script	no	crate has a build script
+logos-derive	0.15.1	excluded: proc-macro	no	
+lz4_flex	0.13.1	qualifies: no default features	no	feature 'dep:twox-hash' enables an optional dependency
+lzma-sys	0.1.20	excluded: crate has a build script	no	crate has a build script
+markup5ever	0.39.0	excluded: crate requires dependencies ['log', 'tendril', 'web_atoms']	no	crate requires dependencies ['log', 'tendril', 'web_atoms']
+matchers	0.2.0	excluded: crate requires dependencies ['regex-automata']	no	crate requires dependencies ['regex-automata']
+md-5	0.10.6	excluded: crate requires dependencies ['cfg-if', 'digest']	no	crate requires dependencies ['cfg-if', 'digest']
+measureme	12.0.3	excluded: crate requires dependencies ['log', 'memmap2', 'parking_lot', 'perf-event-open-sys', 'rustc-hash', 'smallvec']	no	crate requires dependencies ['log', 'memmap2', 'parking_lot', 'perf-event-open-sys', 'rustc-hash', 'smallvec']
+memchr	2.8.3	qualifies: default features	yes	path package in the lock; crates.io archive at its version
+memmap2	0.2.3	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+minifier	0.3.6	qualifies: no default features	no	feature 'clap' enables an optional dependency
+minimal-lexical	0.2.1	qualifies: default features	yes	
+miniz_oxide	0.8.9	excluded: crate requires dependencies ['adler2']	no	crate requires dependencies ['adler2']
+mio	1.2.2	excluded: crate requires dependencies ['libc', 'wasi']	no	crate requires dependencies ['libc', 'wasi']
+miow	0.6.1	excluded: crate requires dependencies ['windows-sys']	no	crate requires dependencies ['windows-sys']
+munge	0.4.7	excluded: archive not in the registry cache	no	
+munge_macro	0.4.7	excluded: archive not in the registry cache	no	
+new_debug_unreachable	1.0.6	qualifies: default features	no	
+nix	0.30.1	excluded: crate has a build script	no	crate has a build script
+nix	0.31.3	excluded: crate has a build script	no	crate has a build script
+nom	7.1.3	excluded: crate requires dependencies ['memchr', 'minimal-lexical']	no	crate requires dependencies ['memchr', 'minimal-lexical']
+normpath	1.5.1	qualifies: default features	no	
+nu-ansi-term	0.50.3	qualifies: default features	no	
+num	0.4.3	excluded: crate requires dependencies ['num-complex', 'num-integer', 'num-iter', 'num-rational', 'num-traits']	no	crate requires dependencies ['num-complex', 'num-integer', 'num-iter', 'num-rational', 'num-traits']
+num-bigint	0.4.8	excluded: crate requires dependencies ['num-integer', 'num-traits']	no	crate requires dependencies ['num-integer', 'num-traits']
+num-complex	0.4.6	excluded: crate requires dependencies ['num-traits']	no	crate requires dependencies ['num-traits']
+num-integer	0.1.47	excluded: crate requires dependencies ['num-traits']	no	crate requires dependencies ['num-traits']
+num-iter	0.1.46	excluded: crate requires dependencies ['num-integer', 'num-traits']	no	crate requires dependencies ['num-integer', 'num-traits']
+num-rational	0.4.2	excluded: crate requires dependencies ['num-integer', 'num-traits']	no	crate requires dependencies ['num-integer', 'num-traits']
+num-traits	0.2.19	excluded: crate has a build script	no	crate has a build script
+num_cpus	1.17.0	excluded: crate requires dependencies ['hermit-abi']	no	crate requires dependencies ['hermit-abi']
+objc2	0.6.4	excluded: crate has a build script	no	crate has a build script
+objc2-cloud-kit	0.3.2	excluded: crate requires dependencies ['objc2', 'objc2-foundation']	no	crate requires dependencies ['objc2', 'objc2-foundation']
+objc2-core-data	0.3.2	excluded: crate requires dependencies ['objc2', 'objc2-foundation']	no	crate requires dependencies ['objc2', 'objc2-foundation']
+objc2-core-foundation	0.3.2	qualifies: no default features	no	feature 'dep:objc2' enables an optional dependency
+objc2-core-graphics	0.3.2	excluded: crate requires dependencies ['objc2-core-foundation']	no	crate requires dependencies ['objc2-core-foundation']
+objc2-core-image	0.3.2	excluded: crate requires dependencies ['objc2', 'objc2-foundation']	no	crate requires dependencies ['objc2', 'objc2-foundation']
+objc2-core-location	0.3.2	excluded: crate requires dependencies ['objc2', 'objc2-foundation']	no	crate requires dependencies ['objc2', 'objc2-foundation']
+objc2-core-text	0.3.2	excluded: crate requires dependencies ['objc2-core-foundation']	no	crate requires dependencies ['objc2-core-foundation']
+objc2-encode	4.1.0	qualifies: default features	no	
+objc2-foundation	0.3.2	excluded: crate requires dependencies ['objc2']	no	crate requires dependencies ['objc2']
+objc2-io-kit	0.3.2	excluded: crate requires dependencies ['objc2-core-foundation']	no	crate requires dependencies ['objc2-core-foundation']
+objc2-io-surface	0.3.2	qualifies: no default features	no	feature 'dep:objc2-foundation' enables an optional dependency
+objc2-quartz-core	0.3.2	excluded: crate requires dependencies ['objc2', 'objc2-foundation']	no	crate requires dependencies ['objc2', 'objc2-foundation']
+objc2-ui-kit	0.3.2	excluded: crate requires dependencies ['objc2', 'objc2-foundation']	no	crate requires dependencies ['objc2', 'objc2-foundation']
+objc2-user-notifications	0.3.2	excluded: crate requires dependencies ['objc2', 'objc2-foundation']	no	crate requires dependencies ['objc2', 'objc2-foundation']
+object	0.36.7	excluded: crate has a build script	no	crate has a build script
+object	0.37.3	excluded: crate has a build script	no	crate has a build script
+object	0.39.1	excluded: crate has a build script	no	crate has a build script
+odht	0.3.1	excluded: crate requires dependencies ['cfg-if']	no	crate requires dependencies ['cfg-if']
+once_cell	1.21.4	qualifies: default features	no	
+once_cell_polyfill	1.70.2	qualifies: default features	no	
+opener	0.8.5	excluded: crate requires dependencies ['bstr']	no	crate requires dependencies ['bstr']
+openssl-probe	0.1.6	qualifies: default features	no	
+openssl-sys	0.9.117	excluded: crate has a build script	no	crate has a build script
+option-ext	0.2.0	qualifies: default features	no	
+ordered-float	2.10.1	excluded: crate requires dependencies ['num-traits']	no	crate requires dependencies ['num-traits']
+os_info	3.15.0	excluded: crate requires dependencies ['android_system_properties', 'log', 'nix', 'objc2', 'objc2-foundation', 'objc2-ui-kit']	no	crate requires dependencies ['android_system_properties', 'log', 'nix', 'objc2', 'objc2-foundation', 'objc2-ui-kit']
+owo-colors	4.3.0	excluded: crate has a build script	no	crate has a build script
+papergrid	0.11.0	excluded: crate requires dependencies ['bytecount', 'fnv', 'unicode-width']	no	crate requires dependencies ['bytecount', 'fnv', 'unicode-width']
+parking_lot	0.12.5	excluded: crate requires dependencies ['lock_api', 'parking_lot_core']	no	crate requires dependencies ['lock_api', 'parking_lot_core']
+parking_lot_core	0.9.12	excluded: crate has a build script	no	crate has a build script
+pathdiff	0.2.3	qualifies: default features	no	
+percent-encoding	2.3.2	qualifies: default features	yes	
+perf-event-open-sys	3.0.0	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+pest	2.9.0	excluded: crate requires dependencies ['ucd-trie']	no	crate requires dependencies ['ucd-trie']
+pest_derive	2.9.0	excluded: proc-macro	no	
+pest_generator	2.9.0	excluded: crate requires dependencies ['pest', 'pest_meta', 'proc-macro2', 'quote', 'syn']	no	crate requires dependencies ['pest', 'pest_meta', 'proc-macro2', 'quote', 'syn']
+pest_meta	2.9.0	excluded: crate requires dependencies ['pest']	no	crate requires dependencies ['pest']
+phf	0.12.1	excluded: crate requires dependencies ['phf_shared']	no	crate requires dependencies ['phf_shared']
+phf	0.13.1	excluded: crate requires dependencies ['phf_shared']	no	crate requires dependencies ['phf_shared']
+phf_codegen	0.13.1	excluded: crate requires dependencies ['phf_generator', 'phf_shared']	no	crate requires dependencies ['phf_generator', 'phf_shared']
+phf_generator	0.13.1	excluded: crate requires dependencies ['fastrand', 'phf_shared']	no	crate requires dependencies ['fastrand', 'phf_shared']
+phf_shared	0.12.1	excluded: crate requires dependencies ['siphasher']	no	crate requires dependencies ['siphasher']
+phf_shared	0.13.1	excluded: crate requires dependencies ['siphasher']	no	crate requires dependencies ['siphasher']
+pin-project-lite	0.2.17	qualifies: default features	no	
+pkcs8	0.10.2	excluded: crate requires dependencies ['der', 'spki']	no	crate requires dependencies ['der', 'spki']
+pkg-config	0.3.34	qualifies: default features	no	
+polonius-engine	0.13.0	excluded: crate requires dependencies ['datafrog', 'log', 'rustc-hash']	no	crate requires dependencies ['datafrog', 'log', 'rustc-hash']
+portable-atomic	1.15.0	excluded: crate has a build script	no	crate has a build script
+portable-atomic-util	0.2.7	excluded: crate has a build script	no	crate has a build script
+postcard	1.1.3	excluded: crate requires dependencies ['cobs', 'serde']	no	crate requires dependencies ['cobs', 'serde']
+potential_utf	0.1.6	qualifies: default features	no	
+ppv-lite86	0.2.21	excluded: crate requires dependencies ['zerocopy']	no	crate requires dependencies ['zerocopy']
+precomputed-hash	0.1.1	qualifies: default features	no	
+predicates	3.1.4	excluded: crate requires dependencies ['anstyle', 'predicates-core']	no	crate requires dependencies ['anstyle', 'predicates-core']
+predicates-core	1.0.10	qualifies: default features	no	
+predicates-tree	1.0.13	excluded: crate requires dependencies ['predicates-core', 'termtree']	no	crate requires dependencies ['predicates-core', 'termtree']
+prettydiff	0.9.0	excluded: crate requires dependencies ['owo-colors']	no	crate requires dependencies ['owo-colors']
+proc-macro-crate	3.5.0	excluded: crate requires dependencies ['toml_edit']	no	crate requires dependencies ['toml_edit']
+proc-macro-hack	0.5.20+deprecated	excluded: proc-macro	no	
+proc-macro2	1.0.107	excluded: crate has a build script	no	crate has a build script
+proptest	1.11.0	excluded: crate requires dependencies ['bitflags', 'num-traits', 'rand', 'rand_chacha', 'rand_xorshift', 'unarray']	no	crate requires dependencies ['bitflags', 'num-traits', 'rand', 'rand_chacha', 'rand_xorshift', 'unarray']
+psm	0.1.32	excluded: crate has a build script	no	crate has a build script
+ptr_meta	0.3.1	excluded: archive not in the registry cache	no	
+ptr_meta_derive	0.3.1	excluded: archive not in the registry cache	no	
+pulldown-cmark	0.11.3	excluded: crate has a build script	no	crate has a build script
+pulldown-cmark-escape	0.11.0	qualifies: default features	no	
+punycode	0.4.1	qualifies: default features	no	
+quick-error	1.2.3	qualifies: default features	no	
+quine-mc_cluskey	0.2.4	qualifies: default features	no	
+quote	1.0.47	excluded: crate has a build script	no	crate has a build script
+r-efi	5.3.0	qualifies: default features	no	
+r-efi	6.0.0	qualifies: default features	no	
+rancor	0.1.1	excluded: archive not in the registry cache	no	
+rand	0.10.2	excluded: crate requires dependencies ['rand_core']	no	crate requires dependencies ['rand_core']
+rand	0.9.5	excluded: crate requires dependencies ['rand_core']	no	crate requires dependencies ['rand_core']
+rand_chacha	0.9.0	excluded: crate requires dependencies ['ppv-lite86', 'rand_core']	no	crate requires dependencies ['ppv-lite86', 'rand_core']
+rand_core	0.10.1	qualifies: default features	no	
+rand_core	0.6.4	qualifies: default features	no	
+rand_core	0.9.5	qualifies: default features	no	
+rand_xorshift	0.4.0	excluded: crate requires dependencies ['rand_core']	no	crate requires dependencies ['rand_core']
+rand_xoshiro	0.7.0	excluded: crate requires dependencies ['rand_core']	no	crate requires dependencies ['rand_core']
+rayon	1.12.0	excluded: crate requires dependencies ['either', 'rayon-core']	no	crate requires dependencies ['either', 'rayon-core']
+rayon-core	1.13.0	excluded: crate has a build script	no	crate has a build script
+redox_syscall	0.5.18	excluded: crate requires dependencies ['bitflags']	no	crate requires dependencies ['bitflags']
+redox_users	0.5.2	excluded: crate requires dependencies ['getrandom', 'libredox', 'thiserror']	no	crate requires dependencies ['getrandom', 'libredox', 'thiserror']
+ref-cast	1.0.27	excluded: crate has a build script	no	crate has a build script
+ref-cast-impl	1.0.27	excluded: proc-macro	no	
+regex	1.13.1	excluded: crate requires dependencies ['regex-automata', 'regex-syntax']	no	crate requires dependencies ['regex-automata', 'regex-syntax']
+regex-automata	0.4.18	qualifies: no default features	no	feature 'dep:regex-syntax' enables an optional dependency
+regex-lite	0.1.9	qualifies: default features	no	
+regex-syntax	0.8.11	qualifies: default features	yes	
+rend	0.5.3	excluded: archive not in the registry cache	no	
+rkyv	0.8.16	excluded: archive not in the registry cache	no	
+rkyv_derive	0.8.16	excluded: archive not in the registry cache	no	
+rug	1.30.0	excluded: crate has a build script	no	crate has a build script
+rustc-build-sysroot	0.5.13	excluded: crate requires dependencies ['anyhow', 'rustc_version', 'tempfile', 'toml', 'walkdir']	no	crate requires dependencies ['anyhow', 'rustc_version', 'tempfile', 'toml', 'walkdir']
+rustc-demangle	0.1.28	qualifies: default features	no	
+rustc-hash	1.1.0	qualifies: default features	no	
+rustc-hash	2.1.2	qualifies: default features	yes	path package in the lock; crates.io archive at its version
+rustc-literal-escaper	0.0.8	qualifies: default features	no	
+rustc-semver	1.1.0	qualifies: default features	no	
+rustc-stable-hash	0.1.2	qualifies: default features	no	
+rustc-std-workspace-core	1.0.1	excluded: archive not in the registry cache	no	
+rustc_apfloat	0.2.3+llvm-462a31f5a5ab	excluded: crate has a build script	no	crate has a build script
+rustc_tools_util	0.4.2	qualifies: default features	no	path package in the lock; crates.io archive at its version
+rustc_tools_util	0.4.2	qualifies: default features	no	
+rustc_version	0.4.1	excluded: crate requires dependencies ['semver']	no	crate requires dependencies ['semver']
+rustdoc-json-stable	0.9.7	excluded: crate requires dependencies ['cargo-manifest', 'cargo_metadata', 'serde', 'thiserror', 'toml', 'tracing']	no	crate requires dependencies ['cargo-manifest', 'cargo_metadata', 'serde', 'thiserror', 'toml', 'tracing']
+rustdoc-types	0.57.4	excluded: crate requires dependencies ['serde', 'serde_derive']	no	crate requires dependencies ['serde', 'serde_derive']
+rustfix	0.8.7	excluded: crate requires dependencies ['serde', 'serde_json', 'thiserror', 'tracing']	no	crate requires dependencies ['serde', 'serde_json', 'thiserror', 'tracing']
+rustix	1.1.4	excluded: crate has a build script	no	crate has a build script
+rustversion	1.0.23	excluded: proc-macro	no	
+rusty-fork	0.3.1	excluded: crate requires dependencies ['fnv', 'quick-error', 'tempfile']	no	crate requires dependencies ['fnv', 'quick-error', 'tempfile']
+ruzstd	0.7.3	qualifies: no default features	no	feature 'dep:twox-hash' enables an optional dependency
+ruzstd	0.8.3	qualifies: no default features	no	feature 'dep:twox-hash' enables an optional dependency
+same-file	1.0.6	qualifies: default features	yes	
+schannel	0.1.29	excluded: crate requires dependencies ['windows-sys']	no	crate requires dependencies ['windows-sys']
+schemars	1.2.2	excluded: crate requires dependencies ['dyn-clone', 'ref-cast', 'serde', 'serde_json']	no	crate requires dependencies ['dyn-clone', 'ref-cast', 'serde', 'serde_json']
+schemars_derive	1.2.2	excluded: proc-macro	no	
+scoped-tls	1.0.1	qualifies: default features	no	
+scopeguard	1.2.0	qualifies: default features	yes	
+scratch	1.0.9	excluded: crate has a build script	no	crate has a build script
+self_cell	1.3.0	qualifies: default features	no	
+semver	1.0.28	qualifies: default features	no	
+serde	1.0.229	excluded: crate has a build script	no	crate has a build script
+serde-untagged	0.1.9	excluded: crate requires dependencies ['erased-serde', 'serde', 'serde_core', 'typeid']	no	crate requires dependencies ['erased-serde', 'serde', 'serde_core', 'typeid']
+serde-value	0.7.0	excluded: crate requires dependencies ['ordered-float', 'serde']	no	crate requires dependencies ['ordered-float', 'serde']
+serde_core	1.0.229	excluded: crate has a build script	no	crate has a build script
+serde_derive	1.0.229	excluded: proc-macro	no	
+serde_derive_internals	0.30.0	excluded: crate requires dependencies ['proc-macro2', 'quote', 'syn']	no	crate requires dependencies ['proc-macro2', 'quote', 'syn']
+serde_json	1.0.151	excluded: crate has a build script	no	crate has a build script
+serde_path_to_error	0.1.20	excluded: crate requires dependencies ['itoa', 'serde', 'serde_core']	no	crate requires dependencies ['itoa', 'serde', 'serde_core']
+serde_spanned	0.6.9	qualifies: default features	no	
+serde_spanned	1.1.1	qualifies: no default features	no	feature 'dep:serde_core' enables an optional dependency
+sha1	0.10.7	excluded: crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']	no	crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']
+sha2	0.10.9	excluded: crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']	no	crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']
+sha2	0.10.9	excluded: crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']	no	crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']
+sha2	0.11.0	excluded: crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']	no	crate requires dependencies ['cfg-if', 'cpufeatures', 'digest']
+sha2-asm	0.6.4	excluded: crate has a build script	no	crate has a build script
+sharded-slab	0.1.7	excluded: crate requires dependencies ['lazy_static']	no	crate requires dependencies ['lazy_static']
+shlex	1.3.0	qualifies: default features	no	
+signal-hook	0.3.18	excluded: crate has a build script	no	crate has a build script
+signal-hook-registry	1.4.8	excluded: crate requires dependencies ['errno', 'libc']	no	crate requires dependencies ['errno', 'libc']
+signature	2.2.0	qualifies: default features	no	
+simd-adler32	0.3.10	qualifies: default features	no	
+simdutf8	0.1.5	qualifies: default features	no	
+similar	2.7.0	qualifies: default features	no	
+siphasher	1.0.3	qualifies: default features	yes	
+slab	0.4.12	qualifies: default features	no	
+smallvec	1.15.2	qualifies: default features	yes	
+socket2	0.6.5	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+spanned	0.4.1	excluded: crate requires dependencies ['anyhow', 'bstr', 'color-eyre']	no	crate requires dependencies ['anyhow', 'bstr', 'color-eyre']
+spki	0.7.3	excluded: crate requires dependencies ['der']	no	crate requires dependencies ['der']
+stable_deref_trait	1.2.1	qualifies: default features	no	
+stacker	0.1.25	excluded: crate has a build script	no	crate has a build script
+static_assertions	1.1.0	qualifies: default features	no	
+string_cache	0.9.0	excluded: crate requires dependencies ['new_debug_unreachable', 'parking_lot', 'phf_shared', 'precomputed-hash']	no	crate requires dependencies ['new_debug_unreachable', 'parking_lot', 'phf_shared', 'precomputed-hash']
+string_cache_codegen	0.6.1	excluded: crate requires dependencies ['phf_generator', 'phf_shared', 'proc-macro2', 'quote']	no	crate requires dependencies ['phf_generator', 'phf_shared', 'proc-macro2', 'quote']
+stringdex	0.0.6	excluded: crate requires dependencies ['stacker']	no	crate requires dependencies ['stacker']
+strsim	0.11.1	qualifies: default features	yes	
+subtle	2.6.1	qualifies: default features	no	
+syn	2.0.119	excluded: crate requires dependencies ['proc-macro2', 'unicode-ident']	no	crate requires dependencies ['proc-macro2', 'unicode-ident']
+syn	3.0.4	excluded: crate requires dependencies ['proc-macro2', 'unicode-ident']	no	crate requires dependencies ['proc-macro2', 'unicode-ident']
+synstructure	0.13.2	excluded: crate requires dependencies ['proc-macro2', 'quote', 'syn']	no	crate requires dependencies ['proc-macro2', 'quote', 'syn']
+sysinfo	0.39.6	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+tabled	0.15.0	excluded: crate requires dependencies ['papergrid', 'unicode-width']	no	crate requires dependencies ['papergrid', 'unicode-width']
+tar	0.4.46	excluded: crate requires dependencies ['filetime', 'libc']	no	crate requires dependencies ['filetime', 'libc']
+tempfile	3.27.0	excluded: crate requires dependencies ['fastrand', 'once_cell', 'rustix']	no	crate requires dependencies ['fastrand', 'once_cell', 'rustix']
+tendril	0.5.1	excluded: crate requires dependencies ['new_debug_unreachable']	no	crate requires dependencies ['new_debug_unreachable']
+term	1.2.1	qualifies: default features	no	
+termcolor	1.4.1	qualifies: default features	yes	
+termize	0.2.1	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+termtree	0.5.1	qualifies: default features	no	
+thin-vec	0.2.19	qualifies: default features	no	
+thiserror	1.0.69	excluded: crate has a build script	no	crate has a build script
+thiserror	2.0.20	excluded: crate has a build script	no	crate has a build script
+thiserror-impl	1.0.69	excluded: proc-macro	no	
+thiserror-impl	2.0.20	excluded: proc-macro	no	
+thorin-dwp	0.9.0	excluded: crate requires dependencies ['gimli', 'hashbrown', 'object', 'tracing']	no	crate requires dependencies ['gimli', 'hashbrown', 'object', 'tracing']
+thread_local	1.1.10	excluded: crate requires dependencies ['cfg-if']	no	crate requires dependencies ['cfg-if']
+threadpool	1.8.1	excluded: crate requires dependencies ['num_cpus']	no	crate requires dependencies ['num_cpus']
+tikv-jemalloc-sys	0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7	excluded: archive not in the registry cache	no	
+tinystr	0.8.4	excluded: crate requires dependencies ['displaydoc']	no	crate requires dependencies ['displaydoc']
+tinyvec	1.12.0	qualifies: default features	no	
+tinyvec_macros	0.1.1	qualifies: default features	no	
+tokio	1.53.1	excluded: crate requires dependencies ['pin-project-lite']	no	crate requires dependencies ['pin-project-lite']
+tokio-macros	2.7.2	excluded: proc-macro	no	
+toml	0.7.8	excluded: crate requires dependencies ['serde', 'serde_spanned', 'toml_datetime']	no	crate requires dependencies ['serde', 'serde_spanned', 'toml_datetime']
+toml	0.8.23	excluded: crate requires dependencies ['serde', 'serde_spanned', 'toml_datetime']	no	crate requires dependencies ['serde', 'serde_spanned', 'toml_datetime']
+toml	0.9.12+spec-1.1.0	excluded: crate requires dependencies ['serde_spanned', 'toml_datetime']	no	crate requires dependencies ['serde_spanned', 'toml_datetime']
+toml	1.1.4+spec-1.1.0	excluded: crate requires dependencies ['serde_spanned', 'toml_datetime']	no	crate requires dependencies ['serde_spanned', 'toml_datetime']
+toml_datetime	0.6.11	qualifies: default features	no	
+toml_datetime	0.7.5+spec-1.1.0	qualifies: default features	no	
+toml_datetime	1.1.1+spec-1.1.0	qualifies: default features	no	
+toml_edit	0.19.15	excluded: crate requires dependencies ['indexmap', 'toml_datetime', 'winnow']	no	crate requires dependencies ['indexmap', 'toml_datetime', 'winnow']
+toml_edit	0.22.27	excluded: crate requires dependencies ['indexmap', 'toml_datetime']	no	crate requires dependencies ['indexmap', 'toml_datetime']
+toml_edit	0.25.13+spec-1.1.0	excluded: crate requires dependencies ['indexmap', 'toml_datetime']	no	crate requires dependencies ['indexmap', 'toml_datetime']
+toml_parser	1.1.3+spec-1.1.0	excluded: crate requires dependencies ['winnow']	no	crate requires dependencies ['winnow']
+toml_write	0.1.2	qualifies: default features	no	
+toml_writer	1.1.2+spec-1.1.0	qualifies: default features	no	
+tracing	0.1.44	excluded: crate requires dependencies ['pin-project-lite', 'tracing-core']	no	crate requires dependencies ['pin-project-lite', 'tracing-core']
+tracing-attributes	0.1.31	excluded: proc-macro	no	
+tracing-core	0.1.36	qualifies: no default features	no	feature 'once_cell' enables an optional dependency
+tracing-error	0.2.1	excluded: crate requires dependencies ['tracing', 'tracing-subscriber']	no	crate requires dependencies ['tracing', 'tracing-subscriber']
+tracing-log	0.2.0	excluded: crate requires dependencies ['log', 'once_cell', 'tracing-core']	no	crate requires dependencies ['log', 'once_cell', 'tracing-core']
+tracing-serde	0.2.0	excluded: crate requires dependencies ['serde', 'tracing-core']	no	crate requires dependencies ['serde', 'tracing-core']
+tracing-subscriber	0.3.23	excluded: crate requires dependencies ['tracing-core']	no	crate requires dependencies ['tracing-core']
+tracing-tree	0.3.1	excluded: crate requires dependencies ['nu-ansi-term', 'tracing-core', 'tracing-subscriber']	no	crate requires dependencies ['nu-ansi-term', 'tracing-core', 'tracing-subscriber']
+twox-hash	1.6.3	excluded: crate requires dependencies ['cfg-if', 'static_assertions']	no	crate requires dependencies ['cfg-if', 'static_assertions']
+twox-hash	2.1.3	qualifies: no default features	no	feature 'dep:rand' enables an optional dependency
+type-map	0.5.1	excluded: crate requires dependencies ['rustc-hash']	no	crate requires dependencies ['rustc-hash']
+typeid	1.0.3	excluded: crate has a build script	no	crate has a build script
+typenum	1.20.1	qualifies: default features	no	
+ucd-parse	0.1.13	excluded: crate requires dependencies ['regex-lite']	no	crate requires dependencies ['regex-lite']
+ucd-trie	0.1.7	qualifies: default features	no	
+ui_test	0.30.7	excluded: crate requires dependencies ['annotate-snippets', 'anyhow', 'bstr', 'color-eyre', 'colored', 'comma', 'crossbeam-channel', 'levenshtein', 'prettydiff', 'regex', 'rustc_version', 'rustfix', 'serde', 'serde_json', 'spanned']	no	crate requires dependencies ['annotate-snippets', 'anyhow', 'bstr', 'color-eyre', 'colored', 'comma', 'crossbeam-channel', 'levenshtein', 'prettydiff', 'regex', 'rustc_version', 'rustfix', 'serde', 'serde_json', 'spanned']
+unarray	0.1.4	qualifies: default features	no	
+unic-langid	0.9.6	excluded: crate requires dependencies ['unic-langid-impl']	no	crate requires dependencies ['unic-langid-impl']
+unic-langid-impl	0.9.6	excluded: crate requires dependencies ['tinystr']	no	crate requires dependencies ['tinystr']
+unic-langid-macros	0.9.6	excluded: crate requires dependencies ['proc-macro-hack', 'tinystr', 'unic-langid-impl', 'unic-langid-macros-impl']	no	crate requires dependencies ['proc-macro-hack', 'tinystr', 'unic-langid-impl', 'unic-langid-macros-impl']
+unic-langid-macros-impl	0.9.6	excluded: proc-macro	no	
+unicase	2.9.0	qualifies: default features	no	
+unicode-ident	1.0.24	qualifies: default features	yes	
+unicode-normalization	0.1.25	excluded: crate requires dependencies ['tinyvec']	no	crate requires dependencies ['tinyvec']
+unicode-properties	0.1.4	qualifies: default features	no	
+unicode-script	0.5.8	qualifies: default features	no	
+unicode-security	0.1.2	excluded: crate requires dependencies ['unicode-normalization', 'unicode-script']	no	crate requires dependencies ['unicode-normalization', 'unicode-script']
+unicode-segmentation	1.13.3	qualifies: default features	yes	
+unicode-width	0.1.14	qualifies: default features	no	
+unicode-width	0.2.2	qualifies: default features	yes	
+unicode-xid	0.2.6	qualifies: default features	no	
+unified-diff	0.2.1	excluded: crate requires dependencies ['diff']	no	crate requires dependencies ['diff']
+unit-prefix	0.5.2	qualifies: default features	no	
+unty	0.0.4	qualifies: default features	no	
+url	2.5.8	excluded: crate requires dependencies ['form_urlencoded', 'idna', 'percent-encoding']	no	crate requires dependencies ['form_urlencoded', 'idna', 'percent-encoding']
+urlencoding	2.1.3	qualifies: default features	no	
+utf8_iter	1.0.4	qualifies: default features	no	
+utf8parse	0.2.2	qualifies: default features	no	
+uuid	1.25.0	excluded: archive not in the registry cache	no	
+valuable	0.1.1	excluded: crate has a build script	no	crate has a build script
+vcpkg	0.2.15	qualifies: default features	no	
+version_check	0.9.5	qualifies: default features	no	
+virtue	0.0.18	qualifies: default features	no	
+wait-timeout	0.2.1	excluded: crate requires dependencies ['libc']	no	crate requires dependencies ['libc']
+walkdir	2.5.0	excluded: crate requires dependencies ['same-file']	no	crate requires dependencies ['same-file']
+wasi	0.11.1+wasi-snapshot-preview1	qualifies: default features	no	
+wasi	0.14.2+wasi-0.2.4	excluded: crate requires dependencies ['wit-bindgen-rt']	no	crate requires dependencies ['wit-bindgen-rt']
+wasi-preview1-component-adapter-provider	46.0.3	excluded: archive not in the registry cache	no	
+wasm-bindgen	0.2.127	excluded: crate has a build script	no	crate has a build script
+wasm-bindgen-macro	0.2.127	excluded: proc-macro	no	
+wasm-bindgen-macro-support	0.2.127	excluded: crate requires dependencies ['bumpalo', 'proc-macro2', 'quote', 'syn', 'wasm-bindgen-shared']	no	crate requires dependencies ['bumpalo', 'proc-macro2', 'quote', 'syn', 'wasm-bindgen-shared']
+wasm-bindgen-shared	0.2.127	excluded: crate has a build script	no	crate has a build script
+wasm-component-ld	0.5.30	excluded: archive not in the registry cache	no	
+wasm-encoder	0.219.2	excluded: crate requires dependencies ['leb128']	no	crate requires dependencies ['leb128']
+wasm-encoder	0.257.1	excluded: archive not in the registry cache	no	
+wasm-encoder	0.258.0	excluded: archive not in the registry cache	no	
+wasm-metadata	0.257.1	excluded: archive not in the registry cache	no	
+wasmparser	0.219.2	excluded: crate requires dependencies ['bitflags']	no	crate requires dependencies ['bitflags']
+wasmparser	0.236.1	excluded: crate has a build script	no	crate has a build script
+wasmparser	0.257.1	excluded: archive not in the registry cache	no	
+wasmparser	0.258.0	excluded: archive not in the registry cache	no	
+wast	258.0.0	excluded: archive not in the registry cache	no	
+wat	1.258.0	excluded: archive not in the registry cache	no	
+web-time	1.1.0	excluded: crate requires dependencies ['js-sys', 'wasm-bindgen']	no	crate requires dependencies ['js-sys', 'wasm-bindgen']
+web_atoms	0.2.6	excluded: crate has a build script	no	crate has a build script
+winapi	0.3.9	excluded: crate has a build script	no	crate has a build script
+winapi-i686-pc-windows-gnu	0.4.0	excluded: crate has a build script	no	crate has a build script
+winapi-util	0.1.11	qualifies: default features	no	
+winapi-x86_64-pc-windows-gnu	0.4.0	excluded: crate has a build script	no	crate has a build script
+windows	0.61.3	excluded: crate requires dependencies ['windows-collections', 'windows-core', 'windows-future', 'windows-link', 'windows-numerics']	no	crate requires dependencies ['windows-collections', 'windows-core', 'windows-future', 'windows-link', 'windows-numerics']
+windows	0.62.2	excluded: crate requires dependencies ['windows-collections', 'windows-core', 'windows-future', 'windows-numerics']	no	crate requires dependencies ['windows-collections', 'windows-core', 'windows-future', 'windows-numerics']
+windows-bindgen	0.66.0	excluded: crate requires dependencies ['serde', 'serde_json', 'windows-threading']	no	crate requires dependencies ['serde', 'serde_json', 'windows-threading']
+windows-collections	0.2.0	excluded: crate requires dependencies ['windows-core']	no	crate requires dependencies ['windows-core']
+windows-collections	0.3.2	excluded: crate requires dependencies ['windows-core']	no	crate requires dependencies ['windows-core']
+windows-core	0.61.2	excluded: crate requires dependencies ['windows-implement', 'windows-interface', 'windows-link', 'windows-result', 'windows-strings']	no	crate requires dependencies ['windows-implement', 'windows-interface', 'windows-link', 'windows-result', 'windows-strings']
+windows-core	0.62.2	excluded: crate requires dependencies ['windows-implement', 'windows-interface', 'windows-link', 'windows-result', 'windows-strings']	no	crate requires dependencies ['windows-implement', 'windows-interface', 'windows-link', 'windows-result', 'windows-strings']
+windows-future	0.2.1	excluded: crate requires dependencies ['windows-core', 'windows-link', 'windows-threading']	no	crate requires dependencies ['windows-core', 'windows-link', 'windows-threading']
+windows-future	0.3.2	excluded: crate requires dependencies ['windows-core', 'windows-link', 'windows-threading']	no	crate requires dependencies ['windows-core', 'windows-link', 'windows-threading']
+windows-implement	0.60.2	excluded: proc-macro	no	
+windows-interface	0.59.3	excluded: proc-macro	no	
+windows-link	0.1.3	qualifies: default features	no	
+windows-link	0.2.1	qualifies: default features	no	
+windows-numerics	0.2.0	excluded: crate requires dependencies ['windows-core', 'windows-link']	no	crate requires dependencies ['windows-core', 'windows-link']
+windows-numerics	0.3.1	excluded: crate requires dependencies ['windows-core', 'windows-link']	no	crate requires dependencies ['windows-core', 'windows-link']
+windows-result	0.3.4	excluded: crate requires dependencies ['windows-link']	no	crate requires dependencies ['windows-link']
+windows-result	0.4.1	excluded: crate requires dependencies ['windows-link']	no	crate requires dependencies ['windows-link']
+windows-strings	0.4.2	excluded: crate requires dependencies ['windows-link']	no	crate requires dependencies ['windows-link']
+windows-strings	0.5.1	excluded: crate requires dependencies ['windows-link']	no	crate requires dependencies ['windows-link']
+windows-sys	0.61.2	excluded: crate requires dependencies ['windows-link']	no	crate requires dependencies ['windows-link']
+windows-threading	0.1.0	excluded: crate requires dependencies ['windows-link']	no	crate requires dependencies ['windows-link']
+windows-threading	0.2.1	excluded: crate requires dependencies ['windows-link']	no	crate requires dependencies ['windows-link']
+winnow	0.5.40	qualifies: default features	no	
+winnow	0.7.15	qualifies: default features	no	
+winnow	1.0.4	qualifies: default features	no	
+winsplit	0.1.0	qualifies: default features	no	
+wit-bindgen-rt	0.39.0	excluded: crate has a build script	no	crate has a build script
+wit-component	0.257.1	excluded: archive not in the registry cache	no	
+wit-parser	0.257.1	excluded: archive not in the registry cache	no	
+writeable	0.6.4	qualifies: default features	no	
+xattr	1.6.1	excluded: crate requires dependencies ['libc', 'rustix']	no	crate requires dependencies ['libc', 'rustix']
+xz2	0.1.7	excluded: crate requires dependencies ['lzma-sys']	no	crate requires dependencies ['lzma-sys']
+yoke	0.8.3	excluded: crate requires dependencies ['stable_deref_trait']	no	crate requires dependencies ['stable_deref_trait']
+yoke-derive	0.8.2	excluded: proc-macro	no	
+zerocopy	0.8.56	excluded: crate has a build script	no	crate has a build script
+zerocopy-derive	0.8.56	excluded: proc-macro	no	
+zerofrom	0.1.8	qualifies: default features	no	
+zerofrom-derive	0.1.7	excluded: proc-macro	no	
+zeroize	1.9.0	qualifies: default features	no	
+zerotrie	0.2.5	excluded: crate requires dependencies ['displaydoc']	no	crate requires dependencies ['displaydoc']
+zerovec	0.11.8	excluded: crate requires dependencies ['zerofrom']	no	crate requires dependencies ['zerofrom']
+zerovec-derive	0.11.6	excluded: proc-macro	no	
+zlib-rs	0.6.7	qualifies: default features	no	
+zmij	1.0.23	excluded: crate has a build script	no	crate has a build script
+zstd	0.13.3	excluded: crate requires dependencies ['zstd-safe']	no	crate requires dependencies ['zstd-safe']
+zstd-safe	7.2.4	excluded: crate has a build script	no	crate has a build script
+zstd-sys	2.0.16+zstd.1.5.7	excluded: crate has a build script	no	crate has a build script

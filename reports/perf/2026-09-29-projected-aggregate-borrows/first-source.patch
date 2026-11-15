@@ -1,0 +1,42 @@
+diff --git a/crates/rustc-codegen-trust-cg/src/lib.rs b/crates/rustc-codegen-trust-cg/src/lib.rs
+index 7a966a9ff..76343bbb7 100644
+--- a/crates/rustc-codegen-trust-cg/src/lib.rs
++++ b/crates/rustc-codegen-trust-cg/src/lib.rs
+@@ -108589,11 +108589,12 @@ fn compute_memory_backed_locals<'tcx>(
+             let (_dst, rvalue) = &**boxed;
+             let source = match rvalue {
+                 Rvalue::RawPtr(_, source) => source,
+-                // A closure or nested aggregate field needs stable storage
+-                // when borrowed. In particular, an inlined String construction
+-                // can leave its Vec scalarized before taking &mut String.vec.
+-                // Giving the base a slot lets both the callee's mutations and
+-                // subsequent whole-value moves observe the same Rust image.
++                // An aggregate field needs stable storage when borrowed: the
++                // borrowed-aggregate binding can name a whole local, but cannot
++                // name an aggregate projection. This also includes a FLAT field
++                // such as Chars.iter. Testing whether the referent needs a slot
++                // as a whole local misses that case. Give the parent a slot so
++                // a callee's mutations survive a subsequent whole-value move.
+                 Rvalue::Ref(_, _, source)
+                     if matches!(
+                         ctx.monomorphize_ty(place_rust_ty(ctx, body, source)).kind(),
+@@ -108603,10 +108604,15 @@ fn compute_memory_backed_locals<'tcx>(
+                         && source.projection.iter().all(|p| {
+                             matches!(p, ProjectionElem::Field(..) | ProjectionElem::Downcast(..))
+                         })
+-                        && memory_aggregate_address_taken_needs_slot(
+-                            ctx.tcx,
+-                            ctx.monomorphize_ty(place_rust_ty(ctx, body, source)),
+-                        )?) =>
++                        && {
++                            let referent =
++                                ctx.monomorphize_ty(place_rust_ty(ctx, body, source));
++                            box_dyn_dynamic_data(ctx.tcx, referent).is_some()
++                                || matches!(
++                                    memory_aggregate_layout_shared(ctx.tcx, referent),
++                                    Ok(Some(layout)) if layout.size != 0
++                                )
++                        }) =>
+                 {
+                     source
+                 }

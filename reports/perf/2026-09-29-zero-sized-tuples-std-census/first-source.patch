@@ -1,0 +1,21 @@
+diff --git a/crates/rustc-codegen-trust-cg/src/lib.rs b/crates/rustc-codegen-trust-cg/src/lib.rs
+index f67905512..38e67af35 100644
+--- a/crates/rustc-codegen-trust-cg/src/lib.rs
++++ b/crates/rustc-codegen-trust-cg/src/lib.rs
+@@ -101706,6 +101706,16 @@ fn rust_ty_to_trust_ir_ty_inner<'tcx>(
+         },
+         ty::Never => TrustIrTy::Never,
+         ty::Tuple(fields) if fields.is_empty() => TrustIrTy::Unit,
++        // A tuple of zero-sized fields has no ABI bits, even when it is the
++        // nonempty argument tuple of a generic Fn* call. Keep its field types
++        // in MIR for projections and drop glue; only its value carrier is Unit.
++        ty::Tuple(..)
++            if tcx.sess.target.arch.desc() == "aarch64"
++                && tcx.sess.target.os == rustc_target::spec::Os::Linux
++                && is_zero_sized_ty(tcx, ty) =>
++        {
++            TrustIrTy::Unit
++        }
+         // A ZERO-LENGTH array `[T; 0]` is a ZST exactly like `()` / a field-less
+         // struct (the `None => TrustIrTy::Unit` of the ADT arm below): it has no
+         // element to read or write, occupies no bytes, and takes no ABI slot. Map

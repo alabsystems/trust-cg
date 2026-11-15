@@ -1,6 +1,6 @@
 # Shape-coverage differential gate (rustc bridge)
 
-One program per *shape*, compared against rustc's LLVM backend at O0–O3, with
+One program per *shape*, compared against trustc's LLVM backend at O0–O3, with
 every binary run twice so an out-of-bounds read shows up as run-to-run
 variation.
 

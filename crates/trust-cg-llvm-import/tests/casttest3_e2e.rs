@@ -1,18 +1,23 @@
 #![cfg(feature = "driver")]
 
-// Regression coverage for llvm-test-suite 2002-05-02-CastTest3.
+// trust-cg-llvm-import / tests / casttest3_e2e.rs
+//
+// Regression coverage for llvm-test-suite 2002-05-02-CastTest3, compiled for
+// this host's explicit triple (ELF on AArch64 Linux GNU, Mach-O on AArch64
+// macOS), linked with `cc` and run natively with no arguments, so `argc` is 1
+// and the program takes the -769 branch.
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod macos_aarch64 {
-    use std::fs;
-    use std::process::Command;
+mod common;
 
-    use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
-    use trust_cg_codegen::pipeline::OptLevel;
-    use trust_cg_codegen::target::Target;
-    use trust_cg_llvm_import::import_text;
+use std::fs;
+use std::process::Command;
 
-    const CASTTEST3_LL: &str = r#"
+use common::{
+    compile_for_host, describe_status, link_with_cc, native_host_or_skip, unique_temp_dir,
+};
+use trust_cg_codegen::pipeline::OptLevel;
+
+const CASTTEST3_LL: &str = r#"
 @.str = private unnamed_addr constant [11 x i8] c"s1   = %d\0A\00", align 1
 @.str.1 = private unnamed_addr constant [11 x i8] c"us2  = %u\0A\00", align 1
 
@@ -55,63 +60,29 @@ select_end:
 }
 "#;
 
-    #[test]
-    fn casttest3_imported_program_links_and_runs() {
-        if Command::new("cc")
-            .arg("--version")
-            .output()
-            .map(|out| !out.status.success())
-            .unwrap_or(true)
-        {
-            return;
-        }
-
-        let module = import_text(CASTTEST3_LL, "casttest3").expect("import CastTest3 LL");
-        let compiler = Compiler::new(CompilerConfig {
-            opt_level: OptLevel::O0,
-            target: Target::Aarch64,
-            emit_proofs: false,
-            trace_level: CompilerTraceLevel::None,
-            emit_debug: false,
-            parallel: false,
-            cegis_superopt_budget_sec: None,
-            enable_fsym_trust_ir_preflight: false,
-            enable_jit_fast_regalloc: false,
-            jit_validation_mode_override: None,
-            panic_unwind: false,
-        });
-        let result = compiler.compile(&module).expect("compile CastTest3");
-
-        let dir = std::env::temp_dir().join(format!("trust-cg-casttest3-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let obj = dir.join("casttest3.o");
-        let bin = dir.join("casttest3");
-        fs::write(&obj, result.object_code).expect("write object");
-
-        let link = Command::new("cc")
-            .arg(&obj)
-            .arg("-o")
-            .arg(&bin)
-            .output()
-            .expect("link CastTest3");
-        assert!(
-            link.status.success(),
-            "link failed: {}",
-            String::from_utf8_lossy(&link.stderr)
-        );
-
-        let run = Command::new(&bin).output().expect("run CastTest3");
-        assert!(
-            run.status.success(),
-            "CastTest3 exited with {:?}; stdout=`{}` stderr=`{}`",
-            run.status.code(),
-            String::from_utf8_lossy(&run.stdout),
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&run.stdout),
-            "s1   = -769\nus2  = 64767\n"
-        );
+#[test]
+fn casttest3_imported_program_links_and_runs() {
+    if !native_host_or_skip("casttest3_imported_program_links_and_runs") {
+        return;
     }
+
+    let object = compile_for_host(CASTTEST3_LL, "casttest3", OptLevel::O0);
+    let dir = unique_temp_dir("casttest3");
+    let obj = dir.join("casttest3.o");
+    let bin = dir.join("casttest3");
+    fs::write(&obj, object).expect("write object");
+    link_with_cc(&obj, &bin);
+
+    let run = Command::new(&bin).output().expect("run CastTest3");
+    assert!(
+        run.status.success(),
+        "CastTest3 exited with {}; stdout=`{}` stderr=`{}`",
+        describe_status(run.status),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "s1   = -769\nus2  = 64767\n"
+    );
 }

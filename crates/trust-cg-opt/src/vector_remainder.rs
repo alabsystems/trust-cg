@@ -16,22 +16,8 @@
 //! loop's own preheader never does.
 
 use crate::effects::{for_each_inst_def, for_each_inst_use};
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, VReg};
-
-fn vreg_of(op: &trust_cg_ir::MachOperand) -> Option<VReg> {
-    match op {
-        trust_cg_ir::MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn imm_of(op: &trust_cg_ir::MachOperand) -> Option<i64> {
-    match op {
-        trust_cg_ir::MachOperand::Imm(i) => Some(*i),
-        _ => None,
-    }
-}
 
 /// Whether some instruction in `preheader` defines `acc` from a value that
 /// derives — within that block, through at most `MAX_HOPS` single-def
@@ -45,7 +31,7 @@ pub(crate) fn preheader_folds_neon_lane_into(
     let block = func.block(preheader);
     // Last def of each vreg WITHIN the preheader (later defs shadow earlier
     // ones, matching what a use after them reads).
-    let mut local_def: HashMap<u32, InstId> = HashMap::new();
+    let mut local_def: HashMap<u32, InstId> = HashMap::default();
     for &id in &block.insts {
         for_each_inst_def(func.inst(id), |d| {
             local_def.insert(d.id, id);
@@ -99,7 +85,7 @@ pub(crate) fn iv_is_vector_advanced_upstream(
     iv: VReg,
 ) -> bool {
     let mut frontier = vec![preheader];
-    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seen: HashSet<BlockId> = HashSet::default();
     for _ in 0..3 {
         let mut next = Vec::new();
         for b in frontier {
@@ -115,9 +101,9 @@ pub(crate) fn iv_is_vector_advanced_upstream(
                 // descending maps) with k > 1: a scalar loop steps by one.
                 if matches!(inst.opcode, AArch64Opcode::AddRI | AArch64Opcode::SubRI)
                     && inst.operands.len() == 3
-                    && vreg_of(&inst.operands[0]) == Some(iv)
-                    && vreg_of(&inst.operands[1]) == Some(iv)
-                    && imm_of(&inst.operands[2]).is_some_and(|k| k > 1)
+                    && inst.operands[0].as_vreg() == Some(iv)
+                    && inst.operands[1].as_vreg() == Some(iv)
+                    && inst.operands[2].as_imm().is_some_and(|k| k > 1)
                 {
                     return true;
                 }

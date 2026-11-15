@@ -1,5 +1,17 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+// Compiled only on an aarch64-apple-darwin host: another host builds this
+// target with no test in it, never one that passes without running (L06-P10).
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/darwin_native_prerequisites.rs"]
+mod darwin_native;
+#[path = "support/emitted_objects.rs"]
+mod emitted_objects_support;
+#[path = "support/positive_evidence.rs"]
+mod positive_evidence;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // E2E (aarch64-apple-darwin): a REAL Rust `#[coroutine]` generator compiled
 // THROUGH THE BRIDGE, linked, and RUN — asserting the yielded sequence is correct.
@@ -28,86 +40,23 @@ mod target_dir_support;
 // correct run yields 10 then 20 then returns 30 => 10*1_000_000 + 20*1_000 + 30 =
 // 10_020_030. Any wrong value, wrong order, or skipped/extra yield changes it.
 //
-// PROOF GATE: compiled with `TCG_NO_PROOF_CERTS=1`. Per-instruction AArch64
-// mappings exist, but the final Mach-O object also emits compact-unwind
-// `ARM64_RELOC_UNSIGNED` rows. Those object-side rows are now inventoried
-// fail-closed and are not yet backed by a relocation proof, so this semantic
-// runtime lane must not claim certified-object authority.
+// PROOFS-OFF DIAGNOSTIC: the bridge compile passes the backend's
+// `no-proof-certs` knob (`-Ztrust-ir-cg-args=no-proof-certs`; trustc refuses
+// the former `TCG_NO_PROOF_CERTS=1` environment spelling). A pass pins native
+// runtime semantics only and is never certified-object evidence. With
+// certificates on, the same crate is refused at proof promotion
+// (`[TCG-PROOF-465]`, measured 2026-09-29 on Trust 9192: the frame's
+// `StpPreIndex` is statistical sampling, and `LdrbRI` is an instruction-derived
+// obligation without a checked certificate; the proof wall of ledger L07-P2).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const TARGET: &str = "aarch64-apple-darwin";
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run coroutine test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
-}
-
-fn aarch64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
-}
-
-fn host_is_aarch64_macos() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
-fn has_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    backend_artifact_support::current_test_backend()
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -195,18 +144,9 @@ fn is_reachable_from_driver(obj: &Path) -> bool {
 
 #[test]
 fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
-    if !host_is_aarch64_macos() {
-        eprintln!("skipping: requires an aarch64-apple-darwin host");
-        return;
-    }
-    if !aarch64_std_available() {
-        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
-        return;
-    }
-    if !has_cc() {
-        eprintln!("skipping: cc not available");
-        return;
-    }
+    // The backend knob option, Darwin rust-std and `cc` are required here; a
+    // missing one fails the test by name instead of returning early.
+    darwin_native::require("coroutine_generator_aarch64", &["cc"]);
 
     let dylib = ensure_dylib_built();
     let dir = workdir("seq");
@@ -216,9 +156,13 @@ fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
     //    terminator — that is the lowering this test pins.
     let src_path = dir.join("gen_seq.rs");
     std::fs::write(&src_path, GEN_CRATE).expect("write source");
-    let mir = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "staticlib", "-Copt-level=0", "-Zmir-opt-level=0"])
+    let mir = toolchain_support::rustc_command()
+        .args([
+            "--crate-type",
+            "staticlib",
+            "-Copt-level=0",
+            "-Zmir-opt-level=0",
+        ])
         .args(["--emit=mir", "-o"])
         .arg(dir.join("gen_seq.mir"))
         .arg(&src_path)
@@ -246,35 +190,31 @@ fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
         s
     };
     let obj_out = dir.join("gen_seq");
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "staticlib"])
         .arg(&backend_arg)
-        .env("TCG_NO_PROOF_CERTS", "1")
+        .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]))
         .args(["--target", TARGET, "-Cpanic=abort", "-Copt-level=0"])
         .arg("--emit=obj")
         .arg("-o")
         .arg(&obj_out)
         .arg(&src_path)
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
         "bridge failed to compile the coroutine crate. stderr: <<<{stderr}>>>"
     );
 
-    // rustc places each function in its own CGU, so the bridge emits one object per
-    // function (the `ay_gen_seq` driver, the coroutine `resume` body, `Pin::new`)
-    // plus the dead allocator shim / runtime helpers. Collect every object that
-    // defines code; the linker drops the unreferenced ones. The coroutine's
-    // `drop_in_place` glue is legitimately SKIPPED (the frame holds no drop-needing
-    // state, so the caller's `drop(g)` is a no-op) and must be unreachable — which
-    // it is, since nothing references that symbol.
-    let all_objs: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("read workdir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "o"))
+    // A single CGU uses the exact requested -o path, which has no .o suffix
+    // here; multi-CGU emission can also leave .o files. Gather both shapes
+    // once each, then keep only objects defining the program-reachable code.
+    // In particular, the dead allocator shim must not enter the link merely
+    // because it is present in the directory.
+    let all_objs: Vec<PathBuf> = emitted_objects_support::emitted_objects(&obj_out)
+        .expect("read emitted objects")
+        .into_iter()
         .filter(|p| is_reachable_from_driver(p))
         .collect();
     assert!(
@@ -288,12 +228,11 @@ fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
             .contains("_ay_gen_seq")
     });
     let has_resume_body = all_objs.iter().any(|o| {
-        let nm = String::from_utf8_lossy(
-            &Command::new("nm").arg(o).output().expect("nm").stdout,
-        )
-        .into_owned();
+        let nm = String::from_utf8_lossy(&Command::new("nm").arg(o).output().expect("nm").stdout)
+            .into_owned();
         // The coroutine resume body is the `{closure#0}` of `ay_gen_seq`.
-        nm.lines().any(|l| l.contains("ay_gen_seq0") && !l.contains("_ay_gen_seq"))
+        nm.lines()
+            .any(|l| l.contains("ay_gen_seq0") && !l.contains("_ay_gen_seq"))
     });
     assert!(
         has_driver && has_resume_body,
@@ -301,7 +240,7 @@ fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
          objects: {all_objs:?}"
     );
 
-    // 2. Link all code objects with the C driver and RUN under a 10s timeout.
+    // 2. Link all code objects with the C driver and RUN under a 10 s deadline.
     let driver_path = dir.join("driver.c");
     std::fs::write(&driver_path, DRIVER_C).expect("write driver.c");
     let bin = dir.join("bin");
@@ -310,6 +249,7 @@ fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
     for o in &all_objs {
         link.arg(o);
     }
+    link.arg(toolchain_support::write_abort_stubs(&dir, &all_objs));
     let link = link.output().expect("cc link");
     assert!(
         link.status.success(),
@@ -317,14 +257,17 @@ fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
         String::from_utf8_lossy(&link.stderr)
     );
 
-    // 3. RUN natively on aarch64 under a timeout. Exit 0 iff the generator yielded
-    //    10 then 20 then returned 30 (packed == 10_020_030).
-    let run = Command::new("timeout")
-        .arg("10")
-        .arg(&bin)
-        .output()
-        .or_else(|_| Command::new(&bin).output())
-        .expect("run linked binary");
+    // 3. RUN natively on aarch64 under an in-process 10 s deadline. Exit 0 iff
+    //    the generator yielded 10 then 20 then returned 30 (packed == 10_020_030).
+    let run = darwin_native::run_with_deadline(&mut Command::new(&bin), Duration::from_secs(10))
+        .unwrap_or_else(|killed| {
+            panic!(
+                "coroutine driver did not exit within 10 s and was killed. \
+                 stdout: {:?} stderr: {:?}",
+                String::from_utf8_lossy(&killed.stdout),
+                String::from_utf8_lossy(&killed.stderr)
+            )
+        });
     let stdout = String::from_utf8_lossy(&run.stdout);
     let code = run.status.code().expect("process terminated by signal");
     assert_eq!(
@@ -339,4 +282,12 @@ fn coroutine_generator_yields_in_order_and_links_runs_aarch64() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::Off,
+    );
 }
+
+// Linux ELF twin: `coroutine_generator_linux.rs` compiles this `GEN_CRATE` and
+// runs this `DRIVER_C` for aarch64-unknown-linux-gnu; keep the two
+// byte-identical.

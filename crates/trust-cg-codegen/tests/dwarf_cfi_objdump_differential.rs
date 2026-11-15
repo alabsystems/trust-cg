@@ -9,8 +9,8 @@
 // lane breaks that: it packs the REAL emitted `.eh_frame` bytes into a minimal
 // ELF64 container (hand-rolled, so this lane does not depend on the trusted
 // Mach-O/ELF writers), disassembles the CFI with an EXTERNAL tool
-// (`llvm-objdump --dwarf=frames`, pinned to the nightly-2026-04-20 toolchain,
-// same as the ENC-2 lane), and asserts the external tool's decoded CIE/FDE
+// (`llvm-objdump --dwarf=frames` from the Trust package's sysroot, pinned the
+// same way as the ENC-2 lane), and asserts the external tool's decoded CIE/FDE
 // fields match the documented x86-64 System V CFI intent.
 //
 // GRACEFUL SKIP: if no pinned objdump is found the suite skips with an eprintln
@@ -22,15 +22,14 @@ use std::process::Command;
 use trust_cg_codegen::dwarf_cfi::{DwarfCfiSection, x86_64_fde_from_prologue};
 use trust_cg_ir::x86_64_regs::{R12, R13, R14, R15, RBX};
 
-const PINNED_TOOLCHAIN: &str = "nightly-2026-04-20";
-
 // ---------------------------------------------------------------------------
 // Pinned external objdump resolution (mirrors the ENC-2 lane).
 // ---------------------------------------------------------------------------
 
-/// Resolve an llvm-objdump. Order: TCG_LLVM_OBJDUMP override, then the pinned
-/// toolchain's bundled llvm-objdump, then /usr/bin/objdump (Apple LLVM, which
-/// also supports `--dwarf=frames`).
+/// Resolve an llvm-objdump. Order: TCG_LLVM_OBJDUMP override, then the
+/// installed Trust package's bundled llvm-objdump
+/// (`<trustc --print sysroot>/lib/rustlib/<triple>/bin/llvm-objdump`), then
+/// /usr/bin/objdump (Apple LLVM, which also supports `--dwarf=frames`).
 fn find_objdump() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("TCG_LLVM_OBJDUMP") {
         let p = PathBuf::from(p);
@@ -38,41 +37,24 @@ fn find_objdump() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // rustup which -> toolchain root -> lib/rustlib/<triple>/bin/llvm-objdump
-    if let Ok(out) = Command::new("rustup")
-        .args(["which", "--toolchain", PINNED_TOOLCHAIN, "rustc"])
-        .output()
-        && out.status.success()
-    {
-        let rustc = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-        if let Some(root) = rustc.parent().and_then(Path::parent)
-            && let Ok(rd) = std::fs::read_dir(root.join("lib/rustlib"))
-        {
-            for e in rd.flatten() {
-                let cand = e.path().join("bin/llvm-objdump");
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
+    // trustc refuses to run under any TRUST_CG_*/TCG_* control a gate exports.
+    let mut command = Command::new("trustc");
+    for (key, _) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("TRUST_CG_") || key_text.starts_with("TCG_") {
+            command.env_remove(&key);
         }
     }
-    // Direct scan of ~/.rustup/toolchains/<pinned>*/lib/rustlib/*/bin.
-    if let Some(home) = std::env::var_os("HOME") {
-        let tc = PathBuf::from(home).join(".rustup/toolchains");
-        if let Ok(rd) = std::fs::read_dir(&tc) {
-            for e in rd.flatten() {
-                if e.file_name()
-                    .to_string_lossy()
-                    .starts_with(PINNED_TOOLCHAIN)
-                    && let Ok(rd2) = std::fs::read_dir(e.path().join("lib/rustlib"))
-                {
-                    for e2 in rd2.flatten() {
-                        let cand = e2.path().join("bin/llvm-objdump");
-                        if cand.is_file() {
-                            return Some(cand);
-                        }
-                    }
-                }
+    if let Ok(out) = command.args(["--print", "sysroot"]).output()
+        && out.status.success()
+        && let Ok(rd) = std::fs::read_dir(
+            PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).join("lib/rustlib"),
+        )
+    {
+        for e in rd.flatten() {
+            let cand = e.path().join("bin/llvm-objdump");
+            if cand.is_file() {
+                return Some(cand);
             }
         }
     }
@@ -170,8 +152,12 @@ fn elf64_with_eh_frame(eh_frame: &[u8]) -> Vec<u8> {
 }
 
 fn run_dwarf_frames(objdump: &Path, object: &[u8], tag: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("tcg_ehdc_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // Removed when this function returns (or unwinds).
+    let scratch = tempfile::Builder::new()
+        .prefix("tcg_ehdc_")
+        .tempdir()
+        .expect("create temp dir");
+    let dir = scratch.path();
     let obj_path = dir.join(format!("{tag}.o"));
     std::fs::write(&obj_path, object).expect("write object");
 
@@ -197,8 +183,8 @@ fn run_dwarf_frames(objdump: &Path, object: &[u8], tag: &str) -> String {
 fn eh_frame_matches_external_objdump() {
     let Some(objdump) = find_objdump() else {
         eprintln!(
-            "ENC-EHDC anchor: SKIP — no llvm-objdump found (pinned toolchain \
-             {PINNED_TOOLCHAIN} absent, /usr/bin/objdump absent, TCG_LLVM_OBJDUMP unset). \
+            "ENC-EHDC anchor: SKIP — no llvm-objdump found (the Trust package \
+             ships none, /usr/bin/objdump absent, TCG_LLVM_OBJDUMP unset). \
              The external eh_frame differential did not run; the structural round-trip \
              gate still enforces correctness."
         );
@@ -209,7 +195,7 @@ fn eh_frame_matches_external_objdump() {
     // PUSH RBP / MOV RBP,RSP / PUSH RBX,R12..R15 / SUB RSP, 4096.
     let mut section = DwarfCfiSection::new_x86_64();
     let callee = [RBX, R12, R13, R14, R15];
-    section.add_fde(x86_64_fde_from_prologue(&callee, 4096, 0, 512, 0));
+    section.add_fde(x86_64_fde_from_prologue(&callee, 4096, 0, 512, 0).unwrap());
     let bytes = section.to_bytes();
 
     // Sanity: our OWN round-trip gate must accept these bytes first.

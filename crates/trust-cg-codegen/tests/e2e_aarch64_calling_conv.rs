@@ -12,14 +12,14 @@
 // -- call a trust-cg function declared with the Rust/Fast/Cold convention and
 // diffing the result. If the convention did not match the C register ABI, the
 // arguments/return would be read from the wrong registers.
+// These scalar fixtures execute on Linux GNU and macOS AArch64 with explicit
+// target metadata. They do not establish general Rust FnAbi compatibility.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-use std::fs;
-use std::process::Command;
-
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+#[path = "common/aarch64_native.rs"]
+mod native;
 use trust_cg_codegen::pipeline::OptLevel;
 
 use trust_ir::{
@@ -28,17 +28,16 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
 // `fn name(a: i64, b: i64, c: i64) -> i64 { a*b + c }` with a given convention.
 fn build_fn(m: &mut TrustIrModule, id: u32, name: &str, cc: CallingConv) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.calling_conv = cc;
     f.blocks = vec![TrustIrBlock {
@@ -68,7 +67,8 @@ fn build_fn(m: &mut TrustIrModule, id: u32, name: &str, cc: CallingConv) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -80,14 +80,7 @@ fn build_module() -> TrustIrModule {
 }
 
 fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Result<Vec<u8>, String> {
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        ..CompilerConfig::default()
-    });
-    compiler
-        .compile(module)
-        .map(|r| r.object_code)
-        .map_err(|e| format!("{e:?}"))
+    native::try_compile(module, opt)
 }
 
 const DRIVER: &str = r#"
@@ -110,46 +103,14 @@ int main(void){
 "#;
 
 fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
-        return None;
-    }
-    let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
-    let _ = fs::create_dir_all(&dir);
-    let obj_path = dir.join(format!("{tag}.o"));
-    let drv_path = dir.join("driver.c");
-    let bin_path = dir.join(format!("{tag}_bin"));
-    fs::write(&obj_path, obj).unwrap();
-    fs::write(&drv_path, DRIVER).unwrap();
-    let link = Command::new("cc")
-        .args([
-            drv_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
-            "-o",
-            bin_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("cc");
-    assert!(
-        link.status.success(),
-        "link:\n{}",
-        String::from_utf8_lossy(&link.stderr)
-    );
-    let code = Command::new(bin_path.to_str().unwrap())
-        .output()
-        .unwrap()
-        .status
-        .code()
-        .unwrap_or(-1);
-    let _ = fs::remove_dir_all(&dir);
-    Some(code)
+    native::link_run(tag, obj, DRIVER)
 }
 
 #[test]
 fn e2e_aarch64_c_compatible_conventions() {
     let module = build_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
-        let obj = compile_at(&module, opt).expect("Rust/Fast/Cold must compile");
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+        let obj = native::compile(&module, opt);
         let Some(code) = link_run("calling_conv", &obj) else {
             return;
         };
@@ -170,6 +131,7 @@ fn swift_convention_with_aggregate_stays_fail_closed() {
     // + return (budget 5) must stay rejected rather than silently mislowered.
     let mut m = TrustIrModule::new("swift_cc_agg");
     m.structs.push(StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "I64x5".to_string(),
         fields: (0..5)
@@ -184,11 +146,14 @@ fn swift_convention_with_aggregate_stays_fail_closed() {
         repr: StructRepr::C,
     });
     let agg = Ty::Struct(StructId::new(0));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![agg.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![agg.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), "swifty_agg", ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     f.blocks = vec![TrustIrBlock {
@@ -198,7 +163,8 @@ fn swift_convention_with_aggregate_stays_fail_closed() {
             values: vec![ValueId::new(0)],
         })],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     let err = compile_at(&m, OptLevel::O0)
         .expect_err("Swift with aggregate params/returns must fail closed, not compile");
     assert!(

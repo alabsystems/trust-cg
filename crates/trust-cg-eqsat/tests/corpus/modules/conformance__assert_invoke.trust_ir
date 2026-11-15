@@ -1,0 +1,23 @@
+; TrustIr text format v1
+module "assert_invoke"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (ptr) -> ()
+
+functy.1 = (bool, usize) -> (usize)
+
+global internal @loc.0 u64 = 7
+
+fn @panic_const_div_by_zero(functy.0) {
+}
+
+fn @guarded(functy.1) {
+    ; #body-gate: ungated
+bb0(%0: bool, %1: usize):
+    assert_invoke %0, div_by_zero, panic @func.0 at @global.0 to bb1(%1) unwind bb2
+bb1(%2: usize):
+    ret %2
+bb2:
+    %3, %4 = landingpad cleanup
+    resume %3
+}

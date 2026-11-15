@@ -8,7 +8,7 @@
 // pure functions only, driving the compiler boundary with a `MockCompiler`. Each
 // test states which historical bug or invariant it locks in.
 //
-// Run in-workspace with:  cargo test -p trust-cg-fuzz --test bridge_diff
+// Run in-workspace with:  scripts/trust_cargo.sh test -p trust-cg-fuzz --test bridge_diff
 
 use std::collections::HashMap;
 

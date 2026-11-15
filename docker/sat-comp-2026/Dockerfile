@@ -29,9 +29,15 @@ FROM --platform=linux/amd64 ubuntu:24.04 AS builder
 ARG TRUST_CG_REF=v0.1.0
 ARG RUST_VERSION=1.97.1
 
+# STOCK EXCEPTION (no x86_64-unknown-linux-gnu Trust package exists (X12);
+# the Darwin package ships no Linux std: `trustc --target
+# x86_64-unknown-linux-gnu` -> E0463): the SAT-Comp/StarExec submission builds
+# on stock Rust. The repository's rust-toolchain.toml pins the Trust toolchain
+# (owner directive 2026-09-28), so RUSTUP_TOOLCHAIN names the stock one here.
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
+    RUSTUP_TOOLCHAIN=${RUST_VERSION} \
     PATH=/usr/local/cargo/bin:$PATH
 
 # Base toolchain. `build-essential` gives gcc + make for the vendored

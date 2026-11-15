@@ -170,6 +170,204 @@ fn vectorizes_ivfp_reduction() {
     );
 }
 
+fn recognized_loop(func: &MachFunction) -> Recognized {
+    let dom = DomTree::compute(func);
+    let loops = LoopAnalysis::compute(func, &dom);
+    loops
+        .all_loops()
+        .find_map(|lp| Recognized::recognize(func, &dom, lp.header, lp.latch, &lp.body))
+        .expect("control fixture must be recognized before testing application")
+}
+
+#[test]
+fn candidate_boundary_success_snapshot() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        let rec = recognized_loop(&func);
+        assert!(apply(&mut func, &rec, tuned));
+        println!("CANDIDATE_SNAPSHOT_FPRED_{tuned}: {func:?}");
+    }
+}
+
+fn assert_refusal_preserves_function(func: &mut MachFunction, rec: &Recognized, tuned: bool) {
+    let before = format!("{func:?}");
+    assert!(!apply(func, rec, tuned));
+    assert_eq!(
+        format!("{func:?}"),
+        before,
+        "a declined rewrite must not mutate IR"
+    );
+}
+
+#[test]
+fn allocation_boundary_exhausted_counter_declines_without_mutation() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        func.next_vreg = u32::MAX;
+        let rec = recognized_loop(&func);
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_boundary_late_exhaustion_declines_without_mutation() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        // Enough for some setup, but not the full vector loop and scalar drain.
+        func.next_vreg = u32::MAX - 12;
+        let rec = recognized_loop(&func);
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_boundary_failed_lowering_preserves_function() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        let mut rec = recognized_loop(&func);
+        // Inject a stale private plan: force the existing lower() refusal path
+        // after preheader materialization and vector-block construction.
+        rec.def.remove(&20);
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_boundary_failed_splice_preserves_function() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        let rec = recognized_loop(&func);
+        // Inject a stale splice target without changing its arena identity.
+        func.inst_mut(rec.preheader_term).operands = vec![b(rec.exit)];
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_anchor_missing_setup_preserves_function() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        let rec = recognized_loop(&func);
+        // Inject a stale private plan with an arena-resident, detached anchor.
+        for block in &mut func.blocks {
+            block.insts.retain(|id| *id != rec.preheader_term);
+        }
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_anchor_missing_layout_preserves_function() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        let rec = recognized_loop(&func);
+        func.block_order.retain(|id| *id != rec.vec_guard);
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_boundary_maximum_operand_declines_without_counter_walk() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        // Unlinked arena instructions still own identities. This use must not
+        // be missed just because the block layout does not reference it.
+        func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![g(99), g(u32::MAX)]));
+        func.next_vreg = 0;
+        let rec = recognized_loop(&func);
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_boundary_noalias_identity_is_not_reused() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        func.noalias_params.push(u32::MAX);
+        let rec = recognized_loop(&func);
+        assert_refusal_preserves_function(&mut func, &rec, tuned);
+    }
+}
+
+#[test]
+fn allocation_boundary_sparse_ids_jump_directly_to_fresh_range() {
+    for tuned in [false, true] {
+        let mut func = build_loop(1, Accum::PlainFadd, false, false);
+        let high = u32::MAX - 128;
+        func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![g(99), g(high)]));
+        func.next_vreg = 0;
+        let original_insts = func.insts.len();
+        let rec = recognized_loop(&func);
+        assert!(apply(&mut func, &rec, tuned));
+        assert!(func.next_vreg > high + 1);
+        for inst in &func.insts[original_insts..] {
+            for reg in inst
+                .operands
+                .iter()
+                .filter_map(trust_cg_ir::MachOperand::as_vreg)
+            {
+                assert!(
+                    reg.id < 100 || reg.id > high,
+                    "new ID collides with sparse input"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn allocation_boundary_last_representable_range_preserves_lowering() {
+    for tuned in [false, true] {
+        for shape in [
+            Accum::PlainFadd,
+            Accum::FusedFmadd,
+            Accum::FusedFmaddCommuted,
+        ] {
+            let original = build_loop(1, shape, false, false);
+            let rec = recognized_loop(&original);
+            let mut ordinary = original.clone();
+            assert!(apply(&mut ordinary, &rec, tuned));
+            let used = ordinary.next_vreg - original.next_vreg;
+            assert!(used > 12, "late-exhaustion control must enter construction");
+
+            let mut boundary = original.clone();
+            let first = u32::MAX - used;
+            boundary.next_vreg = first;
+            assert!(apply(&mut boundary, &rec, tuned));
+            assert_eq!(boundary.next_vreg, u32::MAX);
+            // Normalize only newly allocated identities. All other IR fields,
+            // CFG edges, instruction ordering and flags must match exactly.
+            for inst in &mut boundary.insts {
+                for op in &mut inst.operands {
+                    if let MachOperand::VReg(reg) = op
+                        && reg.id >= first
+                    {
+                        reg.id = reg.id - first + original.next_vreg;
+                    }
+                }
+            }
+            boundary.next_vreg = ordinary.next_vreg;
+            assert_eq!(format!("{boundary:?}"), format!("{ordinary:?}"));
+        }
+    }
+}
+
+#[test]
+fn allocation_boundary_public_passes_report_no_change_on_exhaustion() {
+    let mut func = build_loop(1, Accum::PlainFadd, false, false);
+    func.next_vreg = u32::MAX - 12;
+    let before = format!("{func:?}");
+    let mut pass = NeonFPRedPass::new();
+    let mut analyses = AnalysisCache::new();
+    for _ in 0..2 {
+        assert!(!pass.run(&mut func));
+        assert_eq!(pass.fired(), 0);
+        assert!(!pass.run_with_analyses(&mut func, &mut analyses));
+        assert_eq!(pass.fired(), 0);
+        assert_eq!(format!("{func:?}"), before);
+    }
+}
+
 #[test]
 fn ordered_drain_structure_is_lane0_then_lane1_per_pair() {
     let mut func = build_loop(1, Accum::PlainFadd, false, false);
@@ -734,4 +932,51 @@ fn accepts_the_isel_zero_seed_through_an_fpr_copy() {
         "the copied-through zero seed must still vectorize"
     );
     assert_eq!(pass.fired(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the vector loop reproduces
+// `iv`, `acc` and `acc_src`, and its drain branches straight to the exit when
+// nothing remains.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    let iv = VReg::new(10, RegClass::Gpr64);
+    let good = || build_loop(1, Accum::PlainFadd, false, false);
+    assert!(NeonFPRedPass::new().run(&mut good()), "plain fixture fires");
+    let mut wrong = Vec::new();
+    let mut carried = good();
+    crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+    if NeonFPRedPass::new().run(&mut carried) {
+        wrong.push("fired with a second accumulator");
+    }
+    let mut live_out = good();
+    crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+    if NeonFPRedPass::new().run(&mut live_out) {
+        wrong.push("fired with a live-out-only register");
+    }
+    assert!(wrong.is_empty(), "skipped register state: {wrong:?}");
+}
+
+/// The post-increment index `iv' = iv + 1` read after the loop (a source `i`
+/// used after `while i < n` in this rotated shape). The pass's own live-out
+/// scan admitted it, but the vector code never writes it, so at an empty
+/// remainder the exit read a register no instruction on that path wrote.
+#[test]
+fn refuses_a_post_increment_index_read_after_the_loop() {
+    let mut func = build_loop(1, Accum::PlainFadd, false, false);
+    let exit = BlockId(3);
+    let read = func.push_inst(MachInst::new(
+        AArch64Opcode::MovR,
+        vec![
+            MachOperand::VReg(VReg::new(60, RegClass::Gpr64)),
+            MachOperand::VReg(VReg::new(12, RegClass::Gpr64)),
+        ],
+    ));
+    func.block_mut(exit).insts.insert(0, read);
+    assert!(
+        !NeonFPRedPass::new().run(&mut func),
+        "an exit reading `iv + 1` must stay scalar"
+    );
 }

@@ -1,0 +1,305 @@
+{
+  "name": "closure_layout",
+  "functions": [
+    {
+      "id": 0,
+      "name": "add_lo_hi",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U8"
+            ],
+            [
+              1,
+              "U64"
+            ],
+            [
+              2,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "U8",
+                  "dst_ty": "U64",
+                  "operand": 0
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "U64",
+                  "lhs": 3,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "U64",
+                  "lhs": 4,
+                  "rhs": 2
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    5
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": {
+        "Gated": {
+          "authority": "conformance-fixture"
+        }
+      },
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "program",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Closure": 0
+                  },
+                  "value": {
+                    "Closure": {
+                      "func": 0,
+                      "captures": [
+                        {
+                          "Int": 3
+                        },
+                        {
+                          "Int": 5
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U64",
+                  "value": {
+                    "Int": 16
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CallIndirect": {
+                  "callee": 0,
+                  "sig": 1,
+                  "args": [
+                    1
+                  ],
+                  "calling_conv": "C"
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": {
+        "Gated": {
+          "authority": "conformance-fixture"
+        }
+      },
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [
+    {
+      "func": 1,
+      "captures": [
+        "U8",
+        "U64"
+      ]
+    }
+  ],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "U8",
+        "U64",
+        "U64"
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U64"
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "aapcs64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": [
+    {
+      "closure": 0,
+      "size": 16,
+      "align": 8,
+      "capture_offsets": [
+        8,
+        0
+      ]
+    }
+  ]
+}

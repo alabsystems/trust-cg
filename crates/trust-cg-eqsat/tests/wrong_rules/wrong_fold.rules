@@ -1,0 +1,11 @@
+; mutant-of: fold_sub
+; mutation: wrong evaluation (a - b folded as a + b)
+; subject: u16
+; const: a = 7
+; const: b = 5
+(rule fold_sub
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (sub (const ?a) (const ?b)))
+  (rhs (eval add ?a ?b))
+  (where))

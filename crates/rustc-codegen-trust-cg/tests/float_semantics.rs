@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/positive_evidence.rs"]
+mod positive_evidence;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Runtime oracle for rustc_codegen_trust_cg float comparison semantics.
 //
@@ -11,63 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let dylib_name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&dylib_name),
-        target_dir.join("debug").join(&dylib_name),
-    ];
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.clone();
-        }
-    }
-
-    let pinned_cargo_toolchain = format!("+{}", pinned_toolchain());
-    let status = Command::new("cargo")
-        .arg(pinned_cargo_toolchain)
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run float-semantics test"
-    );
-
-    let built = target_dir.join("release").join(&dylib_name);
-    assert!(
-        built.exists(),
-        "expected dylib at {:?} but it was not produced",
-        built
-    );
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
@@ -94,15 +43,13 @@ fn compile_backend_source(stem: &str, src: &str) -> BackendCompile {
         s.push(&dylib);
         s
     };
-    let toolchain = pinned_toolchain();
-    let output = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .arg(&backend_arg)
         .arg("-o")
         .arg(&out_bin)
         .arg(&src_path)
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
 
     let _ = std::fs::remove_file(&src_path);
 
@@ -149,42 +96,16 @@ fn run_binary_with_timeout(path: &Path, timeout: Duration) -> Output {
     }
 }
 
-/// True while the aarch64 Mach-O object-relocation Certified composition
-/// has not landed (ObjectRelocationProofRegistry::aarch64_macho_production()
-/// is deliberately empty): every backend compile on this host fails
-/// promotion with TCG-PROOF-465/object-relocation-inventory. When the
-/// lanes register, this returns false and the original capability
-/// assertions below resume automatically — nothing to un-ignore.
-fn aarch64_macho_promotion_ratchet(stderr: &str) -> bool {
-    cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && stderr.contains("TCG-PROOF-465")
-        && stderr.contains("object relocation inventory")
-}
-
 fn assert_backend_source_exits_success(stem: &str, src: &str) {
     let compiled = compile_backend_source(stem, src);
     eprintln!("rustc stdout:\n{}", compiled.stdout);
     eprintln!("rustc stderr:\n{}", compiled.stderr);
     eprintln!("rustc exit: {:?}", compiled.status);
 
-    if !compiled.status.success() && aarch64_macho_promotion_ratchet(&compiled.stderr) {
-        // The compile died on the deliberate fail-closed ratchet. Pin the
-        // documented diagnostic shape instead of the runtime oracle.
-        assert!(
-            compiled.stderr.contains("proof promotion rejected"),
-            "ratchet rejection lost its documented shape for {stem}. stderr: <<<{stderr}>>>",
-            stderr = compiled.stderr
-        );
-        assert!(
-            compiled
-                .stderr
-                .contains("no object relocation proof is registered"),
-            "ratchet rejection lost its documented shape for {stem}. stderr: <<<{stderr}>>>",
-            stderr = compiled.stderr
-        );
-        return;
-    }
-
+    // The oracle compiles in the default (certificates-on) lane. A refusal of
+    // any kind fails here: on aarch64-apple-darwin a proof-promotion refusal
+    // (`[TCG-PROOF-465]`) used to be an accepted early return, which passed
+    // this test without running the oracle (ledger L06-P10).
     assert!(
         compiled.status.success(),
         "rustc failed to compile {stem} oracle. stderr was: <<<{stderr}>>>",
@@ -226,6 +147,10 @@ fn assert_backend_source_exits_success(stem: &str, src: &str) {
     );
     assert_eq!(run_stdout, "", "{stem} oracle wrote stdout");
     assert_eq!(run_stderr, "", "{stem} oracle wrote stderr");
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::On,
+    );
 }
 
 #[test]
@@ -296,17 +221,17 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
     assert_backend_source_exits_success("float_semantics", src);
 }
 
+// Built for x86_64 hosts and for aarch64-apple-darwin, where it runs in the
+// default (certificates-on) lane and fails while proof promotion refuses the
+// program; it used to return early on every non-x86_64 host (ledger L06-P10).
+// Not built on Linux AArch64, where this oracle has not been measured; pure
+// unit tests in lib.rs still pin the complete symbol table on every host.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn powi_and_libm_intrinsics_run_with_readable_float_semantics() {
-    // The backend's AArch64 object-relocation proof lane deliberately fails
-    // closed today (TCG-PROOF-465). Keep this executable oracle strict on the
-    // x86_64 lane where these libcalls are supported and relocation-certified;
-    // pure unit tests in lib.rs still pin the complete symbol table on every host.
-    if !cfg!(target_arch = "x86_64") {
-        eprintln!("skipping: x86_64 runtime requires the certified x86_64 relocation lane");
-        return;
-    }
-
     let src = r#"
 #![no_main]
 
@@ -370,6 +295,10 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
             .contains("fixed nearest-even rounding is not modeled"),
         "missing precise fail-closed diagnostic: <<<{}>>>",
         compiled.stderr
+    );
+    positive_evidence::record(
+        positive_evidence::Evidence::ExpectedRefusal,
+        positive_evidence::Certs::On,
     );
 }
 

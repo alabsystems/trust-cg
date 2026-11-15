@@ -16,11 +16,12 @@
 // `x86_64/pipeline.rs::build_x86_64_eh_frame_cfi` -> `DwarfCfiSection::to_bytes`.
 // Until this gate, those unwind bytes were a TRUSTED surface — the emitter was
 // believed to serialize a well-formed CIE/FDE, with nothing re-reading the
-// bytes. This module SHRINKS that trusted island: it is the eh_frame analogue
-// of ENC-3 (`x86_64/decode_check.rs`, per-instruction decode-check) and ENC-9
-// (`macho/reparse.rs`, Mach-O reparse gate). A decoder/validator can only ever
-// STRENGTHEN soundness (reject a malformed table) — it can never introduce a
-// miscompile — so it is sound-in-isolation.
+// bytes. This module provides a separate structural check, analogous to the
+// instruction decode-check and object-reparse gates. It can detect serialization
+// disagreements, but does not establish that the emitter's intended unwind
+// program describes the actual machine frame correctly. The AArch64 ELF module
+// emitter and both AArch64 Mach-O DWARF-fallback emitters run the same gate
+// before their terminator is stripped.
 //
 // INDEPENDENCE (honest labeling)
 // ------------------------------
@@ -34,6 +35,9 @@
 // `objdump --macho --dwarf=frames` differential lane in
 // `tests/dwarf_cfi_objdump_differential.rs`, which pins the emitted CIE/FDE
 // fields against a real external disassembler for a representative function.
+// For AArch64 ELF, `tests/aarch64_elf_cfi_differential.rs` interprets the
+// emitted programs with `llvm-dwarfdump --eh-frame` and compares the rows with
+// the disassembled prologue and the frame layout.
 //
 // SCOPE
 // -----
@@ -45,6 +49,10 @@
 // encoding), the initial instruction program, per-FDE CIE pointer, PC begin/
 // range, per-FDE LSDA augmentation, the call-frame instruction program, the
 // 8-byte padding contract, and the zero terminator.
+// Each declared entry is parsed through its own bounded cursor. Instruction
+// programs are compared byte-for-byte with intent, not interpreted as DW_CFA
+// semantics. The pointer-width model covers the emitter's LP64 absptr/sdata4/
+// sdata8 forms; this is not a general-purpose DWARF decoder.
 //
 // SCOPED OUT (follow-on): the `__gcc_except_tab` LSDA call-site/action/type
 // tables (`exception_handling.rs`). This decode-check covers the CIE/FDE
@@ -106,9 +114,9 @@ fn check_eq<T: PartialEq + core::fmt::Debug>(
 const DW_CFA_NOP: u8 = 0x00;
 /// eh_frame CIE id (distinguishes a CIE from an FDE).
 const CIE_ID: u32 = 0;
-/// DW_EH_PE size nibble: sdata4 / udata4.
+/// DW_EH_PE size nibble: sdata4.
 const DW_EH_PE_SDATA4_NIBBLE: u8 = 0x0B;
-/// DW_EH_PE size nibble: sdata8 / udata8.
+/// DW_EH_PE size nibble: sdata8.
 const DW_EH_PE_SDATA8_NIBBLE: u8 = 0x0C;
 
 /// Byte width of a DW_EH_PE-encoded pointer, derived independently from the
@@ -155,43 +163,29 @@ impl<'a> Reader<'a> {
     }
 
     fn u32_le(&mut self) -> Result<u32, EhFrameDecodeError> {
-        let end = self.pos + 4;
-        let slice = self
-            .bytes
-            .get(self.pos..end)
-            .ok_or_else(|| EhFrameDecodeError {
-                message: format!("truncated: need 4 bytes (u32) at offset {}", self.pos),
-            })?;
-        let v = u32::from_le_bytes(slice.try_into().unwrap());
-        self.pos = end;
-        Ok(v)
+        let slice = self.take(4)?;
+        Ok(u32::from_le_bytes(slice.try_into().unwrap()))
     }
 
     /// Read `size` bytes (4 or 8) as a sign-extended little-endian value.
     fn sized_le(&mut self, size: usize) -> Result<i64, EhFrameDecodeError> {
-        let end = self.pos + size;
-        let slice = self
-            .bytes
-            .get(self.pos..end)
-            .ok_or_else(|| EhFrameDecodeError {
-                message: format!(
-                    "truncated: need {size} bytes (sized ptr) at offset {}",
-                    self.pos
-                ),
-            })?;
         let v = match size {
-            4 => i64::from(i32::from_le_bytes(slice.try_into().unwrap())),
-            8 => i64::from_le_bytes(slice.try_into().unwrap()),
+            4 => i64::from(i32::from_le_bytes(self.take(4)?.try_into().unwrap())),
+            8 => i64::from_le_bytes(self.take(8)?.try_into().unwrap()),
             other => {
                 return err(format!("unsupported DW_EH_PE pointer size {other}"));
             }
         };
-        self.pos = end;
         Ok(v)
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], EhFrameDecodeError> {
-        let end = self.pos + n;
+        let end = self.pos.checked_add(n).ok_or_else(|| EhFrameDecodeError {
+            message: format!(
+                "byte extent overflows: need {n} bytes at offset {}",
+                self.pos
+            ),
+        })?;
         let slice = self
             .bytes
             .get(self.pos..end)
@@ -200,6 +194,23 @@ impl<'a> Reader<'a> {
             })?;
         self.pos = end;
         Ok(slice)
+    }
+
+    /// Read a DWARF32 length and isolate exactly that entry's body. Primitive
+    /// reads inside the returned cursor cannot consume the following entry.
+    fn entry_body(&mut self, kind: &str) -> Result<Reader<'a>, EhFrameDecodeError> {
+        let length = self.u32_le()?;
+        let total_size = u64::from(length) + 4;
+        // The emitted LP64 entries include their prefix in 8-byte alignment.
+        if !total_size.is_multiple_of(8) {
+            return err(format!(
+                "{kind} total size {total_size} is not 8-byte aligned"
+            ));
+        }
+        let length = usize::try_from(length).map_err(|_| EhFrameDecodeError {
+            message: format!("{kind} length {length} is not representable on this host"),
+        })?;
+        Ok(Reader::new(self.take(length)?))
     }
 
     /// Read a null-terminated string, INCLUDING the terminating NUL (to match
@@ -223,7 +234,7 @@ impl<'a> Reader<'a> {
         let mut shift = 0u32;
         loop {
             let byte = self.u8()?;
-            if shift >= 64 {
+            if shift >= 64 || (shift == 63 && byte > 1) {
                 return err("ULEB128 overflows u64".to_string());
             }
             result |= u64::from(byte & 0x7F) << shift;
@@ -234,13 +245,22 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn uleb128_len(&mut self) -> Result<usize, EhFrameDecodeError> {
+        let length = self.uleb128()?;
+        usize::try_from(length).map_err(|_| EhFrameDecodeError {
+            message: format!("ULEB128 length {length} is not representable on this host"),
+        })
+    }
+
     /// Independent SLEB128 decoder (DWARF-5 §7.6, written from the spec).
     fn sleb128(&mut self) -> Result<i64, EhFrameDecodeError> {
         let mut result: i64 = 0;
         let mut shift = 0u32;
         loop {
             let byte = self.u8()?;
-            if shift >= 64 {
+            // The tenth group has only one value bit left. Its remaining
+            // bits must be the sign extension, and it must terminate here.
+            if shift >= 64 || (shift == 63 && !matches!(byte, 0 | 0x7f)) {
                 return err("SLEB128 overflows i64".to_string());
             }
             result |= i64::from(byte & 0x7F) << shift;
@@ -290,20 +310,20 @@ pub fn verify_eh_frame_roundtrip(
 
     // ---- CIE ----
     let cie = section.cie();
-    let cie_start = r.pos;
     let (pc_size, lsda_size) = decode_and_check_cie(&mut r, cie)?;
-    let cie_end = r.pos;
-    // Sanity: the CIE occupies a whole number of bytes and starts at 0.
-    debug_assert_eq!(cie_start, 0);
-    let _ = cie_end;
 
     // ---- FDEs ----
     for (i, fde) in section.fdes().iter().enumerate() {
         let fde_start = r.pos;
         // The emitter's CIE pointer = (offset of the CIE-pointer field) - (CIE
-        // start). The CIE-pointer field sits at fde_start + 4; the CIE starts at
-        // cie_start (0). This is recomputed here independently from byte offsets.
-        let expected_cie_pointer = (fde_start as u32 + 4) - cie_start as u32;
+        // start). The CIE-pointer field sits at fde_start + 4; the single CIE
+        // starts at section offset zero. Reject offsets DWARF32 cannot encode.
+        let expected_cie_pointer = fde_start
+            .checked_add(4)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or_else(|| EhFrameDecodeError {
+                message: format!("FDE[{i}] CIE-pointer offset exceeds the DWARF32 range"),
+            })?;
         decode_and_check_fde(&mut r, fde, i, expected_cie_pointer, pc_size, lsda_size)?;
     }
 
@@ -343,23 +363,7 @@ fn decode_and_check_cie(
     r: &mut Reader<'_>,
     cie: &DwarfCie,
 ) -> Result<(usize, usize), EhFrameDecodeError> {
-    let length = r.u32_le()? as usize;
-    let body_start = r.pos;
-    let entry_end = body_start + length;
-    if entry_end > r.bytes.len() {
-        return err(format!(
-            "CIE length {length} runs past end of section ({} bytes available)",
-            r.bytes.len() - body_start
-        ));
-    }
-    // eh_frame alignment contract: the whole entry (4-byte length + body) is a
-    // multiple of the pointer size (8 on LP64 Darwin).
-    if !(length + 4).is_multiple_of(8) {
-        return err(format!(
-            "CIE total size {} is not 8-byte aligned",
-            length + 4
-        ));
-    }
+    let mut r = r.entry_body("CIE")?;
 
     // CIE id must be 0 in eh_frame.
     let cie_id = r.u32_le()?;
@@ -404,13 +408,13 @@ fn decode_and_check_cie(
             "unexpected non-'z' augmentation {augmentation:?}: emitter always emits 'z'-prefixed"
         ));
     }
-    let aug_data_len = r.uleb128()? as usize;
-    let aug_data = r.take(aug_data_len)?.to_vec();
+    let aug_data_len = r.uleb128_len()?;
+    let aug_data = r.take(aug_data_len)?;
 
     // Parse the augmentation data in the exact order the letters appear after
     // 'z' — 'P' personality (encoding byte + pointer), 'L' LSDA encoding byte,
     // 'R' FDE pointer encoding byte — independently of the emitter.
-    let mut ar = Reader::new(&aug_data);
+    let mut ar = Reader::new(aug_data);
     let mut decoded_fde_ptr_enc: Option<u8> = None;
     let mut decoded_lsda_enc: Option<u8> = None;
     let mut decoded_personality_enc: Option<u8> = None;
@@ -470,14 +474,14 @@ fn decode_and_check_cie(
     )?;
 
     // Initial instructions + padding fill the rest of the entry body.
-    let region = r.take(entry_end - r.pos)?;
+    let region = r.take(r.remaining())?;
     check_instruction_region(
         "CIE initial instructions",
         region,
         &cie.initial_instructions,
     )?;
 
-    debug_assert_eq!(r.pos, entry_end);
+    debug_assert!(r.at_end());
 
     // Sizes used to parse the FDEs (the emitter derives lsda_size from the LSDA
     // encoding when present, else it defaults to the FDE pointer size).
@@ -502,22 +506,7 @@ fn decode_and_check_fde(
 ) -> Result<(), EhFrameDecodeError> {
     let field = |name: &str| format!("FDE[{index}] {name}");
 
-    let length = r.u32_le()? as usize;
-    let body_start = r.pos;
-    let entry_end = body_start + length;
-    if entry_end > r.bytes.len() {
-        return err(format!(
-            "{}: length {length} runs past end of section",
-            field("")
-        ));
-    }
-    if !(length + 4).is_multiple_of(8) {
-        return err(format!(
-            "{}: total size {} not 8-byte aligned",
-            field(""),
-            length + 4
-        ));
-    }
+    let mut r = r.entry_body(&format!("FDE[{index}]"))?;
 
     // CIE pointer — nonzero in eh_frame, and equal to the recomputed offset.
     let cie_pointer = r.u32_le()?;
@@ -537,7 +526,7 @@ fn decode_and_check_fde(
 
     // FDE augmentation data: length ULEB, then (for a "zPLR" CIE with an LSDA)
     // the LSDA pointer. The length is self-describing.
-    let aug_data_len = r.uleb128()? as usize;
+    let aug_data_len = r.uleb128_len()?;
     match fde.lsda_pointer {
         Some(intent_lsda) => {
             check_eq(&field("LSDA aug data length"), aug_data_len, lsda_size)?;
@@ -550,10 +539,10 @@ fn decode_and_check_fde(
     }
 
     // Call-frame instructions + padding fill the rest of the entry body.
-    let region = r.take(entry_end - r.pos)?;
+    let region = r.take(r.remaining())?;
     check_instruction_region(&field("call-frame instructions"), region, &fde.instructions)?;
 
-    debug_assert_eq!(r.pos, entry_end);
+    debug_assert!(r.at_end());
     Ok(())
 }
 
@@ -616,7 +605,7 @@ mod tests {
     /// dynamic-alloc function.
     fn x86_64_simple_section() -> DwarfCfiSection {
         let mut section = DwarfCfiSection::new_x86_64();
-        let fde = x86_64_fde_from_prologue(&[], 0, 0, 96, 0);
+        let fde = x86_64_fde_from_prologue(&[], 0, 0, 96, 0).unwrap();
         section.add_fde(fde);
         section
     }
@@ -626,7 +615,7 @@ mod tests {
     fn x86_64_rich_section() -> DwarfCfiSection {
         let mut section = DwarfCfiSection::new_x86_64();
         let callee = [RBX, R12, R13, R14, R15];
-        let fde = x86_64_fde_from_prologue(&callee, 4096, 0, 512, 3);
+        let fde = x86_64_fde_from_prologue(&callee, 4096, 0, 512, 3).unwrap();
         section.add_fde(fde);
         section
     }
@@ -634,8 +623,8 @@ mod tests {
     /// Two functions in one section (two FDEs sharing the CIE).
     fn x86_64_two_fde_section() -> DwarfCfiSection {
         let mut section = DwarfCfiSection::new_x86_64();
-        section.add_fde(x86_64_fde_from_prologue(&[RBX], 16, 0, 64, 1));
-        section.add_fde(x86_64_fde_from_prologue(&[R12, R13], 256, 0, 200, 2));
+        section.add_fde(x86_64_fde_from_prologue(&[RBX], 16, 0, 64, 1).unwrap());
+        section.add_fde(x86_64_fde_from_prologue(&[R12, R13], 256, 0, 200, 2).unwrap());
         section
     }
 
@@ -667,7 +656,9 @@ mod tests {
         // The zPLR augmentation (personality + LSDA) round-trip. Not on the
         // default x86 path yet, but the decoder covers it.
         let mut section = DwarfCfiSection::new_x86_64_with_eh();
-        let fde = x86_64_fde_from_prologue(&[RBX], 32, 0, 128, 1).with_lsda();
+        let fde = x86_64_fde_from_prologue(&[RBX], 32, 0, 128, 1)
+            .unwrap()
+            .with_lsda();
         section.add_fde(fde);
         let bytes = section.to_bytes();
         verify_eh_frame_roundtrip(&section, &bytes).expect("zPLR x86 eh_frame must round-trip");
@@ -709,6 +700,60 @@ mod tests {
         verify_eh_frame_roundtrip(&section, &bytes).expect("aarch64 eh_frame must round-trip");
     }
 
+    /// The AArch64 ELF CIEs (zR, and zPLR with an indirect pcrel|sdata4
+    /// personality) with a frame saving FPRs through `DW_CFA_offset_extended`,
+    /// as the AArch64 ELF module emitter serializes them.
+    #[test]
+    fn roundtrip_aarch64_elf_cies_with_fpr_saves() {
+        use crate::frame::{CalleeSavedPair, FrameLayout};
+        use trust_cg_ir::regs::{V8, V9, X29, X30};
+        let layout = FrameLayout {
+            callee_saved_pairs: vec![
+                CalleeSavedPair {
+                    reg1: X29,
+                    reg2: X30,
+                    fp_offset: 0,
+                    is_fpr: false,
+                },
+                CalleeSavedPair {
+                    reg1: V8,
+                    reg2: V9,
+                    fp_offset: -16,
+                    is_fpr: true,
+                },
+            ],
+            callee_saved_area_size: 32,
+            spill_area_size: 0,
+            local_area_size: 0,
+            outgoing_arg_area_size: 0,
+            total_frame_size: 32,
+            uses_frame_pointer: true,
+            is_leaf: false,
+            uses_red_zone: false,
+            fp_to_spill_offset: -16,
+            has_dynamic_alloc: false,
+        };
+        for with_eh in [false, true] {
+            let mut section = if with_eh {
+                DwarfCfiSection::new_aarch64_elf_with_eh()
+            } else {
+                DwarfCfiSection::new_aarch64_elf()
+            };
+            let mut fde = DwarfFde::from_layout(&layout, 0, 64, 0);
+            if with_eh {
+                fde = fde.with_lsda();
+            }
+            section.add_fde(fde);
+            let bytes = section.to_bytes();
+            verify_eh_frame_roundtrip(&section, &bytes)
+                .unwrap_or_else(|e| panic!("ELF eh_frame (eh={with_eh}) must round-trip: {e}"));
+            // The unterminated object form is not a complete serialization.
+            assert!(
+                verify_eh_frame_roundtrip(&section, &section.to_bytes_no_terminator()).is_err()
+            );
+        }
+    }
+
     #[test]
     fn roundtrip_empty_section() {
         let section = DwarfCfiSection::new_x86_64();
@@ -731,6 +776,62 @@ mod tests {
             res.is_err(),
             "TEETH FAILURE: corruption `{what}` at byte {idx} was NOT rejected"
         );
+    }
+
+    #[test]
+    fn rejects_short_cie_without_reading_the_next_entry() {
+        let section = x86_64_simple_section();
+        let mut bytes = section.to_bytes();
+        // An aligned entry containing only the CIE id. The remaining section
+        // must not supply the missing fields of this entry.
+        bytes[..4].copy_from_slice(&4u32.to_le_bytes());
+        assert!(verify_eh_frame_roundtrip(&section, &bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_short_fde_without_reading_the_next_entry() {
+        let section = x86_64_two_fde_section();
+        let mut bytes = section.to_bytes();
+        let fde_start = 4 + u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        bytes[fde_start..fde_start + 4].copy_from_slice(&4u32.to_le_bytes());
+        assert!(verify_eh_frame_roundtrip(&section, &bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_unrepresentable_cie_augmentation_extent() {
+        let section = x86_64_simple_section();
+        let mut bytes = section.to_bytes();
+        // CIE zR augmentation length is at byte 15. Replace it with ULEB128
+        // u64::MAX; its extent overflows even a 64-bit cursor at this offset.
+        assert_eq!(bytes[15], 1);
+        bytes.splice(
+            15..16,
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1],
+        );
+        assert!(verify_eh_frame_roundtrip(&section, &bytes).is_err());
+    }
+
+    #[test]
+    fn mutated_and_truncated_sections_never_panic() {
+        for section in [
+            x86_64_simple_section(),
+            x86_64_rich_section(),
+            x86_64_two_fde_section(),
+        ] {
+            let bytes = section.to_bytes();
+            for end in 0..bytes.len() {
+                assert!(verify_eh_frame_roundtrip(&section, &bytes[..end]).is_err());
+            }
+            for offset in 0..bytes.len() {
+                let mut corrupted = bytes.clone();
+                for byte in 0..=u8::MAX {
+                    corrupted[offset] = byte;
+                    // Mutation may preserve an encoding's meaning; every
+                    // outcome must still be a Result, never a panic.
+                    let _ = verify_eh_frame_roundtrip(&section, &corrupted);
+                }
+            }
+        }
     }
 
     #[test]
@@ -870,6 +971,52 @@ mod tests {
     }
 
     // ---- Independent LEB128 decoder sanity (spec byte patterns) ----
+
+    #[test]
+    fn reader_rejects_overflowing_extents_without_advancing() {
+        let mut reader = Reader::new(&[0]);
+        reader.u8().unwrap();
+        assert!(reader.take(usize::MAX).is_err());
+        assert_eq!(reader.pos, 1);
+        assert!(reader.sized_le(usize::MAX).is_err());
+        assert_eq!(reader.pos, 1);
+    }
+
+    #[test]
+    fn leb128_terminal_groups_must_fit_the_result_width() {
+        for final_byte in 0..=u8::MAX {
+            let mut bytes = [0x80; 10];
+            bytes[9] = final_byte;
+            assert_eq!(
+                Reader::new(&bytes).uleb128().is_ok(),
+                final_byte <= 1,
+                "unsigned terminal group {final_byte:#x}",
+            );
+            assert_eq!(
+                Reader::new(&bytes).sleb128().is_ok(),
+                matches!(final_byte, 0 | 0x7f),
+                "signed terminal group {final_byte:#x}",
+            );
+        }
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1])
+                .uleb128()
+                .unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0])
+                .sleb128()
+                .unwrap(),
+            i64::MAX
+        );
+        assert_eq!(
+            Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f])
+                .sleb128()
+                .unwrap(),
+            i64::MIN
+        );
+    }
 
     #[test]
     fn uleb128_decoder_matches_spec_examples() {

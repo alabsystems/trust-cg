@@ -8,7 +8,7 @@ The v0.1.0 labels here are deliberate provenance, not staleness: this evidence
 was taken against the v0.1.0 SAT-Comp package that
 [`docker/sat-comp-2026/Dockerfile`](../docker/sat-comp-2026/Dockerfile) still
 pins. Re-running it on a later release would require re-measuring, not
-relabelling. The current trust-cg release is 0.5.0; see
+relabelling. The current trust-cg release is 0.6.0; see
 [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Release claim status
@@ -69,8 +69,8 @@ that its fixture count still matches the manifest.
 Run correctness checks before collecting or interpreting timings:
 
 ```sh
-cargo test --locked -p trust-cg-sat-host --test trust_cg_sat_cli
-cargo test --locked -p trust-cg-sat-host --test sat_corpus
+targo --unverified test --locked -p trust-cg-sat-host --test trust_cg_sat_cli
+targo --unverified test --locked -p trust-cg-sat-host --test sat_corpus
 ```
 
 The corpus test performs these checks:
@@ -104,8 +104,8 @@ Capture this beside every result:
 ```sh
 git rev-parse HEAD
 git status --short
-rustc -vV
-cargo -V
+trustc -vV
+targo --unverified -vV
 uname -a
 ```
 
@@ -124,7 +124,7 @@ report_dir="${TMPDIR:-/tmp}/trust-cg-sat-v0.1.0"
 mkdir -p "$report_dir/cache"
 
 XDG_CACHE_HOME="$report_dir/cache" \
-  cargo run --release --locked -p trust-cg-sat-host \
+  targo --unverified run --release --locked -p trust-cg-sat-host \
     --bin satlib_bench_table -- --repetitions 10 --warmup \
     >"$report_dir/satlib-tables.md" \
     2>"$report_dir/satlib-diagnostics.txt"
@@ -140,10 +140,10 @@ minutes.
 ### Criterion runs
 
 ```sh
-cargo bench --locked -p trust-cg-sat-host \
+targo --unverified bench --locked -p trust-cg-sat-host \
   --bench satlib_jit_shadow_bench
 
-cargo bench --locked -p trust-cg-sat-host \
+targo --unverified bench --locked -p trust-cg-sat-host \
   --bench microsat_c_o3_baseline_bench
 ```
 

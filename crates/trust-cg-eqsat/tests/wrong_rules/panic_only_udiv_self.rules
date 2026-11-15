@@ -1,0 +1,9 @@
+; mutant-of: (none: not a registered rule)
+; mutation: equal only on runs that do not fail: x / x is 1 except at x = 0, where udiv is undefined behaviour
+; subject: u32
+(rule udiv_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (udiv ?x ?x))
+  (rhs (const 1))
+  (where))

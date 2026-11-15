@@ -1,0 +1,44 @@
+; TrustIr text format v1
+module "_RNvCscxU6ucfUIkC_23s40_mixed_int_float_abi1f"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (u64, f64, i32, f32, u8, f64, i64, f32, u16, f64, i8, f32, u32, f64, u64, f32) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCscxU6ucfUIkC_23s40_mixed_int_float_abi1f(functy.0) {
+bb0(%1: u64, %2: f64, %3: i32, %4: f32, %5: u8, %6: f64, %7: i64, %8: f32, %9: u16, %10: f64, %11: i8, %12: f32, %13: u32, %14: f64, %15: u64, %16: f32):
+    %40 = fadd f64 %2, %6
+    %41 = fadd f64 %40, %10
+    %42 = fadd f64 %41, %14
+    %43 = fadd f32 %4, %8
+    %44 = fadd f32 %43, %12
+    %45 = fadd f32 %44, %16
+    %46 = fpext f32 %45 to f64
+    %47 = fadd f64 %42, %46
+    %48 = sext i32 %3 to u64
+    %49 = xor u64 %1, %48
+    %50 = zext u8 %5 to u64
+    %51 = xor u64 %49, %50
+    %52 = bitcast i64 %7 to u64
+    %53 = xor u64 %51, %52
+    %54 = zext u16 %9 to u64
+    %55 = xor u64 %53, %54
+    %56 = bitcast i8 %11 to u8
+    %57 = zext u8 %56 to u64
+    %58 = xor u64 %55, %57
+    %59 = zext u32 %13 to u64
+    %60 = xor u64 %58, %59
+    %61 = xor u64 %60, %15
+    %62 = bitcast f64 %47 to u64
+    %63 = add u64 %61, %62
+    ret %63
+}

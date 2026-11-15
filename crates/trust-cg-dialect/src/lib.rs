@@ -9,18 +9,16 @@
 //! **above** trust_ir and progressively lowers to MachIR. It does not take an MLIR
 //! dependency and does not replicate MLIR's C++ trait hierarchy.
 //!
-//! Design doc: `designs/2026-04-18-dialect-framework.md`.
-//!
 //! # Layering
 //!
 //! ```text
 //! verif.*   (frontend / verification-layer ops)
 //!   |
 //!   v  VerifToTrustIr conversion
-//! trust_ir.*   (wraps real trust_ir opcodes)
+//! trust_ir.*   (small sample I64 facade, separate from the main trust-ir IR)
 //!   |
 //!   v  TrustIrToMachir conversion
-//! machir.* (wraps AArch64/x86/... opcodes)
+//! machir.* (single-block AArch64 I64 facade)
 //!   |
 //!   v  emit_mach_function -> trust_cg_ir::MachFunction
 //! ```
@@ -43,7 +41,9 @@ pub use conversion::{ConversionDriver, ConversionError, ConversionPattern, Rewri
 pub use dialect::{Arity, Capabilities, Dialect, OpDef, TypeConstraint};
 pub use id::{BlockId, DialectId, DialectOpId, OpCode, OpId, ValueId};
 pub use machir_emit::{EmitError, emit_mach_function};
-pub use module::{DialectBlock, DialectFunction, DialectModule};
+pub use module::{
+    DialectBlock, DialectBuildError, DialectFunction, DialectIdentityDomain, DialectModule,
+};
 pub use op::{Attribute, Attributes, DialectOp};
 pub use pass::{
     Legality, Pass, PassError, validate_legality, validate_type_constraints,
@@ -118,9 +118,10 @@ impl std::error::Error for LowerModuleError {}
 /// and `machir` dialects registered — the standard way is to call
 /// [`dialects::conversions::register_all`] at registry construction time.
 ///
-/// Any `DialectOp` that isn't covered by the registered lowering patterns
-/// is a hard error at the legality gate, so unhandled ops fail in a single
-/// known location rather than silently leaking into the MachFunction.
+/// Conversion checks structure and mapped identities; legality rejects leftover
+/// dialects or invalid operation types; emission checks its narrower machine
+/// subset. Failure returns no machine-function vector, but earlier conversion
+/// stages may already have changed `module`.
 pub fn lower_module(module: &mut DialectModule) -> Result<Vec<MachFunction>, LowerModuleError> {
     let verif_id = module
         .registry
@@ -147,9 +148,8 @@ pub fn lower_module(module: &mut DialectModule) -> Result<Vec<MachFunction>, Low
         .run(module)
         .map_err(LowerModuleError::TrustIrToMachir)?;
 
-    // Stage 3: legality — only machir.* ops should remain. This is the
-    // single known location where an unhandled DialectOp fails hard (per
-    // Trust Codegen#433 / trust_ir#428 guidance).
+    // Stage 3: only well-typed machir.* operations may remain. The emitter
+    // additionally checks its supported layout and ABI subset.
     let legality = Legality::new().produces(machir_id);
     validate_legality(module, &legality).map_err(LowerModuleError::Legality)?;
 

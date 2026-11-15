@@ -10,7 +10,7 @@
 //! Pair with a wasm runtime (e.g. node) to validate + run the emitted module:
 //!
 //! ```text
-//! cargo run -p trust-cg-codegen --example wasm_lower_demo -- /tmp/demo.wasm
+//! scripts/trust_cargo.sh run -p trust-cg-codegen --example wasm_lower_demo -- /tmp/demo.wasm
 //! node -e 'const b=require("fs").readFileSync("/tmp/demo.wasm"); \
 //!   WebAssembly.instantiate(b).then(({instance})=>{ \
 //!     console.log(instance.exports.sum_to(5,0,1,1)); })'  // -> 15
@@ -494,12 +494,13 @@ fn main() {
         fb.build();
     }
 
-    // Slice 2c: struct-field GEP. pair_sum(x,y): Pair{a:i32@0,b:i32@4};
+    // Slice 2c: explicit field byte offsets. pair_sum(x,y): Pair{a:i32@0,b:i32@4};
     // p=alloca Pair; p.a=x; p.b=y; return p.a + p.b.
     {
         use trust_ir::StructId;
         use trust_ir::ty::{FieldDef, StructDef};
         let sid = mb.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Pair".to_string(),
             fields: vec![
@@ -525,16 +526,15 @@ fn main() {
         let y = fb.add_block_param(e, Ty::I32);
         fb.switch_to_block(e);
         let buf = fb.alloca(Ty::Struct(sid));
-        let zero = fb.iconst(Ty::I32, 0);
         let f0 = fb.iconst(Ty::I32, 0);
-        let f1 = fb.iconst(Ty::I32, 1);
-        let pa = fb.gep(Ty::Struct(sid), buf, vec![zero, f0]);
+        let f1 = fb.iconst(Ty::I32, 4);
+        let pa = fb.gep(Ty::U8, buf, vec![f0]);
         fb.store(Ty::I32, pa, x);
-        let pb = fb.gep(Ty::Struct(sid), buf, vec![zero, f1]);
+        let pb = fb.gep(Ty::U8, buf, vec![f1]);
         fb.store(Ty::I32, pb, y);
-        let qa = fb.gep(Ty::Struct(sid), buf, vec![zero, f0]);
+        let qa = fb.gep(Ty::U8, buf, vec![f0]);
         let va = fb.load(Ty::I32, qa);
-        let qb = fb.gep(Ty::Struct(sid), buf, vec![zero, f1]);
+        let qb = fb.gep(Ty::U8, buf, vec![f1]);
         let vb = fb.load(Ty::I32, qb);
         let s = fb.add(Ty::I32, va, vb);
         fb.ret(vec![s]);
@@ -687,10 +687,17 @@ fn main() {
         }
     }
 
-    let mut module = mb.build();
+    let mut module = mb
+        .build()
+        .expect("ModuleBuilder::build: the example module");
     // compile_module fail-closes on target-free modules: pin the wasm32 shape.
     module.target_info = Some(wasm::wasm32_target_info());
-    let bytes = wasm::compile_module(&module).expect("Slice 0 lowering failed");
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("Slice 0 lowering failed");
 
     let path = std::env::args()
         .nth(1)
@@ -698,4 +705,13 @@ fn main() {
     let mut f = std::fs::File::create(&path).expect("create output file");
     f.write_all(&bytes).expect("write wasm bytes");
     eprintln!("wrote {} bytes to {path}", bytes.len());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

@@ -400,8 +400,9 @@ pub fn x86_produces_value(opcode: X86Opcode) -> bool {
         | Jmp | Jcc | Call | CallR | CallM | Ret
         // Stack store
         | Push
-        // Pseudo with no value
-        | Nop | NopMulti | StackAlloc
+        // Pseudo with no value (`StackAlloc [dst, ..]` writes `dst`, so it
+        // produces a value; production changed that answer after this slice)
+        | Nop | NopMulti
         // Memory fence
         | Mfence
         // Atomic exchange (complex implicit operands)
@@ -493,6 +494,10 @@ pub fn x86_is_removable(opcode: X86Opcode) -> bool {
 }
 
 // ── x86_writes_flags (effects.rs:795-825, VERBATIM) ──────────────────────────
+// Re-pinned to production 10f0b0d4c, which dropped `Not` from the may-write
+// set: x86 NOT (F7 /2, the only form `X86Opcode::Not` encodes) leaves RFLAGS
+// unchanged (Intel SDM Vol. 2B, NOT: "Flags Affected: None"). Variants added
+// to production after b2c58eb are not members of this slice's enum.
 pub fn x86_writes_flags(opcode: X86Opcode) -> bool {
     use X86Opcode::*;
     matches!(
@@ -503,7 +508,7 @@ pub fn x86_writes_flags(opcode: X86Opcode) -> bool {
         | ImulRR | ImulRRI | ImulRM | Idiv | Div | Mul
         | Neg | Inc | Dec
         // Logical
-        | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI | Not
+        | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI
         // Shifts
         | ShlRR | ShlRI | ShrRR | ShrRI | SarRR | SarRI
         // Compare/test

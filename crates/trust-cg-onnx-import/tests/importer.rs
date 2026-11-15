@@ -5,9 +5,135 @@
 use serde_json::{Value, json};
 use trust_cg_onnx_import::{
     AttentionFusionOptions, AttentionFusionUnsupportedReason, Error, GraphFixture, TensorRole,
-    VnnOp, VnnProvenance, attention_fusion_report, attention_fusion_report_for_graph_fixture,
-    import_graph_fixture_str, import_onnx_model_proto_bytes, import_path,
+    VNN_DIALECT, VNN_OP_PREFIX, VnnOp, VnnProvenance, attention_fusion_report,
+    attention_fusion_report_for_graph_fixture, import_graph_fixture_str,
+    import_onnx_model_proto_bytes, import_path,
 };
+
+// ---------------------------------------------------------------------------
+// FORMAT FIREWALL enforcement.
+//
+// The `trust_ir.vnn` dialect label and the `trust_ir.vnn.*` op names asserted
+// throughout this file are HISTORICAL and denote no TrustIr artifact: this
+// crate has no `trust-ir` dependency and emits no TrustIr. The 2026-09-01
+// decision was to KEEP the strings (they are a pinned output contract that
+// roughly 1300 lines of assertions below match byte-for-byte) and document them
+// unmissably instead of churning the wire format. The test below is the
+// enforcing half of that decision: it pins both labels AND checks the premise
+// the documentation rests on, so the claim cannot quietly become false.
+// ---------------------------------------------------------------------------
+
+/// The four dependencies the crate-level FORMAT FIREWALL section enumerates.
+const DOCUMENTED_DEPENDENCIES: [&str; 4] = ["serde", "serde_json", "sha2", "thiserror"];
+
+#[test]
+fn vnn_labels_are_pinned_and_this_crate_emits_no_trustir() {
+    // 1. The emitted labels are a pinned output contract. Renaming them is a
+    //    wire-format break, not a cleanup — see the crate docs for the decision.
+    assert_eq!(VNN_DIALECT, "trust_ir.vnn");
+    assert_eq!(VNN_OP_PREFIX, "trust_ir.vnn.");
+    assert_eq!(VNN_OP_PREFIX, format!("{VNN_DIALECT}."));
+
+    // 2. Every fixture this importer accepts emits exactly those labels.
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut imported = 0usize;
+    let mut entries = std::fs::read_dir(&fixtures)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
+        // Rejection fixtures (e.g. dynamic_shape) are expected to fail; they
+        // emit no module and so carry no label to check.
+        let Ok(module) = import_path(&path) else {
+            continue;
+        };
+        imported += 1;
+        assert_eq!(
+            module.dialect,
+            VNN_DIALECT,
+            "{} emitted an unpinned dialect label",
+            path.display()
+        );
+        for op in &module.ops {
+            assert!(
+                op.op.starts_with(VNN_OP_PREFIX),
+                "{} emitted op `{}` outside the pinned `{VNN_OP_PREFIX}` vocabulary",
+                path.display(),
+                op.op
+            );
+        }
+    }
+    assert!(
+        imported >= 8,
+        "expected the fixture corpus to import; only {imported} module(s) did, so the \
+         label check above proved nothing"
+    );
+
+    // 3. The premise the FORMAT FIREWALL rests on: this crate depends on no
+    //    part of trust-ir, so the `trust_ir.` prefix above cannot denote a
+    //    TrustIr artifact. If this fails, the crate documentation has become
+    //    FALSE and the naming decision must be re-taken — do not delete this
+    //    assertion to make a new dependency land.
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let mut section = String::new();
+    let mut declared = Vec::new();
+    let mut trust_ir_deps = Vec::new();
+    for raw in manifest.lines() {
+        // Comments must be stripped before matching: the manifest deliberately
+        // MENTIONS trust-ir in prose (the `trust-cg-onnx-to-vnn-trust-ir`
+        // rename note), and prose is not a dependency. No `#` appears inside a
+        // quoted value in this manifest, so a plain split is exact here.
+        let line = match raw.find('#') {
+            Some(index) => &raw[..index],
+            None => raw,
+        }
+        .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = header.trim().to_string();
+            continue;
+        }
+        if !section.ends_with("dependencies") {
+            continue;
+        }
+        let key = line
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        if line.contains("trust-ir") || line.contains("trust_ir") {
+            trust_ir_deps.push(format!("[{section}] {line}"));
+        }
+        declared.push(key);
+    }
+    assert!(
+        trust_ir_deps.is_empty(),
+        "trust-cg-onnx-import declared a trust-ir dependency: {trust_ir_deps:?}\n\
+         The crate-level FORMAT FIREWALL states this crate has NO trust-ir dependency \
+         and that its `trust_ir.vnn` labels denote no TrustIr artifact. Adding one \
+         makes that documentation false. Re-open the naming decision (keep-and-document \
+         vs. rename + regenerate goldens) instead of relaxing this check."
+    );
+
+    declared.sort();
+    let mut expected = DOCUMENTED_DEPENDENCIES.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        declared, expected,
+        "the crate-level FORMAT FIREWALL enumerates this crate's ENTIRE dependency \
+         list; update that sentence in src/lib.rs (and DOCUMENTED_DEPENDENCIES here) to \
+         match, after confirming the new dependency does not reach trust-ir"
+    );
+}
 
 #[test]
 fn imports_single_conv2d_fixture() {

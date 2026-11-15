@@ -1,0 +1,34 @@
+# trust-cg-eqsat - Tier E e-graph over trust-ir function bodies (PKG-U1)
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-eqsat"
+description = "Eager acyclic e-graph (Tier E) over trust-ir function bodies, with derivations for an independent checker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+# The engine reads and writes trust-ir bodies and nothing else. It must never
+# depend on trust-cg-eqsat-check: the checker shares no code with the engine
+# (tests/eqsat_determinism_and_mutants.rs, case checker_shares_no_code_with_engine).
+trust-ir = { workspace = true }
+
+[dev-dependencies]
+# Validation of corpus modules and of the bodies the engine returns (tests and
+# the corpus probe example only).
+trust-ir-build = { workspace = true }
+# The exit test replays every derivation the engine emits through the
+# independent checker. A dev-dependency only: the engine's library graph
+# stays free of it.
+trust-cg-eqsat-check = { workspace = true }
+
+[lints]
+workspace = true

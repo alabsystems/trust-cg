@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // crates/rustc-codegen-trust-cg/tests/opt_parity_x86.rs
 //
@@ -30,8 +34,8 @@ mod target_dir_support;
 // THE SWEEP
 // ---------
 // For a set of in-envelope, exit-code-observable, panic=abort guests, compile
-// each at rustc -Copt-level=0, 2 AND 3 through BOTH lanes (stock rustc/LLVM
-// oracle and the trust-cg bridge), run them, and record the full
+// each at trustc -Copt-level=0, 2 AND 3 through BOTH lanes (trustc's own LLVM
+// backend as the oracle, and the trust-cg bridge), run them, and record the full
 //   (program) x (O0,O2,O3) x (bridge,llvm)
 // exit-code matrix. Then classify each program:
 //
@@ -64,7 +68,7 @@ mod target_dir_support;
 //
 // Run (requires the target-bridge toolchain + x86_64-apple-darwin std, x86 host):
 //     cd crates/rustc-codegen-trust-cg
-//     cargo test --release --test opt_parity_x86 -- --nocapture
+//     targo --unverified test --release --test opt_parity_x86 -- --nocapture
 //
 // (Plumbing mirrors tests/real_program_corpus_x86.rs and tests/vec_x86.rs —
 // each bridge test target is its own crate, so the toolchain/dylib/run helpers
@@ -105,7 +109,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 // The three frontend opt levels whose MIR shapes diverge. -O1 is omitted on
 // purpose: the bridge caps at its own O1 internally, and O2/O3 are the levels
@@ -130,12 +134,19 @@ const PARITY_CLEAN_FLOOR: usize = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RunOutcome {
-    Exited { code: i32 },
-    Signalled { signal: i32 },
+    Exited {
+        code: i32,
+    },
+    Signalled {
+        signal: i32,
+    },
     /// rustc (compile+link in one invocation) failed — for the trust-cg lane
     /// this is the fail-closed shape (compile rejection OR an unemitted-symbol
     /// link error; both mean the program never runs, so it cannot miscompile).
-    CompileError { stderr_tail: String, tcg_codes: Vec<String> },
+    CompileError {
+        stderr_tail: String,
+        tcg_codes: Vec<String>,
+    },
     Timeout,
 }
 
@@ -173,69 +184,12 @@ enum Class {
 // Toolchain / dylib plumbing (mirror of tests/real_program_corpus_x86.rs)
 // ---------------------------------------------------------------------------
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run the opt-parity gate"
-    );
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -311,13 +265,11 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> R
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join("bin");
 
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
     // Typed diagnostics for the gap ledger (harmless if the bridge ignores it).
-    cmd.env("TCG_DIAG_JSON", "1");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    cmd.arg(toolchain_support::backend_knobs_arg(&["diag-json"]));
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
@@ -334,17 +286,12 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> R
     .arg("-o")
     .arg(&bin)
     .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let _ = std::fs::remove_dir_all(&dir);
         return RunOutcome::CompileError {
-            stderr_tail: stderr
-                .lines()
-                .rev()
-                .take(6)
-                .collect::<Vec<_>>()
-                .join(" | "),
+            stderr_tail: stderr.lines().rev().take(6).collect::<Vec<_>>().join(" | "),
             tcg_codes: extract_tcg_codes(&stderr),
         };
     }
@@ -872,9 +819,8 @@ fn opt_level_parity_sweep_gate() {
                     // (b) bridge ran at this level — must match LLVM at this level.
                     if let Some(rc) = reference.exit_code() {
                         if *bc != rc {
-                            per_level_miscompile.push(format!(
-                                "O{lvl}: bridge_exit={bc} != llvm_exit={rc}"
-                            ));
+                            per_level_miscompile
+                                .push(format!("O{lvl}: bridge_exit={bc} != llvm_exit={rc}"));
                         }
                     } else {
                         // LLVM did not plain-exit (trap/timeout) while bridge did.
@@ -964,11 +910,21 @@ fn opt_level_parity_sweep_gate() {
                 format!("fail-closed at {} [{}]", levels.join(","), codes.join(","))
             };
             if bridge_ran_codes.is_empty() {
-                note.push_str(" (all levels fail-closed — uniform completeness gap, not opt-conditional)");
+                note.push_str(
+                    " (all levels fail-closed — uniform completeness gap, not opt-conditional)",
+                );
             }
         }
 
-        eprintln!("  => {:?}: {}", class, if note.is_empty() { "all 6 cells agree" } else { &note });
+        eprintln!(
+            "  => {:?}: {}",
+            class,
+            if note.is_empty() {
+                "all 6 cells agree"
+            } else {
+                &note
+            }
+        );
         rows.push(Row {
             name: guest.name,
             what: guest.what,
@@ -979,7 +935,10 @@ fn opt_level_parity_sweep_gate() {
     }
 
     // ---- Report: the full matrix ----
-    let parity_clean = rows.iter().filter(|r| r.class == Class::ParityClean).count();
+    let parity_clean = rows
+        .iter()
+        .filter(|r| r.class == Class::ParityClean)
+        .count();
     let opt_gap = rows.iter().filter(|r| r.class == Class::OptGap).count();
     let miscompile = rows.iter().filter(|r| r.class == Class::Miscompile).count();
 
@@ -1039,10 +998,7 @@ fn opt_level_parity_sweep_gate() {
             eprintln!("  {m}");
         }
     }
-    eprintln!(
-        "\nwall time: {:.1}s",
-        started.elapsed().as_secs_f64()
-    );
+    eprintln!("\nwall time: {:.1}s", started.elapsed().as_secs_f64());
     eprintln!("======================================================================\n");
 
     // ---- The gate ----

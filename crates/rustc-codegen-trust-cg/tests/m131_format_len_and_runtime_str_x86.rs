@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: two `format!` SILENT-MISCOMPILE classes found by the FUZZ-1
 // differential sweep over the runtime-`&str` `format!` surface (RTFMT-1), now
@@ -19,9 +23,15 @@ mod target_dir_support;
 // the isel catches when read directly ([TCG-REGALLOC-063], fail-closed), but the
 // format integer emitter re-read it as a `Load` from an UNINITIALIZED slot,
 // DEFEATING that guard and printing a stale garbage integer (differential:
-// `a.len()==7` printed as `4096`, so `"measure#7"` became `"measure#4096"`). Now
-// the classifier rejects any integer placeholder whose value transitively depends
-// on a length.
+// `a.len()==7` printed as `4096`, so `"measure#7"` became `"measure#4096"`). The
+// classifier then rejected any integer placeholder whose value transitively
+// depended on a length. That gate is gone (2026-10-03): the undefined value came
+// from `str::len` being a real -O0 call taking the `&str` pair by value, whose
+// by-value-aggregate retype poisoned the caller's slot; the retype is scoped to
+// a call-site temp and `str::len` is intercepted, and with the gate disabled
+// every length shape matched LLVM natively on aarch64-apple-darwin at -O0..-O3
+// (`format_length_black_box_aarch64` pins these reproducers to MATCH there).
+// Here they must still match LLVM or fail closed.
 //
 // CLASS 2 [TCG-FMT-RTSTR]: a GENUINE runtime-length `&str` placeholder (no
 // compile-time length), e.g. a pre-bound `String::as_str()` view: `let a =
@@ -37,65 +47,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -126,9 +85,8 @@ fn try_compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -204,7 +162,7 @@ fn format_len_and_runtime_str_never_miscompile() {
     let dir = workdir("run");
 
     let shapes: &[(&str, &str)] = &[
-        // ---- CLASS 1 [TCG-FMT-LEN]: integer placeholder = a `.len()` ----
+        // ---- CLASS 1 (formerly [TCG-FMT-LEN]): integer placeholder = a `.len()` ----
         // The canonical repro: `a.len()` printed as a stale `4096`.
         (
             "len_after_str",
@@ -290,7 +248,11 @@ fn const_length_runtime_str_still_compiles_and_matches() {
         let (tout, tbin) = try_compile(&dir, "cl_t", &src, Some(&dylib), opt);
         if tout.status.success() {
             compiled_any = true;
-            assert_eq!(run_exit_code(&tbin), llvm, "const-length format! diverged at opt={opt}");
+            assert_eq!(
+                run_exit_code(&tbin),
+                llvm,
+                "const-length format! diverged at opt={opt}"
+            );
         }
     }
     assert!(

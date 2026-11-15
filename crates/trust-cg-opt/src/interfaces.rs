@@ -11,7 +11,7 @@
 //!
 //! The interfaces in this module mirror the MLIR op-interface concept and
 //! back the [`rewrite`](crate::rewrite) framework's interface-aware
-//! constraints. See `designs/2026-04-18-rewrite-and-interfaces.md`.
+//! constraints.
 //!
 //! # Interfaces
 //!

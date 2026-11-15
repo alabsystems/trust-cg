@@ -72,7 +72,7 @@
 //! path. The `MovR` writebacks intentionally re-define the SAME carrier dsts —
 //! they are the same block-param writebacks the latch performed.
 
-use std::collections::HashSet;
+use crate::fast_hash::FxHashSet as HashSet;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, CondCode, InstId, MachFunction, MachInst, MachOperand, PassId,
@@ -151,7 +151,7 @@ pub fn run_extended_loop_rotation(
     func: &mut MachFunction,
     provenance: Option<&mut ProvenanceMap>,
 ) -> bool {
-    if !loop_rotate_enabled() || !loop_rotate_extended_enabled() {
+    if !loop_rotate_extended_enabled() {
         return false;
     }
     run_loop_latch_layout_combine(func, provenance, true)
@@ -176,7 +176,11 @@ fn run_loop_latch_layout_combine(
         // depends on.
         let vreg_uses = VregUseIndex::build(func);
         let dom = DomTree::compute(func);
-        let loops = LoopAnalysis::compute(func, &dom);
+        // This driver reads only header/latch/body/preheader. Parent/depth are
+        // irrelevant to every admission tier, and computing them is O(L^2).
+        // Keep the mandatory one-rewrite-then-rebuild/reoffer semantics while
+        // avoiding that unused work on every iteration.
+        let loops = LoopAnalysis::compute_for_rewrite_driver(func, &dom);
         // The EXTENDED tier rotates INNERMOST loops only: rotating a loop
         // that contains other loops buys one taken branch per OUTER
         // iteration — amortized over the whole inner execution, nothing —
@@ -234,38 +238,23 @@ fn rewrite_loop(
     if rewrite_counted_two_block_loop(func, lp, provenance.as_deref_mut()) {
         return true;
     }
-    if loop_rotate_enabled() {
-        // Tier 3a: rotate a top-tested two-block counted loop whose header exits
-        // on the CONDITION (`b.cond exit; b body`) — the inverse orientation of
-        // tier 1's `b.cond body; b exit`. The header is already a valid zero-trip
-        // guard, so it is left untouched; the loop test is duplicated into a
-        // split latch (fib2's tail-recursion-elim accumulator loop).
-        if rewrite_rotated_two_block_case_b(func, lp, provenance.as_deref_mut()) {
-            return true;
-        }
-        // Tier 3b: rotate a loop whose header is a PURE TEST-ONLY guard by
-        // duplicating that test into each in-loop backedge predecessor, so the
-        // steady state skips the header round-trip (ackermann's countdown loop
-        // with two backedges, header `cbz M, exit`).
-        if duplicate_header_test_into_latches(
-            func,
-            lp,
-            provenance.as_deref_mut(),
-            extended,
-            vreg_uses,
-        ) {
-            return true;
-        }
+    // Tier 3a: rotate a top-tested two-block counted loop whose header exits
+    // on the CONDITION (`b.cond exit; b body`) — the inverse orientation of
+    // tier 1's `b.cond body; b exit`. The header is already a valid zero-trip
+    // guard, so it is left untouched; the loop test is duplicated into a
+    // split latch (fib2's tail-recursion-elim accumulator loop).
+    if rewrite_rotated_two_block_case_b(func, lp, provenance.as_deref_mut()) {
+        return true;
     }
-    latch_taildup_enabled() && tail_duplicate_pure_latch_chain(func, lp, provenance)
-}
-
-/// Compile-time kill switch: set `TCG_NO_LOOP_ROTATE` (any value) to disable the
-/// two loop-ROTATION tiers (case-B two-block rotation and test-only-header
-/// duplication). The whole pass is additionally governed by
-/// `TRUST_CG_DISABLE_PASSES=looplatch`.
-fn loop_rotate_enabled() -> bool {
-    std::env::var_os("TCG_NO_LOOP_ROTATE").is_none()
+    // Tier 3b: rotate a loop whose header is a PURE TEST-ONLY guard by
+    // duplicating that test into each in-loop backedge predecessor, so the
+    // steady state skips the header round-trip (ackermann's countdown loop
+    // with two backedges, header `cbz M, exit`).
+    if duplicate_header_test_into_latches(func, lp, provenance.as_deref_mut(), extended, vreg_uses)
+    {
+        return true;
+    }
+    tail_duplicate_pure_latch_chain(func, lp, provenance)
 }
 
 /// Gate for the EXTENDED tier-3b rotation (inverted-orientation headers,
@@ -276,8 +265,7 @@ fn loop_rotate_enabled() -> bool {
 /// is fixed at the source: neon-fill's NATIVE arm now requires the canonical
 /// unconditional latch backedge and classifies rotated loops through its
 /// ROTATED arm's `rotated_exit` guard instead. `TCG_NO_LOOP_ROTATE_EXT`
-/// remains as a bisection kill switch for the extension alone
-/// (`TCG_NO_LOOP_ROTATE` still disables all rotation tiers).
+/// remains as a bisection kill switch for the extension alone.
 /// Measured upside: b1_mispredict -11% (1.140x -> 1.016x vs LLVM).
 /// Consulted only by [`run_extended_loop_rotation`]; the in-pipeline pass
 /// instance always runs legacy-only.
@@ -468,7 +456,7 @@ fn parse_bcond_header(
         cond: if branch_to_body {
             branch_cond
         } else {
-            branch_cond.invert()
+            branch_cond.logical_complement()?
         },
         body: BlockId(0),
         exit: BlockId(0),
@@ -515,7 +503,7 @@ fn parse_materialized_bool_before_bcond(
     Some(HeaderCondition {
         compare_id,
         compare_inst: compare.clone(),
-        cond: cond_for_body(branch_to_body, branch_takes_when_cset_true, cset_cond),
+        cond: cond_for_body(branch_to_body, branch_takes_when_cset_true, cset_cond)?,
         body: BlockId(0),
         exit: BlockId(0),
         branch_id: insts[cond_pos],
@@ -551,7 +539,7 @@ fn parse_cbnz_header(
     Some(HeaderCondition {
         compare_id,
         compare_inst: compare.clone(),
-        cond: cond_for_body(branch_to_body, branch_takes_when_cset_true, cset_cond),
+        cond: cond_for_body(branch_to_body, branch_takes_when_cset_true, cset_cond)?,
         body: BlockId(0),
         exit: BlockId(0),
         branch_id: insts[cond_pos],
@@ -563,12 +551,14 @@ fn cond_for_body(
     branch_to_body: bool,
     branch_takes_when_cset_true: bool,
     cset_cond: CondCode,
-) -> CondCode {
-    if branch_to_body == branch_takes_when_cset_true {
+) -> Option<CondCode> {
+    // Materialized CSET conditions must be representable in both senses.
+    let complement = cset_cond.logical_complement()?;
+    Some(if branch_to_body == branch_takes_when_cset_true {
         cset_cond
     } else {
-        cset_cond.invert()
-    }
+        complement
+    })
 }
 
 fn header_has_only_condition_insts(
@@ -576,7 +566,7 @@ fn header_has_only_condition_insts(
     parsed: &HeaderCondition,
     exit_branch_id: InstId,
 ) -> bool {
-    let mut allowed: HashSet<InstId> = HashSet::new();
+    let mut allowed: HashSet<InstId> = HashSet::default();
     allowed.insert(parsed.compare_id);
     allowed.insert(parsed.branch_id);
     allowed.insert(exit_branch_id);
@@ -888,7 +878,7 @@ fn parse_case_b_header(func: &MachFunction, lp: &NaturalLoop) -> Option<CaseBHea
     Some(CaseBHeader {
         compare_id,
         compare_inst: compare.clone(),
-        continue_cond: exit_cond.invert(),
+        continue_cond: exit_cond.logical_complement()?,
         exit,
     })
 }
@@ -1369,13 +1359,6 @@ const MAX_TAILDUP_CHAIN_INSTS: usize = 8;
 /// Blocks the latch chain may span.
 const MAX_TAILDUP_CHAIN_BLOCKS: usize = 4;
 
-/// Compile-time kill switch: set `TCG_NO_LATCH_TAILDUP` (any value) to disable
-/// the rotated-loop tail-duplication tier. The whole pass (both tiers) is
-/// additionally governed by `TRUST_CG_DISABLE_PASSES=looplatch`.
-fn latch_taildup_enabled() -> bool {
-    std::env::var_os("TCG_NO_LATCH_TAILDUP").is_none()
-}
-
 /// The exact pure instruction sequence executed from the head of a latch chain
 /// through the terminating backedge `B header` (exclusive).
 struct PureLatchChain {
@@ -1401,7 +1384,7 @@ fn parse_pure_latch_chain(
 ) -> Option<PureLatchChain> {
     let mut cloned = Vec::new();
     let mut bcond_targets = Vec::new();
-    let mut visited: HashSet<BlockId> = HashSet::new();
+    let mut visited: HashSet<BlockId> = HashSet::default();
     let mut cur = head;
 
     for _ in 0..MAX_TAILDUP_CHAIN_BLOCKS {
@@ -1600,36 +1583,59 @@ fn add_edge_unique(func: &mut MachFunction, from: BlockId, to: BlockId) {
 /// exactly enough to answer the question without losing precision.
 #[derive(Default)]
 struct VregUseIndex {
-    /// vreg id -> (first using block, used by two or more distinct blocks)
-    ///
-    /// Fixed-seed hashing: this map is INSERTED INTO and LOOKED UP, never
-    /// iterated, so the hasher cannot reach the output. It is rebuilt once per
-    /// driver iteration over every operand of every instruction, which is the
-    /// only reason it is worth the swap.
-    uses: crate::fast_hash::FxHashMap<u32, (BlockId, bool)>,
+    /// vreg id -> (first using block, used by two or more distinct blocks),
+    /// for ids below the function's `next_vreg` (every id the function
+    /// allocated); `None` for an unused id. A dense table: this index is
+    /// rebuilt once per driver iteration over every operand of every
+    /// instruction, where the hash map it replaced was most of the build.
+    dense: Vec<Option<(BlockId, bool)>>,
+    /// The same, for any id at or above `next_vreg` (none in a well-formed
+    /// function). Inserted into and looked up, never iterated, so the hasher
+    /// cannot reach the output.
+    overflow: crate::fast_hash::FxHashMap<u32, (BlockId, bool)>,
 }
 
 impl VregUseIndex {
+    /// Largest dense table this index allocates (ids above it overflow).
+    const DENSE_LIMIT: u32 = 1 << 22;
+
     fn build(func: &MachFunction) -> Self {
-        let mut uses: crate::fast_hash::FxHashMap<u32, (BlockId, bool)> =
+        let mut dense: Vec<Option<(BlockId, bool)>> =
+            vec![None; func.next_vreg.min(Self::DENSE_LIMIT) as usize];
+        let mut overflow: crate::fast_hash::FxHashMap<u32, (BlockId, bool)> =
             crate::fast_hash::FxHashMap::default();
         for (index, block) in func.blocks.iter().enumerate() {
             let bid = BlockId(index as u32);
             for &iid in &block.insts {
                 for op in &func.inst(iid).operands {
                     if let MachOperand::VReg(v) = op {
-                        uses.entry(v.id)
-                            .and_modify(|(first, multi)| {
+                        let slot = match dense.get_mut(v.id as usize) {
+                            Some(slot) => slot,
+                            None => {
+                                overflow
+                                    .entry(v.id)
+                                    .and_modify(|(first, multi)| {
+                                        if *first != bid {
+                                            *multi = true;
+                                        }
+                                    })
+                                    .or_insert((bid, false));
+                                continue;
+                            }
+                        };
+                        match slot {
+                            Some((first, multi)) => {
                                 if *first != bid {
                                     *multi = true;
                                 }
-                            })
-                            .or_insert((bid, false));
+                            }
+                            None => *slot = Some((bid, false)),
+                        }
                     }
                 }
             }
         }
-        Self { uses }
+        Self { dense, overflow }
     }
 
     /// Is `vreg` used by any instruction outside `block`?
@@ -1640,9 +1646,13 @@ impl VregUseIndex {
     /// instruction belongs to exactly one block, so "not in header.insts" and
     /// "in some other block" are the same set.)
     fn used_outside(&self, vreg: u32, block: BlockId) -> bool {
-        match self.uses.get(&vreg) {
+        let entry = match self.dense.get(vreg as usize) {
+            Some(entry) => *entry,
+            None => self.overflow.get(&vreg).copied(),
+        };
+        match entry {
             None => false,
-            Some((first, multi)) => *multi || *first != block,
+            Some((first, multi)) => multi || first != block,
         }
     }
 }
@@ -1658,8 +1668,24 @@ thread_local! {
     ///
     /// The index is refreshed once per outer iteration. It does not need to be
     /// perfectly fresh to be CORRECT — see `next_block`.
-    static BLOCK_ORDER_POS: std::cell::RefCell<crate::fast_hash::FxHashMap<BlockId, usize>> =
-        std::cell::RefCell::new(crate::fast_hash::FxHashMap::default());
+    ///
+    /// Indexed by `BlockId.0`; [`NO_POSITION`] for a block not in the order.
+    static BLOCK_ORDER_POS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`BLOCK_ORDER_POS`]'s "not in `block_order`".
+const NO_POSITION: usize = usize::MAX;
+
+/// The cached layout position of `block`, if the index has one.
+fn cached_block_order_position(block: BlockId) -> Option<usize> {
+    BLOCK_ORDER_POS.with(|index| {
+        index
+            .borrow()
+            .get(block.0 as usize)
+            .copied()
+            .filter(|&pos| pos != NO_POSITION)
+    })
 }
 
 /// Rebuild the `block_order` position index. Cheap (one pass) and called once
@@ -1669,9 +1695,14 @@ fn refresh_block_order_index(func: &MachFunction) {
     BLOCK_ORDER_POS.with(|index| {
         let mut index = index.borrow_mut();
         index.clear();
-        index.reserve(func.block_order.len());
+        index.resize(func.blocks.len(), NO_POSITION);
         for (position, &block) in func.block_order.iter().enumerate() {
-            index.insert(block, position);
+            // A block id outside `func.blocks` stays uncached; its lookups
+            // take the scan, as a missing entry always did. A repeated id
+            // keeps its last position, as the map's overwriting insert did.
+            if let Some(slot) = index.get_mut(block.0 as usize) {
+                *slot = position;
+            }
         }
     });
 }
@@ -1683,7 +1714,7 @@ fn refresh_block_order_index(func: &MachFunction) {
 /// A stale or missing entry falls back to the original linear scan, so this can
 /// never return something the scan would not have.
 fn block_order_position(func: &MachFunction, block: BlockId) -> Option<usize> {
-    let cached = BLOCK_ORDER_POS.with(|index| index.borrow().get(&block).copied());
+    let cached = cached_block_order_position(block);
     if let Some(pos) = cached
         && func.block_order.get(pos) == Some(&block)
     {
@@ -1699,7 +1730,7 @@ fn next_block(func: &MachFunction, block: BlockId) -> Option<BlockId> {
     // entry falls back to the original scan. So the index can never produce an
     // answer the linear scan would not have produced — it only makes the common
     // case O(1).
-    let cached = BLOCK_ORDER_POS.with(|index| index.borrow().get(&block).copied());
+    let cached = cached_block_order_position(block);
     if let Some(pos) = cached
         && func.block_order.get(pos) == Some(&block)
     {
@@ -1870,9 +1901,154 @@ mod tests {
         )
     }
 
+    /// The dense use index answers `used_outside` exactly as the hash-map
+    /// index it replaced, for every id (ids at and above `next_vreg` too) and
+    /// every block, on generated functions.
+    #[test]
+    fn dense_vreg_use_index_answers_what_the_map_index_answered() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        for case in 0..200 {
+            let mut func = MachFunction::new(format!("uses{case}"), Signature::new(vec![], vec![]));
+            let blocks = 1 + next(6) as usize;
+            for _ in 1..blocks {
+                func.create_block();
+            }
+            for b in 0..blocks {
+                for _ in 0..next(5) {
+                    let operands = (0..1 + next(3))
+                        .map(|_| MachOperand::VReg(VReg::new(next(40) as u32, RegClass::Gpr64)))
+                        .collect();
+                    let id = func.push_inst(MachInst::new(AArch64Opcode::AddRR, operands));
+                    func.append_inst(BlockId(b as u32), id);
+                }
+            }
+            // Some ids lie at or above `next_vreg`, in the overflow map.
+            func.next_vreg = next(45) as u32;
+            let mut reference: crate::fast_hash::FxHashMap<u32, (BlockId, bool)> =
+                crate::fast_hash::FxHashMap::default();
+            for (index, block) in func.blocks.iter().enumerate() {
+                let bid = BlockId(index as u32);
+                for &iid in &block.insts {
+                    for op in &func.inst(iid).operands {
+                        if let MachOperand::VReg(v) = op {
+                            reference
+                                .entry(v.id)
+                                .and_modify(|(first, multi)| {
+                                    if *first != bid {
+                                        *multi = true;
+                                    }
+                                })
+                                .or_insert((bid, false));
+                        }
+                    }
+                }
+            }
+            let index = VregUseIndex::build(&func);
+            for vreg in 0..50u32 {
+                for b in 0..=blocks as u32 {
+                    let expected = match reference.get(&vreg) {
+                        None => false,
+                        Some((first, multi)) => *multi || *first != BlockId(b),
+                    };
+                    assert_eq!(
+                        index.used_outside(vreg, BlockId(b)),
+                        expected,
+                        "case {case}: used_outside(v{vreg}, bb{b})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The dense layout index answers `next_block` and `block_order_position`
+    /// as the scan does, also after the order changes under it, for an id
+    /// outside the function and for an id the order repeats.
+    #[test]
+    fn dense_block_order_index_answers_what_the_scan_answers() {
+        let mut func = MachFunction::new("order".to_string(), Signature::new(vec![], vec![]));
+        for _ in 0..5 {
+            func.create_block();
+        }
+        let scan_next = |func: &MachFunction, block: BlockId| {
+            let pos = func.block_order.iter().position(|&b| b == block)?;
+            func.block_order.get(pos + 1).copied()
+        };
+        refresh_block_order_index(&func);
+        for b in 0..8 {
+            assert_eq!(next_block(&func, BlockId(b)), scan_next(&func, BlockId(b)));
+        }
+        // A stale index after a move is verified against the live order.
+        move_block_after(&mut func, BlockId(1), BlockId(4));
+        for b in 0..8 {
+            assert_eq!(next_block(&func, BlockId(b)), scan_next(&func, BlockId(b)));
+            assert_eq!(
+                block_order_position(&func, BlockId(b)),
+                func.block_order.iter().position(|&x| x == BlockId(b))
+            );
+        }
+        // A repeated id: the index keeps its last position, as the map did.
+        func.block_order.push(BlockId(2));
+        refresh_block_order_index(&func);
+        assert_eq!(
+            block_order_position(&func, BlockId(2)),
+            Some(func.block_order.len() - 1)
+        );
+        assert_eq!(next_block(&func, BlockId(2)), None);
+    }
+
     fn run_pass(func: &mut MachFunction) -> bool {
         let mut pass = LoopLatchLayoutCombine;
         pass.run(func)
+    }
+
+    #[test]
+    fn test_al_nv_loop_branch_complement_refused() {
+        for cc in [CondCode::AL, CondCode::NV] {
+            let mut func = MachFunction::new(
+                "unconditional_guard".to_string(),
+                Signature::new(vec![], vec![]),
+            );
+            let entry = func.entry;
+            let exit = func.create_block();
+            push(
+                &mut func,
+                entry,
+                MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]),
+            );
+            push(
+                &mut func,
+                entry,
+                MachInst::new(
+                    AArch64Opcode::BCond,
+                    vec![imm(cc.encoding() as i64), block(exit)],
+                ),
+            );
+            let insts = &func.block(entry).insts;
+            assert_eq!(parse_bcond_header(&func, insts, 1, true).unwrap().cond, cc);
+            assert!(parse_bcond_header(&func, insts, 1, false).is_none());
+        }
+    }
+
+    #[test]
+    fn test_al_nv_materialized_loop_refuses_transaction() {
+        for cc in [CondCode::AL, CondCode::NV] {
+            let (mut func, ids) = make_counted_loop();
+            func.inst_mut(ids.cset).operands[1] = imm(cc.encoding() as i64);
+            let before = format!("{func:?}");
+            let mut provenance = ProvenanceMap::new();
+            assert!(!LoopLatchLayoutCombine.run_with_provenance(&mut func, &mut provenance));
+            assert_eq!(format!("{func:?}"), before);
+            assert_eq!(
+                format!("{provenance:?}"),
+                format!("{:?}", ProvenanceMap::new())
+            );
+        }
     }
 
     #[test]

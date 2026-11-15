@@ -75,8 +75,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -222,17 +233,23 @@ fn build_call_through_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("indirect_test");
 
     // Callee signature (i64, i64) -> i64
-    let binop_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let binop_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // _call_through(ptr, i64, i64) -> i64
-    let ct_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ct_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(FuncId::new(0), "_call_through", ct_ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -255,7 +272,9 @@ fn build_call_through_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -267,17 +286,23 @@ fn build_call_through_module() -> TrustIrModule {
 fn build_dispatch_select_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("indirect_test");
 
-    let binop_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let binop_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // _dispatch(i64 sel, ptr fp0, ptr fp1, i64 a, i64 b) -> i64
-    let dispatch_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::Ptr, Ty::Ptr, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let dispatch_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::Ptr, Ty::Ptr, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(FuncId::new(0), "_dispatch", dispatch_ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -325,7 +350,9 @@ fn build_dispatch_select_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -409,4 +436,13 @@ int main(void) {
 "#;
     let r = differential_test("dispatch_select", &module, c_source);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

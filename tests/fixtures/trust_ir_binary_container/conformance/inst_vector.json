@@ -1,0 +1,340 @@
+{
+  "name": "inst_vector",
+  "functions": [
+    {
+      "id": 0,
+      "name": "batch_i32",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Ptr"
+            ],
+            [
+              1,
+              {
+                "Vector": [
+                  "I32",
+                  4
+                ]
+              }
+            ],
+            [
+              2,
+              {
+                "Vector": [
+                  "I32",
+                  4
+                ]
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "ptr": 0,
+                  "volatile": false,
+                  "align": 16
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "lhs": 1,
+                  "rhs": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Sub",
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "lhs": 4,
+                  "rhs": 3
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "lhs": 5,
+                  "rhs": 2
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "And",
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "lhs": 6,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Or",
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "lhs": 7,
+                  "rhs": 2
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "lhs": 8,
+                  "rhs": 3
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Eq",
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "lhs": 9,
+                  "rhs": 3
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Select": {
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "cond": 10,
+                  "then_val": 9,
+                  "else_val": 3
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": {
+                    "Vector": [
+                      "I32",
+                      4
+                    ]
+                  },
+                  "ptr": 0,
+                  "value": 11,
+                  "volatile": false,
+                  "align": 16
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    11,
+                    10
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Ptr",
+        {
+          "Vector": [
+            "I32",
+            4
+          ]
+        },
+        {
+          "Vector": [
+            "I32",
+            4
+          ]
+        }
+      ],
+      "returns": [
+        {
+          "Vector": [
+            "I32",
+            4
+          ]
+        },
+        {
+          "Vector": [
+            "Bool",
+            4
+          ]
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

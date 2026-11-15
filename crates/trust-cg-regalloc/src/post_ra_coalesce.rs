@@ -58,12 +58,6 @@ const NOP_OPCODE: u16 = 0xFFFF;
 /// objects are byte-identical to the pre-widening compiler.
 const WIDE_BACKDEF_KILL_SWITCH: &str = "TCG_NO_WIDE_BACKDEF_COALESCE";
 
-/// Kill switch for the SUB-REGISTER copy transforms — the cross-width GPR
-/// self-copy (`Copy Wr <- Xr`, emitted `mov wr, wr`) and the narrow-return
-/// zero-extension collapse (`UXTW Xd, Ws`, emitted `mov wd, ws`). When set,
-/// both shapes are left alone exactly as before.
-const SUBREG_COPY_KILL_SWITCH: &str = "TCG_NO_SUBREG_COPY_COALESCE";
-
 /// Which of the two independently-killable transforms this run may perform.
 /// Read once per pass invocation and threaded down, so a single run makes one
 /// decision for the whole function (and unit tests can drive every setting
@@ -73,8 +67,10 @@ pub struct PostRACoalesceConfig {
     /// Admit the wide pure-single-def ALU allowlist for backward-def
     /// retargeting (`TCG_NO_WIDE_BACKDEF_COALESCE` clears it).
     pub wide_backdef: bool,
-    /// Admit the sub-register GPR32/GPR64 copy transforms
-    /// (`TCG_NO_SUBREG_COPY_COALESCE` clears it).
+    /// Admit the sub-register GPR32/GPR64 copy transforms: the cross-width
+    /// GPR self-copy (`Copy Wr <- Xr`, emitted `mov wr, wr`) and the
+    /// narrow-return zero-extension collapse (`UXTW Xd, Ws`, emitted
+    /// `mov wd, ws`).
     pub subreg_copies: bool,
 }
 
@@ -91,11 +87,11 @@ impl PostRACoalesceConfig {
         subreg_copies: true,
     };
 
-    /// Derive the configuration from the process environment kill switches.
+    /// Derive the configuration from the process environment kill switch.
     fn from_env() -> Self {
         Self {
             wide_backdef: std::env::var_os(WIDE_BACKDEF_KILL_SWITCH).is_none(),
-            subreg_copies: std::env::var_os(SUBREG_COPY_KILL_SWITCH).is_none(),
+            subreg_copies: true,
         }
     }
 }
@@ -191,6 +187,13 @@ pub fn post_ra_coalesce(func: &mut MachFunction) -> PostRACoalesceResult {
     post_ra_coalesce_with_config(func, PostRACoalesceConfig::from_env())
 }
 
+/// Remove only physical self-copies, without renaming registers or retargeting
+/// definitions. Cross-width Wn/Xn aliases use the same high-half liveness proof
+/// as the full pass. This bounded mode is suitable for O0 canonicalization.
+pub fn eliminate_physical_self_copies(func: &mut MachFunction) -> PostRACoalesceResult {
+    post_ra_coalesce_impl(func, PostRACoalesceConfig::from_env(), true)
+}
+
 /// [`post_ra_coalesce`] with the wide backward-def allowlist forced on or off.
 /// The public entry point derives `wide` from the
 /// `TCG_NO_WIDE_BACKDEF_COALESCE` kill switch; tests drive both settings here
@@ -200,13 +203,21 @@ pub fn post_ra_coalesce_with_config(
     func: &mut MachFunction,
     cfg: PostRACoalesceConfig,
 ) -> PostRACoalesceResult {
+    post_ra_coalesce_impl(func, cfg, false)
+}
+
+fn post_ra_coalesce_impl(
+    func: &mut MachFunction,
+    cfg: PostRACoalesceConfig,
+    identity_only: bool,
+) -> PostRACoalesceResult {
     // Fall back to the exact historical implementation if any physical
     // register encoding exceeds the bitset capacity. Mutations never
     // introduce register encodings that are not already present (renames use
     // `src`, retargets use `dst`, NOPs only clear), so a single up-front scan
     // suffices.
     if function_has_out_of_range_preg(func) {
-        return post_ra_coalesce_reference_with_config(func, cfg);
+        return post_ra_coalesce_reference_impl(func, cfg, identity_only);
     }
 
     let mut result = PostRACoalesceResult::default();
@@ -221,7 +232,9 @@ pub fn post_ra_coalesce_with_config(
             .collect()
     };
 
-    let mut cache = CachedLiveness::new(func.blocks.len());
+    // Built at the first block that needs liveness (a function with no copy
+    // candidate never builds it), from the function as it is then.
+    let mut cache: Option<SccLiveness> = None;
 
     for block_idx in block_indices {
         let block_insts: Vec<InstId> = func.blocks[block_idx].insts.clone();
@@ -236,9 +249,10 @@ pub fn post_ra_coalesce_with_config(
             continue;
         }
 
-        // Reproduce the reference's block-start liveness snapshot: recompute
-        // (from per-block summaries) iff a mutation occurred since the last
-        // fixpoint.
+        // Reproduce the reference's block-start liveness snapshot: re-solve
+        // (from per-block summaries) the strongly connected components a
+        // mutation since they were last solved can have changed and this
+        // block's successors read ([`SccLiveness`]).
         // Sub-stage timers (TRUST_CG_TIME_PASSES, `stage=post-ra::*`); pure
         // instrumentation. Measured 2026-08-27: live-out (the liveness cache's
         // from-scratch re-solve after each coalesced block) is ~91% of this
@@ -246,14 +260,25 @@ pub fn post_ra_coalesce_with_config(
         // tried and measured out (B/A 0.999 on the corpus — the affected
         // region is effectively the whole function inside loops).
         let tl = crate::ra_stage_start();
-        let block_live_out: BTreeSet<PReg> = cache.live_out_at_block_start(func, block_idx);
+        let block_live_out: BTreeSet<PReg> = cache
+            .get_or_insert_with(|| SccLiveness::new(func))
+            .live_out_at_block_start(func, block_idx);
         crate::ra_stage_end(&func.name, false, "post-ra::live-out", tl);
 
         let copies_before = result.copies_removed;
         let tc = crate::ra_stage_start();
-        coalesce_block(func, &block_insts, &block_live_out, &mut result, cfg);
+        coalesce_block(
+            func,
+            &block_insts,
+            &block_live_out,
+            &mut result,
+            cfg,
+            identity_only,
+        );
         crate::ra_stage_end(&func.name, false, "post-ra::coalesce-block", tc);
-        if result.copies_removed != copies_before {
+        if result.copies_removed != copies_before
+            && let Some(cache) = &mut cache
+        {
             // The block's transfer function may have changed; its summary must
             // be rebuilt and the global fixpoint refreshed before the next
             // block consults liveness.
@@ -290,6 +315,14 @@ pub fn post_ra_coalesce_reference_with_config(
     func: &mut MachFunction,
     cfg: PostRACoalesceConfig,
 ) -> PostRACoalesceResult {
+    post_ra_coalesce_reference_impl(func, cfg, false)
+}
+
+fn post_ra_coalesce_reference_impl(
+    func: &mut MachFunction,
+    cfg: PostRACoalesceConfig,
+    identity_only: bool,
+) -> PostRACoalesceResult {
     let mut result = PostRACoalesceResult::default();
 
     // Process each block independently (block-local analysis).
@@ -306,7 +339,14 @@ pub fn post_ra_coalesce_reference_with_config(
         let liveness = compute_physical_liveness(func);
         let block_live_out = &liveness.live_out[block_idx];
         let block_insts: Vec<InstId> = func.blocks[block_idx].insts.clone();
-        coalesce_block(func, &block_insts, block_live_out, &mut result, cfg);
+        coalesce_block(
+            func,
+            &block_insts,
+            block_live_out,
+            &mut result,
+            cfg,
+            identity_only,
+        );
     }
 
     // Remove NOP'd instructions from block instruction lists.
@@ -327,6 +367,7 @@ fn coalesce_block(
     block_live_out: &BTreeSet<PReg>,
     result: &mut PostRACoalesceResult,
     cfg: PostRACoalesceConfig,
+    identity_only: bool,
 ) {
     // We process copies in forward order. When a copy is coalesced by
     // renaming, we update subsequent instructions in the block immediately.
@@ -339,7 +380,8 @@ fn coalesce_block(
         // Case 0: the narrow-return zero-extension `UXTW Xd, Ws` — encoded as
         // `mov wd, ws`. It is not a copy opcode, so it is handled first and on
         // its own terms (see `try_narrow_zext_collapse`).
-        if cfg.subreg_copies
+        if !identity_only
+            && cfg.subreg_copies
             && inst.opcode == trust_cg_ir::inst::AArch64Opcode::Uxtw as u16
             && !inst.flags.is_call_arg_setup()
             && let Some((ext_dst, ext_src)) = narrow_zext_operands(inst)
@@ -432,7 +474,7 @@ fn coalesce_block(
             continue;
         }
 
-        if !can_coalesce_copy_registers(dst_preg, src_preg) {
+        if identity_only || !can_coalesce_copy_registers(dst_preg, src_preg) {
             continue;
         }
 
@@ -1475,7 +1517,9 @@ fn block_summary(func: &MachFunction, block_idx: usize, masks: &OverlapMasks) ->
     BlockSummary { gen_set, kill }
 }
 
-/// Whole-function liveness cache with mutation-driven invalidation.
+/// Whole-function liveness cache with mutation-driven invalidation: the
+/// sweep's cache before [`SccLiveness`], kept as the summary-fixpoint oracle.
+#[cfg(test)]
 struct CachedLiveness {
     summaries: Vec<BlockSummary>,
     live_out: Vec<PRegSet>,
@@ -1486,6 +1530,7 @@ struct CachedLiveness {
     valid: bool,
 }
 
+#[cfg(test)]
 impl CachedLiveness {
     fn new(num_blocks: usize) -> Self {
         CachedLiveness {
@@ -1526,8 +1571,10 @@ impl CachedLiveness {
         // Rebuild summaries only for blocks whose contents changed.
         match self.stale_blocks.take() {
             None => {
-                for block_idx in 0..func.blocks.len() {
-                    self.summaries[block_idx] = block_summary(func, block_idx, masks);
+                for (block_idx, summary) in
+                    self.summaries[..func.blocks.len()].iter_mut().enumerate()
+                {
+                    *summary = block_summary(func, block_idx, masks);
                 }
             }
             Some(stale) => {
@@ -1586,6 +1633,222 @@ impl CachedLiveness {
 
         self.live_out = live_out;
         self.valid = true;
+    }
+}
+
+/// Block-start liveness for the coalescing sweep, re-solved only where a
+/// mutation can have changed what the next block reads (ledger row L14-P6).
+///
+/// [`CachedLiveness`] re-solved the whole function's fixpoint before every
+/// block that followed a coalescing mutation. The measured note above says
+/// that is ~91% of this pass, and on a function made of many loops it is
+/// quadratic in them: 33 ms of a 120-loop function, 0.59 s at 480.
+///
+/// The fixpoint is the reference's: over the blocks `block_order` lists
+/// (every block when it is empty), with the live-in of any other block
+/// empty, it converges to the least solution (a round-robin pass count is
+/// bounded by the path length, well inside the reference's cap). That
+/// solution decomposes over the strongly connected components of those
+/// blocks: a component's least solution, given the exact live-ins of the
+/// components after it, is the least solution of its own equations. So the
+/// components are numbered in topological order (every edge goes from a
+/// lower to a higher or the same number), every component numbered at or
+/// above `exact_from` holds its exact live-ins, a mutation in component `c`
+/// can change only components numbered `c` or lower (only those can reach
+/// it), and a block's live-out reads its successors, which are numbered at
+/// or above its own component. A query re-solves, highest first, just the
+/// components between its own and `exact_from`. When a sweep in layout order
+/// mutates one loop and moves on, the next loops read their live-outs
+/// without a re-solve.
+struct SccLiveness {
+    summaries: Vec<BlockSummary>,
+    /// Blocks mutated since their summary was built.
+    stale_summaries: Vec<usize>,
+    live_in: Vec<PRegSet>,
+    /// Topological component number of each block of the system
+    /// (`usize::MAX` for a block outside it).
+    component: Vec<usize>,
+    /// The blocks of each component, in reverse layout order (the order the
+    /// reference visits them in).
+    members: Vec<Vec<usize>>,
+    /// Every component numbered at or above this holds exact live-ins.
+    exact_from: usize,
+}
+
+impl SccLiveness {
+    fn new(func: &MachFunction) -> Self {
+        let num_blocks = func.blocks.len();
+        let masks = overlap_masks();
+        let summaries = (0..num_blocks)
+            .map(|block_idx| block_summary(func, block_idx, masks))
+            .collect();
+        // The system's blocks, in the order the reference iterates them
+        // (reversed below), each once.
+        let order: Vec<usize> = if func.block_order.is_empty() {
+            (0..num_blocks).collect()
+        } else {
+            let mut seen = vec![false; num_blocks];
+            func.block_order
+                .iter()
+                .map(|block_id| block_id.0 as usize)
+                .filter(|&block_idx| !std::mem::replace(&mut seen[block_idx], true))
+                .collect()
+        };
+        let mut in_system = vec![false; num_blocks];
+        for &block_idx in &order {
+            in_system[block_idx] = true;
+        }
+        let successors = |block_idx: usize| {
+            func.blocks[block_idx]
+                .succs
+                .iter()
+                .map(|succ| succ.0 as usize)
+                .filter(|&succ| succ < num_blocks && in_system[succ])
+        };
+
+        // Tarjan's algorithm, iteratively. Components are completed sinks
+        // first, so completion index `k` of `n` is topological number
+        // `n - 1 - k`.
+        let mut index = vec![usize::MAX; num_blocks];
+        let mut lowlink = vec![0usize; num_blocks];
+        let mut on_stack = vec![false; num_blocks];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut completed: Vec<Vec<usize>> = Vec::new();
+        let mut next_index = 0usize;
+        for &root in &order {
+            if index[root] != usize::MAX {
+                continue;
+            }
+            let mut frames: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+            index[root] = next_index;
+            lowlink[root] = next_index;
+            next_index += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            frames.push((root, successors(root).collect(), 0));
+            while let Some((node, succs, cursor)) = frames.last_mut() {
+                let node = *node;
+                if let Some(&succ) = succs.get(*cursor) {
+                    *cursor += 1;
+                    if index[succ] == usize::MAX {
+                        index[succ] = next_index;
+                        lowlink[succ] = next_index;
+                        next_index += 1;
+                        stack.push(succ);
+                        on_stack[succ] = true;
+                        frames.push((succ, successors(succ).collect(), 0));
+                    } else if on_stack[succ] {
+                        lowlink[node] = lowlink[node].min(index[succ]);
+                    }
+                    continue;
+                }
+                frames.pop();
+                if let Some((parent, _, _)) = frames.last() {
+                    let parent = *parent;
+                    lowlink[parent] = lowlink[parent].min(lowlink[node]);
+                }
+                if lowlink[node] == index[node] {
+                    let mut scc = Vec::new();
+                    while let Some(member) = stack.pop() {
+                        on_stack[member] = false;
+                        scc.push(member);
+                        if member == node {
+                            break;
+                        }
+                    }
+                    completed.push(scc);
+                }
+            }
+        }
+        let count = completed.len();
+        let mut component = vec![usize::MAX; num_blocks];
+        for (k, scc) in completed.iter().enumerate() {
+            for &block_idx in scc {
+                component[block_idx] = count - 1 - k;
+            }
+        }
+        let mut members = vec![Vec::new(); count];
+        for &block_idx in order.iter().rev() {
+            members[component[block_idx]].push(block_idx);
+        }
+        SccLiveness {
+            summaries,
+            stale_summaries: Vec::new(),
+            live_in: vec![PRegSet::EMPTY; num_blocks],
+            component,
+            members,
+            exact_from: count,
+        }
+    }
+
+    fn note_block_mutated(&mut self, block_idx: usize) {
+        self.stale_summaries.push(block_idx);
+        if let Some(&component) = self.component.get(block_idx)
+            && component != usize::MAX
+        {
+            self.exact_from = self.exact_from.max(component + 1);
+        }
+    }
+
+    /// The block-start `live_out` snapshot for `block_idx`: equal to
+    /// `compute_physical_liveness(func).live_out[block_idx]` evaluated on the
+    /// current (post-mutation) function, as the reference computes it at the
+    /// top of each block iteration.
+    fn live_out_at_block_start(&mut self, func: &MachFunction, block_idx: usize) -> BTreeSet<PReg> {
+        let Some(&component) = self.component.get(block_idx) else {
+            return BTreeSet::new();
+        };
+        if component == usize::MAX {
+            // Outside the system: the reference never updates its live-out.
+            return BTreeSet::new();
+        }
+        if component < self.exact_from {
+            self.resolve(func, component);
+        }
+        let mut live_out = PRegSet::EMPTY;
+        for succ in &func.blocks[block_idx].succs {
+            if let Some(succ_live_in) = self.live_in.get(succ.0 as usize) {
+                live_out.union_with(succ_live_in);
+            }
+        }
+        live_out.to_btree_set()
+    }
+
+    /// Solve every component from `exact_from - 1` down to `lowest`, each
+    /// from empty sets against the exact live-ins of the components after it.
+    fn resolve(&mut self, func: &MachFunction, lowest: usize) {
+        let masks = overlap_masks();
+        for block_idx in std::mem::take(&mut self.stale_summaries) {
+            self.summaries[block_idx] = block_summary(func, block_idx, masks);
+        }
+        for component in (lowest..self.exact_from).rev() {
+            for &block_idx in &self.members[component] {
+                self.live_in[block_idx] = PRegSet::EMPTY;
+            }
+            loop {
+                let mut changed = false;
+                for &block_idx in &self.members[component] {
+                    let mut new_live_out = PRegSet::EMPTY;
+                    for succ in &func.blocks[block_idx].succs {
+                        if let Some(succ_live_in) = self.live_in.get(succ.0 as usize) {
+                            new_live_out.union_with(succ_live_in);
+                        }
+                    }
+                    let summary = &self.summaries[block_idx];
+                    let mut new_live_in = new_live_out;
+                    new_live_in.subtract(&summary.kill);
+                    new_live_in.union_with(&summary.gen_set);
+                    if new_live_in != self.live_in[block_idx] {
+                        self.live_in[block_idx] = new_live_in;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        self.exact_from = lowest;
     }
 }
 
@@ -1683,7 +1946,14 @@ fn can_retarget_source_def(
     // `Imm(0)` — the tight sound proxy, and a superset of the historical
     // LoopLatchLayoutCombine `AddRI dst, src, #0` hardening barrier (a copy in
     // disguise that must never be coalesced).
-    if has_blinded_opaque_operand(inst) {
+    //
+    // The sole exception is the exact, canonical `CSET Rd, EQ` schema. CSET
+    // has exactly one non-def operand, a condition-code immediate; zero is the
+    // architectural encoding of EQ, not an operand kind that can carry a
+    // symbol, jump-table index, or incoming-frame argument. Requiring the
+    // complete one-use schema keeps malformed/extended CSETs fail-closed and
+    // leaves the opaque-operand firewall intact for every carrier opcode.
+    if has_blinded_opaque_operand(inst) && !is_canonical_eq_cset(inst) {
         return false;
     }
 
@@ -1697,6 +1967,19 @@ fn has_blinded_opaque_operand(inst: &MachInst) -> bool {
         .iter()
         .chain(inst.uses.iter())
         .any(|operand| matches!(operand, MachOperand::Imm(0)))
+}
+
+/// Does this instruction have the only audited semantic-zero operand shape?
+///
+/// The caller has already required one plain register def and no implicit
+/// operands; this predicate additionally requires no tied operands. At the
+/// regalloc seam, canonical `CSET Rd, EQ` therefore has exactly one use,
+/// `Imm(0)`. No relocation- or frame-bearing CSET form exists.
+fn is_canonical_eq_cset(inst: &MachInst) -> bool {
+    inst.opcode == trust_cg_ir::inst::AArch64Opcode::CSet as u16
+        && inst.tied_operands.is_empty()
+        && inst.uses.len() == 1
+        && matches!(inst.uses.first(), Some(MachOperand::Imm(0)))
 }
 
 /// Opcode admission for backward-def retargeting.
@@ -2241,6 +2524,39 @@ mod tests {
     // -- Rename coalescing tests --
 
     #[test]
+    fn test_identity_only_preserves_distinct_copies_and_wide_observations() {
+        for wide_read in [false, true] {
+            let read = if wide_read { X0 } else { W0 };
+            let mut func = make_function(vec![vec![
+                preg_copy(W0, X0),
+                preg_inst(2, &[X2], &[read]),
+                preg_copy(X1, X3),
+                preg_inst(2, &[X2], &[X1]),
+            ]]);
+            let mut reference = func.clone();
+            let result = eliminate_physical_self_copies(&mut func);
+            let oracle =
+                post_ra_coalesce_reference_impl(&mut reference, PostRACoalesceConfig::ALL, true);
+            assert_eq!(result, oracle);
+            assert_eq!(format!("{func:?}"), format!("{reference:?}"));
+            assert_eq!(result.identity_copies, u32::from(!wide_read));
+            assert_eq!(result.rename_coalesced, 0);
+            assert_eq!(func.insts[2].opcode, crate::phi_elim::PSEUDO_COPY);
+            assert_eq!(func.insts[3].uses, vec![MachOperand::PReg(X1)]);
+        }
+        let mut extension = make_function(vec![vec![
+            cset_inst(W1, 0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+        assert_eq!(
+            eliminate_physical_self_copies(&mut extension).copies_removed,
+            0
+        );
+        assert_eq!(extension.blocks[0].insts.len(), 3);
+    }
+
+    #[test]
     fn test_rename_simple() {
         // PSEUDO_COPY X1 <- X0 (X0 is not redefined, X1 used once after)
         // ADD X2, X1, X3  → should become ADD X2, X0, X3
@@ -2495,6 +2811,149 @@ mod tests {
             &[dst],
             &[src],
         )
+    }
+
+    /// Helper: post-RA `CSET Wd, cc` (defs=[Wd], uses=[Imm(cc)]).
+    fn cset_inst(dst: PReg, cc: i64) -> MachInst {
+        MachInst {
+            opcode: trust_cg_ir::inst::AArch64Opcode::CSet as u16,
+            defs: vec![MachOperand::PReg(dst)],
+            uses: vec![MachOperand::Imm(cc)],
+            implicit_defs: Vec::new(),
+            implicit_uses: Vec::new(),
+            flags: InstFlags::default(),
+            tied_operands: vec![],
+        }
+    }
+
+    #[test]
+    fn test_narrow_zext_collapses_canonical_eq_cset_into_return_register() {
+        // Exact post-RA shape from the TrustIR `(x == y) as u32` pipeline:
+        //   cmp  w0, w1
+        //   cset w1, eq             (EQ's condition encoding is Imm(0))
+        //   uxtw x0, w1             (encoded as `mov w0, w1`)
+        //   ret
+        //
+        // EQ's zero is a semantic condition code, not a blinded opaque
+        // operand. Retargeting CSET to W0 gives the same zero-extended X0 and
+        // removes the UXTW, matching the already-admitted nonzero conditions.
+        let mut func = make_function(vec![vec![
+            preg_inst(
+                trust_cg_ir::inst::AArch64Opcode::CmpRR as u16,
+                &[],
+                &[W0, W1],
+            ),
+            cset_inst(W1, 0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 1);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let cset = &func.insts[func.blocks[0].insts[1].0 as usize];
+        assert_eq!(cset.defs, vec![MachOperand::PReg(W0)]);
+        assert_eq!(cset.uses, vec![MachOperand::Imm(0)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_eq_cset_kept_when_source_still_live() {
+        // The semantic-zero exemption changes no liveness requirement: W1 is
+        // read after the extension, so deleting its CSET definition is unsafe.
+        let mut func = make_function(vec![vec![
+            cset_inst(W1, 0),
+            uxtw_inst(X0, W1),
+            preg_inst(2, &[W2], &[W1]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 0);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let cset = &func.insts[func.blocks[0].insts[0].0 as usize];
+        assert_eq!(cset.defs, vec![MachOperand::PReg(W1)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_eq_cset_rejects_noncanonical_operand_schema() {
+        // A CSET carrying anything beyond its single condition-code use is
+        // malformed/extended. Do not let the EQ exemption turn its Imm(0)
+        // into a blanket bypass of the opaque-operand firewall.
+        let mut malformed = cset_inst(W1, 0);
+        malformed.uses.push(MachOperand::PReg(X2));
+        let mut func = make_function(vec![vec![malformed, uxtw_inst(X0, W1), ret_inst(vec![X0])]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 0);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let cset = &func.insts[func.blocks[0].insts[0].0 as usize];
+        assert_eq!(cset.defs, vec![MachOperand::PReg(W1)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_eq_cset_rejects_stale_tied_schema() {
+        // A valid CSET has no tied destination. Keep the semantic-zero
+        // exemption fail-closed even if malformed regalloc IR carries a stale
+        // tie descriptor without the corresponding source use.
+        let mut malformed = cset_inst(W1, 0);
+        malformed.tied_operands.push((0, 0));
+        let mut func = make_function(vec![vec![malformed, uxtw_inst(X0, W1), ret_inst(vec![X0])]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 0);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let cset = &func.insts[func.blocks[0].insts[0].0 as usize];
+        assert_eq!(cset.defs, vec![MachOperand::PReg(W1)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_zero_immediate_firewall_still_blocks_addri() {
+        // The exception is opcode- and schema-exact. A zero AddRI remains the
+        // hardening copy disguise / possible blinded opaque carrier and must
+        // never be retargeted through the same UXTW shape.
+        let mut func = make_function(vec![vec![
+            imm_form_inst(trust_cg_ir::inst::AArch64Opcode::AddRI as u16, W1, W2, 0),
+            uxtw_inst(X0, W1),
+            ret_inst(vec![X0]),
+        ]]);
+
+        let result = post_ra_coalesce(&mut func);
+
+        assert_eq!(result.copies_removed, 0);
+        assert_eq!(func.blocks[0].insts.len(), 3);
+        let add = &func.insts[func.blocks[0].insts[0].0 as usize];
+        assert_eq!(add.defs, vec![MachOperand::PReg(W1)]);
+    }
+
+    #[test]
+    fn test_narrow_zext_eq_cset_kept_when_either_kill_switch_is_off() {
+        // This fold remains governed by BOTH existing levers: sub-register
+        // transforms must be enabled and CSET must be in the wide producer
+        // allowlist.
+        for cfg in [
+            PostRACoalesceConfig {
+                wide_backdef: true,
+                subreg_copies: false,
+            },
+            PostRACoalesceConfig {
+                wide_backdef: false,
+                subreg_copies: true,
+            },
+        ] {
+            let mut func = make_function(vec![vec![
+                cset_inst(W1, 0),
+                uxtw_inst(X0, W1),
+                ret_inst(vec![X0]),
+            ]]);
+
+            let result = post_ra_coalesce_with_config(&mut func, cfg);
+
+            assert_eq!(result.copies_removed, 0, "cfg={cfg:?}");
+            assert_eq!(func.blocks[0].insts.len(), 3, "cfg={cfg:?}");
+        }
     }
 
     #[test]
@@ -3709,6 +4168,68 @@ mod tests {
     // set-for-set identical `live_out` to `compute_physical_liveness`.
     // -----------------------------------------------------------------------
 
+    /// L14-P6: the component-scoped liveness answers every block-start query
+    /// of a sweep exactly as the whole-function re-solve does, over random
+    /// CFGs, layouts (as built, shuffled, with a block missing, with a block
+    /// repeated, or empty) and mutations that remove or add uses.
+    #[test]
+    fn scc_liveness_matches_the_whole_function_resolve_under_mutation() {
+        let mut queries = 0usize;
+        let mut mutations = 0usize;
+        for seed in 0..400u64 {
+            let mut rng = XorShift::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0x1234);
+            let mut func = random_function(&mut rng, 24, 8);
+            let n = func.blocks.len();
+            let variant = rng.below(5);
+            if variant >= 1 {
+                for i in (1..func.block_order.len()).rev() {
+                    let j = rng.below(i as u64 + 1) as usize;
+                    func.block_order.swap(i, j);
+                }
+            }
+            match variant {
+                2 if n > 1 => {
+                    func.block_order.pop();
+                }
+                3 => {
+                    let repeated = func.block_order[rng.below(n as u64) as usize];
+                    func.block_order.push(repeated);
+                }
+                4 => func.block_order.clear(),
+                _ => {}
+            }
+            let order: Vec<usize> = if func.block_order.is_empty() {
+                (0..n).collect()
+            } else {
+                func.block_order.iter().map(|b| b.0 as usize).collect()
+            };
+            let mut scoped = SccLiveness::new(&func);
+            let mut whole = CachedLiveness::new(n);
+            for &block_idx in &order {
+                assert_eq!(
+                    scoped.live_out_at_block_start(&func, block_idx),
+                    whole.live_out_at_block_start(&func, block_idx),
+                    "seed {seed} block {block_idx}"
+                );
+                queries += 1;
+                let insts = func.blocks[block_idx].insts.clone();
+                if insts.is_empty() || rng.below(3) != 0 {
+                    continue;
+                }
+                let id = insts[rng.below(insts.len() as u64) as usize].0 as usize;
+                if !func.insts[id].uses.is_empty() && rng.below(2) == 0 {
+                    func.insts[id].uses[0] = MachOperand::PReg(random_preg(&mut rng));
+                } else {
+                    nop_inst(&mut func.insts[id]);
+                }
+                scoped.note_block_mutated(block_idx);
+                whole.note_block_mutated(block_idx);
+                mutations += 1;
+            }
+        }
+        assert!(queries > 3_000 && mutations > 800, "{queries} {mutations}");
+    }
+
     #[test]
     fn test_summary_liveness_equals_reference_liveness() {
         for seed in 0..200u64 {
@@ -3835,7 +4356,7 @@ mod tests {
 
     /// The full-size reproduction of the TY fused-BFS shape. The reference
     /// path takes ~35s in release / ~10min in debug, so this runs only on
-    /// demand: `TRUST_CG_RUN_MEASUREMENT_TESTS=1 cargo test --release
+    /// demand: `TRUST_CG_RUN_MEASUREMENT_TESTS=1 scripts/trust_cargo.sh test --release
     /// test_huge_function`.
     /// Measured: fast 94ms vs reference 34.7s (369x) at 2000 blocks.
     #[test]

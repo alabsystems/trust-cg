@@ -49,10 +49,12 @@ impl JitParentLoopKernelProvider {
         system: TransitionSystem,
         frontier_capacity: usize,
     ) -> Result<Self, JitCompileError> {
-        let module = build_parent_loop_module();
+        let module = build_parent_loop_module()?;
         let config = CompilerConfig::for_host_jit();
         let extern_symbols: HashMap<String, *const u8> = HashMap::new();
-        let result = Compiler::new(config).compile_module_to_jit(&module, &extern_symbols)?;
+        let result = Compiler::new(config)
+            .with_codegen_license(crate::in_process_kernel_license())
+            .compile_module_to_jit(&module, &extern_symbols)?;
         let buffer = result.buffer;
 
         let entry: KernelEntry = {

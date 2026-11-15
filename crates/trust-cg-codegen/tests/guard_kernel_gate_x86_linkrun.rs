@@ -15,9 +15,10 @@
 //! # Why this is an object-level + cross-arch-RUN oracle, not an x86 RUN
 //!
 //! The primary intent is a real x86 compile+link+RUN binary (`x86_inbounds_returns_value_and_oob_traps`),
-//! gated behind the SAME Rosetta health check the rest of the x86 link/run corpus uses
-//! (`has_cc_x86_64_link_run`). On a healthy x86 / Rosetta host it links the emitted Mach-O against a C
-//! driver and runs it: in-bounds index returns the correct element, OOB index traps (SIGILL from UD2).
+//! its link+RUN leg gated behind the SAME host-capability probe the rest of the x86 link/run corpus
+//! uses (`x86_64_link_run`). Where that probe proves an x86-64 driver it links the emitted object
+//! against a C driver and runs it: in-bounds index returns the correct element, OOB index traps
+//! (SIGILL from UD2).
 //!
 //! On this repository's primary dev host — Apple Silicon (arm64 macOS) — Rosetta cannot execute the
 //! emitted x86-64 binary ("bad CPU type in executable"), so that test SKIPs (it prints a SKIP line).
@@ -31,26 +32,36 @@
 //!   2. `aarch64_linkrun_inbounds_returns_value_and_oob_traps` — the cross-arch RUNTIME mirror. The
 //!      fail-closed authority policy is arch-neutral, so AArch64 — which runs natively here — proves
 //!      that Discharged and Pending fixtures both compute in-bounds values and trap out of bounds.
+//!      It is compiled only on an AArch64 macOS host (a compile-time `cfg`, not a runtime SKIP),
+//!      so on an x86-64 Linux host the primary x86 RUN carries (A) and (B) and no SKIP line is
+//!      printed.
 //!
 //! Together these give a runnable-here proof of both (A) and (B); the x86 RUN upgrades (B)+(A) to a
 //! literal x86 execution wherever Rosetta/an x86 host is healthy.
 
+#[path = "common/admission_expect.rs"]
+mod admission_expect;
+
 use std::fs;
 use std::path::Path;
+// Only `link_and_run_aarch64` constructs a `Command`, and that function is now
+// compiled only on an aarch64 macOS host, so the import carries the same gate.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::process::Command;
 
 mod common;
 use common::disasm::{
-    DisasmInsn, disassemble_x86_text, has_bounds_guard,
-    has_indexed_load_access as has_split_indexed_load_access, has_objdump, has_ud2,
+    DisasmInsn, ObjFormat, disassemble_x86_text, has_bounds_guard,
+    has_indexed_load_access as has_split_indexed_load_access, has_objdump_for, has_ud2,
 };
 use common::rosetta::{
-    codegen_link_timeout, codegen_run_timeout, command_output_with_timeout, has_cc_x86_64_link_run,
-    run_executable_with_timeout,
+    codegen_link_timeout, codegen_run_timeout, command_output_with_timeout,
+    run_executable_with_timeout, x86_64_cc, x86_64_link_run_or_skip,
 };
+use common::x86_64_object::assert_host_x86_64_object;
 use common::x86_interp::{
-    Outcome, X86ByteInterp, count_op_classes, decode_all, extract_macho_text,
-    normalize_objdump_mnemonic, objdump_mnemonics,
+    Outcome, X86ByteInterp, count_op_classes, decode_all, extract_text, normalize_objdump_mnemonic,
+    objdump_mnemonics,
 };
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
@@ -82,13 +93,18 @@ const BASE_VALUE: i64 = 100;
 /// Both statuses are non-authoritative without exact replay; both retain the runtime bounds check.
 fn build_module(name: &str, status: ProofStatus) -> Module {
     let mut module = Module::new("guard_kernel_gate_x86_linkrun");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
     let node = InstrNode::new(Inst::ExtractElement {
         ty: Ty::I64,
@@ -114,12 +130,61 @@ fn build_module(name: &str, status: ProofStatus) -> Module {
         status,
         "array index is in bounds",
     ));
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
+/// Whether trust-ir refuses this file's fixtures (both public statuses). A
+/// node-level `ProofRef` must name a `Discharged`/`Trusted` row sited on that
+/// node, and a `Discharged` row needs a replayed certificate
+/// (`ProofRefUnresolved`, `ProofRefSiteMismatch`, `DischargedWithoutCertificate`);
+/// since WS7.3 every ingestion entry refuses what trust-ir's codegen admission
+/// refuses, so no object exists and no guard can be eliminated. That refusal is
+/// asserted here on both object routes; the tests below then have nothing to
+/// run.
+fn fixtures_refused_at_ingestion() -> bool {
+    let mut refused = 0;
+    for status in [ProofStatus::Discharged, ProofStatus::Pending] {
+        let module = build_module("refusal_probe", status);
+        // Judged under the default policy, the one the refusing compiles
+        // below state.
+        let Some((variant, _)) = admission_expect::first_finding(
+            &module,
+            &trust_cg_lower::CodegenLicensePolicy::default(),
+        ) else {
+            continue;
+        };
+        for target in [Target::X86_64, Target::Aarch64] {
+            let error = Compiler::new(CompilerConfig {
+                opt_level: OptLevel::O2,
+                target,
+                ..CompilerConfig::default()
+            })
+            .compile(&module)
+            .expect_err("trust-ir refuses the fixture, so must trust-cg")
+            .to_string();
+            assert!(error.contains(&variant), "{status:?} {target:?}: {error}");
+        }
+        refused += 1;
+    }
+    assert!(
+        refused == 0 || refused == 2,
+        "trust-ir refuses one public status but not the other"
+    );
+    refused == 2
+}
+
 fn compile_x86_object(module: &Module) -> Vec<u8> {
-    let spec = TargetSpec::parse("x86_64-apple-darwin").expect("parse x86_64-apple-darwin");
+    // The host's x86-64 triple, so the emitted object is what the host `cc`
+    // links: Mach-O on macOS, ELF on GNU/Linux.
+    let triple = if cfg!(target_os = "macos") {
+        "x86_64-apple-darwin"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    };
+    let spec = TargetSpec::parse(triple).expect("the host x86-64 triple parses");
     let compiler = Compiler::new_for_target_spec(
         CompilerConfig {
             opt_level: OptLevel::O2,
@@ -127,16 +192,19 @@ fn compile_x86_object(module: &Module) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         spec,
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     compiler.compile(module).expect("x86 compile").object_code
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn compile_aarch64_object(module: &Module) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O2,
         target: Target::Aarch64,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .expect("aarch64 compile")
@@ -150,10 +218,12 @@ fn ud2_count(bytes: &[u8]) -> usize {
     bytes.windows(2).filter(|w| w == b"\x0F\x0B").count()
 }
 
-/// True on AArch64 macOS hosts where native `cc` can link+run the emitted Mach-O object.
-fn can_link_and_run_aarch64() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
+// The AArch64 link+run mirror is a COMPILE-TIME lane: it exists only on an
+// AArch64 macOS host, where native `cc` links and runs the emitted Mach-O
+// object. On every other host it is compiled out rather than printing a
+// runtime SKIP, so a Linux x86-64 floor (which counts any SKIP line as a
+// failure) sees only the lanes that can run there, and an AArch64 macOS run
+// still requires the mirror to pass.
 
 // ===========================================================================
 // (1) ALWAYS-ON x86 OBJECT-LEVEL ORACLE — public metadata keeps hardware traps.
@@ -170,7 +240,9 @@ fn can_link_and_run_aarch64() -> bool {
 /// `objdump` is present. Returns `None` only when `objdump` is unavailable (the
 /// raw-byte floor then carries the proof).
 fn disasm_or_none(label: &str, obj: &[u8]) -> Option<Vec<DisasmInsn>> {
-    if !has_objdump() {
+    // This target compiles for the HOST triple, so the decode needs the host's own
+    // container format.
+    if !has_objdump_for(ObjFormat::native()) {
         return None;
     }
     Some(
@@ -193,8 +265,11 @@ fn has_indexed_load_access(insns: &[DisasmInsn]) -> bool {
 
 #[test]
 fn x86_object_public_proof_metadata_keeps_hardware_guard() {
+    if fixtures_refused_at_ingestion() {
+        return;
+    }
     let env_scope = env_lock::override_scope();
-    let objdump = has_objdump();
+    let objdump = has_objdump_for(ObjFormat::native());
 
     // Public Discharged status is deliberately non-authoritative.
     let discharged = build_module("x86_proven", ProofStatus::Discharged);
@@ -240,7 +315,7 @@ fn x86_object_public_proof_metadata_keeps_hardware_guard() {
         assert!(
             has_bounds_guard(&off_d, ARRAY_LEN),
             "gate OFF: decoded stream must contain the full bounds-check guard \
-             `cmpq $0x{ARRAY_LEN:x}, idx ; jae <trap> ; <trap>: ud2`"
+             `cmpq $0x{ARRAY_LEN:x}, idx ; jae <trap> ; <trap>: ud2`; decoded stream: {off_d:#?}"
         );
         assert!(
             has_indexed_load_access(&off_d),
@@ -338,48 +413,58 @@ fn x86_object_public_proof_metadata_keeps_hardware_guard() {
 }
 
 // ===========================================================================
-// (2) PRIMARY x86 COMPILE + LINK + RUN (host-gated on a healthy x86 / Rosetta host).
+// (2) PRIMARY x86 COMPILE + LINK + RUN (link+RUN host-gated).
 //
-// On an x86-64 host (or a healthy Rosetta 2 aarch64 host with
-// TRUST_CG_RUN_ROSETTA_LINKRUN=1) this links the emitted x86-64 Mach-O against a
-// C driver and RUNS it:
+// Every host compiles both statuses and checks each emitted object is the host's
+// x86-64 relocatable defining the entry the C driver calls. Where
+// `x86_64_link_run` proves an x86-64 driver (an x86-64 host, a healthy Rosetta 2
+// aarch64 macOS host with TRUST_CG_RUN_ROSETTA_LINKRUN=1, or a cross driver plus
+// binfmt_misc/qemu-user) this links the objects against a C driver and RUNS them:
 //   * Discharged and Pending statuses both return the correct in-bounds element;
 //   * both trap out of bounds because neither public status is replay authority.
 //
-// On the arm64 dev host Rosetta cannot run x86-64 binaries, so this SKIPs.
+// Elsewhere the link+RUN leg prints a SKIP line.
 // ===========================================================================
 
 #[test]
 fn x86_inbounds_returns_value_and_oob_traps() {
-    if !has_cc_x86_64_link_run() {
-        eprintln!(
-            "SKIP: x86 compile+link+RUN proof — no healthy x86-64 / Rosetta host (this arm64 macOS \
-             host cannot execute x86-64 binaries: 'bad CPU type'). The always-on x86 OBJECT proof \
-             `x86_object_public_proof_metadata_keeps_hardware_guard` and the AArch64 link+RUN \
-             mirror `aarch64_linkrun_inbounds_returns_value_and_oob_traps` cover correctness here."
-        );
+    if fixtures_refused_at_ingestion() {
         return;
     }
-
     // Unset/default selects the unconditional fail-closed production policy.
     // The thread-local gate stays logically absent for the whole body and is
     // restored on scope exit.
     let env_scope = env_lock::override_scope();
     let _gate_guard = env_lock::ScopedEnvVar::unset(&env_scope, "TRUST_CG_GUARD_KERNEL_GATE");
 
-    // (A) Public Discharged status keeps the bounds check and computes in-bounds values correctly.
+    // Compile legs (every host): public Discharged and Pending statuses.
     let proven = build_module("x86rt_proven", ProofStatus::Discharged);
     let proven_obj = compile_x86_object(&proven);
+    assert_host_x86_64_object("x86rt_proven", &proven_obj, &["x86rt_proven"], &[]);
+    let unproven = build_module("x86rt_unproven", ProofStatus::Pending);
+    let unproven_obj = compile_x86_object(&unproven);
+    assert_host_x86_64_object("x86rt_unproven", &unproven_obj, &["x86rt_unproven"], &[]);
+
+    if !x86_64_link_run_or_skip(
+        "x86_inbounds_returns_value_and_oob_traps",
+        "x86-64 link+RUN leg (the always-on object proof \
+         `x86_object_public_proof_metadata_keeps_hardware_guard` and the `x86_interp_*` \
+         literal-execution tests still cover the guard)",
+    ) {
+        return;
+    }
+
+    // (A) Public Discharged status keeps the bounds check and computes in-bounds values correctly.
     // ABI: the emitted Trust function takes the `[i64;8]` array BY VALUE. Per the
     // System V x86-64 ABI a 64-byte aggregate is MEMORY class, so the array is
     // passed on the stack (the emitted prologue reads it from 0x10(%rbp)) and `idx`
     // arrives in %rdi. The C driver must therefore pass a by-value STRUCT wrapping
     // the array (a 64-byte struct is MEMORY class -> stack), NOT a `long *` pointer
     // (which would put a pointer in %rdi and mismatch the callee, failing loudly on
-    // a Rosetta/x86 host). NOTE: this test SKIPs on the arm64/no-Rosetta dev host,
-    // so this driver is compile-correct + ABI-correct by analysis but its runtime
-    // is confirmed only on a Rosetta/x86 host; the host-independent `x86_interp_*`
-    // tests below are the faithful literal-execution oracle here. (The AArch64
+    // a Rosetta/x86 host). NOTE: this leg SKIPs on a host without an x86-64
+    // driver, so there this driver is compile-correct + ABI-correct by analysis
+    // and its runtime is confirmed only where the leg runs; the host-independent
+    // `x86_interp_*` tests below are the faithful literal-execution oracle. (The AArch64
     // `aa_*` drivers below correctly keep `long *arr`: AAPCS64 passes a >16-byte
     // aggregate by REFERENCE, and those tests run + pass natively on this host.)
     let driver = r#"
@@ -414,8 +499,6 @@ int main(int argc, char **argv) {
     );
 
     // (B) Pending follows the same runtime-safe behavior.
-    let unproven = build_module("x86rt_unproven", ProofStatus::Pending);
-    let unproven_obj = compile_x86_object(&unproven);
     let driver2 = r#"
 #include <stdio.h>
 #include <stdlib.h>
@@ -444,20 +527,20 @@ int main(int argc, char **argv) {
 }
 
 // ===========================================================================
-// (3) CROSS-ARCH RUNTIME MIRROR — AArch64 link + RUN (runs natively on this host).
+// (3) CROSS-ARCH RUNTIME MIRROR — AArch64 link + RUN (AArch64 macOS hosts only).
 //
-// The fail-closed policy is arch-neutral. AArch64 runs natively here, so it
-// proves both public statuses retain a runtime guard while preserving in-bounds
-// computation.
+// The fail-closed policy is arch-neutral. On an AArch64 macOS host the mirror
+// runs natively and proves both public statuses retain a runtime guard while
+// preserving in-bounds computation. Elsewhere it is compiled out: the x86-64
+// RUN above is the executing lane there, and no SKIP line is printed.
 // ===========================================================================
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn aarch64_linkrun_inbounds_returns_value_and_oob_traps() {
-    if !can_link_and_run_aarch64() {
-        eprintln!("SKIP: AArch64 link+run mirror requires an aarch64 macOS host");
+    if fixtures_refused_at_ingestion() {
         return;
     }
-
     // Unset/default fail-closed policy under test. The thread-local gate stays
     // logically absent for the whole body and is restored on scope exit.
     let env_scope = env_lock::override_scope();
@@ -564,7 +647,7 @@ fn proof_array() -> [i64; 8] {
 /// the in-process interpreter with `idx`. Returns the interpreter outcome.
 fn interp_run(module: &Module, idx: i64) -> Outcome {
     let obj = compile_x86_object(module);
-    let text = extract_macho_text(&obj);
+    let text = extract_text(&obj);
     let mut interp = X86ByteInterp::new(text);
     interp.setup_call(&proof_array(), idx);
     interp
@@ -581,7 +664,7 @@ fn cross_check_against_objdump(label: &str, obj: &[u8]) {
         // still carry coverage; nothing to cross-check against.
         return;
     };
-    let text = extract_macho_text(obj);
+    let text = extract_text(obj);
     let ours =
         decode_all(&text).unwrap_or_else(|e| panic!("in-house decode failed for {label}: {e:?}"));
 
@@ -615,6 +698,9 @@ fn cross_check_against_objdump(label: &str, obj: &[u8]) {
 
 #[test]
 fn x86_interp_inbounds_returns_value_and_oob_traps() {
+    if fixtures_refused_at_ingestion() {
+        return;
+    }
     let env_scope = env_lock::override_scope();
     let array = proof_array();
 
@@ -698,6 +784,9 @@ fn x86_interp_inbounds_returns_value_and_oob_traps() {
 
 #[test]
 fn x86_interp_negative_controls_cannot_false_pass() {
+    if fixtures_refused_at_ingestion() {
+        return;
+    }
     // The interpreter must be able to FAIL — these controls prove it is genuinely
     // decoding and executing, not rubber-stamping a PASS.
     let env_scope = env_lock::override_scope();
@@ -744,7 +833,7 @@ fn x86_interp_negative_controls_cannot_false_pass() {
     //     must match objdump's instruction count exactly (catches length bugs).
     let obj = compile_x86_object(&on_mod);
     if let Some(objdump_stream) = objdump_mnemonics(&obj) {
-        let text = extract_macho_text(&obj);
+        let text = extract_text(&obj);
         let ours = decode_all(&text).expect("in-house decode of real text");
         assert_eq!(
             ours.len(),
@@ -778,7 +867,8 @@ fn make_dir(test_name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Link an x86-64 object + C driver with `cc -arch x86_64`, run with `arg`, return (exit_code, stdout).
+/// Link an x86-64 object + C driver with the proven x86-64 driver, run with `arg`, return
+/// (exit_code, stdout).
 fn link_and_run_x86(test_name: &str, obj: &[u8], driver_src: &str, arg: &str) -> (i32, String) {
     let dir = make_dir(&format!("x86_{test_name}"));
     let obj_path = dir.join("g.o");
@@ -787,13 +877,8 @@ fn link_and_run_x86(test_name: &str, obj: &[u8], driver_src: &str, arg: &str) ->
     fs::write(&driver_path, driver_src).expect("write driver");
     let binary = dir.join("g");
 
-    let mut link = Command::new("cc");
-    link.args(if cfg!(target_os = "macos") {
-        &["-arch", "x86_64"][..]
-    } else {
-        &[][..]
-    })
-    .args([
+    let mut link = x86_64_cc();
+    link.args([
         "-o",
         binary.to_str().unwrap(),
         driver_path.to_str().unwrap(),
@@ -812,6 +897,7 @@ fn link_and_run_x86(test_name: &str, obj: &[u8], driver_src: &str, arg: &str) ->
 }
 
 /// Link an AArch64 object + C driver with native `cc`, run with `arg`, return (exit_code, stdout).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn link_and_run_aarch64(test_name: &str, obj: &[u8], driver_src: &str, arg: &str) -> (i32, String) {
     let dir = make_dir(&format!("aa_{test_name}"));
     let obj_path = dir.join("g.o");
@@ -873,13 +959,25 @@ fn run_with_arg(binary: &Path, arg: &str) -> (i32, String) {
 
 /// Count AArch64 `BRK #imm` (`0xD4200000` masked) — the AArch64 trap a surviving bounds-check carrier
 /// expands to. Used only as the AArch64 analogue of `ud2_count`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn ud2_count_brk(bytes: &[u8]) -> usize {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|w| {
             let word = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
             // BRK #imm16: 1101 0100 001 imm16 000 00  => top byte 0xD4, bits[23:21]=001, low5=0.
             (word & 0xFFE0_001F) == 0xD420_0000
         })
         .count()
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

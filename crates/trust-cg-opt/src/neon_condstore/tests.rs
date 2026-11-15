@@ -9,7 +9,9 @@
 // separately pinned inert because no typed ownership capability exists yet.
 
 use super::*;
+use trust_cg_ir::MachInst;
 use trust_cg_ir::Signature;
+mod candidate;
 
 fn v(id: u32) -> MachOperand {
     MachOperand::VReg(VReg::new(id, RegClass::Gpr32))
@@ -577,4 +579,35 @@ fn second_run_is_a_no_op() {
         assert_eq!(func.insts.len(), insts, "run {again} added instructions");
         assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`). The public pass is inert until
+// typed writable-buffer evidence exists; the structural transform is routed
+// through the contract anyway, so enabling it cannot skip the rule.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    let iv = VReg::new(6, RegClass::Gpr32);
+    let good = || {
+        let mut func = build_condstore_loop(false);
+        func.noalias_params = vec![0, 1];
+        func
+    };
+    let run =
+        |func: &mut MachFunction| NeonCondStorePass::new().run_with_structural_test_authority(func);
+    assert!(run(&mut good()), "plain fixture fires");
+    let mut wrong = Vec::new();
+    let mut carried = good();
+    crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+    if run(&mut carried) {
+        wrong.push("fired with a second accumulator");
+    }
+    let mut live_out = good();
+    crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+    if run(&mut live_out) {
+        wrong.push("fired with a live-out-only register");
+    }
+    assert!(wrong.is_empty(), "skipped register state: {wrong:?}");
 }

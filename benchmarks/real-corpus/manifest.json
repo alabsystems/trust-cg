@@ -1,0 +1,936 @@
+{
+ "schema": "trust-cg-real-corpus-manifest-v1",
+ "corpus": "l14-real-corpus",
+ "version": "1.0.1",
+ "date": "2026-10-14",
+ "ledger": [
+  "L14-P7"
+ ],
+ "description": "The larger L14-P7 denominator beyond the 18-program beat-llvm corpus: the bridge's 13 real-program guests, 27 crates.io library crates from the Trust toolchain's own Cargo.lock (no build script, no required dependency, compiled alone with the default or the named dependency-free features), the installed Trust compiler's own library/core at its revision (O0 and O3), and the scale_gate and compile-scaling ladders. Every row is intent-to-treat.",
+ "selection_rules": [
+  "A crates.io crate is in the Trust compiler's Cargo.lock at this version, has no build script and no required dependency, and its default features enable no optional dependency (otherwise the named dependency-free features are used).",
+  "Version 1.0.0's 27 crates are a convenience sample: they were hand-picked from the crates that meet the first rule, before any proofs-on measurement of them, by no further written criterion, so they are neither random nor exhaustive. On the 2026-10-14 host 189 crates meet the first rule (reports/perf/2026-10-14-darwin-aarch64-requalification/l14p7-real-corpus/qualifying-crates.tsv, from commands/qualifying_crates.py), and every one of the 27 is among them. A crate-level completion rate or ratio describes these 27 only; adding the other qualifying crates is a later version's change.",
+  "A row's identity is its source digest: the .crate archive SHA-256 (the crates.io checksum), the guest or generator text SHA-256, or the git tree of library/ at the driver's revision. A changed digest is a new corpus version, never an edit in place.",
+  "Rows are never removed because of a bridge outcome; a version may add rows, and removes one only with a stated reason recorded in revisions."
+ ],
+ "defaults": {
+  "opt_level": "3",
+  "panic": "abort",
+  "timeout_s": 900,
+  "n_compile": 3,
+  "n_run": 5
+ },
+ "revisions": [
+  {
+   "version": "1.0.0",
+   "date": "2026-10-14",
+   "note": "First version, fixed before the first proofs-on measurement of these rows."
+  },
+  {
+   "version": "1.0.1",
+   "date": "2026-10-14",
+   "note": "selection_rules now states how the 27 crates were sampled (review round 1). No row changed: the rows are 1.0.0's, which the 2026-10-14 run measured (manifest sha256 e8883a23acd04082bb1e2e78f0933e67549ef989a6174e3fcaa2b318e9e88a8b)."
+  }
+ ],
+ "rows": [
+  {
+   "id": "real-program/p01_interp",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p01_interp",
+    "sha256": "fef0b006aaba88cdb403f03968b6510b7e0ed34bbf50df2513842658dd5294c8"
+   }
+  },
+  {
+   "id": "real-program/p02_sort_vec",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p02_sort_vec",
+    "sha256": "48d57af4568e1f922ed62698ec7baa5dd8295082343e34d285e693cba3d87490"
+   }
+  },
+  {
+   "id": "real-program/p03_tokenizer",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p03_tokenizer",
+    "sha256": "e9b76b2aee3c13014bbe9ff3274fe172e112110969cd91d7135b1922c2c9fbf0"
+   }
+  },
+  {
+   "id": "real-program/p04_matmul",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p04_matmul",
+    "sha256": "6e6ecce4fe94452565be054200af368f7c82a9ea531cf6a07f44ae458ea833f2"
+   }
+  },
+  {
+   "id": "real-program/p05_state_machine",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p05_state_machine",
+    "sha256": "0c3a60f288faf85ba1e4f44da0084d9332a48ca8286759a91c6d76aec2700c5e"
+   }
+  },
+  {
+   "id": "real-program/p06_rdp",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p06_rdp",
+    "sha256": "f9c6798db7f7f9e6ff5ea82b45a8322ea009c2b91aefcd1ce4ef4bfb6f227b95"
+   }
+  },
+  {
+   "id": "real-program/p07_wordcount",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p07_wordcount",
+    "sha256": "b823a5476426b36cba23a8b97a987c7d89cf7f2a6c180f2a9827bdd592848b70"
+   }
+  },
+  {
+   "id": "real-program/p08_fnv_hash",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p08_fnv_hash",
+    "sha256": "0bfa7141274150cd16541178f70f75faa1ef798bd5dae1b7a4e3815f2c0ccc0b"
+   }
+  },
+  {
+   "id": "real-program/p09_sieve",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p09_sieve",
+    "sha256": "959b2f4a7dc0b5768c981e39e00d122bc04b2566227a9686e3b1bc17bd695d2e"
+   }
+  },
+  {
+   "id": "real-program/p10_struct_logic",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p10_struct_logic",
+    "sha256": "a739b955854a249296c99ff951f2024de8910d165f7b5f8bea68811a7141165d"
+   }
+  },
+  {
+   "id": "real-program/p11_vec_stack",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p11_vec_stack",
+    "sha256": "5b87be01f47f8a32e70639c381052dd39e5ec1d2dbe1e484d1f8f5ed3ae89444"
+   }
+  },
+  {
+   "id": "real-program/p12_box_tree",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p12_box_tree",
+    "sha256": "f0e9290db06ec2f629c36a553be7b555dad531270d160c0a178fdc2e22e0ba94"
+   }
+  },
+  {
+   "id": "real-program/p13_sort_std",
+   "kind": "real-program",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "source": {
+    "type": "corpus-guest",
+    "file": "crates/rustc-codegen-trust-cg/tests/real_program_corpus/corpus_guests.rs",
+    "guest": "p13_sort_std",
+    "sha256": "d7d312e25eb80af1b7703ce21329d33c244bf0e0b30b6ed5fcc2145c8f99182b"
+   }
+  },
+  {
+   "id": "crate/adler2-2.0.1",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "adler2",
+    "version": "2.0.1",
+    "sha256": "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+   }
+  },
+  {
+   "id": "crate/aho-corasick-1.1.5",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "aho-corasick",
+    "version": "1.1.5",
+    "sha256": "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba",
+    "features": [
+     "std"
+    ],
+    "default_features": false
+   }
+  },
+  {
+   "id": "crate/arrayvec-0.7.8",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "arrayvec",
+    "version": "0.7.8",
+    "sha256": "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+   }
+  },
+  {
+   "id": "crate/bitflags-2.13.1",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "bitflags",
+    "version": "2.13.1",
+    "sha256": "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+   }
+  },
+  {
+   "id": "crate/either-1.18.0",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "either",
+    "version": "1.18.0",
+    "sha256": "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
+   }
+  },
+  {
+   "id": "crate/fastrand-2.5.0",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "fastrand",
+    "version": "2.5.0",
+    "sha256": "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+   }
+  },
+  {
+   "id": "crate/fnv-1.0.7",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "fnv",
+    "version": "1.0.7",
+    "sha256": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+   }
+  },
+  {
+   "id": "crate/foldhash-0.2.0",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "foldhash",
+    "version": "0.2.0",
+    "sha256": "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+   }
+  },
+  {
+   "id": "crate/glob-0.3.4",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "glob",
+    "version": "0.3.4",
+    "sha256": "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+   }
+  },
+  {
+   "id": "crate/hashbrown-0.15.5",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "hashbrown",
+    "version": "0.15.5",
+    "sha256": "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1",
+    "features": [
+     "inline-more",
+     "raw-entry"
+    ],
+    "default_features": false
+   }
+  },
+  {
+   "id": "crate/heck-0.5.0",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "heck",
+    "version": "0.5.0",
+    "sha256": "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+   }
+  },
+  {
+   "id": "crate/hex-0.4.3",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "hex",
+    "version": "0.4.3",
+    "sha256": "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+   }
+  },
+  {
+   "id": "crate/itoa-1.0.18",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "itoa",
+    "version": "1.0.18",
+    "sha256": "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+   }
+  },
+  {
+   "id": "crate/memchr-2.8.3",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "memchr",
+    "version": "2.8.3",
+    "sha256": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+   }
+  },
+  {
+   "id": "crate/minimal-lexical-0.2.1",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "minimal-lexical",
+    "version": "0.2.1",
+    "sha256": "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+   }
+  },
+  {
+   "id": "crate/percent-encoding-2.3.2",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "percent-encoding",
+    "version": "2.3.2",
+    "sha256": "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+   }
+  },
+  {
+   "id": "crate/regex-syntax-0.8.11",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "regex-syntax",
+    "version": "0.8.11",
+    "sha256": "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+   }
+  },
+  {
+   "id": "crate/rustc-hash-2.1.2",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "rustc-hash",
+    "version": "2.1.2",
+    "sha256": "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+   }
+  },
+  {
+   "id": "crate/same-file-1.0.6",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "same-file",
+    "version": "1.0.6",
+    "sha256": "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+   }
+  },
+  {
+   "id": "crate/scopeguard-1.2.0",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "scopeguard",
+    "version": "1.2.0",
+    "sha256": "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+   }
+  },
+  {
+   "id": "crate/siphasher-1.0.3",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "siphasher",
+    "version": "1.0.3",
+    "sha256": "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+   }
+  },
+  {
+   "id": "crate/smallvec-1.15.2",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "smallvec",
+    "version": "1.15.2",
+    "sha256": "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+   }
+  },
+  {
+   "id": "crate/strsim-0.11.1",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "strsim",
+    "version": "0.11.1",
+    "sha256": "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+   }
+  },
+  {
+   "id": "crate/termcolor-1.4.1",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "termcolor",
+    "version": "1.4.1",
+    "sha256": "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+   }
+  },
+  {
+   "id": "crate/unicode-ident-1.0.24",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "unicode-ident",
+    "version": "1.0.24",
+    "sha256": "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+   }
+  },
+  {
+   "id": "crate/unicode-segmentation-1.13.3",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "unicode-segmentation",
+    "version": "1.13.3",
+    "sha256": "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+   }
+  },
+  {
+   "id": "crate/unicode-width-0.2.2",
+   "kind": "real-crate",
+   "crate_type": "lib",
+   "source": {
+    "type": "crates-io",
+    "name": "unicode-width",
+    "version": "0.2.2",
+    "sha256": "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+   }
+  },
+  {
+   "id": "trust-sysroot/core-O0",
+   "kind": "trust-sysroot",
+   "crate_type": "lib",
+   "opt_level": "0",
+   "edition": "2024",
+   "crate_name": "core",
+   "env": {
+    "RUSTC_BOOTSTRAP": "1"
+   },
+   "timeout_s": 3600,
+   "source": {
+    "type": "trust-git",
+    "revision": "321aaeda75478038420d97830f14724c33c8dc39",
+    "path": "library",
+    "tree": "fbda2d979e5915f5ef620c6ca79c0631a7bc4cac",
+    "archive_paths": [
+     "library/core",
+     "library/stdarch",
+     "library/portable-simd"
+    ],
+    "root": "core/src/lib.rs"
+   }
+  },
+  {
+   "id": "trust-sysroot/core-O3",
+   "kind": "trust-sysroot",
+   "crate_type": "lib",
+   "opt_level": "3",
+   "edition": "2024",
+   "crate_name": "core",
+   "env": {
+    "RUSTC_BOOTSTRAP": "1"
+   },
+   "timeout_s": 3600,
+   "source": {
+    "type": "trust-git",
+    "revision": "321aaeda75478038420d97830f14724c33c8dc39",
+    "path": "library",
+    "tree": "fbda2d979e5915f5ef620c6ca79c0631a7bc4cac",
+    "archive_paths": [
+     "library/core",
+     "library/stdarch",
+     "library/portable-simd"
+    ],
+    "root": "core/src/lib.rs"
+   }
+  },
+  {
+   "id": "ladder/scale_gate/small",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "3",
+   "source": {
+    "type": "generator",
+    "generator": "scale_gate",
+    "size": "small",
+    "sha256": "9479f23ce39f82626d306bf60d44a3e0e3c164e96ba9c5f2f206f5c7ddab4f48"
+   }
+  },
+  {
+   "id": "ladder/scale_gate/medium",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "3",
+   "source": {
+    "type": "generator",
+    "generator": "scale_gate",
+    "size": "medium",
+    "sha256": "3c2a844af56486b367fb3f3497092bb98693bdbf4fa755484e01e436d39aa840"
+   }
+  },
+  {
+   "id": "ladder/scale_gate/large",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "3",
+   "source": {
+    "type": "generator",
+    "generator": "scale_gate",
+    "size": "large",
+    "sha256": "67fe2064eb8765a542a5bb402e0b39b7a01836a898e54146f4b78ea47ea5f5eb"
+   }
+  },
+  {
+   "id": "ladder/scale_gate/xlarge",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "3",
+   "source": {
+    "type": "generator",
+    "generator": "scale_gate",
+    "size": "xlarge",
+    "sha256": "c98ff3b799f102a758f79135dd3434075b9d3ac8f519b44626741f466065df6f"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/blocks-100",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "blocks",
+    "n": 100,
+    "sha256": "1181682da1be45da1804d1310dad25750fe109785dda0d0aa1b355bd85914b4f"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/blocks-200",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "blocks",
+    "n": 200,
+    "sha256": "53f47a4ed3e8580689ff176a6145c73c741e2403024ef21a0818c4069c271463"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/blocks-400",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "blocks",
+    "n": 400,
+    "sha256": "9c6973eb6ced148304c870a98f5d54f10ba9cc1c67f7407fb006ce1bf2535db8"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/blocks-800",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "blocks",
+    "n": 800,
+    "sha256": "05622bbaba11ea1a7bcad70d54d21d0898a6fb6b0a4c7a0a0c1a992d2f24d95b"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/loops-15",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "loops",
+    "n": 15,
+    "sha256": "e31bd86e57857c63775232a7853077cc9646044e89710dd797ee7cfc2ed4c8d7"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/loops-30",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "loops",
+    "n": 30,
+    "sha256": "5d31ea26d3ac983c83cc49882f14a71baf887b4c7c33d1b95627b045bd130a24"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/loops-60",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "loops",
+    "n": 60,
+    "sha256": "fc83e940b71d61a7666be928e75c6b4ca8cf75d20339d8a37e71b7e91a4b74c5"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/loops-120",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "loops",
+    "n": 120,
+    "sha256": "5a675f16552c076354c1f8b2d661dfb188059ec23cad26c159f7bd807b5ae0b3"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/funcs-50",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "funcs",
+    "n": 50,
+    "sha256": "464947ec5b4a4c564a5ac8ddc9abd321365a9581c1e7ea8f10332c6a90fedf10"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/funcs-100",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "funcs",
+    "n": 100,
+    "sha256": "06eddef81409465d4080fad5272278652a09644404aa4e4a04a31d160e4fa5c7"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/funcs-200",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "funcs",
+    "n": 200,
+    "sha256": "6de94edf4380e9b8ee779dee1bc47638701f8ecfd334526dc5daaf7b54f3a1c4"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/funcs-400",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "funcs",
+    "n": 400,
+    "sha256": "014fca39d3a52f328a31c9e0ef2bd27dcac83e67976faaf39759ca755fd8eca7"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/arraysize-4096",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "arraysize",
+    "n": 4096,
+    "sha256": "a1166a8895bac27bbb8bbfcc76ab6332f172157326563fcbf1bf1c21ecc72a18"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/arraysize-16384",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "arraysize",
+    "n": 16384,
+    "sha256": "655363d80456f917a84a8f67d8c3eabb0c9343eaa226c2560bc1f63ed222e308"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/arraysize-65536",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "arraysize",
+    "n": 65536,
+    "sha256": "f24aee440cd7ee711cb5441b76d92cb4b7b750e1fccb479387a66658c2ec70cc"
+   }
+  },
+  {
+   "id": "ladder/compile-scaling/arraysize-262144",
+   "kind": "scale-ladder",
+   "crate_type": "bin",
+   "run": true,
+   "edition": "2021",
+   "opt_level": "2",
+   "rustc_flags": [
+    "-Coverflow-checks=off",
+    "-Ccodegen-units=1",
+    "-Cdefault-linker-libraries=y"
+   ],
+   "source": {
+    "type": "generator",
+    "generator": "compile-scaling",
+    "shape": "arraysize",
+    "n": 262144,
+    "sha256": "cf383030aa4dbf9a901a31e56ce5f63516fd9539b4d4f17054c4da5c20d072c6"
+   }
+  }
+ ]
+}

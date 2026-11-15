@@ -99,9 +99,10 @@
 //! the `1 << (x % 32)` bit-mask idiom clang folds and tcg previously kept
 //! (nsieve-bits' BTEST/BFLIP hot loops).
 //!
-//! Fail-closed conditions: same block, `t` single-use function-wide, all four
-//! registers the same GPR width, and `amt` NOT redefined between the `AndRI`
-//! and the shift (checked via the walk's last-def positions — see below).
+//! Fail-closed conditions: every function-wide use of `t` is a same-block
+//! register-amount shift with the same GPR width, and neither `amt` nor `t` is
+//! redefined between the `AndRI` and the last such shift. The common single-use
+//! case retains the walk's cheaper last-def check.
 //!
 //! # Reaching-definition hygiene (applies to ALL patterns in this pass)
 //!
@@ -118,11 +119,11 @@
 //! running, LSR fusion becomes a no-op. The shift-amount mask elision alone:
 //! set `TCG_NO_SHIFT_AMT_MASK_ELIDE` (any value).
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
-    AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap, VReg,
-    regs::RegClass,
+    AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
+    VReg, regs::RegClass,
 };
 
 use crate::pass_manager::MachinePass;
@@ -196,13 +197,13 @@ fn run_shift_alu_fuse(func: &mut MachFunction, mut provenance: Option<&mut Prove
         // order because we populate this as we walk), and entries are
         // INVALIDATED when any later instruction redefines the vreg, so a map
         // hit is the true reaching definition at the consumer.
-        let mut lsl_defs: HashMap<VReg, ProducerDef> = HashMap::new();
-        let mut lsr_defs: HashMap<VReg, ProducerDef> = HashMap::new();
-        let mut and_defs: HashMap<VReg, ProducerDef> = HashMap::new();
+        let mut lsl_defs: HashMap<VReg, ProducerDef> = HashMap::default();
+        let mut lsr_defs: HashMap<VReg, ProducerDef> = HashMap::default();
+        let mut and_defs: HashMap<VReg, ProducerDef> = HashMap::default();
         // Most recent in-block def position of EVERY vreg (any opcode). Guards
         // the folded SOURCE operand: moving its read down to the consumer is
         // only sound if no intervening instruction redefined it.
-        let mut last_def_pos: HashMap<VReg, usize> = HashMap::new();
+        let mut last_def_pos: HashMap<VReg, usize> = HashMap::default();
 
         for (pos, inst_id) in func.block(block_id).insts.clone().into_iter().enumerate() {
             let opcode = func.inst(inst_id).opcode;
@@ -237,19 +238,26 @@ fn run_shift_alu_fuse(func: &mut MachFunction, mut provenance: Option<&mut Prove
                 AArch64Opcode::LslRR | AArch64Opcode::LsrRR | AArch64Opcode::AsrRR
                     if mask_elide_enabled =>
                 {
-                    if let Some((and_id, amt)) = try_elide_shift_amount_mask(
+                    if let Some((and_id, amt, shifts)) = try_elide_shift_amount_mask(
+                        block_id,
+                        inst_id,
                         func.inst(inst_id),
                         func,
                         &and_defs,
                         &read_counts,
                         &last_def_pos,
                     ) {
-                        // Rewrite the shift amount in place (opcode unchanged),
-                        // then delete the now-dead AndRI (single-use, consumed).
-                        func.inst_mut(inst_id).operands[2] = MachOperand::VReg(amt);
+                        // Rewrite every eligible shift amount in place (opcodes
+                        // unchanged), then delete the now-dead AndRI.
+                        for shift_id in shifts {
+                            func.inst_mut(shift_id).operands[2] = MachOperand::VReg(amt);
+                            if let Some(provenance) = provenance.as_deref_mut() {
+                                provenance
+                                    .record_in_place_transform(shift_id, shift_alu_fuse_pass_id());
+                            }
+                        }
                         *func.inst_mut(and_id) = MachInst::new(AArch64Opcode::Nop, vec![]);
                         if let Some(provenance) = provenance.as_deref_mut() {
-                            provenance.record_in_place_transform(inst_id, shift_alu_fuse_pass_id());
                             provenance.record_in_place_transform(and_id, shift_alu_fuse_pass_id());
                         }
                         changed = true;
@@ -306,28 +314,29 @@ fn run_shift_alu_fuse(func: &mut MachFunction, mut provenance: Option<&mut Prove
 }
 
 /// Try to elide a redundant amount-mask `AndRI` feeding a register-amount
-/// shift. On success returns `(and_inst_id, amt)` — the caller replaces the
-/// shift's amount operand with `amt` and deletes the `AndRI`.
+/// shift. On success returns `(and_inst_id, amt, shifts)` — the caller replaces
+/// every listed shift's amount operand with `amt` and deletes the `AndRI`.
 ///
 /// SOUND because LSLV/LSRV/ASRV take the amount mod the register width in
 /// hardware (see the module note): when `mask` keeps all low `log2(width)`
 /// bits, `(amt & mask) mod width == amt mod width` for every `amt`.
 fn try_elide_shift_amount_mask(
+    block_id: BlockId,
+    shift_id: InstId,
     shift: &MachInst,
     func: &MachFunction,
     and_defs: &HashMap<VReg, ProducerDef>,
     read_counts: &HashMap<VReg, u32>,
     last_def_pos: &HashMap<VReg, usize>,
-) -> Option<(InstId, VReg)> {
+) -> Option<(InstId, VReg, Vec<InstId>)> {
     if shift.operands.len() != 3 {
         return None;
     }
     let dst = shift.operands[0].as_vreg()?;
     let src = shift.operands[1].as_vreg()?;
     let t = shift.operands[2].as_vreg()?;
-    // t must be SINGLE-USE (only this shift reads it) so deleting its AndRI is
-    // safe.
-    if read_counts.get(&t).copied().unwrap_or(0) != 1 {
+    let read_count = read_counts.get(&t).copied().unwrap_or(0);
+    if read_count == 0 {
         return None;
     }
     let and_def = *and_defs.get(&t)?;
@@ -353,13 +362,133 @@ fn try_elide_shift_amount_mask(
     if (mask as u64) & low_bits != low_bits {
         return None;
     }
-    // amt must not be redefined between the AndRI and the shift (its read
-    // moves down to the shift site). A def AT the AndRI position is the AndRI
-    // itself writing amt (t == amt) — also unsafe, also declined.
-    if last_def_pos.get(&amt).is_some_and(|&p| p >= and_def.pos) {
+    if read_count == 1 {
+        // Common case: amt must not be redefined between the AndRI and the
+        // shift (its read moves down to the shift site). A def AT the AndRI
+        // position is the AndRI itself writing amt (t == amt) — also unsafe.
+        if last_def_pos.get(&amt).is_some_and(|&p| p >= and_def.pos) {
+            return None;
+        }
+        return Some((and_def.inst, amt, vec![shift_id]));
+    }
+
+    // Shared mask: deleting the producer is sound only when *every* read is an
+    // amount read by a same-width variable shift reached by this AndRI. Validate
+    // and return the complete consumer set so the caller rewrites it atomically.
+    let shifts =
+        shared_mask_shift_uses(func, block_id, shift_id, and_def, t, amt, width, read_count)?;
+    Some((and_def.inst, amt, shifts))
+}
+
+/// Validate all reads of a multiply-used masked shift amount.
+///
+/// This deliberately accepts only one closed shape: every read must be operand
+/// 2 of a well-formed `LslRR`/`LsrRR`/`AsrRR` in the producer's block, after
+/// the producer, and all data/amount registers must have `width`. Any intervening
+/// redefinition of either the masked value or its raw source declines the whole
+/// rewrite.
+#[allow(clippy::too_many_arguments)]
+fn shared_mask_shift_uses(
+    func: &MachFunction,
+    block_id: BlockId,
+    first_shift_id: InstId,
+    and_def: ProducerDef,
+    t: VReg,
+    amt: VReg,
+    width: u32,
+    read_count: u32,
+) -> Option<Vec<InstId>> {
+    let block = func.block(block_id);
+    if block.insts.get(and_def.pos).copied()? != and_def.inst {
         return None;
     }
-    Some((and_def.inst, amt))
+
+    let mut shifts = Vec::new();
+    let mut last_use_pos = and_def.pos;
+    for &other_block_id in &func.block_order {
+        for (pos, &inst_id) in func.block(other_block_id).insts.iter().enumerate() {
+            let inst = func.inst(inst_id);
+            let mut reads_t_as_amount = false;
+            let mut reads_t_elsewhere = false;
+            crate::effects::aarch64_for_each_use_position(
+                inst.opcode,
+                inst.operands.len(),
+                |operand_pos| {
+                    if inst
+                        .operands
+                        .get(operand_pos)
+                        .and_then(MachOperand::as_vreg)
+                        == Some(t)
+                    {
+                        if operand_pos == 2 {
+                            reads_t_as_amount = true;
+                        } else {
+                            reads_t_elsewhere = true;
+                        }
+                    }
+                },
+            );
+            if !reads_t_as_amount && !reads_t_elsewhere {
+                continue;
+            }
+            if reads_t_elsewhere
+                || other_block_id != block_id
+                || pos <= and_def.pos
+                || !matches!(
+                    inst.opcode,
+                    AArch64Opcode::LslRR | AArch64Opcode::LsrRR | AArch64Opcode::AsrRR
+                )
+                || inst.operands.len() != 3
+            {
+                return None;
+            }
+            let dst = inst.operands[0].as_vreg()?;
+            let src = inst.operands[1].as_vreg()?;
+            if inst.operands[2].as_vreg()? != t
+                || gpr_width(dst.class)? != width
+                || gpr_width(src.class)? != width
+                || gpr_width(t.class)? != width
+            {
+                return None;
+            }
+            shifts.push(inst_id);
+            last_use_pos = last_use_pos.max(pos);
+        }
+    }
+
+    // The role-oracle count and the closed-shape scan must agree exactly. This
+    // also rejects duplicate appearances of t within one instruction.
+    if u32::try_from(shifts.len()).ok()? != read_count || shifts.first().copied()? != first_shift_id
+    {
+        return None;
+    }
+
+    // Moving amt's read to every shift requires amt to retain the value read by
+    // the AndRI. A t redefinition would likewise mean a later shift no longer
+    // consumes this producer. Check through the final consumer, not beyond it.
+    for &inst_id in block
+        .insts
+        .iter()
+        .take(last_use_pos + 1)
+        .skip(and_def.pos + 1)
+    {
+        let inst = func.inst(inst_id);
+        let mut redefines_input = false;
+        crate::effects::aarch64_for_each_def_position(
+            inst.opcode,
+            inst.operands.len(),
+            |def_pos| {
+                if let Some(v) = inst.operands.get(def_pos).and_then(MachOperand::as_vreg) {
+                    redefines_input |= v == t || v == amt;
+                }
+            },
+        );
+        if redefines_input {
+            return None;
+        }
+    }
+
+    Some(shifts)
 }
 
 /// Count, for every VReg, how many times it appears as a READ operand across
@@ -369,7 +498,7 @@ fn try_elide_shift_amount_mask(
 /// oracle: `read_counts[t] == 1` means the only reader of `t` is the candidate
 /// consumer, so folding it and deleting its producer is safe.
 fn count_vreg_reads(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);

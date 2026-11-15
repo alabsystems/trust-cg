@@ -1,17 +1,64 @@
 {
   "schema": "trust-cg-gates-v1",
+  "version": 4,
   "source_of_truth": "metrics-contract.md (section 10) -- this file must never drift from it",
-  "results_schema": "trust-cg-bench-v1",
+  "results_schema": "trust-cg-bench-v2",
   "notes": [
     "Predicates are conjunctions in a jq-compatible subset: `.path op literal [and ...]`.",
-    "They evaluate identically via `jq '<predicate>' results.json` (when jq is installed) and via",
-    "the dependency-free checker: python3 benchmarks/beat-llvm/contract/check_gates.py <results.json>.",
-    "Every gate ALSO requires the eligibility predicate. `.headline_eligible` is computed by the",
-    "harness per contract section 8 (quiet AND clean tree AND no proof-weakening TCG_* env AND",
-    "contract-default N AND 0 MISMATCH) and stamped into every results JSON.",
-    "Geomeans are over MATCH rows and must be co-published with coverage_pct (intent-to-treat)."
+    "For valid measured inputs they can be evaluated via jq or the dependency-free checker:",
+    "python3 benchmarks/beat-llvm/contract/check_gates.py <results.json>. Unlike jq's total ordering,",
+    "the checker rejects malformed predicates and fails numeric thresholds with null or nonnumeric operands.",
+    "Every gate ALSO requires the eligibility predicate. Gates are evaluated on the aggregates recomputed from the per-program table (check_gates.recomputed_view), never on a stamp. `.headline_eligible` is computed by the",
+    "harness per contract section 8 (quiet AND clean tree AND no proof-weakening TCG_* env or backend knob AND",
+    "contract-default N (compile 3, run 5, peak RSS 5) AND 0 MISMATCH AND a complete size/RSS measurement AND a usable, undegraded proof checker) and stamped into every results JSON; check_gates.evidence_eligible rechecks it.",
+    "Geomeans are over MATCH rows and must be co-published with coverage_pct (intent-to-treat).",
+    "Every aggregate a predicate reads is EXACT (unrounded) and fail-closed: null unless EVERY covered MATCH row has its value; check_gates.table_aggregates recomputes it from the per-program table (runtime and compile from each lane's raw samples) and a stamp that disagrees is refused. Rounding is for display only.",
+    "A predicate whose aggregate input is null is UNMEASURED (check_gates.gate_verdict), never a pass or a fail.",
+    "Ineligibility withholds evidence status only: the ledger ratchet regression-checks every like-with-like row (the contract corpus at the contract N), so a measured regression is RED whether or not the row is evidence; a --progs subset or a run below the contract N is INCONCLUSIVE, and only a run of exactly the contract corpus can be evidence. A corpus change is compared on shared programs and is otherwise INCONCLUSIVE until `check_perf_ratchet.py --append --new-lineage '<reason>'` records a new lineage on an eligible evidence row (its first baseline).",
+    "Provenance, including bridge_cg_args (the backend knobs the harness passed), is self-reported by the harness and unsigned: a hand-edited results JSON can misstate it.",
+    "`schema` names the file format (unchanged); `version` numbers the predicate set, eligibility and aggregation rules, with `revisions` recording each change.",
+    "Size has two measures: `size_bytes` (linked file st_size, shared std included; S1/S2) and `emitted_size_bytes` (version 3; S3/S4): the linked image's code and read-only data bytes that the system linker's map attributes to the objects the compile wrote into its own private output directory, after dead stripping (benchmarks/beat-llvm/emitted_size.py). Peak RSS readings (version 3) are the median of an odd number of dedicated samples per lane, recomputed from the retained samples."
   ],
-  "eligibility": ".headline_eligible == true and .provenance.quiet == true and .provenance.git_dirty == false and .aggregates.mismatch_count == 0",
+  "revisions": [
+    {
+      "version": 1,
+      "summary": "Runtime (G1a/G1b/G1c), compile (G2) and coverage (G5) gates; no size or RSS predicate."
+    },
+    {
+      "version": 2,
+      "date": "2026-09-26",
+      "summary": "Adds size predicates S1/S2 and preregisters peak-RSS predicates R1/R2. S1/S2 are not preregistered in the strict sense: every one of the 29 committed ledger rows already recorded a linked-size geomean (their thresholds come from the July 2026 roadmap of 2026-07-01, written before the first ledger row recorded a size on 2026-07-02). R1/R2 are preregistered for aarch64-unknown-linux-gnu, where no row has a non-null RSS; the 7 x86_64-apple-darwin rows recorded a program-RSS geomean, and compiler RSS was never condensed into a row. No existing gate predicate or threshold changed. Versioned with it, before any eligible run under them: every aggregate is exact and fail-closed and is recomputed from the per-program table (runtime and compile from raw samples); the --cold lane is true cold (a fresh private XDG_CACHE_HOME per compile, population cost timed), because the Trust driver refuses the TCG_* environment the former lane used and every such compile failed; eligibility also requires complete readings and samples, a calibrated RSS sampler, an independent proof checker that runs when probed, no DEGRADED-verification banner and no backend knob, and exactly the contract corpus (a --progs subset is never evidence or a baseline); and ineligibility no longer exempts a like-with-like row from the ratchet's regression checks.",
+      "rationale": [
+        "Size thresholds come from the July 2026 roadmap's BENCH-1 contract design: GATE-P2 parity-all 'size geomean <= 1.10x' and GATE-SB 'size <= 1.0x'. The roadmap named stripped __TEXT+__DATA; the harness measures linked executable file bytes (st_size), which include the shared std, so S1/S2 can pass on std alone and say nothing about emitted-code size (ledger L14-P10).",
+        "Program peak RSS is read by a per-process sampler that reports max(the wrapper's own resident set, inherited across exec on Linux, and the program's peak). A comparison is RESOLVED only when both readings are above 2x the measured floor (the TY/TLC contract's rule, section 8.3). A bridge reading more than 5% above both the LLVM reading and the floor is a conclusive loss wherever it sits (it is the bridge's peak, and the LLVM reading can only overstate LLVM's). R1 fails on any loss, passes only when EVERY matching program's comparison is resolved and none is a loss, and is otherwise unmeasured: a program at the floor is not a measured parity. On the aarch64 Linux host 16 of 18 programs sit at the ~13.7 MB floor, so R1 is expected to read unmeasured there until the sampler floor is lowered. R1 is one-sided: it cannot establish the roadmap GATE-SB's 'RSS <= 1.0x', and the program-RSS geomean is reported, not gated.",
+        "The 5% band is the contract's minimum runtime parity band, applied because one dedicated RSS sample per lane has no spread estimate.",
+        "Compiler peak RSS readings sit far above the floor; R2 mirrors G2-M1 (<= 1.00x LLVM -O2) and additionally requires that no compiler reading is floor-bound, so it cannot pass on unresolved readings.",
+        "Exact comparison: gates were previously compared on aggregates and per-program ratios rounded to 3 decimals, which let a value up to 0.0005 over a '<=' threshold pass (a linked-size geomean of 1.0000187 read 1.0 and passed S2). Rounding is now display-only for every thresholded aggregate (G1a, G1b, G1c, G2, G5, S1, S2, R2)."
+      ]
+    },
+    {
+      "version": 3,
+      "date": "2026-09-29",
+      "summary": "Defines and gates emitted-code size (S3/S4, preregistered) and makes every peak-RSS reading the median of N=5 dedicated samples per lane with a spread-aware R1 parity band, under which a comparison whose sample spread exceeds 0.25 is unresolved. S1/S2 keep reading the linked file size; no other predicate or threshold changed. Eligibility also requires N >= 5 in provenance and in every retained RSS lane of a MATCH row (a run with no MATCH row has no retained reading and is held to the provenance N only). Results schema trust-cg-bench-v2 (a lane's rss_samples entry is a list); results and ledger rows from before this version stay readable but are not baselines for the redefined metrics.",
+      "rationale": [
+        "Linked file bytes include the shared standard library, which both lanes link from the same sysroot rlibs, so the size geomean read 1.000x on all 22 AArch64 Linux rows and 1.0006x on the Darwin diagnostic rows whatever the backend emitted (ledger L14-P10). Emitted-code size counts only the bytes the linker's own map places from the objects the compile produced (its codegen units and allocator shim, including the standard-library generics the crate instantiates), in code sections and read-only data sections, after dead stripping. Writable data, zero-fill and unwind tables are recorded per class but not gated: Darwin's compact unwind table is linker-synthesized and cannot be attributed per object.",
+        "S3/S4 are preregistered in the strict sense: no committed ledger row recorded an emitted-code size. Their thresholds are the July 2026 roadmap's GATE-P2 parity-all size bound (<= 1.10x) and GATE-SB (<= 1.00x). The roadmap stated them for 'binary size (stripped __TEXT+__DATA, plus the linked bin)', segments of the linked image that include the statically linked std and writable __DATA; applying them to emitted-code size is this version's reading of that intent, not the roadmap's wording.",
+        "The map-linked image is a second link of the same compile; the harness refuses the reading unless its section bytes equal the timed binary's (emitted_size.image_digest ignores only load commands, __LINKEDIT and the ELF build-id), so the attribution describes the measured binary.",
+        "Peak RSS repeats within about 1% on a quiet host, but a single dedicated sample has no spread estimate, so version 2 had to apply the 5% runtime band blind. N = 5 matches the runtime run count and costs about 12 extra compiles and 8 extra runs per program. The median of an odd N is itself a reading; a lane with any failed sample has no reading (never a median of survivors). R1's per-program band is the contract's runtime rule max(5%, 2 x relative spread), the spread being (max-min)/median of the larger-spread lane. A range is moved by one outlier sample that the median ignores (bridge samples 90,90,90,90,180 MiB against 50 MiB read a +80% median inside a 3x band), so a comparison whose spread exceeds 0.25, the runtime lane's resolvability cap (run.py RELIABLE_SPREAD_MAX), is unresolved: a median beyond its band is still a loss, but a noisy comparison never counts as parity and R1 then reads unmeasured. Evidence requires N >= 5 in provenance and in every retained lane of a MATCH row; a run with no MATCH row (the Darwin production lane today) is held to the provenance N only, as in version 2.",
+        "Rows of gates.json version 2 or earlier are not baselines for peak RSS, the resolved-loss count or emitted-code size (their method differs); no committed version-2 row recorded a non-null RSS value, so no baseline is lost."
+      ]
+    },
+    {
+      "version": 4,
+      "date": "2026-10-02",
+      "summary": "The program peak-RSS geomean (rss_geomean_vs_llvm_o3) is null unless the RSS sampler is calibrated and no MATCH program's comparison is floor-bound (either median at or below 2x the sampler floor), and a condensed ledger row's per-program rss_vs_llvm_o3 is null for a floor-bound program. No predicate, threshold or eligibility rule changed: R1 already read unmeasured on floor-bound programs, and the geomean was reported, not gated. Ruling OD-32, docs/decision-record.md.",
+      "rationale": [
+        "On Linux the fresh Python wrapper imposes a sampler floor of about its own resident set (about 10 MB); small corpus programs read at that floor in both lanes, so a geomean over them came out near 1.0 while resolving nothing. A reading at or below twice the floor is an upper bound, and a ratio of upper bounds reads as a measurement it is not.",
+        "No committed ledger row of version 3 or later recorded a non-null program-RSS geomean, so no baseline changes meaning."
+      ]
+    }
+  ],
+  "eligibility": ".headline_eligible == true and .provenance.quiet == true and .provenance.git_dirty == false and .aggregates.mismatch_count == 0 and .aggregates.resource_measurement_complete == true",
   "gates": {
     "G1a_scalar_runtime_M2": {
       "description": "scalar-integer corpus runtime geomean <= 1.30x LLVM -O3 (scalar category only, per manifest.json — the corpus now spans categories, BENCH-3)",
@@ -40,6 +87,30 @@
     "G5_coverage_M6": {
       "description": "intent-to-treat coverage >= 80% compile-and-match",
       "predicate": ".aggregates.coverage_pct >= 80"
+    },
+    "S1_size_linked_parity_vs_O3": {
+      "description": "linked executable file bytes (st_size, shared std included; not emitted-code size) geomean <= 1.10x LLVM -O3 (the roadmap BENCH-1 GATE-P2 threshold, applied to linked bytes)",
+      "predicate": ".aggregates.size_geomean_vs_llvm_o3 != null and .aggregates.size_geomean_vs_llvm_o3 <= 1.10"
+    },
+    "S2_size_linked_SB_vs_O3": {
+      "description": "linked executable file bytes geomean <= 1.00x LLVM -O3 (the roadmap BENCH-1 GATE-SB size threshold, applied to linked bytes)",
+      "predicate": ".aggregates.size_geomean_vs_llvm_o3 != null and .aggregates.size_geomean_vs_llvm_o3 <= 1.00"
+    },
+    "S3_size_emitted_parity_vs_O3": {
+      "description": "emitted-code bytes (the linked image's code and read-only data the linker map attributes to the program's own objects; shared std excluded) geomean <= 1.10x LLVM -O3 (roadmap GATE-P2 size)",
+      "predicate": ".aggregates.emitted_size_geomean_vs_llvm_o3 != null and .aggregates.emitted_size_geomean_vs_llvm_o3 <= 1.10"
+    },
+    "S4_size_emitted_SB_vs_O3": {
+      "description": "emitted-code bytes geomean <= 1.00x LLVM -O3 (roadmap GATE-SB size)",
+      "predicate": ".aggregates.emitted_size_geomean_vs_llvm_o3 != null and .aggregates.emitted_size_geomean_vs_llvm_o3 <= 1.00"
+    },
+    "R1_program_rss_no_resolved_loss": {
+      "description": "no MATCH program's bridge peak-RSS median exceeds max(its LLVM -O3 median, the sampler floor) by more than its parity band max(5%, 2 x the larger lane's relative sample spread) (a conclusive loss); passes only when every program's comparison is resolved (both medians above 2x the sampler floor and neither lane's relative sample spread above 0.25), otherwise unmeasured; one-sided: cannot certify a win or RSS <= 1.0x",
+      "predicate": ".aggregates.program_rss_resolved_loss_count == 0"
+    },
+    "R2_compile_rss_parity_vs_O2": {
+      "description": "compiler peak RSS (largest single process of the trustc invocation, median of N compiles per lane) geomean <= 1.00x LLVM -O2, with no compiler median at or below 2x the sampler floor (mirrors G2-M1)",
+      "predicate": ".aggregates.compile_rss_geomean_vs_llvm_o2 != null and .aggregates.compile_rss_geomean_vs_llvm_o2 <= 1.00 and .aggregates.compile_rss_floor_bound_count == 0"
     }
   }
 }

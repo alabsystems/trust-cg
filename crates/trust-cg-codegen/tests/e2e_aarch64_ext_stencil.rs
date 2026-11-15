@@ -20,8 +20,13 @@ use trust_cg_codegen::pipeline::OptLevel;
 use trust_ir::{ICmpOp, ParamAttrs, Ty};
 use trust_ir_build::ModuleBuilder;
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// `kernel(ptr o, ptr a, i32 n)`: `for i in [1, n-1): o[i] = a[i-1]+a[i]+a[i+1]`
@@ -77,7 +82,7 @@ fn build_module() -> trust_ir::Module {
         fb.ret(vec![]);
         fb.build();
     }
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     // Mark BOTH pointer params `noalias` — the stencil pass's aliasing gate.
     let f = module
         .functions
@@ -102,7 +107,8 @@ fn compile_at(module: &trust_ir::Module, opt: OptLevel) -> Result<Vec<u8>, Strin
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|r| r.object_code)
@@ -166,8 +172,8 @@ int main(void) {
 
 /// Link `obj` against the driver, run it, and return (exit_code, disassembly).
 fn link_run_disasm(tag: &str, obj: &[u8]) -> Option<(i32, String)> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -184,6 +190,7 @@ fn link_run_disasm(tag: &str, obj: &[u8]) -> Option<(i32, String)> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -222,6 +229,15 @@ fn e2e_aarch64_forged_noalias_stencil_stays_scalar_and_bit_exact() {
 
     // -O2: public noalias labels remain report-only, so retain the scalar body.
     let obj2 = compile_at(&module, OptLevel::O2).expect("O2 must compile");
+    // Independent of the host objdump's syntax (LLVM prints `ext.16b`, GNU
+    // prints `ext v0.16b`): no EXT (vector) word, `0 Q 101110 000 Rm 0 imm4 0
+    // Rn Rd`, may appear in the object's code.
+    assert!(
+        !native_host::text_words(&obj2)
+            .into_iter()
+            .any(|word| word & 0xbfe0_8400 == 0x2e00_0000),
+        "label-only noalias must not authorize EXT (object words)"
+    );
     let Some((code, disasm)) = link_run_disasm("ext_sten_o2", &obj2) else {
         return;
     };
@@ -252,4 +268,13 @@ fn e2e_aarch64_forged_noalias_stencil_stays_scalar_and_bit_exact() {
     }
 
     assert_eq!(code, 0, "O2 scalar fallback mismatch vs scalar reference");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

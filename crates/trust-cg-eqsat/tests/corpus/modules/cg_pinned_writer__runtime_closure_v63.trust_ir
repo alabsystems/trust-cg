@@ -1,0 +1,23 @@
+; TrustIr text format v1
+module "runtime_closure_v63"
+
+functy.0 = (i64) -> (i64)
+
+functy.1 = () -> (i64)
+
+functy.2 = (i64, i64, i64) -> (i64)
+
+closure_ty functy.1 { i64, i64, i64 }
+
+fn @host(functy.0) {
+    ; #body-gate: ungated
+bb0(%0: i64):
+    %1 = make_closure closure.0 @func.1 (%0, %0, %0)
+    ret %0
+}
+
+fn @target(functy.2) {
+    ; #body-gate: ungated
+bb0(%0: i64, %1: i64, %2: i64):
+    ret %0
+}

@@ -1,7 +1,7 @@
 // trust-cg-codegen/tests/e2e_aarch64_swift_aggregate.rs
 //
 // Completeness: the AGGREGATE subset of the `Swift` (swiftcall) calling
-// convention on aarch64-apple-darwin. Unlike the C ABI (AAPCS64), swiftcall
+// convention on aarch64-apple-darwin. Unlike the C ABI (DarwinPCS), swiftcall
 // lowers aggregates FIELD-WISE: a 17-32 byte all-integer struct is passed and
 // returned directly in x0-x3 (C uses sret / a byref pointer); a mixed int+FP
 // struct splits its integer fields into GPRs and gives EACH FP scalar field its
@@ -14,11 +14,20 @@
 // function `__attribute__((swiftcall))` with the ORIGINAL aggregate prototype
 // and checks that the values round-trip / sum correctly. Because trust-cg's
 // scalarized layout coincides with clang's swiftcall layout, the checks pass --
-// which is exactly what proves the coincidence, bit-exact at O0 and O2.
+// which is exactly what proves the coincidence, bit-exact at O0 and O2. The
+// objects are compiled for an explicit `aarch64-apple-darwin` target on every
+// host; only macOS links and runs them.
+//
+// The scalarization is bound to that witnessed Darwin contract (c6d2228c6).
+// Under AAPCS64 (`aarch64-unknown-linux-gnu`) no swiftcall aggregate layout has
+// been witnessed, so every one of these shapes is refused by name as an
+// unsupported calling convention; that refusal is pinned here per shape,
+// beside a scalar swiftcc control that AAPCS64 still admits.
 //
 // A budget >= 5 struct (>4 combined GPR-word + FP-field components) is OUTSIDE
 // the sound subset -- swiftcall passes it indirectly / via sret, which trust-cg
-// keeps FAIL-CLOSED (a compile error), pinned here too.
+// keeps FAIL-CLOSED (a named compile error), pinned here too, as is a packed
+// struct whose layout is not natural-C.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -26,8 +35,10 @@
 use std::fs;
 use std::process::Command;
 
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+use trust_cg_codegen::compiler::{CompileError, Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::TargetSpec;
+use trust_cg_lower::AdapterError;
 
 use trust_ir::{
     BinOp, Block as TrustIrBlock, CallingConv, CastOp, FieldDef, FuncTy,
@@ -36,6 +47,11 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
+// The witnessed swiftcall contract (DarwinPCS, Mach-O) and the AAPCS64 ELF
+// target on which no swiftcall aggregate layout has been witnessed.
+const DARWIN: &str = "aarch64-apple-darwin";
+const AAPCS64_LINUX: &str = "aarch64-unknown-linux-gnu";
+
 fn can_link_and_run_aarch64_macho() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
@@ -43,6 +59,7 @@ fn can_link_and_run_aarch64_macho() -> bool {
 // A C-repr struct type whose ABI matches the clang driver's `struct`.
 fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields: fields
@@ -67,11 +84,14 @@ fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
 // round-trip scrambles.
 fn build_identity(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
     let agg = Ty::Struct(StructId::new(struct_id));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![agg.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![agg.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(fid), name, ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     f.blocks = vec![TrustIrBlock {
@@ -81,7 +101,8 @@ fn build_identity(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
             values: vec![ValueId::new(0)],
         })],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // swiftcc `fn sum3(s: {i64,i64,i64}) -> i64 { s.0 + s.1 + s.2 }` -- an
@@ -90,11 +111,14 @@ fn build_identity(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
 // hide) is caught. Returns a scalar (no aggregate return).
 fn build_sum3(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
     let agg = Ty::Struct(StructId::new(struct_id));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(fid), name, ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     f.blocks = vec![TrustIrBlock {
@@ -138,7 +162,8 @@ fn build_sum3(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // swiftcc `fn summix(s: {i64,f64,i64}) -> f64 { (double)s.0 + s.1 + (double)s.2 }`
@@ -147,11 +172,14 @@ fn build_sum3(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
 // word and the FP field share NO 8-byte chunk).
 fn build_summix(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
     let agg = Ty::Struct(StructId::new(struct_id));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(fid), name, ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     f.blocks = vec![TrustIrBlock {
@@ -212,7 +240,8 @@ fn build_summix(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // swiftcc `fn split6(a,b,c,d,e,f: i64, s: {i64,i64,i64}) -> i64
@@ -224,11 +253,14 @@ fn build_split6(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
     let agg = Ty::Struct(StructId::new(struct_id));
     let mut params: Vec<Ty> = vec![Ty::I64; 6];
     params.push(agg.clone());
-    let ft = m.add_func_type(FuncTy {
-        params,
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params,
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(fid), name, ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     let mut body = Vec::new();
@@ -282,11 +314,32 @@ fn build_split6(m: &mut TrustIrModule, fid: u32, name: &str, struct_id: u32) {
         params,
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
-fn build_module() -> TrustIrModule {
-    let mut m = TrustIrModule::new("swift_aggregate");
+type ShapeBuilder = fn(&mut TrustIrModule, u32, &str, u32);
+
+// Every aggregate shape in the witnessed Darwin subset, in function-id order:
+// (function, builder, struct id, index of its first aggregate parameter).
+const SHAPES: [(&str, ShapeBuilder, u32, usize); 7] = [
+    // 24B all-int param + return -> x0-x2
+    ("sw_id24", build_identity, 0, 0),
+    // 24B all-int param -> i64
+    ("sw_sum24", build_sum3, 0, 0),
+    // 32B all-int param + return -> x0-x3
+    ("sw_id32", build_identity, 1, 0),
+    // {i64;double;i64} param + return -> x0,d0,x1
+    ("sw_idmix", build_identity, 2, 0),
+    // {i64;double;i64} param -> f64
+    ("sw_summix", build_summix, 2, 0),
+    // {float;float;i64;i64} -> s0,s1,x0,x1
+    ("sw_idff", build_identity, 3, 0),
+    // 24B all-int SPLITS x6,x7,[sp] after 6 i64s
+    ("sw_split6", build_split6, 0, 6),
+];
+
+fn add_structs(m: &mut TrustIrModule) {
     // Struct ids must be distinct; func ids too.
     m.structs
         .push(struct_def(0, "S24", &[Ty::I64, Ty::I64, Ty::I64])); // 24B all-int
@@ -296,14 +349,85 @@ fn build_module() -> TrustIrModule {
         .push(struct_def(2, "SMix", &[Ty::I64, Ty::F64, Ty::I64])); // mixed {i64;double;i64}
     m.structs
         .push(struct_def(3, "SFF", &[Ty::F32, Ty::F32, Ty::I64, Ty::I64])); // {float;float;i64;i64}
+}
 
-    build_identity(&mut m, 0, "sw_id24", 0); // 24B all-int param + return -> x0-x2
-    build_sum3(&mut m, 1, "sw_sum24", 0); // 24B all-int param -> i64
-    build_identity(&mut m, 2, "sw_id32", 1); // 32B all-int param + return -> x0-x3
-    build_identity(&mut m, 3, "sw_idmix", 2); // {i64;double;i64} param + return -> x0,d0,x1
-    build_summix(&mut m, 4, "sw_summix", 2); // {i64;double;i64} param -> f64
-    build_identity(&mut m, 5, "sw_idff", 3); // {float;float;i64;i64} -> s0,s1,x0,x1
-    build_split6(&mut m, 6, "sw_split6", 0); // 24B all-int SPLITS x6,x7,[sp] after 6 i64s
+fn build_module() -> TrustIrModule {
+    let mut m = TrustIrModule::new("swift_aggregate");
+    add_structs(&mut m);
+    for (fid, (name, build, struct_id, _)) in SHAPES.iter().enumerate() {
+        build(&mut m, fid as u32, name, *struct_id);
+    }
+    field_typed_extracts(&mut m);
+    m
+}
+
+/// The builders spell `ExtractField.ty` as the AGGREGATE type (a legacy
+/// spelling the adapter reads); trust-ir's `ExtractField.ty` is the extracted
+/// FIELD's type (`OperandTypeMismatch` otherwise), and since WS7.3 every
+/// ingestion entry refuses what the validator refuses. Rewrite each to the
+/// struct's declared field type.
+fn field_typed_extracts(m: &mut TrustIrModule) {
+    let structs = m.structs.clone();
+    for f in &mut m.functions {
+        for block in &mut f.blocks {
+            for node in &mut block.body {
+                if let Inst::ExtractField { ty, field, .. } = &mut node.inst
+                    && let Ty::Struct(id) = ty
+                {
+                    let field_ty = structs
+                        .iter()
+                        .find(|def| def.id == *id)
+                        .and_then(|def| def.fields.get(*field as usize))
+                        .map(|field| field.ty.clone())
+                        .expect("ExtractField names a declared struct field");
+                    *ty = field_ty;
+                }
+            }
+        }
+    }
+}
+
+// One shape per module, so each refusal names its own function.
+fn build_shape_module(name: &str, build: ShapeBuilder, struct_id: u32) -> TrustIrModule {
+    let mut m = TrustIrModule::new(format!("swift_aggregate_{name}"));
+    add_structs(&mut m);
+    build(&mut m, 0, name, struct_id);
+    field_typed_extracts(&mut m);
+    m
+}
+
+// swiftcc `fn add2(a: i64, b: i64) -> i64 { a + b }` -- single-register
+// scalars only, which AAPCS64 places exactly as swiftcc does.
+fn build_scalar_control_module() -> TrustIrModule {
+    let mut m = TrustIrModule::new("swift_scalar_control");
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let mut f = TrustIrFunction::new(FuncId::new(0), "sw_add2", ft, BlockId::new(0));
+    f.calling_conv = CallingConv::Swift;
+    f.blocks = vec![TrustIrBlock {
+        id: BlockId::new(0),
+        params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
+        body: vec![
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Add,
+                ty: Ty::I64,
+                lhs: ValueId::new(0),
+                rhs: ValueId::new(1),
+            })
+            .with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Return {
+                values: vec![ValueId::new(2)],
+            }),
+        ],
+    }];
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -328,6 +452,7 @@ fn build_budget5_module() -> TrustIrModule {
 fn build_packed_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("swift_aggregate_packed");
     m.structs.push(StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "PackedI8I64".to_string(),
         fields: vec![
@@ -352,16 +477,64 @@ fn build_packed_module() -> TrustIrModule {
     m
 }
 
-fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Result<Vec<u8>, String> {
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        ..CompilerConfig::default()
-    });
-    compiler
-        .compile(module)
-        .map(|r| r.object_code)
-        .map_err(|e| format!("{e:?}"))
+// Compile for an explicit triple: `Compiler::new` would derive the OS/ABI from
+// the host, and the swiftcall aggregate contract depends on it.
+#[allow(clippy::result_large_err)] // Test helper returns the compiler's own error type unchanged.
+fn compile_for(
+    triple: &str,
+    module: &TrustIrModule,
+    opt: OptLevel,
+) -> Result<Vec<u8>, CompileError> {
+    Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: opt,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse(triple).unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(module)
+    .map(|r| r.object_code)
 }
+
+// The adapter's exact refusal of a swiftcc signature whose parameter `index`
+// (of type `ty`) is an aggregate that the target's C register ABI does not
+// place identically to swiftcall.
+fn swift_aggregate_param_refusal(function: &str, index: usize, ty: &Ty) -> String {
+    format!(
+        "function {function} uses unsupported calling convention Swift for target aarch64; \
+         Trust-CG lowers C-register-ABI conventions (C/Fast/Cold/Rust for any signature, and \
+         the subset of Swift that aarch64's C ABI places identically to swiftcc: non-variadic, \
+         single-register scalar parameters, and at most 4 combined integer+FP return register \
+         components) and must not silently use the C ABI for a convention/signature with a \
+         different register layout. Here parameter {index} ({ty:?}) is not a single-register \
+         scalar (an aggregate, or a scalar with no witnessed identical placement)"
+    )
+}
+
+fn assert_swift_aggregate_refused(
+    result: Result<Vec<u8>, CompileError>,
+    function: &str,
+    index: usize,
+    ty: &Ty,
+    context: &str,
+) {
+    match result {
+        Err(CompileError::Adapter(AdapterError::UnsupportedInstruction(message))) => assert_eq!(
+            message,
+            swift_aggregate_param_refusal(function, index, ty),
+            "{context}: wrong refusal for {function}"
+        ),
+        Err(other) => panic!(
+            "{context}: {function} must be refused as an unsupported Swift convention, \
+             got {other:?}"
+        ),
+        Ok(_) => panic!("{context}: {function} must fail closed, but compiled"),
+    }
+}
+
+const MACHO_MAGIC_64: [u8; 4] = [0xcf, 0xfa, 0xed, 0xfe];
+const ELF_MAGIC: [u8; 4] = *b"\x7fELF";
 
 // The driver declares each function with `__attribute__((swiftcall))` and the
 // ORIGINAL aggregate prototype. Because trust-cg's scalarized layout coincides
@@ -421,7 +594,13 @@ int main(void) {
 
 fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
     if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+        eprintln!(
+            "SKIP native swiftcall run: linking and running the Mach-O object needs an \
+             aarch64 macOS host with clang (host probe: os={} arch={}); the {DARWIN} object \
+             compiled but was not executed",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -459,11 +638,53 @@ fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
 fn e2e_aarch64_swift_aggregate_matches_swiftcall() {
     let module = build_module();
     for opt in [OptLevel::O0, OptLevel::O2] {
-        let obj = compile_at(&module, opt).expect("swift aggregate module must compile");
+        let obj = compile_for(DARWIN, &module, opt).unwrap_or_else(|e| {
+            panic!("swift aggregate module must compile for {DARWIN} at {opt:?}: {e:?}")
+        });
+        assert_eq!(
+            obj.get(..4),
+            Some(&MACHO_MAGIC_64[..]),
+            "{DARWIN} object at {opt:?}"
+        );
         let Some(code) = link_run("swift_aggregate", &obj) else {
-            return;
+            continue;
         };
         assert_eq!(code, 0, "swift aggregate / swiftcall mismatch at {opt:?}");
+    }
+}
+
+// The scalarization is bound to the witnessed Darwin contract (c6d2228c6).
+// Under AAPCS64 each witnessed Darwin shape keeps its aggregate type and is
+// refused by name, naming the function and its first aggregate parameter,
+// while the same one-shape module still compiles for Darwin and a scalar
+// swiftcc signature still compiles for AAPCS64.
+#[test]
+fn e2e_aarch64_swift_aggregate_is_refused_by_name_under_aapcs64() {
+    let control = build_scalar_control_module();
+    for opt in [OptLevel::O0, OptLevel::O2] {
+        let obj = compile_for(AAPCS64_LINUX, &control, opt).unwrap_or_else(|e| {
+            panic!("scalar swiftcc control must compile for {AAPCS64_LINUX} at {opt:?}: {e:?}")
+        });
+        assert_eq!(
+            obj.get(..4),
+            Some(&ELF_MAGIC[..]),
+            "{AAPCS64_LINUX} object at {opt:?}"
+        );
+    }
+    for (name, build, struct_id, param) in SHAPES {
+        let module = build_shape_module(name, build, struct_id);
+        let aggregate = Ty::Struct(StructId::new(struct_id));
+        compile_for(DARWIN, &module, OptLevel::O0)
+            .unwrap_or_else(|e| panic!("{name} must compile for {DARWIN}: {e:?}"));
+        for opt in [OptLevel::O0, OptLevel::O2] {
+            assert_swift_aggregate_refused(
+                compile_for(AAPCS64_LINUX, &module, opt),
+                name,
+                param,
+                &aggregate,
+                &format!("{AAPCS64_LINUX} at {opt:?}"),
+            );
+        }
     }
 }
 
@@ -473,12 +694,16 @@ fn e2e_aarch64_swift_aggregate_matches_swiftcall() {
 #[test]
 fn e2e_aarch64_swift_aggregate_budget5_fails_closed() {
     let module = build_budget5_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
-        let result = compile_at(&module, opt);
-        assert!(
-            result.is_err(),
-            "budget>=5 swiftcc aggregate must fail-closed, but compiled at {opt:?}"
-        );
+    for triple in [DARWIN, AAPCS64_LINUX] {
+        for opt in [OptLevel::O0, OptLevel::O2] {
+            assert_swift_aggregate_refused(
+                compile_for(triple, &module, opt),
+                "sw_id5",
+                0,
+                &Ty::Struct(StructId::new(0)),
+                &format!("budget>=5 swiftcc aggregate for {triple} at {opt:?}"),
+            );
+        }
     }
 }
 
@@ -488,11 +713,24 @@ fn e2e_aarch64_swift_aggregate_budget5_fails_closed() {
 #[test]
 fn e2e_aarch64_swift_aggregate_packed_fails_closed() {
     let module = build_packed_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
-        let result = compile_at(&module, opt);
-        assert!(
-            result.is_err(),
-            "packed swiftcc aggregate must fail-closed, but compiled at {opt:?}"
-        );
+    for triple in [DARWIN, AAPCS64_LINUX] {
+        for opt in [OptLevel::O0, OptLevel::O2] {
+            assert_swift_aggregate_refused(
+                compile_for(triple, &module, opt),
+                "sw_idpk",
+                0,
+                &Ty::Struct(StructId::new(0)),
+                &format!("packed swiftcc aggregate for {triple} at {opt:?}"),
+            );
+        }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

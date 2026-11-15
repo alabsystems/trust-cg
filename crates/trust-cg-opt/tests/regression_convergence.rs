@@ -297,6 +297,8 @@ fn regression_convergence_pipeline_o3_multiblock_terminates() {
     func.add_edge(bb1, bb3);
     func.add_edge(bb2, bb3);
 
+    func.try_sync_vreg_counter()
+        .expect("fixture register ids fit u32");
     let pipeline = OptimizationPipeline::new(OptLevel::O3);
     let pass_count = pipeline.pass_count();
     let start = Instant::now();

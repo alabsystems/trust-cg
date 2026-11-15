@@ -17,8 +17,8 @@ readme.workspace = true
 
 [features]
 default = []
-# WP-2 — forward the decidable-lattice guard-elision authority (see
-# `trust-cg-lower/src/lattice_guard.rs`). DEFAULT OFF.
+# WP-2 experimental lane, DEFAULT OFF. The lower crate requires replayed
+# RefinementType authority; this feature alone grants none (OD-27).
 lattice-guard-elision = ["trust-cg-lower/lattice-guard-elision"]
 
 [dependencies]

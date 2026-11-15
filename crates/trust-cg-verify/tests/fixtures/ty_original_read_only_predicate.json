@@ -1,0 +1,1193 @@
+{
+  "caller_memory_boundary": "read intervals must be live, initialized, readable, aligned appropriately and stable for the call; Ptr and parameter attributes are not permission/lifetime evidence; no disjointness/noalias assumption between read regions; machine private-frame obligations and K3 wrapper remain separate",
+  "evidence": "source/shape capture; not native execution or independent proof",
+  "expected_status_words": {
+    "error": 12884901889,
+    "fallback": 12884901892,
+    "false": 0,
+    "true": 4294967296
+  },
+  "format": "ty-original-read-only-predicate-source-v1",
+  "literal_pool": [
+    1,
+    9,
+    10,
+    9,
+    1
+  ],
+  "model_ctx_size_bytes": 40,
+  "module": {
+    "closure_types": [],
+    "completeness": null,
+    "enums": [],
+    "files": [],
+    "func_types": [
+      {
+        "is_vararg": false,
+        "params": [
+          "Ptr",
+          "Ptr",
+          "Ptr",
+          "Ptr"
+        ],
+        "returns": [
+          "U64"
+        ]
+      },
+      {
+        "is_vararg": false,
+        "params": [
+          "Ptr",
+          "Ptr"
+        ],
+        "returns": [
+          "U64"
+        ]
+      },
+      {
+        "is_vararg": false,
+        "params": [
+          "Ptr",
+          "Ptr"
+        ],
+        "returns": [
+          "U64"
+        ]
+      },
+      {
+        "is_vararg": false,
+        "params": [
+          "Ptr",
+          "Ptr"
+        ],
+        "returns": [
+          "U64"
+        ]
+      },
+      {
+        "is_vararg": false,
+        "params": [
+          "Ptr",
+          "Ptr"
+        ],
+        "returns": [
+          "U64"
+        ]
+      }
+    ],
+    "functions": [
+      {
+        "attrs": {
+          "cold": false,
+          "inlinehint": false,
+          "naked": false,
+          "params": [],
+          "readnone": false,
+          "readonly": false,
+          "target_features": []
+        },
+        "blocks": [
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 8
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  4
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "GEP": {
+                    "base": 0,
+                    "inbounds": false,
+                    "indices": [
+                      4
+                    ],
+                    "pointee_ty": "U8"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  5
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Load": {
+                    "align": null,
+                    "ptr": 5,
+                    "ty": "Ptr",
+                    "volatile": false
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  6
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  7
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "GEP": {
+                    "base": 1,
+                    "inbounds": false,
+                    "indices": [
+                      7
+                    ],
+                    "pointee_ty": "U8"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  8
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Load": {
+                    "align": null,
+                    "ptr": 8,
+                    "ty": "I64",
+                    "volatile": false
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  9
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 24
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  10
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "GEP": {
+                    "base": 6,
+                    "inbounds": false,
+                    "indices": [
+                      10
+                    ],
+                    "pointee_ty": "U8"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  11
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Load": {
+                    "align": null,
+                    "ptr": 11,
+                    "ty": "I64",
+                    "volatile": false
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  12
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 7
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  13
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "lhs": 9,
+                    "op": "And",
+                    "rhs": 13,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  14
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 7
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  15
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "lhs": 12,
+                    "op": "And",
+                    "rhs": 15,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  16
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 4
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  17
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 14,
+                    "op": "Eq",
+                    "rhs": 17,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  18
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 18,
+                    "else_args": [],
+                    "else_target": 2,
+                    "then_args": [],
+                    "then_target": 1
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 0,
+            "params": [
+              [
+                0,
+                "Ptr"
+              ],
+              [
+                1,
+                "Ptr"
+              ],
+              [
+                2,
+                "Ptr"
+              ],
+              [
+                3,
+                "Ptr"
+              ]
+            ]
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 12884901892
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  19
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      19
+                    ]
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 1,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 4
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  20
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 16,
+                    "op": "Eq",
+                    "rhs": 20,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  21
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 21,
+                    "else_args": [],
+                    "else_target": 3,
+                    "then_args": [],
+                    "then_target": 1
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 2,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 12884901889
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  24
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      24
+                    ]
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 4,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  22
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 14,
+                    "op": "Eq",
+                    "rhs": 22,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  23
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 23,
+                    "else_args": [],
+                    "else_target": 4,
+                    "then_args": [],
+                    "then_target": 5
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 3,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 1
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  25
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 16,
+                    "op": "Eq",
+                    "rhs": 25,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  26
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 26,
+                    "else_args": [],
+                    "else_target": 4,
+                    "then_args": [],
+                    "then_target": 6
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 5,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 3
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  27
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "lhs": 9,
+                    "op": "AShr",
+                    "rhs": 27,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  28
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 3
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  29
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "lhs": 12,
+                    "op": "AShr",
+                    "rhs": 29,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  30
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 2147483648
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  31
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "lhs": 28,
+                    "op": "Add",
+                    "rhs": 31,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  32
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 4294967296
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  33
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 32,
+                    "op": "Uge",
+                    "rhs": 33,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  34
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 34,
+                    "else_args": [],
+                    "else_target": 7,
+                    "then_args": [],
+                    "then_target": 4
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 6,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 2147483648
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  35
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "lhs": 30,
+                    "op": "Add",
+                    "rhs": 35,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  36
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 4294967296
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  37
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 36,
+                    "op": "Uge",
+                    "rhs": 37,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  38
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 38,
+                    "else_args": [],
+                    "else_target": 8,
+                    "then_args": [],
+                    "then_target": 4
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 7,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 9,
+                    "op": "Slt",
+                    "rhs": 12,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  39
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 10
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  40
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 2
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  41
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Select": {
+                    "cond": 39,
+                    "else_val": 41,
+                    "then_val": 40,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  42
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 7
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  43
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "BinOp": {
+                    "lhs": 42,
+                    "op": "And",
+                    "rhs": 43,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  44
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 2
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  45
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 44,
+                    "op": "Eq",
+                    "rhs": 45,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  46
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 46,
+                    "else_args": [],
+                    "else_target": 4,
+                    "then_args": [],
+                    "then_target": 9
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 8,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 4294967296
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  49
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      49
+                    ]
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 10,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "U64",
+                    "value": {
+                      "Int": 0
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  50
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "Return": {
+                    "values": [
+                      50
+                    ]
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 11,
+            "params": []
+          },
+          {
+            "body": [
+              {
+                "inst": {
+                  "Const": {
+                    "ty": "I64",
+                    "value": {
+                      "Int": 10
+                    }
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  47
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "ICmp": {
+                    "lhs": 42,
+                    "op": "Eq",
+                    "rhs": 47,
+                    "ty": "I64"
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [
+                  48
+                ],
+                "span": null
+              },
+              {
+                "inst": {
+                  "CondBr": {
+                    "cond": 48,
+                    "else_args": [],
+                    "else_target": 11,
+                    "then_args": [],
+                    "then_target": 10
+                  }
+                },
+                "proof_context": null,
+                "proofs": [],
+                "results": [],
+                "span": null
+              }
+            ],
+            "id": 9,
+            "params": []
+          }
+        ],
+        "body_gate": null,
+        "calling_conv": "C",
+        "display_path": null,
+        "entry": 0,
+        "id": 60004,
+        "linkage": "Internal",
+        "name": "tyw1_u3",
+        "producer": null,
+        "proofs": [],
+        "scopes": null,
+        "section": null,
+        "source_provenance": null,
+        "summary": null,
+        "ty": 0,
+        "value_names": null,
+        "visibility": "Default"
+      }
+    ],
+    "global_asm": [],
+    "globals": [],
+    "imports": [],
+    "name": "tyw1_model",
+    "obligation_diagnostics": [],
+    "predicates": [],
+    "proof_certificates": [],
+    "proof_obligations": [],
+    "records": [],
+    "spec_modules": [],
+    "structs": [],
+    "target_info": null,
+    "tuple_layouts": [],
+    "types": [],
+    "universes": []
+  },
+  "original_core_instruction_count": 59,
+  "projection": "original module clone selecting only the exact Second function; all original body/SSA/block/function/type IDs, attributes, proofs and remaining module context retained",
+  "required_reads": [
+    {
+      "offset_bytes": 8,
+      "required_extent_bytes": 16,
+      "root": "parameter 0: ctx",
+      "width_bytes": 8
+    },
+    {
+      "offset_bytes": 0,
+      "required_extent_bytes": 8,
+      "root": "parameter 1: parent",
+      "width_bytes": 8
+    },
+    {
+      "offset_bytes": 24,
+      "required_extent_bytes": 32,
+      "root": "pointer loaded from ctx.literal_pool",
+      "width_bytes": 8
+    }
+  ],
+  "selection": {
+    "function_id": 60004,
+    "function_name": "tyw1_u3",
+    "model_ir_op": "int.lt(Cur(0), Pool(integer 1))",
+    "model_ir_root": 7,
+    "original_function_ordinal": 5,
+    "pool_id": 3,
+    "pool_word_index": 3,
+    "selected_function_ordinal": 0,
+    "unit_index": 3,
+    "unit_key": "inv:Second",
+    "unit_role": "Invariant"
+  },
+  "source_provenance": {
+    "cfg_text": "INIT Init\nNEXT Next\nINVARIANTS First Second\nPROPERTY P\n",
+    "dependency_texts": [],
+    "frontend": "FrontEndStats { source: Some(Ok(())), source_resolved: 11, adapter_fallback: 0, disagreements: 0, first_disagreement: None, root_disagreements: 0, term_source: 13, term_ast_only: 0, term_disagreements: 0, first_term_disagreement: None }",
+    "module_name": "PredicateInvariantOrder",
+    "original_core_module_digest": "ProofDigest { algorithm: Sha256, bytes: [225, 192, 229, 161, 59, 234, 74, 204, 187, 197, 69, 206, 234, 104, 59, 176, 143, 255, 48, 160, 14, 138, 135, 134, 4, 227, 184, 90, 196, 16, 216, 56] }",
+    "original_core_module_name": "tyw1_model",
+    "root_text": "---- MODULE PredicateInvariantOrder ----\nEXTENDS Naturals\nVARIABLE x\nInit == x = 0\nNext == x' = x + 1\nFirst == TRUE\nSecond == x < 1\nP == [](x < 0)\n====\n",
+    "selected_core_module_digest": "ProofDigest { algorithm: Sha256, bytes: [209, 104, 176, 253, 133, 211, 127, 152, 43, 241, 169, 48, 133, 170, 14, 74, 134, 192, 186, 233, 186, 2, 39, 25, 76, 0, 173, 177, 77, 97, 64, 209] }"
+  },
+  "unused_pointer_parameters": [
+    2,
+    3
+  ]
+}

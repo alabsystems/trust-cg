@@ -4,7 +4,223 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use super::*;
+use trust_cg_ir::MachInst;
 use trust_cg_ir::Signature;
+
+use crate::candidate::tests::support;
+
+#[test]
+fn candidate_lowering_refusal_preserves_live_function() {
+    for path in 0..3 {
+        let mut func = candidate_fixture(path);
+        let mut plan = candidate_plan(&func);
+        let missing = VReg::new(u32::MAX, RegClass::Gpr32);
+        match &mut plan {
+            Plan::Reduce(rec) => rec.term = missing,
+            Plan::Arg(rec) => rec.term = missing,
+            Plan::Chain(rec) => rec.reductions[0].base = missing,
+        }
+        support::assert_refusal(&mut func, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_every_register_reservation_is_atomic() {
+    for (label, fixture) in candidate_variants() {
+        let plan = candidate_plan(&fixture);
+        support::every_reservation(label, &fixture, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_sparse_detached_and_metadata_ids_remain_fresh() {
+    for (_, fixture) in candidate_variants() {
+        let plan = candidate_plan(&fixture);
+        support::sparse_ids(&fixture, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_duplicate_setup_ownership_is_refused() {
+    for path in 0..3 {
+        let mut func = candidate_fixture(path);
+        let plan = candidate_plan(&func);
+        let (pre, guard) = candidate_anchors(&plan);
+        func.block_mut(guard).insts.push(pre);
+        support::assert_refusal(&mut func, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_public_routes_refuse_without_mutation() {
+    for (label, fixture) in candidate_variants() {
+        for analyses_route in [false, true] {
+            let mut positive = fixture.clone();
+            let mut pass = NeonMinMaxPass::new();
+            assert!(
+                if analyses_route {
+                    pass.run_with_analyses(&mut positive, &mut AnalysisCache::new())
+                } else {
+                    pass.run(&mut positive)
+                },
+                "positive {label}"
+            );
+            assert_eq!(pass.fired(), 1);
+            for metadata in [false, true] {
+                let mut func = fixture.clone();
+                if metadata {
+                    func.noalias_params.push(u32::MAX);
+                } else {
+                    func.next_vreg = u32::MAX;
+                }
+                support::assert_refusal(&mut func, |func| {
+                    if analyses_route {
+                        pass.run_with_analyses(func, &mut AnalysisCache::new())
+                    } else {
+                        pass.run(func)
+                    }
+                });
+                assert_eq!(pass.fired(), 0, "{label}");
+            }
+        }
+    }
+}
+
+#[test]
+fn candidate_public_routes_remain_idempotent() {
+    for (label, mut func) in candidate_variants() {
+        println!("IDEMPOTENCE_VARIANT {label}");
+        let mut pass = NeonMinMaxPass::new();
+        assert!(pass.run(&mut func), "{label}");
+        support::assert_refusal(&mut func, |func| pass.run(func));
+        assert_eq!(pass.fired(), 0);
+    }
+}
+
+fn candidate_plan(func: &MachFunction) -> Plan {
+    let dom = DomTree::compute(func);
+    let loops = LoopAnalysis::compute(func, &dom);
+    loops
+        .all_loops()
+        .find_map(|lp| {
+            ArgRecognized::recognize(func, &dom, lp.header, lp.latch, &lp.body)
+                .map(Plan::Arg)
+                .or_else(|| {
+                    Recognized::recognize(func, &dom, lp.header, lp.latch, &lp.body)
+                        .map(Plan::Reduce)
+                })
+                .or_else(|| {
+                    ChainRecognized::recognize(func, &dom, lp.header, lp.latch, &lp.body)
+                        .map(Plan::Chain)
+                })
+        })
+        .expect("unmodified fixture must be recognized")
+}
+
+fn apply_candidate_plan(func: &mut MachFunction, plan: &Plan) -> bool {
+    match plan {
+        Plan::Arg(rec) => apply_arg(func, rec),
+        Plan::Reduce(rec) => apply(func, rec),
+        Plan::Chain(rec) => apply_chain(func, rec),
+    }
+}
+
+fn candidate_fixture(path: usize) -> MachFunction {
+    match path {
+        0 => build_loop(Red::MinMaxIndirect(CC_GT)),
+        1 => build_argminmax_loop(CC_LT, IdxSel::PicksIv),
+        2 => build_chain(&[
+            DiamondSpec { cc: CC_GT, base: 0 },
+            DiamondSpec { cc: CC_LT, base: 1 },
+        ]),
+        _ => unreachable!(),
+    }
+}
+
+fn candidate_anchors(plan: &Plan) -> (InstId, BlockId) {
+    match plan {
+        Plan::Arg(rec) => (rec.preheader_term, rec.guard),
+        Plan::Reduce(rec) => (rec.preheader_term, rec.guard),
+        Plan::Chain(rec) => (rec.preheader_term, rec.guard),
+    }
+}
+
+fn assert_candidate_refusal(path: usize, kind: usize) {
+    let mut func = candidate_fixture(path);
+    let plan = candidate_plan(&func);
+    let (pre, guard) = candidate_anchors(&plan);
+    support::corrupt(&mut func, pre, guard, kind);
+    support::assert_refusal(&mut func, |func| apply_candidate_plan(func, &plan));
+}
+
+macro_rules! candidate_refusal_test {
+    ($name:ident, $path:expr, $kind:expr) => {
+        #[test]
+        fn $name() {
+            assert_candidate_refusal($path, $kind);
+        }
+    };
+}
+candidate_refusal_test!(candidate_reduce_early_exhaustion, 0, 0);
+candidate_refusal_test!(candidate_reduce_late_exhaustion, 0, 1);
+candidate_refusal_test!(candidate_reduce_metadata_exhaustion, 0, 2);
+candidate_refusal_test!(candidate_reduce_splice_refusal, 0, 3);
+candidate_refusal_test!(candidate_reduce_missing_setup, 0, 4);
+candidate_refusal_test!(candidate_reduce_missing_layout, 0, 5);
+candidate_refusal_test!(candidate_arg_early_exhaustion, 1, 0);
+candidate_refusal_test!(candidate_arg_late_exhaustion, 1, 1);
+candidate_refusal_test!(candidate_arg_metadata_exhaustion, 1, 2);
+candidate_refusal_test!(candidate_arg_splice_refusal, 1, 3);
+candidate_refusal_test!(candidate_arg_missing_setup, 1, 4);
+candidate_refusal_test!(candidate_arg_missing_layout, 1, 5);
+candidate_refusal_test!(candidate_chain_early_exhaustion, 2, 0);
+candidate_refusal_test!(candidate_chain_late_exhaustion, 2, 1);
+candidate_refusal_test!(candidate_chain_metadata_exhaustion, 2, 2);
+candidate_refusal_test!(candidate_chain_splice_refusal, 2, 3);
+candidate_refusal_test!(candidate_chain_missing_setup, 2, 4);
+candidate_refusal_test!(candidate_chain_missing_layout, 2, 5);
+
+fn candidate_variants() -> Vec<(&'static str, MachFunction)> {
+    vec![
+        ("reduce-i32-max", build_loop(Red::MinMaxIndirect(CC_GT))),
+        ("reduce-i32-affine", build_loop(Red::XorIvAffine)),
+        ("reduce-i32-multiply", build_loop(Red::XorIvMulConst)),
+        ("reduce-i64-min", build_loop_i64(Red::MinMaxDirect(CC_LO))),
+        ("reduce-i64-max", build_loop_i64(Red::MinMaxIndirect(CC_GT))),
+        (
+            "reduce-i64-xor",
+            build_loop_i64(Red::Bitwise(AArch64Opcode::EorRR)),
+        ),
+        ("arg-i32-min", build_argminmax_loop(CC_LT, IdxSel::PicksIv)),
+        (
+            "arg-i64-max",
+            build_argminmax_loop_i64(CC_HI, IdxSel::PicksIv),
+        ),
+        (
+            "chain-independent",
+            build_chain(&[
+                DiamondSpec { cc: CC_GT, base: 0 },
+                DiamondSpec { cc: CC_LT, base: 1 },
+            ]),
+        ),
+        (
+            "chain-shared",
+            build_chain(&[
+                DiamondSpec { cc: CC_GT, base: 0 },
+                DiamondSpec { cc: CC_LT, base: 0 },
+            ]),
+        ),
+    ]
+}
+
+#[test]
+fn candidate_success_snapshots() {
+    for (label, mut func) in candidate_variants() {
+        let plan = candidate_plan(&func);
+        assert!(apply_candidate_plan(&mut func, &plan), "{label}");
+        println!("MINMAX_CANDIDATE_SNAPSHOT {label}: {func:?}");
+    }
+}
 
 fn v(id: u32) -> MachOperand {
     MachOperand::VReg(VReg::new(id, RegClass::Gpr32))
@@ -1667,4 +1883,54 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): every recognizer's vector loop
+// reproduces only the induction and its accumulators, so a second carried
+// register and a live-out-only register must each refuse.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build, VReg); 3] = [
+        (
+            "min/max reduction",
+            || build_loop(Red::MinMaxIndirect(CC_GT)),
+            VReg::new(5, RegClass::Gpr32),
+        ),
+        (
+            "argmin",
+            || build_argminmax_loop(CC_LT, IdxSel::PicksIv),
+            VReg::new(5, RegClass::Gpr32),
+        ),
+        (
+            "forward-chain min/max",
+            || build_chain(&[DiamondSpec { cc: CC_GT, base: 0 }]),
+            VReg::new(5, RegClass::Gpr64),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, build, iv) in shapes {
+        assert!(
+            NeonMinMaxPass::new().run(&mut build()),
+            "{name}: plain fires"
+        );
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if NeonMinMaxPass::new().run(&mut carried) {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if NeonMinMaxPass::new().run(&mut live_out) {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state:\n  {}",
+        wrong.join("\n  ")
+    );
 }

@@ -14,8 +14,7 @@
 //! interfaces; adequate for the boolean queries passes currently need — see
 //! the design doc §3.3).
 //!
-//! `TypeConstraint` follows `designs/2026-04-18-aggregates-dialects-coordination.md`
-//! §5: it references `trust_cg_ir::function::Type` directly rather than defining
+//! `TypeConstraint` references `trust_cg_ir::function::Type` directly rather than defining
 //! a parallel type enum. This is the shared-substrate invariant — dialects
 //! layer on top of the value-type system, not beside it.
 
@@ -26,7 +25,6 @@ use crate::id::OpCode;
 /// Per-position type constraint used by [`OpDef::operand_types`] and
 /// [`OpDef::result_types`].
 ///
-/// This vocabulary mirrors §5 of `designs/2026-04-18-aggregates-dialects-coordination.md`.
 /// Intended consumers:
 ///   * `validate_type_constraints` — runtime legality checking at
 ///     pass boundaries.
@@ -169,8 +167,7 @@ impl Arity {
 /// Metadata for a single op within a [`Dialect`].
 ///
 /// `operand_types` / `result_types` carry the per-position
-/// [`TypeConstraint`] vocabulary required by
-/// `designs/2026-04-18-aggregates-dialects-coordination.md` §5. For
+/// [`TypeConstraint`] vocabulary. For
 /// fixed-arity ops the slice length should equal the arity; for
 /// variadic ops (`Arity::Variadic`) a single-element slice applies to
 /// every operand/result (see [`validate_type_constraints`](crate::pass::validate_type_constraints)

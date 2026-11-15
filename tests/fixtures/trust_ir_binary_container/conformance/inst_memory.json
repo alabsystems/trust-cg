@@ -1,0 +1,583 @@
+{
+  "name": "inst_memory",
+  "functions": [
+    {
+      "id": 0,
+      "name": "mem_roundtrip",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Ptr"
+            ],
+            [
+              1,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 2,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "GEP": {
+                  "pointee_ty": "I32",
+                  "base": 0,
+                  "indices": [
+                    4
+                  ],
+                  "inbounds": false
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "I32",
+                  "ptr": 2,
+                  "volatile": true,
+                  "align": null
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 2,
+                  "value": 1,
+                  "volatile": false,
+                  "align": 4
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "GEP": {
+                  "pointee_ty": "I32",
+                  "base": 0,
+                  "indices": [
+                    4
+                  ],
+                  "inbounds": true
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": 8
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Dealloc": {
+                  "ptr": 8
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": "NullPtr",
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "GlobalAddr": {
+                  "global": 0
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Undef": {
+                  "ty": "I32"
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 7
+                  }
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "HeapAlloc": {
+                  "ty": "I32",
+                  "count": null,
+                  "align": null,
+                  "origin": "RustHeap"
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "I32",
+                  "ptr": 13,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Dealloc": {
+                  "ptr": 13
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Dealloc": {
+                  "ptr": 2
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "aggregates",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Undef": {
+                  "ty": {
+                    "Tuple": [
+                      "I32",
+                      "F64",
+                      "Bool"
+                    ]
+                  }
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 7
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "InsertField": {
+                  "ty": {
+                    "Tuple": [
+                      "I32",
+                      "F64",
+                      "Bool"
+                    ]
+                  },
+                  "aggregate": 0,
+                  "field": 0,
+                  "value": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ExtractField": {
+                  "ty": "I32",
+                  "aggregate": 2,
+                  "field": 0
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Undef": {
+                  "ty": {
+                    "Array": [
+                      0,
+                      4
+                    ]
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 42
+                  }
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "InsertElement": {
+                  "ty": {
+                    "Array": [
+                      0,
+                      4
+                    ]
+                  },
+                  "array": 4,
+                  "index": 5,
+                  "value": 6
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ExtractElement": {
+                  "ty": "I32",
+                  "array": 7,
+                  "index": 5
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "MEM_STATIC",
+      "ty": "I32",
+      "mutable": false,
+      "initializer": {
+        "Int": 7
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 32,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        "Ptr",
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "I32"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

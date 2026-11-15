@@ -75,10 +75,7 @@ fn explicit_target_triple_precedes_profile() {
 #[test]
 fn custom_target_json_uses_its_file_stem_not_its_path() {
     assert_eq!(
-        target_dir_support::target_output_component(
-            "/workspace/targets/aarch64-proof.json",
-            None,
-        ),
+        target_dir_support::target_output_component("/workspace/targets/aarch64-proof.json", None,),
         Some(Path::new("aarch64-proof").to_path_buf())
     );
     assert_eq!(
@@ -90,10 +87,7 @@ fn custom_target_json_uses_its_file_stem_not_its_path() {
 #[test]
 fn host_tuple_uses_the_resolved_rustc_host_directory() {
     assert_eq!(
-        target_dir_support::target_output_component(
-            "host-tuple",
-            Some("aarch64-apple-darwin"),
-        ),
+        target_dir_support::target_output_component("host-tuple", Some("aarch64-apple-darwin"),),
         Some(Path::new("aarch64-apple-darwin").to_path_buf())
     );
     assert_eq!(

@@ -17,12 +17,22 @@
 //   4. object-file/linker flags are REFUSED by name before input loading;
 //   5. non-closed-module wasm triples (WASI, emscripten) are rejected at
 //      `--target` parsing;
-//   6. dropped requests (an explicit `-O`, an explicit `--fsym-solver` with
-//      the preflight off) are refused by name;
+//   6. dropped requests (an explicit `--fsym-solver` with the preflight off)
+//      are refused by name, and every `-O` level is read: -O0 emits the
+//      lowering's own bodies byte for byte, -O1 to -O3 the validated local
+//      emission pass, on both the closed-module and the object route;
 //   7. PUBLICATION ORDER: a failed compile publishes NOTHING, and a
 //      successful one publishes every requested artifact;
 //   8. aliased output paths (an artifact over its own input, two artifacts
-//      over one file) are refused by name.
+//      over one file) are refused by name;
+//   9. `-c` writes a relocatable wasm object (`<input>.o`) for `wasm-ld`;
+//  10. several inputs are compiled to objects and linked by `wasm-ld` into
+//      one module whose cross-object call runs (skipped without `wasm-ld`;
+//      the execution leg is skipped without `node`);
+//  12. the codegen-license flags (`--recognize-authority`,
+//      `--refuse-unlicensed`) reach both wasm32 lanes, and trust-ir's codegen
+//      admission refuses an evidence-bound license with no certificate there
+//      whatever the flags say.
 //
 // "Well-formed wasm" is not asserted by eyeballing the magic header: every
 // emitted module is run through `wasmparser::Validator`, the Bytecode Alliance
@@ -36,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use trust_cg_codegen::jit_diagnostics::sha256_hex;
-use trust_cg_codegen::pipeline::{encode_tmbc, encode_trust_ir_text};
+use trust_cg_codegen::pipeline::{OptLevel, encode_tmbc, encode_trust_ir_text};
 use trust_cg_codegen::wasm;
 use trust_ir::{ICmpOp, Module as TrustIrModule, Ty};
 use trust_ir_build::ModuleBuilder;
@@ -50,16 +60,9 @@ fn trust_cg_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_trust-cg"))
 }
 
-/// Create a fresh, empty scratch directory under the OS temp dir.
-fn scratch_dir(test_name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "trust_cg_cli_wasm_{}_{}",
-        test_name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+/// A new scratch directory, removed when the returned guard is dropped.
+fn scratch_dir(test_name: &str) -> scratch::ScratchDir {
+    scratch::create(&format!("trust_cg_cli_wasm_{test_name}_"))
 }
 
 /// `fn seven() -> i32 { 7 }`, pinned to the wasm32 lane.
@@ -72,7 +75,7 @@ fn make_const_module() -> TrustIrModule {
     let c = fb.iconst(Ty::I32, 7);
     fb.ret(vec![c]);
     fb.build();
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.target_info = Some(wasm::wasm32_target_info());
     module
 }
@@ -106,7 +109,7 @@ fn make_gcd_module() -> TrustIrModule {
     fb.switch_to_block(exit);
     fb.ret(vec![g]);
     fb.build();
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.target_info = Some(wasm::wasm32_target_info());
     module
 }
@@ -198,6 +201,7 @@ fn cli_wasm32_compiles_text_format_module_end_to_end() {
     std::fs::write(&trust_ir_path, &text).expect("write .trust_ir");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--format=text")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
@@ -235,6 +239,7 @@ fn cli_wasm32_compiles_tmbc_loop_module_with_default_output_path() {
 
     // The bare `wasm32` alias, no -o: output derives as `<input>.wasm`.
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--target")
         .arg("wasm32")
         .arg(&tmbc_path)
@@ -267,6 +272,7 @@ fn cli_wasm32_refuses_target_free_module() {
     std::fs::write(&tmbc_path, &bytes).expect("write .tmbc");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--target")
         .arg("wasm32-unknown-unknown")
         .arg(&tmbc_path)
@@ -294,6 +300,7 @@ fn cli_wasm32_refuses_target_free_module() {
 #[test]
 fn cli_wasm32_refuses_linker_and_object_flags_by_name() {
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--target")
         .arg("wasm32")
         .arg("-g")
@@ -331,6 +338,7 @@ fn cli_wasm32_refuses_linker_and_object_flags_by_name() {
 fn cli_rejects_wasi_and_emscripten_wasm_triples_at_target_parsing() {
     for target in ["wasm32-wasip1", "wasm32-wasi", "wasm32-unknown-emscripten"] {
         let output = Command::new(trust_cg_bin())
+            .arg("--permit-unlicensed")
             .arg("--target")
             .arg(target)
             .arg("unused.tmbc")
@@ -353,50 +361,141 @@ fn cli_rejects_wasi_and_emscripten_wasm_triples_at_target_parsing() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Dropped requests are refused by name.
+// 6. Dropped requests are refused by name; every -O level is read.
 // ---------------------------------------------------------------------------
 
-/// An EXPLICIT `-O` on the wasm lane is a dropped request (the route never
-/// reads opt_level), so it is refused by name — and the refusal fires before
-/// any input is read or artifact written, even with `--emit-json` present.
-#[test]
-fn explicit_opt_level_is_refused_and_emits_nothing() {
-    let dir = scratch_dir("explicit_opt_level");
-    let input = dir.join("m.trust_ir");
-    std::fs::write(
-        &input,
-        "module \"probe\"\ntarget \"wasm32-unknown-unknown\" 4 little\n",
-    )
-    .expect("write input");
-    let json = dir.join("side-effect.json");
-
-    let out = Command::new(trust_cg_bin())
-        .args([
-            "--format=text",
-            "--target",
-            "wasm32-unknown-unknown",
-            "-O3",
-            "--emit-json",
-        ])
-        .arg(&json)
-        .arg(&input)
+/// Compile `input` through the CLI's wasm lane with `flags`, writing `out`;
+/// returns the validated bytes and the parsed evidence line.
+fn compile_wasm_with(input: &Path, out: &Path, flags: &[&str]) -> (Vec<u8>, serde_json::Value) {
+    let run = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
+        .args(["--format=text", "--target", "wasm32-unknown-unknown"])
+        .args(flags)
+        .arg(input)
+        .arg("-o")
+        .arg(out)
         .output()
         .expect("run trust-cg");
-
-    assert!(!out.status.success(), "explicit -O must be refused");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(
-        stderr.contains("-O/--opt-level"),
-        "refusal must name the flag, got: {stderr}"
+        run.status.success(),
+        "{flags:?} must compile. stderr:\n{stderr}"
     );
     assert!(
-        !json.exists(),
-        "a refused invocation must write no artifacts"
+        !stderr.contains("-O/--opt-level"),
+        "no -O level is refused, got: {stderr}"
+    );
+    (read_validated_wasm(out), parse_evidence(&stderr))
+}
+
+/// Every `-O` level is a request the closed-module route reads. -O0 emits
+/// each function's baseline body: the bytes the codegen library emits at O0,
+/// with the local emission pass reported as not enabled. -O1, -O2 and -O3
+/// run the pass; the default level is -O2. The loop module has copies the
+/// pass removes, so O0 and O2 differ.
+#[test]
+fn every_opt_level_reaches_the_closed_module_route() {
+    let dir = scratch_dir("opt_levels_closed");
+    let module = make_gcd_module();
+    let input = dir.join("gcd.trust_ir");
+    std::fs::write(&input, encode_trust_ir_text(&module)).expect("write input");
+    let mut by_level = Vec::new();
+    for (flag, level) in [
+        ("-O0", OptLevel::O0),
+        ("-O1", OptLevel::O1),
+        ("-O2", OptLevel::O2),
+        ("-O3", OptLevel::O3),
+    ] {
+        let out = dir.join(format!("gcd{flag}.wasm"));
+        let (bytes, evidence) = compile_wasm_with(&input, &out, &[flag]);
+        assert_evidence_describes(&evidence, &bytes, 1);
+        let (library, _) = wasm::compile_sized_closed_module_with_evidence_license_optimized(
+            &module,
+            &permit_unlicensed(),
+            level,
+        )
+        .expect("library compile");
+        assert_eq!(
+            bytes, library,
+            "{flag} must emit the codegen library's bytes at {level:?}"
+        );
+        assert_eq!(
+            evidence["local_emission"]["enabled"],
+            serde_json::json!(level != OptLevel::O0),
+            "{flag}: {evidence}"
+        );
+        by_level.push(bytes);
+    }
+    let (default, _) = compile_wasm_with(&input, &dir.join("gcd-default.wasm"), &[]);
+    assert_eq!(default, by_level[2], "the default level is -O2");
+    assert_ne!(
+        by_level[0], by_level[2],
+        "-O0 must keep the lowering's body, which the pass rewrites at -O2"
     );
 }
 
-/// The DEFAULT opt level is not a dropped request: no refusal is emitted, the
-/// run SUCCEEDS, and the module it publishes is a real, validated wasm module
+/// The object route (`-c`) reads `-O` too: -O0 is the library's O0 object
+/// (the lowering's bodies) and -O2 its O2 object, and they differ.
+#[test]
+fn every_opt_level_reaches_the_object_route() {
+    let dir = scratch_dir("opt_levels_object");
+    let module = make_gcd_module();
+    let input = dir.join("gcd.trust_ir");
+    std::fs::write(&input, encode_trust_ir_text(&module)).expect("write input");
+    let mut by_level = Vec::new();
+    for (flag, level) in [
+        ("-O0", OptLevel::O0),
+        ("-O1", OptLevel::O1),
+        ("-O2", OptLevel::O2),
+        ("-O3", OptLevel::O3),
+    ] {
+        let out = dir.join(format!("gcd{flag}.o"));
+        let (bytes, evidence) = compile_wasm_with(&input, &out, &["-c", flag]);
+        let (library, _) = wasm::compile_object_with_evidence_license_optimized(
+            &module,
+            &permit_unlicensed(),
+            level,
+        )
+        .expect("library compile");
+        assert_eq!(
+            bytes, library,
+            "-c {flag} must emit the codegen library's object at {level:?}"
+        );
+        assert_eq!(
+            evidence["local_emission"]["enabled"],
+            serde_json::json!(level != OptLevel::O0),
+            "-c {flag}: {evidence}"
+        );
+        by_level.push(bytes);
+    }
+    assert_ne!(
+        by_level[0], by_level[2],
+        "-c -O0 must keep the lowering's body"
+    );
+}
+
+/// An invalid level is still refused at argument parsing.
+#[test]
+fn an_unknown_opt_level_is_refused() {
+    let dir = scratch_dir("opt_level_unknown");
+    let input = dir.join("m.trust_ir");
+    std::fs::write(&input, encode_trust_ir_text(&make_const_module())).expect("write input");
+    let out = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
+        .args(["--format=text", "--target", "wasm32-unknown-unknown", "-Os"])
+        .arg(&input)
+        .output()
+        .expect("run trust-cg");
+    assert!(!out.status.success(), "-Os is not a level this CLI has");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid optimization level"),
+        "got: {stderr}"
+    );
+    assert!(!input.with_extension("wasm").exists(), "nothing is written");
+}
+
+/// The DEFAULT opt level: no refusal is emitted, the run SUCCEEDS, and the module it publishes is a real, validated wasm module
 /// whose evidence matches the bytes on disk. (Asserting only the absence of
 /// the refusal string would pass on a compile that failed outright.)
 #[test]
@@ -407,6 +506,7 @@ fn default_opt_level_is_not_refused() {
     let out = dir.join("m.wasm");
 
     let run = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .args(["--format=text", "--target", "wasm32-unknown-unknown", "-c"])
         .arg(&input)
         .arg("-o")
@@ -428,8 +528,7 @@ fn default_opt_level_is_not_refused() {
 }
 
 /// `--fsym-solver` is only read while the preflight runs, so passing it under
-/// the default `--fsym=off` is a dropped request — the same class as the
-/// explicit `-O` above — and is refused by name. (The rule is CLI-wide; it is
+/// the default `--fsym=off` is a dropped request and is refused by name. (The rule is CLI-wide; it is
 /// exercised here on the wasm lane, where the sibling dropped-request refusals
 /// live.)
 #[test]
@@ -440,6 +539,7 @@ fn explicit_fsym_solver_without_the_preflight_is_refused() {
     let out = dir.join("m.wasm");
 
     let refused = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .args([
             "--format=text",
             "--target",
@@ -468,6 +568,7 @@ fn explicit_fsym_solver_without_the_preflight_is_refused() {
     // With the preflight actually on, the same solver request is honoured and
     // the compile publishes its module.
     let accepted = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .args([
             "--format=text",
             "--target",
@@ -509,6 +610,7 @@ fn wasm32_publishes_nothing_when_the_backend_refuses_the_module() {
     let out = dir.join("out.wasm");
 
     let run = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .args(["--target", "wasm32-unknown-unknown", "--emit-json"])
         .arg(&json)
         .arg("--emit-trust_ir")
@@ -552,6 +654,7 @@ fn wasm32_publishes_every_requested_artifact_after_a_successful_compile() {
     let out = dir.join("out.wasm");
 
     let run = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .args(["--target", "wasm32-unknown-unknown", "--emit-json"])
         .arg(&json)
         .arg("--emit-trust_ir")
@@ -598,6 +701,7 @@ fn wasm32_refuses_an_output_path_that_aliases_the_input() {
     std::fs::write(&input, &source).expect("write input");
 
     let run = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .args(["--format=text", "--target", "wasm32-unknown-unknown"])
         .arg("--emit-json")
         .arg(&input)
@@ -638,6 +742,7 @@ fn wasm32_refuses_two_outputs_that_name_one_file() {
     let aliased = dir.join(".").join("out.json");
 
     let run = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .args(["--target", "wasm32-unknown-unknown", "--emit-json"])
         .arg(&json)
         .arg("-o")
@@ -659,4 +764,588 @@ fn wasm32_refuses_two_outputs_that_name_one_file() {
         !json.exists(),
         "a refused invocation must write no artifacts"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 9./10. Relocatable objects and wasm-ld linking.
+// ---------------------------------------------------------------------------
+
+const GCD_TEXT: &str = "module \"gcd_unit\"\ntarget \"wasm32-unknown-unknown\" 4 little\n\n\
+    functy.0 = (i32, i32) -> (i32)\n\n\
+    fn @gcd(functy.0) {\n\
+    bb0(%1: i32, %2: i32):\n\
+    \x20   br bb1(%1, %2)\n\
+    bb1(%3: i32, %4: i32):\n\
+    \x20   %5 = const i32 0\n\
+    \x20   %6 = icmp ne i32 %4, %5\n\
+    \x20   condbr %6, bb2, bb3\n\
+    bb2:\n\
+    \x20   %7 = urem i32 %3, %4\n\
+    \x20   br bb1(%4, %7)\n\
+    bb3:\n\
+    \x20   ret %3\n\
+    }\n";
+
+/// `lcm(a, b) = a / gcd(a, b) * b`, calling the `gcd` another object defines.
+const LCM_TEXT: &str = "module \"lcm_unit\"\ntarget \"wasm32-unknown-unknown\" 4 little\n\n\
+    functy.0 = (i32, i32) -> (i32)\n\n\
+    fn @gcd(functy.0) {\n}\n\n\
+    fn @lcm(functy.0) {\n\
+    bb0(%1: i32, %2: i32):\n\
+    \x20   %3 = call @func.0(%1, %2)\n\
+    \x20   %4 = udiv i32 %1, %3\n\
+    \x20   %5 = mul i32 %4, %2\n\
+    \x20   ret %5\n\
+    }\n";
+
+fn wasm_ld() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("WASM_LD") {
+        return Some(PathBuf::from(path));
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join("wasm-ld"))
+        .find(|candidate| candidate.is_file())
+}
+
+#[test]
+fn wasm32_compile_only_writes_a_relocatable_object() {
+    let dir = scratch_dir("compile_only_object");
+    let input = dir.join("gcd.trust_ir");
+    std::fs::write(&input, GCD_TEXT).expect("write input");
+    let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
+        .args(["--format=text", "--target", "wasm32", "-c"])
+        .arg(&input)
+        .output()
+        .expect("run trust-cg");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "-c should succeed. stderr:\n{stderr}"
+    );
+    let object = dir.join("gcd.o");
+    assert!(
+        stderr.contains("relocatable object"),
+        "missing object summary line. stderr:\n{stderr}"
+    );
+    let bytes = read_validated_wasm(&object);
+    // A relocatable object carries the tool-conventions `linking` section
+    // wasm-ld reads (with its symbol table), and no memory of its own.
+    let mut linking = false;
+    let mut defines_memory = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        match payload.expect("parse object") {
+            wasmparser::Payload::CustomSection(c) if c.name() == "linking" => linking = true,
+            wasmparser::Payload::MemorySection(_) => defines_memory = true,
+            _ => {}
+        }
+    }
+    assert!(linking, "the object has no `linking` section");
+    assert!(
+        !defines_memory,
+        "a relocatable object must not define its own memory"
+    );
+    assert!(!dir.join("gcd.wasm").exists(), "-c must not write a module");
+}
+
+#[test]
+fn wasm32_links_several_inputs_with_wasm_ld() {
+    let Some(linker) = wasm_ld() else {
+        eprintln!(
+            "wasm32_links_several_inputs_with_wasm_ld: SKIPPED — no wasm-ld (WASM_LD / PATH)"
+        );
+        return;
+    };
+    let dir = scratch_dir("link_two_inputs");
+    let (gcd, lcm, out) = (
+        dir.join("gcd.trust_ir"),
+        dir.join("lcm.trust_ir"),
+        dir.join("app.wasm"),
+    );
+    std::fs::write(&gcd, GCD_TEXT).expect("write gcd");
+    std::fs::write(&lcm, LCM_TEXT).expect("write lcm");
+    let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
+        .args(["--format=text", "--target", "wasm32", "--wasm-ld"])
+        .arg(&linker)
+        .arg("-o")
+        .arg(&out)
+        .arg(&lcm)
+        .arg(&gcd)
+        .output()
+        .expect("run trust-cg");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "linking should succeed. stderr:\n{stderr}"
+    );
+    let bytes = read_validated_wasm(&out);
+    let mut exports = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::ExportSection(r) = payload.expect("parse module") {
+            exports.extend(r.into_iter().map(|e| e.expect("export").name.to_owned()));
+        }
+    }
+    for name in ["gcd", "lcm"] {
+        assert!(
+            exports.iter().any(|e| e == name),
+            "`{name}` not exported: {exports:?}"
+        );
+    }
+    let Some(node) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("node"))
+        .find(|c| c.is_file())
+    else {
+        eprintln!("wasm32_links_several_inputs_with_wasm_ld: execution leg SKIPPED — no node");
+        return;
+    };
+    let run = Command::new(node)
+        .arg("-e")
+        .arg(
+            "const E = new WebAssembly.Instance(new WebAssembly.Module(\
+             require('fs').readFileSync(process.argv[1])), {}).exports; \
+             console.log(E.lcm(4, 6), E.lcm(21, 6), E.gcd(48, 18));",
+        )
+        .arg(&out)
+        .output()
+        .expect("run node");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "12 42 6",
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// `counter` is a data global; `bump` increments it through its address.
+const COUNTER_TEXT: &str = "module \"counter_unit\"\ntarget \"wasm32-unknown-unknown\" 4 little\n\n\
+    functy.0 = () -> (i32)\n\n\
+    global mut @counter i32 = 41\n\n\
+    fn @bump(functy.0) {\n\
+    bb0:\n\
+    \x20   %1 = global_addr @global.0\n\
+    \x20   %2 = load i32, ptr %1\n\
+    \x20   %3 = const i32 1\n\
+    \x20   %4 = add i32 %2, %3\n\
+    \x20   store i32 %4, ptr %1\n\
+    \x20   ret %4\n\
+    }\n";
+
+/// A linker named like the generic lld driver (`rust-lld`, as rustup ships
+/// it) is run with `-flavor wasm` when given by `--wasm-ld`, exactly as when
+/// it is found on PATH; and the link lays the 1 MiB shadow stack out BELOW
+/// static data (`--stack-first`, as rustc links wasm32), so static data
+/// starts above the stack.
+#[cfg(unix)]
+#[test]
+fn wasm32_links_through_a_generic_rust_lld_driver_with_the_stack_first() {
+    let Some(linker) = wasm_ld() else {
+        eprintln!(
+            "wasm32_links_through_a_generic_rust_lld_driver_with_the_stack_first: SKIPPED — no \
+             wasm-ld (WASM_LD / PATH)"
+        );
+        return;
+    };
+    let dir = scratch_dir("rust_lld_flavor");
+    // lld selects its driver from argv[0]: a `rust-lld` name selects none.
+    let rust_lld = dir.join("rust-lld");
+    std::os::unix::fs::symlink(&linker, &rust_lld).expect("symlink rust-lld");
+    let (counter, gcd, out) = (
+        dir.join("counter.trust_ir"),
+        dir.join("gcd.trust_ir"),
+        dir.join("app.wasm"),
+    );
+    std::fs::write(&counter, COUNTER_TEXT).expect("write counter");
+    std::fs::write(&gcd, GCD_TEXT).expect("write gcd");
+    let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
+        .args(["--format=text", "--target", "wasm32", "--wasm-ld"])
+        .arg(&rust_lld)
+        .arg("-o")
+        .arg(&out)
+        .arg(&counter)
+        .arg(&gcd)
+        .output()
+        .expect("run trust-cg");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "linking through rust-lld should succeed. stderr:\n{stderr}"
+    );
+    let bytes = read_validated_wasm(&out);
+    // Every active data segment sits at or above the 1 MiB stack.
+    let mut offsets = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::DataSection(r) = payload.expect("parse module") {
+            for data in r {
+                if let wasmparser::DataKind::Active { offset_expr, .. } =
+                    data.expect("data segment").kind
+                {
+                    let mut ops = offset_expr.get_operators_reader();
+                    if let wasmparser::Operator::I32Const { value } = ops.read().expect("op") {
+                        offsets.push(value);
+                    }
+                }
+            }
+        }
+    }
+    assert!(!offsets.is_empty(), "the counter's data segment is missing");
+    assert!(
+        offsets.iter().all(|&o| o >= 1 << 20),
+        "static data must sit above the 1 MiB stack: {offsets:?}"
+    );
+    let Some(node) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("node"))
+        .find(|c| c.is_file())
+    else {
+        eprintln!("rust-lld link: execution leg SKIPPED — no node");
+        return;
+    };
+    let run = Command::new(node)
+        .arg("-e")
+        .arg(
+            "const E = new WebAssembly.Instance(new WebAssembly.Module(\
+             require('fs').readFileSync(process.argv[1])), {}).exports; \
+             console.log(E.bump(), E.bump(), E.gcd(48, 18));",
+        )
+        .arg(&out)
+        .output()
+        .expect("run node");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "42 43 6",
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. The closed module sizes its memory to its static data; builds are
+//     reproducible; the link refuses an export named like the memory.
+// ---------------------------------------------------------------------------
+
+/// A 72,000-byte immutable table read by index: past the one page the
+/// default closed module owns.
+fn big_table_text() -> String {
+    let values: Vec<String> = (0..18_000u32)
+        .map(|i| ((i * 7919) % 100_003).to_string())
+        .collect();
+    format!(
+        "module \"big\"\ntarget \"wasm32-unknown-unknown\" 4 little\n\ntype ty.0 = i32\n\n\
+         functy.0 = (i32) -> (i32)\n\nglobal @big [ty.0 x 18000] = array[ {} ]\n\n\
+         fn @at(functy.0) {{\nbb0(%1: i32):\n    %2 = global_addr @global.0\n\
+             %3 = gep i32, ptr %2, %1\n    %4 = load i32, ptr %3\n    ret %4\n}}\n",
+        values.join(", ")
+    )
+}
+
+#[test]
+fn wasm32_closed_module_holds_static_data_past_one_page() {
+    let dir = scratch_dir("big_static_data");
+    let input = dir.join("big.trust_ir");
+    let out = dir.join("big.wasm");
+    std::fs::write(&input, big_table_text()).expect("write input");
+    let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
+        .args(["--format=text", "--target", "wasm32", "-o"])
+        .arg(&out)
+        .arg(&input)
+        .output()
+        .expect("run trust-cg");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr:\n{stderr}");
+    let bytes = read_validated_wasm(&out);
+    let Some(node) = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("node"))
+        .find(|c| c.is_file())
+    else {
+        return;
+    };
+    let run = Command::new(node)
+        .arg("-e")
+        .arg(
+            "const E = new WebAssembly.Instance(new WebAssembly.Module(\
+             require('fs').readFileSync(process.argv[1])), {}).exports; \
+             console.log(E.at(0), E.at(1), E.at(17999));",
+        )
+        .arg(&out)
+        .output()
+        .expect("run node");
+    let want = |i: u32| (i * 7919) % 100_003;
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        format!("{} {} {}", want(0), want(1), want(17_999)),
+        "{} bytes; stderr: {}",
+        bytes.len(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+/// Homes that never conflict share one frame offset; their order must not
+/// follow a hash map's. Two separate processes (fresh hash seeds) emit the
+/// same bytes and the same evidence digest, closed and as an object.
+#[test]
+fn wasm32_output_is_reproducible_across_processes() {
+    let dir = scratch_dir("reproducible");
+    let input = dir.join("tie.trust_ir");
+    let mut text = String::from(
+        "module \"tie\"\ntarget \"wasm32-unknown-unknown\" 4 little\n\n\
+         struct @P { : i32 @0, : i32 @4 } size=8 align=4 id=0\n\n\
+         functy.0 = (i32, i32) -> (i32)\n\nfn @f(functy.0) {\nbb0(%0: i32, %1: i32):\n",
+    );
+    let mut last = 0;
+    let mut next = 2;
+    for _ in 0..16 {
+        text.push_str(&format!(
+            "    %{} = make_aggregate struct.0 (%{last}, %1)\n    %{} = extractfield i32 %{}, 0\n",
+            next,
+            next + 1,
+            next
+        ));
+        last = next + 1;
+        next += 2;
+    }
+    text.push_str(&format!("    ret %{last}\n}}\n"));
+    std::fs::write(&input, text).expect("write input");
+    let run = |args: &[&str], out: &Path| {
+        let output = Command::new(trust_cg_bin())
+            .arg("--permit-unlicensed")
+            .args(["--format=text", "--target", "wasm32"])
+            .args(args)
+            .arg("-o")
+            .arg(out)
+            .arg(&input)
+            .output()
+            .expect("run trust-cg");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "stderr:\n{stderr}");
+        (std::fs::read(out).expect("read output"), stderr)
+    };
+    for args in [&[][..], &["-c"][..]] {
+        let (a, sa) = run(args, &dir.join("a.out"));
+        let (b, sb) = run(args, &dir.join("b.out"));
+        assert_eq!(a, b, "{args:?}: two runs emitted different bytes");
+        assert_eq!(
+            parse_evidence(&sa)["module_sha256"],
+            parse_evidence(&sb)["module_sha256"]
+        );
+    }
+}
+
+/// `wasm-ld` exports the linked memory as `memory` and, under
+/// `--export-dynamic`, every default-visibility definition by name, without
+/// checking the two apart: an exported `memory` function would give the
+/// module two exports of one name. The link refuses it by name.
+#[test]
+fn wasm32_link_refuses_a_definition_exported_as_memory() {
+    let Some(linker) = wasm_ld() else {
+        eprintln!("wasm32_link_refuses_a_definition_exported_as_memory: SKIPPED — no wasm-ld");
+        return;
+    };
+    let dir = scratch_dir("memory_export");
+    let (mem, gcd, out) = (
+        dir.join("mem.trust_ir"),
+        dir.join("gcd.trust_ir"),
+        dir.join("app.wasm"),
+    );
+    std::fs::write(
+        &mem,
+        "module \"mem\"\ntarget \"wasm32-unknown-unknown\" 4 little\n\n\
+         functy.0 = (i32) -> (i32)\n\nfn @memory(functy.0) {\nbb0(%1: i32):\n    ret %1\n}\n",
+    )
+    .expect("write mem");
+    std::fs::write(&gcd, GCD_TEXT).expect("write gcd");
+    let link = |extra: &[&str]| {
+        let _ = std::fs::remove_file(&out);
+        let output = Command::new(trust_cg_bin())
+            .arg("--permit-unlicensed")
+            .args(["--format=text", "--target", "wasm32", "--wasm-ld"])
+            .arg(&linker)
+            .args(extra)
+            .arg("-o")
+            .arg(&out)
+            .arg(&mem)
+            .arg(&gcd)
+            .output()
+            .expect("run trust-cg");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    // Options that only size or share the memory keep its `memory` export
+    // (`--initial-memory=` used to switch the check off).
+    for extra in [
+        &[][..],
+        &["-Wl,--initial-memory=1310720"],
+        &["-Wl,--max-memory=1310720"],
+    ] {
+        let (ok, stderr) = link(extra);
+        assert!(!ok, "{extra:?}: the link must be refused");
+        assert!(
+            stderr.contains("exported function `memory`"),
+            "{extra:?} stderr:\n{stderr}"
+        );
+        assert!(!out.exists(), "{extra:?}: nothing is published");
+    }
+    // A renamed memory export frees the name.
+    let (ok, stderr) = link(&["-Wl,--export-memory=mem"]);
+    assert!(ok, "a renamed memory export links: {stderr}");
+    wasmparser::Validator::new()
+        .validate_all(&std::fs::read(&out).expect("linked module"))
+        .expect("the linked module validates");
+    // Any other export collision the link produces is caught in the linked
+    // module itself, which is removed.
+    let (ok, stderr) = link(&["-Wl,--export=__heap_base,--export-memory=__heap_base"]);
+    assert!(!ok, "a duplicate export must be refused");
+    assert!(
+        stderr.contains("exports `__heap_base` twice"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!out.exists(), "the invalid module is removed");
+}
+
+// 12. The codegen-license flags reach both wasm32 lanes.
+
+/// `make_const_module` with exactly one licensing state.
+fn write_gated_module(dir: &Path, name: &str, gate: Option<trust_ir::BodyGate>) -> PathBuf {
+    let mut module = make_const_module();
+    for function in &mut module.functions {
+        function.body_gate = gate.clone();
+    }
+    let path = dir.join(format!("{name}.tmbc"));
+    std::fs::write(&path, encode_tmbc(&module).expect("encode tMBC")).expect("write tMBC");
+    path
+}
+
+/// `trust-cg --target wasm32 [-c] -o <out> [flags] <input>` on the closed
+/// module (`compile_only == false`) or the object lane; returns (success,
+/// stderr) after checking that an output exists exactly when it succeeded.
+fn run_wasm_lane(dir: &Path, input: &Path, compile_only: bool, flags: &[&str]) -> (bool, String) {
+    let out = dir.join(format!(
+        "{}.{}",
+        input.file_stem().unwrap().to_string_lossy(),
+        if compile_only { "o" } else { "wasm" }
+    ));
+    let _ = std::fs::remove_file(&out);
+    let mut command = Command::new(trust_cg_bin());
+    command.args(["--target", "wasm32"]);
+    if compile_only {
+        command.arg("-c");
+    }
+    let output = command
+        .arg("-o")
+        .arg(&out)
+        .args(flags)
+        .arg(input)
+        .output()
+        .expect("run trust-cg");
+    let ok = output.status.success();
+    assert_eq!(
+        out.exists(),
+        ok,
+        "an output exists exactly when the compile succeeds"
+    );
+    (ok, String::from_utf8_lossy(&output.stderr).to_string())
+}
+
+#[test]
+fn codegen_license_flags_reach_both_wasm32_lanes() {
+    let dir = scratch_dir("license_flags");
+    let gated = |authority: &str| Some(trust_ir::BodyGate::gated(authority.to_string()));
+    let vendor = write_gated_module(dir.path(), "vendor", gated("vendor-gate"));
+    let unlicensed = write_gated_module(dir.path(), "unlicensed", None);
+    let ungated = write_gated_module(dir.path(), "ungated", Some(trust_ir::BodyGate::Ungated));
+    let clean = write_gated_module(dir.path(), "clean", gated("clean-kernel-tv"));
+    for compile_only in [false, true] {
+        let lane = if compile_only { "object" } else { "module" };
+        // `--recognize-authority` widens the recognized set on this lane too.
+        let (ok, stderr) = run_wasm_lane(dir.path(), &vendor, compile_only, &[]);
+        assert!(!ok, "{lane}: an unrecognized authority must fail");
+        assert!(
+            stderr.contains("does not recognize") && stderr.contains("vendor-gate"),
+            "{lane}: stderr:\n{stderr}"
+        );
+        let (ok, stderr) = run_wasm_lane(
+            dir.path(),
+            &vendor,
+            compile_only,
+            &["--recognize-authority", "vendor-gate"],
+        );
+        assert!(
+            ok,
+            "{lane}: a recognized authority compiles. stderr:\n{stderr}"
+        );
+        // A claim-less body is refused by default and by the explicit
+        // `--refuse-unlicensed` (roadmap WS7.5, DG-73), and compiles only
+        // under the disclosed `--permit-unlicensed`.
+        for flags in [&[][..], &["--refuse-unlicensed"][..]] {
+            let (ok, stderr) = run_wasm_lane(dir.path(), &unlicensed, compile_only, flags);
+            assert!(!ok, "{lane} {flags:?}: a claim-less body must fail");
+            assert!(
+                stderr.contains("no codegen license"),
+                "{lane} {flags:?}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("--permit-unlicensed: '"),
+                "{lane} {flags:?}: nothing disclosed: {stderr}"
+            );
+        }
+        let (ok, stderr) = run_wasm_lane(
+            dir.path(),
+            &unlicensed,
+            compile_only,
+            &["--permit-unlicensed"],
+        );
+        assert!(
+            ok,
+            "{lane}: --permit-unlicensed compiles a claim-less body: {stderr}"
+        );
+        assert!(
+            stderr.contains("--permit-unlicensed: '") && stderr.contains("NO codegen license"),
+            "{lane}: the permitted body is disclosed: {stderr}"
+        );
+        let (ok, stderr) = run_wasm_lane(
+            dir.path(),
+            &vendor,
+            compile_only,
+            &[
+                "--refuse-unlicensed",
+                "--recognize-authority",
+                "vendor-gate",
+            ],
+        );
+        assert!(ok, "{lane}: a licensed body compiles: {stderr}");
+        // No flag admits an `ungated` body, or an evidence-bound license
+        // worn without its certificate (trust-ir's codegen admission).
+        for flags in [&[][..], &["--recognize-authority", "ungated"][..]] {
+            let (ok, stderr) = run_wasm_lane(dir.path(), &ungated, compile_only, flags);
+            assert!(!ok, "{lane} {flags:?}: an ungated body must fail");
+            assert!(stderr.contains("affirmatively ungated"), "{lane}: {stderr}");
+        }
+        for flags in [&[][..], &["--recognize-authority", "clean-kernel-tv"][..]] {
+            let (ok, stderr) = run_wasm_lane(dir.path(), &clean, compile_only, flags);
+            assert!(
+                !ok,
+                "{lane} {flags:?}: an evidence-bound license without its evidence must fail"
+            );
+            assert!(
+                stderr.contains("without the evidence it names")
+                    && stderr.contains("clean-kernel-tv"),
+                "{lane} {flags:?}: stderr:\n{stderr}"
+            );
+        }
+    }
+}
+
+#[path = "common/scratch.rs"]
+mod scratch;
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes (or is refused) because the license silently refused it.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

@@ -1,0 +1,21 @@
+diff --git a/crates/trust-cg-codegen/src/compiler.rs b/crates/trust-cg-codegen/src/compiler.rs
+index aabe38c70..06f7bee02 100644
+--- a/crates/trust-cg-codegen/src/compiler.rs
++++ b/crates/trust-cg-codegen/src/compiler.rs
+@@ -13198,6 +13198,16 @@ impl Compiler {
+             call_abi,
+             panic_unwind: self.config.panic_unwind,
+             macho_build_version,
++            // SCRATCH (x86-multi-result LinearScan execution evidence; never
++            // landed): TCG_SCRATCH_X86_AOT_LINEARSCAN selects the host JIT's
++            // fast allocator strategy for AOT objects.
++            regalloc_mode: if std::env::var_os("TCG_SCRATCH_X86_AOT_LINEARSCAN").is_some() {
++                crate::x86_64::pipeline::X86RegAllocMode::Full(
++                    trust_cg_regalloc::AllocStrategy::LinearScan,
++                )
++            } else {
++                X86PipelineConfig::default().regalloc_mode
++            },
+             ..X86PipelineConfig::default()
+         });
+ 

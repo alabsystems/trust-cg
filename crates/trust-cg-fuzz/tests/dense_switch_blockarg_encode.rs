@@ -34,6 +34,7 @@ fn aot_object(module: &trust_ir::Module, opt: OptLevel) -> Result<Vec<u8>, Strin
         opt_level: opt,
         ..CompilerConfig::default()
     })
+    .with_codegen_license(permit_unlicensed())
     .compile(module)
     .map(|r| r.object_code)
     .map_err(|e| format!("{e:?}"))
@@ -52,6 +53,7 @@ fn jit1(module: &trust_ir::Module, opt: OptLevel, fast: bool, args: [i64; 4]) ->
     };
     cfg.opt_level = opt;
     let buf = Compiler::new(cfg)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &externs)
         .expect("compile")
         .buffer;
@@ -144,7 +146,7 @@ fn build_dense_switch_blockarg() -> trust_ir::Module {
     fb.ret(vec![dv]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn expected(args: [i64; 4]) -> i64 {
@@ -207,4 +209,13 @@ fn dense_switch_blockarg_aot_object_encodes_at_all_opts() {
             "AOT object at {opt:?} produced empty object_code"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

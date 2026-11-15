@@ -1,0 +1,19 @@
+; TrustIr text format v1
+module "mir::closure::p_fmin"
+target "aarch64-apple-darwin" 8 little
+file 0 "probe.rs"
+
+functy.0 = (ptr, ptr, ptr) -> ()
+
+functy.1 = (ptr, ptr, ptr) -> ()
+
+fn @_RNvMNtCs2EYQwhfuABO_4core3f64d3minCs681FMJlG080_5probe(functy.0) {
+}
+
+fn @p_fmin(functy.1) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    call @func.0(%0, %1, %2)
+    br bb1
+bb1:
+    ret
+}

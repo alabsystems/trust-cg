@@ -1,34 +1,13 @@
+//! Pure Cargo target-directory resolution rules, exercised by
+//! `tests/target_dir_resolution.rs`.
+//!
+//! No bridge test uses these to find a backend library: each loads the library
+//! Cargo built for its own test build (`support/backend_artifact.rs`), and
+//! `scripts/tests/test_bridge_backend_selection.py` refuses target-directory
+//! probing. These functions read no environment.
+
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-
-/// Resolve Cargo's target root exactly once for the bridge integration tests.
-/// Relative `CARGO_TARGET_DIR`/`CARGO_BUILD_TARGET_DIR` values are relative to
-/// the invoking process's working directory (not to `CARGO_MANIFEST_DIR`).
-#[allow(dead_code)]
-pub fn cargo_target_dir(manifest_dir: &Path) -> PathBuf {
-    let root = resolve_target_dir(
-        manifest_dir,
-        &std::env::current_dir().expect("integration-test current directory"),
-        std::env::var_os("CARGO_TARGET_DIR")
-            .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
-            .as_deref(),
-    );
-    match std::env::var("CARGO_BUILD_TARGET") {
-        Ok(target) if !target.trim().is_empty() => {
-            let host = (target.trim() == "host-tuple")
-                .then(resolve_rustc_host_tuple)
-                .flatten();
-            let component = target_output_component(&target, host.as_deref()).unwrap_or_else(|| {
-                panic!(
-                    "CARGO_BUILD_TARGET={target:?} does not identify one Cargo artifact directory"
-                )
-            });
-            root.join(component)
-        }
-        _ => root,
-    }
-}
 
 /// Cargo names a custom JSON target's artifact directory after the file stem,
 /// not after the path supplied to `--target`/`CARGO_BUILD_TARGET`. It also
@@ -55,18 +34,6 @@ pub fn target_output_component(configured: &str, rustc_host: Option<&str>) -> Op
     } else {
         Some(path.to_path_buf())
     }
-}
-
-fn resolve_rustc_host_tuple() -> Option<String> {
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let output = Command::new(rustc).arg("-vV").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
 }
 
 pub fn resolve_target_dir(

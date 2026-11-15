@@ -37,10 +37,14 @@
 //
 // The two disjoint 12-bit slices reconstruct the 24-bit window `X & 0x00FF_FFFF`
 // on top of TP. The AArch64 ELF ABI (IHI0056, "TLS relocations") range-checks the
-// HI12 relocation `0 <= X < 2^24`, and ISel refuses `off > 0xFF_FFFF`
-// (`ISelError::LocalExecTlsRefOffsetTooLarge`), so within every admitted program
+// HI12 relocation `0 <= X < 2^24`, which the static linker applies to the linked
+// value; the AArch64 ELF emitter already refuses an object whose own TLS layout
+// puts `X` at `2^24` or above (`[TCG-RELOC-WINDOW-TLSLE]`), and ISel refuses a
+// pre-resolved offset `off > 0xFF_FFFF`
+// (`ISelError::LocalExecTlsRefOffsetTooLarge`). So within every linked program
 // `X < 2^24` and the reconstructed address `TP + (X & 0xFFFFFF)` equals the exact
-// intended thread-local address `TP + X`.
+// intended thread-local address `TP + X`; the range itself is the linker's check,
+// not a proved obligation.
 //
 // Scope / soundness boundary. This lane proves the ELF TLS relocation
 // *bit-field placement + value reconstruction* — the part the relocations are
@@ -71,13 +75,13 @@
 // data-GOT rows; the MRS+ADD completion is plain register arithmetic covered
 // by the integer-op proof family.
 //
-// The GeneralDynamic/LocalDynamic (`__tls_get_addr`/TLSDESC) rows and the
-// CHECKED (non-`_NC`) `R_AARCH64_TLSLE_ADD_TPREL_LO12` are NOT emitted by the
-// backend (`select_tls_ref` fails closed: GD/LD are unreachable-by-lane —
-// trust-cg emits main-executable objects only, no dylib/dlopen lane exists),
-// so they stay FAIL-CLOSED — not proven here, not registered in any
-// proof-required registry. The four kinds that ARE proven here serve as the
-// production registry value lane for the emitted TLS relocations
+// The CHECKED (non-`_NC`) `R_AARCH64_TLSLE_ADD_TPREL_LO12` is never emitted.
+// The four TLSDESC rows ARE emitted for general/local-dynamic TLS under the
+// `pic` relocation model, but no obligation here models their values or the
+// linker's in-place GD->IE/LE rewrite of the slots, so they stay FAIL-CLOSED —
+// not proven here, not registered in any proof-required registry. The four
+// kinds that ARE proven here serve as the production registry value lane for
+// the emitted TLS relocations
 // (`ObjectRelocationProofRegistry::aarch64_elf_production`), composed with
 // the per-object ELF reparse binding exactly like the ordinary rows.
 //
@@ -606,12 +610,11 @@ pub fn proof_tlsie_lo12_without_alignment_refutes() -> ProofObligation {
 /// - LD64_GOTTPREL_LO12_NC (the ADRP+LDR pair addresses exactly the 8-aligned
 ///   GOT-TPREL slot `G+A`; the LDR imm12 is 8-scaled, bits [11:3]).
 ///
-/// All must verify. The GD/LD (`__tls_get_addr`/TLSDESC) rows and the checked
-/// (non-`_NC`) `R_AARCH64_TLSLE_ADD_TPREL_LO12` are NOT emitted by the backend
-/// (GD/LD are unreachable-by-lane: trust-cg emits main-executable objects
-/// only), so they are intentionally NOT proven here and stay fail-closed —
-/// which is why the production registry cites this lane ONLY for the four
-/// kinds below and keeps the checked TPREL_LO12 out.
+/// All must verify. The emitted TLSDESC rows (general/local-dynamic under the
+/// `pic` relocation model) have no obligation here, and the checked
+/// (non-`_NC`) `R_AARCH64_TLSLE_ADD_TPREL_LO12` is never emitted; both stay
+/// fail-closed, which is why the production registry cites this lane ONLY for
+/// the four kinds below.
 pub fn aarch64_elf_tls_relocation_proofs() -> Vec<ProofObligation> {
     vec![
         proof_tlsle_add_tprel_hi12(),
@@ -649,7 +652,12 @@ mod tests {
 
     #[test]
     fn all_aarch64_elf_tls_reloc_proofs_verify() {
+        let full_address = proof_tlsle_full_tprel_address().name;
         for obligation in aarch64_elf_tls_relocation_proofs() {
+            if obligation.name == full_address {
+                // Unreachable by sampling; see the test below.
+                continue;
+            }
             let result = verify_by_evaluation(&obligation);
             assert!(
                 matches!(result, VerificationResult::Valid),
@@ -658,6 +666,35 @@ mod tests {
                 result
             );
         }
+    }
+
+    /// The exact-address proof's ABI range precondition `S + A <u 2^24` over
+    /// two 64-bit inputs holds at no edge combination of the multi-input sweep
+    /// and at about 2^-40 per uniform draw; the sweep's precondition-directed
+    /// trials (small values, the bound's own constant) reach it. The claim is
+    /// also checked at in-range witnesses — the window's ends, a wrapping
+    /// `S + A` that lands in range, and assorted thread pointers. Sampled
+    /// evidence is statistical; a formal claim comes from the strict AY gate.
+    #[test]
+    fn tlsle_full_tprel_address_holds_at_in_range_witnesses() {
+        crate::lowering_proof::assert_directed_sampling_holds_at(
+            &proof_tlsle_full_tprel_address(),
+            &[
+                &[("TP", 0x0000_7fff_0000_0000), ("S", 0x10), ("A", 0x20)],
+                &[
+                    ("TP", 0xffff_8000_0000_0000),
+                    ("S", 0xff_f000),
+                    ("A", 0xfff),
+                ],
+                &[("TP", u64::MAX), ("S", 0), ("A", 0)],
+                &[("TP", 0x1234), ("S", u64::MAX), ("A", 1)],
+                &[
+                    ("TP", 0x7fff_ffff_ffff_f000),
+                    ("S", 0x80_0000),
+                    ("A", 0x7f_ffff),
+                ],
+            ],
+        );
     }
 
     #[test]

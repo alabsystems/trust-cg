@@ -38,6 +38,7 @@ fn jit1(module: &trust_ir::Module, opt: OptLevel, fast: bool, a: i64) -> i64 {
     };
     cfg.opt_level = opt;
     let buf = Compiler::new(cfg)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &externs)
         .expect("compile")
         .buffer;
@@ -165,7 +166,7 @@ fn build_jump_table_in_loop() -> trust_ir::Module {
     fb.ret(vec![e_acc]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -184,4 +185,13 @@ fn jump_table_in_loop_matches_reference() {
             }
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

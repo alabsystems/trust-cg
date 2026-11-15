@@ -1,0 +1,226 @@
+{
+  "name": "proof_diagnostics",
+  "functions": [
+    {
+      "id": 0,
+      "name": "checked_incr",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 11,
+                "col": 9
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I32",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 12,
+                "col": 5
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 1,
+                "line": 3,
+                "col": 1
+              },
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "PanicFreedom",
+      "status": "Failed",
+      "description": "i32 increment must not overflow",
+      "formula": null,
+      "function": 0,
+      "source": {
+        "source_id": "rust:src/main.rs::checked_incr",
+        "assertion_id": "assert:i32-add-no-overflow",
+        "range": {
+          "file": 0,
+          "start_line": 12,
+          "start_col": 5,
+          "end_line": 12,
+          "end_col": 10
+        },
+        "public": {
+          "obligation_id": "vc:checked_incr:overflow:0",
+          "semantic_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              205,
+              251,
+              253,
+              67,
+              226,
+              202,
+              160,
+              201,
+              171,
+              163,
+              59,
+              141,
+              252,
+              223,
+              242,
+              115,
+              76,
+              86,
+              18,
+              157,
+              209,
+              255,
+              94,
+              213,
+              104,
+              142,
+              128,
+              110,
+              200,
+              73,
+              140,
+              24
+            ]
+          }
+        }
+      },
+      "site": null
+    }
+  ],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [
+    "src/main.rs",
+    "src/lib.rs"
+  ],
+  "obligation_diagnostics": [
+    {
+      "obligation": 0,
+      "severity": "Error",
+      "message": "could not prove x + 1 stays in i32 range",
+      "location": {
+        "file": 0,
+        "line": 12,
+        "col": 5
+      },
+      "detail": "counterexample: x = 2147483647"
+    },
+    {
+      "obligation": 0,
+      "severity": "Warning",
+      "message": "caller relies on this increment staying in range",
+      "location": {
+        "file": 1,
+        "line": 3,
+        "col": 1
+      }
+    },
+    {
+      "obligation": 0,
+      "severity": "Note",
+      "message": "counterexample model available",
+      "location": null,
+      "detail": "model: (define-fun x () Int 2147483647)"
+    }
+  ],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

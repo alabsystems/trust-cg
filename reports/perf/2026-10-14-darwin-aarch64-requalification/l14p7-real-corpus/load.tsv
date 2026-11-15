@@ -1,0 +1,7 @@
+utc	phase	step	loadavg_1_5_15
+2026-10-14T15:45:56Z	campaign	start	4.21 5.57 7.15
+2026-10-14T15:45:56Z	wait-start	10-real-corpus	4.21 5.57 7.15
+2026-10-14T15:45:57Z	wait-end-rc0	10-real-corpus	4.21 5.57 7.15
+2026-10-14T15:45:57Z	before	10-real-corpus	4.21 5.57 7.15
+2026-10-14T18:01:58Z	after	10-real-corpus	7.92 6.70 5.89
+2026-10-14T18:01:58Z	campaign	end	7.92 6.70 5.89

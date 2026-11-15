@@ -5,24 +5,27 @@
 
 //! Minimal `machir` dialect wrapping a small subset of `AArch64Opcode`.
 //!
-//! Ops are the final lowering target before [`emit_mach_function`] translates
+//! Ops are the final lowering target before
+//! [`emit_mach_function`](crate::emit_mach_function) translates
 //! the dialect function into `trust_cg_ir::MachFunction`. The `machir` layer is a
-//! thin wrapper: one dialect op corresponds to one MachInst.
+//! small I64 facade, not a one-to-one instruction wrapper: full-width literals
+//! expand into MOVZ/MOVK, and parameter/return ABI transfers are explicit.
 
 use trust_cg_ir::{AArch64Opcode, Type};
 
 use crate::dialect::{Arity, Capabilities, Dialect, OpDef, TypeConstraint};
 use crate::id::OpCode;
 
+/// Materialize the complete I64/U64 `value` attribute, using MOVK when needed.
 pub const MACHIR_MOVZ_I64: OpCode = OpCode(0);
 pub const MACHIR_ADD_RR: OpCode = OpCode(1);
 pub const MACHIR_EOR_RR: OpCode = OpCode(2);
 pub const MACHIR_RET: OpCode = OpCode(3);
 
-/// Translate a `machir` opcode into the corresponding `AArch64Opcode`.
+/// Return a `machir` operation's base AArch64 opcode, not its full expansion.
 ///
-/// Returns `None` for opcodes that have no direct AArch64 equivalent — the
-/// caller (emit_mach_function) treats this as a bug and fails the lowering.
+/// A mapping alone does not define operand or ABI lowering. The emitter uses
+/// dedicated handlers and returns an error for unsupported operations.
 pub fn to_aarch64(op: OpCode) -> Option<AArch64Opcode> {
     match op {
         MACHIR_MOVZ_I64 => Some(AArch64Opcode::Movz),
@@ -50,9 +53,8 @@ impl Default for MachirDialect {
 // --- Type-constraint slices ------------------------------------------------
 //
 // MachIR ops in this PoC all operate on I64 values (AArch64 Xn registers).
-// Once #391/#393 land wider MachIR coverage these constraints will branch on
-// operand width; for now the explicit `Specific(I64)` matches the hand-written
-// MachInst output of `emit_mach_function`.
+// The explicit `Specific(I64)` constraints match the implemented machine
+// emitters. Wider opcode coverage requires corresponding type and ABI handling.
 
 static MACHIR_I64_RESULTS: &[TypeConstraint] = &[TypeConstraint::Specific(Type::I64)];
 static MACHIR_I64_BINARY_OPERANDS: &[TypeConstraint] = &[

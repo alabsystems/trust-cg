@@ -72,6 +72,9 @@
 
 #![cfg(target_arch = "aarch64")]
 
+#[path = "common/emitted_fixture.rs"]
+mod emitted_fixture;
+
 use std::collections::HashMap;
 
 use trust_cg_codegen::Target;
@@ -86,10 +89,11 @@ use prod_encoding_mem::{LoadStoreOp, LoadStoreSize, PairMode, PairOp, PairSize, 
 /// Parse + JIT one embedded module; return the buffer (keep it alive while
 /// calling fn pointers bound from it).
 fn jit_module(text: &str, what: &str) -> trust_cg_codegen::jit::ExecutableBuffer {
-    let module = trust_ir::parser::parse_module(text)
+    let module = emitted_fixture::parse_emitted(text)
         .unwrap_or_else(|e| panic!("MIR-emitted `{what}` trust-ir text must parse: {e:?}"));
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -4285,4 +4289,13 @@ fn trust_self3_encode_ldp_stp_post_index_roundtrip() {
          PostIndex wrapper's JIT"
     );
     drop(buffer);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

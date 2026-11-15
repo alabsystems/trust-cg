@@ -7,6 +7,26 @@
 //! multiply-accumulate — BY A SMALL COMPILE-TIME CONSTANT into a short
 //! shift + add/sub sequence, off the hardware `MUL`/`MADD` critical path.
 //!
+//! The pass also carries the closely-related unsigned widening-multiply
+//! combine:
+//!
+//! ```text
+//!   ta = AndRI(a, 0xffff_ffff)
+//!   tb = AndRI(b, 0xffff_ffff)
+//!   d  = MulRR(ta, tb)
+//!   =>
+//!   d  = Umull(a, b)
+//! ```
+//!
+//! `UMULL Xd, Wn, Wm` reads exactly the low 32 bits of each source and returns
+//! their full 64-bit product, so this is the exact identity
+//! `(a & (2^32-1)) * (b & (2^32-1)) = zext32(a) * zext32(b)`.  The product is
+//! at most `(2^32-1)^2 < 2^64`, so the rewrite also preserves the absence of
+//! unsigned overflow established by the source masks.  Both AND results must
+//! be function-wide single-use, same-block reaching definitions, with neither
+//! unmasked source redefined before the multiply.  Every uncertain shape is
+//! left unchanged.
+//!
 //! # Why
 //!
 //! `MUL`/`MADD` are latency-3-4 on Apple cores. When the multiply sits on a
@@ -59,10 +79,12 @@
 //!
 //! Compile-time: set `TCG_NO_MUL_SHIFT_REDUCE` (any value) — [`run`] becomes a
 //! no-op. Per-pass bisect: `TRUST_CG_DISABLE_PASSES=mulshift`.
+//! The widening combine alone can be disabled with
+//! `TCG_NO_MASKED_UMULL_FUSE` (the constant strength reduction keeps running).
 //!
 //! [`run`]: MachinePass::run
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -121,6 +143,17 @@ fn pass_id() -> PassId {
     PassId::new("mul-shift-reduce")
 }
 
+fn masked_umull_pass_id() -> PassId {
+    PassId::new("masked-umull-fuse")
+}
+
+/// Narrow rollback lever for the `AND #0xffff_ffff` + `MUL` -> `UMULL`
+/// combine.  Use the shared environment accessor so tests can override it
+/// without racing the process environment.
+fn masked_umull_enabled() -> bool {
+    crate::env_lock::var_os("TCG_NO_MASKED_UMULL_FUSE").is_none()
+}
+
 /// A single signed power-of-two term of the multiplier decomposition:
 /// `positive ? +(x<<shift) : -(x<<shift)`. `shift == 0` means the plain `x`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +192,9 @@ impl MulShiftReduce {
     }
 }
 
+/// One block's instruction list and the plans recognized in it.
+type BlockPlans = (BlockId, Vec<InstId>, Vec<(InstId, Plan)>);
+
 fn run_mul_shift_reduce(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
@@ -180,32 +216,10 @@ fn run_mul_shift_reduce(
         return false;
     }
     let mut changed = false;
-    // `unique_reaching_const` rebuilds three whole-function indexes on every
-    // call, so resolving one constant per candidate is quadratic in the block
-    // size. Phase A is explicitly an IMMUTABLE recognition pass, so ONE index
-    // serves all of its queries.
-    //
-    // It is built exactly ONCE and never refreshed. Phase B invalidates it, and
-    // re-indexing the whole function after every mutated block is a cure worse
-    // than the disease on block-dense code: measured on `branchy`, refreshing
-    // per block made this pass 49.4ms -> 88.4ms at 200 blocks, an 18-24% whole-
-    // compile regression, because each rebuild is O(function) but serves only
-    // the handful of multiplies in one block. Once stale, later blocks fall back
-    // to the per-query path, which is exactly the pre-existing behaviour.
-    //
-    // The single build still captures the case it was written for — one large
-    // block with many multiplies, where it is worth 5.6x — while bounding the
-    // indexing cost at O(function) per pass run instead of O(blocks x function).
-    // ONE index for the entire pass run, and Phase A for the WHOLE function
-    // completes before any mutation — so the index never goes stale and every
-    // query is served by it.
-    //
-    // The previous shape built the index once but LATCHED IT OFF at the first
-    // materialized plan, after which every remaining block fell back to the
-    // one-shot scan path. On block-dense code the first block containing a
-    // multiply latches it, so essentially every candidate paid a whole-function
-    // scan — the pass was back at its original cost (branchy measured at exact
-    // parity, not faster). Splitting the phases function-wide removes the latch.
+    // Phase A recognizes candidates for the whole function before any mutation,
+    // so one lazy reaching-definitions context serves all queries. Phase B/C
+    // invalidate that snapshot, but never query it again. Interleaving rewrites
+    // with recognition would require rebuilding it or using one-shot scans.
     //
     // Recognition is unaffected by hoisting it ahead of every rewrite. Phase B
     // materializes a shift/add sequence and Phase C splices the multiply out;
@@ -222,7 +236,7 @@ fn run_mul_shift_reduce(
 
     // Phase A (immutable, whole function): recognize every rewritable multiply
     // against the UNMUTATED function, building a fully-validated Plan for each.
-    let mut recognized: Vec<(BlockId, Vec<InstId>, Vec<(InstId, Plan)>)> = Vec::new();
+    let mut recognized: Vec<BlockPlans> = Vec::new();
     for block_id in func.block_order.clone() {
         let block_insts = func.block(block_id).insts.clone();
         let mut plans: Vec<(InstId, Plan)> = Vec::new();
@@ -236,9 +250,36 @@ fn run_mul_shift_reduce(
         }
     }
 
+    // Materialization moves ProvenanceMap history before the splices commit.
+    // Require one actual reference in ALL blocks, including blocks omitted
+    // from layout, before any such mutation. Saturating at two suffices for
+    // uniqueness and keeps arbitrary duplicate reference counts bounded.
+    // Repeated layout entries must not materialize the same site twice either.
+    if !recognized.is_empty() {
+        let mut owners: HashMap<InstId, (u8, u8)> = HashMap::default();
+        for (_, _, plans) in &recognized {
+            for (id, _) in plans {
+                let (planned, _) = owners.entry(*id).or_default();
+                *planned = planned.saturating_add(1).min(2);
+            }
+        }
+        for block in &func.blocks {
+            for id in &block.insts {
+                if let Some((_, references)) = owners.get_mut(id) {
+                    *references = references.saturating_add(1).min(2);
+                }
+            }
+        }
+        for (_, _, plans) in &mut recognized {
+            plans.retain(|(id, _)| owners.get(id) == Some(&(1, 1)));
+        }
+        recognized.retain(|(_, _, plans)| !plans.is_empty());
+    }
+
+    let mut consumed = Vec::new();
     for (block_id, block_insts, plans) in recognized {
         // Phase B (mutable): materialize each plan into fresh instructions.
-        let mut replacements: HashMap<InstId, Vec<InstId>> = HashMap::new();
+        let mut replacements: HashMap<InstId, Vec<InstId>> = HashMap::default();
         for (inst_id, plan) in plans {
             let new_ids = materialize(func, &plan, inst_id, provenance.as_deref_mut());
             replacements.insert(inst_id, new_ids);
@@ -246,8 +287,8 @@ fn run_mul_shift_reduce(
         }
 
         // Phase C: splice each rewritten multiply's InstId out for its sequence.
-        // The original MachInst stays inert in the arena (unreferenced, never
-        // encoded) — the same delete discipline the other machine peepholes use.
+        // Collect only actual replacement keys. The original arena payload is
+        // retired after EVERY splice, and only when no block still links it.
         let new_insts: Vec<InstId> = block_insts
             .iter()
             .flat_map(|iid| match replacements.get(iid) {
@@ -256,6 +297,262 @@ fn run_mul_shift_reduce(
             })
             .collect();
         func.block_mut(block_id).insts = new_insts;
+        consumed.extend(replacements.keys().copied());
+    }
+    crate::retirement::retire_unlinked(func, &consumed);
+
+    // Run the independent low-word widening combine only after every
+    // constant-multiply candidate has been recognized and materialized.  This
+    // preserves Phase A's invariant that its indexes observe the original
+    // function, while still folding any untouched masked `MulRR` sites.
+    if masked_umull_enabled() {
+        changed |= run_masked_umull_fuse(func, provenance);
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
+// `(x & 0xffff_ffff) * (y & 0xffff_ffff)` -> `UMULL x, y`
+// ---------------------------------------------------------------------------
+
+const LOW_WORD_MASK: i64 = 0xffff_ffff;
+
+#[derive(Clone, Copy)]
+struct MaskedWordDef {
+    inst: InstId,
+    pos: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MaskedUmullPlan {
+    lhs_and: InstId,
+    rhs_and: InstId,
+    lhs: VReg,
+    rhs: VReg,
+}
+
+/// Require the ordinary value-producing shape before deleting or changing an
+/// instruction.  An instruction with bespoke implicit effects or flags is not
+/// the isel form this identity proves and is therefore left alone.
+fn canonical_masked_umull_inst(inst: &MachInst, opcode: AArch64Opcode, arity: usize) -> bool {
+    inst.opcode == opcode
+        && inst.operands.len() == arity
+        && inst.implicit_defs.is_empty()
+        && inst.implicit_uses.is_empty()
+        && inst.flags == opcode.default_flags()
+        // No transfer of an opcode-bound proof to a shift/add or UMULL is
+        // established here. Preserve the original instruction instead.
+        && inst.proof.is_none()
+}
+
+fn masked_word_source(
+    func: &MachFunction,
+    masked: VReg,
+    def: MaskedWordDef,
+    last_def_pos: &HashMap<u32, usize>,
+) -> Option<VReg> {
+    let inst = func.inst(def.inst);
+    if !canonical_masked_umull_inst(inst, AArch64Opcode::AndRI, 3)
+        || inst.operands[0].as_vreg()? != masked
+        || inst.operands[2].as_imm()? != LOW_WORD_MASK
+        || masked.class != RegClass::Gpr64
+        || masked.id >= func.next_vreg
+    {
+        return None;
+    }
+    let src = inst.operands[1].as_vreg()?;
+    // Keep the producer in ordinary SSA-like form.  A tied `t = t & mask`
+    // would make deleting the defining instruction depend on the pre-def value
+    // of the same VReg, an admission surface this F1 combine does not need.
+    if src.class != RegClass::Gpr64 || src.id >= func.next_vreg || src == masked {
+        return None;
+    }
+
+    // Folding moves the source read from the AND down to the multiply.  A
+    // redefinition in that interval would make the later read observe a
+    // different value.  No entry means the source is a live-in, which is fine.
+    if last_def_pos
+        .get(&src.id)
+        .is_some_and(|&last| last > def.pos)
+    {
+        return None;
+    }
+    Some(src)
+}
+
+fn analyze_masked_umull(
+    func: &MachFunction,
+    mul: &MachInst,
+    and_defs: &HashMap<u32, MaskedWordDef>,
+    read_counts: &HashMap<u32, u8>,
+    last_def_pos: &HashMap<u32, usize>,
+) -> Option<MaskedUmullPlan> {
+    if !canonical_masked_umull_inst(mul, AArch64Opcode::MulRR, 3) {
+        return None;
+    }
+    let dst = mul.operands[0].as_vreg()?;
+    let masked_lhs = mul.operands[1].as_vreg()?;
+    let masked_rhs = mul.operands[2].as_vreg()?;
+    if dst.class != RegClass::Gpr64
+        || masked_lhs.class != RegClass::Gpr64
+        || masked_rhs.class != RegClass::Gpr64
+        || dst.id >= func.next_vreg
+        || masked_lhs.id >= func.next_vreg
+        || masked_rhs.id >= func.next_vreg
+        // Keep the admission surface deliberately narrow.  A single masked
+        // value squared could also use UMULL, but deleting one producer would
+        // require a separate exact-two-reads proof.
+        || masked_lhs == masked_rhs
+        || read_counts.get(&masked_lhs.id).copied() != Some(1)
+        || read_counts.get(&masked_rhs.id).copied() != Some(1)
+    {
+        return None;
+    }
+    let lhs_def = *and_defs.get(&masked_lhs.id)?;
+    let rhs_def = *and_defs.get(&masked_rhs.id)?;
+    if lhs_def.inst == rhs_def.inst {
+        return None;
+    }
+    let lhs = masked_word_source(func, masked_lhs, lhs_def, last_def_pos)?;
+    let rhs = masked_word_source(func, masked_rhs, rhs_def, last_def_pos)?;
+    Some(MaskedUmullPlan {
+        lhs_and: lhs_def.inst,
+        rhs_and: rhs_def.inst,
+        lhs,
+        rhs,
+    })
+}
+
+fn run_masked_umull_fuse(
+    func: &mut MachFunction,
+    mut provenance: Option<&mut ProvenanceMap>,
+) -> bool {
+    // Collect only eligible opcode/metadata shapes from layout. Without both
+    // opcodes there is no candidate and no need for a whole-function census.
+    // Count layout occurrences too: a duplicate layout must not authorize
+    // mutating a site as though it were uniquely emitted.
+    let mut has_and = false;
+    let mut has_mul = false;
+    let mut owners: HashMap<InstId, (u8, u8)> = HashMap::default();
+    let mut read_counts: HashMap<u32, u8> = HashMap::default();
+    for &block_id in &func.block_order {
+        for &inst_id in &func.block(block_id).insts {
+            let inst = func.inst(inst_id);
+            match inst.opcode {
+                AArch64Opcode::AndRI
+                    if canonical_masked_umull_inst(inst, AArch64Opcode::AndRI, 3) =>
+                {
+                    has_and = true;
+                    if let Some(dst) = inst.operands[0].as_vreg()
+                        && dst.class == RegClass::Gpr64
+                        && dst.id < func.next_vreg
+                    {
+                        read_counts.entry(dst.id).or_default();
+                    }
+                }
+                AArch64Opcode::MulRR
+                    if canonical_masked_umull_inst(inst, AArch64Opcode::MulRR, 3) =>
+                {
+                    has_mul = true;
+                }
+                _ => continue,
+            }
+            let (planned, _) = owners.entry(inst_id).or_default();
+            *planned = planned.saturating_add(1).min(2);
+        }
+    }
+    if !has_and || !has_mul {
+        return false;
+    }
+
+    // Overwriting/deleting an arena instruction requires unique ownership in
+    // ALL blocks, not just layout. Deleting an AND additionally requires one
+    // read operand in the whole function: the multiply operand. Compute both
+    // inventories in the same traversal, including omitted-layout consumers
+    // through different instruction IDs. Shared operand roles remain the sole
+    // read classifier; no instruction semantics are reimplemented here. Only
+    // potential AND-result registers need storage; saturating at two retains
+    // exactly the distinction that deletion's single-read gate consumes.
+    // Keys are numeric IDs, not class-sensitive VRegs: a W-view read still
+    // consumes the low bits of its X-view producer.
+    for block in &func.blocks {
+        for &inst_id in &block.insts {
+            if let Some((_, references)) = owners.get_mut(&inst_id) {
+                *references = references.saturating_add(1).min(2);
+            }
+            crate::effects::for_each_inst_use(func.inst(inst_id), |used| {
+                if let Some(count) = read_counts.get_mut(&used.id) {
+                    *count = count.saturating_add(1).min(2);
+                }
+            });
+        }
+    }
+    let mut changed = false;
+
+    for block_id in func.block_order.clone() {
+        // Only same-block preceding ANDs are eligible.  Entries are removed by
+        // every later definition of the same numeric ID, making a hit the
+        // actual reaching definition at the multiply. W writes clobber the X
+        // view too, matching the shared reaching-constant definition model.
+        let mut and_defs: HashMap<u32, MaskedWordDef> = HashMap::default();
+        let mut last_def_pos: HashMap<u32, usize> = HashMap::default();
+        let block_insts = func.block(block_id).insts.clone();
+
+        for (pos, inst_id) in block_insts.into_iter().enumerate() {
+            // Keep the original shape for def-map maintenance after an in-place
+            // rewrite of the current multiply.
+            let original = func.inst(inst_id).clone();
+
+            if original.opcode == AArch64Opcode::MulRR
+                && let Some(plan) =
+                    analyze_masked_umull(func, &original, &and_defs, &read_counts, &last_def_pos)
+                && [plan.lhs_and, plan.rhs_and, inst_id]
+                    .iter()
+                    .all(|id| owners.get(id) == Some(&(1, 1)))
+            {
+                let mut fused = original.clone();
+                fused.opcode = AArch64Opcode::Umull;
+                fused.operands = vec![
+                    original.operands[0].clone(),
+                    MachOperand::VReg(plan.lhs),
+                    MachOperand::VReg(plan.rhs),
+                ];
+                fused.flags = AArch64Opcode::Umull.default_flags();
+                *func.inst_mut(inst_id) = fused;
+                *func.inst_mut(plan.lhs_and) = MachInst::new(AArch64Opcode::Nop, vec![]);
+                *func.inst_mut(plan.rhs_and) = MachInst::new(AArch64Opcode::Nop, vec![]);
+                if let Some(provenance) = provenance.as_deref_mut() {
+                    provenance.record_merge(
+                        &[plan.lhs_and, plan.rhs_and, inst_id],
+                        inst_id,
+                        masked_umull_pass_id(),
+                    );
+                }
+                changed = true;
+            }
+
+            // Update the maps from the original instruction AFTER matching so
+            // an instruction cannot act as its own reaching definition.
+            let mut defs = Vec::new();
+            crate::effects::aarch64_for_each_def_position(
+                original.opcode,
+                original.operands.len(),
+                |def_pos| {
+                    if let Some(MachOperand::VReg(v)) = original.operands.get(def_pos) {
+                        defs.push(*v);
+                    }
+                },
+            );
+            for v in defs {
+                and_defs.remove(&v.id);
+                last_def_pos.insert(v.id, pos);
+            }
+            if original.opcode == AArch64Opcode::AndRI
+                && let Some(dst) = original.operands.first().and_then(MachOperand::as_vreg)
+            {
+                and_defs.insert(dst.id, MaskedWordDef { inst: inst_id, pos });
+            }
+        }
     }
     changed
 }
@@ -331,7 +628,7 @@ fn analyze(
         AArch64Opcode::MulRR => {
             // MulRR [dst, op1, op2] : dst = op1 * op2. Multiply commutes, so the
             // constant may be either source; the other is `x`.
-            if inst.operands.len() != 3 {
+            if !canonical_masked_umull_inst(inst, AArch64Opcode::MulRR, 3) {
                 return None;
             }
             let dst = inst.operands[0].as_vreg()?;
@@ -344,7 +641,7 @@ fn analyze(
         AArch64Opcode::Madd => {
             // Madd [dst, Xn, Xm, Xa] : dst = Xa + Xn*Xm. Xn*Xm commutes; Xa is
             // the addend folded in verbatim.
-            if inst.operands.len() != 4 {
+            if !canonical_masked_umull_inst(inst, AArch64Opcode::Madd, 4) {
                 return None;
             }
             let dst = inst.operands[0].as_vreg()?;
@@ -360,6 +657,7 @@ fn analyze(
 
 /// Try to build a plan for `dst = addend? + x * (const held by `cst`)`. `x` is
 /// the multiplicand; `cst` is the candidate constant-multiplier operand.
+#[allow(clippy::too_many_arguments)]
 fn plan_for(
     func: &MachFunction,
     ctx: &std::cell::OnceCell<ReachingCtx>,
@@ -370,6 +668,16 @@ fn plan_for(
     cst: VReg,
     addend: Option<VReg>,
 ) -> Option<Plan> {
+    // Materialization allocates temporaries starting at next_vreg. Every old
+    // operand must belong to the existing arena or a fresh temporary could
+    // collide with a live operand. Refuse before reaching-def queries as well
+    // as before any allocation or provenance mutation.
+    if [dst, x, cst].iter().any(|v| v.id >= func.next_vreg)
+        || addend.is_some_and(|v| v.id >= func.next_vreg)
+    {
+        return None;
+    }
+
     // All operands must be the SAME GPR class as the destination — the emitted
     // shift/add/sub derive their W-vs-X form from the destination register, so a
     // width mismatch would silently change semantics. Bail on any non-GPR class.
@@ -411,9 +719,7 @@ fn plan_for(
             } else {
                 i128::from(raw)
             };
-            if decompose(c, width).is_none() {
-                return None;
-            }
+            decompose(c, width)?;
         }
         Some(MoveWide::Single(None)) | Some(MoveWide::Many) => {}
     }
@@ -518,6 +824,50 @@ fn decompose(c: i128, width: u32) -> Option<Vec<Term>> {
         }
     }
     None
+}
+
+/// Whether a `Madd`'s addend `y` is computed in the multiply's own block (its
+/// last definition before the `Madd` there, by numeric register ID, is not a
+/// constant materialization)
+/// while the decomposition subtracts a term (`2^k - 1`, `1 - 2^k`). Such an
+/// addend is the per-iteration value the multiply's result waits for
+/// (p5_struct_acc's `a = a*31 + (c ^ i)`: `c ^ i` is the end of the loop's
+/// long recurrence), so it is added LAST: `((x<<k) - x) + y` puts one add
+/// after `y` instead of two (`(y + (x<<k)) - x`), and the path from `x` stays
+/// shift, sub, add. The `2^k + 1` shape keeps its order: with no subtracted
+/// term the deferral measured as a regression on `m1_call_chain`
+/// (`addend_last`'s note).
+fn late_addend_with_negative_term(func: &MachFunction, plan: &Plan, madd: InstId) -> bool {
+    let Some(y) = plan.addend else {
+        return false;
+    };
+    if !plan.terms.iter().any(|t| !t.positive) {
+        return false;
+    }
+    for &bid in &func.block_order {
+        let insts = &func.block(bid).insts;
+        let Some(pos) = insts.iter().position(|&iid| iid == madd) else {
+            continue;
+        };
+        let Some(def) = insts[..pos]
+            .iter()
+            .rev()
+            .map(|&iid| func.inst(iid))
+            .find(|inst| crate::effects::inst_clobbers_vreg_id(inst, y.id))
+        else {
+            return false;
+        };
+        return !matches!(
+            def.opcode,
+            AArch64Opcode::Movz
+                | AArch64Opcode::Movn
+                | AArch64Opcode::Movk
+                | AArch64Opcode::MovI
+                | AArch64Opcode::Adrp
+                | AArch64Opcode::AddPCRel
+        );
+    }
+    false
 }
 
 /// Does any `Csel` read `dst` as one of its two SELECT VALUE operands
@@ -651,10 +1001,11 @@ fn materialize(
     // (a measured regression). Requiring a Csel consumer keeps EVERY non-select
     // 2^k+1 Madd byte-identical, and by O2/O3 pass order `if-convert` has already
     // formed the Csel that consumes this Madd's dst, so the check sees it.
-    let addend_last = plan.addend.is_some()
+    let addend_last = (plan.addend.is_some()
         && plan.terms.iter().all(|t| t.positive)
         && plan.terms.iter().any(|t| t.shift == 0)
-        && dst_feeds_csel_value_arm(func, plan.dst);
+        && dst_feeds_csel_value_arm(func, plan.dst))
+        || late_addend_with_negative_term(func, plan, old_id);
     // The `Madd` addend is an extra positive summand, ready before the loop body
     // (loop-invariant / early), so it sorts with the ready terms — UNLESS
     // `addend_last`, in which case it is deferred to the final outermost add.
@@ -698,10 +1049,9 @@ fn materialize(
     for &n in &neg {
         steps.push((AArch64Opcode::SubRR, n));
     }
-    // Deferred `2^k+1`-shape addend: the FINAL outermost `+ y` (see
-    // `addend_last`). Guaranteed non-empty step list overall: `addend_last`
-    // implies ≥2 positive terms (a plain-`x` seed plus a positive shift), so
-    // `pos` already contributes ≥1 step even before this one.
+    // Deferred addend: the FINAL outermost `+ y` (see `addend_last`). The
+    // step list is non-empty either way: the `2^k+1` shape has ≥2 positive
+    // terms, and the late-addend shapes have a negative term (a `-` step).
     if addend_last {
         let y = plan.addend.expect("addend_last implies a Madd addend");
         steps.push((AArch64Opcode::AddRR, y));

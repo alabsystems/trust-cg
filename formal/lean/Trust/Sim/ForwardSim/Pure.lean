@@ -110,6 +110,7 @@ structure PureTransition (lay : Layout) (s s' : SrcState) where
     `pcAdvance` is the straight-line CFG fact (fall-through to the lowered successor). -/
 structure PureFrame (lay : Layout) (step : LoweredStep) (s s' : SrcState)
     (tr : PureTransition lay s s') where
+  entryReady : ∀ m, R lay s m → step.entry m
   /-- VALUE: the low-`w` read-back of the written def register denotes the source result. -/
   dstDenotes : ∀ m, R lay s m →
       Val.int tr.w tr.hw (((step.exec m).regs tr.rDst).truncate tr.w) = s'.env tr.vDst
@@ -237,6 +238,7 @@ def pureInstrCert
     (clob : ∀ m, R lay s m → Preserves (clobberOf step) m (step.exec m))
     (hmemEq : ∀ a, s'.mem a = s.mem a) :
     InstrCert lay step s s' where
+  entryReady := fr.entryReady
   value     := fun _ hR => pure_value_leg tr fr hR
   clobber   := clob
   carrierOk := fun _ hR => pure_carrier_leg tr fr hR

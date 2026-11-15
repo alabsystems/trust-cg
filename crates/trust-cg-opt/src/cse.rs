@@ -49,7 +49,7 @@
 //!
 //! Reference: LLVM `MachineCSE.cpp`, GVN
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachOperand, OpcodeCategory, PassId,
@@ -123,6 +123,7 @@ enum CanonOperand {
     /// so they are legal CSE keys. Kept distinct from `Other` so that the
     /// unhashable-operand guard below does not reject symbol-bearing keys.
     Symbol(String),
+    ExactModuleSymbol(String),
     Other, // non-hashable operands (blocks, etc.)
 }
 
@@ -138,6 +139,7 @@ impl CanonOperand {
             MachOperand::Imm(i) => CanonOperand::Imm(*i),
             MachOperand::FImm(f) => CanonOperand::FImm(f.to_bits()),
             MachOperand::Symbol(s) => CanonOperand::Symbol(s.clone()),
+            MachOperand::ExactModuleSymbol(s) => CanonOperand::ExactModuleSymbol(s.clone()),
             _ => CanonOperand::Other,
         }
     }
@@ -152,6 +154,13 @@ struct AvailExpr {
     block: BlockId,
     /// The VReg defined by the instruction (operand[0]).
     def_vreg: VReg,
+    /// The instruction follows a mid-block exit in its own block: a
+    /// conditional branch (a switch's compare-and-branch cascade) or a call
+    /// whose exception edge leaves for a landing pad
+    /// ([`crate::eh_call_custody::UnwindExits`]). An instruction after one
+    /// does not run on every path into the blocks its block dominates, so it
+    /// is available only later in its own block.
+    after_exit: bool,
 }
 
 /// Relocation-pseudo CSE fixpoint (Dhrystone lever): collapse dependent
@@ -227,7 +236,7 @@ fn run_cse(
     reloc_fixpoint: bool,
 ) -> bool {
     // Table of available expressions: key -> first occurrence.
-    let mut available: HashMap<ExprKey, AvailExpr> = HashMap::new();
+    let mut available: HashMap<ExprKey, AvailExpr> = HashMap::default();
     let def_counts = count_defs(func);
     let tied_def_use_vregs = collect_tied_def_use_vregs(func);
 
@@ -260,7 +269,10 @@ fn run_cse(
                 let inst = func.inst(inst_id);
                 if matches!(
                     inst.opcode,
-                    AArch64Opcode::LdrGot | AArch64Opcode::LdrTlvp | AArch64Opcode::LdrGottprel
+                    AArch64Opcode::LdrGot
+                        | AArch64Opcode::LdrTlvp
+                        | AArch64Opcode::LdrGottprel
+                        | AArch64Opcode::LdrTlsdesc
                 ) && let Some(MachOperand::VReg(base)) = inst.operands.get(1)
                 {
                     bases.insert(*base);
@@ -274,7 +286,7 @@ fn run_cse(
     // original def. The version is required because this IR is not SSA:
     // the same VReg may be redefined later, and only uses of the specific
     // eliminated definition are safe to rewrite.
-    let mut replacements: HashMap<(VReg, u32), VReg> = HashMap::new();
+    let mut replacements: HashMap<(VReg, u32), VReg> = HashMap::default();
 
     // Instructions to remove (marked dead).
     let mut dead_insts: Vec<InstId> = Vec::new();
@@ -293,15 +305,25 @@ fn run_cse(
     // (e.g., `v20 = mov v21; v21 = mov v23` in phi-resolution blocks).
     // Expressions using different definitions of the same VReg must get
     // different keys to prevent unsound CSE.
-    let mut vreg_versions: HashMap<VReg, u32> = HashMap::new();
+    let mut vreg_versions: HashMap<VReg, u32> = HashMap::default();
+
+    // Calls an exception leaves their block through (see
+    // `AvailExpr::after_exit`).
+    let unwind_exits = crate::eh_call_custody::UnwindExits::collect(func);
 
     // Walk in dominator-tree preorder to see definitions before uses.
     let preorder = dom_preorder(dom, func.entry);
 
     for &block_id in &preorder {
         let block = func.block(block_id);
+        // Whether a mid-block exit has been passed in this block (see
+        // `AvailExpr::after_exit`).
+        let mut after_exit = false;
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
+            if inst.opcode.is_conditional_branch() || unwind_exits.contains(inst_id) {
+                after_exit = true;
+            }
 
             // Track VReg definitions: increment version for each def.
             // This must happen for ALL instructions (not just CSE candidates)
@@ -444,8 +466,13 @@ fn run_cse(
                 }
 
                 // Verify dominance: the available instruction's block must
-                // dominate the current block.
-                if dom.dominates(avail.block, block_id) {
+                // dominate the current block, and an instruction after a
+                // mid-block exit (a conditional branch, or a call an
+                // exception leaves through) dominates only the rest of its
+                // own block.
+                if dom.dominates(avail.block, block_id)
+                    && (avail.block == block_id || !avail.after_exit)
+                {
                     // CSE: replace all uses of def_vreg with avail.def_vreg.
                     replacements.insert((def_vreg, def_version), avail.def_vreg);
                     dead_insts.push(inst_id);
@@ -469,6 +496,7 @@ fn run_cse(
                     inst_id,
                     block: block_id,
                     def_vreg,
+                    after_exit,
                 },
             );
         }
@@ -499,8 +527,8 @@ fn run_cse(
     // Apply replacements: rewrite uses in the same dominator-preorder used
     // to build versioned CSE keys, so each use sees the matching definition
     // version for its VReg operands.
-    let mut rewrite_versions: HashMap<VReg, u32> = HashMap::new();
-    let mut rewritten_inst_ids: HashSet<InstId> = HashSet::new();
+    let mut rewrite_versions: HashMap<VReg, u32> = HashMap::default();
+    let mut rewritten_inst_ids: HashSet<InstId> = HashSet::default();
     for &block_id in &preorder {
         let inst_ids = func.block(block_id).insts.clone();
         for inst_id in inst_ids {
@@ -617,7 +645,7 @@ fn make_expr_key(
 }
 
 fn count_defs(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::default();
 
     for &block_id in &func.block_order {
         let block = func.block(block_id);
@@ -633,7 +661,7 @@ fn count_defs(func: &MachFunction) -> HashMap<VReg, u32> {
 }
 
 fn collect_tied_def_use_vregs(func: &MachFunction) -> HashSet<VReg> {
-    let mut tied_vregs = HashSet::new();
+    let mut tied_vregs = HashSet::default();
 
     for &block_id in &func.block_order {
         let block = func.block(block_id);
@@ -673,6 +701,7 @@ fn canon_operand_cmp(a: &CanonOperand, b: &CanonOperand) -> std::cmp::Ordering {
         (CanonOperand::Imm(a), CanonOperand::Imm(b)) => a.cmp(b),
         (CanonOperand::FImm(a), CanonOperand::FImm(b)) => a.cmp(b),
         (CanonOperand::Symbol(a), CanonOperand::Symbol(b)) => a.cmp(b),
+        (CanonOperand::ExactModuleSymbol(a), CanonOperand::ExactModuleSymbol(b)) => a.cmp(b),
         (CanonOperand::VReg(_, _), _) => Ordering::Less,
         (_, CanonOperand::VReg(_, _)) => Ordering::Greater,
         (CanonOperand::Imm(_), _) => Ordering::Less,
@@ -681,6 +710,8 @@ fn canon_operand_cmp(a: &CanonOperand, b: &CanonOperand) -> std::cmp::Ordering {
         (_, CanonOperand::FImm(_)) => Ordering::Greater,
         (CanonOperand::Symbol(_), _) => Ordering::Less,
         (_, CanonOperand::Symbol(_)) => Ordering::Greater,
+        (CanonOperand::ExactModuleSymbol(_), _) => Ordering::Less,
+        (_, CanonOperand::ExactModuleSymbol(_)) => Ordering::Greater,
         (CanonOperand::Other, CanonOperand::Other) => Ordering::Equal,
     }
 }
@@ -938,6 +969,168 @@ mod tests {
 
         let mut cse = CommonSubexprElim;
         assert!(!cse.run(&mut func));
+    }
+
+    #[test]
+    fn test_cse_does_not_reuse_a_def_after_a_mid_block_exit() {
+        //   bb0: v5 = add v0, v1    ; before the exit: available in bb3
+        //        b.cond bb1         ; a mid-block exit (a switch cascade)
+        //        v2 = sub v0, v1    ; after it: skipped on the bb0 -> bb1 path
+        //        b bb2
+        //   bb1: b bb3
+        //   bb2: b bb3
+        //   bb3: v3 = sub v0, v1    ; must keep its own def
+        //        v4 = add v0, v1    ; reuses v5
+        //        ret
+        //
+        // bb0 dominates bb3, but `v2` is defined only on the path through
+        // bb2; reusing it at bb3 reads a register the bb1 path never wrote.
+        let mut func = MachFunction::new(
+            "test_cse_mid_block_exit".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let early = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(5), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb0, early);
+        let exit = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb0, exit);
+        let late = func.push_inst(MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![vreg(2), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb0, late);
+        let to_bb2 = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb2)],
+        ));
+        func.append_inst(bb0, to_bb2);
+        for block in [bb1, bb2] {
+            let br = func.push_inst(MachInst::new(
+                AArch64Opcode::B,
+                vec![MachOperand::Block(bb3)],
+            ));
+            func.append_inst(block, br);
+        }
+        let join_sub = func.push_inst(MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![vreg(3), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb3, join_sub);
+        let join_add = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(4), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb3, join_add);
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb3, ret);
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb0, bb2);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb2, bb3);
+
+        let mut pass = CommonSubexprElim;
+        assert!(
+            pass.run(&mut func),
+            "the add before the exit is still reused"
+        );
+        assert!(
+            func.block(bb3).insts.contains(&join_sub),
+            "the sub after a mid-block exit was reused in a block the exit path reaches"
+        );
+        assert!(!func.block(bb3).insts.contains(&join_add));
+    }
+
+    /// `bb0` is an invoke block: its call leaves for the landing pad `bb2`
+    /// in the middle of the block, as instruction selection lowers `Invoke`.
+    ///
+    /// ```text
+    ///   bb0: bl may_throw        ; exception edge to bb2 (when `invoke`)
+    ///        v2 = sub v0, v1     ; after the call: not run on the unwind path
+    ///        v6 = sub v0, v1     ; same block: reuses v2
+    ///        b bb1
+    ///   bb1: ret                 ; the normal destination
+    ///   bb2: v3 = sub v0, v1     ; the landing pad
+    ///        ret
+    /// ```
+    fn invoke_then_pad(invoke: bool) -> (MachFunction, [InstId; 2]) {
+        let mut func = MachFunction::new(
+            "test_cse_invoke_pad".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let call = func.push_inst(MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("may_throw".into())],
+        ));
+        func.append_inst(bb0, call);
+        let after_call = func.push_inst(MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![vreg(2), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb0, after_call);
+        let same_block = func.push_inst(MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![vreg(6), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb0, same_block);
+        let br = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb0, br);
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb1, ret);
+        let pad_sub = func.push_inst(MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![vreg(3), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb2, pad_sub);
+        let pad_ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb2, pad_ret);
+        func.add_edge(bb0, bb1);
+        if invoke {
+            crate::eh_call_custody::tests::bind_invoke(&mut func, call, bb0, bb2);
+        } else {
+            func.add_edge(bb0, bb2);
+        }
+        (func, [same_block, pad_sub])
+    }
+
+    #[test]
+    fn test_cse_does_not_reuse_a_def_after_an_invoke_call_in_its_landing_pad() {
+        // The invoke block dominates its landing pad, but an exception leaves
+        // at the call: `v2` was never written on the unwind path, so reusing
+        // it in the pad reads whatever the register held when the callee
+        // threw (the O3 LICM-hoisted constant miscompile).
+        let (mut func, [same_block, pad_sub]) = invoke_then_pad(true);
+        let bb0 = func.entry;
+        let mut pass = CommonSubexprElim;
+        assert!(
+            pass.run(&mut func),
+            "the same-block duplicate is still reused"
+        );
+        assert!(!func.block(bb0).insts.contains(&same_block));
+        assert!(
+            func.block(BlockId(2)).insts.contains(&pad_sub),
+            "a def after the invoke's call was reused in its landing pad"
+        );
+
+        // Control: without the exception edge the same shape is reused in
+        // bb2, so the row above is decided by the invoke alone.
+        let (mut func, [_, pad_sub]) = invoke_then_pad(false);
+        assert!(CommonSubexprElim.run(&mut func));
+        assert!(!func.block(BlockId(2)).insts.contains(&pad_sub));
     }
 
     #[test]
@@ -1720,6 +1913,47 @@ mod tests {
             "distinct symbols must never share a base pointer"
         );
         assert_eq!(func.block(func.entry).insts.len(), 5);
+    }
+
+    #[test]
+    fn exact_module_address_cse_preserves_binding_but_shares_identical_exact_addresses() {
+        let mut instructions = Vec::new();
+        for (index, sym) in [
+            symbol("same_name"),
+            MachOperand::ExactModuleSymbol("same_name".into()),
+            MachOperand::ExactModuleSymbol("same_name".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let page = 2 + index as u32 * 2;
+            instructions.push(MachInst::new(
+                AArch64Opcode::Adrp,
+                vec![vreg(page), sym.clone()],
+            ));
+            instructions.push(MachInst::new(
+                AArch64Opcode::AddPCRel,
+                vec![vreg(page + 1), vreg(page), sym],
+            ));
+        }
+        instructions.push(MachInst::new(AArch64Opcode::Ret, vec![]));
+        let mut func = make_func_with_insts(instructions);
+        assert!(run_cse_fixpoint(&mut func));
+        let block = func.block(func.entry);
+        assert_eq!(
+            block.insts.len(),
+            5,
+            "ordinary and exact pairs must remain distinct"
+        );
+        assert!(matches!(
+            func.inst(block.insts[0]).operands[1],
+            MachOperand::Symbol(_)
+        ));
+        assert!(matches!(
+            func.inst(block.insts[2]).operands[1],
+            MachOperand::ExactModuleSymbol(_)
+        ));
+        assert!(!run_cse_fixpoint(&mut func));
     }
 
     #[test]

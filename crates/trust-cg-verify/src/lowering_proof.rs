@@ -10,7 +10,7 @@
 // assert `NOT(trust_ir_result == aarch64_result)` and check for UNSAT.
 // If UNSAT, the rule is proven correct for all inputs.
 //
-// Reference: Alive2 (PLDI 2021), designs/2026-04-13-verification-architecture.md
+// Reference: Alive2 (PLDI 2021)
 
 //! Proof obligations for lowering rule verification.
 //!
@@ -22,6 +22,24 @@ use crate::smt::{BATCH_LANES, BatchScratch, BatchTape, EvalEnv, FlatProg, SVal, 
 use crate::verify::VerificationResult;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[cfg(test)]
+mod canonical_conjunction_tests;
+mod checked_fcmp;
+mod checked_fp_values;
+#[cfg(test)]
+mod exhaustive_domain_tests;
+
+/// Canonical original-query construction, shared by every serializer and
+/// producer. Request/replay reuse must bind this protocol as well as content.
+pub(crate) const CANONICAL_PROOF_FORMULA_PROTOCOL: &str =
+    "trust-cg.proof-formula.midpoint-conjunction.v2";
+
+/// Whether finite evaluation must validate and sample the stored scalar FP
+/// comparison or value trees. Shared by primary/memo dispatch and strength accounting.
+pub(crate) fn uses_checked_scalar_fp_evaluation(obligation: &ProofObligation) -> bool {
+    checked_fcmp::applies(obligation) || checked_fp_values::applies(obligation)
+}
 
 /// Translation validation check kind, aligned with tRust trust-transval's `CheckKind`.
 ///
@@ -157,15 +175,15 @@ impl TransvalCheckKind {
 /// isel choice, because the machine side was hand-written to match.
 ///
 /// A [`MachineSideProvenance::Reconstructed`] obligation is different in kind:
-/// its `aarch64_expr` was rebuilt FROM THE REAL EMITTED INSTRUCTION at verify
-/// time (its actual opcode and its actual operand wiring), while
-/// `trust_ir_expr` is built from the INTENDED source op over the SAME shared
-/// symbols. The two sides therefore agree IFF isel emitted a semantically
-/// correct instruction with correct operand wiring. If isel emitted `SUB` for an
-/// `Iadd`, the machine side is `bvsub` and the source side is `bvadd` ⇒ the
-/// obligation REFUTES. THAT non-vacuous refutability is the content the credit
-/// rule is allowed to count even though, for a *correct* commutative lowering,
-/// the two sides happen to be `bvadd == bvadd`.
+/// its target expression was rebuilt from the real emitted opcode and positional
+/// operands rather than copied from a static proof template. This tag records
+/// that target-side fact only. It does **not** itself prove that the source
+/// expression was independently recovered from the actual lowering input, nor
+/// that symbolic operands were bound to that input's exact values. Current
+/// architecture reconstructors may infer the nominal source family from the
+/// emitted opcode, so a wrong source selection can otherwise self-attest as
+/// `E == E`. Any complete lowering claim must pair this target-side provenance
+/// with separately enforced exact source/operand provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MachineSideProvenance {
     /// Machine side was taken from a STATIC database builder that constructs the
@@ -178,8 +196,9 @@ pub enum MachineSideProvenance {
     /// Machine side was RECONSTRUCTED from the real emitted machine instruction
     /// at verify time (its opcode and positional operands), per
     /// `function_verifier::reconstruct_alu_obligation`. This is the only
-    /// provenance whose proof is credited *because* it is reconstructed (see
-    /// [`ProofObligation::is_reconstructed`]).
+    /// provenance the existing reconstruction-reporting rule recognizes (see
+    /// [`ProofObligation::is_reconstructed`]). This tag alone is not authority
+    /// for a local structural-identity Formal proof.
     Reconstructed {
         /// Stable identifier of the REAL machine opcode the machine side was
         /// built from (the `{:?}` of the `AArch64Opcode`). Recorded for audit /
@@ -256,31 +275,29 @@ pub struct ProofObligation {
 }
 
 impl ProofObligation {
-    /// STRICT structural proven-honesty predicate (task #61, STRICT decision).
+    /// STRICT static-template proven-honesty predicate (task #61).
     ///
-    /// A lowering proof counts as *genuinely proven / covered / verified* IFF it
-    /// is NON-DEGENERATE — its trust_ir-side and machine-side semantic
-    /// expressions are STRUCTURALLY DISTINCT (`SmtExpr` derives `PartialEq`,
-    /// smt.rs):
+    /// A static-database lowering proof counts as *genuinely proven / covered /
+    /// verified* IFF it is NON-DEGENERATE — its trust_ir-side and machine-side
+    /// semantic expressions are STRUCTURALLY DISTINCT (`SmtExpr` derives
+    /// `PartialEq`, smt.rs):
     ///
     /// ```text
     /// is_genuinely_proven  <=>  trust_ir_expr != aarch64_expr
     /// ```
     ///
-    /// This is the SOLE criterion for crediting a proof. There is NO name-ledger
-    /// exemption and NO genuine-identity allowlist exemption: a structurally
-    /// `X == X` proof NEVER counts as proven, even an audited "genuine" 1:1
-    /// identity. An `X == X` obligation asserts only `NOT(X == X)` is UNSAT,
-    /// which is a vacuous tautology in the chosen model — it is a
-    /// model-consistency check, NOT a lowering-correctness proof, because no
-    /// wrong opcode/instruction/placement on the machine side could ever refute
-    /// it (both sides are the very same constructed expression).
+    /// This is the sole criterion for crediting a
+    /// [`MachineSideProvenance::StaticDb`] proof. There is no name-ledger or
+    /// allowlist exemption for a static `X == X`: it asserts only
+    /// `NOT(X == X)` is UNSAT and cannot be refuted by a wrong emitted opcode or
+    /// operand placement, because neither side came from that instruction.
     ///
-    /// Degenerate (`X == X`) obligations may still EXIST in the database as
-    /// documented debt / model-consistency entries, but they contribute ZERO to
-    /// any proven/covered/verified tally. This predicate is fail-closed by
-    /// construction: an injected or accidental `X == X` proof can never be
-    /// counted proven anywhere, regardless of its name or any allowlist.
+    /// Static degenerate (`X == X`) obligations may still exist in the database
+    /// as documented debt / model-consistency entries, but they contribute zero
+    /// to any proven/covered/verified tally. Real-operand reconstructed
+    /// obligations are reported through a separate legacy rule keyed by
+    /// [`Self::is_reconstructed`]; that target-side tag alone must not be treated
+    /// as exact source/operand provenance.
     pub fn is_genuinely_proven(&self) -> bool {
         self.trust_ir_expr != self.aarch64_expr
     }
@@ -292,11 +309,11 @@ impl ProofObligation {
     /// on: a reconstructed obligation is credited `Verified` IFF
     /// `is_reconstructed() && discharge == Valid`. Unlike
     /// [`Self::is_genuinely_proven`], this does NOT require the two SMT
-    /// expressions to be structurally distinct — a *correct* commutative ALU
-    /// lowering legitimately reconstructs to `bvadd == bvadd`. The non-vacuity
-    /// comes from the machine side being built from the REAL opcode + operands:
-    /// a wrong isel opcode (e.g. SUB for Iadd) or wrong operand wiring on a
-    /// non-commutative op (SUB) yields structurally distinct sides that REFUTE.
+    /// expressions to be structurally distinct — a commutative ALU
+    /// reconstruction commonly produces `bvadd == bvadd`. This predicate says
+    /// nothing about whether the source operation and operands were
+    /// independently bound: callers needing complete lowering authority must
+    /// enforce that provenance separately.
     pub fn is_reconstructed(&self) -> bool {
         matches!(
             self.machine_side_provenance,
@@ -304,34 +321,62 @@ impl ProofObligation {
         )
     }
 
-    /// Structural degeneracy: `trust_ir_expr == aarch64_expr`. The exact
-    /// negation of [`Self::is_genuinely_proven`]. A degenerate obligation proves
-    /// nothing about a lowering and is never counted proven/covered/verified.
+    /// Structural identity: `trust_ir_expr == aarch64_expr`, the exact negation
+    /// of [`Self::is_genuinely_proven`]. For static-database provenance this is a
+    /// degenerate obligation that proves nothing about a lowering. Existing
+    /// reports distinguish target-side reconstruction via
+    /// [`Self::is_reconstructed`], but that distinction alone does not make an
+    /// exact identity complete source-lowering evidence.
     pub fn is_degenerate(&self) -> bool {
         !self.is_genuinely_proven()
     }
 
     /// Build the negated equivalence formula for SMT solving.
     ///
-    /// Returns the expression: `preconditions => NOT(trust_ir == aarch64)`.
+    /// Returns `AND(all preconditions, NOT(trust_ir == aarch64))`.
     /// If this is UNSAT, the lowering is correct.
+    ///
+    /// Canonical connective shape is midpoint-balanced. Every original opaque
+    /// leaf remains in the historical written order: reverse(preconditions),
+    /// then the disequality. No leaf is simplified, flattened or deduplicated.
     pub fn negated_equivalence(&self) -> SmtExpr {
+        // The count comes from the stored Vec plus the sole terminal. Consume
+        // each term exactly once without a second O(n) premise inventory. Each
+        // recursive range is halved, so connective work is O(n), construction
+        // frames are O(log n), and there are exactly n original And nodes.
+        fn build(terms: &mut impl Iterator<Item = SmtExpr>, count: usize) -> SmtExpr {
+            if count == 1 {
+                return terms.next().expect("canonical original leaf inventory");
+            }
+            let left = count / 2;
+            let lhs = build(terms, left);
+            let rhs = build(terms, count - left);
+            lhs.and_expr(rhs)
+        }
+
         let equiv = self
             .trust_ir_expr
             .clone()
             .eq_expr(self.aarch64_expr.clone());
         let not_equiv = equiv.not_expr();
 
-        if self.preconditions.is_empty() {
-            not_equiv
-        } else {
-            // precond_1 AND precond_2 AND ... AND NOT(equiv)
-            let mut combined = not_equiv;
-            for pre in &self.preconditions {
-                combined = pre.clone().and_expr(combined);
-            }
-            combined
-        }
+        let count = self
+            .preconditions
+            .len()
+            .checked_add(1)
+            .expect("non-zero-sized Vec leaf count plus one cannot overflow");
+        let mut terms = self
+            .preconditions
+            .iter()
+            .rev()
+            .cloned()
+            .chain(std::iter::once(not_equiv));
+        let formula = build(&mut terms, count);
+        assert!(
+            terms.next().is_none(),
+            "complete canonical original inventory"
+        );
+        formula
     }
 
     /// Serialize the proof obligation to SMT-LIB2 format (for ay CLI).
@@ -342,7 +387,7 @@ impl ProofObligation {
 
         // Keep this legacy serializer close to the source expression shape.
         // Solver entry points use ay_bridge::prepare_formula_for_smt for
-        // stronger simplification before invoking ay/z3.
+        // stronger simplification before invoking AY.
         let raw_formula = self.negated_equivalence();
         let formula = expand_bounded_quantifiers(&raw_formula);
 
@@ -417,20 +462,15 @@ pub fn shift_in_range_precondition(amount: SmtExpr, width: u32) -> SmtExpr {
 /// 32/64-bit proof obligations. Edge cases are always tested first
 /// (0, 1, MAX, midpoints), then this many random trials follow.
 ///
-/// At 100,000 trials the false-positive probability per proof is
-/// approximately 1 - (1 - 2^{-32})^{100000} for 32-bit, which provides
-/// reasonable confidence but is **not** a formal proof. Use ay/z3 via
-/// [`crate::ay_bridge::verify_with_ay`] for complete guarantees.
+/// A fixed sample count does not establish a universal confidence bound:
+/// detection depends on the input distribution and the particular defect.
+/// This is **not** a formal proof. Use AY plus independent Clean checking via
+/// [`crate::ay_bridge::verify_with_ay`] for supported represented obligations.
 pub const DEFAULT_SAMPLE_COUNT: u64 = 100_000;
 
-/// Maximum bit-width for which exhaustive verification is performed.
-///
-/// For widths <= this threshold (with <= 2 inputs), every possible input
-/// combination is tested (2^{width * num_inputs} evaluations). For widths
-/// above this threshold, random sampling is used instead.
-///
-/// Currently set to 8 because exhaustive 16-bit with 2 inputs requires
-/// 2^32 evaluations (4 billion), which is too slow for routine testing.
+/// Exhaustive work budget, expressed as the width of each of two inputs.
+/// The default permits 2^(2 * 8) tuples, regardless of how input bits are split.
+/// Two 16-bit inputs still require 2^32 evaluations and are sampled by default.
 pub const EXHAUSTIVE_WIDTH_THRESHOLD: u32 = 8;
 
 /// Configuration for the verification evaluation engine.
@@ -441,9 +481,9 @@ pub const EXHAUSTIVE_WIDTH_THRESHOLD: u32 = 8;
 ///
 /// | Level | Width | Inputs | Strategy | Guarantee |
 /// |-------|-------|--------|----------|-----------|
-/// | **Exhaustive** | <= 8 | <= 2 | All 2^(w*n) combos | Complete for that width |
-/// | **Statistical** | > 8 | any | Edge cases + N random samples | Probabilistic (configurable N) |
-/// | **Formal** | any | any | SMT solver (ay/z3) | Complete (not yet default) |
+/// | **Exhaustive** | Total <= 16 bits by default | Distinct integer inputs | Complete Cartesian domain | Complete for that domain |
+/// | **Statistical** | Above the domain budget | any | Edge cases + N random samples | Probabilistic (configurable N) |
+/// | **Formal** | supported | supported | AY + independent Clean checking | Complete for the represented obligation |
 ///
 /// # Path to formal verification
 ///
@@ -451,13 +491,33 @@ pub const EXHAUSTIVE_WIDTH_THRESHOLD: u32 = 8;
 /// for small widths, statistical sampling for larger widths. This catches most
 /// bugs but cannot prove correctness for all 2^64 input combinations.
 ///
-/// The path to full formal verification:
-/// 1. **Current**: Mock evaluation (this module) -- fast, catches regressions
-/// 2. **Available**: CLI ay/z3 via [`crate::ay_bridge`] -- serialize to SMT-LIB2, pipe to solver
-/// 3. **Future**: Native ay API (feature-gated `ay`) -- in-process SMT, no subprocess overhead
+/// Evaluation and formal discharge are distinct APIs. [`crate::ay_bridge`]
+/// uses aterm's packaged AY solver and independent Clean checker. The native
+/// AY experiment was retired; there is no native-AY Cargo feature.
 ///
-/// When ay integration is the default, `verify_by_evaluation` will become
-/// the fast pre-check, with ay providing the formal proof.
+/// Statistical sampling is never instruction credit under either policy: the
+/// function verifiers report a sampled discharge as `Unverified`.
+/// Whether a function verifier replays source-bound obligations through the live
+/// AY + independent-checker authority.
+///
+/// This is explicit verifier policy, not an environment switch. Library and
+/// diagnostic verifiers keep [`EvaluationOnly`](Self::EvaluationOnly); compiler
+/// proof-promotion verifiers select
+/// [`SourceBoundReplay`](Self::SourceBoundReplay), under which an enforced,
+/// source-paired AArch64 walk replays its checked frame and arithmetic
+/// obligations formally. No policy upgrades a registry theorem or a sampled
+/// verdict: the former live formal-on-miss route was deleted with the
+/// withdrawal of substring, representative and statistical credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProofReplayPolicy {
+    /// Evaluation evidence only; no live solver is entered.
+    #[default]
+    EvaluationOnly,
+    /// Replay checked source-bound obligations through AY + an independent
+    /// checker. Inconclusive replays leave the instruction uncredited.
+    SourceBoundReplay,
+}
+
 #[derive(Debug, Clone)]
 pub struct VerificationConfig {
     /// Number of random samples for statistical verification of widths
@@ -467,13 +527,19 @@ pub struct VerificationConfig {
     /// At N=1,000,000 a single 32-bit proof takes ~100ms on modern hardware.
     pub sample_count: u64,
 
-    /// Maximum bit-width for exhaustive verification.
-    /// Defaults to [`EXHAUSTIVE_WIDTH_THRESHOLD`] (8).
+    /// Exhaustive work budget, expressed as the width of each of two inputs.
+    /// Defaults to [`EXHAUSTIVE_WIDTH_THRESHOLD`] (8): at most 2^16 tuples.
+    /// Actual input widths are summed, so one 16-bit input or several narrower
+    /// inputs have the same budget as two 8-bit inputs. FP is never enumerated.
     ///
-    /// Setting this to 16 enables exhaustive 16-bit single-input proofs
-    /// (65,536 evaluations) but 16-bit two-input proofs require 2^32
-    /// evaluations and will be very slow.
+    /// A single 16-bit input already fits the default budget (65,536 tuples).
+    /// Raising this to 16 also permits 16-bit two-input proofs, requiring 2^32
+    /// evaluations, so it can be very slow.
     pub exhaustive_threshold: u32,
+
+    /// Whether source-bound obligations are replayed through live proof
+    /// authority.
+    pub proof_replay_policy: ProofReplayPolicy,
 }
 
 impl Default for VerificationConfig {
@@ -481,6 +547,7 @@ impl Default for VerificationConfig {
         Self {
             sample_count: DEFAULT_SAMPLE_COUNT,
             exhaustive_threshold: EXHAUSTIVE_WIDTH_THRESHOLD,
+            proof_replay_policy: ProofReplayPolicy::EvaluationOnly,
         }
     }
 }
@@ -493,6 +560,133 @@ impl VerificationConfig {
             ..Default::default()
         }
     }
+
+    /// Configuration for a compiler verifier whose reports may authorize proof
+    /// promotion. This does not weaken failure behavior: only a checked live
+    /// [`AYResult::Verified`](crate::ay_bridge::AYResult::Verified) of a
+    /// source-bound obligation credits `Formal`; every inconclusive replay
+    /// leaves its instructions uncredited.
+    pub fn for_proof_promotion() -> Self {
+        Self {
+            proof_replay_policy: ProofReplayPolicy::SourceBoundReplay,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn replays_source_bound_obligations(&self) -> bool {
+        self.proof_replay_policy == ProofReplayPolicy::SourceBoundReplay
+    }
+}
+
+/// One policy shared by dispatch, memo shortcuts and strength accounting.
+/// Count complete input tuples, not the first input's width. This both avoids
+/// undersampling wider later inputs and permits complete small-domain checks
+/// without increasing the historical two-input worst-case work budget.
+pub(crate) fn exhaustive_input_count(
+    obligation: &ProofObligation,
+    config: &VerificationConfig,
+) -> Option<u64> {
+    if obligation.inputs.is_empty()
+        || !obligation.fp_inputs.is_empty()
+        || uses_checked_scalar_fp_evaluation(obligation)
+    {
+        return None;
+    }
+    let budget_bits = config.exhaustive_threshold.saturating_mul(2).min(63);
+    let mut bits = 0u32;
+    for (index, (name, width)) in obligation.inputs.iter().enumerate() {
+        if *width == 0
+            || *width > 63
+            || obligation.inputs[..index]
+                .iter()
+                .any(|(earlier, _)| earlier == name)
+        {
+            return None;
+        }
+        bits = bits.checked_add(*width)?;
+        if bits > budget_bits {
+            return None;
+        }
+    }
+    1u64.checked_shl(bits)
+}
+
+fn needs_multi_input_sampling(obligation: &ProofObligation) -> bool {
+    obligation.inputs.len() > 2
+        || obligation
+            .inputs
+            .windows(2)
+            .any(|pair| pair[0].1 != pair[1].1)
+}
+
+/// Every uninterpreted function `obligation`'s terms mention — both sides and
+/// every precondition — sorted and deduplicated.
+pub(crate) fn evaluator_uninterpreted_functions(obligation: &ProofObligation) -> Vec<String> {
+    let mut names = obligation.trust_ir_expr.uninterpreted_functions();
+    names.extend(obligation.aarch64_expr.uninterpreted_functions());
+    for pre in &obligation.preconditions {
+        names.extend(pre.uninterpreted_functions());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The terms of `obligation` that carry an uninterpreted function, in term
+/// order: `source expression`, `machine expression`, `precondition {index}` —
+/// the same names the point-level `Inconclusive` reasons use, so a
+/// precondition is identified by its position whichever path declines it.
+fn evaluator_uninterpreted_function_sites(obligation: &ProofObligation) -> Vec<String> {
+    let carries = |term: &SmtExpr| !term.uninterpreted_functions().is_empty();
+    let mut sites = Vec::new();
+    if carries(&obligation.trust_ir_expr) {
+        sites.push("source expression".to_string());
+    }
+    if carries(&obligation.aarch64_expr) {
+        sites.push("machine expression".to_string());
+    }
+    for (index, pre) in obligation.preconditions.iter().enumerate() {
+        if carries(pre) {
+            sites.push(format!("precondition {index}"));
+        }
+    }
+    sites
+}
+
+/// The evaluator's answer for an obligation it cannot decide AT ALL: one whose
+/// terms carry an uninterpreted function.
+///
+/// Concrete evaluation assigns a value to every declared input and computes
+/// both sides; a UF has no interpretation here (`SmtExpr::try_eval` errors on
+/// it), so no sampled or exhaustive point is evidence for OR against the
+/// obligation. The honest outcome is a named, fail-closed non-verdict —
+/// `Unknown`, never `Valid`, never a panic. (The frame theorems bind initial
+/// memory as the zero-argument UF `entry_memory`; they are solver-lane
+/// obligations that merely sit in the same registry.) Deciding this on the
+/// whole obligation, before any point is evaluated, also covers a UF that no
+/// tested point reaches: `try_eval` evaluates only the taken arm of an `ite`,
+/// so a point-level check alone could compare such an obligation as equal.
+/// The reason names every function and every term that carries one, and is
+/// deterministic in the obligation alone, so a sequential and a chunked sweep
+/// agree on it.
+pub(crate) fn evaluator_undecidable(obligation: &ProofObligation) -> Option<VerificationResult> {
+    let names = evaluator_uninterpreted_functions(obligation);
+    if names.is_empty() {
+        return None;
+    }
+    let listed = names
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sites = evaluator_uninterpreted_function_sites(obligation).join(", ");
+    Some(VerificationResult::Unknown {
+        reason: format!(
+            "evaluator cannot decide: uninterpreted function {listed} (in {sites}); \
+             concrete evaluation has no interpretation for it, so no tested point is \
+             evidence either way — this obligation needs the solver lane"
+        ),
+    })
 }
 
 /// Verify a proof obligation by exhaustive testing for small widths
@@ -500,22 +694,31 @@ impl VerificationConfig {
 ///
 /// # Verification strategy
 ///
-/// - **Widths <= 8, inputs <= 2**: Exhaustive -- tests all 2^(width * num_inputs)
-///   input combinations. This is a complete proof for that bit-width.
-/// - **Widths > 8, inputs <= 2**: Statistical -- tests 6 edge cases per input
+/// - **Integer domains within budget**: Exhaustive -- tests every tuple using
+///   each input's own width (at most 65,536 tuples by default).
+/// - **Larger uniform domains, inputs <= 2**: Statistical -- tests 6 edge cases per input
 ///   (0, 1, MAX, MAX-1, midpoint, midpoint-1) in all combinations (36 pairs),
 ///   then [`DEFAULT_SAMPLE_COUNT`] (100,000) random samples using a deterministic
 ///   LCG seeded from the proof obligation name.
-/// - **3+ inputs**: Statistical -- tests 36 edge-case combinations, then
+/// - **Larger mixed-width or 3+ input domains**: Statistical -- tests edge cases, then
 ///   [`DEFAULT_SAMPLE_COUNT`] random samples with per-input width masking.
 ///
 /// # Guarantees
 ///
-/// For widths <= 8: **complete** -- equivalent to formal proof for that width.
-/// For widths > 8: **statistical** -- high confidence but not a formal proof.
-/// A counterexample-free result with 100,000 random 32-bit samples means the
-/// probability of a lurking bug at any single input point is bounded by
-/// ~10^{-5}, but adversarial or structured bugs could still hide.
+/// Within the exhaustive budget: **complete** for the declared input domain.
+/// Above it: **statistical**, not a proof. A fixed sample count establishes no
+/// universal confidence bound; detection depends on the defect and distribution.
+///
+/// Either way, a sweep in which no tested point satisfies the obligation's
+/// preconditions compared nothing and returns [`VerificationResult::Unknown`],
+/// never `Valid`: the exhaustive sweep says so directly, the sampled sweeps
+/// with a "vacuous sample" reason (sampling cannot tell an unsatisfiable
+/// precondition from one it never hit).
+///
+/// An obligation whose terms carry an **uninterpreted function** is outside
+/// concrete evaluation altogether and returns `Unknown` naming the function
+/// (see [`evaluator_undecidable`]) — never `Valid`, never a panic. Any other
+/// term `SmtExpr::try_eval` refuses likewise stops the sweep with `Unknown`.
 ///
 /// For formal guarantees on 32/64-bit widths, use
 /// [`crate::ay_bridge::verify_with_ay`] or enable the `ay` feature.
@@ -531,10 +734,27 @@ pub fn verify_by_evaluation_with_config(
     obligation: &ProofObligation,
     config: &VerificationConfig,
 ) -> VerificationResult {
+    // A term the evaluator cannot interpret is a NON-VERDICT for the whole
+    // obligation, decided before any dispatch (including the identical-tree
+    // shortcut below, which `memoized_verify_by_evaluation` replicates and
+    // must exclude in lockstep): see `evaluator_undecidable`.
+    if let Some(undecidable) = evaluator_undecidable(obligation) {
+        return undecidable;
+    }
+    // Checked scalar FP must precede BOTH legacy FP substitution and the
+    // identical-tree shortcut: equal malformed/unbound trees are not evidence.
+    if uses_checked_scalar_fp_evaluation(obligation) {
+        return if checked_fp_values::applies(obligation) {
+            checked_fp_values::verify(obligation, config)
+        } else {
+            checked_fcmp::verify(obligation, config)
+        };
+    }
     let width = obligation.inputs.first().map(|(_, w)| *w).unwrap_or(32);
     let num_inputs = obligation.inputs.len();
+    let exhaustive_count = exhaustive_input_count(obligation, config);
 
-    // FP-only obligations (e.g. FADD/FSUB/FMUL/FDIV/FNEG/FABS/FSQRT/FCMP
+    // Legacy FP-only obligations (e.g. FADD/FSUB/FMUL/FDIV/FNEG/FABS/FSQRT
     // lowering proofs) carry their operands in `fp_inputs` rather than
     // `inputs`. Dispatch them to the dedicated FP evaluator which:
     //   1. substitutes a battery of IEEE-754 edge-case test vectors
@@ -566,6 +786,12 @@ pub fn verify_by_evaluation_with_config(
         return verify_fp_by_evaluation(obligation);
     }
 
+    // Establish the complete supported scalar subset before considering the
+    // identity shortcut. Unsupported expressions or preconditions must reach
+    // the fallible interpreter and cannot gain a Valid verdict from equality.
+    let compiled = CompiledObligation::try_new(obligation);
+    let compiled = compiled.as_ref();
+
     // SOUND VERDICT-IDENTICAL SHORT-CIRCUIT (proof-lane floor).
     //
     // When the two modeled sides are the SAME expression tree, evaluation is a
@@ -573,9 +799,14 @@ pub fn verify_by_evaluation_with_config(
     // IDENTICAL `EvalResult` at every sampled point. `check_single_point` can
     // therefore only return `Equal`/`PreconditionUnmet` — a `Counterexample`
     // is STRUCTURALLY impossible. On the STATISTICAL dispatch below a
-    // counterexample-free sweep returns exactly `Valid` (`verify_random` /
-    // `verify_random_multi` never downgrade to `Unknown`), so return `Valid`
-    // directly and skip the whole `DEFAULT_SAMPLE_COUNT` (100k) sweep.
+    // counterexample-free sweep returns `Valid` exactly when at least one
+    // sampled point satisfied every precondition, and the vacuous-sample
+    // `Unknown` otherwise (see `sampled_sweep_verdict`). So return `Valid`
+    // directly — skipping the whole `DEFAULT_SAMPLE_COUNT` (100k) sweep — only
+    // when that witness is already in hand: trivially with no preconditions,
+    // else at a point of the sweep's own edge battery
+    // (`identical_sides_edge_witness`). With no edge witness the full sweep
+    // runs and decides between `Valid` and the vacuous-sample `Unknown` itself.
     //
     // This fires on the correctly-lowered commutative/associative integer ALU +
     // immediate-baked + address-of LEA reconstructed obligations
@@ -586,10 +817,8 @@ pub fn verify_by_evaluation_with_config(
     // fire there and the full REFUTING sweep runs unchanged — refutation power
     // is exactly preserved.
     //
-    // Restricted to the STATISTICAL path (`num_inputs > 2 || width >
-    // exhaustive_threshold`, an EXACT mirror of the dispatch condition at the
-    // `verify_random_multi` / `verify_exhaustive` / `verify_random` split
-    // below): the exhaustive (<=8-bit, <=2-input) path can legitimately
+    // Restricted to the STATISTICAL path through the same input-domain policy
+    // as dispatch and strength accounting: the exhaustive path can legitimately
     // downgrade a vacuous-precondition obligation to `Unknown` via
     // `sweep_verdict`, so it must still run. `fp_inputs` obligations are
     // handled/returned above.
@@ -606,28 +835,22 @@ pub fn verify_by_evaluation_with_config(
     // `Valid` would credit `Valid` where the sweep refutes = a silent
     // proof-system miscompile. We therefore EXCLUDE any tree that contains a
     // `TrapIfZero` (`collect_trap_poison_decls` empty) and let it run the full
-    // sweep. A trap-free identical tree evaluates only to `Bv`/`Bv128`/`Bool`
-    // (reflexive `==`) or `Float` (NaN == NaN special-cased), so every
-    // satisfying point is `Equal` and the sweep verdict is exactly `Valid`.
-    if (num_inputs > 2 || width > config.exhaustive_threshold)
+    // sweep. Requiring the complete compiled scalar subset also excludes
+    // uninterpreted functions, missing input bindings and unsupported guards.
+    // Within that subset, every trap-free satisfying point is `Equal`.
+    if exhaustive_count.is_none()
+        && let Some(co) = compiled
         && obligation.trust_ir_expr == obligation.aarch64_expr
         && crate::smt::collect_trap_poison_decls(&obligation.trust_ir_expr).is_empty()
+        && identical_sides_edge_witness(obligation, co)
     {
         return VerificationResult::Valid;
     }
 
-    // Compile the obligation to the indexed scalar fast path ONCE (None => the
-    // samplers fall back to the interpreter, see `CompiledObligation`).
-    let compiled = CompiledObligation::try_new(obligation);
-    let compiled = compiled.as_ref();
-
-    // For 3+ inputs or mixed widths, use multi-input random sampling.
-    if num_inputs > 2 {
-        return verify_random_multi(obligation, compiled, config.sample_count);
-    }
-
-    if width <= config.exhaustive_threshold {
-        verify_exhaustive(obligation, compiled, width)
+    if let Some(count) = exhaustive_count {
+        verify_exhaustive(obligation, compiled, count)
+    } else if needs_multi_input_sampling(obligation) {
+        verify_random_multi(obligation, compiled, config.sample_count)
     } else {
         verify_random(obligation, compiled, width, config.sample_count)
     }
@@ -799,21 +1022,33 @@ pub fn memoized_verify_by_evaluation(
     obligation: &ProofObligation,
     config: &VerificationConfig,
 ) -> VerificationResult {
-    // Identical-sided TRAP-FREE obligations sweep to `Valid` unconditionally
-    // (see the short-circuit in `verify_by_evaluation_with_config`, whose
-    // predicate this replicates IN LOCKSTEP — including the trap-free guard):
+    // Identical-sided TRAP-FREE obligations with a precondition witness in
+    // hand sweep to `Valid` (see the short-circuit in
+    // `verify_by_evaluation_with_config`, whose predicate this replicates IN
+    // LOCKSTEP — including the trap-free guard and the edge-battery witness):
     // return `Valid` WITHOUT cloning the obligation into an `EvalMemoKey`
     // (line below) or taking the shard lock. This is the SAME verdict the memo
     // would compute and store on this key; it is pure clone/lock elision that
     // removes the per-instruction clone on the <16-inst serial functions.
-    // The predicate MUST stay identical to the primary short-circuit (the
-    // extra `fp_inputs.is_empty()` is a strict subset — FP obligations never
-    // reach the primary short-circuit either, as they return above).
-    let width = obligation.inputs.first().map(|(_, w)| *w).unwrap_or(32);
+    // The predicate MUST exclude the same checked-comparison route as the
+    // primary entry. Legacy FP-only obligations also return before the primary
+    // shortcut and are excluded here by `fp_inputs.is_empty()`. The complete
+    // supported scalar subset is required here too: equality alone cannot
+    // evaluate an unsupported expression or precondition. Without an edge
+    // witness the obligation takes the memo like any other, and the sweep
+    // decides between `Valid` and the vacuous-sample `Unknown`.
+    // The primary entry answers a UF-bearing obligation with a non-verdict
+    // BEFORE its shortcut (`evaluator_undecidable`), so the elided shortcut
+    // here must decline the same obligations — walked only once the two sides
+    // already compare equal.
     if obligation.fp_inputs.is_empty()
-        && (obligation.inputs.len() > 2 || width > config.exhaustive_threshold)
+        && !uses_checked_scalar_fp_evaluation(obligation)
+        && exhaustive_input_count(obligation, config).is_none()
         && obligation.trust_ir_expr == obligation.aarch64_expr
         && crate::smt::collect_trap_poison_decls(&obligation.trust_ir_expr).is_empty()
+        && evaluator_uninterpreted_functions(obligation).is_empty()
+        && let Some(co) = CompiledObligation::try_new(obligation)
+        && identical_sides_edge_witness(obligation, &co)
     {
         return VerificationResult::Valid;
     }
@@ -874,27 +1109,32 @@ pub fn memoized_verify_by_evaluation(
     if let Some(ms) = computed_ms {
         // TCG_SWEEP_BT=<substring>: print the backtrace of the FIRST miss whose
         // name contains it, to find which discharge site owns a kind.
-        if let Some(want) = std::env::var_os("TCG_SWEEP_BT") {
-            if obligation.name.contains(&*want.to_string_lossy()) {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    eprintln!(
-                        "TCG_SWEEP_BT {}\n{}",
-                        obligation.name,
-                        std::backtrace::Backtrace::force_capture()
-                    );
-                });
-            }
+        if let Some(want) = std::env::var_os("TCG_SWEEP_BT")
+            && obligation.name.contains(&*want.to_string_lossy())
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "TCG_SWEEP_BT {}\n{}",
+                    obligation.name,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
         }
         let co = CompiledObligation::try_new(obligation);
         let compiled = co.is_some();
         let ops = co.as_ref().map(CompiledObligation::op_count).unwrap_or(0);
         let thread = std::thread::current();
         eprintln!(
-            "TCG_TIME_SWEEP {ms:8.2}ms thread={} compiled={compiled} ops={ops} inputs={} width={width} \
+            "TCG_TIME_SWEEP {ms:8.2}ms thread={} compiled={compiled} ops={ops} inputs={} widths={:?} \
              cat={:?} {}",
             thread.name().unwrap_or("?"),
             obligation.inputs.len(),
+            obligation
+                .inputs
+                .iter()
+                .map(|(_, width)| *width)
+                .collect::<Vec<_>>(),
             obligation.category,
             obligation.name,
         );
@@ -909,114 +1149,183 @@ fn sweep_trace_enabled() -> bool {
 }
 
 /// PROOF-4 B1: discharge a FIXED `ProofDatabase` registry obligation,
-/// preferring a tier-0 candidate that is revalidated live over the per-compile
-/// statistical sampling sweep.
+/// preferring a replayable committed proof over the evaluation sweep.
 ///
 /// - **Exhaustive** (<= 8-bit, <= 2-input) obligations: the evaluation sweep IS
-///   a complete proof for the width — unchanged path, `Exhaustive` strength. No
-///   tier-0 consultation (there is nothing stronger to prefer).
-/// - **Statistical** (> 8-bit / > 2-input) obligations: consult the committed
-///   tier-0 verdict DB for a candidate. A hit is revalidated by a live solver
-///   in this process before it can become `Valid` at `Formal` strength. A miss
-///   or inconclusive live result falls back to the statistical sweep unchanged.
-///   The persisted row is never proof authority by itself.
+///   a complete proof for the width — `Exhaustive` strength. No tier-0
+///   consultation (there is nothing stronger to prefer).
+/// - **Statistical** (> 8-bit / > 2-input) obligations: an exact portable
+///   certificate replay, or a committed tier-0 candidate revalidated by a live
+///   solver in this process, yields `Formal`. Otherwise the result is the
+///   evaluation sweep at its honest `Statistical` strength. No policy spends a
+///   live solve on a miss: that formal-on-miss upgrade route existed only to
+///   lift registry credit and was deleted with it. The persisted row is never
+///   proof authority by itself.
 ///
-/// Returns `(result, strength)` so the discharge site can record the ACCURATE
-/// strength (`Formal` on a tier-0 hit). Crediting is MONOTONE: every obligation
-/// that discharged `Valid` before still does; some Statistical verdicts are
-/// merely UPGRADED to live-solver-proven `Formal`. Nothing that compiled before
-/// can fail closed because a miss remains behavior-identical to the fallback.
+/// This discharges the THEOREM. It is not instruction credit: the function
+/// verifiers never bind a registry theorem to an emitted instruction.
 pub fn discharge_registry_obligation(
     obligation: &ProofObligation,
     config: &VerificationConfig,
 ) -> (VerificationResult, crate::verify::VerificationStrength) {
     use crate::verify::VerificationStrength;
     let base = VerificationStrength::for_obligation_with_config(obligation, config);
-    if matches!(base, VerificationStrength::Statistical { .. })
-        && crate::verdict_db::tier0_lookup_obligation(obligation)
-    {
-        return (VerificationResult::Valid, VerificationStrength::Formal);
+    if matches!(base, VerificationStrength::Statistical { .. }) {
+        // Portable DRAT authority is solver-independent and binds the exact
+        // canonical DB query.  Consult it before tier-0 so a missing, dirty, or
+        // differently-versioned solver cannot hide a replayable proof.
+        if crate::verdict_db::portable_cert_verified_obligation(obligation) {
+            return (VerificationResult::Valid, VerificationStrength::Formal);
+        }
+        match crate::verdict_db::tier0_lookup_obligation(obligation) {
+            crate::verdict_db::Tier0LookupOutcome::Verified => {
+                return (VerificationResult::Valid, VerificationStrength::Formal);
+            }
+            crate::verdict_db::Tier0LookupOutcome::Refuted { counterexample } => {
+                return (
+                    VerificationResult::Invalid {
+                        counterexample: format!(
+                            "live tier-0 candidate revalidation refuted the obligation: \
+                             {counterexample}"
+                        ),
+                    },
+                    base,
+                );
+            }
+            crate::verdict_db::Tier0LookupOutcome::Inconclusive
+            | crate::verdict_db::Tier0LookupOutcome::Miss => {}
+        }
     }
     (memoized_verify_by_evaluation(obligation, config), base)
 }
 
-/// PROOF-5 / TV-9 (PROOF-4 B2): discharge a RECONSTRUCTED-provenance obligation,
-/// crediting a live-revalidated (PARAMETRIC / tier-0) verdict — or, on a
-/// solver-present host, a live solver verdict — as `Formal` (SolverProven)
-/// instead of the 100k-sample `Statistical` sweep. This is the reconstructed
-/// half of the statistical-lane retirement (the registry half is
-/// [`discharge_registry_obligation`]).
+/// Discharge a target-reconstructed obligation without overstating its source
+/// authority.
 ///
-/// `instance` is the PRECISE reconstructed obligation (its baked immediate/
-/// displacement intact); `canonical` is its PARAMETRIC form used for the tier-0
-/// lookup — for the immediate-baked binary/shift RI families the immediate is a
-/// FREE variable (forall-imm; the negated equivalence stays QF_BV, so one
-/// committed row covers the WHOLE width family), and for every immediate-free
-/// family `canonical` is byte-identical to `instance`. A parametric verdict
-/// logically IMPLIES every instance (the immediate is a value of the free
-/// variable), so crediting an instance from it is strictly STRONGER than a
-/// per-instance sample sweep.
+/// `instance` is reconstructed from the real emitted opcode and positional
+/// operands. `canonical` is the corresponding free-immediate theorem retained
+/// for exact-query/certificate generation. Neither object currently binds the
+/// inferred source opcode, width, or fresh symbolic operands to the exact LIR /
+/// trust-ir instruction that caused the emission. A solver or portable
+/// certificate can therefore prove the represented target-derived theorem but
+/// cannot, by itself, prove this particular source-to-target lowering.
 ///
-/// Discharge order (Statistical `> 8`-bit obligations only — an Exhaustive
-/// `<= 8`-bit obligation's evaluation sweep is already a complete proof and is
-/// left unchanged):
+/// Until that relationship is represented by an independently checked binding
+/// token, every reconstructed obligation stays on its honest evaluation tier:
+/// `Exhaustive` for the small complete domain, otherwise `Statistical`. The
+/// canonical tier-0 rows and portable certificates remain useful, independently
+/// replayable theorem artifacts, but confer no per-instruction `Formal` credit.
 ///
-///   1. **tier-0 parametric/canonical candidate + live revalidation** →
-///      `Formal` (SolverProven). The persisted candidate never establishes the
-///      verdict itself.
-///   2. **miss + the OPT-IN live lane** (`TCG_RECON_SOLVER_ROUTE=1`, solver
-///      present) → discharge this INSTANCE live (bounded budget,
-///      process-memoized): `Verified` → `Formal`; a genuine QF_BV refutation →
-///      `Invalid` (the caller fails CLOSED — the P0 miscompile catch); an
-///      inconclusive (Timeout/Unknown/Error) result → fall through to the
-///      statistical sweep. Off by default (a per-miss solver spawn is a strict-
-///      lane choice); see [`crate::verdict_db::reconstructed_live_solver_enabled`].
-///   3. **miss (default lane, or SOLVER-ABSENT host, or inconclusive live
-///      solve)** → the statistical sweep remains a clearly-labeled `Statistical`
-///      fallback. Building without a solver — and any family not yet in the
-///      offline DB — is NEVER failed closed (that would be a completeness
-///      regression).
-///
-/// SOUNDNESS: crediting is MONOTONE — this can only turn a `Statistical` credit
-/// into a stronger `Formal` one, or (on a genuine refutation) fail closed; it
-/// NEVER credits an unproven obligation as `Formal` and NEVER weakens a gate.
-/// The M3 criterion — 0 obligations credited via `method=Statistical` on
-/// solver-present hosts — is met by step 1 for the tier-0-covered families and
-/// step 2 for the rest.
+/// This function is the UNBOUND route and its behavior is exactly that. When a
+/// caller HOLDS the binding token, it calls
+/// [`discharge_reconstructed_obligation_with_exact_source_binding`] instead;
+/// that token is unforgeable outside
+/// [`crate::x86_source_operand_binding::bind_exact_source_operands`], so the
+/// two routes cannot be confused and this one can never answer `Formal`.
 pub fn discharge_reconstructed_obligation(
     instance: &ProofObligation,
-    canonical: &ProofObligation,
+    _canonical: &ProofObligation,
     config: &VerificationConfig,
 ) -> (VerificationResult, crate::verify::VerificationStrength) {
     use crate::verify::VerificationStrength;
+
+    // Do NOT promote `instance.trust_ir_expr == instance.aarch64_expr` locally
+    // based only on `Reconstructed` provenance. That tag binds how the target
+    // tree was produced, but current architecture reconstructors can infer the
+    // nominal source op from the emitted opcode and do not bind symbolic inputs
+    // to the exact source operands. A bad source Iadd -> machine SUB can therefore
+    // self-reconstruct as `bvsub == bvsub`. A checked solver can prove that
+    // represented equality, but callers still need separately enforced exact
+    // source+operand provenance to turn it into a complete lowering claim. This
+    // function must not synthesize a local Formal verdict from identity alone.
+    // Pinned end-to-end by
+    // `reconstructed_identity_cannot_formally_self_attest_wrong_source_opcode`.
     let base = VerificationStrength::for_obligation_with_config(instance, config);
-    // Exhaustive (<=8-bit, <=2-input): the evaluation sweep IS a complete proof
-    // for the width — unchanged path, `Exhaustive` strength.
-    if !matches!(base, VerificationStrength::Statistical { .. }) {
-        return (memoized_verify_by_evaluation(instance, config), base);
-    }
-    // (1) Persisted PARAMETRIC candidate, independently revalidated live.
-    if crate::verdict_db::tier0_lookup_obligation(canonical) {
-        return (VerificationResult::Valid, VerificationStrength::Formal);
-    }
-    // (2) SOLVER-PRESENT miss: discharge this instance LIVE so the credit is
-    // SolverProven, never a sampled sweep (M3). Inconclusive → statistical.
-    if crate::verdict_db::reconstructed_live_solver_enabled() {
-        match crate::verdict_db::live_discharge_reconstructed(instance) {
-            Some(VerificationResult::Valid) => {
-                return (VerificationResult::Valid, VerificationStrength::Formal);
-            }
-            Some(invalid @ VerificationResult::Invalid { .. }) => {
-                // A genuine QF_BV counterexample → fail closed (P0 catch).
-                return (invalid, base);
-            }
-            // Inconclusive / unavailable: fall through to the statistical sweep.
-            _ => {}
-        }
-    }
-    // (3) SOLVER-ABSENT (or inconclusive live solve) fallback — honest
-    // `Statistical` label, never fail-closed for lack of a solver.
     (memoized_verify_by_evaluation(instance, config), base)
+}
+
+/// Discharge a target-reconstructed obligation whose symbolic inputs ARE bound
+/// to the exact operands of an identified source instruction (TV-1 EXTENDED).
+///
+/// This is the same reconstructed route as
+/// [`discharge_reconstructed_obligation`] over the same obligation; the only
+/// difference is that the caller has supplied an
+/// [`crate::x86_source_operand_binding::ExactSourceOperandBinding`], the witness
+/// that the third provenance ingredient — operand identity — was checked. That
+/// witness cannot be constructed outside
+/// [`crate::x86_source_operand_binding::bind_exact_source_operands`], so the
+/// `Formal` credit below is reachable only through the checked binding.
+///
+/// # Why `Formal` is warranted HERE and refused there
+///
+/// [`discharge_reconstructed_obligation`] refuses a local `Formal` verdict
+/// because the reconstruction's source side is inferred from the emitted opcode
+/// and its symbols are fresh: a bad source `Iadd` lowered to a machine `SUB`
+/// self-reconstructs as `bvsub == bvsub`, which a solver proves without saying
+/// anything about the lowering. Under the witness both defects are excluded:
+/// the source operation was checked EQUAL to the replayed source instruction's
+/// opcode (so the obligation reads `⟦S⟧ == ⟦M⟧` and a wrong selection refutes),
+/// and each symbol stands for the exact machine operand ISel recorded for the
+/// corresponding operand of that instruction. Nothing in the chain is sampled:
+/// the binding is a decidable syntactic check and the equality is discharged by
+/// an exact portable DRAT certificate or a tier-0 candidate revalidated by a
+/// live checked solver, both keyed on THIS obligation's content.
+///
+/// # WHAT THIS REACHES IN PRACTICE, measured
+///
+/// Those two are now the WHOLE list. The E0.2/E0.5 withdrawal deleted
+/// `try_formal_on_miss`, the tier-0 MISS arm that ran one live checked solve, so
+/// a freshly reconstructed obligation with no committed artifact has nothing
+/// left to reach `Formal` with and takes the fallback below. MEASURED on Linux
+/// x86-64 (`reports/perf/2026-09-27-linux-x86-64-xd01-on-current-upstream/`),
+/// that is every bound row on the eight floor targets: the binding's current
+/// contribution is refutation and refusal, not credit. The `Formal` arm is kept
+/// because it is the honest verdict for a bound obligation that DOES have a
+/// committed certificate or row, and because it is the arm a future
+/// source-bound live lane for x86-64 would discharge through — not because
+/// anything on this host takes it today.
+///
+/// A non-`Formal` outcome falls back to
+/// [`discharge_reconstructed_obligation`] verbatim, so a missing artifact, a
+/// disabled verdict database, or an inconclusive answer LOWERS to the existing
+/// honest tier rather than granting anything.
+///
+/// The binding's boundary (what a `Formal` credit here does and does not cover)
+/// is stated on [`crate::x86_source_operand_binding`]; it is not repeated here
+/// so the two cannot drift.
+pub(crate) fn discharge_reconstructed_obligation_with_exact_source_binding(
+    instance: &ProofObligation,
+    canonical: &ProofObligation,
+    config: &VerificationConfig,
+    _binding: &crate::x86_source_operand_binding::ExactSourceOperandBinding,
+) -> (VerificationResult, crate::verify::VerificationStrength) {
+    use crate::verify::VerificationStrength;
+
+    // The INSTANCE obligation is what gets routed, never the parametric
+    // `canonical` form: crediting the instance from a free-immediate
+    // generalization would need a substitution argument the binding does not
+    // supply. `canonical` stays an artifact-identity carrier here, exactly as on
+    // the unbound route.
+    //
+    // WHICH ROUTE, after E0.2/E0.5. The live formal-on-miss upgrade is gone, so
+    // the only ways this obligation reaches `Formal` are the two that replay a
+    // committed artifact against THIS obligation's content: an exact portable
+    // DRAT certificate, or a tier-0 candidate revalidated by a live checked
+    // solver. Both are content-keyed on the instance, neither is a name lookup,
+    // and neither was reintroduced here — `discharge_registry_obligation` is
+    // called for those two lanes only, and it spends no solve on a miss.
+    let (result, strength) = discharge_registry_obligation(instance, config);
+    if matches!(strength, VerificationStrength::Formal)
+        && matches!(result, VerificationResult::Valid)
+    {
+        return (result, strength);
+    }
+    // A REFUTATION from the registry route is the mechanism's content and must
+    // not be discarded by falling back to sampling.
+    if matches!(result, VerificationResult::Invalid { .. }) {
+        return (result, strength);
+    }
+    discharge_reconstructed_obligation(instance, canonical, config)
 }
 
 /// Test-only probe: does the shared memo hold a verdict for exactly this
@@ -1059,29 +1368,22 @@ fn verify_random_multi(
     // a fresh HashMap allocation + per-input String-key clone on every one of the
     // up-to-100k samples. Verdict-identical: the env contents at each check are
     // exactly what `build_env_edge`/`build_env_multi` produced before.
-    let mut env = EvalEnv::default();
-    for (name, _) in &obligation.inputs {
-        env.insert(name.clone(), 0);
-    }
+    let mut env = multi_input_sweep_env(obligation);
 
     // Reused FlatProg scratch tape (owned by the sample loop, like `env`), so the
     // compiled fast path allocates nothing per sample.
     let mut scratch: Vec<SVal> = Vec::new();
 
-    // Edge cases: cycle through multiple edge-case combinations
-    let num_edge_combos = 36;
-    for edge_idx in 0..num_edge_combos {
-        fill_env_edge(&mut env, &obligation.inputs, edge_idx);
-        match check_single_point(obligation, compiled, &env, &mut scratch) {
-            PointCheck::Counterexample(result) => return result,
-            // Sampling CANNOT distinguish an unsatisfiable precondition from a
-            // merely-rare one, so it does NOT downgrade to Unknown here (that is
-            // only sound on the EXHAUSTIVE path). See `verify_exhaustive` /
-            // `sweep_verdict`; the z3 path's satisfiability gate is the real
-            // vacuous-proof protection.
-            PointCheck::Equal | PointCheck::PreconditionUnmet => {}
-        }
-    }
+    // Edge cases: cycle through multiple edge-case combinations. Every point
+    // at which the preconditions held is counted: sampling CANNOT distinguish
+    // an unsatisfiable precondition from a merely-rare one, so a sweep in which
+    // NO point satisfied them has compared nothing and ends `Unknown`, never
+    // `Valid` (`sampled_sweep_verdict`).
+    let edge_satisfied =
+        match multi_input_edge_battery(obligation, compiled, &mut env, &mut scratch) {
+            Ok(satisfied) => satisfied,
+            Err(verdict) => return verdict,
+        };
 
     // Random trials: the SAME sample sequence the sequential loop always drew,
     // split into ordered chunks across the current rayon pool (or run whole on
@@ -1091,74 +1393,342 @@ fn verify_random_multi(
     } else {
         (1, trials)
     };
-    if chunks <= 1 {
-        return random_chunk_multi(obligation, compiled, rng_state, 0, trials, &env)
-            .unwrap_or(VerificationResult::Valid);
-    }
-    let job = {
-        let ob = Arc::new(obligation.clone());
-        let co = compiled.map(|c| Arc::new(c.clone()));
-        let env = Arc::new(env);
-        Arc::new(move |start, count| {
-            random_chunk_multi(&ob, co.as_deref(), rng_state, start, count, &env)
-        })
+    let random = if chunks <= 1 {
+        random_chunk_multi(obligation, compiled, rng_state, 0, trials, &env)
+    } else {
+        let job = {
+            let ob = Arc::new(obligation.clone());
+            let co = compiled.map(|c| Arc::new(c.clone()));
+            let env = Arc::new(env.clone());
+            Arc::new(move |start, count| {
+                random_chunk_multi(&ob, co.as_deref(), rng_state, start, count, &env)
+            })
+        };
+        fan_out_chunks(trials, chunks, per, job)
     };
-    fan_out_chunks(trials, chunks, per, job).unwrap_or(VerificationResult::Valid)
+    let random_satisfied = match random {
+        Ok(satisfied) => satisfied,
+        Err(verdict) => return verdict,
+    };
+
+    // Precondition-directed trials (NEW-CG-SAMPLER): the uniform draws above
+    // are consecutive outputs of one LCG, so they can never reach a
+    // precondition that RELATES inputs (two aligned addresses, `x == y`) or
+    // pins one to a constant. These points come from an independent stream and
+    // are built from the preconditions' own constants and from earlier inputs,
+    // then checked exactly like every other point: a point that misses the
+    // preconditions compares nothing, one that meets them compares both sides.
+    let directed = directed_trial_count(obligation, trials);
+    let directed_satisfied = match directed_chunk_multi(obligation, compiled, directed, &mut env) {
+        Ok(satisfied) => satisfied,
+        Err(verdict) => return verdict,
+    };
+    sampled_sweep_verdict(
+        edge_satisfied
+            .saturating_add(random_satisfied)
+            .saturating_add(directed_satisfied),
+        MULTI_INPUT_EDGE_COMBOS
+            .saturating_add(trials)
+            .saturating_add(directed),
+    )
 }
 
-/// Exhaustive verification for small bit-widths.
-fn verify_exhaustive(
-    obligation: &ProofObligation,
-    compiled: Option<&CompiledObligation>,
-    width: u32,
-) -> VerificationResult {
-    let max_val = 1u64 << width;
-    let num_inputs = obligation.inputs.len();
+/// Edge-case combinations the multi-input sweep evaluates before its random
+/// trials (`fill_env_edge` indices `0..MULTI_INPUT_EDGE_COMBOS`).
+const MULTI_INPUT_EDGE_COMBOS: u64 = 36;
 
-    // Reused FlatProg scratch tape across all exhaustive points.
-    let mut scratch: Vec<SVal> = Vec::new();
+/// Most precondition-directed trials one multi-input sweep adds.
+const DIRECTED_TRIAL_CAP: u64 = 16_384;
 
-    let mut saw_satisfying = false;
-    if num_inputs == 1 {
-        let name = &obligation.inputs[0].0;
-        let mut env = EvalEnv::default();
-        env.insert(name.clone(), 0);
-        for a in 0..max_val {
-            *env.get_mut(name).expect("exhaustive input must be bound") = a;
-            match check_single_point(obligation, compiled, &env, &mut scratch) {
-                PointCheck::Counterexample(result) => return result,
-                PointCheck::Equal => saw_satisfying = true,
-                PointCheck::PreconditionUnmet => {}
+/// Precondition-directed trials for `obligation`: none without preconditions
+/// (every uniform draw already satisfies them), otherwise as many as the
+/// uniform trials up to [`DIRECTED_TRIAL_CAP`] — so a sweep configured with no
+/// random trials stays the edge battery alone.
+fn directed_trial_count(obligation: &ProofObligation, trials: u64) -> u64 {
+    if obligation.preconditions.is_empty() {
+        0
+    } else {
+        trials.min(DIRECTED_TRIAL_CAP)
+    }
+}
+
+/// Every bitvector constant in `obligation`'s preconditions, plus 0 and 1:
+/// the values a precondition such as `is_fixed == 1`, `region_len == 4` or
+/// `x < 2^24` names or bounds.
+fn precondition_constants(obligation: &ProofObligation) -> Vec<u64> {
+    fn walk(expr: &SmtExpr, out: &mut Vec<u64>) {
+        if let SmtExpr::BvConst { value, .. } = expr {
+            out.push(*value);
+        }
+        expr.for_each_child(&mut |child| walk(child, out));
+    }
+    let mut constants = vec![0, 1];
+    for pre in &obligation.preconditions {
+        walk(pre, &mut constants);
+    }
+    constants.sort_unstable();
+    constants.dedup();
+    constants
+}
+
+/// SplitMix64: the directed trials' generator. Its outputs are independent
+/// of the sampling LCG and have no fixed relation between consecutive draws.
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Fill `env` with one precondition-directed point. Each input independently
+/// takes one of: a uniform value; a constant from the preconditions; a small
+/// value; a uniform value aligned to 2..64 bytes; an EARLIER input's value
+/// plus a small signed power-of-two offset (equal, adjacent or disjoint
+/// addresses, `x == y`); or an edge value. Every value is masked to its
+/// input's width.
+fn fill_env_directed(
+    env: &mut EvalEnv,
+    inputs: &[(String, u32)],
+    constants: &[u64],
+    state: &mut u64,
+    chosen: &mut Vec<u64>,
+) {
+    chosen.clear();
+    for (index, (name, width)) in inputs.iter().enumerate() {
+        let draw = splitmix64(state);
+        let pick = splitmix64(state);
+        let value = match draw % 8 {
+            2 => constants[(pick % constants.len() as u64) as usize],
+            3 => pick % 64,
+            4 => pick & !((1u64 << (1 + pick % 6)) - 1),
+            5 | 6 if index > 0 => {
+                let base = chosen[(pick % index as u64) as usize];
+                let magnitude = if pick & (1 << 16) == 0 {
+                    0
+                } else {
+                    1u64 << ((pick >> 8) % 8)
+                };
+                if pick & (1 << 17) == 0 {
+                    base.wrapping_add(magnitude)
+                } else {
+                    base.wrapping_sub(magnitude)
+                }
+            }
+            7 => {
+                let top = mask(u64::MAX, *width);
+                let sign = 1u64 << width.saturating_sub(1).min(63);
+                [0, 1, top, top.wrapping_sub(1), sign, sign.wrapping_sub(1)][(pick % 6) as usize]
+            }
+            _ => pick,
+        };
+        let value = mask(value, *width);
+        chosen.push(value);
+        if let Some(slot) = env.get_mut(name) {
+            *slot = value;
+        }
+    }
+}
+
+/// A precondition the directed trials solve directly, after drawing a point.
+enum DirectedRepair {
+    /// `input == expr` (either side), `expr` not naming `input`: assign it.
+    Assign {
+        name: String,
+        width: u32,
+        expr: SmtExpr,
+    },
+    /// `(input & mask) == value` (either operand order), `value` within
+    /// `mask`: force those bits.
+    Bits {
+        name: String,
+        width: u32,
+        mask: u64,
+        value: u64,
+    },
+}
+
+/// Whether `expr` reads the variable `name`.
+fn mentions_var(expr: &SmtExpr, name: &str) -> bool {
+    if let SmtExpr::Var { name: var, .. } = expr {
+        return var == name;
+    }
+    let mut found = false;
+    expr.for_each_child(&mut |child| found = found || mentions_var(child, name));
+    found
+}
+
+/// The equality preconditions of `obligation` that pin one input: to another
+/// expression (`assigned_preg == fixed_preg`, `expected == *addr_a`,
+/// `region_len == 4`) or to fixed low bits (`addr & 7 == 0`). Every other
+/// precondition is left to the draw.
+fn directed_repairs(obligation: &ProofObligation) -> Vec<DirectedRepair> {
+    let input = |expr: &SmtExpr| match expr {
+        SmtExpr::Var { name, width }
+            if obligation
+                .inputs
+                .iter()
+                .any(|(input, w)| input == name && w == width) =>
+        {
+            Some((name.clone(), *width))
+        }
+        _ => None,
+    };
+    let mut repairs = Vec::new();
+    for pre in &obligation.preconditions {
+        let SmtExpr::Eq { lhs, rhs } = pre else {
+            continue;
+        };
+        for (side, other) in [(lhs, rhs), (rhs, lhs)] {
+            if let Some((name, width)) = input(side) {
+                if !mentions_var(other, &name) {
+                    repairs.push(DirectedRepair::Assign {
+                        name,
+                        width,
+                        expr: (**other).clone(),
+                    });
+                    break;
+                }
+                continue;
+            }
+            let (SmtExpr::BvAnd { lhs: a, rhs: b, .. }, SmtExpr::BvConst { value, .. }) =
+                (side.as_ref(), other.as_ref())
+            else {
+                continue;
+            };
+            let bits = match (a.as_ref(), b.as_ref()) {
+                (var, SmtExpr::BvConst { value: mask, .. })
+                | (SmtExpr::BvConst { value: mask, .. }, var) => input(var).map(|v| (v, *mask)),
+                _ => None,
+            };
+            if let Some(((name, width), mask)) = bits
+                && value & !mask == 0
+            {
+                repairs.push(DirectedRepair::Bits {
+                    name,
+                    width,
+                    mask,
+                    value: *value,
+                });
+                break;
             }
         }
-    } else if num_inputs == 2 {
-        let name_a = &obligation.inputs[0].0;
-        let name_b = &obligation.inputs[1].0;
-        let same_name = name_a == name_b;
-        let mut env = EvalEnv::default();
-        env.insert(name_a.clone(), 0);
-        env.insert(name_b.clone(), 0);
-        for a in 0..max_val {
-            if !same_name {
-                *env.get_mut(name_a)
-                    .expect("first exhaustive input must be bound") = a;
+    }
+    repairs
+}
+
+/// Apply `repairs` in precondition order to the drawn point in `env`. A
+/// repair whose expression does not evaluate to a bitvector leaves the drawn
+/// value; the point is checked against every precondition either way.
+fn apply_directed_repairs(env: &mut EvalEnv, repairs: &[DirectedRepair]) {
+    for repair in repairs {
+        match repair {
+            DirectedRepair::Assign { name, width, expr } => {
+                if let Ok(crate::smt::EvalResult::Bv(value)) = expr.try_eval(&*env)
+                    && let Some(slot) = env.get_mut(name)
+                {
+                    *slot = mask(value, *width);
+                }
             }
-            for b in 0..max_val {
-                *env.get_mut(name_b)
-                    .expect("second exhaustive input must be bound") = b;
-                match check_single_point(obligation, compiled, &env, &mut scratch) {
-                    PointCheck::Counterexample(result) => return result,
-                    PointCheck::Equal => saw_satisfying = true,
-                    PointCheck::PreconditionUnmet => {}
+            DirectedRepair::Bits {
+                name,
+                width,
+                mask: bits,
+                value,
+            } => {
+                if let Some(slot) = env.get_mut(name) {
+                    *slot = mask((*slot & !bits) | value, *width);
                 }
             }
         }
-    } else {
-        return VerificationResult::Unknown {
-            reason: format!("exhaustive check not implemented for {} inputs", num_inputs),
-        };
     }
+}
 
+/// The multi-input sweep's `count` precondition-directed points: each is
+/// drawn by [`fill_env_directed`], then the equality preconditions that pin
+/// one input are solved for it ([`directed_repairs`]). Seeded from the
+/// obligation name so the sweep stays reproducible. Returns as
+/// [`random_chunk_multi`] does.
+fn directed_chunk_multi(
+    obligation: &ProofObligation,
+    compiled: Option<&CompiledObligation>,
+    count: u64,
+    env: &mut EvalEnv,
+) -> Result<u64, VerificationResult> {
+    if count == 0 {
+        return Ok(0);
+    }
+    let constants = precondition_constants(obligation);
+    let repairs = directed_repairs(obligation);
+    let mut state = sample_seed(&obligation.name) ^ 0x5eed_d1ec_7ed0_0001;
+    let mut chosen = Vec::with_capacity(obligation.inputs.len());
+    let mut scratch: Vec<SVal> = Vec::new();
+    let mut satisfied = 0u64;
+    for _ in 0..count {
+        fill_env_directed(env, &obligation.inputs, &constants, &mut state, &mut chosen);
+        apply_directed_repairs(env, &repairs);
+        check_single_point(obligation, compiled, env, &mut scratch).tally(&mut satisfied)?;
+    }
+    Ok(satisfied)
+}
+
+/// The multi-input sweep's reusable env: one slot per input name.
+fn multi_input_sweep_env(obligation: &ProofObligation) -> EvalEnv {
+    let mut env = EvalEnv::default();
+    for (name, _) in &obligation.inputs {
+        env.insert(name.clone(), 0);
+    }
+    env
+}
+
+/// The multi-input sweep's edge battery: `Ok(n)` with the number of points at
+/// which every precondition held (and the two sides agreed), or the first
+/// terminal verdict.
+fn multi_input_edge_battery(
+    obligation: &ProofObligation,
+    compiled: Option<&CompiledObligation>,
+    env: &mut EvalEnv,
+    scratch: &mut Vec<SVal>,
+) -> Result<u64, VerificationResult> {
+    let mut satisfied = 0u64;
+    for edge_idx in 0..MULTI_INPUT_EDGE_COMBOS as usize {
+        fill_env_edge(env, &obligation.inputs, edge_idx);
+        check_single_point(obligation, compiled, env, scratch).tally(&mut satisfied)?;
+    }
+    Ok(satisfied)
+}
+
+/// Enumerate the complete Cartesian input domain with a mixed-radix counter.
+/// The last coordinate changes fastest; only carry-affected bindings are
+/// updated. Scratch and the environment are allocated once, not per tuple.
+fn verify_exhaustive(
+    obligation: &ProofObligation,
+    compiled: Option<&CompiledObligation>,
+    input_count: u64,
+) -> VerificationResult {
+    let mut scratch: Vec<SVal> = Vec::new();
+    let mut env = EvalEnv::default();
+    for (name, _) in &obligation.inputs {
+        env.insert(name.clone(), 0);
+    }
+    let mut saw_satisfying = false;
+    for _ in 0..input_count {
+        match check_single_point(obligation, compiled, &env, &mut scratch) {
+            PointCheck::Counterexample(result) => return result,
+            PointCheck::Inconclusive(reason) => return VerificationResult::Unknown { reason },
+            PointCheck::Equal => saw_satisfying = true,
+            PointCheck::PreconditionUnmet => {}
+        }
+        for (name, width) in obligation.inputs.iter().rev() {
+            let value = env.get_mut(name).expect("exhaustive input must be bound");
+            *value += 1;
+            if *value < (1u64 << *width) {
+                break;
+            }
+            *value = 0;
+        }
+    }
     sweep_verdict(obligation, saw_satisfying)
 }
 
@@ -1173,50 +1743,27 @@ fn verify_random(
     // We use a linear congruential generator seeded from the rule name hash.
     let rng_state = sample_seed(&obligation.name);
 
-    let mask_val = mask(u64::MAX, width);
-
-    // Always test edge cases first: 0, 1, max, midpoints. EvalEnv stores
-    // concrete samples as u64, so widths above 64 use the representable
-    // carrier's high bit; shifting a u64 by an i128-width count would panic in
-    // debug builds and provides no additional sample information.
-    let sampled_sign_bit = 1u64 << width.saturating_sub(1).min(63);
-    let edge_cases: Vec<u64> = vec![
-        0,
-        1,
-        mask_val,
-        mask_val.wrapping_sub(1),
-        sampled_sign_bit,
-        sampled_sign_bit.wrapping_sub(1),
-    ];
-
     // Reuse ONE env across all samples: insert the (≤2) input keys once, then
     // update their values in place each iteration — avoids a per-sample HashMap
     // alloc + String-key clone. Verdict-identical to the old per-sample
     // `build_env`.
-    let mut env = EvalEnv::default();
-    if let Some((name, _)) = obligation.inputs.first() {
-        env.insert(name.clone(), 0);
-    }
-    if let Some((name, _)) = obligation.inputs.get(1) {
-        env.insert(name.clone(), 0);
-    }
+    let mut env = two_input_sweep_env(obligation);
 
     // Reused FlatProg scratch tape across all samples.
     let mut scratch: Vec<SVal> = Vec::new();
 
-    // Sampling path: cannot prove a precondition unsatisfiable (only the
-    // exhaustive path can), so it never downgrades to Unknown — it reports
-    // "no counterexample found", exactly as before. The z3 satisfiability gate
-    // is the real vacuous-proof protection.
-    for a_val in &edge_cases {
-        for b_val in &edge_cases {
-            fill_env_2(&mut env, &obligation.inputs, *a_val, Some(*b_val), width);
-            match check_single_point(obligation, compiled, &env, &mut scratch) {
-                PointCheck::Counterexample(result) => return result,
-                PointCheck::Equal | PointCheck::PreconditionUnmet => {}
-            }
-        }
-    }
+    // Sampling path: it cannot prove a precondition unsatisfiable (only the
+    // exhaustive path can), but it does not need to. Every point at which the
+    // preconditions held is counted, and a sweep in which NO point satisfied
+    // them compared nothing, so it ends `Unknown` rather than `Valid`
+    // (`sampled_sweep_verdict`) — whether the precondition is unsatisfiable or
+    // merely never sampled. The solver path's satisfiability gate remains the
+    // protection for a precondition that sampling does satisfy.
+    let edge_satisfied =
+        match two_input_edge_battery(obligation, compiled, width, &mut env, &mut scratch) {
+            Ok(satisfied) => satisfied,
+            Err(verdict) => return verdict,
+        };
 
     // Same sample sequence as ever, in ordered chunks across the current pool
     // (see `fan_out_chunks`); each sample draws twice from the LCG.
@@ -1225,19 +1772,127 @@ fn verify_random(
     } else {
         (1, trials)
     };
-    if chunks <= 1 {
-        return random_chunk_2(obligation, compiled, width, rng_state, 0, trials, &env)
-            .unwrap_or(VerificationResult::Valid);
-    }
-    let job = {
-        let ob = Arc::new(obligation.clone());
-        let co = compiled.map(|c| Arc::new(c.clone()));
-        let env = Arc::new(env);
-        Arc::new(move |start, count| {
-            random_chunk_2(&ob, co.as_deref(), width, rng_state, start, count, &env)
-        })
+    let random = if chunks <= 1 {
+        random_chunk_2(obligation, compiled, width, rng_state, 0, trials, &env)
+    } else {
+        let job = {
+            let ob = Arc::new(obligation.clone());
+            let co = compiled.map(|c| Arc::new(c.clone()));
+            let env = Arc::new(env);
+            Arc::new(move |start, count| {
+                random_chunk_2(&ob, co.as_deref(), width, rng_state, start, count, &env)
+            })
+        };
+        fan_out_chunks(trials, chunks, per, job)
     };
-    fan_out_chunks(trials, chunks, per, job).unwrap_or(VerificationResult::Valid)
+    match random {
+        Ok(random_satisfied) => sampled_sweep_verdict(
+            edge_satisfied.saturating_add(random_satisfied),
+            TWO_INPUT_EDGE_POINTS.saturating_add(trials),
+        ),
+        Err(verdict) => verdict,
+    }
+}
+
+/// Points in the shared-width sweep's edge battery: every ordered pair of the
+/// six [`two_input_edge_cases`] values.
+const TWO_INPUT_EDGE_POINTS: u64 = 36;
+
+/// The six edge values of the shared-width (≤ 2 input) sweep: 0, 1, max,
+/// max - 1 and the sign-bit midpoints. EvalEnv stores concrete samples as u64,
+/// so widths above 64 use the representable carrier's high bit; shifting a u64
+/// by an i128-width count would panic in debug builds and provides no
+/// additional sample information.
+fn two_input_edge_cases(width: u32) -> [u64; 6] {
+    let mask_val = mask(u64::MAX, width);
+    let sampled_sign_bit = 1u64 << width.saturating_sub(1).min(63);
+    [
+        0,
+        1,
+        mask_val,
+        mask_val.wrapping_sub(1),
+        sampled_sign_bit,
+        sampled_sign_bit.wrapping_sub(1),
+    ]
+}
+
+/// The shared-width sweep's reusable env: slots for the (≤ 2) inputs it fills.
+fn two_input_sweep_env(obligation: &ProofObligation) -> EvalEnv {
+    let mut env = EvalEnv::default();
+    for (name, _) in obligation.inputs.iter().take(2) {
+        env.insert(name.clone(), 0);
+    }
+    env
+}
+
+/// The shared-width sweep's edge battery: `Ok(n)` with the number of points
+/// at which every precondition held (and the two sides agreed), or the first
+/// terminal verdict.
+fn two_input_edge_battery(
+    obligation: &ProofObligation,
+    compiled: Option<&CompiledObligation>,
+    width: u32,
+    env: &mut EvalEnv,
+    scratch: &mut Vec<SVal>,
+) -> Result<u64, VerificationResult> {
+    let edge_cases = two_input_edge_cases(width);
+    let mut satisfied = 0u64;
+    for a_val in edge_cases {
+        for b_val in edge_cases {
+            fill_env_2(env, &obligation.inputs, a_val, Some(b_val), width);
+            check_single_point(obligation, compiled, env, scratch).tally(&mut satisfied)?;
+        }
+    }
+    Ok(satisfied)
+}
+
+/// Fold a SAMPLING sweep (no counterexample, no inconclusive point) into its
+/// verdict. `satisfied` counts the sampled points at which every precondition
+/// held and the two sides were compared (and agreed); `attempted` counts every
+/// sampled point, edge battery included.
+///
+/// A sweep with `satisfied == 0` compared NOTHING: every point was excluded by
+/// the preconditions, so its lack of a counterexample is no evidence at all.
+/// Sampling cannot tell an unsatisfiable precondition from one it merely never
+/// hit, so it claims neither — the verdict is an explicit `Unknown`, never
+/// `Valid`. This is the sampling twin of the exhaustive path's
+/// [`sweep_verdict`], and the same rule the checked scalar FP lanes apply.
+fn sampled_sweep_verdict(satisfied: u64, attempted: u64) -> VerificationResult {
+    if satisfied == 0 {
+        return VerificationResult::Unknown {
+            reason: format!(
+                "vacuous sample: none of the {attempted} sampled inputs satisfied the \
+                 preconditions, so the sweep compared nothing; sampling cannot tell an \
+                 unsatisfiable precondition from one it never hit"
+            ),
+        };
+    }
+    VerificationResult::Valid
+}
+
+/// Whether an identical-sided, trap-free compiled obligation's full sweep is
+/// already known to return `Valid`: the sides cannot disagree at any point (see
+/// the short-circuit in [`verify_by_evaluation_with_config`]), so the sweep's
+/// verdict is `Valid` exactly when some sampled point satisfies every
+/// precondition. With no preconditions every point does. Otherwise look for a
+/// satisfying point in the sweep's OWN edge battery (the same points, in the
+/// same env, that the dispatching sweep evaluates first); `false` means "not
+/// known yet", and the caller runs the full sweep, which then decides between
+/// `Valid` and the vacuous-sample `Unknown` on all of its points.
+fn identical_sides_edge_witness(obligation: &ProofObligation, co: &CompiledObligation) -> bool {
+    if obligation.preconditions.is_empty() {
+        return true;
+    }
+    let mut scratch: Vec<SVal> = Vec::new();
+    let edges = if needs_multi_input_sampling(obligation) {
+        let mut env = multi_input_sweep_env(obligation);
+        multi_input_edge_battery(obligation, Some(co), &mut env, &mut scratch)
+    } else {
+        let width = obligation.inputs.first().map(|(_, w)| *w).unwrap_or(32);
+        let mut env = two_input_sweep_env(obligation);
+        two_input_edge_battery(obligation, Some(co), width, &mut env, &mut scratch)
+    };
+    matches!(edges, Ok(satisfied) if satisfied > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,8 +1912,13 @@ fn verify_random(
 //   would have reached (O(log n), no iteration). Chunk `i` therefore draws
 //   precisely samples `[i·per, (i+1)·per)` of the original sequence.
 // * The verdict AND the reported counterexample. Chunks are ordered; the first
-//   `Some` in chunk order is the globally-first counterexample, exactly what
-//   the sequential loop's early return produced.
+//   `Err` in chunk order is the globally-first counterexample (or
+//   inconclusive point), exactly what the sequential loop's early return
+//   produced.
+// * The evidence count. Every chunk returns how many of its samples satisfied
+//   the preconditions, and the counts of ALL chunks are summed, so the
+//   vacuous-sample decision (`sampled_sweep_verdict`) sees the same number
+//   the sequential loop counts.
 // * `DEFAULT_SAMPLE_COUNT` and the certificate it is stamped into. The count
 //   of samples drawn is unchanged; only which thread draws them differs.
 // * The recursive evaluator's stack. Only compiled (flat-tape) obligations are
@@ -1374,8 +2034,14 @@ fn sample_chunking(trials: u64) -> (u64, u64) {
 }
 
 /// Fan `chunks` chunks of the sample sequence out across the CURRENT rayon
-/// pool and return the FIRST counterexample in sequence order (chunks are
-/// ordered; a counterexample in chunk `i` precedes every sample of `i+1`).
+/// pool and return the FIRST terminal verdict (counterexample or inconclusive
+/// point) in sequence order (chunks are ordered; a counterexample in chunk `i`
+/// precedes every sample of `i+1`), else `Ok` with the total number of points
+/// at which every precondition held, summed over ALL chunks — the evidence
+/// count [`sampled_sweep_verdict`] needs. Every chunk runs to completion before
+/// this returns, so the sum covers the whole sequence; a chunk with no
+/// recorded result (which the protocol below rules out) fails closed as
+/// `Unknown` rather than contributing zero.
 ///
 /// The calling worker is inside a memo cell's compute-once closure
 /// (`memoized_verify_by_evaluation`), and other workers that reach that cell
@@ -1400,13 +2066,13 @@ fn fan_out_chunks(
     trials: u64,
     chunks: u64,
     per: u64,
-    job: Arc<dyn Fn(u64, u64) -> Option<VerificationResult> + Send + Sync>,
-) -> Option<VerificationResult> {
+    job: Arc<dyn Fn(u64, u64) -> Result<u64, VerificationResult> + Send + Sync>,
+) -> Result<u64, VerificationResult> {
     use std::sync::atomic::{AtomicU64, Ordering};
-    type Job = dyn Fn(u64, u64) -> Option<VerificationResult> + Send + Sync;
+    type Job = dyn Fn(u64, u64) -> Result<u64, VerificationResult> + Send + Sync;
     struct Shared {
         next: AtomicU64,
-        results: std::sync::Mutex<Vec<Option<VerificationResult>>>,
+        results: std::sync::Mutex<Vec<Option<Result<u64, VerificationResult>>>>,
         in_flight: std::sync::Mutex<usize>,
         drained: std::sync::Condvar,
     }
@@ -1421,12 +2087,11 @@ fn fan_out_chunks(
             }
             let start = i * per;
             let count = trials.saturating_sub(start).min(per);
-            if let Some(result) = job(start, count) {
-                shared
-                    .results
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)[i as usize] = Some(result);
-            }
+            let result = job(start, count);
+            shared
+                .results
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[i as usize] = Some(result);
             ran += 1;
         }
     }
@@ -1486,21 +2151,39 @@ fn fan_out_chunks(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
-    results.into_iter().flatten().next()
+    let mut satisfied = 0u64;
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Some(Ok(count)) => satisfied = satisfied.saturating_add(count),
+            Some(Err(verdict)) => return Err(verdict),
+            None => {
+                return Err(VerificationResult::Unknown {
+                    reason: format!("sample chunk {i} of {chunks} recorded no result"),
+                });
+            }
+        }
+    }
+    Ok(satisfied)
 }
 
-/// The lanes of one batch that FAIL: precondition met (`EvalResult::as_bool`
-/// of every precondition), sides not `semantically_equal`. Bit `l` = lane `l`.
-/// Exactly `check_single_point`'s decision per lane, on the batched tapes:
-/// equal iff neither side is Poison, both roots have the same sort, and the
-/// values agree. A failing lane is always re-checked by the scalar
+/// One batch's per-lane decision (bit `l` = lane `l`): `met` = every
+/// precondition held (`EvalResult::as_bool` of each), `fail` = met AND the
+/// sides are not `semantically_equal` (so `fail` ⊆ `met`). Exactly
+/// `check_single_point`'s decision per lane, on the batched tapes: equal iff
+/// neither side is Poison, both roots have the same sort, and the values
+/// agree. A failing lane is always re-checked by the scalar
 /// `check_single_point` (which also renders the counterexample text), so a
 /// spurious failure here costs one scalar evaluation and changes nothing.
+struct BatchCheck {
+    met: u8,
+    fail: u8,
+}
+
 fn check_batch(
     cb: &CompiledBatch,
     inputs: &[[u64; BATCH_LANES]],
     scratch: &mut BatchScratch,
-) -> u8 {
+) -> BatchCheck {
     let mut met: u8 = u8::MAX;
     for pc in &cb.preconds {
         let root = pc.eval_batch(inputs, scratch);
@@ -1510,7 +2193,7 @@ fn check_batch(
             }
         }
         if met == 0 {
-            return 0;
+            return BatchCheck { met: 0, fail: 0 };
         }
     }
     let t = cb.trust_ir.eval_batch(inputs, scratch);
@@ -1530,7 +2213,30 @@ fn check_batch(
             fail |= bit;
         }
     }
-    fail
+    BatchCheck { met, fail }
+}
+
+/// Tally one batch into a chunk's running count of compared points: lanes the
+/// batch found met and equal count directly; each failing lane is re-checked
+/// by the scalar [`check_single_point`] at the identical env (`recheck_lane(l)`
+/// fills lane `l` into the env and runs it), whose decision is authoritative —
+/// `Equal` counts, `PreconditionUnmet` does not, and a counterexample or
+/// inconclusive point is the chunk's terminal verdict.
+fn tally_batch(
+    check: BatchCheck,
+    live: u8,
+    satisfied: &mut u64,
+    mut recheck_lane: impl FnMut(usize) -> PointCheck,
+) -> Result<(), VerificationResult> {
+    let met = check.met & live;
+    let mut fail = check.fail & met;
+    *satisfied = satisfied.saturating_add(u64::from((met & !fail).count_ones()));
+    while fail != 0 {
+        let l = fail.trailing_zeros() as usize;
+        fail &= fail - 1;
+        recheck_lane(l).tally(satisfied)?;
+    }
+    Ok(())
 }
 
 /// Lane buffers for a batch, one per `EvalEnv` SLOT — a slot per DISTINCT
@@ -1575,7 +2281,10 @@ fn fill_env_from_lanes(
 }
 
 /// Chunk `[start, start + count)` of the 2-input shared-width sample sequence.
-/// `seed` is the LCG state before sample 0; every sample draws twice.
+/// `seed` is the LCG state before sample 0; every sample draws twice. `Ok(n)`:
+/// no terminal point, and `n` of the chunk's points satisfied every
+/// precondition (and agreed); `Err`: the chunk's first counterexample or
+/// inconclusive point.
 fn random_chunk_2(
     obligation: &ProofObligation,
     compiled: Option<&CompiledObligation>,
@@ -1584,10 +2293,11 @@ fn random_chunk_2(
     start: u64,
     count: u64,
     env_template: &EvalEnv,
-) -> Option<VerificationResult> {
+) -> Result<u64, VerificationResult> {
     let mut rng_state = sample_lcg_jump(seed, start.wrapping_mul(2));
     let mut env = env_template.clone();
     let mut scratch: Vec<SVal> = Vec::new();
+    let mut satisfied = 0u64;
     if let Some(cb) = compiled.and_then(|c| c.batch.as_ref()) {
         // Batched: the same draws in the same order, `BATCH_LANES` samples per
         // evaluation; a failing lane is confirmed (and rendered) by the scalar
@@ -1598,6 +2308,9 @@ fn random_chunk_2(
         let mut done = 0u64;
         while done < count {
             let n = (count - done).min(BATCH_LANES as u64) as usize;
+            // `l` is the LANE column; it indexes several `lanes` rows chosen by
+            // `slot_of`, so no single-slice iterator expresses this loop.
+            #[allow(clippy::needless_range_loop)]
             for l in 0..n {
                 rng_state = sample_lcg_step(rng_state);
                 let a_val = mask(rng_state, width);
@@ -1616,20 +2329,14 @@ fn random_chunk_2(
             } else {
                 (1u8 << n) - 1
             };
-            let mut fail = check_batch(cb, &lanes, &mut bscratch) & live;
-            while fail != 0 {
-                let l = fail.trailing_zeros() as usize;
-                fail &= fail - 1;
+            let check = check_batch(cb, &lanes, &mut bscratch);
+            tally_batch(check, live, &mut satisfied, |l| {
                 fill_env_from_lanes(&mut env, &obligation.inputs, &lanes, &slot_of, l);
-                if let PointCheck::Counterexample(result) =
-                    check_single_point(obligation, compiled, &env, &mut scratch)
-                {
-                    return Some(result);
-                }
-            }
+                check_single_point(obligation, compiled, &env, &mut scratch)
+            })?;
             done += n as u64;
         }
-        return None;
+        return Ok(satisfied);
     }
     for _ in 0..count {
         rng_state = sample_lcg_step(rng_state);
@@ -1637,17 +2344,14 @@ fn random_chunk_2(
         rng_state = sample_lcg_step(rng_state);
         let b_val = mask(rng_state, width);
         fill_env_2(&mut env, &obligation.inputs, a_val, Some(b_val), width);
-        if let PointCheck::Counterexample(result) =
-            check_single_point(obligation, compiled, &env, &mut scratch)
-        {
-            return Some(result);
-        }
+        check_single_point(obligation, compiled, &env, &mut scratch).tally(&mut satisfied)?;
     }
-    None
+    Ok(satisfied)
 }
 
 /// Chunk `[start, start + count)` of the multi-input sample sequence; every
-/// sample draws once per input (`fill_env_multi`).
+/// sample draws once per input (`fill_env_multi`). Returns as
+/// [`random_chunk_2`] does.
 fn random_chunk_multi(
     obligation: &ProofObligation,
     compiled: Option<&CompiledObligation>,
@@ -1655,11 +2359,12 @@ fn random_chunk_multi(
     start: u64,
     count: u64,
     env_template: &EvalEnv,
-) -> Option<VerificationResult> {
+) -> Result<u64, VerificationResult> {
     let draws = obligation.inputs.len() as u64;
     let mut rng_state = sample_lcg_jump(seed, start.wrapping_mul(draws));
     let mut env = env_template.clone();
     let mut scratch: Vec<SVal> = Vec::new();
+    let mut satisfied = 0u64;
     if let Some(cb) = compiled.and_then(|c| c.batch.as_ref()) {
         // Batched twin of the loop below: one draw per input per sample, masked
         // to that input's width exactly as `fill_env_multi` does.
@@ -1668,6 +2373,9 @@ fn random_chunk_multi(
         let mut done = 0u64;
         while done < count {
             let n = (count - done).min(BATCH_LANES as u64) as usize;
+            // `l` is the LANE column; it indexes several `lanes` rows chosen by
+            // `slot_of`, so no single-slice iterator expresses this loop.
+            #[allow(clippy::needless_range_loop)]
             for l in 0..n {
                 // In `fill_env_multi` order: one draw per input; a repeated
                 // name's slot keeps the last write.
@@ -1681,30 +2389,20 @@ fn random_chunk_multi(
             } else {
                 (1u8 << n) - 1
             };
-            let mut fail = check_batch(cb, &lanes, &mut bscratch) & live;
-            while fail != 0 {
-                let l = fail.trailing_zeros() as usize;
-                fail &= fail - 1;
+            let check = check_batch(cb, &lanes, &mut bscratch);
+            tally_batch(check, live, &mut satisfied, |l| {
                 fill_env_from_lanes(&mut env, &obligation.inputs, &lanes, &slot_of, l);
-                if let PointCheck::Counterexample(result) =
-                    check_single_point(obligation, compiled, &env, &mut scratch)
-                {
-                    return Some(result);
-                }
-            }
+                check_single_point(obligation, compiled, &env, &mut scratch)
+            })?;
             done += n as u64;
         }
-        return None;
+        return Ok(satisfied);
     }
     for _ in 0..count {
         fill_env_multi(&mut env, &obligation.inputs, &mut rng_state);
-        if let PointCheck::Counterexample(result) =
-            check_single_point(obligation, compiled, &env, &mut scratch)
-        {
-            return Some(result);
-        }
+        check_single_point(obligation, compiled, &env, &mut scratch).tally(&mut satisfied)?;
     }
-    None
+    Ok(satisfied)
 }
 
 /// Update a REUSED env's values for the (≤2)-input shared-width sampling path
@@ -1750,15 +2448,7 @@ fn fill_env_multi(env: &mut EvalEnv, inputs: &[(String, u32)], rng_state: &mut u
 /// already present). Same values as the old `build_env_edge`, no realloc/clone.
 fn fill_env_edge(env: &mut EvalEnv, inputs: &[(String, u32)], edge_idx: usize) {
     for (i, (name, width)) in inputs.iter().enumerate() {
-        let mask_val = mask(u64::MAX, *width);
-        let edges: [u64; 6] = [
-            0,
-            1,
-            mask_val,
-            mask_val.wrapping_sub(1),
-            1u64 << (width.saturating_sub(1)),
-            (1u64 << (width.saturating_sub(1))).wrapping_sub(1),
-        ];
+        let edges = two_input_edge_cases(*width);
         let idx = (edge_idx.wrapping_add(i * 3)) % edges.len();
         if let Some(slot) = env.get_mut(name) {
             *slot = edges[idx];
@@ -1768,31 +2458,58 @@ fn fill_env_edge(env: &mut EvalEnv, inputs: &[(String, u32)], edge_idx: usize) {
 
 /// Outcome of evaluating one concrete test point.
 enum PointCheck {
-    /// The point does not satisfy the obligation's preconditions (skip it). A
-    /// precondition that references a variable absent from `env` is also treated
-    /// as unmet — see [`preconditions_hold`] — so an ill-formed precondition can
-    /// never be silently counted as a satisfying point.
+    /// The point does not satisfy the obligation's preconditions.
     PreconditionUnmet,
     /// Preconditions hold and `trust_ir == aarch64` at this point.
     Equal,
     /// Preconditions hold but the two sides differ — a real counterexample.
     Counterexample(VerificationResult),
+    /// Concrete evaluation could not interpret a required expression. This is
+    /// NOT `PreconditionUnmet`: skipping such a point would let the sampling
+    /// path finish having tested nothing. UF-bearing obligations are already
+    /// declined whole by [`evaluator_undecidable`] before any sweep; this is
+    /// the point-level backstop for everything else `try_eval` can refuse.
+    Inconclusive(String),
 }
 
-/// Panic-safe precondition evaluation: are ALL of `obligation`'s preconditions
-/// true at `env`? `SmtExpr::eval` panics on a variable absent from `env`, so a
-/// precondition whose free variables are not all bound here is treated as NOT
-/// satisfied (we cannot evaluate it). This makes the mock path robust to a
-/// precondition that names an undeclared variable (a malformed loop guard /
-/// disjointness term) — it fails closed rather than panicking or vacuously
-/// passing.
-fn preconditions_hold(obligation: &ProofObligation, env: &EvalEnv) -> bool {
-    obligation.preconditions.iter().all(|pre| {
-        if pre.free_vars().iter().any(|v| !env.contains_key(v)) {
-            return false;
+impl PointCheck {
+    /// Fold this point into a sweep: `Equal` is one more compared point (every
+    /// precondition held), `PreconditionUnmet` compares nothing, and a
+    /// counterexample or inconclusive point is the sweep's terminal verdict.
+    fn tally(self, satisfied: &mut u64) -> Result<(), VerificationResult> {
+        match self {
+            Self::Equal => {
+                *satisfied = satisfied.saturating_add(1);
+                Ok(())
+            }
+            Self::PreconditionUnmet => Ok(()),
+            Self::Counterexample(result) => Err(result),
+            Self::Inconclusive(reason) => Err(VerificationResult::Unknown { reason }),
         }
-        pre.eval(env).as_bool()
-    })
+    }
+}
+
+/// Evaluate the preconditions without treating an unsupported expression or
+/// missing binding as a false guard. Those errors leave the sweep inconclusive.
+///
+/// EVERY precondition is evaluated before the conjunction is decided: stopping
+/// at the first false one would never evaluate an unsupported precondition
+/// listed after it, so an obligation whose early guard excludes every sampled
+/// point would hide the later one's error and — when no point satisfies the
+/// guards — report only a vacuous sample instead of naming the precondition
+/// the evaluator cannot interpret. Whether an obligation's preconditions are
+/// interpretable must not depend on their order. (The compiled fast path in
+/// [`check_single_point`] may short-circuit: every compiled precondition is
+/// in the supported subset, so none of them can fail to evaluate.)
+fn preconditions_hold(obligation: &ProofObligation, env: &EvalEnv) -> Result<bool, String> {
+    let mut all_hold = true;
+    for (index, pre) in obligation.preconditions.iter().enumerate() {
+        let value = pre
+            .try_eval(env)
+            .map_err(|error| format!("cannot concretely evaluate precondition {index}: {error}"))?;
+        all_hold &= value.as_bool();
+    }
+    Ok(all_hold)
 }
 
 /// Check a single test point.
@@ -1882,11 +2599,14 @@ fn verify_by_evaluation_with_compiled(
     config: &VerificationConfig,
     compiled: Option<&CompiledObligation>,
 ) -> VerificationResult {
+    if let Some(undecidable) = evaluator_undecidable(obligation) {
+        return undecidable;
+    }
     let width = obligation.inputs.first().map(|(_, w)| *w).unwrap_or(32);
-    if obligation.inputs.len() > 2 {
+    if let Some(count) = exhaustive_input_count(obligation, config) {
+        verify_exhaustive(obligation, compiled, count)
+    } else if needs_multi_input_sampling(obligation) {
         verify_random_multi(obligation, compiled, config.sample_count)
-    } else if width <= config.exhaustive_threshold {
-        verify_exhaustive(obligation, compiled, width)
     } else {
         verify_random(obligation, compiled, width, config.sample_count)
     }
@@ -1900,9 +2620,9 @@ fn check_single_point(
 ) -> PointCheck {
     // Fast path: pre-compiled scalar obligation. A compiled obligation has ALL
     // its (precondition + expression) variables among `inputs`, so the
-    // interpreter's "free var not in env -> precondition unmet" case cannot apply
-    // here — every precondition is a well-defined bool, exactly matching
-    // `preconditions_hold` when no var is missing. `scratch` is a reused per-loop
+    // interpreter's missing-binding error cannot apply here — every
+    // precondition is in the supported scalar subset, matching
+    // `preconditions_hold` when evaluation succeeds. `scratch` is a reused per-loop
     // buffer; each `FlatProg::eval` clears it and returns an owned `EvalResult`,
     // so reusing it across preconds/trust_ir/aarch64 is sound (no aliasing).
     if let Some(co) = compiled {
@@ -1925,12 +2645,31 @@ fn check_single_point(
         };
     }
 
-    if !preconditions_hold(obligation, env) {
-        return PointCheck::PreconditionUnmet;
+    match preconditions_hold(obligation, env) {
+        Ok(true) => {}
+        Ok(false) => return PointCheck::PreconditionUnmet,
+        Err(reason) => return PointCheck::Inconclusive(reason),
     }
 
-    let trust_ir_result = obligation.trust_ir_expr.eval(env);
-    let aarch64_result = obligation.aarch64_expr.eval(env);
+    // Fallible on purpose: `SmtExpr::eval` panics on anything `try_eval`
+    // refuses, and a panic inside the process-wide memo cell takes a compile
+    // down. Whatever cannot be evaluated is a non-verdict, not a crash.
+    let trust_ir_result = match obligation.trust_ir_expr.try_eval(env) {
+        Ok(result) => result,
+        Err(error) => {
+            return PointCheck::Inconclusive(format!(
+                "cannot concretely evaluate source expression: {error}"
+            ));
+        }
+    };
+    let aarch64_result = match obligation.aarch64_expr.try_eval(env) {
+        Ok(result) => result,
+        Err(error) => {
+            return PointCheck::Inconclusive(format!(
+                "cannot concretely evaluate machine expression: {error}"
+            ));
+        }
+    };
 
     // Use NaN-aware semantic equality: two `Float(NaN)` values are considered
     // equivalent because IEEE-754 `NaN != NaN` would otherwise produce spurious
@@ -3622,8 +4361,9 @@ pub fn proof_isub_i128_whole_chain() -> ProofObligation {
 ///
 /// `lsb`/`width` are SMALL (`idxw`-bit) symbolic vars so the no-solver
 /// statistical sampler lands a large fraction (~1/8) of draws inside the
-/// precondition `0 < width ∧ lsb + width ≤ W` (a full-`W` var would make every
-/// random draw precondition-unmet ⇒ a VACUOUS pass that also fails to refute).
+/// precondition `0 < width ∧ lsb + width ≤ W` (a full-`W` var would leave every
+/// random draw precondition-unmet ⇒ a sweep that compares nothing: the
+/// vacuous-sample `Unknown`, with no power to refute).
 /// `idxw` is the smallest width that still represents the full-register endpoint
 /// (`width = W`, `lsb = 0`). They are zero-extended to `w` for use as the
 /// shift/mask amounts. Reference: ARM DDI 0487, C6.2.335 UBFM / C6.2.334 UBFX.
@@ -4121,17 +4861,17 @@ pub fn proof_fadd_f32() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp32_const(0.0); // placeholder; concrete values tested by FP verifier
-    let b = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 32), 8, 24);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fadd_F32 -> FADD Sd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fadd, Type::F32, a.clone(), b.clone()),
         aarch64_expr: encode_fadd_rr(FPSize::Single, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32), ("fp_b_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24), ("b".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4143,17 +4883,17 @@ pub fn proof_fadd_f64() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp64_const(0.0);
-    let b = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 64), 11, 53);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fadd_F64 -> FADD Dd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fadd, Type::F64, a.clone(), b.clone()),
         aarch64_expr: encode_fadd_rr(FPSize::Double, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64), ("fp_b_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53), ("b".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4165,17 +4905,17 @@ pub fn proof_fsub_f32() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp32_const(0.0);
-    let b = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 32), 8, 24);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fsub_F32 -> FSUB Sd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fsub, Type::F32, a.clone(), b.clone()),
         aarch64_expr: encode_fsub_rr(FPSize::Single, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32), ("fp_b_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24), ("b".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4187,17 +4927,17 @@ pub fn proof_fsub_f64() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp64_const(0.0);
-    let b = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 64), 11, 53);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fsub_F64 -> FSUB Dd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fsub, Type::F64, a.clone(), b.clone()),
         aarch64_expr: encode_fsub_rr(FPSize::Double, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64), ("fp_b_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53), ("b".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4209,17 +4949,17 @@ pub fn proof_fmul_f32() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp32_const(0.0);
-    let b = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 32), 8, 24);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fmul_F32 -> FMUL Sd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fmul, Type::F32, a.clone(), b.clone()),
         aarch64_expr: encode_fmul_rr(FPSize::Single, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32), ("fp_b_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24), ("b".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4231,17 +4971,17 @@ pub fn proof_fmul_f64() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp64_const(0.0);
-    let b = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 64), 11, 53);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fmul_F64 -> FMUL Dd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fmul, Type::F64, a.clone(), b.clone()),
         aarch64_expr: encode_fmul_rr(FPSize::Double, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64), ("fp_b_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53), ("b".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4252,16 +4992,16 @@ pub fn proof_fneg_f32() -> ProofObligation {
     use crate::trust_ir_semantics::encode_trust_ir_fneg;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fneg_F32 -> FNEG Sd".to_string(),
         trust_ir_expr: encode_trust_ir_fneg(Type::F32, a.clone()),
         aarch64_expr: encode_fneg(FPSize::Single, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4272,16 +5012,16 @@ pub fn proof_fneg_f64() -> ProofObligation {
     use crate::trust_ir_semantics::encode_trust_ir_fneg;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fneg_F64 -> FNEG Dd".to_string(),
         trust_ir_expr: encode_trust_ir_fneg(Type::F64, a.clone()),
         aarch64_expr: encode_fneg(FPSize::Double, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4291,15 +5031,15 @@ pub fn proof_ffloor_f32() -> ProofObligation {
     use crate::aarch64_semantics::{FPSize, encode_frintm};
     use crate::trust_ir_semantics::encode_trust_ir_ffloor;
     use trust_cg_lower::types::Type;
-    let a = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Ffloor_F32 -> FRINTM Sd".to_string(),
         trust_ir_expr: encode_trust_ir_ffloor(Type::F32, a.clone()),
         aarch64_expr: encode_frintm(FPSize::Single, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4309,15 +5049,15 @@ pub fn proof_ffloor_f64() -> ProofObligation {
     use crate::aarch64_semantics::{FPSize, encode_frintm};
     use crate::trust_ir_semantics::encode_trust_ir_ffloor;
     use trust_cg_lower::types::Type;
-    let a = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Ffloor_F64 -> FRINTM Dd".to_string(),
         trust_ir_expr: encode_trust_ir_ffloor(Type::F64, a.clone()),
         aarch64_expr: encode_frintm(FPSize::Double, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4327,15 +5067,15 @@ pub fn proof_fceil_f32() -> ProofObligation {
     use crate::aarch64_semantics::{FPSize, encode_frintp};
     use crate::trust_ir_semantics::encode_trust_ir_fceil;
     use trust_cg_lower::types::Type;
-    let a = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fceil_F32 -> FRINTP Sd".to_string(),
         trust_ir_expr: encode_trust_ir_fceil(Type::F32, a.clone()),
         aarch64_expr: encode_frintp(FPSize::Single, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4345,15 +5085,15 @@ pub fn proof_fceil_f64() -> ProofObligation {
     use crate::aarch64_semantics::{FPSize, encode_frintp};
     use crate::trust_ir_semantics::encode_trust_ir_fceil;
     use trust_cg_lower::types::Type;
-    let a = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fceil_F64 -> FRINTP Dd".to_string(),
         trust_ir_expr: encode_trust_ir_fceil(Type::F64, a.clone()),
         aarch64_expr: encode_frintp(FPSize::Double, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4363,15 +5103,15 @@ pub fn proof_ftrunc_f32() -> ProofObligation {
     use crate::aarch64_semantics::{FPSize, encode_frintz};
     use crate::trust_ir_semantics::encode_trust_ir_ftrunc;
     use trust_cg_lower::types::Type;
-    let a = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Ftrunc_F32 -> FRINTZ Sd".to_string(),
         trust_ir_expr: encode_trust_ir_ftrunc(Type::F32, a.clone()),
         aarch64_expr: encode_frintz(FPSize::Single, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4381,15 +5121,15 @@ pub fn proof_ftrunc_f64() -> ProofObligation {
     use crate::aarch64_semantics::{FPSize, encode_frintz};
     use crate::trust_ir_semantics::encode_trust_ir_ftrunc;
     use trust_cg_lower::types::Type;
-    let a = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Ftrunc_F64 -> FRINTZ Dd".to_string(),
         trust_ir_expr: encode_trust_ir_ftrunc(Type::F64, a.clone()),
         aarch64_expr: encode_frintz(FPSize::Double, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4403,17 +5143,17 @@ pub fn proof_fdiv_f32() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp32_const(0.0);
-    let b = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 32), 8, 24);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fdiv_F32 -> FDIV Sd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fdiv, Type::F32, a.clone(), b.clone()),
         aarch64_expr: encode_fdiv_rr(FPSize::Single, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32), ("fp_b_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24), ("b".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4427,17 +5167,17 @@ pub fn proof_fdiv_f64() -> ProofObligation {
     use trust_cg_lower::instructions::Opcode;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp64_const(0.0);
-    let b = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_b_bits", 64), 11, 53);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fdiv_F64 -> FDIV Dd".to_string(),
         trust_ir_expr: encode_trust_ir_fp_binop(&Opcode::Fdiv, Type::F64, a.clone(), b.clone()),
         aarch64_expr: encode_fdiv_rr(FPSize::Double, a, b),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64), ("fp_b_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53), ("b".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4450,43 +5190,35 @@ pub fn proof_fdiv_f64() -> ProofObligation {
 ///
 /// Reference: ARM DDI 0487, C7.2.73 FABS (scalar).
 pub fn proof_fabs_f32() -> ProofObligation {
-    use crate::aarch64_semantics::{FPSize, encode_fabs};
-    use crate::trust_ir_semantics::encode_trust_ir_fabs;
-    use trust_cg_lower::types::Type;
-
-    let a = SmtExpr::fp32_const(0.0);
-
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "Fabs_F32 -> FABS Sd".to_string(),
-        trust_ir_expr: encode_trust_ir_fabs(Type::F32, a.clone()),
-        aarch64_expr: encode_fabs(FPSize::Single, a),
-        inputs: vec![],
-        preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24)],
-        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
-    }
+    proof_fabs_bits(32, "Fabs_F32 -> FABS Sd")
 }
 
 /// Build the proof obligation for: `trust_ir::Fabs(F64, a) -> FABS Dd, Dn`
 ///
 /// Reference: ARM DDI 0487, C7.2.73 FABS (scalar).
 pub fn proof_fabs_f64() -> ProofObligation {
-    use crate::aarch64_semantics::{FPSize, encode_fabs};
-    use crate::trust_ir_semantics::encode_trust_ir_fabs;
-    use trust_cg_lower::types::Type;
+    proof_fabs_bits(64, "Fabs_F64 -> FABS Dd")
+}
 
-    let a = SmtExpr::fp64_const(0.0);
-
+/// Full raw-bit FABS obligation. TrustIR's `UnOp::FAbs` contract clears
+/// the sign bit; the source mask retains every exponent and fraction bit.
+/// The machine model independently concatenates zero with bits N-2 through 0,
+/// matching FABS's register bit operation, including signed zero and NaN payloads.
+/// These symbolic operands replace the legacy constant-zero FP placeholders.
+fn proof_fabs_bits(width: u32, name: &str) -> ProofObligation {
+    let input = SmtExpr::var("a", width);
+    let magnitude_mask = (1u64 << (width - 1)) - 1;
     ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "Fabs_F64 -> FABS Dd".to_string(),
-        trust_ir_expr: encode_trust_ir_fabs(Type::F64, a.clone()),
-        aarch64_expr: encode_fabs(FPSize::Double, a),
-        inputs: vec![],
+        machine_side_provenance: MachineSideProvenance::StaticDb,
+        name: name.to_string(),
+        trust_ir_expr: input
+            .clone()
+            .bvand(SmtExpr::bv_const(magnitude_mask, width)),
+        aarch64_expr: SmtExpr::bv_const(0, 1).concat(input.extract(width - 2, 0)),
+        inputs: vec![("a".to_string(), width)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53)],
-        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+        fp_inputs: vec![],
+        category: Some(TransvalCheckKind::InstructionLowering),
     }
 }
 
@@ -4498,16 +5230,16 @@ pub fn proof_fsqrt_f32() -> ProofObligation {
     use crate::trust_ir_semantics::encode_trust_ir_fsqrt;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp32_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 32), 8, 24);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fsqrt_F32 -> FSQRT Sd".to_string(),
         trust_ir_expr: encode_trust_ir_fsqrt(Type::F32, a.clone()),
         aarch64_expr: encode_fsqrt(FPSize::Single, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4520,16 +5252,16 @@ pub fn proof_fsqrt_f64() -> ProofObligation {
     use crate::trust_ir_semantics::encode_trust_ir_fsqrt;
     use trust_cg_lower::types::Type;
 
-    let a = SmtExpr::fp64_const(0.0);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("fp_a_bits", 64), 11, 53);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "Fsqrt_F64 -> FSQRT Dd".to_string(),
         trust_ir_expr: encode_trust_ir_fsqrt(Type::F64, a.clone()),
         aarch64_expr: encode_fsqrt(FPSize::Double, a),
-        inputs: vec![],
+        inputs: vec![("fp_a_bits".to_string(), 64)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 11, 53)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -4558,25 +5290,18 @@ fn proof_fcmp_generic(
         (Type::F64, FPSize::Double, 11u32, 53u32)
     };
 
-    let a = if is_f32 {
-        SmtExpr::fp32_const(0.0)
-    } else {
-        SmtExpr::fp64_const(0.0)
-    };
-    let b = if is_f32 {
-        SmtExpr::fp32_const(0.0)
-    } else {
-        SmtExpr::fp64_const(0.0)
-    };
+    let width = eb + sb;
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("a_bits", width), eb, sb);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("b_bits", width), eb, sb);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: name.to_string(),
         trust_ir_expr: encode_trust_ir_fcmp(&cond, ty, a.clone(), b.clone()),
         aarch64_expr: encode_fcmp(fp_size, a, b, &cond),
-        inputs: vec![],
+        inputs: vec![("a_bits".into(), width), ("b_bits".into(), width)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), eb, sb), ("b".to_string(), eb, sb)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -5102,13 +5827,12 @@ fn minmax_obligation_kind(name: &str) -> Option<FpMinMaxKind> {
 /// Proof names follow the convention `Fcmp_{CondCode}_{Size} -> FCMP+CSET`.
 /// This function extracts the condition code and maps it to the corresponding
 /// `FloatCC` variant.
-/// The FCMP condition an FP obligation's NAME encodes, or `None` for a name
-/// this evaluator does not understand — which the caller turns into an
-/// `Unknown` verdict (fail-closed), never a panic: the evaluator runs inside
-/// a process-wide memo cell, and a panic there takes the compile down.
+/// This is a test-only naming-inventory helper. Production evaluation never
+/// reconstructs a comparison condition or expression from an obligation name.
 /// Two spellings exist in the registry: the aarch64/x86 `Fcmp_<CC>_...`
 /// (`Eq NE LT LE GT GE Ord Uno UEQ UNE ULT ULE UGT UGE`) and the wasm
 /// `FCmp_<cc>_...` (`OEq ONe OLt OLe OGt OGe UEq UNe ULt ULe UGt UGe`).
+#[cfg(test)]
 fn parse_float_cc_from_name(name: &str) -> Option<trust_cg_lower::instructions::FloatCC> {
     use trust_cg_lower::instructions::FloatCC;
     let rest = name
@@ -5150,9 +5874,12 @@ fn parse_float_cc_from_name(name: &str) -> Option<trust_cg_lower::instructions::
 ///
 /// For unary FP operations (FNEG, FABS, FSQRT): tests each edge case value individually.
 ///
-/// For FP comparisons (FCMP): tests all combinations of edge cases including
-/// NaN, which is critical for verifying ordered/unordered comparison semantics.
-/// Results are compared as BV1 (bitvector width 1) rather than Float.
+/// For bound scalar FP comparisons (FCMP): validates raw-input declarations
+/// and recursive sorts, evaluates the stored trees/preconditions over IEEE
+/// edges and the default random workload, and compares BV1 results (or the
+/// exactly validated Wasm BV1-to-i32 / i32 0-or-1 materialization pair). Unknown
+/// means malformed/unsupported binding, an evaluation error, or no applicable
+/// sampled point. The other legacy FP families retain their edge-only path.
 ///
 /// # Verification strength
 ///
@@ -5160,6 +5887,28 @@ fn parse_float_cc_from_name(name: &str) -> Option<trust_cg_lower::instructions::
 /// the mock evaluation approach used for integer proofs at larger bit-widths.
 /// For formal FP proofs, use the ay QF_FP theory via [`crate::ay_bridge`].
 pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResult {
+    // Raw-bit scalar comparisons evaluate the actual stored trees, including
+    // preconditions, IEEE edges and the full default random workload. Other
+    // legacy FP families below retain their separate edge-only behavior.
+    if uses_checked_scalar_fp_evaluation(obligation) {
+        return verify_by_evaluation_with_config(obligation, &VerificationConfig::default());
+    }
+    // Raw-bit FP operations (including FABS) must evaluate their stored trees.
+    // The legacy FP path substitutes constant operands and cannot bind these
+    // bitvector variables. The primary evaluator only calls back here when
+    // fp_inputs is nonempty, so this dispatch cannot recurse.
+    if obligation.fp_inputs.is_empty()
+        && matches!(
+            obligation.trust_ir_expr.sort(),
+            crate::smt::SmtSort::BitVec(_)
+        )
+        && matches!(
+            obligation.aarch64_expr.sort(),
+            crate::smt::SmtSort::BitVec(_)
+        )
+    {
+        return verify_by_evaluation(obligation);
+    }
     let empty_env = HashMap::new();
 
     // FP test vectors: representative values covering IEEE 754 edge cases.
@@ -5298,15 +6047,12 @@ pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResu
                 let (trust_ir_expr, machine_expr) = mk(a_val, b_val);
                 let trust_ir_result = trust_ir_expr.try_eval(&empty_env);
                 let machine_result = machine_expr.try_eval(&empty_env);
-                if let (Ok(t), Ok(m)) = (&trust_ir_result, &machine_result)
-                    && !fp_results_equal(t, m)
-                {
-                    return VerificationResult::Invalid {
-                        counterexample: format!(
-                            "a={}, b={}, trust_ir={:?}, machine={:?}",
-                            a_val, b_val, t, m
-                        ),
-                    };
+                if let Some(result) = check_fp_evaluation_results(
+                    &trust_ir_result,
+                    &machine_result,
+                    format!("a={a_val}, b={b_val}"),
+                ) {
+                    return result;
                 }
             }
         }
@@ -5323,12 +6069,12 @@ pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResu
                     build_fp_unary_expr(&obligation.aarch64_expr, a_val as f64, is_f32);
                 let trust_ir_result = trust_ir_expr.try_eval(&empty_env);
                 let aarch64_result = aarch64_expr.try_eval(&empty_env);
-                if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-                    && !fp_results_equal(t, a)
-                {
-                    return VerificationResult::Invalid {
-                        counterexample: format!("a={}, trust_ir={:?}, aarch64={:?}", a_val, t, a),
-                    };
+                if let Some(result) = check_fp_evaluation_results(
+                    &trust_ir_result,
+                    &aarch64_result,
+                    format!("a={a_val}"),
+                ) {
+                    return result;
                 }
             }
         } else {
@@ -5337,92 +6083,21 @@ pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResu
                 let aarch64_expr = build_fp_unary_expr(&obligation.aarch64_expr, a_val, is_f32);
                 let trust_ir_result = trust_ir_expr.try_eval(&empty_env);
                 let aarch64_result = aarch64_expr.try_eval(&empty_env);
-                if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-                    && !fp_results_equal(t, a)
-                {
-                    return VerificationResult::Invalid {
-                        counterexample: format!("a={}, trust_ir={:?}, aarch64={:?}", a_val, t, a),
-                    };
+                if let Some(result) = check_fp_evaluation_results(
+                    &trust_ir_result,
+                    &aarch64_result,
+                    format!("a={a_val}"),
+                ) {
+                    return result;
                 }
             }
         }
     } else if is_cmp {
-        // FP comparison (FCMP): produces BV1. We call the encoder functions
-        // directly with concrete values rather than template substitution,
-        // because FCMP expression trees contain multiple FPConst(0.0)
-        // placeholders for both operands that cannot be structurally
-        // distinguished during tree walking.
-        let Some(cond) = parse_float_cc_from_name(&obligation.name) else {
-            return VerificationResult::Unknown {
-                reason: format!(
-                    "FCMP obligation name `{}` encodes no condition this evaluator knows",
-                    obligation.name
-                ),
-            };
+        // Never reconstruct a comparison from its name. A comparison outside
+        // the checked raw-input contract cannot obtain finite Valid here.
+        return VerificationResult::Unknown {
+            reason: "FP comparison lacks checked raw-input binding".into(),
         };
-        if is_f32 {
-            for &a_val in &f32_test_values {
-                for &b_val in &f32_test_values {
-                    let a_expr = SmtExpr::fp32_const(a_val);
-                    let b_expr = SmtExpr::fp32_const(b_val);
-                    let trust_ir_expr = crate::trust_ir_semantics::encode_trust_ir_fcmp(
-                        &cond,
-                        trust_cg_lower::types::Type::F32,
-                        a_expr.clone(),
-                        b_expr.clone(),
-                    );
-                    let aarch64_expr = crate::aarch64_semantics::encode_fcmp(
-                        crate::aarch64_semantics::FPSize::Single,
-                        a_expr,
-                        b_expr,
-                        &cond,
-                    );
-                    let trust_ir_result = trust_ir_expr.try_eval(&empty_env);
-                    let aarch64_result = aarch64_expr.try_eval(&empty_env);
-                    if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-                        && !fp_results_equal(t, a)
-                    {
-                        return VerificationResult::Invalid {
-                            counterexample: format!(
-                                "a={}, b={}, trust_ir={:?}, aarch64={:?}",
-                                a_val, b_val, t, a
-                            ),
-                        };
-                    }
-                }
-            }
-        } else {
-            for &a_val in &f64_test_values {
-                for &b_val in &f64_test_values {
-                    let a_expr = SmtExpr::fp64_const(a_val);
-                    let b_expr = SmtExpr::fp64_const(b_val);
-                    let trust_ir_expr = crate::trust_ir_semantics::encode_trust_ir_fcmp(
-                        &cond,
-                        trust_cg_lower::types::Type::F64,
-                        a_expr.clone(),
-                        b_expr.clone(),
-                    );
-                    let aarch64_expr = crate::aarch64_semantics::encode_fcmp(
-                        crate::aarch64_semantics::FPSize::Double,
-                        a_expr,
-                        b_expr,
-                        &cond,
-                    );
-                    let trust_ir_result = trust_ir_expr.try_eval(&empty_env);
-                    let aarch64_result = aarch64_expr.try_eval(&empty_env);
-                    if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-                        && !fp_results_equal(t, a)
-                    {
-                        return VerificationResult::Invalid {
-                            counterexample: format!(
-                                "a={}, b={}, trust_ir={:?}, aarch64={:?}",
-                                a_val, b_val, t, a
-                            ),
-                        };
-                    }
-                }
-            }
-        }
     } else {
         // Binary FP operation (FADD, FSUB, FMUL, FDIV)
         if is_f32 {
@@ -5442,15 +6117,12 @@ pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResu
                     );
                     let trust_ir_result = trust_ir_expr.try_eval(&empty_env);
                     let aarch64_result = aarch64_expr.try_eval(&empty_env);
-                    if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-                        && !fp_results_equal(t, a)
-                    {
-                        return VerificationResult::Invalid {
-                            counterexample: format!(
-                                "a={}, b={}, trust_ir={:?}, aarch64={:?}",
-                                a_val, b_val, t, a
-                            ),
-                        };
+                    if let Some(result) = check_fp_evaluation_results(
+                        &trust_ir_result,
+                        &aarch64_result,
+                        format!("a={a_val}, b={b_val}"),
+                    ) {
+                        return result;
                     }
                 }
             }
@@ -5463,15 +6135,12 @@ pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResu
                         build_fp_binary_expr(&obligation.aarch64_expr, a_val, b_val, is_f32);
                     let trust_ir_result = trust_ir_expr.try_eval(&empty_env);
                     let aarch64_result = aarch64_expr.try_eval(&empty_env);
-                    if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-                        && !fp_results_equal(t, a)
-                    {
-                        return VerificationResult::Invalid {
-                            counterexample: format!(
-                                "a={}, b={}, trust_ir={:?}, aarch64={:?}",
-                                a_val, b_val, t, a
-                            ),
-                        };
+                    if let Some(result) = check_fp_evaluation_results(
+                        &trust_ir_result,
+                        &aarch64_result,
+                        format!("a={a_val}, b={b_val}"),
+                    ) {
+                        return result;
                     }
                 }
             }
@@ -5479,6 +6148,28 @@ pub fn verify_fp_by_evaluation(obligation: &ProofObligation) -> VerificationResu
     }
 
     VerificationResult::Valid
+}
+
+/// A sample only agrees when both evaluators produced comparable values.
+/// Missing bindings and unsupported semantics refuse the obligation, even if
+/// both sides fail in the same way; failed samples are never positive evidence.
+fn check_fp_evaluation_results(
+    source: &Result<crate::smt::EvalResult, crate::smt::SmtError>,
+    machine: &Result<crate::smt::EvalResult, crate::smt::SmtError>,
+    sample: String,
+) -> Option<VerificationResult> {
+    match (source, machine) {
+        (Ok(source), Ok(machine)) if fp_results_equal(source, machine) => None,
+        (Ok(source), Ok(machine)) => Some(VerificationResult::Invalid {
+            counterexample: format!("{sample}, trust_ir={source:?}, machine={machine:?}"),
+        }),
+        (Err(error), _) => Some(VerificationResult::Unknown {
+            reason: format!("FP source evaluation failed at {sample}: {error}"),
+        }),
+        (_, Err(error)) => Some(VerificationResult::Unknown {
+            reason: format!("FP machine evaluation failed at {sample}: {error}"),
+        }),
+    }
 }
 
 /// Build a concrete FP binary expression by substituting concrete values.
@@ -5619,14 +6310,11 @@ fn verify_fp_reconstructed_by_evaluation(obligation: &ProofObligation) -> Verifi
         let b = mk_fp(b_val);
         let t = subst_fp_recon_leaves(&obligation.trust_ir_expr, &a, &b);
         let m = subst_fp_recon_leaves(&obligation.aarch64_expr, &a, &b);
-        if let (Ok(tr), Ok(mr)) = (t.try_eval(&empty_env), m.try_eval(&empty_env))
-            && !fp_results_equal(&tr, &mr)
-        {
-            return Some(VerificationResult::Invalid {
-                counterexample: format!("a={a_val}, b={b_val}, trust_ir={tr:?}, machine={mr:?}"),
-            });
-        }
-        None
+        check_fp_evaluation_results(
+            &t.try_eval(&empty_env),
+            &m.try_eval(&empty_env),
+            format!("a={a_val}, b={b_val}"),
+        )
     };
 
     // Ternary (FMADD) check: substitute all three named leaves and compare the
@@ -5639,16 +6327,11 @@ fn verify_fp_reconstructed_by_evaluation(obligation: &ProofObligation) -> Verifi
         let c = mk_fp(c_val);
         let t = subst_fp_recon_leaves3(&obligation.trust_ir_expr, &a, &b, &c);
         let m = subst_fp_recon_leaves3(&obligation.aarch64_expr, &a, &b, &c);
-        if let (Ok(tr), Ok(mr)) = (t.try_eval(&empty_env), m.try_eval(&empty_env))
-            && !fp_results_equal(&tr, &mr)
-        {
-            return Some(VerificationResult::Invalid {
-                counterexample: format!(
-                    "a={a_val}, b={b_val}, c={c_val}, trust_ir={tr:?}, machine={mr:?}"
-                ),
-            });
-        }
-        None
+        check_fp_evaluation_results(
+            &t.try_eval(&empty_env),
+            &m.try_eval(&empty_env),
+            format!("a={a_val}, b={b_val}, c={c_val}"),
+        )
     };
 
     if is_unary {
@@ -8247,6 +8930,148 @@ const SCALAR_SHIFT_RETRACTED_DEGENERATE: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// E0.5: the formal-on-miss upgrade route is deleted, not bounded. Under
+    /// the compiler's proof-promotion policy a registry obligation with no
+    /// portable certificate and no tier-0 row is discharged by evaluation at
+    /// its honest Statistical strength, and a real counted solver process is
+    /// never entered. Before the deletion this configuration spent a live AY
+    /// attempt per call (bounded at two per key by f992f4fc).
+    #[cfg(unix)]
+    #[test]
+    fn registry_miss_never_enters_a_live_solver_under_promotion_policy() {
+        use crate::smt::SmtExpr;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = crate::ay_bridge::formal_solver_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Counts every real query, whatever it answers. The AY identity rule
+        // starts an admitted fixture from its private copy, so the script names
+        // its own path literally (bind_self) for the counter to land where this
+        // test reads it, and its digest is declared below: without that
+        // admission every query stopped at TCG-AY-IDENTITY-MISMATCH and
+        // `calls() == 0` held whatever the code did (measured: a restored live
+        // route on a registry miss passed this test).
+        let solver = dir.path().join("ay-counting");
+        std::fs::write(
+            &solver,
+            crate::ay_identity::test_fixtures::bind_self(
+                &solver,
+                "#!/bin/sh\n\
+                 if test \"$1\" = --version; then printf 'ay fixture\\n'; exit 0; fi\n\
+                 printf 'q\\n' >> \"$0.calls\"\n\
+                 printf 'unsat\\n'\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&solver, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let calls = || {
+            std::fs::read_to_string(solver.with_extension("calls"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        // Unique content, so no portable certificate or memo cell can answer it.
+        let input = format!("e05_registry_miss_{}", std::process::id());
+        let x = SmtExpr::var(&input, 32);
+        let obligation = ProofObligation {
+            machine_side_provenance: MachineSideProvenance::StaticDb,
+            name: format!("E0.5 registry miss {}", dir.path().display()),
+            trust_ir_expr: x.clone().bvadd(SmtExpr::bv_const(0, 32)),
+            aarch64_expr: x,
+            inputs: vec![(input, 32)],
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: None,
+        };
+        let declaration = crate::ay_identity::test_fixtures::declare(&[solver.as_path()]);
+        crate::env_lock::with_env_edits(|env| {
+            env.set("AY_SOLVER_PATH", &solver);
+            env.set(
+                crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV,
+                &declaration,
+            );
+            env.set("TCG_NO_VERDICT_DB", "1");
+            env.set("TCG_NO_SOLVER_SERVER", "1");
+            env.set("TCG_NO_CERT_STORE", "1");
+            env.set("TCG_REFINE_SOLVER", "1");
+            env.remove("TCG_NO_PROOF_CACHE");
+            let promotion = VerificationConfig::for_proof_promotion();
+            assert!(!crate::verdict_db::portable_cert_verified_obligation(
+                &obligation
+            ));
+            for _ in 0..3 {
+                let (result, strength) = discharge_registry_obligation(&obligation, &promotion);
+                assert!(matches!(result, VerificationResult::Valid), "{result:?}");
+                assert!(
+                    matches!(
+                        strength,
+                        crate::verify::VerificationStrength::Statistical { .. }
+                    ),
+                    "no live route may upgrade a registry miss: {strength:?}"
+                );
+            }
+        });
+        assert_eq!(calls(), 0, "a registry miss must never reach the solver");
+    }
+
+    #[test]
+    fn portable_registry_proofs_promote_but_reconstruction_needs_source_binding() {
+        use trust_cg_ir::regs::VReg;
+        use trust_cg_ir::{AArch64Opcode, MachInst, MachOperand, RegClass};
+
+        crate::env_lock::with_env_edits(|env| {
+            // Prove the registry path does not inherit authority from either
+            // tier-0 or a live AY process. The portable checker is its sole
+            // route. A reconstructed theorem remains independently replayable
+            // below, but cannot promote an instruction without source binding.
+            env.set("TCG_NO_VERDICT_DB", "1");
+            env.set("TCG_REFINE_SOLVER", "0");
+            env.remove("TCG_NO_PROOF_CACHE");
+            env.remove("TCG_CANARY_NO_CACHE");
+
+            let promotion = VerificationConfig::for_proof_promotion();
+            let (icmp_result, icmp_strength) =
+                discharge_registry_obligation(&proof_icmp_eq_i32(), &promotion);
+            assert!(matches!(icmp_result, VerificationResult::Valid));
+            assert_eq!(
+                icmp_strength,
+                crate::verify::VerificationStrength::Formal,
+                "an independently replayed registry proof must not require tier-0 or AY"
+            );
+
+            let r = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+            let inst = MachInst::new(AArch64Opcode::LsrRI, vec![r(0), r(1), MachOperand::Imm(17)]);
+            let instance = crate::function_verifier::reconstruct_alu_obligation(&inst)
+                .expect("LsrRI instance reconstruction");
+            let canonical = crate::function_verifier::canonical_reconstruct_obligation(&inst)
+                .expect("LsrRI canonical reconstruction");
+            assert_ne!(
+                crate::verdict_db::db_obligation_smt2(&instance),
+                crate::verdict_db::db_obligation_smt2(&canonical),
+                "the regression needs a baked instance distinct from its parametric proof"
+            );
+            assert!(
+                crate::verdict_db::portable_cert_verified_obligation(&canonical),
+                "the canonical Ushr64 query must have portable proof authority"
+            );
+            assert!(
+                !crate::verdict_db::portable_cert_verified_obligation(&instance),
+                "the baked instance must not accidentally carry the canonical query key"
+            );
+
+            let (recon_result, recon_strength) =
+                discharge_reconstructed_obligation(&instance, &canonical, &promotion);
+            assert!(matches!(recon_result, VerificationResult::Valid));
+            assert_eq!(
+                recon_strength,
+                crate::verify::VerificationStrength::Statistical {
+                    sample_count: promotion.sample_count,
+                },
+                "a target-derived canonical proof cannot confer source-lowering authority"
+            );
+        });
+    }
+
     #[test]
     fn random_fallback_i128_edge_samples_do_not_shift_u64_out_of_range() {
         let x = SmtExpr::var("x", 128);
@@ -8295,8 +9120,10 @@ mod tests {
     /// SAME `VerificationResult` variant the full 100k-sample sweep would, in
     /// every direction — Valid where identical trap-free sides sweep to Valid,
     /// and NOT short-circuited (so the refuting/vacuous sweep still runs) for
-    /// distinct-sided OR trap-capable obligations. A divergence here would be a
-    /// silent proof-system miscompile (crediting Valid where the sweep refutes).
+    /// distinct-sided OR trap-capable obligations, or for identical-sided ones
+    /// whose preconditions no edge point satisfies. A divergence here would be
+    /// a silent proof-system miscompile (crediting Valid where the sweep
+    /// refutes, or where it compared nothing).
     #[test]
     fn test_structural_identity_short_circuit_is_verdict_identical() {
         use crate::verify::VerificationStrength;
@@ -8309,14 +9136,12 @@ mod tests {
             config: &VerificationConfig,
         ) -> VerificationResult {
             let width = obligation.inputs.first().map(|(_, w)| *w).unwrap_or(32);
-            let num_inputs = obligation.inputs.len();
             let compiled = CompiledObligation::try_new(obligation);
             let compiled = compiled.as_ref();
-            if num_inputs > 2 {
-                return verify_random_multi(obligation, compiled, config.sample_count);
-            }
-            if width <= config.exhaustive_threshold {
-                verify_exhaustive(obligation, compiled, width)
+            if let Some(count) = exhaustive_input_count(obligation, config) {
+                verify_exhaustive(obligation, compiled, count)
+            } else if needs_multi_input_sampling(obligation) {
+                verify_random_multi(obligation, compiled, config.sample_count)
             } else {
                 verify_random(obligation, compiled, width, config.sample_count)
             }
@@ -8522,6 +9347,72 @@ mod tests {
                 tag(&sweep),
                 "{}: memo diverged from refuting sweep",
                 o.name
+            );
+        }
+
+        // -- (4) IDENTICAL-SIDED, TRAP-FREE, WITH PRECONDITIONS: the sweep is
+        //    `Valid` only when some sampled point satisfies them and the
+        //    vacuous-sample `Unknown` otherwise, so the short-circuit may fire
+        //    only with a witness in hand. Edge-witnessed and random-witnessed
+        //    obligations sweep Valid; an obligation no point satisfies sweeps
+        //    Unknown — and the short-circuit and memo must agree in every case.
+        let a_is = |value: u64| a().eq_expr(SmtExpr::bv_const(value, 64));
+        let not_an_edge: Vec<SmtExpr> = [0, 1, u64::MAX, u64::MAX - 1, 1 << 63, (1 << 63) - 1]
+            .into_iter()
+            .map(|edge| a_is(edge).not_expr())
+            .collect();
+        let with_preconditions = [
+            (
+                oblig(
+                    "id-add-rr edge-witnessed",
+                    a().bvadd(b()),
+                    a().bvadd(b()),
+                    ab(),
+                    vec![a_is(0)],
+                ),
+                0,
+            ),
+            (
+                oblig(
+                    "id-add-rr random-witnessed",
+                    a().bvadd(b()),
+                    a().bvadd(b()),
+                    ab(),
+                    not_an_edge,
+                ),
+                0,
+            ),
+            (
+                oblig(
+                    "id-add-rr never satisfied",
+                    a().bvadd(b()),
+                    a().bvadd(b()),
+                    ab(),
+                    vec![a_is(0).and_expr(a_is(1))],
+                ),
+                2,
+            ),
+        ];
+        for (o, expected) in &with_preconditions {
+            let sc = verify_by_evaluation_with_config(o, &cfg);
+            let sweep = full_sweep(o, &cfg);
+            let memo = memoized_verify_by_evaluation(o, &cfg);
+            assert_eq!(tag(&sweep), *expected, "{}: full sweep {:?}", o.name, sweep);
+            assert_eq!(
+                tag(&sc),
+                tag(&sweep),
+                "{}: short-circuit diverged from sweep ({:?} vs {:?})",
+                o.name,
+                sc,
+                sweep
+            );
+            assert_eq!(
+                tag(&memo),
+                tag(&sweep),
+                "{}: memo diverged from sweep ({:?} vs {:?})",
+                o.name,
+                memo,
+                sweep
             );
         }
     }
@@ -10040,17 +10931,18 @@ mod tests {
             category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
         };
 
-        // With default threshold (8), 16-bit falls into random sampling
+        // One 16-bit input fits the default two-8-bit-input work budget.
         let config_default = VerificationConfig::default();
-        assert!(
-            obligation.inputs[0].1 > config_default.exhaustive_threshold,
-            "16-bit should exceed default exhaustive threshold"
+        assert_eq!(
+            exhaustive_input_count(&obligation, &config_default),
+            Some(65_536)
         );
 
         // With raised threshold, it should use exhaustive
         let config_16 = VerificationConfig {
             sample_count: 10,
             exhaustive_threshold: 16,
+            ..VerificationConfig::default()
         };
         let result = verify_by_evaluation_with_config(&obligation, &config_16);
         assert!(matches!(result, VerificationResult::Valid));
@@ -10059,6 +10951,69 @@ mod tests {
     // -----------------------------------------------------------------------
     // Floating-point lowering proof tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn fp_static_evaluation_errors_refuse() {
+        for original in [
+            proof_fsqrt_f32(),
+            proof_fsqrt_f64(),
+            proof_fdiv_f32(),
+            proof_fdiv_f64(),
+        ] {
+            for side in 0..3 {
+                let mut obligation = original.clone();
+                let missing = SmtExpr::var("unbound_fp_operand", 64);
+                if side != 1 {
+                    obligation.trust_ir_expr = missing.clone();
+                }
+                if side != 0 {
+                    obligation.aarch64_expr = missing;
+                }
+                assert!(
+                    matches!(
+                        verify_fp_by_evaluation(&obligation),
+                        VerificationResult::Unknown { .. }
+                    ),
+                    "{} side {side} accepted an evaluation error",
+                    original.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fp_reconstructed_evaluation_errors_refuse() {
+        for width in [32, 64] {
+            for arity in 1..=3 {
+                for side in 0..3 {
+                    let mut obligation = if width == 32 {
+                        proof_fsqrt_f32()
+                    } else {
+                        proof_fsqrt_f64()
+                    };
+                    let format = if width == 32 { (8, 24) } else { (11, 53) };
+                    obligation.fp_inputs = (0..arity)
+                        .map(|i| (format!("recon_{i}"), format.0, format.1))
+                        .collect();
+                    let bound = SmtExpr::var("recon_a", width).fp_neg();
+                    let missing = SmtExpr::var("unbound_fp_operand", width).fp_neg();
+                    obligation.trust_ir_expr = if side == 1 {
+                        bound.clone()
+                    } else {
+                        missing.clone()
+                    };
+                    obligation.aarch64_expr = if side == 0 { bound } else { missing };
+                    assert!(
+                        matches!(
+                            verify_fp_reconstructed_by_evaluation(&obligation),
+                            VerificationResult::Unknown { .. }
+                        ),
+                        "width {width}, arity {arity}, side {side} accepted an evaluation error"
+                    );
+                }
+            }
+        }
+    }
 
     /// Helper: verify a floating-point proof obligation and assert Valid.
     fn assert_fp_valid(obligation: &ProofObligation) {
@@ -10342,9 +11297,11 @@ mod tests {
     fn test_fp_proof_smt2_output() {
         let obligation = proof_fadd_f64();
         let smt2 = obligation.to_smt2();
-        // Should declare FP inputs
-        assert!(smt2.contains("(declare-const a (_ FloatingPoint 11 53))"));
-        assert!(smt2.contains("(declare-const b (_ FloatingPoint 11 53))"));
+        // Raw symbolic operands occur in the actual formula, not just declarations.
+        assert!(smt2.contains("(declare-const fp_a_bits (_ BitVec 64))"));
+        assert!(smt2.contains("(declare-const fp_b_bits (_ BitVec 64))"));
+        assert!(smt2.contains("((_ to_fp 11 53) fp_a_bits)"));
+        assert!(smt2.contains("((_ to_fp 11 53) fp_b_bits)"));
         assert!(smt2.contains("(check-sat)"));
     }
 
@@ -10998,6 +11955,29 @@ mod chunked_sampling_tests {
             category: None,
         }
     }
+    /// Mixed-width sampling must not shift its u64 carrier by an i128 width.
+    /// It still finds an actual wrong result; a successful sample is not a proof.
+    #[test]
+    fn wide_multi_input_sampling_preserves_refutation_without_shift_overflow() {
+        let mut ob = obligation("wide_multi_input", &["a", "b", "flag"], &[]);
+        ob.inputs = vec![("a".into(), 128), ("b".into(), 128), ("flag".into(), 1)];
+        ob.trust_ir_expr = SmtExpr::var("a", 128);
+        ob.aarch64_expr = SmtExpr::var("a", 128).bvadd(SmtExpr::bv_const(1, 128));
+        let cfg = VerificationConfig {
+            sample_count: 16,
+            ..VerificationConfig::default()
+        };
+        assert!(matches!(
+            verify_by_evaluation_with_config(&ob, &cfg),
+            VerificationResult::Invalid { .. }
+        ));
+        for edge_idx in 0..MULTI_INPUT_EDGE_COMBOS as usize {
+            let mut env = multi_input_sweep_env(&ob);
+            fill_env_edge(&mut env, &ob.inputs, edge_idx);
+            assert!(*env.get("flag").unwrap() <= 1);
+        }
+    }
+
     /// The value of input `a` (the first draw) at sample index `k` of an
     /// obligation with `draws` inputs — what the sequential loop draws there.
     fn a_at(name: &str, draws: u64, k: u64) -> u64 {
@@ -11311,6 +12291,45 @@ mod chunked_sampling_tests {
         assert_eq!(chunked(&uses_b), "Valid");
     }
 
+    /// The evidence count is summed over EVERY chunk. The only sample that
+    /// satisfies this precondition is sample 77,777 — deep inside chunk 6 of 8
+    /// — so the sweep compared exactly one point, in a late chunk, and must be
+    /// `Valid` pooled and sequential alike; dropping any chunk's count would
+    /// turn it into the vacuous-sample `Unknown`. With that one point excluded
+    /// as well, nothing is compared and both ways must say so.
+    #[test]
+    fn a_lone_satisfying_sample_in_a_late_chunk_is_counted() {
+        let name = "chunk-test: lone satisfying sample in chunk 6";
+        let lone = a_at(name, 2, 77_777);
+        let is_lone = SmtExpr::Eq {
+            lhs: v("a"),
+            rhs: k(lone),
+        };
+        let mut ob = valid_but_not_identical(name);
+        ob.preconditions = vec![is_lone.clone()];
+        let compiled = CompiledObligation::try_new(&ob).expect("compiled");
+        let whole = random_chunk_2(
+            &ob,
+            Some(&compiled),
+            64,
+            sample_seed(name),
+            0,
+            DEFAULT_SAMPLE_COUNT,
+            &two_input_sweep_env(&ob),
+        );
+        assert!(
+            matches!(whole, Ok(1)),
+            "exactly one random sample satisfies the precondition: {whole:?}"
+        );
+        assert_eq!(sequential(&ob), "Valid");
+        assert_eq!(chunked(&ob), "Valid");
+
+        ob.preconditions.push(is_lone.not_expr());
+        let s = sequential(&ob);
+        assert!(s.contains("vacuous sample"), "{s}");
+        assert_eq!(chunked(&ob), s);
+    }
+
     /// A correct obligation is Valid both ways (no false counterexample from a
     /// mis-seeded chunk).
     #[test]
@@ -11382,7 +12401,8 @@ mod fp_name_parser_tests {
     use super::*;
 
     /// Every FCMP obligation in the fixed registry — both the `Fcmp_` and the
-    /// wasm `FCmp_` spelling — names a condition the FP evaluator knows.
+    /// wasm `FCmp_` spelling — follows the condition naming inventory. This is
+    /// not how the evaluator chooses the semantics of a stored expression.
     #[test]
     fn every_registry_fcmp_name_parses() {
         let db = crate::proof_database::ProofDatabase::new();
@@ -11409,21 +12429,422 @@ mod fp_name_parser_tests {
     /// obligation, FP ones included (`FCmp_OEq_f32 -> wasm` used to panic the
     /// name parser). A panic inside the process-wide memo cell would take a
     /// compile down; an unknown name is an `Unknown` verdict instead.
+    ///
+    /// "A verdict" includes the honest NON-verdict: the source-bound frame
+    /// theorem binds initial memory as the uninterpreted function
+    /// `entry_memory`, which concrete evaluation cannot interpret. It used to
+    /// panic `SmtExpr::eval`; it must now be `Unknown` naming that function —
+    /// and never `Valid`, which the evaluator has no evidence for.
     #[test]
     fn evaluator_returns_a_verdict_for_every_registry_obligation() {
         let db = crate::proof_database::ProofDatabase::new();
         let config = VerificationConfig::with_sample_count(2_000);
         let mut fp = 0;
+        let mut uf_bearing = Vec::new();
         for cp in db.all() {
             let ob = &cp.obligation;
             if ob.inputs.is_empty() {
                 fp += 1;
             }
-            let _ = verify_by_evaluation_with_config(ob, &config);
+            let verdict = verify_by_evaluation_with_config(ob, &config);
+            let ufs = evaluator_uninterpreted_functions(ob);
+            if ufs.is_empty() {
+                continue;
+            }
+            uf_bearing.push(ob.name.clone());
+            match &verdict {
+                VerificationResult::Unknown { reason } => {
+                    assert!(
+                        reason.starts_with("evaluator cannot decide: uninterpreted function"),
+                        "`{}`: non-verdict must be named, got {reason:?}",
+                        ob.name
+                    );
+                    for uf in &ufs {
+                        assert!(
+                            reason.contains(&format!("'{uf}'")),
+                            "`{}`: reason does not name UF {uf}: {reason:?}",
+                            ob.name
+                        );
+                    }
+                }
+                other => panic!(
+                    "`{}` carries UF(s) {ufs:?} but the evaluator returned {other:?}",
+                    ob.name
+                ),
+            }
         }
         assert!(
             fp >= 20,
             "expected FP-only obligations in the registry, saw {fp}"
         );
+        assert!(
+            uf_bearing
+                .iter()
+                .any(|n| n == crate::source_bound_frame::FRAME_OBLIGATION_NAME),
+            "expected the frame theorem among the UF-bearing entries, saw {uf_bearing:?}"
+        );
     }
+
+    /// The exportable source-bound frame theorem the registry carries applies
+    /// the uninterpreted `entry_memory` array; evaluation must decline it as
+    /// inconclusive, naming the function, not panic in `SmtExpr::eval` and not
+    /// credit a vacuous `Valid`.
+    #[test]
+    fn evaluator_declines_the_registry_frame_theorem_naming_its_uninterpreted_memory() {
+        let ob = crate::source_bound_frame::frame_obligation();
+        let result =
+            verify_by_evaluation_with_config(&ob, &VerificationConfig::with_sample_count(8));
+        assert!(
+            matches!(&result, VerificationResult::Unknown { reason } if reason.contains("entry_memory")),
+            "{result:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod uf_undecidable_tests {
+    //! A term the concrete evaluator has no interpretation for is a named,
+    //! fail-closed NON-verdict — never `Valid`, never a panic — on every
+    //! entry (primary, memoized, the scalar-only test seam) and identically
+    //! sequential vs chunked. Pinned after the frame theorem's `entry_memory`
+    //! took `SmtExpr::eval` down inside two registry sweeps.
+    use super::*;
+    use crate::memory_proofs::{encode_load_le, encode_store_le, memory_sort};
+    use crate::smt::{SmtExpr as E, SmtSort};
+
+    fn inputs(names: &[&str]) -> Vec<(String, u32)> {
+        names.iter().map(|n| (n.to_string(), 64)).collect()
+    }
+
+    fn obligation(
+        name: &str,
+        trust_ir: E,
+        machine: E,
+        pre: Vec<E>,
+        ins: &[&str],
+    ) -> ProofObligation {
+        ProofObligation {
+            name: name.into(),
+            trust_ir_expr: trust_ir,
+            aarch64_expr: machine,
+            inputs: inputs(ins),
+            preconditions: pre,
+            fp_inputs: Vec::new(),
+            category: None,
+            machine_side_provenance: MachineSideProvenance::StaticDb,
+        }
+    }
+
+    /// `entry_memory` shaped exactly like the frame theorems: a store then a
+    /// load through a zero-argument array-valued UF.
+    fn memory_roundtrip() -> E {
+        let sp = E::var("sp", 64);
+        let v = E::var("v", 64);
+        let memory = E::uf("entry_memory", Vec::new(), memory_sort());
+        encode_load_le(&encode_store_le(&memory, &sp, &v, 8), &sp, 8)
+    }
+
+    fn assert_uf_non_verdict(verdict: &VerificationResult, uf: &str) {
+        match verdict {
+            VerificationResult::Unknown { reason } => {
+                assert!(
+                    reason.starts_with("evaluator cannot decide: uninterpreted function")
+                        && reason.contains(&format!("'{uf}'")),
+                    "reason must name the UF: {reason:?}"
+                );
+            }
+            other => panic!("expected a UF non-verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uninterpreted_functions_are_collected_from_every_term() {
+        let ob = obligation(
+            "uf: collect",
+            E::uf("f", vec![E::var("a", 64)], SmtSort::BitVec(64)),
+            E::uf(
+                "g",
+                vec![E::uf("h", Vec::new(), SmtSort::BitVec(64))],
+                SmtSort::BitVec(64),
+            ),
+            vec![E::uf("p", Vec::new(), SmtSort::Bool)],
+            &["a"],
+        );
+        assert_eq!(evaluator_uninterpreted_functions(&ob), ["f", "g", "h", "p"]);
+        assert_eq!(
+            evaluator_uninterpreted_function_sites(&ob),
+            ["source expression", "machine expression", "precondition 0"]
+        );
+        let plain = obligation("uf: none", E::var("a", 64), E::var("a", 64), vec![], &["a"]);
+        assert!(evaluator_uninterpreted_functions(&plain).is_empty());
+        assert!(evaluator_undecidable(&plain).is_none());
+    }
+
+    /// The machine side reads back what it stored — true under EVERY
+    /// interpretation of `entry_memory`, and still not the evaluator's to
+    /// credit: it has no interpretation at all.
+    #[test]
+    fn uf_on_one_side_is_a_named_non_verdict_not_valid_and_not_a_panic() {
+        let ob = obligation(
+            "uf: memory roundtrip",
+            E::var("v", 64),
+            memory_roundtrip(),
+            vec![],
+            &["sp", "v"],
+        );
+        let cfg = VerificationConfig::with_sample_count(500);
+        assert_uf_non_verdict(&verify_by_evaluation_with_config(&ob, &cfg), "entry_memory");
+        assert_uf_non_verdict(&verify_by_evaluation(&ob), "entry_memory");
+        assert_uf_non_verdict(&memoized_verify_by_evaluation(&ob, &cfg), "entry_memory");
+    }
+
+    /// A UF only in a precondition must not be skipped as "unmet": on the
+    /// sampling path a skipped point is a vacuous pass, and `a == a` with
+    /// every point skipped would finish `Valid`.
+    #[test]
+    fn uf_in_a_precondition_is_a_non_verdict_never_a_vacuous_valid() {
+        let a = E::var("a", 64);
+        let ob = obligation(
+            "uf: precondition",
+            a.clone(),
+            a.clone().bvadd(E::bv_const(0, 64)),
+            vec![E::uf("admissible", vec![a], SmtSort::Bool)],
+            &["a", "b"],
+        );
+        let cfg = VerificationConfig::with_sample_count(500);
+        assert_uf_non_verdict(&verify_by_evaluation_with_config(&ob, &cfg), "admissible");
+        // The scalar-only seam (no whole-obligation gate would still reach
+        // `check_single_point`): same answer.
+        let scalar = CompiledObligation::try_new_scalar_only(&ob);
+        assert!(
+            scalar.is_none(),
+            "a UF must keep the obligation off the compiled tapes"
+        );
+        assert_uf_non_verdict(
+            &verify_by_evaluation_with_compiled(&ob, &cfg, scalar.as_ref()),
+            "admissible",
+        );
+    }
+
+    /// Identical sides carrying a UF: the shortcut that credits `e == e`
+    /// without a sweep is declined in lockstep on the primary entry and the
+    /// memo's elided copy of it. Both must say the same thing.
+    #[test]
+    fn identical_sides_with_a_uf_are_declined_in_lockstep_with_the_memo() {
+        let f = E::uf("f", vec![E::var("a", 64)], SmtSort::BitVec(64));
+        let ob = obligation("uf: identical sides", f.clone(), f, vec![], &["a", "b"]);
+        let cfg = VerificationConfig::with_sample_count(500);
+        assert!(
+            exhaustive_input_count(&ob, &cfg).is_none(),
+            "must be on the statistical path"
+        );
+        let primary = verify_by_evaluation_with_config(&ob, &cfg);
+        let memo = memoized_verify_by_evaluation(&ob, &cfg);
+        assert_uf_non_verdict(&primary, "f");
+        assert_eq!(format!("{primary:?}"), format!("{memo:?}"));
+    }
+
+    /// Sequential (scalar seam) and pooled/chunked sweeps agree on the
+    /// non-verdict, text included — it depends on the obligation, not on which
+    /// point or chunk saw it first.
+    #[test]
+    fn uf_non_verdict_is_identical_sequential_vs_chunked() {
+        let ob = obligation(
+            "uf: chunked",
+            E::var("v", 64),
+            memory_roundtrip(),
+            vec![],
+            &["sp", "v", "w"],
+        );
+        let cfg = VerificationConfig::with_sample_count(20_000);
+        let seq = format!(
+            "{:?}",
+            verify_by_evaluation_with_compiled(
+                &ob,
+                &cfg,
+                CompiledObligation::try_new_scalar_only(&ob).as_ref()
+            )
+        );
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let par = pool.install(|| format!("{:?}", verify_by_evaluation_with_config(&ob, &cfg)));
+        assert_eq!(seq, par);
+        assert!(seq.contains("'entry_memory'"), "{seq}");
+    }
+
+    /// The registry's own frame theorem, end to end.
+    #[test]
+    fn frame_theorem_is_a_named_non_verdict() {
+        let ob = crate::source_bound_frame::frame_obligation();
+        let cfg = VerificationConfig::with_sample_count(2_000);
+        assert_uf_non_verdict(&verify_by_evaluation_with_config(&ob, &cfg), "entry_memory");
+        assert_uf_non_verdict(&memoized_verify_by_evaluation(&ob, &cfg), "entry_memory");
+    }
+
+    /// The point-level backstop, for a term `try_eval` refuses that is NOT a
+    /// UF: a `select` on a bitvector is out of the compiled subset, so it
+    /// reaches the interpreter, which errors — the sweep stops with `Unknown`
+    /// (naming the failure), not a panic and not a skipped point.
+    #[test]
+    fn a_non_uf_evaluation_error_is_a_non_verdict_not_a_panic() {
+        let bad = E::select(E::var("a", 64), E::var("b", 64));
+        let ob = obligation(
+            "select on bv",
+            E::var("a", 64),
+            bad.clone(),
+            vec![],
+            &["a", "b"],
+        );
+        assert!(
+            evaluator_undecidable(&ob).is_none(),
+            "no UF here: the gate must not fire"
+        );
+        assert!(CompiledObligation::try_new(&ob).is_none());
+        let cfg = VerificationConfig::with_sample_count(500);
+        match verify_by_evaluation_with_config(&ob, &cfg) {
+            VerificationResult::Unknown { reason } => assert!(
+                reason.starts_with("cannot concretely evaluate machine expression")
+                    && reason.contains("select on non-array"),
+                "{reason:?}"
+            ),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // ... and in a precondition, the same: never an unmet-skip.
+        let ob = obligation(
+            "select on bv (precondition)",
+            E::var("a", 64),
+            E::var("a", 64).bvadd(E::bv_const(0, 64)),
+            vec![bad.eq_expr(E::bv_const(0, 8))],
+            &["a", "b"],
+        );
+        match verify_by_evaluation_with_config(&ob, &cfg) {
+            VerificationResult::Unknown { reason } => assert!(
+                reason.starts_with("cannot concretely evaluate precondition 0")
+                    && reason.contains("select on non-array"),
+                "{reason:?}"
+            ),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "lowering_proof_eval_errors.rs"]
+mod eval_error_tests;
+
+#[cfg(test)]
+#[path = "lowering_proof_vacuous_sample_tests.rs"]
+mod vacuous_sample_tests;
+
+/// Least number of precondition-satisfying points the directed trials must
+/// contribute for [`assert_directed_sampling_holds_at`]: a sweep whose only
+/// evidence is a handful of points is not the evidence these tests claim.
+#[cfg(test)]
+pub(crate) const MIN_DIRECTED_EVIDENCE: u64 = 64;
+
+/// Test support for an obligation whose preconditions RELATE its inputs (two
+/// aligned, disjoint addresses; `x == y`; `is_fixed == 1`) so that the
+/// uniform draws of the multi-input sweep never satisfy them and only its
+/// precondition-directed trials do (NEW-CG-SAMPLER; before them the sweep
+/// compared nothing and reported the vacuous-sample `Unknown`, TRUSTCG-02).
+/// [`verify_by_evaluation`] must be `Valid`, the directed trials alone must
+/// have compared at least [`MIN_DIRECTED_EVIDENCE`] points, and the claim is
+/// also checked at each explicit `witness` (every input bound, in range):
+/// every precondition must hold and both sides must evaluate and agree.
+#[cfg(test)]
+pub(crate) fn assert_directed_sampling_holds_at(
+    obligation: &ProofObligation,
+    witnesses: &[&[(&str, u64)]],
+) {
+    assert_directed_sampling_valid(obligation);
+    assert!(
+        !witnesses.is_empty(),
+        "'{}': explicit witnesses are required",
+        obligation.name
+    );
+    for witness in witnesses {
+        assert_holds_at_witness(obligation, witness);
+    }
+}
+
+/// The sampled half of [`assert_directed_sampling_holds_at`]: the sweep is
+/// `Valid` and its directed trials alone compared at least
+/// [`MIN_DIRECTED_EVIDENCE`] points.
+#[cfg(test)]
+pub(crate) fn assert_directed_sampling_valid(obligation: &ProofObligation) {
+    let sampled = verify_by_evaluation(obligation);
+    assert!(
+        matches!(sampled, VerificationResult::Valid),
+        "'{}': the directed trials reach its preconditions, so the sweep must compare \
+         points and agree, got {sampled:?}",
+        obligation.name
+    );
+    assert!(
+        needs_multi_input_sampling(obligation),
+        "'{}'",
+        obligation.name
+    );
+    let compiled = CompiledObligation::try_new(obligation);
+    let mut env = multi_input_sweep_env(obligation);
+    let directed = directed_chunk_multi(
+        obligation,
+        compiled.as_ref(),
+        directed_trial_count(obligation, VerificationConfig::default().sample_count),
+        &mut env,
+    )
+    .expect("a correct obligation has no terminal directed point");
+    assert!(
+        directed >= MIN_DIRECTED_EVIDENCE,
+        "'{}': the directed trials compared only {directed} points",
+        obligation.name
+    );
+}
+
+/// Every precondition holds at `witness` (every input bound, in range) and
+/// both sides evaluate and agree there.
+#[cfg(test)]
+fn assert_holds_at_witness(obligation: &ProofObligation, witness: &[(&str, u64)]) {
+    let mut env = EvalEnv::default();
+    for (name, value) in witness.iter() {
+        env.insert((*name).to_string(), *value);
+    }
+    for (name, width) in &obligation.inputs {
+        let value = *env.get(name).unwrap_or_else(|| {
+            panic!(
+                "'{}': witness {witness:?} leaves `{name}` unbound",
+                obligation.name
+            )
+        });
+        assert_eq!(
+            value,
+            mask(value, *width),
+            "'{}': witness value for `{name}` exceeds {width} bits",
+            obligation.name
+        );
+    }
+    for (index, pre) in obligation.preconditions.iter().enumerate() {
+        let held = pre
+            .try_eval(&env)
+            .unwrap_or_else(|error| panic!("'{}': precondition {index}: {error}", obligation.name));
+        assert!(
+            held.as_bool(),
+            "'{}': witness {witness:?} must satisfy precondition {index}",
+            obligation.name
+        );
+    }
+    let source = obligation
+        .trust_ir_expr
+        .try_eval(&env)
+        .unwrap_or_else(|error| panic!("'{}': source side: {error}", obligation.name));
+    let machine = obligation
+        .aarch64_expr
+        .try_eval(&env)
+        .unwrap_or_else(|error| panic!("'{}': machine side: {error}", obligation.name));
+    assert!(
+        source.semantically_equal(&machine),
+        "'{}' disagrees at witness {witness:?}: source={source:?}, machine={machine:?}",
+        obligation.name
+    );
 }

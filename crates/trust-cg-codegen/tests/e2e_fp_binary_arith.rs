@@ -97,11 +97,14 @@ fn build_binop_jit(
     f_ty: Ty,
     op: BinOp,
 ) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![int_ty.clone(), int_ty.clone()],
-        returns: vec![int_ty.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![int_ty.clone(), int_ty.clone()],
+            returns: vec![int_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -143,17 +146,21 @@ fn build_binop_jit(
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// JIT (a*b)+c as TWO SEPARATE ops (FMul then FAdd), integer-bits in/out:
 /// fn(i64,i64,i64)->i64. Used by the anti-fusion (no-FMADD-contraction) control.
 fn build_muladd_jit_f64(func_id: u32, name: &str, m: &mut TrustIrModule) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -212,7 +219,8 @@ fn build_muladd_jit_f64(func_id: u32, name: &str, m: &mut TrustIrModule) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -222,6 +230,7 @@ fn build_muladd_jit_f64(func_id: u32, name: &str, m: &mut TrustIrModule) {
 fn jit_buffer(m: &TrustIrModule) -> trust_cg_codegen::jit::ExecutableBuffer {
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(m, &HashMap::new())
         .expect("hand-built fp binary-arith module must JIT-compile")
         .buffer
@@ -1406,4 +1415,13 @@ fn armed_controls() {
          f32-widened model); sub/div operand order preserved. A wrong-op / chop / precision-losing / \
          swapped-operand lowering WOULD be caught. The clean bills are load-bearing."
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

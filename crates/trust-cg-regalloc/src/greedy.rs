@@ -55,6 +55,8 @@ use crate::machine_types::{MachFunction, PReg, RegClass, VReg};
 use crate::split;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::time::Duration;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Sub-register aliasing support (issue #336)
@@ -331,6 +333,137 @@ impl Ord for PriorityEntry {
 }
 
 // ---------------------------------------------------------------------------
+// The split-generation bound
+// ---------------------------------------------------------------------------
+
+/// How many splits a live range may descend through before the allocator stops
+/// splitting it and spills instead.
+///
+/// THE RULE, and why it has this shape. LLVM’s greedy allocator advances a
+/// piece produced by splitting to `RS_Split2`/`RS_Spill` rather than back to the
+/// unbounded stage, so a split PRODUCT is not itself a candidate for unbounded
+/// splitting. This allocator used to put both halves back at [`Stage::New`]
+/// ([`GreedyAllocator::apply_split`]), which makes a high-pressure range split
+/// until its fragments are too short to split again — an unbounded cascade whose
+/// cost is quadratic, because every split appends a `PSEUDO_COPY` to
+/// `func.insts` and every later split attempt re-scans the grown list.
+///
+/// A generation of 1 is exactly LLVM’s rule: an original range may be split
+/// once, and each piece then takes assignment, eviction or a spill slot. The
+/// bound is expressed as a generation count rather than a stage so that deeper
+/// ladders can be measured against it.
+const DEFAULT_SPLIT_GENERATION_CAP: u32 = 1;
+
+/// The split-generation bound in force, or `None` for the historical unbounded
+/// cascade.
+///
+/// * unset — [`DEFAULT_SPLIT_GENERATION_CAP`].
+/// * `TCG_RA_SPLIT_DEPTH=<n>` — that generation bound instead; `0` disables
+///   splitting altogether.
+/// * `TCG_RA_SPLIT_UNBOUNDED=1` — the pre-bound behaviour, bit for bit, for
+///   reproducing an old measurement. It wins over `TCG_RA_SPLIT_DEPTH`.
+///
+/// WHAT THE BOUND MEASURED, on the Clean-kernel corpus (2026-09-27/28,
+/// `x86_64-unknown-linux-gnu`, release, stock rustc 1.97.1). Unbounded,
+/// `build_env` in `clean_lazy_delta.gate.trust.tir` — 776 vregs, 1565 trust-ir
+/// instructions, 151 blocks — performs 159 813 splits, grows `func.insts` from
+/// ~1.8k to 161 653, SPILLS 157 852 of the 160 589 resulting pieces, and costs
+/// 331s of a 343s module compile. At generation 1 the same module compiles in
+/// under half a second and its object is ~7.8x SMALLER: the cascade was inserting
+/// copies that were then spilled, so a split copy that is itself spilled becomes
+/// store+reload — strictly worse than spilling its parent. Deeper generations
+/// are monotonically slower AND bigger on this corpus.
+///
+/// THIS IS A QUALITY DECISION, NOT A CORRECTNESS ONE. Spilling more is always
+/// sound, and every allocation the bound produces still goes through the
+/// always-on regalloc translation validator and the x86 TV-4/TV-5 recheck. It
+/// does change emitted bytes, so a byte-identity comparison against a
+/// pre-bound recording must set `TCG_RA_SPLIT_UNBOUNDED=1` — with a NON-EMPTY
+/// value, since an empty one reads as unset (see the body).
+///
+/// IT IS NOT A NO-OP OUTSIDE THE CLEAN CORPUS. An earlier claim that it was
+/// rested on a broken A/B (the bounded side exported the override as `""`, which
+/// the old `is_some()` test read as SET, so both sides ran unbounded). Re-run
+/// across all 34 `e2e_x86_64_*` suites — 489 greedy allocations, 57 of which
+/// split — three suites and eight distinct functions differ, and on every one of
+/// the eight the bound emits FEWER instructions, no more spills, fewer splits and
+/// fewer live vregs: `tcg_cs_stress` and `tcg_cs_two_exit` in
+/// `e2e_x86_64_callee_saved`, four bodies in `e2e_x86_64_fp_across_call`, and
+/// `_deep_select_chain` in `e2e_x86_64_triple_oracle` (117 instructions and 26
+/// spills become 77 and 6). All three suites pass in BOTH modes, one of them a
+/// cross-backend oracle. The remaining 31 suites are byte-identical. Execution
+/// speed of the changed bodies is still unmeasured on x86.
+fn split_depth_cap() -> Option<u32> {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<Option<u32>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        // An EMPTY or whitespace value counts as unset, not as "unbounded".
+        // `var_os(..).is_some()` treats `TCG_RA_SPLIT_UNBOUNDED=` as set, which
+        // silently makes a bounded-vs-unbounded A/B run the unbounded path on
+        // BOTH sides and report a spurious byte-identical result. That is not a
+        // hypothetical: it is how the first version of this commit's
+        // outside-the-corpus measurement came to claim the bound was a no-op.
+        if unbounded_override_is_set(std::env::var_os("TCG_RA_SPLIT_UNBOUNDED").as_deref()) {
+            return None;
+        }
+        Some(
+            std::env::var("TCG_RA_SPLIT_DEPTH")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(DEFAULT_SPLIT_GENERATION_CAP),
+        )
+    })
+}
+
+/// Whether `TCG_RA_SPLIT_UNBOUNDED` asks for the pre-bound path.
+///
+/// Empty and whitespace-only values read as UNSET. Pulled out as a pure
+/// function because [`split_depth_cap`] memoizes in a `OnceLock` and so cannot
+/// be exercised twice in one process.
+fn unbounded_override_is_set(raw: Option<&std::ffi::OsStr>) -> bool {
+    raw.is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC (default off, `TCG_RA_GREEDY_STATS=1`): where the greedy
+// allocator's own time goes, per function.
+// ---------------------------------------------------------------------------
+//
+// `TRUST_CG_TIME_PASSES` reports the `allocate` stage as one number. On the
+// Clean-kernel corpus that stage is 94% of a whole module compile (measured
+// 2026-09-27: `build_env` in `clean_lazy_delta.gate.trust.tir`, 323.3s of a
+// 343.3s compile), so it needs splitting into the worklist's own steps. This
+// counts and times them. PURELY OBSERVATIONAL: inert unless the env var is set,
+// and it never reads or writes an interval, an assignment or a verdict.
+
+fn greedy_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_RA_GREEDY_STATS").is_some())
+}
+
+/// Counters and wall time for one function's greedy allocation. Diagnostic
+/// only; see [`greedy_stats_enabled`].
+#[derive(Debug, Default, Clone)]
+struct GreedyStats {
+    pops: u64,
+    try_assign_calls: u64,
+    try_assign_hits: u64,
+    try_evict_calls: u64,
+    try_evict_hits: u64,
+    try_split_calls: u64,
+    try_split_hits: u64,
+    spills: u64,
+    split_attempts: u64,
+    interference_start_calls: u64,
+    t_try_assign: Duration,
+    t_try_evict: Duration,
+    t_try_split: Duration,
+    t_interference_start: Duration,
+    t_split_attempts: Duration,
+}
+
+// ---------------------------------------------------------------------------
 // Greedy allocator
 // ---------------------------------------------------------------------------
 
@@ -349,6 +482,9 @@ pub struct GreedyAllocator {
     /// [`Self::set_hint_exempt`]). Empty by default, which reproduces the
     /// historical hint behavior exactly.
     hint_exempt: BTreeMap<(VReg, PReg), Vec<u32>>,
+    /// Per vreg, call positions where the call reads it for the last time
+    /// (see [`Self::set_call_operand_exempt`]). Empty by default.
+    call_operand_exempt: BTreeMap<VReg, Vec<u32>>,
     /// Physical registers reserved at specific instruction positions by
     /// implicit defs, such as call-clobbered ABI registers.
     reserved_regs: BTreeMap<PReg, Vec<u32>>,
@@ -396,7 +532,7 @@ pub struct GreedyAllocator {
     /// Main priority queue.
     worklist: BinaryHeap<PriorityEntry>,
 
-    // -- KILL-OR-COMMIT stats recording (docs/per-use-splitting-plan.md) --
+    // -- KILL-OR-COMMIT stats recording (docs/archive/per-use-splitting-plan.md) --
     // Inert unless TCG_AY_KILLCOMMIT is set; never affects any allocation
     // decision — it only remembers what the allocator did so the stats probe
     // can embed greedy's realized solution.
@@ -406,6 +542,19 @@ pub struct GreedyAllocator {
     killcommit_splits: Vec<(u32, u32)>,
     /// Split parentage: new piece vreg id -> the vreg id it was split from.
     killcommit_parent: BTreeMap<u32, u32>,
+
+    /// DIAGNOSTIC counters/timers, populated only when `TCG_RA_GREEDY_STATS`
+    /// is set (see [`GreedyStats`]). Never read by an allocation decision.
+    stats: GreedyStats,
+    /// DIAGNOSTIC: positions scanned by `find_interference_start` (a `&self`
+    /// method, hence the cell). Counted unconditionally; read only by the
+    /// env-gated report.
+    scanned_positions: std::cell::Cell<u64>,
+    /// How many splits separate each vreg from the original range it descends
+    /// from — its split GENERATION. Two map writes per realized split, read by
+    /// the split-generation bound in [`split_depth_cap`] on every compile
+    /// (`TCG_RA_SPLIT_UNBOUNDED=1` makes the bound `None` and this unread).
+    split_depth: BTreeMap<VReg, u32>,
 }
 
 impl GreedyAllocator {
@@ -450,6 +599,7 @@ impl GreedyAllocator {
             allocatable_regs: allocatable.clone(),
             hints,
             hint_exempt: BTreeMap::new(),
+            call_operand_exempt: BTreeMap::new(),
             reserved_regs,
             reserved_union: std::cell::RefCell::new(BTreeMap::new()),
             max_cascade_depth: 10,
@@ -467,6 +617,9 @@ impl GreedyAllocator {
             killcommit_recording: crate::killcommit::recording_enabled(),
             killcommit_splits: Vec::new(),
             killcommit_parent: BTreeMap::new(),
+            stats: GreedyStats::default(),
+            scanned_positions: std::cell::Cell::new(0),
+            split_depth: BTreeMap::new(),
         }
     }
 
@@ -497,6 +650,30 @@ impl GreedyAllocator {
     /// Empty (the default) reproduces the historical behavior byte for byte.
     pub fn set_hint_exempt(&mut self, hint_exempt: BTreeMap<(VReg, PReg), Vec<u32>>) {
         self.hint_exempt = hint_exempt;
+    }
+
+    /// Supply, per vreg, the call positions at which it is read as the call's
+    /// own operand for the last time (`crate::dying_call_operand_positions`).
+    /// The call reads it before its clobbers take effect, so a register
+    /// reserved at that position does not interfere with it, on every
+    /// assignment path; each position is re-checked against the interval it
+    /// is applied to (its last point). Empty (the default) reproduces the
+    /// strict check.
+    pub fn set_call_operand_exempt(&mut self, exempt: BTreeMap<VReg, Vec<u32>>) {
+        self.call_operand_exempt = exempt;
+    }
+
+    fn call_operand_exempt_for(&self, vreg: VReg, interval: &LiveInterval) -> Vec<u32> {
+        self.call_operand_exempt
+            .get(&vreg)
+            .map(|positions| {
+                positions
+                    .iter()
+                    .copied()
+                    .filter(|&p| interval.end() == p + 1)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Returns typed split failures observed while searching split candidates.
@@ -581,8 +758,15 @@ impl GreedyAllocator {
         &mut self,
         func: &mut MachFunction,
     ) -> Result<AllocationResult, AllocError> {
+        // DIAGNOSTIC only (`TCG_RA_GREEDY_STATS`); see `GreedyStats`.
+        let stats_on = greedy_stats_enabled();
+        let initial_vregs = self.intervals.len();
+        let t_all = stats_on.then(Instant::now);
         while let Some(entry) = self.worklist.pop() {
             let vreg = entry.vreg;
+            if stats_on {
+                self.stats.pops += 1;
+            }
 
             if self.is_assigned(vreg) || self.is_spilled(vreg) {
                 continue;
@@ -594,7 +778,14 @@ impl GreedyAllocator {
             }
 
             // Step 1: try direct assignment.
-            if let Some(preg) = self.try_assign(vreg) {
+            let t = stats_on.then(Instant::now);
+            let assigned = self.try_assign(vreg);
+            if let Some(t) = t {
+                self.stats.t_try_assign += t.elapsed();
+                self.stats.try_assign_calls += 1;
+                self.stats.try_assign_hits += u64::from(assigned.is_some());
+            }
+            if let Some(preg) = assigned {
                 self.assign(vreg, preg);
                 self.advance_stage(vreg, Stage::Done);
                 continue;
@@ -602,7 +793,14 @@ impl GreedyAllocator {
 
             // Step 2: try eviction.
             if current_stage <= Stage::Evict {
-                if let Some(preg) = self.try_evict(vreg) {
+                let t = stats_on.then(Instant::now);
+                let evicted = self.try_evict(vreg);
+                if let Some(t) = t {
+                    self.stats.t_try_evict += t.elapsed();
+                    self.stats.try_evict_calls += 1;
+                    self.stats.try_evict_hits += u64::from(evicted.is_some());
+                }
+                if let Some(preg) = evicted {
                     self.assign(vreg, preg);
                     self.advance_stage(vreg, Stage::Done);
                     continue;
@@ -615,9 +813,24 @@ impl GreedyAllocator {
                 continue;
             }
 
-            // Step 3: try splitting.
-            if current_stage == Stage::Split {
-                if self.try_split(vreg, func) {
+            // Step 3: try splitting, within the split-generation bound.
+            //
+            // `depth_exhausted` is the LLVM-shaped rule from
+            // [`split_depth_cap`]: a range that already descends through the
+            // permitted number of splits does not split again, it advances to
+            // Spill. `TCG_RA_SPLIT_UNBOUNDED=1` makes the cap `None` and this
+            // the historical unbounded path.
+            let depth_exhausted = split_depth_cap()
+                .is_some_and(|cap| self.split_depth.get(&vreg).copied().unwrap_or(0) >= cap);
+            if current_stage == Stage::Split && !depth_exhausted {
+                let t = stats_on.then(Instant::now);
+                let split = self.try_split(vreg, func);
+                if let Some(t) = t {
+                    self.stats.t_try_split += t.elapsed();
+                    self.stats.try_split_calls += 1;
+                    self.stats.try_split_hits += u64::from(split);
+                }
+                if split {
                     // Both halves have been re-enqueued; do not spill.
                     continue;
                 }
@@ -628,11 +841,65 @@ impl GreedyAllocator {
                 });
                 continue;
             }
+            if current_stage == Stage::Split {
+                // The split-generation bound is exhausted for this range: take
+                // a spill slot rather than fragment it further.
+                self.advance_stage(vreg, Stage::Spill);
+                self.worklist.push(PriorityEntry {
+                    vreg,
+                    weight: entry.weight,
+                });
+                continue;
+            }
 
             // Step 4: spill.
+            if stats_on {
+                self.stats.spills += 1;
+            }
             self.do_spill(vreg);
         }
 
+        if let Some(t_all) = t_all {
+            let s = &self.stats;
+            eprintln!(
+                "[trust-cg-ra-greedy] func={} insts={} blocks={} vregs_in={} vregs_end={} \
+                 total_ms={:.1} pops={} assign={}/{} {:.1}ms evict={}/{} {:.1}ms \
+                 split={}/{} {:.1}ms split_attempts={} {:.1}ms \
+                 interference_start={} pos={} {:.1}ms spills={}",
+                func.name,
+                func.insts.len(),
+                func.blocks.len(),
+                initial_vregs,
+                self.intervals.len(),
+                t_all.elapsed().as_secs_f64() * 1e3,
+                s.pops,
+                s.try_assign_hits,
+                s.try_assign_calls,
+                s.t_try_assign.as_secs_f64() * 1e3,
+                s.try_evict_hits,
+                s.try_evict_calls,
+                s.t_try_evict.as_secs_f64() * 1e3,
+                s.try_split_hits,
+                s.try_split_calls,
+                s.t_try_split.as_secs_f64() * 1e3,
+                s.split_attempts,
+                s.t_split_attempts.as_secs_f64() * 1e3,
+                s.interference_start_calls,
+                self.scanned_positions.get(),
+                s.t_interference_start.as_secs_f64() * 1e3,
+                s.spills,
+            );
+            let helpers = split::take_split_helper_stats();
+            let mut row = format!("[trust-cg-ra-greedy-helpers] func={}", func.name);
+            for (name, stat) in split::SPLIT_HELPER_NAMES.iter().zip(helpers.iter()) {
+                row.push_str(&format!(
+                    " {name}={} {:.1}ms",
+                    stat.calls,
+                    stat.nanos as f64 / 1e6
+                ));
+            }
+            eprintln!("{row}");
+        }
         Ok(self.build_result())
     }
 
@@ -677,12 +944,13 @@ impl GreedyAllocator {
         let Some(interval) = self.intervals.get(&vreg) else {
             return false;
         };
-        let exempt = self
+        let mut exempt = self
             .hint_exempt
             .get(&(vreg, preg))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if self.reserved_interferes_except(interval, preg, exempt) {
+            .cloned()
+            .unwrap_or_default();
+        exempt.extend(self.call_operand_exempt_for(vreg, interval));
+        if self.reserved_interferes_except(interval, preg, &exempt) {
             return true;
         }
         self.interferes_with_preg(vreg, preg, interval)
@@ -696,7 +964,8 @@ impl GreedyAllocator {
             None => return false,
         };
 
-        if self.reserved_interferes(interval, preg) {
+        let call_exempt = self.call_operand_exempt_for(vreg, interval);
+        if self.reserved_interferes_except(interval, preg, &call_exempt) {
             return true;
         }
 
@@ -718,9 +987,39 @@ impl GreedyAllocator {
         preg: PReg,
         exempt: &[u32],
     ) -> bool {
+        // SAME existential, searched from the RANGE side.
+        //
+        // `with_reserved_points` hands back a SORTED, deduplicated position list
+        // (it sorts and dedups before memoizing), so the reserved positions that
+        // fall inside one live range are a CONTIGUOUS SLICE, locatable by two
+        // binary searches. The historical form scanned EVERY reserved position
+        // and called `is_live_at` (itself a binary search over `ranges`) on each:
+        // O(|pts| . log|ranges|).
+        //
+        // WHY THAT MATTERED. `reserve_implicit_use_spans` /
+        // `reserve_incoming_argument_spans` record ONE POSITION PER INSTRUCTION
+        // of a span, so a function that keeps an argument register live across a
+        // long call-bearing region gets a `pts` list proportional to the FUNCTION
+        // LENGTH, and `try_assign` runs this once per allocatable register per
+        // vreg. That made the closure the single largest self-time item inside
+        // the greedy allocator. Walking the (few) ranges instead is
+        // O(|ranges| . log|pts|).
+        //
+        // IDENTITY. `is_live_at(pos)` is true iff some range contains `pos`
+        // under half-open [start, end) semantics, so "some pos in `pts` is live
+        // and not exempt" is exactly "for some range r, some pos in
+        // `pts` inter [r.start, r.end) is not exempt". Both forms are pure
+        // existentials over the same set, so evaluation order is immaterial. A
+        // degenerate empty range [s, s) selects an empty slice, matching
+        // `is_live_at`'s refusal to report it. Neither sortedness nor
+        // disjointness of `ranges` is assumed — only that `pts` is sorted, which
+        // `with_reserved_points` establishes.
         self.with_reserved_points(preg, |pts| {
-            pts.iter()
-                .any(|&pos| interval.is_live_at(pos) && !exempt.contains(&pos))
+            interval.ranges.iter().any(|r| {
+                let lo = pts.partition_point(|&p| p < r.start);
+                let hi = pts.partition_point(|&p| p < r.end);
+                pts[lo..hi].iter().any(|pos| !exempt.contains(pos))
+            })
         })
     }
 
@@ -1105,33 +1404,59 @@ impl GreedyAllocator {
         };
 
         let mut attempted = BTreeSet::new();
+        let stats_on = greedy_stats_enabled();
 
         // Strategy 1: gap-based split (least aggressive, best quality).
         for split_point in Self::gap_split_points_by_quality(&interval) {
-            if attempted.insert(split_point)
-                && self.try_split_at(vreg, &interval, split_point, func)
-            {
-                return true;
+            if attempted.insert(split_point) {
+                let t = stats_on.then(Instant::now);
+                let ok = self.try_split_at(vreg, &interval, split_point, func);
+                if let Some(t) = t {
+                    self.stats.t_split_attempts += t.elapsed();
+                    self.stats.split_attempts += 1;
+                }
+                if ok {
+                    return true;
+                }
             }
         }
 
         // Strategy 2: interference-aware split.
-        if let Some(interference_start) = self.find_interference_start(vreg)
+        let t = stats_on.then(Instant::now);
+        let interference_start = self.find_interference_start(vreg);
+        if let Some(t) = t {
+            self.stats.t_interference_start += t.elapsed();
+            self.stats.interference_start_calls += 1;
+        }
+        if let Some(interference_start) = interference_start
             && let Some(split_point) =
                 split::find_split_near_interference(&interval, interference_start)
             && attempted.insert(split_point)
-            && self.try_split_at(vreg, &interval, split_point, func)
         {
-            return true;
+            let t = stats_on.then(Instant::now);
+            let ok = self.try_split_at(vreg, &interval, split_point, func);
+            if let Some(t) = t {
+                self.stats.t_split_attempts += t.elapsed();
+                self.stats.split_attempts += 1;
+            }
+            if ok {
+                return true;
+            }
         }
 
         // Strategy 3: per-use split (most aggressive).
         let per_use_splits = split::find_per_use_split_points(&interval);
         for (split_point, _weight) in per_use_splits {
-            if attempted.insert(split_point)
-                && self.try_split_at(vreg, &interval, split_point, func)
-            {
-                return true;
+            if attempted.insert(split_point) {
+                let t = stats_on.then(Instant::now);
+                let ok = self.try_split_at(vreg, &interval, split_point, func);
+                if let Some(t) = t {
+                    self.stats.t_split_attempts += t.elapsed();
+                    self.stats.split_attempts += 1;
+                }
+                if ok {
+                    return true;
+                }
             }
         }
 
@@ -1180,7 +1505,7 @@ impl GreedyAllocator {
         match split::split_interval_checked(interval, split_point, func) {
             Ok(result) => {
                 if self.killcommit_recording {
-                    // Stats-only (docs/per-use-splitting-plan.md): remember the
+                    // Stats-only (docs/archive/per-use-splitting-plan.md): remember the
                     // realized split point + piece parentage. Positions are in
                     // the phase-5-entry numbering (the split machinery skips
                     // its own inserted copies when interpreting positions).
@@ -1204,6 +1529,11 @@ impl GreedyAllocator {
     /// Apply a split result: remove the old interval, insert both halves,
     /// and enqueue them on the worklist.
     fn apply_split(&mut self, vreg: VReg, result: split::SplitResult) {
+        // Split generation of both halves. Both go back on the worklist at
+        // [`Stage::New`] so they can still be assigned or evict, but their
+        // generation is one deeper than their parent’s, which is what stops the
+        // cascade at [`split_depth_cap`] — LLVM’s `RS_Split2` rule.
+        let child_depth = self.split_depth.get(&vreg).copied().unwrap_or(0) + 1;
         // Remove the old interval.
         self.intervals.remove(&vreg);
         self.stage.remove(&vreg);
@@ -1227,6 +1557,8 @@ impl GreedyAllocator {
             vreg: new_vreg,
             weight: new_weight,
         });
+        self.split_depth.insert(orig_vreg, child_depth);
+        self.split_depth.insert(new_vreg, child_depth);
     }
 
     // -----------------------------------------------------------------------
@@ -1245,16 +1577,22 @@ impl GreedyAllocator {
         let class = interval.vreg.class;
         let allocatable = self.allocatable_regs.get(&class)?;
 
+        let mut scanned: u64 = 0;
         for range in &interval.ranges {
             for pos in range.start..range.end {
+                scanned += 1;
                 let all_interfere = allocatable
                     .iter()
                     .all(|&preg| self.is_occupied_at(preg, pos, vreg));
                 if all_interfere {
+                    self.scanned_positions
+                        .set(self.scanned_positions.get() + scanned);
                     return Some(pos);
                 }
             }
         }
+        self.scanned_positions
+            .set(self.scanned_positions.get() + scanned);
 
         None
     }
@@ -1393,6 +1731,24 @@ mod tests {
     };
     use crate::phi_elim;
     use std::collections::BTreeMap;
+
+    /// An empty `TCG_RA_SPLIT_UNBOUNDED` must read as UNSET.
+    ///
+    /// Regression pin for a measurement defect, not a feature: a shell loop
+    /// that exports the variable as `""` on the bounded side of an A/B runs the
+    /// UNBOUNDED path on both sides, so the two recordings come out identical
+    /// and the bound looks like a no-op when it is not.
+    #[test]
+    fn empty_unbounded_override_reads_as_unset() {
+        use std::ffi::OsStr;
+        assert!(!unbounded_override_is_set(None));
+        assert!(!unbounded_override_is_set(Some(OsStr::new(""))));
+        assert!(!unbounded_override_is_set(Some(OsStr::new("  "))));
+        assert!(!unbounded_override_is_set(Some(OsStr::new("\t\n"))));
+        assert!(unbounded_override_is_set(Some(OsStr::new("1"))));
+        assert!(unbounded_override_is_set(Some(OsStr::new("0"))));
+        assert!(unbounded_override_is_set(Some(OsStr::new(" yes "))));
+    }
 
     // -- helpers --
 

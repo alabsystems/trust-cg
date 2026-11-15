@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: BY-VALUE AGGREGATES across the ABI — structs / tuples /
 // fixed arrays / multi-variant enums / Option passed, returned, stored, matched,
@@ -12,7 +16,7 @@ mod target_dir_support;
 // License: Apache-2.0
 //
 // Every case is a FULL-PROGRAM differential: the same source is compiled by BOTH
-// the trust-cg bridge AND the stock LLVM backend, both binaries are run, and the
+// the trust-cg bridge AND trustc's own LLVM backend, both binaries are run, and the
 // trust-cg exit code MUST equal the LLVM exit code. A wrong field offset or ABI
 // register class (the danger of by-value aggregates) shows up as a mismatch.
 //
@@ -33,68 +37,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run byval-aggregate test");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -110,7 +60,7 @@ fn backend_arg(dylib: &Path) -> OsString {
     s
 }
 
-/// Compile `src` with the given backend (`None` = stock LLVM, `Some(dylib)` =
+/// Compile `src` with the given backend (`None` = trustc's LLVM, `Some(dylib)` =
 /// trust-cg) at `-Copt-level=0`. Returns `(compiled_ok, stderr)`.
 fn compile(dylib: Option<&Path>, dir: &Path, src: &Path, out: &Path) -> (bool, String) {
     compile_at(dylib, dir, src, out, 0)
@@ -127,9 +77,8 @@ fn compile_at(
     out: &Path,
     opt_level: u8,
 ) -> (bool, String) {
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = dylib {
         cmd.arg(backend_arg(dylib));
     }
@@ -161,7 +110,10 @@ fn assert_byval_matches_llvm(stem: &str, src_text: &str) {
     // LLVM ground truth.
     let llvm_bin = dir.join("llvm_out");
     let (llvm_ok, llvm_err) = compile(None, &dir, &src, &llvm_bin);
-    assert!(llvm_ok, "[{stem}] LLVM backend failed to compile. stderr: <<<{llvm_err}>>>");
+    assert!(
+        llvm_ok,
+        "[{stem}] LLVM backend failed to compile. stderr: <<<{llvm_err}>>>"
+    );
     let llvm_run = Command::new(&llvm_bin).output().expect("run llvm binary");
     let llvm_exit = llvm_run.status.code();
 
@@ -177,7 +129,9 @@ fn assert_byval_matches_llvm(stem: &str, src_text: &str) {
         !tcg_err.contains("failing closed"),
         "[{stem}] trust-cg unexpectedly failed closed. stderr: <<<{tcg_err}>>>"
     );
-    let tcg_run = Command::new(&tcg_bin).output().expect("run trust-cg binary");
+    let tcg_run = Command::new(&tcg_bin)
+        .output()
+        .expect("run trust-cg binary");
     let tcg_exit = tcg_run.status.code();
 
     let _ = std::fs::remove_dir_all(&dir);

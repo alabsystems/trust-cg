@@ -79,9 +79,22 @@
 //!    the function's whole lifetime. It is therefore safe to execute in the
 //!    preheader even when the loop body runs zero iterations (the value is
 //!    simply dead), in a conditional preheader, and ahead of any in-loop trap.
-//! 4. **Atomics/volatile/fences never participate**: any instruction carrying
-//!    an `X86ProofOrigin` (the atomic/volatile lowering marker) anywhere in the
-//!    loop disables the tier, and a marked load is never a candidate.
+//! 4. **Atomics/volatile/fences never participate**, but by TWO different
+//!    mechanisms, and conflating them is how the real guard gets deleted:
+//!
+//!    * ATOMICS carry an `X86ProofOrigin`. Any instruction carrying one
+//!      anywhere in the loop disables the tier, and a marked load is never a
+//!      candidate.
+//!    * VOLATILE carries NO `proof_origin` at all. `X86ProofOrigin` has exactly
+//!      three variants — `AtomicLoad`, `AtomicStore`, `FenceSeqCst` — so every
+//!      `proof_origin` check in this file is an ATOMICS-ONLY guard. Volatile is
+//!      lowered to the dedicated `Volatile*` opcodes, which
+//!      `crate::effects` maps to `MemoryEffect::Call`; what actually excludes
+//!      them here is the `MemoryEffect::Call` veto on the invariant-load tier.
+//!
+//!    This comment previously called `X86ProofOrigin` "the atomic/volatile
+//!    lowering marker". It is not, and a reader who believed it could remove
+//!    the effect check as redundant and silently lose the volatile guard.
 //!
 //! # Reference
 //!
@@ -97,7 +110,8 @@ use trust_cg_lower::instructions::Block;
 use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
 use crate::effects::{
-    MemoryEffect, x86_inst_effect, x86_produces_value, x86_reads_flags, x86_writes_flags,
+    MemoryEffect, x86_inst_effect, x86_operand0_may_be_read, x86_produces_value, x86_reads_flags,
+    x86_writes_flags,
 };
 use crate::mach_view;
 use crate::x86_pass_manager::X86MachinePass;
@@ -113,7 +127,13 @@ pub struct X86LoopInvariantCodeMotion {
     /// written RFLAGS is provably dead — see [`hoistable_flag_arith`] and
     /// [`rflags_dead_after_site`]/[`preheader_flag_hoist_safe`].
     hoist_flag_arith: bool,
+    /// POINTER-BASE invariant-load arm. DEFAULT ON at O2/O3 since 2026-09-29;
+    /// see [`pointer_base_load_is_hoistable`] for both measurements.
+    pointer_base_loads: bool,
     guarded_hoist: bool,
+    /// The pure-call cluster tier ([`hoist_pure_call_clusters`]). DEFAULT ON in
+    /// every policy; see [`pure_call_hoist_default`].
+    hoist_pure_calls: bool,
 }
 
 impl X86LoopInvariantCodeMotion {
@@ -122,7 +142,9 @@ impl X86LoopInvariantCodeMotion {
         Self {
             hoist_invariant_loads: false,
             hoist_flag_arith: false,
+            pointer_base_loads: false,
             guarded_hoist: false,
+            hoist_pure_calls: pure_call_hoist_default(),
         }
     }
 
@@ -132,8 +154,20 @@ impl X86LoopInvariantCodeMotion {
         Self {
             hoist_invariant_loads: true,
             hoist_flag_arith: true,
-            guarded_hoist: std::env::var_os("TCG_X86_LICM_GUARDED_HOIST").is_some(),
+            // The SINGLE place the arm's policy default is read, so the pipeline
+            // and every in-process test see the same answer.
+            pointer_base_loads: pointer_base_loads_default(),
+            guarded_hoist: guarded_hoist_default(),
+            hoist_pure_calls: pure_call_hoist_default(),
         }
+    }
+
+    /// Override the POINTER-BASE invariant-load arm, whose policy default is
+    /// ON — see [`pointer_base_loads_default`]. Used for A/B work and by tests
+    /// that need BOTH arms in one process without touching the global knob.
+    pub fn with_pointer_base_loads(mut self, enabled: bool) -> Self {
+        self.pointer_base_loads = enabled;
+        self
     }
 
     /// Override the flag-writing-arithmetic tier (Lever B kill switch). The load
@@ -143,15 +177,48 @@ impl X86LoopInvariantCodeMotion {
         self
     }
 
+    /// Override the pure-call cluster tier, whose policy default is ON — see
+    /// [`pure_call_hoist_default`]. Lets a test compare both arms in one
+    /// process without touching the global knob.
+    pub fn with_pure_call_hoist(mut self, enabled: bool) -> Self {
+        self.hoist_pure_calls = enabled;
+        self
+    }
+
     /// Run x86 LICM directly on an ISel function.
     pub fn run_on_function(&mut self, func: &mut X86ISelFunction) -> bool {
         run_impl(
             func,
             self.hoist_invariant_loads,
             self.hoist_flag_arith,
+            self.pointer_base_loads,
             self.guarded_hoist,
+            self.hoist_pure_calls,
         )
     }
+}
+
+static LICM_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the whole pass's opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-licm`). DEFAULT ON. With it set, the pass
+/// manager's run of x86 LICM changes nothing, at every opt level and in every
+/// tier: Region-LICM, the instruction tiers, the load arms and the pure-call
+/// clusters. Off is always correct: every instruction stays in its loop.
+///
+/// A diagnostic knob for the O2 proof census (slice 26's pre-build
+/// measurement, `~/tcg-scratch/s26-design`): it measures which roots LICM's
+/// hoists decide. `run_on_function` ignores it, so a test can still run the
+/// pass directly.
+pub fn set_licm_disabled(disabled: bool) -> bool {
+    match LICM_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LICM_DISABLED.get() == Some(&requested),
+    }
+}
+
+fn licm_disabled() -> bool {
+    LICM_DISABLED.get().copied().unwrap_or(false)
 }
 
 impl X86MachinePass for X86LoopInvariantCodeMotion {
@@ -160,11 +227,16 @@ impl X86MachinePass for X86LoopInvariantCodeMotion {
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
+        if licm_disabled() {
+            return false;
+        }
         run_impl(
             func,
             self.hoist_invariant_loads,
             self.hoist_flag_arith,
+            self.pointer_base_loads,
             self.guarded_hoist,
+            self.hoist_pure_calls,
         )
     }
 }
@@ -177,7 +249,9 @@ fn run_impl(
     func: &mut X86ISelFunction,
     hoist_invariant_loads: bool,
     hoist_flag_arith: bool,
+    pointer_base_loads: bool,
     guarded_hoist: bool,
+    hoist_pure_calls: bool,
 ) -> bool {
     // Need at least one back-edge to have a loop. A single block can have no
     // natural loop with a preheader, so bail fast in the common case.
@@ -203,7 +277,9 @@ fn run_impl(
 
     // S4 Region-LICM — Stage 2: hoist provably outer-invariant inner LOOPS out
     // of their enclosing loop (design §8 v2). DEFAULT-ON at O1+ (this pass does
-    // not run at O0); kill switch `TCG_NO_REGION_LICM`. The transform is
+    // not run at O0). `TCG_NO_REGION_LICM` is an in-process switch only
+    // (`trustc` refuses every `TCG_*` variable); through the compiler, the
+    // tracked `no-x86-licm` turns off the whole pass, this tier with it. The transform is
     // fail-safe by construction (every legality miss DECLINES to the correct
     // original) and was certified before the default-ON flip by: b03 (29x) /
     // b01 (24x) native == LLVM; all 18 perf benches ON-vs-OFF 0-mismatch; a
@@ -244,21 +320,31 @@ fn run_impl(
             &idom,
             hoist_invariant_loads,
             hoist_flag_arith,
+            pointer_base_loads,
         ) {
             changed = true;
         }
     }
 
-    // Pure-call cluster hoist tier (gated default-OFF behind `TCG_PURE_CALL_HOIST`;
-    // this pass has NO translation-validation net, so it stays opt-in until its
-    // `fuzz/repros/purecall/` adversarial corpus is differentially green). Hoists a
-    // loop-invariant call to a proven-pure callee out of a loop PROVEN to run
-    // >=1 time. Reuses the loops/idom/def_counts computed above — the existing
-    // value-producer hoists move instructions between body and preheader but
-    // never change the CFG or the whole-function def counts.
-    if pure_call_hoist_enabled() {
+    // Pure-call cluster hoist tier (on by default since 47e3d5694; the tracked
+    // opt-out `-Ztrust-ir-cg-args=no-x86-pure-call-hoist` switches it off). It
+    // has no translation-validation net: its nets are the unit tests below and
+    // the `fuzz/repros/purecall/` differential, which compiles each program
+    // with and without it. Hoists a loop-invariant call to a
+    // proven-pure callee that the loop's first iteration runs on every entry,
+    // after nothing the move could hide (`hoist_pure_call_clusters`). Reuses
+    // the loops/idom/def_counts computed above — the existing value-producer
+    // hoists move instructions between body and preheader but never change the
+    // CFG or the whole-function def counts.
+    let eh_call_blocks: HashSet<Block> = func
+        .eh_info
+        .call_sites
+        .iter()
+        .map(|site| site.call_block)
+        .collect();
+    if hoist_pure_calls {
         for lp in &loops {
-            if hoist_pure_call_clusters(func, lp, &def_counts, &idom) {
+            if hoist_pure_call_clusters(func, lp, &def_counts, &idom, &eh_call_blocks) {
                 changed = true;
             }
         }
@@ -275,16 +361,6 @@ fn run_impl(
     changed
 }
 
-/// Gate for the pure-call cluster hoist tier. Default ON (opt-out kill switch
-/// `TCG_NO_PURE_CALL_HOIST`). Landed default-on after a differential-fuzz
-/// campaign: baseline vs both-on preserved exit codes across 354 program-pairs
-/// (118 programs x -O0/-O2/-O3, x2-consistent, 0 mismatch), with the hoist
-/// firing in 75/90 generated pure-fn-in-loop programs. The tier still has no
-/// per-pass validation net, so the kill switch stays for fast rollback.
-fn pure_call_hoist_enabled() -> bool {
-    std::env::var_os("TCG_NO_PURE_CALL_HOIST").is_none()
-}
-
 // ===========================================================================
 // Hoisting
 // ===========================================================================
@@ -292,10 +368,11 @@ fn pure_call_hoist_enabled() -> bool {
 fn hoist_loop_invariants(
     func: &mut X86ISelFunction,
     lp: &NaturalLoop,
-    def_counts: &HashMap<VReg, usize>,
-    idom: &HashMap<Block, Block>,
+    def_counts: &HashMap<u32, usize>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
     hoist_invariant_loads: bool,
     hoist_flag_arith: bool,
+    pointer_base_loads: bool,
 ) -> bool {
     // Only hoist when a natural preheader exists. We never synthesize one:
     // rewiring CFG edges before proving any hoist is legal is exactly the
@@ -389,22 +466,23 @@ fn hoist_loop_invariants(
                         if !rflags_dead_after_site(func, block_id, idx) {
                             continue;
                         }
-                        if std::env::var_os("TCG_X86_LICM_ALU_LOG").is_some() {
-                            eprintln!(
-                                "[licm-flag-arith] ACCEPT {:?} in `{}` block #{:?}",
-                                inst.opcode, func.name, block_id.0,
-                            );
-                        }
                         def
                     } else if let Some(tier) = &load_tier {
                         let Some(def) = hoistable_invariant_load(
                             func,
                             inst,
                             tier,
-                            &loop_defs,
                             &invariant_vregs,
                             def_counts,
                             idom,
+                            &LoadSite {
+                                block_id,
+                                idx,
+                                lp,
+                                hoisted: &hoisted_set,
+                                pointer_base_loads,
+                                loop_defs: &loop_defs,
+                            },
                         ) else {
                             continue;
                         };
@@ -419,10 +497,17 @@ fn hoist_loop_invariants(
                         func,
                         inst,
                         tier,
-                        &loop_defs,
                         &invariant_vregs,
                         def_counts,
                         idom,
+                        &LoadSite {
+                            block_id,
+                            idx,
+                            lp,
+                            hoisted: &hoisted_set,
+                            pointer_base_loads,
+                            loop_defs: &loop_defs,
+                        },
                     ) else {
                         continue;
                     };
@@ -512,7 +597,7 @@ fn hoist_loop_invariants(
 ///
 /// Inserting before the `Jcc` instead is NOT a safe general repair: it would
 /// execute the hoisted code on the path that does not enter the loop, which
-/// breaks the pure-call tier's `loop_runs_at_least_once` precondition (a pure
+/// breaks the pure-call tier's `loop_first_entry` precondition (a pure
 /// call may diverge or trap, so it may only be relocated ahead of a loop that
 /// definitely runs). So we require the shape that makes the position
 /// unambiguous, exactly as the region-LICM tier in this file already demands
@@ -616,9 +701,9 @@ fn call_splice_flag_safe(func: &X86ISelFunction, preheader: Block, insert_pos: u
 fn recognize_pure_call_cluster(
     block: &trust_cg_lower::X86ISelBlock,
     call_idx: usize,
-    loop_defs: &HashMap<VReg, Block>,
+    loop_defs: &HashMap<u32, Block>,
     invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<VReg, usize>,
+    def_counts: &HashMap<u32, usize>,
 ) -> Option<(usize, usize)> {
     let call = &block.insts[call_idx];
 
@@ -641,7 +726,7 @@ fn recognize_pure_call_cluster(
     let [X86ISelOperand::VReg(dst), X86ISelOperand::PReg(src)] = res.operands.as_slice() else {
         return None;
     };
-    if *src != RAX || def_counts.get(dst).copied().unwrap_or(0) != 1 {
+    if *src != RAX || def_counts.get(&dst.id).copied().unwrap_or(0) != 1 {
         return None;
     }
 
@@ -659,8 +744,7 @@ fn recognize_pure_call_cluster(
     if expected.len() != n_args {
         return None; // duplicate arg registers desync the accounting
     }
-    for i in start..call_idx {
-        let m = &block.insts[i];
+    for m in &block.insts[start..call_idx] {
         if !matches!(m.opcode, X86Opcode::MovRR | X86Opcode::MovRR32) {
             return None;
         }
@@ -773,16 +857,18 @@ fn interp_const_defs(block: &trust_cg_lower::X86ISelBlock, vals: &mut HashMap<VR
 /// The interpreter seeds constants from the entry-path (idom chain up to the
 /// preheader — this pins the counter to its INIT value, the first-iteration
 /// value) then walks the header, tracking the last compare's operands as flags,
-/// and reports whether control concretely enters the loop body.
-fn loop_runs_at_least_once(
+/// and returns the loop-body block control concretely enters (`None` when the
+/// first visit is not proven to enter the body).
+fn loop_first_entry(
     func: &X86ISelFunction,
     lp: &NaturalLoop,
     preheader: Block,
-    idom: &HashMap<Block, Block>,
-) -> bool {
-    let dbg = std::env::var_os("TCG_PURE_CALL_HOIST_DEBUG").is_some();
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+) -> Option<Block> {
     macro_rules! decline {
-        ($($a:tt)*) => {{ if dbg { eprintln!("[pure-call-hoist]   >=1-trip decline: {}", format!($($a)*)); } return false; }};
+        ($($a:tt)*) => {{
+            return None;
+        }};
     }
     if !dominates(preheader, lp.header, idom) {
         decline!(
@@ -877,13 +963,7 @@ fn loop_runs_at_least_once(
                     .find(|s| s != t)
                     .unwrap_or(*t);
                 let dest = if taken { *t } else { other };
-                let enters = lp.body.contains(&dest);
-                if dbg {
-                    eprintln!(
-                        "[pure-call-hoist]   guard resolved: taken={taken} dest={dest:?} enters_body={enters}"
-                    );
-                }
-                return enters;
+                return lp.body.contains(&dest).then_some(dest);
             }
             X86Opcode::Jmp | X86Opcode::Ret => {
                 decline!("reached {:?} before a conditional branch", m.opcode);
@@ -953,33 +1033,58 @@ fn loop_runs_at_least_once(
     decline!("header had no resolvable conditional branch");
 }
 
+/// The blocks the loop's first iteration runs in order, as far as the CFG fixes
+/// them: the header, the body block its first visit is proven to enter
+/// (`loop_first_entry`), then each block's single successor while it stays in
+/// the loop and is not yet on the path. Every block on the path runs, entirely,
+/// on every run that enters the loop, unless an instruction before it traps or
+/// never completes (which `call_may_move_ahead_of` excludes for the prefix of
+/// a hoisted call).
+fn first_iteration_path(func: &X86ISelFunction, lp: &NaturalLoop, first: Block) -> Vec<Block> {
+    let mut path = vec![lp.header];
+    let mut next = Some(first);
+    while let Some(b) = next {
+        if !lp.body.contains(&b) || path.contains(&b) {
+            break;
+        }
+        path.push(b);
+        next = match func.blocks.get(&b).map(|blk| blk.successors.as_slice()) {
+            Some([only]) => Some(*only),
+            _ => None,
+        };
+    }
+    path
+}
+
+/// Whether a pure call that may diverge or trap can move ahead of `inst`
+/// without the move being observable: `inst` touches no memory and makes no
+/// call (`x86_inst_effect` is `Pure`) and always completes (it is not a
+/// divide, which raises #DE, nor `ud2` nor a trap pseudo).
+fn call_may_move_ahead_of(inst: &X86ISelInst) -> bool {
+    x86_inst_effect(inst).is_pure()
+        && !matches!(
+            inst.opcode,
+            X86Opcode::Idiv
+                | X86Opcode::Div
+                | X86Opcode::Ud2
+                | X86Opcode::TrapBoundsCheckExact
+                | X86Opcode::TrapNullIfZeroExact
+                | X86Opcode::TrapDivZeroExact
+                | X86Opcode::TrapShiftRangeExact
+        )
+}
+
 /// Hoist every loop-invariant pure-call cluster out of `lp` into its preheader,
-/// when the loop is proven to run at least once. Returns whether anything moved.
+/// when the loop's first iteration runs it after nothing the move could hide.
+/// Returns whether anything moved.
 fn hoist_pure_call_clusters(
     func: &mut X86ISelFunction,
     lp: &NaturalLoop,
-    def_counts: &HashMap<VReg, usize>,
-    idom: &HashMap<Block, Block>,
+    def_counts: &HashMap<u32, usize>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+    eh_call_blocks: &HashSet<Block>,
 ) -> bool {
-    let dbg = std::env::var_os("TCG_PURE_CALL_HOIST_DEBUG").is_some();
-    let n_pure_calls = |f: &X86ISelFunction| -> usize {
-        lp.body
-            .iter()
-            .filter_map(|b| f.blocks.get(b))
-            .flat_map(|b| b.insts.iter())
-            .filter(|i| {
-                i.opcode == X86Opcode::Call && i.flags.contains(InstFlags::PURE_CALL_HOISTABLE)
-            })
-            .count()
-    };
     let Some(preheader) = lp.preheader else {
-        if dbg && n_pure_calls(func) > 0 {
-            eprintln!(
-                "[pure-call-hoist] header={:?} DECLINE: no natural preheader ({} pure calls in body)",
-                lp.header,
-                n_pure_calls(func)
-            );
-        }
         return false;
     };
     // FAIL-CLOSED, before any mutation (see `preheader_insert_pos`): a
@@ -991,26 +1096,18 @@ fn hoist_pure_call_clusters(
         .get(&preheader)
         .and_then(|ph| preheader_insert_pos(ph, lp.header))
     else {
-        if dbg && n_pure_calls(func) > 0 {
-            eprintln!(
-                "[pure-call-hoist] header={:?} DECLINE: preheader {:?} lacks an explicit Jmp to the header",
-                lp.header, preheader
-            );
-        }
         return false;
     };
-    // Soundness precondition: a pure call may diverge/trap, so it may only be
-    // relocated ahead of a loop guaranteed to have executed it at least once.
-    if !loop_runs_at_least_once(func, lp, preheader, idom) {
-        if dbg && n_pure_calls(func) > 0 {
-            eprintln!(
-                "[pure-call-hoist] header={:?} DECLINE: >=1-trip NOT proven ({} pure calls in body)",
-                lp.header,
-                n_pure_calls(func)
-            );
-        }
+    // Soundness precondition: a pure callee may diverge or trap (the purity
+    // fixpoint admits cycles and recursion), so a call may move into the
+    // preheader only if the source runs it on EVERY run that enters the loop,
+    // with nothing before it that the move could hide. The loop is proven to
+    // enter its body on the first header visit; the call must lie on that
+    // first iteration's straight path (`first_iteration_path`).
+    let Some(first_successor) = loop_first_entry(func, lp, preheader, idom) else {
         return false;
-    }
+    };
+    let first_path = first_iteration_path(func, lp, first_successor);
     // Soundness precondition: a System V callee may CLOBBER RFLAGS (flags are
     // not callee-saved), and `x86_writes_flags` does NOT list `Call`, so the
     // flag model treats the spliced cluster as flag-preserving and no later
@@ -1018,21 +1115,7 @@ fn hoist_pure_call_clusters(
     // anything — the call-tier counterpart of `preheader_flag_hoist_safe`,
     // which Lever B already applies for exactly this reason.
     if !call_splice_flag_safe(func, preheader, ph_insert_pos) {
-        if dbg && n_pure_calls(func) > 0 {
-            eprintln!(
-                "[pure-call-hoist] header={:?} DECLINE: preheader splice point not flag-dead ({} pure calls in body)",
-                lp.header,
-                n_pure_calls(func)
-            );
-        }
         return false;
-    }
-    if dbg {
-        eprintln!(
-            "[pure-call-hoist] header={:?} >=1-trip PROVEN, {} pure call(s) in body",
-            lp.header,
-            n_pure_calls(func)
-        );
     }
 
     let loop_defs = build_loop_defs(func, &lp.body);
@@ -1041,61 +1124,71 @@ fn hoist_pure_call_clusters(
     // must be defined OUTSIDE the loop.
     let invariant_vregs: HashSet<VReg> = HashSet::new();
 
-    // Discover cluster instruction indices in discovery order (block order, then
-    // ascending index). `claimed` guards against overlapping ranges.
+    // Discover clusters in the first iteration's execution order: the path's
+    // blocks in order, each in ascending index. The walk stops at the first
+    // instruction a call may not move ahead of (`call_may_move_ahead_of`) that
+    // is not itself part of an admitted cluster: a later call would move ahead
+    // of it. Hoisted clusters keep their relative order, so one call never
+    // moves ahead of another.
     let mut to_hoist: Vec<(Block, usize)> = Vec::new();
-    for &block_id in &func.block_order {
-        if !lp.body.contains(&block_id) {
-            continue;
+    'path: for &block_id in &first_path {
+        // x86 still has legacy block-only Invoke custody. Purity does not
+        // authorize moving any call out of, or ahead of, such a handler block.
+        if eh_call_blocks.contains(&block_id) {
+            break;
         }
         let Some(block) = func.blocks.get(&block_id) else {
-            continue;
+            break;
         };
-        let mut claimed: HashSet<usize> = HashSet::new();
+        // The cluster's arg-setup moves precede its CALL; they are walked as
+        // prefix (register moves pass `call_may_move_ahead_of`) and claimed
+        // with the cluster. `next_free` keeps clusters from overlapping.
+        let mut next_free = 0usize;
         for idx in 0..block.insts.len() {
+            if idx < next_free {
+                continue;
+            }
             let inst = &block.insts[idx];
-            if inst.opcode != X86Opcode::Call
-                || !inst.flags.contains(InstFlags::PURE_CALL_HOISTABLE)
-            {
-                continue;
-            }
-            let Some((start, end)) =
-                recognize_pure_call_cluster(block, idx, &loop_defs, &invariant_vregs, def_counts)
-            else {
-                if dbg {
-                    let call = &block.insts[idx];
-                    eprintln!(
-                        "[pure-call-hoist]   call@{:?}[{}] NOT recognized: {} arg_regs, result_regs={:?}, next_op={:?}",
-                        block_id,
-                        idx,
-                        call.call_arg_regs.len(),
-                        call.call_result_regs.as_ref().map(|r| r.len()),
-                        block.insts.get(idx + 1).map(|i| i.opcode),
-                    );
+            // The block's terminators end its straight path. Anything but a
+            // further branch after one runs only on some of its successors
+            // (`jb arm; call f; jmp latch`), so the walk ends there.
+            if matches!(
+                inst.opcode,
+                X86Opcode::Jcc | X86Opcode::Jmp | X86Opcode::JmpR | X86Opcode::Ret
+            ) {
+                if block.insts[idx..]
+                    .iter()
+                    .all(|i| matches!(i.opcode, X86Opcode::Jcc | X86Opcode::Jmp))
+                {
+                    continue 'path;
                 }
-                continue;
-            };
-            if (start..=end).any(|i| claimed.contains(&i)) {
-                continue; // overlaps an already-claimed cluster — skip defensively
+                break 'path;
             }
-            for i in start..=end {
-                claimed.insert(i);
-                to_hoist.push((block_id, i));
+            if inst.opcode == X86Opcode::Call
+                && inst.flags.contains(InstFlags::PURE_CALL_HOISTABLE)
+                && let Some((start, end)) = recognize_pure_call_cluster(
+                    block,
+                    idx,
+                    &loop_defs,
+                    &invariant_vregs,
+                    def_counts,
+                )
+                && start >= next_free
+            {
+                for i in start..=end {
+                    to_hoist.push((block_id, i));
+                }
+                next_free = end + 1;
+                continue;
+            }
+            if !call_may_move_ahead_of(inst) {
+                break 'path;
             }
         }
     }
 
     if to_hoist.is_empty() {
         return false;
-    }
-
-    if std::env::var_os("TCG_PURE_CALL_HOIST_DEBUG").is_some() {
-        eprintln!(
-            "[pure-call-hoist] loop header={:?} >=1-trip PROVEN, hoisting {} cluster instruction(s) to preheader {:?}",
-            lp.header,
-            to_hoist.len(),
-            preheader
-        );
     }
 
     // Extract in discovery order, remove from source blocks high-index-first so
@@ -1146,7 +1239,7 @@ fn hoist_pure_call_clusters(
 /// Returns the single SSA def VReg of `inst` iff `inst` satisfies every
 /// machine-movement precondition (purity, no flag/memory/call/fixed-register
 /// coupling, single whole-function def). Mirrors the AArch64 LICM gate set.
-fn hoistable_def(inst: &X86ISelInst, def_counts: &HashMap<VReg, usize>) -> Option<VReg> {
+fn hoistable_def(inst: &X86ISelInst, def_counts: &HashMap<u32, usize>) -> Option<VReg> {
     let flags = inst.flags;
 
     // Pure memory effect only (no load/store/call/barrier).
@@ -1179,9 +1272,9 @@ fn hoistable_def(inst: &X86ISelInst, def_counts: &HashMap<VReg, usize>) -> Optio
     if inst_touches_fixed_or_abstract_operand(inst) {
         return None;
     }
-    // Tied def-use opcodes read their destination; treating their other
+    // Tied def-use forms read their destination; treating their other
     // operands as the only sources is unsound. Decline them.
-    if first_operand_is_def_and_use(inst) {
+    if x86_operand0_may_be_read(inst) {
         return None;
     }
 
@@ -1190,7 +1283,7 @@ fn hoistable_def(inst: &X86ISelInst, def_counts: &HashMap<VReg, usize>) -> Optio
         Some(X86ISelOperand::VReg(v)) => *v,
         _ => return None,
     };
-    if def_counts.get(&def).copied().unwrap_or(0) != 1 {
+    if def_counts.get(&def.id).copied().unwrap_or(0) != 1 {
         return None;
     }
 
@@ -1230,6 +1323,7 @@ fn operand_is_fixed_or_abstract(operand: &X86ISelOperand) -> bool {
     match operand {
         X86ISelOperand::PReg(_)
         | X86ISelOperand::Symbol(_)
+        | X86ISelOperand::ExactModuleSymbol(_)
         | X86ISelOperand::StackSlot(_)
         | X86ISelOperand::ConstPoolEntry(_) => true,
         // A memory operand here would mean a load/store, already excluded by the
@@ -1240,38 +1334,6 @@ fn operand_is_fixed_or_abstract(operand: &X86ISelOperand) -> bool {
         }
         _ => false,
     }
-}
-
-/// Tied def-use opcodes whose operand 0 is both written and read. Their "source"
-/// operands are not the whole input set, so the invariance test under-counts.
-/// (These also all write flags and are rejected upstream, but be explicit.)
-fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
-    use X86Opcode::*;
-    matches!(
-        inst.opcode,
-        Neg | Not
-            | Inc
-            | Dec
-            | AddRI
-            | SubRI
-            | AndRI
-            | OrRI
-            | XorRI
-            | AddRM
-            | SubRM
-            | ImulRM
-            | ImulRMSib
-            | ShlRI
-            | ShrRI
-            | SarRI
-            | ShlRR
-            | ShrRR
-            | SarRR
-            // Rotate-by-CL: same tied [dst, src] shape as the CL shifts.
-            | RolRCl
-            | AdcRR
-            | SbbRR
-    )
 }
 
 // ===========================================================================
@@ -1329,23 +1391,18 @@ fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
 /// `preheader_flag_hoist_safe` are precisely the proof that the write is
 /// unobservable at both ends. Nothing in that argument is `imul`-specific.
 ///
-/// ⚑ Only the RR forms qualify. The immediate and shift forms (`AddRI`,
-/// `OrRI`, `ShlRI`, `ShlRR`, `Neg`, `Not`, `Inc`, `Dec`, …) are TWO-ADDRESS at
-/// ISel level — operand 0 is both def and use — and `first_operand_is_def_and_use`
-/// rejects them. Listing them here would be dead weight that reads as coverage.
-///
-/// Kill switch `TCG_NO_X86_LICM_ALU` restores the imul-only behaviour so the
-/// extension can be A/B'd inside ONE dylib.
+/// ⚑ Only the three-address RR forms qualify. The immediate and shift forms
+/// (`AddRI`, `OrRI`, `ShlRI`, `ShlRR`, `Neg`, `Not`, `Inc`, `Dec`, …) are
+/// TWO-ADDRESS at ISel level — operand 0 is both def and use — and so is the
+/// two-operand RR form `[d, s]`; `effects::x86_operand0_may_be_read` rejects
+/// them per form. Listing the immediate forms here would be dead weight that
+/// reads as coverage.
 fn is_hoistable_flag_arith_opcode(opcode: X86Opcode) -> bool {
     use X86Opcode::*;
-    if matches!(opcode, ImulRR | ImulRRI) {
-        return true;
-    }
-    licm_alu_hoist_enabled() && matches!(opcode, AddRR | SubRR | AndRR | OrRR | XorRR)
-}
-
-fn licm_alu_hoist_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_LICM_ALU").is_none()
+    matches!(
+        opcode,
+        ImulRR | ImulRRI | AddRR | SubRR | AndRR | OrRR | XorRR
+    )
 }
 
 /// True iff `opcode` architecturally overwrites ALL six status flags
@@ -1389,7 +1446,7 @@ fn x86_fully_defines_flags(opcode: X86Opcode) -> bool {
 /// abstract operands, and no flag *read*. Flag WRITES are permitted here (unlike
 /// [`hoistable_def`]); the caller additionally proves the written flags dead via
 /// [`rflags_dead_after_site`] and [`preheader_flag_hoist_safe`].
-fn hoistable_flag_arith(inst: &X86ISelInst, def_counts: &HashMap<VReg, usize>) -> Option<VReg> {
+fn hoistable_flag_arith(inst: &X86ISelInst, def_counts: &HashMap<u32, usize>) -> Option<VReg> {
     let flags = inst.flags;
 
     if !is_hoistable_flag_arith_opcode(inst.opcode) {
@@ -1416,9 +1473,10 @@ fn hoistable_flag_arith(inst: &X86ISelInst, def_counts: &HashMap<VReg, usize>) -
     if inst_touches_fixed_or_abstract_operand(inst) {
         return None;
     }
-    // Belt-and-suspenders: never a tied def-use form (imul r,r / r,r,imm are
-    // not, but guard against future opcode additions).
-    if first_operand_is_def_and_use(inst) {
+    // Never a tied def-use form: the two-operand `AddRR [d, s]` is
+    // `d := d + s`, so `s` is not its whole input set. Decided per form; the
+    // three-address `[d, a, b]` and `ImulRRI` forms are not tied.
+    if x86_operand0_may_be_read(inst) {
         return None;
     }
 
@@ -1426,7 +1484,7 @@ fn hoistable_flag_arith(inst: &X86ISelInst, def_counts: &HashMap<VReg, usize>) -
         Some(X86ISelOperand::VReg(v)) => *v,
         _ => return None,
     };
-    if def_counts.get(&def).copied().unwrap_or(0) != 1 {
+    if def_counts.get(&def.id).copied().unwrap_or(0) != 1 {
         return None;
     }
 
@@ -1503,9 +1561,9 @@ fn preheader_flag_hoist_safe(func: &X86ISelFunction, preheader: Block, header: B
 /// stack slot, block, ...) is not.
 fn is_operand_loop_invariant(
     operand: &X86ISelOperand,
-    loop_defs: &HashMap<VReg, Block>,
+    loop_defs: &HashMap<u32, Block>,
     invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<VReg, usize>,
+    def_counts: &HashMap<u32, usize>,
 ) -> bool {
     match operand {
         X86ISelOperand::VReg(v) => {
@@ -1523,22 +1581,118 @@ fn is_operand_loop_invariant(
     }
 }
 
+static OUTER_IV_INVARIANCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the OUTER-IV invariance relaxation from a TRACKED compiler option,
+/// once (`-Ztrust-ir-cg-args=licm-outer-iv`). DEFAULT OFF.
+///
+/// # What it relaxes, and why the old rule was too strong
+///
+/// [`is_vreg_loop_invariant`] refused any vreg with more than ONE definition in
+/// the whole function. An enclosing loop's induction variable has at least two
+/// (its initialisation and its increment), so under that rule **nothing derived
+/// from an outer loop's counter can ever be hoisted out of an inner loop** — and
+/// that is the commonest invariant there is in nested code. `p4_matmul`'s
+/// innermost loop recomputes `k * N` on every `j` iteration for exactly this
+/// reason, because `k` is the middle loop's counter.
+///
+/// # Soundness
+///
+/// A vreg with NO definition inside this loop's body holds one value for the
+/// whole execution of the loop, however many definitions it has elsewhere. The
+/// value at the preheader is that value, because `find_preheader` only yields a
+/// block that is the header's UNIQUE out-of-body predecessor — every entry into
+/// the loop runs the preheader, so the definition reaching the preheader is the
+/// one reaching the header. The multi-def count was therefore never the property
+/// that mattered; "no def inside the body" is, and `loop_defs` already answers
+/// exactly that.
+///
+/// Was kept OPT-IN because hoisting MORE work into a preheader raises register
+/// pressure, and that had already cost this pass once: the pointer-base
+/// invariant-load arm measured 1.46x SLOWER on `h1_vec_push_sum` from pressure
+/// rather than any legality problem. That reading has since been superseded for
+/// THAT arm (h1 now vectorizes, and the arm measured 8.8% faster on the one
+/// program it still changes — see [`pointer_base_load_is_hoistable`]), but the
+/// pressure hazard it demonstrated is real, and the lever's own doc said it
+/// would stay opt-in "until something measures it".
+///
+/// # DEFAULT ON since 2026-09-30, and the measurement that earned it
+///
+/// 90 interleaved rounds, `taskset -c 2`, min statistic, base carried twice:
+///
+/// | `p4_matmul` | vs LLVM -O3 |
+/// | --- | ---: |
+/// | off / off (floor) | 1.0818 / 1.0832 |
+/// | **on** | **1.0753** |
+///
+/// 0.6%, about 4.6 floors. And the register-pressure hazard did not
+/// materialise, for a checkable reason rather than a hopeful one: the arm
+/// changes **1 of 18** `beat-llvm` binaries. It fires on p4 and nowhere else,
+/// so there is no other program for pressure to cost. Exit codes match
+/// trust-cg/LLVM on the one program it changes.
+///
+/// `-Ztrust-ir-cg-args=no-licm-outer-iv` is the forensic opt-out.
+pub fn set_outer_iv_invariance_enabled(enabled: bool) -> bool {
+    match OUTER_IV_INVARIANCE.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => OUTER_IV_INVARIANCE.get() == Some(&requested),
+    }
+}
+
+/// True iff a multi-def vreg with no definition inside the loop counts as
+/// invariant. DEFAULT ON; see [`set_outer_iv_invariance_enabled`].
+fn outer_iv_invariance_enabled() -> bool {
+    if let Some(enabled) = OUTER_IV_INVARIANCE.get() {
+        return *enabled;
+    }
+    // An explicit `0` does not opt out, matching every other tracked Boolean.
+    !crate::env_lock::var_os("TCG_NO_X86_LICM_OUTER_IV").is_some_and(|v| v != "0")
+}
+
 fn is_vreg_loop_invariant(
     v: VReg,
-    loop_defs: &HashMap<VReg, Block>,
+    loop_defs: &HashMap<u32, Block>,
     invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<VReg, usize>,
+    def_counts: &HashMap<u32, usize>,
 ) -> bool {
-    if def_counts.get(&v).copied().unwrap_or(0) != 1 {
-        return false;
+    is_vreg_loop_invariant_with(
+        v,
+        loop_defs,
+        invariant_vregs,
+        def_counts,
+        outer_iv_invariance_enabled(),
+    )
+}
+
+/// [`is_vreg_loop_invariant`] with the outer-IV relaxation passed explicitly.
+///
+/// Exists so both answers are unit-testable in one process: the public entry
+/// reads a `OnceLock`, which by construction cannot be flipped twice in a test
+/// binary, and an untestable enabled path is not worth having.
+fn is_vreg_loop_invariant_with(
+    v: VReg,
+    loop_defs: &HashMap<u32, Block>,
+    invariant_vregs: &HashSet<VReg>,
+    def_counts: &HashMap<u32, usize>,
+    allow_outer_iv: bool,
+) -> bool {
+    let single_def = def_counts.get(&v.id).copied().unwrap_or(0) == 1;
+    if loop_defs.contains_key(&v.id) {
+        // Defined INSIDE this loop: invariant only as the transitive-closure
+        // seed, i.e. a single-def whose own defining instruction was itself
+        // proven invariant and hoisted.
+        return single_def && invariant_vregs.contains(&v);
     }
-    if loop_defs.contains_key(&v) {
-        invariant_vregs.contains(&v)
-    } else {
-        // Defined outside the loop body (or never defined: an entry/arg
-        // value) — invariant relative to this loop.
-        true
+    if single_def {
+        // Defined outside the loop body (or never defined: an entry/arg value)
+        // — invariant relative to this loop.
+        return true;
     }
+    // MULTI-DEF, but no definition inside this loop's body: still one value for
+    // the whole execution of this loop. This is the enclosing loop's induction
+    // variable and anything computed from it. Opt-in; see
+    // `set_outer_iv_invariance_enabled` for the argument and the pressure caveat.
+    allow_outer_iv
 }
 
 // ===========================================================================
@@ -1564,7 +1718,8 @@ fn is_vreg_loop_invariant(
 //    or through a single-def pointer chain of `MovRR` copies, `Lea` address
 //    arithmetic, and one-hop store-to-load forwarding through a non-escaped
 //    slot), and no in-loop store targets `s`. Calls, fences, atomics and
-//    volatile accesses (any `proof_origin` marker), `Push`, dynamic
+//    volatile accesses (excluded by their `MemoryEffect::Call` effect, NOT
+//    by a `proof_origin` marker — they carry none), `Push`, dynamic
 //    `StackAlloc`, SIB-addressed stores, and stores through unresolvable
 //    pointers all disable the tier for the whole loop: hoist NOTHING is the
 //    fail-safe default. (`Pop` needs no veto: it reads `[RSP]` and cannot
@@ -1612,8 +1767,8 @@ const FRAME_RESOLVE_FUEL: u32 = 16;
 fn invariant_load_width(opcode: X86Opcode) -> Option<i64> {
     use X86Opcode::*;
     match opcode {
-        MovRM8 => Some(1),
-        MovRM16 => Some(2),
+        MovRM8 | MovzxRM8 => Some(1),
+        MovRM16 | MovzxRM16 => Some(2),
         MovRM32 => Some(4),
         MovRM => Some(8),
         MovssRM => Some(4),
@@ -1662,8 +1817,8 @@ impl LoadTierAnalysis {
     fn compute(
         func: &X86ISelFunction,
         lp: &NaturalLoop,
-        def_counts: &HashMap<VReg, usize>,
-        idom: &HashMap<Block, Block>,
+        def_counts: &HashMap<u32, usize>,
+        idom: &crate::fast_hash::FxHashMap<Block, Block>,
     ) -> Option<Self> {
         let def_sites = build_def_sites(func);
         let escaped_slots = compute_escaped_slots(func);
@@ -1711,8 +1866,8 @@ impl LoadTierAnalysis {
 fn resolve_plain_store_slot(
     func: &X86ISelFunction,
     inst: &X86ISelInst,
-    def_counts: &HashMap<VReg, usize>,
-    idom: &HashMap<Block, Block>,
+    def_counts: &HashMap<u32, usize>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
     analysis: &LoadTierAnalysis,
 ) -> Option<u32> {
     let width = plain_store_width(inst.opcode)?;
@@ -1758,8 +1913,8 @@ fn resolve_plain_store_slot(
 fn resolve_frame_address(
     func: &X86ISelFunction,
     v: VReg,
-    def_counts: &HashMap<VReg, usize>,
-    idom: &HashMap<Block, Block>,
+    def_counts: &HashMap<u32, usize>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
     analysis: &LoadTierAnalysis,
     fuel: u32,
 ) -> Option<(u32, i64)> {
@@ -1767,7 +1922,7 @@ fn resolve_frame_address(
         return None;
     }
     // Multi-def vregs are path-sensitive carriers, not values.
-    if def_counts.get(&v).copied().unwrap_or(0) != 1 {
+    if def_counts.get(&v.id).copied().unwrap_or(0) != 1 {
         return None;
     }
     let &(block_id, idx) = analysis.def_sites.get(&v)?;
@@ -1839,8 +1994,8 @@ fn forward_pointer_through_slot(
     q: u32,
     qoff: i64,
     load_site: (Block, usize),
-    def_counts: &HashMap<VReg, usize>,
-    idom: &HashMap<Block, Block>,
+    def_counts: &HashMap<u32, usize>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
     analysis: &LoadTierAnalysis,
     fuel: u32,
 ) -> Option<(u32, i64)> {
@@ -1892,7 +2047,11 @@ fn forward_pointer_through_slot(
 }
 
 /// Does instruction site `a` dominate site `b`?
-fn site_dominates(a: (Block, usize), b: (Block, usize), idom: &HashMap<Block, Block>) -> bool {
+fn site_dominates(
+    a: (Block, usize),
+    b: (Block, usize),
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+) -> bool {
     if a.0 == b.0 {
         return a.1 < b.1;
     }
@@ -1904,14 +2063,329 @@ fn site_dominates(a: (Block, usize), b: (Block, usize), idom: &HashMap<Block, Bl
 /// is a plain, effect-free, provably in-bounds fixed-slot load whose slot is
 /// disjoint from every slot stored in the loop, and whose address operands
 /// are available at the preheader.
+static GUARDED_HOIST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the GUARDED-HOIST tier of x86 LICM from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=x86-licm-guarded-hoist`). DEFAULT OFF.
+///
+/// Until 2026-09-30 the only channel was `TCG_X86_LICM_GUARDED_HOIST`, which `trustc`
+/// refuses before the backend loads, so this tier had never been measured through the bridge.
+pub fn set_guarded_hoist_enabled(enabled: bool) -> bool {
+    match GUARDED_HOIST.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => GUARDED_HOIST.get() == Some(&requested),
+    }
+}
+
+/// Whether the guarded-hoist tier runs when the config states no preference. DEFAULT FALSE.
+pub fn guarded_hoist_default() -> bool {
+    GUARDED_HOIST.get().copied().unwrap_or(false)
+        || std::env::var_os("TCG_X86_LICM_GUARDED_HOIST").is_some()
+}
+
+static POINTER_BASE_LOADS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the POINTER-BASE arm's OPT-OUT from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-licm-pointer-loads`). Same install-once contract as
+/// `crate::x86_vectorize::set_trace_enabled`.
+///
+/// Exists so the arm can be A/B'd inside ONE dylib. That matters here more than
+/// usual: the arm's effect was only separable from benchmark noise by toggling it
+/// within a single build (see [`pointer_base_load_is_hoistable`] for what that
+/// measured), and comparing two builds on a 10 ms program cannot establish it.
+pub fn set_pointer_base_loads_disabled(disabled: bool) -> bool {
+    match POINTER_BASE_LOADS_ENABLED.set(!disabled) {
+        Ok(()) => true,
+        Err(requested) => POINTER_BASE_LOADS_ENABLED.get() == Some(&requested),
+    }
+}
+
+/// Whether the pipeline should enable the POINTER-BASE arm.
+///
+/// DEFAULT TRUE since 2026-09-29. It was default FALSE on a single measurement —
+/// 1.49x SLOWER on `h1_vec_push_sum` — and that measurement no longer applies to
+/// anything: h1 now VECTORIZES, so its scalar loop is the packed loop's remainder
+/// tail and this arm leaves h1's binary BYTE-IDENTICAL. Re-measured on the one
+/// program the arm still changes, `h3_box_leak`:
+///
+/// | | hot loop | memory ops | min ms | vs LLVM |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | arm OFF | 14 insns | 6 | 25.25 | 1.0954x |
+/// | arm ON | **10 insns** | **3** | **23.03** | **0.9993x** |
+///
+/// 8.8% faster, and it takes h3 from 10% behind LLVM to matching it. Across the
+/// 18-program corpus the arm changes h3 and NOTHING else, with the execution
+/// differential 18/18 MATCH.
+pub fn pointer_base_loads_default() -> bool {
+    POINTER_BASE_LOADS_ENABLED.get().copied().unwrap_or(true)
+}
+
+static PURE_CALL_HOIST_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the pure-call tier's OPT-OUT from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-pure-call-hoist`). Same install-once contract as
+/// [`set_pointer_base_loads_disabled`].
+///
+/// The tier has no translation-validation net, and a wrong hoist miscompiles
+/// silently (OD-230 fixed two). Its differential corpus, `fuzz/repros/purecall/`,
+/// needs a hoist-off compile of each program from the same backend; this is
+/// that switch. The env kill switch it replaces, `TCG_NO_PURE_CALL_HOIST`, was
+/// deleted in 747cf19b4 and is refused by `trustc` in any case.
+pub fn set_pure_call_hoist_disabled(disabled: bool) -> bool {
+    match PURE_CALL_HOIST_ENABLED.set(!disabled) {
+        Ok(()) => true,
+        Err(requested) => PURE_CALL_HOIST_ENABLED.get() == Some(&requested),
+    }
+}
+
+/// Whether LICM runs its pure-call cluster tier. DEFAULT TRUE (since
+/// 47e3d5694), in the pure-only policy too; only the tracked opt-out turns it
+/// off. Off is always correct: every call stays where the source put it.
+pub fn pure_call_hoist_default() -> bool {
+    PURE_CALL_HOIST_ENABLED.get().copied().unwrap_or(true)
+}
+
+/// Where a candidate load sits, plus what has already been selected for
+/// hoisting. These are the facts the POINTER-BASE arm of
+/// [`hoistable_invariant_load`] needs and the frame-slot arm does not.
+struct LoadSite<'a> {
+    block_id: Block,
+    idx: usize,
+    lp: &'a NaturalLoop,
+    /// `(block, index)` pairs already committed to this loop's hoist list.
+    hoisted: &'a HashSet<(Block, usize)>,
+    /// Whether the POINTER-BASE arm is enabled. DEFAULT ON — see
+    /// [`pointer_base_load_is_hoistable`] for both measurements.
+    pointer_base_loads: bool,
+    /// Vregs defined INSIDE the loop body. A per-loop fact, carried here so the
+    /// hoist predicate stays inside clippy's argument budget.
+    loop_defs: &'a HashMap<u32, Block>,
+}
+
+/// Whether `inst` can neither FAULT nor transfer control.
+///
+/// Fail-closed by allowlist: only pure register/immediate data movement
+/// ([`x86_is_removable`], which covers moves, `Lea`, extensions and SSE
+/// register moves) and the pure flag-writing ALU set qualify. Everything
+/// unrecognised is assumed able to fault — which keeps integer division (it
+/// traps on zero and on `INT_MIN / -1`), every memory access, calls, branches,
+/// pseudos and side-effecting carriers out without enumerating them.
+fn cannot_fault_or_transfer(inst: &X86ISelInst) -> bool {
+    if inst.proof_origin.is_some() {
+        return false;
+    }
+    let flags = inst.flags;
+    if flags.is_call()
+        || flags.is_branch()
+        || flags.is_terminator()
+        || flags.is_return()
+        || flags.is_pseudo()
+        || flags.has_side_effects()
+        || flags.reads_memory()
+        || flags.writes_memory()
+    {
+        return false;
+    }
+    if !x86_inst_effect(inst).is_pure() {
+        return false;
+    }
+    crate::effects::x86_is_removable(inst.opcode)
+        || crate::x86_dce::local_dce_pure_flag_alu(inst.opcode)
+}
+
+/// Whether entering `ph` ALWAYS continues into `header`.
+///
+/// Derived from `ph`'s own terminator, never from the cached `successors`
+/// field: a stale or incomplete edge list here would license hoisting a
+/// dereference onto a path that skips the loop. A direct `Jmp header` qualifies,
+/// a terminator-free block qualifies when `header` is its LAYOUT successor, and
+/// every other shape (conditional branch, indirect jump, return) refuses.
+fn preheader_enters_header_unconditionally(
+    func: &X86ISelFunction,
+    ph: Block,
+    header: Block,
+) -> bool {
+    let Some(block) = func.blocks.get(&ph) else {
+        return false;
+    };
+    match block.insts.last() {
+        Some(last) if last.opcode == X86Opcode::Jmp => {
+            last.operands.len() == 1
+                && matches!(last.operands.first(), Some(X86ISelOperand::Block(b)) if *b == header)
+        }
+        Some(last)
+            if last.flags.is_branch() || last.flags.is_terminator() || last.flags.is_return() =>
+        {
+            false
+        }
+        _ => {
+            func.block_order
+                .iter()
+                .position(|b| *b == ph)
+                .and_then(|i| func.block_order.get(i + 1))
+                .copied()
+                == Some(header)
+        }
+    }
+}
+
+/// POINTER-BASE arm of the invariant-load tier: hoist a load whose address is
+/// NOT resolvable to a frame slot.
+///
+/// The frame-slot arm proves non-trapping from slot BOUNDS ("fully inside a
+/// fixed-size frame slot"). A pointer base has no such argument, so this arm
+/// proves FAULT EQUIVALENCE from dominance instead, and it needs the loop to be
+/// free of memory writes for the value argument. All four conditions:
+///
+/// 1. **The loop writes NO memory.** [`LoadTierAnalysis::compute`] already
+///    refuses the loop unless every memory write is a plain store attributable
+///    to a fixed slot (and refuses calls, fences, atomics and volatiles
+///    outright), so an EMPTY `stored_slots` means the loop performs no stores at
+///    all. Nothing can therefore change what this address holds between
+///    iterations — which is what the frame-slot arm gets from slot-granular
+///    store tracking and this arm cannot, because a pointer could alias any
+///    slot.
+/// 2. **The candidate is in the loop HEADER.** The header executes on every
+///    entry to the loop.
+/// 3. **The preheader continues into the header unconditionally**
+///    ([`preheader_enters_header_unconditionally`], read off the terminator).
+///    With (2) this gives: whenever the preheader runs, this load runs. So a
+///    zero-trip loop is not a counterexample — the header still executes once,
+///    including this load, before the exit test.
+/// 4. **Nothing before it in the header can fault or transfer control**, except
+///    instructions ALREADY committed to this loop's hoist list. Those move to
+///    the preheader in the same relative order, so a fault among them happens in
+///    the same sequence it did before. Anything else that could fault would mean
+///    the original load was not guaranteed to be reached.
+///
+/// Together: the hoisted load executes exactly when the original did, reads the
+/// same address, and nothing in the loop can have changed that memory.
+///
+/// # DEFAULT ON since 2026-09-29 — and the measurement that first turned it OFF
+///
+/// This arm was default OFF on a real, correctly-taken measurement, and it is now
+/// default ON on a later one. Both are recorded, because the first was not wrong
+/// about what it measured — it stopped applying.
+///
+/// ## The reading that turned it off (2026-09-28)
+///
+/// Measured on `h1_vec_push_sum` (x86-64 Linux, one dylib, the arm toggled by
+/// knob so both arms share a build; 41 runs each, medians):
+///
+/// | arm | median | vs LLVM -O3 | rel_spread |
+/// | --- | ---: | ---: | ---: |
+/// | ON | 33.79 ms | 3.685x | 0.066 |
+/// | OFF | 23.21 ms | 2.531x | 0.186 |
+///
+/// **ON was 1.456x SLOWER**, far outside that spread. It hoisted what it claimed
+/// to: that probe's hot loop went from 18 instructions to 10 and its six
+/// loop-invariant loads dropped to one. The loop still got slower, and the
+/// disassembly said why — with the length load hoisted, the register allocator no
+/// longer kept the data base in a register across the loop and reloaded it from
+/// the frame each iteration (`mov -0x58(%rbp),%r10` then `mov (%r10),%rsi`),
+/// turning two INDEPENDENT loads into a two-deep DEPENDENT chain on the critical
+/// path. Hoisting lengthened live ranges, the allocator spilled, and the spill
+/// cost more than the hoisted loads saved. A REGISTER-PRESSURE problem, not a
+/// legality one.
+///
+/// ## Why that reading no longer applies to any program (2026-09-29)
+///
+/// `h1_vec_push_sum` now VECTORIZES: its scalar loop is the packed loop's
+/// remainder tail, entered at most three times, and this arm leaves h1's binary
+/// BYTE-IDENTICAL. The regression above was therefore not repealed — it was
+/// removed from the corpus by a different change, and re-measuring was mandatory
+/// rather than optional.
+///
+/// Across the 18-program runtime corpus the arm now changes exactly ONE program,
+/// `h3_box_leak`, with the execution differential 18/18 MATCH. On that program
+/// (`taskset -c 2`, 40 interleaved rounds, minimum of each, a byte-identical copy
+/// of the ON binary carried in every batch as the noise floor):
+///
+/// | arm | hot loop | memory ops | min | vs LLVM -O3 |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | OFF | 14 insns | 6 | 25.25 ms | 1.0954x |
+/// | ON | **10 insns** | **3** | **23.03 ms** | **0.9993x** |
+/// | ON, identical copy | — | — | 22.93 ms | 0.9948x |
+///
+/// 8.8% faster, against a 0.45% floor, and it takes h3 from 10% behind LLVM to
+/// matching it. The pressure hazard is still real and still unmodelled; what the
+/// h3 numbers show is that on a loop whose base pointer stays in a register, the
+/// three loads this arm removes are a straight win. A pressure model would let it
+/// fire in more places safely — it is not needed to make these two facts true.
+///
+/// The `while found_new` fixpoint makes this CASCADE — hoisting `[p+0]` proves its
+/// result invariant, which lets the pure tier hoist a `Lea` derived from it,
+/// which brings the next level's load under condition (4) on a later round.
+fn pointer_base_load_is_hoistable(
+    func: &X86ISelFunction,
+    site: &LoadSite<'_>,
+    tier: &LoadTierAnalysis,
+    base: VReg,
+    loop_defs: &HashMap<u32, Block>,
+) -> bool {
+    if !site.pointer_base_loads {
+        return false;
+    }
+    if !tier.stored_slots.is_empty() {
+        return false;
+    }
+    // 0. The base is defined OUTSIDE the loop — strictly stronger than the
+    //    invariance the caller already checked, which also admits a base proven
+    //    invariant and hoisted on an earlier round.
+    //
+    //    This is what keeps the celled-pointer REFUTATIONS intact
+    //    (`x86_licm_load_tier_forwarding_requires_non_escaped_cell`,
+    //    `..._requires_unique_cell_store`). There the base is itself an in-loop
+    //    load of a pointer out of a frame cell, and the frame-slot arm hoists the
+    //    dependent "lane" load only by FORWARDING that cell's stored value —
+    //    which is unjustified once the cell escapes or has ambiguous stores. This
+    //    arm forwards nothing and would otherwise accept those shapes on its own
+    //    (invariant base, store-free loop, fault-equivalent prefix) and silently
+    //    defeat two committed refutations of a known miscompile family. Requiring
+    //    an outside-the-loop base excludes exactly the forwarded-cell shape while
+    //    still admitting a load through a parameter or other pre-loop pointer.
+    //
+    //    The cost is the second level of a chain: `[[p]+k]` does not hoist even
+    //    when `[p]` does, because the intermediate is defined in the loop. That
+    //    is deliberate under-approximation, not an oversight.
+    if loop_defs.contains_key(&base.id) {
+        return false;
+    }
+    let header = site.lp.header;
+    if site.block_id != header {
+        return false;
+    }
+    let Some(ph) = site.lp.preheader else {
+        return false;
+    };
+    if !preheader_enters_header_unconditionally(func, ph, header) {
+        return false;
+    }
+    let Some(header_block) = func.blocks.get(&header) else {
+        return false;
+    };
+    if site.idx > header_block.insts.len() {
+        return false;
+    }
+    for (i, prev) in header_block.insts.iter().enumerate().take(site.idx) {
+        if site.hoisted.contains(&(header, i)) {
+            continue;
+        }
+        if !cannot_fault_or_transfer(prev) {
+            return false;
+        }
+    }
+    true
+}
+
 fn hoistable_invariant_load(
     func: &X86ISelFunction,
     inst: &X86ISelInst,
     tier: &LoadTierAnalysis,
-    loop_defs: &HashMap<VReg, Block>,
     invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<VReg, usize>,
-    idom: &HashMap<Block, Block>,
+    def_counts: &HashMap<u32, usize>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+    site: &LoadSite<'_>,
 ) -> Option<VReg> {
     let width = invariant_load_width(inst.opcode)?;
     // Never move an atomic/volatile lowering carrier.
@@ -1936,28 +2410,46 @@ fn hoistable_invariant_load(
         Some(X86ISelOperand::VReg(d)) => *d,
         _ => return None,
     };
-    if def_counts.get(&dst).copied().unwrap_or(0) != 1 {
+    if def_counts.get(&dst.id).copied().unwrap_or(0) != 1 {
         return None;
     }
 
-    // Address: a fixed stack slot plus a static offset.
-    let (slot, off) = match inst.operands.get(1)? {
-        X86ISelOperand::MemAddr { base, disp } => match base.as_ref() {
-            X86ISelOperand::StackSlot(s) => (*s, i64::from(*disp)),
-            X86ISelOperand::VReg(r) => {
-                // The base register must remain available (and unchanged) at
-                // the preheader insertion point: defined outside the loop, or
-                // itself proven invariant and hoisted ahead of this load.
-                if !is_vreg_loop_invariant(*r, loop_defs, invariant_vregs, def_counts) {
-                    return None;
-                }
-                let (s, o) =
-                    resolve_frame_address(func, *r, def_counts, idom, tier, FRAME_RESOLVE_FUEL)?;
-                (s, o.checked_add(i64::from(*disp))?)
+    // Address: a fixed stack slot plus a static offset, or — when it does not
+    // resolve to a slot at all — a loop-invariant POINTER base (see
+    // `pointer_base_load_is_hoistable` for that arm's separate argument).
+    let X86ISelOperand::MemAddr { base, disp } = inst.operands.get(1)? else {
+        return None;
+    };
+    let frame = match base.as_ref() {
+        X86ISelOperand::StackSlot(s) => Some((*s, i64::from(*disp))),
+        X86ISelOperand::VReg(r) => {
+            // The base register must remain available (and unchanged) at
+            // the preheader insertion point: defined outside the loop, or
+            // itself proven invariant and hoisted ahead of this load. Required
+            // by BOTH arms.
+            if !is_vreg_loop_invariant(*r, site.loop_defs, invariant_vregs, def_counts) {
+                return None;
             }
-            _ => return None,
-        },
+            match resolve_frame_address(func, *r, def_counts, idom, tier, FRAME_RESOLVE_FUEL) {
+                Some((s, o)) => Some((s, o.checked_add(i64::from(*disp))?)),
+                None => None,
+            }
+        }
         _ => return None,
+    };
+
+    let Some((slot, off)) = frame else {
+        // POINTER-BASE arm. The base is loop-invariant (checked above) but names
+        // no frame slot, so slot bounds cannot prove non-trapping and
+        // slot-granular store tracking cannot prove invariance.
+        let X86ISelOperand::VReg(base) = base.as_ref() else {
+            return None;
+        };
+        return if pointer_base_load_is_hoistable(func, site, tier, *base, site.loop_defs) {
+            Some(dst)
+        } else {
+            None
+        };
     };
 
     // Provably non-trapping: fully in bounds of a fixed-size frame slot.
@@ -2097,23 +2589,28 @@ fn build_direct_slot_stores(func: &X86ISelFunction) -> HashMap<u32, Vec<(Block, 
 // Def maps
 // ===========================================================================
 
-fn build_def_counts(func: &X86ISelFunction) -> HashMap<VReg, usize> {
-    let mut counts: HashMap<VReg, usize> = HashMap::new();
+/// May-write identity is the register ID, independent of its width/class view.
+/// Count each ID once per instruction, including implicit exchange/CAS writes.
+fn build_def_counts(func: &X86ISelFunction) -> HashMap<u32, usize> {
+    let mut counts = HashMap::new();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
         };
         for inst in &block.insts {
-            if let Some(def) = defined_vreg(inst) {
-                *counts.entry(def).or_insert(0) += 1;
+            for def in crate::effects::x86_may_defined_vregs(inst) {
+                *counts.entry(def.id).or_insert(0) += 1;
             }
         }
     }
     counts
 }
 
-fn build_loop_defs(func: &X86ISelFunction, body: &HashSet<Block>) -> HashMap<VReg, Block> {
-    let mut defs: HashMap<VReg, Block> = HashMap::new();
+fn build_loop_defs(
+    func: &X86ISelFunction,
+    body: &crate::fast_hash::FxHashSet<Block>,
+) -> HashMap<u32, Block> {
+    let mut defs = HashMap::new();
     for block_id in &func.block_order {
         if !body.contains(block_id) {
             continue;
@@ -2122,8 +2619,8 @@ fn build_loop_defs(func: &X86ISelFunction, body: &HashSet<Block>) -> HashMap<VRe
             continue;
         };
         for inst in &block.insts {
-            if let Some(def) = defined_vreg(inst) {
-                defs.insert(def, *block_id);
+            for def in crate::effects::x86_may_defined_vregs(inst) {
+                defs.insert(def.id, *block_id);
             }
         }
     }
@@ -2165,7 +2662,7 @@ struct NaturalLoop {
     /// Loop header (the back-edge target; the sole in-body successor of the
     /// preheader). Entered from the preheader on the first iteration.
     header: Block,
-    body: HashSet<Block>,
+    body: crate::fast_hash::FxHashSet<Block>,
     /// Unique non-loop predecessor of the header, if one exists.
     preheader: Option<Block>,
     /// Nesting depth (outermost = 1); larger = more deeply nested.
@@ -2179,8 +2676,8 @@ struct NaturalLoop {
 /// `block_order[0]`, exactly as before).
 fn compute_idom(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
-) -> HashMap<Block, Block> {
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+) -> crate::fast_hash::FxHashMap<Block, Block> {
     let rpo = mach_view::compute_rpo(func);
     mach_view::compute_idom(func, preds, &rpo)
 }
@@ -2201,12 +2698,12 @@ fn compute_idom(
 ///       exit), and it lies inside the outer body
 ///   L5  the inner header dominates every outer latch (the region runs on
 ///       every outer iteration)
-///   L6  the outer loop provably runs ≥1 time (`loop_runs_at_least_once` — the
+///   L6  the outer loop provably runs ≥1 time (`loop_first_entry` — the
 ///       pure-call hoist's mini-interpreter, reused verbatim)
 fn region_licm_scan(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
-    idom: &HashMap<Block, Block>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
     loops: &[NaturalLoop],
 ) {
     use crate::effects::{MemoryEffect, x86_inst_effect, x86_produces_value};
@@ -2341,7 +2838,7 @@ fn region_licm_scan(
         // L6: the outer loop provably runs at least once.
         let l6 = outer
             .preheader
-            .map(|p| loop_runs_at_least_once(func, outer, p, idom))
+            .map(|p| loop_first_entry(func, outer, p, idom).is_some())
             .unwrap_or(false);
 
         let candidate = l1 && l2_bad.is_none() && l4 && l5 && l6;
@@ -2415,7 +2912,7 @@ fn region_def_of(inst: &X86ISelInst) -> Option<VReg> {
 fn verify_preheader_defs_precede_uses(
     func: &X86ISelFunction,
     preheader: Block,
-    def_counts: &HashMap<VReg, usize>,
+    def_counts: &HashMap<u32, usize>,
 ) {
     // Both production callers (`hoist_loop_invariants`, `hoist_pure_call_clusters`)
     // reach this only after splicing through a `blocks.get_mut(&preheader)`
@@ -2428,7 +2925,7 @@ fn verify_preheader_defs_precede_uses(
     let mut def_pos: HashMap<VReg, usize> = HashMap::new();
     for (i, inst) in insts.iter().enumerate() {
         if let Some(d) = region_def_of(inst)
-            && def_counts.get(&d).copied().unwrap_or(0) == 1
+            && def_counts.get(&d.id).copied().unwrap_or(0) == 1
         {
             def_pos.entry(d).or_insert(i); // earliest def wins
         }
@@ -2474,7 +2971,7 @@ fn verify_preheader_defs_precede_uses(
 ///   L2  every inner-loop instruction is memory-Pure (no load/store/call).
 ///   L4  the inner loop has exactly ONE exit block, inside outer.body.
 ///   L5  inner.header dominates every outer latch (region runs each iteration).
-///   L6  the outer loop provably runs >= 1 time (`loop_runs_at_least_once`).
+///   L6  the outer loop provably runs >= 1 time (`loop_first_entry`).
 ///   P   outer.preheader exists and ends in an explicit `Jmp outer.header`;
 ///       `ip` ends in an explicit `Jmp inner.header`. (Explicit terminators →
 ///       layout-order independence for the moved blocks.)
@@ -2490,8 +2987,8 @@ fn verify_preheader_defs_precede_uses(
 fn region_licm_hoist(
     func: &mut X86ISelFunction,
     loops: &[NaturalLoop],
-    preds: &HashMap<Block, Vec<Block>>,
-    idom: &HashMap<Block, Block>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
 ) -> bool {
     let dbg = std::env::var_os("TCG_REGION_LICM_DEBUG").is_some();
     macro_rules! decline {
@@ -2571,7 +3068,7 @@ fn region_licm_hoist(
         }
 
         // L6: outer runs >= 1 time.
-        if !loop_runs_at_least_once(func, outer, op_pre, idom) {
+        if loop_first_entry(func, outer, op_pre, idom).is_none() {
             decline!("outer {:?} not proven >=1-trip", outer.header);
             continue;
         }
@@ -2895,7 +3392,7 @@ fn collect_operand_vregs(op: &X86ISelOperand, f: &mut impl FnMut(VReg)) {
 
 /// `a` dominates `b` iff walking `b` up the idom chain reaches `a` (reflexive).
 /// Thin wrapper over [`crate::mach_view::dominates`].
-fn dominates(a: Block, b: Block, idom: &HashMap<Block, Block>) -> bool {
+fn dominates(a: Block, b: Block, idom: &crate::fast_hash::FxHashMap<Block, Block>) -> bool {
     mach_view::dominates(a, b, idom)
 }
 
@@ -2938,8 +3435,8 @@ fn dominates(a: Block, b: Block, idom: &HashMap<Block, Block>) -> bool {
 /// pins this.
 fn find_natural_loops(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
-    idom: &HashMap<Block, Block>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
 ) -> Vec<NaturalLoop> {
     // ⚑ DETERMINISM: return the upstream order DIRECTLY. This used to collect
     // into a `HashMap<Block, NaturalLoop>` and return `by_header.into_values()`,
@@ -2990,7 +3487,8 @@ fn find_natural_loops(
 // ===========================================================================
 
 fn ghoist_trace() -> bool {
-    std::env::var_os("TCG_X86_LICM_GUARDED_TRACE").is_some()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_X86_LICM_GUARDED_TRACE").is_some())
 }
 
 macro_rules! ghtrace {
@@ -3086,7 +3584,7 @@ fn gh_const_of(
     block: &trust_cg_lower::X86ISelBlock,
     upto: usize,
     v: VReg,
-    def_counts: &HashMap<VReg, usize>,
+    def_counts: &HashMap<u32, usize>,
     def_sites: &HashMap<VReg, (Block, usize)>,
 ) -> Option<i64> {
     let (cur, pos) = gh_resolve_copies(block, upto, v);
@@ -3096,7 +3594,7 @@ fn gh_const_of(
             _ => None,
         },
         None => {
-            if def_counts.get(&cur).copied().unwrap_or(0) != 1 {
+            if def_counts.get(&cur.id).copied().unwrap_or(0) != 1 {
                 return None;
             }
             let &(db, di) = def_sites.get(&cur)?;
@@ -3119,7 +3617,7 @@ fn gh_term_of(
     block: &trust_cg_lower::X86ISelBlock,
     upto: usize,
     v: VReg,
-    def_counts: &HashMap<VReg, usize>,
+    def_counts: &HashMap<u32, usize>,
     def_sites: &HashMap<VReg, (Block, usize)>,
 ) -> (VReg, i64, usize) {
     let (cur, pos) = gh_resolve_copies(block, upto, v);
@@ -3128,7 +3626,7 @@ fn gh_term_of(
     let (site_block, i, inst) = match local {
         Some((i, inst)) => (block, i, inst),
         None => {
-            if def_counts.get(&cur).copied().unwrap_or(0) == 1 {
+            if def_counts.get(&cur.id).copied().unwrap_or(0) == 1 {
                 if let Some(&(db, di)) = def_sites.get(&cur) {
                     if let Some(dblk) = func.blocks.get(&db) {
                         if let Some(dinst) = dblk.insts.get(di) {
@@ -3209,7 +3707,7 @@ fn gh_resolve_sym_addr(
     block_id: Block,
     upto: usize,
     v: VReg,
-    def_counts: &HashMap<VReg, usize>,
+    def_counts: &HashMap<u32, usize>,
     def_sites: &HashMap<VReg, (Block, usize)>,
     fuel: u32,
 ) -> Option<GhSymAddr> {
@@ -3220,7 +3718,7 @@ fn gh_resolve_sym_addr(
     let (site_block, site_idx, inst) = match gh_nearest_local_def(block, upto, v) {
         Some((i, inst)) => (block_id, i, inst),
         None => {
-            if def_counts.get(&v).copied().unwrap_or(0) != 1 {
+            if def_counts.get(&v.id).copied().unwrap_or(0) != 1 {
                 return None;
             }
             let &(db, di) = def_sites.get(&v)?;
@@ -3344,7 +3842,7 @@ fn gh_resolve_sym_addr(
 /// in the pre-loop region. Returns None at a genuine merge.
 fn gh_reach_pred(
     lp: &NaturalLoop,
-    preds: &HashMap<Block, Vec<Block>>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
     b: Block,
     body_inv: bool,
 ) -> Option<Block> {
@@ -3381,7 +3879,7 @@ fn gh_reach_pred(
 fn gh_chain_terminal(
     func: &X86ISelFunction,
     lp: &NaturalLoop,
-    preds: &HashMap<Block, Vec<Block>>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
     at_block: Block,
     upto: usize,
     v: VReg,
@@ -3472,8 +3970,8 @@ fn gh_guard_in_block(
 /// in-body pred), and finally — for a body-invariant root — the preheader
 /// ancestor chain (single pred). Fail-closed.
 struct GhCfgAnalysis<'a> {
-    preds: &'a HashMap<Block, Vec<Block>>,
-    idom: &'a HashMap<Block, Block>,
+    preds: &'a crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+    idom: &'a crate::fast_hash::FxHashMap<Block, Block>,
 }
 
 fn gh_bound(
@@ -3910,6 +4408,7 @@ fn guarded_slice_hoist(func: &mut X86ISelFunction, lp: &NaturalLoop) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod eh_call_custody_tests;
     use super::*;
 
     use trust_cg_ir::regs::{RegClass, VReg};
@@ -4095,6 +4594,55 @@ mod tests {
         assert_eq!(ph[1].opcode, X86Opcode::Jmp);
     }
 
+    /// `StackAlloc [dst, count, unit, align]` writes `dst` on every iteration.
+    /// When `dst` also has a definition before the loop, a `Lea` of the fresh
+    /// allocation reads a loop-defined register and must stay in the loop.
+    /// While `x86_produces_value(StackAlloc)` answered `false`, neither the
+    /// loop-def map nor the whole-function def count saw that write, so
+    /// `dst` looked single-def and defined outside the loop and the `Lea`
+    /// was hoisted to the preheader, where it read the pre-loop value.
+    #[test]
+    fn x86_licm_keeps_a_read_of_a_stack_alloc_destination_in_the_loop() {
+        let mem = |base: u32, disp: i32| X86ISelOperand::MemAddr {
+            base: Box::new(vreg(base)),
+            disp,
+        };
+        let body = vec![
+            X86ISelInst::new(
+                X86Opcode::StackAlloc,
+                vec![vreg(5), vreg(9), imm(8), imm(16)],
+            ),
+            X86ISelInst::new(X86Opcode::Lea, vec![vreg(6), mem(5, 8)]),
+            X86ISelInst::new(X86Opcode::MovMR, vec![mem(6, 0), vreg(7)]),
+        ];
+        let mut func = make_self_loop(body);
+        {
+            let ph = &mut func.blocks.get_mut(&Block(0)).unwrap().insts;
+            ph.insert(0, X86ISelInst::new(X86Opcode::MovRI, vec![vreg(5), imm(0)]));
+            ph.insert(1, X86ISelInst::new(X86Opcode::MovRI, vec![vreg(7), imm(7)]));
+            ph.insert(2, X86ISelInst::new(X86Opcode::MovRI, vec![vreg(9), imm(4)]));
+        }
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+
+        pass.run_on_function(&mut func);
+
+        let header = block_insts(&func, Block(1));
+        let alloc = header
+            .iter()
+            .position(|i| i.opcode == X86Opcode::StackAlloc)
+            .expect("StackAlloc stays in the loop");
+        let lea = header
+            .iter()
+            .position(|i| i.opcode == X86Opcode::Lea)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the Lea of the per-iteration allocation was hoisted: preheader {:#?}",
+                    block_insts(&func, Block(0))
+                )
+            });
+        assert!(alloc < lea, "{header:#?}");
+    }
+
     /// Build the same self-loop but give the PREHEADER a two-terminator tail
     /// `Jcc header ; Jmp other`, the shape x86 ISel really emits (see
     /// `x86_loop_unroll::analyze_counted_loop`, which models it literally).
@@ -4164,7 +4712,7 @@ mod tests {
     ///
     /// Inserting before the `Jcc` is not a safe general repair either — it
     /// would run the hoisted code on the path that does NOT enter the loop,
-    /// breaking the pure-call tier's `loop_runs_at_least_once` precondition.
+    /// breaking the pure-call tier's `loop_first_entry` precondition.
     /// Hence: decline, matching region-LICM's precondition P in this same file.
     #[test]
     fn x86_licm_declines_two_terminator_preheader() {
@@ -4726,6 +5274,162 @@ mod tests {
         func
     }
 
+    /// Build a loop whose header loads through a base defined in the PREHEADER
+    /// and not resolvable to a frame slot — the `&Vec` parameter shape. `extra`
+    /// is prepended to the loop body before the candidate load.
+    fn make_pointer_base_loop(extra: Vec<X86ISelInst>) -> X86ISelFunction {
+        let mut body = extra;
+        body.push(load(7, mem_vreg(1, 0)));
+        let mut func = make_self_loop(body);
+        func.stack_slots = vec![StackSlotInfo::new(8, 8)];
+        // v1 = a pointer that is NOT a frame address, defined in the preheader.
+        let bb0 = Block(0);
+        let ph = func.blocks.get_mut(&bb0).unwrap();
+        ph.insts.insert(
+            0,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(1), X86ISelOperand::Imm(4096)]),
+        );
+        func
+    }
+
+    /// The arm is DEFAULT ON at O2/O3, and that is a MEASURED decision — see
+    /// [`pointer_base_load_is_hoistable`] for both readings. Pinned so that
+    /// turning it back off is a deliberate edit which fails this test first.
+    ///
+    /// The second half is the falsifiability arm: the SAME assertion, inverted,
+    /// under the explicit opt-out. Without it a `MovRM` the pass never emitted
+    /// would satisfy the first half vacuously. The opt-out is spelled through the
+    /// builder rather than [`set_pointer_base_loads_disabled`] on purpose — that
+    /// installer is process-global and install-once, so a test using it would
+    /// decide the default for every other test in this binary.
+    #[test]
+    fn x86_licm_pointer_base_arm_is_default_on_and_its_opt_out_restores_the_load() {
+        let mut func = make_pointer_base_loop(vec![]);
+        let mut pass = X86LoopInvariantCodeMotion::with_invariant_load_hoisting();
+        pass.run_on_function(&mut func);
+        assert!(
+            !block_insts(&func, Block(1))
+                .iter()
+                .any(|i| i.opcode == X86Opcode::MovRM && i.operands[0] == vreg(7)),
+            "the pointer-base load must be hoisted out of the loop by default: {:?}",
+            block_insts(&func, Block(1))
+        );
+
+        let mut opted_out = make_pointer_base_loop(vec![]);
+        let mut pass = X86LoopInvariantCodeMotion::with_invariant_load_hoisting()
+            .with_pointer_base_loads(false);
+        pass.run_on_function(&mut opted_out);
+        assert!(
+            block_insts(&opted_out, Block(1))
+                .iter()
+                .any(|i| i.opcode == X86Opcode::MovRM && i.operands[0] == vreg(7)),
+            "under the opt-out the pointer-base load must stay in the loop: {:?}",
+            block_insts(&opted_out, Block(1))
+        );
+    }
+
+    /// POINTER-BASE arm: a header load through a preheader-defined pointer, in a
+    /// loop that writes no memory, hoists even though its address resolves to no
+    /// frame slot.
+    #[test]
+    fn x86_licm_pointer_base_load_hoists_from_the_header() {
+        let mut func = make_pointer_base_loop(vec![]);
+        let mut pass = X86LoopInvariantCodeMotion::with_invariant_load_hoisting()
+            .with_pointer_base_loads(true);
+        assert!(
+            pass.run_on_function(&mut func),
+            "the pass must report a change"
+        );
+        assert_eq!(
+            count_opcode(block_insts(&func, Block(1)), X86Opcode::MovRM),
+            0,
+            "the pointer-base load must leave the loop: {:?}",
+            block_insts(&func, Block(1))
+        );
+        assert_eq!(
+            count_opcode(block_insts(&func, Block(0)), X86Opcode::MovRM),
+            1,
+            "and land in the preheader"
+        );
+    }
+
+    /// REFUTATION: any store in the loop disables the arm. A pointer could alias
+    /// any slot, so slot-granular store tracking cannot clear it — the arm's
+    /// value argument is "the loop writes no memory at all".
+    #[test]
+    fn x86_licm_pointer_base_load_refuses_when_the_loop_stores() {
+        let mut func = make_pointer_base_loop(vec![store(mem_slot(0, 0), 1)]);
+        let mut pass = X86LoopInvariantCodeMotion::with_invariant_load_hoisting()
+            .with_pointer_base_loads(true);
+        pass.run_on_function(&mut func);
+        assert!(
+            block_insts(&func, Block(1))
+                .iter()
+                .any(|i| i.opcode == X86Opcode::MovRM && i.operands[0] == vreg(7)),
+            "a store in the loop must keep the pointer-base load inside it: {:?}",
+            block_insts(&func, Block(1))
+        );
+    }
+
+    /// REFUTATION: fault equivalence needs a clean prefix. A memory access that
+    /// STAYS in the loop ahead of the candidate means the candidate was not
+    /// guaranteed to be reached, so hoisting it would introduce a dereference.
+    #[test]
+    fn x86_licm_pointer_base_load_refuses_behind_an_unhoisted_load() {
+        // v6 is defined INSIDE the loop, so `[v6+0]` can hoist by neither arm and
+        // stays ahead of the candidate.
+        let mut func = make_pointer_base_loop(vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(6), X86ISelOperand::Imm(8)]),
+            load(5, mem_vreg(6, 0)),
+        ]);
+        let mut pass = X86LoopInvariantCodeMotion::with_invariant_load_hoisting()
+            .with_pointer_base_loads(true);
+        pass.run_on_function(&mut func);
+        let header = block_insts(&func, Block(1));
+        assert!(
+            header
+                .iter()
+                .any(|i| i.opcode == X86Opcode::MovRM && i.operands[0] == vreg(5)),
+            "the blocking load stays (it is the premise of this test): {header:?}"
+        );
+        assert!(
+            header
+                .iter()
+                .any(|i| i.opcode == X86Opcode::MovRM && i.operands[0] == vreg(7)),
+            "so the candidate behind it must stay too: {header:?}"
+        );
+    }
+
+    /// REFUTATION: a CONDITIONAL preheader refuses. Hoisting into a block that
+    /// can bypass the loop would dereference on the loop-skipped path.
+    #[test]
+    fn x86_licm_pointer_base_load_refuses_a_conditional_preheader() {
+        let mut func = make_self_loop_jcc_preheader(vec![load(7, mem_vreg(1, 0))]);
+        func.stack_slots = vec![StackSlotInfo::new(8, 8)];
+        let bb0 = Block(0);
+        let ph = func.blocks.get_mut(&bb0).unwrap();
+        ph.insts.insert(
+            0,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(1), X86ISelOperand::Imm(4096)]),
+        );
+        let mut pass = X86LoopInvariantCodeMotion::with_invariant_load_hoisting()
+            .with_pointer_base_loads(true);
+        pass.run_on_function(&mut func);
+        assert!(
+            func.blocks.values().any(|b| b
+                .insts
+                .iter()
+                .any(|i| i.opcode == X86Opcode::MovRM && i.operands[0] == vreg(7))),
+            "the load must still exist somewhere"
+        );
+        assert_eq!(
+            count_opcode(block_insts(&func, Block(0)), X86Opcode::MovRM),
+            0,
+            "and must NOT have been hoisted into the conditional preheader: {:?}",
+            block_insts(&func, Block(0))
+        );
+    }
+
     #[test]
     fn x86_licm_load_tier_forwards_celled_pointer_chain() {
         let mut func = make_celled_pointer_loop();
@@ -4908,6 +5612,40 @@ mod tests {
                 count_opcode(block_insts(&func, Block(0)), op),
                 1,
                 "{op:?} must land in the preheader"
+            );
+        }
+    }
+
+    /// REFUTATION: the TWO-operand RR form `AddRR [d, s]` is `d := d + s`. It
+    /// reads `d`, so its value is not a function of `s` alone and it must not
+    /// be treated as invariant even when `s` is and `d` has no other def.
+    /// LICM's private tied list was per opcode, did not name the RR forms, and
+    /// admitted it; the shared per-form `x86_operand0_may_be_read` refuses it.
+    /// (A single-def register whose only def reads it is read before any def
+    /// on entry, so well-formed ISel does not produce this shape; the pass
+    /// result is what is pinned.)
+    #[test]
+    fn x86_licm_flag_arith_refuses_tied_two_operand_rr_forms() {
+        for op in [
+            X86Opcode::OrRR,
+            X86Opcode::AndRR,
+            X86Opcode::XorRR,
+            X86Opcode::AddRR,
+            X86Opcode::SubRR,
+            X86Opcode::ImulRR,
+        ] {
+            let body = vec![
+                X86ISelInst::new(X86Opcode::MovRI, vec![vreg(11), imm(17)]),
+                X86ISelInst::new(op, vec![vreg(10), vreg(11)]),
+                cmp_ri(13, 0),
+            ];
+            let mut func = make_self_loop(body);
+            let mut pass = X86LoopInvariantCodeMotion::with_invariant_load_hoisting();
+            pass.run_on_function(&mut func);
+            assert_eq!(
+                count_opcode(block_insts(&func, Block(1)), op),
+                1,
+                "tied {op:?} [v10, v11] reads v10 and must stay in the loop"
             );
         }
     }
@@ -5156,6 +5894,8 @@ mod tests {
             hoist_invariant_loads: true,
             guarded_hoist: true,
             hoist_flag_arith: false,
+            pointer_base_loads: false,
+            hoist_pure_calls: true,
         }
     }
 
@@ -5492,5 +6232,502 @@ mod tests {
             vec![vreg(60), X86ISelOperand::PReg(RAX)]
         );
         assert_eq!(ph.last().unwrap().opcode, X86Opcode::Jmp);
+    }
+
+    /// The pure-call cluster `mov rdi, v{arg}; call {name}; mov v{result}, rax`.
+    fn push_pure_call_cluster(
+        func: &mut X86ISelFunction,
+        b: Block,
+        arg: u32,
+        result: u32,
+        name: &str,
+    ) {
+        use trust_cg_lower::x86_64_isel::{X86CallArgReg, X86CallResultReg};
+        func.push_inst(
+            b,
+            X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::PReg(RDI), vreg(arg)]),
+        );
+        let call = X86ISelInst::new(
+            X86Opcode::Call,
+            vec![X86ISelOperand::Symbol(name.to_string())],
+        );
+        let mut call_flags = call.flags;
+        call_flags.insert(InstFlags::PURE_CALL_HOISTABLE);
+        let call = X86ISelInst::with_flags(call.opcode, call.operands, call_flags)
+            .with_call_arg_regs(vec![X86CallArgReg::full(RDI)])
+            .with_call_result_regs(vec![X86CallResultReg::new(RAX, 64)]);
+        func.push_inst(b, call);
+        func.push_inst(
+            b,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![vreg(result), X86ISelOperand::PReg(RAX)],
+            ),
+        );
+    }
+
+    /// A counted loop that the entry state proves runs (`v20 = 0`, header
+    /// `cmp v20, 10; jb body`), with `body` and `latch` filled by the caller:
+    /// bb0 preheader -> bb1 header {jb bb2; jmp bb5} -> bb2 body ... -> bb4
+    /// latch {v20 += 1; jmp bb1}; bb5 exit. `v30` is a loop-invariant argument.
+    fn counted_call_loop(
+        body: impl FnOnce(&mut X86ISelFunction),
+        order: Vec<Block>,
+    ) -> X86ISelFunction {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut func = X86ISelFunction::new("x86_licm_call_path".to_string(), sig);
+        for b in 0..6 {
+            func.ensure_block(Block(b));
+        }
+        func.next_vreg = 64;
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(20), imm(0)]),
+        );
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(30), imm(1)]),
+        );
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(1)];
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(22), imm(10)]),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(20), vreg(22)]),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::B),
+                    X86ISelOperand::Block(Block(2)),
+                ],
+            ),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(5))]),
+        );
+        func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(2), Block(5)];
+        body(&mut func);
+        func.push_inst(
+            Block(4),
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(20), vreg(20), imm(1)]),
+        );
+        func.push_inst(
+            Block(4),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(4)).unwrap().successors = vec![Block(1)];
+        func.push_inst(Block(5), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.block_order = order;
+        func
+    }
+
+    fn jmp_to(func: &mut X86ISelFunction, from: Block, to: Block) {
+        func.push_inst(
+            from,
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(to)]),
+        );
+        func.blocks.get_mut(&from).unwrap().successors = vec![to];
+    }
+
+    fn calls_in(func: &X86ISelFunction, b: Block) -> Vec<String> {
+        block_insts(func, b)
+            .iter()
+            .filter(|i| i.opcode == X86Opcode::Call)
+            .map(|i| match &i.operands[0] {
+                X86ISelOperand::Symbol(s) => s.clone(),
+                other => panic!("call target {other:?}"),
+            })
+            .collect()
+    }
+
+    fn default_order() -> Vec<Block> {
+        (0..6).map(Block).collect()
+    }
+
+    /// POSITIVE CONTROL for the first-iteration rule: the call sits in the body
+    /// block the header's first visit is proven to enter, after only register
+    /// moves, so every run that enters the loop runs it — it hoists.
+    #[test]
+    fn pure_call_on_the_first_iterations_path_hoists() {
+        let mut func = counted_call_loop(
+            |f| {
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::MovRI, vec![vreg(40), imm(5)]),
+                );
+                push_pure_call_cluster(f, Block(2), 30, 60, "pure_fn");
+                jmp_to(f, Block(2), Block(4));
+                f.blocks.remove(&Block(3));
+            },
+            vec![Block(0), Block(1), Block(2), Block(4), Block(5)],
+        );
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        assert!(pass.run_on_function(&mut func));
+        assert_eq!(calls_in(&func, Block(0)), vec!["pure_fn".to_string()]);
+        assert!(calls_in(&func, Block(2)).is_empty());
+    }
+
+    /// The opt-out (`with_pure_call_hoist(false)`, the tracked knob
+    /// `no-x86-pure-call-hoist`) keeps the positive control's call in its loop,
+    /// in both policies: the hoist-off arm of the `fuzz/repros/purecall/`
+    /// differential compiles exactly the source's calls.
+    #[test]
+    fn pure_call_hoist_off_keeps_the_call_in_its_loop() {
+        for pass in [
+            X86LoopInvariantCodeMotion::pure_only(),
+            X86LoopInvariantCodeMotion::with_invariant_load_hoisting(),
+        ] {
+            let mut func = counted_call_loop(
+                |f| {
+                    f.push_inst(
+                        Block(2),
+                        X86ISelInst::new(X86Opcode::MovRI, vec![vreg(40), imm(5)]),
+                    );
+                    push_pure_call_cluster(f, Block(2), 30, 60, "pure_fn");
+                    jmp_to(f, Block(2), Block(4));
+                    f.blocks.remove(&Block(3));
+                },
+                vec![Block(0), Block(1), Block(2), Block(4), Block(5)],
+            );
+            let mut pass = pass.with_pure_call_hoist(false);
+            let _ = pass.run_on_function(&mut func);
+            assert!(calls_in(&func, Block(0)).is_empty());
+            assert_eq!(calls_in(&func, Block(2)), vec!["pure_fn".to_string()]);
+        }
+    }
+
+    /// A pure callee may diverge or trap. A call in a CONDITIONAL arm of a loop
+    /// that runs — `for i in 0..10 { if i == 1000 { s += f(x) } }` — never runs
+    /// in the source, so hoisting it would introduce the divergence or trap.
+    #[test]
+    fn pure_call_in_a_conditional_arm_is_not_hoisted() {
+        let mut func = counted_call_loop(
+            |f| {
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::MovRI, vec![vreg(23), imm(1000)]),
+                );
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(20), vreg(23)]),
+                );
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(
+                        X86Opcode::Jcc,
+                        vec![
+                            X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::E),
+                            X86ISelOperand::Block(Block(3)),
+                        ],
+                    ),
+                );
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(4))]),
+                );
+                f.blocks.get_mut(&Block(2)).unwrap().successors = vec![Block(3), Block(4)];
+                push_pure_call_cluster(f, Block(3), 30, 60, "pure_fn");
+                jmp_to(f, Block(3), Block(4));
+            },
+            default_order(),
+        );
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        let _ = pass.run_on_function(&mut func);
+        assert!(
+            calls_in(&func, Block(0)).is_empty(),
+            "a call the first iteration may skip must stay in its arm"
+        );
+        assert_eq!(calls_in(&func, Block(3)), vec!["pure_fn".to_string()]);
+    }
+
+    /// A call after a row that can trap (`TrapDivZeroExact`) may not move ahead
+    /// of it: a diverging callee would hide the source's trap.
+    #[test]
+    fn pure_call_after_a_trap_is_not_hoisted() {
+        let mut func = counted_call_loop(
+            |f| {
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::TrapDivZeroExact, vec![vreg(30)]),
+                );
+                push_pure_call_cluster(f, Block(2), 30, 60, "pure_fn");
+                jmp_to(f, Block(2), Block(4));
+                f.blocks.remove(&Block(3));
+            },
+            vec![Block(0), Block(1), Block(2), Block(4), Block(5)],
+        );
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        let _ = pass.run_on_function(&mut func);
+        assert!(
+            calls_in(&func, Block(0)).is_empty(),
+            "the call must stay behind the trap"
+        );
+        assert_eq!(calls_in(&func, Block(2)), vec!["pure_fn".to_string()]);
+    }
+
+    /// A call between a block's conditional branch and its final jump runs
+    /// only on the fall-through edge: `cmp i, 1000; je arm; call f; jmp latch`
+    /// reaches `f` only when `i != 1000`. It is not on the first iteration's
+    /// straight path, so it is not hoisted.
+    #[test]
+    fn pure_call_after_a_conditional_branch_in_its_block_is_not_hoisted() {
+        let mut func = counted_call_loop(
+            |f| {
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::MovRI, vec![vreg(23), imm(0)]),
+                );
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(20), vreg(23)]),
+                );
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(
+                        X86Opcode::Jcc,
+                        vec![
+                            X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::E),
+                            X86ISelOperand::Block(Block(3)),
+                        ],
+                    ),
+                );
+                push_pure_call_cluster(f, Block(2), 30, 60, "pure_fn");
+                f.push_inst(
+                    Block(2),
+                    X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(4))]),
+                );
+                f.blocks.get_mut(&Block(2)).unwrap().successors = vec![Block(3), Block(4)];
+                jmp_to(f, Block(3), Block(4));
+            },
+            default_order(),
+        );
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        let _ = pass.run_on_function(&mut func);
+        assert!(
+            calls_in(&func, Block(0)).is_empty(),
+            "a call after its block's conditional branch must stay"
+        );
+        assert_eq!(calls_in(&func, Block(2)), vec!["pure_fn".to_string()]);
+    }
+
+    /// Two calls on the first iteration's path keep the order they run in, even
+    /// when the layout order disagrees: header -> bb3 (`first`) -> bb2
+    /// (`second`) -> latch, laid out bb2 before bb3. One callee diverging and
+    /// the other trapping is observable in which runs first.
+    #[test]
+    fn hoisted_pure_calls_keep_their_first_iteration_order() {
+        let mut func = counted_call_loop(
+            |f| {
+                push_pure_call_cluster(f, Block(3), 30, 61, "first");
+                jmp_to(f, Block(3), Block(2));
+                push_pure_call_cluster(f, Block(2), 30, 62, "second");
+                jmp_to(f, Block(2), Block(4));
+            },
+            default_order(),
+        );
+        // The header's first visit enters bb3, not bb2.
+        if let Some(X86ISelOperand::Block(t)) = func.blocks.get_mut(&Block(1)).unwrap().insts[2]
+            .operands
+            .get_mut(1)
+        {
+            *t = Block(3);
+        }
+        func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(3), Block(5)];
+        let mut pass = X86LoopInvariantCodeMotion::pure_only();
+        assert!(pass.run_on_function(&mut func));
+        assert_eq!(
+            calls_in(&func, Block(0)),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn outer_iv_custody_isolated() {
+        const CHILD: &str = "CG_OUTER_IV_CUSTODY";
+        let Ok(case) = std::env::var(CHILD) else {
+            let mut failures = Vec::new();
+            for case in [
+                "default",
+                "zero",
+                "one",
+                "empty",
+                "installed_on",
+                "installed_off",
+                "exchange_source",
+                "alias_source",
+                "exchange_dest",
+                "alias_dest",
+            ] {
+                let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+                cmd.args([
+                    "--exact",
+                    "x86_licm::tests::outer_iv_custody_isolated",
+                    "--nocapture",
+                    "--test-threads=1",
+                ]);
+                cmd.env(CHILD, case).env_remove("TCG_NO_X86_LICM_OUTER_IV");
+                if case != "default" {
+                    // The arm is DEFAULT ON since 2026-09-30, so the variable is
+                    // now the OPT-OUT. The installed-value cases deliberately set
+                    // the OPPOSITE env value, so each still proves the installed
+                    // value wins over the environment.
+                    cmd.env(
+                        "TCG_NO_X86_LICM_OUTER_IV",
+                        if matches!(case, "zero" | "installed_off") {
+                            "0"
+                        } else if case == "empty" {
+                            ""
+                        } else {
+                            "1"
+                        },
+                    );
+                }
+                let output = cmd.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                println!(
+                    "case {case}:\n{stdout}{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success() || !stdout.contains("running 1 test") {
+                    failures.push(case);
+                }
+            }
+            assert!(failures.is_empty(), "failed cases: {failures:?}");
+            return;
+        };
+        if case.starts_with("installed_") {
+            let enabled = case == "installed_on";
+            assert!(set_outer_iv_invariance_enabled(enabled));
+            assert!(set_outer_iv_invariance_enabled(enabled));
+            assert!(!set_outer_iv_invariance_enabled(!enabled));
+        }
+        let narrow = |id| X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr32));
+        let candidate = X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(7)]);
+        let mut body = Vec::new();
+        match case.as_str() {
+            "exchange_source" => {
+                body.push(X86ISelInst::new(X86Opcode::Xchg, vec![vreg(8), vreg(7)]))
+            }
+            "alias_source" => body.push(X86ISelInst::new(
+                X86Opcode::MovRR32,
+                vec![narrow(7), narrow(30)],
+            )),
+            _ => {}
+        }
+        body.push(candidate.clone());
+        match case.as_str() {
+            "exchange_dest" => body.push(X86ISelInst::new(X86Opcode::Xchg, vec![vreg(8), vreg(9)])),
+            "alias_dest" => body.push(X86ISelInst::new(
+                X86Opcode::MovRR32,
+                vec![narrow(9), narrow(30)],
+            )),
+            _ => {}
+        }
+        body.push(X86ISelInst::new(
+            X86Opcode::AddRI,
+            vec![narrow(30), narrow(30), imm(1)],
+        ));
+        body.push(store(mem_vreg(50, 0), 9));
+        let mut func = make_self_loop(body);
+        let init = [
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(7), imm(11)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(7), imm(22)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(8), imm(33)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![narrow(30), imm(0)]),
+        ];
+        func.blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .insts
+            .splice(0..0, init);
+        X86LoopInvariantCodeMotion::pure_only().run_on_function(&mut func);
+        // DEFAULT ON: absent opts in, and an explicit `0` does NOT opt out
+        // (the tracked-Boolean policy). `one` and `empty` opt OUT. The
+        // `installed_*` cases carry the opposite env value, so a hoist here
+        // proves the installed value beat the environment.
+        let should_hoist = matches!(case.as_str(), "default" | "zero" | "installed_on");
+        let has = |b| {
+            block_insts(&func, b)
+                .iter()
+                .any(|i| i.opcode == candidate.opcode && i.operands == candidate.operands)
+        };
+        assert_eq!(has(Block(0)), should_hoist, "preheader candidate");
+        assert_eq!(has(Block(1)), !should_hoist, "loop candidate");
+    }
+
+    // ---- outer-IV invariance relaxation ----
+
+    fn inv_inputs() -> (HashMap<u32, Block>, HashSet<VReg>, HashMap<u32, usize>) {
+        let loop_defs: HashMap<u32, Block> = HashMap::new();
+        let invariant: HashSet<VReg> = HashSet::new();
+        let mut defs: HashMap<u32, usize> = HashMap::new();
+        // v7 is an ENCLOSING loop's induction variable: two defs (init and
+        // increment), NEITHER inside this loop's body.
+        defs.insert(7, 2);
+        // v8 is an ordinary single-def value from outside the loop.
+        defs.insert(8, 1);
+        (loop_defs, invariant, defs)
+    }
+
+    #[test]
+    fn an_outer_loop_iv_is_not_invariant_by_default() {
+        let (ld, iv, dc) = inv_inputs();
+        assert!(
+            !is_vreg_loop_invariant_with(VReg::new(7, RegClass::Gpr64), &ld, &iv, &dc, false),
+            "default refuses a multi-def vreg even with no def inside the loop"
+        );
+    }
+
+    #[test]
+    fn an_outer_loop_iv_is_invariant_under_the_relaxation() {
+        let (ld, iv, dc) = inv_inputs();
+        assert!(
+            is_vreg_loop_invariant_with(VReg::new(7, RegClass::Gpr64), &ld, &iv, &dc, true),
+            "no definition inside the body means one value for the whole loop"
+        );
+    }
+
+    #[test]
+    fn a_single_def_outside_the_loop_is_invariant_either_way() {
+        let (ld, iv, dc) = inv_inputs();
+        for relax in [false, true] {
+            assert!(is_vreg_loop_invariant_with(
+                VReg::new(8, RegClass::Gpr64),
+                &ld,
+                &iv,
+                &dc,
+                relax
+            ));
+        }
+    }
+
+    #[test]
+    fn a_vreg_defined_inside_the_loop_stays_non_invariant_under_the_relaxation() {
+        // THE case the relaxation must not touch: a def INSIDE the body that has
+        // not been proven invariant. This is the loop's own counter.
+        let mut ld: HashMap<u32, Block> = HashMap::new();
+        ld.insert(9, Block(1));
+        let iv: HashSet<VReg> = HashSet::new();
+        let mut dc: HashMap<u32, usize> = HashMap::new();
+        dc.insert(9, 2);
+        for relax in [false, true] {
+            assert!(
+                !is_vreg_loop_invariant_with(VReg::new(9, RegClass::Gpr64), &ld, &iv, &dc, relax),
+                "a definition inside the loop body is never invariant here"
+            );
+        }
     }
 }

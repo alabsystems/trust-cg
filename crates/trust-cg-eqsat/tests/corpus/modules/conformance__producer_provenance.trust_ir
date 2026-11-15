@@ -1,0 +1,45 @@
+; TrustIr text format v1
+module "producer_provenance"
+
+functy.0 = (i32) -> (i32)
+
+fn @from_clean_default(functy.0) {
+    ; #producer: clean
+bb0(%0: i32):
+    ret %0
+}
+
+fn @from_trust(functy.0) {
+    ; #producer: trust
+bb0(%0: i32):
+    ret %0
+}
+
+fn @from_trust_ir(functy.0) {
+    ; #producer: trust-ir
+bb0(%0: i32):
+    ret %0
+}
+
+fn @from_tswift_deprecated(functy.0) {
+    ; #producer: tswift
+bb0(%0: i32):
+    ret %0
+}
+
+fn @from_tc_deprecated(functy.0) {
+    ; #producer: tc
+bb0(%0: i32):
+    ret %0
+}
+
+fn @from_other_escape(functy.0) {
+    ; #producer: "custom \"exotic\" frontend v1"
+bb0(%0: i32):
+    ret %0
+}
+
+fn @untagged(functy.0) {
+bb0(%0: i32):
+    ret %0
+}

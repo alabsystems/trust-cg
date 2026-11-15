@@ -610,6 +610,56 @@ fn ops_of(func: &MachFunction, block: BlockId) -> Vec<AArch64Opcode> {
 }
 
 #[test]
+fn shared_analysis_cache_stays_lazy_for_local_folds() {
+    let mut func = make_func(sxtw_madd_load_chain());
+    let mut cache = AnalysisCache::new();
+    assert!(ExtRegAddrFold.run_with_analyses_and_provenance(
+        &mut func,
+        &mut cache,
+        &mut ProvenanceMap::new(),
+    ));
+    assert_eq!(cache.stats().domtree_computations, 0);
+    assert_eq!(cache.stats().loop_analysis_computations, 0);
+}
+
+#[test]
+fn shared_analysis_cache_is_filled_once_and_reused_for_cross_block_folds() {
+    let mut cache = AnalysisCache::new();
+    for _ in 0..2 {
+        // Fresh instructions, identical graph: analyses remain reusable after
+        // the previous invocation rewrote its memory/address instructions.
+        let mut func = make_cross_block_rmw(4, &[], 0);
+        assert!(ExtRegAddrFold.run_with_analyses_and_provenance(
+            &mut func,
+            &mut cache,
+            &mut ProvenanceMap::new(),
+        ));
+        assert_eq!(cache.stats().domtree_computations, 1);
+        assert_eq!(cache.stats().loop_analysis_computations, 1);
+        assert_eq!(cache.stats().cfg_invalidations, 0);
+        assert!(ops_of(&func, func.block_order[1]).contains(&AArch64Opcode::StrRO));
+    }
+}
+
+#[test]
+fn shared_analysis_cache_rebinds_a_different_graph_before_folding() {
+    let mut cache = AnalysisCache::new();
+    let unrelated = make_func(vec![]);
+    cache.domtree_and_loops(&unrelated);
+
+    let mut func = make_cross_block_rmw(4, &[], 0);
+    assert!(ExtRegAddrFold.run_with_analyses_and_provenance(
+        &mut func,
+        &mut cache,
+        &mut ProvenanceMap::new(),
+    ));
+    assert_eq!(cache.stats().domtree_computations, 2);
+    assert_eq!(cache.stats().loop_analysis_computations, 2);
+    assert_eq!(cache.stats().cfg_invalidations, 1);
+    assert!(ops_of(&func, func.block_order[1]).contains(&AArch64Opcode::StrRO));
+}
+
+#[test]
 fn folds_cross_block_rmw_store_to_str_ro() {
     // The nsieve-bits bit-flip: the load's Madd address is shared with a store
     // in a dominated single-predecessor successor. BOTH fold to the RO form and

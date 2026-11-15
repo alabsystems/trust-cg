@@ -1,0 +1,36 @@
+; TrustIr text format v1
+module "t"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "r1_budget_trip_mints_no_flip.rs"
+
+functy.0 = (u32, u32) -> (u32)
+
+functy.1 = () -> ()
+
+rustcc fn @_RNvCs6cbwH7xzw2Z_1t6helper(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "helper"
+    ; #names: %0="x", %1="divisor"
+bb0(%0: u32, %1: u32):
+    %2 = const u32 0  ; #loc: 0 54 4
+    %3 = icmp ne u32 %1, %2  ; #loc: 0 54 4
+    assert %3, div_by_zero  ; #proof: div_nonzero  ; #loc: 0 54 4
+    %4 = udiv u32 %0, %1  ; #loc: 0 54 4
+    ret %4  ; #loc: 0 55 1
+}
+
+rustcc fn @_RNvCs6cbwH7xzw2Z_1t4main(functy.1) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "main"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 58 4
+bb0:
+    %0 = const u32 10  ; #loc: 0 58 19  ; #scope: 0
+    %1 = const u32 5  ; #loc: 0 58 23  ; #scope: 0
+    %2 = call @func.0(%0, %1)  ; #loc: 0 58 12  ; #scope: 0
+    ret  ; #loc: 0 59 1  ; #scope: 0
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (div_by_zero) at L54C4 of `t::helper`: divisor is nonzero. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "t::helper#L54C4#div_by_zero#o0" range 0 54 4 54 15 site f0/bb0#2

@@ -1,0 +1,8 @@
+; X = (X mod 2^64) + 2^64 * (X div 2^64)
+(set-logic ALL)
+(define-fun P64 () Int 18446744073709551616)
+(define-fun P128 () Int 340282366920938463463374607431768211456)
+(define-fun r64 ((x Int)) Bool (and (<= 0 x) (< x P64)))
+(declare-const x Int)
+(assert (not (= x (+ (mod x P64) (* P64 (div x P64))))))
+(check-sat)

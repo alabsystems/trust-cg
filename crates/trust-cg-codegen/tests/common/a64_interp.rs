@@ -45,6 +45,7 @@
 //   FpCompare          : FCMP / FCMPE (register and #0.0), setting NZCV per the
 //                        AArch64 FP-compare rules — the CORE of the NaN test.
 //   Branches           : RET, B, B.cond, CBZ/CBNZ, TBZ/TBNZ (PC-relative)
+//   LoadStoreAcqRel    : LDAR/STLR (all sizes) as plain single-thread accesses
 //
 // Flag semantics use the ARM `AddWithCarry` / `ConditionHolds` pseudocode so the
 // signed/unsigned/overflow/NaN edge cases are modeled exactly, not approximated.
@@ -59,6 +60,8 @@ use trust_cg_lift::disasm::aarch64::{
 /// is never skipped or treated as a NOP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum A64Error {
+    /// An executed `BRK #imm16`, distinct from an unsupported instruction.
+    Trap { immediate: u16 },
     /// The leaf disassembler rejected the 32-bit word.
     Decode(DecodeError),
     /// A decoded instruction variant / form this interpreter does not model.
@@ -566,6 +569,11 @@ impl A64Interp {
                 self.text[pc + 2],
                 self.text[pc + 3],
             ]);
+            if word & 0xFFE0_001F == 0xD420_0000 {
+                return Err(A64Error::Trap {
+                    immediate: ((word >> 5) & 0xffff) as u16,
+                });
+            }
             let ins = decode(word)?;
             self.trace.push(format!("{pc:#06x}: {ins:?}"));
             match self.exec(&ins, pc)? {
@@ -938,6 +946,15 @@ impl A64Interp {
                         Some((ls.rn, wb)),
                     )?;
                 }
+                Ok(Flow::Next)
+            }
+            // LDAR{B,H} / STLR{B,H}: one plain access in this single-threaded
+            // model (acquire/release order nothing without another thread).
+            // The load zero-extends like LDR{B,H}.
+            Instruction::LoadStoreAcquireRelease(ls) => {
+                let addr = self.read_sp(ls.rn, 64);
+                let opc = if ls.load { 0b01 } else { 0b00 };
+                self.exec_load_store(ls.size, opc, false, ls.rt, addr, None)?;
                 Ok(Flow::Next)
             }
             Instruction::LoadStoreRegister(ls) => {

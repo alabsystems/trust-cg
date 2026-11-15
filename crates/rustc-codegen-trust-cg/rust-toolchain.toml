@@ -1,23 +1,20 @@
-# rustc_codegen_trust_cg nightly pin.
+# rustc_codegen_trust_cg toolchain pin: THE TRUST TOOLCHAIN.
 #
-# This standalone research-preview bridge links rustc internals through
-# `#![feature(rustc_private)]`; both those APIs and the `CodegenBackend` dylib
-# ABI are unstable. Change this date only with a clean bridge rebuild and the
-# focused integration tests. Trait drift commonly appears as E0046, E0050, or
-# E0432 and must be fixed in `src/lib.rs` as part of the same pin update.
+# This crate links rustc internals through `#![feature(rustc_private)]`, and
+# the compiler it is a backend FOR is Trust's `trustc` — so it is built with,
+# and against, the Trust toolchain (rustup's `trust` toolchain: the
+# atpkg-delivered pack, or a stage sysroot linked by the Trust bootstrap).
+# It used to pin a stock upstream nightly (`nightly-2026-04-20`, rustc 1.97);
+# that meant the backend was compiled by a compiler it could never be loaded
+# into, and its rustc-API surface drifted from the compiler that actually
+# ships it. The Trust superproject's self-host lane (`-Zcodegen-backend=
+# trust-ir-cg`) builds this exact crate with its own stage compiler.
 #
-# Pinned compiler:
-#     rustc 1.97.0-nightly (e22c616e4 2026-04-19)
+# API drift against the Trust compiler surfaces as E0046/E0050/E0432 and is
+# fixed in `src/lib.rs`, version-shimmed through `build.rs` probes where an
+# older rustc must keep building.
 #
-# The in-tree `rustc_codegen_cranelift` reference source used for
-# trait-shape guidance lives at:
-#
-#     $(rustup run nightly-2026-04-20 rustc --print sysroot)/lib/rustlib/rustc-src/rust/compiler/rustc_codegen_cranelift/src/lib.rs
-#
-# `rustc-dev` and `rust-src` are required because this crate links
-# against rustc internal crates via `#![feature(rustc_private)]`.
-# `llvm-tools` matches cranelift's component list.
+# `rustc-dev` (the rustc_private rmetas + librustc_driver) ships in the Trust
+# sysroot; `rust-src` is needed by the tests' fixtures only.
 [toolchain]
-channel = "nightly-2026-04-20"
-components = ["rust-src", "rustc-dev", "llvm-tools", "rustfmt"]
-profile = "minimal"
+channel = "trust"

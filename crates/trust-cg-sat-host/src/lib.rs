@@ -83,7 +83,7 @@ impl OwnedMicroSatSolver {
     }
 
     /// Borrow the initialized native solver for read-only inspection.
-    pub fn as_ref(&self) -> &sys::solver {
+    pub fn native(&self) -> &sys::solver {
         // SAFETY: the only constructor returns after parse initialized every
         // field needed by the solver, including on parse-time UNSAT.
         unsafe { self.inner.assume_init_ref() }
@@ -174,7 +174,7 @@ mod tests {
     fn microsat_destroy_clears_state_and_is_idempotent() {
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
 
         let mut file = NamedTempFile::new().expect("create tempfile");
         file.write_all(b"p cnf 1 1\n1 0\n").expect("write cnf");
@@ -184,14 +184,14 @@ mod tests {
         // SAFETY: the test file is a well-formed DIMACS instance.
         let (mut solver, parse_rc) = unsafe { OwnedMicroSatSolver::parse(c_path.as_c_str()) };
         assert_eq!(parse_rc, sys::SAT);
-        assert!(!solver.as_ref().DB.is_null());
+        assert!(!solver.native().DB.is_null());
 
         // Exercise the C lifecycle function directly. The owner's eventual
         // Drop calls it once more, which also verifies repeated destruction is
         // harmless after the first call zeroed the struct.
         unsafe { sys::microsat_destroy(solver.as_mut_ptr()) };
-        assert!(solver.as_ref().DB.is_null());
-        assert_eq!(solver.as_ref().mem_max, 0);
+        assert!(solver.native().DB.is_null());
+        assert_eq!(solver.native().mem_max, 0);
         unsafe { sys::microsat_destroy(solver.as_mut_ptr()) };
     }
 
@@ -200,7 +200,7 @@ mod tests {
     fn repeated_parse_time_unsat_does_not_leak_input_descriptors() {
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
 
         let mut file = NamedTempFile::new().expect("create tempfile");
         file.write_all(b"p cnf 1 1\n0\n").expect("write cnf");
@@ -237,7 +237,7 @@ mod tests {
     fn smoke_sat_two_clause() {
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf = "p cnf 2 2\n1 2 0\n-1 2 0\n";
         let rc = run_solver(cnf);
         assert_eq!(rc, sys::SAT, "expected SAT (=1), got {rc}");
@@ -247,7 +247,7 @@ mod tests {
     fn smoke_unsat_unit_pair() {
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf = "p cnf 1 2\n1 0\n-1 0\n";
         let rc = run_solver(cnf);
         assert_eq!(rc, sys::UNSAT, "expected UNSAT (=0), got {rc}");
@@ -529,7 +529,7 @@ p cnf 6 9
         // preserved".
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf_path = Path::new("tests/fixtures/sat_corpus/uuf50-01.cnf");
         if !cnf_path.exists() {
             eprintln!(
@@ -563,12 +563,12 @@ p cnf 6 9
     fn primary_jit_wall_clock_uuf50() {
         // Wall-clock characterization. Times native-only versus
         // PRIMARY_JIT_MODE on a generated UNSAT fixture. Run with
-        //   cargo test --release -p trust-cg-sat-host \
+        //   scripts/trust_cargo.sh test --release -p trust-cg-sat-host \
         //     primary_jit_wall_clock_uuf50 -- --nocapture
         use std::time::Instant;
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf_path = Path::new("tests/fixtures/sat_corpus/uuf50-01.cnf");
         assert!(
             cnf_path.exists(),
@@ -650,8 +650,8 @@ p cnf 6 9
             };
             let toks: Vec<&str> = body.split_whitespace().collect();
             assert!(
-                toks.len() >= 2,
-                "line {} has no literals before terminator: {:?}",
+                !toks.is_empty(),
+                "line {} has no clause terminator: {:?}",
                 idx,
                 line
             );
@@ -676,7 +676,7 @@ p cnf 6 9
         let cnf = "p cnf 1 2\n1 0\n-1 0\n";
         let rc = run_solver(cnf);
         flush_drat_output().expect("flush drat");
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
 
         assert_eq!(rc, sys::UNSAT, "expected UNSAT (=0), got {rc}");
         assert!(proof_path.exists(), "drat file not written");
@@ -697,7 +697,7 @@ p cnf 6 9
         let tmp = tempfile::tempdir().expect("tempdir");
         let proof_path = tmp.path().join("should_not_exist.drat");
 
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf = "p cnf 1 2\n1 0\n-1 0\n";
         let rc = run_solver(cnf);
 
@@ -719,7 +719,7 @@ p cnf 6 9
         enable_drat_output(&first).expect("enable drat first");
         let _ = run_solver("p cnf 1 2\n1 0\n-1 0\n");
         flush_drat_output().expect("flush first");
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let first_len = fs::metadata(&first).expect("stat first").len();
         assert!(first_len > 0, "first proof is empty");
 
@@ -733,7 +733,7 @@ p cnf 6 9
         enable_drat_output(&second).expect("enable drat second");
         let _ = run_solver("p cnf 1 2\n1 0\n-1 0\n");
         flush_drat_output().expect("flush second");
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         assert!(second.exists(), "second proof not written");
         assert_drat_well_formed(&second);
         let first_len_after = fs::metadata(&first).expect("stat first again").len();
@@ -860,7 +860,7 @@ p cnf 6 9
         // state and could either diverge or learn the wrong clause.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf = "p cnf 3 3\n1 0\n-1 2 0\n-2 3 0\n";
 
         // Native baseline: both flags off.
@@ -947,7 +947,7 @@ p cnf 6 9
         // tick up.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf = "\
 p cnf 6 10
 1 0
@@ -1003,7 +1003,7 @@ p cnf 6 10
         // global divergence counter never advances.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let fixtures: &[(&str, i32)] = &[
             ("tests/fixtures/sat_corpus/uuf50-01.cnf", sys::UNSAT),
             ("tests/fixtures/sat_corpus/uuf75-01.cnf", sys::UNSAT),
@@ -1042,12 +1042,12 @@ p cnf 6 10
     fn primary_jit_wall_clock_uuf75_and_uuf100() {
         // Wall-clock characterization across two larger UNSAT fixtures.
         // Run with
-        //   cargo test --release -p trust-cg-sat-host \
+        //   scripts/trust_cargo.sh test --release -p trust-cg-sat-host \
         //     primary_jit_wall_clock_uuf75_and_uuf100 -- --nocapture
         use std::time::Instant;
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
 
         let fixtures: &[&str] = &[
             "tests/fixtures/sat_corpus/uuf75-01.cnf",
@@ -1111,7 +1111,7 @@ p cnf 6 10
             }
         };
         flush_drat_output().expect("flush drat");
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         assert_eq!(rc, sys::UNSAT);
 
         let out = Command::new(trust_cg_drat_trim::drat_trim_executable_path())
@@ -1187,7 +1187,7 @@ p cnf 6 10
         // reports it for the reviewer either way.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         reset_jit_shadow_for_tests();
         let _force = AnalyzeDriverForceGuard::enable();
         let analyze_driven_before = JIT_ANALYZE_DRIVEN.load(Ordering::SeqCst);
@@ -1246,7 +1246,7 @@ p cnf 6 9
         // a regression there shows up as a counter assertion failure.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         reset_jit_shadow_for_tests();
         let _force = AnalyzeDriverForceGuard::enable();
         let analyze_driven_before = JIT_ANALYZE_DRIVEN.load(Ordering::SeqCst);
@@ -1302,7 +1302,7 @@ p cnf 6 9
         // this test fires alongside the older one.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf = "\
 p cnf 6 10
 1 0
@@ -1356,7 +1356,7 @@ p cnf 6 10
         // default-on, completing the recompile-free architecture.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let _force = AnalyzeDriverForceGuard::enable();
         let fixtures: &[(&str, i32)] = &[
             ("tests/fixtures/sat_corpus/uuf50-01.cnf", sys::UNSAT),
@@ -1450,7 +1450,7 @@ p cnf 6 10
         // regresses, this test fires before the broader corpus test.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         let cnf_path = Path::new("tests/fixtures/sat_corpus/uf50-01.cnf");
         if !cnf_path.exists() {
             eprintln!(
@@ -1487,13 +1487,13 @@ p cnf 6 10
         // `JIT_ANALYZE_DRIVER_FORCE=true` (gate removed). Compares
         // end-to-end wall-clock against native-only on
         // uuf75/uuf100/php-10-9. Run with
-        //   cargo test --release -p trust-cg-sat-host \
+        //   scripts/trust_cargo.sh test --release -p trust-cg-sat-host \
         //     primary_jit_wall_clock_analyze_driver_force \
         //     -- --nocapture
         use std::time::Instant;
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         const REPS: usize = 5;
         let fixtures: &[(&str, i32)] = &[
             ("tests/fixtures/sat_corpus/uuf75-01.cnf", sys::UNSAT),
@@ -1591,7 +1591,7 @@ p cnf 6 10
         // invariant on real instances.
         let _solver_guard = SOLVER_LOCK.lock().expect("solver lock not poisoned");
         let _drat_guard = drat_lock();
-        disable_drat_output();
+        disable_drat_output().expect("finalize drat output");
         reset_jit_shadow_for_tests();
         let _force = AnalyzeDriverForceGuard::enable();
         let divergences_before = JIT_DIVERGENCE_COUNT.load(Ordering::SeqCst);

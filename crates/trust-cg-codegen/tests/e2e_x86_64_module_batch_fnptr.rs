@@ -19,8 +19,11 @@
 //                       pointer through a `Ty::Func` BLOCK PARAMETER, and
 //                       invokes it via `CallIndirect`.
 //                   [1] extern DECLARATION of `fnptr_target`.
-//   module CLOSCLR: [0] `closure_caller(x)`: same shape but the pointer is a
-//                       capture-free `Constant::Closure` (the bridge's
+//   module CLOSCLR: [0] `closure_caller(x)`: the same shape in a SECOND
+//                       caller module (its fn-item-as-value constant is a
+//                       `Constant::FnDef` too: a capture-free
+//                       `Constant::Closure` typed `Ty::Func` is not valid
+//                       trust-ir, `ConstTypeMismatch`, and the bridge's
 //                       lang_start / fn-item-as-value shape).
 //                   [1] extern DECLARATION of `fnptr_target`.
 //
@@ -143,14 +146,37 @@ fn unary_i64_func_ty(m: &mut TrustIrModule) -> FuncTyId {
     m.add_func_type(FuncTy {
         params: vec![Ty::I64],
         returns: vec![Ty::I64],
+        abi: None,
         is_vararg: false,
     })
+    .expect("Module::add_func_type: test fixture")
 }
 
 /// Module TARGETS: `fnptr_target(x) = x * 2` (FuncId 0) and the same-signature
 /// DECOY `fnptr_decoy(x) = x + 1000` (FuncId 1).
+/// Every input carries the host x86-64 target: a caller module alone has an
+/// FFI boundary (its bodyless declaration of `fnptr_target`), which trust-ir
+/// refuses without a pinned target (`TargetInfoRequired`; every ingestion
+/// entry refuses what the validator refuses, WS7.3), and the merge requires
+/// its inputs to agree on `target_info`.
+fn pin_target(m: &mut TrustIrModule) {
+    m.target_info = Some(trust_ir::TargetInfo {
+        triple: if cfg!(target_os = "macos") {
+            "x86_64-apple-darwin"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
+        .into(),
+        pointer_size: 8,
+        endianness: trust_ir::Endianness::Little,
+        abi: None,
+        struct_passing: trust_ir::StructPassingPolicy::NativeC,
+    });
+}
+
 fn build_targets_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("batch_fnptr_targets_mod");
+    pin_target(&mut m);
     let ft = unary_i64_func_ty(&mut m);
 
     let mut target = TrustIrFunction::new(FuncId::new(0), "fnptr_target", ft, BlockId::new(0));
@@ -170,7 +196,8 @@ fn build_targets_module() -> TrustIrModule {
             node(Inst::Return { values: vec![v(1)] }, vec![]),
         ],
     }];
-    m.add_function(target);
+    m.try_add_function(target)
+        .expect("Module::try_add_function: test fixture");
 
     let mut decoy = TrustIrFunction::new(FuncId::new(1), "fnptr_decoy", ft, BlockId::new(0));
     decoy.blocks = vec![TrustIrBlock {
@@ -196,27 +223,23 @@ fn build_targets_module() -> TrustIrModule {
             node(Inst::Return { values: vec![v(2)] }, vec![]),
         ],
     }];
-    m.add_function(decoy);
+    m.try_add_function(decoy)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
 /// A caller module: `NAME(x)` materializes a function-pointer constant to its
 /// sibling `fnptr_target` (an extern DECLARATION at LOCAL FuncId 1), threads
-/// it through a `Ty::Func` block parameter, and `CallIndirect`s it. When
-/// `as_closure` is set the pointer is a capture-free `Constant::Closure`
-/// instead of a `Constant::FnDef` (both bridge shapes).
-fn build_caller_module(mod_name: &str, fn_name: &str, as_closure: bool) -> TrustIrModule {
+/// it through a `Ty::Func` block parameter, and `CallIndirect`s it. The
+/// constant is typed with the caller module's OWN signature id, which the
+/// merge must unify with the upgrading definition's (trust-ir compares
+/// `Ty::Func` nominally).
+fn build_caller_module(mod_name: &str, fn_name: &str) -> TrustIrModule {
     let mut m = TrustIrModule::new(mod_name);
+    pin_target(&mut m);
     let ft = unary_i64_func_ty(&mut m);
 
-    let fnptr_const = if as_closure {
-        Constant::Closure {
-            func: FuncId::new(1),
-            captures: vec![],
-        }
-    } else {
-        Constant::FnDef(FuncId::new(1))
-    };
+    let fnptr_const = Constant::FnDef(FuncId::new(1));
 
     let mut caller = TrustIrFunction::new(FuncId::new(0), fn_name, ft, BlockId::new(0));
     caller.blocks = vec![
@@ -258,11 +281,13 @@ fn build_caller_module(mod_name: &str, fn_name: &str, as_closure: bool) -> Trust
             ],
         },
     ];
-    m.add_function(caller);
+    m.try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
 
     // Bodyless extern declaration of the target at LOCAL FuncId 1.
     let decl = TrustIrFunction::new(FuncId::new(1), "fnptr_target", ft, BlockId::new(0));
-    m.add_function(decl);
+    m.try_add_function(decl)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -300,6 +325,7 @@ fn compile(
         emit_proofs,
         ..CompilerConfig::default()
     })
+    .with_codegen_license(permit_unlicensed())
     .compile(module)
     .expect("x86-64 compile should succeed")
 }
@@ -318,6 +344,7 @@ fn assert_relocation_proof_promotion_accepted(module: &TrustIrModule) {
         emit_proofs: true,
         ..CompilerConfig::default()
     })
+    .with_codegen_license(permit_unlicensed())
     .compile(module)
     .expect("proved x86-64 object relocation inventory must promote");
     assert!(
@@ -335,8 +362,8 @@ fn assert_relocation_proof_promotion_accepted(module: &TrustIrModule) {
 fn batched_fn_pointer_indirect_call_reaches_the_right_function() {
     // ---- 1. Eligibility: the fn-pointer modules are batchable now.
     let targets = build_targets_module();
-    let caller = build_caller_module("batch_fnptr_caller_mod", "fnptr_caller", false);
-    let closclr = build_caller_module("batch_fnptr_closure_mod", "closure_caller", true);
+    let caller = build_caller_module("batch_fnptr_caller_mod", "fnptr_caller");
+    let closclr = build_caller_module("batch_fnptr_closure_mod", "closure_caller");
     for (m, tag) in [
         (&targets, "targets"),
         (&caller, "caller"),
@@ -349,7 +376,8 @@ fn batched_fn_pointer_indirect_call_reaches_the_right_function() {
         );
     }
 
-    // ---- 2. The merge: FuncIds shifted, FnDef/Closure constants remapped.
+    // ---- 2. The merge: FuncIds shifted, FnDef constants remapped, and every
+    // caller's signature id unified with the definition's.
     let merged = merge_modules(&[targets.clone(), caller.clone(), closclr.clone()])
         .expect("fn-pointer merge must succeed (CT-BATCH-5)");
     assert_eq!(merged.functions.len(), 4, "decl->def dedup");
@@ -363,16 +391,21 @@ fn batched_fn_pointer_indirect_call_reaches_the_right_function() {
             .flat_map(|b| b.body.iter())
             .find_map(|n| match &n.inst {
                 Inst::Const {
+                    ty,
                     value: Constant::FnDef(fid),
-                    ..
-                }
-                | Inst::Const {
-                    value: Constant::Closure { func: fid, .. },
-                    ..
-                } => Some(*fid),
+                } => Some((*fid, ty.clone())),
                 _ => None,
             })
             .expect("caller must carry a fn-pointer constant");
+        let (fid, ty) = fid;
+        // trust-ir compares `Ty::Func` nominally: the constant must name the
+        // DEFINITION's merged signature id, not the caller's own copy.
+        assert_eq!(
+            ty,
+            Ty::Func(merged.functions[0].ty),
+            "`{}`'s fn-pointer constant must carry fnptr_target's merged signature",
+            f.name
+        );
         assert_eq!(
             fid,
             FuncId::new(0),
@@ -477,4 +510,13 @@ fn batched_fn_pointer_indirect_call_reaches_the_right_function() {
     assert_eq!(clang_exit, 0);
 
     cleanup(&dir);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

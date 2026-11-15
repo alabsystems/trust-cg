@@ -233,20 +233,22 @@ impl AArch64Opcode {
             // Control flow
             B | Br => OpcodeCategory::Branch,
             BCond | Bcc | Cbz | Cbnz | Tbz | Tbnz => OpcodeCategory::CondBranch,
-            Bl | Blr | BL | BLR | TailCall => OpcodeCategory::Call,
+            Bl | Blr | BL | BLR | TailCall | TlsDescCall | BlrTlsdesc => OpcodeCategory::Call,
             Ret => OpcodeCategory::Ret,
 
             // Memory loads
             LdrRI | LdrPreIndex | LdrPostIndex | LdrbRI | LdrhRI | LdrsbRI | LdrshRI
             | LdrLiteral | LdpRI | LdpPostIndex | LdrRO | LdrbRO | LdrhRO | LdrswRO | LdrGot
-            | LdrTlvp | LdrGottprel | NeonLd1Post | NeonLdpQPost | Ldar | Ldarb | Ldarh | Ldaxr => {
+            | LdrTlvp | LdrGottprel | LdrTlsdesc | NeonLd1Post | NeonLdpQPost | Ldar | Ldarb
+            | Ldarh | Ldaxr | Ldxr | Ldxrb | Ldxrh | Ldaxrb | Ldaxrh | Ldxp | Ldaxp => {
                 OpcodeCategory::Load
             }
 
             // Memory stores
             StrRI | StrPreIndex | StrPostIndex | StrbRI | StrhRI | StpRI | StpPreIndex | StrRO
             | StrbRO | StrhRO | STRWui | STRXui | STRSui | STRDui | NeonSt1Post | NeonStpQPost
-            | Stlr | Stlrb | Stlrh | Stlxr => OpcodeCategory::Store,
+            | Stlr | Stlrb | Stlrh | Stlxr | Stxr | Stxrb | Stxrh | Stlxrb | Stlxrh | Stxp
+            | Stlxp => OpcodeCategory::Store,
 
             // Pseudo
             Phi => OpcodeCategory::Phi,
@@ -315,12 +317,13 @@ impl X86Opcode {
 
             // Memory loads
             MovRM8 | MovRM16 | MovRM32 | MovRM | MovsdRM | MovssRM | MovRMSib | MovsxdRMSib
-            | MovRM32Sib | AddRM | SubRM | CmpRM | ImulRM | ImulRMSib | TestRM | Ptest
-            | MovRipRel | MovRipRelTlv | MovssRipRel | MovsdRipRel | Pop => OpcodeCategory::Load,
+            | MovRM32Sib | MovdquRMSib | AddRM | SubRM | CmpRM | ImulRM | ImulRMSib | TestRM
+            | Ptest | MovRipRel | MovRipRelTlv | MovssRipRel | MovsdRipRel | Pop | MovzxRM8
+            | MovzxRM16 | MovzxRM8Sib => OpcodeCategory::Load,
 
             // Memory stores
             MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovMRSib | MovMR32Sib
-            | Push => OpcodeCategory::Store,
+            | MovdquMRSib | Push => OpcodeCategory::Store,
 
             // Pseudo
             Phi => OpcodeCategory::Phi,
@@ -452,6 +455,8 @@ impl TargetInfo for AArch64Target {
                 | AddsRI
                 | SubsRR
                 | SubsRI
+                | Adcs
+                | Sbcs
         )
     }
 
@@ -470,7 +475,7 @@ impl TargetInfo for AArch64Target {
         //   See issue #409.
         matches!(
             opcode,
-            CSet | Csel | Csinc | Csinv | Csneg | FcselRR | Adc | Sbc
+            CSet | Csel | Csinc | Csinv | Csneg | FcselRR | Adc | Sbc | Adcs | Sbcs
         )
     }
 
@@ -553,7 +558,7 @@ impl TargetInfo for X86_64Target {
             // Memory fence
             | Mfence
             // Atomic exchange (complex implicit operands)
-            | Cmpxchg | Cmpxchg8 | Cmpxchg16
+            | Cmpxchg | Cmpxchg8 | Cmpxchg16 | AtomicLoadCmpxchg16b
             // Sign-extend implicit writes
             | Cdq | Cqo
             // Fixed-register arithmetic with implicit results
@@ -594,8 +599,9 @@ impl TargetInfo for X86_64Target {
             | Ucomisd | Ucomiss
             // Bit manipulation that sets flags
             | Bsf | Bsr | Tzcnt | Lzcnt | Popcnt | BtRI
-            // Atomic
-            | Cmpxchg | Cmpxchg8 | Cmpxchg16
+            // Atomic (the 128-bit load pseudo's zeroing XORs write every flag,
+            // then its CMPXCHG16B writes ZF)
+            | Cmpxchg | Cmpxchg8 | Cmpxchg16 | AtomicLoadCmpxchg16b
             | AtomicRmwCasLoop
             | V4I32MaskExtract
             | V16I8MaskExtract

@@ -8,11 +8,9 @@
 
 //! Typed external-tool wrappers.
 //!
-//! Each supported tool (clang, csmith, ay, ...) is a zero-sized struct
-//! with a `check()` method that verifies presence + returns a
-//! `VersionInfo`. Subcommands compose these into higher-level operations.
+//! [`probe_one`] reports a tool's presence and version as a [`VersionInfo`];
+//! [`Cargo`] names the one tool subcommands spawn by type.
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::shell::{Spawn, which};
@@ -65,67 +63,22 @@ fn probe(name: &str, arg: &str) -> VersionInfo {
     }
 }
 
-macro_rules! tool {
-    ($(#[$attr:meta])* $name:ident, $bin:expr, $version_arg:expr) => {
-        $(#[$attr])*
-        #[derive(Clone, Copy, Debug, Default)]
-        pub struct $name;
-        impl $name {
-            /// Short program name used on `PATH`.
-            #[must_use]
-            pub const fn program() -> &'static str {
-                $bin
-            }
-            /// Probe presence + version.
-            ///
-            /// # Errors
-            /// Currently infallible but returns `Result` for consistency.
-            pub fn check(self) -> Result<VersionInfo> {
-                Ok(probe($bin, $version_arg))
-            }
-        }
-    };
+/// `targo` — the Trust toolchain's Cargo (owner directive 2026-09-28: ALab
+/// systems build with Trust). Build verbs need a lane: callers pass
+/// `--unverified`. Used by WS1 and WS6.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cargo;
+
+impl Cargo {
+    /// Short program name used on `PATH`.
+    #[must_use]
+    pub const fn program() -> &'static str {
+        "targo"
+    }
 }
 
-tool!(
-    /// The `clang` C/C++ compiler. Required for WS2, WS3.
-    Clang, "clang", "--version"
-);
-tool!(
-    /// The system `cc` compiler (links binaries in several WSs).
-    Cc, "cc", "--version"
-);
-tool!(
-    /// csmith — random C program generator. Required for WS3 `fuzz`.
-    Csmith, "csmith", "--version"
-);
-tool!(
-    /// YARPGen — random C/C++ program generator. Required for WS3.
-    Yarpgen, "yarpgen", "--version"
-);
-tool!(
-    /// creduce — testcase reducer for miscompiles.
-    Creduce, "creduce", "--version"
-);
-tool!(
-    /// ay — SMT solver for WS7.
-    AY, "ay", "--version"
-);
-tool!(
-    /// `gh` — GitHub CLI. Used to file miscompile issues from WS3.
-    Gh, "gh", "--version"
-);
-tool!(
-    /// `cargo` — Rust package manager. Used by WS1 and WS6.
-    Cargo, "cargo", "--version"
-);
-tool!(
-    /// `rustc` — Rust compiler. Used by WS4, WS5, WS6.
-    Rustc, "rustc", "--version"
-);
-
-/// Called by `cmd::doctor` to tell the operator how to install a missing
-/// tool. Keep in sync with the `tool!` macro calls above.
+/// Called by `cmd::doctor` and `cmd::rustc` to tell the operator how to
+/// install a missing tool.
 #[must_use]
 pub fn install_hint(program: &str) -> &'static str {
     match program {
@@ -133,9 +86,15 @@ pub fn install_hint(program: &str) -> &'static str {
         "csmith" => "brew install csmith",
         "yarpgen" => "build from source: https://github.com/intel/yarpgen",
         "creduce" => "brew install creduce",
-        "ay" => "build AY and place `ay` on PATH: https://github.com/alabsystems/ay",
+        "ay" => {
+            "install a Trust toolchain that ships `bin/ay`; trust-cg's verifier runs ONLY that \
+             identity-checked AY (crates/trust-cg-verify/src/ay_identity.rs), never one found on PATH"
+        }
         "gh" => "brew install gh",
-        "cargo" | "rustc" => "install via rustup: https://rustup.rs",
+        "targo" | "trustc" => {
+            "install the Trust toolchain package (aterm's atpkg; see `aterm help rust`); \
+             there is no stock rustup fallback"
+        }
         _ => "check tool documentation",
     }
 }
@@ -143,5 +102,37 @@ pub fn install_hint(program: &str) -> &'static str {
 /// Convenience: call `probe` once for a single tool name.
 #[must_use]
 pub fn probe_one(name: &str) -> VersionInfo {
+    if name == "ay" {
+        return probe_toolchain_ay();
+    }
     probe(name, "--version")
+}
+
+/// AY is never searched for on `PATH` and never executed here. trust-cg's
+/// verifier admits exactly one AY: the `bin/ay` of the Trust toolchain it was
+/// built with, identified by the SHA-256 of its bytes recorded at build time
+/// (`crates/trust-cg-verify/src/ay_identity.rs`), and starts only that. This
+/// row reports whether the Trust package `trustc`'s sysroot ships that file; the
+/// identity itself is checked by the verifier when it is used.
+fn probe_toolchain_ay() -> VersionInfo {
+    let sysroot = Spawn::new("trustc")
+        .args(["--print", "sysroot"])
+        .capture()
+        .ok()
+        .filter(crate::shell::Captured::success)
+        .map(|captured| captured.stdout.trim().to_string())
+        .filter(|sysroot| !sysroot.is_empty());
+    let Some(sysroot) = sysroot else {
+        return VersionInfo::missing("ay");
+    };
+    let path = std::path::Path::new(&sysroot).join("bin").join("ay");
+    if !path.is_file() {
+        return VersionInfo::missing("ay");
+    }
+    VersionInfo {
+        name: "ay".to_string(),
+        path: Some(path.to_string_lossy().into_owned()),
+        version: "not executed (identity checked by sha256 at use)".to_string(),
+        present: true,
+    }
 }

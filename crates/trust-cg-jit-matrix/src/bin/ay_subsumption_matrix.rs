@@ -692,8 +692,10 @@ fn collect_environment(args: &Args) -> Result<EnvironmentReport> {
             .unwrap_or_else(|| "unknown".to_string()),
         cpu_brand: command_output("sysctl", &["-n", "machdep.cpu.brand_string"])
             .unwrap_or_else(|| "unknown".to_string()),
-        rustc_version: command_output("rustc", &["-Vv"]).unwrap_or_else(|| "unknown".to_string()),
-        cargo_version: command_output("cargo", &["-V"]).unwrap_or_else(|| "unknown".to_string()),
+        // The installed Trust package the repository builds with.
+        rustc_version: command_output("trustc", &["-Vv"]).unwrap_or_else(|| "unknown".to_string()),
+        cargo_version: command_output("targo", &["--unverified", "-V"])
+            .unwrap_or_else(|| "unknown".to_string()),
         trust_cg_commit: git_output(Path::new("."), &["rev-parse", "HEAD"])
             .unwrap_or_else(|| "unknown".to_string()),
         trust_cg_dirty: git_dirty(Path::new(".")).unwrap_or(true),
@@ -1038,7 +1040,15 @@ fn phase8_ay_counter_scope(
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    // trustc refuses to run under TRUST_CG_*/TCG_* controls; no probe needs them.
+    let mut command = Command::new(program);
+    for (key, _) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("TRUST_CG_") || key_text.starts_with("TCG_") {
+            command.env_remove(&key);
+        }
+    }
+    let output = command.args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }

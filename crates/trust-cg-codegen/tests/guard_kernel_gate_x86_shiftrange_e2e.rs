@@ -34,11 +34,14 @@ use trust_ir::{
 /// the shift carrying the public `ShiftInRange` annotation.
 fn build_shift_in_range_module() -> (Module, TrustIrFunction) {
     let mut module = Module::new("guard_kernel_gate_x86_shiftrange_e2e");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "proven_shl_x86", ft, BlockId::new(0));
     let shl = InstrNode::new(Inst::BinOp {
         op: BinOp::Shl,
@@ -58,7 +61,9 @@ fn build_shift_in_range_module() -> (Module, TrustIrFunction) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (module, func)
 }
 
@@ -67,7 +72,8 @@ fn build_shift_in_range_module() -> (Module, TrustIrFunction) {
 /// carrier->obligation bindings) and the adapter's synthesized-id report.
 fn lower_to_x86_isel(func: &TrustIrFunction, module: &Module) -> (X86ISelFunction, Vec<u64>) {
     let (lir_func, proof_ctx): (LirFunction, LirProofContext) =
-        trust_cg_lower::translate_function(func, module).expect("adapter translate");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translate");
 
     let sig = trust_cg_lower::function::Signature {
         params: lir_func.signature.params.clone(),
@@ -236,7 +242,8 @@ fn compile_x86_object(module: &Module) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         spec,
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     let result = compiler.compile(module).expect("x86 compile");
     result.object_code
 }
@@ -245,7 +252,7 @@ fn compile_x86_object(module: &Module) -> Vec<u8> {
 /// and the runtime range trap remain present in both objects.
 #[test]
 fn x86_shift_range_kernel_gate_env_values_keep_hardware_guard() {
-    use common::disasm::{disassemble_x86_text, has_objdump};
+    use common::disasm::{ObjFormat, disassemble_x86_text, has_objdump_for};
 
     let (module, _func) = build_shift_in_range_module();
 
@@ -279,7 +286,10 @@ fn x86_shift_range_kernel_gate_env_values_keep_hardware_guard() {
 
     // SEMANTIC object-level oracle (when objdump is available on the host): decode the actual emitted
     // x86 stream and assert the shift and runtime trap are present under both legacy values.
-    if has_objdump() {
+    // The subject is compiled for `x86_64-apple-darwin`, so the decode needs an
+    // objdump that reads MACH-O — on a GNU-only host there is none and the
+    // raw-byte oracle above is the whole check.
+    if has_objdump_for(ObjFormat::MachO) {
         let off_insns = disassemble_x86_text(&off).expect("objdump decodes gate-off object");
         let on_insns = disassemble_x86_text(&on).expect("objdump decodes gate-on object");
 
@@ -360,4 +370,13 @@ fn x86_shift_range_fingerprint_is_width_sensitive_but_unbound() {
         "the width is part of the binding key: a 32-bit proof cannot discharge a 64-bit shift guard"
     );
     assert!(!isel_func.guard_obligations.contains_key(&fp_width_32));
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

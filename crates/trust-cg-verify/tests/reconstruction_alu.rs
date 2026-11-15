@@ -73,7 +73,7 @@ fn single_inst_func(inst: MachInst) -> MachFunction {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn add_rr_reconstructs_and_is_credited_verified() {
+fn add_rr_reconstructs_but_sampled_discharge_is_not_credited() {
     // `ADD Wd, Wn, Wm` with real (virtual) register operands.
     let inst = MachInst::new(AArch64Opcode::AddRR, vec![vreg32(0), vreg32(1), vreg32(2)]);
 
@@ -97,26 +97,24 @@ fn add_rr_reconstructs_and_is_credited_verified() {
         VerificationResult::Valid
     ));
 
-    // End-to-end through the function verifier: credited GENUINELY (not a
-    // degenerate binding) because its provenance is Reconstructed.
+    // End-to-end through the function verifier: the reconstructed 32-bit
+    // obligation discharges only by sampling, so it is reported (naming the
+    // reconstruction) and never credited (E0.2).
     let func = single_inst_func(inst);
     let report = verify_function(&func);
-    assert_eq!(report.verified_count(), 1);
-    assert_eq!(report.genuinely_verified_count(), 1);
-    assert_eq!(report.unverified_count(), 0);
+    assert_eq!(report.verified_count(), 0);
+    assert_eq!(report.sampled_uncredited_count(), 1);
     match &report.instructions[0].result {
-        InstructionVerificationResult::Verified {
-            degenerate,
-            proof_name,
-            ..
-        } => {
+        InstructionVerificationResult::Unverified { reason } => {
             assert!(
-                !*degenerate,
-                "reconstructed proof must be credited, not degenerate"
+                reason.starts_with(
+                    trust_cg_verify::function_verifier::STATISTICAL_EVIDENCE_IS_NOT_CREDIT
+                ),
+                "{reason}"
             );
-            assert!(proof_name.contains("RECONSTRUCTED"));
+            assert!(reason.contains("RECONSTRUCTED"), "{reason}");
         }
-        other => panic!("expected Verified, got {other:?}"),
+        other => panic!("expected an uncredited sampled reconstruction, got {other:?}"),
     }
 }
 

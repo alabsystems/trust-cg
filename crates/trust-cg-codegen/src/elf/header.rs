@@ -66,6 +66,9 @@ pub struct Elf64Header {
     pub sh_strndx: u16,
     /// Processor-specific flags.
     pub flags: u32,
+    /// `e_ident[EI_OSABI]`. `ELFOSABI_NONE` (System V) unless a GNU extension
+    /// in the object (`SHF_GNU_RETAIN`) requires `ELFOSABI_GNU`.
+    pub osabi: u8,
 }
 
 impl Elf64Header {
@@ -77,6 +80,7 @@ impl Elf64Header {
             sh_num,
             sh_strndx,
             flags: 0,
+            osabi: ELFOSABI_NONE,
         }
     }
 
@@ -91,7 +95,7 @@ impl Elf64Header {
         ident[4] = ELFCLASS64; // 64-bit
         ident[5] = ELFDATA2LSB; // Little-endian
         ident[6] = EV_CURRENT; // ELF version 1
-        ident[7] = ELFOSABI_NONE; // UNIX System V
+        ident[7] = self.osabi; // UNIX System V unless a GNU extension is present
         // ident[8..16] = 0 (padding)
         buf.extend_from_slice(&ident);
 

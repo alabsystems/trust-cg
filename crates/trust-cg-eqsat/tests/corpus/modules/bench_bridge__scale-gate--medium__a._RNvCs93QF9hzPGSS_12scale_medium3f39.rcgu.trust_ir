@@ -1,0 +1,70 @@
+; TrustIr text format v1
+module "_RNvCs93QF9hzPGSS_12scale_medium3f39"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (u64, u64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCs93QF9hzPGSS_12scale_medium3f39(functy.0) {
+bb0(%1: u64, %2: u64):
+    %18 = copy u64 %1
+    %20 = const u64 443779575
+    %19 = xor u64 %18, %20
+    %21 = const u64 0
+    br bb1(%19, %1, %21)
+bb1(%22: u64, %23: u64, %24: u64):
+    %25 = copy u64 %24
+    %27 = const u64 64
+    %26 = icmp ult u64 %25, %27
+    condbr %26, bb2, bb6
+bb6:
+    ret %22
+bb2:
+    %29 = const u64 6364136223846793005
+    %28 = mul u64 %22, %29
+    %30 = copy u64 %24
+    %31 = xor u64 %30, %2
+    %32 = add u64 %28, %31
+    %33 = copy u64 %32
+    %35 = const i32 29
+    %36 = const u64 29
+    %34 = lshr u64 %33, %36
+    %37 = xor u64 %32, %34
+    %38 = copy u64 %37
+    %40 = const u64 7
+    %39 = urem u64 %38, %40
+    switch %39 [ 0: bb3 default: bb4 ]
+bb3:
+    %41 = copy u64 %23
+    %42 = add u64 %37, %41
+    %43 = copy u64 %42
+    br bb5(%43)
+bb4:
+    %44 = copy u64 %24
+    %45 = xor u64 %37, %44
+    br bb5(%45)
+bb5(%46: u64):
+    %47 = bitcast u64 %23 to i64
+    %48 = const i64 40
+    %49 = const i64 24
+    %50 = shl i64 %47, %48
+    %51 = lshr i64 %47, %49
+    %52 = or i64 %50, %51
+    %53 = bitcast i64 %52 to u64
+    %54 = copy u64 %53
+    br bb7
+bb7:
+    %55 = copy u64 %54
+    %57 = const u64 1
+    %56 = add u64 %24, %57
+    br bb1(%46, %55, %56)
+}

@@ -45,6 +45,43 @@ pub mod jit_disk_cache;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub mod executable_buffer_cache;
 
+/// The trust-ir codegen license this crate JIT-compiles its IN-MEMORY solver
+/// kernels under (roadmap WS7.5, decision gate DG-73).
+///
+/// The kernels are built from this crate's own trust-ir templates, which
+/// carry no `body_gate`, and trust-cg's default policy now REFUSES a
+/// claim-less body. They compile under the NAMED, COUNTED exception
+/// `InProcessJitKernel` (census: trust-cg-lower
+/// `the_unlicensed_permit_exceptions_are_named_and_counted`) — never under a
+/// silent default — until the templates stamp a license of their own.
+/// `Ungated`, unrecognized authorities and a gated body without its evidence
+/// stay refused.
+#[must_use]
+pub fn in_process_kernel_license() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default().with_unlicensed_permit_exception(
+        trust_cg_codegen::UnlicensedPermitException::InProcessJitKernel,
+    )
+}
+
+/// The trust-ir codegen license this crate's BENCH tools (`compile_corpus`,
+/// `tier_up_bench`) compile their corpora under (roadmap WS7.5, decision
+/// gate DG-73).
+///
+/// A corpus module — a rustc-bridge module dump, a `scripts/fuzz` kernel —
+/// carries no `body_gate`, and trust-cg's default policy REFUSES a claim-less
+/// body: under the default every lane would record the same license refusal,
+/// and two builds would compare "identical" on nothing. They compile under
+/// the NAMED, COUNTED exception `BenchCorpus` (census: trust-cg-lower
+/// `the_unlicensed_permit_exceptions_are_named_and_counted`), never under a
+/// silent default. `Ungated`, unrecognized authorities and a gated body
+/// without its evidence stay refused. Bench tooling only: no proof or
+/// publication authority.
+#[must_use]
+pub fn bench_corpus_license() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed_permit_exception(trust_cg_codegen::UnlicensedPermitException::BenchCorpus)
+}
+
 /// Stable aggregate counter schema for Phase 8 native promotion evidence.
 pub const PHASE8_NATIVE_PROMOTION_COUNTERS_SCHEMA: &str =
     "trust-cg.phase8.native_promotion_counters.v1";
@@ -1629,12 +1666,44 @@ pub fn validate_ay_subsumption_cases(cases: &AYSubsumptionCases) -> Result<Corre
     if cases.clauses.is_empty() {
         bail!("workload has no clauses");
     }
+    for (name, count) in [
+        ("clause count", cases.clauses.len()),
+        ("query count", cases.contains_queries.len()),
+        ("subsumption pair count", cases.subsumption_pairs.len()),
+    ] {
+        u32::try_from(count).with_context(|| format!("{name} exceeds the scanner u32 ABI"))?;
+    }
+    let repetitions = usize::try_from(cases.benchmark_matrix.measurement_repetitions)
+        .context("measurement repetitions exceed host usize")?;
+    usize::try_from(cases.benchmark_matrix.warmup_iterations)
+        .context("warmup iterations exceed host usize")?;
+    if repetitions == 0 {
+        bail!("measurement repetitions must be positive");
+    }
+    for items in [
+        cases
+            .contains_queries
+            .len()
+            .checked_mul(cases.clauses.len()),
+        Some(cases.subsumption_pairs.len()),
+    ] {
+        items
+            .and_then(|items| items.checked_mul(TRUST_CG_PROBE_BATCHES_PER_REPETITION))
+            .and_then(|items| items.checked_mul(repetitions))
+            .context("measurement item count exceeds host usize")?;
+    }
+    repetitions
+        .checked_mul(std::mem::size_of::<f64>())
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .context("measurement sample storage exceeds host allocation domain")?;
 
     let mut ids = BTreeSet::new();
     let mut by_id = BTreeMap::new();
     let mut real_literal_lanes = 0usize;
     let mut padded_literal_lanes = 0usize;
     for clause in &cases.clauses {
+        u32::try_from(clause.id)
+            .with_context(|| format!("clause id {} exceeds the scanner u32 ABI", clause.id))?;
         if !ids.insert(clause.id) {
             bail!("duplicate clause id {}", clause.id);
         }
@@ -1657,8 +1726,14 @@ pub fn validate_ay_subsumption_cases(cases: &AYSubsumptionCases) -> Result<Corre
         if clause.lits.contains(&cases.sentinel) {
             bail!("clause {} includes sentinel as a real literal", clause.id);
         }
-        real_literal_lanes += clause.length;
-        padded_literal_lanes += clause.padded_length;
+        real_literal_lanes = real_literal_lanes
+            .checked_add(clause.length)
+            .context("real literal lane count exceeds host usize")?;
+        padded_literal_lanes = padded_literal_lanes
+            .checked_add(clause.padded_length)
+            .context("padded literal lane count exceeds host usize")?;
+        u32::try_from(padded_literal_lanes / 4)
+            .context("padded chunk count exceeds the scanner u32 ABI")?;
         by_id.insert(clause.id, clause);
     }
 
@@ -1856,7 +1931,7 @@ pub fn planned_ay_subsumption_throughput_with_backend_buckets(
                 } else {
                     (TRUST_CG_PENDING_PROMOTION_DISPOSITION, false)
                 };
-                rows.push(ThroughputSummaryRow {
+                let mut row = ThroughputSummaryRow {
                     operation,
                     length_bucket: length_bucket.clone(),
                     variant: variant.clone(),
@@ -1902,16 +1977,15 @@ pub fn planned_ay_subsumption_throughput_with_backend_buckets(
                         }
                     },
                     scalar_speedup: None,
-                });
+                };
                 if let Some(trust_cg_measurement) = trust_cg_measurement {
-                    let row = rows.last_mut().expect("row was just pushed");
                     row.mean_throughput_per_us = trust_cg_measurement.mean_throughput_per_us;
                 }
                 if let Some(trust_cg_backend_measurement) = trust_cg_backend_measurement {
-                    let row = rows.last_mut().expect("row was just pushed");
                     row.mean_throughput_per_us =
                         trust_cg_backend_measurement.mean_throughput_per_us;
                 }
+                rows.push(row);
             }
         }
     }
@@ -3011,7 +3085,17 @@ pub fn run_ay_reference_execution_with_length_buckets(
         );
     }
 
-    let compile = Command::new("rustc")
+    // The installed Trust package's trustc (or `$RUSTC`) in its explicit
+    // unverified lane; trustc refuses to run under TRUST_CG_*/TCG_* controls.
+    let mut compile = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "trustc".into()));
+    for (key, _) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("TRUST_CG_") || key_text.starts_with("TCG_") {
+            compile.env_remove(&key);
+        }
+    }
+    let compile = compile
+        .arg("-Ztrust-verify=off")
         .arg("--edition=2021")
         .arg("-C")
         .arg("opt-level=3")
@@ -3026,7 +3110,7 @@ pub fn run_ay_reference_execution_with_length_buckets(
                 Some(state),
                 Some("ay_reference_helper_compile_failed"),
                 format!(
-                    "rustc failed compiling ay reference helper: {}",
+                    "trustc failed compiling ay reference helper: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 ),
             );
@@ -3035,7 +3119,7 @@ pub fn run_ay_reference_execution_with_length_buckets(
             return ay_reference_unavailable_report(
                 Some(state),
                 Some("ay_reference_helper_compile_failed"),
-                format!("launching rustc for ay reference helper failed: {err}"),
+                format!("launching trustc for ay reference helper failed: {err}"),
             );
         }
     };
@@ -4177,13 +4261,14 @@ pub fn run_trust_cg_backend_probe_with_length_buckets(
         .filter(|variant| variant.starts_with("trust_cg_"))
         .map(|variant| run_trust_cg_backend_probe_row(cases, variant, length_buckets))
         .collect::<Vec<_>>();
-    let status = if rows.iter().all(|row| {
-        row.status == "padded_scanner_probe_executed"
-            && row.chunk_mismatch_count == 0
-            && row.contains_mismatch_count == 0
-            && row.subsumption_mismatch_count == 0
-            && row.mismatches.is_empty()
-    }) {
+    let status = if !rows.is_empty()
+        && rows.iter().all(|row| {
+            row.status == "padded_scanner_probe_executed"
+                && row.chunk_mismatch_count == 0
+                && row.contains_mismatch_count == 0
+                && row.subsumption_mismatch_count == 0
+                && row.mismatches.is_empty()
+        }) {
         "padded_scanner_probe_pass"
     } else if rows
         .iter()
@@ -4221,20 +4306,22 @@ pub fn run_trust_cg_backend_execution_with_length_buckets(
         .collect::<Vec<_>>();
     let scalar_control_comparisons = run_trust_cg_contains4_scalar_control_comparisons(cases);
     let profitability_comparisons = trust_cg_backend_profitability_comparisons(&rows);
-    let rows_pass = rows.iter().all(|row| {
-        row.status == "trust_cg_backend_executed"
-            && row.chunk_mismatch_count == 0
-            && row.contains_mismatch_count == 0
-            && row.subsumption_mismatch_count == 0
-            && row.mismatches.is_empty()
-            && row
-                .operation_measurements
-                .iter()
-                .all(|measurement| measurement.status == "backend_measured")
-    });
-    let scalar_control_pass = scalar_control_comparisons
-        .iter()
-        .all(|comparison| comparison.status == "scalar_control_match");
+    let rows_pass = !rows.is_empty()
+        && rows.iter().all(|row| {
+            row.status == "trust_cg_backend_executed"
+                && row.chunk_mismatch_count == 0
+                && row.contains_mismatch_count == 0
+                && row.subsumption_mismatch_count == 0
+                && row.mismatches.is_empty()
+                && row
+                    .operation_measurements
+                    .iter()
+                    .all(|measurement| measurement.status == "backend_measured")
+        });
+    let scalar_control_pass = !scalar_control_comparisons.is_empty()
+        && scalar_control_comparisons
+            .iter()
+            .all(|comparison| comparison.status == "scalar_control_match");
     let status = if rows_pass && scalar_control_pass {
         "trust_cg_backend_execution_pass"
     } else if rows
@@ -4583,7 +4670,6 @@ const TRUST_CG_BATCH_SUBSUMPTION_SCANNER_BACKEND_FN: &str =
 #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 const TRUST_CG_BATCH_SUBSUMPTION_REPEATED_CHECKSUM_BACKEND_FN: &str =
     "trust_cg_ay_batch_subsumption_repeated_checksum_backend";
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 const TRUST_CG_PROBE_BATCHES_PER_REPETITION: usize = 64;
 const TRUST_CG_PROBE_WORKLOAD_BUCKET: &str = "fixture_mixed_2_16_probe";
 const TRUST_CG_RAW_PROBE_PROMOTION_DISPOSITION: &str = "profile_only_non_promoting";
@@ -5595,7 +5681,7 @@ fn prepare_trust_cg_contains4_masked_backend_function(
             contains4_scanner_batch_rewrite_override: Some(
                 trust_cg_backend_enables_contains4_batch_scanner(variant),
             ),
-            ..trust_cg_codegen::pipeline::PipelineConfig::default()
+            ..trust_cg_codegen::pipeline::PipelineConfig::for_host_aarch64()
         });
     pipeline.prepare_ir_function(&mut func).map_err(|err| {
         format!("Trust Codegen backend prepare_ir_function failed for {variant}: {err}")
@@ -5658,6 +5744,8 @@ fn execute_trust_cg_contains4_scalar_control_comparison(
 ) -> Result<TrustCgContains4ScalarControlComparison, String> {
     use std::collections::HashMap;
 
+    validate_ay_subsumption_cases(cases)
+        .map_err(|error| format!("invalid scanner workload: {error:#}"))?;
     let comparison_cases = trust_cg_contains4_scalar_control_cases(cases);
     if comparison_cases.is_empty() {
         return Err(
@@ -5758,6 +5846,8 @@ fn execute_trust_cg_backend_probe_row(
 ) -> Result<TrustCgBackendProbeRow, String> {
     use std::collections::HashMap;
 
+    validate_ay_subsumption_cases(cases)
+        .map_err(|error| format!("invalid scanner workload: {error:#}"))?;
     let arena = TrustCgPaddedChunkArena::new(cases);
     let probe_cases = trust_cg_contains4_probe_cases_from_arena(cases, &arena);
     if probe_cases.is_empty() {
@@ -5896,6 +5986,8 @@ fn execute_trust_cg_backend_execution_row(
 ) -> Result<TrustCgBackendExecutionRow, String> {
     use std::collections::HashMap;
 
+    validate_ay_subsumption_cases(cases)
+        .map_err(|error| format!("invalid scanner workload: {error:#}"))?;
     let arena = TrustCgPaddedChunkArena::new(cases);
     let probe_cases = trust_cg_contains4_probe_cases_from_arena(cases, &arena);
     if probe_cases.is_empty() {
@@ -8888,6 +8980,64 @@ mod tests {
     }
 
     #[test]
+    fn scanner_workload_rejects_unrepresentable_identity_and_expansion() {
+        let mut cases = ay_subsumption_cases_fixture();
+        #[cfg(target_pointer_width = "64")]
+        {
+            cases.clauses[0].id = u32::MAX as usize + 1;
+            let error = validate_ay_subsumption_cases(&cases).unwrap_err();
+            assert!(error.to_string().contains("clause id"));
+        }
+        cases = ay_subsumption_cases_fixture();
+        cases.clauses[0].padded_length = usize::MAX - 3;
+        assert!(validate_ay_subsumption_cases(&cases).is_err());
+        cases = ay_subsumption_cases_fixture();
+        cases.benchmark_matrix.measurement_repetitions = u64::MAX;
+        assert!(validate_ay_subsumption_cases(&cases).is_err());
+        cases.benchmark_matrix.measurement_repetitions = 0;
+        assert!(validate_ay_subsumption_cases(&cases).is_err());
+    }
+
+    #[test]
+    fn scanner_probe_with_no_variants_is_not_a_vacuous_pass() {
+        let mut cases = ay_subsumption_cases_fixture();
+        cases.benchmark_matrix.variants.clear();
+        let report = run_trust_cg_backend_probe(&cases);
+        assert!(report.rows.is_empty());
+        assert_eq!(report.status, "padded_scanner_probe_unavailable");
+    }
+
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn public_scanner_execution_validates_before_jit_or_arena_construction() {
+        let mut cases = ay_subsumption_cases_fixture();
+        cases.clauses[0].length = cases.clauses[0].lits.len() + 1;
+        let probe = run_trust_cg_backend_probe(&cases);
+        assert!(!probe.rows.is_empty());
+        assert!(
+            probe
+                .rows
+                .iter()
+                .all(|row| row.message.contains("invalid scanner workload"))
+        );
+        let execution = run_trust_cg_backend_execution_with_length_buckets(&cases, &[]);
+        assert!(!execution.rows.is_empty());
+        assert!(
+            execution
+                .rows
+                .iter()
+                .all(|row| row.message.contains("invalid scanner workload"))
+        );
+        assert!(
+            execution
+                .scalar_control_comparisons
+                .iter()
+                .all(|row| row.message.contains("invalid scanner workload"))
+        );
+        assert_eq!(execution.status, "trust_cg_backend_execution_unavailable");
+    }
+
+    #[test]
     fn load_ay_subsumption_cases_rejects_oversized_file_before_reading() {
         let path = std::env::temp_dir().join(format!(
             "trust-cg-jit-matrix-oversized-cases-{}-{}.json",
@@ -10692,7 +10842,13 @@ mod tests {
         assert_eq!(batch.b_start_chunks.len(), cases.subsumption_pairs.len());
         assert_eq!(batch.b_end_chunks.len(), cases.subsumption_pairs.len());
         assert_eq!(batch.records.len(), cases.subsumption_pairs.len() * 6);
-        for (record, pair) in batch.records.chunks_exact(6).zip(&cases.subsumption_pairs) {
+        for (record, pair) in batch
+            .records
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .zip(&cases.subsumption_pairs)
+        {
             let a_range = arena
                 .ranges_by_clause_id
                 .get(&pair.a)
@@ -10983,10 +11139,10 @@ mod tests {
             let valid_mask = case.chunk.valid_mask;
             let match_mask = (case.chunk.chunk_start_lane % 16) as u8;
             assert_eq!(case.expected_mask, i32::from(valid_mask & match_mask));
-            for lane_offset in 0..4 {
+            for (lane_offset, lane) in case.chunk.lanes[..4].iter().enumerate() {
                 let lane_bit = 1u8 << lane_offset;
                 if valid_mask & lane_bit == 0 {
-                    assert_eq!(case.chunk.lanes[lane_offset], cases.sentinel);
+                    assert_eq!(*lane, cases.sentinel);
                 }
             }
         }
@@ -11091,7 +11247,7 @@ mod tests {
                 contains4_scanner_batch_rewrite_override: Some(
                     trust_cg_backend_enables_contains4_batch_scanner(variant),
                 ),
-                ..trust_cg_codegen::pipeline::PipelineConfig::default()
+                ..trust_cg_codegen::pipeline::PipelineConfig::for_host_aarch64()
             });
         pipeline
             .prepare_ir_function(&mut func)

@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: heap-allocating std Rust using `Vec<i64>` compiled for
 // x86_64 via the rustc_codegen_trust_cg bridge — COMPILED, LINKED, and RUN, with
@@ -47,65 +51,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run Vec test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -135,9 +88,8 @@ fn try_compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -154,7 +106,11 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>) -> PathBuf
     assert!(
         output.status.success(),
         "compile of `{name}` failed ({} backend). stderr: <<<{}>>>",
-        if backend.is_some() { "trust-cg" } else { "llvm" },
+        if backend.is_some() {
+            "trust-cg"
+        } else {
+            "llvm"
+        },
         String::from_utf8_lossy(&output.stderr)
     );
     bin
@@ -290,10 +246,11 @@ fn vec_programs_run_and_match_llvm() {
              std::process::exit((s % 126) as i32); }",
             78,
         ),
-        // `Vec::drain(start..)` — a to-END (suffix) drain. Dropping the Drain
-        // truncates the Vec to `start` (no tail to shift). `[1,2,3,4,5].drain(2..)`
-        // removes [3,4,5]; v = [1,2], so `len*10 + v[0] + v[1]` = 20 + 1 + 2 = 23.
-        // A wrong post-drop length or shifted content diverges.
+        // `Vec::drain(start..)` — a to-END (suffix) drain. As in std, `Vec::drain`
+        // shortens the Vec to `start` before the Drain exists, and its drop has no
+        // tail to move back. `[1,2,3,4,5].drain(2..)` removes [3,4,5]; v = [1,2],
+        // so `len*10 + v[0] + v[1]` = 20 + 1 + 2 = 23. A wrong length after the
+        // drain or shifted content diverges.
         (
             "vec_drain_suffix",
             "fn main() { let mut v = vec![1i32, 2, 3, 4, 5]; v.drain(2..); \
@@ -317,10 +274,10 @@ fn vec_programs_run_and_match_llvm() {
             209,
         ),
         // `for x in v.drain(start..)` — ITERATE the drained suffix (the Drain
-        // into_iter-identity + modeled next), THEN the drop truncates the Vec.
-        // drain(2..) yields 3,4,5 (s=12); v = [1,2]; `s + len*10 + v[0] + v[1]`
-        // = 12 + 20 + 1 + 2 = 35. Wrong yield set, or a drop that failed to
-        // truncate, diverges.
+        // into_iter-identity + modeled next) over the Vec `Vec::drain` already
+        // shortened to `start`; the drop moves no tail. drain(2..) yields 3,4,5
+        // (s=12); v = [1,2]; `s + len*10 + v[0] + v[1]` = 12 + 20 + 1 + 2 = 35.
+        // A wrong yield set or a wrong length after the drain diverges.
         (
             "vec_drain_suffix_iter",
             "fn main() { let mut v = vec![1i32, 2, 3, 4, 5]; let mut s = 0i32; \
@@ -582,7 +539,11 @@ fn vec_iter_sum_matches_llvm() {
     // Both backends compile + run it; the exit codes must match (= 55). A wrong
     // sum (e.g. a dropped element or a bad slice length) would be a miscompile.
     let llvm_bin = compile(&dir, "vec_iter_llvm", src, None);
-    assert_eq!(run_exit_code(&llvm_bin), 55, "LLVM Vec iter-sum should be 55");
+    assert_eq!(
+        run_exit_code(&llvm_bin),
+        55,
+        "LLVM Vec iter-sum should be 55"
+    );
 
     let tcg_bin = compile(&dir, "vec_iter_tcg", src, Some(&dylib));
     assert_eq!(

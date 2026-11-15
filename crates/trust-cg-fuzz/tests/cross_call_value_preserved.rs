@@ -34,6 +34,7 @@ fn jit4(module: &trust_ir::Module, opt: OptLevel, fast: bool, row: [i64; 4]) -> 
     };
     cfg.opt_level = opt;
     let buf = Compiler::new(cfg)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &externs)
         .expect("compile")
         .buffer;
@@ -73,7 +74,7 @@ fn build_store_load_across_call() -> trust_ir::Module {
     let loaded = fb.load(Ty::I64, slot);
     fb.ret(vec![loaded]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -112,7 +113,9 @@ fn build_narrow_across_call(nargs: usize) -> trust_ir::Module {
         fb.switch_to_block(blk);
         let mut acc = p[0];
         for i in 0..nargs {
-            let k = fb.iconst(Ty::I16, (0x9e37_79b1_i128 + (i as i128) * 0x193) & 0xffff);
+            // The low 16 bits, as the signed i16 lane value TrustIR types.
+            let bits = (0x9e37_79b1_i128 + (i as i128) * 0x193) & 0xffff;
+            let k = fb.iconst(Ty::I16, i128::from(bits as u16 as i16));
             let m = fb.binop(BinOp::Mul, Ty::I16, p[i], k);
             acc = fb.binop(BinOp::Add, Ty::I16, acc, m);
             acc = fb.binop(BinOp::Xor, Ty::I16, acc, p[(i + 1) % nargs]);
@@ -141,7 +144,7 @@ fn build_narrow_across_call(nargs: usize) -> trust_ir::Module {
         fb.ret(vec![out]);
         fb.build();
     }
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // Regression for defect #4b: a narrow (i16) value passed as 5+ callee args while
@@ -173,4 +176,13 @@ fn narrow_value_across_call_matches_o0() {
             }
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

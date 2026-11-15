@@ -64,7 +64,8 @@ fn compile_module_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
         opt_level,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("compilation should succeed");
@@ -151,7 +152,7 @@ fn build_scalar_if_module() -> TrustIrModule {
     fb.ret(vec![result]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -246,7 +247,7 @@ fn build_scalar_if_state_module() -> TrustIrModule {
     fb.ret(vec![]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -451,4 +452,13 @@ int main(void) {
         );
         cleanup(&dir);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

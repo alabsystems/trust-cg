@@ -65,7 +65,8 @@ fn compile_module(
         opt_level,
         trace_level,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
 
     compiler
         .compile(module)
@@ -81,7 +82,7 @@ fn build_return_42_module() -> TrustIrModule {
     let result_val = fb.iconst(Ty::I64, 42);
     fb.ret(vec![result_val]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_add_i64_module() -> TrustIrModule {
@@ -95,7 +96,7 @@ fn build_add_i64_module() -> TrustIrModule {
     let result_val = fb.binop(BinOp::Add, Ty::I64, a, b);
     fb.ret(vec![result_val]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_identity_module() -> TrustIrModule {
@@ -107,7 +108,7 @@ fn build_identity_module() -> TrustIrModule {
     fb.switch_to_block(entry);
     fb.ret(vec![param0]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_multi_function_module() -> TrustIrModule {
@@ -133,7 +134,7 @@ fn build_multi_function_module() -> TrustIrModule {
         fb2.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -560,4 +561,13 @@ fn e2e_tmbc_format_detection() {
     assert!(!is_json_format(b"tMBCextra_bytes_nonJSON"));
     assert!(!is_json_format(b"tMB"));
     assert!(!is_json_format(b""));
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

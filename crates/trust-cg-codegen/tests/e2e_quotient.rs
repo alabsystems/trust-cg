@@ -30,6 +30,11 @@
 #![allow(non_snake_case)]
 #![allow(unused_imports)]
 
+// Host-target loading of the frozen Clean fixtures (rewrites the AArch64
+// `target` header line to this host; see the module for the evidence).
+#[path = "common/kernel_fixture.rs"]
+mod kernel_fixture;
+
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -543,7 +548,8 @@ fn shim_for(n: &str) -> Option<*const u8> {
 // JIT plumbing.
 // ════════════════════════════════════════════════════════════════════════════
 fn parse_validate(text: &str, what: &str) -> trust_ir::Module {
-    let m = trust_ir::parser::parse_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
+    let m =
+        kernel_fixture::parse_host_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
     let errs = trust_ir_build::validate_module(&m);
     assert!(errs.is_empty(), "{what} validate: {errs:?}");
     m
@@ -562,8 +568,9 @@ fn jit(text: &str, what: &str) -> trust_cg_codegen::jit::ExecutableBuffer {
             externs.insert(f.name.clone(), shim);
         }
     }
-    let config = CompilerConfig::jit_fast(Target::Aarch64);
+    let config = CompilerConfig::jit_fast(kernel_fixture::host_jit_target());
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .unwrap_or_else(|e| panic!("JIT compile {what} failed: {e:?}"))
         .buffer
@@ -1076,4 +1083,13 @@ fn r18_armed_axiom_module_corruption() {
     eprintln!(
         "armed: bumping the anon seed in the AXIOM module shifts every axiom type's meta tree (native unchanged) — the axiom .tir is genuinely compiled+executed"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

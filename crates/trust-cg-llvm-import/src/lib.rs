@@ -17,11 +17,20 @@
 
 use std::path::Path;
 
+mod attributes;
+mod lexical;
+mod llvm_runtime_libcalls;
+mod metadata;
 mod native_vector;
 mod parser;
+mod triple;
 mod vector;
 
-pub use parser::{import_module, import_text};
+pub use parser::{
+    import_module, import_text, import_text_for_compile, import_text_for_target, read_module_text,
+};
+/// The relocation model [`import_text_for_compile`] reads, the backend's.
+pub use trust_cg_lower::RelocationModel;
 
 /// Errors returned by the LLVM IR importer.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +49,23 @@ pub enum Error {
     /// rather than as a crash or failure.
     #[error("unsupported LLVM IR feature: {0}")]
     Unsupported(String),
+
+    /// The trust-ir module refused a row the import needed (a table or the
+    /// obligation id space is full). Nothing was added for it.
+    #[error("the trust-ir module refused: {0}")]
+    ModuleRefused(String),
+}
+
+impl From<trust_ir::IdSpaceExhausted> for Error {
+    fn from(exhausted: trust_ir::IdSpaceExhausted) -> Self {
+        Error::ModuleRefused(exhausted.to_string())
+    }
+}
+
+impl From<trust_ir::AddFunctionError> for Error {
+    fn from(refusal: trust_ir::AddFunctionError) -> Self {
+        Error::ModuleRefused(refusal.to_string())
+    }
 }
 
 /// Convenience alias for importer results.

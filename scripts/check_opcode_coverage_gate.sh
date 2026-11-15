@@ -10,14 +10,14 @@
 # and fails on unknown classification or evidence drift. With default features,
 # accepted records may be evaluator-backed statistical evidence; they are not
 # correctness proofs. This wraps the coverage-gate test suite in trust-cg-verify so it runs
-# in the same lane as the other ratchet-style gates (`cargo run -p trust-cg-test
-# --quiet -- ratchet tests`, `... ratchet warnings`, ...).
+# in the same lane as the other ratchet-style gates (`scripts/trust_cargo.sh run -p trust-cg-test
+# --quiet -- ratchet tests`, ...).
 #
 # The actual coverage logic lives in
 #   crates/trust-cg-verify/src/coverage_gate.rs
 #   crates/trust-cg-verify/tests/coverage_gate_tests.rs
 # and is exhaustiveness-forced at COMPILE time (a new opcode variant will not
-# compile until classified). This script makes the gate explicit in CI and
+# compile until classified). This script makes the local gate explicit and
 # prints the full audit log (allowlist included) so exceptions stay visible.
 #
 # Exit codes:
@@ -37,8 +37,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "check_opcode_coverage_gate: cargo not found on PATH" >&2
+# The installed Trust package's targo (scripts/trust_cargo.sh; no stock fallback).
+TRUST_CARGO="${SCRIPT_DIR}/trust_cargo.sh"
+if [ ! -x "${TRUST_CARGO}" ]; then
+    echo "check_opcode_coverage_gate: missing executable ${TRUST_CARGO}" >&2
     exit 2
 fi
 
@@ -55,9 +57,11 @@ echo "   features: ${FEATURES:-<default: evaluator-backed statistical evidence; 
 echo
 
 # --nocapture so the per-backend audit_log() (every opcode + allowlist reasons)
-# is visible in CI output, keeping the gate honest.
+# is visible in the local gate output. --offline: the gate never fetches, so a
+# dependency missing from the local registry cache is a tooling failure here,
+# not a network access (scripts/tests/test_opcode_coverage_gate.py pins it).
 cd "${REPO_ROOT}"
-if cargo test -p trust-cg-verify ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} --test coverage_gate_tests -- --nocapture; then
+if "${TRUST_CARGO}" test --locked --offline -p trust-cg-verify ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} --test coverage_gate_tests -- --nocapture; then
     echo
     echo "check_opcode_coverage_gate: PASS — accepted/deferred/excluded opcode classifications match the pinned inventory."
     exit 0

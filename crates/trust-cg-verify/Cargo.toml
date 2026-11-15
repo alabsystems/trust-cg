@@ -16,7 +16,7 @@ homepage.workspace = true
 readme.workspace = true
 
 [features]
-default = []
+default = ["original-i128-cic"]
 # Solver-backed verification uses the external AY subprocess path in
 # `ay_bridge.rs`. Keeping AY out of this crate's dependency graph preserves the
 # one-way Trust-CG -> AY tool boundary and avoids an AY <-> Trust-CG Cargo cycle.
@@ -27,14 +27,25 @@ default = []
 # remain compiled and testable. Not enabled by default.
 # To enable: `cargo build -p trust-cg-verify --features fsym`.
 fsym = []
-# tRust trust-types Formula <-> trust-cg SmtExpr compatibility adapter.
-# Kept opt-in so the default verification lane does not grow a hard tRust
-# dependency before the #260 integration path flips on.
-trust-types-bridge = ["dep:trust-types"]
 # slow-full-database: enables long-running full ProofDatabase integration
 # checks that are intentionally excluded from the default package lane.
 # To run: `cargo test -p trust-cg-verify --features slow-full-database --test full_proof_suite`.
 slow-full-database = []
+# live-ay: run the live-AY batch group, the `ay_bridge::tests::test_ay_batch_verify_*`
+# tests that send whole proof categories through the external AY solver one
+# obligation at a time. They dominate a `--lib` run (TRUSTCG-21), so without
+# this feature they are compiled but `#[ignore]`d with that reason; the full
+# matrix runs them in their own `lib-live-ay` shard and the release gate's
+# `--all-features` lane runs them too. No production code reads it.
+live-ay = []
+# Dependency-closed Clean replay of retained original i128 mathematical goals.
+# This is not a per-instance source-binding or SourceNoUB capability.
+original-i128-cic = ["dep:clean-kernel", "dep:clean-olean"]
+# Canonical ByteV1 replay of a bounded caller-memory store invocation. This
+# separate API does not grant native-code or compiler publication authority.
+core-byte-replay = ["dep:clean-kernel", "dep:clean-verify", "dep:trust-ir-build"]
+# Checked original source-call/Core entry, separate from the historical store API.
+source-defined-call = ["core-byte-replay", "trust-ir-build/source-value-operational"]
 
 [dependencies]
 trust-cg-ir = { workspace = true }
@@ -42,6 +53,12 @@ trust-cg-lower = { workspace = true }
 trust-cg-opt = { workspace = true }
 trust-cg-process-env = { workspace = true }
 trust-ir = { workspace = true }
+trust-ir-build = { workspace = true, optional = true }
+# Match the Clean revision owned by the pinned TrustIR family. No path patch
+# or substitute semantics may supply the replay vocabulary.
+clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "e7ae5d418cbac2e1a029369a5b5eda690d471c5c", optional = true }
+clean-olean = { git = "https://github.com/alabsystems/clean.git", rev = "e7ae5d418cbac2e1a029369a5b5eda690d471c5c", optional = true, default-features = false }
+clean-verify = { git = "https://github.com/alabsystems/clean.git", rev = "e7ae5d418cbac2e1a029369a5b5eda690d471c5c", optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -51,7 +68,6 @@ serde_json = { workspace = true }
 # be evaluated.
 sha2 = "0.10"
 rayon = "1.10"
-trust-types = { workspace = true, optional = true }
 tempfile = "3"
 # ENC-6 / CERT-SKIP: the vendored `drat-trim` DRAT proof checker, built as a
 # standalone executable in OUT_DIR. Promoted from dev-only to a production
@@ -61,16 +77,35 @@ tempfile = "3"
 # checker, not a solver: it can only confirm or reject a recorded refutation,
 # never mint one, and every rejection falls back to the live solver discharge.
 trust-cg-drat-trim = { workspace = true }
+# The committed bound-memory form certificates (`verdict_db/bound_memory_certs`)
+# are ~409 MB of text; they are committed zstd-compressed (~57 MB) and
+# decompressed on demand. Already in the lockfile (clean-kernel uses it). The
+# decoder carries no authority: the embedded manifest binds the SHA-256 of the
+# DECOMPRESSED certificate, and drat-trim replays those exact bytes.
+zstd = { version = "0.13", default-features = false }
+
+[build-dependencies]
+# build.rs records the SHA-256 of the build toolchain's `bin/ay` bytes: the
+# identity `src/ay_identity.rs` admits (see there). Same digest crate as the
+# runtime comparison. serde_json reads an overlay toolchain's manifest.
+sha2 = "0.10"
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Nonblocking pipe reads and unreaped-child process-group ownership for the
+# verification subprocess supervisor. Each lockfile already contains libc.
+libc = "0.2"
 
 [target.'cfg(not(windows))'.dependencies]
-# `asm` selects the accelerated SHA2 path on supported Unix hosts. Identical
-# digest, ~4x faster on the measured ARMv8 host: the solver-identity hash runs
-# over the ~95MB `ay` binary once per compile and cost ~230ms in the software
-# backend. Target-scoping the feature preserves that acceleration while Windows
-# uses sha2's portable implementation.
+# Enable SHA2 assembly on supported non-Windows targets while Windows uses
+# sha2's portable implementation. Both compute the same solver-identity digest;
+# binary size and hashing cost depend on the selected build, not this feature.
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
+# The retained-context producer reads the locked dependency identity rather
+# than labelling newly produced data with a stale hardcoded Clean revision.
+toml = "0.8"
 # THE INCUMBENT, kept alive on purpose. `rmp-serde` was this crate's cache
 # payload format up to CegisCacheEntry::VERSION 5; `cegis_cache_codec` replaced
 # it so no third-party serializer sits on a shipping path. It is retained as a
@@ -102,3 +137,19 @@ trust-ir-build = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "core_byte_store"
+required-features = ["core-byte-replay"]
+
+[[test]]
+name = "core_byte_writer"
+required-features = ["core-byte-replay"]
+
+[[example]]
+name = "retain_original_i128_context"
+required-features = ["original-i128-cic"]
+
+[[test]]
+name = "normal_result_post"
+required-features = ["core-byte-replay"]

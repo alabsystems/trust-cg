@@ -471,6 +471,209 @@ pub fn encode_reinterpret(x: SmtExpr) -> SmtExpr {
     x
 }
 
+// --- Rotates, bit counts, zero test and select --------------------------------
+//
+// Transcribed from the WebAssembly Core Specification numerics (`irotl`,
+// `irotr`, `iclz`, `ictz`, `ieqz`) and the `select` instruction. The rotate and
+// bit-count encoders are written in a form deliberately different from their
+// trust-ir counterparts in `trust_ir_semantics`, so those obligations compare
+// two constructions rather than one expression with itself. `eqz` and `select`
+// share their core predicate with the trust-ir side; their obligations check the
+// decoded byte and width, the `Bool`-as-`i32` 0/1 carrier and (for `select`) the
+// val1/val2/condition stack order, as the two-operand compares do.
+
+/// The rotate a wasm `rotl`/`rotr` opcode byte computes. The byte fixes both the
+/// direction and the operand width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmRotateOp {
+    /// `i32.rotl` (0x77).
+    I32Rotl,
+    /// `i64.rotl` (0x89).
+    I64Rotl,
+    /// `i32.rotr` (0x78).
+    I32Rotr,
+    /// `i64.rotr` (0x8a).
+    I64Rotr,
+}
+
+impl WasmRotateOp {
+    /// The operand (and result) width in bits.
+    pub fn width(self) -> u32 {
+        match self {
+            WasmRotateOp::I32Rotl | WasmRotateOp::I32Rotr => 32,
+            WasmRotateOp::I64Rotl | WasmRotateOp::I64Rotr => 64,
+        }
+    }
+
+    /// `true` for a left rotate.
+    pub fn is_left(self) -> bool {
+        matches!(self, WasmRotateOp::I32Rotl | WasmRotateOp::I64Rotl)
+    }
+}
+
+/// Decode a wasm rotate opcode byte. `None` for every other byte.
+pub fn decode_rotate(op_byte: u8) -> Option<WasmRotateOp> {
+    use WasmRotateOp::*;
+    Some(match op_byte {
+        0x77 => I32Rotl,
+        0x89 => I64Rotl,
+        0x78 => I32Rotr,
+        0x8a => I64Rotr,
+        _ => return None,
+    })
+}
+
+/// `i32.rotl` (0x77) / `i64.rotl` (0x89): spec `irotl_N(i1, i2)` — let `k` be
+/// `i2 mod N`; the result is `i1` rotated left by `k` bits. Rendered as the two
+/// logical shifts a rotation decomposes into, `(i1 << k) | (i1 >>u (N - k))`,
+/// with `k` taken by masking (`N` is a power of two). At `k = 0` the right shift
+/// is by `N`, which SMT-LIB defines as `0`, so the result is `i1`.
+pub fn encode_rotl(a: SmtExpr, b: SmtExpr, width: u32) -> SmtExpr {
+    let k = shift_mask(b, width);
+    let back = SmtExpr::bv_const(u64::from(width), width).bvsub(k.clone());
+    a.clone().bvshl(k).bvor(a.bvlshr(back))
+}
+
+/// `i32.rotr` (0x78) / `i64.rotr` (0x8a): spec `irotr_N(i1, i2)` — `i1` rotated
+/// right by `i2 mod N` bits, `(i1 >>u k) | (i1 << (N - k))`. The `k = 0` case
+/// reduces to `i1` exactly as in [`encode_rotl`].
+pub fn encode_rotr(a: SmtExpr, b: SmtExpr, width: u32) -> SmtExpr {
+    let k = shift_mask(b, width);
+    let back = SmtExpr::bv_const(u64::from(width), width).bvsub(k.clone());
+    a.clone().bvlshr(k).bvor(a.bvshl(back))
+}
+
+/// The bit count a wasm `clz`/`ctz` opcode byte computes. The byte fixes both
+/// the count and the operand width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmBitCountOp {
+    /// `i32.clz` (0x67).
+    I32Clz,
+    /// `i64.clz` (0x79).
+    I64Clz,
+    /// `i32.ctz` (0x68).
+    I32Ctz,
+    /// `i64.ctz` (0x7a).
+    I64Ctz,
+}
+
+impl WasmBitCountOp {
+    /// The operand (and result) width in bits.
+    pub fn width(self) -> u32 {
+        match self {
+            WasmBitCountOp::I32Clz | WasmBitCountOp::I32Ctz => 32,
+            WasmBitCountOp::I64Clz | WasmBitCountOp::I64Ctz => 64,
+        }
+    }
+
+    /// `true` for a leading-zero count.
+    pub fn is_leading(self) -> bool {
+        matches!(self, WasmBitCountOp::I32Clz | WasmBitCountOp::I64Clz)
+    }
+}
+
+/// Decode a wasm `clz`/`ctz` opcode byte. `None` for every other byte,
+/// including the `popcnt` bytes, which [`decode_popcnt`] owns.
+pub fn decode_bit_count(op_byte: u8) -> Option<WasmBitCountOp> {
+    use WasmBitCountOp::*;
+    Some(match op_byte {
+        0x67 => I32Clz,
+        0x79 => I64Clz,
+        0x68 => I32Ctz,
+        0x7a => I64Ctz,
+        _ => return None,
+    })
+}
+
+/// `i32.clz` (0x67) / `i64.clz` (0x79): spec `iclz_N(i)` — the number of leading
+/// zero bits; `N` when `i` is `0`. Rendered by smearing the highest set bit into
+/// every lower position (`i | i>>1 | i>>2 | ...`) and subtracting the resulting
+/// population count from `N`.
+pub fn encode_clz(x: SmtExpr) -> SmtExpr {
+    let width = x.bv_width();
+    let mut smeared = x;
+    let mut step = 1u32;
+    while step < width {
+        let shifted = smeared
+            .clone()
+            .bvlshr(SmtExpr::bv_const(u64::from(step), width));
+        smeared = smeared.bvor(shifted);
+        step *= 2;
+    }
+    SmtExpr::bv_const(u64::from(width), width).bvsub(encode_popcnt(smeared))
+}
+
+/// `i32.ctz` (0x68) / `i64.ctz` (0x7a): spec `ictz_N(i)` — the number of
+/// trailing zero bits; `N` when `i` is `0`. Rendered as the population count of
+/// `!i & (i - 1)`, the mask of exactly the trailing zero positions (all ones
+/// when `i` is `0`).
+pub fn encode_ctz(x: SmtExpr) -> SmtExpr {
+    let width = x.bv_width();
+    let all_ones = SmtExpr::bv_const(u64::MAX >> (64 - width), width);
+    let not_x = x.clone().bvxor(all_ones);
+    let below = x.bvsub(SmtExpr::bv_const(1, width));
+    encode_popcnt(not_x.bvand(below))
+}
+
+/// The zero test a wasm `eqz` opcode byte computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmEqzOp {
+    /// `i32.eqz` (0x45).
+    I32,
+    /// `i64.eqz` (0x50).
+    I64,
+}
+
+impl WasmEqzOp {
+    /// The operand width in bits. The result is always an `i32`.
+    pub fn width(self) -> u32 {
+        match self {
+            WasmEqzOp::I32 => 32,
+            WasmEqzOp::I64 => 64,
+        }
+    }
+}
+
+/// Decode a wasm `eqz` opcode byte. `None` for every other byte.
+pub fn decode_eqz(op_byte: u8) -> Option<WasmEqzOp> {
+    Some(match op_byte {
+        0x45 => WasmEqzOp::I32,
+        0x50 => WasmEqzOp::I64,
+        _ => return None,
+    })
+}
+
+/// `i32.eqz` (0x45) / `i64.eqz` (0x50): spec `ieqz_N(i)` — the `i32` `1` if `i`
+/// is `0`, else `0`, at either operand width.
+pub fn encode_eqz(x: SmtExpr) -> SmtExpr {
+    let width = x.bv_width();
+    bool_to_i32(x.eq_expr(SmtExpr::bv_const(0, width)))
+}
+
+/// The value-polymorphic `select` form a wasm opcode byte encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmSelectOp {
+    /// `select` (0x1b), the untyped form the backend emits. The typed
+    /// `select t*` (0x1c) carries a type vector and is not decoded here.
+    Untyped,
+}
+
+/// Decode a wasm `select` opcode byte. `None` for every other byte.
+pub fn decode_select(op_byte: u8) -> Option<WasmSelectOp> {
+    match op_byte {
+        0x1b => Some(WasmSelectOp::Untyped),
+        _ => None,
+    }
+}
+
+/// `select` (0x1b): the spec pops the `i32` condition `c` (top of stack), then
+/// `val2`, then `val1`; it pushes `val1` if `c` is not `0`, else `val2`. The
+/// parameters are in that stack order: `val1` deepest, `c` on top.
+pub fn encode_select(val1: SmtExpr, val2: SmtExpr, c: SmtExpr) -> SmtExpr {
+    let nonzero = c.eq_expr(SmtExpr::bv_const(0, 32)).not_expr();
+    SmtExpr::ite(nonzero, val1, val2)
+}
+
 // --- Arithmetic (result width == operand width) -----------------------------
 
 /// `i32.add` (0x6a) / `i64.add` (0x7c): `(a + b) mod 2^N`.
@@ -646,6 +849,49 @@ pub fn encode_ineg(x: SmtExpr, width: u32) -> SmtExpr {
     SmtExpr::bv_const(0, width).bvsub(x)
 }
 
+/// The operand width a wasm `copysign` opcode byte fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmCopysignOp {
+    /// `f32.copysign` (0x98).
+    F32,
+    /// `f64.copysign` (0xa6).
+    F64,
+}
+
+impl WasmCopysignOp {
+    /// The operand (and result) width in bits.
+    pub fn width(self) -> u32 {
+        match self {
+            WasmCopysignOp::F32 => 32,
+            WasmCopysignOp::F64 => 64,
+        }
+    }
+}
+
+/// Decode a wasm `copysign` opcode byte. `None` for every other byte.
+pub fn decode_copysign(op_byte: u8) -> Option<WasmCopysignOp> {
+    Some(match op_byte {
+        0x98 => WasmCopysignOp::F32,
+        0xa6 => WasmCopysignOp::F64,
+        _ => return None,
+    })
+}
+
+/// `f32.copysign` (0x98) / `f64.copysign` (0xa6) over the operands' IEEE-754
+/// BIT PATTERNS (`z1` deeper on the stack, `z2` on top), transcribed from the
+/// spec's `fcopysign_N(z1, z2)`: if `z1` and `z2` have the same sign, the result
+/// is `z1`; otherwise it is `z1` with its sign negated. The sign of a NaN is its
+/// sign bit, and a NaN keeps its payload. Stated as a case split on the two
+/// sign bits and a sign-bit flip — not as the mask-and-merge the trust-ir side
+/// uses — and carried as bitvectors because the operation never rounds and the
+/// FP evaluator compares NaNs without their sign or payload.
+pub fn encode_copysign(z1: SmtExpr, z2: SmtExpr, width: u32) -> SmtExpr {
+    let top = width - 1;
+    let same_sign = z1.clone().extract(top, top).eq_expr(z2.extract(top, top));
+    let negated = z1.clone().bvxor(SmtExpr::bv_const(1u64 << top, width));
+    SmtExpr::ite(same_sign, z1, negated)
+}
+
 /// `f32.neg` (0x8c) / `f64.neg` (0x9a).
 pub fn encode_fneg(x: SmtExpr) -> SmtExpr {
     x.fp_neg()
@@ -764,9 +1010,10 @@ pub fn encode_trunc_sat_u(src: SmtExpr, int_width: u32) -> SmtExpr {
 // --- Linear memory (byte-addressed, little-endian) --------------------------
 //
 // wasm linear memory is a byte array; `i32.store`/`i32.load` (and i64) access
-// `N` consecutive bytes in **little-endian** order at the effective address
-// (here, the pointer the backend's `local.get ptr` placed on the stack; the
-// memarg static offset is 0 in the current lowering). We model memory as
+// `N` consecutive bytes in **little-endian** order at the effective address.
+// The encoders below take that address directly; the memarg STATIC OFFSET is
+// modelled by `encode_effective_address` / `encode_mem_load_at` /
+// `encode_mem_store_at` (next section). We model memory as
 // `(Array (BitVec 32) (BitVec 8))` and an N-byte access as N byte ops.
 
 /// A zero-initialized linear memory: `(Array (BitVec 32) (BitVec 8))` of 0s.
@@ -1096,6 +1343,64 @@ pub fn encode_mem_store(
         return None;
     }
     Some(encode_store_n(mem, addr, val, op.access_bytes()))
+}
+
+// --- The memarg effective address -----------------------------------------------
+//
+// Spec §4.4.7 (`t.load memarg`, `t.store memarg`): the effective address is
+// `ea = i + memarg.offset`, the i32 operand and the u32 offset added as
+// INTEGERS — no wrap — and the access TRAPS when `ea + N` exceeds the memory
+// size. A wasm32 memory holds at most 2^32 bytes, so every access that does not
+// trap has `ea + N <= 2^32`, and on exactly those accesses the byte index is
+// the low 32 bits of `ea`. The lowering reaches struct fields, enum tags and
+// lanes, the high half of a 128-bit value, sret slots and parameter / return
+// lanes through a NONZERO offset, so the offset is modelled here rather than
+// assumed to be 0.
+
+/// The unbounded effective address `zext(base) + zext(offset)` of a memarg
+/// access, as a 64-bit value (it reaches at most 2^33 - 2).
+pub fn encode_effective_address(base: SmtExpr, offset: SmtExpr) -> SmtExpr {
+    base.zero_ext(32).bvadd(offset.zero_ext(32))
+}
+
+/// The spec's NO-TRAP condition for an `n_bytes` access at `(base, offset)` on
+/// a memory of the full 2^32 bytes: `ea + n_bytes <= 2^32`, in unbounded
+/// arithmetic. A smaller memory traps on more accesses, never fewer.
+pub fn encode_access_does_not_trap(base: SmtExpr, offset: SmtExpr, n_bytes: u32) -> SmtExpr {
+    encode_effective_address(base, offset)
+        .bvadd(SmtExpr::bv_const(u64::from(n_bytes), 64))
+        .bvule(SmtExpr::bv_const(1u64 << 32, 64))
+}
+
+/// The byte index an access at `(base, offset)` reads or writes: the low 32
+/// bits of the effective address, which IS the effective address whenever
+/// [`encode_access_does_not_trap`] holds.
+pub fn encode_access_address(base: SmtExpr, offset: SmtExpr) -> SmtExpr {
+    encode_effective_address(base, offset).extract(31, 0)
+}
+
+/// A decoded wasm LOAD with memarg offset `offset`: [`encode_mem_load`] at
+/// [`encode_access_address`]. Meaningful under [`encode_access_does_not_trap`];
+/// outside it the spec traps and no value is produced.
+pub fn encode_mem_load_at(
+    mem: SmtExpr,
+    base: SmtExpr,
+    offset: SmtExpr,
+    op: WasmMemOp,
+) -> Option<SmtExpr> {
+    encode_mem_load(mem, encode_access_address(base, offset), op)
+}
+
+/// A decoded wasm STORE with memarg offset `offset`: [`encode_mem_store`] at
+/// [`encode_access_address`], under the same no-trap reading.
+pub fn encode_mem_store_at(
+    mem: SmtExpr,
+    base: SmtExpr,
+    offset: SmtExpr,
+    val: SmtExpr,
+    op: WasmMemOp,
+) -> Option<SmtExpr> {
+    encode_mem_store(mem, encode_access_address(base, offset), val, op)
 }
 
 // --- Narrow-width (i32/i64-carried u8/u16/i8/i16) normalization --------------

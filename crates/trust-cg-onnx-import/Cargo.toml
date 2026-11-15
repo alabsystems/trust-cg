@@ -13,7 +13,7 @@ publish = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 readme = { workspace = true }
-description = "ONNX graph fixture importer for VNN tensor trust-ir JSON"
+description = "ONNX graph importer for the standalone VNN tensor JSON model (emits no TrustIr)"
 
 [dependencies]
 serde = { workspace = true }
@@ -21,9 +21,23 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
 
+# NOTE: this binary emits the standalone VNN tensor JSON model, NOT TrustIr.
+# It was named `trust-cg-onnx-to-vnn-trust-ir` until 2026-09-01, which read as a
+# TrustIr producer in the build graph; this crate has no `trust-ir` dependency and
+# never constructs a `trust_ir::Module`. Renamed rather than reworked so the name
+# states what it does without pre-judging whether the tensor region ever lands in
+# TrustIr (see ~/trust-ir/designs/2026-09-01-tensor-region-scoping.md).
+#
+# The emitted `trust_ir.vnn` dialect label and `trust_ir.vnn.*` op names were
+# deliberately KEPT on 2026-09-01: they are a pinned output contract that the
+# golden assertions in tests/importer.rs match byte-for-byte, so the prefix is
+# documented as historical rather than renamed. The FORMAT FIREWALL section in
+# src/lib.rs is the statement; `vnn_labels_are_pinned_and_this_crate_emits_no_trustir`
+# in tests/importer.rs enforces it, and fails if a trust-ir dependency is added
+# to the sections below.
 [[bin]]
-name = "trust-cg-onnx-to-vnn-trust-ir"
-path = "src/bin/trust-cg-onnx-to-vnn-trust-ir.rs"
+name = "trust-cg-onnx-to-vnn-json"
+path = "src/bin/trust-cg-onnx-to-vnn-json.rs"
 
 [lints]
 workspace = true

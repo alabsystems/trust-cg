@@ -1,0 +1,5 @@
+(set-logic QF_BVFP)
+(declare-const x (_ BitVec 32))
+(define-fun fx () (_ FloatingPoint 8 24) ((_ to_fp 8 24) x))
+(assert (not (= (fp.isNaN fx) (and (= ((_ extract 30 23) x) #xff) (not (= ((_ extract 22 0) x) #b00000000000000000000000))))))
+(check-sat)

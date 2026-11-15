@@ -5,16 +5,19 @@
 
 //! Conservative algebraic peepholes for x86-64 ISel-output functions.
 //!
-//! This pass is intentionally narrow: it only rewrites local, single
-//! instructions with virtual GPR operands, and it only replaces flag-writing
-//! instructions when the written RFLAGS are proven dead inside the block or
-//! when the replacement preserves the produced RFLAGS exactly.
+//! Includes algebraic identities, address folding, and instruction-sequence
+//! rewrites. Flag-changing replacements require a proof that the affected
+//! flags are dead or that the replacement preserves the consumed flags.
 
 use trust_cg_ir::X86Opcode;
 use trust_cg_ir::regs::{RegClass, VReg};
 use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
-use crate::effects::{x86_inst_effect, x86_reads_flags, x86_writes_flags};
+use crate::effects::{
+    FlagOverwrite, condition_flag_overwrite, x86_inst_effect, x86_reads_flags, x86_writes_flags,
+};
+use crate::fast_hash::{FxHashMap, FxHashSet};
+use crate::x86_flag_liveness::X86FlagLiveness;
 use crate::x86_pass_manager::X86MachinePass;
 
 /// Admission callback for the peepholes that CONSTRUCT a reconstruction-lane
@@ -29,34 +32,75 @@ use crate::x86_pass_manager::X86MachinePass;
 /// unless a caller explicitly wires the proof-backed admission.
 pub type ReconstructionAdmit = fn(X86Opcode) -> bool;
 
+/// Admission callback for the `IMUL r,r,imm` -> `SHL ; ADD/SUB` const-multiply
+/// strength reduction. `true` iff the ALGEBRAIC identity
+///
+/// ```text
+///   x * (2^a + 1) == (x << a) + x        (plus_one = true)
+///   x * (2^a - 1) == (x << a) - x        (plus_one = false)
+/// ```
+///
+/// at bit-width `width` is discharged on this build. Unlike
+/// [`ReconstructionAdmit`] the opcodes involved (`ShlRI`/`AddRR`/`SubRR`) are
+/// pre-existing emittable surface already verified per-instruction — what this
+/// gate discharges is the RING IDENTITY the rewrite relies on, which the
+/// AArch64 side proves as `proof_add_lsl_shift` / `proof_sub_lsl_shift`.
+///
+/// Injected by the constructor for the same reason as `ReconstructionAdmit`
+/// (trust-cg-opt must not depend on trust-cg-verify), and the fail-closed
+/// default ([`X86Peephole::default`], [`X86Peephole::new`]) admits NOTHING, so
+/// the arm never fires unless a caller wires the proof-backed admission. A
+/// `false` verdict leaves the original (correct, itself proof-covered) `IMUL`
+/// in place: an admission gate, never a rejection gate.
+pub type ConstMulShiftAdmit = fn(width: u32, a: u32, plus_one: bool) -> bool;
+
 /// Bounded algebraic-identity peepholes for x86-64 ISel-output functions.
 pub struct X86Peephole {
     /// Proof admission for opcode-constructing fusions. See
     /// [`ReconstructionAdmit`].
     admit_reconstructed: ReconstructionAdmit,
+    /// Proof admission for the const-multiply shift reduction. See
+    /// [`ConstMulShiftAdmit`].
+    admit_constmul_shift: ConstMulShiftAdmit,
 }
 
 impl X86Peephole {
     /// Create the pass with the given reconstruction-proof admission callback.
+    /// The const-multiply shift reduction stays FAIL-CLOSED; use
+    /// [`Self::with_admissions`] to wire it.
     pub fn new(admit_reconstructed: ReconstructionAdmit) -> Self {
         Self {
             admit_reconstructed,
+            admit_constmul_shift: |_, _, _| false,
+        }
+    }
+
+    /// Create the pass with BOTH proof admissions wired.
+    pub fn with_admissions(
+        admit_reconstructed: ReconstructionAdmit,
+        admit_constmul_shift: ConstMulShiftAdmit,
+    ) -> Self {
+        Self {
+            admit_reconstructed,
+            admit_constmul_shift,
         }
     }
 
     /// Run x86 peepholes directly on an ISel function.
     pub fn run_on_function(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit_reconstructed)
+        run_impl(func, self.admit_reconstructed, self.admit_constmul_shift)
     }
 }
 
 impl Default for X86Peephole {
-    /// The CLOSED admission: every peephole except the RMW fusion and the
-    /// variable-rotate collapse runs unchanged; the admission-gated fusions
-    /// never fire (fail-closed on the proof).
+    /// The CLOSED admission: every peephole except the RMW fusion, the
+    /// variable-rotate collapse and the const-multiply shift reduction runs
+    /// unchanged; the admission-gated rewrites never fire (fail-closed on the
+    /// proof).
     fn default() -> Self {
         Self {
             admit_reconstructed: |_| false,
+            admit_constmul_shift: |_, _, _| false,
         }
     }
 }
@@ -67,7 +111,7 @@ impl X86MachinePass for X86Peephole {
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit_reconstructed)
+        run_impl(func, self.admit_reconstructed, self.admit_constmul_shift)
     }
 }
 
@@ -78,15 +122,72 @@ enum PeepholeEdit {
     ReplaceTwo(X86ISelInst, X86ISelInst),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FlagOverwrite {
-    None,
-    Partial,
-    Full,
+static PEEPHOLE_ENTRY_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the peephole-entry body dump from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=trace-peephole-entry`). DEFAULT OFF, diagnostics only, no
+/// codegen effect.
+///
+/// # Why this exists
+///
+/// The x86 lane had dumps at exactly two pass positions, both owned by the
+/// vectorizer: `vectorize-post-sroa` (after SROA, before LICM) and
+/// `vectorize-late` (after the WHOLE cleanup cluster). There was nothing at the
+/// peephole/BCE/DCE position.
+///
+/// That gap has a measured cost. Five separate transformations were designed in
+/// this round against a `vectorize-late` dump and every one fired on NOTHING,
+/// because that dump shows the body AFTER the peephole has already run, so the
+/// shapes they matched do not exist where they execute. `p2_collatz`'s late dump
+/// shows `ShrRI v26, v12, 1 ; MovRR v27, v26` with `v27` multi-def — a textbook
+/// match for a producer/write-back coalesce — and such a fold declines, because at
+/// THIS position that shape is not there.
+///
+/// So: before writing a transformation for a pass in the cleanup cluster, dump the
+/// body as that pass sees it.
+pub fn set_peephole_entry_trace_enabled(enabled: bool) -> bool {
+    match PEEPHOLE_ENTRY_TRACE.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => PEEPHOLE_ENTRY_TRACE.get() == Some(&requested),
+    }
 }
 
-fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit) -> bool {
+fn peephole_entry_trace_enabled() -> bool {
+    if let Some(enabled) = PEEPHOLE_ENTRY_TRACE.get() {
+        return *enabled;
+    }
+    crate::tcg_env_flag("TCG_X86_TRACE_PEEPHOLE_ENTRY")
+}
+
+fn run_impl(
+    func: &mut X86ISelFunction,
+    admit_reconstructed: ReconstructionAdmit,
+    admit_constmul_shift: ConstMulShiftAdmit,
+) -> bool {
     let mut changed = false;
+
+    // Ground-truth dump of the body AS THIS PASS SEES IT. See
+    // `set_peephole_entry_trace_enabled` for why this exists.
+    if peephole_entry_trace_enabled() {
+        eprintln!(
+            "x86-peephole[entry]: fn `{}` blocks={}",
+            func.name,
+            func.block_order.len()
+        );
+        for block_id in &func.block_order {
+            let Some(block) = func.blocks.get(block_id) else {
+                continue;
+            };
+            eprintln!(
+                "  block {:?} succs={:?}",
+                block_id.0,
+                block.successors.iter().map(|b| b.0).collect::<Vec<_>>()
+            );
+            for inst in &block.insts {
+                eprintln!("    {:?} {:?}", inst.opcode, inst.operands);
+            }
+        }
+    }
 
     // Function-scope pass: fold uniquely-defined `MovRI` constants into the
     // immediate slot of their ALU consumers. Runs before the fusion passes so
@@ -97,8 +198,7 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
 
     // Multi-instruction pass: cmp+setcc+(zero-test)+Jcc fusion. Must run FIRST,
     // before any pass rewrites the `Setcc`/`Movzx`/`CmpRI %D,0`/`Jcc` shape
-    // (setcc-hoist erases the Movzx; and-pow2-bt and the single-inst loop
-    // rewrite the zero-test). Collapses a materialized-boolean branch back to a
+    // (and-pow2-bt and the single-inst loop rewrite the zero-test). Collapses a materialized-boolean branch back to a
     // direct conditional jump on the comparison's flags. See
     // `try_cmp_setcc_branch_fusion` for the hand-proof and side conditions.
     for block_id in func.block_order.clone() {
@@ -107,15 +207,16 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
         }
     }
 
-    // Multi-instruction pass: setcc-flag-hoist. Must run before the
-    // single-instruction simplification loop so that hoisting the xor does not
-    // race with movri-zero -> xor-zero, etc. See `try_setcc_hoist` for the
-    // hand-proof and side conditions.
-    for block_id in func.block_order.clone() {
-        if setcc_hoist_run_on_block(func, block_id) {
-            changed = true;
-        }
-    }
+    // No pass here may separate a `Setcc %D, cc` from ISel's following
+    // `Movzx %D, %D`. `Setcc` writes only %D[7:0], and every register model
+    // (the allocator's `x86_operand_access`, `effects::x86_operand0_may_be_read`,
+    // the post-RA dataflow check) treats it as a pure def of operand 0 that
+    // does not read %D. A form that relies on %D[31:8] surviving the `Setcc`
+    // (the retired setcc-flag-hoist: `XorRR %D,%D; [flag_writer]; Setcc %D`
+    // with the Movzx deleted) is invisible to those models: the xor's value is
+    // dead in liveness, and a spilled %D gets a fresh scratch with no reload,
+    // so the stored bool carries stale bits 31:8. See the regression
+    // `setcc_bool_survives_peephole_and_spill_materialization` (codegen).
 
     // Multi-instruction pass: shl/shr/or -> ROL. Flags liveness is computed ONCE
     // for the function; the rewrite is only legal where the OR's flags are dead.
@@ -137,11 +238,28 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // liveness is recomputed because the constant-rotate pass above may have
     // deleted flag-writing shifts. See `rotate_var_idiom_run_on_block` for
     // the hand-proof and side conditions.
+    // The whole-function maps (single-def instruction index + function-wide
+    // use/def counts) are a pure function of `func`, and this routine mutates
+    // `func` ONLY when it returns `true`, so ONE build serves every block up
+    // to the next collapse — instead of one build per block, which made this
+    // loop O(blocks x instructions). Rebuilding immediately after any
+    // collapse hands each block exactly the maps a per-block build would have
+    // produced, so the emitted bytes are unchanged. (Same restructuring as
+    // `SibFoldVRegMaps` above; `function_use_def_counts` was 8.4% of the whole
+    // x86 optimization phase at 2400 functions, measured 2026-08-31.)
     if rotate_var_idiom_enabled() {
         let live_in = flags_live_in_by_block(func);
+        let mut maps = RotateVarFnMaps::build(func);
         for block_id in func.block_order.clone() {
-            if rotate_var_idiom_run_on_block(func, block_id, &live_in, admit_reconstructed) {
+            if rotate_var_idiom_run_on_block_with_maps(
+                func,
+                block_id,
+                &live_in,
+                admit_reconstructed,
+                &maps,
+            ) {
                 changed = true;
+                maps = RotateVarFnMaps::build(func);
             }
         }
     }
@@ -164,36 +282,79 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // must run before the single-instruction loop, which could otherwise
     // rewrite the imul/shl/add shape (e.g. imm folding) and break the window.
     // See `try_sib_addr_fold` for the full hand-proof and side conditions.
+    // The whole-function VReg maps are a pure function of `func`, and a block
+    // that folds nothing leaves `func` untouched, so ONE build serves every
+    // block up to the next fold — instead of one build per block, which made
+    // this loop O(blocks x instructions) (10.8% of the whole x86 optimization
+    // phase at 2400 functions, measured 2026-08-31). Rebuilding immediately
+    // after any fold hands each block exactly the maps a per-block build would
+    // have produced, so the emitted bytes are unchanged.
+    {
+        let mut maps = SibFoldVRegMaps::build(func);
+        for block_id in func.block_order.clone() {
+            if sib_addr_fold_run_on_block_with_maps(func, block_id, &maps) {
+                changed = true;
+                maps = SibFoldVRegMaps::build(func);
+            }
+        }
+    }
+
+    // Same fold, the anchor the loop above does not have: a memory op that
+    // ALREADY carries a SIB operand with `scale == 1` whose index is a
+    // power-of-two `imul`/`shl`. A frontend that lowers an element address as an
+    // explicit stride multiply and lets the SIB do the base addition emits
+    // neither a `LeaSib` nor an `AddRR`, so the multiply survived into the hot
+    // loop. The rewrite is an exact equality (both the `imul` and SIB scaling are
+    // modulo 2^64), so it carries no overflow side condition. DEFAULT-ON;
+    // `TCG_NO_X86_SIB_SCALE1_FOLD` is the forensic opt-out. See
+    // `sib_scale1_index_fold_run_on_block` for the side conditions.
+    if sib_scale1_index_fold_enabled() {
+        let mut counts = FnUseDefCounts::build(func);
+        let mut flags = X86FlagLiveness::analyze(func);
+        for block_id in func.block_order.clone() {
+            if sib_scale1_index_fold_run_on_block(func, block_id, &counts, &flags) {
+                changed = true;
+                counts = FnUseDefCounts::build(func);
+                flags = X86FlagLiveness::analyze(func);
+            }
+        }
+    }
+
+    // Multi-instruction pass: a SIB memory operand whose INDEX register holds
+    // a block-local compile-time constant becomes `[base + disp]`. This is the
+    // machine-level form of an element address at a literal index
+    // (`Iconst k; Iconst size; Imul; ArrayGep`), which the selector emits as a
+    // scaled-index address over a materialized constant and the SIB fold above
+    // carries into the load or store. It runs here, on the optimizer's stream,
+    // so the selector's own rows for `ArrayGep` are untouched. Rewrite-only:
+    // DCE sweeps the constant's computation. Before the address-chain fold so
+    // that fold sees the plain `[base + disp]` operand. See
+    // `sib_const_index_fold_run_on_block` for the side conditions.
     for block_id in func.block_order.clone() {
-        if sib_addr_fold_run_on_block(func, block_id) {
+        if sib_const_index_fold_run_on_block(func, block_id) {
             changed = true;
         }
     }
 
-    // Multi-instruction pass: LOCAL address-chain fold (X9 slice 2,
-    // DEFAULT-ON; `TCG_NO_X86_ADDR_CHAIN_FOLD` opts out). Generalizes the SIB
-    // fold above to the post-unroll dialect (multi-def vreg ids from verbatim
-    // clones, AddRI displacement chains, scale-1 AddRR indices) via local nearest-
-    // reaching-def resolution. Rewrite-only: the dead chains are swept by
-    // DCE. See `addr_chain_fold_run_on_block` for the hand-proof.
-    if addr_chain_fold_enabled() {
-        for block_id in func.block_order.clone() {
-            if addr_chain_fold_run_on_block(func, block_id) {
-                changed = true;
-            }
+    // Multi-instruction pass: LOCAL address-chain fold (X9 slice 2).
+    // Generalizes the SIB fold above to the post-unroll dialect (multi-def vreg
+    // ids from verbatim clones, AddRI displacement chains, scale-1 AddRR
+    // indices) via local nearest-reaching-def resolution. Rewrite-only: the dead
+    // chains are swept by DCE. See `addr_chain_fold_run_on_block` for the
+    // hand-proof.
+    for block_id in func.block_order.clone() {
+        if addr_chain_fold_run_on_block(func, block_id) {
+            changed = true;
         }
     }
 
-    // Multi-instruction pass: RM fusion (X9 slice 3, DEFAULT-ON;
-    // `TCG_NO_X86_IMUL_FUSE` opts out). Folds a locally-dead 64-bit load into the
+    // Multi-instruction pass: RM fusion (X9 slice 3). Folds a locally-dead 64-bit load into the
     // multiply that is its only consumer (`ImulRM`/`ImulRMSib`). Runs after
     // the addr-chain fold so SIB-formed loads are already in their final
     // shape. See `imul_fuse_run_on_block` for the hand-proof.
-    if imul_fuse_enabled() {
-        for block_id in func.block_order.clone() {
-            if imul_fuse_run_on_block(func, block_id) {
-                changed = true;
-            }
+    for block_id in func.block_order.clone() {
+        if imul_fuse_run_on_block(func, block_id) {
+            changed = true;
         }
     }
 
@@ -207,16 +368,52 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // the two RM/MR families never race for one load, and after the
     // addr-chain fold so SIB shapes are final. See `rmw_fuse_run_on_block`
     // for the hand-proof.
+    // Same hoist as the rotate-var loop above: the whole-function maps are a
+    // pure function of `func` and `rmw_fuse_run_on_block_with_maps` mutates
+    // `func` only when it returns `true`, so one build serves every block up
+    // to the next fusion and is rebuilt the instant one fires — handing each
+    // block exactly the maps a per-block build would have produced.
     if rmw_fuse_enabled() {
+        let mut maps = RmwFuseFnMaps::build(func);
         for block_id in func.block_order.clone() {
-            if rmw_fuse_run_on_block(func, block_id, admit_reconstructed) {
+            if rmw_fuse_run_on_block_with_maps(
+                func,
+                block_id,
+                admit_reconstructed,
+                &maps,
+                rmw_fuse_sdef_enabled(),
+            ) {
                 changed = true;
+                maps = RmwFuseFnMaps::build(func);
             }
         }
     }
 
-    // Multi-instruction pass: latch-advance collapse (DEFAULT-ON;
-    // `TCG_NO_X86_LATCH_COLLAPSE` opts out). The frontend's counted-loop latch
+    // Whole-function VReg use/def counts, SHARED by the four passes below
+    // (latch-advance collapse, LEA-displacement fold, commute normalization,
+    // SIB-base LEA fold). Each used to build its own private copy at its own
+    // entry, and `function_use_def_counts` is an O(instructions x operands)
+    // hashing scan: measured 2026-08-31 at 2400 functions, whole-function map
+    // building was the largest single item inside this pass, which is itself
+    // ~32% of x86_optimization.
+    //
+    // The sharing is EXACT, not approximate. `function_use_def_counts` is a
+    // pure function of `func`; each routine below reports mutation precisely by
+    // returning `true`; and the cache is cleared the moment one does. So every
+    // consumer still sees counts frozen at ITS OWN entry — which is what their
+    // side conditions are proved against (see
+    // `latch_advance_collapse_run_on_block`: "windows are matched against
+    // counts frozen at pass entry"). The rebuild is skipped only when `func` is
+    // provably the identical function the cached counts describe, so the edit
+    // sets, and therefore the emitted bytes, are unchanged.
+    //
+    // DISCIPLINE: a cached copy must never outlive an IR mutation. Anything
+    // added between here and the `drop` below that can rewrite `func` MUST
+    // clear `fn_counts` (the `drop` makes a later reader a compile error, not a
+    // silent stale read).
+    let mut fn_counts: Option<FnUseDefCounts> = None;
+
+    // Multi-instruction pass: latch-advance collapse. The frontend's counted-loop latch
     // `AddRI n,c,k ; MovRR c,n ; Cmp{RI,RR} n,… ; Jcc` advances through a
     // fresh vreg `n`, which regalloc must place in a SECOND register and the
     // AddRI->LEA bridge then spells as `lea k(c),n ; mov n,c ; cmp n,…` — two
@@ -227,28 +424,58 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // position before; the compare overwrites them before the Jcc either
     // way). Measured (hand-asm ablation, 2026-08-28): p1 latch -10.3%,
     // exact-parity with LLVM together with the commute pass below.
-    if latch_advance_collapse_enabled() {
-        let (uses, defs) = function_use_def_counts(func);
+    let counts: &FnUseDefCounts = fn_counts.get_or_insert_with(|| FnUseDefCounts::build(func));
+    let mut fired = false;
+    for block_id in func.block_order.clone() {
+        if latch_advance_collapse_run_on_block(
+            func,
+            block_id,
+            &counts.uses,
+            &counts.defs,
+            latch_advance_window_enabled(),
+        ) {
+            fired = true;
+        }
+    }
+    if fired {
+        changed = true;
+        fn_counts = None; // `func` mutated: the cached counts are stale.
+    }
+
+    // Two-address increment collapse: `Lea tmp,[base+disp] ; MovRR base,tmp` ->
+    // `AddRI base,base,disp`, wherever the flags are dead from the `lea` onward
+    // (`Lea` writes none, `AddRI` writes all — that condition IS the argument).
+    // The expansion exists because its emitter could not know the flags were
+    // dead; this pass can. DEFAULT-ON; `TCG_NO_X86_LEA_WRITEBACK` opts out.
+    if lea_writeback_collapse_enabled() {
+        let counts: &FnUseDefCounts = fn_counts.get_or_insert_with(|| FnUseDefCounts::build(func));
+        let mut fired = false;
         for block_id in func.block_order.clone() {
-            if latch_advance_collapse_run_on_block(func, block_id, &uses, &defs) {
-                changed = true;
+            if lea_writeback_collapse_run_on_block(func, block_id, counts) {
+                fired = true;
             }
+        }
+        if fired {
+            changed = true;
+            fn_counts = None; // `func` mutated: the cached counts are stale.
         }
     }
 
-    // Multi-instruction pass: LEA displacement fold (DEFAULT-ON;
-    // `TCG_NO_X86_LEA_DISP_FOLD` opts out). `LeaSib t,[b+i*s+d] ; AddRI x,t,k`
+    // Multi-instruction pass: LEA displacement fold. `LeaSib t,[b+i*s+d] ; AddRI x,t,k`
     // with `t` living only in this window folds to `LeaSib x,[b+i*s+(d+k)]` —
     // the p2_collatz `lea (%rcx,%rcx,2) ; add $1` chain becomes LLVM's single
     // `lea 1(%rcx,%rcx,2)`. Legal when the AddRI's flags are provably dead
     // (LEA writes none) and the folded displacement stays in i32.
-    if lea_disp_fold_enabled() {
-        let (uses, defs) = function_use_def_counts(func);
-        for block_id in func.block_order.clone() {
-            if lea_disp_fold_run_on_block(func, block_id, &uses, &defs) {
-                changed = true;
-            }
+    let counts: &FnUseDefCounts = fn_counts.get_or_insert_with(|| FnUseDefCounts::build(func));
+    let mut fired = false;
+    for block_id in func.block_order.clone() {
+        if lea_disp_fold_run_on_block(func, block_id, &counts.uses, &counts.defs) {
+            fired = true;
         }
+    }
+    if fired {
+        changed = true;
+        fn_counts = None; // `func` mutated: the cached counts are stale.
     }
 
     // Single-instruction pass: commutative dying-source-first normalization
@@ -263,17 +490,24 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // semantics- and proof-neutral (reconstruction re-checks the operand
     // wiring). Precedent: the saxpyq ImulRR operand swap (3ea43e17).
     if commute_dying_source_enabled() {
-        let (uses, defs) = function_use_def_counts(func);
+        let counts: &FnUseDefCounts = fn_counts.get_or_insert_with(|| FnUseDefCounts::build(func));
+        let mut fired = false;
         for block_id in func.block_order.clone() {
-            if commute_dying_source_run_on_block(func, block_id, &uses, &defs) {
-                changed = true;
+            if commute_dying_source_run_on_block(func, block_id, &counts.uses, &counts.defs) {
+                fired = true;
             }
+        }
+        if fired {
+            changed = true;
+            fn_counts = None; // `func` mutated: the cached counts are stale.
         }
     }
 
-    // SIB-base LEA fold (OPT-IN `TCG_X86_SIB_BASE_FOLD`): fold each stack-slot
-    // base-`Lea` into its already-formed indexed SIB memory operand, killing the
-    // redundant per-access `leaq -N(%rbp)`. See `sib_base_lea_fold`. NOTE: this
+    // SIB-base LEA fold (measured evidence in the comment above
+    // `sib_base_lea_fold`): fold each
+    // stack-slot base-`Lea` into its already-formed indexed SIB memory operand,
+    // killing the redundant per-access `leaq -N(%rbp)`. See
+    // `sib_base_lea_fold`. NOTE: this
     // runs in the mid-pipeline peephole (before cmov-swap), so on a swap-diamond
     // bench (b06) it changes the store addressing enough that cmov-swap's
     // recognizer no longer matches -> b06 keeps the fold's addressing but loses
@@ -281,7 +515,19 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // cmov-swap diamond). Scheduling it LATE (after cmov-swap) was tried and
     // REVERTED: the pass-manager fixpoint then converges to a state where the
     // fold never fires whenever cmov-swap is scheduled, making it a no-op.
-    changed |= sib_base_lea_fold(func);
+    //
+    // Takes the shared whole-function counts: `def_count`/`use_count` are the
+    // only maps it consults, so it no longer builds a private
+    // `SibFoldVRegMaps` whose `mention_blocks` half it never queried.
+    let counts: &FnUseDefCounts = fn_counts.get_or_insert_with(|| FnUseDefCounts::build(func));
+    if sib_base_lea_fold(func, counts) {
+        changed = true;
+    }
+    // Last consumer of the shared counts. Moving the cache out here retires it
+    // by construction: this fold may have rewritten `func`, and any future
+    // reader added below would now fail to compile (use after move) instead of
+    // silently reading counts that no longer describe the IR.
+    drop(fn_counts);
 
     // Multi-instruction pass: redundant self-zero-test elision (task #72
     // pass 2). `test v,v` / `cmp v,0` whose ZF is already established by the
@@ -289,7 +535,7 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // reader in the block needs only ZF (E/NE). OPT-IN via
     // `TCG_X86_TEST_ELIDE` for the staged rollout. See
     // `redundant_self_test_elision_run_on_block` for the side conditions.
-    if std::env::var_os("TCG_X86_TEST_ELIDE").is_some() {
+    if test_elide_enabled() {
         for block_id in func.block_order.clone() {
             if redundant_self_test_elision_run_on_block(func, block_id) {
                 changed = true;
@@ -297,8 +543,7 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
         }
     }
 
-    // Zero-idiom gate (DEFAULT-ON; `TCG_NO_X86_ZEROIDIOM_GATE` opts out):
-    // compute the function-wide use set once so the MovRI-0 -> XorRR rewrite
+    // Zero-idiom gate: compute the function-wide use set once so the MovRI-0 -> XorRR rewrite
     // can DECLINE on never-read destinations. Rationale: `XorRR d, d` puts d
     // in a formal USE position, which makes the (per-vreg, function-wide)
     // DCE use-set consider every def of that id live — in a post-unroll body
@@ -306,14 +551,7 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
     // store pairs. Leaving an unread zero as MovRI keeps it in DCE's
     // removable set. Declining a rewrite is a semantic no-op, so both error
     // directions of this predicate reduce to the status quo.
-    // DEFAULT-ON (both error directions reduce to the status quo);
-    // `TCG_NO_X86_ZEROIDIOM_GATE` is the forensic opt-out.
-    let zeroidiom_used: Option<std::collections::HashSet<VReg>> =
-        if std::env::var_os("TCG_NO_X86_ZEROIDIOM_GATE").is_none() {
-            Some(peephole_function_use_set(func))
-        } else {
-            None
-        };
+    let zeroidiom_used = peephole_function_use_set(func);
 
     for block_id in func.block_order.clone() {
         let Some(block) = func.blocks.get_mut(&block_id) else {
@@ -322,7 +560,12 @@ fn run_impl(func: &mut X86ISelFunction, admit_reconstructed: ReconstructionAdmit
 
         let mut index = 0;
         while index < block.insts.len() {
-            match simplify_inst_gated(&block.insts, index, zeroidiom_used.as_ref()) {
+            match simplify_inst_gated(
+                &block.insts,
+                index,
+                Some(&zeroidiom_used),
+                admit_constmul_shift,
+            ) {
                 Some(PeepholeEdit::Remove) => {
                     block.insts.remove(index);
                     changed = true;
@@ -438,12 +681,11 @@ fn cmp_setcc_branch_fusion_run_on_block(
         return false;
     };
     let insts = &block.insts;
-    let use_counts = vreg_uses_in_block(insts);
 
     let mut edits: Vec<CmpSetccBranchEdit> = Vec::new();
     let mut i = 0;
     while i + 2 < insts.len() {
-        if let Some(edit) = try_cmp_setcc_branch_fusion(insts, i, &use_counts) {
+        if let Some(edit) = try_cmp_setcc_branch_fusion(insts, i) {
             // Cross-block liveness guard: %D must not be read in any other
             // block (no live-out). We are erasing its only definition.
             let setcc_dst = edit.setcc_dst;
@@ -475,15 +717,6 @@ fn cmp_setcc_branch_fusion_run_on_block(
 
     if edits.is_empty() {
         return false;
-    }
-
-    if std::env::var_os("TRUST_CG_X86_CMP_BRANCH_FUSION_LOG").is_some() {
-        eprintln!(
-            "x86-cmp-setcc-branch-fusion: fired {} time(s) in function `{}` block #{:?}",
-            edits.len(),
-            func.name,
-            block_id.0,
-        );
     }
 
     let block = func.blocks.get_mut(&block_id).expect("block existed above");
@@ -526,7 +759,6 @@ struct CmpSetccBranchEdit {
 fn try_cmp_setcc_branch_fusion(
     insts: &[X86ISelInst],
     flag_writer_idx: usize,
-    use_counts: &std::collections::HashMap<VReg, u32>,
 ) -> Option<CmpSetccBranchEdit> {
     use trust_cg_ir::X86CondCode;
 
@@ -693,13 +925,12 @@ fn try_cmp_setcc_branch_fusion(
             }
         }
     }
-    // Defensive: confirm the use counts are consistent with the chain being
-    // fully internal to the window (no surprise extra readers we missed). The
-    // tail (read by the zero-test) is the only value that could plausibly be
-    // counted elsewhere; the escape scans above already rule that out, but we
-    // also assert each chain vreg is defined exactly once (by the inst that
-    // introduces it). `use_counts` is consulted only as a redundant guard.
-    let _ = use_counts;
+    // NOTE (2026-08-31): this matcher used to take a block-wide
+    // `HashMap<VReg, u32>` use-count map "as a redundant guard", but never
+    // read it — the window is proved internal by the in-block scan above plus
+    // the caller's cross-block escape scan. The parameter and the per-block
+    // `vreg_uses_in_block` build that existed only to feed it are gone; the
+    // side conditions and therefore the emitted bytes are unchanged.
 
     Some(CmpSetccBranchEdit {
         flag_writer_idx,
@@ -734,268 +965,6 @@ fn is_zero_test_of(inst: &X86ISelInst, vreg: VReg) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Setcc-flag-hoist (3-instruction multi-window rewrite)
-// ---------------------------------------------------------------------------
-//
-// Pattern (before):
-//   [flag_writer]            // e.g. CmpRR / TestRR / Ucomisd
-//   Setcc cc, %D
-//   Movzx  %D, %D            // ISel emits zero-extend of low byte to dword
-//
-// Pattern (after):
-//   XorRR  %D, %D            // hoisted clear; clobbers RFLAGS
-//   [flag_writer]            // re-establishes RFLAGS
-//   Setcc cc, %D             // writes low byte; high bits stay zero from xor
-//
-// HAND-PROOF (algebraic identity):
-//   - Setcc writes only %D[7:0]; high bits are left undefined per Intel SDM.
-//   - Movzx %D,%D zero-extends %D[7:0] to %D[31:0] (and zeros the upper 32
-//     bits via x86-64 32-bit-operand semantics).
-//   - In the rewritten form, xor sets all of %D to 0 *before* the flag_writer;
-//     the flag_writer does not touch %D (verified); the setcc then writes the
-//     low byte (cc ? 1 : 0). Result: %D == 0 or 1, with high bits zero, which
-//     equals the post-movzx value of the original sequence.
-//
-// SIDE CONDITIONS (each must hold or the rewrite is unsound):
-//   1. flag_writer fully writes RFLAGS (`x86_writes_flags` and a Full
-//      condition_flag_overwrite). This is what guarantees the Setcc reads the
-//      correct flags after we hoist the xor above flag_writer (the xor would
-//      otherwise leak its flags into the Setcc).
-//   2. flag_writer does NOT read or write %D. If it did, hoisting xor above
-//      flag_writer would change the inputs (read) or output (write) of
-//      flag_writer.
-//   3. %D is dead on entry to the window. Conservatively: %D does not appear
-//      as any operand of any instruction in the block before flag_writer.
-//      This is required because xor clobbers %D, so if some earlier read of
-//      %D had been live across, we would now read the cleared value.
-//   4. No instruction between flag_writer and the setcc writes flags. Both
-//      the original and the rewritten sequence rely on the setcc reading the
-//      flags produced by flag_writer; an intermediate flag-writer would break
-//      both forms (the original already misbehaves) - we refuse to fire to
-//      keep the pre/post equivalence symmetric and obvious.
-//   5. The setcc destination is single-use: only the movzx consumes it. If
-//      anything outside the window read %D[7:0] (the un-extended form), the
-//      rewrite would change observable behavior because the original kept
-//      high bits undefined whereas after the rewrite they are zero.
-//   6. Setcc and Movzx form the canonical ISel pair: same Gpr32 vreg, Movzx
-//      is an in-place zero-extend of %D into %D.
-//
-// PROOF PROVENANCE: this is a hand-proved peephole. CEGIS is not yet wired
-// up to x86, so we encode the proof in this
-// comment and gate the rewrite on the side conditions above. Each Setcc
-// and the hoisted XorRR inherit `proof_origin` from the consumed
-// flag_writer/Setcc, so DWARF/source-loc reporting still points at the
-// originating trust_ir instruction.
-
-fn setcc_hoist_run_on_block(
-    func: &mut X86ISelFunction,
-    block_id: trust_cg_lower::instructions::Block,
-) -> bool {
-    let Some(block) = func.blocks.get(&block_id) else {
-        return false;
-    };
-    let insts = &block.insts;
-
-    // Precompute %D operand counts across the entire block so that the
-    // single-use check (condition 5) is correct against any consumer in the
-    // same block. This is conservative: cross-block uses are not counted, so
-    // we additionally require %D to be defined inside this block by the
-    // Setcc (no live-out: any escape would have been visible to a downstream
-    // pass; if uncertain we just refuse).
-    let mut edits: Vec<SetccHoistEdit> = Vec::new();
-    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-    let use_counts = vreg_uses_in_block(insts);
-
-    let mut i = 0;
-    while i + 1 < insts.len() {
-        if consumed.contains(&i) {
-            i += 1;
-            continue;
-        }
-        if let Some(edit) = try_setcc_hoist(insts, i, &use_counts) {
-            consumed.insert(edit.flag_writer_idx);
-            consumed.insert(edit.setcc_idx);
-            consumed.insert(edit.movzx_idx);
-            // Advance past movzx so we don't try to also match the next window
-            // overlapping the just-rewritten one.
-            i = edit.movzx_idx + 1;
-            edits.push(edit);
-        } else {
-            i += 1;
-        }
-    }
-
-    if edits.is_empty() {
-        return false;
-    }
-
-    // Optional diagnostic: TRUST_CG_X86_SETCC_HOIST_LOG=1 prints how many
-    // windows fired per block. Kept off by default; harmless when unset.
-    if std::env::var_os("TRUST_CG_X86_SETCC_HOIST_LOG").is_some() {
-        eprintln!(
-            "x86-setcc-hoist: fired {} time(s) in function `{}` block #{:?}",
-            edits.len(),
-            func.name,
-            block_id.0,
-        );
-    }
-
-    // Apply edits in reverse order so that earlier indices remain valid.
-    let block = func.blocks.get_mut(&block_id).expect("block existed above");
-    for edit in edits.into_iter().rev() {
-        let flag_writer = block.insts[edit.flag_writer_idx].clone();
-        let setcc = block.insts[edit.setcc_idx].clone();
-        // Build the hoisted XorRR with proof_origin inherited from setcc
-        // (which itself carries the trust_ir Icmp/Fcmp origin in practice).
-        let mut xor = xorrr_zero(edit.dst);
-        xor.proof_origin = setcc.proof_origin.or(flag_writer.proof_origin);
-
-        // Remove movzx first (largest index).
-        block.insts.remove(edit.movzx_idx);
-        // The flag_writer..setcc range is unchanged. Insert xor just before
-        // flag_writer.
-        block.insts.insert(edit.flag_writer_idx, xor);
-    }
-
-    true
-}
-
-#[derive(Debug)]
-struct SetccHoistEdit {
-    flag_writer_idx: usize,
-    setcc_idx: usize,
-    movzx_idx: usize,
-    dst: VReg,
-}
-
-fn try_setcc_hoist(
-    insts: &[X86ISelInst],
-    flag_writer_idx: usize,
-    use_counts: &std::collections::HashMap<VReg, u32>,
-) -> Option<SetccHoistEdit> {
-    let flag_writer = insts.get(flag_writer_idx)?;
-
-    // Condition 1: flag_writer must fully write flags.
-    if !x86_writes_flags(flag_writer.opcode) {
-        return None;
-    }
-    if condition_flag_overwrite(flag_writer) != FlagOverwrite::Full {
-        return None;
-    }
-    // Flag-writer must be a "pure" flag producer: not a call/branch/return
-    // and not touching memory. Note: CmpRR/TestRR/Ucomisd are tagged with
-    // HAS_SIDE_EFFECTS (their side effect is writing RFLAGS), so we do not
-    // use `instruction_may_export_flags` here - we only refuse the more
-    // restrictive control-flow / memory cases.
-    let fw_flags = flag_writer.flags;
-    if fw_flags.is_call()
-        || fw_flags.is_branch()
-        || fw_flags.is_terminator()
-        || fw_flags.is_return()
-        || fw_flags.reads_memory()
-        || fw_flags.writes_memory()
-        || fw_flags.is_pseudo()
-    {
-        return None;
-    }
-
-    // Scan forward to find the Setcc; verify no intermediate flag writes
-    // (condition 4) and that the Setcc consumes flag_writer's flags.
-    let mut setcc_idx = None;
-    let mut j = flag_writer_idx + 1;
-    while j < insts.len() {
-        let cur = &insts[j];
-        if cur.opcode == X86Opcode::Setcc {
-            setcc_idx = Some(j);
-            break;
-        }
-        // Any intermediate flag write breaks the window (condition 4).
-        match condition_flag_overwrite(cur) {
-            FlagOverwrite::None => {}
-            FlagOverwrite::Partial | FlagOverwrite::Full => return None,
-        }
-        // Any intermediate flag read on a non-setcc opcode (jcc, cmovcc)
-        // means flag_writer's flags are consumed elsewhere; even if the
-        // window is otherwise valid, hoisting xor is unsound because the
-        // xor would clobber the flag input of those instructions in the
-        // unrewritten form, but here it's hoisted ABOVE flag_writer so
-        // they would still read flag_writer's output - safe. Skip the
-        // check but stop searching: the *first* Setcc, if any, is the one
-        // we care about; later setccs are out of scope.
-        if x86_reads_flags(cur.opcode) {
-            // A jcc here exports flags; bail.
-            return None;
-        }
-        j += 1;
-    }
-    let setcc_idx = setcc_idx?;
-    let movzx_idx = setcc_idx + 1;
-    if movzx_idx >= insts.len() {
-        return None;
-    }
-    let setcc = &insts[setcc_idx];
-    let movzx = &insts[movzx_idx];
-
-    // Condition 6: canonical ISel pair `Setcc %D, cc; Movzx %D, %D`.
-    if movzx.opcode != X86Opcode::Movzx {
-        return None;
-    }
-    let setcc_dst = match setcc.operands.as_slice() {
-        [X86ISelOperand::VReg(dst), X86ISelOperand::CondCode(_)] => *dst,
-        _ => return None,
-    };
-    // ISel emits Setcc into a Gpr32 vreg (the bool carrier). Restrict to that.
-    if setcc_dst.class != RegClass::Gpr32 {
-        return None;
-    }
-    match movzx.operands.as_slice() {
-        [X86ISelOperand::VReg(mdst), X86ISelOperand::VReg(msrc)]
-            if *mdst == setcc_dst && *msrc == setcc_dst => {}
-        _ => return None,
-    }
-
-    // Setcc's flags must match the default (no foreign side-effect bits).
-    if setcc.flags != X86Opcode::Setcc.default_flags() {
-        return None;
-    }
-    if movzx.flags != X86Opcode::Movzx.default_flags() {
-        return None;
-    }
-
-    // Condition 2: flag_writer must not read or write %D.
-    if instruction_mentions_vreg(flag_writer, setcc_dst) {
-        return None;
-    }
-
-    // Condition 3: %D must be dead on entry to the window. Conservative
-    // check: %D does not appear as any operand of any instruction in the
-    // block before flag_writer.
-    for prior in &insts[..flag_writer_idx] {
-        if instruction_mentions_vreg(prior, setcc_dst) {
-            return None;
-        }
-    }
-
-    // Condition 5: the Setcc destination is single-use in the block - only
-    // the Movzx consumes it. (The Setcc itself is the def, not a use.)
-    let total_uses = use_counts.get(&setcc_dst).copied().unwrap_or(0);
-    // Movzx contributes 2 mentions of %D in its operand list - dst and src -
-    // but only the src is a use. `vreg_uses_in_block` already filters dsts
-    // out (see helper). We expect exactly one use: the Movzx.
-    if total_uses != 1 {
-        return None;
-    }
-
-    Some(SetccHoistEdit {
-        flag_writer_idx,
-        setcc_idx,
-        movzx_idx,
-        dst: setcc_dst,
-    })
-}
-
 /// Returns true if `vreg` appears anywhere in `inst`'s operand list, either
 /// as a top-level VReg or inside a memory-addressing operand. Conservative:
 /// any mention counts.
@@ -1016,16 +985,69 @@ fn operand_mentions_vreg(op: &X86ISelOperand, vreg: VReg) -> bool {
     }
 }
 
-/// Per-block use-count of VRegs. The operand at position 0 of a two-operand
-/// or three-operand value-producing instruction is treated as a definition
-/// (not a use). This matches the convention used elsewhere in this pass:
-/// `Setcc %D, cc` defines %D, `Movzx %D, %D` defines the first %D and uses
-/// the second. We approximate this conservatively by treating every operand
-/// of a non-producing instruction as a use, and every non-first operand of
-/// a value-producing instruction as a use.
-/// Kill switch for the latch-advance collapse (any value disables).
-fn latch_advance_collapse_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_LATCH_COLLAPSE").is_none()
+/// True when `inst` mentions ANY width view of `v`'s register, in any operand
+/// position. Used by the latch-advance window scan, where a MISSED mention is
+/// fail-open (a reader of `c` before the write-back would observe the advanced
+/// value after the rewrite).
+fn inst_mentions_vreg_id(inst: &X86ISelInst, v: VReg) -> bool {
+    inst.operands
+        .iter()
+        .any(|op| operand_mentions_vreg_id(op, v))
+}
+
+fn operand_mentions_vreg_id(op: &X86ISelOperand, v: VReg) -> bool {
+    match op {
+        X86ISelOperand::VReg(x) => x.id == v.id,
+        X86ISelOperand::MemAddr { base, .. } => operand_mentions_vreg_id(base, v),
+        X86ISelOperand::SibMemAddr { base, index, .. } => {
+            operand_mentions_vreg_id(base, v) || operand_mentions_vreg_id(index, v)
+        }
+        _ => false,
+    }
+}
+
+/// True when `inst` may DEFINE any width view of `v`'s register, over the audited
+/// def-position table. Class-blind on the id, as everywhere else in this file.
+fn inst_defines_vreg_id_local(inst: &X86ISelInst, v: VReg) -> bool {
+    crate::effects::x86_may_defined_vregs(inst).any(|d| d.id == v.id)
+        || (crate::effects::x86_produces_value(inst.opcode)
+            && matches!(inst.operands.first(), Some(X86ISelOperand::VReg(d)) if d.id == v.id))
+}
+
+/// Whether the latch-advance collapse may reach ACROSS the loop's other carried
+/// copies (and accept the flag-neutral `Lea` spelling of the advance), rather
+/// than requiring the advance, write-back, compare and branch to be adjacent.
+///
+/// DEFAULT OFF, and the reason is measured rather than cautionary. Widened, it
+/// fires on 9 of the 18 `beat-llvm` programs and is a NET LOSS:
+///
+/// | program | new/old | in-batch control |
+/// | --- | ---: | ---: |
+/// | b1_mispredict | 0.9961 (0.39% faster) | 0.9993 |
+/// | h3_box_leak | **1.0173 (1.7% SLOWER)** | 0.9986 |
+/// | v3_popcount | 1.0028 | 0.9992 |
+/// | h1, h4, m2, p1, p5, p6 | neutral | |
+///
+/// So it buys 0.39% on the largest gap and costs 1.7% on h3_box_leak, which is
+/// itself one of the programs still above LLVM — removing an instruction from
+/// h3's loop made it slower, the same non-monotonicity this corpus has shown
+/// four other times. Correct and tested, but the global default stays as it was.
+/// `-Ztrust-ir-cg-args=x86-latch-window` opts in.
+fn latch_advance_window_enabled() -> bool {
+    if let Some(enabled) = LATCH_ADVANCE_WINDOW.get() {
+        return *enabled;
+    }
+    crate::tcg_env_flag("TCG_X86_LATCH_WINDOW")
+}
+
+static LATCH_ADVANCE_WINDOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the widened latch-advance window from a TRACKED compiler option.
+pub fn set_latch_advance_window_enabled(enabled: bool) -> bool {
+    match LATCH_ADVANCE_WINDOW.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => LATCH_ADVANCE_WINDOW.get() == Some(&requested),
+    }
 }
 
 /// The commutative dying-source-first swap is 🛑 REFUTED AS A DEFAULT and
@@ -1046,15 +1068,10 @@ fn commute_dying_source_enabled() -> bool {
 /// FUNCTION-WIDE use and def counts under [`vreg_uses_in_block`]'s exact
 /// def/use convention (operand 0 of a value-producing opcode is the def; its
 /// only reads are addressing base/index regs; every other operand is a use).
-fn function_use_def_counts(
-    func: &X86ISelFunction,
-) -> (
-    std::collections::HashMap<VReg, u32>,
-    std::collections::HashMap<VReg, u32>,
-) {
+fn function_use_def_counts(func: &X86ISelFunction) -> (FxHashMap<VReg, u32>, FxHashMap<VReg, u32>) {
     use crate::effects::x86_produces_value;
-    let mut uses = std::collections::HashMap::new();
-    let mut defs = std::collections::HashMap::new();
+    let mut uses = FxHashMap::default();
+    let mut defs = FxHashMap::default();
     for block in func.blocks.values() {
         for inst in &block.insts {
             let produces = x86_produces_value(inst.opcode);
@@ -1073,6 +1090,202 @@ fn function_use_def_counts(
     (uses, defs)
 }
 
+static TEST_ELIDE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the redundant self-test elision from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=x86-test-elide`). DEFAULT OFF.
+///
+/// The pass deletes a `test v,v` / `cmp v,0` whose ZF is already established by
+/// the nearest preceding ALU definition of `v`, when every downstream flag reader
+/// in the block needs only ZF. Its comment calls it opt-in "for the staged
+/// rollout" — i.e. pending measurement rather than refused — and the only lever
+/// was `TCG_X86_TEST_ELIDE`, which `trustc` refuses before the backend loads, so
+/// the staged rollout could not actually be measured through the bridge.
+pub fn set_test_elide_enabled(enabled: bool) -> bool {
+    match TEST_ELIDE_ENABLED.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => TEST_ELIDE_ENABLED.get() == Some(&requested),
+    }
+}
+
+fn test_elide_enabled() -> bool {
+    if let Some(enabled) = TEST_ELIDE_ENABLED.get() {
+        return *enabled;
+    }
+    crate::tcg_env_flag("TCG_X86_TEST_ELIDE")
+}
+
+static LEA_WRITEBACK_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the two-address increment collapse's opt-out from a TRACKED compiler
+/// option, once (`-Ztrust-ir-cg-args=no-x86-lea-writeback`). `true` disables it.
+///
+/// The environment fallback below is refused by `trustc`, so this setter is the
+/// only channel that can A/B the fold through the bridge.
+pub fn set_lea_writeback_disabled(disabled: bool) -> bool {
+    match LEA_WRITEBACK_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LEA_WRITEBACK_DISABLED.get() == Some(&requested),
+    }
+}
+
+fn lea_writeback_collapse_enabled() -> bool {
+    if let Some(disabled) = LEA_WRITEBACK_DISABLED.get() {
+        return !*disabled;
+    }
+    // Match tracked Boolean policy: an explicit zero does not opt out.
+    std::env::var_os("TCG_NO_X86_LEA_WRITEBACK")
+        .is_none_or(|value| value == std::ffi::OsStr::new("0"))
+}
+
+/// Collapse a two-address increment expansion: `Lea tmp, [base + disp]` followed
+/// immediately by `MovRR base, tmp` becomes `AddRI base, base, disp`.
+///
+/// # The shape
+///
+/// A source-level `x += k` on a value the register allocator keeps in `base`
+/// reaches the machine level as a non-destructive `lea` into a fresh vreg plus a
+/// copy back, because `lea` does not write flags and the expansion is
+/// flag-neutral by construction:
+///
+/// ```text
+///   lea  tmp, [base + 1]
+///   mov  base, tmp        ; write-back
+/// ```
+///
+/// Two instructions and a wasted register for what `add $1, base` does in one.
+/// Measured in `p2_collatz`'s inner loop, and present once or twice per hot loop
+/// in 11 of the 14 ported beat-llvm programs.
+///
+/// # Why the flag condition is the whole argument
+///
+/// `Lea` writes NO flags; `AddRI` writes all of them. So the rewrite is only
+/// sound where the flags are dead from the `lea`'s position onward, and
+/// [`sib_fold_flags_dead`] is what establishes that — it refuses on the first
+/// flag reader and on any control-flow or ABI boundary that could expose RFLAGS.
+/// This is exactly why the expansion exists in the first place: whoever emitted
+/// it could not know the flags were dead, and this pass can.
+///
+/// # Side conditions (any failure leaves both instructions alone)
+///
+/// * The two instructions are ADJACENT, so nothing between them can read `base`
+///   (which would see the pre-increment value the fold destroys) or redefine
+///   either register.
+/// * The `lea`'s address is `MemAddr { base: VReg, disp }` with `disp != 0`; a
+///   SIB form has a runtime index and is not an immediate add, and `disp == 0` is
+///   a plain copy for other passes to handle.
+/// * `tmp` is globally single-def and used EXACTLY once (by the write-back), so
+///   retiring it cannot change any other reader.
+/// * `base` and `tmp` are distinct 64-bit registers, and neither instruction
+///   carries a `proof_origin` or non-default flags.
+fn lea_writeback_collapse_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    counts: &FnUseDefCounts,
+) -> bool {
+    let Some(block) = func.blocks.get(&block_id) else {
+        return false;
+    };
+    let insts = block.insts.clone();
+    // (lea index, base vreg, displacement)
+    let mut edits: Vec<(usize, VReg, i64)> = Vec::new();
+
+    for idx in 0..insts.len().saturating_sub(1) {
+        let lea = &insts[idx];
+        let mov = &insts[idx + 1];
+        if mov.opcode != X86Opcode::MovRR {
+            continue;
+        }
+        if !matches!(lea.opcode, X86Opcode::Lea | X86Opcode::AddRI) {
+            continue;
+        }
+        if lea.proof_origin.is_some() || mov.proof_origin.is_some() {
+            continue;
+        }
+        if lea.flags != lea.opcode.default_flags() || mov.flags != mov.opcode.default_flags() {
+            continue;
+        }
+        // Two spellings of the same non-destructive increment reach here:
+        //
+        //   Lea   tmp, [base + disp]   -- flag-NEUTRAL, so folding to `AddRI`
+        //                                 introduces a flag write and needs the
+        //                                 flag-deadness proof below.
+        //   AddRI tmp, base, disp      -- already writes the flags, at the very
+        //                                 position the rewrite keeps them at and
+        //                                 with the identical result, so that
+        //                                 spelling needs NO flag condition.
+        let (tmp, base, disp) = match lea.opcode {
+            X86Opcode::Lea => {
+                let [
+                    X86ISelOperand::VReg(tmp),
+                    X86ISelOperand::MemAddr { base, disp },
+                ] = lea.operands.as_slice()
+                else {
+                    continue;
+                };
+                let X86ISelOperand::VReg(base) = base.as_ref() else {
+                    continue;
+                };
+                (*tmp, *base, i64::from(*disp))
+            }
+            _ => {
+                let [
+                    X86ISelOperand::VReg(tmp),
+                    X86ISelOperand::VReg(base),
+                    X86ISelOperand::Imm(imm),
+                ] = lea.operands.as_slice()
+                else {
+                    continue;
+                };
+                (*tmp, *base, *imm)
+            }
+        };
+        let (tmp, base) = (&tmp, &base);
+        if disp == 0 {
+            continue;
+        }
+        // The write-back must copy exactly this `tmp` into exactly this `base`.
+        let [X86ISelOperand::VReg(mov_dst), X86ISelOperand::VReg(mov_src)] =
+            mov.operands.as_slice()
+        else {
+            continue;
+        };
+        if mov_dst != base || mov_src != tmp || base == tmp {
+            continue;
+        }
+        if base.class != RegClass::Gpr64 || tmp.class != RegClass::Gpr64 {
+            continue;
+        }
+        if counts.def_count(*tmp) != 1 || counts.use_count(*tmp) != 1 {
+            continue;
+        }
+        // Only the `Lea` spelling introduces a flag write that was not there
+        // before; the `AddRI` spelling keeps the same write at the same place.
+        if lea.opcode == X86Opcode::Lea && !sib_fold_flags_dead(&insts, idx) {
+            continue;
+        }
+        edits.push((idx, *base, disp));
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+    let block = func.blocks.get_mut(&block_id).expect("block existed above");
+    // Descending so earlier indices stay valid as the write-backs are removed.
+    for (idx, base, disp) in edits.into_iter().rev() {
+        block.insts[idx] = X86ISelInst::new(
+            X86Opcode::AddRI,
+            vec![
+                X86ISelOperand::VReg(base),
+                X86ISelOperand::VReg(base),
+                X86ISelOperand::Imm(disp),
+            ],
+        );
+        block.insts.remove(idx + 1);
+    }
+    true
+}
+
 /// Latch-advance collapse: `AddRI n,c,k ; MovRR c,n ; Cmp{RI,RR} n,… ; Jcc`
 /// -> `AddRI c,c,k ; Cmp{RI,RR} c,… ; Jcc` when `n` is single-def and its
 /// ONLY uses are the write-back and the compare. Value-exact: the compare
@@ -1086,8 +1299,9 @@ fn function_use_def_counts(
 fn latch_advance_collapse_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
-    uses: &std::collections::HashMap<VReg, u32>,
-    defs: &std::collections::HashMap<VReg, u32>,
+    uses: &FxHashMap<VReg, u32>,
+    defs: &FxHashMap<VReg, u32>,
+    widened: bool,
 ) -> bool {
     let Some(block) = func.blocks.get_mut(&block_id) else {
         return false;
@@ -1096,65 +1310,157 @@ fn latch_advance_collapse_run_on_block(
     let mut changed = false;
     let mut i = 0;
     while i + 3 < insts.len() {
-        let matched = (|| -> Option<(VReg, VReg)> {
-            let [
-                X86ISelOperand::VReg(n),
-                X86ISelOperand::VReg(c),
-                X86ISelOperand::Imm(_),
-            ] = insts[i].operands.as_slice()
-            else {
-                return None;
+        let matched = (|| -> Option<(VReg, VReg, i64, usize, usize)> {
+            // The advance arrives in EITHER spelling. `AddRI n,c,k` already
+            // writes the flags at the position the rewrite keeps them at, so it
+            // needs no flag condition. `Lea n,[c+k]` is flag-NEUTRAL, so folding
+            // it to `AddRI` INTRODUCES a flag write — discharged by the window
+            // itself: the matched `Cmp` overwrites the flags before the matched
+            // `Jcc` reads them, and the scan below admits no flag reader in
+            // between.
+            let (n, c, k) = match (insts[i].opcode, insts[i].operands.as_slice()) {
+                (
+                    X86Opcode::AddRI,
+                    [
+                        X86ISelOperand::VReg(n),
+                        X86ISelOperand::VReg(c),
+                        X86ISelOperand::Imm(k),
+                    ],
+                ) => (*n, *c, *k),
+                (
+                    X86Opcode::Lea,
+                    [
+                        X86ISelOperand::VReg(n),
+                        X86ISelOperand::MemAddr { base, disp },
+                    ],
+                ) if widened => match base.as_ref() {
+                    X86ISelOperand::VReg(c) => (*n, *c, i64::from(*disp)),
+                    _ => return None,
+                },
+                _ => return None,
             };
-            if insts[i].opcode != X86Opcode::AddRI || n == c || n.class != c.class {
+            if n == c || n.class != c.class || n.class != RegClass::Gpr64 {
                 return None;
             }
-            let (n, c) = (*n, *c);
-            if insts[i + 1].opcode != X86Opcode::MovRR {
+            // Only the `Lea` spelling INTRODUCES a flag write at the advance's
+            // position (`AddRI` already wrote the flags there, unchanged by the
+            // rewrite). That distinction is what scan (1) below needs.
+            let advance_introduces_flag_write = insts[i].opcode == X86Opcode::Lea;
+            if insts[i].proof_origin.is_some() || insts[i].flags != insts[i].opcode.default_flags()
+            {
                 return None;
             }
-            let [X86ISelOperand::VReg(wc), X86ISelOperand::VReg(wn)] =
-                insts[i + 1].operands.as_slice()
-            else {
-                return None;
-            };
-            if *wc != c || *wn != n {
-                return None;
-            }
-            let cmp_reads_n = match (insts[i + 2].opcode, insts[i + 2].operands.as_slice()) {
-                (X86Opcode::CmpRI, [X86ISelOperand::VReg(a), X86ISelOperand::Imm(_)]) => *a == n,
-                (X86Opcode::CmpRR, [X86ISelOperand::VReg(a), X86ISelOperand::VReg(b)]) => {
-                    *a == n && *b != n && *b != c
-                }
-                _ => false,
-            };
-            if !cmp_reads_n || insts[i + 3].opcode != X86Opcode::Jcc {
-                return None;
-            }
-            // `n` exists ONLY inside this window: one def (the AddRI), two
+            // `n` exists ONLY inside this window: one def (the advance), two
             // uses (the write-back and the compare).
             if defs.get(&n).copied().unwrap_or(0) != 1 || uses.get(&n).copied().unwrap_or(0) != 2 {
                 return None;
             }
-            Some((n, c))
+
+            // The write-back and the compare NEED NOT BE ADJACENT to the advance.
+            // The ISel interleaves the loop's OTHER carried copies between them —
+            // b1_mispredict's latch is
+            //   AddRI n,c,1 ; MovRR v11,v29 ; MovRR c,n ; MovRR v10,v107 ; CmpRI n,K ; Jcc
+            // so an adjacency-only matcher declined it. Search forward instead,
+            // with exactly the two scans the rewrite needs.
+            // Off: the original strict-adjacency window (the write-back at i+1,
+            // the compare at i+2, the Jcc at i+3). On: search forward up to 12.
+            let limit = if widened {
+                (i + 12).min(insts.len())
+            } else {
+                (i + 4).min(insts.len())
+            };
+
+            // (1) Find the write-back `MovRR c,n`. Between the advance and it,
+            //     NOTHING may mention `c`: after the rewrite `c` is clobbered at
+            //     the advance, so a reader in that range would see the ADVANCED
+            //     value instead of the old one.
+            let mut w = None;
+            for (j, inst) in insts.iter().enumerate().take(limit).skip(i + 1) {
+                if inst.opcode == X86Opcode::MovRR
+                    && inst.operands.as_slice()
+                        == [X86ISelOperand::VReg(c), X86ISelOperand::VReg(n)].as_slice()
+                    && inst.proof_origin.is_none()
+                {
+                    w = Some(j);
+                    break;
+                }
+                if inst_mentions_vreg_id(inst, c) || inst_mentions_vreg_id(inst, n) {
+                    return None;
+                }
+                // ⚑ SOUNDNESS, and it only bites once `widened` admits the `Lea`
+                // spelling: rewriting a flag-NEUTRAL `Lea` to `AddRI` makes
+                // position `i` a flag WRITER. A flag reader between the advance
+                // and the write-back would then read the advance's flags instead
+                // of the ones live-in to `i`. Scan (2) already refuses a flag
+                // reader on its own stretch; this stretch is empty in the strict
+                // window (`w == i + 1`) and up to 11 instructions long in the
+                // widened one, which is why the check was not needed before.
+                if advance_introduces_flag_write && x86_reads_flags(inst.opcode) {
+                    return None;
+                }
+            }
+            let w = w?;
+            if !widened && w != i + 1 {
+                return None;
+            }
+
+            // (2) Find `Cmp n,_` with its `Jcc` immediately after. Between the
+            //     write-back and it, nothing may DEFINE `c` or `n` (the compare
+            //     is rewritten to read `c`, so it must still hold the advanced
+            //     value) and nothing may read the flags (the advance's flag write
+            //     stays where it is, but the compare must remain the reader the
+            //     `Jcc` sees).
+            let mut m = None;
+            for j in (w + 1)..limit.saturating_sub(1) {
+                let inst = &insts[j];
+                let reads_n = match (inst.opcode, inst.operands.as_slice()) {
+                    (X86Opcode::CmpRI, [X86ISelOperand::VReg(a), X86ISelOperand::Imm(_)]) => {
+                        *a == n
+                    }
+                    (X86Opcode::CmpRR, [X86ISelOperand::VReg(a), X86ISelOperand::VReg(b)]) => {
+                        *a == n && *b != n && *b != c
+                    }
+                    _ => false,
+                };
+                if reads_n && insts[j + 1].opcode == X86Opcode::Jcc && inst.proof_origin.is_none() {
+                    m = Some(j);
+                    break;
+                }
+                if inst_defines_vreg_id_local(inst, c)
+                    || inst_defines_vreg_id_local(inst, n)
+                    || x86_reads_flags(inst.opcode)
+                {
+                    return None;
+                }
+            }
+            let m = m?;
+            if !widened && m != i + 2 {
+                return None;
+            }
+            Some((n, c, k, w, m))
         })();
-        if let Some((_n, c)) = matched {
-            insts[i].operands[0] = X86ISelOperand::VReg(c);
-            if let X86ISelOperand::VReg(a) = &mut insts[i + 2].operands[0] {
+        if let Some((_n, c, k, w, m)) = matched {
+            // Rebuild as the in-place `AddRI c,c,k` regardless of the matched
+            // spelling, rewrite the compare to read `c`, and drop the write-back.
+            insts[i] = X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![
+                    X86ISelOperand::VReg(c),
+                    X86ISelOperand::VReg(c),
+                    X86ISelOperand::Imm(k),
+                ],
+            );
+            if let X86ISelOperand::VReg(a) = &mut insts[m].operands[0] {
                 *a = c;
             }
-            insts.remove(i + 1);
+            insts.remove(w);
             changed = true;
-            i += 3; // past the rewritten AddRI/Cmp/Jcc
+            i = m; // past the rewritten compare (indices shifted down by one)
         } else {
             i += 1;
         }
     }
     changed
-}
-
-/// Kill switch for the LEA displacement fold (any value disables).
-fn lea_disp_fold_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_LEA_DISP_FOLD").is_none()
 }
 
 /// `LeaSib t,[b+i*s+d] ; AddRI x,t,k` -> `LeaSib x,[b+i*s+(d+k)]` when `t`
@@ -1167,8 +1473,8 @@ fn lea_disp_fold_enabled() -> bool {
 fn lea_disp_fold_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
-    uses: &std::collections::HashMap<VReg, u32>,
-    defs: &std::collections::HashMap<VReg, u32>,
+    uses: &FxHashMap<VReg, u32>,
+    defs: &FxHashMap<VReg, u32>,
 ) -> bool {
     let Some(block) = func.blocks.get_mut(&block_id) else {
         return false;
@@ -1237,8 +1543,8 @@ fn lea_disp_fold_run_on_block(
 fn commute_dying_source_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
-    uses: &std::collections::HashMap<VReg, u32>,
-    defs: &std::collections::HashMap<VReg, u32>,
+    uses: &FxHashMap<VReg, u32>,
+    defs: &FxHashMap<VReg, u32>,
 ) -> bool {
     let Some(block) = func.blocks.get_mut(&block_id) else {
         return false;
@@ -1278,9 +1584,9 @@ fn commute_dying_source_run_on_block(
     changed
 }
 
-fn vreg_uses_in_block(insts: &[X86ISelInst]) -> std::collections::HashMap<VReg, u32> {
+fn vreg_uses_in_block(insts: &[X86ISelInst]) -> FxHashMap<VReg, u32> {
     use crate::effects::x86_produces_value;
-    let mut counts = std::collections::HashMap::new();
+    let mut counts = FxHashMap::default();
     for inst in insts {
         let produces = x86_produces_value(inst.opcode);
         for (idx, op) in inst.operands.iter().enumerate() {
@@ -1301,7 +1607,7 @@ fn vreg_uses_in_block(insts: &[X86ISelInst]) -> std::collections::HashMap<VReg, 
     counts
 }
 
-fn count_operand_uses(op: &X86ISelOperand, counts: &mut std::collections::HashMap<VReg, u32>) {
+fn count_operand_uses(op: &X86ISelOperand, counts: &mut FxHashMap<VReg, u32>) {
     match op {
         X86ISelOperand::VReg(v) => {
             *counts.entry(*v).or_insert(0) += 1;
@@ -1315,7 +1621,7 @@ fn count_operand_uses(op: &X86ISelOperand, counts: &mut std::collections::HashMa
     }
 }
 
-fn count_addressing_uses(op: &X86ISelOperand, counts: &mut std::collections::HashMap<VReg, u32>) {
+fn count_addressing_uses(op: &X86ISelOperand, counts: &mut FxHashMap<VReg, u32>) {
     match op {
         X86ISelOperand::MemAddr { base, .. } => count_operand_uses(base, counts),
         X86ISelOperand::SibMemAddr { base, index, .. } => {
@@ -1463,7 +1769,7 @@ fn flags_barrier_for_cfg_scan(inst: &X86ISelInst) -> bool {
 ///
 /// A backward fixpoint over the CFG. Per block the local answer is the FIRST
 /// flag-relevant instruction: a reader (or a possible flag export, e.g. a call)
-/// means live, a writer means dead, and a block with neither passes the
+/// means live, a full overwrite means dead, and a block with neither passes the
 /// question through to its successors. A block with no successors is dead —
 /// flags are not observable across a return.
 ///
@@ -1476,20 +1782,19 @@ fn flags_barrier_for_cfg_scan(inst: &X86ISelInst) -> bool {
 /// programs.
 fn flags_live_in_by_block(
     func: &X86ISelFunction,
-) -> std::collections::HashMap<trust_cg_lower::instructions::Block, bool> {
+) -> FxHashMap<trust_cg_lower::instructions::Block, bool> {
     let local_answer = |b: &trust_cg_lower::X86ISelBlock| -> Option<bool> {
         b.insts.iter().find_map(|inst| {
             if x86_reads_flags(inst.opcode) || flags_barrier_for_cfg_scan(inst) {
                 Some(true)
-            } else if x86_writes_flags(inst.opcode) {
+            } else if condition_flag_overwrite(inst) == FlagOverwrite::Full {
                 Some(false)
             } else {
                 None
             }
         })
     };
-    let mut live: std::collections::HashMap<_, bool> =
-        func.blocks.keys().map(|b| (*b, false)).collect();
+    let mut live: FxHashMap<_, bool> = func.blocks.keys().map(|b| (*b, false)).collect();
     // Monotone in `live`, so this terminates; bounded anyway for safety.
     for _ in 0..=func.blocks.len() {
         let mut changed = false;
@@ -1518,7 +1823,7 @@ fn flags_live_in_by_block(
 /// [`flags_live_in_by_block`] for the fall-off-the-end case.
 fn flags_dead_at(
     func: &X86ISelFunction,
-    live_in: &std::collections::HashMap<trust_cg_lower::instructions::Block, bool>,
+    live_in: &FxHashMap<trust_cg_lower::instructions::Block, bool>,
     block_id: trust_cg_lower::instructions::Block,
     index: usize,
 ) -> bool {
@@ -1529,7 +1834,7 @@ fn flags_dead_at(
         if x86_reads_flags(inst.opcode) || flags_barrier_for_cfg_scan(inst) {
             return false;
         }
-        if x86_writes_flags(inst.opcode) {
+        if condition_flag_overwrite(inst) == FlagOverwrite::Full {
             return true;
         }
     }
@@ -1570,17 +1875,13 @@ fn flags_dead_at(
 fn rotate_idiom_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
-    live_in: &std::collections::HashMap<trust_cg_lower::instructions::Block, bool>,
+    live_in: &FxHashMap<trust_cg_lower::instructions::Block, bool>,
 ) -> bool {
-    if std::env::var_os("TCG_NO_X86_ROTATE_IDIOM").is_some() {
-        return false;
-    }
     let Some(block) = func.blocks.get(&block_id) else {
         return false;
     };
     let insts = &block.insts;
     let use_counts = vreg_uses_in_block(insts);
-    let trace = std::env::var_os("TCG_ROL_TRACE").is_some();
     // (or_index, dst, src, amount, shl_index, shr_index)
     let mut edits: Vec<(usize, VReg, VReg, i64, usize, usize)> = Vec::new();
 
@@ -1640,9 +1941,6 @@ fn rotate_idiom_run_on_block(
             || use_counts.get(a).copied().unwrap_or(0) != 1
             || use_counts.get(b).copied().unwrap_or(0) != 1
         {
-            if trace {
-                eprintln!("ROL reject @{i}: def/use counts");
-            }
             continue;
         }
         let first_shift = shl_at.min(shr_at);
@@ -1650,29 +1948,10 @@ fn rotate_idiom_run_on_block(
             crate::effects::x86_produces_value(between.opcode)
                 && matches!(between.operands.first(), Some(X86ISelOperand::VReg(v)) if *v == shl_src)
         }) {
-            if trace {
-                eprintln!("ROL reject @{i}: source redefined");
-            }
             continue;
         }
         if !flags_dead_at(func, live_in, block_id, i) {
-            if trace {
-                let after: Vec<_> = insts[i + 1..].iter().map(|x| x.opcode).collect();
-                let succ_head: Vec<_> = block
-                    .successors
-                    .first()
-                    .and_then(|s| func.blocks.get(s))
-                    .map(|sb| sb.insts.iter().take(6).map(|x| x.opcode).collect())
-                    .unwrap_or_default();
-                eprintln!(
-                    "ROL reject @{i}: flags live; after={after:?} succs={:?} succ_head={succ_head:?}",
-                    block.successors
-                );
-            }
             continue;
-        }
-        if trace {
-            eprintln!("ROL ACCEPT @{i}: rol {k} (w={width})");
         }
         edits.push((i, *d, shl_src, k, shl_at, shr_at));
     }
@@ -1725,12 +2004,9 @@ fn rotate_var_idiom_enabled() -> bool {
 /// the whole instruction so the low-6 chain walk can enforce default flags
 /// and no `proof_origin` on every link it crosses (fail-closed hardening the
 /// opcode/operands pair cannot express).
-fn rotate_var_single_def_insts(
-    func: &X86ISelFunction,
-) -> std::collections::HashMap<u32, X86ISelInst> {
+fn rotate_var_single_def_insts(func: &X86ISelFunction) -> FxHashMap<u32, X86ISelInst> {
     use crate::effects::x86_produces_value;
-    let mut sites: std::collections::HashMap<u32, Option<X86ISelInst>> =
-        std::collections::HashMap::new();
+    let mut sites: FxHashMap<u32, Option<X86ISelInst>> = FxHashMap::default();
     for block in func.blocks.values() {
         for inst in &block.insts {
             if !x86_produces_value(inst.opcode) {
@@ -1754,16 +2030,35 @@ fn rotate_var_single_def_insts(
         .collect()
 }
 
+/// The whole-function facts the variable-rotate matcher consults: the
+/// single-def instruction index and the function-wide use/def counts. A PURE
+/// function of `func`, so one build is valid for as long as `func` is
+/// unchanged — see [`rotate_var_idiom_run_on_block_with_maps`].
+struct RotateVarFnMaps {
+    sites: FxHashMap<u32, X86ISelInst>,
+    fn_uses: FxHashMap<VReg, u32>,
+    fn_defs: FxHashMap<VReg, u32>,
+}
+
+impl RotateVarFnMaps {
+    fn build(func: &X86ISelFunction) -> Self {
+        let sites = rotate_var_single_def_insts(func);
+        let (fn_uses, fn_defs) = function_use_def_counts(func);
+        RotateVarFnMaps {
+            sites,
+            fn_uses,
+            fn_defs,
+        }
+    }
+}
+
 /// Chase `v` through single-def plain `MovRR` copies to a single-def `MovRI`
 /// root, returning the immediate — the same soundness argument as
 /// `fold_unique_const_into_imm_forms`' copy chase: a single-def vreg has one
 /// static value assignment, so any read that observes a defined value
 /// observes exactly the root immediate. Fail-closed on any non-default-flags
 /// or proof-tagged link.
-fn rotate_var_const_of(
-    sites: &std::collections::HashMap<u32, X86ISelInst>,
-    v: VReg,
-) -> Option<i64> {
+fn rotate_var_const_of(sites: &FxHashMap<u32, X86ISelInst>, v: VReg) -> Option<i64> {
     let mut v = v;
     for _ in 0..16 {
         let inst = sites.get(&v.id)?;
@@ -1792,10 +2087,7 @@ fn rotate_var_const_of(
 ///
 /// Anything else — including a non-default-flags or proof-tagged def — is not
 /// a link and stops the walk (fail-closed).
-fn rotate_var_low6_link(
-    sites: &std::collections::HashMap<u32, X86ISelInst>,
-    inst: &X86ISelInst,
-) -> Option<VReg> {
+fn rotate_var_low6_link(sites: &FxHashMap<u32, X86ISelInst>, inst: &X86ISelInst) -> Option<VReg> {
     if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
         return None;
     }
@@ -1843,10 +2135,7 @@ fn rotate_var_low6_link(
 ///   machine model `encode_rol_rcl_masked` proves exactly this), so any
 ///   low-6-equal feed is exact; choosing the deepest one lets DCE kill the
 ///   whole masking chain (the p6 [1]-[6] chain).
-fn rotate_var_low6_walk(
-    sites: &std::collections::HashMap<u32, X86ISelInst>,
-    start: VReg,
-) -> (VReg, VReg) {
+fn rotate_var_low6_walk(sites: &FxHashMap<u32, X86ISelInst>, start: VReg) -> (VReg, VReg) {
     let mut v = start;
     let mut feed = start;
     for _ in 0..16 {
@@ -1950,16 +2239,24 @@ fn rotate_var_window_ok(inst: &X86ISelInst) -> bool {
 /// when `admit(RolRCl)` — the injected, memoized
 /// `reconstruction_discharges_valid` callback. No admission, no rewrite; the
 /// (itself proof-covered) generic expansion stays.
-fn rotate_var_idiom_run_on_block(
+fn rotate_var_idiom_run_on_block_with_maps(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
-    live_in: &std::collections::HashMap<trust_cg_lower::instructions::Block, bool>,
+    live_in: &FxHashMap<trust_cg_lower::instructions::Block, bool>,
     admit: ReconstructionAdmit,
+    // Whole-function facts for the CURRENT state of `func`, owned by the
+    // caller. This routine mutates `func` ONLY when it returns `true` (see
+    // the `edits.is_empty()` early return below), so the caller may reuse one
+    // build across consecutive blocks that collapsed nothing and rebuild the
+    // instant one does — which is exactly what a per-block build would have
+    // produced, and is what keeps the emitted bytes identical.
+    maps: &RotateVarFnMaps,
 ) -> bool {
     use trust_cg_ir::x86_64_regs::RCX;
 
-    let sites = rotate_var_single_def_insts(func);
-    let (fn_uses, fn_defs) = function_use_def_counts(func);
+    let sites = &maps.sites;
+    let fn_uses = &maps.fn_uses;
+    let fn_defs = &maps.fn_defs;
     // Shared reborrow for the whole MATCH phase (the closure below needs the
     // function for `flags_dead_at` while `insts` is borrowed); the mutable
     // APPLY phase begins only after both borrows end.
@@ -1978,7 +2275,7 @@ fn rotate_var_idiom_run_on_block(
         doomed: Vec<usize>, // shl, shr, second CL mov, in-block neg/compl defs
     }
     let mut edits: Vec<Edit> = Vec::new();
-    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut consumed: FxHashSet<usize> = FxHashSet::default();
 
     let clean = |w: &X86ISelInst| w.proof_origin.is_none() && w.flags == w.opcode.default_flags();
     let single_def_single_use = |v: VReg| {
@@ -2098,13 +2395,13 @@ fn rotate_var_idiom_run_on_block(
             else {
                 return None;
             };
-            if rotate_var_const_of(&sites, *z) != Some(0) {
+            if rotate_var_const_of(sites, *z) != Some(0) {
                 return None;
             }
             // Count equality: the CL feed and the complement input must chase
             // to the SAME <=1-def root through low-6-preserving links.
-            let (root_cl, feed) = rotate_var_low6_walk(&sites, f1);
-            let (root_e, _) = rotate_var_low6_walk(&sites, *e);
+            let (root_cl, feed) = rotate_var_low6_walk(sites, f1);
+            let (root_e, _) = rotate_var_low6_walk(sites, *e);
             if root_cl != root_e || fn_defs.get(&root_cl).copied().unwrap_or(0) > 1 {
                 return None;
             }
@@ -2232,6 +2529,20 @@ fn rotate_var_idiom_run_on_block(
     true
 }
 
+/// Build the whole-function maps and collapse one block. Equivalent to
+/// [`rotate_var_idiom_run_on_block_with_maps`] with a freshly built map set;
+/// kept for the unit tests, which exercise one block of a fixed function.
+#[cfg(test)]
+fn rotate_var_idiom_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    live_in: &FxHashMap<trust_cg_lower::instructions::Block, bool>,
+    admit: ReconstructionAdmit,
+) -> bool {
+    let maps = RotateVarFnMaps::build(func);
+    rotate_var_idiom_run_on_block_with_maps(func, block_id, live_in, admit, &maps)
+}
+
 fn and_pow2_bt_branch_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
@@ -2241,12 +2552,8 @@ fn and_pow2_bt_branch_run_on_block(
     };
     let insts = &block.insts;
 
-    // Precompute %dst use counts across the entire block. Kept for symmetry
-    // with the setcc-hoist pass; not consulted by the current side conditions.
-    let use_counts = vreg_uses_in_block(insts);
-
     let mut edits: Vec<AndPow2BtEdit> = Vec::new();
-    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut consumed: FxHashSet<usize> = FxHashSet::default();
 
     let mut i = 0;
     while i + 2 < insts.len() {
@@ -2254,7 +2561,7 @@ fn and_pow2_bt_branch_run_on_block(
             i += 1;
             continue;
         }
-        if let Some(edit) = try_and_pow2_bt_branch(insts, i, &use_counts) {
+        if let Some(edit) = try_and_pow2_bt_branch(insts, i) {
             // Cross-block liveness guard: refuse if %and_dst is mentioned in
             // any other block of the function. This is conservative but
             // correct - the rewrite erases the AND's write-back, so any
@@ -2298,17 +2605,6 @@ fn and_pow2_bt_branch_run_on_block(
 
     if edits.is_empty() {
         return false;
-    }
-
-    // Optional diagnostic: TRUST_CG_X86_BT_BRANCH_LOG=1 prints how many windows
-    // fired per block. Off by default; harmless when unset.
-    if std::env::var_os("TRUST_CG_X86_BT_BRANCH_LOG").is_some() {
-        eprintln!(
-            "x86-and-pow2-bt-branch: fired {} time(s) in function `{}` block #{:?}",
-            edits.len(),
-            func.name,
-            block_id.0,
-        );
     }
 
     // Apply edits in reverse order so earlier indices remain valid.
@@ -2361,11 +2657,7 @@ struct AndPow2BtEdit {
     target: trust_cg_lower::instructions::Block,
 }
 
-fn try_and_pow2_bt_branch(
-    insts: &[X86ISelInst],
-    and_idx: usize,
-    use_counts: &std::collections::HashMap<VReg, u32>,
-) -> Option<AndPow2BtEdit> {
+fn try_and_pow2_bt_branch(insts: &[X86ISelInst], and_idx: usize) -> Option<AndPow2BtEdit> {
     use trust_cg_ir::X86CondCode;
 
     let and_inst = insts.get(and_idx)?;
@@ -2470,8 +2762,10 @@ fn try_and_pow2_bt_branch(
         _ => return None,
     };
 
-    // (e) intentionally elided - subsumed by (b) and (f).
-    let _ = use_counts;
+    // (e) intentionally elided - subsumed by (b) and (f). (This matcher used
+    // to take a block-wide use-count map for that condition and never read it;
+    // the parameter and the `vreg_uses_in_block` build that fed it were
+    // removed 2026-08-31 without touching any side condition.)
 
     // (f) AndRI's destination must be dead after the Jcc - no later block-local
     // instruction mentions %and_dst.
@@ -2510,8 +2804,8 @@ fn try_and_pow2_bt_branch(
 /// Function-wide vreg USE set for the zero-idiom gate (same convention as
 /// DCE's `collect_used_vregs`: operand 0 of a value producer is a def, not a
 /// use, except for tied first operands; addressing regs count).
-fn peephole_function_use_set(func: &X86ISelFunction) -> std::collections::HashSet<VReg> {
-    let mut used = std::collections::HashSet::new();
+fn peephole_function_use_set(func: &X86ISelFunction) -> FxHashSet<VReg> {
+    let mut used = FxHashSet::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -2561,10 +2855,7 @@ fn dce_style_first_operand_is_use(inst: &X86ISelInst) -> bool {
         && inst.operands.len() == 2)
 }
 
-fn collect_peephole_operand_vregs(
-    operand: &X86ISelOperand,
-    used: &mut std::collections::HashSet<VReg>,
-) {
+fn collect_peephole_operand_vregs(operand: &X86ISelOperand, used: &mut FxHashSet<VReg>) {
     match operand {
         X86ISelOperand::VReg(vreg) => {
             used.insert(*vreg);
@@ -2580,11 +2871,22 @@ fn collect_peephole_operand_vregs(
 
 #[cfg(test)]
 fn simplify_inst(insts: &[X86ISelInst], index: usize) -> Option<PeepholeEdit> {
-    simplify_inst_gated(insts, index, None)
+    // Fail-closed const-multiply admission, exactly like `X86Peephole::default`:
+    // the existing single-instruction tests must observe no behaviour change.
+    simplify_inst_gated(insts, index, None, |_, _, _| false)
+}
+
+/// [`simplify_inst`] with the const-multiply shift reduction ADMITTED — the
+/// in-test stand-in for the proof-backed callback wired in the codegen
+/// pipeline. Keeps the admission an explicit, visible argument at every call
+/// site instead of a global.
+#[cfg(test)]
+fn simplify_inst_constmul_admitted(insts: &[X86ISelInst], index: usize) -> Option<PeepholeEdit> {
+    simplify_inst_gated(insts, index, None, |_, _, _| true)
 }
 
 // ---------------------------------------------------------------------------
-// RM-fusion (X9 slice 3; DEFAULT-ON, `TCG_NO_X86_IMUL_FUSE` opts out)
+// RM-fusion (X9 slice 3)
 //
 //   MovRMSib t, [sib]        MovRR     d, a          (3-operand form; the
 //   ImulRR   d, a, t    ->   ImulRMSib d, [sib]       2-op tied `ImulRR d, t`
@@ -2633,17 +2935,48 @@ fn simplify_inst(insts: &[X86ISelInst], index: usize) -> Option<PeepholeEdit> {
 //      between). The redef scan is class-blind on the id (narrow-alias).
 // ---------------------------------------------------------------------------
 
-/// DEFAULT-ON (same 2026-07-20 record as the addr-chain fold);
-/// `TCG_NO_X86_IMUL_FUSE` is the forensic opt-out.
-fn imul_fuse_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_IMUL_FUSE").is_none()
+/// The `AddRR` arm of RM fusion's opt-out, set from a tracked compiler option.
+static ADD_FUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the `AddRR` arm of RM fusion's opt-out from a TRACKED compiler option
+/// (`-Ztrust-ir-cg-args=no-x86-add-fuse`). DEFAULT ON.
+pub fn set_add_fuse_disabled(disabled: bool) -> bool {
+    match ADD_FUSE.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => ADD_FUSE.get() == Some(&requested),
+    }
+}
+
+fn add_fuse_enabled() -> bool {
+    if let Some(disabled) = ADD_FUSE.get() {
+        return !*disabled;
+    }
+    !crate::tcg_env_flag("TCG_NO_X86_ADD_FUSE")
 }
 
 /// The load kinds the fusion accepts, mapped to their fused opcode. Every EA
 /// component must be a VReg — a PReg (or other) base/index would make
 /// condition E's redef scan vacuously pass over an address the pass cannot
 /// track (adversarial-review FAIL_CLOSED_GAP); refuse those shapes outright.
-fn imul_fuse_load_kind(inst: &X86ISelInst) -> Option<(VReg, X86ISelOperand, X86Opcode)> {
+/// The fused RM opcode for an `(anchor, load)` pair, or `None` when that
+/// combination has no RM form.
+///
+/// `ImulRR` has both a plain and a SIB RM form. `AddRR` has only the plain
+/// `AddRM` — there is no `AddRMSib` in the opcode set — so a SIB-formed load
+/// feeding an add is refused rather than mis-spelled.
+fn rm_fuse_opcode(anchor: X86Opcode, load: X86Opcode) -> Option<X86Opcode> {
+    match (anchor, load) {
+        (X86Opcode::ImulRR, X86Opcode::MovRM) => Some(X86Opcode::ImulRM),
+        (X86Opcode::ImulRR, X86Opcode::MovRMSib) => Some(X86Opcode::ImulRMSib),
+        (X86Opcode::AddRR, X86Opcode::MovRM) => Some(X86Opcode::AddRM),
+        _ => None,
+    }
+}
+
+fn imul_fuse_load_kind(
+    inst: &X86ISelInst,
+    anchor: X86Opcode,
+) -> Option<(VReg, X86ISelOperand, X86Opcode)> {
     if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
         return None;
     }
@@ -2656,7 +2989,11 @@ fn imul_fuse_load_kind(inst: &X86ISelInst) -> Option<(VReg, X86ISelOperand, X86O
                 && matches!(base.as_ref(), X86ISelOperand::VReg(b) if b.class == RegClass::Gpr64)
                 && matches!(index.as_ref(), X86ISelOperand::VReg(i) if i.class == RegClass::Gpr64) =>
             {
-                Some((*t, sib.clone(), X86Opcode::ImulRMSib))
+                Some((
+                    *t,
+                    sib.clone(),
+                    rm_fuse_opcode(anchor, X86Opcode::MovRMSib)?,
+                ))
             }
             _ => None,
         },
@@ -2667,7 +3004,7 @@ fn imul_fuse_load_kind(inst: &X86ISelInst) -> Option<(VReg, X86ISelOperand, X86O
             ] if t.class == RegClass::Gpr64
                 && matches!(base.as_ref(), X86ISelOperand::VReg(b) if b.class == RegClass::Gpr64) =>
             {
-                Some((*t, mem.clone(), X86Opcode::ImulRM))
+                Some((*t, mem.clone(), rm_fuse_opcode(anchor, X86Opcode::MovRM)?))
             }
             _ => None,
         },
@@ -2734,7 +3071,7 @@ fn imul_fuse_t_dead_after(insts: &[X86ISelInst], j: usize, t: VReg) -> bool {
         }
         // Any mention of the id (any class) in a USE position keeps it; an
         // operand-0 def of the same id at the same class ends the range.
-        let mut mentions = std::collections::HashSet::new();
+        let mut mentions = FxHashSet::default();
         for op in &w.operands {
             collect_operand_mentions_flat(op, &mut mentions);
         }
@@ -2749,7 +3086,7 @@ fn imul_fuse_t_dead_after(insts: &[X86ISelInst], j: usize, t: VReg) -> bool {
             {
                 return false;
             }
-            let mut src_mentions = std::collections::HashSet::new();
+            let mut src_mentions = FxHashSet::default();
             for op in w.operands.iter().skip(1) {
                 collect_operand_mentions_flat(op, &mut src_mentions);
             }
@@ -2763,7 +3100,7 @@ fn imul_fuse_t_dead_after(insts: &[X86ISelInst], j: usize, t: VReg) -> bool {
     false
 }
 
-fn collect_operand_mentions_flat(op: &X86ISelOperand, out: &mut std::collections::HashSet<VReg>) {
+fn collect_operand_mentions_flat(op: &X86ISelOperand, out: &mut FxHashSet<VReg>) {
     match op {
         X86ISelOperand::VReg(v) => {
             out.insert(*v);
@@ -2793,16 +3130,30 @@ fn imul_fuse_run_on_block(
         replacement: Vec<X86ISelInst>,
     }
     let mut fusions: Vec<Fusion> = Vec::new();
-    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut consumed: FxHashSet<usize> = FxHashSet::default();
 
     for j in 0..insts.len() {
         let anchor = &insts[j];
-        if anchor.opcode != X86Opcode::ImulRR
+        // ImulRR was the original anchor; AddRR is the same shape with the same
+        // commutativity and the same flag semantics (both write the full flag set
+        // at the position the fused op keeps them at), and `AddRM` is a
+        // first-class opcode — encoded, covered by the coverage gate, modelled by
+        // the post-RA flag dataflow, and carrying labelled addressing proofs. It
+        // was simply never CREATED by any peephole, which is why
+        // `h3_box_leak`'s `mov (%rax),%rcx ; add %rcx,%r14` stayed two
+        // instructions where LLVM emits one `add (%r11),%rdi`.
+        let anchor_ok = match anchor.opcode {
+            X86Opcode::ImulRR => true,
+            X86Opcode::AddRR => add_fuse_enabled(),
+            _ => false,
+        };
+        if !anchor_ok
             || anchor.proof_origin.is_some()
-            || anchor.flags != X86Opcode::ImulRR.default_flags()
+            || anchor.flags != anchor.opcode.default_flags()
         {
             continue;
         }
+        let anchor_opcode = anchor.opcode;
         let g64 = |r: &VReg| r.class == RegClass::Gpr64;
         // Decode the anchor form: (d, other_factor, t_candidates).
         let (d, factors): (VReg, Vec<VReg>) = match anchor.operands.as_slice() {
@@ -2840,7 +3191,8 @@ fn imul_fuse_run_on_block(
             if consumed.contains(&i) || consumed.contains(&j) {
                 continue;
             }
-            let Some((lt, mem, fused_opcode)) = imul_fuse_load_kind(&insts[i]) else {
+            let Some((lt, mem, fused_opcode)) = imul_fuse_load_kind(&insts[i], anchor_opcode)
+            else {
                 continue;
             };
             if lt != t {
@@ -2865,7 +3217,7 @@ fn imul_fuse_run_on_block(
                 if !imul_fuse_window_ok(w) {
                     continue 'factors;
                 }
-                let mut w_mentions = std::collections::HashSet::new();
+                let mut w_mentions = FxHashSet::default();
                 for op in &w.operands {
                     collect_operand_mentions_flat(op, &mut w_mentions);
                 }
@@ -2915,20 +3267,10 @@ fn imul_fuse_run_on_block(
         return false;
     }
 
-    if std::env::var_os("TCG_X86_IMUL_FUSE_LOG").is_some() {
-        eprintln!(
-            "x86-imul-fuse: fused {} load(s) in `{}` block #{:?}",
-            fusions.len(),
-            func.name,
-            block_id.0,
-        );
-    }
-
     // Rebuild the block: delete each load, splice each replacement at the
     // multiply's position.
-    let mut delete: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut replace: std::collections::HashMap<usize, Vec<X86ISelInst>> =
-        std::collections::HashMap::new();
+    let mut delete: FxHashSet<usize> = FxHashSet::default();
+    let mut replace: FxHashMap<usize, Vec<X86ISelInst>> = FxHashMap::default();
     for f in fusions {
         delete.insert(f.load_idx);
         replace.insert(f.imul_idx, f.replacement);
@@ -3033,8 +3375,57 @@ fn imul_fuse_run_on_block(
 /// DEFAULT-ON (same record as imul_fuse); `TCG_NO_X86_RMW_FUSE` is the
 /// forensic opt-out. Read through the lock-guarded process-env shim so the
 /// kill-switch test can override it without racing parallel test threads.
+static RMW_FUSE_SDEF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the opt-out for allowing a def of the fused instruction's REGISTER
+/// operand `s` inside the RMW fusion's W1 window
+/// (`-Ztrust-ir-cg-args=no-x86-rmw-fuse-sdef`). DEFAULT ON — see the condition's
+/// comment for why the old refusal was stricter than the rewrite needs.
+pub fn set_rmw_fuse_sdef_disabled(disabled: bool) -> bool {
+    match RMW_FUSE_SDEF.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => RMW_FUSE_SDEF.get() == Some(&requested),
+    }
+}
+
+fn rmw_fuse_sdef_enabled() -> bool {
+    if let Some(disabled) = RMW_FUSE_SDEF.get() {
+        return !*disabled;
+    }
+    !crate::tcg_env_flag("TCG_NO_X86_RMW_FUSE_SDEF")
+}
+
+static RMW_FUSE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the RMW-fusion decline trace (`-Ztrust-ir-cg-args=trace-x86-rmw-fuse`).
+/// Diagnostics only — no codegen effect.
+pub fn set_rmw_fuse_trace_enabled(enabled: bool) -> bool {
+    match RMW_FUSE_TRACE.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => RMW_FUSE_TRACE.get() == Some(&requested),
+    }
+}
+
+fn rmw_fuse_trace_enabled() -> bool {
+    RMW_FUSE_TRACE.get().copied().unwrap_or(false) || crate::tcg_env_flag("TCG_X86_RMW_FUSE_TRACE")
+}
+
+static RMW_FUSE_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the memory-destination RMW fusion's opt-out from a TRACKED compiler
+/// option, once (`-Ztrust-ir-cg-args=no-x86-rmw-fuse`). DEFAULT ON.
+/// `TCG_NO_X86_RMW_FUSE` remains the in-process channel for tests; `trustc`
+/// refuses it.
+pub fn set_rmw_fuse_disabled(disabled: bool) -> bool {
+    match RMW_FUSE_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => RMW_FUSE_DISABLED.get() == Some(&requested),
+    }
+}
+
 fn rmw_fuse_enabled() -> bool {
-    crate::env_lock::var_os("TCG_NO_X86_RMW_FUSE").is_none()
+    !RMW_FUSE_DISABLED.get().copied().unwrap_or(false)
+        && crate::env_lock::var_os("TCG_NO_X86_RMW_FUSE").is_none()
 }
 
 /// The load kinds the RMW fusion accepts, mapped to the REQUIRED same-family
@@ -3091,10 +3482,9 @@ fn rmw_fuse_load_kind(inst: &X86ISelInst) -> Option<(VReg, X86ISelOperand, X86Op
 /// caller enforces that temporal condition with [`rmw_fuse_ea_reg_ids`].
 fn rmw_fuse_single_def_sites(
     func: &X86ISelFunction,
-) -> std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)> {
+) -> FxHashMap<u32, (X86Opcode, Vec<X86ISelOperand>)> {
     use crate::effects::x86_produces_value;
-    let mut sites: std::collections::HashMap<u32, Option<(X86Opcode, Vec<X86ISelOperand>)>> =
-        std::collections::HashMap::new();
+    let mut sites: FxHashMap<u32, Option<(X86Opcode, Vec<X86ISelOperand>)>> = FxHashMap::default();
     for block in func.blocks.values() {
         for inst in &block.insts {
             if !x86_produces_value(inst.opcode) {
@@ -3118,13 +3508,35 @@ fn rmw_fuse_single_def_sites(
         .collect()
 }
 
+/// The whole-function facts the RMW matcher consults: the single-def site
+/// index and the function-wide use/def counts. A PURE function of `func`, so
+/// one build is valid for as long as `func` is unchanged — see
+/// [`rmw_fuse_run_on_block_with_maps`].
+struct RmwFuseFnMaps {
+    sites: FxHashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
+    fn_uses: FxHashMap<VReg, u32>,
+    fn_defs: FxHashMap<VReg, u32>,
+}
+
+impl RmwFuseFnMaps {
+    fn build(func: &X86ISelFunction) -> Self {
+        let sites = rmw_fuse_single_def_sites(func);
+        let (fn_uses, fn_defs) = function_use_def_counts(func);
+        RmwFuseFnMaps {
+            sites,
+            fn_uses,
+            fn_defs,
+        }
+    }
+}
+
 /// Canonicalize a SIB (index, scale) pair through single-def `MovRR` copy
 /// chains and single-def `ImulRRI x{2,4,8}` scale folds, returning the root
 /// id and the effective hardware scale. Fail-closed at every step: a
 /// multi-def link, a non-copy/non-scale def, or a scale outside {1,2,4,8}
 /// stops the walk at the current vreg.
 fn rmw_fuse_canon_index(
-    sites: &std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
+    sites: &FxHashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
     mut v: VReg,
     mut scale: u8,
 ) -> (u32, u8) {
@@ -3166,14 +3578,14 @@ fn rmw_fuse_canon_index(
 /// write, while a later store using the root observes its new value. Scanning
 /// only the syntactic alias would then equate two different addresses.
 fn rmw_fuse_ea_reg_ids(
-    sites: &std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
+    sites: &FxHashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
     mem: &X86ISelOperand,
 ) -> Vec<u32> {
     let mut ids = imul_fuse_ea_reg_ids(mem);
-    if let X86ISelOperand::SibMemAddr { index, scale, .. } = mem {
-        if let X86ISelOperand::VReg(index) = index.as_ref() {
-            ids.push(rmw_fuse_canon_index(sites, *index, *scale).0);
-        }
+    if let X86ISelOperand::SibMemAddr { index, scale, .. } = mem
+        && let X86ISelOperand::VReg(index) = index.as_ref()
+    {
+        ids.push(rmw_fuse_canon_index(sites, *index, *scale).0);
     }
     ids.sort_unstable();
     ids.dedup();
@@ -3187,7 +3599,7 @@ fn rmw_fuse_ea_reg_ids(
 /// and a store using `index = j*8, scale 1` against a load's
 /// `index = j, scale 8`.
 fn rmw_fuse_same_ea(
-    sites: &std::collections::HashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
+    sites: &FxHashMap<u32, (X86Opcode, Vec<X86ISelOperand>)>,
     load_mem: &X86ISelOperand,
     store_mem: &X86ISelOperand,
 ) -> bool {
@@ -3239,23 +3651,60 @@ fn rmw_fuse_w2_ok(inst: &X86ISelInst) -> bool {
     imul_fuse_window_ok(inst) && !x86_reads_flags(inst.opcode) && !x86_writes_flags(inst.opcode)
 }
 
-/// Run the RMW fusion on one block. Returns whether anything changed.
-///
-/// `admit` is the fail-closed proof admission (condition P): the fused opcode
-/// is never constructed unless `admit(fused_opcode)`.
+/// Build the whole-function maps and fuse one block. Equivalent to
+/// [`rmw_fuse_run_on_block_with_maps`] with a freshly built map set; kept for
+/// the unit tests, which exercise one block of a fixed function.
+#[cfg(test)]
 fn rmw_fuse_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
     admit: ReconstructionAdmit,
 ) -> bool {
-    let sites = rmw_fuse_single_def_sites(func);
-    let (fn_uses, fn_defs) = function_use_def_counts(func);
+    rmw_fuse_run_on_block_sdef(func, block_id, admit, rmw_fuse_sdef_enabled())
+}
+
+/// [`rmw_fuse_run_on_block`] with the W1 `s`-def relaxation chosen explicitly,
+/// so the tests drive both arms without touching process-global state.
+#[cfg(test)]
+fn rmw_fuse_run_on_block_sdef(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    admit: ReconstructionAdmit,
+    allow_s_def_in_w1: bool,
+) -> bool {
+    let maps = RmwFuseFnMaps::build(func);
+    rmw_fuse_run_on_block_with_maps(func, block_id, admit, &maps, allow_s_def_in_w1)
+}
+
+/// Run the RMW fusion on one block. Returns whether anything changed.
+///
+/// `admit` is the fail-closed proof admission (condition P): the fused opcode
+/// is never constructed unless `admit(fused_opcode)`.
+fn rmw_fuse_run_on_block_with_maps(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    admit: ReconstructionAdmit,
+    // Whole-function facts for the CURRENT state of `func`, owned by the
+    // caller. This routine mutates `func` ONLY when it returns `true` (see the
+    // `fusions.is_empty()` early return below), so the caller may reuse one
+    // build across consecutive blocks that fused nothing and rebuild the
+    // instant one does — handing every block exactly the maps a per-block
+    // build would have produced, which is what keeps the emitted bytes
+    // identical to the per-block rebuild.
+    maps: &RmwFuseFnMaps,
+    allow_s_def_in_w1: bool,
+) -> bool {
+    let sites = &maps.sites;
+    let fn_uses = &maps.fn_uses;
+    let fn_defs = &maps.fn_defs;
     // The block is looked up ONCE, mutably, and held for the whole pass: the
     // match phase below reads it through the shared `insts` reborrow (every
-    // function-wide fact it needs — `sites`, `fn_uses`, `fn_defs` — is an
-    // owned snapshot computed above), and the apply phase writes through the
-    // same binding once `insts` is dead. There is therefore no second lookup
-    // whose failure would have to be asserted against.
+    // function-wide fact it needs — `sites`, `fn_uses`, `fn_defs` — is a
+    // caller-owned snapshot borrowed from `maps`, never from `func`), and the
+    // apply phase writes through the same binding once `insts` is dead. There
+    // is therefore no second lookup whose failure would have to be asserted
+    // against.
+    let func_name = func.name.clone();
     let Some(block) = func.blocks.get_mut(&block_id) else {
         return false;
     };
@@ -3268,7 +3717,22 @@ fn rmw_fuse_run_on_block(
         replacement: X86ISelInst,
     }
     let mut fusions: Vec<Fusion> = Vec::new();
-    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut consumed: FxHashSet<usize> = FxHashSet::default();
+
+    // Decline trace (`-Ztrust-ir-cg-args=trace-x86-rmw-fuse`, diagnostics only).
+    // Every condition below used to decline in SILENCE, and this pass has
+    // fifteen of them: window purity, the EA redef scan, the `sdef` rule, the
+    // two deadness scans, canonical-EA equality. Reading the output cannot tell
+    // you which one fired, so a lost fusion was not debuggable — the same gap
+    // `trace-vectorize-bail` closed for the vectorizer. Reported once per
+    // (anchor, form) so a candidate that fails on its first source and fuses on
+    // its second shows both lines.
+    let trace = rmw_fuse_trace_enabled();
+    let rmw_trace = |j: usize, op: X86Opcode, why: &str| {
+        if trace {
+            eprintln!("rmw-fuse-bail[{func_name}/{block_id:?}/anchor={j}:{op:?}]: {why}");
+        }
+    };
 
     for j in 0..insts.len() {
         let anchor = &insts[j];
@@ -3300,6 +3764,11 @@ fn rmw_fuse_run_on_block(
             // the load is deleted); t != d (fail-closed — one id playing both
             // roles defeats the two deadness scans).
             if s.id == t.id || t.id == d.id {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "condition A: the loaded value and the fused source are one id, or t aliases d",
+                );
                 continue;
             }
             // Find t's nearest def above j (condition B).
@@ -3307,23 +3776,53 @@ fn rmw_fuse_run_on_block(
                 .rev()
                 .find(|&x| local_fold_defines_vreg(&insts[x], t))
             else {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "no definition of the load temp above the ALU",
+                );
                 continue;
             };
             if consumed.contains(&i) || consumed.contains(&j) {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "the load or the ALU is already consumed by another fusion",
+                );
                 continue;
             }
             let Some((lt, mem, store_opcode)) = rmw_fuse_load_kind(&insts[i]) else {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "the temp's def is not an accepted load form (rmw_fuse_load_kind)",
+                );
                 continue;
             };
             if lt != t {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "the load defines a different vreg than this form's temp",
+                );
                 continue;
             }
             // Condition P: the proof admission gate. No admission, no fusion —
             // the opcode is never constructed, so it can never be emitted.
             let Some(fused_opcode) = rmw_fuse_fused_opcode(anchor.opcode, store_opcode) else {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "no fused memory-destination opcode for this (ALU, store) pair",
+                );
                 continue;
             };
             if !admit(fused_opcode) {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "the proof admission gate refused the fused opcode",
+                );
                 continue;
             }
             // Condition E: EA regs exclude t (overwritten by the load) and d
@@ -3333,28 +3832,76 @@ fn rmw_fuse_run_on_block(
             // load. Otherwise `alias <- root; load [alias]; root += 1; store
             // [root]` is falsely considered one EA: the alias still holds the
             // old root while the store observes the new one.
-            let ea_ids = rmw_fuse_ea_reg_ids(&sites, &mem);
+            let ea_ids = rmw_fuse_ea_reg_ids(sites, &mem);
             if ea_ids.iter().any(|&id| id == t.id || id == d.id) {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "condition E: an EA register is the load temp or the ALU def",
+                );
                 continue;
             }
             // Condition W1 over (i,j): pure register ALU, no mention of t, no
-            // def of the EA regs or of s.
+            // def of the EA regs.
+            //
+            // `s` IS ALLOWED TO BE DEFINED HERE, and that relaxation is what lets
+            // `b1_mispredict`'s hot loop fuse. The replacement is spliced at the
+            // STORE's position (see the rebuild below), which is the LATEST of the
+            // three, so the fused instruction reads `s` there — after any def of
+            // `s` between the load and the ALU. What actually has to hold is that
+            // `s` carries from the ALU to the store unchanged, and the W2 window
+            // below already refuses a def of `s` on exactly that stretch. A def
+            // in W1 is not deleted either: only the load and the ALU are, so `s`
+            // is still computed where it was.
+            //
+            // b1's shape, which the old condition declined:
+            //   MovRMSib t, [slot + j*8]     ; the load
+            //   MovRR    s, acc              ; a def of `s` -- this is the one
+            //   AddRR    d, t, s             ; the anchor
+            //   MovMRSib [slot + j'*8], d    ; the store (j' a copy of j)
+            // The `s` def is a pure register copy: it cannot touch memory (the
+            // window is `imul_fuse_window_ok`, which excludes every memory op),
+            // cannot mention `t`, and cannot define an EA register — all still
+            // checked. `no-x86-rmw-fuse-sdef` restores the stricter window.
             for w in &insts[i + 1..j] {
                 if !imul_fuse_window_ok(w) {
+                    rmw_trace(
+                        j,
+                        anchor.opcode,
+                        "W1 window impurity between the load and the ALU",
+                    );
                     continue 'forms;
                 }
-                let mut w_mentions = std::collections::HashSet::new();
+                let mut w_mentions = FxHashSet::default();
                 for op in &w.operands {
                     collect_operand_mentions_flat(op, &mut w_mentions);
                 }
                 if w_mentions.iter().any(|m| m.id == t.id) {
+                    rmw_trace(
+                        j,
+                        anchor.opcode,
+                        "W1 between load and ALU mentions the load temp",
+                    );
                     continue 'forms;
                 }
-                if ea_ids
+                let must_not_define: Vec<u32> = if allow_s_def_in_w1 {
+                    ea_ids.clone()
+                } else {
+                    ea_ids
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(s.id))
+                        .collect()
+                };
+                if must_not_define
                     .iter()
-                    .chain(std::iter::once(&s.id))
                     .any(|&id| local_fold_defines_vreg(w, VReg::new(id, RegClass::Gpr64)))
                 {
+                    rmw_trace(
+                        j,
+                        anchor.opcode,
+                        "W1 defines a register the fusion may not have redefined (the sdef rule)",
+                    );
                     continue 'forms;
                 }
             }
@@ -3376,7 +3923,7 @@ fn rmw_fuse_run_on_block(
                         // The FUSED instruction keeps the LOAD's operand
                         // spelling either way. Value operand exactly d.
                         [m, X86ISelOperand::VReg(v)]
-                            if rmw_fuse_same_ea(&sites, &mem, m) && *v == d
+                            if rmw_fuse_same_ea(sites, &mem, m) && *v == d
                     );
                 if is_matching_store {
                     store_idx = Some(k);
@@ -3388,7 +3935,7 @@ fn rmw_fuse_run_on_block(
                 if !rmw_fuse_w2_ok(w) {
                     break;
                 }
-                let mut w_mentions = std::collections::HashSet::new();
+                let mut w_mentions = FxHashSet::default();
                 for op in &w.operands {
                     collect_operand_mentions_flat(op, &mut w_mentions);
                 }
@@ -3404,9 +3951,19 @@ fn rmw_fuse_run_on_block(
                 }
             }
             let Some(k) = store_idx else {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "no matching store of the ALU def to the same EA after the ALU",
+                );
                 continue;
             };
             if consumed.contains(&k) {
+                rmw_trace(
+                    j,
+                    anchor.opcode,
+                    "the matching store is already consumed by another fusion",
+                );
                 continue;
             }
             // Condition D: t locally dead after j; d locally dead after k.
@@ -3424,9 +3981,11 @@ fn rmw_fuse_run_on_block(
                     && fn_uses.get(&x).copied().unwrap_or(0) == 1
             };
             if !(imul_fuse_t_dead_after(insts, j, t) || whole_fn_dead(t)) {
+                rmw_trace(j, anchor.opcode, "the load temp is not dead after the ALU");
                 continue;
             }
             if !(imul_fuse_t_dead_after(insts, k, d) || (s != d && whole_fn_dead(d))) {
+                rmw_trace(j, anchor.opcode, "the ALU def is not dead after the store");
                 continue;
             }
             // Build the replacement: `OpMR[Sib] [mem], s` with the opcode's
@@ -3461,9 +4020,8 @@ fn rmw_fuse_run_on_block(
 
     // Rebuild the block: delete each load and ALU, splice each replacement at
     // the store's position.
-    let mut delete: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut replace: std::collections::HashMap<usize, X86ISelInst> =
-        std::collections::HashMap::new();
+    let mut delete: FxHashSet<usize> = FxHashSet::default();
+    let mut replace: FxHashMap<usize, X86ISelInst> = FxHashMap::default();
     for f in fusions {
         delete.insert(f.load_idx);
         delete.insert(f.alu_idx);
@@ -3491,7 +4049,8 @@ fn rmw_fuse_run_on_block(
 fn simplify_inst_gated(
     insts: &[X86ISelInst],
     index: usize,
-    zeroidiom_used: Option<&std::collections::HashSet<VReg>>,
+    zeroidiom_used: Option<&FxHashSet<VReg>>,
+    admit_constmul_shift: ConstMulShiftAdmit,
 ) -> Option<PeepholeEdit> {
     let inst = &insts[index];
 
@@ -3606,17 +4165,28 @@ fn simplify_inst_gated(
                 // temporary (requires d != s). The flags guard above
                 // already proved the IMUL's flag results are dead, and
                 // every replacement opcode is inside the proof perimeter.
-                // Kill switch: `TCG_NO_X86_CONSTMUL_LEA`.
-                3 | 5 | 9 if constmul_lea_enabled() && dst != src => Some(PeepholeEdit::Replace(
-                    lea_sib_scaled(dst, src, (imm - 1) as u8),
-                )),
+                3 | 5 | 9 if dst != src => Some(PeepholeEdit::Replace(lea_sib_scaled(
+                    dst,
+                    src,
+                    (imm - 1) as u8,
+                ))),
                 // d = s*7 as TWO dependent LEAs: d = s + s*2 (=3s), then
                 // d = s + d*2 (=7s), reusing d as the temporary (d != s).
-                // 2 cycles, ZERO reg-reg movs, no flags written. The prior
-                // ShlRI+SubRR shape measured NULL on p5: the two-address
-                // SHL forces a MovRR onto the loop-carried path and mov
-                // elimination under pressure gives that cycle right back.
-                7 if constmul_lea_enabled() && dst != src => Some(PeepholeEdit::ReplaceTwo(
+                // 2 cycles, ZERO reg-reg movs, no flags written.
+                //
+                // ⚑ SCOPE OF THE RECORDED NULL (corrected 2026-09-01). The
+                // earlier note here said "the ShlRI+SubRR shape measured NULL
+                // on p5" without naming the site, which read as a general
+                // verdict on SHL+SUB. It is not. The a74e7cd6 measurement was
+                // about THIS arm — p5's `st.b.wrapping_mul(7)` — where the
+                // double-LEA replaced SHL+SUB and the suite row did not move.
+                // p5's OTHER multiply, `st.a.wrapping_mul(31)`, was never
+                // rewritten at all (it fell through to `_ => None`), and the
+                // stated mechanism cannot apply to it: there the SHL's
+                // two-address MovRR READS the loop-carried value and WRITES a
+                // dead-after-one-use temp, so it is not on the carried path.
+                // The `2^a ± 1` arm below claims that site.
+                7 if dst != src => Some(PeepholeEdit::ReplaceTwo(
                     lea_sib_scaled(dst, src, 2),
                     X86ISelInst::new(
                         X86Opcode::LeaSib,
@@ -3631,6 +4201,37 @@ fn simplify_inst_gated(
                         ],
                     ),
                 )),
+                // d = s * (2^a ± 1)  ->  SHL d, s, a ; ADD/SUB d, d, s.
+                //
+                // Reaches the constants the LEA arms above cannot express
+                // (31, 33, 63, 65, ...) — on p5's `st.a.wrapping_mul(31)` the
+                // rewrite is what rustc-LLVM and gcc-16 both emit, `mov`
+                // included. The measured mechanism is PORT CONTENTION, not
+                // latency: p5's recurrence has ~4 cycles of slack over IMUL's
+                // 3-cycle latency, but its four dependent LEAs already
+                // saturate p1/p5 and `IMUL r64,r64,imm` is p1-EXCLUSIVE. The
+                // replacement issues elsewhere (`mov` renamed away, `shl` on
+                // p0/p6, `sub` on p0156).
+                //
+                // ⚑ This is NOT unconditionally throughput-safe the way the
+                // AArch64 `mul_shift_reduce` is: AArch64 has a 3-address
+                // shift, so its form is 2 instructions for 1, whereas here it
+                // is 2 PLUS a possible two-address MovRR — up to +2 uops for
+                // one IMUL. The ONE-SHIFT restriction in
+                // `constmul_shift_decompose` (only `2^a ± 1`, never `24 =
+                // 16+8` or `576`) is what bounds that exposure.
+                //
+                // Preconditions: `d != s` (with `d == s` the second
+                // instruction would read a clobbered value); the IMUL's flags
+                // proven dead by the guard above (the replacement writes
+                // RFLAGS only at the original position, so the SAME full
+                // overwrite still dominates every reader); and the ALGEBRAIC
+                // identity `x·(2^a ± 1) ≡ (x<<a) ± x (mod 2^W)` discharged by
+                // the injected admission (fail-closed: no proof ⇒ the IMUL
+                // stands). Kill switch: `TCG_NO_X86_CONSTMUL_SHIFT`.
+                _ if constmul_shift_enabled() && dst != src => {
+                    constmul_shift_reduce(dst, src, imm, admit_constmul_shift)
+                }
                 _ => None,
             }
         }
@@ -3781,10 +4382,122 @@ fn test_rr(src: VReg) -> X86ISelInst {
     )
 }
 
-/// Kill switch for the small-constant IMUL -> LEA/SHL-SUB strength
-/// reduction (any value disables).
-fn constmul_lea_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_CONSTMUL_LEA").is_none()
+/// Kill switch for the `IMUL r,r,2^a±1` -> `SHL ; ADD/SUB` arm alone (any
+/// value disables), so it can be paired-A/B'd independently of the LEA arms.
+///
+/// NOT memoized — a SEMANTIC gate, and the in-process kill-switch tests flip it
+/// between calls. (Only pure log/trace gates are cached in this file.)
+fn constmul_shift_enabled() -> bool {
+    std::env::var_os("TCG_NO_X86_CONSTMUL_SHIFT").is_none()
+}
+
+/// Decompose a multiplier into the ONE-SHIFT two-term form `2^a + t` with
+/// `t ∈ {+1, -1}` and `1 <= a < width`. Returns `(a, plus_one)`, or `None`
+/// (BAIL) for anything else.
+///
+/// Ported from `mul_shift_reduce::decompose`, keeping its restrictions:
+///
+/// * the `b != 0` ONE-SHIFT bail — the smaller power must be `2^0`, so the
+///   sequence is a single shift plus one add/sub. A two-shift form (`24 =
+///   16 + 8`, `576`, `14`) would be 3 ALU ops for one MUL and is a measured
+///   throughput regression in matmul's index math;
+/// * a leading POSITIVE `2^a` term. That additionally excludes `1 - 2^a`,
+///   which AArch64 does admit but x86 cannot express without a
+///   `SubRR [dst, src, dst]` — a `dst == rhs` alias that routes into the
+///   two-address scratch path (the s31226 P0 class) for zero suite sites.
+///
+/// A pure power of two (`c == 2^a`) also BAILS: Stage 1 deliberately does not
+/// claim `IMUL $2` / `IMUL $8`, whose blast radius is the copy-bloat-sensitive
+/// b1 + h-family.
+fn constmul_shift_decompose(c: i128, width: u32) -> Option<(u32, bool)> {
+    // `|c| <= 1` is mul by 0/1/-1: degenerate, handled by the arms above.
+    if c.abs() < 2 {
+        return None;
+    }
+    let w = i128::from(width);
+    for a in 1..w {
+        let pa: i128 = 1i128 << a;
+        // Pure power of two — NOT claimed by Stage 1.
+        if c == pa {
+            return None;
+        }
+        for &sa in &[1i128, -1i128] {
+            let rem = c - sa * pa;
+            if rem == 0 {
+                continue;
+            }
+            let mag = rem.unsigned_abs();
+            if !mag.is_power_of_two() {
+                continue;
+            }
+            let b = mag.trailing_zeros();
+            if (a as u32) <= b || b >= width {
+                continue; // distinct powers, b < a, both in range
+            }
+            // ONE-SHIFT restriction (see the doc comment).
+            if b != 0 {
+                continue;
+            }
+            if sa < 0 {
+                continue; // excludes (-,-) and (-,+) == `1 - 2^a`
+            }
+            return Some((a as u32, rem > 0));
+        }
+    }
+    None
+}
+
+/// Build `SHL d, s, a ; ADD/SUB d, d, s` for `d = s * (2^a ± 1)`, or `None` if
+/// the multiplier is not of that shape / the identity is not admitted.
+///
+/// The caller has already established `dst != src`, that the IMUL's RFLAGS are
+/// dead, and that both kill switches are off.
+fn constmul_shift_reduce(
+    dst: VReg,
+    src: VReg,
+    imm: i64,
+    admit_constmul_shift: ConstMulShiftAdmit,
+) -> Option<PeepholeEdit> {
+    let width: u32 = match dst.class {
+        RegClass::Gpr64 => 64,
+        RegClass::Gpr32 => 32,
+        _ => return None,
+    };
+    // Sign-extend at the OPERATION width: a 32-bit `-3` arrives as the
+    // zero-extended `0xFFFF_FFFD`; reading it as `-3` finds the compact
+    // decomposition. `x * c ≡ x * (c mod 2^W) (mod 2^W)`, so re-signing the low
+    // `W` bits is value-preserving (same re-signing as `mul_shift_reduce`).
+    let c: i128 = if width == 32 {
+        i128::from(imm as i32)
+    } else {
+        i128::from(imm)
+    };
+    let (a, plus_one) = constmul_shift_decompose(c, width)?;
+    // FAIL-CLOSED on the algebraic obligation: no discharge, no rewrite.
+    if !admit_constmul_shift(width, a, plus_one) {
+        return None;
+    }
+    let shl = X86ISelInst::new(
+        X86Opcode::ShlRI,
+        vec![
+            X86ISelOperand::VReg(dst),
+            X86ISelOperand::VReg(src),
+            X86ISelOperand::Imm(i64::from(a)),
+        ],
+    );
+    let combine = X86ISelInst::new(
+        if plus_one {
+            X86Opcode::AddRR
+        } else {
+            X86Opcode::SubRR
+        },
+        vec![
+            X86ISelOperand::VReg(dst),
+            X86ISelOperand::VReg(dst),
+            X86ISelOperand::VReg(src),
+        ],
+    );
+    Some(PeepholeEdit::ReplaceTwo(shl, combine))
 }
 
 /// `dst = src + src*scale` — the single-LEA form of `src * (scale+1)` for
@@ -3914,7 +4627,21 @@ fn can_replace_flag_writer(insts: &[X86ISelInst], index: usize) -> bool {
     }
 }
 
+/// Forensic opt-out that reverts `flags_written_here_are_dead` to bailing at a
+/// PARTIAL flag overwrite.
+///
+/// NOT memoized: like every other kill switch here it must stay observable to
+/// an in-process flip (cf. `x86_tied_copy_elide_kill_switch_reverts_the_arm`
+/// in the codegen pipeline, which pins exactly that contract). Instead the
+/// read is HOISTED out of the scan below — it used to sit inside the loop
+/// body, one `getenv` per scanned instruction, i.e. O(n^2) environment scans
+/// per block in the worst case.
+fn strict_partial_flags_enabled() -> bool {
+    std::env::var_os("TCG_X86_STRICT_PARTIAL_FLAGS").is_some()
+}
+
 fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
+    let strict_partial = strict_partial_flags_enabled();
     for inst in &insts[index + 1..] {
         if x86_reads_flags(inst.opcode) {
             return false;
@@ -3930,9 +4657,7 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
             // XorRR full overwrite, vetoing the constmul reduction on the
             // loop-carried critical path.) TCG_X86_STRICT_PARTIAL_FLAGS
             // reverts to the old bail for isolation A/Bs.
-            FlagOverwrite::Partial
-                if std::env::var_os("TCG_X86_STRICT_PARTIAL_FLAGS").is_some() =>
-            {
+            FlagOverwrite::Partial if strict_partial => {
                 return false;
             }
             FlagOverwrite::None | FlagOverwrite::Partial => {}
@@ -3945,42 +4670,6 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
     }
 
     false
-}
-
-pub(crate) fn condition_flag_overwrite(inst: &X86ISelInst) -> FlagOverwrite {
-    use FlagOverwrite::*;
-    use X86Opcode::*;
-
-    match inst.opcode {
-        Not => None,
-        ShlRI | ShrRI | SarRI if shift_immediate_is_zero(inst) => None,
-
-        AddRR | AddRI | AddRM | SubRR | SubRI | SubRM | Neg | AndRR | AndRI | OrRR | OrRI
-        | XorRR | XorRI | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM | Ucomisd
-        | Ucomiss | Popcnt => Full,
-
-        // RolRCl is Partial like the CL shifts (writes only CF/OF, and only
-        // when the runtime CL count is nonzero — never a Full overwrite).
-        Inc | Dec | ImulRR | ImulRRI | ImulRM | ImulRMSib | Idiv | Div | Mul | ShlRR | ShlRI
-        | ShrRR | ShrRI | SarRR | SarRI | RolRCl | Bsf | Bsr | Tzcnt | Lzcnt | BtRI | Cmpxchg => {
-            Partial
-        }
-
-        _ if x86_writes_flags(inst.opcode) => Partial,
-        _ => None,
-    }
-}
-
-fn shift_immediate_is_zero(inst: &X86ISelInst) -> bool {
-    matches!(
-        inst.operands.as_slice(),
-        [X86ISelOperand::VReg(_), X86ISelOperand::Imm(0)]
-            | [
-                X86ISelOperand::VReg(_),
-                X86ISelOperand::VReg(_),
-                X86ISelOperand::Imm(0),
-            ]
-    )
 }
 
 fn instruction_may_export_flags(inst: &X86ISelInst) -> bool {
@@ -4046,10 +4735,8 @@ fn is_supported_gpr(vreg: VReg) -> bool {
 /// and the encoder cover them; a gap would fail closed downstream, never
 /// miscompile.
 fn fold_unique_const_into_imm_forms(func: &mut X86ISelFunction) -> bool {
-    use std::collections::HashMap;
-
     // Conservative def counts: any first-operand vreg occurrence counts.
-    let mut def_counts: HashMap<VReg, usize> = HashMap::new();
+    let mut def_counts: FxHashMap<VReg, usize> = FxHashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -4062,7 +4749,7 @@ fn fold_unique_const_into_imm_forms(func: &mut X86ISelFunction) -> bool {
     }
 
     // Collect uniquely-defined MovRI constants with imm32-representable values.
-    let mut consts: HashMap<VReg, i64> = HashMap::new();
+    let mut consts: FxHashMap<VReg, i64> = FxHashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -4304,82 +4991,101 @@ struct SibAddrFoldEdit {
     copy_deletes: Vec<usize>,
 }
 
+/// The whole-function VReg use/def counts, packaged with the `use_count` /
+/// `def_count` accessors their consumers expect.
+///
+/// Field-for-field EXACTLY `function_use_def_counts`: `vreg_uses_in_block`'s
+/// use convention, and "operand 0 of a value-producing opcode" for defs.
+/// [`SibFoldVRegMaps`] holds one for its counts. Existing as a named type
+/// lets ONE build serve several consumers instead of each pass rebuilding its
+/// own copy.
+///
+/// A PURE function of `func`, so a built copy stays exactly correct until
+/// `func` is next mutated — and no longer. Callers that hold one across a
+/// rewrite MUST drop it; see the cache discipline in `run_impl`.
+pub(crate) struct FnUseDefCounts {
+    uses: FxHashMap<VReg, u32>,
+    defs: FxHashMap<VReg, u32>,
+}
+
+impl FnUseDefCounts {
+    fn build(func: &X86ISelFunction) -> Self {
+        let (uses, defs) = function_use_def_counts(func);
+        FnUseDefCounts { uses, defs }
+    }
+
+    #[inline]
+    fn def_count(&self, v: VReg) -> u32 {
+        self.defs.get(&v).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn use_count(&self, v: VReg) -> u32 {
+        self.uses.get(&v).copied().unwrap_or(0)
+    }
+}
+
 /// Whole-function VReg maps precomputed ONCE per `sib_addr_fold_run_on_block`
 /// invocation, replacing the per-anchor whole-function scans that made the
 /// pass O(n^2) on a single large function (matmul's 15920-inst body).
 ///
 /// `func` is IMMUTABLE across the entire anchor loop — all edits are collected
 /// into a `Vec` and applied only AFTER the loop — so every per-anchor
-/// `function_vreg_def_count` / `function_vreg_use_count` / cross-block escape
+/// whole-function def count / use count / cross-block escape
 /// scan returns the IDENTICAL answer within one invocation. Precomputing them
 /// once yields the SAME verdicts and therefore the SAME edit set (byte-
 /// identical codegen). The maps MUST be rebuilt per invocation (the function
 /// DOES mutate between block invocations via the end-of-loop edits) and MUST
 /// NOT be hoisted across invocations.
 struct SibFoldVRegMaps {
-    /// Total definitions of each VReg (operand 0 of a value-producing inst),
-    /// function-wide. Mirrors `function_vreg_def_count` exactly.
-    def_counts: std::collections::HashMap<VReg, u32>,
-    /// Total uses of each VReg (per `vreg_uses_in_block`), function-wide.
-    /// Mirrors `function_vreg_use_count` exactly.
-    use_counts: std::collections::HashMap<VReg, u32>,
-    /// For each VReg, the set of blocks that MENTION it (any operand, per
-    /// `instruction_mentions_vreg`). Replaces the cross-block escape scan:
-    /// a VReg escapes `block_id` iff it is mentioned in some other block.
-    mention_blocks: std::collections::HashMap<
-        VReg,
-        std::collections::HashSet<trust_cg_lower::instructions::Block>,
-    >,
+    /// Function-wide definition and use counts: `function_vreg_def_count`'s
+    /// predicate for defs, `vreg_uses_in_block`'s convention (which reads
+    /// addressing regs inside memory operands too) for uses.
+    counts: FnUseDefCounts,
+    /// For each VReg, the blocks that MENTION it (any operand, per
+    /// `instruction_mentions_vreg`), kept only as far as the cross-block
+    /// escape question needs: the one block, or the fact that there are
+    /// several.
+    mention_blocks: FxHashMap<VReg, MentionBlocks>,
+}
+
+/// The blocks mentioning one VReg, as [`SibFoldVRegMaps::escapes`] reads them.
+#[derive(Clone, Copy)]
+enum MentionBlocks {
+    /// Every mention is in this block.
+    One(trust_cg_lower::instructions::Block),
+    /// At least two distinct blocks mention it.
+    Several,
 }
 
 impl SibFoldVRegMaps {
-    /// Build all three maps in a single O(n) pass over every block/inst.
+    /// Build the maps in two O(n) passes over every block/inst.
     fn build(func: &X86ISelFunction) -> Self {
-        use crate::effects::x86_produces_value;
-        let mut def_counts: std::collections::HashMap<VReg, u32> = std::collections::HashMap::new();
-        let mut use_counts: std::collections::HashMap<VReg, u32> = std::collections::HashMap::new();
-        let mut mention_blocks: std::collections::HashMap<
-            VReg,
-            std::collections::HashSet<trust_cg_lower::instructions::Block>,
-        > = std::collections::HashMap::new();
-
+        let counts = FnUseDefCounts::build(func);
+        let mut mention_blocks: FxHashMap<VReg, MentionBlocks> = FxHashMap::default();
         for (bid, block) in &func.blocks {
-            // Use counts: accumulate the per-block use map (same predicate as
-            // `function_vreg_use_count`).
-            for (v, c) in vreg_uses_in_block(&block.insts) {
-                *use_counts.entry(v).or_insert(0) += c;
-            }
             for inst in &block.insts {
-                // Def counts: operand-0 VReg of each value-producing inst
-                // (same predicate as `function_vreg_def_count`).
-                if x86_produces_value(inst.opcode)
-                    && let Some(X86ISelOperand::VReg(v)) = inst.operands.first()
-                {
-                    *def_counts.entry(*v).or_insert(0) += 1;
-                }
-                // Mention blocks: every VReg any operand mentions (same
-                // predicate as `instruction_mentions_vreg`).
+                // Every VReg any operand mentions (same predicate as
+                // `instruction_mentions_vreg`).
                 for op in &inst.operands {
                     collect_operand_mentions(op, *bid, &mut mention_blocks);
                 }
             }
         }
-
         SibFoldVRegMaps {
-            def_counts,
-            use_counts,
+            counts,
             mention_blocks,
         }
     }
 
     #[inline]
     fn def_count(&self, v: VReg) -> u32 {
-        self.def_counts.get(&v).copied().unwrap_or(0)
+        self.counts.def_count(v)
     }
 
     #[inline]
     fn use_count(&self, v: VReg) -> u32 {
-        self.use_counts.get(&v).copied().unwrap_or(0)
+        self.counts.use_count(v)
     }
 
     /// True iff `v` is mentioned in any block other than `block_id`. Replaces
@@ -4387,9 +5093,12 @@ impl SibFoldVRegMaps {
     /// .any(|i| instruction_mentions_vreg(i, v)))`.
     #[inline]
     fn escapes(&self, v: VReg, block_id: trust_cg_lower::instructions::Block) -> bool {
-        self.mention_blocks
-            .get(&v)
-            .is_some_and(|bs| bs.iter().any(|b| *b != block_id))
+        match self.mention_blocks.get(&v) {
+            None => false,
+            Some(MentionBlocks::One(only)) => *only != block_id,
+            // Two distinct blocks cannot both be `block_id`.
+            Some(MentionBlocks::Several) => true,
+        }
     }
 }
 
@@ -4399,14 +5108,18 @@ impl SibFoldVRegMaps {
 fn collect_operand_mentions(
     op: &X86ISelOperand,
     bid: trust_cg_lower::instructions::Block,
-    mention_blocks: &mut std::collections::HashMap<
-        VReg,
-        std::collections::HashSet<trust_cg_lower::instructions::Block>,
-    >,
+    mention_blocks: &mut FxHashMap<VReg, MentionBlocks>,
 ) {
     match op {
         X86ISelOperand::VReg(v) => {
-            mention_blocks.entry(*v).or_default().insert(bid);
+            mention_blocks
+                .entry(*v)
+                .and_modify(|seen| {
+                    if matches!(seen, MentionBlocks::One(first) if *first != bid) {
+                        *seen = MentionBlocks::Several;
+                    }
+                })
+                .or_insert(MentionBlocks::One(bid));
         }
         X86ISelOperand::MemAddr { base, .. } => {
             collect_operand_mentions(base, bid, mention_blocks);
@@ -4419,22 +5132,42 @@ fn collect_operand_mentions(
     }
 }
 
+/// Build the whole-function maps and fold one block. Equivalent to
+/// [`sib_addr_fold_run_on_block_with_maps`] with a freshly built map set; kept
+/// for the unit tests, which exercise one block of a fixed function.
+#[cfg(test)]
 fn sib_addr_fold_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
 ) -> bool {
+    let maps = SibFoldVRegMaps::build(func);
+    sib_addr_fold_run_on_block_with_maps(func, block_id, &maps)
+}
+
+fn sib_addr_fold_run_on_block_with_maps(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    // Whole-function VReg maps for the CURRENT state of `func`. `func` is
+    // immutable across the anchor loop below, so these replace the O(n)
+    // per-anchor scans that made the loop O(n^2), with byte-identical results.
+    //
+    // The caller owns the lifetime because `SibFoldVRegMaps::build` is a pure
+    // function of `func` and this routine mutates `func` ONLY when it returns
+    // `true` (see the `edits.is_empty()` early return below). The caller may
+    // therefore reuse one build across consecutive blocks that changed
+    // nothing and rebuild the instant one does — handing every block exactly
+    // the maps `build(func)` would have produced at that point, which is what
+    // keeps the emitted bytes identical to the per-block rebuild.
+    maps: &SibFoldVRegMaps,
+) -> bool {
     let Some(block) = func.blocks.get(&block_id) else {
         return false;
     };
-    let insts = block.insts.clone();
-
-    // Precompute the whole-function VReg maps ONCE for this invocation. `func`
-    // is immutable across the anchor loop below, so these replace the O(n)
-    // per-anchor scans that made the loop O(n^2), with byte-identical results.
-    let maps = SibFoldVRegMaps::build(func);
+    // The anchor scan only reads `func`; every edit owns its operands.
+    let insts: &[X86ISelInst] = &block.insts;
 
     let mut edits: Vec<SibAddrFoldEdit> = Vec::new();
-    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut consumed: FxHashSet<usize> = FxHashSet::default();
 
     // Anchor on each address-producing instruction feeding memory ops:
     //   (1) `LeaSib d, [base+index*scale+disp]` (already a formed SIB address,
@@ -4448,8 +5181,8 @@ fn sib_addr_fold_run_on_block(
         if consumed.contains(&anchor_idx) {
             continue;
         }
-        let edit = try_sib_addr_fold_from_leasib(block_id, &insts, anchor_idx, &maps)
-            .or_else(|| try_sib_addr_fold_from_add(block_id, &insts, anchor_idx, &maps));
+        let edit = try_sib_addr_fold_from_leasib(block_id, insts, anchor_idx, maps)
+            .or_else(|| try_sib_addr_fold_from_add(block_id, insts, anchor_idx, maps));
         if let Some(edit) = edit {
             if let Some(scale_def_idx) = edit.scale_def_idx {
                 consumed.insert(scale_def_idx);
@@ -4467,17 +5200,6 @@ fn sib_addr_fold_run_on_block(
 
     if edits.is_empty() {
         return false;
-    }
-
-    if std::env::var_os("TRUST_CG_X86_SIB_FOLD_LOG").is_some() {
-        let mem_ops: usize = edits.iter().map(|e| e.mem_rewrites.len()).sum();
-        eprintln!(
-            "x86-sib-addr-fold: fired {} time(s) ({} mem ops) in function `{}` block #{:?}",
-            edits.len(),
-            mem_ops,
-            func.name,
-            block_id.0,
-        );
     }
 
     // Rewrite every memory op in place, then delete the scale-def + add of each
@@ -4581,31 +5303,10 @@ fn def_vreg(inst: &X86ISelInst) -> Option<VReg> {
     }
 }
 
-/// Count total uses of `vreg` across the whole function (all blocks), reading
-/// addressing regs inside memory operands too. Used to enforce the whole-
-/// function single-use guard for the scale/address intermediates.
-///
-/// Retained as the REFERENCE definition of the per-VReg use count that
-/// `SibFoldVRegMaps::use_counts` precomputes in bulk (the two must agree
-/// exactly). The SIB-fold anchor loop now queries the precomputed map instead
-/// of calling this per anchor (which was O(n) per anchor -> O(n^2)).
-#[allow(dead_code)]
-fn function_vreg_use_count(func: &X86ISelFunction, vreg: VReg) -> u32 {
-    let mut count = 0u32;
-    for block in func.blocks.values() {
-        let counts = vreg_uses_in_block(&block.insts);
-        count += counts.get(&vreg).copied().unwrap_or(0);
-    }
-    count
-}
-
 /// Count total definitions of `vreg` (operand 0 of value-producing insts)
-/// across the whole function.
-///
-/// Retained as the REFERENCE definition of the per-VReg def count that
-/// `SibFoldVRegMaps::def_counts` precomputes in bulk (the two must agree
-/// exactly); no longer called per anchor.
-#[allow(dead_code)]
+/// across the whole function. Uses the same predicate as
+/// `SibFoldVRegMaps::def_count`, which the SIB fold precomputes in bulk
+/// instead of calling this per anchor.
 fn function_vreg_def_count(func: &X86ISelFunction, vreg: VReg) -> u32 {
     use crate::effects::x86_produces_value;
     let mut count = 0u32;
@@ -4759,7 +5460,7 @@ fn sib_foldable_mem_op(inst: &X86ISelInst) -> Option<(bool, VReg, X86ISelOperand
         // let a BYTE array participate in indexed addressing at all — the whole
         // `&[u8]` / `Vec<u8>` / `[u8; N]` class previously fell through here and
         // paid a base-`Lea` plus an `Add` on every single element access.
-        X86Opcode::MovRM8 if byte_sib_fold_enabled() => {
+        X86Opcode::MovRM8 => {
             if inst.flags != X86Opcode::MovRM8.default_flags() {
                 return None;
             }
@@ -4776,7 +5477,27 @@ fn sib_foldable_mem_op(inst: &X86ISelInst) -> Option<(bool, VReg, X86ISelOperand
                 _ => None,
             }
         }
-        X86Opcode::MovMR8 if byte_sib_fold_enabled() => {
+        // The zero-extending byte load folds to its SIB sibling the same way:
+        // same `[dst, [addr + 0]]` shape, width and extension fixed by the
+        // opcode. There is no 16-bit SIB sibling, so `MovzxRM16` stays put.
+        X86Opcode::MovzxRM8 => {
+            if inst.flags != X86Opcode::MovzxRM8.default_flags() {
+                return None;
+            }
+            match inst.operands.as_slice() {
+                [
+                    dst @ X86ISelOperand::VReg(_),
+                    X86ISelOperand::MemAddr { base, disp },
+                ] if *disp == 0 => {
+                    let X86ISelOperand::VReg(addr) = base.as_ref() else {
+                        return None;
+                    };
+                    Some((true, *addr, dst.clone(), X86Opcode::MovzxRM8Sib))
+                }
+                _ => None,
+            }
+        }
+        X86Opcode::MovMR8 => {
             if inst.flags != X86Opcode::MovMR8.default_flags() {
                 return None;
             }
@@ -4835,6 +5556,52 @@ fn sib_foldable_mem_op(inst: &X86ISelInst) -> Option<(bool, VReg, X86ISelOperand
                         return None;
                     };
                     Some((true, *addr, dst.clone(), X86Opcode::MovssRMSib))
+                }
+                _ => None,
+            }
+        }
+        // PACKED 128-bit siblings: the same shape once more, with the access
+        // width (128) fixed by the opcode exactly as it is for MovdquRM/MovdquMR.
+        // BOTH directions are covered here, unlike the scalar-FP pair above:
+        // `MovdquMRSib` exists (there is no MovsdMRSib), and the store is the
+        // one that matters — the vectorizer's packed fill/copy bodies are stores.
+        //
+        // The ALIGNED family (MovdqaRM/MovdqaMR) is deliberately NOT folded: its
+        // proof carries the honest `ea % 16 == 0` precondition, and moving the
+        // address into a base+index*scale operand is exactly the rewrite that
+        // could invalidate it (the fold does not know the index is a multiple of
+        // 16). MOVDQU carries no alignment precondition, so the same rewrite is
+        // unconditionally address-preserving there.
+        X86Opcode::MovdquRM => {
+            if inst.flags != X86Opcode::MovdquRM.default_flags() {
+                return None;
+            }
+            match inst.operands.as_slice() {
+                [
+                    dst @ X86ISelOperand::VReg(_),
+                    X86ISelOperand::MemAddr { base, disp },
+                ] if *disp == 0 => {
+                    let X86ISelOperand::VReg(addr) = base.as_ref() else {
+                        return None;
+                    };
+                    Some((true, *addr, dst.clone(), X86Opcode::MovdquRMSib))
+                }
+                _ => None,
+            }
+        }
+        X86Opcode::MovdquMR => {
+            if inst.flags != X86Opcode::MovdquMR.default_flags() {
+                return None;
+            }
+            match inst.operands.as_slice() {
+                [
+                    X86ISelOperand::MemAddr { base, disp },
+                    src @ X86ISelOperand::VReg(_),
+                ] if *disp == 0 => {
+                    let X86ISelOperand::VReg(addr) = base.as_ref() else {
+                        return None;
+                    };
+                    Some((false, *addr, src.clone(), X86Opcode::MovdquMRSib))
                 }
                 _ => None,
             }
@@ -5185,11 +5952,10 @@ fn try_sib_addr_fold_from_add(
     // deliberately so: there is no scale-def to delete, so `x`/`y` need NOT be
     // single-def/single-use. They only have to still hold the same values where
     // the SIB operand reads them, which is exactly the no-redef window below.
-    if byte_sib_fold_enabled()
-        // A proof-origin-carrying AddRR is a CARRIER (bounds/overflow check),
-        // not plain address arithmetic; deleting it would drop the check. The
-        // memory ops are screened the same way inside `sib_foldable_mem_op`.
-        && add.proof_origin.is_none()
+    // A proof-origin-carrying AddRR is a CARRIER (bounds/overflow check),
+    // not plain address arithmetic; deleting it would drop the check. The
+    // memory ops are screened the same way inside `sib_foldable_mem_op`.
+    if add.proof_origin.is_none()
         && x.class == RegClass::Gpr64
         && y.class == RegClass::Gpr64
         && x != y
@@ -5235,7 +6001,7 @@ fn try_sib_addr_fold_from_add(
     None
 }
 
-/// Task #72 pass 2 — redundant self-zero-test elision.
+/// Redundant self-zero-test elision.
 ///
 /// Deletes `TestRR v, v` (or `CmpRI v, 0`) when:
 ///   1. the NEAREST preceding in-block def of `v` is an ALU op that sets ZF
@@ -5243,13 +6009,16 @@ fn try_sib_addr_fold_from_add(
 ///      forms) with `v` as its destination — after it, `ZF == (v == 0)`,
 ///      exactly what the self-test would recompute;
 ///   2. no instruction BETWEEN that def and the test writes flags or
-///      redefines `v`;
-///   3. every flag READER from the test to the end of the block consumes only
-///      ZF (`Jcc`/`Setcc`/`Cmovcc` with `E`/`NE`), and no reader appears
-///      after an intervening flag WRITER (those see the new flags, not ours).
-///      Cross-block flag liveness does not exist in this ISel (every consumer
-///      follows an in-block producer — the invariant TV-5's block-local flag
-///      model already relies on), so reaching the terminators ends the scan.
+///      may redefine any width view of `v`; the establishing ALU definition
+///      itself must match the test's exact typed register;
+///   3. every flag READER before the next full overwrite consumes only ZF
+///      (`Jcc`/`Setcc`/`Cmovcc` with `E`/`NE`). Readers after a full overwrite
+///      observe the new flags.
+///      Without an in-block overwrite, outgoing flags must also be dead in
+///      every successor, as established by the CFG liveness analysis.
+///   4. the test and the scanned window have default flags and no proof
+///      annotation. Removing or crossing proof-bound instructions requires a
+///      separate evidence transport which this pass does not provide.
 ///
 /// The CF/OF difference between the ALU op and `test` (ADD/SUB set them
 /// arithmetically; `test` clears them) is invisible to E/NE consumers, which
@@ -5283,17 +6052,21 @@ fn redundant_self_test_elision_run_on_block(
     };
     let n = block.insts.len();
     let mut delete_at: Option<usize> = None;
+    let mut live_in = None;
 
     'scan: for i in 0..n {
         let inst = &block.insts[i];
+        if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
+            continue;
+        }
         // The self-zero-test shapes.
         let v = match inst.opcode {
-            X86Opcode::TestRR => match (inst.operands.first(), inst.operands.get(1)) {
-                (Some(X86ISelOperand::VReg(a)), Some(X86ISelOperand::VReg(b))) if a == b => *a,
+            X86Opcode::TestRR => match inst.operands.as_slice() {
+                [X86ISelOperand::VReg(a), X86ISelOperand::VReg(b)] if a == b => *a,
                 _ => continue,
             },
-            X86Opcode::CmpRI => match (inst.operands.first(), inst.operands.get(1)) {
-                (Some(X86ISelOperand::VReg(a)), Some(X86ISelOperand::Imm(0))) => *a,
+            X86Opcode::CmpRI => match inst.operands.as_slice() {
+                [X86ISelOperand::VReg(a), X86ISelOperand::Imm(0)] => *a,
                 _ => continue,
             },
             _ => continue,
@@ -5305,26 +6078,33 @@ fn redundant_self_test_elision_run_on_block(
         while j > 0 {
             j -= 1;
             let prev = &block.insts[j];
-            let defines_v = crate::effects::x86_produces_value(prev.opcode)
-                && matches!(prev.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == v);
+            if prev.proof_origin.is_some() || prev.flags != prev.opcode.default_flags() {
+                continue 'scan;
+            }
+            let defines_v = crate::effects::x86_may_defined_vregs(prev).any(|d| d.id == v.id);
             if defines_v {
-                if !zf_per_result_def(prev.opcode) {
+                if !zf_per_result_def(prev.opcode)
+                    || !matches!(prev.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == v)
+                {
                     continue 'scan;
                 }
                 found_def = true;
                 break;
             }
-            if x86_writes_flags(prev.opcode) {
+            if x86_writes_flags(prev.opcode) || flags_barrier_for_cfg_scan(prev) {
                 continue 'scan;
             }
         }
         if !found_def {
             continue;
         }
-        // (3): every flag reader after the test (until a flag writer or block
-        // end) must be ZF-only.
-        for k in (i + 1)..n {
-            let later = &block.insts[k];
+        // (3): every reader before a full overwrite must be ZF-only. Partial
+        // writers may preserve CF/OF, whose values differ after this rewrite.
+        let mut flags_overwritten = false;
+        for later in &block.insts[i + 1..n] {
+            if later.proof_origin.is_some() || later.flags != later.opcode.default_flags() {
+                continue 'scan;
+            }
             if x86_reads_flags(later.opcode) {
                 let cc_ok = match later.opcode {
                     X86Opcode::Jcc | X86Opcode::Setcc => {
@@ -5346,8 +6126,22 @@ fn redundant_self_test_elision_run_on_block(
                     continue 'scan;
                 }
             }
-            if x86_writes_flags(later.opcode) {
+            if condition_flag_overwrite(later) == FlagOverwrite::Full {
+                flags_overwritten = true;
                 break; // later readers see the new flags, not ours.
+            }
+            if flags_barrier_for_cfg_scan(later) {
+                continue 'scan;
+            }
+        }
+        if !flags_overwritten && !block.successors.is_empty() {
+            let live_in = live_in.get_or_insert_with(|| flags_live_in_by_block(func));
+            if block
+                .successors
+                .iter()
+                .any(|succ| live_in.get(succ).copied().unwrap_or(true))
+            {
+                continue;
             }
         }
         delete_at = Some(i);
@@ -5364,8 +6158,7 @@ fn redundant_self_test_elision_run_on_block(
 }
 
 // ---------------------------------------------------------------------------
-// Local address-chain fold (X9 slice 2; DEFAULT-ON,
-// `TCG_NO_X86_ADDR_CHAIN_FOLD` opts out)
+// Local address-chain fold (X9 slice 2)
 //
 //   mov  t0, base           ; MovRR copy hop
 //   add  t0, #imm           ; AddRI (tied or 3-op)   -> disp accumulation
@@ -5426,46 +6219,277 @@ fn redundant_self_test_elision_run_on_block(
 //      shape actually changed (avoids `changed=true` fixpoint churn).
 // ---------------------------------------------------------------------------
 
-/// Env gate for the local address-chain fold. DEFAULT-ON after the
-/// 2026-07-20 record (adversarial review, 600+-seed differential fuzz/soak
-/// across TCG_OPT_LEVEL 0/2/3, 18/18 bench checksums, proofs-ON discharge);
-/// `TCG_NO_X86_ADDR_CHAIN_FOLD` is the forensic opt-out (the legacy opt-in
-/// name is accepted and redundant).
-fn addr_chain_fold_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_ADDR_CHAIN_FOLD").is_none()
+/// Set once by [`set_sib_scale1_fold_disabled`]; `true` disables the SIB
+/// scale-1 index fold.
+static SIB_SCALE1_FOLD_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install this fold's opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-sib-scale1-fold`). `true` disables the fold.
+///
+/// Under `trustc` the `TCG_NO_X86_SIB_SCALE1_FOLD` variable is REFUSED before the
+/// backend loads, so this setter is the only channel that reaches the fold there —
+/// and without it the fold could not be A/B'd through the bridge at all.
+pub fn set_sib_scale1_fold_disabled(disabled: bool) -> bool {
+    match SIB_SCALE1_FOLD_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => SIB_SCALE1_FOLD_DISABLED.get() == Some(&requested),
+    }
 }
 
-/// SIB-base LEA fold — DEFAULT-ON (`TCG_NO_X86_SIB_BASE_FOLD` is the forensic
-/// opt-out). Folds each stack-slot base-`Lea` into its indexed SIB memory operand,
-/// eliminating the redundant per-access `leaq -N(%rbp)` (trust-cg had 0 folded
-/// indexed accesses vs LLVM's 11-22 on the sort cluster). Composes with the
-/// default-on cmov-swap: cmov-swap models the folded `StackSlot`-SIB bases
-/// (`x86_cmov_swap.rs` `sib_base`), so the swap-diamond bench (b06) keeps cmov-swap
-/// AND the tighter addressing — no regression. Measured (cmov+fold vs cmov-only):
-/// b06 ~1.5 (no regression, was 2.35 pre-fix), b07 −14% / b18 −15% / b05 −10%;
-/// composed geomean ~0.95-0.98. The fold runs inside `X86Peephole::run_impl` (one
-/// scheduled pass), so flipping it default-on does not change the pass count.
-/// Byte-element SIB addressing — DEFAULT-ON (`TCG_NO_X86_BYTE_SIB` is the
-/// forensic opt-out, and the handle for a PAIRED A/B inside ONE dylib).
-///
-/// Gates BOTH halves of the byte-indexing fix together, because neither is
-/// useful alone:
-///   * the 8-bit `MovRM8`/`MovMR8` arms of `sib_foldable_mem_op` (there was no
-///     `MovRM8Sib`/`MovMR8Sib` opcode at all before), and
-///   * the SCALE-1 arm of `try_sib_addr_fold_from_add` (a byte array indexes at
-///     scale 1, so ISel emits a bare `AddRR` with no scale-def to anchor on).
-///
-/// Together they let `&[u8]` / `Vec<u8>` / `[u8; N]` element accesses carry
-/// their address in the memory operand instead of paying a base-`Lea` plus an
-/// `Add` per access. Composes with `sib_base_lea_fold`, which then folds the
-/// stack-slot base into the SIB displacement.
-fn byte_sib_fold_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_BYTE_SIB").is_none()
+/// Whether the scale-1 index fold proves flag-deadness with the CROSS-BLOCK
+/// [`X86FlagLiveness`] analysis rather than the block-local scan. DEFAULT ON;
+/// `-Ztrust-ir-cg-args=no-x86-sib-crossblock-flags` is the isolating A/B lever —
+/// `no-x86-sib-scale1-fold` cannot isolate it, because that disables the whole
+/// fold rather than just the widened proof.
+fn sib_crossblock_flag_proof_enabled() -> bool {
+    if let Some(disabled) = SIB_CROSSBLOCK_FLAGS_DISABLED.get() {
+        return !*disabled;
+    }
+    !crate::tcg_env_flag("TCG_NO_X86_SIB_CROSSBLOCK_FLAGS")
 }
 
-fn sib_base_lea_fold_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_SIB_BASE_FOLD").is_none()
+static SIB_CROSSBLOCK_FLAGS_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the cross-block flag-proof opt-out from a TRACKED compiler option.
+pub fn set_sib_crossblock_flags_disabled(disabled: bool) -> bool {
+    match SIB_CROSSBLOCK_FLAGS_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => SIB_CROSSBLOCK_FLAGS_DISABLED.get() == Some(&requested),
+    }
 }
+
+fn sib_scale1_index_fold_enabled() -> bool {
+    if let Some(disabled) = SIB_SCALE1_FOLD_DISABLED.get() {
+        return !*disabled;
+    }
+    !crate::tcg_env_flag("TCG_NO_X86_SIB_SCALE1_FOLD")
+}
+
+/// Fold a power-of-two `imul`/`shl` scale-def INTO the scale field of a memory
+/// op that already carries a SIB operand with `scale == 1`.
+///
+/// # The shape, and why the existing fold cannot reach it
+///
+/// [`sib_addr_fold_run_on_block_with_maps`] anchors on a formed
+/// `LeaSib d,[base+index*scale+disp]`, or on an `imul`/`shl` followed by an
+/// `AddRR` that materialises `base + index*scale`. A frontend that lowers an
+/// element address as an explicit stride multiply and then lets the SIB do the
+/// base addition emits NEITHER:
+///
+/// ```text
+///   imul  scaled, index, 8          ; ImulRRI
+///   mov   dst, [base + scaled*1]    ; MovRMSib, scale == 1
+/// ```
+///
+/// There is no `LeaSib` and no `AddRR`, so the fold has no anchor and the
+/// multiply survives into the hot loop. This arm supplies that anchor:
+///
+/// ```text
+///   mov   dst, [base + index*8]     ; the multiply is free in the SIB
+/// ```
+///
+/// # Why the rewrite is exact
+///
+/// `imul` with 64-bit operands yields the low 64 bits, i.e. `index * k` modulo
+/// 2^64, and SIB address computation is also modulo 2^64. So `(index * k) * 1`
+/// and `index * k` are the SAME value for every input INCLUDING the wrapping
+/// ones — this is an equality, not an approximation, and it is why the arm needs
+/// no range or non-overflow side condition.
+///
+/// # Side conditions (any failure leaves the code alone)
+///
+/// * The memory op's SIB scale is exactly 1, and its index is a VReg.
+/// * That index is globally single-def, its def is in THIS block before the
+///   memory op, and [`sib_scale_def`] reads it as a power-of-two `ImulRRI`/
+///   `ShlRI` with scale in `{2,4,8}` (scale 1 would be a no-op rewrite).
+/// * The def carries no `proof_origin` and default flags — the same cleanliness
+///   the sibling folds require, so a proof-carrying instruction is never moved.
+/// * The scale-def's SOURCE register is not redefined between the def and the
+///   memory op. Without this the rewritten SIB would read a later value of the
+///   source instead of the one that was multiplied.
+/// * The index is used exactly once (by this memory op), and the scale-def's
+///   RFLAGS are dead there, so deleting the multiply is observationally
+///   invisible. A multi-use index is left alone rather than partially rewritten.
+fn sib_scale1_index_fold_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    counts: &FnUseDefCounts,
+    flags: &X86FlagLiveness,
+) -> bool {
+    let Some(block) = func.blocks.get(&block_id) else {
+        return false;
+    };
+    let insts = block.insts.clone();
+    // scale-def index -> (new scale, source vreg, every memory op to rewrite)
+    let mut edits: Vec<(usize, u8, VReg, Vec<usize>)> = Vec::new();
+
+    for (def_idx, def) in insts.iter().enumerate() {
+        if def.proof_origin.is_some() {
+            continue;
+        }
+        let Some(X86ISelOperand::VReg(scaled)) = def.operands.first() else {
+            continue;
+        };
+        let scaled = *scaled;
+        if counts.def_count(scaled) != 1 {
+            continue;
+        }
+        let Some((new_scale, src)) = sib_scale_def(def) else {
+            continue;
+        };
+        if new_scale == 1 {
+            continue;
+        }
+        // Every appearance of `scaled` must be a scale-1 SIB index, and every
+        // one of its uses must be in THIS block. A use anywhere else -- in
+        // another block, as a plain register operand, or as a SIB base -- means
+        // the multiply is still needed, so rewriting would keep it and gain
+        // nothing while raising register pressure.
+        let mut mem_uses: Vec<usize> = Vec::new();
+        let mut appearances: u32 = 0;
+        let mut disqualified = false;
+        for (use_idx, inst) in insts.iter().enumerate().skip(def_idx + 1) {
+            let (as_scale1_index, elsewhere) = scale1_index_appearances(inst, scaled);
+            appearances += as_scale1_index + elsewhere;
+            if elsewhere > 0 || as_scale1_index > 1 {
+                disqualified = true;
+                break;
+            }
+            if as_scale1_index == 1 {
+                if inst.proof_origin.is_some() {
+                    disqualified = true;
+                    break;
+                }
+                mem_uses.push(use_idx);
+            }
+        }
+        if disqualified || mem_uses.is_empty() || appearances != counts.use_count(scaled) {
+            continue;
+        }
+        // The multiplied SOURCE must not be redefined between the multiply and
+        // the LAST rewritten use; otherwise the rewritten SIB would index on a
+        // later value than the one that was multiplied.
+        let last_use = *mem_uses.last().expect("non-empty");
+        if insts[def_idx + 1..last_use]
+            .iter()
+            .any(|i| local_fold_defines_vreg(i, src))
+        {
+            continue;
+        }
+        // Deleting the multiply must not lose observable flags.
+        //
+        // This used the block-LOCAL `sib_fold_flags_dead`, which refuses at the
+        // block terminator. That is where `b1_mispredict` lost: its
+        // `ImulRRI v91, v89, 8` is the second-to-last instruction of its block and
+        // the `AndRI _, _, 6` that discharges the flag obligation is in the
+        // fall-through SUCCESSOR, so the scale-8 arm could never fire and the
+        // multiply plus its feeding copy stayed in the hot loop.
+        // `sib_fold_falls_back_to_scale_1_and_retains_the_chain_when_flags_may_be_live`
+        // pins that fallback, and its doc names the remedy: "only by widening the
+        // flag-deadness proof". [`X86FlagLiveness`] IS that widening — the
+        // cross-block RFLAGS analysis written for this exact shape, already the
+        // basis of x86 DCE's flag reasoning — so this asks it instead.
+        //
+        // The snapshot stays valid while this pass mutates the function, by the
+        // argument in that module: every deletion here is justified by "the flags
+        // this instruction writes are dead", which cannot move a block's entry
+        // verdict from dead to live. The caller re-analyzes after a block changes
+        // anyway, so the question does not arise.
+        let flags_dead = if sib_crossblock_flag_proof_enabled() {
+            flags.flags_dead_after(&insts, block_id, def_idx)
+        } else {
+            sib_fold_flags_dead(&insts, def_idx)
+        };
+        if !flags_dead {
+            continue;
+        }
+        edits.push((def_idx, new_scale, src, mem_uses));
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+    let block = func.blocks.get_mut(&block_id).expect("block existed above");
+    let mut to_delete: Vec<usize> = Vec::new();
+    for (def_idx, new_scale, src, mem_uses) in edits {
+        for mem_idx in mem_uses {
+            if let Some(slot) = block.insts[mem_idx]
+                .operands
+                .iter_mut()
+                .find(|o| matches!(o, X86ISelOperand::SibMemAddr { .. }))
+                && let X86ISelOperand::SibMemAddr { index, scale, .. } = slot
+            {
+                **index = X86ISelOperand::VReg(src);
+                *scale = new_scale;
+            }
+        }
+        to_delete.push(def_idx);
+    }
+    to_delete.sort_unstable();
+    to_delete.dedup();
+    for idx in to_delete.into_iter().rev() {
+        block.insts.remove(idx);
+    }
+    true
+}
+
+/// Count how `v` appears in `inst`, split into "as the index of a scale-1 SIB
+/// operand" and "anywhere else".
+///
+/// The split is the safety condition for retiring the multiply that defines `v`.
+/// Only the first kind can be rewritten to index on the pre-multiply source; any
+/// appearance of the second kind (a plain register operand, a SIB BASE, or the
+/// index of a SIB whose scale is not 1) still needs `v`'s multiplied value, so
+/// the multiply must stay and the fold declines. `MovMRSib [base+v*1], v` — a
+/// store OF the index THROUGH the index — is exactly the case this rejects.
+fn scale1_index_appearances(inst: &X86ISelInst, v: VReg) -> (u32, u32) {
+    let mut as_scale1_index = 0;
+    let mut elsewhere = 0;
+    for op in &inst.operands {
+        match op {
+            X86ISelOperand::VReg(u) if *u == v => elsewhere += 1,
+            X86ISelOperand::MemAddr { base, .. } => {
+                if matches!(base.as_ref(), X86ISelOperand::VReg(u) if *u == v) {
+                    elsewhere += 1;
+                }
+            }
+            X86ISelOperand::SibMemAddr {
+                base, index, scale, ..
+            } => {
+                if matches!(base.as_ref(), X86ISelOperand::VReg(u) if *u == v) {
+                    elsewhere += 1;
+                }
+                if matches!(index.as_ref(), X86ISelOperand::VReg(u) if *u == v) {
+                    if *scale == 1 {
+                        as_scale1_index += 1;
+                    } else {
+                        elsewhere += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (as_scale1_index, elsewhere)
+}
+
+// SIB-base LEA fold: folds each stack-slot base-`Lea` into its indexed SIB
+// memory operand, eliminating the redundant per-access `leaq -N(%rbp)`
+// (trust-cg had 0 folded indexed accesses vs LLVM's 11-22 on the sort
+// cluster). Composes with the default-on cmov-swap: cmov-swap models the
+// folded `StackSlot`-SIB bases (`x86_cmov_swap.rs` `sib_base`), so the
+// swap-diamond bench (b06) keeps cmov-swap AND the tighter addressing.
+// Measured (cmov+fold vs cmov-only): b06 ~1.5 (was 2.35 pre-fix), b07 −14% /
+// b18 −15% / b05 −10%; composed geomean ~0.95-0.98.
+//
+// Byte-element SIB addressing has two halves that are only useful together:
+//   * the 8-bit `MovRM8`/`MovzxRM8`/`MovMR8` arms of `sib_foldable_mem_op`, and
+//   * the SCALE-1 arm of `try_sib_addr_fold_from_add` (a byte array indexes at
+//     scale 1, so ISel emits a bare `AddRR` with no scale-def to anchor on).
+// Together they let `&[u8]` / `Vec<u8>` / `[u8; N]` element accesses carry
+// their address in the memory operand instead of paying a base-`Lea` plus an
+// `Add` per access; `sib_base_lea_fold` then folds the stack-slot base into
+// the SIB displacement.
 
 /// Run the SIB-base LEA fold over `func` (the body of the `X86SibBaseFold` pass).
 /// Builds the function-wide clean base-`Lea` and `MovRR`-copy indices, then folds
@@ -5473,16 +6497,17 @@ fn sib_base_lea_fold_enabled() -> bool {
 /// same-block VReg) base, leaving the now-dead base-`Lea`s for DCE. Extracted so
 /// it can run LATE — after cmov-swap / if-convert, whose diamond recognizers
 /// match the PRE-fold addressing (see the note in `run_impl`). Returns whether
-/// anything changed. Inert unless `TCG_X86_SIB_BASE_FOLD` is set.
-pub fn sib_base_lea_fold(func: &mut X86ISelFunction) -> bool {
-    if !sib_base_lea_fold_enabled() {
-        return false;
-    }
-    let maps = SibFoldVRegMaps::build(func);
+/// anything changed. The measured evidence is in the comment above it.
+///
+/// `counts` must describe `func` AS IT IS ON ENTRY — the caller supplies it so
+/// one build can serve several passes. This pass consults only
+/// `def_count`/`use_count`, which is exactly `FnUseDefCounts`; it never needs
+/// the mention-block half of [`SibFoldVRegMaps`].
+pub(crate) fn sib_base_lea_fold(func: &mut X86ISelFunction, counts: &FnUseDefCounts) -> bool {
+    let maps = counts;
     // Function-wide index of clean, single-def base-`Lea`s (the `&arr` LEA is
     // loop-invariant, hoisted to a preheader; a block-local scan would miss it).
-    let mut lea_defs: std::collections::HashMap<VReg, LeaBaseDef> =
-        std::collections::HashMap::new();
+    let mut lea_defs: FxHashMap<VReg, LeaBaseDef> = FxHashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -5514,7 +6539,7 @@ pub fn sib_base_lea_fold(func: &mut X86ISelFunction) -> bool {
     }
     // Function-wide index of clean, single-def register copies (`MovRR b, s`):
     // the SIB base is a COPY of the `&arr` LEA, resolved through this chain.
-    let mut copy_src: std::collections::HashMap<VReg, VReg> = std::collections::HashMap::new();
+    let mut copy_src: FxHashMap<VReg, VReg> = FxHashMap::default();
     for block in func.blocks.values() {
         for inst in &block.insts {
             if inst.opcode == X86Opcode::MovRR
@@ -5531,7 +6556,7 @@ pub fn sib_base_lea_fold(func: &mut X86ISelFunction) -> bool {
     }
     let mut changed = false;
     for block_id in func.block_order.clone() {
-        if sib_base_lea_fold_run_on_block(func, block_id, &maps, &lea_defs, &copy_src) {
+        if sib_base_lea_fold_run_on_block(func, block_id, maps, &lea_defs, &copy_src) {
             changed = true;
         }
     }
@@ -5546,26 +6571,14 @@ pub fn sib_base_lea_fold(func: &mut X86ISelFunction) -> bool {
 /// the same underlying register (the dirty-high-bits class), so a narrow def
 /// must stop the resolver / poison the window exactly like a full def.
 fn local_fold_defines_vreg(inst: &X86ISelInst, v: VReg) -> bool {
-    if matches!(
-        inst.opcode,
-        X86Opcode::Xchg
-            | X86Opcode::Cmpxchg
-            | X86Opcode::Cmpxchg8
-            | X86Opcode::Cmpxchg16
-            | X86Opcode::AtomicRmwCasLoop
-            | X86Opcode::AtomicRmwCasLoop8
-            | X86Opcode::AtomicRmwCasLoop16
-    ) {
-        return inst
-            .operands
-            .iter()
-            .any(|op| matches!(op, X86ISelOperand::VReg(d) if d.id == v.id));
+    if crate::effects::x86_may_defined_vregs(inst).any(|d| d.id == v.id) {
+        return true;
     }
     // ANY instruction with a VReg operand 0 matching the id is treated as a
-    // POTENTIAL def (fail-closed) — NOT gated on `x86_produces_value`,
-    // which deliberately excludes StackAlloc even though StackAlloc DOES
-    // write its operand-0 vreg (the allocated address); gating on it would
-    // let the resolver walk past such a def to a stale one
+    // POTENTIAL def (fail-closed) — NOT gated on `x86_produces_value`, which
+    // excluded StackAlloc until it was taught that StackAlloc writes its
+    // operand-0 vreg (the allocated address); gating on a classifier would
+    // let the resolver walk past any def it misses to a stale one
     // (adversarial-review finding). Treating a use-position operand 0
     // (e.g. CmpRR's) as a def merely terminates resolution early:
     // conservative, never wrong.
@@ -5647,6 +6660,24 @@ fn classify_local_chain_link(inst: &X86ISelInst, v: VReg) -> Option<LocalChainLi
                 X86ISelOperand::VReg(s1),
                 X86ISelOperand::VReg(s2),
             ] if *d == v && g64(d) && g64(s1) && g64(s2) => Some(LocalChainLink::AddReg(*s1, *s2)),
+            _ => None,
+        },
+        // `Lea d, [s + k]`: d := s + sign_extend(k), the value `AddRI d, s, k`
+        // computes, with no flag write. This is how the selector spells a
+        // constant field offset (`StructGep`), and what the constant-index SIB
+        // fold leaves behind a derived base. Only a Gpr64 register base is a
+        // link: a `StackSlot` base, or any other base operand, ends resolution
+        // at `d`.
+        X86Opcode::Lea => match inst.operands.as_slice() {
+            [
+                X86ISelOperand::VReg(d),
+                X86ISelOperand::MemAddr { base, disp },
+            ] if *d == v && g64(d) => match base.as_ref() {
+                X86ISelOperand::VReg(s) if g64(s) => {
+                    Some(LocalChainLink::AddImm(*s, i64::from(*disp)))
+                }
+                _ => None,
+            },
             _ => None,
         },
         _ => None,
@@ -5870,15 +6901,6 @@ fn addr_chain_fold_run_on_block(
         return false;
     }
 
-    if std::env::var_os("TCG_X86_ADDR_CHAIN_FOLD_LOG").is_some() {
-        eprintln!(
-            "x86-addr-chain-fold: rewrote {} mem op(s) in `{}` block #{:?}",
-            rewrites.len(),
-            func.name,
-            block_id.0,
-        );
-    }
-
     // `addr_chain_fold_run_on_block` opens with
     // `let Some(block) = func.blocks.get(&block_id) else { return false }`;
     // the rewrite-collection scan between there and here only reads `func`.
@@ -5892,6 +6914,198 @@ fn addr_chain_fold_run_on_block(
         } else {
             vec![r.new_addr, r.value_operand]
         };
+    }
+    true
+}
+
+/// Depth bound of [`local_const_value`]: a constant index is at most a
+/// strength-reduced multiply of a multiply of a literal.
+const LOCAL_CONST_MAX_DEPTH: usize = 4;
+
+/// The 64-bit value `v` holds immediately before `insts[pos]`, when the
+/// instructions of this block alone determine it as a compile-time constant.
+///
+/// `v` must be a `Gpr64` register. Its nearest reaching definition in the
+/// block is found CLASS-BLIND ([`nearest_local_def_before`]: any instruction
+/// that may write the id at any width, or carries it as operand 0), so a
+/// narrow write between a constant definition and `pos` ends the walk at an
+/// instruction no arm below accepts. A register with no definition in the
+/// block (live-in) is not a constant here.
+///
+/// The accepted definitions, each with default flags, no `proof_origin`, and
+/// `Gpr64` registers throughout:
+///
+/// * `MovRI v, k`: the value is `k`.
+/// * `LeaSib v, [x + y*s + d]` with `s` in `{1,2,4,8}`: `x + y*s + d` modulo
+///   2^64, which is what a 64-bit `lea` computes, with `x` and `y` read
+///   immediately before the `lea`.
+/// * `ImulRRI v, x, k` with `k` a sign-extended 32-bit immediate, and the
+///   three-address `ImulRR v, x, y`: the low 64 bits of the product, which is
+///   the wrapping product for every pair of operands.
+///
+/// Nothing is rewritten on the strength of this value except by the caller,
+/// so the multiply forms need no flag condition: their instructions stay in
+/// place until they are dead.
+fn local_const_value(insts: &[X86ISelInst], pos: usize, v: VReg, depth: usize) -> Option<i64> {
+    if depth == 0 || v.class != RegClass::Gpr64 {
+        return None;
+    }
+    let def_idx = nearest_local_def_before(insts, pos, v)?;
+    let inst = &insts[def_idx];
+    if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
+        return None;
+    }
+    let g64 = |r: &VReg| r.class == RegClass::Gpr64;
+    let source = |r: &VReg| local_const_value(insts, def_idx, *r, depth - 1);
+    match (inst.opcode, inst.operands.as_slice()) {
+        (X86Opcode::MovRI, [X86ISelOperand::VReg(d), X86ISelOperand::Imm(k)]) if *d == v => {
+            Some(*k)
+        }
+        (
+            X86Opcode::LeaSib,
+            [
+                X86ISelOperand::VReg(d),
+                X86ISelOperand::SibMemAddr {
+                    base,
+                    index,
+                    scale,
+                    disp,
+                },
+            ],
+        ) if *d == v && matches!(*scale, 1 | 2 | 4 | 8) => match (base.as_ref(), index.as_ref()) {
+            (X86ISelOperand::VReg(x), X86ISelOperand::VReg(y)) if g64(x) && g64(y) => Some(
+                source(x)?
+                    .wrapping_add(source(y)?.wrapping_mul(i64::from(*scale)))
+                    .wrapping_add(i64::from(*disp)),
+            ),
+            _ => None,
+        },
+        (
+            X86Opcode::ImulRRI,
+            [
+                X86ISelOperand::VReg(d),
+                X86ISelOperand::VReg(x),
+                X86ISelOperand::Imm(k),
+            ],
+        ) if *d == v && g64(x) && i32::try_from(*k).is_ok() => Some(source(x)?.wrapping_mul(*k)),
+        (
+            X86Opcode::ImulRR,
+            [
+                X86ISelOperand::VReg(d),
+                X86ISelOperand::VReg(x),
+                X86ISelOperand::VReg(y),
+            ],
+        ) if *d == v && g64(x) && g64(y) => Some(source(x)?.wrapping_mul(source(y)?)),
+        _ => None,
+    }
+}
+
+/// Fold a block-local constant SIB index into the displacement:
+///
+/// ```text
+///   mov  i, 3                       ; or any `local_const_value` form
+///   mov  dst, [base + i*8 + 16]     ; MovRMSib
+/// ```
+///
+/// becomes `mov dst, [base + 40]` (`MovRM`). Stores and the 32-bit forms
+/// likewise. The instruction keeps its position and its base register, so no
+/// register is read at a new program point.
+///
+/// # Why the rewrite is exact
+///
+/// The SIB operand addresses `base + i*scale + sext(disp)` modulo 2^64. With
+/// `i` equal to the constant `K` the offset is `K*scale + disp`. The fold
+/// fires only when that sum is exact in `i64` and fits a sign-extended 32-bit
+/// displacement, so the new operand `[base + disp']` names the same address.
+///
+/// # Side conditions (any failure leaves the instruction alone)
+///
+/// * The anchor is `MovRMSib`/`MovMRSib` over a `Gpr64` value or
+///   `MovRM32Sib`/`MovMR32Sib` over a `Gpr32` value, with default flags and no
+///   `proof_origin`, exactly two operands.
+/// * Its base and index are `Gpr64` virtual registers and its scale is 1, 2,
+///   4 or 8. A stack-slot or physical-register base is left to its own folds.
+/// * [`local_const_value`] names the index's value at the anchor.
+/// * `K*scale + disp` does not overflow `i64` and fits `i32`.
+///
+/// Rewrite-only: never deletes instructions (DCE owns the sweep). Returns
+/// whether anything changed.
+fn sib_const_index_fold_run_on_block(
+    func: &mut X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+) -> bool {
+    let Some(block) = func.blocks.get(&block_id) else {
+        return false;
+    };
+    let insts = &block.insts;
+
+    let mut rewrites: Vec<(usize, X86Opcode, usize, X86ISelOperand)> = Vec::new();
+    for (mem_idx, inst) in insts.iter().enumerate() {
+        let (new_opcode, addr_slot, value_class) = match inst.opcode {
+            X86Opcode::MovRMSib => (X86Opcode::MovRM, 1, RegClass::Gpr64),
+            X86Opcode::MovMRSib => (X86Opcode::MovMR, 0, RegClass::Gpr64),
+            X86Opcode::MovRM32Sib => (X86Opcode::MovRM32, 1, RegClass::Gpr32),
+            X86Opcode::MovMR32Sib => (X86Opcode::MovMR32, 0, RegClass::Gpr32),
+            _ => continue,
+        };
+        if inst.proof_origin.is_some()
+            || inst.flags != inst.opcode.default_flags()
+            || inst.operands.len() != 2
+        {
+            continue;
+        }
+        if !matches!(&inst.operands[1 - addr_slot], X86ISelOperand::VReg(r) if r.class == value_class)
+        {
+            continue;
+        }
+        let X86ISelOperand::SibMemAddr {
+            base,
+            index,
+            scale,
+            disp,
+        } = &inst.operands[addr_slot]
+        else {
+            continue;
+        };
+        let (X86ISelOperand::VReg(b), X86ISelOperand::VReg(i)) = (base.as_ref(), index.as_ref())
+        else {
+            continue;
+        };
+        if b.class != RegClass::Gpr64 || !matches!(*scale, 1 | 2 | 4 | 8) {
+            continue;
+        }
+        let Some(k) = local_const_value(insts, mem_idx, *i, LOCAL_CONST_MAX_DEPTH) else {
+            continue;
+        };
+        let Some(new_disp) = k
+            .checked_mul(i64::from(*scale))
+            .and_then(|offset| offset.checked_add(i64::from(*disp)))
+            .and_then(|offset| i32::try_from(offset).ok())
+        else {
+            continue;
+        };
+        rewrites.push((
+            mem_idx,
+            new_opcode,
+            addr_slot,
+            X86ISelOperand::MemAddr {
+                base: Box::new(X86ISelOperand::VReg(*b)),
+                disp: new_disp,
+            },
+        ));
+    }
+
+    if rewrites.is_empty() {
+        return false;
+    }
+
+    // The scan above only reads `func`, and the block was found at entry.
+    let block = func.blocks.get_mut(&block_id).expect("block existed above");
+    for (mem_idx, new_opcode, addr_slot, new_addr) in rewrites {
+        let mem = &mut block.insts[mem_idx];
+        mem.opcode = new_opcode;
+        mem.flags = new_opcode.default_flags();
+        mem.operands[addr_slot] = new_addr;
     }
     true
 }
@@ -5940,8 +7154,8 @@ struct LeaBaseDef {
 ///   frame-invariant `StackSlot` LEA the resolved base holds the same address.
 fn resolve_sib_base_lea<'a>(
     mut b: VReg,
-    lea_defs: &'a std::collections::HashMap<VReg, LeaBaseDef>,
-    copy_src: &std::collections::HashMap<VReg, VReg>,
+    lea_defs: &'a FxHashMap<VReg, LeaBaseDef>,
+    copy_src: &FxHashMap<VReg, VReg>,
 ) -> Option<&'a LeaBaseDef> {
     for _ in 0..16 {
         if let Some(ld) = lea_defs.get(&b) {
@@ -5958,9 +7172,9 @@ fn resolve_sib_base_lea<'a>(
 fn sib_base_lea_fold_run_on_block(
     func: &mut X86ISelFunction,
     block_id: trust_cg_lower::instructions::Block,
-    maps: &SibFoldVRegMaps,
-    lea_defs: &std::collections::HashMap<VReg, LeaBaseDef>,
-    copy_src: &std::collections::HashMap<VReg, VReg>,
+    maps: &FnUseDefCounts,
+    lea_defs: &FxHashMap<VReg, LeaBaseDef>,
+    copy_src: &FxHashMap<VReg, VReg>,
 ) -> bool {
     let Some(block) = func.blocks.get(&block_id) else {
         return false;
@@ -5986,6 +7200,7 @@ fn sib_base_lea_fold_run_on_block(
                 | X86Opcode::MovMRSib
                 | X86Opcode::MovRM8Sib
                 | X86Opcode::MovMR8Sib
+                | X86Opcode::MovzxRM8Sib
                 // Scalar-FP SIB loads participate too: a stack-allocated float
                 // array (`let a = [0f64; N]`) otherwise re-materializes its
                 // base LEA per access exactly like the GPR case.
@@ -6066,15 +7281,6 @@ fn sib_base_lea_fold_run_on_block(
         return false;
     }
 
-    if std::env::var_os("TCG_X86_SIB_BASE_FOLD_LOG").is_some() {
-        eprintln!(
-            "x86-sib-base-fold: rewrote {} SIB base(s) in `{}` block #{:?}",
-            rewrites.len(),
-            func.name,
-            block_id.0,
-        );
-    }
-
     // `sib_base_lea_fold_run_on_block` opens with
     // `let Some(block) = func.blocks.get(&block_id) else { return false }`;
     // the rewrite-collection scan between there and here only reads `func`.
@@ -6139,6 +7345,551 @@ mod tests {
         entry_insts(func).iter().map(|inst| inst.opcode).collect()
     }
 
+    /// REPRODUCER for the dead address chain measured in `b1_mispredict`'s hot
+    /// loop (`reports/perf/2026-09-28-linux-x86-64-first-runtime/`): after the SIB
+    /// fold rewrites a store's address into `[slot + index*8]`, the `imul`/`add`
+    /// chain that computed the old address should be swept.
+    ///
+    /// The shipped code keeps `movq %r13,%rcx ; addq %rax,%rcx` in that loop with
+    /// nothing reading it, and the cause was NOT established by reading — frame
+    /// lowering only rewrites operands, and DCE runs immediately after this pass
+    /// with `AddRR` in its pure flag-writing allowlist. This test asks the question
+    /// directly on the exact shape, so the answer is a pass/fail rather than an
+    /// argument.
+    #[test]
+    fn sib_fold_retires_the_whole_address_chain_when_flags_are_dead() {
+        // v1 = &slot0 ; v3 = v2 * 8 ; v4 = v1 + v3 ; v5 = v4 ; [v5] = v6
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    vreg(1),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(0)),
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(7), X86ISelOperand::Imm(8)]),
+            X86ISelInst::new(X86Opcode::ImulRR, vec![vreg(3), vreg(2), vreg(7)]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(4), vreg(1), vreg(3)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(5), vreg(4)]),
+            X86ISelInst::new(
+                X86Opcode::MovMR,
+                vec![
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(vreg(5)),
+                        disp: 0,
+                    },
+                    vreg(6),
+                ],
+            ),
+        ]);
+        func.stack_slots = vec![trust_cg_lower::function::StackSlotInfo::new(128, 8)];
+        // The latch of a real loop body: a FULL flag overwrite after the store,
+        // then the terminator. The DCE flag obligation
+        // (`flags_written_here_are_dead`) is discharged by that overwrite and
+        // NOT by the terminator — see the companion test below, which drops the
+        // `cmp` and pins that the sweep then correctly declines.
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(8), vreg(9)]),
+        );
+        func.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+        let before = entry_opcodes(&func);
+        let mut pm = X86PassManager::new()
+            .with_pass(Box::new(crate::X86Peephole::default()))
+            .with_pass(Box::new(crate::X86DeadCodeElimination));
+        pm.run_once(&mut func);
+        let after = entry_opcodes(&func);
+
+        let store_folded = entry_insts(&func)
+            .iter()
+            .any(|i| matches!(i.opcode, X86Opcode::MovMRSib));
+        for i in entry_insts(&func) {
+            eprintln!("[sib-fold-dce]   {:?} {:?}", i.opcode, i.operands);
+        }
+        let imuls = after.iter().filter(|o| **o == X86Opcode::ImulRR).count();
+        let adds = after.iter().filter(|o| **o == X86Opcode::AddRR).count();
+
+        // Record what actually happened either way: this test exists to ANSWER
+        // the question, so a decline is as informative as a fold.
+        eprintln!(
+            "[sib-fold-dce] before={before:?}\n[sib-fold-dce] after={after:?}\n\
+             [sib-fold-dce] store_folded_to_sib={store_folded} imul_left={imuls} add_left={adds}"
+        );
+
+        assert!(
+            store_folded,
+            "the store must fold to a SIB address for this test to mean anything: {after:?}"
+        );
+        assert_eq!(
+            adds, 0,
+            "the scale-8 arm supersedes the address computation, so no `add` remains: \
+             {after:?}"
+        );
+        assert_eq!(
+            imuls, 0,
+            "the scale-8 arm scales inside the SIB operand, so the explicit `imul` is \
+             retired too: {after:?}"
+        );
+        assert_eq!(
+            after.iter().filter(|o| **o == X86Opcode::Lea).count(),
+            0,
+            "the SIB operand names the slot directly, so the `lea` that materialised \
+             its address is retired as well: {after:?}"
+        );
+        // Exactness, not just a count: the surviving store must address the slot
+        // with the RAW index at scale 8. Folding the PRE-SCALED index at scale 1
+        // would also erase the `add`, but only by keeping the `imul` alive — and
+        // asserting on counts alone would not tell the two apart.
+        let store = entry_insts(&func)
+            .iter()
+            .find(|i| i.opcode == X86Opcode::MovMRSib)
+            .expect("the folded store")
+            .clone();
+        match &store.operands[0] {
+            X86ISelOperand::SibMemAddr {
+                base,
+                index,
+                scale,
+                disp,
+            } => {
+                assert_eq!(**base, X86ISelOperand::StackSlot(0), "slot base: {store:?}");
+                assert_eq!(
+                    **index,
+                    vreg(2),
+                    "the RAW index, not the product: {store:?}"
+                );
+                assert_eq!(*scale, 8, "scaled inside the operand: {store:?}");
+                assert_eq!(*disp, 0);
+            }
+            other => panic!("expected a SIB address, got {other:?}"),
+        }
+    }
+
+    /// The FALLBACK arm, and its cost, pinned exactly.
+    ///
+    /// `sib_fold_flags_dead` is what selects between the two arms, and it needs a
+    /// FULL flag overwrite before any flag reader, refusing at a call, branch,
+    /// terminator, or the end of the block. Drop the `cmp` from the companion test
+    /// above and that proof fails, so the scale-8 arm cannot fire: the fold takes
+    /// the scale-1 arm instead, addressing the slot with the PRE-SCALED index. The
+    /// `imul` therefore stays live, and the `add` — whose VALUE nothing reads any
+    /// more — stays too, because its RFLAGS write is exactly what could not be
+    /// proven dead.
+    ///
+    /// This is the shape the `b1_mispredict` benchmark ships
+    /// (`imul $8,%rsi,%rax` / `add %rax,%rcx` / `mov %rbx,-0xa8(%rbp,%rax,1)`), so
+    /// this test is where to start when revisiting that sequence. Deleting the
+    /// `add` here would need its flags proven dead, which is the same obligation
+    /// that already failed — so the cost is NOT recoverable by a dead-code pass,
+    /// only by widening the flag-deadness proof or by scaling inside the operand.
+    /// (A DCE tier for value-dead flag-writing ALU was written and measured for
+    /// this: it fires zero times on the codegen corpus, because whenever its flag
+    /// obligation holds the scale-8 arm has already retired the chain. It was not
+    /// kept.)
+    #[test]
+    fn sib_fold_falls_back_to_scale_1_and_retains_the_chain_when_flags_may_be_live() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    vreg(1),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(0)),
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(7), X86ISelOperand::Imm(8)]),
+            X86ISelInst::new(X86Opcode::ImulRR, vec![vreg(3), vreg(2), vreg(7)]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(4), vreg(1), vreg(3)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(5), vreg(4)]),
+            X86ISelInst::new(
+                X86Opcode::MovMR,
+                vec![
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(vreg(5)),
+                        disp: 0,
+                    },
+                    vreg(6),
+                ],
+            ),
+        ]);
+        func.stack_slots = vec![trust_cg_lower::function::StackSlotInfo::new(128, 8)];
+        // No flag overwrite and no terminator: flags fall off the block end.
+        let mut pm = X86PassManager::new()
+            .with_pass(Box::new(crate::X86Peephole::default()))
+            .with_pass(Box::new(crate::X86DeadCodeElimination));
+        pm.run_once(&mut func);
+        let after = entry_opcodes(&func);
+
+        assert_eq!(
+            after.iter().filter(|o| **o == X86Opcode::AddRR).count(),
+            1,
+            "the `add`'s destination is unread, but its RFLAGS write may be live-out, \
+             so no pass here is entitled to delete it: {after:?}"
+        );
+        let store = entry_insts(&func)
+            .iter()
+            .find(|i| i.opcode == X86Opcode::MovMRSib)
+            .expect("the fallback arm still folds the store")
+            .clone();
+        match &store.operands[0] {
+            X86ISelOperand::SibMemAddr { index, scale, .. } => {
+                assert_eq!(
+                    *scale, 1,
+                    "the fallback arm addresses at scale 1: {store:?}"
+                );
+                assert_eq!(
+                    **index,
+                    vreg(3),
+                    "and with the PRE-SCALED product as the index, which is what keeps \
+                     the `imul` live: {store:?}"
+                );
+            }
+            other => panic!("expected a SIB address, got {other:?}"),
+        }
+        assert_eq!(
+            after
+                .iter()
+                .filter(|o| matches!(o, X86Opcode::ImulRR | X86Opcode::ImulRRI))
+                .count(),
+            1,
+            "the `imul` is live: the SIB operand reads its product: {after:?}"
+        );
+    }
+
+    #[test]
+    fn cfg_analysis_preserves_flags_across_partial_writes() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(0), vreg(1), vreg(2)]),
+            X86ISelInst::new(X86Opcode::Inc, vec![vreg(3)]),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        ]);
+        func.ensure_block(Block(1));
+        func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(1)];
+        func.push_inst(Block(1), X86ISelInst::new(X86Opcode::Dec, vec![vreg(4)]));
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vreg32(5), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+        );
+        let live_in = flags_live_in_by_block(&func);
+        assert!(live_in[&Block(1)], "DEC preserves incoming carry");
+        assert!(!flags_dead_at(&func, &live_in, Block(0), 0));
+    }
+
+    #[test]
+    fn self_test_preserves_flags_across_partial_writes() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(0), vreg(1), vreg(2)]),
+            X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+            X86ISelInst::new(X86Opcode::Inc, vec![vreg(3)]),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vreg32(4), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+        ]);
+        assert!(!redundant_self_test_elision_run_on_block(
+            &mut func,
+            Block(0)
+        ));
+        assert_eq!(entry_insts(&func)[1].opcode, X86Opcode::TestRR);
+    }
+
+    #[test]
+    fn self_test_preserves_flags_read_in_successor() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(0), vreg(1), vreg(2)]),
+            X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        ]);
+        func.ensure_block(Block(1));
+        func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(1)];
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vreg32(4), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+        );
+        assert!(!redundant_self_test_elision_run_on_block(
+            &mut func,
+            Block(0)
+        ));
+        // A full overwrite at successor entry makes the self-test removable.
+        func.blocks.get_mut(&Block(1)).unwrap().insts.insert(
+            0,
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(5), vreg(1), vreg(2)]),
+        );
+        assert!(redundant_self_test_elision_run_on_block(
+            &mut func,
+            Block(0)
+        ));
+    }
+
+    #[test]
+    fn self_test_preserves_flags_across_call_barriers() {
+        for call_index in [1, 2] {
+            let mut func = make_func(vec![
+                X86ISelInst::new(X86Opcode::AddRR, vec![vreg(0), vreg(1), vreg(2)]),
+                X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+                X86ISelInst::new(
+                    X86Opcode::Setcc,
+                    vec![vreg32(3), X86ISelOperand::CondCode(X86CondCode::E)],
+                ),
+            ]);
+            func.blocks
+                .get_mut(&Block(0))
+                .unwrap()
+                .insts
+                .insert(call_index, X86ISelInst::new(X86Opcode::Call, vec![]));
+            assert!(
+                !redundant_self_test_elision_run_on_block(&mut func, Block(0)),
+                "call at {call_index} must block self-test elision"
+            );
+        }
+    }
+
+    fn self_test_window(test: X86ISelInst, middle: Option<X86ISelInst>) -> X86ISelFunction {
+        let mut insts = vec![X86ISelInst::new(
+            X86Opcode::AddRR,
+            vec![test.operands[0].clone(), vreg(1), vreg(2)],
+        )];
+        insts.extend(middle);
+        insts.push(test);
+        insts.push(X86ISelInst::new(
+            X86Opcode::Setcc,
+            vec![vreg32(4), X86ISelOperand::CondCode(X86CondCode::E)],
+        ));
+        insts.push(X86ISelInst::new(X86Opcode::Ret, vec![]));
+        make_func(insts)
+    }
+
+    #[test]
+    fn self_test_refuses_narrow_alias_redefinition() {
+        for test in [
+            X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(0), X86ISelOperand::Imm(0)]),
+        ] {
+            // ADD result 1 leaves ZF=0; copying a zero through the 32-bit
+            // alias changes the whole register without changing flags. The
+            // following test MUST set ZF=1 before SETE.
+            let mut func = self_test_window(
+                test,
+                Some(X86ISelInst::new(
+                    X86Opcode::MovRR32,
+                    vec![vreg32(0), vreg32(3)],
+                )),
+            );
+            assert!(!redundant_self_test_elision_run_on_block(
+                &mut func,
+                Block(0)
+            ));
+            assert_eq!(entry_insts(&func).len(), 5);
+        }
+    }
+
+    #[test]
+    fn self_test_refuses_wide_alias_redefinition() {
+        let test = X86ISelInst::new(X86Opcode::TestRR, vec![vreg32(0), vreg32(0)]);
+        let mut func = self_test_window(
+            test,
+            Some(X86ISelInst::new(X86Opcode::MovRR, vec![vreg(0), vreg(3)])),
+        );
+        let anchor = &mut func.blocks.get_mut(&Block(0)).unwrap().insts[0];
+        anchor.operands = vec![vreg32(0), vreg32(1), vreg32(2)];
+        assert!(!redundant_self_test_elision_run_on_block(
+            &mut func,
+            Block(0)
+        ));
+        assert_eq!(entry_insts(&func).len(), 5);
+    }
+
+    #[test]
+    fn self_test_preserves_proof_metadata() {
+        for annotated_at in 0..4 {
+            let mut func = self_test_window(
+                X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+                Some(X86ISelInst::new(X86Opcode::MovRR, vec![vreg(6), vreg(7)])),
+            );
+            func.blocks.get_mut(&Block(0)).unwrap().insts[annotated_at].proof_origin =
+                Some(X86ProofOrigin::AtomicLoad);
+            let before = entry_insts(&func).to_vec();
+            assert!(
+                !redundant_self_test_elision_run_on_block(&mut func, Block(0)),
+                "proof-annotated instruction at {annotated_at} cannot be removed or crossed"
+            );
+            let after = entry_insts(&func);
+            assert_eq!(before.len(), after.len());
+            for (before, after) in before.iter().zip(after) {
+                assert_eq!(before.opcode, after.opcode);
+                assert_eq!(before.operands, after.operands);
+                assert_eq!(before.flags, after.flags);
+                assert_eq!(before.proof_origin, after.proof_origin);
+            }
+        }
+    }
+
+    #[test]
+    fn self_test_preserves_custom_flags() {
+        for guarded_at in 0..4 {
+            let mut func = self_test_window(
+                X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+                Some(X86ISelInst::new(X86Opcode::MovRR, vec![vreg(6), vreg(7)])),
+            );
+            let guarded = &mut func.blocks.get_mut(&Block(0)).unwrap().insts[guarded_at];
+            guarded.flags = guarded.flags.union(InstFlags::READS_MEMORY);
+            let before = entry_insts(&func).to_vec();
+            assert!(!redundant_self_test_elision_run_on_block(
+                &mut func,
+                Block(0)
+            ));
+            assert!(writeback_instructions_unchanged(
+                &before,
+                entry_insts(&func)
+            ));
+        }
+    }
+
+    #[test]
+    fn self_test_requires_exact_shape_and_definition_width() {
+        let mut extra = X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]);
+        extra.operands.push(vreg(8));
+        let mut malformed = self_test_window(extra, None);
+        assert!(!redundant_self_test_elision_run_on_block(
+            &mut malformed,
+            Block(0)
+        ));
+
+        let mut mixed = self_test_window(
+            X86ISelInst::new(X86Opcode::TestRR, vec![vreg32(0), vreg32(0)]),
+            None,
+        );
+        mixed.blocks.get_mut(&Block(0)).unwrap().insts[0].operands[0] = vreg(0);
+        // A nonzero 64-bit result may have zero low bits. It cannot establish
+        // ZF for a narrower test even though the canonical register ID agrees.
+        assert!(!redundant_self_test_elision_run_on_block(
+            &mut mixed,
+            Block(0)
+        ));
+    }
+
+    #[test]
+    fn self_test_keeps_secondary_exchange_writes() {
+        let mut func = self_test_window(
+            X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+            Some(X86ISelInst::new(X86Opcode::Xchg, vec![vreg(7), vreg(0)])),
+        );
+        assert!(!redundant_self_test_elision_run_on_block(
+            &mut func,
+            Block(0)
+        ));
+        assert_eq!(entry_insts(&func).len(), 5);
+    }
+
+    #[test]
+    fn self_test_removes_only_redundant_unannotated_tests() {
+        for test in [
+            X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(0), X86ISelOperand::Imm(0)]),
+        ] {
+            let mut func = self_test_window(
+                test,
+                Some(X86ISelInst::new(X86Opcode::MovRR, vec![vreg(6), vreg(7)])),
+            );
+            let before = entry_insts(&func).to_vec();
+            assert!(redundant_self_test_elision_run_on_block(
+                &mut func,
+                Block(0)
+            ));
+            let expected = [
+                before[0].clone(),
+                before[1].clone(),
+                before[3].clone(),
+                before[4].clone(),
+            ];
+            assert!(writeback_instructions_unchanged(
+                &expected,
+                entry_insts(&func)
+            ));
+        }
+    }
+
+    #[test]
+    fn self_test_policy_isolated_public_optimizer() {
+        const CHILD: &str = "CG_SELF_TEST_POLICY_CASE";
+        const TEST: &str = "x86_peephole::tests::self_test_policy_isolated_public_optimizer";
+        let Ok(case) = std::env::var(CHILD) else {
+            let mut failures = Vec::new();
+            for case in [
+                "default",
+                "zero",
+                "one",
+                "empty",
+                "installed_on",
+                "installed_off",
+            ] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", TEST, "--nocapture", "--test-threads=1"]);
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("TCG_")
+                        || key.to_string_lossy().starts_with("TRUST_CG_")
+                    {
+                        command.env_remove(key);
+                    }
+                }
+                command.env(CHILD, case);
+                match case {
+                    "zero" | "installed_on" => {
+                        command.env("TCG_X86_TEST_ELIDE", "0");
+                    }
+                    "one" | "installed_off" => {
+                        command.env("TCG_X86_TEST_ELIDE", "1");
+                    }
+                    "empty" => {
+                        command.env("TCG_X86_TEST_ELIDE", "");
+                    }
+                    _ => {}
+                }
+                let output = command.output().unwrap();
+                println!(
+                    "case {case}:\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success() {
+                    failures.push(case);
+                }
+            }
+            assert!(failures.is_empty(), "failed cases: {failures:?}");
+            return;
+        };
+        if case.starts_with("installed_") {
+            let enabled = case == "installed_on";
+            assert!(set_test_elide_enabled(enabled));
+            assert!(set_test_elide_enabled(enabled));
+            assert!(!set_test_elide_enabled(!enabled));
+        }
+        let enabled = matches!(case.as_str(), "one" | "empty" | "installed_on");
+        for clobber in [false, true] {
+            let mut func = self_test_window(
+                X86ISelInst::new(X86Opcode::TestRR, vec![vreg(0), vreg(0)]),
+                clobber.then(|| X86ISelInst::new(X86Opcode::MovRR32, vec![vreg32(0), vreg32(3)])),
+            );
+            X86Peephole::default().run_on_function(&mut func);
+            assert_eq!(
+                entry_opcodes(&func).contains(&X86Opcode::TestRR),
+                !enabled || clobber
+            );
+        }
+    }
+
     // ---- sib_base_lea_fold tests -----------------------------------------
 
     fn lea_base(dst: u32, base: X86ISelOperand, disp: i32) -> X86ISelInst {
@@ -6170,9 +7921,8 @@ mod tests {
     }
 
     fn run_sib_base_fold(func: &mut X86ISelFunction) -> bool {
-        let maps = SibFoldVRegMaps::build(func);
-        let mut lea_defs: std::collections::HashMap<VReg, LeaBaseDef> =
-            std::collections::HashMap::new();
+        let maps = FnUseDefCounts::build(func);
+        let mut lea_defs: FxHashMap<VReg, LeaBaseDef> = FxHashMap::default();
         for (block_id, block) in &func.blocks {
             for (idx, inst) in block.insts.iter().enumerate() {
                 if inst.opcode == X86Opcode::Lea
@@ -6196,7 +7946,7 @@ mod tests {
                 }
             }
         }
-        let mut copy_src: std::collections::HashMap<VReg, VReg> = std::collections::HashMap::new();
+        let mut copy_src: FxHashMap<VReg, VReg> = FxHashMap::default();
         for block in func.blocks.values() {
             for inst in &block.insts {
                 if inst.opcode == X86Opcode::MovRR
@@ -8148,395 +9898,66 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Setcc-hoist tests
+    // Setcc/Movzx pair retention
     // -----------------------------------------------------------------------
     //
-    // The pattern `[flag_writer]; Setcc cc, %D; Movzx %D, %D` is rewritten
-    // to `XorRR %D, %D; [flag_writer]; Setcc cc, %D`. See `try_setcc_hoist`
-    // in this file for the hand-proof and the six side conditions.
+    // A `Setcc %D; Movzx %D,%D` pair whose bool is not consumed by a branch
+    // must survive the peephole intact: every register model reads `Setcc` as
+    // a pure def, which is only true while the Movzx follows it. These shapes
+    // were rewritten by the retired setcc-flag-hoist into
+    // `XorRR %D,%D; [flag_writer]; Setcc %D` (Movzx deleted), which the
+    // allocator could not see depended on %D[31:8].
 
     #[test]
-    fn x86_peephole_setcc_hoist_fires_on_canonical_icmp_pair() {
-        // CmpRR %1, %2 ; Setcc E, %D ; Movzx %D, %D
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)])
-                .with_proof_origin(X86ProofOrigin::AtomicLoad),
+    fn x86_peephole_keeps_setcc_movzx_pair() {
+        let setcc = |d: u32, cc: X86CondCode| {
             X86ISelInst::new(
                 X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(peephole.run_on_function(&mut func));
-
-        let insts = entry_insts(&func);
-        assert_eq!(
-            entry_opcodes(&func),
+                vec![vreg32(d), X86ISelOperand::CondCode(cc)],
+            )
+        };
+        let movzx = |d: u32| X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(d), vreg32(d)]);
+        let cases = vec![
+            // Canonical icmp pair, bool consumed only outside the block.
             vec![
-                X86Opcode::XorRR,
-                X86Opcode::CmpRR,
-                X86Opcode::Setcc,
-                X86Opcode::Ret,
-            ]
-        );
-        // Xor clears %D before the compare.
-        assert_eq!(insts[0].operands, vec![vreg32(10), vreg32(10)]);
-        // CmpRR is unchanged and retains its proof_origin.
-        assert_eq!(insts[1].operands, vec![vreg(1), vreg(2)]);
-        assert_eq!(insts[1].proof_origin, Some(X86ProofOrigin::AtomicLoad));
-        // Setcc writes the low byte.
-        assert_eq!(
-            insts[2].operands,
-            vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_fires_on_canonical_testrr_pair() {
-        // TestRR is also a Full flag writer; same pattern should fire.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::TestRR, vec![vreg(1), vreg(1)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::NE)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(peephole.run_on_function(&mut func));
-
-        assert_eq!(
-            entry_opcodes(&func),
+                X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
+                setcc(10, X86CondCode::E),
+                movzx(10),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+            // TestRR flag writer.
             vec![
-                X86Opcode::XorRR,
-                X86Opcode::TestRR,
-                X86Opcode::Setcc,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_inherits_proof_origin() {
-        // Proof-origin on the Setcc should land on the hoisted Xor; if the
-        // Setcc has none, the flag_writer's proof_origin is used.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)])
-                .with_proof_origin(X86ProofOrigin::AtomicLoad),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-        assert!(peephole.run_on_function(&mut func));
-
-        let insts = entry_insts(&func);
-        assert_eq!(insts[0].opcode, X86Opcode::XorRR);
-        // Xor inherits proof_origin from setcc (none here) then flag_writer
-        // (AtomicLoad in this test).
-        assert_eq!(insts[0].proof_origin, Some(X86ProofOrigin::AtomicLoad));
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_declines_on_dst_mismatch() {
-        // Setcc writes to %10 but Movzx reads %11 - not the canonical pair.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(11), vreg32(11)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(!peephole.run_on_function(&mut func));
-        assert_eq!(
-            entry_opcodes(&func),
+                X86ISelInst::new(X86Opcode::TestRR, vec![vreg(1), vreg(1)]),
+                setcc(10, X86CondCode::NE),
+                movzx(10),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+            // Two independent windows.
             vec![
-                X86Opcode::CmpRR,
-                X86Opcode::Setcc,
-                X86Opcode::Movzx,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_declines_when_dst_live_before_flag_writer() {
-        // %10 is used as an operand of the AddRI BEFORE the cmp, so hoisting
-        // xor would clobber the value being read.
-        let mut func = make_func(vec![
-            X86ISelInst::new(
-                X86Opcode::AddRI,
-                vec![vreg32(20), vreg32(10), X86ISelOperand::Imm(1)],
-            ),
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(!peephole.run_on_function(&mut func));
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::AddRI,
-                X86Opcode::CmpRR,
-                X86Opcode::Setcc,
-                X86Opcode::Movzx,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_declines_with_intervening_partial_flag_write() {
-        // Inc partially writes RFLAGS (touches OF, SF, ZF, AF, PF but leaves
-        // CF). It cannot serve as flag_writer (its overwrite is Partial), and
-        // it blocks the cmp -> setcc scan from above. Neither i=cmp nor i=Inc
-        // is a valid window start.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(X86Opcode::Inc, vec![vreg(3)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(!peephole.run_on_function(&mut func));
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::CmpRR,
-                X86Opcode::Inc,
-                X86Opcode::Setcc,
-                X86Opcode::Movzx,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_picks_latest_flag_writer_when_two_dominate() {
-        // CmpRR; AddRR; Setcc; Movzx - both CmpRR and AddRR are full flag
-        // writers, but AddRR's flags are what Setcc actually reads. The
-        // rewrite is sound when keyed on AddRR (the latest flag writer) and
-        // we should rewrite to: xor; CmpRR; AddRR; Setcc.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(3), vreg(4)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(peephole.run_on_function(&mut func));
-        // The rewrite hoists xor above AddRR, keeping CmpRR in place.
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::CmpRR,
-                X86Opcode::XorRR,
-                X86Opcode::AddRR,
-                X86Opcode::Setcc,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_declines_when_flag_writer_mentions_dst() {
-        // flag_writer reads %D (vreg32(10)). The xor cannot be hoisted because
-        // it would change the input to the flag_writer. We don't construct
-        // CmpRR with a Gpr32 operand directly (class mismatch), so use TestRR
-        // on the same Gpr32 vreg used as the setcc dst.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::TestRR, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(!peephole.run_on_function(&mut func));
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::TestRR,
-                X86Opcode::Setcc,
-                X86Opcode::Movzx,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_declines_when_setcc_dst_escapes_window() {
-        // %10 is consumed by a downstream AddRI in addition to the Movzx. The
-        // single-use side condition fails - refuse to fire.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(
-                X86Opcode::AddRI,
-                vec![vreg32(20), vreg32(10), X86ISelOperand::Imm(1)],
-            ),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(!peephole.run_on_function(&mut func));
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::CmpRR,
-                X86Opcode::Setcc,
-                X86Opcode::Movzx,
-                X86Opcode::AddRI,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_declines_when_jcc_consumes_flags_first() {
-        // A Jcc reads the flags BEFORE the setcc; refusing to hoist preserves
-        // observable behavior even though jcc is technically still consuming
-        // flag_writer's flags - we are conservative.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(
-                X86Opcode::Jcc,
-                vec![
-                    X86ISelOperand::CondCode(X86CondCode::E),
-                    X86ISelOperand::Block(Block(1)),
-                ],
-            ),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(!peephole.run_on_function(&mut func));
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::CmpRR,
-                X86Opcode::Jcc,
-                X86Opcode::Setcc,
-                X86Opcode::Movzx,
-                X86Opcode::Ret,
-            ]
-        );
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_proof_of_fire_on_bcp_style_isel_output() {
-        // This mirrors what `select_comparison` in trust-cg-lower emits for an
-        // Icmp whose result feeds a single downstream consumer outside the
-        // CmpRR/Setcc/Movzx triple - e.g., a store or a MovRR32 into a PReg
-        // for return-value materialization. We pick MovRR32 -> RAX as the
-        // consumer because that is what real ISel emits for `ret i32 %D` in
-        // the SysV ABI:
-        //   CmpRR %lhs, %rhs    ; flags
-        //   Setcc E, %D         ; bool low byte
-        //   Movzx %D, %D        ; zero-extend
-        //   MovRR32 RAX, %D     ; ABI return materialization
-        //   Ret
-        //
-        // After hoist:
-        //   XorRR %D, %D
-        //   CmpRR %lhs, %rhs
-        //   Setcc E, %D
-        //   MovRR32 RAX, %D
-        //   Ret
-        //
-        // %D has two uses in the block (Movzx src and MovRR32 src) so this
-        // test reproduces the conservative refusal documented above; this is
-        // a *negative* proof-of-fire that the conservative side condition is
-        // honored even on shapes where soundness would technically allow the
-        // rewrite. See file-level comment for the relaxation roadmap.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(20), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(20), vreg32(20)]),
-            X86ISelInst::new(
-                X86Opcode::MovRR32,
-                vec![X86ISelOperand::PReg(RAX), vreg32(20)],
-            ),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-        peephole.run_on_function(&mut func);
-        let opcodes = entry_opcodes(&func);
-        // setcc-hoist conservatively declines because %D is used twice.
-        assert_ne!(opcodes.first(), Some(&X86Opcode::XorRR));
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_fires_when_setcc_result_is_truly_single_use() {
-        // Construct a function in which the Setcc destination is consumed
-        // ONLY by the Movzx and nothing else. This is the canonical pattern
-        // that the V1 setcc-hoist is tuned for - e.g., post-CSE/post-DCE
-        // when the bool value's only remaining live consumer happens to be
-        // the zero-extend itself (rare in raw ISel output, common after the
-        // DCE pass has stripped a downstream consumer).
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(20), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(20), vreg32(20)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-        assert!(peephole.run_on_function(&mut func));
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::XorRR,
-                X86Opcode::CmpRR,
-                X86Opcode::Setcc,
-                X86Opcode::Ret,
-            ]
-        );
+                X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
+                setcc(10, X86CondCode::E),
+                movzx(10),
+                X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(3), vreg(4)]),
+                setcc(11, X86CondCode::NE),
+                movzx(11),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+        ];
+        for insts in cases {
+            let mut func = make_func(insts.clone());
+            X86Peephole::default().run_on_function(&mut func);
+            let shape = |insts: &[X86ISelInst]| {
+                insts
+                    .iter()
+                    .map(|inst| (inst.opcode, inst.operands.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                shape(entry_insts(&func)),
+                shape(&insts),
+                "the Setcc/Movzx pair must be left intact"
+            );
+        }
     }
 
     #[test]
@@ -8544,7 +9965,7 @@ mod tests {
         // The BCP hot path lowers `condbr (icmp eq a, b), then, else` to
         //   CmpRR a, b ; Setcc E, %D ; Movzx %D, %D ;
         //   CmpRI %D, 0 ; Jcc NE, then ; Jmp else
-        // The cmp-setcc-branch fusion (which runs before setcc-hoist and the
+        // The cmp-setcc-branch fusion (which runs before the
         // single-instruction cmp-zero->test rewrite) recognizes that the
         // boolean %D is single-use and dead after the branch, and collapses the
         // whole chain to a direct `CmpRR a, b ; Jcc E, then ; Jmp else`. This
@@ -9064,42 +10485,6 @@ mod tests {
         peephole.run_on_function(&mut func);
 
         assert!(!entry_opcodes(&func).contains(&X86Opcode::BtRI));
-    }
-
-    #[test]
-    fn x86_peephole_setcc_hoist_fires_on_two_independent_windows() {
-        // Two separate flag_writer/setcc/movzx triples should both rewrite.
-        let mut func = make_func(vec![
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(10), X86ISelOperand::CondCode(X86CondCode::E)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(10), vreg32(10)]),
-            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(3), vreg(4)]),
-            X86ISelInst::new(
-                X86Opcode::Setcc,
-                vec![vreg32(11), X86ISelOperand::CondCode(X86CondCode::NE)],
-            ),
-            X86ISelInst::new(X86Opcode::Movzx, vec![vreg32(11), vreg32(11)]),
-            X86ISelInst::new(X86Opcode::Ret, vec![]),
-        ]);
-        let mut peephole = X86Peephole::default();
-
-        assert!(peephole.run_on_function(&mut func));
-
-        assert_eq!(
-            entry_opcodes(&func),
-            vec![
-                X86Opcode::XorRR,
-                X86Opcode::CmpRR,
-                X86Opcode::Setcc,
-                X86Opcode::XorRR,
-                X86Opcode::CmpRR,
-                X86Opcode::Setcc,
-                X86Opcode::Ret,
-            ]
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -9716,7 +11101,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::AddRR, vec![vreg(7), vreg(8), vreg(5)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        assert!(run_impl(&mut func, |_| false));
+        assert!(run_impl(&mut func, |_| false, |_, _, _| false));
         let opcodes = entry_opcodes(&func);
         assert!(
             opcodes.contains(&X86Opcode::MovRMSib),
@@ -9968,6 +11353,89 @@ mod tests {
                 panic!("expected SibMemAddr");
             }
         }
+    }
+
+    #[test]
+    fn sib_fold_from_leasib_packed_v128_store_and_load() {
+        // THE `v2_memfill` VECTOR-BODY SHAPE. The vectorizer emits
+        //   lea  v11, [v2 + v1*1]     ; LeaSib (base + iv)
+        //   movdqu [v11], x20         ; 16-byte packed store
+        // and the packed store previously had no SIB form at all, so the LeaSib
+        // survived into the hot loop. It must now fold to one MovdquMRSib
+        // carrying the LeaSib's SIB operand, with the LeaSib deleted. The
+        // matching LOAD direction (v1_saxpy's `movdqu x,[px]`) folds the same way.
+        let x128 = |id: u32| vreg_class(id, RegClass::Fpr128);
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::LeaSib, vec![vreg(11), sib_op(2, 1, 1, 0)]),
+            X86ISelInst::new(X86Opcode::MovdquMR, vec![mem_addr(vreg(11), 0), x128(20)]),
+            X86ISelInst::new(X86Opcode::LeaSib, vec![vreg(12), sib_op(3, 1, 4, 16)]),
+            X86ISelInst::new(X86Opcode::MovdquRM, vec![x128(21), mem_addr(vreg(12), 0)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(sib_addr_fold_run_on_block(&mut func, Block(0)));
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::MovdquMRSib,
+                X86Opcode::MovdquRMSib,
+                X86Opcode::Ret
+            ]
+        );
+        let insts = entry_insts(&func);
+        // Store: [SibMemAddr, value]; scale 1 / disp 0 preserved, value intact.
+        if let X86ISelOperand::SibMemAddr {
+            base,
+            index,
+            scale,
+            disp,
+        } = &insts[0].operands[0]
+        {
+            assert_eq!(base.as_ref(), &vreg(2));
+            assert_eq!(index.as_ref(), &vreg(1));
+            assert_eq!(*scale, 1);
+            assert_eq!(*disp, 0);
+        } else {
+            panic!("expected SibMemAddr on the packed store");
+        }
+        assert_eq!(insts[0].operands[1], x128(20));
+        // Load: [value, SibMemAddr]; scale 4 / disp 16 preserved exactly.
+        assert_eq!(insts[1].operands[0], x128(21));
+        if let X86ISelOperand::SibMemAddr { scale, disp, .. } = &insts[1].operands[1] {
+            assert_eq!(*scale, 4);
+            assert_eq!(*disp, 16);
+        } else {
+            panic!("expected SibMemAddr on the packed load");
+        }
+    }
+
+    #[test]
+    fn sib_fold_refuses_aligned_movdqa_packed_moves() {
+        // MOVDQA's proof carries the honest `ea % 16 == 0` precondition, and this
+        // fold does not know that base+index*scale stays 16-aligned. There is
+        // deliberately no MovdqaRMSib/MovdqaMRSib to fold into, and
+        // `sib_foldable_mem_op` must decline both directions rather than
+        // silently re-route an aligned move onto the unaligned opcode.
+        let x128 = |id: u32| vreg_class(id, RegClass::Fpr128);
+        let load = X86ISelInst::new(X86Opcode::MovdqaRM, vec![x128(20), mem_addr(vreg(2), 0)]);
+        let store = X86ISelInst::new(X86Opcode::MovdqaMR, vec![mem_addr(vreg(2), 0), x128(20)]);
+        assert!(
+            sib_foldable_mem_op(&load).is_none(),
+            "MovdqaRM must not fold"
+        );
+        assert!(
+            sib_foldable_mem_op(&store).is_none(),
+            "MovdqaMR must not fold"
+        );
+        // Volatile packed moves keep their stronger ordering proof and must also
+        // decline (they carry different default flags AND a different opcode).
+        let vol = X86ISelInst::new(
+            X86Opcode::VolatileMovdquMR,
+            vec![mem_addr(vreg(2), 0), x128(20)],
+        );
+        assert!(
+            sib_foldable_mem_op(&vol).is_none(),
+            "VolatileMovdquMR must not fold into a plain SIB store"
+        );
     }
 
     #[test]
@@ -10299,6 +11767,582 @@ mod tests {
         ]);
         assert!(addr_chain_fold_run_on_block(&mut func, Block(0)));
         assert_eq!(entry_insts(&func)[2].operands, vec![vreg(3), mem(1, 16)]);
+    }
+
+    fn lea_link(dst: X86ISelOperand, base: X86ISelOperand, disp: i32) -> X86ISelInst {
+        X86ISelInst::new(
+            X86Opcode::Lea,
+            vec![
+                dst,
+                X86ISelOperand::MemAddr {
+                    base: Box::new(base),
+                    disp,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn addr_chain_fold_lea_displacement_link_folds_for_load_and_store() {
+        // Lea v2, [v1+0x18] ; MovRM v3, [v2+0]   ->  MovRM v3, [v1+0x18]
+        // Lea v4, [v1-8]    ; MovMR [v4+4], v3   ->  MovMR [v1-4], v3
+        let mut func = make_func(vec![
+            lea_link(vreg(2), vreg(1), 0x18),
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(2, 0)]),
+            lea_link(vreg(4), vreg(1), -8),
+            X86ISelInst::new(X86Opcode::MovMR, vec![mem(4, 4), vreg(3)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(addr_chain_fold_run_on_block(&mut func, Block(0)));
+        let insts = entry_insts(&func);
+        assert_eq!(insts[1].opcode, X86Opcode::MovRM);
+        assert_eq!(insts[1].operands, vec![vreg(3), mem(1, 0x18)]);
+        assert_eq!(insts[3].opcode, X86Opcode::MovMR);
+        assert_eq!(insts[3].operands, vec![mem(1, -4), vreg(3)]);
+        // Rewrite-only: both Leas stay for DCE.
+        assert_eq!(insts[0].opcode, X86Opcode::Lea);
+        assert_eq!(insts[2].opcode, X86Opcode::Lea);
+    }
+
+    #[test]
+    fn addr_chain_fold_lea_link_refuses_base_redef_in_window() {
+        // v1 is redefined between the Lea and the load, at full width and
+        // through a Gpr32 view of the same id. Folding would read the new v1.
+        for redef in [vreg(1), vreg_class(1, RegClass::Gpr32)] {
+            let mut func = make_func(vec![
+                lea_link(vreg(2), vreg(1), 8),
+                X86ISelInst::new(X86Opcode::MovRI, vec![redef, X86ISelOperand::Imm(99)]),
+                X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(2, 0)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            assert!(!addr_chain_fold_run_on_block(&mut func, Block(0)));
+        }
+    }
+
+    #[test]
+    fn addr_chain_fold_lea_link_requires_gpr64_register_base_and_dest() {
+        // A stack-slot base is not a register link.
+        let mut func = make_func(vec![
+            lea_link(vreg(2), X86ISelOperand::StackSlot(0), 8),
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(2, 0)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!addr_chain_fold_run_on_block(&mut func, Block(0)));
+
+        // A Gpr32 base register is not a 64-bit address source.
+        let mut func = make_func(vec![
+            lea_link(vreg(2), vreg_class(1, RegClass::Gpr32), 8),
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(2, 0)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!addr_chain_fold_run_on_block(&mut func, Block(0)));
+
+        // A Gpr32 Lea result is a narrow view of v2, not the address read.
+        let mut func = make_func(vec![
+            lea_link(vreg_class(2, RegClass::Gpr32), vreg(1), 8),
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(2, 0)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!addr_chain_fold_run_on_block(&mut func, Block(0)));
+    }
+
+    #[test]
+    fn addr_chain_fold_lea_link_refuses_disp_overflow_and_non_default_flags() {
+        let mut func = make_func(vec![
+            lea_link(vreg(2), vreg(1), i32::MAX),
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(2, 8)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!addr_chain_fold_run_on_block(&mut func, Block(0)));
+
+        // A link whose flags differ from the opcode default is not classified.
+        let mut flagged = lea_link(vreg(2), vreg(1), 8);
+        flagged.flags = X86Opcode::MovMR.default_flags();
+        assert_ne!(flagged.flags, X86Opcode::Lea.default_flags());
+        let mut func = make_func(vec![
+            flagged,
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(2, 0)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!addr_chain_fold_run_on_block(&mut func, Block(0)));
+    }
+
+    fn sib_operand(
+        base: X86ISelOperand,
+        index: X86ISelOperand,
+        scale: u8,
+        disp: i32,
+    ) -> X86ISelOperand {
+        X86ISelOperand::SibMemAddr {
+            base: Box::new(base),
+            index: Box::new(index),
+            scale,
+            disp,
+        }
+    }
+
+    fn movri(dst: X86ISelOperand, value: i64) -> X86ISelInst {
+        X86ISelInst::new(X86Opcode::MovRI, vec![dst, X86ISelOperand::Imm(value)])
+    }
+
+    /// `prefix` (which defines the index v2), then
+    /// `MovRMSib v3, [v1 + v2*scale + disp]`, then `Ret`. Runs the
+    /// constant-index fold and returns the load as it stands afterwards.
+    fn const_index_load(prefix: Vec<X86ISelInst>, scale: u8, disp: i32) -> (bool, X86ISelInst) {
+        let load_idx = prefix.len();
+        let mut insts = prefix;
+        insts.push(X86ISelInst::new(
+            X86Opcode::MovRMSib,
+            vec![vreg(3), sib_operand(vreg(1), vreg(2), scale, disp)],
+        ));
+        insts.push(X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let mut func = make_func(insts);
+        let changed = sib_const_index_fold_run_on_block(&mut func, Block(0));
+        (changed, entry_insts(&func)[load_idx].clone())
+    }
+
+    #[test]
+    fn sib_const_index_fold_rewrites_every_anchor_form_to_base_plus_disp() {
+        // mov v2, 3 ; <op> [v1 + v2*8 + 16]  ->  <op> [v1 + 40]
+        let cases = [
+            (X86Opcode::MovRMSib, X86Opcode::MovRM, true, vreg(3)),
+            (X86Opcode::MovMRSib, X86Opcode::MovMR, false, vreg(3)),
+            (X86Opcode::MovRM32Sib, X86Opcode::MovRM32, true, vreg32(3)),
+            (X86Opcode::MovMR32Sib, X86Opcode::MovMR32, false, vreg32(3)),
+        ];
+        for (sib_opcode, plain_opcode, is_load, value) in cases {
+            let addr = sib_operand(vreg(1), vreg(2), 8, 16);
+            let operands = if is_load {
+                vec![value.clone(), addr]
+            } else {
+                vec![addr, value.clone()]
+            };
+            let anchor = X86ISelInst::new(sib_opcode, operands);
+            let mut func = make_func(vec![
+                movri(vreg(2), 3),
+                anchor,
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            assert!(
+                sib_const_index_fold_run_on_block(&mut func, Block(0)),
+                "{sib_opcode:?}"
+            );
+            let insts = entry_insts(&func);
+            // Rewrite-only: the constant stays for DCE.
+            assert_eq!(insts.len(), 3);
+            assert_eq!(insts[0].opcode, X86Opcode::MovRI);
+            assert_eq!(insts[1].opcode, plain_opcode);
+            assert_eq!(insts[1].flags, plain_opcode.default_flags());
+            let expected = if is_load {
+                vec![value, mem(1, 40)]
+            } else {
+                vec![mem(1, 40), value]
+            };
+            assert_eq!(insts[1].operands, expected, "{sib_opcode:?}");
+            // A second run has nothing left to do.
+            assert!(!sib_const_index_fold_run_on_block(&mut func, Block(0)));
+        }
+    }
+
+    #[test]
+    fn sib_const_index_fold_displacement_is_exact_at_the_i32_bounds() {
+        let max = i64::from(i32::MAX);
+        let min = i64::from(i32::MIN);
+        // (index constant, scale, starting disp, expected disp or None)
+        let cases: [(i64, u8, i32, Option<i32>); 9] = [
+            (0, 8, 0, Some(0)),
+            (-2, 8, 4, Some(-12)),
+            (max, 1, 0, Some(i32::MAX)),
+            (min, 1, 0, Some(i32::MIN)),
+            (max, 1, 1, None),
+            (min, 1, -1, None),
+            (1 << 29, 4, 0, None),
+            (i64::MAX, 2, 0, None),
+            (i64::MIN, 1, -1, None),
+        ];
+        for (k, scale, disp, expected) in cases {
+            let (changed, load) = const_index_load(vec![movri(vreg(2), k)], scale, disp);
+            match expected {
+                Some(new_disp) => {
+                    assert!(changed, "{k}*{scale}+{disp}");
+                    assert_eq!(load.opcode, X86Opcode::MovRM);
+                    assert_eq!(load.operands, vec![vreg(3), mem(1, new_disp)]);
+                }
+                None => {
+                    assert!(!changed, "{k}*{scale}+{disp}");
+                    assert_eq!(load.opcode, X86Opcode::MovRMSib);
+                    assert_eq!(
+                        load.operands,
+                        vec![vreg(3), sib_operand(vreg(1), vreg(2), scale, disp)]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sib_const_index_fold_reads_lea_and_multiply_constants() {
+        // The strength-reduced literal index: mov v5, 8 ; lea v2, [v5 + v5*2].
+        let lea3 = X86ISelInst::new(
+            X86Opcode::LeaSib,
+            vec![vreg(2), sib_operand(vreg(5), vreg(5), 2, 0)],
+        );
+        let (changed, load) = const_index_load(vec![movri(vreg(5), 8), lea3], 1, 0);
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, 24)]);
+
+        // lea with distinct sources and a displacement: 7 + 5*4 - 3 = 24.
+        let lea = X86ISelInst::new(
+            X86Opcode::LeaSib,
+            vec![vreg(2), sib_operand(vreg(5), vreg(6), 4, -3)],
+        );
+        let (changed, load) =
+            const_index_load(vec![movri(vreg(5), 7), movri(vreg(6), 5), lea], 1, 0);
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, 24)]);
+
+        // imul v2, v5, 8 with v5 = 6.
+        let imul_ri = X86ISelInst::new(
+            X86Opcode::ImulRRI,
+            vec![vreg(2), vreg(5), X86ISelOperand::Imm(8)],
+        );
+        let (changed, load) = const_index_load(vec![movri(vreg(5), 6), imul_ri], 1, 0);
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, 48)]);
+
+        // imul v2, v5, v6 with v5 = -7, v6 = 8.
+        let imul_rr = X86ISelInst::new(X86Opcode::ImulRR, vec![vreg(2), vreg(5), vreg(6)]);
+        let (changed, load) =
+            const_index_load(vec![movri(vreg(5), -7), movri(vreg(6), 8), imul_rr], 1, 0);
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, -56)]);
+
+        // A product that wraps is the wrapping product: (2^62 * 4) = 0 mod 2^64.
+        let imul_wrap = X86ISelInst::new(
+            X86Opcode::ImulRRI,
+            vec![vreg(2), vreg(5), X86ISelOperand::Imm(4)],
+        );
+        let (changed, load) = const_index_load(vec![movri(vreg(5), 1 << 62), imul_wrap], 8, 8);
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, 8)]);
+    }
+
+    #[test]
+    fn sib_const_index_fold_declines_an_index_that_is_not_a_local_constant() {
+        let imul_ri = |imm: i64| {
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(2), vreg(5), X86ISelOperand::Imm(imm)],
+            )
+        };
+        let flagged = |mut inst: X86ISelInst| {
+            inst.flags = X86Opcode::MovMR.default_flags();
+            assert_ne!(inst.flags, inst.opcode.default_flags());
+            inst
+        };
+        let with_origin = |mut inst: X86ISelInst| {
+            inst.proof_origin = Some(X86ProofOrigin::AtomicLoad);
+            inst
+        };
+        let cases: Vec<(&str, Vec<X86ISelInst>)> = vec![
+            ("live-in index", vec![]),
+            (
+                "index copied from a constant",
+                vec![
+                    movri(vreg(5), 3),
+                    X86ISelInst::new(X86Opcode::MovRR, vec![vreg(2), vreg(5)]),
+                ],
+            ),
+            (
+                "narrow write after the constant",
+                vec![movri(vreg(2), 3), movri(vreg32(2), 1)],
+            ),
+            (
+                "narrow tied write after the constant",
+                vec![
+                    movri(vreg(2), 3),
+                    X86ISelInst::new(X86Opcode::AddRI, vec![vreg32(2), X86ISelOperand::Imm(1)]),
+                ],
+            ),
+            ("Gpr32 constant definition", vec![movri(vreg32(2), 3)]),
+            (
+                "constant definition with a proof origin",
+                vec![with_origin(movri(vreg(2), 3))],
+            ),
+            (
+                "constant definition with non-default flags",
+                vec![flagged(movri(vreg(2), 3))],
+            ),
+            (
+                "multiply by an immediate outside i32",
+                vec![movri(vreg(5), 0), imul_ri(i64::from(i32::MAX) + 1)],
+            ),
+            ("multiply of a live-in", vec![imul_ri(8)]),
+            (
+                "multiply source redefined narrow",
+                vec![movri(vreg(5), 3), movri(vreg32(5), 1), imul_ri(8)],
+            ),
+            (
+                "tied multiply",
+                vec![
+                    movri(vreg(2), 3),
+                    movri(vreg(5), 8),
+                    X86ISelInst::new(X86Opcode::ImulRR, vec![vreg(2), vreg(5)]),
+                ],
+            ),
+            (
+                "multiply with a Gpr32 source",
+                vec![
+                    movri(vreg(5), 3),
+                    movri(vreg(6), 8),
+                    X86ISelInst::new(X86Opcode::ImulRR, vec![vreg(2), vreg32(5), vreg(6)]),
+                ],
+            ),
+            (
+                "lea over a stack-slot base",
+                vec![
+                    movri(vreg(5), 3),
+                    X86ISelInst::new(
+                        X86Opcode::LeaSib,
+                        vec![
+                            vreg(2),
+                            sib_operand(X86ISelOperand::StackSlot(0), vreg(5), 1, 0),
+                        ],
+                    ),
+                ],
+            ),
+            (
+                "lea with a Gpr32 index",
+                vec![
+                    movri(vreg(5), 3),
+                    X86ISelInst::new(
+                        X86Opcode::LeaSib,
+                        vec![vreg(2), sib_operand(vreg(5), vreg32(5), 1, 0)],
+                    ),
+                ],
+            ),
+            (
+                "lea with a scale that is not 1, 2, 4 or 8",
+                vec![
+                    movri(vreg(5), 3),
+                    X86ISelInst::new(
+                        X86Opcode::LeaSib,
+                        vec![vreg(2), sib_operand(vreg(5), vreg(5), 3, 0)],
+                    ),
+                ],
+            ),
+            (
+                "chain deeper than the bound",
+                vec![
+                    movri(vreg(5), 1),
+                    X86ISelInst::new(
+                        X86Opcode::ImulRRI,
+                        vec![vreg(6), vreg(5), X86ISelOperand::Imm(2)],
+                    ),
+                    X86ISelInst::new(
+                        X86Opcode::ImulRRI,
+                        vec![vreg(7), vreg(6), X86ISelOperand::Imm(2)],
+                    ),
+                    X86ISelInst::new(
+                        X86Opcode::ImulRRI,
+                        vec![vreg(8), vreg(7), X86ISelOperand::Imm(2)],
+                    ),
+                    X86ISelInst::new(
+                        X86Opcode::ImulRRI,
+                        vec![vreg(2), vreg(8), X86ISelOperand::Imm(2)],
+                    ),
+                ],
+            ),
+        ];
+        for (name, prefix) in cases {
+            let (changed, load) = const_index_load(prefix, 1, 0);
+            assert!(!changed, "{name}");
+            assert_eq!(load.opcode, X86Opcode::MovRMSib, "{name}");
+        }
+
+        // A Gpr32 index over its own Gpr32 constant is not a 64-bit constant:
+        // the definition matches the register exactly, and only the class
+        // requirement on the resolved register declines it.
+        let mut func = make_func(vec![
+            movri(vreg32(2), 3),
+            X86ISelInst::new(
+                X86Opcode::MovRMSib,
+                vec![vreg(3), sib_operand(vreg(1), vreg32(2), 8, 0)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!sib_const_index_fold_run_on_block(&mut func, Block(0)));
+        assert_eq!(entry_insts(&func)[1].opcode, X86Opcode::MovRMSib);
+
+        // The deepest accepted chain is one link shorter than the refused one.
+        let (changed, load) = const_index_load(
+            vec![
+                movri(vreg(6), 1),
+                X86ISelInst::new(
+                    X86Opcode::ImulRRI,
+                    vec![vreg(7), vreg(6), X86ISelOperand::Imm(2)],
+                ),
+                X86ISelInst::new(
+                    X86Opcode::ImulRRI,
+                    vec![vreg(8), vreg(7), X86ISelOperand::Imm(2)],
+                ),
+                X86ISelInst::new(
+                    X86Opcode::ImulRRI,
+                    vec![vreg(2), vreg(8), X86ISelOperand::Imm(2)],
+                ),
+            ],
+            1,
+            0,
+        );
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, 8)]);
+    }
+
+    #[test]
+    fn sib_const_index_fold_uses_the_constant_reaching_the_anchor() {
+        // The nearest definition decides: 3 is overwritten by 5 before the load.
+        let (changed, load) = const_index_load(vec![movri(vreg(2), 3), movri(vreg(2), 5)], 8, 0);
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, 40)]);
+
+        // A constant assigned AFTER the load does not reach it.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::MovRMSib,
+                vec![vreg(3), sib_operand(vreg(1), vreg(2), 8, 0)],
+            ),
+            movri(vreg(2), 3),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!sib_const_index_fold_run_on_block(&mut func, Block(0)));
+
+        // A multiply reads its source as it stood AT the multiply: v5 is 6
+        // there and is 100 by the time of the load.
+        let (changed, load) = const_index_load(
+            vec![
+                movri(vreg(5), 6),
+                X86ISelInst::new(
+                    X86Opcode::ImulRRI,
+                    vec![vreg(2), vreg(5), X86ISelOperand::Imm(8)],
+                ),
+                movri(vreg(5), 100),
+            ],
+            1,
+            0,
+        );
+        assert!(changed);
+        assert_eq!(load.operands, vec![vreg(3), mem(1, 48)]);
+    }
+
+    #[test]
+    fn sib_const_index_fold_declines_an_anchor_outside_its_dialect() {
+        let load = |value: X86ISelOperand, addr: X86ISelOperand| {
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![value, addr])
+        };
+        let mut flagged = load(vreg(3), sib_operand(vreg(1), vreg(2), 8, 0));
+        flagged.flags = X86Opcode::MovMR.default_flags();
+        assert_ne!(flagged.flags, X86Opcode::MovRMSib.default_flags());
+        let mut with_origin = load(vreg(3), sib_operand(vreg(1), vreg(2), 8, 0));
+        with_origin.proof_origin = Some(X86ProofOrigin::AtomicLoad);
+        let cases: Vec<(&str, X86ISelInst)> = vec![
+            ("non-default flags", flagged),
+            ("proof origin", with_origin),
+            (
+                "stack-slot base",
+                load(
+                    vreg(3),
+                    sib_operand(X86ISelOperand::StackSlot(0), vreg(2), 8, 0),
+                ),
+            ),
+            (
+                "Gpr32 base",
+                load(vreg(3), sib_operand(vreg32(1), vreg(2), 8, 0)),
+            ),
+            (
+                "Gpr32 index",
+                load(vreg(3), sib_operand(vreg(1), vreg32(2), 8, 0)),
+            ),
+            (
+                "Gpr32 value on the 64-bit form",
+                load(vreg32(3), sib_operand(vreg(1), vreg(2), 8, 0)),
+            ),
+            (
+                "Gpr64 value on the 32-bit form",
+                X86ISelInst::new(
+                    X86Opcode::MovRM32Sib,
+                    vec![vreg(3), sib_operand(vreg(1), vreg(2), 8, 0)],
+                ),
+            ),
+            (
+                "scale that is not 1, 2, 4 or 8",
+                load(vreg(3), sib_operand(vreg(1), vreg(2), 3, 0)),
+            ),
+            (
+                "a third operand",
+                X86ISelInst::new(
+                    X86Opcode::MovRMSib,
+                    vec![vreg(3), sib_operand(vreg(1), vreg(2), 8, 0), vreg(4)],
+                ),
+            ),
+            (
+                "an opcode outside the four anchors",
+                X86ISelInst::new(
+                    X86Opcode::LeaSib,
+                    vec![vreg(3), sib_operand(vreg(1), vreg(2), 8, 0)],
+                ),
+            ),
+        ];
+        for (name, anchor) in cases {
+            let before = anchor.clone();
+            let mut func = make_func(vec![
+                movri(vreg(2), 3),
+                anchor,
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            assert!(
+                !sib_const_index_fold_run_on_block(&mut func, Block(0)),
+                "{name}"
+            );
+            let after = &entry_insts(&func)[1];
+            assert_eq!(after.opcode, before.opcode, "{name}");
+            assert_eq!(after.operands, before.operands, "{name}");
+            assert_eq!(after.flags, before.flags, "{name}");
+        }
+    }
+
+    #[test]
+    fn peephole_folds_a_literal_element_index_to_a_displacement() {
+        // The selector's stream for `*p.gep[3]` over 8-byte elements spelled as
+        // a byte offset: mov v5, 8 ; lea v2, [v5 + v5*2] ; lea v4, [v1 + v2*1] ;
+        // mov v3, [v4]. The whole pass leaves one `mov v3, [v1 + 24]` reading v1.
+        let mut func = make_func(vec![
+            movri(vreg(5), 8),
+            X86ISelInst::new(
+                X86Opcode::LeaSib,
+                vec![vreg(2), sib_operand(vreg(5), vreg(5), 2, 0)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::LeaSib,
+                vec![vreg(4), sib_operand(vreg(1), vreg(2), 1, 0)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem(4, 0)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut peephole = X86Peephole::default();
+        assert!(peephole.run_on_function(&mut func));
+        let loads: Vec<_> = entry_insts(&func)
+            .iter()
+            .filter(|inst| inst.opcode == X86Opcode::MovRM)
+            .collect();
+        assert_eq!(loads.len(), 1, "{:?}", entry_insts(&func));
+        assert_eq!(loads[0].operands, vec![vreg(3), mem(1, 24)]);
+        assert!(
+            !entry_insts(&func)
+                .iter()
+                .any(|inst| matches!(inst.opcode, X86Opcode::MovRMSib | X86Opcode::MovMRSib)),
+            "{:?}",
+            entry_insts(&func)
+        );
     }
 
     #[test]
@@ -10718,6 +12762,97 @@ mod tests {
             "scale-folded store EA must fuse: {:?}",
             entry_opcodes(&func)
         );
+    }
+
+    #[test]
+    fn rmw_fuse_fuses_when_the_register_operand_is_defined_before_the_alu() {
+        // b1_mispredict's hot-loop shape, which the pre-2026-09-29 W1 window
+        // declined: the fused register operand `s` is DEFINED between the load
+        // and the ALU.
+        //
+        //   MovRMSib t, [slot + j*8]      ; the load
+        //   MovRR    s, acc               ; <- the def of `s` W1 used to refuse
+        //   AddRR    d, t, s              ; the anchor
+        //   MovMRSib [slot + j'*8], d     ; the store, j' a copy-alias of j
+        //
+        // Sound because the replacement is spliced at the STORE's position, the
+        // latest of the three, so the fused instruction reads `s` AFTER that def;
+        // and the W2 window still refuses a redef of `s` between the ALU and the
+        // store, which is the stretch that actually has to carry.
+        let sib_i = |id: u32| X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::StackSlot(0)),
+            index: Box::new(vreg(id)),
+            scale: 8,
+            disp: 0,
+        };
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(44), X86ISelOperand::Imm(3)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(51), vreg(44)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(4), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(5), sib_i(44)]),
+            // The def of `s` inside W1.
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(7), vreg(4)]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(6), vreg(5), vreg(7)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_i(51), vreg(6)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut off = func.clone();
+
+        assert!(
+            rmw_fuse_run_on_block_sdef(&mut func, Block(0), |_| true, true),
+            "a def of `s` in W1 must not block the fusion"
+        );
+        let ops = entry_opcodes(&func);
+        assert!(
+            ops.contains(&X86Opcode::AddMRSib),
+            "expected the memory-destination add: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&X86Opcode::MovRMSib),
+            "the load is deleted: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&X86Opcode::AddRR),
+            "the register add is deleted: {ops:?}"
+        );
+
+        // FALSIFIABILITY: the stricter window still declines the same fixture, so
+        // the relaxation is what decides.
+        assert!(
+            !rmw_fuse_run_on_block_sdef(&mut off, Block(0), |_| true, false),
+            "`no-x86-rmw-fuse-sdef` must restore the refusal"
+        );
+        assert!(!entry_opcodes(&off).contains(&X86Opcode::AddMRSib));
+    }
+
+    #[test]
+    fn rmw_fuse_still_refuses_a_redef_of_s_between_the_alu_and_the_store() {
+        // THE CONDITION THAT REMAINS. `s` must carry unchanged from the ALU to the
+        // store, because the fused instruction reads it at the store's position.
+        // A redef on that stretch must decline even with the relaxation on.
+        let sib_i = |id: u32| X86ISelOperand::SibMemAddr {
+            base: Box::new(X86ISelOperand::StackSlot(0)),
+            index: Box::new(vreg(id)),
+            scale: 8,
+            disp: 0,
+        };
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(44), X86ISelOperand::Imm(3)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(51), vreg(44)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(4), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(5), sib_i(44)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(7), vreg(4)]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(6), vreg(5), vreg(7)]),
+            // Clobbers `s` between the ALU and the store.
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(7), X86ISelOperand::Imm(9)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_i(51), vreg(6)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(
+            !rmw_fuse_run_on_block_sdef(&mut func, Block(0), |_| true, true),
+            "a redef of `s` between the ALU and the store must decline"
+        );
+        assert!(!entry_opcodes(&func).contains(&X86Opcode::AddMRSib));
     }
 
     #[test]
@@ -11426,10 +13561,10 @@ mod tests {
         let used = peephole_function_use_set(&unread);
         let insts = &unread.blocks.get(&Block(0)).unwrap().insts;
         // v1 unread -> gate declines.
-        assert!(simplify_inst_gated(insts, 0, Some(&used)).is_none());
+        assert!(simplify_inst_gated(insts, 0, Some(&used), |_, _, _| false).is_none());
         // v2 read -> rewrite proceeds.
         assert!(matches!(
-            simplify_inst_gated(insts, 1, Some(&used)),
+            simplify_inst_gated(insts, 1, Some(&used), |_, _, _| false),
             Some(PeepholeEdit::Replace(_))
         ));
         // Ungated behavior unchanged: both rewrite.
@@ -11456,6 +13591,309 @@ mod tests {
     }
 
     #[test]
+    fn latch_collapse_reaches_across_the_other_carried_copies() {
+        // b1_mispredict's ACTUAL latch: the ISel interleaves the loop's other
+        // carried copies between the advance, the write-back and the compare, so
+        // an adjacency-only matcher declined it.
+        //
+        //   AddRI n,c,1 ; MovRR x,y ; MovRR c,n ; MovRR z,w ; CmpRI n,K ; Jcc
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(109), vreg(9), imm(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(11), vreg(29)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(109)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(10), vreg(107)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(109), imm(60000000)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(latch_advance_collapse_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs,
+            true
+        ));
+        let insts = entry_insts(&func);
+        assert_eq!(insts.len(), 5, "only the write-back is gone");
+        assert_eq!(insts[0].opcode, X86Opcode::AddRI);
+        assert_eq!(insts[0].operands[0], vreg(9), "in-place advance on c");
+        assert_eq!(insts[0].operands[1], vreg(9));
+        // The unrelated copies are untouched and keep their order.
+        assert_eq!(insts[1].operands.as_slice(), [vreg(11), vreg(29)]);
+        assert_eq!(insts[2].operands.as_slice(), [vreg(10), vreg(107)]);
+        assert_eq!(insts[3].opcode, X86Opcode::CmpRI);
+        assert_eq!(insts[3].operands[0], vreg(9), "compare rewritten to read c");
+    }
+
+    #[test]
+    fn latch_collapse_window_is_off_by_default() {
+        // FALSIFIABILITY for the gate: with the widened window OFF — the DEFAULT
+        // — both new shapes decline, so the default stream is exactly what it was
+        // before the widening. The measurement that keeps it off is in
+        // `latch_advance_window_enabled`'s doc (b1 +0.39%, h3_box_leak -1.7%).
+        let non_adjacent = || {
+            make_func(vec![
+                X86ISelInst::new(X86Opcode::AddRI, vec![vreg(109), vreg(9), imm(1)]),
+                X86ISelInst::new(X86Opcode::MovRR, vec![vreg(11), vreg(29)]),
+                X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(109)]),
+                X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(109), imm(100)]),
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::B),
+                        X86ISelOperand::Block(Block(0)),
+                    ],
+                ),
+            ])
+        };
+        let mut off = non_adjacent();
+        let (uses, defs) = function_use_def_counts(&off);
+        assert!(
+            !latch_advance_collapse_run_on_block(&mut off, Block(0), &uses, &defs, false),
+            "the non-adjacent shape must decline with the window OFF"
+        );
+        assert_eq!(entry_insts(&off).len(), 5);
+
+        // And the same fixture DOES collapse with it on, so the gate is what
+        // decides and the refutation above is not vacuous.
+        let mut on = non_adjacent();
+        let (uses, defs) = function_use_def_counts(&on);
+        assert!(latch_advance_collapse_run_on_block(
+            &mut on,
+            Block(0),
+            &uses,
+            &defs,
+            true
+        ));
+        assert_eq!(entry_insts(&on).len(), 4);
+    }
+
+    #[test]
+    fn widened_latch_collapse_refuses_a_flag_reader_before_the_write_back() {
+        // Rewriting the flag-NEUTRAL `Lea` spelling to `AddRI` makes the advance
+        // a flag WRITER. A flag reader between the advance and the write-back
+        // would then read the advance's flags instead of the ones live-in to the
+        // advance — so the widened window must decline this shape. The stretch is
+        // empty in the strict window, which is why only the widened path needs it.
+        let lea_shape = || {
+            make_func(vec![
+                X86ISelInst::new(
+                    X86Opcode::Lea,
+                    vec![
+                        vreg(109),
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(vreg(9)),
+                            disp: 1,
+                        },
+                    ],
+                ),
+                // Reads RFLAGS, and mentions neither `c` nor `n`, so the existing
+                // scans admit it.
+                X86ISelInst::new(
+                    X86Opcode::Setcc,
+                    vec![vreg(11), X86ISelOperand::CondCode(X86CondCode::E)],
+                ),
+                X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(109)]),
+                X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(109), imm(100)]),
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::B),
+                        X86ISelOperand::Block(Block(0)),
+                    ],
+                ),
+            ])
+        };
+        let mut func = lea_shape();
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(
+            !latch_advance_collapse_run_on_block(&mut func, Block(0), &uses, &defs, true),
+            "a flag reader between a `Lea` advance and the write-back must decline"
+        );
+        assert_eq!(entry_insts(&func).len(), 5);
+
+        // NON-VACUOUS, and it pins the condition to the SPELLING: the identical
+        // shape with an `AddRI` advance still collapses, because that spelling
+        // already wrote the flags at that position and the rewrite keeps the
+        // write exactly where it was.
+        let mut addri = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(109), vreg(9), imm(1)]),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vreg(11), X86ISelOperand::CondCode(X86CondCode::E)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(109)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(109), imm(100)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&addri);
+        assert!(
+            latch_advance_collapse_run_on_block(&mut addri, Block(0), &uses, &defs, true),
+            "the `AddRI` spelling introduces no new flag write, so it still collapses"
+        );
+        assert_eq!(entry_insts(&addri).len(), 4);
+    }
+
+    #[test]
+    fn latch_collapse_refuses_when_c_is_read_before_the_write_back() {
+        // THE SOUNDNESS CONDITION of the widened window. After the rewrite `c` is
+        // clobbered at the advance, so any reader of `c` between the advance and
+        // the write-back would observe the ADVANCED value instead of the old one.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(109), vreg(9), imm(1)]),
+            // This reads `c` — the collapse must decline.
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(11), vreg(9)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(109)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(109), imm(100)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(
+            !latch_advance_collapse_run_on_block(&mut func, Block(0), &uses, &defs, true),
+            "a read of c before the write-back must decline"
+        );
+        assert_eq!(entry_insts(&func).len(), 5, "nothing removed");
+    }
+
+    #[test]
+    fn latch_collapse_refuses_when_c_is_redefined_before_the_compare() {
+        // The compare is rewritten to read `c`, so `c` must still hold the
+        // advanced value when it is reached.
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRI, vec![vreg(109), vreg(9), imm(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(109)]),
+            // Clobbers `c` between the write-back and the compare.
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(9), imm(7)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(109), imm(100)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(
+            !latch_advance_collapse_run_on_block(&mut func, Block(0), &uses, &defs, true),
+            "a redefinition of c before the compare must decline"
+        );
+        assert_eq!(entry_insts(&func).len(), 5, "nothing removed");
+    }
+
+    #[test]
+    fn latch_collapse_accepts_the_lea_spelling_of_the_advance() {
+        // `Lea n,[c+1] ; MovRR c,n ; CmpRI n,K ; Jcc` — the shape
+        // `b1_mispredict` ships (`lea 0x1(%rdi),%rax ; mov %rax,%rdi ;
+        // cmp $K,%rax ; jb`), present in 8 of the 18 beat-llvm programs. The
+        // `AddRI` spelling was already handled; this is the flag-neutral one.
+        //
+        // Folding `Lea` to `AddRI` INTRODUCES a flag write, discharged by the
+        // window itself: the matched `Cmp` is immediately after (the `MovRR`
+        // between them is deleted) and fully overwrites the flags before the
+        // matched `Jcc` reads them.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    vreg(5),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(vreg(1)),
+                        disp: 1,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(5)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(5), imm(0x3938700)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(latch_advance_collapse_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs,
+            true
+        ));
+        let insts = entry_insts(&func);
+        assert_eq!(insts.len(), 3, "the MovRR write-back is gone");
+        assert_eq!(
+            insts[0].opcode,
+            X86Opcode::AddRI,
+            "the Lea is rebuilt as the in-place AddRI"
+        );
+        assert_eq!(insts[0].operands[0], vreg(1), "in-place advance");
+        assert_eq!(insts[0].operands[1], vreg(1));
+        assert_eq!(insts[0].operands[2], imm(1), "displacement carried across");
+        assert_eq!(insts[1].opcode, X86Opcode::CmpRI);
+        assert_eq!(insts[1].operands[0], vreg(1), "compare reads c");
+    }
+
+    #[test]
+    fn latch_collapse_refuses_a_lea_whose_temp_escapes_the_window() {
+        // FALSIFIABILITY for the arm above: `n` must exist only inside the
+        // window (one def, exactly two uses). Give the temp a third use and the
+        // collapse must decline, because deleting the write-back would leave
+        // that reader looking at a vreg nothing defines.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    vreg(5),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(vreg(1)),
+                        disp: 1,
+                    },
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(5)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(5), imm(100)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+            // The extra use.
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(5)]),
+        ]);
+        let (uses, defs) = function_use_def_counts(&func);
+        assert!(!latch_advance_collapse_run_on_block(
+            &mut func,
+            Block(0),
+            &uses,
+            &defs,
+            true
+        ));
+        assert_eq!(entry_insts(&func).len(), 5, "nothing removed");
+    }
+
+    #[test]
     fn latch_collapse_rewrites_the_counted_loop_latch() {
         // AddRI n,c,1 ; MovRR c,n ; CmpRI n,100 ; Jcc  ->  in-place advance.
         let mut func = make_func(vec![
@@ -11475,7 +13913,8 @@ mod tests {
             &mut func,
             Block(0),
             &uses,
-            &defs
+            &defs,
+            true
         ));
         let insts = entry_insts(&func);
         assert_eq!(insts.len(), 3, "the MovRR write-back is gone");
@@ -11506,7 +13945,8 @@ mod tests {
             &mut func,
             Block(0),
             &uses,
-            &defs
+            &defs,
+            true
         ));
         assert_eq!(entry_insts(&func).len(), 5);
     }
@@ -11531,7 +13971,8 @@ mod tests {
             &mut func,
             Block(0),
             &uses,
-            &defs
+            &defs,
+            true
         ));
     }
 
@@ -11707,6 +14148,192 @@ mod tests {
         );
     }
 
+    // ---- constmul 2^a +/- 1 -> SHL ; ADD/SUB -----------------------------
+
+    /// The p5_struct_acc shape: `IMUL d, s, $31` with dead flags and `d != s`
+    /// becomes `SHL d, s, 5 ; SUB d, d, s`.
+    #[test]
+    fn constmul_thirty_one_becomes_shl_sub() {
+        let insts = vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(31)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(2)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ];
+        let Some(PeepholeEdit::ReplaceTwo(shl, sub)) = simplify_inst_constmul_admitted(&insts, 0)
+        else {
+            panic!("x31 must rewrite to SHL+SUB");
+        };
+        assert_eq!(shl.opcode, X86Opcode::ShlRI);
+        assert_eq!(shl.operands, vec![vreg(2), vreg(1), imm(5)]);
+        assert_eq!(sub.opcode, X86Opcode::SubRR);
+        assert_eq!(sub.operands, vec![vreg(2), vreg(2), vreg(1)]);
+    }
+
+    /// `2^a + 1` takes the ADD form. `33 = 32 + 1`.
+    #[test]
+    fn constmul_thirty_three_becomes_shl_add() {
+        let insts = vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(33)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ];
+        let Some(PeepholeEdit::ReplaceTwo(shl, add)) = simplify_inst_constmul_admitted(&insts, 0)
+        else {
+            panic!("x33 must rewrite to SHL+ADD");
+        };
+        assert_eq!(shl.operands, vec![vreg(2), vreg(1), imm(5)]);
+        assert_eq!(add.opcode, X86Opcode::AddRR);
+        assert_eq!(add.operands, vec![vreg(2), vreg(2), vreg(1)]);
+    }
+
+    /// The ONE-SHIFT restriction: two-shift constants (`24 = 16+8`,
+    /// `126 = 128-2`, `13`) and the pure powers of two Stage 1 deliberately
+    /// leaves alone must all keep the IMUL.
+    #[test]
+    fn constmul_shift_bails_on_two_shift_and_power_of_two_constants() {
+        for c in [24i64, 126, 13, 14, 100, 576, 61, 37, 2, 8, 4096] {
+            let insts = vec![
+                X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(c)]),
+                X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+            ];
+            assert!(
+                simplify_inst_constmul_admitted(&insts, 0).is_none(),
+                "x{c} must NOT be claimed by the one-shift arm"
+            );
+        }
+    }
+
+    /// `1 - 2^a` (e.g. `-31`) is excluded on x86: it would need
+    /// `SUB d, s, d`, the `dst == rhs` alias that routes into the two-address
+    /// scratch path.
+    #[test]
+    fn constmul_shift_bails_on_one_minus_two_pow_a() {
+        let insts = vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(-31)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ];
+        assert!(simplify_inst_constmul_admitted(&insts, 0).is_none());
+    }
+
+    /// `d == s`: the SHL would clobber the source the ADD/SUB still needs.
+    #[test]
+    fn constmul_shift_declines_tied_destination() {
+        let insts = vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(1), vreg(1), imm(31)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ];
+        assert!(simplify_inst_constmul_admitted(&insts, 0).is_none());
+    }
+
+    /// Live IMUL flags: the guard the arm shares with the LEA arms.
+    #[test]
+    fn constmul_shift_declines_when_imul_flags_are_read() {
+        let insts = vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(31)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::O),
+                    X86ISelOperand::Block(Block(0)),
+                ],
+            ),
+        ];
+        assert!(simplify_inst_constmul_admitted(&insts, 0).is_none());
+    }
+
+    /// FAIL-CLOSED on the proof: an undischarged algebraic obligation leaves
+    /// the IMUL standing. This is what `X86Peephole::default` / `::new` see.
+    #[test]
+    fn constmul_shift_fails_closed_without_the_admission() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(31)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(2)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ]);
+        let mut pass = X86Peephole::default();
+        pass.run(&mut func);
+        let ops = entry_opcodes(&func);
+        assert!(
+            ops.contains(&X86Opcode::ImulRRI),
+            "unadmitted identity must keep the IMUL: {ops:?}"
+        );
+        assert!(!ops.contains(&X86Opcode::ShlRI));
+    }
+
+    /// End to end through the pass with the admission wired: the IMUL is gone
+    /// and the SHL+SUB pair is in the block.
+    ///
+    /// ⚑ The `TCG_NO_X86_CONSTMUL_SHIFT` kill switch is deliberately NOT
+    /// exercised here. trust-cg-opt has no process-wide env test lock (the
+    /// codegen crate's `env_lock` is not available), and every other test in
+    /// this module reaches the same arm, so mutating the variable in-process
+    /// would race them. The switch is read UNCACHED per call
+    /// (`constmul_shift_enabled`) and is validated by the paired A/B that
+    /// gates landing.
+    #[test]
+    fn constmul_shift_fires_through_the_pass_when_admitted() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(31)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(9), vreg(2)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ]);
+        assert!(X86Peephole::with_admissions(|_| false, |_, _, _| true).run(&mut func));
+        let ops = entry_opcodes(&func);
+        assert!(ops.contains(&X86Opcode::ShlRI), "arm fires: {ops:?}");
+        assert!(ops.contains(&X86Opcode::SubRR));
+        assert!(!ops.contains(&X86Opcode::ImulRRI));
+    }
+
+    /// Width is taken from the DESTINATION class and the immediate re-signed
+    /// at that width: a 32-bit `-31` arrives zero-extended as `0xFFFF_FFE1`
+    /// and must still be REFUSED (it is `1 - 2^5`), not misread as a huge
+    /// positive constant.
+    #[test]
+    fn constmul_shift_resigns_the_immediate_at_gpr32_width() {
+        let claimed = vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg32(2), vreg32(1), imm(31)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(9), imm(0)]),
+        ];
+        let Some(PeepholeEdit::ReplaceTwo(shl, _)) = simplify_inst_constmul_admitted(&claimed, 0)
+        else {
+            panic!("32-bit x31 must rewrite");
+        };
+        assert_eq!(shl.operands[2], imm(5));
+
+        let resigned = vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg32(2), vreg32(1), imm(0xFFFF_FFE1u32 as i64)],
+            ),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg32(9), imm(0)]),
+        ];
+        assert!(simplify_inst_constmul_admitted(&resigned, 0).is_none());
+    }
+
+    /// The decomposer itself, pinned independently of the pass plumbing.
+    #[test]
+    fn constmul_shift_decompose_claims_exactly_two_pow_a_plus_minus_one() {
+        assert_eq!(constmul_shift_decompose(31, 64), Some((5, false)));
+        assert_eq!(constmul_shift_decompose(33, 64), Some((5, true)));
+        assert_eq!(constmul_shift_decompose(3, 64), Some((1, true)));
+        assert_eq!(constmul_shift_decompose(7, 64), Some((3, false)));
+        assert_eq!(constmul_shift_decompose(63, 32), Some((6, false)));
+        // Two-shift, pure powers, `1 - 2^a`, and the degenerate multipliers.
+        for c in [24i128, 576, 14, 13, 100, 126, 2, 8, -31, -3, 0, 1, -1] {
+            assert_eq!(
+                constmul_shift_decompose(c, 64),
+                None,
+                "x{c} must not decompose"
+            );
+        }
+        // Shift amount must stay in range at the operation width: `2^32 + 1`
+        // would need `a = 32`, which is not `< width`.
+        assert_eq!(constmul_shift_decompose((1i128 << 32) + 1, 32), None);
+        assert_eq!(
+            constmul_shift_decompose((1i128 << 31) - 1, 32),
+            Some((31, false))
+        );
+    }
+
     #[test]
     fn lea_disp_fold_merges_the_add_one() {
         // lea (c,c,2),t ; add t,1 -> x  ==>  lea 1(c,c,2),x
@@ -11807,5 +14434,669 @@ mod tests {
             &uses,
             &defs
         ));
+    }
+
+    // ===================================================================
+    // SIB scale-1 index fold (the explicit-stride-multiply dialect)
+    // ===================================================================
+
+    fn sib_of(base_id: u32, index_id: u32, scale: u8, disp: i32) -> X86ISelOperand {
+        X86ISelOperand::SibMemAddr {
+            base: Box::new(vreg(base_id)),
+            index: Box::new(vreg(index_id)),
+            scale,
+            disp,
+        }
+    }
+
+    /// The shape the existing fold has no anchor for: an explicit stride
+    /// multiply feeding a SIB that ALREADY does the base addition at scale 1.
+    ///   imul v10, v1(index), k
+    ///   mov  v3, [v2 + v10*1]
+    ///   cmp  v4, v5        ; full-flag overwrite => the imul's flags are dead
+    ///   ret
+    fn scale1_load_window(scale_op: X86Opcode, imm: i64, sib_scale: u8) -> X86ISelFunction {
+        make_func(vec![
+            X86ISelInst::new(scale_op, vec![vreg(10), vreg(1), X86ISelOperand::Imm(imm)]),
+            X86ISelInst::new(
+                X86Opcode::MovRMSib,
+                vec![vreg(3), sib_of(2, 10, sib_scale, 0)],
+            ),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ])
+    }
+
+    fn only_sib(func: &X86ISelFunction) -> (u8, u32) {
+        for inst in entry_insts(func) {
+            for op in &inst.operands {
+                if let X86ISelOperand::SibMemAddr { index, scale, .. } = op
+                    && let X86ISelOperand::VReg(v) = index.as_ref()
+                {
+                    return (*scale, v.id);
+                }
+            }
+        }
+        panic!("no SIB operand found");
+    }
+
+    #[test]
+    fn scale1_fold_moves_an_imul_stride_into_the_sib_scale() {
+        let mut func = scale1_load_window(X86Opcode::ImulRRI, 8, 1);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(sib_scale1_index_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &counts,
+            &flags
+        ));
+        let insts = entry_insts(&func);
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|i| i.opcode == X86Opcode::ImulRRI)
+                .count(),
+            0,
+            "the multiply is retired"
+        );
+        // The SIB now scales the ORIGINAL index by 8.
+        assert_eq!(only_sib(&func), (8, 1));
+    }
+
+    #[test]
+    fn scale1_fold_handles_the_shl_spelling() {
+        let mut func = scale1_load_window(X86Opcode::ShlRI, 3, 1);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(sib_scale1_index_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &counts,
+            &flags
+        ));
+        assert_eq!(only_sib(&func), (8, 1));
+    }
+
+    #[test]
+    fn scale1_fold_declines_when_the_sib_scale_is_not_one() {
+        // `[base + (index*8)*2]` is not `[base + index*8]`; only scale 1 is a
+        // pure pass-through of the pre-scaled value.
+        let mut func = scale1_load_window(X86Opcode::ImulRRI, 8, 2);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(!sib_scale1_index_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &counts,
+            &flags
+        ));
+        assert_eq!(only_sib(&func), (2, 10), "untouched");
+    }
+
+    #[test]
+    fn scale1_fold_declines_a_non_power_of_two_stride() {
+        // A stride of 24 (a 24-byte element) has no SIB encoding.
+        let mut func = scale1_load_window(X86Opcode::ImulRRI, 24, 1);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(!sib_scale1_index_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &counts,
+            &flags
+        ));
+        assert_eq!(only_sib(&func), (1, 10), "untouched");
+    }
+
+    #[test]
+    fn scale1_fold_declines_when_the_multiplied_source_is_redefined_between() {
+        // `imul v10, v1, 8 ; v1 = ... ; mov v3,[v2+v10*1]` — rewriting the SIB to
+        // index on v1 would read the NEW v1, not the value that was multiplied.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(8)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(3), sib_of(2, 10, 1, 0)]),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(
+            !sib_scale1_index_fold_run_on_block(&mut func, Block(0), &counts, &flags),
+            "a redefined stride source must block the fold"
+        );
+        assert_eq!(only_sib(&func), (1, 10), "untouched");
+    }
+
+    #[test]
+    fn scale1_fold_declines_when_the_multiply_flags_are_live() {
+        // No full-flag overwrite before a flag READER: deleting the imul would
+        // change what the reader sees.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(8)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(3), sib_of(2, 10, 1, 0)]),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::O),
+                    X86ISelOperand::Block(Block(1)),
+                ],
+            ),
+        ]);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(
+            !sib_scale1_index_fold_run_on_block(&mut func, Block(0), &counts, &flags),
+            "live multiply flags must block the fold"
+        );
+        assert_eq!(only_sib(&func), (1, 10), "untouched");
+    }
+
+    #[test]
+    fn scale1_fold_rewrites_every_use_of_a_shared_index() {
+        // `c[i] = c[i] + ..` — a load and a store share one pre-scaled index.
+        // Both SIBs are rewritten and the single multiply retires. This is the
+        // read-modify-write shape a matmul inner loop presents.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(8)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(3), sib_of(2, 10, 1, 0)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_of(2, 10, 1, 0), vreg(3)]),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(sib_scale1_index_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &counts,
+            &flags
+        ));
+        let insts = entry_insts(&func);
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|i| i.opcode == X86Opcode::ImulRRI)
+                .count(),
+            0,
+            "the shared multiply retires once every use is rewritten"
+        );
+        // BOTH memory ops now index on the original vreg at scale 8.
+        let sibs: Vec<(u8, u32)> = insts
+            .iter()
+            .flat_map(|i| i.operands.iter())
+            .filter_map(|o| match o {
+                X86ISelOperand::SibMemAddr { index, scale, .. } => match index.as_ref() {
+                    X86ISelOperand::VReg(v) => Some((*scale, v.id)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sibs, vec![(8, 1), (8, 1)]);
+    }
+
+    #[test]
+    fn scale1_fold_declines_when_the_index_is_also_the_stored_value() {
+        // `mov [base + v*1], v` — the multiplied value is BOTH the address index
+        // and the datum. Retiring the multiply would store the wrong number.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(8)],
+            ),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![sib_of(2, 10, 1, 0), vreg(10)]),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(
+            !sib_scale1_index_fold_run_on_block(&mut func, Block(0), &counts, &flags),
+            "an index that is also the stored value must block the fold"
+        );
+        assert_eq!(only_sib(&func), (1, 10), "untouched");
+    }
+
+    #[test]
+    fn scale1_fold_declines_when_the_index_is_used_as_a_sib_base() {
+        // As a BASE the value is not scaled by the SIB, so it still needs the
+        // multiply.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(8)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(3), sib_of(10, 2, 1, 0)]),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(!sib_scale1_index_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &counts,
+            &flags
+        ));
+    }
+
+    #[test]
+    fn scale1_fold_declines_when_a_use_escapes_the_block() {
+        // The whole-function use count exceeds what this block accounts for, so
+        // some other block still needs the multiplied value.
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(8)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(3), sib_of(2, 10, 1, 0)]),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        // A second block consuming the pre-scaled value.
+        let b1 = Block(1);
+        func.ensure_block(b1);
+        func.push_inst(
+            b1,
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(7), vreg(8), vreg(10)]),
+        );
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(
+            !sib_scale1_index_fold_run_on_block(&mut func, Block(0), &counts, &flags),
+            "a use outside this block must block the fold"
+        );
+        assert_eq!(only_sib(&func), (1, 10), "untouched");
+    }
+
+    #[test]
+    fn scale1_fold_preserves_the_displacement() {
+        let mut func = scale1_load_window(X86Opcode::ImulRRI, 4, 1);
+        // Give the SIB a non-zero displacement.
+        {
+            let block = func.blocks.get_mut(&Block(0)).unwrap();
+            for op in block.insts[1].operands.iter_mut() {
+                if let X86ISelOperand::SibMemAddr { disp, .. } = op {
+                    *disp = 24;
+                }
+            }
+        }
+        let counts = FnUseDefCounts::build(&func);
+        let flags = X86FlagLiveness::analyze(&func);
+        assert!(sib_scale1_index_fold_run_on_block(
+            &mut func,
+            Block(0),
+            &counts,
+            &flags
+        ));
+        let insts = entry_insts(&func);
+        let found = insts.iter().any(|i| {
+            i.operands.iter().any(|o| {
+                matches!(
+                    o,
+                    X86ISelOperand::SibMemAddr {
+                        scale: 4,
+                        disp: 24,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(found, "scale folded to 4 AND displacement 24 preserved");
+    }
+
+    // ===================================================================
+    // Two-address increment collapse (lea + write-back -> add)
+    // ===================================================================
+
+    #[test]
+    fn writeback_policy_isolated_public_optimizer() {
+        const CHILD: &str = "CG_WRITEBACK_POLICY_CASE";
+        const TEST: &str = "x86_peephole::tests::writeback_policy_isolated_public_optimizer";
+        let Ok(case) = std::env::var(CHILD) else {
+            let mut failures = Vec::new();
+            for case in [
+                "default",
+                "zero",
+                "one",
+                "empty",
+                "installed_on",
+                "installed_off",
+            ] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", TEST, "--nocapture", "--test-threads=1"]);
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().starts_with("TCG_")
+                        || key.to_string_lossy().starts_with("TRUST_CG_")
+                    {
+                        command.env_remove(key);
+                    }
+                }
+                command.env(CHILD, case);
+                match case {
+                    "zero" | "installed_off" => {
+                        command.env("TCG_NO_X86_LEA_WRITEBACK", "0");
+                    }
+                    "one" | "installed_on" => {
+                        command.env("TCG_NO_X86_LEA_WRITEBACK", "1");
+                    }
+                    "empty" => {
+                        command.env("TCG_NO_X86_LEA_WRITEBACK", "");
+                    }
+                    _ => {}
+                }
+                let output = command.output().unwrap();
+                println!(
+                    "case {case}:\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success() {
+                    failures.push(case);
+                }
+            }
+            assert!(failures.is_empty(), "failed cases: {failures:?}");
+            return;
+        };
+        if case.starts_with("installed_") {
+            let disabled = case == "installed_off";
+            assert!(set_lea_writeback_disabled(disabled));
+            assert!(set_lea_writeback_disabled(disabled));
+            assert!(!set_lea_writeback_disabled(!disabled));
+        }
+        let enabled = matches!(case.as_str(), "default" | "zero" | "installed_on");
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(17)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![vreg(2), vreg(1), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        X86Peephole::default().run_on_function(&mut func);
+        assert_eq!(
+            entry_insts(&func)
+                .iter()
+                .any(|i| i.opcode == X86Opcode::AddRI
+                    && i.operands == vec![vreg(1), vreg(1), X86ISelOperand::Imm(17)]),
+            enabled
+        );
+        assert_eq!(entry_opcodes(&func).contains(&X86Opcode::MovRR), !enabled);
+    }
+
+    fn writeback_instructions_unchanged(before: &[X86ISelInst], after: &[X86ISelInst]) -> bool {
+        before.len() == after.len()
+            && before.iter().zip(after).all(|(a, b)| {
+                a.opcode == b.opcode
+                    && a.operands == b.operands
+                    && a.flags == b.flags
+                    && a.proof_origin == b.proof_origin
+            })
+    }
+
+    #[test]
+    fn writeback_rejects_extra_operands() {
+        let mut rewritten = Vec::new();
+        for extra_at in [0, 1] {
+            let mut pair = vec![
+                lea_disp(10, 1, 1),
+                X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            ];
+            pair[extra_at]
+                .operands
+                .push(X86ISelOperand::PReg(trust_cg_ir::x86_64_regs::RAX));
+            pair.push(X86ISelInst::new(
+                X86Opcode::CmpRI,
+                vec![vreg(1), X86ISelOperand::Imm(7)],
+            ));
+            let func = run_lea_writeback(pair.clone());
+            if !writeback_instructions_unchanged(&pair, entry_insts(&func)) {
+                rewritten.push(extra_at);
+            }
+        }
+        assert!(
+            rewritten.is_empty(),
+            "malformed instructions rewritten at {rewritten:?}"
+        );
+    }
+
+    #[test]
+    fn writeback_preserves_origins_and_fixed_registers() {
+        for guarded_at in [0, 1] {
+            for origin in [true, false] {
+                let mut pair = vec![
+                    lea_disp(10, 1, 1),
+                    X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+                ];
+                if origin {
+                    pair[guarded_at].proof_origin =
+                        Some(trust_cg_lower::x86_64_isel::X86ProofOrigin::AtomicLoad);
+                } else {
+                    pair[guarded_at].operands[0] =
+                        X86ISelOperand::PReg(trust_cg_ir::x86_64_regs::RAX);
+                }
+                pair.push(X86ISelInst::new(
+                    X86Opcode::CmpRI,
+                    vec![vreg(1), X86ISelOperand::Imm(7)],
+                ));
+                let func = run_lea_writeback(pair.clone());
+                assert!(
+                    writeback_instructions_unchanged(&pair, entry_insts(&func)),
+                    "changed guarded instruction: position={guarded_at}, origin={origin}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn writeback_preserves_signed_displacement_edges() {
+        for disp in [i32::MIN, -1, 1, i32::MAX] {
+            for use_lea in [true, false] {
+                let first = if use_lea {
+                    lea_disp(10, 1, disp)
+                } else {
+                    X86ISelInst::new(
+                        X86Opcode::AddRI,
+                        vec![vreg(10), vreg(1), X86ISelOperand::Imm(i64::from(disp))],
+                    )
+                };
+                let func = run_lea_writeback(vec![
+                    first,
+                    X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+                    X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+                ]);
+                assert_eq!(entry_insts(&func).len(), 2);
+                assert_eq!(
+                    entry_insts(&func)[0].operands,
+                    vec![vreg(1), vreg(1), X86ISelOperand::Imm(i64::from(disp))]
+                );
+            }
+        }
+    }
+
+    fn lea_disp(dst: u32, base: u32, disp: i32) -> X86ISelInst {
+        X86ISelInst::new(
+            X86Opcode::Lea,
+            vec![
+                vreg(dst),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(vreg(base)),
+                    disp,
+                },
+            ],
+        )
+    }
+
+    fn run_lea_writeback(insts: Vec<X86ISelInst>) -> X86ISelFunction {
+        let mut func = make_func(insts);
+        let counts = FnUseDefCounts::build(&func);
+        lea_writeback_collapse_run_on_block(&mut func, Block(0), &counts);
+        func
+    }
+
+    #[test]
+    fn lea_writeback_becomes_an_in_place_add() {
+        // `lea tmp,[base+1] ; mov base,tmp` with the flags dead (the trailing
+        // CmpRI fully overwrites them before any reader).
+        let func = run_lea_writeback(vec![
+            lea_disp(10, 1, 1),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let ops = entry_opcodes(&func);
+        assert!(!ops.contains(&X86Opcode::Lea), "the lea is gone");
+        assert!(
+            !ops.contains(&X86Opcode::MovRR),
+            "the write-back copy is gone"
+        );
+        let add = entry_insts(&func)
+            .iter()
+            .find(|i| i.opcode == X86Opcode::AddRI)
+            .expect("an in-place add replaced the pair");
+        assert_eq!(
+            add.operands,
+            vec![vreg(1), vreg(1), X86ISelOperand::Imm(1)],
+            "adds the displacement to the base in place"
+        );
+    }
+
+    #[test]
+    fn lea_writeback_is_refused_when_the_flags_are_live() {
+        // THE condition: `Lea` writes no flags, `AddRI` writes all of them. A
+        // reader before any full overwrite must block the rewrite.
+        let func = run_lea_writeback(vec![
+            lea_disp(10, 1, 1),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![vreg(2), vreg(3), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let ops = entry_opcodes(&func);
+        assert!(ops.contains(&X86Opcode::Lea), "flag-neutral lea retained");
+        assert!(ops.contains(&X86Opcode::MovRR));
+        assert!(!ops.contains(&X86Opcode::AddRI));
+    }
+
+    #[test]
+    fn lea_writeback_is_refused_when_the_temporary_has_another_reader() {
+        let func = run_lea_writeback(vec![
+            lea_disp(10, 1, 1),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            // A second consumer of the pre-increment value.
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(4), vreg(10)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(entry_opcodes(&func).contains(&X86Opcode::Lea));
+    }
+
+    #[test]
+    fn lea_writeback_is_refused_for_a_zero_displacement_copy() {
+        // `lea tmp,[base+0] ; mov base,tmp` is a plain copy, not an increment;
+        // other passes own it and an `add $0` would be strictly worse.
+        let func = run_lea_writeback(vec![
+            lea_disp(10, 1, 0),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(entry_opcodes(&func).contains(&X86Opcode::Lea));
+        assert!(!entry_opcodes(&func).contains(&X86Opcode::AddRI));
+    }
+
+    #[test]
+    fn lea_writeback_is_refused_for_a_scaled_index_address() {
+        // A SIB address adds a RUNTIME index, which is not an immediate add.
+        let func = run_lea_writeback(vec![
+            X86ISelInst::new(X86Opcode::LeaSib, vec![vreg(10), sib_of(1, 2, 8, 1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!entry_opcodes(&func).contains(&X86Opcode::AddRI));
+    }
+
+    #[test]
+    fn lea_writeback_is_refused_when_the_pair_is_not_adjacent() {
+        // An instruction between them could read `base`, which after the fold
+        // already holds the incremented value.
+        let func = run_lea_writeback(vec![
+            lea_disp(10, 1, 1),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(5), vreg(1)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(entry_opcodes(&func).contains(&X86Opcode::Lea));
+        assert!(!entry_opcodes(&func).contains(&X86Opcode::AddRI));
+    }
+
+    #[test]
+    fn addri_writeback_folds_even_with_the_flags_live() {
+        // The `AddRI` spelling needs NO flag condition, and this is the test that
+        // says so: the rewrite keeps the SAME flag write at the SAME position with
+        // the identical result, so a downstream reader is unaffected. (The `Lea`
+        // spelling in the sibling test must refuse the same shape, because there
+        // folding would INTRODUCE a flag write.)
+        let func = run_lea_writeback(vec![
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(1)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![vreg(2), vreg(3), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(
+            !entry_opcodes(&func).contains(&X86Opcode::MovRR),
+            "the write-back copy is retired"
+        );
+        let add = entry_insts(&func)
+            .iter()
+            .find(|i| i.opcode == X86Opcode::AddRI)
+            .expect("an in-place add remains");
+        assert_eq!(add.operands, vec![vreg(1), vreg(1), X86ISelOperand::Imm(1)]);
+    }
+
+    #[test]
+    fn addri_writeback_is_refused_when_the_temporary_is_read_again() {
+        let func = run_lea_writeback(vec![
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![vreg(10), vreg(1), X86ISelOperand::Imm(1)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(10)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(4), vreg(10)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert_eq!(
+            entry_insts(&func)
+                .iter()
+                .filter(|i| i.opcode == X86Opcode::MovRR)
+                .count(),
+            2,
+            "a second reader of the temporary blocks the fold"
+        );
     }
 }

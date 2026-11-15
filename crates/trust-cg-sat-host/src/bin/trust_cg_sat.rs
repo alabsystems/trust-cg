@@ -24,9 +24,10 @@
 // * `--shadow`        — engage `SHADOW_MODE` (JIT BCP runs as a
 //   differential check alongside native propagate; native is still
 //   authoritative for the return value).
-// * `--primary-jit`   — engage `PRIMARY_JIT_MODE` (JIT BCP's verdict
-//   becomes the primary return value where the epoch-0 authority
-//   rules permit; mutually exclusive with `--shadow`).
+// * `--primary-jit`   — engage `PRIMARY_JIT_MODE` (attempt JIT BCP replacement
+//   with the default analyze driver; declined replacements use native, and
+//   non-root analysis continues through native propagation; mutually exclusive
+//   with `--shadow`).
 // * `--jit-kernel`    — pick the JIT BCP kernel that both `--shadow`
 //   and `--primary-jit` build. Default `watched-literal`; the `scan`
 //   and `with-decisions` kernels remain available for
@@ -48,9 +49,7 @@ use std::sync::atomic::Ordering;
 
 use clap::Parser;
 
-use trust_cg_sat_host::drat_recorder::{
-    disable_drat_output, enable_drat_output, flush_drat_output,
-};
+use trust_cg_sat_host::drat_recorder::{disable_drat_output, enable_drat_output};
 use trust_cg_sat_host::propagate::{
     JIT_DIVERGENCE_COUNT, JIT_INIT_COUNT, JIT_KERNEL_CHOICE, JIT_KERNEL_SCAN,
     JIT_KERNEL_WATCHED_LITERAL, JIT_KERNEL_WITH_DECISIONS, JIT_PRIMARY_RETURNS,
@@ -64,6 +63,7 @@ use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 const EXIT_SAT: u8 = 10;
 const EXIT_UNSAT: u8 = 20;
 const EXIT_UNKNOWN: u8 = 0;
+const EXIT_FAILURE: u8 = 1;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,7 +75,7 @@ const EXIT_UNKNOWN: u8 = 0;
                   trust_cg_sat <instance.cnf> [proof.drat]\n\
                   trust_cg_sat <instance.cnf> --proof proof.drat\n\n\
                   Exit codes: 10 = SATISFIABLE, 20 = UNSATISFIABLE, \
-                  0 = UNKNOWN."
+                  0 = UNKNOWN, 1 = input/output failure."
 )]
 struct Args {
     /// Path to the DIMACS CNF instance.
@@ -166,9 +166,9 @@ fn main() -> ExitCode {
             let msg = format!("c trust_cg_sat: error: {err}");
             println!("{msg}");
             eprintln!("{msg}");
-            // UNKNOWN exit per SAT-Comp contract: anything other than
-            // 10 or 20 means "no answer."
-            ExitCode::from(EXIT_UNKNOWN)
+            // Still "no answer" to SAT-Comp (neither 10 nor 20), but a
+            // nonzero status lets ordinary scripts detect input/output errors.
+            ExitCode::from(EXIT_FAILURE)
         }
     }
 }
@@ -220,6 +220,26 @@ fn run(args: Args) -> Result<u8, CliError> {
     }
 
     let proof_path = args.proof.clone().or_else(|| args.proof_positional.clone());
+    if let Some(path) = &proof_path {
+        let input = same_file::Handle::from_path(&args.cnf)?;
+        match same_file::Handle::from_path(path) {
+            Ok(output) if input == output => {
+                return Err(CliError(format!(
+                    "DRAT proof output {} aliases CNF input {}",
+                    path.display(),
+                    args.cnf.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError(format!(
+                    "cannot inspect DRAT proof output {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
 
     let mut stdout = io::stdout().lock();
     let comment = |s: &str, stdout: &mut io::StdoutLock<'_>| -> io::Result<()> {
@@ -295,13 +315,9 @@ fn run(args: Args) -> Result<u8, CliError> {
         unsafe { solver.solve() }
     };
 
-    // Flush any buffered DRAT before we read the file or exit.
-    if proof_path.is_some()
-        && let Err(e) = flush_drat_output()
-    {
-        comment(&format!("WARNING: drat flush failed: {e}"), &mut stdout)?;
-    }
-    disable_drat_output();
+    // An incomplete requested proof is a failed run, not a warning attached
+    // to a successful solver result. Finalization includes callback errors.
+    disable_drat_output().map_err(|e| CliError(format!("DRAT output failed: {e}")))?;
 
     // Emit telemetry comments before the result line so a parser that
     // greps `^s ` still works. SAT-Comp parsers ignore unknown `c`
@@ -313,6 +329,18 @@ fn run(args: Args) -> Result<u8, CliError> {
         &mut stdout,
     )?;
     if args.shadow || args.primary_jit {
+        comment(
+            "telemetry counts saturate at u64::MAX; saturated deltas are lower bounds",
+            &mut stdout,
+        )?;
+        comment(
+            "jit_primary_returns is a legacy activity count: replacement kernel attempts plus mapped comparisons, not authoritative returns or native calls avoided",
+            &mut stdout,
+        )?;
+        comment(
+            "jit_successful_runs counts accepted replacements plus matching comparisons, not consecutive agreements or independent proofs",
+            &mut stdout,
+        )?;
         let jit_inits_delta = JIT_INIT_COUNT.load(Ordering::SeqCst) - jit_inits_before;
         let divergences_delta = JIT_DIVERGENCE_COUNT.load(Ordering::SeqCst) - divergences_before;
         let jit_primary_delta = JIT_PRIMARY_RETURNS.load(Ordering::SeqCst) - jit_primary_before;

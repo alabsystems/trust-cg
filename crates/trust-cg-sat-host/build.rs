@@ -63,8 +63,7 @@ use std::path::PathBuf;
 // Every failure below returns `Err` instead of panicking. A build script that
 // returns `Err` still fails the build loudly — cargo prints the message and
 // stops — so nothing is downgraded to a silent fallback; the `Err` form only
-// buys room to name the path that was resolved and the remediation, and keeps
-// this file free of panic-family sites (`ratchet/panic_audit.md`).
+// buys room to name the path that was resolved and the remediation.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or(
@@ -142,6 +141,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .opt_level(3);
     let cc_tool = build.get_compiler();
     if !cc_tool.is_like_msvc() {
+        // MicroSAT names a `struct solver` member `false`. C23 makes `false`
+        // a keyword, and GCC 15 selects C23 by default (`-std=gnu23`), so the
+        // renamed source stops compiling on a stock GCC 15 host (Ubuntu
+        // gcc 15.2.0, x86-64 Linux, 2026-09-20: "expected identifier or '('
+        // before 'false'"). Pin the pre-C23 GNU dialect every previous driver
+        // defaulted to; the source is unchanged.
+        build.flag_if_supported("-std=gnu17");
         build.flag_if_supported("-O3");
         build.flag_if_supported("-march=native");
     }

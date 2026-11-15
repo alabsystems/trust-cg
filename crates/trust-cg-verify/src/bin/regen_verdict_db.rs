@@ -16,7 +16,7 @@
 //! Usage (from the repo):
 //!
 //! ```text
-//! cargo run --release -p trust-cg-verify --bin regen_verdict_db [out-path]
+//! scripts/trust_cargo.sh run --release -p trust-cg-verify --bin regen_verdict_db [out-path]
 //! ```
 
 use std::path::PathBuf;

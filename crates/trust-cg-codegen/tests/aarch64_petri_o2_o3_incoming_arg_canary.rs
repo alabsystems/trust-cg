@@ -1,5 +1,8 @@
 #![cfg(target_arch = "aarch64")]
 
+#[path = "common/field_typed.rs"]
+mod field_typed;
+
 use std::collections::HashMap;
 
 use trust_cg_codegen::pipeline::OptLevel;
@@ -112,7 +115,9 @@ fn build_petri_canary_module() -> trust_ir::Module {
 
         fb.switch_to_block(merge);
         let state0_ptr = fb.gep(Ty::I64, state, vec![zero_offset]);
-        let state0 = fb.load(Ty::I64, state0_ptr);
+        // Loaded as the `u64` it is stored as (a store of an `i64` value at
+        // `u64` is `OperandTypeMismatch`; WS7.3 ingestion admission).
+        let state0 = fb.load(Ty::U64, state0_ptr);
         let petri_mix0 = fb.binop(BinOp::Add, Ty::U32, parent, child);
         let petri_mix1 = fb.binop(BinOp::Xor, Ty::U32, petri_mix0, token);
         let petri_mix2 = fb.binop(BinOp::Add, Ty::U32, petri_mix1, rotated);
@@ -132,14 +137,15 @@ fn build_petri_canary_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_to_jit(module: &trust_ir::Module, opt_level: OptLevel) -> ExecutableBuffer {
     let mut config = CompilerConfig::jit_fast(Target::Aarch64);
     config.opt_level = opt_level;
     Compiler::new(config)
-        .compile_module_to_jit(module, &HashMap::new())
+        .with_codegen_license(permit_unlicensed())
+        .compile_module_to_jit(&field_typed::normalized(module), &HashMap::new())
         .unwrap_or_else(|err| panic!("{opt_level:?} compile failed: {err}"))
         .buffer
 }
@@ -228,4 +234,13 @@ fn petri_incoming_arg_and_zero_offset_load_survive_o2_o3_pressure() {
         run_case(entry, opt_level, 123);
         run_case(entry, opt_level, 124);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

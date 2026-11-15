@@ -213,7 +213,7 @@ fn render_markdown(
     s.push_str(&row(
         "WS1",
         "L1 Unit",
-        "`cargo test` pass-count",
+        "`targo test` pass-count",
         records.get("matrix").unwrap_or(&None),
     ));
     s.push('\n');
@@ -241,7 +241,7 @@ fn render_markdown(
     s.push_str(&row(
         "WS5",
         "L5 Bootstrap",
-        "rustc stage reached",
+        "not measured: `bootstrap` is an unimplemented stub (exit 2)",
         records.get("bootstrap").unwrap_or(&None),
     ));
     s.push('\n');
@@ -484,6 +484,25 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(42)
         );
+    }
+
+    #[test]
+    fn matrix_v2_keeps_raw_passes_and_runtime_skips_distinct() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        write_fixture(
+            &temp.path().join("evals/results/tests/2026-09-09.json"),
+            r#"{"schema":"trust-cg.test-matrix.v2","totals":{"passed":2,"libtest_passed":5,"runtime_skipped":3,"failed":0,"outcome_counts":{"skipped":1}}}"#,
+        );
+        let records = discover_latest(temp.path());
+        let matrix = &records["matrix"];
+        let totals = matrix.as_ref().unwrap().totals.as_ref().unwrap();
+        assert_eq!(totals["passed"], 2);
+        assert_eq!(totals["libtest_passed"], 5);
+        assert_eq!(totals["runtime_skipped"], 3);
+        assert_eq!(totals["outcome_counts"]["skipped"], 1);
+        let rendered = metric_cell(matrix);
+        assert!(rendered.contains("\"passed\":2"));
+        assert!(rendered.contains("\"runtime_skipped\":3"));
     }
 
     #[test]

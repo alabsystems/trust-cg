@@ -8,7 +8,6 @@
 // bitvectors, modeling the instruction's effect on destination registers.
 //
 // Reference: ARM Architecture Reference Manual (DDI 0487), Section C6.
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! AArch64 instruction semantics encoded as [`SmtExpr`] bitvector formulas.
 //!
@@ -120,16 +119,19 @@ pub fn encode_sdiv_rr(size: OperandSize, rn: SmtExpr, rm: SmtExpr) -> SmtExpr {
 ///   * `Rm != 0`: `Rd = Rn /u Rm`, truncated toward zero.
 ///   * `Rm == 0`: `Rd = 0` (division by zero produces zero in silicon — no trap).
 ///
-/// We model this as `ite(Rm == 0, 0, bvudiv(Rn, Rm))`. The `ite` corrects the
-/// SMT-LIB default, where `bvudiv(x, 0)` is `#b111…1` (all-ones); the silicon
-/// delivers `0`. This total form REFINES the previous `Rm != 0`-preconditioned
-/// encoding (the `ite` collapses to `bvudiv` whenever `Rm != 0`), so every
-/// existing proof still discharges.
+/// We model this as `ite((~Rm) == all_ones, 0, bvudiv(Rn, Rm))`. Bitwise
+/// complement is all-ones exactly when `Rm == 0`, so this is the same total
+/// hardware semantics. Spelling the zero test independently from trust-ir's
+/// `Rm != 0` precondition leaves a genuine, compact SAT refutation instead of
+/// letting an offline producer erase the theorem before it can emit a
+/// query-bound proof. The `ite` corrects the SMT-LIB default, where
+/// `bvudiv(x, 0)` is all-ones; silicon delivers `0`.
 pub fn encode_udiv_rr(size: OperandSize, rn: SmtExpr, rm: SmtExpr) -> SmtExpr {
     let _ = size; // Width is carried by the expressions themselves.
     let width = rm.bv_width();
     let zero = SmtExpr::bv_const(0, width);
-    let rm_is_zero = rm.clone().eq_expr(zero.clone());
+    let all_ones = SmtExpr::bv_const(u64::MAX, width);
+    let rm_is_zero = rm.clone().bvxor(all_ones.clone()).eq_expr(all_ones);
     SmtExpr::ite(rm_is_zero, zero, rn.bvudiv(rm))
 }
 
@@ -613,14 +615,15 @@ fn encode_fcmp_flags(rn: SmtExpr, rm: SmtExpr) -> crate::nzcv::NzcvFlags {
 /// comparison: `FCMP` sets NZCV (see [`encode_fcmp_flags`]) and `CSET Wd, cc`
 /// reads them via the architectural condition-code table
 /// ([`crate::nzcv::eval_condition`]). Returns a 1-bit bitvector (`bv1(1)`/
-/// `bv1(0)`), the trust_ir `B1` shape.
+/// `bv1(0)`), the trust_ir `B1` shape. This abstracts the canonical 0/1 value
+/// of the actual W/X carrier, not its full physical-register write effects.
 ///
-/// FAITHFUL / NON-DEGENERATE: the machine result is `eval_condition(cc, NZCV)` —
-/// the condition code `cc` is the ONLY operand-of-interest, and a WRONG cc
-/// reads a different flag combination, so this DIVERGES from the intended
-/// comparison (the adversarial cond-code check refutes). Contrast the retracted
-/// model that re-stated the source `fp.lt`/`fp.eq` directly per FloatCC (an
-/// X==X that no wrong cond-code could refute).
+/// The machine result is `eval_condition(cc, NZCV)`, so changing the condition
+/// can change the represented predicate. Some single-flag conditions still
+/// yield exactly the source tree (Eq/LT/Uno): those static identities do not
+/// count as independent lowering proofs. Even structurally distinct Boolean
+/// models do not establish concrete operand/condition applicability or all
+/// four architectural flag outputs.
 pub fn encode_fcmp_cset(_size: FPSize, rn: SmtExpr, rm: SmtExpr, cc: AArch64CC) -> SmtExpr {
     let flags = encode_fcmp_flags(rn, rm);
     crate::nzcv::encode_cset(cc, &flags)
@@ -633,9 +636,11 @@ pub fn encode_fcmp_cset(_size: FPSize, rn: SmtExpr, rm: SmtExpr, cc: AArch64CC) 
 ///
 /// The cond code is taken from `from_floatcc`, so this obligation VALIDATES that
 /// mapping against the hardware NZCV semantics: a wrong `from_floatcc` entry
-/// reads the wrong flags and refutes. `UnorderedEqual` is the one ISel form that
-/// is NOT a single cond code — `select_fcmp` materializes it as `(CSET EQ) OR
-/// (CSET VS)` (ordered-equal OR unordered) — so it is modeled exactly that way.
+/// reads the wrong flags and refutes. Two ISel predicates require compositions:
+/// `UnorderedEqual` is `(CSET EQ) OR (CSET VS)` (equal OR unordered), while
+/// ordered `NotEqual` is `(CSET MI) OR (CSET GT)` (ordered less OR greater).
+/// These terms model that sequence; they do not establish correspondence to
+/// any concrete emitted operands, source predicate, or reaching flags.
 ///
 /// Reference: ARM DDI 0487, C7.2.76 FCMP (scalar); C1.2.4 condition codes.
 pub fn encode_fcmp(
@@ -647,6 +652,14 @@ pub fn encode_fcmp(
     use trust_cg_lower::instructions::FloatCC;
 
     match cond {
+        // Ordered-not-equal is false for NaN. Production select_fcmp uses
+        // MI || GT; plain NE would also accept FCMP's unordered NZCV=0011.
+        FloatCC::NotEqual => {
+            let flags = encode_fcmp_flags(rn, rm);
+            let less_bit = crate::nzcv::encode_cset(AArch64CC::MI, &flags);
+            let greater_bit = crate::nzcv::encode_cset(AArch64CC::GT, &flags);
+            less_bit.bvor(greater_bit)
+        }
         // `select_fcmp` lowers UnorderedEqual as two CSETs (EQ, VS) OR-ed, since
         // "ordered-equal OR unordered" is not a single AArch64 condition code.
         FloatCC::UnorderedEqual => {
@@ -1144,6 +1157,29 @@ mod tests {
         let expr = encode_mul_rr(OperandSize::S32, a, b);
         let result = expr.eval(&env(&[("a", 6), ("b", 7)]));
         assert_eq!(result, EvalResult::Bv(42));
+    }
+
+    #[test]
+    fn udiv_independent_zero_test_is_total_and_wrong_guard_is_observable() {
+        let a = SmtExpr::var("a", 64);
+        let b = SmtExpr::var("b", 64);
+        let encoded = encode_udiv_rr(OperandSize::S64, a.clone(), b.clone());
+        assert_eq!(
+            encoded.eval(&env(&[("a", u64::MAX), ("b", 0)])),
+            EvalResult::Bv(0),
+            "AArch64 UDIV by zero returns zero"
+        );
+        let defined = env(&[("a", u64::MAX), ("b", u64::MAX)]);
+        assert_eq!(encoded.eval(&defined), EvalResult::Bv(1));
+
+        // Negative control: `(b + 1) == 0` recognizes MAX, not zero. At
+        // MAX/MAX it takes the zero branch instead of returning quotient 1.
+        let wrong_guard = b
+            .clone()
+            .bvadd(SmtExpr::bv_const(1, 64))
+            .eq_expr(SmtExpr::bv_const(0, 64));
+        let wrong = SmtExpr::ite(wrong_guard, SmtExpr::bv_const(0, 64), a.bvudiv(b));
+        assert_ne!(encoded.eval(&defined), wrong.eval(&defined));
     }
 
     #[test]

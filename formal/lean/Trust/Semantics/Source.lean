@@ -9,14 +9,14 @@
   and return — together with the observable `Event` labels that make I/O / call / ret
   externally visible.
 
-  Consistency with the SHARED CONTRACT (Trust.Model):
+  Consistency with the SHARED CONTRACT (Trust.Model.Core):
     * We do NOT redefine `Val`, `Loc`, `MachState`, `SrcState`, `Event`, or `R`.
-    * The contract declares `srcStep : SrcState → Event → SrcState → Prop` OPAQUE.
-      This module gives the *intended denotation* as a concrete inductive `SrcStep`
-      and exposes `srcStep_spec : srcStep = SrcStep` as the single bridging
-      characterization the downstream Sim.* modules program against. Because the
-      contract's `srcStep` is genuinely `opaque`, this characterization is stated as
-      an EXPLICIT `axiom` (auditable via `#print axioms`), NOT a `sorry`-proof.
+    * `Trust.Model` (the link step) DEFINES `srcStep p := SrcStep p`, so the equation
+      `Source.srcStep_spec p : srcStep p = SrcStep p` is `rfl` there. While the contract
+      declared `srcStep` opaque, that equation was an explicit axiom.
+    * `SrcStep p` fetches the exact instruction at the current PC in `p`.
+      Returns and operation-local faults terminate. No rule can introduce an
+      unrelated call, return, trap or MMIO action.
 
   The op vocabulary mirrors the real bridge interpreter
   (rustc-codegen-trust-cg/src/trust_ir_interp.rs):
@@ -30,7 +30,7 @@
   Copyright 2026 Andrew Yates. Apache 2.0.
 -/
 import Std.Tactic.BVDecide
-import Trust.Model        -- the SHARED CONTRACT preamble (R, Val, SrcState, Event, srcStep …)
+import Trust.Model.Core   -- the SHARED CONTRACT preamble (R, Val, SrcState, Event …)
 
 namespace Trust
 namespace Source
@@ -96,10 +96,11 @@ def i128Bits : Val → BitVec 128
 
 /-! ## Pure binary-op denotation at a fixed width `w ≤ 64`.
 
-    These are the EXACT specifications the per-instruction bv_decide certs
-    (`lowerAdd_correct`, etc.) must match. Shifts mask the amount to `w-1` bits,
-    mirroring x86 SHL/SHR/SAR (which mask to the operand width) and the interpreter's
-    `mask_shift_amount`. URem is the encoder's `a - udiv(a,b)*b` form. -/
+    These are the value specifications the instruction certs must match. Shifts
+    retain OD-57's selected masked refinement outside the TrustIR-defined range;
+    the interpreter itself reports out-of-range shifts as undefined behavior.
+    For admitted power-of-two widths the in-range values agree. URem is the
+    encoder's `a - udiv(a,b)*b` form. -/
 
 /-- Mask a shift amount to the low `clog2`-equivalent bits: `amt &&& (w-1)` as a
     BitVec of the operand width. trust-cg width `w` is a power of two in {8,16,32,64};
@@ -109,8 +110,8 @@ def maskAmt (w : Nat) (amt : BitVec w) : BitVec w :=
 
 /-- Denotation of a pure (non-i128) binary op on width-`w` operands.
     Division/remainder by zero is left to the source-level trap precondition
-    (the `hdiv` hypothesis on `SrcStep.bin`); here we use Lean's total `BitVec`
-    div/rem (which return a fixed value on 0) and forbid the zero case at the step. -/
+    (the division guard in `execute`); Lean's total `BitVec` denotations are
+    used only after excluding zero divisors and signed MIN / -1 overflow. -/
 def evalBin (op : BinOp) (w : Nat) (a b : BitVec w) : BitVec w :=
   match op with
   | .add  => a + b
@@ -127,16 +128,23 @@ def evalBin (op : BinOp) (w : Nat) (a b : BitVec w) : BitVec w :=
   | .lshr => a >>> (maskAmt w b)
   | .ashr => BitVec.sshiftRight' a (maskAmt w b)
 
-/-- `urem` agrees with `BitVec.umod` away from divisor 0 — the bridge encoder uses
-    the `a - udiv*b` form, and bv_decide certifies it equals the canonical `umod`.
-    This is the one shape-bridging fact the Compare/Arith certs reuse. -/
+/-- `urem` agrees with `BitVec.umod` away from divisor zero. Natural-number
+    quotient/remainder decomposition proves the encoder's subtraction form at
+    every width, including the modular subtraction bookkeeping. -/
 theorem evalBin_urem_eq_umod (w : Nat) (a b : BitVec w) (hb : b ≠ 0) :
     evalBin .urem w a b = BitVec.umod a b := by
-  -- a - udiv(a,b)*b = umod a b is a bitvector identity for b ≠ 0; for the concrete
-  -- widths trust-cg uses (8/16/32/64) bv_decide discharges it. At symbolic `w` it is
-  -- the library lemma `BitVec.umod_eq` rearranged; we keep the small-width discharge
-  -- pattern the rest of the development uses and defer the polymorphic-width proof.
-  sorry  -- mechanical: BitVec.udiv/umod algebra (a - (a/b)*b = a % b); per-width bv_decide.
+  have hprod := Nat.div_mul_le_self a.toNat b.toNat
+  have hsum := Nat.mod_add_div a.toNat b.toNat
+  rw [Nat.mul_comm] at hsum
+  have hbound := a.isLt
+  have hprodmod : (a.toNat / b.toNat * b.toNat) % 2 ^ w = a.toNat / b.toNat * b.toNat :=
+    Nat.mod_eq_of_lt (by omega)
+  have hcalc : 2 ^ w - a.toNat / b.toNat * b.toNat + a.toNat =
+      2 ^ w + a.toNat % b.toNat := by omega
+  apply BitVec.eq_of_toNat_eq
+  simp only [evalBin, BitVec.udiv_eq, BitVec.umod_eq, BitVec.toNat_sub,
+    BitVec.toNat_mul, BitVec.toNat_udiv, BitVec.toNat_umod]
+  rw [hprodmod, hcalc, Nat.add_mod_left, Nat.mod_eq_of_lt (by omega)]
 
 /-- i128 binary op (the register-pair family: add/sub/mul/and/or/xor; shifts/div on
     i128 take the libcall/wide path and are NOT in this pure slice). -/
@@ -261,6 +269,20 @@ inductive SrcTerm
   | call   (target : BitVec 64) (ret : SrcPC)        -- observable CALL event
   | ret                                              -- observable RET event
 
+/-- An immutable program position selects exactly one operation. -/
+inductive CodeItem
+  | instr (instruction : SrcInstr)
+  | term (terminator : SrcTerm)
+  | mmioWrite (address value : SOperand)
+  | trap
+
+/-- The source instruction map is a semantic input, not mutable source memory. -/
+structure Program where
+  code : SrcPC → Option CodeItem
+
+def Program.ofList (items : List CodeItem) : Program :=
+  ⟨fun pc => items[pc]?⟩
+
 /-! ## Evaluating an operand against a source state. -/
 
 /-- Resolve an `SOperand` to a `Val` in state `s`. Names read the env; constants are
@@ -331,172 +353,213 @@ def gotoWith (s : SrcState) (target : SrcPC)
                 fun x => x = vb.1 ∨ l x) s.live
   { s with env := env', live := live', pc := target }
 
-/-- The intended source semantics. `SrcStep s ev s'`. -/
-inductive SrcStep : SrcState → Event → SrcState → Prop
-  /-- pure width-`w` binary op. Division/remainder require a non-zero divisor
-      (a source-level trap precondition; a zero divisor is not a `bin` step — it is
-      matched by `SrcStep.trap`, which the validator fails-closed on). -/
-  | bin {s dst op w hw a b}
-      (hdiv : (op = .udiv ∨ op = .urem ∨ op = .sdiv ∨ op = .srem) →
-                intBitsAt w (evalOperand s b) ≠ 0) :
-      SrcStep s .tau
-        (setEnv (bumpPC s) dst
+/-- Faults are selected by the fetched operation or invalid control, and terminate. -/
+def fault (s : SrcState) : Event × SrcState := (.trap, { s with halted := true })
+
+def hasIntWidth (w : Nat) : Val → Bool
+  | .int actual _ _ => actual == w
+  | _ => false
+
+/-- Comparisons materialize canonical i8 0/1; B1 constants use width one. -/
+def hasBool : Val → Bool
+  | .int w _ bits => decide (w = 1 ∨ w = 8) && decide (bits.toNat ≤ 1)
+  | _ => false
+
+/-- Read a canonical boolean after `hasBool` has established its representation. -/
+def boolValue : Val → Bool
+  | .int _ _ bits => bits.toNat == 1
+  | _ => false
+
+def hasI128 : Val → Bool
+  | .i128 _ => true
+  | _ => false
+
+def needsNonzeroDivisor : BinOp → Bool
+  | .udiv | .urem | .sdiv | .srem => true
+  | _ => false
+
+/-- TrustIR signed division AND remainder are undefined at MIN / -1 (OD-178). -/
+def signedDivOverflow (op : BinOp) (w : Nat) (a b : BitVec w) : Bool :=
+  match op with
+  | .sdiv | .srem => decide (0 < w) &&
+      (a == BitVec.ofNat w (2 ^ (w - 1))) && (b == -1)
+  | _ => false
+
+def divisionFault (op : BinOp) (w : Nat) (a b : BitVec w) : Bool :=
+  (needsNonzeroDivisor op && (b == 0)) || signedDivOverflow op w a b
+
+def castAllowed (op : CastOp) (sw dw : Nat) : Bool :=
+  match op with
+  | .sext | .zext => decide (sw ≤ dw)
+  | .trunc => decide (dw ≤ sw)
+
+theorem castAllowed_iff (op : CastOp) (sw dw : Nat) :
+    castAllowed op sw dw = true ↔ CastOk op sw dw := by
+  cases op <;> simp [castAllowed, CastOk]
+
+def addressOperand (s : SrcState) (operand : SOperand) : Option (BitVec 64) :=
+  if hasIntWidth 64 (evalOperand s operand) then some (intBitsAt 64 (evalOperand s operand))
+  else none
+
+/-- Execute the selected operation. Existing arithmetic denotations are unchanged.
+    Ill-typed operands, invalid casts, zero divisors, signed division overflow and unsupported i128 operations
+    fault at that operation. Duplicate switch keys are malformed and fault too. -/
+def execute (item : CodeItem) (s : SrcState) : Event × SrcState :=
+  match item with
+  | .instr (.bin dst op w hw a b) =>
+      if hasIntWidth w (evalOperand s a) && hasIntWidth w (evalOperand s b) then
+        if divisionFault op w (intBitsAt w (evalOperand s a))
+            (intBitsAt w (evalOperand s b)) then fault s
+        else (.tau, setEnv (bumpPC s) dst
           (.int w hw (evalBin op w (intBitsAt w (evalOperand s a))
-                                   (intBitsAt w (evalOperand s b)))))
-  /-- i128 register-pair op (add/sub/mul/and/or/xor). -/
-  | bin128 {s dst op a b r}
-      (h : evalBin128 op (i128Bits (evalOperand s a)) (i128Bits (evalOperand s b)) = some r) :
-      SrcStep s .tau (setEnv (bumpPC s) dst (.i128 r))
-  /-- integer comparison → 1-bit result widened to i8 0/1 (the SETcc shape). -/
-  | icmp {s : SrcState} {dst : VName} {op : ICmpOp} {w : Nat} {hw : w ≤ 64} {a b : SOperand} :
-      SrcStep s .tau
-        (setEnv (bumpPC s) dst
-          (.int 8 (by omega)
-            (if evalICmp op w (intBitsAt w (evalOperand s a))
-                               (intBitsAt w (evalOperand s b))
-             then (1 : BitVec 8) else 0)))
-  /-- three-way compare → i8 Ordering. -/
-  | cmp3 {s : SrcState} {dst : VName} {signed : Bool} {w : Nat} {hw : w ≤ 64} {a b : SOperand} :
-      SrcStep s .tau
-        (setEnv (bumpPC s) dst
-          (.int 8 (by omega)
-            (cmpSpec signed w (intBitsAt w (evalOperand s a))
-                              (intBitsAt w (evalOperand s b))).toI8))
-  /-- integer cast (well-formedness `CastOk` is a precondition). -/
-  | cast {s : SrcState} {dst : VName} {op : CastOp} {sw dw : Nat}
-      {hsw : sw ≤ 64} {hdw : dw ≤ 64} {x : SOperand}
-      (hok : CastOk op sw dw) :
-      SrcStep s .tau
-        (setEnv (bumpPC s) dst
-          (.int dw hdw (evalCast op sw dw (intBitsAt sw (evalOperand s x)))))
-  /-- memory load of `byteWidth w` bytes from `addr`. Silent (own-memory). -/
-  | load {s dst w hw addr}
-      (a : BitVec 64) (ha : evalOperand s addr = .int 64 (by omega) a) :
-      SrcStep s .tau
-        (setEnv (bumpPC s) dst
-          (.int w hw ((srcReadBytes s.mem a (byteWidth w)).setWidth w)))
-  /-- memory store of `byteWidth w` bytes of `val` to `addr`. Silent (own-memory). -/
-  | store {s : SrcState} {w : Nat} {hw : w ≤ 64} {addr val : SOperand}
-      (a : BitVec 64) (ha : evalOperand s addr = .int 64 (by omega) a)
-      (vb : BitVec w) (hv : intBitsAt w (evalOperand s val) = vb) :
-      SrcStep s .tau
-        (bumpPC { s with
-          mem := srcWriteBytes s.mem a (byteWidth w)
-                   ((vb.setWidth (8 * byteWidth w)) ) })
-  /-- unconditional branch with block-arg threading. -/
-  | br {s : SrcState} {target : SrcPC} {args : List (VName × SOperand)} :
-      SrcStep s .tau
-        (gotoWith s target (args.map (fun vb => (vb.1, evalOperand s vb.2))))
-  /-- conditional branch on a (width-1 or width-w nonzero) condition. -/
-  | condbr_true {s : SrcState} {cond : SOperand} {t f : SrcPC}
-      {tArgs fArgs : List (VName × SOperand)}
-      (hc : intBitsAt 1 (evalOperand s cond) ≠ 0) :
-      SrcStep s .tau
-        (gotoWith s t (tArgs.map (fun vb => (vb.1, evalOperand s vb.2))))
-  | condbr_false {s : SrcState} {cond : SOperand} {t f : SrcPC}
-      {tArgs fArgs : List (VName × SOperand)}
-      (hc : intBitsAt 1 (evalOperand s cond) = 0) :
-      SrcStep s .tau
-        (gotoWith s f (fArgs.map (fun vb => (vb.1, evalOperand s vb.2))))
-  /-- switchInt: jump to the case whose key matches the (zero-extended-to-64) scrutinee,
-      else default. `hmem` pins the chosen `(key, target)` pair; `hsel` pins the value.
-      switchInt keys are distinct (a `BitVec 64` cannot appear twice with two targets in
-      a well-formed table), so "a matching case" is unambiguous and this is deterministic
-      with `switch_default` (whose guard requires NO case matches). -/
-  | switch_case {s : SrcState} {scrut : SOperand} {w : Nat} {hw : w ≤ 64}
-      {cases : List (BitVec 64 × SrcPC)} {default target : SrcPC} {key : BitVec 64}
-      (hmem : (key, target) ∈ cases)
-      (hsel : (intBitsAt w (evalOperand s scrut)).setWidth 64 = key)
-      : SrcStep s .tau (gotoWith s target [])
-  | switch_default {s : SrcState} {scrut : SOperand} {w : Nat} {hw : w ≤ 64}
-      {cases : List (BitVec 64 × SrcPC)} {default : SrcPC}
-      (hno : ∀ k t, (k, t) ∈ cases →
-               (intBitsAt w (evalOperand s scrut)).setWidth 64 ≠ k) :
-      SrcStep s .tau (gotoWith s default [])
-  /-- call: emits an observable CALL event and transfers to the callee entry pc.
-      (The callee runs under its OWN refinement; from this block's view the call is an
-      observable boundary — the contract's `Event.call`.) -/
-  | call {s target ret} :
-      SrcStep s (.call target) ({ s with pc := ret })
-  /-- return: emits the observable RET event. The post-state pc is irrelevant
-      (control leaves the function); we keep `s` so the relation is total-shaped. -/
-  | ret {s} :
-      SrcStep s .ret s
-  /-- memory-mapped I/O store: a write to an OFF-frame, non-program address is an
-      observable `.mmio` event (the externally visible channel). Distinguished from a
-      plain `store` by the layout marking the address as device memory; modeled here as
-      an explicit rule producing the event. -/
-  | mmio_write {s addr a val v}
-      (ha : evalOperand s addr = .int 64 (by omega) a)
-      (hv : intBitsAt 64 (evalOperand s val) = v) :
-      SrcStep s (.mmio a v true) (bumpPC s)
-  /-- a stuck/UB source action TRAPS — emits `.trap`. trust-cg's translation validator
-      fails CLOSED on exactly these (the cert gate refuses to certify), so a trapping
-      source step is matched by a machine trap, preserving the refinement. -/
-  | trap {s} :
-      SrcStep s .trap s
-
-/-! ## Bridging the opaque contract hook to this definition.
-
-    The contract declares `srcStep` opaque so downstream modules don't depend on the
-    constructor list. We expose the intended equation. -/
-
-/-- The source semantics this module establishes. Downstream `Sim.*` modules obtain
-    `srcStep s ev s' ↔ SrcStep s ev s'` from `srcStep_spec` and case on `SrcStep`.
-
-    HONEST STATUS: the contract declares `srcStep` as `opaque`. An `opaque` constant
-    in Lean 4 is irreducible BY CONSTRUCTION — its body is sealed, so `srcStep = SrcStep`
-    is NOT derivable (not by `rfl`, not by anything) from the contract as written. A
-    `by sorry` here would be a `sorry` that does genuine work: every downstream `Sim.*`
-    case-analysis on a source step depends on rewriting the opaque hook to this concrete
-    inductive, so the equation is LOAD-BEARING, not a mechanical filler.
-
-    The faithful encoding of "the assembled build links `srcStep := SrcStep` so this is
-    `rfl`" is therefore an EXPLICIT `axiom`, NOT a theorem-with-sorry. Stating it as an
-    axiom makes the assumption auditable (it shows up in `#print axioms`) instead of
-    masquerading as a discharged proof. It fixes ONLY the source-side meaning (no
-    machine/refinement content), so it cannot smuggle the forward-simulation conclusion;
-    but it is, unavoidably, an assumption against the literal `opaque` contract and must
-    be discharged by the link step (where `srcStep` is *defined* to be `SrcStep`, making
-    the axiom `rfl`-true and dischargeable). -/
-axiom srcStep_spec : srcStep = SrcStep
-
-/-! ## Determinism / progress sanity lemmas (cheap, real).
-
-    These are genuine facts about the source semantics that the Sim layer uses to know
-    the source step it is matching is the *only* one (so the chosen machine match is
-    forced). They are proved, not stubbed. -/
-
-/-- A pure `bin` step's result is exactly `evalBin` (no hidden nondeterminism in the
-    value). Trivial by construction but stated so callers can rewrite. -/
-theorem bin_result {s dst op w hw a b}
-    (hdiv : (op = .udiv ∨ op = .urem ∨ op = .sdiv ∨ op = .srem) →
-              intBitsAt w (evalOperand s b) ≠ 0)
-    (s') (hstep :
-      s' = setEnv (bumpPC s) dst
-            (.int w hw (evalBin op w (intBitsAt w (evalOperand s a))
-                                     (intBitsAt w (evalOperand s b))))) :
-    SrcStep s .tau s' := by
-  subst hstep; exact SrcStep.bin hdiv
-
-/-- `condbr` is deterministic: the true and false rules have disjoint guards, so at
-    most one fires from a given state. (Used by the Sim condBr case to pick the unique
-    machine edge `jcc_*_correct` matches.) -/
-theorem condbr_disjoint {s cond}
-    (htrue  : intBitsAt 1 (evalOperand s cond) ≠ 0)
-    (hfalse : intBitsAt 1 (evalOperand s cond) = 0) : False :=
-  htrue hfalse
-
-/-- The i8 a `cmp3` step writes equals the `cmpSpec`-derived i8 — restates the rule's
-    payload so the Compare cert (`lowerCmp_correct`) plugs in directly. -/
-theorem cmp3_payload {s : SrcState} {dst : VName} {signed : Bool} {w : Nat}
-    {hw : w ≤ 64} {a b : SOperand} :
-    SrcStep s .tau
-      (setEnv (bumpPC s) dst
-        (.int 8 (by omega)
+            (intBitsAt w (evalOperand s b)))))
+      else fault s
+  | .instr (.bin128 dst op a b) =>
+      if hasI128 (evalOperand s a) && hasI128 (evalOperand s b) then
+        match evalBin128 op (i128Bits (evalOperand s a)) (i128Bits (evalOperand s b)) with
+        | some result => (.tau, setEnv (bumpPC s) dst (.i128 result))
+        | none => fault s
+      else fault s
+  | .instr (.icmp dst op w _ a b) =>
+      if hasIntWidth w (evalOperand s a) && hasIntWidth w (evalOperand s b) then
+        (.tau, setEnv (bumpPC s) dst (.int 8 (by omega)
+          (if evalICmp op w (intBitsAt w (evalOperand s a))
+            (intBitsAt w (evalOperand s b)) then 1 else 0)))
+      else fault s
+  | .instr (.cmp3 dst signed w _ a b) =>
+      if hasIntWidth w (evalOperand s a) && hasIntWidth w (evalOperand s b) then
+        (.tau, setEnv (bumpPC s) dst (.int 8 (by omega)
           (cmpSpec signed w (intBitsAt w (evalOperand s a))
-                            (intBitsAt w (evalOperand s b))).toI8)) :=
-  @SrcStep.cmp3 s dst signed w hw a b
+            (intBitsAt w (evalOperand s b))).toI8))
+      else fault s
+  | .instr (.cast dst op sw dw _ hdw x) =>
+      if hasIntWidth sw (evalOperand s x) && castAllowed op sw dw then
+        (.tau, setEnv (bumpPC s) dst
+          (.int dw hdw (evalCast op sw dw (intBitsAt sw (evalOperand s x)))))
+      else fault s
+  | .instr (.load dst w hw addr) =>
+      match addressOperand s addr with
+      | some a => (.tau, setEnv (bumpPC s) dst
+          (.int w hw ((srcReadBytes s.mem a (byteWidth w)).setWidth w)))
+      | none => fault s
+  | .instr (.store w _ addr val) =>
+      match addressOperand s addr with
+      | some a =>
+          if hasIntWidth w (evalOperand s val) then
+            (.tau, bumpPC { s with mem := srcWriteBytes s.mem a (byteWidth w) ((intBitsAt w (evalOperand s val)).setWidth (8 * byteWidth w)) })
+          else fault s
+      | none => fault s
+  | .term (.br target args) =>
+      (.tau, gotoWith s target (args.map (fun vb => (vb.1, evalOperand s vb.2))))
+  | .term (.condbr cond t f tArgs fArgs) =>
+      if hasBool (evalOperand s cond) then
+        if boolValue (evalOperand s cond) then
+          (.tau, gotoWith s t (tArgs.map (fun vb => (vb.1, evalOperand s vb.2))))
+        else (.tau, gotoWith s f (fArgs.map (fun vb => (vb.1, evalOperand s vb.2))))
+      else fault s
+  | .term (.switch scrut w _ cases default) =>
+      if hasIntWidth w (evalOperand s scrut) then
+        if (cases.map Prod.fst).Nodup then
+          let key := (intBitsAt w (evalOperand s scrut)).setWidth 64
+          match cases.find? (fun row => row.1 == key) with
+          | some (_, target) => (.tau, gotoWith s target [])
+          | none => (.tau, gotoWith s default [])
+        else fault s
+      else fault s
+  | .term (.call target ret) => (.call target, { s with pc := ret })
+  | .term .ret => (.ret, { s with halted := true })
+  | .mmioWrite addr val =>
+      match addressOperand s addr with
+      | some a =>
+          if hasIntWidth 64 (evalOperand s val) then
+            (.mmio a (intBitsAt 64 (evalOperand s val)) true, bumpPC s)
+          else fault s
+      | none => fault s
+  | .trap => fault s
+
+/-- Fetch at the actual program counter. Missing code faults; terminal states do not step. -/
+def nextStep (p : Program) (s : SrcState) : Option (Event × SrcState) :=
+  if s.halted then none
+  else some (match p.code s.pc with
+    | some item => execute item s
+    | none => fault s)
+
+/-- Program-indexed source transition; it has no unfetched instruction rule. -/
+def SrcStep (p : Program) (s : SrcState) (event : Event) (s' : SrcState) : Prop :=
+  nextStep p s = some (event, s')
+
+theorem step_deterministic {p : Program} {s s₁ s₂ : SrcState} {e₁ e₂ : Event}
+    (h₁ : SrcStep p s e₁ s₁) (h₂ : SrcStep p s e₂ s₂) : e₁ = e₂ ∧ s₁ = s₂ := by
+  change nextStep p s = some (e₁, s₁) at h₁
+  change nextStep p s = some (e₂, s₂) at h₂
+  have hp := Option.some.inj (h₁.symm.trans h₂)
+  exact ⟨congrArg Prod.fst hp, congrArg Prod.snd hp⟩
+
+/-- Every running state has the fetched step or a local fault, never an empty transition domain. -/
+theorem running_has_step (p : Program) (s : SrcState) (hrun : s.halted = false) :
+    ∃ event s', SrcStep p s event s' := by
+  let result := match p.code s.pc with
+    | some item => execute item s
+    | none => fault s
+  refine ⟨result.1, result.2, ?_⟩
+  change (if s.halted then none else some result) = some (result.1, result.2)
+  simp [hrun]
+
+theorem halted_no_step {p : Program} {s s' : SrcState} {event : Event}
+    (hh : s.halted = true) : ¬ SrcStep p s event s' := by
+  simp [SrcStep, nextStep, hh]
+
+theorem ret_step {p : Program} {s : SrcState}
+    (hrun : s.halted = false) (hfetch : p.code s.pc = some (.term .ret)) :
+    SrcStep p s .ret { s with halted := true } := by
+  simp [SrcStep, nextStep, hrun, hfetch, execute]
+
+theorem trap_step {p : Program} {s : SrcState}
+    (hrun : s.halted = false) (hfetch : p.code s.pc = some .trap) :
+    SrcStep p s .trap { s with halted := true } := by
+  simp [SrcStep, nextStep, hrun, hfetch, execute, fault]
+
+theorem missing_code_traps {p : Program} {s : SrcState}
+    (hrun : s.halted = false) (hfetch : p.code s.pc = none) :
+    SrcStep p s .trap { s with halted := true } := by
+  simp [SrcStep, nextStep, hrun, hfetch, fault]
+
+theorem ret_cannot_trap {p : Program} {s s' : SrcState}
+    (hrun : s.halted = false) (hfetch : p.code s.pc = some (.term .ret)) :
+    ¬ SrcStep p s .trap s' := by
+  intro h
+  have he := (step_deterministic (ret_step hrun hfetch) h).1
+  cases he
+
+/-- Operand and fault guards must be discharged for the fetched binary operation. -/
+theorem bin_result {p : Program} {s : SrcState} {dst : VName} {op : BinOp}
+    {w : Nat} {hw : w ≤ 64} {a b : SOperand}
+    (hrun : s.halted = false)
+    (hfetch : p.code s.pc = some (.instr (.bin dst op w hw a b)))
+    (hargs : (hasIntWidth w (evalOperand s a) && hasIntWidth w (evalOperand s b)) = true)
+    (hdiv : divisionFault op w (intBitsAt w (evalOperand s a))
+      (intBitsAt w (evalOperand s b)) = false) :
+    SrcStep p s .tau (setEnv (bumpPC s) dst
+      (.int w hw (evalBin op w (intBitsAt w (evalOperand s a))
+        (intBitsAt w (evalOperand s b))))) := by
+  simp only [SrcStep, nextStep, hrun, hfetch, execute, hargs, hdiv,
+    Bool.false_eq_true, ↓reduceIte]
+
+theorem condbr_disjoint {s cond}
+    (htrue : boolValue (evalOperand s cond) = true)
+    (hfalse : boolValue (evalOperand s cond) = false) : False := by
+  rw [htrue] at hfalse
+  cases hfalse
+
+theorem cmp3_payload {p : Program} {s : SrcState} {dst : VName} {signed : Bool}
+    {w : Nat} {hw : w ≤ 64} {a b : SOperand}
+    (hrun : s.halted = false)
+    (hfetch : p.code s.pc = some (.instr (.cmp3 dst signed w hw a b)))
+    (hargs : (hasIntWidth w (evalOperand s a) && hasIntWidth w (evalOperand s b)) = true) :
+    SrcStep p s .tau (setEnv (bumpPC s) dst (.int 8 (by omega)
+      (cmpSpec signed w (intBitsAt w (evalOperand s a))
+        (intBitsAt w (evalOperand s b))).toI8)) := by
+  simp [SrcStep, nextStep, hrun, hfetch, execute, hargs]
 
 /-! ## A concrete end-to-end witness the certs reuse: signed 3-way compare at w=8.
 

@@ -1,0 +1,21 @@
+; TrustIr text format v1
+module "composition"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+
+functy.0 = (i32) -> (i32)
+
+import import.0 = "trusted_prelude" digest "sha256" [17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17] producer clean
+
+fn @reciprocal(functy.0) {
+    ; #summary: proved params ["x"]
+    ; #requires: formula "trust-types.Formula@1" "{\"Ne\":[{\"Var\":[\"x\",\"Int\"]},{\"Int\":0}]}" smtlib "(not (= x 0))" sort "Bool"
+    ; #ensures: formula "smtlib2" "(not (= result 0))" smtlib "(not (= result 0))" sort "Bool"
+    ; #backed-by: extern 0 "reciprocal" obligation 3
+}
+
+fn @passthrough(functy.0) {
+    ; #summary: unproved params ["x"]
+    ; #ensures: formula "smtlib2" "(= result x)" smtlib "(= result x)" sort "Bool"
+bb0(%0: i32):
+    ret %0
+}

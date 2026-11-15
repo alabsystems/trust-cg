@@ -190,17 +190,20 @@
 //! on the phi-based `MachFunction` IR; this pass is its port to the phi-free
 //! multi-def-carrier `X86ISelFunction` IR).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use crate::fast_hash::{FxHashMap, FxHashSet};
 
 use trust_cg_ir::regs::RegClass;
 use trust_cg_ir::{VReg, X86Opcode};
 use trust_cg_lower::instructions::Block;
 use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
-use crate::effects::{x86_produces_value, x86_reads_flags};
+use crate::effects::{
+    FlagOverwrite, condition_flag_overwrite, x86_produces_value, x86_reads_flags,
+};
 use crate::mach_view;
 use crate::x86_pass_manager::X86MachinePass;
-use crate::x86_peephole::{FlagOverwrite, condition_flag_overwrite};
 
 /// Admission callback: must return `true` only when the per-`(width, step,
 /// stride)` recurrence obligation `(iv + step)*stride == iv*stride +
@@ -214,18 +217,40 @@ pub type StrengthReduceAdmission = fn(width: u32, step: i64, stride: i64) -> boo
 /// Induction-variable strength reduction for x86-64 ISel machine functions.
 pub struct X86StrengthReduce {
     admit: StrengthReduceAdmission,
+    /// Whether the seed multiply may be placed EARLIER in the preheader than the
+    /// terminator, to get behind a flag overwriter. `None` = take the process default
+    /// (see [`flag_safe_seed_default`]).
+    flag_safe_seed: Option<bool>,
 }
 
 impl X86StrengthReduce {
     /// Create the pass with the given per-(width, step, stride) admission
     /// gate.
     pub fn new(admit: StrengthReduceAdmission) -> Self {
-        Self { admit }
+        Self {
+            admit,
+            flag_safe_seed: None,
+        }
+    }
+
+    /// Override the flag-safe seed placement for THIS pass instance.
+    ///
+    /// A builder rather than the process-global `OnceLock`, for the reason
+    /// `x86_slot_forward::with_enabled` records: a test that installed the global would
+    /// decide the default for every other test in the binary, and the order tests run in
+    /// would then change results.
+    pub fn with_flag_safe_seed(mut self, enabled: bool) -> Self {
+        self.flag_safe_seed = Some(enabled);
+        self
+    }
+
+    fn flag_safe_seed(&self) -> bool {
+        self.flag_safe_seed.unwrap_or_else(flag_safe_seed_default)
     }
 
     /// Run directly on an ISel function (test entry point).
     pub fn run_on_function(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit)
+        run_impl(func, self.admit, self.flag_safe_seed())
     }
 }
 
@@ -235,23 +260,56 @@ impl X86MachinePass for X86StrengthReduce {
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit)
+        run_impl(func, self.admit, self.flag_safe_seed())
     }
 }
 
-fn log_enabled() -> bool {
-    std::env::var_os("TRUST_CG_X86_SR_LOG").is_some()
+static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install this pass's OPT-OUT from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-strength-reduce`). DEFAULT ON.
+///
+/// Until 2026-09-29 the only channel was the environment variable
+/// `TCG_NO_STRENGTH_REDUCE`, and `trustc` refuses every `TCG_*` variable before the
+/// backend loads — so this pass, which is ON by default and rewrites address
+/// arithmetic in hot loops, could not be A/B'd through the bridge at all. Its
+/// contribution has therefore never been measured here.
+pub fn set_strength_reduce_disabled(disabled: bool) -> bool {
+    match DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => DISABLED.get() == Some(&requested),
+    }
 }
 
-/// Verbose per-rejection diagnostics (development / triage only).
-fn debug_enabled() -> bool {
-    std::env::var_os("TRUST_CG_X86_SR_DEBUG").is_some()
+/// Install the DECLINE TRACE from a tracked option, once
+/// (`-Ztrust-ir-cg-args=trace-x86-strength-reduce`).
+///
+/// The pass has 52 decline points and no diagnostics, so "it is on by default and the
+/// multiply is still there" was not actionable. This names the condition each candidate
+/// died on — the same thing `trace-vectorize-bail` does for the vectorizer, which is what
+/// made the vectorizer's dialect gaps findable.
+pub fn set_strength_reduce_trace_enabled(enabled: bool) -> bool {
+    match TRACE.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => TRACE.get() == Some(&requested),
+    }
 }
 
-macro_rules! sr_debug {
+/// Whether the pass runs. DEFAULT TRUE; the env fallback goes through
+/// `tcg_env_flag`, so `TCG_NO_STRENGTH_REDUCE=0` means "do not disable".
+pub fn strength_reduce_enabled_default() -> bool {
+    !DISABLED.get().copied().unwrap_or(false) && !crate::tcg_env_flag("TCG_NO_STRENGTH_REDUCE")
+}
+
+fn trace_enabled() -> bool {
+    TRACE.get().copied().unwrap_or(false) || crate::tcg_env_flag("TCG_TRACE_X86_STRENGTH_REDUCE")
+}
+
+macro_rules! sr_trace {
     ($($arg:tt)*) => {
-        if debug_enabled() {
-            eprintln!($($arg)*);
+        if trace_enabled() {
+            eprintln!("[x86-strength-reduce] {}", format!($($arg)*));
         }
     };
 }
@@ -265,23 +323,13 @@ const MAX_REDUCTIONS_PER_FUNCTION: usize = 64;
 /// Copy-chain chase depth bound for [`canon_const`] / [`resolve_iv_operand`].
 const MAX_CHAIN_DEPTH: u32 = 8;
 
-fn run_impl(func: &mut X86ISelFunction, admit: StrengthReduceAdmission) -> bool {
+fn run_impl(
+    func: &mut X86ISelFunction,
+    admit: StrengthReduceAdmission,
+    flag_safe_seed: bool,
+) -> bool {
     if func.block_order.len() < 2 {
         return false;
-    }
-
-    // Development triage: dump the whole function before the pass runs.
-    if debug_enabled() && std::env::var_os("TRUST_CG_X86_SR_DUMP").is_some() {
-        eprintln!("x86-strength-reduce[dump] fn `{}`:", func.name);
-        for block_id in &func.block_order {
-            let Some(block) = func.blocks.get(block_id) else {
-                continue;
-            };
-            eprintln!("  block {:?} succs {:?}:", block_id.0, block.successors);
-            for (i, inst) in block.insts.iter().enumerate() {
-                eprintln!("    [{i}] {:?} {:?}", inst.opcode, inst.operands);
-            }
-        }
     }
 
     let mut changed = false;
@@ -291,7 +339,7 @@ fn run_impl(func: &mut X86ISelFunction, admit: StrengthReduceAdmission) -> bool 
     // and def-count trivially consistent (no incremental bookkeeping to get
     // wrong).
     for _ in 0..MAX_REDUCTIONS_PER_FUNCTION {
-        if !apply_one_reduction(func, admit) {
+        if !apply_one_reduction(func, admit, flag_safe_seed) {
             break;
         }
         changed = true;
@@ -346,16 +394,14 @@ struct Candidate {
     preheader: Block,
 }
 
-fn apply_one_reduction(func: &mut X86ISelFunction, admit: StrengthReduceAdmission) -> bool {
+fn apply_one_reduction(
+    func: &mut X86ISelFunction,
+    admit: StrengthReduceAdmission,
+    flag_safe_seed: bool,
+) -> bool {
     let preds = build_predecessor_map(func);
     let idom = compute_idom(func, &preds);
     let mut loops = find_natural_loops(func, &preds, &idom);
-    sr_debug!(
-        "x86-strength-reduce[debug] `{}`: {} block(s), {} natural loop(s)",
-        func.name,
-        func.block_order.len(),
-        loops.len()
-    );
     if loops.is_empty() {
         return false;
     }
@@ -366,10 +412,27 @@ fn apply_one_reduction(func: &mut X86ISelFunction, admit: StrengthReduceAdmissio
     let def_sites = build_def_sites(func);
 
     for lp in &loops {
-        let Some(candidate) = find_candidate(func, lp, &preds, &idom, &def_sites, admit) else {
+        let Some(candidate) =
+            find_candidate(func, lp, &preds, &idom, &def_sites, admit, flag_safe_seed)
+        else {
+            sr_trace!(
+                "{}: loop header {:?} depth {} -> NO CANDIDATE",
+                func.name,
+                lp.header,
+                lp.depth
+            );
             continue;
         };
-        apply_candidate(func, &candidate);
+        sr_trace!(
+            "{}: loop header {:?} depth {} -> REDUCING imul stride {} at {:?}[{}]",
+            func.name,
+            lp.header,
+            lp.depth,
+            candidate.stride,
+            candidate.mul_block,
+            candidate.mul_idx
+        );
+        apply_candidate(func, &candidate, flag_safe_seed);
         return true;
     }
     false
@@ -382,19 +445,13 @@ fn apply_one_reduction(func: &mut X86ISelFunction, admit: StrengthReduceAdmissio
 fn find_candidate(
     func: &X86ISelFunction,
     lp: &NaturalLoop,
-    preds: &HashMap<Block, Vec<Block>>,
-    idom: &HashMap<Block, Block>,
-    def_sites: &HashMap<VReg, Vec<(Block, usize)>>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+    def_sites: &DefSites,
     admit: StrengthReduceAdmission,
+    flag_safe_seed: bool,
 ) -> Option<Candidate> {
-    let Some(preheader) = lp.preheader else {
-        sr_debug!(
-            "x86-strength-reduce[debug] `{}` loop@{:?}: no natural preheader",
-            func.name,
-            lp.header.0
-        );
-        return None;
-    };
+    let preheader = lp.preheader?;
 
     // Side condition 1: no side entries. Every body block except the header
     // has all predecessors inside the body, and the header's only non-body
@@ -408,15 +465,11 @@ fn find_candidate(
                 .iter()
                 .any(|p| !lp.body.contains(p) && *p != preheader)
             {
+                sr_trace!("  decline: header {block:?} has a non-preheader outside pred");
                 return None;
             }
         } else if block_preds.iter().any(|p| !lp.body.contains(p)) {
-            sr_debug!(
-                "x86-strength-reduce[debug] `{}` loop@{:?}: side entry into body block {:?}",
-                func.name,
-                lp.header.0,
-                block.0
-            );
+            sr_trace!("  decline: body block {block:?} has a side entry");
             return None;
         }
     }
@@ -424,34 +477,15 @@ fn find_candidate(
     // Side condition 5 (preheader point): the seed multiply writes RFLAGS
     // right before the preheader's terminator; current flags there must be
     // dead.
-    let ph_insert = preheader_insert_pos(func.blocks.get(&preheader)?);
-    if !flags_dead_from(func, preheader, ph_insert, &mut HashSet::new(), 4) {
-        sr_debug!(
-            "x86-strength-reduce[debug] `{}` loop@{:?}: RFLAGS live at preheader {:?} insert",
-            func.name,
-            lp.header.0,
-            preheader.0
-        );
-        return None;
-    }
-
-    // Side condition 2: match induction variables.
+    // Side condition 2 first, because the seed's placement depends on WHICH iv it reads
+    // (see `preheader_seed_insert_pos`): a preheader that computes the iv itself cannot
+    // host the seed above that computation.
     let ivs = find_induction_variables(func, lp, def_sites, idom, preds);
     if ivs.is_empty() {
-        sr_debug!(
-            "x86-strength-reduce[debug] `{}` loop@{:?}: no induction variable matched",
-            func.name,
-            lp.header.0
-        );
+        sr_trace!("  decline: no induction variable matched in this loop");
         return None;
     }
-    sr_debug!(
-        "x86-strength-reduce[debug] `{}` loop@{:?}: {} IV(s): {:?}",
-        func.name,
-        lp.header.0,
-        ivs.len(),
-        ivs.iter().map(|iv| (iv.iv.id, iv.step)).collect::<Vec<_>>()
-    );
+    sr_trace!("  {} induction variable(s) matched", ivs.len());
     let resolution = IvResolutionContext {
         func,
         lp,
@@ -468,12 +502,6 @@ fn find_candidate(
         }
         let block = func.blocks.get(&block_id)?;
         for (idx, inst) in block.insts.iter().enumerate() {
-            if debug_enabled() && matches!(inst.opcode, X86Opcode::ImulRR | X86Opcode::ImulRRI) {
-                eprintln!(
-                    "x86-strength-reduce[debug] `{}` loop@{:?}: imul at {:?}[{}]: {:?}",
-                    func.name, lp.header.0, block_id.0, idx, inst.operands
-                );
-            }
             let Some((dst, iv, stride)) =
                 match_candidate_mul(&resolution, inst, (block_id, idx), &ivs)
             else {
@@ -482,21 +510,19 @@ fn find_candidate(
             // Side condition 5 (multiply point): the multiply's own flag
             // write disappears (mov writes no flags); its flags must be dead.
             if !flags_dead_from(func, block_id, idx + 1, &mut HashSet::new(), 4) {
-                sr_debug!(
-                    "x86-strength-reduce[debug]   -> rejected: RFLAGS live after imul {:?}[{}]",
-                    block_id.0,
-                    idx
+                sr_trace!(
+                    "  imul stride {stride} at {block_id:?}[{idx}]: decline, FLAGS LIVE after \
+                     the multiply (depth-4 scan)"
                 );
                 continue;
             }
             // Side condition 4: definite initialization of the preheader
             // seed's IV read at the preheader.
             if !defined_at_preheader(func, iv.iv, &lp.body, preheader, idom) {
-                sr_debug!(
-                    "x86-strength-reduce[debug]   -> rejected: iv v{} not definitely \
-                     initialized at preheader {:?}",
-                    iv.iv.id,
-                    preheader.0
+                sr_trace!(
+                    "  imul stride {stride} at {block_id:?}[{idx}]: decline, iv {:?} not \
+                     definitely defined at the preheader",
+                    iv.iv
                 );
                 continue;
             }
@@ -507,10 +533,9 @@ fn find_candidate(
             // scale-def shape that fold matches. Leave them to the peephole;
             // a scale-1/2/4/8 multiply not feeding memory is cheap anyway.
             if matches!(stride, 1 | 2 | 4 | 8) {
-                sr_debug!(
-                    "x86-strength-reduce[debug]   -> skipped: SIB-legal stride {} (OPT-7 \
-                     SIB fold territory)",
-                    stride
+                sr_trace!(
+                    "  imul stride {stride} at {block_id:?}[{idx}]: decline, SIB-legal scale \
+                     (left to the address fold)"
                 );
                 continue;
             }
@@ -518,24 +543,29 @@ fn find_candidate(
             // sign-extended i32 range for ImulRRI/AddRI).
             let advance = stride.wrapping_mul(iv.step);
             if i32::try_from(stride).is_err() || i32::try_from(advance).is_err() {
-                sr_debug!(
-                    "x86-strength-reduce[debug]   -> rejected: stride {} / advance {} \
-                     outside imm32",
-                    stride,
-                    advance
+                sr_trace!(
+                    "  imul stride {stride} at {block_id:?}[{idx}]: decline, stride or advance \
+                     {advance} outside i32"
                 );
                 continue;
             }
             // Side condition 6: the per-(width, step, stride) algebraic
             // obligation must be discharged. Gpr64 carriers only in v1.
             if !admit(64, iv.step, stride) {
-                if log_enabled() {
-                    eprintln!(
-                        "x86-strength-reduce: obligation (width 64, step {}, stride {}) NOT \
-                         discharged; leaving multiply in place in `{}`",
-                        iv.step, stride, func.name
-                    );
-                }
+                sr_trace!(
+                    "  imul stride {stride} step {} at {block_id:?}[{idx}]: decline, the \
+                     algebraic obligation was NOT discharged",
+                    iv.step
+                );
+                continue;
+            }
+            // Side condition 5 (preheader point): the seed multiply writes RFLAGS in the
+            // preheader, so it needs a slot where that write cannot be observed.
+            if preheader_seed_insert_pos(func, preheader, iv.iv, flag_safe_seed).is_none() {
+                sr_trace!(
+                    "  imul stride {stride} at {block_id:?}[{idx}]: decline, no flag-safe \
+                     seed slot in preheader {preheader:?}"
+                );
                 continue;
             }
             return Some(Candidate {
@@ -559,9 +589,9 @@ fn find_candidate(
 struct IvResolutionContext<'a> {
     func: &'a X86ISelFunction,
     lp: &'a NaturalLoop,
-    def_sites: &'a HashMap<VReg, Vec<(Block, usize)>>,
-    idom: &'a HashMap<Block, Block>,
-    preds: &'a HashMap<Block, Vec<Block>>,
+    def_sites: &'a DefSites,
+    idom: &'a crate::fast_hash::FxHashMap<Block, Block>,
+    preds: &'a crate::fast_hash::FxHashMap<Block, Vec<Block>>,
 }
 
 fn match_candidate_mul(
@@ -604,13 +634,6 @@ fn match_candidate_mul(
                     let Some(value) =
                         canon_const(func, const_op, context.def_sites, MAX_CHAIN_DEPTH)
                     else {
-                        sr_debug!(
-                            "x86-strength-reduce[debug]   -> operand v{} resolves to iv v{} \
-                             but v{} is not a provable constant",
-                            iv_op.id,
-                            iv.iv.id,
-                            const_op.id
-                        );
                         continue;
                     };
                     return Some((*d, *iv, value));
@@ -843,13 +866,6 @@ fn resolve_passthrough_param(
     let mut srcs: Vec<(Block, usize, VReg)> = Vec::with_capacity(defs.len());
     for &(db, di) in defs {
         if !lp.body.contains(&db) || db == iv.update_block {
-            sr_debug!(
-                "x86-strength-reduce[debug]   -> param v{} def at {:?}[{}] outside \
-                 body/in latch",
-                p.id,
-                db.0,
-                di
-            );
             return false;
         }
         let Some(block) = func.blocks.get(&db) else {
@@ -857,13 +873,6 @@ fn resolve_passthrough_param(
         };
         let inst = &block.insts[di];
         if inst.opcode != X86Opcode::MovRR || inst.flags != X86Opcode::MovRR.default_flags() {
-            sr_debug!(
-                "x86-strength-reduce[debug]   -> param v{} def at {:?}[{}] is not a plain \
-                 MovRR copy",
-                p.id,
-                db.0,
-                di
-            );
             return false;
         }
         let [X86ISelOperand::VReg(dst), X86ISelOperand::VReg(src)] = inst.operands.as_slice()
@@ -877,13 +886,6 @@ fn resolve_passthrough_param(
     }
     // P2: the read is must-covered by p's defs.
     if !param_defs_cover_read(func, p, lp, def_sites, preds, read_site) {
-        sr_debug!(
-            "x86-strength-reduce[debug]   -> param v{} read at {:?}[{}] not must-covered \
-             by its defs",
-            p.id,
-            read_site.0.0,
-            read_site.1
-        );
         return false;
     }
     // P3: every def's source resolves at the def site to the IV's current
@@ -893,14 +895,6 @@ fn resolve_passthrough_param(
         .iter()
         .all(|&(db, di, src)| resolve_value_at(context, src, (db, di), iv, param_stack, depth - 1));
     param_stack.pop();
-    if !ok {
-        sr_debug!(
-            "x86-strength-reduce[debug]   -> param v{}: a def's source does not resolve \
-             to iv v{} / pass-through",
-            p.id,
-            iv.iv.id
-        );
-    }
     ok
 }
 
@@ -926,8 +920,8 @@ fn param_defs_cover_read(
     func: &X86ISelFunction,
     p: VReg,
     lp: &NaturalLoop,
-    def_sites: &HashMap<VReg, Vec<(Block, usize)>>,
-    preds: &HashMap<Block, Vec<Block>>,
+    def_sites: &DefSites,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
     read_site: (Block, usize),
 ) -> bool {
     let no_defs: Vec<(Block, usize)> = Vec::new();
@@ -942,9 +936,9 @@ fn param_defs_cover_read(
     {
         return true;
     }
-    let def_blocks: HashSet<Block> = defs.iter().map(|&(b, _)| b).collect();
+    let def_blocks: FxHashSet<Block> = defs.iter().map(|&(b, _)| b).collect();
     let empty: Vec<Block> = Vec::new();
-    let covered_in = |b: Block, covered_out: &HashMap<Block, bool>| -> bool {
+    let covered_in = |b: Block, covered_out: &FxHashMap<Block, bool>| -> bool {
         if b == lp.header {
             return false;
         }
@@ -954,7 +948,7 @@ fn param_defs_cover_read(
                 .iter()
                 .all(|pr| lp.body.contains(pr) && covered_out.get(pr).copied().unwrap_or(false))
     };
-    let mut covered_out: HashMap<Block, bool> = lp.body.iter().map(|b| (*b, true)).collect();
+    let mut covered_out: FxHashMap<Block, bool> = lp.body.iter().map(|b| (*b, true)).collect();
     let mut changed = true;
     while changed {
         changed = false;
@@ -983,12 +977,7 @@ fn param_defs_cover_read(
 /// defined value, that value is the chased constant. The rewrite
 /// re-materializes the constant as an immediate and never reads the chain
 /// at any new position, so definite-initialization is preserved trivially.
-fn canon_const(
-    func: &X86ISelFunction,
-    v: VReg,
-    def_sites: &HashMap<VReg, Vec<(Block, usize)>>,
-    depth: u32,
-) -> Option<i64> {
+fn canon_const(func: &X86ISelFunction, v: VReg, def_sites: &DefSites, depth: u32) -> Option<i64> {
     if depth == 0 {
         return None;
     }
@@ -1023,9 +1012,9 @@ fn canon_const(
 fn find_induction_variables(
     func: &X86ISelFunction,
     lp: &NaturalLoop,
-    def_sites: &HashMap<VReg, Vec<(Block, usize)>>,
-    idom: &HashMap<Block, Block>,
-    preds: &HashMap<Block, Vec<Block>>,
+    def_sites: &DefSites,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
 ) -> Vec<IvMatch> {
     let mut ivs = Vec::new();
     // Deterministic: iterate defs in block order.
@@ -1091,9 +1080,9 @@ fn match_iv_update(
     inst: &X86ISelInst,
     inst_pos: (Block, usize),
     lp: &NaturalLoop,
-    def_sites: &HashMap<VReg, Vec<(Block, usize)>>,
-    idom: &HashMap<Block, Block>,
-    preds: &HashMap<Block, Vec<Block>>,
+    def_sites: &DefSites,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
 ) -> Option<(VReg, i64)> {
     match inst.opcode {
         X86Opcode::MovRR => {
@@ -1231,9 +1220,9 @@ fn match_increment_of(
 fn defined_at_preheader(
     func: &X86ISelFunction,
     v: VReg,
-    body: &HashSet<Block>,
+    body: &FxHashSet<Block>,
     preheader: Block,
-    idom: &HashMap<Block, Block>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
 ) -> bool {
     for block_id in &func.block_order {
         if body.contains(block_id) {
@@ -1315,7 +1304,7 @@ fn flags_dead_from(
 // Rewrite
 // ===========================================================================
 
-fn apply_candidate(func: &mut X86ISelFunction, candidate: &Candidate) {
+fn apply_candidate(func: &mut X86ISelFunction, candidate: &Candidate, flag_safe_seed: bool) {
     let iv = candidate.iv;
     let dst = candidate.dst;
 
@@ -1344,20 +1333,6 @@ fn apply_candidate(func: &mut X86ISelFunction, candidate: &Candidate) {
         ],
     );
 
-    if log_enabled() {
-        eprintln!(
-            "x86-strength-reduce: fired in `{}`: imul at #{:?}[{}] (iv v{}, step {}, stride \
-             {}) -> recurrence v{}",
-            func.name,
-            candidate.mul_block.0,
-            candidate.mul_idx,
-            iv.iv.id,
-            iv.step,
-            candidate.stride,
-            r.id,
-        );
-    }
-
     // 1. Replace the multiply in place with `mov dst, r` (keeps the
     //    instruction's lowering provenance; index-stable).
     {
@@ -1382,15 +1357,19 @@ fn apply_candidate(func: &mut X86ISelFunction, candidate: &Candidate) {
         block.insts.insert(iv.update_idx + 1, advance);
     }
 
-    // 3. Splice the seed into the preheader before its terminator. The
-    //    preheader is never the update block (it is outside the loop body),
-    //    so the advance insertion above cannot shift this position.
+    // 3. Splice the seed into the preheader at its FLAG-SAFE slot (see
+    //    `preheader_seed_insert_pos`; `find_candidate` already proved one exists). The
+    //    preheader is never the update block (it is outside the loop body), so the
+    //    advance insertion above cannot shift this position.
+    let preheader_seed_pos =
+        preheader_seed_insert_pos(func, candidate.preheader, iv.iv, flag_safe_seed)
+            .expect("find_candidate proved a flag-safe preheader seed slot exists");
     {
         let ph = func
             .blocks
             .get_mut(&candidate.preheader)
             .expect("preheader exists");
-        let pos = preheader_insert_pos(ph);
+        let pos = preheader_seed_pos;
         ph.insts.insert(pos, seed);
     }
 }
@@ -1399,6 +1378,97 @@ fn new_gpr64_vreg(func: &mut X86ISelFunction) -> VReg {
     let id = func.next_vreg;
     func.next_vreg += 1;
     VReg::new(id, RegClass::Gpr64)
+}
+
+/// Where the flag-clobbering SEED multiply may go in the preheader, or `None` if
+/// nowhere is safe.
+///
+/// [`preheader_insert_pos`] puts it immediately before the terminator, which is wrong
+/// whenever the preheader ends `Cmp; Jcc`: the seed's `ImulRRI` writes RFLAGS and the
+/// `Jcc` reads the `Cmp`'s, so side condition 5 declines. MEASURED with
+/// `trace-x86-strength-reduce`, that decline is what kept this pass off BOTH hot loops of
+/// `p4_matmul` — its `k` loop (depth 3) and one of its depth-4 loops each report
+/// "PREHEADER flags live at the seed-multiply insert point", while only the depth-2 loop
+/// was reduced. The pass's own module doc names p4's `a[i*N + k]` (stride 24) as its
+/// canonical win, so it was declining on precisely the case it exists for.
+///
+/// The seed reads ONLY the entering `iv`, so it does not have to sit last. Any
+/// instruction that FULLY overwrites the flags kills the seed's flag write, so the slot
+/// immediately BEFORE the preheader's last full flag overwriter is flag-safe by
+/// construction — nothing can observe the seed's flags, because the very next instruction
+/// replaces them and there is nothing in between.
+///
+/// Two conditions are still required and both are checked here:
+///   * that slot must be at or after `iv`'s definition, so a preheader that computes the
+///     iv itself is not reordered around it;
+///   * the default slot is preferred whenever it is already flag-dead, so this only ever
+///     ADDS candidates and never moves an insertion the old rule accepted.
+fn preheader_seed_insert_pos(
+    func: &X86ISelFunction,
+    preheader: Block,
+    iv: VReg,
+    flag_safe_seed: bool,
+) -> Option<usize> {
+    let block = func.blocks.get(&preheader)?;
+    let default_pos = preheader_insert_pos(block);
+    if flags_dead_from(func, preheader, default_pos, &mut HashSet::new(), 4) {
+        return Some(default_pos);
+    }
+    if !flag_safe_seed {
+        // DEFAULT. The earlier-slot search below is a MEASURED REGRESSION on the one
+        // program it was built for, so it is opt-in: see `flag_safe_seed_default`.
+        return None;
+    }
+    // Last full flag overwriter strictly before the default slot.
+    let pos = (0..default_pos).rev().find(|&idx| {
+        matches!(
+            condition_flag_overwrite(&block.insts[idx]),
+            FlagOverwrite::Full
+        )
+    })?;
+    // `iv` must be available there: reject if it is defined at or after `pos`.
+    if block.insts[pos..]
+        .iter()
+        .any(|inst| defined_vreg(inst) == Some(iv))
+    {
+        return None;
+    }
+    Some(pos)
+}
+
+static FLAG_SAFE_SEED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the flag-safe seed placement from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=x86-sr-flag-safe-seed`). **DEFAULT OFF, because it is a measured
+/// REGRESSION.**
+///
+/// The capability is real: without it the pass declines any loop whose preheader ends
+/// `cmp; jcc`, which `trace-x86-strength-reduce` showed was keeping it off BOTH hot loops
+/// of `p4_matmul` — the program its own module doc names as the canonical win. With it, the
+/// depth-3 `k` loop reduces (`REDUCING imul stride 24`).
+///
+/// And it makes p4 SLOWER. 50 interleaved rounds vs LLVM -O3, arms duplicated
+/// (floor 0.0001): pass off 1.0864, pass on with the terminator-only placement 1.0800,
+/// pass on with this placement **1.0926**. So the extra reduction costs 1.2% — the
+/// recurrence carrier is live across the whole `k` loop, adding register pressure to an
+/// already tight SIMD body, which is the same wall recorded for LICM's pointer-base
+/// hoisting (18 -> 10 instructions and 1.46x SLOWER). b1/p2/h4 are unchanged within noise.
+///
+/// It is kept, opt-in and measurable, because the reduction it enables may pay on a loop
+/// that is not register-starved; it must not be turned on without per-loop pressure
+/// evidence.
+pub fn set_flag_safe_seed_enabled(enabled: bool) -> bool {
+    match FLAG_SAFE_SEED.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => FLAG_SAFE_SEED.get() == Some(&requested),
+    }
+}
+
+/// Whether the earlier-slot seed search runs when an instance states no preference.
+/// DEFAULT FALSE.
+pub fn flag_safe_seed_default() -> bool {
+    FLAG_SAFE_SEED.get().copied().unwrap_or(false)
+        || crate::tcg_env_flag("TCG_X86_SR_FLAG_SAFE_SEED")
 }
 
 /// Splice point in the preheader: immediately before the trailing
@@ -1414,9 +1484,12 @@ fn preheader_insert_pos(block: &trust_cg_lower::X86ISelBlock) -> usize {
 // Def maps
 // ===========================================================================
 
+/// Each vreg's definition sites, in block order. Read by key only.
+type DefSites = FxHashMap<VReg, Vec<(Block, usize)>>;
+
 /// Every definition site of every vreg, whole function, in block order.
-fn build_def_sites(func: &X86ISelFunction) -> HashMap<VReg, Vec<(Block, usize)>> {
-    let mut sites: HashMap<VReg, Vec<(Block, usize)>> = HashMap::new();
+fn build_def_sites(func: &X86ISelFunction) -> DefSites {
+    let mut sites = DefSites::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -1431,10 +1504,7 @@ fn build_def_sites(func: &X86ISelFunction) -> HashMap<VReg, Vec<(Block, usize)>>
 }
 
 /// The unique whole-function definition site of `v`, if it has exactly one.
-fn single_def_site(
-    def_sites: &HashMap<VReg, Vec<(Block, usize)>>,
-    v: VReg,
-) -> Option<(Block, usize)> {
+fn single_def_site(def_sites: &DefSites, v: VReg) -> Option<(Block, usize)> {
     match def_sites.get(&v)?.as_slice() {
         &[site] => Some(site),
         _ => None,
@@ -1479,14 +1549,14 @@ fn defined_vreg(inst: &X86ISelInst) -> Option<VReg> {
 /// [`mach_view::GenericLoop`]).
 struct NaturalLoop {
     header: Block,
-    body: HashSet<Block>,
+    body: FxHashSet<Block>,
     /// Unique non-loop predecessor of the header, if one exists.
     preheader: Option<Block>,
     /// Nesting depth (outermost = 1); larger = more deeply nested.
     depth: u32,
 }
 
-fn build_predecessor_map(func: &X86ISelFunction) -> HashMap<Block, Vec<Block>> {
+fn build_predecessor_map(func: &X86ISelFunction) -> crate::fast_hash::FxHashMap<Block, Vec<Block>> {
     mach_view::predecessor_map(func)
 }
 
@@ -1495,15 +1565,15 @@ fn build_predecessor_map(func: &X86ISelFunction) -> HashMap<Block, Vec<Block>> {
 /// [`mach_view::compute_rpo`].
 fn compute_idom(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
-) -> HashMap<Block, Block> {
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+) -> crate::fast_hash::FxHashMap<Block, Block> {
     let rpo = mach_view::compute_rpo(func);
     mach_view::compute_idom(func, preds, &rpo)
 }
 
 /// `a` dominates `b` (reflexive). Shared implementation:
 /// [`mach_view::dominates`].
-fn dominates(a: Block, b: Block, idom: &HashMap<Block, Block>) -> bool {
+fn dominates(a: Block, b: Block, idom: &crate::fast_hash::FxHashMap<Block, Block>) -> bool {
     mach_view::dominates(a, b, idom)
 }
 
@@ -1515,8 +1585,8 @@ fn dominates(a: Block, b: Block, idom: &HashMap<Block, Block>) -> bool {
 /// merged loop — so the pre-sort order cannot influence pass behavior.
 fn find_natural_loops(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
-    idom: &HashMap<Block, Block>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
 ) -> Vec<NaturalLoop> {
     mach_view::find_natural_loops(func, preds, idom)
         .into_iter()
@@ -2238,11 +2308,22 @@ mod tests {
         );
     }
 
+    /// A `cmp; jcc` preheader is now REDUCED, with the seed placed before the `cmp`.
+    ///
+    /// This test asserted rejection until 2026-09-29. The rejection was not a soundness
+    /// requirement, only a consequence of always splicing the seed immediately before the
+    /// terminator: there the seed's RFLAGS write is live into the `jcc`. The seed reads
+    /// only the entering iv, so it can sit earlier, and the slot just before the `cmp` is
+    /// flag-safe BY CONSTRUCTION — the `cmp` fully overwrites the flags the seed wrote and
+    /// there is nothing in between to observe them, so the `jcc` still branches on the
+    /// `cmp`'s result.
+    ///
+    /// Why it was worth changing: measured with `trace-x86-strength-reduce`, this exact
+    /// decline is what kept the pass off BOTH hot loops of `p4_matmul`, the program its own
+    /// module doc names as the canonical win.
     #[test]
-    fn preheader_with_live_flags_is_rejected() {
+    fn cmp_jcc_preheader_reduces_with_the_seed_placed_before_the_cmp() {
         let mut func = make_canonical_loop();
-        // The preheader ends in cmp + jcc: inserting the flag-writing seed
-        // before the jcc would corrupt the branch.
         let bb0 = Block(0);
         {
             let ph = &mut func.blocks.get_mut(&bb0).unwrap().insts;
@@ -2257,10 +2338,88 @@ mod tests {
             ));
         }
         func.blocks.get_mut(&bb0).unwrap().successors = vec![Block(1), Block(3)];
-        let mut pass = X86StrengthReduce::new(admit_all);
+        let before = func.blocks.get(&bb0).unwrap().insts.len();
+        // Opt in through the BUILDER: the placement is default-off (a measured regression
+        // on p4_matmul), and using the process-global installer here would decide the
+        // default for every other test in this binary.
+        let mut pass = X86StrengthReduce::new(admit_all).with_flag_safe_seed(true);
+        assert!(
+            pass.run_on_function(&mut func),
+            "a cmp/jcc preheader has a flag-safe seed slot before the cmp, so it reduces"
+        );
+        let ph = &func.blocks.get(&bb0).unwrap().insts;
+        assert_eq!(ph.len(), before + 1, "exactly one seed was spliced in");
+        // ORDER is the whole safety argument, so assert it rather than just the count:
+        // seed, then the flag overwriter, then the branch.
+        let n = ph.len();
+        assert_eq!(
+            ph[n - 3].opcode,
+            X86Opcode::ImulRRI,
+            "the seed must sit BEFORE the cmp, not between cmp and jcc"
+        );
+        assert_eq!(
+            ph[n - 2].opcode,
+            X86Opcode::CmpRI,
+            "the cmp still precedes the jcc"
+        );
+        assert_eq!(ph[n - 1].opcode, X86Opcode::Jcc);
+    }
+
+    /// With the placement at its DEFAULT (off), a `cmp; jcc` preheader is still declined.
+    ///
+    /// This is the behaviour shipped, and it is shipped deliberately: enabling the earlier
+    /// slot makes `p4_matmul` go 1.0800 -> 1.0926 against LLVM (register pressure from the
+    /// recurrence carrier). Pinning the default here means turning it on can never be a
+    /// silent change.
+    #[test]
+    fn the_default_still_declines_a_cmp_jcc_preheader() {
+        let mut func = make_canonical_loop();
+        let bb0 = Block(0);
+        {
+            let ph = &mut func.blocks.get_mut(&bb0).unwrap().insts;
+            ph.pop();
+            ph.push(X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(0), imm(7)]));
+            ph.push(X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::E),
+                    X86ISelOperand::Block(Block(3)),
+                ],
+            ));
+        }
+        func.blocks.get_mut(&bb0).unwrap().successors = vec![Block(1), Block(3)];
+        let mut pass = X86StrengthReduce::new(admit_all).with_flag_safe_seed(false);
         assert!(
             !pass.run_on_function(&mut func),
-            "a flag-live preheader insertion point must be rejected"
+            "the default must keep the terminator-only placement, so this stays declined"
+        );
+    }
+
+    /// A preheader with NO flag overwriter to hide behind is still rejected.
+    ///
+    /// Here the preheader ends in a bare `jcc` whose flags were set in some earlier block,
+    /// so there is no in-block slot where the seed's RFLAGS write dies. This is the case
+    /// the old blanket rejection existed for, and it must keep failing closed.
+    #[test]
+    fn preheader_without_a_flag_overwriter_is_still_rejected() {
+        let mut func = make_canonical_loop();
+        let bb0 = Block(0);
+        {
+            let ph = &mut func.blocks.get_mut(&bb0).unwrap().insts;
+            ph.pop(); // drop jmp; leave NO cmp behind
+            ph.push(X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::E),
+                    X86ISelOperand::Block(Block(3)),
+                ],
+            ));
+        }
+        func.blocks.get_mut(&bb0).unwrap().successors = vec![Block(1), Block(3)];
+        let mut pass = X86StrengthReduce::new(admit_all).with_flag_safe_seed(true);
+        assert!(
+            !pass.run_on_function(&mut func),
+            "with no flag overwriter in the preheader the seed has nowhere safe to go"
         );
     }
 

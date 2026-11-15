@@ -179,7 +179,9 @@
 //! address chain is folded into one extended-register load by the very next
 //! pass. Kill switch: `TRUST_CG_DISABLE_PASSES=scalar_unroll`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{ExitPlan, Handoff, LoopLocality, exit_of_test};
+use crate::mach_util::branch_targets;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -307,29 +309,8 @@ impl ScalarUnrollPass {
             }
         }
 
-        let dump = std::env::var("TRUST_CG_DUMP_SCALARUNROLL").is_ok();
         let mut changed = false;
         for plan in plans {
-            if dump {
-                let mode = match plan.mode {
-                    Mode::Split { op, identity } => format!("split(op={op:?},id={identity})"),
-                    Mode::Serial => "serial".to_string(),
-                };
-                let accs: Vec<VReg> = plan.accs.iter().map(|(a, _)| *a).collect();
-                let full = match &plan.full_unroll {
-                    Some(fu) => format!(
-                        "FULL(trip={},init={},folds={})",
-                        fu.trip,
-                        fu.init,
-                        fu.folds.len()
-                    ),
-                    None => "4-wide".to_string(),
-                };
-                eprintln!(
-                    "[scalar-unroll] FIRE fn={} entry={:?} mode={} {} iv={:?} accs={:?}",
-                    func.name, plan.entry, mode, full, plan.iv, accs
-                );
-            }
             apply(func, &plan);
             self.fired += 1;
             changed = true;
@@ -399,6 +380,9 @@ struct Plan {
     /// straight-line by `apply_full_unroll` (all but one iteration), instead of
     /// the 4-wide guarded `apply`. `None` ⇒ the ordinary 4-wide path runs.
     full_unroll: Option<FullUnroll>,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv, accs..]`. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 /// A single load whose address is a proven affine function of the induction
@@ -416,6 +400,8 @@ struct Plan {
 /// evaluated at `iv==0`). Full-unroll hoists the base once — `base.map(ptr) +
 /// REST` — and emits each copy `k` (iv the known constant `c`) as
 /// `Ldr{,b,h}RI [base, #imm0 + coeff*c]`.
+/// RO folds additionally apply their admitted index scale to both REST and
+/// the coefficient; low32 packed extensions are not distributed this way.
 struct LoadFold {
     /// The original load instruction (`Ldr{,b,h}RO` or `Ldr{,b,h}RI`).
     load: InstId,
@@ -438,6 +424,9 @@ struct LoadFold {
     coeff: i64,
     /// Encoding scale (bytes) for the immediate form of this load width.
     scale: i64,
+    /// RO scale applied to the complete index before adding the base. RI
+    /// whole-address folds use zero. `coeff` already includes this factor.
+    index_shift: u32,
     /// Body instructions computing the offset (backward slice, stopping at
     /// `iv`/constants/invariants). Cloned ONCE with `iv->0` to materialize `REST`.
     slice: Vec<InstId>,
@@ -541,20 +530,6 @@ fn is_store(op: AArch64Opcode) -> bool {
     )
 }
 
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
 /// Copy idioms used for loop-carried writebacks: `MovR`/`Copy`/`FmovFprFpr`
 /// (FP accumulators) and `AddRI(d, s, #0)`.
 fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
@@ -562,12 +537,12 @@ fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
         AArch64Opcode::MovR | AArch64Opcode::Copy | AArch64Opcode::FmovFprFpr
             if inst.operands.len() == 2 =>
         {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
+            Some((inst.operands[0].as_vreg()?, inst.operands[1].as_vreg()?))
         }
         AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
+            if inst.operands.len() == 3 && inst.operands[2].as_imm() == Some(0) =>
         {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
+            Some((inst.operands[0].as_vreg()?, inst.operands[1].as_vreg()?))
         }
         _ => None,
     }
@@ -600,16 +575,92 @@ fn test_block_shape(func: &MachFunction, b: BlockId) -> Option<(VReg, VReg, Bloc
     {
         return None;
     }
-    if imm_of(&bcond.operands[0]) != Some(CC_LT) {
+    if bcond.operands[0].as_imm() != Some(CC_LT) {
         return None; // signed `<` counted loops only
     }
-    let iv = vreg_of(&cmp.operands[0])?;
-    let bound = vreg_of(&cmp.operands[1])?;
+    let iv = cmp.operands[0].as_vreg()?;
+    let bound = cmp.operands[1].as_vreg()?;
     let target = match bcond.operands.get(1)? {
         MachOperand::Block(t) => *t,
         _ => return None,
     };
     Some((iv, bound, target))
+}
+
+/// The TOP-TESTED header test: [`test_block_shape`], widened in two ways the
+/// rustc bridge's `while k < v.len()` loops need (`h3_box_leak`'s gather sum):
+///
+/// * the compare may be preceded by `MovR` copies of its operands
+///   (`ck = MovR k ; CmpRR ck, n`): each copy is a distinct fresh register
+///   that no other prefix copy redefines, so at the compare it holds its
+///   source's value, and the source is returned;
+/// * the test may be unsigned `LO` when the induction is `Gpr64`. The 64-bit
+///   main-loop guard is already unsigned (`n <s 4` skips it; otherwise
+///   `iv <u n - 3` makes all four lanes `<u n` without wrap), and the
+///   untouched header re-tests the original `iv <u n` for the tail.
+///
+/// Returns `(iv, bound, target, exit_inst, widened)`: `exit_inst` is the
+/// trailing `B`; `widened` says the header needed either widening (a copy or
+/// `LO`), which the caller admits for SPLIT mode only.
+fn top_test_shape(func: &MachFunction, b: BlockId) -> Option<(VReg, VReg, BlockId, InstId, bool)> {
+    let insts = &func.block(b).insts;
+    let n = insts.len();
+    if n < 3 {
+        return None;
+    }
+    let cmp = func.inst(insts[n - 3]);
+    let bcond = func.inst(insts[n - 2]);
+    let br = func.inst(insts[n - 1]);
+    if cmp.opcode != AArch64Opcode::CmpRR
+        || bcond.opcode != AArch64Opcode::BCond
+        || br.opcode != AArch64Opcode::B
+    {
+        return None;
+    }
+    // Keyed by numeric register ID: a W and an X view of one ID alias.
+    let mut copy_src: HashMap<u32, VReg> = HashMap::default();
+    for &id in &insts[..n - 3] {
+        let inst = func.inst(id);
+        let (AArch64Opcode::MovR, [MachOperand::VReg(d), MachOperand::VReg(src)]) =
+            (inst.opcode, inst.operands.as_slice())
+        else {
+            return None;
+        };
+        if d.id == src.id
+            || d.class != src.class
+            || !inst.implicit_defs.is_empty()
+            || copy_src.contains_key(&d.id)
+            || copy_src.values().any(|v| v.id == d.id)
+            || copy_src.contains_key(&src.id)
+        {
+            return None;
+        }
+        copy_src.insert(d.id, *src);
+    }
+    // A compare operand that reads a copy through the other view is refused.
+    let resolve = |v: VReg| match copy_src.get(&v.id) {
+        Some(src) if src.class == v.class => Some(*src),
+        Some(_) => None,
+        None => Some(v),
+    };
+    let iv = resolve(cmp.operands[0].as_vreg()?)?;
+    let bound = resolve(cmp.operands[1].as_vreg()?)?;
+    let unsigned = match bcond.operands[0].as_imm() {
+        Some(CC_LT) => false,
+        Some(CC_LO) if iv.class == RegClass::Gpr64 => true,
+        _ => return None,
+    };
+    let target = match bcond.operands.get(1)? {
+        MachOperand::Block(t) => *t,
+        _ => return None,
+    };
+    Some((
+        iv,
+        bound,
+        target,
+        insts[n - 1],
+        unsigned || !copy_src.is_empty(),
+    ))
 }
 
 /// CLANG-ROTATED (importer -O1, folded at O2): recognize the rotated loop whose
@@ -675,7 +726,7 @@ fn detect_clang_rotated(
         return None;
     }
     let bcond = func.inst(hinsts[p]);
-    let cc = imm_of(&bcond.operands[0])?;
+    let cc = bcond.operands[0].as_imm()?;
     if cc != CC_EQ && cc != CC_GE {
         return None;
     }
@@ -697,8 +748,8 @@ fn detect_clang_rotated(
     if cmp.opcode != AArch64Opcode::CmpRR {
         return None;
     }
-    let iv_src = vreg_of(&cmp.operands[0])?;
-    let bound = vreg_of(&cmp.operands[1])?;
+    let iv_src = cmp.operands[0].as_vreg()?;
+    let bound = cmp.operands[1].as_vreg()?;
     let iv = linsts
         .iter()
         .filter_map(|&id| copy_like(func.inst(id)))
@@ -725,9 +776,10 @@ fn detect_clang_rotated(
 /// materializes exactly that value.
 ///
 /// Returns `(cmp_inst, imm, iv_class, preheader_terminator)`. Fail-closed on any
-/// deviation (non-`CmpRI` guard, out-of-window immediate, non-GPR induction, no
-/// unique preheader, preheader not ending in an unconditional branch to the
-/// header) — the guard keeps its `CmpRI` (and any `#0`/CBZ fusions) untouched.
+/// deviation (a header that dispatches through a jump table, non-`CmpRI`
+/// guard, out-of-window immediate, non-GPR induction, no unique preheader,
+/// preheader not ending in an unconditional branch to the header) — the guard
+/// keeps its `CmpRI` (and any `#0`/CBZ fusions) untouched.
 fn find_const_trip_cmpri_guard(
     func: &MachFunction,
     header: BlockId,
@@ -735,6 +787,28 @@ fn find_const_trip_cmpri_guard(
     preheader: BlockId,
 ) -> Option<(InstId, i64, RegClass, InstId)> {
     let hinsts = &func.block(header).insts;
+    // A header that dispatches through a jump table (`Adr Xb, JumpTableIndex`
+    // .. `Br`) is not a counted loop's exit test: its loop-leaving `B.HI` is
+    // the table's bounds check `CMP Xindex, #(len - 1)`, and no constant-trip
+    // recognizer accepts a header that ends in an indirect branch. The
+    // per-compile switch binder (`trust_cg_verify::aarch64_switch_binding`)
+    // binds that bound to an immediate or to a move-wide chain IN the
+    // dispatch block and refuses one produced anywhere else, so rewriting it
+    // here to `CmpRR(index, movz)` with the `Movz` in the preheader would only
+    // move the bound out of the block it is bound in and fail the compile
+    // `[TCG-A64-SWITCH-BIND]` (a coroutine resume loop of five or more states
+    // at O2/O3; regression: trust-cg-codegen
+    // `tests/aarch64_jump_table_loop_header_bound.rs`).
+    if hinsts.iter().any(|&id| {
+        let inst = func.inst(id);
+        inst.opcode == AArch64Opcode::Br
+            || inst
+                .operands
+                .iter()
+                .any(|op| op.as_jump_table_index().is_some())
+    }) {
+        return None;
+    }
     // The header's loop-leaving conditional branch (a target outside the body).
     let p = hinsts.iter().position(|&id| {
         let i = func.inst(id);
@@ -755,8 +829,8 @@ fn find_const_trip_cmpri_guard(
     if cmp.opcode != AArch64Opcode::CmpRI || cmp.operands.len() != 2 {
         return None;
     }
-    let iv_step = vreg_of(&cmp.operands[0])?;
-    let imm_val = imm_of(&cmp.operands[1])?;
+    let iv_step = cmp.operands[0].as_vreg()?;
+    let imm_val = cmp.operands[1].as_imm()?;
     if !(MIN_FULL..=0xFFF).contains(&imm_val) {
         return None;
     }
@@ -876,10 +950,12 @@ impl Plan {
         // is PURE writebacks + `B -> header`. `entry` is the header itself, so
         // `apply` uses the tighter guard (`header_reentry`) that leaves >= 1 tail
         // iteration — re-entering the unconditional-body header stays in bounds.
-        let (entry, rotated, header_reentry, iv, bound) = if let Some((iv, bound, t)) =
-            test_block_shape(func, header)
+        let mut widened_test = false;
+        let (entry, rotated, header_reentry, iv, bound) = if let Some((iv, bound, t, exit_br, w)) =
+            top_test_shape(func, header)
             && t == latch
         {
+            widened_test = w;
             // TOP-TESTED. Header preds must be exactly {preheader, latch};
             // the latch's only successor is the header (single back-edge);
             // the exit continuation must be outside the loop.
@@ -890,7 +966,7 @@ impl Plan {
             if func.block(latch).succs != vec![header] {
                 return None;
             }
-            let exit = match func.inst(func.block(header).insts[2]).operands.first() {
+            let exit = match func.inst(exit_br).operands.first() {
                 Some(MachOperand::Block(t)) => *t,
                 _ => return None,
             };
@@ -921,14 +997,14 @@ impl Plan {
             if cmp.opcode != AArch64Opcode::CmpRR || bcond.opcode != AArch64Opcode::BCond {
                 return None;
             }
-            if imm_of(&bcond.operands[0]) != Some(CC_LT) {
+            if bcond.operands[0].as_imm() != Some(CC_LT) {
                 return None;
             }
             if !matches!(bcond.operands.get(1), Some(MachOperand::Block(t)) if *t == header) {
                 return None;
             }
-            let iv = vreg_of(&cmp.operands[0])?;
-            let bound = vreg_of(&cmp.operands[1])?;
+            let iv = cmp.operands[0].as_vreg()?;
+            let bound = cmp.operands[1].as_vreg()?;
             if func.block(latch).succs.len() != 2 || func.block(header).succs != vec![latch] {
                 return None;
             }
@@ -1038,7 +1114,7 @@ impl Plan {
             return None; // `iv` was not written exactly once among the writebacks
         }
         // Carried accumulators must be distinct and alias neither iv nor bound.
-        let mut acc_ids: HashSet<u32> = HashSet::new();
+        let mut acc_ids: HashSet<u32> = HashSet::default();
         for (a, _) in &accs {
             if *a == iv || *a == bound || !acc_ids.insert(a.id) {
                 return None;
@@ -1059,7 +1135,7 @@ impl Plan {
             .iter()
             .flat_map(|&b| func.block(b).insts.iter().copied())
             .collect();
-        let mut def_count: HashMap<u32, usize> = HashMap::new();
+        let mut def_count: HashMap<u32, usize> = HashMap::default();
         for &id in &loop_inst_ids {
             let inst = func.inst(id);
             for_each_inst_def(inst, |d| {
@@ -1152,7 +1228,7 @@ impl Plan {
                 continue;
             }
             // The `+1` induction increment: `iv_src = iv + 1`.
-            if inst.operands.first().and_then(vreg_of) == Some(iv_src)
+            if inst.operands.first().and_then(MachOperand::as_vreg) == Some(iv_src)
                 && is_increment_by_one(func, &loop_inst_ids, inst, iv)
             {
                 iv_inc = Some(id);
@@ -1161,6 +1237,34 @@ impl Plan {
             body_insts.push(id);
         }
         iv_inc?;
+        // A copy that only feeds the loop test (`ck = MovR k ; CmpRR ck, n`,
+        // admitted by `top_test_shape`) is control, not body: the main loop
+        // has its own test, so cloning it per lane would only add dead copies
+        // and make the lanes look as if they read `iv`.
+        body_insts.retain(|&id| {
+            let inst = func.inst(id);
+            let (AArch64Opcode::MovR, [MachOperand::VReg(d), _]) =
+                (inst.opcode, inst.operands.as_slice())
+            else {
+                return true;
+            };
+            let uses: Vec<InstId> = loop_inst_ids
+                .iter()
+                .copied()
+                .filter(|&other| {
+                    other != id
+                        && func
+                            .inst(other)
+                            .operands
+                            .iter()
+                            .any(|op| op.as_vreg() == Some(*d))
+                })
+                .collect();
+            uses.is_empty()
+                || !uses
+                    .iter()
+                    .all(|&other| func.inst(other).opcode == AArch64Opcode::CmpRR)
+        });
 
         // -- Closed world: each body inst defines a fresh vreg and reads only
         // {iv, acc, earlier body defs, loop invariants}. Track loads and
@@ -1175,8 +1279,8 @@ impl Plan {
         if body_insts.is_empty() || body_insts.len() > max_body {
             return None;
         }
-        let mut body_defs: HashSet<u32> = HashSet::new();
-        let mut load_derived: HashSet<u32> = HashSet::new();
+        let mut body_defs: HashSet<u32> = HashSet::default();
+        let mut load_derived: HashSet<u32> = HashSet::default();
         let mut acc_reads = 0usize;
         let mut n_loads = 0usize;
         let mut has_gather = false;
@@ -1197,7 +1301,7 @@ impl Plan {
                 // and SPLIT is forbidden below whenever a store is present.
                 has_store = true;
                 for (idx, op) in inst.operands.iter().enumerate() {
-                    if let Some(v) = vreg_of(op) {
+                    if let Some(v) = op.as_vreg() {
                         if idx == 0 {
                             // Stored value: {acc, earlier body def, invariant}.
                             //
@@ -1243,7 +1347,7 @@ impl Plan {
             }
             let mut reads_load = false;
             for op in inst.operands.iter().skip(1) {
-                if let Some(v) = vreg_of(op) {
+                if let Some(v) = op.as_vreg() {
                     if acc_ids.contains(&v.id) {
                         acc_reads += 1;
                     } else if v != iv && !body_defs.contains(&v.id) && def_count.contains_key(&v.id)
@@ -1323,9 +1427,13 @@ impl Plan {
             // (The per-acc check above already forced `acc_src` to be a body
             // def: the sole accumulator's source cannot be itself — copy-like
             // writebacks require `d != s` — so it is not in `acc_ids`.)
-            let root = *body_insts
-                .iter()
-                .find(|&&id| func.inst(id).operands.first().and_then(vreg_of) == Some(acc_src))?;
+            let root = *body_insts.iter().find(|&&id| {
+                func.inst(id)
+                    .operands
+                    .first()
+                    .and_then(MachOperand::as_vreg)
+                    == Some(acc_src)
+            })?;
             let root_inst = func.inst(root);
             // A store in the loop forbids SPLIT (which reorders the term across
             // independent accumulators): force the order-preserving SERIAL path.
@@ -1335,8 +1443,8 @@ impl Plan {
                     if acc_reads != 1 || root_inst.operands.len() != 3 {
                         return None;
                     }
-                    let a = vreg_of(&root_inst.operands[1])?;
-                    let b = vreg_of(&root_inst.operands[2])?;
+                    let a = root_inst.operands[1].as_vreg()?;
+                    let b = root_inst.operands[2].as_vreg()?;
                     if a == acc || b == acc {
                         Some((root_inst.opcode, identity))
                     } else {
@@ -1370,6 +1478,15 @@ impl Plan {
             // is bit-identical to the scalar loop's sequential one.
             Mode::Serial
         };
+        // The widened header test (copies, unsigned `LO`) is admitted for the
+        // SPLIT gather reductions it was measured on (`h3_box_leak`). A SERIAL
+        // unroll of such a loop (`p1_xorshift`'s loadless two-variable
+        // recurrence, which `xorshift-pair-fusion` already shortens) measured
+        // no gain over the rolled loop (0.958x against 0.963x LLVM -O3
+        // cycles) for 132 more bytes, so it stays rolled.
+        if widened_test && !matches!(mode, Mode::Split { .. }) {
+            return None;
+        }
 
         // FULL-UNROLL opportunity: a compile-time constant-trip SERIAL reduction
         // whose addresses fold to base+immediate loads. `None` (the common case)
@@ -1388,7 +1505,44 @@ impl Plan {
             &acc_ids,
         );
 
+        // LOOP STATE (`crate::loop_contract`): the main loop reproduces `iv` and
+        // the carried accumulators. The closed-world body rule above already
+        // keeps every other body register from carrying state across the back
+        // edge; the contract also refuses one that is live out, which a
+        // zero-iteration scalar tail would leave stale. The main loop (and the
+        // full unroll) resumes at `entry`: the header itself for the top-tested
+        // and clang-rotated shapes (`Handoff::Header`, exact there), but for
+        // `loop-latch-layout`'s rotated shape `entry` is the guard outside the
+        // loop, which may go straight to the exit.
+        let handoff = if rotated {
+            Handoff::HeaderOrExit
+        } else {
+            Handoff::Header
+        };
+        // The unrolled loop runs only iterations the loop test continues: the
+        // header's test (top-tested, clang-rotated), or the latch's
+        // (`loop-latch-layout`'s rotated shape). The loop may leave by no other
+        // exit.
+        let carried: Vec<VReg> = std::iter::once(iv)
+            .chain(accs.iter().map(|&(acc, _)| acc))
+            .collect();
+        let test_block = if rotated { latch } else { header };
+        let exits = ExitPlan::loop_test(
+            test_block,
+            exit_of_test(func, body.iter().copied(), test_block)?,
+        );
+        let locality = LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &exits,
+            handoff,
+            &carried,
+        )
+        .ok()?;
+
         Some(Plan {
+            _locality: locality,
             entry,
             preheader,
             preheader_term,
@@ -1440,11 +1594,11 @@ fn const_val_rec(func: &MachFunction, v: VReg, depth: u32) -> Option<i64> {
                     i64::try_from(value).ok()?
                 }
                 AArch64Opcode::MovR | AArch64Opcode::Copy => {
-                    let s = vreg_of(&inst.operands[1])?;
+                    let s = inst.operands[1].as_vreg()?;
                     const_val_rec(func, s, depth + 1)?
                 }
-                AArch64Opcode::AddRI if imm_of(&inst.operands[2]) == Some(0) => {
-                    let s = vreg_of(&inst.operands[1])?;
+                AArch64Opcode::AddRI if inst.operands[2].as_imm() == Some(0) => {
+                    let s = inst.operands[1].as_vreg()?;
                     const_val_rec(func, s, depth + 1)?
                 }
                 _ => return None,
@@ -1484,10 +1638,10 @@ fn outside_def_const(
                     i64::try_from(value).ok()?
                 }
                 AArch64Opcode::MovR | AArch64Opcode::Copy => {
-                    const_val_of(func, vreg_of(&inst.operands[1])?)?
+                    const_val_of(func, inst.operands[1].as_vreg()?)?
                 }
-                AArch64Opcode::AddRI if imm_of(&inst.operands[2]) == Some(0) => {
-                    const_val_of(func, vreg_of(&inst.operands[1])?)?
+                AArch64Opcode::AddRI if inst.operands[2].as_imm() == Some(0) => {
+                    const_val_of(func, inst.operands[1].as_vreg()?)?
                 }
                 _ => return None,
             });
@@ -1570,24 +1724,24 @@ fn iv_affine_coeff(
     use AArch64Opcode::*;
     match inst.opcode {
         Movz | Movn | Movk => Some(0),
-        AddRR => Some(rec(vreg_of(&inst.operands[1])?)? + rec(vreg_of(&inst.operands[2])?)?),
-        AddRI => rec(vreg_of(&inst.operands[1])?),
-        SubRR => Some(rec(vreg_of(&inst.operands[1])?)? - rec(vreg_of(&inst.operands[2])?)?),
-        SubRI => rec(vreg_of(&inst.operands[1])?),
+        AddRR => Some(rec(inst.operands[1].as_vreg()?)? + rec(inst.operands[2].as_vreg()?)?),
+        AddRI => rec(inst.operands[1].as_vreg()?),
+        SubRR => Some(rec(inst.operands[1].as_vreg()?)? - rec(inst.operands[2].as_vreg()?)?),
+        SubRI => rec(inst.operands[1].as_vreg()?),
         MulRR => {
-            let a = vreg_of(&inst.operands[1])?;
-            let b = vreg_of(&inst.operands[2])?;
+            let a = inst.operands[1].as_vreg()?;
+            let b = inst.operands[2].as_vreg()?;
             mul_coeff(func, a, b, iv, loop_def, acc_ids, depth)
         }
         Madd => {
-            let a = vreg_of(&inst.operands[1])?;
-            let b = vreg_of(&inst.operands[2])?;
-            let addend = vreg_of(&inst.operands[3])?;
+            let a = inst.operands[1].as_vreg()?;
+            let b = inst.operands[2].as_vreg()?;
+            let addend = inst.operands[3].as_vreg()?;
             Some(mul_coeff(func, a, b, iv, loop_def, acc_ids, depth)? + rec(addend)?)
         }
         LslRI => {
-            let a = rec(vreg_of(&inst.operands[1])?)?;
-            let sh = imm_of(&inst.operands[2])?;
+            let a = rec(inst.operands[1].as_vreg()?)?;
+            let sh = inst.operands[2].as_imm()?;
             if !(0..=31).contains(&sh) {
                 return None;
             }
@@ -1598,7 +1752,7 @@ fn iv_affine_coeff(
             // induction itself, or an invariant. `iv` here is a 32-bit counter
             // sign/zero-extended to form a 64-bit index; extending `init+k`
             // (all in `[0, MAX_FULL)`) is identity, so the coefficient carries.
-            let x = vreg_of(&inst.operands[1])?;
+            let x = inst.operands[1].as_vreg()?;
             if x == iv {
                 Some(1)
             } else if rec(x)? == 0 {
@@ -1648,7 +1802,7 @@ fn collect_offset_slice(
         return;
     }
     for op in func.inst(def).operands.iter().skip(1) {
-        if let Some(v) = vreg_of(op) {
+        if let Some(v) = op.as_vreg() {
             collect_offset_slice(func, v, loop_def, out);
         }
     }
@@ -1675,7 +1829,7 @@ fn collect_inloop_loads(
         return; // leaf — the two-level bound is enforced against `def`'s address
     }
     for op in func.inst(def).operands.iter().skip(1) {
-        if let Some(v) = vreg_of(op) {
+        if let Some(v) = op.as_vreg() {
             collect_inloop_loads(func, v, loop_def, out);
         }
     }
@@ -1714,7 +1868,7 @@ fn gather_admissible(
     // single address register.
     let mut rows = Vec::new();
     for op in func.inst(id).operands.iter().skip(1) {
-        if let Some(v) = vreg_of(op) {
+        if let Some(v) = op.as_vreg() {
             collect_inloop_loads(func, v, loop_def, &mut rows);
         }
     }
@@ -1726,7 +1880,7 @@ fn gather_admissible(
         return false;
     }
     // The row load must produce a full-width 8-byte pointer.
-    let Some(row_dst) = vreg_of(&row.operands[0]) else {
+    let Some(row_dst) = row.operands[0].as_vreg() else {
         return false;
     };
     if row_dst.class != RegClass::Gpr64 || mem_scale_of(row.opcode, row_dst) != Some(8) {
@@ -1736,7 +1890,7 @@ fn gather_admissible(
     // loop-invariant base (affine ⇒ it reads no load ⇒ two-level max).
     match row.opcode {
         AArch64Opcode::LdrRO => {
-            let (Some(rbase), Some(roff)) = (vreg_of(&row.operands[1]), vreg_of(&row.operands[2]))
+            let (Some(rbase), Some(roff)) = (row.operands[1].as_vreg(), row.operands[2].as_vreg())
             else {
                 return false;
             };
@@ -1746,7 +1900,7 @@ fn gather_admissible(
             iv_affine_coeff(func, roff, iv, loop_def, acc_ids, 0).is_some()
         }
         AArch64Opcode::LdrRI => {
-            let Some(raddr) = vreg_of(&row.operands[1]) else {
+            let Some(raddr) = row.operands[1].as_vreg() else {
                 return false;
             };
             if raddr == iv {
@@ -1810,13 +1964,13 @@ fn try_full_unroll(
         .iter()
         .map(|&id| func.inst(id))
         .find(|i| i.opcode == AArch64Opcode::BCond)
-        .and_then(|i| imm_of(&i.operands[0]))?;
+        .and_then(|i| i.operands[0].as_imm())?;
     if exit_cc != CC_EQ && exit_cc != CC_GE {
         return None;
     }
 
     // Map every in-loop-defined vreg to its (single) def instruction.
-    let mut loop_def: HashMap<u32, InstId> = HashMap::new();
+    let mut loop_def: HashMap<u32, InstId> = HashMap::default();
     for &id in body {
         for_each_inst_def(func.inst(id), |d| {
             loop_def.insert(d.id, id);
@@ -1824,7 +1978,7 @@ fn try_full_unroll(
     }
 
     let mut folds: Vec<LoadFold> = Vec::new();
-    let mut skip: HashSet<InstId> = HashSet::new();
+    let mut skip: HashSet<InstId> = HashSet::default();
     let mut iv_read_by_compute = false;
 
     // A store anywhere in the loop forbids admitting a two-level gather (it could
@@ -1841,11 +1995,21 @@ fn try_full_unroll(
             continue; // invariant address (recognizer-enforced); cloned as-is
         }
         if is_load(op) {
-            let dst = vreg_of(&inst.operands[0])?;
+            let dst = inst.operands[0].as_vreg()?;
             match op {
                 AArch64Opcode::LdrRO | AArch64Opcode::LdrbRO | AArch64Opcode::LdrhRO => {
-                    let base = vreg_of(&inst.operands[1])?;
-                    let offset = vreg_of(&inst.operands[2])?;
+                    // Full-width index extension is identity modulo 2^64.
+                    // UXTW/SXTW do NOT distribute over an arbitrary affine
+                    // expression: retain those RO accesses in ordinary unroll
+                    // until the complete index has an adequate range proof.
+                    // Do not erase malformed modes or operand tails either.
+                    let shifted = match inst.operands.as_slice() {
+                        [_, _, _] | [_, _, _, MachOperand::Imm(6 | 14)] => false,
+                        [_, _, _, MachOperand::Imm(7 | 15)] => true,
+                        _ => return None,
+                    };
+                    let base = inst.operands[1].as_vreg()?;
+                    let offset = inst.operands[2].as_vreg()?;
                     if base == iv {
                         return None;
                     }
@@ -1868,8 +2032,38 @@ fn try_full_unroll(
                     }
                     let coeff = iv_affine_coeff(func, offset, iv, &loop_def, acc_ids, 0)?;
                     let scale = mem_scale_of(op, dst)?;
+                    let index_shift = if shifted { scale.trailing_zeros() } else { 0 };
+                    let coeff = coeff.checked_mul(1_i64 << index_shift)?;
                     let mut slice = Vec::new();
                     collect_offset_slice(func, offset, &loop_def, &mut slice);
+                    // The coefficient recognizer alone is not width-aware.
+                    // RO's affine distribution must stay in modulo-64
+                    // arithmetic, not silently distribute a W truncation.
+                    if offset.class != RegClass::Gpr64 {
+                        return None;
+                    }
+                    for &sid in &slice {
+                        let part = func.inst(sid);
+                        if matches!(part.opcode, AArch64Opcode::Sxtw | AArch64Opcode::Uxtw) {
+                            let dst = part.operands.first().and_then(MachOperand::as_vreg)?;
+                            let source = part.operands.get(1).and_then(MachOperand::as_vreg)?;
+                            let invariant = source != iv && !loop_def.contains_key(&source.id);
+                            // Current valid constant seeds are small MOVZs;
+                            // keep the actual range requirement explicit if
+                            // constant recognition is expanded in the future.
+                            let small_iv = source == iv && bound_val <= i64::from(i32::MAX);
+                            if dst.class != RegClass::Gpr64 || !(invariant || small_iv) {
+                                return None;
+                            }
+                        } else if part
+                            .operands
+                            .iter()
+                            .filter_map(MachOperand::as_vreg)
+                            .any(|v| v.class != RegClass::Gpr64)
+                        {
+                            return None;
+                        }
+                    }
                     for &s in &slice {
                         skip.insert(s);
                     }
@@ -1881,12 +2075,13 @@ fn try_full_unroll(
                         imm0: 0,
                         coeff,
                         scale,
+                        index_shift,
                         slice,
                     });
                 }
                 AArch64Opcode::LdrRI | AArch64Opcode::LdrbRI | AArch64Opcode::LdrhRI => {
-                    let addr = vreg_of(&inst.operands[1])?;
-                    let imm0 = imm_of(&inst.operands[2])?;
+                    let addr = inst.operands[1].as_vreg()?;
+                    let imm0 = inst.operands[2].as_imm()?;
                     if addr == iv {
                         return None;
                     }
@@ -1912,6 +2107,7 @@ fn try_full_unroll(
                             imm0,
                             coeff,
                             scale,
+                            index_shift: 0,
                             slice,
                         });
                     } else {
@@ -1936,7 +2132,12 @@ fn try_full_unroll(
             continue;
         }
         // A compute instruction: it may read iv directly (then materialise iv).
-        if inst.operands.iter().skip(1).any(|o| vreg_of(o) == Some(iv)) {
+        if inst
+            .operands
+            .iter()
+            .skip(1)
+            .any(|o| o.as_vreg() == Some(iv))
+        {
             iv_read_by_compute = true;
         }
     }
@@ -1956,7 +2157,7 @@ fn try_full_unroll(
             func.inst(s)
                 .operands
                 .first()
-                .and_then(vreg_of)
+                .and_then(MachOperand::as_vreg)
                 .map(|v| v.id)
         })
         .collect();
@@ -1966,7 +2167,7 @@ fn try_full_unroll(
             continue;
         }
         for op in func.inst(id).operands.iter().skip(1) {
-            if let Some(v) = vreg_of(op)
+            if let Some(v) = op.as_vreg()
                 && skip_defs.contains(&v.id)
             {
                 return None;
@@ -2005,15 +2206,15 @@ fn is_increment_by_one(
     match inst.opcode {
         AArch64Opcode::AddRI => {
             inst.operands.len() == 3
-                && vreg_of(&inst.operands[1]) == Some(iv)
-                && imm_of(&inst.operands[2]) == Some(1)
+                && inst.operands[1].as_vreg() == Some(iv)
+                && inst.operands[2].as_imm() == Some(1)
         }
         AArch64Opcode::AddRR => {
             if inst.operands.len() != 3 {
                 return false;
             }
-            let a = vreg_of(&inst.operands[1]);
-            let b = vreg_of(&inst.operands[2]);
+            let a = inst.operands[1].as_vreg();
+            let b = inst.operands[2].as_vreg();
             let other = if a == Some(iv) {
                 b
             } else if b == Some(iv) {
@@ -2042,7 +2243,7 @@ fn is_movz_one_outside(func: &MachFunction, loop_insts: &[InstId], v: VReg) -> b
             }
             if inst.opcode != AArch64Opcode::Movz
                 || inst.operands.len() != 2
-                || imm_of(&inst.operands[1]) != Some(1)
+                || inst.operands[1].as_imm() != Some(1)
             {
                 return false;
             }
@@ -2224,12 +2425,32 @@ fn apply(func: &mut MachFunction, plan: &Plan) {
     // when the body actually reads `iv` — a loadless recurrence (iterative fib)
     // never indexes memory, so per-lane indices would be dead arithmetic (no
     // DCE runs after this pass at O2, so we must not emit it).
+    // Indexed loads `LdrRO [d, base, iv, LSL #3]` from a loop-invariant base
+    // read lane `k` at `[base + iv*8, #8k]`: one pointer per base for the
+    // whole main-loop iteration instead of an `iv+k` register per lane, and
+    // adjacent immediate offsets that `mem-pair` can pair (`lane_offset_loads`).
+    let lane_loads = lane_offset_loads(func, plan);
+    let mut lane_base: HashMap<u32, VReg> = HashMap::default();
+    for &base in lane_loads.values() {
+        if let std::collections::hash_map::Entry::Vacant(slot) = lane_base.entry(base.id) {
+            let p = alloc(func, RegClass::Gpr64);
+            emit(
+                func,
+                ub,
+                AArch64Opcode::AddRRShift,
+                vec![vreg(p), vreg(base), vreg(plan.iv), imm(3)],
+            );
+            slot.insert(p);
+        }
+    }
     let body_uses_iv = plan.body.iter().any(|&id| {
-        func.inst(id)
-            .operands
-            .iter()
-            .skip(1)
-            .any(|op| vreg_of(op) == Some(plan.iv))
+        !lane_loads.contains_key(&id)
+            && func
+                .inst(id)
+                .operands
+                .iter()
+                .skip(1)
+                .any(|op| op.as_vreg() == Some(plan.iv))
     });
     let mut lane_iv: Vec<VReg> = vec![plan.iv];
     for k in 1..UNROLL {
@@ -2262,11 +2483,11 @@ fn apply(func: &mut MachFunction, plan: &Plan) {
             let mut lane_next: Vec<(VReg, VReg)> = Vec::new();
             for k in 0..UNROLL as usize {
                 let acc_k = if k == 0 { acc } else { extra_accs[k - 1] };
-                let mut map: HashMap<u32, VReg> = HashMap::new();
+                let mut map: HashMap<u32, VReg> = HashMap::default();
                 map.insert(plan.iv.id, lane_iv[k]);
                 map.insert(acc.id, acc_k);
                 for &id in &plan.body {
-                    clone_inst(func, ub, id, &mut map);
+                    clone_lane_inst(func, ub, id, k, &lane_loads, &lane_base, &mut map);
                 }
                 lane_next.push((acc_k, *map.get(&acc_src.id).expect("root cloned")));
             }
@@ -2312,14 +2533,14 @@ fn apply(func: &mut MachFunction, plan: &Plan) {
             // bit-identical to `UNROLL` scalar iterations (module docs). k=1
             // reduces to the single-accumulator chain verbatim.
             let mut prev: Vec<VReg> = plan.accs.iter().map(|(a, _)| *a).collect();
-            for &lane in lane_iv.iter().take(UNROLL as usize) {
-                let mut map: HashMap<u32, VReg> = HashMap::new();
+            for (k, &lane) in lane_iv.iter().take(UNROLL as usize).enumerate() {
+                let mut map: HashMap<u32, VReg> = HashMap::default();
                 map.insert(plan.iv.id, lane);
                 for (j, (a, _)) in plan.accs.iter().enumerate() {
                     map.insert(a.id, prev[j]);
                 }
                 for &id in &plan.body {
-                    clone_inst(func, ub, id, &mut map);
+                    clone_lane_inst(func, ub, id, k, &lane_loads, &lane_base, &mut map);
                 }
                 prev = plan
                     .accs
@@ -2424,9 +2645,9 @@ fn apply_full_unroll(func: &mut MachFunction, plan: &Plan, fu: &FullUnroll) {
     // the invariant REST remains) and adding the invariant pointer (RO loads); an
     // RI load with no separate pointer (`base = None`) hoists its whole affine
     // address, so `offset(iv=0)` IS the base.
-    let mut base_of: HashMap<InstId, VReg> = HashMap::new();
+    let mut base_of: HashMap<InstId, VReg> = HashMap::default();
     for lf in &fu.folds {
-        let mut smap: HashMap<u32, VReg> = HashMap::new();
+        let mut smap: HashMap<u32, VReg> = HashMap::default();
         smap.insert(iv.id, zero);
         for &sid in &plan.body {
             if lf.slice.contains(&sid) {
@@ -2436,6 +2657,18 @@ fn apply_full_unroll(func: &mut MachFunction, plan: &Plan, fu: &FullUnroll) {
         // `offset(iv=0)` is REST; with an empty slice (offset itself invariant)
         // it is the offset register directly.
         let off0 = *smap.get(&lf.offset.id).unwrap_or(&lf.offset);
+        let off0 = if lf.index_shift != 0 {
+            let scaled = alloc(func, RegClass::Gpr64);
+            emit(
+                func,
+                ub,
+                AArch64Opcode::LslRI,
+                vec![vreg(scaled), vreg(off0), imm(i64::from(lf.index_shift))],
+            );
+            scaled
+        } else {
+            off0
+        };
         let base = match lf.base {
             Some(ptr) => {
                 let b = alloc(func, RegClass::Gpr64);
@@ -2456,7 +2689,7 @@ fn apply_full_unroll(func: &mut MachFunction, plan: &Plan, fu: &FullUnroll) {
     let mut prev: Vec<VReg> = plan.accs.iter().map(|(a, _)| *a).collect();
     for k in 0..(fu.trip - 1) {
         let iv_val = fu.init + k;
-        let mut map: HashMap<u32, VReg> = HashMap::new();
+        let mut map: HashMap<u32, VReg> = HashMap::default();
         for (j, (a, _)) in plan.accs.iter().enumerate() {
             map.insert(a.id, prev[j]);
         }
@@ -2563,7 +2796,7 @@ fn collapse_zero_ops(func: &mut MachFunction, ub: BlockId) {
     let insts: Vec<InstId> = func.block(ub).insts.clone();
 
     // `ub`-local registers proven to hold 0.
-    let mut zero: HashSet<u32> = HashSet::new();
+    let mut zero: HashSet<u32> = HashSet::default();
     for &id in &insts {
         let inst = func.inst(id);
         if let Some((d, 0)) = crate::reaching_const::movz_value(inst) {
@@ -2583,12 +2816,12 @@ fn collapse_zero_ops(func: &mut MachFunction, ub: BlockId) {
         .filter(|(idx, _)| *idx != ub.0 as usize)
         .flat_map(|(_, b)| b.insts.iter())
         .flat_map(|&iid| func.inst(iid).operands.iter().skip(1))
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .collect();
 
-    let mut subst: HashMap<u32, VReg> = HashMap::new();
-    let mut remove: HashSet<InstId> = HashSet::new();
+    let mut subst: HashMap<u32, VReg> = HashMap::default();
+    let mut remove: HashSet<InstId> = HashSet::default();
 
     for &id in &insts {
         // Resolve this instruction's use operands through prior substitutions.
@@ -2603,17 +2836,17 @@ fn collapse_zero_ops(func: &mut MachFunction, ub: BlockId) {
             }
         }
         let inst = func.inst(id);
-        let is_zero = |o: &MachOperand| vreg_of(o).is_some_and(|v| zero.contains(&v.id));
+        let is_zero = |o: &MachOperand| o.as_vreg().is_some_and(|v| zero.contains(&v.id));
         // The equal source this op collapses to, if any.
         let equal_src = match inst.opcode {
             AArch64Opcode::Madd if is_zero(&inst.operands[1]) || is_zero(&inst.operands[2]) => {
-                vreg_of(&inst.operands[3])
+                inst.operands[3].as_vreg()
             }
-            AArch64Opcode::AddRR if is_zero(&inst.operands[1]) => vreg_of(&inst.operands[2]),
-            AArch64Opcode::AddRR if is_zero(&inst.operands[2]) => vreg_of(&inst.operands[1]),
+            AArch64Opcode::AddRR if is_zero(&inst.operands[1]) => inst.operands[2].as_vreg(),
+            AArch64Opcode::AddRR if is_zero(&inst.operands[2]) => inst.operands[1].as_vreg(),
             _ => None,
         };
-        if let (Some(dst), Some(src)) = (vreg_of(&inst.operands[0]), equal_src)
+        if let (Some(dst), Some(src)) = (inst.operands[0].as_vreg(), equal_src)
             && !used_outside.contains(&dst.id)
         {
             // Operands are already resolved, so `src` is the canonical value.
@@ -2633,7 +2866,7 @@ fn collapse_zero_ops(func: &mut MachFunction, ub: BlockId) {
         .iter()
         .flat_map(|b| b.insts.iter())
         .flat_map(|&iid| func.inst(iid).operands.iter().skip(1))
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .collect();
     let dead_zero: HashSet<InstId> = func
@@ -2651,6 +2884,101 @@ fn collapse_zero_ops(func: &mut MachFunction, ub: BlockId) {
     func.block_mut(ub)
         .insts
         .retain(|id| !dead_zero.contains(id));
+}
+
+/// Body loads `LdrRO [d, base, iv, #7]` (a 64-bit load at `base + iv*8`, the
+/// encoder's `LSL #3` mode) whose `d` is a 64-bit register and whose `base` is
+/// loop-invariant, directly or through one body copy `base = MovR inv`: the
+/// load's id mapped to the invariant base. Every lane `k` of the main loop
+/// reads `base + (iv + k)*8 = (base + iv*8) + 8k`, the same address the
+/// clone with `iv -> iv+k` reads, so the lane loads `[p, #8k]` from one
+/// `p = base + iv*8` instead. Lanes run only when all four indices pass the
+/// loop test, so no address is added; only its arithmetic is regrouped.
+fn lane_offset_loads(func: &MachFunction, plan: &Plan) -> HashMap<InstId, VReg> {
+    let mut out = HashMap::default();
+    if plan.iv.class != RegClass::Gpr64 {
+        return out;
+    }
+    let mut loop_defs: HashSet<u32> = HashSet::default();
+    loop_defs.insert(plan.iv.id);
+    for (a, _) in &plan.accs {
+        loop_defs.insert(a.id);
+    }
+    let mut copy_of: HashMap<u32, VReg> = HashMap::default();
+    for &id in &plan.body {
+        let inst = func.inst(id);
+        for_each_inst_def(inst, |d| {
+            loop_defs.insert(d.id);
+        });
+        if let (AArch64Opcode::MovR, [MachOperand::VReg(d), MachOperand::VReg(src)]) =
+            (inst.opcode, inst.operands.as_slice())
+        {
+            copy_of.insert(d.id, *src);
+        }
+    }
+    for &id in &plan.body {
+        let inst = func.inst(id);
+        let (
+            AArch64Opcode::LdrRO,
+            [
+                MachOperand::VReg(d),
+                MachOperand::VReg(base),
+                MachOperand::VReg(idx),
+                MachOperand::Imm(7),
+            ],
+        ) = (inst.opcode, inst.operands.as_slice())
+        else {
+            continue;
+        };
+        if d.class != RegClass::Gpr64 || *idx != plan.iv || base.class != RegClass::Gpr64 {
+            continue;
+        }
+        let invariant = if loop_defs.contains(&base.id) {
+            match copy_of.get(&base.id) {
+                Some(src) if !loop_defs.contains(&src.id) && src.class == RegClass::Gpr64 => *src,
+                _ => continue,
+            }
+        } else {
+            *base
+        };
+        out.insert(id, invariant);
+    }
+    out
+}
+
+/// [`clone_inst`] for lane `k`, except a `lane_offset_loads` load, which
+/// becomes `LdrRI [d', p, #8k]` from its base's lane pointer `p`.
+fn clone_lane_inst(
+    func: &mut MachFunction,
+    b: BlockId,
+    id: InstId,
+    k: usize,
+    lane_loads: &HashMap<InstId, VReg>,
+    lane_base: &HashMap<u32, VReg>,
+    map: &mut HashMap<u32, VReg>,
+) {
+    let Some(p) = lane_loads
+        .get(&id)
+        .and_then(|base| lane_base.get(&base.id))
+        .copied()
+    else {
+        clone_inst(func, b, id, map);
+        return;
+    };
+    let old_dst = func
+        .inst(id)
+        .operands
+        .first()
+        .and_then(MachOperand::as_vreg)
+        .expect("validated body def");
+    let new_dst = alloc(func, old_dst.class);
+    map.insert(old_dst.id, new_dst);
+    emit(
+        func,
+        b,
+        AArch64Opcode::LdrRI,
+        vec![vreg(new_dst), vreg(p), imm(8 * k as i64)],
+    );
 }
 
 /// Clone body instruction `id` into `b`, remapping operand vregs through
@@ -2679,7 +3007,7 @@ fn clone_inst(func: &mut MachFunction, b: BlockId, id: InstId, map: &mut HashMap
     let old_dst = inst
         .operands
         .first()
-        .and_then(vreg_of)
+        .and_then(MachOperand::as_vreg)
         .expect("validated body def");
     let mut operands: Vec<MachOperand> = Vec::with_capacity(inst.operands.len());
     operands.push(MachOperand::Imm(0)); // placeholder for the def
@@ -2743,7 +3071,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);
@@ -2770,17 +3098,7 @@ fn simple_body_def(inst: &MachInst) -> Option<VReg> {
     if tied {
         return None;
     }
-    inst.operands.first().and_then(vreg_of)
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|op| match op {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
+    inst.operands.first().and_then(MachOperand::as_vreg)
 }
 
 fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
@@ -2815,3 +3133,7 @@ fn insert_new_blocks_before(func: &mut MachFunction, before: BlockId, new_blocks
 #[cfg(test)]
 #[path = "scalar_unroll/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "scalar_unroll/lane_offset_tests.rs"]
+mod lane_offset_tests;

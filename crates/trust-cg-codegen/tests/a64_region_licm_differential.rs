@@ -42,11 +42,14 @@ use common::a64_interp::{A64Interp, extract_text, symbol_addrs, text_branch_relo
 /// OUTER and INNER are compile-time constants so the >=1-trip guard discharges.
 fn build_nested_outer_invariant(outer_bound: i128, inner_bound: i128) -> M {
     let mut module = M::new("region_licm_e2e");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = trust_ir::Function::new(FuncId::new(0), "_nested", ft, BlockId::new(0));
 
     let c = |v: i128, r: u32| {
@@ -150,7 +153,9 @@ fn build_nested_outer_invariant(outer_bound: i128, inner_bound: i128) -> M {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -167,7 +172,8 @@ fn compile_a64(m: &M, opt: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     c.compile(m).expect("aarch64 compile").object_code
 }
 
@@ -257,4 +263,13 @@ fn a64_region_licm_hoisted_output_matches_oracle_and_unhoisted() {
             );
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

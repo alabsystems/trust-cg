@@ -1,0 +1,19 @@
+utc	phase	step	loadavg_1_5_15
+2026-09-29T11:40:15Z	campaign	start	2.80 5.55 8.17
+2026-09-29T11:40:15Z	before	01-beat-llvm-evidence-warm-cold	2.80 5.55 8.17
+2026-09-29T11:42:07Z	after	01-beat-llvm-evidence-warm-cold	12.16 7.59 8.62
+2026-09-29T11:42:07Z	before	02-perf-ratchet-require-current	12.16 7.59 8.62
+2026-09-29T11:42:08Z	after	02-perf-ratchet-require-current	12.16 7.59 8.62
+2026-09-29T11:42:08Z	before	03-check-gates-evidence	12.16 7.59 8.62
+2026-09-29T11:42:08Z	after	03-check-gates-evidence	12.16 7.59 8.62
+2026-09-29T11:42:08Z	before	04-beat-llvm-diagnostic-no-proof-certs	12.16 7.59 8.62
+2026-09-29T11:42:10Z	after	04-beat-llvm-diagnostic-no-proof-certs	11.51 7.53 8.59
+2026-09-29T11:42:10Z	before	06-scale-gate-rss	11.51 7.53 8.59
+2026-09-29T11:42:58Z	after	06-scale-gate-rss	12.29 8.35 8.84
+2026-09-29T11:42:58Z	before	07-compile-scaling	12.29 8.35 8.84
+2026-09-29T11:43:48Z	after	07-compile-scaling	18.53 10.74 9.70
+2026-09-29T11:43:48Z	before	08-compile-time-canary	18.53 10.74 9.70
+2026-09-29T11:43:50Z	after	08-compile-time-canary	18.17 10.80 9.73
+2026-09-29T11:43:50Z	before	09-determinism-sentinel	18.17 10.80 9.73
+2026-09-29T11:44:02Z	after	09-determinism-sentinel	19.74 11.38 9.95
+2026-09-29T11:44:02Z	campaign	end	19.74 11.38 9.95

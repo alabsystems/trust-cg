@@ -1,0 +1,9 @@
+# The diagnostic repeat (step 12) ran after the ledger append (logs/10-...), so run.py stamped the tree dirty.
+provenance git_diff_sha256: 991541c5c8e17634383f6510715578b1f83c243adbf585c810f961c488e977cf
+sha256 of the working-tree diff after the append: 991541c5c8e17634383f6510715578b1f83c243adbf585c810f961c488e977cf
+equal: True
+dylib_sha256: b638dc7adfdc82cb605e8bd822c41b75c12da0978231963aaeeeec5e3240d318
+# diff --stat:
+ benchmarks/LEDGER.md | 3 ++-
+ ratchet/ledger.jsonl | 1 +
+ 2 files changed, 3 insertions(+), 1 deletion(-)

@@ -1,0 +1,498 @@
+{
+  "name": "result_residual_fixture",
+  "functions": [
+    {
+      "id": 0,
+      "name": "result_enum",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Enum": 2
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "ExtractField": {
+                  "ty": "U8",
+                  "aggregate": 0,
+                  "field": 0
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 12,
+                "col": 4
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Switch": {
+                  "value": 1,
+                  "default": 2,
+                  "default_args": [],
+                  "cases": [
+                    {
+                      "value": {
+                        "Int": 0
+                      },
+                      "target": 1,
+                      "args": []
+                    }
+                  ],
+                  "exhaustive_enum_unreachable": false
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 12,
+                "col": 4
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Br": {
+                  "target": 3,
+                  "args": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 12,
+                "col": 4
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "ExtractField": {
+                  "ty": {
+                    "Enum": 0
+                  },
+                  "aggregate": 0,
+                  "field": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 12,
+                "col": 4
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "MakeAggregate": {
+                  "ty": {
+                    "Enum": 1
+                  },
+                  "variant": 1,
+                  "fields": [
+                    2
+                  ]
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 12,
+                "col": 4
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 12,
+                "col": 4
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U64",
+                  "value": {
+                    "Int": 11
+                  }
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 13,
+                "col": 7
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Enum": 1
+                  },
+                  "value": {
+                    "Aggregate": [
+                      {
+                        "Int": 0
+                      },
+                      {
+                        "Int": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 13,
+                "col": 4
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "InsertField": {
+                  "ty": {
+                    "Enum": 1
+                  },
+                  "aggregate": 5,
+                  "field": 1,
+                  "value": 4
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 13,
+                "col": 4
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    6
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 14,
+                "col": 1
+              },
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": "Trust",
+      "value_names": [
+        [
+          0,
+          "input"
+        ]
+      ],
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [
+    {
+      "id": 0,
+      "name": "RichError",
+      "fields": [
+        {
+          "name": "address",
+          "ty": "Ptr",
+          "offset": 0
+        },
+        {
+          "name": "code",
+          "ty": "U64",
+          "offset": 8
+        },
+        {
+          "name": "metadata",
+          "ty": "U64",
+          "offset": 16
+        }
+      ],
+      "size": 24,
+      "align": 8,
+      "repr": "Rust"
+    }
+  ],
+  "enums": [
+    {
+      "id": 0,
+      "name": "RichEnum",
+      "variants": [
+        {
+          "name": "Pointer",
+          "fields": [
+            {
+              "Struct": 0
+            }
+          ],
+          "field_names": []
+        },
+        {
+          "name": "Text",
+          "fields": [
+            {
+              "FatPtr": "Str"
+            }
+          ],
+          "field_names": []
+        },
+        {
+          "name": "Code",
+          "fields": [
+            "U64"
+          ],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        0,
+        1,
+        2
+      ],
+      "repr": "U64",
+      "layout": {
+        "encoding": {
+          "Direct": {
+            "tag_offset": 0
+          }
+        },
+        "size": 32,
+        "align": 8,
+        "variant_field_offsets": [
+          [
+            8
+          ],
+          [
+            8
+          ],
+          [
+            8
+          ]
+        ]
+      }
+    },
+    {
+      "id": 1,
+      "name": "Result",
+      "variants": [
+        {
+          "name": "Ok",
+          "fields": [
+            "U64"
+          ],
+          "field_names": []
+        },
+        {
+          "name": "Err",
+          "fields": [
+            {
+              "Enum": 0
+            }
+          ],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        0,
+        1
+      ],
+      "repr": null,
+      "layout": {
+        "encoding": {
+          "Niche": {
+            "untagged_variant": 1,
+            "niche_variants_start": 0,
+            "niche_variants_end": 0,
+            "niche_start": 18446744073709551615,
+            "niche_offset": 0,
+            "niche_ty": "U64"
+          }
+        },
+        "size": 32,
+        "align": 8,
+        "variant_field_offsets": [
+          [
+            8
+          ],
+          [
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "name": "Result",
+      "variants": [
+        {
+          "name": "Ok",
+          "fields": [
+            "Unit"
+          ],
+          "field_names": []
+        },
+        {
+          "name": "Err",
+          "fields": [
+            {
+              "Enum": 0
+            }
+          ],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        0,
+        1
+      ],
+      "repr": null,
+      "layout": {
+        "encoding": {
+          "Niche": {
+            "untagged_variant": 1,
+            "niche_variants_start": 0,
+            "niche_variants_end": 0,
+            "niche_start": 18446744073709551615,
+            "niche_offset": 0,
+            "niche_ty": "U64"
+          }
+        },
+        "size": 32,
+        "align": 8,
+        "variant_field_offsets": [
+          [
+            0
+          ],
+          [
+            0
+          ]
+        ]
+      }
+    }
+  ],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "Enum": 2
+        }
+      ],
+      "returns": [
+        {
+          "Enum": 1
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [
+    "../source/crates/trust-thir-lower/probes/result_residual.rs"
+  ],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": []
+}

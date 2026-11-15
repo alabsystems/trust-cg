@@ -1,0 +1,75 @@
+; TrustIr text format v1
+module "_RNvCskx4mzVUvllO_18s51_match_patterns8classify"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (i64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCskx4mzVUvllO_18s51_match_patterns8classify(functy.0) {
+bb0(%1: i64):
+    %12 = const i64 -9223372036854775808
+    %11 = icmp sle i64 %12, %1
+    condbr %11, bb4, bb3
+bb4:
+    %14 = const i64 -1
+    %13 = icmp sle i64 %1, %14
+    condbr %13, bb2, bb3
+bb3:
+    switch %1 [ 0: bb9 1: bb8 2: bb8 3: bb8 default: bb1 ]
+bb9:
+    %15 = const u64 2
+    br bb12(%15)
+bb8:
+    %16 = const u64 3
+    br bb12(%16)
+bb1:
+    %18 = const i64 2
+    %19 = const i64 63
+    %20 = ashr i64 %1, %19
+    %21 = const i64 63
+    %22 = lshr i64 %20, %21
+    %23 = add i64 %1, %22
+    %24 = const i64 1
+    %25 = ashr i64 %23, %24
+    %26 = const i64 1
+    %27 = shl i64 %25, %26
+    %17 = sub i64 %1, %27
+    switch %17 [ 0: bb10 default: bb11 ]
+bb10:
+    %28 = bitcast i64 %1 to u64
+    %30 = const u64 255
+    %29 = and u64 %28, %30
+    br bb12(%29)
+bb11:
+    %32 = const i64 4
+    %31 = icmp sle i64 %32, %1
+    condbr %31, bb7, bb5
+bb7:
+    %34 = const i64 100
+    %33 = icmp sle i64 %1, %34
+    condbr %33, bb6, bb5
+bb5:
+    %35 = const u64 99
+    br bb12(%35)
+bb6:
+    %36 = bitcast i64 %1 to u64
+    %38 = const u64 2
+    %37 = mul u64 %36, %38
+    %40 = const u64 255
+    %39 = and u64 %37, %40
+    br bb12(%39)
+bb2:
+    %41 = const u64 1
+    br bb12(%41)
+bb12(%42: u64):
+    ret %42
+}

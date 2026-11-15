@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: BOUNDED `.flat_map(f)` — `(0..n).flat_map(|x| a..x).sum()` /
 // `.count()` / `.fold(init, g)` over a `Range<T>` outer AND a `Range<T>` inner
@@ -15,80 +19,33 @@ mod target_dir_support;
 // `src/lib.rs` for the driver this exercises: a DEDICATED two-level nested loop
 // that bypasses `emit_chain_next`/`AdapterKind` entirely (their "≤1 item out
 // per ≤1 item pulled" contract cannot express flat_map's "0..N items out per 1
-// outer pull"). The ctor writes a PRIVATE `{start,end}` encoding into the real
-// (rustc-sized) `FlatMap` slot; this is sound ONLY because the real
-// `FlattenCompat::next`/`try_fold` body is UNCONDITIONALLY unlowerable by this
-// backend today — `flatmap_bare_for_loop_still_fails_closed_after_backend_load`
-// below is the PERMANENT regression guard for that standing invariant (see the
-// ctor's doc comment): if it ever starts compiling, this whole driver's private
-// encoding needs an `iter_chain_wraps_flatmap`-style guard before it can keep
-// shipping.
+// outer pull"). The ctor writes std's own `FlatMap::new` value (`Fuse` =
+// `Some(Map { range, f })`, `frontiter`/`backiter` = `None`) into the real
+// (rustc-sized) slot, and the driver folds `frontiter`, the outer range and
+// `backiter` in std's order, so a value std code built or advanced is driven
+// exactly as std drives it. `flatmap_bare_for_loop_still_fails_closed_after_backend_load`
+// below pins that the real `FlattenCompat::next` body still does not lower (a
+// coverage boundary; a change there is a reviewed edit).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::OnceLock;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
+/// `(0..3).flat_map(|x| 0..x).sum()`: x=0 -> {} ; x=1 -> {0} ; x=2 -> {0,1}.
+/// Sum = 0 + 0 + (0+1) = 1. A shape the bounded driver admits: the x86-64
+/// differential's first case and the canaries' positive control.
+const SUM_BASIC_SRC: &str = "fn main() { let s: i64 = (0..std::hint::black_box(3i64)).flat_map(|x| 0..x).sum(); \
+                             std::process::exit(s as i32); }";
+const SUM_BASIC_EXIT: i32 = 1;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let dylib_name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&dylib_name),
-        target_dir.join("debug").join(&dylib_name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run flat_map test");
-    let built = target_dir.join("debug").join(&dylib_name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -119,11 +76,17 @@ fn compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
+        // The `unwind` leg is an execution differential: certified compiles
+        // refuse objects with exception tables ([TCG-EH-UNPROVED]), and every
+        // x86-64 object compiled under panic=unwind carries them, so that leg
+        // compiles without proof certificates. The `abort` leg keeps them.
+        if panic == "unwind" {
+            cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
+        }
     }
     cmd.args(["--target", TARGET])
         .arg(format!("-Cpanic={panic}"))
@@ -164,14 +127,7 @@ fn flatmap_bounded_programs_run_and_match_llvm() {
 
     // (name, source, expected exit code).
     let shapes: &[(&str, &str, i32)] = &[
-        // `(0..3).flat_map(|x| 0..x).sum()`: x=0 -> {} ; x=1 -> {0} ; x=2 -> {0,1}.
-        // Sum = 0 + 0 + (0+1) = 1.
-        (
-            "sum_basic",
-            "fn main() { let s: i64 = (0..std::hint::black_box(3i64)).flat_map(|x| 0..x).sum(); \
-             std::process::exit(s as i32); }",
-            1,
-        ),
+        ("sum_basic", SUM_BASIC_SRC, SUM_BASIC_EXIT),
         // EMPTY-only: every inner range is empty (`0..0`) regardless of `x` — must
         // never touch the accumulate step.
         (
@@ -223,8 +179,14 @@ fn flatmap_bounded_programs_run_and_match_llvm() {
         for panic in ["abort", "unwind"] {
             let llvm_bin = compile(&dir, &format!("{name}_{panic}_llvm"), src, None, panic)
                 .unwrap_or_else(|e| panic!("LLVM compile of `{name}` ({panic}) failed: {e}"));
-            let tcg_bin = compile(&dir, &format!("{name}_{panic}_tcg"), src, Some(&dylib), panic)
-                .unwrap_or_else(|e| panic!("trust-cg compile of `{name}` ({panic}) failed: {e}"));
+            let tcg_bin = compile(
+                &dir,
+                &format!("{name}_{panic}_tcg"),
+                src,
+                Some(&dylib),
+                panic,
+            )
+            .unwrap_or_else(|e| panic!("trust-cg compile of `{name}` ({panic}) failed: {e}"));
             let llvm_exit = run_exit_code(&llvm_bin);
             let tcg_exit = run_exit_code(&tcg_bin);
             assert_eq!(
@@ -243,7 +205,11 @@ fn flatmap_bounded_programs_run_and_match_llvm() {
 
 fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
-    path.push(format!("rcl2_flatmap_neg_{}_{}.rs", stem, std::process::id()));
+    path.push(format!(
+        "rcl2_flatmap_neg_{}_{}.rs",
+        stem,
+        std::process::id()
+    ));
     std::fs::write(&path, contents).expect("failed to write temp source file");
     path
 }
@@ -251,21 +217,43 @@ fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
 struct BackendRun {
     status: ExitStatus,
     stderr: String,
+    /// The canary crate's name (its source file's stem), which the refused
+    /// symbols carry.
+    crate_name: String,
+}
+
+/// The canaries' compile: the host target, the default `panic=unwind`, and
+/// no proof certificates. The canaries check that the backend's LOWERING
+/// refuses their shapes. Certificates are irrelevant to that and, with them
+/// on, the default `panic=unwind` build would be refused anyway on an x86-64
+/// host ([TCG-EH-UNPROVED]: every such object carries exception tables), so
+/// a canary could pass for the wrong reason.
+fn host_backend_command(dylib: &Path, src_path: &Path, out_bin: &Path) -> Command {
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.arg(backend_arg(dylib))
+        .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]))
+        .arg("-o")
+        .arg(out_bin)
+        .arg(src_path);
+    cmd
 }
 
 fn run_backend_on_source(stem: &str, src: &str) -> BackendRun {
     let src_path = write_temp_source(stem, src);
-    let out_bin = std::env::temp_dir().join(format!("rcl2_flatmap_neg_out_{stem}_{}", std::process::id()));
+    let crate_name = src_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("UTF-8 source stem")
+        .to_string();
+    let out_bin = std::env::temp_dir().join(format!(
+        "rcl2_flatmap_neg_out_{stem}_{}",
+        std::process::id()
+    ));
     let dylib = ensure_dylib_built();
 
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg(backend_arg(&dylib))
-        .arg("-o")
-        .arg(&out_bin)
-        .arg(&src_path)
+    let output = host_backend_command(&dylib, &src_path, &out_bin)
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
 
     let _ = std::fs::remove_file(&src_path);
     let _ = std::fs::remove_file(&out_bin);
@@ -273,7 +261,126 @@ fn run_backend_on_source(stem: &str, src: &str) -> BackendRun {
     BackendRun {
         status: output.status,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        crate_name,
     }
+}
+
+/// The canaries' positive control: `sum_basic`, a shape the bounded driver
+/// admits, compiled in the canaries' configuration for the same host and run.
+/// A canary's refusal says something about the flat_map gate only when this
+/// host compiles the shape the gate admits. `Err` is the reason to skip (the
+/// control does not compile here); a control that compiles but computes the
+/// wrong value is a miscompile and panics.
+fn positive_control() -> Result<(), String> {
+    static CONTROL: OnceLock<Result<Result<(), String>, String>> = OnceLock::new();
+    let outcome = CONTROL.get_or_init(|| {
+        let dylib = ensure_dylib_built();
+        let dir = workdir("control");
+        let src_path = dir.join("sum_basic_control.rs");
+        std::fs::write(&src_path, SUM_BASIC_SRC).expect("write control source");
+        let bin = dir.join("sum_basic_control");
+        let output = host_backend_command(&dylib, &src_path, &bin)
+            .output()
+            .expect("failed to spawn trustc");
+        let outcome = if output.status.success() {
+            let exit = run_exit_code(&bin);
+            if exit == SUM_BASIC_EXIT {
+                Ok(Ok(()))
+            } else {
+                Err(format!(
+                    "the positive control `sum_basic` compiled for this host and exited \
+                     {exit}, expected {SUM_BASIC_EXIT}: a miscompile"
+                ))
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let refusal = stderr
+                .lines()
+                .find(|line| line.contains("[TCG-") && !line.starts_with("error:"))
+                .or_else(|| stderr.lines().find(|line| line.starts_with("error")))
+                .unwrap_or("(no diagnostic)")
+                .trim()
+                .to_string();
+            Ok(Err(refusal))
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    });
+    match outcome {
+        Ok(control) => control.clone(),
+        Err(miscompile) => panic!("{miscompile}"),
+    }
+}
+
+/// `true` when the canary runs; otherwise it prints why it is skipped.
+fn canary_runs(canary: &str) -> bool {
+    match positive_control() {
+        Ok(()) => true,
+        Err(refusal) => {
+            eprintln!(
+                "skipping {canary}: the positive control `sum_basic` does not compile for this \
+                 host, so a refusal here would say nothing about the flat_map gate. Control \
+                 refusal: {refusal}"
+            );
+            false
+        }
+    }
+}
+
+/// The canaries' refusal must come from lowering, not from proof
+/// promotion: with certificates off neither the exception-table refusal nor
+/// any other certificate refusal can fire.
+fn assert_not_a_certificate_refusal(stderr: &str) {
+    for marker in [
+        "TCG-EH-UNPROVED",
+        "TCG-PROOF-465",
+        "proof promotion rejected",
+    ] {
+        assert!(
+            !stderr.contains(marker),
+            "the canary failed for a certificate reason ({marker:?}), not the lowering refusal \
+             it guards. stderr: <<<{stderr}>>>"
+        );
+    }
+}
+
+/// A crash or a link failure is not the refusal a canary guards.
+fn assert_not_an_incidental_failure(stderr: &str) {
+    for marker in ["internal compiler error", "panicked at", "linking with"] {
+        assert!(
+            !stderr.contains(marker),
+            "the canary failed incidentally ({marker:?}), not with the lowering refusal it \
+             guards. stderr: <<<{stderr}>>>"
+        );
+    }
+}
+
+/// A terminal canary (`.sum()` over a flat_map shape the bounded driver does
+/// not admit): the bridge refuses the canary crate's own `main` because the
+/// terminal's chain is unmodeled.
+fn assert_terminal_refused_as_unmodeled(run: &BackendRun) {
+    let stderr = run.stderr.as_str();
+    assert!(
+        stderr.contains("[TCG-MIR-UNSUPPORTED]"),
+        "expected the [TCG-MIR-UNSUPPORTED] refusal. stderr: <<<{stderr}>>>"
+    );
+    let mangled_main = format!("{}4main", run.crate_name);
+    let path_main = format!("{}::main", run.crate_name);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("[TCG-ITER-UNMODELED]")
+                && (line.contains(&mangled_main) || line.contains(&path_main))),
+        "expected [TCG-ITER-UNMODELED] naming `{}::main`. stderr: <<<{stderr}>>>",
+        run.crate_name
+    );
+    assert_common_canary_refusal(stderr);
+}
+
+fn assert_common_canary_refusal(stderr: &str) {
+    assert_no_backend_load_failure(stderr);
+    assert_not_a_certificate_refusal(stderr);
+    assert_not_an_incidental_failure(stderr);
 }
 
 fn assert_no_backend_load_failure(stderr: &str) {
@@ -293,19 +400,18 @@ fn assert_no_backend_load_failure(stderr: &str) {
     }
 }
 
-/// ⚠️ THE STANDING-INVARIANT CANARY (see `lower_flatmap_bounded_ctor`'s doc
-/// comment). The private `{start,end}` ctor encoding this driver writes into a
-/// real `FlatMap` slot is sound ONLY because `<FlattenCompat<Map<Range,F>,Range>
-/// as Iterator>::next`/`try_fold` is UNCONDITIONALLY unlowerable by this
-/// backend's general call path today — so a bare `for` loop over a `flat_map`
-/// (which reaches that real body directly, with NO `.sum()`/`.fold()`/`.count()`
-/// terminal to intercept) MUST keep failing to compile. If this test ever starts
-/// observing a successful compile, that invariant has silently broken and this
-/// whole driver needs an `iter_chain_wraps_flatmap`-style guard (mirroring
-/// `iter_chain_wraps_stepby`) before it can keep shipping — treat it as
-/// equivalent in severity to a live miscompile, not a green light.
+/// COVERAGE CANARY. A bare `for` loop over a `flat_map` reaches the real
+/// `<FlattenCompat<Map<Range,F>,Range> as Iterator>::next` body directly (NO
+/// `.sum()`/`.fold()`/`.count()` terminal to intercept), and that body does not
+/// lower today, so the program fails closed. The bounded ctor writes std's own
+/// `FlatMap` layout, so a future change that makes the body lower reads the
+/// value std's `FlatMap::new` would have written; this canary still pins the
+/// boundary so such a change is a reviewed edit (with its own differential).
 #[test]
 fn flatmap_bare_for_loop_still_fails_closed_after_backend_load() {
+    if !canary_runs("flatmap_bare_for_loop_still_fails_closed_after_backend_load") {
+        return;
+    }
     let src = r#"
 fn main() {
     let mut acc: i64 = 0;
@@ -321,24 +427,42 @@ fn main() {
     eprintln!("rustc exit: {:?}", output.status);
     assert!(
         !output.status.success(),
-        "STANDING INVARIANT BROKEN: a bare `for` loop over `.flat_map(..)` (no \
-         sum/fold/count terminal) unexpectedly COMPILED. `lower_flatmap_bounded_ctor`'s \
-         private {{start,end}} encoding depends on `FlattenCompat::next`/`try_fold` \
-         staying unconditionally unlowerable by the general call path — this now needs \
-         an `iter_chain_wraps_flatmap`-style guard before this driver can keep shipping. \
-         stderr: <<<{stderr}>>>"
+        "COVERAGE BOUNDARY MOVED: a bare `for` loop over `.flat_map(..)` (no \
+         sum/fold/count terminal) unexpectedly COMPILED, so the real \
+         `FlattenCompat::next` body now lowers; review it against std with a \
+         differential before updating this canary. stderr: <<<{stderr}>>>"
     );
-    assert_no_backend_load_failure(stderr);
+    assert!(
+        stderr.contains("[TCG-MIR-UNSUPPORTED]"),
+        "expected the [TCG-MIR-UNSUPPORTED] refusal. stderr: <<<{stderr}>>>"
+    );
+    // The refused function is the real `FlattenCompat` step the loop reaches:
+    // `<Fuse<Map<Range<i64>, main::{closure}>> as FuseImpl<_>>::next`, v0-mangled
+    // or demangled, both carrying the canary crate's name.
+    assert!(
+        stderr.lines().any(|line| {
+            ["Fuse", "Map", "Range", "FuseImpl", "next"]
+                .iter()
+                .all(|part| line.contains(part))
+                && line.contains(&output.crate_name)
+        }),
+        "expected the refusal to name `FuseImpl::next` over `Fuse<Map<Range<_>, {}::main::{{closure}}>>`. \
+         stderr: <<<{stderr}>>>",
+        output.crate_name
+    );
+    assert_common_canary_refusal(stderr);
 }
 
 /// Composed-adapter canary: `.flat_map(..)` UNDER an outer `.map(..)` — the
 /// terminal's self type is `Map<FlatMap<...>, G>`, not itself a bare `FlatMap`,
 /// so `resolve_flatmap_bounded` cannot see it — must fail closed (never a wrong
-/// sum), whichever stage (the `.map()` ctor embedding the private encoding into
-/// a real `Map<FlatMap,G>` value, or the terminal finding no modeled chain)
-/// actually rejects it first.
+/// sum), whichever stage (the `.map()` ctor over a `FlatMap` inner, or the
+/// terminal finding no modeled chain) actually rejects it first.
 #[test]
 fn flatmap_under_map_fails_closed_after_backend_load() {
+    if !canary_runs("flatmap_under_map_fails_closed_after_backend_load") {
+        return;
+    }
     let src = r#"
 fn main() {
     let s: i64 = (0..std::hint::black_box(3i64)).flat_map(|x| 0..x).map(|y| y * 2).sum();
@@ -355,7 +479,7 @@ fn main() {
          outside `resolve_flatmap_bounded`'s scope and must fail closed, not silently \
          drop the outer `.map()`. stderr: <<<{stderr}>>>"
     );
-    assert_no_backend_load_failure(stderr);
+    assert_terminal_refused_as_unmodeled(&output);
 }
 
 /// `.rev()` composed over a bounded flat_map: the terminal's self type is
@@ -363,6 +487,9 @@ fn main() {
 /// silently ignore the `.rev()`.
 #[test]
 fn flatmap_then_rev_fails_closed_after_backend_load() {
+    if !canary_runs("flatmap_then_rev_fails_closed_after_backend_load") {
+        return;
+    }
     let src = r#"
 fn main() {
     let s: i64 = (0..std::hint::black_box(3i64)).flat_map(|x| 0..x).rev().sum();
@@ -378,7 +505,7 @@ fn main() {
         "`.flat_map(..).rev().sum()` unexpectedly compiled — must fail closed, never \
          silently ignore the `.rev()`. stderr: <<<{stderr}>>>"
     );
-    assert_no_backend_load_failure(stderr);
+    assert_terminal_refused_as_unmodeled(&output);
 }
 
 /// A CAPTURING closure (`f` closes over a runtime local `k`): `resolve_flatmap_
@@ -386,6 +513,9 @@ fn main() {
 /// silently compute over garbage upvar bytes.
 #[test]
 fn flatmap_capturing_closure_fails_closed_after_backend_load() {
+    if !canary_runs("flatmap_capturing_closure_fails_closed_after_backend_load") {
+        return;
+    }
     let src = r#"
 fn main() {
     let k: i64 = std::hint::black_box(1i64);
@@ -402,13 +532,16 @@ fn main() {
         "a CAPTURING flat_map closure unexpectedly compiled — must fail closed. \
          stderr: <<<{stderr}>>>"
     );
-    assert_no_backend_load_failure(stderr);
+    assert_terminal_refused_as_unmodeled(&output);
 }
 
 /// A non-Range inner (`Vec<T>` via `vec![x, x]`): `range_index_ty(U)` must
 /// reject it — must fail closed.
 #[test]
 fn flatmap_non_range_inner_fails_closed_after_backend_load() {
+    if !canary_runs("flatmap_non_range_inner_fails_closed_after_backend_load") {
+        return;
+    }
     let src = r#"
 fn main() {
     let s: i64 = (0..std::hint::black_box(3i64)).flat_map(|x| vec![x, x]).sum();
@@ -424,5 +557,5 @@ fn main() {
         "a non-Range flat_map inner (`Vec`) unexpectedly compiled — must fail closed. \
          stderr: <<<{stderr}>>>"
     );
-    assert_no_backend_load_failure(stderr);
+    assert_terminal_refused_as_unmodeled(&output);
 }

@@ -1,6 +1,6 @@
 // E2E: AArch64 macOS exception handling at -O2, and unwind-THROUGH plain
 // trust-cg frames — end to end through the REAL compiler pipeline, linked
-// with c++, and RUN under a hard timeout.
+// with c++, and run with a process polling deadline.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -32,8 +32,10 @@
 //    a trust-cg-compiled function and catches it in the C++ caller of that
 //    function: main [c++] -> mid [trust-cg] -> thrower [c++, throws].
 //
-// SAFETY: produced binaries ALWAYS run under a hard timeout so a broken
-// catch (loop/abort/hang in the unwinder) fails fast and diagnosably.
+// Execution uses a polling deadline and nonblocking termination requests.
+// Kernel-blocked children can survive a timeout; host cleanup is not guaranteed.
+
+mod common;
 
 use std::fs;
 use std::process::Command;
@@ -53,11 +55,45 @@ use trust_ir::{
 fn macho_compiler(config: CompilerConfig) -> Compiler {
     let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
         .expect("aarch64-apple-darwin parses");
-    Compiler::new_for_target_spec(config, spec)
+    Compiler::new_for_target_spec(config, spec).with_codegen_license(permit_unlicensed())
 }
 
-fn host_is_aarch64_macos() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+#[path = "common/pinned_target.rs"]
+mod pinned_target;
+
+/// AArch64 Linux GNU (ELF: `.eh_frame` + `.gcc_except_table`, libstdc++) or
+/// macOS (Mach-O: compact unwind + `__gcc_except_tab`, libc++abi) can link
+/// and run the EH object with the host `c++`.
+fn host_can_link_and_run_aarch64_eh() -> bool {
+    native_host::NATIVE
+}
+
+/// Compile for `triple`, asserting the container and the per-format LSDA
+/// section an EH-carrying object must include.
+fn compile_eh_obj_for(module: &TrustIrModule, opt_level: OptLevel, triple: &str) -> Vec<u8> {
+    let spec = trust_cg_codegen::target::TargetSpec::parse(triple).expect("triple parses");
+    let result = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level,
+            ..CompilerConfig::default()
+        },
+        spec,
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&pinned_target::pinned(module, triple))
+    .expect("EH module compilation should succeed");
+    let obj = result.object_code;
+    let contains = |needle: &[u8]| obj.windows(needle.len()).any(|w| w == needle);
+    if triple.contains("linux") {
+        native_host::assert_elf_aarch64_object(&obj);
+        assert!(contains(b".eh_frame"), "ELF EH object must carry .eh_frame");
+    } else {
+        native_host::assert_macho_arm64_object(&obj);
+    }
+    obj
 }
 
 /// Build the trust-ir module of `e2e_aarch64_eh_invoke_trust_ir`: extern
@@ -66,22 +102,30 @@ fn build_tc_try_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("eh_invoke_o2");
 
     // FuncId 0: extern void cxx_throw()  — may throw a C++ exception.
-    let throw_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let throw_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut cxx_throw =
         TrustIrFunction::new(FuncId::new(0), "cxx_throw", throw_ft, BlockId::new(0));
     cxx_throw.linkage = Linkage::External;
-    module.add_function(cxx_throw);
+    module
+        .try_add_function(cxx_throw)
+        .expect("Module::try_add_function: test fixture");
 
     // FuncId 1: extern void* __cxa_begin_catch(void* exn)
-    let begin_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::Ptr],
-        is_vararg: false,
-    });
+    let begin_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::Ptr],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut begin = TrustIrFunction::new(
         FuncId::new(1),
         "__cxa_begin_catch",
@@ -89,24 +133,34 @@ fn build_tc_try_module() -> TrustIrModule {
         BlockId::new(0),
     );
     begin.linkage = Linkage::External;
-    module.add_function(begin);
+    module
+        .try_add_function(begin)
+        .expect("Module::try_add_function: test fixture");
 
     // FuncId 2: extern void __cxa_end_catch()
-    let end_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let end_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut end = TrustIrFunction::new(FuncId::new(2), "__cxa_end_catch", end_ft, BlockId::new(0));
     end.linkage = Linkage::External;
-    module.add_function(end);
+    module
+        .try_add_function(end)
+        .expect("Module::try_add_function: test fixture");
 
     // FuncId 3: int tc_try()
-    let try_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let try_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut tc_try = TrustIrFunction::new(FuncId::new(3), "tc_try", try_ft, BlockId::new(0));
     tc_try.blocks = vec![
         // bb0: invoke cxx_throw() to bb1 unwind bb2
@@ -166,8 +220,11 @@ fn build_tc_try_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(tc_try);
+    module
+        .try_add_function(tc_try)
+        .expect("Module::try_add_function: test fixture");
 
+    pinned_target::pin(&mut module, "aarch64-apple-darwin");
     module
 }
 
@@ -176,20 +233,28 @@ fn build_tc_try_module() -> TrustIrModule {
 fn build_mid_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("unwind_through");
 
-    let thrower_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let thrower_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut thrower = TrustIrFunction::new(FuncId::new(0), "thrower", thrower_ft, BlockId::new(0));
     thrower.linkage = Linkage::External;
-    module.add_function(thrower);
+    module
+        .try_add_function(thrower)
+        .expect("Module::try_add_function: test fixture");
 
-    let mid_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let mid_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut mid = TrustIrFunction::new(FuncId::new(1), "mid", mid_ft, BlockId::new(0));
     mid.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -209,8 +274,11 @@ fn build_mid_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(mid);
+    module
+        .try_add_function(mid)
+        .expect("Module::try_add_function: test fixture");
 
+    pinned_target::pin(&mut module, "aarch64-apple-darwin");
     module
 }
 
@@ -278,13 +346,13 @@ fn eh_plain_function_gets_walkthrough_unwind_entry_without_personality() {
 
 #[test]
 fn eh_invoke_trust_ir_o2_link_and_run_both_paths() {
-    if !host_is_aarch64_macos() {
-        eprintln!("SKIP: EH O2 e2e requires an aarch64-apple-darwin host");
+    if !host_can_link_and_run_aarch64_eh() {
+        eprintln!("SKIP: EH O2 e2e requires an AArch64 Linux GNU or macOS host");
         return;
     }
 
     let module = build_tc_try_module();
-    let obj = compile_to_obj_at(&module, OptLevel::O2);
+    let obj = compile_eh_obj_for(&module, OptLevel::O2, native_host::TRIPLE);
 
     let dir = std::env::temp_dir().join("trust_cg_eh_o2_trust_ir_e2e");
     let _ = fs::remove_dir_all(&dir);
@@ -329,8 +397,10 @@ int main() {
         String::from_utf8_lossy(&link.stderr)
     );
 
-    let (exit_code, stdout, stderr, timed_out) =
-        run_with_timeout(&bin_path, Duration::from_secs(10));
+    let (exit_code, stdout, stderr, timed_out) = run_with_timeout(
+        &bin_path,
+        common::rosetta::exec_timeout(Duration::from_secs(10)),
+    );
     assert!(
         !timed_out,
         "O2 tc_try HUNG — unwinder never resolved the landing pad. \
@@ -352,13 +422,13 @@ int main() {
 
 #[test]
 fn eh_unwind_through_plain_trust_cg_frame() {
-    if !host_is_aarch64_macos() {
-        eprintln!("SKIP: unwind-through e2e requires an aarch64-apple-darwin host");
+    if !host_can_link_and_run_aarch64_eh() {
+        eprintln!("SKIP: unwind-through e2e requires an AArch64 Linux GNU or macOS host");
         return;
     }
 
     let module = build_mid_module();
-    let obj = compile_to_obj_at(&module, OptLevel::O2);
+    let obj = compile_eh_obj_for(&module, OptLevel::O2, native_host::TRIPLE);
 
     let dir = std::env::temp_dir().join("trust_cg_eh_walkthrough_e2e");
     let _ = fs::remove_dir_all(&dir);
@@ -401,8 +471,10 @@ int main() {
         String::from_utf8_lossy(&link.stderr)
     );
 
-    let (exit_code, stdout, stderr, timed_out) =
-        run_with_timeout(&bin_path, Duration::from_secs(10));
+    let (exit_code, stdout, stderr, timed_out) = run_with_timeout(
+        &bin_path,
+        common::rosetta::exec_timeout(Duration::from_secs(10)),
+    );
     assert!(
         !timed_out,
         "unwind-through binary HUNG. stdout: {stdout}\nstderr: {stderr}"
@@ -423,43 +495,67 @@ int main() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Run `bin` with a hard wall-clock timeout. Returns
-/// `(exit_code, stdout, stderr, timed_out)`. On timeout the child is killed.
+/// The Linux GNU native lane's objects, checked at object level on every host:
+/// the O2 invoke module carries `.eh_frame`, the LSDA and the ELF personality;
+/// the plain walk-through module carries `.eh_frame` without a personality.
+#[test]
+fn eh_o2_and_walkthrough_linux_objects_carry_eh_frame() {
+    let obj = compile_eh_obj_for(
+        &build_tc_try_module(),
+        OptLevel::O2,
+        "aarch64-unknown-linux-gnu",
+    );
+    let contains = |needle: &[u8]| obj.windows(needle.len()).any(|w| w == needle);
+    assert!(contains(b".gcc_except_table"), "missing .gcc_except_table");
+    assert!(contains(b"__gxx_personality_v0"), "missing ELF personality");
+    let plain = compile_eh_obj_for(
+        &build_mid_module(),
+        OptLevel::O2,
+        "aarch64-unknown-linux-gnu",
+    );
+    assert!(
+        !plain
+            .windows(b"__gxx_personality_v0".len())
+            .any(|w| w == b"__gxx_personality_v0"),
+        "plain module must not import a personality routine"
+    );
+}
+
+#[cfg(unix)]
+#[path = "common/direct_timeout_contract.rs"]
+mod direct_timeout_contract;
+
+#[cfg(unix)]
+#[test]
+fn eh_supervisor_preserves_direct_status_and_timeout_observations() {
+    direct_timeout_contract::check(run_with_timeout);
+}
+
+/// Preserve direct-child exit codes with the shared polling/termination boundary.
+/// A timeout requests termination; it does not guarantee child/host cleanup.
 fn run_with_timeout(
     bin: &std::path::Path,
     timeout: Duration,
 ) -> (Option<i32>, String, String, bool) {
-    use std::io::Read;
+    let result = common::rosetta::command_output_with_timeout(&mut Command::new(bin), timeout)
+        .expect("run supervised EH binary");
+    (
+        if result.timed_out {
+            None
+        } else {
+            result.output.status.code()
+        },
+        String::from_utf8_lossy(&result.output.stdout).into_owned(),
+        String::from_utf8_lossy(&result.output.stderr).into_owned(),
+        result.timed_out,
+    )
+}
 
-    let mut child = Command::new(bin)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn EH binary");
-
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = String::new();
-                let mut err = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    let _ = s.read_to_string(&mut out);
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    let _ = s.read_to_string(&mut err);
-                }
-                return (status.code(), out, err, false);
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return (None, String::new(), String::new(), true);
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => panic!("waiting on EH binary failed: {e}"),
-        }
-    }
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -18,13 +18,31 @@ fn build_same_name_external_call(symbol: &str) -> MachFunction {
     let sig = Signature::new(vec![Type::I64], vec![Type::I64]);
     let mut func = MachFunction::new(symbol.to_string(), sig);
     let entry = func.entry;
-
-    let bl = MachInst::new(
-        AArch64Opcode::Bl,
-        vec![MachOperand::Symbol(symbol.to_string())],
-    );
-    let bl_id = func.push_inst(bl);
-    func.append_inst(entry, bl_id);
+    // Save and restore the frame record around the BL, as frame lowering
+    // does: the final-stream frame net rejects a return through the link
+    // register the BL clobbered. The BL is therefore the second word.
+    let frame_record = |opcode: AArch64Opcode, offset: i64| {
+        MachInst::new(
+            opcode,
+            vec![
+                MachOperand::PReg(trust_cg_ir::regs::X29),
+                MachOperand::PReg(trust_cg_ir::regs::X30),
+                MachOperand::Special(trust_cg_ir::regs::SpecialReg::SP),
+                MachOperand::Imm(offset),
+            ],
+        )
+    };
+    for inst in [
+        frame_record(AArch64Opcode::StpPreIndex, -16),
+        MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol(symbol.to_string())],
+        ),
+        frame_record(AArch64Opcode::LdpPostIndex, 16),
+    ] {
+        let id = func.push_inst(inst);
+        func.append_inst(entry, id);
+    }
 
     // Signature returns [I64] -> the ABI return-register alias set is [X0].
     let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
@@ -66,7 +84,9 @@ fn explicit_extern_same_name_does_not_patch_bl_to_compiled_function_itself() {
         .get_fn_ptr_bound(symbol)
         .expect("compiled function remains publicly addressable")
         .as_ptr();
-    let bl_site = func_ptr;
+    // SAFETY: the compiled function's second word is the BL (after the
+    // frame-record save); both words lie inside the published code.
+    let bl_site = unsafe { func_ptr.add(4) };
     let bl_target = decode_aarch64_bl_target(bl_site);
 
     assert_ne!(

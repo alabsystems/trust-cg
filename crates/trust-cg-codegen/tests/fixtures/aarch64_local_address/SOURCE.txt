@@ -1,0 +1,32 @@
+Genuine regenerated Clean native99 layout_enum_300 input; no function/row removal.
+The earlier native99 temporary input was deleted and has no retained raw hash.
+This is the distinct automatically retained 2026-10-28 reproduction, not that file.
+
+Source program SHA256:
+560cba4922ee73af9b655562fefb92be632ec8fbdbae736b17bdceba3f5cf1ed
+Licensed full module SHA256:
+00b5ebde6bfe21b4cf7fab9a34b6ec473755c3ca79dce8078f95f8259e16339e
+Module bytes: 1010981
+Pre-license module digest:
+sha256:bc8ca9d6308b459026bda39b29cd45329a7a94502c20065b78763c804ce73ac0
+
+Clean source: 8ff377f00592b5bab7f54ab0a57e48591f4b0d6a
+Actual compiled Clean CLI SHA256:
+aaacbfadc6992797a193cdaf41cd4d063ec6789ea35a5c410bce542751b583dd
+Producer invocation: clean run layout_enum_300.lean --decl main --opt-level 0
+  --backend trust-cg --keep-temp --receipt <owned receipt>
+Actual old CG invocation:
+  trust-cg -c --target aarch64 --recognize-authority clean-compiler-unvalidated
+  --refuse-unlicensed -o <scratch>/module.o <scratch>/module.tmbc
+Old CG source: 7dc9b3ef35c17e7ae9e112865a4f7461c89dce94
+Old CG binary SHA256:
+c170e0f3fe6c95ecb315415aa318f1d8317f0bbbd2e1a5a18983318aea062c08
+Native original-case result: refused TCG-A64-BRANCH-RELAX in E.casesOn,
+  BCond BlockId(0), position607, following Adr.
+Direct immutable old-CG replay reproduced that refusal; post-hash unchanged.
+
+The complete module carries 8 clean-compiler-unvalidated bodies and 0 kernel-TV
+certified bodies. Explicitly recognizing that existing experimental authority
+does not grant a proof or binary claim; default recognition and unlicensed
+refusals remain tested separately. This fixture supplies native regression
+input, not source/byte/proof authority or whole native99 qualification.

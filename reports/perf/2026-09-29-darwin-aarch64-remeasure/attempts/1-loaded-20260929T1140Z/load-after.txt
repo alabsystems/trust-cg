@@ -1,0 +1,54 @@
+# load-after — 2026-09-29T11:44:02Z
+## uptime
+ 4:44  up 27 days,  8:57, 1 user, load averages: 19.74 11.38 9.95
+## sysctl vm.loadavg
+{ 19.74 11.38 9.95 }
+## top processes by CPU (top -l 2, second sample)
+PID    COMMAND          %CPU  TIME     MEM   
+18754  aterm_agent-8879 163.3 01:22.44 182M+ 
+543    mds              94.7  05:11:37 592M+ 
+18782  tippy-driver     87.2  00:40.47 6162M+
+814    mds_stores       85.4  06:59:55 232M+ 
+25893  trustc           76.4  00:22.98 3098M+
+0      kernel_task      59.4  33:13:24 83M+  
+48869  XprotectService  17.1  09:15:31 3984K 
+555    opendirectoryd   10.8  27:22.02 13M   
+553    contextstored    8.1   27:50.37 6689K 
+38923  mdworker_shared  7.6   00:00.41 2832K 
+38934  mdworker_shared  7.2   00:00.29 2832K 
+32815  mdworker_shared  7.0   00:01.15 2768K 
+38922  mdworker_shared  6.5   00:00.30 2816K 
+38935  mdworker_shared  6.2   00:00.28 2832K 
+43616  top              6.2   00:00.25 4400K+
+## memory (vm_stat)
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                    35597.
+Pages active:                                1400480.
+Pages inactive:                              1072354.
+Pages speculative:                            348632.
+Pages throttled:                                   0.
+Pages wired down:                             185600.
+Pages purgeable:                               18938.
+"Translation faults":                    17316429626.
+Pages copy-on-write:                       842027968.
+Pages zero filled:                        8688178497.
+Pages reactivated:                         399098031.
+Pages purged:                               92325381.
+File-backed pages:                           1710476.
+Anonymous pages:                             1110990.
+Pages stored in compressor:                   265067.
+Pages occupied by compressor:                  43184.
+Decompressions:                           1742334432.
+Compressions:                             1812294403.
+Pageins:                                   267652187.
+Pageouts:                                    1768416.
+Swapins:                                   747002195.
+Swapouts:                                  753536677.
+## power
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=34603107)	80%; AC attached; not charging present: true
+ powermode            0
+## thermal
+Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+Note: No CPU power status has been recorded

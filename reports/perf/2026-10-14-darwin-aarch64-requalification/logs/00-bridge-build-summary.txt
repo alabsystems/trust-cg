@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 5m 50s
+      351.34 real       751.03 user         9.25 sys
+          6669008896  maximum resident set size
+          7435051045  instructions retired
+exit=0
+2026-10-14T13:32:32Z
+ 6:32  up 42 days, 10:46, 1 user, load averages: 13.47 5.49 3.18
+warning: nested explicit-unverified Targo propagation is unavailable on this platform; the outer explicit command remains authorized, but recursive `$CARGO` invocations must select their own lane
+source HEAD at build: 2dde71362ed9 (backend inputs identical at efc47d3bc, which adds only benchmarks/ and scripts/tests/ files)

@@ -7,9 +7,6 @@
 // Part of #387 (proptest panic-fuzz) / Part of #372 (Crash-free codegen) /
 // Part of #450 (widen opcode coverage >= 80%).
 //
-// Reference: `designs/2026-04-18-crash-free-codegen-plan.md` §5 (proptest
-// as primary defense) and §6 (per-crate harness).
-//
 // Contract under test: for *any* `MachInst` value, `encode_instruction`
 // must either return `Ok(u32)` or `Err(EncodeError)` — it must NEVER
 // panic, abort, overflow (in debug), or trigger a slice-index panic. This
@@ -19,9 +16,9 @@
 // exhaustive over random-but-valid and random-malformed inputs.
 //
 // Run:
-//   cargo test -p trust-cg-codegen --test panic_fuzz_encode
+//   scripts/trust_cargo.sh test -p trust-cg-codegen --test panic_fuzz_encode
 // Increase case count via env:
-//   PROPTEST_CASES=100000 cargo test -p trust-cg-codegen --test panic_fuzz_encode
+//   PROPTEST_CASES=100000 scripts/trust_cargo.sh test -p trust-cg-codegen --test panic_fuzz_encode
 //
 // ---------------------------------------------------------------------------
 // Coverage (#450)
@@ -268,7 +265,9 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         Just(SubsRR),
         Just(SubsRI),
         Just(Adc),
+        Just(Adcs),
         Just(Sbc),
+        Just(Sbcs),
         Just(Umulh),
         Just(Smulh),
         Just(Madd),
@@ -289,6 +288,7 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         Just(FmaddRR),
         Just(FminnmRR),
         Just(FmaxnmRR),
+        Just(FrintnRR),
         Just(FrintmRR),
         Just(FrintpRR),
         Just(FrintzRR),
@@ -371,6 +371,10 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         Just(Mrs),
         Just(TailCall),
         Just(AlignNop),
+        Just(TlsDescCall),
+        Just(LdrTlsdesc),
+        Just(AddTlsdescLo12),
+        Just(BlrTlsdesc),
     ];
     let llvm_aliases = prop_oneof![
         Just(MOVWrr),
@@ -388,6 +392,48 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         Just(MOVZWi),
         Just(MOVZXi),
         Just(Bcc),
+    ];
+    // Baseline LL/SC exclusives, CLREX and the opaque LL/SC pseudos (the
+    // pseudos never encode; they must return a typed error, not panic).
+    let llsc = prop_oneof![
+        Just(Ldxr),
+        Just(Ldxrb),
+        Just(Ldxrh),
+        Just(Ldaxrb),
+        Just(Ldaxrh),
+        Just(Stxr),
+        Just(Stxrb),
+        Just(Stxrh),
+        Just(Stlxrb),
+        Just(Stlxrh),
+        Just(Ldxp),
+        Just(Ldaxp),
+        Just(Stxp),
+        Just(Stlxp),
+        Just(Clrex),
+        Just(LlscRmw8),
+        Just(LlscRmw16),
+        Just(LlscRmw32),
+        Just(LlscRmw64),
+        Just(LlscCmpSwap8),
+        Just(LlscCmpSwap16),
+        Just(LlscCmpSwap32),
+        Just(LlscCmpSwap64),
+        Just(LlscLoad128),
+        Just(LlscStore128),
+        Just(LlscRmw128),
+        Just(LlscCmpSwap128),
+    ];
+    // FEAT_CRC32 checksum steps (selected only under a function's `crc`).
+    let crc32 = prop_oneof![
+        Just(Crc32B),
+        Just(Crc32H),
+        Just(Crc32W),
+        Just(Crc32X),
+        Just(Crc32Cb),
+        Just(Crc32Ch),
+        Just(Crc32Cw),
+        Just(Crc32Cx),
     ];
     let pseudos = prop_oneof![Just(Phi), Just(StackAlloc), Just(Copy), Just(Nop),];
     prop_oneof![
@@ -410,6 +456,8 @@ fn opcode_strategy() -> impl Strategy<Value = AArch64Opcode> {
         atomic_release,
         trap_rc_sysreg,
         llvm_aliases,
+        llsc,
+        crc32,
         pseudos,
     ]
 }
@@ -547,7 +595,9 @@ fn strat_arith_rr() -> impl Strategy<Value = OpPair> {
             Just(AddsRR),
             Just(SubsRR),
             Just(Adc),
+            Just(Adcs),
             Just(Sbc),
+            Just(Sbcs),
             Just(Umulh),
             Just(Smulh),
             Just(Smull),
@@ -1450,6 +1500,61 @@ fn strat_atomic_stlxr() -> impl Strategy<Value = OpPair> {
     })
 }
 
+fn strat_llsc_exclusive() -> impl Strategy<Value = OpPair> {
+    use AArch64Opcode::*;
+    // Single-register LL/SC exclusives: loads [Rt, Rn], stores [Ws, Rt, Rn];
+    // pair exclusives: loads [Xt1, Xt2, Xn], stores [Ws, Xt1, Xt2, Xn];
+    // CLREX takes no operands. Overlapping registers must be a typed error.
+    let single = (
+        prop_oneof![
+            Just(Ldxr),
+            Just(Ldxrb),
+            Just(Ldxrh),
+            Just(Ldaxrb),
+            Just(Ldaxrh),
+            Just(Stxr),
+            Just(Stxrb),
+            Just(Stxrh),
+            Just(Stlxrb),
+            Just(Stlxrh),
+        ],
+        gpr32_strategy(),
+        prop_oneof![gpr_strategy(), gpr32_strategy()],
+        gpr_strategy(),
+    )
+        .prop_map(|(op, ws, rt, rn)| {
+            let operands = if trust_cg_ir::llsc::is_exclusive_store(op) {
+                vec![
+                    MachOperand::PReg(ws),
+                    MachOperand::PReg(rt),
+                    MachOperand::PReg(rn),
+                ]
+            } else {
+                vec![MachOperand::PReg(rt), MachOperand::PReg(rn)]
+            };
+            (op, operands)
+        });
+    let pair = (
+        prop_oneof![Just(Ldxp), Just(Ldaxp), Just(Stxp), Just(Stlxp)],
+        gpr32_strategy(),
+        gpr_strategy(),
+        gpr_strategy(),
+        gpr_strategy(),
+    )
+        .prop_map(|(op, ws, rt, rt2, rn)| {
+            let mut operands = vec![
+                MachOperand::PReg(rt),
+                MachOperand::PReg(rt2),
+                MachOperand::PReg(rn),
+            ];
+            if trust_cg_ir::llsc::is_exclusive_store(op) {
+                operands.insert(0, MachOperand::PReg(ws));
+            }
+            (op, operands)
+        });
+    prop_oneof![single, pair, Just((Clrex, vec![]))]
+}
+
 fn strat_atomic_lse_rmw() -> impl Strategy<Value = OpPair> {
     use AArch64Opcode::*;
     // LDADD/LDCLR/LDEOR/LDSET/SWP/CAS family: [Rs, Rt, Rn].
@@ -1670,6 +1775,7 @@ fn valid_machinst_strategy() -> impl Strategy<Value = MachInst> {
         strat_atomic_load_acquire().boxed(),
         strat_atomic_store_release().boxed(),
         strat_atomic_stlxr().boxed(),
+        strat_llsc_exclusive().boxed(),
         strat_atomic_lse_rmw().boxed(),
         strat_barrier().boxed(),
         strat_address().boxed(),
@@ -1720,12 +1826,48 @@ fn assert_no_panic(inst: &MachInst) {
     }
 }
 
+/// The case count every property in this file runs: PROPTEST_CASES, else 256.
+fn panic_fuzz_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Positive control for the case count, as in `panic_fuzz_lower.rs`: a
+/// property with this file's case configuration counts the cases it actually
+/// ran and prints both figures on one line. The Linux floor requires the
+/// line with this file's default and the fuzz lane with its
+/// `--proptest-cases`, so a case count shrunk behind their back fails them.
+#[test]
+fn panic_fuzz_runs_its_configured_case_count() {
+    let configured = panic_fuzz_cases();
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: configured,
+        ..ProptestConfig::default()
+    });
+    let run = std::cell::Cell::new(0u32);
+    runner
+        .run(&any::<u64>(), |_| {
+            run.set(run.get() + 1);
+            Ok(())
+        })
+        .expect("the counting property cannot fail");
+    println!(
+        "panic-fuzz proptest cases: configured={configured} run={}",
+        run.get()
+    );
+    assert!(run.get() > 0, "no proptest case ran");
+    assert_eq!(
+        run.get(),
+        configured,
+        "proptest ran a different number of cases"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
+        cases: panic_fuzz_cases(),
         max_shrink_iters: 500,
         .. ProptestConfig::default()
     })]

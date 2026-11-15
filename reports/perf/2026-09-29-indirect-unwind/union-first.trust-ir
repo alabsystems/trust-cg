@@ -1,0 +1,102 @@
+; TrustIr text format v1
+; #lossy: entry-block(fn 0), function-id(position 1 id 2), function-id(position 2 id 3), function-id(position 3 id 4), function-id(position 4 id 5), function-id(position 5 id 6), function-id(position 6 id 7)
+module "check_union"
+target "aarch64-unknown-linux-gnu" 8 little
+
+functy.0 = (ptr, u64) -> (u64)
+
+functy.1 = () -> ()
+
+functy.2 = (&mut u64, u64) -> (u64)
+
+functy.3 = (functy.2, &mut u64, u64) -> (u64)
+
+functy.4 = (u64, u64) -> ()
+
+functy.5 = (&mut u64) -> (u64)
+
+functy.6 = (&mut *const u64) -> ()
+
+functy.7 = () -> ()
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @check_union(functy.0) {
+bb9:
+    br bb1
+bb0(%1: ptr, %2: u64):
+    %13 = alloca [ty.3 x 1], align 8
+    %14 = alloca u64
+    %15 = alloca i64, align 8
+    %17 = const u64 85
+    %16 = xor u64 %2, %17
+    store u64 %16, ptr %14
+    %18 = ptrtoptr ptr %14 to *const u64
+    %19 = copy *const u64 %18
+    %20 = copy &mut u64 %14
+    %21 = reify_fn_pointer ptr %1 to functy.2
+    %22 = invoke @func.3(%21, %20, %2) to bb9() unwind bb5
+bb1:
+    %23 = load u64, ptr %14
+    %24 = load u64, ptr %14
+    %25 = const u64 2
+    call @func.4(%25, %24)
+    br bb2
+bb2:
+    %26 = ptrtoptr ptr %13 to &mut u64
+    %27 = invoke @func.5(%26) to bb3() unwind bb5
+bb3:
+    %28 = load u64, ptr %14
+    %29 = load u64, ptr %14
+    %30 = xor u64 %27, %29
+    %31 = alloca (*const u64)
+    %32 = insertfield (*const u64) %31, 0, %19
+    call @func.6(%31)
+    br bb4
+bb4:
+    ret %30
+bb5:
+    %33, %34 = landingpad cleanup
+    store i64 %33, ptr %15
+    br bb8
+bb8:
+    %35 = alloca (*const u64)
+    %36 = insertfield (*const u64) %35, 0, %19
+    invoke @func.6(%35) to bb6() unwind bb10
+bb10:
+    %37, %38 = landingpad cleanup
+    call @func.7()
+    unreachable
+bb6:
+    %39 = load i64, ptr %15
+    resume %39
+}
+
+fn @rust_eh_personality(functy.1) {
+}
+
+internal fn @trustcg.indirect_unwind.check_union.2(functy.3) {
+bb0(%0: functy.2, %1: &mut u64, %2: u64):
+    %3 = call_indirect %0(functy.2)(%1, %2)
+    ret %3
+}
+
+fn @aggregate_event(functy.4) {
+}
+
+fn @aggregate_read_union(functy.5) {
+}
+
+fn @_RINvNtCsfsP382UbnKb_4core3ptr9drop_glueNtCsa4B9rCJltzw_16aggregate_corpus5GuardEBD_(functy.6) {
+}
+
+fn @_RNvNtCsfsP382UbnKb_4core9panicking16panic_in_cleanup(functy.7) {
+}

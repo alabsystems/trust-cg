@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // crates/rustc-codegen-trust-cg/tests/bridge_differential_x86.rs
 //
@@ -10,8 +14,8 @@ mod target_dir_support;
 // License: Apache-2.0
 //
 // This is the out-of-workspace half of the P2 harness. It compiles each corpus
-// program TWICE — once with stock rustc/LLVM (the ORACLE), once with the trust-cg
-// codegen backend (`-Zcodegen-backend=<librustc_codegen_trust_cg.dylib>`) — runs
+// program TWICE — once with trustc's own LLVM backend (the ORACLE), once with the
+// trust-cg codegen backend (`-Zcodegen-backend=<backend library>`) — runs
 // both binaries, captures exit-code / stdout / trap-vs-value, and diffs them.
 //
 // WHY THIS, NOT `trust-cg-fuzz/src/jit_diff.rs`:
@@ -19,10 +23,11 @@ mod target_dir_support;
 //   MIR->trust-ir adapter. The bridge bug classes (#54/#55/#56/#69/#71/#72,
 //   &mut-to-join-local) live IN that adapter, so they appear identically in the
 //   interpreter oracle and the JIT test side and cancel out. The only oracle that
-//   does NOT pass through trust-cg is stock LLVM — which is what this driver uses.
+//   does NOT pass through trust-cg is LLVM — the build compiler's (trustc's) own
+//   LLVM backend, which is what this driver uses.
 //
-// This file lives in the bridge crate (its own workspace, pinned nightly with
-// `rustc_private`), NOT in `trust-cg-fuzz`, because actually invoking the bridge
+// This file lives in the bridge crate (its own workspace, pinned to the Trust
+// toolchain with `rustc_private`), NOT in `trust-cg-fuzz`, because actually invoking the bridge
 // requires the `target-bridge` toolchain. It re-derives a minimal outcome model +
 // diff engine inline (mirroring `trust_cg_fuzz::bridge_diff`) because the bridge
 // crate cannot depend on the workspace fuzz crate; the AUTHORITATIVE, unit-tested
@@ -32,12 +37,12 @@ mod target_dir_support;
 //
 // Run (requires target-bridge + x86_64-apple-darwin std, x86_64 host):
 //     cd crates/rustc-codegen-trust-cg
-//     cargo +nightly-2026-04-20 test --release --test bridge_differential_x86 -- --nocapture
+//     targo --unverified test --release --locked --test bridge_differential_x86 -- --nocapture
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 // Pin the macOS deployment target for BOTH the rustc-oracle and the trust-cg
 // compile, and for the `cc` link, so the produced object's `LC_BUILD_VERSION`
@@ -72,7 +77,10 @@ enum DiffVerdict {
     Agree,
     TrustCgFailedClosed(String),
     ReferenceCompileError(String),
-    Divergence { kind: DivergenceKind, detail: String },
+    Divergence {
+        kind: DivergenceKind,
+        detail: String,
+    },
 }
 
 /// Identical contract to `trust_cg_fuzz::bridge_diff::diff_outcomes`.
@@ -85,8 +93,14 @@ fn diff_outcomes(reference: &RunOutcome, test: &RunOutcome) -> DiffVerdict {
     }
     match (reference, test) {
         (
-            RunOutcome::Exited { code: rc, stdout: rs },
-            RunOutcome::Exited { code: tc, stdout: ts },
+            RunOutcome::Exited {
+                code: rc,
+                stdout: rs,
+            },
+            RunOutcome::Exited {
+                code: tc,
+                stdout: ts,
+            },
         ) => {
             if rc == tc && rs == ts {
                 DiffVerdict::Agree
@@ -129,66 +143,12 @@ fn diff_outcomes(reference: &RunOutcome, test: &RunOutcome) -> DiffVerdict {
 // Toolchain / dylib plumbing (mirror of the established x86 bridge tests)
 // ---------------------------------------------------------------------------
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run bridge differential");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -202,7 +162,8 @@ fn workdir(stem: &str) -> PathBuf {
     dir
 }
 
-/// `abort()` stubs for undefined `panic*` symbols so the object links standalone
+/// `abort()` stubs for `core`'s undefined diverging helpers (`panic*`, `*_fail`) so
+/// the object links standalone
 /// (the corpus inputs are chosen so these checks never fire). Mirrors
 /// `m51_signed_narrow_x86.rs::write_panic_stubs`.
 fn write_panic_stubs(dir: &Path, obj: &Path) -> PathBuf {
@@ -210,7 +171,7 @@ fn write_panic_stubs(dir: &Path, obj: &Path) -> PathBuf {
     let mut stubs = String::from("#include <stdlib.h>\n");
     for line in String::from_utf8_lossy(&nm.stdout).lines() {
         let sym = line.trim().trim_start_matches('U').trim();
-        if sym.contains("panic") {
+        if toolchain_support::is_abort_stub_symbol(sym) {
             let c = sym.strip_prefix('_').unwrap_or(sym);
             stubs.push_str(&format!(
                 "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -231,15 +192,60 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> R
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
+    // A STD program (no `#![no_main]`: a `fn main` that prints) cannot be
+    // linked standalone from its object — `std::rt::lang_start` and
+    // `std::io::_print` live in the precompiled `std`. Build it as an ordinary
+    // binary instead and run that; the comparison (exit code + stdout) is the
+    // same. Three corpus rows are such programs.
+    if !src.contains("#![no_main]") {
+        let bin = dir.join("bin");
+        let mut cmd = toolchain_support::rustc_command();
+        cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
+        cmd.arg("--crate-type").arg("bin");
+        if let Some(dylib) = dylib {
+            let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
+            backend_arg.push(dylib);
+            cmd.arg(&backend_arg);
+        }
+        cmd.args([
+            "--target",
+            TARGET,
+            "-Cpanic=abort",
+            "-Coverflow-checks=off",
+            "-Ccodegen-units=1",
+        ])
+        .arg(format!("-Copt-level={opt}"))
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src_path);
+        let output = cmd.output().expect("failed to spawn trustc");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_dir_all(&dir);
+            return RunOutcome::CompileError {
+                stderr_tail: stderr.lines().rev().take(8).collect::<Vec<_>>().join(" | "),
+            };
+        }
+        let run = Command::new(&bin).output().expect("run compiled binary");
+        let _ = std::fs::remove_dir_all(&dir);
+        return match run.status.code() {
+            Some(code) => RunOutcome::Exited {
+                code,
+                stdout: run.stdout,
+            },
+            None => RunOutcome::Signalled {
+                signal: signal_of(&run.status),
+            },
+        };
+    }
+
+    let mut cmd = toolchain_support::rustc_command();
     // Pin the deployment target for BOTH backends (this function is the single
     // rustc shell-out used for the oracle and the trust-cg side): the emitted
     // object's mach-o build-version minos is set from this env, so both sides
     // produce a 13.0 floor and link identically on a 13.x host.
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
@@ -258,11 +264,11 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> R
         "-Ccodegen-units=1",
     ])
     .arg(format!("-Copt-level={opt}"))
-        .arg("--emit=obj")
-        .arg("--out-dir")
-        .arg(&dir)
-        .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    .arg("--emit=obj")
+    .arg("--out-dir")
+    .arg(&dir)
+    .arg(&src_path);
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_dir_all(&dir);
@@ -288,7 +294,9 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> R
     // authoritative floor passed straight through cc to ld. The C stub is also
     // compiled by this same cc invocation, so it picks up the same floor.
     link.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET)
-        .arg(format!("-mmacosx-version-min={MACOS_DEPLOYMENT_TARGET}"));
+        .args(host_target_support::deployment_min_flags(
+            MACOS_DEPLOYMENT_TARGET,
+        ));
     link.arg("-o").arg(&bin);
     for obj in &objs {
         link.arg(obj);
@@ -405,6 +413,113 @@ fn corpus() -> Vec<Case> {
                       fail-closed on the non-scalar (i32,bool) temp); O2/O3 admitted by proof, \
                       O0 non-inlined overflowing_add call fails closed (safe)",
             src: include_str!("bridge_corpus/ovf_tuple_loop.rs"),
+        },
+        Case {
+            name: "stale_celled_entry_arg",
+            bug_ref: "an ENTRY ARGUMENT written through an escaped `&mut` \
+                      (`*identity(&mut p) = q; p.b`): every read must load its cell (was a \
+                      SILENT wrong value at O0 — the incoming parameter, 20 vs 40)",
+            src: include_str!("bridge_corpus/stale_celled_entry_arg.rs"),
+        },
+        Case {
+            name: "stale_celled_local_copy",
+            bug_ref: "a celled local / scalar entry argument written through an escaped \
+                      `&mut`, then read (the companion shapes that failed closed before)",
+            src: include_str!("bridge_corpus/stale_celled_local_copy.rs"),
+        },
+        Case {
+            name: "partial_eightbyte_blackbox",
+            bug_ref: "3/5/6/7/11-byte arrays round-tripped through `black_box`: the lane \
+                      assembly must zero-extend byte/word pieces and the call result must be \
+                      stored width-exactly (was garbage at O0 for 3 and 7 bytes)",
+            src: include_str!("bridge_corpus/partial_eightbyte_blackbox.rs"),
+        },
+        Case {
+            name: "cma_u128_fallback",
+            bug_ref: "`u128::carrying_mul_add` calls the intrinsic's fallback body (was \
+                      `carrying_mul_add width 128 is not modeled`); narrower unsigned \
+                      widths stay inline",
+            src: include_str!("bridge_corpus/cma_u128_fallback.rs"),
+        },
+        Case {
+            name: "cma_signed_fallback",
+            bug_ref: "signed `carrying_mul_add` (i128/i64/i32 MIN/MAX corners) through the \
+                      fallback body",
+            src: include_str!("bridge_corpus/cma_signed_fallback.rs"),
+        },
+        Case {
+            name: "opt_u128_pair_args",
+            bug_ref: "by-value `Option<u128>` / `Option<i128>` / `(u128, bool)` / \
+                      `(u64, u128)` arguments on the x86-64 Pair lane with I128 scalars, \
+                      incl. register exhaustion (was [TCG-ARG-ABI])",
+            src: include_str!("bridge_corpus/opt_u128_pair_args.rs"),
+        },
+        Case {
+            name: "fn_item_shim_aggregate_arg",
+            bug_ref: "a fn-ITEM `FnPtrShim` whose tupled argument is a by-value aggregate \
+                      (`Option::map(Map::into_inner)`; was `Place projection field 0 \
+                      before aggregate binding`)",
+            src: include_str!("bridge_corpus/fn_item_shim_aggregate_arg.rs"),
+        },
+        Case {
+            name: "aggregate_ref_stored_as_value",
+            bug_ref: "a bare `&agg` stored as a value into a closure / ADT / tuple / \
+                      `Option<&T>` (`wtf8::EncodeWide::next`; was `borrowed aggregate \
+                      reference used without deref`)",
+            src: include_str!("bridge_corpus/aggregate_ref_stored_as_value.rs"),
+        },
+        Case {
+            name: "nonnull_str_field_through_ref",
+            bug_ref: "scalar fields read through `&S` where S's first field is `NonNull<str>` \
+                      (core::panic::Location): the pointee tuple collapsed the 16-byte field \
+                      to one lane (was a SILENT wrong value: 133/118 vs 68)",
+            src: include_str!("bridge_corpus/nonnull_str_field_through_ref.rs"),
+        },
+        Case {
+            name: "panic_location_unwrap",
+            bug_ref: "the location a synthesized panic reports (`Option::unwrap` on None): \
+                      the raise now asks rustc's caller-location walk \
+                      (`caller_location_value_for`) instead of passing a raw span \
+                      (was the callee's own line in core/option.rs)",
+            src: include_str!("bridge_corpus/panic_location_unwrap.rs"),
+        },
+        Case {
+            name: "ssa071_celled_return_place",
+            bug_ref: "a CELLED return place (`&_0` into a ref-returning callee: core \
+                      `io::error::repr::Repr::new_custom`, u64 newtype, bool, u128): Return \
+                      must load the cell (was [TCG-SSA-071] `ValueId(0)` never defined)",
+            src: include_str!("bridge_corpus/ssa071_celled_return_place.rs"),
+        },
+        Case {
+            name: "celled_index_arg_custom_mir",
+            bug_ref: "a CELLED entry-argument index (`p = &raw const i; i = 5; (*a)[i]`): \
+                      the Index readers read the INCOMING parameter (a silent wrong value, \
+                      LLVM 17 vs 5); a celled index is now loaded from its cell",
+            src: include_str!("bridge_corpus/celled_index_arg_custom_mir.rs"),
+        },
+        Case {
+            name: "celled_index_local_custom_mir",
+            bug_ref: "a CELLED non-argument index local: the Index readers read the \
+                      never-defined `ValueId(local)` ([TCG-SSA-071] fail closed); a celled \
+                      index is now loaded from its cell",
+            src: include_str!("bridge_corpus/celled_index_local_custom_mir.rs"),
+        },
+        Case {
+            name: "celled_index_readers_custom_mir",
+            bug_ref: "a CELLED entry-argument index through EVERY Index reader (array \
+                      through a reference, memory-backed local array, slice read, slice \
+                      store, `&(*s)[i]` borrow, `&[&dyn Tr]` element, const slice): each \
+                      read the stale incoming index (checksum 198 vs LLVM 19)",
+            src: include_str!("bridge_corpus/celled_index_readers_custom_mir.rs"),
+        },
+        Case {
+            name: "ssa071_cell_retry_loops",
+            bug_ref: "SSA-071 cell retry: core `overflowing_pow` (u64/u128/i128 — the \
+                      in-loop join param hides `overflow`'s derivation), `maximal_suffix` \
+                      (`left = right` rotation + `period = right - left`), a \
+                      diamond-then-combine accumulator; the VC declines, the flagged slots \
+                      are re-lowered in memory cells and every gate re-runs",
+            src: include_str!("bridge_corpus/ssa071_cell_retry_loops.rs"),
         },
         Case {
             name: "niche_nested_enum",
@@ -683,27 +798,12 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             name: "const_bounds_check_elim",
-            bug_ref: "OPT-6a: a CONSTANT-index, CONSTANT-length array bounds check is routed \
-                      into the verified Certified-Elimination Kernel (bridge emits a \
-                      GuardBoundsCheck probe + ay-discharged module obligation via \
-                      try_lower_bounds_check_as_verified_guard); the kernel deletes it, or with \
-                      no solver / TCG_REFINE_SOLVER=0 it silently stays the legacy compare+branch. \
-                      Every access is strictly in bounds so the observable result MUST equal LLVM \
-                      whether or not the probe fires; dynamic-index (a[j]) stays the unchanged \
-                      legacy path. O0/O2/O3",
+            bug_ref: "Constant-index bounds checks retain the original MIR condition as a runtime assertion. In-bounds execution must equal LLVM at O0/O2/O3.",
             src: include_str!("bridge_corpus/const_bounds_check_elim.rs"),
         },
         Case {
             name: "dom_bounds_check_elim",
-            bug_ref: "OPT-6b: RUNTIME-index bounds checks dominated by a loop-guard compare \
-                      (`while q < 64 { comp[q] = ..; q += p; }` — the sieve marking-loop shape, \
-                      plus a `<=`-guard at-boundary write touching the LAST valid index) are \
-                      routed into the verified Certified-Elimination Kernel: the bridge proves \
-                      the per-instance implication (idx <op> K) => (idx <u len) through the ay \
-                      lane and only a genuine Verified verdict licenses the deletion \
-                      (try_lower_bounds_check_as_dominated_verified_guard). Every access is in \
-                      bounds so the result MUST equal LLVM whether the probe fires (solver on) \
-                      or not (TCG_REFINE_SOLVER=0). O0/O2/O3",
+            bug_ref: "Runtime-index accesses dominated by loop guards retain their bounds assertions. Marking loops and the last valid index must equal LLVM at O0/O2/O3.",
             src: include_str!("bridge_corpus/dom_bounds_check_elim.rs"),
         },
         Case {
@@ -1094,9 +1194,10 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             name: "float_to_int_unchecked",
-            bug_ref: "float_to_int_unchecked uses non-saturating FPToSI/FPToUI on its \
-                      defined in-range domain; f32/f64 to narrow/wide signed/unsigned \
-                      integers, with fractional truncation; UB inputs intentionally absent",
+            bug_ref: "float_to_int_unchecked lowers to the saturating FPToSISat/FPToUISat, \
+                      which equal it on its defined domain; f32/f64 to narrow/wide \
+                      signed/unsigned integers, with fractional truncation; UB inputs \
+                      intentionally absent",
             src: include_str!("bridge_corpus/float_to_int_unchecked.rs"),
         },
         Case {
@@ -1200,6 +1301,311 @@ fn corpus() -> Vec<Case> {
                       u16/i32/u64 sign bits through the I64 helper lane. ==LLVM O0/O2/O3.",
             src: include_str!("bridge_corpus/array_repeat_fill.rs"),
         },
+        Case {
+            name: "fix_thin_raw_ptr_metadata",
+            bug_ref: "THIN-pointer metadata is the ZST `()`: `PtrMetadata(*const T)` for \
+                      `T: Sized` produces no bits and `from_raw_parts_mut(data, ())` IS the \
+                      data pointer. Both were `library/core` roots at O0 (\"pointer metadata \
+                      unsupported operand type *const ()\" / \"AggregateKind::RawPtr\"): the \
+                      first died in the slice-LENGTH resolver, the second in the generic \
+                      RawPtr refusal. The FAT case (a real `meta` length) keeps its \
+                      `{data,len}` slot path and is untouched. Prints 7 + 9 == 16, so a \
+                      rebuilt pointer aimed at the wrong object cannot read as a pass",
+            src: include_str!("bridge_corpus/fix_thin_raw_ptr_metadata.rs"),
+        },
+        Case {
+            name: "fix_refret_cell_nonprimitive",
+            bug_ref: "reference-RETURNING callee over a NON-PRIMITIVE scalar referent: \
+                      without a real address the `&mut` reaches the callee as a materialized \
+                      temp, so the `&mut` it returns addresses a DEAD temp and `*r = ..` is \
+                      dropped. `direct_scalar_ref_select_return` refused it by name (6 + 2 \
+                      `library/core` roots); the cure is the ADDRESS — the reference-escaping \
+                      arm of `compute_scalar_cell_locals` now cells every referent the memory \
+                      model can represent, not only Int/Uint/Float/Bool/Char. A guard-only \
+                      'fix' compiles this and prints the STALE 7 instead of 99. CONTROL: \
+                      bridge_corpus/fix_ctl_refret_vec_intercepted.rs must still fail closed",
+            src: include_str!("bridge_corpus/fix_refret_cell_nonprimitive.rs"),
+        },
+        Case {
+            name: "fix_o_identity_nonlocal_callee",
+            bug_ref: "the same dead-temp hazard through a NON-LOCAL callee \
+                      (`core::convert::identity::<&mut Cur>`), which \
+                      `direct_scalar_ref_select_return` never inspects: with the \
+                      pre-widening primitive-only narrowing of \
+                      `cellable_reference_referent_ty` restored, O0 COMPILES and prints \
+                      the stale `seen=5`, exit 1 (measured) — no refusal exists to catch \
+                      it, unlike the LOCAL-callee twin fix_refret_cell_nonprimitive",
+            src: include_str!("bridge_corpus/fix_o_identity_nonlocal_callee.rs"),
+        },
+        Case {
+            name: "fix_o_nonnull_as_mut_scalarized_temp",
+            bug_ref: "the `IterMut::next` shape: a SCALARIZED `NonNull<u64>` temp borrowed \
+                      into a local `&mut NonNull<u64> -> &mut u64` callee that returns the \
+                      address the NonNull HOLDS; the referent is celled by the widened \
+                      reference-escaping arm. a=42 b=100 s=142",
+            src: include_str!("bridge_corpus/fix_o_nonnull_as_mut_scalarized_temp.rs"),
+        },
+        Case {
+            name: "fix_o_wrapping_and_rawptr_referents",
+            bug_ref: "`Wrapping<u32>` and `*mut u64` referents through local \
+                      `&mut`-returning callees; a new pointer stored through the returned \
+                      `&mut *mut u64` must re-aim `p` (a lost store would print a=41 b=2). \
+                      w=42 a=1 b=42",
+            src: include_str!("bridge_corpus/fix_o_wrapping_and_rawptr_referents.rs"),
+        },
+        Case {
+            name: "fix_o_box_referent_probe",
+            bug_ref: "PROBE: a `Box<u32>` referent through a local `&mut Box<u32>`-returning \
+                      callee; refused by name today ([TCG-SCALAR-CELL-LAYOUT]), and if it \
+                      ever compiles it must print seen=9",
+            src: include_str!("bridge_corpus/fix_o_box_referent_probe.rs"),
+        },
+        Case {
+            name: "fix_o_ref_of_ref_referent_probe",
+            bug_ref: "PROBE: a `&u32` referent (whose own referent is a scalarized local) \
+                      through a local `&mut &u32`-returning callee — the partial-chain-cell \
+                      miscompile shape; refused by name today, and if it ever compiles it \
+                      must print seen=9, never the stale 5",
+            src: include_str!("bridge_corpus/fix_o_ref_of_ref_referent_probe.rs"),
+        },
+        Case {
+            name: "fix_u128_leading_ones_pow2",
+            bug_ref: "`u128` leading_ones / trailing_ones / is_power_of_two — the three \
+                      bit-manipulation ops with no two-limb decomposition, and the reason \
+                      `<u128>::checked_pow` / `overflowing_pow` were `library/core` roots \
+                      (\"bitmanip op with width > 64 unsupported\"; checked_pow's \
+                      change-of-base fast path opens with `base.is_power_of_two()`). Same \
+                      limb arithmetic as the eight ops already decomposed. A wrong identity \
+                      returns a plausible small integer, so ten seeds (incl. the 2^64 \
+                      boundary, the top bit, all-ones and zero) fold into one checksum",
+            src: include_str!("bridge_corpus/fix_u128_leading_ones_pow2.rs"),
+        },
+        Case {
+            name: "pointee_lanes_tuple_nested",
+            bug_ref: "[TCG-POINTEE-LANES] tuple pointee with a NESTED struct / array field \
+                      (`&(Range, i16)`, `&(u16, [u16; 3])` — core's `unicode_data::conversions` \
+                      table elements; 10 `library/core` roots: `get_unchecked`, \
+                      `binary_search_by` closures, `lookup`). The flat scalar-field lane \
+                      fails on the aggregate field; the byte-offset lane now types the \
+                      pointee from rustc's layout (`memory_aggregate_reference_pointee_lane_ty` \
+                      tuple arm) and every `(*r).N` walks real offsets. A wrong field offset \
+                      or element stride changes the folded checksum",
+            src: include_str!("bridge_corpus/pointee_lanes_tuple_nested.rs"),
+        },
+        Case {
+            name: "pair_arg_lanes",
+            bug_ref: "[TCG-ARG-ABI] by-value `PassMode::Pair` ARGUMENTS (74 `library/core` \
+                      roots): `Option<u8>` through a closure body's `?`, `Option<u32>`, \
+                      `Range<u16>`, `(i16, i16)` after three scalars, a `{u32, u16}` \
+                      mixed-width struct, two pairs in one list and a pair through a \
+                      trait-object method. The declaration, the callee entry block and every \
+                      call site ask one `scalar_pair_param_plan`; the two lanes move through \
+                      the argument's slot at rustc's own offsets. A wrong lane offset, a \
+                      swapped lane or a dirty tag byte changes the folded checksum",
+            src: include_str!("bridge_corpus/pair_arg_lanes.rs"),
+        },
+        Case {
+            name: "union_fat_leaf",
+            bug_ref: "union with a FAT-POINTER leaf (`MaybeUninit<Part>`, `Part::Copy(&[u8])` — \
+                      core's `flt2dec` formatting buffer; 21 `library/core` roots): the union \
+                      slot layout carries the leaf flags instead of refusing, a whole union \
+                      element is stored through `&mut [MaybeUninit<Part>]` and into a local \
+                      array by a lane copy of the source slot, and `MaybeUninit::new` / \
+                      `assume_init` round-trip the 24-byte value. A torn `{data, len}`, a \
+                      wrong element stride or a lost tag changes the folded checksum",
+            src: include_str!("bridge_corpus/union_fat_leaf.rs"),
+        },
+        Case {
+            name: "small_classes_batch2",
+            bug_ref: "four small `library/core` refusal classes: `array::from_fn`'s \
+                      `try_from_fn::<NeverShortCircuit<T>, N, _>` (a `from_residual` over an \
+                      UNINHABITED residual, lowered as the unreachable rustc leaves there), \
+                      `AtomicPtr<T>::{store, load}` (an atomic over a pointer element), a \
+                      `const_eval_select` runtime arm taking a `&[u8]` argument PROJECTED out \
+                      of the tupled-args place, and a whole `Use` copy out of an address-taken \
+                      struct (leaves loaded from its slot at rustc's layout offsets). A wrong \
+                      leaf offset, a torn slice pair or a lost atomic store changes the \
+                      folded checksum",
+            src: include_str!("bridge_corpus/small_classes_batch2.rs"),
+        },
+        Case {
+            name: "closure_slice_arg",
+            bug_ref: "P0 (measured 2026-09-22): a closure whose parameter is a `&[u8]` / `&str` \
+                      fat pointer, called through `Fn::call` at O0 — the call site pushed ONE \
+                      8-byte value (the data-only `Ptr`) against the closure body's 16-byte \
+                      `{ data, len }` slot declaration, so the body read the pair out of the \
+                      slice's own bytes and SIGSEGV'd; the element is now passed as the \
+                      address of its pair inside the tupled-args slot, as a direct call does",
+            src: include_str!("bridge_corpus/closure_slice_arg.rs"),
+        },
+        Case {
+            name: "pointee_lanes_simd_overaligned",
+            bug_ref: "[TCG-POINTEE-LANES] over-aligned (32/64-byte) `#[repr(simd)]` / \
+                      `#[repr(C, align(N))]` struct pointee (core_arch `as_array`, 8 \
+                      `library/core` roots): `&Self` / `*const Self` typed as a 16-byte-lane \
+                      shell for the address-preserving cast to `&[T; N]`. Agrees with LLVM at \
+                      O2/O3; at O0 the fixture's `main` stops on a pre-existing `&*p` reborrow \
+                      shape (a refusal, reported as a note)",
+            src: include_str!("bridge_corpus/pointee_lanes_simd_overaligned.rs"),
+        },
+        Case {
+            name: "m143_nonnull_slice_boundary",
+            bug_ref: "[TCG-ARG-ABI]/[TCG-RET-ABI] x47: the transparent wide-slice newtype \
+                      (`NonNull<[T]>` / `NonNull<str>`) by value in a signature takes the \
+                      `&[T]` two-lane slot; at O0 this instantiates `NonNull::<[u8]>::{as_ptr, \
+                      cast, from_ref, from_mut}`, `NonNull::<str>::as_ptr`, `slice::Iter::<u8>::new` \
+                      and `IterMut::<u8>::new` as roots. A lost length lane, a data lane \
+                      read as a slot address or a wrong register pairing changes the sum",
+            src: include_str!("bridge_corpus/m143_nonnull_slice_boundary.rs"),
+        },
+        Case {
+            name: "nonnull_holder_field",
+            bug_ref: "review 2026-09-22 (predicted torn lane, measured whole): a struct \
+                      carrying a `NonNull<[u8]>` field built from a slotted parameter, read \
+                      back two-lane through `&Holder` and through a by-value field copy into \
+                      the return slot, stack poisoned before each call",
+            src: include_str!("bridge_corpus/nonnull_holder_field.rs"),
+        },
+        Case {
+            name: "pair_arg_exhaustion",
+            bug_ref: "cross-backend ABI (measured 2026-09-23): a `PassMode::Pair` argument \
+                      with exactly one integer register left — the bridge placed a 16-byte \
+                      two-INTEGER pair (slices, `&str`, `NonNull<[u8]>`, `(u64, u64)`, \
+                      `Range<usize>`, `Option<u64>`) as one all-or-nothing aggregate where \
+                      rustc places two independent scalars (R9 + stack). Every `Pair` now \
+                      rides the two-value lane on x86-64; this whole-program fixture pins \
+                      the bridge's own consistency across the shapes it now owns, plus \
+                      closure bodies, which keep the whole slot by structure",
+            src: include_str!("bridge_corpus/pair_arg_exhaustion.rs"),
+        },
+        Case {
+            name: "fix_return_celled_local",
+            bug_ref: "a CELLED return local. `&res` on the tail-returned local (NRVO makes \
+                      `res` BE `_0`) cells `_0` via the widened reference-escaping arm of \
+                      `compute_scalar_cell_locals`, so every whole-local write to `_0` \
+                      STORES into the cell instead of binding an SSA scalar — and \
+                      `TerminatorKind::Return` then asked `value_for_scalar_binding` for \
+                      `_0`, found nothing, and FABRICATED the never-defined synthetic \
+                      `ValueId(0)`: \"[TCG-SSA-071] value ValueId(0) used in bbN is never \
+                      defined\". That was `core::io::error::repr::Repr::new_custom`, the one \
+                      genuine capability LOSS of the reference-return cell widening. \
+                      CAPABILITY, not soundness: the definition was in the cell and the \
+                      return was not looking there, so the return LOADS it. Prints one \
+                      checksum folding the tag (survived the cell round trip), an \
+                      identity check against the original address (a garbage cell load \
+                      moves it) and the payload read through the recovered pointer",
+            src: include_str!("bridge_corpus/fix_return_celled_local.rs"),
+        },
+        Case {
+            name: "fix_q_control_flow_from_residual",
+            bug_ref: "`?` on a `ControlFlow` — the THIRD std `Try` type. `from_residual` \
+                      modeled only Result/Option, so every `ControlFlow` accumulator failed \
+                      closed (3 `library/core` roots, all `Iterator::try_fold`/`try_rfold` \
+                      monomorphizations). `ControlFlow`'s `FromResidual` is the IDENTITY \
+                      (`Break(b) => Break(b)`, no `From` anywhere), so the lowering is write \
+                      the `Break` tag + copy the `Break` payload. Covers a SCALAR payload \
+                      (memory slot), a ZST payload (tag-only enum) and an AGGREGATE payload \
+                      (multi-leaf copy), each with its CONTINUE path — a fix that wrote \
+                      `Break` unconditionally still prints plausible break values and is \
+                      caught only by the continue rows",
+            src: include_str!("bridge_corpus/fix_q_control_flow_from_residual.rs"),
+        },
+        Case {
+            name: "fix_q_agg_field_through_deref",
+            bug_ref: "a by-value AGGREGATE read straight out of `&self` — `_0 = copy \
+                      ((*_1).0: [u8; 4])`, i.e. `fn f(&self) -> [T; N] { self.field }`. The \
+                      projected-source arm admitted only a MEMORY-BACKED base, never a \
+                      `Deref`-leading chain through a thin reference, so the whole accessor \
+                      family stopped there (`Ipv4Addr::octets`, `Ipv6Addr::octets`, \
+                      `Ipv6Addr::segments` — 3 `library/core` roots) even though the address \
+                      arithmetic is identical. Fields carry distinct values at a NON-ZERO \
+                      offset so an offset-0 or wrong-field read is visible; the raw-pointer \
+                      base rides the same arm",
+            src: include_str!("bridge_corpus/fix_q_agg_field_through_deref.rs"),
+        },
+        Case {
+            name: "fix_q_slice_arg_from_struct_field",
+            bug_ref: "a `&[T]` call ARGUMENT that is a FIELD of an aggregate — `f(move \
+                      (_3.1: &[u8]))`, which is what `const_eval_select!`'s `@capture` tuple \
+                      produces (`slice::memchr::memchr_aligned` arg 1 and \
+                      `str::validations::run_utf8_validation` arg 0, 2 `library/core` roots). \
+                      A slice field of a memory-backed aggregate is ALREADY the two lanes \
+                      `{data @ off, len @ off+8}`, so the field's own address IS the \
+                      `{data,len}` slot the parameter ABI wants. Ordinary source spells this \
+                      with a temp at every opt level, so the fixture uses the intrinsic \
+                      directly. Both lanes are checked (length seeds and bounds the fold) \
+                      against the whole-local argument path on the same slices",
+            src: include_str!("bridge_corpus/fix_q_slice_arg_from_struct_field.rs"),
+        },
+        Case {
+            name: "fix_q_single_upvar_closure_leaf",
+            bug_ref: "a SINGLE-UPVAR closure IS its upvar and must map like one. The struct \
+                      arm of the type mapper collapses a single-scalar-leaf aggregate to that \
+                      leaf; the closure arm always built a tuple, so `FromFn<F>` mapped to \
+                      the upvar's scalar while the closure mapped to `Tuple([<that scalar>])` \
+                      — not a memory scalar — and every place-address walk bottoming out at \
+                      the closure field failed closed (3 `library/core` roots, all \
+                      `fmt::builders::from_fn::<closure>`). The collapse is gated on rustc's \
+                      OWN layout (one upvar, at offset 0, closure size == leaf size); the \
+                      TWO-upvar row is the CONTROL that the tuple mapping and its `(*env).N` \
+                      index scheme are untouched",
+            src: include_str!("bridge_corpus/fix_q_single_upvar_closure_leaf.rs"),
+        },
+        Case {
+            name: "indirect_arg_lanes",
+            bug_ref: "cross-backend ABI (measured 2026-09-27): rustc passes every sized \
+                      `Memory` argument larger than a pointer (`{u32, u32, u32}`, `[u32; 3]`, \
+                      `[u8; 16]`, 24/40-byte structs, a non-`ScalarPair` float struct, a \
+                      `Memory` enum, a capturing closure) as `PassMode::Indirect` — ONE \
+                      pointer to a caller-made copy — while the bridge passed the bytes \
+                      (register lanes <=16 bytes, a `byval` stack copy above): an LLVM caller \
+                      of a bridge callee SIGSEGV'd, the other direction read wrong values. \
+                      The indirect argument lane passes the pointer; this whole-program \
+                      fixture pins the bridge's own consistency across every call-site \
+                      family the lane owns (direct, register exhaustion, sret + indirect, a \
+                      mutating callee, recursion, closures, generic and `dyn` methods, fn \
+                      pointers, const / deref / scalarized operands)",
+            src: include_str!("bridge_corpus/indirect_arg_lanes.rs"),
+        },
+        Case {
+            name: "indirect_scalar_newtype_lanes",
+            bug_ref: "cross-backend ABI (measured 2026-09-28): an over-aligned single-scalar \
+                      newtype (`#[repr(C, align(16))] struct A16 { a: u64 }`, \
+                      `#[repr(align(128))] struct CP(u64)`) is ONE scalar to the bridge's type \
+                      mapper but a padded `Memory` value rustc passes as `PassMode::Indirect`; \
+                      the bridge used the pointer register as the value (LLVM rlib + bridge bin \
+                      SIGSEGV). The scalar sub-lane passes a fresh padded copy; this \
+                      whole-program fixture pins the bridge's own consistency across direct, \
+                      exhaustion, a mutating callee, recursion, `dyn` / generic methods, fn \
+                      pointers, the closure lane, const operands and an alignment above the \
+                      stack's",
+            src: include_str!("bridge_corpus/indirect_scalar_newtype_lanes.rs"),
+        },
+        Case {
+            name: "padded_scalar_home_alignment",
+            bug_ref: "over-aligned scalar HOMES (measured 2026-09-28): an over-aligned \
+                      single-scalar newtype (`A16`, `CP` at align 128, `A8(u8)`) is ONE scalar \
+                      to the bridge, and every stack home it got — the temporary behind a \
+                      `&a` call argument, a raw-borrowed or closure-captured local's cell, a \
+                      `&dyn` data pointer, a `&mut` temporary — was an `Alloca` of the scalar, \
+                      so a `&A16` rustc promises 16-aligned was 8 mod 16 (O0 aborted on the \
+                      `&*p` alignment check, O2 / O3 exited 70 against 147; an LLVM `-O2` \
+                      callee loading the promised 16 bytes SIGSEGV'd). Each home now has \
+                      rustc's extent and alignment",
+            src: include_str!("bridge_corpus/padded_scalar_home_alignment.rs"),
+        },
+        Case {
+            name: "entry_ref_field_address",
+            bug_ref: "a field reference through a thin entry `&self` stored into a CELL \
+                      (derived `Debug`'s `&&self.last_field`, unsized to `&dyn`): the x86-64 \
+                      macOS bridge refused a raw-pointer / newtype / tuple field with `Place \
+                      deref memory store from Rvalue::Ref (projected source's base is not a \
+                      reference to a memory-eligible aggregate)` (`<VaListInner as \
+                      Debug>::fmt`, the one `library/core` lowering root at O0) and a \
+                      nested-struct field with `Ty::Adt multi-field struct`; the cell now \
+                      holds `arg + layout offset`, read and written back through it",
+            src: include_str!("bridge_corpus/entry_ref_field_address.rs"),
+        },
     ]
 }
 
@@ -1265,6 +1671,227 @@ fn bridge_corpus_matches_llvm_across_opt_levels() {
     );
 }
 
+/// Two former SILENT miscompiles are claimed supported surfaces: a celled entry
+/// argument read after a write through an escaped `&mut` (the read loads the
+/// cell), and partial-eightbyte arrays through `black_box` (zero-extended lane
+/// assembly, width-exact result stores). Every optimization level must compile
+/// and agree with LLVM — a refusal here would hide the regression the row pins.
+#[test]
+fn former_silent_miscompiles_are_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    for (name, src, code) in [
+        (
+            "stale_celled_entry_arg_strict",
+            include_str!("bridge_corpus/stale_celled_entry_arg.rs"),
+            40,
+        ),
+        (
+            "partial_eightbyte_blackbox_strict",
+            include_str!("bridge_corpus/partial_eightbyte_blackbox.rs"),
+            53,
+        ),
+        (
+            "nonnull_str_field_through_ref_strict",
+            include_str!("bridge_corpus/nonnull_str_field_through_ref.rs"),
+            68,
+        ),
+    ] {
+        for opt in ["0", "2", "3"] {
+            let reference = compile_link_run(name, src, opt, None);
+            assert_eq!(
+                reference,
+                RunOutcome::Exited {
+                    code,
+                    stdout: Vec::new(),
+                },
+                "{name}: LLVM fixture result changed at opt={opt}"
+            );
+            let test = compile_link_run(name, src, opt, Some(&dylib));
+            assert_eq!(
+                diff_outcomes(&reference, &test),
+                DiffVerdict::Agree,
+                "{name} must compile and equal LLVM at opt={opt}; got {test:?}"
+            );
+        }
+    }
+}
+
+/// A field reference through a thin entry reference, stored into a cell, is a
+/// CLAIMED supported surface on x86-64: every optimization level must compile
+/// and agree with LLVM (exit 42: every field read back through its stored
+/// address is that field's) — never regress back to the deref-store refusal.
+/// The four-cell cross-backend twin is `m148_x86_entry_ref_field_addr_xback`.
+#[test]
+fn entry_reference_field_addresses_are_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let name = "entry_ref_field_address_strict";
+    let src = include_str!("bridge_corpus/entry_ref_field_address.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run(name, src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 42,
+                stdout: Vec::new(),
+            },
+            "{name}: LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run(name, src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "{name} must compile and equal LLVM at opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// A CELLED return place (`library/core`'s `io::error::repr::Repr::new_custom`:
+/// `&_0` borrowed into a callee whose return carries a reference) is a CLAIMED
+/// supported surface: `Return` loads the cell. Every optimization level must
+/// compile and agree with LLVM — never regress back to fail-closed — and the
+/// readable fixture checksum must remain 4.
+#[test]
+fn ssa071_celled_return_place_is_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/ssa071_celled_return_place.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("ssa071_celled_return_place_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 4,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("ssa071_celled_return_place_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "a celled return place must remain supported and equal LLVM at opt={opt}; \
+             got {test:?}"
+        );
+    }
+}
+
+/// A CELLED index local (an address-taken entry argument or local) must be read
+/// from its CELL by every `Index(local)` reader (`index_local_value`). The SSA
+/// binding of a celled entry argument is its INCOMING parameter, which the
+/// readers used to read — a SILENT WRONG VALUE (LLVM 17 vs 5; the reader battery
+/// 19 vs 198) — and a celled non-argument local's is never defined (fail closed).
+/// Every optimization level must compile and agree with LLVM, and the readable
+/// fixture results must remain 17, 17 and 19.
+#[test]
+fn celled_index_locals_are_read_from_their_cells_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let rows = [
+        (
+            "celled_index_arg_strict",
+            include_str!("bridge_corpus/celled_index_arg_custom_mir.rs"),
+            17,
+        ),
+        (
+            "celled_index_local_strict",
+            include_str!("bridge_corpus/celled_index_local_custom_mir.rs"),
+            17,
+        ),
+        (
+            "celled_index_readers_strict",
+            include_str!("bridge_corpus/celled_index_readers_custom_mir.rs"),
+            19,
+        ),
+    ];
+    for (stem, src, code) in rows {
+        for opt in ["0", "2", "3"] {
+            let reference = compile_link_run(stem, src, opt, None);
+            assert_eq!(
+                reference,
+                RunOutcome::Exited {
+                    code,
+                    stdout: Vec::new(),
+                },
+                "{stem}: LLVM fixture result changed at opt={opt}"
+            );
+            let test = compile_link_run(stem, src, opt, Some(&dylib));
+            assert_eq!(
+                diff_outcomes(&reference, &test),
+                DiffVerdict::Agree,
+                "{stem}: a celled index must be read from its cell and equal LLVM at \
+                 opt={opt}; got {test:?}"
+            );
+        }
+    }
+}
+
+/// Three `library/core` [TCG-SSA-071] roots' shapes are a CLAIMED supported
+/// surface through the cell retry (`overflowing_pow` for u64/u128/i128,
+/// `maximal_suffix`, a diamond-then-combine accumulator). Every optimization level
+/// must compile and agree with LLVM — never regress back to fail-closed — and the
+/// readable fixture checksum must remain 58.
+#[test]
+fn ssa071_cell_retry_loops_are_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/ssa071_cell_retry_loops.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("ssa071_cell_retry_loops_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 58,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("ssa071_cell_retry_loops_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "the cell-retry loops must remain supported and equal LLVM at opt={opt}; \
+             got {test:?}"
+        );
+    }
+}
+
 /// Unlike the broad corpus (where a fail-closed result is generally acceptable),
 /// overlapping copy is a claimed supported surface. Pin that stronger contract:
 /// every optimization level must compile and agree with LLVM, never regress back
@@ -1300,6 +1927,376 @@ fn overlapping_copy_memmove_is_supported_across_opt_levels() {
     }
 }
 
+/// A tuple pointee with a nested struct / array field is a CLAIMED supported
+/// surface (the `unicode_data::conversions` table shape; 10 `library/core`
+/// roots). Pin the stronger contract: every optimization level must compile and
+/// agree with LLVM, never regress back to fail-closed, and the readable fixture
+/// checksum must remain 120.
+#[test]
+fn tuple_pointee_with_nested_aggregate_field_is_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/pointee_lanes_tuple_nested.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("pointee_lanes_tuple_nested_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 120,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("pointee_lanes_tuple_nested_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "tuple pointee with a nested aggregate field must remain supported and equal \
+             LLVM at opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// By-value `PassMode::Pair` ARGUMENTS are a CLAIMED supported surface (the
+/// two-value argument lane; 74 `library/core` roots). Pin the stronger contract:
+/// every optimization level must compile and agree with LLVM, never regress
+/// back to fail-closed, and the readable fixture checksum must remain 48.
+#[test]
+fn scalar_pair_arguments_are_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/pair_arg_lanes.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("pair_arg_lanes_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 48,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("pair_arg_lanes_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "scalar-pair arguments must remain supported and equal LLVM at opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// A union with a fat-pointer leaf (`MaybeUninit<Part>`) is a CLAIMED supported
+/// surface (core's `flt2dec` buffers; 21 `library/core` roots). Pin the stronger
+/// contract: every optimization level must compile and agree with LLVM, never
+/// regress back to fail-closed, and the readable fixture checksum must remain 61.
+#[test]
+fn fat_leaf_union_is_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/union_fat_leaf.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("union_fat_leaf_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 61,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("union_fat_leaf_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "fat-leaf union must remain supported and equal LLVM at opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// A closure taking a slice / `str` fat pointer is a CLAIMED supported surface
+/// and its failure mode was a crash, not a refusal. Pin the stronger contract:
+/// every optimization level must compile and agree with LLVM, never regress to
+/// fail-closed, and the readable fixture checksum must remain 43.
+#[test]
+fn closure_with_a_fat_pointer_parameter_is_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/closure_slice_arg.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("closure_slice_arg_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 43,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("closure_slice_arg_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "a closure with a fat-pointer parameter must remain supported and equal LLVM at \
+             opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// Every x86-64 `PassMode::Pair` argument rides the two-value lane, including at
+/// register exhaustion (one integer register left). The cross-backend agreement
+/// is `m144`; this pins the bridge's own whole-program consistency across every
+/// call-site family the lane now owns: every optimization level must compile,
+/// agree with LLVM and keep 23.
+#[test]
+fn pair_arguments_at_register_exhaustion_are_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/pair_arg_exhaustion.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("pair_arg_exhaustion_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 23,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("pair_arg_exhaustion_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "a pair argument at register exhaustion must remain supported and equal LLVM at \
+             opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// Every sized `Memory` argument larger than a pointer rides rustc's
+/// `PassMode::Indirect` pointer (the indirect argument lane). The cross-backend
+/// agreement is `m145`; this pins the bridge's own whole-program consistency
+/// across every call-site family the lane owns: every optimization level must
+/// compile, agree with LLVM and keep 107.
+#[test]
+fn indirect_arguments_are_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/indirect_arg_lanes.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("indirect_arg_lanes_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 107,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("indirect_arg_lanes_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "an indirect (`PassMode::Indirect`) argument must remain supported and equal LLVM \
+             at opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// An over-aligned single-scalar newtype rides the indirect argument lane's
+/// SCALAR SUB-LANE (a fresh padded copy, the scalar at offset 0). The
+/// cross-backend agreement is `m145`'s `w1_*` rows; this pins the bridge's own
+/// whole-program consistency: every optimization level must compile, agree with
+/// LLVM and keep 7.
+#[test]
+fn indirect_scalar_newtype_arguments_are_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/indirect_scalar_newtype_lanes.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("indirect_scalar_newtype_lanes_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 7,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run(
+            "indirect_scalar_newtype_lanes_strict",
+            src,
+            opt,
+            Some(&dylib),
+        );
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "a padded single-scalar newtype argument must remain supported and equal LLVM at \
+             opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// Every stack home of an over-aligned single-scalar newtype (the temporary
+/// behind a `&a` call argument, a raw-borrowed or closure-captured local's
+/// cell, a `&dyn` data pointer, a `&mut` temporary) has rustc's extent and
+/// alignment (`padded_scalar_home_extent`): no misalignment flag, every
+/// optimization level, equal to LLVM (147).
+#[test]
+fn padded_scalar_homes_are_rustc_aligned_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/padded_scalar_home_alignment.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("padded_scalar_home_alignment_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 147,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run(
+            "padded_scalar_home_alignment_strict",
+            src,
+            opt,
+            Some(&dylib),
+        );
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "an over-aligned scalar newtype's stack homes must be rustc-aligned and equal \
+             LLVM at opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// A struct field of the transparent wide-slice newtype, built from a slotted
+/// parameter and read back two-lane, is a CLAIMED supported surface. Pin it
+/// strict: every optimization level must compile, agree with LLVM and keep 77.
+#[test]
+fn nonnull_holder_field_is_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/nonnull_holder_field.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("nonnull_holder_field_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 77,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("nonnull_holder_field_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "the newtype struct field must remain supported and equal LLVM at opt={opt}; got {test:?}"
+        );
+    }
+}
+
+/// The transparent wide-slice newtype at a boundary (`NonNull<[T]>` / `NonNull<str>`
+/// by value) is a CLAIMED supported surface (47 `library/core` roots). Pin the
+/// stronger contract: every optimization level must compile and agree with
+/// LLVM, never regress back to fail-closed, and the fixture sum must remain 52.
+#[test]
+fn transparent_wide_slice_newtype_at_the_boundary_is_supported_across_opt_levels() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let src = include_str!("bridge_corpus/m143_nonnull_slice_boundary.rs");
+    for opt in ["0", "2", "3"] {
+        let reference = compile_link_run("m143_nonnull_slice_boundary_strict", src, opt, None);
+        assert_eq!(
+            reference,
+            RunOutcome::Exited {
+                code: 52,
+                stdout: Vec::new(),
+            },
+            "LLVM fixture result changed at opt={opt}"
+        );
+        let test = compile_link_run("m143_nonnull_slice_boundary_strict", src, opt, Some(&dylib));
+        assert_eq!(
+            diff_outcomes(&reference, &test),
+            DiffVerdict::Agree,
+            "the transparent wide-slice newtype must remain supported and equal LLVM at opt={opt}; got {test:?}"
+        );
+    }
+}
+
 /// Unlike the broad corpus, this pins the newly claimed intrinsic at the O0 call
 /// path that actually reaches `float_to_int_unchecked`: it must compile, execute,
 /// and agree with LLVM over defined (in-range, non-NaN) inputs.
@@ -1324,12 +2321,7 @@ fn float_to_int_unchecked_is_supported_and_matches_llvm_at_o0() {
         },
         "LLVM fixture result changed"
     );
-    let test = compile_link_run(
-        "float_to_int_unchecked_strict",
-        src,
-        "0",
-        Some(&dylib),
-    );
+    let test = compile_link_run("float_to_int_unchecked_strict", src, "0", Some(&dylib));
     assert_eq!(
         diff_outcomes(&reference, &test),
         DiffVerdict::Agree,
@@ -1349,7 +2341,7 @@ fn float_to_int_unchecked_is_supported_and_matches_llvm_at_o0() {
 // `trust_cg_verify::ssa_loop_complete::check_function_fail_closed(&func)` before
 // inserting the produced function into the module. These two tests exercise that
 // EXACT symbol against trust-ir built by hand, so the wiring residual is proven
-// closed independent of the pinned nightly + x86 host the differential needs:
+// closed independent of the Trust x86 std + x86 host the differential needs:
 //   - the #71 dropped-aggregate-field loop shape is REJECTED (fail closed),
 //     which is the bug the bridge could previously emit silently; and
 //   - a correctly-threaded loop is ACCEPTED (no over-eager fail-closed that
@@ -1554,9 +2546,8 @@ fn dropped_aggregate_loop() -> Function {
     }));
 
     let mut bb3 = Block::new(bb(3));
-    bb3.body.push(InstrNode::new(Inst::Return {
-        values: vec![v(0)],
-    }));
+    bb3.body
+        .push(InstrNode::new(Inst::Return { values: vec![v(0)] }));
 
     f.blocks = vec![bb0, bb1, bb2, bb3];
     f
@@ -1593,21 +2584,56 @@ fn p1_3_gate_accepts_threaded_scalar_loop() {
 #[test]
 fn inline_diff_engine_smoke() {
     assert_eq!(
-        diff_outcomes(&RunOutcome::Exited { code: 1, stdout: vec![] }, &RunOutcome::Exited { code: 1, stdout: vec![] }),
+        diff_outcomes(
+            &RunOutcome::Exited {
+                code: 1,
+                stdout: vec![]
+            },
+            &RunOutcome::Exited {
+                code: 1,
+                stdout: vec![]
+            }
+        ),
         DiffVerdict::Agree
     );
     assert!(matches!(
-        diff_outcomes(&RunOutcome::Exited { code: 60, stdout: vec![] }, &RunOutcome::Exited { code: 30, stdout: vec![] }),
-        DiffVerdict::Divergence { kind: DivergenceKind::WrongValue, .. }
-    ));
-    assert!(matches!(
-        diff_outcomes(&RunOutcome::Exited { code: 0, stdout: vec![] }, &RunOutcome::Signalled { signal: 8 }),
-        DiffVerdict::Divergence { kind: DivergenceKind::TrapMismatch, .. }
+        diff_outcomes(
+            &RunOutcome::Exited {
+                code: 60,
+                stdout: vec![]
+            },
+            &RunOutcome::Exited {
+                code: 30,
+                stdout: vec![]
+            }
+        ),
+        DiffVerdict::Divergence {
+            kind: DivergenceKind::WrongValue,
+            ..
+        }
     ));
     assert!(matches!(
         diff_outcomes(
-            &RunOutcome::Exited { code: 0, stdout: vec![] },
-            &RunOutcome::CompileError { stderr_tail: "x".into() }
+            &RunOutcome::Exited {
+                code: 0,
+                stdout: vec![]
+            },
+            &RunOutcome::Signalled { signal: 8 }
+        ),
+        DiffVerdict::Divergence {
+            kind: DivergenceKind::TrapMismatch,
+            ..
+        }
+    ));
+    assert!(matches!(
+        diff_outcomes(
+            &RunOutcome::Exited {
+                code: 0,
+                stdout: vec![]
+            },
+            &RunOutcome::CompileError {
+                stderr_tail: "x".into()
+            }
         ),
         DiffVerdict::TrustCgFailedClosed(_)
     ));

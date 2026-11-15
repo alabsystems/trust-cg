@@ -6,7 +6,7 @@
 //! `trust-cg-test suite` — external LLVM test-suite runner.
 //!
 //! This planned WS2 dispatcher reports an explicit not-implemented status in
-//! v0.1.0; `scripts/run_llvm_test_suite.sh` remains the maintained runner.
+//! v0.1.0; no maintained external llvm-test-suite runner exists.
 
 use clap::Args;
 

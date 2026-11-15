@@ -15,7 +15,7 @@
 //! compile on the Linux target triple. Without a cross-check they bit-rot
 //! silently until someone runs on Linux and hits a compile error.
 //!
-//! This subcommand runs `cargo check --target <TARGET> -p <PACKAGE>` for
+//! This subcommand runs `targo --unverified check --target <TARGET> -p <PACKAGE>` for
 //! every (target, package) pair we care about and reports the results. It
 //! does **not** execute code — only checks that the compiler accepts the
 //! Linux `cfg` arms. Runtime behavior testing would need QEMU or a real
@@ -23,16 +23,18 @@
 //!
 //! ## Toolchain discovery
 //!
-//! If `rustup` is not on `PATH`, or the requested target is not
-//! installed (`rustup target list --installed` misses it), the target is
-//! reported as `skipped` with an install hint. This keeps the default
-//! `cargo test` run on macOS green when cross-toolchains aren't set up —
-//! missing toolchains are environmental, not a Worker regression.
+//! The toolchain is the installed Trust package (`targo`/`trustc`; owner
+//! directive 2026-09-28). A target is installed when that package's sysroot
+//! ships its std (`<sysroot>/lib/rustlib/<target>/lib`). BLOCKED today: the
+//! Darwin Trust package ships no Linux std (measured `trustc --target
+//! x86_64-unknown-linux-gnu` -> E0463 can't find crate for `std`), so both
+//! targets report `skipped` until it does. Missing targets are
+//! environmental, not a Worker regression; there is no stock fallback.
 //!
 //! Exit codes:
 //!   * 0 (Ok)         — every installed target compiled cleanly.
 //!   * 1 (Failed)     — at least one installed target failed to compile.
-//!   * 2 (EnvBroken)  — `cargo` is missing (cannot run anything).
+//!   * 2 (EnvBroken)  — `targo` is missing (cannot run anything).
 //!
 //! When every target is skipped (no installed Linux targets), the exit
 //! is `Ok` with a diagnostic — this is the common case on a fresh macOS
@@ -73,17 +75,18 @@ const DEFAULT_PACKAGE: &str = "trust-cg-codegen";
 #[derive(Args, Debug, Clone)]
 #[command(
     long_about = "Cross-compile check for the Linux `#[cfg(target_os = \"linux\")]` \
-                  paths in trust-cg-codegen. Runs `cargo check --target <T> -p <P>` \
+                  paths in trust-cg-codegen. Runs `targo --unverified check --target <T> -p <P>` \
                   for each installed Linux target. Missing targets are skipped \
                   (they are environmental, not a failure) so this subcommand is \
                   safe to wire into CI on macOS-only developer boxes.\n\n\
-                  Installed targets are discovered via `rustup target list \
-                  --installed`. Install one with e.g. \
-                  `rustup target add x86_64-unknown-linux-gnu`.\n\n\
+                  A target is installed when the Trust package's sysroot ships \
+                  its std (`<trustc --print sysroot>/lib/rustlib/<T>/lib`). The \
+                  Darwin Trust package ships no Linux std today, so both \
+                  targets are skipped there.\n\n\
                   Exit codes:\n  \
                   0 — every installed target compiled (or all targets skipped).\n  \
                   1 — at least one installed target failed to compile.\n  \
-                  2 — cargo missing from PATH.\n\n\
+                  2 — targo missing from PATH.\n\n\
                   # Examples\n\n  \
                   trust-cg-test lint-linux\n  \
                   trust-cg-test lint-linux --format json\n  \
@@ -104,9 +107,9 @@ pub struct LintLinuxArgs {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum TargetStatus {
-    /// Target installed and `cargo check` exited 0.
+    /// Target installed and `targo check` exited 0.
     Passed,
-    /// Target installed but `cargo check` exited non-zero.
+    /// Target installed but `targo check` exited non-zero.
     Failed,
     /// Target not installed; compiler wasn't invoked.
     Skipped,
@@ -117,7 +120,7 @@ struct TargetRow {
     target: String,
     package: String,
     status: TargetStatus,
-    /// Exit code of `cargo check`. `None` when skipped.
+    /// Exit code of `targo check`. `None` when skipped.
     exit_code: Option<i32>,
     /// Brief reason when `Skipped`, or diagnostic tail when `Failed`.
     note: String,
@@ -126,7 +129,7 @@ struct TargetRow {
 #[derive(Debug, Serialize)]
 struct LintReport {
     command: &'static str,
-    rustup_present: bool,
+    trustc_present: bool,
     installed_targets: Vec<String>,
     rows: Vec<TargetRow>,
     exit: ResultStatus,
@@ -136,9 +139,9 @@ struct LintReport {
 pub fn run(global: &GlobalArgs, args: &LintLinuxArgs) -> anyhow::Result<ResultStatus> {
     let repo = RepoRoot::locate(Path::new("."))?;
 
-    // Env broken: cargo is missing. Nothing else to do.
+    // Env broken: targo is missing. Nothing else to do.
     if which(Cargo::program()).is_none() {
-        eprintln!("lint-linux: cargo not found on PATH");
+        eprintln!("lint-linux: targo (the Trust package's) not found on PATH");
         return Ok(ResultStatus::EnvBroken);
     }
 
@@ -153,7 +156,7 @@ pub fn run(global: &GlobalArgs, args: &LintLinuxArgs) -> anyhow::Result<ResultSt
         args.package.clone()
     };
 
-    let (rustup_present, installed) = discover_installed_targets();
+    let (trustc_present, installed) = discover_installed_targets(&targets);
 
     let mut rows: Vec<TargetRow> = Vec::new();
     let mut any_failed = false;
@@ -168,7 +171,7 @@ pub fn run(global: &GlobalArgs, args: &LintLinuxArgs) -> anyhow::Result<ResultSt
                     package: package.clone(),
                     status: TargetStatus::Skipped,
                     exit_code: None,
-                    note: skip_reason(rustup_present, target),
+                    note: skip_reason(trustc_present, target),
                 });
                 continue;
             }
@@ -192,7 +195,7 @@ pub fn run(global: &GlobalArgs, args: &LintLinuxArgs) -> anyhow::Result<ResultSt
 
     let report = LintReport {
         command: "lint-linux",
-        rustup_present,
+        trustc_present,
         installed_targets: installed,
         rows,
         exit,
@@ -209,42 +212,37 @@ pub fn run(global: &GlobalArgs, args: &LintLinuxArgs) -> anyhow::Result<ResultSt
     Ok(exit)
 }
 
-/// Return `(rustup_present, installed_targets)`. When `rustup` is missing
-/// we cannot enumerate installed targets, so we return an empty list and
-/// every target ends up `Skipped` with a rustup-install hint.
-fn discover_installed_targets() -> (bool, Vec<String>) {
-    if which("rustup").is_none() {
+/// Return `(trustc_present, installed_targets)`: the requested targets whose
+/// std the installed Trust package's sysroot ships. When `trustc` is missing
+/// nothing can be enumerated and every target ends up `Skipped`.
+fn discover_installed_targets(targets: &[String]) -> (bool, Vec<String>) {
+    if which("trustc").is_none() {
         return (false, Vec::new());
     }
-    let captured = Spawn::new("rustup")
-        .arg("target")
-        .arg("list")
-        .arg("--installed")
-        .capture();
-    let Ok(out) = captured else {
+    let Ok(out) = Spawn::new("trustc").args(["--print", "sysroot"]).capture() else {
         return (true, Vec::new());
     };
     if !out.success() {
         return (true, Vec::new());
     }
-    let list: Vec<String> = out
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    let rustlib = Path::new(out.stdout.trim()).join("lib").join("rustlib");
+    let list = targets
+        .iter()
+        .filter(|target| rustlib.join(target.as_str()).join("lib").is_dir())
+        .cloned()
         .collect();
     (true, list)
 }
 
-fn skip_reason(rustup_present: bool, target: &str) -> String {
-    if !rustup_present {
-        return "rustup missing; install: https://rustup.rs".to_string();
+fn skip_reason(trustc_present: bool, target: &str) -> String {
+    if !trustc_present {
+        return "trustc missing: install the Trust toolchain package (see `aterm help rust`)"
+            .to_string();
     }
-    format!("target not installed; run: rustup target add {target}")
+    format!("the installed Trust package ships no {target} std; nothing to check against")
 }
 
-/// Run `cargo check --target <target> -p <package>` from the repo root.
+/// Run `targo --unverified check --target <target> -p <package>` from the repo root.
 ///
 /// Non-zero exit codes are reflected in `TargetStatus::Failed` rather
 /// than propagated as a `Result::Err` — the caller wants to continue
@@ -261,12 +259,15 @@ fn run_cargo_check(
             package: package.to_string(),
             status: TargetStatus::Passed,
             exit_code: Some(0),
-            note: format!("dry-run: would invoke `cargo check --target {target} -p {package}`"),
+            note: format!(
+                "dry-run: would invoke `targo --unverified check --target {target} -p {package}`"
+            ),
         });
     }
 
     let captured = Spawn::new(Cargo::program())
         .cwd(repo.0.clone())
+        .arg("--unverified")
         .arg("check")
         .arg("--target")
         .arg(target)
@@ -275,7 +276,7 @@ fn run_cargo_check(
         .arg("--message-format=human")
         .arg("--color=never")
         .capture()
-        .with_context(|| format!("invoking cargo check for target {target}"))?;
+        .with_context(|| format!("invoking targo check for target {target}"))?;
 
     let status = if captured.success() {
         TargetStatus::Passed
@@ -320,14 +321,12 @@ fn diagnostic_tail(stderr: &str, stdout: &str) -> String {
 fn print_human(r: &LintReport, any_ran: bool) {
     println!("trust-cg-test lint-linux");
     println!();
-    if !r.rustup_present {
-        println!("  rustup: not found on PATH — every target will be skipped.");
-        println!("  install via https://rustup.rs then:");
-        println!("    rustup target add x86_64-unknown-linux-gnu");
-        println!("    rustup target add aarch64-unknown-linux-gnu");
+    if !r.trustc_present {
+        println!("  trustc: not found on PATH — every target will be skipped.");
+        println!("  install the Trust toolchain package (see `aterm help rust`).");
         println!();
     } else if r.installed_targets.is_empty() {
-        println!("  rustup: present, but `rustup target list --installed` returned empty.");
+        println!("  trustc: present, but its sysroot ships no requested Linux target std.");
         println!();
     }
 
@@ -365,12 +364,12 @@ fn print_human(r: &LintReport, any_ran: bool) {
             println!("  status: OK (all installed Linux targets compiled)");
         }
         ResultStatus::Ok => println!(
-            "  status: OK (no Linux targets installed; install one with `rustup target add <triple>`)"
+            "  status: OK (no Linux target std in the installed Trust package; nothing was checked)"
         ),
         ResultStatus::Failed => println!(
-            "  status: FAILED (see failing row above; re-run `cargo check --target <triple> -p <package>` for full output)"
+            "  status: FAILED (see failing row above; re-run `targo --unverified check --target <triple> -p <package>` for full output)"
         ),
-        ResultStatus::EnvBroken => println!("  status: ENV_BROKEN (cargo missing)"),
+        ResultStatus::EnvBroken => println!("  status: ENV_BROKEN (targo missing)"),
         ResultStatus::NotImplemented | ResultStatus::UsageError | ResultStatus::Errored => {
             println!("  status: {:?}", r.exit);
         }
@@ -382,16 +381,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn skip_reason_without_rustup_points_to_installer() {
+    fn skip_reason_without_trustc_points_to_the_trust_package() {
         let s = skip_reason(false, "x86_64-unknown-linux-gnu");
-        assert!(s.contains("rustup"));
-        assert!(s.contains("rustup.rs"));
+        assert!(s.contains("trustc missing"));
+        assert!(!s.contains("rustup"));
     }
 
     #[test]
-    fn skip_reason_with_rustup_points_to_target_add() {
+    fn skip_reason_with_trustc_names_the_missing_std() {
         let s = skip_reason(true, "aarch64-unknown-linux-gnu");
-        assert!(s.contains("rustup target add aarch64-unknown-linux-gnu"));
+        assert!(s.contains("ships no aarch64-unknown-linux-gnu std"));
+        assert!(!s.contains("rustup"));
     }
 
     #[test]
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn diagnostic_tail_handles_empty_inputs() {
-        assert!(diagnostic_tail("", "").is_empty());
+        assert_eq!(diagnostic_tail("", ""), "");
         assert_eq!(diagnostic_tail("only stderr", ""), "only stderr");
         assert_eq!(diagnostic_tail("", "only stdout"), "only stdout");
     }

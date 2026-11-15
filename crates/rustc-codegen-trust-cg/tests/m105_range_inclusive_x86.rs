@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: `RangeInclusive` (`a..=b` / `1..=n`) as a `for`-loop source
 // AND an iterator-chain source, compiled for x86_64 via the
@@ -40,9 +44,9 @@ mod target_dir_support;
 // compose with the existing adapter chain.
 //
 // SCOPE: a `RangeInclusive<T>` for a scalar INTEGER index `T` (signed / unsigned,
-// runtime bounds). A non-integer / char range, or `.rev()` over a
-// `RangeInclusive` (a backward walk with its own exhausted bookkeeping), is NOT
-// modeled and fails closed (no binary, never a wrong value).
+// runtime bounds). A non-integer / char range is NOT modeled and fails closed
+// (no binary, never a wrong value). `.rev()` over a `RangeInclusive` is driven
+// as std's `spec_next_back` (`range_inclusive_rev_matches_llvm`).
 //
 // Each program is compiled with BOTH backends and run at -O0 AND -O3; the
 // trust-cg exit code must equal the LLVM exit code (and the expected value). The
@@ -52,68 +56,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run range-inclusive test"
-    );
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -144,9 +94,8 @@ fn try_compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -164,7 +113,11 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>, opt: &str)
     assert!(
         output.status.success(),
         "compile of `{name}` failed ({} backend, -Copt-level={opt}). stderr: <<<{}>>>",
-        if backend.is_some() { "trust-cg" } else { "llvm" },
+        if backend.is_some() {
+            "trust-cg"
+        } else {
+            "llvm"
+        },
         String::from_utf8_lossy(&output.stderr)
     );
     bin
@@ -206,7 +159,9 @@ fn range_inclusive_programs_run_and_match_llvm() {
         // `for i in 1..=n { s += i }` == n(n+1)/2 == 15 for n = 5.
         (
             "forloop_sum",
-            format!("fn main(){{let mut s=0i64; for i in 1..={bb}(5i64){{s+=i;}} std::process::exit(s as i32);}}"),
+            format!(
+                "fn main(){{let mut s=0i64; for i in 1..={bb}(5i64){{s+=i;}} std::process::exit(s as i32);}}"
+            ),
             15,
         ),
         // `(1..=n).sum()` == 15 (chain consumer over the inclusive source).
@@ -219,70 +174,92 @@ fn range_inclusive_programs_run_and_match_llvm() {
         // FILTER adapter over the inclusive source; works at -O0 AND -O3).
         (
             "chain_filter_count",
-            format!("fn main(){{let c=(1..={bb}(5i64)).filter(|x|x%2==0).count(); std::process::exit(c as i32);}}"),
+            format!(
+                "fn main(){{let c=(1..={bb}(5i64)).filter(|x|x%2==0).count(); std::process::exit(c as i32);}}"
+            ),
             2,
         ),
         // `(0..=n).collect::<Vec<_>>()` length == n+1 == 6.
         (
             "collect_len",
-            format!("fn main(){{let v:Vec<i64>=(0..={bb}(5i64)).collect(); std::process::exit(v.len() as i32);}}"),
+            format!(
+                "fn main(){{let v:Vec<i64>=(0..={bb}(5i64)).collect(); std::process::exit(v.len() as i32);}}"
+            ),
             6,
         ),
         // `(0..=n).collect::<Vec<_>>()` index [3] == 3 (the inclusive sequence is 0..=5).
         (
             "collect_index",
-            format!("fn main(){{let v:Vec<i64>=(0..={bb}(5i64)).collect(); std::process::exit(v[3] as i32);}}"),
+            format!(
+                "fn main(){{let v:Vec<i64>=(0..={bb}(5i64)).collect(); std::process::exit(v[3] as i32);}}"
+            ),
             3,
         ),
         // Nested `for i in 1..=a { for j in 1..=b { s += i+j } }`. a=3,b=2 ->
         // sum over (i,j) of (i+j) = (2+3)+(3+4)+(4+5) = 21.
         (
             "nested",
-            format!("fn main(){{let mut s=0i64; for i in 1..={bb}(3i64){{for j in 1..={bb}(2i64){{s+=i+j;}}}} std::process::exit(s as i32);}}"),
+            format!(
+                "fn main(){{let mut s=0i64; for i in 1..={bb}(3i64){{for j in 1..={bb}(2i64){{s+=i+j;}}}} std::process::exit(s as i32);}}"
+            ),
             21,
         ),
         // Runtime bounds `a..=b` (a=4,b=8): 4+5+6+7+8 = 30.
         (
             "runtime_bounds",
-            format!("fn main(){{let a={bb}(4i64);let b={bb}(8i64);let mut s=0i64;for i in a..=b{{s+=i;}} std::process::exit(s as i32);}}"),
+            format!(
+                "fn main(){{let a={bb}(4i64);let b={bb}(8i64);let mut s=0i64;for i in a..=b{{s+=i;}} std::process::exit(s as i32);}}"
+            ),
             30,
         ),
         // `a..=a` (a == b): exactly ONE element (the inclusive endpoint). s = 7.
         (
             "single_element",
-            format!("fn main(){{let a={bb}(7i64);let mut s=0i64;for i in a..=a{{s+=i;}} std::process::exit(s as i32);}}"),
+            format!(
+                "fn main(){{let a={bb}(7i64);let mut s=0i64;for i in a..=a{{s+=i;}} std::process::exit(s as i32);}}"
+            ),
             7,
         ),
         // `a..=b` with a > b: EMPTY (zero iterations). count = 0.
         (
             "empty_a_gt_b",
-            format!("fn main(){{let a={bb}(9i64);let b={bb}(4i64);let mut c=0i64;for _ in a..=b{{c+=1;}} std::process::exit(c as i32);}}"),
+            format!(
+                "fn main(){{let a={bb}(9i64);let b={bb}(4i64);let mut c=0i64;for _ in a..=b{{c+=1;}} std::process::exit(c as i32);}}"
+            ),
             0,
         ),
         // u8 `1..=255` — the `T::MAX` boundary: the LAST element is 255, then the
         // loop STOPS (no `255 + 1` overflow wrap). Final element == 255.
         (
             "u8_max_last",
-            format!("fn main(){{let mut last=0u8;for i in 1u8..={bb}(255u8){{last=i;}} std::process::exit(last as i32);}}"),
+            format!(
+                "fn main(){{let mut last=0u8;for i in 1u8..={bb}(255u8){{last=i;}} std::process::exit(last as i32);}}"
+            ),
             255,
         ),
         // u8 `1..=255` element COUNT == 255 (it terminates — an off-by-one /
         // overflow would loop forever or under-count).
         (
             "u8_max_count",
-            format!("fn main(){{let mut c=0i32;for _ in 1u8..={bb}(255u8){{c+=1;}} std::process::exit(c);}}"),
+            format!(
+                "fn main(){{let mut c=0i32;for _ in 1u8..={bb}(255u8){{c+=1;}} std::process::exit(c);}}"
+            ),
             255,
         ),
         // Signed crossing zero `-3..=3`: sum of squares = 9+4+1+0+1+4+9 = 28.
         (
             "signed_neg_pos",
-            format!("fn main(){{let mut s=0i64;for i in {bb}(-3i64)..=3i64{{s+=i*i;}} std::process::exit(s as i32);}}"),
+            format!(
+                "fn main(){{let mut s=0i64;for i in {bb}(-3i64)..=3i64{{s+=i*i;}} std::process::exit(s as i32);}}"
+            ),
             28,
         ),
         // Signed i8 `-24..=24` count == 49 (inclusive both ends).
         (
             "i8_neg_pos_count",
-            format!("fn main(){{let mut c=0i32;for _ in {bb}(-24i8)..=24i8{{c+=1;}} std::process::exit(c);}}"),
+            format!(
+                "fn main(){{let mut c=0i32;for _ in {bb}(-24i8)..=24i8{{c+=1;}} std::process::exit(c);}}"
+            ),
             49,
         ),
         // === RangeInclusive short-circuit / find / try_fold family (the SIGILL-gap
@@ -296,33 +273,43 @@ fn range_inclusive_programs_run_and_match_llvm() {
         // `for x in (0..=n).filter(p)` — the exact SIGILL repro. Odds in 0..=9 = 25.
         (
             "filter_forloop_shortcircuit",
-            format!("fn main(){{let mut s=0i64; for x in (0..={bb}(9i64)).filter(|v|v%2==1){{s+=x;}} std::process::exit(s as i32);}}"),
+            format!(
+                "fn main(){{let mut s=0i64; for x in (0..={bb}(9i64)).filter(|v|v%2==1){{s+=x;}} std::process::exit(s as i32);}}"
+            ),
             25,
         ),
         // `(0..=n).find(p)` — first x with x*x>30 is 6.
         (
             "find_predicate",
-            format!("fn main(){{let r=(0..={bb}(9i64)).find(|&x|x*x>30); std::process::exit(r.unwrap_or(-1) as i32);}}"),
+            format!(
+                "fn main(){{let r=(0..={bb}(9i64)).find(|&x|x*x>30); std::process::exit(r.unwrap_or(-1) as i32);}}"
+            ),
             6,
         ),
         // `(0..=n).any(p)` — 7 is in 0..=9 -> true.
         (
             "any_predicate",
-            format!("fn main(){{let b=(0..={bb}(9i64)).any(|x|x==7); std::process::exit(if b {{1}} else {{0}});}}"),
+            format!(
+                "fn main(){{let b=(0..={bb}(9i64)).any(|x|x==7); std::process::exit(if b {{1}} else {{0}});}}"
+            ),
             1,
         ),
         // `(0..=n).all(p)` — every element < 100 -> true (exercises the Continue /
         // exhaustion arm, the classic inclusive-final-element case).
         (
             "all_predicate",
-            format!("fn main(){{let b=(0..={bb}(9i64)).all(|x|x<100); std::process::exit(if b {{1}} else {{0}});}}"),
+            format!(
+                "fn main(){{let b=(0..={bb}(9i64)).all(|x|x<100); std::process::exit(if b {{1}} else {{0}});}}"
+            ),
             1,
         ),
         // `(0..=n).position(p)` — index of the first `== 3` is 3 (non-ZST usize
         // accumulator + `&mut acc` reference capture in the check).
         (
             "position_predicate",
-            format!("fn main(){{let p=(0..={bb}(9i64)).position(|x|x==3); std::process::exit(p.map(|v|v as i32).unwrap_or(-1));}}"),
+            format!(
+                "fn main(){{let p=(0..={bb}(9i64)).position(|x|x==3); std::process::exit(p.map(|v|v as i32).unwrap_or(-1));}}"
+            ),
             3,
         ),
     ];
@@ -357,19 +344,25 @@ fn range_inclusive_programs_run_and_match_llvm() {
         // `(1..=n).map(|x| x*x).sum()` == 1+4+9+16+25 == 55.
         (
             "chain_map_sum",
-            format!("fn main(){{let s:i64=(1..={bb}(5i64)).map(|x|x*x).sum(); std::process::exit(s as i32);}}"),
+            format!(
+                "fn main(){{let s:i64=(1..={bb}(5i64)).map(|x|x*x).sum(); std::process::exit(s as i32);}}"
+            ),
             55,
         ),
         // u8 chain `1..=127` widened sum = 127*128/2 = 8128; 8128 % 256 = 192.
         (
             "u8_chain_map_sum",
-            format!("fn main(){{let s:u32=(1u8..={bb}(127u8)).map(|x|x as u32).sum(); std::process::exit((s%256) as i32);}}"),
+            format!(
+                "fn main(){{let s:u32=(1u8..={bb}(127u8)).map(|x|x as u32).sum(); std::process::exit((s%256) as i32);}}"
+            ),
             192,
         ),
         // `(0..=n).map(|x| x*2).collect()` index [4] == 8.
         (
             "chain_map_collect",
-            format!("fn main(){{let v:Vec<i64>=(0..={bb}(5i64)).map(|x|x*2).collect(); std::process::exit(v[4] as i32);}}"),
+            format!(
+                "fn main(){{let v:Vec<i64>=(0..={bb}(5i64)).map(|x|x*2).collect(); std::process::exit(v[4] as i32);}}"
+            ),
             8,
         ),
     ];
@@ -418,7 +411,11 @@ fn range_inclusive_map_closure_chain_runs_o3() {
         "fn main(){{let s:i64=(1..={bb}(5i64)).map(|x|x*x).sum(); std::process::exit(s as i32);}}"
     );
     let llvm = compile(&dir, "mapfc_llvm", &src, None, "3");
-    assert_eq!(run_exit_code(&llvm), 55, "LLVM map-closure inclusive sum -O3 should be 55");
+    assert_eq!(
+        run_exit_code(&llvm),
+        55,
+        "LLVM map-closure inclusive sum -O3 should be 55"
+    );
 
     let tcg = compile(&dir, "mapfc_o3_tcg", &src, Some(&dylib), "3");
     assert_eq!(
@@ -480,13 +477,25 @@ fn range_inclusive_capturing_shortcircuit_fails_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `.rev()` over a `RangeInclusive` (a backward `end..=start` walk with its own
-/// exhausted-flag bookkeeping) is NOT modeled — it must FAIL CLOSED (no binary)
-/// at BOTH -O0 and -O3, never produce a wrong value. (A plain `Range` reverses
-/// fine; only the inclusive form is gated.) LLVM compiles and runs it, so this
-/// is a deliberate coverage gap, not a correctness bug.
+/// `.rev()` over a `RangeInclusive` — std's `spec_next_back` walk (yield `end`,
+/// step it down, set `exhausted` on the `start == end` element), which the
+/// bridge models in `emit_source_next` — must build and exit with LLVM's code
+/// at BOTH -O0 and -O3. Until 2026-09-30 the reversed inclusive walk was not
+/// modeled and this test asserted the bridge FAILED CLOSED on it.
+///
+/// UNMEASURED ON x86_64: the change that made this lower is target-independent
+/// (MIR -> trust-ir, layout-derived field offsets), and these exact programs
+/// were measured equal to LLVM on aarch64-apple-darwin and cross-COMPILED for
+/// x86_64-apple-darwin there (the bridge produced a binary at -O0 and -O3), but
+/// no x86_64 binary of them has been RUN. The x86 instruction selection of the
+/// emitted loop is the residual risk this row is left to catch on an x86 host.
+///
+/// The bridge side passes `no-proof-certs`, as the AArch64 differentials do:
+/// with per-compile proof certificates on, the backend refuses these programs
+/// at proof promotion (`[TCG-PROOF-465]`, measured for x86_64 on this tree),
+/// which is unrelated to the walk and would make the row pin nothing.
 #[test]
-fn range_inclusive_rev_fails_closed() {
+fn range_inclusive_rev_matches_llvm() {
     if !host_is_x86_64() {
         eprintln!("skipping: x86_64 run requires an x86_64 host");
         return;
@@ -495,26 +504,88 @@ fn range_inclusive_rev_fails_closed() {
         eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
         return;
     }
+    if toolchain_support::skip_without_backend_knobs("range_inclusive_rev_matches_llvm") {
+        return;
+    }
     let dylib = ensure_dylib_built();
     let dir = workdir("rev");
     let bb = "std::hint::black_box";
 
-    let rev_src = format!(
-        "fn main(){{let s:i64=(1..={bb}(5i64)).rev().sum(); std::process::exit(s as i32);}}"
-    );
-    // LLVM still runs it (1+2+3+4+5 = 15) — confirm the program is well-formed.
-    let llvm = compile(&dir, "rev_llvm", &rev_src, None, "0");
-    assert_eq!(run_exit_code(&llvm), 15, "LLVM rev-inclusive sum should be 15");
+    // (name, source, LLVM's exit code — measured on aarch64, where the bridge
+    // matched it at -O0 and -O3).
+    let shapes: Vec<(&str, String, i32)> = vec![
+        // 1+2+3+4+5 = 15.
+        (
+            "rev_sum",
+            format!(
+                "fn main(){{let s:i64=(1..={bb}(5i64)).rev().sum(); std::process::exit(s as i32);}}"
+            ),
+            15,
+        ),
+        // Order-sensitive: 987654321 % 251 = 194 (the forward walk gives 123456789 % 251 = 58).
+        (
+            "rev_fold_order",
+            format!(
+                "fn main(){{let d=(1..={bb}(9u64)).rev().fold(0u64,|a,x|a*10+x); \
+                 std::process::exit((d%251) as i32);}}"
+            ),
+            194,
+        ),
+        // The full u8 width, walked down from 255 to 0.
+        (
+            "rev_fold_u8_full",
+            format!(
+                "fn main(){{let d=(0..={bb}(255u8)).rev().fold(0u32,|a,x|a.wrapping_mul(3)\
+                 .wrapping_add(u32::from(x))); std::process::exit((d%251) as i32);}}"
+            ),
+            98,
+        ),
+        // A range partly consumed by `next_back` (1..=3 remains: 3*2*1 = 6), and an
+        // empty one (5..=4 sums to 0): 6*10 + 0.
+        (
+            "rev_after_next_back",
+            format!(
+                "fn main(){{let mut r=1u8..={bb}(4u8); r.next_back(); let s:u8=r.rev().product(); \
+                 let e:u8=({bb}(5u8)..=4).rev().sum(); \
+                 std::process::exit(i32::from(s)*10+i32::from(e));}}"
+            ),
+            60,
+        ),
+    ];
 
-    for opt in ["0", "3"] {
-        let (output, bin) = try_compile(&dir, &format!("rev_o{opt}_tcg"), &rev_src, Some(&dylib), opt);
-        assert!(
-            !output.status.success() && !bin.exists(),
-            "trust-cg unexpectedly produced a binary for `.rev()` over a RangeInclusive \
-             (-O{opt}); a reversed inclusive range is not modeled and must FAIL CLOSED. \
-             stderr: <<<{}>>>",
-            String::from_utf8_lossy(&output.stderr)
+    for (name, src, expected) in &shapes {
+        let llvm = compile(&dir, &format!("{name}_llvm"), src, None, "0");
+        assert_eq!(
+            run_exit_code(&llvm),
+            *expected,
+            "LLVM `{name}` should exit {expected}"
         );
+        for opt in ["0", "3"] {
+            let src_path = dir.join(format!("{name}_o{opt}_tcg.rs"));
+            std::fs::write(&src_path, src).expect("write source");
+            let bin = dir.join(format!("{name}_o{opt}_tcg"));
+            let mut cmd = toolchain_support::rustc_command();
+            cmd.args(["--crate-type", "bin"])
+                .arg(backend_arg(&dylib))
+                .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]))
+                .args(["--target", TARGET, "-Cpanic=abort", "-Coverflow-checks=off"])
+                .arg(format!("-Copt-level={opt}"))
+                .arg("-o")
+                .arg(&bin)
+                .arg(&src_path);
+            let output = cmd.output().expect("spawn rustc");
+            assert!(
+                output.status.success(),
+                "trust-cg refused `{name}` (-O{opt}); the reversed inclusive walk is modeled and \
+                 must build. stderr: <<<{}>>>",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                run_exit_code(&bin),
+                *expected,
+                "trust-cg `{name}` (-O{opt}) disagrees with LLVM's exit code {expected}"
+            );
+        }
     }
 
     let _ = std::fs::remove_dir_all(&dir);

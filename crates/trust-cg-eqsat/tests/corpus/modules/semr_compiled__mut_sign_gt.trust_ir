@@ -1,0 +1,31 @@
+; TrustIr text format v1
+module "mut_sign_gt"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "mut_sign_gt.rs"
+
+functy.0 = (i8) -> (i8)
+
+rustcc fn @_RNvCs8RWKVZpTvfP_11mut_sign_gt8below_gt(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "below_gt"
+    ; #names: %0="x"
+bb0(%0: i8):
+    %1 = const i8 0  ; #loc: 0 2 34
+    %2 = icmp sgt i8 %0, %1  ; #loc: 0 2 30
+    condbr %2, bb1, bb2  ; #loc: 0 2 27
+bb1:
+    br bb3(%0)  ; #loc: 0 2 27
+bb2:
+    %3 = const i8 100  ; #loc: 0 2 53
+    %4, %5 = sub.overflow i8 %0, %3  ; #loc: 0 2 49
+    %6 = const bool false  ; #loc: 0 2 49
+    %7 = const bool true  ; #loc: 0 2 49
+    %8 = select bool %5, %6, %7  ; #loc: 0 2 49
+    assert %8, overflow sub  ; #proof: no_overflow  ; #loc: 0 2 49
+    br bb3(%4)  ; #loc: 0 2 27
+bb3(%9: i8):
+    ret %9  ; #loc: 0 2 60
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L2C49 of `mut_sign_gt::below_gt`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "mut_sign_gt::below_gt#L2C49#overflow#o0" range 0 2 49 2 56 site f0/bb2#5

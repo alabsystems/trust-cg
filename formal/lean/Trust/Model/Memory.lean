@@ -141,12 +141,56 @@ theorem read_write_disjoint
   intro k hk
   exact byte_distinct hsw hlw hnwS hnwL hdis hj hk
 
+/-! The byte count is smaller than the address space, so each store address
+    is distinct. The base may wrap across the address-space boundary. -/
+
+private theorem writeLE_split_byte (n : Nat) (v : BitVec (8 * (n + 1))) :
+    (((v >>> (8 : BitVec (8 * (n + 1)))).truncate (8 * n)) ++ v.truncate 8).cast
+      (by omega) = v := by
+  have hshift : (8 : BitVec (8 * (n + 1))).toNat = 8 := by
+    change 8 % 2 ^ (8 * (n + 1)) = 8
+    apply Nat.mod_eq_of_lt
+    have hpow : 2 ^ 4 ≤ 2 ^ (8 * (n + 1)) :=
+      Nat.pow_le_pow_right (by decide) (by omega)
+    omega
+  ext i hi
+  simp only [BitVec.getElem_cast, BitVec.getElem_append, BitVec.truncate,
+    BitVec.getElem_setWidth, BitVec.ushiftRight_eq', hshift,
+    BitVec.getLsbD_ushiftRight]
+  split
+  · simp_all only [BitVec.getLsbD_eq_getElem]
+  · simpa only [show 8 + (i - 8) = i by omega] using BitVec.getLsbD_eq_getElem (x := v) hi
+
 theorem read_write_same
-    (m : MachState) (base : BitVec 64) (w : Nat) (val : BitVec (8 * w)) :
+    (m : MachState) (base : BitVec 64) (w : Nat) (val : BitVec (8 * w))
+    (hwidth : w < 2 ^ 64) :
     readLE (writeLE m base w val) base w = val := by
-  -- MECHANICAL (stubbed): the LE round-trip. Heterogeneous-width BitVec bookkeeping
-  -- (cast/++/>>>/truncate). Axiom-isolated (sorryAx) and NOT consumed downstream.
-  sorry
+  induction w generalizing m base with
+  | zero =>
+      exact BitVec.eq_of_getElem_eq (by intro i hi; omega)
+  | succ w ih =>
+      simp only [writeLE, readLE, readBytes]
+      have hframe :
+          (writeLE (m.writeByte base (val.truncate 8)) (base + 1) w
+            ((val >>> (8 : BitVec (8 * (w + 1)))).truncate (8 * w))).mem base =
+          val.truncate 8 := by
+        rw [writeLE_mem_frame]
+        · exact writeByte_mem_self m base (val.truncate 8)
+        · intro k hk heq
+          rw [addr_step] at heq
+          have hzero : (0 : BitVec 64) = BitVec.ofNat 64 (k + 1) := by
+            apply (BitVec.add_right_inj base).mp
+            simpa using heq
+          have hn := congrArg BitVec.toNat hzero
+          change 0 = (k + 1) % 2 ^ 64 at hn
+          rw [Nat.mod_eq_of_lt (by omega)] at hn
+          omega
+      have htail := ih (m.writeByte base (val.truncate 8)) (base + 1)
+        ((val >>> (8 : BitVec (8 * (w + 1)))).truncate (8 * w)) (by omega)
+      change readBytes _ _ _ = _ at htail
+      rw [hframe, htail]
+      exact writeLE_split_byte w val
+
 
 /-! ## agreeOn and its store-preservation lemma (R.memAgree maintenance) -/
 

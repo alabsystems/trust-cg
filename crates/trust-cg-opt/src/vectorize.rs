@@ -54,20 +54,26 @@
 //!
 //! Reference: LLVM `LoopVectorize.cpp`, CompCert verified loop optimization.
 
-use std::collections::{HashMap, HashSet};
+mod loop_contract;
+
+use crate::loop_contract::{
+    CoveredLoop, ExitPlan, Handoff, Lanes, LoopLocality, Remainder, exit_of_test, publish_covered,
+};
+
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::aarch64_regs::preg_class;
 use trust_cg_ir::cost_model::{CostModelGen, MultiTargetCostModel, NeonArrangement, NeonOp};
 use trust_cg_ir::{
-    AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProofFact,
-    ProvenanceMap, RegClass, VReg,
+    AArch64Opcode, BlockId, InstFlags, InstId, MachFunction, MachInst, MachOperand, PassId,
+    ProofFact, ProvenanceMap, RegClass, VReg,
 };
 
 use crate::cache::StableHasher;
 use crate::dom::DomTree;
 use crate::effects::{
-    MemoryEffect, aarch64_for_each_def_position, aarch64_for_each_use_position, for_each_inst_def,
-    has_tied_def_use, opcode_effect, reads_flags, single_inst_def, writes_flags,
+    MemoryEffect, aarch64_for_each_use_position, for_each_inst_def, opcode_effect, reads_flags,
+    single_inst_def, writes_flags,
 };
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::{AnalysisCache, MachinePass};
@@ -79,6 +85,20 @@ use crate::proof_opts::{
 
 const DEFAULT_MIN_TRIP_COUNT: u32 = 8;
 const HOT_MIN_TRIP_COUNT: u32 = 4;
+/// Production authority for the imported-O0 i32 induction-store rewrite.
+///
+/// The rewrite was quarantined (09dd766ef) as a known miscompile: its vector
+/// stores started at `array_base` whatever the entry index, and its
+/// `index + 3 < bound` guard was an i32 add that wraps. The rewrite now
+/// addresses `a[entry]` and evaluates the guard on sign-extended 64-bit
+/// values. Its matcher discharges the `loop_contract` obligations: order,
+/// invariance of the base and bound, escape of loop values, a single
+/// dominating stride and unit, the exact loop shape, and a private index
+/// slot. `tests/loop_idiom_contract.rs` runs the scalar and rewritten loops
+/// through a MachIR interpreter, both through this pass and through the
+/// rewrite's own driver. Setting this back to `false` re-quarantines the
+/// rewrite. There is no environment or metadata bypass.
+const I32_INDUCTION_STORE_REWRITE_AUTHORITY_AVAILABLE: bool = true;
 const ENABLE_CONTAINS4_SCANNER_MEMORY_REWRITE_ENV: &str =
     "TRUST_CG_ENABLE_CONTAINS4_SCANNER_MEMORY_REWRITE";
 const ENABLE_CONTAINS4_SCANNER_BATCH_REWRITE_ENV: &str =
@@ -182,6 +202,13 @@ pub struct VectorizationPlan {
     pub neon_cost: f64,
     /// Whether this plan is profitable (neon_cost < scalar_cost).
     pub is_profitable: bool,
+    /// The loop-state contract (`crate::loop_contract`) passed for the in-place
+    /// rewrite, with the loop its iteration-coverage clause checks the rewrite
+    /// against. The plan cannot be built without it.
+    scope: CoveredLoop<BlockId>,
+    /// The scalar loop the plan was made for, whose shape publication checks
+    /// where the clause cannot (`clause_gap`).
+    scalar_loop: NaturalLoop,
 }
 
 impl VectorizationPlan {
@@ -436,7 +463,7 @@ fn find_horizontal_any_reductions(
     lp: &NaturalLoop,
     compare_idioms: &[VectorCompareIdiom],
 ) -> Vec<HorizontalAnyReduction> {
-    let mut compare_by_result: HashMap<VReg, VectorCompareIdiom> = HashMap::new();
+    let mut compare_by_result: HashMap<VReg, VectorCompareIdiom> = HashMap::default();
     for &idiom in compare_idioms {
         if let Some(result) = def_vreg(func.inst(idiom.cset_inst)) {
             compare_by_result.insert(result, idiom);
@@ -515,12 +542,12 @@ fn find_ordered_sub_reductions(
             } else if let Some((accumulator, writeback_inst, accumulator_load_inst)) =
                 find_stack_slot_ordered_sub_accumulator(
                     func,
+                    lp,
                     block_insts,
                     pos,
                     lhs,
                     sub_dst,
-                    &use_counts,
-                    defs,
+                    maps,
                 )
             {
                 (
@@ -637,15 +664,29 @@ fn find_ordered_sub_reductions(
     reductions
 }
 
+/// The stack-slot accumulator of an ordered-sub reducer at `reducer_pos`:
+/// `ldr lhs, [address]` earlier in the block with no store or call between,
+/// the reducer, then `str sub_dst, [address]`, as (accumulator, store, load).
+///
+/// The rewrite keeps the load and the store and runs them once per vector
+/// iteration, for all `vf` lanes, at the address its register holds then.
+/// The scalar loop runs them once per iteration, so `address` must hold the
+/// same slot in every iteration: no instruction of `lp` may define it. Every
+/// definition is checked ([`vreg_definitions`]), not only the last one in
+/// layout that `stack_slot_address_vreg` reads; a copy in the latch that
+/// moved the address to another slot was otherwise kept and ran once per
+/// vector iteration, and both lanes of an iteration accumulated into the
+/// slot the first lane saw.
 fn find_stack_slot_ordered_sub_accumulator(
     func: &MachFunction,
+    lp: &NaturalLoop,
     block_insts: &[InstId],
     reducer_pos: usize,
     lhs: VReg,
     sub_dst: VReg,
-    use_counts: &HashMap<u32, usize>,
-    defs: &HashMap<u32, InstId>,
+    maps: &VecMaps,
 ) -> Option<(VReg, InstId, InstId)> {
+    let (use_counts, defs) = (&maps.use_counts, &maps.defs);
     if lhs.class != RegClass::Gpr64
         || sub_dst.class != RegClass::Gpr64
         || use_counts.get(&lhs.id).copied().unwrap_or(0) != 1
@@ -656,6 +697,12 @@ fn find_stack_slot_ordered_sub_accumulator(
 
     let writeback_inst = *block_insts.get(reducer_pos + 1)?;
     let address = str_gpr64_to_stack_slot_address(func, writeback_inst, sub_dst, defs)?;
+    if vreg_definitions(func, address.id)
+        .iter()
+        .any(|(block_id, _, _)| lp.body.contains(block_id))
+    {
+        return None;
+    }
     let (load_pos, load_inst) = block_insts
         .iter()
         .copied()
@@ -703,7 +750,7 @@ fn is_dependency_free(
     induction: Option<VectorInduction>,
 ) -> bool {
     // Build the set of defs inside the loop body.
-    let mut loop_defs: HashMap<u32, InstId> = HashMap::new();
+    let mut loop_defs: HashMap<u32, InstId> = HashMap::default();
     for &block_id in &lp.body {
         let block = func.block(block_id);
         for &inst_id in &block.insts {
@@ -763,7 +810,7 @@ fn vectorized_defs_have_only_vector_consumers(
     ordered_sub_reductions: &[OrderedSubReduction],
 ) -> bool {
     let vectorizable_set: HashSet<InstId> = vectorizable_insts.iter().copied().collect();
-    let mut bridge_insts: HashSet<InstId> = HashSet::new();
+    let mut bridge_insts: HashSet<InstId> = HashSet::default();
 
     for idiom in compare_idioms {
         bridge_insts.insert(idiom.cmp_inst);
@@ -962,7 +1009,7 @@ fn find_i32_vector_induction(
                             vectorizable_insts,
                             inst_id,
                             loaded_from.id,
-                            &use_counts,
+                            use_counts,
                         )
                     {
                         (loaded_from, Some(alias))
@@ -976,7 +1023,7 @@ fn find_i32_vector_induction(
                             vectorizable_insts,
                             inst_id,
                             address,
-                            &use_counts,
+                            use_counts,
                             defs,
                         )
                         && has_i32_stack_slot_writeback(func, lp, address, dst)
@@ -1026,14 +1073,16 @@ fn find_i32_vector_induction(
                 continue;
             };
 
-            let lhs_is_one = defs
-                .get(&lhs.id)
-                .and_then(|&def| movz_i32_imm(func.inst(def)))
-                .is_some_and(|(_, imm)| imm == 1);
-            let rhs_is_one = defs
-                .get(&rhs.id)
-                .and_then(|&def| movz_i32_imm(func.inst(def)))
-                .is_some_and(|(_, imm)| imm == 1);
+            // The step register must be 1 on EVERY path (every def of the id
+            // is that `Movz`), not only in its last def in layout.
+            let is_one = |v: VReg| {
+                defs.get(&v.id)
+                    .and_then(|&def| movz_i32_imm(func.inst(def)))
+                    .is_some_and(|(_, imm)| imm == 1)
+                    && crate::mach_util::const_value(func, defs, v) == Some(1)
+            };
+            let lhs_is_one = is_one(lhs);
+            let rhs_is_one = is_one(rhs);
             let loaded_current = if lhs_is_one {
                 rhs
             } else if rhs_is_one {
@@ -1059,7 +1108,7 @@ fn find_i32_vector_induction(
                     vectorizable_insts,
                     inst_id,
                     scalar_current.id,
-                    &use_counts,
+                    use_counts,
                 ) else {
                     continue;
                 };
@@ -1088,7 +1137,7 @@ fn find_i32_vector_induction(
                     vectorizable_insts,
                     inst_id,
                     address,
-                    &use_counts,
+                    use_counts,
                     defs,
                 ) else {
                     continue;
@@ -1116,6 +1165,19 @@ fn find_i32_vector_induction(
     }
 
     if let Some(induction) = found.as_mut() {
+        // The rewrite maps the alias, and below the sign extension, to the
+        // induction's lanes, which is right only when the copy (the `Sxtw`)
+        // is the register's one definition: register work the plan leaves
+        // scalar can redefine it in the loop (`w40 = movz #5` after
+        // `w40 = mov w81` had the vectorized `rbit` read the lanes, not 5).
+        // Every definition is counted, not the last one in layout `defs`
+        // holds, and a second one refuses the loop.
+        if induction
+            .scalar_current_alias
+            .is_some_and(|alias| vreg_definitions(func, alias.id).len() != 1)
+        {
+            return Err(());
+        }
         let mut sign_extend = None;
         let induction_stack_address = defs.get(&induction.scalar_current.id).and_then(|&def| {
             ldr_i32_from_stack_slot(func, def, induction.scalar_current, None, defs)
@@ -1159,6 +1221,17 @@ fn find_i32_vector_induction(
                 {
                     continue;
                 }
+                // `source_matches` reads the source's last definition in
+                // layout: a copy laid out after a `movz` into the source that
+                // runs first still matched. The source must be the induction
+                // itself or have one definition, and the result must have
+                // one, the `Sxtw`.
+                if vreg_definitions(func, dst.id).len() != 1
+                    || (src.id != induction.scalar_current.id
+                        && vreg_definitions(func, src.id).len() != 1)
+                {
+                    return Err(());
+                }
                 if sign_extend.is_some() {
                     return Err(());
                 }
@@ -1175,22 +1248,37 @@ fn find_i32_vector_induction(
     Ok(found)
 }
 
+/// The compare a loop's estimated trip count comes from.
+#[derive(Debug, Clone, Copy)]
+struct TripCompare {
+    inst: InstId,
+    /// The constant bound, taken as the trip count.
+    trip_count: u32,
+    /// The operand holding the bound: a compare-immediate's immediate, or
+    /// the `CmpRR` register an earlier `Movz`/`Movk` of the block set.
+    bound_operand: usize,
+}
+
 /// Estimate the trip count of a loop from its structure.
 ///
 /// Looks for a simple counted loop pattern:
-/// - Compare against immediate in the latch or header.
-/// - The immediate is the trip count.
+/// - Compare against a constant in the latch or header.
+/// - The constant is the trip count.
 ///
 /// Returns None if the trip count cannot be determined statically.
-fn estimate_trip_count(func: &MachFunction, lp: &NaturalLoop) -> Option<u32> {
-    // Look in the latch block for a compare-immediate that controls the branch.
-    estimate_trip_count_in_block(func, lp.latch)
-        .or_else(|| estimate_trip_count_in_block(func, lp.header))
+fn find_trip_compare(func: &MachFunction, lp: &NaturalLoop) -> Option<TripCompare> {
+    // Look in the latch block for a compare that controls the branch.
+    trip_compare_in_block(func, lp.latch).or_else(|| trip_compare_in_block(func, lp.header))
 }
 
+#[cfg(test)]
 fn estimate_trip_count_in_block(func: &MachFunction, block_id: BlockId) -> Option<u32> {
+    trip_compare_in_block(func, block_id).map(|compare| compare.trip_count)
+}
+
+fn trip_compare_in_block(func: &MachFunction, block_id: BlockId) -> Option<TripCompare> {
     let block = func.block(block_id);
-    let mut constants: HashMap<VReg, u64> = HashMap::new();
+    let mut constants: HashMap<VReg, u64> = HashMap::default();
     for &inst_id in &block.insts {
         let inst = func.inst(inst_id);
         match inst.opcode {
@@ -1224,24 +1312,32 @@ fn estimate_trip_count_in_block(func: &MachFunction, block_id: BlockId) -> Optio
                 }
             }
             AArch64Opcode::CmpRR => {
-                for operand in &inst.operands {
+                for (bound_operand, operand) in inst.operands.iter().enumerate() {
                     if let Some(vreg) = vreg_from_operand(operand)
                         && let Some(&val) = constants.get(&vreg)
                         && val > 0
                         && val <= 100_000_000
                     {
-                        return Some(val as u32);
+                        return Some(TripCompare {
+                            inst: inst_id,
+                            trip_count: val as u32,
+                            bound_operand,
+                        });
                     }
                 }
             }
             AArch64Opcode::CmpRI | AArch64Opcode::CMPWri | AArch64Opcode::CMPXri => {
                 // The immediate operand is typically the last operand.
-                for operand in &inst.operands {
+                for (bound_operand, operand) in inst.operands.iter().enumerate() {
                     if let MachOperand::Imm(val) = operand
                         && *val > 0
                         && *val <= 100_000_000
                     {
-                        return Some(*val as u32);
+                        return Some(TripCompare {
+                            inst: inst_id,
+                            trip_count: *val as u32,
+                            bound_operand,
+                        });
                     }
                 }
             }
@@ -1249,6 +1345,844 @@ fn estimate_trip_count_in_block(func: &MachFunction, block_id: BlockId) -> Optio
         }
     }
     None
+}
+
+/// A rewrite the loop-state contract's iteration-coverage clause can admit
+/// although it is wrong. The in-place rewrite refuses each beside the clause
+/// (OD-LOOP-COVERAGE-20261008's reversal trigger, met 2026-10-10; the checks
+/// `95660b90e` deleted, and what the plan does not account for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClauseGap {
+    /// The header, which holds the loop's only exit test and is not its own
+    /// latch, runs work besides that test. The clause does not count a
+    /// top-tested loop's final, exiting header entry as an iteration, and the
+    /// rewrite counts only latch entries, so the work of that entry runs once
+    /// in the scalar loop and on `vf` lanes in the vector one while both
+    /// counts agree.
+    HeaderWork,
+    /// An instruction of the loop that the plan does not account for
+    /// ([`planned_insts`]) does more than compute registers
+    /// ([`computes_registers_only`]): it reads or writes memory, calls,
+    /// traps, or branches somewhere other than the header's exit test. The
+    /// rewrite leaves it scalar, so it runs once per vector iteration, not
+    /// once per scalar iteration, and the clause, which counts iterations,
+    /// does not see it: a store of the induction kept every second value at
+    /// VF=2.
+    UnplannedEffect,
+    /// A plan whose trip is not fixed at compile time
+    /// ([`trip_is_compile_time`]), an induction plan or a plain one. The
+    /// clause decides a trip that depends on a run-time value only at the
+    /// values it samples, so an unsampled value can leave a remainder that
+    /// the vector loop runs as extra lanes, or drop lanes.
+    RunTimeTrip,
+    /// Register work the plan leaves scalar defines, in the loop, a register
+    /// a planned instruction reads, and that value can reach the read inside
+    /// the loop ([`planned_input_gap`]). The rewrite runs the work once per
+    /// vector iteration, or gives the read lanes the work never writes, so
+    /// the read no longer sees what it sees in the scalar loop:
+    /// `x48 = movz #0` between the `acc64` bridge's load and its reducer was
+    /// kept once per vector iteration, and the rewrite subtracted both lanes
+    /// from 0 where the scalar loop subtracts each from 0.
+    UnplannedDefinition,
+    /// A read the rewrite gives lanes (a vectorized instruction's source, a
+    /// compare idiom's operand, the value a reduction bridge drains) of a
+    /// register other than the induction's sees a value its iteration does
+    /// not compute through a planned lane producer: one from before the
+    /// loop, one from the previous iteration, or one a scalar planned
+    /// instruction writes ([`planned_input_gap`]). The rewrite builds lanes
+    /// only for the induction and for the planned lane producers' results,
+    /// so such a read saw a SIMD register nothing writes ahead of it in the
+    /// iteration: a loop-invariant operand is never broadcast.
+    UncomputedLaneInput,
+}
+
+/// Why publishing `plan` on `func` needs more than the iteration-coverage
+/// clause, if it does: [`ClauseGap::HeaderWork`] unless the header is its own
+/// latch or runs only its exit test ([`header_runs_only_its_test`]),
+/// [`ClauseGap::UnplannedEffect`] unless every instruction of the loop the
+/// plan does not account for only computes registers
+/// ([`loop_effects_are_planned`]), [`ClauseGap::RunTimeTrip`] unless the
+/// plan's trip counter ([`plan_trip_counter`]) makes its trip fixed at
+/// compile time ([`trip_is_compile_time`]), and
+/// [`ClauseGap::UnplannedDefinition`] or [`ClauseGap::UncomputedLaneInput`]
+/// unless every planned instruction reads in the rewrite what it reads in
+/// the scalar loop ([`planned_input_gap`]).
+fn clause_gap(func: &MachFunction, plan: &VectorizationPlan) -> Option<ClauseGap> {
+    let lp = &plan.scalar_loop;
+    if lp.header != lp.latch && !header_runs_only_its_test(func, lp.header) {
+        return Some(ClauseGap::HeaderWork);
+    }
+    if !loop_effects_are_planned(func, plan) {
+        return Some(ClauseGap::UnplannedEffect);
+    }
+    let Some(counter) =
+        plan_trip_counter(func, plan).filter(|&counter| trip_is_compile_time(func, lp, counter))
+    else {
+        return Some(ClauseGap::RunTimeTrip);
+    };
+    planned_input_gap(func, plan, counter)
+}
+
+/// The instructions of the loop that `plan` rewrites or keeps on purpose:
+/// its vectorized instructions, compare idioms and reduction bridges (the
+/// ordered-sub accumulator's load, extension, reducer and write-back, a
+/// horizontal-any reducer), and the induction's step and sign extension.
+fn planned_insts(plan: &VectorizationPlan) -> HashSet<InstId> {
+    let mut planned: HashSet<InstId> = plan.vectorizable_insts.iter().copied().collect();
+    for idiom in &plan.compare_idioms {
+        planned.extend([idiom.cmp_inst, idiom.cset_inst]);
+    }
+    for reduction in &plan.horizontal_any_reductions {
+        planned.extend([reduction.compare.cmp_inst, reduction.compare.cset_inst]);
+        planned.insert(reduction.reducer_inst);
+    }
+    for reduction in &plan.ordered_sub_reductions {
+        planned.insert(reduction.reducer_inst);
+        planned.extend(reduction.extension_inst);
+        planned.extend(reduction.writeback_inst);
+        planned.extend(reduction.accumulator_load_inst);
+    }
+    if let Some(induction) = plan.induction {
+        planned.insert(induction.step_inst);
+        planned.extend(induction.sign_extend_inst);
+    }
+    planned
+}
+
+/// Whether running an instruction of `opcode` changes nothing but its
+/// register results and the flags: no memory access, call, trap, barrier or
+/// transfer of control other than an unconditional branch.
+fn computes_registers_only(opcode: AArch64Opcode) -> bool {
+    use AArch64Opcode::*;
+    matches!(
+        opcode,
+        MovR | Copy
+            | Movz
+            | Movk
+            | Movn
+            | MovI
+            | MOVWrr
+            | MOVXrr
+            | MOVZWi
+            | MOVZXi
+            | Nop
+            | AddRR
+            | AddRI
+            | SubRR
+            | SubRI
+            | MulRR
+            | Madd
+            | Msub
+            | Neg
+            | AndRR
+            | AndRI
+            | OrrRR
+            | OrrRI
+            | EorRR
+            | EorRI
+            | BicRR
+            | OrnRR
+            | LslRR
+            | LsrRR
+            | AsrRR
+            | LslRI
+            | LsrRI
+            | AsrRI
+            | RorRI
+            | Rbit
+            | Sxtw
+            | Uxtw
+            | Sxtb
+            | Sxth
+            | Uxtb
+            | Uxth
+            | Ubfm
+            | Sbfm
+            | Bfm
+            | CmpRR
+            | CmpRI
+            | CMPWrr
+            | CMPXrr
+            | CMPWri
+            | CMPXri
+            | Tst
+            | Csel
+            | CSet
+            | Csinc
+            | Csinv
+            | Csneg
+            | Adrp
+            | Adr
+            | AddPCRel
+            | B
+    )
+}
+
+/// Whether every instruction of `plan`'s loop is accounted for by the plan
+/// ([`planned_insts`]), only computes registers
+/// ([`computes_registers_only`]), or is the header's conditional exit
+/// branch. The rewrite runs each instruction it leaves scalar once per
+/// vector iteration: a store, load, call or trap would run (or fault) on one
+/// lane in `vf`, and another conditional branch would decide for every lane
+/// what runs.
+///
+/// What each lane computes is not the coverage clause's to decide: the
+/// clause decides the iteration count only. Register work left scalar, run
+/// once per vector iteration, must change nothing a planned instruction
+/// reads, and every read the rewrite gives lanes must see lanes the
+/// iteration computes; [`planned_input_gap`] refuses a plan where either
+/// can fail. Each reader of the induction's lanes must read in them what it
+/// reads in the scalar loop; [`induction_lanes_reach_every_reader`]
+/// declines the rewrite where it cannot. These check what the planned
+/// instructions read, not what the vector instructions compute from it,
+/// and are not a proof that each lane computes the scalar iteration's value.
+fn loop_effects_are_planned(func: &MachFunction, plan: &VectorizationPlan) -> bool {
+    let planned = planned_insts(plan);
+    let lp = &plan.scalar_loop;
+    lp.body.iter().all(|&block_id| {
+        func.block(block_id).insts.iter().all(|&inst_id| {
+            let opcode = func.inst(inst_id).opcode;
+            planned.contains(&inst_id)
+                || computes_registers_only(opcode)
+                || (block_id == lp.header && opcode == AArch64Opcode::BCond)
+        })
+    })
+}
+
+/// How the rewrite treats a planned instruction's read of a register
+/// ([`planned_reads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PlannedRead {
+    /// The rewrite gives the read lanes (`reg_map`): a vectorized
+    /// instruction's source, a compare idiom's operand, the value an
+    /// ordered-sub bridge drains (its extension's source and the reducer's
+    /// subtrahend) and the compare result a horizontal-any reducer drains.
+    Lanes,
+    /// The read stays scalar and runs once per vector iteration: a reduction
+    /// bridge's accumulator, address or stored value, the induction's sign
+    /// extension, and a copy the induction's lanes stand for.
+    Scalar,
+    /// The header's exit compare and the trip counter's step, and a copy
+    /// either reads.
+    Counter,
+}
+
+/// The registers `inst` reads.
+fn source_vregs(inst: &MachInst) -> Vec<VReg> {
+    let mut vregs = Vec::new();
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if let Some(MachOperand::VReg(vreg)) = inst.operands.get(pos) {
+            vregs.push(*vreg);
+        }
+    });
+    vregs
+}
+
+/// Every register the planned instructions of `plan` read, as (reader,
+/// register, how the rewrite reads it). The planned instructions are the
+/// vectorized instructions, the compare idioms, the reduction bridges (an
+/// ordered-sub's extension, reducer, accumulator load and write-back, a
+/// horizontal-any reducer), the induction's sign extension, the header's
+/// exit compare and the trip counter's step (`counter`). A reducer's
+/// accumulator stays scalar and its drained value gets lanes.
+fn planned_reads(
+    func: &MachFunction,
+    plan: &VectorizationPlan,
+    counter: TripCounter,
+) -> Vec<(InstId, VReg, PlannedRead)> {
+    let mut reads = Vec::new();
+    let mut push = |inst_id: InstId, kind: PlannedRead| {
+        for vreg in source_vregs(func.inst(inst_id)) {
+            reads.push((inst_id, vreg, kind));
+        }
+    };
+    for &inst_id in &plan.vectorizable_insts {
+        push(inst_id, PlannedRead::Lanes);
+    }
+    for idiom in &plan.compare_idioms {
+        push(idiom.cmp_inst, PlannedRead::Lanes);
+    }
+    for reduction in &plan.ordered_sub_reductions {
+        if let Some(inst_id) = reduction.extension_inst {
+            push(inst_id, PlannedRead::Lanes);
+        }
+        for inst_id in [reduction.accumulator_load_inst, reduction.writeback_inst]
+            .into_iter()
+            .flatten()
+        {
+            push(inst_id, PlannedRead::Scalar);
+        }
+    }
+    if let Some(sign_extend) = plan
+        .induction
+        .and_then(|induction| induction.sign_extend_inst)
+    {
+        push(sign_extend, PlannedRead::Scalar);
+    }
+    if let Some(cmp_pos) = header_exit_compare(func, plan.scalar_loop.header) {
+        push(
+            func.block(plan.scalar_loop.header).insts[cmp_pos],
+            PlannedRead::Counter,
+        );
+    }
+    push(counter.step_inst, PlannedRead::Counter);
+    // `sub dst, lhs, value`: the accumulator `lhs`, and the lanes `value`.
+    for reduction in &plan.ordered_sub_reductions {
+        let reducer = func.inst(reduction.reducer_inst);
+        for (pos, kind) in [(1, PlannedRead::Scalar), (2, PlannedRead::Lanes)] {
+            if let Some(vreg) = reducer.operands.get(pos).and_then(vreg_from_operand) {
+                reads.push((reduction.reducer_inst, vreg, kind));
+            }
+        }
+    }
+    // `orr acc, acc, cmp_bool`: the accumulator, and the compare's lanes.
+    for reduction in &plan.horizontal_any_reductions {
+        let compare_result = def_vreg_id(func.inst(reduction.compare.cset_inst));
+        for vreg in source_vregs(func.inst(reduction.reducer_inst)) {
+            let kind = if Some(vreg.id) == compare_result {
+                PlannedRead::Lanes
+            } else {
+                PlannedRead::Scalar
+            };
+            reads.push((reduction.reducer_inst, vreg, kind));
+        }
+    }
+    reads
+}
+
+/// Whether control can run from the instruction at position `from.1` of
+/// block `from.0` (that one included) to the read at `to` with no
+/// instruction writing a register of id `id` on the way: along `lp`'s edges
+/// only, and into its header only when `around` (an edge into the header
+/// from inside the loop is a back edge, so without it the path stays in one
+/// iteration).
+fn write_free_path(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    id: u32,
+    from: (BlockId, usize),
+    to: (BlockId, usize),
+    around: bool,
+) -> bool {
+    let writes = |block: BlockId, start: usize, end: usize| {
+        let insts = &func.block(block).insts;
+        insts[start.min(insts.len())..end.min(insts.len())]
+            .iter()
+            .any(|&inst_id| {
+                let mut hit = false;
+                for_each_inst_def(func.inst(inst_id), |def| hit |= def.id == id);
+                hit
+            })
+    };
+    let ((from_block, from_pos), (to_block, to_pos)) = (from, to);
+    if from_block == to_block && from_pos <= to_pos {
+        return !writes(from_block, from_pos, to_pos);
+    }
+    if writes(from_block, from_pos, usize::MAX) {
+        return false;
+    }
+    let mut seen: HashSet<BlockId> = HashSet::default();
+    let mut work: Vec<BlockId> = func.block(from_block).succs.clone();
+    while let Some(block) = work.pop() {
+        if !lp.body.contains(&block) || (!around && block == lp.header) || !seen.insert(block) {
+            continue;
+        }
+        if block == to_block && !writes(block, 0, to_pos) {
+            return true;
+        }
+        if !writes(block, 0, usize::MAX) {
+            work.extend(func.block(block).succs.iter().copied());
+        }
+    }
+    false
+}
+
+/// Why a planned instruction of `plan` may read, in the rewrite, another
+/// value than in the scalar loop, if it may. `counter` is the plan's trip
+/// counter, whose trip [`trip_is_compile_time`] has fixed.
+///
+/// The rewrite keeps register work it does not plan scalar and runs it once
+/// per vector iteration, and gives a planned read lanes or keeps it scalar
+/// ([`planned_reads`]). Each read is checked over the loop's paths, a
+/// definition counting where it can reach the read with no other write of
+/// the register between ([`write_free_path`]), around the back edge too:
+/// - [`ClauseGap::UnplannedDefinition`]: an in-loop definition the plan does
+///   not make reaches it. The plan's own definitions are its planned
+///   instructions and the counter's step, and the copies and constants it
+///   accounts for: for a read that stays scalar or gets lanes, the copy of
+///   the induction into its alias or into the register its sign extension
+///   reads, and the copy of the step's result into the induction (where
+///   they sit is [`induction_lanes_reach_every_reader`]'s); for the trip
+///   test and the step, any copy or move-wide constant (which ones is
+///   [`trip_is_compile_time`]'s). A copy the plan accounts for is checked
+///   in turn as a reader of its source.
+/// - [`ClauseGap::UncomputedLaneInput`]: a read given lanes, of a register
+///   other than the induction, its alias and its sign extension (whose
+///   lanes [`induction_lanes_reach_every_reader`] checks), does not see on
+///   every path a value its iteration computes by a planned lane producer
+///   (a vectorized instruction, a compare idiom's `cset`, an ordered-sub
+///   extension): the value the register holds as the iteration starts, from
+///   before the loop or from the previous iteration, reaches it, or a
+///   scalar planned instruction's does.
+///
+/// It decides what the planned instructions read, on MachIR register
+/// identities; it is not a proof that each lane computes the scalar
+/// iteration's value.
+fn planned_input_gap(
+    func: &MachFunction,
+    plan: &VectorizationPlan,
+    counter: TripCounter,
+) -> Option<ClauseGap> {
+    let lp = &plan.scalar_loop;
+    let mut planned = planned_insts(plan);
+    planned.insert(counter.step_inst);
+    let lane_producers: HashSet<InstId> = plan
+        .vectorizable_insts
+        .iter()
+        .copied()
+        .chain(plan.compare_idioms.iter().map(|idiom| idiom.cset_inst))
+        .chain(
+            plan.ordered_sub_reductions
+                .iter()
+                .filter_map(|reduction| reduction.extension_inst),
+        )
+        .collect();
+    let induction = plan.induction;
+    let induction_lanes: HashSet<u32> = induction
+        .map(|induction| {
+            [
+                Some(induction.scalar_current),
+                induction.scalar_current_alias,
+                induction.sign_extended_current,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|vreg| vreg.id)
+            .collect()
+        })
+        .unwrap_or_default();
+    let sign_extend_source = induction
+        .and_then(|induction| induction.sign_extend_inst)
+        .and_then(|inst_id| {
+            func.inst(inst_id)
+                .operands
+                .get(1)
+                .and_then(vreg_from_operand)
+        });
+    // The copies the plan makes into the induction's registers: the step's
+    // result into the induction, the induction into its alias and into the
+    // register its sign extension reads.
+    let induction_copy = |vreg: VReg, def: InstId| {
+        let (Some(induction), Some((dst, src))) = (induction, gpr32_copy(func.inst(def))) else {
+            return false;
+        };
+        dst.id == vreg.id
+            && if vreg.id == induction.scalar_current.id {
+                src.id == induction.scalar_next.id
+            } else {
+                src.id == induction.scalar_current.id
+                    && (induction
+                        .scalar_current_alias
+                        .is_some_and(|alias| alias.id == vreg.id)
+                        || sign_extend_source.is_some_and(|source| source.id == vreg.id))
+            }
+    };
+    let copy_or_constant = |def: InstId| {
+        let inst = func.inst(def);
+        gpr32_copy(inst).is_some()
+            || matches!(inst.opcode, AArch64Opcode::Movz | AArch64Opcode::Movk)
+    };
+
+    let mut work = planned_reads(func, plan, counter);
+    let mut seen: HashSet<(InstId, u32, PlannedRead)> = HashSet::default();
+    while let Some((reader, vreg, kind)) = work.pop() {
+        if !seen.insert((reader, vreg.id, kind)) {
+            continue;
+        }
+        // Every planned instruction comes from a block of the loop.
+        let Some(read_at) = block_inst_position(func, reader) else {
+            return Some(ClauseGap::UnplannedDefinition);
+        };
+        let lane_input = kind == PlannedRead::Lanes && !induction_lanes.contains(&vreg.id);
+        if lane_input && write_free_path(func, lp, vreg.id, (lp.header, 0), read_at, false) {
+            return Some(ClauseGap::UncomputedLaneInput);
+        }
+        for (block_id, pos, def) in vreg_definitions(func, vreg.id) {
+            if !lp.body.contains(&block_id)
+                || !write_free_path(func, lp, vreg.id, (block_id, pos + 1), read_at, true)
+            {
+                continue;
+            }
+            if lane_input {
+                if lane_producers.contains(&def) {
+                    continue;
+                }
+                return Some(if planned.contains(&def) {
+                    ClauseGap::UncomputedLaneInput
+                } else {
+                    ClauseGap::UnplannedDefinition
+                });
+            }
+            if planned.contains(&def) {
+                continue;
+            }
+            let accounted_for = match kind {
+                PlannedRead::Counter => copy_or_constant(def),
+                PlannedRead::Lanes | PlannedRead::Scalar => induction_copy(vreg, def),
+            };
+            if !accounted_for {
+                return Some(ClauseGap::UnplannedDefinition);
+            }
+            if let Some((_, source)) = gpr32_copy(func.inst(def)) {
+                let copy_kind = if kind == PlannedRead::Counter {
+                    PlannedRead::Counter
+                } else {
+                    PlannedRead::Scalar
+                };
+                work.push((def, source, copy_kind));
+            }
+        }
+    }
+    None
+}
+
+/// The position in `header` of its exit compare: the compare right before
+/// the `b.cond`, `b` that end the block.
+fn header_exit_compare(func: &MachFunction, header: BlockId) -> Option<usize> {
+    let insts = &func.block(header).insts;
+    let [.., cmp, bcond, branch] = insts.as_slice() else {
+        return None;
+    };
+    (matches!(
+        func.inst(*cmp).opcode,
+        AArch64Opcode::CmpRR | AArch64Opcode::CmpRI | AArch64Opcode::CMPWri | AArch64Opcode::CMPXri
+    ) && func.inst(*bcond).opcode == AArch64Opcode::BCond
+        && func.inst(*branch).opcode == AArch64Opcode::B)
+        .then(|| insts.len() - 3)
+}
+
+/// Whether `header` runs nothing but its exit test: copies and constants
+/// (`MovR`, `Copy`, `Movz`, `Movk`), then the compare, `b.cond` and `b`
+/// ([`header_exit_compare`]). No loop work then runs on the final header
+/// entry, the one a top-tested loop leaves from.
+fn header_runs_only_its_test(func: &MachFunction, header: BlockId) -> bool {
+    header_exit_compare(func, header).is_some_and(|cmp_pos| {
+        func.block(header).insts[..cmp_pos].iter().all(|&inst_id| {
+            matches!(
+                func.inst(inst_id).opcode,
+                AArch64Opcode::MovR
+                    | AArch64Opcode::Copy
+                    | AArch64Opcode::Movz
+                    | AArch64Opcode::Movk
+            )
+        })
+    })
+}
+
+/// The register a loop's exit test counts and the instruction that advances
+/// it: an induction plan's induction, or a plain plan's counter.
+#[derive(Debug, Clone, Copy)]
+struct TripCounter {
+    /// The register the header's exit compare reads, itself or through
+    /// header copies.
+    current: VReg,
+    /// The register the step writes: `current` itself, or a register the
+    /// loop copies into it.
+    next: VReg,
+    /// The instruction that computes `next`.
+    step_inst: InstId,
+}
+
+/// `plan`'s trip counter, when its step reads only the counter and
+/// constants: for an induction plan, the induction, whose `AddRI` step reads
+/// the induction itself or a register defined only as a copy of it; for a
+/// plain (no induction) plan, [`plain_trip_counter`].
+fn plan_trip_counter(func: &MachFunction, plan: &VectorizationPlan) -> Option<TripCounter> {
+    let Some(induction) = plan.induction else {
+        return plain_trip_counter(func, &plan.scalar_loop);
+    };
+    let current = induction.scalar_current;
+    let (next, source, _) = addri_i32_step(func.inst(induction.step_inst))?;
+    (source.id == current.id || defined_only_as_copies_of(func, source, current)).then_some(
+        TripCounter {
+            current,
+            next,
+            step_inst: induction.step_inst,
+        },
+    )
+}
+
+/// A plain (no induction) plan's trip counter: the register the header's
+/// exit compare reads, through header copies ([`header_copy_root`]), whose
+/// next value one in-loop instruction computes. That step is an i32 `AddRI`,
+/// `SubRI`, `AddRR`, `SubRR`, `MulRR` or `Madd` reading only immediates, the
+/// counter, registers defined only as copies of it, and registers defined
+/// once, by a `Movz`.
+fn plain_trip_counter(func: &MachFunction, lp: &NaturalLoop) -> Option<TripCounter> {
+    let cmp_pos = header_exit_compare(func, lp.header)?;
+    let cmp = func.inst(func.block(lp.header).insts[cmp_pos]);
+    let tested = cmp.operands.first().and_then(gpr32_vreg_from_operand)?;
+    let current = header_copy_root(func, lp, tested, cmp_pos);
+    let in_loop_definitions = |id: u32| -> Vec<InstId> {
+        vreg_definitions(func, id)
+            .into_iter()
+            .filter(|(block_id, _, _)| lp.body.contains(block_id))
+            .map(|(_, _, inst_id)| inst_id)
+            .collect()
+    };
+    let next = in_loop_definitions(current.id)
+        .into_iter()
+        .find_map(|inst_id| gpr32_copy(func.inst(inst_id)).map(|(_, src)| src))
+        .unwrap_or(current);
+    let &[step_inst] = in_loop_definitions(next.id).as_slice() else {
+        return None;
+    };
+    let step = func.inst(step_inst);
+    let reads_counter_or_constant = |operand: &MachOperand| match operand {
+        MachOperand::Imm(_) => true,
+        MachOperand::VReg(vreg) => {
+            vreg.id == current.id
+                || defined_only_as_copies_of(func, *vreg, current)
+                || defined_once_by_movz(func, *vreg)
+        }
+        _ => false,
+    };
+    (matches!(
+        step.opcode,
+        AArch64Opcode::AddRI
+            | AArch64Opcode::SubRI
+            | AArch64Opcode::AddRR
+            | AArch64Opcode::SubRR
+            | AArch64Opcode::MulRR
+            | AArch64Opcode::Madd
+    ) && step
+        .operands
+        .first()
+        .and_then(gpr32_vreg_from_operand)
+        .is_some_and(|dst| dst.id == next.id)
+        && step.operands[1..].iter().all(reads_counter_or_constant))
+    .then_some(TripCounter {
+        current,
+        next,
+        step_inst,
+    })
+}
+
+/// Whether a plan's trip is fixed at compile time:
+/// - the header's exit compare ([`header_exit_compare`]) is the constant trip
+///   compare `trip_compare_in_block` reads, with the bound as its second
+///   operand, and a `CmpRR` bound is defined only by the header's
+///   `Movz`/`Movk` ahead of the compare;
+/// - it tests the trip counter or a header copy of it ([`header_copy_of`]);
+/// - the counter changes in the loop only by its step
+///   ([`advanced_only_by_its_step`]), which reads only the counter and
+///   constants ([`plan_trip_counter`]), and enters the loop as a constant
+///   ([`counter_entry_value`]).
+///
+/// The iteration-coverage clause then has no input for the trip (no other
+/// branch or trap is in the loop, [`loop_effects_are_planned`]), and its one
+/// run decides the rewritten loop's iteration count exactly. It decides the
+/// count only: what the planned instructions read is checked beside it
+/// ([`planned_input_gap`]), and what each lane computes from that is the
+/// pass's premise ([`loop_effects_are_planned`]).
+fn trip_is_compile_time(func: &MachFunction, lp: &NaturalLoop, counter: TripCounter) -> bool {
+    let Some(cmp_pos) = header_exit_compare(func, lp.header) else {
+        return false;
+    };
+    let cmp_id = func.block(lp.header).insts[cmp_pos];
+    let cmp = func.inst(cmp_id);
+    let Some(tested) = cmp.operands.first().and_then(gpr32_vreg_from_operand) else {
+        return false;
+    };
+    let bound_is_header_constant = cmp.opcode != AArch64Opcode::CmpRR
+        || (cmp.operands.len() == 2
+            && cmp
+                .operands
+                .get(1)
+                .and_then(vreg_from_operand)
+                .is_some_and(|bound| {
+                    vreg_definitions(func, bound.id)
+                        .iter()
+                        .all(|&(block_id, pos, inst_id)| {
+                            block_id == lp.header
+                                && pos < cmp_pos
+                                && matches!(
+                                    func.inst(inst_id).opcode,
+                                    AArch64Opcode::Movz | AArch64Opcode::Movk
+                                )
+                        })
+                }));
+    trip_compare_in_block(func, lp.header)
+        .is_some_and(|trip| trip.inst == cmp_id && trip.bound_operand == 1)
+        && bound_is_header_constant
+        && header_copy_of(func, lp, counter.current, tested, cmp_pos)
+        && advanced_only_by_its_step(func, lp, counter)
+        && counter_entry_value(func, lp, counter.current).is_some()
+}
+
+/// Whether the counter changes inside `lp` only by its step, once in every
+/// iteration: the step is in the latch, every in-loop definition of the
+/// counter is the step itself or a copy of the step's result after it in
+/// the latch, and the step's result has no other in-loop definition. The
+/// header then tests the value the counter entered with or the one the last
+/// iteration's step computed, never one that reaches it another way (a
+/// header copy of the step's result made the first test read a run-time
+/// value).
+fn advanced_only_by_its_step(func: &MachFunction, lp: &NaturalLoop, counter: TripCounter) -> bool {
+    let Some(step_pos) = func
+        .block(lp.latch)
+        .insts
+        .iter()
+        .position(|&inst_id| inst_id == counter.step_inst)
+    else {
+        return false;
+    };
+    let in_loop_definitions = |id: u32| {
+        vreg_definitions(func, id)
+            .into_iter()
+            .filter(|(block_id, _, _)| lp.body.contains(block_id))
+    };
+    in_loop_definitions(counter.current.id).all(|(block_id, pos, inst_id)| {
+        inst_id == counter.step_inst
+            || (block_id == lp.latch
+                && pos > step_pos
+                && gpr32_copy(func.inst(inst_id)).is_some_and(|(_, src)| src.id == counter.next.id))
+    }) && in_loop_definitions(counter.next.id).all(|(_, _, inst_id)| inst_id == counter.step_inst)
+}
+
+/// Every definition of register `id`, as (block, position in block, inst).
+fn vreg_definitions(func: &MachFunction, id: u32) -> Vec<(BlockId, usize, InstId)> {
+    let mut sites = Vec::new();
+    for &block_id in &func.block_order {
+        for (pos, &inst_id) in func.block(block_id).insts.iter().enumerate() {
+            let mut defines = false;
+            for_each_inst_def(func.inst(inst_id), |def| defines |= def.id == id);
+            if defines {
+                sites.push((block_id, pos, inst_id));
+            }
+        }
+    }
+    sites
+}
+
+/// A `MovR`/`Copy` between two Gpr32 virtual registers, as `(dst, src)`.
+fn gpr32_copy(inst: &MachInst) -> Option<(VReg, VReg)> {
+    if !matches!(inst.opcode, AArch64Opcode::MovR | AArch64Opcode::Copy) || inst.operands.len() != 2
+    {
+        return None;
+    }
+    Some((
+        gpr32_vreg_from_operand(&inst.operands[0])?,
+        gpr32_vreg_from_operand(&inst.operands[1])?,
+    ))
+}
+
+/// Whether `vreg` has a definition and every one is a Gpr32 copy of `of`.
+fn defined_only_as_copies_of(func: &MachFunction, vreg: VReg, of: VReg) -> bool {
+    let defs = vreg_definitions(func, vreg.id);
+    !defs.is_empty()
+        && defs.iter().all(|&(_, _, inst_id)| {
+            gpr32_copy(func.inst(inst_id)).is_some_and(|(_, src)| src.id == of.id)
+        })
+}
+
+/// Whether `vreg`'s one definition in the function is a shift-free `Movz`.
+fn defined_once_by_movz(func: &MachFunction, vreg: VReg) -> bool {
+    matches!(
+        vreg_definitions(func, vreg.id).as_slice(),
+        &[(_, _, inst_id)] if crate::reaching_const::movz_value(func.inst(inst_id))
+            .is_some_and(|(dst, _)| dst.id == vreg.id)
+    )
+}
+
+/// The constant the counter register `current` holds when control enters
+/// the loop, when the register shape proves it: `current` has exactly one
+/// definition outside the loop, in the preheader, and that is a shift-free
+/// `Movz`, or a chain of Gpr32 copies from registers defined exactly once,
+/// outside the loop, that ends in one. Anything else (a stack-slot induction
+/// included) is unproved.
+fn counter_entry_value(func: &MachFunction, lp: &NaturalLoop, current: VReg) -> Option<u64> {
+    let preheader = lp.preheader?;
+    let outside: Vec<_> = vreg_definitions(func, current.id)
+        .into_iter()
+        .filter(|(block_id, _, _)| !lp.body.contains(block_id))
+        .collect();
+    let &[(block_id, _, mut def)] = outside.as_slice() else {
+        return None;
+    };
+    if block_id != preheader {
+        return None;
+    }
+    let mut vreg = current;
+    for _ in 0..8 {
+        let inst = func.inst(def);
+        if let Some((dst, value)) = crate::reaching_const::movz_value(inst) {
+            return (dst.id == vreg.id).then_some(value);
+        }
+        let (dst, src) = gpr32_copy(inst)?;
+        let defs = vreg_definitions(func, src.id);
+        let &[(src_block, _, src_def)] = defs.as_slice() else {
+            return None;
+        };
+        if dst.id != vreg.id || lp.body.contains(&src_block) {
+            return None;
+        }
+        vreg = src;
+        def = src_def;
+    }
+    None
+}
+
+/// The register at the root of the chain of Gpr32 copies that defines
+/// `tested`, read at position `before` of the header: the first register in
+/// the chain that is not defined exactly once, in the header, ahead of its
+/// reader, by a copy.
+fn header_copy_root(func: &MachFunction, lp: &NaturalLoop, tested: VReg, before: usize) -> VReg {
+    let (mut vreg, mut before) = (tested, before);
+    for _ in 0..8 {
+        let defs = vreg_definitions(func, vreg.id);
+        let &[(block_id, pos, def)] = defs.as_slice() else {
+            return vreg;
+        };
+        let Some((dst, src)) = gpr32_copy(func.inst(def)) else {
+            return vreg;
+        };
+        if block_id != lp.header || pos >= before || dst.id != vreg.id {
+            return vreg;
+        }
+        (vreg, before) = (src, pos);
+    }
+    vreg
+}
+
+/// Whether `tested`, read at position `before` of the header, is the
+/// counter register `current` itself or a chain of Gpr32 copies of it, each
+/// defined exactly once, in the header, ahead of its reader.
+fn header_copy_of(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    current: VReg,
+    tested: VReg,
+    before: usize,
+) -> bool {
+    let (mut vreg, mut before) = (tested, before);
+    for _ in 0..8 {
+        if vreg.id == current.id {
+            return true;
+        }
+        let defs = vreg_definitions(func, vreg.id);
+        let &[(block_id, pos, def)] = defs.as_slice() else {
+            return false;
+        };
+        let Some((dst, src)) = gpr32_copy(func.inst(def)) else {
+            return false;
+        };
+        if block_id != lp.header || pos >= before || dst.id != vreg.id {
+            return false;
+        }
+        (vreg, before) = (src, pos);
+    }
+    false
 }
 
 fn loop_has_rbit_result_type(func: &MachFunction, insts: &[InstId], reg_class: RegClass) -> bool {
@@ -1306,7 +2240,7 @@ pub fn analyze_loop_with(
 ) -> Option<VectorizationPlan> {
     // Collect vectorizable instructions and their element types.
     let mut vectorizable_insts: Vec<InstId> = Vec::new();
-    let mut element_types: HashMap<VecElementType, u32> = HashMap::new();
+    let mut element_types: HashMap<VecElementType, u32> = HashMap::default();
 
     for &block_id in &lp.body {
         let block = func.block(block_id);
@@ -1439,8 +2373,18 @@ pub fn analyze_loop_with(
         return None;
     }
 
-    // Estimate trip count.
-    let trip_count = estimate_trip_count(func, lp);
+    // Estimate trip count. Whether the rewritten loop runs exactly the
+    // scalar loop's iterations (a divided trip compare on the induction
+    // itself, a remainder, an undivided bound past an odd trip count, a
+    // nonzero start, an inclusive test) is not decided here: the loop-state
+    // contract's iteration-coverage clause runs the rewritten loop against
+    // the scalar one before it is published (`apply_vectorization_impl`).
+    // What the clause cannot decide (work on the exiting header entry, an
+    // instruction the plan leaves scalar that does more than compute
+    // registers, a trip that depends on a run-time value, a planned read
+    // that register work left scalar changes or whose lanes the rewrite
+    // does not compute) publication refuses beside it (`clause_gap`).
+    let trip_count = find_trip_compare(func, lp).map(|compare| compare.trip_count);
 
     // Cost analysis: compare scalar vs NEON.
     let tc = trip_count.unwrap_or(64); // assume 64 iterations if unknown
@@ -1471,7 +2415,31 @@ pub fn analyze_loop_with(
     // scalar RBIT recurrences per unrolled step.
     let is_profitable = mixed_width_bitreverse_induction || neon_cost < scalar_cost;
 
+    // LOOP STATE (`crate::loop_contract`): the rewrite runs the loop itself
+    // `vf` times fewer (the trip test is divided) and upgrades every vectorized
+    // register to a fresh SIMD register, so no scalar register the loop writes
+    // holds its scalar value once control leaves. None may be live into an
+    // exit. (`vectorized_defs_have_only_vector_consumers` above also keeps the
+    // vectorized values from any scalar consumer; this adds the registers it
+    // does not see, the loop counter included.)
+    //
+    // The rewritten loop runs only iterations its divided trip test admits,
+    // so the header's test must be the loop's only exit.
+    let exit = exit_of_test(func, lp.body.iter().copied(), lp.header)?;
+    let scope = LoopLocality::check_covered(
+        func,
+        lp.body.iter().copied(),
+        lp.header,
+        lp.preheader?,
+        &ExitPlan::loop_test(lp.header, exit),
+        Handoff::Exits,
+        &[],
+    )
+    .ok()?;
+
     Some(VectorizationPlan {
+        scope,
+        scalar_loop: lp.clone(),
         loop_header: lp.header,
         loop_latch: lp.latch,
         trip_count,
@@ -2010,12 +2978,76 @@ struct Contains4MemoryChunk {
 
 #[derive(Debug, Clone, Copy)]
 struct I32InductionStoreLoop {
+    /// The loop-state contract (`crate::loop_contract`) passed for the
+    /// register index, if any. The plan cannot be built without it.
+    _locality: LoopLocality,
     preheader: BlockId,
     header: BlockId,
     branch_to_header: InstId,
     index: I32InductionStoreIndex,
+    /// Loop-invariant bound the scalar header compares against.
     bound: VReg,
+    /// Loop-invariant array base (a body-local copy resolved to its source).
     array_base: VReg,
+}
+
+/// The i32 induction-store loop test: `index < bound`, signed.
+#[derive(Debug, Clone, Copy)]
+struct I32InductionStoreHeader {
+    index: I32InductionStoreIndex,
+    bound: VReg,
+    body: BlockId,
+    exit: BlockId,
+}
+
+/// The matched `a[index] = index + 1` body.
+#[derive(Debug, Clone)]
+struct I32InductionStoreBody {
+    /// The register-form add's unit operand; `None` for `AddRI #1`.
+    one: Option<VReg>,
+    /// A body-local `Movz #1` admitted into the body: the add's unit, or a
+    /// dead leftover of the imported-O0 shape.
+    one_inst: Option<InstId>,
+    /// The index as the body reads it.
+    index_view: VReg,
+    /// The body copy or reload that produces `index_view`, if any.
+    index_view_inst: Option<InstId>,
+    value_inst: InstId,
+    sign_extend_inst: InstId,
+    address_inst: InstId,
+    store_inst: InstId,
+    element_size: VReg,
+    /// A body-local definition of the element size, if any.
+    element_size_inst: Option<InstId>,
+    /// The address computation's base operand.
+    addend: VReg,
+    /// The body-local copy that produces `addend`, if any.
+    base_copy_inst: Option<InstId>,
+    /// `addend` resolved through `base_copy_inst`.
+    array_base: VReg,
+}
+
+impl I32InductionStoreBody {
+    fn allowed_insts(&self) -> Vec<InstId> {
+        let mut allowed = vec![
+            self.value_inst,
+            self.sign_extend_inst,
+            self.address_inst,
+            self.store_inst,
+        ];
+        for inst in [
+            self.one_inst,
+            self.index_view_inst,
+            self.element_size_inst,
+            self.base_copy_inst,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            push_unique_inst(&mut allowed, inst);
+        }
+        allowed
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2080,7 +3112,7 @@ fn build_def_map_inner(func: &MachFunction) -> HashMap<u32, InstId> {
 }
 
 fn build_vreg_use_counts(func: &MachFunction) -> HashMap<u32, usize> {
-    let mut uses = HashMap::new();
+    let mut uses = HashMap::default();
     for &block in &func.block_order {
         for &iid in &func.block(block).insts {
             let inst = func.inst(iid);
@@ -2323,7 +3355,7 @@ fn match_i32_induction_store_header(
     func: &MachFunction,
     block: BlockId,
     defs: &HashMap<u32, InstId>,
-) -> Option<(I32InductionStoreIndex, VReg, BlockId, BlockId)> {
+) -> Option<I32InductionStoreHeader> {
     const AARCH64_COND_NE: i64 = 1;
     const AARCH64_COND_LT: i64 = 11;
 
@@ -2344,26 +3376,44 @@ fn match_i32_induction_store_header(
     }
     let cmp_index = gpr32_vreg_from_operand(&cmp.operands[0])?;
     let cmp_bound = gpr32_vreg_from_operand(&cmp.operands[1])?;
-    let stack_index =
-        ldr_i32_from_stack_slot_in_insts(func, &insts[..cmp_pos], cmp_index, None, defs);
-    if insts[..cmp_pos].iter().any(|&inst_id| {
-        func.inst(inst_id).opcode != AArch64Opcode::MovR
-            && stack_index.is_none_or(|(_, load_inst)| load_inst != inst_id)
-    }) {
+
+    // Before the compare the header may only produce the two compared
+    // registers: the index as a copy or a stack reload, the bound as a copy.
+    // Each is the nearest write before the compare, so it is what the compare
+    // reads; anything else the header computes is outside the idiom.
+    let cmp_block_pos = func
+        .block(block)
+        .insts
+        .iter()
+        .position(|&inst_id| inst_id == cmp_id)?;
+    let index_def = loop_contract::reaching_def_in_block(func, block, cmp_block_pos, cmp_index);
+    let bound_def = loop_contract::reaching_def_in_block(func, block, cmp_block_pos, cmp_bound);
+    let index = match index_def {
+        None => I32InductionStoreIndex::Register(cmp_index),
+        Some(def) => match movr_vreg_copy(func.inst(def)) {
+            Some((dst, src)) if dst == cmp_index && src.class == RegClass::Gpr32 => {
+                I32InductionStoreIndex::Register(src)
+            }
+            Some(_) => return None,
+            None => I32InductionStoreIndex::StackSlot {
+                address: ldr_i32_from_stack_slot(func, def, cmp_index, None, defs)?,
+            },
+        },
+    };
+    let bound = match bound_def {
+        None => cmp_bound,
+        Some(def) => match movr_vreg_copy(func.inst(def)) {
+            Some((dst, src)) if dst == cmp_bound && src.class == RegClass::Gpr32 => src,
+            _ => return None,
+        },
+    };
+    if matches!(index, I32InductionStoreIndex::Register(index) if index.id == bound.id)
+        || insts[..cmp_pos]
+            .iter()
+            .any(|&inst_id| Some(inst_id) != index_def && Some(inst_id) != bound_def)
+    {
         return None;
     }
-    let index = if let Some((address, _load_inst)) = stack_index {
-        I32InductionStoreIndex::StackSlot { address }
-    } else {
-        I32InductionStoreIndex::Register(
-            movr_source_for_dst_in_insts(func, &insts[..cmp_pos], cmp_index)
-                .map(|(source, _)| source)
-                .unwrap_or(cmp_index),
-        )
-    };
-    let bound = movr_source_for_dst_in_insts(func, &insts[..cmp_pos], cmp_bound)
-        .map(|(source, _)| source)
-        .unwrap_or(cmp_bound);
 
     let tail = &insts[cmp_pos + 1..];
     if tail.len() == 2 {
@@ -2376,9 +3426,12 @@ fn match_i32_induction_store_header(
         {
             return None;
         }
-        let body = branch_target(bcond)?;
-        let exit = branch_target(branch)?;
-        return Some((index, bound, body, exit));
+        return Some(I32InductionStoreHeader {
+            index,
+            bound,
+            body: branch_target(bcond)?,
+            exit: branch_target(branch)?,
+        });
     }
 
     if tail.len() != 4 {
@@ -2405,39 +3458,13 @@ fn match_i32_induction_store_header(
     if test.operands[0] != MachOperand::VReg(bool_value) {
         return None;
     }
-    let body = branch_target(bcond)?;
-    let exit = branch_target(branch)?;
-    Some((index, bound, body, exit))
+    Some(I32InductionStoreHeader {
+        index,
+        bound,
+        body: branch_target(bcond)?,
+        exit: branch_target(branch)?,
+    })
 }
-
-fn find_branch_to_header(
-    func: &MachFunction,
-    preheader: BlockId,
-    header: BlockId,
-) -> Option<InstId> {
-    func.block(preheader)
-        .insts
-        .iter()
-        .copied()
-        .rev()
-        .find(|&inst_id| {
-            let inst = func.inst(inst_id);
-            matches!(inst.opcode, AArch64Opcode::B | AArch64Opcode::BCond)
-                && block_target_operand(inst, header)
-        })
-}
-
-type I32InductionStoreBody = (
-    Option<VReg>,
-    Option<InstId>,
-    VReg,
-    VReg,
-    InstId,
-    InstId,
-    InstId,
-    InstId,
-    Vec<InstId>,
-);
 
 fn match_i32_induction_store_body(
     func: &MachFunction,
@@ -2446,61 +3473,46 @@ fn match_i32_induction_store_body(
     defs: &HashMap<u32, InstId>,
 ) -> Option<I32InductionStoreBody> {
     let insts = &func.block(body).insts;
-    let mut extra_allowed = Vec::new();
 
-    let mut store_value_inst = None;
-    let mut store_value = None;
-    let mut one: Option<Option<VReg>> = None;
-    let mut body_index = None;
+    // `value = index + 1`, reading the index directly or through a body-local
+    // copy or reload. The unit is only a candidate filter here; the contract
+    // requires its one definition to dominate every use.
+    let is_unit = |vreg: VReg| {
+        defs.get(&vreg.id)
+            .and_then(|&def| movz_i32_imm(func.inst(def)))
+            .is_some_and(|(_, imm)| imm == 1)
+    };
+    let mut matched = None;
     for &inst_id in insts {
         let inst = func.inst(inst_id);
-        let matched = if let Some((dst, src, 1)) = addri_i32_step(inst) {
+        let found = if let Some((dst, src, 1)) = addri_i32_step(inst) {
             loop_index_view_for_store_index(func, body, src, index, defs)
-                .map(|index_copy| (dst, src, index_copy, None))
+                .map(|view_inst| (dst, src, view_inst, None))
         } else if inst.opcode == AArch64Opcode::AddRR && inst.operands.len() == 3 {
             let dst = gpr32_vreg_from_operand(&inst.operands[0])?;
             let lhs = gpr32_vreg_from_operand(&inst.operands[1])?;
             let rhs = gpr32_vreg_from_operand(&inst.operands[2])?;
-            let rhs_is_one = defs
-                .get(&rhs.id)
-                .and_then(|&def| movz_i32_imm(func.inst(def)).map(|(_, imm)| (def, imm)))
-                .is_some_and(|(_, imm)| imm == 1);
-            let lhs_is_one = defs
-                .get(&lhs.id)
-                .and_then(|&def| movz_i32_imm(func.inst(def)).map(|(_, imm)| (def, imm)))
-                .is_some_and(|(_, imm)| imm == 1);
-            let lhs_index_copy = loop_index_view_for_store_index(func, body, lhs, index, defs);
-            let rhs_index_copy = loop_index_view_for_store_index(func, body, rhs, index, defs);
-            if let Some(index_copy) = lhs_index_copy
-                && rhs_is_one
+            if let Some(view_inst) = loop_index_view_for_store_index(func, body, lhs, index, defs)
+                && is_unit(rhs)
             {
-                Some((dst, lhs, index_copy, Some(rhs)))
-            } else if let Some(index_copy) = rhs_index_copy
-                && lhs_is_one
+                Some((dst, lhs, view_inst, Some(rhs)))
+            } else if let Some(view_inst) =
+                loop_index_view_for_store_index(func, body, rhs, index, defs)
+                && is_unit(lhs)
             {
-                Some((dst, rhs, index_copy, Some(lhs)))
+                Some((dst, rhs, view_inst, Some(lhs)))
             } else {
                 None
             }
         } else {
             None
         };
-        let Some((matched_value, matched_index, index_copy, matched_one)) = matched else {
-            continue;
-        };
-        store_value_inst = Some(inst_id);
-        store_value = Some(matched_value);
-        body_index = Some(matched_index);
-        one = Some(matched_one);
-        if let Some(index_copy) = index_copy {
-            push_unique_inst(&mut extra_allowed, index_copy);
+        if let Some(found) = found {
+            matched = Some((inst_id, found));
+            break;
         }
-        break;
     }
-    let store_value_inst = store_value_inst?;
-    let store_value = store_value?;
-    let one = one?;
-    let body_index = body_index?;
+    let (value_inst, (value, index_view, index_view_inst, one)) = matched?;
     let one_inst =
         one.and_then(|one| defs.get(&one.id).copied().filter(|def| insts.contains(def)))
             .or_else(|| {
@@ -2509,28 +3521,17 @@ fn match_i32_induction_store_body(
                 })
             });
 
-    let mut sign_extend_inst = None;
-    let mut wide_index = None;
-    for &inst_id in insts {
+    let (sign_extend_inst, wide_index) = insts.iter().copied().find_map(|inst_id| {
         let inst = func.inst(inst_id);
-        if inst.opcode == AArch64Opcode::Sxtw
+        let dst = vreg_from_operand(inst.operands.first()?)?;
+        (inst.opcode == AArch64Opcode::Sxtw
             && inst.operands.len() == 2
-            && inst.operands[1] == MachOperand::VReg(body_index)
-            && let Some(dst) = vreg_from_operand(&inst.operands[0])
-            && dst.class == RegClass::Gpr64
-        {
-            sign_extend_inst = Some(inst_id);
-            wide_index = Some(dst);
-            break;
-        }
-    }
-    let sign_extend_inst = sign_extend_inst?;
-    let wide_index = wide_index?;
+            && inst.operands[1] == MachOperand::VReg(index_view)
+            && dst.class == RegClass::Gpr64)
+            .then_some((inst_id, dst))
+    })?;
 
-    let mut address_inst = None;
     let mut address = None;
-    let mut element_size = None;
-    let mut array_base = None;
     for &inst_id in insts {
         let inst = func.inst(inst_id);
         if inst.opcode != AArch64Opcode::Madd || inst.operands.len() != 4 {
@@ -2541,78 +3542,83 @@ fn match_i32_induction_store_body(
         let rhs = vreg_from_operand(&inst.operands[2])?;
         let addend = vreg_from_operand(&inst.operands[3])?;
         if dst.class != RegClass::Gpr64
-            || lhs.class != RegClass::Gpr64
             || rhs.class != RegClass::Gpr64
             || addend.class != RegClass::Gpr64
-            || lhs.id != wide_index.id
+            || lhs != wide_index
         {
             continue;
         }
         // The def map is LAST-WINS over the emitted layout, so for a stride
         // register with several live defs it names whichever `Movz` comes last
-        // rather than the one on the path actually taken. This is the SOLE
-        // element-size gate — the recognized loop carries no element size and
-        // the rewriter hardcodes 4 — so believing the wrong one emits a
-        // 4-byte-stride `NeonSt1Post` over data of a different width. Demonstrated
-        // at MachIR level: a diamond whose first predecessor sets stride 8 and
-        // second sets stride 4 FIRES, while 4-then-8 declines. Not reachable from
-        // any frontend today (the gate only ever sees a `Movz` when the
-        // multiplier is an IR constant, which is single-def), so this is the
-        // fail-closed guard for a hole that is real but currently unreachable.
+        // rather than the one on the path actually taken. The rewrite stores
+        // four consecutive i32 lanes, so believing the wrong stride emits a
+        // 4-byte-stride `NeonSt1Post` over data of a different width. This is
+        // the candidate filter; the contract additionally requires the one
+        // definition to dominate the address computation.
         let stride_def = defs
             .get(&rhs.id)
             .copied()
             .filter(|_| crate::effects::live_def_count(func, rhs.id) == 1);
         let stride_is_i32 = stride_def.is_some_and(|def| {
-            let def_inst = func.inst(def);
-            crate::reaching_const::movz_value(def_inst)
-                .is_some_and(|(dst, value)| dst == rhs && value == 4)
+            crate::reaching_const::movz_value(func.inst(def))
+                .is_some_and(|(defined, value)| defined == rhs && value == 4)
         });
         if !stride_is_i32 {
             continue;
         }
-        if let Some(stride_def) = stride_def.filter(|def| insts.contains(def)) {
-            push_unique_inst(&mut extra_allowed, stride_def);
-        }
-        let (canonical_base, base_copy) = movr_source_for_dst_in_block(func, body, addend)
+        let (array_base, base_copy_inst) = match movr_source_for_dst_in_block(func, body, addend)
             .filter(|(source, _)| source.class == RegClass::Gpr64)
-            .unwrap_or((addend, inst_id));
-        if base_copy != inst_id {
-            push_unique_inst(&mut extra_allowed, base_copy);
-        }
-        address_inst = Some(inst_id);
-        address = Some(dst);
-        element_size = Some(rhs);
-        array_base = Some(canonical_base);
+        {
+            Some((source, copy)) => (source, Some(copy)),
+            None => (addend, None),
+        };
+        address = Some((
+            inst_id,
+            dst,
+            rhs,
+            stride_def.filter(|def| insts.contains(def)),
+            addend,
+            base_copy_inst,
+            array_base,
+        ));
         break;
     }
-    let address_inst = address_inst?;
-    let address = address?;
-    let element_size = element_size?;
-    let array_base = array_base?;
+    let (
+        address_inst,
+        address,
+        element_size,
+        element_size_inst,
+        addend,
+        base_copy_inst,
+        array_base,
+    ) = address?;
 
     let store_inst = insts.iter().copied().find(|&inst_id| {
         let inst = func.inst(inst_id);
         inst.opcode == AArch64Opcode::StrRI
             && inst.operands
                 == [
-                    MachOperand::VReg(store_value),
+                    MachOperand::VReg(value),
                     MachOperand::VReg(address),
                     MachOperand::Imm(0),
                 ]
     })?;
 
-    Some((
+    Some(I32InductionStoreBody {
         one,
         one_inst,
-        array_base,
-        element_size,
-        store_inst,
-        store_value_inst,
+        index_view,
+        index_view_inst,
+        value_inst,
         sign_extend_inst,
         address_inst,
-        extra_allowed,
-    ))
+        store_inst,
+        element_size,
+        element_size_inst,
+        addend,
+        base_copy_inst,
+        array_base,
+    })
 }
 
 fn match_i32_induction_store_latch(
@@ -2658,7 +3664,7 @@ fn match_i32_induction_store_latch(
     let writeback = func.inst(writeback_id);
     let branch = func.inst(branch_id);
     let next = if let Some((next, src, 1)) = addri_i32_step(step) {
-        (src.id == step_index.id).then_some(next)?
+        (src == step_index).then_some(next)?
     } else {
         let one = one?;
         if step.opcode != AArch64Opcode::AddRR || step.operands.len() != 3 {
@@ -2667,9 +3673,7 @@ fn match_i32_induction_store_latch(
         let next = gpr32_vreg_from_operand(&step.operands[0])?;
         let lhs = gpr32_vreg_from_operand(&step.operands[1])?;
         let rhs = gpr32_vreg_from_operand(&step.operands[2])?;
-        if !((lhs.id == step_index.id && rhs.id == one.id)
-            || (lhs.id == one.id && rhs.id == step_index.id))
-        {
+        if !((lhs == step_index && rhs == one) || (lhs == one && rhs == step_index)) {
             return None;
         }
         next
@@ -2677,7 +3681,7 @@ fn match_i32_induction_store_latch(
     match index {
         I32InductionStoreIndex::Register(index) => {
             let (dst, src) = movr_vreg_copy(writeback)?;
-            if dst.id != index.id || src.id != next.id {
+            if dst != index || src != next {
                 return None;
             }
         }
@@ -2693,18 +3697,120 @@ fn match_i32_induction_store_latch(
     Some((step_id, writeback_id))
 }
 
-fn body_contains_only_i32_induction_store_idiom(
+fn inst_vreg(func: &MachFunction, inst: InstId, pos: usize) -> Option<VReg> {
+    vreg_from_operand(func.inst(inst).operands.get(pos)?)
+}
+
+/// The order, constant, invariance, carried-state and escape obligations of
+/// the i32 induction-store rewrite (see [`loop_contract`]).
+///
+/// The rewrite's vector loop runs before the scalar header, stores
+/// `index + 1 ..= index + 4` to `a[index .. index + 4]` while `index + 3 <
+/// bound`, and advances only the induction state. It is a refinement when
+/// each scalar iteration does exactly that and nothing else observable.
+fn i32_induction_store_contract_holds(
     func: &MachFunction,
-    body: BlockId,
-    latch: BlockId,
-    allowed: &[InstId],
-) -> bool {
-    func.block(body).insts.iter().copied().all(|inst_id| {
-        let inst = func.inst(inst_id);
-        inst.opcode == AArch64Opcode::Nop
-            || allowed.contains(&inst_id)
-            || (inst.opcode == AArch64Opcode::B && branch_target(inst) == Some(latch))
-    })
+    shape: &loop_contract::IdiomLoopShape,
+    header: &I32InductionStoreHeader,
+    body: &I32InductionStoreBody,
+    latch_step: InstId,
+    latch_writeback: InstId,
+) -> Option<LoopLocality> {
+    use loop_contract::{defined_in_loop, dominating_unique_constant, reads_def};
+
+    let (Some(value), Some(wide_index), Some(address)) = (
+        inst_vreg(func, body.value_inst, 0),
+        inst_vreg(func, body.sign_extend_inst, 0),
+        inst_vreg(func, body.address_inst, 0),
+    ) else {
+        return None;
+    };
+    // Order: every datapath operand reads the definition the matcher assigned.
+    let ordered = reads_def(func, body.value_inst, body.index_view, body.index_view_inst)
+        && reads_def(
+            func,
+            body.sign_extend_inst,
+            body.index_view,
+            body.index_view_inst,
+        )
+        && reads_def(
+            func,
+            body.address_inst,
+            wide_index,
+            Some(body.sign_extend_inst),
+        )
+        && reads_def(func, body.address_inst, body.addend, body.base_copy_inst)
+        && reads_def(func, body.store_inst, value, Some(body.value_inst))
+        && reads_def(func, body.store_inst, address, Some(body.address_inst))
+        && body
+            .base_copy_inst
+            .is_none_or(|copy| reads_def(func, copy, body.array_base, None))
+        && match (header.index, body.index_view_inst) {
+            (_, None) => true,
+            (I32InductionStoreIndex::Register(index), Some(copy)) => {
+                reads_def(func, copy, index, None)
+            }
+            (I32InductionStoreIndex::StackSlot { address }, Some(load)) => {
+                reads_def(func, load, address, None)
+            }
+        };
+    if !ordered {
+        return None;
+    }
+
+    // Constants: one dominating definition each, so no other path can supply
+    // a different stride or step.
+    let dom = DomTree::compute(func);
+    let latch_step_uses_unit = func.inst(latch_step).opcode == AArch64Opcode::AddRR;
+    let constants = dominating_unique_constant(func, &dom, body.element_size, body.address_inst)
+        == Some(4)
+        && body.one.is_none_or(|one| {
+            dominating_unique_constant(func, &dom, one, body.value_inst) == Some(1)
+                && (!latch_step_uses_unit
+                    || dominating_unique_constant(func, &dom, one, latch_step) == Some(1))
+        });
+    // Invariance: the vector loop reads the bound and the base before the
+    // scalar header has run.
+    let invariant = !defined_in_loop(func, shape, header.bound)
+        && !defined_in_loop(func, shape, body.array_base);
+    if !constants || !invariant {
+        return None;
+    }
+
+    // Carried state: a register index is written only by the latch; a stack
+    // index lives in a slot no pointer can reach.
+    let carried = match header.index {
+        I32InductionStoreIndex::Register(index) => {
+            if loop_contract::loop_defs_of(func, shape, index) != [latch_writeback] {
+                return None;
+            }
+            Some(index)
+        }
+        I32InductionStoreIndex::StackSlot { address } => {
+            if defined_in_loop(func, shape, address)
+                || !loop_contract::private_i32_stack_slot(func, address)
+            {
+                return None;
+            }
+            None
+        }
+    };
+    // Escape: the loop-state contract, for the one register the vector loop
+    // reproduces (a register index; a stack index is memory). The rewrite's
+    // vector header exits only to the scalar header (`Handoff::Header`;
+    // `idiom_rewrites_hand_off_only_to_the_scalar_header` checks it), so a
+    // value the header recomputes may be live out. The vector loop runs only
+    // iterations the header's test continues, and the loop may leave by no
+    // other exit (the shape admits none; the contract refuses one).
+    LoopLocality::check(
+        func,
+        shape.blocks(),
+        shape.header,
+        &ExitPlan::loop_test(shape.header, shape.exit),
+        Handoff::Header,
+        carried.as_slice(),
+    )
+    .ok()
 }
 
 fn match_i32_induction_store_loop(
@@ -2712,51 +3818,37 @@ fn match_i32_induction_store_loop(
     lp: &NaturalLoop,
     defs: &HashMap<u32, InstId>,
 ) -> Option<I32InductionStoreLoop> {
-    let header = lp.header;
-    let latch = lp.latch;
-    let preheader = func
-        .block(header)
-        .preds
-        .iter()
-        .copied()
-        .find(|&pred| pred != latch)?;
-    let branch_to_header = find_branch_to_header(func, preheader, header)?;
-
-    let (index, bound, scalar_body, _exit) = match_i32_induction_store_header(func, header, defs)?;
-    if !func.block(scalar_body).succs.contains(&latch) {
+    let header = match_i32_induction_store_header(func, lp.header, defs)?;
+    let shape = loop_contract::idiom_loop_shape(func, lp, header.body, header.exit)?;
+    let body = match_i32_induction_store_body(func, shape.body, header.index, defs)?;
+    let (latch_step, latch_writeback) = match_i32_induction_store_latch(
+        func,
+        shape.latch,
+        shape.header,
+        header.index,
+        body.one,
+        defs,
+    )?;
+    if !loop_contract::block_is_exactly(func, shape.body, &body.allowed_insts(), shape.latch) {
         return None;
     }
-
-    let (
-        one,
-        one_inst,
-        array_base,
-        _element_size,
-        store_inst,
-        store_value_inst,
-        sign_extend_inst,
-        address_inst,
-        extra_allowed,
-    ) = match_i32_induction_store_body(func, scalar_body, index, defs)?;
-    let (_latch_step_inst, _latch_writeback_inst) =
-        match_i32_induction_store_latch(func, latch, header, index, one, defs)?;
-    let mut allowed_body_insts = vec![store_inst, store_value_inst, sign_extend_inst, address_inst];
-    allowed_body_insts.extend(extra_allowed);
-    if let Some(one_inst) = one_inst {
-        allowed_body_insts.push(one_inst);
-    }
-    if !body_contains_only_i32_induction_store_idiom(func, scalar_body, latch, &allowed_body_insts)
-    {
-        return None;
-    }
+    let locality = i32_induction_store_contract_holds(
+        func,
+        &shape,
+        &header,
+        &body,
+        latch_step,
+        latch_writeback,
+    )?;
 
     Some(I32InductionStoreLoop {
-        preheader,
-        header,
-        branch_to_header,
-        index,
-        bound,
-        array_base,
+        _locality: locality,
+        preheader: shape.preheader,
+        header: shape.header,
+        branch_to_header: shape.branch_to_header,
+        index: header.index,
+        bound: header.bound,
+        array_base: body.array_base,
     })
 }
 
@@ -2784,88 +3876,125 @@ fn rewrite_i32_induction_store_loop(
     let vector_header = func.create_block();
     let vector_body = func.create_block();
     let vector_latch = func.create_block();
+    // Created after the loop blocks so their ids do not move, laid out first.
+    let vector_entry = func.create_block();
     insert_new_blocks_before(
         func,
         idiom.header,
-        &[vector_header, vector_body, vector_latch],
+        &[vector_entry, vector_header, vector_body, vector_latch],
     );
 
     if !rewrite_block_target(
         func.inst_mut(idiom.branch_to_header),
         idiom.header,
-        vector_header,
+        vector_entry,
     ) {
         return None;
     }
 
     remove_cfg_edge(func, idiom.preheader, idiom.header);
-    func.add_edge(idiom.preheader, vector_header);
+    func.add_edge(idiom.preheader, vector_entry);
+    func.add_edge(vector_entry, vector_header);
     func.add_edge(vector_header, vector_body);
     func.add_edge(vector_header, idiom.header);
     func.add_edge(vector_body, vector_latch);
     func.add_edge(vector_latch, vector_header);
 
     let mut created = Vec::new();
-    let vector_index = match idiom.index {
-        I32InductionStoreIndex::Register(index) => index,
-        I32InductionStoreIndex::StackSlot { address } => {
-            let index = alloc_fresh_vreg(func, RegClass::Gpr32);
-            push_inst_to_block(
-                func,
-                vector_header,
-                MachInst::new(
-                    AArch64Opcode::LdrRI,
-                    vec![
-                        MachOperand::VReg(index),
-                        MachOperand::VReg(address),
-                        MachOperand::Imm(0),
-                    ],
-                ),
-                &mut created,
-            );
-            index
-        }
-    };
+    let current_index =
+        |func: &mut MachFunction, block: BlockId, created: &mut Vec<InstId>| match idiom.index {
+            I32InductionStoreIndex::Register(index) => index,
+            I32InductionStoreIndex::StackSlot { address } => {
+                let index = alloc_fresh_vreg(func, RegClass::Gpr32);
+                push_inst_to_block(
+                    func,
+                    block,
+                    MachInst::new(
+                        AArch64Opcode::LdrRI,
+                        vec![
+                            MachOperand::VReg(index),
+                            MachOperand::VReg(address),
+                            MachOperand::Imm(0),
+                        ],
+                    ),
+                    created,
+                );
+                index
+            }
+        };
 
+    // The vector stores start at `a[index]` for the index the loop is entered
+    // with, which need not be zero: `vector_base = array_base + sext(index) *
+    // 4`, the scalar body's own address computation. `NeonSt1Post` then
+    // advances it by 16 bytes per four-lane iteration, in step with the index.
+    let entry_index = current_index(func, vector_entry, &mut created);
+    let wide_entry_index = alloc_fresh_vreg(func, RegClass::Gpr64);
+    let element_bytes = alloc_fresh_vreg(func, RegClass::Gpr64);
     let vector_base = alloc_fresh_vreg(func, RegClass::Gpr64);
-    let base_copy = func.push_inst(MachInst::new(
-        AArch64Opcode::MovR,
-        vec![
-            MachOperand::VReg(vector_base),
-            MachOperand::VReg(idiom.array_base),
-        ],
-    ));
-    if !insert_before_inst(func, idiom.branch_to_header, &[base_copy]) {
-        return None;
+    for inst in [
+        MachInst::new(
+            AArch64Opcode::Sxtw,
+            vec![
+                MachOperand::VReg(wide_entry_index),
+                MachOperand::VReg(entry_index),
+            ],
+        ),
+        MachInst::new(
+            AArch64Opcode::Movz,
+            vec![
+                MachOperand::VReg(element_bytes),
+                MachOperand::Imm(ELEMENT_SIZE_S),
+            ],
+        ),
+        MachInst::new(
+            AArch64Opcode::Madd,
+            vec![
+                MachOperand::VReg(vector_base),
+                MachOperand::VReg(wide_entry_index),
+                MachOperand::VReg(element_bytes),
+                MachOperand::VReg(idiom.array_base),
+            ],
+        ),
+        MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(vector_header)]),
+    ] {
+        push_inst_to_block(func, vector_entry, inst, &mut created);
     }
-    created.push(base_copy);
 
-    let guard = alloc_fresh_vreg(func, RegClass::Gpr32);
-    push_inst_to_block(
-        func,
-        vector_header,
+    // Four more scalar iterations remain exactly when `index + 3 < bound`.
+    // Evaluate it on sign-extended 64-bit values: an i32 `index + 3` wraps
+    // for an index within three of `i32::MAX` and would admit a vector
+    // iteration the scalar loop never runs.
+    let vector_index = current_index(func, vector_header, &mut created);
+    let wide_index = alloc_fresh_vreg(func, RegClass::Gpr64);
+    let wide_bound = alloc_fresh_vreg(func, RegClass::Gpr64);
+    let guard = alloc_fresh_vreg(func, RegClass::Gpr64);
+    for inst in [
+        MachInst::new(
+            AArch64Opcode::Sxtw,
+            vec![
+                MachOperand::VReg(wide_index),
+                MachOperand::VReg(vector_index),
+            ],
+        ),
+        MachInst::new(
+            AArch64Opcode::Sxtw,
+            vec![
+                MachOperand::VReg(wide_bound),
+                MachOperand::VReg(idiom.bound),
+            ],
+        ),
         MachInst::new(
             AArch64Opcode::AddRI,
             vec![
                 MachOperand::VReg(guard),
-                MachOperand::VReg(vector_index),
+                MachOperand::VReg(wide_index),
                 MachOperand::Imm(3),
             ],
         ),
-        &mut created,
-    );
-    push_inst_to_block(
-        func,
-        vector_header,
         MachInst::new(
             AArch64Opcode::CmpRR,
-            vec![MachOperand::VReg(guard), MachOperand::VReg(idiom.bound)],
+            vec![MachOperand::VReg(guard), MachOperand::VReg(wide_bound)],
         ),
-        &mut created,
-    );
-    push_inst_to_block(
-        func,
-        vector_header,
         MachInst::new(
             AArch64Opcode::BCond,
             vec![
@@ -2873,14 +4002,10 @@ fn rewrite_i32_induction_store_loop(
                 MachOperand::Block(vector_body),
             ],
         ),
-        &mut created,
-    );
-    push_inst_to_block(
-        func,
-        vector_header,
         MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(idiom.header)]),
-        &mut created,
-    );
+    ] {
+        push_inst_to_block(func, vector_header, inst, &mut created);
+    }
 
     let lane0 = alloc_fresh_vreg(func, RegClass::Gpr32);
     let lanes = alloc_fresh_vreg(func, RegClass::Fpr128);
@@ -3076,10 +4201,30 @@ struct ReverseAccumulationCandidate {
 
 #[derive(Debug, Clone)]
 struct ReverseAccumulationLoop {
+    /// The loop-state contract (`crate::loop_contract`) passed for the
+    /// register index, if any. The plan cannot be built without it.
+    _locality: LoopLocality,
     preheader: BlockId,
     branch_to_header: InstId,
     index: ReverseAccumulationIndex,
     candidate: ReverseAccumulationCandidate,
+    /// Loop-invariant source base the vector loop reads: the candidate's
+    /// base, or the source of the body-local copy that produces it. The
+    /// vector loop runs before the body, so it must never read the copy.
+    source_base: VReg,
+    /// Loop-invariant destination base, resolved like `source_base`.
+    dest_base: VReg,
+}
+
+/// The reverse-accumulation loop test: `index >= 0`, signed.
+#[derive(Debug, Clone, Copy)]
+struct ReverseAccumulationHeader {
+    index: ReverseAccumulationIndex,
+    body: BlockId,
+    exit: BlockId,
+    compare: InstId,
+    /// The zero register of a register-form compare.
+    zero: Option<VReg>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3093,7 +4238,7 @@ fn proof_facts_contain(facts: &[ProofFact], needle: ProofFact) -> bool {
 }
 
 fn any_inst_has_proof_fact(
-    proof_facts: &HashMap<InstId, Vec<ProofFact>>,
+    proof_facts: &std::collections::HashMap<InstId, Vec<ProofFact>>,
     insts: &[InstId],
     fact: ProofFact,
 ) -> bool {
@@ -3104,14 +4249,19 @@ fn any_inst_has_proof_fact(
     })
 }
 
+/// A call of the C library's `calloc`, read by name. Machine-level symbols
+/// carry no Mach-O underscore (the object writer adds it), so `_calloc` is a
+/// different C symbol and is not matched. `calloc` is on the shared
+/// runtime-symbol list, so the compiler refuses a module whose own
+/// definition of it would receive the call.
 fn direct_calloc_call(inst: &MachInst) -> bool {
+    let calloc = trust_cg_lower::RuntimeSymbol::Calloc.name();
     matches!(inst.opcode, AArch64Opcode::Bl | AArch64Opcode::BL)
-        && inst.operands.iter().any(|operand| {
-            matches!(
-                operand,
-                MachOperand::Symbol(symbol) if matches!(symbol.as_str(), "calloc" | "_calloc")
-            )
-        })
+        && !inst.flags.contains(InstFlags::EXACT_MODULE_CALL)
+        && inst
+            .operands
+            .iter()
+            .any(|operand| matches!(operand, MachOperand::Symbol(symbol) if symbol == calloc))
 }
 
 fn block_inst_position(func: &MachFunction, target: InstId) -> Option<(BlockId, usize)> {
@@ -3165,7 +4315,7 @@ fn calloc_return_origin_for_vreg(
     defs: &HashMap<u32, InstId>,
 ) -> Option<InstId> {
     let mut current = base;
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for _ in 0..16 {
         if !seen.insert(current.id) {
             return None;
@@ -3184,19 +4334,25 @@ fn calloc_return_origin_for_vreg(
     None
 }
 
+/// The `(wide_index, element_size, base)` operands of `address = wide_index *
+/// element_size + base`, when `address_inst` is exactly that Gpr64 `Madd`.
 fn match_reverse_accumulation_madd_address(
     func: &MachFunction,
     address_inst: InstId,
+    address: VReg,
 ) -> Option<(VReg, VReg, VReg)> {
     let inst = func.inst(address_inst);
-    match inst.opcode {
-        AArch64Opcode::Madd => Some((
-            gpr64_vreg_from_operand(inst.operands.get(1)?)?,
-            gpr64_vreg_from_operand(inst.operands.get(2)?)?,
-            gpr64_vreg_from_operand(inst.operands.get(3)?)?,
-        )),
-        _ => None,
+    if inst.opcode != AArch64Opcode::Madd
+        || inst.operands.len() != 4
+        || inst.operands[0] != MachOperand::VReg(address)
+    {
+        return None;
     }
+    Some((
+        gpr64_vreg_from_operand(&inst.operands[1])?,
+        gpr64_vreg_from_operand(&inst.operands[2])?,
+        gpr64_vreg_from_operand(&inst.operands[3])?,
+    ))
 }
 
 fn movn_i32_minus_one(inst: &MachInst) -> Option<VReg> {
@@ -3207,25 +4363,17 @@ fn movn_i32_minus_one(inst: &MachInst) -> Option<VReg> {
     Some(dst)
 }
 
-fn vreg_is_i32_zero(func: &MachFunction, defs: &HashMap<u32, InstId>, vreg: VReg) -> bool {
-    defs.get(&vreg.id)
-        .and_then(|&def| movz_i32_imm(func.inst(def)).map(|(_, imm)| imm))
-        == Some(0)
-}
-
-fn vreg_i32_zero_def(
-    func: &MachFunction,
-    defs: &HashMap<u32, InstId>,
-    vreg: VReg,
-) -> Option<InstId> {
-    let def = defs.get(&vreg.id).copied()?;
-    (movz_i32_imm(func.inst(def)) == Some((vreg, 0))).then_some(def)
-}
-
-fn vreg_is_i32_minus_one(func: &MachFunction, defs: &HashMap<u32, InstId>, vreg: VReg) -> bool {
-    defs.get(&vreg.id)
-        .and_then(|&def| movn_i32_minus_one(func.inst(def)))
-        .is_some_and(|dst| dst == vreg)
+/// The address a zero-offset 32-bit `LdrRI` defining exactly `value` reads.
+fn i32_load_address(func: &MachFunction, load: InstId, value: VReg) -> Option<VReg> {
+    let inst = func.inst(load);
+    if inst.opcode != AArch64Opcode::LdrRI
+        || inst.operands.len() != 3
+        || inst.operands[0] != MachOperand::VReg(value)
+        || inst.operands[2] != MachOperand::Imm(0)
+    {
+        return None;
+    }
+    gpr64_vreg_from_operand(&inst.operands[1])
 }
 
 fn match_reverse_accumulation_loop_body(func: &MachFunction, lp: &NaturalLoop) -> Option<BlockId> {
@@ -3258,37 +4406,34 @@ fn match_reverse_accumulation_candidate(
 
     for &store_id in &func.block(loop_body).insts {
         let store = func.inst(store_id);
-        if store.opcode != AArch64Opcode::StrRI {
+        if store.opcode != AArch64Opcode::StrRI || store.operands.len() != 3 {
             continue;
         }
-        let stored_value = gpr32_vreg_from_operand(store.operands.first()?)?;
-        let dest_address = gpr64_vreg_from_operand(store.operands.get(1)?)?;
-        if !matches!(store.operands.get(2), Some(MachOperand::Imm(0))) {
+        let stored_value = gpr32_vreg_from_operand(&store.operands[0])?;
+        let dest_address = gpr64_vreg_from_operand(&store.operands[1])?;
+        if store.operands[2] != MachOperand::Imm(0) {
             continue;
         }
 
         let add_id = defs.get(&stored_value.id).copied()?;
         let add = func.inst(add_id);
-        if add.opcode != AArch64Opcode::AddRR {
-            continue;
-        }
-        let lhs = gpr32_vreg_from_operand(add.operands.get(1)?)?;
-        let rhs = gpr32_vreg_from_operand(add.operands.get(2)?)?;
-
-        let lhs_load_id = defs.get(&lhs.id).copied()?;
-        let rhs_load_id = defs.get(&rhs.id).copied()?;
-        let lhs_load = func.inst(lhs_load_id);
-        let rhs_load = func.inst(rhs_load_id);
-        if lhs_load.opcode != AArch64Opcode::LdrRI || rhs_load.opcode != AArch64Opcode::LdrRI {
-            continue;
-        }
-        let lhs_address = gpr64_vreg_from_operand(lhs_load.operands.get(1)?)?;
-        let rhs_address = gpr64_vreg_from_operand(rhs_load.operands.get(1)?)?;
-        if !matches!(lhs_load.operands.get(2), Some(MachOperand::Imm(0)))
-            || !matches!(rhs_load.operands.get(2), Some(MachOperand::Imm(0)))
+        if add.opcode != AArch64Opcode::AddRR
+            || add.operands.len() != 3
+            || add.operands[0] != MachOperand::VReg(stored_value)
         {
             continue;
         }
+        let lhs = gpr32_vreg_from_operand(&add.operands[1])?;
+        let rhs = gpr32_vreg_from_operand(&add.operands[2])?;
+
+        let lhs_load_id = defs.get(&lhs.id).copied()?;
+        let rhs_load_id = defs.get(&rhs.id).copied()?;
+        let (Some(lhs_address), Some(rhs_address)) = (
+            i32_load_address(func, lhs_load_id, lhs),
+            i32_load_address(func, rhs_load_id, rhs),
+        ) else {
+            continue;
+        };
 
         let (dest_load_inst, source_load_inst, source_address) = if lhs_address == dest_address {
             (lhs_load_id, rhs_load_id, rhs_address)
@@ -3301,9 +4446,9 @@ fn match_reverse_accumulation_candidate(
         let source_address_inst = defs.get(&source_address.id).copied()?;
         let dest_address_inst = defs.get(&dest_address.id).copied()?;
         let (source_wide_index, source_element_size, source_base) =
-            match_reverse_accumulation_madd_address(func, source_address_inst)?;
+            match_reverse_accumulation_madd_address(func, source_address_inst, source_address)?;
         let (dest_wide_index, dest_element_size, dest_base) =
-            match_reverse_accumulation_madd_address(func, dest_address_inst)?;
+            match_reverse_accumulation_madd_address(func, dest_address_inst, dest_address)?;
         if source_wide_index != dest_wide_index || source_element_size != dest_element_size {
             continue;
         }
@@ -3337,12 +4482,19 @@ fn match_reverse_accumulation_candidate(
     None
 }
 
+/// Match the header's `index >= 0` loop test.
+///
+/// Condition immediate 10 is the hardware GE encoding (`B.GE`, `CSET GE`):
+/// the loop runs `index = n, n - 1, ..., 0`. The index must be the compare's
+/// first operand; the reversed `0 >= index` is a different loop. Before the
+/// compare the header may only produce the compared register (a copy or a
+/// stack reload of the index) and a canonical zero.
 fn match_reverse_accumulation_header(
     func: &MachFunction,
     lp: &NaturalLoop,
     defs: &HashMap<u32, InstId>,
-) -> Option<(ReverseAccumulationIndex, BlockId)> {
-    const AARCH64_COND_GT: i64 = 10;
+) -> Option<ReverseAccumulationHeader> {
+    const AARCH64_COND_GE: i64 = 10;
     const AARCH64_COND_NE: i64 = 1;
     let header = lp.header;
 
@@ -3359,32 +4511,29 @@ fn match_reverse_accumulation_header(
             AArch64Opcode::CmpRI | AArch64Opcode::CmpRR
         )
     })?;
+    let compare = insts[cmp_pos];
     let tail = &insts[cmp_pos + 1..];
-    let cmp = func.inst(insts[cmp_pos]);
-    let (cmp_index, cmp_zero_def) = match cmp.opcode {
+    let cmp = func.inst(compare);
+    let (cmp_index, zero) = match cmp.opcode {
         AArch64Opcode::CmpRI
             if cmp.operands.len() == 2 && cmp.operands[1] == MachOperand::Imm(0) =>
         {
             (gpr32_vreg_from_operand(&cmp.operands[0])?, None)
         }
-        AArch64Opcode::CmpRR if cmp.operands.len() == 2 => {
-            let lhs = gpr32_vreg_from_operand(&cmp.operands[0])?;
-            let rhs = gpr32_vreg_from_operand(&cmp.operands[1])?;
-            if vreg_is_i32_zero(func, defs, rhs) {
-                (lhs, vreg_i32_zero_def(func, defs, rhs))
-            } else if vreg_is_i32_zero(func, defs, lhs) {
-                (rhs, vreg_i32_zero_def(func, defs, lhs))
-            } else {
-                return None;
-            }
-        }
+        AArch64Opcode::CmpRR if cmp.operands.len() == 2 => (
+            gpr32_vreg_from_operand(&cmp.operands[0])?,
+            Some(gpr32_vreg_from_operand(&cmp.operands[1])?),
+        ),
         _ => return None,
     };
+    if zero.is_some_and(|zero| zero.id == cmp_index.id) {
+        return None;
+    }
     let (branch_body, branch_exit) = match tail {
         [branch_body, branch_exit]
             if func.inst(*branch_body).opcode == AArch64Opcode::BCond
                 && func.inst(*branch_body).operands.len() == 2
-                && func.inst(*branch_body).operands[0] == MachOperand::Imm(AARCH64_COND_GT)
+                && func.inst(*branch_body).operands[0] == MachOperand::Imm(AARCH64_COND_GE)
                 && func.inst(*branch_exit).opcode == AArch64Opcode::B =>
         {
             (func.inst(*branch_body), func.inst(*branch_exit))
@@ -3396,7 +4545,8 @@ fn match_reverse_accumulation_header(
             let branch_exit = func.inst(*branch_exit_id);
             let cset_value = vreg_from_operand(cset.operands.first()?)?;
             if cset.opcode != AArch64Opcode::CSet
-                || cset.operands.get(1) != Some(&MachOperand::Imm(AARCH64_COND_GT))
+                || cset.operands.len() != 2
+                || cset.operands[1] != MachOperand::Imm(AARCH64_COND_GE)
                 || cmp_cset.opcode != AArch64Opcode::CmpRI
                 || cmp_cset.operands.len() != 2
                 || cmp_cset.operands[0] != MachOperand::VReg(cset_value)
@@ -3413,40 +4563,56 @@ fn match_reverse_accumulation_header(
         _ => return None,
     };
 
-    let stack_index =
-        ldr_i32_from_stack_slot_in_insts(func, &insts[..cmp_pos], cmp_index, None, defs);
-    if insts[..cmp_pos].iter().any(|&inst_id| {
-        let dead_immediate_zero =
-            cmp.opcode == AArch64Opcode::CmpRI
-                && movz_i32_imm(func.inst(inst_id)).is_some_and(|(zero, imm)| {
-                    imm == 0
-                        && !lp.body.iter().any(|&block| {
-                            func.block(block).insts.iter().copied().any(|candidate| {
-                                inst_source_uses_vreg(func.inst(candidate), zero.id)
-                            })
-                        })
-                });
-        func.inst(inst_id).opcode != AArch64Opcode::MovR
-            && cmp_zero_def != Some(inst_id)
-            && stack_index.is_none_or(|(_, load_inst)| load_inst != inst_id)
-            && !dead_immediate_zero
-    }) {
-        return None;
-    }
-    let index = if let Some((address, _load_inst)) = stack_index {
-        ReverseAccumulationIndex::StackSlot { address }
-    } else {
-        ReverseAccumulationIndex::Register(
-            movr_source_for_dst_in_insts(func, &insts[..cmp_pos], cmp_index)
-                .map(|(source, _)| source)
-                .unwrap_or(cmp_index),
-        )
+    let cmp_block_pos = func
+        .block(header)
+        .insts
+        .iter()
+        .position(|&inst_id| inst_id == compare)?;
+    let index_def = loop_contract::reaching_def_in_block(func, header, cmp_block_pos, cmp_index);
+    let index = match index_def {
+        None => ReverseAccumulationIndex::Register(cmp_index),
+        Some(def) => match movr_vreg_copy(func.inst(def)) {
+            Some((dst, src)) if dst == cmp_index && src.class == RegClass::Gpr32 => {
+                ReverseAccumulationIndex::Register(src)
+            }
+            Some(_) => return None,
+            None => ReverseAccumulationIndex::StackSlot {
+                address: ldr_i32_from_stack_slot(func, def, cmp_index, None, defs)?,
+            },
+        },
     };
-    let body = branch_target(branch_body)?;
-    branch_target(branch_exit)?;
-    Some((index, body))
+    for &inst_id in &insts[..cmp_pos] {
+        if Some(inst_id) == index_def {
+            continue;
+        }
+        // A canonical zero: the register-form compare's operand, or (for
+        // `CmpRI #0`) the pre-canonical selector zero the loop never reads.
+        let Some((defined, 0)) = movz_i32_imm(func.inst(inst_id)) else {
+            return None;
+        };
+        let admitted = match zero {
+            Some(zero) => defined == zero,
+            None => !lp.body.iter().any(|&block| {
+                func.block(block)
+                    .insts
+                    .iter()
+                    .any(|&candidate| inst_source_uses_vreg(func.inst(candidate), defined.id))
+            }),
+        };
+        if !admitted {
+            return None;
+        }
+    }
+    Some(ReverseAccumulationHeader {
+        index,
+        body: branch_target(branch_body)?,
+        exit: branch_target(branch_exit)?,
+        compare,
+        zero,
+    })
 }
 
+/// `[next = index - 1; index = next; B header]`, exactly.
 fn match_reverse_accumulation_latch(
     func: &MachFunction,
     latch: BlockId,
@@ -3466,11 +4632,14 @@ fn match_reverse_accumulation_latch(
     let step = func.inst(insts[0]);
     let writeback = func.inst(insts[1]);
     let branch = func.inst(insts[2]);
-    let next = gpr32_vreg_from_operand(step.operands.first()?)?;
-    let source = gpr32_vreg_from_operand(step.operands.get(1)?)?;
+    if step.operands.len() != 3 {
+        return None;
+    }
+    let next = gpr32_vreg_from_operand(&step.operands[0])?;
+    let source = gpr32_vreg_from_operand(&step.operands[1])?;
     let reverse_step = match step.opcode {
-        AArch64Opcode::AddRI => step.operands.get(2) == Some(&MachOperand::Imm(-1)),
-        AArch64Opcode::SubRI => step.operands.get(2) == Some(&MachOperand::Imm(1)),
+        AArch64Opcode::AddRI => step.operands[2] == MachOperand::Imm(-1),
+        AArch64Opcode::SubRI => step.operands[2] == MachOperand::Imm(1),
         _ => false,
     };
     if source != index || !reverse_step {
@@ -3486,85 +4655,200 @@ fn match_reverse_accumulation_latch(
     Some((insts[0], insts[1]))
 }
 
+/// `[index = load slot; next = index - 1; store next -> slot]` in `latch`,
+/// each reading the one before it, where the store is the latch's only write
+/// of the slot and a register-form `- 1` is one dominating `Movn`.
 fn match_reverse_accumulation_stack_latch(
     func: &MachFunction,
     latch: BlockId,
     header: BlockId,
     address: VReg,
     defs: &HashMap<u32, InstId>,
-) -> Option<Vec<InstId>> {
-    let insts: Vec<InstId> = func
-        .block(latch)
-        .insts
-        .iter()
-        .copied()
-        .filter(|&inst_id| func.inst(inst_id).opcode != AArch64Opcode::Nop)
-        .collect();
+    dom: &DomTree,
+) -> Option<[InstId; 3]> {
+    let insts = &func.block(latch).insts;
     let branch_id = *insts.last()?;
     if as_block_branch(func.inst(branch_id), AArch64Opcode::B) != Some(header) {
         return None;
     }
-
-    for &store_id in &insts {
-        let store = func.inst(store_id);
-        if store.opcode != AArch64Opcode::StrRI
-            || store.operands.len() != 3
-            || store.operands[1] != MachOperand::VReg(address)
-            || store.operands[2] != MachOperand::Imm(0)
-        {
-            continue;
-        }
-        let next = gpr32_vreg_from_operand(&store.operands[0])?;
-        let step_id = defs.get(&next.id).copied()?;
-        let step = func.inst(step_id);
-        let (index, reverse_step) = match step.opcode {
-            AArch64Opcode::AddRI if step.operands.len() == 3 => {
-                let dst = gpr32_vreg_from_operand(&step.operands[0])?;
-                let src = gpr32_vreg_from_operand(&step.operands[1])?;
-                (src, dst == next && step.operands[2] == MachOperand::Imm(-1))
-            }
-            AArch64Opcode::SubRI if step.operands.len() == 3 => {
-                let dst = gpr32_vreg_from_operand(&step.operands[0])?;
-                let src = gpr32_vreg_from_operand(&step.operands[1])?;
-                (src, dst == next && step.operands[2] == MachOperand::Imm(1))
-            }
-            AArch64Opcode::AddRR if step.operands.len() == 3 => {
-                let dst = gpr32_vreg_from_operand(&step.operands[0])?;
-                let lhs = gpr32_vreg_from_operand(&step.operands[1])?;
-                let rhs = gpr32_vreg_from_operand(&step.operands[2])?;
-                if dst != next {
-                    continue;
-                }
-                if vreg_is_i32_minus_one(func, defs, rhs) {
-                    (lhs, true)
-                } else if vreg_is_i32_minus_one(func, defs, lhs) {
-                    (rhs, true)
-                } else {
-                    (lhs, false)
-                }
-            }
-            _ => continue,
-        };
-        if !reverse_step {
-            continue;
-        }
-        let load_id = defs.get(&index.id).copied()?;
-        ldr_i32_from_stack_slot(func, load_id, index, Some(address), defs)?;
-        return Some(vec![load_id, step_id, store_id]);
+    let mut slot_stores = insts.iter().copied().filter(|&inst_id| {
+        let inst = func.inst(inst_id);
+        inst.opcode == AArch64Opcode::StrRI
+            && inst.operands.get(1) == Some(&MachOperand::VReg(address))
+    });
+    let store_id = slot_stores.next()?;
+    if slot_stores.next().is_some() {
+        return None;
     }
-
-    None
+    let store = func.inst(store_id);
+    if store.operands.len() != 3 || store.operands[2] != MachOperand::Imm(0) {
+        return None;
+    }
+    let next = gpr32_vreg_from_operand(&store.operands[0])?;
+    let (_, store_pos) = loop_contract::layout_inst_position(func, store_id)?;
+    let step_id = loop_contract::reaching_def_in_block(func, latch, store_pos, next)?;
+    let step = func.inst(step_id);
+    if step.operands.len() != 3 || step.operands[0] != MachOperand::VReg(next) {
+        return None;
+    }
+    let is_minus_one = |vreg: VReg| {
+        loop_contract::dominating_unique_def(func, dom, vreg, step_id)
+            .and_then(|def| movn_i32_minus_one(func.inst(def)))
+            == Some(vreg)
+    };
+    let index = match step.opcode {
+        AArch64Opcode::AddRI if step.operands[2] == MachOperand::Imm(-1) => {
+            gpr32_vreg_from_operand(&step.operands[1])?
+        }
+        AArch64Opcode::SubRI if step.operands[2] == MachOperand::Imm(1) => {
+            gpr32_vreg_from_operand(&step.operands[1])?
+        }
+        AArch64Opcode::AddRR => {
+            let lhs = gpr32_vreg_from_operand(&step.operands[1])?;
+            let rhs = gpr32_vreg_from_operand(&step.operands[2])?;
+            if is_minus_one(rhs) {
+                lhs
+            } else if is_minus_one(lhs) {
+                rhs
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let (_, step_pos) = loop_contract::layout_inst_position(func, step_id)?;
+    let load_id = loop_contract::reaching_def_in_block(func, latch, step_pos, index)?;
+    ldr_i32_from_stack_slot(func, load_id, index, Some(address), defs)?;
+    Some([load_id, step_id, store_id])
 }
 
-fn body_contains_only_reverse_accumulation_idiom(
+/// The loop-invariant base the vector loop must read for the scalar address
+/// computation `address_inst`, whose base operand is `base`: `base` itself
+/// when the loop never writes it, or the source of the body-local copy that
+/// produces it. Such a copy joins `admitted`.
+fn reverse_accumulation_vector_base(
     func: &MachFunction,
-    body: BlockId,
-    branch_target_block: BlockId,
-    candidate: ReverseAccumulationCandidate,
-    extra_allowed: &[InstId],
-) -> bool {
-    let allowed = [
-        candidate.sign_extend_inst,
+    shape: &loop_contract::IdiomLoopShape,
+    address_inst: InstId,
+    base: VReg,
+    admitted: &mut Vec<InstId>,
+) -> Option<VReg> {
+    let (block, position) = loop_contract::layout_inst_position(func, address_inst)?;
+    let Some(copy) = loop_contract::reaching_def_in_block(func, block, position, base) else {
+        return (!loop_contract::defined_in_loop(func, shape, base)).then_some(base);
+    };
+    let (dst, src) = movr_vreg_copy(func.inst(copy))?;
+    if dst != base
+        || src.class != RegClass::Gpr64
+        || !loop_contract::reads_def(func, copy, src, None)
+        || loop_contract::defined_in_loop(func, shape, src)
+    {
+        return None;
+    }
+    push_unique_inst(admitted, copy);
+    Some(src)
+}
+
+/// Match `for (i = n; i >= 0; i--) dst[i] += src[i]` over i32 elements and
+/// discharge the rewrite's contract (see [`loop_contract`]).
+///
+/// The vector loop runs before the scalar header and, while `i >= 15`,
+/// performs the sixteen iterations `i - 15 ..= i` and decrements only the
+/// induction state. That is a refinement when each scalar iteration does
+/// exactly `dst[i] = dst[i] + src[i]` and nothing else observable; the
+/// report's proof facts separately require the two arrays not to overlap.
+fn match_reverse_accumulation_loop(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    defs: &HashMap<u32, InstId>,
+) -> Option<ReverseAccumulationLoop> {
+    use loop_contract::{defined_in_loop, reads_def};
+
+    let candidate = match_reverse_accumulation_candidate(func, lp, defs)?;
+    let header = match_reverse_accumulation_header(func, lp, defs)?;
+    if header.body != candidate.loop_body {
+        return None;
+    }
+    let shape = loop_contract::idiom_loop_shape(func, lp, candidate.loop_body, header.exit)?;
+
+    // Order: every datapath operand reads the definition the candidate
+    // assigned to it, earlier in the body.
+    let sign_extend = candidate.sign_extend_inst;
+    let wide_index = inst_vreg(func, sign_extend, 0)?;
+    let source_address = inst_vreg(func, candidate.source_address_inst, 0)?;
+    let dest_address = inst_vreg(func, candidate.dest_address_inst, 0)?;
+    let source_value = inst_vreg(func, candidate.source_load_inst, 0)?;
+    let dest_value = inst_vreg(func, candidate.dest_load_inst, 0)?;
+    let sum = inst_vreg(func, candidate.add_inst, 0)?;
+    let ordered = [candidate.source_address_inst, candidate.dest_address_inst]
+        .into_iter()
+        .all(|address_inst| reads_def(func, address_inst, wide_index, Some(sign_extend)))
+        && reads_def(
+            func,
+            candidate.source_load_inst,
+            source_address,
+            Some(candidate.source_address_inst),
+        )
+        && reads_def(
+            func,
+            candidate.dest_load_inst,
+            dest_address,
+            Some(candidate.dest_address_inst),
+        )
+        && reads_def(
+            func,
+            candidate.add_inst,
+            source_value,
+            Some(candidate.source_load_inst),
+        )
+        && reads_def(
+            func,
+            candidate.add_inst,
+            dest_value,
+            Some(candidate.dest_load_inst),
+        )
+        && reads_def(
+            func,
+            candidate.dest_store_inst,
+            sum,
+            Some(candidate.add_inst),
+        )
+        && reads_def(
+            func,
+            candidate.dest_store_inst,
+            dest_address,
+            Some(candidate.dest_address_inst),
+        );
+    if !ordered {
+        return None;
+    }
+
+    // Constants: both address computations scale by one dominating `Movz
+    // #4`, since the vector loop moves sixteen contiguous i32 lanes, and the
+    // loop test compares against one dominating zero.
+    let dom = DomTree::compute(func);
+    let scaled_by_four = [candidate.source_address_inst, candidate.dest_address_inst]
+        .into_iter()
+        .all(|address_inst| {
+            loop_contract::dominating_unique_constant(
+                func,
+                &dom,
+                candidate.element_size,
+                address_inst,
+            ) == Some(4)
+        });
+    let zero_is_zero = header.zero.is_none_or(|zero| {
+        loop_contract::dominating_unique_def(func, &dom, zero, header.compare)
+            .and_then(|def| movz_i32_imm(func.inst(def)))
+            == Some((zero, 0))
+    });
+    if !scaled_by_four || !zero_is_zero {
+        return None;
+    }
+
+    // Invariance: the vector loop reads both bases before the body has run.
+    let mut admitted = vec![
+        sign_extend,
         candidate.source_address_inst,
         candidate.source_load_inst,
         candidate.dest_address_inst,
@@ -3572,110 +4856,120 @@ fn body_contains_only_reverse_accumulation_idiom(
         candidate.add_inst,
         candidate.dest_store_inst,
     ];
-    func.block(body).insts.iter().copied().all(|inst_id| {
-        let inst = func.inst(inst_id);
-        inst.opcode == AArch64Opcode::Nop
-            || allowed.contains(&inst_id)
-            || extra_allowed.contains(&inst_id)
-            || (inst.opcode == AArch64Opcode::B && branch_target(inst) == Some(branch_target_block))
-    })
-}
+    let source_base = reverse_accumulation_vector_base(
+        func,
+        &shape,
+        candidate.source_address_inst,
+        candidate.source_base,
+        &mut admitted,
+    )?;
+    let dest_base = reverse_accumulation_vector_base(
+        func,
+        &shape,
+        candidate.dest_address_inst,
+        candidate.dest_base,
+        &mut admitted,
+    )?;
 
-fn loop_defined_inst(func: &MachFunction, lp: &NaturalLoop, inst_id: InstId) -> bool {
-    lp.body
-        .iter()
-        .any(|&block| func.block(block).insts.contains(&inst_id))
-}
-
-fn loop_invariant_base_copy(
-    func: &MachFunction,
-    lp: &NaturalLoop,
-    defs: &HashMap<u32, InstId>,
-    base: VReg,
-) -> Option<InstId> {
-    let copy_id = defs.get(&base.id).copied()?;
-    let (dst, src) = movr_vreg_copy(func.inst(copy_id))?;
-    if dst != base || dst.class != RegClass::Gpr64 || src.class != RegClass::Gpr64 {
-        return None;
-    }
-    if defs
-        .get(&src.id)
-        .is_some_and(|&src_def| loop_defined_inst(func, lp, src_def))
-    {
-        return None;
-    }
-    Some(copy_id)
-}
-
-fn match_reverse_accumulation_loop(
-    func: &MachFunction,
-    lp: &NaturalLoop,
-    defs: &HashMap<u32, InstId>,
-) -> Option<ReverseAccumulationLoop> {
-    let candidate = match_reverse_accumulation_candidate(func, lp, defs)?;
-    let preheader = lp.preheader.or_else(|| {
-        func.block(lp.header)
-            .preds
-            .iter()
-            .copied()
-            .find(|pred| !lp.body.contains(pred))
-    })?;
-    let branch_to_header = find_branch_to_header(func, preheader, lp.header)?;
-    let (index, header_body) = match_reverse_accumulation_header(func, lp, defs)?;
-    if header_body != candidate.loop_body {
-        return None;
-    }
-
-    let mut extra_allowed_insts = Vec::new();
-    for base in [candidate.source_base, candidate.dest_base] {
-        if let Some(inst_id) = loop_invariant_base_copy(func, lp, defs, base) {
-            push_unique_inst(&mut extra_allowed_insts, inst_id);
-        }
-    }
-    match index {
+    // Carried state: a register index is written only by the latch; a stack
+    // index lives in a slot no pointer can reach, and the datapath reads it
+    // before the latch writes it back.
+    let (carried, latch_insts) = match header.index {
         ReverseAccumulationIndex::Register(index) => {
-            if candidate.narrow_index != index {
+            if candidate.narrow_index != index || !reads_def(func, sign_extend, index, None) {
                 return None;
             }
-            match_reverse_accumulation_latch(func, lp.latch, lp.header, index)?;
+            let (step, writeback) =
+                match_reverse_accumulation_latch(func, shape.latch, shape.header, index)?;
+            if loop_contract::loop_defs_of(func, &shape, index) != [writeback] {
+                return None;
+            }
+            (Some(index), vec![step, writeback])
         }
         ReverseAccumulationIndex::StackSlot { address } => {
-            let load_id = defs.get(&candidate.narrow_index.id).copied()?;
-            ldr_i32_from_stack_slot(func, load_id, candidate.narrow_index, Some(address), defs)?;
-            push_unique_inst(&mut extra_allowed_insts, load_id);
-            for inst_id in
-                match_reverse_accumulation_stack_latch(func, lp.latch, lp.header, address, defs)?
+            let (block, sign_extend_pos) = loop_contract::layout_inst_position(func, sign_extend)?;
+            let index_load = loop_contract::reaching_def_in_block(
+                func,
+                block,
+                sign_extend_pos,
+                candidate.narrow_index,
+            )?;
+            ldr_i32_from_stack_slot(
+                func,
+                index_load,
+                candidate.narrow_index,
+                Some(address),
+                defs,
+            )?;
+            let [latch_load, step, writeback] = match_reverse_accumulation_stack_latch(
+                func,
+                shape.latch,
+                shape.header,
+                address,
+                defs,
+                &dom,
+            )?;
+            let (_, load_pos) = loop_contract::layout_inst_position(func, index_load)?;
+            let (_, writeback_pos) = loop_contract::layout_inst_position(func, writeback)?;
+            if !reads_def(func, index_load, address, None)
+                || (shape.body == shape.latch && load_pos > writeback_pos)
+                || defined_in_loop(func, &shape, address)
+                || !loop_contract::private_i32_stack_slot(func, address)
             {
-                push_unique_inst(&mut extra_allowed_insts, inst_id);
+                return None;
             }
+            push_unique_inst(&mut admitted, index_load);
+            (None, vec![latch_load, step, writeback])
         }
-    }
-    let body_branch_target = if candidate.loop_body == lp.latch {
-        lp.header
-    } else {
-        lp.latch
     };
-    if !body_contains_only_reverse_accumulation_idiom(
-        func,
-        candidate.loop_body,
-        body_branch_target,
-        candidate,
-        &extra_allowed_insts,
-    ) {
+
+    // Exact contents: the body holds the datapath (and, when it is its own
+    // latch, the induction update) and ends in its one branch.
+    let body_successor = if shape.body == shape.latch {
+        for &inst_id in &latch_insts {
+            push_unique_inst(&mut admitted, inst_id);
+        }
+        shape.header
+    } else {
+        if !loop_contract::block_is_exactly(func, shape.latch, &latch_insts, shape.header) {
+            return None;
+        }
+        shape.latch
+    };
+    if !loop_contract::block_is_exactly(func, shape.body, &admitted, body_successor) {
         return None;
     }
+    // Escape: the loop-state contract, for the one register the vector loop
+    // reproduces (a register index; a stack index is memory). The rewrite
+    // resumes only at the scalar header (`Handoff::Header`; checked by
+    // `idiom_rewrites_hand_off_only_to_the_scalar_header`). It runs only
+    // iterations the header's test continues, and the loop may leave by no
+    // other exit.
+    let locality = LoopLocality::check(
+        func,
+        shape.blocks(),
+        shape.header,
+        &ExitPlan::loop_test(shape.header, shape.exit),
+        Handoff::Header,
+        carried.as_slice(),
+    )
+    .ok()?;
+
     Some(ReverseAccumulationLoop {
-        preheader,
-        branch_to_header,
-        index,
+        _locality: locality,
+        preheader: shape.preheader,
+        branch_to_header: shape.branch_to_header,
+        index: header.index,
         candidate,
+        source_base,
+        dest_base,
     })
 }
 
 fn reverse_accumulation_report(
     func: &MachFunction,
     lp: &NaturalLoop,
-    proof_facts: &HashMap<InstId, Vec<ProofFact>>,
+    proof_facts: &std::collections::HashMap<InstId, Vec<ProofFact>>,
     defs: &HashMap<u32, InstId>,
 ) -> Option<ReverseAccumulationProofReport> {
     let candidate = match_reverse_accumulation_candidate(func, lp, defs)?;
@@ -3759,7 +5053,7 @@ fn reverse_accumulation_report(
 fn reverse_accumulation_reports(
     func: &MachFunction,
     loop_analysis: &LoopAnalysis,
-    proof_facts: &HashMap<InstId, Vec<ProofFact>>,
+    proof_facts: &std::collections::HashMap<InstId, Vec<ProofFact>>,
     defs: &HashMap<u32, InstId>,
 ) -> Vec<ReverseAccumulationProofReport> {
     loop_analysis
@@ -3771,7 +5065,7 @@ fn reverse_accumulation_reports(
 fn reverse_accumulation_loop_is_proof_accepted(
     func: &MachFunction,
     lp: &NaturalLoop,
-    proof_facts: &HashMap<InstId, Vec<ProofFact>>,
+    proof_facts: &std::collections::HashMap<InstId, Vec<ProofFact>>,
     defs: &HashMap<u32, InstId>,
 ) -> bool {
     reverse_accumulation_report(func, lp, proof_facts, defs)
@@ -3784,7 +5078,11 @@ fn rewrite_reverse_accumulation_loop(
     provenance: Option<&mut ProvenanceMap>,
 ) -> Option<VectorizationResult> {
     const S4_ARRANGEMENT: i64 = 5;
-    const AARCH64_COND_GT: i64 = 10;
+    // Hardware condition 10 is GE: the scalar loop runs while `index >= 0`
+    // and the vector loop while `index >= 15`, i.e. while the sixteen
+    // iterations `index - 15 ..= index` are all still to run.
+    const AARCH64_COND_GE: i64 = 10;
+    const ELEMENT_BYTES: i64 = 4;
     const REVERSE_VECTOR_LANES: i64 = 16;
     const REVERSE_VECTOR_GUARD: i64 = REVERSE_VECTOR_LANES - 1;
     const REVERSE_VECTOR_PAIRS: usize = 2;
@@ -3895,7 +5193,7 @@ fn rewrite_reverse_accumulation_loop(
             MachInst::new(
                 AArch64Opcode::BCond,
                 vec![
-                    MachOperand::Imm(AARCH64_COND_GT),
+                    MachOperand::Imm(AARCH64_COND_GE),
                     MachOperand::Block(vector_body),
                 ],
             ),
@@ -3918,6 +5216,7 @@ fn rewrite_reverse_accumulation_loop(
 
     let chunk_start = alloc_fresh_vreg(func, RegClass::Gpr32);
     let wide_chunk_start = alloc_fresh_vreg(func, RegClass::Gpr64);
+    let element_bytes = alloc_fresh_vreg(func, RegClass::Gpr64);
     let source_ptr = alloc_fresh_vreg(func, RegClass::Gpr64);
     let dest_load_ptr = alloc_fresh_vreg(func, RegClass::Gpr64);
     let dest_store_ptr = alloc_fresh_vreg(func, RegClass::Gpr64);
@@ -3953,6 +5252,23 @@ fn rewrite_reverse_accumulation_loop(
         ),
         &mut created,
     );
+    // The vector loop materializes its own element size: the scalar stride
+    // register may be defined inside the scalar body, which has not run yet.
+    push_inst_to_block(
+        func,
+        vector_body,
+        with_source_loc(
+            MachInst::new(
+                AArch64Opcode::Movz,
+                vec![
+                    MachOperand::VReg(element_bytes),
+                    MachOperand::Imm(ELEMENT_BYTES),
+                ],
+            ),
+            source_loc,
+        ),
+        &mut created,
+    );
     push_inst_to_block(
         func,
         vector_body,
@@ -3962,8 +5278,8 @@ fn rewrite_reverse_accumulation_loop(
                 vec![
                     MachOperand::VReg(source_ptr),
                     MachOperand::VReg(wide_chunk_start),
-                    MachOperand::VReg(idiom.candidate.element_size),
-                    MachOperand::VReg(idiom.candidate.source_base),
+                    MachOperand::VReg(element_bytes),
+                    MachOperand::VReg(idiom.source_base),
                 ],
             ),
             source_loc,
@@ -3980,8 +5296,8 @@ fn rewrite_reverse_accumulation_loop(
                     vec![
                         MachOperand::VReg(dest_ptr),
                         MachOperand::VReg(wide_chunk_start),
-                        MachOperand::VReg(idiom.candidate.element_size),
-                        MachOperand::VReg(idiom.candidate.dest_base),
+                        MachOperand::VReg(element_bytes),
+                        MachOperand::VReg(idiom.dest_base),
                     ],
                 ),
                 source_loc,
@@ -4197,7 +5513,7 @@ fn rewrite_reverse_accumulation_loop(
 fn rewrite_reverse_accumulation_loops(
     func: &mut MachFunction,
     loop_analysis: &LoopAnalysis,
-    proof_facts: &HashMap<InstId, Vec<ProofFact>>,
+    proof_facts: &std::collections::HashMap<InstId, Vec<ProofFact>>,
     mut provenance: Option<&mut ProvenanceMap>,
     maps: &mut VecMaps,
 ) -> Vec<VectorizationResult> {
@@ -4597,12 +5913,7 @@ fn find_contains4_masked_idioms(
         let positions = block_inst_positions(func, block_id);
         for &inst_id in &func.block(block_id).insts {
             if let Some(idiom) = try_match_contains4_masked_root(
-                func,
-                defs,
-                &use_counts,
-                &positions,
-                block_id,
-                inst_id,
+                func, defs, use_counts, &positions, block_id, inst_id,
             ) {
                 idioms.push(idiom);
             }
@@ -4906,18 +6217,19 @@ fn rewrite_contains4_masked_idiom(
     ));
     created.push(seed_lanes);
 
-    for lane in 1..4 {
+    for (offset, bit) in idiom.bits[1..4].iter().enumerate() {
+        let lane = offset + 1;
         let ins = func.push_inst(with_source_loc(
             MachInst::new(
                 AArch64Opcode::NeonInsGen,
                 vec![
                     MachOperand::VReg(lanes_vec),
-                    MachOperand::VReg(idiom.bits[lane].lane_value),
+                    MachOperand::VReg(bit.lane_value),
                     MachOperand::Imm(lane as i64),
                     MachOperand::Imm(ELEMENT_SIZE_S),
                 ],
             ),
-            func.inst(idiom.bits[lane].cmp_inst).source_loc,
+            func.inst(bit.cmp_inst).source_loc,
         ));
         created.push(ins);
     }
@@ -5065,7 +6377,7 @@ fn rewrite_contains4_masked_slp(
     // it bails, so the caller's maps are stale after one even with no rewrite.
     let idioms = find_contains4_masked_idioms(func, &maps.defs, &maps.use_counts);
     let attempted = !idioms.is_empty();
-    let mut consumed = HashSet::new();
+    let mut consumed = HashSet::default();
     let mut results = Vec::new();
 
     for idiom in idioms {
@@ -5556,14 +6868,150 @@ fn first_vectorized_use_of_vreg(
         .find(|&inst_id| inst_source_uses_vreg(func.inst(inst_id), vreg_id))
 }
 
-fn materialize_vf4_i32_induction(
-    func: &mut MachFunction,
+/// Whether the induction's lanes, built once per vector iteration ahead of
+/// `lanes_at` from the induction's value there, are what every instruction
+/// the rewrite gives them reads in the scalar loop.
+///
+/// The rewrite maps the induction, its alias and its sign extension to the
+/// lanes in every vectorized instruction and every compare idiom that reads
+/// one of them (`rewrite_compare_idiom_to_neon` reads a compare's operands
+/// through the same register map), and advances the induction by `vf` at
+/// its step. That is right only when:
+/// - each such reader, the alias's copy, the `Sxtw` and the copy the `Sxtw`
+///   reads are in `lanes_at`'s block, every reader at or after `lanes_at`
+///   and every copy ahead of its first reader;
+/// - the induction has no definition in that block from the first of them
+///   to the last;
+/// - the step runs after the last of them: later in that block, or in the
+///   latch when that block is not the latch.
+///
+/// The lanes are built at the first reader the plan lists, which need not
+/// run first: a reader in a block that ran earlier, or ahead of the first
+/// direct reader of the induction, read lanes not yet built in its
+/// iteration (undefined in the first), and a reader after the latch's
+/// write-back read the lanes of the induction advanced by `vf` where the
+/// scalar loop reads it advanced by one. The lanes are built at a
+/// vectorized reader, so a compare idiom that reads the induction ahead of
+/// every vectorized reader read lanes not yet built (in the first
+/// iteration, a register nothing had written).
+fn induction_lanes_reach_every_reader(
+    func: &MachFunction,
+    lp: &NaturalLoop,
     induction: VectorInduction,
     vectorizable_insts: &[InstId],
+    compare_idioms: &[VectorCompareIdiom],
+    lanes_at: InstId,
+) -> bool {
+    let Some((block, start)) = block_inst_position(func, lanes_at) else {
+        return false;
+    };
+    let insts = &func.block(block).insts;
+    let position = |inst_id: InstId| insts.iter().position(|&id| id == inst_id);
+    let sole_definition = |vreg: VReg| match vreg_definitions(func, vreg.id).as_slice() {
+        &[(_, _, inst_id)] => Some(inst_id),
+        _ => None,
+    };
+    let lane_ids: Vec<u32> = [
+        Some(induction.scalar_current),
+        induction.scalar_current_alias,
+        induction.sign_extended_current,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|vreg| vreg.id)
+    .collect();
+    let (mut first, mut last) = (start, start);
+    let mut first_reader: HashMap<u32, usize> = HashMap::default();
+    let readers = vectorizable_insts
+        .iter()
+        .copied()
+        .chain(compare_idioms.iter().map(|idiom| idiom.cmp_inst));
+    for reader in readers {
+        let reads: Vec<u32> = lane_ids
+            .iter()
+            .copied()
+            .filter(|&id| inst_source_uses_vreg(func.inst(reader), id))
+            .collect();
+        if reads.is_empty() {
+            continue;
+        }
+        let Some(pos) = position(reader).filter(|&pos| pos >= start) else {
+            return false;
+        };
+        last = last.max(pos);
+        for id in reads {
+            first_reader
+                .entry(id)
+                .and_modify(|earliest| *earliest = (*earliest).min(pos))
+                .or_insert(pos);
+        }
+    }
+    // The copies the lanes stand for, each with its first reader's position.
+    let mut copies: Vec<(InstId, Option<usize>)> = Vec::new();
+    if let Some(alias) = induction.scalar_current_alias {
+        let Some(copy) = sole_definition(alias) else {
+            return false;
+        };
+        copies.push((copy, first_reader.get(&alias.id).copied()));
+    }
+    if let (Some(sign_extend), Some(wide)) =
+        (induction.sign_extend_inst, induction.sign_extended_current)
+    {
+        copies.push((sign_extend, first_reader.get(&wide.id).copied()));
+        let Some(source) = func
+            .inst(sign_extend)
+            .operands
+            .get(1)
+            .and_then(vreg_from_operand)
+        else {
+            return false;
+        };
+        if source.id != induction.scalar_current.id {
+            let Some(copy) = sole_definition(source) else {
+                return false;
+            };
+            copies.push((copy, position(sign_extend)));
+        }
+    }
+    for (copy, reader) in copies {
+        match (position(copy), reader) {
+            (Some(pos), Some(reader)) if pos < reader => first = first.min(pos),
+            _ => return false,
+        }
+    }
+    vreg_definitions(func, induction.scalar_current.id)
+        .iter()
+        .filter(|(def_block, _, _)| *def_block == block)
+        .all(|&(_, pos, _)| pos < first || pos >= last)
+        && block_inst_position(func, induction.step_inst).is_some_and(|(step_block, pos)| {
+            if step_block == block {
+                pos >= last
+            } else {
+                step_block == lp.latch && block != lp.latch
+            }
+        })
+}
+
+fn materialize_vf4_i32_induction(
+    func: &mut MachFunction,
+    lp: &NaturalLoop,
+    induction: VectorInduction,
+    vectorizable_insts: &[InstId],
+    compare_idioms: &[VectorCompareIdiom],
 ) -> Option<InductionRewriteResult> {
     const ELEMENT_SIZE_S: i64 = 4;
     let insert_before =
         first_vectorized_use_of_vreg(func, vectorizable_insts, induction.scalar_current.id)?;
+    if !induction_lanes_reach_every_reader(
+        func,
+        lp,
+        induction,
+        vectorizable_insts,
+        compare_idioms,
+        insert_before,
+    ) {
+        return None;
+    }
     let source_loc = func.inst(insert_before).source_loc;
     let lanes = alloc_fresh_vreg(func, RegClass::Fpr128);
     let lane_values: [VReg; 3] = std::array::from_fn(|_| alloc_fresh_vreg(func, RegClass::Gpr32));
@@ -5631,8 +7079,10 @@ fn materialize_vf4_i32_induction(
 
 fn materialize_vf2_mixed_i32_i64_induction(
     func: &mut MachFunction,
+    lp: &NaturalLoop,
     induction: VectorInduction,
     vectorizable_insts: &[InstId],
+    compare_idioms: &[VectorCompareIdiom],
 ) -> Option<InductionRewriteResult> {
     const ELEMENT_SIZE_S: i64 = 4;
     const ELEMENT_SIZE_D: i64 = 8;
@@ -5648,6 +7098,16 @@ fn materialize_vf2_mixed_i32_i64_induction(
                     first_vectorized_use_of_vreg(func, vectorizable_insts, wide.id)
                 })
             })?;
+    if !induction_lanes_reach_every_reader(
+        func,
+        lp,
+        induction,
+        vectorizable_insts,
+        compare_idioms,
+        insert_before,
+    ) {
+        return None;
+    }
     let sign_extend_inst = induction.sign_extend_inst?;
     let source_loc = func.inst(insert_before).source_loc;
 
@@ -5778,8 +7238,23 @@ fn materialize_vf2_mixed_i32_i64_induction(
 ///    operands of vectorized instructions.
 /// 3. Adjusting the loop trip count comparison: divides by the
 ///    vectorization factor so each vector iteration processes `vf` elements.
-/// 4. Creating a scalar epilogue block for remainder iterations
-///    (trip_count % vf) when the trip count is not evenly divisible.
+///
+/// The rewrite has no scalar remainder. A plan whose trip count `vf` does not
+/// divide, or whose rewritten loop runs any other number of iterations than
+/// the scalar one, is refused and leaves the function unchanged. `clause_gap`
+/// first refuses what the loop-state contract's iteration-coverage clause
+/// cannot decide: work on a top-tested loop's exiting header entry, which
+/// the clause does not count; an instruction the plan does not account for
+/// that does more than compute registers, which the rewrite would run once
+/// per vector iteration; a plan, induction or plain, whose trip is not
+/// fixed at compile time, which the clause decides only at its samples; and
+/// a planned instruction that would read another value than in the scalar
+/// loop, because register work left scalar writes it or the rewrite builds
+/// no lanes for it ([`planned_input_gap`]). The clause then runs the
+/// rewritten loop against the scalar one with no run-time input to the
+/// trip, so its one run decides the count exactly. It decides the count
+/// only; what each lane computes from what it reads stays the pass's
+/// premise ([`loop_effects_are_planned`]).
 ///
 /// # Arguments
 /// - `func`: The machine function to modify.
@@ -5795,7 +7270,40 @@ pub fn apply_vectorization(
     apply_vectorization_impl(func, plan, None)
 }
 
+/// Apply `plan` and publish the rewrite only when the loop-state contract's
+/// iteration-coverage clause admits it (`crate::loop_contract::coverage`): the
+/// rewritten loop, each of whose iterations (one pass through the latch) runs
+/// `vf` scalar iterations, must run exactly the scalar loop's iterations, with
+/// nothing left for a remainder. A plan the clause cannot decide
+/// ([`clause_gap`]) is refused first, and a rewrite that leaves work in such a
+/// header is declined. The rewrite runs on a copy of the function and of the
+/// provenance map; a refusal leaves both unchanged.
 fn apply_vectorization_impl(
+    func: &mut MachFunction,
+    plan: &VectorizationPlan,
+    provenance: Option<&mut ProvenanceMap>,
+) -> Option<VectorizationResult> {
+    if clause_gap(func, plan).is_some() {
+        return None;
+    }
+    let header = plan.scalar_loop.header;
+    let top_tested = header != plan.scalar_loop.latch;
+    publish_covered(func, provenance, &plan.scope, |candidate, provenance| {
+        let result = rewrite_vectorization(candidate, plan, provenance)?;
+        if top_tested && !header_runs_only_its_test(candidate, header) {
+            return None;
+        }
+        let lanes = Lanes {
+            blocks: vec![(plan.loop_latch, u64::from(plan.vf))],
+            remainder: Remainder::None,
+            copies: Vec::new(),
+        };
+        Some((lanes, result))
+    })
+    .ok()
+}
+
+fn rewrite_vectorization(
     func: &mut MachFunction,
     plan: &VectorizationPlan,
     mut provenance: Option<&mut ProvenanceMap>,
@@ -5817,21 +7325,11 @@ fn apply_vectorization_impl(
     let mut insts_rewritten: u32 = 0;
     let mut compare_idioms_rewritten: u32 = 0;
     let mut regs_upgraded: u32 = 0;
-    let mut reg_map: HashMap<u32, trust_cg_ir::VReg> = HashMap::new();
-    let scalar_epilogue_sources = capture_scalar_epilogue_sources(func, plan);
+    let mut reg_map: HashMap<u32, trust_cg_ir::VReg> = HashMap::default();
+    // The rewrite has no remainder code: a trip count `vf` does not divide
+    // leaves `remainder` iterations unrun, which the iteration-coverage
+    // clause refuses before anything is published.
     let remainder = plan.trip_count.map(|tc| tc % vf).unwrap_or(0);
-    if remainder > 0
-        && !plan.vectorizable_insts.is_empty()
-        && !scalar_epilogue_sources
-            .iter()
-            .all(scalar_epilogue_source_is_supported)
-    {
-        // Validate the scalar replay shape before the first vector rewrite.
-        // Returning after mutation would leave a partially transformed
-        // function when a future vectorizable opcode adds a nonzero, tied,
-        // or second destination.
-        return None;
-    }
     let reduction_compare_result_ids: HashMap<InstId, u32> = plan
         .horizontal_any_reductions
         .iter()
@@ -5843,12 +7341,20 @@ fn apply_vectorization_impl(
 
     if let Some(induction) = plan.induction {
         let rewrite = match (plan.element_type, plan.vf, induction.sign_extend_inst) {
-            (VecElementType::I32, 4, _) => {
-                materialize_vf4_i32_induction(func, induction, &plan.vectorizable_insts)?
-            }
-            (VecElementType::I64, 2, Some(_)) => {
-                materialize_vf2_mixed_i32_i64_induction(func, induction, &plan.vectorizable_insts)?
-            }
+            (VecElementType::I32, 4, _) => materialize_vf4_i32_induction(
+                func,
+                &plan.scalar_loop,
+                induction,
+                &plan.vectorizable_insts,
+                &plan.compare_idioms,
+            )?,
+            (VecElementType::I64, 2, Some(_)) => materialize_vf2_mixed_i32_i64_induction(
+                func,
+                &plan.scalar_loop,
+                induction,
+                &plan.vectorizable_insts,
+                &plan.compare_idioms,
+            )?,
             _ => return None,
         };
         reg_map.insert(induction.scalar_current.id, rewrite.lanes);
@@ -5998,38 +7504,13 @@ fn apply_vectorization_impl(
         }
     }
 
-    // Step 3: Create scalar epilogue for remainder iterations.
-    let has_epilogue = remainder > 0 && !plan.vectorizable_insts.is_empty();
-    if has_epilogue {
-        let epilogue_insts = create_scalar_epilogue(
-            func,
-            plan,
-            remainder,
-            vector_trip_count,
-            &scalar_epilogue_sources,
-        )?;
-        if let Some(provenance) = provenance {
-            let pass = vectorize_pass_id();
-            for (source_id, clone_id) in epilogue_insts.cloned {
-                if provenance.get_entry(source_id).is_some() {
-                    provenance.record_clone(source_id, clone_id, pass.clone());
-                } else {
-                    provenance.record_creation(clone_id, pass.clone(), "vectorize scalar epilogue");
-                }
-            }
-            for inst_id in epilogue_insts.generated {
-                provenance.record_creation(inst_id, pass.clone(), "vectorize scalar epilogue");
-            }
-        }
-    }
-
     Some(VectorizationResult {
         insts_rewritten,
         compare_idioms_rewritten,
         horizontal_reductions_recognized: plan.horizontal_any_reductions.len() as u32,
         ordered_sub_reductions_recognized: plan.ordered_sub_reductions.len() as u32,
         regs_upgraded,
-        has_epilogue,
+        has_epilogue: false,
         vector_trip_count,
         remainder,
     })
@@ -6075,254 +7556,6 @@ fn adjust_trip_count_in_block(
     adjusted
 }
 
-struct ScalarEpilogueInsts {
-    cloned: Vec<(InstId, InstId)>,
-    generated: Vec<InstId>,
-}
-
-#[derive(Clone)]
-struct ScalarEpilogueSource {
-    source_id: InstId,
-    opcode: AArch64Opcode,
-    operands: Vec<MachOperand>,
-    source_loc: Option<trust_cg_ir::SourceLoc>,
-}
-
-fn capture_scalar_epilogue_sources(
-    func: &MachFunction,
-    plan: &VectorizationPlan,
-) -> Vec<ScalarEpilogueSource> {
-    plan.vectorizable_insts
-        .iter()
-        .map(|&source_id| {
-            let inst = func.inst(source_id);
-            ScalarEpilogueSource {
-                source_id,
-                opcode: inst.opcode,
-                operands: inst.operands.clone(),
-                source_loc: inst.source_loc,
-            }
-        })
-        .collect()
-}
-
-fn scalar_reg_class_for_element(element_type: VecElementType) -> RegClass {
-    match element_type {
-        VecElementType::I8 | VecElementType::I16 | VecElementType::I32 => RegClass::Gpr32,
-        VecElementType::I64 => RegClass::Gpr64,
-        VecElementType::F32 => RegClass::Fpr32,
-        VecElementType::F64 => RegClass::Fpr64,
-    }
-}
-
-fn scalar_epilogue_vreg(
-    func: &mut MachFunction,
-    vreg: VReg,
-    is_def: bool,
-    element_type: VecElementType,
-    vreg_map: &mut HashMap<VReg, VReg>,
-) -> VReg {
-    if is_def {
-        let scalar_vreg = alloc_fresh_vreg(func, scalar_reg_class_for_element(element_type));
-        vreg_map.insert(vreg, scalar_vreg);
-        return scalar_vreg;
-    }
-
-    if let Some(&scalar_vreg) = vreg_map.get(&vreg) {
-        return scalar_vreg;
-    }
-
-    let scalar_vreg = alloc_fresh_vreg(func, scalar_reg_class_for_element(element_type));
-    vreg_map.insert(vreg, scalar_vreg);
-    scalar_vreg
-}
-
-fn scalar_epilogue_source_is_supported(source: &ScalarEpilogueSource) -> bool {
-    if !is_vectorizable(source.opcode) || has_tied_def_use(source.opcode) {
-        return false;
-    }
-
-    let mut def_positions = Vec::new();
-    aarch64_for_each_def_position(source.opcode, source.operands.len(), |pos| {
-        def_positions.push(pos);
-    });
-    def_positions.as_slice() == [0]
-}
-
-fn clone_scalar_epilogue_source(
-    func: &mut MachFunction,
-    epilogue_block: BlockId,
-    source: &ScalarEpilogueSource,
-    element_type: VecElementType,
-    vreg_map: &mut HashMap<VReg, VReg>,
-) -> Option<InstId> {
-    // The scalar replay has a one-result cloning model. The vectorizable
-    // opcode whitelist currently guarantees this shape; keep an explicit
-    // fail-closed boundary so a future tied/multi-def opcode cannot inherit
-    // the old operand-0 assumption.
-    if !scalar_epilogue_source_is_supported(source) {
-        return None;
-    }
-
-    let scalar_ops = source
-        .operands
-        .iter()
-        .enumerate()
-        .map(|(idx, operand)| match operand {
-            MachOperand::VReg(vreg) => {
-                let is_def = idx == 0;
-                MachOperand::VReg(scalar_epilogue_vreg(
-                    func,
-                    *vreg,
-                    is_def,
-                    element_type,
-                    vreg_map,
-                ))
-            }
-            other => other.clone(),
-        })
-        .collect();
-
-    let mut epilogue_inst = trust_cg_ir::MachInst::new(source.opcode, scalar_ops);
-    epilogue_inst.source_loc = source.source_loc;
-    let new_inst_id = func.push_inst(epilogue_inst);
-    func.append_inst(epilogue_block, new_inst_id);
-    Some(new_inst_id)
-}
-
-/// Create a scalar epilogue block that handles remainder iterations.
-///
-/// The epilogue is a simple block containing copies of the original scalar
-/// vectorizable instructions. For vector-induction plans, the epilogue is
-/// unrolled over the concrete remainder lanes so each scalar replay consumes
-/// the post-vector induction value (`i + vector_iters * VF + lane`).
-fn create_scalar_epilogue(
-    func: &mut MachFunction,
-    plan: &VectorizationPlan,
-    remainder: u32,
-    vector_trip_count: Option<u32>,
-    sources: &[ScalarEpilogueSource],
-) -> Option<ScalarEpilogueInsts> {
-    // Keep this local check even though `apply_vectorization_impl` performs
-    // the same preflight before any rewrite. It protects this mutating helper
-    // if it gains another caller.
-    if !sources.iter().all(scalar_epilogue_source_is_supported) {
-        return None;
-    }
-
-    let mut cloned = Vec::new();
-    let mut generated = Vec::new();
-
-    // Create the epilogue block.
-    let epilogue_block = func.create_block();
-
-    if let Some(induction) = plan.induction {
-        let vector_base = vector_trip_count? * plan.vf;
-        let source_loc = sources.first().and_then(|source| source.source_loc);
-
-        for lane in 0..remainder {
-            let mut vreg_map = HashMap::new();
-            let scalar_induction = alloc_fresh_vreg(func, RegClass::Gpr32);
-            let induction_value = func.push_inst(with_source_loc(
-                MachInst::new(
-                    AArch64Opcode::AddRI,
-                    vec![
-                        MachOperand::VReg(scalar_induction),
-                        MachOperand::VReg(induction.scalar_current),
-                        MachOperand::Imm((vector_base + lane) as i64),
-                    ],
-                ),
-                source_loc,
-            ));
-            func.append_inst(epilogue_block, induction_value);
-            generated.push(induction_value);
-            vreg_map.insert(induction.scalar_current, scalar_induction);
-
-            for source in sources {
-                let clone_id = clone_scalar_epilogue_source(
-                    func,
-                    epilogue_block,
-                    source,
-                    plan.element_type,
-                    &mut vreg_map,
-                )?;
-                cloned.push((source.source_id, clone_id));
-            }
-        }
-
-        let epilogue_exit = func.create_block();
-        let ret_inst = trust_cg_ir::MachInst::new(AArch64Opcode::Ret, vec![]);
-        let ret_id = func.push_inst(ret_inst);
-        func.append_inst(epilogue_exit, ret_id);
-        generated.push(ret_id);
-
-        let branch_id = func.push_inst(trust_cg_ir::MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(epilogue_exit)],
-        ));
-        func.append_inst(epilogue_block, branch_id);
-        generated.push(branch_id);
-
-        func.add_edge(epilogue_block, epilogue_exit);
-        return Some(ScalarEpilogueInsts { cloned, generated });
-    }
-
-    // Clone the vectorizable instructions into the epilogue block
-    // in their original scalar form.
-    let mut vreg_map = HashMap::new();
-    for source in sources {
-        let clone_id = clone_scalar_epilogue_source(
-            func,
-            epilogue_block,
-            source,
-            plan.element_type,
-            &mut vreg_map,
-        )?;
-        cloned.push((source.source_id, clone_id));
-    }
-
-    // Add a CMP + BCond to loop the epilogue `remainder` times,
-    // or if remainder is small enough, just unroll (for simplicity,
-    // we add a CMP against the remainder count).
-    let counter_vreg = alloc_fresh_vreg(func, RegClass::Gpr32);
-
-    let cmp_inst = trust_cg_ir::MachInst::new(
-        AArch64Opcode::CmpRI,
-        vec![
-            MachOperand::VReg(counter_vreg),
-            MachOperand::Imm(remainder as i64),
-        ],
-    );
-    let cmp_id = func.push_inst(cmp_inst);
-    func.append_inst(epilogue_block, cmp_id);
-    generated.push(cmp_id);
-
-    // Create an exit block for the epilogue.
-    let epilogue_exit = func.create_block();
-    let ret_inst = trust_cg_ir::MachInst::new(AArch64Opcode::Ret, vec![]);
-    let ret_id = func.push_inst(ret_inst);
-    func.append_inst(epilogue_exit, ret_id);
-    generated.push(ret_id);
-
-    // Conditional branch: loop back or exit.
-    let bcond_inst = trust_cg_ir::MachInst::new(
-        AArch64Opcode::BCond,
-        vec![
-            MachOperand::Block(epilogue_exit),
-            MachOperand::Block(epilogue_block),
-        ],
-    );
-    let bcond_id = func.push_inst(bcond_inst);
-    func.append_inst(epilogue_block, bcond_id);
-    generated.push(bcond_id);
-
-    // Wire up CFG edges.
-    func.add_edge(epilogue_block, epilogue_exit);
-    func.add_edge(epilogue_block, epilogue_block); // self-loop for remainder
-
-    Some(ScalarEpilogueInsts { cloned, generated })
-}
-
 // ---------------------------------------------------------------------------
 // VectorizationPass — MachinePass implementation
 // ---------------------------------------------------------------------------
@@ -6331,13 +7564,13 @@ fn create_scalar_epilogue(
 ///
 /// Analyzes loops for vectorization opportunities, builds vectorization
 /// plans, and rewrites the IR to use NEON SIMD instructions for profitable
-/// loops. Scalar epilogue blocks are generated for remainder iterations
-/// when the trip count is not evenly divisible by the vectorization factor.
+/// loops. A loop whose trip count the vectorization factor does not divide
+/// is left scalar: no remainder epilogue is wired into the CFG.
 ///
 /// The pass operates in two phases:
 /// 1. **Analysis**: Detect vectorizable loops, compute profitability.
 /// 2. **Rewriting**: Replace scalar instructions with NEON equivalents,
-///    adjust trip counts, create epilogue blocks.
+///    adjust trip counts.
 pub struct VectorizationPass {
     /// Apple Silicon generation for cost modeling.
     generation: CostModelGen,
@@ -6350,7 +7583,7 @@ pub struct VectorizationPass {
     /// Enables the inlined/batch scanner contains4 backend rewrite.
     enable_contains4_scanner_batch_rewrite: bool,
     /// Proof facts sidecar transported from trust_ir/import metadata.
-    proof_facts: HashMap<InstId, Vec<ProofFact>>,
+    proof_facts: std::collections::HashMap<InstId, Vec<ProofFact>>,
     /// Collected vectorization plans (for diagnostics/testing).
     plans: Vec<VectorizationPlan>,
     /// Results from the last rewriting phase (for diagnostics/testing).
@@ -6370,7 +7603,7 @@ impl VectorizationPass {
             profile_hotness: None,
             enable_contains4_scanner_memory_rewrite: contains4_scanner_memory_rewrite_env_enabled(),
             enable_contains4_scanner_batch_rewrite: contains4_scanner_batch_rewrite_env_enabled(),
-            proof_facts: HashMap::new(),
+            proof_facts: std::collections::HashMap::new(),
             plans: Vec::new(),
             results: Vec::new(),
             reverse_accumulation_reports: Vec::new(),
@@ -6386,7 +7619,7 @@ impl VectorizationPass {
             profile_hotness: None,
             enable_contains4_scanner_memory_rewrite: contains4_scanner_memory_rewrite_env_enabled(),
             enable_contains4_scanner_batch_rewrite: contains4_scanner_batch_rewrite_env_enabled(),
-            proof_facts: HashMap::new(),
+            proof_facts: std::collections::HashMap::new(),
             plans: Vec::new(),
             results: Vec::new(),
             reverse_accumulation_reports: Vec::new(),
@@ -6505,12 +7738,16 @@ impl VectorizationPass {
             return changed;
         }
 
-        let store_loop_results = rewrite_i32_induction_store_loops(
-            func,
-            loop_analysis,
-            provenance.as_deref_mut(),
-            &mut maps,
-        );
+        let store_loop_results = if I32_INDUCTION_STORE_REWRITE_AUTHORITY_AVAILABLE {
+            rewrite_i32_induction_store_loops(
+                func,
+                loop_analysis,
+                provenance.as_deref_mut(),
+                &mut maps,
+            )
+        } else {
+            Vec::new()
+        };
         if !store_loop_results.is_empty() {
             self.results.extend(store_loop_results);
             let dom = DomTree::compute(func);
@@ -6677,11 +7914,45 @@ impl MachinePass for VectorizationPass {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    mod loop_idiom_contract;
+    pub(crate) mod mach_interp;
+
     use super::*;
+
+    /// The vectorizer's rewrite WITHOUT the loop-state contract's
+    /// iteration-coverage clause, for tests of what the rewrite EMITS. Most
+    /// fixtures here are not counted loops (their trip compare reads a
+    /// register nothing defines, and their back edge advances nothing), so
+    /// the clause cannot see them run any iteration and publication
+    /// (`apply_vectorization`, the pass) refuses them. The
+    /// `make_o2_revertbits_sub_loop` fixtures are real counted loops and go
+    /// through publication.
+    fn rewrite_unchecked(
+        func: &mut MachFunction,
+        plan: &VectorizationPlan,
+    ) -> Option<VectorizationResult> {
+        rewrite_vectorization(func, plan, None)
+    }
+
+    /// The pass's loop sweep on `func`'s one loop, publishing through the
+    /// unchecked rewrite (see [`rewrite_unchecked`]): the plan, and the
+    /// rewrite's result.
+    fn vectorize_one_loop_unchecked(
+        func: &mut MachFunction,
+        provenance: Option<&mut ProvenanceMap>,
+    ) -> (VectorizationPlan, Option<VectorizationResult>) {
+        let dom = DomTree::compute(func);
+        let la = LoopAnalysis::compute(func, &dom);
+        let lp = la.all_loops().next().expect("one loop").clone();
+        let plan = analyze_loop(func, &lp, &MultiTargetCostModel::new(CostModelGen::M1))
+            .expect("the loop is planned");
+        let result = rewrite_vectorization(func, &plan, provenance);
+        (plan, result)
+    }
     use crate::dom::DomTree;
     use crate::loops::LoopAnalysis;
-    use crate::pass_manager::{AnalysisCache, MachinePass};
+    use crate::pass_manager::MachinePass;
     use crate::pgo::{BlockProfile, FunctionProfile, ProfData};
     use trust_cg_ir::{
         AArch64Opcode, BlockId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -8265,56 +9536,18 @@ mod tests {
         func
     }
 
-    /// Build a profitable trip-count-4 loop. The independent arithmetic ops
-    /// make NEON profitable once the hot-profile gate drops from 8 to 4.
-    fn make_profitable_small_trip_count_loop() -> MachFunction {
-        let mut func =
-            MachFunction::new("hot_small_tc".to_string(), Signature::new(vec![], vec![]));
-        let bb0 = func.entry;
-        let bb1 = func.create_block();
-        let bb2 = func.create_block();
-        let bb3 = func.create_block();
+    /// The O2 revertBits shape counted `for (i = 0; i < bound; i++)`: a real
+    /// counted loop the vectorizer publishes through the iteration-coverage
+    /// clause, for other modules' tests.
+    pub(crate) fn o2_revertbits_counted_loop(bound: u32) -> MachFunction {
+        make_o2_revertbits_sub_loop(0, O2TripBound::Const(bound), COND_LT).func
+    }
 
-        let br0 = func.push_inst(MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(bb1)],
-        ));
-        func.append_inst(bb0, br0);
-
-        for id in 2..12 {
-            let add = func.push_inst(MachInst::new(
-                AArch64Opcode::AddRR,
-                vec![vreg32(id), vreg32(0), vreg32(1)],
-            ));
-            func.append_inst(bb1, add);
-        }
-
-        let cmp = func.push_inst(MachInst::new(
-            AArch64Opcode::CmpRI,
-            vec![vreg32(20), imm(4)],
-        ));
-        func.append_inst(bb1, cmp);
-
-        let bcond = func.push_inst(MachInst::new(
-            AArch64Opcode::BCond,
-            vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
-        ));
-        func.append_inst(bb1, bcond);
-
-        let br3 = func.push_inst(MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(bb1)],
-        ));
-        func.append_inst(bb3, br3);
-
-        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
-        func.append_inst(bb2, ret);
-
-        func.add_edge(bb0, bb1);
-        func.add_edge(bb1, bb2);
-        func.add_edge(bb1, bb3);
-        func.add_edge(bb3, bb1);
-
+    /// The O2 revertBits counted loop with trip count 4 (below the default
+    /// minimum of 8), named as `profile_hotness_for_vec_header` profiles it.
+    fn small_trip_count_counted_loop() -> MachFunction {
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(4), COND_LT).func;
+        func.name = "hot_small_tc".to_string();
         func
     }
 
@@ -8867,7 +10100,7 @@ mod tests {
 
     #[test]
     fn test_hot_profile_header_lowers_min_trip_count_gate() {
-        let mut func = make_profitable_small_trip_count_loop();
+        let mut func = small_trip_count_counted_loop();
         let hotness = profile_hotness_for_vec_header(100, 100);
         let mut pass = VectorizationPass::new().with_profile_hotness(Some(hotness));
 
@@ -8892,7 +10125,7 @@ mod tests {
         ];
 
         for (case, hotness) in cases {
-            let mut func = make_profitable_small_trip_count_loop();
+            let mut func = small_trip_count_counted_loop();
             let mut pass = VectorizationPass::new().with_profile_hotness(hotness);
 
             let changed = pass.run(&mut func);
@@ -9016,7 +10249,7 @@ mod tests {
         assert_eq!(plan.vectorizable_insts, vec![rbit_id]);
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.insts_rewritten, 1);
         assert_eq!(result.vector_trip_count, Some(16));
 
@@ -9051,7 +10284,10 @@ mod tests {
 
     #[test]
     fn test_i32_induction_bitreverse_builds_vf4_lanes_and_step() {
-        let (mut func, rbit_id, step_id, current) = make_i32_induction_bitreverse_loop(10, 1, true);
+        // Trip count 16: VF=4 divides it. A remainder (the former trip count
+        // 10) is declined; see
+        // test_i32_induction_remainder_lanes_are_reachable_or_vectorizer_declines.
+        let (mut func, rbit_id, step_id, current) = make_i32_induction_bitreverse_loop(16, 1, true);
         let initial_blocks = func.num_blocks();
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
@@ -9061,7 +10297,7 @@ mod tests {
         let mut plan = analyze_loop(&func, lp, &cost_model).unwrap();
         assert_eq!(plan.element_type, VecElementType::I32);
         assert_eq!(plan.vf, 4);
-        assert_eq!(plan.trip_count, Some(10));
+        assert_eq!(plan.trip_count, Some(16));
         assert_eq!(plan.vectorizable_insts, vec![rbit_id]);
         assert_eq!(
             plan.induction,
@@ -9077,13 +10313,14 @@ mod tests {
         );
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
-        assert_eq!(result.vector_trip_count, Some(2));
-        assert_eq!(result.remainder, 2);
-        assert!(result.has_epilogue);
-        assert!(
-            func.num_blocks() > initial_blocks,
-            "non-multiple trip counts keep scalar epilogue coverage"
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
+        assert_eq!(result.vector_trip_count, Some(4));
+        assert_eq!(result.remainder, 0);
+        assert!(!result.has_epilogue);
+        assert_eq!(
+            func.num_blocks(),
+            initial_blocks,
+            "an exact trip count needs no new blocks"
         );
 
         assert_eq!(
@@ -9128,35 +10365,6 @@ mod tests {
             MachOperand::VReg(lanes_vec),
             "vectorized bitreverse consumes i + {{0,1,2,3}} lanes"
         );
-
-        let epilogue = func.block(BlockId(initial_blocks as u32));
-        let remainder_replay = &epilogue.insts[..4];
-        for (lane, chunk) in remainder_replay.chunks_exact(2).enumerate() {
-            let expected_offset = 8 + lane as i64;
-            let induction_value = func.inst(chunk[0]);
-            assert_eq!(induction_value.opcode, AArch64Opcode::AddRI);
-            assert_eq!(induction_value.operands[1], MachOperand::VReg(current));
-            assert_eq!(
-                induction_value.operands[2],
-                MachOperand::Imm(expected_offset)
-            );
-            let scalar_i = match induction_value.operands[0] {
-                MachOperand::VReg(vreg) => vreg,
-                ref other => panic!("expected scalar remainder induction vreg, got {other:?}"),
-            };
-
-            let scalar_rbit = func.inst(chunk[1]);
-            assert_eq!(
-                scalar_rbit.opcode,
-                AArch64Opcode::Rbit,
-                "epilogue must replay the original scalar bitreverse"
-            );
-            assert_eq!(
-                scalar_rbit.operands[1],
-                MachOperand::VReg(scalar_i),
-                "remainder lane {lane} should consume i+{expected_offset}"
-            );
-        }
     }
 
     #[test]
@@ -9173,6 +10381,2251 @@ mod tests {
         );
     }
 
+    /// Point the fixture's header trip compare (`CmpRI _, #trip`) at `counter`.
+    fn retarget_header_trip_compare(func: &mut MachFunction, counter: VReg) -> InstId {
+        let cmp = func
+            .block(BlockId(1))
+            .insts
+            .iter()
+            .copied()
+            .find(|&inst_id| func.inst(inst_id).opcode == AArch64Opcode::CmpRI)
+            .expect("fixture header has a CmpRI trip test");
+        func.inst_mut(cmp).operands[0] = MachOperand::VReg(counter);
+        cmp
+    }
+
+    /// Induction values a single-block loop processes when it starts at
+    /// `i = 0`, handles `lanes_per_iteration` consecutive values per trip,
+    /// advances by `step`, and repeats while the advanced value is `< bound`
+    /// (the fixtures test after the step and its writeback).
+    fn covered_induction_lanes(step: i64, bound: i64, lanes_per_iteration: i64) -> Vec<i64> {
+        assert!(
+            step > 0,
+            "the model needs a forward induction, got step {step}"
+        );
+        let mut covered = Vec::new();
+        let mut i = 0;
+        loop {
+            covered.extend(i..i + lanes_per_iteration);
+            let next = i + step;
+            if next >= bound {
+                return covered;
+            }
+            i = next;
+        }
+    }
+
+    /// The vectorizer's view of a loop whose exit compare reads its own
+    /// induction: the plan the pass would build (forced profitable, as the
+    /// mixed revertBits plan is), then the rewrite. If the rewrite fires, the
+    /// scaled step and the rewritten trip bound must still cover every lane;
+    /// the expected behaviour is that it declines and leaves `func` unchanged.
+    fn assert_induction_trip_compare_is_not_double_scaled(
+        func: &mut MachFunction,
+        step_inst: InstId,
+        cmp: InstId,
+        trip_count: i64,
+    ) {
+        let before = format!("{func:?}");
+        let dom = DomTree::compute(func);
+        let la = LoopAnalysis::compute(func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        let lp = la.all_loops().next().unwrap();
+        let plan = analyze_loop(func, lp, &cost_model);
+        if let Some(mut plan) = plan {
+            assert!(plan.induction.is_some(), "fixture must plan an induction");
+            plan.is_profitable = true;
+            if apply_vectorization(func, &plan).is_some() {
+                let imm_at = |inst_id: InstId, pos: usize| match func.inst(inst_id).operands[pos] {
+                    MachOperand::Imm(value) => value,
+                    ref other => panic!("expected an immediate at {pos}, got {other:?}"),
+                };
+                let step = imm_at(step_inst, 2);
+                let bound = imm_at(cmp, 1);
+                let covered = covered_induction_lanes(step, bound, i64::from(plan.vf));
+                assert_eq!(
+                    covered,
+                    (0..trip_count).collect::<Vec<_>>(),
+                    "VF={} rewrite advances the induction by {step} and rewrote its own trip \
+                     bound {trip_count} to {bound}: the loop covers {} of {trip_count} lanes",
+                    plan.vf,
+                    covered.len()
+                );
+            }
+        }
+        assert_eq!(
+            format!("{func:?}"),
+            before,
+            "a trip compare on the vectorized induction must make the vectorizer decline"
+        );
+    }
+
+    #[test]
+    fn test_i32_induction_trip_compare_on_induction_declines() {
+        // Refuter reproduction (vectorize.md): the exit test reads the
+        // induction itself, not a separate counter. The VF=4 rewrite scales
+        // the step to 4 and also divided the bound 64 to 16, so the loop ran
+        // i = 0, 4, 8, 12 and covered lanes 0..16 of 0..64.
+        let (mut func, _rbit_id, step_id, current) =
+            make_i32_induction_bitreverse_loop(64, 1, false);
+        let next = VReg::new(12, RegClass::Gpr32);
+        let writeback = func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(current), MachOperand::VReg(next)],
+        ));
+        let step_pos = func
+            .block(BlockId(1))
+            .insts
+            .iter()
+            .position(|&inst_id| inst_id == step_id)
+            .unwrap();
+        func.block_mut(BlockId(1))
+            .insts
+            .insert(step_pos + 1, writeback);
+        let cmp = retarget_header_trip_compare(&mut func, current);
+
+        assert_induction_trip_compare_is_not_double_scaled(&mut func, step_id, cmp, 64);
+    }
+
+    #[test]
+    fn test_mixed_width_revertbits_trip_compare_on_induction_declines() {
+        // Refuter reproduction, mixed i32/i64 VF=2 variant: `cmp i, #64` on
+        // the written-back induction. The rewrite steps by 2 and also divided
+        // the bound to 32, so the ordered-sub accumulators saw half the lanes.
+        let (
+            mut func,
+            _rbit32,
+            _uxtw,
+            _sub32,
+            _sxtw,
+            _rbit64,
+            _sub64,
+            current,
+            _next,
+            _acc64,
+            _writeback32,
+            _writeback64,
+        ) = make_mixed_width_revertbits_sub_loop();
+        let step_inst = func
+            .block(BlockId(1))
+            .insts
+            .iter()
+            .copied()
+            .find(|&inst_id| func.inst(inst_id).opcode == AArch64Opcode::AddRR)
+            .unwrap();
+        let cmp = retarget_header_trip_compare(&mut func, current);
+
+        assert_induction_trip_compare_is_not_double_scaled(&mut func, step_inst, cmp, 64);
+    }
+
+    #[test]
+    fn test_mixed_width_revertbits_trip_compare_on_reloaded_stack_induction_declines() {
+        // The imported clang -O0 shape: the induction lives in a stack slot
+        // and the trip test reloads it (`ldr w, [slot]; cmp w, #64`), so the
+        // compared register is a fresh load, not one of the induction vregs.
+        let (
+            mut func,
+            _rbit32,
+            _uxtw,
+            _sub32,
+            _sxtw,
+            _rbit64,
+            _sub64,
+            current,
+            next,
+            _acc64,
+            writeback32,
+            writeback64,
+        ) = make_mixed_width_revertbits_sub_loop();
+        replace_mixed_width_revertbits_accumulators_with_stack_slots(
+            &mut func,
+            writeback32,
+            writeback64,
+        );
+        let (_, _, _, _, index_address) =
+            replace_mixed_width_revertbits_induction_with_stack_slot(&mut func, current, next);
+        let step_inst = func
+            .block(BlockId(1))
+            .insts
+            .iter()
+            .copied()
+            .find(|&inst_id| func.inst(inst_id).opcode == AArch64Opcode::AddRR)
+            .unwrap();
+        let reloaded = VReg::new(40, RegClass::Gpr32);
+        let cmp = retarget_header_trip_compare(&mut func, reloaded);
+        let reload = func.push_inst(MachInst::new(
+            AArch64Opcode::LdrRI,
+            vec![
+                MachOperand::VReg(reloaded),
+                MachOperand::VReg(index_address),
+                MachOperand::Imm(0),
+            ],
+        ));
+        let cmp_pos = func
+            .block(BlockId(1))
+            .insts
+            .iter()
+            .position(|&inst_id| inst_id == cmp)
+            .unwrap();
+        func.block_mut(BlockId(1)).insts.insert(cmp_pos, reload);
+
+        assert_induction_trip_compare_is_not_double_scaled(&mut func, step_inst, cmp, 64);
+    }
+
+    /// Blocks control can reach from the entry: recorded CFG successors,
+    /// every `Block` operand, and the layout fall-through of a block that does
+    /// not end in `B` or `Ret`. An over-approximation, so a block missing from
+    /// it has no way in.
+    fn blocks_reachable_from_entry(func: &MachFunction) -> HashSet<BlockId> {
+        let mut seen = HashSet::default();
+        let mut work = vec![func.entry];
+        while let Some(block_id) = work.pop() {
+            if !seen.insert(block_id) {
+                continue;
+            }
+            let block = func.block(block_id);
+            work.extend(block.succs.iter().copied());
+            for &inst_id in &block.insts {
+                work.extend(crate::mach_util::branch_targets(func.inst(inst_id)));
+            }
+            let ends_in_jump = block.insts.last().is_some_and(|&inst_id| {
+                matches!(
+                    func.inst(inst_id).opcode,
+                    AArch64Opcode::B | AArch64Opcode::Ret
+                )
+            });
+            if !ends_in_jump
+                && let Some(at) = func.block_order.iter().position(|&b| b == block_id)
+                && let Some(&next) = func.block_order.get(at + 1)
+            {
+                work.push(next);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn test_i32_induction_remainder_lanes_are_reachable_or_vectorizer_declines() {
+        // Trip count 10 at VF=4: the divided compare runs 2 vector iterations
+        // over lanes 0..8, and lanes 8 and 9 existed only as scalar replays in
+        // an epilogue nothing branched to (a0603f3bc). They must run, or the
+        // vectorizer must decline: the iteration-coverage clause refuses.
+        let (mut func, _rbit_id, _step_id, current) =
+            make_i32_induction_bitreverse_loop(10, 1, false);
+        let initial_blocks = func.num_blocks();
+        let before = format!("{func:?}");
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        let lp = la.all_loops().next().unwrap();
+
+        if let Some(mut plan) = analyze_loop(&func, lp, &cost_model) {
+            plan.is_profitable = true;
+            if let Some(result) = apply_vectorization(&mut func, &plan) {
+                let vector_iterations = result
+                    .vector_trip_count
+                    .expect("a constant trip count gives a vector trip count");
+                let vector_lanes = i64::from(vector_iterations * plan.vf);
+                let reachable = blocks_reachable_from_entry(&func);
+                let mut covered: Vec<i64> = (0..vector_lanes).collect();
+                let mut unreachable_replays = Vec::new();
+                for block in initial_blocks..func.num_blocks() {
+                    let block_id = BlockId(block as u32);
+                    for &inst_id in &func.block(block_id).insts {
+                        let inst = func.inst(inst_id);
+                        if inst.opcode == AArch64Opcode::AddRI
+                            && inst.operands.get(1) == Some(&MachOperand::VReg(current))
+                            && let Some(&MachOperand::Imm(lane)) = inst.operands.get(2)
+                        {
+                            if reachable.contains(&block_id) {
+                                covered.push(lane);
+                            } else {
+                                unreachable_replays.push((block_id.0, lane));
+                            }
+                        }
+                    }
+                }
+                covered.sort_unstable();
+                covered.dedup();
+                assert_eq!(
+                    covered,
+                    (0..10).collect::<Vec<_>>(),
+                    "VF={} rewrite runs {vector_iterations} vector iterations over lanes \
+                     0..{vector_lanes}, and its scalar replays (bb, lane) {unreachable_replays:?} \
+                     sit in blocks nothing branches to: {} of 10 lanes run",
+                    plan.vf,
+                    covered.len()
+                );
+            }
+        }
+        assert_eq!(
+            format!("{func:?}"),
+            before,
+            "a remainder the rewrite cannot run must make the vectorizer decline"
+        );
+    }
+
+    /// AArch64 condition encodings of the O2 revertBits fixtures' header
+    /// test, and of the `csel` that keys a value on the argument.
+    const COND_EQ: i64 = 0;
+    const COND_LT: i64 = 11;
+    const COND_LE: i64 = 13;
+
+    /// Trip bound of an O2-shaped revertBits loop.
+    #[derive(Debug, Clone, Copy)]
+    enum O2TripBound {
+        /// `movz` (and `movk` above 16 bits) of a constant in the header: how
+        /// ISel materializes a bound that does not fit `cmp`'s imm12.
+        Const(u32),
+        /// The function argument in `w0`, unknown at compile time.
+        Runtime,
+    }
+
+    struct O2RevertBitsLoop {
+        func: MachFunction,
+        /// The latch's `add w52, w50, #1`.
+        step: InstId,
+        /// The header's bound, compare and branches, which the rewrite must
+        /// leave alone for the coverage model to read them from the fixture.
+        header_test: Vec<InstId>,
+    }
+
+    /// The subtracting revertBits loop as the O2 pipeline hands it to the
+    /// vectorizer (the MIR after `sroa` for `revertBits_clang_o0.ll`, same
+    /// vreg numbers): a promoted i32 induction tested at the top of the
+    /// header, a body that subtracts `zext(rbit32(i))` and `rbit64(sxtw(i))`
+    /// from stack accumulators, and a latch that advances `i`. The pass plans
+    /// it as the mixed-width VF=2 induction.
+    ///
+    /// ```text
+    /// bb0: w7 = movz #start; w81 = mov w7; b bb1
+    /// bb1: w38 = mov w81; w39 = <bound>; cmp w38, w39; b.<cond> bb2; b bb4
+    /// bb2: [acc32] -= zext(rbit(w81)); [acc64] -= rbit(sxtw(w81)); b bb3
+    /// bb3: w52 = add w81, #1; w81 = mov w52; b bb1
+    /// bb4: ret
+    /// ```
+    fn make_o2_revertbits_sub_loop(start: i64, bound: O2TripBound, cond: i64) -> O2RevertBitsLoop {
+        let mut func = MachFunction::new(
+            "o2_revertbits_sub_loop".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let entry = func.entry;
+        let header = func.create_block();
+        let body = func.create_block();
+        let latch = func.create_block();
+        let exit = func.create_block();
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let x = |id| VReg::new(id, RegClass::Gpr64);
+        let induction = w(81);
+        let acc32_address = x(1);
+        let acc64_address = x(2);
+
+        let emit = |func: &mut MachFunction, block, opcode, operands| {
+            append_test_inst(func, block, MachInst::new(opcode, operands))
+        };
+
+        // The accumulators' slots are 1 and 2; slot 0 is allocated unused so
+        // the stack-slot counter covers every id an operand names (the pass
+        // manager's L10-P5 admission refuses a stale counter).
+        for _ in 0..3 {
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(8, 8));
+        }
+        for (address, slot) in [(acc32_address, 1), (acc64_address, 2)] {
+            emit(
+                &mut func,
+                entry,
+                AArch64Opcode::AddPCRel,
+                vec![
+                    MachOperand::VReg(address),
+                    MachOperand::PReg(trust_cg_ir::aarch64_regs::SP),
+                    MachOperand::StackSlot(StackSlotId(slot)),
+                ],
+            );
+        }
+        let bound_vreg = match bound {
+            O2TripBound::Const(_) => w(39),
+            O2TripBound::Runtime => {
+                emit(
+                    &mut func,
+                    entry,
+                    AArch64Opcode::Copy,
+                    vec![
+                        MachOperand::VReg(w(90)),
+                        MachOperand::PReg(trust_cg_ir::aarch64_regs::W0),
+                    ],
+                );
+                w(90)
+            }
+        };
+        emit(
+            &mut func,
+            entry,
+            AArch64Opcode::Movz,
+            vec![MachOperand::VReg(w(7)), imm(start)],
+        );
+        emit(
+            &mut func,
+            entry,
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(induction), MachOperand::VReg(w(7))],
+        );
+        emit(
+            &mut func,
+            entry,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(header)],
+        );
+
+        let mut header_test = Vec::new();
+        emit(
+            &mut func,
+            header,
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(w(38)), MachOperand::VReg(induction)],
+        );
+        if let O2TripBound::Const(value) = bound {
+            header_test.push(emit(
+                &mut func,
+                header,
+                AArch64Opcode::Movz,
+                vec![
+                    MachOperand::VReg(bound_vreg),
+                    imm(i64::from(value & 0xFFFF)),
+                ],
+            ));
+            if value > 0xFFFF {
+                header_test.push(emit(
+                    &mut func,
+                    header,
+                    AArch64Opcode::Movk,
+                    vec![
+                        MachOperand::VReg(bound_vreg),
+                        imm(i64::from(value >> 16)),
+                        imm(16),
+                    ],
+                ));
+            }
+        }
+        header_test.push(emit(
+            &mut func,
+            header,
+            AArch64Opcode::CmpRR,
+            vec![MachOperand::VReg(w(38)), MachOperand::VReg(bound_vreg)],
+        ));
+        header_test.push(emit(
+            &mut func,
+            header,
+            AArch64Opcode::BCond,
+            vec![imm(cond), MachOperand::Block(body)],
+        ));
+        header_test.push(emit(
+            &mut func,
+            header,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(exit)],
+        ));
+
+        for (address, wide) in [(acc32_address, false), (acc64_address, true)] {
+            let (copy, ext, rbit, loaded, diff) = if wide {
+                (w(45), x(46), x(47), x(48), x(49))
+            } else {
+                (w(40), x(42), w(41), x(43), x(44))
+            };
+            emit(
+                &mut func,
+                body,
+                AArch64Opcode::MovR,
+                vec![MachOperand::VReg(copy), MachOperand::VReg(induction)],
+            );
+            if wide {
+                emit(
+                    &mut func,
+                    body,
+                    AArch64Opcode::Sxtw,
+                    vec![MachOperand::VReg(ext), MachOperand::VReg(copy)],
+                );
+                emit(
+                    &mut func,
+                    body,
+                    AArch64Opcode::Rbit,
+                    vec![MachOperand::VReg(rbit), MachOperand::VReg(ext)],
+                );
+            } else {
+                emit(
+                    &mut func,
+                    body,
+                    AArch64Opcode::Rbit,
+                    vec![MachOperand::VReg(rbit), MachOperand::VReg(copy)],
+                );
+                emit(
+                    &mut func,
+                    body,
+                    AArch64Opcode::Uxtw,
+                    vec![MachOperand::VReg(ext), MachOperand::VReg(rbit)],
+                );
+            }
+            let subtrahend = if wide { rbit } else { ext };
+            emit(
+                &mut func,
+                body,
+                AArch64Opcode::LdrRI,
+                vec![
+                    MachOperand::VReg(loaded),
+                    MachOperand::VReg(address),
+                    imm(0),
+                ],
+            );
+            emit(
+                &mut func,
+                body,
+                AArch64Opcode::SubRR,
+                vec![
+                    MachOperand::VReg(diff),
+                    MachOperand::VReg(loaded),
+                    MachOperand::VReg(subtrahend),
+                ],
+            );
+            emit(
+                &mut func,
+                body,
+                AArch64Opcode::StrRI,
+                vec![MachOperand::VReg(diff), MachOperand::VReg(address), imm(0)],
+            );
+        }
+        emit(
+            &mut func,
+            body,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(latch)],
+        );
+
+        emit(
+            &mut func,
+            latch,
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(w(50)), MachOperand::VReg(induction)],
+        );
+        emit(
+            &mut func,
+            latch,
+            AArch64Opcode::Movz,
+            vec![MachOperand::VReg(w(51)), imm(1)],
+        );
+        let step = emit(
+            &mut func,
+            latch,
+            AArch64Opcode::AddRI,
+            vec![MachOperand::VReg(w(52)), MachOperand::VReg(w(50)), imm(1)],
+        );
+        emit(
+            &mut func,
+            latch,
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(induction), MachOperand::VReg(w(52))],
+        );
+        emit(
+            &mut func,
+            latch,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(header)],
+        );
+
+        emit(&mut func, exit, AArch64Opcode::Ret, vec![]);
+
+        func.add_edge(entry, header);
+        func.add_edge(header, body);
+        func.add_edge(header, exit);
+        func.add_edge(body, latch);
+        func.add_edge(latch, header);
+
+        O2RevertBitsLoop {
+            func,
+            step,
+            header_test,
+        }
+    }
+
+    /// Induction values a top-tested counted loop runs: `i` starts at
+    /// `start`; while `continues(i)` holds, the body handles the `lanes`
+    /// consecutive values from `i` and the latch advances `i` by `step`.
+    fn top_tested_loop_lanes(
+        start: i64,
+        step: i64,
+        lanes: i64,
+        continues: impl Fn(i64) -> bool,
+    ) -> Vec<i64> {
+        assert!(
+            step > 0,
+            "the model needs a forward induction, got step {step}"
+        );
+        let mut covered = Vec::new();
+        let mut i = start;
+        while continues(i) {
+            covered.extend(i..i + lanes);
+            i += step;
+        }
+        covered
+    }
+
+    /// Vectorize an O2-shaped revertBits loop and, if the rewrite fires,
+    /// check that the vector loop runs exactly the induction values the
+    /// scalar loop runs. The rewrite must leave the header test
+    /// and the induction's entry value alone, so the model takes `start`,
+    /// `bound` (for a runtime bound, the value assumed in `w0`) and `cond`
+    /// from the fixture and the step from the rewritten latch. Returns
+    /// whether the rewrite fired.
+    fn o2_revertbits_rewrite_runs_scalar_lanes(
+        fixture: &mut O2RevertBitsLoop,
+        start: i64,
+        bound: i64,
+        cond: i64,
+    ) -> bool {
+        let header_test = |func: &MachFunction| -> Vec<String> {
+            fixture
+                .header_test
+                .iter()
+                .map(|&inst_id| format!("{:?}", func.inst(inst_id)))
+                .collect()
+        };
+        let func = &mut fixture.func;
+        let header_test_before = header_test(func);
+        let dom = DomTree::compute(func);
+        let la = LoopAnalysis::compute(func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        let lp = la.all_loops().next().expect("fixture has one loop");
+        let Some(mut plan) = analyze_loop(func, lp, &cost_model) else {
+            return false;
+        };
+        assert!(plan.induction.is_some(), "fixture must plan an induction");
+        plan.is_profitable = true;
+        if apply_vectorization(func, &plan).is_none() {
+            return false;
+        }
+
+        assert_eq!(
+            header_test(func),
+            header_test_before,
+            "the rewrite must leave the header's trip test alone"
+        );
+        let step = match func.inst(fixture.step).operands[2] {
+            MachOperand::Imm(step) => step,
+            ref other => panic!("expected the latch step immediate, got {other:?}"),
+        };
+        let (relation, continues): (&str, Box<dyn Fn(i64) -> bool>) = match cond {
+            COND_LT => ("<", Box::new(move |i| i < bound)),
+            COND_LE => ("<=", Box::new(move |i| i <= bound)),
+            other => panic!("unmodeled header condition {other}"),
+        };
+        let scalar = top_tested_loop_lanes(start, 1, 1, &continues);
+        let vector = top_tested_loop_lanes(start, step, i64::from(plan.vf), &continues);
+        assert!(
+            vector == scalar,
+            "VF={} rewrite advances i by {step} from {start} under the untouched test \
+             `i {relation} {bound}`: the vector loop runs {} values {:?}..={:?}, the scalar \
+             loop {} values {:?}..={:?}",
+            plan.vf,
+            vector.len(),
+            vector.first(),
+            vector.last(),
+            scalar.len(),
+            scalar.first(),
+            scalar.last()
+        );
+        true
+    }
+
+    /// Expect the vectorizer to decline an O2-shaped revertBits loop: if the
+    /// rewrite fires, the coverage check reports the lanes it gets wrong.
+    fn assert_o2_revertbits_rewrite_declines(
+        mut fixture: O2RevertBitsLoop,
+        start: i64,
+        bound: i64,
+        cond: i64,
+    ) {
+        let before = format!("{:?}", fixture.func);
+        o2_revertbits_rewrite_runs_scalar_lanes(&mut fixture, start, bound, cond);
+        assert_eq!(
+            format!("{:?}", fixture.func),
+            before,
+            "the vectorizer must decline a loop whose lanes it cannot match"
+        );
+    }
+
+    #[test]
+    fn test_o2_revertbits_top_tested_loop_from_zero_vectorizes_every_lane() {
+        // The shape imported_revertbits_clang_o0_vectorizes_mixed_width_sub_loop
+        // relies on: `for (i = 0; i < bound; i++)` with VF dividing the bound.
+        // 0x2_0000 is a `movz #0; movk #2, lsl 16` bound like the real 1 << 24.
+        for bound in [64, 0x2_0000] {
+            let mut fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(bound), COND_LT);
+            assert!(
+                o2_revertbits_rewrite_runs_scalar_lanes(&mut fixture, 0, i64::from(bound), COND_LT),
+                "bound {bound}: the counted loop from 0 must still vectorize"
+            );
+        }
+    }
+
+    #[test]
+    fn test_o2_revertbits_trip_bound_not_divisible_by_vf_declines() {
+        // Suspect: the CmpRR bound stays at tc while the step becomes VF, so
+        // with tc % VF != 0 the last vector iteration runs past the bound.
+        for bound in [65, 0x2_0001] {
+            assert_o2_revertbits_rewrite_declines(
+                make_o2_revertbits_sub_loop(0, O2TripBound::Const(bound), COND_LT),
+                0,
+                i64::from(bound),
+                COND_LT,
+            );
+        }
+    }
+
+    #[test]
+    fn test_o2_revertbits_nonzero_induction_start_declines() {
+        // Suspect: nothing checks that the induction starts at 0. From 1, the
+        // loop runs bound - 1 iterations, which VF no longer divides.
+        assert_o2_revertbits_rewrite_declines(
+            make_o2_revertbits_sub_loop(1, O2TripBound::Const(64), COND_LT),
+            1,
+            64,
+            COND_LT,
+        );
+    }
+
+    #[test]
+    fn test_o2_revertbits_runtime_trip_bound_declines() {
+        // The same untouched-bound path with no constant bound: the plan has
+        // no trip count, so no remainder is ever considered. With w0 = 65 the
+        // VF=2 loop runs lane 65.
+        assert_o2_revertbits_rewrite_declines(
+            make_o2_revertbits_sub_loop(0, O2TripBound::Runtime, COND_LT),
+            0,
+            65,
+            COND_LT,
+        );
+    }
+
+    #[test]
+    fn test_o2_revertbits_inclusive_trip_bound_declines() {
+        // `i <= 64` runs 65 iterations although VF divides the constant 64.
+        assert_o2_revertbits_rewrite_declines(
+            make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LE),
+            0,
+            64,
+            COND_LE,
+        );
+    }
+
+    /// The iteration-coverage clause's verdict on the UNCHECKED rewrite of
+    /// `func`'s one loop (what `rewrite_vectorization` builds, before
+    /// publication). Panics when the vectorizer plans nothing or the rewrite
+    /// declines on its own: the point is what the clause decides.
+    fn clause_verdict_on_unchecked_rewrite(
+        func: &MachFunction,
+    ) -> Result<(), crate::loop_contract::CoverageEscape<BlockId>> {
+        let dom = DomTree::compute(func);
+        let la = LoopAnalysis::compute(func, &dom);
+        let lp = la.all_loops().next().expect("one loop");
+        let mut plan = analyze_loop(func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+            .expect("the vectorizer plans the loop");
+        plan.is_profitable = true;
+        let mut rewritten = func.clone();
+        rewrite_vectorization(&mut rewritten, &plan, None).expect("the rewrite is built");
+        let lanes = Lanes {
+            blocks: vec![(plan.loop_latch, u64::from(plan.vf))],
+            remainder: Remainder::None,
+            copies: Vec::new(),
+        };
+        crate::loop_contract::check_coverage(func, &rewritten, &plan.scope, &lanes).map(|_| ())
+    }
+
+    /// The scalar and rewritten iteration counts of a counted mismatch.
+    fn counted_mismatch(
+        verdict: Result<(), crate::loop_contract::CoverageEscape<BlockId>>,
+        name: &str,
+    ) -> (u128, u128) {
+        match verdict {
+            Err(crate::loop_contract::CoverageEscape::Mismatch {
+                scalar, rewritten, ..
+            }) => (scalar.iterations, rewritten.iterations),
+            other => panic!("{name}: expected a counted mismatch, got {other:?}"),
+        }
+    }
+
+    /// The iteration-coverage clause refuses each measured `vectorize`
+    /// miscover: `4b1fb93c7` (the rewrite divides its own induction's trip
+    /// bound) and `a0603f3bc` (an undivided bound past an odd trip count, from
+    /// a nonzero start, under an inclusive test, and at a run-time bound).
+    /// Those commits declined each shape with a private check; the rewrite
+    /// still builds every one of these loops wrong, and the clause runs it
+    /// against the scalar loop and reports the iteration counts. The clause
+    /// decides the run-time bound only at the values it samples, so the pass
+    /// also refuses an induction trip that depends on a run-time value
+    /// (`test_o2_revertbits_trip_keyed_on_an_unsampled_run_time_value_declines`).
+    /// The control from zero under a divisible bound is admitted.
+    #[test]
+    fn test_coverage_clause_refuses_every_measured_vectorize_miscover() {
+        let control = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+        assert_eq!(clause_verdict_on_unchecked_rewrite(&control.func), Ok(()));
+
+        let cases = [
+            ("odd constant bound 65", 0, O2TripBound::Const(65), COND_LT),
+            ("nonzero start 1", 1, O2TripBound::Const(64), COND_LT),
+            ("inclusive test i <= 64", 0, O2TripBound::Const(64), COND_LE),
+            ("run-time bound", 0, O2TripBound::Runtime, COND_LT),
+        ];
+        for (name, start, bound, cond) in cases {
+            let fixture = make_o2_revertbits_sub_loop(start, bound, cond);
+            let (scalar, rewritten) =
+                counted_mismatch(clause_verdict_on_unchecked_rewrite(&fixture.func), name);
+            assert_ne!(scalar, rewritten, "{name}");
+        }
+
+        // `4b1fb93c7` on the O2 shape: the trip test `cmp i, #64` reads the
+        // induction, so the rewrite both steps by 2 and divides the bound to
+        // 32, running 32 of the 64 iterations.
+        let mut fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+        let header = BlockId(1);
+        let bound_movz = fixture.header_test[0];
+        let cmp = fixture.header_test[1];
+        assert_eq!(fixture.func.inst(bound_movz).opcode, AArch64Opcode::Movz);
+        assert_eq!(fixture.func.inst(cmp).opcode, AArch64Opcode::CmpRR);
+        fixture
+            .func
+            .block_mut(header)
+            .insts
+            .retain(|&id| id != bound_movz);
+        let lhs = fixture.func.inst(cmp).operands[0].clone();
+        let compare = fixture.func.inst_mut(cmp);
+        compare.opcode = AArch64Opcode::CmpRI;
+        compare.operands = vec![lhs, imm(64)];
+        assert_eq!(
+            counted_mismatch(
+                clause_verdict_on_unchecked_rewrite(&fixture.func),
+                "trip compare on the induction"
+            ),
+            (64, 32)
+        );
+
+        // The same defect on `make_i32_induction_bitreverse_loop` (VF=4, 16 of
+        // 64): that fixture's header `BCond` names two blocks and no
+        // condition, a transfer the clause's model does not describe, so it
+        // refuses undecided.
+        let (mut func, _rbit_id, step_id, current) =
+            make_i32_induction_bitreverse_loop(64, 1, false);
+        let next = VReg::new(12, RegClass::Gpr32);
+        let writeback = func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(current), MachOperand::VReg(next)],
+        ));
+        let step_pos = func
+            .block(BlockId(1))
+            .insts
+            .iter()
+            .position(|&inst_id| inst_id == step_id)
+            .unwrap();
+        func.block_mut(BlockId(1))
+            .insts
+            .insert(step_pos + 1, writeback);
+        retarget_header_trip_compare(&mut func, current);
+        assert!(clause_verdict_on_unchecked_rewrite(&func).is_err());
+    }
+
+    /// Move the O2 revertBits fixture's body work into its header, ahead of
+    /// the trip compare, and branch from the header straight to the latch: a
+    /// mid-tested loop, whose work also runs on the final header entry, the
+    /// one the loop leaves from.
+    ///
+    /// ```text
+    /// bb1: [acc32] -= zext(rbit(w81)); [acc64] -= rbit(sxtw(w81))
+    ///      w38 = mov w81; w39 = <bound>; cmp w38, w39; b.<cond> bb3; b bb4
+    /// bb2: ret (unreachable, out of the layout)
+    /// ```
+    fn move_body_work_into_header(fixture: &mut O2RevertBitsLoop) {
+        let (header, body, latch) = (BlockId(1), BlockId(2), BlockId(3));
+        let func = &mut fixture.func;
+        let mut insts = func.block(body).insts.clone();
+        let branch = insts.pop().expect("the body ends in its branch");
+        assert_eq!(func.inst(branch).opcode, AArch64Opcode::B);
+        insts.extend(func.block(header).insts.iter().copied());
+        func.block_mut(header).insts = insts;
+        let bcond = fixture.header_test[fixture.header_test.len() - 2];
+        assert_eq!(func.inst(bcond).operands[1], MachOperand::Block(body));
+        func.inst_mut(bcond).operands[1] = MachOperand::Block(latch);
+        for succ in &mut func.block_mut(header).succs {
+            if *succ == body {
+                *succ = latch;
+            }
+        }
+        for pred in &mut func.block_mut(latch).preds {
+            if *pred == body {
+                *pred = header;
+            }
+        }
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        let body_block = func.block_mut(body);
+        body_block.insts = vec![ret];
+        body_block.preds.clear();
+        body_block.succs.clear();
+        func.block_order.retain(|&block| block != body);
+    }
+
+    /// Replace the entry's `movz` of register `dst` with a value the entry
+    /// computes from the argument: `dst = (w0 == key) ? hit : miss`. `w0`
+    /// arrives through an instruction the coverage clause does not model, so
+    /// it is one of its sampled inputs.
+    fn key_entry_constant(func: &mut MachFunction, dst: VReg, key: i64, hit: i64, miss: i64) {
+        let entry = func.entry;
+        let movz = func
+            .block(entry)
+            .insts
+            .iter()
+            .copied()
+            .find(|&inst_id| {
+                let inst = func.inst(inst_id);
+                inst.opcode == AArch64Opcode::Movz
+                    && inst.operands.first() == Some(&MachOperand::VReg(dst))
+            })
+            .expect("the entry's movz of the register");
+        let pos = func
+            .block(entry)
+            .insts
+            .iter()
+            .position(|&inst_id| inst_id == movz)
+            .unwrap();
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let (arg, hit_vreg, miss_vreg) = (w(dst.id + 200), w(dst.id + 300), w(dst.id + 400));
+        let keyed = [
+            MachInst::new(
+                AArch64Opcode::Copy,
+                vec![
+                    MachOperand::VReg(arg),
+                    MachOperand::PReg(trust_cg_ir::aarch64_regs::W0),
+                ],
+            ),
+            MachInst::new(AArch64Opcode::CmpRI, vec![MachOperand::VReg(arg), imm(key)]),
+            MachInst::new(
+                AArch64Opcode::Movz,
+                vec![MachOperand::VReg(hit_vreg), imm(hit)],
+            ),
+            MachInst::new(
+                AArch64Opcode::Movz,
+                vec![MachOperand::VReg(miss_vreg), imm(miss)],
+            ),
+            MachInst::new(
+                AArch64Opcode::Csel,
+                vec![
+                    MachOperand::VReg(dst),
+                    MachOperand::VReg(hit_vreg),
+                    MachOperand::VReg(miss_vreg),
+                    imm(COND_EQ),
+                ],
+            ),
+        ]
+        .map(|inst| func.push_inst(inst));
+        func.block_mut(entry)
+            .insts
+            .splice(pos..=pos, keyed.iter().copied());
+    }
+
+    /// Move the O2 revertBits fixture's constant header bound `w39` into the
+    /// entry, keyed on the argument: `w39 = (w0 == key) ? hit : miss`.
+    fn key_the_trip_bound(fixture: &mut O2RevertBitsLoop, key: i64, hit: i64, miss: i64) {
+        let (entry, header) = (fixture.func.entry, BlockId(1));
+        let bound_movz = fixture.header_test.remove(0);
+        assert_eq!(
+            fixture.func.inst(bound_movz).opcode,
+            AArch64Opcode::Movz,
+            "a constant bound below 2^16"
+        );
+        fixture
+            .func
+            .block_mut(header)
+            .insts
+            .retain(|&inst_id| inst_id != bound_movz);
+        let branch = fixture.func.block(entry).insts.len() - 1;
+        fixture
+            .func
+            .block_mut(entry)
+            .insts
+            .insert(branch, bound_movz);
+        key_entry_constant(
+            &mut fixture.func,
+            VReg::new(39, RegClass::Gpr32),
+            key,
+            hit,
+            miss,
+        );
+    }
+
+    /// [`clause_gap`] of the vectorizer's plan for `func`'s one loop.
+    fn planned_clause_gap(func: &MachFunction) -> Option<ClauseGap> {
+        let dom = DomTree::compute(func);
+        let la = LoopAnalysis::compute(func, &dom);
+        let lp = la.all_loops().next().expect("one loop");
+        let plan = analyze_loop(func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+            .expect("the vectorizer plans the loop");
+        clause_gap(func, &plan)
+    }
+
+    /// The vectorizer pass on `func` must leave it unchanged.
+    fn assert_vectorization_pass_declines(mut func: MachFunction, name: &str) {
+        let before = format!("{func:?}");
+        assert!(!VectorizationPass::new().run(&mut func), "{name}");
+        assert_eq!(format!("{func:?}"), before, "{name}");
+    }
+
+    /// OD-LOOP-COVERAGE-20261008's reversal trigger, measured 2026-10-10. The
+    /// iteration-coverage clause does not count a top-tested loop's final,
+    /// exiting header entry as an iteration, and the in-place rewrite counts
+    /// only latch entries, so work that runs ahead of the header's trip
+    /// compare is counted on neither side. Under `i < 64` the scalar header
+    /// runs that work 65 times (`i = 0..=64`), the VF=2 rewrite on 33 entries
+    /// of 2 lanes (`i = 0..=65`), both count 64 iterations, and the clause
+    /// admits it (natively, an importer program built from
+    /// `revertBits_clang_o0.ll` ran one extra lane at O2). The vectorizer
+    /// refuses a header that runs anything but its test, as it did before
+    /// `95660b90e`.
+    #[test]
+    fn test_o2_revertbits_work_on_the_exiting_header_entry_declines() {
+        let mid_tested = || {
+            let mut fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+            move_body_work_into_header(&mut fixture);
+            fixture
+        };
+        assert_eq!(
+            clause_verdict_on_unchecked_rewrite(&mid_tested().func),
+            Ok(()),
+            "the clause alone admits the mid-tested rewrite"
+        );
+
+        let mut func = mid_tested().func;
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let lp = la.all_loops().next().expect("one loop");
+        let mut plan = analyze_loop(&func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+            .expect("the vectorizer plans the mid-tested loop");
+        assert!(plan.induction.is_some());
+        plan.is_profitable = true;
+        assert_eq!(clause_gap(&func, &plan), Some(ClauseGap::HeaderWork));
+        let before = format!("{func:?}");
+        assert!(apply_vectorization(&mut func, &plan).is_none());
+        assert_eq!(format!("{func:?}"), before);
+        assert_vectorization_pass_declines(mid_tested().func, "mid-tested loop");
+    }
+
+    /// OD-LOOP-COVERAGE-20261008's reversal trigger, measured 2026-10-10. The
+    /// iteration-coverage clause runs a trip that depends on a run-time value
+    /// only at the values it samples, and `10` is not one of them. With
+    /// `bound = (w0 == 10) ? 5 : 8` every sampled run sees 8, which VF=2
+    /// divides, and the clause admits the rewrite; at `w0 = 10` the vector
+    /// loop runs lane 5 under the untouched `i < 5` (natively, the same at
+    /// `argc == 6`). With `start = (w0 == 10) ? 1 : 0` under `i < 64` it runs
+    /// lane 64. The vectorizer refuses an induction plan whose trip is not
+    /// fixed at compile time, as it did before `95660b90e`.
+    #[test]
+    fn test_o2_revertbits_trip_keyed_on_an_unsampled_run_time_value_declines() {
+        let keyed_bound = |hit| {
+            let mut fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+            key_the_trip_bound(&mut fixture, 10, hit, 8);
+            fixture
+        };
+        let keyed_start = |hit| {
+            let mut fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+            key_entry_constant(&mut fixture.func, VReg::new(7, RegClass::Gpr32), 10, hit, 0);
+            fixture
+        };
+        let constant = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+        assert_eq!(planned_clause_gap(&constant.func), None);
+        for (name, fixture, start, bound) in [
+            ("bound (w0 == 10) ? 5 : 8", keyed_bound(5), 0, 5),
+            ("start (w0 == 10) ? 1 : 0", keyed_start(1), 1, 64),
+        ] {
+            assert_eq!(
+                clause_verdict_on_unchecked_rewrite(&fixture.func),
+                Ok(()),
+                "{name}: the clause alone admits the rewrite"
+            );
+            assert_eq!(
+                planned_clause_gap(&fixture.func),
+                Some(ClauseGap::RunTimeTrip),
+                "{name}"
+            );
+            assert_vectorization_pass_declines(fixture.func.clone(), name);
+            assert_o2_revertbits_rewrite_declines(fixture, start, bound, COND_LT);
+        }
+    }
+
+    /// Insert `movz dst, #value` ahead of the entry's branch.
+    fn insert_entry_movz(func: &mut MachFunction, dst: VReg, value: i64) {
+        insert_before_branch(
+            func,
+            func.entry,
+            vec![MachInst::new(
+                AArch64Opcode::Movz,
+                vec![MachOperand::VReg(dst), imm(value)],
+            )],
+        );
+    }
+
+    /// Insert `insts` ahead of `block`'s final branch.
+    fn insert_before_branch(func: &mut MachFunction, block: BlockId, insts: Vec<MachInst>) {
+        let ids: Vec<InstId> = insts.into_iter().map(|inst| func.push_inst(inst)).collect();
+        let at = func.block(block).insts.len() - 1;
+        func.block_mut(block).insts.splice(at..at, ids);
+    }
+
+    /// The O2 revertBits loop that also stores its induction, `last = i`, to
+    /// stack slot 0 in `block` with `store` (`StrRI` or `VolatileStrRI`).
+    fn o2_revertbits_storing_the_induction(block: BlockId, store: AArch64Opcode) -> MachFunction {
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let x3 = VReg::new(3, RegClass::Gpr64);
+        let entry = func.entry;
+        insert_before_branch(
+            &mut func,
+            entry,
+            vec![MachInst::new(
+                AArch64Opcode::AddPCRel,
+                vec![
+                    MachOperand::VReg(x3),
+                    MachOperand::PReg(trust_cg_ir::aarch64_regs::SP),
+                    MachOperand::StackSlot(StackSlotId(0)),
+                ],
+            )],
+        );
+        insert_before_branch(
+            &mut func,
+            block,
+            vec![
+                MachInst::new(
+                    AArch64Opcode::MovR,
+                    vec![MachOperand::VReg(w(70)), MachOperand::VReg(w(81))],
+                ),
+                MachInst::new(
+                    store,
+                    vec![MachOperand::VReg(w(70)), MachOperand::VReg(x3), imm(0)],
+                ),
+            ],
+        );
+        func
+    }
+
+    /// The O2 revertBits loop with a guard between its header and its body:
+    /// `if (i < 33)` the body's work runs, else the iteration goes straight
+    /// to the latch.
+    ///
+    /// ```text
+    /// bb1: ... b.lt bb5; b bb4
+    /// bb5: w90 = mov w81; cmp w90, #33; b.ge bb3; b bb2
+    /// ```
+    fn o2_revertbits_with_a_guarded_body() -> MachFunction {
+        const COND_GE: i64 = 10;
+        let fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+        let mut func = fixture.func;
+        let (header, body, latch) = (BlockId(1), BlockId(2), BlockId(3));
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let guard = func.create_block();
+        for inst in [
+            MachInst::new(
+                AArch64Opcode::MovR,
+                vec![MachOperand::VReg(w(90)), MachOperand::VReg(w(81))],
+            ),
+            MachInst::new(
+                AArch64Opcode::CmpRI,
+                vec![MachOperand::VReg(w(90)), imm(33)],
+            ),
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![imm(COND_GE), MachOperand::Block(latch)],
+            ),
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(body)]),
+        ] {
+            append_test_inst(&mut func, guard, inst);
+        }
+        let bcond = fixture.header_test[fixture.header_test.len() - 2];
+        assert_eq!(func.inst(bcond).operands[1], MachOperand::Block(body));
+        func.inst_mut(bcond).operands[1] = MachOperand::Block(guard);
+        func.block_mut(header).succs.retain(|&succ| succ != body);
+        func.block_mut(body).preds.retain(|&pred| pred != header);
+        func.add_edge(header, guard);
+        func.add_edge(guard, latch);
+        func.add_edge(guard, body);
+        func
+    }
+
+    /// The rewrite leaves scalar what its plan does not account for and runs
+    /// it once per vector iteration. A store of the induction (`last = i`)
+    /// in the latch or the body then runs on even `i` only at VF=2, and an
+    /// `if (i < 33)` guard decides for both lanes from the first, so lane 33
+    /// does the body's work; the clause counts iterations and admits each.
+    /// The vectorizer refuses an instruction of the loop its plan does not
+    /// account for that does more than compute registers (natively, revertBits
+    /// with the store printed `last=16777214` at O2 for 16777215).
+    #[test]
+    fn test_o2_revertbits_unplanned_effect_in_the_loop_declines() {
+        let (body, latch) = (BlockId(2), BlockId(3));
+        for (name, func) in [
+            (
+                "latch store",
+                o2_revertbits_storing_the_induction(latch, AArch64Opcode::StrRI),
+            ),
+            (
+                "body store",
+                o2_revertbits_storing_the_induction(body, AArch64Opcode::StrRI),
+            ),
+            (
+                "volatile body store",
+                o2_revertbits_storing_the_induction(body, AArch64Opcode::VolatileStrRI),
+            ),
+            ("guarded body", o2_revertbits_with_a_guarded_body()),
+        ] {
+            assert_vectorization_pass_declines(func.clone(), name);
+            assert_eq!(
+                clause_verdict_on_unchecked_rewrite(&func),
+                Ok(()),
+                "{name}: the clause alone admits the rewrite"
+            );
+            assert_eq!(
+                planned_clause_gap(&func),
+                Some(ClauseGap::UnplannedEffect),
+                "{name}"
+            );
+        }
+    }
+
+    /// `AddPCRel dst, sp, slot`.
+    fn stack_slot_address(dst: VReg, slot: u32) -> MachInst {
+        MachInst::new(
+            AArch64Opcode::AddPCRel,
+            vec![
+                MachOperand::VReg(dst),
+                MachOperand::PReg(trust_cg_ir::aarch64_regs::SP),
+                MachOperand::StackSlot(StackSlotId(slot)),
+            ],
+        )
+    }
+
+    /// The O2 revertBits loop with `x5 = &slot0` in the entry and a dead
+    /// `x2 = &slot2` at the top of the exit, the last definition in layout
+    /// of the `acc64` bridge's address `x2`; with `moved`, the latch also
+    /// moves that address to slot 0 (`x2 = mov x5`).
+    fn o2_revertbits_with_a_moving_bridge_address(moved: bool) -> MachFunction {
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
+        let (latch, exit) = (BlockId(3), BlockId(4));
+        let x = |id| VReg::new(id, RegClass::Gpr64);
+        let entry = func.entry;
+        insert_before_branch(&mut func, entry, vec![stack_slot_address(x(5), 0)]);
+        if moved {
+            insert_before_branch(
+                &mut func,
+                latch,
+                vec![MachInst::new(
+                    AArch64Opcode::MovR,
+                    vec![MachOperand::VReg(x(2)), MachOperand::VReg(x(5))],
+                )],
+            );
+        }
+        let dead = func.push_inst(stack_slot_address(x(2), 2));
+        func.block_mut(exit).insts.insert(0, dead);
+        func
+    }
+
+    /// Register work the plan leaves scalar may redefine the address of a
+    /// load and store the plan keeps, an ordered-sub reduction's stack
+    /// bridge, and the rewrite runs that bridge once per vector iteration.
+    /// With the `acc64` address moved to slot 0 in the latch, both lanes of
+    /// an iteration accumulated into the slot the first lane saw:
+    /// interpreted, the scalar loop leaves slot 0 = 2^63 and slot 2 = 0, the
+    /// published VF=2 rewrite slot 0 = 0 and slot 2 = 2^63 (round-2 review of
+    /// `23ed4a3e0`). The recognizer read only the address's last definition
+    /// in layout, the dead one in the exit. It now refuses an address with
+    /// any definition in the loop; the loop without the copy still
+    /// vectorizes.
+    #[test]
+    fn test_o2_revertbits_bridge_address_redefined_in_the_loop_declines() {
+        let x2 = VReg::new(2, RegClass::Gpr64);
+        // For each ordered-sub bridge the recognizer finds in `func`'s loop,
+        // whether its kept load or store reads `x2`.
+        let bridges_at_x2 = |func: &MachFunction| -> Vec<bool> {
+            let dom = DomTree::compute(func);
+            let la = LoopAnalysis::compute(func, &dom);
+            let lp = la.all_loops().next().expect("one loop");
+            let vectorizable: Vec<InstId> = lp
+                .body
+                .iter()
+                .flat_map(|&block_id| func.block(block_id).insts.clone())
+                .filter(|&inst_id| is_vectorizable(func.inst(inst_id).opcode))
+                .collect();
+            let reads_x2 = |inst_id: Option<InstId>| {
+                inst_id.is_some_and(|inst_id| inst_source_uses_vreg(func.inst(inst_id), x2.id))
+            };
+            find_ordered_sub_reductions(func, lp, &vectorizable, &VecMaps::build(func))
+                .iter()
+                .map(|reduction| {
+                    reads_x2(reduction.writeback_inst) || reads_x2(reduction.accumulator_load_inst)
+                })
+                .collect()
+        };
+        let mut control = o2_revertbits_with_a_moving_bridge_address(false);
+        let mut found = bridges_at_x2(&control);
+        found.sort();
+        assert_eq!(found, [false, true], "both bridges of the control");
+        assert!(
+            VectorizationPass::new().run(&mut control),
+            "the loop whose bridge address stays put vectorizes"
+        );
+        let moved = o2_revertbits_with_a_moving_bridge_address(true);
+        assert_eq!(
+            bridges_at_x2(&moved),
+            [false],
+            "only the bridge at the unmoved address is recognized"
+        );
+        assert_vectorization_pass_declines(moved, "bridge address moved in the latch");
+    }
+
+    /// A new block, laid out last, holding `insts` and a branch to `to`.
+    fn append_branching_block(func: &mut MachFunction, insts: Vec<InstId>, to: BlockId) -> BlockId {
+        let block = func.create_block();
+        for inst_id in insts {
+            func.append_inst(block, inst_id);
+        }
+        append_test_inst(
+            func,
+            block,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(to)]),
+        );
+        func.add_edge(block, to);
+        block
+    }
+
+    /// Send `from`'s transfer to `old` to `new` instead.
+    fn redirect_edge(func: &mut MachFunction, from: BlockId, old: BlockId, new: BlockId) {
+        for inst_id in func.block(from).insts.clone() {
+            rewrite_block_target(func.inst_mut(inst_id), old, new);
+        }
+        func.block_mut(from).succs.retain(|&succ| succ != old);
+        func.block_mut(old).preds.retain(|&pred| pred != from);
+        func.add_edge(from, new);
+    }
+
+    /// The instruction of `block` that defines `vreg` with `opcode`.
+    fn defining_inst(
+        func: &MachFunction,
+        block: BlockId,
+        opcode: AArch64Opcode,
+        vreg: VReg,
+    ) -> InstId {
+        *func
+            .block(block)
+            .insts
+            .iter()
+            .find(|&&inst_id| {
+                let inst = func.inst(inst_id);
+                inst.opcode == opcode && inst.operands.first() == Some(&MachOperand::VReg(vreg))
+            })
+            .expect("the fixture's definition")
+    }
+
+    /// Insert `inst` right after `anchor` in `block`.
+    fn insert_after(func: &mut MachFunction, block: BlockId, anchor: InstId, inst: MachInst) {
+        let pos = func
+            .block(block)
+            .insts
+            .iter()
+            .position(|&inst_id| inst_id == anchor)
+            .expect("the anchor");
+        let inst_id = func.push_inst(inst);
+        func.block_mut(block).insts.insert(pos + 1, inst_id);
+    }
+
+    /// The O2 revertBits loop with a second definition of a register the
+    /// rewrite maps to the induction's lanes, or of the copy the `sxtw`
+    /// reads:
+    /// - `alias`: `w40 = movz #5` right after the body's `w40 = mov w81`,
+    ///   the copy the narrow `rbit` reads;
+    /// - `sign extension`: `x46 = movz #5` right after `x46 = sxtw w45`;
+    /// - `sign extension source`: the body's `w45 = mov w81` moved to a new
+    ///   block, laid out last, between the header and the body, and
+    ///   `w45 = movz #5` right ahead of the `sxtw`, so the copy is `w45`'s
+    ///   last definition in layout but not the one the `sxtw` reads;
+    /// - `alias copied in the latch`: the body's `w40 = mov w81` moved to the
+    ///   top of the latch, and `w40 = movz #0` in the entry, so the body
+    ///   reads the previous iteration's copy.
+    fn o2_revertbits_with_a_redefined_induction_register(shape: &str) -> MachFunction {
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
+        let (header, body, latch) = (BlockId(1), BlockId(2), BlockId(3));
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let x = |id| VReg::new(id, RegClass::Gpr64);
+        let movz =
+            |dst: VReg| MachInst::new(AArch64Opcode::Movz, vec![MachOperand::VReg(dst), imm(5)]);
+        match shape {
+            "alias" => {
+                let copy = defining_inst(&func, body, AArch64Opcode::MovR, w(40));
+                insert_after(&mut func, body, copy, movz(w(40)));
+            }
+            "sign extension" => {
+                let sxtw = defining_inst(&func, body, AArch64Opcode::Sxtw, x(46));
+                insert_after(&mut func, body, sxtw, movz(x(46)));
+            }
+            "sign extension source" => {
+                let copy = defining_inst(&func, body, AArch64Opcode::MovR, w(45));
+                func.block_mut(body)
+                    .insts
+                    .retain(|&inst_id| inst_id != copy);
+                let sxtw = defining_inst(&func, body, AArch64Opcode::Sxtw, x(46));
+                let pos = func
+                    .block(body)
+                    .insts
+                    .iter()
+                    .position(|&inst_id| inst_id == sxtw)
+                    .unwrap();
+                let redefinition = func.push_inst(movz(w(45)));
+                func.block_mut(body).insts.insert(pos, redefinition);
+                let copy_block = append_branching_block(&mut func, vec![copy], body);
+                redirect_edge(&mut func, header, body, copy_block);
+            }
+            "alias copied in the latch" => {
+                let copy = defining_inst(&func, body, AArch64Opcode::MovR, w(40));
+                func.block_mut(body)
+                    .insts
+                    .retain(|&inst_id| inst_id != copy);
+                func.block_mut(latch).insts.insert(0, copy);
+                let entry = func.entry;
+                insert_before_branch(
+                    &mut func,
+                    entry,
+                    vec![MachInst::new(
+                        AArch64Opcode::Movz,
+                        vec![MachOperand::VReg(w(40)), imm(0)],
+                    )],
+                );
+            }
+            other => panic!("unknown shape {other}"),
+        }
+        func
+    }
+
+    /// The rewrite maps the induction's alias and its sign extension to the
+    /// induction's lanes. Register work the plan leaves scalar can redefine
+    /// either, or the copy the `sxtw` reads, in the loop, and the recognizer
+    /// read one definition of each (the alias's not at all, the source's
+    /// last in layout). Interpreted at VF=2 (round-2 review of `23ed4a3e0`),
+    /// each published rewrite computed the `rbit` of the lanes instead of
+    /// 5: `acc32` = 0xffffffe080000000 where the scalar loop leaves
+    /// -64 * rbit32(5) = 0xffffffd800000000 (alias), `acc64` = 2^63 where it
+    /// leaves 64 * rbit64(5) = 0 mod 2^64 (sign extension, and its source);
+    /// with the alias copied in the latch, `acc32` = 0xffffffe080000000
+    /// where the scalar loop, one value behind, leaves 0xffffffe17c000000.
+    /// The recognizer now refuses the loop unless the alias and the sign
+    /// extension have one definition each, the copy and the `sxtw`, and the
+    /// `sxtw` reads the induction or a register with one definition.
+    #[test]
+    fn test_o2_revertbits_redefined_induction_alias_or_sign_extension_declines() {
+        let control = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
+        let induction_of = |func: &MachFunction| {
+            let dom = DomTree::compute(func);
+            let la = LoopAnalysis::compute(func, &dom);
+            let lp = la.all_loops().next().expect("one loop");
+            analyze_loop(func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+                .and_then(|plan| plan.induction)
+        };
+        let planned = induction_of(&control).expect("the control plans its induction");
+        assert_eq!(
+            (
+                planned.scalar_current_alias.map(|alias| alias.id),
+                planned.sign_extended_current.map(|wide| wide.id)
+            ),
+            (Some(40), Some(46))
+        );
+        for shape in [
+            "alias",
+            "sign extension",
+            "sign extension source",
+            "alias copied in the latch",
+        ] {
+            let func = o2_revertbits_with_a_redefined_induction_register(shape);
+            assert!(
+                induction_of(&func).is_none(),
+                "{shape}: no induction is planned"
+            );
+            assert_vectorization_pass_declines(func, shape);
+        }
+    }
+
+    /// The O2 revertBits loop with its lane readers placed where lanes built
+    /// ahead of the first one the plan lists do not reach them all:
+    /// - `latch reader after the write-back`: a third bridge,
+    ///   `[slot0] -= zext(rbit(w81))`, at the end of the latch, after
+    ///   `w81 = mov w52`; the scalar loop reads `i + 1` there;
+    /// - `wide half in an earlier block`: the narrow half (the `w40` copy
+    ///   and its bridge) moved to a new block between the body and the
+    ///   latch, so the lanes are built there, after the body's wide `rbit`;
+    /// - `direct reader after the alias reader`: the same third bridge at the
+    ///   end of the body, the lanes then built ahead of it, after the
+    ///   body's narrow and wide `rbit`s;
+    /// - `body work after the latch's write-back`: the body's work moved to
+    ///   the end of the latch, after `w81 = mov w52`, so every reader sees
+    ///   `i + 1` in the scalar loop and the lanes are built from the
+    ///   induction already advanced by `vf`.
+    fn o2_revertbits_with_misplaced_lane_readers(shape: &str) -> MachFunction {
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
+        let (body, latch) = (BlockId(2), BlockId(3));
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let x = |id| VReg::new(id, RegClass::Gpr64);
+        let direct_bridge = || {
+            vec![
+                MachInst::new(
+                    AArch64Opcode::Rbit,
+                    vec![MachOperand::VReg(w(61)), MachOperand::VReg(w(81))],
+                ),
+                MachInst::new(
+                    AArch64Opcode::Uxtw,
+                    vec![MachOperand::VReg(x(62)), MachOperand::VReg(w(61))],
+                ),
+                MachInst::new(
+                    AArch64Opcode::LdrRI,
+                    vec![MachOperand::VReg(x(63)), MachOperand::VReg(x(3)), imm(0)],
+                ),
+                MachInst::new(
+                    AArch64Opcode::SubRR,
+                    vec![
+                        MachOperand::VReg(x(64)),
+                        MachOperand::VReg(x(63)),
+                        MachOperand::VReg(x(62)),
+                    ],
+                ),
+                MachInst::new(
+                    AArch64Opcode::StrRI,
+                    vec![MachOperand::VReg(x(64)), MachOperand::VReg(x(3)), imm(0)],
+                ),
+            ]
+        };
+        match shape {
+            "latch reader after the write-back" | "direct reader after the alias reader" => {
+                let entry = func.entry;
+                insert_before_branch(&mut func, entry, vec![stack_slot_address(x(3), 0)]);
+                let block = if shape.starts_with("latch") {
+                    latch
+                } else {
+                    body
+                };
+                insert_before_branch(&mut func, block, direct_bridge());
+            }
+            "wide half in an earlier block" => {
+                let copy = defining_inst(&func, body, AArch64Opcode::MovR, w(40));
+                let insts = func.block(body).insts.clone();
+                let start = insts.iter().position(|&inst_id| inst_id == copy).unwrap();
+                let narrow: Vec<InstId> = insts[start..start + 6].to_vec();
+                assert_eq!(
+                    func.inst(narrow[5]).opcode,
+                    AArch64Opcode::StrRI,
+                    "the narrow half ends in its store"
+                );
+                func.block_mut(body)
+                    .insts
+                    .retain(|inst_id| !narrow.contains(inst_id));
+                let narrow_block = append_branching_block(&mut func, narrow, latch);
+                redirect_edge(&mut func, body, latch, narrow_block);
+            }
+            "body work after the latch's write-back" => {
+                let mut work = func.block(body).insts.clone();
+                let branch = work.pop().expect("the body ends in its branch");
+                func.block_mut(body).insts = vec![branch];
+                let at = func.block(latch).insts.len() - 1;
+                func.block_mut(latch).insts.splice(at..at, work);
+            }
+            other => panic!("unknown shape {other}"),
+        }
+        func
+    }
+
+    /// The rewrite builds the induction's lanes once per vector iteration,
+    /// ahead of the first vectorized reader the plan lists, from the
+    /// induction's value there, maps the induction, its alias and its sign
+    /// extension to them in every vectorized reader, and advances the
+    /// induction by `vf` at its step. Each shape here was published at
+    /// `23ed4a3e0`. A reader that ran earlier in the iteration (in an
+    /// earlier block, or ahead of the first direct reader of the induction)
+    /// read lanes not yet built: interpreted, the first iteration read an
+    /// undefined register. Lanes built after the latch's write-back hold the
+    /// induction advanced by `vf` where the scalar loop reads `i + 1`: with
+    /// the body's work there, the rewrite summed `rbit` over `2..=65` for
+    /// `1..=64`, `acc32` = 0xffffffe07c000000 where the scalar loop leaves
+    /// 0xffffffe07e000000. The rewrite now declines unless every lane reader
+    /// and every copy the lanes stand for is in the block the lanes are
+    /// built in, each reader at or after them and each copy ahead of its
+    /// reader, the induction is not redefined among them, and the step runs
+    /// after them ([`induction_lanes_reach_every_reader`]).
+    #[test]
+    fn test_o2_revertbits_lane_readers_the_lanes_do_not_reach_decline() {
+        for shape in [
+            "latch reader after the write-back",
+            "wide half in an earlier block",
+            "direct reader after the alias reader",
+            "body work after the latch's write-back",
+        ] {
+            let func = o2_revertbits_with_misplaced_lane_readers(shape);
+            let dom = DomTree::compute(&func);
+            let la = LoopAnalysis::compute(&func, &dom);
+            let lp = la.all_loops().next().expect("one loop");
+            let plan = analyze_loop(&func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+                .unwrap_or_else(|| panic!("{shape}: the vectorizer plans the loop"));
+            assert!(plan.induction.is_some(), "{shape}: an induction plan");
+            assert_eq!(clause_gap(&func, &plan), None, "{shape}: no clause gap");
+            assert_vectorization_pass_declines(func, shape);
+        }
+    }
+
+    /// The O2 revertBits loop whose induction is also defined by a copy
+    /// `w81 = mov <from>` at the top of the header, ahead of its test, with
+    /// `<from>` keyed on the argument in the entry: `(w0 == 10) ? 1 : 0`.
+    fn o2_revertbits_with_a_header_copy_into_the_induction(from: u32) -> O2RevertBitsLoop {
+        let mut fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+        let from = VReg::new(from, RegClass::Gpr32);
+        insert_entry_movz(&mut fixture.func, from, 0);
+        key_entry_constant(&mut fixture.func, from, 10, 1, 0);
+        let copy = fixture.func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![
+                MachOperand::VReg(VReg::new(81, RegClass::Gpr32)),
+                MachOperand::VReg(from),
+            ],
+        ));
+        fixture.func.block_mut(BlockId(1)).insts.insert(0, copy);
+        fixture
+    }
+
+    /// The latch's copy `w81 = mov w52` of the step's result removed.
+    fn remove_latch_writeback(fixture: &mut O2RevertBitsLoop) {
+        let latch = BlockId(3);
+        let func = &mut fixture.func;
+        let writeback: Vec<InstId> = func
+            .block(latch)
+            .insts
+            .iter()
+            .copied()
+            .filter(|&inst_id| {
+                let inst = func.inst(inst_id);
+                inst.opcode == AArch64Opcode::MovR
+                    && inst.operands[0] == MachOperand::VReg(VReg::new(81, RegClass::Gpr32))
+            })
+            .collect();
+        assert_eq!(writeback.len(), 1, "the latch's write-back");
+        func.block_mut(latch)
+            .insts
+            .retain(|inst_id| !writeback.contains(inst_id));
+    }
+
+    /// A run-time start entering through a header copy of the step's result,
+    /// `w81 = mov w52` ahead of the test with `w52 = (w0 == 10) ? 1 : 0` in
+    /// the entry, while `w81` keeps its one constant entry definition
+    /// (`w81 = mov w7`). The first test reads the keyed value: at `w0 = 10`
+    /// the scalar loop runs `i = 1..=63` and the VF=2 rewrite `1..=64`, and
+    /// the clause, whose samples never hit 10, admits it. The same holds with
+    /// the latch's write-back removed, the header copy then the induction's
+    /// only in-loop definition. The vectorizer refuses an in-loop definition
+    /// of the counter outside the latch, as it did before `95660b90e`
+    /// (`advanced_only_by_its_step`).
+    #[test]
+    fn test_o2_revertbits_start_through_a_header_copy_of_the_step_result_declines() {
+        let header_copy = || o2_revertbits_with_a_header_copy_into_the_induction(52);
+        let header_copy_only = || {
+            let mut fixture = header_copy();
+            remove_latch_writeback(&mut fixture);
+            fixture
+        };
+        for (name, fixture) in [
+            ("header copy of the step's result", header_copy()),
+            ("header copy, no latch write-back", header_copy_only()),
+        ] {
+            assert_vectorization_pass_declines(fixture.func.clone(), name);
+            assert_eq!(
+                clause_verdict_on_unchecked_rewrite(&fixture.func),
+                Ok(()),
+                "{name}: the clause alone admits the rewrite"
+            );
+            assert_eq!(
+                planned_clause_gap(&fixture.func),
+                Some(ClauseGap::RunTimeTrip),
+                "{name}"
+            );
+            assert_o2_revertbits_rewrite_declines(fixture, 1, 64, COND_LT);
+        }
+    }
+
+    /// Each sub-check of [`trip_is_compile_time`] that alone refuses a
+    /// run-time trip the clause admits:
+    /// - `bound_is_header_constant`: the header bound `movz w39, #64` is
+    ///   redefined by `mov w39, w77` with `w77 = (w0 == 10) ? 5 : 64`.
+    ///   `trip_compare_in_block` still reads 64, and at `w0 = 10` the VF=2
+    ///   rewrite runs lane 5 under `i < 5`.
+    /// - `advanced_only_by_its_step`: the header copies `w81 = mov w60`
+    ///   ahead of the test, `w60 = (w0 == 10) ? 1 : 0` in the entry and
+    ///   `w60 = mov w52` in the latch; at `w0 = 10` the rewrite runs lane 64.
+    #[test]
+    fn test_o2_revertbits_each_compile_time_trip_check_refuses_its_keyed_trip() {
+        let keyed_bound_copy = || {
+            let mut fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+            let keyed = VReg::new(77, RegClass::Gpr32);
+            insert_entry_movz(&mut fixture.func, keyed, 64);
+            key_entry_constant(&mut fixture.func, keyed, 10, 5, 64);
+            let bound_movz = fixture.header_test[0];
+            let header = BlockId(1);
+            let pos = fixture
+                .func
+                .block(header)
+                .insts
+                .iter()
+                .position(|&inst_id| inst_id == bound_movz)
+                .expect("the header's bound movz");
+            let copy = fixture.func.push_inst(MachInst::new(
+                AArch64Opcode::MovR,
+                vec![
+                    MachOperand::VReg(VReg::new(39, RegClass::Gpr32)),
+                    MachOperand::VReg(keyed),
+                ],
+            ));
+            fixture.func.block_mut(header).insts.insert(pos + 1, copy);
+            fixture
+        };
+        let keyed_header_copy = || {
+            let mut fixture = o2_revertbits_with_a_header_copy_into_the_induction(60);
+            insert_before_branch(
+                &mut fixture.func,
+                BlockId(3),
+                vec![MachInst::new(
+                    AArch64Opcode::MovR,
+                    vec![
+                        MachOperand::VReg(VReg::new(60, RegClass::Gpr32)),
+                        MachOperand::VReg(VReg::new(52, RegClass::Gpr32)),
+                    ],
+                )],
+            );
+            fixture
+        };
+        for (name, fixture, start, bound) in [
+            ("bound redefined by a header copy", keyed_bound_copy(), 0, 5),
+            (
+                "induction copied from a third register",
+                keyed_header_copy(),
+                1,
+                64,
+            ),
+        ] {
+            assert_eq!(
+                clause_verdict_on_unchecked_rewrite(&fixture.func),
+                Ok(()),
+                "{name}: the clause alone admits the rewrite"
+            );
+            assert_eq!(
+                planned_clause_gap(&fixture.func),
+                Some(ClauseGap::RunTimeTrip),
+                "{name}"
+            );
+            assert_vectorization_pass_declines(fixture.func.clone(), name);
+            assert_o2_revertbits_rewrite_declines(fixture, start, bound, COND_LT);
+        }
+    }
+
+    /// A plain (no induction) plan: `acc64 -= rbit64(x95)` with `x95` loop
+    /// invariant, under a counter the header tests with `cmp w38, #64` and
+    /// the latch advances by `madd w52, w50, w51, w51` (`w51 = 1`, not an
+    /// induction step), from `w7`: 0, or with `keyed_start`
+    /// `(w0 == 10) ? 1 : 0`.
+    fn make_o2_plain_sub_loop(keyed_start: bool) -> MachFunction {
+        let fixture = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT);
+        let mut func = fixture.func;
+        let (header, body) = (BlockId(1), BlockId(2));
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let x = |id| VReg::new(id, RegClass::Gpr64);
+        insert_entry_movz(&mut func, x(95), 0x1234);
+        let narrow = |inst: &MachInst| {
+            matches!(inst.operands.first(), Some(MachOperand::VReg(v)) if (40..=46).contains(&v.id))
+                || (inst.opcode == AArch64Opcode::StrRI
+                    && inst.operands.first() == Some(&MachOperand::VReg(x(44))))
+        };
+        let kept: Vec<InstId> = func
+            .block(body)
+            .insts
+            .iter()
+            .copied()
+            .filter(|&inst_id| !narrow(func.inst(inst_id)))
+            .collect();
+        func.block_mut(body).insts = kept;
+        for inst_id in func.block(body).insts.clone() {
+            if func.inst(inst_id).opcode == AArch64Opcode::Rbit {
+                func.inst_mut(inst_id).operands[1] = MachOperand::VReg(x(95));
+            }
+        }
+        *func.inst_mut(fixture.step) = MachInst::new(
+            AArch64Opcode::Madd,
+            vec![
+                MachOperand::VReg(w(52)),
+                MachOperand::VReg(w(50)),
+                MachOperand::VReg(w(51)),
+                MachOperand::VReg(w(51)),
+            ],
+        );
+        let [bound_movz, cmp, ..] = fixture.header_test[..] else {
+            panic!("the header's bound and compare");
+        };
+        func.block_mut(header)
+            .insts
+            .retain(|&inst_id| inst_id != bound_movz);
+        *func.inst_mut(cmp) = MachInst::new(
+            AArch64Opcode::CmpRI,
+            vec![MachOperand::VReg(w(38)), imm(64)],
+        );
+        if keyed_start {
+            key_entry_constant(&mut func, w(7), 10, 1, 0);
+        }
+        func
+    }
+
+    /// A plain plan's trip is decided by the clause only at its samples. With
+    /// the counter's start keyed on `w0`, the samples see 0 and the rewrite
+    /// (counter step 1 under the divided `i < 32`, 2 lanes an iteration)
+    /// runs 62 of the scalar 63 subtractions at `w0 = 10`. The vectorizer
+    /// refuses a plain plan whose counter does not enter the loop as a
+    /// constant ([`ClauseGap::RunTimeTrip`]); from a constant start the trip
+    /// is fixed at compile time. Until 2026-10-11 that plan was then published
+    /// (the cost model rates it unprofitable, so `is_profitable` is forced),
+    /// although its vectorized `rbit` reads `x95`, a value from before the
+    /// loop that the rewrite builds no lanes for: the published `rbit` read a
+    /// SIMD register nothing writes. A plain plan builds no induction lanes,
+    /// so the first vectorized instruction of every chain reads such a value,
+    /// and the plan is refused for it ([`ClauseGap::UncomputedLaneInput`]).
+    #[test]
+    fn test_plain_plan_with_a_run_time_counter_start_declines() {
+        let forced_plan = |func: &MachFunction| {
+            let dom = DomTree::compute(func);
+            let la = LoopAnalysis::compute(func, &dom);
+            let lp = la.all_loops().next().expect("one loop");
+            let mut plan = analyze_loop(func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+                .expect("the vectorizer plans the loop");
+            assert!(plan.induction.is_none(), "a plain plan");
+            assert_eq!((plan.vf, plan.trip_count), (2, Some(64)));
+            plan.is_profitable = true;
+            plan
+        };
+
+        let keyed = make_o2_plain_sub_loop(true);
+        let plan = forced_plan(&keyed);
+        let mut func = keyed.clone();
+        assert!(
+            apply_vectorization(&mut func, &plan).is_none(),
+            "a plain plan whose counter starts at a run-time value is published"
+        );
+        assert_eq!(format!("{func:?}"), format!("{keyed:?}"));
+        assert_eq!(
+            clause_verdict_on_unchecked_rewrite(&keyed),
+            Ok(()),
+            "the clause alone admits the rewrite"
+        );
+        assert_eq!(clause_gap(&keyed, &plan), Some(ClauseGap::RunTimeTrip));
+
+        let constant = make_o2_plain_sub_loop(false);
+        let plan = forced_plan(&constant);
+        assert!(
+            plan_trip_counter(&constant, &plan).is_some_and(|counter| trip_is_compile_time(
+                &constant,
+                &plan.scalar_loop,
+                counter
+            )),
+            "from a constant start the trip is fixed at compile time"
+        );
+        assert_eq!(
+            clause_gap(&constant, &plan),
+            Some(ClauseGap::UncomputedLaneInput),
+            "the rbit reads x95, whose lanes nothing builds"
+        );
+        let mut func = constant.clone();
+        assert!(apply_vectorization(&mut func, &plan).is_none());
+        assert_eq!(format!("{func:?}"), format!("{constant:?}"));
+    }
+
+    /// The O2 revertBits loop with register work the plan leaves scalar
+    /// writing a register a planned instruction reads, or, with `killed`, the
+    /// same work where a planned definition overwrites it before the read:
+    /// - `loaded accumulator`: `x48 = movz #0` right ahead of the `acc64`
+    ///   reducer `x49 = sub x48, x47` (killed: at the end of the body, ahead
+    ///   of the next iteration's `x48 = ldr [x2]`);
+    /// - `wide lane value` and `narrow lane value`: the body split after its
+    ///   two `rbit`s, the bridges moved to a new block, and `x47 = movz #0`
+    ///   (`w41 = movz #0`) in a block run between them but laid out ahead of
+    ///   the body, so the `rbit` stays the register's last definition in
+    ///   layout, the one the bridge recognizer reads (killed: the `movz` right
+    ///   ahead of the `rbit`).
+    fn o2_revertbits_with_scalar_work_on_a_planned_read(shape: &str, killed: bool) -> MachFunction {
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
+        let (body, latch) = (BlockId(2), BlockId(3));
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let x = |id| VReg::new(id, RegClass::Gpr64);
+        let movz =
+            |dst: VReg| MachInst::new(AArch64Opcode::Movz, vec![MachOperand::VReg(dst), imm(0)]);
+        let position = |func: &MachFunction, inst_id: InstId| {
+            func.block(body)
+                .insts
+                .iter()
+                .position(|&id| id == inst_id)
+                .expect("in the body")
+        };
+        let reset = match shape {
+            "loaded accumulator" => x(48),
+            "wide lane value" => x(47),
+            "narrow lane value" => w(41),
+            other => panic!("unknown shape {other}"),
+        };
+        if shape == "loaded accumulator" {
+            if killed {
+                insert_before_branch(&mut func, body, vec![movz(reset)]);
+            } else {
+                let reducer = defining_inst(&func, body, AArch64Opcode::SubRR, x(49));
+                let at = position(&func, reducer);
+                let reset_id = func.push_inst(movz(reset));
+                func.block_mut(body).insts.insert(at, reset_id);
+            }
+            return func;
+        }
+        let rbit = defining_inst(&func, body, AArch64Opcode::Rbit, reset);
+        if killed {
+            let at = position(&func, rbit);
+            let reset_id = func.push_inst(movz(reset));
+            func.block_mut(body).insts.insert(at, reset_id);
+            return func;
+        }
+        let lane_work: Vec<InstId> = [
+            defining_inst(&func, body, AArch64Opcode::MovR, w(40)),
+            defining_inst(&func, body, AArch64Opcode::Rbit, w(41)),
+            defining_inst(&func, body, AArch64Opcode::MovR, w(45)),
+            defining_inst(&func, body, AArch64Opcode::Sxtw, x(46)),
+            defining_inst(&func, body, AArch64Opcode::Rbit, x(47)),
+        ]
+        .to_vec();
+        let mut bridges = func.block(body).insts.clone();
+        let branch = bridges.pop().expect("the body ends in its branch");
+        bridges.retain(|inst_id| !lane_work.contains(inst_id));
+        func.block_mut(body).insts = lane_work;
+        func.block_mut(body).insts.push(branch);
+        let bridge_block = append_branching_block(&mut func, bridges, latch);
+        let reset_id = func.push_inst(movz(reset));
+        let reset_block = append_branching_block(&mut func, vec![reset_id], bridge_block);
+        redirect_edge(&mut func, body, latch, reset_block);
+        func.block_order.retain(|&block| block != reset_block);
+        let after_entry = func
+            .block_order
+            .iter()
+            .position(|&block| block == func.entry)
+            .expect("the entry is laid out")
+            + 1;
+        func.block_order.insert(after_entry, reset_block);
+        func
+    }
+
+    /// Register work the plan leaves scalar runs once per vector iteration,
+    /// and the rewrite gives a lane read the lanes the planned producer
+    /// builds, so work that writes a register a planned instruction reads,
+    /// where the value reaches the read, changes what the read sees. Each
+    /// shape was published at `27aeaa0df`, the clause admitting it, with a
+    /// wrong value (MachIR, interpreted at VF=2 with the round-3 verifier's
+    /// evaluator): the `acc64` slot holds 0x8800000000000000 =
+    /// -(rbit64(62) + rbit64(63)) where the scalar loop leaves
+    /// 0x0400000000000000 = -rbit64(63) (`loaded accumulator`, the kept
+    /// `movz` resetting the accumulator once for both lanes), 2^63 where it
+    /// leaves 0 (`wide lane value`), and the `acc32` slot 0xffffffe080000000
+    /// where it leaves 0 (`narrow lane value`), the bridge draining the
+    /// `rbit` lanes where the scalar loop subtracts the `movz`'s 0. The
+    /// vectorizer now refuses an in-loop definition outside the plan that
+    /// reaches a planned read ([`planned_input_gap`]); the same work
+    /// overwritten by a planned definition first still vectorizes.
+    #[test]
+    fn test_o2_revertbits_scalar_work_reaching_a_planned_read_declines() {
+        for shape in ["loaded accumulator", "wide lane value", "narrow lane value"] {
+            let func = o2_revertbits_with_scalar_work_on_a_planned_read(shape, false);
+            let dom = DomTree::compute(&func);
+            let la = LoopAnalysis::compute(&func, &dom);
+            let lp = la.all_loops().next().expect("one loop");
+            let plan = analyze_loop(&func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+                .unwrap_or_else(|| panic!("{shape}: the vectorizer plans the loop"));
+            assert!(
+                plan.induction.is_some() && plan.ordered_sub_reductions.len() == 2,
+                "{shape}: the induction and both bridges are planned"
+            );
+            assert_eq!(
+                clause_verdict_on_unchecked_rewrite(&func),
+                Ok(()),
+                "{shape}: the clause alone admits the rewrite"
+            );
+            assert_eq!(
+                planned_clause_gap(&func),
+                Some(ClauseGap::UnplannedDefinition),
+                "{shape}"
+            );
+            assert_vectorization_pass_declines(func, shape);
+        }
+        for shape in ["loaded accumulator", "wide lane value"] {
+            let mut func = o2_revertbits_with_scalar_work_on_a_planned_read(shape, true);
+            assert_eq!(planned_clause_gap(&func), None, "{shape}, killed");
+            assert!(
+                VectorizationPass::new().run(&mut func),
+                "{shape}: work a planned definition overwrites first still vectorizes"
+            );
+        }
+    }
+
+    /// A VF=4 i32 induction loop counted `for (i = 0; i < 64; i++)`: the body
+    /// runs `pre`, subtracts `zext(rbit(rbit_source))` from the `acc` stack
+    /// slot, then runs `post`; the latch steps the induction `w81` itself.
+    /// The entry also sets `w9 = 3`, `w61 = 0` and `w70 = 0`.
+    ///
+    /// ```text
+    /// bb0: x1 = &slot1; w9 = movz #3; w61 = movz #0; w70 = movz #0;
+    ///      w7 = movz #0; w81 = mov w7; b bb1
+    /// bb1: w38 = mov w81; w39 = movz #64; cmp w38, w39; b.lt bb2; b bb4
+    /// bb2: <pre>; w41 = rbit <rbit_source>; x42 = uxtw w41; x43 = ldr [x1];
+    ///      x44 = sub x43, x42; str x44, [x1]; <post>; b bb3
+    /// bb3: w52 = add w81, #1; w81 = mov w52; b bb1
+    /// bb4: ret
+    /// ```
+    fn make_i32_induction_sub_loop(
+        pre: Vec<MachInst>,
+        rbit_source: VReg,
+        post: Vec<MachInst>,
+    ) -> MachFunction {
+        let mut func = MachFunction::new(
+            "i32_induction_sub_loop".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let entry = func.entry;
+        let header = func.create_block();
+        let body = func.create_block();
+        let latch = func.create_block();
+        let exit = func.create_block();
+        let w = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr32));
+        let x = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+        let inst = |opcode, operands| MachInst::new(opcode, operands);
+        for _ in 0..2 {
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(8, 8));
+        }
+        let mut entry_insts = vec![stack_slot_address(VReg::new(1, RegClass::Gpr64), 1)];
+        for (id, value) in [(9, 3), (61, 0), (70, 0), (7, 0)] {
+            entry_insts.push(inst(AArch64Opcode::Movz, vec![w(id), imm(value)]));
+        }
+        entry_insts.extend([
+            inst(AArch64Opcode::MovR, vec![w(81), w(7)]),
+            inst(AArch64Opcode::B, vec![MachOperand::Block(header)]),
+        ]);
+        let header_insts = vec![
+            inst(AArch64Opcode::MovR, vec![w(38), w(81)]),
+            inst(AArch64Opcode::Movz, vec![w(39), imm(64)]),
+            inst(AArch64Opcode::CmpRR, vec![w(38), w(39)]),
+            inst(
+                AArch64Opcode::BCond,
+                vec![imm(COND_LT), MachOperand::Block(body)],
+            ),
+            inst(AArch64Opcode::B, vec![MachOperand::Block(exit)]),
+        ];
+        let mut body_insts = pre;
+        body_insts.extend([
+            inst(
+                AArch64Opcode::Rbit,
+                vec![w(41), MachOperand::VReg(rbit_source)],
+            ),
+            inst(AArch64Opcode::Uxtw, vec![x(42), w(41)]),
+            inst(AArch64Opcode::LdrRI, vec![x(43), x(1), imm(0)]),
+            inst(AArch64Opcode::SubRR, vec![x(44), x(43), x(42)]),
+            inst(AArch64Opcode::StrRI, vec![x(44), x(1), imm(0)]),
+        ]);
+        body_insts.extend(post);
+        body_insts.push(inst(AArch64Opcode::B, vec![MachOperand::Block(latch)]));
+        let latch_insts = vec![
+            inst(AArch64Opcode::AddRI, vec![w(52), w(81), imm(1)]),
+            inst(AArch64Opcode::MovR, vec![w(81), w(52)]),
+            inst(AArch64Opcode::B, vec![MachOperand::Block(header)]),
+        ];
+        for (block, insts) in [
+            (entry, entry_insts),
+            (header, header_insts),
+            (body, body_insts),
+            (latch, latch_insts),
+            (exit, vec![inst(AArch64Opcode::Ret, vec![])]),
+        ] {
+            for each in insts {
+                append_test_inst(&mut func, block, each);
+            }
+        }
+        func.add_edge(entry, header);
+        func.add_edge(header, body);
+        func.add_edge(header, exit);
+        func.add_edge(body, latch);
+        func.add_edge(latch, header);
+        func
+    }
+
+    /// `cmp lhs, rhs; cset dst, eq`.
+    fn i32_eq_compare(lhs: u32, rhs: u32, dst: u32) -> Vec<MachInst> {
+        let w = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr32));
+        vec![
+            MachInst::new(AArch64Opcode::CmpRR, vec![w(lhs), w(rhs)]),
+            MachInst::new(AArch64Opcode::CSet, vec![w(dst), imm(0)]),
+        ]
+    }
+
+    /// `func`'s one loop planned as a VF=4 i32 induction plan, with
+    /// `is_profitable` forced (the cost model rates these small fixtures
+    /// unprofitable; a larger body of the same shape is not).
+    fn forced_vf4_induction_plan(func: &MachFunction, name: &str) -> VectorizationPlan {
+        let dom = DomTree::compute(func);
+        let la = LoopAnalysis::compute(func, &dom);
+        let lp = la.all_loops().next().expect("one loop");
+        let mut plan = analyze_loop(func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+            .unwrap_or_else(|| panic!("{name}: the vectorizer plans the loop"));
+        assert!(
+            plan.induction.is_some() && plan.vf == 4,
+            "{name}: a VF=4 induction plan"
+        );
+        plan.is_profitable = true;
+        plan
+    }
+
+    /// The rewrite reads a compare idiom's operands through the same register
+    /// map as a vectorized instruction's, so a compare of the induction reads
+    /// its lanes, which the rewrite builds at the first vectorized reader of
+    /// the induction. A compare of the induction ahead of that reader, alone
+    /// or feeding a horizontal-any reduction, read lanes not yet built: at
+    /// `27aeaa0df` each was published, and interpreted, the first iteration's
+    /// `cmeq` read a SIMD register nothing had written. The lane check now
+    /// counts compare idioms among the readers
+    /// ([`induction_lanes_reach_every_reader`]); the same compare after the
+    /// reader is still published.
+    #[test]
+    fn test_i32_induction_compare_ahead_of_the_lanes_declines() {
+        let w81 = VReg::new(81, RegClass::Gpr32);
+        let compare_reduced = || {
+            let mut insts = i32_eq_compare(81, 81, 60);
+            insts.push(MachInst::new(
+                AArch64Opcode::OrrRR,
+                vec![vreg32(70), vreg32(70), vreg32(60)],
+            ));
+            insts
+        };
+        for (name, pre) in [
+            ("compare ahead of the lanes", i32_eq_compare(81, 81, 60)),
+            ("compare ahead of the lanes, reduced", compare_reduced()),
+        ] {
+            let func = make_i32_induction_sub_loop(pre, w81, vec![]);
+            let plan = forced_vf4_induction_plan(&func, name);
+            assert_eq!(plan.compare_idioms.len(), 1, "{name}");
+            assert_eq!(clause_gap(&func, &plan), None, "{name}: no clause gap");
+            let mut unchecked = func.clone();
+            assert!(
+                rewrite_unchecked(&mut unchecked, &plan).is_none(),
+                "{name}: the rewrite declines"
+            );
+            let mut published = func.clone();
+            assert!(
+                apply_vectorization(&mut published, &plan).is_none(),
+                "{name}"
+            );
+            assert_eq!(format!("{published:?}"), format!("{func:?}"), "{name}");
+        }
+        let after = make_i32_induction_sub_loop(vec![], w81, i32_eq_compare(81, 81, 60));
+        let plan = forced_vf4_induction_plan(&after, "compare after the lanes");
+        let mut published = after.clone();
+        assert!(
+            apply_vectorization(&mut published, &plan).is_some(),
+            "a compare after the lanes is published"
+        );
+    }
+
+    /// Every read the rewrite gives lanes, other than of the induction, must
+    /// see lanes its iteration computes by a planned producer, and nothing
+    /// the plan leaves scalar may write a register a planned instruction
+    /// reads where the value reaches the read. At `27aeaa0df` each shape here
+    /// was published (MachIR; interpreted, each rewrite read a SIMD register
+    /// nothing writes ahead of it in the iteration, or ran a compare on
+    /// other values than the scalar loop's):
+    /// - `compare of the header's copy`: `cmp w38, w81` reads the header's
+    ///   copy of the counter, which the rewrite never gives lanes;
+    /// - `compare of a constant set in the loop`: `w62 = movz #5` in the body,
+    ///   then `cmp w62, w81`;
+    /// - `compare of a reset lane value`: `w63 = rbit w81; w63 = movz #5`,
+    ///   then `cmp w63, w81`, which in the rewrite saw the `rbit` lanes;
+    /// - `add of a loop invariant`: `w60 = add w81, w9` with `w9 = 3` set
+    ///   before the loop, never broadcast;
+    /// - `add of the previous iteration's value`: `w60 = add w61, w81` ahead
+    ///   of `w61 = add w81, w81`, which the rewrite read from the previous
+    ///   vector iteration's lanes, and in the first from nothing.
+    ///
+    /// The plain loop still publishes.
+    #[test]
+    fn test_i32_induction_planned_reads_the_rewrite_does_not_compute_decline() {
+        let w = |id| VReg::new(id, RegClass::Gpr32);
+        let add = |dst, lhs, rhs| {
+            MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![vreg32(dst), vreg32(lhs), vreg32(rhs)],
+            )
+        };
+        let movz = |dst, value| MachInst::new(AArch64Opcode::Movz, vec![vreg32(dst), imm(value)]);
+        let shapes = [
+            (
+                "compare of the header's copy",
+                make_i32_induction_sub_loop(vec![], w(81), i32_eq_compare(38, 81, 60)),
+                ClauseGap::UnplannedDefinition,
+            ),
+            (
+                "compare of a constant set in the loop",
+                make_i32_induction_sub_loop(
+                    vec![],
+                    w(81),
+                    [vec![movz(62, 5)], i32_eq_compare(62, 81, 60)].concat(),
+                ),
+                ClauseGap::UnplannedDefinition,
+            ),
+            (
+                "compare of a reset lane value",
+                make_i32_induction_sub_loop(
+                    vec![
+                        MachInst::new(AArch64Opcode::Rbit, vec![vreg32(63), vreg32(81)]),
+                        movz(63, 5),
+                    ],
+                    w(81),
+                    i32_eq_compare(63, 81, 60),
+                ),
+                ClauseGap::UnplannedDefinition,
+            ),
+            (
+                "add of a loop invariant",
+                make_i32_induction_sub_loop(vec![add(60, 81, 9)], w(60), vec![]),
+                ClauseGap::UncomputedLaneInput,
+            ),
+            (
+                "add of the previous iteration's value",
+                make_i32_induction_sub_loop(vec![add(60, 61, 81)], w(60), vec![add(61, 81, 81)]),
+                ClauseGap::UncomputedLaneInput,
+            ),
+        ];
+        for (name, func, gap) in shapes {
+            let plan = forced_vf4_induction_plan(&func, name);
+            assert_eq!(clause_gap(&func, &plan), Some(gap), "{name}");
+            let mut published = func.clone();
+            assert!(
+                apply_vectorization(&mut published, &plan).is_none(),
+                "{name}"
+            );
+            assert_eq!(format!("{published:?}"), format!("{func:?}"), "{name}");
+        }
+        let plain = make_i32_induction_sub_loop(vec![], w(81), vec![]);
+        let plan = forced_vf4_induction_plan(&plain, "plain");
+        assert_eq!(clause_gap(&plain, &plan), None);
+        let mut published = plain.clone();
+        assert!(
+            apply_vectorization(&mut published, &plan).is_some(),
+            "the loop without them is published"
+        );
+    }
+
     #[test]
     fn test_imported_o0_i32_induction_store_rewrites_to_vector_main_and_scalar_tail() {
         let mut func = make_imported_o0_i32_induction_store_loop();
@@ -9186,7 +12639,7 @@ mod tests {
         let results = rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(func.num_blocks(), initial_blocks + 3);
+        assert_eq!(func.num_blocks(), initial_blocks + 4);
         assert_eq!(count_opcode(&func, AArch64Opcode::NeonSt1Post), 1);
         assert_eq!(
             count_opcode(&func, AArch64Opcode::StrRI),
@@ -9197,6 +12650,7 @@ mod tests {
         let vector_header = BlockId(initial_blocks as u32);
         let vector_body = BlockId(initial_blocks as u32 + 1);
         let vector_latch = BlockId(initial_blocks as u32 + 2);
+        let vector_entry = BlockId(initial_blocks as u32 + 3);
         let preheader_branch = func
             .block(func.entry)
             .insts
@@ -9207,8 +12661,28 @@ mod tests {
             .expect("preheader should still end in a branch");
         assert_eq!(
             branch_target(func.inst(preheader_branch)),
-            Some(vector_header),
+            Some(vector_entry),
             "preheader should enter the vector main loop first"
+        );
+        let entry_ops: Vec<_> = func
+            .block(vector_entry)
+            .insts
+            .iter()
+            .map(|&inst_id| func.inst(inst_id).opcode)
+            .collect();
+        assert_eq!(
+            entry_ops,
+            vec![
+                AArch64Opcode::Sxtw,
+                AArch64Opcode::Movz,
+                AArch64Opcode::Madd,
+                AArch64Opcode::B,
+            ],
+            "the vector stores start at a[i] for the entry value of i"
+        );
+        assert_eq!(
+            branch_target(func.inst(func.block(vector_entry).insts[3])),
+            Some(vector_header)
         );
         assert!(func.block(original_header).preds.contains(&vector_header));
 
@@ -9221,23 +12695,27 @@ mod tests {
         assert_eq!(
             header_ops,
             vec![
+                AArch64Opcode::Sxtw,
+                AArch64Opcode::Sxtw,
                 AArch64Opcode::AddRI,
                 AArch64Opcode::CmpRR,
                 AArch64Opcode::BCond,
                 AArch64Opcode::B,
             ],
-            "vector guard checks i + 3 < n before storing four lanes"
+            "vector guard checks i + 3 < n on 64-bit values before storing four lanes"
+        );
+        let guard = func.inst(func.block(vector_header).insts[2]);
+        assert_eq!(guard.operands[2], MachOperand::Imm(3));
+        assert!(
+            matches!(guard.operands[0], MachOperand::VReg(vreg) if vreg.class == RegClass::Gpr64),
+            "i + 3 must not wrap in 32 bits"
         );
         assert_eq!(
-            func.inst(func.block(vector_header).insts[0]).operands[2],
-            MachOperand::Imm(3)
-        );
-        assert_eq!(
-            func.inst(func.block(vector_header).insts[2]).operands,
+            func.inst(func.block(vector_header).insts[4]).operands,
             vec![MachOperand::Imm(11), MachOperand::Block(vector_body)]
         );
         assert_eq!(
-            branch_target(func.inst(func.block(vector_header).insts[3])),
+            branch_target(func.inst(func.block(vector_header).insts[5])),
             Some(original_header),
             "non-multiple-of-four and small-n cases fall into scalar tail"
         );
@@ -9305,8 +12783,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_imported_o0_i32_induction_store_accepts_post_sroa_alias_shape() {
+    /// The imported-O0 store loop after SROA: the loop state lives in
+    /// `index_state` (v22), `bound_state` (v21) and `base_state` (v20), seeded
+    /// in the preheader from v0/v1/v6 and read through per-block copies.
+    fn make_post_sroa_alias_i32_induction_store_loop() -> MachFunction {
         let mut func = make_imported_o0_i32_induction_store_loop();
         let preheader = func.entry;
         let header = BlockId(1);
@@ -9405,6 +12885,14 @@ mod tests {
         let latch_insts = func.block(latch).insts.clone();
         func.inst_mut(latch_insts[1]).operands[1] = MachOperand::VReg(latch_index);
         func.inst_mut(latch_insts[2]).operands[0] = MachOperand::VReg(index_state);
+        func
+    }
+
+    #[test]
+    fn test_imported_o0_i32_induction_store_accepts_post_sroa_alias_shape() {
+        let mut func = make_post_sroa_alias_i32_induction_store_loop();
+        let index_state = VReg::new(22, RegClass::Gpr32);
+        let bound_state = VReg::new(21, RegClass::Gpr32);
 
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
@@ -9417,10 +12905,10 @@ mod tests {
         assert_eq!(count_opcode(&func, AArch64Opcode::NeonSt1Post), 1);
         assert!(
             func.insts.iter().any(|inst| {
-                inst.opcode == AArch64Opcode::CmpRR
+                inst.opcode == AArch64Opcode::Sxtw
                     && inst.operands.get(1) == Some(&MachOperand::VReg(bound_state))
             }),
-            "vector guard should compare against the canonical SROA bound state"
+            "vector guard should widen the canonical SROA bound state"
         );
         assert!(
             func.insts.iter().any(|inst| {
@@ -9662,9 +13150,56 @@ mod tests {
         assert_eq!(count_opcode(&func, AArch64Opcode::StrRI), 1);
     }
 
+    /// After the CFG-mutating store-loop rewrite the pass must return: its
+    /// loop analysis still describes the pre-rewrite CFG. The store loop's
+    /// exit here continues into a second loop that the generic analysis does
+    /// plan, so a pass that went on with the stale analysis would record a
+    /// plan.
     #[test]
     fn test_i32_induction_store_pass_stops_before_generic_stale_loop_analysis() {
         let mut func = make_imported_o0_i32_induction_store_loop();
+        let store_exit = BlockId(3);
+        let add_header = func.create_block();
+        let add_exit = func.create_block();
+        let add_latch = func.create_block();
+        let exit_ret = *func.block(store_exit).insts.last().expect("store exit");
+        *func.inst_mut(exit_ret) =
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(add_header)]);
+        for inst in [
+            MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![vreg32(62), vreg32(60), vreg32(61)],
+            ),
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg32(63), imm(100)]),
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![MachOperand::Block(add_exit), MachOperand::Block(add_latch)],
+            ),
+        ] {
+            let id = func.push_inst(inst);
+            func.append_inst(add_header, id);
+        }
+        let back = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(add_header)],
+        ));
+        func.append_inst(add_latch, back);
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(add_exit, ret);
+        func.add_edge(store_exit, add_header);
+        func.add_edge(add_header, add_exit);
+        func.add_edge(add_header, add_latch);
+        func.add_edge(add_latch, add_header);
+
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
+        assert_eq!(la.num_loops(), 2);
+        let add_loop = la.get_loop(add_header).expect("second loop");
+        assert!(
+            analyze_loop(&func, add_loop, &cost_model).is_some(),
+            "the generic analysis plans the second loop, so continuing would be observable"
+        );
         let mut pass = VectorizationPass::new();
 
         assert!(pass.run(&mut func));
@@ -9929,7 +13464,7 @@ mod tests {
         assert_eq!(plan.vectorizable_insts, vec![rbit_id]);
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.insts_rewritten, 1);
         assert_eq!(result.vector_trip_count, Some(32));
 
@@ -9977,7 +13512,7 @@ mod tests {
         );
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.ordered_sub_reductions_recognized, 1);
         assert_eq!(func.inst(rbit_id).opcode, AArch64Opcode::NeonRev32V);
         assert_eq!(func.inst(uxtw_id).opcode, AArch64Opcode::Nop);
@@ -10036,7 +13571,7 @@ mod tests {
         );
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.ordered_sub_reductions_recognized, 1);
         assert_eq!(func.inst(rbit_id).opcode, AArch64Opcode::NeonRev64V);
         assert_eq!(func.inst(sub_id).opcode, AArch64Opcode::NeonUmovGen);
@@ -10111,7 +13646,7 @@ mod tests {
         assert_eq!(plan.ordered_sub_reductions.len(), 2);
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.vector_trip_count, Some(32));
         assert_eq!(func.inst(rbit32).opcode, AArch64Opcode::NeonRev32V);
         assert_eq!(func.inst(rbit32).operands[2], MachOperand::Imm(0));
@@ -10225,7 +13760,7 @@ mod tests {
         );
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.ordered_sub_reductions_recognized, 2);
         assert_eq!(
             func.inst(load_acc32).opcode,
@@ -10315,7 +13850,7 @@ mod tests {
         assert_eq!(plan.ordered_sub_reductions.len(), 2);
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.ordered_sub_reductions_recognized, 2);
         assert_eq!(func.inst(rbit32).opcode, AArch64Opcode::NeonRev32V);
         assert_eq!(func.inst(rbit64).opcode, AArch64Opcode::NeonRev64V);
@@ -10392,7 +13927,7 @@ mod tests {
         assert_eq!(plan.vectorizable_insts, vec![rbit32, rbit64]);
         plan.is_profitable = true;
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.ordered_sub_reductions_recognized, 2);
         assert_eq!(func.inst(rbit32).opcode, AArch64Opcode::NeonRev32V);
         assert_eq!(func.inst(rbit64).opcode, AArch64Opcode::NeonRev64V);
@@ -10553,7 +14088,7 @@ mod tests {
         assert_eq!(plan.arrangement, NeonArrangement::S4);
         assert!(plan.is_profitable);
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.insts_rewritten, 1);
         assert_eq!(result.compare_idioms_rewritten, 1);
 
@@ -10660,17 +14195,10 @@ mod tests {
     fn test_ay_horizontal_any_rewrites_to_umaxv_sequence() {
         let (mut func, cmp_id, cset_id, orr_id) = make_ay_i32_eq_horizontal_any_loop();
 
-        let mut pass = VectorizationPass::new();
-        let changed = pass.run(&mut func);
-
-        assert!(
-            changed,
-            "horizontal-any recognition should lower through UMAXV"
-        );
-        assert_eq!(pass.plans().len(), 1);
-        assert_eq!(pass.plans()[0].horizontal_any_reductions.len(), 1);
-        assert_eq!(pass.results().len(), 1);
-        assert_eq!(pass.results()[0].horizontal_reductions_recognized, 1);
+        let (plan, result) = vectorize_one_loop_unchecked(&mut func, None);
+        let result = result.expect("horizontal-any recognition should lower through UMAXV");
+        assert_eq!(plan.horizontal_any_reductions.len(), 1);
+        assert_eq!(result.horizontal_reductions_recognized, 1);
         assert_eq!(func.inst(cmp_id).opcode, AArch64Opcode::NeonCmeqV);
         assert_eq!(func.inst(cset_id).opcode, AArch64Opcode::Nop);
         assert_eq!(func.inst(orr_id).opcode, AArch64Opcode::NeonUmaxv);
@@ -11180,10 +14708,8 @@ mod tests {
         func.inst_mut(cset_id).source_loc = Some(cset_loc);
         func.inst_mut(orr_id).source_loc = Some(reducer_loc);
 
-        let mut pass = VectorizationPass::new();
-        let changed = pass.run(&mut func);
-
-        assert!(changed, "expected horizontal-any vectorization");
+        let (_plan, result) = vectorize_one_loop_unchecked(&mut func, None);
+        assert!(result.is_some(), "expected horizontal-any vectorization");
         assert_eq!(func.inst(cmp_id).opcode, AArch64Opcode::NeonCmeqV);
         assert_eq!(
             func.inst(cmp_id).source_loc,
@@ -11231,9 +14757,8 @@ mod tests {
         provenance.record_lowering(TrustIrInstId(71), &[cset_id], PassId::new("isel"));
         provenance.record_lowering(TrustIrInstId(72), &[orr_id], PassId::new("isel"));
 
-        let mut pass = VectorizationPass::new();
-        let mut analyses = AnalysisCache::new();
-        assert!(pass.run_with_analyses_and_provenance(&mut func, &mut analyses, &mut provenance));
+        let (_plan, result) = vectorize_one_loop_unchecked(&mut func, Some(&mut provenance));
+        assert!(result.is_some(), "the rewrite runs");
 
         let cmp_entry = provenance
             .get_entry(cmp_id)
@@ -11391,21 +14916,45 @@ mod tests {
 
     #[test]
     fn test_pass_finds_vectorizable_loop() {
-        let mut func = make_vectorizable_add_loop();
+        // A real counted loop (the O2 revertBits shape): the pass plans it and
+        // publishes the rewrite through the iteration-coverage clause.
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
         let mut pass = VectorizationPass::new();
         let changed = pass.run(&mut func);
 
         assert!(changed, "pass should find profitable vectorization");
         assert_eq!(pass.plans().len(), 1);
+        assert!(pass.plans()[0].is_profitable);
+    }
 
-        let plan = &pass.plans()[0];
-        assert!(plan.is_profitable);
-        assert!(plan.speedup() > 1.0);
+    /// A synthetic fixture that is not a counted loop is planned but never
+    /// published: the iteration-coverage clause cannot see it run.
+    #[test]
+    fn test_pass_publishes_no_rewrite_of_a_loop_that_runs_no_iteration_count() {
+        let mut func = make_vectorizable_add_loop();
+        let before = format!("{func:?}");
+        let mut pass = VectorizationPass::new();
+        assert!(!pass.run(&mut func));
+        assert_eq!(pass.plans().len(), 1, "the loop is planned");
+        assert!(pass.results().is_empty());
+        assert_eq!(format!("{func:?}"), before);
     }
 
     // =========================================================================
     // Test: speedup calculation
     // =========================================================================
+
+    /// A real plan for `make_vectorizable_add_loop`, whose fields a test then
+    /// overrides with struct-update syntax: a `VectorizationPlan` carries the
+    /// loop-state contract's token, so it cannot be spelled field by field.
+    fn real_add_loop_plan() -> VectorizationPlan {
+        let func = make_vectorizable_add_loop();
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let lp = la.all_loops().next().expect("one loop");
+        analyze_loop(&func, lp, &MultiTargetCostModel::new(CostModelGen::M1))
+            .expect("the add loop is recognized")
+    }
 
     #[test]
     fn test_speedup_calculation() {
@@ -11424,6 +14973,7 @@ mod tests {
             scalar_cost: 100.0,
             neon_cost: 50.0,
             is_profitable: true,
+            ..real_add_loop_plan()
         };
         assert!((plan.speedup() - 2.0).abs() < 0.001);
 
@@ -11781,7 +15331,7 @@ mod tests {
         let plan = analyze_loop(&func, lp, &cost_model).unwrap();
         assert!(plan.is_profitable);
 
-        let result = apply_vectorization(&mut func, &plan);
+        let result = rewrite_unchecked(&mut func, &plan);
         assert!(result.is_some(), "vectorization should succeed");
 
         let result = result.unwrap();
@@ -11822,7 +15372,7 @@ mod tests {
         let lp = la.all_loops().next().unwrap();
         let plan = analyze_loop(&func, lp, &cost_model).unwrap();
 
-        apply_vectorization(&mut func, &plan);
+        rewrite_unchecked(&mut func, &plan);
 
         // The add instruction should have an extra immediate for arrangement.
         // Original: [dst, src1, src2] = 3 operands
@@ -11860,7 +15410,7 @@ mod tests {
         assert_eq!(plan.trip_count, Some(100));
         assert_eq!(plan.vf, 4);
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(
             result.vector_trip_count,
             Some(25),
@@ -11888,13 +15438,17 @@ mod tests {
     }
 
     // =========================================================================
-    // Test: apply_vectorization creates epilogue for remainder
+    // Test: apply_vectorization declines a remainder it cannot run
     // =========================================================================
 
     #[test]
-    fn test_apply_vectorization_creates_epilogue() {
+    fn test_remainder_epilogue_is_reachable_or_vectorizer_declines() {
+        // The plain (no induction) path: trip count 102 at VF=4 leaves 2
+        // iterations no code runs (the scalar epilogue the rewrite once built
+        // had no incoming edge; the iteration-coverage clause now refuses).
         let mut func = make_remainder_loop();
         let initial_blocks = func.num_blocks();
+        let before = format!("{func:?}");
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
         let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
@@ -11902,26 +15456,35 @@ mod tests {
         let lp = la.all_loops().next().unwrap();
         let plan = analyze_loop(&func, lp, &cost_model).unwrap();
         assert_eq!(plan.trip_count, Some(102));
+        assert_eq!(plan.vf, 4);
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
-        assert!(
-            result.has_epilogue,
-            "should create epilogue for remainder=2"
-        );
-        assert_eq!(result.remainder, 2, "102 % 4 = 2");
-        assert_eq!(result.vector_trip_count, Some(25), "102 / 4 = 25");
-
-        // New blocks should have been created (epilogue + epilogue_exit).
-        assert!(
-            func.num_blocks() > initial_blocks,
-            "epilogue blocks should be created: {} > {}",
-            func.num_blocks(),
-            initial_blocks
+        if let Some(result) = apply_vectorization(&mut func, &plan) {
+            let reachable = blocks_reachable_from_entry(&func);
+            let unreachable: Vec<u32> = (initial_blocks..func.num_blocks())
+                .map(|block| BlockId(block as u32))
+                .filter(|block| !reachable.contains(block))
+                .map(|block| block.0)
+                .collect();
+            assert!(
+                unreachable.is_empty(),
+                "trip count 102, VF={}: the vector loop runs {:?} iterations of 4 and the \
+                 remainder of {} is left to new blocks {unreachable:?} that nothing branches to",
+                plan.vf,
+                result.vector_trip_count,
+                result.remainder
+            );
+        }
+        assert_eq!(
+            format!("{func:?}"),
+            before,
+            "a remainder the rewrite cannot run must make the vectorizer decline"
         );
     }
 
+    /// A rewrite that fails part-way (here opcode-table drift after analysis:
+    /// an LSE atomic the rewrite cannot vectorize) publishes nothing.
     #[test]
-    fn scalar_epilogue_shape_rejection_precedes_every_vector_rewrite() {
+    fn a_refused_rewrite_leaves_no_partial_vectorization() {
         let mut func = make_remainder_loop();
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
@@ -11962,7 +15525,7 @@ mod tests {
         let plan = analyze_loop(&func, lp, &cost_model).unwrap();
         assert_eq!(plan.trip_count, Some(100));
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert!(
             !result.has_epilogue,
             "no epilogue needed when TC is exactly divisible"
@@ -11996,6 +15559,7 @@ mod tests {
             scalar_cost: 50.0,
             neon_cost: 100.0,
             is_profitable: false,
+            ..real_add_loop_plan()
         };
 
         let mut func = make_vectorizable_add_loop();
@@ -12024,6 +15588,7 @@ mod tests {
             scalar_cost: 100.0,
             neon_cost: 50.0,
             is_profitable: true,
+            ..real_add_loop_plan()
         };
 
         let mut func = make_vectorizable_add_loop();
@@ -12055,7 +15620,7 @@ mod tests {
             "add, sub, mul should all be vectorizable"
         );
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.insts_rewritten, 3, "all 3 ops should be rewritten");
 
         // Verify each rewritten instruction has Fpr128 register class.
@@ -12080,7 +15645,7 @@ mod tests {
 
     #[test]
     fn test_pass_produces_results() {
-        let mut func = make_vectorizable_add_loop();
+        let mut func = make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
         let mut pass = VectorizationPass::new();
         let changed = pass.run(&mut func);
 
@@ -12154,7 +15719,7 @@ mod tests {
         let lp = la.all_loops().next().unwrap();
         let plan = analyze_loop(&func, lp, &cost_model).unwrap();
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.vector_trip_count, Some(25));
         assert_eq!(result.remainder, 0);
         assert!(!result.has_epilogue);
@@ -12162,81 +15727,11 @@ mod tests {
         assert!(result.regs_upgraded > 0);
     }
 
-    // =========================================================================
-    // Test: VectorizationResult fields are correct for remainder case
-    // =========================================================================
-
     #[test]
-    fn test_vectorization_result_with_remainder() {
-        let mut func = make_remainder_loop();
-        let dom = DomTree::compute(&func);
-        let la = LoopAnalysis::compute(&func, &dom);
-        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
-
-        let lp = la.all_loops().next().unwrap();
-        let plan = analyze_loop(&func, lp, &cost_model).unwrap();
-
-        let result = apply_vectorization(&mut func, &plan).unwrap();
-        assert_eq!(result.vector_trip_count, Some(25));
-        assert_eq!(result.remainder, 2);
-        assert!(result.has_epilogue);
-        assert!(result.insts_rewritten > 0);
-    }
-
-    // =========================================================================
-    // Test: epilogue block contains scalar copies of vectorized instructions
-    // =========================================================================
-
-    #[test]
-    fn test_epilogue_contains_scalar_instructions() {
-        let mut func = make_remainder_loop();
-        let initial_blocks = func.num_blocks();
-        let dom = DomTree::compute(&func);
-        let la = LoopAnalysis::compute(&func, &dom);
-        let cost_model = MultiTargetCostModel::new(CostModelGen::M1);
-
-        let lp = la.all_loops().next().unwrap();
-        let plan = analyze_loop(&func, lp, &cost_model).unwrap();
-        let num_vec_insts = plan.vectorizable_insts.len();
-
-        apply_vectorization(&mut func, &plan);
-
-        // The epilogue block is the first new block after original blocks.
-        let epilogue_block_id = BlockId(initial_blocks as u32);
-        let epilogue_block = func.block(epilogue_block_id);
-
-        // Epilogue should contain: scalar copies of vectorized insts + CMP + BCond
-        // = num_vec_insts + 2
-        assert_eq!(
-            epilogue_block.insts.len(),
-            num_vec_insts + 2,
-            "epilogue should have {} insts ({}+2)",
-            num_vec_insts + 2,
-            num_vec_insts
-        );
-
-        // The scalar copy should use Gpr32 (since element type is I32).
-        let first_inst_id = epilogue_block.insts[0];
-        let first_inst = func.inst(first_inst_id);
-        assert_eq!(
-            first_inst.opcode,
-            AArch64Opcode::AddRR,
-            "epilogue should copy the add"
-        );
-        for operand in &first_inst.operands {
-            if let MachOperand::VReg(vreg) = operand {
-                assert_eq!(
-                    vreg.class,
-                    RegClass::Gpr32,
-                    "epilogue operands should be scalar (Gpr32)"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_source_loc_preserved_on_vectorized_scalar_epilogue_clone() {
-        let mut func = make_remainder_loop();
+    fn test_source_loc_preserved_on_vectorized_scalar_rewrite() {
+        // Exact trip count (100 at VF=4): a remainder is declined, so the
+        // former scalar-epilogue clone this test also checked no longer exists.
+        let mut func = make_vectorizable_add_loop();
         let initial_blocks = func.num_blocks();
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
@@ -12248,29 +15743,25 @@ mod tests {
         let loc = source_loc(211);
         func.inst_mut(scalar_inst_id).source_loc = Some(loc);
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
 
-        assert!(result.has_epilogue, "expected remainder epilogue");
+        assert!(
+            !result.has_epilogue,
+            "an exact trip count needs no epilogue"
+        );
+        assert_eq!(func.num_blocks(), initial_blocks);
         assert_eq!(
             func.inst(scalar_inst_id).source_loc,
             Some(loc),
             "vectorized in-place instruction must keep its source_loc"
         );
-
-        let epilogue_block_id = BlockId(initial_blocks as u32);
-        let epilogue_block = func.block(epilogue_block_id);
-        let cloned_inst_id = epilogue_block.insts[0];
-        assert_eq!(func.inst(cloned_inst_id).opcode, AArch64Opcode::AddRR);
-        assert_eq!(
-            func.inst(cloned_inst_id).source_loc,
-            Some(loc),
-            "scalar epilogue clone must inherit the vectorized instruction source_loc"
-        );
     }
 
     #[test]
-    fn test_vectorize_provenance_marks_scalar_rewrite_trip_count_and_epilogue() {
-        let mut func = make_remainder_loop();
+    fn test_vectorize_provenance_marks_scalar_rewrite_and_trip_count() {
+        // Exact trip count (100 at VF=4); see
+        // test_source_loc_preserved_on_vectorized_scalar_rewrite.
+        let mut func = make_vectorizable_add_loop();
         let initial_blocks = func.num_blocks();
         let header = BlockId(1);
         let add_id = func
@@ -12292,9 +15783,8 @@ mod tests {
         provenance.record_lowering(TrustIrInstId(80), &[add_id], PassId::new("isel"));
         provenance.record_lowering(TrustIrInstId(81), &[cmp_id], PassId::new("isel"));
 
-        let mut pass = VectorizationPass::new();
-        let mut analyses = AnalysisCache::new();
-        assert!(pass.run_with_analyses_and_provenance(&mut func, &mut analyses, &mut provenance));
+        let (_plan, result) = vectorize_one_loop_unchecked(&mut func, Some(&mut provenance));
+        assert!(result.is_some(), "the rewrite runs");
 
         let add_entry = provenance
             .get_entry(add_id)
@@ -12316,76 +15806,36 @@ mod tests {
         );
         assert!(
             func.inst(cmp_id).operands.contains(&MachOperand::Imm(25)),
-            "trip-count compare should be rewritten from 102 to 25"
+            "trip-count compare should be rewritten from 100 to 25"
         );
-
-        let epilogue_block = func.block(BlockId(initial_blocks as u32));
-        let epilogue_exit = func.block(BlockId(initial_blocks as u32 + 1));
-        let cloned_add_id = epilogue_block.insts[0];
-        let cloned_add_entry = provenance
-            .get_entry(cloned_add_id)
-            .expect("epilogue scalar clone should have provenance");
-        assert_eq!(cloned_add_entry.trust_ir_origins, vec![TrustIrInstId(80)]);
-        let transform = cloned_add_entry.transforms.last().unwrap();
-        assert_eq!(transform.pass, PassId::new("vectorize"));
-        assert_eq!(transform.kind, TransformKind::Cloned { source: add_id });
         assert_eq!(
             provenance.get_mach_insts(TrustIrInstId(80)),
-            Some(&[add_id, cloned_add_id][..])
+            Some(&[add_id][..]),
+            "an exact trip count adds no scalar clone of the add"
         );
-
-        for inst_id in epilogue_block
-            .insts
-            .iter()
-            .skip(1)
-            .chain(epilogue_exit.insts.iter())
-        {
-            let entry = provenance
-                .get_entry(*inst_id)
-                .expect("epilogue instruction should have provenance");
-            assert!(entry.trust_ir_origins.is_empty());
-            assert!(matches!(
-                &entry.status,
-                ProvenanceStatus::CompilerGenerated { pass, reason }
-                    if *pass == PassId::new("vectorize")
-                        && reason == "vectorize scalar epilogue"
-            ));
-        }
+        assert_eq!(func.num_blocks(), initial_blocks);
     }
 
     // =========================================================================
-    // Test: full pass end-to-end with rewriting and epilogue
+    // Test: the pass leaves a loop with a remainder scalar
     // =========================================================================
 
     #[test]
-    fn test_pass_end_to_end_with_rewriting() {
+    fn test_pass_leaves_remainder_loop_scalar() {
+        // The pass planned TC=102 at VF=4 and used to rewrite it with a scalar
+        // epilogue that nothing branches to; it now keeps the plan and makes
+        // no change.
         let mut func = make_remainder_loop();
-        let initial_num_insts = func.num_insts();
-        let initial_num_blocks = func.num_blocks();
+        let before = format!("{func:?}");
 
         let mut pass = VectorizationPass::new();
         let changed = pass.run(&mut func);
 
-        assert!(changed, "pass should report changes");
-        assert!(!pass.plans().is_empty(), "should have plans");
-        assert!(!pass.results().is_empty(), "should have results");
-
-        let result = &pass.results()[0];
-        assert!(result.insts_rewritten > 0, "should rewrite instructions");
-        assert!(
-            result.has_epilogue,
-            "should create epilogue for TC=102, VF=4"
-        );
-
-        // Function should have grown (new epilogue blocks and instructions).
-        assert!(
-            func.num_insts() > initial_num_insts,
-            "function should have more instructions after rewriting"
-        );
-        assert!(
-            func.num_blocks() > initial_num_blocks,
-            "function should have more blocks after epilogue creation"
-        );
+        assert!(!changed, "a remainder loop must not be rewritten");
+        assert_eq!(pass.plans().len(), 1, "the loop is still planned");
+        assert_eq!(pass.plans()[0].trip_count, Some(102));
+        assert!(pass.results().is_empty(), "no rewrite result for TC=102");
+        assert_eq!(format!("{func:?}"), before);
     }
 
     // =========================================================================
@@ -12447,7 +15897,7 @@ mod tests {
         assert_eq!(plan.element_type, VecElementType::F64);
         assert_eq!(plan.vf, 2);
 
-        let result = apply_vectorization(&mut func, &plan).unwrap();
+        let result = rewrite_unchecked(&mut func, &plan).unwrap();
         assert_eq!(result.insts_rewritten, 1);
 
         // The FaddRR operands should now be Fpr128.
@@ -12557,6 +16007,117 @@ mod tests {
             before.operands,
             "the minority-width add must keep its scalar operands and gain no \
              arrangement immediate"
+        );
+    }
+
+    /// The `calloc` name match reads exactly the listed name: `bl calloc`
+    /// matches, and neither `bl _calloc` (a different C symbol; machine-level
+    /// symbols carry no Mach-O underscore), a call flagged
+    /// `EXACT_MODULE_CALL`, nor another callee does.
+    #[test]
+    fn direct_calloc_call_reads_exactly_the_listed_name() {
+        let call = |name: &str, flags: InstFlags| {
+            MachInst::with_flags(
+                AArch64Opcode::Bl,
+                vec![MachOperand::Symbol(name.to_string())],
+                flags,
+            )
+        };
+        let calloc = trust_cg_lower::RuntimeSymbol::Calloc.name();
+        assert!(direct_calloc_call(&call(calloc, InstFlags::EMPTY)));
+        assert!(!direct_calloc_call(&call(
+            &format!("_{calloc}"),
+            InstFlags::EMPTY
+        )));
+        assert!(!direct_calloc_call(&call(
+            calloc,
+            InstFlags::EXACT_MODULE_CALL
+        )));
+        assert!(!direct_calloc_call(&call("malloc", InstFlags::EMPTY)));
+    }
+
+    /// The premise of `Handoff::Header`, which both idioms claim when they check
+    /// the loop-state contract: the rewritten CFG leaves the new vector blocks
+    /// only for the original scalar header. A rewrite that also branched to the
+    /// exit would need `Handoff::HeaderOrExit`.
+    #[test]
+    fn idiom_rewrites_hand_off_only_to_the_scalar_header() {
+        fn only_loop_header(func: &MachFunction) -> BlockId {
+            let dom = DomTree::compute(func);
+            let loops = LoopAnalysis::compute(func, &dom);
+            let headers: Vec<BlockId> = loops.all_loops().map(|lp| lp.header).collect();
+            assert_eq!(headers.len(), 1, "fixture has one loop");
+            headers[0]
+        }
+        fn new_blocks(func: &MachFunction, before: usize) -> Vec<BlockId> {
+            (before..func.num_blocks())
+                .map(|id| BlockId(id as u32))
+                .collect()
+        }
+
+        let mut func = make_imported_o0_i32_induction_store_loop();
+        let header = only_loop_header(&func);
+        let before = func.num_blocks();
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let mut maps = VecMaps::build(&func);
+        assert_eq!(
+            rewrite_i32_induction_store_loops(&mut func, &la, None, &mut maps).len(),
+            1
+        );
+        let created = new_blocks(&func, before);
+        assert!(!created.is_empty());
+        assert!(crate::loop_contract::hands_off_only_to(
+            &func, &created, header
+        ));
+
+        let (mut func, source_addr, dest_addr) = make_imported_o0_reverse_accumulation_loop();
+        let header = only_loop_header(&func);
+        let before = func.num_blocks();
+        let metadata = ProofOptimizationMetadata::new()
+            .with_inst_proof_facts(source_addr, vec![ProofFact::NoAlias, ProofFact::InBounds])
+            .with_inst_proof_facts(dest_addr, vec![ProofFact::NoAlias, ProofFact::InBounds]);
+        let mut pass = VectorizationPass::new();
+        pass.set_proof_optimization_metadata(&metadata);
+        assert!(pass.run(&mut func));
+        let created = new_blocks(&func, before);
+        assert!(!created.is_empty());
+        assert!(crate::loop_contract::hands_off_only_to(
+            &func, &created, header
+        ));
+    }
+
+    /// The in-place path runs the loop itself `vf` times fewer and never
+    /// executes the scalar body's other register updates, so a non-vectorized
+    /// loop register read after the loop (`last = i`, a copy the vectorizable
+    /// set does not contain) must keep the loop scalar. The pass's own gate
+    /// only keeps VECTORIZED values from scalar consumers; the loop-state
+    /// contract refuses this one.
+    #[test]
+    fn in_place_refuses_a_scalar_loop_register_read_after_the_loop() {
+        let fixture = || make_o2_revertbits_sub_loop(0, O2TripBound::Const(64), COND_LT).func;
+        let mut plain = fixture();
+        assert!(
+            VectorizationPass::new().run(&mut plain),
+            "plain fixture fires"
+        );
+        // `last = i` in the header, read at the exit (bb4).
+        let mut func = fixture();
+        let header = BlockId(1);
+        let exit = BlockId(4);
+        let last = func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![vreg32(9), vreg32(81)],
+        ));
+        func.block_mut(header).insts.insert(0, last);
+        let read = func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![vreg32(10), vreg32(9)],
+        ));
+        func.block_mut(exit).insts.insert(0, read);
+        assert!(
+            !VectorizationPass::new().run(&mut func),
+            "a scalar loop register read after the loop must stay scalar"
         );
     }
 }

@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // crates/rustc-codegen-trust-cg/tests/refinement_x86.rs
 //
@@ -29,19 +33,18 @@ mod target_dir_support;
 //
 // Run (requires the target-bridge toolchain + x86_64-apple-darwin std, x86 host):
 //     cd crates/rustc-codegen-trust-cg
-//     cargo +nightly-2026-04-20 test --release --test refinement_x86 -- --nocapture
+//     targo --unverified test --release --locked --test refinement_x86 -- --nocapture
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
 // A scalar program that drives every refinement-covered op family on correct
 // lowerings: integer arith (mul/sub/add), an unsigned div/rem, a signed shift,
 // integer comparisons, signed negation, an int<->int widen (i32 -> i64), a
 // signed int -> float conversion (the #68-cvt shape), a SATURATING float -> int
-// cast (FPToSI/FPToUI), and OVERFLOWING add/sub/mul (Inst::Overflow). `black_box`-style
+// cast (FPToSISat/FPToUISat), and OVERFLOWING add/sub/mul (Inst::Overflow). `black_box`-style
 // opacity is unnecessary: the obligations are over symbolic operands, so they
 // fire regardless of constant folding.
 const SCALAR_PROGRAM: &str = r#"
@@ -86,10 +89,10 @@ fn to_float(a: i32) -> f32 {
     a as f32
 }
 
-// FloatToInt (FPToSI / FPToUI): Rust `as` is saturating; the bridge lowers it to
-// the saturating x86 sequence (CVTT + threshold compares + CMOV). The refinement
-// models the saturating spec, so a correct lowering must Refine. Covers signed
-// and unsigned destinations.
+// FloatToInt: Rust `as` is saturating; the bridge lowers it to trust-ir's
+// saturating FPToSISat / FPToUISat (the x86 selector's CVTT + threshold compares
+// + CMOV). The refinement models the saturating spec, so a correct lowering must
+// Refine. Covers signed and unsigned destinations.
 #[inline(never)]
 fn from_float_signed(x: f32) -> i32 {
     x as i32
@@ -132,66 +135,12 @@ fn main() {
 }
 "#;
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run refinement test");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -210,24 +159,28 @@ fn workdir(stem: &str) -> PathBuf {
 /// at object-emission time). Returns `Ok(())` on a successful object emission, or
 /// `Err(stderr_tail)` on a compile failure — which is exactly how a refuted /
 /// inconclusive refinement obligation surfaces.
-fn compile_object(stem: &str, src: &str, opt: &str, dylib: &Path, refine: bool) -> Result<(), String> {
+fn compile_object(
+    stem: &str,
+    src: &str,
+    opt: &str,
+    dylib: &Path,
+    refine: bool,
+) -> Result<(), String> {
     let dir = workdir(stem);
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
     if refine {
         // Read inside the dylib by `MirLoweringCtx::new` -> obligations are
         // accumulated and discharged at the tail of `mir_to_trust_ir`.
-        cmd.env("TCG_REFINE", "1");
+        cmd.arg(toolchain_support::backend_knobs_arg(&["refine"]));
     } else {
         // Make sure no ambient value leaks in from the parent environment.
         cmd.env_remove("TCG_REFINE");
     }
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    cmd.arg("--crate-type").arg("bin");
     let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
     backend_arg.push(dylib);
     cmd.arg(&backend_arg);
@@ -243,10 +196,15 @@ fn compile_object(stem: &str, src: &str, opt: &str, dylib: &Path, refine: bool) 
     .arg("--out-dir")
     .arg(&dir)
     .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = stderr.lines().rev().take(12).collect::<Vec<_>>().join(" | ");
+        let tail = stderr
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .join(" | ");
         let _ = std::fs::remove_dir_all(&dir);
         return Err(tail);
     }

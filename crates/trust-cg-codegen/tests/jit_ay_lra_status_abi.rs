@@ -674,19 +674,22 @@ fn ay_lra_affected_row_batch_status_lookup_contract(
 
 fn build_status_probe_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("jit_ay_lra_status_abi");
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I64, // planned sparse-substitute output length
-            Ty::I64, // output capacity
-            Ty::I64, // checked arithmetic lhs
-            Ty::I64, // checked arithmetic rhs
-            Ty::I64, // current basis epoch
-            Ty::I64, // expected basis epoch
-            Ty::Ptr, // ExpectedAYLraStatusAbi*
-        ],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I64, // planned sparse-substitute output length
+                Ty::I64, // output capacity
+                Ty::I64, // checked arithmetic lhs
+                Ty::I64, // checked arithmetic rhs
+                Ty::I64, // current basis epoch
+                Ty::I64, // expected basis epoch
+                Ty::Ptr, // ExpectedAYLraStatusAbi*
+            ],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry_id = b(0);
     let stale_id = b(1);
@@ -853,25 +856,30 @@ fn build_status_probe_module() -> TrustIrModule {
         overflow_block,
         ok_block,
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn build_affected_row_batch_status_probe_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("jit_ay_lra_affected_row_batch_status_abi");
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I64, // affected rows in the batch
-            Ty::I64, // per-row output capacity
-            Ty::I64, // synthetic failure mode
-            Ty::I64, // current basis epoch
-            Ty::I64, // expected basis epoch
-            Ty::Ptr, // i64 row-output lengths[AFFECTED_ROW_BATCH_ROWS]
-            Ty::Ptr, // ExpectedAYLraAffectedRowBatchStatusAbi*
-        ],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I64, // affected rows in the batch
+                Ty::I64, // per-row output capacity
+                Ty::I64, // synthetic failure mode
+                Ty::I64, // current basis epoch
+                Ty::I64, // expected basis epoch
+                Ty::Ptr, // i64 row-output lengths[AFFECTED_ROW_BATCH_ROWS]
+                Ty::Ptr, // ExpectedAYLraAffectedRowBatchStatusAbi*
+            ],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry_id = b(0);
     let stale_id = b(1);
@@ -1100,18 +1108,20 @@ fn build_affected_row_batch_status_probe_module() -> TrustIrModule {
         overflow_row_two,
         ok_block,
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn prepare_status_probe_machine() -> trust_cg_ir::MachFunction {
     let module = build_status_probe_module();
-    let lowered = trust_cg_lower::translate_module(&module).expect("ay LRA status probe lowers");
+    let lowered = permit_translate_module(&module).expect("ay LRA status probe lowers");
     assert_eq!(lowered.len(), 1, "expected one lowered status probe");
 
     let pipeline_config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     pipeline
@@ -1121,8 +1131,7 @@ fn prepare_status_probe_machine() -> trust_cg_ir::MachFunction {
 
 fn prepare_affected_row_batch_status_probe_machine() -> trust_cg_ir::MachFunction {
     let module = build_affected_row_batch_status_probe_module();
-    let lowered =
-        trust_cg_lower::translate_module(&module).expect("ay LRA affected-row batch probe lowers");
+    let lowered = permit_translate_module(&module).expect("ay LRA affected-row batch probe lowers");
     assert_eq!(
         lowered.len(),
         1,
@@ -1131,7 +1140,7 @@ fn prepare_affected_row_batch_status_probe_machine() -> trust_cg_ir::MachFunctio
 
     let pipeline_config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     pipeline
@@ -1675,7 +1684,7 @@ fn ay_lra_status_probe_o2_volatile_status_stores_are_resolved_from_x6() {
 #[test]
 fn ay_lra_status_probe_seventh_pointer_arg_is_x6_livein_and_lookup_only() {
     let module = build_status_probe_module();
-    let lowered = trust_cg_lower::translate_module(&module).expect("ay LRA status probe lowers");
+    let lowered = permit_translate_module(&module).expect("ay LRA status probe lowers");
     assert_eq!(lowered.len(), 1, "expected one lowered status probe");
     let lir = &lowered[0].0;
 
@@ -1704,6 +1713,15 @@ fn ay_lra_status_probe_seventh_pointer_arg_is_x6_livein_and_lookup_only() {
     let mut isel = InstructionSelector::new(
         "ay_lra_status_formal_liveins".to_owned(),
         lir.signature.clone(),
+    );
+    isel.set_abi_variant(
+        trust_cg_lower::abi::AArch64AbiVariant::from_target_triple(
+            &trust_cg_codegen::target::TargetSpec::host_for_architecture(
+                trust_cg_codegen::Target::Aarch64,
+            )
+            .triple(),
+        )
+        .expect("the AArch64 host has a modeled calling convention"),
     );
     isel.lower_formal_arguments(&lir.signature, entry)
         .expect("formal arguments lower");
@@ -1746,8 +1764,7 @@ fn ay_lra_status_probe_seventh_pointer_arg_is_x6_livein_and_lookup_only() {
 #[test]
 fn ay_lra_sparse_affected_row_batch_status_probe_resolves_status_from_x6() {
     let module = build_affected_row_batch_status_probe_module();
-    let lowered =
-        trust_cg_lower::translate_module(&module).expect("ay LRA affected-row batch probe lowers");
+    let lowered = permit_translate_module(&module).expect("ay LRA affected-row batch probe lowers");
     assert_eq!(
         lowered.len(),
         1,
@@ -1790,6 +1807,15 @@ fn ay_lra_sparse_affected_row_batch_status_probe_resolves_status_from_x6() {
     let mut isel = InstructionSelector::new(
         "ay_lra_affected_row_batch_status_formal_liveins".to_owned(),
         lir.signature.clone(),
+    );
+    isel.set_abi_variant(
+        trust_cg_lower::abi::AArch64AbiVariant::from_target_triple(
+            &trust_cg_codegen::target::TargetSpec::host_for_architecture(
+                trust_cg_codegen::Target::Aarch64,
+            )
+            .triple(),
+        )
+        .expect("the AArch64 host has a modeled calling convention"),
     );
     isel.lower_formal_arguments(&lir.signature, entry)
         .expect("formal arguments lower");
@@ -2075,4 +2101,28 @@ fn ay_lra_status_contract_lookup_rejects_mismatches() {
         }
         other => panic!("expected null symbol pointer, got {other:?}"),
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

@@ -1,0 +1,31 @@
+; TrustIr text format v1
+module "mut_sign_ge"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "mut_sign_ge.rs"
+
+functy.0 = (i8) -> (i8)
+
+rustcc fn @_RNvCsjUhgJ17fZle_11mut_sign_ge8below_ge(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "below_ge"
+    ; #names: %0="x"
+bb0(%0: i8):
+    %1 = const i8 1  ; #loc: 0 2 35
+    %2 = icmp sge i8 %0, %1  ; #loc: 0 2 30
+    condbr %2, bb1, bb2  ; #loc: 0 2 27
+bb1:
+    br bb3(%0)  ; #loc: 0 2 27
+bb2:
+    %3 = const i8 100  ; #loc: 0 2 54
+    %4, %5 = sub.overflow i8 %0, %3  ; #loc: 0 2 50
+    %6 = const bool false  ; #loc: 0 2 50
+    %7 = const bool true  ; #loc: 0 2 50
+    %8 = select bool %5, %6, %7  ; #loc: 0 2 50
+    assert %8, overflow sub  ; #proof: no_overflow  ; #loc: 0 2 50
+    br bb3(%4)  ; #loc: 0 2 27
+bb3(%9: i8):
+    ret %9  ; #loc: 0 2 61
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L2C50 of `mut_sign_ge::below_ge`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "mut_sign_ge::below_ge#L2C50#overflow#o0" range 0 2 50 2 57 site f0/bb2#5

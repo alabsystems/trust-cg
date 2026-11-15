@@ -1,0 +1,141 @@
+{
+  "name": "IMAGE_REF",
+  "functions": [
+    {
+      "id": 0,
+      "name": "IMAGE_REF.static.anchor",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "Internal",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    }
+  ],
+  "structs": [
+    {
+      "id": 0,
+      "name": "IMAGE_REF.allocation",
+      "fields": [
+        {
+          "name": "part0",
+          "ty": "Ptr",
+          "offset": 0
+        }
+      ],
+      "size": 8,
+      "align": 1,
+      "repr": {
+        "Packed": 1
+      }
+    }
+  ],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "IMAGE_REF.static.alloc5",
+      "ty": {
+        "Array": [
+          0,
+          5
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Bytes": {
+          "data": [
+            104,
+            101,
+            108,
+            108,
+            111
+          ],
+          "utf8": false
+        }
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 1,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "IMAGE_REF",
+      "ty": {
+        "Struct": 0
+      },
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "SymbolAddr": {
+              "symbol": "IMAGE_REF.static.alloc5",
+              "addend": 0
+            }
+          }
+        ]
+      },
+      "linkage": "External",
+      "tls": null,
+      "align": 8,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "U8"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": []
+}

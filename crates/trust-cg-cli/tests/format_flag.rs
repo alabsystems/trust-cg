@@ -3,8 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Per `designs/2026-04-16-trust_ir-transport-architecture.md` Layer 4 and
-// issue #414, the CLI defaults to binary `.tmbc` input. JSON is retained
+// Per issue #414, the CLI defaults to binary `.tmbc` input. JSON is retained
 // only as `--format=json`. These tests exercise the CLI binary end-to-end
 // for the three acceptance-criteria cases:
 //
@@ -41,22 +40,12 @@ fn make_test_module() -> TrustIrModule {
     let r = fb.iconst(Ty::I64, 42);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
-/// Create a fresh, empty scratch directory under the OS temp dir.
-///
-/// Uses `process::id` + a test-name suffix so parallel `cargo test`
-/// invocations do not collide.
-fn scratch_dir(test_name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "trust_cg_cli_format_{}_{}",
-        test_name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+/// A new scratch directory, removed when the returned guard is dropped.
+fn scratch_dir(test_name: &str) -> scratch::ScratchDir {
+    scratch::create(&format!("trust_cg_cli_format_{test_name}_"))
 }
 
 /// Path to the compiled `trust-cg` binary for this test run.
@@ -124,6 +113,7 @@ fn cli_binary_default_accepts_tmbc() {
     std::fs::write(&tmbc_path, &tmbc).expect("write tmbc");
 
     let status = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("-c")
         .arg("-o")
         .arg(&out_path)
@@ -176,6 +166,7 @@ fn cli_explicit_x86_targets_emit_requested_object_formats() {
     for (target, output_name, assert_object) in cases {
         let out_path = dir.join(output_name);
         let output = Command::new(trust_cg_bin())
+            .arg("--permit-unlicensed")
             .arg("-c")
             .arg("--target")
             .arg(target)
@@ -213,6 +204,7 @@ fn cli_binary_default_rejects_json_with_hint() {
     std::fs::write(&json_path, json).expect("write json");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("-c")
         .arg("-o")
         .arg(&out_path)
@@ -262,6 +254,7 @@ fn cli_format_json_accepts_json_input() {
     std::fs::write(&json_path, json).expect("write json");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--format=json")
         .arg("-c")
         .arg("-o")
@@ -307,6 +300,7 @@ fn cli_format_auto_accepts_both() {
 
     // JSON via --format=auto.
     let out_j = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--format=auto")
         .arg("-c")
         .arg("-o")
@@ -322,6 +316,7 @@ fn cli_format_auto_accepts_both() {
 
     // .tmbc via --format=auto.
     let out_b = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--format=auto")
         .arg("-c")
         .arg("-o")
@@ -356,6 +351,7 @@ fn cli_input_json_is_deprecated_alias() {
     .expect("write json");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--input-json")
         .arg(&json_path)
         .arg("-c")
@@ -378,3 +374,6 @@ fn cli_input_json_is_deprecated_alias() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[path = "common/scratch.rs"]
+mod scratch;

@@ -21,26 +21,54 @@
 //     vectors from `Constant::Vector` literals, performs the packed FP op,
 //     bitcasts the result to the matching integer vector, extracts one lane via
 //     the (integer) vector dialect, and returns the lane's raw bit pattern as
-//     an i64. trust-cg and clang must agree on the returned integer.
+//     an i64. This form needs a VECTOR BITCAST (`<4 x f32>` -> `<4 x i32>`,
+//     `<2 x f64>` -> `<2 x i64>`), which the lowering lane REFUSES -- see the
+//     REGRESSION NOTE below. Its two tests therefore assert that exact refusal
+//     on every host instead of running a differential.
 //
 // ORACLE COUNT NOTE: a triple oracle (adding the trust_ir interpreter) is NOT
 // used. The trust-cg-codegen crate's interpreter -- the one the x86-64 oracle
 // corpus is wired to -- does not model packed vector values (vector constants
 // evaluate to `Undef`; there is no `InterpreterValue::Vector`), so it cannot
-// execute packed vector FP. These tests therefore stay differential (trust-cg
-// vs clang). Per-lane semantic equivalence is independently established by the
-// discharged SMT lowering proofs in `trust-cg-verify::all_x86_64_proofs`.
+// execute packed vector FP. The memory-form tests therefore stay differential
+// (trust-cg vs clang). The packed FP ARITHMETIC lowerings (ADDPS/ADDPD
+// families) have discharged SMT lowering proofs in
+// `trust-cg-verify::all_x86_64_proofs`; the vector BITCAST has none, which is
+// half of why it is refused.
 //
-// Host: x86-64 macOS.
+// REGRESSION NOTE (2026-09-21): `db2082e3f` pinned vector `CastOp::Bitcast`
+// as refused even at equal total width
+// (`trust-cg-lower/tests/vector_type_admission.rs`); `b98de7239` admitted it
+// in `validate_cast_shape` so that the pack/arith/extract tests here would
+// pass on an x86-64 host, without touching those pins. Ruling: a shape enters
+// the lowering lane only if (a) trust-ir's semantic model defines its meaning
+// AND (b) trust-cg's translation-validation / proof lane covers the lowering.
+// Vector bitcast fails both at trust-ir 283f1747: the Lean `semCast`
+// `.Bitcast` arm and the reference interpreter's `eval_bitcast` both end in a
+// type error for a vector operand (the model has no byte image for a vector at
+// all), and trust-cg-verify has only scalar `Bitcast_*` obligations -- the
+// `MOVDQA xmm,xmm` the selector emits has no `opcode_to_proof_query` row and
+// lands per-instruction `Unverified`. "One register move" is a claim about the
+// emitter, not a proof about the semantics; lane order under reinterpretation
+// is a memory-layout question the model does not answer. So the refusal was
+// restored, and the pack/arith/extract tests now assert it (compile-only, on
+// every host, with a non-vacuity control). The clang lane-differential harness
+// they used (`differential_int`, the `*_lane_driver` C sources) is in git
+// history at `c96dc3d33` for the day BOTH (a) and (b) are established;
+// re-admitting the shape requires that evidence, not an edit to these
+// assertions.
+//
+// Host: x86-64 macOS for the differential families; any host for the refusal
+// pins.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use trust_cg_codegen::Target;
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
+use trust_cg_codegen::compiler::{CompileError, Compiler, CompilerConfig, CompilerTraceLevel};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_lower::AdapterError;
 
 use trust_ir::dialect::vector as vector_dialect;
 use trust_ir::{
@@ -83,8 +111,8 @@ fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
 
-fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
+fn x86_64_config() -> CompilerConfig {
+    CompilerConfig {
         opt_level: OptLevel::O0,
         target: Target::X86_64,
         emit_proofs: false,
@@ -95,8 +123,22 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    }
+}
+
+fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
+    let compiler = Compiler::new(x86_64_config()).with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -213,130 +255,42 @@ fn differential_test(
     Ok(())
 }
 
-/// Parse "key=value" integer lines from stdout.
-fn parse_int_results(stdout: &str) -> HashMap<String, i64> {
-    let mut m = HashMap::new();
-    for line in stdout.lines() {
-        if let Some((k, v)) = line.trim().split_once('=')
-            && let Ok(n) = v.trim().parse::<i64>()
-        {
-            m.insert(k.trim().to_string(), n);
-        }
-    }
-    m
-}
-
-/// Differential harness for integer-returning packed-FP functions: compares
-/// the trust-cg compiled binary and clang on the function's i64 lane result.
-///
-/// NOTE ON ORACLE COUNT: a third (interpreter) oracle is intentionally omitted.
-/// The trust-cg-codegen crate's interpreter (`trust_cg_codegen::interpreter`,
-/// the one the x86-64 oracle corpus uses) does not model packed vector values
-/// at all -- vector constants evaluate to `Undef` and there is no
-/// `InterpreterValue::Vector` -- so it cannot execute packed-FP arithmetic. The
-/// trust_ir interpreter does model packed vector FP, but the e2e corpus is
-/// wired to the codegen interpreter, so these tests stay differential
-/// (trust-cg vs clang), with clang as the golden oracle. The per-lane semantic
-/// equivalence is independently established by the discharged SMT lowering
-/// proofs (`all_x86_64_proofs`).
-///
-/// Each function takes no arguments (it builds its packed-FP inputs from
-/// constants), performs the packed op, bitcasts to the matching integer vector,
-/// and returns one lane's raw bit pattern as i64. `c_source` uses the
-/// `-DEXTERN_ONLY` split convention.
-fn differential_int(
-    test_name: &str,
+/// The refusal the pack/arith/extract form must get, and nothing else: the
+/// adapter's cast shape gate (`validate_cast_shape`) refusing
+/// `CastOp::Bitcast` between exactly `src` and `dst`. Compile-only, so it runs
+/// on every host without `cc`. It is NON-VACUOUS: `control` is the bitcast-free
+/// memory form of the same packed op and must compile for the same target, so
+/// the check cannot pass on unrelated packed-FP or x86-64 breakage. See the
+/// REGRESSION NOTE in the file header.
+fn assert_vector_bitcast_refused(
     module: &TrustIrModule,
-    c_source: &str,
-    key: &str,
-) -> Result<(), String> {
-    let dir = make_test_dir(test_name);
-
-    // Oracle 1: trust-cg
-    let obj_bytes = compile_trust_ir_module_x86_64(module);
-    let obj_path = dir.join("trust_cg.o");
-    fs::write(&obj_path, &obj_bytes).map_err(|e| format!("write .o: {}", e))?;
-    let driver_path = dir.join("driver.c");
-    fs::write(&driver_path, c_source).map_err(|e| format!("write driver.c: {}", e))?;
-
-    let trust_cg_bin = dir.join("test_trust_cg");
-    let trust_cg_link = Command::new("cc")
-        .args(if cfg!(target_os = "macos") {
-            &["-arch", "x86_64"][..]
-        } else {
-            &[][..]
-        })
-        .args([
-            "-DEXTERN_ONLY",
-            "-O0",
-            "-o",
-            trust_cg_bin.to_str().unwrap(),
-            driver_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
-        ])
-        .output()
-        .map_err(|e| format!("trust-cg link: {}", e))?;
-    if !trust_cg_link.status.success() {
-        let stderr = String::from_utf8_lossy(&trust_cg_link.stderr);
-        cleanup(&dir);
-        return Err(format!("trust-cg link failed: {}", stderr));
-    }
-    let trust_cg_run = Command::new(&trust_cg_bin)
-        .output()
-        .map_err(|e| format!("run trust-cg binary: {}", e))?;
-    let trust_cg = parse_int_results(&String::from_utf8_lossy(&trust_cg_run.stdout));
-
-    // Oracle 2: clang (golden)
-    let clang_bin = dir.join("test_clang");
-    let clang_compile = Command::new("cc")
-        .args(if cfg!(target_os = "macos") {
-            &["-arch", "x86_64"][..]
-        } else {
-            &[][..]
-        })
-        .args([
-            "-O0",
-            "-o",
-            clang_bin.to_str().unwrap(),
-            driver_path.to_str().unwrap(),
-        ])
-        .output()
-        .map_err(|e| format!("clang compile: {}", e))?;
-    if !clang_compile.status.success() {
-        let stderr = String::from_utf8_lossy(&clang_compile.stderr);
-        cleanup(&dir);
-        return Err(format!("clang compile failed: {}", stderr));
-    }
-    let clang_run = Command::new(&clang_bin)
-        .output()
-        .map_err(|e| format!("run clang binary: {}", e))?;
-    let clang = parse_int_results(&String::from_utf8_lossy(&clang_run.stdout));
-
-    eprintln!("=== x86-64 packed-FP lane differential: {} ===", test_name);
-    eprintln!("  trust-cg: {:?}", trust_cg);
-    eprintln!("  clang:    {:?}", clang);
-
-    let mut mismatches = Vec::new();
-    match (trust_cg.get(key), clang.get(key)) {
-        (Some(&l), Some(&k)) => {
-            if l != k {
-                mismatches.push(format!("  {}: trust-cg={}, clang={}", key, l, k));
-            }
+    src: &Ty,
+    dst: &Ty,
+    control: &TrustIrModule,
+) {
+    let compiler = Compiler::new(x86_64_config()).with_codegen_license(permit_unlicensed());
+    let error = compiler.compile(module).expect_err(
+        "vector Bitcast must be refused: trust-ir's semantic model gives it no meaning and \
+         no trust-cg lowering proof covers it (ruling 2026-09-21)",
+    );
+    match &error {
+        CompileError::Adapter(AdapterError::UnsupportedInstruction(message)) => {
+            let names_src = message.contains(&format!("src_ty={src:?}"));
+            let names_dst = message.contains(&format!("dst_ty={dst:?}"));
+            assert!(
+                message.contains("CastOp::Bitcast") && names_src && names_dst,
+                "the refusal must come from the cast shape gate and name the vector \
+                 shapes {src:?} -> {dst:?}: {message}"
+            );
         }
-        (l, k) => mismatches.push(format!("  {}: MISSING trust-cg={:?} clang={:?}", key, l, k)),
+        other => panic!(
+            "vector Bitcast {src:?} -> {dst:?} must be refused by the adapter's cast shape \
+             gate as UnsupportedInstruction, not fail elsewhere: {other:?}"
+        ),
     }
-
-    cleanup(&dir);
-    if mismatches.is_empty() {
-        eprintln!("  trust-cg AND clang AGREE");
-        Ok(())
-    } else {
-        Err(format!(
-            "DIFFERENTIAL MISMATCH {}:\n{}",
-            test_name,
-            mismatches.join("\n")
-        ))
-    }
+    compiler.compile(control).unwrap_or_else(|e| {
+        panic!("NON-VACUITY: the bitcast-free memory form of the same packed op must compile: {e}")
+    });
 }
 
 // =============================================================================
@@ -355,11 +309,14 @@ fn v2_f64() -> Ty {
 /// VEC is the packed FP vector type. Pointers are passed as i64 values.
 fn build_packed_memform_module(name: &str, vec_ty: Ty, op: BinOp) -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -404,12 +361,15 @@ fn build_packed_memform_module(name: &str, vec_ty: Ty, op: BinOp) -> TrustIrModu
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 // =============================================================================
-// trust_ir builders -- triple-oracle (constant inputs, integer lane return)
+// trust_ir builders -- pack / arithmetic / extract (constant inputs, integer
+// lane return): the form whose vector bitcast the lowering lane REFUSES
 // =============================================================================
 
 /// Build `i64 NAME() { vr = consts_a OP consts_b; return (i64) bitcast(vr to
@@ -419,6 +379,9 @@ fn build_packed_memform_module(name: &str, vec_ty: Ty, op: BinOp) -> TrustIrModu
 /// vector (`<4 x i32>` for f32, `<2 x i64>` for f64); `int_lane_ty` is the
 /// integer lane type (I32 / I64). The extracted integer lane is zero/sign
 /// extended to i64 (for I32 we widen with ZExt to compare raw bit patterns).
+/// The `vec_ty -> int_vec_ty` bitcast is the instruction the lowering lane
+/// refuses (REGRESSION NOTE in the header); the module is built exactly as the
+/// differential form was so the refusal pins target the real shape.
 #[allow(clippy::too_many_arguments)]
 fn build_packed_const_lane_module(
     name: &str,
@@ -431,11 +394,14 @@ fn build_packed_const_lane_module(
     lane: u32,
 ) -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
 
     let make_vec_const =
@@ -520,7 +486,9 @@ fn build_packed_const_lane_module(
         params: vec![],
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -653,149 +621,80 @@ fn v2f64_fdiv_differential() {
 }
 
 // =============================================================================
-// Triple-oracle tests: pack lanes (via constants), arithmetic, extract one lane
+// Refusal pins: pack lanes (via constants), arithmetic, extract one lane
 // =============================================================================
 //
 // Each function performs the packed FP op on two constant vectors, bitcasts the
 // result to the matching integer vector, and returns one lane's raw bit pattern
-// as i64. The interpreter models packed vector FP + bitcast + integer lane
-// extract, so all three oracles can be compared on exact bits.
-
-/// `<4 x f32>` triple-oracle C reference: build the same constant vectors,
-/// perform the op, and reinterpret the chosen lane's bits as a u32, printed as
-/// a decimal integer matching the trust_ir ZExt-to-i64 result.
-fn v4f32_lane_driver(func: &str, op_c: &str, key: &str, lane: usize) -> String {
-    format!(
-        r#"
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
-typedef float v4f __attribute__((vector_size(16)));
-#ifdef EXTERN_ONLY
-extern long {func}(void);
-#else
-long {func}(void) {{
-    v4f a = {{ 1.5f, -2.25f, 9.0f, 8.0f }};
-    v4f b = {{ 0.5f,  4.0f,  3.0f, 2.0f }};
-    v4f r = a {op_c} b;
-    uint32_t bits;
-    memcpy(&bits, ((const float*)&r) + {lane}, 4);
-    return (long)(uint64_t)bits;
-}}
-#endif
-int main(void) {{
-    printf("{key}=%ld\n", {func}());
-    return 0;
-}}
-"#,
-        func = func,
-        op_c = op_c,
-        key = key,
-        lane = lane
-    )
-}
-
-/// `<2 x f64>` triple-oracle C reference.
-fn v2f64_lane_driver(func: &str, op_c: &str, key: &str, lane: usize) -> String {
-    format!(
-        r#"
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
-typedef double v2d __attribute__((vector_size(16)));
-#ifdef EXTERN_ONLY
-extern long {func}(void);
-#else
-long {func}(void) {{
-    v2d a = {{ 1.5, -2.25 }};
-    v2d b = {{ 0.5,  4.0 }};
-    v2d r = a {op_c} b;
-    uint64_t bits;
-    memcpy(&bits, ((const double*)&r) + {lane}, 8);
-    return (long)bits;
-}}
-#endif
-int main(void) {{
-    printf("{key}=%ld\n", {func}());
-    return 0;
-}}
-"#,
-        func = func,
-        op_c = op_c,
-        key = key,
-        lane = lane
-    )
-}
+// as i64. The vector bitcast is REFUSED by the lowering lane (REGRESSION NOTE
+// in the header): trust-ir's semantic model gives it no meaning and no trust-cg
+// lowering proof covers it, so these pins assert that refusal -- for every op
+// and lane the differential form used -- rather than run a differential. They
+// are compile-only and not host-gated: the refusal happens in the adapter,
+// before any object code, linker or oracle.
 
 #[test]
-fn v4f32_pack_arith_extract_lane_differential() {
-    if !x86_64_oracle_enabled() {
-        return;
-    }
+fn v4f32_pack_arith_extract_lane_refuses_vector_bitcast() {
     let a = vec![1.5, -2.25, 9.0, 8.0];
     let b = vec![0.5, 4.0, 3.0, 2.0];
-    // (op, c-operator, lane)
-    let cases: &[(BinOp, &str, u32)] = &[
-        (BinOp::FAdd, "+", 0),
-        (BinOp::FSub, "-", 1),
-        (BinOp::FMul, "*", 2),
-        (BinOp::FDiv, "/", 3),
+    let int_vec_ty = Ty::Vector(Box::new(Ty::I32), 4);
+    // (op, lane)
+    let cases: &[(BinOp, u32)] = &[
+        (BinOp::FAdd, 0),
+        (BinOp::FSub, 1),
+        (BinOp::FMul, 2),
+        (BinOp::FDiv, 3),
     ];
-    for (op, op_c, lane) in cases {
+    for (op, lane) in cases {
         let func = format!("_v4f32_lane_{:?}_{}", op, lane).to_lowercase();
-        let key = format!("v4f32_{:?}_l{}", op, lane).to_lowercase();
         let module = build_packed_const_lane_module(
             &func,
             v4_f32(),
-            Ty::Vector(Box::new(Ty::I32), 4),
+            int_vec_ty.clone(),
             Ty::I32,
             *op,
             a.clone(),
             b.clone(),
             *lane,
         );
-        differential_int(
-            &format!("v4f32_to_{}", func),
-            &module,
-            &v4f32_lane_driver(&func, op_c, &key, *lane as usize),
-            &key,
-        )
-        .unwrap();
+        let control = build_packed_memform_module(&format!("{func}_memform"), v4_f32(), *op);
+        assert_vector_bitcast_refused(&module, &v4_f32(), &int_vec_ty, &control);
     }
 }
 
 #[test]
-fn v2f64_pack_arith_extract_lane_differential() {
-    if !x86_64_oracle_enabled() {
-        return;
-    }
+fn v2f64_pack_arith_extract_lane_refuses_vector_bitcast() {
     let a = vec![1.5, -2.25];
     let b = vec![0.5, 4.0];
-    let cases: &[(BinOp, &str, u32)] = &[
-        (BinOp::FAdd, "+", 0),
-        (BinOp::FSub, "-", 1),
-        (BinOp::FMul, "*", 0),
-        (BinOp::FDiv, "/", 1),
+    let int_vec_ty = Ty::Vector(Box::new(Ty::I64), 2);
+    let cases: &[(BinOp, u32)] = &[
+        (BinOp::FAdd, 0),
+        (BinOp::FSub, 1),
+        (BinOp::FMul, 0),
+        (BinOp::FDiv, 1),
     ];
-    for (op, op_c, lane) in cases {
+    for (op, lane) in cases {
         let func = format!("_v2f64_lane_{:?}_{}", op, lane).to_lowercase();
-        let key = format!("v2f64_{:?}_l{}", op, lane).to_lowercase();
         let module = build_packed_const_lane_module(
             &func,
             v2_f64(),
-            Ty::Vector(Box::new(Ty::I64), 2),
+            int_vec_ty.clone(),
             Ty::I64,
             *op,
             a.clone(),
             b.clone(),
             *lane,
         );
-        differential_int(
-            &format!("v2f64_to_{}", func),
-            &module,
-            &v2f64_lane_driver(&func, op_c, &key, *lane as usize),
-            &key,
-        )
-        .unwrap();
+        let control = build_packed_memform_module(&format!("{func}_memform"), v2_f64(), *op);
+        assert_vector_bitcast_refused(&module, &v2_f64(), &int_vec_ty, &control);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

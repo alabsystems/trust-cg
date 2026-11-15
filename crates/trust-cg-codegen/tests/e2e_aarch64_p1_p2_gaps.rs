@@ -2,7 +2,7 @@
 //
 // Pins for the P1/P2 aarch64 completeness-audit gaps (§3, P1 & P2). Each gap is
 // either a CORRECT lowering (pinned differential-vs-clang, link-and-run on an
-// aarch64-apple-darwin host at O0 AND O2) or a SOUND fail-close (pinned by a
+// AArch64 macOS or Linux GNU host at O0 AND O2) or a SOUND fail-close (pinned by a
 // "must be rejected" compile check):
 //
 //   G7   InsertField of a nested-aggregate field into a NON-packed struct
@@ -26,6 +26,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
+#[path = "common/pinned_target.rs"]
+mod pinned_target;
+
+#[path = "common/field_typed.rs"]
+mod field_typed;
+
 use std::fs;
 use std::process::Command;
 
@@ -39,26 +45,38 @@ use trust_ir::{
     StructRepr, SwitchCase, Ty, ValueId,
 };
 
-fn aarch64_host() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn compile_obj(module: &TirModule, opt: OptLevel) -> Result<Vec<u8>, String> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
-        .compile(module)
+        // trust-ir's spelling of the fixtures (WS7.3 ingestion admission):
+        // field-typed `ExtractField`s and the host target pinned (`memcpy` is
+        // an FFI boundary).
+        .compile(&pinned_target::pinned(
+            &field_typed::normalized(module),
+            pinned_target::host_triple(),
+        ))
         .map(|r| r.object_code)
         .map_err(|e| format!("{e:?}"))
 }
 
 /// Link `obj` against C `driver` (compiled at -O2), run, return the exit code.
-/// `None` => not an aarch64-apple-darwin host (skip).
+/// `None` => not an AArch64 macOS or Linux GNU host (skip).
 fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !aarch64_host() {
-        eprintln!("SKIP {tag}: link-and-run requires aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP {tag}: link-and-run requires an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_p1p2"));
@@ -76,6 +94,7 @@ fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc available");
     assert!(
@@ -103,6 +122,7 @@ fn run_both_opts(tag: &str, module: &TirModule, driver: &str) {
 
 fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields: fields
@@ -180,11 +200,14 @@ fn g7_insertfield_aggregate_field_nonpacked_matches_clang() {
     let inner = Ty::Struct(StructId::new(0));
 
     // fn setinner(n: Nest, v: {i64,i64}) -> Nest { n.inner = v; n }
-    let ft = m.add_func_type(FuncTy {
-        params: vec![nest.clone(), inner.clone()],
-        returns: vec![nest.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![nest.clone(), inner.clone()],
+            returns: vec![nest.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g7_setinner", ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -202,7 +225,8 @@ fn g7_insertfield_aggregate_field_nonpacked_matches_clang() {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 
     run_both_opts("g7", &m, G7_DRIVER);
 }
@@ -220,11 +244,14 @@ fn build_g9_callee(m: &mut TirModule) {
     let mut params: Vec<Ty> = vec![Ty::I64; 7];
     params.push(s_ty.clone());
     params.push(Ty::I64);
-    let ft = m.add_func_type(FuncTy {
-        params,
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params,
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g9_sum", ft, BlockId::new(0));
     let mut block_params: Vec<(ValueId, Ty)> = (0..7).map(|i| (ValueId::new(i), Ty::I64)).collect();
     block_params.push((ValueId::new(7), s_ty.clone())); // s
@@ -257,7 +284,8 @@ fn build_g9_callee(m: &mut TirModule) {
         params: block_params,
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 const G9_DRIVER: &str = r#"
@@ -308,11 +336,14 @@ fn build_g8_module() -> TirModule {
     // ---- callee: g8_big_callee(a..h:i64, big:{i64,i64,i64}) -> i64 ----
     let mut params: Vec<Ty> = vec![Ty::I64; 8];
     params.push(s3.clone());
-    let ft = m.add_func_type(FuncTy {
-        params,
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params,
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g8_big_callee", ft, BlockId::new(0));
     let mut bp: Vec<(ValueId, Ty)> = (0..8).map(|i| (ValueId::new(i), Ty::I64)).collect();
     bp.push((ValueId::new(8), s3.clone()));
@@ -349,34 +380,42 @@ fn build_g8_module() -> TirModule {
         params: bp,
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 
     // ---- extern sinks (defined by clang) ----
-    let big_sink_ft = m.add_func_type(FuncTy {
-        params: {
-            let mut p: Vec<Ty> = vec![Ty::I64; 8];
-            p.push(s3.clone());
-            p
-        },
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let big_sink_ft = m
+        .add_func_type(FuncTy {
+            params: {
+                let mut p: Vec<Ty> = vec![Ty::I64; 8];
+                p.push(s3.clone());
+                p
+            },
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut big_sink =
         TirFunction::new(FuncId::new(1), "g8_big_sink", big_sink_ft, BlockId::new(0));
     big_sink.blocks = vec![];
     big_sink.linkage = Linkage::External;
-    m.add_function(big_sink);
+    m.try_add_function(big_sink)
+        .expect("Module::try_add_function: test fixture");
 
-    let small_sink_ft = m.add_func_type(FuncTy {
-        params: {
-            let mut p: Vec<Ty> = vec![Ty::I64; 7];
-            p.push(s2.clone());
-            p.push(Ty::I64);
-            p
-        },
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let small_sink_ft = m
+        .add_func_type(FuncTy {
+            params: {
+                let mut p: Vec<Ty> = vec![Ty::I64; 7];
+                p.push(s2.clone());
+                p.push(Ty::I64);
+                p
+            },
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut small_sink = TirFunction::new(
         FuncId::new(2),
         "g8_small_sink",
@@ -385,15 +424,19 @@ fn build_g8_module() -> TirModule {
     );
     small_sink.blocks = vec![];
     small_sink.linkage = Linkage::External;
-    m.add_function(small_sink);
+    m.try_add_function(small_sink)
+        .expect("Module::try_add_function: test fixture");
 
     // ---- caller: g8_big_caller(big:{i64,i64,i64}) -> i64 {
     //          return g8_big_sink(1,2,3,4,5,6,7,8, big) } ----
-    let big_caller_ft = m.add_func_type(FuncTy {
-        params: vec![s3.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let big_caller_ft = m
+        .add_func_type(FuncTy {
+            params: vec![s3.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut big_caller = TirFunction::new(
         FuncId::new(3),
         "g8_big_caller",
@@ -435,15 +478,19 @@ fn build_g8_module() -> TirModule {
         params: vec![(ValueId::new(0), s3.clone())],
         body: cbody,
     }];
-    m.add_function(big_caller);
+    m.try_add_function(big_caller)
+        .expect("Module::try_add_function: test fixture");
 
     // ---- caller: g8_small_caller(s:{i64,i64}) -> i64 {
     //          return g8_small_sink(1,2,3,4,5,6,7, s, 8) } ----
-    let small_caller_ft = m.add_func_type(FuncTy {
-        params: vec![s2.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let small_caller_ft = m
+        .add_func_type(FuncTy {
+            params: vec![s2.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut small_caller = TirFunction::new(
         FuncId::new(4),
         "g8_small_caller",
@@ -492,7 +539,8 @@ fn build_g8_module() -> TirModule {
         params: vec![(ValueId::new(0), s2.clone())],
         body: sbody,
     }];
-    m.add_function(small_caller);
+    m.try_add_function(small_caller)
+        .expect("Module::try_add_function: test fixture");
 
     m
 }
@@ -548,6 +596,9 @@ fn build_g10_module() -> TirModule {
     let mut m = TirModule::new("g10");
     // Imported: no initializer, External linkage -> a cross-object DATA import.
     m.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "g10_shared".to_string(),
         ty: Ty::I64,
         mutable: true,
@@ -559,11 +610,14 @@ fn build_g10_module() -> TirModule {
     let g = GlobalId::new(0);
 
     // void g10_bump(void) { g10_shared += 1; }
-    let bump_ft = m.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let bump_ft = m
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut bump = TirFunction::new(FuncId::new(0), "g10_bump", bump_ft, BlockId::new(0));
     bump.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -599,14 +653,18 @@ fn build_g10_module() -> TirModule {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    m.add_function(bump);
+    m.try_add_function(bump)
+        .expect("Module::try_add_function: test fixture");
 
     // int64_t g10_read(void) { return g10_shared; }
-    let read_ft = m.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let read_ft = m
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut read = TirFunction::new(FuncId::new(1), "g10_read", read_ft, BlockId::new(0));
     read.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -625,7 +683,8 @@ fn build_g10_module() -> TirModule {
             }),
         ],
     }];
-    m.add_function(read);
+    m.try_add_function(read)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -660,22 +719,29 @@ fn build_g11_module() -> TirModule {
     let ptr = Ty::PtrMut(Box::new(Ty::I8));
 
     // extern void* memcpy(void*, void*, i64)  (recognised by name).
-    let mc_ft = m.add_func_type(FuncTy {
-        params: vec![ptr.clone(), ptr.clone(), Ty::I64],
-        returns: vec![ptr.clone()],
-        is_vararg: false,
-    });
+    let mc_ft = m
+        .add_func_type(FuncTy {
+            params: vec![ptr.clone(), ptr.clone(), Ty::I64],
+            returns: vec![ptr.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut memcpy = TirFunction::new(FuncId::new(0), "memcpy", mc_ft, BlockId::new(0));
     memcpy.blocks = vec![];
     memcpy.linkage = Linkage::External;
-    m.add_function(memcpy);
+    m.try_add_function(memcpy)
+        .expect("Module::try_add_function: test fixture");
 
     // void* g11(void* dst, void* src, i64 n) { return memcpy(dst, src, n); }
-    let g11_ft = m.add_func_type(FuncTy {
-        params: vec![ptr.clone(), ptr.clone(), Ty::I64],
-        returns: vec![ptr.clone()],
-        is_vararg: false,
-    });
+    let g11_ft = m
+        .add_func_type(FuncTy {
+            params: vec![ptr.clone(), ptr.clone(), Ty::I64],
+            returns: vec![ptr.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut g11 = TirFunction::new(FuncId::new(1), "g11", g11_ft, BlockId::new(0));
     g11.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -695,7 +761,8 @@ fn build_g11_module() -> TirModule {
             }),
         ],
     }];
-    m.add_function(g11);
+    m.try_add_function(g11)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -746,11 +813,14 @@ fn ret_i32_block(id: u32, nv: ValueId, val: i64) -> TirBlock {
 fn build_g13_module() -> TirModule {
     let mut m = TirModule::new("g13");
     // fn g13(a: u8, b: u8) -> i32 { let s = (a*b) as u8; match s { ... } }
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::U8, Ty::U8],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::U8, Ty::U8],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g13", ft, BlockId::new(0));
     // cases: 50 -> 200, 144 -> 100, 200 -> 300 ; default 999.
     let cases = [(50i64, 200i64), (144, 100), (200, 300)];
@@ -795,7 +865,8 @@ fn build_g13_module() -> TirModule {
         999,
     ));
     f.blocks = blocks;
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -853,11 +924,14 @@ fn expect_float_atomic_failclose(m: &TirModule, tag: &str) {
 #[test]
 fn g14_float_atomic_load_fails_closed() {
     let mut m = TirModule::new("g14");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![f32_ptr()],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![f32_ptr()],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g14_aload_f32", ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -874,18 +948,22 @@ fn g14_float_atomic_load_fails_closed() {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     expect_float_atomic_failclose(&m, "g14_float_atomic_load");
 }
 
 #[test]
 fn g15_float_atomic_store_fails_closed() {
     let mut m = TirModule::new("g15");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![f32_ptr(), Ty::F32],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![f32_ptr(), Ty::F32],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g15_astore_f32", ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -900,18 +978,22 @@ fn g15_float_atomic_store_fails_closed() {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     expect_float_atomic_failclose(&m, "g15_float_atomic_store");
 }
 
 #[test]
 fn g16_float_cmpxchg_fails_closed() {
     let mut m = TirModule::new("g16");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![f32_ptr(), Ty::F32, Ty::F32],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![f32_ptr(), Ty::F32, Ty::F32],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g16_cas_f32", ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -928,6 +1010,7 @@ fn g16_float_cmpxchg_fails_closed() {
                 desired: ValueId::new(2),
                 success: Ordering::SeqCst,
                 failure: Ordering::SeqCst,
+                weak: false,
             })
             .with_results(vec![ValueId::new(3), ValueId::new(4)]),
             InstrNode::new(Inst::Return {
@@ -935,6 +1018,16 @@ fn g16_float_cmpxchg_fails_closed() {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     expect_float_atomic_failclose(&m, "g16_float_cmpxchg");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

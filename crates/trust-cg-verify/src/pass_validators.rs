@@ -205,21 +205,33 @@ pub trait PassValidator {
                 AYResult::Verified => PassValidation::Verified {
                     obligation_name: obligation.name,
                 },
-                AYResult::SolverUnsat => PassValidation::Rejected {
-                    obligation_name: obligation.name,
-                    reason:
-                        "fail-closed: solver UNSAT lacked an independently accepted exact proof"
-                            .to_string(),
-                },
+                AYResult::SolverUnsat => {
+                    let reason = formal_lane_refusal(
+                        "solver UNSAT lacked an independently accepted exact proof",
+                        "the live solver's UNSAT then lacked an independently accepted exact proof",
+                        ay_bridge::portable_certificate_miss_reason(&obligation, config),
+                    );
+                    PassValidation::Rejected {
+                        obligation_name: obligation.name,
+                        reason,
+                    }
+                }
                 AYResult::CounterExample(cex) => PassValidation::Rejected {
                     obligation_name: obligation.name,
                     reason: format!("counterexample: {cex:?}"),
                 },
-                AYResult::Timeout => PassValidation::Rejected {
-                    obligation_name: obligation.name,
-                    reason: "fail-closed: solver timeout (obligation outside the exhaustive lanes)"
-                        .to_string(),
-                },
+                AYResult::Timeout => {
+                    let reason = formal_lane_refusal(
+                        "solver timeout (obligation outside the exhaustive lanes)",
+                        "the live solver then ran out of time (obligation outside the \
+                         exhaustive lanes)",
+                        ay_bridge::portable_certificate_miss_reason(&obligation, config),
+                    );
+                    PassValidation::Rejected {
+                        obligation_name: obligation.name,
+                        reason,
+                    }
+                }
                 AYResult::Unknown(m) => PassValidation::Rejected {
                     obligation_name: obligation.name,
                     reason: format!("fail-closed: solver unknown ({m})"),
@@ -273,6 +285,25 @@ pub trait PassValidator {
             }
             PassValidation::Rejected { .. } => Err(validation),
         }
+    }
+}
+
+/// The refusal reason of a formal-lane verdict whose AY result carries no
+/// text (a timeout, an unaccepted UNSAT). When a committed portable
+/// certificate exists for the query and was not consumed (`portable_miss`, as
+/// [`ay_bridge::portable_certificate_miss_reason`] names it: a checker that is
+/// missing, unreadable or not authorized), that miss is the cause, named
+/// first: the live solver ran only because the certificate could not be
+/// replayed. So the 30 s popcnt canary on a host whose checker path is gone
+/// reads "checker not found at ...", never a solver timeout.
+fn formal_lane_refusal(
+    solver_only: &str,
+    after_miss: &str,
+    portable_miss: Option<String>,
+) -> String {
+    match portable_miss {
+        Some(miss) => format!("fail-closed: {miss}; {after_miss}"),
+        None => format!("fail-closed: {solver_only}"),
     }
 }
 
@@ -576,6 +607,34 @@ fn popcount_spec(x: SmtExpr, w: u32) -> SmtExpr {
 /// emitted `[8, 16]` (+32 for 64-bit) shift-add chain (at w=8 there are none, as
 /// `>>8` on an 8-bit value is identity).
 fn popcount_swar(x: SmtExpr, w: u32, m1: u64, m2: u64, m4: u64, final_mask: u64) -> SmtExpr {
+    popcount_swar_with_folds(x, w, m1, m2, m4, final_mask, &shipping_folds(w))
+}
+
+/// The reduction-fold shifts the emitter runs at width `w`: 8, 16, … < w.
+fn shipping_folds(w: u32) -> Vec<u32> {
+    let mut folds = Vec::new();
+    let mut shift = 8u32;
+    while shift < w {
+        folds.push(shift);
+        shift *= 2;
+    }
+    folds
+}
+
+/// [`popcount_swar`] with an explicit fold list, so a test can state a WRONG
+/// expansion (a dropped or misplaced fold) and show it refuted. Production
+/// callers go through [`popcount_swar`], whose output is pinned byte-for-byte
+/// to the committed certificate query by
+/// `committed_queries_match_all_current_obligations`.
+fn popcount_swar_with_folds(
+    x: SmtExpr,
+    w: u32,
+    m1: u64,
+    m2: u64,
+    m4: u64,
+    final_mask: u64,
+    folds: &[u32],
+) -> SmtExpr {
     // dst = x - ((x >> 1) & m1)
     let t = x
         .clone()
@@ -593,14 +652,12 @@ fn popcount_swar(x: SmtExpr, w: u32, m1: u64, m2: u64, m4: u64, final_mask: u64)
         .clone()
         .bvadd(dst.bvlshr(SmtExpr::bv_const(4, w)))
         .bvand(SmtExpr::bv_const(m4, w));
-    // dst += dst >> shift, for shift = 8, 16, … < w
+    // dst += dst >> shift, for each fold shift
     let mut dst = dst;
-    let mut shift = 8u32;
-    while shift < w {
+    for &shift in folds {
         dst = dst
             .clone()
             .bvadd(dst.bvlshr(SmtExpr::bv_const(shift as u64, w)));
-        shift *= 2;
     }
     // dst & final_mask
     dst.bvand(SmtExpr::bv_const(final_mask, w))
@@ -1619,6 +1676,35 @@ fn build_pass_certificate_request(
 
 #[cfg(test)]
 mod tests {
+    /// A formal-lane verdict that carries no text names a portable-certificate
+    /// miss first (2026-11-03: 17 Darwin x86-64 O2 census roots read
+    /// `solver timeout` while the build-embedded checker path pointed into a
+    /// deleted worktree); without a miss the refusal is the solver's.
+    #[test]
+    fn a_textless_formal_lane_refusal_names_the_portable_miss_first() {
+        let miss = "checker not found at /gone/out/drat-trim: a committed portable certificate \
+                    exists for this exact query"
+            .to_string();
+        let timeout = super::formal_lane_refusal(
+            "solver timeout (obligation outside the exhaustive lanes)",
+            "the live solver then ran out of time (obligation outside the exhaustive lanes)",
+            Some(miss),
+        );
+        assert!(
+            timeout.starts_with("fail-closed: checker not found at /gone/out/drat-trim"),
+            "{timeout}"
+        );
+        assert!(!timeout.contains("solver timeout"), "{timeout}");
+        assert_eq!(
+            super::formal_lane_refusal(
+                "solver timeout (obligation outside the exhaustive lanes)",
+                "unused",
+                None
+            ),
+            "fail-closed: solver timeout (obligation outside the exhaustive lanes)"
+        );
+    }
+
     use super::*;
     use crate::certified_pass_chain::CertifiedPassChain;
 
@@ -1629,22 +1715,16 @@ mod tests {
     /// a guarded test skips LOUDLY only on the exact fail-closed gap
     /// diagnostics — a counterexample, timeout, error, or any other
     /// rejection still fails the original assertion.
-    fn validator_certification_gap(
-        obligation: &ProofObligation,
-        validation: &PassValidation,
-    ) -> Option<String> {
+    fn validator_certification_gap(validation: &PassValidation) -> Option<String> {
         let PassValidation::Rejected { reason, .. } = validation else {
             return None;
         };
         let inner = reason
             .strip_prefix("fail-closed: solver unknown (")?
             .strip_suffix(')')?;
-        let config = AYConfig::default();
-        crate::formal_gap::confirmed_certification_gap(
-            obligation,
-            &config,
-            &crate::ay_bridge::AYResult::Unknown(inner.to_string()),
-        )
+        crate::formal_gap::disclosed_proof_hole(&crate::ay_bridge::AYResult::Unknown(
+            inner.to_string(),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1824,10 +1904,13 @@ mod tests {
             return;
         }
         assert!(
-            crate::ay_bridge::z3_available(),
-            "formal proof campaign requested, but no AY/Z3 solver is available"
+            crate::ay_bridge::ay_available(),
+            "formal proof campaign requested, but the AY + Clean proof route is unavailable"
         );
 
+        // Solver-coupled: serialize on the process-global resident `ay` slot
+        // like every other live-solver test in this binary.
+        let _solver_lock = crate::ay_bridge::formal_solver_test_lock();
         let v = PopcntSwarExpansionValidator::x86_generic("popcnt-expand", 64);
         let obligation = v.obligation();
         let cfg = crate::ay_bridge::AYConfig::default().with_timeout(240_000);
@@ -1865,6 +1948,104 @@ mod tests {
             ),
             "a wrong SWAR fold mask must be caught (the equivalence is non-vacuous)"
         );
+    }
+
+    /// A mutated SWAR statement for the refutation controls below.
+    fn popcnt_mutant(
+        w: u32,
+        name: &str,
+        masks: (u64, u64, u64, u64),
+        folds: &[u32],
+    ) -> ProofObligation {
+        let x = SmtExpr::var("x", w);
+        let (m1, m2, m4, final_mask) = masks;
+        ProofObligation {
+            machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+            name: format!("popcnt-mutant-{name}-i{w}"),
+            trust_ir_expr: popcount_spec(x.clone(), w),
+            aarch64_expr: popcount_swar_with_folds(x, w, m1, m2, m4, final_mask, folds),
+            inputs: vec![("x".to_string(), w)],
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: Some(TransvalCheckKind::InstructionLowering),
+        }
+    }
+
+    /// At the widths the emitter actually ships (32 and 64), every wrong
+    /// constant and every wrong fold is REFUTED by evaluation (the edge cases
+    /// it always tries include all-ones, which is the only witness against a
+    /// too-narrow final mask), and none of those mutated statements can borrow
+    /// the committed width-32 certificate: its query key is the exact bytes of
+    /// the correct statement.
+    #[test]
+    fn popcnt_swar_wrong_constants_are_refuted_at_every_shipping_width() {
+        let config = crate::ay_bridge::AYConfig::default();
+        for w in [32u32, 64] {
+            let (m1, m2, m4, final_mask) = PopcntSwarExpansionValidator::masks(w);
+            let folds = shipping_folds(w);
+            type Masks = (u64, u64, u64, u64);
+            let mut mutants: Vec<(&str, Masks, Vec<u32>)> = vec![
+                ("m1", (m1 ^ 1, m2, m4, final_mask), folds.clone()),
+                ("m2", (m1, m2 ^ 1, m4, final_mask), folds.clone()),
+                ("m4", (m1, m2, m4 ^ 1, final_mask), folds.clone()),
+                ("final-mask", (m1, m2, m4, final_mask >> 1), folds.clone()),
+                (
+                    "drop-fold-8",
+                    (m1, m2, m4, final_mask),
+                    folds.iter().copied().filter(|&f| f != 8).collect(),
+                ),
+                (
+                    "fold-16-as-12",
+                    (m1, m2, m4, final_mask),
+                    folds
+                        .iter()
+                        .map(|&f| if f == 16 { 12 } else { f })
+                        .collect(),
+                ),
+            ];
+            if w == 64 {
+                mutants.push((
+                    "drop-fold-32",
+                    (m1, m2, m4, final_mask),
+                    folds.iter().copied().filter(|&f| f != 32).collect(),
+                ));
+            }
+            for (name, masks, folds) in mutants {
+                let mutant = popcnt_mutant(w, name, masks, &folds);
+                assert!(
+                    matches!(
+                        verify_by_evaluation(&mutant),
+                        VerificationResult::Invalid { .. }
+                    ),
+                    "i{w} mutant `{name}` must be refuted by evaluation"
+                );
+                let smt2 = crate::ay_bridge::generate_smt2_query(&mutant, &config);
+                assert!(
+                    !crate::canary_cert::cert_skip_verified(&smt2),
+                    "i{w} mutant `{name}` must not be able to borrow a committed certificate"
+                );
+            }
+        }
+    }
+
+    /// Why width 32 must be proved and width 8 is only a proxy: at 8 bits the
+    /// fold chain is empty, so a dropped or misplaced fold changes nothing and
+    /// the exhaustive proof is Valid for the WRONG expansion.
+    #[test]
+    fn popcnt_fold_errors_are_invisible_at_width_8() {
+        let masks = PopcntSwarExpansionValidator::masks(8);
+        assert!(shipping_folds(8).is_empty());
+        for (name, folds) in [("drop-fold-8", vec![]), ("fold-16-as-12", vec![12u32])] {
+            let folds: Vec<u32> = folds.into_iter().filter(|&f| f < 8).collect();
+            let mutant = popcnt_mutant(8, name, masks, &folds);
+            assert!(
+                !matches!(
+                    verify_by_evaluation(&mutant),
+                    VerificationResult::Invalid { .. }
+                ),
+                "at i8 the fold mutant `{name}` is indistinguishable from the shipped expansion"
+            );
+        }
     }
 
     /// Sentinel-S5 guard-carrier expansions: the CORRECT condition code each
@@ -1910,13 +2091,23 @@ mod tests {
     }
 
     /// At the REAL operand widths (i32/i64), require the committed exact-query
-    /// certificates to replay without a live solver. These are a single
-    /// CMP/TEST-flag + `Jcc` equivalence, not a sampled result.
+    /// certificates to replay without a live solver, for EVERY carrier the
+    /// expanders emit — including the `DivZero` row the x86-64 pipeline's
+    /// canary asks for first. These are a single CMP/TEST-flag + `Jcc`
+    /// equivalence, not a sampled result. All four rows are committed
+    /// certificates, so a host whose bundled checker is not qualified
+    /// (`docs/portable-checker-host-qualification.md`) fails this test rather
+    /// than silently compiling guards it cannot confirm.
     #[test]
     fn guard_carrier_real_widths_verify() {
         use GuardCarrierKind::*;
         for w in [32u32, 64] {
-            for (kind, cc) in [(Bounds, X86CondCode::AE), (NullIfZero, X86CondCode::E)] {
+            for (kind, cc) in [
+                (Bounds, X86CondCode::AE),
+                (ShiftRange, X86CondCode::AE),
+                (NullIfZero, X86CondCode::E),
+                (DivZero, X86CondCode::E),
+            ] {
                 let v = GuardCarrierExpansionValidator::new("guard", kind, cc, w);
                 let validation = v.validate();
                 assert!(
@@ -1929,8 +2120,10 @@ mod tests {
 
     #[test]
     fn wide_validators_use_portable_certs_before_missing_solver_and_mutation_fails_closed() {
+        // An explicit AY that must never be needed: the inert fixture exits 97
+        // for any invocation, so a verdict can only come from the portable cert.
         let config = AYConfig {
-            solver_path: Some("/definitely/missing/ay".to_string()),
+            solver: Some(crate::ay_identity::test_fixtures::inert()),
             timeout_ms: crate::verdict_db::DB_VERDICT_TIMEOUT_MS,
             produce_models: true,
         };
@@ -1939,27 +2132,30 @@ mod tests {
             popcnt.validate_with_config(&config).is_verified(),
             "the expensive popcount cert must also be portable across AY absence"
         );
-        let valid = GuardCarrierExpansionValidator::new(
-            "x86-guard-carrier-expand",
-            GuardCarrierKind::Bounds,
-            X86CondCode::AE,
-            32,
-        );
-        assert!(
-            valid.validate_with_config(&config).is_verified(),
-            "an exact portable cert hit must not require a live AY binary"
-        );
+        // Both guard shapes: the unsigned-range carrier, and the zero-test
+        // carrier whose i32 row is the first query the x86-64 pipeline's
+        // guard-carrier canary asks for. For each, the condition the expander
+        // really emits must come back verified from the committed certificate
+        // alone, and the inverted condition must miss the certificate and fail
+        // closed with no live AY to fall back to.
+        for (kind, emitted, inverted) in [
+            (GuardCarrierKind::Bounds, X86CondCode::AE, X86CondCode::B),
+            (GuardCarrierKind::DivZero, X86CondCode::E, X86CondCode::NE),
+        ] {
+            let valid =
+                GuardCarrierExpansionValidator::new("x86-guard-carrier-expand", kind, emitted, 32);
+            assert!(
+                valid.validate_with_config(&config).is_verified(),
+                "{kind:?}: an exact portable cert hit must not require a live AY binary"
+            );
 
-        let mutated = GuardCarrierExpansionValidator::new(
-            "x86-guard-carrier-expand",
-            GuardCarrierKind::Bounds,
-            X86CondCode::B,
-            32,
-        );
-        assert!(
-            !mutated.validate_with_config(&config).is_verified(),
-            "a query mutation must miss the cert and fail closed without AY"
-        );
+            let mutated =
+                GuardCarrierExpansionValidator::new("x86-guard-carrier-expand", kind, inverted, 32);
+            assert!(
+                !mutated.validate_with_config(&config).is_verified(),
+                "{kind:?}: a query mutation must miss the cert and fail closed without AY"
+            );
+        }
     }
 
     /// LOCKS IN #67: the SDIV-identity expansion is correct on AArch64
@@ -2479,7 +2675,7 @@ mod tests {
             // Certification-gap guard (crate::formal_gap): skip LOUDLY on the
             // exact fail-closed gap diagnostics only; anything else still
             // fails the original assertion.
-            if let Some(reason) = validator_certification_gap(&v.obligation(), &validation) {
+            if let Some(reason) = validator_certification_gap(&validation) {
                 crate::formal_gap::print_gap_skip(
                     &format!(
                         "strength_reduce_recurrence_production_width_genuinely_verifies \

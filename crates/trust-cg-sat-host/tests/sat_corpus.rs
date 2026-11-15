@@ -217,7 +217,7 @@ fn run_one(fixture: &Fixture) -> Result<FixtureReport, String> {
     let rc = solve_path(&cnf_path);
     let solve_elapsed = t0.elapsed();
     flush_drat_output().map_err(|e| format!("flush_drat: {e}"))?;
-    disable_drat_output();
+    disable_drat_output().expect("finalize drat output");
 
     if rc != expected {
         return Err(format!(
@@ -388,10 +388,12 @@ fn release_corpus_solver_agrees_and_emits_well_formed_drat() {
         }
     }
 
-    // Aggregate stderr summary so `cargo test -- --nocapture` gives a
-    // human-readable view of what happened.
-    let stderr = std::io::stderr();
-    let mut out = stderr.lock();
+    // Aggregate stderr summary so `targo --unverified test -- --nocapture` gives a
+    // human-readable view of what happened. It is printed through `eprint!`,
+    // which libtest captures: a direct `std::io::stderr()` write bypasses the
+    // capture and splits this test's `test ... ok` result line in a run that
+    // keeps output captured (`--show-output`).
+    let mut out = Vec::<u8>::new();
     writeln!(out, "sat_corpus: ran {} fixtures", manifest.fixtures.len()).ok();
     writeln!(
         out,
@@ -458,7 +460,7 @@ fn release_corpus_solver_agrees_and_emits_well_formed_drat() {
     for e in &errors {
         writeln!(out, "sat_corpus: FAIL {}", e).ok();
     }
-    drop(out);
+    eprint!("{}", String::from_utf8_lossy(&out));
 
     assert!(
         errors.is_empty(),
@@ -489,7 +491,7 @@ fn release_corpus_primary_jit_mode_zero_divergences() {
     let manifest = load_manifest();
     // DRAT is per-process; tests above this one may have left the
     // recorder armed. Disable to keep PRIMARY_JIT_MODE solves quiet.
-    disable_drat_output();
+    disable_drat_output().expect("finalize drat output");
     let divergences_before = JIT_DIVERGENCE_COUNT.load(Ordering::SeqCst);
     let primaries_before = JIT_PRIMARY_RETURNS.load(Ordering::SeqCst);
     let mut failures: Vec<String> = Vec::new();

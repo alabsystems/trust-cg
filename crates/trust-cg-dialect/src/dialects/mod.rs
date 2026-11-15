@@ -11,7 +11,8 @@
 //! * [`trust_ir`] — a small subset of trust_ir ops (`trust_ir.add`, `trust_ir.xor`,
 //!   `trust_ir.const`, `trust_ir.ret`).
 //! * [`machir`] — a small subset of MachIR ops mapping to `AArch64Opcode`.
-//! * [`conversions`] — `VerifToTrustIr` and `TrustIrToMachir` [`ConversionPattern`]s.
+//! * [`conversions`] — `VerifToTrustIr` and `TrustIrToMachir`
+//!   [`ConversionPattern`](crate::conversion::ConversionPattern)s.
 
 pub mod ay;
 pub mod conversions;

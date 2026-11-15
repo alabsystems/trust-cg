@@ -17,6 +17,7 @@
 
 use trust_cg_codegen::compiler::{CompileError, Compiler, CompilerConfig, CompilerTraceLevel};
 use trust_cg_codegen::pipeline::{DispatchVerifyMode, OptLevel, Pipeline, PipelineConfig};
+use trust_cg_lower::instructions::Opcode as LirOpcode;
 
 use trust_ir::ProofAnnotation;
 use trust_ir::{BinOp, ICmpOp, Inst, InstrNode};
@@ -33,13 +34,32 @@ use trust_ir::{BlockId, FuncId, FuncTyId, ValueId};
 /// This file inspects Mach-O structure end to end, so pin the
 /// aarch64-apple-darwin spec for the Compiler-API tests: `Compiler::new`
 /// derives the object format from the HOST, which on Linux emits ELF and
-/// breaks every Mach-O header parse below. The Pipeline-based tests already
-/// use the empty-triple historical Mach-O default; Mach-O byte emission is
-/// host-independent.
+/// breaks every Mach-O header parse below. The Pipeline-based tests name the
+/// same triple through `PipelineConfig::for_target` (the pipeline refuses an
+/// empty triple since 95450aa8d); Mach-O byte emission is host-independent.
+///
+/// Never use this pin for in-process JIT. `compile_module_to_jit` requires
+/// the host's exact OS/ABI spec (commit 9107c5902), so off macOS it refuses
+/// this spec with `JitTargetSpecMismatch` before generating any code; see
+/// [`host_jit_compiler`].
 fn macho_compiler(config: CompilerConfig) -> Compiler {
-    let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
-        .expect("aarch64-apple-darwin parses");
-    Compiler::new_for_target_spec(config, spec)
+    Compiler::new_for_target_spec(config, macho_target_spec())
+        .with_codegen_license(permit_unlicensed())
+}
+
+fn macho_target_spec() -> trust_cg_codegen::target::TargetSpec {
+    trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
+        .expect("aarch64-apple-darwin parses")
+}
+
+/// Compiler for in-process JIT tests, bound to the host's exact OS/ABI spec
+/// (`TargetSpec::host()`): DarwinPCS on macOS, AAPCS64/ELF on Linux. JIT code
+/// runs in this process, so its target is the host's and never a pinned
+/// object format. On macOS this is the same spec as [`macho_compiler`].
+#[cfg(target_arch = "aarch64")]
+fn host_jit_compiler(config: CompilerConfig) -> Compiler {
+    Compiler::new_for_target_spec(config, trust_cg_codegen::target::TargetSpec::host())
+        .with_codegen_license(permit_unlicensed())
 }
 
 /// Verify that bytes begin with a valid Mach-O 64-bit magic number.
@@ -72,7 +92,7 @@ fn compile_trust_ir_via_pipeline(
     let config = PipelineConfig {
         opt_level,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
     let pipeline = Pipeline::new(config);
     let ir_func = prepare_trust_ir_via_pipeline(trust_ir_func, module, opt_level)?;
@@ -103,13 +123,17 @@ fn prepare_trust_ir_with_metrics_via_pipeline(
     ),
     String,
 > {
-    let (lir_func, proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
-        .map_err(|e| format!("adapter error: {}", e))?;
+    let (lir_func, proof_ctx) = trust_cg_lower::translate_function_with_license(
+        trust_ir_func,
+        module,
+        &permit_unlicensed(),
+    )
+    .map_err(|e| format!("adapter error: {}", e))?;
 
     let config = PipelineConfig {
         opt_level,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
     let pipeline = Pipeline::new(config);
     pipeline
@@ -124,11 +148,14 @@ fn prepare_trust_ir_with_metrics_via_pipeline(
 /// fn simple_add(a: i64, b: i64) -> i64 { a + b }
 fn build_simple_add() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "simple_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -146,18 +173,23 @@ fn build_simple_add() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
 /// fn simple_sub(a: i64, b: i64) -> i64 { a - b }
 fn build_simple_sub() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(1), "simple_sub", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -175,18 +207,23 @@ fn build_simple_sub() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
 /// fn mul_vals(a: i64, b: i64) -> i64 { a * b }
 fn build_mul() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(2), "mul_vals", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -204,18 +241,23 @@ fn build_mul() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
 /// fn return_const() -> i64 { 42 }
 fn build_return_const() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(3), "return_const", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -231,7 +273,9 @@ fn build_return_const() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -240,11 +284,14 @@ fn build_return_const() -> (TrustIrFunction, TrustIrModule) {
 /// Three blocks: entry with branch, two return blocks.
 fn build_max_val() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(4), "max_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -282,7 +329,9 @@ fn build_max_val() -> (TrustIrFunction, TrustIrModule) {
             })],
         },
     ];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -291,11 +340,14 @@ fn build_max_val() -> (TrustIrFunction, TrustIrModule) {
 /// Loop: sum = 0, i = n; while (i > 0) { sum += i; i -= 1 }; return sum
 fn build_count_down() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(5), "count_down", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): init sum=0, jump to loop header
@@ -379,7 +431,9 @@ fn build_count_down() -> (TrustIrFunction, TrustIrModule) {
             ],
         },
     ];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -390,11 +444,14 @@ fn build_count_down() -> (TrustIrFunction, TrustIrModule) {
 /// annotation is report metadata and must not authorize a machine rewrite.
 fn build_add_with_no_overflow_proof() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(6), "proven_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -413,7 +470,9 @@ fn build_add_with_no_overflow_proof() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -423,11 +482,14 @@ fn build_add_with_no_overflow_proof() -> (TrustIrFunction, TrustIrModule) {
 /// proof and must never be converted to machine-level InBounds.
 fn build_add_with_bounded_output_proof() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(16), "bounded_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -446,7 +508,9 @@ fn build_add_with_bounded_output_proof() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -456,13 +520,18 @@ fn build_add_with_bounded_output_proof() -> (TrustIrFunction, TrustIrModule) {
 /// runtime bounds guard.  O2 must retain it while replay authority is absent.
 fn build_array_extract_with_in_bounds_proof() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, 8);
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(18), "proven_extract", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -480,7 +549,9 @@ fn build_array_extract_with_in_bounds_proof() -> (TrustIrFunction, TrustIrModule
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -497,11 +568,14 @@ fn build_div_rem_with_nonzero_proof(
     op: BinOp,
 ) -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(func_id), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -520,7 +594,9 @@ fn build_div_rem_with_nonzero_proof(
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -529,11 +605,14 @@ fn build_div_rem_with_nonzero_proof(
 /// Shift with ShiftInRange proof annotation on the shift amount.
 fn build_shift_with_in_range_proof() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(17), "proven_lshr", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -552,7 +631,9 @@ fn build_shift_with_in_range_proof() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -562,11 +643,14 @@ fn build_shift_with_in_range_proof() -> (TrustIrFunction, TrustIrModule) {
 /// and potentially GPU/ANE dispatch.
 fn build_pure_function() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(8), "pure_add", ft_id, BlockId::new(0));
     func.proofs = vec![ProofAnnotation::Pure];
     func.blocks = vec![TrustIrBlock {
@@ -585,7 +669,9 @@ fn build_pure_function() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -598,11 +684,14 @@ fn build_pure_function() -> (TrustIrFunction, TrustIrModule) {
 ///   bb3: return result
 fn build_diamond_cfg() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(9), "diamond", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0: compare and branch
@@ -681,7 +770,87 @@ fn build_diamond_cfg() -> (TrustIrFunction, TrustIrModule) {
             })],
         },
     ];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
+    (func, module)
+}
+
+/// Exact F1 source shape: `(x == y) as u32` / `(x < y) as u32` represented as
+/// a TrustIR branch diamond whose two edges pass constants into a join block.
+fn build_word_bool_cmp(name: &str, op: ICmpOp) -> (TrustIrFunction, TrustIrModule) {
+    let mut module = TrustIrModule::new(name);
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::U32, Ty::U32],
+            returns: vec![Ty::U32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let mut func = TrustIrFunction::new(FuncId::new(90), name, ft_id, BlockId::new(0));
+    func.blocks = vec![
+        TrustIrBlock {
+            id: BlockId::new(0),
+            params: vec![(ValueId::new(0), Ty::U32), (ValueId::new(1), Ty::U32)],
+            body: vec![
+                InstrNode::new(Inst::ICmp {
+                    op,
+                    ty: Ty::U32,
+                    lhs: ValueId::new(0),
+                    rhs: ValueId::new(1),
+                })
+                .with_result(ValueId::new(3)),
+                InstrNode::new(Inst::CondBr {
+                    cond: ValueId::new(3),
+                    then_target: BlockId::new(1),
+                    then_args: vec![],
+                    else_target: BlockId::new(2),
+                    else_args: vec![],
+                }),
+            ],
+        },
+        TrustIrBlock {
+            id: BlockId::new(1),
+            params: vec![],
+            body: vec![
+                InstrNode::new(Inst::Const {
+                    ty: Ty::U32,
+                    value: Constant::Int(1),
+                })
+                .with_result(ValueId::new(4)),
+                InstrNode::new(Inst::Br {
+                    target: BlockId::new(3),
+                    args: vec![ValueId::new(4)],
+                }),
+            ],
+        },
+        TrustIrBlock {
+            id: BlockId::new(2),
+            params: vec![],
+            body: vec![
+                InstrNode::new(Inst::Const {
+                    ty: Ty::U32,
+                    value: Constant::Int(0),
+                })
+                .with_result(ValueId::new(5)),
+                InstrNode::new(Inst::Br {
+                    target: BlockId::new(3),
+                    args: vec![ValueId::new(5)],
+                }),
+            ],
+        },
+        TrustIrBlock {
+            id: BlockId::new(3),
+            params: vec![(ValueId::new(2), Ty::U32)],
+            body: vec![InstrNode::new(Inst::Return {
+                values: vec![ValueId::new(2)],
+            })],
+        },
+    ];
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -771,13 +940,107 @@ fn test_pipeline_diamond_cfg_compiles() {
     assert_valid_macho(&obj_bytes, "diamond");
 
     // Also verify the LIR structure has the expected 4 blocks.
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate diamond");
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate diamond");
     assert_eq!(
         lir_func.blocks.len(),
         4,
         "diamond should have 4 blocks (entry, if, else, merge)"
     );
+}
+
+#[test]
+fn test_f1_word_boolean_diamonds_reach_cset_through_real_o3_pipeline() {
+    use trust_cg_ir::regs::W0;
+    use trust_cg_ir::{AArch64Opcode, MachOperand};
+    use trust_cg_lower::instructions::Block as LirBlock;
+
+    for (name, op, expected_cc) in [
+        ("eq_word_u32", ICmpOp::Eq, 0_i64),
+        ("ult_word_u32", ICmpOp::Ult, 3_i64),
+    ] {
+        let (trust_ir_func, module) = build_word_bool_cmp(name, op);
+
+        // Pin the adapter seam: each constant remains on its own LIR edge and
+        // the join argument is made explicit as `Iconst; Copy; Jump`. ISel
+        // maps that directly to `Movz; MovR; B`; the machine pass must
+        // recognize this real shape rather than a hand-written one-instruction
+        // approximation.
+        let (lir, _) = trust_cg_lower::translate_function_with_license(
+            &trust_ir_func,
+            &module,
+            &permit_unlicensed(),
+        )
+        .expect("F1 comparison diamond must lower to LIR");
+        for arm in [LirBlock(1), LirBlock(2)] {
+            let instructions = &lir.blocks[&arm].instructions;
+            assert_eq!(
+                instructions.len(),
+                3,
+                "{name}: expected const + join copy + jump: {instructions:#?}"
+            );
+            assert!(matches!(instructions[0].opcode, LirOpcode::Iconst { .. }));
+            assert_eq!(instructions[1].opcode, LirOpcode::Copy);
+            assert!(matches!(instructions[2].opcode, LirOpcode::Jump { .. }));
+            assert_eq!(
+                instructions[1].args.len(),
+                1,
+                "{name}: the join value must feed the explicit LIR edge copy"
+            );
+        }
+
+        let machine = prepare_trust_ir_via_pipeline(&trust_ir_func, &module, OptLevel::O3)
+            .unwrap_or_else(|error| panic!("{name}: real O3 pipeline failed: {error}"));
+        let live_insts: Vec<_> = machine
+            .block_order
+            .iter()
+            .flat_map(|&block| machine.block(block).insts.iter().copied())
+            .map(|inst_id| machine.inst(inst_id))
+            .collect();
+        let csets: Vec<_> = live_insts
+            .iter()
+            .copied()
+            .filter(|inst| inst.opcode == AArch64Opcode::CSet)
+            .collect();
+        assert_eq!(
+            csets.len(),
+            1,
+            "{name}: expected one final CSET: {machine:#?}"
+        );
+        assert_eq!(
+            csets[0].operands.get(1),
+            Some(&MachOperand::Imm(expected_cc)),
+            "{name}: CSET must preserve the source comparison predicate"
+        );
+        assert_eq!(
+            csets[0].operands.first(),
+            Some(&MachOperand::PReg(W0)),
+            "{name}: CSET must write the u32 ABI return register directly: {machine:#?}"
+        );
+        assert!(
+            live_insts
+                .iter()
+                .all(|inst| inst.opcode != AArch64Opcode::Uxtw),
+            "{name}: direct CSET return must not retain the final UXTW/mov: {machine:#?}"
+        );
+        assert!(
+            live_insts.iter().all(|inst| {
+                !matches!(
+                    inst.opcode,
+                    AArch64Opcode::BCond
+                        | AArch64Opcode::Cbz
+                        | AArch64Opcode::Cbnz
+                        | AArch64Opcode::Tbz
+                        | AArch64Opcode::Tbnz
+                )
+            }),
+            "{name}: the boolean materialization must not retain a branch diamond: {machine:#?}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -794,8 +1057,12 @@ fn test_pipeline_loop_compiles() {
     assert_valid_macho(&obj_bytes, "count_down");
 
     // count_down has 4 blocks (entry, loop header, exit, loop body).
-    let (lir_func, _) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate count_down");
+    let (lir_func, _) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate count_down");
     assert!(
         lir_func.blocks.len() >= 4,
         "count_down should have at least 4 blocks, got {}",
@@ -819,8 +1086,12 @@ fn test_pipeline_proof_annotation_no_overflow() {
     assert_valid_macho(&obj_bytes, "proven_add");
 
     // Verify the proof context was extracted by the adapter.
-    let (_, proof_ctx) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate proven_add");
+    let (_, proof_ctx) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate proven_add");
     assert!(
         !proof_ctx.value_proofs.is_empty(),
         "proof context should contain extracted NoOverflow proof"
@@ -841,8 +1112,12 @@ fn test_pipeline_no_overflow_claim_remains_report_only_without_replay_authority(
             .all(|inst| inst.proof != Some(trust_cg_ir::ProofAnnotation::NoSignedOverflow)),
         "a public NoOverflow label must not become machine-level rewrite authority"
     );
-    let (_, proof_ctx) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should preserve report-only proof metadata");
+    let (_, proof_ctx) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should preserve report-only proof metadata");
     assert!(
         !proof_ctx.value_proofs.is_empty(),
         "the claim should remain observable for reporting/replay binding"
@@ -852,8 +1127,12 @@ fn test_pipeline_no_overflow_claim_remains_report_only_without_replay_authority(
 #[test]
 fn test_pipeline_bounded_output_proof_does_not_bind_as_in_bounds() {
     let (trust_ir_func, module) = build_add_with_bounded_output_proof();
-    let (_, proof_ctx) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate bounded_add");
+    let (_, proof_ctx) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate bounded_add");
 
     assert!(
         proof_ctx
@@ -881,8 +1160,12 @@ fn test_pipeline_bounded_output_proof_does_not_bind_as_in_bounds() {
 #[test]
 fn test_pipeline_in_bounds_claim_keeps_exact_runtime_guard_without_replay_authority() {
     let (trust_ir_func, module) = build_array_extract_with_in_bounds_proof();
-    let (_, proof_ctx) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate proven_extract");
+    let (_, proof_ctx) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate proven_extract");
 
     assert!(
         proof_ctx.value_proofs.values().flatten().any(|proof| {
@@ -1251,7 +1534,7 @@ fn test_compiler_metrics_surface_valid_shift_proof_optimization() {
 #[test]
 fn test_jit_metrics_surface_proof_optimization_summary() {
     let (_, module) = build_div_with_nonzero_proof();
-    let compiler = macho_compiler(CompilerConfig {
+    let compiler = host_jit_compiler(CompilerConfig {
         opt_level: OptLevel::O2,
         target: trust_cg_codegen::Target::Aarch64,
         parallel: false,
@@ -1272,6 +1555,56 @@ fn test_jit_metrics_surface_proof_optimization_summary() {
     assert_eq!(metrics.certificate_count, 0);
     assert_eq!(metrics.guard_eliminated_count, 0);
     assert_eq!(metrics.non_zero_divisor_guard_eliminated_count, 0);
+}
+
+/// The Mach-O pin is the host JIT spec only on macOS. On macOS the public JIT
+/// API must compile with it. On any other AArch64 host it must refuse the pin
+/// by name before generating code, reporting the requested and host specs.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_jit_admits_the_macho_pin_only_as_the_host_spec() {
+    use trust_cg_codegen::target::TargetSpec;
+
+    let (_, module) = build_div_with_nonzero_proof();
+    let compiler = macho_compiler(CompilerConfig {
+        opt_level: OptLevel::O2,
+        target: trust_cg_codegen::Target::Aarch64,
+        parallel: false,
+        ..CompilerConfig::default()
+    });
+    let requested = macho_target_spec();
+    let host = TargetSpec::host();
+    let outcome = compiler.compile_module_to_jit(&module, &std::collections::HashMap::new());
+
+    if requested == host {
+        let result =
+            outcome.expect("on a Darwin host the Mach-O pin is the host JIT spec and must compile");
+        assert_eq!(
+            result.metrics.proof_optimizations.certificate_count,
+            result.proof_optimization_certificates.len()
+        );
+        return;
+    }
+    eprintln!(
+        "host JIT spec is {}, not {}: expecting the named cross-OS/ABI JIT refusal",
+        host.triple(),
+        requested.triple()
+    );
+    match outcome {
+        Err(CompileError::JitTargetSpecMismatch {
+            requested: reported_requested,
+            host: reported_host,
+        }) => {
+            assert_eq!(reported_requested, requested);
+            assert_eq!(reported_host, host);
+        }
+        Err(other) => panic!("expected JitTargetSpecMismatch for the Mach-O pin, got {other:?}"),
+        Ok(_) => panic!(
+            "the public JIT API installed {} code on a {} host",
+            requested.triple(),
+            host.triple()
+        ),
+    }
 }
 
 #[test]
@@ -1467,12 +1800,16 @@ fn build_multi_function_module(
         let new_ft_id = if let Some(pos) = registered_fts.iter().position(|ft| ft == src_ft) {
             FuncTyId::new(pos as u32)
         } else {
-            let id = module.add_func_type(src_ft.clone());
+            let id = module
+                .add_func_type(src_ft.clone())
+                .expect("Module::add_func_type: test fixture");
             registered_fts.push(src_ft.clone());
             id
         };
         func.ty = new_ft_id;
-        module.add_function(func);
+        module
+            .try_add_function(func)
+            .expect("Module::try_add_function: test fixture");
     }
     module
 }
@@ -1523,7 +1860,7 @@ fn test_pipeline_dispatch_verify_fallback_mode() {
         opt_level: OptLevel::O2,
         emit_debug: false,
         verify_dispatch: DispatchVerifyMode::FallbackOnFailure,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
 
     let pipeline = Pipeline::new(config);
@@ -1534,8 +1871,12 @@ fn test_pipeline_dispatch_verify_fallback_mode() {
 
     // Compile a function through this pipeline configuration.
     let (trust_ir_func, module) = build_simple_add();
-    let (lir_func, _) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate simple_add");
+    let (lir_func, _) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate simple_add");
 
     let obj_bytes = pipeline
         .compile_function(&lir_func)
@@ -1553,13 +1894,17 @@ fn test_pipeline_dispatch_verify_off_mode() {
         opt_level: OptLevel::O0,
         emit_debug: false,
         verify_dispatch: DispatchVerifyMode::Off,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
 
     let pipeline = Pipeline::new(config);
     let (trust_ir_func, module) = build_simple_add();
-    let (lir_func, _) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate simple_add");
+    let (lir_func, _) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate simple_add");
 
     let obj_bytes = pipeline
         .compile_function(&lir_func)
@@ -1577,13 +1922,17 @@ fn test_pipeline_with_debug_info() {
         opt_level: OptLevel::O0,
         emit_debug: true,
         verify_dispatch: DispatchVerifyMode::Off,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
 
     let pipeline = Pipeline::new(config);
     let (trust_ir_func, module) = build_simple_add();
-    let (lir_func, _) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate simple_add");
+    let (lir_func, _) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate simple_add");
 
     let obj_bytes = pipeline
         .compile_function(&lir_func)
@@ -1597,11 +1946,15 @@ fn test_pipeline_with_debug_info() {
         opt_level: OptLevel::O0,
         emit_debug: false,
         verify_dispatch: DispatchVerifyMode::Off,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
     let pipeline_no_debug = Pipeline::new(config_no_debug);
-    let (lir_func2, _) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate simple_add again");
+    let (lir_func2, _) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate simple_add again");
     let obj_bytes_no_debug = pipeline_no_debug
         .compile_function(&lir_func2)
         .expect("pipeline without debug should compile");
@@ -1678,7 +2031,7 @@ fn test_compiler_api_optimization_pass_metrics() {
 
 #[test]
 fn test_pipeline_default_config() {
-    let config = PipelineConfig::default();
+    let config = PipelineConfig::for_target("aarch64-apple-darwin");
     assert_eq!(config.opt_level, OptLevel::O2);
     assert!(!config.emit_debug);
     assert_eq!(
@@ -1696,8 +2049,12 @@ fn test_compile_to_object_convenience() {
     use trust_cg_codegen::pipeline::compile_to_object;
 
     let (trust_ir_func, module) = build_simple_add();
-    let (lir_func, _) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should translate simple_add");
+    let (lir_func, _) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should translate simple_add");
 
     let obj_bytes =
         compile_to_object(&lir_func, OptLevel::O2).expect("compile_to_object should succeed");
@@ -1886,4 +2243,13 @@ fn test_multi_function_module_differs_from_single() {
         !symbols_one.contains(&"_return_const".to_string()),
         "single-function module should not contain _return_const"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

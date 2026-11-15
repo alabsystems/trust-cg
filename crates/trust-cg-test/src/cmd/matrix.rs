@@ -224,18 +224,13 @@ fn path_arg_for_bash(path: &Path) -> OsString {
     }
 }
 
+/// The directory of the Trust package's `targo` (and `trustc`), so the login
+/// shell the matrix script runs in finds them first. There is no stock
+/// `~/.cargo/bin` fallback.
 fn cargo_bin_for_bash() -> OsString {
-    which("cargo")
-        .or_else(|| which("cargo.exe"))
+    which("targo")
+        .or_else(|| which("targo.exe"))
         .and_then(|path| path.parent().map(path_arg_for_bash))
-        .or_else(|| {
-            std::env::var_os("USERPROFILE").map(|home| {
-                let mut path = PathBuf::from(home);
-                path.push(".cargo");
-                path.push("bin");
-                path_arg_for_bash(&path)
-            })
-        })
         .unwrap_or_else(|| OsString::from("/usr/bin"))
 }
 

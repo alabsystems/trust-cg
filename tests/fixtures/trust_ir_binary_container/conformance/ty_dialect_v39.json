@@ -1,0 +1,127 @@
+{
+  "name": "ty_dialect_v39",
+  "functions": [
+    {
+      "id": 0,
+      "name": "nominal_identity",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Dialect": {
+                  "namespace": "example",
+                  "name": "value",
+                  "version": 1
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Dialect": {
+                      "namespace": "example",
+                      "name": "value",
+                      "version": 1
+                    }
+                  },
+                  "operand": 0
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "Dialect": {
+            "namespace": "example",
+            "name": "value",
+            "version": 1
+          }
+        }
+      ],
+      "returns": [
+        {
+          "Dialect": {
+            "namespace": "example",
+            "name": "value",
+            "version": 1
+          }
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

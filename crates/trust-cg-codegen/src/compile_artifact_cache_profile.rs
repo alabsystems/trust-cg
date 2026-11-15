@@ -37,13 +37,13 @@ pub const COMPILE_ARTIFACT_PROFILE_USE_DISABLED_SHA256: &str =
 ///
 /// Proof-authoritative partitions require an explicit source-lock identity instead.
 pub const COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY: &str =
-    "trust_ir:cf5a6eaecea7d7a36f0d89c63e36882b787b770d";
+    "trust_ir:a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87";
 
 /// AY revision identity used by unchecked production cache partitions.
 ///
 /// Proof-authoritative partitions require an explicit source-lock identity instead.
 pub const COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY: &str =
-    "ay:5d586a5c2035e94c3f6ad00028e21ae5529cd2f3";
+    "ay:9dfa20b5790b03c8ffe57fbbe67316ece665c5be";
 
 /// Maximum manifest size accepted when replaying a local compile artifact cache entry.
 pub const COMPILE_ARTIFACT_CACHE_MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -1621,17 +1621,32 @@ mod tests {
 
         let root_manifest = include_str!("../../../Cargo.toml");
         let trust_ir_revision_field = format!("rev = \"{trust_ir_revision}\"");
-        let trust_ir_rows = root_manifest
+        // Every root-manifest line that names the trust-ir repository (the
+        // `trust-ir` and `trust-ir-build` pins and the dev-only
+        // `trust-ir-conformance` corpus runner) carries the cache identity's
+        // revision: the count is derived, never pinned, so a fourth line
+        // cannot split the cohort unnoticed and a renumbering here is not a
+        // textual conflict.
+        let trust_ir_lines: Vec<&str> = root_manifest
             .lines()
             .filter(|line| {
-                line.contains("https://github.com/alabsystems/trust-ir.git")
-                    && line.contains(&trust_ir_revision_field)
+                // Dependency declarations only: the manifest's comments quote
+                // the same URL when they describe the local `[patch]` lanes.
+                !line.trim_start().starts_with('#')
+                    && line.contains("git = \"https://github.com/alabsystems/trust-ir.git\"")
             })
-            .count();
-        assert_eq!(
-            trust_ir_rows, 2,
-            "unchecked TrustIR cache identity must match both root manifest pins"
+            .collect();
+        assert!(
+            trust_ir_lines.len() >= 2,
+            "the root manifest pins at least trust-ir and trust-ir-build"
         );
+        for line in &trust_ir_lines {
+            assert!(
+                line.contains(&trust_ir_revision_field),
+                "unchecked TrustIR cache identity must match every root manifest trust-ir pin; \
+                 this line does not carry it: {line}"
+            );
+        }
 
         let regalloc_manifest = include_str!("../../trust-cg-regalloc/Cargo.toml");
         let ay_revision_field = format!("rev = \"{ay_revision}\"");

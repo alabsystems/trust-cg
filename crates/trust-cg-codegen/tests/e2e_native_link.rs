@@ -7,10 +7,9 @@
 // with our native linker (no system ld, no cc), write to disk, execute it,
 // and assert the exit code.
 //
-// This is the first test that actually proves the native linker produces a
-// runnable binary end-to-end. All other linker tests are structural (asserting
-// bytes and header fields); this one runs the binary via fork+exec and checks
-// the exit code from the operating system.
+// These tests run the linked binaries and require the expected exit status.
+// A loader refusal, signal, or timeout is a failure, not an accepted prototype
+// gap. Linker unit tests separately execute imported calls and distant BSS.
 //
 // The minimal program used is a direct Darwin syscall sequence:
 //
@@ -27,8 +26,8 @@
 // Part of #328; mapped-header follow-up tracked by #653.
 
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+mod common;
+use common::rosetta::{codegen_run_timeout, run_executable_with_timeout};
 
 use trust_cg_codegen::macho::linker::{DylibConfig, MachOParser, link, link_with_dylibs};
 use trust_cg_codegen::macho::reloc::Relocation;
@@ -42,11 +41,11 @@ fn is_macos_aarch64() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("trust_cg_e2e_native_link_{}", name));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+fn temp_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("trust_cg_e2e_native_link_{name}_"))
+        .tempdir()
+        .expect("create owned temp dir")
 }
 
 /// Build the AArch64 machine code for the minimal exit(42) program.
@@ -90,11 +89,10 @@ enum RunOutcome {
 }
 
 /// Write the linked bytes to a file, chmod +x, and try to execute it.
-/// Returns a classified outcome instead of panicking so tests can assert on
-/// the precise T3 gap until the full dyld-ready emitter lands.
+/// Return a classified outcome with bounded execution and owned scratch files.
 fn run_linked_binary(exe_bytes: &[u8], test_name: &str) -> RunOutcome {
     let dir = temp_dir(test_name);
-    let exe_path = dir.join("a.out");
+    let exe_path = dir.path().join("a.out");
     fs::write(&exe_path, exe_bytes).expect("write executable");
 
     // chmod +x.
@@ -106,19 +104,23 @@ fn run_linked_binary(exe_bytes: &[u8], test_name: &str) -> RunOutcome {
         fs::set_permissions(&exe_path, perms).expect("chmod");
     }
 
-    let output = match Command::new(&exe_path).output() {
+    let output = match run_executable_with_timeout(&exe_path, codegen_run_timeout()) {
         Ok(o) => o,
         Err(e) => return RunOutcome::SpawnFailed(e),
     };
+    assert!(
+        !output.timed_out,
+        "native-linked executable timed out: {test_name}"
+    );
 
-    if let Some(code) = output.status.code() {
+    if let Some(code) = output.output.status.code() {
         return RunOutcome::Exited(code);
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = output.status.signal() {
+        if let Some(sig) = output.output.status.signal() {
             return RunOutcome::Signal(sig);
         }
     }
@@ -130,69 +132,55 @@ fn run_linked_binary(exe_bytes: &[u8], test_name: &str) -> RunOutcome {
 // T1 prototype tests
 // ---------------------------------------------------------------------------
 
-/// Assert the outcome is one of:
-///  (a) Exited(42) — success (ideal; reached once T3 dyld-ready metadata lands).
-///  (b) SpawnFailed with ENOEXEC/EBADARCH — the kernel rejected the binary
-///      because a remaining dyld/kernel validator requirement is still
-///      missing. This is the documented T3 gap; the test passes so the
-///      regression check remains green once T3 lands, and the assertion message
-///      records the exact kernel errno for progress tracking.
-///  (c) Signal — the kernel / dyld killed the process after accepting it,
-///      also mapped to the T3 gap.
-///
-/// Any other outcome (wrong exit code, unexpected spawn error) is a failure.
+/// Native execution evidence requires the exact exit status.
 #[track_caller]
-fn assert_exit42_or_t3_gap(outcome: RunOutcome, label: &str) {
+fn assert_exit42(outcome: RunOutcome, label: &str) {
     match outcome {
-        RunOutcome::Exited(42) => {
-            // Ideal outcome — T3 is complete, linker produces dyld-ready binaries.
-        }
+        RunOutcome::Exited(42) => {}
         RunOutcome::Exited(code) => {
             panic!(
-                "[{}] binary ran but returned {} (expected 42 or T3-gap error); \
+                "[{}] binary ran but returned {} (expected 42); \
                  this is a regression — the linker produced runnable code but with \
                  wrong semantics.",
                 label, code
             );
         }
         RunOutcome::SpawnFailed(err) => {
-            // Accept ENOEXEC (8), EBADARCH (86), "Bad executable" (85 on macOS),
-            // or generic "Exec format error" from the kernel. After ad-hoc
-            // LC_CODE_SIGNATURE emission these identify the next concrete
-            // dyld/kernel validator gap.
-            let raw = err.raw_os_error();
-            let kind = err.kind();
-            let accept = matches!(raw, Some(8) | Some(85) | Some(86))
-                || kind == std::io::ErrorKind::InvalidData
-                || kind == std::io::ErrorKind::PermissionDenied;
-            if !accept {
-                panic!(
-                    "[{}] unexpected spawn error: {} (raw={:?}, kind={:?})",
-                    label, err, raw, kind
-                );
-            }
-            eprintln!(
-                "[{}] T3-gap confirmed: kernel rejected binary (errno {:?}, {}). \
-                 Plain/dylib emitter now maps headers into __TEXT and includes __LINKEDIT-hosted \
-                 LC_DYLD_CHAINED_FIXUPS / LC_DYLD_EXPORTS_TRIE payloads and \
-                 an ad-hoc LC_CODE_SIGNATURE; remaining blocker is the next \
-                 dyld/kernel validation gap.",
-                label, raw, err
-            );
+            panic!("[{label}] native-linked executable failed to spawn: {err}");
         }
         #[cfg(unix)]
         RunOutcome::Signal(sig) => {
-            eprintln!(
-                "[{}] T3-gap confirmed: kernel/dyld killed the process with signal {}. \
-                 Next blocker is a post-signature dyld/kernel validation gap.",
-                label, sig
-            );
+            panic!("[{label}] native-linked executable was killed by signal {sig}");
         }
     }
 }
 
-/// End-to-end: build .o, link with `link()` (no dylibs), run, assert exit 42
-/// or documented T3 gap (remaining dyld/kernel validator work).
+#[test]
+fn native_execution_assertion_rejects_loader_failures_and_wrong_exits() {
+    assert_exit42(RunOutcome::Exited(42), "control");
+    assert!(
+        std::panic::catch_unwind(|| assert_exit42(RunOutcome::Exited(0), "wrong exit control"))
+            .is_err()
+    );
+    for errno in [8, 13] {
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_exit42(
+                    RunOutcome::SpawnFailed(std::io::Error::from_raw_os_error(errno)),
+                    "loader refusal control",
+                );
+            })
+            .is_err()
+        );
+    }
+    #[cfg(unix)]
+    assert!(
+        std::panic::catch_unwind(|| assert_exit42(RunOutcome::Signal(9), "signal control"))
+            .is_err()
+    );
+}
+
+/// End-to-end: build .o, link with `link()` (no dylibs), run, assert exit 42.
 ///
 /// This path uses the plain executable emitter (no LC_LOAD_DYLIB / __stubs / __got).
 /// The preflight slices add LC_LOAD_DYLINKER, LC_BUILD_VERSION, LC_UUID,
@@ -219,7 +207,7 @@ fn t1_exit42_native_link_no_dylib() {
     let exe_bytes = link(&[parsed]).expect("link");
     assert_preflight_load_commands(&exe_bytes, false);
     let outcome = run_linked_binary(&exe_bytes, "plain");
-    assert_exit42_or_t3_gap(outcome, "plain/no-dylib");
+    assert_exit42(outcome, "plain/no-dylib");
 }
 
 /// End-to-end with libSystem dylib config. Exercises `link_with_dylibs` path,
@@ -242,7 +230,7 @@ fn t1_exit42_native_link_with_libsystem() {
     let exe_bytes = link_with_dylibs(&[parsed], &config).expect("link_with_dylibs");
     assert_preflight_load_commands(&exe_bytes, false);
     let outcome = run_linked_binary(&exe_bytes, "libsystem");
-    assert_exit42_or_t3_gap(outcome, "libsystem");
+    assert_exit42(outcome, "libsystem");
 }
 
 /// End-to-end native linker proof for the remaining parent #328 runtime gap:
@@ -273,21 +261,20 @@ fn t1_multi_object_branch26_native_link_runs_exit42() {
     main_code.extend_from_slice(&svc_80.to_le_bytes());
     main_writer.add_text_section(&main_code);
     main_writer.add_symbol("_main", 1, 0, true).unwrap();
-    main_writer
+    let helper_id = main_writer
         .add_symbol("_exit42_helper", 0, 0, true)
         .unwrap();
+    let helper_index = main_writer.final_symbol_index(helper_id).unwrap().unwrap();
     main_writer
-        .add_relocation(0, Relocation::branch26(0, 1))
+        .add_relocation(0, Relocation::branch26(0, helper_index))
         .unwrap();
 
     let main_obj_bytes = main_writer.write().unwrap();
-    let mut main_obj = MachOParser::parse(&main_obj_bytes).expect("parse main .o");
-    let helper_idx = main_obj
-        .symbols
-        .iter()
-        .position(|s| s.name == "_exit42_helper")
-        .expect("_exit42_helper undefined symbol");
-    main_obj.sections[0].relocations[0].symbol_index = helper_idx as u32;
+    let main_obj = MachOParser::parse(&main_obj_bytes).expect("parse main .o");
+    assert_eq!(
+        main_obj.symbols[main_obj.sections[0].relocations[0].symbol_index as usize].name,
+        "_exit42_helper"
+    );
 
     let mut helper_writer = MachOWriter::new();
     helper_writer.add_text_section(&build_exit42_code());
@@ -622,7 +609,8 @@ fn assert_linkedit_payloads(exe: &[u8], commands: &[LoadCommand], expected_impor
     let segments = segment_commands(exe, commands);
     let linkedit = single_segment(&segments, "__LINKEDIT");
     let text = single_segment(&segments, "__TEXT");
-    let data = segments.iter().find(|seg| seg.name == "__DATA");
+    // Imported symbols are bound in the read-only-after-fixups GOT segment.
+    let got_segment = segments.iter().position(|seg| seg.name == "__DATA_CONST");
     assert_eq!(
         segments.last().map(|seg| seg.name.as_str()),
         Some("__LINKEDIT")
@@ -665,13 +653,14 @@ fn assert_linkedit_payloads(exe: &[u8], commands: &[LoadCommand], expected_impor
             assert_eq!(read_u32(exe, starts + 4 + idx * 4), 0);
         }
     } else {
-        let data_seg_offset = read_u32(exe, starts + 4 + 2 * 4) as usize;
-        assert_ne!(data_seg_offset, 0);
-        let data = data.expect("__DATA segment expected");
-        let seg_start = starts + data_seg_offset;
+        let got_segment = got_segment.expect("__DATA_CONST segment expected for imports");
+        let got_seg_offset = read_u32(exe, starts + 4 + got_segment * 4) as usize;
+        assert_ne!(got_seg_offset, 0);
+        let got = &segments[got_segment];
+        let seg_start = starts + got_seg_offset;
         assert_eq!(read_u32(exe, seg_start + 4) as u16, PAGE_SIZE as u16);
         assert_eq!(read_u32(exe, seg_start + 6) as u16, DYLD_CHAINED_PTR_64);
-        assert_eq!(read_u64(exe, seg_start + 8), data.vmaddr - text.vmaddr);
+        assert_eq!(read_u64(exe, seg_start + 8), got.vmaddr - text.vmaddr);
         assert_ne!(
             read_u32(exe, seg_start + 22) as u16,
             DYLD_CHAINED_PTR_START_NONE
@@ -718,26 +707,24 @@ fn linked_libsystem_exit_call() -> Vec<u8> {
     code.extend_from_slice(&bl_exit.to_le_bytes());
     writer.add_text_section(&code);
     writer.add_symbol("_main", 1, 0, true).unwrap();
-    writer.add_symbol("_exit", 0, 0, true).unwrap();
+    let exit_id = writer.add_symbol("_exit", 0, 0, true).unwrap();
+    let exit_index = writer.final_symbol_index(exit_id).unwrap().unwrap();
     writer
         .add_relocation(
             0,
-            trust_cg_codegen::macho::reloc::Relocation::branch26(4, 1),
+            trust_cg_codegen::macho::reloc::Relocation::branch26(4, exit_index),
         )
         .unwrap();
 
     let obj_bytes = writer.write().unwrap();
     let parsed = MachOParser::parse(&obj_bytes).unwrap();
-    let mut parsed_fixed = parsed.clone();
-    let exit_idx = parsed_fixed
-        .symbols
-        .iter()
-        .position(|s| s.name == "_exit")
-        .unwrap();
-    parsed_fixed.sections[0].relocations[0].symbol_index = exit_idx as u32;
+    assert_eq!(
+        parsed.symbols[parsed.sections[0].relocations[0].symbol_index as usize].name,
+        "_exit"
+    );
 
     let config = DylibConfig::with_libsystem();
-    link_with_dylibs(&[parsed_fixed], &config).unwrap()
+    link_with_dylibs(&[parsed], &config).unwrap()
 }
 
 fn assert_preflight_load_commands(exe: &[u8], expect_dylib: bool) {

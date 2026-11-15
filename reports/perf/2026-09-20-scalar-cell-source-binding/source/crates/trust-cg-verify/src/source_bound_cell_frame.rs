@@ -1,0 +1,343 @@
+// Author: Andrew Yates | Copyright 2026 Andrew Yates | Apache-2.0
+
+//! Bounded, independent byte transport across one scalar stack object and calls.
+//! This checker grants no proof credit. External calls share the source ABI
+//! contract: they can observe their arguments and the escaped source object,
+//! preserve callee-save registers, and cannot access unescaped frame storage.
+
+use trust_cg_ir::regs::{PReg, SpecialReg, X19, X20, X29, X30};
+use trust_cg_ir::{
+    AArch64Opcode as M, InstFlags, InstId, MachFunction, MachInst, MachOperand as O,
+};
+use trust_cg_lower::Function;
+
+use super::cell_source::values;
+use super::output_memory::{Byte, bytes};
+
+pub(super) struct CheckedCellFrame {
+    pub envelope: Vec<InstId>,
+    pub cell_width: usize,
+    pub calls: usize,
+}
+
+#[derive(Clone)]
+enum GeneralValue {
+    Unknown,
+    Address(i64),
+}
+
+fn register(operand: &O) -> Option<PReg> {
+    match operand {
+        O::PReg(reg) => Some(*reg),
+        _ => None,
+    }
+}
+
+fn fp(reg: PReg) -> Option<(usize, usize)> {
+    match reg.encoding() {
+        96..=127 => Some((usize::from(reg.encoding() - 96), 8)),
+        128..=159 => Some((usize::from(reg.encoding() - 128), 4)),
+        _ => None,
+    }
+}
+
+fn body_gpr(reg: PReg) -> Option<usize> {
+    matches!(reg.encoding(), 0..=17 | 19..=20).then_some(usize::from(reg.encoding()))
+}
+
+fn caller(reg: PReg) -> bool {
+    match reg.encoding() {
+        0..=18 | 30 | 32..=50 | 62 => true,
+        64..=95 => matches!(reg.encoding()-64, 0..=7 | 16..=31),
+        96..=127 => matches!(reg.encoding()-96, 0..=7 | 16..=31),
+        128..=159 => matches!(reg.encoding()-128, 0..=7 | 16..=31),
+        165..=196 => matches!(reg.encoding()-165, 0..=7 | 16..=31),
+        _ => false,
+    }
+}
+
+fn ordinary(inst: &MachInst) -> bool {
+    inst.implicit_defs.is_empty()
+        && inst.implicit_uses.is_empty()
+        && (inst.flags == MachInst::new(inst.opcode, Vec::new()).flags
+            || inst.flags
+                == (MachInst::new(inst.opcode, Vec::new()).flags | InstFlags::IS_CALL_ARG_SETUP))
+}
+
+fn inert(inst: &MachInst) -> bool {
+    let inert_register =
+        |reg| body_gpr(reg).is_some() || fp(reg).is_some_and(|(i, _)| i < 8 || i >= 16);
+    inst.opcode == M::Nop
+        && inst.implicit_defs.is_empty()
+        && inst.implicit_uses.iter().copied().all(inert_register)
+        && (matches!(inst.flags, InstFlags::EMPTY | InstFlags::IS_PSEUDO)
+            || inst.flags == (InstFlags::IS_PSEUDO | InstFlags::IS_CALL_ARG_SETUP))
+        && match inst.operands.as_slice() {
+            [] => true,
+            [O::PReg(a), O::PReg(b)] => a == b && inert_register(*a),
+            _ => false,
+        }
+}
+
+fn envelope(machine: &MachFunction, ids: &[InstId]) -> Option<Vec<InstId>> {
+    if ids.len() < 9 {
+        return None;
+    }
+    let pair = |a, b, offset| {
+        vec![
+            O::PReg(a),
+            O::PReg(b),
+            O::Special(SpecialReg::SP),
+            O::Imm(offset),
+        ]
+    };
+    let sp = |offset| {
+        vec![
+            O::Special(SpecialReg::SP),
+            O::Special(SpecialReg::SP),
+            O::Imm(offset),
+        ]
+    };
+    let positions = [0, 1, 2, 3, ids.len() - 4, ids.len() - 3, ids.len() - 2];
+    let expected = [
+        (M::StpPreIndex, pair(X20, X19, -32)),
+        (M::StpRI, pair(X29, X30, 16)),
+        (
+            M::AddRI,
+            vec![O::PReg(X29), O::Special(SpecialReg::SP), O::Imm(16)],
+        ),
+        (M::SubRI, sp(16)),
+        (M::AddRI, sp(16)),
+        (M::LdpRI, pair(X29, X30, 16)),
+        (M::LdpPostIndex, pair(X20, X19, 32)),
+    ];
+    for (position, (opcode, operands)) in positions.iter().zip(expected) {
+        if !super::exact_instruction(
+            machine.insts.get(ids[*position].0 as usize)?,
+            opcode,
+            &operands,
+        ) {
+            return None;
+        }
+    }
+    Some(positions.map(|p| ids[p]).to_vec())
+}
+
+pub(super) fn check(
+    source: &Function,
+    machine: &MachFunction,
+    ids: &[InstId],
+) -> Option<CheckedCellFrame> {
+    use trust_cg_ir::function::{StackProtectorMode, StackSlotAllocationKind, Type};
+    let contract = values::contract(source)?;
+    let ty = if contract.width == 4 {
+        Type::F32
+    } else {
+        Type::F64
+    };
+    if source.name != machine.name
+        || machine.signature.params != vec![ty.clone(); contract.parameters]
+        || machine.signature.returns != [ty]
+        || machine.stack_slots.len() != 1
+        || machine.stack_slots[0].size != contract.width as u32
+        || machine.stack_slots[0].align != contract.width as u32
+        || machine.stack_slots[0].allocation != StackSlotAllocationKind::Fixed
+        || machine.eh_metadata.has_eh_info()
+        || machine.stack_protector != StackProtectorMode::None
+        || machine.stack_protector_slot.is_some()
+        || !machine.jump_tables.is_empty()
+    {
+        return None;
+    }
+    let envelope = envelope(machine, ids)?;
+    let mut gpr = vec![GeneralValue::Unknown; 31];
+    gpr[29] = GeneralValue::Address(-16);
+    let mut fpr: Vec<Vec<Byte>> = (0..32)
+        .map(|i| bytes(8, |b| Byte::Register(96 + i, b)))
+        .collect();
+    for (i, reg) in fpr.iter_mut().enumerate().take(contract.parameters) {
+        reg[..contract.width].clone_from_slice(&bytes(contract.width, |b| Byte::Parameter(i, b)));
+    }
+    let cell_address = -32 - contract.width as i64;
+    let mut cell = None;
+    let mut calls = 0;
+    for id in &ids[4..ids.len() - 4] {
+        let inst = machine.insts.get(id.0 as usize)?;
+        if inert(inst) {
+            continue;
+        }
+        if inst.opcode == M::Bl {
+            let [O::Symbol(symbol)] = inst.operands.as_slice() else {
+                return None;
+            };
+            let expected = contract.calls.get(calls)?;
+            if inst.flags != MachInst::new(M::Bl, Vec::new()).flags
+                || !inst.implicit_defs.iter().copied().all(caller)
+                || inst.implicit_uses
+                    != [
+                        PReg::new(0),
+                        PReg::new(if contract.width == 4 { 128 } else { 96 }),
+                    ]
+                || *symbol != expected.name
+                || !matches!(gpr[0],GeneralValue::Address(a) if a==cell_address)
+                || cell.as_ref()? != &expected.cell_before
+                || fpr[0][..contract.width] != expected.argument
+            {
+                return None;
+            }
+            cell = Some(bytes(contract.width, |b| Byte::Call(calls, b)));
+            for reg in &mut gpr[..19] {
+                *reg = GeneralValue::Unknown;
+            }
+            gpr[30] = GeneralValue::Unknown;
+            for (i, reg) in fpr.iter_mut().enumerate() {
+                if i < 8 || i >= 16 {
+                    *reg = bytes(8, |b| Byte::Clobber(calls, 96 + i as u8, b));
+                }
+            }
+            calls += 1;
+            continue;
+        }
+        if !ordinary(inst) {
+            return None;
+        }
+        match (inst.opcode, inst.operands.as_slice()) {
+            (M::MOVXrr, [O::PReg(dst), O::PReg(src)]) => {
+                gpr[body_gpr(*dst)?] = gpr.get(usize::from(src.encoding()))?.clone();
+            }
+            (M::AddRI | M::SubRI, [O::PReg(dst), O::PReg(src), O::Imm(offset)])
+                if (0..4096).contains(offset) =>
+            {
+                let GeneralValue::Address(base) = gpr.get(usize::from(src.encoding()))? else {
+                    return None;
+                };
+                let address = if inst.opcode == M::AddRI {
+                    base.checked_add(*offset)?
+                } else {
+                    base.checked_sub(*offset)?
+                };
+                gpr[body_gpr(*dst)?] = GeneralValue::Address(address);
+            }
+            (M::NeonOrrV, [O::PReg(dst), O::PReg(left), O::PReg(right), O::Imm(1)])
+                if left == right =>
+            {
+                let (d, w) = fp(*dst)?;
+                let (s, sw) = fp(*left)?;
+                if w != sw || !(d < 8 || d >= 16) {
+                    return None;
+                }
+                fpr[d] = fpr[s].clone();
+            }
+            (M::StrRI | M::LdrRI, [data, O::PReg(base), O::Imm(0)]) => {
+                let (index, width) = fp(register(data)?)?;
+                if width != contract.width
+                    || !(index < 8 || index >= 16)
+                    || !matches!(gpr.get(usize::from(base.encoding()))?,GeneralValue::Address(a) if *a==cell_address)
+                {
+                    return None;
+                }
+                if inst.opcode == M::StrRI {
+                    cell = Some(fpr[index][..width].to_vec());
+                } else {
+                    fpr[index] = bytes(8, |_| Byte::Constant(0));
+                    fpr[index][..width].clone_from_slice(cell.as_ref()?);
+                }
+            }
+            _ => return None,
+        }
+    }
+    let ret = machine.insts.get(ids.last()?.0 as usize)?;
+    if ret.opcode != M::Ret
+        || ret.operands != [O::PReg(X30)]
+        || ret.flags != MachInst::new(M::Ret, Vec::new()).flags
+        || !ret.implicit_defs.is_empty()
+        || ret.implicit_uses != [PReg::new(if contract.width == 4 { 128 } else { 96 })]
+        || calls != contract.calls.len()
+        || cell? != contract.cell_after
+        || fpr[0][..contract.width] != contract.result
+    {
+        return None;
+    }
+    Some(CheckedCellFrame {
+        envelope,
+        cell_width: contract.width,
+        calls,
+    })
+}
+
+/// The stack-local algebra after framing a conforming external call's public
+/// effects. The byte interpreter must separately establish that private saves
+/// do not escape and that source/machine call observations coincide. This
+/// formula alone grants no permission to assume a callback preserves memory.
+pub(super) fn obligation(width: usize) -> crate::lowering_proof::ProofObligation {
+    use crate::lowering_proof::{MachineSideProvenance, ProofObligation, TransvalCheckKind};
+    use crate::memory_proofs::{encode_load_le, encode_store_le, memory_sort};
+    use crate::smt::SmtExpr as E;
+    assert!(matches!(width, 4 | 8));
+    let sp = E::var("entry_sp", 64);
+    let address = |below| sp.clone().bvsub(E::bv_const(below, 64));
+    let original = E::uf("entry_memory", Vec::new(), memory_sort());
+    let saved = [
+        ("entry_x20", 32),
+        ("entry_x19", 24),
+        ("entry_fp", 16),
+        ("entry_lr", 8),
+    ];
+    let mut memory = original.clone();
+    for (name, below) in saved {
+        memory = encode_store_le(&memory, &address(below), &E::var(name, 64), 8);
+    }
+    let cell = address(32 + width as u64);
+    let before = E::var("cell_before", (width * 8) as u32);
+    let after = E::var("cell_after", (width * 8) as u32);
+    memory = encode_store_le(&memory, &cell, &before, width as u32);
+    memory = encode_store_le(&memory, &cell, &after, width as u32);
+    let restored_sp = sp
+        .clone()
+        .bvsub(E::bv_const(32, 64))
+        .bvsub(E::bv_const(16, 64))
+        .bvadd(E::bv_const(16, 64))
+        .bvadd(E::bv_const(32, 64));
+    let mut complete = restored_sp.eq_expr(sp.clone());
+    for (name, below) in saved {
+        complete = complete
+            .and_expr(encode_load_le(&memory, &address(below), 8).eq_expr(E::var(name, 64)));
+    }
+    complete = complete.and_expr(encode_load_le(&memory, &cell, width as u32).eq_expr(after));
+    let observe = E::var("observe", 64);
+    let outside = observe
+        .clone()
+        .bvult(address(48))
+        .or_expr(observe.clone().bvuge(sp.clone()));
+    complete = complete.and_expr(
+        outside
+            .not_expr()
+            .or_expr(E::select(memory, observe.clone()).eq_expr(E::select(original, observe))),
+    );
+    let mut inputs = vec![("entry_sp".into(), 64), ("observe".into(), 64)];
+    inputs.extend(saved.map(|(name, _)| (name.into(), 64)));
+    inputs.extend([
+        ("cell_before".into(), (width * 8) as u32),
+        ("cell_after".into(), (width * 8) as u32),
+    ]);
+    ProofObligation {
+        name: format!(
+            "Source-bound AArch64 scalar cell: private saves and {}-bit payload",
+            width * 8
+        ),
+        trust_ir_expr: E::bool_const(true),
+        aarch64_expr: complete,
+        inputs,
+        preconditions: vec![
+            sp.clone().bvuge(E::bv_const(48, 64)),
+            sp.bvand(E::bv_const(15, 64)).eq_expr(E::bv_const(0, 64)),
+        ],
+        fp_inputs: Vec::new(),
+        category: Some(TransvalCheckKind::RegisterAllocation),
+        machine_side_provenance: MachineSideProvenance::StaticDb,
+    }
+}
+
+#[cfg(test)]
+#[path = "source_bound_cell_tests.rs"]
+mod tests;

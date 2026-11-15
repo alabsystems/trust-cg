@@ -1,0 +1,29 @@
+; TrustIr text format v1
+module "_RNvXCsZtHVlr1GGI_19s52_raii_guard_dropNtB2_7CounterNtNtNtCsiHPWGBzRfGA_4core3ops4drop4Drop4drop"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (&mut &mut u64) -> ()
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvXCsZtHVlr1GGI_19s52_raii_guard_dropNtB2_7CounterNtNtNtCsiHPWGBzRfGA_4core3ops4drop4Drop4drop(functy.0) {
+bb0(%1: &mut &mut u64):
+    %7 = load &mut u64, ptr %1
+    %8 = load u64, ptr %7
+    %10 = const u64 31
+    %9 = mul u64 %8, %10
+    %12 = const u64 7
+    %11 = add u64 %9, %12
+    %13 = load &mut u64, ptr %1
+    %14 = copy u64 %11
+    store u64 %14, ptr %13
+    ret
+}

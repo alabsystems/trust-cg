@@ -62,7 +62,6 @@
 //! (32 >= 18 for `[P; 2]`) and the shrink can only ever write further inside a
 //! slot than it did before — never past it. Pinned at the bottom.
 
-use trust_cg_lower::adapter::translate_function;
 use trust_cg_lower::instructions::Opcode;
 use trust_ir::{
     Block as TrustIrBlock, BlockId, Constant, FieldDef, FuncId, FuncTy, FuncTyId,
@@ -92,6 +91,7 @@ fn f(name: &str, ty: Ty) -> FieldDef {
 
 fn sdef(id: u32, name: &str, repr: StructRepr, fields: Vec<FieldDef>) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields,
@@ -151,25 +151,31 @@ fn module_with_body(params: Vec<(ValueId, Ty)>, body: Vec<InstrNode>) -> TrustIr
     module.types.push(p_arr2()); // TyId(1)
     module.types.push(nat_ty()); // TyId(2)
     module.structs = vec![packed_p(), natural_n()];
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: params.iter().map(|(_, t)| t.clone()).collect(),
-        returns: vec![],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: params.iter().map(|(_, t)| t.clone()).collect(),
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "k", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
         params,
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn lower(module: &TrustIrModule) -> trust_cg_lower::function::Function {
     let func = module.functions.first().expect("one function");
     let (lir_func, _proofs) =
-        translate_function(func, module).expect("adapter must lower the fixture");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter must lower the fixture");
     lir_func
 }
 
@@ -194,8 +200,8 @@ fn iconsts(opcodes: &[Opcode]) -> Vec<i64> {
         .collect()
 }
 
-/// Every `ArrayGep` element type in the emitted stream — empty means every
-/// stride was materialised explicitly.
+/// Every `ArrayGep` element type in the emitted stream. An I8 element uses
+/// the separately materialised byte offset, never the aggregate carrier size.
 fn array_geps(opcodes: &[Opcode]) -> Vec<String> {
     opcodes
         .iter()
@@ -237,10 +243,11 @@ fn extract_element_of_a_packed_element_strides_by_rustcs_size() {
         vec![9],
         "`size_of::<P>() == 9` in rustc; ExtractElement strode `Struct([I8, I64]).bytes()` = 16"
     );
-    assert!(
-        array_geps(&ops).is_empty(),
-        "ArrayGep cannot express a 9-byte stride for a 16-byte LIR carrier, so the \
-         arithmetic must be explicit; got {ops:?}"
+    assert_eq!(
+        array_geps(&ops),
+        vec!["I8"],
+        "the explicit 9-byte product is a byte offset; the 16-byte LIR carrier \
+         must never supply the stride; got {ops:?}"
     );
 }
 
@@ -271,21 +278,18 @@ fn insert_element_strides_and_copies_the_packed_extent() {
     );
     assert_eq!(
         iconsts(&ops),
-        vec![9, 9],
-        "the STRIDE (9) then the COPY LENGTH (9). A 16-byte copy at a 9-byte stride \
-         clobbers the next element; a 9-byte copy at a 16-byte stride leaves element 1 \
-         seven bytes stale"
+        vec![18, 9, 9],
+        "the VALUE COPY of the source array (its authoritative 18 bytes, not the natural \
+         32), then the STRIDE (9) then the COPY LENGTH (9). A 16-byte copy at a 9-byte \
+         stride clobbers the next element; a 9-byte copy at a 16-byte stride leaves \
+         element 1 seven bytes stale"
     );
 }
 
-/// SITE 3 — `translate_multi_index_gep`, BOTH steps.
-///
-/// `GEP { pointee_ty: [P; 2], indices: [i, j] }` strides the whole array then
-/// one element: rustc's 18 then 9, where trust-cg emitted the natural-C 32 then
-/// 16. The outer step is the case `explicit_element_stride` could not answer at
-/// all before, because the pointee is a `Ty::Array` and no `StructDef` backs it.
+/// Each index of a TrustIR GEP strides the entire pointee array. Its
+/// authoritative packed size is 18, while the natural-C carrier is 32.
 #[test]
-fn multi_index_gep_strides_both_levels_by_rustcs_sizes() {
+fn multi_index_gep_uses_the_same_packed_extent_for_every_index() {
     let module = module_with_body(
         vec![(v(0), Ty::Ptr), (v(1), Ty::I64), (v(2), Ty::I64)],
         vec![
@@ -302,15 +306,14 @@ fn multi_index_gep_strides_both_levels_by_rustcs_sizes() {
     let ops = opcodes(&module);
     assert_eq!(
         iconsts(&ops),
-        vec![18, 9],
-        "`size_of::<[P; 2]>() == 18` and `size_of::<P>() == 9`; trust-cg strode 32 then 16"
+        vec![18, 18],
+        "both indices stride `size_of::<[P; 2]>() == 18`"
     );
-    assert!(array_geps(&ops).is_empty(), "got {ops:?}");
+    assert_eq!(array_geps(&ops), vec!["I8", "I8"], "got {ops:?}");
 }
 
-/// SITE 3, nested — `[[P; 2]; 2]` steps 36, 18, 9. The extent of an array of
-/// arrays is only right if the element recursion bottoms out at the STRUCT
-/// authority rather than at the outermost LIR type.
+/// Nested array layout still resolves the packed element's authority, but
+/// GEP applies the resulting whole-array extent to every index.
 #[test]
 fn multi_index_gep_over_an_array_of_arrays_recurses_to_the_element_authority() {
     let module = module_with_body(
@@ -333,8 +336,8 @@ fn multi_index_gep_over_an_array_of_arrays_recurses_to_the_element_authority() {
     );
     assert_eq!(
         iconsts(&opcodes(&module)),
-        vec![36, 18, 9],
-        "rustc: `size_of::<[[P; 2]; 2]>() == 36`, `[P; 2]` 18, `P` 9"
+        vec![36, 36, 36],
+        "every index strides `size_of::<[[P; 2]; 2]>() == 36`"
     );
 }
 
@@ -343,7 +346,7 @@ fn multi_index_gep_over_an_array_of_arrays_recurses_to_the_element_authority() {
 /// `Inst::GEP` read it from byte 9.
 ///
 /// At an authoritative stride the whole element address is a compile-time
-/// constant, so it folds to one `Iconst` + `Iadd` — the same encoding the
+/// constant, so it uses one `Iconst` + byte-stride `ArrayGep` — the same encoding the
 /// packed/declared STRUCT branch of this arm already emits.
 #[test]
 fn aggregate_constant_places_array_elements_at_rustcs_offsets() {
@@ -369,7 +372,7 @@ fn aggregate_constant_places_array_elements_at_rustcs_offsets() {
         "rustc puts element 1 of `[P; 2]` at byte 9; this arm wrote it at 16 while \
          `GEP {{ pointee_ty: P }}` read it from 9"
     );
-    assert!(array_geps(&ops).is_empty(), "got {ops:?}");
+    assert_eq!(array_geps(&ops), vec!["I8"; 6], "got {ops:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +415,8 @@ fn every_path_addresses_element_one_of_the_same_array_at_the_same_byte() {
     );
     let extract_stride = iconsts(&opcodes(&extract));
 
-    // WRITE, InsertElement (first Iconst is the stride).
+    // WRITE, InsertElement (the first Iconst is the length of the value
+    // copy of the source array, the second the stride).
     let insert = module_with_body(
         vec![(v(0), p_arr2()), (v(1), Ty::I64), (v(2), p_ty())],
         vec![
@@ -426,7 +430,7 @@ fn every_path_addresses_element_one_of_the_same_array_at_the_same_byte() {
             ret(),
         ],
     );
-    let insert_stride = vec![iconsts(&opcodes(&insert))[0]];
+    let insert_stride = vec![iconsts(&opcodes(&insert))[1]];
 
     assert_eq!(read_stride, vec![9], "the path that was already correct");
     assert_eq!(extract_stride, read_stride, "READ/READ agreement");
@@ -483,7 +487,7 @@ fn arrays_of_natural_c_elements_still_use_arraygep() {
         array_geps(&ops),
         vec![
             "Array(Struct([I8, I64]), 2)".to_string(),
-            "Struct([I8, I64])".to_string(),
+            "Array(Struct([I8, I64]), 2)".to_string(),
         ],
         "both steps of a natural-C multi-index GEP keep ArrayGep, got {ops:?}"
     );
@@ -631,4 +635,13 @@ fn an_array_too_large_for_the_u32_carrier_is_refused_at_type_translation() {
     let lir = translate_type_with_tables(&many_small, &structs, &small_types)
         .expect("count is not the constraint; extent is");
     assert_eq!(lir.bytes(), 268_435_456);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

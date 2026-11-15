@@ -4,8 +4,9 @@
 # Copyright 2026 Andrew Yates | License: Apache-2.0
 #
 # Part of WS3 (differential fuzzing) in the "proving trust-cg replaces llvm" plan.
-# Three drivers:
+# Four drivers:
 #   - trust-ir-gen: generate random trust-ir, diff interpreter vs compile-pipeline
+#   - trust-ir-jit-diff: execute random trust-ir through the host JIT and sandbox
 #   - csmith-driver: external csmith → clang -O0 oracle vs Trust Codegen (via trust-ir)
 #   - yarpgen-driver: external yarpgen → same wrapping
 
@@ -28,6 +29,9 @@ trust-ir = { workspace = true }
 trust-ir-build = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 # Used by the JIT-diff harness to fork a sandbox child per JIT invocation so a

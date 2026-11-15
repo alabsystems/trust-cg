@@ -1,0 +1,23 @@
+; TrustIr text format v1
+module "_RNCNvCsqi0vjoYZO4_18s59_result_methods1f0B3_"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (i64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNCNvCsqi0vjoYZO4_18s59_result_methods1f0B3_(functy.0) {
+bb0(%2: i64):
+    %4 = bitcast i64 %2 to u64
+    %6 = const u64 255
+    %5 = and u64 %4, %6
+    ret %5
+}

@@ -1,9 +1,7 @@
 AtomicOperations	-> ldar	4	AtomicLoad_I8 -> LDARB
 Arithmetic	-> umull xd	1	Umull_RR -> UMULL Xd, Wn, Wm: Xd == zext64(Wn) * zext64(Wm)
 NeonLowering	absv.4s lanewise-intent	1	NEON AbsV.4S lanewise-intent == D-pair per-lane signed abs (faithful)
-Arithmetic	add	11	Iadd_I8 -> ADD (8-bit)
-MachOEmission	add(lsl#12) == tp	1	ELF AArch64: R_AARCH64_TLSLE_ADD_TPREL_HI12 ADD(LSL#12) == TP + (TPREL & 0xFFF000)
-MachOEmission	add;add == tp	2	ELF AArch64: R_AARCH64_TLSLE_ADD_TPREL_LO12_NC ADD;ADD == TP + (TPREL & 0xFFFFFF)
+Arithmetic	add	17	Iadd_I8 -> ADD (8-bit)
 BitwiseShift	add_lsl_shift_i32	5	Add_Lsl_Shift_I32 k=1 -> ADD (shifted LSL, 32-bit): base + src*2^k == base + (src<<k)
 BitwiseShift	add_lsr_shift_i32	5	Add_Lsr_Shift_I32 k=1 -> ADD (shifted LSR, 32-bit): base + src/2^k == base + (src>>u k)
 NeonLowering	addv.4s lanewise-intent	1	NEON AddV.4S lanewise-intent == D-pair per-lane bvadd (faithful)
@@ -25,16 +23,16 @@ NeonLowering	cmgev.4s lanewise-intent	1	NEON CmgeV.4S lanewise-intent == D-pair 
 NeonLowering	cmgtv.4s lanewise-intent	1	NEON CmgtV.4S lanewise-intent == D-pair per-lane sgt-mask (faithful)
 NeonLowering	cmhiv.4s lanewise-intent	1	NEON CmhiV.4S lanewise-intent == D-pair per-lane ugt-mask (faithful)
 NeonLowering	cmhsv.4s lanewise-intent	1	NEON CmhsV.4S lanewise-intent == D-pair per-lane uge-mask (faithful)
-Comparison	cmp	20	Icmp_Eq_I32 -> CMP+CSET_EQ
+Comparison	cmp	338	Icmp_Eq_I32 -> CMP+CSET_EQ
 NeonLowering	cntv.16b lanewise-intent	1	NEON CntV.16B lanewise-intent == D-pair per-byte popcount (faithful)
 Branch	condbr	20	CondBr_Eq_I32 -> CMP+B.EQ
+AtomicOperations	dmb_ish: orders	1	DMB_ISH: orders prior load before subsequent load
+AtomicOperations	dmb_ishld: orders	1	DMB_ISHLD: orders prior load before subsequent load
 BitwiseShift	eor_ror_shift_i32	5	Eor_Ror_Shift_I32 k=1 -> EOR (shifted ROR, 32-bit): frontend ROTL-XOR == shifted-register EOR-ROR
 NeonLowering	eorv.16b lanewise-intent	1	NEON EorV.16B lanewise-intent == whole-register bvxor (faithful)
 NeonLowering	extv.16b lanewise-intent	5	NEON ExtV.16B lanewise-intent #1 == D-pair byte-window extract (faithful)
 FloatingPoint	fabs	2	Fabs_F32 -> FABS Sd
 FloatingPoint	fadd	2	Fadd_F32 -> FADD Sd
-FloatingPoint	fcmp_ge	2	Fcmp_GE_F32 -> FCMP+CSET
-FloatingPoint	fcsel	12	Fcsel_F32 Equal -> CMP+FCSEL (S): trust_ir Select == bit-preserving FPR mux
 NeonLowering	fcvtl2v.2d lane0 fpext-intent	1	NEON Fcvtl2V.2d lane0 fpext-intent == high-half f32->f64 widen (EXACT fpext; FP semantics via shared model, see module docs)
 NeonLowering	fcvtlv.2d lane0 fpext-intent	1	NEON FcvtlV.2d lane0 fpext-intent == low-half f32->f64 widen (EXACT fpext; FP semantics via shared model, see module docs)
 FpConversion	fcvtzs	7	FcvtToInt_I32_F32 -> FCVTZS Wd,Sn
@@ -59,7 +57,7 @@ AtomicOperations	ldset_i32: mem	1	LDSET_I32: mem[addr] = old | operand
 Memory	load	24	LDP_QF_ABV_I32_offset0: two adjacent Load_I32 == LDP [Xn, #0]
 Arithmetic	madd_rr	1	AArch64 MADD_RR generic
 Arithmetic	msub_rr	1	AArch64 MSUB_RR generic
-Arithmetic	mul	11	Imul_I8 -> MUL (8-bit)
+Arithmetic	mul	18	Imul_I8 -> MUL (8-bit)
 NeonLowering	mulv.4s lanewise-intent	1	NEON MulV.4S lanewise-intent == D-pair per-lane bvmul (faithful)
 Arithmetic	neg	4	Neg_I8 -> NEG (8-bit)
 NeonLowering	notv.16b lanewise-intent	1	NEON NotV.16B lanewise-intent (~a) == whole-register bvnot (faithful)
@@ -76,16 +74,18 @@ ExtensionTruncation	sextend_i8_to_i32	1	Sextend_I8_to_I32 -> SXTB
 NeonLowering	shlvimm.4s #3 lanewise-intent	1	NEON ShlVImm.4S #3 lanewise-intent == D-pair per-lane bvshl (faithful)
 NeonLowering	smaxv.4s lanewise-intent	1	NEON SmaxV.4S lanewise-intent == D-pair per-lane smax (faithful)
 NeonLowering	sminv.4s lanewise-intent	1	NEON SminV.4S lanewise-intent == D-pair per-lane smin (faithful)
-FrameLayout	sp alignment preserved	4	FrameLayout: SP alignment preserved (SP % 16 == 0 after SUB)
 AtomicOperations	stlr	4	AtomicStore_Load_I8: STLRB->LDARB roundtrip
 Memory	store	32	Roundtrip_I8: store then load
-Arithmetic	sub	10	Isub_I8 -> SUB (8-bit)
+Arithmetic	sub	12	Isub_I8 -> SUB (8-bit)
 BitwiseShift	sub_lsl_shift_i32	5	Sub_Lsl_Shift_I32 k=1 -> SUB (shifted LSL, 32-bit): base - src*2^k == base - (src<<k)
 NeonLowering	subv.4s lanewise-intent	1	NEON SubV.4S lanewise-intent == D-pair per-lane bvsub (faithful)
+AtomicOperations	swp_i32: mem	1	SWP_I32: mem[addr] = operand
+AtomicOperations	swp_i64: mem	1	SWP_I64: mem[addr] = operand
 CmpCombine	tst packed nzcv	2	TST packed NZCV w64
 CmpCombine	tst packed nzcv w32	1	TST packed NZCV w32
 CmpCombine	tst packed nzcv w64	1	TST packed NZCV w64
 CmpCombine	tst w64: eq	1	TST w64: EQ ≡ (Rn & Rm) == 0
+CmpCombine	tst w64: ne	1	TST w64: NE ≡ (Rn & Rm) != 0
 ExtensionTruncation	ubfm extract w	2	AArch64: UBFM extract w32 ENCODING (immr=lsb, imms=lsb+width-1) == ExtractBits
 ExtensionTruncation	ubfm extract w32	1	AArch64: UBFM extract w32 ENCODING (immr=lsb, imms=lsb+width-1) == ExtractBits
 ExtensionTruncation	ubfm extract w64	1	AArch64: UBFM extract w64 ENCODING (immr=lsb, imms=lsb+width-1) == ExtractBits

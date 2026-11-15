@@ -17,16 +17,16 @@ readme.workspace = true
 
 [features]
 default = []
-# WP-2 — turn the decidable-lattice guard-replay capability
-# (`lattice_guard::LatticeBoundsCapability`) into actual elimination authority.
-#
-# OFF by default: without this feature the capability is still minted and
-# inspectable (so its soundness tests run on every build) but
-# `lattice_guard::lattice_guard_replay_authority_available()` is `false` and every
-# consumer refuses to turn it into behavior — a default build emits byte-identical
-# code to the pre-lattice compiler. A Cargo feature, not an environment variable,
-# so no runtime input can flip the policy.
+# WP-2 experimental lane, OFF by default. OD-27 requires a replayed
+# RefinementType premise before guard elision. No such rechecker exists in
+# trust-cg: enabling this feature mints no production source capability and
+# removes no guard. Predicate implication diagnostics remain available.
 lattice-guard-elision = []
+# Test-only mutation knobs (`trust_cg_lower::mutation_knobs`) that re-introduce
+# historical miscompiles so differential gates can prove they catch them.
+# NEVER enabled by a shipped build: `MUTATION_KNOBS` reports it, and every knob
+# starts OFF even when the feature is compiled in.
+mutation-knobs = []
 
 [dependencies]
 # Shared machine IR model (canonical type definitions)

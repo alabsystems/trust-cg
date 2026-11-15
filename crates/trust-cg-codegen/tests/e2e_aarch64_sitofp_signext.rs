@@ -11,8 +11,8 @@
 // (SXTB/SXTH/SXTW) before SCVTF.
 //
 // This test compiles sitofp/uitofp from every integer width to f32/f64, links,
-// and RUNS on aarch64-apple-darwin, diffing bit-exact against the C cast
-// reference (clang/LLVM) with a battery of NEGATIVE inputs that reproduces the
+// and RUNS on AArch64 macOS or Linux GNU, diffing bit-exact against the C cast
+// reference (host C compiler) with a battery of NEGATIVE inputs that reproduces the
 // original bug. It fails closed (exit != 0) if the sign-extension regresses.
 //
 // NOTE (verifier gate): the per-instruction certs PASSED on the buggy code —
@@ -37,17 +37,25 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// `fn name(x: src) -> dst { x as dst }` via a single int->float Cast.
 fn build_itofp(func_id: u32, name: &str, module: &mut TrustIrModule, op: CastOp, src: Ty, dst: Ty) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![src.clone()],
-        returns: vec![dst.clone()],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![src.clone()],
+            returns: vec![dst.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -65,7 +73,9 @@ fn build_itofp(func_id: u32, name: &str, module: &mut TrustIrModule, op: CastOp,
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -89,7 +99,8 @@ fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("int->float casts must compile (proof/coverage gate included)");
@@ -149,8 +160,8 @@ int main(void){
 "#;
 
 fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: link-and-run requires an aarch64-apple-darwin host");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: link-and-run requires an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -168,6 +179,7 @@ fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc available");
     assert!(
@@ -198,4 +210,13 @@ fn e2e_aarch64_sitofp_sign_extends_negatives() {
              a nonzero code in 1..=6 means a SIGNED narrow source was not sign-extended",
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -37,7 +37,9 @@ use thiserror::Error;
 use trust_cg_ir::function::MachFunction as IrMachFunction;
 use trust_cg_ir::inst::{AArch64Opcode, InstFlags, MachInst};
 use trust_cg_ir::operand::MachOperand;
-use trust_cg_ir::regs::{RegClass, SP, SpecialReg, WSP, WZR, XZR, preg_class};
+use trust_cg_ir::regs::{RegClass, SpecialReg, preg_class};
+#[cfg(test)]
+use trust_cg_ir::regs::{WSP, WZR};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -68,6 +70,64 @@ pub enum LowerError {
         "exception-handling sidecar unsupported at code-only lowering API `{api}` for `{function}`"
     )]
     EhSidecarUnsupported { function: String, api: &'static str },
+    /// The relaxed words disagree with offsets re-derived from the final
+    /// layout of the relaxed function.
+    #[error("[TCG-A64-LAYOUT-XCHECK] fn `{function}` relaxed layout cross-check failed: {error}")]
+    LayoutCrossCheck {
+        function: String,
+        error: crate::aarch64::layout_crosscheck::LayoutCrossCheckError,
+    },
+    /// The encoded words of a switch dispatch do not bind to the function's
+    /// intent and recorded CFG (`trust_cg_verify::aarch64_switch_binding`):
+    /// the relaxed words on the relaxing route, the plain words on
+    /// `encode_function`.
+    #[error("[TCG-A64-SWITCH-BIND] fn `{function}` switch dispatch binding failed: {error}")]
+    SwitchBinding {
+        function: String,
+        error: trust_cg_verify::aarch64_switch_binding::SwitchBindingError,
+    },
+}
+
+/// Cross-check relaxed bytes against the relaxed function's final layout,
+/// then bind its switch dispatch to them.
+/// Branch intents are still symbolic here, so every relaxed displacement is
+/// re-derived from recomputed block starts rather than from the relaxer's
+/// own resolved sequence.
+fn crosscheck_relaxed_layout(
+    func: &IrMachFunction,
+    relaxed: &relax::RelaxedCode,
+    code: &[u8],
+) -> Result<(), LowerError> {
+    let block_offsets = func
+        .block_order
+        .iter()
+        .map(|block| {
+            let offset = relaxed.block_offsets.get(block.0 as usize).copied();
+            (*block, offset.unwrap_or(u32::MAX))
+        })
+        .collect();
+    crate::aarch64::layout_crosscheck::check_final_layout(func, code, None, &block_offsets, false)
+        .map_err(|error| LowerError::LayoutCrossCheck {
+            function: func.name.clone(),
+            error,
+        })?;
+    // Relaxation rewrote `func` in place, so its non-pseudo instructions are
+    // the relaxed words one for one.
+    bind_switch_dispatch(func, code)
+}
+
+/// Bind every switch dispatch, compare group and fused compare-and-branch of
+/// `code` to `func`'s intent and recorded CFG
+/// (`trust_cg_verify::aarch64_switch_binding`), as the pipeline encoder does
+/// after its layout cross-check. Neither `lower` route appends jump tables,
+/// so a jump-table dispatch is refused here.
+fn bind_switch_dispatch(func: &IrMachFunction, code: &[u8]) -> Result<(), LowerError> {
+    trust_cg_verify::aarch64_switch_binding::check_aarch64_switch_dispatch(func, code)
+        .map(|_| ())
+        .map_err(|error| LowerError::SwitchBinding {
+            function: func.name.clone(),
+            error,
+        })
 }
 
 fn reject_eh_sidecar_drop(func: &IrMachFunction, api: &'static str) -> Result<(), LowerError> {
@@ -263,23 +323,31 @@ pub fn expand_pseudos(func: &mut IrMachFunction) -> Result<(), LowerError> {
                 // Leave as-is; the encoder handles these directly.
             }
             other => {
-                // Unknown pseudo-instruction — this is a bug. An unrecognized
-                // pseudo reaching expansion means either ISel emitted something
-                // we don't handle, or an earlier pass failed to lower it.
-                // Log a warning with the opcode for debugging.
-                eprintln!(
-                    "WARNING: unrecognized pseudo-instruction {:?} in expand_pseudos, \
-                     converting to NOP. This may indicate a missing expansion rule.",
-                    other
-                );
-                inst.opcode = AArch64Opcode::Nop;
-                inst.flags = InstFlags::IS_PSEUDO;
-                inst.operands.clear();
+                // An unrecognized pseudo has no authorized erasure rule.
+                // Preserve the offending instruction for diagnostics rather
+                // than silently deleting computation, memory effects or traps.
+                return Err(LowerError::UnresolvedPseudo(other));
             }
         }
     }
 
     Ok(())
+}
+
+/// Record one expansion of a trap carrier in the function's sidecar
+/// ([`trust_cg_ir::function::TrapExpansionRecord`]) so the verifier and the
+/// per-compile decode check can judge its words against the carrier's trap
+/// condition.
+fn record_trap_expansion(
+    func: &mut IrMachFunction,
+    carrier: &MachInst,
+    insts: &[trust_cg_ir::types::InstId],
+) {
+    func.trap_expansions
+        .push(trust_cg_ir::function::TrapExpansionRecord {
+            carrier: carrier.clone(),
+            insts: insts.to_vec(),
+        });
 }
 
 /// Expand `TrapNullIfZero ptr` to a safe conditional runtime check.
@@ -300,6 +368,7 @@ pub fn expand_trap_null_if_zero(func: &mut IrMachFunction) {
             }
 
             let source_loc = inst_snapshot.source_loc;
+            let expansion_start = new_insts.len();
             if let Some(ptr) = inst_snapshot.operands.first().cloned() {
                 let inst = func.inst_mut(inst_id);
                 inst.opcode = AArch64Opcode::Cbnz;
@@ -321,6 +390,7 @@ pub fn expand_trap_null_if_zero(func: &mut IrMachFunction) {
             trap.source_loc = source_loc;
             let trap_id = func.push_inst(trap);
             new_insts.push(trap_id);
+            record_trap_expansion(func, &inst_snapshot, &new_insts[expansion_start..]);
         }
 
         func.blocks[block_idx].insts = new_insts;
@@ -349,6 +419,7 @@ pub fn expand_trap_div_zero_if_zero(func: &mut IrMachFunction) {
             }
 
             let source_loc = inst_snapshot.source_loc;
+            let expansion_start = new_insts.len();
             if let Some(divisor) = inst_snapshot.operands.first().cloned() {
                 let inst = func.inst_mut(inst_id);
                 inst.opcode = AArch64Opcode::Cbnz;
@@ -370,6 +441,7 @@ pub fn expand_trap_div_zero_if_zero(func: &mut IrMachFunction) {
             trap.source_loc = source_loc;
             let trap_id = func.push_inst(trap);
             new_insts.push(trap_id);
+            record_trap_expansion(func, &inst_snapshot, &new_insts[expansion_start..]);
         }
 
         func.blocks[block_idx].insts = new_insts;
@@ -398,7 +470,10 @@ pub fn expand_trap_div_zero_if_zero(func: &mut IrMachFunction) {
 /// stage — the same scratch the overflow-mul carrier uses) and compared
 /// register-to-register. The 64-bit `CMP` is exact for the full `usize` index the
 /// Rust bounds check compares, and `MOVZ` zero-extends so `X16`'s upper bits are
-/// clean. A bound outside `[0, i32::MAX]` (never produced under the caps above)
+/// clean. A 32-bit index (a W register) uses `W16` instead, since `CMP` takes
+/// two registers of one width; the bound fits 32 bits, so `CMP Wn, W16` is the
+/// exact `index <u bound` at the index's width. A bound outside
+/// `[0, i32::MAX]` (never produced under the caps above)
 /// falls through to the `CMP #imm` path, which fails the compile closed on an
 /// unencodable immediate rather than emitting a misencoded check.
 pub fn expand_trap_bounds_check_exact(func: &mut IrMachFunction) {
@@ -414,6 +489,7 @@ pub fn expand_trap_bounds_check_exact(func: &mut IrMachFunction) {
             }
 
             let source_loc = inst_snapshot.source_loc;
+            let expansion_start = new_insts.len();
             let Some(index) = inst_snapshot.operands.get(1).cloned() else {
                 let inst = func.inst_mut(inst_id);
                 inst.opcode = AArch64Opcode::TrapBoundsCheck;
@@ -446,12 +522,27 @@ pub fn expand_trap_bounds_check_exact(func: &mut IrMachFunction) {
                 _ => None,
             };
             if let Some(k) = large_bound {
-                let x16 = MachOperand::PReg(trust_cg_ir::regs::X16);
+                // The scratch takes the INDEX's width: `CMP` requires both
+                // registers of one width, so a 32-bit index (an `I32` source
+                // index in a W register) compares against W16. Writing W16
+                // zero-extends into X16, and k <= i32::MAX fits 32 bits, so
+                // the 32-bit compare tests exactly `index <u k` at the index's
+                // width. A 64-bit index keeps X16.
+                let index_is_w = match &index {
+                    MachOperand::PReg(p) => preg_class(*p) == RegClass::Gpr32,
+                    MachOperand::VReg(v) => v.class == RegClass::Gpr32,
+                    _ => false,
+                };
+                let x16 = MachOperand::PReg(if index_is_w {
+                    trust_cg_ir::regs::W16
+                } else {
+                    trust_cg_ir::regs::X16
+                });
                 let lo = k & 0xffff;
                 let hi = (k >> 16) & 0xffff;
 
-                // MOVZ X16, #lo — reuse the carrier InstId; zero-extends, clearing
-                // bits [63:16] (bits [63:32] stay zero since k <= i32::MAX).
+                // MOVZ X16 (W16), #lo — reuse the carrier InstId; zero-extends,
+                // clearing bits [63:16] (bits [63:32] stay zero since k <= i32::MAX).
                 let inst = func.inst_mut(inst_id);
                 inst.opcode = AArch64Opcode::Movz;
                 inst.operands = vec![x16.clone(), MachOperand::Imm(lo)];
@@ -511,6 +602,7 @@ pub fn expand_trap_bounds_check_exact(func: &mut IrMachFunction) {
             trap.source_loc = source_loc;
             let trap_id = func.push_inst(trap);
             new_insts.push(trap_id);
+            record_trap_expansion(func, &inst_snapshot, &new_insts[expansion_start..]);
         }
 
         func.blocks[block_idx].insts = new_insts;
@@ -538,6 +630,7 @@ pub fn expand_trap_shift_range_if_oob(func: &mut IrMachFunction) {
             }
 
             let source_loc = inst_snapshot.source_loc;
+            let expansion_start = new_insts.len();
             let amount = inst_snapshot.operands.first().cloned();
             let bitwidth = inst_snapshot.operands.get(1).cloned();
             let (Some(amount), Some(bitwidth)) = (amount, bitwidth) else {
@@ -572,6 +665,7 @@ pub fn expand_trap_shift_range_if_oob(func: &mut IrMachFunction) {
             trap.source_loc = source_loc;
             let trap_id = func.push_inst(trap);
             new_insts.push(trap_id);
+            record_trap_expansion(func, &inst_snapshot, &new_insts[expansion_start..]);
         }
 
         func.blocks[block_idx].insts = new_insts;
@@ -649,6 +743,7 @@ pub fn expand_trap_overflow_exact(func: &mut IrMachFunction) {
             }
 
             let source_loc = inst_snapshot.source_loc;
+            let expansion_start = new_insts.len();
             let lhs = inst_snapshot.operands.first().cloned();
             let rhs = inst_snapshot.operands.get(1).cloned();
             let tag = match inst_snapshot.operands.get(2) {
@@ -766,6 +861,7 @@ pub fn expand_trap_overflow_exact(func: &mut IrMachFunction) {
                 trap.source_loc = source_loc;
                 let trap_id = func.push_inst(trap);
                 new_insts.push(trap_id);
+                record_trap_expansion(func, &inst_snapshot, &new_insts[expansion_start..]);
 
                 continue;
             }
@@ -814,6 +910,7 @@ pub fn expand_trap_overflow_exact(func: &mut IrMachFunction) {
             trap.source_loc = source_loc;
             let trap_id = func.push_inst(trap);
             new_insts.push(trap_id);
+            record_trap_expansion(func, &inst_snapshot, &new_insts[expansion_start..]);
         }
 
         func.blocks[block_idx].insts = new_insts;
@@ -843,6 +940,15 @@ pub fn expand_trap_overflow_exact(func: &mut IrMachFunction) {
 /// Pre-validates operands (#98, #105) before delegation to catch malformed
 /// instructions early rather than silently encoding wrong values.
 fn encode_inst(inst: &MachInst) -> Result<u32, LowerError> {
+    if inst
+        .operands
+        .iter()
+        .any(|operand| operand.as_exact_module_symbol().is_some())
+    {
+        return Err(LowerError::UnsupportedInstruction(
+            "exact module function addresses require the binding-aware pipeline encoder".into(),
+        ));
+    }
     // Helper: extract physical register hardware encoding from operand.
     // Returns an error for non-register operands instead of silently
     // defaulting to XZR (reg 31), which would produce wrong code (#98).
@@ -864,126 +970,6 @@ fn encode_inst(inst: &MachInst) -> Result<u32, LowerError> {
             ))),
         }
     };
-
-    let pair_transfer_hw = |idx: usize| -> Result<u32, LowerError> {
-        if idx >= inst.operands.len() {
-            return Err(LowerError::MissingOperand {
-                opcode: inst.opcode,
-                index: idx,
-            });
-        }
-        match &inst.operands[idx] {
-            MachOperand::PReg(p) if *p != SP && *p != WSP && *p != XZR && *p != WZR => {
-                Ok(p.hw_enc() as u32)
-            }
-            other => Err(LowerError::EncodingFailed(format!(
-                "expected pair transfer register operand at index {} for {:?}, got {:?}",
-                idx, inst.opcode, other
-            ))),
-        }
-    };
-
-    let pair_base_hw = |idx: usize| -> Result<u32, LowerError> {
-        if idx >= inst.operands.len() {
-            return Err(LowerError::MissingOperand {
-                opcode: inst.opcode,
-                index: idx,
-            });
-        }
-        match &inst.operands[idx] {
-            MachOperand::PReg(p) if *p != WSP && *p != XZR && *p != WZR => Ok(p.hw_enc() as u32),
-            MachOperand::Special(SpecialReg::SP) => Ok(31),
-            other => Err(LowerError::EncodingFailed(format!(
-                "expected pair base register operand at index {} for {:?}, got {:?}",
-                idx, inst.opcode, other
-            ))),
-        }
-    };
-
-    let pair_offset_imm = |idx: usize| -> Result<(), LowerError> {
-        match inst.operands.get(idx) {
-            Some(MachOperand::Imm(_)) | None => Ok(()),
-            Some(other) => Err(LowerError::EncodingFailed(format!(
-                "expected pair offset immediate operand at index {} for {:?}, got {:?}",
-                idx, inst.opcode, other
-            ))),
-        }
-    };
-
-    let single_writeback_transfer_hw = |idx: usize| -> Result<u32, LowerError> {
-        if idx >= inst.operands.len() {
-            return Err(LowerError::MissingOperand {
-                opcode: inst.opcode,
-                index: idx,
-            });
-        }
-        match &inst.operands[idx] {
-            MachOperand::PReg(p)
-                if trust_cg_ir::regs::preg_class(*p) == trust_cg_ir::regs::RegClass::Gpr64
-                    && *p != SP =>
-            {
-                Ok(p.hw_enc() as u32)
-            }
-            MachOperand::Special(SpecialReg::XZR) => Ok(31),
-            other => Err(LowerError::EncodingFailed(format!(
-                "expected 64-bit GPR or XZR transfer operand at index {} for {:?}, got {:?}",
-                idx, inst.opcode, other
-            ))),
-        }
-    };
-
-    let single_writeback_base_hw = |idx: usize| -> Result<u32, LowerError> {
-        if idx >= inst.operands.len() {
-            return Err(LowerError::MissingOperand {
-                opcode: inst.opcode,
-                index: idx,
-            });
-        }
-        match &inst.operands[idx] {
-            MachOperand::PReg(p)
-                if trust_cg_ir::regs::preg_class(*p) == trust_cg_ir::regs::RegClass::Gpr64
-                    && *p != XZR =>
-            {
-                Ok(p.hw_enc() as u32)
-            }
-            MachOperand::Special(SpecialReg::SP) => Ok(31),
-            other => Err(LowerError::EncodingFailed(format!(
-                "expected 64-bit GPR or SP writeback base operand at index {} for {:?}, got {:?}",
-                idx, inst.opcode, other
-            ))),
-        }
-    };
-
-    let single_writeback_imm9 = |idx: usize| -> Result<(), LowerError> {
-        match inst.operands.get(idx) {
-            Some(MachOperand::Imm(v)) if (-256..=255).contains(v) => Ok(()),
-            Some(MachOperand::Imm(v)) => Err(LowerError::EncodingFailed(format!(
-                "single-register writeback immediate at index {} for {:?} out of signed imm9 range: {}",
-                idx, inst.opcode, v
-            ))),
-            Some(other) => Err(LowerError::EncodingFailed(format!(
-                "expected signed imm9 operand at index {} for {:?}, got {:?}",
-                idx, inst.opcode, other
-            ))),
-            None => Err(LowerError::MissingOperand {
-                opcode: inst.opcode,
-                index: idx,
-            }),
-        }
-    };
-
-    let reject_single_writeback_overlap =
-        |transfer_idx: usize, base_idx: usize| -> Result<(), LowerError> {
-            let transfer_hw = single_writeback_transfer_hw(transfer_idx)?;
-            let base_hw = single_writeback_base_hw(base_idx)?;
-            if base_hw != 31 && transfer_hw == base_hw {
-                return Err(LowerError::EncodingFailed(format!(
-                    "single-register writeback transfer/base overlap is unpredictable for {:?}",
-                    inst.opcode
-                )));
-            }
-            Ok(())
-        };
 
     // Helper: extract immediate value from operand.
     let imm_val = |idx: usize| -> i64 {
@@ -1133,53 +1119,10 @@ fn encode_inst(inst: &MachInst) -> Result<u32, LowerError> {
                 | (rn << 5)
                 | rd)
         }
-        // =================================================================
-        // Pipeline-specific: integer-only register-offset loads/stores.
-        // The unified encoder handles FPR paths differently via encoding_mem.
-        // Keep local for integer pipeline consistency.
-        // =================================================================
-        AArch64Opcode::LdrRO => {
-            let sf = if is_64bit(0) { 1u32 } else { 0u32 };
-            let rt = preg_hw(0)?;
-            let rn = preg_hw(1)?;
-            let rm = preg_hw(2)?;
-            let size = if sf == 1 { 0b11u32 } else { 0b10u32 };
-            let (option, s) = if inst.operands.len() > 3 {
-                let packed = imm_val(3) as u32;
-                ((packed >> 1) & 0b111, packed & 1)
-            } else {
-                (0b011u32, 0u32)
-            };
-            Ok(((size << 30) | (0b111 << 27))
-                | (0b01 << 22)
-                | (1 << 21)
-                | (rm << 16)
-                | (option << 13)
-                | (s << 12)
-                | (0b10 << 10)
-                | (rn << 5)
-                | rt)
-        }
-        AArch64Opcode::StrRO => {
-            let sf = if is_64bit(0) { 1u32 } else { 0u32 };
-            let rt = preg_hw(0)?;
-            let rn = preg_hw(1)?;
-            let rm = preg_hw(2)?;
-            let size = if sf == 1 { 0b11u32 } else { 0b10u32 };
-            let (option, s) = if inst.operands.len() > 3 {
-                let packed = imm_val(3) as u32;
-                ((packed >> 1) & 0b111, packed & 1)
-            } else {
-                (0b011u32, 0u32)
-            };
-            Ok(((size << 30) | (0b111 << 27))
-                | (1 << 21)
-                | (rm << 16)
-                | (option << 13)
-                | (s << 12)
-                | (0b10 << 10)
-                | (rn << 5)
-                | rt)
+        // Keep the legacy entry point on the same strict GPR/FP register and
+        // packed-mode contract as final encoding; RO has no writeback ban.
+        AArch64Opcode::LdrRO | AArch64Opcode::StrRO => {
+            encode_instruction(inst).map_err(map_encode_error)
         }
 
         // =================================================================
@@ -1220,6 +1163,15 @@ fn encode_inst(inst: &MachInst) -> Result<u32, LowerError> {
              no direct encoding exists"
                 .to_string(),
         )),
+        // ELF TLSDESC slots: likewise only encodable by the module emitter.
+        AArch64Opcode::TlsDescCall
+        | AArch64Opcode::LdrTlsdesc
+        | AArch64Opcode::AddTlsdescLo12
+        | AArch64Opcode::BlrTlsdesc => Err(LowerError::EncodingFailed(format!(
+            "{:?} requires ELF TLSDESC expansion and fixup interception (module emitter); \
+             no direct encoding exists",
+            inst.opcode
+        ))),
 
         // =================================================================
         // FP instructions: pre-validate operand types (#105) then delegate.
@@ -1380,8 +1332,8 @@ fn encode_inst(inst: &MachInst) -> Result<u32, LowerError> {
         | AArch64Opcode::StrPreIndex
         | AArch64Opcode::LdrPostIndex
         | AArch64Opcode::StrPostIndex => {
-            reject_single_writeback_overlap(0, 1)?;
-            single_writeback_imm9(2)?;
+            // The unified encoder owns exact arity, W/X transfer width, the
+            // imm9 range and cross-width transfer/base overlap validation.
             encode_instruction(inst).map_err(map_encode_error)
         }
         AArch64Opcode::LdrbRI
@@ -1394,51 +1346,15 @@ fn encode_inst(inst: &MachInst) -> Result<u32, LowerError> {
             preg_hw(1)?;
             encode_instruction(inst).map_err(map_encode_error)
         }
-        AArch64Opcode::StpRI | AArch64Opcode::LdpRI => {
-            pair_transfer_hw(0)?;
-            pair_transfer_hw(1)?;
-            pair_base_hw(2)?;
-            pair_offset_imm(3)?;
-            encode_instruction(inst).map_err(map_encode_error)
-        }
-        AArch64Opcode::StpPreIndex | AArch64Opcode::LdpPostIndex => {
-            preg_hw(0)?;
-            preg_hw(1)?;
-            preg_hw(2)?;
-            // FAIL-CLOSED (mirrors `reject_single_writeback_overlap` for the
-            // single-register forms, and the NEON pair path): for a WRITEBACK
-            // pair the architecture makes `Rn == Rt` or `Rn == Rt2` CONSTRAINED
-            // UNPREDICTABLE, and a load pair additionally forbids `Rt == Rt2`.
-            // Liveness already prevents this — the base and both transfer
-            // registers are simultaneously live at the instruction, and
-            // `effects::fill_operand_roles` models the base as DefUse so the
-            // allocator can never overlap them (audited over 6590 emitted
-            // writeback instructions: zero overlaps). This check exists so a
-            // future pass emitting these opcodes gets a hard compile error
-            // instead of silently-unpredictable bytes.
-            let base_hw = single_writeback_base_hw(2)?;
-            if base_hw != 31 {
-                for t in [0usize, 1] {
-                    if single_writeback_transfer_hw(t)? == base_hw {
-                        return Err(LowerError::EncodingFailed(format!(
-                            "pair writeback transfer/base overlap is unpredictable for {:?}",
-                            inst.opcode
-                        )));
-                    }
-                }
-            }
-            if inst.opcode == AArch64Opcode::LdpPostIndex {
-                let (t0, t1) = (
-                    single_writeback_transfer_hw(0)?,
-                    single_writeback_transfer_hw(1)?,
-                );
-                if t0 != 31 && t0 == t1 {
-                    return Err(LowerError::EncodingFailed(format!(
-                        "load pair with Rt == Rt2 is unpredictable for {:?}",
-                        inst.opcode
-                    )));
-                }
-            }
+        AArch64Opcode::StpRI
+        | AArch64Opcode::LdpRI
+        | AArch64Opcode::StpPreIndex
+        | AArch64Opcode::LdpPostIndex
+        | AArch64Opcode::NeonLdpQPost
+        | AArch64Opcode::NeonStpQPost => {
+            // One exact pair contract owns widths, aliases, arity and scaled
+            // offsets. In particular equal-numbered FP/GPR fields are not an
+            // overlap, while SP and ZR retain their different operand roles.
             encode_instruction(inst).map_err(map_encode_error)
         }
 
@@ -1503,10 +1419,54 @@ fn encode_relaxed_instructions(
 ///
 /// This is the simpler path used when branch relaxation is not needed
 /// (e.g., when branch targets have already been resolved to immediates).
+/// Unresolved semantic pseudos are rejected before encoding; mutable pseudo
+/// flags alone never authorize erasing an instruction. Named metadata/refcount
+/// compatibility behavior and exact physical identity copies remain unchanged.
 pub fn encode_function(func: &IrMachFunction) -> Result<Vec<u8>, LowerError> {
     crate::pipeline::enforce_aarch64_post_regalloc_resolved(func)
         .map_err(|e| LowerError::MalformedFunction(e.to_string()))?;
     reject_eh_sidecar_drop(func, "lower::encode_function")?;
+
+    // Preflight the complete emitted stream before producing any bytes. This
+    // API does not expand copies or guards, and its already-resolved branches
+    // prohibit silently changing the byte occupancy of accepted instructions.
+    for &block_id in &func.block_order {
+        for &inst_id in &func.block(block_id).insts {
+            let inst = func.inst(inst_id);
+            match inst.opcode {
+                AArch64Opcode::Copy => {
+                    // Only an exact identity on a known non-System physical
+                    // register is erasable. Width aliases are not identities.
+                    if !matches!(
+                        inst.operands.as_slice(),
+                        [MachOperand::PReg(dst), MachOperand::PReg(src)]
+                            if dst == src && preg_class(*dst) != RegClass::System
+                    ) {
+                        return Err(LowerError::UnresolvedPseudo(inst.opcode));
+                    }
+                }
+                AArch64Opcode::TrapBoundsCheckExact
+                | AArch64Opcode::TrapNullIfZero
+                | AArch64Opcode::TrapDivZeroIfZero
+                | AArch64Opcode::TrapShiftRangeIfOOB
+                | AArch64Opcode::TrapOverflowExact => {
+                    return Err(LowerError::UnresolvedPseudo(inst.opcode));
+                }
+                // Preserve existing named erasure/NOP compatibility only;
+                // this does not establish ownership or surviving-Phi semantics.
+                AArch64Opcode::Phi
+                | AArch64Opcode::StackAlloc
+                | AArch64Opcode::Nop
+                | AArch64Opcode::Retain
+                | AArch64Opcode::Release => {}
+                _ if inst.is_pseudo() => {
+                    return Err(LowerError::UnresolvedPseudo(inst.opcode));
+                }
+                _ => {}
+            }
+        }
+    }
+
     let mut code = Vec::new();
 
     for &block_id in &func.block_order {
@@ -1521,6 +1481,9 @@ pub fn encode_function(func: &IrMachFunction) -> Result<Vec<u8>, LowerError> {
         }
     }
 
+    // No layout cross-check runs on this route; the binding still checks
+    // every dispatch word against the already-resolved intent.
+    bind_switch_dispatch(func, &code)?;
     Ok(code)
 }
 
@@ -1554,12 +1517,16 @@ pub fn lower_function(func: &mut IrMachFunction) -> Result<LowerResult, LowerErr
 
     // Phase 7: Frame lowering — compute layout, eliminate frame indices,
     // insert prologue/epilogue.
+    // As in the full pipeline, reserve SP-relative call stores before frame
+    // insertion changes SP; otherwise they can overwrite the saved FP/LR pair.
+    let outgoing_arg_size = frame::compute_max_outgoing_arg_size(func);
     let layout = if frame::function_has_runtime_stack_slots(func) {
-        frame::compute_frame_layout_dynamic(func, 0, true)
+        frame::try_compute_frame_layout_dynamic(func, outgoing_arg_size, true)
     } else {
-        frame::compute_frame_layout(func, 0, true)
-    };
-    frame::eliminate_frame_indices(func, &layout);
+        frame::try_compute_frame_layout(func, outgoing_arg_size, true)
+    }?;
+    frame::eliminate_frame_indices(func, &layout)
+        .map_err(|error| LowerError::FrameLowering(error.to_string()))?;
     frame::insert_prologue_epilogue(func, &layout)?;
 
     // Expand any remaining pseudo-instructions.
@@ -1569,6 +1536,8 @@ pub fn lower_function(func: &mut IrMachFunction) -> Result<LowerResult, LowerErr
     expand_trap_div_zero_if_zero(func);
     expand_trap_shift_range_if_oob(func);
     expand_trap_overflow_exact(func);
+    crate::llsc::expand_llsc_atomics(func)
+        .map_err(|error| LowerError::MalformedFunction(error.to_string()))?;
 
     // Run branch relaxation — this resolves Block operands to immediate
     // offsets and handles out-of-range branches.
@@ -1582,6 +1551,7 @@ pub fn lower_function(func: &mut IrMachFunction) -> Result<LowerResult, LowerErr
     // Encode the relaxed instruction sequence to bytes.
     let code = encode_relaxed_instructions(&func.name, &relaxed.instructions)
         .map_err(|e| LowerError::EncodingFailed(e.to_string()))?;
+    crosscheck_relaxed_layout(func, &relaxed, &code)?;
 
     Ok(LowerResult {
         code,
@@ -1601,10 +1571,10 @@ pub fn lower_function_no_frame(func: &mut IrMachFunction) -> Result<LowerResult,
 
     // Use a dummy frame layout since frame lowering was already done.
     let layout = if frame::function_has_runtime_stack_slots(func) {
-        frame::compute_frame_layout_dynamic(func, 0, true)
+        frame::try_compute_frame_layout_dynamic(func, 0, true)
     } else {
-        frame::compute_frame_layout(func, 0, true)
-    };
+        frame::try_compute_frame_layout(func, 0, true)
+    }?;
 
     // Expand any remaining pseudo-instructions.
     expand_pseudos(func)?;
@@ -1613,6 +1583,8 @@ pub fn lower_function_no_frame(func: &mut IrMachFunction) -> Result<LowerResult,
     expand_trap_div_zero_if_zero(func);
     expand_trap_shift_range_if_oob(func);
     expand_trap_overflow_exact(func);
+    crate::llsc::expand_llsc_atomics(func)
+        .map_err(|error| LowerError::MalformedFunction(error.to_string()))?;
 
     // Run branch relaxation.
     let relaxed = relax::relax_branches(func)?;
@@ -1625,6 +1597,7 @@ pub fn lower_function_no_frame(func: &mut IrMachFunction) -> Result<LowerResult,
     // Encode.
     let code = encode_relaxed_instructions(&func.name, &relaxed.instructions)
         .map_err(|e| LowerError::EncodingFailed(e.to_string()))?;
+    crosscheck_relaxed_layout(func, &relaxed, &code)?;
 
     Ok(LowerResult {
         code,
@@ -2269,6 +2242,86 @@ mod tests {
     // Pseudo-expansion tests
     // -----------------------------------------------------------------------
 
+    fn unknown_pseudo_control(opcode: AArch64Opcode) -> MachInst {
+        match opcode {
+            AArch64Opcode::AddRI => MachInst::new(
+                opcode,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X0),
+                    MachOperand::Imm(1),
+                ],
+            ),
+            AArch64Opcode::StrRI => MachInst::new(
+                opcode,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(0),
+                ],
+            ),
+            AArch64Opcode::Brk => MachInst::new(opcode, vec![MachOperand::Imm(1)]),
+            _ => panic!("unexpected pseudo-refusal control: {opcode:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expand_pseudos_rejects_unknown_without_erasing_instruction() {
+        for opcode in [
+            AArch64Opcode::AddRI,
+            AArch64Opcode::StrRI,
+            AArch64Opcode::Brk,
+        ] {
+            // Non-canonical public MachIR flags must not turn a real semantic
+            // instruction into an authorized no-op. Current legitimate opcode
+            // pseudos all have named expansion/preservation arms above.
+            let mut inst = unknown_pseudo_control(opcode);
+            inst.flags = inst.flags.union(InstFlags::IS_PSEUDO);
+            let original = inst.clone();
+            let mut func = make_func("unknown_pseudo", vec![inst]);
+            assert!(matches!(
+                expand_pseudos(&mut func),
+                Err(LowerError::UnresolvedPseudo(found)) if found == opcode
+            ));
+            assert_eq!(func.insts[0].opcode, original.opcode);
+            assert_eq!(func.insts[0].operands, original.operands);
+            assert_eq!(func.insts[0].flags, original.flags);
+        }
+    }
+
+    #[test]
+    fn test_expand_pseudos_explicit_copy_and_metadata_controls() {
+        let mut func = make_func(
+            "named_pseudo_controls",
+            vec![
+                MachInst::new(AArch64Opcode::Phi, vec![MachOperand::Imm(0)]),
+                MachInst::new(AArch64Opcode::StackAlloc, vec![MachOperand::Imm(16)]),
+                MachInst::new(AArch64Opcode::Nop, vec![MachOperand::Imm(7)]),
+                MachInst::new(
+                    AArch64Opcode::Copy,
+                    vec![MachOperand::PReg(X0), MachOperand::PReg(X1)],
+                ),
+                MachInst::new(
+                    AArch64Opcode::Copy,
+                    vec![MachOperand::PReg(X0), MachOperand::PReg(X0)],
+                ),
+            ],
+        );
+        expand_pseudos(&mut func).unwrap();
+        for index in [0, 1, 4] {
+            assert_eq!(func.insts[index].opcode, AArch64Opcode::Nop);
+            assert!(func.insts[index].operands.is_empty());
+        }
+        assert_eq!(func.insts[2].opcode, AArch64Opcode::Nop);
+        assert_eq!(func.insts[2].operands, vec![MachOperand::Imm(7)]);
+        assert_eq!(func.insts[3].opcode, AArch64Opcode::MovR);
+        assert_eq!(
+            func.insts[3].operands,
+            vec![MachOperand::PReg(X0), MachOperand::PReg(X1)]
+        );
+        assert!(!func.insts[3].is_pseudo());
+    }
+
     #[test]
     fn test_expand_pseudos_removes_phi() {
         let mut func = make_func(
@@ -2678,6 +2731,486 @@ mod tests {
     // -----------------------------------------------------------------------
     // Full lowering test
     // -----------------------------------------------------------------------
+
+    // Fixed post-RA inputs: five transfer widths, scalar/pair stores, two
+    // spellings of SP, and omitted-zero/explicit-zero/nonzero offsets. The
+    // literal fields below do not use the encoder or outgoing-area scanner.
+    fn direct_lower_outgoing_cases() -> Vec<(String, MachInst, u32, u32, u32, u32)> {
+        use trust_cg_ir::regs::{D0, D1, S0, S1, V0, V1};
+        let mut cases = Vec::new();
+        for (name, first, second, bytes, scalar_word, pair_word) in [
+            ("W", W0, W1, 4u32, 0xb900_03e0u32, 0x2900_07e0u32),
+            ("X", X0, X1, 8, 0xf900_03e0, 0xa900_07e0),
+            ("S", S0, S1, 4, 0xbd00_03e0, 0x2d00_07e0),
+            ("D", D0, D1, 8, 0xfd00_03e0, 0x6d00_07e0),
+            ("Q", V0, V1, 16, 0x3d80_03e0, 0xad00_07e0),
+        ] {
+            for pair in [false, true] {
+                for (base_name, base) in [
+                    ("physical-sp", MachOperand::PReg(SP)),
+                    ("special-sp", MachOperand::Special(SpecialReg::SP)),
+                ] {
+                    for (offset_name, authored_offset) in [
+                        ("implicit-zero", None),
+                        ("explicit-zero", Some(0u32)),
+                        ("nonzero", Some(3 * bytes)),
+                    ] {
+                        let offset = authored_offset.unwrap_or(0);
+                        let access_bytes = bytes * if pair { 2 } else { 1 };
+                        let outgoing = (offset + access_bytes + 15) & !15;
+                        let mut operands = vec![MachOperand::PReg(first)];
+                        if pair {
+                            operands.push(MachOperand::PReg(second));
+                        }
+                        operands.push(base.clone());
+                        if let Some(offset) = authored_offset {
+                            operands.push(MachOperand::Imm(i64::from(offset)));
+                        }
+                        let (opcode, word) = if pair {
+                            (AArch64Opcode::StpRI, pair_word | ((offset / bytes) << 15))
+                        } else {
+                            (AArch64Opcode::StrRI, scalar_word | ((offset / bytes) << 10))
+                        };
+                        cases.push((
+                            format!("{opcode:?}/{name}/{base_name}/{offset_name}"),
+                            MachInst::new(opcode, operands),
+                            word,
+                            outgoing,
+                            offset,
+                            access_bytes,
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(cases.len(), 60);
+        cases
+    }
+
+    fn direct_lower_outgoing_indirect_function(store: MachInst) -> MachFunction {
+        let call = MachInst::new(AArch64Opcode::Blr, vec![MachOperand::PReg(X2)]);
+        assert_eq!(encode_instruction(&call).unwrap(), 0xd63f_0040);
+        make_func(
+            "direct_lower_outgoing",
+            vec![store, call, MachInst::new(AArch64Opcode::Ret, vec![])],
+        )
+    }
+
+    fn direct_lower_outgoing_words(store: u32, outgoing: u32) -> Vec<u32> {
+        // FP/LR occupy the top16 bytes. An outgoing area moves body SP below
+        // them, and must be released before the post-index FP/LR restore.
+        let mut words = vec![0xa9bf_7bfd, 0x9100_03fd];
+        if outgoing != 0 {
+            words.push(0xd100_03ff | (outgoing << 10));
+        }
+        // BLR X2 is an independently encodable indirect call. The code-only
+        // lowerer does not patch a symbolic BL into a relocatable placeholder.
+        words.extend([store, 0xd63f_0040]);
+        if outgoing != 0 {
+            words.push(0x9100_03ff | (outgoing << 10));
+        }
+        words.extend([0xa8c1_7bfd, 0xd65f_03c0]);
+        words
+    }
+
+    #[test]
+    fn direct_lower_outgoing_indirect_call_stores_reserve_saved_frame_record() {
+        let mut failures = Vec::new();
+        let mut emitted = 0;
+        let mut actual_saved_record_overlaps = 0;
+        for (label, store, store_word, outgoing, offset, access_bytes) in
+            direct_lower_outgoing_cases()
+        {
+            // Admission and standalone word correctness are prerequisites,
+            // not substitutes for the complete lowering/frame assertion.
+            assert_eq!(encode_instruction(&store).unwrap(), store_word, "{label}");
+            let mut func = direct_lower_outgoing_indirect_function(store);
+            crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+            let result = match lower_function(&mut func) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("DIRECT_LOWER_OUTGOING_REFUSAL {label}: {error:?}");
+                    failures.push(format!("{label}: unexpected refusal {error:?}"));
+                    continue;
+                }
+            };
+            emitted += 1;
+            assert_eq!(result.code.len() % 4, 0, "{label}");
+            let words = result
+                .code
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
+                .collect::<Vec<_>>();
+            let layout = &result.frame_layout;
+            let actual_outgoing = layout.sp_adjustment();
+            let expected = direct_lower_outgoing_words(store_word, outgoing);
+            let actual_stream_matches_layout =
+                words == direct_lower_outgoing_words(store_word, actual_outgoing);
+            // Count overlap only after matching the COMPLETE emitted stream
+            // that establishes body SP and the saved FP/LR location.
+            let saved_overlap = actual_stream_matches_layout
+                && offset < actual_outgoing + 16
+                && offset + access_bytes > actual_outgoing;
+            actual_saved_record_overlaps += usize::from(saved_overlap);
+            eprintln!(
+                "DIRECT_LOWER_OUTGOING {label} expected_area={outgoing} actual_area={} total={} complete_layout_stream={actual_stream_matches_layout} saved_overlap={saved_overlap} words={words:08x?}",
+                layout.outgoing_arg_area_size, layout.total_frame_size
+            );
+            if layout.outgoing_arg_area_size != outgoing
+                || layout.total_frame_size != 16 + outgoing
+                || layout.callee_saved_area_size != 16
+                || layout.spill_area_size != 0
+                || layout.local_area_size != 0
+                || layout.callee_saved_pairs.len() != 1
+                || !layout.uses_frame_pointer
+                || layout.is_leaf
+                || layout.uses_red_zone
+                || layout.has_dynamic_alloc
+                || layout.fp_to_spill_offset != 0
+                || words != expected
+                || !result.relocations.is_empty()
+                || saved_overlap
+            {
+                failures.push(format!("{label}: expected_area={outgoing} actual_area={} expected_words={expected:08x?} actual_words={words:08x?}", layout.outgoing_arg_area_size));
+            }
+        }
+        eprintln!(
+            "DIRECT_LOWER_OUTGOING routes=60 emitted={emitted} failures={} actual_saved_record_overlaps={actual_saved_record_overlaps}",
+            failures.len()
+        );
+        assert_eq!(emitted, 60);
+        assert!(
+            failures.is_empty(),
+            "{}/60 direct-lower frame contracts failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn direct_lower_outgoing_indirect_explicit_frame_control_preserves_exact_stream() {
+        let mut failures = Vec::new();
+        let mut emitted = 0;
+        for (label, store, store_word, outgoing, _, _) in direct_lower_outgoing_cases() {
+            let mut func = direct_lower_outgoing_indirect_function(store);
+            crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+            // Control route supplies the independently sized area explicitly.
+            // lower_function_no_frame must not insert a second frame; its
+            // returned diagnostic layout is not used to claim a reservation.
+            let layout = frame::try_compute_frame_layout(&func, outgoing, true).unwrap();
+            assert_eq!(layout.total_frame_size, 16 + outgoing, "{label}");
+            frame::insert_prologue_epilogue(&mut func, &layout).unwrap();
+            let result = match lower_function_no_frame(&mut func) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("DIRECT_LOWER_OUTGOING_EXPLICIT_REFUSAL {label}: {error:?}");
+                    failures.push(format!("{label}: unexpected refusal {error:?}"));
+                    continue;
+                }
+            };
+            emitted += 1;
+            assert_eq!(result.code.len() % 4, 0, "{label}");
+            let words = result
+                .code
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
+                .collect::<Vec<_>>();
+            let expected = direct_lower_outgoing_words(store_word, outgoing);
+            if words != expected || !result.relocations.is_empty() {
+                failures.push(format!(
+                    "{label}: expected={expected:08x?} actual={words:08x?}"
+                ));
+            }
+        }
+        eprintln!(
+            "DIRECT_LOWER_OUTGOING_EXPLICIT routes=60 emitted={emitted} failures={}",
+            failures.len()
+        );
+        assert_eq!(emitted, 60);
+        assert!(
+            failures.is_empty(),
+            "{}/60 explicit-frame controls failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    fn direct_lower_outgoing_explicit_control(
+        mut func: MachFunction,
+        outgoing: u32,
+        expected: &[u32],
+    ) {
+        let layout = if frame::function_has_runtime_stack_slots(&func) {
+            frame::try_compute_frame_layout_dynamic(&func, outgoing, true)
+        } else {
+            frame::try_compute_frame_layout(&func, outgoing, true)
+        }
+        .unwrap();
+        assert_eq!(layout.outgoing_arg_area_size, outgoing);
+        frame::eliminate_frame_indices(&mut func, &layout).unwrap();
+        frame::insert_prologue_epilogue(&mut func, &layout).unwrap();
+        let result = lower_function_no_frame(&mut func).unwrap();
+        let words = result
+            .code
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(result.code.len(), expected.len() * 4);
+        assert_eq!(words, expected);
+        assert!(result.relocations.is_empty());
+    }
+
+    #[test]
+    fn direct_lower_outgoing_runtime_slot_retains_indirect_call_area() {
+        use trust_cg_ir::function::{StackSlot, StackSlotSizeSource};
+        // A frame with runtime-sized slots probes its static area's final SP
+        // (`str xzr, [sp]`) so a later runtime allocation starts touched.
+        let expected = [
+            0xa9bf_7bfd,
+            0x9100_03fd,
+            0xd100_83ff,
+            0xf900_03ff,
+            0xf900_0fe0,
+            0xd63f_0040,
+            0x9100_03bf,
+            0xa8c1_7bfd,
+            0xd65f_03c0,
+        ];
+        let mut failures = Vec::new();
+        let mut emitted = 0;
+        for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+            let mut func = direct_lower_outgoing_indirect_function(MachInst::new(
+                AArch64Opcode::StrRI,
+                vec![MachOperand::PReg(X0), base.clone(), MachOperand::Imm(24)],
+            ));
+            // A real runtime-sized slot selects lower_function's outer dynamic
+            // branch. It is unused metadata: this is not an executed alloca or
+            // a test of StackAlloc expansion.
+            func.alloc_stack_slot(StackSlot::new_dynamic(StackSlotSizeSource::Unknown, 16));
+            assert!(frame::function_has_runtime_stack_slots(&func));
+            assert!(
+                func.insts
+                    .iter()
+                    .all(|inst| inst.opcode != AArch64Opcode::StackAlloc)
+            );
+            crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+            direct_lower_outgoing_explicit_control(func.clone(), 32, &expected);
+            let result = match lower_function(&mut func) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("DIRECT_LOWER_OUTGOING_RUNTIME {base:?}: {error:?}");
+                    failures.push(format!("{base:?}: unexpected refusal {error:?}"));
+                    continue;
+                }
+            };
+            emitted += 1;
+            let words = result
+                .code
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
+                .collect::<Vec<_>>();
+            let layout = &result.frame_layout;
+            eprintln!(
+                "DIRECT_LOWER_OUTGOING_RUNTIME {base:?} layout={layout:?} words={words:08x?}"
+            );
+            if layout.outgoing_arg_area_size != 32
+                || layout.total_frame_size != 48
+                || layout.callee_saved_area_size != 16
+                || layout.spill_area_size != 0
+                || layout.local_area_size != 0
+                || layout.sp_adjustment() != 32
+                || layout.fp_to_spill_offset != 0
+                || !layout.has_dynamic_alloc
+                || !layout.uses_frame_pointer
+                || layout.is_leaf
+                || layout.uses_red_zone
+                || frame::stack_slot_frame_offsets(&func, layout) != vec![None]
+                || result.code.len() != 36
+                || words != expected
+                || !result.relocations.is_empty()
+            {
+                failures.push(format!(
+                    "{base:?}: expected dynamic outgoing32/frame48; {layout:?}; words={words:08x?}"
+                ));
+            }
+        }
+        eprintln!(
+            "DIRECT_LOWER_OUTGOING_RUNTIME direct=2 explicit=2 emitted={emitted} failures={}",
+            failures.len()
+        );
+        assert_eq!(emitted, 2, "{failures:?}");
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn direct_lower_outgoing_local_and_saved_pair_stay_above_indirect_call_area() {
+        use trust_cg_ir::function::StackSlot;
+        let expected = [
+            0xa9be_4ff4,
+            0xa901_7bfd,
+            0x9100_43fd,
+            0xd100_c3ff,
+            0xd100_83b3,
+            0xf900_0260,
+            0xf900_0fe0,
+            0xd63f_0040,
+            0xf940_0260,
+            0x9100_c3ff,
+            0xa941_7bfd,
+            0xa8c2_4ff4,
+            0xd65f_03c0,
+        ];
+        let mut failures = Vec::new();
+        let mut emitted = 0;
+        for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+            let mut func = make_func("direct_lower_outgoing_local", vec![]);
+            func.signature = Signature::new(vec![], vec![Type::I64]);
+            let slot = func.alloc_stack_slot(StackSlot::new(16, 16));
+            for inst in [
+                // StackAddr uses the existing frame-address producer route;
+                // FIE must turn it into SUB X19,X29,#32, not a relocation.
+                MachInst::new(
+                    AArch64Opcode::AddPCRel,
+                    vec![
+                        MachOperand::PReg(X19),
+                        MachOperand::PReg(SP),
+                        MachOperand::StackSlot(slot),
+                    ],
+                ),
+                MachInst::new(
+                    AArch64Opcode::StrRI,
+                    vec![MachOperand::PReg(X0), MachOperand::PReg(X19)],
+                ),
+                MachInst::new(
+                    AArch64Opcode::StrRI,
+                    vec![MachOperand::PReg(X0), base.clone(), MachOperand::Imm(24)],
+                ),
+                MachInst::new(AArch64Opcode::Blr, vec![MachOperand::PReg(X2)]),
+                MachInst::new(
+                    AArch64Opcode::LdrRI,
+                    vec![MachOperand::PReg(X0), MachOperand::PReg(X19)],
+                ),
+                MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]),
+            ] {
+                let id = func.push_inst(inst);
+                func.append_inst(func.entry, id);
+            }
+            crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+            direct_lower_outgoing_explicit_control(func.clone(), 32, &expected);
+            let result = match lower_function(&mut func) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("DIRECT_LOWER_OUTGOING_LOCAL {base:?}: {error:?}");
+                    failures.push(format!("{base:?}: unexpected refusal {error:?}"));
+                    continue;
+                }
+            };
+            emitted += 1;
+            let words = result
+                .code
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
+                .collect::<Vec<_>>();
+            let layout = &result.frame_layout;
+            // Body SP is FP-64. Outgoing bytes are [SP,SP+32), the
+            // fixed slot is [FP-32,FP-16), extra saves [FP-16,FP),
+            // then the saved FP/LR record [FP,FP+16).
+            eprintln!("DIRECT_LOWER_OUTGOING_LOCAL {base:?} layout={layout:?} words={words:08x?}");
+            if layout.outgoing_arg_area_size != 32
+                || layout.total_frame_size != 80
+                || layout.callee_saved_area_size != 32
+                || layout.spill_area_size != 16
+                || layout.local_area_size != 0
+                || layout.sp_adjustment() != 48
+                || layout.fp_to_spill_offset != -16
+                || layout.has_dynamic_alloc
+                || layout.callee_saved_pairs.len() != 2
+                || !layout.uses_frame_pointer
+                || layout.is_leaf
+                || layout.uses_red_zone
+                || frame::stack_slot_frame_offsets(&func, layout) != vec![Some(-32)]
+                || result.code.len() != 52
+                || words != expected
+                || !result.relocations.is_empty()
+            {
+                failures.push(format!("{base:?}: expected outgoing32/local16/CSA32/frame80; {layout:?}; words={words:08x?}"));
+            }
+        }
+        eprintln!(
+            "DIRECT_LOWER_OUTGOING_LOCAL direct=2 explicit=2 emitted={emitted} failures={}",
+            failures.len()
+        );
+        assert_eq!(emitted, 2, "{failures:?}");
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn direct_lower_outgoing_oversized_sp_stores_refuse_on_both_public_routes() {
+        use crate::pipeline::{OptLevel, Pipeline, PipelineConfig, PipelineError};
+        let pipeline = Pipeline::new(PipelineConfig {
+            opt_level: OptLevel::O0,
+            target_triple: "aarch64-unknown-linux-gnu".into(),
+            ..PipelineConfig::default()
+        });
+        let mut attempts = 0;
+        let mut failures = Vec::new();
+        for offset in [i64::from(u32::MAX) - 7, i64::from(u32::MAX) + 1, i64::MAX] {
+            for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+                let func = direct_lower_outgoing_indirect_function(MachInst::new(
+                    AArch64Opcode::StrRI,
+                    vec![
+                        MachOperand::PReg(X0),
+                        base.clone(),
+                        MachOperand::Imm(offset),
+                    ],
+                ));
+                crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+                // No wrapping area credit. This alone is NOT successful
+                // safety evidence: both complete public routes must refuse.
+                assert_eq!(frame::compute_max_outgoing_arg_size(&func), 0);
+                let direct = lower_function(&mut func.clone());
+                let piped = pipeline.encode_and_emit(&mut func.clone());
+                attempts += 2;
+                let direct_reason = format!(
+                    "encoding failed: invalid operand at index 1 for StrRI: offset {offset} out of range for both unsigned and unscaled encoding"
+                );
+                let pipeline_reason = format!(
+                    "frame-address materialization: SP-relative offset {offset} exceeds the ±4095 immediate range and the shifted-register add/sub form cannot take SP as Rn without a second scratch — kept fail-closed"
+                );
+                eprintln!(
+                    "DIRECT_LOWER_OUTGOING_OVERSIZE {base:?}/{offset} direct={direct:?} pipeline={piped:?}"
+                );
+                if !matches!(&direct, Err(LowerError::EncodingFailed(reason)) if reason == &direct_reason)
+                {
+                    failures.push(format!(
+                        "{base:?}/{offset}: wrong direct outcome {direct:?}"
+                    ));
+                }
+                if !matches!(&piped, Err(PipelineError::Encoding(reason)) if reason == &pipeline_reason)
+                {
+                    failures.push(format!(
+                        "{base:?}/{offset}: wrong pipeline outcome {piped:?}"
+                    ));
+                }
+            }
+        }
+        eprintln!(
+            "DIRECT_LOWER_OUTGOING_OVERSIZE attempts={attempts} expected_refusals=12 failures={}",
+            failures.len()
+        );
+        assert_eq!(attempts, 12);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 
     #[test]
     fn test_lower_function_simple() {
@@ -3115,6 +3648,507 @@ mod tests {
         );
     }
 
+    fn pair_memory_legacy_cases() -> Vec<(AArch64Opcode, u16, u32, i64)> {
+        let mut rows = Vec::new();
+        // Independent signed-offset store literals: W, X, S, D, Q.
+        for (opcode, mode, load, q_only) in [
+            (AArch64Opcode::StpRI, 2, false, false),
+            (AArch64Opcode::LdpRI, 2, true, false),
+            (AArch64Opcode::StpPreIndex, 3, false, false),
+            (AArch64Opcode::LdpPostIndex, 1, true, false),
+            (AArch64Opcode::NeonStpQPost, 1, false, true),
+            (AArch64Opcode::NeonLdpQPost, 1, true, true),
+        ] {
+            for (bank, literal, scale) in [
+                (32, 0x2900_0000u32, 4),
+                (0, 0xa900_0000, 8),
+                (128, 0x2d00_0000, 4),
+                (96, 0x6d00_0000, 8),
+                (64, 0xad00_0000, 16),
+            ] {
+                if !q_only || bank == 64 {
+                    rows.push((
+                        opcode,
+                        bank,
+                        (literal & !(3 << 23)) | (mode << 23) | (u32::from(load) << 22),
+                        scale,
+                    ));
+                }
+            }
+        }
+        rows
+    }
+
+    fn pair_memory_legacy_reg(bank: u16, number: u16) -> MachOperand {
+        use trust_cg_ir::regs::WZR;
+        MachOperand::PReg(match (bank, number) {
+            (0, 31) => XZR,
+            (32, 31) => WZR,
+            _ => PReg::new(bank + number),
+        })
+    }
+
+    #[test]
+    fn pair_memory_legacy_literal_parity() {
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        let rows = pair_memory_legacy_cases();
+        assert_eq!(rows.len(), 22);
+        for (opcode, bank, literal, scale) in rows {
+            for (rt, rt2) in [(0, 1), (30, 31)] {
+                for base in [
+                    MachOperand::PReg(X19),
+                    MachOperand::PReg(SP),
+                    MachOperand::Special(SpecialReg::SP),
+                ] {
+                    for quotient in [None, Some(-64i64), Some(0), Some(63)] {
+                        let rn = if base == MachOperand::PReg(X19) {
+                            19
+                        } else {
+                            31
+                        };
+                        let mut operands = vec![
+                            pair_memory_legacy_reg(bank, rt),
+                            pair_memory_legacy_reg(bank, rt2),
+                            base.clone(),
+                        ];
+                        if let Some(q) = quotient {
+                            operands.push(MachOperand::Imm(q * scale));
+                        }
+                        let inst = MachInst::new(opcode, operands);
+                        let expected = literal
+                            | (((quotient.unwrap_or(0) as u32) & 127) << 15)
+                            | (u32::from(rt2) << 10)
+                            | (rn << 5)
+                            | u32::from(rt);
+                        for (route, actual) in [
+                            ("legacy", encode_inst(&inst).map_err(|e| e.to_string())),
+                            (
+                                "unified",
+                                encode_instruction(&inst).map_err(|e| e.to_string()),
+                            ),
+                        ] {
+                            attempted += 1;
+                            if actual != Ok(expected) {
+                                failures.push(format!(
+                                    "{route} {inst:?}: {actual:?}, expected {expected:#010x}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 1056);
+        assert!(
+            failures.is_empty(),
+            "{}/1056 pair literal route failures; first32:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(32)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn pair_memory_legacy_malformed_shape_and_banks_refuse() {
+        use trust_cg_ir::regs::{D0, H0, V0, WSP, WZR};
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for (opcode, bank, _, scale) in pair_memory_legacy_cases()
+            .into_iter()
+            .filter(|(_, bank, _, _)| *bank == 0 || *bank == 64)
+        {
+            let good = vec![
+                pair_memory_legacy_reg(bank, 0),
+                pair_memory_legacy_reg(bank, 1),
+                MachOperand::PReg(X19),
+                MachOperand::Imm(0),
+            ];
+            let mut bad = Vec::new();
+            for length in 0..3 {
+                bad.push(good[..length].to_vec());
+            }
+            let mut tail = good.clone();
+            tail.push(MachOperand::Imm(0));
+            bad.push(tail);
+            for offset in [
+                MachOperand::PReg(X2),
+                MachOperand::Imm(scale * 64),
+                MachOperand::Imm(-scale * 65),
+                MachOperand::Imm(1),
+                MachOperand::Imm(i64::MIN),
+                MachOperand::Imm(i64::MAX),
+            ] {
+                let mut operands = good.clone();
+                operands[3] = offset;
+                bad.push(operands);
+            }
+            for base in [
+                MachOperand::PReg(W0),
+                MachOperand::PReg(WSP),
+                MachOperand::PReg(XZR),
+                MachOperand::PReg(WZR),
+                MachOperand::PReg(D0),
+                MachOperand::PReg(V0),
+                MachOperand::PReg(PReg::new(162)),
+                MachOperand::PReg(PReg::new(4095)),
+                MachOperand::Special(SpecialReg::XZR),
+                MachOperand::Special(SpecialReg::WZR),
+            ] {
+                let mut operands = good.clone();
+                operands[2] = base;
+                bad.push(operands);
+            }
+            for data in [
+                MachOperand::PReg(SP),
+                MachOperand::PReg(WSP),
+                MachOperand::Special(SpecialReg::SP),
+                MachOperand::PReg(H0),
+                MachOperand::PReg(PReg::new(162)),
+                MachOperand::PReg(PReg::new(4095)),
+            ] {
+                for pos in [0, 1] {
+                    let mut operands = good.clone();
+                    operands[pos] = data.clone();
+                    bad.push(operands);
+                }
+            }
+            assert_eq!(bad.len(), 32);
+            for operands in bad {
+                let inst = MachInst::new(opcode, operands);
+                for (route, admitted) in [
+                    ("legacy", encode_inst(&inst).is_ok()),
+                    ("unified", encode_instruction(&inst).is_ok()),
+                ] {
+                    attempted += 1;
+                    if admitted {
+                        failures.push(format!("{route} admitted {inst:?}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 640);
+        assert!(
+            failures.is_empty(),
+            "{}/640 malformed pair admissions; first32:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(32)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn pair_memory_legacy_zero_and_alias_policy() {
+        use trust_cg_ir::regs::WZR;
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for (opcode, bank, literal, _) in pair_memory_legacy_cases() {
+            let load = matches!(
+                opcode,
+                AArch64Opcode::LdpRI | AArch64Opcode::LdpPostIndex | AArch64Opcode::NeonLdpQPost
+            );
+            let writeback = !matches!(opcode, AArch64Opcode::LdpRI | AArch64Opcode::StpRI);
+            for number in [0, 31] {
+                let inst = MachInst::new(
+                    opcode,
+                    vec![
+                        pair_memory_legacy_reg(bank, number),
+                        pair_memory_legacy_reg(bank, number),
+                        MachOperand::PReg(X19),
+                        MachOperand::Imm(0),
+                    ],
+                );
+                let expected = literal | (u32::from(number) << 10) | (19 << 5) | u32::from(number);
+                for (route, actual) in [
+                    ("legacy", encode_inst(&inst).map_err(|e| e.to_string())),
+                    (
+                        "unified",
+                        encode_instruction(&inst).map_err(|e| e.to_string()),
+                    ),
+                ] {
+                    attempted += 1;
+                    if (load && actual.is_ok()) || (!load && actual != Ok(expected)) {
+                        failures.push(format!("duplicate {route} {inst:?}: {actual:?}"));
+                    }
+                }
+            }
+            let inst = MachInst::new(
+                opcode,
+                vec![
+                    pair_memory_legacy_reg(bank, 0),
+                    pair_memory_legacy_reg(bank, 1),
+                    MachOperand::PReg(X0),
+                    MachOperand::Imm(0),
+                ],
+            );
+            let reject = writeback && matches!(bank, 0 | 32);
+            for (route, actual) in [
+                ("legacy", encode_inst(&inst).map_err(|e| e.to_string())),
+                (
+                    "unified",
+                    encode_instruction(&inst).map_err(|e| e.to_string()),
+                ),
+            ] {
+                attempted += 1;
+                if (reject && actual.is_ok()) || (!reject && actual != Ok(literal | (1 << 10))) {
+                    failures.push(format!("alias {route} {inst:?}: {actual:?}"));
+                }
+            }
+        }
+        assert_eq!(attempted, 132);
+        // All physical/special zero spellings retain their explicit widths.
+        for (zero, other, literal) in [
+            (MachOperand::PReg(XZR), X1, 0xa900_0000u32),
+            (MachOperand::Special(SpecialReg::XZR), X1, 0xa900_0000),
+            (MachOperand::PReg(WZR), W1, 0x2900_0000),
+            (MachOperand::Special(SpecialReg::WZR), W1, 0x2900_0000),
+        ] {
+            let inst = MachInst::new(
+                AArch64Opcode::StpRI,
+                vec![zero, MachOperand::PReg(other), MachOperand::PReg(X19)],
+            );
+            for (route, actual) in [
+                ("legacy", encode_inst(&inst).map_err(|e| e.to_string())),
+                (
+                    "unified",
+                    encode_instruction(&inst).map_err(|e| e.to_string()),
+                ),
+            ] {
+                attempted += 1;
+                if actual != Ok(literal | (1 << 10) | (19 << 5) | 31) {
+                    failures.push(format!("zero {route} {inst:?}: {actual:?}"));
+                }
+            }
+        }
+        assert_eq!(attempted, 140);
+        assert!(
+            failures.is_empty(),
+            "{}/140 pair alias/zero failures; first32:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(32)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    fn scalar_writeback_literal_bases() -> [(AArch64Opcode, u32); 4] {
+        // Independently transcribed W-register encodings with imm9/Rn/Rt=0.
+        // Bit30 selects X width; pre-index is mode11, post-index mode01.
+        [
+            (AArch64Opcode::LdrPreIndex, 0xb840_0c00),
+            (AArch64Opcode::StrPreIndex, 0xb800_0c00),
+            (AArch64Opcode::LdrPostIndex, 0xb840_0400),
+            (AArch64Opcode::StrPostIndex, 0xb800_0400),
+        ]
+    }
+
+    #[test]
+    fn scalar_writeback_legacy_literal_parity() {
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for (opcode, w_base) in scalar_writeback_literal_bases() {
+            for (transfer, width_bit, rt) in [
+                (MachOperand::PReg(W0), 0, 0),
+                (MachOperand::PReg(X0), 1 << 30, 0),
+                (MachOperand::PReg(WZR), 0, 31),
+                (MachOperand::PReg(XZR), 1 << 30, 31),
+                (MachOperand::Special(SpecialReg::WZR), 0, 31),
+                (MachOperand::Special(SpecialReg::XZR), 1 << 30, 31),
+            ] {
+                for (base, rn) in [
+                    (MachOperand::PReg(X1), 1),
+                    (MachOperand::PReg(SP), 31),
+                    (MachOperand::Special(SpecialReg::SP), 31),
+                ] {
+                    for offset in [-256_i64, -1, 0, 255] {
+                        attempted += 1;
+                        let expected =
+                            w_base | width_bit | (((offset as u32) & 511) << 12) | (rn << 5) | rt;
+                        let inst = MachInst::new(
+                            opcode,
+                            vec![transfer.clone(), base.clone(), MachOperand::Imm(offset)],
+                        );
+                        for (route, result) in [
+                            ("legacy", encode_inst(&inst).map_err(|e| e.to_string())),
+                            (
+                                "unified",
+                                encode_instruction(&inst).map_err(|e| e.to_string()),
+                            ),
+                        ] {
+                            if result != Ok(expected) {
+                                failures.push(format!(
+                                    "{route}/{inst:?}: expected {expected:08x}, got {result:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 288);
+        assert!(
+            failures.is_empty(),
+            "{} mismatched route outcomes in {} literal cases (two routes each):\n{}",
+            failures.len(),
+            attempted,
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn scalar_writeback_legacy_and_unified_refuse_malformed_operands() {
+        use trust_cg_ir::regs::{B0, D0, H0, NZCV, S0, V0};
+
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for (opcode, _) in scalar_writeback_literal_bases() {
+            let mut malformed = vec![
+                vec![],
+                vec![MachOperand::PReg(X0)],
+                vec![MachOperand::PReg(X0), MachOperand::PReg(X1)],
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(0),
+                    MachOperand::Imm(1),
+                ],
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(0),
+                    MachOperand::PReg(X2),
+                ],
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::MemOp {
+                        base: X1,
+                        offset: 0,
+                    },
+                ],
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::PReg(X2),
+                ],
+            ];
+            for offset in [-257_i64, 256, i64::MIN, i64::MAX, 1_i64 << 32] {
+                malformed.push(vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(offset),
+                ]);
+            }
+            for transfer in [SP, WSP, V0, D0, S0, H0, B0, NZCV, PReg::new(u16::MAX)] {
+                malformed.push(vec![
+                    MachOperand::PReg(transfer),
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(8),
+                ]);
+            }
+            malformed.push(vec![
+                MachOperand::Special(SpecialReg::SP),
+                MachOperand::PReg(X1),
+                MachOperand::Imm(8),
+            ]);
+            for base in [
+                W0,
+                WSP,
+                V0,
+                D0,
+                S0,
+                H0,
+                B0,
+                NZCV,
+                PReg::new(u16::MAX),
+                XZR,
+                WZR,
+            ] {
+                malformed.push(vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(base),
+                    MachOperand::Imm(8),
+                ]);
+            }
+            for base in [SpecialReg::XZR, SpecialReg::WZR] {
+                malformed.push(vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::Special(base),
+                    MachOperand::Imm(8),
+                ]);
+            }
+            assert_eq!(malformed.len(), 35);
+            for operands in malformed {
+                attempted += 1;
+                let inst = MachInst::new(opcode, operands);
+                for (route, accepted) in [
+                    ("legacy", encode_inst(&inst).is_ok()),
+                    ("unified", encode_instruction(&inst).is_ok()),
+                ] {
+                    if accepted {
+                        failures.push(format!("{route}: malformed instruction encoded: {inst:?}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 140);
+        assert!(
+            failures.is_empty(),
+            "{} malformed route admissions in {attempted} cases (two routes each):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn scalar_writeback_legacy_and_unified_refuse_every_cross_width_overlap() {
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for (opcode, _) in scalar_writeback_literal_bases() {
+            for register in 0..31_u16 {
+                for bank in [0, 32] {
+                    attempted += 1;
+                    // Wn aliases Xn even though the PReg identities differ.
+                    let inst = MachInst::new(
+                        opcode,
+                        vec![
+                            MachOperand::PReg(PReg::new(register + bank)),
+                            MachOperand::PReg(PReg::new(register)),
+                            MachOperand::Imm(8),
+                        ],
+                    );
+                    for (route, accepted) in [
+                        ("legacy", encode_inst(&inst).is_ok()),
+                        ("unified", encode_instruction(&inst).is_ok()),
+                    ] {
+                        if accepted {
+                            failures.push(format!(
+                                "{route}: overlapping instruction encoded: {inst:?}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 248);
+        assert!(
+            failures.is_empty(),
+            "{} overlapping route admissions in {attempted} cases (two routes each):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn test_scalar_writeback_allows_xzr_transfer() {
         for opcode in [
@@ -3287,14 +4321,14 @@ mod tests {
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("pair transfer register operand"),
-            "Error should mention pair transfer register, got: {}",
+            err_msg.contains("index 0") && err_msg.contains("never SP/WSP"),
+            "Error should identify the forbidden SP transfer, got: {}",
             err_msg
         );
     }
 
     #[test]
-    fn test_pair_offset_rejects_special_transfer_registers() {
+    fn test_pair_offset_distinguishes_special_sp_and_zero_transfers() {
         let sp_transfer = MachInst::new(
             AArch64Opcode::StpRI,
             vec![
@@ -3318,14 +4352,15 @@ mod tests {
                 MachOperand::Imm(0),
             ],
         );
-        assert!(
-            encode_inst(&xzr_transfer).is_err(),
-            "Special(XZR) should not validate as a pair transfer operand"
+        assert_eq!(
+            encode_inst(&xzr_transfer).unwrap(),
+            0xa940_07ff,
+            "LDP XZR, X1, [SP, #0] has a legal distinct discarded destination"
         );
     }
 
     #[test]
-    fn test_pair_offset_rejects_preg_zero_transfer_registers() {
+    fn test_pair_offset_accepts_preg_zero_but_rejects_mixed_widths() {
         let xzr_transfer = MachInst::new(
             AArch64Opcode::StpRI,
             vec![
@@ -3335,9 +4370,10 @@ mod tests {
                 MachOperand::Imm(0),
             ],
         );
-        assert!(
-            encode_inst(&xzr_transfer).is_err(),
-            "PReg(XZR) should not validate as a pair transfer operand"
+        assert_eq!(
+            encode_inst(&xzr_transfer).unwrap(),
+            0xa900_03ff,
+            "STP XZR, X0, [SP, #0] stores an eight-byte zero first"
         );
 
         let wzr_transfer = MachInst::new(
@@ -3351,7 +4387,7 @@ mod tests {
         );
         assert!(
             encode_inst(&wzr_transfer).is_err(),
-            "PReg(WZR) should not validate as a pair transfer operand"
+            "X0 and WZR are different transfer widths and cannot form one pair"
         );
     }
 
@@ -3378,8 +4414,8 @@ mod tests {
             );
             let err_msg = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains("pair base register operand"),
-                "Error should mention pair base register, got: {}",
+                err_msg.contains("index 2") && err_msg.contains("64-bit GPR or SP memory base"),
+                "Error should identify the invalid memory base, got: {}",
                 err_msg
             );
         }
@@ -3405,8 +4441,8 @@ mod tests {
             );
             let err_msg = result.unwrap_err().to_string();
             assert!(
-                err_msg.contains("pair offset immediate operand"),
-                "Error should mention pair offset immediate, got: {}",
+                err_msg.contains("index 3") && err_msg.contains("expected immediate"),
+                "Error should identify the pair offset immediate, got: {}",
                 err_msg
             );
         }
@@ -3730,6 +4766,298 @@ mod tests {
     // -----------------------------------------------------------------------
     // LDR/STR register offset encoding tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_offset_legacy_literal_parity() {
+        use trust_cg_ir::regs::{D0, D31, H0, H31, S0, S31, V0, V31, X30};
+
+        // Authored architectural store words with zero register fields and
+        // option/S unset. Q uses opc=10; the other stores use opc=00.
+        let transfers = [
+            (MachOperand::PReg(W0), 0xb820_0800_u32, 0),
+            (MachOperand::PReg(X0), 0xf820_0800, 0),
+            (MachOperand::PReg(H0), 0x7c20_0800, 0),
+            (MachOperand::PReg(S0), 0xbc20_0800, 0),
+            (MachOperand::PReg(D0), 0xfc20_0800, 0),
+            (MachOperand::PReg(V0), 0x3ca0_0800, 0),
+            (MachOperand::PReg(H31), 0x7c20_0800, 31),
+            (MachOperand::PReg(S31), 0xbc20_0800, 31),
+            (MachOperand::PReg(D31), 0xfc20_0800, 31),
+            (MachOperand::PReg(V31), 0x3ca0_0800, 31),
+            (MachOperand::PReg(WZR), 0xb820_0800, 31),
+            (MachOperand::PReg(XZR), 0xf820_0800, 31),
+            (MachOperand::Special(SpecialReg::WZR), 0xb820_0800, 31),
+            (MachOperand::Special(SpecialReg::XZR), 0xf820_0800, 31),
+        ];
+        let modes = [
+            None,
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(12),
+            Some(13),
+            Some(14),
+            Some(15),
+        ];
+        let mut attempted = 0;
+        let mut failures = Vec::new();
+        for opcode in [AArch64Opcode::LdrRO, AArch64Opcode::StrRO] {
+            for (transfer, store_word, rt) in &transfers {
+                for (base, rn) in [
+                    (MachOperand::PReg(X0), 0),
+                    (MachOperand::PReg(SP), 31),
+                    (MachOperand::Special(SpecialReg::SP), 31),
+                ] {
+                    for mode in modes {
+                        let packed = mode.unwrap_or(6);
+                        let mut indices = vec![
+                            (MachOperand::PReg(X0), 0),
+                            (MachOperand::PReg(X30), 30),
+                            (MachOperand::PReg(XZR), 31),
+                            (MachOperand::Special(SpecialReg::XZR), 31),
+                            (MachOperand::PReg(WZR), 31),
+                            (MachOperand::Special(SpecialReg::WZR), 31),
+                        ];
+                        if matches!(packed, 4 | 5 | 12 | 13) {
+                            indices.push((MachOperand::PReg(W2), 2));
+                        }
+                        for (index, rm) in indices {
+                            attempted += 1;
+                            let mut operands = vec![transfer.clone(), base.clone(), index];
+                            if let Some(mode) = mode {
+                                operands.push(MachOperand::Imm(mode));
+                            }
+                            let inst = MachInst::new(opcode, operands);
+                            let load_bit = if opcode == AArch64Opcode::LdrRO {
+                                1 << 22
+                            } else {
+                                0
+                            };
+                            let expected = *store_word
+                                | load_bit
+                                | (rm << 16)
+                                | (((packed as u32) >> 1) << 13)
+                                | (((packed as u32) & 1) << 12)
+                                | (rn << 5)
+                                | *rt;
+                            for (route, result) in [
+                                ("legacy", encode_inst(&inst).map_err(|e| e.to_string())),
+                                (
+                                    "unified",
+                                    encode_instruction(&inst).map_err(|e| e.to_string()),
+                                ),
+                            ] {
+                                if result != Ok(expected) {
+                                    failures.push(format!(
+                                        "{route}/{inst:?}: expected {expected:08x}, got {result:?}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 4_872);
+        assert!(
+            failures.is_empty(),
+            "{} mismatched route outcomes in {attempted} literal cases (two routes each; first 32 shown):\n{}",
+            failures.len(),
+            failures[..failures.len().min(32)].join("\n")
+        );
+    }
+
+    #[test]
+    fn register_offset_legacy_refuses_raw_modes_and_shapes() {
+        use trust_cg_ir::regs::VReg;
+
+        let canonical = vec![
+            MachOperand::PReg(X0),
+            MachOperand::PReg(X1),
+            MachOperand::PReg(X2),
+        ];
+        let mut malformed = vec![vec![], canonical[..1].to_vec(), canonical[..2].to_vec()];
+        for packed in [
+            -1_i64,
+            i64::MIN,
+            i64::MAX,
+            0,
+            1,
+            2,
+            3,
+            8,
+            9,
+            10,
+            11,
+            16,
+            20,
+            21,
+            22,
+            23,
+            28,
+            29,
+            30,
+            31,
+            (1_i64 << 32) + 4,
+            (1_i64 << 32) + 6,
+            (1_i64 << 32) + 12,
+            -(1_i64 << 32) + 6,
+        ] {
+            let mut operands = canonical.clone();
+            operands.push(MachOperand::Imm(packed));
+            malformed.push(operands);
+        }
+        for mode in [
+            MachOperand::PReg(X0),
+            MachOperand::Special(SpecialReg::XZR),
+            MachOperand::VReg(VReg::new(0, RegClass::Gpr64)),
+            MachOperand::MemOp {
+                base: X0,
+                offset: 6,
+            },
+        ] {
+            let mut operands = canonical.clone();
+            operands.push(mode);
+            malformed.push(operands);
+        }
+        for tail in [MachOperand::Imm(0), MachOperand::PReg(X2)] {
+            let mut operands = canonical.clone();
+            operands.extend([MachOperand::Imm(6), tail]);
+            malformed.push(operands);
+        }
+        assert_eq!(malformed.len(), 33);
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for opcode in [AArch64Opcode::LdrRO, AArch64Opcode::StrRO] {
+            for operands in &malformed {
+                attempted += 1;
+                let inst = MachInst::new(opcode, operands.clone());
+                for (route, accepted) in [
+                    ("legacy", encode_inst(&inst).is_ok()),
+                    ("unified", encode_instruction(&inst).is_ok()),
+                ] {
+                    if accepted {
+                        failures.push(format!("{route}: malformed instruction encoded: {inst:?}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 66);
+        assert!(
+            failures.is_empty(),
+            "{} malformed route admissions in {attempted} cases (two routes each; first 32 shown):\n{}",
+            failures.len(),
+            failures[..failures.len().min(32)].join("\n")
+        );
+    }
+
+    #[test]
+    fn register_offset_legacy_refuses_wrong_operand_banks() {
+        use trust_cg_ir::regs::{B0, D0, H0, NZCV, S0, V0, VReg};
+
+        let invalid_by_position = [
+            vec![SP, WSP, B0, NZCV, PReg::new(u16::MAX)],
+            vec![
+                W0,
+                WSP,
+                XZR,
+                WZR,
+                H0,
+                S0,
+                D0,
+                V0,
+                B0,
+                NZCV,
+                PReg::new(u16::MAX),
+            ],
+            vec![SP, WSP, H0, S0, D0, V0, B0, NZCV, PReg::new(u16::MAX)],
+        ];
+        let mut malformed = Vec::new();
+        for mode in [
+            None,
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(12),
+            Some(13),
+            Some(14),
+            Some(15),
+        ] {
+            for (position, invalid) in invalid_by_position.iter().enumerate() {
+                let mut replacements: Vec<_> =
+                    invalid.iter().copied().map(MachOperand::PReg).collect();
+                replacements.extend([
+                    MachOperand::Imm(0),
+                    MachOperand::VReg(VReg::new(position as u32, RegClass::Gpr64)),
+                    MachOperand::MemOp {
+                        base: X1,
+                        offset: 0,
+                    },
+                ]);
+                if position == 1 {
+                    replacements.extend([
+                        MachOperand::Special(SpecialReg::XZR),
+                        MachOperand::Special(SpecialReg::WZR),
+                    ]);
+                } else {
+                    replacements.push(MachOperand::Special(SpecialReg::SP));
+                }
+                for replacement in replacements {
+                    let mut operands = vec![
+                        MachOperand::PReg(X0),
+                        MachOperand::PReg(X1),
+                        MachOperand::PReg(X2),
+                    ];
+                    operands[position] = replacement;
+                    if let Some(mode) = mode {
+                        operands.push(MachOperand::Imm(mode));
+                    }
+                    malformed.push(operands);
+                }
+            }
+        }
+        // Unlike a W spill reload, a bare physical Wn carries no proof that
+        // Xn's upper half is zero. Explicit zero aliases are positive above.
+        for mode in [None, Some(6), Some(7), Some(14), Some(15)] {
+            for index in [W0, PReg::new(62)] {
+                let mut operands = vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::PReg(index),
+                ];
+                if let Some(mode) = mode {
+                    operands.push(MachOperand::Imm(mode));
+                }
+                malformed.push(operands);
+            }
+        }
+        assert_eq!(malformed.len(), 352);
+        let mut attempted = 0;
+        let mut failures = Vec::new();
+        for opcode in [AArch64Opcode::LdrRO, AArch64Opcode::StrRO] {
+            for operands in &malformed {
+                attempted += 1;
+                let inst = MachInst::new(opcode, operands.clone());
+                for (route, accepted) in [
+                    ("legacy", encode_inst(&inst).is_ok()),
+                    ("unified", encode_instruction(&inst).is_ok()),
+                ] {
+                    if accepted {
+                        failures.push(format!("{route}: malformed instruction encoded: {inst:?}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 704);
+        assert!(
+            failures.is_empty(),
+            "{} malformed route admissions in {attempted} cases (two routes each; first 32 shown):\n{}",
+            failures.len(),
+            failures[..failures.len().min(32)].join("\n")
+        );
+    }
 
     #[test]
     fn test_encode_ldr_ro() {
@@ -4207,5 +5535,185 @@ mod tests {
                 .expect_err("malformed TST must fail closed");
             assert!(matches!(err, LowerError::EncodingFailed(_)));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Switch-dispatch binding on the `lower` routes
+    // -----------------------------------------------------------------------
+
+    /// `bb0: CMP X0, #3 ; B.EQ bb2` / `bb1: TBZ X1, #3, bb3` / `bb2: 9000 x
+    /// ADD X2, X2, #1 ; RET` / `bb3: RET`. The TBZ target lies beyond TBZ's
+    /// 32 KiB range, so relaxation rewrites it to `TBNZ X1, #3, +8 ; B bb3`.
+    fn compare_and_far_test_branch() -> MachFunction {
+        let sig = Signature::new(vec![], vec![]);
+        let mut func = MachFunction::new("relaxed_dispatch".to_string(), sig);
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let push = |func: &mut MachFunction, block: BlockId, inst: MachInst| {
+            let id = func.push_inst(inst);
+            func.append_inst(block, id);
+        };
+        push(
+            &mut func,
+            bb0,
+            MachInst::new(
+                AArch64Opcode::CmpRI,
+                vec![MachOperand::PReg(X0), MachOperand::Imm(3)],
+            ),
+        );
+        push(
+            &mut func,
+            bb0,
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    MachOperand::Imm(i64::from(trust_cg_ir::CondCode::EQ.encoding())),
+                    MachOperand::Block(bb2),
+                ],
+            ),
+        );
+        push(
+            &mut func,
+            bb1,
+            MachInst::new(
+                AArch64Opcode::Tbz,
+                vec![
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(3),
+                    MachOperand::Block(bb3),
+                ],
+            ),
+        );
+        for _ in 0..9000 {
+            push(
+                &mut func,
+                bb2,
+                MachInst::new(
+                    AArch64Opcode::AddRI,
+                    vec![
+                        MachOperand::PReg(X2),
+                        MachOperand::PReg(X2),
+                        MachOperand::Imm(1),
+                    ],
+                ),
+            );
+        }
+        push(&mut func, bb2, MachInst::new(AArch64Opcode::Ret, vec![]));
+        push(&mut func, bb3, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb0, bb2);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb1, bb3);
+        func
+    }
+
+    /// The relaxing route binds the compare group and the relaxed fused
+    /// branch (an inverted `TBNZ` over the inserted `B`), and refuses a
+    /// compare immediate that no longer matches the intent although the
+    /// layout cross-check, which does not read compare operands, accepts it.
+    #[test]
+    fn relaxed_lower_path_binds_switch_dispatch() {
+        let mut func = compare_and_far_test_branch();
+        let result = lower_function(&mut func).expect("relaxed lowering binds");
+        let words: Vec<u32> = result
+            .code
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        // TBNZ X1, #3, +8 (b5=0, op=1, b40=3, imm14=2, Rt=1).
+        assert!(
+            words.contains(&0x3718_0041),
+            "the far TBZ must have been relaxed to TBNZ +8"
+        );
+        let report = trust_cg_verify::aarch64_switch_binding::check_aarch64_switch_dispatch(
+            &func,
+            &result.code,
+        )
+        .expect("the relaxed image binds");
+        assert_eq!(report.compare_groups, 1);
+        assert_eq!(report.compare_consumers, 1);
+        assert_eq!(report.fused_branches, 1);
+
+        let relaxed = relax::relax_branches(&mut func).expect("already relaxed");
+        crosscheck_relaxed_layout(&func, &relaxed, &result.code).expect("unchanged image binds");
+        // CMP X0, #3 is the first word; rewrite it to CMP X0, #4.
+        assert_eq!(words[0], 0xf100_0c1f);
+        let mut corrupt = result.code.clone();
+        corrupt[..4].copy_from_slice(&0xf100_101f_u32.to_le_bytes());
+        let err = crosscheck_relaxed_layout(&func, &relaxed, &corrupt)
+            .expect_err("a compare constant the intent does not name must refuse");
+        assert!(
+            matches!(err, LowerError::SwitchBinding { .. }),
+            "expected the switch binding to refuse, got {err:?}"
+        );
+        assert!(err.to_string().contains("[TCG-A64-SWITCH-BIND]"), "{err}");
+    }
+
+    /// Neither `lower` route appends jump tables, so a jump-table dispatch
+    /// is refused by the binding on the resolved-branch route instead of
+    /// being emitted with a placeholder `ADR` and no table.
+    #[test]
+    fn lower_encode_function_refuses_a_jump_table_it_cannot_emit() {
+        let sig = Signature::new(vec![], vec![]);
+        let mut func = MachFunction::new("unappended_table".to_string(), sig);
+        let entry = func.entry;
+        let arms: Vec<BlockId> = (0..3).map(|_| func.create_block()).collect();
+        let dispatch = vec![
+            MachInst::new(
+                AArch64Opcode::CmpRI,
+                vec![MachOperand::PReg(X0), MachOperand::Imm(1)],
+            ),
+            // B.HI to arms[0] (the default), 6 words ahead.
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    MachOperand::Imm(i64::from(trust_cg_ir::CondCode::HI.encoding())),
+                    MachOperand::Imm(5),
+                ],
+            ),
+            MachInst::new(
+                AArch64Opcode::Adr,
+                vec![MachOperand::PReg(X1), MachOperand::JumpTableIndex(0)],
+            ),
+            MachInst::new(
+                AArch64Opcode::LdrswRO,
+                vec![
+                    MachOperand::PReg(X2),
+                    MachOperand::PReg(X1),
+                    MachOperand::PReg(X0),
+                ],
+            ),
+            MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::PReg(X2),
+                ],
+            ),
+            MachInst::new(AArch64Opcode::Br, vec![MachOperand::PReg(X0)]),
+        ];
+        for inst in dispatch {
+            let id = func.push_inst(inst);
+            func.append_inst(entry, id);
+        }
+        for &arm in &arms {
+            let id = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+            func.append_inst(arm, id);
+            func.add_edge(entry, arm);
+        }
+        func.jump_tables.push(trust_cg_ir::function::JumpTableData {
+            min_val: 0,
+            targets: arms[1..].to_vec(),
+        });
+        let err = encode_function(&func).expect_err("no table is appended on this route");
+        assert!(
+            matches!(err, LowerError::SwitchBinding { .. }),
+            "expected the switch binding to refuse, got {err:?}"
+        );
     }
 }

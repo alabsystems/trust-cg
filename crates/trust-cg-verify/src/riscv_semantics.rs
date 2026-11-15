@@ -22,7 +22,6 @@
 //   - Chapter 2.4 "Integer Computational Instructions" (ADD/SUB/AND/OR/XOR/
 //     SLL/SRL/SRA/SLT/SLTU, ADDI/XORI/SLLI/SRLI/SLTIU)
 //   - "M" Standard Extension, Section 7.1 (MUL)
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! RISC-V RV64 instruction semantics encoded as [`SmtExpr`] bitvector formulas.
 //!
@@ -478,10 +477,6 @@ pub fn encode_fsub(fmt: RiscVFpFormat, rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
 pub fn encode_fsub_d(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
     encode_fsub(RiscVFpFormat::D, rs1, rs2)
 }
-/// Encode `FSUB.s`.
-pub fn encode_fsub_s(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
-    encode_fsub(RiscVFpFormat::S, rs1, rs2)
-}
 
 /// Encode `FMUL.d rd, rs1, rs2` (and `FMUL.s`) — scalar FP multiply (RNE),
 /// NaN-canonicalized. Reference: RISC-V ISA, FMUL.S / FMUL.D + Sec 11.3.
@@ -506,10 +501,6 @@ pub fn encode_fdiv(fmt: RiscVFpFormat, rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
 pub fn encode_fdiv_d(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
     encode_fdiv(RiscVFpFormat::D, rs1, rs2)
 }
-/// Encode `FDIV.s`.
-pub fn encode_fdiv_s(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
-    encode_fdiv(RiscVFpFormat::S, rs1, rs2)
-}
 
 /// Encode `FSQRT.d rd, rs1` (and `FSQRT.s`) — scalar FP square root (RNE),
 /// NaN-canonicalized (sqrt of a negative or NaN -> the RISC-V canonical NaN).
@@ -520,10 +511,6 @@ pub fn encode_fsqrt(fmt: RiscVFpFormat, rs1: SmtExpr) -> SmtExpr {
 /// Encode `FSQRT.d`.
 pub fn encode_fsqrt_d(rs1: SmtExpr) -> SmtExpr {
     encode_fsqrt(RiscVFpFormat::D, rs1)
-}
-/// Encode `FSQRT.s`.
-pub fn encode_fsqrt_s(rs1: SmtExpr) -> SmtExpr {
-    encode_fsqrt(RiscVFpFormat::S, rs1)
 }
 
 // ---------------------------------------------------------------------------
@@ -552,10 +539,6 @@ pub fn encode_feq(fmt: RiscVFpFormat, rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
 pub fn encode_feq_d(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
     encode_feq(RiscVFpFormat::D, rs1, rs2)
 }
-/// Encode `FEQ.s`.
-pub fn encode_feq_s(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
-    encode_feq(RiscVFpFormat::S, rs1, rs2)
-}
 
 /// Encode `FLT.d rd, rs1, rs2` (and `FLT.s`) — set rd=1 iff `rs1 < rs2`
 /// (ordered; NaN operand -> 0). 1-bit result. Reference: RISC-V ISA, FLT.
@@ -571,10 +554,6 @@ pub fn encode_flt(fmt: RiscVFpFormat, rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
 pub fn encode_flt_d(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
     encode_flt(RiscVFpFormat::D, rs1, rs2)
 }
-/// Encode `FLT.s`.
-pub fn encode_flt_s(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
-    encode_flt(RiscVFpFormat::S, rs1, rs2)
-}
 
 /// Encode `FLE.d rd, rs1, rs2` (and `FLE.s`) — set rd=1 iff `rs1 <= rs2`
 /// (ordered; NaN operand -> 0). 1-bit result. Reference: RISC-V ISA, FLE.
@@ -589,10 +568,6 @@ pub fn encode_fle(fmt: RiscVFpFormat, rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
 /// Encode `FLE.d`.
 pub fn encode_fle_d(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
     encode_fle(RiscVFpFormat::D, rs1, rs2)
-}
-/// Encode `FLE.s`.
-pub fn encode_fle_s(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
-    encode_fle(RiscVFpFormat::S, rs1, rs2)
 }
 
 // ---------------------------------------------------------------------------
@@ -707,10 +682,6 @@ pub fn encode_fmin(fmt: RiscVFpFormat, rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
 pub fn encode_fmin_d(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
     encode_fmin(RiscVFpFormat::D, rs1, rs2)
 }
-/// Encode `FMIN.s`.
-pub fn encode_fmin_s(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
-    encode_fmin(RiscVFpFormat::S, rs1, rs2)
-}
 
 /// Encode `FMAX.d rd, rs1, rs2` (and `FMAX.s`) — RISC-V IEEE-2019
 /// maximumNumber. Reference: RISC-V ISA, Section 11.6 (FMAX.S/FMAX.D).
@@ -720,10 +691,6 @@ pub fn encode_fmax(fmt: RiscVFpFormat, rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
 /// Encode `FMAX.d`.
 pub fn encode_fmax_d(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
     encode_fmax(RiscVFpFormat::D, rs1, rs2)
-}
-/// Encode `FMAX.s`.
-pub fn encode_fmax_s(rs1: SmtExpr, rs2: SmtExpr) -> SmtExpr {
-    encode_fmax(RiscVFpFormat::S, rs1, rs2)
 }
 
 // ---------------------------------------------------------------------------

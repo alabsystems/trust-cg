@@ -80,6 +80,7 @@ fn run_triple_oracle(
 
 fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields: fields
@@ -211,6 +212,8 @@ fn ret(value: u32) -> InstrNode {
 
 fn func(id: u32, name: &str, ty: FuncTyId, blocks: Vec<TrustIrBlock>) -> TrustIrFunction {
     TrustIrFunction {
+        body_gate: None,
+        display_path: None,
         attrs: Default::default(),
         id: FuncId::new(id),
         name: name.to_string(),
@@ -225,6 +228,9 @@ fn func(id: u32, name: &str, ty: FuncTyId, blocks: Vec<TrustIrBlock>) -> TrustIr
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     }
 }
 
@@ -233,6 +239,8 @@ fn func(id: u32, name: &str, ty: FuncTyId, blocks: Vec<TrustIrBlock>) -> TrustIr
 /// can `Call` it by `FuncId` and the linker binds it to the C driver's body.
 fn extern_decl(id: u32, name: &str, ty: FuncTyId) -> TrustIrFunction {
     TrustIrFunction {
+        body_gate: None,
+        display_path: None,
         attrs: Default::default(),
         id: FuncId::new(id),
         name: name.to_string(),
@@ -247,6 +255,9 @@ fn extern_decl(id: u32, name: &str, ty: FuncTyId) -> TrustIrFunction {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     }
 }
 
@@ -257,11 +268,18 @@ fn module(
     functions: Vec<TrustIrFunction>,
 ) -> TrustIrModule {
     TrustIrModule {
+        completeness: None,
+        drop_glue: Vec::new(),
+        global_asm: vec![],
+        tuple_layouts: Vec::new(),
+        imports: vec![],
         name: name.to_string(),
         functions,
         structs,
         records: vec![],
         closure_types: vec![],
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
         globals: vec![],
         func_types,
         types: vec![],
@@ -315,6 +333,7 @@ fn i64_struct_sum_module(name: &str, agg_name: &str, n: usize) -> TrustIrModule 
         vec![FuncTy {
             params: vec![aggregate.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -413,6 +432,7 @@ fn i64_f64_mix_struct_sum_module(name: &str, agg_name: &str) -> TrustIrModule {
         vec![FuncTy {
             params: vec![aggregate.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -494,6 +514,7 @@ fn combined_callee_module(name: &str, agg_name: &str) -> TrustIrModule {
         vec![FuncTy {
             params: vec![Ty::I64, Ty::I64, aggregate.clone(), Ty::I64, Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -613,11 +634,13 @@ fn caller_calls_extern_module(name: &str, callee: &str, agg_name: &str) -> Trust
             FuncTy {
                 params: vec![Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![aggregate.clone()],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -801,11 +824,13 @@ fn self_contained_caller_callee_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -980,11 +1005,13 @@ fn stack_args_self_contained_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::I64, Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: (0..8).map(|_| Ty::I64).collect(),
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],

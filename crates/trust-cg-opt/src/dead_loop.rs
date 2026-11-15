@@ -37,6 +37,9 @@
 //!      where `T` is `iv` or `iv+1`. Unit stride + these condition codes give a
 //!      finite trip count (`b.EQ`/`b.LT` on a `+1` counter visits `bound` within
 //!      `2^bits` iterations; the monotone `>=` / `<` cases cross any fixed bound).
+//!      A register bound counts as invariant only when every write of it is
+//!      outside the body or every write materializes the same constant: a bound
+//!      that differs from trip to trip can step past an `EQ` counter forever.
 //!
 //!    Those trip-count arguments all assume the compare RUNS ONCE PER TRIP and
 //!    that a trip is finite, so two structural conditions are also required:
@@ -55,18 +58,28 @@
 //!    memory-effect model (no store, no load, no call, no atomic, no barrier, no
 //!    implicit defs/uses, no `HAS_SIDE_EFFECTS`).
 //! 4. **No value defined in the loop is live-out**, except the induction
-//!    variable. A live-out non-IV value (e.g. a reduction result) => BAIL. A
+//!    variable: the crate's one loop-state contract ([`crate::loop_contract`]),
+//!    asked with the deletion's single hand-off at the exit, so a narrower
+//!    view of a loop register and the flags count too. A live-out non-IV value
+//!    (e.g. a reduction result) => BAIL. A
 //!    live-out IV is replaced by its CLOSED-FORM final value materialized in the
 //!    preheader (only the exactly-computable constant-bounds top-tested shape is
 //!    supported; anything else BAILS).
-//! 5. **Single exit**: exactly one edge leaves the body. Rewire `preheader ->
-//!    exit`, drop the body blocks. Multiple exits => BAIL.
+//! 5. **Single exit**: the loop leaves by exactly one edge, the exit test of
+//!    (2). The ways it can leave are the loop-state contract's to enumerate
+//!    and account for ([`crate::loop_contract::loop_exits`]): a second edge, a
+//!    trap or a return is refused there. Rewire `preheader -> exit`, drop the
+//!    body blocks.
 //!
 //! The pass iterates to a local fixpoint, so nested dead loops are peeled
 //! (deleting the outer loop directly also removes an all-pure nested inner
 //! loop). Every uncertainty is resolved by BAILING.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{
+    ExitPlan, Handoff, LoopExit, LoopLocality, LoopStateEscape, StateReg, loop_exits,
+};
+use crate::mach_util::copy_like;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -114,7 +127,6 @@ impl DeadCountedLoopElimination {
         mut cached: Option<&mut AnalysisCache>,
     ) -> bool {
         self.fired = 0;
-        let dump = std::env::var("TRUST_CG_DUMP_DEADLOOP").is_ok();
         let mut changed = false;
 
         // Delete one loop per iteration, recomputing dominance + loop analysis
@@ -161,16 +173,6 @@ impl DeadCountedLoopElimination {
             let mut deleted = false;
             for lp in &loops {
                 if let Some(plan) = recognize(func, &dom, &maps, lp) {
-                    if dump {
-                        eprintln!(
-                            "[deadloop] FIRE fn={} header={:?} exit={:?} body={} liveout_iv={}",
-                            func.name,
-                            plan.header,
-                            plan.exit,
-                            plan.body.len(),
-                            plan.liveout.is_some()
-                        );
-                    }
                     apply(func, &plan);
                     self.fired += 1;
                     changed = true;
@@ -183,9 +185,6 @@ impl DeadCountedLoopElimination {
             }
         }
 
-        if changed && std::env::var("TRUST_CG_DUMP_DEADLOOP").is_ok() {
-            eprintln!("[deadloop] fn={} deleted={}", func.name, self.fired);
-        }
         changed
     }
 }
@@ -242,6 +241,10 @@ struct DeadLoopPlan {
     exiting: BlockId,
     /// Present iff the IV is live-out (closed-form final value to materialize).
     liveout: Option<LiveOutIv>,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv]` when the IV is live out (materialized), else nothing, handing off only at the exit.
+    /// The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 // ---------------------------------------------------------------------------
@@ -260,9 +263,9 @@ struct Maps {
 
 impl Maps {
     fn build(func: &MachFunction) -> Self {
-        let mut def_first: HashMap<VReg, InstId> = HashMap::new();
-        let mut def_count: HashMap<VReg, u32> = HashMap::new();
-        let mut inst_block: HashMap<InstId, BlockId> = HashMap::new();
+        let mut def_first: HashMap<VReg, InstId> = HashMap::default();
+        let mut def_count: HashMap<VReg, u32> = HashMap::default();
+        let mut inst_block: HashMap<InstId, BlockId> = HashMap::default();
         for &bid in &func.block_order {
             for &iid in &func.block(bid).insts {
                 inst_block.insert(iid, bid);
@@ -330,19 +333,24 @@ fn recognize(
         return None;
     }
 
-    // (5) Single exit edge: exactly one (body -> non-body) edge in the whole loop.
-    let mut exit_edges: Vec<(BlockId, BlockId)> = Vec::new();
-    for &b in body {
-        for &s in &func.block(b).succs {
-            if !body.contains(&s) {
-                exit_edges.push((b, s));
-            }
-        }
-    }
-    if exit_edges.len() != 1 {
+    // (5) Single exit: the loop-state contract's enumeration of the ways the
+    // loop can leave holds exactly one edge, taken by one transfer. The
+    // contract check below accounts for it as the loop test, and refuses
+    // anything else.
+    let leaves = loop_exits(func, body.iter().copied());
+    let [
+        (
+            LoopExit::Edge {
+                from: exiting,
+                to: exit,
+            },
+            1,
+        ),
+    ] = leaves.as_slice()
+    else {
         return None;
-    }
-    let (exiting, exit) = exit_edges[0];
+    };
+    let (exiting, exit) = (*exiting, *exit);
     if body.contains(&exit) {
         return None;
     }
@@ -396,7 +404,7 @@ fn recognize(
 
     // Identify the unit-stride IV from the latch write-backs, tied to the exit
     // test value.
-    let iv_info = find_counted_iv(func, dom, &maps, latch, body, &exit_test)?;
+    let iv_info = find_counted_iv(func, dom, maps, latch, body, &exit_test)?;
 
     // (2) Bound must be loop-invariant.
     if !is_loop_invariant(func, body, &exit_test.bound) {
@@ -409,25 +417,40 @@ fn recognize(
         return None;
     }
 
-    // (4) Live-out analysis.
-    let body_defs = collect_body_defs(func, body);
-    let liveouts = collect_liveouts(func, body, &body_defs);
-
-    let liveout = if liveouts.is_empty() {
-        None
-    } else if liveouts.len() == 1 && liveouts.contains(&iv_info.iv) {
-        // The IV is the only live-out value: materialize its closed-form final
-        // value. Only the exactly-computable constant-bounds top-tested shape is
-        // supported; anything else BAILS (fail-closed).
-        Some(materialize_liveout_iv(
-            func, &maps, preheader, &iv_info, &exit_test,
-        )?)
-    } else {
-        // A non-IV loop value is live-out (e.g. a reduction result): BAIL.
-        return None;
+    // (4) Live-out analysis: the crate's one loop-state contract
+    // (`crate::loop_contract`). Deleting the loop hands off only at its single
+    // exit, so no register the loop writes (the flags included) may be live
+    // there, except the IV when its closed-form final value is materialized.
+    let exit_only = [exit];
+    let check = |carried: &[VReg]| {
+        LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &ExitPlan::loop_test(exiting, exit),
+            Handoff::Only(&exit_only),
+            carried,
+        )
+    };
+    let (liveout, locality) = match check(&[]) {
+        Ok(locality) => (None, locality),
+        Err(LoopStateEscape::Live {
+            reg: StateReg::Virtual(reg),
+            ..
+        }) if reg == iv_info.iv => {
+            // The IV is live out: materialize its closed-form final value. Only
+            // the exactly-computable constant-bounds top-tested shape is
+            // supported; anything else BAILS (fail-closed). Then nothing else
+            // may be live out.
+            let liveout = materialize_liveout_iv(func, maps, preheader, &iv_info, &exit_test)?;
+            (Some(liveout), check(&[iv_info.iv]).ok()?)
+        }
+        // A non-IV loop value is live out (e.g. a reduction result): BAIL.
+        Err(_) => return None,
     };
 
     Some(DeadLoopPlan {
+        _locality: locality,
         body: body.iter().copied().collect(),
         preheader,
         header,
@@ -477,7 +500,7 @@ fn find_exit_test(func: &MachFunction, exiting: BlockId, exit: BlockId) -> Optio
         return None;
     }
     let branch_target = block_operand(last)?; // fall-through target `o`
-    let cc = imm_of(&bcond.operands[0])?;
+    let cc = bcond.operands[0].as_imm()?;
     let cond_target = bcond.operands.iter().find_map(|op| {
         if let MachOperand::Block(b) = op {
             Some(*b)
@@ -498,12 +521,12 @@ fn find_exit_test(func: &MachFunction, exiting: BlockId, exit: BlockId) -> Optio
     // Flag producer must be the immediately-preceding CmpRR/CmpRI.
     let (test, bound) = match cmp.opcode {
         AArch64Opcode::CmpRR => (
-            vreg_of(&cmp.operands[0])?,
-            BoundOperand::Reg(vreg_of(&cmp.operands[1])?),
+            cmp.operands[0].as_vreg()?,
+            BoundOperand::Reg(cmp.operands[1].as_vreg()?),
         ),
         AArch64Opcode::CmpRI => (
-            vreg_of(&cmp.operands[0])?,
-            BoundOperand::Imm(imm_of(&cmp.operands[1])?),
+            cmp.operands[0].as_vreg()?,
+            BoundOperand::Imm(cmp.operands[1].as_imm()?),
         ),
         _ => return None,
     };
@@ -894,34 +917,11 @@ fn is_pure_effect_free(inst: &MachInst) -> bool {
 // Small helpers (mirrors of the NEON recognizers' utilities)
 // ---------------------------------------------------------------------------
 
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    op.as_vreg()
-}
-
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    op.as_imm()
-}
-
 fn block_operand(inst: &MachInst) -> Option<BlockId> {
     inst.operands.iter().find_map(|op| match op {
         MachOperand::Block(b) => Some(*b),
         _ => None,
     })
-}
-
-/// `MovR(d, s)` / `Copy(d, s)` / `AddRI(d, s, 0)` copy idioms => `(d, s)`.
-fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
-    match inst.opcode {
-        AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
-        {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        _ => None,
-    }
 }
 
 /// `iv_next == iv + 1` (via `AddRI(iv, 1)` or `AddRR(iv, const-1)`).
@@ -933,15 +933,15 @@ fn is_step_one(func: &MachFunction, maps: &Maps, iv_next: VReg, iv: VReg) -> boo
     match inst.opcode {
         AArch64Opcode::AddRI => {
             inst.operands.len() == 3
-                && vreg_of(&inst.operands[1]) == Some(iv)
-                && imm_of(&inst.operands[2]) == Some(1)
+                && inst.operands[1].as_vreg() == Some(iv)
+                && inst.operands[2].as_imm() == Some(1)
         }
         AArch64Opcode::AddRR => {
             if inst.operands.len() != 3 {
                 return false;
             }
-            let a = vreg_of(&inst.operands[1]);
-            let b = vreg_of(&inst.operands[2]);
+            let a = inst.operands[1].as_vreg();
+            let b = inst.operands[2].as_vreg();
             (a == Some(iv) && b.and_then(|v| resolve_const(func, maps, v)) == Some(1))
                 || (b == Some(iv) && a.and_then(|v| resolve_const(func, maps, v)) == Some(1))
         }
@@ -969,12 +969,12 @@ fn resolve_const(func: &MachFunction, maps: &Maps, v: VReg) -> Option<i64> {
                 return i64::try_from(value).ok();
             }
             AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-                cur = vreg_of(&inst.operands[1])?;
+                cur = inst.operands[1].as_vreg()?;
             }
             AArch64Opcode::AddRI
-                if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
+                if inst.operands.len() == 3 && inst.operands[2].as_imm() == Some(0) =>
             {
-                cur = vreg_of(&inst.operands[1])?;
+                cur = inst.operands[1].as_vreg()?;
             }
             _ => return None,
         }
@@ -997,7 +997,7 @@ fn const_iv_init(func: &MachFunction, maps: &Maps, preheader: BlockId, iv: VReg)
                     i64::try_from(value).ok()
                 }
                 AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-                    resolve_const(func, maps, vreg_of(&inst.operands[1])?)
+                    resolve_const(func, maps, inst.operands[1].as_vreg()?)
                 }
                 _ => None,
             };
@@ -1006,72 +1006,28 @@ fn const_iv_init(func: &MachFunction, maps: &Maps, preheader: BlockId, iv: VReg)
     None
 }
 
-/// A bound operand is loop-invariant iff it is an immediate, a value defined
-/// entirely outside the loop body, or a materialized compile-time constant
-/// (`Movz`/`Movk`/`Movn` chain — invariant even if recomputed inside the body).
+/// A bound operand is loop-invariant iff it is an immediate, or a register
+/// that holds ONE value for the whole loop execution: every instruction that
+/// writes its id lies outside the loop body, or every one of them belongs to a
+/// `Movz`(+`Movk`) run materializing the SAME constant
+/// ([`crate::mach_util::materialized_runs_value`]), however often the body
+/// rewrites it. A register written with different constants on different
+/// in-body paths (one `Movz` per exit edge of a fully unrolled search) changes
+/// from trip to trip, and `terminating_cc`'s EQ argument (a `+1` counter visits
+/// a FIXED bound within `2^bits` trips) does not hold for it. Defs are matched
+/// by vreg id, class-blind: a write of the W view is a write of the register.
 fn is_loop_invariant(func: &MachFunction, body: &HashSet<BlockId>, bound: &BoundOperand) -> bool {
     match bound {
         BoundOperand::Imm(_) => true,
         BoundOperand::Reg(v) => {
-            // Defined entirely outside the loop body?
-            let mut any = false;
-            let mut all_outside = true;
-            for &bid in &func.block_order {
-                let in_body = body.contains(&bid);
-                for &iid in &func.block(bid).insts {
-                    let inst = func.inst(iid);
-                    if inst_defines_vreg(inst, *v) {
-                        any = true;
-                        if in_body {
-                            all_outside = false;
-                        }
-                    }
-                }
-            }
-            if any && all_outside {
-                return true;
-            }
-            // Otherwise it must be a materialized constant.
-            is_materialized_constant(func, *v)
-        }
-    }
-}
-
-/// True iff EVERY definition of `v` is a `Movz`/`Movk`/`Movn` with immediate
-/// operands (so `v` holds a compile-time constant, hence is loop-invariant).
-fn is_materialized_constant(func: &MachFunction, v: VReg) -> bool {
-    let mut any = false;
-    let mut any_base = false;
-    for &bid in &func.block_order {
-        for &iid in &func.block(bid).insts {
-            let inst = func.inst(iid);
-            if !inst_defines_vreg(inst, v) {
-                continue;
-            }
-            any = true;
-            let ok = match inst.opcode {
-                AArch64Opcode::Movz => {
-                    let valid =
-                        crate::reaching_const::movz_value(inst).is_some_and(|(dst, _)| dst == v);
-                    any_base |= valid;
-                    valid
-                }
-                AArch64Opcode::Movn => {
-                    let valid =
-                        crate::reaching_const::movn_value(inst).is_some_and(|(dst, _)| dst == v);
-                    any_base |= valid;
-                    valid
-                }
-                AArch64Opcode::Movk => crate::reaching_const::parse_move_wide_inst(inst)
-                    .is_some_and(|(dst, _, _)| dst == v),
-                _ => false,
-            };
-            if !ok {
+            let sites = crate::mach_util::live_def_sites(func, v.id);
+            if sites.is_empty() {
                 return false;
             }
+            sites.iter().all(|site| !body.contains(&site.block))
+                || crate::mach_util::materialized_runs_value(func, *v, &sites).is_some()
         }
     }
-    any && any_base
 }
 
 /// Count `v`'s definitions inside the loop body.
@@ -1086,45 +1042,6 @@ fn count_body_defs(func: &MachFunction, body: &HashSet<BlockId>, v: VReg) -> usi
         }
     }
     n
-}
-
-/// All vregs defined inside the loop body.
-fn collect_body_defs(func: &MachFunction, body: &HashSet<BlockId>) -> HashSet<VReg> {
-    let mut defs = HashSet::new();
-    for &b in body {
-        for &iid in &func.block(b).insts {
-            let inst = func.inst(iid);
-            for_each_inst_def(inst, |v| {
-                defs.insert(v);
-            });
-        }
-    }
-    defs
-}
-
-/// Body-defined vregs that are USED outside the loop body (live-out).
-fn collect_liveouts(
-    func: &MachFunction,
-    body: &HashSet<BlockId>,
-    body_defs: &HashSet<VReg>,
-) -> HashSet<VReg> {
-    let mut liveouts = HashSet::new();
-    for &b in &func.block_order {
-        if body.contains(&b) {
-            continue;
-        }
-        for &iid in &func.block(b).insts {
-            let inst = func.inst(iid);
-            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
-                if let Some(v) = inst.operands.get(pos).and_then(MachOperand::as_vreg)
-                    && body_defs.contains(&v)
-                {
-                    liveouts.insert(v);
-                }
-            });
-        }
-    }
-    liveouts
 }
 
 #[cfg(test)]
@@ -1218,6 +1135,38 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, MachOperand::Block(b) if *b == bb3))
         );
+    }
+
+    /// `make_rotated_empty_loop` with `Movz bound, #value` inserted before the
+    /// latch's back-edge branch, so the body rewrites the EQ bound every trip.
+    fn rotated_loop_rewriting_its_bound(value: i64) -> (MachFunction, BlockId) {
+        use AArch64Opcode::*;
+        let (mut func, _bb0, bb1, bb2, _bb3) = make_rotated_empty_loop();
+        let rewrite = func.push_inst(MachInst::new(Movz, vec![vr(g64(2)), imm(value)]));
+        let pos = func.block(bb2).insts.len() - 1;
+        func.block_mut(bb2).insts.insert(pos, rewrite);
+        (func, bb1)
+    }
+
+    /// The EQ bound is 10 on the first trip and 11 on every later one: no
+    /// longer one fixed value, so the `+1 visits the bound` argument does not
+    /// apply and the loop is kept.
+    #[test]
+    fn does_not_delete_eq_loop_whose_bound_takes_two_constants() {
+        let (mut func, bb1) = rotated_loop_rewriting_its_bound(11);
+        let mut pass = DeadCountedLoopElimination::new();
+        assert!(!pass.run(&mut func), "a per-trip bound must block deletion");
+        assert!(func.block_order.contains(&bb1));
+    }
+
+    /// Positive control: the body rewrites the bound with the SAME constant,
+    /// so it is still one value for the whole loop and the loop is deleted.
+    #[test]
+    fn deletes_eq_loop_whose_bound_is_rewritten_with_the_same_constant() {
+        let (mut func, bb1) = rotated_loop_rewriting_its_bound(10);
+        let mut pass = DeadCountedLoopElimination::new();
+        assert!(pass.run(&mut func), "a rematerialized bound is invariant");
+        assert!(!func.block_order.contains(&bb1));
     }
 
     #[test]
@@ -1593,5 +1542,44 @@ mod tests {
             assert_eq!(func.insts.len(), insts, "run {again} added instructions");
             assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
         }
+    }
+
+    /// Loop-state contract (`crate::loop_contract`): a NARROWER VIEW of a loop
+    /// register read after the loop (`w4`, the low half of `iv1 = iv + 1`) is
+    /// a read of it. The pass's own live-out scan matched registers by class
+    /// as well as number and missed it, so it deleted the loop and the exit
+    /// read a register nothing wrote.
+    #[test]
+    fn does_not_delete_loop_with_a_narrow_view_liveout() {
+        use AArch64Opcode::*;
+        let (mut func, _bb0, bb1, _bb2, bb3) = make_rotated_empty_loop();
+        let exit_read = func.push_inst(MachInst::new(
+            MovR,
+            vec![
+                vr(VReg::new(20, RegClass::Gpr32)),
+                vr(VReg::new(4, RegClass::Gpr32)),
+            ],
+        ));
+        func.block_mut(bb3).insts.insert(0, exit_read);
+        let mut pass = DeadCountedLoopElimination::new();
+        assert!(
+            !pass.run(&mut func),
+            "a narrow view of a loop value is live out"
+        );
+        assert!(func.block_order.contains(&bb1));
+    }
+
+    /// The flags are a register: the exit reads NZCV the loop's exit compare
+    /// set (`cset` on `iv1 == bound`). Deleting the loop leaves whatever the
+    /// preheader set, so the loop must stay.
+    #[test]
+    fn does_not_delete_loop_whose_exit_reads_the_flags() {
+        use AArch64Opcode::*;
+        let (mut func, _bb0, bb1, _bb2, bb3) = make_rotated_empty_loop();
+        let cset = func.push_inst(MachInst::new(CSet, vec![vr(g64(21)), imm(CC_EQ)]));
+        func.block_mut(bb3).insts.insert(0, cset);
+        let mut pass = DeadCountedLoopElimination::new();
+        assert!(!pass.run(&mut func), "the exit reads the loop's flags");
+        assert!(func.block_order.contains(&bb1));
     }
 }

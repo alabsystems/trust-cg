@@ -1,0 +1,103 @@
+; TrustIr text format v1
+module "large_aggregate_invoke"
+target "aarch64-unknown-linux-gnu" 8 little abi="aapcs64"
+
+struct @Quad { q0: i64 @0, q1: i64 @8, q2: i64 @16, q3: i64 @24 } size=32 align=8 repr=c id=0
+
+struct @Big { g: [ty.0 x 40] @0 } size=320 align=8 repr=c id=1
+
+struct @Giant { g: [ty.0 x 9000] @0 } size=72000 align=8 repr=c id=2
+
+functy.0 = (struct.0, i64) -> (i64)
+
+functy.1 = (struct.1, i64) -> (i64)
+
+functy.2 = (struct.2, i64) -> (i64)
+
+functy.3 = (ptr) -> (ptr)
+
+functy.4 = () -> ()
+
+functy.5 = (ptr, struct.0, i64) -> (i64)
+
+functy.6 = (ptr, ptr, i64) -> (i64)
+
+functy.7 = (ptr, i64) -> (i64)
+
+type ty.0 = i64
+
+fn @c_throw_quad(functy.0) {
+}
+
+fn @c_throw_big(functy.1) {
+}
+
+fn @c_throw_giant(functy.2) {
+}
+
+fn @__cxa_begin_catch(functy.3) {
+}
+
+fn @__cxa_end_catch(functy.4) {
+}
+
+fn @inv_param(functy.5) {
+bb0(%0: ptr, %1: struct.0, %2: i64):
+    %3 = invoke @func.0(%1, %2) to bb1() unwind bb2
+bb1:
+    store struct.0 %1, ptr %0
+    ret %3
+bb2:
+    %4, %5 = landingpad catch 0
+    %6 = call @func.3(%4)
+    call @func.4()
+    store struct.0 %1, ptr %0
+    %7 = const i64 -1
+    ret %7
+}
+
+fn @inv_load_copy(functy.6) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %3 = load struct.1, ptr %1
+    %4 = invoke @func.1(%3, %2) to bb1() unwind bb2
+bb1:
+    store struct.1 %3, ptr %0
+    ret %4
+bb2:
+    %5, %6 = landingpad catch 0
+    %7 = call @func.3(%5)
+    call @func.4()
+    store struct.1 %3, ptr %0
+    %8 = const i64 -1
+    ret %8
+}
+
+fn @inv_load_fast(functy.7) {
+bb0(%0: ptr, %1: i64):
+    %2 = load struct.1, ptr %0
+    %3 = invoke @func.1(%2, %1) to bb1() unwind bb2
+bb1:
+    ret %3
+bb2:
+    %4, %5 = landingpad catch 0
+    %6 = call @func.3(%4)
+    call @func.4()
+    %7 = const i64 -1
+    ret %7
+}
+
+fn @inv_giant(functy.6) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %3 = load struct.2, ptr %1
+    %4 = invoke @func.2(%3, %2) to bb1() unwind bb2
+bb1:
+    store struct.2 %3, ptr %0
+    ret %4
+bb2:
+    %5, %6 = landingpad catch 0
+    %7 = call @func.3(%5)
+    call @func.4()
+    store struct.2 %3, ptr %0
+    %8 = const i64 -1
+    ret %8
+}

@@ -1,9 +1,7 @@
 /-
-  Sim.ForwardSim.Call — VERIFIED AS-IS (no corrections required).
-  Reviewed against the Trust.Model preamble, Trust.Sim.Match signatures, the Pure/Mem
-  templates, and the MetaTheorem.CompileRefines consumption site. The module is sound;
-  the single `sorry` (CalleeContract_of_IH) is genuinely off the compile_refines path
-  and does not smuggle the conclusion. The file is returned unchanged.
+  Sim.ForwardSim.Call — the call case of the forward simulation, conditional on a
+  residency-guarded `CalleeContract`. Every caller must establish its entry condition.
+  This interface alone constructs no runtime contract or source-program binding.
 -/
 
 import Trust.Model
@@ -81,7 +79,9 @@ structure CallTransition (lay : Layout) (s s' : SrcState) where
 structure CalleeContract (lay : Layout) (s s' : SrcState)
     (tr : CallTransition lay s s') where
   runCallee : MachState → MachState
-  runs      : ∀ m, x86StepPlus m Event.tau (runCallee m)
+  entry : MachState → Prop
+  entry_nonempty : ∃ m, entry m
+  runs      : ∀ m, entry m → x86StepPlus m Event.tau (runCallee m)
   retValue  : ∀ m, R lay s m →
                 denoteLoc (runCallee m) (lay.asgn tr.dst) (lay.kind tr.dst) = s'.env tr.dst
   savedPreserved : ∀ m, R lay s m → ∀ r, CalleeSaved r → (runCallee m).regs r = m.regs r
@@ -95,6 +95,7 @@ structure CalleeContract (lay : Layout) (s s' : SrcState)
 
 structure CallFrame (lay : Layout) (s s' : SrcState)
     (tr : CallTransition lay s s') (cc : CalleeContract lay s s' tr) where
+  entryReady : ∀ m, R lay s m → cc.entry m
   othersInCalleeSaved : ∀ v, Live s' v → v ≠ tr.dst →
                           ∃ r ww, ∃ (hww : ww ≤ 64),
                             lay.asgn v = .reg r ∧ lay.kind v = .int ww hww ∧ CalleeSaved r
@@ -104,6 +105,8 @@ def callStep
     (tr : CallTransition lay s s') (cc : CalleeContract lay s s' tr) : LoweredStep where
   exec  := cc.runCallee
   event := Event.tau
+  entry := cc.entry
+  entry_nonempty := cc.entry_nonempty
   runs  := cc.runs
 
 theorem call_value_leg
@@ -179,6 +182,7 @@ def callInstrCert
     (clob : ∀ m, R lay s m → Preserves (clobberOf (callStep tr cc)) m ((callStep tr cc).exec m))
     (hmemEq : ∀ a, lay.nonFrame a → s'.mem a = s.mem a) :
     InstrCert lay (callStep tr cc) s s' where
+  entryReady := fr.entryReady
   value     := call_value_leg tr cc fr
   clobber   := clob
   carrierOk := call_carrier_leg tr cc fr
@@ -196,30 +200,10 @@ theorem forward_sim_call
   have h := matchStep_exists (callInstrCert tr cc fr clob hmemEq) hR
   simpa [callStep] using h
 
-opaque calleeMeasure (lay : Layout) (s : SrcState) : Nat
-
--- `CalleeContract` is a data-carrying `structure` (Type, not Prop), so this producer must be a
--- `def`, not a `theorem`. Its body is the SAME baseline `sorry` (off the `compile_refines` path).
-noncomputable def CalleeContract_of_IH
-    (lay : Layout) (s s' : SrcState) (tr : CallTransition lay s s')
-    (ih : calleeMeasure lay s' < calleeMeasure lay s →
-            ∀ {lay' : Layout}, ForwardSimStmt lay') :
-    CalleeContract lay s s' tr := by
-  sorry  -- open: well-founded call-graph descent — instantiate the callee's `compile_refines`
-         -- (`ih`) over its entry→exit run, then extract the SysV ABI facts (return in rax/(rax,rdx),
-         -- callee-saved rbx/rbp/r12..r15 restored by prologue/epilogue, off-frame mem preserved)
-         -- from the callee's exit `R`, and package them as `CalleeContract`.  Needs the callee
-         -- program object + the terminating call-graph measure, absent from this skeleton.
-
-theorem retPair_readback (m : MachState) :
-    denoteLoc m (.pair sysvRetLo sysvRetHi) .i128
-      = .i128 ((m.regs sysvRetHi ++ m.regs sysvRetLo).cast (by omega)) := by
-  simp only [denote_i128_pair]
-
-theorem retHi_not_calleeSaved : ¬ CalleeSaved sysvRetHi := by decide
-
-theorem retRegs_callerSaved : CallerSaved sysvRetLo ∧ CallerSaved sysvRetHi := by
-  constructor <;> decide
+/- A call-graph induction hypothesis alone supplies neither resident code nor the
+   callee's value, register and memory contracts. The old unguarded construction
+   remains refuted by `MetaTheorem.Vacuity.unguarded_calleeContract_of_IH_refuted`.
+   Concrete caller/provider and loader evidence is still required. -/
 
 end ForwardSim
 end Sim

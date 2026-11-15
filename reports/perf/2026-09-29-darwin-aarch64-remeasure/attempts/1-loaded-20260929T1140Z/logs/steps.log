@@ -1,0 +1,19 @@
+=== 01-beat-llvm-evidence-warm-cold: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --retain-dir $HOME/trust-cg/.claude/worktrees/agent-workflow/reports/perf/2026-09-29-darwin-aarch64-remeasure
+01-beat-llvm-evidence-warm-cold	exit=0	wall_s=111.6
+evidence results: benchmarks/beat-llvm/results/80b0e03aa609-20260929T114207Z.json
+=== 02-perf-ratchet-require-current: python3 scripts/check_perf_ratchet.py --require-current benchmarks/beat-llvm/results/80b0e03aa609-20260929T114207Z.json
+02-perf-ratchet-require-current	exit=3	wall_s=0.7
+=== 03-check-gates-evidence: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/80b0e03aa609-20260929T114207Z.json
+03-check-gates-evidence	exit=2	wall_s=0.1
+=== 04-beat-llvm-diagnostic-no-proof-certs: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --bridge-cg-arg no-proof-certs --retain-dir $HOME/trust-cg/.claude/worktrees/agent-workflow/reports/perf/2026-09-29-darwin-aarch64-remeasure/diagnostic-no-proof-certs
+04-beat-llvm-diagnostic-no-proof-certs	exit=2	wall_s=1.9
+diagnostic results: benchmarks/beat-llvm/results/80b0e03aa609-20260929T114207Z.json
+=== 06-scale-gate-rss: python3 benchmarks/beat-llvm/scale_gate.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --rss
+06-scale-gate-rss	exit=0	wall_s=48.4
+=== 07-compile-scaling: python3 benchmarks/compile-scaling/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --out-dir $SCRATCH/darwin-remeasure-wf228801/compile-scaling-work
+07-compile-scaling	exit=0	wall_s=49.6
+=== 08-compile-time-canary: bash scripts/compile_time_canary.sh --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc
+08-compile-time-canary	exit=1	wall_s=2.1
+=== 09-determinism-sentinel: bash scripts/compile_determinism_sentinel.sh 5 --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc
+09-determinism-sentinel	exit=2	wall_s=12.0
+campaign done 2026-09-29T11:44:04Z

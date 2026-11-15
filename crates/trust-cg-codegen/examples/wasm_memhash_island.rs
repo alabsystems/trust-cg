@@ -40,7 +40,7 @@
 //! return h                                    // ptr MUST be 4-byte aligned
 //! ```
 //!
-//!     cargo run --example wasm_memhash_island -- <outdir>
+//!     scripts/trust_cargo.sh run --example wasm_memhash_island -- <outdir>
 //!
 //! writes `memhash_island.wasm` (trust-cg bytes, NO wasm-opt), the twin source,
 //! and `memhash_expected.json`. The expectations are computed by walking the
@@ -55,7 +55,7 @@ use trust_cg_codegen::wasm::{
     self, ISLAND_ABI_NAMESPACE, ISLAND_MEMORY_IMPORT, WasmMemoryPolicy, WasmModulePolicy,
     WasmStackPolicy,
 };
-use trust_ir::{BinOp, ICmpOp, Ty};
+use trust_ir::{BinOp, CastOp, ICmpOp, Ty};
 use trust_ir_build::ModuleBuilder;
 
 /// The host memory the island binds, in the NORMATIVE island namespace.
@@ -153,6 +153,14 @@ fn build_mem_hash(mb: &mut ModuleBuilder) -> trust_ir::FuncId {
     let four = fb.iconst(Ty::I32, 4);
     let off = fb.binop(BinOp::Mul, Ty::I32, bi, four);
     let addr = fb.binop(BinOp::Add, Ty::I32, ptr, off);
+    // The address arrives as an i32 (wasm32's pointer width, and the twin's
+    // `*const u32`), but a `load` operand must be POINTER-LIKE: trust-ir
+    // refuses an integer address with `OperandNotPointer { op: "load",
+    // ty: "i32" }`, which is what this generator produced. Spell the
+    // conversion instead of relying on the width coincidence — `IntToPtr` is
+    // what the operation is, the interpreter resolves the raw address against
+    // its memory model, and wasm lowers it to the same `i32.load`.
+    let addr = fb.cast(CastOp::IntToPtr, Ty::I32, Ty::Ptr, addr);
     let word = fb.load(Ty::I32, addr);
     let mixed = fb.binop(BinOp::Xor, Ty::I32, bh, word);
     let prime = fb.iconst(Ty::I32, i128::from(FNV_PRIME as i32));
@@ -227,7 +235,9 @@ fn main() {
 
     let mut mb = ModuleBuilder::new("memhash_island");
     let fid = build_mem_hash(&mut mb);
-    let mut module = mb.build();
+    let mut module = mb
+        .build()
+        .expect("ModuleBuilder::build: the example module");
     module.target_info = Some(wasm::wasm32_target_info());
 
     // The P2 policy: the host's memory, no memory of our own, and no stack —
@@ -241,7 +251,9 @@ fn main() {
         stack: WasmStackPolicy::OwnedTop,
         ..WasmModulePolicy::closed()
     };
-    let bytes = wasm::compile_module_with_policy(&module, &policy).expect("compile_module");
+    let bytes =
+        wasm::compile_module_with_policy_and_license(&module, &policy, &permit_unlicensed())
+            .expect("compile_module");
     let _ = fid;
 
     // 16 pages, not 1: the LLVM twin's linker declares a 16-page minimum for
@@ -294,4 +306,13 @@ fn main() {
         cases.len(),
         corpus.len(),
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

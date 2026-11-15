@@ -100,12 +100,31 @@ fn fp_binary_oblig(name: &str, trust_ir_expr: SmtExpr, aarch64_expr: SmtExpr) ->
 }
 
 // ===========================================================================
-// (a) Positive: every family reconstructs, is Reconstructed, discharges Valid,
-//     and is credited GENUINELY through the function verifier.
+// (a) Positive: every family reconstructs, is Reconstructed and discharges
+//     Valid. FP obligations are never enumerated, so their discharge is
+//     sampled: the function verifier reports it and never credits it (E0.2).
 // ===========================================================================
 
+/// The single instruction is an uncredited, sampled reconstruction.
+fn assert_sampled_uncredited(report: &trust_cg_verify::FunctionVerificationReport) {
+    assert_eq!(report.verified_count(), 0, "{report:?}");
+    assert_eq!(report.sampled_uncredited_count(), 1, "{report:?}");
+    match &report.instructions[0].result {
+        InstructionVerificationResult::Unverified { reason } => {
+            assert!(
+                reason.starts_with(
+                    trust_cg_verify::function_verifier::STATISTICAL_EVIDENCE_IS_NOT_CREDIT
+                ),
+                "{reason}"
+            );
+            assert!(reason.contains("RECONSTRUCTED"), "{reason}");
+        }
+        other => panic!("expected an uncredited sampled reconstruction, got {other:?}"),
+    }
+}
+
 #[test]
-fn fadd_reconstructs_and_is_credited_verified() {
+fn fadd_reconstructs_but_sampled_discharge_is_not_credited() {
     let inst = MachInst::new(AArch64Opcode::FaddRR, vec![s(0), s(1), s(2)]);
     let oblig = reconstruct_alu_obligation(&inst).expect("FADD must reconstruct");
     assert!(oblig.is_reconstructed());
@@ -114,19 +133,7 @@ fn fadd_reconstructs_and_is_credited_verified() {
         VerificationResult::Valid
     ));
 
-    let report = verify_function(&single_inst_func(inst));
-    assert_eq!(report.genuinely_verified_count(), 1);
-    match &report.instructions[0].result {
-        InstructionVerificationResult::Verified {
-            degenerate,
-            proof_name,
-            ..
-        } => {
-            assert!(!*degenerate);
-            assert!(proof_name.contains("RECONSTRUCTED"));
-        }
-        other => panic!("expected Verified, got {other:?}"),
-    }
+    assert_sampled_uncredited(&verify_function(&single_inst_func(inst)));
 }
 
 #[test]
@@ -275,7 +282,7 @@ fn fp_c() -> SmtExpr {
 }
 
 #[test]
-fn fmadd_reconstructs_and_is_credited_verified() {
+fn fmadd_reconstructs_but_sampled_discharge_is_not_credited() {
     let inst = MachInst::new(AArch64Opcode::FmaddRR, vec![s(0), s(1), s(2), s(3)]);
     let oblig = reconstruct_alu_obligation(&inst).expect("FMADD must reconstruct");
     assert!(oblig.is_reconstructed());
@@ -284,19 +291,7 @@ fn fmadd_reconstructs_and_is_credited_verified() {
         "FMADD must discharge Valid (single-rounding fp.fma both sides)"
     );
 
-    let report = verify_function(&single_inst_func(inst));
-    assert_eq!(report.genuinely_verified_count(), 1);
-    match &report.instructions[0].result {
-        InstructionVerificationResult::Verified {
-            degenerate,
-            proof_name,
-            ..
-        } => {
-            assert!(!*degenerate);
-            assert!(proof_name.contains("RECONSTRUCTED"));
-        }
-        other => panic!("expected Verified, got {other:?}"),
-    }
+    assert_sampled_uncredited(&verify_function(&single_inst_func(inst)));
 }
 
 #[test]
@@ -595,26 +590,23 @@ fn fmul_swap_does_not_refute_commutative() {
 
 #[test]
 fn fp_madd_div_eval_routes_through_reconstruction() {
-    // Madd reconstructs through the function verifier and is credited GENUINELY.
+    // Madd reconstructs through the function verifier; its 32-bit discharge is
+    // sampled, so it is reported and never credited (E0.2).
     let inst = MachInst::new(AArch64Opcode::Madd, vec![w(0), w(1), w(2), w(3)]);
-    let report = verify_function(&single_inst_func(inst));
-    assert_eq!(
-        report.genuinely_verified_count(),
-        1,
-        "Madd must be credited via reconstruction"
-    );
+    assert_sampled_uncredited(&verify_function(&single_inst_func(inst)));
 }
 
 // ===========================================================================
 // (g) FP-FORMAT casts (FCVT widen/narrow): FcvtSD (F32->F64) + FcvtDS
 //     (F64->F32). Both operands FP, of differing widths. Positive: reconstruct
-//     + discharge Valid + credited GENUINELY. Refutation: a WRONG DIRECTION
-//     (FcvtSD<->FcvtDS / wrong dest format) diverges under the wiring-preserving
-//     FP evaluator for a value that does not round-trip through binary32.
+//     + discharge Valid (sampled, so reported and never credited since E0.2).
+//     Refutation: a WRONG DIRECTION (FcvtSD<->FcvtDS / wrong dest format)
+//     diverges under the wiring-preserving FP evaluator for a value that does
+//     not round-trip through binary32.
 // ===========================================================================
 
 #[test]
-fn fcvt_sd_and_ds_reconstruct_valid_and_credited() {
+fn fcvt_sd_and_ds_reconstruct_valid_but_are_not_credited() {
     let cases = [
         // FcvtSD widens S->D: [D, S].
         MachInst::new(AArch64Opcode::FcvtSD, vec![d(0), s(1)]),
@@ -630,23 +622,8 @@ fn fcvt_sd_and_ds_reconstruct_valid_and_credited() {
             matches!(verify_by_evaluation(&oblig), VerificationResult::Valid),
             "{op:?} must discharge Valid"
         );
-        let report = verify_function(&single_inst_func(inst));
-        assert_eq!(
-            report.genuinely_verified_count(),
-            1,
-            "{op:?} must be credited via reconstruction"
-        );
-        match &report.instructions[0].result {
-            InstructionVerificationResult::Verified {
-                degenerate,
-                proof_name,
-                ..
-            } => {
-                assert!(!*degenerate, "{op:?} must be GENUINE (non-degenerate)");
-                assert!(proof_name.contains("RECONSTRUCTED"), "{op:?}: {proof_name}");
-            }
-            other => panic!("expected Verified for {op:?}, got {other:?}"),
-        }
+        // Sampled FP discharge: reported, never credited (E0.2).
+        assert_sampled_uncredited(&verify_function(&single_inst_func(inst)));
     }
 }
 

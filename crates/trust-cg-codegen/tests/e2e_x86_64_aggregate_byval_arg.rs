@@ -75,6 +75,7 @@ fn run_differential(
 
 fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields: fields
@@ -124,26 +125,44 @@ fn alloca(result: u32, ty: Ty) -> InstrNode {
     )
 }
 
-/// `result = aggregate with `field` set to `value``. Lowers (in the adapter) to
-/// a `StructGep` + typed `Store` into the aggregate's storage, then a `Copy` of
-/// the base pointer — i.e. the exact "constructed aggregate carried by address"
-/// shape the rustc bridge emits via `emit_aggregate_field_store`.
-fn insert_field(
-    result: u32,
-    aggregate_ty: &Ty,
-    aggregate: u32,
-    field: u32,
+/// `*(base + byte_offset) = value`: one field of a constructed aggregate
+/// written through its slot pointer, as VALID trust-ir — a byte-offset `GEP`
+/// over an `I8` pointee (trust-ir GEP is flat: `base + index * size_of(I8)`)
+/// and a typed `Store`. This is the memory write the rustc bridge's
+/// `emit_aggregate_field_store` means; it used to be spelled as the "store
+/// form" of `InsertField` over the slot pointer, which trust-ir does not
+/// define and trust-cg refuses by name since WS7.1. `offset_id` / `ptr_id`
+/// are fresh value ids for the offset constant and the field address.
+fn store_field(
+    offset_id: u32,
+    ptr_id: u32,
+    base: u32,
+    byte_offset: i128,
+    field_ty: Ty,
     value: u32,
-) -> InstrNode {
-    node(
-        Inst::InsertField {
-            ty: aggregate_ty.clone(),
-            aggregate: ValueId::new(aggregate),
-            field,
-            value: ValueId::new(value),
-        },
-        vec![result],
-    )
+) -> [InstrNode; 3] {
+    [
+        iconst(offset_id, Ty::I64, byte_offset),
+        node(
+            Inst::GEP {
+                pointee_ty: Ty::I8,
+                base: ValueId::new(base),
+                indices: vec![ValueId::new(offset_id)],
+                inbounds: true,
+            },
+            vec![ptr_id],
+        ),
+        node(
+            Inst::Store {
+                ty: field_ty,
+                ptr: ValueId::new(ptr_id),
+                value: ValueId::new(value),
+                volatile: false,
+                align: None,
+            },
+            vec![],
+        ),
+    ]
 }
 
 fn extract_field(result: u32, aggregate_ty: &Ty, aggregate: u32, field: u32) -> InstrNode {
@@ -202,6 +221,8 @@ fn ret(value: u32) -> InstrNode {
 
 fn func(id: u32, name: &str, ty: FuncTyId, block: TrustIrBlock) -> TrustIrFunction {
     TrustIrFunction {
+        body_gate: None,
+        display_path: None,
         attrs: Default::default(),
         id: FuncId::new(id),
         name: name.to_string(),
@@ -216,6 +237,9 @@ fn func(id: u32, name: &str, ty: FuncTyId, block: TrustIrBlock) -> TrustIrFuncti
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     }
 }
 
@@ -238,11 +262,18 @@ fn module(
     functions: Vec<TrustIrFunction>,
 ) -> TrustIrModule {
     TrustIrModule {
+        completeness: None,
+        drop_glue: Vec::new(),
+        global_asm: vec![],
+        tuple_layouts: Vec::new(),
+        imports: vec![],
         name: name.to_string(),
         functions,
         structs,
         records: vec![],
         closure_types: vec![],
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
         globals: vec![],
         func_types,
         types: vec![],
@@ -266,28 +297,30 @@ fn module(
 ///   `s = alloca {i64,i64}; s.f0 = x+1; s.f1 = x*3; return _add2(s);`
 /// `_add2` is an EXTERN callee (clang-built in the driver) returning f0+f1.
 ///
-/// The aggregate is built via `Alloca` + `InsertField` (the rustc bridge's
-/// `emit_aggregate_field_store` shape): the slot pointer `s` (value 1) is typed
+/// The aggregate is built via `Alloca` + per-field `GEP` + `Store` (the memory
+/// write the rustc bridge's `emit_aggregate_field_store` means): the slot pointer `s` (value 1) is typed
 /// `Ty::Ptr` by its `Alloca` origin, so its aggregate type as a CALL ARGUMENT
 /// is supplied only by the adapter seeding the callee's parameter type — the
 /// gap this file guards.
 fn byval_i64x2_module() -> TrustIrModule {
     let agg = Ty::Struct(StructId::new(0));
-    let body = vec![
+    let mut body = vec![
         // value 0 = x
         alloca(1, agg.clone()),
         iconst(2, Ty::I64, 1),
         binop(3, BinOp::Add, Ty::I64, 0, 2), // x+1
         iconst(4, Ty::I64, 3),
         binop(5, BinOp::Mul, Ty::I64, 0, 4), // x*3
-        // s.f0 = x+1, s.f1 = x*3 (InsertField -> StructGep + Store into the slot)
-        insert_field(6, &agg, 1, 0, 3),
-        insert_field(7, &agg, 1, 1, 5),
+    ];
+    // s.f0 = x+1, s.f1 = x*3 (GEP + Store into the slot)
+    body.extend(store_field(100, 101, 1, 0, Ty::I64, 3));
+    body.extend(store_field(102, 103, 1, 8, Ty::I64, 5));
+    body.extend([
         // result = _add2(s)  -- value 1 is the alloca pointer (Ty::Ptr): its
         // aggregate type comes from the callee param signature, not its origin.
         call(Some(10), 1, &[1]),
         ret(10),
-    ];
+    ]);
     module(
         "byval_i64x2",
         vec![struct_def(0, "I64x2", &[Ty::I64, Ty::I64])],
@@ -296,11 +329,13 @@ fn byval_i64x2_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![agg],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -313,6 +348,8 @@ fn byval_i64x2_module() -> TrustIrModule {
             ),
             // extern callee declaration (no body, resolved at link time).
             TrustIrFunction {
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(1),
                 name: "_add2".to_string(),
@@ -327,6 +364,9 @@ fn byval_i64x2_module() -> TrustIrModule {
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                section: None,
+                visibility: Default::default(),
+                retained: false,
             },
         ],
     )
@@ -370,7 +410,7 @@ int main(void) {
 
 fn byval_i64x3_module() -> TrustIrModule {
     let agg = Ty::Struct(StructId::new(0));
-    let body = vec![
+    let mut body = vec![
         // value 0 = x
         alloca(1, agg.clone()),
         iconst(2, Ty::I64, 1),
@@ -379,12 +419,11 @@ fn byval_i64x3_module() -> TrustIrModule {
         binop(5, BinOp::Add, Ty::I64, 0, 4), // x+2
         iconst(6, Ty::I64, 3),
         binop(7, BinOp::Add, Ty::I64, 0, 6), // x+3
-        insert_field(8, &agg, 1, 0, 3),
-        insert_field(9, &agg, 1, 1, 5),
-        insert_field(10, &agg, 1, 2, 7),
-        call(Some(14), 1, &[1]),
-        ret(14),
     ];
+    body.extend(store_field(100, 101, 1, 0, Ty::I64, 3));
+    body.extend(store_field(102, 103, 1, 8, Ty::I64, 5));
+    body.extend(store_field(104, 105, 1, 16, Ty::I64, 7));
+    body.extend([call(Some(14), 1, &[1]), ret(14)]);
     module(
         "byval_i64x3",
         vec![struct_def(0, "I64x3M", &[Ty::I64, Ty::I64, Ty::I64])],
@@ -393,11 +432,13 @@ fn byval_i64x3_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![agg],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -409,6 +450,8 @@ fn byval_i64x3_module() -> TrustIrModule {
                 block(vec![(0, Ty::I64)], body),
             ),
             TrustIrFunction {
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(1),
                 name: "_add3".to_string(),
@@ -423,6 +466,9 @@ fn byval_i64x3_module() -> TrustIrModule {
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                section: None,
+                visibility: Default::default(),
+                retained: false,
             },
         ],
     )
@@ -466,17 +512,16 @@ int main(void) {
 
 fn byval_i64_f64_module() -> TrustIrModule {
     let agg = Ty::Struct(StructId::new(0));
-    let body = vec![
+    let mut body = vec![
         // value 0 = x (i64)
         alloca(1, agg.clone()),
         iconst(2, Ty::I64, 7),
         binop(3, BinOp::Add, Ty::I64, 0, 2), // f0 = x + 7  (i64)
         si64_to_fp(4, 0),                    // f1 = (double)x
-        insert_field(5, &agg, 1, 0, 3),
-        insert_field(6, &agg, 1, 1, 4),
-        call(Some(9), 1, &[1]),
-        ret(9),
     ];
+    body.extend(store_field(100, 101, 1, 0, Ty::I64, 3));
+    body.extend(store_field(102, 103, 1, 8, Ty::F64, 4));
+    body.extend([call(Some(9), 1, &[1]), ret(9)]);
     module(
         "byval_i64_f64",
         vec![struct_def(0, "I64F64", &[Ty::I64, Ty::F64])],
@@ -485,11 +530,13 @@ fn byval_i64_f64_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![agg],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -501,6 +548,8 @@ fn byval_i64_f64_module() -> TrustIrModule {
                 block(vec![(0, Ty::I64)], body),
             ),
             TrustIrFunction {
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(1),
                 name: "_mix_if".to_string(),
@@ -515,6 +564,9 @@ fn byval_i64_f64_module() -> TrustIrModule {
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                section: None,
+                visibility: Default::default(),
+                retained: false,
             },
         ],
     )
@@ -566,6 +618,7 @@ int main(void) {
 fn byval_enum_arg_module() -> TrustIrModule {
     let enum_ty = Ty::Enum(EnumId::new(0));
     let edef = EnumDef {
+        origin: None,
         id: EnumId::new(0),
         name: "E".to_string(),
         variants: vec![EnumVariant {
@@ -591,11 +644,13 @@ fn byval_enum_arg_module() -> TrustIrModule {
             FuncTy {
                 params: vec![enum_ty.clone()],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![enum_ty.clone()],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -607,6 +662,8 @@ fn byval_enum_arg_module() -> TrustIrModule {
                 block(vec![(0, enum_ty)], body),
             ),
             TrustIrFunction {
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(1),
                 name: "_enum_use".to_string(),
@@ -621,9 +678,50 @@ fn byval_enum_arg_module() -> TrustIrModule {
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                section: None,
+                visibility: Default::default(),
+                retained: false,
             },
         ],
     )
+}
+
+/// Host-independent (compile only, no link or run): every module above that
+/// builds its aggregate through a slot pointer lowers to an x86-64 object. The
+/// differential tests only run on an x86-64 host, so without this a fixture
+/// spelled in a form trust-cg refuses (the `InsertField` store form these used
+/// to use, refused by name since WS7.1) would go unseen elsewhere. (These are
+/// backend-convention fixtures — a `Ptr` carrying a by-value aggregate
+/// argument, no `target_info` — not validator-clean trust-ir; this checks
+/// only that the adapter admits them.)
+#[test]
+fn x86_64_byval_modules_lower_on_any_host() {
+    for m in [
+        byval_i64x2_module(),
+        byval_i64x3_module(),
+        byval_i64_f64_module(),
+        byval_combined_module(),
+        self_contained_byval_i64x2_module(),
+    ] {
+        assert!(
+            m.functions.iter().flat_map(|f| &f.blocks).all(|b| b
+                .body
+                .iter()
+                .all(|n| !matches!(n.inst, Inst::InsertField { .. }))),
+            "{}: the slot is written with GEP + Store, not InsertField",
+            m.name
+        );
+        let compiler = Compiler::new(CompilerConfig {
+            opt_level: OptLevel::O0,
+            target: Target::X86_64,
+            ..CompilerConfig::default()
+        });
+        let result = compiler
+            .with_codegen_license(permit_unlicensed())
+            .compile(&m)
+            .unwrap_or_else(|err| panic!("{}: {err:?}", m.name));
+        assert!(!result.object_code.is_empty(), "{}", m.name);
+    }
 }
 
 #[test]
@@ -635,7 +733,8 @@ fn x86_64_byval_enum_arg_fails_closed() {
         opt_level: OptLevel::O0,
         target: Target::X86_64,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let err = compiler
         .compile(&m)
         .expect_err("by-value enum aggregate must fail closed, never miscompile");
@@ -664,17 +763,19 @@ fn x86_64_byval_enum_arg_fails_closed() {
 fn byval_combined_module() -> TrustIrModule {
     let agg = Ty::Struct(StructId::new(0));
     // value ids: 0=a, 1=b, 2=c
-    let body = vec![
+    let mut body = vec![
         alloca(3, agg.clone()),
         binop(4, BinOp::Add, Ty::I64, 0, 1), // a+b
         binop(5, BinOp::Sub, Ty::I64, 0, 1), // a-b
-        insert_field(6, &agg, 3, 0, 4),
-        insert_field(7, &agg, 3, 1, 5),
+    ];
+    body.extend(store_field(100, 101, 3, 0, Ty::I64, 4));
+    body.extend(store_field(102, 103, 3, 8, Ty::I64, 5));
+    body.extend([
         iconst(10, Ty::I64, 99),
         // _combined(a, b, s, c, 99)
         call(Some(11), 1, &[0, 1, 3, 2, 10]),
         ret(11),
-    ];
+    ]);
     module(
         "byval_combined",
         vec![struct_def(0, "I64x2C", &[Ty::I64, Ty::I64])],
@@ -683,11 +784,13 @@ fn byval_combined_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::I64, Ty::I64, Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![Ty::I64, Ty::I64, agg, Ty::I64, Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -699,6 +802,8 @@ fn byval_combined_module() -> TrustIrModule {
                 block(vec![(0, Ty::I64), (1, Ty::I64), (2, Ty::I64)], body),
             ),
             TrustIrFunction {
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(1),
                 name: "_combined".to_string(),
@@ -713,6 +818,9 @@ fn byval_combined_module() -> TrustIrModule {
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                section: None,
+                visibility: Default::default(),
+                retained: false,
             },
         ],
     )
@@ -773,15 +881,17 @@ fn self_contained_byval_i64x2_module() -> TrustIrModule {
     ];
 
     // entry `_sc2_entry(a, b) -> i64`: s = {a, b}; return _sc2(s) + a
-    let entry_body = vec![
+    let mut entry_body = vec![
         // value 0 = a, 1 = b
         alloca(2, agg.clone()),
-        insert_field(3, &agg, 2, 0, 0),
-        insert_field(4, &agg, 2, 1, 1),
+    ];
+    entry_body.extend(store_field(100, 101, 2, 0, Ty::I64, 0));
+    entry_body.extend(store_field(102, 103, 2, 8, Ty::I64, 1));
+    entry_body.extend([
         call(Some(7), 1, &[2]),
         binop(8, BinOp::Add, Ty::I64, 7, 0), // keep `a` live across the call
         ret(8),
-    ];
+    ]);
 
     module(
         "self_contained_byval_i64x2",
@@ -791,11 +901,13 @@ fn self_contained_byval_i64x2_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::I64, Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![agg.clone()],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -844,4 +956,13 @@ int main(void) {
 }
 "#;
     run_differential("x86_64_self_contained_byval_i64x2", &m, c, driver).unwrap();
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

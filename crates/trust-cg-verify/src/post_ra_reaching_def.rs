@@ -87,7 +87,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use trust_cg_ir::aarch64_regs::{preg_class, reg_number};
 use trust_cg_ir::{AArch64Opcode, MachFunction, MachInst, MachOperand, PReg, RegClass};
-use trust_cg_opt::effects::{OperandRole, aarch64_operand_roles, is_lse_cas, is_lse_rmw};
+use trust_cg_opt::effects::{
+    OperandRole, aarch64_operand_roles, has_explicit_atomic_operand_roles,
+};
 
 pub use crate::post_regalloc_recheck::PostRegallocRecheckMode;
 
@@ -187,7 +189,7 @@ fn is_explicit_writeback(op: AArch64Opcode) -> bool {
 /// itself used — the invariant that makes the WARN net false-positive-free.
 fn uses_all_operands(inst: &MachInst) -> bool {
     let op = inst.opcode;
-    if is_lse_rmw(op) || is_lse_cas(op) || is_explicit_writeback(op) {
+    if has_explicit_atomic_operand_roles(op) || is_explicit_writeback(op) {
         return false;
     }
     inst.writes_memory()
@@ -200,24 +202,55 @@ fn uses_all_operands(inst: &MachInst) -> bool {
         )
 }
 
-/// Faithful reproduction of codegen `classify_operand_positions`: LSE atomics
-/// and explicit-writeback forms use the shared role table directly; the
-/// all-operands-are-uses class short-circuits; everything else uses the shared
-/// role table (`produces_value` => operand 0 is a def, `has_tied_def_use` =>
-/// def-use).
-fn operand_roles(inst: &MachInst) -> Vec<OperandRole> {
+/// Faithful reproduction of codegen `classify_operand_positions`: LSE atomics,
+/// the exclusive store `STLXR` (whose operand 0 is the status DEF although it
+/// writes memory) and explicit-writeback forms use the shared role table
+/// directly; the all-operands-are-uses class short-circuits; everything else
+/// uses the shared role table (`produces_value` => operand 0 is a def,
+/// `has_tied_def_use` => def-use).
+pub(crate) fn operand_roles(inst: &MachInst) -> Vec<OperandRole> {
     let op = inst.opcode;
     let n = inst.operands.len();
     if n == 0 {
         return Vec::new();
     }
-    if is_lse_rmw(op) || is_lse_cas(op) || is_explicit_writeback(op) {
+    if has_explicit_atomic_operand_roles(op) || is_explicit_writeback(op) {
         return aarch64_operand_roles(op, n);
     }
     if uses_all_operands(inst) {
         return vec![OperandRole::Use; n];
     }
     aarch64_operand_roles(op, n)
+}
+
+/// [`operand_roles`] as `(def positions, use positions)` bitmasks, without
+/// allocating (operand positions at 64 or beyond are not representable and
+/// are reported as neither; callers refuse such instructions).
+pub(crate) fn operand_role_masks(inst: &MachInst) -> (u64, u64) {
+    let op = inst.opcode;
+    let n = inst.operands.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    if !(has_explicit_atomic_operand_roles(op) || is_explicit_writeback(op))
+        && uses_all_operands(inst)
+    {
+        let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        return (0, all);
+    }
+    let mut defs = 0u64;
+    let mut uses = 0u64;
+    trust_cg_opt::effects::aarch64_for_each_def_position(op, n, |pos| {
+        if pos < 64 {
+            defs |= 1 << pos;
+        }
+    });
+    trust_cg_opt::effects::aarch64_for_each_use_position(op, n, |pos| {
+        if pos < 64 {
+            uses |= 1 << pos;
+        }
+    });
+    (defs, uses)
 }
 
 /// `(gen_mask, reads)` for one instruction:
@@ -230,7 +263,9 @@ fn operand_roles(inst: &MachInst) -> Vec<OperandRole> {
 ///
 /// Non-register operands and System registers contribute nothing
 /// (`loc_mask == 0` skips them in both the gen_bits accumulation and the read check).
-fn inst_gen_reads(inst: &MachInst) -> (u64, Vec<PReg>) {
+/// The trap-guard obligation ([`crate::aarch64_trap_guard`]) reuses it to show
+/// the IP scratch registers a guard window writes are dead after it.
+pub(crate) fn inst_gen_reads(inst: &MachInst) -> (u64, Vec<PReg>) {
     let roles = operand_roles(inst);
     let mut gen_bits = 0u64;
     let mut reads = Vec::new();
@@ -475,16 +510,16 @@ pub struct ReachingDefViolation {
 // Mode + telemetry
 // ---------------------------------------------------------------------------
 
-/// Default mode for the aarch64 reaching-def net: WARN (first slice). Flip to
-/// ENFORCE only after a 0-hit corpus soak, exactly as the structural recheck was.
+/// Default mode for the aarch64 reaching-def net: ENFORCE after its zero-hit
+/// corpus soak, exactly as the structural recheck was.
 pub const AARCH64_REACHING_DEF_DEFAULT: PostRegallocRecheckMode = PostRegallocRecheckMode::Enforce;
 
 /// Resolve the active mode from `TCG_AARCH64_POST_RA_REACHING_DEF`
 /// (`off`|`warn`|`enforce`, or `0`|`1`|`2`), defaulting to
 /// [`AARCH64_REACHING_DEF_DEFAULT`]. Env gating is permitted here because the
-/// default is the NON-gating WARN mode; it is the knob the soak ratchet turns.
+/// environment knob is an explicit diagnostic downgrade/disable escape hatch.
 pub fn reaching_def_mode() -> PostRegallocRecheckMode {
-    match std::env::var("TCG_AARCH64_POST_RA_REACHING_DEF").as_deref() {
+    match trust_cg_process_env::var("TCG_AARCH64_POST_RA_REACHING_DEF").as_deref() {
         Ok("off") | Ok("0") => PostRegallocRecheckMode::Off,
         Ok("enforce") | Ok("2") => PostRegallocRecheckMode::Enforce,
         Ok("warn") | Ok("1") => PostRegallocRecheckMode::Warn,
@@ -544,24 +579,13 @@ pub fn evaluate(
     if mode == PostRegallocRecheckMode::Off {
         return None;
     }
-    let debug = std::env::var_os("TCG_AARCH64_POST_RA_REACHING_DEF_DEBUG").is_some();
     let violations = match analyze(func) {
         Some(v) => {
             STREAMS_ANALYZED.fetch_add(1, Ordering::Relaxed);
-            if debug {
-                eprintln!(
-                    "[A64-RD-DEBUG] fn={} outcome=analyzed viol={}",
-                    func.name,
-                    v.len()
-                );
-            }
             v
         }
         None => {
             STREAMS_DECLINED.fetch_add(1, Ordering::Relaxed);
-            if debug {
-                eprintln!("[A64-RD-DEBUG] fn={} outcome=declined", func.name);
-            }
             return None;
         }
     };
@@ -627,6 +651,27 @@ mod tests {
         assert!(evaluate(&f, PostRegallocRecheckMode::Enforce).is_some());
         assert!(evaluate(&f, PostRegallocRecheckMode::Warn).is_none());
         assert!(evaluate(&f, PostRegallocRecheckMode::Off).is_none());
+    }
+
+    #[test]
+    fn exclusive_store_status_is_a_definition() {
+        // stlxr w9, x2, [x1] ; cbnz w9 — the status register is written by the
+        // store (codegen's classifier treats operand 0 as a def), so the
+        // following read has a reaching definition.
+        let stlxr = MachInst::new(
+            AArch64Opcode::Stlxr,
+            vec![
+                MachOperand::PReg(trust_cg_ir::aarch64_regs::W9),
+                MachOperand::PReg(trust_cg_ir::aarch64_regs::X2),
+                MachOperand::PReg(X1),
+            ],
+        );
+        assert_eq!(
+            operand_roles(&stlxr),
+            vec![OperandRole::Def, OperandRole::Use, OperandRole::Use]
+        );
+        let read = add(X0, X9, X1);
+        assert!(check(&single_block("stlxr_status", vec![stlxr, read])).is_empty());
     }
 
     #[test]

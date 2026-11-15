@@ -193,7 +193,7 @@ fn prepare(func: &LirFunction, ctx: &ProofContext) -> MachFunction {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O2,
         verify: false,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
     pipeline
         .prepare_function_with_metrics(func, Some(ctx))

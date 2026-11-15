@@ -29,6 +29,36 @@ use trust_cg_dialect::module::{DialectFunction, DialectModule};
 use trust_cg_dialect::op::{Attribute, DialectOp};
 use trust_cg_dialect::registry::DialectRegistry;
 
+#[test]
+fn malformed_source_layout_is_rejected_before_rebuilding() {
+    for defect in 0..5 {
+        let (mut module, _, _, _, _) = build_three_block_source();
+        let function = &mut module.functions[0];
+        match defect {
+            0 => function.blocks.clear(),
+            1 => function.blocks[1].id = function.blocks[0].id,
+            2 => function.blocks[0]
+                .ops
+                .push(trust_cg_dialect::id::OpId(u32::MAX)),
+            3 => function.ops[0]
+                .attrs
+                .push(("missing".into(), Attribute::Block(BlockId(u32::MAX)))),
+            4 => {
+                let duplicate = function.blocks[0].ops[0];
+                function.blocks[1].ops.push(duplicate);
+            }
+            _ => unreachable!(),
+        }
+        let before = format!("{function:?}");
+        let error = ConversionDriver::new().run(&mut module).unwrap_err();
+        assert!(
+            matches!(error, ConversionError::InvalidFunction(_)),
+            "{error}"
+        );
+        assert_eq!(format!("{:?}", module.functions[0]), before);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -62,18 +92,21 @@ fn build_three_block_source() -> (
     let mut registry = DialectRegistry::new();
     let (verif_id, trust_ir_id, _machir_id, _ay_id) = register_all(&mut registry);
 
-    let mut f = DialectFunction::new("multi_bb", vec![Type::I64], vec![Type::I64]);
+    let mut f = DialectFunction::new("multi_bb", vec![Type::I64], vec![Type::I64])
+        .expect("bounded test function");
     let bb0 = f.entry_block().unwrap();
     let p = f.params[0].0;
 
     // bb1 carries a block parameter %q: i64.
-    let (bb1, bb1_params) = f.new_block_with_params(vec![Type::I64]);
+    let (bb1, bb1_params) = f
+        .new_block_with_params(vec![Type::I64])
+        .expect("bounded test function");
     let q = bb1_params[0];
 
-    let bb2 = f.new_block();
+    let bb2 = f.new_block().expect("bounded test function");
 
     // bb0 body.
-    let t0 = f.alloc_value();
+    let t0 = f.alloc_value().expect("bounded test function");
     f.append_op(
         bb0,
         DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_CONST),
@@ -81,8 +114,9 @@ fn build_three_block_source() -> (
         vec![],
         vec![("value".to_string(), Attribute::U64(1))],
         None,
-    );
-    let added = f.alloc_value();
+    )
+    .expect("bounded test function");
+    let added = f.alloc_value().expect("bounded test function");
     f.append_op(
         bb0,
         DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_ADD),
@@ -90,9 +124,10 @@ fn build_three_block_source() -> (
         vec![p, t0],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
     // Attribute::Block(bb1) — tests CFG remap through the block_map.
-    let fp_a = f.alloc_value();
+    let fp_a = f.alloc_value().expect("bounded test function");
     f.append_op(
         bb0,
         DialectOpId::new(verif_id, verif::FINGERPRINT_BATCH),
@@ -100,10 +135,11 @@ fn build_three_block_source() -> (
         vec![p, p],
         vec![("goto".to_string(), Attribute::Block(bb1))],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     // bb1 body (must use %q so block-param wiring is observable).
-    let t1 = f.alloc_value();
+    let t1 = f.alloc_value().expect("bounded test function");
     f.append_op(
         bb1,
         DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_CONST),
@@ -111,8 +147,9 @@ fn build_three_block_source() -> (
         vec![],
         vec![("value".to_string(), Attribute::U64(2))],
         None,
-    );
-    let fp_b = f.alloc_value();
+    )
+    .expect("bounded test function");
+    let fp_b = f.alloc_value().expect("bounded test function");
     f.append_op(
         bb1,
         DialectOpId::new(verif_id, verif::FINGERPRINT_BATCH),
@@ -120,7 +157,8 @@ fn build_three_block_source() -> (
         vec![q, q],
         vec![("goto".to_string(), Attribute::Block(bb2))],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     // bb2: terminator.
     f.append_op(
@@ -130,7 +168,8 @@ fn build_three_block_source() -> (
         vec![],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     let mut module = DialectModule::new("multi_bb_mod", registry);
     module.push_function(f);
@@ -249,7 +288,7 @@ impl ConversionPattern for VerifStubToTrustIrXor {
         let a = op.operands[0];
         let b = op.operands[1];
         let (src_result, ty) = op.results[0].clone();
-        let dst = rewriter.alloc_value();
+        let dst = rewriter.alloc_value()?;
         // Preserve Attribute::Block("goto") — the driver has already remapped
         // it into destination-block space for us, so we just clone it across.
         let attrs: Vec<(String, Attribute)> = op.attrs.clone();
@@ -259,7 +298,7 @@ impl ConversionPattern for VerifStubToTrustIrXor {
             vec![a, b],
             attrs,
             op.source,
-        );
+        )?;
         rewriter.bind_result(src_result, dst);
         Ok(())
     }
@@ -367,14 +406,15 @@ fn terminator_in_last_block_does_not_bubble_up() {
     let mut registry = DialectRegistry::new();
     let (_verif_id, trust_ir_id, _machir_id, _ay_id) = register_all(&mut registry);
 
-    let mut f = DialectFunction::new("two_bb", vec![Type::I64], vec![Type::I64]);
+    let mut f = DialectFunction::new("two_bb", vec![Type::I64], vec![Type::I64])
+        .expect("bounded test function");
     let bb0 = f.entry_block().unwrap();
     let p = f.params[0].0;
 
-    let bb1 = f.new_block();
+    let bb1 = f.new_block().expect("bounded test function");
 
     // bb0: a single non-terminator op.
-    let t0 = f.alloc_value();
+    let t0 = f.alloc_value().expect("bounded test function");
     f.append_op(
         bb0,
         DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_ADD),
@@ -382,7 +422,8 @@ fn terminator_in_last_block_does_not_bubble_up() {
         vec![p, p],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     // bb1: the terminator, consuming bb0's result. This creates a cross-block
     // SSA edge which the old code could only satisfy by collapsing blocks.
@@ -393,7 +434,8 @@ fn terminator_in_last_block_does_not_bubble_up() {
         vec![t0],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     let mut module = DialectModule::new("two_bb_mod", registry);
     module.push_function(f);

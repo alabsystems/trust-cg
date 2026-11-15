@@ -1,0 +1,15 @@
+# Stock-Rust process-contract harness only; this does not build the bridge dylib.
+[package]
+name = "bridge-build-probe-contract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bridge-build-probe-contract"
+path = "../../../../crates/rustc-codegen-trust-cg/build.rs"
+
+[dependencies]
+serde_json = "=1.0.151"
+
+[workspace]

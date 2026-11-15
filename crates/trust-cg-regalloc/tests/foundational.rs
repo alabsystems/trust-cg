@@ -394,7 +394,7 @@ fn phi_elim_two_block_single_phi_lowers_to_copy_in_predecessor() {
         stack_slots: BTreeMap::new(),
     };
 
-    eliminate_phis(&mut func);
+    eliminate_phis(&mut func).unwrap();
 
     let block0_has_copy_v2_from_v0 = func.blocks[0].insts.iter().any(|id| {
         let inst = &func.insts[id.0 as usize];

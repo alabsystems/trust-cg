@@ -1,0 +1,686 @@
+{
+  "name": "proof_surface",
+  "functions": [
+    {
+      "id": 0,
+      "name": "bump",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U64"
+            ],
+            [
+              1,
+              {
+                "RefMut": "U64"
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "U64",
+                  "lhs": 0,
+                  "rhs": 0
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [
+          {
+            "schema": "smtlib2",
+            "payload": "(bvult x #x8000000000000000)",
+            "smtlib": "(bvult x #x8000000000000000)",
+            "sort": "Bool",
+            "bindings": [
+              [
+                "x",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "Param": {
+                      "index": 0
+                    }
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "ensures": [
+          {
+            "schema": "smtlib2",
+            "payload": "(and (= result sum) (= p_exit p_exit) heap (not unwinding))",
+            "smtlib": "(and (= result sum) (= p_exit p_exit) heap (not unwinding))",
+            "sort": "Bool",
+            "bindings": [
+              [
+                "result",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "ResultSlot": {
+                      "index": 0
+                    }
+                  }
+                }
+              ],
+              [
+                "p_exit",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "MutParamExit": {
+                      "index": 1
+                    }
+                  }
+                }
+              ],
+              [
+                "sum",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "Value": 2
+                  }
+                }
+              ],
+              [
+                "heap",
+                {
+                  "sort": "Bool",
+                  "place": "World"
+                }
+              ],
+              [
+                "unwinding",
+                {
+                  "sort": "Bool",
+                  "place": "Unwind"
+                }
+              ]
+            ]
+          }
+        ],
+        "params": [
+          "x",
+          "p"
+        ],
+        "proved": false,
+        "decreases": [
+          {
+            "schema": "smtlib2",
+            "payload": "x",
+            "smtlib": "x",
+            "sort": "(_ BitVec 64)",
+            "bindings": [
+              [
+                "x",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "Param": {
+                      "index": 0
+                    }
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "backed_by": null
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "reciprocal",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [],
+        "ensures": [
+          {
+            "schema": "smtlib2",
+            "payload": "(not (= result 0))",
+            "smtlib": "(not (= result 0))",
+            "sort": "Bool"
+          }
+        ],
+        "params": [
+          "x"
+        ],
+        "proved": true,
+        "decreases": [],
+        "backed_by": {
+          "module": 0,
+          "symbol": "reciprocal",
+          "obligation": 2
+        }
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "U64",
+        {
+          "RefMut": "U64"
+        }
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U64"
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "Termination",
+      "status": "Pending",
+      "description": "bump terminates",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(bvule x x)",
+        "smtlib": "(bvule x x)",
+        "sort": "Bool",
+        "bindings": [
+          [
+            "x",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "Param": {
+                  "index": 0
+                }
+              }
+            }
+          ]
+        ]
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 1,
+      "kind": "Ownership",
+      "status": "Pending",
+      "description": "bump's &mut is exclusive",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(bvule x x)",
+        "smtlib": "(bvule x x)",
+        "sort": "Bool",
+        "bindings": [
+          [
+            "x",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "Param": {
+                  "index": 0
+                }
+              }
+            }
+          ]
+        ]
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 2,
+      "kind": {
+        "Custom": {
+          "namespace": "trust.contract",
+          "name": "unlowered \"old(x)\" clause"
+        }
+      },
+      "status": "Pending",
+      "description": "a source clause the compiler could not lower",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(bvule x x)",
+        "smtlib": "(bvule x x)",
+        "sort": "Bool",
+        "bindings": [
+          [
+            "x",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "Param": {
+                  "index": 0
+                }
+              }
+            }
+          ]
+        ]
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 3,
+      "kind": "Postcondition",
+      "status": "Trusted",
+      "description": "an audited postcondition",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(= 1 1)",
+        "smtlib": "(= 1 1)",
+        "sort": "Bool"
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 4,
+      "kind": "Postcondition",
+      "status": "Trusted",
+      "description": "an audited postcondition",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(= 1 1)",
+        "smtlib": "(= 1 1)",
+        "sort": "Bool"
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 5,
+      "kind": "Postcondition",
+      "status": "Trusted",
+      "description": "an audited postcondition",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(= 1 1)",
+        "smtlib": "(= 1 1)",
+        "sort": "Bool"
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 6,
+      "kind": "Postcondition",
+      "status": "Trusted",
+      "description": "an audited postcondition",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(= 1 1)",
+        "smtlib": "(= 1 1)",
+        "sort": "Bool"
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    }
+  ],
+  "proof_certificates": [
+    {
+      "obligation": 3,
+      "prover": "manual-audit",
+      "evidence": {
+        "Trusted": "reviewed; coverage row 0"
+      },
+      "assurance": {
+        "bound": "Unbounded",
+        "request_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80
+          ]
+        }
+      }
+    },
+    {
+      "obligation": 4,
+      "prover": "manual-audit",
+      "evidence": {
+        "Trusted": "reviewed; coverage row 1"
+      },
+      "assurance": {
+        "bound": {
+          "UnwindBounded": {
+            "depth": 8
+          }
+        },
+        "request_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81,
+            81
+          ]
+        }
+      }
+    },
+    {
+      "obligation": 5,
+      "prover": "manual-audit",
+      "evidence": {
+        "Trusted": "reviewed; coverage row 2"
+      },
+      "assurance": {
+        "bound": {
+          "ModelBounded": {
+            "size": 3
+          }
+        },
+        "request_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82,
+            82
+          ]
+        }
+      }
+    },
+    {
+      "obligation": 6,
+      "prover": "manual-audit",
+      "evidence": {
+        "Trusted": "reviewed; coverage row 3"
+      },
+      "assurance": {
+        "bound": "Unrecorded",
+        "request_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83,
+            83
+          ]
+        }
+      }
+    }
+  ],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "aapcs64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [
+    {
+      "name": "proof_surface_dep",
+      "digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68,
+          68
+        ]
+      },
+      "producer": "Clean"
+    }
+  ],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

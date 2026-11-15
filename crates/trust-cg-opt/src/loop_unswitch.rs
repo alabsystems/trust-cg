@@ -66,6 +66,11 @@
 //!   NZCV it wrote must be provably dead: every path from the branch block's
 //!   successors must reach a flag WRITER (or a call, which clobbers NZCV)
 //!   before any flag READER — else decline;
+//! * every body block's successors are exactly the `Block` operands of its
+//!   instructions and no body instruction reads a jump table, since the clone's
+//!   edges are rebuilt from those operands (a switch dispatch's targets live in
+//!   `MachFunction::jump_tables`, which a clone would share;
+//!   `mach_util::clone_reproduces_out_edges`);
 //! * one unswitch per function per pass run.
 //!
 //! Dead in-version paths (the not-taken target's subgraph, when it becomes
@@ -73,7 +78,7 @@
 //! cleans them downstream. Kill switch: `TCG_NO_LOOP_UNSWITCH`; bisect key
 //! `unswitch` (`TRUST_CG_DISABLE_PASSES=unswitch`).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, CondCode, InstFlags, InstId, MachFunction, MachInst, MachOperand, VReg,
@@ -84,6 +89,7 @@ use crate::effects::{
     aarch64_for_each_def_position, aarch64_for_each_use_position, reads_flags, writes_flags,
 };
 use crate::loops::{LoopAnalysis, NaturalLoop};
+use crate::mach_util::body_clone_reproduces_out_edges;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// Maximum number of blocks in an unswitchable loop body. Queens' `Try` trial
@@ -131,11 +137,11 @@ impl MachinePass for LoopUnswitch {
         // is invalidated on any CFG-fingerprint change — an in-place rewrite
         // that survives the fingerprint cannot alter preds/succs. Recomputing
         // here paid one O(blocks) walk per pass invocation for nothing.
-        let changed = {
+
+        {
             let dom = analyses.domtree(func);
             run_unswitch(func, &loop_analysis, dom)
-        };
-        changed
+        }
     }
 }
 
@@ -173,16 +179,32 @@ fn run_unswitch(func: &mut MachFunction, loop_analysis: &LoopAnalysis, dom: &Dom
         return false;
     }
 
+    let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
     // Innermost loops only (same filter as the unroller). `all_loops()`
     // iterates in header order (BTreeMap) — deterministic.
     let all_loops: Vec<NaturalLoop> = loop_analysis.all_loops().cloned().collect();
+    // A loop is innermost when no loop names its header as parent.
+    let parents: HashSet<BlockId> = all_loops.iter().filter_map(|o| o.parent).collect();
+    // Whole-function facts the search reads, built once for every loop: the
+    // search is read-only until a plan is applied, after which this returns.
+    let mut index = UnswitchIndex::new();
 
     for lp in &all_loops {
-        let is_innermost = !all_loops.iter().any(|o| o.parent == Some(lp.header));
+        let is_innermost = !parents.contains(&lp.header);
         if !is_innermost {
             continue;
         }
-        if let Some(plan) = find_unswitch(func, lp, dom) {
+        if !protected.is_empty()
+            && lp.body.iter().any(|b| {
+                func.block(*b)
+                    .insts
+                    .iter()
+                    .any(|id| protected.contains(*id))
+            })
+        {
+            continue;
+        }
+        if let Some(plan) = find_unswitch(func, lp, dom, &mut index) {
             apply_unswitch(func, &plan);
             // Cap: one unswitch per function per run. The versions produced
             // here contain no invariant conditional branch (it was replaced
@@ -226,9 +248,115 @@ fn decode_eq_ne(enc: i64) -> Option<CondCode> {
     }
 }
 
+/// Whole-function facts [`find_unswitch`] reads, built once per pass run
+/// (ledger row L14-P6). Each loop used to rebuild the def sites and scan
+/// every block of the function for body live-outs and for its own body
+/// blocks in layout order, which made a function with many loops cost
+/// quadratically in them (24 ms of a 120-loop function, 0.40 s at 480).
+struct UnswitchIndex {
+    /// How many loops have reached the scans so far. The first one runs the
+    /// literal scans (a function with one candidate loop pays what it paid
+    /// before); later ones read the index, built on first need.
+    searched: usize,
+    /// [`build_def_sites`], shared by every loop.
+    def_sites: std::cell::OnceCell<HashMap<VReg, Vec<(InstId, BlockId)>>>,
+    /// Each block's position in `block_order`, when no block appears there
+    /// twice (`None` otherwise: the literal filter runs).
+    layout_position: std::cell::OnceCell<Option<HashMap<BlockId, usize>>>,
+    /// Per vreg, the `block_order` blocks with an instruction using it.
+    use_blocks: std::cell::OnceCell<HashMap<VReg, Vec<BlockId>>>,
+}
+
+impl UnswitchIndex {
+    fn new() -> Self {
+        Self {
+            searched: 0,
+            def_sites: std::cell::OnceCell::new(),
+            layout_position: std::cell::OnceCell::new(),
+            use_blocks: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Count one more loop reaching the scans; whether it is the first.
+    fn note_search(&mut self) -> bool {
+        self.searched += 1;
+        self.searched == 1
+    }
+
+    fn def_sites(&self, func: &MachFunction) -> &HashMap<VReg, Vec<(InstId, BlockId)>> {
+        self.def_sites.get_or_init(|| build_def_sites(func))
+    }
+
+    /// The body's blocks in `block_order` order: `block_order` filtered by
+    /// membership, as the literal filter computes it.
+    fn body_blocks(&self, func: &MachFunction, body: &HashSet<BlockId>) -> Vec<BlockId> {
+        let positions = self.layout_position.get_or_init(|| {
+            let mut positions: HashMap<BlockId, usize> = HashMap::default();
+            for (position, &b) in func.block_order.iter().enumerate() {
+                if positions.insert(b, position).is_some() {
+                    return None;
+                }
+            }
+            Some(positions)
+        });
+        let Some(positions) = positions else {
+            return func
+                .block_order
+                .iter()
+                .copied()
+                .filter(|b| body.contains(b))
+                .collect();
+        };
+        let mut blocks: Vec<(usize, BlockId)> = body
+            .iter()
+            .filter_map(|b| positions.get(b).map(|&position| (position, *b)))
+            .collect();
+        blocks.sort_unstable();
+        blocks.into_iter().map(|(_, b)| b).collect()
+    }
+
+    /// [`body_has_live_out`]: some vreg defined in `body` is used by an
+    /// instruction of a `block_order` block outside `body`.
+    fn body_has_live_out(&self, func: &MachFunction, body: &HashSet<BlockId>) -> bool {
+        let use_blocks = self.use_blocks.get_or_init(|| {
+            let mut use_blocks: HashMap<VReg, Vec<BlockId>> = HashMap::default();
+            for &b in &func.block_order {
+                for &iid in &func.block(b).insts {
+                    let inst = func.inst(iid);
+                    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |up| {
+                        if let Some(MachOperand::VReg(v)) = inst.operands.get(up) {
+                            let blocks = use_blocks.entry(*v).or_default();
+                            if blocks.last() != Some(&b) {
+                                blocks.push(b);
+                            }
+                        }
+                    });
+                }
+            }
+            use_blocks
+        });
+        let mut body_defined: HashSet<VReg> = HashSet::default();
+        for &b in body {
+            for &iid in &func.block(b).insts {
+                let inst = func.inst(iid);
+                aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |dp| {
+                    if let Some(MachOperand::VReg(v)) = inst.operands.get(dp) {
+                        body_defined.insert(*v);
+                    }
+                });
+            }
+        }
+        body_defined.iter().any(|v| {
+            use_blocks
+                .get(v)
+                .is_some_and(|blocks| blocks.iter().any(|b| !body.contains(b)))
+        })
+    }
+}
+
 /// Def sites of every vreg: `(inst, block)` pairs, over `block_order`.
 fn build_def_sites(func: &MachFunction) -> HashMap<VReg, Vec<(InstId, BlockId)>> {
-    let mut map: HashMap<VReg, Vec<(InstId, BlockId)>> = HashMap::new();
+    let mut map: HashMap<VReg, Vec<(InstId, BlockId)>> = HashMap::default();
     for &b in &func.block_order {
         for &iid in &func.block(b).insts {
             let inst = func.inst(iid);
@@ -243,9 +371,10 @@ fn build_def_sites(func: &MachFunction) -> HashMap<VReg, Vec<(InstId, BlockId)>>
 }
 
 /// True if any vreg defined inside `body` is used by an instruction outside
-/// `body` (a register live-out — declined; see the module gates).
+/// `body` (a register live-out — declined; see the module gates). The scan
+/// [`UnswitchIndex::body_has_live_out`] answers from its index.
 fn body_has_live_out(func: &MachFunction, body: &HashSet<BlockId>) -> bool {
-    let mut body_defined: HashSet<VReg> = HashSet::new();
+    let mut body_defined: HashSet<VReg> = HashSet::default();
     for &b in body {
         for &iid in &func.block(b).insts {
             let inst = func.inst(iid);
@@ -285,7 +414,7 @@ fn body_has_live_out(func: &MachFunction, body: &HashSet<BlockId>) -> bool {
 /// pseudos) counts as a reader.
 fn nzcv_dead_from(func: &MachFunction, starts: &[BlockId]) -> bool {
     use AArch64Opcode::*;
-    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seen: HashSet<BlockId> = HashSet::default();
     let mut work: Vec<BlockId> = starts.to_vec();
     while let Some(b) = work.pop() {
         if !seen.insert(b) {
@@ -344,7 +473,12 @@ fn nzcv_dead_from(func: &MachFunction, starts: &[BlockId]) -> bool {
 
 /// Recognize an unswitchable invariant conditional branch in `lp`, applying
 /// every gate from the module doc. Returns the validated plan or `None`.
-fn find_unswitch(func: &MachFunction, lp: &NaturalLoop, dom: &DomTree) -> Option<UnswitchPlan> {
+fn find_unswitch(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    dom: &DomTree,
+    index: &mut UnswitchIndex,
+) -> Option<UnswitchPlan> {
     let preheader = lp.preheader?;
     let header = lp.header;
 
@@ -367,18 +501,30 @@ fn find_unswitch(func: &MachFunction, lp: &NaturalLoop, dom: &DomTree) -> Option
     if lp.body.len() > MAX_BODY_BLOCKS {
         return None;
     }
-    let body_blocks: Vec<BlockId> = func
-        .block_order
-        .iter()
-        .copied()
-        .filter(|b| lp.body.contains(b))
-        .collect();
+    let first_search = index.note_search();
+    let body_blocks: Vec<BlockId> = if first_search {
+        func.block_order
+            .iter()
+            .copied()
+            .filter(|b| lp.body.contains(b))
+            .collect()
+    } else {
+        index.body_blocks(func, &lp.body)
+    };
     // Every body block must be in block_order (the clone iterates it).
     if body_blocks.len() != lp.body.len() {
         return None;
     }
     let body_insts: usize = body_blocks.iter().map(|b| func.block(*b).insts.len()).sum();
     if body_insts > MAX_BODY_INSTS {
+        return None;
+    }
+
+    // The clone's control flow is rebuilt from its instructions' `Block`
+    // operands alone (`clone_remap` + `wire_out_edges`); anything else that
+    // carries a body edge (a jump table, a fall-through) would be shared with,
+    // or lost by, the clone.
+    if !body_clone_reproduces_out_edges(func, &body_blocks) {
         return None;
     }
 
@@ -407,11 +553,16 @@ fn find_unswitch(func: &MachFunction, lp: &NaturalLoop, dom: &DomTree) -> Option
     }
 
     // No register live-outs from the body.
-    if body_has_live_out(func, &lp.body) {
+    let live_out = if first_search {
+        body_has_live_out(func, &lp.body)
+    } else {
+        index.body_has_live_out(func, &lp.body)
+    };
+    if live_out {
         return None;
     }
 
-    let def_sites = build_def_sites(func);
+    let def_sites = index.def_sites(func);
 
     // Scan for invariant conditional branches; require EXACTLY one.
     let mut found: Option<UnswitchPlan> = None;
@@ -530,7 +681,7 @@ fn renamable_clone_vregs(func: &MachFunction, body: &[BlockId], dom: &DomTree) -
     let body_set: HashSet<BlockId> = body.iter().copied().collect();
 
     // Def sites of each vreg inside the body: (block, position-within-block).
-    let mut defs: HashMap<VReg, Vec<(BlockId, usize)>> = HashMap::new();
+    let mut defs: HashMap<VReg, Vec<(BlockId, usize)>> = HashMap::default();
     for &b in body {
         for (pos, &iid) in func.block(b).insts.iter().enumerate() {
             let inst = func.inst(iid);
@@ -556,7 +707,7 @@ fn renamable_clone_vregs(func: &MachFunction, body: &[BlockId], dom: &DomTree) -
         })
     };
 
-    let mut unsafe_vregs: HashSet<VReg> = HashSet::new();
+    let mut unsafe_vregs: HashSet<VReg> = HashSet::default();
     for &b in &func.block_order {
         let in_body = body_set.contains(&b);
         for (pos, &iid) in func.block(b).insts.iter().enumerate() {
@@ -637,7 +788,7 @@ fn apply_unswitch(func: &mut MachFunction, plan: &UnswitchPlan) {
         .collect();
 
     // 2. Create the clone blocks (version B), preserving loop depth.
-    let mut map: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut map: HashMap<BlockId, BlockId> = HashMap::default();
     for &bo in &plan.body_blocks {
         let nb = func.create_block();
         func.block_mut(nb).loop_depth = func.block(bo).loop_depth;
@@ -717,6 +868,7 @@ fn apply_unswitch(func: &mut MachFunction, plan: &UnswitchPlan) {
 
 #[cfg(test)]
 mod tests {
+    mod eh_call_custody_tests;
     use super::*;
     use trust_cg_ir::{RegClass, Signature};
 
@@ -944,6 +1096,43 @@ mod tests {
         });
     }
 
+    /// The taken arm (bb3) dispatches through a jump table to bb5. A clone
+    /// would share `jump_tables[0]` and so branch into version A's targets;
+    /// the pass must decline.
+    #[test]
+    fn declines_a_jump_table_dispatch_in_the_body() {
+        let mut f = make_unswitchable_loop();
+        let bb3 = BlockId(3);
+        let bb5 = BlockId(5);
+        f.jump_tables.push(trust_cg_ir::function::JumpTableData {
+            min_val: 0,
+            targets: vec![bb5],
+        });
+        let t = VReg::new(f.alloc_vreg(), RegClass::Gpr64);
+        f.block_mut(bb3).insts.clear();
+        for inst in [
+            MachInst::new(
+                AArch64Opcode::Adr,
+                vec![MachOperand::VReg(t), MachOperand::JumpTableIndex(0)],
+            ),
+            MachInst::new(AArch64Opcode::Br, vec![MachOperand::VReg(t)]),
+        ] {
+            let id = f.push_inst(inst);
+            f.append_inst(bb3, id);
+        }
+        assert_eq!(f.block(bb3).succs, vec![bb5]);
+        assert!(!run_pass(&mut f), "jump-table body must decline");
+    }
+
+    /// A body block with an out-edge no `Block` operand names: the clone,
+    /// wired from its operands, would lose that edge. Decline.
+    #[test]
+    fn declines_an_out_edge_no_operand_names() {
+        let mut f = make_unswitchable_loop();
+        f.add_edge(BlockId(4), BlockId(6));
+        assert!(!run_pass(&mut f), "unnamed out-edge must decline");
+    }
+
     #[test]
     fn declines_branch_on_loop_defined_vreg() {
         let mut f = make_unswitchable_loop();
@@ -1072,5 +1261,50 @@ mod tests {
             assert_eq!(f.insts.len(), insts, "run {again} added instructions");
             assert_eq!(f.blocks.len(), blocks, "run {again} added blocks");
         }
+    }
+
+    /// L14-P6: the per-run index answers what the per-loop scans it replaced
+    /// answer — the body blocks in layout order, the live-out decision and
+    /// the def sites — for every loop of variants of the fixture: the plain
+    /// shape, a body value used after the loop, a layout listing one body
+    /// block twice, and a layout missing one.
+    #[test]
+    fn unswitch_index_matches_the_per_loop_scans() {
+        let mut variants = vec![make_unswitchable_loop()];
+        let mut live_out = make_unswitchable_loop();
+        let use_inst = live_out.push_inst(MachInst::new(
+            AArch64Opcode::AddRI,
+            vec![op_v(5), op_v(3), op_i(1)],
+        ));
+        live_out.block_mut(BlockId(7)).insts.insert(0, use_inst);
+        variants.push(live_out);
+        let mut repeated = make_unswitchable_loop();
+        repeated.block_order.push(BlockId(3));
+        variants.push(repeated);
+        let mut missing = make_unswitchable_loop();
+        missing.block_order.retain(|&b| b != BlockId(4));
+        variants.push(missing);
+        let mut compared = 0;
+        for f in &variants {
+            let dom = DomTree::compute(f);
+            let loops = LoopAnalysis::compute(f, &dom);
+            let index = UnswitchIndex::new();
+            assert_eq!(index.def_sites(f), &build_def_sites(f));
+            for lp in loops.all_loops() {
+                let literal: Vec<BlockId> = f
+                    .block_order
+                    .iter()
+                    .copied()
+                    .filter(|b| lp.body.contains(b))
+                    .collect();
+                assert_eq!(index.body_blocks(f, &lp.body), literal);
+                assert_eq!(
+                    index.body_has_live_out(f, &lp.body),
+                    body_has_live_out(f, &lp.body)
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared >= variants.len());
     }
 }

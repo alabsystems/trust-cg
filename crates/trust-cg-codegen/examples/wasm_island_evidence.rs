@@ -14,7 +14,7 @@
 //! This closes that gap in the only direction that is honest: the families
 //! take BYTES, so point them at the exact `.wasm` a visitor downloads.
 //!
-//!     cargo run --example wasm_island_evidence -- <module.wasm> [more.wasm ...]
+//!     scripts/trust_cargo.sh run --example wasm_island_evidence -- <module.wasm> [more.wasm ...]
 //!
 //! It runs, per module:
 //!   * the module-indexing family (4) — every declared index resolves, imports

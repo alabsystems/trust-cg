@@ -21,10 +21,28 @@
 #![allow(non_snake_case)]
 #![allow(unused_imports)]
 
-#[cfg(kernel_fixture_layout_unknown)]
+// Host-target loading of the frozen Clean fixtures (rewrites the AArch64
+// `target` header line to this host; see the module for the evidence).
+#[path = "common/kernel_fixture.rs"]
+mod kernel_fixture;
+
+// A lint driver (`clippy-driver`/`tippy-driver`) links no test binary, so
+// under `kernel_fixture_layout_lint_only` this target is compiled only to BE
+// LINTED; the fixtures still cannot run, because every JIT entry point below
+// refuses at runtime under that same cfg. The ae9 Linux compiler selects its
+// own separately generated fixtures.
+#[cfg(all(
+    kernel_fixture_layout_unknown,
+    not(kernel_fixture_ae9_linux),
+    not(kernel_fixture_layout_lint_only)
+))]
 compile_error!(
     "kernel JIT fixtures require exact Rust 1.95.0, Rust 1.97.1, or the certified Trust compiler"
 );
+
+#[cfg(kernel_fixture_layout_lint_only)]
+#[path = "common/kernel_fixture_guard.rs"]
+mod kernel_fixture_guard;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,8 +64,10 @@ pub mod rn;
 // Both certified fixture lanes run all tests; nothing is ignored.
 #[cfg(kernel_fixture_layout_matches)]
 const TIR: &str = include_str!("clean_defeq_cache.tir");
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const TIR: &str = include_str!("clean_defeq_cache.trust.tir");
+#[cfg(kernel_fixture_ae9_linux)]
+const TIR: &str = include_str!("fixtures/ae9-linux/clean_defeq_cache.tir");
 
 type Pair = (rn::Expr, rn::Expr);
 
@@ -311,7 +331,8 @@ extern "C" fn s_realloc(ptr: *mut u8, size: usize, align: usize, new_size: usize
 }
 
 fn parse_validate(text: &str, what: &str) -> trust_ir::Module {
-    let m = trust_ir::parser::parse_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
+    let m =
+        kernel_fixture::parse_host_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
     let errs = trust_ir_build::validate_module(&m);
     assert!(errs.is_empty(), "{what} validate: {errs:?}");
     m
@@ -383,11 +404,17 @@ fn norm_extern(name: &str) -> String {
     out
 }
 
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_with(
     text: &str,
     what: &str,
     ext: &HashMap<String, *const u8>,
 ) -> trust_cg_codegen::jit::ExecutableBuffer {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_with");
     let module = parse_validate(text, what);
     // Build a normalized index of the shim table.
     let mut norm_index: HashMap<String, *const u8> = HashMap::new();
@@ -424,13 +451,20 @@ fn jit_with(
         };
         resolved.insert(f.name.clone(), ptr);
     }
-    let config = CompilerConfig::jit_fast(Target::Aarch64);
+    let config = CompilerConfig::jit_fast(kernel_fixture::host_jit_target());
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &resolved)
         .unwrap_or_else(|e| panic!("JIT compile {what} failed: {e:?}"))
         .buffer
 }
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit(text: &str, what: &str) -> trust_cg_codegen::jit::ExecutableBuffer {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit");
     jit_with(text, what, &externs())
 }
 fn bind(buf: &trust_cg_codegen::jit::ExecutableBuffer, sym: &str) -> *const u8 {
@@ -921,4 +955,13 @@ fn cache_full_native_jit_sweep_and_poison_push() {
     eprintln!(
         "sweep: {n} (cat,lo) native==JIT; poisoned-store flips the warm verdict (store genuinely consulted)"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

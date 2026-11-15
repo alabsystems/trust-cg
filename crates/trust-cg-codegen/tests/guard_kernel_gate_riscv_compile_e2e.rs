@@ -45,13 +45,18 @@ const ARRAY_LEN: u64 = 8;
 /// `GuardBoundsCheck` producer without synthesizing proof authority.
 fn build_proven_extract_module() -> Module {
     let mut module = Module::new("guard_kernel_gate_riscv_compile_e2e");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "proven_extract", ft, BlockId::new(0));
     let node = InstrNode::new(Inst::ExtractElement {
         ty: Ty::I64,
@@ -70,7 +75,9 @@ fn build_proven_extract_module() -> Module {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -80,17 +87,23 @@ fn build_proven_extract_module() -> Module {
 /// at module-emit time (AUIPC+JALR pcrel pair) — no relocation, no linker.
 fn build_intra_module_call_module() -> Module {
     let mut module = Module::new("riscv_intra_module_call");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // A defined callee.
-    let callee_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let callee_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut callee = TrustIrFunction::new(FuncId::new(1), "callee", callee_ft, BlockId::new(0));
     callee.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -99,7 +112,9 @@ fn build_intra_module_call_module() -> Module {
             values: vec![ValueId::new(0)],
         })],
     }];
-    module.add_function(callee);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
 
     let mut func = TrustIrFunction::new(FuncId::new(0), "caller", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -116,7 +131,9 @@ fn build_intra_module_call_module() -> Module {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -127,21 +144,38 @@ fn build_intra_module_call_module() -> Module {
 /// placeholder for a real linker to patch.
 fn build_external_call_module() -> Module {
     let mut module = Module::new("riscv_external_call");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
+    // The external callee is an FFI boundary: the module pins the target it
+    // is compiled for (`TargetInfoRequired`; WS7.3 ingestion admission).
+    module.target_info = Some(trust_ir::TargetInfo {
+        triple: "riscv64gc-unknown-linux-gnu".into(),
+        pointer_size: 8,
+        endianness: trust_ir::Endianness::Little,
+        abi: None,
+        struct_passing: trust_ir::StructPassingPolicy::NativeC,
     });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // An EXTERNAL (declaration-only, no blocks) callee — not defined here.
-    let ext_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ext_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let ext = TrustIrFunction::new(FuncId::new(1), "ext", ext_ft, BlockId::new(0));
     // No blocks: a declaration. The translator emits no body for it, so it is
     // not a defined module function; the call below becomes an external symbol.
-    module.add_function(ext);
+    module
+        .try_add_function(ext)
+        .expect("Module::try_add_function: test fixture");
 
     let mut func = TrustIrFunction::new(FuncId::new(0), "caller", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -158,14 +192,18 @@ fn build_external_call_module() -> Module {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn count_words(bytes: &[u8], target: u32) -> usize {
     bytes
-        .chunks_exact(4)
-        .filter(|w| *w == target.to_le_bytes())
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|w| **w == target.to_le_bytes())
         .count()
 }
 
@@ -175,7 +213,10 @@ fn compile_riscv(module: &Module) -> trust_cg_codegen::compiler::CompilationResu
         parallel: false,
         ..CompilerConfig::default()
     };
-    Compiler::new(cfg).compile(module).expect("RISC-V compile")
+    Compiler::new(cfg)
+        .with_codegen_license(permit_unlicensed())
+        .compile(module)
+        .expect("RISC-V compile")
 }
 
 /// Compile without the shared LIR inliner. Cross-call tests exercise the call
@@ -188,6 +229,7 @@ fn compile_riscv_o0(module: &Module) -> trust_cg_codegen::compiler::CompilationR
         ..CompilerConfig::default()
     };
     Compiler::new(cfg)
+        .with_codegen_license(permit_unlicensed())
         .compile(module)
         .expect("RISC-V O0 compile")
 }
@@ -483,4 +525,13 @@ fn riscv_compile_external_cross_call_emits_r_riscv_call_relocation() {
         "the instruction at r_offset+4 must be the JALR (contiguous AUIPC+JALR pair); \
          arg-setup moves must precede the AUIPC"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

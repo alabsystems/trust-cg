@@ -1,0 +1,3 @@
+DATA ONLY: external consumer rederives the goal and audits every declaration.
+definition-0: name=boundConditional32 is_reducible=false reducibility=Regular(1)
+source=boundConditional32

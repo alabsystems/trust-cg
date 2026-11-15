@@ -30,8 +30,13 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn i64_load(ptr: ValueId, out: ValueId) -> InstrNode {
@@ -49,6 +54,9 @@ fn build_module() -> TrustIrModule {
 
     // int64_t g_counter = 100;            (mutable, exported -> __data)
     m.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "g_counter".to_string(),
         ty: Ty::I64,
         mutable: true,
@@ -59,6 +67,9 @@ fn build_module() -> TrustIrModule {
     });
     // const int64_t g_ro = 42;            (immutable, exported -> __const)
     m.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "g_ro".to_string(),
         ty: Ty::I64,
         mutable: false,
@@ -69,6 +80,9 @@ fn build_module() -> TrustIrModule {
     });
     // const double g_pi = 3.14159;        (immutable f64 -> __const, 8 IEEE bytes)
     m.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "g_pi".to_string(),
         ty: Ty::F64,
         mutable: false,
@@ -85,8 +99,10 @@ fn build_module() -> TrustIrModule {
         m.add_func_type(FuncTy {
             params: vec![],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         })
+        .expect("Module::add_func_type: test fixture")
     };
 
     // int64_t get_counter(void) { return g_counter; }
@@ -103,7 +119,8 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(get_counter);
+    m.try_add_function(get_counter)
+        .expect("Module::try_add_function: test fixture");
 
     // int64_t get_ro(void) { return g_ro; }
     let ft1 = ret_i64(&mut m);
@@ -119,14 +136,18 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(get_ro);
+    m.try_add_function(get_ro)
+        .expect("Module::try_add_function: test fixture");
 
     // int64_t add_counter(int64_t x) { g_counter += x; return g_counter; }
-    let ft2 = m.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft2 = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut add_counter = TrustIrFunction::new(FuncId::new(2), "add_counter", ft2, BlockId::new(0));
     add_counter.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -153,14 +174,18 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(add_counter);
+    m.try_add_function(add_counter)
+        .expect("Module::try_add_function: test fixture");
 
     // double get_pi(void) { return g_pi; }
-    let ft3 = m.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft3 = m
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut get_pi = TrustIrFunction::new(FuncId::new(3), "get_pi", ft3, BlockId::new(0));
     get_pi.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -179,7 +204,8 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(get_pi);
+    m.try_add_function(get_pi)
+        .expect("Module::try_add_function: test fixture");
 
     m
 }
@@ -188,7 +214,8 @@ fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Result<Vec<u8>, String> 
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|r| r.object_code)
@@ -229,8 +256,8 @@ int main(void){
 "#;
 
 fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -247,6 +274,7 @@ fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -274,4 +302,13 @@ fn e2e_aarch64_global_var_matches_clang() {
         };
         assert_eq!(code, 0, "global-var result mismatch at {opt:?}");
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

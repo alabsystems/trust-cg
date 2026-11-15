@@ -1,0 +1,21 @@
+; TrustIr text format v1
+module "tcg_tls"
+
+functy.0 = () -> (u64)
+
+global tls(local_exec) mut align(8) @tcg_t u64 = 42
+global tls(local_exec) mut align(8) @tcg_tz u64 = 0
+
+fn @tcg_tls_get(functy.0) {
+bb0:
+    %0 = global_addr @global.0
+    %1 = load u64, ptr %0
+    ret %1
+}
+
+fn @tcg_tls_get_z(functy.0) {
+bb0:
+    %0 = global_addr @global.1
+    %1 = load u64, ptr %0
+    ret %1
+}

@@ -39,6 +39,7 @@ fn call_i32(name: &str, args: Vec<Value>, result: u32) -> Instruction {
     Instruction {
         opcode: Opcode::Call {
             name: name.to_owned(),
+            binding: Default::default(),
         },
         args,
         results: vec![Value(result)],
@@ -266,7 +267,7 @@ fn sysv_mixed_i32_f64_call_uses_independent_gpr_and_xmm_sequences() {
 fn host_jit_o0_compiler() -> Compiler {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
-    Compiler::new(config)
+    Compiler::new(config).with_codegen_license(permit_unlicensed())
 }
 
 fn weighted_i32_sum(
@@ -404,7 +405,7 @@ fn build_ay_sysv_host_jit_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -476,4 +477,13 @@ fn x86_64_sysv_host_jit_executes_ay_abi_canaries() {
 
     assert_eq!(mixed_direct(1, 2.0, 3, 4.0, 5, 6.0, 7, 8.0), 87_654_321.0);
     assert_eq!(mixed_call(1, 2.0, 3, 4.0, 5, 6.0, 7, 8.0), 87_654_321.5);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

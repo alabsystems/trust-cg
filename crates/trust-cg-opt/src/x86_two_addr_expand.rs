@@ -117,6 +117,26 @@ use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
 use crate::x86_pass_manager::X86MachinePass;
 
+static COMMUTE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the commuted-tie arm from a TRACKED compiler option
+/// (`-Ztrust-ir-cg-args=x86-twoaddr-commute`). DEFAULT OFF while it is measured;
+/// see `try_expand`'s DIRECTION comment for why it is not the variant the module
+/// doc refutes.
+pub fn set_commute_enabled(enabled: bool) -> bool {
+    match COMMUTE.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => COMMUTE.get() == Some(&requested),
+    }
+}
+
+fn commute_enabled() -> bool {
+    if let Some(enabled) = COMMUTE.get() {
+        return *enabled;
+    }
+    crate::env_lock::var_os("TCG_X86_TWOADDR_COMMUTE").is_some()
+}
+
 fn enabled() -> bool {
     // DEFAULT-ON. `TCG_NO_X86_TWOADDR_EXPAND` kills the pass and ALWAYS wins;
     // the legacy `TCG_X86_TWOADDR_EXPAND` opt-in is subsumed by the default
@@ -124,11 +144,61 @@ fn enabled() -> bool {
     crate::env_lock::var_os("TCG_NO_X86_TWOADDR_EXPAND").is_none()
 }
 
+static REGISTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the pass's PIPELINE REGISTRATION from a TRACKED compiler option
+/// (`-Ztrust-ir-cg-args=x86-twoaddr-expand`), once. DEFAULT OFF — default-on is
+/// REFUTED at three gate granularities (see the module doc; p7_sieve +43%).
+///
+/// This is the channel the pass was missing, not a new lever. [`enabled`] below is
+/// already DEFAULT-ON, but that default never applied inside the bridge, because
+/// the x86 pipeline only ever CONSTRUCTED the pass when the environment variable
+/// `TCG_X86_TWOADDR_EXPAND` was set — and `trustc` refuses every `TCG_*` variable
+/// before the backend loads. So the pass could not run at all through the bridge,
+/// which is why its two tracked sub-knobs (`x86-twoaddr-commute`,
+/// `x86-twoaddr-expand-all`) measured BYTE-IDENTICAL on every program: they
+/// configure a pass that was never in the schedule. Measuring either one requires
+/// this.
+pub fn set_register_enabled(enabled: bool) -> bool {
+    match REGISTER.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => REGISTER.get() == Some(&requested),
+    }
+}
+
+/// Whether the x86 pipeline should add this pass. DEFAULT FALSE, so the default
+/// pass schedule (and the `optimization_passes_run` pin) is unchanged.
+///
+/// The environment fallback goes through [`crate::tcg_env_flag`], so
+/// `TCG_X86_TWOADDR_EXPAND=0` means OFF. The previous gate was
+/// `var_os(..).is_some()`, under which `=0` would have ENABLED the pass.
+pub fn register_enabled() -> bool {
+    REGISTER.get().copied().unwrap_or(false) || crate::tcg_env_flag("TCG_X86_TWOADDR_EXPAND")
+}
+
+static EXPAND_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the loop-scope call gate's LIFT from a TRACKED compiler option
+/// (`-Ztrust-ir-cg-args=x86-twoaddr-expand-all`), once.
+///
+/// The gate's own note says it was "kept for future suite A/Bs", but its only
+/// channel was the environment variable `TCG_X86_TWOADDR_EXPAND_ALL`, and `trustc`
+/// REFUSES every `TCG_*` variable before the backend loads — so the A/B it was
+/// kept for could not be run through the bridge at all. This is that channel.
+pub fn set_expand_all_enabled(enabled: bool) -> bool {
+    match EXPAND_ALL.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => EXPAND_ALL.get() == Some(&requested),
+    }
+}
+
 fn expand_all() -> bool {
-    // Opt-in `TCG_X86_TWOADDR_EXPAND_ALL`: lift the block-scope call gate and
-    // expand in EVERY eligible block (the pre-2026-08-29 unconditional
-    // behavior), kept for future suite A/Bs. It never overrides the kill
-    // switch — `enabled()` is checked first and returns early.
+    // Opt-in: lift the block-scope call gate and expand in EVERY eligible block
+    // (the pre-2026-08-29 unconditional behavior), kept for suite A/Bs. It never
+    // overrides the kill switch — `enabled()` is checked first and returns early.
+    if let Some(enabled) = EXPAND_ALL.get() {
+        return *enabled;
+    }
     crate::env_lock::var_os("TCG_X86_TWOADDR_EXPAND_ALL").is_some()
 }
 
@@ -192,6 +262,26 @@ fn eligible_blocks(func: &X86ISelFunction) -> std::collections::HashSet<Block> {
 /// GPR three-operand two-address integer ALU ops (def = operand 0, tied lhs =
 /// operand 1, second source = operand 2). Only the RR forms whose second source
 /// is a register (so the `d == b` aliasing guard is meaningful).
+/// The subset of [`is_expandable_gpr_two_address`] whose operation is
+/// COMMUTATIVE over its two register sources, so `d = a op b` and `d = b op a`
+/// compute the same value and the same flags.
+///
+/// `SubRR`/`SbbRR` are excluded (not commutative). `AdcRR` is excluded too:
+/// addition with carry-in is commutative in its two register operands, but it
+/// also READS the carry flag, and this pass's deadness proofs say nothing about
+/// flag liveness — so it is left on the un-commuted path rather than reasoned
+/// about.
+fn is_commutative_gpr_two_address(op: X86Opcode) -> bool {
+    matches!(
+        op,
+        X86Opcode::AddRR
+            | X86Opcode::AndRR
+            | X86Opcode::OrRR
+            | X86Opcode::XorRR
+            | X86Opcode::ImulRR
+    )
+}
+
 fn is_expandable_gpr_two_address(op: X86Opcode) -> bool {
     matches!(
         op,
@@ -276,11 +366,11 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
     let read_counts = count_reads(func);
     let mut changed = false;
     for block_id in func.block_order.clone() {
-        if let Some(eligible) = &eligible {
-            if !eligible.contains(&block_id) {
-                // Ineligible: left byte-identical to the pass being off.
-                continue;
-            }
+        if let Some(eligible) = &eligible
+            && !eligible.contains(&block_id)
+        {
+            // Ineligible: left byte-identical to the pass being off.
+            continue;
         }
         let Some(block) = func.blocks.get_mut(&block_id) else {
             continue;
@@ -294,7 +384,9 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
             // first-touch kind at its position (`a` and `b` stay first-touched
             // as READS, `d` as a WRITE — `d ∉ {a, b}` by the guards), which is
             // all the scan observes.
-            if let Some((copy, rewritten)) = try_expand(inst, &insts[idx + 1..], &read_counts) {
+            if let Some((copy, rewritten)) =
+                try_expand(inst, &insts[..idx], &insts[idx + 1..], &read_counts)
+            {
                 new_insts.push(copy);
                 new_insts.push(rewritten);
                 changed = true;
@@ -368,13 +460,11 @@ fn lhs_dead_after(a: VReg, tail: &[X86ISelInst]) -> bool {
     for inst in tail {
         let pure_def = x86_produces_value(inst.opcode) && !operand_zero_also_reads(inst.opcode);
         for (i, op) in inst.operands.iter().enumerate() {
-            if pure_def && i == 0 {
-                if matches!(op, X86ISelOperand::VReg(_)) {
-                    continue; // pure def slot: a write, not a read
-                }
-                // A memory operand in the def slot would still READ its
-                // base/index — fall through to the read check (conservative).
+            if pure_def && i == 0 && matches!(op, X86ISelOperand::VReg(_)) {
+                continue; // pure def slot: a write, not a read
             }
+            // A memory operand in the def slot would still READ its
+            // base/index — fall through to the read check (conservative).
             if operand_reads_vreg(op, a) {
                 return false; // read before any redefinition -> live
             }
@@ -403,8 +493,69 @@ fn operand_reads_vreg(op: &X86ISelOperand, a: VReg) -> bool {
 /// guards satisfied AND expanding it is profitable (`a` dead after the op by
 /// either deadness proof), return `(MovRR [d, a], Op [d, d, b])`; else `None`.
 /// `tail_after` is the rest of the candidate's block, used by proof (2).
+/// Is this candidate the ALU of a memory read-modify-write that the peephole's
+/// `rmw_fuse` would collapse to ONE memory-destination instruction?
+///
+/// The shape, as `rmw_fuse_load_kind` and its store counterpart accept it:
+///
+/// ```text
+///   MovRM[Sib]  a, M        <- load of a source, ANYWHERE earlier in the block
+///   Op          d, a, b     <- THIS candidate
+///   MovMR[Sib]  M, d        <- store of the def, ANYWHERE later in the block
+///       ==>  OpMR[Sib]  M, b
+/// ```
+///
+/// Expanding here rewrites the ALU to the TIED form `Op [d, d, b]`, and the
+/// fusion's **condition A** (`t.id == d.id` — "one id playing both roles
+/// defeats the two deadness scans") then refuses it permanently: at O3 the pass
+/// manager runs to fixpoint, so the peephole sees the expanded form on a later
+/// iteration and declines. That is not a guess — the decline trace
+/// (`trace-x86-rmw-fuse`) reports condition A on `b1_mispredict`'s `main` ONLY
+/// when the expansion knobs are on, and reports no other new condition.
+///
+/// ⚑ Two things this must NOT do, both learned by getting them wrong:
+///
+/// * **Do not compare the addresses.** `rmw_fuse` carries a canonical-spelling
+///   apparatus (`rmw_fuse_single_def_sites`, the EA-reg redef scan) precisely
+///   because the load's and the store's EAs are usually spelled differently
+///   here. A version requiring structural equality never fired at all.
+/// * **Do not require adjacency.** `rmw_fuse` tolerates a WINDOW between the
+///   load and the ALU and between the ALU and the store (its W1/W2 purity
+///   rules). A version that required the load to be the immediately preceding
+///   instruction protected b1's `t[j] ^= s` arm and missed its `t[j] += acc`
+///   arm, whose load sits further up.
+///
+/// So the test is deliberately a SUPERSET of the fusion's acceptance, scanning
+/// the whole block in both directions. It is a PROFITABILITY rule:
+/// over-declining costs at most the one copy the expansion would have saved,
+/// while under-declining costs the fusion's two.
+fn sits_in_a_memory_rmw_window(
+    before: &[X86ISelInst],
+    after: &[X86ISelInst],
+    opcode: X86Opcode,
+    a: VReg,
+    b: VReg,
+    d: VReg,
+) -> bool {
+    // Either source may be the loaded value: `rmw_fuse` says so at its own
+    // operand match ("try each source as the load result `t`"), and
+    // `rmw_fuse_fused_opcode` is exactly these two commutative families.
+    let fusable_commutative = matches!(opcode, X86Opcode::XorRR | X86Opcode::AddRR);
+    let loads_a_source = before.iter().any(|inst| {
+        matches!(inst.opcode, X86Opcode::MovRM | X86Opcode::MovRMSib)
+            && matches!(inst.operands.first(), Some(X86ISelOperand::VReg(t))
+                if *t == a || (fusable_commutative && *t == b))
+    });
+    let stores_the_def = after.iter().any(|inst| {
+        matches!(inst.opcode, X86Opcode::MovMR | X86Opcode::MovMRSib)
+            && matches!(inst.operands.get(1), Some(X86ISelOperand::VReg(src)) if *src == d)
+    });
+    loads_a_source && stores_the_def
+}
+
 fn try_expand(
     inst: &X86ISelInst,
+    before: &[X86ISelInst],
     tail_after: &[X86ISelInst],
     read_counts: &std::collections::HashMap<VReg, u32>,
 ) -> Option<(X86ISelInst, X86ISelInst)> {
@@ -434,6 +585,11 @@ fn try_expand(
     if d.class != a.class {
         return None;
     }
+    // DEFER TO THE RMW FUSION. See `sits_in_a_memory_rmw_window`: breaking that
+    // window costs two instructions to save one.
+    if sits_in_a_memory_rmw_window(before, tail_after, inst.opcode, a, b, d) {
+        return None;
+    }
     let copy_op = copy_opcode_for_class(d.class)?;
     // PROFITABILITY (two independent sound deadness proofs; either suffices):
     //  (1) GLOBAL single-read: `a` is read exactly once function-wide
@@ -452,28 +608,92 @@ fn try_expand(
     // range ends at this op, `d`'s begins here -> no interference) with zero
     // added pressure. When neither holds the copy might survive and only raise
     // pressure — that can REGRESS spill-heavy loops (b06/b18) — so we skip.
-    if read_counts.get(&a).copied() != Some(1) && !lhs_dead_after(a, tail_after) {
-        return None;
-    }
+    let dead = |v: VReg| read_counts.get(&v).copied() == Some(1) || lhs_dead_after(v, tail_after);
 
-    // DIRECTION (load-bearing): tie dst to the LHS `a` — never commute to tie
-    // the rhs `b`, even when `b` is the dying operand. The commuted form was
-    // REFUTED (+24% on p1): it rotates the loop-carried value into a fresh
-    // register every stage and breaks backedge coalescing. See the module doc.
+    // DIRECTION. The default is to tie dst to the LHS `a`, and the module doc
+    // records that the COMMUTED form — tie dst to the rhs `b` — was REFUTED at
+    // +24% on p1, because it "rotates the loop-carried value into a fresh
+    // register every stage and breaks backedge coalescing".
     //
+    // The arm below is NOT that variant, and the difference is mechanical rather
+    // than a matter of degree: it fires ONLY on candidates this function would
+    // otherwise `return None` for, i.e. only where `a` is NOT provably dead. On
+    // every candidate the pass acts on today — every candidate with a dying LHS,
+    // which is p1's whole xorshift — the un-commuted path is taken exactly as
+    // before. So the refuted variant's mechanism cannot be reached: it requires
+    // commuting a candidate whose LHS dies, and this never does.
+    //
+    // That claim is not left as an argument. `p1_xorshift` is BYTE-IDENTICAL with
+    // this arm on, which is the property the refutation turns on and the thing
+    // the report measures.
+    //
+    // Where it does fire is the shape `b1_mispredict` ships: `s` (the
+    // loop-carried value) is the LHS and is read several more times after the
+    // xor, while the shift temp is the rhs and dies here. Tying dst to the dying
+    // temp lets the coalescer fold the copy away; tying it to the live `s` cannot,
+    // which is why the gate declined and the copies survived to post-RA fixup.
+    let (tie, other) = if dead(a) {
+        (a, b)
+    } else if commute_enabled()
+        && is_commutative_gpr_two_address(inst.opcode)
+        && d.class == b.class
+        && dead(b)
+    {
+        (b, a)
+    } else {
+        return None;
+    };
+
     // Preserve the original op's flags / proof origin on the rewritten op (it is
-    // the same operation, just with dst reused as lhs). The copy is a plain move.
+    // the same operation, just with dst reused as lhs — and, on the commuted arm,
+    // with the two COMMUTATIVE sources exchanged). The copy is a plain move.
     let copy = X86ISelInst::new(
         copy_op,
-        vec![X86ISelOperand::VReg(d), X86ISelOperand::VReg(a)],
+        vec![X86ISelOperand::VReg(d), X86ISelOperand::VReg(tie)],
     );
     let mut rewritten = inst.clone();
     rewritten.operands = vec![
         X86ISelOperand::VReg(d),
         X86ISelOperand::VReg(d),
-        X86ISelOperand::VReg(b),
+        X86ISelOperand::VReg(other),
     ];
     Some((copy, rewritten))
+}
+
+#[cfg(test)]
+mod register_gate_tests {
+    /// The registration gate's ENV fallback must treat a literal `0` as OFF.
+    ///
+    /// The gate this replaced was `var_os("TCG_X86_TWOADDR_EXPAND").is_some()`, under
+    /// which `TCG_X86_TWOADDR_EXPAND=0` REGISTERED the pass — the defect class already
+    /// repaired for three other knobs. Asserted through the pure policy function so no
+    /// process-global state is touched and the test cannot race the `OnceLock`.
+    #[test]
+    fn env_fallback_treats_literal_zero_as_off() {
+        use std::ffi::OsStr;
+        assert!(
+            !crate::tcg_flag_from(None),
+            "unset must not register the pass: default-on is refuted (p7_sieve +43%)"
+        );
+        assert!(
+            !crate::tcg_flag_from(Some(OsStr::new("0"))),
+            "`=0` must mean OFF; the previous is_some() gate enabled the pass for it"
+        );
+        assert!(crate::tcg_flag_from(Some(OsStr::new("1"))));
+    }
+
+    /// With no tracked option installed and no environment variable, the pass is NOT
+    /// registered — so the default x86 schedule, and the `optimization_passes_run`
+    /// pin, are unchanged by adding the tracked channel.
+    #[test]
+    fn default_is_off_so_the_schedule_pin_is_unchanged() {
+        // `register_enabled` consults the OnceLock first; this asserts the
+        // no-preference branch, which is what the pipeline sees by default.
+        assert!(
+            !super::REGISTER.get().copied().unwrap_or(false),
+            "no tracked option installed in this test binary, so the default must be off"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -963,5 +1183,98 @@ mod tests {
             X86Opcode::MovRR,
             vec![vr(g64(1)), vr(g64(2))],
         )));
+    }
+
+    /// The exact triple `b1_mispredict`'s arms carry: `t[j] ^= s`, lowered as
+    /// load / xor / store on one stack-array address. The expansion must leave
+    /// it alone so `rmw_fuse` can collapse all three to one `XorMRSib`.
+    fn rmw_triple(addr: X86ISelOperand, a: VReg, d: VReg, s: VReg) -> Vec<X86ISelInst> {
+        vec![
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vr(a), addr.clone()]),
+            X86ISelInst::new(X86Opcode::XorRR, vec![vr(d), vr(a), vr(s)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![addr, vr(d)]),
+        ]
+    }
+
+    fn sib(base: VReg, index: VReg) -> X86ISelOperand {
+        X86ISelOperand::SibMemAddr {
+            base: Box::new(vr(base)),
+            index: Box::new(vr(index)),
+            scale: 8,
+            disp: 0,
+        }
+    }
+
+    #[test]
+    fn declines_the_alu_of_a_memory_rmw_window() {
+        let (a, d, s, base, idx) = (g64(1), g64(2), g64(3), g64(4), g64(5));
+        let mut f = func_with(rmw_triple(sib(base, idx), a, d, s));
+        assert!(
+            !run_impl(&mut f),
+            "the RMW window's ALU must be left alone: breaking the fusion costs \
+             two instructions to save one"
+        );
+        assert_eq!(count(&f, X86Opcode::MovRR), 0, "no copy inserted");
+        assert_eq!(count(&f, X86Opcode::XorRR), 1);
+    }
+
+    #[test]
+    fn declines_even_when_the_two_addresses_are_spelled_differently() {
+        // `rmw_fuse` canonicalizes the two EAs, so requiring them to be
+        // structurally equal here would miss the real arms. A load of the LHS
+        // and a store of the DEF around one ALU is the shape.
+        let (a, d, s, base, idx, other) = (g64(1), g64(2), g64(3), g64(4), g64(5), g64(6));
+        let mut insts = rmw_triple(sib(base, idx), a, d, s);
+        insts[2] = X86ISelInst::new(X86Opcode::MovMRSib, vec![sib(base, other), vr(d)]);
+        let mut f = func_with(insts);
+        assert!(!run_impl(&mut f));
+        assert_eq!(count(&f, X86Opcode::MovRR), 0, "no copy inserted");
+    }
+
+    #[test]
+    fn declines_a_non_adjacent_load_too() {
+        // `rmw_fuse` tolerates a window between the load and the ALU, so an
+        // intervening instruction does NOT mean there is no fusion to protect.
+        // Requiring adjacency is what missed b1's `t[j] += acc` arm.
+        let (a, d, s, base, idx, z) = (g64(1), g64(2), g64(3), g64(4), g64(5), g64(6));
+        let mut insts = rmw_triple(sib(base, idx), a, d, s);
+        insts.insert(
+            1,
+            X86ISelInst::new(X86Opcode::MovRI, vec![vr(z), X86ISelOperand::Imm(7)]),
+        );
+        let mut f = func_with(insts);
+        assert!(!run_impl(&mut f));
+        assert_eq!(count(&f, X86Opcode::MovRR), 0, "no copy inserted");
+    }
+
+    #[test]
+    fn declines_when_the_loaded_value_is_the_rhs_of_a_commutative_alu() {
+        // b1's `t[j] += acc` arm shape: the loaded value can be EITHER source,
+        // because `rmw_fuse` tries each one as the load result.
+        let (t, d, acc, base, idx) = (g64(1), g64(2), g64(3), g64(4), g64(5));
+        let addr = sib(base, idx);
+        let mut f = func_with(vec![
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vr(t), addr.clone()]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vr(d), vr(acc), vr(t)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![addr, vr(d)]),
+        ]);
+        assert!(!run_impl(&mut f));
+        assert_eq!(count(&f, X86Opcode::MovRR), 0);
+    }
+
+    #[test]
+    fn a_noncommutative_alu_only_protects_its_lhs() {
+        // `SubRR` is not one of `rmw_fuse_fused_opcode`'s families, so nothing
+        // is at stake when the loaded value is its rhs, and declining there
+        // would cost a real copy saving for no reason.
+        let (t, d, x, base, idx) = (g64(1), g64(2), g64(3), g64(4), g64(5));
+        let addr = sib(base, idx);
+        let mut f = func_with(vec![
+            X86ISelInst::new(X86Opcode::MovRMSib, vec![vr(t), addr.clone()]),
+            X86ISelInst::new(X86Opcode::SubRR, vec![vr(d), vr(x), vr(t)]),
+            X86ISelInst::new(X86Opcode::MovMRSib, vec![addr, vr(d)]),
+        ]);
+        assert!(run_impl(&mut f), "no fusion family -> ordinary candidate");
+        assert_eq!(count(&f, X86Opcode::MovRR), 1);
     }
 }

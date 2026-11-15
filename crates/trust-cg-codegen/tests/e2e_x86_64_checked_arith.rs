@@ -83,8 +83,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -214,17 +225,23 @@ fn build_checked_module(name_v: &str, name_o: &str, op: OverflowOp, op_ty: Ty) -
     let mut module = TrustIrModule::new("checked_test");
 
     // value-returning fn type: (op_ty, op_ty) -> op_ty
-    let ft_v = module.add_func_type(FuncTy {
-        params: vec![op_ty.clone(), op_ty.clone()],
-        returns: vec![op_ty.clone()],
-        is_vararg: false,
-    });
+    let ft_v = module
+        .add_func_type(FuncTy {
+            params: vec![op_ty.clone(), op_ty.clone()],
+            returns: vec![op_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // overflow-bit fn type: (op_ty, op_ty) -> i32
-    let ft_o = module.add_func_type(FuncTy {
-        params: vec![op_ty.clone(), op_ty.clone()],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_o = module
+        .add_func_type(FuncTy {
+            params: vec![op_ty.clone(), op_ty.clone()],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // --- _NAME_v: return wrapped value ---
     let mut fv = TrustIrFunction::new(FuncId::new(0), name_v, ft_v, BlockId::new(0));
@@ -248,7 +265,9 @@ fn build_checked_module(name_v: &str, name_o: &str, op: OverflowOp, op_ty: Ty) -
             }),
         ],
     }];
-    module.add_function(fv);
+    module
+        .try_add_function(fv)
+        .expect("Module::try_add_function: test fixture");
 
     // --- _NAME_o: return overflow bit zero-extended to i32 ---
     let mut fo = TrustIrFunction::new(FuncId::new(1), name_o, ft_o, BlockId::new(0));
@@ -279,7 +298,9 @@ fn build_checked_module(name_v: &str, name_o: &str, op: OverflowOp, op_ty: Ty) -
             }),
         ],
     }];
-    module.add_function(fo);
+    module
+        .try_add_function(fo)
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -509,4 +530,13 @@ int main(void) {
 "#;
     let r = differential_test("checked_umul", &module, c_source);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

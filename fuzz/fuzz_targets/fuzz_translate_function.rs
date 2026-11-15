@@ -15,6 +15,16 @@
 
 use libfuzzer_sys::fuzz_target;
 
+/// The license this target lowers under. Its generated bodies carry no
+/// `body_gate`, which trust-cg refuses by default (roadmap WS7.5, decision
+/// gate DG-73); refusing every input at the license would leave the lowering
+/// this target fuzzes unreached. The named, counted `FuzzHarness` exception
+/// keeps it reached.
+fn license() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed_permit_exception(trust_cg_lower::UnlicensedPermitException::FuzzHarness)
+}
+
 use trust_cg_lower::trust_ir_compat::{
     BinOp, Block as TmirBlock, BlockId, Constant, FuncId, FuncTy, Function as TmirFunction, ICmpOp,
     Inst, InstrNode, Module as TmirModule, Ty, ValueId,
@@ -67,11 +77,14 @@ fn signed_lane(byte: u8) -> i128 {
 
 fn build_vector_function(data: &[u8], ty: Ty, ops: &[BinOp]) -> (TmirFunction, TmirModule) {
     let mut module = TmirModule::new("_fuzz_lower_vector");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![ty.clone()],
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("a fresh fuzz module has room for its signature");
 
     let mut func = TmirFunction::new(FuncId::new(0), "_fuzz_vector_fn", ft_id, BlockId::new(0));
     let mut next_vid: u32 = 1000;
@@ -142,13 +155,13 @@ fuzz_target!(|data: &[u8]| {
     match data.first().copied().unwrap_or(0) % 4 {
         1 => {
             let (func, module) = build_vector_function(data, v2i64_ty(), &[BinOp::Add, BinOp::Sub]);
-            let _ = trust_cg_lower::translate_function(&func, &module);
+            let _ = trust_cg_lower::translate_function_with_license(&func, &module, &license());
             return;
         }
         2 => {
             let (func, module) =
                 build_vector_function(data, v4i32_ty(), &[BinOp::Shl, BinOp::LShr, BinOp::AShr]);
-            let _ = trust_cg_lower::translate_function(&func, &module);
+            let _ = trust_cg_lower::translate_function_with_license(&func, &module, &license());
             return;
         }
         _ => {}
@@ -163,11 +176,14 @@ fuzz_target!(|data: &[u8]| {
     let mut module = TmirModule::new("_fuzz_lower");
     let num_params = (data.first().copied().unwrap_or(0) % 3) as usize;
     let params = vec![Ty::I64; num_params];
-    let ft_id = module.add_func_type(FuncTy {
-        params: params.clone(),
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: params.clone(),
+            returns: vec![Ty::I64],
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("a fresh fuzz module has room for its signature");
 
     let mut func = TmirFunction::new(FuncId::new(0), "_fuzz_fn", ft_id, BlockId::new(0));
     let mut next_vid: u32 = 1000;
@@ -257,5 +273,5 @@ fuzz_target!(|data: &[u8]| {
         body,
     });
 
-    let _ = trust_cg_lower::translate_function(&func, &module);
+    let _ = trust_cg_lower::translate_function_with_license(&func, &module, &license());
 });

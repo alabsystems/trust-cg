@@ -1,0 +1,22 @@
+; TrustIr text format v1
+module "_RNvXs_CsguvOONaKOiR_25s26_dyn_dispatch_boxarrayNtB4_3MulNtB4_2Op5apply"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (&u64, u64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvXs_CsguvOONaKOiR_25s26_dyn_dispatch_boxarrayNtB4_3MulNtB4_2Op5apply(functy.0) {
+bb0(%1: &u64, %2: u64):
+    %4 = load u64, ptr %1
+    %5 = mul u64 %2, %4
+    ret %5
+}

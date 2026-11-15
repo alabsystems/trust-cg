@@ -1,8 +1,10 @@
-# rustc_codegen_trust_cg — experimental nightly rustc backend.
+# rustc_codegen_trust_cg — experimental rustc codegen backend for the Trust
+# compiler.
 #
-# This crate is a nightly rustc codegen backend. It is NOT part of the
-# Trust Codegen workspace (different toolchain, uses `rustc_private`). Build with
-# the nightly pinned by this crate's `rust-toolchain.toml`.
+# This crate is a `rustc_private` codegen backend, built with and loaded by the
+# Trust toolchain (`rust-toolchain.toml` `channel = "trust"`). It is NOT part of
+# the Trust Codegen workspace (its own manifest and lock). Build with
+# `targo --unverified build`.
 #
 # Author: Andrew Yates <andrewyates.name@gmail.com>
 # Copyright 2026 Andrew Yates
@@ -13,7 +15,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 license = "Apache-2.0"
-description = "Experimental Trust Codegen backend for nightly rustc"
+description = "Experimental Trust Codegen backend for the Trust rustc (trustc)"
 publish = false
 repository = "https://github.com/alabsystems/trust-cg"
 homepage = "https://github.com/alabsystems/trust-cg"
@@ -26,73 +28,76 @@ crate-type = ["dylib"]
 
 [features]
 default = []
-# ay-regalloc: forward the AY-PBO optimal register allocator (STAGE 3) down the
-# codegen dep chain (trust-cg-codegen -> trust-cg-regalloc). DEFAULT OFF, so the
-# shipped bridge is byte-identical to origin. Even when compiled in, the AY path
-# is entered only when the `TCG_AY_REGALLOC` env var is set (an opt-in behind a
-# high -O tier). A wrong AY allocation can never miscompile: it passes the same
-# always-on translation validator + per-instruction certs + TV-4 recheck greedy
-# does, and any rejection/timeout/oversize falls back to the greedy allocation.
+# Forward optional AY allocation support to codegen and register allocation.
+# Runtime selection and candidate validation remain in those crates. Enabling
+# this feature alone is not evidence of solver execution or code correctness.
 ay-regalloc = ["trust-cg-codegen/ay-regalloc"]
 
+[build-dependencies]
+# Only classify complete compiler diagnostics from throwaway API probes.
+serde_json = "1.0"
+
 [dependencies]
-# `verify` (a default feature, restated explicitly here) compiles in the
-# per-function proof-certificate surface (`cfg(feature = "verify")` paths in
-# `compiler.rs`: `generate_x86_64_proof_certificates`, the AArch64 cert path,
-# relocation-inventory certs). Without it, `emit_proofs = true` fail-closes
-# every x86-64 compile with `ProofsUnsupportedForTarget` (#465). The feature
-# adds NO new dependencies: trust-cg-verify is already a non-optional dep of
-# trust-cg-codegen (`default-features = false`, no solver toolchain) and the
-# verifier discharges obligations by pure exhaustive/statistical evaluation.
+tempfile = "3"
+# Keep the per-function certificate surface compiled in while disabling other
+# codegen defaults. Available certificate APIs do not mean every emitted
+# function has a complete, nonvacuous formal proof; admission checks the actual
+# evidence. AY and Clean are managed aterm executables, not bundled by Cargo.
 trust-cg-codegen = { path = "../trust-cg-codegen", default-features = false, features = ["verify"] }
 trust-cg-lower = { path = "../trust-cg-lower" }
-# P1.3: the structural SSA / loop-completeness fail-closed gate
-# (`ssa_loop_complete::check_function_fail_closed`) lives in trust-cg-verify.
-# `default-features = false` keeps the SMT/ay subprocess toolchain out of the
-# bridge's dependency graph — the checker imports only `trust_ir` + `std`, so
-# this pulls in trust-cg-opt + rayon + sha2 but no solver binary.
+# The structural SSA / loop-completeness checker lives in trust-cg-verify.
+# This direct dependency does not enable that crate's optional default features.
 trust-cg-verify = { path = "../trust-cg-verify", default-features = false }
 # Direct dependency (not `workspace = true`): this crate is its own workspace (see the
 # empty `[workspace]` below), so it cannot inherit `trust-ir` from the main
 # Trust Codegen workspace. The git source + features mirror the root workspace's
 # `workspace.dependencies.trust-ir` so feature unification with the
 # trust-cg-codegen/trust-cg-lower path deps stays consistent.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "cf5a6eaecea7d7a36f0d89c63e36882b787b770d", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+
+[dev-dependencies]
+# Test-only: construct every `CompileError` / `PipelineError` payload so each
+# variant's diagnostic layer code is asserted (`src/compile_error_diag_tests.rs`).
+# All four are already in this crate's dependency graph through trust-cg-codegen.
+rayon = "1.12"
+serde_json = "1.0"
+trust-cg-ir = { path = "../trust-cg-ir" }
+trust-cg-opt = { path = "../trust-cg-opt" }
+# The solver-coupled `src/` tests run every AY query on the FRESH one-shot
+# transcript (thread-local `TCG_NO_SOLVER_SERVER=1` through this crate's
+# override API), exactly as the strict formal campaign does: the resident
+# `ay --incremental` server discards stderr, where AY publishes its decisive
+# `(:reason-unknown …)` diagnostics, so through it a certification gap
+# truncates to a bare `unknown` that no guard may exempt.
+trust-cg-process-env = { path = "../trust-cg-process-env" }
+# Test-only: the WS7.3-pre regression (`tests/mir_lane_valid_trust_ir.rs`)
+# holds the MIR lane's emitted modules to trust-ir's own validator. Same rev
+# and features as the root workspace's pin, and already in this crate's graph
+# through trust-cg-codegen / trust-cg-lower, so no new package is built.
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", features = ["binary"] }
 
 [package.metadata.rust-analyzer]
 # Tell rust-analyzer to enable `rustc_private` so it indexes our
 # extern crate rustc_* statements correctly.
 rustc_private = true
 
-# Keep this crate OUT of the Trust Codegen cargo workspace on purpose. It needs
-# a pinned nightly toolchain and links against rustc internals; those
+# Keep this crate OUT of the Trust Codegen cargo workspace on purpose. It links
+# against rustc internals (`rustc_private`) of the Trust compiler; those
 # concerns must not leak into the rest of the workspace.
 [workspace]
 
-# The backend ships as a ~89MB dylib that rustc dlopen()s on EVERY invocation,
-# so its load cost is paid once per compile and shows up as fixed overhead in
-# every compile-time comparison.
-#
-# WHAT THE DYNAMIC LINKER ACTUALLY TOUCHES (measured, aarch64 Cortex-X925):
-# a dlopen faults in only ~150 pages of this 89MB file. Every relocation
-# targets .data.rel.ro/.got/.data/.tbss -- ZERO target .text, .rodata,
-# .eh_frame or .gcc_except_table. So load cost is driven by the loader
-# METADATA (.dynsym/.dynstr/.gnu.hash/.rela.*) and the symbol/relocation
-# COUNT, not by how big the code is. Consequences, all measured:
-#   * Stripping does not help: .symtab/.strtab are never read at load.
-#   * Shrinking .eh_frame (2.6MB) / .gcc_except_table (4.8MB) cannot help
-#     either -- they are only paged in while unwinding, never at load.
-#   * opt-level="s" cut .text 57.8MB -> 35.4MB and still made load *slower*
-#     (dlopen 0.19 -> 0.30ms), because it raised the relocation count.
-# The lever that works is cutting exported symbols -- see
-# `emit_hidden_rlib_symbols` in build.rs (`--exclude-libs,ALL`), worth
-# ~1.4ms/invocation.
-#
-# lto="thin" + codegen-units=1 trades bridge BUILD time for per-compile load
-# time -- the right direction for something invoked far more often than it is
-# built. lto="fat" was measured and is NOT worth it: 4m20s vs 24s to relink for
-# a 2.8KB smaller dylib and no load-time difference (median paired diff
-# -0.12ms, faster in 23/41 rounds = noise).
+# rustc loads this backend dylib during compilation. Preserve the selected
+# release profile; build time, library size, and loader cost require fresh
+# artifact- and target-specific measurements. ELF archive-symbol localization
+# is configured separately by emit_hidden_rlib_symbols in build.rs.
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The AY identity rule (crates/trust-cg-verify/src/ay_identity.rs) digests the
+# toolchain AY (~90 MB) once per process before starting it. sha2's aarch64
+# backend is intrinsics that are not inlined at opt-level 0: measured
+# 2026-09-17 on this machine, 0.64-1.52 s per process with sha2 unoptimized
+# versus 35-50 ms with this package optimized (and 41-50 ms in release).
+[profile.dev.package.sha2]
+opt-level = 3

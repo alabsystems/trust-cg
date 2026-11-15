@@ -40,17 +40,14 @@
   buffers.  The atomic certs reuse the exact `execInstr`/​`writeBytes`/​`readBytes` machinery from
   `Model.Encoder` and the `lockXaddMR` reified opcode already in the EmittableNeedsProof set.
 
-  WHAT IS HONESTLY STUBBED (each `sorry` one-lined and classified at its site):
-    * the lift of the OPAQUE `srcStep`/`x86Step` to per-thread concurrent steps is `stubbed-semantics`
-      (the real per-thread relation is owned by `Semantics.Source` / `Model.Machine`); we package
-      the relevant projection as a STRUCTURE, never a `sorry` that assumes a conclusion;
-    * a couple of `writeBytes`/​`readBytes` byte-store identities reused from `Sim.ForwardSim.Mem`
-      are `mechanical`.
-  NONE of these smuggle this module's actual results: the bv_decide RMW-value certs and the
-  lost-update separation theorem are fully proven.  The "deferral" is recorded HONESTLY — the
-  concurrent forward-simulation top theorem `atomic_forward_sim` is stated and reduced to the
-  per-thread atomic certs, with the genuinely-open whole-program interleaving induction (the
-  compositional concurrent metatheorem) marked `open`, NOT assumed.
+  WHAT IS NOT PROVED:
+    * the per-thread concurrent steps lift the linked `srcStep`/`x86Step` (`Trust.Model`) through
+      the `ConcSrcStep`/`ConcMachStep` STRUCTURES, never through a `sorry`;
+    * there is no concurrent forward-simulation theorem. The former `sorry`
+      `atomic_forward_sim` claimed one for every layout; it is false under the linked relations
+      (`MetaTheorem.Vacuity.atomic_forward_sim_refuted`) and is removed. The atomic load/store
+      value and memory lemmas below are proved under explicit source/drained-memory agreement.
+  The bv_decide RMW-value certs and the lost-update separation theorem are fully proven.
 
   ── VERIFIER CORRECTION (adversarial review) ───────────────────────────────────────────────────
   The five `cm`-parameterized theorems (`atomicLoad_value`, `atomicStore_shared_agree`,
@@ -211,15 +208,14 @@ where
       { cm with buf := fun u => if u = t then [] else cm.buf u }
 
 /-! ###########################################################################################
-    ## 3.  The per-thread LIFT of the OPAQUE `srcStep` / `x86Step` to the concurrent model.
+    ## 3.  The per-thread LIFT of `srcStep` / `x86Step` to the concurrent model.
 
-    `Trust.Model.srcStep` / `x86Step` are the SINGLE-thread relations (opaque).  In a concurrent
-    run, a global step is "some thread `t` takes one of its local steps, against the SHARED
-    memory".  We DON'T re-axiomatize the local relations; we LIFT them: a concurrent source step is
-    a chosen `t` whose local `srcStep` fires, with the shared memory threaded through that thread's
-    `SrcState.mem`.  The lift is `stubbed-semantics` (the precise mem-threading is owned by the
-    semantics modules), packaged as a STRUCTURE the metatheorem fills — never a `sorry` that
-    assumes the simulation goal.
+    `Trust.srcStep` / `x86Step` are the SINGLE-thread relations (defined in `Trust.Model`).  In a
+    concurrent run, a global step is "some thread `t` takes one of its local steps, against the
+    SHARED memory".  We DON'T re-axiomatize the local relations; we LIFT them: a concurrent source
+    step is a chosen `t` whose local `srcStep` fires, with the shared memory threaded through that
+    thread's `SrcState.mem`.  The lift is packaged as a STRUCTURE — never a `sorry` that assumes
+    the simulation goal.
     ######################################################################################### -/
 
 /-- Install thread `t`'s local view of the shared memory before running its local step. -/
@@ -229,9 +225,9 @@ def ConcSrc.localize (cs : ConcSrc) (t : Tid) : SrcState :=
 /-- A CONCURRENT source step: thread `t` fires its local `srcStep` (with the shared memory as its
     `mem`), emitting `ev`, and the global state updates that thread's local state + the shared
     memory.  This is the interleaving semantics: any enabled thread may go next. -/
-structure ConcSrcStep (cs : ConcSrc) (t : Tid) (ev : Event) (cs' : ConcSrc) : Prop where
-  /-- the chosen thread's local step fires from its localized state. -/
-  localStep : srcStep (cs.localize t) ev (cs'.localize t)
+structure ConcSrcStep (code : Tid → Source.Program) (cs : ConcSrc) (t : Tid) (ev : Event) (cs' : ConcSrc) : Prop where
+  /-- Fetch from the fixed program of this thread, against its localized state. -/
+  localStep : srcStep (code t) (cs.localize t) ev (cs'.localize t)
   /-- every OTHER thread is untouched by `t`'s step (interleaving: only one thread moves). -/
   others    : ∀ u, u ≠ t → cs'.threads u = cs.threads u
 
@@ -483,22 +479,28 @@ def atomicLoadExec (cm : ConcMach) (t : Tid) (a : BitVec 64) (rDst : GPR) (n len
           { (setReg (fenced.threads t) rDst loaded) with rip := (fenced.threads t).rip + BitVec.ofNat 64 len }
         else fenced.threads u }
 
-/-- ATOMIC LOAD VALUE cert: after the atomic-load move, `t`'s destination register denotes the
-    source's loaded value.  The drained view = the committed shared store (the acquire fence), and
-    the source read the same shared store, so the loaded value matches.  The width round-trip is the
-    same `setWidth64_truncate_w` fact as the sequential load.
-    classification of the `sorry`: mechanical — it is the SAME `setWidth`/​`truncate`/​drain-view
-    algebra as the sequential `load_value_dst`, lifted to `readShared`; no concurrency-specific gap
-    and no smuggled conclusion (the value EQUALS the source's `envDst` by construction). -/
+/-- The atomic load returns the source value when source shared memory agrees
+    with the drained machine memory. This relation is an explicit premise:
+    arbitrary unrelated source and machine states cannot establish the result.
+    The proof reads the actual destination register and preserves its low `w`
+    bits through the 64-bit carrier. -/
 theorem atomicLoad_value
     {lay : Layout} {cs cs' : ConcSrc} {t : Tid} (cm : ConcMach)
-    (ld : AtomicLoadShape lay cs cs' t) (len : Nat) :
+    (ld : AtomicLoadShape lay cs cs' t) (len : Nat)
+    (hbase : ∀ q, cs.shared q = (mLockedRMW1.drainAll cm t).shared q) :
     denoteLoc ((atomicLoadExec cm t ld.addr ld.rDst ld.width.bytes len).localizeView t)
               (lay.asgn ld.vDst) (lay.kind ld.vDst)
       = (cs'.localize t).env ld.vDst := by
-  sorry  -- mechanical: `denote_int_reg` on `rDst` = (drained-shared read).setWidth64 |>.truncate w
-         -- = (readShared cs.shared addr n).truncate w = `ld.envDst`; the drain-view equality is
-         -- `viewOf_empty_buf` after `drainAll` empties the buffer.  Same shape as `load_value_dst`.
+  have hreg : ((atomicLoadExec cm t ld.addr ld.rDst ld.width.bytes len).localizeView t).regs ld.rDst
+      = (readShared (mLockedRMW1.drainAll cm t).shared ld.addr ld.width.bytes).setWidth 64 := by
+    simp [ConcMach.localizeView, atomicLoadExec, setReg]
+  rw [ld.hkind, ld.hasgn]
+  simp only [denoteLoc, hreg]
+  rw [ld.envDst]
+  have hmem : cs.shared = (mLockedRMW1.drainAll cm t).shared := funext hbase
+  rw [hmem]
+  congr 1
+  exact BitVec.setWidth_setWidth_of_le _ ld.hw
 
 /-! ###########################################################################################
     ## 9.  The atomic STORE cert — aligned MOV (+ fence) realizes the atomic store under TSO.
@@ -526,17 +528,17 @@ structure AtomicStoreShape (lay : Layout) (cs cs' : ConcSrc) (t : Tid) where
     is the concurrent analogue of `agreeOn_write`, against the shared store rather than a single
     thread's `.mem`.  PROVEN directly: both sides are `writeShared … addr storedVal n` of agreeing
     bases (the incoming `RC.local_R.memAgree` lifted to the shared store).
-    classification of the `sorry`: mechanical — `writeShared` is the same byte fold as
-    `writeBytes`; the in-range/​out-of-range split is exactly `agreeOn_write`'s, lifted to the
-    shared store.  No concurrency gap, no smuggled conclusion. -/
+    Function extensionality transports the existing shared-memory premise
+    through the unchanged byte-store definition. -/
 theorem atomicStore_shared_agree
     {lay : Layout} {cs cs' : ConcSrc} {t : Tid} (cm : ConcMach)
     (sh : AtomicStoreShape lay cs cs' t)
     (hbase : ∀ q, cs.shared q = (mLockedRMW1.drainAll cm t).shared q) :
     ∀ q, cs'.shared q = (atomicStoreCommit cm t sh.addr sh.storedVal sh.width.bytes).shared q := by
-  sorry  -- mechanical: `cs'.shared = writeShared cs.shared …` (sharedEq); RHS = `writeShared
-         -- (drainAll cm t).shared …`; equal byte-for-byte by `hbase` + the `writeBytes`-style
-         -- in-range/out-of-range split (same proof as `agreeOn_write`).
+  have hmem : cs.shared = (mLockedRMW1.drainAll cm t).shared := funext hbase
+  intro q
+  rw [sh.sharedEq, hmem]
+  rfl
 
 /-! ###########################################################################################
     ## 10.  The `fetch_add` cert — LOCK XADD realizes the atomic RMW (NOT load+add+store).
@@ -630,14 +632,12 @@ theorem fetchAdd_indivisible
   rw [if_neg hu]
 
 /-! ###########################################################################################
-    ## 11.  The concurrent forward-simulation statement and the per-thread atomic dispatch.
+    ## 11.  The concurrent forward-simulation statement.
 
-    The concurrent top theorem `atomic_forward_sim` mirrors `ForwardSimStmt`, lifted: from a TSO-
-    consistent matching state, any concurrent SOURCE step is matched by ≥1 concurrent machine steps
-    re-establishing `RC`.  For the ATOMIC opcodes the per-thread cert (load/store/fetch_add above)
-    supplies the local move; the WHOLE-PROGRAM interleaving induction (that re-establishing `RC` for
-    the acting thread, plus framing the others, gives a global concurrent simulation) is the
-    genuinely-open compositional metatheorem.
+    `AtomicForwardSimStmt` mirrors `ForwardSimStmt`, lifted: from a TSO-consistent matching state,
+    any concurrent SOURCE step is matched by ≥1 concurrent machine steps re-establishing `RC`.  As
+    stated, over fixed per-thread source programs and the silent model machine, it is false
+    for a program that actually traps and some layout (`MetaTheorem.Vacuity.atomic_forward_sim_refuted`); no theorem asserts it.
     ######################################################################################### -/
 
 /-- The concurrent step relation (one or more concurrent machine moves of a single thread `t`). -/
@@ -650,29 +650,17 @@ inductive ConcMachPlus (t : Tid) : ConcMach → Event → ConcMach → Prop
     successor, with the SAME observable.  This is the goal the atomic certs feed; for the
     EmittableNeedsProof atomics it is discharged by the per-thread move (LOCK XADD / aligned MOV)
     plus the indivisibility fact of §10. -/
-def AtomicForwardSimStmt (lay : Layout) : Prop :=
-  ∀ {cs cm t ev cs'}, RC lay cs cm t → ConcSrcStep cs t ev cs' →
+def AtomicForwardSimStmt (code : Tid → Source.Program) (lay : Layout) : Prop :=
+  ∀ {cs cm t ev cs'}, RC lay cs cm t → ConcSrcStep code cs t ev cs' →
     ∃ cm', ConcMachPlus t cm ev cm' ∧ RC lay cs' cm' t
 
-/-- DISPATCH (the per-thread atomic case of the concurrent metatheorem): given the atomic source
-    transition and the matching `RC`, the LOCK XADD / aligned-MOV move re-establishes `RC`.
-    classification of the `sorry`: GENUINELY-OPEN — this is the COMPOSITIONAL concurrent
-    metatheorem (whole-program interleaving + thread-modular `RC` framing), the concurrent analogue
-    of the sequential `MetaTheorem`.  It is NOT in scope for this single-opcode skeleton: it would
-    (a) build the per-thread atomic `LoweredStep` (the n-byte LOCK XADD / aligned MOV move), (b)
-    re-establish `RC.local_R` from the per-leg certs of §8–§10 (proven), (c) re-establish `RC.tso`
-    after the drain (the fence empties `t`'s buffer; §`viewOf_empty_buf`), and (d) FRAME every other
-    thread (untouched: `ConcMachStep.others` / `fetchAdd_indivisible`).  Steps (a)–(d) rest on the
-    proven facts above; the open part is the well-founded interleaving recursion over the global
-    schedule, absent from this skeleton.  It does NOT smuggle the conclusion — the SEPARATION
-    (§6, fully proven) shows the result is non-trivial, and the value/​mem/​indivisibility legs
-    (§5, §10, fully proven) are the real content. -/
-theorem atomic_forward_sim (lay : Layout) : AtomicForwardSimStmt lay := by
-  sorry  -- open: compositional concurrent metatheorem (whole-program interleaving + thread-modular
-         -- `RC` framing).  The per-thread atomic legs (value: §5/§10, shared-mem agree: §9, load:
-         -- §8, indivisibility/​others-frame: §10) are PROVEN; this assembles them across the global
-         -- schedule via the interleaving recursion, which needs the program/​schedule objects absent
-         -- from the skeleton.  NOT a smuggle: the separation theorem (§6) is proven independently.
+/-  `atomic_forward_sim : ∀ lay, AtomicForwardSimStmt lay` was a `sorry` (the compositional
+    concurrent metatheorem). It is false (`MetaTheorem.Vacuity.atomic_forward_sim_refuted`): the
+    acting thread's linked source step can trap, and no concurrent machine step is observable
+    because the model `x86Step` is silent. The per-thread atomic legs below and the separation
+    theorem of §6 are unaffected. `formal/lean/SOUNDNESS.md` states what a concurrent theorem
+    needs (a program-indexed thread semantics, an event-bearing machine, a non-tautological
+    `TSOConsistent`, and the interleaving induction). -/
 
 /-! ###########################################################################################
     ## 12.  Sanity / pinning facts (all PROVEN, no `sorry`).

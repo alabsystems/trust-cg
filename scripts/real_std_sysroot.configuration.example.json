@@ -1,0 +1,10 @@
+{
+  "repository": "/path/to/trust-cg",
+  "output": "/path/to/owned/new-sysroot-output",
+  "toolchain": "/path/to/frozen/trust-toolchain",
+  "compiler_source": "/path/to/Trust-source-checkout",
+  "compiler_commit": "ae9c2c1daa0fc80afbfd380e493f5581ac714acb",
+  "target": "aarch64-unknown-linux-gnu",
+  "core_fixture_directory": "/path/to/trust-cg/tests/support/real_std_sysroot",
+  "alloc_fixture_directory": "/path/to/trust-cg/tests/support/real_std_sysroot"
+}

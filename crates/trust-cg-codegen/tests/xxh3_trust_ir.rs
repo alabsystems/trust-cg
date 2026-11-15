@@ -153,8 +153,12 @@ fn compile_trust_ir(
     module: &TrustIrModule,
     opt_level: OptLevel,
 ) -> Result<Vec<u8>, String> {
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
-        .map_err(|e| format!("adapter: {}", e))?;
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+        trust_ir_func,
+        module,
+        &permit_unlicensed(),
+    )
+    .map_err(|e| format!("adapter: {}", e))?;
     let config = PipelineConfig {
         target_triple: host_aarch64_triple().to_string(),
         opt_level,
@@ -244,7 +248,8 @@ fn const_i64(vid: &mut VidCounter, val: u64) -> (ValueId, InstrNode) {
     let r = vid.next();
     let node = InstrNode::new(Inst::Const {
         ty: Ty::I64,
-        value: Constant::Int(val as i128),
+        // The u64 bit pattern, as the signed i64 lane value TrustIR types.
+        value: Constant::Int(i128::from(val as i64)),
     })
     .with_result(r);
     (r, node)
@@ -477,11 +482,14 @@ fn emit_rrmxmx(
 
 fn build_xxh3_64_short() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("xxh3");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = BlockId::new(0);
     let mut func = TrustIrFunction::new(FuncId::new(0), "xxh3_64_short", ft_id, entry);
@@ -851,7 +859,9 @@ fn build_xxh3_64_short() -> (TrustIrFunction, TrustIrModule) {
         },
     ];
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -1456,4 +1466,13 @@ fn test_xxh3_compilation_is_deterministic() {
         obj_o2_a.len(),
         obj_o2_b.len()
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

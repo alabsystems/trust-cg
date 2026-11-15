@@ -1,7 +1,7 @@
 // trust-cg-codegen/tests/e2e_aarch64_f16_scalar.rs
 //
-// End-to-end (compile -> link -> RUN on aarch64-apple-darwin) coverage for scalar
-// binary16 (IEEE FP16 / ARMv8.2-FP16) arithmetic and unary ops.
+// End-to-end (compile -> link -> RUN on AArch64 macOS, and on Linux GNU through
+// the explicit-FP16 pipeline lane) coverage for scalar binary16 (IEEE FP16 / ARMv8.2-FP16) arithmetic and unary ops.
 //
 // These fail-closed in the adapter's validate_scalar_binop_shape /
 // validate_unop_shape gates until now (F32/F64 only). AArch64 with FEAT_FP16
@@ -18,8 +18,8 @@
 // FRem over f16 lowers by promoting to f32, calling `fmodf`, and demoting (fmod
 // is exact) — see adapter::tests::test_frem_f16_lowers_via_promoted_fmodf.
 //
-// Verified bit-exact against clang's native _Float16 ops and libm on real Apple
-// Silicon (NaN-aware compare).
+// Verified bit-exact against the host C compiler's _Float16 ops and libm
+// (NaN-aware compare).
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -29,6 +29,7 @@ use std::process::Command;
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::{AArch64IsaProfile, TargetSpec};
 
 use trust_ir::{
     BinOp, Block as TrustIrBlock, FuncTy, Function as TrustIrFunction, Inst, InstrNode,
@@ -36,17 +37,118 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId, ValueId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O) can link and run the objects.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
+}
+
+/// The optional ISA feature this family needs. Darwin's AOT target contract
+/// admits it, so the production `Compiler` lane runs there; generic Linux AOT
+/// refuses it by design (pinned below). Every native host also runs two
+/// explicit-profile lanes, the only admitted FP16 lanes on Linux GNU: the
+/// public pipeline with the profile bound, and the production `Compiler` with
+/// `CompilerConfig::aarch64_isa_profile`, which records the profile in the
+/// compile policy and artifact identity. A host CPU without FP16 is a
+/// failure, never a skip.
+const PROFILE: AArch64IsaProfile = AArch64IsaProfile::FP16;
+
+fn objects_at(module: &TrustIrModule, opt: OptLevel) -> Vec<(&'static str, Vec<u8>)> {
+    let mut objects = Vec::new();
+    if !native_host::LINUX_GNU {
+        objects.push(("darwin-aot", compile_to_obj_at(module, opt)));
+    }
+    if native_host::NATIVE {
+        assert!(
+            PROFILE.is_supported_by_host(),
+            "the explicit FP16 native lane requires host FP16"
+        );
+        let object = native_host::compile_with_isa_profile(module, opt, PROFILE)
+            .unwrap_or_else(|error| panic!("explicit FP16 {opt:?}: {error}"));
+        objects.push(("explicit-fp16", object));
+        objects.push((
+            "explicit-fp16-compiler",
+            compile_with_explicit_profile(native_host::TRIPLE, module, opt),
+        ));
+    }
+    objects
+}
+
+/// The production `Compiler` with an explicit FEAT_FP16 profile for `triple`.
+fn compile_with_explicit_profile(triple: &str, module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
+    let compiler = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: opt,
+            aarch64_isa_profile: Some(PROFILE),
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse(triple).unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed());
+    assert_eq!(compiler.aarch64_object_isa_profile(), PROFILE);
+    compiler
+        .compile(module)
+        .unwrap_or_else(|error| panic!("explicit-profile Compiler {triple} {opt:?}: {error}"))
+        .object_code
+}
+
+/// Generic Linux AOT keeps refusing this family by name; only the explicit
+/// profile admits it. Object-level, so it runs on every host.
+#[test]
+fn generic_linux_aot_refuses_fp16_family_by_name() {
+    let error = Compiler::new_for_target_spec(
+        CompilerConfig::default(),
+        TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&build_module())
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("FEAT_FP16 is not admitted"), "{error}");
+}
+
+/// The production `Compiler` admits the family on generic Linux only through
+/// an explicit, recorded profile: the object carries FEAT_FP16 data
+/// processing, and the profile changes the compile policy's Artifact digest.
+/// Object-level, so it runs on every host.
+#[test]
+fn explicit_fp16_compiler_profile_admits_the_family_on_generic_linux() {
+    use trust_cg_codegen::compile_policy::{CompilePolicy, CompilePolicyPartition};
+    let linux = TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap();
+    for opt in [OptLevel::O0, OptLevel::O2] {
+        let object =
+            compile_with_explicit_profile("aarch64-unknown-linux-gnu", &build_module(), opt);
+        native_host::assert_elf_aarch64_object(&object);
+        let fadd_h = |w: u32| w & 0xffe0_fc00 == 0x1ee0_2800;
+        assert!(
+            native_host::text_words(&object).into_iter().any(fadd_h),
+            "{opt:?}: the explicit-profile Linux object lacks FADD Hd, Hn, Hm"
+        );
+    }
+    let artifact = |profile| {
+        let config = CompilerConfig {
+            aarch64_isa_profile: profile,
+            ..CompilerConfig::default()
+        };
+        CompilePolicy::from_compiler(linux, &config)
+            .unwrap()
+            .digest(CompilePolicyPartition::Artifact)
+    };
+    assert_ne!(artifact(None), artifact(Some(PROFILE)));
 }
 
 /// `fn name(a: f16, b: f16) -> f16 { op(a, b) }`.
 fn build_fp_binop(func_id: u32, name: &str, module: &mut TrustIrModule, op: BinOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F16, Ty::F16],
-        returns: vec![Ty::F16],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F16, Ty::F16],
+            returns: vec![Ty::F16],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -64,16 +166,21 @@ fn build_fp_binop(func_id: u32, name: &str, module: &mut TrustIrModule, op: BinO
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// `fn name(x: f16) -> f16 { op(x) }`.
 fn build_fp_unop(func_id: u32, name: &str, module: &mut TrustIrModule, op: UnOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F16],
-        returns: vec![Ty::F16],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F16],
+            returns: vec![Ty::F16],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -90,7 +197,9 @@ fn build_fp_unop(func_id: u32, name: &str, module: &mut TrustIrModule, op: UnOp)
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -115,7 +224,8 @@ fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("scalar f16 ops must compile (proof/coverage gate included)");
@@ -181,8 +291,8 @@ int main(void) {
 "#;
 
 fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: link-and-run requires an aarch64-apple-darwin host");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: link-and-run requires an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -201,6 +311,7 @@ fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc available");
     assert!(
@@ -221,13 +332,51 @@ fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
 fn e2e_aarch64_scalar_f16_arith() {
     let module = build_module();
     for opt in [OptLevel::O0, OptLevel::O2] {
-        let obj = compile_to_obj_at(&module, opt);
-        let Some(code) = link_run_exit_code("f16_scalar", &obj, DRIVER) else {
+        let objects = objects_at(&module, opt);
+        if objects.is_empty() {
+            eprintln!("SKIP: link-and-run requires an AArch64 Linux GNU or macOS host");
             return;
-        };
-        assert_eq!(
-            code, 0,
-            "scalar f16 op runtime mismatch at {opt:?} (failing-case code {code})",
+        }
+        for (lane, obj) in objects {
+            let Some(code) = link_run_exit_code(&format!("f16_scalar_{lane}"), &obj, DRIVER) else {
+                return;
+            };
+            assert_eq!(
+                code, 0,
+                "scalar f16 op runtime mismatch at {opt:?} via {lane} (failing-case code {code})",
+            );
+        }
+    }
+}
+
+/// The Linux GNU explicit-fp16 lane's object, checked at object level on
+/// every host: it compiles for the generic Linux triple and carries the
+/// feature's instructions.
+#[test]
+fn explicit_fp16_linux_object_carries_feature_instructions() {
+    for opt in [OptLevel::O0, OptLevel::O2] {
+        let object = native_host::compile_with_isa_profile_for(
+            "aarch64-unknown-linux-gnu",
+            &build_module(),
+            opt,
+            AArch64IsaProfile::FP16,
+        )
+        .unwrap_or_else(|error| panic!("{opt:?}: {error}"));
+        native_host::assert_elf_aarch64_object(&object);
+        // Half-precision data processing: FP data-processing with ftype=11 (H).
+        let lse = |w: u32| w & 0xffe0_fc00 == 0x1ee0_2800;
+        assert!(
+            native_host::text_words(&object).into_iter().any(lse),
+            "{opt:?}: explicit fp16 Linux object lacks the feature instructions"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

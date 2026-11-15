@@ -259,7 +259,7 @@ fn encode_naked_to_host_object(func: &MachFunction) -> Vec<u8> {
         let text = writer.add_text_section(&code);
         // STT_FUNC = 2; ELF symbols carry no leading underscore.
         writer.add_symbol(&func.name, text, 0, code.len() as u64, true, 2);
-        writer.write()
+        writer.write_checked().unwrap()
     }
 }
 
@@ -391,6 +391,13 @@ fn build_max_function() -> MachFunction {
     let ret = MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]);
     let ret_id = func.push_inst(ret);
     func.append_inst(bb2, ret_id);
+
+    // Record the CFG the code implements: the per-compile switch-dispatch
+    // binding requires every conditional branch to land on a recorded
+    // successor (or inside its own block), so B.GT bb2 needs bb0 -> bb2.
+    func.add_edge(bb0, bb1);
+    func.add_edge(bb0, bb2);
+    func.add_edge(bb1, bb2);
 
     func
 }
@@ -1251,7 +1258,8 @@ fn test_e2e_trust_ir_high_register_pressure() {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
 
     let result = compiler
         .compile(&module)
@@ -1374,11 +1382,14 @@ int main(void) {
 /// }
 fn build_trust_ir_high_pressure_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_high_pressure", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1471,7 +1482,9 @@ fn build_trust_ir_high_pressure_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1887,11 +1900,14 @@ int main(void) {
 ///                 br bb1(new_counter, new_sum)
 fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum_1_to_n", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): n is param v0, create const 0, branch to loop header
@@ -1985,7 +2001,9 @@ fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2003,7 +2021,8 @@ fn test_e2e_sum_trust_ir_pipeline() {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
 
     let result = compiler
         .compile(&module)
@@ -2107,4 +2126,13 @@ int main(void) {
 
         cleanup(&dir);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -67,7 +67,15 @@ pub fn proof_branch26_call_target() -> ProofObligation {
     // Spec: the branch should land on the call target T = S + A.
     let intended = target.clone();
     // Emitted/runtime: PC + the encoded PC-relative displacement (T - P).
-    let displacement = target.bvsub(p.clone());
+    // Spell the linker's subtraction independently as two's-complement
+    // addition.  This remains exactly `T - P` in BV64, while avoiding a
+    // producer-side `bvsub` cancellation that used to collapse the complete
+    // theorem to `false` before AY could emit a query-bound DRAT proof.
+    let neg_p = p
+        .clone()
+        .bvxor(SmtExpr::bv_const(u64::MAX, W))
+        .bvadd(SmtExpr::bv_const(1, W));
+    let displacement = target.clone().bvadd(neg_p);
     let reconstructed = p.bvadd(displacement);
 
     ProofObligation {

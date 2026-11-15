@@ -6,24 +6,46 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
 // End-to-end test for expansion item #3 (floating-point types + ops):
-// take clang-O0-shaped LL snippets that use `float` / `double` and
-// drive them through the full codegen pipeline to an AArch64 Mach-O
-// object.
+// take clang-O0-shaped LL snippets that use `half` / `float` / `double`
+// and drive them through the full codegen pipeline to AArch64 objects.
 //
 // Goals:
 //   LL -> trust_ir (this crate)
 //     -> trust-cg-lower MachIR (FP BinOp / FCmp / FP casts)
 //       -> trust-cg-opt / trust-cg-regalloc / trust-cg-codegen
-//         -> Mach-O bytes.
+//         -> Mach-O bytes (aarch64-apple-darwin) and ELF bytes
+//            (aarch64-unknown-linux-gnu).
+//
+// Every compile names its target triple, so the object container, calling
+// convention and optional-ISA contract never depend on the host running the
+// test (`Compiler::new` would derive all three from the host). FEAT_FP16
+// scalar arithmetic is part of Apple's AOT contract but refused by name on
+// the generic Linux baseline; the f16 rows compile under the explicit
+// `AArch64IsaProfile::FP16` profile and pin both contracts.
 //
 // Hermetic: the `.ll` is embedded as a string constant (verified by
 // hand against Apple clang 17.0.0 on 2026-04-20, arm64-apple-macosx).
-// No dependency on a system `clang` being installed for CI.
+// These embedded import/object tests do not require a system `clang`,
+// and nothing here runs the emitted code.
 
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
-use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::Target;
+use trust_cg_codegen::compiler::{CompileError, Compiler, CompilerConfig, CompilerTraceLevel};
+use trust_cg_codegen::macho::linker::MachOParser;
+use trust_cg_codegen::pipeline::{OptLevel, PipelineError};
+use trust_cg_codegen::target::{AArch64IsaProfile, TargetSpec};
 use trust_cg_llvm_import::import_text;
+
+/// Apple arm64: Mach-O, DarwinPCS, and an AOT contract that admits FEAT_FP16.
+const APPLE: &str = "aarch64-apple-darwin";
+/// Generic Linux AArch64: ELF, AAPCS64, and a baseline without FEAT_FP16.
+const LINUX: &str = "aarch64-unknown-linux-gnu";
+/// Every program below is compiled for both explicit targets.
+const TARGETS: [&str; 2] = [APPLE, LINUX];
+
+/// The generic-baseline refusal for the binary16 constant that
+/// `LL_ADD_F16_CONST` materializes (FMOV Hd, #imm or FMOV Hd, Wn).
+const FP16_CONSTANT_REFUSAL: &str = "AArch64 FEAT_FP16 is not admitted for FMOV-immediate/GPR-to-H \
+     f16 constant; the generic AArch64 baseline may only transport f16 values and convert f16 \
+     <-> f32/f64";
 
 /// The f32 program: `float add(float a, float b) { return a + b; }`.
 /// Clang -O0 spills params to alloca + reloads before the fadd — we
@@ -74,7 +96,8 @@ entry:
 /// result alloca dropped: the select between the two return values is
 /// instead expressed as distinct basic blocks reached by a `br i1`
 /// predicated on `fcmp olt`. That matches the semantics exactly and
-/// removes the need for a phi (phis are not yet supported — item #2).
+/// isolates the floating-point comparison from phi lowering, which has its
+/// own end-to-end coverage in `switch_e2e.rs`.
 const LL_CMP_LT: &str = r#"
 define i32 @cmp_lt(double %x, double %y) {
 entry:
@@ -108,11 +131,20 @@ entry:
 }
 "#;
 
-fn compile_to_aarch64(src: &str, module_name: &str) -> Vec<u8> {
+/// Compile `src` at O0 for the explicit `triple`. `isa_profile` is
+/// [`CompilerConfig::aarch64_isa_profile`]; `None` keeps the target's AOT
+/// contract.
+fn try_compile(
+    src: &str,
+    module_name: &str,
+    triple: &str,
+    isa_profile: Option<AArch64IsaProfile>,
+) -> Result<Vec<u8>, Box<CompileError>> {
     let module = import_text(src, module_name).expect("import");
+    let target_spec = TargetSpec::parse(triple).expect("target spec");
     let cfg = CompilerConfig {
         opt_level: OptLevel::O0,
-        target: Target::Aarch64,
+        target: target_spec.architecture,
         emit_proofs: false,
         trace_level: CompilerTraceLevel::None,
         emit_debug: false,
@@ -121,17 +153,105 @@ fn compile_to_aarch64(src: &str, module_name: &str) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution: Default::default(),
         panic_unwind: false,
+        aarch64_isa_profile: isa_profile,
+        ..CompilerConfig::default()
     };
-    let compiler = Compiler::new(cfg);
-    let result = compiler
+    Compiler::new_for_target_spec(cfg, target_spec)
+        .with_codegen_license(permit_unlicensed())
         .compile(&module)
-        .unwrap_or_else(|e| panic!("compile `{module_name}` failed: {e}"));
+        .map(|result| result.object_code)
+        .map_err(Box::new)
+}
+
+/// [`try_compile`] that must yield a non-empty object in `triple`'s
+/// container: Mach-O arm64 for Apple, ELF AArch64 for Linux.
+fn compile_for(
+    src: &str,
+    module_name: &str,
+    triple: &str,
+    isa_profile: Option<AArch64IsaProfile>,
+) -> Vec<u8> {
+    let object = try_compile(src, module_name, triple, isa_profile)
+        .unwrap_or_else(|e| panic!("compile `{module_name}` for `{triple}` failed: {e}"));
     assert!(
-        !result.object_code.is_empty(),
-        "pipeline returned empty Mach-O buffer for `{module_name}`"
+        !object.is_empty(),
+        "pipeline returned an empty object for `{module_name}` on `{triple}`"
     );
-    result.object_code
+    let word = |at: usize| u32::from_le_bytes(object[at..at + 4].try_into().unwrap());
+    if triple == APPLE {
+        // MH_MAGIC_64, CPU_TYPE_ARM64.
+        assert_eq!(
+            (word(0), word(4)),
+            (0xfeed_facf, 0x0100_000c),
+            "`{module_name}` on `{triple}` is not a Mach-O arm64 object"
+        );
+    } else {
+        // ELF magic, EM_AARCH64.
+        assert!(
+            object.starts_with(b"\x7fELF") && u16::from_le_bytes([object[18], object[19]]) == 183,
+            "`{module_name}` on `{triple}` is not an ELF AArch64 object"
+        );
+    }
+    object
+}
+
+/// Every program reaches an object on both explicit targets.
+fn compile_to_aarch64(src: &str, module_name: &str) {
+    for triple in TARGETS {
+        compile_for(src, module_name, triple, None);
+    }
+}
+
+/// The little-endian instruction words of the object's code section
+/// (`__TEXT,__text` or `.text`).
+fn text_words(object: &[u8]) -> Vec<u32> {
+    let text = if object.starts_with(b"\x7fELF") {
+        elf_text(object).to_vec()
+    } else {
+        MachOParser::parse(object)
+            .expect("parse Mach-O object")
+            .sections
+            .into_iter()
+            .find(|section| section.segment == "__TEXT" && section.name == "__text")
+            .expect("__TEXT,__text section")
+            .data
+    };
+    assert_eq!(text.len() % 4, 0, "code section is not word sized");
+    text.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
+        .collect()
+}
+
+/// The `.text` bytes of an ELF64 little-endian relocatable object.
+fn elf_text(object: &[u8]) -> &[u8] {
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([object[at], object[at + 1]]));
+    let u32_at = |at: usize| u32::from_le_bytes(object[at..at + 4].try_into().unwrap()) as usize;
+    let u64_at = |at: usize| {
+        usize::try_from(u64::from_le_bytes(object[at..at + 8].try_into().unwrap())).unwrap()
+    };
+    // e_shoff, e_shentsize, e_shnum, e_shstrndx; sh_name, sh_offset, sh_size.
+    let (table, entry_size, count) = (u64_at(0x28), u16_at(0x3a), u16_at(0x3c));
+    let names_header = table + u16_at(0x3e) * entry_size;
+    let names = &object[u64_at(names_header + 0x18)..][..u64_at(names_header + 0x20)];
+    let text = (0..count)
+        .map(|index| table + index * entry_size)
+        .find(|&header| names[u32_at(header)..].split(|byte| *byte == 0).next() == Some(b".text"))
+        .expect("ELF .text section");
+    &object[u64_at(text + 0x18)..][..u64_at(text + 0x20)]
+}
+
+/// The object contains `FADD Hd, Hn, Hm` (scalar half precision, FEAT_FP16).
+fn assert_has_fp16_fadd(object: &[u8], triple: &str, lane: &str) {
+    assert!(
+        text_words(object)
+            .into_iter()
+            .any(|word| word & 0xffe0_fc00 == 0x1ee0_2800),
+        "`{triple}` {lane}: `add_h_one` lacks FADD Hd, Hn, Hm"
+    );
 }
 
 #[test]
@@ -155,9 +275,38 @@ fn fadd_f64_full_pipeline_aarch64_o0() {
     compile_to_aarch64(LL_ADD_F64, "add_d");
 }
 
+/// FEAT_FP16 is intended here: `fadd half` with a binary16 constant selects
+/// FMOV Hd, #1.0 and FADD Hd, Hn, Hm. The explicit FP16 profile admits them
+/// on both targets. Apple's AOT contract admits them without a profile,
+/// which is what this row compiled when it took the Apple host's target.
 #[test]
 fn fadd_f16_const_full_pipeline_aarch64_o0() {
-    compile_to_aarch64(LL_ADD_F16_CONST, "add_h_one");
+    for triple in TARGETS {
+        let object = compile_for(
+            LL_ADD_F16_CONST,
+            "add_h_one",
+            triple,
+            Some(AArch64IsaProfile::FP16),
+        );
+        assert_has_fp16_fadd(&object, triple, "explicit FP16 profile");
+    }
+    let object = compile_for(LL_ADD_F16_CONST, "add_h_one", APPLE, None);
+    assert_has_fp16_fadd(&object, APPLE, "Apple AOT contract");
+}
+
+/// Twin: without the explicit profile the generic Linux baseline refuses the
+/// FEAT_FP16 constant by name. It does not emit FP16 instructions that a
+/// baseline CPU might not implement.
+#[test]
+fn fadd_f16_const_generic_linux_baseline_refuses_fp16_by_name() {
+    let error = try_compile(LL_ADD_F16_CONST, "add_h_one", LINUX, None)
+        .expect_err("the generic Linux baseline must refuse FEAT_FP16");
+    match error.as_ref() {
+        CompileError::Pipeline(PipelineError::ISel(message)) => {
+            assert_eq!(message, FP16_CONSTANT_REFUSAL);
+        }
+        other => panic!("expected the named FEAT_FP16 refusal, got {other:?}"),
+    }
 }
 
 #[test]
@@ -195,4 +344,13 @@ entry:
         );
         compile_to_aarch64(&src, op_name);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // crates/rustc-codegen-trust-cg/tests/loop_threading_x86.rs
 //
@@ -38,12 +42,11 @@ mod target_dir_support;
 //
 // Run (requires the target-bridge toolchain + x86_64-apple-darwin std, x86 host):
 //     cd crates/rustc-codegen-trust-cg
-//     cargo +nightly-2026-04-20 test --release --test loop_threading_x86 -- --nocapture
+//     targo --unverified test --release --locked --test loop_threading_x86 -- --nocapture
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
 // A euclid-shaped single-latch loop over two loop-carried u64 scalars: the
@@ -68,66 +71,12 @@ fn main() {
 }
 "#;
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run loop-threading test");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -151,19 +100,17 @@ fn compile_object(stem: &str, src: &str, opt: &str, dylib: &Path, refine: bool) 
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
     if refine {
-        cmd.env("TCG_P3C_REFINE", "1");
-        cmd.env("TCG_REFINE_TRACE", "1");
+        cmd.arg(toolchain_support::backend_knobs_arg(&["p3c-refine"]));
+        cmd.arg(toolchain_support::backend_knobs_arg(&["refine-trace"]));
     } else {
         cmd.env_remove("TCG_P3C_REFINE");
         cmd.env_remove("TCG_REFINE");
         cmd.env_remove("TCG_REFINE_TRACE");
     }
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    cmd.arg("--crate-type").arg("bin");
     let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
     backend_arg.push(dylib);
     cmd.arg(&backend_arg);
@@ -179,7 +126,7 @@ fn compile_object(stem: &str, src: &str, opt: &str, dylib: &Path, refine: bool) 
     .arg("--out-dir")
     .arg(&dir)
     .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let mut success = output.status.success();
     if success {
@@ -241,7 +188,12 @@ fn loop_carried_threading_vc_fires_and_refines() {
     assert!(
         ok_off,
         "with the refinement lane unset the program must still compile.\nstderr:\n{}",
-        stderr_off.lines().rev().take(20).collect::<Vec<_>>().join("\n")
+        stderr_off
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert!(
         !stderr_off.contains("loop-threading"),

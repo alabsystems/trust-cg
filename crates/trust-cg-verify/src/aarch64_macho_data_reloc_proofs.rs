@@ -135,8 +135,16 @@ pub fn proof_page21_adrp_page() -> ProofObligation {
 
     // Spec: ADRP should land on the target's page base.
     let intended = page_target.clone();
-    // Emitted/runtime: page(P) + encoded page delta.
-    let page_delta = page_target.bvsub(page_p.clone());
+    // Emitted/runtime: page(P) + encoded page delta.  Represent subtraction
+    // independently as two's-complement addition.  In BV64 this is exactly
+    // `page_target - page_p`, but it prevents the offline producer from
+    // simplifying the authored theorem to bare `false` before emitting a
+    // query-bound DRAT proof.
+    let neg_page_p = page_p
+        .clone()
+        .bvxor(SmtExpr::bv_const(u64::MAX, W))
+        .bvadd(SmtExpr::bv_const(1, W));
+    let page_delta = page_target.clone().bvadd(neg_page_p);
     let reconstructed = page_p.bvadd(page_delta);
 
     ProofObligation {

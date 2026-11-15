@@ -1,0 +1,60 @@
+; TrustIr text format v1
+; #lossy: function-id(position 1 id 2)
+module "shared_from_mut_record"
+target "aarch64-unknown-linux-gnu" 8 little
+
+struct @shared_from_mut_record.const.alloc5.allocation { part0: ptr @0, part1: [ty.5 x 16] @8 } size=24 align=1 repr=packed(1) id=0
+
+functy.0 = (&mut [ty.3 x 6], u64) -> (&(u32, u32, u32))
+
+functy.1 = (ptr, i64, ptr) -> ()
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+type ty.5 = u8
+
+global internal align(1) @shared_from_mut_record.const.alloc1 [ty.5 x 19] = bytes<696e646578206f7574206f6620626f756e6473>
+
+global internal align(8) @shared_from_mut_record.const.alloc5 struct.0 = { symaddr<shared_from_mut_record.const.alloc2>, bytes<56000000000000001f00000015000000> }
+
+global internal align(1) @shared_from_mut_record.const.alloc2 [ty.5 x 87] = bytes<2f686f6d652f6179617465732f74727573742d63672f7461726765742f7374642d636f6d706c6574696f6e2d696e7665737469676174696f6e2f6167677265676174652d7265626f72726f772d636f727075732e727300>
+
+fn @shared_from_mut_record(functy.0) {
+bb0(%1: &mut [ty.3 x 6], %2: u64):
+    %6 = const u64 3
+    %5 = icmp ult u64 %2, %6
+    condbr %5, bb1, bb3
+bb3:
+    %7 = global_addr @global.0
+    %8 = const i64 19
+    %9 = global_addr @global.1
+    call @func.2(%7, %8, %9)
+    unreachable
+bb1:
+    %10 = const i64 8
+    %11 = ptrtoptr &mut [ty.3 x 6] %1 to ptr
+    %12 = ptrtoint ptr %11 to i64
+    %13 = copy i64 %10
+    %14 = add i64 %12, %13
+    %15 = inttoptr i64 %14 to ptr
+    %16 = copy ptr %15
+    %17 = ptrtoint ptr %16 to i64
+    %18 = bitcast u64 %2 to i64
+    %19 = const i64 12
+    %20 = mul i64 %18, %19
+    %21 = add i64 %17, %20
+    %22 = inttoptr i64 %21 to ptr
+    %23 = ptrtoptr &mut (u32, u32, u32) %22 to &(u32, u32, u32)
+    ret %23
+}
+
+fn @_RNvNtCsfsP382UbnKb_4core9panicking5panic(functy.1) {
+}

@@ -678,11 +678,14 @@ fn build_trust_ir_forward_direct_call_module() -> trust_ir::Module {
     };
 
     let mut module = TrustIrModule::new("jit_trust_ir_forward_direct_call");
-    let sig = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let sig = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut caller = TrustIrFunction::new(
         FuncId::new(0),
@@ -724,8 +727,12 @@ fn build_trust_ir_forward_direct_call_module() -> trust_ir::Module {
         ],
     });
 
-    module.add_function(caller);
-    module.add_function(callee);
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -773,16 +780,22 @@ fn build_internal_helper_call_abi_retbuf_module() -> trust_ir::Module {
     };
 
     let mut module = TrustIrModule::new("jit_internal_helper_call_abi_retbuf");
-    let helper_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32, Ty::Ptr, Ty::I64],
-        returns: vec![],
-        is_vararg: false,
-    });
-    let caller_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let helper_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32, Ty::Ptr, Ty::I64],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let caller_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut helper = TrustIrFunction::new(
         FuncId::new(0),
@@ -931,8 +944,12 @@ fn build_internal_helper_call_abi_retbuf_module() -> trust_ir::Module {
         ],
     }];
 
-    module.add_function(helper);
-    module.add_function(caller);
+    module
+        .try_add_function(helper)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1162,13 +1179,13 @@ fn build_call_raw_callback_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
 fn test_jit_call_indirect_raw_callback_writes_through_pointer() {
     let module = build_call_raw_callback_module();
-    let compiler = Compiler::jit_fast(Target::Aarch64);
+    let compiler = Compiler::jit_fast(Target::Aarch64).with_codegen_license(permit_unlicensed());
     let ext: HashMap<String, *const u8> = HashMap::new();
     let result = compiler
         .compile_module_to_jit(&module, &ext)
@@ -1407,12 +1424,7 @@ fn build_indirect_call_live_values_survive_volatile_clobber_module() -> trust_ir
             Ty::U64,
             host_clobber_call_volatile_registers as *const () as usize as i128,
         );
-        let callback_ptr = fb.cast(
-            CastOp::IntToPtr,
-            Ty::U64,
-            Ty::Func(callback_ty),
-            callback_addr,
-        );
+        let callback_ptr = fb.cast(CastOp::IntToPtr, Ty::U64, Ty::Ptr, callback_addr);
         fb.call_indirect_void(callback_ptr, callback_ty, vec![]);
 
         let mut acc = fb.iconst(Ty::U64, 0);
@@ -1423,7 +1435,7 @@ fn build_indirect_call_live_values_survive_volatile_clobber_module() -> trust_ir
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_trust_ir_like_callout_indirect_module() -> trust_ir::Module {
@@ -1448,12 +1460,7 @@ fn build_trust_ir_like_callout_indirect_module() -> trust_ir::Module {
             Ty::U64,
             host_trust_ir_like_callout_action as *const () as usize as i128,
         );
-        let callback_ptr = fb.cast(
-            CastOp::IntToPtr,
-            Ty::U64,
-            Ty::Func(callback_ty),
-            callback_addr,
-        );
+        let callback_ptr = fb.cast(CastOp::IntToPtr, Ty::U64, Ty::Ptr, callback_addr);
 
         let runtime_error = fb.iconst(Ty::I64, CALLOUT_STATUS_RUNTIME_ERROR as i128);
         fb.store(Ty::I64, out, runtime_error);
@@ -1478,7 +1485,7 @@ fn build_trust_ir_like_callout_indirect_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_direct_call_retbuf_live_across_call_module() -> trust_ir::Module {
@@ -1488,16 +1495,22 @@ fn build_direct_call_retbuf_live_across_call_module() -> trust_ir::Module {
     };
 
     let mut module = TrustIrModule::new("jit_direct_call_retbuf_live_across_call");
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let helper_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::I32, Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let helper_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::I32, Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut entry = TrustIrFunction::new(
         FuncId::new(0),
@@ -1573,7 +1586,9 @@ fn build_direct_call_retbuf_live_across_call_module() -> trust_ir::Module {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
 
     let mut helper = TrustIrFunction::new(
         FuncId::new(1),
@@ -1648,7 +1663,9 @@ fn build_direct_call_retbuf_live_across_call_module() -> trust_ir::Module {
             }),
         ],
     }];
-    module.add_function(helper);
+    module
+        .try_add_function(helper)
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -1712,16 +1729,22 @@ fn build_trust_ir_like_stack_callout_indirect_module() -> trust_ir::Module {
     };
 
     let mut module = TrustIrModule::new("jit_call_indirect_trust_ir_like_stack_callout");
-    let callback_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32],
-        returns: vec![],
-        is_vararg: false,
-    });
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::U32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let callback_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::U32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = BlockId::new(0);
     let state_in = ValueId::new(0);
@@ -1767,7 +1790,7 @@ fn build_trust_ir_like_stack_callout_indirect_module() -> trust_ir::Module {
         InstrNode::new(Inst::Cast {
             op: CastOp::IntToPtr,
             src_ty: Ty::U64,
-            dst_ty: Ty::Func(callback_ty),
+            dst_ty: Ty::Ptr,
             operand: callback_addr,
         })
         .with_result(callback_ptr),
@@ -1881,7 +1904,9 @@ fn build_trust_ir_like_stack_callout_indirect_module() -> trust_ir::Module {
         entry,
     );
     function.blocks = vec![block];
-    module.add_function(function);
+    module
+        .try_add_function(function)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2027,16 +2052,22 @@ fn build_trust_ir_like_mini_bfs_callout_indirect_module() -> trust_ir::Module {
     }
 
     let mut module = TrustIrModule::new("jit_call_indirect_trust_ir_like_mini_bfs");
-    let callback_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32],
-        returns: vec![],
-        is_vararg: false,
-    });
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::U64],
-        returns: vec![Ty::U64],
-        is_vararg: false,
-    });
+    let callback_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::U32],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::U64],
+            returns: vec![Ty::U64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry_id = BlockId::new(0);
     let header_id = BlockId::new(1);
@@ -2147,7 +2178,7 @@ fn build_trust_ir_like_mini_bfs_callout_indirect_module() -> trust_ir::Module {
         Inst::Cast {
             op: CastOp::IntToPtr,
             src_ty: Ty::U64,
-            dst_ty: Ty::Func(callback_ty),
+            dst_ty: Ty::Ptr,
             operand: callback_addr,
         },
     );
@@ -2310,7 +2341,9 @@ fn build_trust_ir_like_mini_bfs_callout_indirect_module() -> trust_ir::Module {
         done,
         error,
     ];
-    module.add_function(function);
+    module
+        .try_add_function(function)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2415,25 +2448,31 @@ fn build_loop_livein_callout_indirect_module() -> trust_ir::Module {
     }
 
     let mut module = TrustIrModule::new("jit_loop_livein_callout");
-    let callback_ty = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::Ptr,
-            Ty::Ptr,
-            Ty::U64,
-            Ty::U64,
-            Ty::U64,
-            Ty::U64,
-            Ty::U64,
-            Ty::U64,
-        ],
-        returns: vec![],
-        is_vararg: false,
-    });
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::U64],
-        returns: vec![Ty::U64],
-        is_vararg: false,
-    });
+    let callback_ty = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::Ptr,
+                Ty::Ptr,
+                Ty::U64,
+                Ty::U64,
+                Ty::U64,
+                Ty::U64,
+                Ty::U64,
+                Ty::U64,
+            ],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::U64],
+            returns: vec![Ty::U64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry_id = BlockId::new(0);
     let header_id = BlockId::new(1);
@@ -2505,7 +2544,7 @@ fn build_loop_livein_callout_indirect_module() -> trust_ir::Module {
         Inst::Cast {
             op: CastOp::IntToPtr,
             src_ty: Ty::U64,
-            dst_ty: Ty::Func(callback_ty),
+            dst_ty: Ty::Ptr,
             operand: callback_addr,
         },
     );
@@ -2553,7 +2592,9 @@ fn build_loop_livein_callout_indirect_module() -> trust_ir::Module {
     let mut function =
         TrustIrFunction::new(FuncId::new(0), "loop_livein_callout", entry_ty, entry_id);
     function.blocks = vec![entry, header, body, done];
-    module.add_function(function);
+    module
+        .try_add_function(function)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2570,16 +2611,19 @@ fn compile_trust_ir_module_with_ty_pipeline_backend(
     ext: &HashMap<String, *const u8>,
     opt_level: OptLevel,
 ) -> Result<trust_cg_codegen::ExecutableBuffer, String> {
-    let functions_with_proofs =
-        trust_cg_lower::adapter::translate_module(module).map_err(|err| err.to_string())?;
+    let functions_with_proofs = permit_translate_module(module).map_err(|err| err.to_string())?;
+    // The prepared functions run in this process, so they are lowered for the
+    // host's AArch64 OS/ABI, the triple `JitCompiler` itself lowers for
+    // (95450aa8d): AAPCS64 on Linux, DarwinPCS on macOS. A pinned Darwin
+    // triple would run DarwinPCS code (red-zone frames, packed narrow stack
+    // arguments) under a Linux caller.
     let pipeline = trust_cg_codegen::Pipeline::new(trust_cg_codegen::PipelineConfig {
         opt_level,
         emit_debug: false,
         verify_dispatch: trust_cg_codegen::DispatchVerifyMode::Off,
         verify: false,
-        target_triple: "aarch64-apple-darwin".to_owned(),
         cegis_superopt_budget_sec: None,
-        ..Default::default()
+        ..trust_cg_codegen::PipelineConfig::for_host_aarch64()
     });
 
     let mut ir_functions = Vec::new();
@@ -2596,6 +2640,13 @@ fn compile_trust_ir_module_with_ty_pipeline_backend(
         verify_dispatch: trust_cg_codegen::DispatchVerifyMode::Off,
         ..JitConfig::default()
     });
+    if jit.aarch64_target_triple() != pipeline.config.target_triple {
+        return Err(format!(
+            "prepared for {} but the JIT lowers for {}",
+            pipeline.config.target_triple,
+            jit.aarch64_target_triple()
+        ));
+    }
     jit.compile_raw(&ir_functions, ext)
         .map_err(|err| err.to_string())
 }
@@ -2702,11 +2753,14 @@ fn build_bool_block_param_live_pointer_alias_module() -> trust_ir::Module {
     }
 
     let mut module = TrustIrModule::new("jit_bool_block_param_live_pointer_alias");
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::U64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::U64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry_id = BlockId::new(0);
     let value_check_id = BlockId::new(1);
@@ -2790,7 +2844,9 @@ fn build_bool_block_param_live_pointer_alias_module() -> trust_ir::Module {
         entry_id,
     );
     function.blocks = vec![entry, value_check, use_ptr];
-    module.add_function(function);
+    module
+        .try_add_function(function)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2858,7 +2914,7 @@ fn build_trust_ir_icmp_eq_select_old_vs_appended_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -2940,7 +2996,7 @@ fn build_trust_ir_broadcast_channel_shape_select_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_ty_bytecode_register_false_path_module() -> trust_ir::Module {
@@ -3078,11 +3134,14 @@ fn build_ty_bytecode_register_false_path_module() -> trust_ir::Module {
     }
 
     let mut module = TrustIrModule::new("jit_ty_bytecode_register_false_path");
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry_id = BlockId::new(0);
     let self_30_id = BlockId::new(1);
@@ -3284,7 +3343,9 @@ fn build_ty_bytecode_register_false_path_module() -> trust_ir::Module {
         ret,
         true_block,
     ];
-    module.add_function(function);
+    module
+        .try_add_function(function)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4893,7 +4954,8 @@ fn test_jit_missing_symbol_returns_unresolved_not_zero_addr() {
 // lower adapter treats it as `Type::Struct([capture types...])` with C-layout
 // (natural-alignment, in-order) offsets, so:
 //   * construction stores each capture operand at its struct-layout offset
-//     (`Alloca` + per-capture `InsertField` -> StructGep + Store), and
+//     (per-capture `InsertField` over a seed closure value -> a private copy +
+//     StructGep + Store), and
 //   * `ExtractElement(Ty::Closure, idx)` loads the capture at that offset
 //     (StructGep + Load).
 //
@@ -4907,8 +4969,9 @@ fn test_jit_missing_symbol_returns_unresolved_not_zero_addr() {
 
 /// Build a module with three functions `get_capture_0/1/2`, each of which:
 ///   1. takes the three capture operands `(i32, i64, i8)` as params,
-///   2. allocates closure storage and stores each operand into its capture
-///      slot via `InsertField` (the closure-aggregate construction path),
+///   2. loads a zeroed seed closure value from closure storage and inserts
+///      each operand into its capture slot via `InsertField` (the
+///      closure-aggregate construction path),
 ///   3. extracts capture `N` via `ExtractElement(Ty::Closure, N)`, and
 ///   4. returns it zero-extended to `i64`.
 fn build_closure_capture_roundtrip_module() -> trust_ir::Module {
@@ -4921,25 +4984,33 @@ fn build_closure_capture_roundtrip_module() -> trust_ir::Module {
 
     // The closure's bare-fn signature is irrelevant to the capture layout, but
     // `ClosureTy` references a func type, so register a trivial one first.
-    let bare_fn = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let bare_fn = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // Heterogeneous captures: I32, I64, I8 — distinct widths exercise the
     // natural-alignment struct layout (I32 @ 0, I64 @ 8 after padding, I8 @ 16).
-    let closure_id: ClosureTyId = module.add_closure_type(ClosureTy {
-        func: bare_fn,
-        captures: vec![Ty::I32, Ty::I64, Ty::I8],
-    });
+    let closure_id: ClosureTyId = module
+        .add_closure_type(ClosureTy {
+            func: bare_fn,
+            captures: vec![Ty::I32, Ty::I64, Ty::I8],
+        })
+        .expect("Module::add_closure_type: test fixture");
     let closure_ty = Ty::Closure(closure_id);
 
     // Each extractor function: (i32, i64, i8) -> i64.
-    let extractor_fty = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I64, Ty::I8],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let extractor_fty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I64, Ty::I8],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     for (func_idx, capture_index) in [0u32, 1, 2].into_iter().enumerate() {
         let name = format!("get_capture_{capture_index}");
@@ -4958,6 +5029,7 @@ fn build_closure_capture_roundtrip_module() -> trust_ir::Module {
         //   v7        = constant capture index
         //   v8        = ExtractElement result (the selected capture)
         //   v9        = result widened to i64 (when needed)
+        //   v20..v26  = the zero-initialized seed closure VALUE (see below)
         let mut body = vec![
             // Allocate closure-sized storage. `Alloca { ty: Closure }` sizes the
             // slot from the struct layout via `translate_ty`.
@@ -4967,13 +5039,59 @@ fn build_closure_capture_roundtrip_module() -> trust_ir::Module {
                 align: None,
             })
             .with_result(ValueId::new(3)),
-            // Store each capture operand into its capture slot. The first
-            // InsertField takes the raw Alloca pointer as the aggregate; its
-            // result (and every subsequent one) is typed `Ty::Closure`, so the
+            // Zero its 24 bytes (three i64 words) and LOAD a seed closure
+            // VALUE from it. `InsertField` is a value update of a value of the
+            // closure type: its aggregate operand cannot be the raw `Alloca`
+            // pointer (that "store form" is invalid trust-ir, refused by name
+            // since WS7.1).
+            InstrNode::new(Inst::Const {
+                ty: Ty::I64,
+                value: Constant::Int(0),
+            })
+            .with_result(ValueId::new(20)),
+            InstrNode::new(Inst::Const {
+                ty: Ty::I64,
+                value: Constant::Int(1),
+            })
+            .with_result(ValueId::new(21)),
+            InstrNode::new(Inst::Const {
+                ty: Ty::I64,
+                value: Constant::Int(2),
+            })
+            .with_result(ValueId::new(22)),
+        ];
+        for (word, index) in [(23_u32, 20_u32), (24, 21), (25, 22)] {
+            body.push(
+                InstrNode::new(Inst::GEP {
+                    pointee_ty: Ty::I64,
+                    base: ValueId::new(3),
+                    indices: vec![ValueId::new(index)],
+                    inbounds: true,
+                })
+                .with_result(ValueId::new(word)),
+            );
+            body.push(InstrNode::new(Inst::Store {
+                ty: Ty::I64,
+                ptr: ValueId::new(word),
+                value: ValueId::new(20),
+                volatile: false,
+                align: None,
+            }));
+        }
+        body.extend([
+            InstrNode::new(Inst::Load {
+                ty: closure_ty.clone(),
+                ptr: ValueId::new(3),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(26)),
+            // Store each capture operand into its capture slot of a new closure
+            // value. Every InsertField result is typed `Ty::Closure`, so the
             // later ExtractElement sees a closure source.
             InstrNode::new(Inst::InsertField {
                 ty: closure_ty.clone(),
-                aggregate: ValueId::new(3),
+                aggregate: ValueId::new(26),
                 field: 0,
                 value: ValueId::new(0),
             })
@@ -5006,7 +5124,7 @@ fn build_closure_capture_roundtrip_module() -> trust_ir::Module {
                 index: ValueId::new(7),
             })
             .with_result(ValueId::new(8)),
-        ];
+        ]);
 
         // Widen the extracted capture to i64 for the return (capture 1 is
         // already i64). Use zero-extension — the test feeds non-negative values.
@@ -5043,7 +5161,9 @@ fn build_closure_capture_roundtrip_module() -> trust_ir::Module {
             ],
             body,
         }];
-        module.add_function(func);
+        module
+            .try_add_function(func)
+            .expect("Module::try_add_function: test fixture");
     }
 
     module
@@ -5093,4 +5213,28 @@ fn test_jit_closure_capture_aggregate_roundtrip() {
         cap2 as u8 as i64,
         "capture 2 (I8) must round-trip at its struct-layout offset (16)"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

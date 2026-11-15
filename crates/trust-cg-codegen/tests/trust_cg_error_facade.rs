@@ -97,10 +97,13 @@ fn typed_wrappers_expose_std_error_sources() {
 
 #[test]
 fn async_submit_rejection_converts_from_public_reject_data() {
-    let mut service = AsyncCompileService::with_default_service(AsyncCompileServiceConfig {
-        max_queued: 0,
-        ..AsyncCompileServiceConfig::default()
-    });
+    let mut service = AsyncCompileService::new(
+        permit_compile_service(),
+        AsyncCompileServiceConfig {
+            max_queued: 0,
+            ..AsyncCompileServiceConfig::default()
+        },
+    );
     let reject = service
         .submit(CompileRequest::new(
             "facade-async-reject",
@@ -123,4 +126,16 @@ fn async_submit_rejection_converts_from_public_reject_data() {
         }
         other => panic!("expected async submit rejection, got {other:?}"),
     }
+}
+
+/// This file's fixtures carry no codegen license (`body_gate: None`), which
+/// the compile service REFUSES by default (roadmap WS7.5, decision gate
+/// DG-73). Its services state `Permit` explicitly, so no request passes
+/// because it was silently refused.
+fn permit_compile_service() -> trust_cg_codegen::CompileService {
+    trust_cg_codegen::CompileService::new(trust_cg_codegen::CompileServiceConfig {
+        codegen_license: trust_cg_codegen::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit),
+        ..trust_cg_codegen::CompileServiceConfig::default()
+    })
 }

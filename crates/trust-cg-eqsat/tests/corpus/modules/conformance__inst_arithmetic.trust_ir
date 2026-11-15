@@ -1,0 +1,73 @@
+; TrustIr text format v1
+module "inst_arithmetic"
+
+functy.0 = (i64, i64, i32, u32, f32, f64, bool, ptr, fatptr<str>, u64) -> (i64)
+
+fn @int_ops(functy.0) {
+bb0(%0: i64, %1: i64, %2: i32, %3: u32, %4: f32, %5: f64, %6: bool, %7: ptr, %8: fatptr<str>, %9: u64):
+    %10 = add i64 %0, %1
+    %11 = sub i64 %0, %1
+    %12 = mul i64 %0, %1
+    %13 = udiv i64 %0, %1
+    %14 = sdiv i64 %0, %1
+    %15 = urem i64 %0, %1
+    %16 = srem i64 %0, %1
+    %17 = and i64 %0, %1
+    %18 = or i64 %0, %1
+    %19 = xor i64 %0, %1
+    %20 = shl i64 %0, %1
+    %21 = lshr i64 %0, %1
+    %22 = ashr i64 %0, %1
+    %23 = fadd f64 %5, %5
+    %24 = fsub f64 %5, %5
+    %25 = fmul f64 %5, %5
+    %26 = fdiv f64 %5, %5
+    %27 = frem f64 %5, %5
+    %28 = neg i64 %0
+    %29 = fneg f64 %5
+    %30 = not i64 %0
+    %31 = ctpop i64 %0
+    %32, %33 = add.overflow i64 %0, %1
+    %34, %35 = sub.overflow i64 %0, %1
+    %36, %37 = mul.overflow i64 %0, %1
+    %38 = icmp eq i64 %0, %1
+    %39 = icmp ne i64 %0, %1
+    %40 = icmp ult i64 %0, %1
+    %41 = icmp ule i64 %0, %1
+    %42 = icmp ugt i64 %0, %1
+    %43 = icmp uge i64 %0, %1
+    %44 = icmp slt i64 %0, %1
+    %45 = icmp sle i64 %0, %1
+    %46 = icmp sgt i64 %0, %1
+    %47 = icmp sge i64 %0, %1
+    %48 = fcmp oeq f64 %5, %5
+    %49 = fcmp one f64 %5, %5
+    %50 = fcmp olt f64 %5, %5
+    %51 = fcmp ole f64 %5, %5
+    %52 = fcmp ogt f64 %5, %5
+    %53 = fcmp oge f64 %5, %5
+    %54 = fcmp ueq f64 %5, %5
+    %55 = fcmp une f64 %5, %5
+    %56 = fcmp ult f64 %5, %5
+    %57 = fcmp ule f64 %5, %5
+    %58 = fcmp ugt f64 %5, %5
+    %59 = fcmp uge f64 %5, %5
+    %60 = trunc i64 %0 to i32
+    %61 = zext i32 %2 to i64
+    %62 = sext i32 %2 to i64
+    %63 = fptrunc f64 %5 to f32
+    %64 = fpext f32 %4 to f64
+    %65 = fptoui f64 %5 to u32
+    %66 = fptosi f64 %5 to i32
+    %67 = uitofp u32 %3 to f32
+    %68 = sitofp i32 %2 to f64
+    %69 = ptrtoint ptr %7 to u64
+    %70 = inttoptr u64 %9 to ptr
+    %71 = bitcast f32 %4 to i32
+    %72 = ptr_data fatptr<str> %8
+    %73 = ptr_metadata fatptr<str> %8 to u64
+    %74 = ptr_from_parts fatptr<str> ptr %7, u64 %9
+    %75 = copy i64 %0
+    %76 = select i64 %6, %0, %1
+    ret %0
+}

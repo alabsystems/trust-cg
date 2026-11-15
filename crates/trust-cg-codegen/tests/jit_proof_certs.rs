@@ -76,15 +76,29 @@ fn with_big_stack<F: FnOnce() + Send + 'static>(body: F) {
 // ---------------------------------------------------------------------------
 
 /// Certificate is attached when `verify = true` and every field is
-/// populated consistently with the executable buffer's code layout.
+/// populated consistently with the executable buffer's code layout. The raw
+/// `ADD X0, X0, X1` has no source binding, so its 64-bit ADD discharges only
+/// by sampling, which E0.2 reports and never credits: the certificate carries
+/// the provenance pairs and an empty chain, and it is not proof-grade (the
+/// same policy `jit_fail_closed_proof_policy`'s raw-sampling control pins).
 #[test]
 fn verify_on_attaches_certificate() {
     with_big_stack(|| {
+        let add_fn = build_add();
+        let report = trust_cg_verify::verify_function(&add_fn);
+        assert!(report.precondition_failure.is_none(), "{report:?}");
+        assert_eq!(report.failed_count(), 0, "{report:?}");
+        assert_eq!(report.sampled_uncredited_count(), 1, "{report:?}");
+        assert_eq!(report.genuinely_verified_count(), 0, "{report:?}");
+        assert!(
+            !report.emitted_opcode_inventory().is_promotable(),
+            "{report:?}"
+        );
+
         let jit = JitCompiler::new(JitConfig {
             verify: true,
             ..Default::default()
         });
-        let add_fn = build_add();
         let ext: HashMap<String, *const u8> = HashMap::new();
         let buf = jit
             .compile_raw(&[add_fn], &ext)
@@ -138,17 +152,24 @@ fn verify_on_attaches_certificate() {
                 .collect::<Vec<_>>()
         );
 
-        // Certificate chain must contain the successful AddRR proof.
+        // The chain records only Verified or Failed obligations; the sampled
+        // AddRR is neither, so it contributes no row, and the certificate,
+        // its lowering export and the buffer stay below proof grade.
         let chain = cert.chain();
         assert!(
-            chain.all_verified(),
-            "chain should be all-verified (only records proven obligations): {}",
-            chain.certificates.len()
+            chain.certificates.is_empty(),
+            "a sampled AddRR must not enter the chain: {:?}",
+            chain.certificates
         );
         assert!(
-            !chain.certificates.is_empty(),
-            "chain must contain at least one certificate (AddRR)"
+            !chain.all_verified(),
+            "an empty chain is never all-verified"
         );
+        assert!(!cert.is_verified(), "sampled evidence is not proof-grade");
+        assert_eq!(cert.coverage_percent(), 0.0);
+        assert!(cert.lowering_certificate().is_none());
+        assert!(!buf.all_function_semantics_verified());
+        assert!(!buf.all_verified());
     });
 }
 
@@ -175,8 +196,7 @@ fn replay_check_passes_on_untampered() {
 }
 
 /// Certificate is NOT attached when the caller explicitly disables
-/// verification. `all_verified()` still returns true vacuously (no
-/// certificates = no failures).
+/// verification. The aggregate proof predicate must fail non-vacuously.
 #[test]
 fn verify_off_skips_certificate() {
     with_big_stack(|| {
@@ -199,10 +219,8 @@ fn verify_off_skips_certificate() {
             0,
             "certificates iterator should be empty when verify=false"
         );
-        assert!(
-            buf.all_verified(),
-            "all_verified is vacuously true when no certs are present"
-        );
+        assert!(!buf.all_function_semantics_verified());
+        assert!(!buf.all_verified());
     });
 }
 

@@ -13,11 +13,11 @@
 //! (NaN) compare, and the PARITY flag PF is the unordered signal. So x86's
 //! NaN bugs would be distinct from aarch64's.
 //!
-//! VERIFICATION PATH: (b) — x86 machine code CANNOT be executed on this
-//! aarch64 host. `tests/e2e_x86_64_triple_oracle.rs` (and its `x86_64_corpus`
-//! gate `x86_64_oracle_enabled` → `is_x86_64()` = `cfg!(target_arch="x86_64")`)
-//! EARLY-RETURNS on aarch64: there is no x86 emulator/Rosetta path that flips
-//! `cfg!(target_arch)`. So instead of running x86, we verify the x86 fcmp
+//! VERIFICATION PATH: (b). When this audit was written, x86 machine code could
+//! not be executed on an aarch64 host here: the `x86_64_corpus` oracle gate
+//! demanded `cfg!(target_arch = "x86_64")`. Since 2026-09-27 that gate runs
+//! through Rosetta 2 where the driver probe proves it works, but this audit
+//! stays independent of any executor. So instead of running x86, we verify the x86 fcmp
 //! CC-MAPPING LOGIC as a pure integer function:
 //!   * native == JIT: the mapping table + UCOMISD flag model + SETcc evaluator
 //!     + the SETcc/AND-SETNP/OR-SETP composition are transcribed VERBATIM from
@@ -99,6 +99,7 @@ fn jit_module(text: &str, what: &str) -> trust_cg_codegen::jit::ExecutableBuffer
         .unwrap_or_else(|e| panic!("MIR-emitted `{what}` trust-ir text must parse: {e:?}"));
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -632,4 +633,13 @@ fn x86_fcmp_aarch64_bug_is_x86_clean() {
             fcc_name(tag)
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

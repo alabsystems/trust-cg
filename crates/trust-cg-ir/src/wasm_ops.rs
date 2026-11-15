@@ -107,6 +107,18 @@ pub enum WasmOpcode {
     /// `i32.popcnt` (0x69) / `i64.popcnt` (0x7b) — population count.
     I32Popcnt,
     I64Popcnt,
+    /// `i32.clz` (0x67) / `i64.clz` (0x79) — count leading zeros.
+    I32Clz,
+    I64Clz,
+    /// `i32.ctz` (0x68) / `i64.ctz` (0x7a) — count trailing zeros.
+    I32Ctz,
+    I64Ctz,
+    /// `i32.rotl` (0x77) / `i64.rotl` (0x89) — rotate left, amount mod N.
+    I32Rotl,
+    I64Rotl,
+    /// `i32.rotr` (0x78) / `i64.rotr` (0x8a) — rotate right, amount mod N.
+    I32Rotr,
+    I64Rotr,
 
     // =====================================================================
     // Integer comparisons (operand i32 / i64; result i32 0/1) — RECONSTRUCTABLE
@@ -141,6 +153,9 @@ pub enum WasmOpcode {
     /// `i32.ge_u` (0x4f) / `i64.ge_u` (0x5a).
     I32GeU,
     I64GeU,
+    /// `i32.eqz` (0x45) / `i64.eqz` (0x50) — test for zero.
+    I32Eqz,
+    I64Eqz,
 
     // =====================================================================
     // Floating-point arithmetic (f32 / f64) — RECONSTRUCTABLE value ops
@@ -163,6 +178,10 @@ pub enum WasmOpcode {
     /// `f32.max` (0x97) / `f64.max` (0xa5).
     F32Max,
     F64Max,
+    /// `f32.copysign` (0x98) / `f64.copysign` (0xa6) — the first operand's
+    /// magnitude with the second operand's sign.
+    F32Copysign,
+    F64Copysign,
 
     // =====================================================================
     // Floating-point comparisons (operand f32 / f64; result i32 0/1) — RECON
@@ -261,7 +280,8 @@ pub enum WasmOpcode {
     /// Unlike the integer constants these immediates are NOT LEB128: the spec
     /// fixes them at 4 and 8 little-endian bytes of the value's bit pattern, so
     /// the signed-LEB decoder that credits `i32.const`/`i64.const` does not
-    /// reach them (see `coverage_gate::wasm_deferred_value_op_reason`).
+    /// reach them; their credit is the independent float-payload decoder,
+    /// `wasm_encoding_proofs::float_const_immediate_discharges_valid`.
     F32Const,
     F64Const,
 
@@ -290,6 +310,11 @@ pub enum WasmOpcode {
     I32Store,
     /// `i64.store` (0x37).
     I64Store,
+    /// `memory.copy` (0xfc 10) / `memory.fill` (0xfc 11) — bulk memory. They
+    /// carry the 0xfc prefix byte; [`WasmOpcode::bulk_memory_sub_opcode`] is
+    /// the sub-index.
+    MemoryCopy,
+    MemoryFill,
 
     // =====================================================================
     // Structured control flow — STRUCTURAL (relooper / CFG family)
@@ -318,6 +343,8 @@ pub enum WasmOpcode {
     Return,
     /// `drop` (0x1a).
     Drop,
+    /// `select` (0x1b) — one of two operands, chosen by an i32 condition.
+    Select,
 
     // =====================================================================
     // Calls — STRUCTURAL (call-ABI family)
@@ -390,6 +417,14 @@ impl WasmOpcode {
             I64ShrU => 0x88,
             I32Popcnt => 0x69,
             I64Popcnt => 0x7b,
+            I32Clz => 0x67,
+            I64Clz => 0x79,
+            I32Ctz => 0x68,
+            I64Ctz => 0x7a,
+            I32Rotl => 0x77,
+            I64Rotl => 0x89,
+            I32Rotr => 0x78,
+            I64Rotr => 0x8a,
             // Integer comparisons
             I32Eq => 0x46,
             I64Eq => 0x51,
@@ -411,6 +446,8 @@ impl WasmOpcode {
             I64GeS => 0x59,
             I32GeU => 0x4f,
             I64GeU => 0x5a,
+            I32Eqz => 0x45,
+            I64Eqz => 0x50,
             // FP arithmetic
             F32Add => 0x92,
             F64Add => 0xa0,
@@ -424,6 +461,8 @@ impl WasmOpcode {
             F64Min => 0xa4,
             F32Max => 0x97,
             F64Max => 0xa5,
+            F32Copysign => 0x98,
+            F64Copysign => 0xa6,
             // FP comparisons
             F32Eq => 0x5b,
             F64Eq => 0x61,
@@ -487,6 +526,8 @@ impl WasmOpcode {
             I64Load => 0x29,
             I32Store => 0x36,
             I64Store => 0x37,
+            // 0xfc-prefixed bulk memory: PREFIX byte.
+            MemoryCopy | MemoryFill => 0xfc,
             // Control flow
             Unreachable => 0x00,
             Nop => 0x01,
@@ -500,6 +541,7 @@ impl WasmOpcode {
             BrTable => 0x0e,
             Return => 0x0f,
             Drop => 0x1a,
+            Select => 0x1b,
             // Calls
             Call => 0x10,
             CallIndirect => 0x11,
@@ -530,6 +572,17 @@ impl WasmOpcode {
             I64TruncSatF64U => 7,
             _ => return None,
         })
+    }
+
+    /// The 0xfc-prefix SUB-INDEX of a bulk-memory instruction: 10 for
+    /// `memory.copy`, 11 for `memory.fill`. `None` for every other opcode.
+    pub fn bulk_memory_sub_opcode(self) -> Option<u32> {
+        use WasmOpcode::*;
+        match self {
+            MemoryCopy => Some(10),
+            MemoryFill => Some(11),
+            _ => None,
+        }
     }
 
     /// The 0xfd-prefix SUB-OPCODE (the LEB128 immediate following the 0xfd SIMD
@@ -614,6 +667,14 @@ mod tests {
             I64ShrU,
             I32Popcnt,
             I64Popcnt,
+            I32Clz,
+            I64Clz,
+            I32Ctz,
+            I64Ctz,
+            I32Rotl,
+            I64Rotl,
+            I32Rotr,
+            I64Rotr,
             I32Eq,
             I64Eq,
             I32Ne,
@@ -634,6 +695,8 @@ mod tests {
             I64GeS,
             I32GeU,
             I64GeU,
+            I32Eqz,
+            I64Eqz,
             F32Add,
             F64Add,
             F32Sub,
@@ -646,6 +709,8 @@ mod tests {
             F64Min,
             F32Max,
             F64Max,
+            F32Copysign,
+            F64Copysign,
             F32Eq,
             F64Eq,
             F32Ne,
@@ -708,6 +773,8 @@ mod tests {
             I64Load,
             I32Store,
             I64Store,
+            MemoryCopy,
+            MemoryFill,
             Unreachable,
             Nop,
             Block,
@@ -720,6 +787,7 @@ mod tests {
             BrTable,
             Return,
             Drop,
+            Select,
             Call,
             CallIndirect,
             V128Load,
@@ -734,7 +802,7 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(all_opcodes().len(), 143);
+        assert_eq!(all_opcodes().len(), 158);
     }
 
     #[test]

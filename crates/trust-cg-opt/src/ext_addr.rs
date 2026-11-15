@@ -82,7 +82,7 @@
 //! unfaithful-load debt (same reason string as `LdrRO`) — NOT proof-credited.
 //! The narrow forms are the new opcodes this pass introduces.
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachOperand, PassId, ProvenanceMap, RegClass,
@@ -96,11 +96,12 @@ use crate::effects::{
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
-/// Packed extend/shift operand values (`(option << 1) | S`), matching the
-/// `LdrRO`/`StrRO` encoder contract in trust-cg-codegen.
-const OPTION_UXTW: i64 = 0b010;
-const OPTION_LSL: i64 = 0b011;
-const OPTION_SXTW: i64 = 0b110;
+/// The `option` field of the packed extend/shift operand (`(option << 1) |
+/// S`), matching the `LdrRO`/`StrRO` encoder contract in trust-cg-codegen.
+/// `LSL` reads the whole X index register; `UXTW`/`SXTW` read its low word.
+pub(crate) const OPTION_UXTW: i64 = 0b010;
+pub(crate) const OPTION_LSL: i64 = 0b011;
+pub(crate) const OPTION_SXTW: i64 = 0b110;
 
 fn pack_extend(option: i64, shifted: bool) -> i64 {
     (option << 1) | (shifted as i64)
@@ -115,7 +116,7 @@ impl MachinePass for ExtRegAddrFold {
     }
 
     fn run(&mut self, func: &mut MachFunction) -> bool {
-        run_ext_addr_fold(func, None)
+        run_ext_addr_fold(func, &mut AnalysisCache::new(), None)
     }
 
     fn run_with_provenance(
@@ -123,16 +124,16 @@ impl MachinePass for ExtRegAddrFold {
         func: &mut MachFunction,
         provenance: &mut ProvenanceMap,
     ) -> bool {
-        run_ext_addr_fold(func, Some(provenance))
+        run_ext_addr_fold(func, &mut AnalysisCache::new(), Some(provenance))
     }
 
     fn run_with_analyses_and_provenance(
         &mut self,
         func: &mut MachFunction,
-        _analyses: &mut AnalysisCache,
+        analyses: &mut AnalysisCache,
         provenance: &mut ProvenanceMap,
     ) -> bool {
-        self.run_with_provenance(func, provenance)
+        run_ext_addr_fold(func, analyses, Some(provenance))
     }
 }
 
@@ -161,7 +162,11 @@ struct FoldPlan {
     dead_chain: Vec<InstId>,
 }
 
-fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut ProvenanceMap>) -> bool {
+fn run_ext_addr_fold(
+    func: &mut MachFunction,
+    analyses: &mut AnalysisCache,
+    mut provenance: Option<&mut ProvenanceMap>,
+) -> bool {
     let use_counts = count_vreg_uses(func);
     let def_counts = count_vreg_defs(func);
     let movz_scales = collect_single_def_movz_scales(func, &def_counts);
@@ -172,97 +177,22 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
 
     let add_sites = collect_single_def_add_sites(func, &def_counts);
 
-    // Dominator tree + loop analysis for the cross-block SEXT-SCALE fold,
-    // computed LAZILY together (only when the first cross-block Madd candidate
-    // appears) so a function with no such candidate pays nothing.
-    let mut domtree: Option<DomTree> = None;
-    let mut loops: Option<LoopAnalysis> = None;
+    // Recognition only reads the function. Bind both graph analyses lazily
+    // to this snapshot, using the driver's cache when one was supplied. The
+    // freshness check runs once, not once per candidate; functions needing
+    // neither loop admission nor cross-block dominance never initialize it.
+    let cfg_analyses = std::cell::LazyCell::new(|| analyses.domtree_and_loops(func));
 
-    // Kill switch (fail-open to disabled): the cross-block read-modify-write
-    // STORE fold — Fold (A). Set `TCG_NO_EXT_ADDR_XBLOCK_STORE` to keep the
-    // store's `Madd`/`Str` chain unfolded (leaving only the same-block folds).
-    // Fold (A) is OPT-IN (default-off): it is perf-neutral overall and slightly
-    // costs memory-bound loops (nsieve-bits) by adding AGU work off the critical
-    // path. Enable with TCG_EXT_ADDR_XBLOCK_STORE=1 (do-no-harm default).
+    // Cross-block read-modify-write stores and narrow stores remain opt-in.
+    // Their profitability needs current, provenance-stamped corpus measurements;
+    // static instruction deletion is not sufficient evidence of a speedup.
     let xblock_store_enabled = crate::env_lock::var_os("TCG_EXT_ADDR_XBLOCK_STORE").is_some();
-
-    // Switch (fail-open to DISABLED) for the NARROW-STORE fold: byte and
-    // halfword stores into `StrbRO`/`StrhRO`. OPT-IN — enable with
-    // `TCG_EXT_ADDR_NARROW_STORE=1`. Default-off is a do-no-harm decision backed
-    // by the measurement below, and it exactly mirrors Fold (A) above, which is
-    // default-off for the same reason on the wide store.
-    //
-    // WHY IT EXISTS — the STORE-ADDRESS FOLD ASYMMETRY. This pass folded
-    // `LdrbRI`/`LdrhRI` into `LdrbRO`/`LdrhRO` but had no store counterpart,
-    // because the IR had no narrow register-offset STORE opcode at all. The
-    // asymmetry is NOT an operand-role or def/use-position bug in the plan
-    // machinery (`StrRI` -> `StrRO` has always ridden the same helpers, so the
-    // store role was already correct); it was a missing opcode, so narrow
-    // stores fell out of the opcode match on the pass's very first gate.
-    //
-    // The visible cost is a copy loop that spends 4 instructions per element
-    // where 2 suffice — the load side folds `[reg, reg]`, the store side keeps
-    // `add x0, xB, xI ; strb w1, [x0]`:
-    //
-    // ```text
-    // before  ldrb w1, [x26, x2] ; add x0, x16, x2 ; strb w1, [x0]
-    // after   ldrb w1, [x26, x2] ; strb w1, [x16, x2]
-    // ```
-    //
-    // SITE COUNT, from an env-gated trace at the fire point (R4 — NOT from
-    // counting the shape in finished objects): 11 `StrbRI` sites reach the pass
-    // with a zero offset, a private single-def `Gpr64` address, and an available
-    // single-def `Add` producer — passing every gate the LOAD path applies — and
-    // were declined by the opcode match alone: huffbench/compdecomp x6,
-    // ReedSolomon rsenc_204 x2 / main x2 / rsdec_204 x1. That is exactly the
-    // count of unfolded `add`+`strb` pairs in the two objects (6 and 5), and
-    // clang emits ZERO of them (it emits 6 and 3 `strb [reg, reg]` instead).
-    //
-    // PROFITABILITY — WHY THIS IS OFF BY DEFAULT. The static asymmetry is real
-    // (clang emits `strb [reg, reg]` at every one of these sites and trust-cg
-    // emitted `add` + `strb [reg]`), but closing it did not pay anywhere:
-    //
-    // * Folding EVERY narrow store, in-loop ones included, made the corpus
-    //   slower. huffbench (6 sites, all in hot loops) ran +1.23%/+0.82% slower
-    //   at the shipping default and +1.57%/+1.84% slower under
-    //   `TCG_NO_LOOP_HEAD_ALIGN=1` — min and 20%-trimmed median agreeing in sign
-    //   in BOTH alignment arms, so it is the transform, not padding. That
-    //   reproduces the cost already documented for the wide in-loop `StrRO` in
-    //   `try_madd_general_plan`: register-offset addressing on a STORE adds AGU
-    //   work off the critical path, once per iteration.
-    //   (sieve and richards_benchmark FLIPPED SIGN between the two alignment
-    //   arms — how a repadding artifact presents — so their deltas are not
-    //   attributable to this fold in either direction.)
-    // * Adding the in-loop gate below cut the corpus from 20 folded sites to 1
-    //   (an acyclic store in huffbench). huffbench still measured +1.26%/+0.57%
-    //   and +1.35%/+1.85% slower; a single removed `add` at an acyclic site
-    //   cannot cost 1%, so that residual is object-layout shift (the object
-    //   shrank 32 bytes) — but there is no measurable WIN to weigh against it.
-    //
-    // So: no configuration of this fold is a demonstrated improvement, and the
-    // one program it changes measures slower in every arm. The opcodes,
-    // encoder, verifier coverage and spill-width decomposition all stay (they
-    // are correctness infrastructure, pinned by unit tests and an executable
-    // differential witness); only the FIRING is default-off. With the switch
-    // unset the compiler is byte-identical to the pre-lever build across the
-    // whole 63-object corpus.
     let narrow_store_enabled = crate::env_lock::var_os("TCG_EXT_ADDR_NARROW_STORE").is_some();
 
-    // Kill switch (fail-open to enabled) for the SEXT-SCALE lever: the
-    // cross-block-capable single-def Madd fold. A scaled-index `Madd` address
-    // (`stack[s]` in Towers' Push/Pop/Move) is computed once and reused for a
-    // load AND a store in a LATER block; the same-block position helpers cannot
-    // see the cross-block uses, so the all-or-nothing grouping drops the whole
-    // (partially foldable) chain and the surviving `Madd` later strength-reduces
-    // to the standalone `sxtw + add …, lsl #s` clang folds into the addressing
-    // mode. When `base` and the index are WHOLE-FUNCTION SINGLE-DEF their values
-    // are invariant everywhere their def dominates — and since the mem op uses
-    // the `Madd` result, the `Madd` uses base/index, and a single def dominates
-    // ALL its uses, that includes every use site of the address — so
-    // `[base, index, sxtw/uxtw/lsl #s]` computes the identical effective address
-    // at each use with no dominator analysis. Set `TCG_NO_EXT_ADDR_SEXT_SCALE`
-    // to keep the chain unfolded (reproduces the pre-lever behavior).
-    let sext_scale_enabled = std::env::var_os("TCG_NO_EXT_ADDR_SEXT_SCALE").is_none();
+    // The cross-block SEXT-SCALE fallback is enabled unless explicitly disabled.
+    // Whole-function single-def base/index checks and dominance establish
+    // availability at the memory operation; single-def membership alone does
+    // not prove that an executable path passes through the definition.
 
     for block_id in func.block_order.clone() {
         let block_insts = func.block(block_id).insts.clone();
@@ -291,27 +221,13 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
                 AArch64Opcode::StrhRI if narrow_store_enabled => (AArch64Opcode::StrhRO, Some(2)),
                 _ => continue,
             };
-            // A narrow STORE inside a loop is DECLINED, for exactly the reason
-            // `try_madd_general_plan` already declines an in-loop `StrRO`:
-            // folding a store into register-offset addressing in a (typically
-            // memory-bound) loop adds AGU work off the critical path. That was
-            // measured before for the wide store (which is why Fold (A) is
-            // default-off) and re-measured here for the narrow store — folding
-            // in-loop byte stores costs huffbench +0.8%/+1.8% (min/trimmed
-            // median, both alignment arms agreeing in sign). A store at an
-            // ACYCLIC site still folds: deleting its address chain is a pure
-            // win with no per-iteration AGU cost. LOADS are always folded —
-            // their address IS the critical path, so RO addressing only helps,
-            // which is the real asymmetry between the two sides.
-            if matches!(new_opcode, AArch64Opcode::StrbRO | AArch64Opcode::StrhRO) {
-                if domtree.is_none() {
-                    let dt = DomTree::compute(func);
-                    loops = Some(LoopAnalysis::compute(func, &dt));
-                    domtree = Some(dt);
-                }
-                if loops.as_ref().unwrap().is_in_loop(block_id) {
-                    continue;
-                }
+            // Narrow stores inside loops remain outside this opt-in transform.
+            // Loads and acyclic stores still need the structural admission
+            // checks below; admission is not a universal profitability claim.
+            if matches!(new_opcode, AArch64Opcode::StrbRO | AArch64Opcode::StrhRO)
+                && cfg_analyses.1.is_in_loop(block_id)
+            {
+                continue;
             }
             if inst.operands.len() != 3 {
                 continue;
@@ -431,12 +347,8 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
                 // mem op, and it picks the SAME variant (Sxtw/Uxtw vs LSL) the
                 // same-block path would, so every plan sharing an address stays
                 // consistent.
-                if plan.is_none() && sext_scale_enabled {
-                    if domtree.is_none() {
-                        let dt = DomTree::compute(func);
-                        loops = Some(LoopAnalysis::compute(func, &dt));
-                        domtree = Some(dt);
-                    }
+                if plan.is_none() {
+                    let (domtree, loops) = *cfg_analyses;
                     plan = try_madd_general_plan(
                         func,
                         block_id,
@@ -444,8 +356,8 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
                         new_opcode,
                         access_size,
                         madd_site,
-                        domtree.as_ref().unwrap(),
-                        loops.as_ref().unwrap(),
+                        domtree,
+                        loops,
                         &movz_scales,
                         &def_counts,
                         &use_counts,
@@ -561,6 +473,9 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
         }
     }
 
+    // The immutable recognition snapshot (`cfg_analyses`) holds only
+    // references into `func`; its last use is above, so its borrow has ended
+    // before the rewrites below.
     let mut changed = false;
 
     if !plans.is_empty() {
@@ -577,7 +492,7 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
         //
         // The single-def guard bounds `plan_count <= use_count`; the filter keeps
         // the deterministic block/position plan order (no map iteration).
-        let mut plan_count: HashMap<VReg, usize> = HashMap::new();
+        let mut plan_count: HashMap<VReg, usize> = HashMap::default();
         for plan in &plans {
             *plan_count.entry(plan.addr_dst).or_insert(0) += 1;
         }
@@ -648,15 +563,12 @@ fn run_ext_addr_fold(func: &mut MachFunction, mut provenance: Option<&mut Proven
     // Second-b phase (Fold C): the SAME identity zero-extend, but for the case
     // where the narrow-load result feeds OTHER consumers besides the extend (so
     // the load cannot be redirected). Every use of the extend's destination is
-    // rewritten to the load result and the extend is deleted. Kill switch:
-    // `TCG_NO_EXT_ADDR_ZEXT_IDENTITY`.
-    if std::env::var_os("TCG_NO_EXT_ADDR_ZEXT_IDENTITY").is_none()
-        && fold_identity_narrow_zext(
-            func,
-            provenance.as_deref_mut(),
-            (!changed).then_some(&def_counts),
-        )
-    {
+    // rewritten to the load result and the extend is deleted.
+    if fold_identity_narrow_zext(
+        func,
+        provenance.as_deref_mut(),
+        (!changed).then_some(&def_counts),
+    ) {
         changed = true;
     }
 
@@ -1104,6 +1016,10 @@ fn try_cross_block_store_plan(
     })
 }
 
+/// A function's (def, use) counts per virtual register, shared by a caller
+/// whose instruction stream has not changed since it built them.
+type DefUseCounts<'a> = (&'a HashMap<VReg, u32>, &'a HashMap<VReg, u32>);
+
 /// A byte load (`LdrbRI`/`LdrbRO`) zero-extends its result into all 32 bits of
 /// the W transfer register, so a subsequent `Uxtb` of that result is the
 /// identity; a halfword load (`LdrhRI`/`LdrhRO`) likewise makes a `Uxth`
@@ -1115,7 +1031,7 @@ fn try_cross_block_store_plan(
 fn fold_redundant_narrow_zext(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
-    shared_counts: Option<(&HashMap<VReg, u32>, &HashMap<VReg, u32>)>,
+    shared_counts: Option<DefUseCounts<'_>>,
 ) -> bool {
     // `shared_counts` are the caller's (def, use) counts, valid because nothing
     // has mutated the function since they were built; otherwise recount.
@@ -1134,7 +1050,7 @@ fn fold_redundant_narrow_zext(
         load_id: InstId,
         clears_bits_above: u32, // 8 for byte loads, 16 for halfword loads
     }
-    let mut load_defs: HashMap<VReg, LoadDef> = HashMap::new();
+    let mut load_defs: HashMap<VReg, LoadDef> = HashMap::default();
     for block_id in &func.block_order {
         for &inst_id in &func.block(*block_id).insts {
             let inst = func.inst(inst_id);
@@ -1250,7 +1166,7 @@ fn fold_redundant_narrow_zext(
 fn fold_narrow_load_sext(
     func: &mut MachFunction,
     mut provenance: Option<&mut ProvenanceMap>,
-    shared_counts: Option<(&HashMap<VReg, u32>, &HashMap<VReg, u32>)>,
+    shared_counts: Option<DefUseCounts<'_>>,
 ) -> bool {
     let owned;
     let (def_counts, use_counts): (&HashMap<VReg, u32>, &HashMap<VReg, u32>) = match shared_counts {
@@ -1268,7 +1184,7 @@ fn fold_narrow_load_sext(
         signed_opcode: AArch64Opcode,
         width: i64,
     }
-    let mut load_defs: HashMap<VReg, LoadDef> = HashMap::new();
+    let mut load_defs: HashMap<VReg, LoadDef> = HashMap::default();
     for block_id in &func.block_order {
         for &inst_id in &func.block(*block_id).insts {
             let inst = func.inst(inst_id);
@@ -1389,8 +1305,7 @@ fn fold_narrow_load_sext(
 /// unless: the extend's destination is a single def (this extend), it shares the
 /// load result's register class (both `Gpr32`, so the substitution is
 /// well-typed), and the load clears every bit at/above the extend width. A
-/// `Sxtb`/`Sxth` is untouched (sign extension is a genuine value change). Kill
-/// switch: `TCG_NO_EXT_ADDR_ZEXT_IDENTITY`.
+/// `Sxtb`/`Sxth` is untouched (sign extension is a genuine value change).
 fn fold_identity_narrow_zext(
     func: &mut MachFunction,
     provenance: Option<&mut ProvenanceMap>,
@@ -1412,7 +1327,7 @@ fn fold_identity_narrow_zext(
         load_id: InstId,
         clears_bits_above: u32,
     }
-    let mut load_defs: HashMap<VReg, LoadDef> = HashMap::new();
+    let mut load_defs: HashMap<VReg, LoadDef> = HashMap::default();
     for block_id in &func.block_order {
         for &inst_id in &func.block(*block_id).insts {
             let inst = func.inst(inst_id);
@@ -1554,7 +1469,7 @@ fn defines_in_range(
 }
 
 fn count_vreg_uses(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
@@ -1570,7 +1485,7 @@ fn count_vreg_uses(func: &MachFunction) -> HashMap<VReg, u32> {
 }
 
 fn count_vreg_defs(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
@@ -1593,7 +1508,7 @@ fn collect_single_def_movz_scales(
     func: &MachFunction,
     def_counts: &HashMap<VReg, u32>,
 ) -> HashMap<VReg, i64> {
-    let mut scales: HashMap<VReg, i64> = HashMap::new();
+    let mut scales: HashMap<VReg, i64> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
@@ -1617,7 +1532,7 @@ fn collect_single_def_ext_sites(
     func: &MachFunction,
     def_counts: &HashMap<VReg, u32>,
 ) -> HashMap<VReg, InstSite> {
-    let mut sites: HashMap<VReg, InstSite> = HashMap::new();
+    let mut sites: HashMap<VReg, InstSite> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for (position, &inst_id) in block.insts.iter().enumerate() {
@@ -1646,7 +1561,7 @@ fn collect_single_def_madd_sites(
     func: &MachFunction,
     def_counts: &HashMap<VReg, u32>,
 ) -> HashMap<VReg, InstSite> {
-    let mut sites: HashMap<VReg, InstSite> = HashMap::new();
+    let mut sites: HashMap<VReg, InstSite> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for (position, &inst_id) in block.insts.iter().enumerate() {
@@ -1679,7 +1594,7 @@ fn collect_single_def_add_sites(
     func: &MachFunction,
     def_counts: &HashMap<VReg, u32>,
 ) -> HashMap<VReg, InstSite> {
-    let mut sites: HashMap<VReg, InstSite> = HashMap::new();
+    let mut sites: HashMap<VReg, InstSite> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for (position, &inst_id) in block.insts.iter().enumerate() {

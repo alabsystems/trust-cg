@@ -40,8 +40,6 @@
 //! The pass also scans for multi-instruction patterns (e.g., ADDS followed
 //! by TrapOverflow) where the proof annotation is on the first instruction
 //! of the sequence.
-//!
-//! Reference: designs/2026-04-12-aarch64-backend.md, "Proof-Enabled Optimizations"
 
 use std::collections::{HashMap, HashSet};
 
@@ -479,8 +477,8 @@ impl ProofOptimization {
     /// and live-carrier binding.
     ///
     /// Unlike [`ProofOptimization::enable_kernel_gate`], this API accepts no public evidence table
-    /// or obligation map.  The lattice feature enables the replay algorithm, while possession of
-    /// this reconstructed object carries the per-use authority.
+    /// or obligation map. The feature alone grants no authority: the public constructor stays
+    /// unavailable until trust-cg can replay the exact RefinementType premise (OD-27).
     pub fn enable_lattice_kernel_gate(
         &mut self,
         authority: trust_cg_lower::lattice_guard::LatticeGuardReplayAuthority,
@@ -745,10 +743,9 @@ impl ProofOptimization {
         // checked-to-unchecked rewrites, alias refinement, CSE, pair combining, or guard removal.
         // In-crate unit tests retain the structural model; downstream/production builds stay inert
         // until an exact validator-issued replay capability replaces this policy seam.
-        // ... with ONE exception, added by WP-2: a decidable-lattice replay capability IS exact
-        // obligation-bound evidence (see `trust_cg_lower::lattice_guard`). When only that authority
-        // is held, the pass runs in a RESTRICTED scope — see `lattice_bounds_only` — so the arms
-        // that still have no exact evidence behind them stay exactly as inert as they are today.
+        // The lattice lane also requires a replayed RefinementType premise. Its public authority
+        // stays unavailable until a rechecker exists. If it becomes available, its scope remains
+        // restricted to the exact bounds carriers; no other proof-consuming arm inherits it.
         let full_authority =
             trust_cg_lower::guard_evidence::validator_guard_replay_authority_available();
         let lattice_authority = self
@@ -2558,6 +2555,10 @@ fn hash_operand(h: &mut StableHasher, operand: &MachOperand) {
         }
         MachOperand::Symbol(symbol) => {
             h.write_u8(9);
+            h.write_str(symbol);
+        }
+        MachOperand::ExactModuleSymbol(symbol) => {
+            h.write_u8(12);
             h.write_str(symbol);
         }
         MachOperand::JumpTableIndex(index) => {

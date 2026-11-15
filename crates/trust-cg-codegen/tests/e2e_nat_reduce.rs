@@ -30,6 +30,11 @@
 #![allow(non_snake_case)]
 #![allow(unused_imports)]
 
+// Host-target loading of the frozen Clean fixtures (rewrites the AArch64
+// `target` header line to this host; see the module for the evidence).
+#[path = "common/kernel_fixture.rs"]
+mod kernel_fixture;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use trust_cg_codegen::Target;
@@ -301,7 +306,7 @@ fn classify_nat_extern(name: &str) -> Option<NatExtern> {
 }
 
 fn nat_extern_signature(kind: NatExtern) -> (Vec<trust_ir::Ty>, Vec<trust_ir::Ty>) {
-    use trust_ir::Ty::{Bool, Ptr, U32, U64};
+    use trust_ir::TyG::{Bool, Ptr, U32, U64};
 
     match kind {
         NatExtern::Alloc => (vec![U64, U64], vec![Ptr]),
@@ -504,11 +509,14 @@ fn nat_extern_classifier_rejects_wrong_monomorphized_types() {
 #[test]
 fn nat_extern_bindings_reject_signature_drift() {
     let mut module = parse_validate(ARITH_TIR, "arith extern signature mutation");
-    let wrong_ty = module.add_func_type(trust_ir::FuncTy {
-        params: vec![trust_ir::Ty::Ptr, trust_ir::Ty::U64],
-        returns: vec![trust_ir::Ty::U64],
-        is_vararg: false,
-    });
+    let wrong_ty = module
+        .add_func_type(trust_ir::FuncTy {
+            params: vec![trust_ir::Ty::Ptr, trust_ir::Ty::U64],
+            returns: vec![trust_ir::Ty::U64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let function = module
         .functions
         .iter_mut()
@@ -566,7 +574,8 @@ fn nat_extern_bindings_reject_unknown_and_duplicate_semantic_symbols() {
 }
 
 fn parse_validate(text: &str, what: &str) -> trust_ir::Module {
-    let m = trust_ir::parser::parse_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
+    let m =
+        kernel_fixture::parse_host_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
     let errs = trust_ir_build::validate_module(&m);
     assert!(errs.is_empty(), "{what} validate: {errs:?}");
     m
@@ -584,8 +593,9 @@ fn jit(text: &str, what: &str) -> trust_cg_codegen::jit::ExecutableBuffer {
             );
         }
     }
-    let config = CompilerConfig::jit_fast(Target::Aarch64);
+    let config = CompilerConfig::jit_fast(kernel_fixture::host_jit_target());
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &ext)
         .unwrap_or_else(|e| panic!("JIT compile {what} failed: {e:?}"))
         .buffer
@@ -1225,8 +1235,9 @@ fn jit_with_externs(
             );
         }
     }
-    let config = CompilerConfig::jit_fast(Target::Aarch64);
+    let config = CompilerConfig::jit_fast(kernel_fixture::host_jit_target());
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, ext)
         .unwrap_or_else(|e| panic!("JIT {what}: {e:?}"))
         .buffer
@@ -1305,4 +1316,13 @@ fn nat_armed_golden_and_shim_corruption_controls() {
             jt.lo
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

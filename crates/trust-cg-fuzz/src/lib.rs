@@ -3,7 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Differential fuzzing infrastructure for Trust Codegen. Three drivers live in
+// Differential fuzzing infrastructure for Trust Codegen. Four drivers live in
 // `src/bin/*.rs`; shared helpers (PRNG, trust_ir generation, JSON run log
 // schema) live here.
 //
@@ -13,6 +13,26 @@
 pub mod prng;
 pub mod runlog;
 pub mod trust_ir_gen;
+
+// Seeded multi-block programs (diamonds, counted loops, calls, compares
+// reused by selects) for the JIT differential lane.
+pub mod control_gen;
+
+/// The trust-ir codegen license every driver of this harness compiles its
+/// GENERATED modules under (roadmap WS7.5, decision gate DG-73).
+///
+/// A generated module carries no `body_gate`, and trust-cg's default policy
+/// now REFUSES a claim-less body, which would make every differential
+/// vacuous (each input refused at the license, before the lowering it exists
+/// to exercise). The harness compiles under the NAMED, COUNTED exception
+/// `FuzzHarness` (census: trust-cg-lower
+/// `the_unlicensed_permit_exceptions_are_named_and_counted`); it is test
+/// infrastructure, not a codegen service.
+#[must_use]
+pub fn fuzz_license() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed_permit_exception(trust_cg_lower::UnlicensedPermitException::FuzzHarness)
+}
 
 // P2: rustc/LLVM-oracle bridge differential harness CORE (outcome model, diff
 // engine, ddmin reducer, seed corpus, BridgeCompiler trait). Pure std — the

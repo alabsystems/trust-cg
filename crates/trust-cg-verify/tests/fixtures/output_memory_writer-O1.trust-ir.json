@@ -1,0 +1,893 @@
+{
+  "name": "output_memory_writer",
+  "functions": [
+    {
+      "id": 0,
+      "name": "output_memory_writer",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              1,
+              {
+                "RefMut": {
+                  "Tuple": [
+                    "U64",
+                    "U64",
+                    "U64",
+                    "U64",
+                    "U64"
+                  ]
+                }
+              }
+            ],
+            [
+              2,
+              "U64"
+            ],
+            [
+              3,
+              "U64"
+            ],
+            [
+              4,
+              "U64"
+            ],
+            [
+              5,
+              "U64"
+            ],
+            [
+              6,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "Ptr",
+                  "operand": 1
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToInt",
+                  "src_ty": "Ptr",
+                  "dst_ty": "I64",
+                  "operand": 8
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "I64",
+                  "operand": 7
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 8
+                  }
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": "I64",
+                  "lhs": 10,
+                  "rhs": 11
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 9,
+                  "rhs": 12
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "IntToPtr",
+                  "src_ty": "I64",
+                  "dst_ty": "Ptr",
+                  "operand": 13
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "U64",
+                  "operand": 2
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 14,
+                  "value": 15,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "Ptr",
+                  "operand": 1
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToInt",
+                  "src_ty": "Ptr",
+                  "dst_ty": "I64",
+                  "operand": 17
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "I64",
+                  "operand": 16
+                }
+              },
+              "results": [
+                19
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 8
+                  }
+                }
+              },
+              "results": [
+                20
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": "I64",
+                  "lhs": 19,
+                  "rhs": 20
+                }
+              },
+              "results": [
+                21
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 18,
+                  "rhs": 21
+                }
+              },
+              "results": [
+                22
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "IntToPtr",
+                  "src_ty": "I64",
+                  "dst_ty": "Ptr",
+                  "operand": 22
+                }
+              },
+              "results": [
+                23
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "U64",
+                  "operand": 3
+                }
+              },
+              "results": [
+                24
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 23,
+                  "value": 24,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 2
+                  }
+                }
+              },
+              "results": [
+                25
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "Ptr",
+                  "operand": 1
+                }
+              },
+              "results": [
+                26
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToInt",
+                  "src_ty": "Ptr",
+                  "dst_ty": "I64",
+                  "operand": 26
+                }
+              },
+              "results": [
+                27
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "I64",
+                  "operand": 25
+                }
+              },
+              "results": [
+                28
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 8
+                  }
+                }
+              },
+              "results": [
+                29
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": "I64",
+                  "lhs": 28,
+                  "rhs": 29
+                }
+              },
+              "results": [
+                30
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 27,
+                  "rhs": 30
+                }
+              },
+              "results": [
+                31
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "IntToPtr",
+                  "src_ty": "I64",
+                  "dst_ty": "Ptr",
+                  "operand": 31
+                }
+              },
+              "results": [
+                32
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "U64",
+                  "operand": 4
+                }
+              },
+              "results": [
+                33
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 32,
+                  "value": 33,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 3
+                  }
+                }
+              },
+              "results": [
+                34
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "Ptr",
+                  "operand": 1
+                }
+              },
+              "results": [
+                35
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToInt",
+                  "src_ty": "Ptr",
+                  "dst_ty": "I64",
+                  "operand": 35
+                }
+              },
+              "results": [
+                36
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "I64",
+                  "operand": 34
+                }
+              },
+              "results": [
+                37
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 8
+                  }
+                }
+              },
+              "results": [
+                38
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": "I64",
+                  "lhs": 37,
+                  "rhs": 38
+                }
+              },
+              "results": [
+                39
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 36,
+                  "rhs": 39
+                }
+              },
+              "results": [
+                40
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "IntToPtr",
+                  "src_ty": "I64",
+                  "dst_ty": "Ptr",
+                  "operand": 40
+                }
+              },
+              "results": [
+                41
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "U64",
+                  "operand": 5
+                }
+              },
+              "results": [
+                42
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 41,
+                  "value": 42,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 4
+                  }
+                }
+              },
+              "results": [
+                43
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "Ptr",
+                  "operand": 1
+                }
+              },
+              "results": [
+                44
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToInt",
+                  "src_ty": "Ptr",
+                  "dst_ty": "I64",
+                  "operand": 44
+                }
+              },
+              "results": [
+                45
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "I64",
+                  "operand": 43
+                }
+              },
+              "results": [
+                46
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 8
+                  }
+                }
+              },
+              "results": [
+                47
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": "I64",
+                  "lhs": 46,
+                  "rhs": 47
+                }
+              },
+              "results": [
+                48
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 45,
+                  "rhs": 48
+                }
+              },
+              "results": [
+                49
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "IntToPtr",
+                  "src_ty": "I64",
+                  "dst_ty": "Ptr",
+                  "operand": 49
+                }
+              },
+              "results": [
+                50
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "U64",
+                  "operand": 6
+                }
+              },
+              "results": [
+                51
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 50,
+                  "value": 51,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "RefMut": {
+            "Tuple": [
+              "U64",
+              "U64",
+              "U64",
+              "U64",
+              "U64"
+            ]
+          }
+        },
+        "U64",
+        "U64",
+        "U64",
+        "U64",
+        "U64"
+      ],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "I8",
+    "I16",
+    "I32",
+    "I64",
+    "I128"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": []
+}

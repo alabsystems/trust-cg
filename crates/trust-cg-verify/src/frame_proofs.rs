@@ -500,11 +500,11 @@ pub fn proof_frame_sp_alignment_8bit() -> ProofObligation {
 // This is the array-theory read-over-write-at-different-index axiom,
 // instantiated for the specific callee-save layout.
 //
-// Encoding (QF_ABV):
-//   mem' = store(mem, offset_a, val_a)
-//   mem'' = store(mem', offset_b, val_b)
-//   Prove: select(mem'', offset_a) == val_a
-//   Precondition: offset_a != offset_b
+// Encoding (QF_BV, explicit McCarthy read-over-write):
+//   after_a = ite(read_addr == offset_a, val_a, mem_default)
+//   after_b = ite(read_addr == offset_b, val_b, after_a)
+//   Prove: after_b == val_a
+//   Preconditions: read_addr == offset_a, offset_a != offset_b
 // ===========================================================================
 
 /// Proof: Callee-save pair slots don't overlap in memory.
@@ -520,36 +520,34 @@ pub fn proof_frame_callee_save_no_overlap() -> ProofObligation {
     let width = 64;
     let val_a = SmtExpr::var("val_a", width);
     let val_b = SmtExpr::var("val_b", width);
+    let mem_default = SmtExpr::var("mem_default", width);
     let offset_a = SmtExpr::var("offset_a", width);
     let offset_b = SmtExpr::var("offset_b", width);
+    let read_addr = SmtExpr::var("read_addr", width);
 
-    // Initial memory.
-    let mem = SmtExpr::const_array(SmtSort::BitVec(width), SmtExpr::bv_const(0, width));
-
-    // Store val_a at offset_a, then val_b at offset_b.
-    let mem1 = SmtExpr::store(mem, offset_a.clone(), val_a.clone());
-    let mem2 = SmtExpr::store(mem1, offset_b, val_b);
-
-    // Read back from offset_a -- should still be val_a.
-    let read_a = SmtExpr::select(mem2, offset_a);
-
-    // Precondition: offsets are different.
-    let oa_pc = SmtExpr::var("offset_a", width);
-    let ob_pc = SmtExpr::var("offset_b", width);
-    let offsets_differ = oa_pc.eq_expr(ob_pc).not_expr();
+    // Expand select(store(store(mem, A, va), B, vb), R) using the two
+    // McCarthy read-over-write cases, latest store first. This is the exact
+    // scalar semantics of the former QF_ABV term, including both alias paths.
+    let reads_a = read_addr.clone().eq_expr(offset_a.clone());
+    let reads_b = read_addr.clone().eq_expr(offset_b.clone());
+    let after_a = SmtExpr::ite(reads_a.clone(), val_a.clone(), mem_default);
+    let after_b = SmtExpr::ite(reads_b, val_b, after_a);
+    let offsets_differ = offset_a.clone().eq_expr(offset_b).not_expr();
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "FrameLayout: callee-save pair slots don't overlap".to_string(),
         trust_ir_expr: val_a,
-        aarch64_expr: read_a,
+        aarch64_expr: after_b,
         inputs: vec![
             ("val_a".to_string(), width),
             ("val_b".to_string(), width),
+            ("mem_default".to_string(), width),
             ("offset_a".to_string(), width),
             ("offset_b".to_string(), width),
+            ("read_addr".to_string(), width),
         ],
-        preconditions: vec![offsets_differ],
+        preconditions: vec![reads_a, offsets_differ],
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::RegisterAllocation),
     }
@@ -758,11 +756,20 @@ pub fn proof_frame_slot_distinct_offsets_8bit() -> ProofObligation {
 pub fn proof_frame_callee_save_restore_identity() -> ProofObligation {
     let width = 64;
     let reg_val = SmtExpr::var("reg_val", width);
-    let offset = SmtExpr::var("offset", width);
+    let mem_default = SmtExpr::var("mem_default", width);
+    let save_addr = SmtExpr::var("save_addr", width);
+    let restore_addr = SmtExpr::var("restore_addr", width);
 
-    let mem = SmtExpr::const_array(SmtSort::BitVec(width), SmtExpr::bv_const(0, width));
-    let saved = SmtExpr::store(mem, offset.clone(), reg_val.clone());
-    let restored = SmtExpr::select(saved, offset);
+    // Exact McCarthy ROW1 semantics for loading after one store. State the
+    // same-address premise independently as xor==0; this proves that premise
+    // selects the stored-value branch instead of handing the producer an
+    // already-collapsed `false` assertion.
+    let same_addr = restore_addr.clone().eq_expr(save_addr.clone());
+    let restored = SmtExpr::ite(same_addr, reg_val.clone(), mem_default);
+    let addresses_match = restore_addr
+        .clone()
+        .bvxor(save_addr)
+        .eq_expr(SmtExpr::bv_const(0, width));
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
@@ -770,10 +777,12 @@ pub fn proof_frame_callee_save_restore_identity() -> ProofObligation {
         trust_ir_expr: reg_val,
         aarch64_expr: restored,
         inputs: vec![
+            ("save_addr".to_string(), width),
             ("reg_val".to_string(), width),
-            ("offset".to_string(), width),
+            ("restore_addr".to_string(), width),
+            ("mem_default".to_string(), width),
         ],
-        preconditions: vec![],
+        preconditions: vec![addresses_match],
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::RegisterAllocation),
     }
@@ -1299,7 +1308,9 @@ const FRAME_RETRACTED_DEGENERATE: &[&str] = &[
 mod tests {
     use super::*;
     use crate::lowering_proof::verify_by_evaluation;
+    use crate::smt::EvalResult;
     use crate::verify::VerificationResult;
+    use std::collections::HashMap;
 
     // --- Offset Computation ---
 
@@ -1429,6 +1440,74 @@ mod tests {
             matches!(result, VerificationResult::Valid),
             "callee-save non-overlap proof failed: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn frame_callee_save_scalar_lemmas_hit_the_premises_and_reject_wrong_addresses() {
+        let no_overlap = proof_frame_callee_save_no_overlap();
+        let no_overlap_env = HashMap::from([
+            ("val_a".to_string(), 0x1122_3344_5566_7788),
+            ("val_b".to_string(), 0x8877_6655_4433_2211),
+            ("mem_default".to_string(), 0xdead_beef_dead_beef),
+            ("offset_a".to_string(), 0x100),
+            ("offset_b".to_string(), 0x110),
+            ("read_addr".to_string(), 0x100),
+        ]);
+        assert!(
+            no_overlap
+                .preconditions
+                .iter()
+                .all(|pre| pre.eval(&no_overlap_env).as_bool()),
+            "directed non-overlap witness must exercise the theorem body"
+        );
+        assert_eq!(
+            no_overlap.trust_ir_expr.eval(&no_overlap_env),
+            no_overlap.aarch64_expr.eval(&no_overlap_env)
+        );
+        let wrong_no_overlap = SmtExpr::ite(
+            SmtExpr::var("read_addr", 64).eq_expr(SmtExpr::var("offset_b", 64)),
+            SmtExpr::var("val_b", 64),
+            SmtExpr::var("mem_default", 64),
+        );
+        assert_ne!(
+            no_overlap.trust_ir_expr.eval(&no_overlap_env),
+            wrong_no_overlap.eval(&no_overlap_env),
+            "dropping the first store must be observable"
+        );
+
+        let restore = proof_frame_callee_save_restore_identity();
+        let restore_env = HashMap::from([
+            ("save_addr".to_string(), u64::MAX - 7),
+            ("reg_val".to_string(), 0x0123_4567_89ab_cdef),
+            ("restore_addr".to_string(), u64::MAX - 7),
+            ("mem_default".to_string(), 0xfedc_ba98_7654_3210),
+        ]);
+        assert!(
+            restore
+                .preconditions
+                .iter()
+                .all(|pre| pre.eval(&restore_env).as_bool()),
+            "directed restore witness must satisfy the xor-zero premise"
+        );
+        assert_eq!(
+            restore.trust_ir_expr.eval(&restore_env),
+            restore.aarch64_expr.eval(&restore_env)
+        );
+        let wrong_restore = SmtExpr::ite(
+            SmtExpr::var("restore_addr", 64)
+                .eq_expr(SmtExpr::var("save_addr", 64).bvadd(SmtExpr::bv_const(1, 64))),
+            SmtExpr::var("reg_val", 64),
+            SmtExpr::var("mem_default", 64),
+        );
+        assert_ne!(
+            restore.trust_ir_expr.eval(&restore_env),
+            wrong_restore.eval(&restore_env),
+            "an off-by-one restore address must be observable"
+        );
+        assert_eq!(
+            restore.trust_ir_expr.eval(&restore_env),
+            EvalResult::Bv(0x0123_4567_89ab_cdef)
         );
     }
 

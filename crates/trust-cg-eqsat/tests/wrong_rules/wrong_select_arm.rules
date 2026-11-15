@@ -1,0 +1,9 @@
+; mutant-of: select_true
+; mutation: wrong arm (select true x y is x)
+; subject: i32
+(rule select_true
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (select true ?x ?y))
+  (rhs ?y)
+  (where))

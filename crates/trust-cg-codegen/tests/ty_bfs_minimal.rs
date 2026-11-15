@@ -9,13 +9,19 @@
 //
 // Part of #270
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig};
+#[cfg(target_arch = "x86_64")]
+use trust_cg_codegen::Target;
+#[cfg(target_arch = "x86_64")]
+use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+use trust_cg_codegen::pipeline::OptLevel;
+#[cfg(target_arch = "aarch64")]
+use trust_cg_codegen::pipeline::{Pipeline, PipelineConfig};
 
 use trust_ir::{BinOp, Inst, InstrNode};
 use trust_ir::{
@@ -29,12 +35,16 @@ use trust_ir::{BlockId, FuncId, Ty, ValueId};
 // disassembly must follow the host format — Mach-O on macOS, ELF elsewhere.
 // ---------------------------------------------------------------------------
 
+/// The host triple the object pipeline targets: the file is compiled only on
+/// the in-process JIT hosts (`aarch64`, `x86_64`), and the object it emits is
+/// linked and run by the host `cc`.
 #[allow(dead_code)]
-fn host_aarch64_triple() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "aarch64-apple-darwin"
-    } else {
-        "aarch64-unknown-linux-gnu"
+fn host_triple() -> &'static str {
+    match (cfg!(target_arch = "aarch64"), cfg!(target_os = "macos")) {
+        (true, true) => "aarch64-apple-darwin",
+        (true, false) => "aarch64-unknown-linux-gnu",
+        (false, true) => "x86_64-apple-darwin",
+        (false, false) => "x86_64-unknown-linux-gnu",
     }
 }
 
@@ -77,10 +87,6 @@ fn v(n: u32) -> ValueId {
 
 fn b(n: u32) -> BlockId {
     BlockId::new(n)
-}
-
-fn is_aarch64() -> bool {
-    cfg!(target_arch = "aarch64")
 }
 
 fn has_cc() -> bool {
@@ -141,23 +147,48 @@ fn cleanup(dir: &Path) {
 // Compilation helper
 // ---------------------------------------------------------------------------
 
+/// Compile the kernel to a host-native object. On AArch64 this is the
+/// low-level `Pipeline` (the historical path, unchanged); that pipeline emits
+/// AArch64 machine code only and refuses every other triple, so x86-64 goes
+/// through `Compiler::compile`, the multi-target AOT entry that owns the
+/// x86-64 lowering, encoding and ELF/Mach-O emission.
 fn compile_trust_ir(
     trust_ir_func: &TrustIrFunction,
     module: &TrustIrModule,
     opt_level: OptLevel,
 ) -> Result<Vec<u8>, String> {
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+            trust_ir_func,
+            module,
+            &permit_unlicensed(),
+        )
         .map_err(|e| format!("adapter: {}", e))?;
-    let config = PipelineConfig {
-        target_triple: host_aarch64_triple().to_string(),
-        opt_level,
-        emit_debug: false,
-        ..Default::default()
-    };
-    let pipeline = Pipeline::new(config);
-    pipeline
-        .compile_function(&lir_func)
-        .map_err(|e| format!("pipeline: {}", e))
+        let config = PipelineConfig {
+            target_triple: host_triple().to_string(),
+            opt_level,
+            emit_debug: false,
+            ..Default::default()
+        };
+        let pipeline = Pipeline::new(config);
+        pipeline
+            .compile_function(&lir_func)
+            .map_err(|e| format!("pipeline: {}", e))
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = trust_ir_func;
+        Compiler::new(CompilerConfig {
+            opt_level,
+            target: Target::X86_64,
+            ..CompilerConfig::default()
+        })
+        .with_codegen_license(permit_unlicensed())
+        .compile(module)
+        .map(|result| result.object_code)
+        .map_err(|e| format!("compiler: {:?}", e))
+    }
 }
 
 fn assert_valid_macho(bytes: &[u8], ctx: &str) {
@@ -264,11 +295,14 @@ fn mul_i64(vid: &mut VidCounter, lhs: ValueId, rhs: ValueId) -> (ValueId, InstrN
 
 fn build_ty_bfs_kernel() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("ty_bfs");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::Ptr, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = b(0);
     let mut func = TrustIrFunction::new(FuncId::new(0), "ty_bfs_kernel", ft_id, entry);
@@ -357,7 +391,9 @@ fn build_ty_bfs_kernel() -> (TrustIrFunction, TrustIrModule) {
         body,
     }];
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -402,12 +438,13 @@ int main(void) {
 "#;
 
 fn run_ty_bfs_e2e(opt_level: OptLevel, test_name: &str) {
-    if !is_aarch64() {
-        eprintln!("skipping {}: requires aarch64", test_name);
-        return;
-    }
     if !has_cc() {
-        eprintln!("skipping {}: cc not available", test_name);
+        // `SKIP:` at line start is the spelling scripts/matrix_results.py
+        // recognizes; "skipping ..." is invisible to it, which would let this
+        // target report green with ZERO executing legs — the floor's own
+        // docstring counts a runtime SKIP as a failure, and these four legs are
+        // the only ones that prove x86-64 TY code actually runs.
+        eprintln!("SKIP: {test_name}: cc not available, so the executed leg did NOT run");
         return;
     }
 
@@ -499,4 +536,13 @@ fn test_ty_bfs_e2e_correctness_o2() {
 #[test]
 fn test_ty_bfs_e2e_correctness_o3() {
     run_ty_bfs_e2e(OptLevel::O3, "ty_bfs_e2e_o3");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

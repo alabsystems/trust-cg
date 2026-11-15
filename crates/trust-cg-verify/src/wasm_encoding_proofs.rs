@@ -21,7 +21,12 @@
 //       7-bit budget with the spec's own three cases and its range side
 //       conditions — and shares no code, and no shape, with the encoder's
 //       `value >>= 7` loop. The obligation decodes the REAL emitted immediate
-//       bytes and compares against the constant the trust-ir carried.
+//       bytes and compares against the constant the trust-ir carried. The
+//       FLOAT constants carry a fixed-width little-endian IEEE-754 payload
+//       instead; [`spec_decode_float_payload`] reads it from the spec's float
+//       production and [`spec_narrow_binary64_to_binary32`] states, from the
+//       format definitions, the binary32 pattern an `F32` constant's binary64
+//       carrier denotes, so a rounding bug in the `f32.const` narrowing refutes.
 //
 //   (4) MODULE-LEVEL INDEXING / ENCODING. Every index the backend hands out
 //       must resolve in its space, imported entities must occupy the LOW
@@ -797,8 +802,8 @@ pub fn emitted_const_immediate_obligations() -> Vec<EncodingObligation> {
 ///   the P3 narrow-width family's obligation, and a wrong carrier value would
 ///   encode and decode perfectly here.
 /// * anything about `f32.const` / `f64.const`. Those carry a raw IEEE-754
-///   payload, not an LEB128; they stay RED, by name, in
-///   [`WASM_ENCODING_DEFERRALS`].
+///   payload, not an LEB128; their credit is
+///   [`float_const_immediate_discharges_valid`].
 /// * that the constant is on the operand stack at the right moment, or is
 ///   consumed by the right instruction. That is the stack/CFG discipline, not
 ///   the immediate encoding.
@@ -824,6 +829,825 @@ pub fn const_immediate_discharges_valid(byte: u8) -> bool {
         }
     }
     seen > 0
+}
+
+// ===========================================================================
+// (5d) f32.const / f64.const: the raw IEEE-754 payload and the narrowing
+// ===========================================================================
+
+/// One captured float const immediate: `(the trust-ir binary64 carrier's bits,
+/// the const width in bits, the immediate bytes the REAL backend emitted)`.
+///
+/// trust-ir carries every float constant as a binary64 (`Constant::Float(f64)`)
+/// whatever its type, so the carrier is the SOURCE side of both widths.
+pub type EmittedFloatConstImmediate = (u64, u32, &'static [u8]);
+
+/// The immediate bytes the real wasm backend emitted for each float constant,
+/// captured by compiling a `() -> fN { ret <const> }` trust-ir module and
+/// DECODING the emitted code section (never by asking the encoder).
+///
+/// It exists for the reason [`EMITTED_CONST_IMMEDIATES`] does — the coverage
+/// gate's credit hook cannot compile — and it cannot rot for the same reason:
+/// `tests/support/wasm_float_live_emit.rs` recompiles every entry through the
+/// live backend and requires byte identity, and `wasm_encoding_gate` and the
+/// ratio-pinning `coverage_gate_tests` run that re-derivation.
+///
+/// # What the value set covers
+///
+/// For `f32.const` the obligation is about the NARROWING as much as the bytes,
+/// so the binary32 set is the rounding cases: two ties (one to even downward,
+/// one upward), two inexact values RNE rounds up where truncation would not,
+/// the exact `f32::MAX`, the tie above it (which overflows), a far overflow,
+/// the least normal, the least subnormal, the tie below it (to `+0.0`) and the
+/// value just above that tie, a far underflow, both infinities, both signs of
+/// zero and of the quiet NaN, a NaN whose payload survives narrowing, and a
+/// signalling-NaN carrier (narrowing quiets it). For `f64.const` the carrier IS
+/// the intent, so the set is the bit-pattern classes: both zeros, normals,
+/// subnormals, the extremes, both infinities, quiet NaNs with and without a
+/// payload, and signalling NaNs of both signs. [`float_const_credit_failures`]
+/// refuses a corpus that has lost any of these classes.
+pub const EMITTED_FLOAT_CONST_IMMEDIATES: &[EmittedFloatConstImmediate] = &[
+    // ---- f32.const (0x43): the binary64 carrier, narrowed ----
+    // +0.0 -> 0x00000000
+    (0x0000_0000_0000_0000, 32, &[0x00, 0x00, 0x00, 0x00]),
+    // -0.0 -> 0x80000000
+    (0x8000_0000_0000_0000, 32, &[0x00, 0x00, 0x00, 0x80]),
+    // 1.0 -> 0x3f800000
+    (0x3ff0_0000_0000_0000, 32, &[0x00, 0x00, 0x80, 0x3f]),
+    // -1.5 -> 0xbfc00000
+    (0xbff8_0000_0000_0000, 32, &[0x00, 0x00, 0xc0, 0xbf]),
+    // 0.1: round-to-nearest rounds UP -> 0x3dcccccd
+    (0x3fb9_9999_9999_999a, 32, &[0xcd, 0xcc, 0xcc, 0x3d]),
+    // pi: round-to-nearest rounds UP -> 0x40490fdb
+    (0x4009_21fb_5444_2d18, 32, &[0xdb, 0x0f, 0x49, 0x40]),
+    // 1 + 2^-24: a tie, to even (down) -> 0x3f800000
+    (0x3ff0_0000_1000_0000, 32, &[0x00, 0x00, 0x80, 0x3f]),
+    // 1 + 3 * 2^-24: a tie, to even (up) -> 0x3f800002
+    (0x3ff0_0000_3000_0000, 32, &[0x02, 0x00, 0x80, 0x3f]),
+    // f32::MAX, exact -> 0x7f7fffff
+    (0x47ef_ffff_e000_0000, 32, &[0xff, 0xff, 0x7f, 0x7f]),
+    // the tie above f32::MAX: overflows -> 0x7f800000
+    (0x47ef_ffff_f000_0000, 32, &[0x00, 0x00, 0x80, 0x7f]),
+    // 1e300: overflows -> 0x7f800000
+    (0x7e37_e43c_8800_759c, 32, &[0x00, 0x00, 0x80, 0x7f]),
+    // 2^-126, the least normal -> 0x00800000
+    (0x3810_0000_0000_0000, 32, &[0x00, 0x00, 0x80, 0x00]),
+    // 2^-149, the least subnormal -> 0x00000001
+    (0x36a0_0000_0000_0000, 32, &[0x01, 0x00, 0x00, 0x00]),
+    // 2^-150: a tie, to even -> 0x00000000
+    (0x3690_0000_0000_0000, 32, &[0x00, 0x00, 0x00, 0x00]),
+    // just above 2^-150 -> 0x00000001
+    (0x3690_0000_0000_0001, 32, &[0x01, 0x00, 0x00, 0x00]),
+    // 1e-300: underflows -> 0x00000000
+    (0x01a5_6e1f_c2f8_f359, 32, &[0x00, 0x00, 0x00, 0x00]),
+    // +inf -> 0x7f800000
+    (0x7ff0_0000_0000_0000, 32, &[0x00, 0x00, 0x80, 0x7f]),
+    // -inf -> 0xff800000
+    (0xfff0_0000_0000_0000, 32, &[0x00, 0x00, 0x80, 0xff]),
+    // quiet NaN -> 0x7fc00000
+    (0x7ff8_0000_0000_0000, 32, &[0x00, 0x00, 0xc0, 0x7f]),
+    // negative quiet NaN -> 0xffc00000
+    (0xfff8_0000_0000_0000, 32, &[0x00, 0x00, 0xc0, 0xff]),
+    // quiet NaN whose payload survives narrowing -> 0x7fc00001
+    (0x7ff8_0000_2000_0000, 32, &[0x01, 0x00, 0xc0, 0x7f]),
+    // signalling-NaN carrier: narrowing quiets it -> 0x7fc00001
+    (0x7ff0_0000_2000_0000, 32, &[0x01, 0x00, 0xc0, 0x7f]),
+    // ---- f64.const (0x44): the binary64 carrier, exactly ----
+    // +0.0
+    (
+        0x0000_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ),
+    // -0.0
+    (
+        0x8000_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80],
+    ),
+    // 1.0
+    (
+        0x3ff0_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f],
+    ),
+    // -1.5
+    (
+        0xbff8_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xbf],
+    ),
+    // 0.1
+    (
+        0x3fb9_9999_9999_999a,
+        64,
+        &[0x9a, 0x99, 0x99, 0x99, 0x99, 0x99, 0xb9, 0x3f],
+    ),
+    // pi
+    (
+        0x4009_21fb_5444_2d18,
+        64,
+        &[0x18, 0x2d, 0x44, 0x54, 0xfb, 0x21, 0x09, 0x40],
+    ),
+    // every byte distinct
+    (
+        0x0123_4567_89ab_cdef,
+        64,
+        &[0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01],
+    ),
+    // f64::MAX
+    (
+        0x7fef_ffff_ffff_ffff,
+        64,
+        &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xef, 0x7f],
+    ),
+    // the least normal
+    (
+        0x0010_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00],
+    ),
+    // the greatest subnormal
+    (
+        0x000f_ffff_ffff_ffff,
+        64,
+        &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00],
+    ),
+    // the least subnormal
+    (
+        0x0000_0000_0000_0001,
+        64,
+        &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ),
+    // +inf
+    (
+        0x7ff0_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x7f],
+    ),
+    // -inf
+    (
+        0xfff0_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xff],
+    ),
+    // quiet NaN
+    (
+        0x7ff8_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x7f],
+    ),
+    // negative quiet NaN
+    (
+        0xfff8_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0xff],
+    ),
+    // quiet NaN with a payload
+    (
+        0x7ff8_0000_0000_0001,
+        64,
+        &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x7f],
+    ),
+    // signalling NaN
+    (
+        0x7ff0_0000_0000_0001,
+        64,
+        &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x7f],
+    ),
+    // signalling NaN with a high payload
+    (
+        0x7ff4_0000_0000_0000,
+        64,
+        &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf4, 0x7f],
+    ),
+    // negative signalling NaN
+    (
+        0xfff0_0000_0000_0001,
+        64,
+        &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xff],
+    ),
+];
+
+/// Why a float payload decode failed. Both variants are refutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatPayloadError {
+    /// The width is not one the spec gives a float production (32 or 64).
+    UnsupportedWidth {
+        /// The width asked for.
+        bits: u32,
+    },
+    /// Fewer bytes than the production's fixed length.
+    Truncated {
+        /// Bytes the production consumes.
+        needed: usize,
+        /// Bytes available.
+        available: usize,
+    },
+}
+
+/// The spec's float production (WebAssembly Core Specification §5.2.3,
+/// "Floating-Point"): `fN ::= b*:byte^{N/8} => z` where `bytes_fN(z) = b*`, and
+/// `bytes_fN(z) = bytes_iN(bits_fN(z))` is the LITTLE-ENDIAN byte sequence of
+/// the IEEE-754 bit pattern (§4.3.1 / §5.2.2): byte `k` carries the pattern's
+/// weight-`256^k` digit.
+///
+/// Transcribed as that positional sum over exactly `N/8` bytes. It shares no
+/// code with the encoder's `to_le_bytes`, and it returns the BIT PATTERN, never
+/// a float, so a NaN's sign and payload survive the decode and `-0.0` is not
+/// `+0.0`. Returns the pattern and the byte count consumed; fails closed on a
+/// short stream and on a width with no float production.
+pub fn spec_decode_float_payload(
+    bytes: &[u8],
+    bits: u32,
+) -> Result<(u64, usize), FloatPayloadError> {
+    let needed = match bits {
+        32 => 4usize,
+        64 => 8,
+        _ => return Err(FloatPayloadError::UnsupportedWidth { bits }),
+    };
+    if bytes.len() < needed {
+        return Err(FloatPayloadError::Truncated {
+            needed,
+            available: bytes.len(),
+        });
+    }
+    let mut pattern: u128 = 0;
+    let mut weight: u128 = 1;
+    for &digit in &bytes[..needed] {
+        pattern += u128::from(digit) * weight;
+        weight *= 256;
+    }
+    Ok((pattern as u64, needed))
+}
+
+/// Narrow a binary64 bit pattern to binary32 under IEEE 754-2019
+/// `convertFormat` with the given rounding: `nearest_even` is
+/// roundTiesToEven, otherwise roundTowardZero (used only to build the rounding
+/// negative control).
+///
+/// Written from the format definitions in integer arithmetic, not by casting:
+/// the value is `significand * 2^exponent`, the target quantum is `2^(E - 23)`
+/// for a binary32-normal leading exponent `E` and `2^-149` below the normal
+/// range, and a result whose biased exponent reaches 255 is an overflow
+/// (infinity under roundTiesToEven, `f32::MAX` magnitude under
+/// roundTowardZero). An infinity maps to the infinity of the same sign. A NaN
+/// maps to a QUIET NaN of the same sign whose trailing significand keeps the
+/// carrier's high-order payload bits (§6.2.3: convertFormat delivers a quiet
+/// NaN, and should preserve the payload as far as the format allows).
+fn narrow_binary64_to_binary32(carrier: u64, nearest_even: bool) -> u32 {
+    let sign = ((carrier >> 63) as u32) << 31;
+    let biased = ((carrier >> 52) & 0x7ff) as i32;
+    let fraction = carrier & ((1u64 << 52) - 1);
+    if biased == 0x7ff {
+        if fraction == 0 {
+            return sign | 0x7f80_0000;
+        }
+        return sign | 0x7fc0_0000 | (fraction >> 29) as u32;
+    }
+    let (significand, exponent) = if biased == 0 {
+        (fraction, -1074i32)
+    } else {
+        (fraction | (1u64 << 52), biased - 1075)
+    };
+    if significand == 0 {
+        return sign;
+    }
+    let leading = 63 - significand.leading_zeros() as i32 + exponent;
+    let mut quantum = if leading >= -126 { leading - 23 } else { -149 };
+    let drop = quantum - exponent;
+    let mut kept: u64 = if drop <= 0 {
+        significand << (-drop) as u32
+    } else if drop >= 64 {
+        0
+    } else {
+        let kept = significand >> drop as u32;
+        let rest = significand & ((1u64 << drop as u32) - 1);
+        let half = 1u64 << (drop as u32 - 1);
+        if nearest_even && (rest > half || (rest == half && kept & 1 == 1)) {
+            kept + 1
+        } else {
+            kept
+        }
+    };
+    if kept >= 1 << 24 {
+        kept >>= 1;
+        quantum += 1;
+    }
+    if kept >= 1 << 23 {
+        let biased32 = quantum + 23 + 127;
+        if biased32 >= 255 {
+            return if nearest_even {
+                sign | 0x7f80_0000
+            } else {
+                sign | 0x7f7f_ffff
+            };
+        }
+        return sign | ((biased32 as u32) << 23) | (kept as u32 - (1 << 23));
+    }
+    sign | kept as u32
+}
+
+/// The binary32 pattern a trust-ir `F32` constant denotes, from its binary64
+/// carrier: IEEE 754 roundTiesToEven `convertFormat`, NaNs quieted with their
+/// high-order payload kept. The reference interpreter materializes an `F32`
+/// constant as `(value as f32).to_bits()`, the host's binary64-to-binary32
+/// conversion. `tests/wasm_encoding_gate.rs` checks every corpus carrier
+/// against the reference interpreter and compares this narrowing with the host
+/// conversion at every rounding boundary (ties, near ties, subnormal ties,
+/// overflow); a unit test here compares the two over a random sweep. Evidence
+/// over those carriers, not a proof over all of them.
+pub fn spec_narrow_binary64_to_binary32(carrier: u64) -> u32 {
+    narrow_binary64_to_binary32(carrier, true)
+}
+
+/// The bit pattern a trust-ir float constant of width `bits` denotes, from its
+/// binary64 carrier: the carrier itself at 64, its narrowing at 32. `None` for
+/// any other width.
+pub fn trust_ir_float_const_bits(carrier: u64, bits: u32) -> Option<u64> {
+    match bits {
+        32 => Some(u64::from(spec_narrow_binary64_to_binary32(carrier))),
+        64 => Some(carrier),
+        _ => None,
+    }
+}
+
+/// How two float bit patterns of one width differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatBitsDivergence {
+    /// Only the sign bit differs (`-0.0` read as `+0.0`, a negated constant).
+    SignOnly,
+    /// Both are NaNs and they differ (payload, quiet bit or sign): invisible to
+    /// any NaN-equal-NaN comparison.
+    NanPayload,
+    /// Any other difference.
+    Value,
+}
+
+/// Why a float const immediate was refuted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatConstRefutation {
+    /// The opcode is not `f32.const` (0x43) or `f64.const` (0x44).
+    NotAFloatConstOpcode {
+        /// The opcode byte.
+        opcode: u8,
+    },
+    /// The immediate is shorter than the width's fixed payload.
+    Truncated {
+        /// Bytes the production consumes.
+        needed: usize,
+        /// Bytes present.
+        available: usize,
+    },
+    /// The immediate is longer than the width's fixed payload.
+    TrailingBytes {
+        /// Bytes the production consumed.
+        consumed: usize,
+        /// Bytes present.
+        len: usize,
+    },
+    /// The decoded pattern is not the intended one.
+    BitsDiffer {
+        /// The width in bits.
+        bits: u32,
+        /// The pattern the bytes denote.
+        decoded: u64,
+        /// The pattern the trust-ir constant denotes.
+        intended: u64,
+        /// How they differ.
+        divergence: FloatBitsDivergence,
+    },
+}
+
+impl fmt::Display for FloatConstRefutation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FloatConstRefutation::NotAFloatConstOpcode { opcode } => write!(
+                f,
+                "0x{opcode:02x} is not a float const opcode (0x43 f32.const / 0x44 f64.const)"
+            ),
+            FloatConstRefutation::Truncated { needed, available } => write!(
+                f,
+                "the payload needs {needed} byte(s) but the immediate has {available}"
+            ),
+            FloatConstRefutation::TrailingBytes { consumed, len } => write!(
+                f,
+                "the payload is {consumed} byte(s) but the immediate has {len}; trailing bytes \
+                 are not part of it"
+            ),
+            FloatConstRefutation::BitsDiffer {
+                bits,
+                decoded,
+                intended,
+                divergence,
+            } => write!(
+                f,
+                "the f{bits} payload decodes to 0x{decoded:x}, the constant denotes \
+                 0x{intended:x} ({divergence:?} divergence)"
+            ),
+        }
+    }
+}
+
+fn is_nan_bits(pattern: u64, bits: u32) -> bool {
+    let (exp_mask, frac_mask) = if bits == 32 {
+        (0x7f80_0000u64, 0x007f_ffffu64)
+    } else {
+        (0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff)
+    };
+    pattern & exp_mask == exp_mask && pattern & frac_mask != 0
+}
+
+fn is_signalling_nan_bits(pattern: u64, bits: u32) -> bool {
+    let quiet = if bits == 32 { 1u64 << 22 } else { 1u64 << 51 };
+    is_nan_bits(pattern, bits) && pattern & quiet == 0
+}
+
+fn divergence_of(decoded: u64, intended: u64, bits: u32) -> FloatBitsDivergence {
+    if decoded ^ intended == 1u64 << (bits - 1) {
+        FloatBitsDivergence::SignOnly
+    } else if is_nan_bits(decoded, bits) && is_nan_bits(intended, bits) {
+        FloatBitsDivergence::NanPayload
+    } else {
+        FloatBitsDivergence::Value
+    }
+}
+
+/// The FAMILY-(5) verdict for one emitted FLOAT constant.
+///
+/// * SOURCE side: `carrier` — the binary64 bits the trust-ir `Const` carried,
+///   put through [`trust_ir_float_const_bits`] at the opcode's width.
+/// * MACHINE side: `immediate` — the REAL bytes that followed the opcode, put
+///   through [`spec_decode_float_payload`].
+///
+/// Holds iff the decode consumes EXACTLY the immediate and the decoded BIT
+/// PATTERN equals the intended one. The comparison is on bit patterns, so
+/// `-0.0` against `+0.0`, one NaN payload against another, and a quiet against
+/// a signalling NaN all refute.
+pub fn float_const_immediate_verdict(
+    carrier: u64,
+    opcode: u8,
+    immediate: &[u8],
+) -> Result<(), FloatConstRefutation> {
+    let bits = match opcode {
+        OP_F32_CONST => 32u32,
+        OP_F64_CONST => 64,
+        other => return Err(FloatConstRefutation::NotAFloatConstOpcode { opcode: other }),
+    };
+    let intended =
+        trust_ir_float_const_bits(carrier, bits).expect("32 and 64 are the float const widths");
+    let (decoded, used) = match spec_decode_float_payload(immediate, bits) {
+        Ok(decoded) => decoded,
+        Err(FloatPayloadError::Truncated { needed, available }) => {
+            return Err(FloatConstRefutation::Truncated { needed, available });
+        }
+        Err(FloatPayloadError::UnsupportedWidth { .. }) => {
+            return Err(FloatConstRefutation::NotAFloatConstOpcode { opcode });
+        }
+    };
+    if used != immediate.len() {
+        return Err(FloatConstRefutation::TrailingBytes {
+            consumed: used,
+            len: immediate.len(),
+        });
+    }
+    if decoded != intended {
+        return Err(FloatConstRefutation::BitsDiffer {
+            bits,
+            decoded,
+            intended,
+            divergence: divergence_of(decoded, intended, bits),
+        });
+    }
+    Ok(())
+}
+
+/// [`float_const_immediate_verdict`] as a reportable [`EncodingObligation`].
+pub fn float_const_immediate_obligation(
+    carrier: u64,
+    opcode: u8,
+    immediate: &[u8],
+) -> EncodingObligation {
+    let name = format!(
+        "0x{opcode:02x} float const, carrier 0x{carrier:016x} -> the emitted payload \
+         {immediate:02x?} decodes to the pattern the constant denotes"
+    );
+    match float_const_immediate_verdict(carrier, opcode, immediate) {
+        Ok(()) => EncodingObligation::holds(EncodingFamily::ConstImmediate, name),
+        Err(why) => {
+            EncodingObligation::refuted(EncodingFamily::ConstImmediate, name, why.to_string())
+        }
+    }
+}
+
+/// A negative control for the float const obligation: a mutation of a REAL
+/// captured immediate (or of its claimed source) that a wrong encoding or a
+/// wrong narrowing would produce, each with the refutation it must draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatConstControl {
+    /// The payload written big-endian. Must refute as [`FloatConstRefutation::BitsDiffer`].
+    ByteSwapped,
+    /// The last payload byte dropped. Must refute as [`FloatConstRefutation::Truncated`].
+    Truncated,
+    /// The payload of one width under the other width's opcode: an `f64`
+    /// payload under `0x43` must refute as [`FloatConstRefutation::TrailingBytes`],
+    /// an `f32` payload under `0x44` as [`FloatConstRefutation::Truncated`].
+    WidthConfusion,
+    /// An `f64` signalling NaN written with its quiet bit set. Must refute as a
+    /// [`FloatBitsDivergence::NanPayload`] divergence.
+    QuietedSignallingNan,
+    /// An `f32` narrowing of a signalling-NaN carrier that keeps the payload but
+    /// does NOT quiet it. Must refute as a [`FloatBitsDivergence::NanPayload`]
+    /// divergence.
+    UnquietedNarrowing,
+    /// A negative constant written with its sign bit cleared. Must refute as a
+    /// [`FloatBitsDivergence::SignOnly`] divergence.
+    SignDropped,
+    /// An `f32` narrowing by truncation (roundTowardZero) where it differs from
+    /// roundTiesToEven. Must refute as a [`FloatBitsDivergence::Value`] divergence.
+    TowardZeroNarrowing,
+    /// The real bytes claimed for the NEGATED carrier. Must refute as a
+    /// [`FloatBitsDivergence::SignOnly`] divergence.
+    NegatedClaim,
+}
+
+impl FloatConstControl {
+    /// Every control.
+    pub const ALL: [FloatConstControl; 8] = [
+        FloatConstControl::ByteSwapped,
+        FloatConstControl::Truncated,
+        FloatConstControl::WidthConfusion,
+        FloatConstControl::QuietedSignallingNan,
+        FloatConstControl::UnquietedNarrowing,
+        FloatConstControl::SignDropped,
+        FloatConstControl::TowardZeroNarrowing,
+        FloatConstControl::NegatedClaim,
+    ];
+
+    /// Whether the control applies at all at `bits` (it may still be
+    /// inapplicable to a particular entry).
+    pub fn applies_at(self, bits: u32) -> bool {
+        match self {
+            FloatConstControl::QuietedSignallingNan => bits == 64,
+            FloatConstControl::UnquietedNarrowing | FloatConstControl::TowardZeroNarrowing => {
+                bits == 32
+            }
+            _ => true,
+        }
+    }
+
+    /// Build the control for one captured entry: `(claimed carrier, opcode,
+    /// immediate bytes)`. `None` when the entry cannot express this control
+    /// (a palindromic payload cannot be byte-swapped, a positive constant has
+    /// no sign to drop, and so on).
+    pub fn build(self, carrier: u64, bits: u32, immediate: &[u8]) -> Option<(u64, u8, Vec<u8>)> {
+        if !self.applies_at(bits) {
+            return None;
+        }
+        let opcode = if bits == 32 {
+            OP_F32_CONST
+        } else {
+            OP_F64_CONST
+        };
+        let intended = trust_ir_float_const_bits(carrier, bits)?;
+        let payload = |pattern: u64| -> Vec<u8> {
+            if bits == 32 {
+                (pattern as u32).to_le_bytes().to_vec()
+            } else {
+                pattern.to_le_bytes().to_vec()
+            }
+        };
+        match self {
+            FloatConstControl::ByteSwapped => {
+                let swapped: Vec<u8> = immediate.iter().rev().copied().collect();
+                (swapped != immediate).then_some((carrier, opcode, swapped))
+            }
+            FloatConstControl::Truncated => immediate
+                .split_last()
+                .map(|(_, kept)| (carrier, opcode, kept.to_vec())),
+            FloatConstControl::WidthConfusion => {
+                if bits == 32 {
+                    Some((carrier, OP_F64_CONST, immediate.to_vec()))
+                } else {
+                    Some((carrier, OP_F32_CONST, immediate.to_vec()))
+                }
+            }
+            FloatConstControl::QuietedSignallingNan => is_signalling_nan_bits(intended, 64)
+                .then(|| (carrier, opcode, payload(intended | 1 << 51))),
+            FloatConstControl::UnquietedNarrowing => {
+                if !is_signalling_nan_bits(carrier, 64) {
+                    return None;
+                }
+                let sign = ((carrier >> 63) as u32) << 31;
+                let unquieted = sign | 0x7f80_0000 | ((carrier & ((1 << 52) - 1)) >> 29) as u32;
+                // A payload living entirely below bit 29 would narrow to an
+                // infinity rather than a NaN; that is a different bug.
+                is_nan_bits(u64::from(unquieted), 32)
+                    .then(|| (carrier, opcode, payload(u64::from(unquieted))))
+            }
+            FloatConstControl::SignDropped => {
+                let sign = 1u64 << (bits - 1);
+                (intended & sign != 0).then(|| (carrier, opcode, payload(intended & !sign)))
+            }
+            FloatConstControl::TowardZeroNarrowing => {
+                let truncated = u64::from(narrow_binary64_to_binary32(carrier, false));
+                (truncated != intended).then(|| (carrier, opcode, payload(truncated)))
+            }
+            FloatConstControl::NegatedClaim => {
+                Some((carrier ^ (1 << 63), opcode, immediate.to_vec()))
+            }
+        }
+    }
+
+    /// Whether `refutation` is the one this control must draw at `bits`.
+    pub fn is_its_refutation(self, bits: u32, refutation: &FloatConstRefutation) -> bool {
+        use FloatBitsDivergence as D;
+        use FloatConstRefutation as R;
+        match (self, refutation) {
+            (FloatConstControl::ByteSwapped, R::BitsDiffer { .. }) => true,
+            (FloatConstControl::Truncated, R::Truncated { .. }) => true,
+            (FloatConstControl::WidthConfusion, R::TrailingBytes { .. }) => bits == 64,
+            (FloatConstControl::WidthConfusion, R::Truncated { .. }) => bits == 32,
+            (
+                FloatConstControl::QuietedSignallingNan | FloatConstControl::UnquietedNarrowing,
+                R::BitsDiffer {
+                    divergence: D::NanPayload,
+                    ..
+                },
+            ) => true,
+            (
+                FloatConstControl::SignDropped | FloatConstControl::NegatedClaim,
+                R::BitsDiffer {
+                    divergence: D::SignOnly,
+                    ..
+                },
+            ) => true,
+            (
+                FloatConstControl::TowardZeroNarrowing,
+                R::BitsDiffer {
+                    divergence: D::Value,
+                    ..
+                },
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Every reason the float const credit at `opcode` must be REFUSED over
+/// `corpus`; empty means the credit stands. Public so the gate tests can show
+/// the hook refusing a doctored corpus.
+///
+/// It demands, at the opcode's width: at least one entry; every entry holding;
+/// the value classes the corpus documents all present (negative zero, an
+/// infinity, a subnormal, a NaN with a payload beyond the quiet bit, and — at
+/// 64 — a signalling NaN; at 32 — a signalling-NaN carrier, a rounding case
+/// where truncation differs, a tie, and a finite carrier that overflows); and
+/// every negative control that applies at the width built at least once, with
+/// every built instance refuted for the reason it states.
+pub fn float_const_credit_failures(
+    opcode: u8,
+    corpus: &[EmittedFloatConstImmediate],
+) -> Vec<String> {
+    let bits = match opcode {
+        OP_F32_CONST => 32u32,
+        OP_F64_CONST => 64,
+        other => return vec![format!("0x{other:02x} is not a float const opcode")],
+    };
+    let mut failures = Vec::new();
+    let entries: Vec<&EmittedFloatConstImmediate> =
+        corpus.iter().filter(|(_, w, _)| *w == bits).collect();
+    if entries.is_empty() {
+        failures.push(format!(
+            "no captured f{bits}.const immediate: an empty set is not evidence"
+        ));
+        return failures;
+    }
+    for &&(carrier, _, bytes) in &entries {
+        if let Err(why) = float_const_immediate_verdict(carrier, opcode, bytes) {
+            failures.push(format!("carrier 0x{carrier:016x}: {why}"));
+        }
+    }
+    let intents: Vec<u64> = entries
+        .iter()
+        .filter_map(|&&(carrier, _, _)| trust_ir_float_const_bits(carrier, bits))
+        .collect();
+    let sign = 1u64 << (bits - 1);
+    let (exp_mask, frac_mask, quiet) = if bits == 32 {
+        (0x7f80_0000u64, 0x007f_ffffu64, 1u64 << 22)
+    } else {
+        (0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff, 1u64 << 51)
+    };
+    let mut classes: Vec<(&str, bool)> = vec![
+        ("negative zero", intents.contains(&sign)),
+        (
+            "an infinity",
+            intents.iter().any(|&p| p & !sign == exp_mask),
+        ),
+        (
+            "a subnormal",
+            intents
+                .iter()
+                .any(|&p| p & exp_mask == 0 && p & frac_mask != 0),
+        ),
+        (
+            "a NaN with a payload beyond the quiet bit",
+            intents
+                .iter()
+                .any(|&p| is_nan_bits(p, bits) && p & frac_mask & !quiet != 0),
+        ),
+    ];
+    if bits == 64 {
+        classes.push((
+            "a signalling NaN",
+            intents.iter().any(|&p| is_signalling_nan_bits(p, 64)),
+        ));
+    } else {
+        let carriers: Vec<u64> = entries.iter().map(|&&(c, _, _)| c).collect();
+        classes.push((
+            "a signalling-NaN carrier",
+            carriers.iter().any(|&c| is_signalling_nan_bits(c, 64)),
+        ));
+        classes.push((
+            "a carrier whose truncation differs from its rounding",
+            carriers.iter().any(|&c| {
+                narrow_binary64_to_binary32(c, false) != narrow_binary64_to_binary32(c, true)
+            }),
+        ));
+        classes.push((
+            "a finite carrier that overflows",
+            carriers.iter().any(|&c| {
+                c & 0x7ff0_0000_0000_0000 != 0x7ff0_0000_0000_0000
+                    && spec_narrow_binary64_to_binary32(c) & 0x7fff_ffff == 0x7f80_0000
+            }),
+        ));
+        classes.push((
+            "a rounding tie",
+            carriers.iter().any(|&c| {
+                let biased = ((c >> 52) & 0x7ff) as i32;
+                // A normal binary32 result drops 29 fraction bits; the tie is
+                // exactly the half-quantum pattern in them.
+                (897..=1150).contains(&biased) && c & ((1 << 29) - 1) == 1 << 28
+            }),
+        ));
+    }
+    for (class, present) in classes {
+        if !present {
+            failures.push(format!("the f{bits} corpus has lost its {class}"));
+        }
+    }
+    for control in FloatConstControl::ALL {
+        if !control.applies_at(bits) {
+            continue;
+        }
+        let mut built = 0usize;
+        for &&(carrier, _, bytes) in &entries {
+            let Some((claimed, op, mutated)) = control.build(carrier, bits, bytes) else {
+                continue;
+            };
+            built += 1;
+            match float_const_immediate_verdict(claimed, op, &mutated) {
+                Ok(()) => failures.push(format!(
+                    "control {control:?} SURVIVED on carrier 0x{carrier:016x} ({mutated:02x?})"
+                )),
+                Err(why) if !control.is_its_refutation(bits, &why) => failures.push(format!(
+                    "control {control:?} on carrier 0x{carrier:016x} refuted for the wrong reason: \
+                     {why}"
+                )),
+                Err(_) => {}
+            }
+        }
+        if built == 0 {
+            failures.push(format!(
+                "control {control:?} could not be built on any f{bits} entry: it is not evidence"
+            ));
+        }
+    }
+    failures
+}
+
+/// THE COVERAGE-GATE CREDIT HOOK for `f32.const` (0x43) / `f64.const` (0x44).
+///
+/// `true` iff [`float_const_credit_failures`] is empty over
+/// [`EMITTED_FLOAT_CONST_IMMEDIATES`]: every captured immediate decodes, under
+/// the independent spec payload decoder, to exactly the bit pattern the trust-ir
+/// constant denotes — through the independently stated narrowing at 32 bits —
+/// the corpus still spans its value classes, and every negative control refutes
+/// for its stated reason. `false` for any other byte.
+///
+/// What the credit does NOT say: that the lowering chose the right CONSTANT
+/// (the carrier is taken as given), that every binary64 carrier narrows
+/// correctly through the module path (the corpus is its listed cases, each
+/// checked against the reference interpreter by the gate target; the narrowing
+/// itself is compared with the host conversion at every rounding boundary by
+/// the gate target and over a random sweep by a unit test here, not proven), or
+/// anything about stack discipline. The NaN rule
+/// of the narrowing is the IEEE 754 recommended payload preservation, which is
+/// what the reference interpreter's host conversion does on the hosts this
+/// runs on; the standard does not require it.
+pub fn float_const_immediate_discharges_valid(byte: u8) -> bool {
+    matches!(byte, OP_F32_CONST | OP_F64_CONST)
+        && float_const_credit_failures(byte, EMITTED_FLOAT_CONST_IMMEDIATES).is_empty()
 }
 
 // ===========================================================================
@@ -1569,7 +2393,7 @@ fn decode_expr_at(c: &mut Cur<'_>) -> Result<Vec<Instr>, WasmDecodeError> {
         let imm = match opcode {
             // --- control ---
             0x00 | 0x01 | 0x05 | 0x0f | 0x1a | 0x1b => Imm::None, // unreachable/nop/else/return/drop/select
-            0x02 | 0x03 | 0x04 => {
+            0x02..=0x04 => {
                 let bt = decode_blocktype(c)?;
                 depth += 1;
                 Imm::BlockType(bt)
@@ -1641,9 +2465,8 @@ fn decode_expr_at(c: &mut Cur<'_>) -> Result<Vec<Instr>, WasmDecodeError> {
                         sub_at,
                         format!(
                             "0xfc sub-index {sub} is a BULK-MEMORY instruction \
-                             (memory.init/data.drop/memory.copy/memory.fill); the wasm32 backend \
-                             does not emit those and nothing here decodes their data-index \
-                             immediates, so fail closed"
+                             (memory.init/data.drop/memory.copy/memory.fill); nothing here \
+                             decodes their memory- and data-index immediates, so fail closed"
                         ),
                     );
                 }
@@ -1666,7 +2489,7 @@ fn decode_expr_at(c: &mut Cur<'_>) -> Result<Vec<Instr>, WasmDecodeError> {
             offset: off,
             opcode,
             imm,
-            depth: if matches!(opcode, 0x02 | 0x03 | 0x04) {
+            depth: if matches!(opcode, 0x02..=0x04) {
                 depth - 1
             } else {
                 depth
@@ -1698,6 +2521,14 @@ fn decode_blocktype(c: &mut Cur<'_>) -> Result<i64, WasmDecodeError> {
 // ===========================================================================
 
 const F4: EncodingFamily = EncodingFamily::ModuleIndexing;
+
+/// The first table element a closed module's element segment fills. Element 0
+/// stays the null funcref, so the null pointer (0) is never the address of a
+/// function and a `call_indirect` through it traps; a function pointer is
+/// therefore `funcidx + CLOSED_TABLE_BASE`. This is the convention `wasm-ld`
+/// applies to a linked module (its default `--table-base` is 1), restated
+/// here rather than imported from the backend it checks.
+pub const CLOSED_TABLE_BASE: u32 = 1;
 
 fn check(
     family: EncodingFamily,
@@ -2178,8 +3009,8 @@ pub fn module_indexing_obligations(bytes: &[u8]) -> Vec<EncodingObligation> {
     if m.tables.is_empty() && m.table_import_count() == 0 {
         out.push(EncodingObligation::not_applicable(
             F4,
-            "the funcref element segment installs element i = function i over the WHOLE index \
-             space",
+            "the funcref element segment installs element i + 1 = function i over the WHOLE \
+             index space",
             "this module declares no table, so there is no element segment to check",
         ));
     } else {
@@ -2187,8 +3018,8 @@ pub fn module_indexing_obligations(bytes: &[u8]) -> Vec<EncodingObligation> {
         match seg {
             None => out.push(EncodingObligation::refuted(
                 F4,
-                "the funcref element segment installs element i = function i over the WHOLE index \
-                 space",
+                "the funcref element segment installs element i + 1 = function i over the WHOLE \
+                 index space",
                 "the module declares a table but emits NO element segment — every indirect call \
                  would trap on an uninitialized element",
             )),
@@ -2199,8 +3030,10 @@ pub fn module_indexing_obligations(bytes: &[u8]) -> Vec<EncodingObligation> {
                     .iter()
                     .enumerate()
                     .all(|(i, f)| *f == i as u32);
-                let offset_ok = matches!(s.offset.first().map(|i| &i.imm), Some(Imm::I32(0)))
-                    && s.offset.len() == 2
+                let offset_ok = matches!(
+                    s.offset.first().map(|i| &i.imm),
+                    Some(Imm::I32(base)) if *base as u32 == CLOSED_TABLE_BASE
+                ) && s.offset.len() == 2
                     && s.offset[1].opcode == 0x0b;
                 out.push(check(
                     F4,
@@ -2220,13 +3053,17 @@ pub fn module_indexing_obligations(bytes: &[u8]) -> Vec<EncodingObligation> {
                 ));
                 out.push(check(
                     F4,
-                    "element i is function i (so a function pointer IS its funcidx)".to_string(),
+                    "element vector entry i is function i (installed from table index \
+                     CLOSED_TABLE_BASE, so a function pointer is its funcidx + 1)"
+                        .to_string(),
                     identity_ok,
                     || format!("element vector is {:?}, not the identity", s.func_indices),
                 ));
                 out.push(check(
                     F4,
-                    "the element segment's offset expression is `i32.const 0; end`".to_string(),
+                    "the element segment's offset expression is `i32.const 1; end` (element 0 \
+                     stays the null funcref)"
+                        .to_string(),
                     offset_ok,
                     || format!("offset expression decodes to {:?}", s.offset),
                 ));
@@ -2240,17 +3077,19 @@ pub fn module_indexing_obligations(bytes: &[u8]) -> Vec<EncodingObligation> {
                         })
                         .unwrap_or(0)
                 });
+                let needed = u64::from(CLOSED_TABLE_BASE) + s.func_indices.len() as u64;
                 out.push(check(
                     F4,
                     format!(
-                        "the table's declared minimum ({declared}) holds the whole element \
-                         segment ({} entry(ies))",
+                        "the table's declared minimum ({declared}) holds the null slot and the \
+                         whole element segment ({} entry(ies))",
                         s.func_indices.len()
                     ),
-                    declared >= s.func_indices.len() as u64,
+                    declared >= needed,
                     || {
                         format!(
-                            "table min {declared} < {} element(s) — instantiation would trap",
+                            "table min {declared} < {needed} (the null slot + {} element(s)) — \
+                             instantiation would trap",
                             s.func_indices.len()
                         )
                     },
@@ -2714,38 +3553,51 @@ pub fn target_conformance_obligations(
         ));
     }
 
-    // --- memarg offsets and materialized addresses inhabit the wasm32 space ---
+    // --- memarg alignment within the access; the offset's range ---
     let mut bad_memarg = Vec::new();
     let mut memargs = 0usize;
     for (ord, ins) in m.all_instrs() {
-        if let Imm::MemArg { align_exp, offset } = ins.imm {
+        if let Imm::MemArg { align_exp, .. } = ins.imm {
             memargs += 1;
-            // `offset` is already a decoded u32, so it inhabits the wasm32
-            // address space by construction; what CAN go wrong is an alignment
-            // exponent naming an alignment wider than the access.
-            if align_exp > 3 {
-                bad_memarg.push(format!(
-                    "body {ord}: memarg align exponent {align_exp} claims {}-byte alignment; the \
-                     widest wasm32 scalar access is 8 bytes (exponent 3)",
-                    1u64 << align_exp
-                ));
+            // The spec's validation rule is `2^align <= access bytes`. The
+            // static offset is a u32 by the spec's own production, so its
+            // RANGE needs no check; whether it is the offset the trust-ir
+            // layout intends is not an encoding question and is not checked
+            // here (the value-domain offset obligations state what an offset
+            // means; the lane differentials are the only evidence that the
+            // chosen one is right).
+            let natural = crate::wasm_semantics::decode_mem_op(ins.opcode)
+                .map(|op| op.access_bytes().trailing_zeros());
+            match natural {
+                Some(max) if align_exp <= max => {}
+                Some(max) => bad_memarg.push(format!(
+                    "body {ord}: opcode 0x{:02x} claims {}-byte alignment (exponent {align_exp}); \
+                     its {}-byte access admits at most exponent {max}",
+                    ins.opcode,
+                    1u64 << align_exp.min(63),
+                    1u32 << max
+                )),
+                None => bad_memarg.push(format!(
+                    "body {ord}: opcode 0x{:02x} carries a memarg but is not a modelled \
+                     load/store",
+                    ins.opcode
+                )),
             }
-            let _ = offset;
         }
     }
     if memargs == 0 {
         out.push(EncodingObligation::not_applicable(
             F6,
-            "every memarg's static offset and alignment inhabit the wasm32 scalar access space",
+            "every memarg's alignment is within its access width",
             "this module emits no linear-memory access",
         ));
     } else {
         out.push(check(
             F6,
             format!(
-                "every memarg's alignment exponent is <= 3 (the widest wasm32 scalar access is 8 \
-                 bytes) over {memargs} access(es); the static offset is a u32 by the spec's own \
-                 production, so it inhabits the wasm32 address space by construction"
+                "every memarg's alignment exponent is at most log2 of its opcode's access width \
+                 over {memargs} access(es) (the static offset is a u32 by the spec's own \
+                 production; whether it is the intended layout offset is NOT checked here)"
             ),
             bad_memarg.is_empty(),
             || bad_memarg.join("; "),
@@ -2807,7 +3659,7 @@ pub fn target_conformance_obligations(
     //   * memory limits inhabit the 65536-page wasm32 space and use an MVP
     //     (non-memory64) limits flag;
     //   * every memarg's static offset is a u32 by the spec's own production and
-    //     its alignment exponent is <= 3;
+    //     its alignment exponent is at most log2 of its access width;
     //   * every mutable defined global (the shadow-stack pointer) and every
     //     imported global (a host-published region base) is i32.
     //
@@ -2895,17 +3747,6 @@ pub const WASM_ENCODING_DEFERRALS: &[WasmEncodingDeferral] = &[
                  encoding is proven at the byte level, not through the module",
     },
     WasmEncodingDeferral {
-        name: "f32.const / f64.const immediates",
-        family: "P4 family 5 (byte reconstruction), currently unbuilt",
-        reason: "the float const forms carry a RAW 4/8-byte little-endian IEEE-754 payload, not an \
-                 LEB128, so the independent LEB decoder says nothing about them and the two RED \
-                 rows this family closes are the INTEGER ones. Decoding the raw payload is easy; \
-                 what is NOT easy is the source side, because the trust-ir carries an f64 and the \
-                 f32 form is a lossy `as f32` narrowing whose rounding is its own obligation. \
-                 Stating a bit-pattern equality without stating the narrowing would credit a \
-                 rounding bug, so no obligation is built and the row stays RED",
-    },
-    WasmEncodingDeferral {
         name: "TargetInfo `abi` and `struct_passing`",
         family: "P4 family 6 (target conformance)",
         reason: "the wasm32 pin also declares `abi: None` and `struct_passing: Unclassified`. \
@@ -2918,12 +3759,13 @@ pub const WASM_ENCODING_DEFERRALS: &[WasmEncodingDeferral] = &[
     WasmEncodingDeferral {
         name: "custom sections, the start section, datacount, bulk memory, reference types, SIMD",
         family: "no family — the decoder FAIL-CLOSES on each",
-        reason: "the backend emits none of these today, and the decoder refuses a module \
-                 containing one rather than skipping it. That is deliberate: skipping unexamined \
-                 bytes is how an encoding gate goes quietly vacuous. The cost is equally \
-                 deliberate and named here — the day the backend legitimately emits a name \
-                 section or a bulk-memory op, this family goes RED until its decoder and its \
-                 obligations are extended, which is the correct direction to fail",
+        reason: "the decoder refuses a module containing one rather than skipping it. That is \
+                 deliberate: skipping unexamined bytes is how an encoding gate goes quietly \
+                 vacuous. The cost is equally deliberate and named here: the backend DOES emit \
+                 `memory.copy` / `memory.fill` for trust-ir MemCopy / MemSet and for aggregate \
+                 moves, so a module containing either is refused by this decoder and none of this family's \
+                 obligations run over it, which is the correct direction to fail. The same holds \
+                 the day the backend emits a name section or any other form in this list",
     },
 ];
 
@@ -3245,7 +4087,7 @@ pub fn mutate_drop_last_element(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Rewrite the LAST element-segment entry to function 0, breaking the
-/// `element i == function i` identity while leaving the count intact. Length
+/// `element vector entry i == function i` identity while leaving the count intact. Length
 /// preserving whenever both indices are single-byte, which they are for every
 /// module this backend emits.
 pub fn mutate_element_identity(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -3571,7 +4413,9 @@ mod tests {
     /// substantive reason.
     #[test]
     fn deferrals_are_named_and_substantive() {
-        assert_eq!(WASM_ENCODING_DEFERRALS.len(), 7);
+        // Six: the float-const payload row left when its independent decoder
+        // and narrowing obligation landed.
+        assert_eq!(WASM_ENCODING_DEFERRALS.len(), 6);
         let names: std::collections::HashSet<_> =
             WASM_ENCODING_DEFERRALS.iter().map(|d| d.name).collect();
         assert_eq!(names.len(), WASM_ENCODING_DEFERRALS.len());
@@ -3591,5 +4435,107 @@ mod tests {
     #[test]
     fn the_pin_is_wasm32_le_4() {
         assert_eq!(WASM32_PIN, ("wasm32", 4, true));
+    }
+
+    /// The float const credit stands at both widths, and fails closed on any
+    /// other byte.
+    #[test]
+    fn float_const_credit_stands_at_both_widths() {
+        for op in [OP_F32_CONST, OP_F64_CONST] {
+            let failures = float_const_credit_failures(op, EMITTED_FLOAT_CONST_IMMEDIATES);
+            assert!(failures.is_empty(), "0x{op:02x}: {failures:#?}");
+            assert!(float_const_immediate_discharges_valid(op));
+        }
+        assert!(!float_const_immediate_discharges_valid(OP_I32_CONST));
+    }
+
+    /// The payload decoder is the spec's little-endian production: the digit
+    /// at byte `k` has weight `256^k`, and a short stream is refused.
+    #[test]
+    fn float_payload_decoder_is_little_endian_and_fixed_width() {
+        assert_eq!(
+            spec_decode_float_payload(&[0x01, 0x02, 0x03, 0x04], 32),
+            Ok((0x0403_0201, 4))
+        );
+        assert_eq!(
+            spec_decode_float_payload(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x7f, 0xaa], 64),
+            Ok((0x7ff8_0000_0000_0000, 8))
+        );
+        assert_eq!(
+            spec_decode_float_payload(&[0x00; 7], 64),
+            Err(FloatPayloadError::Truncated {
+                needed: 8,
+                available: 7
+            })
+        );
+        assert_eq!(
+            spec_decode_float_payload(&[0x00; 2], 16),
+            Err(FloatPayloadError::UnsupportedWidth { bits: 16 })
+        );
+    }
+
+    /// The stated narrowing agrees with the host binary64-to-binary32
+    /// conversion — the one the reference interpreter uses for an `F32`
+    /// constant — over edge carriers and a deterministic sweep of both the
+    /// whole pattern space and the binary32 exponent window.
+    #[test]
+    fn stated_narrowing_matches_the_host_conversion() {
+        let mut carriers: Vec<u64> = EMITTED_FLOAT_CONST_IMMEDIATES
+            .iter()
+            .map(|&(c, _, _)| c)
+            .collect();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for i in 0..400_000u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            carriers.push(if i % 2 == 0 {
+                state
+            } else {
+                // Exponent 0x360..=0x480: subnormal, normal and overflowing
+                // binary32 results, where rounding happens.
+                (state & 0x800f_ffff_ffff_ffff) | ((0x360 + (state >> 52) % 0x121) << 52)
+            });
+        }
+        for carrier in carriers {
+            let host = (f64::from_bits(carrier) as f32).to_bits();
+            let stated = spec_narrow_binary64_to_binary32(carrier);
+            if f64::from_bits(carrier).is_nan() {
+                // Rust leaves a NaN cast's payload to the platform; the stated
+                // rule is the IEEE recommended one. Pin NaN-ness and sign here;
+                // the live-module corpus pins the payload.
+                assert!(f32::from_bits(stated).is_nan());
+                assert_eq!(stated >> 31, host >> 31, "carrier 0x{carrier:016x}");
+            } else {
+                assert_eq!(stated, host, "carrier 0x{carrier:016x}");
+            }
+        }
+    }
+
+    /// Every control refutes for its stated reason on some entry of each
+    /// width it applies at, and a doctored corpus is refused.
+    #[test]
+    fn float_const_controls_have_teeth() {
+        // A wrong payload in the corpus.
+        let mut doctored: Vec<EmittedFloatConstImmediate> = EMITTED_FLOAT_CONST_IMMEDIATES.to_vec();
+        let at = doctored
+            .iter()
+            .position(|&(c, w, _)| c == 0x3fb9_9999_9999_999a && w == 32)
+            .expect("0.1 is in the corpus");
+        doctored[at].2 = &[0xcc, 0xcc, 0xcc, 0x3d];
+        assert!(!float_const_credit_failures(OP_F32_CONST, &doctored).is_empty());
+        // A corpus that lost its signalling NaNs.
+        let no_snan: Vec<EmittedFloatConstImmediate> = EMITTED_FLOAT_CONST_IMMEDIATES
+            .iter()
+            .copied()
+            .filter(|&(c, w, _)| !(w == 64 && is_signalling_nan_bits(c, 64)))
+            .collect();
+        let failures = float_const_credit_failures(OP_F64_CONST, &no_snan);
+        assert!(
+            failures.iter().any(|f| f.contains("signalling NaN")),
+            "{failures:#?}"
+        );
+        // An empty corpus is not evidence.
+        assert!(!float_const_credit_failures(OP_F32_CONST, &[]).is_empty());
     }
 }

@@ -25,7 +25,7 @@
 //! lies within the register. Operand roles come from the shared AArch64
 //! use/definition oracle, including tied def-use instructions such as `MOVK`.
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
     AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap, VReg,
@@ -95,8 +95,8 @@ fn run_lsr_and_ubfx(func: &mut MachFunction, mut provenance: Option<&mut Provena
     let mut changed = false;
 
     for block_id in func.block_order.clone() {
-        let mut lsr_defs: HashMap<VReg, ProducerDef> = HashMap::new();
-        let mut last_def_pos: HashMap<VReg, usize> = HashMap::new();
+        let mut lsr_defs: HashMap<VReg, ProducerDef> = HashMap::default();
+        let mut last_def_pos: HashMap<VReg, usize> = HashMap::default();
 
         for (pos, inst_id) in func.block(block_id).insts.clone().into_iter().enumerate() {
             if let Some((lsr_id, mut ubfm)) = try_fuse(
@@ -232,7 +232,7 @@ fn gpr_width(class: RegClass) -> Option<u32> {
 }
 
 fn count_vreg_reads(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);

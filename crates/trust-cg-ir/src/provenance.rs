@@ -3,8 +3,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: designs/2026-04-13-debugging-transparency.md (Provenance Tracking)
-//
 // This module maintains source-to-binary mappings through every compilation
 // stage: ISel creates trust_ir->MachIR mappings, optimization passes update them,
 // and encoding adds the final binary offsets. The transitive closure gives
@@ -37,7 +35,7 @@
 //! | Delete A (DCE) | `record_deletion` | Mark as OptimizedAway with justification |
 //! | Create new inst | `record_creation` | Mark as CompilerGenerated |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -456,10 +454,26 @@ impl ProvenanceEntry {
 /// let offsets = provenance.query_offset(trust_ir_id);   // trust_ir -> [binary offsets]
 /// let sources = provenance.query_source(0x48);       // offset -> [trust_ir ids]
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProvenanceMap {
     /// trust_ir instruction -> MachIR instructions (1:N from ISel).
     trust_ir_to_mach: BTreeMap<TrustIrInstId, Vec<InstId>>,
+    /// Reverse index of `trust_ir_to_mach`: for each MachIR instruction, how
+    /// many times each trust_ir instruction's list names it (keys with a zero
+    /// count are absent). Exact: every mutation of `trust_ir_to_mach` keeps it
+    /// in step, and debug builds re-derive it (`debug_assert_mach_index_exact`,
+    /// on an amortized schedule).
+    ///
+    /// It exists so a replacement or merge rewrites only the lists that the
+    /// rewrite CHANGES, instead of scanning every list of the function: CSE and
+    /// GVN merge each eliminated duplicate into one survivor, and a full scan
+    /// per merge made a merge-heavy module quadratic (75% of a 38 G-instruction
+    /// compile). A list the rewrite leaves unchanged is skipped; the lists
+    /// rewritten are rewritten exactly as the scan rewrote them.
+    mach_to_trust_ir: BTreeMap<InstId, BTreeMap<TrustIrInstId, u32>>,
+    /// The part of the reverse index with a count of two or more: the lists
+    /// that name a MachIR instruction more than once.
+    mach_repeated_in: BTreeMap<InstId, BTreeSet<TrustIrInstId>>,
     /// MachIR instruction -> binary offset (1:1 from encoding).
     mach_to_offset: BTreeMap<InstId, u32>,
     /// Transitive: trust_ir -> binary offsets (built by `build_transitive`).
@@ -472,19 +486,33 @@ pub struct ProvenanceMap {
     var_declaration_order: Vec<TrustIrVarId>,
     /// Source-visible variable live ranges.
     var_locations: BTreeMap<TrustIrVarId, Vec<VarLocation>>,
+    /// Debug builds: mutations since the reverse index was last re-derived
+    /// (see [`Self::debug_assert_mach_index_exact`]).
+    #[cfg(debug_assertions)]
+    debug_mutations_since_check: usize,
 }
+
+/// Debug builds: the whole reverse index is re-derived once the mutations
+/// since the last re-derivation, times this budget, reach the map's size. See
+/// [`ProvenanceMap::debug_assert_mach_index_exact`].
+#[cfg(debug_assertions)]
+const DEBUG_INDEX_CHECK_BUDGET: usize = 32;
 
 impl ProvenanceMap {
     /// Create an empty provenance map.
     pub fn new() -> Self {
         Self {
             trust_ir_to_mach: BTreeMap::new(),
+            mach_to_trust_ir: BTreeMap::new(),
+            mach_repeated_in: BTreeMap::new(),
             mach_to_offset: BTreeMap::new(),
             trust_ir_to_offset: BTreeMap::new(),
             offset_to_trust_ir: BTreeMap::new(),
             entries: BTreeMap::new(),
             var_declaration_order: Vec::new(),
             var_locations: BTreeMap::new(),
+            #[cfg(debug_assertions)]
+            debug_mutations_since_check: 0,
         }
     }
 
@@ -508,9 +536,170 @@ impl ProvenanceMap {
             .extend_from_slice(mach_ids);
 
         for &mach_id in mach_ids {
+            self.add_index_occurrence(mach_id, trust_ir_id);
             self.entries.insert(
                 mach_id,
                 ProvenanceEntry::from_lowering(trust_ir_id, pass.clone()),
+            );
+        }
+        self.debug_assert_mach_index_exact();
+    }
+
+    /// Record one more occurrence of `mach_id` in `trust_ir_id`'s list.
+    fn add_index_occurrence(&mut self, mach_id: InstId, trust_ir_id: TrustIrInstId) {
+        let count = self
+            .mach_to_trust_ir
+            .entry(mach_id)
+            .or_default()
+            .entry(trust_ir_id)
+            .or_insert(0);
+        *count += 1;
+        if *count == 2 {
+            self.mach_repeated_in
+                .entry(mach_id)
+                .or_default()
+                .insert(trust_ir_id);
+        }
+    }
+
+    /// Set the number of times `trust_ir_id`'s list names `mach_id`.
+    fn set_index_count(&mut self, mach_id: InstId, trust_ir_id: TrustIrInstId, count: u32) {
+        if count == 0 {
+            if let Some(keys) = self.mach_to_trust_ir.get_mut(&mach_id) {
+                keys.remove(&trust_ir_id);
+                if keys.is_empty() {
+                    self.mach_to_trust_ir.remove(&mach_id);
+                }
+            }
+        } else {
+            self.mach_to_trust_ir
+                .entry(mach_id)
+                .or_default()
+                .insert(trust_ir_id, count);
+        }
+        if count >= 2 {
+            self.mach_repeated_in
+                .entry(mach_id)
+                .or_default()
+                .insert(trust_ir_id);
+        } else if let Some(keys) = self.mach_repeated_in.get_mut(&mach_id) {
+            keys.remove(&trust_ir_id);
+            if keys.is_empty() {
+                self.mach_repeated_in.remove(&mach_id);
+            }
+        }
+    }
+
+    /// The lists a merge of `sources` into `merged` changes, each once: every
+    /// list naming a source other than `merged`, and, when `merged` is itself a
+    /// source, every list naming it more than once. A list whose only source
+    /// occurrence is a single `merged` is left as it is by the merge, so it is
+    /// not visited.
+    fn lists_changed_by_merge(
+        &self,
+        sources: &[InstId],
+        merged: InstId,
+    ) -> BTreeSet<TrustIrInstId> {
+        let mut keys = BTreeSet::new();
+        for id in sources {
+            if *id == merged {
+                if let Some(repeated) = self.mach_repeated_in.get(id) {
+                    keys.extend(repeated.iter().copied());
+                }
+            } else if let Some(named) = self.mach_to_trust_ir.get(id) {
+                keys.extend(named.keys().copied());
+            }
+        }
+        keys
+    }
+
+    /// Re-count, in the rewritten lists `keys`, the occurrences of each of
+    /// `mach_ids` (the only instructions a rewrite adds to or drops from a
+    /// list).
+    fn recount_index(&mut self, keys: &BTreeSet<TrustIrInstId>, mach_ids: &[InstId]) {
+        for key in keys {
+            for (i, id) in mach_ids.iter().enumerate() {
+                if mach_ids[..i].contains(id) {
+                    continue;
+                }
+                let count = self
+                    .trust_ir_to_mach
+                    .get(key)
+                    .map_or(0, |list| list.iter().filter(|x| *x == id).count());
+                self.set_index_count(*id, *key, u32::try_from(count).unwrap_or(u32::MAX));
+            }
+        }
+    }
+
+    /// Debug builds, after a mutation: re-derive the reverse index on an
+    /// amortized schedule (the mutation methods call this).
+    ///
+    /// A re-derivation costs time and allocations proportional to the whole
+    /// map. Run after every mutation, it made a debug-build compile quadratic
+    /// in function size: `aarch64_compile_scaling` (L14-P6) read 13.5x
+    /// instructions retired per 4x step on a block of calls. It runs once
+    /// `mutations * DEBUG_INDEX_CHECK_BUDGET` reaches the map's size: after
+    /// every mutation while the map holds at most `DEBUG_INDEX_CHECK_BUDGET`
+    /// instructions, and after every `size / DEBUG_INDEX_CHECK_BUDGET`
+    /// mutations above that, so the checks cost about
+    /// `DEBUG_INDEX_CHECK_BUDGET` re-derived instructions per mutation. A drift
+    /// is therefore reported at the next scheduled check instead of at the
+    /// mutation that caused it (unless a later mutation's recount happens to
+    /// repair it), and [`Self::build_transitive`] re-derives the index once
+    /// more, unconditionally. Release builds do nothing here.
+    fn debug_assert_mach_index_exact(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let size = self.mach_to_trust_ir.len() + self.entries.len();
+            let pending = self.debug_mutations_since_check + 1;
+            if pending.saturating_mul(DEBUG_INDEX_CHECK_BUDGET) < size {
+                self.debug_mutations_since_check = pending;
+                return;
+            }
+            self.debug_mutations_since_check = 0;
+            self.debug_assert_mach_index_exact_now();
+        }
+    }
+
+    /// Debug builds: the reverse index holds exactly each instruction's
+    /// occurrence count in each list, the repeated part exactly the counts of
+    /// two or more, and no entry names an origin twice.
+    fn debug_assert_mach_index_exact_now(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let mut derived: BTreeMap<InstId, BTreeMap<TrustIrInstId, u32>> = BTreeMap::new();
+            for (key, list) in &self.trust_ir_to_mach {
+                for id in list {
+                    *derived.entry(*id).or_default().entry(*key).or_insert(0) += 1;
+                }
+            }
+            debug_assert_eq!(
+                derived, self.mach_to_trust_ir,
+                "provenance reverse index drifted"
+            );
+            let repeated: BTreeMap<InstId, BTreeSet<TrustIrInstId>> = derived
+                .iter()
+                .map(|(id, keys)| {
+                    (
+                        *id,
+                        keys.iter()
+                            .filter(|(_, n)| **n >= 2)
+                            .map(|(k, _)| *k)
+                            .collect::<BTreeSet<_>>(),
+                    )
+                })
+                .filter(|(_, keys)| !keys.is_empty())
+                .collect();
+            debug_assert_eq!(
+                repeated, self.mach_repeated_in,
+                "provenance repeat index drifted"
+            );
+            debug_assert!(
+                self.entries.values().all(|entry| {
+                    let unique: BTreeSet<_> = entry.trust_ir_origins.iter().collect();
+                    unique.len() == entry.trust_ir_origins.len()
+                }),
+                "a provenance entry names an origin twice"
             );
         }
     }
@@ -531,14 +720,27 @@ impl ProvenanceMap {
             self.entries.insert(new, entry);
         }
 
-        // Update trust_ir_to_mach: replace old with new in all mappings.
-        for mach_ids in self.trust_ir_to_mach.values_mut() {
-            for id in mach_ids.iter_mut() {
-                if *id == old {
-                    *id = new;
+        // Update trust_ir_to_mach: replace old with new in every mapping that
+        // names it (the reverse index lists exactly those). Replacing an
+        // instruction with itself changes no list.
+        if old != new {
+            let keys: BTreeSet<TrustIrInstId> = self
+                .mach_to_trust_ir
+                .get(&old)
+                .map(|named| named.keys().copied().collect())
+                .unwrap_or_default();
+            for key in &keys {
+                if let Some(mach_ids) = self.trust_ir_to_mach.get_mut(key) {
+                    for id in mach_ids.iter_mut() {
+                        if *id == old {
+                            *id = new;
+                        }
+                    }
                 }
             }
+            self.recount_index(&keys, &[old, new]);
         }
+        self.debug_assert_mach_index_exact();
     }
 
     /// Record that multiple instructions were merged into one.
@@ -546,12 +748,27 @@ impl ProvenanceMap {
     /// The merged instruction inherits provenance from all sources.
     /// Rule: `provenance[merged] = union(provenance[sources])`
     pub fn record_merge(&mut self, sources: &[InstId], merged: InstId, pass: PassId) {
-        // Collect all trust_ir origins from all source entries.
+        // Collect all trust_ir origins from all source entries, first
+        // occurrence first, and their transforms in source order.
         let mut all_origins: Vec<TrustIrInstId> = Vec::new();
         let mut all_transforms: Vec<TransformRecord> = Vec::new();
-
+        let mut first = true;
         for &src in sources {
             if let Some(entry) = self.entries.remove(&src) {
+                if first {
+                    // An entry never names an origin twice (every entry is
+                    // built by a lowering, a clone, a replacement or a
+                    // deduplicating merge, and `debug_assert_mach_index_exact`
+                    // checks it), so the first entry's origins are what the
+                    // deduplicating push would build, in the same order, and
+                    // its transforms are what extending an empty list would
+                    // build. Taking both avoids copying the survivor's history
+                    // on every merge into it.
+                    all_origins = entry.trust_ir_origins;
+                    all_transforms = entry.transforms;
+                    first = false;
+                    continue;
+                }
                 for origin in &entry.trust_ir_origins {
                     if !all_origins.contains(origin) {
                         all_origins.push(*origin);
@@ -575,30 +792,18 @@ impl ProvenanceMap {
         });
         self.entries.insert(merged, merged_entry);
 
-        // Update trust_ir_to_mach: replace all sources with merged.
-        for mach_ids in self.trust_ir_to_mach.values_mut() {
-            let mut found = false;
-            mach_ids.retain(|id| {
-                if sources.contains(id) {
-                    if !found {
-                        found = true;
-                        // Keep this slot, will be overwritten below.
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                }
-            });
-            // Replace the first occurrence of a source with merged.
-            for id in mach_ids.iter_mut() {
-                if sources.contains(id) {
-                    *id = merged;
-                    break;
-                }
+        // Update trust_ir_to_mach: replace all sources with merged in every
+        // mapping the merge changes (see `lists_changed_by_merge`).
+        let keys = self.lists_changed_by_merge(sources, merged);
+        for key in &keys {
+            if let Some(mach_ids) = self.trust_ir_to_mach.get_mut(key) {
+                collapse_sources_into(mach_ids, sources, merged);
             }
         }
+        let mut touched = sources.to_vec();
+        touched.push(merged);
+        self.recount_index(&keys, &touched);
+        self.debug_assert_mach_index_exact();
     }
 
     /// Record that consumed instructions and still-live dependencies were
@@ -661,34 +866,24 @@ impl ProvenanceMap {
         });
         self.entries.insert(merged, merged_entry);
 
-        for mach_ids in self.trust_ir_to_mach.values_mut() {
-            let mut found = false;
-            mach_ids.retain(|id| {
-                if consumed_sources.contains(id) {
-                    if !found {
-                        found = true;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                }
-            });
-            for id in mach_ids.iter_mut() {
-                if consumed_sources.contains(id) {
-                    *id = merged;
-                    break;
-                }
+        let keys = self.lists_changed_by_merge(consumed_sources, merged);
+        for key in &keys {
+            if let Some(mach_ids) = self.trust_ir_to_mach.get_mut(key) {
+                collapse_sources_into(mach_ids, consumed_sources, merged);
             }
         }
+        let mut touched = consumed_sources.to_vec();
+        touched.push(merged);
+        self.recount_index(&keys, &touched);
 
         for origin in all_origins {
             let mach_ids = self.trust_ir_to_mach.entry(origin).or_default();
             if !mach_ids.contains(&merged) {
                 mach_ids.push(merged);
+                self.add_index_occurrence(merged, origin);
             }
         }
+        self.debug_assert_mach_index_exact();
     }
 
     /// Record that an optimization pass cloned `source` into `clone`.
@@ -715,8 +910,10 @@ impl ProvenanceMap {
             let mach_ids = self.trust_ir_to_mach.entry(origin).or_default();
             if !mach_ids.contains(&clone) {
                 mach_ids.push(clone);
+                self.add_index_occurrence(clone, origin);
             }
         }
+        self.debug_assert_mach_index_exact();
     }
 
     /// Record that an instruction was deleted by an optimization pass (DCE).
@@ -966,6 +1163,7 @@ impl ProvenanceMap {
     /// Must be called after all encoding is complete. Populates
     /// `trust_ir_to_offset` and `offset_to_trust_ir` for query use.
     pub fn build_transitive(&mut self) {
+        self.debug_assert_mach_index_exact_now();
         self.trust_ir_to_offset.clear();
         self.offset_to_trust_ir.clear();
 
@@ -1109,6 +1307,51 @@ impl Default for ProvenanceMap {
     }
 }
 
+/// The derived `Debug` of the map's recorded state. The reverse index is a
+/// cache of `trust_ir_to_mach` and is not printed, so the rendering is the one
+/// the map had before it carried the index.
+impl core::fmt::Debug for ProvenanceMap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ProvenanceMap")
+            .field("trust_ir_to_mach", &self.trust_ir_to_mach)
+            .field("mach_to_offset", &self.mach_to_offset)
+            .field("trust_ir_to_offset", &self.trust_ir_to_offset)
+            .field("offset_to_trust_ir", &self.offset_to_trust_ir)
+            .field("entries", &self.entries)
+            .field("var_declaration_order", &self.var_declaration_order)
+            .field("var_locations", &self.var_locations)
+            .finish()
+    }
+}
+
+/// Rewrite one trust_ir -> MachIR list for a merge of `sources` into
+/// `merged`: keep only the first occurrence of any source, drop the others,
+/// and replace that first occurrence with `merged`. A list naming no source is
+/// unchanged.
+fn collapse_sources_into(mach_ids: &mut Vec<InstId>, sources: &[InstId], merged: InstId) {
+    let mut found = false;
+    mach_ids.retain(|id| {
+        if sources.contains(id) {
+            if !found {
+                found = true;
+                // Keep this slot, will be overwritten below.
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    });
+    // Replace the first occurrence of a source with merged.
+    for id in mach_ids.iter_mut() {
+        if sources.contains(id) {
+            *id = merged;
+            break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ProvenanceStats — summary statistics
 // ---------------------------------------------------------------------------
@@ -1235,6 +1478,46 @@ impl SourceInstDigest {
         for b in opcode_debug.as_bytes() {
             step(*b);
         }
+        step(0xFF);
+        for b in (num_args as u64).to_le_bytes() {
+            step(b);
+        }
+        for b in (num_results as u64).to_le_bytes() {
+            step(b);
+        }
+        Self(h)
+    }
+
+    /// [`Self::compute`] over `opcode`'s `Debug` rendering, streamed into the
+    /// hash as it is written instead of first collected into a `String`: the
+    /// same bytes in the same order, so the same digest, without the per-call
+    /// allocation (this runs once per selected source instruction).
+    pub fn compute_debug<T: std::fmt::Debug + ?Sized>(
+        opcode: &T,
+        num_args: usize,
+        num_results: usize,
+    ) -> Self {
+        struct Fnv(u64);
+        impl std::fmt::Write for Fnv {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                for byte in text.bytes() {
+                    self.0 ^= u64::from(byte);
+                    self.0 = self.0.wrapping_mul(SourceInstDigest::FNV_PRIME);
+                }
+                Ok(())
+            }
+        }
+        let mut fnv = Fnv(Self::FNV_OFFSET);
+        // Writing to `Fnv` cannot fail; a `Debug` impl that reports an error
+        // would make `format!` panic, so fall back to exactly that path.
+        if std::fmt::Write::write_fmt(&mut fnv, format_args!("{opcode:?}")).is_err() {
+            return Self::compute(&format!("{opcode:?}"), num_args, num_results);
+        }
+        let mut h = fnv.0;
+        let mut step = |byte: u8| {
+            h ^= u64::from(byte);
+            h = h.wrapping_mul(Self::FNV_PRIME);
+        };
         step(0xFF);
         for b in (num_args as u64).to_le_bytes() {
             step(b);
@@ -2382,6 +2665,24 @@ mod tests {
         assert_ne!(a, SourceInstDigest::compute("Isub", 2, 1));
         assert_ne!(a, SourceInstDigest::compute("Iadd", 1, 1));
         assert_ne!(a, SourceInstDigest::compute("Iadd", 2, 0));
+        // The streamed form hashes exactly the rendered bytes.
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        enum Op {
+            Iadd,
+            Iconst { ty: &'static str, imm: i64 },
+            Wide(Vec<u8>, Option<(u32, char)>),
+        }
+        for (op, args, results) in [
+            (Op::Iadd, 2, 1),
+            (Op::Iconst { ty: "I64", imm: -5 }, 0, 1),
+            (Op::Wide(vec![1, 2, 255], Some((7, '\u{e9}'))), 3, 0),
+        ] {
+            assert_eq!(
+                SourceInstDigest::compute_debug(&op, args, results),
+                SourceInstDigest::compute(&format!("{op:?}"), args, results)
+            );
+        }
         assert_ne!(
             SourceInstDigest::compute("Iconst { ty: I32, imm: 5 }", 0, 1),
             SourceInstDigest::compute("Iconst { ty: I64, imm: 5 }", 0, 1),
@@ -2428,5 +2729,240 @@ mod tests {
         assert_eq!(cov.per_opcode["MovRR"].synthetic, 2);
         assert_eq!(cov.totals(), (2, 2));
         assert!((cov.source_attributed_fraction() - 0.5).abs() < 1e-12);
+    }
+
+    /// The trust_ir -> MachIR lists and the per-instruction entries the
+    /// full-scan implementation produced before the reverse index, kept
+    /// verbatim as the oracle.
+    #[derive(Default)]
+    struct ScanReference {
+        lists: BTreeMap<TrustIrInstId, Vec<InstId>>,
+        entries: BTreeMap<InstId, ProvenanceEntry>,
+    }
+
+    impl ScanReference {
+        fn lowering(&mut self, key: TrustIrInstId, ids: &[InstId], pass: PassId) {
+            self.lists.entry(key).or_default().extend_from_slice(ids);
+            for &id in ids {
+                self.entries
+                    .insert(id, ProvenanceEntry::from_lowering(key, pass.clone()));
+            }
+        }
+        fn replacement(&mut self, old: InstId, new: InstId, pass: PassId) {
+            if let Some(mut entry) = self.entries.remove(&old) {
+                entry.transforms.push(TransformRecord {
+                    pass,
+                    kind: TransformKind::Replaced { old },
+                });
+                self.entries.insert(new, entry);
+            }
+            for ids in self.lists.values_mut() {
+                for id in ids.iter_mut() {
+                    if *id == old {
+                        *id = new;
+                    }
+                }
+            }
+        }
+        fn collapse(&mut self, sources: &[InstId], merged: InstId) {
+            for ids in self.lists.values_mut() {
+                let mut found = false;
+                ids.retain(|id| {
+                    if sources.contains(id) {
+                        if !found {
+                            found = true;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                });
+                for id in ids.iter_mut() {
+                    if sources.contains(id) {
+                        *id = merged;
+                        break;
+                    }
+                }
+            }
+        }
+        fn merge(&mut self, sources: &[InstId], merged: InstId, pass: PassId) {
+            let mut all_origins: Vec<TrustIrInstId> = Vec::new();
+            let mut all_transforms: Vec<TransformRecord> = Vec::new();
+            for &src in sources {
+                if let Some(entry) = self.entries.remove(&src) {
+                    for origin in &entry.trust_ir_origins {
+                        if !all_origins.contains(origin) {
+                            all_origins.push(*origin);
+                        }
+                    }
+                    all_transforms.extend(entry.transforms);
+                }
+            }
+            let mut merged_entry = ProvenanceEntry {
+                trust_ir_origins: all_origins,
+                transforms: all_transforms,
+                status: ProvenanceStatus::Active,
+            };
+            merged_entry.transforms.push(TransformRecord {
+                pass,
+                kind: TransformKind::Merged {
+                    sources: sources.to_vec(),
+                },
+            });
+            self.entries.insert(merged, merged_entry);
+            self.collapse(sources, merged);
+        }
+        fn merge_live(
+            &mut self,
+            consumed: &[InstId],
+            live: &[InstId],
+            merged: InstId,
+            pass: PassId,
+        ) {
+            let mut all_origins: Vec<TrustIrInstId> = Vec::new();
+            let mut all_transforms: Vec<TransformRecord> = Vec::new();
+            let mut all_sources: Vec<InstId> = Vec::new();
+            for &src in live {
+                if let Some(entry) = self.entries.get(&src) {
+                    for origin in &entry.trust_ir_origins {
+                        if !all_origins.contains(origin) {
+                            all_origins.push(*origin);
+                        }
+                    }
+                    all_transforms.extend(entry.transforms.clone());
+                    if !all_sources.contains(&src) {
+                        all_sources.push(src);
+                    }
+                }
+            }
+            for &src in consumed {
+                if let Some(entry) = self.entries.remove(&src) {
+                    for origin in &entry.trust_ir_origins {
+                        if !all_origins.contains(origin) {
+                            all_origins.push(*origin);
+                        }
+                    }
+                    all_transforms.extend(entry.transforms);
+                    if !all_sources.contains(&src) {
+                        all_sources.push(src);
+                    }
+                }
+            }
+            let mut merged_entry = ProvenanceEntry {
+                trust_ir_origins: all_origins.clone(),
+                transforms: all_transforms,
+                status: ProvenanceStatus::Active,
+            };
+            merged_entry.transforms.push(TransformRecord {
+                pass,
+                kind: TransformKind::Merged {
+                    sources: all_sources,
+                },
+            });
+            self.entries.insert(merged, merged_entry);
+            self.collapse(consumed, merged);
+            for origin in all_origins {
+                let ids = self.lists.entry(origin).or_default();
+                if !ids.contains(&merged) {
+                    ids.push(merged);
+                }
+            }
+        }
+        fn clone_inst(&mut self, source: InstId, clone: InstId, pass: PassId) {
+            let Some(mut entry) = self.entries.get(&source).cloned() else {
+                return;
+            };
+            entry.transforms.push(TransformRecord {
+                pass,
+                kind: TransformKind::Cloned { source },
+            });
+            self.entries.insert(clone, entry.clone());
+            for origin in entry.trust_ir_origins {
+                let ids = self.lists.entry(origin).or_default();
+                if !ids.contains(&clone) {
+                    ids.push(clone);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_rewrites_equal_the_full_scan_on_random_histories() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |bound: u32| -> u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(bound)) as u32
+        };
+        let mut merges_into_a_source = 0usize;
+        for _history in 0..600 {
+            let mut map = ProvenanceMap::new();
+            let mut reference = ScanReference::default();
+            // Small id spaces force duplicates, self-merges and old == new.
+            let n_keys = 1 + next(6);
+            let n_ids = 2 + next(10);
+            for step in 0..60u32 {
+                let pass = PassId::new(format!("p{}", step % 3));
+                match next(7) {
+                    0 | 1 => {
+                        let key = TrustIrInstId(next(n_keys));
+                        let ids: Vec<InstId> = (0..next(4)).map(|_| InstId(next(n_ids))).collect();
+                        map.record_lowering(key, &ids, pass.clone());
+                        reference.lowering(key, &ids, pass);
+                    }
+                    2 => {
+                        let (old, new) = (InstId(next(n_ids)), InstId(next(n_ids)));
+                        map.record_replacement(old, new, pass.clone());
+                        reference.replacement(old, new, pass);
+                    }
+                    3 | 4 => {
+                        let sources: Vec<InstId> =
+                            (0..1 + next(3)).map(|_| InstId(next(n_ids))).collect();
+                        // Half the merges fold into one of their sources, the
+                        // CSE/GVN shape (survivor first or not).
+                        let merged = if next(2) == 0 {
+                            merges_into_a_source += 1;
+                            sources[next(sources.len() as u32) as usize]
+                        } else {
+                            InstId(next(n_ids))
+                        };
+                        map.record_merge(&sources, merged, pass.clone());
+                        reference.merge(&sources, merged, pass);
+                    }
+                    5 => {
+                        let consumed: Vec<InstId> =
+                            (0..next(3)).map(|_| InstId(next(n_ids))).collect();
+                        let live: Vec<InstId> = (0..next(3)).map(|_| InstId(next(n_ids))).collect();
+                        let merged = InstId(next(n_ids));
+                        map.record_merge_with_live_sources(&consumed, &live, merged, pass.clone());
+                        reference.merge_live(&consumed, &live, merged, pass);
+                    }
+                    _ => {
+                        let (source, clone) = (InstId(next(n_ids)), InstId(next(n_ids)));
+                        map.record_clone(source, clone, pass.clone());
+                        reference.clone_inst(source, clone, pass);
+                    }
+                }
+                assert_eq!(map.trust_ir_to_mach, reference.lists);
+                assert_eq!(
+                    format!("{:?}", map.entries),
+                    format!("{:?}", reference.entries)
+                );
+                map.debug_assert_mach_index_exact_now();
+            }
+        }
+        assert!(merges_into_a_source > 1000);
+    }
+
+    #[test]
+    fn debug_rendering_omits_the_reverse_index() {
+        let mut map = ProvenanceMap::new();
+        map.record_lowering(TrustIrInstId(1), &[InstId(3), InstId(4)], isel_pass());
+        let rendered = format!("{map:?}");
+        assert!(rendered.starts_with("ProvenanceMap { trust_ir_to_mach: {"));
+        assert!(!rendered.contains("mach_to_trust_ir"));
     }
 }

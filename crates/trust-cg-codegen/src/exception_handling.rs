@@ -44,9 +44,47 @@
 //! | Type Table             |
 //! |  (grows backward from  |
 //! |   TType base offset)   |
-//! |  - type info pointers  |  4 bytes each (udata4 encoding)
+//! |  - type info pointers  |  4 bytes each, DW_EH_PE_indirect|pcrel|sdata4
 //! +-----------------------+
 //! ```
+//!
+//! # Type table binding and the selector contract
+//!
+//! trust-ir's `Inst::LandingPad` names catch clauses by `catch_type_indices`
+//! only (`0` is catch-all); it carries no typeinfo symbols. The compiler
+//! binds those indices through the function's EH type table
+//! (`ExceptionHandlingMetadata::eh_type_table`, entry `k - 1` is the symbol
+//! for catch type index `k`), which the lowering adapter reads from the
+//! module's reserved `__trust_cg_eh_type_table` global when (and only when)
+//! one of the function's trust-ir landing pads catches a typed exception.
+//! The LSDA type table then uses IDENTITY slots: slot `k` holds the typeinfo
+//! of catch type index `k` (unreferenced slots are NULL and inert), and the
+//! catch-all NULL slot is slot `N + 1`, where `N` is the length of the
+//! function's EH type table: the module table's length in a function that
+//! catches a typed exception, `0` otherwise. `N` is fixed by the trust-ir
+//! input at lowering, so it does not depend on which landing pads survive
+//! optimization, on the optimization level, or on the emitter.
+//!
+//! Typed catches are bound only under `__gxx_personality_v0`. libc++abi
+//! delivers the matched action's type-table slot as the landing pad's
+//! selector, so the `LandingPad` result `results[1]` equals the matched catch
+//! type index, and a catch-all match yields `N + 1` (`1` in a function that
+//! catches no typed exception). `rust_eh_personality` ignores the type table:
+//! it enters the pad for any positive first action and always delivers
+//! selector `0`, so a typed catch under it would silently become a catch-all
+//! whose selector never matches; both the lowering adapter and this builder
+//! refuse it by name (`[TCG-EH-TTYPE]`). Each typed slot is a 4-byte zero
+//! placeholder carrying one [`LsdaTypeInfoRelocation`]; the object emitter
+//! must bind every relocation (Mach-O: `ARM64_RELOC_POINTER_TO_GOT`,
+//! pc-relative) or refuse.
+//!
+//! The compiler's [`RUST_EH_EMPTY_FILTER`] extension uses an otherwise
+//! unrepresentable positive catch index as the sole clause of a non-cleanup
+//! Rust pad. It emits terminal action -1 and an empty filter list at TType
+//! base. Rust stops phase-one search here, but skips this pad during forced
+//! unwinding. The adapter and this builder reject mixed clauses, cleanup,
+//! and other personalities. General exception-specification lists remain
+//! unsupported. These EH tables remain part of the disclosed trusted base.
 //!
 //! # Personality routines
 //!
@@ -57,11 +95,18 @@
 //! - `rust_eh_personality` — Rust panic unwinding
 //! - `__gcc_personality_v0` — C cleanup-only
 
+use trust_cg_ir::EhTypeTable;
+use trust_cg_lower::function::{RUST_EH_EMPTY_FILTER, validate_rust_eh_empty_filter};
+
 /// Canonical linker-level Rust personality name before object-format mangling.
 /// Mach-O adds its one platform underscore at emission; ELF uses this spelling
 /// directly. Historical `_rust_eh_personality` / `__rust_eh_personality`
 /// spellings are object-level/internal aliases, not portable linker names.
 pub const RUST_EH_PERSONALITY_SYMBOL: &str = "rust_eh_personality";
+
+/// The Itanium C++ personality, the only routine under which typed catches
+/// are bound: it reports the matched type-table slot as the selector.
+pub(crate) const CXX_PERSONALITY_SYMBOL: &str = "__gxx_personality_v0";
 
 /// Why an EH personality symbol cannot be represented safely in an object.
 ///
@@ -105,17 +150,58 @@ pub(crate) enum ExceptionTableBuildError {
     /// the intended handler order.
     #[error("landing pad at byte offset {offset} repeats catch type index {type_index}")]
     DuplicateCatchType { offset: u32, type_index: u32 },
-    /// Positive typed catches need typeinfo symbol relocations, not numeric IDs.
+    /// Positive typed catches need typeinfo symbol relocations, not numeric
+    /// IDs. Emitters that publish LSDA bytes without a relocation channel
+    /// (the x86-64 object paths and the synthetic filler LSDAs) use the
+    /// byte-only builder and refuse typed catches by this name.
     #[error(
-        "landing pad at byte offset {offset} uses typed catch index {type_index}, but the LSDA byte-only path has no typeinfo-symbol relocation authority; only catch-all index 0 and cleanup are currently wired"
+        "landing pad at byte offset {offset} uses typed catch index {type_index}, but the LSDA byte-only path has no typeinfo-symbol relocation authority; only catch-all index 0 and cleanup are wired on this emitter"
     )]
     TypedCatchRelocationUnsupported { offset: u32, type_index: u32 },
+    /// A typed catch index must be bound by the function's EH type table.
+    #[error(
+        "landing pad at byte offset {offset} uses typed catch index {type_index}, but the function's EH type table binds only {table_len} typeinfo symbol(s) [TCG-EH-TTYPE]"
+    )]
+    TypedCatchUnbound {
+        offset: u32,
+        type_index: u32,
+        table_len: u64,
+    },
+    /// Only `__gxx_personality_v0` reports the matched type-table slot as the
+    /// selector; `rust_eh_personality` ignores the type table and delivers
+    /// selector 0, so a typed catch under any other routine is refused.
+    #[error(
+        "landing pad at byte offset {offset} uses typed catch index {type_index} under personality `{personality}`, which ignores the LSDA type table (it enters the pad for any positive first action and delivers selector 0); typed catches are bound only under `__gxx_personality_v0` [TCG-EH-TTYPE]"
+    )]
+    TypedCatchPersonalityUnsupported {
+        offset: u32,
+        type_index: u32,
+        personality: String,
+    },
+    /// A typeinfo symbol must be representable in an object symbol table.
+    #[error(
+        "EH type table entry {type_index} names an unrepresentable typeinfo symbol {symbol:?} (empty or embedded NUL) [TCG-EH-TTYPE]"
+    )]
+    InvalidTypeInfoSymbol { type_index: u32, symbol: String },
+    /// Only the explicitly bound empty Rust filter is representable.
+    #[error(
+        "action record {action_index} uses an unbound exception-specification filter {type_filter} [TCG-EH-FILTER]"
+    )]
+    ExceptionSpecificationFilterUnsupported {
+        action_index: usize,
+        type_filter: i32,
+    },
+    #[error("invalid empty exception filter at landing pad {offset}: {detail}")]
+    InvalidEmptyFilter { offset: u32, detail: &'static str },
     /// The serialized action table uses 1-based `u32` byte offsets.
     #[error("serialized LSDA action table exceeds its u32 byte-offset domain")]
     ActionTableTooLarge,
     /// Positive type filters are signed 32-bit indices in an action record.
     #[error("LSDA type table has too many entries for an i32 action filter")]
     TypeTableTooLarge,
+    /// The assembled LSDA layout exceeds the host's addressable byte domain.
+    #[error("serialized LSDA layout exceeds the host address space")]
+    LsdaLayoutTooLarge,
     /// A zero-sized region can never match an instruction pointer.
     #[error("call-site range {index} at byte offset {start} has zero length")]
     EmptyCallSite { index: usize, start: u32 },
@@ -338,31 +424,114 @@ impl ActionEntry {
 
 /// A type info entry in the LSDA type table.
 ///
-/// Each entry holds a reference to a type info object (e.g.,
-/// `std::type_info` for C++). The index is used by action entries
-/// to identify which exception types to catch.
-///
-/// Index 0 is reserved for "cleanup" (no specific type match).
+/// Each entry is a 4-byte `DW_EH_PE_indirect|pcrel|sdata4` reference to a
+/// type info object (e.g. `std::type_info` for C++). A bound entry is a zero
+/// placeholder plus one [`LsdaTypeInfoRelocation`] the object emitter must
+/// resolve; an unbound entry is the literal NULL the personality treats as
+/// "match any type" (`catch(...)`), or an inert unreferenced slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeInfo {
-    /// Type info index. For now this is an opaque index that will be
-    /// resolved to a symbol reference or relocation during object emission.
-    /// 0 = catch-all / cleanup (matches any type).
-    pub type_info_index: u32,
+    /// Linker-level typeinfo symbol (no object-format prefix), or `None` for
+    /// a NULL slot.
+    pub symbol: Option<String>,
 }
 
 impl TypeInfo {
-    /// Create a type info entry.
-    pub fn new(index: u32) -> Self {
+    /// Create a type info entry bound to a typeinfo symbol.
+    pub fn bound(symbol: impl Into<String>) -> Self {
         Self {
-            type_info_index: index,
+            symbol: Some(symbol.into()),
         }
     }
 
-    /// Create a catch-all type info entry (index 0).
+    /// Create a NULL type info entry (catch-all, or an inert unused slot).
     pub fn catch_all() -> Self {
-        Self { type_info_index: 0 }
+        Self { symbol: None }
     }
+}
+
+/// The LSDA type table: slots `1..=len`, each a typeinfo pointer. Only the
+/// bound slots are stored; every other slot is a NULL typeinfo (the catch-all,
+/// or an inert slot no action names). A table of `len` slots therefore costs
+/// its bound entries, not `len`: the identity slots below the catch-all of a
+/// long module table (trust-ir v50 splat tables included) are appended in
+/// O(1), and only the serialized image is `4 * len` bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LsdaTypeTable {
+    len: u32,
+    /// `(slot, symbol)` of every bound slot, in ascending slot order.
+    bound: Vec<(u32, String)>,
+}
+
+impl LsdaTypeTable {
+    /// The number of slots.
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// Whether the table has no slot.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Append one slot and return its 1-based slot number, or `None` when
+    /// the table already has `u32::MAX` slots.
+    pub fn push(&mut self, entry: TypeInfo) -> Option<u32> {
+        let slot = self.len.checked_add(1)?;
+        if let Some(symbol) = entry.symbol {
+            self.bound.push((slot, symbol));
+        }
+        self.len = slot;
+        Some(slot)
+    }
+
+    /// Append `count` NULL slots in O(1), or `None` when the table would
+    /// pass `u32::MAX` slots.
+    pub fn push_null_slots(&mut self, count: u32) -> Option<()> {
+        self.len = self.len.checked_add(count)?;
+        Some(())
+    }
+
+    /// The entry at 1-based `slot`, or `None` outside `1..=len`.
+    pub fn get(&self, slot: u32) -> Option<TypeInfo> {
+        if slot == 0 || slot > self.len {
+            return None;
+        }
+        Some(
+            match self.bound.binary_search_by_key(&slot, |(bound, _)| *bound) {
+                Ok(index) => TypeInfo::bound(self.bound[index].1.clone()),
+                Err(_) => TypeInfo::catch_all(),
+            },
+        )
+    }
+
+    /// The bound slots `(slot, symbol)`, in ascending slot order.
+    pub fn bound_slots(&self) -> &[(u32, String)] {
+        &self.bound
+    }
+}
+
+/// One typeinfo pointer slot of a serialized LSDA that the object emitter
+/// must relocate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsdaTypeInfoRelocation {
+    /// Byte offset of the 4-byte slot within the LSDA bytes.
+    pub offset: u32,
+    /// Linker-level typeinfo symbol (no object-format prefix).
+    pub symbol: String,
+}
+
+/// Serialized LSDA bytes together with the typeinfo relocations they need.
+///
+/// `bytes` alone is never a complete exception table when
+/// `typeinfo_relocations` is non-empty: every listed slot is a zero
+/// placeholder that reads as a catch-all until the emitter binds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsdaImage {
+    /// The `__gcc_except_tab` / `.gcc_except_table` bytes.
+    pub bytes: Vec<u8>,
+    /// Typeinfo slots to relocate, in ascending `offset` order.
+    pub typeinfo_relocations: Vec<LsdaTypeInfoRelocation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -380,10 +549,13 @@ pub struct ExceptionTable {
     pub call_sites: Vec<CallSiteEntry>,
     /// Action entries (type filter chains for landing pads).
     pub actions: Vec<ActionEntry>,
-    /// Type info entries (exception type references).
-    pub type_infos: Vec<TypeInfo>,
+    /// Type-table slots (exception type references), stored sparsely.
+    pub type_table: LsdaTypeTable,
     /// Personality routine symbol name (e.g., "__gxx_personality_v0").
     pub personality: Option<String>,
+    /// Bind action -1 to a single zero byte at the type-table base. Set only
+    /// by the checked Rust empty-filter builder, never inferred from an action.
+    has_empty_filter: bool,
 }
 
 impl ExceptionTable {
@@ -392,8 +564,9 @@ impl ExceptionTable {
         Self {
             call_sites: Vec::new(),
             actions: Vec::new(),
-            type_infos: Vec::new(),
+            type_table: LsdaTypeTable::default(),
             personality: None,
+            has_empty_filter: false,
         }
     }
 
@@ -402,8 +575,9 @@ impl ExceptionTable {
         Self {
             call_sites: Vec::new(),
             actions: Vec::new(),
-            type_infos: Vec::new(),
+            type_table: LsdaTypeTable::default(),
             personality: Some("__gxx_personality_v0".to_string()),
+            has_empty_filter: false,
         }
     }
 
@@ -412,8 +586,9 @@ impl ExceptionTable {
         Self {
             call_sites: Vec::new(),
             actions: Vec::new(),
-            type_infos: Vec::new(),
+            type_table: LsdaTypeTable::default(),
             personality: Some(RUST_EH_PERSONALITY_SYMBOL.to_string()),
+            has_empty_filter: false,
         }
     }
 
@@ -432,10 +607,10 @@ impl ExceptionTable {
         self.actions.len() as u32
     }
 
-    /// Add a type info entry. Returns the 1-based type index.
-    pub fn add_type_info(&mut self, entry: TypeInfo) -> u32 {
-        self.type_infos.push(entry);
-        self.type_infos.len() as u32
+    /// Add a type info entry. Returns the 1-based type index, or `None`
+    /// when the table already has `u32::MAX` slots.
+    pub fn add_type_info(&mut self, entry: TypeInfo) -> Option<u32> {
+        self.type_table.push(entry)
     }
 
     /// Returns true if there are no call sites (no exception handling needed).
@@ -536,8 +711,14 @@ fn uleb128_encoded_len(mut value: u64) -> usize {
 /// `ttype_base` itself includes the padding. In particular, adding alignment
 /// bytes can cross a ULEB128 width boundary such as 127 -> 128. A one-pass
 /// estimate therefore produces a misaligned table for reachable table sizes.
-fn type_table_layout(pre_type_len: usize, type_data_len: usize) -> (usize, usize) {
+fn type_table_layout(
+    pre_type_len: usize,
+    type_data_len: usize,
+) -> Result<(usize, usize), ExceptionTableBuildError> {
     const HEADER_BEFORE_BASE: usize = 2; // LPStart encoding + TType encoding
+    const {
+        assert!(usize::BITS <= u64::BITS);
+    }
 
     // Once a ULEB width boundary has been crossed, at most three additional
     // bytes are needed to find the next 4-byte-aligned address. Searching the
@@ -547,18 +728,22 @@ fn type_table_layout(pre_type_len: usize, type_data_len: usize) -> (usize, usize
         let ttype_base = pre_type_len
             .checked_add(pad)
             .and_then(|value| value.checked_add(type_data_len))
-            .expect("allocated LSDA components must fit in usize");
-        let encoded_base =
-            u64::try_from(ttype_base).expect("supported targets have at most 64-bit usize");
+            .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+        let encoded_base = ttype_base as u64;
         let type_table_start = HEADER_BEFORE_BASE
             .checked_add(uleb128_encoded_len(encoded_base))
             .and_then(|value| value.checked_add(pre_type_len))
             .and_then(|value| value.checked_add(pad))
-            .expect("allocated LSDA components must fit in usize");
+            .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+        type_table_start
+            .checked_add(type_data_len)
+            .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
         if type_table_start.is_multiple_of(4) {
-            return (pad, ttype_base);
+            return Ok((pad, ttype_base));
         }
-        pad = pad.checked_add(1).expect("LSDA alignment padding overflow");
+        pad = pad
+            .checked_add(1)
+            .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
     }
 }
 
@@ -625,26 +810,38 @@ fn emit_action_table(actions: &[ActionEntry]) -> Vec<u8> {
 // Type table emission
 // ---------------------------------------------------------------------------
 
-/// Emit the type table as raw bytes.
+/// The type table's byte length plus the table-relative offsets of the bound
+/// (symbol-carrying) slots.
 ///
-/// Type info entries are emitted in reverse order (the Itanium ABI
+/// Type info entries are laid out in reverse order (the Itanium ABI
 /// specifies that the type table grows backward from the TType base).
-/// Each entry is a 4-byte value (for DW_EH_PE_udata4 encoding).
-///
-/// The entries are emitted in the order they appear in the `type_infos`
-/// slice, but the personality routine indexes them backwards from the
-/// TType base offset. Entry at index 1 is the last 4 bytes before the
-/// TType base, entry 2 is 8 bytes before, etc.
-fn emit_type_table(type_infos: &[TypeInfo]) -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // Type table entries are stored in reverse order so that
-    // type_info[1] is at (TType_base - 4), type_info[2] at (TType_base - 8), etc.
-    for ti in type_infos.iter().rev() {
-        data.extend_from_slice(&ti.type_info_index.to_le_bytes());
+/// Each entry is a 4-byte `DW_EH_PE_indirect|pcrel|sdata4` field: slot 1 is
+/// the last 4 bytes before the TType base, slot 2 is 8 bytes before, etc.
+/// Every slot's bytes are zero (a NULL, or a placeholder for a bound slot's
+/// relocation), so the image is written by the caller as one zero run; the
+/// returned `(offset, symbol)` pairs name the bound slots in ascending offset
+/// order. The cost is the bound slots, never the slot count.
+fn emit_type_table(
+    table: &LsdaTypeTable,
+) -> Result<(usize, Vec<(usize, String)>), ExceptionTableBuildError> {
+    let slot_offset = |slot: u32| {
+        usize::try_from(table.len - slot)
+            .ok()
+            .and_then(|slots_after| slots_after.checked_mul(4))
+            .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)
+    };
+    let byte_len = usize::try_from(table.len)
+        .ok()
+        .and_then(|slots| slots.checked_mul(4))
+        .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+    let mut bound = Vec::new();
+    bound
+        .try_reserve_exact(table.bound.len())
+        .map_err(|_| ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+    for (slot, symbol) in table.bound.iter().rev() {
+        bound.push((slot_offset(*slot)?, symbol.clone()));
     }
-
-    data
+    Ok((byte_len, bound))
 }
 
 // ---------------------------------------------------------------------------
@@ -667,18 +864,38 @@ fn emit_type_table(type_infos: &[TypeInfo]) -> Vec<u8> {
 ///
 /// # Returns
 ///
-/// A `Vec<u8>` containing the serialized LSDA bytes.
-fn generate_lsda(table: &ExceptionTable) -> Vec<u8> {
+/// The serialized LSDA image (bytes plus typeinfo relocations), or an error
+/// if the table carries an unmodelled filter or its layout is too large.
+fn generate_lsda(table: &ExceptionTable) -> Result<LsdaImage, ExceptionTableBuildError> {
+    const {
+        assert!(usize::BITS <= u64::BITS);
+    }
+    // Negative actions must bind the checked, empty Rust filter list. No
+    // arbitrary negative action may read past the type table.
+    if let Some((action_index, action)) = table.actions.iter().enumerate().find(|(_, action)| {
+        action.type_filter < 0
+            && !(table.has_empty_filter
+                && table.personality.as_deref() == Some(RUST_EH_PERSONALITY_SYMBOL)
+                && action.type_filter == -1
+                && action.next_action_offset == 0)
+    }) {
+        return Err(
+            ExceptionTableBuildError::ExceptionSpecificationFilterUnsupported {
+                action_index,
+                type_filter: action.type_filter,
+            },
+        );
+    }
     // Match clang/LLVM's AArch64 macOS call-site encoding (ULEB128). The
     // encoding byte is self-describing, so the host `__gxx_personality_v0`
     // decodes it the same way it decodes its own emitted tables.
     let call_site_encoding = DwEhPe::Uleb128;
-    let has_type_table = !table.type_infos.is_empty();
+    let has_type_table = !table.type_table.is_empty() || table.has_empty_filter;
 
     // Pre-emit the call site table, action table, and type table to compute sizes.
     let call_site_data = emit_call_site_table(&table.call_sites, call_site_encoding);
     let action_data = emit_action_table(&table.actions);
-    let type_data = emit_type_table(&table.type_infos);
+    let (type_data_len, bound_slots) = emit_type_table(&table.type_table)?;
 
     let mut lsda = Vec::new();
 
@@ -708,30 +925,69 @@ fn generate_lsda(table: &ExceptionTable) -> Vec<u8> {
         //   call_site_encoding (1) + call_site_length (ULEB128)
         //   + call_site_data + action_data
         let cs_length_encoded = encode_uleb128(call_site_data.len() as u64);
-        let pre_type_len = 1 // call site encoding byte
-            + cs_length_encoded.len()
-            + call_site_data.len()
-            + action_data.len();
+        let pre_type_len = [
+            cs_length_encoded.len(),
+            call_site_data.len(),
+            action_data.len(),
+        ]
+        .into_iter()
+        .try_fold(1usize, |len, component| len.checked_add(component))
+        .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
 
         // The base field's ULEB128 width and the padding are interdependent at
         // width boundaries, so derive them from the final layout rather than
         // assuming that adding 0..3 bytes leaves the field width unchanged.
-        let (pad, ttype_base) = type_table_layout(pre_type_len, type_data.len());
+        let (pad, ttype_base) = type_table_layout(pre_type_len, type_data_len)?;
 
-        encode_uleb128_into(
-            u64::try_from(ttype_base).expect("supported targets have at most 64-bit usize"),
-            &mut lsda,
-        );
+        let remaining = uleb128_encoded_len(ttype_base as u64)
+            .checked_add(ttype_base)
+            .and_then(|len| len.checked_add(usize::from(table.has_empty_filter)))
+            .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+        lsda.try_reserve_exact(remaining)
+            .map_err(|_| ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+
+        encode_uleb128_into(ttype_base as u64, &mut lsda);
         lsda.push(call_site_encoding as u8);
         encode_uleb128_into(call_site_data.len() as u64, &mut lsda);
         lsda.extend_from_slice(&call_site_data);
         lsda.extend_from_slice(&action_data);
         lsda.extend(std::iter::repeat_n(0u8, pad));
-        lsda.extend_from_slice(&type_data);
-        return lsda;
+        let type_table_start = lsda.len();
+        // Every slot is zero (a NULL, or a relocation placeholder); the
+        // reservation above already holds the whole image.
+        lsda.resize(type_table_start + type_data_len, 0);
+        if table.has_empty_filter {
+            // Filter -1 indexes byte zero after TType base. A zero ULEB is
+            // the empty allowed-type list, matching LLVM filter [0 x ptr] [].
+            lsda.push(0);
+        }
+        let typeinfo_relocations = bound_slots
+            .into_iter()
+            .map(|(slot_offset, symbol)| {
+                let offset = type_table_start
+                    .checked_add(slot_offset)
+                    .and_then(|offset| u32::try_from(offset).ok())
+                    .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+                Ok(LsdaTypeInfoRelocation { offset, symbol })
+            })
+            .collect::<Result<Vec<_>, ExceptionTableBuildError>>()?;
+        return Ok(LsdaImage {
+            bytes: lsda,
+            typeinfo_relocations,
+        });
     }
 
     // --- No type table (cleanup-only): TType encoding = DW_EH_PE_omit. ---
+    let remaining = [
+        uleb128_encoded_len(call_site_data.len() as u64),
+        call_site_data.len(),
+        action_data.len(),
+    ]
+    .into_iter()
+    .try_fold(2usize, |len, component| len.checked_add(component))
+    .ok_or(ExceptionTableBuildError::LsdaLayoutTooLarge)?;
+    lsda.try_reserve_exact(remaining)
+        .map_err(|_| ExceptionTableBuildError::LsdaLayoutTooLarge)?;
     lsda.push(DwEhPe::Omit as u8);
 
     // Call site encoding.
@@ -746,7 +1002,10 @@ fn generate_lsda(table: &ExceptionTable) -> Vec<u8> {
     // --- Action table ---
     lsda.extend_from_slice(&action_data);
 
-    lsda
+    Ok(LsdaImage {
+        bytes: lsda,
+        typeinfo_relocations: Vec::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -758,17 +1017,30 @@ fn generate_lsda(table: &ExceptionTable) -> Vec<u8> {
 // opcodes, resolve final code offsets, and pass that projection through the
 // checked builder below. There is intentionally no raw public LSDA bridge.
 
+/// How a builder binds positive catch type indices.
+#[derive(Debug, Clone, Copy)]
+enum TypeTableBinding<'a> {
+    /// The emitter carries no typeinfo relocation channel: typed catches are
+    /// refused by name (`TypedCatchRelocationUnsupported`).
+    ByteOnly,
+    /// Entry `k - 1` is the typeinfo symbol of catch type index `k`; the
+    /// emitter binds every returned [`LsdaTypeInfoRelocation`].
+    Table(&'a EhTypeTable),
+}
+
 /// Build an `ExceptionTable` from landing pad metadata.
 ///
 /// This is a higher-level builder that takes landing pad descriptors and
 /// automatically constructs the call site table, action table, and type
 /// table. It handles:
 ///
-/// - **Catch typed**: Fails closed until typeinfo-symbol relocations are carried
-///   alongside the LSDA bytes
+/// - **Catch typed**: Identity type-table slots bound through the function's
+///   EH type table (see the module docs); fails closed by name on a
+///   byte-only emitter or an unbound index
 /// - **Catch-all**: Creates a positive action filter referencing a NULL
 ///   type-table slot (distinct from cleanup filter 0)
 /// - **Cleanup**: Creates cleanup call sites (action_idx = 0, landing pad set)
+/// - **Empty Rust filter**: Binds terminal action -1 to an empty filter list
 /// - **Action chains**: When a landing pad has multiple catch types, chains
 ///   them via next_action_offset
 ///
@@ -778,6 +1050,7 @@ fn generate_lsda(table: &ExceptionTable) -> Vec<u8> {
 /// * `landing_pads` — Landing pad descriptors
 /// * `call_site_ranges` — PC ranges mapping to landing pads. Each tuple is
 ///   `(start_offset, length, landing_pad_offset)`.
+/// * `binding` — How positive catch type indices reach typeinfo symbols
 ///
 /// # Returns
 ///
@@ -787,9 +1060,11 @@ fn build_exception_table_from_pads(
     personality: &str,
     landing_pads: &[LandingPadDesc],
     call_site_ranges: &[(u32, u32, u32)],
+    binding: TypeTableBinding<'_>,
 ) -> Result<ExceptionTable, ExceptionTableBuildError> {
     let mut table = ExceptionTable::new();
-    table.personality = Some(required_personality_symbol(Some(personality))?.to_string());
+    let personality = required_personality_symbol(Some(personality))?;
+    table.personality = Some(personality.to_string());
 
     let mut landing_pad_offsets = std::collections::BTreeSet::new();
     for (index, lp) in landing_pads.iter().enumerate() {
@@ -800,6 +1075,15 @@ fn build_exception_table_from_pads(
             return Err(ExceptionTableBuildError::DuplicateLandingPadOffset {
                 offset: lp.landing_pad_offset,
             });
+        }
+        if validate_rust_eh_empty_filter(&lp.catch_type_indices, lp.is_cleanup, personality)
+            .map_err(|detail| ExceptionTableBuildError::InvalidEmptyFilter {
+                offset: lp.landing_pad_offset,
+                detail,
+            })?
+        {
+            table.has_empty_filter = true;
+            continue;
         }
         if !lp.is_cleanup && lp.catch_type_indices.is_empty() {
             return Err(ExceptionTableBuildError::EmptyLandingPad {
@@ -819,44 +1103,135 @@ fn build_exception_table_from_pads(
             });
         }
         if let Some(&type_index) = lp.catch_type_indices.iter().find(|&&index| index != 0) {
-            return Err(ExceptionTableBuildError::TypedCatchRelocationUnsupported {
-                offset: lp.landing_pad_offset,
-                type_index,
-            });
-        }
-    }
-
-    // Collect all distinct catch type indices, mapping each to a 1-based slot
-    // in the type table. A `catch(...)` (catch-all) is encoded the way the
-    // Itanium C++ ABI / `__gxx_personality_v0` expects: a **positive** action
-    // type-filter that points at a type-table slot whose typeinfo pointer is
-    // NULL. The personality treats a NULL typeinfo as "match any type" and
-    // installs the handler. This is the critical distinction from a *cleanup*
-    // action (type-filter 0): a cleanup runs destructors but never stops the
-    // unwind, so encoding a catch-all as type-filter 0 makes the personality
-    // report "no handler", the exception unwinds past the landing pad, and the
-    // program calls `std::terminate()` (the catch silently fails / aborts).
-    //
-    // The reserved index 0 (`type_info_index == 0`) is used as that NULL slot.
-    // We assign each distinct catch index (including the catch-all sentinel 0)
-    // its 1-based type-table slot at insertion time and remember it, so the
-    // action type-filter always matches the real table position regardless of
-    // the order catch-all vs. typed catches first appear.
-    let mut slot_of: std::collections::HashMap<u32, i32> = std::collections::HashMap::new();
-    for lp in landing_pads {
-        for &ti in &lp.catch_type_indices {
-            if let std::collections::hash_map::Entry::Vacant(entry) = slot_of.entry(ti) {
-                if ti == 0 {
-                    table.add_type_info(TypeInfo::catch_all());
-                } else {
-                    table.add_type_info(TypeInfo::new(ti));
+            match binding {
+                TypeTableBinding::ByteOnly => {
+                    return Err(ExceptionTableBuildError::TypedCatchRelocationUnsupported {
+                        offset: lp.landing_pad_offset,
+                        type_index,
+                    });
                 }
-                let slot = i32::try_from(table.type_infos.len())
-                    .map_err(|_| ExceptionTableBuildError::TypeTableTooLarge)?;
-                entry.insert(slot); // 1-based slot index
+                TypeTableBinding::Table(type_table) => {
+                    if personality != CXX_PERSONALITY_SYMBOL {
+                        return Err(ExceptionTableBuildError::TypedCatchPersonalityUnsupported {
+                            offset: lp.landing_pad_offset,
+                            type_index,
+                            personality: personality.to_string(),
+                        });
+                    }
+                    if let Some(&type_index) = lp
+                        .catch_type_indices
+                        .iter()
+                        .find(|&&index| u64::from(index) > type_table.len())
+                    {
+                        return Err(ExceptionTableBuildError::TypedCatchUnbound {
+                            offset: lp.landing_pad_offset,
+                            type_index,
+                            table_len: type_table.len(),
+                        });
+                    }
+                }
             }
         }
     }
+
+    // Type-table slots are the IDENTITY of the catch type index (module docs:
+    // "Type table binding and the selector contract"): slot `k` holds the
+    // typeinfo bound to catch type index `k`, an unreferenced slot stays NULL
+    // (no action names it, so it is inert and imports no symbol), and the
+    // catch-all NULL slot is `N + 1` for the `N`-entry EH type table (`1`
+    // without one). `N` comes from the binding, not from the pads passed in,
+    // so pads an optimizer pruned cannot move the catch-all selector. The C++
+    // personality reports the matched slot as the landing pad's selector, so
+    // a frontend compares `results[1]` with its own catch type index.
+    //
+    // A `catch(...)` (catch-all) is encoded the way the Itanium C++ ABI /
+    // `__gxx_personality_v0` expects: a **positive** action type-filter that
+    // points at a type-table slot whose typeinfo pointer is NULL. The
+    // personality treats a NULL typeinfo as "match any type" and installs the
+    // handler. This is the critical distinction from a *cleanup* action
+    // (type-filter 0): a cleanup runs destructors but never stops the unwind,
+    // so encoding a catch-all as type-filter 0 makes the personality report
+    // "no handler", the exception unwinds past the landing pad, and the
+    // program calls `std::terminate()` (the catch silently fails / aborts).
+    let max_typed_index = landing_pads
+        .iter()
+        .flat_map(|lp| lp.catch_type_indices.iter().copied())
+        .filter(|&index| index != RUST_EH_EMPTY_FILTER)
+        .max()
+        .unwrap_or(0);
+    let uses_catch_all = landing_pads
+        .iter()
+        .any(|lp| lp.catch_type_indices.contains(&0));
+    // Every typed index is bound (checked above), so `max_typed_index <= N`;
+    // the byte-only binding refused every typed index, so there `N == 0`.
+    // Only the catch-all slot depends on `N`, so only a pad that catches all
+    // needs `N` to be representable as a slot.
+    let last_typed_slot = match (uses_catch_all, binding) {
+        (false, _) => max_typed_index,
+        (true, TypeTableBinding::ByteOnly) => 0,
+        (true, TypeTableBinding::Table(type_table)) => u32::try_from(type_table.len())
+            .map_err(|_| ExceptionTableBuildError::TypeTableTooLarge)?,
+    };
+    // Only the referenced typed indices are bound, in ascending order; the
+    // slots between them, and the unreferenced ones up to `N` below the
+    // catch-all, are NULL runs appended in O(1). The cost is the pads' catch
+    // clauses, never `N` (a trust-ir v50 splat table's length included).
+    let referenced: std::collections::BTreeSet<u32> = landing_pads
+        .iter()
+        .flat_map(|lp| lp.catch_type_indices.iter().copied())
+        .filter(|&index| index != 0 && index != RUST_EH_EMPTY_FILTER)
+        .collect();
+    for &type_index in &referenced {
+        let symbol = match binding {
+            // The bound check above guarantees `type_index <= len`; keep the
+            // lookup checked rather than indexed.
+            TypeTableBinding::Table(type_table) => type_table
+                .symbol_for_catch_index(type_index)
+                .ok_or(ExceptionTableBuildError::TypedCatchUnbound {
+                    offset: 0,
+                    type_index,
+                    table_len: type_table.len(),
+                })?,
+            TypeTableBinding::ByteOnly => {
+                return Err(ExceptionTableBuildError::TypedCatchRelocationUnsupported {
+                    offset: 0,
+                    type_index,
+                });
+            }
+        };
+        if symbol.is_empty() || symbol.as_bytes().contains(&0) {
+            return Err(ExceptionTableBuildError::InvalidTypeInfoSymbol {
+                type_index,
+                symbol: symbol.to_string(),
+            });
+        }
+        let gap = type_index - table.type_table.len() - 1;
+        table
+            .type_table
+            .push_null_slots(gap)
+            .and_then(|()| table.type_table.push(TypeInfo::bound(symbol)))
+            .ok_or(ExceptionTableBuildError::TypeTableTooLarge)?;
+    }
+    table
+        .type_table
+        .push_null_slots(last_typed_slot - table.type_table.len())
+        .ok_or(ExceptionTableBuildError::TypeTableTooLarge)?;
+    // A typed catch's filter is its own slot (identity); the catch-all's is
+    // the NULL slot after the last typed one. Both are positive SLEB128
+    // filters, so each must fit an `i32`.
+    let catch_all_filter = if uses_catch_all {
+        let slot = table
+            .add_type_info(TypeInfo::catch_all())
+            .ok_or(ExceptionTableBuildError::TypeTableTooLarge)?;
+        Some(i32::try_from(slot).map_err(|_| ExceptionTableBuildError::TypeTableTooLarge)?)
+    } else {
+        None
+    };
+    let type_filter_of = |catch_idx: u32| match catch_idx {
+        RUST_EH_EMPTY_FILTER => Ok(-1),
+        0 => catch_all_filter.ok_or(ExceptionTableBuildError::TypeTableTooLarge),
+        typed => i32::try_from(typed).map_err(|_| ExceptionTableBuildError::TypeTableTooLarge),
+    };
 
     // Build action entries for each landing pad.
     // Each landing pad gets an action chain. The first action's 1-based index
@@ -882,12 +1257,9 @@ fn build_exception_table_from_pads(
         let num_catches = lp.catch_type_indices.len();
 
         for (i, &catch_idx) in lp.catch_type_indices.iter().enumerate() {
-            // Positive type-filter into the type table (catch-all uses the NULL
-            // slot; see the comment above). Never 0, which would be a cleanup.
-            let type_filter = slot_of
-                .get(&catch_idx)
-                .copied()
-                .expect("every validated catch type has a type-table slot");
+            // Catch types use positive slots; the checked empty-filter clause
+            // uses -1. Neither is 0, which would run as cleanup.
+            let type_filter = type_filter_of(catch_idx)?;
 
             // libc++abi advances from the address of the encoded displacement
             // field (immediately after `type_filter`), not from the action
@@ -977,19 +1349,46 @@ fn build_exception_table_from_pads(
     Ok(table)
 }
 
-/// The sole production LSDA-byte boundary.
+/// The byte-only production LSDA boundary for emitters without a typeinfo
+/// relocation channel (x86-64 objects, filler LSDAs).
 ///
 /// Raw [`ExceptionTable`] serialization remains private because a manually
 /// assembled table can contain unchecked byte displacements or positive typed
-/// catches without the object relocations they require. Target emitters pass
-/// resolved landing-pad/range metadata through this checked constructor.
+/// catches without the object relocations they require. Typed catches are
+/// refused here by name; [`generate_lsda_image_from_pads`] is the relocating
+/// boundary.
 pub(crate) fn generate_lsda_from_pads(
     personality: &str,
     landing_pads: &[LandingPadDesc],
     call_site_ranges: &[(u32, u32, u32)],
 ) -> Result<Vec<u8>, ExceptionTableBuildError> {
-    let table = build_exception_table_from_pads(personality, landing_pads, call_site_ranges)?;
-    Ok(generate_lsda(&table))
+    let table = build_exception_table_from_pads(
+        personality,
+        landing_pads,
+        call_site_ranges,
+        TypeTableBinding::ByteOnly,
+    )?;
+    let image = generate_lsda(&table)?;
+    debug_assert!(image.typeinfo_relocations.is_empty());
+    Ok(image.bytes)
+}
+
+/// The relocating production LSDA boundary: typed catches bind through
+/// `eh_type_table` (entry `k - 1` is the typeinfo symbol of catch type index
+/// `k`) and every returned relocation must be emitted by the object writer.
+pub(crate) fn generate_lsda_image_from_pads(
+    personality: &str,
+    landing_pads: &[LandingPadDesc],
+    call_site_ranges: &[(u32, u32, u32)],
+    eh_type_table: &EhTypeTable,
+) -> Result<LsdaImage, ExceptionTableBuildError> {
+    let table = build_exception_table_from_pads(
+        personality,
+        landing_pads,
+        call_site_ranges,
+        TypeTableBinding::Table(eh_type_table),
+    )?;
+    generate_lsda(&table)
 }
 
 /// Descriptor for a landing pad, used by `build_exception_table_from_pads`.
@@ -1016,8 +1415,8 @@ impl LandingPadDesc {
 
     /// Create a typed catch landing pad descriptor.
     ///
-    /// The current byte-only high-level LSDA builder rejects this descriptor
-    /// until object emission can carry the required typeinfo-symbol relocation.
+    /// The byte-only builder rejects this descriptor by name; the relocating
+    /// builder binds `type_index` through the function's EH type table.
     pub fn catch_typed(offset: u32, type_index: u32) -> Self {
         Self {
             landing_pad_offset: offset,
@@ -1052,6 +1451,39 @@ impl LandingPadDesc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every slot of `table.type_table`, expanded (small fixtures only).
+    fn type_infos(table: &ExceptionTable) -> Vec<TypeInfo> {
+        (1..=table.type_table.len())
+            .map(|slot| table.type_table.get(slot).unwrap())
+            .collect()
+    }
+
+    fn lsda_type_table(entries: Vec<TypeInfo>) -> LsdaTypeTable {
+        let mut table = LsdaTypeTable::default();
+        for entry in entries {
+            table.push(entry).unwrap();
+        }
+        table
+    }
+
+    /// Byte-only builder shape (no type table) for the legacy fixtures.
+    fn from_pads(
+        personality: &str,
+        landing_pads: &[LandingPadDesc],
+        call_site_ranges: &[(u32, u32, u32)],
+    ) -> Result<ExceptionTable, ExceptionTableBuildError> {
+        build_exception_table_from_pads(
+            personality,
+            landing_pads,
+            call_site_ranges,
+            TypeTableBinding::ByteOnly,
+        )
+    }
+
+    fn lsda_bytes(table: &ExceptionTable) -> Vec<u8> {
+        generate_lsda(table).expect("bounded test LSDA").bytes
+    }
 
     // --- ULEB128 encoding tests ---
 
@@ -1181,24 +1613,29 @@ mod tests {
 
     #[test]
     fn test_type_info_entries() {
-        let ti = TypeInfo::new(42);
-        assert_eq!(ti.type_info_index, 42);
+        let ti = TypeInfo::bound("_ZTIi");
+        assert_eq!(ti.symbol.as_deref(), Some("_ZTIi"));
 
         let catch_all = TypeInfo::catch_all();
-        assert_eq!(catch_all.type_info_index, 0);
+        assert!(catch_all.symbol.is_none());
     }
 
     #[test]
     fn test_type_table_emission_order() {
-        // Type infos are emitted in reverse order.
-        let type_infos = vec![TypeInfo::new(1), TypeInfo::new(2), TypeInfo::new(3)];
-        let data = emit_type_table(&type_infos);
+        // Type infos are emitted in reverse order: slot 3 first, slot 1 last.
+        let type_table = lsda_type_table(vec![
+            TypeInfo::bound("one"),
+            TypeInfo::catch_all(),
+            TypeInfo::bound("three"),
+        ]);
+        let (len, bound) = emit_type_table(&type_table).unwrap();
 
-        // Reverse order: 3, 2, 1 — each 4 bytes LE.
-        assert_eq!(data.len(), 12);
-        assert_eq!(u32::from_le_bytes(data[0..4].try_into().unwrap()), 3);
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 2);
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 1);
+        // Every slot is a 4-byte zero placeholder; only bound slots relocate.
+        assert_eq!(len, 12);
+        assert_eq!(
+            bound,
+            vec![(0usize, "three".to_string()), (8usize, "one".to_string())]
+        );
     }
 
     // --- ExceptionTable tests ---
@@ -1275,8 +1712,8 @@ mod tests {
         let action_idx = table.add_action(ActionEntry::catch(1));
         assert_eq!(action_idx, 1);
 
-        let type_idx = table.add_type_info(TypeInfo::new(42));
-        assert_eq!(type_idx, 1);
+        let type_idx = table.add_type_info(TypeInfo::bound("_ZTIi"));
+        assert_eq!(type_idx, Some(1));
 
         assert!(!table.is_empty());
     }
@@ -1293,7 +1730,7 @@ mod tests {
     fn test_empty_lsda() {
         // Empty exception table: no call sites, no actions, no type infos.
         let table = ExceptionTable::new();
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
 
         // Header:
         // [0]: LPStart encoding = 0xFF (omit)
@@ -1313,7 +1750,7 @@ mod tests {
         let mut table = ExceptionTable::new();
         table.add_call_site(CallSiteEntry::cleanup(0, 16, 32));
 
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
 
         // Header check:
         assert_eq!(lsda[0], 0xFF); // LPStart = omit
@@ -1331,9 +1768,9 @@ mod tests {
         let mut table = ExceptionTable::new();
         table.add_call_site(CallSiteEntry::new(0x10, 0x08, 0x50, 1));
         table.add_action(ActionEntry::catch(1));
-        table.add_type_info(TypeInfo::new(100));
+        table.add_type_info(TypeInfo::bound("_ZTIi"));
 
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
 
         // Should have a non-empty LSDA with type table.
         assert!(lsda.len() > 4);
@@ -1360,9 +1797,9 @@ mod tests {
         table.add_call_site(CallSiteEntry::new(0x10, 0x08, 0x90, 1));
         table.add_call_site(CallSiteEntry::no_landing_pad(0x18, 0x04));
         table.add_action(ActionEntry::catch(1));
-        table.add_type_info(TypeInfo::new(1));
+        table.add_type_info(TypeInfo::bound("_ZTIi"));
 
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
 
         // Should produce a valid LSDA.
         assert!(lsda.len() > 4);
@@ -1375,7 +1812,7 @@ mod tests {
         let mut table = ExceptionTable::new();
         table.add_call_site(CallSiteEntry::cleanup(0x00, 0x20, 0x100));
 
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
 
         // No type table (no type_infos).
         assert_eq!(lsda[1], 0xFF); // TType = omit
@@ -1405,9 +1842,9 @@ mod tests {
         let mut table = ExceptionTable::new();
         table.add_call_site(CallSiteEntry::new(0, 8, 16, 1));
         table.add_action(ActionEntry::catch(1));
-        table.add_type_info(TypeInfo::new(42));
+        table.add_type_info(TypeInfo::bound("_ZTIi"));
 
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
 
         // Header:
         // [0]: 0xFF (LPStart omit)
@@ -1450,10 +1887,11 @@ mod tests {
         // bytes of padding, and thereby grows the final base to 129 (two-byte
         // ULEB), moving the type table off alignment. The final-layout search
         // instead finds the self-consistent one-byte pad / base-128 layout.
-        assert_eq!(type_table_layout(123, 4), (1, 128));
+        assert_eq!(type_table_layout(123, 4), Ok((1, 128)));
 
         for pre_type_len in 115..=140 {
-            let (pad, ttype_base) = type_table_layout(pre_type_len, 4);
+            let (pad, ttype_base) =
+                type_table_layout(pre_type_len, 4).expect("bounded test layout");
             assert_eq!(ttype_base, pre_type_len + pad + 4);
             assert_eq!(
                 (2 + uleb128_encoded_len(ttype_base as u64) + pre_type_len + pad) % 4,
@@ -1471,7 +1909,7 @@ mod tests {
                 table.add_call_site(CallSiteEntry::no_landing_pad(0, 1));
             }
             table.add_type_info(TypeInfo::catch_all());
-            let lsda = generate_lsda(&table);
+            let lsda = lsda_bytes(&table);
             let (ttype_offset, field_len) = decode_test_uleb128(&lsda[2..]);
             if field_len > 1 {
                 crossed_boundary = true;
@@ -1487,27 +1925,42 @@ mod tests {
     }
 
     #[test]
+    fn type_table_layout_rejects_component_and_header_overflow() {
+        for (before_types, type_bytes) in [(usize::MAX, 4), (usize::MAX, 0), (0, usize::MAX)] {
+            assert_eq!(
+                type_table_layout(before_types, type_bytes),
+                Err(ExceptionTableBuildError::LsdaLayoutTooLarge)
+            );
+        }
+    }
+
+    #[test]
     fn test_lsda_roundtrip_structure() {
         // Build a complete exception table and verify LSDA structural integrity.
         let mut table = ExceptionTable::with_cxx_personality();
         table.add_call_site(CallSiteEntry::new(0, 12, 24, 1));
         table.add_call_site(CallSiteEntry::cleanup(12, 8, 36));
         table.add_action(ActionEntry::catch(1));
-        table.add_type_info(TypeInfo::new(7));
+        table.add_type_info(TypeInfo::bound("_ZTI7Payload"));
 
-        let lsda = generate_lsda(&table);
+        let image = generate_lsda(&table).expect("bounded test LSDA");
+        let lsda = &image.bytes;
 
         // Basic structural checks.
         assert!(lsda.len() > 10, "LSDA too short: {} bytes", lsda.len());
         assert_eq!(lsda[0], 0xFF); // LPStart omit
         assert_ne!(lsda[1], 0xFF); // TType NOT omit (has type infos)
 
-        // The type info (7) should appear somewhere in the LSDA as a 4-byte LE value.
-        let type_bytes = 7u32.to_le_bytes();
-        assert!(
-            lsda.windows(4).any(|w| w == type_bytes),
-            "Type info value 7 should appear in LSDA"
+        // The single bound slot is the last 4 bytes (slot 1 sits at
+        // TType base - 4) and carries exactly one relocation there.
+        assert_eq!(
+            image.typeinfo_relocations,
+            vec![LsdaTypeInfoRelocation {
+                offset: (lsda.len() - 4) as u32,
+                symbol: "_ZTI7Payload".to_string(),
+            }]
         );
+        assert_eq!(&lsda[lsda.len() - 4..], &[0, 0, 0, 0]);
     }
 
     #[test]
@@ -1539,8 +1992,9 @@ mod tests {
 
     #[test]
     fn test_empty_type_table() {
-        let data = emit_type_table(&[]);
-        assert!(data.is_empty());
+        let (len, bound) = emit_type_table(&LsdaTypeTable::default()).unwrap();
+        assert_eq!(len, 0);
+        assert!(bound.is_empty());
     }
 
     #[test]
@@ -1564,9 +2018,85 @@ mod tests {
 
     #[test]
     fn test_type_table_single_entry() {
-        let data = emit_type_table(&[TypeInfo::new(42)]);
-        // Single entry: 42 as u32 LE.
-        assert_eq!(data, 42u32.to_le_bytes().to_vec());
+        let (len, bound) =
+            emit_type_table(&lsda_type_table(vec![TypeInfo::bound("_ZTIi")])).unwrap();
+        // Single entry: a zero placeholder relocated at table offset 0.
+        assert_eq!(len, 4);
+        assert_eq!(bound, vec![(0usize, "_ZTIi".to_string())]);
+    }
+
+    #[test]
+    fn generate_lsda_refuses_exception_specification_filters_by_name() {
+        let mut table = ExceptionTable::with_cxx_personality();
+        table.add_call_site(CallSiteEntry::new(0, 4, 8, 1));
+        table.add_action(ActionEntry {
+            type_filter: -1,
+            next_action_offset: 0,
+        });
+        table.add_type_info(TypeInfo::bound("_ZTIi"));
+        let error = generate_lsda(&table).unwrap_err();
+        assert_eq!(
+            error,
+            ExceptionTableBuildError::ExceptionSpecificationFilterUnsupported {
+                action_index: 0,
+                type_filter: -1,
+            }
+        );
+        assert!(error.to_string().contains("[TCG-EH-FILTER]"));
+    }
+
+    #[test]
+    fn rust_empty_filter_has_a_bound_negative_action_and_no_typeinfo() {
+        let pad = LandingPadDesc {
+            landing_pad_offset: 16,
+            catch_type_indices: vec![RUST_EH_EMPTY_FILTER],
+            is_cleanup: false,
+        };
+        let image = generate_lsda_image_from_pads(
+            RUST_EH_PERSONALITY_SYMBOL,
+            std::slice::from_ref(&pad),
+            &[(0, 4, 16)],
+            &EhTypeTable::default(),
+        )
+        .unwrap();
+        // Decodeable independently: TType base = byte 3 + 9 = 12;
+        // one call-site -> action 1; action -1, no successor; empty filter.
+        assert_eq!(
+            image.bytes,
+            [0xff, 0x9b, 9, 1, 4, 0, 4, 16, 1, 0x7f, 0, 0, 0]
+        );
+        assert!(image.typeinfo_relocations.is_empty());
+        for (personality, is_cleanup, indices) in [
+            (CXX_PERSONALITY_SYMBOL, false, vec![RUST_EH_EMPTY_FILTER]),
+            (RUST_EH_PERSONALITY_SYMBOL, true, vec![RUST_EH_EMPTY_FILTER]),
+            (
+                RUST_EH_PERSONALITY_SYMBOL,
+                false,
+                vec![RUST_EH_EMPTY_FILTER, 0],
+            ),
+            (
+                RUST_EH_PERSONALITY_SYMBOL,
+                false,
+                vec![RUST_EH_EMPTY_FILTER, 1],
+            ),
+            (
+                RUST_EH_PERSONALITY_SYMBOL,
+                false,
+                vec![RUST_EH_EMPTY_FILTER; 2],
+            ),
+        ] {
+            let error = generate_lsda_from_pads(
+                personality,
+                &[LandingPadDesc {
+                    is_cleanup,
+                    catch_type_indices: indices,
+                    ..pad.clone()
+                }],
+                &[(0, 4, 16)],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("[TCG-EH-FILTER]"), "{error}");
+        }
     }
 
     #[test]
@@ -1609,7 +2139,7 @@ mod tests {
 
     #[test]
     fn test_from_pads_cleanup_only() {
-        let table = build_exception_table_from_pads(
+        let table = from_pads(
             "__rust_eh_personality",
             &[LandingPadDesc::cleanup(0x100)],
             &[(0x00, 0x20, 0x100)],
@@ -1621,15 +2151,17 @@ mod tests {
         assert_eq!(table.call_sites[0].landing_pad, 0x100);
         assert_eq!(table.call_sites[0].action_idx, 0); // cleanup = action 0
         assert!(table.actions.is_empty()); // no action chain for cleanup-only
-        assert!(table.type_infos.is_empty());
+        assert!(table.type_table.is_empty());
 
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
         assert!(lsda.len() > 4);
     }
 
     #[test]
     fn from_pads_typed_catch_fails_without_typeinfo_relocation_authority() {
-        let error = build_exception_table_from_pads(
+        // The byte-only builder (x86-64 objects, the JIT, filler LSDAs) has no
+        // relocation channel and refuses typed catches by name.
+        let error = from_pads(
             "__gxx_personality_v0",
             &[LandingPadDesc::catch_typed(0x50, 1)],
             &[(0x10, 0x08, 0x50)],
@@ -1642,11 +2174,391 @@ mod tests {
                 type_index: 1,
             }
         );
+        assert!(
+            error
+                .to_string()
+                .contains("typeinfo-symbol relocation authority")
+        );
+        assert_eq!(
+            generate_lsda_from_pads(
+                "__gxx_personality_v0",
+                &[LandingPadDesc::catch_typed(0x50, 1)],
+                &[(0x10, 0x08, 0x50)],
+            )
+            .unwrap_err(),
+            error
+        );
+    }
+
+    fn typed_table() -> EhTypeTable {
+        EhTypeTable::from_symbols(vec![
+            "_ZTIi".to_string(),
+            "_ZTId".to_string(),
+            "_ZTIc".to_string(),
+        ])
+    }
+
+    /// A trust-ir v50 splat table binds every index `1..=len` to its one
+    /// symbol, and the LSDA it yields costs the pads' catch clauses, not
+    /// `len`: typed catches alone lay out `max index` slots whatever `len` is,
+    /// a catch-all's slot is `len + 1` (refused by name once that is no `i32`
+    /// filter), and the NULL slots below it are one zero run in the image.
+    #[test]
+    fn splat_type_table_binds_in_the_pads_size_not_its_length() {
+        let typed_only = |len: u64| {
+            let splat = EhTypeTable::splat("_ZTIi".to_string(), len);
+            build_exception_table_from_pads(
+                "__gxx_personality_v0",
+                &[LandingPadDesc::catch_typed(0x50, 2)],
+                &[(0x10, 0x04, 0x50), (0x14, 0x0c, 0)],
+                TypeTableBinding::Table(&splat),
+            )
+            .unwrap()
+        };
+        for len in [2u64, 1 << 40, u64::MAX] {
+            let table = typed_only(len);
+            assert_eq!(table.type_table.len(), 2, "len {len}");
+            assert_eq!(
+                table.type_table.bound_slots(),
+                &[(2, "_ZTIi".to_string())],
+                "len {len}"
+            );
+            assert_eq!(table.actions, vec![ActionEntry::catch(2)]);
+        }
+        assert_eq!(
+            generate_lsda(&typed_only(2)).unwrap(),
+            generate_lsda(&typed_only(1 << 40)).unwrap()
+        );
+
+        let with_catch_all = |len: u64| {
+            let splat = EhTypeTable::splat("_ZTIi".to_string(), len);
+            build_exception_table_from_pads(
+                "__gxx_personality_v0",
+                &[LandingPadDesc {
+                    landing_pad_offset: 0x40,
+                    catch_type_indices: vec![1, 0],
+                    is_cleanup: false,
+                }],
+                &[(0x00, 0x04, 0x40), (0x04, 0x3c, 0)],
+                TypeTableBinding::Table(&splat),
+            )
+        };
+        // The catch-all slot of a `2^31 - 2`-entry table is `i32::MAX`: the
+        // table is built in O(1) (its image would be 8 GiB; it is not
+        // serialized here).
+        let table = with_catch_all((1 << 31) - 2).unwrap();
+        assert_eq!(table.type_table.len(), i32::MAX as u32);
+        assert_eq!(table.type_table.bound_slots(), &[(1, "_ZTIi".to_string())]);
+        assert_eq!(
+            table.actions,
+            vec![
+                ActionEntry {
+                    type_filter: 1,
+                    next_action_offset: 1,
+                },
+                ActionEntry::catch(i32::MAX as u32),
+            ]
+        );
+        for len in [(1u64 << 31) - 1, 1 << 40, u64::MAX] {
+            assert_eq!(
+                with_catch_all(len).unwrap_err(),
+                ExceptionTableBuildError::TypeTableTooLarge,
+                "len {len}"
+            );
+        }
+        // A small splat serializes exactly as the equal list it spells.
+        let splat = with_catch_all(3).unwrap();
+        let list = build_exception_table_from_pads(
+            "__gxx_personality_v0",
+            &[LandingPadDesc {
+                landing_pad_offset: 0x40,
+                catch_type_indices: vec![1, 0],
+                is_cleanup: false,
+            }],
+            &[(0x00, 0x04, 0x40), (0x04, 0x3c, 0)],
+            TypeTableBinding::Table(&EhTypeTable::from_symbols(vec![
+                "_ZTIi".to_string(),
+                "_ZTId".to_string(),
+                "_ZTIc".to_string(),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(
+            generate_lsda(&splat).unwrap(),
+            generate_lsda(&list).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_catch_binds_identity_slots_through_the_type_table() {
+        // catch(double) only: K = 2, so slot 1 (int) is an inert NULL, slot 2
+        // is bound to `_ZTId`, and the action filter is exactly 2 (== the
+        // catch type index, the selector a frontend compares against).
+        let table = build_exception_table_from_pads(
+            "__gxx_personality_v0",
+            &[LandingPadDesc::catch_typed(0x50, 2)],
+            &[(0x10, 0x04, 0x50), (0x14, 0x0c, 0)],
+            TypeTableBinding::Table(&typed_table()),
+        )
+        .unwrap();
+        assert_eq!(
+            type_infos(&table),
+            vec![TypeInfo::catch_all(), TypeInfo::bound("_ZTId")]
+        );
+        assert_eq!(table.actions, vec![ActionEntry::catch(2)]);
+        assert_eq!(table.call_sites[0].action_idx, 1);
+
+        let image = generate_lsda(&table).unwrap();
+        let end = image.bytes.len();
+        // Slot 2 sits at TType base - 8; slot 1 (NULL) at base - 4.
+        assert_eq!(
+            image.typeinfo_relocations,
+            vec![LsdaTypeInfoRelocation {
+                offset: (end - 8) as u32,
+                symbol: "_ZTId".to_string(),
+            }]
+        );
+        assert_eq!(&image.bytes[end - 8..], &[0u8; 8]);
+        assert_eq!(image.bytes[1], 0x9b, "indirect|pcrel|sdata4 TType encoding");
+    }
+
+    #[test]
+    fn typed_catch_chain_with_catch_all_uses_slot_n_plus_one() {
+        // catch(int) then catch(...) against the 3-entry table: int keeps
+        // slot 1, slots 2 and 3 are inert NULLs, the catch-all NULL slot is
+        // N + 1 == 4, and the chain is [filter 1 -> filter 4].
+        let table = build_exception_table_from_pads(
+            "__gxx_personality_v0",
+            &[LandingPadDesc {
+                landing_pad_offset: 0x40,
+                catch_type_indices: vec![1, 0],
+                is_cleanup: false,
+            }],
+            &[(0x00, 0x04, 0x40), (0x04, 0x3c, 0)],
+            TypeTableBinding::Table(&typed_table()),
+        )
+        .unwrap();
+        assert_eq!(
+            type_infos(&table),
+            vec![
+                TypeInfo::bound("_ZTIi"),
+                TypeInfo::catch_all(),
+                TypeInfo::catch_all(),
+                TypeInfo::catch_all()
+            ]
+        );
+        assert_eq!(emit_action_table(&table.actions), vec![1, 1, 4, 0]);
+        let image = generate_lsda(&table).unwrap();
+        let end = image.bytes.len();
+        assert_eq!(
+            image.typeinfo_relocations,
+            vec![LsdaTypeInfoRelocation {
+                offset: (end - 4) as u32,
+                symbol: "_ZTIi".to_string(),
+            }]
+        );
+
+        // Two pads sharing a type keep one identity slot; a second typed
+        // index extends K.
+        let table = build_exception_table_from_pads(
+            "__gxx_personality_v0",
+            &[
+                LandingPadDesc::catch_typed(0x40, 1),
+                LandingPadDesc {
+                    landing_pad_offset: 0x80,
+                    catch_type_indices: vec![3, 1],
+                    is_cleanup: true,
+                },
+            ],
+            &[(0x00, 0x04, 0x40), (0x04, 0x04, 0x80), (0x08, 0x78, 0)],
+            TypeTableBinding::Table(&typed_table()),
+        )
+        .unwrap();
+        assert_eq!(
+            type_infos(&table),
+            vec![
+                TypeInfo::bound("_ZTIi"),
+                TypeInfo::catch_all(),
+                TypeInfo::bound("_ZTIc")
+            ]
+        );
+        // Pad 1: [1 end]; pad 2: [3 -> 1 -> cleanup].
+        assert_eq!(
+            emit_action_table(&table.actions),
+            vec![1, 0, 3, 1, 1, 1, 0, 0]
+        );
+        let image = generate_lsda(&table).unwrap();
+        let end = image.bytes.len();
+        assert_eq!(
+            image.typeinfo_relocations,
+            vec![
+                LsdaTypeInfoRelocation {
+                    offset: (end - 12) as u32,
+                    symbol: "_ZTIc".to_string(),
+                },
+                LsdaTypeInfoRelocation {
+                    offset: (end - 4) as u32,
+                    symbol: "_ZTIi".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// The catch-all slot is fixed by the table the binding carries, not by
+    /// the pads passed in: an optimizer that prunes the pad catching the
+    /// largest typed index leaves every surviving catch-all selector, and the
+    /// typed slots below it, unchanged.
+    #[test]
+    fn catch_all_slot_does_not_depend_on_surviving_pads() {
+        let catch_all_filter = |pads: &[LandingPadDesc], ranges: &[(u32, u32, u32)]| {
+            let table = build_exception_table_from_pads(
+                "__gxx_personality_v0",
+                pads,
+                ranges,
+                TypeTableBinding::Table(&typed_table()),
+            )
+            .unwrap();
+            let chains = emit_action_table(&table.actions);
+            (table.type_table.len(), chains)
+        };
+        let int_then_all = LandingPadDesc {
+            landing_pad_offset: 0x80,
+            catch_type_indices: vec![1, 0],
+            is_cleanup: false,
+        };
+        // Both pads alive (O0 shape): pad 1 catches char (index 3).
+        let (slots, actions) = catch_all_filter(
+            &[LandingPadDesc::catch_typed(0x40, 3), int_then_all.clone()],
+            &[(0x00, 0x04, 0x40), (0x04, 0x04, 0x80), (0x08, 0x78, 0)],
+        );
+        assert_eq!(slots, 4);
+        assert_eq!(actions, vec![3, 0, 1, 1, 4, 0]);
+        // The char pad pruned (O1+ shape): the catch-all is still slot 4.
+        let (slots, actions) = catch_all_filter(
+            std::slice::from_ref(&int_then_all),
+            &[(0x00, 0x04, 0x80), (0x04, 0x7c, 0)],
+        );
+        assert_eq!(slots, 4);
+        assert_eq!(actions, vec![1, 1, 4, 0]);
+        // Without a table (a function that catches no typed exception) the
+        // catch-all is slot 1 on both the relocating and byte-only builders.
+        for binding in [
+            TypeTableBinding::Table(&EhTypeTable::new()),
+            TypeTableBinding::ByteOnly,
+        ] {
+            let table = build_exception_table_from_pads(
+                "__gxx_personality_v0",
+                &[LandingPadDesc::catch_all(0x40)],
+                &[(0x00, 0x10, 0x40)],
+                binding,
+            )
+            .unwrap();
+            assert_eq!(type_infos(&table), vec![TypeInfo::catch_all()]);
+            assert_eq!(table.actions, vec![ActionEntry::catch(1)]);
+        }
+    }
+
+    /// `rust_eh_personality` ignores the type table and delivers selector 0,
+    /// so the relocating builder refuses a typed catch under it (and under
+    /// any routine other than `__gxx_personality_v0`) by name; catch-all and
+    /// cleanup pads keep their Rust-personality LSDAs.
+    #[test]
+    fn typed_catch_is_refused_under_a_personality_that_ignores_the_type_table() {
+        for personality in [
+            "rust_eh_personality",
+            "_rust_eh_personality",
+            "__gcc_personality_v0",
+        ] {
+            let error = generate_lsda_image_from_pads(
+                personality,
+                &[LandingPadDesc {
+                    landing_pad_offset: 0x40,
+                    catch_type_indices: vec![0, 2],
+                    is_cleanup: false,
+                }],
+                &[(0x00, 0x10, 0x40)],
+                &typed_table(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                ExceptionTableBuildError::TypedCatchPersonalityUnsupported {
+                    offset: 0x40,
+                    type_index: 2,
+                    personality: canonical_personality_symbol(personality).to_string(),
+                }
+            );
+            assert!(error.to_string().contains("[TCG-EH-TTYPE]"), "{error}");
+        }
+        let image = generate_lsda_image_from_pads(
+            "rust_eh_personality",
+            &[LandingPadDesc::catch_and_cleanup(0x40, 0)],
+            &[(0x00, 0x10, 0x40)],
+            &EhTypeTable::new(),
+        )
+        .unwrap();
+        assert!(image.typeinfo_relocations.is_empty());
+    }
+
+    #[test]
+    fn typed_catch_refuses_unbound_indices_and_unrepresentable_symbols() {
+        let error = build_exception_table_from_pads(
+            "__gxx_personality_v0",
+            &[LandingPadDesc::catch_typed(0x50, 4)],
+            &[(0x10, 0x08, 0x50)],
+            TypeTableBinding::Table(&typed_table()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ExceptionTableBuildError::TypedCatchUnbound {
+                offset: 0x50,
+                type_index: 4,
+                table_len: 3,
+            }
+        );
+        assert!(error.to_string().contains("[TCG-EH-TTYPE]"));
+
+        for bad in ["", "_ZTI\0i"] {
+            let error = generate_lsda_image_from_pads(
+                "__gxx_personality_v0",
+                &[LandingPadDesc::catch_typed(0x50, 1)],
+                &[(0x10, 0x08, 0x50)],
+                &EhTypeTable::from_symbols(vec![bad.to_string()]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                ExceptionTableBuildError::InvalidTypeInfoSymbol {
+                    type_index: 1,
+                    symbol: bad.to_string(),
+                }
+            );
+        }
+
+        // Catch-all and cleanup pads never consult the table.
+        let image = generate_lsda_image_from_pads(
+            "rust_eh_personality",
+            &[LandingPadDesc::catch_all(0x40)],
+            &[(0x00, 0x10, 0x40)],
+            &EhTypeTable::new(),
+        )
+        .unwrap();
+        assert!(image.typeinfo_relocations.is_empty());
+        assert_eq!(
+            image.bytes,
+            generate_lsda_from_pads(
+                "rust_eh_personality",
+                &[LandingPadDesc::catch_all(0x40)],
+                &[(0x00, 0x10, 0x40)],
+            )
+            .unwrap()
+        );
     }
 
     #[test]
     fn test_from_pads_catch_all() {
-        let table = build_exception_table_from_pads(
+        let table = from_pads(
             "__gxx_personality_v0",
             &[LandingPadDesc::catch_all(0x40)],
             &[(0x00, 0x10, 0x40)],
@@ -1663,21 +2575,21 @@ mod tests {
             table.actions[0].type_filter, 0,
             "catch-all must use a positive type-filter (NULL slot), not cleanup"
         );
-        assert_eq!(table.type_infos.len(), 1);
-        assert_eq!(
-            table.type_infos[0].type_info_index, 0,
+        assert_eq!(table.type_table.len(), 1);
+        assert!(
+            type_infos(&table)[0].symbol.is_none(),
             "catch-all type-table slot must be NULL"
         );
         assert_eq!(
             table.actions[0].type_filter as u32,
-            table.type_infos.len() as u32,
+            table.type_table.len(),
             "type-filter must index the (1-based) NULL catch-all slot"
         );
     }
 
     #[test]
     fn test_from_pads_catch_and_cleanup() {
-        let table = build_exception_table_from_pads(
+        let table = from_pads(
             "__gxx_personality_v0",
             &[LandingPadDesc::catch_and_cleanup(0x60, 0)],
             &[(0x00, 0x10, 0x60)],
@@ -1695,7 +2607,7 @@ mod tests {
 
     #[test]
     fn test_from_pads_multiple_landing_pads() {
-        let table = build_exception_table_from_pads(
+        let table = from_pads(
             "__gxx_personality_v0",
             &[
                 LandingPadDesc::catch_all(0x80),
@@ -1721,7 +2633,7 @@ mod tests {
     #[test]
     fn test_from_pads_end_to_end_lsda() {
         // Build a complete C++-style exception table and generate LSDA.
-        let table = build_exception_table_from_pads(
+        let table = from_pads(
             "__gxx_personality_v0",
             &[
                 LandingPadDesc::catch_all(0x50),
@@ -1731,13 +2643,13 @@ mod tests {
         )
         .unwrap();
 
-        let lsda = generate_lsda(&table);
+        let lsda = lsda_bytes(&table);
         assert!(lsda.len() > 10);
         assert_eq!(lsda[0], 0xFF); // LPStart omit
         assert_ne!(lsda[1], 0xFF); // TType present
 
         // Both catch-all pads share one NULL type-table slot.
-        assert_eq!(table.type_infos.len(), 1);
+        assert_eq!(table.type_table.len(), 1);
         assert_eq!(table.call_sites[0].action_idx, 1);
         assert_eq!(
             table.call_sites[1].action_idx, 3,
@@ -1747,7 +2659,7 @@ mod tests {
 
     #[test]
     fn from_pads_uses_encoded_byte_offsets_across_action_chains() {
-        let table = build_exception_table_from_pads(
+        let table = from_pads(
             "__gxx_personality_v0",
             &[
                 LandingPadDesc::catch_and_cleanup(0x80, 0),
@@ -1768,13 +2680,13 @@ mod tests {
     #[test]
     fn from_pads_rejects_malformed_references_ranges_and_descriptors() {
         assert!(matches!(
-            build_exception_table_from_pads("", &[], &[(0, 4, 0)]),
+            from_pads("", &[], &[(0, 4, 0)]),
             Err(ExceptionTableBuildError::InvalidPersonality(
                 PersonalitySymbolError::Empty
             ))
         ));
         assert!(matches!(
-            build_exception_table_from_pads(
+            from_pads(
                 "rust_eh_personality",
                 &[LandingPadDesc::cleanup(0)],
                 &[(0, 4, 0)]
@@ -1782,7 +2694,7 @@ mod tests {
             Err(ExceptionTableBuildError::ZeroLandingPadOffset { .. })
         ));
         assert!(matches!(
-            build_exception_table_from_pads(
+            from_pads(
                 "rust_eh_personality",
                 &[LandingPadDesc::cleanup(8), LandingPadDesc::catch_all(8)],
                 &[(0, 4, 8)]
@@ -1790,7 +2702,7 @@ mod tests {
             Err(ExceptionTableBuildError::DuplicateLandingPadOffset { offset: 8 })
         ));
         assert!(matches!(
-            build_exception_table_from_pads(
+            from_pads(
                 "rust_eh_personality",
                 &[LandingPadDesc {
                     landing_pad_offset: 8,
@@ -1802,7 +2714,7 @@ mod tests {
             Err(ExceptionTableBuildError::EmptyLandingPad { offset: 8 })
         ));
         assert!(matches!(
-            build_exception_table_from_pads(
+            from_pads(
                 "rust_eh_personality",
                 &[LandingPadDesc {
                     landing_pad_offset: 8,
@@ -1817,7 +2729,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            build_exception_table_from_pads(
+            from_pads(
                 "rust_eh_personality",
                 &[LandingPadDesc::cleanup(8)],
                 &[(0, 4, 12)]
@@ -1825,7 +2737,7 @@ mod tests {
             Err(ExceptionTableBuildError::UnknownLandingPadOffset { offset: 12, .. })
         ));
         assert!(matches!(
-            build_exception_table_from_pads(
+            from_pads(
                 "rust_eh_personality",
                 &[LandingPadDesc::cleanup(8)],
                 &[(0, 4, 0)]
@@ -1833,15 +2745,15 @@ mod tests {
             Err(ExceptionTableBuildError::OrphanLandingPadOffset { offset: 8 })
         ));
         assert!(matches!(
-            build_exception_table_from_pads("rust_eh_personality", &[], &[(0, 0, 0)]),
+            from_pads("rust_eh_personality", &[], &[(0, 0, 0)]),
             Err(ExceptionTableBuildError::EmptyCallSite { .. })
         ));
         assert!(matches!(
-            build_exception_table_from_pads("rust_eh_personality", &[], &[(u32::MAX, 2, 0)]),
+            from_pads("rust_eh_personality", &[], &[(u32::MAX, 2, 0)]),
             Err(ExceptionTableBuildError::CallSiteRangeOverflow { .. })
         ));
         assert!(matches!(
-            build_exception_table_from_pads("rust_eh_personality", &[], &[(4, 4, 0), (6, 4, 0)]),
+            from_pads("rust_eh_personality", &[], &[(4, 4, 0), (6, 4, 0)]),
             Err(ExceptionTableBuildError::OverlappingOrUnsortedCallSites { .. })
         ));
     }

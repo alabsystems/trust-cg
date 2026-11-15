@@ -14,7 +14,7 @@
 
 use trust_cg_ir::inst::{AArch64Opcode, MachInst};
 use trust_cg_ir::operand::MachOperand;
-use trust_cg_ir::regs::{RegClass, SP, SpecialReg, WSP, XZR, preg_class};
+use trust_cg_ir::regs::{RegClass, SP, SpecialReg, WSP, WZR, XZR, preg_class};
 
 use super::encoding;
 use super::encoding_fp::{self, FpArithOp, FpCmpOp, FpConvOp, FpMaddOp, FpSize};
@@ -51,7 +51,7 @@ pub enum EncodeError {
     NeonEncode(#[from] encoding_neon::NeonEncodeError),
     #[error("unsupported FP size {size:?} for opcode {opcode:?}")]
     UnsupportedFpSize { opcode: AArch64Opcode, size: FpSize },
-    #[error("invalid operand at index {index} for {opcode:?}: expected register, got {desc}")]
+    #[error("invalid operand at index {index} for {opcode:?}: {desc}")]
     InvalidOperand {
         opcode: AArch64Opcode,
         index: usize,
@@ -71,6 +71,22 @@ pub enum EncodeError {
 // Operand extraction helpers
 // ---------------------------------------------------------------------------
 
+/// The `C` (Castagnoli) bit and 2-bit `sz` field of a CRC32 opcode, as the
+/// encoder spells them (ENC-5 decodes the word independently).
+pub(crate) fn crc32_fields(opcode: AArch64Opcode) -> (bool, u32) {
+    match opcode {
+        AArch64Opcode::Crc32B => (false, 0b00),
+        AArch64Opcode::Crc32H => (false, 0b01),
+        AArch64Opcode::Crc32W => (false, 0b10),
+        AArch64Opcode::Crc32X => (false, 0b11),
+        AArch64Opcode::Crc32Cb => (true, 0b00),
+        AArch64Opcode::Crc32Ch => (true, 0b01),
+        AArch64Opcode::Crc32Cw => (true, 0b10),
+        AArch64Opcode::Crc32Cx => (true, 0b11),
+        other => unreachable!("{other:?} is not a CRC32 opcode"),
+    }
+}
+
 /// Extract the hardware register number from an operand (PReg or Special).
 /// Returns an error for non-register operands instead of silently defaulting
 /// to XZR (reg 31), which would produce wrong code (#174).
@@ -83,7 +99,7 @@ fn preg_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
         Some(other) => Err(EncodeError::InvalidOperand {
             opcode: inst.opcode,
             index: idx,
-            desc: format!("{:?}", other),
+            desc: format!("expected register, got {other:?}"),
         }),
         None => Err(EncodeError::MissingOperand {
             opcode: inst.opcode,
@@ -91,6 +107,289 @@ fn preg_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
             expected: idx + 1,
         }),
     }
+}
+
+/// SP spelled either way: `Special(SP)` or the `SP` register.
+fn is_sp_operand(op: &MachOperand) -> bool {
+    matches!(op, MachOperand::Special(SpecialReg::SP))
+        || matches!(op, MachOperand::PReg(p) if *p == SP)
+}
+
+/// Fields of `SUBS Rd, SP, Rm` (extended register): exactly three operands,
+/// Rd an X register or XZR (never SP: field 31 is XZR here), Rm an X
+/// register X0-X30 (field 31 would read XZR).
+fn subs_from_sp_fields(inst: &MachInst) -> Result<(u32, u32), EncodeError> {
+    if inst.operands.len() != 3 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: inst.operands.len().min(3),
+            desc: "SUBS from SP takes exactly [Rd, SP, Rm]".into(),
+        });
+    }
+    let rd = match &inst.operands[0] {
+        MachOperand::PReg(p) if preg_class(*p) == RegClass::Gpr64 && *p != SP => {
+            u32::from(p.hw_enc())
+        }
+        MachOperand::Special(SpecialReg::XZR) => 31,
+        other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 0,
+                desc: format!("SUBS from SP writes an X register or XZR, not {other:?}"),
+            });
+        }
+    };
+    let rm = match &inst.operands[2] {
+        MachOperand::PReg(p) if preg_class(*p) == RegClass::Gpr64 && *p != SP && *p != XZR => {
+            u32::from(p.hw_enc())
+        }
+        other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 2,
+                desc: format!("SUBS from SP subtracts an X register X0-X30, not {other:?}"),
+            });
+        }
+    };
+    Ok((rm, rd))
+}
+
+/// Immediate/exclusive memory data (and STLXR status) fields name W/X or ZR,
+/// never SP. Validate the bank before reducing a register to five bits: an
+/// FPR, SP, or system register can otherwise silently name an unrelated GPR.
+fn gpr_memory_data_register(inst: &MachInst, index: usize) -> Result<(u32, u32), EncodeError> {
+    match inst.operands.get(index) {
+        Some(MachOperand::PReg(p))
+            if *p != SP
+                && *p != WSP
+                && matches!(preg_class(*p), RegClass::Gpr32 | RegClass::Gpr64) =>
+        {
+            Ok((p.hw_enc() as u32, preg_class(*p).size_bits()))
+        }
+        Some(MachOperand::Special(SpecialReg::XZR)) => Ok((31, 64)),
+        Some(MachOperand::Special(SpecialReg::WZR)) => Ok((31, 32)),
+        Some(other) => Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index,
+            desc: format!("memory transfer/status requires W/X GPR or ZR, not {other:?}"),
+        }),
+        None => Err(EncodeError::MissingOperand {
+            opcode: inst.opcode,
+            index,
+            expected: index + 1,
+        }),
+    }
+}
+
+/// Exact supported exclusive forms: [Wt/Xt, Xn/SP] and [Ws, Wt/Xt, Xn/SP].
+/// Arm DDI0602 STLXR constrains status/data overlap and status/base overlap
+/// (except base SP). Compare hardware indices so W/X aliases are caught; WZR
+/// status with SP base is legal, but WZR status with WZR/XZR data is not.
+fn exclusive_encoding_fields(
+    inst: &MachInst,
+    store: bool,
+) -> Result<(u32, u32, u32, u32), EncodeError> {
+    exclusive_encoding_fields_sized(inst, store, None)
+}
+
+/// Validate and extract `(size, Rs, Rt, Rn)` for a single-register
+/// load/store-exclusive. `fixed_size` is `Some(0b00|0b01)` for the byte and
+/// halfword forms, whose data register must be a W register (or WZR); word
+/// forms (`None`) derive `size` from the data register width.
+fn exclusive_encoding_fields_sized(
+    inst: &MachInst,
+    store: bool,
+    fixed_size: Option<u32>,
+) -> Result<(u32, u32, u32, u32), EncodeError> {
+    let count = if store { 3 } else { 2 };
+    let actual = inst.operands.len();
+    if actual < count {
+        return Err(EncodeError::MissingOperand {
+            opcode: inst.opcode,
+            index: actual,
+            expected: count,
+        });
+    }
+    if actual > count {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: count,
+            desc: format!(
+                "exclusive form requires exactly {count} register operands; got {actual}"
+            ),
+        });
+    }
+    let (rt, width) = gpr_memory_data_register(inst, usize::from(store))?;
+    let base_index = count - 1;
+    let rn = match &inst.operands[base_index] {
+        MachOperand::PReg(p) if p.encoding() <= SP.encoding() => p.hw_enc() as u32,
+        MachOperand::Special(SpecialReg::SP) => 31,
+        other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: base_index,
+                desc: format!("exclusive address requires X0-X30 or SP, not {other:?}"),
+            });
+        }
+    };
+    let rs = if store {
+        let (status, status_width) = gpr_memory_data_register(inst, 0)?;
+        if status_width != 32 {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 0,
+                desc: "store-exclusive status must be a 32-bit W register or WZR".into(),
+            });
+        }
+        if status == rt || (status == rn && rn != 31) {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 0,
+                desc: "store-exclusive status aliases its data or address register (constrained unpredictable)".into(),
+            });
+        }
+        status
+    } else {
+        31
+    };
+    let size = match fixed_size {
+        Some(size) => {
+            if width != 32 {
+                return Err(EncodeError::InvalidOperand {
+                    opcode: inst.opcode,
+                    index: usize::from(store),
+                    desc: "byte/halfword exclusive data must be a W register or WZR".into(),
+                });
+            }
+            size
+        }
+        None if width == 64 => 0b11,
+        None => 0b10,
+    };
+    Ok((size, rs, rt, rn))
+}
+
+/// Assemble a single-register load/store-exclusive word:
+/// `size 001000 o2=0 L o1=0 Rs o0 Rt2=11111 Rn Rt` (Arm ARM C4.1.94,
+/// "Load/store exclusive register"). `o0` is the acquire bit of a load or the
+/// release bit of a store; loads carry `Rs = 11111`.
+fn exclusive_word(size: u32, load: bool, rs: u32, ordered: bool, rn: u32, rt: u32) -> u32 {
+    (size << 30)
+        | (0b001000 << 24)
+        | (u32::from(load) << 22)
+        | (rs << 16)
+        | (u32::from(ordered) << 15)
+        | (0b11111 << 10)
+        | (rn << 5)
+        | rt
+}
+
+/// Encode LDXP/LDAXP `[Xt1, Xt2, Xn|SP]` or STXP/STLXP `[Ws, Xt1, Xt2,
+/// Xn|SP]` (Arm ARM C4.1.94, 64-bit pair: `1 sz=1 001000 0 L 1 Rs o0 Rt2 Rn
+/// Rt`) after validating X data registers, the W status, arity and the
+/// constrained-unpredictable overlaps (load `Rt == Rt2`; store status equal
+/// to either data register or to a non-SP base).
+fn encode_exclusive_pair(inst: &MachInst) -> Result<u32, EncodeError> {
+    let store = matches!(inst.opcode, AArch64Opcode::Stxp | AArch64Opcode::Stlxp);
+    let ordered = matches!(inst.opcode, AArch64Opcode::Ldaxp | AArch64Opcode::Stlxp);
+    let count = if store { 4 } else { 3 };
+    let actual = inst.operands.len();
+    if actual != count {
+        return Err(if actual < count {
+            EncodeError::MissingOperand {
+                opcode: inst.opcode,
+                index: actual,
+                expected: count,
+            }
+        } else {
+            EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: count,
+                desc: format!("pair exclusive requires exactly {count} operands; got {actual}"),
+            }
+        });
+    }
+    let first = usize::from(store);
+    let (rt, rt_width) = gpr_memory_data_register(inst, first)?;
+    let (rt2, rt2_width) = gpr_memory_data_register(inst, first + 1)?;
+    for (index, width) in [(first, rt_width), (first + 1, rt2_width)] {
+        if width != 64 {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index,
+                desc: "pair exclusive data must be an X register or XZR".into(),
+            });
+        }
+    }
+    let base_index = count - 1;
+    let rn = match &inst.operands[base_index] {
+        MachOperand::PReg(p) if p.encoding() <= SP.encoding() => p.hw_enc() as u32,
+        MachOperand::Special(SpecialReg::SP) => 31,
+        other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: base_index,
+                desc: format!("exclusive address requires X0-X30 or SP, not {other:?}"),
+            });
+        }
+    };
+    let rs = if store {
+        let (status, status_width) = gpr_memory_data_register(inst, 0)?;
+        if status_width != 32 {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 0,
+                desc: "store-exclusive status must be a 32-bit W register or WZR".into(),
+            });
+        }
+        if status == rt || status == rt2 || (status == rn && rn != 31) {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 0,
+                desc: "store-exclusive pair status aliases a data or address register (constrained unpredictable)".into(),
+            });
+        }
+        status
+    } else {
+        if rt == rt2 {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 1,
+                desc: "load-exclusive pair names one destination twice (constrained unpredictable)"
+                    .into(),
+            });
+        }
+        31
+    };
+    Ok(0xC820_0000
+        | (u32::from(!store) << 22)
+        | (rs << 16)
+        | (u32::from(ordered) << 15)
+        | (rt2 << 10)
+        | (rn << 5)
+        | rt)
+}
+
+/// Encode any single-register load/store-exclusive opcode after validating
+/// its register banks, operand arity and status overlap.
+fn encode_exclusive(inst: &MachInst) -> Result<u32, EncodeError> {
+    use trust_cg_ir::llsc::{LlscWidth, exclusive_fixed_width, is_exclusive_store};
+    let store = is_exclusive_store(inst.opcode);
+    let fixed_size = exclusive_fixed_width(inst.opcode).map(|width| match width {
+        LlscWidth::B8 => 0b00,
+        _ => 0b01,
+    });
+    let ordered = matches!(
+        inst.opcode,
+        AArch64Opcode::Ldaxr
+            | AArch64Opcode::Ldaxrb
+            | AArch64Opcode::Ldaxrh
+            | AArch64Opcode::Stlxr
+            | AArch64Opcode::Stlxrb
+            | AArch64Opcode::Stlxrh
+    );
+    let (size, rs, rt, rn) = exclusive_encoding_fields_sized(inst, store, fixed_size)?;
+    Ok(exclusive_word(size, !store, rs, ordered, rn, rt))
 }
 
 /// Reject non-GPR physical registers in a GPR-only move alias.
@@ -121,12 +420,12 @@ fn require_gpr_move_operands(inst: &MachInst, count: usize) -> Result<(), Encode
     Ok(())
 }
 
-/// Validate one register operand of `TST` and return its architectural width.
+/// Return the width of a scalar GPR operand in an encoding where 31 means ZR.
 ///
 /// Logical-register encodings interpret register number 31 as ZR, never SP.
 /// Merely calling `preg_hw` is insufficient because SP and an FPR share an
 /// encodable five-bit hardware number and would silently name a different GPR.
-fn tst_gpr_width(inst: &MachInst, index: usize) -> Result<u32, EncodeError> {
+fn non_sp_gpr_width(inst: &MachInst, index: usize) -> Result<u32, EncodeError> {
     match inst.operands.get(index) {
         Some(MachOperand::PReg(p))
             if *p != SP
@@ -141,7 +440,7 @@ fn tst_gpr_width(inst: &MachInst, index: usize) -> Result<u32, EncodeError> {
             opcode: inst.opcode,
             index,
             desc: format!(
-                "TST register operand must be a scalar GPR or ZR (SP is not encodable), got {other:?}"
+                "register operand must be a scalar GPR or ZR (SP is not encodable), got {other:?}"
             ),
         }),
         None => Err(EncodeError::MissingOperand {
@@ -150,6 +449,164 @@ fn tst_gpr_width(inst: &MachInst, index: usize) -> Result<u32, EncodeError> {
             expected: 2,
         }),
     }
+}
+
+/// CMP has two distinct register-31 meanings: shifted-register SUBS reads ZR,
+/// whereas immediate SUBS reads SP. Admit the exact two-operand public forms
+/// before extracting fields; the CMPW/CMPX aliases also own their width.
+fn comparison_fields(inst: &MachInst, immediate: bool) -> Result<(u32, u32, u32), EncodeError> {
+    if inst.operands.len() < 2 {
+        return Err(EncodeError::MissingOperand {
+            opcode: inst.opcode,
+            index: inst.operands.len(),
+            expected: 2,
+        });
+    }
+    if inst.operands.len() > 2 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 2,
+            desc: "CMP requires exactly two operands".into(),
+        });
+    }
+    let width = if immediate {
+        match &inst.operands[0] {
+            MachOperand::PReg(p) => match p.encoding() {
+                0..=31 => 64,  // X0..X30 and SP, not XZR.
+                32..=63 => 32, // W0..W30 and WSP, not WZR.
+                _ => {
+                    return Err(EncodeError::InvalidOperand {
+                        opcode: inst.opcode,
+                        index: 0,
+                        desc: "immediate CMP requires a W/X GPR or SP, not ZR or another bank"
+                            .into(),
+                    });
+                }
+            },
+            MachOperand::Special(SpecialReg::SP) => 64,
+            other => {
+                return Err(EncodeError::InvalidOperand {
+                    opcode: inst.opcode,
+                    index: 0,
+                    desc: format!("immediate CMP requires a W/X GPR or SP, got {other:?}"),
+                });
+            }
+        }
+    } else {
+        let width = non_sp_gpr_width(inst, 0)?;
+        if non_sp_gpr_width(inst, 1)? != width {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 1,
+                desc: "CMP register widths must agree".into(),
+            });
+        }
+        width
+    };
+    let expected = match inst.opcode {
+        AArch64Opcode::CMPWrr | AArch64Opcode::CMPWri => Some(32),
+        AArch64Opcode::CMPXrr | AArch64Opcode::CMPXri => Some(64),
+        _ => None,
+    };
+    if expected.is_some_and(|expected| width != expected) {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 0,
+            desc: "CMP typed opcode and operand width must agree".into(),
+        });
+    }
+    let rhs = if immediate {
+        imm12_operand(inst, 1)?
+    } else {
+        preg_hw(inst, 1)?
+    };
+    Ok((u32::from(width == 64), preg_hw(inst, 0)?, rhs))
+}
+
+/// Conditional selects have exactly three same-width GPR/ZR operands followed
+/// by a four-bit condition. CSET has one GPR/ZR and a condition whose logical
+/// complement exists: AL and NV are both true, not inverse conditions.
+/// Validate the full intent before reducing any register or condition field.
+fn conditional_select_fields(inst: &MachInst, set_alias: bool) -> Result<(u32, u32), EncodeError> {
+    let registers = if set_alias { 1 } else { 3 };
+    if inst.operands.len() != registers + 1 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: inst.operands.len().min(registers + 1),
+            desc: format!(
+                "conditional select requires exactly {registers} registers and one condition"
+            ),
+        });
+    }
+    let width = non_sp_gpr_width(inst, 0)?;
+    for index in 1..registers {
+        if non_sp_gpr_width(inst, index)? != width {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index,
+                desc: "conditional-select register widths must agree".into(),
+            });
+        }
+    }
+    let maximum = if set_alias { 13 } else { 15 };
+    let cond = match inst.operands[registers] {
+        MachOperand::Imm(value) if (0..=maximum).contains(&value) => value as u32,
+        ref other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: registers,
+                desc: format!("condition must be an immediate in 0..={maximum}, got {other:?}"),
+            });
+        }
+    };
+    Ok((u32::from(width == 64), cond))
+}
+
+/// Scalar integer/FP conversions derive sf from the integer operand, which is
+/// the source for SCVTF/UCVTF and the destination for FCVTZS/FCVTZU. Hard-coding
+/// X width misreads negative W values and changes FP-to-W saturation/results.
+fn encode_scalar_fp_int_conversion(
+    inst: &MachInst,
+    operation: FpConvOp,
+    integer_index: usize,
+) -> Result<u32, EncodeError> {
+    if inst.operands.len() != 2 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: inst.operands.len().min(2),
+            desc: "scalar integer/FP conversion requires exactly two register operands".into(),
+        });
+    }
+    let sf_64 = non_sp_gpr_width(inst, integer_index)? == 64;
+    let fp_index = usize::from(integer_index == 0);
+    let fp_size = match inst.operands.get(fp_index) {
+        Some(MachOperand::PReg(p))
+            if matches!(
+                preg_class(*p),
+                RegClass::Fpr16 | RegClass::Fpr32 | RegClass::Fpr64 | RegClass::Fpr128
+            ) =>
+        {
+            // Preserve the existing generic V-register spelling for scalar D.
+            // A V spelling here is not a vector conversion or a new SIMD form.
+            fp_size_from_preg_class(preg_class(*p))
+        }
+        other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: fp_index,
+                desc: format!(
+                    "expected scalar FP register (or legacy V-as-D spelling), got {other:?}"
+                ),
+            });
+        }
+    };
+    Ok(encoding_fp::encode_fp_int_conv(
+        sf_64,
+        fp_size,
+        operation,
+        preg_hw(inst, 1)? as u8,
+        preg_hw(inst, 0)? as u8,
+    )?)
 }
 
 /// Enforce the canonical operand arity of a move-wide instruction.
@@ -271,18 +728,117 @@ fn require_scalar_fpr_move_operands(inst: &MachInst) -> Result<(), EncodeError> 
     Ok(())
 }
 
-/// Require that `FCSEL Rd, Rn, Rm, cond`'s three register operands (0/1/2) are
-/// all the SAME scalar FPR class (S=`Fpr32` or D=`Fpr64`) and return the derived
-/// [`FpSize`].
+/// Validate an FMOV (general) operand pair and return `(sf_64, fp_size)`.
 ///
-/// This is the BANK CHECK the GPR `Csel` encoder lacks: `Csel` writes the 5-bit
-/// register number straight into the GPR field with no class check, so an FPR
-/// operand reaching it would silently encode as a CSEL on the collided GPRs
-/// (FPR hw 0-31 alias GPR hw 0-31) — the audit-era P0 the FP-select path
-/// fail-closed around. `FcselRR` instead fails closed here on any GPR, on the
+/// The general-register operand (`gpr_index`) must be a W/X register or the
+/// zero register — never SP, since register 31 is XZR here — and the FP operand
+/// (`fpr_index`) a scalar H/S/D register. FMOV (general) exists only between W
+/// and S, X and D, or either and H (Arm ARM, FMOV (general)); the W<->D and
+/// X<->S rows are UNALLOCATED, so a mismatched pair — or operands in the wrong
+/// banks, which the old width defaults turned into a move of the opposite
+/// direction — must fail closed rather than emit such a word.
+fn fmov_general_widths(
+    inst: &MachInst,
+    gpr_index: usize,
+    fpr_index: usize,
+) -> Result<(bool, FpSize), EncodeError> {
+    let invalid = |index, desc: String| EncodeError::InvalidOperand {
+        opcode: inst.opcode,
+        index,
+        desc,
+    };
+    let sf_64 = match inst.operands.get(gpr_index) {
+        Some(MachOperand::PReg(p)) if *p != SP && *p != WSP => match preg_class(*p) {
+            RegClass::Gpr32 => false,
+            RegClass::Gpr64 => true,
+            class => {
+                return Err(invalid(
+                    gpr_index,
+                    format!(
+                        "FMOV (general) needs a W/X register here, got {class:?} — fail-closed"
+                    ),
+                ));
+            }
+        },
+        Some(MachOperand::Special(SpecialReg::WZR)) => false,
+        Some(MachOperand::Special(SpecialReg::XZR)) => true,
+        Some(other) => {
+            return Err(invalid(
+                gpr_index,
+                format!(
+                    "FMOV (general) needs a W/X register or the zero register here, got \
+                     {other:?} — fail-closed"
+                ),
+            ));
+        }
+        None => {
+            return Err(EncodeError::MissingOperand {
+                opcode: inst.opcode,
+                index: gpr_index,
+                expected: 2,
+            });
+        }
+    };
+    let fp_size = match inst.operands.get(fpr_index) {
+        Some(MachOperand::PReg(p)) => match preg_class(*p) {
+            RegClass::Fpr16 => FpSize::Half,
+            RegClass::Fpr32 => FpSize::Single,
+            RegClass::Fpr64 => FpSize::Double,
+            class => {
+                return Err(invalid(
+                    fpr_index,
+                    format!(
+                        "FMOV (general) needs a scalar H/S/D register here, got {class:?} — \
+                         fail-closed"
+                    ),
+                ));
+            }
+        },
+        Some(other) => {
+            return Err(invalid(
+                fpr_index,
+                format!("FMOV (general) needs a scalar H/S/D register here, got {other:?}"),
+            ));
+        }
+        None => {
+            return Err(EncodeError::MissingOperand {
+                opcode: inst.opcode,
+                index: fpr_index,
+                expected: 2,
+            });
+        }
+    };
+    if !matches!(
+        (sf_64, fp_size),
+        (false, FpSize::Single) | (true, FpSize::Double) | (_, FpSize::Half)
+    ) {
+        return Err(invalid(
+            fpr_index,
+            format!(
+                "FMOV (general) between a {}-bit general register and a {fp_size:?} FP register \
+                 has no encoding (the W<->D and X<->S rows are unallocated) — fail-closed",
+                if sf_64 { 64 } else { 32 }
+            ),
+        ));
+    }
+    Ok((sf_64, fp_size))
+}
+
+/// Require that `FCSEL Rd, Rn, Rm, cond`'s three register operands (0/1/2) are
+/// all the SAME scalar FPR class (S=`Fpr32` or D=`Fpr64`), followed by exactly
+/// one immediate condition in 0..=15. Return the validated width and condition.
+///
+/// `FcselRR` fails closed here on any GPR, on the
 /// `Fpr16` (half — the f16 FCSEL form is deliberately not modeled) / `Fpr128`
 /// (no scalar FCSEL) class, and on a width mismatch between the three regs.
-fn require_fcsel_operands(inst: &MachInst) -> Result<FpSize, EncodeError> {
+fn require_fcsel_operands(inst: &MachInst) -> Result<(FpSize, u32), EncodeError> {
+    if inst.operands.len() != 4 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: inst.operands.len().min(4),
+            desc: "FCSEL requires exactly three S/D registers and one condition".to_string(),
+        });
+    }
     let mut class = None;
     for idx in 0..3 {
         match inst.operands.get(idx) {
@@ -310,8 +866,7 @@ fn require_fcsel_operands(inst: &MachInst) -> Result<FpSize, EncodeError> {
                     index: idx,
                     desc: format!(
                         "FCSEL requires a scalar FPR (S/D) in operand {idx}, got {other:?}; \
-                         all three regs must be FPRs (no GPR/half/Q, the bank check the GPR \
-                         Csel lacks) — fail-closed"
+                         all three regs must be FPRs (no GPR/half/Q) — fail-closed"
                     ),
                 });
             }
@@ -319,17 +874,39 @@ fn require_fcsel_operands(inst: &MachInst) -> Result<FpSize, EncodeError> {
                 return Err(EncodeError::MissingOperand {
                     opcode: inst.opcode,
                     index: idx,
-                    expected: 3,
+                    expected: 4,
                 });
             }
         }
     }
-    Ok(match class {
+    let fp_size = match class {
         Some(RegClass::Fpr32) => FpSize::Single,
         Some(RegClass::Fpr64) => FpSize::Double,
-        // Unreachable: the loop only accepts Fpr32/Fpr64.
-        _ => FpSize::Double,
-    })
+        // The loop above admits only Fpr32/Fpr64 and visits operand 0 of an
+        // exactly-four-operand instruction, so this arm has no input today.
+        // It stays a typed refusal so a future edit cannot turn it into a
+        // panic or a guessed width.
+        other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 0,
+                desc: format!(
+                    "FCSEL register class {other:?} is not a scalar S/D FPR — fail-closed"
+                ),
+            });
+        }
+    };
+    let cond = match inst.operands[3] {
+        MachOperand::Imm(value) if (0..=15).contains(&value) => value as u32,
+        ref other => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 3,
+                desc: format!("FCSEL condition must be an immediate in 0..=15, got {other:?}"),
+            });
+        }
+    };
+    Ok((fp_size, cond))
 }
 
 fn reject_sp_in_shifted_reg(inst: &MachInst) -> Result<(), EncodeError> {
@@ -348,11 +925,34 @@ fn reject_sp_in_shifted_reg(inst: &MachInst) -> Result<(), EncodeError> {
     Ok(())
 }
 
-/// Extract an immediate value from an operand. Returns 0 for non-immediates.
-fn imm_val(inst: &MachInst, idx: usize) -> i64 {
+/// An immediate operand, or 0 when the operand is absent (an optional field
+/// whose default is 0). A present operand of any other kind is an error:
+/// reading it as 0 would silently encode a different instruction (a register
+/// shift amount once turned `LSL X0, X1, X2` into `MOV X0, X1`).
+fn imm_val(inst: &MachInst, idx: usize) -> Result<i64, EncodeError> {
     match inst.operands.get(idx) {
-        Some(MachOperand::Imm(v)) => *v,
-        _ => 0,
+        Some(MachOperand::Imm(v)) => Ok(*v),
+        None => Ok(0),
+        Some(other) => Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: idx,
+            desc: format!("expected an immediate, got {other:?}"),
+        }),
+    }
+}
+
+/// An immediate operand, or 0 for an absent operand or a relocation/fixup
+/// target (a symbol, block or jump-table reference), whose field the
+/// relocation or fixup layer patches. Any other operand kind is an error.
+fn imm_or_fixup_placeholder(inst: &MachInst, idx: usize) -> Result<i64, EncodeError> {
+    match inst.operands.get(idx) {
+        Some(
+            MachOperand::Symbol(_)
+            | MachOperand::ExactModuleSymbol(_)
+            | MachOperand::Block(_)
+            | MachOperand::JumpTableIndex(_),
+        ) => Ok(0),
+        _ => imm_val(inst, idx),
     }
 }
 
@@ -371,6 +971,17 @@ fn imm_operand(inst: &MachInst, idx: usize) -> Result<i64, EncodeError> {
             expected: idx + 1,
         }),
     }
+}
+
+/// Admit a byte-sized immediate before the low-level encoder sees it. The
+/// encoder still validates narrower architectural domains such as lane counts.
+fn imm_u8_operand(inst: &MachInst, idx: usize) -> Result<u8, EncodeError> {
+    let value = imm_operand(inst, idx)?;
+    u8::try_from(value).map_err(|_| EncodeError::InvalidOperand {
+        opcode: inst.opcode,
+        index: idx,
+        desc: format!("immediate {value} must be in 0..=255"),
+    })
 }
 
 fn imm12_operand(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
@@ -538,6 +1149,30 @@ fn extract_base_offset(
     }
 }
 
+/// Immediate memory has an X/SP address, never a W/ZR/FPR view. Validate
+/// the bank and arity before using the general layout accessor, which rejects
+/// a non-immediate third operand with the precise offset index (2).
+fn extract_ri_memory_base_offset(inst: &MachInst) -> Result<(u32, i64), EncodeError> {
+    let valid = match inst.operands.get(1) {
+        Some(MachOperand::MemOp { base, .. }) => base.encoding() <= 31 && inst.operands.len() == 2,
+        Some(MachOperand::PReg(base)) if base.encoding() <= 31 => {
+            inst.operands.len() == 2 || inst.operands.len() == 3
+        }
+        Some(MachOperand::Special(SpecialReg::SP)) => {
+            inst.operands.len() == 2 || inst.operands.len() == 3
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 1,
+            desc: "immediate memory requires exactly [Rt, Xn|SP, optional Imm] or [Rt, MemOp{Xn|SP, offset}]".into(),
+        });
+    }
+    extract_base_offset(inst, 1, 2)
+}
+
 /// Encode a load/store with unsigned offset or unscaled immediate, depending
 /// on whether the offset is non-negative and aligned (unsigned imm12) or
 /// negative/unaligned (signed imm9 unscaled).
@@ -545,7 +1180,7 @@ fn extract_base_offset(
 /// * `size` — data width encoding (00=byte, 01=half, 10=word, 11=double)
 /// * `v` — 1 for SIMD/FP, 0 for integer
 /// * `opc` — 00=store, 01=load (or other opc values for sign-extending loads)
-/// * `scale` — access size in bytes (1, 2, 4, or 8)
+/// * `scale` — access size in bytes (1, 2, 4, 8, or 16)
 /// * `offset` — byte offset (signed)
 /// * `rn` — base register hw encoding
 /// * `rt` — transfer register hw encoding
@@ -559,9 +1194,17 @@ fn encode_load_store_auto(
     rt: u32,
 ) -> Result<u32, EncodeError> {
     if offset >= 0 && offset % scale == 0 {
-        let scaled = (offset / scale) as u32;
+        // Check before narrowing: a quotient of 2^32 must not become offset0.
+        let scaled = offset / scale;
         if scaled <= 0xFFF {
-            return Ok(encoding::encode_load_store_ui(size, v, opc, scaled, rn, rt));
+            return Ok(encoding::encode_load_store_ui(
+                size,
+                v,
+                opc,
+                scaled as u32,
+                rn,
+                rt,
+            ));
         }
     }
     // Negative or unaligned offset: use unscaled (LDUR/STUR) encoding.
@@ -612,25 +1255,31 @@ pub fn scalar_ri_offset_encodable(offset: i64, scale: i64) -> bool {
 
 /// The access size in bytes for a scalar register+immediate load/store whose
 /// byte offset is encoded by [`encode_load_store_auto`]. Returns `None` for any
-/// opcode/operand shape that is not such a form (pairs, pre/post-index,
+/// opcode/transfer class that is not such a form (pairs, pre/post-index,
 /// register-offset, non-memory ops, or a transfer register whose class has no
 /// scalar RI encoding here).
 ///
-/// The scale derivation MIRRORS the per-opcode dispatch in `encode_instruction`
-/// (via `sf_from_operand` / `is_fpr` / `fp_mem_fields_from_preg_class`), so a
-/// `scalar_ri_offset_encodable` check built on it agrees with the encoder
-/// bit-for-bit.
+/// Only the transfer is inspected: frame lowering needs this scale before
+/// FrameIndex/StackSlot addresses are resolved. The resolved-address legalizer
+/// separately validates the complete address shape. Ordinary and volatile
+/// aliases share their encoding and scale; legacy typed STR aliases retain
+/// their hardwired widths.
 pub fn scalar_ri_mem_scale(inst: &MachInst) -> Option<i64> {
     use trust_cg_ir::inst::AArch64Opcode as Op;
     let scale = match inst.opcode {
-        // Width follows the transfer register (operand 0), identically to the
-        // `sf_from_operand` (integer) / `fp_mem_fields_from_preg_class` (FP)
-        // derivation in the LdrRI/StrRI encoder arms.
-        Op::LdrRI | Op::StrRI => scalar_transfer_scale(inst)?,
-        // Narrow forms: the access width is fixed by the opcode, never the
-        // (always 32-bit) transfer class.
-        Op::LdrbRI | Op::LdrsbRI | Op::StrbRI => 1,
-        Op::LdrhRI | Op::LdrshRI | Op::StrhRI => 2,
+        Op::LdrRI | Op::StrRI | Op::VolatileLdrRI | Op::VolatileStrRI => {
+            scalar_transfer_scale(inst)?
+        }
+        // Narrow forms accept W and X carriers (including Bool/B1's X alias),
+        // but their memory width is fixed by the opcode.
+        Op::LdrbRI | Op::LdrsbRI | Op::StrbRI | Op::VolatileLdrbRI | Op::VolatileStrbRI => {
+            gpr_memory_data_register(inst, 0).ok()?;
+            1
+        }
+        Op::LdrhRI | Op::LdrshRI | Op::StrhRI | Op::VolatileLdrhRI | Op::VolatileStrhRI => {
+            gpr_memory_data_register(inst, 0).ok()?;
+            2
+        }
         // Typed STR aliases with a hardwired width.
         Op::STRWui | Op::STRSui => 4,
         Op::STRXui | Op::STRDui => 8,
@@ -640,65 +1289,45 @@ pub fn scalar_ri_mem_scale(inst: &MachInst) -> Option<i64> {
 }
 
 /// Access size in bytes implied by the transfer register at operand 0 for an
-/// `LdrRI`/`StrRI`. Mirrors `sf_from_operand` (Gpr32→4, Gpr64/XZR/SP→8, WZR→4)
+/// `LdrRI`/`StrRI` or volatile alias (Gpr32/WZR→4, Gpr64/XZR→8)
 /// and `fp_mem_fields_from_preg_class` (Fpr128→16, Fpr64→8, Fpr32→4, Fpr16→2).
 fn scalar_transfer_scale(inst: &MachInst) -> Option<i64> {
-    match inst.operands.first() {
+    // Recognize FP without constructing a GPR-refusal diagnostic on this
+    // valid, frequently used path.
+    let fp_scale = match inst.operands.first() {
         Some(MachOperand::PReg(p)) => match preg_class(*p) {
-            RegClass::Gpr64 => Some(8),
-            RegClass::Gpr32 => Some(4),
             RegClass::Fpr128 => Some(16),
             RegClass::Fpr64 => Some(8),
             RegClass::Fpr32 => Some(4),
             RegClass::Fpr16 => Some(2),
             _ => None,
         },
-        Some(MachOperand::Special(s)) => match s {
-            SpecialReg::SP | SpecialReg::XZR => Some(8),
-            SpecialReg::WZR => Some(4),
-        },
         _ => None,
-    }
+    };
+    fp_scale.or_else(|| {
+        gpr_memory_data_register(inst, 0)
+            .ok()
+            .map(|(_, width)| i64::from(width / 8))
+    })
 }
 
-/// Transfer register of a scalar writeback form, plus the access WIDTH implied
-/// by its register class.
-///
-/// The width is DERIVED, exactly as the unsigned-offset `LdrRI`/`StrRI` arms
-/// derive theirs, rather than hardcoded. Before this, `encode_scalar_writeback`
-/// pinned `LoadStoreSize::Double` and this helper REJECTED any 32-bit transfer
-/// register — so every pre-existing producer necessarily passes a `Gpr64` and
-/// still encodes as `Double`. Deriving therefore cannot change any instruction
-/// that encoded before; it only admits the `Gpr32` form (`ldr w1, [x16], #4`),
-/// which `post_index_late` needs and which had no representation at all.
+/// Scalar writeback data has the same W/X/ZR bank contract as immediate
+/// memory. SP/WSP must not be reduced to a zero-register hardware field.
 fn scalar_writeback_transfer_hw(
     inst: &MachInst,
     idx: usize,
 ) -> Result<(u32, encoding_mem::LoadStoreSize), EncodeError> {
-    match inst.operands.get(idx) {
-        Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Gpr64 && *p != SP => {
-            Ok((p.hw_enc() as u32, encoding_mem::LoadStoreSize::Double))
-        }
-        Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Gpr32 => {
-            Ok((p.hw_enc() as u32, encoding_mem::LoadStoreSize::Word))
-        }
-        Some(MachOperand::Special(SpecialReg::XZR)) => {
-            Ok((31, encoding_mem::LoadStoreSize::Double))
-        }
-        Some(other) => Err(EncodeError::InvalidOperand {
-            opcode: inst.opcode,
-            index: idx,
-            desc: format!("expected 32/64-bit GPR or XZR transfer register, got {other:?}"),
-        }),
-        None => Err(EncodeError::MissingOperand {
-            opcode: inst.opcode,
-            index: idx,
-            expected: idx + 1,
-        }),
-    }
+    let (rt, width) = gpr_memory_data_register(inst, idx)?;
+    let size = if width == 64 {
+        encoding_mem::LoadStoreSize::Double
+    } else {
+        encoding_mem::LoadStoreSize::Word
+    };
+    Ok((rt, size))
 }
 
-fn scalar_writeback_base_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
+/// A memory base names X0-X30 or SP, never a zero register or another bank.
+fn memory_base_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
     match inst.operands.get(idx) {
         Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Gpr64 && *p != XZR => {
             Ok(p.hw_enc() as u32)
@@ -707,7 +1336,7 @@ fn scalar_writeback_base_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeEr
         Some(other) => Err(EncodeError::InvalidOperand {
             opcode: inst.opcode,
             index: idx,
-            desc: format!("expected 64-bit GPR or SP writeback base, got {other:?}"),
+            desc: format!("expected 64-bit GPR or SP memory base, got {other:?}"),
         }),
         None => Err(EncodeError::MissingOperand {
             opcode: inst.opcode,
@@ -717,13 +1346,187 @@ fn scalar_writeback_base_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeEr
     }
 }
 
+/// Closed operand shape and mode contract for scalar register-offset memory. Spill materialization
+/// also uses this parser before decomposing an RO instruction into RI accesses,
+/// so malformed modes or tails cannot disappear before final encoding.
+pub(crate) fn register_offset_mode(
+    inst: &MachInst,
+) -> Result<(encoding_mem::RegExtend, bool), EncodeError> {
+    let actual = inst.operands.len();
+    if actual < 3 {
+        return Err(EncodeError::MissingOperand {
+            opcode: inst.opcode,
+            index: actual,
+            expected: 3,
+        });
+    }
+    if actual > 4 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 4,
+            desc: "register-offset memory requires exactly [Rt, Xn|SP, Rm, optional Imm(mode)]"
+                .into(),
+        });
+    }
+    use encoding_mem::RegExtend::{Lsl, Sxtw, Sxtx, Uxtw};
+    match inst.operands.get(3) {
+        None => Ok((Lsl, false)),
+        Some(MachOperand::Imm(4)) => Ok((Uxtw, false)),
+        Some(MachOperand::Imm(5)) => Ok((Uxtw, true)),
+        Some(MachOperand::Imm(6)) => Ok((Lsl, false)),
+        Some(MachOperand::Imm(7)) => Ok((Lsl, true)),
+        Some(MachOperand::Imm(12)) => Ok((Sxtw, false)),
+        Some(MachOperand::Imm(13)) => Ok((Sxtw, true)),
+        Some(MachOperand::Imm(14)) => Ok((Sxtx, false)),
+        Some(MachOperand::Imm(15)) => Ok((Sxtx, true)),
+        Some(other) => Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 3,
+            desc: format!(
+                "register-offset mode must be an immediate in {{4,5,6,7,12,13,14,15}}, got {other:?}"
+            ),
+        }),
+    }
+}
+
+fn register_offset_index_hw(
+    inst: &MachInst,
+    extend: encoding_mem::RegExtend,
+) -> Result<u32, EncodeError> {
+    let index_width = non_sp_gpr_width(inst, 2)?;
+    let rm = preg_hw(inst, 2)?;
+    // W extensions explicitly read low32 even when MachIR uses an X carrier.
+    // Full64 modes require X; both zero-register spellings are known full64
+    // zero. A real W spill reload establishes an X view at the producer, not
+    // by widening arbitrary final physical W operands at this boundary.
+    if index_width == 32
+        && rm != 31
+        && matches!(
+            extend,
+            encoding_mem::RegExtend::Lsl | encoding_mem::RegExtend::Sxtx
+        )
+    {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 2,
+            desc: "LSL/SXTX register-offset index requires an X register or known zero".into(),
+        });
+    }
+    Ok(rm)
+}
+
+/// Check narrow RO intent before allocation or spilling erases virtual classes.
+/// A virtual Gpr32 index is retained for the actual W-reload/X-view spill path;
+/// a final physical W index is never silently widened by this admission check.
+pub(crate) fn narrow_register_offset_intent(
+    inst: &MachInst,
+) -> Result<(encoding_mem::RegExtend, bool), EncodeError> {
+    if !matches!(
+        inst.opcode,
+        AArch64Opcode::LdrbRO
+            | AArch64Opcode::LdrhRO
+            | AArch64Opcode::StrbRO
+            | AArch64Opcode::StrhRO
+    ) {
+        return Err(EncodeError::UnsupportedOpcode(inst.opcode));
+    }
+    let mode = register_offset_mode(inst)?;
+    for (position, operand) in inst.operands[..3].iter().enumerate() {
+        if let MachOperand::VReg(vreg) = operand {
+            let supported = if position == 1 {
+                vreg.class == RegClass::Gpr64
+            } else {
+                matches!(vreg.class, RegClass::Gpr32 | RegClass::Gpr64)
+            };
+            if !supported {
+                return Err(EncodeError::InvalidOperand {
+                    opcode: inst.opcode,
+                    index: position,
+                    desc: format!(
+                        "narrow register-offset operand has unsupported virtual class {:?}",
+                        vreg.class
+                    ),
+                });
+            }
+        } else {
+            match position {
+                0 => {
+                    gpr_memory_data_register(inst, 0)?;
+                }
+                1 => {
+                    memory_base_hw(inst, 1)?;
+                }
+                2 => {
+                    register_offset_index_hw(inst, mode.0)?;
+                }
+                // `operands[..3]` yields positions 0..=2 only; refuse rather
+                // than panic if that slice ever widens.
+                _ => {
+                    return Err(EncodeError::InvalidOperand {
+                        opcode: inst.opcode,
+                        index: position,
+                        desc: "narrow register-offset form has exactly three register operands"
+                            .into(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(mode)
+}
+
+fn encode_register_offset(inst: &MachInst, load: bool) -> Result<u32, EncodeError> {
+    let (extend, shifted) = register_offset_mode(inst)?;
+    let narrow_size = match inst.opcode {
+        AArch64Opcode::LdrbRO | AArch64Opcode::StrbRO => Some(0),
+        AArch64Opcode::LdrhRO | AArch64Opcode::StrhRO => Some(1),
+        _ => None,
+    };
+    let v = narrow_size.is_none() && is_fpr(inst, 0);
+    let (size, opc, rt) = if let Some(size) = narrow_size {
+        // Both W and X carriers name the same narrow transfer. Loads write W
+        // (zeroing the X upper half); stores consume only the low byte/halfword.
+        (size, u32::from(load), gpr_memory_data_register(inst, 0)?.0)
+    } else if v {
+        // Preserve the exact H/S/D/Q mapping, including Q's high opc bit.
+        let (size, _, opc) = fp_mem_fields_from_inst(inst, 0, u32::from(load))?;
+        (size, opc, preg_hw(inst, 0)?)
+    } else {
+        let (rt, width) = gpr_memory_data_register(inst, 0)?;
+        (if width == 64 { 3 } else { 2 }, u32::from(load), rt)
+    };
+    let rn = memory_base_hw(inst, 1)?;
+    let rm = register_offset_index_hw(inst, extend)?;
+    // RO has no writeback: transfer/base/index register aliases remain legal.
+    Ok(encoding_mem::encode_ldr_str_register_fields(
+        size, v, opc, rm as u8, extend, shifted, rn as u8, rt as u8,
+    )?)
+}
+
 fn encode_scalar_writeback(
     inst: &MachInst,
     pre_index: bool,
     op: encoding_mem::LoadStoreOp,
 ) -> Result<u32, EncodeError> {
+    let actual = inst.operands.len();
+    if actual < 3 {
+        return Err(EncodeError::MissingOperand {
+            opcode: inst.opcode,
+            index: actual,
+            expected: 3,
+        });
+    }
+    if actual > 3 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 3,
+            desc: format!(
+                "scalar writeback requires exactly [Wt|Xt|ZR, Xn|SP, Imm]; got {actual} operands"
+            ),
+        });
+    }
     let (rt, size) = scalar_writeback_transfer_hw(inst, 0)?;
-    let rn = scalar_writeback_base_hw(inst, 1)?;
+    let rn = memory_base_hw(inst, 1)?;
     if rn != 31 && rt == rn {
         return Err(EncodeError::InvalidOperand {
             opcode: inst.opcode,
@@ -773,6 +1576,46 @@ fn sf_from_operand(inst: &MachInst, idx: usize) -> u32 {
     }
 }
 
+/// Encode a general-register move of width `sf` (MovR / MOVWrr / MOVXrr).
+///
+/// Register 31 is XZR in ORR (shifted register) but SP in ADD (immediate), so
+/// a move from OR to the stack pointer — spelled `SpecialReg::SP` or as the
+/// physical `SP`/`WSP` register — is `ADD Rd, Rn, #0`, and every other move is
+/// `ORR Rd, ZR, Rm`. Encoding an SP operand through ORR would read or write
+/// the zero register instead (MOV Xd, SP becoming MOV Xd, XZR). A move
+/// between SP and a zero register has no single-instruction form and is
+/// refused.
+fn encode_gpr_register_move(inst: &MachInst, sf: u32) -> Result<u32, EncodeError> {
+    let is_sp = |index: usize| match inst.operands.get(index) {
+        Some(MachOperand::Special(SpecialReg::SP)) => true,
+        Some(MachOperand::PReg(p)) => *p == SP || *p == WSP,
+        _ => false,
+    };
+    let is_zr = |index: usize| match inst.operands.get(index) {
+        Some(MachOperand::Special(SpecialReg::XZR | SpecialReg::WZR)) => true,
+        Some(MachOperand::PReg(p)) => *p == XZR || *p == WZR,
+        _ => false,
+    };
+    let (rd, rm) = (preg_hw(inst, 0)?, preg_hw(inst, 1)?);
+    if is_sp(0) || is_sp(1) {
+        if is_zr(0) || is_zr(1) {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: if is_zr(0) { 0 } else { 1 },
+                desc: "a move between SP and a zero register has no single-instruction \
+                       encoding (register 31 is SP in ADD and XZR in ORR) — fail-closed"
+                    .to_string(),
+            });
+        }
+        // ADD Rd|SP, Rn|SP, #0
+        return Ok(encoding::encode_add_sub_imm(sf, 0, 0, 0, 0, rm, rd));
+    }
+    // ORR Rd, ZR, Rm
+    Ok(encoding::encode_logical_shifted_reg(
+        sf, 0b01, 0, 0, rm, 0, 31, rd,
+    ))
+}
+
 /// Check if an operand is an FPR (V-register).
 fn is_fpr(inst: &MachInst, idx: usize) -> bool {
     match inst.operands.get(idx) {
@@ -785,122 +1628,438 @@ fn encode_gpr_move_alias(sf: u32, rd: u32, rn: u32) -> u32 {
     encoding::encode_logical_shifted_reg(sf, 0b01, 0, 0, rn, 0, 31, rd)
 }
 
-fn pair_operand_class(inst: &MachInst, idx: usize) -> Result<RegClass, EncodeError> {
-    match inst.operands.get(idx) {
-        Some(MachOperand::PReg(p)) => Ok(preg_class(*p)),
-        Some(other) => Err(EncodeError::InvalidOperand {
-            opcode: inst.opcode,
-            index: idx,
-            desc: format!("expected pair register, got {:?}", other),
-        }),
-        None => Err(EncodeError::MissingOperand {
-            opcode: inst.opcode,
-            index: idx,
-            expected: idx + 1,
-        }),
+#[cfg(test)]
+mod pair_memory_contract_tests {
+    use super::*;
+    use trust_cg_ir::regs::{PReg, VReg, WZR};
+
+    // Independent literal words for Rt=0, Rt2=1, Rn=2, offset=0.
+    // Arm DDI0602 2025-03 LDP/STP general and SIMD/FP pair formats.
+    fn profiles() -> Vec<(AArch64Opcode, u16, i64, u32)> {
+        use AArch64Opcode::*;
+        vec![
+            (StpRI, 32, 4, 0x2900_0440),
+            (LdpRI, 32, 4, 0x2940_0440),
+            (StpPreIndex, 32, 4, 0x2980_0440),
+            (LdpPostIndex, 32, 4, 0x28c0_0440),
+            (StpRI, 0, 8, 0xa900_0440),
+            (LdpRI, 0, 8, 0xa940_0440),
+            (StpPreIndex, 0, 8, 0xa980_0440),
+            (LdpPostIndex, 0, 8, 0xa8c0_0440),
+            (StpRI, 128, 4, 0x2d00_0440),
+            (LdpRI, 128, 4, 0x2d40_0440),
+            (StpPreIndex, 128, 4, 0x2d80_0440),
+            (LdpPostIndex, 128, 4, 0x2cc0_0440),
+            (StpRI, 96, 8, 0x6d00_0440),
+            (LdpRI, 96, 8, 0x6d40_0440),
+            (StpPreIndex, 96, 8, 0x6d80_0440),
+            (LdpPostIndex, 96, 8, 0x6cc0_0440),
+            (StpRI, 64, 16, 0xad00_0440),
+            (LdpRI, 64, 16, 0xad40_0440),
+            (StpPreIndex, 64, 16, 0xad80_0440),
+            (LdpPostIndex, 64, 16, 0xacc0_0440),
+            (NeonLdpQPost, 64, 16, 0xacc0_0440),
+            (NeonStpQPost, 64, 16, 0xac80_0440),
+        ]
+    }
+
+    fn inst(op: AArch64Opcode, bank: u16) -> MachInst {
+        MachInst::new(
+            op,
+            vec![
+                MachOperand::PReg(PReg::new(bank)),
+                MachOperand::PReg(PReg::new(bank + 1)),
+                MachOperand::PReg(PReg::new(2)),
+            ],
+        )
+    }
+
+    #[test]
+    fn pair_memory_all_widths_modes_and_signed_offsets() {
+        let mut failures = Vec::new();
+        let mut count = 0;
+        for (op, bank, scale, anchor) in profiles() {
+            let mut input = inst(op, bank);
+            count += 1;
+            if encode_instruction(&input).ok() != Some(anchor) {
+                failures.push(format!("{input:?}: omitted zero rejected or wrong word"));
+            }
+            for field in -64i64..=63 {
+                input.operands.truncate(3);
+                input.operands.push(MachOperand::Imm(field * scale));
+                let expected = anchor | (((field as u32) & 127) << 15);
+                count += 1;
+                if encode_instruction(&input).ok() != Some(expected) {
+                    failures.push(format!("{input:?}: expected {expected:#010x}"));
+                }
+            }
+        }
+        assert_eq!(count, 2838);
+        assert!(
+            failures.is_empty(),
+            "{} / {count} failures; first 24: {:?}",
+            failures.len(),
+            &failures[..failures.len().min(24)]
+        );
+    }
+
+    #[test]
+    fn pair_memory_rejects_malformed_shape_banks_and_offsets() {
+        let mut failures = Vec::new();
+        let mut count = 0;
+        for (op, bank, scale, _) in profiles() {
+            let valid = inst(op, bank);
+            let mut malformed = Vec::new();
+            for length in 0..3 {
+                let mut input = valid.clone();
+                input.operands.truncate(length);
+                malformed.push(input);
+            }
+            for value in [
+                i64::MIN,
+                i64::MAX,
+                -65 * scale,
+                64 * scale,
+                128 * scale,
+                192 * scale,
+                (1i64 << 32) * scale,
+                1,
+                -1,
+            ] {
+                let mut input = valid.clone();
+                input.operands.push(MachOperand::Imm(value));
+                malformed.push(input);
+            }
+            for offset in [
+                MachOperand::PReg(PReg::new(3)),
+                MachOperand::Special(SpecialReg::SP),
+                MachOperand::VReg(VReg::new(90, RegClass::Gpr64)),
+            ] {
+                let mut input = valid.clone();
+                input.operands.push(offset);
+                malformed.push(input);
+            }
+            let mut tail = valid.clone();
+            tail.operands
+                .extend([MachOperand::Imm(0), MachOperand::Imm(0)]);
+            malformed.push(tail);
+            for position in 0..3 {
+                for raw in 0u16..=260 {
+                    let legal_bank = if position == 2 {
+                        raw <= 31
+                    } else {
+                        match bank {
+                            0 => raw <= 30 || raw == 160,
+                            32 => (32..=62).contains(&raw) || raw == 161,
+                            64 => (64..=95).contains(&raw),
+                            96 => (96..=127).contains(&raw),
+                            128 => (128..=159).contains(&raw),
+                            _ => unreachable!(),
+                        }
+                    };
+                    if !legal_bank {
+                        let mut input = valid.clone();
+                        input.operands[position] = MachOperand::PReg(PReg::new(raw));
+                        malformed.push(input);
+                    }
+                }
+                let mut input = valid.clone();
+                input.operands[position] = MachOperand::VReg(VReg::new(
+                    80,
+                    if position == 2 {
+                        RegClass::Gpr64
+                    } else {
+                        preg_class(PReg::new(bank))
+                    },
+                ));
+                malformed.push(input);
+            }
+            for input in malformed {
+                count += 1;
+                if let Ok(word) = encode_instruction(&input) {
+                    failures.push(format!("{input:?}: unexpectedly admitted {word:#010x}"));
+                }
+            }
+        }
+        assert_eq!(count, 15532);
+        assert!(
+            failures.is_empty(),
+            "{} / {count} malformed inputs admitted; first 24: {:?}",
+            failures.len(),
+            &failures[..failures.len().min(24)]
+        );
+    }
+
+    #[test]
+    fn pair_memory_alias_rules_and_zero_spellings() {
+        use AArch64Opcode::*;
+        let mut failures = Vec::new();
+        let mut count = 0;
+        for (op, bank, _, _) in profiles() {
+            let load = matches!(op, LdpRI | LdpPostIndex | NeonLdpQPost);
+            let writeback = !matches!(op, StpRI | LdpRI);
+            let gpr = bank == 0 || bank == 32;
+            let valid = inst(op, bank);
+            let mut cases = Vec::new();
+            let mut duplicate = valid.clone();
+            duplicate.operands[1] = duplicate.operands[0].clone();
+            cases.push((duplicate, !load));
+            for position in 0..2 {
+                let mut overlap = valid.clone();
+                overlap.operands[2] = MachOperand::PReg(PReg::new(position as u16));
+                cases.push((overlap, !writeback || !gpr));
+            }
+            if gpr {
+                let zeros = if bank == 0 {
+                    [
+                        MachOperand::PReg(XZR),
+                        MachOperand::Special(SpecialReg::XZR),
+                    ]
+                } else {
+                    [
+                        MachOperand::PReg(WZR),
+                        MachOperand::Special(SpecialReg::WZR),
+                    ]
+                };
+                for first in &zeros {
+                    for second in &zeros {
+                        for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+                            let mut both = valid.clone();
+                            both.operands = vec![first.clone(), second.clone(), base.clone()];
+                            cases.push((both, !load));
+                            for position in 0..2 {
+                                let mut single = valid.clone();
+                                single.operands[position] = first.clone();
+                                single.operands[2] = base.clone();
+                                cases.push((single, true));
+                            }
+                        }
+                    }
+                }
+            }
+            for (input, legal) in cases {
+                count += 1;
+                if encode_instruction(&input).is_ok() != legal {
+                    failures.push(format!("{input:?}: expected legal={legal}"));
+                }
+            }
+        }
+        assert_eq!(count, 258);
+        assert!(
+            failures.is_empty(),
+            "{} / {count} alias failures; first 24: {:?}",
+            failures.len(),
+            &failures[..failures.len().min(24)]
+        );
     }
 }
 
-/// Derive the `(PairSize, v, scale)` for the pre/post-index LDP/STP paths from
-/// the register class of the pair operands. The callee-saved frame lowering
-/// emits GPR X64 pairs (FP/LR and X19–X28) and FPR D64 pairs (the low 64 bits
-/// of V8–V15) through the pre-index (CSA allocation) and post-index (CSA
-/// deallocation) forms; both scale by 8. Fails closed on any other class so an
-/// FPR pair can never be silently encoded as a GPR pair (or vice versa), which
-/// would store/restore the wrong physical registers and clobber a callee-saved
-/// value — the exact miscompile this replaces.
-fn pair_index_size_v(inst: &MachInst) -> Result<(encoding_mem::PairSize, bool, i64), EncodeError> {
-    let class0 = pair_operand_class(inst, 0)?;
-    let class1 = pair_operand_class(inst, 1)?;
-    match (class0, class1) {
-        (RegClass::Gpr64, RegClass::Gpr64) => Ok((encoding_mem::PairSize::X64, false, 8)),
-        (RegClass::Fpr64, RegClass::Fpr64) => Ok((encoding_mem::PairSize::D64, true, 8)),
-        _ => Err(EncodeError::InvalidOperand {
-            opcode: inst.opcode,
-            index: 0,
-            desc: format!(
-                "pre/post-index pair operands must both be Gpr64 or both Fpr64, got {class0:?} and {class1:?}"
-            ),
-        }),
+/// The three addressing modes admitted by the existing pair wrappers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairMemoryMode {
+    Offset,
+    PreIndex,
+    PostIndex,
+}
+
+/// Typed pair intent, also checked before spill normalization can erase an
+/// invalid virtual register class, operand tail, offset, or known alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PairMemoryDescriptor {
+    pub load: bool,
+    pub mode: PairMemoryMode,
+    pub element_bytes: u8,
+    pub data_class: RegClass,
+    pub offset: i64,
+}
+
+fn pair_operand_class(inst: &MachInst, index: usize) -> Result<RegClass, EncodeError> {
+    let class = match inst.operands.get(index) {
+        Some(MachOperand::PReg(p)) if *p != SP && *p != WSP => preg_class(*p),
+        Some(MachOperand::VReg(v)) => v.class,
+        Some(MachOperand::Special(SpecialReg::XZR)) => RegClass::Gpr64,
+        Some(MachOperand::Special(SpecialReg::WZR)) => RegClass::Gpr32,
+        _ => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index,
+                desc: "pair transfer requires W/X/ZR or S/D/Q, never SP/WSP".into(),
+            });
+        }
+    };
+    if !matches!(
+        class,
+        RegClass::Gpr32 | RegClass::Gpr64 | RegClass::Fpr32 | RegClass::Fpr64 | RegClass::Fpr128
+    ) {
+        return Err(unsupported_pair_transfer_class(inst, index, class));
+    }
+    Ok(class)
+}
+
+fn unsupported_pair_transfer_class(inst: &MachInst, index: usize, class: RegClass) -> EncodeError {
+    EncodeError::InvalidOperand {
+        opcode: inst.opcode,
+        index,
+        desc: format!("unsupported pair transfer class {class:?}"),
     }
 }
 
-fn pair_encoding_fields(inst: &MachInst) -> Result<(u32, u32, i64), EncodeError> {
-    let class0 = pair_operand_class(inst, 0)?;
-    let class1 = pair_operand_class(inst, 1)?;
-    match (class0, class1) {
-        (RegClass::Gpr64, RegClass::Gpr64) => Ok((0b10, 0, 8)),
-        (RegClass::Gpr32, RegClass::Gpr32) => Ok((0b00, 0, 4)),
-        (RegClass::Fpr128, RegClass::Fpr128) => Ok((0b10, 1, 16)),
-        (RegClass::Fpr64, RegClass::Fpr64) => Ok((0b01, 1, 8)),
-        (RegClass::Fpr32, RegClass::Fpr32) => Ok((0b00, 1, 4)),
-        _ => Err(EncodeError::InvalidOperand {
-            opcode: inst.opcode,
-            index: 0,
-            desc: format!(
-                "pair operands must have matching pair-encodable classes, got {class0:?} and {class1:?}"
-            ),
-        }),
+/// Call only after the two operands' banks have been validated. Virtual
+/// identities are known before allocation; a mixed virtual/physical pair is
+/// checked again when the final encoder has resolved both operands.
+fn pair_known_same_register(a: &MachOperand, b: &MachOperand) -> bool {
+    match (a, b) {
+        (MachOperand::VReg(a), MachOperand::VReg(b)) => a.id == b.id,
+        (MachOperand::PReg(a), MachOperand::PReg(b)) => a.hw_enc() == b.hw_enc(),
+        (MachOperand::Special(_), MachOperand::PReg(p))
+        | (MachOperand::PReg(p), MachOperand::Special(_)) => p.hw_enc() == 31,
+        (MachOperand::Special(_), MachOperand::Special(_)) => true,
+        _ => false,
     }
 }
 
-fn scaled_pair_imm7(inst: &MachInst, offset: i64, scale: i64) -> Result<u32, EncodeError> {
-    if offset % scale != 0 {
-        return Err(EncodeError::InvalidOperand {
-            opcode: inst.opcode,
-            index: 3,
-            desc: format!("pair offset {offset} is not aligned to element scale {scale}"),
-        });
-    }
-    // The STP/LDP `imm7` field is a SIGNED 7-bit value (scaled range -64..=63).
-    // Range-check the i64 quotient BEFORE any narrowing cast — a `& 0x7F` mask
-    // would silently truncate an out-of-range scaled offset into a *different*
-    // (wrong) stack offset, producing a silent callee-save/frame miscompile.
-    // Mirrors `encoding_mem::check_imm7` (the pre/post-index path's guard).
-    let scaled = offset / scale;
-    if !(-64..=63).contains(&scaled) {
-        return Err(EncodeError::InvalidOperand {
-            opcode: inst.opcode,
-            index: 3,
-            desc: format!(
-                "pair offset {offset} scaled by {scale} = {scaled} is out of signed 7-bit range [-64, 63]"
-            ),
-        });
-    }
-    Ok((scaled as i32 as u32) & 0x7F)
-}
-
-/// FAIL-CLOSED scaled `imm7` for the pre/post-index STP/LDP forms.
+/// Exact admission for the canonical four pair opcodes and the two Q-only
+/// post-index aliases. Three operands retain the historical zero offset.
+/// Stack slots and MemOp are not pair producers; they are not an escape from
+/// the X/SP base contract. Unresolved Gpr64 virtual bases are allowed here,
+/// but never by the final physical encoder.
 ///
-/// The pre/post-index pair encoders (`encode_ldp_stp_pre_index` /
-/// `encode_ldp_stp_post_index`) take an `i8` and then range-check it against the
-/// signed 7-bit field via `check_imm7`. The danger is the *narrowing* step:
-/// computing `(offset / scale) as i8` BEFORE the range check truncates a large
-/// quotient into a different (in-range) `i8`, which then passes `check_imm7` and
-/// silently miscompiles the offset. For example `offset = 1536, scale = 8` gives
-/// quotient `192`, and `192 as i8 == -64`, which `check_imm7` happily accepts —
-/// encoding the WRONG stack offset. We therefore range-check the i64 quotient
-/// (and alignment) up front and only then narrow to `i8`. Mirrors
-/// [`scaled_pair_imm7`] (the signed-offset pair path's guard).
-fn scaled_pair_imm7_i8(inst: &MachInst, offset: i64, scale: i64) -> Result<i8, EncodeError> {
-    if offset % scale != 0 {
-        return Err(EncodeError::InvalidOperand {
+/// Arm DDI0602 (2025-03), LDP/STP general and SIMD/FP: duplicate LDP fields,
+/// including ZR/ZR, are constrained-unpredictable. GPR writeback also forbids
+/// transfer/base overlap except SP. Equal-numbered FP and GPR fields are in
+/// distinct banks and are legal. Stores may repeat their source register.
+pub(crate) fn pair_memory_descriptor(inst: &MachInst) -> Result<PairMemoryDescriptor, EncodeError> {
+    use AArch64Opcode::*;
+    let (load, mode, q_only) = match inst.opcode {
+        StpRI => (false, PairMemoryMode::Offset, false),
+        LdpRI => (true, PairMemoryMode::Offset, false),
+        StpPreIndex => (false, PairMemoryMode::PreIndex, false),
+        LdpPostIndex => (true, PairMemoryMode::PostIndex, false),
+        NeonLdpQPost => (true, PairMemoryMode::PostIndex, true),
+        NeonStpQPost => (false, PairMemoryMode::PostIndex, true),
+        other => return Err(EncodeError::UnsupportedOpcode(other)),
+    };
+    let actual = inst.operands.len();
+    if actual < 3 {
+        return Err(EncodeError::MissingOperand {
             opcode: inst.opcode,
-            index: 3,
-            desc: format!("pair offset {offset} is not aligned to element scale {scale}"),
+            index: actual,
+            expected: 3,
         });
     }
-    let scaled = offset / scale;
-    if !(-64..=63).contains(&scaled) {
+    if actual > 4 {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 4,
+            desc: "pair memory requires exactly [Rt, Rt2, Xn|SP, optional Imm]".into(),
+        });
+    }
+    let data_class = pair_operand_class(inst, 0)?;
+    let second_class = pair_operand_class(inst, 1)?;
+    if data_class != second_class || (q_only && data_class != RegClass::Fpr128) {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 0,
+            desc: format!(
+                "pair transfer classes must match{}: {data_class:?}, {second_class:?}",
+                if q_only { " and be Q" } else { "" }
+            ),
+        });
+    }
+    // `pair_operand_class` admits exactly these five classes; any other class
+    // is refused with the same diagnostic it would have produced.
+    let element_bytes = match data_class {
+        RegClass::Gpr32 | RegClass::Fpr32 => 4,
+        RegClass::Gpr64 | RegClass::Fpr64 => 8,
+        RegClass::Fpr128 => 16,
+        other => return Err(unsupported_pair_transfer_class(inst, 0, other)),
+    };
+    match &inst.operands[2] {
+        MachOperand::VReg(v) if v.class == RegClass::Gpr64 => {}
+        _ => {
+            memory_base_hw(inst, 2)?;
+        }
+    }
+    let offset = if actual == 3 {
+        0
+    } else {
+        imm_operand(inst, 3)?
+    };
+    let scale = i64::from(element_bytes);
+    if offset % scale != 0 || !(-64..=63).contains(&(offset / scale)) {
         return Err(EncodeError::InvalidOperand {
             opcode: inst.opcode,
             index: 3,
             desc: format!(
-                "pair offset {offset} scaled by {scale} = {scaled} is out of signed 7-bit range [-64, 63]"
+                "pair offset {offset} must be aligned to {scale} and fit signed scaled imm7"
             ),
         });
     }
-    Ok(scaled as i8)
+    if load && pair_known_same_register(&inst.operands[0], &inst.operands[1]) {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 1,
+            desc: "pair load destinations must have distinct hardware fields (including ZR)".into(),
+        });
+    }
+    let base_is_sp = matches!(&inst.operands[2], MachOperand::PReg(p) if *p == SP)
+        || matches!(&inst.operands[2], MachOperand::Special(SpecialReg::SP));
+    if mode != PairMemoryMode::Offset
+        && matches!(data_class, RegClass::Gpr32 | RegClass::Gpr64)
+        && !base_is_sp
+        && (pair_known_same_register(&inst.operands[0], &inst.operands[2])
+            || pair_known_same_register(&inst.operands[1], &inst.operands[2]))
+    {
+        return Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 2,
+            desc: "pair writeback base overlaps a GPR transfer register".into(),
+        });
+    }
+    Ok(PairMemoryDescriptor {
+        load,
+        mode,
+        element_bytes,
+        data_class,
+        offset,
+    })
+}
+
+fn encode_pair_memory(inst: &MachInst) -> Result<u32, EncodeError> {
+    let pair = pair_memory_descriptor(inst)?;
+    // PairSize is the raw opc field: its W32/X64 variants also select S/Q
+    // when V=1. Do not infer the transfer size without the V bit.
+    let (size, v) = match pair.data_class {
+        RegClass::Gpr32 => (encoding_mem::PairSize::W32, false),
+        RegClass::Gpr64 => (encoding_mem::PairSize::X64, false),
+        RegClass::Fpr32 => (encoding_mem::PairSize::W32, true),
+        RegClass::Fpr64 => (encoding_mem::PairSize::D64, true),
+        RegClass::Fpr128 => (encoding_mem::PairSize::X64, true),
+        // `pair_memory_descriptor` only yields the five classes above.
+        other => return Err(unsupported_pair_transfer_class(inst, 0, other)),
+    };
+    let mode = match pair.mode {
+        PairMemoryMode::Offset => encoding_mem::PairMode::SignedOffset,
+        PairMemoryMode::PreIndex => encoding_mem::PairMode::PreIndex,
+        PairMemoryMode::PostIndex => encoding_mem::PairMode::PostIndex,
+    };
+    let op = if pair.load {
+        encoding_mem::PairOp::LoadPair
+    } else {
+        encoding_mem::PairOp::StorePair
+    };
+    // Descriptor checked the full i64 quotient before this narrowing.
+    let imm7 = (pair.offset / i64::from(pair.element_bytes)) as i8;
+    Ok(encoding_mem::encode_ldp_stp(
+        size,
+        v,
+        op,
+        mode,
+        imm7,
+        preg_hw(inst, 1)? as u8,
+        memory_base_hw(inst, 2)? as u8,
+        preg_hw(inst, 0)? as u8,
+    )?)
 }
 
 /// FAIL-CLOSED extraction of an ADR/ADRP `imm21` operand.
@@ -913,7 +2072,7 @@ fn scaled_pair_imm7_i8(inst: &MachInst, offset: i64, scale: i64) -> Result<i8, E
 /// against the signed 21-bit window up front (which is strictly inside i32, so
 /// the subsequent narrowing is lossless) and only then narrow.
 fn adr_imm21(inst: &MachInst, idx: usize) -> Result<i32, EncodeError> {
-    let imm = imm_val(inst, idx);
+    let imm = imm_or_fixup_placeholder(inst, idx)?;
     if !(-1_048_576..=1_048_575).contains(&imm) {
         return Err(EncodeError::InvalidOperand {
             opcode: inst.opcode,
@@ -936,7 +2095,7 @@ fn adr_imm21(inst: &MachInst, idx: usize) -> Result<i32, EncodeError> {
 /// selecting a *different* bitfield = a miscompile. Range-check the full i64
 /// value (reject negative or above the sf-dependent max) BEFORE narrowing.
 fn bitfield6_operand(inst: &MachInst, idx: usize, sf: u32) -> Result<u32, EncodeError> {
-    let imm = imm_val(inst, idx);
+    let imm = imm_val(inst, idx)?;
     let max: i64 = if sf == 1 { 63 } else { 31 };
     if !(0..=max).contains(&imm) {
         return Err(EncodeError::InvalidOperand {
@@ -1009,7 +2168,7 @@ fn move_wide_hw(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
 /// full i64 value (reject negative or above the sf-dependent max) BEFORE the
 /// bit split.
 fn tbz_bit_position(inst: &MachInst, idx: usize, sf: u32) -> Result<u32, EncodeError> {
-    let bit = imm_val(inst, idx);
+    let bit = imm_val(inst, idx)?;
     let max: i64 = if sf == 1 { 63 } else { 31 };
     if !(0..=max).contains(&bit) {
         return Err(EncodeError::InvalidOperand {
@@ -1110,15 +2269,60 @@ fn logical_imm_raw_field(
 // Unified encoder
 // ---------------------------------------------------------------------------
 
-/// Encode a single `MachInst` into a 32-bit AArch64 instruction word.
-///
-/// This is the single dispatch point for all AArch64 opcodes. The instruction
-/// must be post-regalloc (all operands are `PReg`, `Special`, `Imm`, etc.).
-///
-/// Pseudo-instructions (`Phi`, `StackAlloc`, `Nop`) emit NOP as a safe
-/// fallback — the caller should skip pseudos before reaching this function.
-pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
-    match inst.opcode {
+// Keep opcode classification and emission bodies in one source of truth.
+// The public match remains exhaustive when AArch64Opcode grows. Each private
+// family has a real stack boundary, so a scalar instruction does not reserve
+// unrelated FP/SIMD/atomic/diagnostic temporaries in an unoptimized build.
+// The caller supplies the operand identifier to preserve macro hygiene for the
+// original bodies and immutable guards.
+macro_rules! aarch64_encoder_families {
+    (
+        $inst:ident;
+        $(
+            $family:ident {
+                $(
+                    $pattern:pat $(if $guard:expr)? => $body:expr,
+                )*
+            }
+        )*
+    ) => {
+        /// Encode a single `MachInst` into a 32-bit AArch64 instruction word.
+        ///
+        /// This is the single dispatch point for all AArch64 opcodes. The instruction
+        /// must be post-regalloc (all operands are `PReg`, `Special`, `Imm`, etc.).
+        ///
+        /// Pseudo-instructions (`Phi`, `StackAlloc`, `Nop`) emit NOP as a safe
+        /// fallback — the caller should skip pseudos before reaching this function.
+        pub fn encode_instruction($inst: &MachInst) -> Result<u32, EncodeError> {
+            match $inst.opcode {
+                $(
+                    $(
+                        $pattern $(if $guard)? => $family($inst),
+                    )*
+                )*
+            }
+        }
+
+        $(
+            #[inline(never)]
+            fn $family($inst: &MachInst) -> Result<u32, EncodeError> {
+                match $inst.opcode {
+                    $(
+                        $pattern $(if $guard)? => $body,
+                    )*
+                    // Only the exhaustive public dispatcher calls workers.
+                    // A routing invariant violation still refuses as a typed
+                    // encoding error instead of panicking or emitting bytes.
+                    _ => Err(EncodeError::UnsupportedOpcode($inst.opcode)),
+                }
+            }
+        )*
+    };
+}
+
+aarch64_encoder_families! {
+    inst;
+    encode_arithmetic_family {
         // =================================================================
         // Arithmetic (data-processing)
         // =================================================================
@@ -1137,7 +2341,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // ADD Rd, Rn, #imm12
         AArch64Opcode::AddRI => {
@@ -1152,7 +2356,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // ADD Rd, Rn, #imm12, LSL #12
         AArch64Opcode::AddRIShift12 => {
@@ -1167,7 +2371,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // SUB Rd, Rn, Rm (shifted register)
         AArch64Opcode::SubRR => {
@@ -1183,7 +2387,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // SUB Rd, Rn, #imm12
         AArch64Opcode::SubRI => {
@@ -1198,7 +2402,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // MUL Rd, Rn, Rm — encoded as MADD Rd, Rn, Rm, XZR
         // ARM ARM: Data-processing (3 source)
@@ -1217,7 +2421,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (ra << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // MSUB Rd, Rn, Rm, Ra — multiply-subtract: Rd = Ra - Rn * Rm
         // ARM ARM: Data-processing (3 source), o0=1
@@ -1242,7 +2446,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (ra << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // SMULL Xd, Wn, Wm — signed multiply long (alias for SMADDL Xd, Wn, Wm, XZR)
         // ARM ARM: Data-processing (3 source)
@@ -1261,7 +2465,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (ra << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // UMULL Xd, Wn, Wm — unsigned multiply long (alias for UMADDL Xd, Wn, Wm, XZR)
         // ARM ARM: Data-processing (3 source)
@@ -1280,7 +2484,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (ra << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // SDIV Rd, Rn, Rm — Data-processing (2 source)
         // 31 30 28:21      20:16 15:10  9:5  4:0
@@ -1296,7 +2500,47 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b000011 << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
+
+        // CRC32{B,H,W,X} / CRC32C{B,H,W,X} Wd, Wn, Wm|Xm — Data-processing
+        // (2 source), FEAT_CRC32:
+        // 31 30 28:21      20:16 15:13 12 11:10 9:5 4:0
+        // sf  0 0011010110  Rm    010   C  sz   Rn  Rd
+        // sf=1 exactly for the doubleword (sz=11) forms. The width is the
+        // opcode's, so each register operand need only be a GPR or ZR view
+        // (never SP: register 31 is ZR here).
+        AArch64Opcode::Crc32B
+        | AArch64Opcode::Crc32H
+        | AArch64Opcode::Crc32W
+        | AArch64Opcode::Crc32X
+        | AArch64Opcode::Crc32Cb
+        | AArch64Opcode::Crc32Ch
+        | AArch64Opcode::Crc32Cw
+        | AArch64Opcode::Crc32Cx => {
+            if inst.operands.len() != 3 {
+                return Err(EncodeError::InvalidOperand {
+                    opcode: inst.opcode,
+                    index: inst.operands.len(),
+                    desc: "CRC32 takes exactly [Wd, Wn, Wm|Xm]".to_string(),
+                });
+            }
+            for index in 0..3 {
+                non_sp_gpr_width(inst, index)?;
+            }
+            let (castagnoli, sz) = crc32_fields(inst.opcode);
+            let sf = u32::from(sz == 0b11);
+            let rd = preg_hw(inst, 0)?;
+            let rn = preg_hw(inst, 1)?;
+            let rm = preg_hw(inst, 2)?;
+            Ok((sf << 31)
+                | (0b0_0011010110u32 << 21)
+                | (rm << 16)
+                | (0b010 << 13)
+                | (u32::from(castagnoli) << 12)
+                | (sz << 10)
+                | (rn << 5)
+                | rd)
+        },
 
         // UDIV Rd, Rn, Rm
         // Same as SDIV but opcode field = 000010
@@ -1311,7 +2555,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b000010 << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // NEG Rd, Rm — alias for SUB Rd, XZR, Rm
         AArch64Opcode::Neg => {
@@ -1321,7 +2565,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             Ok(encoding::encode_add_sub_shifted_reg(
                 sf, 1, 0, 0, rm, 0, 31, rd,
             ))
-        }
+        },
+    }
+
+    encode_logical_register_family {
 
         // =================================================================
         // Logical (shifted register)
@@ -1338,7 +2585,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         AArch64Opcode::OrrRR => {
             let sf = sf_from_operand(inst, 0);
@@ -1352,7 +2599,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         AArch64Opcode::EorRR => {
             let sf = sf_from_operand(inst, 0);
@@ -1366,7 +2613,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // EOR Rd, Rn, Rm, ROR #amount — exclusive-OR with a ROR-shifted second
         // source. Logical (shifted register): opc=EOR=0b10, shift=ROR=0b11, N=0,
@@ -1401,7 +2648,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 rn,                // Rn — the un-shifted operand
                 rd,
             ))
-        }
+        },
 
         // EOR Rd, Rn, Rm, LSL|LSR #k — exclusive-or with a shifted second source.
         // Logical (shifted register): sf | opc=0b10 (EOR) | 01010 | shift | N=0 |
@@ -1441,7 +2688,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 rn,       // Rn — the un-shifted operand
                 rd,
             ))
-        }
+        },
 
         // ADD Rd, Rn, Rm, LSL #k — add with an LSL-shifted second source.
         // Add/subtract (shifted register): op=0 (ADD), S=0, shift=LSL=0b00,
@@ -1476,7 +2723,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 rn,       // Rn — the un-shifted base
                 rd,
             ))
-        }
+        },
 
         // SUB Rd, Rn, Rm, LSL #k — subtract an LSL-shifted second source.
         // Add/subtract (shifted register): op=1 (SUB), S=0, shift=LSL=0b00,
@@ -1508,7 +2755,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 rn,       // Rn — the un-shifted minuend
                 rd,
             ))
-        }
+        },
 
         // ADD Rd, Rn, Rm, LSR #k — add with an LSR-shifted second source.
         // Add/subtract (shifted register): op=0 (ADD), S=0, shift=LSR=0b01,
@@ -1543,7 +2790,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 rn,       // Rn — the un-shifted base
                 rd,
             ))
-        }
+        },
 
         // ORN Rd, Rn, Rm — bitwise OR-NOT (MVN when Rn=XZR)
         // Logical shifted register with opc=01, N=1, shift=0
@@ -1559,7 +2806,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
+    }
+
+    encode_shift_family {
 
         // =================================================================
         // Shifts — Data-processing (2 source)
@@ -1578,7 +2828,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b001000 << 10) // LSLV
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         AArch64Opcode::LsrRR => {
             let sf = sf_from_operand(inst, 0);
@@ -1591,7 +2841,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b001001 << 10) // LSRV
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         AArch64Opcode::AsrRR => {
             let sf = sf_from_operand(inst, 0);
@@ -1604,7 +2854,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b001010 << 10) // ASRV
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // Immediate shifts — encoded via UBFM/SBFM
         // LSL Rd, Rn, #shift  = UBFM Rd, Rn, #(-shift MOD regsize), #(regsize-1-shift)
@@ -1619,7 +2869,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let sf = sf_from_operand(inst, 0);
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
-            let raw_shift = imm_val(inst, 2);
+            let raw_shift = imm_operand(inst, 2)?;
             let regsize = if sf == 1 { 64u32 } else { 32u32 };
             // Shift must be in [0, regsize). Negative or oversized shifts
             // previously caused a debug `attempt to subtract with overflow`
@@ -1647,13 +2897,13 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (imms << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         AArch64Opcode::LsrRI => {
             let sf = sf_from_operand(inst, 0);
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
-            let raw_shift = imm_val(inst, 2);
+            let raw_shift = imm_operand(inst, 2)?;
             let regsize = if sf == 1 { 64u32 } else { 32u32 };
             if raw_shift < 0 || (raw_shift as u64) >= regsize as u64 {
                 return Err(EncodeError::InvalidOperand {
@@ -1678,13 +2928,13 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (imms << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         AArch64Opcode::AsrRI => {
             let sf = sf_from_operand(inst, 0);
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
-            let raw_shift = imm_val(inst, 2);
+            let raw_shift = imm_operand(inst, 2)?;
             let regsize = if sf == 1 { 64u32 } else { 32u32 };
             if raw_shift < 0 || (raw_shift as u64) >= regsize as u64 {
                 return Err(EncodeError::InvalidOperand {
@@ -1708,7 +2958,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (imms << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // ROR Rd, Rn, #shift — alias for EXTR Rd, Rn, Rn, #shift.
         AArch64Opcode::RorRI => {
@@ -1729,7 +2979,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             }
             let shift = raw_shift as u32;
             Ok(encoding::encode_extract(sf, sf, rn, shift, rn, rd))
-        }
+        },
 
         // RBIT Rd, Rn — reverse bits in a 32-bit or 64-bit GPR.
         AArch64Opcode::Rbit => {
@@ -1739,41 +2989,28 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
+    }
+
+    encode_compare_family {
 
         // =================================================================
         // Compare
         // =================================================================
 
         // CMP Rn, Rm = SUBS XZR, Rn, Rm
-        AArch64Opcode::CmpRR => {
-            let sf = sf_from_operand(inst, 0);
+        AArch64Opcode::CmpRR | AArch64Opcode::CMPWrr | AArch64Opcode::CMPXrr => {
+            let (sf, rn, rm) = comparison_fields(inst, false)?;
             Ok(encoding::encode_add_sub_shifted_reg(
-                sf,
-                1,
-                1,
-                0,
-                preg_hw(inst, 1)?,
-                0,
-                preg_hw(inst, 0)?,
-                31,
+                sf, 1, 1, 0, rm, 0, rn, 31,
             ))
-        }
+        },
 
         // CMP Rn, #imm = SUBS XZR, Rn, #imm
-        AArch64Opcode::CmpRI => {
-            let sf = sf_from_operand(inst, 0);
-            let imm = imm12_operand(inst, 1)?;
-            Ok(encoding::encode_add_sub_imm(
-                sf,
-                1,
-                1,
-                0,
-                imm,
-                preg_hw(inst, 0)?,
-                31,
-            ))
-        }
+        AArch64Opcode::CmpRI | AArch64Opcode::CMPWri | AArch64Opcode::CMPXri => {
+            let (sf, rn, imm) = comparison_fields(inst, true)?;
+            Ok(encoding::encode_add_sub_imm(sf, 1, 1, 0, imm, rn, 31))
+        },
 
         // TST — discard-result ANDS. Two operand shapes, dispatched on operand 1:
         //   TST Rn, #imm = ANDS XZR, Rn, #imm   (logical immediate, opc=11)
@@ -1802,7 +3039,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                     })
                 };
             }
-            let rn_width = tst_gpr_width(inst, 0)?;
+            let rn_width = non_sp_gpr_width(inst, 0)?;
             let sf = u32::from(rn_width == 64);
             match inst.operands.get(1) {
                 Some(MachOperand::Imm(_)) => {
@@ -1823,7 +3060,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                         | 31)
                 }
                 _ => {
-                    let rm_width = tst_gpr_width(inst, 1)?;
+                    let rm_width = non_sp_gpr_width(inst, 1)?;
                     if rm_width != rn_width {
                         return Err(EncodeError::InvalidOperand {
                             opcode: inst.opcode,
@@ -1845,57 +3082,27 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                     ))
                 }
             }
-        }
+        },
+    }
+
+    encode_move_family {
 
         // =================================================================
         // Move
         // =================================================================
 
-        // MOV Rd, Rm
-        // When the source is SP (Special::SP), we must use ADD Rd, SP, #0
-        // because register 31 in logical instructions (ORR) is XZR, not SP.
-        // In ADD/SUB (immediate) context, register 31 is SP.
-        // For all other registers, use ORR Rd, XZR, Rm.
+        // MOV Rd, Rm — the destination selects the width.
         AArch64Opcode::MovR => {
             require_gpr_move_operands(inst, 2)?;
-            let sf = sf_from_operand(inst, 0);
-            let is_sp_source = matches!(
-                inst.operands.get(1),
-                Some(MachOperand::Special(SpecialReg::SP))
-            );
-            if is_sp_source {
-                // ADD Rd, SP, #0
-                Ok(encoding::encode_add_sub_imm(
-                    sf,
-                    0,
-                    0,
-                    0,
-                    0,
-                    31,
-                    preg_hw(inst, 0)?,
-                ))
-            } else {
-                // ORR Rd, XZR, Rm
-                Ok(encoding::encode_logical_shifted_reg(
-                    sf,
-                    0b01,
-                    0,
-                    0,
-                    preg_hw(inst, 1)?,
-                    0,
-                    31,
-                    preg_hw(inst, 0)?,
-                ))
-            }
-        }
+            encode_gpr_register_move(inst, sf_from_operand(inst, 0))
+        },
 
         // CSET Xd/Wd, cond — encoded as CSINC Xd, XZR, XZR, invert(cond)
         // ARM ARM C6.2.70: sf | 0 | 0 | 11010100 | Rm(=XZR) | inv_cond | 0 | 1 | Rn(=XZR) | Rd
         // Operands: [PReg(Rd), Imm(cond_encoding)]
         AArch64Opcode::CSet => {
-            let sf = sf_from_operand(inst, 0);
+            let (sf, cond) = conditional_select_fields(inst, true)?;
             let rd = preg_hw(inst, 0)?;
-            let cond = imm_val(inst, 1) as u32 & 0xF;
             // Invert condition code: flip bit 0 (ARM ARM C6.2.70)
             let inv_cond = cond ^ 1;
             let rn = 31u32; // XZR/WZR
@@ -1907,7 +3114,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b01 << 10)     // op2 = 01 (CSINC)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // MovI Rd, #imm16 — encoded as MOVZ at LSL #0.
         //
@@ -1929,7 +3136,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 imm16,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // MOVZ Rd, #imm16{, LSL #0}.
         //
@@ -1964,7 +3171,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 imm16,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // MOVK Rd, #imm16{, LSL #shift}
         //
@@ -1997,7 +3204,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 imm16,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
+    }
+
+    encode_scalar_memory_family {
 
         // =================================================================
         // Load/Store
@@ -2009,21 +3219,26 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         //   Pre-frame-lowering:  [Rt(PReg), Rn(PReg), #offset(Imm)]
         //   Post-frame-lowering: [Rt(PReg), MemOp{base, offset}]
         //
-        // The extract_base_offset helper handles both layouts transparently.
+        // The strict RI address accessor validates both complete layouts.
         // For non-negative aligned offsets, emits LDR (unsigned offset).
         // For negative/unaligned offsets, emits LDUR (unscaled immediate).
         AArch64Opcode::LdrRI | AArch64Opcode::VolatileLdrRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
             if is_fpr(inst, 0) {
+                let rt = preg_hw(inst, 0)?;
+                let (rn, offset) = extract_ri_memory_base_offset(inst)?;
                 let (size, scale, opc) = fp_mem_fields_from_inst(inst, 0, 0b01)?;
                 encode_load_store_auto(size, 1, opc, scale, offset, rn, rt)
             } else {
-                let sf = sf_from_operand(inst, 0);
-                let (size, scale) = if sf == 1 { (0b11, 8i64) } else { (0b10, 4i64) };
+                let (rt, width) = gpr_memory_data_register(inst, 0)?;
+                let (rn, offset) = extract_ri_memory_base_offset(inst)?;
+                let (size, scale) = if width == 64 {
+                    (0b11, 8i64)
+                } else {
+                    (0b10, 4i64)
+                };
                 encode_load_store_auto(size, 0, 0b01, scale, offset, rn, rt)
             }
-        }
+        },
 
         // STR Rt, [Rn, #offset]
         //
@@ -2031,97 +3246,94 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // For non-negative aligned offsets, emits STR (unsigned offset).
         // For negative/unaligned offsets, emits STUR (unscaled immediate).
         AArch64Opcode::StrRI | AArch64Opcode::VolatileStrRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
             if is_fpr(inst, 0) {
+                let rt = preg_hw(inst, 0)?;
+                let (rn, offset) = extract_ri_memory_base_offset(inst)?;
                 let (size, scale, opc) = fp_mem_fields_from_inst(inst, 0, 0b00)?;
                 encode_load_store_auto(size, 1, opc, scale, offset, rn, rt)
             } else {
-                let sf = sf_from_operand(inst, 0);
-                let (size, scale) = if sf == 1 { (0b11, 8i64) } else { (0b10, 4i64) };
+                let (rt, width) = gpr_memory_data_register(inst, 0)?;
+                let (rn, offset) = extract_ri_memory_base_offset(inst)?;
+                let (size, scale) = if width == 64 {
+                    (0b11, 8i64)
+                } else {
+                    (0b10, 4i64)
+                };
                 encode_load_store_auto(size, 0, 0b00, scale, offset, rn, rt)
             }
-        }
+        },
 
-        // 64-bit scalar writeback forms: [Rt, Rn|SP, imm9].
+        // W/X scalar writeback forms: exactly [Rt, Rn|SP, imm9].
         AArch64Opcode::LdrPreIndex => {
             encode_scalar_writeback(inst, true, encoding_mem::LoadStoreOp::Load)
-        }
+        },
         AArch64Opcode::StrPreIndex => {
             encode_scalar_writeback(inst, true, encoding_mem::LoadStoreOp::Store)
-        }
+        },
         AArch64Opcode::LdrPostIndex => {
             encode_scalar_writeback(inst, false, encoding_mem::LoadStoreOp::Load)
-        }
+        },
         AArch64Opcode::StrPostIndex => {
             encode_scalar_writeback(inst, false, encoding_mem::LoadStoreOp::Store)
-        }
+        },
 
         // LDRB Wt, [Xn, #offset] — load byte, zero-extend to 32-bit
         // size=00, V=0, opc=01. Offset scaled by 1 byte.
         AArch64Opcode::LdrbRI | AArch64Opcode::VolatileLdrbRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
+            let (rt, _) = gpr_memory_data_register(inst, 0)?;
+            let (rn, offset) = extract_ri_memory_base_offset(inst)?;
             encode_load_store_auto(0b00, 0, 0b01, 1, offset, rn, rt)
-        }
+        },
 
         // LDRH Wt, [Xn, #offset] — load halfword, zero-extend to 32-bit
         // size=01, V=0, opc=01. Offset scaled by 2 bytes.
         AArch64Opcode::LdrhRI | AArch64Opcode::VolatileLdrhRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
+            let (rt, _) = gpr_memory_data_register(inst, 0)?;
+            let (rn, offset) = extract_ri_memory_base_offset(inst)?;
             encode_load_store_auto(0b01, 0, 0b01, 2, offset, rn, rt)
-        }
+        },
 
         // LDRSB Wt/Xt, [Xn, #offset] — load byte, sign-extend. size=00, V=0.
         // The sign-extension WIDTH follows the transfer register class: a Gpr32
         // destination uses opc=11 (LDRSB Wt, sign-extend to 32); a Gpr64
         // destination uses opc=10 (LDRSB Xt, sign-extend to 64). Both read the
         // identical 1 byte (offset scaled by 1). This mirrors the way the
-        // full-width LdrRI/StrRI arms derive their size from `sf_from_operand`
+        // full-width LdrRI/StrRI arms derive their size from the transfer width
         // (the ext-addr narrow-load sext fold is the only producer and emits
         // whichever width the folded Sxtb/Sxth had).
         AArch64Opcode::LdrsbRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
-            let opc = if sf_from_operand(inst, 0) == 1 {
-                0b10
-            } else {
-                0b11
-            };
+            let (rt, width) = gpr_memory_data_register(inst, 0)?;
+            let (rn, offset) = extract_ri_memory_base_offset(inst)?;
+            let opc = if width == 64 { 0b10 } else { 0b11 };
             encode_load_store_auto(0b00, 0, opc, 1, offset, rn, rt)
-        }
+        },
 
         // LDRSH Wt/Xt, [Xn, #offset] — load halfword, sign-extend. size=01, V=0.
         // opc follows the transfer class exactly as LDRSB above (Gpr32 -> opc=11
         // sign-extend to 32; Gpr64 -> opc=10 sign-extend to 64). Offset scaled
         // by 2.
         AArch64Opcode::LdrshRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
-            let opc = if sf_from_operand(inst, 0) == 1 {
-                0b10
-            } else {
-                0b11
-            };
+            let (rt, width) = gpr_memory_data_register(inst, 0)?;
+            let (rn, offset) = extract_ri_memory_base_offset(inst)?;
+            let opc = if width == 64 { 0b10 } else { 0b11 };
             encode_load_store_auto(0b01, 0, opc, 2, offset, rn, rt)
-        }
+        },
 
         // STRB Wt, [Xn, #offset] — store byte (truncating)
         // size=00, V=0, opc=00. Offset scaled by 1.
         AArch64Opcode::StrbRI | AArch64Opcode::VolatileStrbRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
+            let (rt, _) = gpr_memory_data_register(inst, 0)?;
+            let (rn, offset) = extract_ri_memory_base_offset(inst)?;
             encode_load_store_auto(0b00, 0, 0b00, 1, offset, rn, rt)
-        }
+        },
 
         // STRH Wt, [Xn, #offset] — store halfword (truncating)
         // size=01, V=0, opc=00. Offset scaled by 2.
         AArch64Opcode::StrhRI | AArch64Opcode::VolatileStrhRI => {
-            let rt = preg_hw(inst, 0)?;
-            let (rn, offset) = extract_base_offset(inst, 1, 2)?;
+            let (rt, _) = gpr_memory_data_register(inst, 0)?;
+            let (rn, offset) = extract_ri_memory_base_offset(inst)?;
             encode_load_store_auto(0b01, 0, 0b00, 2, offset, rn, rt)
-        }
+        },
 
         // LDR literal (PC-relative) — uses the same base encoding but with the
         // literal addressing mode. For now encode as LDR unsigned offset with
@@ -2135,95 +3347,19 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let imm19 = branch_offset_signed(inst, 1, 19)?;
             let rt = preg_hw(inst, 0)?;
             Ok(((0b01 << 30) | (0b011 << 27)) | (imm19 << 5) | rt)
-        }
+        },
 
-        // STP Rt, Rt2, [Rn, #offset] (signed offset)
-        // Operand order: [Rt, Rt2, Rn, imm]
-        AArch64Opcode::StpRI => {
-            let offset = if inst.operands.len() > 3 {
-                imm_val(inst, 3)
-            } else {
-                0
-            };
-            let (opc, v, scale) = pair_encoding_fields(inst)?;
-            let scaled_imm7 = scaled_pair_imm7(inst, offset, scale)?;
-            let rt = preg_hw(inst, 0)?;
-            let rt2 = preg_hw(inst, 1)?;
-            let rn = preg_hw(inst, 2)?;
-            Ok(encoding::encode_load_store_pair(
-                opc,
-                v,
-                0,
-                scaled_imm7,
-                rt2,
-                rn,
-                rt,
-            ))
-        }
+        // Pair addressing uses the pre-index address for memory, but the
+        // architectural base writeback occurs after the memory operation.
+        AArch64Opcode::StpRI
+        | AArch64Opcode::LdpRI
+        | AArch64Opcode::StpPreIndex
+        | AArch64Opcode::LdpPostIndex
+        | AArch64Opcode::NeonLdpQPost
+        | AArch64Opcode::NeonStpQPost => encode_pair_memory(inst),
+    }
 
-        // STP Rt, Rt2, [Rn, #offset]! (pre-index: base updated before store)
-        AArch64Opcode::StpPreIndex => {
-            let offset = if inst.operands.len() > 3 {
-                imm_val(inst, 3)
-            } else {
-                0
-            };
-            let (pair_size, v, scale) = pair_index_size_v(inst)?;
-            let scaled_imm7 = scaled_pair_imm7_i8(inst, offset, scale)?;
-            Ok(encoding_mem::encode_ldp_stp_pre_index(
-                pair_size,
-                v,
-                encoding_mem::PairOp::StorePair,
-                scaled_imm7,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 2)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?)
-        }
-
-        // LDP Rt, Rt2, [Rn, #offset] (signed offset)
-        // Operand order: [Rt, Rt2, Rn, imm]
-        AArch64Opcode::LdpRI => {
-            let offset = if inst.operands.len() > 3 {
-                imm_val(inst, 3)
-            } else {
-                0
-            };
-            let (opc, v, scale) = pair_encoding_fields(inst)?;
-            let scaled_imm7 = scaled_pair_imm7(inst, offset, scale)?;
-            let rt = preg_hw(inst, 0)?;
-            let rt2 = preg_hw(inst, 1)?;
-            let rn = preg_hw(inst, 2)?;
-            Ok(encoding::encode_load_store_pair(
-                opc,
-                v,
-                1,
-                scaled_imm7,
-                rt2,
-                rn,
-                rt,
-            ))
-        }
-
-        // LDP Rt, Rt2, [Rn], #offset (post-index: base updated after load)
-        AArch64Opcode::LdpPostIndex => {
-            let offset = if inst.operands.len() > 3 {
-                imm_val(inst, 3)
-            } else {
-                0
-            };
-            let (pair_size, v, scale) = pair_index_size_v(inst)?;
-            let scaled_imm7 = scaled_pair_imm7_i8(inst, offset, scale)?;
-            Ok(encoding_mem::encode_ldp_stp_post_index(
-                pair_size,
-                v,
-                encoding_mem::PairOp::LoadPair,
-                scaled_imm7,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 2)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?)
-        }
+    encode_branch_family {
 
         // =================================================================
         // Branches
@@ -2233,18 +3369,18 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         AArch64Opcode::B | AArch64Opcode::TailCall => {
             let offset = branch_offset_signed(inst, 0, 26)?;
             Ok(encoding::encode_uncond_branch(0, offset))
-        }
+        },
 
         // B.cond <offset> — imm19 signed word offset, range-checked before mask.
         AArch64Opcode::BCond => {
-            let cond = imm_val(inst, 0) as u32 & 0xF;
+            let cond = imm_val(inst, 0)? as u32 & 0xF;
             let offset = if inst.operands.len() > 1 {
                 branch_offset_signed(inst, 1, 19)?
             } else {
                 0
             };
             Ok(encoding::encode_cond_branch(offset, cond))
-        }
+        },
 
         // CBZ Rt, <offset> — imm19 signed word offset, range-checked before mask.
         AArch64Opcode::Cbz => {
@@ -2256,7 +3392,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 0
             };
             Ok(encoding::encode_cmp_branch(sf, 0, imm19, rt))
-        }
+        },
 
         // CBNZ Rt, <offset> — imm19 signed word offset, range-checked before mask.
         AArch64Opcode::Cbnz => {
@@ -2268,7 +3404,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 0
             };
             Ok(encoding::encode_cmp_branch(sf, 1, imm19, rt))
-        }
+        },
 
         // TBZ Rt, #bit, <offset>
         // 31 30:25  24  23:19  18:5    4:0
@@ -2293,7 +3429,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (b40 << 19)
                 | (imm14 << 5)
                 | rt)
-        }
+        },
 
         // TBNZ Rt, #bit, <offset>
         AArch64Opcode::Tbnz => {
@@ -2316,7 +3452,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (b40 << 19)
                 | (imm14 << 5)
                 | rt)
-        }
+        },
 
         // BR Rn
         AArch64Opcode::Br => Ok(encoding::encode_branch_reg(0b0000, preg_hw(inst, 0)?)),
@@ -2325,13 +3461,16 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         AArch64Opcode::Bl => {
             let offset = branch_offset_signed(inst, 0, 26)?;
             Ok(encoding::encode_uncond_branch(1, offset))
-        }
+        },
 
         // BLR Rn
         AArch64Opcode::Blr => Ok(encoding::encode_branch_reg(0b0001, preg_hw(inst, 0)?)),
 
         // RET (X30)
         AArch64Opcode::Ret => Ok(encoding::encode_branch_reg(0b0010, 30)),
+    }
+
+    encode_extension_family {
 
         // =================================================================
         // Extension instructions — encoded via SBFM/UBFM
@@ -2348,7 +3487,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (31 << 10) // imms=31
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // UXTW materializes a 32-to-64 zero extension by writing Wd. Keep sf=0
         // even when operands are tracked as X registers so the high bits clear.
@@ -2359,7 +3498,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             Ok(encoding::encode_logical_shifted_reg(
                 0, 0b01, 0, 0, rn, 0, 31, rd,
             ))
-        }
+        },
 
         // SXTB Rd, Rn = SBFM Xd, Xn, #0, #7
         AArch64Opcode::Sxtb => {
@@ -2371,7 +3510,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (7 << 10) // imms=7
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // SXTH Rd, Rn = SBFM Xd, Xn, #0, #15
         AArch64Opcode::Sxth => {
@@ -2383,7 +3522,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (15 << 10) // imms=15
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // UXTB Wd, Wn = UBFM Wd, Wn, #0, #7
         // Zero-extend byte: clear bits [31:8], keep bits [7:0].
@@ -2396,7 +3535,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (7 << 10) // imms=7
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // UXTH Wd, Wn = UBFM Wd, Wn, #0, #15
         // Zero-extend halfword: clear bits [31:16], keep bits [15:0].
@@ -2409,7 +3548,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (15 << 10) // imms=15
                 | (rn << 5)
                 | rd)
-        }
+        },
+    }
+
+    encode_address_family {
 
         // =================================================================
         // Address generation
@@ -2421,7 +3563,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let imm21 = adr_imm21(inst, 1)?;
             let enc = encoding_mem::encode_adrp(imm21, rd as u8)?;
             Ok(enc)
-        }
+        },
 
         // ADR Rd, #imm21 — PC-relative address (used for jump table base)
         AArch64Opcode::Adr => {
@@ -2429,7 +3571,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let imm21 = adr_imm21(inst, 1)?;
             let enc = encoding_mem::encode_adr(imm21, rd as u8)?;
             Ok(enc)
-        }
+        },
 
         // LDRSW Xt, [Xn, Xm, LSL #2] — load signed word with register offset
         AArch64Opcode::LdrswRO => {
@@ -2438,7 +3580,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rm = preg_hw(inst, 2)?;
             let enc = encoding_mem::encode_ldrsw_register(rm as u8, rn as u8, rt as u8)?;
             Ok(enc)
-        }
+        },
 
         // ADD Rd, Rn, #imm (PC-relative page offset addition)
         AArch64Opcode::AddPCRel => {
@@ -2453,7 +3595,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // ELF local-exec TLS TPREL adds carry a Symbol operand and are only
         // encodable through the module emitter's fixup interception (which
@@ -2462,7 +3604,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // bypassed — fail closed rather than encode a wrong immediate.
         AArch64Opcode::AddTprelHi12 | AArch64Opcode::AddTprelLo12 => {
             Err(EncodeError::UnsupportedOpcode(inst.opcode))
-        }
+        },
+    }
+
+    encode_scalar_fp_family {
 
         // =================================================================
         // Floating-point arithmetic
@@ -2477,7 +3622,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::FsubRR => {
             let fp_size = fp_size_from_inst(inst);
@@ -2489,7 +3634,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::FmulRR => {
             let fp_size = fp_size_from_inst(inst);
@@ -2501,7 +3646,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::FdivRR => {
             let fp_size = fp_size_from_inst(inst);
@@ -2513,7 +3658,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FMADD Rd, Rn, Rm, Ra — scalar fused multiply-add (single rounding).
         // Operands: [Rd, Rn, Rm, Ra]. fp width from Rd's FP register class.
@@ -2528,7 +3673,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8, // Rd
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::FminnmRR => {
             let fp_size = fp_size_from_inst(inst);
@@ -2540,7 +3685,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::FmaxnmRR => {
             let fp_size = fp_size_from_inst(inst);
@@ -2552,7 +3697,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FNEG Dd, Dn — floating-point negate (1-source FP)
         AArch64Opcode::FnegRR => {
@@ -2564,7 +3709,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FABS Dd, Dn — floating-point absolute value (1-source FP)
         AArch64Opcode::FabsRR => {
@@ -2576,7 +3721,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FSQRT Dd, Dn — floating-point square root (1-source FP)
         AArch64Opcode::FsqrtRR => {
@@ -2588,13 +3733,17 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FRINTM/FRINTP/FRINTZ Dd, Dn — round to integral (floor/ceil/trunc),
         // 1-source FP. The FpUnaryOp value is the 6-bit FP-1-source opcode field.
-        AArch64Opcode::FrintmRR | AArch64Opcode::FrintpRR | AArch64Opcode::FrintzRR => {
+        AArch64Opcode::FrintnRR
+        | AArch64Opcode::FrintmRR
+        | AArch64Opcode::FrintpRR
+        | AArch64Opcode::FrintzRR => {
             let fp_size = fp_size_from_inst(inst);
             let op = match inst.opcode {
+                AArch64Opcode::FrintnRR => encoding_fp::FpUnaryOp::FrintN,
                 AArch64Opcode::FrintmRR => encoding_fp::FpUnaryOp::FrintM,
                 AArch64Opcode::FrintpRR => encoding_fp::FpUnaryOp::FrintP,
                 _ => encoding_fp::FpUnaryOp::FrintZ,
@@ -2606,7 +3755,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FMOV Dd, Dn (or Ss, Sn) — FPR-to-FPR register move (1-source FP)
         AArch64Opcode::FmovFprFpr => {
@@ -2619,7 +3768,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FCMP Rn, Rm
         AArch64Opcode::Fcmp => {
@@ -2631,64 +3780,19 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FCVTZS Rd, Rn (FP to signed integer, round toward zero)
-        AArch64Opcode::FcvtzsRR => {
-            // Source is FP register (operand 1), dest is GPR (operand 0)
-            let sf_64 = true; // default to 64-bit integer
-            let fp_size = fp_size_from_source(inst, 1);
-            let enc = encoding_fp::encode_fp_int_conv(
-                sf_64,
-                fp_size,
-                FpConvOp::FcvtzsToInt,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?;
-            Ok(enc)
-        }
+        AArch64Opcode::FcvtzsRR => encode_scalar_fp_int_conversion(inst, FpConvOp::FcvtzsToInt, 0),
 
         // SCVTF Rd, Rn (signed integer to FP)
-        AArch64Opcode::ScvtfRR => {
-            let sf_64 = true;
-            let fp_size = fp_size_from_source(inst, 0);
-            let enc = encoding_fp::encode_fp_int_conv(
-                sf_64,
-                fp_size,
-                FpConvOp::ScvtfToFp,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?;
-            Ok(enc)
-        }
+        AArch64Opcode::ScvtfRR => encode_scalar_fp_int_conversion(inst, FpConvOp::ScvtfToFp, 1),
 
         // FCVTZU Rd, Rn (FP to unsigned integer, round toward zero)
-        AArch64Opcode::FcvtzuRR => {
-            let sf_64 = true;
-            let fp_size = fp_size_from_source(inst, 1);
-            let enc = encoding_fp::encode_fp_int_conv(
-                sf_64,
-                fp_size,
-                FpConvOp::FcvtzuToInt,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?;
-            Ok(enc)
-        }
+        AArch64Opcode::FcvtzuRR => encode_scalar_fp_int_conversion(inst, FpConvOp::FcvtzuToInt, 0),
 
         // UCVTF Rd, Rn (unsigned integer to FP)
-        AArch64Opcode::UcvtfRR => {
-            let sf_64 = true;
-            let fp_size = fp_size_from_source(inst, 0);
-            let enc = encoding_fp::encode_fp_int_conv(
-                sf_64,
-                fp_size,
-                FpConvOp::UcvtfToFp,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?;
-            Ok(enc)
-        }
+        AArch64Opcode::UcvtfRR => encode_scalar_fp_int_conversion(inst, FpConvOp::UcvtfToFp, 1),
 
         // FCVT Dd, Sn (float precision widen: f32 -> f64)
         AArch64Opcode::FcvtSD => {
@@ -2699,7 +3803,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FCVT Ss, Dn (float precision narrow: f64 -> f32)
         AArch64Opcode::FcvtDS => {
@@ -2710,7 +3814,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FCVT Sd, Hn (float precision widen: f16 -> f32)
         AArch64Opcode::FcvtHS => {
@@ -2721,7 +3825,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FCVT Dd, Hn (float precision widen: f16 -> f64)
         AArch64Opcode::FcvtHD => {
@@ -2732,7 +3836,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FCVT Hd, Sn (float precision narrow: f32 -> f16)
         AArch64Opcode::FcvtSH => {
@@ -2743,7 +3847,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FCVT Hd, Dn (float precision narrow: f64 -> f16)
         AArch64Opcode::FcvtDH => {
@@ -2754,12 +3858,11 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FMOV Sd, Wn / FMOV Dd, Xn (GPR to FPR bitcast)
         AArch64Opcode::FmovGprFpr => {
-            let sf_64 = sf_from_operand(inst, 1) == 1;
-            let fp_size = fp_size_from_source(inst, 0);
+            let (sf_64, fp_size) = fmov_general_widths(inst, 1, 0)?;
             let enc = encoding_fp::encode_fp_int_conv(
                 sf_64,
                 fp_size,
@@ -2768,12 +3871,11 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FMOV Wn, Sd / FMOV Xn, Dd (FPR to GPR bitcast)
         AArch64Opcode::FmovFprGpr => {
-            let sf_64 = sf_from_operand(inst, 0) == 1;
-            let fp_size = fp_size_from_source(inst, 1);
+            let (sf_64, fp_size) = fmov_general_widths(inst, 0, 1)?;
             let enc = encoding_fp::encode_fp_int_conv(
                 sf_64,
                 fp_size,
@@ -2782,7 +3884,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
+    }
+
+    encode_checked_arithmetic_family {
 
         // =================================================================
         // Checked arithmetic (flag-setting variants)
@@ -2801,7 +3906,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // ADDS Rd, Rn, #imm12 (flag-setting)
         AArch64Opcode::AddsRI => {
@@ -2816,7 +3921,15 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
+
+        // SUBS Rd, SP, Rm: the first source is SP, which only the
+        // extended-register class can name (the shifted-register class reads
+        // field 31 as XZR). 64-bit only; Rd is an X register or XZR, Rm an X
+        // register.
+        AArch64Opcode::SubsRR if inst.operands.get(1).is_some_and(is_sp_operand) => {
+            subs_from_sp_fields(inst).map(|(rm, rd)| encoding::encode_subs_sp_extended(rm, rd))
+        },
 
         // SUBS Rd, Rn, Rm (shifted register, flag-setting)
         AArch64Opcode::SubsRR => {
@@ -2831,7 +3944,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // SUBS Rd, Rn, #imm12 (flag-setting)
         AArch64Opcode::SubsRI => {
@@ -2846,7 +3959,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
+    }
+
+    encode_wide_arithmetic_family {
 
         // =================================================================
         // i128 multi-register arithmetic
@@ -2862,7 +3978,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rn = preg_hw(inst, 1)?;
             let rm = preg_hw(inst, 2)?;
             Ok((sf << 31) | (0b0_0_11010000u32 << 21) | (rm << 16) | (rn << 5) | rd)
-        }
+        },
 
         // SBC Xd, Xn, Xm — subtract with carry (borrow)
         // ARM ARM: C6.2.229  Subtract with Carry
@@ -2874,7 +3990,33 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rn = preg_hw(inst, 1)?;
             let rm = preg_hw(inst, 2)?;
             Ok((sf << 31) | (0b1_0_11010000u32 << 21) | (rm << 16) | (rn << 5) | rd)
-        }
+        },
+
+        // ADCS Xd, Xn, Xm — add with carry, setting flags
+        // ARM ARM: C6.2.2  Add with Carry, setting flags
+        // Same layout as ADC with the S bit (bit 29) set:
+        // 31 30 29 28:21    20:16 15:10  9:5  4:0
+        // sf  0  1  11010000 Rm   000000 Rn   Rd
+        AArch64Opcode::Adcs => {
+            let sf = sf_from_operand(inst, 0);
+            let rd = preg_hw(inst, 0)?;
+            let rn = preg_hw(inst, 1)?;
+            let rm = preg_hw(inst, 2)?;
+            Ok((sf << 31) | (0b0_1_11010000u32 << 21) | (rm << 16) | (rn << 5) | rd)
+        },
+
+        // SBCS Xd, Xn, Xm — subtract with carry (borrow), setting flags
+        // ARM ARM: C6.2.230  Subtract with Carry, setting flags
+        // Same layout as SBC with the S bit (bit 29) set:
+        // 31 30 29 28:21    20:16 15:10  9:5  4:0
+        // sf  1  1  11010000 Rm   000000 Rn   Rd
+        AArch64Opcode::Sbcs => {
+            let sf = sf_from_operand(inst, 0);
+            let rd = preg_hw(inst, 0)?;
+            let rn = preg_hw(inst, 1)?;
+            let rm = preg_hw(inst, 2)?;
+            Ok((sf << 31) | (0b1_1_11010000u32 << 21) | (rm << 16) | (rn << 5) | rd)
+        },
 
         // UMULH Xd, Xn, Xm — unsigned multiply high
         // ARM ARM: C6.2.332  Unsigned Multiply High
@@ -2892,7 +4034,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b11111 << 10)  // Ra field = 11111 (ignored for UMULH)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // SMULH Xd, Xn, Xm — signed multiply high
         // ARM ARM: C6.2.289  Signed Multiply High
@@ -2911,7 +4053,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b11111 << 10)  // Ra field = 11111 (ignored for SMULH)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // MADD Xd, Xn, Xm, Xa — multiply-add: Xd = Xa + Xn * Xm
         // ARM ARM: C6.2.163  Multiply-Add
@@ -2926,7 +4068,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rm = preg_hw(inst, 2)?;
             let ra = preg_hw(inst, 3)?;
             Ok((sf << 31) | (0b11011 << 24) | (rm << 16) | (ra << 10) | (rn << 5) | rd)
-        }
+        },
+    }
+
+    encode_select_family {
 
         // =================================================================
         // Conditional select / set
@@ -2938,28 +4083,29 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // sf  0  0  11010100 Rm    cond   0  0  Rn   Rd
         // Operands: [dst, true_src, false_src, Imm(cond_code_encoding)]
         AArch64Opcode::Csel => {
-            let sf = sf_from_operand(inst, 0);
+            let (sf, cond) = conditional_select_fields(inst, false)?;
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             let rm = preg_hw(inst, 2)?;
-            let cond = imm_val(inst, 3) as u32 & 0xF;
             Ok(((sf << 31) | (0b11010100 << 21) | (rm << 16) | (cond << 12)) | (rn << 5) | rd)
-        }
+        },
 
         // FCSEL Sd/Dd, Sn/Dn, Sm/Dm, cond — scalar FP conditional select.
         // Operands: [Rd, Rn (true), Rm (false), Imm(cond)]. FAIL-CLOSED unless
-        // all three regs are the same scalar FPR class (S/D) — the bank check the
-        // GPR Csel lacks (see `require_fcsel_operands`). ftype derived from that
+        // all three regs are the same scalar FPR class (S/D), checked by
+        // `require_fcsel_operands`. ftype derived from that
         // class (S=00 / D=01). Byte-verified vs clang-assembled fcsel forms.
         AArch64Opcode::FcselRR => {
-            let fp_size = require_fcsel_operands(inst)?;
+            let (fp_size, cond) = require_fcsel_operands(inst)?;
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             let rm = preg_hw(inst, 2)?;
-            let cond = imm_val(inst, 3) as u32 & 0xF;
             let enc = encoding_fp::encode_fcsel(fp_size, cond, rm as u8, rn as u8, rd as u8)?;
             Ok(enc)
-        }
+        },
+    }
+
+    encode_neon_family {
 
         // =================================================================
         // NEON SIMD (vector) instructions
@@ -2967,7 +4113,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
 
         // Integer vector arithmetic: ADD, SUB, MUL
         AArch64Opcode::NeonAddV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Add,
@@ -2976,10 +4122,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonSubV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Sub,
@@ -2988,10 +4134,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonMulV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Mul,
@@ -3000,14 +4146,14 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Integer vector min/max (per lane): SMAX, SMIN, UMAX, UMIN
         AArch64Opcode::NeonSmaxV
         | AArch64Opcode::NeonSminV
         | AArch64Opcode::NeonUmaxV
         | AArch64Opcode::NeonUminV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let op = match inst.opcode {
                 AArch64Opcode::NeonSmaxV => encoding_neon::IntVec3Op::Smax,
                 AArch64Opcode::NeonSminV => encoding_neon::IntVec3Op::Smin,
@@ -3022,11 +4168,11 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FP vector arithmetic: FADD, FSUB, FMUL, FDIV
         AArch64Opcode::NeonFaddV => {
-            let fp_arr = neon_fp_arrangement(inst);
+            let fp_arr = neon_fp_arrangement(inst)?;
             let enc = encoding_neon::encode_fp_vec3_same(
                 fp_arr,
                 encoding_neon::FpVec3Op::Fadd,
@@ -3035,10 +4181,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonFsubV => {
-            let fp_arr = neon_fp_arrangement(inst);
+            let fp_arr = neon_fp_arrangement(inst)?;
             let enc = encoding_neon::encode_fp_vec3_same(
                 fp_arr,
                 encoding_neon::FpVec3Op::Fsub,
@@ -3047,10 +4193,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonFmulV => {
-            let fp_arr = neon_fp_arrangement(inst);
+            let fp_arr = neon_fp_arrangement(inst)?;
             let enc = encoding_neon::encode_fp_vec3_same(
                 fp_arr,
                 encoding_neon::FpVec3Op::Fmul,
@@ -3059,10 +4205,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonFdivV => {
-            let fp_arr = neon_fp_arrangement(inst);
+            let fp_arr = neon_fp_arrangement(inst)?;
             let enc = encoding_neon::encode_fp_vec3_same(
                 fp_arr,
                 encoding_neon::FpVec3Op::Fdiv,
@@ -3071,12 +4217,12 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FP vector fused multiply-accumulate/subtract: FMLA / FMLS.
         // Operand 0 (Vd) is a tied def-use accumulator (see has_tied_def_use).
         AArch64Opcode::NeonFmlaV | AArch64Opcode::NeonFmlsV => {
-            let fp_arr = neon_fp_arrangement(inst);
+            let fp_arr = neon_fp_arrangement(inst)?;
             let op = if inst.opcode == AArch64Opcode::NeonFmlaV {
                 encoding_neon::FpVec3Op::Fmla
             } else {
@@ -3090,14 +4236,14 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FP vector fused multiply-accumulate BY ELEMENT: FMLA Vd.T, Vn.T,
         // Vm.Ts[lane]. Operand 0 (Vd) is a tied def-use accumulator; operand 3
         // is the broadcast lane, operand 4 (last) the FP arrangement.
         AArch64Opcode::NeonFmlaLaneV => {
-            let fp_arr = neon_fp_arrangement(inst);
-            let lane = imm_val(inst, 3) as u8;
+            let fp_arr = neon_fp_arrangement(inst)?;
+            let lane = imm_u8_operand(inst, 3)?;
             let enc = encoding_neon::encode_fmla_lane(
                 fp_arr,
                 false, // FMLA (the only by-element form emitted; FMLS is a proof control)
@@ -3107,11 +4253,11 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Vector integer->FP conversion: UCVTF / SCVTF (vector, integer form).
         AArch64Opcode::NeonUcvtfV | AArch64Opcode::NeonScvtfV => {
-            let fp_arr = neon_fp_arrangement(inst);
+            let fp_arr = neon_fp_arrangement(inst)?;
             let signed = inst.opcode == AArch64Opcode::NeonScvtfV;
             let enc = encoding_neon::encode_fp_int_cvt_vec(
                 fp_arr,
@@ -3120,7 +4266,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Vector f32->f64 widening convert: FCVTL (low half) / FCVTL2 (high half).
         AArch64Opcode::NeonFcvtlV | AArch64Opcode::NeonFcvtl2V => {
@@ -3131,22 +4277,22 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FP lane extract to a scalar D register: MOV Dd, Vn.D[lane].
         AArch64Opcode::NeonDupScalarD => {
-            let lane = imm_val(inst, 2) as u8;
+            let lane = imm_u8_operand(inst, 2)?;
             let enc = encoding_neon::encode_dup_scalar_d(
                 lane,
                 preg_hw(inst, 1)? as u8,
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // FP vector compare greater-than (register): FCMGT
         AArch64Opcode::NeonFcmgtV => {
-            let fp_arr = neon_fp_arrangement(inst);
+            let fp_arr = neon_fp_arrangement(inst)?;
             let enc = encoding_neon::encode_fp_vec3_same(
                 fp_arr,
                 encoding_neon::FpVec3Op::Fcmgt,
@@ -3155,11 +4301,11 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Vector logic: AND, ORR, EOR, BIC
         AArch64Opcode::NeonAndV => {
-            let q = neon_q_bit(inst);
+            let q = neon_q_bit(inst)?;
             let enc = encoding_neon::encode_vec_logic(
                 q,
                 encoding_neon::VecLogicOp::And,
@@ -3168,10 +4314,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonOrrV => {
-            let q = neon_q_bit(inst);
+            let q = neon_q_bit(inst)?;
             let enc = encoding_neon::encode_vec_logic(
                 q,
                 encoding_neon::VecLogicOp::Orr,
@@ -3180,10 +4326,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonEorV => {
-            let q = neon_q_bit(inst);
+            let q = neon_q_bit(inst)?;
             let enc = encoding_neon::encode_vec_logic(
                 q,
                 encoding_neon::VecLogicOp::Eor,
@@ -3192,10 +4338,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonBicV => {
-            let q = neon_q_bit(inst);
+            let q = neon_q_bit(inst)?;
             let enc = encoding_neon::encode_vec_logic(
                 q,
                 encoding_neon::VecLogicOp::Bic,
@@ -3204,11 +4350,11 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Vector BIT (bitwise insert if true; Vd is a TIED def-use).
         AArch64Opcode::NeonBitV => {
-            let q = neon_q_bit(inst);
+            let q = neon_q_bit(inst)?;
             let enc = encoding_neon::encode_vec_logic(
                 q,
                 encoding_neon::VecLogicOp::Bit,
@@ -3217,20 +4363,20 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Vector NOT
         AArch64Opcode::NeonNotV => {
-            let q = neon_q_bit(inst);
+            let q = neon_q_bit(inst)?;
             let enc =
                 encoding_neon::encode_vec_not(q, preg_hw(inst, 1)? as u8, preg_hw(inst, 0)? as u8)?;
             Ok(enc)
-        }
+        },
 
         // Vector RBIT/REV byte operations.
         // Operands: [Vd, Vn, Imm(arrangement)] where arrangement is 8B/16B.
         AArch64Opcode::NeonRbitV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_vec_byte_2reg(
                 arr,
                 encoding_neon::VecByte2Op::Rbit,
@@ -3238,10 +4384,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonRev32V => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_vec_byte_2reg(
                 arr,
                 encoding_neon::VecByte2Op::Rev32,
@@ -3249,10 +4395,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonRev64V => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_vec_byte_2reg(
                 arr,
                 encoding_neon::VecByte2Op::Rev64,
@@ -3260,52 +4406,52 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Population count (per byte). Operands: [Vd, Vn, Imm(arrangement)] (16B).
         AArch64Opcode::NeonCntV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc =
                 encoding_neon::encode_cnt(arr, preg_hw(inst, 1)? as u8, preg_hw(inst, 0)? as u8)?;
             Ok(enc)
-        }
+        },
 
         // Unsigned add long pairwise (widening). Operands: [Vd, Vn, Imm(input
         // arrangement)] where input is 16B (-> 8H) or 8H (-> 4S).
         AArch64Opcode::NeonUaddlpV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_uaddlp(
                 arr,
                 preg_hw(inst, 1)? as u8,
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Signed add long pairwise (widening). Operands: [Vd, Vn, Imm(input
         // arrangement)] where input is 16B (-> 8H) or 8H (-> 4S).
         AArch64Opcode::NeonSaddlpV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_saddlp(
                 arr,
                 preg_hw(inst, 1)? as u8,
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Per-lane signed absolute value. Operands: [Vd, Vn, Imm(arrangement)] (.4S).
         AArch64Opcode::NeonAbsV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc =
                 encoding_neon::encode_abs(arr, preg_hw(inst, 1)? as u8, preg_hw(inst, 0)? as u8)?;
             Ok(enc)
-        }
+        },
 
         // Unsigned dot-product ACCUMULATE (FEAT_DotProd). Operands:
         // [Vd (accumulator, tied def-use), Vn, Vm, Imm(input arrangement 16B)].
         AArch64Opcode::NeonUdotV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_udot(
                 arr,
                 preg_hw(inst, 2)? as u8,
@@ -3313,7 +4459,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Byte-wise extract/concatenate (sliding window). Operands:
         // [Vd, Vn (LOW source), Vm (HIGH source), Imm(byte shift 4|8|12)].
@@ -3328,7 +4474,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Widening multiply-accumulate-long (SMLAL/SMLAL2/UMLAL/UMLAL2). Operands:
         // [Vd (accumulator, tied def-use), Vn, Vm, Imm(input arrangement .4S)].
@@ -3338,7 +4484,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         | AArch64Opcode::NeonSmlal2V
         | AArch64Opcode::NeonUmlalV
         | AArch64Opcode::NeonUmlal2V => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let high = matches!(
                 inst.opcode,
                 AArch64Opcode::NeonSmlal2V | AArch64Opcode::NeonUmlal2V
@@ -3356,14 +4502,14 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Widening add-wide (UADDW/UADDW2). Operands: [Vd (pure def), Vn (i64
         // addend, a SEPARATE source — NOT tied), Vm (.4S source), Imm(input
         // arrangement .4S)]. Low vs high (`.4S` lanes {0,1} vs {2,3}) is static
         // in the opcode; the encoder fail-closes on any non-.4S input.
         AArch64Opcode::NeonUaddwV | AArch64Opcode::NeonUaddw2V => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let high = matches!(inst.opcode, AArch64Opcode::NeonUaddw2V);
             let enc = encoding_neon::encode_uaddw(
                 arr,
@@ -3373,14 +4519,14 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // SIGNED widening add-wide (SADDW/SADDW2) — the signed sibling: same
         // plain three-operand layout [Vd (pure def), Vn (i64 addend, NOT tied),
         // Vm (.4S source), Imm(input arrangement .4S)]; fail-closes on any
         // non-.4S input.
         AArch64Opcode::NeonSaddwV | AArch64Opcode::NeonSaddw2V => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let high = matches!(inst.opcode, AArch64Opcode::NeonSaddw2V);
             let enc = encoding_neon::encode_saddw(
                 arr,
@@ -3390,14 +4536,14 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Vector integer multiply-ACCUMULATE (MLA.4S). Operands: [Vd
         // (accumulator, tied def-use — the accumulate READS Vd), Vn, Vm,
         // Imm(arrangement .4S)]; the encoder fail-closes on any non-.4S
         // arrangement.
         AArch64Opcode::NeonMlaV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_mla(
                 arr,
                 preg_hw(inst, 2)? as u8,
@@ -3405,7 +4551,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // UNSIGNED pairwise widening ACCUMULATE (UADALP .4S -> .2D). Operands:
         // [Vd (accumulator, tied def-use — the accumulate READS Vd), Vn (.4S
@@ -3413,18 +4559,18 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // non-.4S input (contrast the non-accumulating NeonUaddlpV, which
         // accepts only 16B/8H inputs).
         AArch64Opcode::NeonUadalpV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_uadalp(
                 arr,
                 preg_hw(inst, 1)? as u8,
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // Vector compare: CMEQ, CMGT, CMGE, CMHI, CMHS
         AArch64Opcode::NeonCmeqV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Cmeq,
@@ -3433,10 +4579,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonCmgtV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Cmgt,
@@ -3445,10 +4591,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonCmgeV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Cmge,
@@ -3457,10 +4603,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonCmhiV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Cmhi,
@@ -3469,10 +4615,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         AArch64Opcode::NeonCmhsV => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_int_vec3_same(
                 arr,
                 encoding_neon::IntVec3Op::Cmhs,
@@ -3481,12 +4627,12 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // UMAXV: unsigned max across vector lanes.
         // Operands: [Sd, Vn, Imm(arrangement)]. #573 uses only .4S.
         AArch64Opcode::NeonUmaxv => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             if arr != encoding_neon::VectorArrangement::S4 {
                 return Err(EncodeError::NeonEncode(
                     encoding_neon::NeonEncodeError::InvalidSize(arr.size() as u8),
@@ -3495,12 +4641,12 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let enc =
                 encoding_neon::encode_umaxv_4s(preg_hw(inst, 1)? as u8, preg_hw(inst, 0)? as u8)?;
             Ok(enc)
-        }
+        },
 
         // ADDP: pairwise add across two i64 lanes into scalar Dd.
         // Operands: [Dd, Vn, Imm(arrangement)]. #909 uses only .2D.
         AArch64Opcode::NeonAddpScalar => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             if arr != encoding_neon::VectorArrangement::D2 {
                 return Err(EncodeError::NeonEncode(
                     encoding_neon::NeonEncodeError::InvalidSize(arr.size() as u8),
@@ -3530,14 +4676,14 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // DUP (element): duplicate one vector lane to all lanes
         // Operands: [Vd, Vn, Imm(lane), Imm(element_size)]
         AArch64Opcode::NeonDupElem => {
-            let q = neon_q_bit(inst);
-            let lane = imm_val(inst, 2) as u8;
-            let elem = neon_element_size(inst, 3);
+            let q = neon_destination_q_bit(inst)?;
+            let lane = imm_u8_operand(inst, 2)?;
+            let elem = neon_element_size(inst, 3)?;
             let enc = encoding_neon::encode_dup_element(
                 q,
                 elem,
@@ -3546,7 +4692,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // DUP (general): duplicate GPR to all vector lanes
         // Operands: [Vd, Rn, Imm(element_size)]
@@ -3558,12 +4704,8 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // Q=1). Reading the element-size Imm here would wrongly force Q=1 for the
         // V64 form (it is never 0), mis-encoding a D-register dup as 128-bit.
         AArch64Opcode::NeonDupGen => {
-            let q = match inst.operands.first() {
-                Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Fpr128 => 1,
-                Some(MachOperand::PReg(_)) => 0,
-                _ => neon_q_bit(inst),
-            };
-            let elem = neon_element_size(inst, 2);
+            let q = neon_destination_q_bit(inst)?;
+            let elem = neon_element_size(inst, 2)?;
             let enc = encoding_neon::encode_dup_general(
                 q,
                 elem,
@@ -3571,13 +4713,13 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // INS (general): insert GPR into vector lane
         // Operands: [Vd, Rn, Imm(lane), Imm(element_size)]
         AArch64Opcode::NeonInsGen => {
-            let lane = imm_val(inst, 2) as u8;
-            let elem = neon_element_size(inst, 3);
+            let lane = imm_u8_operand(inst, 2)?;
+            let elem = neon_element_size(inst, 3)?;
             let enc = encoding_neon::encode_ins_general(
                 elem,
                 lane,
@@ -3585,12 +4727,12 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // UMOV (general): extract vector lane to GPR
         // Operands: [Wd/Xd, Vn, Imm(lane), Imm(element_size)]
         AArch64Opcode::NeonUmovGen => {
-            let elem = neon_element_size(inst, 3);
+            let elem = neon_element_size(inst, 3)?;
             let expected_dst = match elem {
                 encoding_neon::ElementSize::B
                 | encoding_neon::ElementSize::H
@@ -3616,7 +4758,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 }
             }
 
-            let lane = imm_val(inst, 2) as u8;
+            let lane = imm_u8_operand(inst, 2)?;
             let enc = encoding_neon::encode_umov_general(
                 elem,
                 lane,
@@ -3624,33 +4766,37 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // MOVI: move immediate to vector (byte form)
         // Operands: [Vd, Imm(imm8)]
         AArch64Opcode::NeonMovi => {
-            let q = match inst.operands.first() {
-                Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Fpr128 => 1,
-                Some(MachOperand::PReg(_)) => 0,
-                _ => neon_q_bit(inst),
-            };
-            let imm8 = imm_val(inst, 1) as u8;
+            let q = neon_destination_q_bit(inst)?;
+            let imm8 = imm_u8_operand(inst, 1)?;
             let enc = encoding_neon::encode_movi_byte(q, imm8, preg_hw(inst, 0)? as u8)?;
             Ok(enc)
-        }
+        },
 
         // SIMD shift by immediate: SHL / USHR / SSHR
         // Operands: [Vd, Vn, Imm(shift), Imm(arrangement)]
         AArch64Opcode::NeonShlVImm | AArch64Opcode::NeonUshrVImm | AArch64Opcode::NeonSshrVImm => {
-            let arr = neon_arrangement(inst);
-            let shift = imm_val(inst, 2);
-            if shift < 0 {
+            if inst.operands.len() != 4 {
                 return Err(EncodeError::InvalidOperand {
                     opcode: inst.opcode,
-                    index: 2,
-                    desc: format!("negative vector shift amount {shift}"),
+                    index: inst.operands.len().min(4),
+                    desc: "vector shift requires destination, source, shift, and arrangement"
+                        .into(),
                 });
             }
+            // Validate before narrowing: truncating i64 to u32 can turn a huge
+            // invalid shift into zero or select a different vector lane width.
+            let shift = imm_operand(inst, 2)?;
+            let shift = u32::try_from(shift).map_err(|_| EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 2,
+                desc: format!("vector shift amount {shift} is not representable as u32"),
+            })?;
+            let arr = neon_arrangement(inst)?;
             let op = match inst.opcode {
                 AArch64Opcode::NeonShlVImm => encoding_neon::VecShiftImmOp::Shl,
                 AArch64Opcode::NeonUshrVImm => encoding_neon::VecShiftImmOp::Ushr,
@@ -3660,94 +4806,39 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let enc = encoding_neon::encode_vec_shift_imm(
                 arr,
                 op,
-                shift as u32,
+                shift,
                 preg_hw(inst, 1)? as u8,
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
 
         // LD1 post-index: SIMD load 1 register
         // Operands: [Vt, Xn, Imm(arrangement)]
         AArch64Opcode::NeonLd1Post => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_ld1_post_imm(
                 arr,
                 preg_hw(inst, 1)? as u8,
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
-
-        // LDP Q-pair post-index: SIMD&FP load pair of 128-bit registers.
-        // Operands: [Vt1, Vt2, Xn, Imm(post-index byte offset)]
-        // FAIL-CLOSED on operand class: both data operands MUST be Fpr128.
-        // A GPR data operand is REJECTED rather than silently encoded as the
-        // integer LDP form — the prior P0 in this family was a pre/post-index
-        // pair encoder hardcoding the GPR form (V=0) and clobbering FPR pairs.
-        AArch64Opcode::NeonLdpQPost => {
-            for idx in [0usize, 1] {
-                let class = pair_operand_class(inst, idx)?;
-                if class != RegClass::Fpr128 {
-                    return Err(EncodeError::InvalidOperand {
-                        opcode: inst.opcode,
-                        index: idx,
-                        desc: format!(
-                            "NeonLdpQPost data operand must be Fpr128 (Q register), got {class:?}"
-                        ),
-                    });
-                }
-            }
-            let offset = imm_val(inst, 3);
-            let enc = encoding_neon::encode_ldp_q_post_imm(
-                offset,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 2)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?;
-            Ok(enc)
-        }
-
-        // STP Q-pair post-index: SIMD&FP store pair of 128-bit registers.
-        // Operands: [Vt1, Vt2, Xn, Imm(post-index byte offset)]
-        // FAIL-CLOSED on operand class: both data operands MUST be Fpr128 — a
-        // GPR data operand is REJECTED rather than silently encoded as the
-        // integer STP form (the LdpQPost P0 class: a hardcoded GPR pair form
-        // clobbering FPR pairs). The STORE sibling of NeonLdpQPost.
-        AArch64Opcode::NeonStpQPost => {
-            for idx in [0usize, 1] {
-                let class = pair_operand_class(inst, idx)?;
-                if class != RegClass::Fpr128 {
-                    return Err(EncodeError::InvalidOperand {
-                        opcode: inst.opcode,
-                        index: idx,
-                        desc: format!(
-                            "NeonStpQPost data operand must be Fpr128 (Q register), got {class:?}"
-                        ),
-                    });
-                }
-            }
-            let offset = imm_val(inst, 3);
-            let enc = encoding_neon::encode_stp_q_post_imm(
-                offset,
-                preg_hw(inst, 1)? as u8,
-                preg_hw(inst, 2)? as u8,
-                preg_hw(inst, 0)? as u8,
-            )?;
-            Ok(enc)
-        }
+        },
 
         // ST1 post-index: SIMD store 1 register
         // Operands: [Vt, Xn, Imm(arrangement)]
         AArch64Opcode::NeonSt1Post => {
-            let arr = neon_arrangement(inst);
+            let arr = neon_arrangement(inst)?;
             let enc = encoding_neon::encode_st1_post_imm(
                 arr,
                 preg_hw(inst, 1)? as u8,
                 preg_hw(inst, 0)? as u8,
             )?;
             Ok(enc)
-        }
+        },
+    }
+
+    encode_atomic_family {
 
         // =================================================================
         // Atomic memory operations (ARMv8 + ARMv8.1-a LSE)
@@ -3762,21 +4853,21 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rt = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             Ok(encode_load_acquire(size, rn, rt))
-        }
+        },
 
         // LDARB Wt, [Xn] — load-acquire byte. size=00.
         AArch64Opcode::Ldarb => {
             let rt = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             Ok(encode_load_acquire(0b00, rn, rt))
-        }
+        },
 
         // LDARH Wt, [Xn] — load-acquire halfword. size=01.
         AArch64Opcode::Ldarh => {
             let rt = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             Ok(encode_load_acquire(0b01, rn, rt))
-        }
+        },
 
         // STLR Xt, [Xn] — store-release register.
         // Encoding: size(2) 001000 100 11111 1 11111 Rn(5) Rt(5)
@@ -3786,21 +4877,21 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rt = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             Ok(encode_store_release(size, rn, rt))
-        }
+        },
 
         // STLRB Wt, [Xn] — store-release byte. size=00.
         AArch64Opcode::Stlrb => {
             let rt = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             Ok(encode_store_release(0b00, rn, rt))
-        }
+        },
 
         // STLRH Wt, [Xn] — store-release halfword. size=01.
         AArch64Opcode::Stlrh => {
             let rt = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             Ok(encode_store_release(0b01, rn, rt))
-        }
+        },
 
         // LSE atomic RMW instructions: LDADD, LDCLR, LDEOR, LDSET,
         // LDSMAX, LDSMIN, LDUMAX, LDUMIN, SWP
@@ -3820,16 +4911,16 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // Operands: [Rs (operand), Rt (old value dest), Rn (address)]
         AArch64Opcode::Ldadd => {
             encode_lse_atomic(inst, 0, 0b000, 0, 0) // A=0, R=0
-        }
+        },
         AArch64Opcode::Ldadda => {
             encode_lse_atomic(inst, 0, 0b000, 1, 0) // A=1, R=0
-        }
+        },
         AArch64Opcode::Ldaddal => {
             encode_lse_atomic(inst, 0, 0b000, 1, 1) // A=1, R=1
-        }
+        },
         AArch64Opcode::Ldaddl => {
             encode_lse_atomic(inst, 0, 0b000, 0, 1) // A=0, R=1 (release-only)
-        }
+        },
         AArch64Opcode::Ldclr => encode_lse_atomic(inst, 0, 0b001, 0, 0),
         AArch64Opcode::Ldclra => encode_lse_atomic(inst, 0, 0b001, 1, 0),
         AArch64Opcode::Ldclral => encode_lse_atomic(inst, 0, 0b001, 1, 1),
@@ -3873,26 +4964,23 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // Operands: [Rs (expected/result), Rt (desired), Rn (address)]
         AArch64Opcode::Cas => {
             encode_cas(inst, 0, 0) // A=0, R=0
-        }
+        },
         AArch64Opcode::Casa => {
             encode_cas(inst, 1, 0) // A=1, R=0
-        }
+        },
         AArch64Opcode::Casal => {
             encode_cas(inst, 1, 1) // A=1, R=1
-        }
+        },
         AArch64Opcode::Casl => {
             encode_cas(inst, 0, 1) // A=0, R=1 (release-only; o0 = R)
-        }
+        },
 
         // LDAXR Xt, [Xn] — load-acquire exclusive register (LL/SC).
         // Encoding: size(2) 001000 010 11111 1 11111 Rn(5) Rt(5)
         // Same encoding as LDAR but with different bit pattern:
         // size(2) 001000 0 1 0 Rs(5=11111) o0(1=1) Rt2(5=11111) Rn(5) Rt(5)
         AArch64Opcode::Ldaxr => {
-            let sf = sf_from_operand(inst, 0);
-            let size = if sf == 1 { 0b11 } else { 0b10 };
-            let rt = preg_hw(inst, 0)?;
-            let rn = preg_hw(inst, 1)?;
+            let (size, _, rt, rn) = exclusive_encoding_fields(inst, false)?;
             // size(2) 001000 0 1 0 11111 1 11111 Rn(5) Rt(5)
             Ok((((size << 30) | (0b001000 << 24)) | (1 << 22))
                 | (0b11111 << 16)
@@ -3900,47 +4988,80 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b11111 << 10)
                 | (rn << 5)
                 | rt)
-        }
+        },
+
+        // Baseline LL/SC exclusives emitted only by the post-RA LL/SC
+        // expansion: LDXR/LDXRB/LDXRH/LDAXRB/LDAXRH (Rs=11111) and
+        // STXR/STXRB/STXRH/STLXRB/STLXRH. Byte/halfword forms fix `size`
+        // and require W data registers; word forms follow the data width.
+        AArch64Opcode::Ldxr
+        | AArch64Opcode::Ldxrb
+        | AArch64Opcode::Ldxrh
+        | AArch64Opcode::Ldaxrb
+        | AArch64Opcode::Ldaxrh
+        | AArch64Opcode::Stxr
+        | AArch64Opcode::Stxrb
+        | AArch64Opcode::Stxrh
+        | AArch64Opcode::Stlxrb
+        | AArch64Opcode::Stlxrh => encode_exclusive(inst),
+
+        // 128-bit pair exclusives, emitted only by the 128-bit LL/SC
+        // expansion.
+        AArch64Opcode::Ldxp | AArch64Opcode::Ldaxp | AArch64Opcode::Stxp | AArch64Opcode::Stlxp => {
+            encode_exclusive_pair(inst)
+        },
+
+        // CLREX #15 — clear the local exclusive monitor (Arm ARM C6.2.64):
+        // 1101 0101 0000 0011 0011 CRm=1111 010 11111.
+        AArch64Opcode::Clrex => {
+            if !inst.operands.is_empty() {
+                return Err(EncodeError::InvalidOperand {
+                    opcode: inst.opcode,
+                    index: 0,
+                    desc: "CLREX takes no operands".into(),
+                });
+            }
+            Ok(0xD503_3F5F)
+        },
 
         // STLXR Ws, Xt, [Xn] — store-release exclusive register (LL/SC).
         // Encoding: size(2) 001000 0 0 0 Rs(5) 1 11111 Rn(5) Rt(5)
         // Operands: [Ws (status), Rt (value), Rn (address)]
         AArch64Opcode::Stlxr => {
-            let sf = sf_from_operand(inst, 1); // size from value register
-            let size = if sf == 1 { 0b11 } else { 0b10 };
-            let rs = preg_hw(inst, 0)?; // status
-            let rt = preg_hw(inst, 1)?; // value
-            let rn = preg_hw(inst, 2)?; // address
+            let (size, rs, rt, rn) = exclusive_encoding_fields(inst, true)?;
             Ok(((size << 30) | (0b001000 << 24))
                 | (rs << 16)
                 | (1 << 15)
                 | (0b11111 << 10)
                 | (rn << 5)
                 | rt)
-        }
+        },
 
         // DMB — data memory barrier.
         // Encoding: 1101 0101 0000 0011 0011 CRm(4) 1 01 11111
         // CRm = barrier option (e.g., 0xF=SY, 0xB=ISH, 0x9=ISHLD, 0xA=ISHST)
         // Operands: [Imm(CRm)]
         AArch64Opcode::Dmb => {
-            let crm = (imm_val(inst, 0) as u32) & 0xF;
+            let crm = (imm_val(inst, 0)? as u32) & 0xF;
             Ok(0xD5033000 | (crm << 8) | 0xBF)
-        }
+        },
 
         // DSB — data synchronization barrier.
         // Encoding: 1101 0101 0000 0011 0011 CRm(4) 1 00 11111
         AArch64Opcode::Dsb => {
-            let crm = (imm_val(inst, 0) as u32) & 0xF;
+            let crm = (imm_val(inst, 0)? as u32) & 0xF;
             Ok(0xD5033000 | (crm << 8) | 0x9F)
-        }
+        },
 
         // ISB — instruction synchronization barrier.
         // Encoding: 1101 0101 0000 0011 0011 CRm(4) 1 10 11111
         AArch64Opcode::Isb => {
-            let crm = (imm_val(inst, 0) as u32) & 0xF;
+            let crm = (imm_val(inst, 0)? as u32) & 0xF;
             Ok(0xD5033000 | (crm << 8) | 0xDF)
-        }
+        },
+    }
+
+    encode_system_family {
 
         // =================================================================
         // System register access (ARM ARM C6.2.169)
@@ -3978,11 +5099,14 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // Operands: [PReg(Rt), Imm(sysreg_bits_16)]
         AArch64Opcode::Mrs => {
             let rt = preg_hw(inst, 0)?;
-            let sysreg_bits = (imm_val(inst, 1) as u32) & 0xFFFF;
+            let sysreg_bits = (imm_val(inst, 1)? as u32) & 0xFFFF;
             // 0xD520_0000 base = bits[31:22]=1101010100, bit21=1 (MRS),
             // bits[20:5]=0, Rt=0.
             Ok(0xD520_0000 | (sysreg_bits << 5) | rt)
-        }
+        },
+    }
+
+    encode_trap_pseudo_family {
 
         // =================================================================
         // Trap fallbacks and pseudo-instructions
@@ -3991,6 +5115,22 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // BRK is a real trap instruction. The legacy Trap* panic pseudos below
         // have no distinct hardware encoding, so a leaked pseudo traps with
         // BRK #1 rather than silently becoming a NOP.
+        // An explicit `BRK #imm16` (the U10 stack-limit Trap uses #0x534c)
+        // keeps its immediate; an operand-free `Brk` is `BRK #1`.
+        AArch64Opcode::Brk if !inst.operands.is_empty() => match inst.operands.as_slice() {
+            [MachOperand::Imm(comment)] => u16::try_from(*comment)
+                .map(|comment| 0xD420_0000 | (u32::from(comment) << 5))
+                .map_err(|_| EncodeError::InvalidOperand {
+                    opcode: inst.opcode,
+                    index: 0,
+                    desc: format!("BRK immediate {comment} is not a 16-bit value"),
+                }),
+            _ => Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: 0,
+                desc: "BRK takes no operand or exactly one 16-bit immediate".into(),
+            }),
+        },
         AArch64Opcode::Brk
         | AArch64Opcode::TrapOverflow
         | AArch64Opcode::TrapBoundsCheck
@@ -3998,7 +5138,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         | AArch64Opcode::TrapDivZero
         | AArch64Opcode::TrapShiftRange => {
             Ok(0xD4200020) // BRK #1
-        }
+        },
 
         // Exact guard carriers must be consumed by proof opts or expanded by
         // lowering before final encoding. Reaching this boundary is a typed
@@ -4008,6 +5148,23 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         | AArch64Opcode::TrapDivZeroIfZero
         | AArch64Opcode::TrapShiftRangeIfOOB
         | AArch64Opcode::TrapOverflowExact => Err(EncodeError::PseudoInstruction(inst.opcode)),
+
+        // Opaque LL/SC atomic pseudos have no single-word encoding: they must
+        // be expanded into their exclusive retry loop after register
+        // allocation (`crate::llsc::expand_llsc_atomics`). A survivor is a
+        // typed pseudo error, never a NOP or a partial sequence.
+        AArch64Opcode::LlscRmw8
+        | AArch64Opcode::LlscRmw16
+        | AArch64Opcode::LlscRmw32
+        | AArch64Opcode::LlscRmw64
+        | AArch64Opcode::LlscCmpSwap8
+        | AArch64Opcode::LlscCmpSwap16
+        | AArch64Opcode::LlscCmpSwap32
+        | AArch64Opcode::LlscCmpSwap64
+        | AArch64Opcode::LlscLoad128
+        | AArch64Opcode::LlscStore128
+        | AArch64Opcode::LlscRmw128
+        | AArch64Opcode::LlscCmpSwap128 => Err(EncodeError::PseudoInstruction(inst.opcode)),
 
         AArch64Opcode::Phi
         | AArch64Opcode::StackAlloc
@@ -4022,6 +5179,9 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // is deliberately encoded — it occupies one word of the final stream
         // so every offset derivation stays exact.
         AArch64Opcode::AlignNop => Ok(NOP),
+    }
+
+    encode_bitfield_family {
 
         // =================================================================
         // Bitfield move instructions (ARM ARM C6.2)
@@ -4046,7 +5206,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (imms << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // SBFM Rd, Rn, #immr, #imms — signed bitfield move
         // sf | 00 | 100110 | N | immr(6) | imms(6) | Rn(5) | Rd(5)
@@ -4066,7 +5226,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (imms << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // BFM Rd, Rn, #immr, #imms — bitfield move (insert)
         // sf | 01 | 100110 | N | immr(6) | imms(6) | Rn(5) | Rd(5)
@@ -4087,7 +5247,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (imms << 10)
                 | (rn << 5)
                 | rd)
-        }
+        },
+    }
+
+    encode_register_offset_family {
 
         // =================================================================
         // Load/Store register offset (ARM ARM C6.2)
@@ -4097,107 +5260,16 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // size | 111 | V | 00 | opc | 1 | Rm(5) | option(3) | S(1) | 10 | Rn(5) | Rt(5)
         // Operands: [Rt, Rn, Rm] — default LSL, no shift (S=0)
         // Optional 4th operand: Imm(extend_option_and_shift) packed as (option<<1)|S
-        AArch64Opcode::LdrRO => {
-            let sf = sf_from_operand(inst, 0);
-            let rt = preg_hw(inst, 0)?;
-            let rn = preg_hw(inst, 1)?;
-            let rm = preg_hw(inst, 2)?;
-            // Default: LSL extend (option=011), no shift (S=0)
-            let (option, s) = if inst.operands.len() > 3 {
-                let packed = imm_val(inst, 3) as u32;
-                ((packed >> 1) & 0b111, packed & 1)
-            } else {
-                (0b011, 0)
-            };
-            if is_fpr(inst, 0) {
-                // FP register-offset load: V=1. The (size, opc) pair comes from
-                // the SAME derivation the unsigned-offset FP path uses, so the
-                // 128-bit form (size=0b00, opc=0b11) is reachable and every
-                // other class keeps its exact width. Deriving it from `FpSize`
-                // instead — which has no `Quad` and folds `Fpr128` into
-                // `Double` — encoded a 16-byte `Q` access as an 8-byte `D`
-                // access, silently halving every register-offset vector
-                // load/store. `fp_mem_fields_from_inst` fails closed on any
-                // class with no FP memory encoding rather than defaulting.
-                let (size, _scale, opc) = fp_mem_fields_from_inst(inst, 0, 0b01)?;
-                Ok(encoding_mem::encode_ldr_str_register_fields(
-                    size,
-                    true,
-                    opc,
-                    rm as u8,
-                    match option {
-                        0b010 => encoding_mem::RegExtend::Uxtw,
-                        0b110 => encoding_mem::RegExtend::Sxtw,
-                        0b111 => encoding_mem::RegExtend::Sxtx,
-                        _ => encoding_mem::RegExtend::Lsl,
-                    },
-                    s != 0,
-                    rn as u8,
-                    rt as u8,
-                )?)
-            } else {
-                // Integer register-offset load: V=0
-                let size = if sf == 1 {
-                    encoding_mem::LoadStoreSize::Double
-                } else {
-                    encoding_mem::LoadStoreSize::Word
-                };
-                Ok(encoding_mem::encode_ldr_str_register(
-                    size,
-                    false,
-                    encoding_mem::LoadStoreOp::Load,
-                    rm as u8,
-                    match option {
-                        0b010 => encoding_mem::RegExtend::Uxtw,
-                        0b110 => encoding_mem::RegExtend::Sxtw,
-                        0b111 => encoding_mem::RegExtend::Sxtx,
-                        _ => encoding_mem::RegExtend::Lsl,
-                    },
-                    s != 0,
-                    rn as u8,
-                    rt as u8,
-                )?)
-            }
-        }
+        AArch64Opcode::LdrRO => encode_register_offset(inst, true),
 
         // LDRB/LDRH Wt, [Xn, Xm{, extend {#amount}}] — narrow register-offset
         // load, zero-extend into the 32-bit W transfer register. The access
         // WIDTH comes from the OPCODE (byte / halfword), NOT the transfer class
-        // (which is always Gpr32 for these), so it is fixed here and never
+        // (which may use a W or X carrier), so it is fixed here and never
         // derived from `sf`. V=0 (integer), opc=01 (load). The packed extend
         // 4th operand is `(option << 1) | S`, identical to `LdrRO`; for byte
         // accesses `S` is a no-op (log2(1)=0), for halfword `S=1` shifts by 1.
-        AArch64Opcode::LdrbRO | AArch64Opcode::LdrhRO => {
-            let rt = preg_hw(inst, 0)?;
-            let rn = preg_hw(inst, 1)?;
-            let rm = preg_hw(inst, 2)?;
-            let (option, s) = if inst.operands.len() > 3 {
-                let packed = imm_val(inst, 3) as u32;
-                ((packed >> 1) & 0b111, packed & 1)
-            } else {
-                (0b011, 0)
-            };
-            let size = if inst.opcode == AArch64Opcode::LdrbRO {
-                encoding_mem::LoadStoreSize::Byte
-            } else {
-                encoding_mem::LoadStoreSize::Half
-            };
-            Ok(encoding_mem::encode_ldr_str_register(
-                size,
-                false,
-                encoding_mem::LoadStoreOp::Load,
-                rm as u8,
-                match option {
-                    0b010 => encoding_mem::RegExtend::Uxtw,
-                    0b110 => encoding_mem::RegExtend::Sxtw,
-                    0b111 => encoding_mem::RegExtend::Sxtx,
-                    _ => encoding_mem::RegExtend::Lsl,
-                },
-                s != 0,
-                rn as u8,
-                rt as u8,
-            )?)
-        }
+        AArch64Opcode::LdrbRO | AArch64Opcode::LdrhRO => encode_register_offset(inst, true),
 
         // STRB/STRH Wt, [Xn, Xm{, extend {#amount}}] — narrow register-offset
         // STORE, the exact mirror of the `LdrbRO`/`LdrhRO` arm above with
@@ -4213,96 +5285,15 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // V=0 (integer). The packed extend 4th operand is `(option << 1) | S`,
         // identical to `StrRO`; for byte accesses `S` is a no-op (log2(1)=0),
         // for halfword `S=1` shifts the index by 1.
-        AArch64Opcode::StrbRO | AArch64Opcode::StrhRO => {
-            let rt = preg_hw(inst, 0)?;
-            let rn = preg_hw(inst, 1)?;
-            let rm = preg_hw(inst, 2)?;
-            let (option, s) = if inst.operands.len() > 3 {
-                let packed = imm_val(inst, 3) as u32;
-                ((packed >> 1) & 0b111, packed & 1)
-            } else {
-                (0b011, 0)
-            };
-            let size = if inst.opcode == AArch64Opcode::StrbRO {
-                encoding_mem::LoadStoreSize::Byte
-            } else {
-                encoding_mem::LoadStoreSize::Half
-            };
-            Ok(encoding_mem::encode_ldr_str_register(
-                size,
-                false,
-                encoding_mem::LoadStoreOp::Store,
-                rm as u8,
-                match option {
-                    0b010 => encoding_mem::RegExtend::Uxtw,
-                    0b110 => encoding_mem::RegExtend::Sxtw,
-                    0b111 => encoding_mem::RegExtend::Sxtx,
-                    _ => encoding_mem::RegExtend::Lsl,
-                },
-                s != 0,
-                rn as u8,
-                rt as u8,
-            )?)
-        }
+        AArch64Opcode::StrbRO | AArch64Opcode::StrhRO => encode_register_offset(inst, false),
 
         // STR Rt, [Rn, Rm{, extend {#amount}}] — register offset store
         // Same encoding format as LdrRO but with opc=00 (store)
         // Operands: [Rt, Rn, Rm] — default LSL, no shift (S=0)
-        AArch64Opcode::StrRO => {
-            let sf = sf_from_operand(inst, 0);
-            let rt = preg_hw(inst, 0)?;
-            let rn = preg_hw(inst, 1)?;
-            let rm = preg_hw(inst, 2)?;
-            let (option, s) = if inst.operands.len() > 3 {
-                let packed = imm_val(inst, 3) as u32;
-                ((packed >> 1) & 0b111, packed & 1)
-            } else {
-                (0b011, 0)
-            };
-            if is_fpr(inst, 0) {
-                // FP register-offset store: V=1, opc base 0b00. Same exact
-                // (size, opc) derivation as the load arm above and as the
-                // unsigned-offset FP path — see there for why `FpSize` must
-                // NOT be used to size a memory access.
-                let (size, _scale, opc) = fp_mem_fields_from_inst(inst, 0, 0b00)?;
-                Ok(encoding_mem::encode_ldr_str_register_fields(
-                    size,
-                    true,
-                    opc,
-                    rm as u8,
-                    match option {
-                        0b010 => encoding_mem::RegExtend::Uxtw,
-                        0b110 => encoding_mem::RegExtend::Sxtw,
-                        0b111 => encoding_mem::RegExtend::Sxtx,
-                        _ => encoding_mem::RegExtend::Lsl,
-                    },
-                    s != 0,
-                    rn as u8,
-                    rt as u8,
-                )?)
-            } else {
-                let size = if sf == 1 {
-                    encoding_mem::LoadStoreSize::Double
-                } else {
-                    encoding_mem::LoadStoreSize::Word
-                };
-                Ok(encoding_mem::encode_ldr_str_register(
-                    size,
-                    false,
-                    encoding_mem::LoadStoreOp::Store,
-                    rm as u8,
-                    match option {
-                        0b010 => encoding_mem::RegExtend::Uxtw,
-                        0b110 => encoding_mem::RegExtend::Sxtw,
-                        0b111 => encoding_mem::RegExtend::Sxtx,
-                        _ => encoding_mem::RegExtend::Lsl,
-                    },
-                    s != 0,
-                    rn as u8,
-                    rt as u8,
-                )?)
-            }
-        }
+        AArch64Opcode::StrRO => encode_register_offset(inst, false),
+    }
+
+    encode_got_tls_family {
 
         // =================================================================
         // GOT and TLV loads
@@ -4317,7 +5308,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             let offset = if inst.operands.len() > 2 {
-                imm_val(inst, 2)
+                imm_or_fixup_placeholder(inst, 2)?
             } else {
                 0
             };
@@ -4327,7 +5318,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             Ok(encoding::encode_load_store_ui(
                 0b11, 0, 0b01, scaled, rn, rd,
             ))
-        }
+        },
 
         // LdrTlvp — LDR Xd, [Xn, #offset] from TLV descriptor
         // Same encoding as LdrGot: standard 64-bit unsigned-offset load.
@@ -4337,7 +5328,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             let offset = if inst.operands.len() > 2 {
-                imm_val(inst, 2)
+                imm_or_fixup_placeholder(inst, 2)?
             } else {
                 0
             };
@@ -4347,7 +5338,7 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
             Ok(encoding::encode_load_store_ui(
                 0b11, 0, 0b01, scaled, rn, rd,
             ))
-        }
+        },
 
         // LdrGottprel — ELF initial-exec GOT-TPREL load. It always carries a
         // Symbol operand and is only encodable through the module emitter's
@@ -4360,6 +5351,19 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // resolved-immediate JIT form exists.
         AArch64Opcode::LdrGottprel => Err(EncodeError::UnsupportedOpcode(inst.opcode)),
 
+        // ELF TLSDESC slots always carry a Symbol and are encodable only
+        // through the module emitter's fixup interception, which also checks
+        // the fixed four-slot shape the static linker relaxes. An unexpanded
+        // `TlsDescCall` means frame lowering was bypassed. Fail closed here
+        // (general-dynamic TLS is not JIT-compatible either).
+        AArch64Opcode::TlsDescCall
+        | AArch64Opcode::LdrTlsdesc
+        | AArch64Opcode::AddTlsdescLo12
+        | AArch64Opcode::BlrTlsdesc => Err(EncodeError::UnsupportedOpcode(inst.opcode)),
+    }
+
+    encode_logical_immediate_family {
+
         // =================================================================
         // Logical immediate (ARM ARM C4.1.4 — Logical (immediate))
         // sf | opc(2) | 100100 | N | immr(6) | imms(6) | Rn(5) | Rd(5)
@@ -4371,6 +5375,9 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         AArch64Opcode::OrrRI => encode_logical_immediate(inst, 0b01),
 
         AArch64Opcode::EorRI => encode_logical_immediate(inst, 0b10),
+    }
+
+    encode_bit_clear_family {
 
         // =================================================================
         // BIC — Bitwise AND-NOT (bit clear)
@@ -4388,7 +5395,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 preg_hw(inst, 1)?,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
+    }
+
+    encode_conditional_select_family {
 
         // =================================================================
         // Conditional select variants (ARM ARM C6.2)
@@ -4398,11 +5408,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
         // ARM ARM: sf | 0 | 0 | 11010100 | Rm | cond | 0 | 1 | Rn | Rd
         // Operands: [Rd, Rn, Rm, Imm(cond)]
         AArch64Opcode::Csinc => {
-            let sf = sf_from_operand(inst, 0);
+            let (sf, cond) = conditional_select_fields(inst, false)?;
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             let rm = preg_hw(inst, 2)?;
-            let cond = imm_val(inst, 3) as u32 & 0xF;
             Ok((sf << 31)
                 | (0b11010100 << 21)
                 | (rm << 16)
@@ -4410,17 +5419,16 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b01 << 10) // op2 = 01 (CSINC)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // CSINV Xd, Xn, Xm, cond — conditional select invert
         // ARM ARM: sf | 1 | 0 | 11010100 | Rm | cond | 0 | 0 | Rn | Rd
         // Operands: [Rd, Rn, Rm, Imm(cond)]
         AArch64Opcode::Csinv => {
-            let sf = sf_from_operand(inst, 0);
+            let (sf, cond) = conditional_select_fields(inst, false)?;
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             let rm = preg_hw(inst, 2)?;
-            let cond = imm_val(inst, 3) as u32 & 0xF;
             Ok(((sf << 31)
                 | (0b10 << 29) // op = 1, S = 0
                 | (0b11010100 << 21)
@@ -4428,17 +5436,16 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (cond << 12)) // op2 = 00 (CSINV)
                 | (rn << 5)
                 | rd)
-        }
+        },
 
         // CSNEG Xd, Xn, Xm, cond — conditional select negate
         // ARM ARM: sf | 1 | 0 | 11010100 | Rm | cond | 0 | 1 | Rn | Rd
         // Operands: [Rd, Rn, Rm, Imm(cond)]
         AArch64Opcode::Csneg => {
-            let sf = sf_from_operand(inst, 0);
+            let (sf, cond) = conditional_select_fields(inst, false)?;
             let rd = preg_hw(inst, 0)?;
             let rn = preg_hw(inst, 1)?;
             let rm = preg_hw(inst, 2)?;
-            let cond = imm_val(inst, 3) as u32 & 0xF;
             Ok((sf << 31)
                 | (0b10 << 29) // op = 1, S = 0
                 | (0b11010100 << 21)
@@ -4447,7 +5454,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 | (0b01 << 10) // op2 = 01 (CSNEG)
                 | (rn << 5)
                 | rd)
-        }
+        },
+    }
+
+    encode_move_not_family {
 
         // =================================================================
         // MOVN — Move Wide with NOT
@@ -4486,7 +5496,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 imm16,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
+    }
+
+    encode_fp_immediate_family {
 
         // =================================================================
         // FMOV immediate — move FP immediate to FPR
@@ -4535,7 +5548,10 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 ((0b00011110u32 << 24) | (ftype << 22) | (1 << 21) | (imm8 << 13) | (0b100 << 10))
                     | rd,
             )
-        }
+        },
+    }
+
+    encode_typed_alias_family {
 
         // =================================================================
         // LLVM-style typed aliases — delegate to generic encoders
@@ -4552,98 +5568,43 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 AArch64Opcode::MOVXrr => 1,
                 _ => unreachable!(),
             };
-            let is_sp_source = matches!(
-                inst.operands.get(1),
-                Some(MachOperand::Special(SpecialReg::SP))
-            );
-            if is_sp_source {
-                Ok(encoding::encode_add_sub_imm(
-                    sf,
-                    0,
-                    0,
-                    0,
-                    0,
-                    31,
-                    preg_hw(inst, 0)?,
-                ))
-            } else {
-                Ok(encoding::encode_logical_shifted_reg(
-                    sf,
-                    0b01,
-                    0,
-                    0,
-                    preg_hw(inst, 1)?,
-                    0,
-                    31,
-                    preg_hw(inst, 0)?,
-                ))
-            }
-        }
+            encode_gpr_register_move(inst, sf)
+        },
 
         // STR typed aliases — delegate to StrRI encoding
         AArch64Opcode::STRWui => {
             let rt = preg_hw(inst, 0)?;
             let (rn, offset) = extract_base_offset(inst, 1, 2)?;
             encode_load_store_auto(0b10, 0, 0b00, 4, offset, rn, rt)
-        }
+        },
 
         AArch64Opcode::STRXui => {
             let rt = preg_hw(inst, 0)?;
             let (rn, offset) = extract_base_offset(inst, 1, 2)?;
             encode_load_store_auto(0b11, 0, 0b00, 8, offset, rn, rt)
-        }
+        },
 
         AArch64Opcode::STRSui => {
             let rt = preg_hw(inst, 0)?;
             let (rn, offset) = extract_base_offset(inst, 1, 2)?;
             encode_load_store_auto(0b10, 1, 0b00, 4, offset, rn, rt)
-        }
+        },
 
         AArch64Opcode::STRDui => {
             let rt = preg_hw(inst, 0)?;
             let (rn, offset) = extract_base_offset(inst, 1, 2)?;
             encode_load_store_auto(0b11, 1, 0b00, 8, offset, rn, rt)
-        }
+        },
 
         // BL (LLVM alias) → Bl encoding — imm26 signed word offset,
         // range-checked before mask.
         AArch64Opcode::BL => {
             let offset = branch_offset_signed(inst, 0, 26)?;
             Ok(encoding::encode_uncond_branch(1, offset))
-        }
+        },
 
         // BLR (LLVM alias) → Blr encoding
         AArch64Opcode::BLR => Ok(encoding::encode_branch_reg(0b0001, preg_hw(inst, 0)?)),
-
-        // CMP register aliases
-        AArch64Opcode::CMPWrr | AArch64Opcode::CMPXrr => {
-            let sf = sf_from_operand(inst, 0);
-            Ok(encoding::encode_add_sub_shifted_reg(
-                sf,
-                1,
-                1,
-                0,
-                preg_hw(inst, 1)?,
-                0,
-                preg_hw(inst, 0)?,
-                31,
-            ))
-        }
-
-        // CMP immediate aliases
-        AArch64Opcode::CMPWri | AArch64Opcode::CMPXri => {
-            let sf = sf_from_operand(inst, 0);
-            let imm = imm12_operand(inst, 1)?;
-            Ok(encoding::encode_add_sub_imm(
-                sf,
-                1,
-                1,
-                0,
-                imm,
-                preg_hw(inst, 0)?,
-                31,
-            ))
-        }
 
         // MOVZ typed aliases — imm16 rejected before mask (the canonical
         // MovI/Movz arm rejects via MovImmTooWide; these aliases bypassed it).
@@ -4665,19 +5626,19 @@ pub fn encode_instruction(inst: &MachInst) -> Result<u32, EncodeError> {
                 imm16,
                 preg_hw(inst, 0)?,
             ))
-        }
+        },
 
         // Bcc (LLVM alias) → BCond encoding — imm19 signed word offset,
         // range-checked before mask.
         AArch64Opcode::Bcc => {
-            let cond = imm_val(inst, 0) as u32 & 0xF;
+            let cond = imm_val(inst, 0)? as u32 & 0xF;
             let offset = if inst.operands.len() > 1 {
                 branch_offset_signed(inst, 1, 19)?
             } else {
                 0
             };
             Ok(encoding::encode_cond_branch(offset, cond))
-        }
+        },
     }
 }
 
@@ -4747,7 +5708,7 @@ fn encode_lse_atomic(
     // class alone cannot distinguish byte/half/word. Without it, derive the size
     // from Rt's register width (W -> word, X -> dword) as before.
     let size = if inst.operands.len() > 3 {
-        match imm_val(inst, 3) {
+        match imm_val(inst, 3)? {
             0 => 0b00, // byte
             1 => 0b01, // half
             other => {
@@ -4789,7 +5750,7 @@ fn encode_cas(inst: &MachInst, a: u32, r: u32) -> Result<u32, EncodeError> {
     // A 4th operand is an explicit access-size immediate for narrow (byte/half)
     // CAS (0=byte, 1=half); otherwise derive from Rs's register width.
     let size = if inst.operands.len() > 3 {
-        match imm_val(inst, 3) {
+        match imm_val(inst, 3)? {
             0 => 0b00, // byte
             1 => 0b01, // half
             other => {
@@ -4931,14 +5892,6 @@ fn fp_size_from_cmp_inst(inst: &MachInst) -> FpSize {
     }
 }
 
-/// FP size derived from a specific source operand index.
-fn fp_size_from_source(inst: &MachInst, idx: usize) -> FpSize {
-    match inst.operands.get(idx) {
-        Some(MachOperand::PReg(p)) => fp_size_from_preg_class(preg_class(*p)),
-        _ => FpSize::Double,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // NEON helpers
 // ---------------------------------------------------------------------------
@@ -4949,13 +5902,12 @@ fn fp_size_from_source(inst: &MachInst, idx: usize) -> FpSize {
 /// the vector arrangement as a small integer:
 ///   0 = 8B, 1 = 16B, 2 = 4H, 3 = 8H, 4 = 2S, 5 = 4S, 6 = 2D
 ///
-/// For instructions with only register operands (logic/NOT), the arrangement
-/// is inferred from the register class (V registers = Q=1, default 128-bit).
-fn neon_arrangement(inst: &MachInst) -> encoding_neon::VectorArrangement {
-    // Check last operand for arrangement encoding
+/// Logic/NOT instructions instead use `neon_q_bit`, which can infer width from
+/// their register class. This explicit arrangement selector has no default.
+fn neon_arrangement(inst: &MachInst) -> Result<encoding_neon::VectorArrangement, EncodeError> {
     let arr_idx = inst.operands.len().saturating_sub(1);
-    let arr_val = imm_val(inst, arr_idx) as u32;
-    match arr_val {
+    let value = imm_operand(inst, arr_idx)?;
+    Ok(match value {
         0 => encoding_neon::VectorArrangement::B8,
         1 => encoding_neon::VectorArrangement::B16,
         2 => encoding_neon::VectorArrangement::H4,
@@ -4963,37 +5915,80 @@ fn neon_arrangement(inst: &MachInst) -> encoding_neon::VectorArrangement {
         4 => encoding_neon::VectorArrangement::S2,
         5 => encoding_neon::VectorArrangement::S4,
         6 => encoding_neon::VectorArrangement::D2,
-        _ => encoding_neon::VectorArrangement::S4, // default: 4S
-    }
+        _ => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: arr_idx,
+                desc: format!("vector arrangement {value} must be in 0..=6"),
+            });
+        }
+    })
 }
 
 /// FP arrangement for NEON FP instructions.
 ///
 /// Convention: last Imm operand encodes arrangement:
 ///   0 = 2S, 1 = 4S, 2 = 2D
-fn neon_fp_arrangement(inst: &MachInst) -> encoding_neon::FpVectorArrangement {
+fn neon_fp_arrangement(inst: &MachInst) -> Result<encoding_neon::FpVectorArrangement, EncodeError> {
     let arr_idx = inst.operands.len().saturating_sub(1);
-    let arr_val = imm_val(inst, arr_idx) as u32;
-    match arr_val {
+    let arr_val = imm_operand(inst, arr_idx)?;
+    Ok(match arr_val {
         0 => encoding_neon::FpVectorArrangement::S2,
         1 => encoding_neon::FpVectorArrangement::S4,
         2 => encoding_neon::FpVectorArrangement::D2,
-        _ => encoding_neon::FpVectorArrangement::S4, // default: 4S
+        _ => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: arr_idx,
+                desc: format!("FP vector arrangement {arr_val} must be in 0..=2"),
+            });
+        }
+    })
+}
+
+/// Width for vector operations whose immediates are data, not arrangements.
+fn neon_destination_q_bit(inst: &MachInst) -> Result<u32, EncodeError> {
+    match inst.operands.first() {
+        Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Fpr64 => Ok(0),
+        Some(MachOperand::PReg(p)) if preg_class(*p) == RegClass::Fpr128 => Ok(1),
+        Some(other) => Err(EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: 0,
+            desc: format!("expected 64/128-bit vector destination, got {other:?}"),
+        }),
+        None => Err(EncodeError::MissingOperand {
+            opcode: inst.opcode,
+            index: 0,
+            expected: 1,
+        }),
     }
 }
 
 /// Extract the Q bit for NEON logic/move instructions.
 ///
-/// For logic instructions that don't carry arrangement in their operands,
-/// infer from the register class: V registers (Fpr128) = Q=1 (128-bit).
-fn neon_q_bit(inst: &MachInst) -> u32 {
-    // Check if last operand is an Imm encoding Q directly
+/// A trailing `Imm` is the integer arrangement selector every NEON
+/// instruction uses (0 = 8B, 1 = 16B, 2 = 4H, 3 = 8H, 4 = 2S, 5 = 4S,
+/// 6 = 2D); a bitwise operation reads only its width, so 8B/4H/2S are the
+/// 64-bit form (Q=0) and the rest the 128-bit form. Any other value is
+/// refused: reading it as 16B would write the upper half of a 64-bit vector
+/// (L10-P6, found by ENC-5's FP/SIMD slice). For logic instructions that
+/// don't carry an arrangement, infer from the register class: V registers
+/// (Fpr128) = Q=1 (128-bit).
+fn neon_q_bit(inst: &MachInst) -> Result<u32, EncodeError> {
+    // Check if last operand is an Imm encoding the arrangement
     let last_idx = inst.operands.len().saturating_sub(1);
-    match inst.operands.get(last_idx) {
-        Some(MachOperand::Imm(v)) => {
-            // For logic: 0 = 8B(Q=0), 1 = 16B(Q=1)
-            if *v == 0 { 0 } else { 1 }
-        }
+    Ok(match inst.operands.get(last_idx) {
+        Some(MachOperand::Imm(v)) => match *v {
+            0 | 2 | 4 => 0,
+            1 | 3 | 5 | 6 => 1,
+            other => {
+                return Err(EncodeError::InvalidOperand {
+                    opcode: inst.opcode,
+                    index: last_idx,
+                    desc: format!("vector arrangement {other} must be in 0..=6"),
+                });
+            }
+        },
         _ => {
             // Infer from register class: V registers are 128-bit (Q=1)
             match inst.operands.first() {
@@ -5007,21 +6002,30 @@ fn neon_q_bit(inst: &MachInst) -> u32 {
                 _ => 1, // default to Q=1 (128-bit)
             }
         }
-    }
+    })
 }
 
 /// Extract element size from an Imm operand at `idx`.
 ///
 /// Convention: 1=B, 2=H, 4=S, 8=D
-fn neon_element_size(inst: &MachInst, idx: usize) -> encoding_neon::ElementSize {
-    let val = imm_val(inst, idx) as u32;
-    match val {
+fn neon_element_size(
+    inst: &MachInst,
+    idx: usize,
+) -> Result<encoding_neon::ElementSize, EncodeError> {
+    let val = imm_operand(inst, idx)?;
+    Ok(match val {
         1 => encoding_neon::ElementSize::B,
         2 => encoding_neon::ElementSize::H,
         4 => encoding_neon::ElementSize::S,
         8 => encoding_neon::ElementSize::D,
-        _ => encoding_neon::ElementSize::S, // default: 32-bit
-    }
+        _ => {
+            return Err(EncodeError::InvalidOperand {
+                opcode: inst.opcode,
+                index: idx,
+                desc: format!("element size {val} must be one of 1, 2, 4, or 8 bytes"),
+            });
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5042,6 +6046,282 @@ mod tests {
     /// Helper to build a MachInst with given opcode and operands.
     fn mk(opcode: AArch64Opcode, ops: Vec<MachOperand>) -> MachInst {
         MachInst::new(opcode, ops)
+    }
+
+    /// L04-P11 fifth review: an immediate field never reads a register, a
+    /// float or a symbol as 0. `LSL X0, X1, X2` used to encode `MOV X0, X1`;
+    /// every immediate-shift form now needs its amount, and every other
+    /// immediate field refuses a non-immediate operand (an absent optional
+    /// field still defaults to 0; ADR/ADRP and the GOT/TLV loads still take a
+    /// relocation target as a placeholder).
+    #[test]
+    fn immediate_fields_refuse_non_immediate_operands() {
+        use AArch64Opcode::{AsrRI, LslRI, LsrRI};
+        for opcode in [LslRI, LsrRI, AsrRI] {
+            assert!(encode_instruction(&mk(opcode, vec![preg(X0), preg(X1), imm(3)])).is_ok());
+            for operands in [
+                vec![preg(X0), preg(X1), preg(X2)],
+                vec![preg(X0), preg(X1), xzr()],
+                vec![preg(X0), preg(X1), MachOperand::Symbol("s".into())],
+                vec![preg(X0), preg(X1)],
+            ] {
+                let inst = mk(opcode, operands);
+                assert!(
+                    encode_instruction(&inst).is_err(),
+                    "{inst:?} must not encode"
+                );
+            }
+        }
+        for inst in [
+            mk(AArch64Opcode::Dmb, vec![preg(X0)]),
+            mk(AArch64Opcode::Mrs, vec![preg(X0), preg(X1)]),
+            mk(AArch64Opcode::BCond, vec![preg(X0), imm(0)]),
+            mk(
+                AArch64Opcode::Bfm,
+                vec![preg(X0), preg(X1), preg(X2), imm(3)],
+            ),
+            mk(AArch64Opcode::Tbz, vec![preg(X0), preg(X1), imm(0)]),
+            mk(AArch64Opcode::Adrp, vec![preg(X0), preg(X1)]),
+        ] {
+            assert!(
+                matches!(
+                    encode_instruction(&inst),
+                    Err(EncodeError::InvalidOperand { .. })
+                ),
+                "{inst:?} must refuse its non-immediate operand"
+            );
+        }
+        // Absent optional fields and relocation placeholders still encode.
+        assert!(encode_instruction(&mk(AArch64Opcode::Dmb, vec![])).is_ok());
+        assert!(
+            encode_instruction(&mk(
+                AArch64Opcode::Adrp,
+                vec![preg(X0), MachOperand::Symbol("s".into())]
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn vector_duplication_and_movi_width_comes_from_the_destination() {
+        use AArch64Opcode::{NeonDupElem, NeonDupGen, NeonMovi};
+        for (destination, q) in [(D0, 0), (V0, 1)] {
+            for byte_size in [1, 2, 4] {
+                for instruction in [
+                    mk(
+                        NeonDupElem,
+                        vec![preg(destination), preg(V1), imm(0), imm(byte_size)],
+                    ),
+                    mk(
+                        NeonDupGen,
+                        vec![preg(destination), preg(W1), imm(byte_size)],
+                    ),
+                    mk(NeonMovi, vec![preg(destination), imm(byte_size)]),
+                ] {
+                    let word = encode_instruction(&instruction).unwrap();
+                    assert_eq!((word >> 30) & 1, q, "{instruction:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_duplication_and_movi_reject_nonvector_destinations() {
+        use AArch64Opcode::{NeonDupElem, NeonDupGen, NeonMovi};
+        for destination in [W0, X0, H0, S0] {
+            for instruction in [
+                mk(
+                    NeonDupElem,
+                    vec![preg(destination), preg(V1), imm(0), imm(1)],
+                ),
+                mk(NeonDupGen, vec![preg(destination), preg(W1), imm(1)]),
+                mk(NeonMovi, vec![preg(destination), imm(1)]),
+            ] {
+                assert!(encode_instruction(&instruction).is_err(), "{instruction:?}");
+            }
+        }
+    }
+
+    fn vector_shift(opcode: AArch64Opcode, shift: i64, arrangement: i64) -> MachInst {
+        mk(
+            opcode,
+            vec![
+                MachOperand::PReg(V0),
+                MachOperand::PReg(V1),
+                MachOperand::Imm(shift),
+                MachOperand::Imm(arrangement),
+            ],
+        )
+    }
+
+    #[test]
+    fn vector_shift_rejects_truncated_and_missing_immediates() {
+        for opcode in [
+            AArch64Opcode::NeonShlVImm,
+            AArch64Opcode::NeonUshrVImm,
+            AArch64Opcode::NeonSshrVImm,
+        ] {
+            for shift in [-1, i64::MIN, 1_i64 << 32, (1_i64 << 32) + 1, i64::MAX] {
+                assert!(
+                    encode_instruction(&vector_shift(opcode, shift, 5)).is_err(),
+                    "{opcode:?} must reject shift {shift}"
+                );
+            }
+            let mut malformed = vector_shift(opcode, 1, 5);
+            malformed.operands[2] = MachOperand::PReg(V2);
+            assert!(encode_instruction(&malformed).is_err());
+            malformed.operands.truncate(2);
+            assert!(encode_instruction(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn vector_shift_requires_an_explicit_valid_arrangement() {
+        for arrangement in [-1, 7, 1_i64 << 32, (1_i64 << 32) + 5, i64::MAX] {
+            assert!(
+                encode_instruction(&vector_shift(AArch64Opcode::NeonShlVImm, 1, arrangement))
+                    .is_err(),
+                "arrangement {arrangement} must not select a default or truncated width"
+            );
+        }
+        let mut malformed = vector_shift(AArch64Opcode::NeonShlVImm, 1, 5);
+        malformed.operands.pop();
+        assert!(encode_instruction(&malformed).is_err());
+        malformed.operands.push(MachOperand::PReg(V2));
+        assert!(encode_instruction(&malformed).is_err());
+        malformed.operands.push(MachOperand::Imm(5));
+        assert!(encode_instruction(&malformed).is_err());
+    }
+
+    #[test]
+    fn vector_shift_preserves_every_valid_width_and_count() {
+        for (arrangement, q, lane_bits) in [
+            (0, 0, 8),
+            (1, 1, 8),
+            (2, 0, 16),
+            (3, 1, 16),
+            (4, 0, 32),
+            (5, 1, 32),
+            (6, 1, 64),
+        ] {
+            for opcode in [
+                AArch64Opcode::NeonShlVImm,
+                AArch64Opcode::NeonUshrVImm,
+                AArch64Opcode::NeonSshrVImm,
+            ] {
+                let left = opcode == AArch64Opcode::NeonShlVImm;
+                for shift in 0..=lane_bits + 1 {
+                    let result = encode_instruction(&vector_shift(opcode, shift, arrangement));
+                    let valid = if left {
+                        shift < lane_bits
+                    } else {
+                        (1..=lane_bits).contains(&shift)
+                    };
+                    if !valid {
+                        assert!(
+                            result.is_err(),
+                            "{opcode:?}: {lane_bits}-bit lanes, shift {shift}"
+                        );
+                        continue;
+                    }
+                    let word = result.unwrap();
+                    // Decode fields directly, without the arrangement or shift
+                    // helpers used to construct the instruction.
+                    assert_eq!((word >> 30) & 1, q);
+                    assert_eq!(
+                        (word >> 29) & 1,
+                        u32::from(opcode == AArch64Opcode::NeonUshrVImm)
+                    );
+                    assert_eq!((word >> 11) & 31, if left { 10 } else { 0 });
+                    assert_eq!(
+                        (word >> 16) & 127,
+                        (if left {
+                            lane_bits + shift
+                        } else {
+                            2 * lane_bits - shift
+                        }) as u32
+                    );
+                    assert_eq!(word & 31, 0);
+                    assert_eq!((word >> 5) & 31, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neon_immediate_controls_are_not_truncated_or_defaulted() {
+        use AArch64Opcode::*;
+        let cases = [
+            (
+                mk(NeonAddV, vec![preg(V0), preg(V1), preg(V2), imm(5)]),
+                3,
+                7,
+            ),
+            (
+                mk(NeonFaddV, vec![preg(V0), preg(V1), preg(V2), imm(1)]),
+                3,
+                3,
+            ),
+            (
+                mk(
+                    NeonFmlaLaneV,
+                    vec![preg(V0), preg(V1), preg(V2), imm(0), imm(1)],
+                ),
+                3,
+                256,
+            ),
+            (mk(NeonDupScalarD, vec![preg(D0), preg(V1), imm(0)]), 2, 256),
+            (
+                mk(NeonDupElem, vec![preg(V0), preg(V1), imm(0), imm(4)]),
+                2,
+                256,
+            ),
+            (
+                mk(NeonInsGen, vec![preg(V0), preg(W1), imm(0), imm(4)]),
+                2,
+                256,
+            ),
+            (
+                mk(NeonUmovGen, vec![preg(W0), preg(V1), imm(0), imm(4)]),
+                2,
+                256,
+            ),
+            (mk(NeonDupGen, vec![preg(V0), preg(W1), imm(4)]), 2, 3),
+            (mk(NeonMovi, vec![preg(V0), imm(17)]), 1, 256),
+        ];
+        for (valid, index, outside_domain) in cases {
+            assert!(
+                encode_instruction(&valid).is_ok(),
+                "valid control {:?}",
+                valid.opcode
+            );
+            for value in [
+                -1,
+                outside_domain,
+                (1_i64 << 32) + imm_val(&valid, index).unwrap(),
+            ] {
+                let mut malformed = valid.clone();
+                malformed.operands[index] = imm(value);
+                assert!(
+                    encode_instruction(&malformed).is_err(),
+                    "{:?} must reject operand {index} = {value}",
+                    valid.opcode
+                );
+            }
+            let mut malformed = valid.clone();
+            malformed.operands[index] = preg(V2);
+            assert!(
+                encode_instruction(&malformed).is_err(),
+                "{:?} must require an immediate",
+                valid.opcode
+            );
+            malformed.operands.truncate(index);
+            assert!(
+                encode_instruction(&malformed).is_err(),
+                "{:?} must not default a missing operand",
+                valid.opcode
+            );
+        }
     }
 
     /// PIN: the FP arrangement selector values the AArch64 ISel emits decode to
@@ -5075,7 +6355,7 @@ mod tests {
                 vec![preg(V0), preg(V1), preg(V2), imm(sel)],
             );
             assert_eq!(
-                neon_fp_arrangement(&inst),
+                neon_fp_arrangement(&inst).unwrap(),
                 want,
                 "FP arrangement selector {sel} must decode to {want:?}"
             );
@@ -5090,21 +6370,22 @@ mod tests {
             AArch64Opcode::NeonFaddV,
             vec![preg(V0), preg(V1), preg(V2), imm(2)],
         );
-        assert_eq!(neon_fp_arrangement(&four_s), FpVectorArrangement::S4);
-        assert_eq!(neon_fp_arrangement(&two_d), FpVectorArrangement::D2);
+        assert_eq!(
+            neon_fp_arrangement(&four_s).unwrap(),
+            FpVectorArrangement::S4
+        );
+        assert_eq!(
+            neon_fp_arrangement(&two_d).unwrap(),
+            FpVectorArrangement::D2
+        );
         // And the integer codes are NOT a valid spelling of those widths here:
-        // 5 and 6 mean `4S`/`2D` to `neon_arrangement`, but fall through this
-        // decoder's default. Passing one to an FP opcode is a silent
-        // width error, which is exactly why they must never be reused.
+        // 5 and 6 mean `4S`/`2D` to `neon_arrangement`, but are invalid FP
+        // selectors. Reject them instead of selecting a different width.
         let int_2d = mk(
             AArch64Opcode::NeonFaddV,
             vec![preg(V0), preg(V1), preg(V2), imm(6)],
         );
-        assert_ne!(
-            neon_fp_arrangement(&int_2d),
-            FpVectorArrangement::D2,
-            "the integer arrangement code for 2D must not accidentally work here"
-        );
+        assert!(neon_fp_arrangement(&int_2d).is_err());
     }
 
     fn preg(r: PReg) -> MachOperand {
@@ -5415,7 +6696,7 @@ mod tests {
         }
     }
 
-    /// `FcselRR` FAILS CLOSED (the bank check the GPR Csel lacks) on any operand
+    /// `FcselRR` FAILS CLOSED on any operand
     /// that is not a matching scalar FPR: a GPR in any reg slot, an f16 (half)
     /// operand (that form is not modeled), a Q (128-bit) operand, and a width
     /// mismatch between the three registers.
@@ -6456,6 +7737,108 @@ mod tests {
         assert_eq!(enc, direct);
     }
 
+    /// FMOV (general) exists only between W and S, X and D, or either and H.
+    /// The W<->D and X<->S rows are unallocated, and operands in the wrong
+    /// banks used to be defaulted into a move of the other direction; every
+    /// such pair must be refused rather than encoded.
+    #[test]
+    fn test_fmov_general_refuses_cross_class_width_and_bank_mismatches() {
+        use AArch64Opcode::{FmovFprGpr, FmovGprFpr};
+        for inst in [
+            mk(FmovFprGpr, vec![preg(W0), preg(D1)]),
+            mk(FmovFprGpr, vec![preg(X0), preg(S1)]),
+            mk(FmovGprFpr, vec![preg(D0), preg(W1)]),
+            mk(FmovGprFpr, vec![preg(S0), preg(X1)]),
+            mk(FmovGprFpr, vec![preg(W0), preg(S1)]),
+            mk(FmovFprGpr, vec![preg(S0), preg(W1)]),
+            mk(FmovFprGpr, vec![preg(SP), preg(D1)]),
+            mk(
+                FmovGprFpr,
+                vec![preg(D0), MachOperand::Special(SpecialReg::SP)],
+            ),
+            mk(FmovFprGpr, vec![preg(X0), preg(V1)]),
+        ] {
+            assert!(
+                matches!(
+                    encode_instruction(&inst),
+                    Err(EncodeError::InvalidOperand { .. })
+                ),
+                "{inst:?} must be refused, got {:?}",
+                encode_instruction(&inst)
+            );
+        }
+        for inst in [
+            mk(FmovFprGpr, vec![preg(W0), preg(H1)]),
+            mk(FmovFprGpr, vec![preg(X0), preg(H1)]),
+            mk(FmovGprFpr, vec![preg(H0), preg(W1)]),
+            mk(FmovGprFpr, vec![preg(H0), preg(X1)]),
+            mk(FmovFprGpr, vec![preg(X0), preg(D1)]),
+            mk(
+                FmovGprFpr,
+                vec![preg(D0), MachOperand::Special(SpecialReg::XZR)],
+            ),
+        ] {
+            assert!(encode_instruction(&inst).is_ok(), "{inst:?}");
+        }
+    }
+
+    /// Register 31 is SP in ADD (immediate) and XZR in ORR: a move from or to
+    /// the stack pointer, however it is spelled, must be the ADD alias. The ORR
+    /// spelling used for a physical SP source read XZR (MOV X3, SP became
+    /// MOV X3, XZR) and for an SP destination discarded the value.
+    #[test]
+    fn test_gpr_move_to_or_from_sp_is_the_add_alias_for_every_spelling() {
+        use trust_cg_ir::regs::WSP;
+        let sp_special = MachOperand::Special(SpecialReg::SP);
+        for (inst, word) in [
+            (
+                mk(AArch64Opcode::MovR, vec![preg(X3), preg(SP)]),
+                0x9100_03E3,
+            ),
+            (
+                mk(AArch64Opcode::MovR, vec![preg(X3), sp_special.clone()]),
+                0x9100_03E3,
+            ),
+            (
+                mk(AArch64Opcode::MovR, vec![preg(SP), preg(X4)]),
+                0x9100_009F,
+            ),
+            (
+                mk(AArch64Opcode::MovR, vec![sp_special.clone(), preg(X4)]),
+                0x9100_009F,
+            ),
+            (
+                mk(AArch64Opcode::MovR, vec![preg(W3), preg(WSP)]),
+                0x1100_03E3,
+            ),
+            (
+                mk(AArch64Opcode::MOVXrr, vec![preg(X3), preg(SP)]),
+                0x9100_03E3,
+            ),
+            (
+                mk(AArch64Opcode::MovR, vec![preg(X3), preg(X4)]),
+                0xAA04_03E3,
+            ),
+        ] {
+            assert_eq!(encode_instruction(&inst).unwrap(), word, "{inst:?}");
+        }
+        for inst in [
+            mk(AArch64Opcode::MovR, vec![preg(SP), preg(XZR)]),
+            mk(
+                AArch64Opcode::MovR,
+                vec![MachOperand::Special(SpecialReg::XZR), sp_special],
+            ),
+        ] {
+            assert!(
+                matches!(
+                    encode_instruction(&inst),
+                    Err(EncodeError::InvalidOperand { .. })
+                ),
+                "{inst:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_fmov_gpr_fpr_uses_32_bit_sf_for_s_w() {
         // FMOV S0, W1
@@ -6753,6 +8136,127 @@ mod tests {
     }
 
     #[test]
+    fn gpr_immediate_memory_rejects_wrong_banks_and_ignored_operands() {
+        use AArch64Opcode as Op;
+        let opcodes = [
+            Op::LdrRI,
+            Op::StrRI,
+            Op::VolatileLdrRI,
+            Op::VolatileStrRI,
+            Op::LdrbRI,
+            Op::LdrhRI,
+            Op::LdrsbRI,
+            Op::LdrshRI,
+            Op::StrbRI,
+            Op::StrhRI,
+            Op::VolatileLdrbRI,
+            Op::VolatileLdrhRI,
+            Op::VolatileStrbRI,
+            Op::VolatileStrhRI,
+        ];
+        let mut admitted = Vec::new();
+        let mut attempted = 0;
+        for opcode in opcodes {
+            let mut malformed = Vec::new();
+            // SP transfer fields mean architectural ZR, not the stack pointer.
+            // System/unknown physical registers must not default to X0.
+            for transfer in [
+                preg(SP),
+                preg(WSP),
+                sp(),
+                preg(PReg::new(162)),
+                preg(PReg::new(u16::MAX)),
+            ] {
+                malformed.push(vec![transfer, preg(X1), imm(0)]);
+            }
+            for base in [
+                W0,
+                WSP,
+                XZR,
+                trust_cg_ir::regs::WZR,
+                D0,
+                V0,
+                PReg::new(162),
+                PReg::new(u16::MAX),
+            ] {
+                malformed.push(vec![preg(X0), preg(base), imm(0)]);
+                malformed.push(vec![preg(X0), MachOperand::MemOp { base, offset: 0 }]);
+            }
+            for base in [SpecialReg::XZR, SpecialReg::WZR] {
+                malformed.push(vec![preg(X0), MachOperand::Special(base), imm(0)]);
+            }
+            malformed.extend([
+                vec![preg(X0), preg(X1), imm(0), imm(8)],
+                vec![
+                    preg(X0),
+                    MachOperand::MemOp {
+                        base: X1,
+                        offset: 0,
+                    },
+                    imm(8),
+                ],
+                vec![
+                    preg(X0),
+                    MachOperand::MemOp {
+                        base: X1,
+                        offset: 0,
+                    },
+                    preg(X2),
+                ],
+            ]);
+            for operands in malformed {
+                attempted += 1;
+                let inst = mk(opcode, operands);
+                if let Ok(word) = encode_instruction(&inst) {
+                    admitted.push(format!("{inst:?} encoded {word:#010x}"));
+                }
+            }
+        }
+        assert_eq!(attempted, 14 * 26);
+        assert!(
+            admitted.is_empty(),
+            "{} of {attempted} malformed intents admitted:\n{}",
+            admitted.len(),
+            admitted.join("\n")
+        );
+    }
+
+    #[test]
+    fn gpr_narrow_immediate_memory_rejects_fp_transfer_banks() {
+        use AArch64Opcode as Op;
+        let opcodes = [
+            Op::LdrbRI,
+            Op::LdrhRI,
+            Op::LdrsbRI,
+            Op::LdrshRI,
+            Op::StrbRI,
+            Op::StrhRI,
+            Op::VolatileLdrbRI,
+            Op::VolatileLdrhRI,
+            Op::VolatileStrbRI,
+            Op::VolatileStrhRI,
+        ];
+        let mut admitted = Vec::new();
+        let mut attempted = 0;
+        for opcode in opcodes {
+            for register in [64, 96, 128, 165, 197] {
+                attempted += 1;
+                let inst = mk(opcode, vec![preg(PReg::new(register)), preg(X1), imm(0)]);
+                if let Ok(word) = encode_instruction(&inst) {
+                    admitted.push(format!("{inst:?} encoded {word:#010x}"));
+                }
+            }
+        }
+        assert_eq!(attempted, 50);
+        assert!(
+            admitted.is_empty(),
+            "{} of {attempted} non-GPR transfers admitted:\n{}",
+            admitted.len(),
+            admitted.join("\n")
+        );
+    }
+
+    #[test]
     fn test_ldr_ri_q_scalar() {
         let base = mk(AArch64Opcode::LdrRI, vec![preg(V0), preg(X1)]);
         assert_eq!(encode_instruction(&base).unwrap(), 0x3DC00020);
@@ -6807,6 +8311,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scalar_writeback_rejects_stack_pointer_data_and_operand_tails() {
+        let mut admitted = Vec::new();
+        let mut count = 0;
+        for opcode in [
+            AArch64Opcode::LdrPreIndex,
+            AArch64Opcode::StrPreIndex,
+            AArch64Opcode::LdrPostIndex,
+            AArch64Opcode::StrPostIndex,
+        ] {
+            let mut malformed = Vec::new();
+            for data in [preg(SP), preg(WSP), sp()] {
+                malformed.push(vec![data, preg(X1), imm(0)]);
+            }
+            for data in [preg(W0), preg(X0)] {
+                for tail in [
+                    imm(0),
+                    preg(X2),
+                    MachOperand::MemOp {
+                        base: X2,
+                        offset: 0,
+                    },
+                ] {
+                    malformed.push(vec![data.clone(), preg(X1), imm(0), tail]);
+                }
+            }
+            for operands in malformed {
+                count += 1;
+                let inst = mk(opcode, operands);
+                if let Ok(word) = encode_instruction(&inst) {
+                    admitted.push(format!("{inst:?} encoded as {word:#010x}"));
+                }
+            }
+        }
+        assert_eq!(count, 36);
+        assert!(
+            admitted.is_empty(),
+            "{} of {count} malformed writebacks admitted:\n{}",
+            admitted.len(),
+            admitted.join("\n")
+        );
+    }
+
+    #[test]
+    fn scalar_writeback_special_wzr_matches_physical_wzr_words() {
+        let mut failures = Vec::new();
+        let mut count = 0;
+        // Independent zero-offset bases, WZR transfer. Pre mode=11, post=01.
+        for (opcode, base_word) in [
+            (AArch64Opcode::LdrPreIndex, 0xb840_0c00_u32),
+            (AArch64Opcode::StrPreIndex, 0xb800_0c00),
+            (AArch64Opcode::LdrPostIndex, 0xb840_0400),
+            (AArch64Opcode::StrPostIndex, 0xb800_0400),
+        ] {
+            for base in [X1, SP] {
+                for offset in [-256, -1, 0, 255] {
+                    let expected = base_word
+                        | (((offset as u32) & 511) << 12)
+                        | (u32::from(base.hw_enc()) << 5)
+                        | 31;
+                    for data in [
+                        preg(trust_cg_ir::regs::WZR),
+                        MachOperand::Special(SpecialReg::WZR),
+                    ] {
+                        count += 1;
+                        let inst = mk(opcode, vec![data, preg(base), imm(offset)]);
+                        match encode_instruction(&inst) {
+                            Ok(word) if word == expected => {}
+                            result => failures
+                                .push(format!("{inst:?}: {result:?}, expected {expected:#010x}")),
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 64);
+        assert!(
+            failures.is_empty(),
+            "{} of {count} valid zero-transfer writebacks failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     #[test]
@@ -7455,6 +9043,52 @@ mod tests {
         assert_eq!(enc, direct);
     }
 
+    /// The FP->int conversion encodes from exactly two register operands, and a
+    /// THIRD operand is refused by index — agreeing with the FP register or
+    /// not.
+    ///
+    /// History, kept because it explains the rule. On 2026-09-14 the selector
+    /// (`select_fcvt_to_int`/`select_fcvt_to_uint`) still appended an `Imm`
+    /// source-width hint, so the exact two-operand arity made every FP->int
+    /// result unencodable — on `library/core` the single `[TCG-REGALLOC-063]`
+    /// ENCODING root, `core::num::imp::traits::pow2_to_pow10`, an ordinary
+    /// `f64 as i64`. The selector no longer emits the hint (it builds
+    /// `[dst, src]`), which closes that root; the hint is legacy, and accepting
+    /// it would let a stale selector or a hand-built lane ship a word whose
+    /// width fields nothing checked. `a64_fp_to_int_pipeline_operand_shape`
+    /// pins the same refusal through the whole-function encoder.
+    #[test]
+    fn fcvt_to_int_refuses_a_legacy_width_hint_operand() {
+        for (opcode, op) in [
+            (AArch64Opcode::FcvtzsRR, FpConvOp::FcvtzsToInt),
+            (AArch64Opcode::FcvtzuRR, FpConvOp::FcvtzuToInt),
+        ] {
+            let bare = encode_instruction(&mk(opcode, vec![preg(X0), preg(V1)]))
+                .expect("the bare two-operand form must encode");
+            let direct = encoding_fp::encode_fp_int_conv(true, FpSize::Double, op, 1, 0).unwrap();
+            assert_eq!(bare, direct, "{opcode:?}");
+            // V1 is a D (64-bit) register: 64 agrees with it, 32 does not.
+            for hint in [64, 32] {
+                let hinted = mk(opcode, vec![preg(X0), preg(V1), MachOperand::Imm(hint)]);
+                let err = encode_instruction(&hinted)
+                    .expect_err("a third conversion operand has no encoding");
+                assert!(
+                    matches!(err, EncodeError::InvalidOperand { index: 2, .. }),
+                    "{opcode:?} hint {hint}: the refusal must name operand index 2: {err:?}"
+                );
+            }
+        }
+        // The int->FP direction keeps the exact arity too.
+        assert!(
+            encode_instruction(&mk(
+                AArch64Opcode::ScvtfRR,
+                vec![preg(V0), preg(X1), MachOperand::Imm(64)],
+            ))
+            .is_err(),
+            "SCVTF/UCVTF must keep the exact two-operand arity"
+        );
+    }
+
     #[test]
     fn test_scvtf() {
         // SCVTF D0, X1
@@ -7629,6 +9263,8 @@ mod tests {
             // i128 multi-register arithmetic
             (AArch64Opcode::Adc, vec![preg(X0), preg(X1), preg(X2)]),
             (AArch64Opcode::Sbc, vec![preg(X0), preg(X1), preg(X2)]),
+            (AArch64Opcode::Adcs, vec![preg(X0), preg(X1), preg(X2)]),
+            (AArch64Opcode::Sbcs, vec![preg(X0), preg(X1), preg(X2)]),
             (AArch64Opcode::Umulh, vec![preg(X0), preg(X1), preg(X2)]),
             (AArch64Opcode::Smulh, vec![preg(X0), preg(X1), preg(X2)]),
             (
@@ -8420,6 +10056,251 @@ mod tests {
     // =========================================================================
     // Register-offset load/store tests (LdrRO, StrRO) — issue #137
     // =========================================================================
+
+    #[derive(Default)]
+    struct RegisterOffsetEncodeCensus {
+        count: usize,
+        failed: usize,
+        examples: Vec<String>,
+    }
+
+    impl RegisterOffsetEncodeCensus {
+        fn observe(&mut self, inst: MachInst, expected: Option<u32>) {
+            self.count += 1;
+            let actual = encode_instruction(&inst);
+            let correct = match (&actual, expected) {
+                (Ok(word), Some(want)) => *word == want,
+                (Err(_), None) => true,
+                _ => false,
+            };
+            if !correct {
+                self.failed += 1;
+                if self.examples.len() < 20 {
+                    self.examples
+                        .push(format!("{inst:?}: {actual:?}, expected {expected:?}"));
+                }
+            }
+        }
+
+        fn finish(self, expected_count: usize) {
+            assert_eq!(self.count, expected_count);
+            assert_eq!(
+                self.failed,
+                0,
+                "{} of {} register-offset controls failed:\n{}",
+                self.failed,
+                self.count,
+                self.examples.join("\n")
+            );
+        }
+    }
+
+    // Independent transfer identities and literal STR-register field bases;
+    // no production class, hardware-index, or low-level encoder accessor.
+    fn register_offset_test_data(raw: u16) -> Option<(u32, u32)> {
+        match raw {
+            0..=30 => Some((0xf820_0800, u32::from(raw))),
+            32..=62 => Some((0xb820_0800, u32::from(raw - 32))),
+            64..=95 => Some((0x3ca0_0800, u32::from(raw - 64))),
+            96..=127 => Some((0xfc20_0800, u32::from(raw - 96))),
+            128..=159 => Some((0xbc20_0800, u32::from(raw - 128))),
+            160 => Some((0xf820_0800, 31)),
+            161 => Some((0xb820_0800, 31)),
+            165..=196 => Some((0x7c20_0800, u32::from(raw - 165))),
+            _ => None,
+        }
+    }
+
+    fn register_offset_test_word(
+        base: u32,
+        load: bool,
+        rt: u32,
+        rn: u32,
+        rm: u32,
+        mode: i64,
+    ) -> u32 {
+        assert!(matches!(mode, 4 | 5 | 6 | 7 | 12 | 13 | 14 | 15));
+        base | (u32::from(load) << 22) | (rm << 16) | ((mode as u32) << 12) | (rn << 5) | rt
+    }
+
+    #[test]
+    fn register_offset_exact_mode_and_shape_census() {
+        let mut census = RegisterOffsetEncodeCensus::default();
+        for (opcode, load) in [(AArch64Opcode::LdrRO, true), (AArch64Opcode::StrRO, false)] {
+            for raw in [0, 32, 64, 96, 128, 165] {
+                let data = preg(PReg::new(raw));
+                let (base, rt) = register_offset_test_data(raw).unwrap();
+                for mode in (-16..=32).chain([
+                    i64::MIN,
+                    i64::MAX,
+                    1_i64 << 32,
+                    (1_i64 << 32) + 6,
+                    -((1_i64 << 32) - 6),
+                    65542,
+                    -65530,
+                ]) {
+                    let expected = matches!(mode, 4 | 5 | 6 | 7 | 12 | 13 | 14 | 15)
+                        .then(|| register_offset_test_word(base, load, rt, 1, 2, mode));
+                    census.observe(
+                        mk(opcode, vec![data.clone(), preg(X1), preg(X2), imm(mode)]),
+                        expected,
+                    );
+                }
+                let good = vec![data.clone(), preg(X1), preg(X2)];
+                census.observe(
+                    mk(opcode, good.clone()),
+                    Some(register_offset_test_word(base, load, rt, 1, 2, 6)),
+                );
+                for len in 0..3 {
+                    census.observe(mk(opcode, good[..len].to_vec()), None);
+                }
+                for mode in [
+                    preg(X3),
+                    MachOperand::FImm(0.0),
+                    MachOperand::Symbol("mode".into()),
+                    MachOperand::Special(SpecialReg::XZR),
+                    MachOperand::MemOp {
+                        base: X3,
+                        offset: 6,
+                    },
+                ] {
+                    census.observe(
+                        mk(opcode, vec![data.clone(), preg(X1), preg(X2), mode]),
+                        None,
+                    );
+                }
+                for tail in [imm(0), preg(X3), MachOperand::Symbol("tail".into())] {
+                    census.observe(
+                        mk(opcode, vec![data.clone(), preg(X1), preg(X2), imm(6), tail]),
+                        None,
+                    );
+                }
+                census.observe(
+                    mk(
+                        opcode,
+                        vec![
+                            data,
+                            MachOperand::MemOp {
+                                base: X1,
+                                offset: 0,
+                            },
+                            preg(X2),
+                        ],
+                    ),
+                    None,
+                );
+            }
+        }
+        census.finish(2 * 6 * (56 + 1 + 3 + 5 + 3 + 1));
+    }
+
+    #[test]
+    fn register_offset_physical_bank_census_before_field_reduction() {
+        let mut census = RegisterOffsetEncodeCensus::default();
+        for (opcode, load) in [(AArch64Opcode::LdrRO, true), (AArch64Opcode::StrRO, false)] {
+            for mode in [4, 5, 6, 7, 12, 13, 14, 15] {
+                for raw in (0..=260_u16).chain([u16::MAX]) {
+                    census.observe(
+                        mk(
+                            opcode,
+                            vec![preg(PReg::new(raw)), preg(X1), preg(X2), imm(mode)],
+                        ),
+                        register_offset_test_data(raw).map(|(base, rt)| {
+                            register_offset_test_word(base, load, rt, 1, 2, mode)
+                        }),
+                    );
+                    for transfer in [0, 32, 64, 96, 128, 165] {
+                        let data = preg(PReg::new(transfer));
+                        let (base, rt) = register_offset_test_data(transfer).unwrap();
+                        census.observe(
+                            mk(
+                                opcode,
+                                vec![data.clone(), preg(PReg::new(raw)), preg(X2), imm(mode)],
+                            ),
+                            (raw <= 31).then(|| {
+                                register_offset_test_word(base, load, rt, u32::from(raw), 2, mode)
+                            }),
+                        );
+                        let index = match raw {
+                            0..=30 => Some(u32::from(raw)),
+                            32..=62 if matches!(mode, 4 | 5 | 12 | 13) => Some(u32::from(raw - 32)),
+                            // Both zero-register spellings have known full64 zero.
+                            160 | 161 => Some(31),
+                            _ => None,
+                        };
+                        census.observe(
+                            mk(
+                                opcode,
+                                vec![data, preg(X1), preg(PReg::new(raw)), imm(mode)],
+                            ),
+                            index.map(|rm| register_offset_test_word(base, load, rt, 1, rm, mode)),
+                        );
+                    }
+                }
+            }
+        }
+        census.finish(2 * 8 * 262 * (1 + 6 * 2));
+    }
+
+    #[test]
+    fn register_offset_zero_aliases_and_legal_register_overlap() {
+        let mut census = RegisterOffsetEncodeCensus::default();
+        for (opcode, load) in [(AArch64Opcode::LdrRO, true), (AArch64Opcode::StrRO, false)] {
+            for mode in [4, 5, 6, 7, 12, 13, 14, 15] {
+                for (transfer, base) in [
+                    (MachOperand::Special(SpecialReg::WZR), 0xb820_0800),
+                    (MachOperand::Special(SpecialReg::XZR), 0xf820_0800),
+                ] {
+                    for (address, rn) in [
+                        (preg(X1), 1),
+                        (preg(SP), 31),
+                        (MachOperand::Special(SpecialReg::SP), 31),
+                    ] {
+                        for index in [
+                            preg(PReg::new(160)),
+                            preg(PReg::new(161)),
+                            MachOperand::Special(SpecialReg::WZR),
+                            MachOperand::Special(SpecialReg::XZR),
+                        ] {
+                            census.observe(
+                                mk(
+                                    opcode,
+                                    vec![transfer.clone(), address.clone(), index, imm(mode)],
+                                ),
+                                Some(register_offset_test_word(base, load, 31, rn, 31, mode)),
+                            );
+                        }
+                    }
+                }
+                for raw in 0..31_u16 {
+                    for transfer in [raw, raw + 32] {
+                        let (base, rt) = register_offset_test_data(transfer).unwrap();
+                        // All-three alias is legal; address inputs precede load output.
+                        census.observe(
+                            mk(
+                                opcode,
+                                vec![
+                                    preg(PReg::new(transfer)),
+                                    preg(PReg::new(raw)),
+                                    preg(PReg::new(raw)),
+                                    imm(mode),
+                                ],
+                            ),
+                            Some(register_offset_test_word(
+                                base,
+                                load,
+                                rt,
+                                u32::from(raw),
+                                u32::from(raw),
+                                mode,
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+        census.finish(2 * 8 * (2 * 3 * 4 + 31 * 2));
+    }
 
     #[test]
     fn test_ldr_ro_64bit() {
@@ -10405,6 +12286,34 @@ mod tests {
         let inst = mk(AArch64Opcode::Sbc, vec![preg(X0), preg(X1), preg(X2)]);
         let enc = encode_instruction(&inst).unwrap();
         assert_eq!(enc, 0xDA020020, "SBC X0, X1, X2 = {enc:#010X}");
+    }
+
+    // --- ADCS (ARM ARM C6.2.2) ---
+    // sf|op=0|S=1|11010000|Rm|000000|Rn|Rd
+
+    #[test]
+    fn test_adcs_x0_x1_x2() {
+        // ADCS X0, X1, X2
+        // ARM ARM: sf=1 0 1 11010000 Rm=00010 000000 Rn=00001 Rd=00000
+        // = 1_0_1_11010000_00010_000000_00001_00000
+        // = 0xBA020020  (= ADC | S bit 29)
+        let inst = mk(AArch64Opcode::Adcs, vec![preg(X0), preg(X1), preg(X2)]);
+        let enc = encode_instruction(&inst).unwrap();
+        assert_eq!(enc, 0xBA020020, "ADCS X0, X1, X2 = {enc:#010X}");
+    }
+
+    // --- SBCS (ARM ARM C6.2.230) ---
+    // sf|op=1|S=1|11010000|Rm|000000|Rn|Rd
+
+    #[test]
+    fn test_sbcs_x0_x1_x2() {
+        // SBCS X0, X1, X2
+        // ARM ARM: sf=1 1 1 11010000 Rm=00010 000000 Rn=00001 Rd=00000
+        // = 1_1_1_11010000_00010_000000_00001_00000
+        // = 0xFA020020  (= SBC | S bit 29)
+        let inst = mk(AArch64Opcode::Sbcs, vec![preg(X0), preg(X1), preg(X2)]);
+        let enc = encode_instruction(&inst).unwrap();
+        assert_eq!(enc, 0xFA020020, "SBCS X0, X1, X2 = {enc:#010X}");
     }
 
     // --- UMULH (ARM ARM C6.2.332) ---

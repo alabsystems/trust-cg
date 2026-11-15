@@ -21,9 +21,23 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-// `main` returns `Result` so the panic-family lint set is empty in this file.
+/// The macOS deployment target the checker is built for. This is a pinned
+/// INPUT to the checker's exact bytes (clang stamps it into
+/// `LC_BUILD_VERSION.minos`), not a compatibility floor: every Apple
+/// `host-checker` row of
+/// `crates/trust-cg-verify/verdict_db/canary_certs/manifest.v1` must be minted
+/// under this value, so the constant and those rows form a bound set. Moving it
+/// re-keys the checker on EVERY Apple host, and each Apple row must then be
+/// re-qualified on its own host (docs/portable-checker-host-qualification.md);
+/// a row minted on a tree without this pin is equally stale once the pin
+/// reaches it. Both Apple rows went stale that way after the 2026-09-21 merge
+/// (x86-64 re-qualified 2026-09-27, ARM64 2026-09-29). See the note at the
+/// `cc::Build` below.
+const APPLE_DEPLOYMENT_TARGET: &str = "26.5";
+
+// `main` returns `Result` instead of panicking.
 // A build script's only caller is cargo, and `Termination for Result` prints
 // the error and exits non-zero, so every path that aborted the build before
 // still aborts it — with a strictly more specific message. Nothing here
@@ -43,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?
         .to_path_buf();
     let src = workspace_root.join("third_party/vendor/drat-trim/drat-trim.c");
+    let reproducible_src = Path::new("third_party/vendor/drat-trim/drat-trim.c");
     assert!(
         src.is_file(),
         "vendored drat-trim source not found at {}; is the release source tree complete?",
@@ -74,9 +89,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // identity carried by portable-certificate manifests.
     let mut build = cc::Build::new();
     build.opt_level(2).debug(false);
+    if target_os == "macos" {
+        // The Apple deployment target is executable bytes too. Left to `cc`,
+        // the value comes from `MACOSX_DEPLOYMENT_TARGET` in the caller's
+        // environment, else from the DEFAULT SDK's version (`xcrun
+        // --show-sdk-version --sdk macosx`, which ignores `SDKROOT`). A
+        // CommandLineTools update that registers a newer default SDK therefore
+        // re-keys the checker with nothing in this repository changed. Measured
+        // 2026-09-20 with identical source, clang 21, flags and
+        // `SDKROOT=MacOSX26.5.sdk`: the CLT 26.6 install of 2026-09-13 made
+        // 27.0 the default, the inferred `-mmacosx-version-min` moved
+        // 26.5 -> 27.0, and the checker moved from 0f634db2… (the committed
+        // manifest identity) to 54c6f06f…, which declined every portable
+        // certificate fail-closed — and silently, until `canary_cert` learned
+        // to announce it. Re-minting the manifest does not remove the
+        // mechanism: its checker line has moved three times already
+        // (2026-08-31, 09-01, 09-10), the last time back to the 08-20 value.
+        //
+        // Pin the value every Apple manifest row is minted with. `cc` reads
+        // this override BEFORE the process environment, so a developer's own
+        // `MACOSX_DEPLOYMENT_TARGET` cannot re-key the checker either. What
+        // remains unpinned is real toolchain identity — the compiler and the
+        // SDK (`LC_BUILD_VERSION.sdk`) — and a change there is a deliberate
+        // re-authorization, not drift.
+        build.env("MACOSX_DEPLOYMENT_TARGET", APPLE_DEPLOYMENT_TARGET);
+    }
     let tool = build.get_compiler();
 
     let mut cmd = tool.to_command();
+    if target_os == "macos" {
+        // cc appends caller CFLAGS after its computed defaults and builder
+        // flags. Reassert this exact-byte input on the final command, after
+        // every tool argument, so a caller's deployment flag cannot replace
+        // the value bound by the reviewed checker manifests. Other compiler
+        // and SDK inputs remain real inputs to checker identity.
+        cmd.arg(format!("-mmacosx-version-min={APPLE_DEPLOYMENT_TARGET}"));
+    }
+    // drat-trim's assertions expand `__FILE__`.  Passing `src` here used to
+    // embed the absolute checkout path in the checker, so otherwise identical
+    // builds in trust-cg and Trust's nested first-party/trust-cg checkout had
+    // different hashes.  Portable-proof manifests intentionally authorize the
+    // exact checker bytes, which made every certificate fail closed in the
+    // nested build.  Compile from a stable root with a stable relative spelling
+    // while retaining `src` above for filesystem/rerun checks.
+    cmd.current_dir(&workspace_root);
     if tool.is_like_msvc() {
         // MSVC's CRT ships no POSIX <sys/time.h>, which upstream
         // drat-trim.c includes for `struct timeval` + `gettimeofday`
@@ -104,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .arg("-Dgetc_unlocked=_getc_nolock")
             // Mirror upstream's Makefile optimisation tier.
             .arg("-O2")
-            .arg(&src)
+            .arg(reproducible_src)
             .arg(format!("-Fe:{}", exe_path.display()))
             .arg(format!("-Fo:{}", out_dir.join("drat-trim.obj").display()));
     } else {
@@ -123,7 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // cannot change proof acceptance.
             cmd.arg("-Dgetc_unlocked=getc");
         }
-        cmd.arg("-O2").arg(&src);
+        cmd.arg("-O2").arg(reproducible_src);
         // Apple's linker derives LC_UUID from content by default. Preserve it:
         // current macOS rejects linker-signed executables with no LC_UUID. The
         // stable basename plus normalized compiler options above make both the
@@ -141,6 +197,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status
     );
 
+    // This is load-bearing for exact-byte certificate authorization.  Catch a
+    // compiler/toolchain change that starts recording the checkout root before
+    // it can silently disable every portable certificate again.
+    let executable = fs::read(&exe_path)
+        .map_err(|e| format!("read built checker {}: {e}", exe_path.display()))?;
+    let workspace_bytes = workspace_root.to_string_lossy();
+    assert!(
+        workspace_bytes.is_empty()
+            || !executable
+                .windows(workspace_bytes.len())
+                .any(|window| window == workspace_bytes.as_bytes()),
+        "built drat-trim embeds checkout root {}; compile inputs must remain path-stable",
+        workspace_root.display()
+    );
+
     // Surface the resulting executable path to the crate's `env!` lookup
     // (`drat_trim_executable_path` in `lib.rs`). The variable name must NOT
     // carry the `TCG_`/`TRUST_CG_` prefix: cargo injects `rustc-env` vars into
@@ -149,6 +220,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (`UNTRACKED_TRUST_CODEGEN_ENV_PREFIXES` in rustc_driver_impl). This is a
     // build-time constant embedded into the crate, not a codegen control.
     println!("cargo:rustc-env=DRAT_TRIM_BUILT_EXE={}", exe_path.display());
+    // The executable is compiled for Cargo's TARGET, not the build-script
+    // HOST. Embed this immutable qualifier beside its path; runtime variables
+    // must not select another platform's reviewed checker authorization.
+    let target = env::var("TARGET").map_err(|e| format!("TARGET is not set by cargo: {e}"))?;
+    println!("cargo:rustc-env=DRAT_TRIM_BUILT_TARGET={target}");
     Ok(())
 }
 

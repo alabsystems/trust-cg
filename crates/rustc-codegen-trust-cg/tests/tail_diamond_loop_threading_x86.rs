@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // crates/rustc-codegen-trust-cg/tests/tail_diamond_loop_threading_x86.rs
 //
@@ -27,9 +31,11 @@ mod target_dir_support;
 //   3. GATE OFF: the -O0 program fails closed (the structural P1.3 rejection
 //      stands). Zero behavior change to the default-on perimeter.
 //   4. A for-loop rotation whose tail diamond makes a THREADED slot depend on the
-//      range-YIELDED value fails CLOSED (a SOUND compile error, not a wrong
-//      value) — an ORTHOGONAL, pre-existing range-payload-opacity limitation, NOT
-//      a tail-diamond-routing failure (see program (4) below).
+//      range-YIELDED value is DECLINED by the VC (a SOUND compile error with the
+//      SSA-071 cell retry off, not a wrong value) — an ORTHOGONAL, pre-existing
+//      range-payload-opacity limitation, NOT a tail-diamond-routing failure (see
+//      program (4) below). On the DEFAULT lane the cell retry re-lowers the
+//      flagged slot in a memory cell and it must compile + match.
 //
 // The "wrong threading stays REFUTED" bite is exercised at the verifier UNIT
 // level (`loop_backedge_symexec::tests::tail_diamond_end_to_end_refines_and_swap_refutes`
@@ -37,12 +43,12 @@ mod target_dir_support;
 //
 // Run (requires the target-bridge toolchain + x86_64-apple-darwin std, x86 host):
 //     cd crates/rustc-codegen-trust-cg
-//     cargo +nightly-2026-04-20 test --release --test tail_diamond_loop_threading_x86 -- --nocapture
+//     targo --unverified test --release --locked --test tail_diamond_loop_threading_x86 -- --nocapture
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
 // (1) the WHILE rotation-with-tail-if: `a,b <- b, a+b` with a TAIL
@@ -136,7 +142,9 @@ fn main() {
 // but because of a SEPARATE, pre-existing range-payload-OPACITY limitation: the
 // `Range` iterator is memory-backed, so the IMPL side loads the yielded `x`
 // opaquely while the MIR SPEC models it as the named lane `l6_start`; the two do
-// not unify, so a slot depending on `x` REFUTES (see the SPEC note at
+// not unify. Measured at 874c4b3ef the VC DECLINES ("back-edge arg for slot 0
+// derives from an unmodeled trust-ir value ... out of model"); were it to
+// REFUTE, the cell retry would be withheld by design (see the SPEC note at
 // `lib.rs`'s `Range::next` model: "a threaded slot whose value DEPENDS on the
 // yielded payload refutes against the IMPL's opaque load and stays fail-closed —
 // never a wrong admit"). Asserted here to fail CLOSED (a sound compile error, NOT
@@ -167,66 +175,12 @@ fn main() {
 }
 "#;
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run tail-diamond test");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -243,24 +197,32 @@ fn workdir(stem: &str) -> PathBuf {
 /// Compile `src` through the trust-cg backend to an object at `opt`. With
 /// `refine` the FULL refinement lane (`TCG_P3C_REFINE=1`) + `TCG_REFINE_TRACE=1`
 /// are set. Returns `(success, stderr)`.
-fn compile_object(stem: &str, src: &str, dylib: &Path, opt: &str, refine: bool) -> (bool, String) {
+fn compile_object(
+    stem: &str,
+    src: &str,
+    dylib: &Path,
+    opt: &str,
+    refine: bool,
+    extra_knobs: &[&str],
+) -> (bool, String) {
     let dir = workdir(stem);
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
     if refine {
-        cmd.env("TCG_P3C_REFINE", "1");
-        cmd.env("TCG_REFINE_TRACE", "1");
+        cmd.arg(toolchain_support::backend_knobs_arg(&["p3c-refine"]));
+        cmd.arg(toolchain_support::backend_knobs_arg(&["refine-trace"]));
     } else {
         cmd.env_remove("TCG_P3C_REFINE");
         cmd.env_remove("TCG_REFINE");
         cmd.env_remove("TCG_REFINE_TRACE");
     }
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    if !extra_knobs.is_empty() {
+        cmd.arg(toolchain_support::backend_knobs_arg(extra_knobs));
+    }
+    cmd.arg("--crate-type").arg("bin");
     let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
     backend_arg.push(dylib);
     cmd.arg(&backend_arg);
@@ -276,7 +238,7 @@ fn compile_object(stem: &str, src: &str, dylib: &Path, opt: &str, refine: bool) 
     .arg("--out-dir")
     .arg(&dir)
     .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let mut success = output.status.success();
     if success {
@@ -298,10 +260,9 @@ fn compile_run(stem: &str, src: &str, dylib: &Path, opt: &str) -> Option<i32> {
     let bin_path = dir.join("prog_bin");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
-    cmd.env("TCG_P3C_REFINE", "1");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"]);
+    cmd.arg(toolchain_support::backend_knobs_arg(&["p3c-refine"]));
     let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
     backend_arg.push(dylib);
     cmd.arg(&backend_arg);
@@ -316,7 +277,7 @@ fn compile_run(stem: &str, src: &str, dylib: &Path, opt: &str) -> Option<i32> {
     .arg("-o")
     .arg(&bin_path)
     .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() || !bin_path.exists() {
         let _ = std::fs::remove_dir_all(&dir);
         return None;
@@ -332,15 +293,9 @@ fn reference_run(stem: &str, src: &str, opt: &str) -> Option<i32> {
     let src_path = dir.join("prog.rs");
     let bin_path = dir.join("prog_ref");
     std::fs::write(&src_path, src).expect("write source");
-    let output = Command::new("rustup")
+    let output = toolchain_support::rustc_command()
         .env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET)
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args([
-            "--target",
-            TARGET,
-            "-Cpanic=abort",
-            "-Coverflow-checks=off",
-        ])
+        .args(["--target", TARGET, "-Cpanic=abort", "-Coverflow-checks=off"])
         .arg(format!("-Copt-level={opt}"))
         .arg("-o")
         .arg(&bin_path)
@@ -360,7 +315,8 @@ fn reference_run(stem: &str, src: &str, opt: &str) -> Option<i32> {
 /// (with the trace showing the back-edge PROVEN) and match the rustc reference.
 fn assert_tail_diamond_compiles_and_matches(name: &str, src: &str, dylib: &Path) {
     for opt in ["0", "3"] {
-        let (ok, stderr) = compile_object(&format!("{name}_o{opt}_obj"), src, dylib, opt, true);
+        let (ok, stderr) =
+            compile_object(&format!("{name}_o{opt}_obj"), src, dylib, opt, true, &[]);
         assert!(
             ok,
             "TCG_P3C_REFINE=1 must compile the tail-diamond loop `{name}` at -O{opt}, but it \
@@ -409,7 +365,14 @@ fn tail_diamond_loops_prove_and_match_o0_and_o3() {
     // trace must show the back-edge PROVEN at -O0 (the VC fired, did not skip),
     // and with the lane OFF it must fail closed (zero change to the default-on
     // perimeter).
-    let (_ok, stderr) = compile_object("for_rot_no_x_trace", FOR_ROT_NO_X_PROGRAM, &dylib, "0", true);
+    let (_ok, stderr) = compile_object(
+        "for_rot_no_x_trace",
+        FOR_ROT_NO_X_PROGRAM,
+        &dylib,
+        "0",
+        true,
+        &[],
+    );
     assert!(
         stderr.contains("back-edge threading PROVEN"),
         "expected the trace to show the tail-diamond back-edge PROVEN at -O0 for `for_rot_no_x`; \
@@ -420,8 +383,15 @@ fn tail_diamond_loops_prove_and_match_o0_and_o3() {
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let (ok_off, stderr_off) =
-        compile_object("for_rot_no_x_off", FOR_ROT_NO_X_PROGRAM, &dylib, "0", false);
+    // With the SSA-071 cell retry OFF: this pins the VC lane's own posture.
+    let (ok_off, stderr_off) = compile_object(
+        "for_rot_no_x_off",
+        FOR_ROT_NO_X_PROGRAM,
+        &dylib,
+        "0",
+        false,
+        &["no-ssa071-cell-retry"],
+    );
     assert!(
         !ok_off,
         "with the refinement lane unset `for_rot_no_x` must FAIL CLOSED (P1.3), but it compiled."
@@ -429,33 +399,55 @@ fn tail_diamond_loops_prove_and_match_o0_and_o3() {
     assert!(
         stderr_off.contains("ssa/loop-completeness check failed"),
         "gate-off failure for `for_rot_no_x` must be the structural P1.3 rejection; got:\n{}",
-        stderr_off.lines().rev().take(8).collect::<Vec<_>>().join("\n")
+        stderr_off
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 
     // (4) rot_add FOR-loop where the threaded slot `a` depends on the
     // range-YIELDED `x`: FAILS CLOSED (the orthogonal range-payload-opacity
     // limitation), and CRUCIALLY produces NO wrong value — a sound compile error,
-    // never a miscompile. This is NOT a tail-diamond-routing failure (the VC
-    // fires; it REFUTES because the SPEC's `l6_start` payload does not unify with
-    // the IMPL's opaque memory load).
-    let (rot_add_ok, rot_add_err) =
-        compile_object("rot_add_for", ROT_ADD_FOR_PROGRAM, &dylib, "0", true);
+    // never a miscompile. This is NOT a tail-diamond-routing failure: the VC
+    // fires and DECLINES, because the IMPL's opaque memory load of the yielded
+    // payload is out of model (a REFUTED VC would instead withhold the retry).
+    //
+    // Measured with the SSA-071 cell retry OFF (the VC's own posture); on the
+    // DEFAULT lane the retry re-lowers the flagged slot in a memory cell, and the
+    // program must then compile and match rustc at -O0 and -O3.
+    let (rot_add_ok, rot_add_err) = compile_object(
+        "rot_add_for",
+        ROT_ADD_FOR_PROGRAM,
+        &dylib,
+        "0",
+        true,
+        &["no-ssa071-cell-retry"],
+    );
     assert!(
         !rot_add_ok,
         "rot_add FOR-loop (threaded slot depends on the range-yielded x) is expected to fail \
          closed under the range-payload-opacity limitation, but it compiled."
     );
     assert!(
-        rot_add_err.contains("REFUTED") || rot_add_err.contains("ssa/loop-completeness check failed"),
+        rot_add_err.contains("REFUTED")
+            || rot_add_err.contains("ssa/loop-completeness check failed"),
         "rot_add FOR-loop must fail closed via the semantic VC REFUTED (a sound compile error, \
          not a wrong value); got:\n{}",
-        rot_add_err.lines().rev().take(8).collect::<Vec<_>>().join("\n")
+        rot_add_err
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
+    assert_tail_diamond_compiles_and_matches("rot_add_for_cells", ROT_ADD_FOR_PROGRAM, &dylib);
 
     eprintln!(
         "tail_diamond_loop_threading_x86: for_rot_no_x PROVEN via the tail-diamond VC (+ gate-off \
          fails closed); rot_add_while / for_rot_no_x / plain_tail_if matched rustc at -O0 and -O3; \
-         rot_add FOR (range-payload dependency) fails CLOSED (sound, orthogonal range-opacity \
-         limitation)."
+         rot_add FOR (range-payload dependency) fails CLOSED with the cell retry off (sound, \
+         orthogonal range-opacity limitation) and matched rustc through the cell retry."
     );
 }

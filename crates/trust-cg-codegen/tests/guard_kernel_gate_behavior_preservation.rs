@@ -53,14 +53,19 @@ enum ProofMode {
 ///     and returning the loaded value (so the load is live and not DCE'd).
 fn build(mode: ProofMode) -> (Module, TrustIrFunction) {
     let mut module = Module::new("guard_kernel_gate_behavior_preservation");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        // params: (array, index, ptr)
-        params: vec![array_ty.clone(), Ty::I64, Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            // params: (array, index, ptr)
+            params: vec![array_ty.clone(), Ty::I64, Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "two_guards", ft, BlockId::new(0));
 
     // value ids: 0=array, 1=index, 2=ptr; 3=array[index]; 4=*ptr; 5=sum
@@ -126,7 +131,9 @@ fn build(mode: ProofMode) -> (Module, TrustIrFunction) {
         ));
     }
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (module, func)
 }
 
@@ -157,11 +164,12 @@ fn brk_count(stream: &[(AArch64Opcode, Vec<MachOperand>)]) -> usize {
 
 fn prepare_aarch64(module: &Module, func: &TrustIrFunction) -> MachFunction {
     let (lir_func, proof_ctx) =
-        trust_cg_lower::translate_function(func, module).expect("adapter translate");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translate");
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O2,
         verify: false,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
     pipeline
         .prepare_function_with_metrics_and_trust_ir_module(
@@ -245,7 +253,8 @@ fn compile_x86_object(module: &Module) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         spec,
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     compiler.compile(module).expect("x86 compile").object_code
 }
 
@@ -313,11 +322,14 @@ fn x86_env_spellings_keep_notnull_alone() {
 /// to isolate the x86 NotNull behavior.
 fn build_notnull_only() -> Module {
     let mut module = Module::new("guard_kernel_gate_notnull_only");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "notnull_only", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -336,6 +348,17 @@ fn build_notnull_only() -> Module {
             }),
         ],
     }];
-    module.add_function(func);
     module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
+    module
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

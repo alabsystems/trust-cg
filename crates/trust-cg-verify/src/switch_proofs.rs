@@ -89,7 +89,6 @@
 //
 // Reference:
 // - `crates/trust-cg-lower/src/switch.rs` -- the lowering under test
-// - `designs/2026-04-13-verification-architecture.md`
 // - Alive2 (PLDI 2021) -- technique
 // - #323 -- switch lowering; #444 -- this proof obligation
 //
@@ -1047,17 +1046,13 @@ mod tests {
             other => {
                 // Certification-gap guard (crate::formal_gap):
                 // `CegisLoop::verify` wraps the bridge diagnostic as
-                // `Error("solver returned unknown: {…}")`; unwrap it and
-                // confirm against this test's OWN obligation (a bare
-                // server-truncated `unknown` is re-confirmed through the
-                // fresh one-shot transcript). Skip LOUDLY on the exact
-                // fail-closed gap diagnostics only; NotEquivalent, Timeout,
-                // and unrelated errors still fail the original assertion.
+                // `Error("solver returned unknown: {…}")`; unwrap it and skip
+                // LOUDLY only on AY's disclosed proof hole. NotEquivalent,
+                // Timeout, checker and self-check rejections, a bare unknown and
+                // unrelated errors still fail the original assertion.
                 if let crate::cegis::CegisResult::Error(reason) = &other
                     && let Some(inner) = reason.strip_prefix("solver returned unknown: ")
-                    && let Some(confirmed) = crate::formal_gap::confirmed_certification_gap(
-                        &obligation,
-                        &crate::ay_bridge::AYConfig::default(),
+                    && let Some(confirmed) = crate::formal_gap::disclosed_proof_hole(
                         &crate::ay_bridge::AYResult::Unknown(inner.to_string()),
                     )
                 {

@@ -1,0 +1,465 @@
+{
+  "name": "effect_summaries",
+  "functions": [
+    {
+      "id": 0,
+      "name": "set",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "PtrMut": "U64"
+              }
+            ],
+            [
+              1,
+              {
+                "PtrMut": "U64"
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U64",
+                  "value": {
+                    "Int": 7
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 0,
+                  "value": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "GlobalAddr": {
+                  "global": 0
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 3,
+                  "value": 2,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [],
+        "ensures": [
+          {
+            "schema": "smtlib2",
+            "payload": "(= (select after #x0000000000000000) (select before #x0000000000000000))",
+            "smtlib": "(= (select after #x0000000000000000) (select before #x0000000000000000))",
+            "sort": "Bool",
+            "bindings": [
+              [
+                "before",
+                {
+                  "sort": {
+                    "Array": [
+                      {
+                        "BitVec": 64
+                      },
+                      {
+                        "BitVec": 64
+                      }
+                    ]
+                  },
+                  "place": "WorldPre"
+                }
+              ],
+              [
+                "after",
+                {
+                  "sort": {
+                    "Array": [
+                      {
+                        "BitVec": 64
+                      },
+                      {
+                        "BitVec": 64
+                      }
+                    ]
+                  },
+                  "place": "WorldPost"
+                }
+              ]
+            ]
+          }
+        ],
+        "params": [
+          "p",
+          "q"
+        ],
+        "proved": false,
+        "decreases": [],
+        "backed_by": null,
+        "effects": {
+          "reads": "Nothing",
+          "writes": {
+            "Places": [
+              {
+                "ParamPointee": {
+                  "index": 0
+                }
+              },
+              {
+                "Global": 0
+              }
+            ]
+          },
+          "allocates": false,
+          "frees": false,
+          "may_unwind": false,
+          "io": false
+        }
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "add",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U64"
+            ],
+            [
+              1,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "U64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [],
+        "ensures": [],
+        "params": [],
+        "proved": false,
+        "decreases": [],
+        "backed_by": null,
+        "effects": {
+          "reads": "Nothing",
+          "writes": "Nothing",
+          "allocates": false,
+          "frees": false,
+          "may_unwind": false,
+          "io": false
+        }
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 2,
+      "name": "ext",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 3,
+      "name": "caller",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "PtrMut": "U64"
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Call": {
+                  "callee": 2,
+                  "args": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [],
+        "ensures": [],
+        "params": [],
+        "proved": false,
+        "decreases": [],
+        "backed_by": null,
+        "effects": {
+          "reads": "Everything",
+          "writes": "Everything",
+          "allocates": true,
+          "frees": true,
+          "may_unwind": true,
+          "io": true
+        }
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "COUNTER",
+      "ty": "U64",
+      "mutable": true,
+      "initializer": {
+        "Int": 0
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        {
+          "PtrMut": "U64"
+        },
+        {
+          "PtrMut": "U64"
+        }
+      ],
+      "returns": [],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U64",
+        "U64"
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        {
+          "PtrMut": "U64"
+        }
+      ],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

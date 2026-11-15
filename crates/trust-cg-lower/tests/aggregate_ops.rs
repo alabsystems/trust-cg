@@ -3,8 +3,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-use trust_cg_lower::adapter::{AdapterError, translate_function};
-use trust_cg_lower::instructions::Opcode;
+use trust_cg_lower::adapter::AdapterError;
+use trust_cg_lower::instructions::{Instruction, Opcode, Value};
 use trust_cg_lower::types::Type;
 use trust_ir::{
     Block as TrustIrBlock, BlockId, ClosureTy, ClosureTyId, Constant, FieldDef, FuncId, FuncTy,
@@ -35,11 +35,45 @@ fn single_function_module(
     let mut module = TrustIrModule::new(func_name);
     module.structs = structs;
     module.types = types;
-    let fty_id: FuncTyId = module.add_func_type(ty);
+    let fty_id: FuncTyId = module
+        .add_func_type(ty)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(0), func_name, fty_id, entry);
     func.blocks = blocks;
-    module.add_function(func);
     module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
+    module
+}
+
+/// An insert into the parameter `Value(0)` is value-semantic: the parameter
+/// is copied into a fresh slot, field `field_index` of that copy is stored as
+/// an `I64`, and the copy is the result — the parameter's storage is never
+/// written.
+fn assert_value_semantic_i64_insert(instructions: &[Instruction], field_index: u32) {
+    let [slot, len, copy, gep, store, result, ..] = instructions else {
+        panic!("too few instructions: {instructions:?}");
+    };
+    assert!(matches!(slot.opcode, Opcode::StackAddr { .. }), "{slot:?}");
+    let fresh = slot.results[0];
+    assert!(matches!(len.opcode, Opcode::Iconst { .. }), "{len:?}");
+    assert!(matches!(copy.opcode, Opcode::Memcpy), "{copy:?}");
+    assert_eq!(copy.args, vec![fresh, Value(0), len.results[0]]);
+    assert!(
+        matches!(gep.opcode, Opcode::StructGep { field_index: f, .. } if f == field_index),
+        "{gep:?}"
+    );
+    assert_eq!(gep.args, vec![fresh], "the field is addressed in the copy");
+    assert!(matches!(
+        store.opcode,
+        Opcode::Store {
+            ty: Type::I64,
+            align: None
+        }
+    ));
+    assert_eq!(store.args, vec![Value(1), gep.results[0]]);
+    assert!(matches!(result.opcode, Opcode::Copy));
+    assert_eq!(result.args, vec![fresh], "the result is the copy");
 }
 
 fn single_function(module: &TrustIrModule) -> &TrustIrFunction {
@@ -60,10 +94,14 @@ fn record_function_module(
     let mut module = TrustIrModule::new(func_name);
     module.records = records;
     module.types = types;
-    let fty_id: FuncTyId = module.add_func_type(ty);
+    let fty_id: FuncTyId = module
+        .add_func_type(ty)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(0), func_name, fty_id, entry);
     func.blocks = blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -91,6 +129,7 @@ fn nested_matrix_struct() -> (Vec<StructDef>, Vec<Ty>, Ty) {
     let matrix_ty = Ty::Array(TyId::new(1), 3);
     let outer_ty = Ty::Struct(StructId::new(0));
     let structs = vec![StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "Outer".to_string(),
         fields: vec![
@@ -127,6 +166,7 @@ fn assert_unsupported_message(err: AdapterError, needle: &str) {
 #[test]
 fn struct_field_extract_lowers_through_struct_gep() {
     let structs = vec![StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "Pair".to_string(),
         fields: vec![
@@ -152,6 +192,7 @@ fn struct_field_extract_lowers_through_struct_gep() {
         FuncTy {
             params: vec![pair.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         structs,
@@ -171,8 +212,12 @@ fn struct_field_extract_lowers_through_struct_gep() {
         }],
     );
 
-    let (lir_func, _proofs) = translate_function(single_function(&module), &module)
-        .expect("adapter must lower struct field extract");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower struct field extract");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
     assert!(matches!(
@@ -196,6 +241,7 @@ fn array_element_extract_lowers_through_array_gep() {
         FuncTy {
             params: vec![array.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         vec![],
@@ -220,8 +266,12 @@ fn array_element_extract_lowers_through_array_gep() {
         }],
     );
 
-    let (lir_func, _proofs) = translate_function(single_function(&module), &module)
-        .expect("adapter must lower array element extract");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower array element extract");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
     assert!(
@@ -250,6 +300,7 @@ fn array_element_insert_lowers_through_array_gep_store_copy() {
         FuncTy {
             params: vec![array.clone(), Ty::I64, Ty::I64],
             returns: vec![array.clone()],
+            abi: None,
             is_vararg: false,
         },
         vec![],
@@ -270,8 +321,12 @@ fn array_element_insert_lowers_through_array_gep_store_copy() {
         }],
     );
 
-    let (lir_func, _proofs) = translate_function(single_function(&module), &module)
-        .expect("adapter must lower array element insert");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower array element insert");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
     assert!(
@@ -301,6 +356,7 @@ fn record_field_extract_lowers_with_record_def() {
         FuncTy {
             params: vec![record.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         vec![pair_record_def()],
@@ -320,8 +376,12 @@ fn record_field_extract_lowers_with_record_def() {
         }],
     );
 
-    let (lir_func, _proofs) = translate_function(single_function(&module), &module)
-        .expect("adapter must lower record field extract");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower record field extract");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
     assert!(matches!(
@@ -345,6 +405,7 @@ fn record_field_insert_lowers_with_record_def() {
         FuncTy {
             params: vec![record.clone(), Ty::I64],
             returns: vec![record.clone()],
+            abi: None,
             is_vararg: false,
         },
         vec![pair_record_def()],
@@ -365,22 +426,15 @@ fn record_field_insert_lowers_with_record_def() {
         }],
     );
 
-    let (lir_func, _proofs) = translate_function(single_function(&module), &module)
-        .expect("adapter must lower record field insert");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower record field insert");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
-    assert!(matches!(
-        bb.instructions[0].opcode,
-        Opcode::StructGep { field_index: 1, .. }
-    ));
-    assert!(matches!(
-        bb.instructions[1].opcode,
-        Opcode::Store {
-            ty: Type::I64,
-            align: None
-        }
-    ));
-    assert!(matches!(bb.instructions[2].opcode, Opcode::Copy));
+    assert_value_semantic_i64_insert(&bb.instructions, 1);
 }
 
 #[test]
@@ -391,6 +445,7 @@ fn insert_field_rejects_value_type_mismatch() {
         FuncTy {
             params: vec![record.clone(), Ty::I32],
             returns: vec![record.clone()],
+            abi: None,
             is_vararg: false,
         },
         vec![pair_record_def()],
@@ -411,18 +466,44 @@ fn insert_field_rejects_value_type_mismatch() {
         }],
     );
 
-    let err = translate_function(single_function(&module), &module).unwrap_err();
+    let err = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .unwrap_err();
     assert_unsupported_message(err, "does not match field type");
 }
 
+fn assert_flat_gep_steps(
+    instructions: &[trust_cg_lower::instructions::Instruction],
+    count: usize,
+    stride: u32,
+) {
+    let strides: Vec<_> = instructions
+        .iter()
+        .filter_map(|inst| match &inst.opcode {
+            Opcode::ArrayGep { elem_ty } => Some(elem_ty.bytes()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(strides, vec![stride; count]);
+    assert!(
+        !instructions
+            .iter()
+            .any(|inst| matches!(inst.opcode, Opcode::StructGep { .. }))
+    );
+}
+
 #[test]
-fn multi_index_record_gep_lowers_through_struct_gep() {
+fn multi_index_record_gep_strides_whole_records() {
     let record = Ty::Record(RecordId::new(0));
     let module = record_function_module(
         "record_multi_index_gep",
         FuncTy {
             params: vec![Ty::Ptr],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         vec![pair_record_def()],
@@ -460,17 +541,15 @@ fn multi_index_record_gep_lowers_through_struct_gep() {
         }],
     );
 
-    let (lir_func, _proofs) = translate_function(single_function(&module), &module)
-        .expect("adapter must lower record multi-index GEP");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower record multi-index GEP");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
-    assert!(
-        bb.instructions
-            .iter()
-            .any(|inst| matches!(inst.opcode, Opcode::StructGep { field_index: 1, .. })),
-        "expected record field StructGep in {:?}",
-        bb.instructions
-    );
+    assert_flat_gep_steps(&bb.instructions, 2, 16);
     assert!(bb.instructions.iter().any(|inst| matches!(
         inst.opcode,
         Opcode::Load {
@@ -481,13 +560,14 @@ fn multi_index_record_gep_lowers_through_struct_gep() {
 }
 
 #[test]
-fn nested_struct_array_multi_index_gep_lowers_through_aggregate_geps() {
+fn nested_struct_array_multi_index_gep_keeps_one_scale() {
     let (structs, types, outer_ty) = nested_matrix_struct();
     let module = single_function_module(
         "nested_struct_array_gep",
         FuncTy {
             params: vec![Ty::Ptr, Ty::I64, Ty::I64],
             returns: vec![Ty::I32],
+            abi: None,
             is_vararg: false,
         },
         structs,
@@ -525,25 +605,30 @@ fn nested_struct_array_multi_index_gep_lowers_through_aggregate_geps() {
         }],
     );
 
-    let (lir_func, _proofs) = translate_function(single_function(&module), &module)
-        .expect("adapter must lower nested multi-index GEP");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower nested multi-index GEP");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
-    assert!(
-        bb.instructions
-            .iter()
-            .any(|inst| matches!(inst.opcode, Opcode::StructGep { field_index: 1, .. })),
-        "expected field-1 StructGep in {:?}",
-        bb.instructions
-    );
-    let array_geps = bb
+    // All four indices stride the complete outer struct, never its fields.
+    let strides: Vec<_> = bb
         .instructions
         .iter()
-        .filter(|inst| matches!(inst.opcode, Opcode::ArrayGep { .. }))
-        .count();
-    assert_eq!(
-        array_geps, 3,
-        "expected leading object, row, and column ArrayGep ops"
+        .filter_map(|inst| match &inst.opcode {
+            Opcode::ArrayGep { elem_ty } => Some(elem_ty.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(strides.len(), 4);
+    assert!(strides.iter().all(|ty| ty == &strides[0]));
+    assert!(matches!(strides[0], Type::Struct(_)));
+    assert!(
+        !bb.instructions
+            .iter()
+            .any(|inst| matches!(inst.opcode, Opcode::StructGep { .. }))
     );
     assert!(bb.instructions.iter().any(|inst| matches!(
         inst.opcode,
@@ -555,13 +640,14 @@ fn nested_struct_array_multi_index_gep_lowers_through_aggregate_geps() {
 }
 
 #[test]
-fn multi_index_gep_rejects_dynamic_struct_field_index() {
+fn multi_index_gep_accepts_dynamic_indices_for_struct_pointees() {
     let (structs, types, outer_ty) = nested_matrix_struct();
     let module = single_function_module(
         "dynamic_struct_field_gep",
         FuncTy {
             params: vec![Ty::Ptr, Ty::I64],
             returns: vec![Ty::Ptr],
+            abi: None,
             is_vararg: false,
         },
         structs,
@@ -587,18 +673,33 @@ fn multi_index_gep_rejects_dynamic_struct_field_index() {
         }],
     );
 
-    let err = translate_function(single_function(&module), &module).unwrap_err();
-    assert_unsupported_message(err, "struct field index must be a constant");
+    let (lir, _) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .unwrap();
+    let steps: Vec<_> = lir.blocks[&lir.entry_block]
+        .instructions
+        .iter()
+        .filter_map(|inst| match &inst.opcode {
+            Opcode::ArrayGep { elem_ty } => Some(elem_ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0], steps[1]);
 }
 
 #[test]
-fn multi_index_gep_rejects_struct_field_out_of_bounds() {
+fn multi_index_gep_indices_are_not_limited_by_field_count() {
     let (structs, types, outer_ty) = nested_matrix_struct();
     let module = single_function_module(
         "oob_struct_field_gep",
         FuncTy {
             params: vec![Ty::Ptr],
             returns: vec![Ty::Ptr],
+            abi: None,
             is_vararg: false,
         },
         structs,
@@ -629,17 +730,35 @@ fn multi_index_gep_rejects_struct_field_out_of_bounds() {
         }],
     );
 
-    let err = translate_function(single_function(&module), &module).unwrap_err();
-    assert_unsupported_message(err, "out of bounds");
+    let (lir, _) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .unwrap();
+    let bb = &lir.blocks[&lir.entry_block];
+    assert_eq!(
+        bb.instructions
+            .iter()
+            .filter(|inst| matches!(inst.opcode, Opcode::ArrayGep { .. }))
+            .count(),
+        2
+    );
+    assert!(
+        !bb.instructions
+            .iter()
+            .any(|inst| matches!(inst.opcode, Opcode::StructGep { .. }))
+    );
 }
 
 #[test]
-fn multi_index_gep_rejects_trailing_index_into_scalar() {
+fn multi_index_gep_accepts_scalar_pointees() {
     let module = single_function_module(
         "scalar_trailing_index_gep",
         FuncTy {
             params: vec![Ty::Ptr, Ty::I64, Ty::I64],
             returns: vec![Ty::Ptr],
+            abi: None,
             is_vararg: false,
         },
         vec![],
@@ -660,8 +779,13 @@ fn multi_index_gep_rejects_trailing_index_into_scalar() {
         }],
     );
 
-    let err = translate_function(single_function(&module), &module).unwrap_err();
-    assert_unsupported_message(err, "non-aggregate type");
+    let (lir, _) = trust_cg_lower::translate_function_with_license(
+        single_function(&module),
+        &module,
+        &permit_unlicensed(),
+    )
+    .unwrap();
+    assert_flat_gep_steps(&lir.blocks[&lir.entry_block].instructions, 2, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -688,17 +812,25 @@ fn closure_capture_extract_lowers_via_struct_gep() {
     let closure = Ty::Closure(ClosureTyId::new(0));
     let mut module = TrustIrModule::new("extract_closure_capture");
     // The closure's bare-fn signature references a func type; add one first.
-    let bare_fn = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
-    module.add_closure_type(heterogeneous_closure_ty(bare_fn));
-    let fty_id = module.add_func_type(FuncTy {
-        params: vec![closure.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let bare_fn = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    module
+        .add_closure_type(heterogeneous_closure_ty(bare_fn))
+        .expect("Module::add_closure_type: test fixture");
+    let fty_id = module
+        .add_func_type(FuncTy {
+            params: vec![closure.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(1), "extract_closure_capture", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -719,10 +851,16 @@ fn closure_capture_extract_lowers_via_struct_gep() {
             InstrNode::new(Inst::Return { values: vec![v(2)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
-    let (lir_func, _proofs) = translate_function(&module.functions[0], &module)
-        .expect("adapter must lower closure capture extract");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        &module.functions[0],
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower closure capture extract");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
     assert!(
@@ -747,17 +885,25 @@ fn closure_capture_extract_lowers_via_struct_gep() {
 fn closure_capture_insert_lowers_via_struct_gep() {
     let closure = Ty::Closure(ClosureTyId::new(0));
     let mut module = TrustIrModule::new("insert_closure_capture");
-    let bare_fn = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
-    module.add_closure_type(heterogeneous_closure_ty(bare_fn));
-    let fty_id = module.add_func_type(FuncTy {
-        params: vec![closure.clone(), Ty::I64],
-        returns: vec![closure.clone()],
-        is_vararg: false,
-    });
+    let bare_fn = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    module
+        .add_closure_type(heterogeneous_closure_ty(bare_fn))
+        .expect("Module::add_closure_type: test fixture");
+    let fty_id = module
+        .add_func_type(FuncTy {
+            params: vec![closure.clone(), Ty::I64],
+            returns: vec![closure.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(1), "insert_closure_capture", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -773,41 +919,44 @@ fn closure_capture_insert_lowers_via_struct_gep() {
             InstrNode::new(Inst::Return { values: vec![v(2)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
-    let (lir_func, _proofs) = translate_function(&module.functions[0], &module)
-        .expect("adapter must lower closure capture insert");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        &module.functions[0],
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must lower closure capture insert");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
-    assert!(matches!(
-        bb.instructions[0].opcode,
-        Opcode::StructGep { field_index: 1, .. }
-    ));
-    assert!(matches!(
-        bb.instructions[1].opcode,
-        Opcode::Store {
-            ty: Type::I64,
-            align: None
-        }
-    ));
-    assert!(matches!(bb.instructions[2].opcode, Opcode::Copy));
+    assert_value_semantic_i64_insert(&bb.instructions, 1);
 }
 
 #[test]
 fn closure_capture_extract_rejects_type_mismatch() {
     let closure = Ty::Closure(ClosureTyId::new(0));
     let mut module = TrustIrModule::new("extract_closure_capture_mismatch");
-    let bare_fn = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
-    module.add_closure_type(heterogeneous_closure_ty(bare_fn));
-    let fty_id = module.add_func_type(FuncTy {
-        params: vec![closure.clone()],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let bare_fn = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    module
+        .add_closure_type(heterogeneous_closure_ty(bare_fn))
+        .expect("Module::add_closure_type: test fixture");
+    let fty_id = module
+        .add_func_type(FuncTy {
+            params: vec![closure.clone()],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(1), "extract_closure_capture_mismatch", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -829,8 +978,24 @@ fn closure_capture_extract_rejects_type_mismatch() {
             InstrNode::new(Inst::Return { values: vec![v(2)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
-    let err = translate_function(&module.functions[0], &module).unwrap_err();
+    let err = trust_cg_lower::translate_function_with_license(
+        &module.functions[0],
+        &module,
+        &permit_unlicensed(),
+    )
+    .unwrap_err();
     assert_unsupported_message(err, "does not match closure capture type");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

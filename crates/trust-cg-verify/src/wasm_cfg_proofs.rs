@@ -99,7 +99,7 @@ use std::fmt;
 /// The wasm number types this checker models. `v128` and the reference types
 /// are deliberately absent: the backend rejects them, and a module containing
 /// one must fail CLOSED (`Inconclusive`) rather than be waved through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValKind {
     /// `i32` (spec byte 0x7f).
     I32,
@@ -1109,14 +1109,25 @@ fn decode_one(r: &mut Reader<'_>, func: u32) -> Result<DecodedInst, DecodeStop> 
         // ---- the 0xfc prefix (saturating truncation, bulk memory) ----
         0xfc => {
             let s = r.uleb32().ok_or_else(|| trunc(func, offset))?;
-            if s > 7 {
-                return Err(DecodeStop::Unsupported(
-                    CfgUnsupported::UnknownPrefixedOpcode {
-                        func,
-                        offset,
-                        sub: s,
-                    },
-                ));
+            match s {
+                0..=7 => {}
+                // memory.copy: destination and source memory indices.
+                10 => {
+                    r.take(2).ok_or_else(|| trunc(func, offset))?;
+                }
+                // memory.fill: the memory index.
+                11 => {
+                    r.take(1).ok_or_else(|| trunc(func, offset))?;
+                }
+                _ => {
+                    return Err(DecodeStop::Unsupported(
+                        CfgUnsupported::UnknownPrefixedOpcode {
+                            func,
+                            offset,
+                            sub: s,
+                        },
+                    ));
+                }
             }
             sub = Some(s);
             Imm::None
@@ -1961,6 +1972,12 @@ fn check_function(
             0x44 => v.push_all(&[ValKind::F64]),
             0xfc => {
                 let sub = inst.sub.unwrap_or(u32::MAX);
+                if matches!(sub, 10 | 11) {
+                    // memory.copy [dst, src, n] / memory.fill [dst, byte, n]:
+                    // three i32 operands, no result.
+                    v.pop_expects(&[ValKind::I32, ValKind::I32, ValKind::I32], off)?;
+                    continue;
+                }
                 let (from, to) =
                     trunc_sat_rule(sub).ok_or(CfgUnsupported::UnknownPrefixedOpcode {
                         func: func_index,
@@ -1969,6 +1986,26 @@ fn check_function(
                     })?;
                 v.pop_expect(from, off)?;
                 v.push_all(&[to]);
+            }
+            // select: [t t i32] -> [t], both operands one numeric type.
+            0x1b => {
+                v.pop_expect(ValKind::I32, off)?;
+                let b = v.pop(off)?;
+                let a = v.pop(off)?;
+                match (a, b) {
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(Failure::Violated(CfgViolation::TypeMismatch {
+                            func: func_index,
+                            offset: off,
+                            expected: a,
+                            found: b,
+                        }));
+                    }
+                    (Some(t), _) | (None, Some(t)) => v.push_all(&[t]),
+                    // Both operands came from unreachable code: the result is
+                    // polymorphic too; model it as nothing on the stack.
+                    (None, None) => {}
+                }
             }
             other => {
                 let (pops, pushes) = numeric_rule(other).ok_or(CfgUnsupported::UnknownOpcode {
@@ -2243,7 +2280,7 @@ pub const WASM_CFG_DEFERRALS: &[WasmCfgDeferral] = &[
                  because a control-flow type check cannot proceed without them, and it SKIPS table, \
                  memory, start, element, data and datacount by length. Nothing here obligates the \
                  section order, the index-space shift that imported functions impose, the element \
-                 segment's funcidx == table-index identity, or the LEB128 encodings themselves \
+                 segment's funcidx-to-table-index mapping, or the LEB128 encodings themselves \
                  beyond rejecting over-long ones. Those are separate families' rows and must not be \
                  read as covered because a module 'passed the CFG check'",
     },
@@ -2536,6 +2573,30 @@ pub fn mutate_local_set_to_get(module: &[u8]) -> Option<Vec<u8>> {
                 *out.get_mut(base + inst.offset)? = 0x20;
                 return Some(out);
             }
+        }
+    }
+    None
+}
+
+/// Rewrite the `nth` `local.set` (0x21) as a `local.get` (0x20), counting
+/// across every function body in order. Returns `None` once `nth` is past the
+/// last `local.set`, so a caller can enumerate every site: whether the extra
+/// value reaches a reachable join depends on the site, as for
+/// [`mutate_bump_nth_branch_depth`].
+pub fn mutate_nth_local_set_to_get(module: &[u8], nth: usize) -> Option<Vec<u8>> {
+    let bodies = decode_function_bodies(module).ok()?;
+    let mut seen = 0usize;
+    for (base, insts) in bodies {
+        for inst in insts {
+            if inst.opcode != 0x21 {
+                continue;
+            }
+            if seen == nth {
+                let mut out = module.to_vec();
+                *out.get_mut(base + inst.offset)? = 0x20;
+                return Some(out);
+            }
+            seen += 1;
         }
     }
     None

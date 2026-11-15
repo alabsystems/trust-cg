@@ -1,0 +1,36 @@
+# trust-ir-cg census: `core`
+* emitted objects in `obj/`: 44 (per-function/per-batch objects the backend DID produce; not a success count of mono items)
+
+* compiler: `rustc 1.99.0-dev (d7f143f3b 2026-09-21) (trustc 0.1.0)` at `trust/build/x86_64-apple-darwin/stage1/bin/trustc`
+* backend: `~/tcg-scratch/runs/p2.dylib`; panic=abort; opt-level=0
+* repo rev: `d7f143f3be5ac67de26cc75b52da3f2d87a7b770`; trust-cg rev: `de1f19099ff1c50c475df239e0bed471805897b5`
+* exit code: `1`; wall: 458s
+* typed refusals (JSON): **1** across **1** functions; distinct codes: 1
+* failed roots (externally required, fail-closed): **3**; distinct reasons: 3
+* skipped internal functions (dropped as unreachable — for a LIBRARY every one is a missing symbol downstream): **0**; distinct reasons: 0
+* trapping stubs emitted for dynamic-dispatch shims (link, but TRAP if reached): **0**; distinct reasons: 0
+* harness errors (non-backend `error:` lines): 0
+
+## Failed roots by reason
+
+| rank | reason | count | example symbol |
+|---:|---|---:|---|
+| 1 | `atomic over non-I<n>..I<n>-scalar element i<n>` | 1 | `_RINvNtNtCs7e1ihmkzmZ8_4core4sync6atomic11atomic_loadnEB6_` |
+| 2 | `atomic over non-I<n>..I<n>-scalar element u<n>` | 1 | `_RINvNtNtCs7e1ihmkzmZ8_4core4sync6atomic11atomic_loadoEB6_` |
+| 3 | `unsupported intrinsic `_`` | 1 | `_RNvMs4_NtNtCs7e1ihmkzmZ8_4core5panic8locationNtB5_8Location6callerB9_` |
+
+## Skipped internal functions by reason
+
+| rank | reason | count | example symbol |
+|---:|---|---:|---|
+
+## Trapping stubs by reason
+
+| rank | reason | count | example symbol |
+|---:|---|---:|---|
+
+## Typed diagnostic codes
+
+| rank | code | count | example function | example why |
+|---:|---|---:|---|---|
+| 1 | `TCG-MIR-UNSUPPORTED` | 1 | `<crate>` | rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): |

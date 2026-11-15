@@ -1,0 +1,27 @@
+; TrustIr text format v1
+module "_RNvCsbNpgVeGsYJb_13m2_call_heavy3mix"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (u64, u64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCsbNpgVeGsYJb_13m2_call_heavy3mix(functy.0) {
+bb0(%1: u64, %2: u64):
+    %7 = const u64 1
+    %6 = or u64 %2, %7
+    %8 = mul u64 %1, %6
+    %10 = const i32 11
+    %11 = const u64 11
+    %9 = lshr u64 %1, %11
+    %12 = xor u64 %8, %9
+    ret %12
+}

@@ -6,9 +6,6 @@
 //
 // Part of #387 (proptest panic-fuzz) / Part of #372 (Crash-free codegen).
 //
-// Reference: `designs/2026-04-18-crash-free-codegen-plan.md` §5 (proptest
-// as primary defense) and §6 (per-crate harness).
-//
 // Contract under test: for *any* trust_ir function, the full end-to-end
 // compilation pipeline (`translate_function` -> `Pipeline::compile_function`)
 // must either return `Ok(Vec<u8>)` or `Err(..)` — it must NEVER panic,
@@ -17,9 +14,9 @@
 // each boundary individually.
 //
 // Run:
-//   cargo test -p trust-cg-codegen --test panic_fuzz_compile
+//   scripts/trust_cargo.sh test -p trust-cg-codegen --test panic_fuzz_compile
 // Increase case count via env:
-//   PROPTEST_CASES=100000 cargo test -p trust-cg-codegen --test panic_fuzz_compile
+//   PROPTEST_CASES=100000 scripts/trust_cargo.sh test -p trust-cg-codegen --test panic_fuzz_compile
 
 use std::panic;
 
@@ -73,6 +70,15 @@ enum VectorLoweringShape {
 // ---------------------------------------------------------------------------
 // Strategies
 // ---------------------------------------------------------------------------
+
+/// The generated functions carry no `body_gate`, which trust-cg refuses by
+/// default (roadmap WS7.5, DG-73). Under the default every case would stop at
+/// the license and this harness would pass VACUOUSLY; it states `Permit` so
+/// every case reaches the pipeline it fuzzes.
+fn permit() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
 
 fn binop_strategy() -> impl Strategy<Value = BinOp> {
     prop_oneof![
@@ -194,11 +200,14 @@ fn vector_lowering_shape_strategy() -> impl Strategy<Value = VectorLoweringShape
 fn materialise(spec: &FuncSpec) -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("_panic_fuzz_compile");
     let params: Vec<Ty> = vec![Ty::I64; spec.num_params as usize];
-    let ft_id = module.add_func_type(FuncTy {
-        params: params.clone(),
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: params.clone(),
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let block_count = spec.blocks.len();
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fuzz_fn", ft_id, BlockId::new(0));
@@ -343,11 +352,14 @@ fn materialise_vector_shape(spec: &VectorLoweringShape) -> (TrustIrFunction, Tru
     };
 
     let mut module = TrustIrModule::new("_panic_fuzz_compile_vector");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fuzz_vector_fn", ft_id, BlockId::new(0));
 
     let lhs_vid = ValueId::new(1000);
@@ -423,7 +435,7 @@ fn assert_no_panic(func: &TrustIrFunction, module: &TrustIrModule, opt_level: Op
     let m = module.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
         // Stage 1: trust_ir -> LIR
-        let lir = match trust_cg_lower::translate_function(&f, &m) {
+        let lir = match trust_cg_lower::translate_function_with_license(&f, &m, &permit()) {
             Ok((lir_func, _)) => lir_func,
             Err(_) => return, // adapter rejected — that's fine, it didn't panic
         };
@@ -431,7 +443,7 @@ fn assert_no_panic(func: &TrustIrFunction, module: &TrustIrModule, opt_level: Op
         let config = PipelineConfig {
             opt_level,
             emit_debug: false,
-            ..Default::default()
+            ..PipelineConfig::for_target("aarch64-apple-darwin")
         };
         let pipeline = Pipeline::new(config);
         let _ = pipeline.compile_function(&lir);
@@ -454,16 +466,52 @@ fn assert_no_panic(func: &TrustIrFunction, module: &TrustIrModule, opt_level: Op
     }
 }
 
+/// The case count every property in this file runs: PROPTEST_CASES, else 64.
+fn panic_fuzz_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64)
+}
+
+/// Positive control for the case count, as in `panic_fuzz_lower.rs`: a
+/// property with this file's case configuration counts the cases it actually
+/// ran and prints both figures on one line. The Linux floor requires the
+/// line with this file's default and the fuzz lane with its
+/// `--proptest-cases`, so a case count shrunk behind their back fails them.
+#[test]
+fn panic_fuzz_runs_its_configured_case_count() {
+    let configured = panic_fuzz_cases();
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: configured,
+        ..ProptestConfig::default()
+    });
+    let run = std::cell::Cell::new(0u32);
+    runner
+        .run(&any::<u64>(), |_| {
+            run.set(run.get() + 1);
+            Ok(())
+        })
+        .expect("the counting property cannot fail");
+    println!(
+        "panic-fuzz proptest cases: configured={configured} run={}",
+        run.get()
+    );
+    assert!(run.get() > 0, "no proptest case ran");
+    assert_eq!(
+        run.get(),
+        configured,
+        "proptest ran a different number of cases"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         // The full pipeline is materially slower than the per-stage
         // harnesses (every case runs ISel, opt, regalloc, frame, encode,
         // emit). 256 cases at O3 on a 3-block function is still <30s
         // locally; reduce via PROPTEST_CASES=32 while iterating.
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64),
+        cases: panic_fuzz_cases(),
         max_shrink_iters: 200,
         .. ProptestConfig::default()
     })]
@@ -523,11 +571,14 @@ fn regression_multi_block_no_edges_panics() {
 
     // Build a 2-block function where both blocks end in Return.
     let mut module = TrustIrModule::new("_panic_fuzz_compile");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fuzz_fn", ft_id, BlockId::new(0));
 
     let mk_block = |id: u32, vid: u32| TrustIrBlock {
@@ -548,12 +599,12 @@ fn regression_multi_block_no_edges_panics() {
 
     // Drive the full pipeline — must not panic. Any return value (Ok or
     // typed Err) is acceptable; only a panic would regress this fix.
-    let (lir, _) = trust_cg_lower::translate_function(&func, &module)
+    let (lir, _) = trust_cg_lower::translate_function_with_license(&func, &module, &permit())
         .expect("adapter should accept multi-block all-Return");
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
     let _ = pipeline.compile_function(&lir);
 }

@@ -1,0 +1,9 @@
+; mutant-of: (none: not a registered rule)
+; mutation: equal only on runs that do not fail: x / -1 is -x except at x = MIN, where sdiv is undefined behaviour
+; subject: i32
+(rule sdiv_neg_one
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize)
+  (lhs (sdiv ?x (const -1)))
+  (rhs (neg ?x))
+  (where))

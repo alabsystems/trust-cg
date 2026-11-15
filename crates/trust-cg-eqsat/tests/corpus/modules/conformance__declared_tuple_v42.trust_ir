@@ -1,0 +1,21 @@
+; TrustIr text format v1
+module "declared_tuple_v42"
+target "x86_64-unknown-linux-gnu" 8 little structpass=unclassified
+
+functy.0 = () -> (u64)
+
+type ty.0 = (u8, u64, u8)
+
+tuple_layout ty.0 size=16 align=8 offsets=[8,0,9]
+
+fn @read_declared_image(functy.0) {
+    ; #body-gate: ungated
+bb0:
+    %0 = alloca (u8, u64, u8)
+    %1 = const (u8, u64, u8) { 17, 1234605616436508552, 34 }
+    store (u8, u64, u8) %1, ptr %0
+    %2 = const i64 0
+    %3 = gep inbounds u8, ptr %0, %2
+    %4 = load u64, ptr %3
+    ret %4
+}

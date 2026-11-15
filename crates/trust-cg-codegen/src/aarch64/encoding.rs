@@ -52,6 +52,27 @@ pub mod shift {
 // Encoding functions
 // ---------------------------------------------------------------------------
 
+/// Encode **SUBS Xd|XZR, SP, Xm** — Add/Subtract (extended register), 64-bit,
+/// `op = 1`, `S = 1`, option `UXTX` (0b011), `imm3 = 0`.
+///
+/// ```text
+/// 31  30 29  28:24  23:22 21  20:16  15:13   12:10  9:5  4:0
+///  1   1  1  01011   00    1   Rm    option  imm3   Rn   Rd
+/// ```
+///
+/// Rn = 31 is SP in this class (in the shifted-register class it is XZR),
+/// and with `S = 1` Rd = 31 is XZR, so `rd = 31` spells `CMP SP, Xm`. This is
+/// the only add/subtract form whose first source may be SP with a register
+/// second source; the U10 prologue stack-limit check uses it.
+///
+/// Source: `AddSubExtendedReg` (`ADDSXrx64`/`SUBSXrx64` family) in
+/// `AArch64InstrFormats.td`.
+pub fn encode_subs_sp_extended(rm: u32, rd: u32) -> u32 {
+    debug_assert!(rm <= 30);
+    debug_assert!(rd <= 31);
+    0xEB20_6000 | (rm << 16) | (31 << 5) | rd
+}
+
 /// Encode **Add/Subtract (shifted register)** — ADD, SUB, ADDS, SUBS.
 ///
 /// ```text

@@ -1,0 +1,55 @@
+# Host identity and toolchains — 2026-09-28T13:52:58Z
+## machine
+hw.model: Mac16,5
+machdep.cpu.brand_string: Apple M4 Max
+hw.ncpu: 16
+hw.physicalcpu: 16
+hw.logicalcpu: 16
+hw.nperflevels: 2
+hw.perflevel0.name: Performance
+hw.perflevel0.physicalcpu: 12
+hw.perflevel1.name: Efficiency
+hw.perflevel1.physicalcpu: 4
+hw.memsize: 51539607552
+hw.pagesize: 16384
+memory_gib: 48.0
+## operating system
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+Darwin 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:17:26 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6041 arm64
+## power
+Now drawing from 'AC Power'
+ -InternalBattery-0 (id=34603107)	80%; AC attached; not charging present: true
+ powermode            0
+## Trust package (every measured lane)
+package: $HOME/Library/Application Support/aterm/pkg/store/trust/9192
+rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)
+binary: trustc
+commit-hash: 321aaeda75478038420d97830f14724c33c8dc39
+commit-date: 2026-09-17
+host: aarch64-apple-darwin
+release: 1.99.0-dev
+trust: 0.1.0
+LLVM version: 22.1.2
+targo 1.99.0-dev (321aaeda7 2026-09-17) (targo 0.1.0)
+## independent proof checker candidates (as the backend reported them)
+clean 0.9.0
+managed clean: $HOME/Library/Application Support/aterm/pkg/store/clean/8606
+clean 0.9.0
+## linker and C toolchain
+Apple clang version 21.0.0 (clang-2100.3.34.2)
+Target: arm64-apple-darwin25.6.0
+@(#)PROGRAM:ld PROJECT:ld-27037.1
+macOS SDK: 27.0
+## harness interpreter
+Python 3.14.5
+## bridge backend
+path: $HOME/trust-cg/.claude/worktrees/agent-workflow/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib
+bytes: 112016672  mtime: 2026-09-28T06:38:06-0700
+sha256: 8fb063d31d9d426100110267ed148bf75dfc712fc4f205fa83e248692d1efb77
+build: cd crates/rustc-codegen-trust-cg && CARGO_TARGET_DIR=target-bridge RUSTC=$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo --unverified build --release --locked
+## source
+01fc13b13608dc933e84bc7fbfec6c50442fe7eb
+01fc13b13608dc933e84bc7fbfec6c50442fe7eb 2026-09-28T06:41:31-07:00 perf: scaling gates take the host target and backend (X-DARWIN-P8)
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "c603897ba0978f3572a18674ec7a5d9c29849671", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }

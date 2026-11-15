@@ -157,9 +157,10 @@ fn wasm_fcmp_model_i1(op: &str, a: &SmtExpr, b: &SmtExpr) -> SmtExpr {
 /// trust-ir **interpreter** (`interpret.rs`: `ordered = !isnan(a)&&!isnan(b)`;
 /// `OXx = ordered && a<x>b`; `UXx = unordered || a<x>b`). The interpreter is the
 /// operational reference (mirrored in Lean). NOTE: this deliberately does NOT
-/// use `trust_ir_semantics::encode_trust_ir_fcmp`, whose `NotEqual` arm is
-/// `!fp.eq` (UNORDERED) and disagrees with the interpreter's ORDERED `ONe` — a
-/// real inconsistency in that SMT-semantics helper; the interpreter is canonical.
+/// use `trust_ir_semantics::encode_trust_ir_fcmp`: retain an independently
+/// written interpreter-canonical predicate model. The shared source encoder's
+/// `NotEqual` arm also implements ordered `ONe`; neither spelling alone binds
+/// the operands of an actual emitted comparison.
 fn interp_fcmp_model_i1(op: &str, a: &SmtExpr, b: &SmtExpr) -> SmtExpr {
     let unordered = a.clone().fp_is_nan().or_expr(b.clone().fp_is_nan());
     let ordered = unordered.clone().not_expr();
@@ -196,16 +197,16 @@ pub fn fcmp_proofs() -> Vec<ProofObligation> {
     let mut out = Vec::new();
     for (eb, sb, tag) in [(8u32, 24u32, "f32"), (11, 53, "f64")] {
         for op in ops {
-            let a = SmtExpr::var("a", eb + sb);
-            let b = SmtExpr::var("b", eb + sb);
+            let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("a_bits", eb + sb), eb, sb);
+            let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("b_bits", eb + sb), eb, sb);
             out.push(ProofObligation {
                 machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
                 name: format!("FCmp_{op}_{tag} -> wasm"),
                 trust_ir_expr: interp_fcmp_model_i1(op, &a, &b),
                 aarch64_expr: wasm_fcmp_model_i1(op, &a, &b),
-                inputs: vec![],
+                inputs: vec![("a_bits".into(), eb + sb), ("b_bits".into(), eb + sb)],
                 preconditions: vec![],
-                fp_inputs: vec![("a".to_string(), eb, sb), ("b".to_string(), eb, sb)],
+                fp_inputs: vec![],
                 category: None,
             });
         }
@@ -215,16 +216,16 @@ pub fn fcmp_proofs() -> Vec<ProofObligation> {
 
 /// Anti-tautology: claim ordered `OEq` lowers to ordered `OLt`. Must be refuted.
 pub fn proof_wrong_oeq_is_olt() -> ProofObligation {
-    let a = SmtExpr::var("a", 32);
-    let b = SmtExpr::var("b", 32);
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("a_bits", 32), 8, 24);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("b_bits", 32), 8, 24);
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: "WRONG: FCmp OEq_f32 -> OLt (must be refuted)".to_string(),
         trust_ir_expr: interp_fcmp_model_i1("OEq", &a, &b),
         aarch64_expr: wasm_fcmp_model_i1("OLt", &a, &b),
-        inputs: vec![],
+        inputs: vec![("a_bits".into(), 32), ("b_bits".into(), 32)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), 8, 24), ("b".to_string(), 8, 24)],
+        fp_inputs: vec![],
         category: None,
     }
 }
@@ -586,7 +587,7 @@ mod tests {
             let verdict = discharge(&ob);
             if verdict == Formal::Proven {
                 proven += 1;
-            } else if let Some(reason) = certification_gap_reason(&ob, &verdict) {
+            } else if let Some(reason) = certification_gap_reason(&verdict) {
                 crate::formal_gap::print_gap_skip(
                     &format!("formal_discharge_summary `{}`", ob.name),
                     &reason,

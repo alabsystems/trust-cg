@@ -1,0 +1,27 @@
+tcg-lrat-cert-v3
+verdict-sha256: 4e33081b216c511c4f8c944370095f6659b34cbe629003dd9f8fd5822345300e
+solver-sha256: 2d62816f907f5091b12e8afae2bf9a73176f88eaee01d4d8832ce2f3726a1991
+cnf-sha256: b014f809553a147608afd125856dfdf742dcecf38ce03f39394422f3215f56e3
+obligation: ConstMat: MOVZ #imm16, LSL #0 == zext(imm16)
+cnf 180
+c ay export pid 3704214 generation 2
+c ay bit-blasted QF_BV CNF (--dump-bv-cnf)
+c complete eager encoding of the current check-sat query
+p cnf 18 5
+-1 0
+-18 0
+18 0
+-1 -18 0
+1 18 0
+
+drat 2
+0
+
+smt2 1326
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const imm16 (_ BitVec 16))
+(assert (not (= ((_ zero_extend 48) imm16) (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor (bvor ((_ zero_extend 63) ((_ extract 0 0) imm16)) (_ bv0 64)) (bvshl ((_ zero_extend 63) ((_ extract 1 1) imm16)) (_ bv1 64))) (bvshl ((_ zero_extend 63) ((_ extract 2 2) imm16)) (_ bv2 64))) (bvshl ((_ zero_extend 63) ((_ extract 3 3) imm16)) (_ bv3 64))) (bvshl ((_ zero_extend 63) ((_ extract 4 4) imm16)) (_ bv4 64))) (bvshl ((_ zero_extend 63) ((_ extract 5 5) imm16)) (_ bv5 64))) (bvshl ((_ zero_extend 63) ((_ extract 6 6) imm16)) (_ bv6 64))) (bvshl ((_ zero_extend 63) ((_ extract 7 7) imm16)) (_ bv7 64))) (bvshl ((_ zero_extend 63) ((_ extract 8 8) imm16)) (_ bv8 64))) (bvshl ((_ zero_extend 63) ((_ extract 9 9) imm16)) (_ bv9 64))) (bvshl ((_ zero_extend 63) ((_ extract 10 10) imm16)) (_ bv10 64))) (bvshl ((_ zero_extend 63) ((_ extract 11 11) imm16)) (_ bv11 64))) (bvshl ((_ zero_extend 63) ((_ extract 12 12) imm16)) (_ bv12 64))) (bvshl ((_ zero_extend 63) ((_ extract 13 13) imm16)) (_ bv13 64))) (bvshl ((_ zero_extend 63) ((_ extract 14 14) imm16)) (_ bv14 64))) (bvshl ((_ zero_extend 63) ((_ extract 15 15) imm16)) (_ bv15 64))))))
+(check-sat)
+(exit)

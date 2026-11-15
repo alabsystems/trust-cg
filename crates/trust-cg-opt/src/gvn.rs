@@ -77,6 +77,7 @@ use crate::effects::{
     MemoryEffect, aarch64_def_operand_positions, has_tied_def_use, opcode_effect, reads_flags,
     writes_flags,
 };
+use crate::eh_call_custody::UnwindExits;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 use crate::proof_opts::{
     OptAdmissionRoute, OptCertificate, OptCertificateKind, OptConsumedProofFact,
@@ -553,6 +554,7 @@ fn run_gvn(
     // preserves the recursive algorithm's scope boundaries.
     dom_walk_gvn(
         func,
+        &UnwindExits::collect(func),
         dom,
         func.entry,
         &mut table,
@@ -696,6 +698,7 @@ fn has_non_primary_def(inst: &MachInst) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn gvn_process_block(
     func: &MachFunction,
+    unwind_exits: &UnwindExits,
     block_id: BlockId,
     table: &mut ScopedValueTable,
     alloc: &mut ValNumAllocator,
@@ -709,8 +712,19 @@ fn gvn_process_block(
     proof_dependent_load_eliminations: &mut Vec<ProofDependentLoadElimination>,
 ) {
     let block = func.block(block_id);
+    // A block can leave in the middle: through a conditional exit (a
+    // switch's compare-and-branch cascade), or through a call whose exception
+    // edge leaves for a landing pad (`UnwindExits`). An expression entered
+    // after one does not run on every path into the blocks this block
+    // dominates, so it serves only the rest of this block and leaves the
+    // table at the block's end.
+    let mut after_exit = false;
+    let mut block_local_exprs: Vec<VNExprKey> = Vec::new();
     for &inst_id in &block.insts {
         let inst = func.inst(inst_id);
+        if inst.opcode.is_conditional_branch() || unwind_exits.contains(inst_id) {
+            after_exit = true;
+        }
         let effect = opcode_effect(inst.opcode);
 
         // Stores and calls kill load value numbers. A proof-reorderable
@@ -841,6 +855,9 @@ fn gvn_process_block(
             // New expression — assign fresh value number.
             let vn = alloc.fresh();
             table.set_vreg_vn(def_vreg, vn);
+            if after_exit {
+                block_local_exprs.push(expr_key.clone());
+            }
             table.insert_expr(expr_key, vn, Leader { inst_id, def_vreg });
             continue;
         }
@@ -854,6 +871,9 @@ fn gvn_process_block(
     // not enough to prove memory availability at CFG merges: a sibling branch
     // may store to the same address before control reaches the merge block.
     table.load_table.clear();
+    for key in &block_local_exprs {
+        table.expr_table.remove(key);
+    }
 }
 
 /// Iterative dominator-tree walk with scope push/pop.
@@ -870,6 +890,7 @@ fn gvn_process_block(
 #[allow(clippy::too_many_arguments)]
 fn dom_walk_gvn(
     func: &MachFunction,
+    unwind_exits: &UnwindExits,
     dom: &DomTree,
     block_id: BlockId,
     table: &mut ScopedValueTable,
@@ -898,6 +919,7 @@ fn dom_walk_gvn(
                 let outer_load_table = std::mem::take(&mut table.load_table);
                 gvn_process_block(
                     func,
+                    unwind_exits,
                     block_id,
                     table,
                     alloc,
@@ -1275,6 +1297,10 @@ fn gvn_hash_operand(h: &mut StableHasher, operand: &MachOperand) {
         }
         MachOperand::Symbol(symbol) => {
             h.write_u8(9);
+            h.write_str(symbol);
+        }
+        MachOperand::ExactModuleSymbol(symbol) => {
+            h.write_u8(12);
             h.write_str(symbol);
         }
         MachOperand::JumpTableIndex(index) => {
@@ -2215,6 +2241,8 @@ mod tests {
         let mut func = make_func_with_insts(vec![l1, st, l2, add, ret]);
 
         let mut pm = PassManager::new().with_pass(Box::new(GlobalValueNumbering));
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let run_stats = pm.run_once_with_stats(&mut func);
 
         assert_eq!(run_stats.changes, 1);
@@ -2259,6 +2287,8 @@ mod tests {
         let mut func = make_func_with_insts(vec![l1, l2, ret]);
 
         let mut pm = PassManager::new().with_pass(Box::new(GlobalValueNumbering));
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let run_stats = pm.run_once_with_stats(&mut func);
 
         assert_eq!(run_stats.changes, 1);
@@ -2430,6 +2460,174 @@ mod tests {
             func.block(header).insts.contains(&header_load),
             "loop-header load must remain"
         );
+    }
+
+    #[test]
+    fn test_gvn_does_not_reuse_a_def_after_a_mid_block_exit() {
+        //   bb0: v5 = add v0, v1    ; before the exit: available in bb3
+        //        b.cond bb1         ; a mid-block exit (a switch cascade)
+        //        v2 = sub v0, v1    ; after it: skipped on the bb0 -> bb1 path
+        //        b bb2
+        //   bb1: b bb3
+        //   bb2: b bb3
+        //   bb3: v3 = sub v0, v1    ; must keep its own def
+        //        v4 = add v0, v1    ; reuses v5
+        //        ret
+        //
+        // bb0 dominates bb3, but `v2` is defined only on the path through
+        // bb2; reusing it at bb3 reads a register the bb1 path never wrote.
+        let mut func = MachFunction::new(
+            "test_gvn_mid_block_exit".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let early = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(5), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb0, early);
+        let exit = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb0, exit);
+        let late = func.push_inst(MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![vreg(2), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb0, late);
+        let to_bb2 = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb2)],
+        ));
+        func.append_inst(bb0, to_bb2);
+        for block in [bb1, bb2] {
+            let br = func.push_inst(MachInst::new(
+                AArch64Opcode::B,
+                vec![MachOperand::Block(bb3)],
+            ));
+            func.append_inst(block, br);
+        }
+        let join_sub = func.push_inst(MachInst::new(
+            AArch64Opcode::SubRR,
+            vec![vreg(3), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb3, join_sub);
+        let join_add = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(4), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb3, join_add);
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb3, ret);
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb0, bb2);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb2, bb3);
+
+        let mut pass = GlobalValueNumbering;
+        assert!(
+            pass.run(&mut func),
+            "the add before the exit is still reused"
+        );
+        assert!(
+            func.block(bb3).insts.contains(&join_sub),
+            "the sub after a mid-block exit was reused in a block the exit path reaches"
+        );
+        assert!(!func.block(bb3).insts.contains(&join_add));
+    }
+
+    /// `bb0` is an invoke block: its call leaves for the landing pad `bb2`
+    /// in the middle of the block, as instruction selection lowers `Invoke`.
+    ///
+    /// ```text
+    ///   bb0: v5 = add v0, v1     ; before the call: available in bb2
+    ///        bl may_throw        ; exception edge to bb2 (when `invoke`)
+    ///        v2 = movz #47073    ; after the call: not run on the unwind path
+    ///        b bb1
+    ///   bb1: ret                 ; the normal destination
+    ///   bb2: v3 = movz #47073    ; the landing pad's own constant
+    ///        v4 = add v0, v1     ; reuses v5
+    ///        ret
+    /// ```
+    fn invoke_then_pad(invoke: bool) -> (MachFunction, [InstId; 2]) {
+        let mut func = MachFunction::new(
+            "test_gvn_invoke_pad".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let early = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(5), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb0, early);
+        let call = func.push_inst(MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("may_throw".into())],
+        ));
+        func.append_inst(bb0, call);
+        let after_call = func.push_inst(MachInst::new(
+            AArch64Opcode::Movz,
+            vec![vreg(2), imm(47073)],
+        ));
+        func.append_inst(bb0, after_call);
+        let br = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb0, br);
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb1, ret);
+        let pad_const = func.push_inst(MachInst::new(
+            AArch64Opcode::Movz,
+            vec![vreg(3), imm(47073)],
+        ));
+        func.append_inst(bb2, pad_const);
+        let pad_add = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(4), vreg(0), vreg(1)],
+        ));
+        func.append_inst(bb2, pad_add);
+        let pad_ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb2, pad_ret);
+        func.add_edge(bb0, bb1);
+        if invoke {
+            crate::eh_call_custody::tests::bind_invoke(&mut func, call, bb0, bb2);
+        } else {
+            func.add_edge(bb0, bb2);
+        }
+        (func, [pad_const, pad_add])
+    }
+
+    #[test]
+    fn test_gvn_does_not_reuse_a_def_after_an_invoke_call_in_its_landing_pad() {
+        // The invoke block dominates its landing pad, but an exception leaves
+        // at the call: `v2` was never written on the unwind path, so reusing
+        // it for the pad's constant reads whatever the register held when the
+        // callee threw (the O3 LICM-hoisted constant miscompile).
+        let (mut func, [pad_const, pad_add]) = invoke_then_pad(true);
+        let pad = BlockId(2);
+        let mut pass = GlobalValueNumbering;
+        assert!(
+            pass.run(&mut func),
+            "the add before the call is still reused"
+        );
+        assert!(!func.block(pad).insts.contains(&pad_add));
+        assert!(
+            func.block(pad).insts.contains(&pad_const),
+            "a def after the invoke's call was reused in its landing pad"
+        );
+
+        // Control: without the exception edge the pad's constant is reused,
+        // so the row above is decided by the invoke alone.
+        let (mut func, [pad_const, _]) = invoke_then_pad(false);
+        assert!(GlobalValueNumbering.run(&mut func));
+        assert!(!func.block(pad).insts.contains(&pad_const));
     }
 
     #[test]

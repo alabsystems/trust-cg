@@ -68,7 +68,7 @@ fn phase4_packet() -> TyReducerEvidencePacket {
         row(
             "callback_abi_call_clobber",
             "parents_2_5_11",
-            "cargo test -p trust-cg-codegen --test ty_callback_abi_call_clobber -- ty_indirect_callback_abi_and_call_clobbers_match_o1_o3 ty_callback_live_values_force_aarch64_callee_save_frame_o1_o3",
+            "scripts/trust_cargo.sh test -p trust-cg-codegen --test ty_callback_abi_call_clobber -- ty_indirect_callback_abi_and_call_clobbers_match_o1_o3 ty_callback_live_values_force_aarch64_callee_save_frame_o1_o3",
             3,
             3,
             "trust-cg-stable128:callback-abi-parent-2-5-11",
@@ -95,7 +95,7 @@ fn phase4_packet() -> TyReducerEvidencePacket {
         row(
             "edge_copy_block_arg",
             "parents_2_5_8_13",
-            "cargo test -p trust-cg-codegen --test ty_edge_copy_loop_call -- ty_edge_copy_loop_call_block_args_match_o1_o3",
+            "scripts/trust_cargo.sh test -p trust-cg-codegen --test ty_edge_copy_loop_call -- ty_edge_copy_loop_call_block_args_match_o1_o3",
             4,
             4,
             "trust-cg-stable128:edge-copy-parent-2-5-8-13",
@@ -109,7 +109,7 @@ fn phase4_packet() -> TyReducerEvidencePacket {
         row(
             "mcl_shaped_native_fused_parent_loop",
             "mixed",
-            "cargo test -p trust-cg-codegen --test ty_mcl_fused_parent_loop -- ty_mcl_fused_parent_loop_o1_o3_match_reference",
+            "scripts/trust_cargo.sh test -p trust-cg-codegen --test ty_mcl_fused_parent_loop -- ty_mcl_fused_parent_loop_o1_o3_match_reference",
             5,
             7,
             "trust-cg-stable128:mcl-parent-mixed",
@@ -130,7 +130,7 @@ fn phase4_packet() -> TyReducerEvidencePacket {
         row(
             "no_action_body_parent_loop",
             "non_empty",
-            "cargo test -p trust-cg-codegen --test ty_native_bfs_no_action_parent_loop -- native_bfs_no_action_parent_loop_o1_o3_status_summaries_match",
+            "scripts/trust_cargo.sh test -p trust-cg-codegen --test ty_native_bfs_no_action_parent_loop -- native_bfs_no_action_parent_loop_o1_o3_status_summaries_match",
             4,
             0,
             "trust-cg-stable128:no-action-parent-non-empty",
@@ -140,7 +140,7 @@ fn phase4_packet() -> TyReducerEvidencePacket {
         row(
             "minimal_parent_loop",
             "duplicate_parent",
-            "cargo test -p trust-cg-codegen --test ty_bfs_minimal_o1_o3_summary -- ty_bfs_minimal_parent_loop_o1_o3_status_summary_matches_reference",
+            "scripts/trust_cargo.sh test -p trust-cg-codegen --test ty_bfs_minimal_o1_o3_summary -- ty_bfs_minimal_parent_loop_o1_o3_status_summary_matches_reference",
             2,
             2,
             "trust-cg-stable128:minimal-parent-duplicate",
@@ -150,7 +150,7 @@ fn phase4_packet() -> TyReducerEvidencePacket {
         row(
             "o3_materialized_helper_return",
             "retbuf_later_clobber",
-            "cargo test -p trust-cg-codegen --test o3_ty_materialized_return -- ty_materialized_retbuf_returns_survive_later_clobber_o1_o3",
+            "scripts/trust_cargo.sh test -p trust-cg-codegen --test o3_ty_materialized_return -- ty_materialized_retbuf_returns_survive_later_clobber_o1_o3",
             0,
             0,
             "trust-cg-stable128:materialized-helper-return-retbuf",
@@ -259,7 +259,7 @@ fn phase4_ty_o3_reducer_packet_json_is_stable_and_sorted() {
     );
     assert!(
         pretty.contains(
-            "\"command\": \"cargo test -p trust-cg-codegen --test ty_mcl_fused_parent_loop"
+            "\"command\": \"scripts/trust_cargo.sh test -p trust-cg-codegen --test ty_mcl_fused_parent_loop"
         )
     );
     let stale_blocked_kind = ["blocked", "_downstream_request", "_replay"].concat();

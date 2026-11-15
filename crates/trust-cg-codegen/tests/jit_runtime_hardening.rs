@@ -45,7 +45,7 @@ fn build_answer_module(module_name: &str, function_name: &str) -> trust_ir::Modu
     let answer = fb.iconst(Ty::I64, 42);
     fb.ret(vec![answer]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_execute_drop(compiler: &Compiler, module_name: &str) {
@@ -126,7 +126,8 @@ mod vm_stat {
 /// @16K pages, over 384 cycles) and trip the 1 MiB bound.
 #[test]
 fn jit_compile_execute_drop_cycles_do_not_accumulate_address_space() {
-    let compiler = Compiler::new(CompilerConfig::for_host_jit());
+    let compiler =
+        Compiler::new(CompilerConfig::for_host_jit()).with_codegen_license(permit_unlicensed());
 
     // Warmup: let allocator arenas, caches, and lazy runtime state settle.
     for i in 0..16 {
@@ -163,7 +164,8 @@ fn jit_parallel_compile_execute_drop_smoke() {
     let threads: Vec<_> = (0..8)
         .map(|t| {
             std::thread::spawn(move || {
-                let compiler = Compiler::new(CompilerConfig::for_host_jit());
+                let compiler = Compiler::new(CompilerConfig::for_host_jit())
+                    .with_codegen_license(permit_unlicensed());
                 for i in 0..32 {
                     compile_execute_drop(&compiler, &format!("jit7_par_{t}_{i}"));
                 }
@@ -180,7 +182,8 @@ fn jit_parallel_compile_execute_drop_smoke() {
 /// hosts), while the owner keeps the buffer alive via Arc.
 #[test]
 fn jit_shared_buffer_cross_thread_execute() {
-    let compiler = Compiler::new(CompilerConfig::for_host_jit());
+    let compiler =
+        Compiler::new(CompilerConfig::for_host_jit()).with_codegen_license(permit_unlicensed());
     let module = build_answer_module("jit7_shared", "answer");
     let result = Arc::new(
         compiler
@@ -219,7 +222,8 @@ fn jit_shared_buffer_cross_thread_execute() {
 /// evidence (deterministic pipeline, no profile hooks).
 #[test]
 fn jit_published_buffer_is_hash_bound() {
-    let compiler = Compiler::new(CompilerConfig::for_host_jit());
+    let compiler =
+        Compiler::new(CompilerConfig::for_host_jit()).with_codegen_license(permit_unlicensed());
     let module = build_answer_module("jit7_hash_bound", "answer");
 
     let first = compiler
@@ -331,4 +335,13 @@ fn jit_published_buffer_is_hash_bound() {
         assert_eq!(second_fn.bytes_sha256, first_fn.bytes_sha256);
         // CachedVerified legitimately changes `cache_hit` on the second run.
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

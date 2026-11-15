@@ -1,6 +1,11 @@
 /-
-  MetaTheorem.CompileRefines — corrected. Doc-comment blocks elided for length;
-  the load-bearing change is the load/store dispatch fix in `forward_sim`.
+  MetaTheorem.CompileRefines — the forward capstone `compile_refines`.
+
+  Source runs and certified runs share one immutable instruction map. The certificate
+  premise covers EVERY source run, with the same event agreement as before. ProgramWitness
+  supplies an inhabited certificate and a nonempty actual execution; Vacuity retains the
+  failures for fetched observable operations the silent machine cannot implement. This is
+  a conditional model theorem, not a proof of the production Rust compiler.
 -/
 
 import Trust.Model
@@ -28,15 +33,20 @@ inductive OpKind (lay : Layout) (s s' : SrcState) : Type
       (hev  : step.event = Event.tau)
   | load
       (step : LoweredStep)
+      (hentry : ∀ m, R lay s m → step.entry m)
       (ld   : Mem.LoadShape lay s s')
       (len  : Nat)
       (hexec : ∀ m, step.exec m = Mem.loadExec ld.addr ld.rDst ld.n len m)
       (haddrOff : ∀ k, k < ld.n → lay.nonFrame (ld.addr + BitVec.ofNat 64 k))
       (hin  : ∀ _m : MachState, (clobberOf step).gprs ld.rDst)
       (hother : ∀ v, Live s' v → v ≠ ld.vDst → ∀ r, lay.asgn v = Loc.reg r → r ≠ ld.rDst)
+      (hpairs : ∀ v, Live s' v → v ≠ ld.vDst → ∀ lo hi,
+        lay.asgn v = Loc.pair lo hi → lo ≠ ld.rDst ∧ hi ≠ ld.rDst)
+      (hwidth : 8 * ld.n ≤ ld.w)
       (hpc  : ∀ m, R lay s m → m.rip + BitVec.ofNat 64 len = lay.entryAddr (lay.lowerOf s'.pc))
   | store
       (step : LoweredStep)
+      (hentry : ∀ m, R lay s m → step.entry m)
       (sh   : Mem.StoreShape lay s s')
       (len  : Nat)
       (hexec : ∀ m, step.exec m = Mem.storeExec sh.addr sh.storedVal sh.n len m)
@@ -60,8 +70,8 @@ inductive OpKind (lay : Layout) (s s' : SrcState) : Type
 
 def OpKind.event {lay : Layout} {s s' : SrcState} : OpKind lay s s' → Event
   | .pure step _ _ _ _ _      => step.event
-  | .load step _ _ _ _ _ _ _  => step.event
-  | .store step _ _ _ _ _     => step.event
+  | .load step _ _ _ _ _ _ _ _ _ _ => step.event
+  | .store step _ _ _ _ _ _   => step.event
   | .condBr _ _ _ _ _         => Event.tau
   | .call _ _ _ _ _           => Event.tau
 
@@ -74,14 +84,14 @@ theorem forward_sim
   cases ok with
   | pure step tr fr clob hmemEq hev =>
       exact forward_sim_pure tr fr clob hmemEq hR
-  | load step ld len hexec haddrOff hin hother hpc =>
+  | load step hentry ld len hexec haddrOff hin hother hpairs hwidth hpc =>
       -- FIX: `hin` is stored machine-parametrically (`∀ _m, …`) in the OpKind, but
       -- `Mem.forwardSim_load` wants the bare `(clobberOf step).gprs ld.rDst`; apply it at `m`.
-      exact Mem.forwardSim_load ld len hexec haddrOff (hin m) hother hpc hR
-  | store step sh len hexec hcover hpc =>
+      exact Mem.forwardSim_load hentry ld len hexec haddrOff (hin m) hother hpairs hwidth hpc hR
+  | store step hentry sh len hexec hcover hpc =>
       -- FIX: `hcover` is stored machine-parametrically (`∀ _m, …`) in the OpKind, but
       -- `Mem.forwardSim_store` wants the un-parametrized cover fact; apply it at `m`.
-      exact Mem.forwardSim_store sh len hexec (hcover m) hpc hR
+      exact Mem.forwardSim_store hentry sh len hexec (hcover m) hpc hR
   | condBr bl cc cbs hres hrt =>
       have h := Control.condBr_forwardSim (cbs m hR) hR (hres m hR) hrt
       have hev : Trust.Model.Encoder.eventOf (.jcc cc bl.rel) = Event.tau := rfl
@@ -91,21 +101,23 @@ theorem forward_sim
       have h := forward_sim_call tr cc fr clob hmemEq hR
       simpa [OpKind.event] using h
 
-inductive srcRun : SrcState → List Event → SrcState → Prop
-  | nil  {s} : srcRun s [] s
+/-- Runs use one fixed code map throughout; a transition cannot replace its program. -/
+inductive srcRun (code : Source.Program) : SrcState → List Event → SrcState → Prop
+  | nil {s} : srcRun code s [] s
   | cons {s ev s₀ evs s'} :
-      srcStep s ev s₀ → srcRun s₀ evs s' → srcRun s (ev :: evs) s'
+      srcStep code s ev s₀ → srcRun code s₀ evs s' → srcRun code s (ev :: evs) s'
 
-inductive CertRun (lay : Layout) : SrcState → List Event → SrcState → Prop
-  | nil  {s} : CertRun lay s [] s
+inductive CertRun (code : Source.Program) (lay : Layout) :
+    SrcState → List Event → SrcState → Prop
+  | nil {s} : CertRun code lay s [] s
   | cons {s ev s₀ evs s'}
-      (hstep : srcStep s ev s₀)
+      (hstep : srcStep code s ev s₀)
       (ok : OpKind lay s s₀) (hev : ok.event = ev)
-      (rest : CertRun lay s₀ evs s') :
-      CertRun lay s (ev :: evs) s'
+      (rest : CertRun code lay s₀ evs s') :
+      CertRun code lay s (ev :: evs) s'
 
-theorem certRun_toSrc {lay : Layout} {s s' : SrcState} {evs : List Event}
-    (h : CertRun lay s evs s') : srcRun s evs s' := by
+theorem certRun_toSrc {code : Source.Program} {lay : Layout} {s s' : SrcState}
+    {evs : List Event} (h : CertRun code lay s evs s') : srcRun code s evs s' := by
   induction h with
   | nil => exact srcRun.nil
   | cons hstep _ _ _ ih => exact srcRun.cons hstep ih
@@ -163,8 +175,8 @@ theorem observable_cons (ev : Event) (evs : List Event) :
   cases isObservable ev <;> simp
 
 theorem simRun
-    {lay : Layout} {s s' : SrcState} {evs : List Event}
-    (hrun : CertRun lay s evs s') :
+    {code : Source.Program} {lay : Layout} {s s' : SrcState} {evs : List Event}
+    (hrun : CertRun code lay s evs s') :
     ∀ {m : MachState}, R lay s m →
       ∃ (mf : MachState) (evsM : List Event),
         x86Run m evsM mf ∧ observable evsM = observable evs ∧ R lay s' mf := by
@@ -182,11 +194,9 @@ theorem simRun
       rw [observable_append, observable_append, observable_taus htau, htailobs, List.nil_append,
           ← observable_cons]
 
-theorem opKind_event_eq
-    {lay : Layout} {s s₀ : SrcState} {ev : Event}
-    (ok : OpKind lay s s₀) (hstep : srcStep s ev s₀) :
-    ok.event = ev := by
-  sorry  -- stubbed-semantics: the source classifier emits `ok` FOR `hstep`, so events coincide.
+/-  `opKind_event_eq` (every `OpKind` for `s ⇒ s₀` has the event of every source step `s ⇒ s₀`)
+    was a `sorry`. It is false (`Vacuity.opKind_event_eq_refuted`): `OpKind` is indexed by the two
+    states, not by the step. The event agreement the capstone uses is `CertRun`'s `hev` field. -/
 
 structure SrcSem where
   entry : SrcState
@@ -200,13 +210,14 @@ def Refines (mb : X86Sem) (sb : SrcSem) : Prop :=
   ∀ obs, sb.behaviours obs → mb.behaviours obs
 
 structure Program where
+  sourceCode : Source.Program
   entryS  : SrcState
   entryM  : MachState
   lay     : Layout
   rEntry  : R lay entryS entryM
 
 def srcBeh (P : Program) (obs : List Event) : Prop :=
-  ∃ (sf : SrcState) (evs : List Event), srcRun P.entryS evs sf ∧ observable evs = obs
+  ∃ (sf : SrcState) (evs : List Event), srcRun P.sourceCode P.entryS evs sf ∧ observable evs = obs
 
 def macBeh (P : Program) (obs : List Event) : Prop :=
   ∃ (mf : MachState) (evsM : List Event), x86Run P.entryM evsM mf ∧ observable evsM = obs
@@ -216,28 +227,27 @@ def srcSem (P : Program) : SrcSem := { entry := P.entryS, behaviours := srcBeh P
 def x86Sem (P : Program) : X86Sem := { entry := P.entryM, behaviours := macBeh P }
 
 def Certified_compile (P : Program) : Prop :=
-  ∀ (sf : SrcState) (evs : List Event), srcRun P.entryS evs sf → CertRun P.lay P.entryS evs sf
+  ∀ (sf : SrcState) (evs : List Event), srcRun P.sourceCode P.entryS evs sf → CertRun P.sourceCode P.lay P.entryS evs sf
 
 theorem compile_refines (P : Program) (hcert : Certified_compile P) :
     Refines (x86Sem P) (srcSem P) := by
   intro obs hsrc
   obtain ⟨sf, evs, hrun, hobs⟩ := hsrc
-  have hcertRun : CertRun P.lay P.entryS evs sf := hcert sf evs hrun
+  have hcertRun : CertRun P.sourceCode P.lay P.entryS evs sf := hcert sf evs hrun
   obtain ⟨mf, evsM, hmacrun, hmacobs, _hRf⟩ := simRun hcertRun P.rEntry
   exact ⟨mf, evsM, hmacrun, by rw [hmacobs]; exact hobs⟩
 
-theorem refines_machine_subset_of_determinism (P : Program)
-    (hdet : ∀ m ev₁ ev₂ m₁ m₂, x86Step m ev₁ m₁ → x86Step m ev₂ m₂ → ev₁ = ev₂ ∧ m₁ = m₂)
-    (hfwd : Refines (x86Sem P) (srcSem P)) :
-    ∀ obs, (x86Sem P).behaviours obs → (srcSem P).behaviours obs := by
-  sorry  -- open: machine⊆source from determinism + maximal runs. OFF compile_refines path.
+/- Reverse refinement is still open: machine silence alone establishes the empty observable
+   trace, not a production compiler theorem. Fetched traps still refute forward refinement
+   for those programs; the new program-indexed source no longer makes it false for all P. -/
 
 theorem simRun_nil {lay : Layout} {s : SrcState} {m : MachState} (hR : R lay s m) :
     ∃ (mf : MachState) (evsM : List Event),
       x86Run m evsM mf ∧ observable evsM = observable ([] : List Event) ∧ R lay s mf :=
   ⟨m, [], x86Run.nil, rfl, hR⟩
 
-theorem certRun_nil {lay : Layout} {s : SrcState} : CertRun lay s [] s := CertRun.nil
+theorem certRun_nil {code : Source.Program} {lay : Layout} {s : SrcState} :
+    CertRun code lay s [] s := CertRun.nil
 
 theorem simRun_single
     {lay : Layout} {s s' : SrcState} {ev : Event} {m : MachState}

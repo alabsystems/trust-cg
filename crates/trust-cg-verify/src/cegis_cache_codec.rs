@@ -42,6 +42,13 @@
 //!   magic, unknown version, unknown tag, short read, non-UTF-8 string, or
 //!   **any trailing byte** all return `None`, which callers treat as a miss.
 //!
+//! The reader checks the format only. Entries carry no MAC, so a well-formed
+//! entry with a changed immediate decodes like an honest one. The pass does
+//! not trust a decoded body: it applies a recorded rewrite only where its own
+//! matcher, run on the current function, rebuilds exactly that body, and
+//! otherwise treats the entry as stale (a miss). [`crate::cegis_cache_io`]
+//! also refuses a root that another user owns or can write.
+//!
 //! The on-disk root is shared between worktrees on a host
 //! ([`crate::cegis_cache_io`]), so "foreign blob" is not hypothetical: a blob
 //! written by a differently-versioned build of this crate is exactly what the
@@ -135,6 +142,7 @@ mod tag {
     pub const SYMBOL: u8 = 9;
     pub const JUMP_TABLE_INDEX: u8 = 10;
     pub const INCOMING_ARG: u8 = 11;
+    pub const EXACT_MODULE_SYMBOL: u8 = 12;
 }
 
 /// The only way encoding can fail.
@@ -407,6 +415,10 @@ fn put_operand(w: &mut Writer, operand: &MachOperandBlob) -> Result<(), CacheCod
             w.u8(tag::SYMBOL);
             w.str(name)?;
         }
+        MachOperandBlob::ExactModuleSymbol(name) => {
+            w.u8(tag::EXACT_MODULE_SYMBOL);
+            w.str(name)?;
+        }
         MachOperandBlob::JumpTableIndex(v) => {
             w.u8(tag::JUMP_TABLE_INDEX);
             w.u32(*v);
@@ -437,6 +449,7 @@ fn get_operand(r: &mut Reader<'_>) -> Option<MachOperandBlob> {
         },
         tag::SPECIAL => MachOperandBlob::Special(get_special_reg(r)?),
         tag::SYMBOL => MachOperandBlob::Symbol(r.str()?),
+        tag::EXACT_MODULE_SYMBOL => MachOperandBlob::ExactModuleSymbol(r.str()?),
         tag::JUMP_TABLE_INDEX => MachOperandBlob::JumpTableIndex(r.u32()?),
         tag::INCOMING_ARG => MachOperandBlob::IncomingArg(r.i64()?),
         _ => return None,

@@ -69,10 +69,79 @@
 //! * Commutative operand swaps: for the verify-owned mirror of codegen's
 //!   `is_x86_commutative_two_address_rr`, the two register value groups are
 //!   sorted before keying (pinned against drift by a codegen-side test).
+//! * The bridge-into-LEA **opcode substitution** — see the section below.
 //! * The `xor r,r`/`pxor x,x` zero idiom: v1's classifier models the idiom as
 //!   a pure def (no reads), so a rename that turns `xor a, a, b` (where `b`
 //!   provably held `a`'s value) into the idiom form is normalized — equal
 //!   input groups on XOR collapse to the same zero-result event.
+//!
+//! # The one OPCODE SUBSTITUTION in the window: bridge-into-LEA
+//!
+//! Every other transform in the coalescing window is a copy deletion plus a
+//! register rename, so the raw `opcode` is a faithful part of an event key.
+//! ONE transform is not: codegen's `x86_try_collapse_bridge_into_lea{,_imm}`
+//! rewrites the post-fixup pair
+//!
+//! ```text
+//!   movq  %a, %d           ; MovRR  [d, a]          (the bridge copy)
+//!   addq  %b, %d           ; AddRR  [d, ghost a, b] (tied, ghost-source form)
+//! ==>
+//!   leaq  (%a,%b), %d      ; LeaSib [d, [a + b*1 + 0]]
+//! ```
+//!
+//! and its immediate sibling `MovRR [d,a] ; AddRI [d, ghost a, k]` into
+//! `Lea [d, [a + k]]`. The copy deletion is already modeled (copies are
+//! non-events); the **opcode change is not**. Keying the event by the raw
+//! opcode plus raw operand tags made every one of these a reported
+//! `event-stream-mismatch` even though the value routing is untouched — which
+//! is precisely why Stage A was stuck in warn-only mode: `enforce` scored
+//! 17/54 on the differential compile gate against a true baseline of 51/54,
+//! and every single refusal was this modeling gap rather than a real
+//! violation.
+//!
+//! [`canonical_add_event`] closes it by keying BOTH spellings of a whole-64-bit
+//! GPR add by the VALUE they route, not by the mnemonic that routes it:
+//!
+//! | instruction | canonical key |
+//! | --- | --- |
+//! | `AddRR [Reg, Reg, Reg]` (tied 3-op) | `(AddRR, [Reg, Reg, Reg])` |
+//! | `LeaSib [Reg, [Reg + Reg*1 + 0]]`   | `(AddRR, [Reg, Reg, Reg])` |
+//! | `AddRI [Reg, Reg, Imm(k)]` (tied)   | `(AddRI, [Reg, Reg, Imm(k)])` |
+//! | `Lea    [Reg, [Reg + k]]`           | `(AddRI, [Reg, Reg, Imm(k)])` |
+//!
+//! The key is *only* the opcode and the non-register operand structure. The
+//! INPUT TERM VECTOR is untouched, and that is what carries the discrimination:
+//!
+//! * the spec-side tied add consumes `state(d)`, which the deleted bridge made
+//!   equal to `state(a)`; the final-side LEA consumes `state(base)`. The two
+//!   events intern to one term **iff the LEA's base is the value the bridge
+//!   delivered**. A wrong base register, a wrong index register, or a bridge
+//!   deleted without rewriting the add all diverge the input vector.
+//! * `k` rides in the key as `Imm(k)` on BOTH sides (the spec's immediate
+//!   operand, the LEA's displacement), so a wrong displacement diverges the
+//!   key. Codegen bounds `k` to a signed 32-bit displacement, so the two
+//!   spellings agree exactly whenever the rewrite is legal.
+//! * The SIB form is normalized only at `scale == 1, disp == 0` — the exact
+//!   shape codegen emits. `[a + b*4]` or `[a + b + 8]` compute different
+//!   values and keep their own `LeaSib` key, so they can never match an
+//!   `AddRR` spec event.
+//! * Sub-64-bit forms are excluded by construction: normalization requires one
+//!   destination lane-def of the full GPR mask and every lane-read at the full
+//!   GPR mask, which is exactly the whole-root class codegen's predicate
+//!   admits (`d == d_root && a == a_root && b == b_root`).
+//!
+//! RFLAGS discrimination is NOT weakened. `AddRR`/`AddRI` define the six
+//! arithmetic flags; `Lea`/`LeaSib` define none. Normalization touches only the
+//! event key — the flag lanes are executed from the unmodified access model, so
+//! after the rewrite the spec holds `FlagDef{op}` where the final still holds
+//! the incoming term. Any later flag consumer therefore keys on different
+//! inputs (event-stream mismatch) and flags live-out of the block compare
+//! unequal (live-out mismatch). Codegen's own `x86_add_flags_dead_after`
+//! precondition — no flag reader before a full condition-code redefinition,
+//! in-block — is exactly the condition under which the two streams reconverge,
+//! so a legal rewrite is clean and an illegal one (flags actually live) is
+//! refuted by the *existing* machinery, with no flag-specific special case
+//! here.
 //!
 //! # Documented Stage A misses (sound to skip; never a false-positive source)
 //!
@@ -176,7 +245,11 @@ pub fn parse_post_ra_spec_mode(raw: Option<&str>) -> PostRegallocRecheckMode {
 
 /// Resolve the active mode from `TCG_POST_RA_SPEC` (default WARN).
 pub fn post_ra_spec_mode() -> PostRegallocRecheckMode {
-    parse_post_ra_spec_mode(std::env::var("TCG_POST_RA_SPEC").ok().as_deref())
+    parse_post_ra_spec_mode(
+        trust_cg_process_env::var("TCG_POST_RA_SPEC")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Process-wide count of captured-spec violations observed (warn or enforce).
@@ -316,6 +389,7 @@ enum OperandTag {
         scale: u8,
         disp: i32,
     },
+    ExactModuleSymbol(String),
 }
 
 fn operand_tag(op: &X86ISelOperand) -> OperandTag {
@@ -326,6 +400,7 @@ fn operand_tag(op: &X86ISelOperand) -> OperandTag {
         X86ISelOperand::Block(b) => OperandTag::BlockRef(b.0),
         X86ISelOperand::CondCode(cc) => OperandTag::Cond(*cc),
         X86ISelOperand::Symbol(s) => OperandTag::Symbol(s.clone()),
+        X86ISelOperand::ExactModuleSymbol(s) => OperandTag::ExactModuleSymbol(s.clone()),
         X86ISelOperand::StackSlot(slot) => OperandTag::Slot(*slot),
         X86ISelOperand::ConstPoolEntry(idx) => OperandTag::Pool(*idx),
         X86ISelOperand::JumpTableIndex(idx) => OperandTag::JumpTable(*idx),
@@ -664,6 +739,7 @@ fn op_requires_impurity_nonce(inst: &X86ISelInst, acc: &InstAccess) -> bool {
         // Explicit memory-form loads + Pop's implicit stack read.
         MovRM8 | MovRM16 | MovRM32 | MovRM | MovRMSib | MovRM32Sib | MovsdRM | MovssRM
         | MovdquRM | MovdqaRM | MovRipRel | MovssRipRel | MovsdRipRel | Pop => true,
+        MovzxRM8 | MovzxRM16 | MovzxRM8Sib => true,
         // Memory-destination RMW ALU: reads the slot's VALUE (load-op-store),
         // so it MUST carry the impurity nonce. These arms are deliberately
         // explicit `true` (the `_ => has_memory_operand` default would already
@@ -680,6 +756,119 @@ fn op_requires_impurity_nonce(inst: &X86ISelInst, acc: &InstAccess) -> bool {
         // tied register and the implicit-CL lane read the classifier reports
         // — no memory value, no nonce.)
         _ => has_memory_operand(inst),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge-into-LEA: the window's one opcode substitution
+// ---------------------------------------------------------------------------
+
+/// True for an operand that is a bare register (the only operand kind whose
+/// [`OperandTag`] is [`OperandTag::Reg`]).
+fn is_register_operand(op: &X86ISelOperand) -> bool {
+    matches!(op, X86ISelOperand::VReg(_) | X86ISelOperand::PReg(_))
+}
+
+/// A value-keyed replacement for `(opcode, operand tags)` in the event key.
+struct CanonicalEventKey {
+    opcode: X86Opcode,
+    tags: Vec<OperandTag>,
+}
+
+/// Canonical key of a whole-64-bit-GPR ADD, in EITHER of the two spellings the
+/// coalescing window may use for it: the post-fixup tied `AddRR`/`AddRI` form
+/// (spec side) and the `LeaSib`/`Lea` form codegen's bridge-into-LEA collapse
+/// rewrites it to (final side). See the module doc's "one OPCODE SUBSTITUTION"
+/// section for the full argument; the short version is that this replaces the
+/// MNEMONIC in the key while leaving the input TERM VECTOR — where all of the
+/// value-routing discrimination lives — completely untouched.
+///
+/// Returns `None` for everything else, including every LEA shape that is not
+/// value-equal to an add (`scale != 1`, `disp != 0` in the SIB form, a
+/// non-register base or index, a RIP-relative or stack-slot base) and every
+/// sub-64-bit or flag-consuming form. Declining is always safe: the raw
+/// opcode+tags key is used instead, which is strictly stricter.
+fn canonical_add_event(inst: &X86ISelInst, acc: &InstAccess) -> Option<CanonicalEventKey> {
+    // Shape floor shared by all four spellings: one whole-GPR destination,
+    // whole-GPR reads only, no flag input, no call/exchange semantics, and
+    // purity (so both spellings key `impurity_nonce: None` — the `Lea` family
+    // and the register-form ALU ops are both explicit non-nonce shapes in
+    // `op_requires_impurity_nonce`, and this re-checks it rather than
+    // depending on that arm never moving).
+    if acc.call_result_locs.is_some()
+        || acc.xchg.is_some()
+        || acc.lane_copy.is_some()
+        || acc.flags_use_mask != 0
+        || op_requires_impurity_nonce(inst, acc)
+    {
+        return None;
+    }
+    if acc.lane_defs.len() != 1 || acc.lane_defs[0].mask != GPR_LANE_MASK {
+        return None;
+    }
+    if acc.lane_reads.iter().any(|read| read.mask != GPR_LANE_MASK) {
+        return None;
+    }
+
+    // `dst = src1 + src2`. Keyed exactly as the tied `AddRR` spells it, so the
+    // commutativity mirror applies to both spellings identically.
+    let reg_form = || CanonicalEventKey {
+        opcode: X86Opcode::AddRR,
+        tags: vec![OperandTag::Reg, OperandTag::Reg, OperandTag::Reg],
+    };
+    // `dst = src1 + k`. `k` is part of the KEY, so a wrong displacement is a
+    // different event.
+    let imm_form = |k: i64| CanonicalEventKey {
+        opcode: X86Opcode::AddRI,
+        tags: vec![OperandTag::Reg, OperandTag::Reg, OperandTag::Imm(k)],
+    };
+
+    match (inst.opcode, inst.operands.as_slice()) {
+        // SPEC side, register form: the post-fixup tied `[dst, ghost src1, src2]`.
+        (X86Opcode::AddRR, [dst, ghost, src2])
+            if acc.lane_reads.len() == 2
+                && is_register_operand(dst)
+                && is_register_operand(ghost)
+                && is_register_operand(src2) =>
+        {
+            Some(reg_form())
+        }
+        // FINAL side, register form: `lea dst, [base + index*1 + 0]`.
+        (
+            X86Opcode::LeaSib,
+            [
+                dst,
+                X86ISelOperand::SibMemAddr {
+                    base,
+                    index,
+                    scale: 1,
+                    disp: 0,
+                },
+            ],
+        ) if acc.lane_reads.len() == 2
+            && is_register_operand(dst)
+            && is_register_operand(base)
+            && is_register_operand(index) =>
+        {
+            Some(reg_form())
+        }
+        // SPEC side, immediate form: the post-fixup tied `[dst, ghost src1, k]`.
+        (X86Opcode::AddRI, [dst, ghost, X86ISelOperand::Imm(k)])
+            if acc.lane_reads.len() == 1
+                && is_register_operand(dst)
+                && is_register_operand(ghost) =>
+        {
+            Some(imm_form(*k))
+        }
+        // FINAL side, immediate form: `lea dst, [base + k]`.
+        (X86Opcode::Lea, [dst, X86ISelOperand::MemAddr { base, disp }])
+            if acc.lane_reads.len() == 1
+                && is_register_operand(dst)
+                && is_register_operand(base) =>
+        {
+            Some(imm_form(i64::from(*disp)))
+        }
+        _ => None,
     }
 }
 
@@ -729,6 +918,11 @@ fn exec_block(
             .map(|read| read_group(&state, read.loc, read.mask))
             .collect();
 
+        // Bridge-into-LEA: the ONE opcode substitution the window performs.
+        // `None` for everything else, in which case the raw opcode + raw
+        // operand tags key the event exactly as before.
+        let canon = canonical_add_event(inst, acc);
+
         // XOR zero idiom normalization: v1 classifies `xor r,r,r`/`pxor x,x`
         // as a pure def (no reads). A sound rename can turn `xor a, a, b`
         // (where b's terms equal a's) INTO that shape, so the general form
@@ -749,8 +943,17 @@ fn exec_block(
 
         let mut inputs: Vec<TermId> = Vec::new();
         if !zero_result {
-            let sortable = post_ra_spec_commutative_two_address_rr(inst.opcode)
-                && register_form
+            // The canonical add form is register-shaped VALUE arithmetic even
+            // in its `Lea` spelling (its "memory" operand is an address
+            // computation that is never dereferenced), so it participates in
+            // commutative-group sorting on the same footing as the tied
+            // `AddRR` it is keyed as — otherwise `lea d,[a+b]` and
+            // `lea d,[b+a]` would key differently from each other AND from
+            // the `AddRR` whose operands the coalescer may have swapped.
+            let value_register_form = register_form || canon.is_some();
+            let key_opcode = canon.as_ref().map_or(inst.opcode, |c| c.opcode);
+            let sortable = post_ra_spec_commutative_two_address_rr(key_opcode)
+                && value_register_form
                 && groups.len() == 2
                 && acc.lane_reads[0].mask == acc.lane_reads[1].mask
                 && acc.flags_use_mask == 0;
@@ -780,14 +983,20 @@ fn exec_block(
             }
         }
 
-        let tags: Vec<OperandTag> = inst.operands.iter().map(operand_tag).collect();
+        let (key_opcode, tags) = match canon {
+            Some(c) => (c.opcode, c.tags),
+            None => (
+                inst.opcode,
+                inst.operands.iter().map(operand_tag).collect::<Vec<_>>(),
+            ),
+        };
         let call_results_meta: Vec<(u8, u16)> = acc
             .call_result_locs
             .as_ref()
             .map(|results| results.iter().map(|r| (r.loc, r.defined_bits)).collect())
             .unwrap_or_default();
         let op = table.intern(TermNode::Op {
-            opcode: inst.opcode,
+            opcode: key_opcode,
             tags,
             inputs,
             call_results_meta,
@@ -1174,6 +1383,18 @@ mod tests {
     use trust_cg_lower::types::Type;
     use trust_cg_lower::x86_64_isel::X86CallResultReg;
 
+    #[test]
+    fn exact_function_address_operand_tag_is_not_an_ordinary_symbol() {
+        assert_ne!(
+            operand_tag(&X86ISelOperand::ExactModuleSymbol("target".into())),
+            operand_tag(&X86ISelOperand::Symbol("target".into()))
+        );
+        assert_ne!(
+            operand_tag(&X86ISelOperand::ExactModuleSymbol("target".into())),
+            operand_tag(&X86ISelOperand::ExactModuleSymbol("_target".into()))
+        );
+    }
+
     /// Serializes tests that assert on the process-wide SPEC_HITS counter.
     static COUNTER_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1192,6 +1413,15 @@ mod tests {
     fn mem(base: X86PReg, disp: i32) -> X86ISelOperand {
         X86ISelOperand::MemAddr {
             base: Box::new(p(base)),
+            disp,
+        }
+    }
+
+    fn sib(base: X86PReg, index: X86PReg, scale: u8, disp: i32) -> X86ISelOperand {
+        X86ISelOperand::SibMemAddr {
+            base: Box::new(p(base)),
+            index: Box::new(p(index)),
+            scale,
             disp,
         }
     }
@@ -1500,6 +1730,329 @@ mod tests {
         };
         let spec = capture(&build());
         assert_clean(&spec, &build());
+    }
+
+    // ===================================================================
+    // Bridge-into-LEA: the window's one opcode substitution
+    //
+    // GREEN = the rewrite codegen actually performs
+    // (`x86_try_collapse_bridge_into_lea{,_imm}` in the x86 pipeline).
+    // RED   = deliberate MUTATIONS of that rewrite. These are the proof that
+    //         teaching the model about the opcode substitution did NOT delete
+    //         the check: every wrong-value spelling of the same rewrite is
+    //         still refuted, and refuted through the INPUT TERM VECTOR /
+    //         non-register operand structure, never through the mnemonic.
+    // ===================================================================
+
+    /// `mov d,a ; add d,d,b`  =>  `lea d,[a+b]` — the register arm. Same
+    /// destination, same value, so the same value-routing event.
+    fn bridge_lea_reg_spec() -> X86ISelFunction {
+        x86_func(
+            "bridge_lea_reg",
+            vec![
+                inst(X86Opcode::MovRR, vec![p(R8), p(RBX)]),
+                // Post-fixup tied GHOST-SOURCE form: [dst, ghost src1, src2].
+                inst(X86Opcode::AddRR, vec![p(R8), p(RBX), p(RCX)]),
+                inst(X86Opcode::MovMR, vec![mem(RBP, -8), p(R8)]),
+                inst(X86Opcode::Ret, vec![]),
+            ],
+        )
+    }
+
+    fn bridge_lea_reg_final(address: X86ISelOperand) -> X86ISelFunction {
+        x86_func(
+            "bridge_lea_reg",
+            vec![
+                inst(X86Opcode::LeaSib, vec![p(R8), address]),
+                inst(X86Opcode::MovMR, vec![mem(RBP, -8), p(R8)]),
+                inst(X86Opcode::Ret, vec![]),
+            ],
+        )
+    }
+
+    /// `mov d,a ; add d,d,k`  =>  `lea d,[a+k]` — the immediate arm.
+    fn bridge_lea_imm_spec() -> X86ISelFunction {
+        x86_func(
+            "bridge_lea_imm",
+            vec![
+                inst(X86Opcode::MovRR, vec![p(R8), p(RBX)]),
+                inst(X86Opcode::AddRI, vec![p(R8), p(RBX), imm(16)]),
+                inst(X86Opcode::MovMR, vec![mem(RBP, -8), p(R8)]),
+                inst(X86Opcode::Ret, vec![]),
+            ],
+        )
+    }
+
+    fn bridge_lea_imm_final(dst: X86PReg, address: X86ISelOperand) -> X86ISelFunction {
+        x86_func(
+            "bridge_lea_imm",
+            vec![
+                inst(X86Opcode::Lea, vec![p(dst), address]),
+                inst(X86Opcode::MovMR, vec![mem(RBP, -8), p(R8)]),
+                inst(X86Opcode::Ret, vec![]),
+            ],
+        )
+    }
+
+    #[test]
+    fn bridge_into_lea_register_arm_passes() {
+        let spec = capture(&bridge_lea_reg_spec());
+        assert_clean(&spec, &bridge_lea_reg_final(sib(RBX, RCX, 1, 0)));
+    }
+
+    #[test]
+    fn bridge_into_lea_register_arm_base_index_swap_passes() {
+        // `lea d,[b+a]` computes the same value as `lea d,[a+b]`: the
+        // canonical key is the tied `AddRR`, which IS in the commutativity
+        // mirror, so the two register groups sort before keying.
+        let spec = capture(&bridge_lea_reg_spec());
+        assert_clean(&spec, &bridge_lea_reg_final(sib(RCX, RBX, 1, 0)));
+    }
+
+    #[test]
+    fn bridge_into_lea_immediate_arm_passes() {
+        let spec = capture(&bridge_lea_imm_spec());
+        assert_clean(
+            &spec,
+            &bridge_lea_imm_final(
+                R8,
+                X86ISelOperand::MemAddr {
+                    base: Box::new(p(RBX)),
+                    disp: 16,
+                },
+            ),
+        );
+    }
+
+    // ---- MUTATIONS of the register arm ----
+
+    #[test]
+    fn bridge_into_lea_wrong_base_register_refuted() {
+        // MUTATION: the LEA reads RDX where the bridge delivered RBX. The
+        // mnemonics are exactly the ones the sound rewrite uses, so this can
+        // ONLY be caught by the input term vector.
+        let spec = capture(&bridge_lea_reg_spec());
+        assert_kind(
+            &spec,
+            &bridge_lea_reg_final(sib(RDX, RCX, 1, 0)),
+            PostRaSpecViolationKind::EventStreamMismatch,
+        );
+    }
+
+    #[test]
+    fn bridge_into_lea_wrong_index_register_refuted() {
+        // MUTATION: the addend is RDX, not the add's RCX.
+        let spec = capture(&bridge_lea_reg_spec());
+        assert_kind(
+            &spec,
+            &bridge_lea_reg_final(sib(RBX, RDX, 1, 0)),
+            PostRaSpecViolationKind::EventStreamMismatch,
+        );
+    }
+
+    #[test]
+    fn bridge_into_lea_wrong_scale_refuted() {
+        // MUTATION: `[a + b*4]` is not `a + b`. Only `scale == 1` normalizes,
+        // so this keeps its own `LeaSib` key and can never match an `AddRR`.
+        let spec = capture(&bridge_lea_reg_spec());
+        assert_kind(
+            &spec,
+            &bridge_lea_reg_final(sib(RBX, RCX, 4, 0)),
+            PostRaSpecViolationKind::EventStreamMismatch,
+        );
+    }
+
+    #[test]
+    fn bridge_into_lea_spurious_displacement_refuted() {
+        // MUTATION: `[a + b + 8]` is not `a + b`. Only `disp == 0` normalizes.
+        let spec = capture(&bridge_lea_reg_spec());
+        assert_kind(
+            &spec,
+            &bridge_lea_reg_final(sib(RBX, RCX, 1, 8)),
+            PostRaSpecViolationKind::EventStreamMismatch,
+        );
+    }
+
+    // ---- MUTATIONS of the immediate arm ----
+
+    #[test]
+    fn bridge_into_lea_wrong_immediate_refuted() {
+        // MUTATION: displacement 24 where the add stepped by 16. The
+        // immediate rides in the canonical KEY on both sides precisely so
+        // that this diverges.
+        let spec = capture(&bridge_lea_imm_spec());
+        assert_kind(
+            &spec,
+            &bridge_lea_imm_final(
+                R8,
+                X86ISelOperand::MemAddr {
+                    base: Box::new(p(RBX)),
+                    disp: 24,
+                },
+            ),
+            PostRaSpecViolationKind::EventStreamMismatch,
+        );
+    }
+
+    #[test]
+    fn bridge_into_lea_immediate_wrong_base_refuted_under_enforce() {
+        // MUTATION: wrong base register in the immediate arm — and the
+        // headline demonstration that ENFORCE mode still FAILS the compile
+        // (and WARN mode still records telemetry) after the modeling fix.
+        let spec = capture(&bridge_lea_imm_spec());
+        let wrong = bridge_lea_imm_final(
+            R8,
+            X86ISelOperand::MemAddr {
+                base: Box::new(p(RDX)),
+                disp: 16,
+            },
+        );
+        assert_kind(&spec, &wrong, PostRaSpecViolationKind::EventStreamMismatch);
+
+        let _guard = counter_guard();
+        let enforced = evaluate_x86_captured_spec_with_mode(
+            &spec,
+            &wrong,
+            &HashMap::new(),
+            "x86_64",
+            X86CallAbi::SystemV,
+            PostRegallocRecheckMode::Enforce,
+        );
+        assert_eq!(
+            enforced.map(|v| v.kind),
+            Some(PostRaSpecViolationKind::EventStreamMismatch),
+            "enforce mode must still fail the compile on a wrong-value LEA rewrite"
+        );
+        let before = post_ra_spec_hit_count();
+        let warned = evaluate_x86_captured_spec_with_mode(
+            &spec,
+            &wrong,
+            &HashMap::new(),
+            "x86_64",
+            X86CallAbi::SystemV,
+            PostRegallocRecheckMode::Warn,
+        );
+        assert!(warned.is_none(), "warn mode must never fail the compile");
+        assert!(
+            post_ra_spec_hit_count() > before,
+            "warn mode must still record telemetry"
+        );
+    }
+
+    #[test]
+    fn bridge_into_lea_wrong_destination_refuted() {
+        // MUTATION: the LEA lands the value in R9, but the downstream store
+        // still reads R8 — which now carries its stale block-entry value.
+        let spec = capture(&bridge_lea_imm_spec());
+        assert_kind(
+            &spec,
+            &bridge_lea_imm_final(
+                R9,
+                X86ISelOperand::MemAddr {
+                    base: Box::new(p(RBX)),
+                    disp: 16,
+                },
+            ),
+            PostRaSpecViolationKind::EventStreamMismatch,
+        );
+    }
+
+    #[test]
+    fn bridge_deleted_without_the_lea_rewrite_refuted() {
+        // MUTATION: the bridge copy is deleted but the tied add is left
+        // untouched, so it now adds to R8's stale block-entry value. This is
+        // the classic load-bearing-copy deletion wearing the LEA arm's
+        // clothes; normalizing the opcode must not hide it.
+        let spec = capture(&bridge_lea_imm_spec());
+        let wrong = x86_func(
+            "bridge_lea_imm",
+            vec![
+                inst(X86Opcode::AddRI, vec![p(R8), p(RBX), imm(16)]),
+                inst(X86Opcode::MovMR, vec![mem(RBP, -8), p(R8)]),
+                inst(X86Opcode::Ret, vec![]),
+            ],
+        );
+        assert_kind(&spec, &wrong, PostRaSpecViolationKind::EventStreamMismatch);
+    }
+
+    #[test]
+    fn bridge_into_lea_over_a_live_flag_definition_refuted() {
+        // MUTATION of the PRECONDITION rather than the operands: codegen's
+        // `x86_add_flags_dead_after` may only fire the collapse when the
+        // add's RFLAGS are dead. `LEA` writes no flags, so firing it under a
+        // live flag consumer drops a definition — and the model catches that
+        // with no flag-specific special case: the `Jcc` consumes `FlagDef{add}`
+        // in the spec and the block-entry ZF in the final stream.
+        let blocks = |entry: Vec<X86ISelInst>| {
+            x86_cfg_func(
+                "lea_over_live_flags",
+                vec![
+                    (entry, vec![1]),
+                    (
+                        vec![
+                            inst(X86Opcode::MovMR, vec![mem(RBP, -8), p(R8)]),
+                            inst(X86Opcode::Ret, vec![]),
+                        ],
+                        vec![],
+                    ),
+                ],
+            )
+        };
+        let spec = capture(&blocks(vec![
+            inst(X86Opcode::MovRR, vec![p(R8), p(RBX)]),
+            inst(X86Opcode::AddRI, vec![p(R8), p(RBX), imm(16)]),
+            inst(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::E),
+                    X86ISelOperand::Block(Block(1)),
+                ],
+            ),
+        ]));
+        let wrong = blocks(vec![
+            inst(
+                X86Opcode::Lea,
+                vec![
+                    p(R8),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(p(RBX)),
+                        disp: 16,
+                    },
+                ],
+            ),
+            inst(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::E),
+                    X86ISelOperand::Block(Block(1)),
+                ],
+            ),
+        ]);
+        assert_kind(&spec, &wrong, PostRaSpecViolationKind::EventStreamMismatch);
+    }
+
+    #[test]
+    fn non_canonical_lea_shapes_keep_their_own_key() {
+        // A LEA that is NOT the bridge shape must still be discriminated from
+        // another LEA: normalization is gated, not blanket. `[a + b*2]` and
+        // `[a + b*8]` compute different values and must diverge.
+        let build = |scale: u8| {
+            x86_func(
+                "plain_lea",
+                vec![
+                    inst(X86Opcode::LeaSib, vec![p(R8), sib(RBX, RCX, scale, 0)]),
+                    inst(X86Opcode::MovMR, vec![mem(RBP, -8), p(R8)]),
+                    inst(X86Opcode::Ret, vec![]),
+                ],
+            )
+        };
+        let spec = capture(&build(2));
+        assert_clean(&spec, &build(2));
+        assert_kind(
+            &spec,
+            &build(8),
+            PostRaSpecViolationKind::EventStreamMismatch,
+        );
     }
 
     // ===================================================================

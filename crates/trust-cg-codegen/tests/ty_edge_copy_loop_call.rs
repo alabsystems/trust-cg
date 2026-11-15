@@ -4,13 +4,13 @@
 // edges, joins at an indirect call, then uses a latch backedge that swaps and
 // duplicates loop-carried values.
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer, Target};
+use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer};
 use trust_ir::{BinOp, CastOp, ICmpOp, Ty, ValueId};
 use trust_ir_build::{FunctionBuilder, ModuleBuilder};
 
@@ -59,45 +59,7 @@ extern "C" fn host_ty_edge_copy_call(
     CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
 
     unsafe {
-        core::arch::asm!(
-            "mov x0, #1",
-            "mov x1, #2",
-            "mov x2, #3",
-            "mov x3, #4",
-            "mov x4, #5",
-            "mov x5, #6",
-            "mov x6, #7",
-            "mov x7, #8",
-            "mov x8, #9",
-            "mov x9, #10",
-            "mov x10, #11",
-            "mov x11, #12",
-            "mov x12, #13",
-            "mov x13, #14",
-            "mov x14, #15",
-            "mov x15, #16",
-            "mov x16, #17",
-            "mov x17, #18",
-            out("x0") _,
-            out("x1") _,
-            out("x2") _,
-            out("x3") _,
-            out("x4") _,
-            out("x5") _,
-            out("x6") _,
-            out("x7") _,
-            out("x8") _,
-            out("x9") _,
-            out("x10") _,
-            out("x11") _,
-            out("x12") _,
-            out("x13") _,
-            out("x14") _,
-            out("x15") _,
-            out("x16") _,
-            out("x17") _,
-            options(nostack)
-        );
+        ty_contract::clobber_call_volatile_gprs();
 
         if !out.is_null() {
             *out = value;
@@ -176,12 +138,12 @@ fn build_edge_copy_parent_loop_module() -> trust_ir::Module {
         let done_status = fb.add_block_param(done, Ty::U64);
 
         fb.switch_to_block(entry);
-        let callback_ptr = fb.cast(
-            CastOp::IntToPtr,
-            Ty::U64,
-            Ty::Func(callback_ty),
-            callback_raw,
-        );
+        // The callback address as a plain code pointer: trust-ir refuses an
+        // `inttoptr` to a `Ty::Func` (`CastIncompatible`; a function value
+        // originates only from `FnDef`), and admits an indirect call through
+        // a pointer-like callee at the declared signature. Since WS7.3 every
+        // ingestion entry refuses what the validator refuses.
+        let callback_ptr = fb.cast(CastOp::IntToPtr, Ty::U64, Ty::Ptr, callback_raw);
         let zero = fb.iconst(Ty::U64, 0);
         let initial_left = fb.iconst(Ty::U64, i128::from(INITIAL_LEFT));
         let initial_right = fb.iconst(Ty::U64, i128::from(INITIAL_RIGHT));
@@ -320,13 +282,14 @@ fn build_edge_copy_parent_loop_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_to_jit(module: &trust_ir::Module, opt_level: OptLevel) -> ExecutableBuffer {
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     config.opt_level = opt_level;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|err| panic!("{opt_level:?} compile failed: {err}"))
         .buffer
@@ -448,4 +411,13 @@ fn ty_edge_copy_loop_call_block_args_match_o1_o3() {
             );
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

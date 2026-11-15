@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: EXTENDED ITERATOR ADAPTERS — `.copied()` / `.cloned()` /
 // `.rev()` / `.take(n)` / `.skip(n)` / `.step_by(k)` / `.enumerate()` — composed
@@ -43,65 +47,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run iter-adapter test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -127,9 +80,8 @@ fn try_compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>) -> Opt
     let src_path = dir.join(format!("{name}.rs"));
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -149,7 +101,11 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>) -> PathBuf
     try_compile(dir, name, src, backend).unwrap_or_else(|| {
         panic!(
             "compile of `{name}` failed ({} backend)",
-            if backend.is_some() { "trust-cg" } else { "llvm" }
+            if backend.is_some() {
+                "trust-cg"
+            } else {
+                "llvm"
+            }
         )
     })
 }
@@ -432,12 +388,11 @@ fn step_by_is_supported_only_at_default_o0() {
         let src_path = dir.join(format!("{name}.rs"));
         std::fs::write(&src_path, src).expect("write source");
         let bin = dir.join(name);
-        let mut cmd = Command::new("rustup");
-        cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-            .args(["--crate-type", "bin"]);
+        let mut cmd = toolchain_support::rustc_command();
+        cmd.args(["--crate-type", "bin"]);
         if let Some(dylib) = backend {
             cmd.arg(backend_arg(dylib));
-            cmd.env("TCG_NO_PROOF_CERTS", "1");
+            cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
         }
         let output = cmd
             .args(["--target", TARGET, "-Cpanic=abort", "-Coverflow-checks=off"])
@@ -450,7 +405,11 @@ fn step_by_is_supported_only_at_default_o0() {
         assert!(
             output.status.success() && bin.exists(),
             "compile of `{name}` failed ({} backend) at -O{opt}; stderr:\n{}",
-            if backend.is_some() { "trust-cg" } else { "LLVM" },
+            if backend.is_some() {
+                "trust-cg"
+            } else {
+                "LLVM"
+            },
             String::from_utf8_lossy(&output.stderr),
         );
         bin
@@ -460,9 +419,8 @@ fn step_by_is_supported_only_at_default_o0() {
         let src_path = dir.join(format!("{name}.rs"));
         std::fs::write(&src_path, src).expect("write source");
         let bin = dir.join(name);
-        let mut cmd = Command::new("rustup");
-        cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-            .args(["--crate-type", "bin"])
+        let mut cmd = toolchain_support::rustc_command();
+        cmd.args(["--crate-type", "bin"])
             .arg(backend_arg(&dylib))
             .args(["--target", TARGET, "-Cpanic=abort", "-Coverflow-checks=off"])
             .arg(format!("-Copt-level={opt}"))
@@ -470,7 +428,7 @@ fn step_by_is_supported_only_at_default_o0() {
             .arg("-o")
             .arg(&bin)
             .arg(&src_path);
-        cmd.env("TCG_NO_PROOF_CERTS", "1");
+        cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
         let output = cmd.output().expect("spawn rustc");
         (
             output.status.success() && bin.exists(),
@@ -572,15 +530,14 @@ fn step_by_is_supported_only_at_default_o0() {
     let src_path = dir.join("holder_stepby_o3.rs");
     std::fs::write(&src_path, holder_src).expect("write holder source");
     let holder_bin = dir.join("holder_stepby_o3");
-    let holder_out = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let holder_out = toolchain_support::rustc_command()
         .args(["--crate-type", "lib"])
         .arg(backend_arg(&dylib))
         .args(["--target", TARGET, "-Cpanic=abort", "-Copt-level=3"])
         .arg("-o")
         .arg(&holder_bin)
         .arg(&src_path)
-        .env("TCG_NO_PROOF_CERTS", "1")
+        .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]))
         .output()
         .expect("spawn rustc");
     assert!(
@@ -606,8 +563,7 @@ fn step_by_is_supported_only_at_default_o0() {
     std::fs::write(&expanding_src_path, expanding_src).expect("write expanding type source");
     for opt in ["1", "3"] {
         let output_path = dir.join(format!("expanding_recursive_type_o{opt}"));
-        let output = Command::new("rustup")
-            .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+        let output = toolchain_support::rustc_command()
             .args(["--crate-type", "lib"])
             .arg(backend_arg(&dylib))
             .args(["--target", TARGET, "-Cpanic=abort"])
@@ -615,7 +571,7 @@ fn step_by_is_supported_only_at_default_o0() {
             .arg("-o")
             .arg(&output_path)
             .arg(&expanding_src_path)
-            .env("TCG_NO_PROOF_CERTS", "1")
+            .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]))
             .output()
             .expect("spawn rustc");
         assert!(
@@ -677,10 +633,10 @@ fn unmodeled_iter_adapters_fail_closed() {
             "fn main() { let k = std::hint::black_box(2usize); \
              let s: i64 = (0..10i64).step_by(k).sum(); std::process::exit(s as i32); }",
         ),
-        // The bridge's StepBy constructor uses synthetic state (a packed word
-        // for unsigned Range sources). A real core method that is not explicitly
-        // intercepted must never read that slot: before the method guard this
-        // compiled and `(0u64..10).step_by(3).size_hint()` returned
+        // A real core method that is not explicitly intercepted must never run
+        // over a bridge-driven StepBy (the `[TCG-STEPBY-METHOD]` surface guard).
+        // Before that guard, when the constructor still wrote a packed private
+        // word, this compiled and `(0u64..10).step_by(3).size_hint()` returned
         // `(0, Some(0))`, while LLVM returned `(4, Some(4))`.
         (
             "step_by_size_hint",
@@ -740,8 +696,7 @@ fn takewhile_borrowed_terminal_fails_closed_but_range_next_remains_supported() {
     let src_path = dir.join("takewhile_reuse_tcg.rs");
     std::fs::write(&src_path, reuse).expect("write source");
     let bin = dir.join("takewhile_reuse_tcg");
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "bin"])
         .arg(backend_arg(&dylib))
         .args(["--target", TARGET, "-Cpanic=abort"])
@@ -856,8 +811,7 @@ fn usize_step_by_reduction_fails_closed_cleanly_at_o2_o3() {
         let src_path = dir.join(format!("{name}.rs"));
         std::fs::write(&src_path, src).expect("write source");
         let bin = dir.join(name);
-        let out = Command::new("rustup")
-            .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+        let out = toolchain_support::rustc_command()
             .args(["--crate-type", "bin"])
             .arg(backend_arg(&dylib))
             .args(["--target", TARGET, "-Cpanic=abort"])

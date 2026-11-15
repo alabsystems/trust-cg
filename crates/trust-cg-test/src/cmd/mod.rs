@@ -36,16 +36,10 @@ pub struct GlobalArgs {
     pub format: OutputFormat,
     /// Command-specific output file or directory override.
     pub out: Option<PathBuf>,
-    /// Per-unit timeout override, in seconds.
-    pub timeout: Option<u64>,
-    /// Worker count override.
-    pub parallel: Option<usize>,
-    /// Suppress progress bars.
+    /// Log errors only.
     pub quiet: bool,
     /// Verbosity counter (0 = info, 1 = debug, 2+ = trace).
     pub verbose: u8,
-    /// Ignore caches for this run.
-    pub no_cache: bool,
     /// Print-only; do not invoke external tools.
     pub dry_run: bool,
 }

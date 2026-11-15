@@ -201,6 +201,51 @@ fn run_otool_h(path: &Path) -> Option<String> {
     }
 }
 
+fn otool_text_alignment(output: &str) -> Option<u32> {
+    let mut is_text = false;
+    let mut is_text_segment = false;
+    for line in output.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            ["Section"] => {
+                is_text = false;
+                is_text_segment = false;
+            }
+            ["sectname", name] => is_text = *name == "__text",
+            ["segname", name] => is_text_segment = *name == "__TEXT",
+            ["align", exponent, ..] if is_text && is_text_segment => {
+                return exponent.strip_prefix("2^")?.parse().ok();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[test]
+fn otool_alignment_is_scoped_to_the_text_section() {
+    for exponent in [4, 5, 6] {
+        let output = format!(
+            "Section\nsectname __data\nsegname __DATA\nalign 2^4 (16)\n\
+             Section\nsectname __text\nsegname __TEXT\nalign 2^{exponent} ({})\n",
+            1 << exponent
+        );
+        assert_eq!(otool_text_alignment(&output), Some(exponent));
+    }
+    assert_eq!(
+        otool_text_alignment("Section\nsectname __data\nsegname __DATA\nalign 2^4 (16)"),
+        None
+    );
+    assert_eq!(
+        otool_text_alignment("Section\nsectname __text\nsegname __DATA\nalign 2^4 (16)"),
+        None
+    );
+    assert_eq!(
+        otool_text_alignment("Section\nsectname __text\nsegname __TEXT\nalign malformed"),
+        None
+    );
+}
+
 fn run_nm(path: &Path) -> Option<String> {
     let output = Command::new("nm")
         .args([path.to_str().unwrap()])
@@ -266,13 +311,11 @@ fn test_x86_64_macho_text_section_attributes() {
     let (offset, size, align, flags) =
         find_section(&bytes, b"__text").expect("__text section not found");
 
-    // x86-64 text alignment: the SysV ABI floor is 2^4 = 16 bytes; since
-    // 08dfb4d1 (static 32-byte loop-head alignment, the JCC-erratum
-    // mitigation) code carrying loop-head padding raises the section to 2^5.
-    // The contract is the FLOOR — never weaker than 16B.
+    // The backend's minimum text alignment is 16 bytes. Its JCC mitigation
+    // raises this to 32 bytes; loop-head containment requires 64 bytes.
     assert!(
         align >= 4,
-        "x86-64 text section alignment must be at least 2^4 (SysV), got 2^{align}"
+        "x86-64 text section alignment must meet the backend's 2^4 minimum, got 2^{align}"
     );
 
     // Text section should have PURE_INSTRUCTIONS and SOME_INSTRUCTIONS flags.
@@ -550,11 +593,15 @@ fn test_x86_64_macho_otool_l_validation() {
         "otool -l should show LC_BUILD_VERSION load command"
     );
 
-    // Verify correct section alignment for x86-64: 2^4 = 16 bytes.
-    assert!(
-        output.contains("2^4 (16)") || output.contains("2^5 (32)"),
-        "otool -l must show at least 16-byte text alignment (2^5 with the \
-         08dfb4d1 loop-head padding)"
+    // Compare the named text section's independently decoded alignment, not
+    // a hardcoded list that excludes the current 64-byte loop-head policy
+    // or accidentally matches a different section's alignment.
+    let (_, _, align, _) = find_section(&bytes, b"__text").expect("text section must exist");
+    assert!(align >= 4, "text alignment must be at least 16 bytes");
+    assert_eq!(
+        otool_text_alignment(&output),
+        Some(align),
+        "otool output:\n{output}"
     );
 
     // Also validate header with otool -h to confirm CPU type.
@@ -788,11 +835,14 @@ fn test_x86_64_macho_trust_ir_compile() {
 
     // Build a simple trust_ir function: fn add(a: i64, b: i64) -> i64 { a + b }
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut trust_ir_func = TrustIrFunction::new(FuncId::new(0), "add", ft_id, BlockId::new(0));
     trust_ir_func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -810,11 +860,17 @@ fn test_x86_64_macho_trust_ir_compile() {
             }),
         ],
     }];
-    module.add_function(trust_ir_func.clone());
+    module
+        .try_add_function(trust_ir_func.clone())
+        .expect("Module::try_add_function: test fixture");
 
     // Translate trust_ir to LIR through the adapter.
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("trust_ir adapter translation should succeed");
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("trust_ir adapter translation should succeed");
 
     // Compile through the x86-64 pipeline to Mach-O.
     let pipeline = X86Pipeline::new(X86PipelineConfig {
@@ -841,12 +897,20 @@ fn test_x86_64_macho_trust_ir_compile() {
     assert!(size > 0, "text section should contain code");
     assert!(
         align >= 4,
-        "x86-64 text alignment must be at least 2^4 (SysV floor; 2^5 with \
-         08dfb4d1 loop-head padding), got 2^{align}"
+        "x86-64 text alignment must be at least 2^4, got 2^{align}"
     );
     assert_ne!(
         flags & S_ATTR_PURE_INSTRUCTIONS,
         0,
         "S_ATTR_PURE_INSTRUCTIONS"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: CLOSURES that CAPTURE an intercepted collection
 // (`Vec`/`HashMap`/`BTreeMap`/`String`) BY REFERENCE — compiled for x86_64 via
@@ -24,10 +28,16 @@ mod target_dir_support;
 //   * `&Vec` captured + indexed in a stored closure.
 //   * two collections captured by one closure.
 //   * a closure stored in a local and called twice, mutating a captured Vec.
-//   * `&mut HashMap` captured + `insert`/`get`/`len` (the interception-supported
-//     HashMap methods) in a stored closure.
 //
 // WHAT FAILS CLOSED (and why — never a miscompile):
+//   * `&mut HashMap` captured + `insert`/`get`/`len` in a stored closure
+//     ([TCG-FOREIGN-MAP]): the closure body reaches the map through its
+//     captured reference, a map the BODY did not construct, and `main` reads the
+//     map back from storage the closure could have rewritten. A map intercept
+//     applies only to a map its own function built (the same lowering read an
+//     LLVM-built map as the bridge's slot image:
+//     `foreign_map_provenance_differential.rs`). It ran and matched before; an
+//     interprocedural receipt would restore it.
 //   * BY-VALUE (`move`) capture of a collection: rustc lays the value out as its
 //     full `{ ptr, cap, len }` struct inline in the env while the bridge models
 //     it as one `Ptr`; the moved-in handle also routes through the un-lowered
@@ -47,65 +57,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run closure-collection test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -136,9 +95,8 @@ fn try_compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -156,7 +114,11 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>, opt: &str)
     assert!(
         output.status.success(),
         "compile of `{name}` failed ({} backend, -Copt-level={opt}). stderr: <<<{}>>>",
-        if backend.is_some() { "trust-cg" } else { "llvm" },
+        if backend.is_some() {
+            "trust-cg"
+        } else {
+            "llvm"
+        },
         String::from_utf8_lossy(&output.stderr)
     );
     bin
@@ -313,19 +275,6 @@ fn closure_collection_by_ref_programs_run_and_match_llvm() {
              std::process::exit((s & 0xff) as i32); }",
             8, // a=[0,1,0,1] b=[1,2,1,2] -> sum(a)+sum(b) = 2 + 6 = 8
         ),
-        // &mut HashMap captured + insert/get/len (the interception-supported
-        // HashMap methods) in a stored closure.
-        (
-            "hashmap_insert_stored",
-            "use std::collections::HashMap; use std::hint::black_box; \
-             fn main(){ let mut m: HashMap<i64,i64> = HashMap::new(); \
-             let mut put = |k: i64, v: i64| { m.insert(k, v); }; \
-             put(black_box(3), black_box(30)); \
-             put(black_box(1), black_box(10)); \
-             let s = m.get(&3).copied().unwrap_or(0) + m.len() as i64; \
-             std::process::exit(s as i32); }",
-            32, // 30+2
-        ),
     ];
 
     for (name, src, expected) in shapes {
@@ -348,6 +297,31 @@ fn closure_collection_unsound_shapes_fail_closed() {
     }
     let dylib = ensure_dylib_built();
     let dir = workdir("failclosed");
+
+    // `&mut HashMap` captured + insert/get/len in a stored closure: refused by map
+    // provenance ([TCG-FOREIGN-MAP]) — the body's map is a captured reference, not a
+    // map the body built. LLVM exits 30 + 2 = 32.
+    let name = "hashmap_insert_stored";
+    let src = "use std::collections::HashMap; use std::hint::black_box; \
+         fn main(){ let mut m: HashMap<i64,i64> = HashMap::new(); \
+         let mut put = |k: i64, v: i64| { m.insert(k, v); }; \
+         put(black_box(3), black_box(30)); \
+         put(black_box(1), black_box(10)); \
+         let s = m.get(&3).copied().unwrap_or(0) + m.len() as i64; \
+         std::process::exit(s as i32); }";
+    let llvm_bin = compile(&dir, &format!("{name}_o0_llvm"), src, None, "0");
+    assert_eq!(
+        run_exit_code(&llvm_bin),
+        32,
+        "LLVM exit for `{name}` at -O0"
+    );
+    let (output, bin) = try_compile(&dir, &format!("{name}_o0_tcg"), src, Some(&dylib), "0");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && !bin.exists() && stderr.contains("[TCG-FOREIGN-MAP]"),
+        "trust-cg must refuse `{name}` at -O0 by map provenance ([TCG-FOREIGN-MAP]); \
+         stderr: <<<{stderr}>>>"
+    );
 
     // BY-VALUE (`move`) capture of a Vec: the moved-in handle's `{ptr,cap,len}`
     // env layout and the `FnOnce::call_once` shim are not modeled. Fails closed.

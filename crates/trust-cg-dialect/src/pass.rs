@@ -78,16 +78,16 @@ pub trait Pass {
     fn run(&self, module: &mut DialectModule) -> Result<(), PassError>;
 }
 
-/// Boolean predicate form of [`validate_type_constraints_report`].
+/// Boolean predicate form of [`validate_type_constraints_with_env`].
 ///
 /// Returns `true` iff the op's actual operand and result types satisfy the
 /// per-position [`TypeConstraint`] slices declared on `def`. Empty constraint
 /// slices are a legacy opt-out and are treated as "no constraint".
 ///
-/// Note: operand types are only checkable when an SSA value->type environment
-/// is supplied. Callers outside a module walk (e.g. synthetic tests) can pass
-/// a lookup that returns `None` for all ids; in that case operand-side
-/// constraints are skipped and only result-side constraints are enforced.
+/// This convenience form supplies an empty type environment, so operand-side
+/// constraints are skipped. Result-side constraints still apply, including
+/// `SameAs` constraints, which fail when the referenced operand is unresolved.
+/// Use [`validate_type_constraints_with_env`] to check known operand types.
 pub fn validate_type_constraints(op: &DialectOp, def: &OpDef) -> bool {
     let empty = std::collections::BTreeMap::new();
     validate_type_constraints_with_env(op, def, &empty).is_ok()
@@ -96,7 +96,7 @@ pub fn validate_type_constraints(op: &DialectOp, def: &OpDef) -> bool {
 /// Structured version of [`validate_type_constraints`].
 ///
 /// `value_types` maps SSA `ValueId`s to concrete `Type`s (built from function
-/// parameters plus prior op results). Positions whose operand type cannot be
+/// parameters, block parameters, and op results). Positions whose operand type cannot be
 /// resolved are skipped on the operand side; the result side is always
 /// checked because `DialectOp` carries the result types inline.
 pub fn validate_type_constraints_with_env(
@@ -233,6 +233,10 @@ fn constraint_for(
 /// - when the op's `OpDef` declares non-empty `operand_types`/`result_types`
 ///   slices, its per-position [`TypeConstraint`]s are checked.
 ///
+/// Function structure and reference existence are checked first. Only placed
+/// operations contribute definitions/types; unplaced arena entries are not
+/// part of the program. This is not a dominance or full semantic verifier.
+///
 /// Returns `Err` with a description of the first offender. Design doc §5
 /// requires both sides of the accept/produce contract to "connect end-to-end"
 /// — so this helper enforces both input and output legality. Passes or tests
@@ -242,12 +246,20 @@ pub fn validate_legality(module: &DialectModule, legality: &Legality) -> Result<
     use std::collections::BTreeMap;
 
     for func in &module.functions {
-        // Per-function value->type environment from parameters + op results.
+        func.validate_structure()
+            .map_err(PassError::LegalityViolation)?;
+        // Block parameters define SSA values just as function parameters and
+        // op results do; omitting them skips operand checks and breaks SameAs.
         let mut value_types: BTreeMap<crate::id::ValueId, Type> = BTreeMap::new();
         for (v, ty) in &func.params {
             value_types.insert(*v, ty.clone());
         }
-        for op in &func.ops {
+        for block in &func.blocks {
+            for (v, ty) in &block.params {
+                value_types.insert(*v, ty.clone());
+            }
+        }
+        for op in func.iter_ops() {
             for (v, ty) in &op.results {
                 value_types.insert(*v, ty.clone());
             }

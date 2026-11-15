@@ -1,0 +1,194 @@
+; TrustIr text format v1
+module "mir::closure::fixup_patch_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_fixup_patch_slice.rs"
+
+functy.0 = (u32, i64, u32, u32, ptr) -> ()
+
+functy.1 = (u32, i64, ptr) -> ()
+
+functy.2 = (u32, i64, ptr) -> ()
+
+functy.3 = (u32, u32, u32, ptr) -> ()
+
+fn @fixup_patch_root(functy.0) {
+bb0(%0: u32, %1: i64, %2: u32, %3: u32, %4: ptr):
+    %20 = const u32 0
+    %21 = icmp eq u32 %3, %20
+    condbr %21, bb1(%0, %1, %4), bb2(%0, %1, %2, %3, %4)
+bb1(%5: u32, %6: i64, %7: ptr):
+    call @func.1(%5, %6, %7)
+    br bb5
+bb2(%8: u32, %9: i64, %10: u32, %11: u32, %12: ptr):
+    %22 = const u32 1
+    %23 = icmp eq u32 %11, %22
+    condbr %23, bb3(%8, %9, %12), bb4(%8, %9, %10, %12)
+bb3(%13: u32, %14: i64, %15: ptr):
+    call @func.2(%13, %14, %15)
+    br bb5
+bb4(%16: u32, %17: i64, %18: u32, %19: ptr):
+    %24 = trunc i64 %17 to u32
+    call @func.3(%16, %24, %18, %19)
+    br bb5
+bb5:
+    ret
+}
+
+fn @apply_branch26_core(functy.1) {
+bb0(%0: u32, %1: i64, %2: ptr):
+    %16 = const i64 3
+    %17 = and i64 %1, %16
+    %18 = const i64 0
+    %19 = icmp ne i64 %17, %18
+    condbr %19, bb1(%0, %2), bb2(%0, %1, %2)
+bb1(%3: u32, %4: ptr):
+    store u32 %3, ptr %4
+    %20 = const u32 1
+    %21 = const i64 4
+    %22 = gep i8, ptr %4, %21
+    store u32 %20, ptr %22
+    br bb6
+bb2(%5: u32, %6: i64, %7: ptr):
+    %23 = const i32 2
+    %24 = zext i32 %23 to i64
+    %25 = ashr i64 %6, %24
+    %26 = const i64 -33554432
+    %27 = icmp slt i64 %25, %26
+    condbr %27, bb5(%5, %7), bb3(%5, %7, %25)
+bb3(%8: u32, %9: ptr, %10: i64):
+    %28 = const i64 33554432
+    %29 = icmp sge i64 %10, %28
+    condbr %29, bb5(%8, %9), bb4(%8, %9, %10)
+bb4(%11: u32, %12: ptr, %13: i64):
+    %30 = trunc i64 %13 to u32
+    %31 = const u32 67108863
+    %32 = and u32 %30, %31
+    %33 = const u32 4227858432
+    %34 = and u32 %11, %33
+    %35 = or u32 %34, %32
+    store u32 %35, ptr %12
+    %36 = const u32 0
+    %37 = const i64 4
+    %38 = gep i8, ptr %12, %37
+    store u32 %36, ptr %38
+    br bb6
+bb5(%14: u32, %15: ptr):
+    store u32 %14, ptr %15
+    %39 = const u32 2
+    %40 = const i64 4
+    %41 = gep i8, ptr %15, %40
+    store u32 %39, ptr %41
+    br bb6
+bb6:
+    ret
+}
+
+fn @apply_page21_core(functy.2) {
+bb0(%0: u32, %1: i64, %2: ptr):
+    %11 = const i64 -1048576
+    %12 = icmp slt i64 %1, %11
+    condbr %12, bb2(%0, %2), bb1(%0, %1, %2)
+bb1(%3: u32, %4: i64, %5: ptr):
+    %13 = const i64 1048576
+    %14 = icmp sge i64 %4, %13
+    condbr %14, bb2(%3, %5), bb3(%3, %4, %5)
+bb2(%6: u32, %7: ptr):
+    store u32 %6, ptr %7
+    %15 = const u32 2
+    %16 = const i64 4
+    %17 = gep i8, ptr %7, %16
+    store u32 %15, ptr %17
+    br bb4
+bb3(%8: u32, %9: i64, %10: ptr):
+    %18 = trunc i64 %9 to u32
+    %19 = const u32 2097151
+    %20 = and u32 %18, %19
+    %21 = const u32 3
+    %22 = and u32 %20, %21
+    %23 = const u32 2
+    %24 = lshr u32 %20, %23
+    %25 = const u32 524287
+    %26 = and u32 %24, %25
+    %27 = const u32 2667577375
+    %28 = and u32 %8, %27
+    %29 = const u32 29
+    %30 = shl u32 %22, %29
+    %31 = or u32 %28, %30
+    %32 = const u32 5
+    %33 = shl u32 %26, %32
+    %34 = or u32 %31, %33
+    store u32 %34, ptr %10
+    %35 = const u32 0
+    %36 = const i64 4
+    %37 = gep i8, ptr %10, %36
+    store u32 %35, ptr %37
+    br bb4
+bb4:
+    ret
+}
+
+fn @apply_pageoff12_core(functy.3) {
+bb0(%0: u32, %1: u32, %2: u32, %3: ptr):
+    %31 = const u32 4096
+    %32 = icmp uge u32 %1, %31
+    condbr %32, bb1(%0, %3), bb2(%0, %1, %2, %3)
+bb1(%4: u32, %5: ptr):
+    store u32 %4, ptr %5
+    %33 = const u32 2
+    %34 = const i64 4
+    %35 = gep i8, ptr %5, %34
+    store u32 %33, ptr %35
+    br bb10
+bb2(%6: u32, %7: u32, %8: u32, %9: ptr):
+    %36 = const u32 0
+    %37 = icmp ugt u32 %8, %36
+    condbr %37, bb3(%6, %7, %8, %9), bb4(%6, %7, %9)
+bb3(%10: u32, %11: u32, %12: u32, %13: ptr):
+    %38 = const u32 1
+    %39 = shl u32 %38, %12
+    %40 = const u32 1
+    %41 = sub u32 %39, %40
+    %42 = and u32 %11, %41
+    %43 = const u32 0
+    %44 = icmp ne u32 %42, %43
+    condbr %44, bb5(%10, %13), bb6(%10, %11, %12, %13)
+bb4(%14: u32, %15: u32, %16: ptr):
+    br bb7(%14, %16, %15)
+bb5(%17: u32, %18: ptr):
+    store u32 %17, ptr %18
+    %45 = const u32 1
+    %46 = const i64 4
+    %47 = gep i8, ptr %18, %46
+    store u32 %45, ptr %47
+    br bb10
+bb6(%19: u32, %20: u32, %21: u32, %22: ptr):
+    %48 = lshr u32 %20, %21
+    br bb7(%19, %22, %48)
+bb7(%23: u32, %24: ptr, %25: u32):
+    %49 = const u32 4096
+    %50 = icmp uge u32 %25, %49
+    condbr %50, bb8(%23, %24), bb9(%23, %24, %25)
+bb8(%26: u32, %27: ptr):
+    store u32 %26, ptr %27
+    %51 = const u32 3
+    %52 = const i64 4
+    %53 = gep i8, ptr %27, %52
+    store u32 %51, ptr %53
+    br bb10
+bb9(%28: u32, %29: ptr, %30: u32):
+    %54 = const u32 4290774015
+    %55 = and u32 %28, %54
+    %56 = const u32 4095
+    %57 = and u32 %30, %56
+    %58 = const u32 10
+    %59 = shl u32 %57, %58
+    %60 = or u32 %55, %59
+    store u32 %60, ptr %29
+    %61 = const u32 0
+    %62 = const i64 4
+    %63 = gep i8, ptr %29, %62
+    store u32 %61, ptr %63
+    br bb10
+bb10:
+    ret
+}

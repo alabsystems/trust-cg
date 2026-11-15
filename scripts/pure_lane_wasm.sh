@@ -13,7 +13,7 @@
 #
 # This script does that, end to end:
 #
-#   add3.rs  --(rustc -Ztrust-cg-frontend=trust-ir)-->  trust-ir Module
+#   add3.rs  --(trustc -Ztrust-cg-frontend=trust-ir)-->  trust-ir Module
 #            --(trust-cg --target wasm32-unknown-unknown)-->  .wasm
 #            --(node)-->  differential against the Rust source semantics
 #
@@ -27,8 +27,13 @@
 #
 # WHAT IT DOES NOT DEMONSTRATE, stated here because the gap IS the finding
 # ------------------------------------------------------------------------
-# The pipeline is NOT push-button. Two edits are applied to the producer's
-# module between the halves, and each names a real missing piece:
+# With WASM32_SYSROOT pointing at a wasm32 sysroot
+# (scripts/build_wasm32_sysroot.sh builds one), the producer is asked for the
+# wasm32 configuration directly: it stamps `wasm32-unknown-unknown 4 little`
+# and keeps `extern "C"` items on the C convention, so its module reaches the
+# backend UNEDITED (measured 2026-09-27: 3 functions, 139 bytes). Without a
+# wasm32 sysroot the pipeline is NOT push-button, and one edit is applied
+# between the halves:
 #
 #   1. TARGET STAMP. The producer stamps the HOST config into the module ---
 #      `target "arm64-apple-macosx" 8 little`. The wasm backend correctly
@@ -36,7 +41,7 @@
 #      trust-ir Module as emitted is NOT target-independent, and "one Module,
 #      every target" is today "one Module per target config" with no way to ask
 #      the producer for a config other than the host's. The honest fix is a
-#      wasm32 sysroot in the stage2 so rustc can be asked for the wasm32
+#      wasm32 sysroot in the stage2 so trustc can be asked for the wasm32
 #      configuration directly; retargeting the stamp is a stand-in for that.
 #
 #      This is sound for THESE bodies and not in general: `add3` and `clamp_lo`
@@ -44,14 +49,10 @@
 #      pointer-size field cannot change what they compute. A body that touched
 #      memory would need the real thing.
 #
-#   2. CALLING CONVENTION. The producer emits `rustcc` (CallingConv::Rust) even
-#      for `extern "C"` items; the wasm backend lowers only CallingConv::C.
-#      Rewriting the convention is safe for these signatures --- all-scalar
-#      i32 arguments and returns, where the two conventions coincide --- and
-#      would NOT be for an aggregate.
-#
-# Both edits are applied by `sed` below, in the open, rather than by a helper
-# that would make them easy to stop noticing.
+# A second edit, rewriting `rustcc` to the C convention, is gone: the wasm
+# backend now lowers CallingConv::Rust itself. The remaining edit is applied by
+# `sed` below, in the open, rather than by a helper that would make it easy to
+# stop noticing.
 #
 # The compile's own evidence block reports `"verdict":"missing_evidence"` and
 # lists `translation_validation` under `not_run`. The CFG structural invariant
@@ -59,26 +60,26 @@
 # proof that the module computes what the trust-ir computes. The load-bearing
 # evidence here is the execution differential at the end.
 #
-#   ./scripts/pure_lane_wasm.sh [stage2-rustc]
+#   [WASM32_SYSROOT=<sysroot>] ./scripts/pure_lane_wasm.sh [trustc]
 #
-# Default rustc: $HOME/trust/build/host/stage2/bin/rustc. Any Trust-built rustc
-# carrying `-Ztrust-cg-frontend` works; the script prints which one it used and
-# its commit hash, because a stale stage2 measures the day it was built rather
-# than the day you ran it.
+# Default: the installed Trust package's trustc (scripts/trust_toolchain.py;
+# it carries `-Ztrust-cg-frontend`). Never a stage of the Trust bootstrap build
+# tree: it is exclusive and x.py deletes its compilers mid-build. The script
+# prints which compiler it used and its commit hash.
 set -euo pipefail
 
-RUSTC="${1:-$HOME/trust/build/host/stage2/bin/rustc}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+RUSTC="${1:-$(python3 -B "$HERE/trust_toolchain.py" --print compiler)}"
 CG="$HERE/../target/release/trust-cg"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 command -v node >/dev/null || { echo "node not found" >&2; exit 1; }
-[ -x "$RUSTC" ] || { echo "no Trust rustc at $RUSTC" >&2; exit 1; }
-[ -x "$CG" ] || { echo "build the CLI first: cargo build --release -p trust-cg-cli" >&2; exit 1; }
+[ -x "$RUSTC" ] || { echo "no trustc at $RUSTC" >&2; exit 1; }
+[ -x "$CG" ] || { echo "build the CLI first: targo --unverified build --release -p trust-cg-cli" >&2; exit 1; }
 
 echo "==> compilers"
-"$RUSTC" --version --verbose | sed -n '1p;/commit-hash/p' | sed 's/^/    rustc: /'
+"$RUSTC" --version --verbose | sed -n '1p;/commit-hash/p' | sed 's/^/    trustc: /'
 echo "    trust-cg: $(git -C "$HERE/.." rev-parse --short=12 HEAD)$([ -n "$(git -C "$HERE/.." status --porcelain)" ] && echo ' (DIRTY)')"
 
 cat > "$OUT/src.rs" <<'RUST'
@@ -99,7 +100,12 @@ RUST
 # behaviour and a different experiment.
 echo "==> producer: THIR -> trust_ir_of -> trust-ir Module"
 mkdir -p "$OUT/ir"
-"$RUSTC" --edition 2021 --crate-name pl3 \
+TARGET_ARGS=()
+if [ -n "${WASM32_SYSROOT:-}" ]; then
+  TARGET_ARGS=(--target wasm32-unknown-unknown --sysroot "$WASM32_SYSROOT")
+  echo "    target: wasm32-unknown-unknown (sysroot $WASM32_SYSROOT)"
+fi
+"$RUSTC" --edition 2021 --crate-name pl3 ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
   -C panic=abort -C overflow-checks=off \
   -Ztrust-verify=off -Ztrust-ir-lower=on -Ztrust-cg-frontend=trust-ir \
   -Ztrust-dump=ir:"$OUT/ir" --emit=obj --crate-type cdylib \
@@ -115,12 +121,17 @@ if t["unsupported"] or t["calls"]["unresolved"]:
     raise SystemExit("refusing: the module is not self-contained")
 PY
 
-# The two documented edits. Kept visible; see the header for why each is sound
-# for these specific bodies and unsound in general.
-echo "==> retarget the module stamp (host config -> wasm32) and set C convention"
-sed -e 's|target "[^"]*" 8 little|target "wasm32-unknown-unknown" 4 little|' \
-    -e 's|^rustcc fn |fn |' \
+# The documented edit, needed only without a wasm32 sysroot. Kept visible; see
+# the header for why it is sound for these specific bodies and unsound in
+# general.
+if [ -n "${WASM32_SYSROOT:-}" ]; then
+  echo "==> no edits: the producer targeted wasm32 itself"
+  cp "$OUT/ir/pl3.trust-ir.txt" "$OUT/pl3.trust_ir"
+else
+  echo "==> retarget the module stamp (host config -> wasm32)"
+  sed -e 's|target "[^"]*" 8 little|target "wasm32-unknown-unknown" 4 little|' \
     "$OUT/ir/pl3.trust-ir.txt" > "$OUT/pl3.trust_ir"
+fi
 grep -n '^target' "$OUT/pl3.trust_ir" | sed 's/^/    /'
 
 echo "==> backend: trust-ir Module -> wasm32"
@@ -169,6 +180,8 @@ node "$OUT/check.mjs" "$OUT/pl3.wasm"
 
 echo
 echo "PURE LANE GREEN --- real Rust to wasm with no LLVM in the chain."
-echo "Read the header before quoting this: two documented edits stand in for a"
-echo "wasm32 sysroot and for extern \"C\" convention propagation, and the"
-echo "compile's own evidence block reports translation_validation as not_run."
+if [ -z "${WASM32_SYSROOT:-}" ]; then
+  echo "Read the header before quoting this: a documented edit stands in for a"
+  echo "wasm32 sysroot (set WASM32_SYSROOT to remove it)."
+fi
+echo "The compile's own evidence block reports translation_validation as not_run."

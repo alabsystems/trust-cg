@@ -1,0 +1,308 @@
+{
+ "b1_mispredict": {
+  "category": "branch",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 3.05,
+   "loadavg_at_retry": 2.89,
+   "retry_ok": false
+  },
+  "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "h1_vec_push_sum": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 2.63,
+   "loadavg_at_retry": 2.54,
+   "retry_ok": false
+  },
+  "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "h2_vec_grow": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 2.38,
+   "loadavg_at_retry": 2.48,
+   "retry_ok": false
+  },
+  "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "h3_box_leak": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 2.95,
+   "loadavg_at_retry": 3.25,
+   "retry_ok": false
+  },
+  "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "h4_vec_dropper": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 3.22,
+   "loadavg_at_retry": 3.03,
+   "retry_ok": false
+  },
+  "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "m1_call_chain": {
+  "category": "multifn",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 3.03,
+   "loadavg_at_retry": 3.03,
+   "retry_ok": false
+  },
+  "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "m2_call_heavy": {
+  "category": "multifn",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 6.26,
+   "loadavg_at_retry": 6.26,
+   "retry_ok": false
+  },
+  "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p1_xorshift": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 8.24,
+   "loadavg_at_retry": 8.24,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 8.24->8.24 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p2_collatz": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 10.87,
+   "loadavg_at_retry": 10.87,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 10.87->10.87 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p3_gcd": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 11.84,
+   "loadavg_at_retry": 11.84,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 11.84->11.84 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p4_matmul": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 18.01,
+   "loadavg_at_retry": 19.3,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 18.01->19.3 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p5_struct_acc": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 18.31,
+   "loadavg_at_retry": 18.31,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 18.31->18.31 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p6_branch_match": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 19.49,
+   "loadavg_at_retry": 18.49,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 19.49->18.49 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p7_sieve": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 16.72,
+   "loadavg_at_retry": 15.27,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 16.72->15.27 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "p8_closure_nest": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 14.29,
+   "loadavg_at_retry": 14.29,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 14.29->14.29 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "v1_saxpy": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 11.11,
+   "loadavg_at_retry": 10.46,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 11.11->10.46 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "v2_memfill": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 9.78,
+   "loadavg_at_retry": 9.16,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 9.78->9.16 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ },
+ "v3_popcount": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": "NONDET-CANDIDATE",
+  "nondet": {
+   "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "err_identical": true,
+   "err_is_solver_timeout": false,
+   "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "load_threshold": 8.0,
+   "loadavg_at_fail": 8.13,
+   "loadavg_at_retry": 7.64,
+   "retry_ok": false
+  },
+  "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 8.13->7.64 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+  "verdict": "INCOMPLETE"
+ }
+}

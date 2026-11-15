@@ -114,19 +114,27 @@ fn emit_forced_spill_kernel(lanes: usize) -> Module {
     b.emit_void(Inst::Return { values: vec![acc] });
 
     let mut module = Module::new("jit_forced_spill_post_ra_frame");
-    let caller_ty_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let callee_ty_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let caller_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let callee_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = Function::new(FuncId(0), "forced_spill_reduce", caller_ty_id, BlockId(0));
     caller.blocks = vec![b.seal(BlockId(0), vec![(input, Ty::Ptr)])];
-    module.add_function(caller);
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
 
     let mut callee_builder = TrustIrBuilder::new();
     let callee_params = callee_builder.reserve_params(1);
@@ -140,7 +148,9 @@ fn emit_forced_spill_kernel(lanes: usize) -> Module {
         BlockId(0),
     );
     callee.blocks = vec![callee_builder.seal(BlockId(0), vec![(callee_params[0], Ty::I64)])];
-    module.add_function(callee);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -150,7 +160,7 @@ fn compile_forced_spill_module(module: &Module) -> (JitCompilationResult, Forced
         parallel: false,
         ..CompilerConfig::default()
     };
-    let compiler = Compiler::new(config);
+    let compiler = Compiler::new(config).with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile_module_to_jit(module, &HashMap::new())
         .expect("O2 JIT compile should succeed for forced-spill regression");
@@ -180,7 +190,7 @@ fn jit_forced_spill_o2_survives_post_ra_copy_lowering_and_frame_elimination() {
     const LANES: usize = 192;
 
     let module = emit_forced_spill_kernel(LANES);
-    let lir_functions = trust_cg_lower::translate_module(&module)
+    let lir_functions = permit_translate_module(&module)
         .expect("forced-spill trust_ir module should lower before O2 prepare");
     assert_eq!(
         lir_functions.len(),
@@ -190,7 +200,7 @@ fn jit_forced_spill_o2_survives_post_ra_copy_lowering_and_frame_elimination() {
 
     let pipeline_config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     let (prepared, metrics) = pipeline
@@ -238,12 +248,12 @@ fn jit_forced_spill_o2_coalesces_redundant_copies_on_spillful_function() {
     const LANES: usize = 192;
 
     let module = emit_forced_spill_kernel(LANES);
-    let lir_functions = trust_cg_lower::translate_module(&module)
+    let lir_functions = permit_translate_module(&module)
         .expect("forced-spill trust_ir module should lower before O2 prepare");
 
     let pipeline_config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     let (_prepared, metrics) = pipeline
@@ -270,4 +280,28 @@ fn jit_forced_spill_o2_coalesces_redundant_copies_on_spillful_function() {
         actual, expected,
         "spillful coalesced JIT result must match the reference implementation"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

@@ -1,0 +1,98 @@
+; TrustIr text format v1
+module "assert_kind"
+
+functy.0 = (usize, usize) -> (usize)
+
+functy.1 = (usize, usize) -> (usize)
+
+functy.2 = (u32, u32) -> (u32)
+
+functy.3 = (u32, u32) -> (u32)
+
+functy.4 = (usize) -> (usize)
+
+functy.5 = (u8) -> (u8)
+
+functy.6 = (bool) -> (bool)
+
+fn @bounds(functy.0) {
+    ; #body-gate: ungated
+bb0(%0: usize, %1: usize):
+    %2 = icmp ult usize %0, %1
+    assert %2, bounds_check %0, %1
+    ret %0
+}
+
+fn @misaligned(functy.1) {
+    ; #body-gate: ungated
+bb0(%0: usize, %1: usize):
+    %2 = icmp ult usize %0, %1
+    assert %2, misaligned_ptr %1, %0
+    ret %0
+}
+
+fn @divide(functy.2) {
+    ; #body-gate: ungated
+bb0(%0: u32, %1: u32):
+    %2 = const u32 0
+    %3 = icmp ne u32 %1, %2
+    assert %3, div_by_zero
+    %4 = udiv u32 %0, %1
+    ret %4
+}
+
+fn @remainder(functy.3) {
+    ; #body-gate: ungated
+bb0(%0: u32, %1: u32):
+    %2 = const u32 0
+    %3 = icmp ne u32 %1, %2
+    assert %3, rem_by_zero
+    %4 = urem u32 %0, %1
+    ret %4
+}
+
+fn @null(functy.4) {
+    ; #body-gate: ungated
+bb0(%0: usize):
+    %1 = const usize 0
+    %2 = icmp ne usize %0, %1
+    assert %2, null_ptr
+    ret %0
+}
+
+fn @overflow(functy.5) {
+    ; #body-gate: ungated
+bb0(%0: u8):
+    %1 = const u8 0
+    %2 = icmp ne u8 %0, %1
+    assert %2, overflow add
+    %3 = const u8 1
+    %4 = icmp ne u8 %0, %3
+    assert %4, overflow sub
+    %5 = const u8 2
+    %6 = icmp ne u8 %0, %5
+    assert %6, overflow mul
+    %7 = const u8 3
+    %8 = icmp ne u8 %0, %7
+    assert %8, overflow div
+    %9 = const u8 4
+    %10 = icmp ne u8 %0, %9
+    assert %10, overflow rem
+    %11 = const u8 5
+    %12 = icmp ne u8 %0, %11
+    assert %12, overflow shl
+    %13 = const u8 6
+    %14 = icmp ne u8 %0, %13
+    assert %14, overflow shr
+    %15 = const u8 7
+    %16 = icmp ne u8 %0, %15
+    assert %16, overflow neg
+    ret %0
+}
+
+fn @legacy(functy.6) {
+    ; #body-gate: ungated
+bb0(%0: bool):
+    assert %0
+    ret %0
+}

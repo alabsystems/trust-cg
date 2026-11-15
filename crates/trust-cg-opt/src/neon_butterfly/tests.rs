@@ -34,7 +34,7 @@ fn count_bcond(func: &MachFunction, cc: i64) -> usize {
         .flat_map(|blk| blk.insts.iter().copied())
         .filter(|&id| {
             let inst = func.inst(id);
-            inst.opcode == AArch64Opcode::BCond && imm_of(&inst.operands[0]) == Some(cc)
+            inst.opcode == AArch64Opcode::BCond && inst.operands[0].as_imm() == Some(cc)
         })
         .count()
 }
@@ -251,6 +251,165 @@ fn run(func: &mut MachFunction) -> usize {
     pass.fired()
 }
 
+fn candidate_boundary_fixture() -> MachFunction {
+    build_butterfly(0)
+}
+
+fn candidate_boundary_plan(func: &MachFunction) -> RecognizedButterfly {
+    let dom = DomTree::compute(func);
+    let loops = LoopAnalysis::compute(func, &dom);
+    loops
+        .all_loops()
+        .find_map(|lp| RecognizedButterfly::recognize(func, &dom, lp.header, lp.latch, &lp.body))
+        .expect("unmodified control must be recognized")
+}
+
+fn candidate_boundary_refusal(func: &mut MachFunction, rec: &RecognizedButterfly) {
+    let before = format!("{func:?}");
+    assert!(!apply_butterfly(func, rec));
+    assert_eq!(
+        format!("{func:?}"),
+        before,
+        "refusal must preserve the whole function"
+    );
+}
+
+#[test]
+fn candidate_boundary_early_exhaustion() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.next_vreg = u32::MAX;
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_late_exhaustion() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.next_vreg = u32::MAX - 4;
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_metadata_exhaustion() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.noalias_params.push(u32::MAX);
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_splice_refusal() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.inst_mut(rec.preheader_term).operands.clear();
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_missing_setup() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    for block in &mut func.blocks {
+        block.insts.retain(|id| *id != rec.preheader_term);
+    }
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_missing_layout() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.block_order.retain(|id| *id != rec.header);
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_success_snapshot() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    assert!(apply_butterfly(&mut func, &rec));
+    println!("CANDIDATE_SNAPSHOT: {func:?}");
+}
+
+#[test]
+fn candidate_boundary_public_entry_points_preserve_refusal() {
+    let mut control = candidate_boundary_fixture();
+    assert!(NeonButterflyPass::new().run(&mut control));
+    let mut func = candidate_boundary_fixture();
+    func.next_vreg = u32::MAX;
+    let before = format!("{func:?}");
+    let mut pass = NeonButterflyPass::new();
+    let mut analyses = AnalysisCache::new();
+    assert!(!pass.run(&mut func));
+    assert!(!pass.run_with_analyses(&mut func, &mut analyses));
+    assert_eq!(pass.fired(), 0);
+    assert_eq!(format!("{func:?}"), before);
+}
+
+#[test]
+fn candidate_boundary_sparse_ids_include_detached_and_noalias() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    let old_ids: HashSet<_> = func
+        .insts
+        .iter()
+        .flat_map(|inst| &inst.operands)
+        .filter_map(|op| op.as_vreg().map(|reg| reg.id))
+        .collect();
+    func.push_inst(MachInst::new(
+        AArch64Opcode::MovR,
+        vec![MachOperand::VReg(VReg::new(1_000_000_000, RegClass::Gpr64))],
+    ));
+    func.noalias_params.push(1_000_000_007);
+    func.next_vreg = 0;
+    let old_len = func.insts.len();
+    assert!(apply_butterfly(&mut func, &rec));
+    let fresh: Vec<_> = func.insts[old_len..]
+        .iter()
+        .flat_map(|inst| &inst.operands)
+        .filter_map(|op| op.as_vreg().map(|reg| reg.id))
+        .filter(|id| !old_ids.contains(id))
+        .collect();
+    assert!(!fresh.is_empty());
+    assert!(fresh.iter().all(|id| *id > 1_000_000_007));
+    assert!(func.next_vreg > 1_000_000_007);
+}
+
+#[test]
+fn candidate_boundary_last_representable_range_preserves_construction() {
+    let original = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&original);
+    let mut ordinary = original.clone();
+    ordinary.try_sync_vreg_counter().unwrap();
+    let first = ordinary.next_vreg;
+    assert!(apply_butterfly(&mut ordinary, &rec));
+    let count = ordinary.next_vreg - first;
+    assert!(count > 1);
+    let mut boundary = original.clone();
+    let boundary_first = u32::MAX - count;
+    boundary.next_vreg = boundary_first;
+    assert!(apply_butterfly(&mut boundary, &rec));
+    assert_eq!(boundary.next_vreg, u32::MAX);
+    for inst in &mut boundary.insts[original.insts.len()..] {
+        for operand in &mut inst.operands {
+            if let MachOperand::VReg(reg) = operand
+                && reg.id >= boundary_first
+            {
+                reg.id = first + (reg.id - boundary_first);
+            }
+        }
+    }
+    boundary.next_vreg = ordinary.next_vreg;
+    assert_eq!(format!("{boundary:?}"), format!("{ordinary:?}"));
+}
+
 #[test]
 fn fires_on_oscar_fft_shape() {
     let mut func = build_butterfly(0);
@@ -280,7 +439,7 @@ fn fires_on_oscar_fft_shape() {
         for &id in &blk.insts {
             let inst = func.inst(id);
             if inst.opcode == AArch64Opcode::NeonRev64V {
-                assert_eq!(imm_of(inst.operands.last().unwrap()), Some(ARR_S4));
+                assert_eq!(inst.operands.last().unwrap().as_imm(), Some(ARR_S4));
             }
             if inst.opcode == AArch64Opcode::NeonEorV {
                 assert_eq!(inst.operands.len(), 3);
@@ -361,4 +520,37 @@ fn second_run_is_a_no_op() {
         assert_eq!(func.insts.len(), insts, "run {again} added instructions");
         assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the vector loop reproduces `iv`
+// and `ivs` only. `bails_on_loop_temp_live_out` above is the contract's
+// live-out row; these add a carried register, a live-out-only register and
+// the flags (the vector exit leaves different NZCV than the scalar compare).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    let iv = VReg::new(38, RegClass::Gpr64);
+    assert_eq!(run(&mut build_butterfly(0)), 1, "plain fixture fires");
+    let mut wrong = Vec::new();
+    let mut carried = build_butterfly(0);
+    crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+    if run(&mut carried) != 0 {
+        wrong.push("fired with a second accumulator");
+    }
+    let mut live_out = build_butterfly(0);
+    crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+    if run(&mut live_out) != 0 {
+        wrong.push("fired with a live-out-only register");
+    }
+    let mut flags = build_butterfly(0);
+    // `build_butterfly` creates entry, header, latch, exit in that order.
+    let exit = BlockId(3);
+    let cset = flags.push_inst(MachInst::new(AArch64Opcode::CSet, vec![v64(97), i(0)]));
+    flags.block_mut(exit).insts.insert(0, cset);
+    if run(&mut flags) != 0 {
+        wrong.push("fired with the flags read at the exit");
+    }
+    assert!(wrong.is_empty(), "skipped register state: {wrong:?}");
 }

@@ -165,11 +165,14 @@ const UNORDERED_PAIRS: usize = 128;
 /// 1 iff the predicate is true, 0 iff false. This is the regression anchor for the R31
 /// bare bug (R31 materialized via `Select(cond,1,0)`; the zext form is strictly purer).
 fn build_bare_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCmpOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -194,18 +197,23 @@ fn build_bare_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCmpO
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// SELECT consumer: `fn(a,b) -> i64 { select(a op b, THEN, ELSE) }` as
 /// `FCmp -> Select(cond, THEN, ELSE) -> Return`, with DISTINCT payloads so the returned
 /// value names the branch. Exercises `select_csel` reading the Fcmp boolean.
 fn build_select_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCmpOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -240,7 +248,9 @@ fn build_select_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCm
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// BRANCH consumer: `fn(a,b) -> i64 { if a op b { THEN } else { ELSE } }` as a diamond —
@@ -248,11 +258,14 @@ fn build_select_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCm
 /// passed as the join block's arg, DIFFERING per edge, so the returned value names which
 /// edge control flow took. Exercises `select_brif` reading the Fcmp boolean.
 fn build_branch_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCmpOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![
         TrustIrBlock {
@@ -293,7 +306,9 @@ fn build_branch_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCm
             })],
         },
     ];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// Build a module with one function per FCmpOp for the given consumer builder.
@@ -311,6 +326,7 @@ type ConsumerFn = unsafe extern "C" fn(f64, f64) -> i64;
 fn jit_buffer(module: &TrustIrModule) -> trust_cg_codegen::jit::ExecutableBuffer {
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .expect("hand-built FP module must JIT-compile (backend supports FP)")
         .buffer
@@ -657,4 +673,13 @@ fn blast_radius_select_branch_armed_controls() {
             "armed control ({tag}): OGt-vs-OLt-oracle diverged on {diverged} rows; pristine==oracle"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

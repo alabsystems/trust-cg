@@ -1,0 +1,18 @@
+{
+  "clean_source": "789c68a6ed9779d2d348f86ac7ec14429d75b7c2",
+  "closed_cone_seconds": 4.867692875,
+  "environment_dag_format": "CLENEDG2",
+  "environment_schema": "clean-env-bincode-v2",
+  "raw_bytes": 7484183,
+  "raw_sha256": "200556874474d6374fa31b50b5aa4ed6ba886b6a2f2f88f25ac6271739681f9c",
+  "roots": [
+    "Trust.Cert.CheckedMulI128Raw.original_unsigned",
+    "Trust.Cert.CheckedMulI128Raw.original_signed",
+    "Trust.Cert.CheckedMulI128Raw.original_constant"
+  ],
+  "schema": 3,
+  "scope": "untrusted retained mathematical context; must freshly recheck before use",
+  "source_lean_level_profile": "Lean430",
+  "zstd_bytes": 1412942,
+  "zstd_sha256": "78cbf3e91e59d9451e350f9a949274f5cb2d5f1a03253185c97582bd687f50a0"
+}

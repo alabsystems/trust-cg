@@ -27,8 +27,10 @@
 //! Reference: `~/llvm-project-ref/llvm/lib/CodeGen/PHIElimination.cpp`
 //! Also: Sreedhar et al., "Translating Out of Static Single Assignment Form"
 
+use crate::AllocError;
 use crate::machine_types::{
     BlockId, InstFlags, InstId, MachBlock, MachFunction, MachInst, MachOperand, VReg,
+    VRegAllocationPlan,
 };
 use std::collections::BTreeMap;
 
@@ -202,8 +204,9 @@ fn edge_needs_phi_copy(func: &MachFunction, src_id: BlockId, dst_id: BlockId) ->
 ///    output at the end of that predecessor block.
 /// 2. Remove the phi instruction.
 ///
-/// This must be called AFTER critical edge splitting.
-pub fn eliminate_phis(func: &mut MachFunction) {
+/// This must be called AFTER critical edge splitting. Register-ID exhaustion
+/// returns an error before any counter, instruction, or block is changed.
+pub fn eliminate_phis(func: &mut MachFunction) -> Result<(), AllocError> {
     // Collect all phi instructions and their copy requirements.
     let mut copies_by_pred: BTreeMap<BlockId, Vec<(VReg, VReg)>> = BTreeMap::new();
     let mut phi_insts_to_remove: Vec<(BlockId, InstId)> = Vec::new();
@@ -242,37 +245,27 @@ pub fn eliminate_phis(func: &mut MachFunction) {
         }
     }
 
-    // Insert one resolved parallel-copy sequence per predecessor edge. Block
-    // arguments are simultaneous assignments; emitting them one-by-one can
-    // clobber a later source on multi-parameter edges.
-    for pred_id in func.block_order.clone() {
+    // Resolve ALL predecessor sequences before committing any of them. A later
+    // cycle can exhaust IDs after an earlier edge was already resolved. Preserve
+    // layout order, followed by the same sorted non-layout fallback as before.
+    let pred_order: Vec<_> = func
+        .block_order
+        .iter()
+        .chain(copies_by_pred.keys())
+        .copied()
+        .collect();
+    let mut ids = func.vreg_allocation_plan();
+    let mut plans = Vec::new();
+    for pred_id in pred_order {
         let Some(copies) = copies_by_pred.remove(&pred_id) else {
             continue;
         };
-
-        let resolved = resolve_parallel_copies(&copies, func);
-        // Insert before the terminator of the predecessor block.
-        let pred_block = &mut func.blocks[pred_id.0 as usize];
-        let insert_pos = find_terminator_pos(pred_block, &func.insts);
-        for (offset, (dest, src)) in resolved.into_iter().enumerate() {
-            let copy_inst = MachInst {
-                opcode: PSEUDO_COPY,
-                defs: vec![MachOperand::VReg(dest)],
-                uses: vec![MachOperand::VReg(src)],
-                implicit_defs: Vec::new(),
-                implicit_uses: Vec::new(),
-                flags: InstFlags::default(),
-                tied_operands: vec![],
-            };
-
-            let copy_id = InstId(func.insts.len() as u32);
-            func.insts.push(copy_inst);
-            pred_block.insts.insert(insert_pos + offset, copy_id);
-        }
+        let resolved = resolve_copy_plan(&copies, &mut ids)?;
+        plans.push((pred_id, resolved));
     }
 
-    for (pred_id, copies) in copies_by_pred {
-        let resolved = resolve_parallel_copies(&copies, func);
+    func.next_vreg = ids.next_vreg();
+    for (pred_id, resolved) in plans {
         let pred_block = &mut func.blocks[pred_id.0 as usize];
         let insert_pos = find_terminator_pos(pred_block, &func.insts);
         for (offset, (dest, src)) in resolved.into_iter().enumerate() {
@@ -297,6 +290,7 @@ pub fn eliminate_phis(func: &mut MachFunction) {
         let block = &mut func.blocks[block_id.0 as usize];
         block.insts.retain(|&id| id != phi_id);
     }
+    Ok(())
 }
 
 /// Find the position of the first terminator in a block.
@@ -319,12 +313,26 @@ fn find_terminator_pos(block: &MachBlock, all_insts: &[MachInst]) -> usize {
 ///
 /// Algorithm: topological sort with cycle detection.
 /// Reference: Hack et al., "Register Allocation for Programs in SSA Form"
+///
+/// Fresh temporaries avoid IDs in both the function arena and the supplied
+/// copy list. On exhaustion, neither the function nor its counter is changed.
 pub fn resolve_parallel_copies(
     copies: &[(VReg, VReg)],
     func: &mut MachFunction,
-) -> Vec<(VReg, VReg)> {
-    if copies.is_empty() {
-        return Vec::new();
+) -> Result<Vec<(VReg, VReg)>, AllocError> {
+    let mut ids = func.vreg_allocation_plan();
+    let result = resolve_copy_plan(copies, &mut ids)?;
+    func.next_vreg = ids.next_vreg();
+    Ok(result)
+}
+
+fn resolve_copy_plan(
+    copies: &[(VReg, VReg)],
+    ids: &mut VRegAllocationPlan,
+) -> Result<Vec<(VReg, VReg)>, AllocError> {
+    for &(dest, src) in copies {
+        ids.observe(dest);
+        ids.observe(src);
     }
 
     // Build dependency graph: dst -> src.
@@ -365,7 +373,9 @@ pub fn resolve_parallel_copies(
         // temporary, then resume the acyclic emission pass above.
         let (dst, src) = remaining.remove(0);
         let class = dst.class;
-        let tmp = func.alloc_vreg(class);
+        let tmp = ids
+            .allocate(class)
+            .ok_or(AllocError::VirtualRegisterExhausted)?;
 
         // tmp <- dst (save the value being overwritten)
         result.push((tmp, dst));
@@ -380,13 +390,199 @@ pub fn resolve_parallel_copies(
         }
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::machine_types::RegClass;
+
+    fn id_boundary_phi_function(next_vreg: u32) -> MachFunction {
+        let phis: Vec<_> = (0..4)
+            .map(|id| MachInst {
+                opcode: 0,
+                defs: vec![MachOperand::VReg(VReg::new(id, RegClass::Gpr64))],
+                // First predecessor is acyclic; the second has two swaps.
+                uses: vec![
+                    MachOperand::VReg(VReg::new(id + 10, RegClass::Gpr64)),
+                    MachOperand::VReg(VReg::new(id ^ 1, RegClass::Gpr64)),
+                ],
+                implicit_defs: vec![],
+                implicit_uses: vec![],
+                flags: InstFlags::IS_PHI,
+                tied_operands: vec![],
+            })
+            .collect();
+        MachFunction {
+            name: "id_boundary".into(),
+            insts: phis,
+            blocks: vec![
+                MachBlock {
+                    insts: vec![],
+                    preds: vec![],
+                    succs: vec![BlockId(2)],
+                    loop_depth: 0,
+                },
+                MachBlock {
+                    insts: vec![],
+                    preds: vec![],
+                    succs: vec![BlockId(2)],
+                    loop_depth: 0,
+                },
+                MachBlock {
+                    insts: (0..4).map(InstId).collect(),
+                    preds: vec![BlockId(0), BlockId(1)],
+                    succs: vec![],
+                    loop_depth: 0,
+                },
+            ],
+            block_order: vec![BlockId(0), BlockId(1), BlockId(2)],
+            entry_block: BlockId(0),
+            next_vreg,
+            next_stack_slot: 0,
+            stack_slots: Default::default(),
+        }
+    }
+
+    #[test]
+    fn id_boundary_copy_cycles_do_not_partially_consume_registers() {
+        let mut func = id_boundary_phi_function(u32::MAX - 1);
+        let copies: Vec<_> = (0..4)
+            .map(|id| {
+                (
+                    VReg::new(id, RegClass::Gpr64),
+                    VReg::new(id ^ 1, RegClass::Gpr64),
+                )
+            })
+            .collect();
+        let before = format!("{func:?}");
+        assert!(matches!(
+            resolve_parallel_copies(&copies, &mut func),
+            Err(AllocError::VirtualRegisterExhausted),
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn id_boundary_phi_failure_preserves_all_predecessors() {
+        let mut func = id_boundary_phi_function(u32::MAX);
+        let before = format!("{func:?}");
+        assert!(matches!(
+            eliminate_phis(&mut func),
+            Err(AllocError::VirtualRegisterExhausted)
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    fn assert_id_boundary_copy_semantics(copies: &[(VReg, VReg)], resolved: &[(VReg, VReg)]) {
+        let before: BTreeMap<_, _> = copies
+            .iter()
+            .flat_map(|&(d, s)| [d, s])
+            .map(|reg| (reg, u64::from(reg.id) + 1000))
+            .collect();
+        let mut after = before.clone();
+        for &(dest, src) in resolved {
+            let value = *after
+                .get(&src)
+                .expect("every emitted source must already be defined");
+            after.insert(dest, value);
+        }
+        for &(dest, src) in copies {
+            assert_eq!(
+                after[&dest], before[&src],
+                "parallel source values must be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn id_boundary_acyclic_copies_need_no_register_capacity() {
+        let mut func = id_boundary_phi_function(u32::MAX);
+        let before = format!("{func:?}");
+        let copies = [(
+            VReg::new(0, RegClass::Gpr64),
+            VReg::new(u32::MAX, RegClass::Gpr64),
+        )];
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
+        assert_id_boundary_copy_semantics(&copies, &result);
+        assert!(resolve_parallel_copies(&[], &mut func).unwrap().is_empty());
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn id_boundary_copy_plan_reserves_non_arena_identities() {
+        let mut func = id_boundary_phi_function(0);
+        let a = VReg::new(100, RegClass::Gpr64);
+        let b = VReg::new(200, RegClass::Gpr64);
+        let copies = [(a, b), (b, a)];
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
+        assert_eq!(func.next_vreg, 202);
+        assert_id_boundary_copy_semantics(&copies, &result);
+    }
+
+    #[test]
+    fn id_boundary_final_two_temporaries_preserve_both_cycles() {
+        let mut func = id_boundary_phi_function(u32::MAX - 2);
+        let copies: Vec<_> = (0..4)
+            .map(|id| {
+                (
+                    VReg::new(id, RegClass::Gpr64),
+                    VReg::new(id ^ 1, RegClass::Gpr64),
+                )
+            })
+            .collect();
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
+        assert_eq!(func.next_vreg, u32::MAX);
+        assert_id_boundary_copy_semantics(&copies, &result);
+    }
+
+    #[test]
+    fn id_boundary_phi_plan_commits_complete_sequences_at_capacity() {
+        let mut func = id_boundary_phi_function(u32::MAX - 2);
+        eliminate_phis(&mut func).unwrap();
+        assert_eq!(func.next_vreg, u32::MAX);
+        assert!(func.blocks[2].insts.is_empty());
+        for pred in [0, 1] {
+            let copies: Vec<_> = (0..4)
+                .map(|id| {
+                    (
+                        VReg::new(id, RegClass::Gpr64),
+                        VReg::new(if pred == 0 { id + 10 } else { id ^ 1 }, RegClass::Gpr64),
+                    )
+                })
+                .collect();
+            let emitted: Vec<_> = func.blocks[pred]
+                .insts
+                .iter()
+                .map(|id| {
+                    let inst = &func.insts[id.0 as usize];
+                    assert_eq!(inst.opcode, PSEUDO_COPY);
+                    (
+                        inst.defs[0].as_vreg().unwrap(),
+                        inst.uses[0].as_vreg().unwrap(),
+                    )
+                })
+                .collect();
+            assert_id_boundary_copy_semantics(&copies, &emitted);
+        }
+    }
+
+    #[test]
+    fn id_boundary_public_allocation_propagates_phi_failure_and_restores_edges() {
+        let mut func = id_boundary_phi_function(u32::MAX);
+        // Force phase 1 to split a real edge before phase 2 needs a cycle temp.
+        func.blocks[0].succs.push(BlockId(1));
+        func.blocks[1].preds.push(BlockId(0));
+        let before = format!("{func:?}");
+        let mut config = crate::AllocConfig::default_aarch64();
+        config.enable_coalescing = false;
+        assert!(matches!(
+            crate::allocate(&mut func, &config),
+            Err(AllocError::VirtualRegisterExhausted)
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
 
     #[test]
     fn pseudo_jump_opcode_does_not_alias_ir_copy() {
@@ -425,7 +621,7 @@ mod tests {
 
         // v2 <- v0, v1 <- v2 — no cycle if ordered correctly.
         let copies = vec![(v1, v2), (v2, v0)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         // v1 <- v2 must come before v2 <- v0 (v2 is overwritten).
         let v1_pos = result.iter().position(|&(d, _)| d == v1).unwrap();
@@ -457,7 +653,7 @@ mod tests {
 
         // v0 <- v1, v1 <- v0 — classic swap cycle.
         let copies = vec![(v0, v1), (v1, v0)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         // Should use a temporary to break the cycle.
         assert!(
@@ -480,7 +676,7 @@ mod tests {
             stack_slots: Default::default(),
         };
 
-        let result = resolve_parallel_copies(&[], &mut func);
+        let result = resolve_parallel_copies(&[], &mut func).unwrap();
         assert!(result.is_empty());
     }
 
@@ -506,7 +702,7 @@ mod tests {
             class: RegClass::Gpr64,
         };
         let copies = vec![(v0, v1)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (v0, v1));
     }
@@ -544,7 +740,7 @@ mod tests {
         };
 
         let copies = vec![(v0, v1), (v1, v2), (v2, v3)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         // No cycle, so no temporary needed.
         assert_eq!(result.len(), 3, "chain should not need temporaries");
@@ -585,7 +781,7 @@ mod tests {
         };
 
         let copies = vec![(v0, v1), (v1, v2), (v2, v0)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         // 3-way cycle requires at least one temporary, so result should be > 3.
         assert!(
@@ -1105,7 +1301,7 @@ mod tests {
         let phi_count_before = func.insts.iter().filter(|i| i.flags.is_phi()).count();
         assert_eq!(phi_count_before, 1, "should start with 1 phi");
 
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // After elimination, no phi instructions should remain in any block.
         for &block_id in &func.block_order {
@@ -1126,7 +1322,7 @@ mod tests {
         let mut func = make_diamond_with_phi();
         let insts_before = func.insts.len();
 
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // Copies should have been inserted. The phi had 2 inputs from 2 preds
         // (v0 from block 1, v1 from block 2). Since v0 != v2 and v1 != v2,
@@ -1172,7 +1368,7 @@ mod tests {
         };
 
         let copies = vec![(v0, v1), (v1, v0)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         // Simulate the copy sequence with a register file.
         let mut regs: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
@@ -1239,7 +1435,7 @@ mod tests {
         };
 
         let copies = vec![(v0, v1), (v1, v2), (v2, v3), (v3, v0)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         // Must use at least one temporary.
         assert!(
@@ -1288,7 +1484,7 @@ mod tests {
 
         // Mix self-copies with real copies.
         let copies = vec![(v0, v1)]; // just one real copy
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (v0, v1));
     }
@@ -1315,7 +1511,7 @@ mod tests {
         };
 
         let copies = vec![(v0, v2), (v1, v3)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
         assert_eq!(result.len(), 2, "independent copies need no temps");
     }
 
@@ -1338,7 +1534,7 @@ mod tests {
         };
 
         let copies = vec![(v0, v1), (v1, v2)];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         let mut regs: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
         regs.insert(0, 10);
@@ -1417,14 +1613,14 @@ mod tests {
         };
 
         let insts_before = func.insts.len();
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
         assert_eq!(func.insts.len(), insts_before, "no phis means no changes");
     }
 
     #[test]
     fn test_eliminate_phis_copies_go_to_correct_predecessor() {
         let mut func = make_diamond_with_phi();
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // Block 1 (then) should now have a copy instruction (v2 <- v0).
         let block1_has_copy = func.blocks[1]
@@ -1444,7 +1640,7 @@ mod tests {
     #[test]
     fn test_eliminate_phis_copy_before_terminator() {
         let mut func = make_diamond_with_phi();
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // In each predecessor block, the copy should be inserted before
         // the terminator (branch) instruction, not after it.
@@ -1495,7 +1691,7 @@ mod tests {
             })
             .collect();
         let copies: Vec<(VReg, VReg)> = (0..5).map(|i| (vregs[i], vregs[(i + 1) % 5])).collect();
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         let initial: Vec<i64> = vec![100, 200, 300, 400, 500];
         let mut regs: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
@@ -1780,7 +1976,7 @@ mod tests {
             stack_slots: Default::default(),
         };
 
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // Both phis should be eliminated.
         for &block_id in &func.block_order {
@@ -1881,7 +2077,7 @@ mod tests {
             stack_slots: Default::default(),
         };
 
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         let block0 = &func.blocks[0];
         let copy_ids: Vec<_> = block0
@@ -1984,7 +2180,7 @@ mod tests {
             stack_slots: Default::default(),
         };
 
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // Block 0 should NOT have a copy (v0 = v0 is a self-copy, skipped).
         let block0_copy_count = func.blocks[0]
@@ -2158,7 +2354,7 @@ mod tests {
         assert_eq!(edges_split, 2, "both edges to block 2 should be critical");
 
         // Step 2: Eliminate phis.
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // Verify: no phi instructions remain.
         for &block_id in &func.block_order {
@@ -2215,7 +2411,7 @@ mod tests {
             (v2_fpr, v3_fpr),
             (v3_fpr, v2_fpr),
         ];
-        let result = resolve_parallel_copies(&copies, &mut func);
+        let result = resolve_parallel_copies(&copies, &mut func).unwrap();
 
         // Both cycles need temps. Simulate to verify correctness.
         let mut regs: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
@@ -2262,7 +2458,7 @@ mod tests {
         //   Block 1 must contain: v2 <- v0 (NOT v2 <- v1)
         //   Block 2 must contain: v2 <- v1 (NOT v2 <- v0)
         let mut func = make_diamond_with_phi();
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         let v0 = VReg {
             id: 0,
@@ -2514,7 +2710,7 @@ mod tests {
             stack_slots: Default::default(),
         };
 
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // No phi instructions should remain.
         for &block_id in &func.block_order {
@@ -2870,7 +3066,7 @@ mod tests {
         }
 
         // Step 3: Eliminate phis (should work correctly with the fix).
-        eliminate_phis(&mut func);
+        eliminate_phis(&mut func).unwrap();
 
         // No phi instructions should remain.
         for &block_id in &func.block_order {

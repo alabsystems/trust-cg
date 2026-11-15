@@ -1,0 +1,907 @@
+{
+  "name": "bounds_unwind",
+  "functions": [
+    {
+      "id": 0,
+      "name": "bounds_unwind",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              1,
+              {
+                "RefMut": {
+                  "Tuple": [
+                    "U64",
+                    "U64",
+                    "U64",
+                    "U64",
+                    "U64",
+                    "U64",
+                    "U64",
+                    "U64"
+                  ]
+                }
+              }
+            ],
+            [
+              2,
+              "U64"
+            ],
+            [
+              3,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U64",
+                  "value": {
+                    "Int": 7
+                  }
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "And",
+                  "ty": "U64",
+                  "lhs": 2,
+                  "rhs": 7
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U64",
+                  "value": {
+                    "Int": 8
+                  }
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ult",
+                  "ty": "U64",
+                  "lhs": 6,
+                  "rhs": 9
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 8,
+                  "then_target": 1,
+                  "then_args": [],
+                  "else_target": 3,
+                  "else_args": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885954311749632
+                  }
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 19
+                  }
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "Ptr",
+                  "value": {
+                    "Int": 18076885958606716928
+                  }
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 1,
+                  "args": [
+                    10,
+                    11,
+                    12
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": "Unreachable",
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "RefMut": {
+                      "Tuple": [
+                        "U64",
+                        "U64",
+                        "U64",
+                        "U64",
+                        "U64",
+                        "U64",
+                        "U64",
+                        "U64"
+                      ]
+                    }
+                  },
+                  "dst_ty": "Ptr",
+                  "operand": 1
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToInt",
+                  "src_ty": "Ptr",
+                  "dst_ty": "I64",
+                  "operand": 13
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "Bitcast",
+                  "src_ty": "U64",
+                  "dst_ty": "I64",
+                  "operand": 6
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 8
+                  }
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": "I64",
+                  "lhs": 15,
+                  "rhs": 16
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 14,
+                  "rhs": 17
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "IntToPtr",
+                  "src_ty": "I64",
+                  "dst_ty": "Ptr",
+                  "operand": 18
+                }
+              },
+              "results": [
+                19
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "U64",
+                  "operand": 3
+                }
+              },
+              "results": [
+                20
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 19,
+                  "value": 20,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    },
+    {
+      "id": 1,
+      "name": "_RNvNtCs6aehNw1KgA1_4core9panicking5panic",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "bounds_unwind.const.alloc1",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 105
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 120
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 102
+          },
+          {
+            "Int": 32
+          },
+          {
+            "Int": 98
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 115
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "bounds_unwind.const.alloc3",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "SymbolAddr": {
+              "symbol": "bounds_unwind.const.alloc2",
+              "addend": 0
+            }
+          },
+          {
+            "Int": 91
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 4
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 1
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          },
+          {
+            "Int": 0
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "bounds_unwind.const.alloc2",
+      "ty": "Ptr",
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 47
+          },
+          {
+            "Int": 104
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 109
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 47
+          },
+          {
+            "Int": 97
+          },
+          {
+            "Int": 121
+          },
+          {
+            "Int": 97
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 47
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 114
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 45
+          },
+          {
+            "Int": 99
+          },
+          {
+            "Int": 103
+          },
+          {
+            "Int": 45
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 45
+          },
+          {
+            "Int": 50
+          },
+          {
+            "Int": 48
+          },
+          {
+            "Int": 50
+          },
+          {
+            "Int": 54
+          },
+          {
+            "Int": 48
+          },
+          {
+            "Int": 57
+          },
+          {
+            "Int": 49
+          },
+          {
+            "Int": 52
+          },
+          {
+            "Int": 47
+          },
+          {
+            "Int": 99
+          },
+          {
+            "Int": 103
+          },
+          {
+            "Int": 45
+          },
+          {
+            "Int": 99
+          },
+          {
+            "Int": 97
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 105
+          },
+          {
+            "Int": 99
+          },
+          {
+            "Int": 97
+          },
+          {
+            "Int": 108
+          },
+          {
+            "Int": 45
+          },
+          {
+            "Int": 98
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 45
+          },
+          {
+            "Int": 99
+          },
+          {
+            "Int": 97
+          },
+          {
+            "Int": 112
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 114
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 45
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 104
+          },
+          {
+            "Int": 105
+          },
+          {
+            "Int": 114
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 47
+          },
+          {
+            "Int": 98
+          },
+          {
+            "Int": 111
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 95
+          },
+          {
+            "Int": 117
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 119
+          },
+          {
+            "Int": 105
+          },
+          {
+            "Int": 110
+          },
+          {
+            "Int": 100
+          },
+          {
+            "Int": 46
+          },
+          {
+            "Int": 114
+          },
+          {
+            "Int": 115
+          },
+          {
+            "Int": 0
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        {
+          "RefMut": {
+            "Tuple": [
+              "U64",
+              "U64",
+              "U64",
+              "U64",
+              "U64",
+              "U64",
+              "U64",
+              "U64"
+            ]
+          }
+        },
+        "U64",
+        "U64"
+      ],
+      "returns": [],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "Ptr",
+        "I64",
+        "Ptr"
+      ],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "I8",
+    "I16",
+    "I32",
+    "I64",
+    "I128"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-unknown-linux-gnu",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "Unclassified"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": []
+}

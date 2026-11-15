@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Differential regression test for the STRUCT-REORDER-THROUGH-REFERENCE miscompile:
 // a struct rustc REORDERS (a small field declared before a wider one, so descending-
@@ -51,65 +55,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m114 test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -130,7 +83,7 @@ fn write_panic_stubs(dir: &Path, objs: &[PathBuf]) -> PathBuf {
     let mut stubs = String::from("#include <stdlib.h>\n");
     for line in String::from_utf8_lossy(&nm.stdout).lines() {
         let sym = line.trim().trim_start_matches('U').trim();
-        if sym.contains("panic") && seen.insert(sym.to_owned()) {
+        if toolchain_support::is_abort_stub_symbol(sym) && seen.insert(sym.to_owned()) {
             let c = sym.strip_prefix('_').unwrap_or(sym);
             stubs.push_str(&format!(
                 "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -165,15 +118,13 @@ fn compile_link_run(stem: &str, body: &str, opt: &str, dylib: Option<&Path>) -> 
     );
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
         cmd.arg(&backend_arg);
-        cmd.env("TCG_NO_PROOF_CERTS", "1");
+        cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
     }
     cmd.args(["--target", TARGET, "-Cpanic=abort", "-Coverflow-checks=off"])
         .arg(format!("-Copt-level={opt}"))
@@ -181,7 +132,7 @@ fn compile_link_run(stem: &str, body: &str, opt: &str, dylib: Option<&Path>) -> 
         .arg("--out-dir")
         .arg(&dir)
         .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&dir);
         if dylib.is_some() {
@@ -287,7 +238,10 @@ fn matches_both_opts(stem: &str, body: &str, expected: i32) {
             Outcome::Exit(code) => code,
             Outcome::FailedClosed => unreachable!(),
         };
-        assert_eq!(llvm, expected, "{stem} (opt={opt}): LLVM oracle {llvm} != expected {expected}");
+        assert_eq!(
+            llvm, expected,
+            "{stem} (opt={opt}): LLVM oracle {llvm} != expected {expected}"
+        );
         match compile_link_run(stem, body, opt, Some(&dylib)) {
             Outcome::Exit(trust) => assert_eq!(
                 trust, llvm,

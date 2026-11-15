@@ -1,0 +1,194 @@
+[
+  {
+    "case": "aliased_f32_read-O0",
+    "capture_sha256": "e6fb9b4f578997cf340cea8820bbe71c289fc433e85666ca18999335b98d5b4f",
+    "machine_prefix_bytes": 14358,
+    "machine_prefix_sha256": "4d962af4b41154d86d37b4532170189c041187eaf4ac70e0a9fd264dd4693f83",
+    "before_o0_identity_copy_cleanup": {
+      "machine_prefix_bytes": 15101,
+      "machine_prefix_sha256": "c9d01c9d8b304811a835e301b8046d68c286dbafadd8a571e8c121c1c0e6abe0"
+    },
+    "derivation": "capture_sha256 after the O0 physical-self-copy-only cleanup introduced in 5f67010c1; disabling only post_ra reproduces before_o0_identity_copy_cleanup exactly"
+  },
+  {
+    "case": "aliased_f32_read-O1",
+    "capture_sha256": "2277e2df6c708ca4a45b44c2f726f74271b24a03a2f5de387f1a07f8122d6397",
+    "machine_prefix_bytes": 14134,
+    "machine_prefix_sha256": "8ab6a7a845d1e53be268a1b539b1fe6d35f25cd22d84aa940f682a4fd1d0c341",
+    "derivation": "capture_sha256 after the O1 CfgSimplify entry/fallthrough merge added by 275e8973a"
+  },
+  {
+    "case": "aliased_f32_read-O2",
+    "capture_sha256": "24a507bd89d20ea6b3c354370455a39f4e801dd190ce3c08e3bea2e2ea4412b1",
+    "machine_prefix_bytes": 13901,
+    "machine_prefix_sha256": "40fccb069c4887d4dfa84da032330393a24a470cdaae00224e9951a530b3b236",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "aliased_f32_read-O3",
+    "capture_sha256": "24a507bd89d20ea6b3c354370455a39f4e801dd190ce3c08e3bea2e2ea4412b1",
+    "machine_prefix_bytes": 13901,
+    "machine_prefix_sha256": "40fccb069c4887d4dfa84da032330393a24a470cdaae00224e9951a530b3b236",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "aliased_f32_write-O0",
+    "capture_sha256": "85d53a45c93336ba165b3ce67a8767eda0f24c1d23d39d10e9b29f26ba496a42",
+    "machine_prefix_bytes": 15524,
+    "machine_prefix_sha256": "0a9eecbee83a72ff48f1376c71d09e6955fc17509c7d1663b0f767d490b665de",
+    "before_o0_identity_copy_cleanup": {
+      "machine_prefix_bytes": 16267,
+      "machine_prefix_sha256": "2c5fd06a43119d44cadec137e7caba22ce69621a19e06d3c57feb4e65eeba066"
+    },
+    "derivation": "capture_sha256 after the O0 physical-self-copy-only cleanup introduced in 5f67010c1; disabling only post_ra reproduces before_o0_identity_copy_cleanup exactly"
+  },
+  {
+    "case": "aliased_f32_write-O1",
+    "capture_sha256": "77e18c465b3dfec86a5b2ed9ed41de507688f31b2e84b661cc0cfd1b13e75aad",
+    "machine_prefix_bytes": 14927,
+    "machine_prefix_sha256": "b3fbb052e9cb80cb981d48d02cf57f60d0495021fee0c8816dfc4e7e4e0af3b1",
+    "derivation": "capture_sha256 after the O1 CfgSimplify entry/fallthrough merge added by 275e8973a"
+  },
+  {
+    "case": "aliased_f32_write-O2",
+    "capture_sha256": "7b39d17cc4bf1bb0352e37b6541f1166a3a9da3a80af93a5fa477037d6bbf4dd",
+    "machine_prefix_bytes": 14698,
+    "machine_prefix_sha256": "1e19111801df257ff4421021939f0422894301e04444108ca24389a179c5b24d",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "aliased_f32_write-O3",
+    "capture_sha256": "7b39d17cc4bf1bb0352e37b6541f1166a3a9da3a80af93a5fa477037d6bbf4dd",
+    "machine_prefix_bytes": 14698,
+    "machine_prefix_sha256": "1e19111801df257ff4421021939f0422894301e04444108ca24389a179c5b24d",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "aliased_f64_read-O0",
+    "capture_sha256": "e8af99c2f57a0b708311cd58f684c2e0f0b8a5c44ce0d6c2961393122f8d74af",
+    "machine_prefix_bytes": 14351,
+    "machine_prefix_sha256": "339a9b3826d28c0c290d31f357f7bc1d6de61b5ba7dc985a3feb8912aa1639fb",
+    "before_o0_identity_copy_cleanup": {
+      "machine_prefix_bytes": 15087,
+      "machine_prefix_sha256": "5bdbacb102a5a3714e283a33d3f97aad9201ddd418690d71efb89bdc6f5ebe6d"
+    },
+    "derivation": "capture_sha256 after the O0 physical-self-copy-only cleanup introduced in 5f67010c1; disabling only post_ra reproduces before_o0_identity_copy_cleanup exactly"
+  },
+  {
+    "case": "aliased_f64_read-O1",
+    "capture_sha256": "7e81be802d0fcf87514badba3b26ce527cfdb830198662db758dccaae37ee7aa",
+    "machine_prefix_bytes": 14127,
+    "machine_prefix_sha256": "0fa9558fed31f81ebdf4bc5d6176c2c40caac6170c0bcd3deaae0bedb865b87b",
+    "derivation": "capture_sha256 after the O1 CfgSimplify entry/fallthrough merge added by 275e8973a"
+  },
+  {
+    "case": "aliased_f64_read-O2",
+    "capture_sha256": "16324f23f6b7cc428fed0e377ee27c8f7a5a33e20ccd2aa553fdf7d7fd443246",
+    "machine_prefix_bytes": 13894,
+    "machine_prefix_sha256": "3f11b2816a40a5a6b83fb9c2a9f08e3335b8b01f120e7c7abfd89660e0b31a9a",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "aliased_f64_read-O3",
+    "capture_sha256": "16324f23f6b7cc428fed0e377ee27c8f7a5a33e20ccd2aa553fdf7d7fd443246",
+    "machine_prefix_bytes": 13894,
+    "machine_prefix_sha256": "3f11b2816a40a5a6b83fb9c2a9f08e3335b8b01f120e7c7abfd89660e0b31a9a",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "aliased_f64_write-O0",
+    "capture_sha256": "4873edf5c21da217c70523085ceed69500b06b2a621f6796f7aab7c7e589e283",
+    "machine_prefix_bytes": 15513,
+    "machine_prefix_sha256": "47cea40d84138b73599dc795f734b6c28070e7eaa855037595cc7f4a2f809d0b",
+    "before_o0_identity_copy_cleanup": {
+      "machine_prefix_bytes": 16249,
+      "machine_prefix_sha256": "80d302b12ede93dd2dd5b69fb02dbc660331bbb2e30f9079964ca328ebfe1ebb"
+    },
+    "derivation": "capture_sha256 after the O0 physical-self-copy-only cleanup introduced in 5f67010c1; disabling only post_ra reproduces before_o0_identity_copy_cleanup exactly"
+  },
+  {
+    "case": "aliased_f64_write-O1",
+    "capture_sha256": "b87f98a12498caca61dbf7f1220a411257ee94cc232b13feaaedd9b18a583aee",
+    "machine_prefix_bytes": 14919,
+    "machine_prefix_sha256": "1270eebcc354cc2bc8cd57af11778e87e66ba294af1abf6ebc290fb5fcadd4d8",
+    "derivation": "capture_sha256 after the O1 CfgSimplify entry/fallthrough merge added by 275e8973a"
+  },
+  {
+    "case": "aliased_f64_write-O2",
+    "capture_sha256": "91da131c51695f6fde73b6eaf8792b2349e581353b93895d0dfd9a0456d079b2",
+    "machine_prefix_bytes": 14690,
+    "machine_prefix_sha256": "abc516acd94be5078fadc793715e0e611a65a845754ecd3fe1b4d1349d1b8f8c",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "aliased_f64_write-O3",
+    "capture_sha256": "91da131c51695f6fde73b6eaf8792b2349e581353b93895d0dfd9a0456d079b2",
+    "machine_prefix_bytes": 14690,
+    "machine_prefix_sha256": "abc516acd94be5078fadc793715e0e611a65a845754ecd3fe1b4d1349d1b8f8c",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "local_cell_read-O0",
+    "capture_sha256": "d47992d0c04d1fd8e8c5c2a0a44707a65e6acff4cf6c46a9bc506d34005b04e6",
+    "machine_prefix_bytes": 15928,
+    "machine_prefix_sha256": "3b3f291668239623fa86a5b1701e7e8fce52ec8d87bc00539232ac8d46d1adcd",
+    "before_o0_identity_copy_cleanup": {
+      "machine_prefix_bytes": 16391,
+      "machine_prefix_sha256": "95e8f5ccb78c69c353be55928279b3ecc3c6b1c301285216114d7edf8343dcc8"
+    },
+    "derivation": "capture_sha256 after the O0 physical-self-copy-only cleanup introduced in 5f67010c1; disabling only post_ra reproduces before_o0_identity_copy_cleanup exactly"
+  },
+  {
+    "case": "local_cell_read-O1",
+    "capture_sha256": "c69590cf6611622004411aeec360c5a8585d631abf51e3efe0458a6ffac821f1",
+    "machine_prefix_bytes": 15703,
+    "machine_prefix_sha256": "366a08585fd18df522cb35a991828640bf922e7b0587844c05c304311c13306c",
+    "derivation": "capture_sha256 after the O1 CfgSimplify entry/fallthrough merge added by 275e8973a"
+  },
+  {
+    "case": "local_cell_read-O2",
+    "capture_sha256": "be046ecebcbc41c967ee87e97180b22ae8707af3d8b6e669b67a4c9c9ae06a3e",
+    "machine_prefix_bytes": 15470,
+    "machine_prefix_sha256": "3b9d1e233d8440d35fa37db91ff2912d18bb3b3d15e755901e97aab5346c73d7",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "local_cell_read-O3",
+    "capture_sha256": "be046ecebcbc41c967ee87e97180b22ae8707af3d8b6e669b67a4c9c9ae06a3e",
+    "machine_prefix_bytes": 15470,
+    "machine_prefix_sha256": "3b9d1e233d8440d35fa37db91ff2912d18bb3b3d15e755901e97aab5346c73d7",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "local_cell_read_f32-O0",
+    "capture_sha256": "a570c766fb12ea84b8d1125f1ae121217ad28515e8fe6a6c6a02693c0ca3ff35",
+    "machine_prefix_bytes": 15422,
+    "machine_prefix_sha256": "a846a4c28e3dbbf6c4e1c903b53d36dccd8527f13a800873b2d6ae1cbc78b8fe",
+    "before_o0_identity_copy_cleanup": {
+      "machine_prefix_bytes": 15889,
+      "machine_prefix_sha256": "40f739073e4ee1c411e06c9dc8beb97a22854500c549d914521977c1e4ff11e4"
+    },
+    "derivation": "capture_sha256 after the O0 physical-self-copy-only cleanup introduced in 5f67010c1; disabling only post_ra reproduces before_o0_identity_copy_cleanup exactly"
+  },
+  {
+    "case": "local_cell_read_f32-O1",
+    "capture_sha256": "3fa3df4e7037dd70484dfffa9cf72bd93cbd2a10111bbe1d4dc1a23f2a2d6113",
+    "machine_prefix_bytes": 15197,
+    "machine_prefix_sha256": "96a9e28c3cfb974f67297a281c04d650ce71bdca0b1c2a216750bb45ce775087",
+    "derivation": "capture_sha256 after the O1 CfgSimplify entry/fallthrough merge added by 275e8973a"
+  },
+  {
+    "case": "local_cell_read_f32-O2",
+    "capture_sha256": "ff5b6ae7652133df530cb28a399ee207da13f37cefdd9ed245b1610756d2e441",
+    "machine_prefix_bytes": 14964,
+    "machine_prefix_sha256": "1e89ea8cb252556149b8fee428d1885bd94a8c5709456cf129b7214094821dfe",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  },
+  {
+    "case": "local_cell_read_f32-O3",
+    "capture_sha256": "ff5b6ae7652133df530cb28a399ee207da13f37cefdd9ed245b1610756d2e441",
+    "machine_prefix_bytes": 14964,
+    "machine_prefix_sha256": "1e89ea8cb252556149b8fee428d1885bd94a8c5709456cf129b7214094821dfe",
+    "derivation": "capture_sha256 after e44b0c0a9 retired each erased dead virtual copy as an operand-free Nop"
+  }
+]

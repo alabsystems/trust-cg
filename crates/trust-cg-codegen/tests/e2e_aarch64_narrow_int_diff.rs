@@ -1,6 +1,6 @@
 // trust-cg-codegen/tests/e2e_aarch64_narrow_int_diff.rs
 //
-// End-to-end (compile -> link -> RUN on aarch64-apple-darwin) differential gate
+// End-to-end (compile -> link -> RUN on Linux GNU or macOS AArch64) differential gate
 // for narrow scalar integer ops (i8/i16), the extension-discipline-sensitive
 // class where the sitofp P0 (commit 71f2e8e) lived: a narrow value in a wide
 // register whose sign/zero extension must be handled correctly. Signed
@@ -8,17 +8,15 @@
 // arithmetic shifts each depend on the low bits being interpreted at the right
 // width and signedness.
 //
-// Every op is diffed bit-exact against clang/LLVM over an operand grid that
+// Every op is diffed bit-exact against the native C compiler over an operand grid that
 // includes the sign boundaries (iN::MIN, -1, iN::MAX). It is a standing
 // regression gate: a future extension-discipline slip fails it closed.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-use std::fs;
-use std::process::Command;
-
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+#[path = "common/aarch64_native.rs"]
+mod native;
 use trust_cg_codegen::pipeline::OptLevel;
 
 use trust_ir::{
@@ -27,16 +25,15 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
 fn cmp_fn(id: u32, name: &str, m: &mut TrustIrModule, ty: Ty, op: ICmpOp) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![ty.clone(), ty.clone()],
-        returns: vec![Ty::Bool],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![ty.clone(), ty.clone()],
+            returns: vec![Ty::Bool],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -54,15 +51,19 @@ fn cmp_fn(id: u32, name: &str, m: &mut TrustIrModule, ty: Ty, op: ICmpOp) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn bin_fn(id: u32, name: &str, m: &mut TrustIrModule, ty: Ty, op: BinOp) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![ty.clone(), ty.clone()],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![ty.clone(), ty.clone()],
+            returns: vec![ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -80,7 +81,8 @@ fn bin_fn(id: u32, name: &str, m: &mut TrustIrModule, ty: Ty, op: BinOp) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -99,16 +101,8 @@ fn build_module() -> TrustIrModule {
     m
 }
 
-fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level,
-        ..CompilerConfig::default()
-    });
-    let result = compiler
-        .compile(module)
-        .expect("narrow int ops must compile");
-    assert!(!result.object_code.is_empty());
-    result.object_code
+fn compile_to_obj_at(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
+    native::compile(module, opt)
 }
 
 const DRIVER: &str = r#"
@@ -160,45 +154,13 @@ int main(void){
 "#;
 
 fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: link-and-run requires an aarch64-apple-darwin host");
-        return None;
-    }
-    let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
-    let _ = fs::create_dir_all(&dir);
-    let obj_path = dir.join(format!("{tag}.o"));
-    let drv_path = dir.join("driver.c");
-    let bin_path = dir.join(format!("{tag}_bin"));
-    fs::write(&obj_path, obj).expect("write .o");
-    fs::write(&drv_path, driver).expect("write driver");
-
-    let link = Command::new("cc")
-        .args([
-            drv_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
-            "-o",
-            bin_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("cc available");
-    assert!(
-        link.status.success(),
-        "link failed:\n{}",
-        String::from_utf8_lossy(&link.stderr)
-    );
-
-    let run = Command::new(bin_path.to_str().unwrap())
-        .output()
-        .expect("run binary");
-    let code = run.status.code().unwrap_or(-1);
-    let _ = fs::remove_dir_all(&dir);
-    Some(code)
+    native::link_run(tag, obj, driver)
 }
 
 #[test]
 fn e2e_aarch64_narrow_int_matches_llvm() {
     let module = build_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = compile_to_obj_at(&module, opt);
         let Some(code) = link_run_exit_code("narrow_int_diff", &obj, DRIVER) else {
             return;

@@ -1,0 +1,10 @@
+; TrustIr text format v1
+module "ty_dialect_v39"
+
+functy.0 = (dialect<example, value, 1>) -> (dialect<example, value, 1>)
+
+fn @nominal_identity(functy.0) {
+bb0(%0: dialect<example, value, 1>):
+    %1 = copy dialect<example, value, 1> %0
+    ret %1
+}

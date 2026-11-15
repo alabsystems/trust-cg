@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // E2E (x86_64-apple-darwin): the bridge lowers rustc MIR `UnwindAction::Cleanup`
 // edges to trust-ir exception handling — `Inst::Invoke` (a call that may unwind),
@@ -60,51 +64,10 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    for cand in [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ] {
-        if cand.exists() {
-            return cand;
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run unwind test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn host_is_x86_64_macos() -> bool {
@@ -112,16 +75,7 @@ fn host_is_x86_64_macos() -> bool {
 }
 
 fn x86_64_std_available() -> bool {
-    Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == TARGET)
-        })
-        .unwrap_or(false)
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -181,24 +135,24 @@ fn has_gcc_except_tab(obj: &Path) -> bool {
 }
 
 /// Compile `UNWIND_CRATE` through the bridge (when `dylib` is `Some`) or through
-/// plain rustc/LLVM (when `None`, the differential ORACLE), with `extra_env`
+/// plain rustc/LLVM (when `None`, the differential ORACLE), with `extra_knobs`
 /// overlaid, into `dir/out_name`. Returns `(rustc_succeeded, stderr)`.
 fn compile_unwind_crate(
     dylib: Option<&Path>,
     dir: &Path,
     panicker_rlib: &Path,
     out_name: &str,
-    extra_env: &[(&str, &str)],
+    extra_knobs: &[&str],
 ) -> (bool, String) {
     let src = dir.join("guard_unwind.rs");
     std::fs::write(&src, UNWIND_CRATE).expect("write source");
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "staticlib"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "staticlib"]);
     if let Some(dylib) = dylib {
         let mut s = std::ffi::OsString::from("-Zcodegen-backend=");
         s.push(dylib);
-        cmd.arg(&s).env("TCG_NO_PROOF_CERTS", "1");
+        cmd.arg(&s)
+            .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
     }
     cmd.args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .args(["-Cforce-unwind-tables=yes"])
@@ -216,8 +170,12 @@ fn compile_unwind_crate(
         .arg("-o")
         .arg(dir.join(out_name))
         .arg(&src);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
+    // Backend knobs travel on the TRACKED `-Ztrust-ir-cg-args` option, never in
+    // the child's environment: trustc refuses every `TCG_*`/`TRUST_CG_*`
+    // variable as an untracked semantic/codegen control, so an environment
+    // overlay here would fail the compile before the backend loaded.
+    if !extra_knobs.is_empty() {
+        cmd.arg(toolchain_support::backend_knobs_arg(extra_knobs));
     }
     let out = cmd.output().expect("spawn rustc via rustup");
     (
@@ -245,8 +203,7 @@ fn bridge_lowers_unwind_cleanup_to_eh_object_x86_64() {
     let src = dir.join("guard_unwind.rs");
     std::fs::write(&src, UNWIND_CRATE).expect("write source");
     let mir_out = dir.join("guard_unwind.mir");
-    let mir_status = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let mir_status = toolchain_support::rustc_command()
         .args(["--crate-type", "lib"])
         .args(["--target", TARGET, "-Cpanic=unwind", "-Zmir-opt-level=0"])
         .arg("--extern")
@@ -277,7 +234,7 @@ fn bridge_lowers_unwind_cleanup_to_eh_object_x86_64() {
         &dir,
         &panicker_rlib,
         "guard_unwind.o",
-        &[("TCG_DISABLE_UNWIND", "1")],
+        &["disable-unwind"],
     );
     assert!(
         !ok_off,
@@ -350,8 +307,7 @@ fn build_panicker_rlib(dir: &Path) -> PathBuf {
     let panicker_src = dir.join("panicker.rs");
     std::fs::write(&panicker_src, PANICKER_CRATE).expect("write panicker");
     let panicker_rlib = dir.join("libpanicker.rlib");
-    let pk = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let pk = toolchain_support::rustc_command()
         .args(["--crate-name", "panicker", "--crate-type", "rlib"])
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .arg("--emit=link")
@@ -462,8 +418,7 @@ fn link_driver_binary(
     let bin = dir.join(bin_name);
     let mut l = std::ffi::OsString::from("-L");
     l.push(dir);
-    let link = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let link = toolchain_support::rustc_command()
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .arg(&l)
         .args(["-l", &format!("static={staticlib_name}")])
@@ -508,14 +463,24 @@ fn bridge_unwind_cleanup_real_panic_caught_x86_64() {
     let panicker_rlib = build_panicker_rlib(&dir);
 
     // (a) Bridge-compiled guard_across_unwind (gate ON by default).
-    let (ok_on, stderr_on) =
-        compile_unwind_crate(Some(&dylib), &dir, &panicker_rlib, "guard_unwind_tcg.o", &[]);
+    let (ok_on, stderr_on) = compile_unwind_crate(
+        Some(&dylib),
+        &dir,
+        &panicker_rlib,
+        "guard_unwind_tcg.o",
+        &[],
+    );
     assert!(
         ok_on,
         "with the flip ON by default the bridge must lower the unwind cleanup. stderr:\n{stderr_on}"
     );
-    let tcg_bin =
-        link_driver_binary(&dir, &panicker_rlib, "guard_unwind_tcg", "guardunwindtcg", "driver_tcg");
+    let tcg_bin = link_driver_binary(
+        &dir,
+        &panicker_rlib,
+        "guard_unwind_tcg",
+        "guardunwindtcg",
+        "driver_tcg",
+    );
 
     // (b) All-LLVM guard_across_unwind (the differential ORACLE): identical
     //     source, plain rustc/LLVM, same driver + link.
@@ -658,15 +623,19 @@ fn compile_abort_cleanup_program(
     let src_path = dir.join(format!("{name}.rs"));
     std::fs::write(&src_path, src).expect("write panic=abort cleanup source");
     let bin = dir.join(name);
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--target", TARGET, "-Cpanic=abort", "-Copt-level=0"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--target", TARGET, "-Cpanic=abort", "-Copt-level=0"]);
     if let Some(dylib) = dylib {
         let mut backend = std::ffi::OsString::from("-Zcodegen-backend=");
         backend.push(dylib);
         cmd.arg(backend);
     }
-    let output = cmd.arg("-o").arg(&bin).arg(&src_path).output().expect("spawn rustc");
+    let output = cmd
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src_path)
+        .output()
+        .expect("spawn rustc");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
@@ -703,8 +672,15 @@ fn abort_strategy_cleanup_edges_compile_and_match_llvm_x86_64() {
     );
     let llvm_ok_run = run_with_timeout(&llvm_ok, std::time::Duration::from_secs(10));
     let tcg_ok_run = run_with_timeout(&tcg_ok, std::time::Duration::from_secs(10));
-    assert_eq!(llvm_ok_run.0, Some(42), "LLVM readable oracle changed: {llvm_ok_run:?}");
-    assert_eq!(tcg_ok_run.0, llvm_ok_run.0, "trust-cg live path differs: {tcg_ok_run:?}");
+    assert_eq!(
+        llvm_ok_run.0,
+        Some(42),
+        "LLVM readable oracle changed: {llvm_ok_run:?}"
+    );
+    assert_eq!(
+        tcg_ok_run.0, llvm_ok_run.0,
+        "trust-cg live path differs: {tcg_ok_run:?}"
+    );
     assert!(!tcg_ok_run.3, "trust-cg live path hung");
 
     let (llvm_panic, _) =
@@ -718,8 +694,14 @@ fn abort_strategy_cleanup_edges_compile_and_match_llvm_x86_64() {
     let llvm_panic_run = run_with_timeout(&llvm_panic, std::time::Duration::from_secs(10));
     let tcg_panic_run = run_with_timeout(&tcg_panic, std::time::Duration::from_secs(10));
     assert!(!llvm_panic_run.3 && !tcg_panic_run.3, "panic path hung");
-    assert_eq!(llvm_panic_run.0, None, "LLVM panic=abort path did not signal");
-    assert_eq!(tcg_panic_run.0, None, "trust-cg panic=abort path did not signal");
+    assert_eq!(
+        llvm_panic_run.0, None,
+        "LLVM panic=abort path did not signal"
+    );
+    assert_eq!(
+        tcg_panic_run.0, None,
+        "trust-cg panic=abort path did not signal"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

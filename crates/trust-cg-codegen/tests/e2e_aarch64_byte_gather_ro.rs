@@ -28,8 +28,13 @@ use trust_cg_codegen::pipeline::OptLevel;
 use trust_ir::{ICmpOp, ParamAttrs, Ty};
 use trust_ir_build::ModuleBuilder;
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// `int bytesum(const uint8_t* b, int n)`:
@@ -77,7 +82,7 @@ fn build_module() -> trust_ir::Module {
         fb.ret(vec![eacc]);
         fb.build();
     }
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     let f = module
         .functions
         .iter_mut()
@@ -97,7 +102,8 @@ fn compile_at(module: &trust_ir::Module, opt: OptLevel) -> Result<Vec<u8>, Strin
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|r| r.object_code)
@@ -174,8 +180,8 @@ int main(void) {
 "#;
 
 fn link_run_disasm(tag: &str, obj: &[u8]) -> Option<(i32, String)> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -192,6 +198,7 @@ fn link_run_disasm(tag: &str, obj: &[u8]) -> Option<(i32, String)> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -258,4 +265,13 @@ fn e2e_aarch64_byte_gather_ro_bit_exact_and_no_overread() {
         code, 0,
         "O2 byte-gather mismatch / guard-page over-read fault"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

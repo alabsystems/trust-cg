@@ -1,0 +1,17 @@
+{
+  "scope": "Immutable actual b8 source/IR/object input data, not an authenticated source/proof capability. New codegen/native checks retain the full eight-function population.",
+  "source_cut": "b8f24f1b5b575f19686a67cda63ff1bb0025459e",
+  "capture_sha256": "09aca108648224c6594031351af91e4df2db62c0de97350dda1d7a25de6f6ce4",
+  "functions": 8,
+  "never_inline": [
+    "trust_c_i16_not",
+    "trust_c_i8_not"
+  ],
+  "files": {
+    "baseline.o": "6929266d922736524ec035e55b11dc7d07763d1c7a411ef29c94e046138304b1",
+    "driver.c": "ae8d174cd04d3b23dc2af776f667fff15f8de28897ea7e6a92e9149c7106d06c",
+    "module.json": "e315f9c327867aad44976310184b9e9318941c49ccd8350f8dc7d7364598e8ad",
+    "observe.S": "cab01d6c90016e8a6c1900dc238ba43b081f6a2b7f7310023c1ed6abf75b4eac",
+    "subject.rs": "5a38892e9ce3a7ab89013595096ba861ddf441bea84cd1d92956c48cab748db0"
+  }
+}

@@ -1,6 +1,9 @@
 // Unit tests for the FP array-reduction vectorizer (neon-farray).
 
 use super::*;
+
+mod candidate;
+mod semantics;
 use trust_cg_ir::Signature;
 
 fn g(id: u32) -> MachOperand {
@@ -631,7 +634,7 @@ fn guards_are_signed_for_negative_start_induction() {
             .flat_map(|blk| blk.insts.iter().copied())
             .filter(|&id| {
                 let inst = func.inst(id);
-                inst.opcode == AArch64Opcode::BCond && imm_of(&inst.operands[0]) == Some(cc)
+                inst.opcode == AArch64Opcode::BCond && inst.operands[0].as_imm() == Some(cc)
             })
             .count()
     };
@@ -712,5 +715,82 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
                 "{label}: run {again} added blocks"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`). The reduction reproduces `iv`,
+// `acc` and `acc_src`; the fill reproduces `iv`. Both vector exits branch
+// straight to the true exit when nothing remains.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build); 2] = [
+        ("fused f64 dot", || {
+            build_loop(Kind::FusedDot, 1, 8, false, false)
+        }),
+        ("iota fill", || {
+            build_fill(false, true, false, 100, false, false)
+        }),
+    ];
+    let iv = VReg::new(10, RegClass::Gpr64);
+    let mut wrong = Vec::new();
+    for (name, build) in shapes {
+        assert!(
+            NeonFArrayPass::new().run(&mut build()),
+            "{name}: plain fires"
+        );
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if NeonFArrayPass::new().run(&mut carried) {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if NeonFArrayPass::new().run(&mut live_out) {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// The post-increment index read after the loop. In these rotated do-whiles the
+/// exit leaves from the header after `iv' = iv + 1` and before the latch copies
+/// it into `iv`, so a source `i` used after `while i < n` is `iv'`. The pass's
+/// own live-out scan admitted `iv'`, but the vector code never writes it: when
+/// the vector loop consumed every iteration it branched to the exit with `iv'`
+/// never written. Refused now, for both the reduction and the fill.
+#[test]
+fn refuses_a_post_increment_index_read_after_the_loop() {
+    let iv_next = MachOperand::VReg(VReg::new(12, RegClass::Gpr64));
+    for (name, mut func) in [
+        (
+            "fused f64 dot",
+            build_loop(Kind::FusedDot, 1, 8, false, false),
+        ),
+        (
+            "iota fill",
+            build_fill(false, true, false, 100, false, false),
+        ),
+    ] {
+        let exit = BlockId(3);
+        let read = func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![
+                MachOperand::VReg(VReg::new(60, RegClass::Gpr64)),
+                iv_next.clone(),
+            ],
+        ));
+        func.block_mut(exit).insts.insert(0, read);
+        assert!(
+            !NeonFArrayPass::new().run(&mut func),
+            "{name}: an exit reading `iv + 1` must stay scalar"
+        );
     }
 }

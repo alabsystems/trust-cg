@@ -785,6 +785,9 @@ fn build_p3_corpus(mb: &mut ModuleBuilder, i32_2: trust_ir::FuncTyId, cases: &mu
         // The corpus module declares exactly this one global, so it is index 0.
         let global_index = 0u32;
         mb.add_global(Global {
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
             name: "DIFFTEST_TABLE".to_string(),
             ty: Ty::Array(u8_ty, table.len() as u64),
             mutable: false,
@@ -834,12 +837,17 @@ fn build_switch_case(
     let v = fb.add_block_param(entry, Ty::I32);
     let x = fb.add_block_param(entry, Ty::I32);
     let case_blocks: Vec<_> = values.iter().map(|_| fb.create_block()).collect();
-    let own_default = fb.create_block();
-    let default_block = if shared_default {
-        case_blocks[0]
-    } else {
-        own_default
-    };
+    // The own-default block is CREATED ONLY WHEN IT IS THE DEFAULT EDGE. It
+    // used to be created unconditionally, so the `shared_default` shape — the
+    // one whose point is that the default label and a case label name the same
+    // arm — also carried a block nothing branched to, and the whole corpus was
+    // refused `InvalidTrustIr { stage: Received, errors: [UnreachableBlock(7)] }`
+    // once trust-ir's validator reached unreachable blocks. The fixture was
+    // wrong, not the validator: an unreachable block is not part of the shape
+    // being measured, and `switch_shared_default`'s claim is about the EDGE.
+    // The non-shared shapes allocate the same ids as before.
+    let own_default = (!shared_default).then(|| fb.create_block());
+    let default_block = own_default.unwrap_or(case_blocks[0]);
     fb.switch_to_block(entry);
     let switch_cases: Vec<SwitchCase> = values
         .iter()
@@ -857,10 +865,12 @@ fn build_switch_case(
         let val = fb.add(Ty::I32, x, kc);
         fb.br(join, vec![val]);
     }
-    fb.switch_to_block(own_default);
-    let sentinel = fb.iconst(Ty::I32, -1);
-    let val = fb.add(Ty::I32, x, sentinel);
-    fb.br(join, vec![val]);
+    if let Some(own_default) = own_default {
+        fb.switch_to_block(own_default);
+        let sentinel = fb.iconst(Ty::I32, -1);
+        let val = fb.add(Ty::I32, x, sentinel);
+        fb.br(join, vec![val]);
+    }
     fb.switch_to_block(join);
     fb.ret(vec![r]);
     fb.build()
@@ -874,12 +884,14 @@ fn main() {
 
     let mut mb = ModuleBuilder::new("difftest");
     let cases = build_corpus(&mut mb);
-    let mut module = mb.build();
+    let mut module = mb
+        .build()
+        .expect("ModuleBuilder::build: the example module");
 
     let interp = Interpreter::with_module(&module).with_options(InterpretOptions {
         fuel: 50_000_000,
         max_call_depth: 256,
-        mem_budget: 256 * 1024 * 1024,
+        panic_strategy: trust_ir::interpret::PanicStrategy::Abort,
     });
 
     let mut rng = Lcg(0x9E3779B97F4A7C15);
@@ -927,7 +939,12 @@ fn main() {
     // fail-closes the other way (reference execution wants the canonical
     // 64-bit layout), so the wasm32 pin is stamped after interpretation.
     module.target_info = Some(wasm::wasm32_target_info());
-    let bytes = wasm::compile_module(&module).expect("compile_module");
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("compile_module");
     std::fs::File::create(format!("{out}.wasm"))
         .unwrap()
         .write_all(&bytes)
@@ -941,4 +958,13 @@ fn main() {
         bytes.len(),
         cases.len()
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

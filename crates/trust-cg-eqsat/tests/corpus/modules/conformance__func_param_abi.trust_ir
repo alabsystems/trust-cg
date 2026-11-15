@@ -1,0 +1,14 @@
+; TrustIr text format v1
+module "func_param_abi"
+target "x86_64-unknown-linux-gnu" 8 little abi="sysv64" structpass=always_memory
+
+struct @BigPair { lo: u64 @0, hi: u64 @8 } size=16 align=8 repr=c id=0
+
+functy.0 = (ptr, ptr) -> ()
+
+fn @copy_pair(functy.0) {
+    ; #param_attrs 0: noalias sret
+    ; #param_attrs 1: dereferenceable(16) align(8) readonly byval
+bb0(%0: ptr, %1: ptr):
+    ret
+}

@@ -3,8 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-//! Tests for the `TypeConstraint` vocabulary added per the coordination spec
-//! §5 (`designs/2026-04-18-aggregates-dialects-coordination.md`).
+//! Tests for the `TypeConstraint` vocabulary.
 //!
 //! The R9 snapshot-6 audit caught that `OpDef` silently dropped
 //! `operand_types` / `result_types`. These tests lock in the restored
@@ -24,6 +23,59 @@ use trust_cg_dialect::pass::{
 };
 use trust_cg_dialect::registry::DialectRegistry;
 use trust_cg_ir::Type;
+
+#[test]
+fn legality_resolves_block_parameter_types() {
+    let mut registry = DialectRegistry::new();
+    let (_, trust_ir_id, _, _) = register_all(&mut registry);
+    let mut module = DialectModule::new("block_params", registry);
+    let mut function =
+        DialectFunction::new("add", vec![], vec![Type::I32]).expect("bounded test function");
+    let (block, params) = function
+        .new_block_with_params(vec![Type::I32, Type::I32])
+        .expect("bounded test function");
+    let result = function.alloc_value().expect("bounded test function");
+    function
+        .append_op(
+            block,
+            DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_ADD),
+            vec![(result, Type::I32)],
+            params,
+            vec![],
+            None,
+        )
+        .expect("bounded test function");
+    module.push_function(function);
+    validate_legality(&module, &Legality::new()).expect("SameAs resolves block parameters");
+
+    module.functions[0].blocks[1].params[1].1 = Type::I64;
+    let error = validate_legality(&module, &Legality::new()).unwrap_err();
+    assert!(error.to_string().contains("operand 1"));
+}
+
+#[test]
+fn legality_checks_constraints_on_block_parameters() {
+    let mut registry = DialectRegistry::new();
+    let (_, trust_ir_id, _, _) = register_all(&mut registry);
+    let mut module = DialectModule::new("block_params", registry);
+    let mut function = DialectFunction::new("ret", vec![], vec![]).expect("bounded test function");
+    let (block, params) = function
+        .new_block_with_params(vec![Type::Struct(vec![Type::I32])])
+        .expect("bounded test function");
+    function
+        .append_op(
+            block,
+            DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_RET),
+            vec![],
+            params,
+            vec![],
+            None,
+        )
+        .expect("bounded test function");
+    module.push_function(function);
+    let error = validate_legality(&module, &Legality::new()).unwrap_err();
+    assert!(error.to_string().contains("AnyScalar"));
+}
 
 // ---------------------------------------------------------------------------
 // Unit-level `TypeConstraint::accepts` coverage.
@@ -328,10 +380,11 @@ fn validate_legality_now_checks_types_end_to_end() {
     let mut registry = DialectRegistry::new();
     let (_verif_id, trust_ir_id, _machir_id, _ay_id) = register_all(&mut registry);
 
-    let mut func = DialectFunction::new("add_i64", vec![Type::I64, Type::I64], vec![Type::I64]);
+    let mut func = DialectFunction::new("add_i64", vec![Type::I64, Type::I64], vec![Type::I64])
+        .expect("bounded test function");
     let entry = func.entry_block().unwrap();
     let (a, b) = (func.params[0].0, func.params[1].0);
-    let sum = func.alloc_value();
+    let sum = func.alloc_value().expect("bounded test function");
     func.append_op(
         entry,
         DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_ADD),
@@ -339,7 +392,8 @@ fn validate_legality_now_checks_types_end_to_end() {
         vec![a, b],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
     func.append_op(
         entry,
         DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_RET),
@@ -347,7 +401,8 @@ fn validate_legality_now_checks_types_end_to_end() {
         vec![sum],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     let mut module = DialectModule::new("m", registry);
     module.push_function(func);
@@ -446,10 +501,11 @@ fn validate_legality_catches_type_mismatch_in_module() {
     let mut registry = DialectRegistry::new();
     let (_verif_id, trust_ir_id, _machir_id, _ay_id) = register_all(&mut registry);
 
-    let mut func = DialectFunction::new("bad_add", vec![Type::F32, Type::F32], vec![Type::F32]);
+    let mut func = DialectFunction::new("bad_add", vec![Type::F32, Type::F32], vec![Type::F32])
+        .expect("bounded test function");
     let entry = func.entry_block().unwrap();
     let (a, b) = (func.params[0].0, func.params[1].0);
-    let sum = func.alloc_value();
+    let sum = func.alloc_value().expect("bounded test function");
     // Mismatched op: operands are F32 but `trust_ir.add` demands AnyInt.
     func.append_op(
         entry,
@@ -458,7 +514,8 @@ fn validate_legality_catches_type_mismatch_in_module() {
         vec![a, b],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     let mut module = DialectModule::new("m_bad", registry);
     module.push_function(func);

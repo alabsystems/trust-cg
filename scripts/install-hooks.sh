@@ -7,8 +7,10 @@
 #
 #   scripts/install-hooks.sh
 #
-# After this, a push that updates `main` runs scripts/soundness_check.sh and is
-# BLOCKED on any red gate. Emergency override: git push --no-verify.
+# After this, a push that updates `main` must carry a verified per-commit
+# soundness attestation (refs/attest/soundness/<C>/*); the hook runs
+# scripts/soundness_check.sh --attest when none verifies and BLOCKS on any red
+# leg. See hooks/pre-push for the transitional owner exception.
 #
 set -eu
 
@@ -24,5 +26,4 @@ chmod +x hooks/* 2>/dev/null || true
 git config core.hooksPath hooks
 
 echo "install-hooks: core.hooksPath = $(git config core.hooksPath)"
-echo "install-hooks: pre-push soundness gate is now ACTIVE for 'main' pushes."
-echo "install-hooks: (override in emergencies with 'git push --no-verify'.)"
+echo "install-hooks: pre-push soundness attestation gate is now ACTIVE for 'main' pushes."

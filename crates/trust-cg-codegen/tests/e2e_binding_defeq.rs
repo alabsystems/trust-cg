@@ -85,22 +85,37 @@
 //! Num{n@8,parent@16} FIELD-REORDERED, ArcInner data @+16).
 //!
 //! Run ONE TEST PER PROCESS (JIT accumulation — jit-parallel-race-2026-06-29.md):
-//!   perl -e 'alarm 600; exec @ARGV' -- cargo test -p trust-cg-codegen \
+//!   perl -e 'alarm 600; exec @ARGV' -- scripts/trust_cargo.sh test -p trust-cg-codegen \
 //!     --test e2e_binding_defeq -- --exact <name> --test-threads=1
 
 #![cfg(target_arch = "aarch64")]
 #![allow(dead_code)]
 #![allow(clippy::all)]
 
-#[cfg(kernel_fixture_layout_unknown)]
+// A lint driver (`clippy-driver`/`tippy-driver`) links no test binary, so
+// under `kernel_fixture_layout_lint_only` this target is compiled only to BE
+// LINTED; the fixtures still cannot run, because every JIT entry point below
+// refuses at runtime under that same cfg. The ae9 Linux compiler selects its
+// own separately generated fixtures.
+#[cfg(all(
+    kernel_fixture_layout_unknown,
+    not(kernel_fixture_ae9_linux),
+    not(kernel_fixture_layout_lint_only)
+))]
 compile_error!(
     "kernel JIT fixtures require exact Rust 1.95.0, Rust 1.97.1, or the certified Trust compiler"
 );
 
+#[cfg(kernel_fixture_layout_lint_only)]
+#[path = "common/kernel_fixture_guard.rs"]
+mod kernel_fixture_guard;
+
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::time::Duration;
+
+#[path = "common/watchdog.rs"]
+mod watchdog;
+use watchdog::run_with_watchdog;
 
 use trust_cg_codegen::Target;
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
@@ -2828,7 +2843,7 @@ bb27:
     call @func.24(%54)
     br bb28
 bb28:
-    call @func.35(%53, %54)
+    call @func.33(%53, %54)
     br bb29
 bb29:
     call @func.29(%58)
@@ -2843,7 +2858,7 @@ bb31:
     br bb32
 bb32:
     %1273 = const bool false
-    call @func.36(%59, %60, %61)
+    call @func.34(%59, %60, %61)
     br bb33
 bb33:
     %1274 = const bool false
@@ -3006,7 +3021,7 @@ bb41:
 bb42:
     %1381 = const bool false
     %1382 = const bool false
-    call @func.39(%65, %66, %67, %68)
+    call @func.35(%65, %66, %67, %68)
     br bb43
 bb43:
     %1383 = const bool false
@@ -3164,10 +3179,10 @@ bb50(%6: u64):
     %1489 = icmp eq u64 %6, %1488
     condbr %1489, bb57, bb58(%6)
 bb51:
-    call @func.41(%77)
+    call @func.36(%77)
     br bb52
 bb52:
-    call @func.42(%79)
+    call @func.37(%79)
     br bb53
 bb53:
     %1490 = const i64 96
@@ -3239,7 +3254,7 @@ bb53:
     store ptr %1491, ptr %78
     br bb54
 bb54:
-    call @func.43(%81)
+    call @func.38(%81)
     br bb55
 bb55:
     %1544 = const i64 96
@@ -3387,10 +3402,10 @@ bb59:
     call @func.24(%86)
     br bb60
 bb60:
-    call @func.35(%85, %86)
+    call @func.33(%85, %86)
     br bb61
 bb61:
-    call @func.44(%88)
+    call @func.39(%88)
     br bb62
 bb62:
     %1649 = const i64 96
@@ -3462,7 +3477,7 @@ bb62:
     store ptr %1650, ptr %87
     br bb63
 bb63:
-    call @func.45(%90)
+    call @func.40(%90)
     br bb64
 bb64:
     %1703 = const i64 96
@@ -3631,7 +3646,7 @@ bb73:
     br bb74
 bb74:
     %1813 = const bool false
-    call @func.46(%99, %100)
+    call @func.41(%99, %100)
     br bb75
 bb75:
     call @func.32(%98, %99)
@@ -3878,14 +3893,14 @@ bb88:
     call @func.29(%118)
     br bb89
 bb89:
-    call @func.46(%117, %118)
+    call @func.41(%117, %118)
     br bb90
 bb90:
     %1979 = const bool true
     call @func.30(%120)
     br bb91
 bb91:
-    call @func.46(%119, %120)
+    call @func.41(%119, %120)
     br bb92
 bb92:
     %1980 = const bool false
@@ -3965,7 +3980,7 @@ bb94:
     store ptr %1983, ptr %114
     br bb95
 bb95:
-    call @func.47(%122)
+    call @func.42(%122)
     br bb96
 bb96:
     %2036 = const i64 96
@@ -4363,11 +4378,11 @@ bb115(%11: u64):
     %2308 = icmp eq u64 %11, %2307
     condbr %2308, bb120, bb121(%11)
 bb116:
-    call @func.41(%142)
+    call @func.36(%142)
     br bb117
 bb117:
     %2309 = const u64 7
-    call @func.48(%144, %2309)
+    call @func.43(%144, %2309)
     br bb118
 bb118:
     %2310 = const i64 96
@@ -4508,7 +4523,7 @@ bb121(%12: u64):
     %2411 = icmp eq u64 %12, %2410
     condbr %2411, bb126, bb127(%12)
 bb122:
-    call @func.41(%148)
+    call @func.36(%148)
     br bb123
 bb123:
     %2412 = const u64 5
@@ -4519,7 +4534,7 @@ bb123:
     store i64 %2415, ptr %2414
     %2416 = const i64 4
     store i64 %2416, ptr %151
-    call @func.49(%150, %151)
+    call @func.44(%150, %151)
     br bb124
 bb124:
     %2417 = const i64 96
@@ -4663,13 +4678,13 @@ bb128:
     call @func.24(%157)
     br bb129
 bb129:
-    call @func.35(%156, %157)
+    call @func.33(%156, %157)
     br bb130
 bb130:
     call @func.29(%161)
     br bb131
 bb131:
-    call @func.46(%160, %161)
+    call @func.41(%160, %161)
     br bb132
 bb132:
     call @func.32(%159, %160)
@@ -4892,13 +4907,13 @@ bb139(%14: u64):
     %2677 = icmp eq u64 %14, %2676
     condbr %2677, bb145, bb146(%14)
 bb140:
-    call @func.41(%168)
+    call @func.36(%168)
     br bb141
 bb141:
     call @func.18(%171)
     br bb142
 bb142:
-    call @func.51(%170, %171)
+    call @func.45(%170, %171)
     br bb143
 bb143:
     %2678 = const i64 96
@@ -5042,13 +5057,13 @@ bb147:
     call @func.25(%176)
     br bb148
 bb148:
-    call @func.35(%175, %176)
+    call @func.33(%175, %176)
     br bb149
 bb149:
     call @func.30(%180)
     br bb150
 bb150:
-    call @func.46(%179, %180)
+    call @func.41(%179, %180)
     br bb151
 bb151:
     call @func.32(%178, %179)
@@ -5270,7 +5285,7 @@ bb160(%17: ptr):
     br bb161(%17)
 bb161(%18: ptr):
     %2935 = const bool false
-    call @func.36(%185, %186, %187)
+    call @func.34(%185, %186, %187)
     br bb162(%18)
 bb162(%19: ptr):
     %2936 = const bool false
@@ -5293,7 +5308,7 @@ bb164:
     call @func.24(%192)
     br bb165
 bb165:
-    call @func.35(%191, %192)
+    call @func.33(%191, %192)
     br bb166
 bb166:
     call @func.18(%195)
@@ -5314,7 +5329,7 @@ bb167:
     %2953 = gep i8, ptr %196, %2952
     %2954 = load i64, ptr %2951
     store i64 %2954, ptr %2953
-    call @func.52(%194, %195, %196)
+    call @func.46(%194, %195, %196)
     br bb168
 bb168:
     %2955 = const i64 96
@@ -5685,7 +5700,7 @@ bb181(%21: u64):
     %3219 = icmp eq u64 %21, %3218
     condbr %3219, bb199, bb200(%21)
 bb182:
-    call @func.41(%210)
+    call @func.36(%210)
     br bb183
 bb183:
     call @func.19(%213)
@@ -5699,7 +5714,7 @@ bb185:
     br bb186
 bb186:
     %3221 = const bool false
-    call @func.53(%212, %213, %214, %215)
+    call @func.47(%212, %213, %214, %215)
     br bb187
 bb187:
     %3222 = const bool false
@@ -5777,13 +5792,13 @@ bb188:
     %3278 = gep i8, ptr %219, %3277
     %3279 = const u64 1
     store u64 %3279, ptr %3278
-    call @func.54(%218, %219)
+    call @func.48(%218, %219)
     br bb189
 bb189:
     %3280 = const bool true
     %3281 = const i64 3
     store i64 %3281, ptr %222
-    call @func.46(%221, %222)
+    call @func.41(%221, %222)
     br bb190
 bb190:
     call @func.32(%220, %221)
@@ -5815,7 +5830,7 @@ bb196:
     %3290 = const bool false
     %3291 = const bool false
     %3292 = const bool false
-    call @func.55(%217, %218, %220, %223, %224, %3292)
+    call @func.49(%217, %218, %220, %223, %224, %3292)
     br bb197
 bb197:
     %3293 = const bool false
@@ -6002,12 +6017,12 @@ bb211:
     br bb212
 bb212:
     %3406 = const bool false
-    call @func.53(%239, %240, %241, %243)
+    call @func.47(%239, %240, %241, %243)
     br bb213
 bb213:
     %3407 = const bool false
     %3408 = const bool false
-    call @func.53(%235, %236, %237, %239)
+    call @func.47(%235, %236, %237, %239)
     br bb214
 bb214:
     %3409 = const bool false
@@ -6256,7 +6271,7 @@ bb227(%23: u64):
     %3575 = icmp eq u64 %23, %3574
     condbr %3575, bb255, bb256(%23)
 bb228:
-    call @func.41(%258)
+    call @func.36(%258)
     br bb229
 bb229:
     call @func.19(%261)
@@ -6268,14 +6283,14 @@ bb231:
     %3576 = const bool true
     %3577 = const i64 3
     store i64 %3577, ptr %265
-    call @func.46(%264, %265)
+    call @func.41(%264, %265)
     br bb232
 bb232:
     call @func.32(%263, %264)
     br bb233
 bb233:
     %3578 = const bool false
-    call @func.53(%260, %261, %262, %263)
+    call @func.47(%260, %261, %262, %263)
     br bb234
 bb234:
     %3579 = const bool false
@@ -6353,13 +6368,13 @@ bb235:
     %3635 = gep i8, ptr %269, %3634
     %3636 = const u64 1
     store u64 %3636, ptr %3635
-    call @func.54(%268, %269)
+    call @func.48(%268, %269)
     br bb236
 bb236:
     %3637 = const bool true
     %3638 = const i64 3
     store i64 %3638, ptr %272
-    call @func.46(%271, %272)
+    call @func.41(%271, %272)
     br bb237
 bb237:
     call @func.32(%270, %271)
@@ -6383,14 +6398,14 @@ bb242:
     %3642 = const bool true
     %3643 = const i64 3
     store i64 %3643, ptr %282
-    call @func.46(%281, %282)
+    call @func.41(%281, %282)
     br bb243
 bb243:
     call @func.32(%280, %281)
     br bb244
 bb244:
     %3644 = const bool false
-    call @func.53(%277, %278, %279, %280)
+    call @func.47(%277, %278, %279, %280)
     br bb245
 bb245:
     %3645 = const bool true
@@ -6421,7 +6436,7 @@ bb250:
 bb251:
     %3653 = const bool false
     %3654 = const bool false
-    call @func.56(%274, %275, %284)
+    call @func.50(%274, %275, %284)
     br bb252
 bb252:
     %3655 = const bool false
@@ -6429,7 +6444,7 @@ bb252:
     %3657 = const bool false
     %3658 = const bool false
     %3659 = const bool false
-    call @func.55(%267, %268, %270, %273, %274, %3659)
+    call @func.49(%267, %268, %270, %273, %274, %3659)
     br bb253
 bb253:
     %3660 = const bool false
@@ -6560,7 +6575,7 @@ bb254:
     store bool %3757, ptr %3759
     br bb394
 bb255:
-    call @func.57(%0)
+    call @func.51(%0)
     br bb394
 bb256(%24: u64):
     %3760 = const u64 20
@@ -6569,7 +6584,7 @@ bb256(%24: u64):
 bb257:
     %3762 = const i64 3
     store i64 %3762, ptr %290
-    call @func.46(%289, %290)
+    call @func.41(%289, %290)
     br bb259
 bb258(%25: u64):
     %3763 = const u64 21
@@ -6600,7 +6615,7 @@ bb264:
     br bb265
 bb265:
     %3770 = const bool false
-    call @func.56(%296, %297, %298)
+    call @func.50(%296, %297, %298)
     br bb266
 bb266:
     %3771 = const bool true
@@ -6609,12 +6624,12 @@ bb266:
     br bb267
 bb267:
     %3773 = const bool false
-    call @func.53(%294, %295, %296, %299)
+    call @func.47(%294, %295, %296, %299)
     br bb268
 bb268:
     %3774 = const bool false
     %3775 = const bool false
-    call @func.53(%291, %292, %293, %294)
+    call @func.47(%291, %292, %293, %294)
     br bb269
 bb269:
     %3776 = const bool true
@@ -6640,7 +6655,7 @@ bb273:
     br bb274
 bb274:
     %3783 = const bool false
-    call @func.56(%305, %306, %307)
+    call @func.50(%305, %306, %307)
     br bb275
 bb275:
     %3784 = const bool true
@@ -6672,7 +6687,7 @@ bb278:
     call @func.23(%309, %310, %311)
     br bb279
 bb279:
-    call @func.41(%312)
+    call @func.36(%312)
     br bb280
 bb280:
     call @func.19(%315)
@@ -6697,7 +6712,7 @@ bb285:
     br bb286
 bb286:
     %3800 = const bool false
-    call @func.53(%319, %320, %321, %322)
+    call @func.47(%319, %320, %321, %322)
     br bb287
 bb287:
     %3801 = const bool true
@@ -6714,17 +6729,17 @@ bb289:
     br bb290
 bb290:
     %3805 = const bool false
-    call @func.53(%323, %324, %325, %326)
+    call @func.47(%323, %324, %325, %326)
     br bb291
 bb291:
     %3806 = const bool false
     %3807 = const bool false
-    call @func.53(%317, %318, %319, %323)
+    call @func.47(%317, %318, %319, %323)
     br bb292
 bb292:
     %3808 = const bool false
     %3809 = const bool false
-    call @func.53(%314, %315, %316, %317)
+    call @func.47(%314, %315, %316, %317)
     br bb293
 bb293:
     %3810 = const bool false
@@ -6819,7 +6834,7 @@ bb299:
     br bb300
 bb300:
     %3868 = const bool false
-    call @func.53(%333, %334, %335, %336)
+    call @func.47(%333, %334, %335, %336)
     br bb301
 bb301:
     %3869 = const bool true
@@ -6958,7 +6973,7 @@ bb306:
     %3968 = gep i8, ptr %345, %3967
     %3969 = load i64, ptr %3966
     store i64 %3969, ptr %3968
-    call @func.56(%340, %341, %345)
+    call @func.50(%340, %341, %345)
     br bb307
 bb307:
     %3970 = const bool false
@@ -7105,7 +7120,7 @@ bb311:
 bb312:
     %4075 = const i64 3
     store i64 %4075, ptr %348
-    call @func.46(%347, %348)
+    call @func.41(%347, %348)
     br bb314
 bb313:
     store ptr %550, ptr %410
@@ -7145,7 +7160,7 @@ bb319:
     br bb320
 bb320:
     %4087 = const bool false
-    call @func.56(%354, %355, %356)
+    call @func.50(%354, %355, %356)
     br bb321
 bb321:
     %4088 = const bool true
@@ -7154,12 +7169,12 @@ bb321:
     br bb322
 bb322:
     %4090 = const bool false
-    call @func.53(%352, %353, %354, %357)
+    call @func.47(%352, %353, %354, %357)
     br bb323
 bb323:
     %4091 = const bool false
     %4092 = const bool false
-    call @func.53(%349, %350, %351, %352)
+    call @func.47(%349, %350, %351, %352)
     br bb324
 bb324:
     %4093 = const bool true
@@ -7185,7 +7200,7 @@ bb328:
     br bb329
 bb329:
     %4100 = const bool false
-    call @func.56(%363, %364, %365)
+    call @func.50(%363, %364, %365)
     br bb330
 bb330:
     %4101 = const bool true
@@ -7217,7 +7232,7 @@ bb333:
     call @func.23(%367, %368, %369)
     br bb334
 bb334:
-    call @func.41(%370)
+    call @func.36(%370)
     br bb335
 bb335:
     call @func.19(%373)
@@ -7242,7 +7257,7 @@ bb340:
     br bb341
 bb341:
     %4117 = const bool false
-    call @func.53(%377, %378, %379, %380)
+    call @func.47(%377, %378, %379, %380)
     br bb342
 bb342:
     %4118 = const bool true
@@ -7259,17 +7274,17 @@ bb344:
     br bb345
 bb345:
     %4122 = const bool false
-    call @func.53(%381, %382, %383, %384)
+    call @func.47(%381, %382, %383, %384)
     br bb346
 bb346:
     %4123 = const bool false
     %4124 = const bool false
-    call @func.53(%375, %376, %377, %381)
+    call @func.47(%375, %376, %377, %381)
     br bb347
 bb347:
     %4125 = const bool false
     %4126 = const bool false
-    call @func.53(%372, %373, %374, %375)
+    call @func.47(%372, %373, %374, %375)
     br bb348
 bb348:
     %4127 = const bool false
@@ -7364,7 +7379,7 @@ bb354:
     br bb355
 bb355:
     %4185 = const bool false
-    call @func.53(%391, %392, %393, %394)
+    call @func.47(%391, %392, %393, %394)
     br bb356
 bb356:
     %4186 = const bool true
@@ -7382,7 +7397,7 @@ bb358:
     %4191 = gep i8, ptr %400, %4190
     %4192 = const u64 1
     store u64 %4192, ptr %4191
-    call @func.54(%399, %400)
+    call @func.48(%399, %400)
     br bb359
 bb359:
     %4193 = const bool true
@@ -7521,14 +7536,14 @@ bb364:
     %4292 = gep i8, ptr %408, %4291
     %4293 = load i64, ptr %4290
     store i64 %4293, ptr %4292
-    call @func.56(%403, %404, %408)
+    call @func.50(%403, %404, %408)
     br bb365
 bb365:
     %4294 = const bool false
     %4295 = const bool false
     %4296 = const bool false
     %4297 = const bool false
-    call @func.55(%398, %399, %401, %402, %403, %4297)
+    call @func.49(%398, %399, %401, %402, %403, %4297)
     br bb366
 bb366:
     %4298 = const bool false
@@ -7676,17 +7691,17 @@ bb370:
     %4405 = const bool false
     br bb394
 bb371:
-    call @func.41(%412)
+    call @func.36(%412)
     br bb372
 bb372:
-    call @func.58(%415)
+    call @func.52(%415)
     br bb373
 bb373:
     call @func.20(%416)
     br bb374
 bb374:
     %4406 = const bool true
-    call @func.59(%418)
+    call @func.53(%418)
     br bb375
 bb375:
     %4407 = const u32 0
@@ -7716,17 +7731,17 @@ bb380:
     br bb381
 bb381:
     %4415 = const bool false
-    call @func.56(%420, %421, %425)
+    call @func.50(%420, %421, %425)
     br bb382
 bb382:
     %4416 = const bool false
     %4417 = const bool false
-    call @func.53(%417, %418, %419, %420)
+    call @func.47(%417, %418, %419, %420)
     br bb383
 bb383:
     %4418 = const bool false
     %4419 = const bool false
-    call @func.53(%414, %415, %416, %417)
+    call @func.47(%414, %415, %416, %417)
     br bb384
 bb384:
     %4420 = const bool false
@@ -7963,13 +7978,13 @@ bb0(%0: ptr, %1: ptr):
     %4 = alloca i64, align 8
     store ptr %1, ptr %2
     %5 = load ptr, ptr %2
-    call @func.62(%3, %5)
+    call @func.56(%3, %5)
     br bb1
 bb1:
     %6 = load ptr, ptr %2
     %7 = const i64 72
     %8 = gep i8, ptr %6, %7
-    call @func.63(%4, %8)
+    call @func.57(%4, %8)
     br bb2
 bb2:
     %9 = load i64, ptr %3
@@ -8260,18 +8275,18 @@ bb12(%44: ptr, %45: ptr, %46: ptr, %47: ptr, %48: bool, %49: u64, %50: u64, %51:
     %495 = call @func.15(%46, %50)
     br bb13(%44, %45, %46, %47, %48, %49, %50, %51, %52, %495)
 bb13(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: bool, %58: u64, %59: u64, %60: u64, %61: ptr, %62: ptr):
-    %496 = call @func.65(%61, %62)
+    %496 = call @func.59(%61, %62)
     br bb14(%53, %54, %55, %56, %57, %58, %59, %60, %496)
 bb14(%63: ptr, %64: ptr, %65: ptr, %66: ptr, %67: bool, %68: u64, %69: u64, %70: u64, %71: bool):
     condbr %71, bb15(%64, %65, %69), bb19(%63, %64, %65, %66, %67, %68, %69, %70)
 bb15(%72: ptr, %73: ptr, %74: u64):
-    call @func.66(%336, %72)
+    call @func.60(%336, %72)
     br bb16(%73, %74)
 bb16(%75: ptr, %76: u64):
     %497 = call @func.15(%75, %76)
     br bb17(%497)
 bb17(%77: ptr):
-    call @func.66(%337, %77)
+    call @func.60(%337, %77)
     br bb18
 bb18:
     %498 = const i64 8
@@ -8433,7 +8448,7 @@ bb23(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: bool):
     %620 = gep i8, ptr %618, %619
     br bb24(%106, %107, %108, %109, %110, %620)
 bb24(%111: ptr, %112: ptr, %113: ptr, %114: ptr, %115: bool, %116: ptr):
-    %621 = call @func.67(%116)
+    %621 = call @func.61(%116)
     br bb25(%111, %112, %113, %114, %115, %621)
 bb25(%117: ptr, %118: ptr, %119: ptr, %120: ptr, %121: bool, %122: bool):
     condbr %122, bb29(%118), bb26(%117, %118, %119, %120, %121)
@@ -8443,12 +8458,12 @@ bb26(%123: ptr, %124: ptr, %125: ptr, %126: ptr, %127: bool):
     %624 = gep i8, ptr %622, %623
     br bb27(%123, %124, %125, %126, %127, %624)
 bb27(%128: ptr, %129: ptr, %130: ptr, %131: ptr, %132: bool, %133: ptr):
-    %625 = call @func.68(%133)
+    %625 = call @func.62(%133)
     br bb28(%128, %129, %130, %131, %132, %625)
 bb28(%134: ptr, %135: ptr, %136: ptr, %137: ptr, %138: bool, %139: bool):
     condbr %139, bb29(%135), bb31(%134, %135, %136, %137, %138)
 bb29(%140: ptr):
-    call @func.66(%341, %140)
+    call @func.60(%341, %140)
     br bb30
 bb30:
     %626 = const i64 8
@@ -8550,12 +8565,12 @@ bb31(%141: ptr, %142: ptr, %143: ptr, %144: ptr, %145: bool):
     %703 = gep i8, ptr %701, %702
     br bb32(%141, %142, %143, %144, %145, %703)
 bb32(%146: ptr, %147: ptr, %148: ptr, %149: ptr, %150: bool, %151: ptr):
-    %704 = call @func.69(%151)
+    %704 = call @func.63(%151)
     br bb33(%146, %147, %148, %149, %150, %704)
 bb33(%152: ptr, %153: ptr, %154: ptr, %155: ptr, %156: bool, %157: bool):
     condbr %157, bb34(%153), bb36(%152, %153, %154, %155, %156)
 bb34(%158: ptr):
-    call @func.66(%343, %158)
+    call @func.60(%343, %158)
     br bb35
 bb35:
     %705 = const i64 8
@@ -8666,7 +8681,7 @@ bb37(%164: ptr, %165: ptr, %166: ptr, %167: ptr, %168: bool):
     %789 = gep i8, ptr %787, %788
     br bb38(%164, %165, %166, %167, %168, %786, %789)
 bb38(%169: ptr, %170: ptr, %171: ptr, %172: ptr, %173: bool, %174: ptr, %175: ptr):
-    %790 = call @func.67(%175)
+    %790 = call @func.61(%175)
     br bb39(%169, %170, %171, %172, %173, %174, %790)
 bb39(%176: ptr, %177: ptr, %178: ptr, %179: ptr, %180: bool, %181: ptr, %182: bool):
     condbr %182, bb43(%177), bb40(%176, %177, %178, %179, %180, %181)
@@ -8676,12 +8691,12 @@ bb40(%183: ptr, %184: ptr, %185: ptr, %186: ptr, %187: bool, %188: ptr):
     %793 = gep i8, ptr %791, %792
     br bb41(%183, %184, %185, %186, %187, %188, %793)
 bb41(%189: ptr, %190: ptr, %191: ptr, %192: ptr, %193: bool, %194: ptr, %195: ptr):
-    %794 = call @func.68(%195)
+    %794 = call @func.62(%195)
     br bb42(%189, %190, %191, %192, %193, %194, %794)
 bb42(%196: ptr, %197: ptr, %198: ptr, %199: ptr, %200: bool, %201: ptr, %202: bool):
     condbr %202, bb43(%197), bb45(%196, %197, %198, %199, %200, %201)
 bb43(%203: ptr):
-    call @func.66(%345, %203)
+    call @func.60(%345, %203)
     br bb44
 bb44:
     %795 = const i64 8
@@ -8783,12 +8798,12 @@ bb45(%204: ptr, %205: ptr, %206: ptr, %207: ptr, %208: bool, %209: ptr):
     %872 = gep i8, ptr %870, %871
     br bb46(%204, %205, %206, %207, %208, %872)
 bb46(%210: ptr, %211: ptr, %212: ptr, %213: ptr, %214: bool, %215: ptr):
-    %873 = call @func.69(%215)
+    %873 = call @func.63(%215)
     br bb47(%210, %211, %212, %213, %214, %873)
 bb47(%216: ptr, %217: ptr, %218: ptr, %219: ptr, %220: bool, %221: bool):
     condbr %221, bb48(%217), bb50(%216, %217, %218, %219, %220)
 bb48(%222: ptr):
-    call @func.66(%347, %222)
+    call @func.60(%347, %222)
     br bb49
 bb49:
     %874 = const i64 8
@@ -8893,7 +8908,7 @@ bb51(%228: ptr, %229: ptr, %230: ptr, %231: ptr, %232: bool, %233: ptr):
     call @func.16(%349, %230)
     br bb52(%228, %229, %230, %231, %232, %233)
 bb52(%234: ptr, %235: ptr, %236: ptr, %237: ptr, %238: bool, %239: ptr):
-    call @func.74(%348, %239, %349)
+    call @func.68(%348, %239, %349)
     br bb53(%234, %235, %236, %237, %238)
 bb53(%240: ptr, %241: ptr, %242: ptr, %243: ptr, %244: bool):
     %952 = load i64, ptr %348
@@ -8930,7 +8945,7 @@ bb54(%245: ptr):
     %977 = gep i8, ptr %350, %976
     %978 = load i64, ptr %975
     store i64 %978, ptr %977
-    call @func.66(%352, %245)
+    call @func.60(%352, %245)
     br bb55
 bb55:
     %979 = load i64, ptr %350
@@ -9098,7 +9113,7 @@ bb58(%256: ptr, %257: ptr, %258: ptr, %259: ptr, %260: bool, %261: ptr):
     call @func.16(%355, %258)
     br bb59(%256, %257, %259, %260, %261)
 bb59(%262: ptr, %263: ptr, %264: ptr, %265: bool, %266: ptr):
-    call @func.74(%354, %266, %355)
+    call @func.68(%354, %266, %355)
     br bb60(%262, %263, %264, %265)
 bb60(%267: ptr, %268: ptr, %269: ptr, %270: bool):
     %1108 = load i64, ptr %354
@@ -9135,7 +9150,7 @@ bb61(%271: ptr):
     %1133 = gep i8, ptr %356, %1132
     %1134 = load i64, ptr %1131
     store i64 %1134, ptr %1133
-    call @func.66(%358, %271)
+    call @func.60(%358, %271)
     br bb62
 bb62:
     %1135 = load i64, ptr %356
@@ -9286,7 +9301,7 @@ bb62:
     store i64 %1253, ptr %1252
     br bb84
 bb63(%272: ptr, %273: ptr, %274: ptr, %275: bool):
-    call @func.77(%360)
+    call @func.71(%360)
     br bb64(%272, %273, %274, %275)
 bb64(%276: ptr, %277: ptr, %278: ptr, %279: bool):
     %1254 = load ptr, ptr %278
@@ -9294,7 +9309,7 @@ bb64(%276: ptr, %277: ptr, %278: ptr, %279: bool):
     %1256 = gep i8, ptr %1254, %1255
     br bb65(%276, %277, %278, %279, %1256)
 bb65(%280: ptr, %281: ptr, %282: ptr, %283: bool, %284: ptr):
-    call @func.78(%362, %280, %284, %360)
+    call @func.72(%362, %280, %284, %360)
     br bb66(%280, %281, %282, %283)
 bb66(%285: ptr, %286: ptr, %287: ptr, %288: bool):
     %1257 = load i64, ptr %362
@@ -9328,7 +9343,7 @@ bb67(%289: ptr):
     %1279 = gep i8, ptr %364, %1278
     %1280 = load i64, ptr %1277
     store i64 %1280, ptr %1279
-    call @func.66(%366, %289)
+    call @func.60(%366, %289)
     br bb69
 bb68(%290: ptr, %291: ptr, %292: ptr, %293: bool):
     %1281 = const i64 8
@@ -9536,12 +9551,12 @@ bb69:
     store i64 %1444, ptr %1443
     br bb83
 bb70(%294: ptr, %295: ptr, %296: ptr, %297: bool):
-    %1445 = call @func.79(%361)
+    %1445 = call @func.73(%361)
     br bb71(%294, %295, %296, %1445, %297)
 bb71(%298: ptr, %299: ptr, %300: ptr, %301: bool, %302: bool):
     condbr %301, bb74(%298, %299, %300, %302), bb72(%299)
 bb72(%303: ptr):
-    call @func.66(%369, %303)
+    call @func.60(%369, %303)
     br bb73
 bb73:
     %1446 = const bool false
@@ -9712,7 +9727,7 @@ bb76(%312: ptr, %313: ptr, %314: ptr, %315: ptr, %316: bool):
     %1578 = gep i8, ptr %1576, %1577
     br bb77(%312, %313, %315, %1578, %316)
 bb77(%317: ptr, %318: ptr, %319: ptr, %320: ptr, %321: bool):
-    call @func.82(%371, %317, %319, %320, %360)
+    call @func.76(%371, %317, %319, %320, %360)
     br bb78(%318, %321)
 bb78(%322: ptr, %323: bool):
     %1579 = load i64, ptr %371
@@ -9749,7 +9764,7 @@ bb79(%324: ptr, %325: bool):
     %1604 = gep i8, ptr %372, %1603
     %1605 = load i64, ptr %1602
     store i64 %1605, ptr %1604
-    call @func.66(%374, %324)
+    call @func.60(%374, %324)
     br bb80(%325)
 bb80(%326: bool):
     %1606 = load i64, ptr %372
@@ -9937,7 +9952,7 @@ bb0(%0: ptr):
     %10 = gep i8, ptr %1, %9
     %11 = const u64 1
     store u64 %11, ptr %10
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -9990,7 +10005,7 @@ bb0(%0: ptr):
     store i64 %26, ptr %25
     %27 = const i64 5
     store i64 %27, ptr %1
-    call @func.49(%0, %1)
+    call @func.44(%0, %1)
     br bb1
 bb1:
     ret
@@ -10004,7 +10019,7 @@ bb0(%0: ptr, %1: u32):
     store u32 %1, ptr %4
     %5 = const i64 3
     store i64 %5, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb1
 bb1:
     ret
@@ -10233,7 +10248,7 @@ bb2:
     store ptr %176, ptr %178
     %179 = const i64 8
     store i64 %179, ptr %4
-    call @func.49(%0, %4)
+    call @func.44(%0, %4)
     br bb3
 bb3:
     ret
@@ -10243,13 +10258,13 @@ fn @nm2(functy.23) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
     %3 = alloca (i64, i64, i64, i64, i64), align 8
     %4 = alloca (i64, i64, i64, i64, i64), align 8
-    call @func.83(%4)
+    call @func.77(%4)
     br bb1
 bb1:
-    call @func.84(%3, %4, %1)
+    call @func.78(%3, %4, %1)
     br bb2
 bb2:
-    call @func.84(%0, %3, %2)
+    call @func.78(%0, %3, %2)
     br bb3
 bb3:
     ret
@@ -10273,7 +10288,7 @@ bb0(%0: ptr):
     %10 = gep i8, ptr %1, %9
     %11 = const u64 1
     store u64 %11, ptr %10
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -10297,7 +10312,7 @@ bb0(%0: ptr):
     %10 = gep i8, ptr %1, %9
     %11 = const u64 1
     store u64 %11, ptr %10
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -10475,7 +10490,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %5 = alloca (i64, i64, i64, i64, i64), align 8
     %6 = const bool false
     %7 = const bool true
-    call @func.85(%3, %1)
+    call @func.79(%3, %1)
     br bb1
 bb1:
     %8 = const bool false
@@ -10505,7 +10520,7 @@ bb1:
     %28 = gep i8, ptr %5, %27
     %29 = load i64, ptr %26
     store i64 %29, ptr %28
-    call @func.85(%4, %5)
+    call @func.79(%4, %5)
     br bb2
 bb2:
     %30 = load ptr, ptr %3
@@ -10554,16 +10569,10 @@ bb0(%0: ptr, %1: ptr):
     store i64 %25, ptr %24
     %26 = const i64 5
     store i64 %26, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3newBE_(functy.33) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE4pushBH_(functy.34) {
 }
 
 fn @params1(functy.35) {
@@ -10572,7 +10581,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = alloca (i64, i64, i64, i64, i64), align 8
     %4 = const bool false
     %5 = const bool true
-    call @func.33(%2)
+    call @func.26(%2)
     br bb1
 bb1:
     %6 = const bool false
@@ -10602,7 +10611,7 @@ bb1:
     %26 = gep i8, ptr %3, %25
     %27 = load i64, ptr %24
     store i64 %27, ptr %26
-    call @func.34(%2, %3)
+    call @func.27(%2, %3)
     br bb2
 bb2:
     %28 = load i64, ptr %2
@@ -10629,7 +10638,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %5 = alloca (i64, i64, i64, i64, i64), align 8
     %6 = const bool false
     %7 = const bool true
-    call @func.85(%3, %1)
+    call @func.79(%3, %1)
     br bb1
 bb1:
     %8 = const bool false
@@ -10659,7 +10668,7 @@ bb1:
     %28 = gep i8, ptr %5, %27
     %29 = load i64, ptr %26
     store i64 %29, ptr %28
-    call @func.85(%4, %5)
+    call @func.79(%4, %5)
     br bb2
 bb2:
     %30 = load ptr, ptr %3
@@ -10675,12 +10684,6 @@ bb2:
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3newBE_(functy.37) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE4pushBH_(functy.38) {
-}
-
 fn @params3(functy.39) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %4 = alloca (i64, i64, i64), align 8
@@ -10693,7 +10696,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %11 = const bool true
     %12 = const bool true
     %13 = const bool true
-    call @func.37(%4)
+    call @func.26(%4)
     br bb1
 bb1:
     %14 = const bool false
@@ -10723,7 +10726,7 @@ bb1:
     %34 = gep i8, ptr %5, %33
     %35 = load i64, ptr %32
     store i64 %35, ptr %34
-    call @func.38(%4, %5)
+    call @func.27(%4, %5)
     br bb2
 bb2:
     %36 = const bool false
@@ -10753,7 +10756,7 @@ bb2:
     %56 = gep i8, ptr %6, %55
     %57 = load i64, ptr %54
     store i64 %57, ptr %56
-    call @func.38(%4, %6)
+    call @func.27(%4, %6)
     br bb3
 bb3:
     %58 = const bool false
@@ -10783,7 +10786,7 @@ bb3:
     %78 = gep i8, ptr %7, %77
     %79 = load i64, ptr %76
     store i64 %79, ptr %78
-    call @func.38(%4, %7)
+    call @func.27(%4, %7)
     br bb4
 bb4:
     %80 = load i64, ptr %4
@@ -10803,12 +10806,9 @@ bb4:
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3newBE_(functy.40) {
-}
-
 fn @params0(functy.41) {
 bb0(%0: ptr):
-    call @func.40(%0)
+    call @func.26(%0)
     br bb1
 bb1:
     ret
@@ -10844,12 +10844,12 @@ bb4:
     br bb5
 bb5:
     %13 = const bool false
-    call @func.53(%3, %4, %5, %6)
+    call @func.47(%3, %4, %5, %6)
     br bb6
 bb6:
     %14 = const bool false
     %15 = const bool false
-    call @func.53(%0, %1, %2, %3)
+    call @func.47(%0, %1, %2, %3)
     br bb7
 bb7:
     %16 = const bool false
@@ -10932,12 +10932,12 @@ bb5:
     br bb6
 bb6:
     %14 = const bool false
-    call @func.53(%4, %5, %6, %7)
+    call @func.47(%4, %5, %6, %7)
     br bb7
 bb7:
     %15 = const bool false
     %16 = const bool false
-    call @func.53(%0, %1, %2, %4)
+    call @func.47(%0, %1, %2, %4)
     br bb8
 bb8:
     %17 = const bool false
@@ -10993,7 +10993,7 @@ bb8:
 fn @rsucc(functy.46) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
-    call @func.85(%2, %1)
+    call @func.79(%2, %1)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -11042,12 +11042,12 @@ bb6:
     br bb7
 bb7:
     %14 = const bool false
-    call @func.53(%4, %5, %6, %7)
+    call @func.47(%4, %5, %6, %7)
     br bb8
 bb8:
     %15 = const bool false
     %16 = const bool false
-    call @func.53(%0, %1, %2, %4)
+    call @func.47(%0, %1, %2, %4)
     br bb9
 bb9:
     %17 = const bool false
@@ -11075,7 +11075,7 @@ bb0(%0: ptr, %1: u64):
     store i64 %14, ptr %13
     %15 = const i64 11
     store i64 %15, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb1
 bb1:
     ret
@@ -11085,7 +11085,7 @@ fn @Expr__from_kind(functy.49) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
     %3 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.91(%2, %1)
+    call @func.83(%2, %1)
     br bb1
 bb1:
     %4 = load i64, ptr %1
@@ -11195,9 +11195,6 @@ bb1:
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.50) {
-}
-
 fn @Expr__cnst(functy.51) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
@@ -11229,7 +11226,7 @@ bb0(%0: ptr, %1: ptr):
     %24 = gep i8, ptr %3, %23
     %25 = load i64, ptr %22
     store i64 %25, ptr %24
-    call @func.50(%4)
+    call @func.10(%4)
     br bb1
 bb1:
     %26 = const i64 8
@@ -11278,7 +11275,7 @@ bb1:
     store i64 %61, ptr %60
     %62 = const i64 6
     store i64 %62, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb2
 bb2:
     ret
@@ -11333,7 +11330,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     store i64 %39, ptr %38
     %40 = const i64 6
     store i64 %40, ptr %3
-    call @func.49(%0, %3)
+    call @func.44(%0, %3)
     br bb1
 bb1:
     ret
@@ -11562,7 +11559,7 @@ bb2:
     store ptr %176, ptr %178
     %179 = const i64 9
     store i64 %179, ptr %4
-    call @func.49(%0, %4)
+    call @func.44(%0, %4)
     br bb3
 bb3:
     ret
@@ -11571,10 +11568,10 @@ bb3:
 fn @nm1(functy.54) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca (i64, i64, i64, i64, i64), align 8
-    call @func.83(%2)
+    call @func.77(%2)
     br bb1
 bb1:
-    call @func.84(%0, %2, %1)
+    call @func.78(%0, %2, %1)
     br bb2
 bb2:
     ret
@@ -11981,7 +11978,7 @@ bb3(%8: bool):
     %327 = const i64 64
     %328 = gep i8, ptr %9, %327
     store bool %8, ptr %328
-    call @func.49(%0, %9)
+    call @func.44(%0, %9)
     br bb4
 bb4:
     ret
@@ -12200,7 +12197,7 @@ bb2:
     store ptr %167, ptr %169
     %170 = const i64 7
     store i64 %170, ptr %3
-    call @func.49(%0, %3)
+    call @func.44(%0, %3)
     br bb3
 bb3:
     ret
@@ -12352,7 +12349,7 @@ bb0(%0: ptr):
     call @func.23(%1, %2, %3)
     br bb1
 bb1:
-    call @func.41(%4)
+    call @func.36(%4)
     br bb2
 bb2:
     call @func.19(%7)
@@ -12377,7 +12374,7 @@ bb7:
     br bb8
 bb8:
     %129 = const bool false
-    call @func.53(%11, %12, %13, %14)
+    call @func.47(%11, %12, %13, %14)
     br bb9
 bb9:
     %130 = const bool true
@@ -12414,7 +12411,7 @@ bb16:
     br bb17
 bb17:
     %139 = const bool false
-    call @func.56(%25, %26, %27)
+    call @func.50(%25, %26, %27)
     br bb18
 bb18:
     %140 = const bool true
@@ -12423,7 +12420,7 @@ bb18:
     br bb19
 bb19:
     %142 = const bool false
-    call @func.53(%23, %24, %25, %28)
+    call @func.47(%23, %24, %25, %28)
     br bb20
 bb20:
     %143 = const bool true
@@ -12441,7 +12438,7 @@ bb22:
     br bb23
 bb23:
     %148 = const bool false
-    call @func.56(%31, %32, %33)
+    call @func.50(%31, %32, %33)
     br bb24
 bb24:
     %149 = const bool true
@@ -12450,32 +12447,32 @@ bb24:
     br bb25
 bb25:
     %151 = const bool false
-    call @func.53(%29, %30, %31, %34)
+    call @func.47(%29, %30, %31, %34)
     br bb26
 bb26:
     %152 = const bool false
     %153 = const bool false
-    call @func.53(%21, %22, %23, %29)
+    call @func.47(%21, %22, %23, %29)
     br bb27
 bb27:
     %154 = const bool false
     %155 = const bool false
-    call @func.53(%18, %19, %20, %21)
+    call @func.47(%18, %19, %20, %21)
     br bb28
 bb28:
     %156 = const bool false
     %157 = const bool false
-    call @func.53(%15, %16, %17, %18)
+    call @func.47(%15, %16, %17, %18)
     br bb29
 bb29:
     %158 = const bool false
     %159 = const bool false
-    call @func.53(%9, %10, %11, %15)
+    call @func.47(%9, %10, %11, %15)
     br bb30
 bb30:
     %160 = const bool false
     %161 = const bool false
-    call @func.53(%6, %7, %8, %9)
+    call @func.47(%6, %7, %8, %9)
     br bb31
 bb31:
     %162 = const bool false
@@ -12570,7 +12567,7 @@ bb37:
     br bb38
 bb38:
     %220 = const bool false
-    call @func.53(%41, %42, %43, %44)
+    call @func.47(%41, %42, %43, %44)
     br bb39
 bb39:
     %221 = const bool true
@@ -12607,7 +12604,7 @@ bb46:
     br bb47
 bb47:
     %230 = const bool false
-    call @func.56(%55, %56, %57)
+    call @func.50(%55, %56, %57)
     br bb48
 bb48:
     %231 = const bool true
@@ -12616,7 +12613,7 @@ bb48:
     br bb49
 bb49:
     %233 = const bool false
-    call @func.53(%53, %54, %55, %58)
+    call @func.47(%53, %54, %55, %58)
     br bb50
 bb50:
     %234 = const bool true
@@ -12634,7 +12631,7 @@ bb52:
     br bb53
 bb53:
     %239 = const bool false
-    call @func.56(%61, %62, %63)
+    call @func.50(%61, %62, %63)
     br bb54
 bb54:
     %240 = const bool true
@@ -12649,7 +12646,7 @@ bb55:
     br bb56
 bb56:
     %245 = const bool false
-    call @func.56(%64, %65, %66)
+    call @func.50(%64, %65, %66)
     br bb57
 bb57:
     %246 = const bool false
@@ -12915,7 +12912,7 @@ bb2:
     %92 = const i64 8
     %93 = gep i8, ptr %91, %92
     %94 = load u32, ptr %90
-    call @func.60(%44, %93)
+    call @func.54(%44, %93)
     br bb32(%94)
 bb3:
     %95 = load ptr, ptr %24
@@ -12927,13 +12924,13 @@ bb3:
     %101 = load ptr, ptr %24
     %102 = const i64 48
     %103 = gep i8, ptr %101, %102
-    call @func.66(%42, %97)
+    call @func.60(%42, %97)
     br bb30(%100, %103)
 bb4:
     %104 = load ptr, ptr %24
     %105 = const i64 8
     %106 = gep i8, ptr %104, %105
-    call @func.92(%41, %106)
+    call @func.84(%41, %106)
     br bb29
 bb5:
     %107 = load ptr, ptr %24
@@ -12949,7 +12946,7 @@ bb5:
     %117 = load ptr, ptr %24
     %118 = const i64 64
     %119 = gep i8, ptr %117, %118
-    call @func.66(%37, %107)
+    call @func.60(%37, %107)
     br bb25(%110, %113, %116, %119)
 bb6:
     %120 = load ptr, ptr %24
@@ -12961,7 +12958,7 @@ bb6:
     %126 = load ptr, ptr %24
     %127 = const i64 16
     %128 = gep i8, ptr %126, %127
-    call @func.93(%34, %122)
+    call @func.85(%34, %122)
     br bb22(%125, %128)
 bb7:
     %129 = load ptr, ptr %24
@@ -12973,7 +12970,7 @@ bb7:
     %135 = load ptr, ptr %24
     %136 = const i64 16
     %137 = gep i8, ptr %135, %136
-    call @func.93(%31, %131)
+    call @func.85(%31, %131)
     br bb19(%134, %137)
 bb8:
     %138 = load ptr, ptr %24
@@ -12982,7 +12979,7 @@ bb8:
     %141 = load ptr, ptr %24
     %142 = const i64 16
     %143 = gep i8, ptr %141, %142
-    call @func.60(%29, %140)
+    call @func.54(%29, %140)
     br bb17(%143)
 bb9:
     %144 = load ptr, ptr %24
@@ -12991,19 +12988,19 @@ bb9:
     %147 = load ptr, ptr %24
     %148 = const i64 48
     %149 = gep i8, ptr %147, %148
-    call @func.66(%27, %146)
+    call @func.60(%27, %146)
     br bb15(%149)
 bb10:
     %150 = load ptr, ptr %24
     %151 = const i64 8
     %152 = gep i8, ptr %150, %151
-    call @func.95(%26, %152)
+    call @func.87(%26, %152)
     br bb14
 bb11:
     %153 = load ptr, ptr %24
     %154 = const i64 8
     %155 = gep i8, ptr %153, %154
-    call @func.96(%25, %155)
+    call @func.88(%25, %155)
     br bb13
 bb12:
     %156 = load ptr, ptr %24
@@ -13057,7 +13054,7 @@ bb14:
     store i64 %190, ptr %0
     br bb33
 bb15(%2: ptr):
-    call @func.61(%28, %2)
+    call @func.55(%28, %2)
     br bb16
 bb16:
     %191 = const i64 8
@@ -13108,7 +13105,7 @@ bb16:
     store i64 %227, ptr %0
     br bb33
 bb17(%3: ptr):
-    call @func.60(%30, %3)
+    call @func.54(%30, %3)
     br bb18
 bb18:
     %228 = load ptr, ptr %29
@@ -13123,10 +13120,10 @@ bb18:
     store i64 %234, ptr %0
     br bb33
 bb19(%4: ptr, %5: ptr):
-    call @func.60(%32, %4)
+    call @func.54(%32, %4)
     br bb20(%5)
 bb20(%6: ptr):
-    call @func.60(%33, %6)
+    call @func.54(%33, %6)
     br bb21
 bb21:
     %235 = const i64 24
@@ -13151,10 +13148,10 @@ bb21:
     store i64 %249, ptr %0
     br bb33
 bb22(%7: ptr, %8: ptr):
-    call @func.60(%35, %7)
+    call @func.54(%35, %7)
     br bb23(%8)
 bb23(%9: ptr):
-    call @func.60(%36, %9)
+    call @func.54(%36, %9)
     br bb24
 bb24:
     %250 = const i64 24
@@ -13179,13 +13176,13 @@ bb24:
     store i64 %264, ptr %0
     br bb33
 bb25(%10: ptr, %11: ptr, %12: ptr, %13: ptr):
-    call @func.60(%38, %10)
+    call @func.54(%38, %10)
     br bb26(%11, %12, %13)
 bb26(%14: ptr, %15: ptr, %16: ptr):
-    call @func.60(%39, %14)
+    call @func.54(%39, %14)
     br bb27(%15, %16)
 bb27(%17: ptr, %18: ptr):
-    call @func.60(%40, %17)
+    call @func.54(%40, %17)
     br bb28(%18)
 bb28(%19: ptr):
     %265 = load bool, ptr %19
@@ -13247,7 +13244,7 @@ bb29:
     br bb33
 bb30(%20: ptr, %21: ptr):
     %307 = load u32, ptr %20
-    call @func.60(%43, %21)
+    call @func.54(%43, %21)
     br bb31(%307)
 bb31(%22: u32):
     %308 = const i64 8
@@ -13428,16 +13425,16 @@ bb9:
     %103 = load ptr, ptr %35
     %104 = const i64 16
     %105 = gep i8, ptr %103, %104
-    call @func.64(%26, %93)
+    call @func.58(%26, %93)
     br bb11(%89, %99, %105)
 bb10:
     %106 = const bool true
     br bb22(%106)
 bb11(%4: ptr, %5: ptr, %6: ptr):
-    call @func.64(%27, %6)
+    call @func.58(%27, %6)
     br bb12(%4, %5)
 bb12(%7: ptr, %8: ptr):
-    %107 = call @func.97(%26, %27)
+    %107 = call @func.89(%26, %27)
     br bb13(%7, %8, %107)
 bb13(%9: ptr, %10: ptr, %11: bool):
     condbr %11, bb14(%9, %10), bb15
@@ -13487,7 +13484,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = alloca (i64, i64, i64, i64), align 8
     store ptr %1, ptr %2
     %4 = load ptr, ptr %2
-    call @func.100(%3, %4)
+    call @func.92(%3, %4)
     br bb1
 bb1:
     %5 = load ptr, ptr %2
@@ -13528,7 +13525,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.101(%6)
+    %7 = call @func.93(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -13542,7 +13539,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.102(%6)
+    %7 = call @func.94(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -13556,7 +13553,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.103(%6)
+    %7 = call @func.95(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -13600,7 +13597,7 @@ bb1(%3: ptr):
     %71 = icmp eq u64 %69, %70
     condbr %71, bb42(%3, %64), bb48
 bb2:
-    call @func.70(%55, %53)
+    call @func.64(%55, %53)
     br bb3
 bb3:
     %72 = load i64, ptr %55
@@ -13612,7 +13609,7 @@ bb3:
     switch %77 [ 1: bb4 0: bb39 default: bb6 ]
 bb4:
     %78 = load ptr, ptr %55
-    %79 = call @func.104(%78)
+    %79 = call @func.96(%78)
     store ptr %79, ptr %56
     br bb5
 bb5:
@@ -13723,7 +13720,7 @@ bb14:
     %166 = load ptr, ptr %56
     %167 = const i64 8
     %168 = gep i8, ptr %166, %167
-    call @func.107(%57, %168, %2)
+    call @func.99(%57, %168, %2)
     br bb15
 bb15:
     %169 = load i64, ptr %57
@@ -13788,16 +13785,16 @@ bb16:
     store i64 %216, ptr %215
     br bb40
 bb17(%4: ptr, %5: u64):
-    %217 = call @func.71(%4)
+    %217 = call @func.65(%4)
     br bb18(%4, %5, %5, %217)
 bb18(%6: ptr, %7: u64, %8: u64, %9: u64):
     %218 = icmp ult u64 %8, %9
     condbr %218, bb19(%6, %7), bb2
 bb19(%10: ptr, %11: u64):
-    %219 = call @func.72(%10, %11)
+    %219 = call @func.66(%10, %11)
     br bb20(%10, %11, %219)
 bb20(%12: ptr, %13: u64, %14: ptr):
-    call @func.107(%59, %14, %2)
+    call @func.99(%59, %14, %2)
     br bb21(%12, %13)
 bb21(%15: ptr, %16: u64):
     %220 = load i64, ptr %59
@@ -13878,7 +13875,7 @@ bb24(%19: ptr):
     %278 = load u64, ptr %61
     br bb17(%19, %278)
 bb25(%20: ptr, %21: ptr, %22: ptr):
-    call @func.73(%21, %22)
+    call @func.67(%21, %22)
     br bb26(%20)
 bb26(%23: ptr):
     %279 = load ptr, ptr %23
@@ -13886,7 +13883,7 @@ bb26(%23: ptr):
     %281 = gep i8, ptr %279, %280
     br bb27(%53, %281)
 bb27(%24: ptr, %25: ptr):
-    call @func.73(%24, %25)
+    call @func.67(%24, %25)
     br bb44
 bb28(%26: ptr, %27: ptr):
     %282 = load ptr, ptr %27
@@ -13894,7 +13891,7 @@ bb28(%26: ptr, %27: ptr):
     %284 = gep i8, ptr %282, %283
     br bb29(%26, %53, %284)
 bb29(%28: ptr, %29: ptr, %30: ptr):
-    call @func.73(%29, %30)
+    call @func.67(%29, %30)
     br bb30(%28)
 bb30(%31: ptr):
     %285 = load ptr, ptr %31
@@ -13902,10 +13899,10 @@ bb30(%31: ptr):
     %287 = gep i8, ptr %285, %286
     br bb31(%53, %287)
 bb31(%32: ptr, %33: ptr):
-    call @func.73(%32, %33)
+    call @func.67(%32, %33)
     br bb45
 bb32(%34: ptr, %35: ptr, %36: ptr, %37: ptr):
-    call @func.73(%36, %37)
+    call @func.67(%36, %37)
     br bb33(%34, %35)
 bb33(%38: ptr, %39: ptr):
     %288 = load ptr, ptr %39
@@ -13913,7 +13910,7 @@ bb33(%38: ptr, %39: ptr):
     %290 = gep i8, ptr %288, %289
     br bb34(%38, %53, %290)
 bb34(%40: ptr, %41: ptr, %42: ptr):
-    call @func.73(%41, %42)
+    call @func.67(%41, %42)
     br bb35(%40)
 bb35(%43: ptr):
     %291 = load ptr, ptr %43
@@ -13921,7 +13918,7 @@ bb35(%43: ptr):
     %293 = gep i8, ptr %291, %292
     br bb36(%53, %293)
 bb36(%44: ptr, %45: ptr):
-    call @func.73(%44, %45)
+    call @func.67(%44, %45)
     br bb46
 bb37(%46: ptr):
     %294 = load ptr, ptr %46
@@ -13929,7 +13926,7 @@ bb37(%46: ptr):
     %296 = gep i8, ptr %294, %295
     br bb38(%53, %296)
 bb38(%47: ptr, %48: ptr):
-    call @func.73(%47, %48)
+    call @func.67(%47, %48)
     br bb47
 bb39:
     %297 = const i64 3
@@ -13986,10 +13983,10 @@ fn @LocalContext__new(functy.77) {
 bb0(%0: ptr):
     %1 = alloca (i64, i64, i64), align 8
     %2 = alloca (i64, i64, i64), align 8
-    call @func.75(%1)
+    call @func.69(%1)
     br bb1
 bb1:
-    call @func.76(%2)
+    call @func.70(%2)
     br bb2
 bb2:
     %3 = load i64, ptr %1
@@ -14036,7 +14033,7 @@ bb2:
 fn @Verifier____env___infer_sort(functy.78) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %4 = const u32 0
-    call @func.112(%0, %1, %2, %4, %3)
+    call @func.102(%0, %1, %2, %4, %3)
     br bb1
 bb1:
     ret
@@ -14094,7 +14091,7 @@ bb5:
     %45 = const bool true
     br bb12(%45)
 bb6(%1: ptr, %2: ptr):
-    %46 = call @func.79(%2)
+    %46 = call @func.73(%2)
     br bb7(%1, %46)
 bb7(%3: ptr, %4: bool):
     condbr %4, bb8(%3), bb9
@@ -14107,10 +14104,10 @@ bb9:
     %50 = const bool false
     br bb12(%50)
 bb10(%6: ptr):
-    %51 = call @func.79(%6)
+    %51 = call @func.73(%6)
     br bb12(%51)
 bb11(%7: ptr):
-    %52 = call @func.79(%7)
+    %52 = call @func.73(%7)
     br bb12(%52)
 bb12(%8: bool):
     ret %8
@@ -14135,10 +14132,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr, %4: ptr):
     %29 = alloca i64, align 8
     %30 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %31 = const bool false
-    call @func.117(%23, %1, %2, %4)
+    call @func.104(%23, %1, %2, %4)
     br bb1(%1, %3, %4)
 bb1(%5: ptr, %6: ptr, %7: ptr):
-    call @func.80(%22, %23)
+    call @func.74(%22, %23)
     br bb2(%5, %6, %7)
 bb2(%8: ptr, %9: ptr, %10: ptr):
     %32 = load i64, ptr %22
@@ -14264,7 +14261,7 @@ bb4(%11: ptr, %12: ptr, %13: ptr):
     %129 = gep i8, ptr %21, %128
     %130 = load i64, ptr %127
     store i64 %130, ptr %129
-    %131 = call @func.118(%11, %21, %12, %13)
+    %131 = call @func.105(%11, %21, %12, %13)
     br bb7(%12, %131, %84)
 bb5:
     %132 = const i64 8
@@ -14295,7 +14292,7 @@ bb5:
     %153 = gep i8, ptr %24, %152
     %154 = load i64, ptr %151
     store i64 %154, ptr %153
-    call @func.81(%0, %24)
+    call @func.75(%0, %24)
     br bb6
 bb6:
     %155 = const bool false
@@ -14592,7 +14589,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %6 = alloca (i64, i64, i64, i64, i64), align 8
     %7 = const bool false
     %8 = const bool true
-    call @func.119(%4, %2)
+    call @func.106(%4, %2)
     br bb1
 bb1:
     %9 = load bool, ptr %4
@@ -14628,7 +14625,7 @@ bb2(%3: u64):
     %33 = gep i8, ptr %5, %32
     %34 = load i64, ptr %31
     store i64 %34, ptr %33
-    call @func.120(%0, %5, %3)
+    call @func.107(%0, %5, %3)
     br bb5
 bb3:
     %35 = const bool false
@@ -14658,7 +14655,7 @@ bb3:
     %55 = gep i8, ptr %6, %54
     %56 = load i64, ptr %53
     store i64 %56, ptr %55
-    call @func.122(%0, %6, %2)
+    call @func.109(%0, %6, %2)
     br bb6
 bb4:
     ret
@@ -14716,12 +14713,6 @@ fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.86) {
 }
 
 fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.87) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.88) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.89) {
 }
 
 fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.90) {
@@ -14818,7 +14809,7 @@ bb4:
     %284 = load ptr, ptr %207
     %285 = const i64 8
     %286 = gep i8, ptr %284, %285
-    %287 = call @func.123(%286)
+    %287 = call @func.110(%286)
     br bb61(%287)
 bb5:
     %288 = load ptr, ptr %207
@@ -14841,13 +14832,13 @@ bb6:
     %303 = load ptr, ptr %207
     %304 = const i64 48
     %305 = gep i8, ptr %303, %304
-    %306 = call @func.124(%302)
+    %306 = call @func.111(%302)
     br bb32(%305, %306)
 bb7:
     %307 = load ptr, ptr %207
     %308 = const i64 8
     %309 = gep i8, ptr %307, %308
-    %310 = call @func.125(%309)
+    %310 = call @func.112(%309)
     br bb28(%309, %310)
 bb8:
     %311 = load ptr, ptr %207
@@ -14855,7 +14846,7 @@ bb8:
     %313 = gep i8, ptr %311, %312
     %314 = load u64, ptr %313
     %315 = const u64 13
-    %316 = call @func.127(%315, %314)
+    %316 = call @func.114(%315, %314)
     br bb27(%316)
 bb9:
     %317 = load ptr, ptr %207
@@ -14903,13 +14894,13 @@ bb12:
     %353 = load u32, ptr %352
     %354 = zext u32 %353 to u64
     %355 = const u64 7
-    %356 = call @func.127(%355, %354)
+    %356 = call @func.114(%355, %354)
     br bb13(%352, %356)
 bb13(%2: ptr, %3: u64):
     %357 = trunc u64 %3 to u32
     %358 = load u32, ptr %2
     %359 = const u32 1
-    %360 = call @func.86(%358, %359)
+    %360 = call @func.80(%358, %359)
     br bb14(%357, %360)
 bb14(%4: u32, %5: u32):
     %361 = const u32 0
@@ -14917,10 +14908,10 @@ bb14(%4: u32, %5: u32):
     %363 = const bool false
     %364 = const bool false
     %365 = const bool false
-    call @func.129(%0, %4, %5, %361, %362, %363, %364, %365)
+    call @func.115(%0, %4, %5, %361, %362, %363, %364, %365)
     br bb80
 bb15(%6: ptr, %7: ptr):
-    call @func.130(%208, %7)
+    call @func.116(%208, %7)
     br bb16(%6)
 bb16(%8: ptr):
     %366 = load ptr, ptr %8
@@ -14928,15 +14919,15 @@ bb16(%8: ptr):
     %368 = gep i8, ptr %366, %367
     br bb17(%368)
 bb17(%9: ptr):
-    call @func.130(%209, %9)
+    call @func.116(%209, %9)
     br bb18
 bb18:
     %369 = load u64, ptr %208
     %370 = load u64, ptr %209
-    call @func.134(%0, %369, %370)
+    call @func.119(%0, %369, %370)
     br bb80
 bb19(%10: ptr, %11: ptr):
-    call @func.130(%210, %11)
+    call @func.116(%210, %11)
     br bb20(%10)
 bb20(%12: ptr):
     %371 = load ptr, ptr %12
@@ -14944,16 +14935,16 @@ bb20(%12: ptr):
     %373 = gep i8, ptr %371, %372
     br bb21(%373)
 bb21(%13: ptr):
-    call @func.130(%211, %13)
+    call @func.116(%211, %13)
     br bb22
 bb22:
     %374 = load u64, ptr %210
     %375 = load u64, ptr %211
     %376 = const u64 0
-    call @func.139(%0, %374, %375, %376)
+    call @func.121(%0, %374, %375, %376)
     br bb80
 bb23(%14: ptr, %15: ptr):
-    call @func.130(%212, %15)
+    call @func.116(%212, %15)
     br bb24(%14)
 bb24(%16: ptr):
     %377 = load ptr, ptr %16
@@ -14961,13 +14952,13 @@ bb24(%16: ptr):
     %379 = gep i8, ptr %377, %378
     br bb25(%379)
 bb25(%17: ptr):
-    call @func.130(%213, %17)
+    call @func.116(%213, %17)
     br bb26
 bb26:
     %380 = load u64, ptr %212
     %381 = load u64, ptr %213
     %382 = const u64 1
-    call @func.139(%0, %380, %381, %382)
+    call @func.121(%0, %380, %381, %382)
     br bb80
 bb27(%18: u64):
     %383 = trunc u64 %18 to u32
@@ -14977,47 +14968,47 @@ bb27(%18: u64):
     %387 = const bool false
     %388 = const bool false
     %389 = const bool false
-    call @func.129(%0, %383, %384, %385, %386, %387, %388, %389)
+    call @func.115(%0, %383, %384, %385, %386, %387, %388, %389)
     br bb80
 bb28(%19: ptr, %20: u64):
     %390 = const u64 11
-    %391 = call @func.127(%390, %20)
+    %391 = call @func.114(%390, %20)
     br bb29(%19, %391)
 bb29(%21: ptr, %22: u64):
     %392 = trunc u64 %22 to u32
-    %393 = call @func.140(%21)
+    %393 = call @func.122(%21)
     br bb30(%21, %392, %393)
 bb30(%23: ptr, %24: u32, %25: bool):
-    %394 = call @func.141(%23)
+    %394 = call @func.123(%23)
     br bb31(%24, %25, %394)
 bb31(%26: u32, %27: bool, %28: bool):
     %395 = const u32 0
     %396 = const u32 0
     %397 = const bool false
     %398 = const bool false
-    call @func.129(%0, %26, %395, %396, %397, %398, %27, %28)
+    call @func.115(%0, %26, %395, %396, %397, %398, %27, %28)
     br bb80
 bb32(%29: ptr, %30: u64):
-    call @func.87(%214, %29)
+    call @func.81(%214, %29)
     br bb33(%29, %30)
 bb33(%31: ptr, %32: u64):
-    %399 = call @func.142(%214)
+    %399 = call @func.124(%214)
     br bb34(%31, %32, %399)
 bb34(%33: ptr, %34: u64, %35: u64):
     %400 = const bool false
     %401 = const u64 0
     br bb35(%33, %34, %35, %400, %401)
 bb35(%36: ptr, %37: u64, %38: u64, %39: bool, %40: u64):
-    %402 = call @func.88(%36)
+    %402 = call @func.65(%36)
     br bb36(%36, %37, %38, %39, %40, %40, %402)
 bb36(%41: ptr, %42: u64, %43: u64, %44: bool, %45: u64, %46: u64, %47: u64):
     %403 = icmp ult u64 %46, %47
     condbr %403, bb37(%41, %42, %43, %44, %45), bb43(%41, %42, %43, %44)
 bb37(%48: ptr, %49: u64, %50: u64, %51: bool, %52: u64):
-    %404 = call @func.89(%48, %52)
+    %404 = call @func.66(%48, %52)
     br bb38(%48, %49, %50, %51, %52, %404)
 bb38(%53: ptr, %54: u64, %55: u64, %56: bool, %57: u64, %58: ptr):
-    %405 = call @func.141(%58)
+    %405 = call @func.123(%58)
     br bb39(%53, %54, %55, %56, %57, %405)
 bb39(%59: ptr, %60: u64, %61: u64, %62: bool, %63: u64, %64: bool):
     condbr %64, bb40(%59, %60, %61), bb41(%59, %60, %61, %62, %63)
@@ -15045,16 +15036,16 @@ bb43(%77: ptr, %78: u64, %79: u64, %80: bool):
     %419 = const u64 0
     br bb44(%77, %78, %79, %80, %418, %419)
 bb44(%81: ptr, %82: u64, %83: u64, %84: bool, %85: bool, %86: u64):
-    %420 = call @func.88(%81)
+    %420 = call @func.65(%81)
     br bb45(%81, %82, %83, %84, %85, %86, %86, %420)
 bb45(%87: ptr, %88: u64, %89: u64, %90: bool, %91: bool, %92: u64, %93: u64, %94: u64):
     %421 = icmp ult u64 %93, %94
     condbr %421, bb46(%87, %88, %89, %90, %91, %92), bb52(%88, %89, %90, %91)
 bb46(%95: ptr, %96: u64, %97: u64, %98: bool, %99: bool, %100: u64):
-    %422 = call @func.89(%95, %100)
+    %422 = call @func.66(%95, %100)
     br bb47(%95, %96, %97, %98, %99, %100, %422)
 bb47(%101: ptr, %102: u64, %103: u64, %104: bool, %105: bool, %106: u64, %107: ptr):
-    %423 = call @func.140(%107)
+    %423 = call @func.122(%107)
     br bb48(%101, %102, %103, %104, %105, %106, %423)
 bb48(%108: ptr, %109: u64, %110: u64, %111: bool, %112: bool, %113: u64, %114: bool):
     condbr %114, bb49(%109, %110, %111), bb50(%108, %109, %110, %111, %112, %113)
@@ -15078,11 +15069,11 @@ bb51(%124: ptr, %125: u64, %126: u64, %127: bool, %128: bool):
     %435 = load u64, ptr %216
     br bb44(%124, %125, %126, %127, %128, %435)
 bb52(%129: u64, %130: u64, %131: bool, %132: bool):
-    %436 = call @func.127(%129, %130)
+    %436 = call @func.114(%129, %130)
     br bb53(%131, %132, %436)
 bb53(%133: bool, %134: bool, %135: u64):
     %437 = const u64 5
-    %438 = call @func.127(%437, %135)
+    %438 = call @func.114(%437, %135)
     br bb54(%133, %134, %438)
 bb54(%136: bool, %137: bool, %138: u64):
     %439 = trunc u64 %138 to u32
@@ -15090,10 +15081,10 @@ bb54(%136: bool, %137: bool, %138: u64):
     %441 = const u32 0
     %442 = const bool false
     %443 = const bool false
-    call @func.129(%0, %439, %440, %441, %442, %443, %137, %136)
+    call @func.115(%0, %439, %440, %441, %442, %443, %137, %136)
     br bb80
 bb55(%139: ptr, %140: ptr, %141: ptr):
-    call @func.130(%217, %141)
+    call @func.116(%217, %141)
     br bb56(%139, %140)
 bb56(%142: ptr, %143: ptr):
     %444 = load ptr, ptr %142
@@ -15101,7 +15092,7 @@ bb56(%142: ptr, %143: ptr):
     %446 = gep i8, ptr %444, %445
     br bb57(%143, %446)
 bb57(%144: ptr, %145: ptr):
-    call @func.130(%218, %145)
+    call @func.116(%218, %145)
     br bb58(%144)
 bb58(%146: ptr):
     %447 = load ptr, ptr %146
@@ -15109,17 +15100,17 @@ bb58(%146: ptr):
     %449 = gep i8, ptr %447, %448
     br bb59(%449)
 bb59(%147: ptr):
-    call @func.130(%219, %147)
+    call @func.116(%219, %147)
     br bb60
 bb60:
     %450 = load u64, ptr %217
     %451 = load u64, ptr %218
     %452 = load u64, ptr %219
-    call @func.147(%0, %450, %451, %452)
+    call @func.125(%0, %450, %451, %452)
     br bb80
 bb61(%148: u64):
     %453 = const u64 3
-    %454 = call @func.127(%453, %148)
+    %454 = call @func.114(%453, %148)
     br bb62(%454)
 bb62(%149: u64):
     %455 = trunc u64 %149 to u32
@@ -15129,14 +15120,14 @@ bb62(%149: u64):
     %459 = const bool false
     %460 = const bool false
     %461 = const bool false
-    call @func.129(%0, %455, %456, %457, %458, %459, %460, %461)
+    call @func.115(%0, %455, %456, %457, %458, %459, %460, %461)
     br bb80
 bb63(%150: ptr, %151: ptr, %152: ptr):
-    call @func.130(%220, %152)
+    call @func.116(%220, %152)
     br bb64(%150, %151)
 bb64(%153: ptr, %154: ptr):
     %462 = load u64, ptr %220
-    %463 = call @func.148(%462)
+    %463 = call @func.126(%462)
     br bb65(%153, %154, %463)
 bb65(%155: ptr, %156: ptr, %157: u8):
     %464 = zext u8 %157 to u32
@@ -15155,59 +15146,59 @@ bb65(%155: ptr, %156: ptr, %157: u8):
 bb66(%158: ptr, %159: ptr):
     %475 = load u32, ptr %221
     %476 = const u32 255
-    %477 = call @func.90(%475, %476)
+    %477 = call @func.82(%475, %476)
     br bb67(%158, %159, %477)
 bb67(%160: ptr, %161: ptr, %162: u32):
     %478 = zext u32 %162 to u64
-    %479 = call @func.124(%160)
+    %479 = call @func.111(%160)
     br bb68(%161, %162, %478, %479)
 bb68(%163: ptr, %164: u32, %165: u64, %166: u64):
     %480 = load u32, ptr %163
     %481 = zext u32 %480 to u64
     %482 = load u64, ptr %220
-    %483 = call @func.149(%482)
+    %483 = call @func.127(%482)
     br bb69(%164, %165, %166, %481, %483)
 bb69(%167: u32, %168: u64, %169: u64, %170: u64, %171: u32):
     %484 = zext u32 %171 to u64
-    %485 = call @func.127(%170, %484)
+    %485 = call @func.114(%170, %484)
     br bb70(%167, %168, %169, %485)
 bb70(%172: u32, %173: u64, %174: u64, %175: u64):
-    %486 = call @func.127(%174, %175)
+    %486 = call @func.114(%174, %175)
     br bb71(%172, %173, %486)
 bb71(%176: u32, %177: u64, %178: u64):
-    %487 = call @func.127(%177, %178)
+    %487 = call @func.114(%177, %178)
     br bb72(%176, %487)
 bb72(%179: u32, %180: u64):
     %488 = trunc u64 %180 to u32
     %489 = load u64, ptr %220
-    %490 = call @func.150(%489)
+    %490 = call @func.128(%489)
     br bb73(%179, %488, %490)
 bb73(%181: u32, %182: u32, %183: u32):
     %491 = load u64, ptr %220
-    %492 = call @func.103(%491)
+    %492 = call @func.95(%491)
     br bb74(%181, %182, %183, %492)
 bb74(%184: u32, %185: u32, %186: u32, %187: bool):
     %493 = load u64, ptr %220
-    %494 = call @func.101(%493)
+    %494 = call @func.93(%493)
     br bb75(%184, %185, %186, %187, %494)
 bb75(%188: u32, %189: u32, %190: u32, %191: bool, %192: bool):
     %495 = load u64, ptr %220
-    %496 = call @func.102(%495)
+    %496 = call @func.94(%495)
     br bb76(%188, %189, %190, %191, %192, %496)
 bb76(%193: u32, %194: u32, %195: u32, %196: bool, %197: bool, %198: bool):
     %497 = load u64, ptr %220
-    %498 = call @func.151(%497)
+    %498 = call @func.129(%497)
     br bb77(%193, %194, %195, %196, %197, %198, %498)
 bb77(%199: u32, %200: u32, %201: u32, %202: bool, %203: bool, %204: bool, %205: bool):
-    call @func.129(%0, %200, %201, %199, %202, %203, %204, %205)
+    call @func.115(%0, %200, %201, %199, %202, %203, %204, %205)
     br bb80
 bb78(%206: ptr):
-    call @func.130(%222, %206)
+    call @func.116(%222, %206)
     br bb79
 bb79:
     %499 = load u64, ptr %222
     %500 = const u64 0
-    call @func.153(%0, %499, %500)
+    call @func.130(%0, %499, %500)
     br bb80
 bb80:
     ret
@@ -15301,7 +15292,7 @@ bb1:
     unreachable
 bb2:
     %30 = load ptr, ptr %4
-    call @func.66(%10, %30)
+    call @func.60(%10, %30)
     br bb12
 bb3:
     %31 = load ptr, ptr %4
@@ -15310,7 +15301,7 @@ bb3:
     %34 = load ptr, ptr %4
     %35 = const i64 16
     %36 = gep i8, ptr %34, %35
-    call @func.94(%8, %33)
+    call @func.86(%8, %33)
     br bb10(%36)
 bb4:
     %37 = load ptr, ptr %4
@@ -15319,13 +15310,13 @@ bb4:
     %40 = load ptr, ptr %4
     %41 = const i64 16
     %42 = gep i8, ptr %40, %41
-    call @func.94(%6, %39)
+    call @func.86(%6, %39)
     br bb8(%42)
 bb5:
     %43 = load ptr, ptr %4
     %44 = const i64 8
     %45 = gep i8, ptr %43, %44
-    call @func.94(%5, %45)
+    call @func.86(%5, %45)
     br bb7
 bb6:
     %46 = const i64 3
@@ -15340,7 +15331,7 @@ bb7:
     store i64 %50, ptr %0
     br bb13
 bb8(%2: ptr):
-    call @func.94(%7, %2)
+    call @func.86(%7, %2)
     br bb9
 bb9:
     %51 = load ptr, ptr %6
@@ -15355,7 +15346,7 @@ bb9:
     store i64 %57, ptr %0
     br bb13
 bb10(%3: ptr):
-    call @func.94(%9, %3)
+    call @func.86(%9, %3)
     br bb11
 bb11:
     %58 = load ptr, ptr %8
@@ -15527,7 +15518,7 @@ bb2:
     %13 = load ptr, ptr %4
     %14 = const i64 8
     %15 = gep i8, ptr %13, %14
-    call @func.98(%7, %12)
+    call @func.90(%7, %12)
     br bb7(%15)
 bb3:
     %16 = load ptr, ptr %4
@@ -15536,14 +15527,14 @@ bb3:
     %19 = load ptr, ptr %4
     %20 = const i64 16
     %21 = gep i8, ptr %19, %20
-    call @func.98(%5, %18)
+    call @func.90(%5, %18)
     br bb5(%21)
 bb4:
     %22 = const i64 0
     store i64 %22, ptr %0
     br bb8
 bb5(%2: ptr):
-    call @func.99(%6, %2)
+    call @func.91(%6, %2)
     br bb6
 bb6:
     %23 = load ptr, ptr %5
@@ -15682,7 +15673,7 @@ bb1(%3: ptr):
     %56 = icmp eq u64 %54, %55
     condbr %56, bb27(%3, %49), bb31
 bb2:
-    call @func.105(%43, %41)
+    call @func.97(%43, %41)
     br bb3
 bb3:
     %57 = load i64, ptr %43
@@ -15763,7 +15754,7 @@ bb12(%10: ptr, %11: bool, %12: u64, %13: u64):
     %113 = const u64 40
     %114 = mul u64 %13, %113
     %115 = gep i8, ptr %112, %114
-    %116 = call @func.65(%115, %10)
+    %116 = call @func.59(%115, %10)
     br bb13(%10, %11, %12, %116)
 bb13(%14: ptr, %15: bool, %16: u64, %17: bool):
     condbr %17, bb14(%14), bb15(%14, %15, %16)
@@ -15789,7 +15780,7 @@ bb16(%22: ptr, %23: bool):
 bb17(%24: ptr, %25: bool):
     condbr %25, bb2, bb18(%24)
 bb18(%26: ptr):
-    call @func.66(%46, %26)
+    call @func.60(%46, %26)
     br bb19
 bb19:
     %129 = load i64, ptr %46
@@ -15820,7 +15811,7 @@ bb19:
     store i64 %149, ptr %148
     br bb26
 bb20(%27: ptr, %28: ptr):
-    call @func.106(%27, %28)
+    call @func.98(%27, %28)
     br bb29
 bb21(%29: ptr, %30: ptr):
     %150 = load ptr, ptr %30
@@ -15828,7 +15819,7 @@ bb21(%29: ptr, %30: ptr):
     %152 = gep i8, ptr %150, %151
     br bb22(%29, %41, %152)
 bb22(%31: ptr, %32: ptr, %33: ptr):
-    call @func.106(%32, %33)
+    call @func.98(%32, %33)
     br bb23(%31)
 bb23(%34: ptr):
     %153 = load ptr, ptr %34
@@ -15836,7 +15827,7 @@ bb23(%34: ptr):
     %155 = gep i8, ptr %153, %154
     br bb24(%41, %155)
 bb24(%35: ptr, %36: ptr):
-    call @func.106(%35, %36)
+    call @func.98(%35, %36)
     br bb30
 bb25:
     %156 = const i64 3
@@ -15877,16 +15868,10 @@ bb31:
     unreachable
 }
 
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.108) {
-}
-
 fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1x_EE13from_residualBM_(functy.109) {
 }
 
 fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.110) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.111) {
 }
 
 fn @Verifier____env___infer_sort_inner(functy.112) {
@@ -15932,10 +15917,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32, %4: ptr):
     %135 = const bool false
     %136 = const bool false
     %137 = load ptr, ptr %98
-    call @func.117(%101, %1, %2, %137)
+    call @func.104(%101, %1, %2, %137)
     br bb1(%1, %3)
 bb1(%5: ptr, %6: u32):
-    call @func.108(%100, %101)
+    call @func.74(%100, %101)
     br bb2(%5, %6)
 bb2(%7: ptr, %8: u32):
     %138 = load i64, ptr %100
@@ -16062,7 +16047,7 @@ bb4(%9: ptr, %10: u32):
     %236 = load i64, ptr %233
     store i64 %236, ptr %235
     %237 = load ptr, ptr %98
-    call @func.154(%104, %9, %99, %237)
+    call @func.131(%104, %9, %99, %237)
     br bb7(%9, %10, %190)
 bb5:
     %238 = const i64 8
@@ -16093,7 +16078,7 @@ bb5:
     %259 = gep i8, ptr %102, %258
     %260 = load i64, ptr %257
     store i64 %260, ptr %259
-    call @func.109(%0, %102)
+    call @func.100(%0, %102)
     br bb6
 bb6:
     %261 = const bool false
@@ -16287,7 +16272,7 @@ bb10(%17: bool):
     %417 = load ptr, ptr %105
     %418 = const i64 8
     %419 = gep i8, ptr %417, %418
-    call @func.95(%106, %419)
+    call @func.87(%106, %419)
     br bb11(%17)
 bb11(%18: bool):
     %420 = const i64 8
@@ -16379,10 +16364,10 @@ bb14(%26: ptr, %27: u32, %28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: bool):
 bb15(%33: ptr, %34: u32, %35: ptr, %36: ptr, %37: ptr, %38: ptr, %39: bool):
     %484 = load u32, ptr %111
     %485 = load ptr, ptr %98
-    call @func.112(%110, %33, %38, %484, %485)
+    call @func.102(%110, %33, %38, %484, %485)
     br bb16(%33, %34, %35, %36, %37, %39)
 bb16(%40: ptr, %41: u32, %42: ptr, %43: ptr, %44: ptr, %45: bool):
-    call @func.110(%109, %110)
+    call @func.101(%109, %110)
     br bb17(%40, %41, %42, %43, %44, %45)
 bb17(%46: ptr, %47: u32, %48: ptr, %49: ptr, %50: ptr, %51: bool):
     %486 = load i64, ptr %109
@@ -16443,7 +16428,7 @@ bb18(%52: ptr, %53: u32, %54: ptr, %55: ptr, %56: ptr, %57: bool):
     %530 = gep i8, ptr %108, %529
     %531 = load i64, ptr %528
     store i64 %531, ptr %530
-    call @func.83(%115)
+    call @func.77(%115)
     br bb20(%52, %53, %54, %55, %56, %57)
 bb19:
     %532 = const i64 8
@@ -16474,11 +16459,11 @@ bb19:
     %553 = gep i8, ptr %112, %552
     %554 = load i64, ptr %551
     store i64 %554, ptr %553
-    call @func.109(%0, %112)
+    call @func.100(%0, %112)
     br bb46
 bb20(%58: ptr, %59: u32, %60: ptr, %61: ptr, %62: ptr, %63: bool):
     %555 = const bool true
-    %556 = call @func.111(%61)
+    %556 = call @func.3(%61)
     br bb21(%58, %59, %60, %62, %556, %63)
 bb21(%64: ptr, %65: u32, %66: ptr, %67: ptr, %68: ptr, %69: bool):
     call @func.13(%116, %68)
@@ -16494,7 +16479,7 @@ bb22(%70: ptr, %71: u32, %72: ptr, %73: ptr, %74: bool):
     store i8 %562, ptr %561
     %563 = const bool false
     %564 = load ptr, ptr %98
-    call @func.156(%114, %564, %115, %116, %117)
+    call @func.133(%114, %564, %115, %116, %117)
     br bb23(%70, %71, %73, %74)
 bb23(%75: ptr, %76: u32, %77: ptr, %78: bool):
     %565 = const bool false
@@ -16504,7 +16489,7 @@ bb23(%75: ptr, %76: u32, %77: ptr, %78: bool):
     br bb24(%75, %76, %568, %78)
 bb24(%79: ptr, %80: u32, %81: ptr, %82: bool):
     %569 = load u64, ptr %114
-    call @func.157(%118, %79, %81, %569)
+    call @func.134(%118, %79, %81, %569)
     br bb25(%79, %80, %82)
 bb25(%83: ptr, %84: u32, %85: bool):
     %570 = const u32 1
@@ -16522,12 +16507,12 @@ bb25(%83: ptr, %84: u32, %85: bool):
 bb26(%86: ptr, %87: ptr, %88: bool):
     %580 = load u32, ptr %120
     %581 = load ptr, ptr %98
-    call @func.112(%119, %86, %87, %580, %581)
+    call @func.102(%119, %86, %87, %580, %581)
     br bb27(%88)
 bb27(%89: bool):
     %582 = const bool true
     %583 = load ptr, ptr %98
-    call @func.159(%583)
+    call @func.136(%583)
     br bb28(%89)
 bb28(%90: bool):
     %584 = const bool false
@@ -16563,7 +16548,7 @@ bb28(%90: bool):
     %609 = gep i8, ptr %123, %608
     %610 = load i64, ptr %607
     store i64 %610, ptr %609
-    call @func.110(%122, %123)
+    call @func.101(%122, %123)
     br bb29(%90)
 bb29(%91: bool):
     %611 = load i64, ptr %122
@@ -16678,7 +16663,7 @@ bb30(%92: bool):
     %699 = gep i8, ptr %128, %698
     %700 = load i64, ptr %697
     store i64 %700, ptr %699
-    call @func.160(%126, %127, %128)
+    call @func.137(%126, %127, %128)
     br bb33(%92)
 bb31:
     %701 = const i64 8
@@ -16709,7 +16694,7 @@ bb31:
     %722 = gep i8, ptr %124, %721
     %723 = load i64, ptr %720
     store i64 %723, ptr %722
-    call @func.109(%0, %124)
+    call @func.100(%0, %124)
     br bb32
 bb32:
     %724 = const bool false
@@ -16819,16 +16804,7 @@ bb47:
     unreachable
 }
 
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.113) {
-}
-
 fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.114) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.115) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.116) {
 }
 
 fn @Verifier____env___infer_type_core(functy.117) {
@@ -17141,13 +17117,13 @@ bb8(%9: ptr):
     %663 = load ptr, ptr %386
     %664 = const i64 48
     %665 = gep i8, ptr %663, %664
-    call @func.161(%397, %9, %662)
+    call @func.138(%397, %9, %662)
     br bb20(%662)
 bb9:
     %666 = load ptr, ptr %386
     %667 = const i64 8
     %668 = gep i8, ptr %666, %667
-    call @func.95(%396, %668)
+    call @func.87(%396, %668)
     br bb17
 bb10:
     %669 = load ptr, ptr %386
@@ -17157,7 +17133,7 @@ bb10:
     %673 = load i64, ptr %671
     store i64 %673, ptr %389
     %674 = load u64, ptr %389
-    call @func.164(%388, %672, %674)
+    call @func.141(%388, %672, %674)
     br bb12(%671)
 bb11:
     %675 = load ptr, ptr %386
@@ -17317,7 +17293,7 @@ bb16:
     store i64 %790, ptr %789
     br bb180
 bb17:
-    call @func.165(%395, %396)
+    call @func.142(%395, %396)
     br bb18
 bb18:
     call @func.32(%394, %395)
@@ -17389,7 +17365,7 @@ bb20(%12: ptr):
     %842 = select i64 %839, %840, %841
     switch %842 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.66(%400, %13)
+    call @func.60(%400, %13)
     br bb23
 bb22:
     %843 = load i64, ptr %397
@@ -17565,10 +17541,10 @@ bb23:
     br bb180
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %980 = load ptr, ptr %385
-    call @func.117(%403, %14, %16, %980)
+    call @func.104(%403, %14, %16, %980)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.113(%402, %403)
+    call @func.74(%402, %403)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %981 = load i64, ptr %402
@@ -17693,7 +17669,7 @@ bb27(%21: ptr, %22: ptr):
     %1079 = load i64, ptr %1076
     store i64 %1079, ptr %1078
     %1080 = load ptr, ptr %385
-    call @func.154(%406, %21, %401, %1080)
+    call @func.131(%406, %21, %401, %1080)
     br bb30(%21, %22, %1033)
 bb28:
     %1081 = const i64 8
@@ -17724,7 +17700,7 @@ bb28:
     %1102 = gep i8, ptr %404, %1101
     %1103 = load i64, ptr %1100
     store i64 %1103, ptr %1102
-    call @func.114(%0, %404)
+    call @func.103(%0, %404)
     br bb29
 bb29:
     %1104 = const bool false
@@ -17914,10 +17890,10 @@ bb32(%26: ptr, %27: ptr, %28: bool):
     br bb33(%26, %27, %1251, %1254, %1257, %28)
 bb33(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr, %34: bool):
     %1258 = load ptr, ptr %385
-    call @func.117(%410, %29, %33, %1258)
+    call @func.104(%410, %29, %33, %1258)
     br bb34(%29, %30, %31, %32, %34)
 bb34(%35: ptr, %36: ptr, %37: ptr, %38: ptr, %39: bool):
-    call @func.113(%409, %410)
+    call @func.74(%409, %410)
     br bb35(%35, %36, %37, %38, %39)
 bb35(%40: ptr, %41: ptr, %42: ptr, %43: ptr, %44: bool):
     %1259 = load i64, ptr %409
@@ -18074,11 +18050,11 @@ bb37:
     %1382 = gep i8, ptr %411, %1381
     %1383 = load i64, ptr %1380
     store i64 %1383, ptr %1382
-    call @func.114(%0, %411)
+    call @func.103(%0, %411)
     br bb187
 bb38(%50: ptr, %51: ptr, %52: ptr, %53: ptr, %54: ptr, %55: ptr, %56: bool):
     %1384 = load ptr, ptr %385
-    %1385 = call @func.118(%50, %54, %55, %1384)
+    %1385 = call @func.105(%50, %54, %55, %1384)
     br bb39(%51, %52, %53, %1385, %56)
 bb39(%57: ptr, %58: ptr, %59: ptr, %60: bool, %61: bool):
     condbr %60, bb40(%57, %59, %61), bb41(%58)
@@ -18088,7 +18064,7 @@ bb40(%62: ptr, %63: ptr, %64: bool):
     %1388 = gep i8, ptr %1386, %1387
     br bb46(%62, %1388, %64)
 bb41(%65: ptr):
-    %1389 = call @func.115(%65)
+    %1389 = call @func.3(%65)
     br bb42(%1389)
 bb42(%66: ptr):
     call @func.13(%415, %66)
@@ -18336,7 +18312,7 @@ bb46(%67: ptr, %68: ptr, %69: bool):
     %1578 = gep i8, ptr %1576, %1577
     br bb47(%68, %1578, %69)
 bb47(%70: ptr, %71: ptr, %72: bool):
-    call @func.166(%418, %70, %71)
+    call @func.143(%418, %70, %71)
     br bb48(%72)
 bb48(%73: bool):
     %1579 = load i64, ptr %418
@@ -18446,10 +18422,10 @@ bb53:
     br bb180
 bb54(%78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr):
     %1655 = load ptr, ptr %385
-    call @func.117(%424, %78, %82, %1655)
+    call @func.104(%424, %78, %82, %1655)
     br bb55(%78, %79, %80, %81)
 bb55(%83: ptr, %84: ptr, %85: ptr, %86: ptr):
-    call @func.113(%423, %424)
+    call @func.74(%423, %424)
     br bb56(%83, %84, %85, %86)
 bb56(%87: ptr, %88: ptr, %89: ptr, %90: ptr):
     %1656 = load i64, ptr %423
@@ -18574,7 +18550,7 @@ bb57(%91: ptr, %92: ptr, %93: ptr, %94: ptr):
     %1754 = load i64, ptr %1751
     store i64 %1754, ptr %1753
     %1755 = load ptr, ptr %385
-    call @func.154(%427, %91, %422, %1755)
+    call @func.131(%427, %91, %422, %1755)
     br bb59(%91, %92, %93, %94, %1708)
 bb58:
     %1756 = const i64 8
@@ -18605,7 +18581,7 @@ bb58:
     %1777 = gep i8, ptr %425, %1776
     %1778 = load i64, ptr %1775
     store i64 %1778, ptr %1777
-    call @func.114(%0, %425)
+    call @func.103(%0, %425)
     br bb176
 bb59(%95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: bool):
     %1779 = load i64, ptr %427
@@ -18778,7 +18754,7 @@ bb60:
     store ptr %1869, ptr %429
     br bb62(%1821)
 bb61(%100: ptr, %101: ptr, %102: ptr, %103: ptr, %104: bool):
-    call @func.83(%432)
+    call @func.77(%432)
     br bb63(%100, %101, %102, %103, %104)
 bb62(%105: bool):
     %1922 = load ptr, ptr %429
@@ -18820,7 +18796,7 @@ bb62(%105: bool):
     br bb174(%105)
 bb63(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: bool):
     %1950 = const bool true
-    %1951 = call @func.115(%108)
+    %1951 = call @func.3(%108)
     br bb64(%106, %107, %108, %109, %1951, %110)
 bb64(%111: ptr, %112: ptr, %113: ptr, %114: ptr, %115: ptr, %116: bool):
     call @func.13(%433, %115)
@@ -18836,7 +18812,7 @@ bb65(%117: ptr, %118: ptr, %119: ptr, %120: ptr, %121: bool):
     store i8 %1957, ptr %1956
     %1958 = const bool false
     %1959 = load ptr, ptr %385
-    call @func.156(%431, %1959, %432, %433, %434)
+    call @func.133(%431, %1959, %432, %433, %434)
     br bb66(%117, %118, %119, %120, %121)
 bb66(%122: ptr, %123: ptr, %124: ptr, %125: ptr, %126: bool):
     %1960 = const bool false
@@ -18846,16 +18822,16 @@ bb66(%122: ptr, %123: ptr, %124: ptr, %125: ptr, %126: bool):
     br bb67(%122, %123, %124, %1963, %126)
 bb67(%127: ptr, %128: ptr, %129: ptr, %130: ptr, %131: bool):
     %1964 = load u64, ptr %431
-    call @func.157(%435, %127, %130, %1964)
+    call @func.134(%435, %127, %130, %1964)
     br bb68(%127, %128, %129, %131)
 bb68(%132: ptr, %133: ptr, %134: ptr, %135: bool):
     %1965 = load ptr, ptr %385
-    call @func.117(%436, %132, %435, %1965)
+    call @func.104(%436, %132, %435, %1965)
     br bb69(%133, %134, %135)
 bb69(%136: ptr, %137: ptr, %138: bool):
     %1966 = const bool true
     %1967 = load ptr, ptr %385
-    call @func.159(%1967)
+    call @func.136(%1967)
     br bb70(%136, %137, %138)
 bb70(%139: ptr, %140: ptr, %141: bool):
     %1968 = const bool false
@@ -18915,7 +18891,7 @@ bb70(%139: ptr, %140: ptr, %141: bool):
     %2013 = gep i8, ptr %439, %2012
     %2014 = load i64, ptr %2011
     store i64 %2014, ptr %2013
-    call @func.113(%438, %439)
+    call @func.74(%438, %439)
     br bb71(%139, %140, %141)
 bb71(%142: ptr, %143: ptr, %144: bool):
     %2015 = load i64, ptr %438
@@ -19039,7 +19015,7 @@ bb72(%145: ptr, %146: ptr):
     %2112 = load i64, ptr %2109
     store i64 %2112, ptr %2111
     %2113 = load u64, ptr %431
-    call @func.167(%442, %437, %2113)
+    call @func.144(%442, %437, %2113)
     br bb75(%145, %146)
 bb73(%147: bool):
     %2114 = const i64 8
@@ -19070,7 +19046,7 @@ bb73(%147: bool):
     %2135 = gep i8, ptr %440, %2134
     %2136 = load i64, ptr %2133
     store i64 %2136, ptr %2135
-    call @func.114(%0, %440)
+    call @func.103(%0, %440)
     br bb74(%147)
 bb74(%148: bool):
     %2137 = const bool false
@@ -19085,7 +19061,7 @@ bb75(%149: ptr, %150: ptr):
     %2143 = gep i8, ptr %445, %2142
     %2144 = load i8, ptr %2141
     store i8 %2144, ptr %2143
-    call @func.116(%446, %150)
+    call @func.54(%446, %150)
     br bb76
 bb76:
     %2145 = const bool false
@@ -19234,7 +19210,7 @@ bb77:
     store ptr %2257, ptr %2259
     %2260 = const i64 9
     store i64 %2260, ptr %444
-    call @func.49(%443, %444)
+    call @func.44(%443, %444)
     br bb78
 bb78:
     %2261 = load i64, ptr %443
@@ -19307,10 +19283,10 @@ bb82:
     br bb180
 bb83(%151: ptr, %152: ptr, %153: ptr, %154: ptr, %155: ptr):
     %2310 = load ptr, ptr %385
-    call @func.117(%451, %151, %155, %2310)
+    call @func.104(%451, %151, %155, %2310)
     br bb84(%151, %152, %153, %154)
 bb84(%156: ptr, %157: ptr, %158: ptr, %159: ptr):
-    call @func.113(%450, %451)
+    call @func.74(%450, %451)
     br bb85(%156, %157, %158, %159)
 bb85(%160: ptr, %161: ptr, %162: ptr, %163: ptr):
     %2311 = load i64, ptr %450
@@ -19435,7 +19411,7 @@ bb86(%164: ptr, %165: ptr, %166: ptr, %167: ptr):
     %2409 = load i64, ptr %2406
     store i64 %2409, ptr %2408
     %2410 = load ptr, ptr %385
-    call @func.154(%454, %164, %449, %2410)
+    call @func.131(%454, %164, %449, %2410)
     br bb88(%164, %165, %166, %167, %2363)
 bb87:
     %2411 = const i64 8
@@ -19466,7 +19442,7 @@ bb87:
     %2432 = gep i8, ptr %452, %2431
     %2433 = load i64, ptr %2430
     store i64 %2433, ptr %2432
-    call @func.114(%0, %452)
+    call @func.103(%0, %452)
     br bb173
 bb88(%168: ptr, %169: ptr, %170: ptr, %171: ptr, %172: bool):
     store ptr %454, ptr %456
@@ -19644,11 +19620,11 @@ bb90(%173: ptr, %174: ptr, %175: ptr, %176: ptr, %177: bool):
     %2578 = load ptr, ptr %456
     %2579 = const i64 8
     %2580 = gep i8, ptr %2578, %2579
-    call @func.95(%455, %2580)
+    call @func.87(%455, %2580)
     br bb91(%173, %174, %175, %176, %177)
 bb91(%178: ptr, %179: ptr, %180: ptr, %181: ptr, %182: bool):
     %2581 = const bool true
-    call @func.83(%461)
+    call @func.77(%461)
     br bb93(%178, %179, %180, %181, %182)
 bb92(%183: bool):
     %2582 = load ptr, ptr %458
@@ -19690,7 +19666,7 @@ bb92(%183: bool):
     br bb171(%183)
 bb93(%184: ptr, %185: ptr, %186: ptr, %187: ptr, %188: bool):
     %2610 = const bool true
-    %2611 = call @func.115(%186)
+    %2611 = call @func.3(%186)
     br bb94(%184, %185, %187, %2611, %188)
 bb94(%189: ptr, %190: ptr, %191: ptr, %192: ptr, %193: bool):
     call @func.13(%462, %192)
@@ -19706,7 +19682,7 @@ bb95(%194: ptr, %195: ptr, %196: ptr, %197: bool):
     store i8 %2617, ptr %2616
     %2618 = const bool false
     %2619 = load ptr, ptr %385
-    call @func.156(%460, %2619, %461, %462, %463)
+    call @func.133(%460, %2619, %461, %462, %463)
     br bb96(%194, %196, %197)
 bb96(%198: ptr, %199: ptr, %200: bool):
     %2620 = const bool false
@@ -19716,16 +19692,16 @@ bb96(%198: ptr, %199: ptr, %200: bool):
     br bb97(%198, %2623, %200)
 bb97(%201: ptr, %202: ptr, %203: bool):
     %2624 = load u64, ptr %460
-    call @func.157(%464, %201, %202, %2624)
+    call @func.134(%464, %201, %202, %2624)
     br bb98(%201, %203)
 bb98(%204: ptr, %205: bool):
     %2625 = load ptr, ptr %385
-    call @func.117(%465, %204, %464, %2625)
+    call @func.104(%465, %204, %464, %2625)
     br bb99(%204, %205)
 bb99(%206: ptr, %207: bool):
     %2626 = const bool true
     %2627 = load ptr, ptr %385
-    call @func.159(%2627)
+    call @func.136(%2627)
     br bb100(%206, %207)
 bb100(%208: ptr, %209: bool):
     %2628 = const bool false
@@ -19785,7 +19761,7 @@ bb100(%208: ptr, %209: bool):
     %2673 = gep i8, ptr %468, %2672
     %2674 = load i64, ptr %2671
     store i64 %2674, ptr %2673
-    call @func.113(%467, %468)
+    call @func.74(%467, %468)
     br bb101(%208, %209)
 bb101(%210: ptr, %211: bool):
     %2675 = load i64, ptr %467
@@ -19910,7 +19886,7 @@ bb102(%212: ptr, %213: bool):
     %2773 = load i64, ptr %2770
     store i64 %2773, ptr %2772
     %2774 = load ptr, ptr %385
-    call @func.154(%471, %212, %466, %2774)
+    call @func.131(%471, %212, %466, %2774)
     br bb104(%213)
 bb103(%214: bool):
     %2775 = const i64 8
@@ -19941,7 +19917,7 @@ bb103(%214: bool):
     %2796 = gep i8, ptr %469, %2795
     %2797 = load i64, ptr %2794
     store i64 %2797, ptr %2796
-    call @func.114(%0, %469)
+    call @func.103(%0, %469)
     br bb188(%214)
 bb104(%215: bool):
     store ptr %471, ptr %473
@@ -20119,7 +20095,7 @@ bb106:
     %2942 = load ptr, ptr %473
     %2943 = const i64 8
     %2944 = gep i8, ptr %2942, %2943
-    call @func.95(%472, %2944)
+    call @func.87(%472, %2944)
     br bb107
 bb107:
     %2945 = const bool false
@@ -20149,7 +20125,7 @@ bb107:
     %2965 = gep i8, ptr %479, %2964
     %2966 = load i64, ptr %2963
     store i64 %2966, ptr %2965
-    call @func.160(%478, %479, %472)
+    call @func.137(%478, %479, %472)
     br bb109
 bb108(%217: bool):
     %2967 = load ptr, ptr %475
@@ -20266,10 +20242,10 @@ bb115:
     br bb180
 bb116(%218: ptr, %219: ptr, %220: ptr, %221: ptr, %222: ptr, %223: ptr):
     %3045 = load ptr, ptr %385
-    call @func.117(%482, %218, %223, %3045)
+    call @func.104(%482, %218, %223, %3045)
     br bb117(%218, %219, %220, %221, %222)
 bb117(%224: ptr, %225: ptr, %226: ptr, %227: ptr, %228: ptr):
-    call @func.113(%481, %482)
+    call @func.74(%481, %482)
     br bb118(%224, %225, %226, %227, %228)
 bb118(%229: ptr, %230: ptr, %231: ptr, %232: ptr, %233: ptr):
     %3046 = load i64, ptr %481
@@ -20394,7 +20370,7 @@ bb119(%234: ptr, %235: ptr, %236: ptr, %237: ptr, %238: ptr):
     %3144 = load i64, ptr %3141
     store i64 %3144, ptr %3143
     %3145 = load ptr, ptr %385
-    call @func.154(%485, %234, %480, %3145)
+    call @func.131(%485, %234, %480, %3145)
     br bb121(%234, %235, %236, %237, %238, %3098)
 bb120:
     %3146 = const i64 8
@@ -20425,7 +20401,7 @@ bb120:
     %3167 = gep i8, ptr %483, %3166
     %3168 = load i64, ptr %3165
     store i64 %3168, ptr %3167
-    call @func.114(%0, %483)
+    call @func.103(%0, %483)
     br bb168
 bb121(%239: ptr, %240: ptr, %241: ptr, %242: ptr, %243: ptr, %244: bool):
     %3169 = load i64, ptr %485
@@ -20642,10 +20618,10 @@ bb124(%251: bool):
     br bb166(%251)
 bb125(%252: ptr, %253: ptr, %254: ptr, %255: ptr, %256: ptr, %257: ptr, %258: bool):
     %3343 = load ptr, ptr %385
-    call @func.117(%491, %252, %257, %3343)
+    call @func.104(%491, %252, %257, %3343)
     br bb126(%252, %253, %254, %255, %256, %258)
 bb126(%259: ptr, %260: ptr, %261: ptr, %262: ptr, %263: ptr, %264: bool):
-    call @func.113(%490, %491)
+    call @func.74(%490, %491)
     br bb127(%259, %260, %261, %262, %263, %264)
 bb127(%265: ptr, %266: ptr, %267: ptr, %268: ptr, %269: ptr, %270: bool):
     %3344 = load i64, ptr %490
@@ -20802,19 +20778,19 @@ bb129(%277: bool):
     %3467 = gep i8, ptr %492, %3466
     %3468 = load i64, ptr %3465
     store i64 %3468, ptr %3467
-    call @func.114(%0, %492)
+    call @func.103(%0, %492)
     br bb189(%277)
 bb130(%278: ptr, %279: ptr, %280: ptr, %281: ptr, %282: ptr, %283: ptr, %284: ptr, %285: bool, %286: bool):
     %3469 = load ptr, ptr %385
-    %3470 = call @func.118(%278, %283, %284, %3469)
+    %3470 = call @func.105(%278, %283, %284, %3469)
     br bb131(%278, %279, %280, %281, %282, %3470, %285, %286)
 bb131(%287: ptr, %288: ptr, %289: ptr, %290: ptr, %291: ptr, %292: bool, %293: bool, %294: bool):
     condbr %292, bb132(%287, %288, %289, %290, %291, %293, %294), bb133(%289, %294)
 bb132(%295: ptr, %296: ptr, %297: ptr, %298: ptr, %299: ptr, %300: bool, %301: bool):
-    call @func.66(%500, %296)
+    call @func.60(%500, %296)
     br bb138(%295, %297, %298, %299, %300, %301)
 bb133(%302: ptr, %303: bool):
-    %3471 = call @func.115(%302)
+    %3471 = call @func.3(%302)
     br bb134(%3471, %303)
 bb134(%304: ptr, %305: bool):
     call @func.13(%496, %304)
@@ -21058,14 +21034,14 @@ bb137(%308: bool, %309: bool):
     br bb183(%308, %309)
 bb138(%310: ptr, %311: ptr, %312: ptr, %313: ptr, %314: bool, %315: bool):
     %3658 = const bool true
-    %3659 = call @func.115(%311)
+    %3659 = call @func.3(%311)
     br bb139(%310, %312, %313, %3659, %314, %315)
 bb139(%316: ptr, %317: ptr, %318: ptr, %319: ptr, %320: bool, %321: bool):
     call @func.13(%501, %319)
     br bb140(%316, %317, %318, %320, %321)
 bb140(%322: ptr, %323: ptr, %324: ptr, %325: bool, %326: bool):
     %3660 = const bool true
-    %3661 = call @func.115(%323)
+    %3661 = call @func.3(%323)
     br bb141(%322, %323, %324, %3661, %325, %326)
 bb141(%327: ptr, %328: ptr, %329: ptr, %330: ptr, %331: bool, %332: bool):
     call @func.13(%502, %330)
@@ -21074,7 +21050,7 @@ bb142(%333: ptr, %334: ptr, %335: ptr, %336: bool, %337: bool):
     %3662 = const bool false
     %3663 = const bool false
     %3664 = load ptr, ptr %385
-    call @func.169(%499, %3664, %500, %501, %502)
+    call @func.145(%499, %3664, %500, %501, %502)
     br bb143(%333, %334, %335, %336, %337)
 bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     %3665 = const bool false
@@ -21085,16 +21061,16 @@ bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     br bb144(%338, %339, %3669, %341, %342)
 bb144(%343: ptr, %344: ptr, %345: ptr, %346: bool, %347: bool):
     %3670 = load u64, ptr %499
-    call @func.157(%503, %343, %345, %3670)
+    call @func.134(%503, %343, %345, %3670)
     br bb145(%343, %344, %346, %347)
 bb145(%348: ptr, %349: ptr, %350: bool, %351: bool):
     %3671 = load ptr, ptr %385
-    call @func.117(%504, %348, %503, %3671)
+    call @func.104(%504, %348, %503, %3671)
     br bb146(%349, %350, %351)
 bb146(%352: ptr, %353: bool, %354: bool):
     %3672 = const bool true
     %3673 = load ptr, ptr %385
-    call @func.159(%3673)
+    call @func.136(%3673)
     br bb147(%352, %353, %354)
 bb147(%355: ptr, %356: bool, %357: bool):
     %3674 = const bool false
@@ -21154,7 +21130,7 @@ bb147(%355: ptr, %356: bool, %357: bool):
     %3719 = gep i8, ptr %507, %3718
     %3720 = load i64, ptr %3717
     store i64 %3720, ptr %3719
-    call @func.113(%506, %507)
+    call @func.74(%506, %507)
     br bb148(%355, %356, %357)
 bb148(%358: ptr, %359: bool, %360: bool):
     %3721 = load i64, ptr %506
@@ -21310,14 +21286,14 @@ bb150(%362: bool, %363: bool):
     %3843 = gep i8, ptr %508, %3842
     %3844 = load i64, ptr %3841
     store i64 %3844, ptr %3843
-    call @func.114(%0, %508)
+    call @func.103(%0, %508)
     br bb151(%362, %363)
 bb151(%364: bool, %365: bool):
     %3845 = const bool false
     br bb183(%364, %365)
 bb152(%366: ptr, %367: ptr):
     %3846 = load u64, ptr %499
-    call @func.170(%510, %366, %3846, %367)
+    call @func.146(%510, %366, %3846, %367)
     br bb153
 bb153:
     %3847 = load i64, ptr %510
@@ -21391,16 +21367,16 @@ bb158:
     %3895 = const bool false
     br bb180
 bb159:
-    call @func.171(%513)
+    call @func.147(%513)
     br bb162
 bb160:
-    call @func.172(%512)
+    call @func.148(%512)
     br bb161
 bb161:
-    call @func.51(%511, %512)
+    call @func.45(%511, %512)
     br bb163
 bb162:
-    call @func.51(%511, %513)
+    call @func.45(%511, %513)
     br bb163
 bb163:
     %3896 = load i64, ptr %511
@@ -21462,7 +21438,7 @@ bb163:
     br bb180
 bb164(%368: ptr, %369: ptr):
     %3942 = load ptr, ptr %385
-    call @func.117(%0, %368, %369, %3942)
+    call @func.104(%0, %368, %369, %3942)
     br bb180
 bb165(%370: bool):
     %3943 = const bool false
@@ -21527,7 +21503,7 @@ bb189(%383: bool):
 
 fn @Verifier____env___is_def_eq(functy.118) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.177(%0, %1, %2, %3)
+    %5 = call @func.152(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
@@ -21738,7 +21714,7 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     %12 = const i64 32
     %13 = gep i8, ptr %1, %12
     %14 = load u64, ptr %13
-    %15 = call @func.127(%14, %2)
+    %15 = call @func.114(%14, %2)
     br bb1(%2, %15)
 bb1(%3: u64, %4: u64):
     %16 = const bool false
@@ -21865,13 +21841,13 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     br bb1
 bb1:
     %20 = const u64 11
-    %21 = call @func.180(%7, %20)
+    %21 = call @func.154(%7, %20)
     br bb2(%21)
 bb2(%3: u64):
     %22 = const i64 32
     %23 = gep i8, ptr %1, %22
     %24 = load u64, ptr %23
-    %25 = call @func.127(%24, %3)
+    %25 = call @func.114(%24, %3)
     br bb3(%25)
 bb3(%4: u64):
     %26 = const bool false
@@ -21940,7 +21916,7 @@ bb3(%4: u64):
     store ptr %49, ptr %9
     br bb4(%4)
 bb4(%5: u64):
-    call @func.121(%11, %2)
+    call @func.108(%11, %2)
     br bb5(%5)
 bb5(%6: u64):
     %77 = load ptr, ptr %9
@@ -21988,13 +21964,13 @@ bb5(%6: u64):
 fn @hash_lit(functy.123) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.181(%3)
+    call @func.155(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.185(%1, %3)
+    call @func.159(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.186(%3)
+    %4 = call @func.160(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -22003,13 +21979,13 @@ bb3(%2: u64):
 fn @hash_name(functy.124) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.181(%3)
+    call @func.155(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.188(%1, %3)
+    call @func.161(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.186(%3)
+    %4 = call @func.160(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -22018,13 +21994,13 @@ bb3(%2: u64):
 fn @hash_level(functy.125) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.181(%3)
+    call @func.155(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.192(%1, %3)
+    call @func.165(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.186(%3)
+    %4 = call @func.160(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -22036,7 +22012,7 @@ fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.126) {
 fn @mix_hash(functy.127) {
 bb0(%0: u64, %1: u64):
     %8 = const u64 14313749767032793493
-    %9 = call @func.126(%1, %8)
+    %9 = call @func.113(%1, %8)
     br bb1(%0, %9)
 bb1(%2: u64, %3: u64):
     %10 = const u32 47
@@ -22052,7 +22028,7 @@ bb2(%4: u64, %5: u64, %6: u64):
     %18 = xor u64 %16, %17
     %19 = xor u64 %4, %18
     %20 = const u64 14313749767032793493
-    %21 = call @func.126(%19, %20)
+    %21 = call @func.113(%19, %20)
     br bb3(%21)
 bb3(%7: u64):
     ret %7
@@ -22060,13 +22036,10 @@ bb4:
     unreachable
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.128) {
-}
-
 fn @ExprMeta__pack(functy.129) {
 bb0(%0: ptr, %1: u32, %2: u32, %3: u32, %4: bool, %5: bool, %6: bool, %7: bool):
     %42 = const u32 255
-    %43 = call @func.128(%3, %42)
+    %43 = call @func.82(%3, %42)
     br bb1(%1, %2, %4, %5, %6, %7, %43)
 bb1(%8: u32, %9: u32, %10: bool, %11: bool, %12: bool, %13: bool, %14: u32):
     %44 = zext u32 %8 to u64
@@ -22156,9 +22129,6 @@ bb0(%0: ptr, %1: ptr):
 fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.131) {
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.132) {
-}
-
 fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.133) {
 }
 
@@ -22170,14 +22140,14 @@ bb0(%0: ptr, %1: u64, %2: u64):
     store u64 %1, ptr %28
     store u64 %2, ptr %29
     %31 = load u64, ptr %28
-    %32 = call @func.148(%31)
+    %32 = call @func.126(%31)
     br bb1(%32)
 bb1(%3: u8):
     %33 = load u64, ptr %29
-    %34 = call @func.148(%33)
+    %34 = call @func.126(%33)
     br bb2(%3, %34)
 bb2(%4: u8, %5: u8):
-    %35 = call @func.131(%4, %5)
+    %35 = call @func.117(%4, %5)
     br bb3(%35)
 bb3(%6: u8):
     %36 = zext u8 %6 to u32
@@ -22196,23 +22166,23 @@ bb3(%6: u8):
 bb4:
     %47 = load u32, ptr %30
     %48 = const u32 255
-    %49 = call @func.132(%47, %48)
+    %49 = call @func.82(%47, %48)
     br bb5(%49)
 bb5(%7: u32):
     %50 = load u64, ptr %28
-    %51 = call @func.150(%50)
+    %51 = call @func.128(%50)
     br bb6(%7, %51)
 bb6(%8: u32, %9: u32):
     %52 = load u64, ptr %29
-    %53 = call @func.150(%52)
+    %53 = call @func.128(%52)
     br bb7(%8, %9, %53)
 bb7(%10: u32, %11: u32, %12: u32):
-    %54 = call @func.133(%11, %12)
+    %54 = call @func.118(%11, %12)
     br bb8(%10, %54)
 bb8(%13: u32, %14: u32):
     %55 = load u64, ptr %28
     %56 = load u64, ptr %29
-    %57 = call @func.127(%55, %56)
+    %57 = call @func.114(%55, %56)
     br bb9(%13, %14, %57)
 bb9(%15: u32, %16: u32, %17: u64):
     %58 = trunc u64 %17 to u32
@@ -22257,16 +22227,7 @@ bb13:
     unreachable
 }
 
-fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.135) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.136) {
-}
-
 fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.137) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.138) {
 }
 
 fn @ExprMeta__mk_binder_meta(functy.139) {
@@ -22277,14 +22238,14 @@ bb0(%0: ptr, %1: u64, %2: u64, %3: u64):
     store u64 %1, ptr %130
     store u64 %2, ptr %131
     %133 = load u64, ptr %130
-    %134 = call @func.148(%133)
+    %134 = call @func.126(%133)
     br bb1(%3, %134)
 bb1(%4: u64, %5: u8):
     %135 = load u64, ptr %131
-    %136 = call @func.148(%135)
+    %136 = call @func.126(%135)
     br bb2(%4, %5, %136)
 bb2(%6: u64, %7: u8, %8: u8):
-    %137 = call @func.135(%7, %8)
+    %137 = call @func.117(%7, %8)
     br bb3(%6, %137)
 bb3(%9: u64, %10: u8):
     %138 = zext u8 %10 to u32
@@ -22303,47 +22264,47 @@ bb3(%9: u64, %10: u8):
 bb4(%11: u64):
     %149 = load u32, ptr %132
     %150 = const u32 255
-    %151 = call @func.136(%149, %150)
+    %151 = call @func.82(%149, %150)
     br bb5(%11, %151)
 bb5(%12: u64, %13: u32):
     %152 = load u64, ptr %131
-    %153 = call @func.150(%152)
+    %153 = call @func.128(%152)
     br bb6(%12, %13, %153)
 bb6(%14: u64, %15: u32, %16: u32):
     %154 = const u32 1
-    %155 = call @func.137(%16, %154)
+    %155 = call @func.120(%16, %154)
     br bb7(%14, %15, %155)
 bb7(%17: u64, %18: u32, %19: u32):
     %156 = load u64, ptr %130
-    %157 = call @func.150(%156)
+    %157 = call @func.128(%156)
     br bb8(%17, %18, %19, %157)
 bb8(%20: u64, %21: u32, %22: u32, %23: u32):
-    %158 = call @func.138(%23, %22)
+    %158 = call @func.118(%23, %22)
     br bb9(%20, %21, %158)
 bb9(%24: u64, %25: u32, %26: u32):
     %159 = zext u32 %25 to u64
     %160 = load u64, ptr %130
-    %161 = call @func.149(%160)
+    %161 = call @func.127(%160)
     br bb10(%24, %25, %26, %159, %161)
 bb10(%27: u64, %28: u32, %29: u32, %30: u64, %31: u32):
     %162 = zext u32 %31 to u64
     %163 = load u64, ptr %131
-    %164 = call @func.149(%163)
+    %164 = call @func.127(%163)
     br bb11(%27, %28, %29, %30, %162, %164)
 bb11(%32: u64, %33: u32, %34: u32, %35: u64, %36: u64, %37: u32):
     %165 = zext u32 %37 to u64
-    %166 = call @func.127(%165, %32)
+    %166 = call @func.114(%165, %32)
     br bb12(%33, %34, %35, %36, %166)
 bb12(%38: u32, %39: u32, %40: u64, %41: u64, %42: u64):
-    %167 = call @func.127(%41, %42)
+    %167 = call @func.114(%41, %42)
     br bb13(%38, %39, %40, %167)
 bb13(%43: u32, %44: u32, %45: u64, %46: u64):
-    %168 = call @func.127(%45, %46)
+    %168 = call @func.114(%45, %46)
     br bb14(%43, %44, %168)
 bb14(%47: u32, %48: u32, %49: u64):
     %169 = trunc u64 %49 to u32
     %170 = load u64, ptr %130
-    %171 = call @func.103(%170)
+    %171 = call @func.95(%170)
     br bb15(%47, %48, %169, %171)
 bb15(%50: u32, %51: u32, %52: u32, %53: bool):
     condbr %53, bb16(%50, %51, %52), bb17(%50, %51, %52)
@@ -22352,11 +22313,11 @@ bb16(%54: u32, %55: u32, %56: u32):
     br bb18(%54, %55, %56, %172)
 bb17(%57: u32, %58: u32, %59: u32):
     %173 = load u64, ptr %131
-    %174 = call @func.103(%173)
+    %174 = call @func.95(%173)
     br bb18(%57, %58, %59, %174)
 bb18(%60: u32, %61: u32, %62: u32, %63: bool):
     %175 = load u64, ptr %130
-    %176 = call @func.101(%175)
+    %176 = call @func.93(%175)
     br bb19(%60, %61, %62, %63, %176)
 bb19(%64: u32, %65: u32, %66: u32, %67: bool, %68: bool):
     condbr %68, bb20(%64, %65, %66, %67), bb21(%64, %65, %66, %67)
@@ -22365,11 +22326,11 @@ bb20(%69: u32, %70: u32, %71: u32, %72: bool):
     br bb22(%69, %70, %71, %72, %177)
 bb21(%73: u32, %74: u32, %75: u32, %76: bool):
     %178 = load u64, ptr %131
-    %179 = call @func.101(%178)
+    %179 = call @func.93(%178)
     br bb22(%73, %74, %75, %76, %179)
 bb22(%77: u32, %78: u32, %79: u32, %80: bool, %81: bool):
     %180 = load u64, ptr %130
-    %181 = call @func.102(%180)
+    %181 = call @func.94(%180)
     br bb23(%77, %78, %79, %80, %81, %181)
 bb23(%82: u32, %83: u32, %84: u32, %85: bool, %86: bool, %87: bool):
     condbr %87, bb24(%82, %83, %84, %85, %86), bb25(%82, %83, %84, %85, %86)
@@ -22378,11 +22339,11 @@ bb24(%88: u32, %89: u32, %90: u32, %91: bool, %92: bool):
     br bb26(%88, %89, %90, %91, %92, %182)
 bb25(%93: u32, %94: u32, %95: u32, %96: bool, %97: bool):
     %183 = load u64, ptr %131
-    %184 = call @func.102(%183)
+    %184 = call @func.94(%183)
     br bb26(%93, %94, %95, %96, %97, %184)
 bb26(%98: u32, %99: u32, %100: u32, %101: bool, %102: bool, %103: bool):
     %185 = load u64, ptr %130
-    %186 = call @func.151(%185)
+    %186 = call @func.129(%185)
     br bb27(%98, %99, %100, %101, %102, %103, %186)
 bb27(%104: u32, %105: u32, %106: u32, %107: bool, %108: bool, %109: bool, %110: bool):
     condbr %110, bb28(%104, %105, %106, %107, %108, %109), bb29(%104, %105, %106, %107, %108, %109)
@@ -22391,10 +22352,10 @@ bb28(%111: u32, %112: u32, %113: u32, %114: bool, %115: bool, %116: bool):
     br bb30(%111, %112, %113, %114, %115, %116, %187)
 bb29(%117: u32, %118: u32, %119: u32, %120: bool, %121: bool, %122: bool):
     %188 = load u64, ptr %131
-    %189 = call @func.151(%188)
+    %189 = call @func.129(%188)
     br bb30(%117, %118, %119, %120, %121, %122, %189)
 bb30(%123: u32, %124: u32, %125: u32, %126: bool, %127: bool, %128: bool, %129: bool):
-    call @func.129(%0, %125, %124, %123, %126, %127, %128, %129)
+    call @func.115(%0, %125, %124, %123, %126, %127, %128, %129)
     br bb31
 bb31:
     ret
@@ -22465,7 +22426,7 @@ bb6:
     %50 = const bool false
     br bb14(%50)
 bb7(%1: ptr):
-    %51 = call @func.141(%1)
+    %51 = call @func.123(%1)
     br bb14(%51)
 bb8(%2: ptr, %3: ptr):
     %52 = load ptr, ptr %2
@@ -22473,7 +22434,7 @@ bb8(%2: ptr, %3: ptr):
     %54 = gep i8, ptr %52, %53
     br bb9(%3, %54)
 bb9(%4: ptr, %5: ptr):
-    %55 = call @func.141(%5)
+    %55 = call @func.123(%5)
     br bb10(%4, %55)
 bb10(%6: ptr, %7: bool):
     condbr %7, bb11, bb12(%6)
@@ -22486,7 +22447,7 @@ bb12(%8: ptr):
     %59 = gep i8, ptr %57, %58
     br bb13(%59)
 bb13(%9: ptr):
-    %60 = call @func.141(%9)
+    %60 = call @func.123(%9)
     br bb14(%60)
 bb14(%10: bool):
     ret %10
@@ -22496,13 +22457,13 @@ fn @hash_levels(functy.142) {
 bb0(%0: ptr):
     %7 = alloca i64, align 8
     %8 = alloca (i64, i64), align 8
-    call @func.181(%7)
+    call @func.155(%7)
     br bb1
 bb1:
     %9 = const i64 8
     %10 = gep i8, ptr %0, %9
     %11 = load u64, ptr %10
-    call @func.194(%7, %11)
+    call @func.166(%7, %11)
     br bb2
 bb2:
     %12 = const u64 0
@@ -22524,7 +22485,7 @@ bb5(%3: u64, %4: u64):
     %22 = const u64 40
     %23 = mul u64 %4, %22
     %24 = gep i8, ptr %21, %23
-    call @func.192(%24, %7)
+    call @func.165(%24, %7)
     br bb6(%3)
 bb6(%5: u64):
     %25 = const u64 1
@@ -22543,24 +22504,12 @@ bb7:
     %35 = load u64, ptr %8
     br bb3(%35)
 bb8:
-    %36 = call @func.186(%7)
+    %36 = call @func.160(%7)
     br bb9(%36)
 bb9(%6: u64):
     ret %6
 bb10:
     unreachable
-}
-
-fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.143) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.144) {
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.145) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.146) {
 }
 
 fn @ExprMeta__mk_let_meta(functy.147) {
@@ -22573,21 +22522,21 @@ bb0(%0: ptr, %1: u64, %2: u64, %3: u64):
     store u64 %2, ptr %176
     store u64 %3, ptr %177
     %179 = load u64, ptr %175
-    %180 = call @func.148(%179)
+    %180 = call @func.126(%179)
     br bb1(%180)
 bb1(%4: u8):
     %181 = load u64, ptr %176
-    %182 = call @func.148(%181)
+    %182 = call @func.126(%181)
     br bb2(%4, %182)
 bb2(%5: u8, %6: u8):
-    %183 = call @func.143(%5, %6)
+    %183 = call @func.117(%5, %6)
     br bb3(%183)
 bb3(%7: u8):
     %184 = load u64, ptr %177
-    %185 = call @func.148(%184)
+    %185 = call @func.126(%184)
     br bb4(%7, %185)
 bb4(%8: u8, %9: u8):
-    %186 = call @func.143(%8, %9)
+    %186 = call @func.117(%8, %9)
     br bb5(%186)
 bb5(%10: u8):
     %187 = zext u8 %10 to u32
@@ -22606,65 +22555,65 @@ bb5(%10: u8):
 bb6:
     %198 = load u32, ptr %178
     %199 = const u32 255
-    %200 = call @func.144(%198, %199)
+    %200 = call @func.82(%198, %199)
     br bb7(%200)
 bb7(%11: u32):
     %201 = load u64, ptr %177
-    %202 = call @func.150(%201)
+    %202 = call @func.128(%201)
     br bb8(%11, %202)
 bb8(%12: u32, %13: u32):
     %203 = const u32 1
-    %204 = call @func.145(%13, %203)
+    %204 = call @func.120(%13, %203)
     br bb9(%12, %204)
 bb9(%14: u32, %15: u32):
     %205 = load u64, ptr %175
-    %206 = call @func.150(%205)
+    %206 = call @func.128(%205)
     br bb10(%14, %15, %206)
 bb10(%16: u32, %17: u32, %18: u32):
     %207 = load u64, ptr %176
-    %208 = call @func.150(%207)
+    %208 = call @func.128(%207)
     br bb11(%16, %17, %18, %208)
 bb11(%19: u32, %20: u32, %21: u32, %22: u32):
-    %209 = call @func.146(%21, %22)
+    %209 = call @func.118(%21, %22)
     br bb12(%19, %20, %209)
 bb12(%23: u32, %24: u32, %25: u32):
-    %210 = call @func.146(%25, %24)
+    %210 = call @func.118(%25, %24)
     br bb13(%23, %210)
 bb13(%26: u32, %27: u32):
     %211 = zext u32 %26 to u64
     %212 = load u64, ptr %175
-    %213 = call @func.149(%212)
+    %213 = call @func.127(%212)
     br bb14(%26, %27, %211, %213)
 bb14(%28: u32, %29: u32, %30: u64, %31: u32):
     %214 = zext u32 %31 to u64
     %215 = load u64, ptr %176
-    %216 = call @func.149(%215)
+    %216 = call @func.127(%215)
     br bb15(%28, %29, %30, %214, %216)
 bb15(%32: u32, %33: u32, %34: u64, %35: u64, %36: u32):
     %217 = zext u32 %36 to u64
     %218 = load u64, ptr %177
-    %219 = call @func.149(%218)
+    %219 = call @func.127(%218)
     br bb16(%32, %33, %34, %35, %217, %219)
 bb16(%37: u32, %38: u32, %39: u64, %40: u64, %41: u64, %42: u32):
     %220 = zext u32 %42 to u64
-    %221 = call @func.127(%41, %220)
+    %221 = call @func.114(%41, %220)
     br bb17(%37, %38, %39, %40, %221)
 bb17(%43: u32, %44: u32, %45: u64, %46: u64, %47: u64):
-    %222 = call @func.127(%46, %47)
+    %222 = call @func.114(%46, %47)
     br bb18(%43, %44, %45, %222)
 bb18(%48: u32, %49: u32, %50: u64, %51: u64):
-    %223 = call @func.127(%50, %51)
+    %223 = call @func.114(%50, %51)
     br bb19(%48, %49, %223)
 bb19(%52: u32, %53: u32, %54: u64):
     %224 = trunc u64 %54 to u32
     %225 = load u64, ptr %175
-    %226 = call @func.103(%225)
+    %226 = call @func.95(%225)
     br bb20(%52, %53, %224, %226)
 bb20(%55: u32, %56: u32, %57: u32, %58: bool):
     condbr %58, bb23(%55, %56, %57), bb21(%55, %56, %57)
 bb21(%59: u32, %60: u32, %61: u32):
     %227 = load u64, ptr %176
-    %228 = call @func.103(%227)
+    %228 = call @func.95(%227)
     br bb22(%59, %60, %61, %228)
 bb22(%62: u32, %63: u32, %64: u32, %65: bool):
     condbr %65, bb23(%62, %63, %64), bb24(%62, %63, %64)
@@ -22673,17 +22622,17 @@ bb23(%66: u32, %67: u32, %68: u32):
     br bb25(%66, %67, %68, %229)
 bb24(%69: u32, %70: u32, %71: u32):
     %230 = load u64, ptr %177
-    %231 = call @func.103(%230)
+    %231 = call @func.95(%230)
     br bb25(%69, %70, %71, %231)
 bb25(%72: u32, %73: u32, %74: u32, %75: bool):
     %232 = load u64, ptr %175
-    %233 = call @func.101(%232)
+    %233 = call @func.93(%232)
     br bb26(%72, %73, %74, %75, %233)
 bb26(%76: u32, %77: u32, %78: u32, %79: bool, %80: bool):
     condbr %80, bb29(%76, %77, %78, %79), bb27(%76, %77, %78, %79)
 bb27(%81: u32, %82: u32, %83: u32, %84: bool):
     %234 = load u64, ptr %176
-    %235 = call @func.101(%234)
+    %235 = call @func.93(%234)
     br bb28(%81, %82, %83, %84, %235)
 bb28(%85: u32, %86: u32, %87: u32, %88: bool, %89: bool):
     condbr %89, bb29(%85, %86, %87, %88), bb30(%85, %86, %87, %88)
@@ -22692,17 +22641,17 @@ bb29(%90: u32, %91: u32, %92: u32, %93: bool):
     br bb31(%90, %91, %92, %93, %236)
 bb30(%94: u32, %95: u32, %96: u32, %97: bool):
     %237 = load u64, ptr %177
-    %238 = call @func.101(%237)
+    %238 = call @func.93(%237)
     br bb31(%94, %95, %96, %97, %238)
 bb31(%98: u32, %99: u32, %100: u32, %101: bool, %102: bool):
     %239 = load u64, ptr %175
-    %240 = call @func.102(%239)
+    %240 = call @func.94(%239)
     br bb32(%98, %99, %100, %101, %102, %240)
 bb32(%103: u32, %104: u32, %105: u32, %106: bool, %107: bool, %108: bool):
     condbr %108, bb35(%103, %104, %105, %106, %107), bb33(%103, %104, %105, %106, %107)
 bb33(%109: u32, %110: u32, %111: u32, %112: bool, %113: bool):
     %241 = load u64, ptr %176
-    %242 = call @func.102(%241)
+    %242 = call @func.94(%241)
     br bb34(%109, %110, %111, %112, %113, %242)
 bb34(%114: u32, %115: u32, %116: u32, %117: bool, %118: bool, %119: bool):
     condbr %119, bb35(%114, %115, %116, %117, %118), bb36(%114, %115, %116, %117, %118)
@@ -22711,17 +22660,17 @@ bb35(%120: u32, %121: u32, %122: u32, %123: bool, %124: bool):
     br bb37(%120, %121, %122, %123, %124, %243)
 bb36(%125: u32, %126: u32, %127: u32, %128: bool, %129: bool):
     %244 = load u64, ptr %177
-    %245 = call @func.102(%244)
+    %245 = call @func.94(%244)
     br bb37(%125, %126, %127, %128, %129, %245)
 bb37(%130: u32, %131: u32, %132: u32, %133: bool, %134: bool, %135: bool):
     %246 = load u64, ptr %175
-    %247 = call @func.151(%246)
+    %247 = call @func.129(%246)
     br bb38(%130, %131, %132, %133, %134, %135, %247)
 bb38(%136: u32, %137: u32, %138: u32, %139: bool, %140: bool, %141: bool, %142: bool):
     condbr %142, bb41(%136, %137, %138, %139, %140, %141), bb39(%136, %137, %138, %139, %140, %141)
 bb39(%143: u32, %144: u32, %145: u32, %146: bool, %147: bool, %148: bool):
     %248 = load u64, ptr %176
-    %249 = call @func.151(%248)
+    %249 = call @func.129(%248)
     br bb40(%143, %144, %145, %146, %147, %148, %249)
 bb40(%149: u32, %150: u32, %151: u32, %152: bool, %153: bool, %154: bool, %155: bool):
     condbr %155, bb41(%149, %150, %151, %152, %153, %154), bb42(%149, %150, %151, %152, %153, %154)
@@ -22730,10 +22679,10 @@ bb41(%156: u32, %157: u32, %158: u32, %159: bool, %160: bool, %161: bool):
     br bb43(%156, %157, %158, %159, %160, %161, %250)
 bb42(%162: u32, %163: u32, %164: u32, %165: bool, %166: bool, %167: bool):
     %251 = load u64, ptr %177
-    %252 = call @func.151(%251)
+    %252 = call @func.129(%251)
     br bb43(%162, %163, %164, %165, %166, %167, %252)
 bb43(%168: u32, %169: u32, %170: u32, %171: bool, %172: bool, %173: bool, %174: bool):
-    call @func.129(%0, %170, %169, %168, %171, %172, %173, %174)
+    call @func.115(%0, %170, %169, %168, %171, %172, %173, %174)
     br bb44
 bb44:
     ret
@@ -22814,16 +22763,13 @@ bb2:
     unreachable
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.152) {
-}
-
 fn @ExprMeta__mk_wrapper_meta(functy.153) {
 bb0(%0: ptr, %1: u64, %2: u64):
     %42 = alloca i64, align 8
     %43 = alloca (i32, i32), align 4
     store u64 %1, ptr %42
     %44 = load u64, ptr %42
-    %45 = call @func.148(%44)
+    %45 = call @func.126(%44)
     br bb1(%2, %45)
 bb1(%3: u64, %4: u8):
     %46 = zext u8 %4 to u32
@@ -22842,43 +22788,43 @@ bb1(%3: u64, %4: u8):
 bb2(%5: u64):
     %57 = load u32, ptr %43
     %58 = const u32 255
-    %59 = call @func.152(%57, %58)
+    %59 = call @func.82(%57, %58)
     br bb3(%5, %59)
 bb3(%6: u64, %7: u32):
     %60 = zext u32 %7 to u64
     %61 = load u64, ptr %42
-    %62 = call @func.149(%61)
+    %62 = call @func.127(%61)
     br bb4(%6, %7, %60, %62)
 bb4(%8: u64, %9: u32, %10: u64, %11: u32):
     %63 = zext u32 %11 to u64
-    %64 = call @func.127(%63, %8)
+    %64 = call @func.114(%63, %8)
     br bb5(%9, %10, %64)
 bb5(%12: u32, %13: u64, %14: u64):
-    %65 = call @func.127(%13, %14)
+    %65 = call @func.114(%13, %14)
     br bb6(%12, %65)
 bb6(%15: u32, %16: u64):
     %66 = trunc u64 %16 to u32
     %67 = load u64, ptr %42
-    %68 = call @func.150(%67)
+    %68 = call @func.128(%67)
     br bb7(%15, %66, %68)
 bb7(%17: u32, %18: u32, %19: u32):
     %69 = load u64, ptr %42
-    %70 = call @func.103(%69)
+    %70 = call @func.95(%69)
     br bb8(%17, %18, %19, %70)
 bb8(%20: u32, %21: u32, %22: u32, %23: bool):
     %71 = load u64, ptr %42
-    %72 = call @func.101(%71)
+    %72 = call @func.93(%71)
     br bb9(%20, %21, %22, %23, %72)
 bb9(%24: u32, %25: u32, %26: u32, %27: bool, %28: bool):
     %73 = load u64, ptr %42
-    %74 = call @func.102(%73)
+    %74 = call @func.94(%73)
     br bb10(%24, %25, %26, %27, %28, %74)
 bb10(%29: u32, %30: u32, %31: u32, %32: bool, %33: bool, %34: bool):
     %75 = load u64, ptr %42
-    %76 = call @func.151(%75)
+    %76 = call @func.129(%75)
     br bb11(%29, %30, %31, %32, %33, %34, %76)
 bb11(%35: u32, %36: u32, %37: u32, %38: bool, %39: bool, %40: bool, %41: bool):
-    call @func.129(%0, %36, %37, %35, %38, %39, %40, %41)
+    call @func.115(%0, %36, %37, %35, %38, %39, %40, %41)
     br bb12
 bb12:
     ret
@@ -22888,7 +22834,7 @@ bb13:
 
 fn @Verifier____env___whnf_impl(functy.154) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    call @func.197(%0, %1, %2, %3)
+    call @func.168(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
@@ -22939,7 +22885,7 @@ bb1:
     store u64 %33, ptr %36
     %37 = load ptr, ptr %5
     %38 = load u64, ptr %0
-    call @func.203(%37, %38)
+    call @func.172(%37, %38)
     br bb2
 bb2:
     %39 = load ptr, ptr %5
@@ -23185,7 +23131,7 @@ bb2:
     %236 = gep i8, ptr %231, %235
     %237 = load i8, ptr %234
     store i8 %237, ptr %236
-    call @func.155(%39, %7)
+    call @func.132(%39, %7)
     br bb3
 bb3:
     ret
@@ -23205,10 +23151,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u64):
     store i64 %10, ptr %9
     %11 = const i64 4
     store i64 %11, ptr %7
-    call @func.49(%6, %7)
+    call @func.44(%6, %7)
     br bb1(%2)
 bb1(%4: ptr):
-    call @func.166(%0, %4, %6)
+    call @func.143(%0, %4, %6)
     br bb2
 bb2:
     br bb3
@@ -23225,7 +23171,7 @@ bb0(%0: ptr):
     %2 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     store ptr %0, ptr %1
     %3 = load ptr, ptr %1
-    call @func.158(%2, %3)
+    call @func.135(%2, %3)
     br bb1
 bb1:
     br bb2
@@ -23247,7 +23193,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %52 = const bool false
     %53 = const bool true
     %54 = const bool true
-    %55 = call @func.79(%2)
+    %55 = call @func.73(%2)
     br bb1(%55, %54, %53)
 bb1(%3: bool, %4: bool, %5: bool):
     condbr %3, bb2(%4, %5), bb3(%4, %5)
@@ -23256,7 +23202,7 @@ bb2(%6: bool, %7: bool):
     store i64 %56, ptr %0
     br bb25(%6, %7)
 bb3(%8: bool, %9: bool):
-    %57 = call @func.204(%2)
+    %57 = call @func.173(%2)
     br bb4(%57, %8, %9)
 bb4(%10: bool, %11: bool, %12: bool):
     condbr %10, bb5, bb6(%11, %12)
@@ -23315,10 +23261,10 @@ bb5:
     %100 = gep i8, ptr %44, %99
     %101 = load i64, ptr %98
     store i64 %101, ptr %100
-    call @func.205(%0, %43, %44)
+    call @func.174(%0, %43, %44)
     br bb27(%80, %58)
 bb6(%13: bool, %14: bool):
-    %102 = call @func.79(%1)
+    %102 = call @func.73(%1)
     br bb7(%102, %13, %14)
 bb7(%15: bool, %16: bool, %17: bool):
     condbr %15, bb8(%17), bb9(%16, %17)
@@ -23352,13 +23298,13 @@ bb8(%18: bool):
     store i64 %124, ptr %123
     br bb25(%103, %18)
 bb9(%19: bool, %20: bool):
-    call @func.206(%46)
+    call @func.175(%46)
     br bb10(%1, %19, %20)
 bb10(%21: ptr, %22: bool, %23: bool):
-    call @func.165(%45, %46)
+    call @func.142(%45, %46)
     br bb11(%21, %22, %23)
 bb11(%24: ptr, %25: bool, %26: bool):
-    %125 = call @func.209(%24, %45)
+    %125 = call @func.178(%24, %45)
     br bb12(%125, %25, %26)
 bb12(%27: bool, %28: bool, %29: bool):
     condbr %27, bb13(%29), bb15(%28)
@@ -23396,7 +23342,7 @@ bb14(%31: bool):
 bb15(%32: bool):
     br bb16(%32)
 bb16(%33: bool):
-    %148 = call @func.209(%1, %2)
+    %148 = call @func.178(%1, %2)
     br bb17(%148, %33)
 bb17(%34: bool, %35: bool):
     condbr %34, bb18(%35), bb19
@@ -23457,7 +23403,7 @@ bb19:
     %191 = gep i8, ptr %48, %190
     %192 = load i64, ptr %189
     store i64 %192, ptr %191
-    call @func.85(%47, %48)
+    call @func.79(%47, %48)
     br bb20
 bb20:
     %193 = const bool false
@@ -23487,7 +23433,7 @@ bb20:
     %213 = gep i8, ptr %50, %212
     %214 = load i64, ptr %211
     store i64 %214, ptr %213
-    call @func.85(%49, %50)
+    call @func.79(%49, %50)
     br bb21
 bb21:
     %215 = load ptr, ptr %47
@@ -23521,7 +23467,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %6 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %7 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %8 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.211(%5, %1, %2)
+    call @func.179(%5, %1, %2)
     br bb1(%1)
 bb1(%3: ptr):
     %9 = load i64, ptr %5
@@ -23594,7 +23540,7 @@ bb4(%4: ptr):
     %60 = gep i8, ptr %6, %59
     %61 = load i64, ptr %58
     store i64 %61, ptr %60
-    call @func.212(%7, %4, %6)
+    call @func.180(%7, %4, %6)
     br bb5
 bb5:
     %62 = load i64, ptr %7
@@ -23753,7 +23699,7 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     store ptr %1, ptr %10
     store u64 %2, ptr %11
     %14 = load ptr, ptr %10
-    %15 = call @func.162(%14)
+    %15 = call @func.139(%14)
     br bb1(%15)
 bb1(%3: u64):
     %16 = const u64 0
@@ -23775,20 +23721,20 @@ bb2(%4: u64):
 bb3:
     %28 = load u64, ptr %12
     %29 = load ptr, ptr %10
-    %30 = call @func.163(%29, %28)
+    %30 = call @func.140(%29, %28)
     store ptr %30, ptr %13
     br bb4(%28)
 bb4(%5: u64):
     %31 = load ptr, ptr %13
     %32 = const i64 200
     %33 = gep i8, ptr %31, %32
-    %34 = call @func.213(%33, %11)
+    %34 = call @func.181(%33, %11)
     br bb5(%5, %34)
 bb5(%6: u64, %7: bool):
     condbr %7, bb6(%6), bb1(%6)
 bb6(%8: u64):
     %35 = load ptr, ptr %10
-    %36 = call @func.163(%35, %8)
+    %36 = call @func.140(%35, %8)
     br bb7(%36)
 bb7(%9: ptr):
     store ptr %9, ptr %0
@@ -23806,7 +23752,7 @@ bb10:
 fn @Level__succ(functy.165) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
-    call @func.85(%2, %1)
+    call @func.79(%2, %1)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -23821,7 +23767,7 @@ bb1:
 fn @Expr__instantiate(functy.166) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
     %3 = const u32 0
-    call @func.216(%0, %1, %2, %3)
+    call @func.182(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
@@ -23833,13 +23779,10 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     store u64 %2, ptr %3
     %4 = load u64, ptr %3
     %5 = const u32 0
-    call @func.218(%0, %1, %4, %5)
+    call @func.183(%0, %1, %4, %5)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE4pushBH_(functy.168) {
 }
 
 fn @LocalContext__push_let(functy.169) {
@@ -23888,7 +23831,7 @@ bb1:
     store u64 %38, ptr %41
     %42 = load ptr, ptr %6
     %43 = load u64, ptr %0
-    call @func.203(%42, %43)
+    call @func.172(%42, %43)
     br bb2
 bb2:
     %44 = load ptr, ptr %6
@@ -24248,7 +24191,7 @@ bb3(%5: ptr):
     %333 = gep i8, ptr %328, %332
     %334 = load i8, ptr %331
     store i8 %334, ptr %333
-    call @func.168(%5, %8)
+    call @func.132(%5, %8)
     br bb4
 bb4:
     ret
@@ -24286,7 +24229,7 @@ bb0(%0: ptr, %1: ptr, %2: u64, %3: ptr):
     %97 = const bool false
     %98 = const bool false
     %99 = load ptr, ptr %74
-    %100 = call @func.69(%99)
+    %100 = call @func.63(%99)
     br bb1(%3, %100)
 bb1(%4: ptr, %5: bool):
     condbr %5, bb2(%4), bb3
@@ -24368,7 +24311,7 @@ bb6(%8: ptr):
     %164 = const i64 48
     %165 = gep i8, ptr %163, %164
     %166 = const bool true
-    call @func.66(%89, %159)
+    call @func.60(%89, %159)
     br bb38(%8, %162, %165)
 bb7(%9: ptr):
     %167 = load ptr, ptr %76
@@ -24385,7 +24328,7 @@ bb7(%9: ptr):
     %178 = const i64 64
     %179 = gep i8, ptr %177, %178
     %180 = const bool true
-    call @func.66(%85, %167)
+    call @func.60(%85, %167)
     br bb30(%9, %170, %173, %176, %179)
 bb8(%10: ptr):
     %181 = load ptr, ptr %76
@@ -24446,7 +24389,7 @@ bb11(%13: ptr):
     %226 = load ptr, ptr %76
     %227 = const i64 8
     %228 = gep i8, ptr %226, %227
-    %229 = call @func.213(%228, %75)
+    %229 = call @func.181(%228, %75)
     br bb12(%13, %229)
 bb12(%14: ptr, %15: bool):
     condbr %15, bb13(%14), bb14
@@ -24460,7 +24403,7 @@ bb14:
 bb15(%17: ptr, %18: ptr, %19: ptr):
     %231 = const bool true
     %232 = load u64, ptr %75
-    call @func.170(%77, %19, %232, %17)
+    call @func.146(%77, %19, %232, %17)
     br bb16(%17, %18)
 bb16(%20: ptr, %21: ptr):
     %233 = load ptr, ptr %21
@@ -24469,11 +24412,11 @@ bb16(%20: ptr, %21: ptr):
     br bb17(%20, %235)
 bb17(%22: ptr, %23: ptr):
     %236 = load u64, ptr %75
-    call @func.170(%78, %23, %236, %22)
+    call @func.146(%78, %23, %236, %22)
     br bb18
 bb18:
     %237 = const bool false
-    call @func.56(%0, %77, %78)
+    call @func.50(%0, %77, %78)
     br bb19
 bb19:
     %238 = const bool false
@@ -24481,7 +24424,7 @@ bb19:
 bb20(%24: ptr, %25: ptr, %26: ptr):
     %239 = const bool true
     %240 = load u64, ptr %75
-    call @func.170(%80, %26, %240, %24)
+    call @func.146(%80, %26, %240, %24)
     br bb21(%24, %25)
 bb21(%27: ptr, %28: ptr):
     %241 = load ptr, ptr %28
@@ -24490,7 +24433,7 @@ bb21(%27: ptr, %28: ptr):
     br bb22(%27, %243)
 bb22(%29: ptr, %30: ptr):
     %244 = load u64, ptr %75
-    call @func.170(%81, %30, %244, %29)
+    call @func.146(%81, %30, %244, %29)
     br bb23
 bb23:
     %245 = const bool false
@@ -24502,7 +24445,7 @@ bb24:
 bb25(%31: ptr, %32: ptr, %33: ptr):
     %247 = const bool true
     %248 = load u64, ptr %75
-    call @func.170(%83, %33, %248, %31)
+    call @func.146(%83, %33, %248, %31)
     br bb26(%31, %32)
 bb26(%34: ptr, %35: ptr):
     %249 = load ptr, ptr %35
@@ -24511,11 +24454,11 @@ bb26(%34: ptr, %35: ptr):
     br bb27(%34, %251)
 bb27(%36: ptr, %37: ptr):
     %252 = load u64, ptr %75
-    call @func.170(%84, %37, %252, %36)
+    call @func.146(%84, %37, %252, %36)
     br bb28
 bb28:
     %253 = const bool false
-    call @func.53(%0, %82, %83, %84)
+    call @func.47(%0, %82, %83, %84)
     br bb29
 bb29:
     %254 = const bool false
@@ -24527,7 +24470,7 @@ bb30(%38: ptr, %39: ptr, %40: ptr, %41: ptr, %42: ptr):
     br bb31(%38, %40, %41, %42, %257)
 bb31(%43: ptr, %44: ptr, %45: ptr, %46: ptr, %47: ptr):
     %258 = load u64, ptr %75
-    call @func.170(%86, %47, %258, %43)
+    call @func.146(%86, %47, %258, %43)
     br bb32(%43, %44, %45, %46)
 bb32(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
     %259 = const bool true
@@ -24537,7 +24480,7 @@ bb32(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
     br bb33(%48, %50, %51, %262)
 bb33(%52: ptr, %53: ptr, %54: ptr, %55: ptr):
     %263 = load u64, ptr %75
-    call @func.170(%87, %55, %263, %52)
+    call @func.146(%87, %55, %263, %52)
     br bb34(%52, %53, %54)
 bb34(%56: ptr, %57: ptr, %58: ptr):
     %264 = const bool true
@@ -24547,14 +24490,14 @@ bb34(%56: ptr, %57: ptr, %58: ptr):
     br bb35(%56, %58, %267)
 bb35(%59: ptr, %60: ptr, %61: ptr):
     %268 = load u64, ptr %75
-    call @func.170(%88, %61, %268, %59)
+    call @func.146(%88, %61, %268, %59)
     br bb36(%60)
 bb36(%62: ptr):
     %269 = load bool, ptr %62
     %270 = const bool false
     %271 = const bool false
     %272 = const bool false
-    call @func.55(%0, %85, %86, %87, %88, %269)
+    call @func.49(%0, %85, %86, %87, %88, %269)
     br bb37
 bb37:
     %273 = const bool false
@@ -24569,21 +24512,21 @@ bb38(%63: ptr, %64: ptr, %65: ptr):
     br bb39(%63, %276, %279)
 bb39(%66: ptr, %67: u32, %68: ptr):
     %280 = load u64, ptr %75
-    call @func.170(%90, %68, %280, %66)
+    call @func.146(%90, %68, %280, %66)
     br bb40(%67)
 bb40(%69: u32):
     %281 = const bool false
-    call @func.219(%0, %89, %69, %90)
+    call @func.184(%0, %89, %69, %90)
     br bb41
 bb41:
     %282 = const bool false
     br bb44
 bb42(%70: ptr, %71: u32, %72: ptr):
     %283 = load u64, ptr %75
-    call @func.170(%91, %72, %283, %70)
+    call @func.146(%91, %72, %283, %70)
     br bb43(%71)
 bb43(%73: u32):
-    call @func.220(%0, %73, %91)
+    call @func.185(%0, %73, %91)
     br bb44
 bb44:
     ret
@@ -24627,7 +24570,7 @@ bb0(%0: ptr):
     %25 = gep i8, ptr %1, %24
     %26 = const u64 6
     store u64 %26, ptr %25
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -24659,7 +24602,7 @@ bb0(%0: ptr):
     %16 = gep i8, ptr %1, %15
     %17 = const u64 3
     store u64 %17, ptr %16
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -24672,9 +24615,6 @@ fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_de
 }
 
 fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.175) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.176) {
 }
 
 fn @Verifier____env___def_eq_inner(functy.177) {
@@ -24729,11 +24669,11 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %227 = alloca i64, align 8
     store ptr %3, ptr %180
     %228 = load ptr, ptr %180
-    call @func.154(%181, %0, %1, %228)
+    call @func.131(%181, %0, %1, %228)
     br bb1(%0, %2)
 bb1(%4: ptr, %5: ptr):
     %229 = load ptr, ptr %180
-    call @func.154(%182, %4, %5, %229)
+    call @func.131(%182, %4, %5, %229)
     br bb2(%4)
 bb2(%6: ptr):
     %230 = const i64 72
@@ -24741,7 +24681,7 @@ bb2(%6: ptr):
     %232 = load i64, ptr %231
     store i64 %232, ptr %183
     %233 = load u64, ptr %183
-    %234 = call @func.221(%233)
+    %234 = call @func.186(%233)
     br bb3(%6, %234)
 bb3(%7: ptr, %8: u64):
     %235 = const i64 72
@@ -24749,13 +24689,13 @@ bb3(%7: ptr, %8: u64):
     %237 = load i64, ptr %236
     store i64 %237, ptr %184
     %238 = load u64, ptr %184
-    %239 = call @func.221(%238)
+    %239 = call @func.186(%238)
     br bb4(%7, %8, %239)
 bb4(%9: ptr, %10: u64, %11: u64):
     %240 = icmp eq u64 %10, %11
     condbr %240, bb5(%9), bb8(%9)
 bb5(%12: ptr):
-    %241 = call @func.226(%12, %181, %182)
+    %241 = call @func.187(%12, %181, %182)
     br bb6(%12, %241)
 bb6(%13: ptr, %14: bool):
     condbr %14, bb7, bb8(%13)
@@ -24813,7 +24753,7 @@ bb8(%15: ptr):
     switch %287 [ 5: bb10(%15) 6: bb11(%15) default: bb9(%15) ]
 bb9(%16: ptr):
     %288 = load ptr, ptr %180
-    call @func.227(%186, %16, %181, %182, %288)
+    call @func.188(%186, %16, %181, %182, %288)
     br bb13(%16)
 bb10(%17: ptr):
     %289 = const i64 8
@@ -24911,7 +24851,7 @@ bb11(%18: ptr):
     switch %378 [ 6: bb12(%18) default: bb9(%18) ]
 bb12(%19: ptr):
     %379 = load ptr, ptr %180
-    %380 = call @func.230(%19, %181, %182, %379)
+    %380 = call @func.189(%19, %181, %182, %379)
     br bb77(%380)
 bb13(%20: ptr):
     %381 = load i8, ptr %186
@@ -25458,7 +25398,7 @@ bb28(%34: ptr):
     %880 = load ptr, ptr %205
     %881 = const i64 48
     %882 = gep i8, ptr %880, %881
-    %883 = call @func.65(%856, %870)
+    %883 = call @func.59(%856, %870)
     br bb59(%34, %864, %882, %883)
 bb29(%35: ptr):
     %884 = load ptr, ptr %187
@@ -25475,7 +25415,7 @@ bb29(%35: ptr):
     %892 = const i64 8
     %893 = gep i8, ptr %891, %892
     store ptr %893, ptr %195
-    %894 = call @func.173(%194, %195)
+    %894 = call @func.149(%194, %195)
     br bb78(%35, %894)
 bb30(%36: ptr):
     %895 = load ptr, ptr %187
@@ -25572,7 +25512,7 @@ bb32(%38: ptr):
     %968 = load ptr, ptr %221
     %969 = const i64 48
     %970 = gep i8, ptr %968, %969
-    %971 = call @func.65(%954, %964)
+    %971 = call @func.59(%954, %964)
     br bb36(%38, %958, %970, %971)
 bb33(%39: ptr):
     %972 = load ptr, ptr %187
@@ -25587,7 +25527,7 @@ bb33(%39: ptr):
     %979 = load ptr, ptr %223
     %980 = const i64 8
     %981 = gep i8, ptr %979, %980
-    %982 = call @func.231(%39, %975, %981)
+    %982 = call @func.190(%39, %975, %981)
     br bb79(%39, %982)
 bb34(%40: ptr):
     %983 = load ptr, ptr %187
@@ -25604,7 +25544,7 @@ bb34(%40: ptr):
     %991 = const i64 8
     %992 = gep i8, ptr %990, %991
     store ptr %992, ptr %191
-    %993 = call @func.174(%190, %191)
+    %993 = call @func.150(%190, %191)
     br bb80(%40, %993)
 bb35(%41: ptr):
     %994 = load ptr, ptr %187
@@ -25621,21 +25561,21 @@ bb35(%41: ptr):
     %1002 = const i64 8
     %1003 = gep i8, ptr %1001, %1002
     store ptr %1003, ptr %189
-    %1004 = call @func.175(%188, %189)
+    %1004 = call @func.151(%188, %189)
     br bb81(%41, %1004)
 bb36(%42: ptr, %43: ptr, %44: ptr, %45: bool):
     condbr %45, bb37(%42, %43, %44), bb38(%42)
 bb37(%46: ptr, %47: ptr, %48: ptr):
-    call @func.176(%192, %47)
+    call @func.81(%192, %47)
     br bb39(%46, %48)
 bb38(%49: ptr):
     %1005 = const bool false
     br bb68(%49, %1005)
 bb39(%50: ptr, %51: ptr):
-    call @func.176(%193, %51)
+    call @func.81(%193, %51)
     br bb40(%50)
 bb40(%52: ptr):
-    %1006 = call @func.232(%52, %192, %193)
+    %1006 = call @func.191(%52, %192, %193)
     br bb82(%52, %1006)
 bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1007 = load ptr, ptr %55
@@ -25644,7 +25584,7 @@ bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     br bb42(%53, %54, %56, %57, %1009)
 bb42(%58: ptr, %59: ptr, %60: ptr, %61: ptr, %62: ptr):
     %1010 = load ptr, ptr %180
-    %1011 = call @func.233(%58, %61, %62, %1010)
+    %1011 = call @func.192(%58, %61, %62, %1010)
     br bb43(%58, %59, %60, %1011)
 bb43(%63: ptr, %64: ptr, %65: ptr, %66: bool):
     condbr %66, bb44(%63, %64, %65), bb45(%63)
@@ -25663,7 +25603,7 @@ bb46(%71: ptr, %72: ptr, %73: ptr):
     br bb47(%71, %73, %1018)
 bb47(%74: ptr, %75: ptr, %76: ptr):
     %1019 = load ptr, ptr %180
-    %1020 = call @func.233(%74, %75, %76, %1019)
+    %1020 = call @func.192(%74, %75, %76, %1019)
     br bb83(%74, %1020)
 bb48(%77: ptr, %78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr, %83: ptr):
     %1021 = load ptr, ptr %80
@@ -25672,7 +25612,7 @@ bb48(%77: ptr, %78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr, %83: ptr):
     br bb49(%77, %78, %79, %81, %82, %83, %1023)
 bb49(%84: ptr, %85: ptr, %86: ptr, %87: ptr, %88: ptr, %89: ptr, %90: ptr):
     %1024 = load ptr, ptr %180
-    %1025 = call @func.233(%84, %89, %90, %1024)
+    %1025 = call @func.192(%84, %89, %90, %1024)
     br bb50(%84, %85, %86, %87, %88, %1025)
 bb50(%91: ptr, %92: ptr, %93: ptr, %94: ptr, %95: ptr, %96: bool):
     condbr %96, bb51(%91, %92, %93, %94, %95), bb56(%91)
@@ -25688,7 +25628,7 @@ bb52(%102: ptr, %103: ptr, %104: ptr, %105: ptr, %106: ptr):
     br bb53(%102, %103, %105, %106, %1031)
 bb53(%107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr):
     %1032 = load ptr, ptr %180
-    %1033 = call @func.233(%107, %110, %111, %1032)
+    %1033 = call @func.192(%107, %110, %111, %1032)
     br bb54(%107, %108, %109, %1033)
 bb54(%112: ptr, %113: ptr, %114: ptr, %115: bool):
     condbr %115, bb55(%112, %113, %114), bb56(%112)
@@ -25707,12 +25647,12 @@ bb57(%120: ptr, %121: ptr, %122: ptr):
     br bb58(%120, %122, %1040)
 bb58(%123: ptr, %124: ptr, %125: ptr):
     %1041 = load ptr, ptr %180
-    %1042 = call @func.233(%123, %124, %125, %1041)
+    %1042 = call @func.192(%123, %124, %125, %1041)
     br bb84(%123, %1042)
 bb59(%126: ptr, %127: ptr, %128: ptr, %129: bool):
     condbr %129, bb60(%126, %127, %128), bb63(%126)
 bb60(%130: ptr, %131: ptr, %132: ptr):
-    %1043 = call @func.175(%196, %197)
+    %1043 = call @func.151(%196, %197)
     br bb61(%130, %131, %132, %1043)
 bb61(%133: ptr, %134: ptr, %135: ptr, %136: bool):
     condbr %136, bb62(%133, %134, %135), bb63(%133)
@@ -25731,7 +25671,7 @@ bb64(%141: ptr, %142: ptr, %143: ptr):
     br bb65(%141, %143, %1050)
 bb65(%144: ptr, %145: ptr, %146: ptr):
     %1051 = load ptr, ptr %180
-    %1052 = call @func.233(%144, %145, %146, %1051)
+    %1052 = call @func.192(%144, %145, %146, %1051)
     br bb85(%144, %1052)
 bb66(%147: ptr, %148: ptr, %149: ptr):
     %1053 = load ptr, ptr %148
@@ -25740,7 +25680,7 @@ bb66(%147: ptr, %148: ptr, %149: ptr):
     br bb67(%147, %149, %1055)
 bb67(%150: ptr, %151: ptr, %152: ptr):
     %1056 = load ptr, ptr %180
-    %1057 = call @func.233(%150, %151, %152, %1056)
+    %1057 = call @func.192(%150, %151, %152, %1056)
     br bb86(%150, %1057)
 bb68(%153: ptr, %154: bool):
     condbr %154, bb69, bb70(%153)
@@ -25749,7 +25689,7 @@ bb69:
     br bb73(%1058)
 bb70(%155: ptr):
     %1059 = load ptr, ptr %180
-    %1060 = call @func.234(%155, %181, %182, %1059)
+    %1060 = call @func.193(%155, %181, %182, %1059)
     br bb71(%1060)
 bb71(%156: bool):
     br bb72(%156)
@@ -25785,9 +25725,6 @@ bb86(%178: ptr, %179: bool):
     br bb68(%178, %179)
 }
 
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.178) {
-}
-
 fn @_RNvMs9_NtCs2EYQwhfuABO_4core3numj12wrapping_mul(functy.179) {
 }
 
@@ -25805,7 +25742,7 @@ bb0(%0: ptr, %1: u64):
     %160 = gep i8, ptr %0, %159
     %161 = load u64, ptr %160
     %162 = const u64 14313749767032793493
-    %163 = call @func.178(%161, %162)
+    %163 = call @func.113(%161, %162)
     br bb1(%1, %161, %163)
 bb1(%2: u64, %3: u64, %4: u64):
     %164 = xor u64 %2, %4
@@ -25908,7 +25845,7 @@ bb12(%65: u64, %66: u64, %67: u64, %68: u64, %69: u64, %70: u64):
     br bb6(%65, %66, %67, %68, %69, %70, %234)
 bb13(%71: u64, %72: u64, %73: u64, %74: u64, %75: u64):
     %235 = const u64 14313749767032793493
-    %236 = call @func.178(%75, %235)
+    %236 = call @func.113(%75, %235)
     br bb14(%71, %72, %73, %74, %236)
 bb14(%76: u64, %77: u64, %78: u64, %79: u64, %80: u64):
     %237 = const u32 47
@@ -25922,12 +25859,12 @@ bb15(%81: u64, %82: u64, %83: u64, %84: u64, %85: u64, %86: u64, %87: u32):
     %243 = lshr u64 %86, %242
     %244 = xor u64 %85, %243
     %245 = const u64 14313749767032793493
-    %246 = call @func.178(%244, %245)
+    %246 = call @func.113(%244, %245)
     br bb16(%81, %82, %83, %84, %246)
 bb16(%88: u64, %89: u64, %90: u64, %91: u64, %92: u64):
     %247 = xor u64 %89, %92
     %248 = const u64 14313749767032793493
-    %249 = call @func.178(%247, %248)
+    %249 = call @func.113(%247, %248)
     br bb17(%88, %90, %91, %249)
 bb17(%93: u64, %94: u64, %95: u64, %96: u64):
     %250 = const u64 1
@@ -25989,7 +25926,7 @@ bb23(%113: u64, %114: u64, %115: u64, %116: u64, %117: u64):
 bb24(%118: u64, %119: u64, %120: u64, %121: u64, %122: u64):
     %290 = load u64, ptr %157
     %291 = const u64 8
-    %292 = call @func.179(%290, %291)
+    %292 = call @func.153(%290, %291)
     br bb25(%118, %119, %120, %121, %122, %292)
 bb25(%123: u64, %124: u64, %125: u64, %126: u64, %127: u64, %128: u64):
     %293 = const u64 63
@@ -26020,7 +25957,7 @@ bb28(%138: u64, %139: u64, %140: u64):
     condbr %310, bb29(%139), bb31(%139)
 bb29(%141: u64):
     %311 = const u64 14313749767032793493
-    %312 = call @func.178(%141, %311)
+    %312 = call @func.113(%141, %311)
     br bb30(%312)
 bb30(%142: u64):
     br bb31(%142)
@@ -26036,7 +25973,7 @@ bb32(%144: u64, %145: u64, %146: u32):
     %319 = lshr u64 %145, %318
     %320 = xor u64 %144, %319
     %321 = const u64 14313749767032793493
-    %322 = call @func.178(%320, %321)
+    %322 = call @func.113(%320, %321)
     br bb33(%322)
 bb33(%147: u64):
     %323 = const u32 47
@@ -26079,7 +26016,7 @@ bb0(%0: ptr, %1: ptr):
     %8 = load i32, ptr %7
     %9 = sext i32 %8 to i64
     store i64 %9, ptr %6
-    call @func.182(%6, %1)
+    call @func.156(%6, %1)
     br bb1(%1)
 bb1(%2: ptr):
     %10 = load ptr, ptr %5
@@ -26092,13 +26029,13 @@ bb3(%3: ptr):
     %13 = load ptr, ptr %5
     %14 = const i64 4
     %15 = gep i8, ptr %13, %14
-    call @func.183(%15, %3)
+    call @func.157(%15, %3)
     br bb5
 bb4(%4: ptr):
     %16 = load ptr, ptr %5
     %17 = const i64 8
     %18 = gep i8, ptr %16, %17
-    call @func.184(%18, %4)
+    call @func.158(%18, %4)
     br bb5
 bb5:
     ret
@@ -26110,9 +26047,6 @@ bb0(%0: ptr):
     ret %1
 }
 
-fn @_RINvXsa_NtNtCs2EYQwhfuABO_4core4hash5implsyNtB8_4Hash4hashNtCsep0XPuQfTSm_25clean_binding_defeq_slice10KaniHasherEBW_(functy.187) {
-}
-
 fn @_Name_as_std__hash__Hash___hash(functy.188) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
@@ -26120,7 +26054,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = load ptr, ptr %2
     %4 = const i64 32
     %5 = gep i8, ptr %3, %4
-    call @func.187(%5, %1)
+    call @func.158(%5, %1)
     br bb1
 bb1:
     ret
@@ -26141,10 +26075,10 @@ bb0(%0: ptr, %1: ptr):
     %14 = alloca i64, align 8
     store ptr %0, ptr %13
     %15 = load ptr, ptr %13
-    call @func.189(%14, %15)
+    call @func.162(%14, %15)
     br bb1(%1)
 bb1(%2: ptr):
-    call @func.190(%14, %2)
+    call @func.163(%14, %2)
     br bb2(%2)
 bb2(%3: ptr):
     %16 = load ptr, ptr %13
@@ -26171,7 +26105,7 @@ bb3:
     unreachable
 bb4(%4: ptr):
     %35 = load ptr, ptr %13
-    call @func.188(%35, %4)
+    call @func.161(%35, %4)
     br bb10
 bb5(%5: ptr):
     %36 = load ptr, ptr %13
@@ -26193,19 +26127,16 @@ bb7(%7: ptr):
     %48 = load ptr, ptr %13
     %49 = const i64 8
     %50 = gep i8, ptr %48, %49
-    call @func.191(%50, %7)
+    call @func.164(%50, %7)
     br bb10
 bb8(%8: ptr, %9: ptr, %10: ptr):
-    call @func.191(%9, %8)
+    call @func.164(%9, %8)
     br bb9(%8, %10)
 bb9(%11: ptr, %12: ptr):
-    call @func.191(%12, %11)
+    call @func.164(%12, %11)
     br bb10
 bb10:
     ret
-}
-
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.193) {
 }
 
 fn @_KaniHasher_as_std__hash__Hasher___write_u64(functy.194) {
@@ -26215,14 +26146,11 @@ bb0(%0: ptr, %1: u64):
     store u64 %5, ptr %0
     %6 = load u64, ptr %0
     %7 = const u64 5871781006564002453
-    %8 = call @func.193(%6, %7)
+    %8 = call @func.113(%6, %7)
     br bb1(%0, %8)
 bb1(%2: ptr, %3: u64):
     store u64 %3, ptr %2
     ret
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.195) {
 }
 
 fn @_RNvXs4_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtB7_5clone5Clone5cloneBM_(functy.196) {
@@ -26334,7 +26262,7 @@ bb4(%8: ptr, %9: ptr):
     %192 = load i64, ptr %191
     store i64 %192, ptr %121
     %193 = load u64, ptr %121
-    call @func.164(%120, %9, %193)
+    call @func.141(%120, %9, %193)
     br bb37(%8, %9)
 bb5(%10: ptr, %11: ptr):
     %194 = load ptr, ptr %103
@@ -26343,7 +26271,7 @@ bb5(%10: ptr, %11: ptr):
     %197 = load ptr, ptr %103
     %198 = const i64 48
     %199 = gep i8, ptr %197, %198
-    call @func.211(%117, %10, %196)
+    call @func.179(%117, %10, %196)
     br bb32(%10, %11)
 bb6(%12: ptr, %13: ptr):
     %200 = load ptr, ptr %103
@@ -26369,7 +26297,7 @@ bb7(%14: ptr, %15: ptr):
     br bb8(%14, %15, %214, %217)
 bb8(%16: ptr, %17: ptr, %18: ptr, %19: ptr):
     %218 = const bool true
-    call @func.154(%104, %16, %19, %17)
+    call @func.131(%104, %16, %19, %17)
     br bb9(%16, %17, %18, %218)
 bb9(%20: ptr, %21: ptr, %22: ptr, %23: bool):
     store ptr %104, ptr %105
@@ -26557,15 +26485,15 @@ bb12(%31: ptr, %32: ptr, %33: ptr, %34: ptr, %35: bool):
     %371 = gep i8, ptr %369, %370
     br bb13(%31, %32, %34, %371, %35)
 bb13(%36: ptr, %37: ptr, %38: ptr, %39: ptr, %40: bool):
-    call @func.166(%106, %38, %39)
+    call @func.143(%106, %38, %39)
     br bb14(%36, %37, %40)
 bb14(%41: ptr, %42: ptr, %43: bool):
-    call @func.154(%0, %41, %106, %42)
+    call @func.131(%0, %41, %106, %42)
     br bb15(%43)
 bb15(%44: bool):
     br bb50(%44)
 bb16(%45: ptr, %46: ptr, %47: ptr, %48: bool):
-    call @func.195(%111, %47)
+    call @func.54(%111, %47)
     br bb17(%45, %46, %48)
 bb17(%49: ptr, %50: ptr, %51: bool):
     %372 = load ptr, ptr %109
@@ -26578,10 +26506,10 @@ bb17(%49: ptr, %50: ptr, %51: bool):
     store ptr %375, ptr %377
     %378 = const i64 7
     store i64 %378, ptr %108
-    call @func.49(%107, %108)
+    call @func.44(%107, %108)
     br bb18(%49, %50, %51)
 bb18(%52: ptr, %53: ptr, %54: bool):
-    call @func.235(%112, %52, %107)
+    call @func.194(%112, %52, %107)
     br bb19(%52, %53, %54)
 bb19(%55: ptr, %56: ptr, %57: bool):
     %379 = load i64, ptr %112
@@ -26648,12 +26576,12 @@ bb20(%58: ptr, %59: ptr):
     %429 = gep i8, ptr %113, %428
     %430 = load i64, ptr %427
     store i64 %430, ptr %429
-    call @func.154(%0, %58, %113, %59)
+    call @func.131(%0, %58, %113, %59)
     br bb21
 bb21:
     br bb46
 bb22(%60: ptr, %61: ptr, %62: bool):
-    call @func.236(%114, %60, %107)
+    call @func.195(%114, %60, %107)
     br bb23(%60, %61, %62)
 bb23(%63: ptr, %64: ptr, %65: bool):
     %431 = load i64, ptr %114
@@ -26720,7 +26648,7 @@ bb24(%66: ptr, %67: ptr):
     %481 = gep i8, ptr %115, %480
     %482 = load i64, ptr %479
     store i64 %482, ptr %481
-    call @func.154(%0, %66, %115, %67)
+    call @func.131(%0, %66, %115, %67)
     br bb25
 bb25:
     br bb46
@@ -26791,10 +26719,10 @@ bb28(%69: ptr, %70: ptr, %71: ptr, %72: ptr):
     %532 = gep i8, ptr %530, %531
     br bb29(%69, %70, %72, %532)
 bb29(%73: ptr, %74: ptr, %75: ptr, %76: ptr):
-    call @func.166(%116, %75, %76)
+    call @func.143(%116, %75, %76)
     br bb30(%73, %74)
 bb30(%77: ptr, %78: ptr):
-    call @func.154(%0, %77, %116, %78)
+    call @func.131(%0, %77, %116, %78)
     br bb31
 bb31:
     br bb48
@@ -26869,7 +26797,7 @@ bb35(%81: ptr, %82: ptr):
     %584 = gep i8, ptr %118, %583
     %585 = load i64, ptr %582
     store i64 %585, ptr %584
-    call @func.154(%0, %81, %118, %82)
+    call @func.131(%0, %81, %118, %82)
     br bb36
 bb36:
     br bb48
@@ -26891,7 +26819,7 @@ bb39(%87: ptr, %88: ptr):
     %594 = load ptr, ptr %122
     %595 = const i64 120
     %596 = gep i8, ptr %594, %595
-    call @func.196(%119, %596)
+    call @func.167(%119, %596)
     br bb40(%87, %88)
 bb40(%89: ptr, %90: ptr):
     %597 = load i64, ptr %119
@@ -26962,15 +26890,15 @@ bb42(%91: ptr, %92: ptr):
     %648 = gep i8, ptr %123, %647
     %649 = load i64, ptr %646
     store i64 %649, ptr %648
-    call @func.154(%0, %91, %123, %92)
+    call @func.131(%0, %91, %123, %92)
     br bb43
 bb43:
     br bb48
 bb44(%93: ptr, %94: ptr, %95: ptr, %96: u32, %97: ptr):
-    call @func.239(%0, %93, %95, %96, %97, %94)
+    call @func.198(%0, %93, %95, %96, %97, %94)
     br bb48
 bb45(%98: ptr, %99: ptr, %100: ptr):
-    call @func.154(%0, %98, %100, %99)
+    call @func.131(%0, %98, %100, %99)
     br bb48
 bb46:
     br bb47
@@ -26983,12 +26911,6 @@ bb49:
     br bb27
 bb50(%101: bool):
     condbr %101, bb49, bb27
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3lenBG_(functy.198) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.199) {
 }
 
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdE3lenBG_(functy.200) {
@@ -27016,21 +26938,21 @@ bb0(%0: ptr, %1: u64):
     br bb1(%44, %45)
 bb1(%2: bool, %3: u64):
     %46 = load ptr, ptr %37
-    %47 = call @func.198(%46)
+    %47 = call @func.139(%46)
     br bb2(%2, %3, %3, %47)
 bb2(%4: bool, %5: u64, %6: u64, %7: u64):
     %48 = icmp ult u64 %6, %7
     condbr %48, bb3(%4, %5), bb9(%4)
 bb3(%8: bool, %9: u64):
     %49 = load ptr, ptr %37
-    %50 = call @func.199(%49, %9)
+    %50 = call @func.140(%49, %9)
     store ptr %50, ptr %39
     br bb4(%8, %9)
 bb4(%10: bool, %11: u64):
     %51 = load ptr, ptr %39
     %52 = const i64 200
     %53 = gep i8, ptr %51, %52
-    %54 = call @func.213(%53, %38)
+    %54 = call @func.181(%53, %38)
     br bb5(%10, %11, %54)
 bb5(%12: bool, %13: u64, %14: bool):
     condbr %14, bb6, bb7(%12, %13)
@@ -27087,7 +27009,7 @@ bb13(%19: bool, %20: u64):
     %87 = load ptr, ptr %37
     %88 = const i64 24
     %89 = gep i8, ptr %87, %88
-    %90 = call @func.200(%89)
+    %90 = call @func.169(%89)
     br bb14(%19, %20, %20, %90)
 bb14(%21: bool, %22: u64, %23: u64, %24: u64):
     %91 = icmp ult u64 %23, %24
@@ -27096,10 +27018,10 @@ bb15(%25: bool, %26: u64):
     %92 = load ptr, ptr %37
     %93 = const i64 24
     %94 = gep i8, ptr %92, %93
-    %95 = call @func.201(%94, %26)
+    %95 = call @func.170(%94, %26)
     br bb16(%25, %26, %95)
 bb16(%27: bool, %28: u64, %29: ptr):
-    %96 = call @func.213(%29, %38)
+    %96 = call @func.181(%29, %38)
     br bb17(%27, %28, %96)
 bb17(%30: bool, %31: u64, %32: bool):
     condbr %32, bb18, bb19(%30, %31)
@@ -27153,7 +27075,7 @@ bb24:
     %128 = const i64 24
     %129 = gep i8, ptr %127, %128
     %130 = load u64, ptr %38
-    call @func.202(%129, %130)
+    call @func.171(%129, %130)
     br bb25
 bb25:
     ret
@@ -27213,7 +27135,7 @@ bb5:
     %45 = const bool false
     br bb12(%45)
 bb6(%1: ptr, %2: ptr):
-    %46 = call @func.204(%2)
+    %46 = call @func.173(%2)
     br bb7(%1, %46)
 bb7(%3: ptr, %4: bool):
     condbr %4, bb8, bb9(%3)
@@ -27226,10 +27148,10 @@ bb9(%5: ptr):
     %50 = gep i8, ptr %48, %49
     br bb10(%50)
 bb10(%6: ptr):
-    %51 = call @func.204(%6)
+    %51 = call @func.173(%6)
     br bb12(%51)
 bb11(%7: ptr):
-    %52 = call @func.204(%7)
+    %52 = call @func.173(%7)
     br bb12(%52)
 bb12(%8: bool):
     ret %8
@@ -27245,7 +27167,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %26 = const bool false
     %27 = const bool true
     %28 = const bool true
-    %29 = call @func.209(%1, %2)
+    %29 = call @func.178(%1, %2)
     br bb1(%29, %28, %27)
 bb1(%3: bool, %4: bool, %5: bool):
     condbr %3, bb2(%4), bb3(%4, %5)
@@ -27279,7 +27201,7 @@ bb2(%6: bool):
     store i64 %51, ptr %50
     br bb15(%6, %30)
 bb3(%7: bool, %8: bool):
-    %52 = call @func.79(%1)
+    %52 = call @func.73(%1)
     br bb4(%52, %7, %8)
 bb4(%9: bool, %10: bool, %11: bool):
     condbr %9, bb5(%11), bb6(%10)
@@ -27313,7 +27235,7 @@ bb5(%12: bool):
     store i64 %74, ptr %73
     br bb15(%53, %12)
 bb6(%13: bool):
-    %75 = call @func.79(%2)
+    %75 = call @func.73(%2)
     br bb7(%75, %13)
 bb7(%14: bool, %15: bool):
     condbr %14, bb8(%15), bb9
@@ -27374,7 +27296,7 @@ bb9:
     %118 = gep i8, ptr %22, %117
     %119 = load i64, ptr %116
     store i64 %119, ptr %118
-    call @func.85(%21, %22)
+    call @func.79(%21, %22)
     br bb10
 bb10:
     %120 = const bool false
@@ -27404,7 +27326,7 @@ bb10:
     %140 = gep i8, ptr %24, %139
     %141 = load i64, ptr %138
     store i64 %141, ptr %140
-    call @func.85(%23, %24)
+    call @func.79(%23, %24)
     br bb11
 bb11:
     %142 = load ptr, ptr %21
@@ -27484,7 +27406,7 @@ bb1(%2: ptr, %3: ptr):
     %68 = icmp eq u64 %66, %67
     condbr %68, bb28(%61), bb33
 bb2:
-    call @func.207(%40, %37)
+    call @func.176(%40, %37)
     br bb3
 bb3:
     %69 = load i64, ptr %40
@@ -27650,7 +27572,7 @@ bb11:
     %210 = load ptr, ptr %209
     store ptr %210, ptr %46
     %211 = load ptr, ptr %46
-    %212 = call @func.65(%207, %211)
+    %212 = call @func.59(%207, %211)
     br bb23(%212)
 bb12:
     %213 = load ptr, ptr %41
@@ -27731,7 +27653,7 @@ bb16(%7: ptr, %8: ptr, %9: ptr):
     %269 = const i64 8
     %270 = gep i8, ptr %42, %269
     store ptr %9, ptr %270
-    call @func.208(%7, %42)
+    call @func.177(%7, %42)
     br bb31
 bb17(%10: ptr, %11: ptr, %12: ptr, %13: ptr):
     %271 = load ptr, ptr %10
@@ -27748,7 +27670,7 @@ bb19(%19: ptr, %20: ptr, %21: ptr, %22: ptr, %23: ptr):
     %277 = const i64 8
     %278 = gep i8, ptr %43, %277
     store ptr %23, ptr %278
-    call @func.208(%21, %43)
+    call @func.177(%21, %43)
     br bb20(%19, %20)
 bb20(%24: ptr, %25: ptr):
     %279 = load ptr, ptr %24
@@ -27765,7 +27687,7 @@ bb22(%29: ptr, %30: ptr, %31: ptr):
     %285 = const i64 8
     %286 = gep i8, ptr %44, %285
     store ptr %31, ptr %286
-    call @func.208(%29, %44)
+    call @func.177(%29, %44)
     br bb32
 bb23(%32: bool):
     condbr %32, bb2, bb24
@@ -27819,9 +27741,6 @@ bb32:
     br bb2
 bb33:
     unreachable
-}
-
-fn @_RNvXs4_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtB7_5clone5Clone5cloneBM_(functy.210) {
 }
 
 fn @Verifier____env___unfold_const(functy.211) {
@@ -27885,7 +27804,7 @@ bb3(%11: ptr, %12: ptr, %13: u64, %14: u64, %15: u64):
     %70 = gep i8, ptr %67, %69
     store ptr %70, ptr %28
     %71 = load ptr, ptr %28
-    %72 = call @func.65(%71, %12)
+    %72 = call @func.59(%71, %12)
     br bb4(%11, %12, %13, %14, %72)
 bb4(%16: ptr, %17: ptr, %18: u64, %19: u64, %20: bool):
     condbr %20, bb5, bb6(%16, %17, %18, %19)
@@ -27893,7 +27812,7 @@ bb5:
     %73 = load ptr, ptr %28
     %74 = const i64 40
     %75 = gep i8, ptr %73, %74
-    call @func.210(%0, %75)
+    call @func.167(%0, %75)
     br bb9
 bb6(%21: ptr, %22: ptr, %23: u64, %24: u64):
     %76 = const u64 1
@@ -27924,10 +27843,10 @@ bb10:
 fn @Verifier____env___infer_type(functy.212) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
     %5 = alloca (i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.77(%5)
+    call @func.71(%5)
     br bb1(%1, %2)
 bb1(%3: ptr, %4: ptr):
-    call @func.117(%0, %3, %4, %5)
+    call @func.104(%0, %3, %4, %5)
     br bb2
 bb2:
     br bb3
@@ -27941,12 +27860,6 @@ bb0(%0: ptr, %1: ptr):
     %3 = load u64, ptr %1
     %4 = icmp eq u64 %2, %3
     ret %4
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.214) {
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.215) {
 }
 
 fn @Expr__instantiate_at(functy.216) {
@@ -27976,7 +27889,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32):
     %128 = const bool false
     %129 = const bool false
     %130 = load ptr, ptr %107
-    %131 = call @func.240(%130)
+    %131 = call @func.199(%130)
     br bb1(%2, %3, %131)
 bb1(%4: ptr, %5: u32, %6: u32):
     %132 = icmp uge u32 %5, %6
@@ -28047,7 +27960,7 @@ bb5(%9: ptr, %10: u32):
     %186 = const i64 48
     %187 = gep i8, ptr %185, %186
     %188 = const bool true
-    call @func.66(%121, %181)
+    call @func.60(%121, %181)
     br bb42(%9, %10, %184, %187)
 bb6(%11: ptr, %12: u32):
     %189 = load ptr, ptr %108
@@ -28064,7 +27977,7 @@ bb6(%11: ptr, %12: u32):
     %200 = const i64 64
     %201 = gep i8, ptr %199, %200
     %202 = const bool true
-    call @func.66(%117, %189)
+    call @func.60(%117, %189)
     br bb33(%11, %12, %192, %195, %198, %201)
 bb7(%13: ptr, %14: u32):
     %203 = load ptr, ptr %108
@@ -28130,7 +28043,7 @@ bb10(%19: ptr, %20: u32):
     condbr %252, bb11(%19, %20), bb12(%20, %250)
 bb11(%21: ptr, %22: u32):
     %253 = const u32 0
-    call @func.242(%0, %21, %253, %22)
+    call @func.200(%0, %21, %253, %22)
     br bb46
 bb12(%23: u32, %24: ptr):
     %254 = load u32, ptr %24
@@ -28139,7 +28052,7 @@ bb12(%23: u32, %24: ptr):
 bb13(%25: ptr):
     %256 = load u32, ptr %25
     %257 = const u32 1
-    %258 = call @func.214(%256, %257)
+    %258 = call @func.120(%256, %257)
     br bb14(%258)
 bb14(%26: u32):
     call @func.21(%0, %26)
@@ -28150,7 +28063,7 @@ bb15:
     br bb46
 bb16(%27: ptr, %28: u32, %29: ptr, %30: ptr):
     %260 = const bool true
-    call @func.216(%109, %30, %27, %28)
+    call @func.182(%109, %30, %27, %28)
     br bb17(%27, %28, %29)
 bb17(%31: ptr, %32: u32, %33: ptr):
     %261 = load ptr, ptr %33
@@ -28158,18 +28071,18 @@ bb17(%31: ptr, %32: u32, %33: ptr):
     %263 = gep i8, ptr %261, %262
     br bb18(%31, %32, %263)
 bb18(%34: ptr, %35: u32, %36: ptr):
-    call @func.216(%110, %36, %34, %35)
+    call @func.182(%110, %36, %34, %35)
     br bb19
 bb19:
     %264 = const bool false
-    call @func.56(%0, %109, %110)
+    call @func.50(%0, %109, %110)
     br bb20
 bb20:
     %265 = const bool false
     br bb46
 bb21(%37: ptr, %38: u32, %39: ptr, %40: ptr):
     %266 = const bool true
-    call @func.216(%112, %40, %37, %38)
+    call @func.182(%112, %40, %37, %38)
     br bb22(%37, %38, %39)
 bb22(%41: ptr, %42: u32, %43: ptr):
     %267 = load ptr, ptr %43
@@ -28178,10 +28091,10 @@ bb22(%41: ptr, %42: u32, %43: ptr):
     br bb23(%41, %42, %269)
 bb23(%44: ptr, %45: u32, %46: ptr):
     %270 = const u32 1
-    %271 = call @func.215(%45, %270)
+    %271 = call @func.80(%45, %270)
     br bb24(%44, %46, %271)
 bb24(%47: ptr, %48: ptr, %49: u32):
-    call @func.216(%113, %48, %47, %49)
+    call @func.182(%113, %48, %47, %49)
     br bb25
 bb25:
     %272 = const bool false
@@ -28192,7 +28105,7 @@ bb26:
     br bb46
 bb27(%50: ptr, %51: u32, %52: ptr, %53: ptr):
     %274 = const bool true
-    call @func.216(%115, %53, %50, %51)
+    call @func.182(%115, %53, %50, %51)
     br bb28(%50, %51, %52)
 bb28(%54: ptr, %55: u32, %56: ptr):
     %275 = load ptr, ptr %56
@@ -28201,14 +28114,14 @@ bb28(%54: ptr, %55: u32, %56: ptr):
     br bb29(%54, %55, %277)
 bb29(%57: ptr, %58: u32, %59: ptr):
     %278 = const u32 1
-    %279 = call @func.215(%58, %278)
+    %279 = call @func.80(%58, %278)
     br bb30(%57, %59, %279)
 bb30(%60: ptr, %61: ptr, %62: u32):
-    call @func.216(%116, %61, %60, %62)
+    call @func.182(%116, %61, %60, %62)
     br bb31
 bb31:
     %280 = const bool false
-    call @func.53(%0, %114, %115, %116)
+    call @func.47(%0, %114, %115, %116)
     br bb32
 bb32:
     %281 = const bool false
@@ -28219,7 +28132,7 @@ bb33(%63: ptr, %64: u32, %65: ptr, %66: ptr, %67: ptr, %68: ptr):
     %284 = gep i8, ptr %282, %283
     br bb34(%63, %64, %66, %67, %68, %284)
 bb34(%69: ptr, %70: u32, %71: ptr, %72: ptr, %73: ptr, %74: ptr):
-    call @func.216(%118, %74, %69, %70)
+    call @func.182(%118, %74, %69, %70)
     br bb35(%69, %70, %71, %72, %73)
 bb35(%75: ptr, %76: u32, %77: ptr, %78: ptr, %79: ptr):
     %285 = const bool true
@@ -28228,7 +28141,7 @@ bb35(%75: ptr, %76: u32, %77: ptr, %78: ptr, %79: ptr):
     %288 = gep i8, ptr %286, %287
     br bb36(%75, %76, %78, %79, %288)
 bb36(%80: ptr, %81: u32, %82: ptr, %83: ptr, %84: ptr):
-    call @func.216(%119, %84, %80, %81)
+    call @func.182(%119, %84, %80, %81)
     br bb37(%80, %81, %82, %83)
 bb37(%85: ptr, %86: u32, %87: ptr, %88: ptr):
     %289 = const bool true
@@ -28238,17 +28151,17 @@ bb37(%85: ptr, %86: u32, %87: ptr, %88: ptr):
     br bb38(%85, %86, %88, %292)
 bb38(%89: ptr, %90: u32, %91: ptr, %92: ptr):
     %293 = const u32 1
-    %294 = call @func.215(%90, %293)
+    %294 = call @func.80(%90, %293)
     br bb39(%89, %91, %92, %294)
 bb39(%93: ptr, %94: ptr, %95: ptr, %96: u32):
-    call @func.216(%120, %95, %93, %96)
+    call @func.182(%120, %95, %93, %96)
     br bb40(%94)
 bb40(%97: ptr):
     %295 = load bool, ptr %97
     %296 = const bool false
     %297 = const bool false
     %298 = const bool false
-    call @func.55(%0, %117, %118, %119, %120, %295)
+    call @func.49(%0, %117, %118, %119, %120, %295)
     br bb41
 bb41:
     %299 = const bool false
@@ -28262,20 +28175,17 @@ bb42(%98: ptr, %99: u32, %100: ptr, %101: ptr):
     %305 = gep i8, ptr %303, %304
     br bb43(%98, %99, %302, %305)
 bb43(%102: ptr, %103: u32, %104: u32, %105: ptr):
-    call @func.216(%122, %105, %102, %103)
+    call @func.182(%122, %105, %102, %103)
     br bb44(%104)
 bb44(%106: u32):
     %306 = const bool false
-    call @func.219(%0, %121, %106, %122)
+    call @func.184(%0, %121, %106, %122)
     br bb45
 bb45:
     %307 = const bool false
     br bb46
 bb46:
     ret
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.217) {
 }
 
 fn @Expr__abstract_fvar_at(functy.218) {
@@ -28308,13 +28218,13 @@ bb0(%0: ptr, %1: ptr, %2: u64, %3: u32):
     %110 = const bool false
     %111 = const bool false
     %112 = load ptr, ptr %87
-    %113 = call @func.69(%112)
+    %113 = call @func.63(%112)
     br bb1(%3, %113)
 bb1(%4: u32, %5: bool):
     condbr %5, bb5(%4), bb2(%4)
 bb2(%6: u32):
     %114 = load ptr, ptr %87
-    %115 = call @func.240(%114)
+    %115 = call @func.199(%114)
     br bb3(%6, %115)
 bb3(%7: u32, %8: u32):
     %116 = icmp ult u32 %7, %8
@@ -28397,7 +28307,7 @@ bb8(%11: u32):
     %180 = const i64 48
     %181 = gep i8, ptr %179, %180
     %182 = const bool true
-    call @func.66(%102, %175)
+    call @func.60(%102, %175)
     br bb47(%11, %178, %181)
 bb9(%12: u32):
     %183 = load ptr, ptr %89
@@ -28414,7 +28324,7 @@ bb9(%12: u32):
     %194 = const i64 64
     %195 = gep i8, ptr %193, %194
     %196 = const bool true
-    call @func.66(%98, %183)
+    call @func.60(%98, %183)
     br bb38(%12, %186, %189, %192, %195)
 bb10(%13: u32):
     %197 = load ptr, ptr %89
@@ -28482,7 +28392,7 @@ bb14(%17: u32):
     %247 = load ptr, ptr %89
     %248 = const i64 8
     %249 = gep i8, ptr %247, %248
-    %250 = call @func.213(%249, %88)
+    %250 = call @func.181(%249, %88)
     br bb15(%17, %250)
 bb15(%18: u32, %19: bool):
     condbr %19, bb16(%18), bb17
@@ -28496,7 +28406,7 @@ bb17:
 bb18(%21: ptr):
     %252 = load u32, ptr %21
     %253 = const u32 1
-    %254 = call @func.217(%252, %253)
+    %254 = call @func.80(%252, %253)
     br bb19(%254)
 bb19(%22: u32):
     call @func.21(%0, %22)
@@ -28508,7 +28418,7 @@ bb20:
 bb21(%23: u32, %24: ptr, %25: ptr):
     %256 = const bool true
     %257 = load u64, ptr %88
-    call @func.218(%90, %25, %257, %23)
+    call @func.183(%90, %25, %257, %23)
     br bb22(%23, %24)
 bb22(%26: u32, %27: ptr):
     %258 = load ptr, ptr %27
@@ -28517,11 +28427,11 @@ bb22(%26: u32, %27: ptr):
     br bb23(%26, %260)
 bb23(%28: u32, %29: ptr):
     %261 = load u64, ptr %88
-    call @func.218(%91, %29, %261, %28)
+    call @func.183(%91, %29, %261, %28)
     br bb24
 bb24:
     %262 = const bool false
-    call @func.56(%0, %90, %91)
+    call @func.50(%0, %90, %91)
     br bb25
 bb25:
     %263 = const bool false
@@ -28529,7 +28439,7 @@ bb25:
 bb26(%30: u32, %31: ptr, %32: ptr):
     %264 = const bool true
     %265 = load u64, ptr %88
-    call @func.218(%93, %32, %265, %30)
+    call @func.183(%93, %32, %265, %30)
     br bb27(%30, %31)
 bb27(%33: u32, %34: ptr):
     %266 = load ptr, ptr %34
@@ -28538,11 +28448,11 @@ bb27(%33: u32, %34: ptr):
     br bb28(%33, %268)
 bb28(%35: u32, %36: ptr):
     %269 = const u32 1
-    %270 = call @func.217(%35, %269)
+    %270 = call @func.80(%35, %269)
     br bb29(%36, %270)
 bb29(%37: ptr, %38: u32):
     %271 = load u64, ptr %88
-    call @func.218(%94, %37, %271, %38)
+    call @func.183(%94, %37, %271, %38)
     br bb30
 bb30:
     %272 = const bool false
@@ -28554,7 +28464,7 @@ bb31:
 bb32(%39: u32, %40: ptr, %41: ptr):
     %274 = const bool true
     %275 = load u64, ptr %88
-    call @func.218(%96, %41, %275, %39)
+    call @func.183(%96, %41, %275, %39)
     br bb33(%39, %40)
 bb33(%42: u32, %43: ptr):
     %276 = load ptr, ptr %43
@@ -28563,15 +28473,15 @@ bb33(%42: u32, %43: ptr):
     br bb34(%42, %278)
 bb34(%44: u32, %45: ptr):
     %279 = const u32 1
-    %280 = call @func.217(%44, %279)
+    %280 = call @func.80(%44, %279)
     br bb35(%45, %280)
 bb35(%46: ptr, %47: u32):
     %281 = load u64, ptr %88
-    call @func.218(%97, %46, %281, %47)
+    call @func.183(%97, %46, %281, %47)
     br bb36
 bb36:
     %282 = const bool false
-    call @func.53(%0, %95, %96, %97)
+    call @func.47(%0, %95, %96, %97)
     br bb37
 bb37:
     %283 = const bool false
@@ -28583,7 +28493,7 @@ bb38(%48: u32, %49: ptr, %50: ptr, %51: ptr, %52: ptr):
     br bb39(%48, %50, %51, %52, %286)
 bb39(%53: u32, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %287 = load u64, ptr %88
-    call @func.218(%99, %57, %287, %53)
+    call @func.183(%99, %57, %287, %53)
     br bb40(%53, %54, %55, %56)
 bb40(%58: u32, %59: ptr, %60: ptr, %61: ptr):
     %288 = const bool true
@@ -28593,7 +28503,7 @@ bb40(%58: u32, %59: ptr, %60: ptr, %61: ptr):
     br bb41(%58, %60, %61, %291)
 bb41(%62: u32, %63: ptr, %64: ptr, %65: ptr):
     %292 = load u64, ptr %88
-    call @func.218(%100, %65, %292, %62)
+    call @func.183(%100, %65, %292, %62)
     br bb42(%62, %63, %64)
 bb42(%66: u32, %67: ptr, %68: ptr):
     %293 = const bool true
@@ -28603,18 +28513,18 @@ bb42(%66: u32, %67: ptr, %68: ptr):
     br bb43(%66, %68, %296)
 bb43(%69: u32, %70: ptr, %71: ptr):
     %297 = const u32 1
-    %298 = call @func.217(%69, %297)
+    %298 = call @func.80(%69, %297)
     br bb44(%70, %71, %298)
 bb44(%72: ptr, %73: ptr, %74: u32):
     %299 = load u64, ptr %88
-    call @func.218(%101, %73, %299, %74)
+    call @func.183(%101, %73, %299, %74)
     br bb45(%72)
 bb45(%75: ptr):
     %300 = load bool, ptr %75
     %301 = const bool false
     %302 = const bool false
     %303 = const bool false
-    call @func.55(%0, %98, %99, %100, %101, %300)
+    call @func.49(%0, %98, %99, %100, %101, %300)
     br bb46
 bb46:
     %304 = const bool false
@@ -28629,21 +28539,21 @@ bb47(%76: u32, %77: ptr, %78: ptr):
     br bb48(%76, %307, %310)
 bb48(%79: u32, %80: u32, %81: ptr):
     %311 = load u64, ptr %88
-    call @func.218(%103, %81, %311, %79)
+    call @func.183(%103, %81, %311, %79)
     br bb49(%80)
 bb49(%82: u32):
     %312 = const bool false
-    call @func.219(%0, %102, %82, %103)
+    call @func.184(%0, %102, %82, %103)
     br bb50
 bb50:
     %313 = const bool false
     br bb53
 bb51(%83: u32, %84: u32, %85: ptr):
     %314 = load u64, ptr %88
-    call @func.218(%104, %85, %314, %83)
+    call @func.183(%104, %85, %314, %83)
     br bb52(%84)
 bb52(%86: u32):
-    call @func.220(%0, %86, %104)
+    call @func.185(%0, %86, %104)
     br bb53
 bb53:
     ret
@@ -28786,7 +28696,7 @@ bb1(%4: u32):
     store ptr %108, ptr %110
     %111 = const i64 12
     store i64 %111, ptr %5
-    call @func.49(%0, %5)
+    call @func.44(%0, %5)
     br bb2
 bb2:
     ret
@@ -28874,7 +28784,7 @@ bb1(%3: u32):
     store ptr %62, ptr %64
     %65 = const i64 13
     store i64 %65, ptr %4
-    call @func.49(%0, %4)
+    call @func.44(%0, %4)
     br bb2
 bb2:
     ret
@@ -28886,18 +28796,6 @@ bb0(%0: u64):
     store u64 %0, ptr %1
     %2 = load u64, ptr %1
     ret %2
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice7LiteralNtB7_9PartialEq2eqBF_(functy.222) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdNtB7_9PartialEq2eqBF_(functy.223) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.224) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.225) {
 }
 
 fn @Verifier____env___structural_eq(functy.226) {
@@ -29585,7 +29483,7 @@ bb14(%12: ptr):
     %793 = load ptr, ptr %175
     %794 = const i64 48
     %795 = gep i8, ptr %793, %794
-    %796 = call @func.65(%769, %783)
+    %796 = call @func.59(%769, %783)
     br bb55(%12, %777, %795, %796)
 bb15:
     %797 = load ptr, ptr %157
@@ -29602,7 +29500,7 @@ bb15:
     %805 = const i64 8
     %806 = gep i8, ptr %804, %805
     store ptr %806, ptr %165
-    %807 = call @func.222(%164, %165)
+    %807 = call @func.149(%164, %165)
     br bb64(%807)
 bb16(%13: ptr):
     %808 = load ptr, ptr %157
@@ -29775,7 +29673,7 @@ bb20(%17: ptr):
     %941 = load ptr, ptr %203
     %942 = const i64 48
     %943 = gep i8, ptr %941, %942
-    %944 = call @func.65(%927, %937)
+    %944 = call @func.59(%927, %937)
     br bb24(%17, %931, %943, %944)
 bb21(%18: ptr):
     %945 = load ptr, ptr %157
@@ -29790,7 +29688,7 @@ bb21(%18: ptr):
     %952 = load ptr, ptr %205
     %953 = const i64 8
     %954 = gep i8, ptr %952, %953
-    %955 = call @func.231(%18, %948, %954)
+    %955 = call @func.190(%18, %948, %954)
     br bb64(%955)
 bb22:
     %956 = load ptr, ptr %157
@@ -29807,7 +29705,7 @@ bb22:
     %964 = const i64 8
     %965 = gep i8, ptr %963, %964
     store ptr %965, ptr %161
-    %966 = call @func.223(%160, %161)
+    %966 = call @func.150(%160, %161)
     br bb64(%966)
 bb23:
     %967 = load ptr, ptr %157
@@ -29824,21 +29722,21 @@ bb23:
     %975 = const i64 8
     %976 = gep i8, ptr %974, %975
     store ptr %976, ptr %159
-    %977 = call @func.224(%158, %159)
+    %977 = call @func.151(%158, %159)
     br bb64(%977)
 bb24(%19: ptr, %20: ptr, %21: ptr, %22: bool):
     condbr %22, bb25(%19, %20, %21), bb26
 bb25(%23: ptr, %24: ptr, %25: ptr):
-    call @func.225(%162, %24)
+    call @func.81(%162, %24)
     br bb27(%23, %25)
 bb26:
     %978 = const bool false
     br bb64(%978)
 bb27(%26: ptr, %27: ptr):
-    call @func.225(%163, %27)
+    call @func.81(%163, %27)
     br bb28(%26)
 bb28(%28: ptr):
-    %979 = call @func.232(%28, %162, %163)
+    %979 = call @func.191(%28, %162, %163)
     br bb64(%979)
 bb29(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %980 = load ptr, ptr %31
@@ -29846,7 +29744,7 @@ bb29(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %982 = gep i8, ptr %980, %981
     br bb30(%29, %30, %32, %33, %982)
 bb30(%34: ptr, %35: ptr, %36: ptr, %37: ptr, %38: ptr):
-    %983 = call @func.226(%34, %37, %38)
+    %983 = call @func.187(%34, %37, %38)
     br bb31(%34, %35, %36, %983)
 bb31(%39: ptr, %40: ptr, %41: ptr, %42: bool):
     condbr %42, bb32(%39, %40, %41), bb33
@@ -29864,7 +29762,7 @@ bb34(%46: ptr, %47: ptr, %48: ptr):
     %990 = gep i8, ptr %988, %989
     br bb35(%46, %48, %990)
 bb35(%49: ptr, %50: ptr, %51: ptr):
-    %991 = call @func.226(%49, %50, %51)
+    %991 = call @func.187(%49, %50, %51)
     br bb64(%991)
 bb36(%52: ptr, %53: ptr, %54: ptr, %55: ptr, %56: ptr):
     %992 = load ptr, ptr %53
@@ -29877,7 +29775,7 @@ bb37(%57: ptr, %58: ptr, %59: ptr, %60: ptr, %61: ptr):
     %997 = gep i8, ptr %995, %996
     br bb38(%57, %58, %60, %61, %997)
 bb38(%62: ptr, %63: ptr, %64: ptr, %65: ptr, %66: ptr):
-    %998 = call @func.226(%62, %65, %66)
+    %998 = call @func.187(%62, %65, %66)
     br bb39(%62, %63, %64, %998)
 bb39(%67: ptr, %68: ptr, %69: ptr, %70: bool):
     condbr %70, bb40(%67, %68, %69), bb41
@@ -29895,7 +29793,7 @@ bb42(%74: ptr, %75: ptr, %76: ptr):
     %1005 = gep i8, ptr %1003, %1004
     br bb43(%74, %76, %1005)
 bb43(%77: ptr, %78: ptr, %79: ptr):
-    %1006 = call @func.226(%77, %78, %79)
+    %1006 = call @func.187(%77, %78, %79)
     br bb64(%1006)
 bb44(%80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     %1007 = load ptr, ptr %83
@@ -29903,7 +29801,7 @@ bb44(%80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     %1009 = gep i8, ptr %1007, %1008
     br bb45(%80, %81, %82, %84, %85, %86, %1009)
 bb45(%87: ptr, %88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: ptr, %93: ptr):
-    %1010 = call @func.226(%87, %92, %93)
+    %1010 = call @func.187(%87, %92, %93)
     br bb46(%87, %88, %89, %90, %91, %1010)
 bb46(%94: ptr, %95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: bool):
     condbr %99, bb47(%94, %95, %96, %97, %98), bb52
@@ -29918,7 +29816,7 @@ bb48(%105: ptr, %106: ptr, %107: ptr, %108: ptr, %109: ptr):
     %1016 = gep i8, ptr %1014, %1015
     br bb49(%105, %106, %108, %109, %1016)
 bb49(%110: ptr, %111: ptr, %112: ptr, %113: ptr, %114: ptr):
-    %1017 = call @func.226(%110, %113, %114)
+    %1017 = call @func.187(%110, %113, %114)
     br bb50(%110, %111, %112, %1017)
 bb50(%115: ptr, %116: ptr, %117: ptr, %118: bool):
     condbr %118, bb51(%115, %116, %117), bb52
@@ -29936,12 +29834,12 @@ bb53(%122: ptr, %123: ptr, %124: ptr):
     %1024 = gep i8, ptr %1022, %1023
     br bb54(%122, %124, %1024)
 bb54(%125: ptr, %126: ptr, %127: ptr):
-    %1025 = call @func.226(%125, %126, %127)
+    %1025 = call @func.187(%125, %126, %127)
     br bb64(%1025)
 bb55(%128: ptr, %129: ptr, %130: ptr, %131: bool):
     condbr %131, bb56(%128, %129, %130), bb59
 bb56(%132: ptr, %133: ptr, %134: ptr):
-    %1026 = call @func.224(%166, %167)
+    %1026 = call @func.151(%166, %167)
     br bb57(%132, %133, %134, %1026)
 bb57(%135: ptr, %136: ptr, %137: ptr, %138: bool):
     condbr %138, bb58(%135, %136, %137), bb59
@@ -29959,7 +29857,7 @@ bb60(%142: ptr, %143: ptr, %144: ptr):
     %1033 = gep i8, ptr %1031, %1032
     br bb61(%142, %144, %1033)
 bb61(%145: ptr, %146: ptr, %147: ptr):
-    %1034 = call @func.226(%145, %146, %147)
+    %1034 = call @func.187(%145, %146, %147)
     br bb64(%1034)
 bb62(%148: ptr, %149: ptr, %150: ptr):
     %1035 = load ptr, ptr %149
@@ -29967,7 +29865,7 @@ bb62(%148: ptr, %149: ptr, %150: ptr):
     %1037 = gep i8, ptr %1035, %1036
     br bb63(%148, %150, %1037)
 bb63(%151: ptr, %152: ptr, %153: ptr):
-    %1038 = call @func.226(%151, %152, %153)
+    %1038 = call @func.187(%151, %152, %153)
     br bb64(%1038)
 bb64(%154: bool):
     ret %154
@@ -29984,7 +29882,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr, %4: ptr):
     %36 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %37 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %38 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.243(%33, %1, %2, %4)
+    call @func.201(%33, %1, %2, %4)
     br bb1(%1, %3, %4)
 bb1(%5: ptr, %6: ptr, %7: ptr):
     %39 = load i64, ptr %33
@@ -30113,7 +30011,7 @@ bb4(%8: ptr, %9: ptr, %10: ptr):
     %136 = gep i8, ptr %32, %135
     %137 = load i64, ptr %134
     store i64 %137, ptr %136
-    %138 = call @func.245(%8, %32)
+    %138 = call @func.202(%8, %32)
     br bb5(%8, %9, %10, %138)
 bb5(%11: ptr, %12: ptr, %13: ptr, %14: bool):
     condbr %14, bb6, bb7(%11, %12, %13)
@@ -30122,7 +30020,7 @@ bb6:
     store i8 %139, ptr %0
     br bb18
 bb7(%15: ptr, %16: ptr, %17: ptr):
-    call @func.246(%35, %15, %32, %17)
+    call @func.203(%35, %15, %32, %17)
     br bb8(%15, %16, %17)
 bb8(%18: ptr, %19: ptr, %20: ptr):
     %140 = load i8, ptr %35
@@ -30144,7 +30042,7 @@ bb11:
     store i8 %148, ptr %0
     br bb18
 bb12(%24: ptr, %25: ptr, %26: ptr):
-    call @func.243(%37, %24, %25, %26)
+    call @func.201(%37, %24, %25, %26)
     br bb13(%24, %26)
 bb13(%27: ptr, %28: ptr):
     %149 = load i64, ptr %37
@@ -30271,7 +30169,7 @@ bb15(%29: ptr, %30: ptr):
     %246 = gep i8, ptr %36, %245
     %247 = load i64, ptr %244
     store i64 %247, ptr %246
-    %248 = call @func.233(%29, %32, %36, %30)
+    %248 = call @func.192(%29, %32, %36, %30)
     br bb16(%248)
 bb16(%31: bool):
     store bool %31, ptr %0
@@ -30282,12 +30180,6 @@ bb18:
     br bb19
 bb19:
     ret
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.228) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.229) {
 }
 
 fn @Verifier____env___is_def_eq_binding(functy.230) {
@@ -30323,7 +30215,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %271 = const bool false
     %272 = const bool false
     %273 = load ptr, ptr %246
-    %274 = call @func.248(%273)
+    %274 = call @func.204(%273)
     br bb1(%0, %2, %274)
 bb1(%4: ptr, %5: ptr, %6: u64):
     %275 = load ptr, ptr %245
@@ -30449,10 +30341,10 @@ bb9(%27: ptr, %28: u64, %29: bool):
     %376 = gep i8, ptr %374, %375
     br bb10(%27, %28, %29, %373, %376)
 bb10(%30: ptr, %31: u64, %32: bool, %33: ptr, %34: ptr):
-    call @func.228(%253, %33)
+    call @func.54(%253, %33)
     br bb11(%30, %31, %32, %34)
 bb11(%35: ptr, %36: u64, %37: bool, %38: ptr):
-    call @func.228(%254, %38)
+    call @func.54(%254, %38)
     br bb12(%35, %36, %37)
 bb12(%39: ptr, %40: u64, %41: bool):
     %377 = load ptr, ptr %253
@@ -30546,10 +30438,10 @@ bb16(%48: ptr, %49: u64, %50: bool, %51: ptr, %52: ptr, %53: ptr):
     %451 = gep i8, ptr %260, %450
     %452 = load i8, ptr %449
     store i8 %452, ptr %451
-    call @func.228(%261, %52)
+    call @func.54(%261, %52)
     br bb17(%48, %49, %50, %53)
 bb17(%54: ptr, %55: u64, %56: bool, %57: ptr):
-    call @func.228(%262, %57)
+    call @func.54(%262, %57)
     br bb18(%54, %55, %56)
 bb18(%58: ptr, %59: u64, %60: bool):
     %453 = const i64 8
@@ -30594,7 +30486,7 @@ bb19(%61: ptr, %62: u64, %63: bool, %64: ptr):
     %482 = gep i8, ptr %480, %481
     br bb20(%61, %62, %63, %64, %482)
 bb20(%65: ptr, %66: u64, %67: bool, %68: ptr, %69: ptr):
-    %483 = call @func.254(%68, %69)
+    %483 = call @func.206(%68, %69)
     br bb21(%65, %66, %67, %483)
 bb21(%70: ptr, %71: u64, %72: bool, %73: bool):
     condbr %73, bb28(%70, %71, %72), bb22(%70, %71, %72)
@@ -30610,13 +30502,13 @@ bb23(%77: ptr, %78: u64, %79: bool, %80: ptr):
     br bb24(%77, %78, %79, %80, %489)
 bb24(%81: ptr, %82: u64, %83: bool, %84: ptr, %85: ptr):
     %490 = load ptr, ptr %246
-    %491 = call @func.233(%81, %84, %85, %490)
+    %491 = call @func.192(%81, %84, %85, %490)
     br bb25(%81, %82, %83, %491)
 bb25(%86: ptr, %87: u64, %88: bool, %89: bool):
     condbr %89, bb28(%86, %87, %88), bb26(%87)
 bb26(%90: u64):
     %492 = load ptr, ptr %246
-    call @func.257(%492, %90)
+    call @func.207(%492, %90)
     br bb27
 bb27:
     %493 = const bool false
@@ -30627,7 +30519,7 @@ bb28(%91: ptr, %92: u64, %93: bool):
     %496 = gep i8, ptr %494, %495
     br bb29(%91, %92, %93, %496)
 bb29(%94: ptr, %95: u64, %96: bool, %97: ptr):
-    %497 = call @func.258(%97)
+    %497 = call @func.208(%97)
     br bb30(%94, %95, %96, %497)
 bb30(%98: ptr, %99: u64, %100: bool, %101: bool):
     condbr %101, bb39(%98, %99, %100), bb31(%98, %99, %100)
@@ -30637,7 +30529,7 @@ bb31(%102: ptr, %103: u64, %104: bool):
     %500 = gep i8, ptr %498, %499
     br bb32(%102, %103, %104, %500)
 bb32(%105: ptr, %106: u64, %107: bool, %108: ptr):
-    %501 = call @func.258(%108)
+    %501 = call @func.208(%108)
     br bb33(%105, %106, %107, %501)
 bb33(%109: ptr, %110: u64, %111: bool, %112: bool):
     condbr %112, bb39(%109, %110, %111), bb34(%109, %110)
@@ -30653,20 +30545,20 @@ bb35(%115: ptr, %116: u64, %117: ptr):
     br bb36(%115, %116, %117, %507)
 bb36(%118: ptr, %119: u64, %120: ptr, %121: ptr):
     %508 = load ptr, ptr %246
-    %509 = call @func.233(%118, %120, %121, %508)
+    %509 = call @func.192(%118, %120, %121, %508)
     br bb37(%119, %509)
 bb37(%122: u64, %123: bool):
     %510 = load ptr, ptr %246
-    call @func.257(%510, %122)
+    call @func.207(%510, %122)
     br bb38(%123)
 bb38(%124: bool):
     br bb74(%124)
 bb39(%125: ptr, %126: u64, %127: bool):
-    call @func.83(%264)
+    call @func.77(%264)
     br bb40(%125, %126, %127)
 bb40(%128: ptr, %129: u64, %130: bool):
     %511 = const bool true
-    %512 = call @func.229(%256)
+    %512 = call @func.3(%256)
     br bb41(%128, %129, %130, %512)
 bb41(%131: ptr, %132: u64, %133: bool, %134: ptr):
     call @func.13(%265, %134)
@@ -30674,7 +30566,7 @@ bb41(%131: ptr, %132: u64, %133: bool, %134: ptr):
 bb42(%135: ptr, %136: u64, %137: bool):
     %513 = const bool false
     %514 = load ptr, ptr %246
-    call @func.156(%263, %514, %264, %265, %255)
+    call @func.133(%263, %514, %264, %265, %255)
     br bb43(%135, %136, %137)
 bb43(%138: ptr, %139: u64, %140: bool):
     %515 = const bool false
@@ -30684,7 +30576,7 @@ bb43(%138: ptr, %139: u64, %140: bool):
     br bb44(%138, %139, %140, %518)
 bb44(%141: ptr, %142: u64, %143: bool, %144: ptr):
     %519 = load u64, ptr %263
-    call @func.157(%266, %141, %144, %519)
+    call @func.134(%266, %141, %144, %519)
     br bb45(%141, %142, %143)
 bb45(%145: ptr, %146: u64, %147: bool):
     %520 = const bool true
@@ -30694,7 +30586,7 @@ bb45(%145: ptr, %146: u64, %147: bool):
     br bb46(%145, %146, %147, %523)
 bb46(%148: ptr, %149: u64, %150: bool, %151: ptr):
     %524 = load u64, ptr %263
-    call @func.157(%267, %148, %151, %524)
+    call @func.134(%267, %148, %151, %524)
     br bb47(%148, %149, %150)
 bb47(%152: ptr, %153: u64, %154: bool):
     %525 = const bool true
@@ -31141,11 +31033,11 @@ bb65(%216: ptr, %217: u64, %218: bool):
     br bb69(%216, %217, %218)
 bb66(%219: ptr, %220: u64):
     %890 = load ptr, ptr %246
-    %891 = call @func.233(%219, %266, %267, %890)
+    %891 = call @func.192(%219, %266, %267, %890)
     br bb67(%220, %891)
 bb67(%221: u64, %222: bool):
     %892 = load ptr, ptr %246
-    call @func.257(%892, %221)
+    call @func.207(%892, %221)
     br bb68(%222)
 bb68(%223: bool):
     br bb72(%223)
@@ -31181,7 +31073,7 @@ bb81(%242: ptr, %243: u64, %244: bool):
 
 fn @Verifier____env___level_eq(functy.231) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
-    %4 = call @func.260(%1, %2)
+    %4 = call @func.209(%1, %2)
     br bb1(%4)
 bb1(%3: bool):
     ret %3
@@ -31231,7 +31123,7 @@ bb6(%14: ptr, %15: u64, %16: u64, %17: ptr, %18: u64):
     %56 = const u64 40
     %57 = mul u64 %18, %56
     %58 = gep i8, ptr %55, %57
-    %59 = call @func.231(%14, %17, %58)
+    %59 = call @func.190(%14, %17, %58)
     br bb7(%14, %15, %16, %59)
 bb7(%19: ptr, %20: u64, %21: u64, %22: bool):
     condbr %22, bb8(%19, %20, %21), bb9
@@ -31265,7 +31157,7 @@ bb13:
 
 fn @Verifier____env___def_eq_impl(functy.233) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.177(%0, %1, %2, %3)
+    %5 = call @func.152(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
@@ -31410,7 +31302,7 @@ bb3(%6: ptr, %7: ptr):
     %159 = load ptr, ptr %37
     %160 = const u32 0
     %161 = const u32 1
-    call @func.261(%44, %159, %160, %161)
+    call @func.210(%44, %159, %160, %161)
     br bb10(%6, %7, %158)
 bb4(%8: ptr, %9: ptr):
     %162 = load ptr, ptr %39
@@ -31426,7 +31318,7 @@ bb4(%8: ptr, %9: ptr):
     %170 = load ptr, ptr %38
     %171 = const u32 0
     %172 = const u32 1
-    call @func.261(%40, %170, %171, %172)
+    call @func.210(%40, %170, %171, %172)
     br bb5(%8, %9, %169)
 bb5(%10: ptr, %11: ptr, %12: ptr):
     %173 = const bool true
@@ -31491,7 +31383,7 @@ bb5(%10: ptr, %11: ptr, %12: ptr):
     br bb6(%10, %11, %12)
 bb6(%13: ptr, %14: ptr, %15: ptr):
     %221 = const bool false
-    call @func.56(%41, %42, %43)
+    call @func.50(%41, %42, %43)
     br bb7(%13, %14, %15)
 bb7(%16: ptr, %17: ptr, %18: ptr):
     %222 = const bool false
@@ -31500,7 +31392,7 @@ bb7(%16: ptr, %17: ptr, %18: ptr):
     %225 = gep i8, ptr %223, %224
     br bb8(%16, %17, %225)
 bb8(%19: ptr, %20: ptr, %21: ptr):
-    %226 = call @func.233(%19, %21, %41, %20)
+    %226 = call @func.192(%19, %21, %41, %20)
     br bb9(%226)
 bb9(%22: bool):
     br bb15(%22)
@@ -31567,7 +31459,7 @@ bb10(%23: ptr, %24: ptr, %25: ptr):
     br bb11(%23, %24, %25)
 bb11(%26: ptr, %27: ptr, %28: ptr):
     %275 = const bool false
-    call @func.56(%45, %46, %47)
+    call @func.50(%45, %46, %47)
     br bb12(%26, %27, %28)
 bb12(%29: ptr, %30: ptr, %31: ptr):
     %276 = const bool false
@@ -31576,7 +31468,7 @@ bb12(%29: ptr, %30: ptr, %31: ptr):
     %279 = gep i8, ptr %277, %278
     br bb13(%29, %30, %279)
 bb13(%32: ptr, %33: ptr, %34: ptr):
-    %280 = call @func.233(%32, %34, %45, %33)
+    %280 = call @func.192(%32, %34, %45, %33)
     br bb14(%280)
 bb14(%35: bool):
     br bb15(%35)
@@ -31618,10 +31510,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32, %4: ptr, %5: ptr):
     %62 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %63 = const bool false
     %64 = const bool true
-    call @func.154(%53, %1, %4, %5)
+    call @func.131(%53, %1, %4, %5)
     br bb1(%1, %2, %3, %5)
 bb1(%6: ptr, %7: ptr, %8: u32, %9: ptr):
-    call @func.263(%54, %53)
+    call @func.211(%54, %53)
     br bb2(%6, %7, %8, %9)
 bb2(%10: ptr, %11: ptr, %12: u32, %13: ptr):
     store ptr %54, ptr %55
@@ -31673,7 +31565,7 @@ bb3(%14: ptr, %15: ptr, %16: u32, %17: ptr):
     %108 = load ptr, ptr %55
     %109 = const i64 8
     %110 = gep i8, ptr %108, %109
-    call @func.264(%56, %14, %110)
+    call @func.212(%56, %14, %110)
     br bb4(%14, %15, %16, %17)
 bb4(%18: ptr, %19: ptr, %20: u32, %21: ptr):
     %111 = load i32, ptr %56
@@ -31683,7 +31575,7 @@ bb5(%22: ptr, %23: ptr, %24: u32, %25: ptr):
     %113 = const i64 4
     %114 = gep i8, ptr %56, %113
     %115 = load u32, ptr %114
-    call @func.270(%57, %53)
+    call @func.217(%57, %53)
     br bb6(%22, %23, %24, %25, %115)
 bb6(%26: ptr, %27: ptr, %28: u32, %29: ptr, %30: u32):
     %116 = zext u32 %30 to u64
@@ -31701,23 +31593,23 @@ bb6(%26: ptr, %27: ptr, %28: u32, %29: ptr, %30: u32):
     condbr %126, bb7(%26, %27, %28, %29), bb23
 bb7(%31: ptr, %32: ptr, %33: u32, %34: ptr):
     %127 = load u64, ptr %58
-    %128 = call @func.237(%57)
+    %128 = call @func.196(%57)
     br bb8(%31, %32, %33, %34, %127, %128)
 bb8(%35: ptr, %36: ptr, %37: u32, %38: ptr, %39: u64, %40: u64):
     %129 = icmp ult u64 %39, %40
     condbr %129, bb9(%35, %38, %39), bb12(%36, %37)
 bb9(%41: ptr, %42: ptr, %43: u64):
-    %130 = call @func.238(%57, %43)
+    %130 = call @func.197(%57, %43)
     br bb10(%41, %42, %130)
 bb10(%44: ptr, %45: ptr, %46: ptr):
-    call @func.154(%0, %44, %46, %45)
+    call @func.131(%0, %44, %46, %45)
     br bb11
 bb11:
     br bb18
 bb12(%47: ptr, %48: u32):
     br bb13(%47, %48)
 bb13(%49: ptr, %50: u32):
-    call @func.66(%60, %49)
+    call @func.60(%60, %49)
     br bb14(%50)
 bb14(%51: u32):
     %131 = const bool false
@@ -31883,7 +31775,7 @@ bb15(%52: u32):
     store ptr %257, ptr %259
     %260 = const i64 12
     store i64 %260, ptr %59
-    call @func.49(%0, %59)
+    call @func.44(%0, %59)
     br bb16
 bb16:
     br bb17
@@ -31913,13 +31805,10 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.150(%6)
+    %7 = call @func.128(%6)
     br bb1(%7)
 bb1(%1: u32):
     ret %1
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.241) {
 }
 
 fn @Expr__lift_at(functy.242) {
@@ -31947,7 +31836,7 @@ bb1:
     br bb31
 bb2(%4: u32, %5: u32):
     %74 = load ptr, ptr %58
-    %75 = call @func.240(%74)
+    %75 = call @func.199(%74)
     br bb3(%4, %5, %75)
 bb3(%6: u32, %7: u32, %8: u32):
     %76 = icmp uge u32 %6, %8
@@ -32071,7 +31960,7 @@ bb10(%17: u32, %18: u32):
     condbr %172, bb11(%18, %170), bb13
 bb11(%19: u32, %20: ptr):
     %173 = load u32, ptr %20
-    %174 = call @func.241(%173, %19)
+    %174 = call @func.80(%173, %19)
     br bb12(%174)
 bb12(%21: u32):
     call @func.21(%0, %21)
@@ -32082,7 +31971,7 @@ bb13:
     br bb31
 bb14(%22: u32, %23: u32, %24: ptr, %25: ptr):
     %176 = const bool true
-    call @func.242(%60, %25, %22, %23)
+    call @func.200(%60, %25, %22, %23)
     br bb15(%22, %23, %24)
 bb15(%26: u32, %27: u32, %28: ptr):
     %177 = load ptr, ptr %28
@@ -32090,18 +31979,18 @@ bb15(%26: u32, %27: u32, %28: ptr):
     %179 = gep i8, ptr %177, %178
     br bb16(%26, %27, %179)
 bb16(%29: u32, %30: u32, %31: ptr):
-    call @func.242(%61, %31, %29, %30)
+    call @func.200(%61, %31, %29, %30)
     br bb17
 bb17:
     %180 = const bool false
-    call @func.56(%0, %60, %61)
+    call @func.50(%0, %60, %61)
     br bb18
 bb18:
     %181 = const bool false
     br bb31
 bb19(%32: u32, %33: u32, %34: ptr, %35: ptr):
     %182 = const bool true
-    call @func.242(%63, %35, %32, %33)
+    call @func.200(%63, %35, %32, %33)
     br bb20(%32, %33, %34)
 bb20(%36: u32, %37: u32, %38: ptr):
     %183 = load ptr, ptr %38
@@ -32110,10 +31999,10 @@ bb20(%36: u32, %37: u32, %38: ptr):
     br bb21(%36, %37, %185)
 bb21(%39: u32, %40: u32, %41: ptr):
     %186 = const u32 1
-    %187 = call @func.241(%39, %186)
+    %187 = call @func.80(%39, %186)
     br bb22(%40, %41, %187)
 bb22(%42: u32, %43: ptr, %44: u32):
-    call @func.242(%64, %43, %44, %42)
+    call @func.200(%64, %43, %44, %42)
     br bb23
 bb23:
     %188 = const bool false
@@ -32124,7 +32013,7 @@ bb24:
     br bb31
 bb25(%45: u32, %46: u32, %47: ptr, %48: ptr):
     %190 = const bool true
-    call @func.242(%66, %48, %45, %46)
+    call @func.200(%66, %48, %45, %46)
     br bb26(%45, %46, %47)
 bb26(%49: u32, %50: u32, %51: ptr):
     %191 = load ptr, ptr %51
@@ -32133,14 +32022,14 @@ bb26(%49: u32, %50: u32, %51: ptr):
     br bb27(%49, %50, %193)
 bb27(%52: u32, %53: u32, %54: ptr):
     %194 = const u32 1
-    %195 = call @func.241(%52, %194)
+    %195 = call @func.80(%52, %194)
     br bb28(%53, %54, %195)
 bb28(%55: u32, %56: ptr, %57: u32):
-    call @func.242(%67, %56, %57, %55)
+    call @func.200(%67, %56, %57, %55)
     br bb29
 bb29:
     %196 = const bool false
-    call @func.53(%0, %65, %66, %67)
+    call @func.47(%0, %65, %66, %67)
     br bb30
 bb30:
     %197 = const bool false
@@ -32158,7 +32047,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %12 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     store ptr %3, ptr %8
     %13 = load ptr, ptr %8
-    call @func.271(%9, %1, %2, %13)
+    call @func.218(%9, %1, %2, %13)
     br bb1(%1, %2)
 bb1(%4: ptr, %5: ptr):
     %14 = load i64, ptr %9
@@ -32172,7 +32061,7 @@ bb2:
     unreachable
 bb3(%6: ptr, %7: ptr):
     %20 = load ptr, ptr %8
-    call @func.276(%11, %6, %7, %20)
+    call @func.219(%11, %6, %7, %20)
     br bb5
 bb4:
     %21 = load i64, ptr %9
@@ -32428,9 +32317,6 @@ bb10:
     ret
 }
 
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.244) {
-}
-
 fn @Verifier____env___type_is_quickly_not_in_prop(functy.245) {
 bb0(%0: ptr, %1: ptr):
     %13 = alloca i64, align 8
@@ -32494,7 +32380,7 @@ bb2:
     %65 = load ptr, ptr %14
     %66 = const i64 48
     %67 = gep i8, ptr %65, %66
-    %68 = call @func.244(%67)
+    %68 = call @func.65(%67)
     br bb4(%64, %68)
 bb3:
     %69 = const bool true
@@ -32504,10 +32390,10 @@ bb4(%2: ptr, %3: u64):
     %71 = icmp eq u64 %3, %70
     condbr %71, bb5(%2), bb14
 bb5(%4: ptr):
-    call @func.172(%15)
+    call @func.148(%15)
     br bb6(%4)
 bb6(%5: ptr):
-    %72 = call @func.65(%5, %15)
+    %72 = call @func.59(%5, %15)
     br bb7(%5, %72)
 bb7(%6: ptr, %7: bool):
     condbr %7, bb8, bb10(%6)
@@ -32519,10 +32405,10 @@ bb9:
 bb10(%8: ptr):
     br bb11(%8)
 bb11(%9: ptr):
-    call @func.171(%16)
+    call @func.147(%16)
     br bb12(%9)
 bb12(%10: ptr):
-    %74 = call @func.65(%10, %16)
+    %74 = call @func.59(%10, %16)
     br bb13(%74)
 bb13(%11: bool):
     br bb15(%11)
@@ -32544,7 +32430,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %19 = alloca i64, align 8
     store ptr %3, ptr %13
     %20 = load ptr, ptr %13
-    call @func.154(%14, %1, %2, %20)
+    call @func.131(%14, %1, %2, %20)
     br bb1(%1)
 bb1(%4: ptr):
     %21 = load i64, ptr %14
@@ -32604,7 +32490,7 @@ bb5:
     br bb18
 bb6(%9: ptr):
     %66 = load ptr, ptr %13
-    call @func.243(%16, %9, %14, %66)
+    call @func.201(%16, %9, %14, %66)
     br bb7(%9)
 bb7(%10: ptr):
     %67 = load i64, ptr %16
@@ -32734,7 +32620,7 @@ bb10(%11: ptr):
     %165 = load i64, ptr %162
     store i64 %165, ptr %164
     %166 = load ptr, ptr %13
-    call @func.154(%18, %11, %15, %166)
+    call @func.131(%18, %11, %15, %166)
     br bb11
 bb11:
     store ptr %18, ptr %19
@@ -32790,7 +32676,7 @@ bb13:
     %211 = load ptr, ptr %19
     %212 = const i64 8
     %213 = gep i8, ptr %211, %212
-    %214 = call @func.79(%213)
+    %214 = call @func.73(%213)
     br bb14(%214)
 bb14(%12: bool):
     store bool %12, ptr %0
@@ -32807,33 +32693,18 @@ bb19:
     ret
 }
 
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3lenBG_(functy.247) {
-}
-
 fn @LocalContext__len(functy.248) {
 bb0(%0: ptr):
     %2 = alloca i64, align 8
     store ptr %0, ptr %2
     %3 = load ptr, ptr %2
-    %4 = call @func.247(%3)
+    %4 = call @func.139(%3)
     br bb1(%4)
 bb1(%1: u64):
     ret %1
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice7LiteralNtB7_9PartialEq2eqBF_(functy.249) {
-}
-
 fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.250) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdNtB7_9PartialEq2eqBF_(functy.251) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.252) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.253) {
 }
 
 fn @expr_syntactic_eq(functy.254) {
@@ -32909,7 +32780,7 @@ bb0(%0: ptr, %1: ptr):
     %229 = load i64, ptr %228
     store i64 %229, ptr %165
     %230 = load u64, ptr %165
-    %231 = call @func.221(%230)
+    %231 = call @func.186(%230)
     br bb1(%231)
 bb1(%2: u64):
     %232 = load ptr, ptr %164
@@ -32918,7 +32789,7 @@ bb1(%2: u64):
     %235 = load i64, ptr %234
     store i64 %235, ptr %166
     %236 = load u64, ptr %166
-    %237 = call @func.221(%236)
+    %237 = call @func.186(%236)
     br bb2(%2, %237)
 bb2(%3: u64, %4: u64):
     %238 = icmp ne u64 %3, %4
@@ -33563,7 +33434,7 @@ bb18:
     %833 = load ptr, ptr %187
     %834 = const i64 48
     %835 = gep i8, ptr %833, %834
-    %836 = call @func.65(%809, %823)
+    %836 = call @func.59(%809, %823)
     br bb65(%813, %817, %829, %835, %836)
 bb19:
     %837 = load ptr, ptr %167
@@ -33580,7 +33451,7 @@ bb19:
     %845 = const i64 8
     %846 = gep i8, ptr %844, %845
     store ptr %846, ptr %177
-    %847 = call @func.249(%176, %177)
+    %847 = call @func.149(%176, %177)
     br bb75(%847)
 bb20:
     %848 = load ptr, ptr %167
@@ -33639,7 +33510,7 @@ bb20:
     %891 = load ptr, ptr %199
     %892 = const i64 64
     %893 = gep i8, ptr %891, %892
-    %894 = call @func.65(%849, %869)
+    %894 = call @func.59(%849, %869)
     br bb50(%853, %857, %861, %865, %875, %881, %887, %893, %894)
 bb21:
     %895 = load ptr, ptr %167
@@ -33771,7 +33642,7 @@ bb24:
     %995 = load ptr, ptr %219
     %996 = const i64 48
     %997 = gep i8, ptr %995, %996
-    %998 = call @func.65(%981, %991)
+    %998 = call @func.59(%981, %991)
     br bb28(%985, %997, %998)
 bb25:
     %999 = load ptr, ptr %167
@@ -33788,7 +33659,7 @@ bb25:
     %1007 = const i64 8
     %1008 = gep i8, ptr %1006, %1007
     store ptr %1008, ptr %173
-    %1009 = call @func.250(%172, %173)
+    %1009 = call @func.205(%172, %173)
     br bb75(%1009)
 bb26:
     %1010 = load ptr, ptr %167
@@ -33805,7 +33676,7 @@ bb26:
     %1018 = const i64 8
     %1019 = gep i8, ptr %1017, %1018
     store ptr %1019, ptr %171
-    %1020 = call @func.251(%170, %171)
+    %1020 = call @func.150(%170, %171)
     br bb75(%1020)
 bb27:
     %1021 = load ptr, ptr %167
@@ -33822,21 +33693,21 @@ bb27:
     %1029 = const i64 8
     %1030 = gep i8, ptr %1028, %1029
     store ptr %1030, ptr %169
-    %1031 = call @func.252(%168, %169)
+    %1031 = call @func.151(%168, %169)
     br bb75(%1031)
 bb28(%5: ptr, %6: ptr, %7: bool):
     condbr %7, bb29(%5, %6), bb30
 bb29(%8: ptr, %9: ptr):
-    call @func.253(%174, %8)
+    call @func.81(%174, %8)
     br bb31(%9)
 bb30:
     %1032 = const bool false
     br bb75(%1032)
 bb31(%10: ptr):
-    call @func.253(%175, %10)
+    call @func.81(%175, %10)
     br bb32
 bb32:
-    %1033 = call @func.277(%174, %175)
+    %1033 = call @func.220(%174, %175)
     br bb75(%1033)
 bb33(%11: ptr, %12: ptr, %13: ptr, %14: ptr):
     %1034 = load ptr, ptr %12
@@ -33844,7 +33715,7 @@ bb33(%11: ptr, %12: ptr, %13: ptr, %14: ptr):
     %1036 = gep i8, ptr %1034, %1035
     br bb34(%11, %13, %14, %1036)
 bb34(%15: ptr, %16: ptr, %17: ptr, %18: ptr):
-    %1037 = call @func.254(%17, %18)
+    %1037 = call @func.206(%17, %18)
     br bb35(%15, %16, %1037)
 bb35(%19: ptr, %20: ptr, %21: bool):
     condbr %21, bb36(%19, %20), bb37
@@ -33862,7 +33733,7 @@ bb38(%24: ptr, %25: ptr):
     %1044 = gep i8, ptr %1042, %1043
     br bb39(%25, %1044)
 bb39(%26: ptr, %27: ptr):
-    %1045 = call @func.254(%26, %27)
+    %1045 = call @func.206(%26, %27)
     br bb75(%1045)
 bb40(%28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %1046 = load u8, ptr %28
@@ -33889,7 +33760,7 @@ bb43(%44: ptr, %45: ptr, %46: ptr, %47: ptr):
     %1061 = gep i8, ptr %1059, %1060
     br bb44(%44, %46, %47, %1061)
 bb44(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
-    %1062 = call @func.254(%50, %51)
+    %1062 = call @func.206(%50, %51)
     br bb45(%48, %49, %1062)
 bb45(%52: ptr, %53: ptr, %54: bool):
     condbr %54, bb46(%52, %53), bb47
@@ -33907,7 +33778,7 @@ bb48(%57: ptr, %58: ptr):
     %1069 = gep i8, ptr %1067, %1068
     br bb49(%58, %1069)
 bb49(%59: ptr, %60: ptr):
-    %1070 = call @func.254(%59, %60)
+    %1070 = call @func.206(%59, %60)
     br bb75(%1070)
 bb50(%61: ptr, %62: ptr, %63: ptr, %64: ptr, %65: ptr, %66: ptr, %67: ptr, %68: ptr, %69: bool):
     condbr %69, bb51(%61, %62, %63, %64, %65, %66, %67, %68), bb64
@@ -33922,7 +33793,7 @@ bb52(%78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: 
     %1076 = gep i8, ptr %1074, %1075
     br bb53(%78, %79, %80, %82, %83, %84, %85, %1076)
 bb53(%86: ptr, %87: ptr, %88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: ptr, %93: ptr):
-    %1077 = call @func.254(%92, %93)
+    %1077 = call @func.206(%92, %93)
     br bb54(%86, %87, %88, %89, %90, %91, %1077)
 bb54(%94: ptr, %95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: ptr, %100: bool):
     condbr %100, bb55(%94, %95, %96, %97, %98, %99), bb64
@@ -33937,7 +33808,7 @@ bb56(%107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr, %112: ptr):
     %1083 = gep i8, ptr %1081, %1082
     br bb57(%107, %108, %110, %111, %112, %1083)
 bb57(%113: ptr, %114: ptr, %115: ptr, %116: ptr, %117: ptr, %118: ptr):
-    %1084 = call @func.254(%117, %118)
+    %1084 = call @func.206(%117, %118)
     br bb58(%113, %114, %115, %116, %1084)
 bb58(%119: ptr, %120: ptr, %121: ptr, %122: ptr, %123: bool):
     condbr %123, bb59(%119, %120, %121, %122), bb64
@@ -33952,7 +33823,7 @@ bb60(%128: ptr, %129: ptr, %130: ptr, %131: ptr):
     %1090 = gep i8, ptr %1088, %1089
     br bb61(%128, %130, %131, %1090)
 bb61(%132: ptr, %133: ptr, %134: ptr, %135: ptr):
-    %1091 = call @func.254(%134, %135)
+    %1091 = call @func.206(%134, %135)
     br bb62(%132, %133, %1091)
 bb62(%136: ptr, %137: ptr, %138: bool):
     condbr %138, bb63(%136, %137), bb64
@@ -33985,7 +33856,7 @@ bb69(%152: ptr, %153: ptr):
     %1105 = gep i8, ptr %1103, %1104
     br bb70(%153, %1105)
 bb70(%154: ptr, %155: ptr):
-    %1106 = call @func.254(%154, %155)
+    %1106 = call @func.206(%154, %155)
     br bb75(%1106)
 bb71(%156: ptr, %157: ptr):
     %1107 = load ptr, ptr %156
@@ -34001,18 +33872,12 @@ bb73(%158: ptr, %159: ptr):
     %1113 = gep i8, ptr %1111, %1112
     br bb74(%159, %1113)
 bb74(%160: ptr, %161: ptr):
-    %1114 = call @func.254(%160, %161)
+    %1114 = call @func.206(%160, %161)
     br bb75(%1114)
 bb75(%162: bool):
     ret %162
 bb76:
     unreachable
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3lenBG_(functy.255) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3popBG_(functy.256) {
 }
 
 fn @LocalContext__truncate_to(functy.257) {
@@ -34023,14 +33888,14 @@ bb0(%0: ptr, %1: u64):
     br bb1(%1)
 bb1(%2: u64):
     %9 = load ptr, ptr %7
-    %10 = call @func.255(%9)
+    %10 = call @func.139(%9)
     br bb2(%2, %10)
 bb2(%3: u64, %4: u64):
     %11 = icmp ugt u64 %4, %3
     condbr %11, bb3(%3), bb5
 bb3(%5: u64):
     %12 = load ptr, ptr %7
-    call @func.256(%8, %12)
+    call @func.135(%8, %12)
     br bb4(%5)
 bb4(%6: u64):
     br bb1(%6)
@@ -34046,13 +33911,10 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.278(%6)
+    %7 = call @func.221(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.259) {
 }
 
 fn @Level__is_def_eq(functy.260) {
@@ -34063,7 +33925,7 @@ bb0(%0: ptr, %1: ptr):
     %10 = alloca (i64, i64, i64, i64, i64), align 8
     store ptr %0, ptr %7
     store ptr %1, ptr %8
-    %11 = call @func.259(%7, %8)
+    %11 = call @func.205(%7, %8)
     br bb1(%11)
 bb1(%2: bool):
     condbr %2, bb2, bb3
@@ -34072,14 +33934,14 @@ bb2:
     br bb8(%12)
 bb3:
     %13 = load ptr, ptr %7
-    call @func.279(%9, %13)
+    call @func.222(%9, %13)
     br bb4
 bb4:
     %14 = load ptr, ptr %8
-    call @func.279(%10, %14)
+    call @func.222(%10, %14)
     br bb5(%9)
 bb5(%3: ptr):
-    %15 = call @func.209(%3, %10)
+    %15 = call @func.178(%3, %10)
     br bb6(%15)
 bb6(%4: bool):
     br bb7(%4)
@@ -34091,13 +33953,10 @@ bb8(%6: bool):
 
 fn @Expr__lift_from(functy.261) {
 bb0(%0: ptr, %1: ptr, %2: u32, %3: u32):
-    call @func.242(%0, %1, %2, %3)
+    call @func.200(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.262) {
 }
 
 fn @Expr__get_app_fn(functy.263) {
@@ -34215,7 +34074,7 @@ bb3:
     %95 = load ptr, ptr %5
     %96 = const i64 8
     %97 = gep i8, ptr %95, %96
-    %98 = call @func.262(%97)
+    %98 = call @func.3(%97)
     br bb4(%98)
 bb4(%2: ptr):
     call @func.13(%4, %2)
@@ -34349,7 +34208,7 @@ bb3(%11: ptr, %12: ptr, %13: u64, %14: u64, %15: u64):
     %76 = gep i8, ptr %73, %75
     store ptr %76, ptr %28
     %77 = load ptr, ptr %28
-    %78 = call @func.65(%77, %12)
+    %78 = call @func.59(%77, %12)
     br bb4(%11, %12, %13, %14, %78)
 bb4(%16: ptr, %17: ptr, %18: u64, %19: u64, %20: bool):
     condbr %20, bb5, bb6(%16, %17, %18, %19)
@@ -34393,9 +34252,6 @@ bb10:
 fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprE3newBE_(functy.265) {
 }
 
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.266) {
-}
-
 fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprE4pushBH_(functy.267) {
 }
 
@@ -34415,7 +34271,7 @@ bb0(%0: ptr, %1: ptr):
     %15 = alloca (i64, i64), align 8
     %16 = const bool false
     %17 = const bool true
-    call @func.265(%10)
+    call @func.213(%10)
     br bb1(%1)
 bb1(%2: ptr):
     call @func.13(%11, %2)
@@ -34473,16 +34329,16 @@ bb3:
     %64 = load ptr, ptr %12
     %65 = const i64 16
     %66 = gep i8, ptr %64, %65
-    %67 = call @func.266(%66)
+    %67 = call @func.3(%66)
     br bb4(%63, %10, %67)
 bb4(%3: ptr, %4: ptr, %5: ptr):
     call @func.13(%13, %5)
     br bb5(%3, %4)
 bb5(%6: ptr, %7: ptr):
-    call @func.267(%7, %13)
+    call @func.214(%7, %13)
     br bb6(%6)
 bb6(%8: ptr):
-    %68 = call @func.266(%8)
+    %68 = call @func.3(%8)
     br bb7(%68)
 bb7(%9: ptr):
     call @func.13(%14, %9)
@@ -34548,10 +34404,10 @@ bb9:
     store i64 %114, ptr %113
     br bb2
 bb10:
-    call @func.268(%15, %10)
+    call @func.215(%15, %10)
     br bb11
 bb11:
-    call @func.269(%15)
+    call @func.216(%15)
     br bb12
 bb12:
     %115 = const bool false
@@ -34579,22 +34435,10 @@ bb14:
 
 fn @Verifier____env___try_infer_type_quick(functy.271) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    call @func.281(%0, %1, %2, %3)
+    call @func.223(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.272) {
-}
-
-fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.273) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.274) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.275) {
 }
 
 fn @Verifier____env___infer_type_infer_only_core(functy.276) {
@@ -34816,7 +34660,7 @@ bb4(%5: ptr):
     %373 = const i64 64
     %374 = gep i8, ptr %372, %373
     %375 = const bool true
-    call @func.66(%255, %362)
+    call @func.60(%255, %362)
     br bb90(%5, %365, %368, %371)
 bb5(%6: ptr):
     %376 = load ptr, ptr %179
@@ -34843,7 +34687,7 @@ bb6(%7: ptr):
     %395 = const i64 16
     %396 = gep i8, ptr %394, %395
     %397 = const bool true
-    call @func.83(%206)
+    call @func.77(%206)
     br bb40(%7, %390, %393, %396)
 bb7(%8: ptr):
     %398 = load ptr, ptr %179
@@ -34863,13 +34707,13 @@ bb8(%9: ptr):
     %410 = load ptr, ptr %179
     %411 = const i64 48
     %412 = gep i8, ptr %410, %411
-    call @func.161(%190, %9, %409)
+    call @func.138(%190, %9, %409)
     br bb20(%409)
 bb9:
     %413 = load ptr, ptr %179
     %414 = const i64 8
     %415 = gep i8, ptr %413, %414
-    call @func.95(%189, %415)
+    call @func.87(%189, %415)
     br bb17
 bb10:
     %416 = load ptr, ptr %179
@@ -34879,7 +34723,7 @@ bb10:
     %420 = load i64, ptr %418
     store i64 %420, ptr %182
     %421 = load u64, ptr %182
-    call @func.164(%181, %419, %421)
+    call @func.141(%181, %419, %421)
     br bb12(%418)
 bb11:
     %422 = load ptr, ptr %179
@@ -35039,7 +34883,7 @@ bb16:
     store i64 %537, ptr %536
     br bb118
 bb17:
-    call @func.165(%188, %189)
+    call @func.142(%188, %189)
     br bb18
 bb18:
     call @func.32(%187, %188)
@@ -35111,7 +34955,7 @@ bb20(%12: ptr):
     %589 = select i64 %586, %587, %588
     switch %589 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.66(%193, %13)
+    call @func.60(%193, %13)
     br bb23
 bb22:
     %590 = load i64, ptr %190
@@ -35287,10 +35131,10 @@ bb23:
     br bb118
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %727 = load ptr, ptr %178
-    call @func.276(%196, %14, %16, %727)
+    call @func.219(%196, %14, %16, %727)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.272(%195, %196)
+    call @func.74(%195, %196)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %728 = load i64, ptr %195
@@ -35415,7 +35259,7 @@ bb27(%21: ptr, %22: ptr):
     %826 = load i64, ptr %823
     store i64 %826, ptr %825
     %827 = load ptr, ptr %178
-    call @func.154(%199, %21, %194, %827)
+    call @func.131(%199, %21, %194, %827)
     br bb30(%22, %780)
 bb28:
     %828 = const i64 8
@@ -35446,7 +35290,7 @@ bb28:
     %849 = gep i8, ptr %197, %848
     %850 = load i64, ptr %847
     store i64 %850, ptr %849
-    call @func.273(%0, %197)
+    call @func.103(%0, %197)
     br bb29
 bb29:
     %851 = const bool false
@@ -35640,7 +35484,7 @@ bb33(%27: ptr, %28: ptr, %29: bool):
     %1007 = gep i8, ptr %1005, %1006
     br bb34(%28, %1007, %29)
 bb34(%30: ptr, %31: ptr, %32: bool):
-    call @func.166(%201, %30, %31)
+    call @func.143(%201, %30, %31)
     br bb35(%32)
 bb35(%33: bool):
     %1008 = load i64, ptr %201
@@ -35746,7 +35590,7 @@ bb39:
     %1082 = const bool false
     br bb118
 bb40(%37: ptr, %38: ptr, %39: ptr, %40: ptr):
-    %1083 = call @func.274(%39)
+    %1083 = call @func.3(%39)
     br bb41(%37, %38, %39, %40, %1083)
 bb41(%41: ptr, %42: ptr, %43: ptr, %44: ptr, %45: ptr):
     call @func.13(%207, %45)
@@ -35762,7 +35606,7 @@ bb42(%46: ptr, %47: ptr, %48: ptr, %49: ptr):
     store i8 %1089, ptr %1088
     %1090 = const bool false
     %1091 = load ptr, ptr %178
-    call @func.156(%205, %1091, %206, %207, %208)
+    call @func.133(%205, %1091, %206, %207, %208)
     br bb43(%46, %47, %48, %49)
 bb43(%50: ptr, %51: ptr, %52: ptr, %53: ptr):
     %1092 = const bool false
@@ -35772,16 +35616,16 @@ bb43(%50: ptr, %51: ptr, %52: ptr, %53: ptr):
     br bb44(%50, %51, %52, %1095)
 bb44(%54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1096 = load u64, ptr %205
-    call @func.157(%209, %54, %57, %1096)
+    call @func.134(%209, %54, %57, %1096)
     br bb45(%54, %55, %56)
 bb45(%58: ptr, %59: ptr, %60: ptr):
     %1097 = load ptr, ptr %178
-    call @func.276(%210, %58, %209, %1097)
+    call @func.219(%210, %58, %209, %1097)
     br bb46(%59, %60)
 bb46(%61: ptr, %62: ptr):
     %1098 = const bool true
     %1099 = load ptr, ptr %178
-    call @func.159(%1099)
+    call @func.136(%1099)
     br bb47(%61, %62)
 bb47(%63: ptr, %64: ptr):
     %1100 = const bool false
@@ -35841,7 +35685,7 @@ bb47(%63: ptr, %64: ptr):
     %1145 = gep i8, ptr %213, %1144
     %1146 = load i64, ptr %1143
     store i64 %1146, ptr %1145
-    call @func.272(%212, %213)
+    call @func.74(%212, %213)
     br bb48(%63, %64)
 bb48(%65: ptr, %66: ptr):
     %1147 = load i64, ptr %212
@@ -35965,7 +35809,7 @@ bb49(%67: ptr, %68: ptr):
     %1244 = load i64, ptr %1241
     store i64 %1244, ptr %1243
     %1245 = load u64, ptr %205
-    call @func.167(%216, %211, %1245)
+    call @func.144(%216, %211, %1245)
     br bb52(%67, %68)
 bb50:
     %1246 = const i64 8
@@ -35996,7 +35840,7 @@ bb50:
     %1267 = gep i8, ptr %214, %1266
     %1268 = load i64, ptr %1265
     store i64 %1268, ptr %1267
-    call @func.273(%0, %214)
+    call @func.103(%0, %214)
     br bb51
 bb51:
     %1269 = const bool false
@@ -36011,7 +35855,7 @@ bb52(%69: ptr, %70: ptr):
     %1275 = gep i8, ptr %219, %1274
     %1276 = load i8, ptr %1273
     store i8 %1276, ptr %1275
-    call @func.275(%220, %70)
+    call @func.54(%220, %70)
     br bb53
 bb53:
     %1277 = const bool false
@@ -36160,7 +36004,7 @@ bb54:
     store ptr %1389, ptr %1391
     %1392 = const i64 9
     store i64 %1392, ptr %218
-    call @func.49(%217, %218)
+    call @func.44(%217, %218)
     br bb55
 bb55:
     %1393 = load i64, ptr %217
@@ -36226,10 +36070,10 @@ bb56:
     br bb118
 bb57(%71: ptr, %72: ptr, %73: ptr, %74: ptr, %75: ptr):
     %1441 = load ptr, ptr %178
-    call @func.276(%225, %71, %75, %1441)
+    call @func.219(%225, %71, %75, %1441)
     br bb58(%71, %72, %73, %74)
 bb58(%76: ptr, %77: ptr, %78: ptr, %79: ptr):
-    call @func.272(%224, %225)
+    call @func.74(%224, %225)
     br bb59(%76, %77, %78, %79)
 bb59(%80: ptr, %81: ptr, %82: ptr, %83: ptr):
     %1442 = load i64, ptr %224
@@ -36354,7 +36198,7 @@ bb60(%84: ptr, %85: ptr, %86: ptr, %87: ptr):
     %1540 = load i64, ptr %1537
     store i64 %1540, ptr %1539
     %1541 = load ptr, ptr %178
-    call @func.154(%228, %84, %223, %1541)
+    call @func.131(%228, %84, %223, %1541)
     br bb62(%84, %85, %86, %87, %1494)
 bb61:
     %1542 = const i64 8
@@ -36385,7 +36229,7 @@ bb61:
     %1563 = gep i8, ptr %226, %1562
     %1564 = load i64, ptr %1561
     store i64 %1564, ptr %1563
-    call @func.273(%0, %226)
+    call @func.103(%0, %226)
     br bb117
 bb62(%88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: bool):
     store ptr %228, ptr %230
@@ -36563,11 +36407,11 @@ bb64(%93: ptr, %94: ptr, %95: ptr, %96: ptr, %97: bool):
     %1709 = load ptr, ptr %230
     %1710 = const i64 8
     %1711 = gep i8, ptr %1709, %1710
-    call @func.95(%229, %1711)
+    call @func.87(%229, %1711)
     br bb65(%93, %94, %95, %96, %97)
 bb65(%98: ptr, %99: ptr, %100: ptr, %101: ptr, %102: bool):
     %1712 = const bool true
-    call @func.83(%235)
+    call @func.77(%235)
     br bb67(%98, %99, %100, %101, %102)
 bb66(%103: bool):
     %1713 = load ptr, ptr %232
@@ -36609,7 +36453,7 @@ bb66(%103: bool):
     br bb115(%103)
 bb67(%104: ptr, %105: ptr, %106: ptr, %107: ptr, %108: bool):
     %1741 = const bool true
-    %1742 = call @func.274(%106)
+    %1742 = call @func.3(%106)
     br bb68(%104, %105, %107, %1742, %108)
 bb68(%109: ptr, %110: ptr, %111: ptr, %112: ptr, %113: bool):
     call @func.13(%236, %112)
@@ -36625,7 +36469,7 @@ bb69(%114: ptr, %115: ptr, %116: ptr, %117: bool):
     store i8 %1748, ptr %1747
     %1749 = const bool false
     %1750 = load ptr, ptr %178
-    call @func.156(%234, %1750, %235, %236, %237)
+    call @func.133(%234, %1750, %235, %236, %237)
     br bb70(%114, %116, %117)
 bb70(%118: ptr, %119: ptr, %120: bool):
     %1751 = const bool false
@@ -36635,16 +36479,16 @@ bb70(%118: ptr, %119: ptr, %120: bool):
     br bb71(%118, %1754, %120)
 bb71(%121: ptr, %122: ptr, %123: bool):
     %1755 = load u64, ptr %234
-    call @func.157(%238, %121, %122, %1755)
+    call @func.134(%238, %121, %122, %1755)
     br bb72(%121, %123)
 bb72(%124: ptr, %125: bool):
     %1756 = load ptr, ptr %178
-    call @func.276(%239, %124, %238, %1756)
+    call @func.219(%239, %124, %238, %1756)
     br bb73(%124, %125)
 bb73(%126: ptr, %127: bool):
     %1757 = const bool true
     %1758 = load ptr, ptr %178
-    call @func.159(%1758)
+    call @func.136(%1758)
     br bb74(%126, %127)
 bb74(%128: ptr, %129: bool):
     %1759 = const bool false
@@ -36704,7 +36548,7 @@ bb74(%128: ptr, %129: bool):
     %1804 = gep i8, ptr %242, %1803
     %1805 = load i64, ptr %1802
     store i64 %1805, ptr %1804
-    call @func.272(%241, %242)
+    call @func.74(%241, %242)
     br bb75(%128, %129)
 bb75(%130: ptr, %131: bool):
     %1806 = load i64, ptr %241
@@ -36829,7 +36673,7 @@ bb76(%132: ptr, %133: bool):
     %1904 = load i64, ptr %1901
     store i64 %1904, ptr %1903
     %1905 = load ptr, ptr %178
-    call @func.154(%245, %132, %240, %1905)
+    call @func.131(%245, %132, %240, %1905)
     br bb78(%133)
 bb77(%134: bool):
     %1906 = const i64 8
@@ -36860,7 +36704,7 @@ bb77(%134: bool):
     %1927 = gep i8, ptr %243, %1926
     %1928 = load i64, ptr %1925
     store i64 %1928, ptr %1927
-    call @func.273(%0, %243)
+    call @func.103(%0, %243)
     br bb121(%134)
 bb78(%135: bool):
     store ptr %245, ptr %247
@@ -37038,7 +36882,7 @@ bb80:
     %2073 = load ptr, ptr %247
     %2074 = const i64 8
     %2075 = gep i8, ptr %2073, %2074
-    call @func.95(%246, %2075)
+    call @func.87(%246, %2075)
     br bb81
 bb81:
     %2076 = const bool false
@@ -37068,7 +36912,7 @@ bb81:
     %2096 = gep i8, ptr %253, %2095
     %2097 = load i64, ptr %2094
     store i64 %2097, ptr %2096
-    call @func.160(%252, %253, %246)
+    call @func.137(%252, %253, %246)
     br bb83
 bb82(%137: bool):
     %2098 = load ptr, ptr %249
@@ -37184,14 +37028,14 @@ bb89:
     %2175 = const bool false
     br bb118
 bb90(%138: ptr, %139: ptr, %140: ptr, %141: ptr):
-    %2176 = call @func.274(%139)
+    %2176 = call @func.3(%139)
     br bb91(%138, %140, %141, %2176)
 bb91(%142: ptr, %143: ptr, %144: ptr, %145: ptr):
     call @func.13(%256, %145)
     br bb92(%142, %143, %144)
 bb92(%146: ptr, %147: ptr, %148: ptr):
     %2177 = const bool true
-    %2178 = call @func.274(%147)
+    %2178 = call @func.3(%147)
     br bb93(%146, %147, %148, %2178)
 bb93(%149: ptr, %150: ptr, %151: ptr, %152: ptr):
     call @func.13(%257, %152)
@@ -37200,7 +37044,7 @@ bb94(%153: ptr, %154: ptr, %155: ptr):
     %2179 = const bool false
     %2180 = const bool false
     %2181 = load ptr, ptr %178
-    call @func.169(%254, %2181, %255, %256, %257)
+    call @func.145(%254, %2181, %255, %256, %257)
     br bb95(%153, %154, %155)
 bb95(%156: ptr, %157: ptr, %158: ptr):
     %2182 = const bool false
@@ -37211,16 +37055,16 @@ bb95(%156: ptr, %157: ptr, %158: ptr):
     br bb96(%156, %157, %2186)
 bb96(%159: ptr, %160: ptr, %161: ptr):
     %2187 = load u64, ptr %254
-    call @func.157(%258, %159, %161, %2187)
+    call @func.134(%258, %159, %161, %2187)
     br bb97(%159, %160)
 bb97(%162: ptr, %163: ptr):
     %2188 = load ptr, ptr %178
-    call @func.276(%259, %162, %258, %2188)
+    call @func.219(%259, %162, %258, %2188)
     br bb98(%163)
 bb98(%164: ptr):
     %2189 = const bool true
     %2190 = load ptr, ptr %178
-    call @func.159(%2190)
+    call @func.136(%2190)
     br bb99(%164)
 bb99(%165: ptr):
     %2191 = const bool false
@@ -37280,7 +37124,7 @@ bb99(%165: ptr):
     %2236 = gep i8, ptr %262, %2235
     %2237 = load i64, ptr %2234
     store i64 %2237, ptr %2236
-    call @func.272(%261, %262)
+    call @func.74(%261, %262)
     br bb100(%165)
 bb100(%166: ptr):
     %2238 = load i64, ptr %261
@@ -37436,14 +37280,14 @@ bb102:
     %2360 = gep i8, ptr %263, %2359
     %2361 = load i64, ptr %2358
     store i64 %2361, ptr %2360
-    call @func.273(%0, %263)
+    call @func.103(%0, %263)
     br bb103
 bb103:
     %2362 = const bool false
     br bb118
 bb104(%168: ptr, %169: ptr):
     %2363 = load u64, ptr %254
-    call @func.170(%265, %168, %2363, %169)
+    call @func.146(%265, %168, %2363, %169)
     br bb105
 bb105:
     %2364 = load i64, ptr %265
@@ -37507,16 +37351,16 @@ bb106:
     %2410 = const bool false
     br bb118
 bb107:
-    call @func.171(%268)
+    call @func.147(%268)
     br bb110
 bb108:
-    call @func.172(%267)
+    call @func.148(%267)
     br bb109
 bb109:
-    call @func.51(%266, %267)
+    call @func.45(%266, %267)
     br bb111
 bb110:
-    call @func.51(%266, %268)
+    call @func.45(%266, %268)
     br bb111
 bb111:
     %2411 = load i64, ptr %266
@@ -37578,7 +37422,7 @@ bb111:
     br bb118
 bb112(%170: ptr, %171: ptr):
     %2457 = load ptr, ptr %178
-    call @func.276(%0, %170, %171, %2457)
+    call @func.219(%0, %170, %171, %2457)
     br bb118
 bb113(%172: bool):
     %2458 = const bool false
@@ -37648,7 +37492,7 @@ bb6(%6: u64, %7: ptr, %8: u64):
     %40 = const u64 40
     %41 = mul u64 %8, %40
     %42 = gep i8, ptr %39, %41
-    %43 = call @func.209(%7, %42)
+    %43 = call @func.178(%7, %42)
     br bb7(%6, %43)
 bb7(%9: u64, %10: bool):
     condbr %10, bb8(%9), bb9
@@ -37685,7 +37529,7 @@ bb0(%0: u64):
     %2 = alloca i64, align 8
     store u64 %0, ptr %2
     %3 = load u64, ptr %2
-    %4 = call @func.150(%3)
+    %4 = call @func.128(%3)
     br bb1(%4)
 bb1(%1: u32):
     %5 = const u32 0
@@ -37695,13 +37539,10 @@ bb1(%1: u32):
 
 fn @Level__normalize(functy.279) {
 bb0(%0: ptr, %1: ptr):
-    call @func.282(%0, %1)
+    call @func.224(%0, %1)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.280) {
 }
 
 fn @Verifier____env___try_infer_type_quick_inner(functy.281) {
@@ -37832,7 +37673,7 @@ bb7:
     %146 = load ptr, ptr %42
     %147 = const i64 8
     %148 = gep i8, ptr %146, %147
-    call @func.95(%50, %148)
+    call @func.87(%50, %148)
     br bb15
 bb8(%10: ptr):
     %149 = load ptr, ptr %42
@@ -37841,7 +37682,7 @@ bb8(%10: ptr):
     %152 = load ptr, ptr %42
     %153 = const i64 48
     %154 = gep i8, ptr %152, %153
-    call @func.161(%0, %10, %151)
+    call @func.138(%0, %10, %151)
     br bb43
 bb9(%11: ptr):
     %155 = load ptr, ptr %42
@@ -37850,7 +37691,7 @@ bb9(%11: ptr):
     %158 = load i64, ptr %157
     store i64 %158, ptr %44
     %159 = load u64, ptr %44
-    call @func.164(%43, %11, %159)
+    call @func.141(%43, %11, %159)
     br bb10
 bb10:
     %160 = load i64, ptr %43
@@ -37933,7 +37774,7 @@ bb14:
     store i64 %216, ptr %215
     br bb43
 bb15:
-    call @func.165(%49, %50)
+    call @func.142(%49, %50)
     br bb16
 bb16:
     %217 = const i64 8
@@ -37966,7 +37807,7 @@ bb16:
     store i64 %239, ptr %238
     %240 = const i64 5
     store i64 %240, ptr %48
-    call @func.49(%47, %48)
+    call @func.44(%47, %48)
     br bb17
 bb17:
     %241 = load i64, ptr %47
@@ -38027,7 +37868,7 @@ bb17:
     store i64 %286, ptr %285
     br bb43
 bb18(%12: ptr, %13: ptr, %14: ptr, %15: ptr):
-    call @func.271(%52, %12, %15, %13)
+    call @func.218(%52, %12, %15, %13)
     br bb19(%12, %13, %14)
 bb19(%16: ptr, %17: ptr, %18: ptr):
     %287 = load i64, ptr %52
@@ -38154,7 +37995,7 @@ bb21(%19: ptr, %20: ptr, %21: ptr):
     %384 = gep i8, ptr %51, %383
     %385 = load i64, ptr %382
     store i64 %385, ptr %384
-    call @func.154(%54, %19, %51, %20)
+    call @func.131(%54, %19, %51, %20)
     br bb22(%21)
 bb22(%22: ptr):
     store ptr %54, ptr %55
@@ -38220,7 +38061,7 @@ bb25(%24: ptr, %25: ptr):
     %438 = gep i8, ptr %436, %437
     br bb26(%25, %438)
 bb26(%26: ptr, %27: ptr):
-    call @func.166(%56, %26, %27)
+    call @func.143(%56, %26, %27)
     br bb27
 bb27:
     %439 = load i64, ptr %56
@@ -38285,7 +38126,7 @@ bb28:
 bb29:
     br bb43
 bb30(%28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: ptr):
-    call @func.271(%58, %28, %32, %29)
+    call @func.218(%58, %28, %32, %29)
     br bb31(%30, %31)
 bb31(%33: ptr, %34: ptr):
     %485 = load i64, ptr %58
@@ -38422,7 +38263,7 @@ bb33(%35: ptr, %36: ptr):
     %590 = gep i8, ptr %61, %589
     %591 = load i8, ptr %588
     store i8 %591, ptr %590
-    %592 = call @func.280(%36)
+    %592 = call @func.3(%36)
     br bb34(%592)
 bb34(%37: ptr):
     call @func.13(%62, %37)
@@ -38485,7 +38326,7 @@ bb35:
     %638 = gep i8, ptr %63, %637
     %639 = load i64, ptr %636
     store i64 %639, ptr %638
-    call @func.53(%60, %61, %62, %63)
+    call @func.47(%60, %61, %62, %63)
     br bb36
 bb36:
     %640 = load i64, ptr %60
@@ -38547,16 +38388,16 @@ bb36:
     %686 = const bool false
     br bb43
 bb37:
-    call @func.171(%66)
+    call @func.147(%66)
     br bb40
 bb38:
-    call @func.172(%65)
+    call @func.148(%65)
     br bb39
 bb39:
-    call @func.51(%64, %65)
+    call @func.45(%64, %65)
     br bb41
 bb40:
-    call @func.51(%64, %66)
+    call @func.45(%64, %66)
     br bb41
 bb41:
     %687 = load i64, ptr %64
@@ -38617,7 +38458,7 @@ bb41:
     store i64 %732, ptr %731
     br bb43
 bb42(%38: ptr, %39: ptr, %40: ptr):
-    call @func.271(%0, %38, %40, %39)
+    call @func.218(%0, %38, %40, %39)
     br bb43
 bb43:
     ret
@@ -38639,7 +38480,7 @@ bb0(%0: ptr, %1: ptr):
     %43 = alloca (i64, i64, i64, i64, i64), align 8
     %44 = const bool false
     %45 = const bool false
-    call @func.284(%33, %1)
+    call @func.225(%33, %1)
     br bb1
 bb1:
     %46 = load ptr, ptr %33
@@ -38671,7 +38512,7 @@ bb2:
     unreachable
 bb3(%2: u32):
     %69 = load ptr, ptr %32
-    call @func.293(%0, %69, %2)
+    call @func.230(%0, %69, %2)
     br bb31
 bb4(%3: u32):
     %70 = load ptr, ptr %32
@@ -38686,7 +38527,7 @@ bb4(%3: u32):
     br bb17(%3, %75, %78)
 bb5:
     %79 = load ptr, ptr %32
-    call @func.95(%0, %79)
+    call @func.87(%0, %79)
     br bb31
 bb6(%4: u32):
     %80 = load ptr, ptr %32
@@ -38716,7 +38557,7 @@ bb7(%5: u32):
     br bb11(%5)
 bb8(%6: u32):
     %101 = load ptr, ptr %32
-    call @func.66(%35, %101)
+    call @func.60(%35, %101)
     br bb10(%6)
 bb9(%7: u32):
     %102 = const bool true
@@ -38786,7 +38627,7 @@ bb13(%12: u32, %13: u32):
     %148 = gep i8, ptr %37, %147
     %149 = load i64, ptr %146
     store i64 %149, ptr %148
-    call @func.165(%36, %37)
+    call @func.142(%36, %37)
     br bb14(%12, %13)
 bb14(%14: u32, %15: u32):
     %150 = const bool true
@@ -38863,7 +38704,7 @@ bb16:
     br bb31
 bb17(%17: u32, %18: ptr, %19: ptr):
     %206 = const bool true
-    call @func.282(%39, %19)
+    call @func.224(%39, %19)
     br bb18(%17, %18)
 bb18(%20: u32, %21: ptr):
     %207 = load ptr, ptr %21
@@ -38871,7 +38712,7 @@ bb18(%20: u32, %21: ptr):
     %209 = gep i8, ptr %207, %208
     br bb19(%20, %209)
 bb19(%22: u32, %23: ptr):
-    call @func.282(%40, %23)
+    call @func.224(%40, %23)
     br bb20(%22)
 bb20(%24: u32):
     %210 = const bool false
@@ -38901,7 +38742,7 @@ bb20(%24: u32):
     %230 = gep i8, ptr %42, %229
     %231 = load i64, ptr %228
     store i64 %231, ptr %230
-    call @func.160(%41, %42, %40)
+    call @func.137(%41, %42, %40)
     br bb21(%24)
 bb21(%25: u32):
     %232 = load i64, ptr %41
@@ -38932,15 +38773,15 @@ bb23(%27: u32):
 bb24(%28: u32, %29: bool):
     condbr %29, bb25(%28), bb28(%28)
 bb25(%30: u32):
-    call @func.294(%43, %41, %30)
+    call @func.231(%43, %41, %30)
     br bb26
 bb26:
-    call @func.282(%0, %43)
+    call @func.224(%0, %43)
     br bb27
 bb27:
     br bb29
 bb28(%31: u32):
-    call @func.294(%0, %41, %31)
+    call @func.231(%0, %41, %31)
     br bb32
 bb29:
     br bb30
@@ -38953,9 +38794,6 @@ bb32:
     br bb29
 bb33:
     unreachable
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.283) {
 }
 
 fn @Level__get_offset(functy.284) {
@@ -38990,7 +38828,7 @@ bb2(%3: u32):
     %31 = const i64 8
     %32 = gep i8, ptr %30, %31
     %33 = const u32 1
-    %34 = call @func.283(%3, %33)
+    %34 = call @func.80(%3, %33)
     br bb3(%32, %34)
 bb3(%4: ptr, %5: u32):
     %35 = load ptr, ptr %4
@@ -39009,22 +38847,10 @@ bb5(%8: u32):
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.285) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.286) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.287) {
-}
-
 fn @_RNvXs8_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref8DerefMut9deref_mutBH_(functy.288) {
 }
 
 fn @_RNvMNtCs2EYQwhfuABO_4core5sliceSNtCsep0XPuQfTSm_25clean_binding_defeq_slice5Level4swapBw_(functy.289) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.290) {
 }
 
 fn @_RNvXsd_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index8IndexMutjE9index_mutBH_(functy.291) {
@@ -39052,31 +38878,31 @@ bb0(%0: ptr, %1: ptr, %2: u32):
     %115 = alloca (i64, i64), align 8
     %116 = alloca (i64, i64), align 8
     %117 = const bool false
-    call @func.285(%101)
+    call @func.10(%101)
     br bb1(%1, %2)
 bb1(%3: ptr, %4: u32):
-    call @func.298(%3, %101)
+    call @func.232(%3, %101)
     br bb2(%4)
 bb2(%5: u32):
-    call @func.285(%102)
+    call @func.10(%102)
     br bb3(%5)
 bb3(%6: u32):
     %118 = const u64 0
     br bb4(%6, %118)
 bb4(%7: u32, %8: u64):
-    %119 = call @func.286(%101)
+    %119 = call @func.65(%101)
     br bb5(%7, %8, %8, %119)
 bb5(%9: u32, %10: u64, %11: u64, %12: u64):
     %120 = icmp ult u64 %11, %12
     condbr %120, bb6(%9, %10), bb11(%9)
 bb6(%13: u32, %14: u64):
-    %121 = call @func.287(%101, %14)
+    %121 = call @func.66(%101, %14)
     br bb7(%13, %14, %121)
 bb7(%15: u32, %16: u64, %17: ptr):
-    call @func.282(%103, %17)
+    call @func.224(%103, %17)
     br bb8(%15, %16)
 bb8(%18: u32, %19: u64):
-    call @func.298(%103, %102)
+    call @func.232(%103, %102)
     br bb9(%18, %19)
 bb9(%20: u32, %21: u64):
     %122 = const u64 1
@@ -39098,7 +38924,7 @@ bb11(%23: u32):
     %133 = const u64 1
     br bb12(%23, %133)
 bb12(%24: u32, %25: u64):
-    %134 = call @func.286(%102)
+    %134 = call @func.65(%102)
     br bb13(%24, %25, %25, %134)
 bb13(%26: u32, %27: u64, %28: u64, %29: u64):
     %135 = icmp ult u64 %28, %29
@@ -39110,7 +38936,7 @@ bb15(%32: u32, %33: u64, %34: u64):
     %137 = icmp ugt u64 %34, %136
     condbr %137, bb16(%32, %33, %34), bb26(%32, %33)
 bb16(%35: u32, %36: u64, %37: u64):
-    %138 = call @func.287(%102, %37)
+    %138 = call @func.66(%102, %37)
     br bb17(%35, %36, %37, %138)
 bb17(%38: u32, %39: u64, %40: u64, %41: ptr):
     %139 = const u64 1
@@ -39127,15 +38953,15 @@ bb17(%38: u32, %39: u64, %40: u64, %41: ptr):
     condbr %148, bb18(%38, %39, %40, %41, %102), bb53
 bb18(%42: u32, %43: u64, %44: u64, %45: ptr, %46: ptr):
     %149 = load u64, ptr %105
-    %150 = call @func.287(%46, %149)
+    %150 = call @func.66(%46, %149)
     br bb19(%42, %43, %44, %45, %150)
 bb19(%47: u32, %48: u64, %49: u64, %50: ptr, %51: ptr):
-    %151 = call @func.302(%50, %51)
+    %151 = call @func.235(%50, %51)
     br bb20(%47, %48, %49, %151)
 bb20(%52: u32, %53: u64, %54: u64, %55: bool):
     condbr %55, bb21(%52, %53, %54), bb26(%52, %53)
 bb21(%56: u32, %57: u64, %58: u64):
-    call @func.288(%106, %102)
+    call @func.226(%106, %102)
     br bb22(%56, %57, %58)
 bb22(%59: u32, %60: u64, %61: u64):
     %152 = const u64 1
@@ -39152,7 +38978,7 @@ bb22(%59: u32, %60: u64, %61: u64):
     condbr %161, bb23(%59, %60, %61, %61), bb53
 bb23(%62: u32, %63: u64, %64: u64, %65: u64):
     %162 = load u64, ptr %107
-    call @func.289(%106, %65, %162)
+    call @func.227(%106, %65, %162)
     br bb24(%62, %63, %64)
 bb24(%66: u32, %67: u64, %68: u64):
     %163 = const u64 1
@@ -39187,16 +39013,16 @@ bb27(%73: u32):
     %184 = load u64, ptr %109
     br bb12(%73, %184)
 bb28(%74: u32):
-    call @func.290(%111, %102)
+    call @func.81(%111, %102)
     br bb29(%74)
 bb29(%75: u32):
-    call @func.307(%110, %111)
+    call @func.237(%110, %111)
     br bb30(%75)
 bb30(%76: u32):
-    call @func.290(%113, %110)
+    call @func.81(%113, %110)
     br bb31(%76)
 bb31(%77: u32):
-    call @func.313(%112, %113)
+    call @func.239(%112, %113)
     br bb32(%77)
 bb32(%78: u32):
     %185 = const u32 0
@@ -39206,20 +39032,20 @@ bb33(%79: u32):
     %187 = const u64 0
     br bb34(%79, %187)
 bb34(%80: u32, %81: u64):
-    %188 = call @func.286(%112)
+    %188 = call @func.65(%112)
     br bb35(%80, %81, %81, %188)
 bb35(%82: u32, %83: u64, %84: u64, %85: u64):
     %189 = icmp ult u64 %84, %85
     condbr %189, bb36(%82, %83), bb42
 bb36(%86: u32, %87: u64):
-    %190 = call @func.287(%112, %87)
+    %190 = call @func.66(%112, %87)
     br bb37(%86, %87, %190)
 bb37(%88: u32, %89: u64, %90: ptr):
-    call @func.294(%114, %90, %88)
+    call @func.231(%114, %90, %88)
     br bb38(%88, %89)
 bb38(%91: u32, %92: u64):
     %191 = const bool true
-    %192 = call @func.291(%112, %92)
+    %192 = call @func.228(%112, %92)
     br bb39(%91, %92, %192)
 bb39(%93: u32, %94: u64, %95: ptr):
     br bb40(%93, %94, %95)
@@ -39268,7 +39094,7 @@ bb41(%99: u32):
     %226 = load u64, ptr %115
     br bb34(%99, %226)
 bb42:
-    %227 = call @func.292(%112)
+    %227 = call @func.229(%112)
     br bb43(%227)
 bb43(%100: bool):
     condbr %100, bb44, bb45
@@ -39277,10 +39103,10 @@ bb44:
     store i64 %228, ptr %0
     br bb47
 bb45:
-    call @func.290(%116, %112)
+    call @func.81(%116, %112)
     br bb46
 bb46:
-    call @func.314(%0, %116)
+    call @func.240(%0, %116)
     br bb52
 bb47:
     br bb48
@@ -39306,7 +39132,7 @@ bb0(%0: ptr, %1: ptr, %2: u32):
     %14 = alloca (i32, i32), align 4
     %15 = const bool false
     %16 = const bool true
-    call @func.95(%11, %1)
+    call @func.87(%11, %1)
     br bb1(%2)
 bb1(%3: u32):
     %17 = const u32 0
@@ -39342,7 +39168,7 @@ bb3(%6: u32, %7: u32):
     %39 = gep i8, ptr %13, %38
     %40 = load i64, ptr %37
     store i64 %40, ptr %39
-    call @func.165(%12, %13)
+    call @func.142(%12, %13)
     br bb4(%6, %7)
 bb4(%8: u32, %9: u32):
     %41 = const bool true
@@ -39421,15 +39247,6 @@ bb7:
     unreachable
 }
 
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3popBH_(functy.295) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBI_(functy.296) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.297) {
-}
-
 fn @Level__push_max_args(functy.298) {
 bb0(%0: ptr, %1: ptr):
     %27 = alloca (i64, i64, i64), align 8
@@ -39452,7 +39269,7 @@ bb1(%2: ptr, %3: ptr):
     %41 = icmp eq u64 %39, %40
     condbr %41, bb13(%2, %3, %34), bb18
 bb2(%4: ptr):
-    call @func.295(%29, %27)
+    call @func.97(%29, %27)
     br bb3(%4)
 bb3(%5: ptr):
     %42 = load i64, ptr %29
@@ -39487,7 +39304,7 @@ bb4(%6: ptr):
     switch %67 [ 2: bb6(%6) default: bb5(%6) ]
 bb5(%7: ptr):
     %68 = load ptr, ptr %30
-    call @func.95(%31, %68)
+    call @func.87(%31, %68)
     br bb10(%7)
 bb6(%8: ptr):
     %69 = load ptr, ptr %30
@@ -39501,7 +39318,7 @@ bb6(%8: ptr):
     %77 = gep i8, ptr %75, %76
     br bb7(%8, %71, %27, %77)
 bb7(%9: ptr, %10: ptr, %11: ptr, %12: ptr):
-    call @func.296(%11, %12)
+    call @func.98(%11, %12)
     br bb8(%9, %10)
 bb8(%13: ptr, %14: ptr):
     %78 = load ptr, ptr %14
@@ -39509,10 +39326,10 @@ bb8(%13: ptr, %14: ptr):
     %80 = gep i8, ptr %78, %79
     br bb9(%13, %27, %80)
 bb9(%15: ptr, %16: ptr, %17: ptr):
-    call @func.296(%16, %17)
+    call @func.98(%16, %17)
     br bb16(%15)
 bb10(%18: ptr):
-    call @func.297(%18, %31)
+    call @func.11(%18, %31)
     br bb17(%18)
 bb11:
     br bb12
@@ -39553,9 +39370,6 @@ bb18:
     unreachable
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.299) {
-}
-
 fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2neBF_(functy.300) {
 }
 
@@ -39587,7 +39401,7 @@ bb0(%0: ptr, %1: ptr):
     store ptr %1, ptr %29
     br bb1
 bb1:
-    %47 = call @func.299(%28, %29)
+    %47 = call @func.205(%28, %29)
     br bb2(%47)
 bb2(%2: bool):
     condbr %2, bb3, bb4
@@ -39596,7 +39410,7 @@ bb3:
     br bb31(%48)
 bb4:
     %49 = load ptr, ptr %28
-    call @func.284(%31, %49)
+    call @func.225(%31, %49)
     br bb5
 bb5:
     %50 = load ptr, ptr %31
@@ -39605,7 +39419,7 @@ bb5:
     %52 = gep i8, ptr %31, %51
     %53 = load u32, ptr %52
     %54 = load ptr, ptr %29
-    call @func.284(%33, %54)
+    call @func.225(%33, %54)
     br bb6(%53)
 bb6(%3: u32):
     %55 = load ptr, ptr %33
@@ -39613,28 +39427,28 @@ bb6(%3: u32):
     %56 = const i64 8
     %57 = gep i8, ptr %33, %56
     %58 = load u32, ptr %57
-    %59 = call @func.300(%30, %32)
+    %59 = call @func.233(%30, %32)
     br bb7(%3, %58, %59)
 bb7(%4: u32, %5: u32, %6: bool):
     condbr %6, bb8, bb30(%4, %5)
 bb8:
     %60 = load ptr, ptr %30
-    %61 = call @func.315(%60)
+    %61 = call @func.241(%60)
     br bb9(%61)
 bb9(%7: u8):
     %62 = load ptr, ptr %32
-    %63 = call @func.315(%62)
+    %63 = call @func.241(%62)
     br bb10(%7, %63)
 bb10(%8: u8, %9: u8):
     %64 = icmp ne u8 %8, %9
     condbr %64, bb11, bb14
 bb11:
     %65 = load ptr, ptr %30
-    %66 = call @func.315(%65)
+    %66 = call @func.241(%65)
     br bb12(%66)
 bb12(%10: u8):
     %67 = load ptr, ptr %32
-    %68 = call @func.315(%67)
+    %68 = call @func.241(%67)
     br bb13(%10, %68)
 bb13(%11: u8, %12: u8):
     %69 = icmp ult u8 %11, %12
@@ -39803,10 +39617,10 @@ bb21:
     %201 = load ptr, ptr %200
     store ptr %201, ptr %46
     %202 = load ptr, ptr %46
-    %203 = call @func.320(%198, %202)
+    %203 = call @func.245(%198, %202)
     br bb31(%203)
 bb22(%13: ptr, %14: ptr):
-    %204 = call @func.301(%35, %36)
+    %204 = call @func.234(%35, %36)
     br bb23(%13, %14, %204)
 bb23(%15: ptr, %16: ptr, %17: bool):
     condbr %17, bb24, bb27(%15, %16)
@@ -39847,15 +39661,6 @@ bb31(%27: bool):
     ret %27
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.303) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.304) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.305) {
-}
-
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3popBG_(functy.306) {
 }
 
@@ -39878,7 +39683,7 @@ bb0(%0: ptr, %1: ptr):
     %92 = alloca (i64, i64, i64, i64, i64), align 8
     %93 = alloca (i64, i64, i64, i64, i64), align 8
     %94 = alloca (i64, i64), align 8
-    call @func.303(%78)
+    call @func.10(%78)
     br bb1
 bb1:
     %95 = const u64 0
@@ -39892,7 +39697,7 @@ bb2(%2: u64, %3: u64):
     %101 = const u64 40
     %102 = mul u64 %3, %101
     %103 = gep i8, ptr %100, %102
-    %104 = call @func.321(%103)
+    %104 = call @func.246(%103)
     br bb3(%2, %104)
 bb3(%4: u64, %5: bool):
     condbr %5, bb4(%4), bb25(%4)
@@ -39941,7 +39746,7 @@ bb8(%10: u64, %11: u64):
     %136 = const u64 40
     %137 = mul u64 %11, %136
     %138 = gep i8, ptr %135, %137
-    %139 = call @func.321(%138)
+    %139 = call @func.246(%138)
     br bb9(%10, %139)
 bb9(%12: u64, %13: bool):
     condbr %13, bb10(%12), bb12(%12)
@@ -39972,7 +39777,7 @@ bb13(%16: u64, %17: u64):
     %156 = const u64 40
     %157 = mul u64 %17, %156
     %158 = gep i8, ptr %155, %157
-    call @func.284(%82, %158)
+    call @func.225(%82, %158)
     br bb14(%16)
 bb14(%18: u64):
     %159 = const i64 8
@@ -40010,7 +39815,7 @@ bb18(%27: u64, %28: u32, %29: u64, %30: u64):
     %182 = const u64 40
     %183 = mul u64 %30, %182
     %184 = gep i8, ptr %181, %183
-    call @func.284(%84, %184)
+    call @func.225(%84, %184)
     br bb19(%27, %28, %29)
 bb19(%31: u64, %32: u32, %33: u64):
     %185 = const i64 8
@@ -40073,10 +39878,10 @@ bb27(%44: u64, %45: ptr, %46: u64):
     %224 = const u64 40
     %225 = mul u64 %46, %224
     %226 = gep i8, ptr %223, %225
-    call @func.95(%87, %226)
+    call @func.87(%87, %226)
     br bb28(%44, %45)
 bb28(%47: u64, %48: ptr):
-    call @func.304(%48, %87)
+    call @func.11(%48, %87)
     br bb29(%47)
 bb29(%49: u64):
     %227 = const i64 8
@@ -40089,7 +39894,7 @@ bb30(%50: u64, %51: u64):
     %232 = const u64 40
     %233 = mul u64 %51, %232
     %234 = gep i8, ptr %231, %233
-    call @func.284(%88, %234)
+    call @func.225(%88, %234)
     br bb31(%50)
 bb31(%52: u64):
     %235 = const u64 1
@@ -40124,10 +39929,10 @@ bb35(%55: u64, %56: u64):
     %255 = const u64 40
     %256 = mul u64 %56, %255
     %257 = gep i8, ptr %254, %256
-    call @func.284(%90, %257)
+    call @func.225(%90, %257)
     br bb36(%55)
 bb36(%57: u64):
-    %258 = call @func.305(%88, %90)
+    %258 = call @func.205(%88, %90)
     br bb37(%57, %258)
 bb37(%58: u64, %59: bool):
     condbr %59, bb38(%58), bb44(%58)
@@ -40149,7 +39954,7 @@ bb39(%61: u64):
     %270 = gep i8, ptr %88, %269
     %271 = load i64, ptr %268
     store i64 %271, ptr %270
-    call @func.306(%91, %78)
+    call @func.236(%91, %78)
     br bb40(%61)
 bb40(%62: u64):
     br bb41(%62)
@@ -40164,10 +39969,10 @@ bb42(%64: u64, %65: ptr, %66: u64):
     %277 = const u64 40
     %278 = mul u64 %66, %277
     %279 = gep i8, ptr %276, %278
-    call @func.95(%92, %279)
+    call @func.87(%92, %279)
     br bb43(%64, %65)
 bb43(%67: u64, %68: ptr):
-    call @func.304(%68, %92)
+    call @func.11(%68, %92)
     br bb50(%67)
 bb44(%69: u64):
     %280 = load i64, ptr %90
@@ -40188,10 +39993,10 @@ bb45(%70: u64, %71: ptr, %72: u64):
     %291 = const u64 40
     %292 = mul u64 %72, %291
     %293 = gep i8, ptr %290, %292
-    call @func.95(%93, %293)
+    call @func.87(%93, %293)
     br bb46(%70, %71)
 bb46(%73: u64, %74: ptr):
-    call @func.304(%74, %93)
+    call @func.11(%74, %93)
     br bb51(%73)
 bb47(%75: u64):
     %294 = const u64 1
@@ -40236,18 +40041,6 @@ bb52:
 fn @_RNvMNtCskTzINo8ZBH9_5alloc5sliceSNtCsep0XPuQfTSm_25clean_binding_defeq_slice5Level6to_vecBx_(functy.308) {
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.309) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.310) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.311) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.312) {
-}
-
 fn @Level__subsume_max_args(functy.313) {
 bb0(%0: ptr, %1: ptr):
     %219 = alloca (i64, i64), align 8
@@ -40270,7 +40063,7 @@ bb0(%0: ptr, %1: ptr):
     %236 = icmp ule u64 %234, %235
     condbr %236, bb1, bb2
 bb1:
-    call @func.308(%0, %1)
+    call @func.238(%0, %1)
     br bb66
 bb2:
     %237 = const bool false
@@ -40293,7 +40086,7 @@ bb5(%6: bool, %7: u64, %8: u64):
     %248 = const u64 40
     %249 = mul u64 %8, %248
     %250 = gep i8, ptr %247, %249
-    call @func.284(%219, %250)
+    call @func.225(%219, %250)
     br bb6(%6, %7)
 bb6(%9: bool, %10: u64):
     %251 = load ptr, ptr %219
@@ -40346,10 +40139,10 @@ bb12(%20: bool):
 bb13(%21: bool):
     condbr %21, bb15, bb14
 bb14:
-    call @func.308(%0, %1)
+    call @func.238(%0, %1)
     br bb66
 bb15:
-    call @func.309(%221)
+    call @func.10(%221)
     br bb16
 bb16:
     %284 = const u64 0
@@ -40371,7 +40164,7 @@ bb19(%24: u64, %25: u64):
     %294 = const u64 40
     %295 = mul u64 %25, %294
     %296 = gep i8, ptr %293, %295
-    call @func.284(%222, %296)
+    call @func.225(%222, %296)
     br bb20(%24, %296)
 bb20(%26: u64, %27: ptr):
     %297 = load ptr, ptr %222
@@ -40405,16 +40198,16 @@ bb23(%32: u64, %33: ptr, %34: bool):
     %319 = const u64 0
     br bb24(%32, %33, %34, %318, %319)
 bb24(%35: u64, %36: ptr, %37: bool, %38: bool, %39: u64):
-    %320 = call @func.310(%221)
+    %320 = call @func.65(%221)
     br bb25(%35, %36, %37, %38, %39, %39, %320)
 bb25(%40: u64, %41: ptr, %42: bool, %43: bool, %44: u64, %45: u64, %46: u64):
     %321 = icmp ult u64 %45, %46
     condbr %321, bb26(%40, %41, %42, %43, %44), bb38(%40, %41, %42, %43)
 bb26(%47: u64, %48: ptr, %49: bool, %50: bool, %51: u64):
-    %322 = call @func.311(%221, %51)
+    %322 = call @func.66(%221, %51)
     br bb27(%47, %48, %49, %50, %51, %322)
 bb27(%52: u64, %53: ptr, %54: bool, %55: bool, %56: u64, %57: ptr):
-    call @func.284(%223, %57)
+    call @func.225(%223, %57)
     br bb28(%52, %53, %54, %55, %56, %57)
 bb28(%58: u64, %59: ptr, %60: bool, %61: bool, %62: u64, %63: ptr):
     %323 = load ptr, ptr %223
@@ -40448,7 +40241,7 @@ bb31(%76: u64, %77: ptr, %78: bool, %79: bool, %80: u64, %81: ptr, %82: bool):
 bb32(%83: u64, %84: ptr, %85: bool, %86: bool, %87: u64, %88: ptr, %89: bool):
     condbr %89, bb33(%83, %84, %85, %86, %87, %88), bb36(%83, %84, %85, %86, %87)
 bb33(%90: u64, %91: ptr, %92: bool, %93: bool, %94: u64, %95: ptr):
-    %344 = call @func.325(%95, %91)
+    %344 = call @func.247(%95, %91)
     br bb34(%90, %91, %92, %93, %94, %344)
 bb34(%96: u64, %97: ptr, %98: bool, %99: bool, %100: u64, %101: bool):
     condbr %101, bb35(%96, %97, %98), bb36(%96, %97, %98, %99, %100)
@@ -40523,7 +40316,7 @@ bb45(%136: u64, %137: ptr, %138: bool, %139: bool, %140: u64, %141: u64):
     %389 = const u64 40
     %390 = mul u64 %141, %389
     %391 = gep i8, ptr %388, %390
-    call @func.284(%227, %391)
+    call @func.225(%227, %391)
     br bb46(%136, %137, %138, %139, %140, %391)
 bb46(%142: u64, %143: ptr, %144: bool, %145: bool, %146: u64, %147: ptr):
     %392 = load ptr, ptr %227
@@ -40557,12 +40350,12 @@ bb49(%160: u64, %161: ptr, %162: bool, %163: bool, %164: u64, %165: ptr, %166: b
 bb50(%167: u64, %168: ptr, %169: bool, %170: bool, %171: u64, %172: ptr, %173: bool):
     condbr %173, bb51(%167, %168, %169, %170, %171, %172), bb56(%167, %168, %169, %170, %171)
 bb51(%174: u64, %175: ptr, %176: bool, %177: bool, %178: u64, %179: ptr):
-    %413 = call @func.325(%179, %175)
+    %413 = call @func.247(%179, %175)
     br bb52(%174, %175, %176, %177, %178, %179, %413)
 bb52(%180: u64, %181: ptr, %182: bool, %183: bool, %184: u64, %185: ptr, %186: bool):
     condbr %186, bb53(%180, %181, %182, %183, %184, %185), bb56(%180, %181, %182, %183, %184)
 bb53(%187: u64, %188: ptr, %189: bool, %190: bool, %191: u64, %192: ptr):
-    %414 = call @func.325(%188, %192)
+    %414 = call @func.247(%188, %192)
     br bb54(%187, %188, %189, %190, %191, %414)
 bb54(%193: u64, %194: ptr, %195: bool, %196: bool, %197: u64, %198: bool):
     condbr %198, bb56(%193, %194, %195, %196, %197), bb55(%193, %194)
@@ -40604,10 +40397,10 @@ bb60:
     %437 = load u64, ptr %229
     br bb17(%437)
 bb61(%214: u64, %215: ptr):
-    call @func.95(%230, %215)
+    call @func.87(%230, %215)
     br bb62(%214, %221)
 bb62(%216: u64, %217: ptr):
-    call @func.312(%217, %230)
+    call @func.11(%217, %230)
     br bb63(%216)
 bb63(%218: u64):
     %438 = const u64 1
@@ -40682,7 +40475,7 @@ bb2(%2: u64):
     %38 = const u64 40
     %39 = mul u64 %2, %38
     %40 = gep i8, ptr %37, %39
-    call @func.95(%0, %40)
+    call @func.87(%0, %40)
     br bb21
 bb3:
     %41 = const i64 8
@@ -40712,10 +40505,10 @@ bb5(%3: u64):
     %60 = const u64 40
     %61 = mul u64 %3, %60
     %62 = gep i8, ptr %59, %61
-    call @func.95(%14, %62)
+    call @func.87(%14, %62)
     br bb6
 bb6:
-    call @func.85(%13, %14)
+    call @func.79(%13, %14)
     br bb7
 bb7:
     %63 = const i64 8
@@ -40745,10 +40538,10 @@ bb9(%4: u64):
     %82 = const u64 40
     %83 = mul u64 %4, %82
     %84 = gep i8, ptr %81, %83
-    call @func.95(%17, %84)
+    call @func.87(%17, %84)
     br bb10
 bb10:
-    call @func.85(%16, %17)
+    call @func.79(%16, %17)
     br bb11
 bb11:
     %85 = const bool true
@@ -40809,10 +40602,10 @@ bb16(%7: u64, %8: u64):
     %125 = const u64 40
     %126 = mul u64 %8, %125
     %127 = gep i8, ptr %124, %126
-    call @func.95(%23, %127)
+    call @func.87(%23, %127)
     br bb17(%7)
 bb17(%9: u64):
-    call @func.85(%22, %23)
+    call @func.79(%22, %23)
     br bb18(%9)
 bb18(%10: u64):
     %128 = const bool false
@@ -40842,7 +40635,7 @@ bb18(%10: u64):
     %148 = gep i8, ptr %25, %147
     %149 = load i64, ptr %146
     store i64 %149, ptr %148
-    call @func.85(%24, %25)
+    call @func.79(%24, %25)
     br bb19(%10)
 bb19(%11: u64):
     %150 = load ptr, ptr %22
@@ -40970,9 +40763,6 @@ fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecRNtCsep0XPuQfTSm_25clean_binding
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecRNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3popBH_(functy.318) {
 }
 
-fn @_RNvXsw_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArceENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.319) {
-}
-
 fn @name_cmp_is_lt(functy.320) {
 bb0(%0: ptr, %1: ptr):
     %29 = alloca (i64, i64, i64), align 8
@@ -40993,7 +40783,7 @@ bb0(%0: ptr, %1: ptr):
     %44 = alloca i64, align 8
     %45 = alloca i64, align 8
     %46 = alloca i64, align 8
-    call @func.316(%29)
+    call @func.242(%29)
     br bb1(%0, %1)
 bb1(%2: ptr, %3: ptr):
     store ptr %2, ptr %30
@@ -41011,17 +40801,17 @@ bb4(%5: ptr):
     %51 = const i64 16
     %52 = gep i8, ptr %50, %51
     %53 = load ptr, ptr %30
-    call @func.317(%29, %53)
+    call @func.243(%29, %53)
     br bb9(%5, %52)
 bb5(%6: ptr):
     %54 = load ptr, ptr %31
     %55 = const i64 8
     %56 = gep i8, ptr %54, %55
     %57 = load ptr, ptr %30
-    call @func.317(%29, %57)
+    call @func.243(%29, %57)
     br bb7(%6, %56)
 bb6(%7: ptr):
-    call @func.316(%32)
+    call @func.242(%32)
     br bb11(%7)
 bb7(%8: ptr, %9: ptr):
     %58 = load ptr, ptr %9
@@ -41053,14 +40843,14 @@ bb13:
     %68 = const i64 16
     %69 = gep i8, ptr %67, %68
     %70 = load ptr, ptr %33
-    call @func.317(%32, %70)
+    call @func.243(%32, %70)
     br bb17(%69)
 bb14:
     %71 = load ptr, ptr %34
     %72 = const i64 8
     %73 = gep i8, ptr %71, %72
     %74 = load ptr, ptr %33
-    call @func.317(%32, %74)
+    call @func.243(%32, %74)
     br bb15(%73)
 bb15(%17: ptr):
     %75 = load ptr, ptr %17
@@ -41079,10 +40869,10 @@ bb18(%20: ptr):
     store ptr %20, ptr %33
     br bb12
 bb19:
-    call @func.318(%35, %29)
+    call @func.244(%35, %29)
     br bb20
 bb20:
-    call @func.318(%36, %32)
+    call @func.244(%36, %32)
     br bb21
 bb21:
     %81 = load ptr, ptr %35
@@ -41174,7 +40964,7 @@ bb32:
     %137 = load ptr, ptr %44
     %138 = const i64 16
     %139 = gep i8, ptr %137, %138
-    call @func.319(%41, %133)
+    call @func.58(%41, %133)
     br bb35(%139)
 bb33:
     %140 = load ptr, ptr %40
@@ -41199,10 +40989,10 @@ bb34(%21: ptr, %22: ptr):
     %155 = icmp ult u64 %153, %154
     br bb39(%155)
 bb35(%23: ptr):
-    call @func.319(%42, %23)
+    call @func.58(%42, %23)
     br bb36
 bb36:
-    %156 = call @func.326(%41, %42)
+    %156 = call @func.248(%41, %42)
     br bb37(%156)
 bb37(%24: i32):
     %157 = const i32 0
@@ -41223,7 +41013,7 @@ bb41(%28: bool):
 fn @Level__is_explicit(functy.321) {
 bb0(%0: ptr):
     %2 = alloca (i64, i64), align 8
-    call @func.284(%2, %0)
+    call @func.225(%2, %0)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -41254,15 +41044,6 @@ bb3:
     br bb4(%23)
 bb4(%1: bool):
     ret %1
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecTRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelBF_EE3popBI_(functy.322) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.323) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecTRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelBG_EE4pushBJ_(functy.324) {
 }
 
 fn @Level__is_geq_core(functy.325) {
@@ -41302,7 +41083,7 @@ bb1(%2: ptr, %3: ptr):
     %80 = icmp eq u64 %78, %79
     condbr %80, bb47(%73), bb54
 bb2:
-    call @func.322(%56, %53)
+    call @func.176(%56, %53)
     br bb3
 bb3:
     %81 = load i64, ptr %56
@@ -41319,19 +41100,19 @@ bb4:
     %89 = gep i8, ptr %56, %88
     %90 = load ptr, ptr %89
     store ptr %90, ptr %58
-    %91 = call @func.323(%57, %58)
+    %91 = call @func.205(%57, %58)
     br bb5(%91)
 bb5(%4: bool):
     condbr %4, bb2, bb6
 bb6:
     %92 = load ptr, ptr %58
-    %93 = call @func.79(%92)
+    %93 = call @func.73(%92)
     br bb7(%93)
 bb7(%5: bool):
     condbr %5, bb2, bb8
 bb8:
     %94 = load ptr, ptr %57
-    call @func.284(%60, %94)
+    call @func.225(%60, %94)
     br bb9
 bb9:
     %95 = load ptr, ptr %60
@@ -41345,7 +41126,7 @@ bb9:
 bb10(%6: u32):
     %101 = load ptr, ptr %59
     %102 = load ptr, ptr %58
-    %103 = call @func.209(%101, %102)
+    %103 = call @func.178(%101, %102)
     br bb11(%6, %103)
 bb11(%7: u32, %8: bool):
     condbr %8, bb2, bb12(%7)
@@ -41408,7 +41189,7 @@ bb15(%11: ptr, %12: ptr, %13: ptr):
     %152 = const i64 8
     %153 = gep i8, ptr %61, %152
     store ptr %13, ptr %153
-    call @func.324(%12, %61)
+    call @func.177(%12, %61)
     br bb16(%11)
 bb16(%14: ptr):
     %154 = load ptr, ptr %14
@@ -41421,7 +41202,7 @@ bb17(%15: ptr, %16: ptr):
     %158 = const i64 8
     %159 = gep i8, ptr %62, %158
     store ptr %16, ptr %159
-    call @func.324(%15, %62)
+    call @func.177(%15, %62)
     br bb50
 bb18(%17: u32):
     %160 = load ptr, ptr %58
@@ -41457,7 +41238,7 @@ bb19:
     br bb20(%184, %187)
 bb20(%18: ptr, %19: ptr):
     %188 = load ptr, ptr %58
-    %189 = call @func.328(%19, %188)
+    %189 = call @func.249(%19, %188)
     br bb21(%18, %189)
 bb21(%20: ptr, %21: bool):
     condbr %21, bb2, bb22(%20)
@@ -41468,7 +41249,7 @@ bb22(%22: ptr):
     br bb23(%192)
 bb23(%23: ptr):
     %193 = load ptr, ptr %58
-    %194 = call @func.328(%23, %193)
+    %194 = call @func.249(%23, %193)
     br bb24(%194)
 bb24(%24: bool):
     condbr %24, bb2, bb25
@@ -41513,7 +41294,7 @@ bb28(%26: ptr, %27: ptr, %28: ptr):
     %225 = const i64 8
     %226 = gep i8, ptr %63, %225
     store ptr %28, ptr %226
-    call @func.324(%27, %63)
+    call @func.177(%27, %63)
     br bb29(%26)
 bb29(%29: ptr):
     %227 = load ptr, ptr %29
@@ -41526,11 +41307,11 @@ bb30(%30: ptr, %31: ptr):
     %231 = const i64 8
     %232 = gep i8, ptr %64, %231
     store ptr %31, ptr %232
-    call @func.324(%30, %64)
+    call @func.177(%30, %64)
     br bb51
 bb31(%32: u32):
     %233 = load ptr, ptr %58
-    call @func.284(%67, %233)
+    call @func.225(%67, %233)
     br bb34(%32)
 bb32:
     %234 = load ptr, ptr %57
@@ -41546,7 +41327,7 @@ bb33(%33: ptr, %34: ptr):
     %241 = const i64 8
     %242 = gep i8, ptr %65, %241
     store ptr %240, ptr %242
-    call @func.324(%33, %65)
+    call @func.177(%33, %65)
     br bb52
 bb34(%35: u32):
     %243 = load ptr, ptr %67
@@ -41554,13 +41335,13 @@ bb34(%35: u32):
     %244 = const i64 8
     %245 = gep i8, ptr %67, %244
     %246 = load u32, ptr %245
-    %247 = call @func.323(%59, %66)
+    %247 = call @func.205(%59, %66)
     br bb35(%35, %246, %247)
 bb35(%36: u32, %37: u32, %38: bool):
     condbr %38, bb38(%36, %37), bb36(%36, %37)
 bb36(%39: u32, %40: u32):
     %248 = load ptr, ptr %66
-    %249 = call @func.79(%248)
+    %249 = call @func.73(%248)
     br bb37(%39, %40, %249)
 bb37(%41: u32, %42: u32, %43: bool):
     condbr %43, bb38(%41, %42), bb40(%41, %42)
@@ -41584,7 +41365,7 @@ bb42:
     %257 = const i64 8
     %258 = gep i8, ptr %68, %257
     store ptr %256, ptr %258
-    call @func.324(%53, %68)
+    call @func.177(%53, %68)
     br bb53
 bb43:
     %259 = const bool false
@@ -41778,9 +41559,6 @@ bb21:
     unreachable
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.327) {
-}
-
 fn @Level__is_geq_leaf(functy.328) {
 bb0(%0: ptr, %1: ptr):
     %20 = alloca i64, align 8
@@ -41791,13 +41569,13 @@ bb0(%0: ptr, %1: ptr):
     %25 = alloca (i64, i64), align 8
     store ptr %0, ptr %20
     store ptr %1, ptr %21
-    %26 = call @func.327(%20, %21)
+    %26 = call @func.205(%20, %21)
     br bb1(%26)
 bb1(%2: bool):
     condbr %2, bb4, bb2
 bb2:
     %27 = load ptr, ptr %21
-    %28 = call @func.79(%27)
+    %28 = call @func.73(%27)
     br bb3(%28)
 bb3(%3: bool):
     condbr %3, bb4, bb5
@@ -41806,7 +41584,7 @@ bb4:
     br bb17(%29)
 bb5:
     %30 = load ptr, ptr %20
-    call @func.284(%23, %30)
+    call @func.225(%23, %30)
     br bb6
 bb6:
     %31 = load ptr, ptr %23
@@ -41820,7 +41598,7 @@ bb6:
 bb7(%4: u32):
     %37 = load ptr, ptr %22
     %38 = load ptr, ptr %21
-    %39 = call @func.209(%37, %38)
+    %39 = call @func.178(%37, %38)
     br bb8(%4, %39)
 bb8(%5: u32, %6: bool):
     condbr %6, bb9, bb10(%5)
@@ -41829,7 +41607,7 @@ bb9:
     br bb17(%40)
 bb10(%7: u32):
     %41 = load ptr, ptr %21
-    call @func.284(%25, %41)
+    call @func.225(%25, %41)
     br bb11(%7)
 bb11(%8: u32):
     %42 = load ptr, ptr %25
@@ -41837,13 +41615,13 @@ bb11(%8: u32):
     %43 = const i64 8
     %44 = gep i8, ptr %25, %43
     %45 = load u32, ptr %44
-    %46 = call @func.327(%22, %24)
+    %46 = call @func.205(%22, %24)
     br bb12(%8, %45, %46)
 bb12(%9: u32, %10: u32, %11: bool):
     condbr %11, bb15(%9, %10), bb13(%9, %10)
 bb13(%12: u32, %13: u32):
     %47 = load ptr, ptr %24
-    %48 = call @func.79(%47)
+    %48 = call @func.73(%47)
     br bb14(%12, %13, %48)
 bb14(%14: u32, %15: u32, %16: bool):
     condbr %16, bb15(%14, %15), bb16
@@ -44540,7 +44318,7 @@ bb27:
     call @func.24(%54)
     br bb28
 bb28:
-    call @func.35(%53, %54)
+    call @func.33(%53, %54)
     br bb29
 bb29:
     call @func.29(%58)
@@ -44555,7 +44333,7 @@ bb31:
     br bb32
 bb32:
     %1273 = const bool false
-    call @func.36(%59, %60, %61)
+    call @func.34(%59, %60, %61)
     br bb33
 bb33:
     %1274 = const bool false
@@ -44718,7 +44496,7 @@ bb41:
 bb42:
     %1381 = const bool false
     %1382 = const bool false
-    call @func.39(%65, %66, %67, %68)
+    call @func.35(%65, %66, %67, %68)
     br bb43
 bb43:
     %1383 = const bool false
@@ -44876,10 +44654,10 @@ bb50(%6: u64):
     %1489 = icmp eq u64 %6, %1488
     condbr %1489, bb57, bb58(%6)
 bb51:
-    call @func.41(%77)
+    call @func.36(%77)
     br bb52
 bb52:
-    call @func.42(%79)
+    call @func.37(%79)
     br bb53
 bb53:
     %1490 = const i64 96
@@ -44951,7 +44729,7 @@ bb53:
     store ptr %1491, ptr %78
     br bb54
 bb54:
-    call @func.43(%81)
+    call @func.38(%81)
     br bb55
 bb55:
     %1544 = const i64 96
@@ -45099,10 +44877,10 @@ bb59:
     call @func.24(%86)
     br bb60
 bb60:
-    call @func.35(%85, %86)
+    call @func.33(%85, %86)
     br bb61
 bb61:
-    call @func.44(%88)
+    call @func.39(%88)
     br bb62
 bb62:
     %1649 = const i64 96
@@ -45174,7 +44952,7 @@ bb62:
     store ptr %1650, ptr %87
     br bb63
 bb63:
-    call @func.45(%90)
+    call @func.40(%90)
     br bb64
 bb64:
     %1703 = const i64 96
@@ -45343,7 +45121,7 @@ bb73:
     br bb74
 bb74:
     %1813 = const bool false
-    call @func.46(%99, %100)
+    call @func.41(%99, %100)
     br bb75
 bb75:
     call @func.32(%98, %99)
@@ -45590,14 +45368,14 @@ bb88:
     call @func.29(%118)
     br bb89
 bb89:
-    call @func.46(%117, %118)
+    call @func.41(%117, %118)
     br bb90
 bb90:
     %1979 = const bool true
     call @func.30(%120)
     br bb91
 bb91:
-    call @func.46(%119, %120)
+    call @func.41(%119, %120)
     br bb92
 bb92:
     %1980 = const bool false
@@ -45677,7 +45455,7 @@ bb94:
     store ptr %1983, ptr %114
     br bb95
 bb95:
-    call @func.47(%122)
+    call @func.42(%122)
     br bb96
 bb96:
     %2036 = const i64 96
@@ -46075,11 +45853,11 @@ bb115(%11: u64):
     %2308 = icmp eq u64 %11, %2307
     condbr %2308, bb120, bb121(%11)
 bb116:
-    call @func.41(%142)
+    call @func.36(%142)
     br bb117
 bb117:
     %2309 = const u64 7
-    call @func.48(%144, %2309)
+    call @func.43(%144, %2309)
     br bb118
 bb118:
     %2310 = const i64 96
@@ -46220,7 +45998,7 @@ bb121(%12: u64):
     %2411 = icmp eq u64 %12, %2410
     condbr %2411, bb126, bb127(%12)
 bb122:
-    call @func.41(%148)
+    call @func.36(%148)
     br bb123
 bb123:
     %2412 = const u64 5
@@ -46231,7 +46009,7 @@ bb123:
     store i64 %2415, ptr %2414
     %2416 = const i64 4
     store i64 %2416, ptr %151
-    call @func.49(%150, %151)
+    call @func.44(%150, %151)
     br bb124
 bb124:
     %2417 = const i64 96
@@ -46375,13 +46153,13 @@ bb128:
     call @func.24(%157)
     br bb129
 bb129:
-    call @func.35(%156, %157)
+    call @func.33(%156, %157)
     br bb130
 bb130:
     call @func.29(%161)
     br bb131
 bb131:
-    call @func.46(%160, %161)
+    call @func.41(%160, %161)
     br bb132
 bb132:
     call @func.32(%159, %160)
@@ -46604,13 +46382,13 @@ bb139(%14: u64):
     %2677 = icmp eq u64 %14, %2676
     condbr %2677, bb145, bb146(%14)
 bb140:
-    call @func.41(%168)
+    call @func.36(%168)
     br bb141
 bb141:
     call @func.18(%171)
     br bb142
 bb142:
-    call @func.51(%170, %171)
+    call @func.45(%170, %171)
     br bb143
 bb143:
     %2678 = const i64 96
@@ -46754,13 +46532,13 @@ bb147:
     call @func.25(%176)
     br bb148
 bb148:
-    call @func.35(%175, %176)
+    call @func.33(%175, %176)
     br bb149
 bb149:
     call @func.30(%180)
     br bb150
 bb150:
-    call @func.46(%179, %180)
+    call @func.41(%179, %180)
     br bb151
 bb151:
     call @func.32(%178, %179)
@@ -46982,7 +46760,7 @@ bb160(%17: ptr):
     br bb161(%17)
 bb161(%18: ptr):
     %2935 = const bool false
-    call @func.36(%185, %186, %187)
+    call @func.34(%185, %186, %187)
     br bb162(%18)
 bb162(%19: ptr):
     %2936 = const bool false
@@ -47005,7 +46783,7 @@ bb164:
     call @func.24(%192)
     br bb165
 bb165:
-    call @func.35(%191, %192)
+    call @func.33(%191, %192)
     br bb166
 bb166:
     call @func.18(%195)
@@ -47026,7 +46804,7 @@ bb167:
     %2953 = gep i8, ptr %196, %2952
     %2954 = load i64, ptr %2951
     store i64 %2954, ptr %2953
-    call @func.52(%194, %195, %196)
+    call @func.46(%194, %195, %196)
     br bb168
 bb168:
     %2955 = const i64 96
@@ -47397,7 +47175,7 @@ bb181(%21: u64):
     %3219 = icmp eq u64 %21, %3218
     condbr %3219, bb199, bb200(%21)
 bb182:
-    call @func.41(%210)
+    call @func.36(%210)
     br bb183
 bb183:
     call @func.19(%213)
@@ -47411,7 +47189,7 @@ bb185:
     br bb186
 bb186:
     %3221 = const bool false
-    call @func.53(%212, %213, %214, %215)
+    call @func.47(%212, %213, %214, %215)
     br bb187
 bb187:
     %3222 = const bool false
@@ -47489,13 +47267,13 @@ bb188:
     %3278 = gep i8, ptr %219, %3277
     %3279 = const u64 1
     store u64 %3279, ptr %3278
-    call @func.54(%218, %219)
+    call @func.48(%218, %219)
     br bb189
 bb189:
     %3280 = const bool true
     %3281 = const i64 3
     store i64 %3281, ptr %222
-    call @func.46(%221, %222)
+    call @func.41(%221, %222)
     br bb190
 bb190:
     call @func.32(%220, %221)
@@ -47527,7 +47305,7 @@ bb196:
     %3290 = const bool false
     %3291 = const bool false
     %3292 = const bool false
-    call @func.55(%217, %218, %220, %223, %224, %3292)
+    call @func.49(%217, %218, %220, %223, %224, %3292)
     br bb197
 bb197:
     %3293 = const bool false
@@ -47714,12 +47492,12 @@ bb211:
     br bb212
 bb212:
     %3406 = const bool false
-    call @func.53(%239, %240, %241, %243)
+    call @func.47(%239, %240, %241, %243)
     br bb213
 bb213:
     %3407 = const bool false
     %3408 = const bool false
-    call @func.53(%235, %236, %237, %239)
+    call @func.47(%235, %236, %237, %239)
     br bb214
 bb214:
     %3409 = const bool false
@@ -47968,7 +47746,7 @@ bb227(%23: u64):
     %3575 = icmp eq u64 %23, %3574
     condbr %3575, bb255, bb256(%23)
 bb228:
-    call @func.41(%258)
+    call @func.36(%258)
     br bb229
 bb229:
     call @func.19(%261)
@@ -47980,14 +47758,14 @@ bb231:
     %3576 = const bool true
     %3577 = const i64 3
     store i64 %3577, ptr %265
-    call @func.46(%264, %265)
+    call @func.41(%264, %265)
     br bb232
 bb232:
     call @func.32(%263, %264)
     br bb233
 bb233:
     %3578 = const bool false
-    call @func.53(%260, %261, %262, %263)
+    call @func.47(%260, %261, %262, %263)
     br bb234
 bb234:
     %3579 = const bool false
@@ -48065,13 +47843,13 @@ bb235:
     %3635 = gep i8, ptr %269, %3634
     %3636 = const u64 1
     store u64 %3636, ptr %3635
-    call @func.54(%268, %269)
+    call @func.48(%268, %269)
     br bb236
 bb236:
     %3637 = const bool true
     %3638 = const i64 3
     store i64 %3638, ptr %272
-    call @func.46(%271, %272)
+    call @func.41(%271, %272)
     br bb237
 bb237:
     call @func.32(%270, %271)
@@ -48095,14 +47873,14 @@ bb242:
     %3642 = const bool true
     %3643 = const i64 3
     store i64 %3643, ptr %282
-    call @func.46(%281, %282)
+    call @func.41(%281, %282)
     br bb243
 bb243:
     call @func.32(%280, %281)
     br bb244
 bb244:
     %3644 = const bool false
-    call @func.53(%277, %278, %279, %280)
+    call @func.47(%277, %278, %279, %280)
     br bb245
 bb245:
     %3645 = const bool true
@@ -48133,7 +47911,7 @@ bb250:
 bb251:
     %3653 = const bool false
     %3654 = const bool false
-    call @func.56(%274, %275, %284)
+    call @func.50(%274, %275, %284)
     br bb252
 bb252:
     %3655 = const bool false
@@ -48141,7 +47919,7 @@ bb252:
     %3657 = const bool false
     %3658 = const bool false
     %3659 = const bool false
-    call @func.55(%267, %268, %270, %273, %274, %3659)
+    call @func.49(%267, %268, %270, %273, %274, %3659)
     br bb253
 bb253:
     %3660 = const bool false
@@ -48272,7 +48050,7 @@ bb254:
     store bool %3757, ptr %3759
     br bb394
 bb255:
-    call @func.57(%0)
+    call @func.51(%0)
     br bb394
 bb256(%24: u64):
     %3760 = const u64 20
@@ -48281,7 +48059,7 @@ bb256(%24: u64):
 bb257:
     %3762 = const i64 3
     store i64 %3762, ptr %290
-    call @func.46(%289, %290)
+    call @func.41(%289, %290)
     br bb259
 bb258(%25: u64):
     %3763 = const u64 21
@@ -48312,7 +48090,7 @@ bb264:
     br bb265
 bb265:
     %3770 = const bool false
-    call @func.56(%296, %297, %298)
+    call @func.50(%296, %297, %298)
     br bb266
 bb266:
     %3771 = const bool true
@@ -48321,12 +48099,12 @@ bb266:
     br bb267
 bb267:
     %3773 = const bool false
-    call @func.53(%294, %295, %296, %299)
+    call @func.47(%294, %295, %296, %299)
     br bb268
 bb268:
     %3774 = const bool false
     %3775 = const bool false
-    call @func.53(%291, %292, %293, %294)
+    call @func.47(%291, %292, %293, %294)
     br bb269
 bb269:
     %3776 = const bool true
@@ -48352,7 +48130,7 @@ bb273:
     br bb274
 bb274:
     %3783 = const bool false
-    call @func.56(%305, %306, %307)
+    call @func.50(%305, %306, %307)
     br bb275
 bb275:
     %3784 = const bool true
@@ -48384,7 +48162,7 @@ bb278:
     call @func.23(%309, %310, %311)
     br bb279
 bb279:
-    call @func.41(%312)
+    call @func.36(%312)
     br bb280
 bb280:
     call @func.19(%315)
@@ -48409,7 +48187,7 @@ bb285:
     br bb286
 bb286:
     %3800 = const bool false
-    call @func.53(%319, %320, %321, %322)
+    call @func.47(%319, %320, %321, %322)
     br bb287
 bb287:
     %3801 = const bool true
@@ -48426,17 +48204,17 @@ bb289:
     br bb290
 bb290:
     %3805 = const bool false
-    call @func.53(%323, %324, %325, %326)
+    call @func.47(%323, %324, %325, %326)
     br bb291
 bb291:
     %3806 = const bool false
     %3807 = const bool false
-    call @func.53(%317, %318, %319, %323)
+    call @func.47(%317, %318, %319, %323)
     br bb292
 bb292:
     %3808 = const bool false
     %3809 = const bool false
-    call @func.53(%314, %315, %316, %317)
+    call @func.47(%314, %315, %316, %317)
     br bb293
 bb293:
     %3810 = const bool false
@@ -48531,7 +48309,7 @@ bb299:
     br bb300
 bb300:
     %3868 = const bool false
-    call @func.53(%333, %334, %335, %336)
+    call @func.47(%333, %334, %335, %336)
     br bb301
 bb301:
     %3869 = const bool true
@@ -48670,7 +48448,7 @@ bb306:
     %3968 = gep i8, ptr %345, %3967
     %3969 = load i64, ptr %3966
     store i64 %3969, ptr %3968
-    call @func.56(%340, %341, %345)
+    call @func.50(%340, %341, %345)
     br bb307
 bb307:
     %3970 = const bool false
@@ -48817,7 +48595,7 @@ bb311:
 bb312:
     %4075 = const i64 3
     store i64 %4075, ptr %348
-    call @func.46(%347, %348)
+    call @func.41(%347, %348)
     br bb314
 bb313:
     store ptr %550, ptr %410
@@ -48857,7 +48635,7 @@ bb319:
     br bb320
 bb320:
     %4087 = const bool false
-    call @func.56(%354, %355, %356)
+    call @func.50(%354, %355, %356)
     br bb321
 bb321:
     %4088 = const bool true
@@ -48866,12 +48644,12 @@ bb321:
     br bb322
 bb322:
     %4090 = const bool false
-    call @func.53(%352, %353, %354, %357)
+    call @func.47(%352, %353, %354, %357)
     br bb323
 bb323:
     %4091 = const bool false
     %4092 = const bool false
-    call @func.53(%349, %350, %351, %352)
+    call @func.47(%349, %350, %351, %352)
     br bb324
 bb324:
     %4093 = const bool true
@@ -48897,7 +48675,7 @@ bb328:
     br bb329
 bb329:
     %4100 = const bool false
-    call @func.56(%363, %364, %365)
+    call @func.50(%363, %364, %365)
     br bb330
 bb330:
     %4101 = const bool true
@@ -48929,7 +48707,7 @@ bb333:
     call @func.23(%367, %368, %369)
     br bb334
 bb334:
-    call @func.41(%370)
+    call @func.36(%370)
     br bb335
 bb335:
     call @func.19(%373)
@@ -48954,7 +48732,7 @@ bb340:
     br bb341
 bb341:
     %4117 = const bool false
-    call @func.53(%377, %378, %379, %380)
+    call @func.47(%377, %378, %379, %380)
     br bb342
 bb342:
     %4118 = const bool true
@@ -48971,17 +48749,17 @@ bb344:
     br bb345
 bb345:
     %4122 = const bool false
-    call @func.53(%381, %382, %383, %384)
+    call @func.47(%381, %382, %383, %384)
     br bb346
 bb346:
     %4123 = const bool false
     %4124 = const bool false
-    call @func.53(%375, %376, %377, %381)
+    call @func.47(%375, %376, %377, %381)
     br bb347
 bb347:
     %4125 = const bool false
     %4126 = const bool false
-    call @func.53(%372, %373, %374, %375)
+    call @func.47(%372, %373, %374, %375)
     br bb348
 bb348:
     %4127 = const bool false
@@ -49076,7 +48854,7 @@ bb354:
     br bb355
 bb355:
     %4185 = const bool false
-    call @func.53(%391, %392, %393, %394)
+    call @func.47(%391, %392, %393, %394)
     br bb356
 bb356:
     %4186 = const bool true
@@ -49094,7 +48872,7 @@ bb358:
     %4191 = gep i8, ptr %400, %4190
     %4192 = const u64 1
     store u64 %4192, ptr %4191
-    call @func.54(%399, %400)
+    call @func.48(%399, %400)
     br bb359
 bb359:
     %4193 = const bool true
@@ -49233,14 +49011,14 @@ bb364:
     %4292 = gep i8, ptr %408, %4291
     %4293 = load i64, ptr %4290
     store i64 %4293, ptr %4292
-    call @func.56(%403, %404, %408)
+    call @func.50(%403, %404, %408)
     br bb365
 bb365:
     %4294 = const bool false
     %4295 = const bool false
     %4296 = const bool false
     %4297 = const bool false
-    call @func.55(%398, %399, %401, %402, %403, %4297)
+    call @func.49(%398, %399, %401, %402, %403, %4297)
     br bb366
 bb366:
     %4298 = const bool false
@@ -49388,17 +49166,17 @@ bb370:
     %4405 = const bool false
     br bb394
 bb371:
-    call @func.41(%412)
+    call @func.36(%412)
     br bb372
 bb372:
-    call @func.58(%415)
+    call @func.52(%415)
     br bb373
 bb373:
     call @func.20(%416)
     br bb374
 bb374:
     %4406 = const bool true
-    call @func.59(%418)
+    call @func.53(%418)
     br bb375
 bb375:
     %4407 = const u32 0
@@ -49428,17 +49206,17 @@ bb380:
     br bb381
 bb381:
     %4415 = const bool false
-    call @func.56(%420, %421, %425)
+    call @func.50(%420, %421, %425)
     br bb382
 bb382:
     %4416 = const bool false
     %4417 = const bool false
-    call @func.53(%417, %418, %419, %420)
+    call @func.47(%417, %418, %419, %420)
     br bb383
 bb383:
     %4418 = const bool false
     %4419 = const bool false
-    call @func.53(%414, %415, %416, %417)
+    call @func.47(%414, %415, %416, %417)
     br bb384
 bb384:
     %4420 = const bool false
@@ -49675,13 +49453,13 @@ bb0(%0: ptr, %1: ptr):
     %4 = alloca i64, align 8
     store ptr %1, ptr %2
     %5 = load ptr, ptr %2
-    call @func.62(%3, %5)
+    call @func.56(%3, %5)
     br bb1
 bb1:
     %6 = load ptr, ptr %2
     %7 = const i64 72
     %8 = gep i8, ptr %6, %7
-    call @func.63(%4, %8)
+    call @func.57(%4, %8)
     br bb2
 bb2:
     %9 = load i64, ptr %3
@@ -49972,18 +49750,18 @@ bb12(%44: ptr, %45: ptr, %46: ptr, %47: ptr, %48: bool, %49: u64, %50: u64, %51:
     %495 = call @func.15(%46, %50)
     br bb13(%44, %45, %46, %47, %48, %49, %50, %51, %52, %495)
 bb13(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: bool, %58: u64, %59: u64, %60: u64, %61: ptr, %62: ptr):
-    %496 = call @func.65(%61, %62)
+    %496 = call @func.59(%61, %62)
     br bb14(%53, %54, %55, %56, %57, %58, %59, %60, %496)
 bb14(%63: ptr, %64: ptr, %65: ptr, %66: ptr, %67: bool, %68: u64, %69: u64, %70: u64, %71: bool):
     condbr %71, bb15(%64, %65, %69), bb19(%63, %64, %65, %66, %67, %68, %69, %70)
 bb15(%72: ptr, %73: ptr, %74: u64):
-    call @func.66(%336, %72)
+    call @func.60(%336, %72)
     br bb16(%73, %74)
 bb16(%75: ptr, %76: u64):
     %497 = call @func.15(%75, %76)
     br bb17(%497)
 bb17(%77: ptr):
-    call @func.66(%337, %77)
+    call @func.60(%337, %77)
     br bb18
 bb18:
     %498 = const i64 8
@@ -50145,7 +49923,7 @@ bb23(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: bool):
     %620 = gep i8, ptr %618, %619
     br bb24(%106, %107, %108, %109, %110, %620)
 bb24(%111: ptr, %112: ptr, %113: ptr, %114: ptr, %115: bool, %116: ptr):
-    %621 = call @func.67(%116)
+    %621 = call @func.61(%116)
     br bb25(%111, %112, %113, %114, %115, %621)
 bb25(%117: ptr, %118: ptr, %119: ptr, %120: ptr, %121: bool, %122: bool):
     condbr %122, bb29(%118), bb26(%117, %118, %119, %120, %121)
@@ -50155,12 +49933,12 @@ bb26(%123: ptr, %124: ptr, %125: ptr, %126: ptr, %127: bool):
     %624 = gep i8, ptr %622, %623
     br bb27(%123, %124, %125, %126, %127, %624)
 bb27(%128: ptr, %129: ptr, %130: ptr, %131: ptr, %132: bool, %133: ptr):
-    %625 = call @func.68(%133)
+    %625 = call @func.62(%133)
     br bb28(%128, %129, %130, %131, %132, %625)
 bb28(%134: ptr, %135: ptr, %136: ptr, %137: ptr, %138: bool, %139: bool):
     condbr %139, bb29(%135), bb31(%134, %135, %136, %137, %138)
 bb29(%140: ptr):
-    call @func.66(%341, %140)
+    call @func.60(%341, %140)
     br bb30
 bb30:
     %626 = const i64 8
@@ -50262,12 +50040,12 @@ bb31(%141: ptr, %142: ptr, %143: ptr, %144: ptr, %145: bool):
     %703 = gep i8, ptr %701, %702
     br bb32(%141, %142, %143, %144, %145, %703)
 bb32(%146: ptr, %147: ptr, %148: ptr, %149: ptr, %150: bool, %151: ptr):
-    %704 = call @func.69(%151)
+    %704 = call @func.63(%151)
     br bb33(%146, %147, %148, %149, %150, %704)
 bb33(%152: ptr, %153: ptr, %154: ptr, %155: ptr, %156: bool, %157: bool):
     condbr %157, bb34(%153), bb36(%152, %153, %154, %155, %156)
 bb34(%158: ptr):
-    call @func.66(%343, %158)
+    call @func.60(%343, %158)
     br bb35
 bb35:
     %705 = const i64 8
@@ -50378,7 +50156,7 @@ bb37(%164: ptr, %165: ptr, %166: ptr, %167: ptr, %168: bool):
     %789 = gep i8, ptr %787, %788
     br bb38(%164, %165, %166, %167, %168, %786, %789)
 bb38(%169: ptr, %170: ptr, %171: ptr, %172: ptr, %173: bool, %174: ptr, %175: ptr):
-    %790 = call @func.67(%175)
+    %790 = call @func.61(%175)
     br bb39(%169, %170, %171, %172, %173, %174, %790)
 bb39(%176: ptr, %177: ptr, %178: ptr, %179: ptr, %180: bool, %181: ptr, %182: bool):
     condbr %182, bb43(%177), bb40(%176, %177, %178, %179, %180, %181)
@@ -50388,12 +50166,12 @@ bb40(%183: ptr, %184: ptr, %185: ptr, %186: ptr, %187: bool, %188: ptr):
     %793 = gep i8, ptr %791, %792
     br bb41(%183, %184, %185, %186, %187, %188, %793)
 bb41(%189: ptr, %190: ptr, %191: ptr, %192: ptr, %193: bool, %194: ptr, %195: ptr):
-    %794 = call @func.68(%195)
+    %794 = call @func.62(%195)
     br bb42(%189, %190, %191, %192, %193, %194, %794)
 bb42(%196: ptr, %197: ptr, %198: ptr, %199: ptr, %200: bool, %201: ptr, %202: bool):
     condbr %202, bb43(%197), bb45(%196, %197, %198, %199, %200, %201)
 bb43(%203: ptr):
-    call @func.66(%345, %203)
+    call @func.60(%345, %203)
     br bb44
 bb44:
     %795 = const i64 8
@@ -50495,12 +50273,12 @@ bb45(%204: ptr, %205: ptr, %206: ptr, %207: ptr, %208: bool, %209: ptr):
     %872 = gep i8, ptr %870, %871
     br bb46(%204, %205, %206, %207, %208, %872)
 bb46(%210: ptr, %211: ptr, %212: ptr, %213: ptr, %214: bool, %215: ptr):
-    %873 = call @func.69(%215)
+    %873 = call @func.63(%215)
     br bb47(%210, %211, %212, %213, %214, %873)
 bb47(%216: ptr, %217: ptr, %218: ptr, %219: ptr, %220: bool, %221: bool):
     condbr %221, bb48(%217), bb50(%216, %217, %218, %219, %220)
 bb48(%222: ptr):
-    call @func.66(%347, %222)
+    call @func.60(%347, %222)
     br bb49
 bb49:
     %874 = const i64 8
@@ -50605,7 +50383,7 @@ bb51(%228: ptr, %229: ptr, %230: ptr, %231: ptr, %232: bool, %233: ptr):
     call @func.16(%349, %230)
     br bb52(%228, %229, %230, %231, %232, %233)
 bb52(%234: ptr, %235: ptr, %236: ptr, %237: ptr, %238: bool, %239: ptr):
-    call @func.74(%348, %239, %349)
+    call @func.68(%348, %239, %349)
     br bb53(%234, %235, %236, %237, %238)
 bb53(%240: ptr, %241: ptr, %242: ptr, %243: ptr, %244: bool):
     %952 = load i64, ptr %348
@@ -50642,7 +50420,7 @@ bb54(%245: ptr):
     %977 = gep i8, ptr %350, %976
     %978 = load i64, ptr %975
     store i64 %978, ptr %977
-    call @func.66(%352, %245)
+    call @func.60(%352, %245)
     br bb55
 bb55:
     %979 = load i64, ptr %350
@@ -50810,7 +50588,7 @@ bb58(%256: ptr, %257: ptr, %258: ptr, %259: ptr, %260: bool, %261: ptr):
     call @func.16(%355, %258)
     br bb59(%256, %257, %259, %260, %261)
 bb59(%262: ptr, %263: ptr, %264: ptr, %265: bool, %266: ptr):
-    call @func.74(%354, %266, %355)
+    call @func.68(%354, %266, %355)
     br bb60(%262, %263, %264, %265)
 bb60(%267: ptr, %268: ptr, %269: ptr, %270: bool):
     %1108 = load i64, ptr %354
@@ -50847,7 +50625,7 @@ bb61(%271: ptr):
     %1133 = gep i8, ptr %356, %1132
     %1134 = load i64, ptr %1131
     store i64 %1134, ptr %1133
-    call @func.66(%358, %271)
+    call @func.60(%358, %271)
     br bb62
 bb62:
     %1135 = load i64, ptr %356
@@ -50998,7 +50776,7 @@ bb62:
     store i64 %1253, ptr %1252
     br bb84
 bb63(%272: ptr, %273: ptr, %274: ptr, %275: bool):
-    call @func.77(%360)
+    call @func.71(%360)
     br bb64(%272, %273, %274, %275)
 bb64(%276: ptr, %277: ptr, %278: ptr, %279: bool):
     %1254 = load ptr, ptr %278
@@ -51006,7 +50784,7 @@ bb64(%276: ptr, %277: ptr, %278: ptr, %279: bool):
     %1256 = gep i8, ptr %1254, %1255
     br bb65(%276, %277, %278, %279, %1256)
 bb65(%280: ptr, %281: ptr, %282: ptr, %283: bool, %284: ptr):
-    call @func.78(%362, %280, %284, %360)
+    call @func.72(%362, %280, %284, %360)
     br bb66(%280, %281, %282, %283)
 bb66(%285: ptr, %286: ptr, %287: ptr, %288: bool):
     %1257 = load i64, ptr %362
@@ -51040,7 +50818,7 @@ bb67(%289: ptr):
     %1279 = gep i8, ptr %364, %1278
     %1280 = load i64, ptr %1277
     store i64 %1280, ptr %1279
-    call @func.66(%366, %289)
+    call @func.60(%366, %289)
     br bb69
 bb68(%290: ptr, %291: ptr, %292: ptr, %293: bool):
     %1281 = const i64 8
@@ -51248,12 +51026,12 @@ bb69:
     store i64 %1444, ptr %1443
     br bb83
 bb70(%294: ptr, %295: ptr, %296: ptr, %297: bool):
-    %1445 = call @func.79(%361)
+    %1445 = call @func.73(%361)
     br bb71(%294, %295, %296, %1445, %297)
 bb71(%298: ptr, %299: ptr, %300: ptr, %301: bool, %302: bool):
     condbr %301, bb74(%298, %299, %300, %302), bb72(%299)
 bb72(%303: ptr):
-    call @func.66(%369, %303)
+    call @func.60(%369, %303)
     br bb73
 bb73:
     %1446 = const bool false
@@ -51424,7 +51202,7 @@ bb76(%312: ptr, %313: ptr, %314: ptr, %315: ptr, %316: bool):
     %1578 = gep i8, ptr %1576, %1577
     br bb77(%312, %313, %315, %1578, %316)
 bb77(%317: ptr, %318: ptr, %319: ptr, %320: ptr, %321: bool):
-    call @func.82(%371, %317, %319, %320, %360)
+    call @func.76(%371, %317, %319, %320, %360)
     br bb78(%318, %321)
 bb78(%322: ptr, %323: bool):
     %1579 = load i64, ptr %371
@@ -51461,7 +51239,7 @@ bb79(%324: ptr, %325: bool):
     %1604 = gep i8, ptr %372, %1603
     %1605 = load i64, ptr %1602
     store i64 %1605, ptr %1604
-    call @func.66(%374, %324)
+    call @func.60(%374, %324)
     br bb80(%325)
 bb80(%326: bool):
     %1606 = load i64, ptr %372
@@ -51649,7 +51427,7 @@ bb0(%0: ptr):
     %10 = gep i8, ptr %1, %9
     %11 = const u64 1
     store u64 %11, ptr %10
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -51702,7 +51480,7 @@ bb0(%0: ptr):
     store i64 %26, ptr %25
     %27 = const i64 5
     store i64 %27, ptr %1
-    call @func.49(%0, %1)
+    call @func.44(%0, %1)
     br bb1
 bb1:
     ret
@@ -51716,7 +51494,7 @@ bb0(%0: ptr, %1: u32):
     store u32 %1, ptr %4
     %5 = const i64 3
     store i64 %5, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb1
 bb1:
     ret
@@ -51945,7 +51723,7 @@ bb2:
     store ptr %176, ptr %178
     %179 = const i64 8
     store i64 %179, ptr %4
-    call @func.49(%0, %4)
+    call @func.44(%0, %4)
     br bb3
 bb3:
     ret
@@ -51955,13 +51733,13 @@ fn @nm2(functy.23) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
     %3 = alloca (i64, i64, i64, i64, i64), align 8
     %4 = alloca (i64, i64, i64, i64, i64), align 8
-    call @func.83(%4)
+    call @func.77(%4)
     br bb1
 bb1:
-    call @func.84(%3, %4, %1)
+    call @func.78(%3, %4, %1)
     br bb2
 bb2:
-    call @func.84(%0, %3, %2)
+    call @func.78(%0, %3, %2)
     br bb3
 bb3:
     ret
@@ -51985,7 +51763,7 @@ bb0(%0: ptr):
     %10 = gep i8, ptr %1, %9
     %11 = const u64 1
     store u64 %11, ptr %10
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -52009,7 +51787,7 @@ bb0(%0: ptr):
     %10 = gep i8, ptr %1, %9
     %11 = const u64 1
     store u64 %11, ptr %10
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -52187,7 +51965,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %5 = alloca (i64, i64, i64, i64, i64), align 8
     %6 = const bool false
     %7 = const bool true
-    call @func.85(%3, %1)
+    call @func.79(%3, %1)
     br bb1
 bb1:
     %8 = const bool false
@@ -52217,7 +51995,7 @@ bb1:
     %28 = gep i8, ptr %5, %27
     %29 = load i64, ptr %26
     store i64 %29, ptr %28
-    call @func.85(%4, %5)
+    call @func.79(%4, %5)
     br bb2
 bb2:
     %30 = load ptr, ptr %3
@@ -52266,16 +52044,10 @@ bb0(%0: ptr, %1: ptr):
     store i64 %25, ptr %24
     %26 = const i64 5
     store i64 %26, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3newBE_(functy.33) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE4pushBH_(functy.34) {
 }
 
 fn @params1(functy.35) {
@@ -52284,7 +52056,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = alloca (i64, i64, i64, i64, i64), align 8
     %4 = const bool false
     %5 = const bool true
-    call @func.33(%2)
+    call @func.26(%2)
     br bb1
 bb1:
     %6 = const bool false
@@ -52314,7 +52086,7 @@ bb1:
     %26 = gep i8, ptr %3, %25
     %27 = load i64, ptr %24
     store i64 %27, ptr %26
-    call @func.34(%2, %3)
+    call @func.27(%2, %3)
     br bb2
 bb2:
     %28 = load i64, ptr %2
@@ -52341,7 +52113,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %5 = alloca (i64, i64, i64, i64, i64), align 8
     %6 = const bool false
     %7 = const bool true
-    call @func.85(%3, %1)
+    call @func.79(%3, %1)
     br bb1
 bb1:
     %8 = const bool false
@@ -52371,7 +52143,7 @@ bb1:
     %28 = gep i8, ptr %5, %27
     %29 = load i64, ptr %26
     store i64 %29, ptr %28
-    call @func.85(%4, %5)
+    call @func.79(%4, %5)
     br bb2
 bb2:
     %30 = load ptr, ptr %3
@@ -52387,12 +52159,6 @@ bb2:
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3newBE_(functy.37) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE4pushBH_(functy.38) {
-}
-
 fn @params3(functy.39) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %4 = alloca (i64, i64, i64), align 8
@@ -52405,7 +52171,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %11 = const bool true
     %12 = const bool true
     %13 = const bool true
-    call @func.37(%4)
+    call @func.26(%4)
     br bb1
 bb1:
     %14 = const bool false
@@ -52435,7 +52201,7 @@ bb1:
     %34 = gep i8, ptr %5, %33
     %35 = load i64, ptr %32
     store i64 %35, ptr %34
-    call @func.38(%4, %5)
+    call @func.27(%4, %5)
     br bb2
 bb2:
     %36 = const bool false
@@ -52465,7 +52231,7 @@ bb2:
     %56 = gep i8, ptr %6, %55
     %57 = load i64, ptr %54
     store i64 %57, ptr %56
-    call @func.38(%4, %6)
+    call @func.27(%4, %6)
     br bb3
 bb3:
     %58 = const bool false
@@ -52495,7 +52261,7 @@ bb3:
     %78 = gep i8, ptr %7, %77
     %79 = load i64, ptr %76
     store i64 %79, ptr %78
-    call @func.38(%4, %7)
+    call @func.27(%4, %7)
     br bb4
 bb4:
     %80 = load i64, ptr %4
@@ -52515,12 +52281,9 @@ bb4:
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3newBE_(functy.40) {
-}
-
 fn @params0(functy.41) {
 bb0(%0: ptr):
-    call @func.40(%0)
+    call @func.26(%0)
     br bb1
 bb1:
     ret
@@ -52556,12 +52319,12 @@ bb4:
     br bb5
 bb5:
     %13 = const bool false
-    call @func.53(%3, %4, %5, %6)
+    call @func.47(%3, %4, %5, %6)
     br bb6
 bb6:
     %14 = const bool false
     %15 = const bool false
-    call @func.53(%0, %1, %2, %3)
+    call @func.47(%0, %1, %2, %3)
     br bb7
 bb7:
     %16 = const bool false
@@ -52644,12 +52407,12 @@ bb5:
     br bb6
 bb6:
     %14 = const bool false
-    call @func.53(%4, %5, %6, %7)
+    call @func.47(%4, %5, %6, %7)
     br bb7
 bb7:
     %15 = const bool false
     %16 = const bool false
-    call @func.53(%0, %1, %2, %4)
+    call @func.47(%0, %1, %2, %4)
     br bb8
 bb8:
     %17 = const bool false
@@ -52705,7 +52468,7 @@ bb8:
 fn @rsucc(functy.46) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
-    call @func.85(%2, %1)
+    call @func.79(%2, %1)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -52754,12 +52517,12 @@ bb6:
     br bb7
 bb7:
     %14 = const bool false
-    call @func.53(%4, %5, %6, %7)
+    call @func.47(%4, %5, %6, %7)
     br bb8
 bb8:
     %15 = const bool false
     %16 = const bool false
-    call @func.53(%0, %1, %2, %4)
+    call @func.47(%0, %1, %2, %4)
     br bb9
 bb9:
     %17 = const bool false
@@ -52787,7 +52550,7 @@ bb0(%0: ptr, %1: u64):
     store i64 %14, ptr %13
     %15 = const i64 11
     store i64 %15, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb1
 bb1:
     ret
@@ -52797,7 +52560,7 @@ fn @Expr__from_kind(functy.49) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
     %3 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.91(%2, %1)
+    call @func.83(%2, %1)
     br bb1
 bb1:
     %4 = load i64, ptr %1
@@ -52907,9 +52670,6 @@ bb1:
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.50) {
-}
-
 fn @Expr__cnst(functy.51) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
@@ -52941,7 +52701,7 @@ bb0(%0: ptr, %1: ptr):
     %24 = gep i8, ptr %3, %23
     %25 = load i64, ptr %22
     store i64 %25, ptr %24
-    call @func.50(%4)
+    call @func.10(%4)
     br bb1
 bb1:
     %26 = const i64 8
@@ -52990,7 +52750,7 @@ bb1:
     store i64 %61, ptr %60
     %62 = const i64 6
     store i64 %62, ptr %2
-    call @func.49(%0, %2)
+    call @func.44(%0, %2)
     br bb2
 bb2:
     ret
@@ -53045,7 +52805,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     store i64 %39, ptr %38
     %40 = const i64 6
     store i64 %40, ptr %3
-    call @func.49(%0, %3)
+    call @func.44(%0, %3)
     br bb1
 bb1:
     ret
@@ -53274,7 +53034,7 @@ bb2:
     store ptr %176, ptr %178
     %179 = const i64 9
     store i64 %179, ptr %4
-    call @func.49(%0, %4)
+    call @func.44(%0, %4)
     br bb3
 bb3:
     ret
@@ -53283,10 +53043,10 @@ bb3:
 fn @nm1(functy.54) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca (i64, i64, i64, i64, i64), align 8
-    call @func.83(%2)
+    call @func.77(%2)
     br bb1
 bb1:
-    call @func.84(%0, %2, %1)
+    call @func.78(%0, %2, %1)
     br bb2
 bb2:
     ret
@@ -53693,7 +53453,7 @@ bb3(%8: bool):
     %327 = const i64 64
     %328 = gep i8, ptr %9, %327
     store bool %8, ptr %328
-    call @func.49(%0, %9)
+    call @func.44(%0, %9)
     br bb4
 bb4:
     ret
@@ -53912,7 +53672,7 @@ bb2:
     store ptr %167, ptr %169
     %170 = const i64 7
     store i64 %170, ptr %3
-    call @func.49(%0, %3)
+    call @func.44(%0, %3)
     br bb3
 bb3:
     ret
@@ -54064,7 +53824,7 @@ bb0(%0: ptr):
     call @func.23(%1, %2, %3)
     br bb1
 bb1:
-    call @func.41(%4)
+    call @func.36(%4)
     br bb2
 bb2:
     call @func.19(%7)
@@ -54089,7 +53849,7 @@ bb7:
     br bb8
 bb8:
     %129 = const bool false
-    call @func.53(%11, %12, %13, %14)
+    call @func.47(%11, %12, %13, %14)
     br bb9
 bb9:
     %130 = const bool true
@@ -54126,7 +53886,7 @@ bb16:
     br bb17
 bb17:
     %139 = const bool false
-    call @func.56(%25, %26, %27)
+    call @func.50(%25, %26, %27)
     br bb18
 bb18:
     %140 = const bool true
@@ -54135,7 +53895,7 @@ bb18:
     br bb19
 bb19:
     %142 = const bool false
-    call @func.53(%23, %24, %25, %28)
+    call @func.47(%23, %24, %25, %28)
     br bb20
 bb20:
     %143 = const bool true
@@ -54153,7 +53913,7 @@ bb22:
     br bb23
 bb23:
     %148 = const bool false
-    call @func.56(%31, %32, %33)
+    call @func.50(%31, %32, %33)
     br bb24
 bb24:
     %149 = const bool true
@@ -54162,32 +53922,32 @@ bb24:
     br bb25
 bb25:
     %151 = const bool false
-    call @func.53(%29, %30, %31, %34)
+    call @func.47(%29, %30, %31, %34)
     br bb26
 bb26:
     %152 = const bool false
     %153 = const bool false
-    call @func.53(%21, %22, %23, %29)
+    call @func.47(%21, %22, %23, %29)
     br bb27
 bb27:
     %154 = const bool false
     %155 = const bool false
-    call @func.53(%18, %19, %20, %21)
+    call @func.47(%18, %19, %20, %21)
     br bb28
 bb28:
     %156 = const bool false
     %157 = const bool false
-    call @func.53(%15, %16, %17, %18)
+    call @func.47(%15, %16, %17, %18)
     br bb29
 bb29:
     %158 = const bool false
     %159 = const bool false
-    call @func.53(%9, %10, %11, %15)
+    call @func.47(%9, %10, %11, %15)
     br bb30
 bb30:
     %160 = const bool false
     %161 = const bool false
-    call @func.53(%6, %7, %8, %9)
+    call @func.47(%6, %7, %8, %9)
     br bb31
 bb31:
     %162 = const bool false
@@ -54282,7 +54042,7 @@ bb37:
     br bb38
 bb38:
     %220 = const bool false
-    call @func.53(%41, %42, %43, %44)
+    call @func.47(%41, %42, %43, %44)
     br bb39
 bb39:
     %221 = const bool true
@@ -54319,7 +54079,7 @@ bb46:
     br bb47
 bb47:
     %230 = const bool false
-    call @func.56(%55, %56, %57)
+    call @func.50(%55, %56, %57)
     br bb48
 bb48:
     %231 = const bool true
@@ -54328,7 +54088,7 @@ bb48:
     br bb49
 bb49:
     %233 = const bool false
-    call @func.53(%53, %54, %55, %58)
+    call @func.47(%53, %54, %55, %58)
     br bb50
 bb50:
     %234 = const bool true
@@ -54346,7 +54106,7 @@ bb52:
     br bb53
 bb53:
     %239 = const bool false
-    call @func.56(%61, %62, %63)
+    call @func.50(%61, %62, %63)
     br bb54
 bb54:
     %240 = const bool true
@@ -54361,7 +54121,7 @@ bb55:
     br bb56
 bb56:
     %245 = const bool false
-    call @func.56(%64, %65, %66)
+    call @func.50(%64, %65, %66)
     br bb57
 bb57:
     %246 = const bool false
@@ -54627,7 +54387,7 @@ bb2:
     %92 = const i64 8
     %93 = gep i8, ptr %91, %92
     %94 = load u32, ptr %90
-    call @func.60(%44, %93)
+    call @func.54(%44, %93)
     br bb32(%94)
 bb3:
     %95 = load ptr, ptr %24
@@ -54639,13 +54399,13 @@ bb3:
     %101 = load ptr, ptr %24
     %102 = const i64 48
     %103 = gep i8, ptr %101, %102
-    call @func.66(%42, %97)
+    call @func.60(%42, %97)
     br bb30(%100, %103)
 bb4:
     %104 = load ptr, ptr %24
     %105 = const i64 8
     %106 = gep i8, ptr %104, %105
-    call @func.92(%41, %106)
+    call @func.84(%41, %106)
     br bb29
 bb5:
     %107 = load ptr, ptr %24
@@ -54661,7 +54421,7 @@ bb5:
     %117 = load ptr, ptr %24
     %118 = const i64 64
     %119 = gep i8, ptr %117, %118
-    call @func.66(%37, %107)
+    call @func.60(%37, %107)
     br bb25(%110, %113, %116, %119)
 bb6:
     %120 = load ptr, ptr %24
@@ -54673,7 +54433,7 @@ bb6:
     %126 = load ptr, ptr %24
     %127 = const i64 16
     %128 = gep i8, ptr %126, %127
-    call @func.93(%34, %122)
+    call @func.85(%34, %122)
     br bb22(%125, %128)
 bb7:
     %129 = load ptr, ptr %24
@@ -54685,7 +54445,7 @@ bb7:
     %135 = load ptr, ptr %24
     %136 = const i64 16
     %137 = gep i8, ptr %135, %136
-    call @func.93(%31, %131)
+    call @func.85(%31, %131)
     br bb19(%134, %137)
 bb8:
     %138 = load ptr, ptr %24
@@ -54694,7 +54454,7 @@ bb8:
     %141 = load ptr, ptr %24
     %142 = const i64 16
     %143 = gep i8, ptr %141, %142
-    call @func.60(%29, %140)
+    call @func.54(%29, %140)
     br bb17(%143)
 bb9:
     %144 = load ptr, ptr %24
@@ -54703,19 +54463,19 @@ bb9:
     %147 = load ptr, ptr %24
     %148 = const i64 48
     %149 = gep i8, ptr %147, %148
-    call @func.66(%27, %146)
+    call @func.60(%27, %146)
     br bb15(%149)
 bb10:
     %150 = load ptr, ptr %24
     %151 = const i64 8
     %152 = gep i8, ptr %150, %151
-    call @func.95(%26, %152)
+    call @func.87(%26, %152)
     br bb14
 bb11:
     %153 = load ptr, ptr %24
     %154 = const i64 8
     %155 = gep i8, ptr %153, %154
-    call @func.96(%25, %155)
+    call @func.88(%25, %155)
     br bb13
 bb12:
     %156 = load ptr, ptr %24
@@ -54769,7 +54529,7 @@ bb14:
     store i64 %190, ptr %0
     br bb33
 bb15(%2: ptr):
-    call @func.61(%28, %2)
+    call @func.55(%28, %2)
     br bb16
 bb16:
     %191 = const i64 8
@@ -54820,7 +54580,7 @@ bb16:
     store i64 %227, ptr %0
     br bb33
 bb17(%3: ptr):
-    call @func.60(%30, %3)
+    call @func.54(%30, %3)
     br bb18
 bb18:
     %228 = load ptr, ptr %29
@@ -54835,10 +54595,10 @@ bb18:
     store i64 %234, ptr %0
     br bb33
 bb19(%4: ptr, %5: ptr):
-    call @func.60(%32, %4)
+    call @func.54(%32, %4)
     br bb20(%5)
 bb20(%6: ptr):
-    call @func.60(%33, %6)
+    call @func.54(%33, %6)
     br bb21
 bb21:
     %235 = const i64 24
@@ -54863,10 +54623,10 @@ bb21:
     store i64 %249, ptr %0
     br bb33
 bb22(%7: ptr, %8: ptr):
-    call @func.60(%35, %7)
+    call @func.54(%35, %7)
     br bb23(%8)
 bb23(%9: ptr):
-    call @func.60(%36, %9)
+    call @func.54(%36, %9)
     br bb24
 bb24:
     %250 = const i64 24
@@ -54891,13 +54651,13 @@ bb24:
     store i64 %264, ptr %0
     br bb33
 bb25(%10: ptr, %11: ptr, %12: ptr, %13: ptr):
-    call @func.60(%38, %10)
+    call @func.54(%38, %10)
     br bb26(%11, %12, %13)
 bb26(%14: ptr, %15: ptr, %16: ptr):
-    call @func.60(%39, %14)
+    call @func.54(%39, %14)
     br bb27(%15, %16)
 bb27(%17: ptr, %18: ptr):
-    call @func.60(%40, %17)
+    call @func.54(%40, %17)
     br bb28(%18)
 bb28(%19: ptr):
     %265 = load bool, ptr %19
@@ -54959,7 +54719,7 @@ bb29:
     br bb33
 bb30(%20: ptr, %21: ptr):
     %307 = load u32, ptr %20
-    call @func.60(%43, %21)
+    call @func.54(%43, %21)
     br bb31(%307)
 bb31(%22: u32):
     %308 = const i64 8
@@ -55140,16 +54900,16 @@ bb9:
     %103 = load ptr, ptr %35
     %104 = const i64 16
     %105 = gep i8, ptr %103, %104
-    call @func.64(%26, %93)
+    call @func.58(%26, %93)
     br bb11(%89, %99, %105)
 bb10:
     %106 = const bool true
     br bb22(%106)
 bb11(%4: ptr, %5: ptr, %6: ptr):
-    call @func.64(%27, %6)
+    call @func.58(%27, %6)
     br bb12(%4, %5)
 bb12(%7: ptr, %8: ptr):
-    %107 = call @func.97(%26, %27)
+    %107 = call @func.89(%26, %27)
     br bb13(%7, %8, %107)
 bb13(%9: ptr, %10: ptr, %11: bool):
     condbr %11, bb14(%9, %10), bb15
@@ -55199,7 +54959,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = alloca (i64, i64, i64, i64), align 8
     store ptr %1, ptr %2
     %4 = load ptr, ptr %2
-    call @func.100(%3, %4)
+    call @func.92(%3, %4)
     br bb1
 bb1:
     %5 = load ptr, ptr %2
@@ -55240,7 +55000,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.101(%6)
+    %7 = call @func.93(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -55254,7 +55014,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.102(%6)
+    %7 = call @func.94(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -55268,7 +55028,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.103(%6)
+    %7 = call @func.95(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -55312,7 +55072,7 @@ bb1(%3: ptr):
     %71 = icmp eq u64 %69, %70
     condbr %71, bb42(%3, %64), bb48
 bb2:
-    call @func.70(%55, %53)
+    call @func.64(%55, %53)
     br bb3
 bb3:
     %72 = load i64, ptr %55
@@ -55324,7 +55084,7 @@ bb3:
     switch %77 [ 1: bb4 0: bb39 default: bb6 ]
 bb4:
     %78 = load ptr, ptr %55
-    %79 = call @func.104(%78)
+    %79 = call @func.96(%78)
     store ptr %79, ptr %56
     br bb5
 bb5:
@@ -55435,7 +55195,7 @@ bb14:
     %166 = load ptr, ptr %56
     %167 = const i64 8
     %168 = gep i8, ptr %166, %167
-    call @func.107(%57, %168, %2)
+    call @func.99(%57, %168, %2)
     br bb15
 bb15:
     %169 = load i64, ptr %57
@@ -55500,16 +55260,16 @@ bb16:
     store i64 %216, ptr %215
     br bb40
 bb17(%4: ptr, %5: u64):
-    %217 = call @func.71(%4)
+    %217 = call @func.65(%4)
     br bb18(%4, %5, %5, %217)
 bb18(%6: ptr, %7: u64, %8: u64, %9: u64):
     %218 = icmp ult u64 %8, %9
     condbr %218, bb19(%6, %7), bb2
 bb19(%10: ptr, %11: u64):
-    %219 = call @func.72(%10, %11)
+    %219 = call @func.66(%10, %11)
     br bb20(%10, %11, %219)
 bb20(%12: ptr, %13: u64, %14: ptr):
-    call @func.107(%59, %14, %2)
+    call @func.99(%59, %14, %2)
     br bb21(%12, %13)
 bb21(%15: ptr, %16: u64):
     %220 = load i64, ptr %59
@@ -55590,7 +55350,7 @@ bb24(%19: ptr):
     %278 = load u64, ptr %61
     br bb17(%19, %278)
 bb25(%20: ptr, %21: ptr, %22: ptr):
-    call @func.73(%21, %22)
+    call @func.67(%21, %22)
     br bb26(%20)
 bb26(%23: ptr):
     %279 = load ptr, ptr %23
@@ -55598,7 +55358,7 @@ bb26(%23: ptr):
     %281 = gep i8, ptr %279, %280
     br bb27(%53, %281)
 bb27(%24: ptr, %25: ptr):
-    call @func.73(%24, %25)
+    call @func.67(%24, %25)
     br bb44
 bb28(%26: ptr, %27: ptr):
     %282 = load ptr, ptr %27
@@ -55606,7 +55366,7 @@ bb28(%26: ptr, %27: ptr):
     %284 = gep i8, ptr %282, %283
     br bb29(%26, %53, %284)
 bb29(%28: ptr, %29: ptr, %30: ptr):
-    call @func.73(%29, %30)
+    call @func.67(%29, %30)
     br bb30(%28)
 bb30(%31: ptr):
     %285 = load ptr, ptr %31
@@ -55614,10 +55374,10 @@ bb30(%31: ptr):
     %287 = gep i8, ptr %285, %286
     br bb31(%53, %287)
 bb31(%32: ptr, %33: ptr):
-    call @func.73(%32, %33)
+    call @func.67(%32, %33)
     br bb45
 bb32(%34: ptr, %35: ptr, %36: ptr, %37: ptr):
-    call @func.73(%36, %37)
+    call @func.67(%36, %37)
     br bb33(%34, %35)
 bb33(%38: ptr, %39: ptr):
     %288 = load ptr, ptr %39
@@ -55625,7 +55385,7 @@ bb33(%38: ptr, %39: ptr):
     %290 = gep i8, ptr %288, %289
     br bb34(%38, %53, %290)
 bb34(%40: ptr, %41: ptr, %42: ptr):
-    call @func.73(%41, %42)
+    call @func.67(%41, %42)
     br bb35(%40)
 bb35(%43: ptr):
     %291 = load ptr, ptr %43
@@ -55633,7 +55393,7 @@ bb35(%43: ptr):
     %293 = gep i8, ptr %291, %292
     br bb36(%53, %293)
 bb36(%44: ptr, %45: ptr):
-    call @func.73(%44, %45)
+    call @func.67(%44, %45)
     br bb46
 bb37(%46: ptr):
     %294 = load ptr, ptr %46
@@ -55641,7 +55401,7 @@ bb37(%46: ptr):
     %296 = gep i8, ptr %294, %295
     br bb38(%53, %296)
 bb38(%47: ptr, %48: ptr):
-    call @func.73(%47, %48)
+    call @func.67(%47, %48)
     br bb47
 bb39:
     %297 = const i64 3
@@ -55698,10 +55458,10 @@ fn @LocalContext__new(functy.77) {
 bb0(%0: ptr):
     %1 = alloca (i64, i64, i64), align 8
     %2 = alloca (i64, i64, i64), align 8
-    call @func.75(%1)
+    call @func.69(%1)
     br bb1
 bb1:
-    call @func.76(%2)
+    call @func.70(%2)
     br bb2
 bb2:
     %3 = load i64, ptr %1
@@ -55748,7 +55508,7 @@ bb2:
 fn @Verifier____env___infer_sort_blind(functy.78) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %4 = const u32 0
-    call @func.112(%0, %1, %2, %4, %3)
+    call @func.102(%0, %1, %2, %4, %3)
     br bb1
 bb1:
     ret
@@ -55806,7 +55566,7 @@ bb5:
     %45 = const bool true
     br bb12(%45)
 bb6(%1: ptr, %2: ptr):
-    %46 = call @func.79(%2)
+    %46 = call @func.73(%2)
     br bb7(%1, %46)
 bb7(%3: ptr, %4: bool):
     condbr %4, bb8(%3), bb9
@@ -55819,10 +55579,10 @@ bb9:
     %50 = const bool false
     br bb12(%50)
 bb10(%6: ptr):
-    %51 = call @func.79(%6)
+    %51 = call @func.73(%6)
     br bb12(%51)
 bb11(%7: ptr):
-    %52 = call @func.79(%7)
+    %52 = call @func.73(%7)
     br bb12(%52)
 bb12(%8: bool):
     ret %8
@@ -55847,10 +55607,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr, %4: ptr):
     %29 = alloca i64, align 8
     %30 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %31 = const bool false
-    call @func.117(%23, %1, %2, %4)
+    call @func.104(%23, %1, %2, %4)
     br bb1(%1, %3, %4)
 bb1(%5: ptr, %6: ptr, %7: ptr):
-    call @func.80(%22, %23)
+    call @func.74(%22, %23)
     br bb2(%5, %6, %7)
 bb2(%8: ptr, %9: ptr, %10: ptr):
     %32 = load i64, ptr %22
@@ -55976,7 +55736,7 @@ bb4(%11: ptr, %12: ptr, %13: ptr):
     %129 = gep i8, ptr %21, %128
     %130 = load i64, ptr %127
     store i64 %130, ptr %129
-    %131 = call @func.118(%11, %21, %12, %13)
+    %131 = call @func.105(%11, %21, %12, %13)
     br bb7(%12, %131, %84)
 bb5:
     %132 = const i64 8
@@ -56007,7 +55767,7 @@ bb5:
     %153 = gep i8, ptr %24, %152
     %154 = load i64, ptr %151
     store i64 %154, ptr %153
-    call @func.81(%0, %24)
+    call @func.75(%0, %24)
     br bb6
 bb6:
     %155 = const bool false
@@ -56304,7 +56064,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %6 = alloca (i64, i64, i64, i64, i64), align 8
     %7 = const bool false
     %8 = const bool true
-    call @func.119(%4, %2)
+    call @func.106(%4, %2)
     br bb1
 bb1:
     %9 = load bool, ptr %4
@@ -56340,7 +56100,7 @@ bb2(%3: u64):
     %33 = gep i8, ptr %5, %32
     %34 = load i64, ptr %31
     store i64 %34, ptr %33
-    call @func.120(%0, %5, %3)
+    call @func.107(%0, %5, %3)
     br bb5
 bb3:
     %35 = const bool false
@@ -56370,7 +56130,7 @@ bb3:
     %55 = gep i8, ptr %6, %54
     %56 = load i64, ptr %53
     store i64 %56, ptr %55
-    call @func.122(%0, %6, %2)
+    call @func.109(%0, %6, %2)
     br bb6
 bb4:
     ret
@@ -56428,12 +56188,6 @@ fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.86) {
 }
 
 fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.87) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.88) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.89) {
 }
 
 fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.90) {
@@ -56530,7 +56284,7 @@ bb4:
     %284 = load ptr, ptr %207
     %285 = const i64 8
     %286 = gep i8, ptr %284, %285
-    %287 = call @func.123(%286)
+    %287 = call @func.110(%286)
     br bb61(%287)
 bb5:
     %288 = load ptr, ptr %207
@@ -56553,13 +56307,13 @@ bb6:
     %303 = load ptr, ptr %207
     %304 = const i64 48
     %305 = gep i8, ptr %303, %304
-    %306 = call @func.124(%302)
+    %306 = call @func.111(%302)
     br bb32(%305, %306)
 bb7:
     %307 = load ptr, ptr %207
     %308 = const i64 8
     %309 = gep i8, ptr %307, %308
-    %310 = call @func.125(%309)
+    %310 = call @func.112(%309)
     br bb28(%309, %310)
 bb8:
     %311 = load ptr, ptr %207
@@ -56567,7 +56321,7 @@ bb8:
     %313 = gep i8, ptr %311, %312
     %314 = load u64, ptr %313
     %315 = const u64 13
-    %316 = call @func.127(%315, %314)
+    %316 = call @func.114(%315, %314)
     br bb27(%316)
 bb9:
     %317 = load ptr, ptr %207
@@ -56615,13 +56369,13 @@ bb12:
     %353 = load u32, ptr %352
     %354 = zext u32 %353 to u64
     %355 = const u64 7
-    %356 = call @func.127(%355, %354)
+    %356 = call @func.114(%355, %354)
     br bb13(%352, %356)
 bb13(%2: ptr, %3: u64):
     %357 = trunc u64 %3 to u32
     %358 = load u32, ptr %2
     %359 = const u32 1
-    %360 = call @func.86(%358, %359)
+    %360 = call @func.80(%358, %359)
     br bb14(%357, %360)
 bb14(%4: u32, %5: u32):
     %361 = const u32 0
@@ -56629,10 +56383,10 @@ bb14(%4: u32, %5: u32):
     %363 = const bool false
     %364 = const bool false
     %365 = const bool false
-    call @func.129(%0, %4, %5, %361, %362, %363, %364, %365)
+    call @func.115(%0, %4, %5, %361, %362, %363, %364, %365)
     br bb80
 bb15(%6: ptr, %7: ptr):
-    call @func.130(%208, %7)
+    call @func.116(%208, %7)
     br bb16(%6)
 bb16(%8: ptr):
     %366 = load ptr, ptr %8
@@ -56640,15 +56394,15 @@ bb16(%8: ptr):
     %368 = gep i8, ptr %366, %367
     br bb17(%368)
 bb17(%9: ptr):
-    call @func.130(%209, %9)
+    call @func.116(%209, %9)
     br bb18
 bb18:
     %369 = load u64, ptr %208
     %370 = load u64, ptr %209
-    call @func.134(%0, %369, %370)
+    call @func.119(%0, %369, %370)
     br bb80
 bb19(%10: ptr, %11: ptr):
-    call @func.130(%210, %11)
+    call @func.116(%210, %11)
     br bb20(%10)
 bb20(%12: ptr):
     %371 = load ptr, ptr %12
@@ -56656,16 +56410,16 @@ bb20(%12: ptr):
     %373 = gep i8, ptr %371, %372
     br bb21(%373)
 bb21(%13: ptr):
-    call @func.130(%211, %13)
+    call @func.116(%211, %13)
     br bb22
 bb22:
     %374 = load u64, ptr %210
     %375 = load u64, ptr %211
     %376 = const u64 0
-    call @func.139(%0, %374, %375, %376)
+    call @func.121(%0, %374, %375, %376)
     br bb80
 bb23(%14: ptr, %15: ptr):
-    call @func.130(%212, %15)
+    call @func.116(%212, %15)
     br bb24(%14)
 bb24(%16: ptr):
     %377 = load ptr, ptr %16
@@ -56673,13 +56427,13 @@ bb24(%16: ptr):
     %379 = gep i8, ptr %377, %378
     br bb25(%379)
 bb25(%17: ptr):
-    call @func.130(%213, %17)
+    call @func.116(%213, %17)
     br bb26
 bb26:
     %380 = load u64, ptr %212
     %381 = load u64, ptr %213
     %382 = const u64 1
-    call @func.139(%0, %380, %381, %382)
+    call @func.121(%0, %380, %381, %382)
     br bb80
 bb27(%18: u64):
     %383 = trunc u64 %18 to u32
@@ -56689,47 +56443,47 @@ bb27(%18: u64):
     %387 = const bool false
     %388 = const bool false
     %389 = const bool false
-    call @func.129(%0, %383, %384, %385, %386, %387, %388, %389)
+    call @func.115(%0, %383, %384, %385, %386, %387, %388, %389)
     br bb80
 bb28(%19: ptr, %20: u64):
     %390 = const u64 11
-    %391 = call @func.127(%390, %20)
+    %391 = call @func.114(%390, %20)
     br bb29(%19, %391)
 bb29(%21: ptr, %22: u64):
     %392 = trunc u64 %22 to u32
-    %393 = call @func.140(%21)
+    %393 = call @func.122(%21)
     br bb30(%21, %392, %393)
 bb30(%23: ptr, %24: u32, %25: bool):
-    %394 = call @func.141(%23)
+    %394 = call @func.123(%23)
     br bb31(%24, %25, %394)
 bb31(%26: u32, %27: bool, %28: bool):
     %395 = const u32 0
     %396 = const u32 0
     %397 = const bool false
     %398 = const bool false
-    call @func.129(%0, %26, %395, %396, %397, %398, %27, %28)
+    call @func.115(%0, %26, %395, %396, %397, %398, %27, %28)
     br bb80
 bb32(%29: ptr, %30: u64):
-    call @func.87(%214, %29)
+    call @func.81(%214, %29)
     br bb33(%29, %30)
 bb33(%31: ptr, %32: u64):
-    %399 = call @func.142(%214)
+    %399 = call @func.124(%214)
     br bb34(%31, %32, %399)
 bb34(%33: ptr, %34: u64, %35: u64):
     %400 = const bool false
     %401 = const u64 0
     br bb35(%33, %34, %35, %400, %401)
 bb35(%36: ptr, %37: u64, %38: u64, %39: bool, %40: u64):
-    %402 = call @func.88(%36)
+    %402 = call @func.65(%36)
     br bb36(%36, %37, %38, %39, %40, %40, %402)
 bb36(%41: ptr, %42: u64, %43: u64, %44: bool, %45: u64, %46: u64, %47: u64):
     %403 = icmp ult u64 %46, %47
     condbr %403, bb37(%41, %42, %43, %44, %45), bb43(%41, %42, %43, %44)
 bb37(%48: ptr, %49: u64, %50: u64, %51: bool, %52: u64):
-    %404 = call @func.89(%48, %52)
+    %404 = call @func.66(%48, %52)
     br bb38(%48, %49, %50, %51, %52, %404)
 bb38(%53: ptr, %54: u64, %55: u64, %56: bool, %57: u64, %58: ptr):
-    %405 = call @func.141(%58)
+    %405 = call @func.123(%58)
     br bb39(%53, %54, %55, %56, %57, %405)
 bb39(%59: ptr, %60: u64, %61: u64, %62: bool, %63: u64, %64: bool):
     condbr %64, bb40(%59, %60, %61), bb41(%59, %60, %61, %62, %63)
@@ -56757,16 +56511,16 @@ bb43(%77: ptr, %78: u64, %79: u64, %80: bool):
     %419 = const u64 0
     br bb44(%77, %78, %79, %80, %418, %419)
 bb44(%81: ptr, %82: u64, %83: u64, %84: bool, %85: bool, %86: u64):
-    %420 = call @func.88(%81)
+    %420 = call @func.65(%81)
     br bb45(%81, %82, %83, %84, %85, %86, %86, %420)
 bb45(%87: ptr, %88: u64, %89: u64, %90: bool, %91: bool, %92: u64, %93: u64, %94: u64):
     %421 = icmp ult u64 %93, %94
     condbr %421, bb46(%87, %88, %89, %90, %91, %92), bb52(%88, %89, %90, %91)
 bb46(%95: ptr, %96: u64, %97: u64, %98: bool, %99: bool, %100: u64):
-    %422 = call @func.89(%95, %100)
+    %422 = call @func.66(%95, %100)
     br bb47(%95, %96, %97, %98, %99, %100, %422)
 bb47(%101: ptr, %102: u64, %103: u64, %104: bool, %105: bool, %106: u64, %107: ptr):
-    %423 = call @func.140(%107)
+    %423 = call @func.122(%107)
     br bb48(%101, %102, %103, %104, %105, %106, %423)
 bb48(%108: ptr, %109: u64, %110: u64, %111: bool, %112: bool, %113: u64, %114: bool):
     condbr %114, bb49(%109, %110, %111), bb50(%108, %109, %110, %111, %112, %113)
@@ -56790,11 +56544,11 @@ bb51(%124: ptr, %125: u64, %126: u64, %127: bool, %128: bool):
     %435 = load u64, ptr %216
     br bb44(%124, %125, %126, %127, %128, %435)
 bb52(%129: u64, %130: u64, %131: bool, %132: bool):
-    %436 = call @func.127(%129, %130)
+    %436 = call @func.114(%129, %130)
     br bb53(%131, %132, %436)
 bb53(%133: bool, %134: bool, %135: u64):
     %437 = const u64 5
-    %438 = call @func.127(%437, %135)
+    %438 = call @func.114(%437, %135)
     br bb54(%133, %134, %438)
 bb54(%136: bool, %137: bool, %138: u64):
     %439 = trunc u64 %138 to u32
@@ -56802,10 +56556,10 @@ bb54(%136: bool, %137: bool, %138: u64):
     %441 = const u32 0
     %442 = const bool false
     %443 = const bool false
-    call @func.129(%0, %439, %440, %441, %442, %443, %137, %136)
+    call @func.115(%0, %439, %440, %441, %442, %443, %137, %136)
     br bb80
 bb55(%139: ptr, %140: ptr, %141: ptr):
-    call @func.130(%217, %141)
+    call @func.116(%217, %141)
     br bb56(%139, %140)
 bb56(%142: ptr, %143: ptr):
     %444 = load ptr, ptr %142
@@ -56813,7 +56567,7 @@ bb56(%142: ptr, %143: ptr):
     %446 = gep i8, ptr %444, %445
     br bb57(%143, %446)
 bb57(%144: ptr, %145: ptr):
-    call @func.130(%218, %145)
+    call @func.116(%218, %145)
     br bb58(%144)
 bb58(%146: ptr):
     %447 = load ptr, ptr %146
@@ -56821,17 +56575,17 @@ bb58(%146: ptr):
     %449 = gep i8, ptr %447, %448
     br bb59(%449)
 bb59(%147: ptr):
-    call @func.130(%219, %147)
+    call @func.116(%219, %147)
     br bb60
 bb60:
     %450 = load u64, ptr %217
     %451 = load u64, ptr %218
     %452 = load u64, ptr %219
-    call @func.147(%0, %450, %451, %452)
+    call @func.125(%0, %450, %451, %452)
     br bb80
 bb61(%148: u64):
     %453 = const u64 3
-    %454 = call @func.127(%453, %148)
+    %454 = call @func.114(%453, %148)
     br bb62(%454)
 bb62(%149: u64):
     %455 = trunc u64 %149 to u32
@@ -56841,14 +56595,14 @@ bb62(%149: u64):
     %459 = const bool false
     %460 = const bool false
     %461 = const bool false
-    call @func.129(%0, %455, %456, %457, %458, %459, %460, %461)
+    call @func.115(%0, %455, %456, %457, %458, %459, %460, %461)
     br bb80
 bb63(%150: ptr, %151: ptr, %152: ptr):
-    call @func.130(%220, %152)
+    call @func.116(%220, %152)
     br bb64(%150, %151)
 bb64(%153: ptr, %154: ptr):
     %462 = load u64, ptr %220
-    %463 = call @func.148(%462)
+    %463 = call @func.126(%462)
     br bb65(%153, %154, %463)
 bb65(%155: ptr, %156: ptr, %157: u8):
     %464 = zext u8 %157 to u32
@@ -56867,59 +56621,59 @@ bb65(%155: ptr, %156: ptr, %157: u8):
 bb66(%158: ptr, %159: ptr):
     %475 = load u32, ptr %221
     %476 = const u32 255
-    %477 = call @func.90(%475, %476)
+    %477 = call @func.82(%475, %476)
     br bb67(%158, %159, %477)
 bb67(%160: ptr, %161: ptr, %162: u32):
     %478 = zext u32 %162 to u64
-    %479 = call @func.124(%160)
+    %479 = call @func.111(%160)
     br bb68(%161, %162, %478, %479)
 bb68(%163: ptr, %164: u32, %165: u64, %166: u64):
     %480 = load u32, ptr %163
     %481 = zext u32 %480 to u64
     %482 = load u64, ptr %220
-    %483 = call @func.149(%482)
+    %483 = call @func.127(%482)
     br bb69(%164, %165, %166, %481, %483)
 bb69(%167: u32, %168: u64, %169: u64, %170: u64, %171: u32):
     %484 = zext u32 %171 to u64
-    %485 = call @func.127(%170, %484)
+    %485 = call @func.114(%170, %484)
     br bb70(%167, %168, %169, %485)
 bb70(%172: u32, %173: u64, %174: u64, %175: u64):
-    %486 = call @func.127(%174, %175)
+    %486 = call @func.114(%174, %175)
     br bb71(%172, %173, %486)
 bb71(%176: u32, %177: u64, %178: u64):
-    %487 = call @func.127(%177, %178)
+    %487 = call @func.114(%177, %178)
     br bb72(%176, %487)
 bb72(%179: u32, %180: u64):
     %488 = trunc u64 %180 to u32
     %489 = load u64, ptr %220
-    %490 = call @func.150(%489)
+    %490 = call @func.128(%489)
     br bb73(%179, %488, %490)
 bb73(%181: u32, %182: u32, %183: u32):
     %491 = load u64, ptr %220
-    %492 = call @func.103(%491)
+    %492 = call @func.95(%491)
     br bb74(%181, %182, %183, %492)
 bb74(%184: u32, %185: u32, %186: u32, %187: bool):
     %493 = load u64, ptr %220
-    %494 = call @func.101(%493)
+    %494 = call @func.93(%493)
     br bb75(%184, %185, %186, %187, %494)
 bb75(%188: u32, %189: u32, %190: u32, %191: bool, %192: bool):
     %495 = load u64, ptr %220
-    %496 = call @func.102(%495)
+    %496 = call @func.94(%495)
     br bb76(%188, %189, %190, %191, %192, %496)
 bb76(%193: u32, %194: u32, %195: u32, %196: bool, %197: bool, %198: bool):
     %497 = load u64, ptr %220
-    %498 = call @func.151(%497)
+    %498 = call @func.129(%497)
     br bb77(%193, %194, %195, %196, %197, %198, %498)
 bb77(%199: u32, %200: u32, %201: u32, %202: bool, %203: bool, %204: bool, %205: bool):
-    call @func.129(%0, %200, %201, %199, %202, %203, %204, %205)
+    call @func.115(%0, %200, %201, %199, %202, %203, %204, %205)
     br bb80
 bb78(%206: ptr):
-    call @func.130(%222, %206)
+    call @func.116(%222, %206)
     br bb79
 bb79:
     %499 = load u64, ptr %222
     %500 = const u64 0
-    call @func.153(%0, %499, %500)
+    call @func.130(%0, %499, %500)
     br bb80
 bb80:
     ret
@@ -57013,7 +56767,7 @@ bb1:
     unreachable
 bb2:
     %30 = load ptr, ptr %4
-    call @func.66(%10, %30)
+    call @func.60(%10, %30)
     br bb12
 bb3:
     %31 = load ptr, ptr %4
@@ -57022,7 +56776,7 @@ bb3:
     %34 = load ptr, ptr %4
     %35 = const i64 16
     %36 = gep i8, ptr %34, %35
-    call @func.94(%8, %33)
+    call @func.86(%8, %33)
     br bb10(%36)
 bb4:
     %37 = load ptr, ptr %4
@@ -57031,13 +56785,13 @@ bb4:
     %40 = load ptr, ptr %4
     %41 = const i64 16
     %42 = gep i8, ptr %40, %41
-    call @func.94(%6, %39)
+    call @func.86(%6, %39)
     br bb8(%42)
 bb5:
     %43 = load ptr, ptr %4
     %44 = const i64 8
     %45 = gep i8, ptr %43, %44
-    call @func.94(%5, %45)
+    call @func.86(%5, %45)
     br bb7
 bb6:
     %46 = const i64 3
@@ -57052,7 +56806,7 @@ bb7:
     store i64 %50, ptr %0
     br bb13
 bb8(%2: ptr):
-    call @func.94(%7, %2)
+    call @func.86(%7, %2)
     br bb9
 bb9:
     %51 = load ptr, ptr %6
@@ -57067,7 +56821,7 @@ bb9:
     store i64 %57, ptr %0
     br bb13
 bb10(%3: ptr):
-    call @func.94(%9, %3)
+    call @func.86(%9, %3)
     br bb11
 bb11:
     %58 = load ptr, ptr %8
@@ -57239,7 +56993,7 @@ bb2:
     %13 = load ptr, ptr %4
     %14 = const i64 8
     %15 = gep i8, ptr %13, %14
-    call @func.98(%7, %12)
+    call @func.90(%7, %12)
     br bb7(%15)
 bb3:
     %16 = load ptr, ptr %4
@@ -57248,14 +57002,14 @@ bb3:
     %19 = load ptr, ptr %4
     %20 = const i64 16
     %21 = gep i8, ptr %19, %20
-    call @func.98(%5, %18)
+    call @func.90(%5, %18)
     br bb5(%21)
 bb4:
     %22 = const i64 0
     store i64 %22, ptr %0
     br bb8
 bb5(%2: ptr):
-    call @func.99(%6, %2)
+    call @func.91(%6, %2)
     br bb6
 bb6:
     %23 = load ptr, ptr %5
@@ -57394,7 +57148,7 @@ bb1(%3: ptr):
     %56 = icmp eq u64 %54, %55
     condbr %56, bb27(%3, %49), bb31
 bb2:
-    call @func.105(%43, %41)
+    call @func.97(%43, %41)
     br bb3
 bb3:
     %57 = load i64, ptr %43
@@ -57475,7 +57229,7 @@ bb12(%10: ptr, %11: bool, %12: u64, %13: u64):
     %113 = const u64 40
     %114 = mul u64 %13, %113
     %115 = gep i8, ptr %112, %114
-    %116 = call @func.65(%115, %10)
+    %116 = call @func.59(%115, %10)
     br bb13(%10, %11, %12, %116)
 bb13(%14: ptr, %15: bool, %16: u64, %17: bool):
     condbr %17, bb14(%14), bb15(%14, %15, %16)
@@ -57501,7 +57255,7 @@ bb16(%22: ptr, %23: bool):
 bb17(%24: ptr, %25: bool):
     condbr %25, bb2, bb18(%24)
 bb18(%26: ptr):
-    call @func.66(%46, %26)
+    call @func.60(%46, %26)
     br bb19
 bb19:
     %129 = load i64, ptr %46
@@ -57532,7 +57286,7 @@ bb19:
     store i64 %149, ptr %148
     br bb26
 bb20(%27: ptr, %28: ptr):
-    call @func.106(%27, %28)
+    call @func.98(%27, %28)
     br bb29
 bb21(%29: ptr, %30: ptr):
     %150 = load ptr, ptr %30
@@ -57540,7 +57294,7 @@ bb21(%29: ptr, %30: ptr):
     %152 = gep i8, ptr %150, %151
     br bb22(%29, %41, %152)
 bb22(%31: ptr, %32: ptr, %33: ptr):
-    call @func.106(%32, %33)
+    call @func.98(%32, %33)
     br bb23(%31)
 bb23(%34: ptr):
     %153 = load ptr, ptr %34
@@ -57548,7 +57302,7 @@ bb23(%34: ptr):
     %155 = gep i8, ptr %153, %154
     br bb24(%41, %155)
 bb24(%35: ptr, %36: ptr):
-    call @func.106(%35, %36)
+    call @func.98(%35, %36)
     br bb30
 bb25:
     %156 = const i64 3
@@ -57589,16 +57343,10 @@ bb31:
     unreachable
 }
 
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.108) {
-}
-
 fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1x_EE13from_residualBM_(functy.109) {
 }
 
 fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.110) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.111) {
 }
 
 fn @Verifier____env___infer_sort_inner_blind(functy.112) {
@@ -57644,10 +57392,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32, %4: ptr):
     %135 = const bool false
     %136 = const bool false
     %137 = load ptr, ptr %98
-    call @func.117(%101, %1, %2, %137)
+    call @func.104(%101, %1, %2, %137)
     br bb1(%1, %3)
 bb1(%5: ptr, %6: u32):
-    call @func.108(%100, %101)
+    call @func.74(%100, %101)
     br bb2(%5, %6)
 bb2(%7: ptr, %8: u32):
     %138 = load i64, ptr %100
@@ -57774,7 +57522,7 @@ bb4(%9: ptr, %10: u32):
     %236 = load i64, ptr %233
     store i64 %236, ptr %235
     %237 = load ptr, ptr %98
-    call @func.154(%104, %9, %99, %237)
+    call @func.131(%104, %9, %99, %237)
     br bb7(%9, %10, %190)
 bb5:
     %238 = const i64 8
@@ -57805,7 +57553,7 @@ bb5:
     %259 = gep i8, ptr %102, %258
     %260 = load i64, ptr %257
     store i64 %260, ptr %259
-    call @func.109(%0, %102)
+    call @func.100(%0, %102)
     br bb6
 bb6:
     %261 = const bool false
@@ -57999,7 +57747,7 @@ bb10(%17: bool):
     %417 = load ptr, ptr %105
     %418 = const i64 8
     %419 = gep i8, ptr %417, %418
-    call @func.95(%106, %419)
+    call @func.87(%106, %419)
     br bb11(%17)
 bb11(%18: bool):
     %420 = const i64 8
@@ -58091,10 +57839,10 @@ bb14(%26: ptr, %27: u32, %28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: bool):
 bb15(%33: ptr, %34: u32, %35: ptr, %36: ptr, %37: ptr, %38: ptr, %39: bool):
     %484 = load u32, ptr %111
     %485 = load ptr, ptr %98
-    call @func.112(%110, %33, %38, %484, %485)
+    call @func.102(%110, %33, %38, %484, %485)
     br bb16(%33, %34, %35, %36, %37, %39)
 bb16(%40: ptr, %41: u32, %42: ptr, %43: ptr, %44: ptr, %45: bool):
-    call @func.110(%109, %110)
+    call @func.101(%109, %110)
     br bb17(%40, %41, %42, %43, %44, %45)
 bb17(%46: ptr, %47: u32, %48: ptr, %49: ptr, %50: ptr, %51: bool):
     %486 = load i64, ptr %109
@@ -58155,7 +57903,7 @@ bb18(%52: ptr, %53: u32, %54: ptr, %55: ptr, %56: ptr, %57: bool):
     %530 = gep i8, ptr %108, %529
     %531 = load i64, ptr %528
     store i64 %531, ptr %530
-    call @func.83(%115)
+    call @func.77(%115)
     br bb20(%52, %53, %54, %55, %56, %57)
 bb19:
     %532 = const i64 8
@@ -58186,11 +57934,11 @@ bb19:
     %553 = gep i8, ptr %112, %552
     %554 = load i64, ptr %551
     store i64 %554, ptr %553
-    call @func.109(%0, %112)
+    call @func.100(%0, %112)
     br bb46
 bb20(%58: ptr, %59: u32, %60: ptr, %61: ptr, %62: ptr, %63: bool):
     %555 = const bool true
-    %556 = call @func.111(%61)
+    %556 = call @func.3(%61)
     br bb21(%58, %59, %60, %62, %556, %63)
 bb21(%64: ptr, %65: u32, %66: ptr, %67: ptr, %68: ptr, %69: bool):
     call @func.13(%116, %68)
@@ -58206,7 +57954,7 @@ bb22(%70: ptr, %71: u32, %72: ptr, %73: ptr, %74: bool):
     store i8 %562, ptr %561
     %563 = const bool false
     %564 = load ptr, ptr %98
-    call @func.156(%114, %564, %115, %116, %117)
+    call @func.133(%114, %564, %115, %116, %117)
     br bb23(%70, %71, %73, %74)
 bb23(%75: ptr, %76: u32, %77: ptr, %78: bool):
     %565 = const bool false
@@ -58216,7 +57964,7 @@ bb23(%75: ptr, %76: u32, %77: ptr, %78: bool):
     br bb24(%75, %76, %568, %78)
 bb24(%79: ptr, %80: u32, %81: ptr, %82: bool):
     %569 = load u64, ptr %114
-    call @func.157(%118, %79, %81, %569)
+    call @func.134(%118, %79, %81, %569)
     br bb25(%79, %80, %82)
 bb25(%83: ptr, %84: u32, %85: bool):
     %570 = const u32 1
@@ -58234,12 +57982,12 @@ bb25(%83: ptr, %84: u32, %85: bool):
 bb26(%86: ptr, %87: ptr, %88: bool):
     %580 = load u32, ptr %120
     %581 = load ptr, ptr %98
-    call @func.112(%119, %86, %87, %580, %581)
+    call @func.102(%119, %86, %87, %580, %581)
     br bb27(%88)
 bb27(%89: bool):
     %582 = const bool true
     %583 = load ptr, ptr %98
-    call @func.159(%583)
+    call @func.136(%583)
     br bb28(%89)
 bb28(%90: bool):
     %584 = const bool false
@@ -58275,7 +58023,7 @@ bb28(%90: bool):
     %609 = gep i8, ptr %123, %608
     %610 = load i64, ptr %607
     store i64 %610, ptr %609
-    call @func.110(%122, %123)
+    call @func.101(%122, %123)
     br bb29(%90)
 bb29(%91: bool):
     %611 = load i64, ptr %122
@@ -58390,7 +58138,7 @@ bb30(%92: bool):
     %699 = gep i8, ptr %128, %698
     %700 = load i64, ptr %697
     store i64 %700, ptr %699
-    call @func.160(%126, %127, %128)
+    call @func.137(%126, %127, %128)
     br bb33(%92)
 bb31:
     %701 = const i64 8
@@ -58421,7 +58169,7 @@ bb31:
     %722 = gep i8, ptr %124, %721
     %723 = load i64, ptr %720
     store i64 %723, ptr %722
-    call @func.109(%0, %124)
+    call @func.100(%0, %124)
     br bb32
 bb32:
     %724 = const bool false
@@ -58531,16 +58279,7 @@ bb47:
     unreachable
 }
 
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.113) {
-}
-
 fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.114) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.115) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.116) {
 }
 
 fn @Verifier____env___infer_type_core_blind(functy.117) {
@@ -58853,13 +58592,13 @@ bb8(%9: ptr):
     %663 = load ptr, ptr %386
     %664 = const i64 48
     %665 = gep i8, ptr %663, %664
-    call @func.161(%397, %9, %662)
+    call @func.138(%397, %9, %662)
     br bb20(%662)
 bb9:
     %666 = load ptr, ptr %386
     %667 = const i64 8
     %668 = gep i8, ptr %666, %667
-    call @func.95(%396, %668)
+    call @func.87(%396, %668)
     br bb17
 bb10:
     %669 = load ptr, ptr %386
@@ -58869,7 +58608,7 @@ bb10:
     %673 = load i64, ptr %671
     store i64 %673, ptr %389
     %674 = load u64, ptr %389
-    call @func.164(%388, %672, %674)
+    call @func.141(%388, %672, %674)
     br bb12(%671)
 bb11:
     %675 = load ptr, ptr %386
@@ -59029,7 +58768,7 @@ bb16:
     store i64 %790, ptr %789
     br bb180
 bb17:
-    call @func.165(%395, %396)
+    call @func.142(%395, %396)
     br bb18
 bb18:
     call @func.32(%394, %395)
@@ -59101,7 +58840,7 @@ bb20(%12: ptr):
     %842 = select i64 %839, %840, %841
     switch %842 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.66(%400, %13)
+    call @func.60(%400, %13)
     br bb23
 bb22:
     %843 = load i64, ptr %397
@@ -59277,10 +59016,10 @@ bb23:
     br bb180
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %980 = load ptr, ptr %385
-    call @func.117(%403, %14, %16, %980)
+    call @func.104(%403, %14, %16, %980)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.113(%402, %403)
+    call @func.74(%402, %403)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %981 = load i64, ptr %402
@@ -59405,7 +59144,7 @@ bb27(%21: ptr, %22: ptr):
     %1079 = load i64, ptr %1076
     store i64 %1079, ptr %1078
     %1080 = load ptr, ptr %385
-    call @func.154(%406, %21, %401, %1080)
+    call @func.131(%406, %21, %401, %1080)
     br bb30(%21, %22, %1033)
 bb28:
     %1081 = const i64 8
@@ -59436,7 +59175,7 @@ bb28:
     %1102 = gep i8, ptr %404, %1101
     %1103 = load i64, ptr %1100
     store i64 %1103, ptr %1102
-    call @func.114(%0, %404)
+    call @func.103(%0, %404)
     br bb29
 bb29:
     %1104 = const bool false
@@ -59626,10 +59365,10 @@ bb32(%26: ptr, %27: ptr, %28: bool):
     br bb33(%26, %27, %1251, %1254, %1257, %28)
 bb33(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr, %34: bool):
     %1258 = load ptr, ptr %385
-    call @func.117(%410, %29, %33, %1258)
+    call @func.104(%410, %29, %33, %1258)
     br bb34(%29, %30, %31, %32, %34)
 bb34(%35: ptr, %36: ptr, %37: ptr, %38: ptr, %39: bool):
-    call @func.113(%409, %410)
+    call @func.74(%409, %410)
     br bb35(%35, %36, %37, %38, %39)
 bb35(%40: ptr, %41: ptr, %42: ptr, %43: ptr, %44: bool):
     %1259 = load i64, ptr %409
@@ -59786,11 +59525,11 @@ bb37:
     %1382 = gep i8, ptr %411, %1381
     %1383 = load i64, ptr %1380
     store i64 %1383, ptr %1382
-    call @func.114(%0, %411)
+    call @func.103(%0, %411)
     br bb187
 bb38(%50: ptr, %51: ptr, %52: ptr, %53: ptr, %54: ptr, %55: ptr, %56: bool):
     %1384 = load ptr, ptr %385
-    %1385 = call @func.118(%50, %54, %55, %1384)
+    %1385 = call @func.105(%50, %54, %55, %1384)
     br bb39(%51, %52, %53, %1385, %56)
 bb39(%57: ptr, %58: ptr, %59: ptr, %60: bool, %61: bool):
     condbr %60, bb40(%57, %59, %61), bb41(%58)
@@ -59800,7 +59539,7 @@ bb40(%62: ptr, %63: ptr, %64: bool):
     %1388 = gep i8, ptr %1386, %1387
     br bb46(%62, %1388, %64)
 bb41(%65: ptr):
-    %1389 = call @func.115(%65)
+    %1389 = call @func.3(%65)
     br bb42(%1389)
 bb42(%66: ptr):
     call @func.13(%415, %66)
@@ -60048,7 +59787,7 @@ bb46(%67: ptr, %68: ptr, %69: bool):
     %1578 = gep i8, ptr %1576, %1577
     br bb47(%68, %1578, %69)
 bb47(%70: ptr, %71: ptr, %72: bool):
-    call @func.166(%418, %70, %71)
+    call @func.143(%418, %70, %71)
     br bb48(%72)
 bb48(%73: bool):
     %1579 = load i64, ptr %418
@@ -60158,10 +59897,10 @@ bb53:
     br bb180
 bb54(%78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr):
     %1655 = load ptr, ptr %385
-    call @func.117(%424, %78, %82, %1655)
+    call @func.104(%424, %78, %82, %1655)
     br bb55(%78, %79, %80, %81)
 bb55(%83: ptr, %84: ptr, %85: ptr, %86: ptr):
-    call @func.113(%423, %424)
+    call @func.74(%423, %424)
     br bb56(%83, %84, %85, %86)
 bb56(%87: ptr, %88: ptr, %89: ptr, %90: ptr):
     %1656 = load i64, ptr %423
@@ -60286,7 +60025,7 @@ bb57(%91: ptr, %92: ptr, %93: ptr, %94: ptr):
     %1754 = load i64, ptr %1751
     store i64 %1754, ptr %1753
     %1755 = load ptr, ptr %385
-    call @func.154(%427, %91, %422, %1755)
+    call @func.131(%427, %91, %422, %1755)
     br bb59(%91, %92, %93, %94, %1708)
 bb58:
     %1756 = const i64 8
@@ -60317,7 +60056,7 @@ bb58:
     %1777 = gep i8, ptr %425, %1776
     %1778 = load i64, ptr %1775
     store i64 %1778, ptr %1777
-    call @func.114(%0, %425)
+    call @func.103(%0, %425)
     br bb176
 bb59(%95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: bool):
     %1779 = load i64, ptr %427
@@ -60490,7 +60229,7 @@ bb60:
     store ptr %1869, ptr %429
     br bb62(%1821)
 bb61(%100: ptr, %101: ptr, %102: ptr, %103: ptr, %104: bool):
-    call @func.83(%432)
+    call @func.77(%432)
     br bb63(%100, %101, %102, %103, %104)
 bb62(%105: bool):
     %1922 = load ptr, ptr %429
@@ -60532,7 +60271,7 @@ bb62(%105: bool):
     br bb174(%105)
 bb63(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: bool):
     %1950 = const bool true
-    %1951 = call @func.115(%108)
+    %1951 = call @func.3(%108)
     br bb64(%106, %107, %108, %109, %1951, %110)
 bb64(%111: ptr, %112: ptr, %113: ptr, %114: ptr, %115: ptr, %116: bool):
     call @func.13(%433, %115)
@@ -60548,7 +60287,7 @@ bb65(%117: ptr, %118: ptr, %119: ptr, %120: ptr, %121: bool):
     store i8 %1957, ptr %1956
     %1958 = const bool false
     %1959 = load ptr, ptr %385
-    call @func.156(%431, %1959, %432, %433, %434)
+    call @func.133(%431, %1959, %432, %433, %434)
     br bb66(%117, %118, %119, %120, %121)
 bb66(%122: ptr, %123: ptr, %124: ptr, %125: ptr, %126: bool):
     %1960 = const bool false
@@ -60558,16 +60297,16 @@ bb66(%122: ptr, %123: ptr, %124: ptr, %125: ptr, %126: bool):
     br bb67(%122, %123, %124, %1963, %126)
 bb67(%127: ptr, %128: ptr, %129: ptr, %130: ptr, %131: bool):
     %1964 = load u64, ptr %431
-    call @func.157(%435, %127, %130, %1964)
+    call @func.134(%435, %127, %130, %1964)
     br bb68(%127, %128, %129, %131)
 bb68(%132: ptr, %133: ptr, %134: ptr, %135: bool):
     %1965 = load ptr, ptr %385
-    call @func.117(%436, %132, %435, %1965)
+    call @func.104(%436, %132, %435, %1965)
     br bb69(%133, %134, %135)
 bb69(%136: ptr, %137: ptr, %138: bool):
     %1966 = const bool true
     %1967 = load ptr, ptr %385
-    call @func.159(%1967)
+    call @func.136(%1967)
     br bb70(%136, %137, %138)
 bb70(%139: ptr, %140: ptr, %141: bool):
     %1968 = const bool false
@@ -60627,7 +60366,7 @@ bb70(%139: ptr, %140: ptr, %141: bool):
     %2013 = gep i8, ptr %439, %2012
     %2014 = load i64, ptr %2011
     store i64 %2014, ptr %2013
-    call @func.113(%438, %439)
+    call @func.74(%438, %439)
     br bb71(%139, %140, %141)
 bb71(%142: ptr, %143: ptr, %144: bool):
     %2015 = load i64, ptr %438
@@ -60751,7 +60490,7 @@ bb72(%145: ptr, %146: ptr):
     %2112 = load i64, ptr %2109
     store i64 %2112, ptr %2111
     %2113 = load u64, ptr %431
-    call @func.167(%442, %437, %2113)
+    call @func.144(%442, %437, %2113)
     br bb75(%145, %146)
 bb73(%147: bool):
     %2114 = const i64 8
@@ -60782,7 +60521,7 @@ bb73(%147: bool):
     %2135 = gep i8, ptr %440, %2134
     %2136 = load i64, ptr %2133
     store i64 %2136, ptr %2135
-    call @func.114(%0, %440)
+    call @func.103(%0, %440)
     br bb74(%147)
 bb74(%148: bool):
     %2137 = const bool false
@@ -60797,7 +60536,7 @@ bb75(%149: ptr, %150: ptr):
     %2143 = gep i8, ptr %445, %2142
     %2144 = load i8, ptr %2141
     store i8 %2144, ptr %2143
-    call @func.116(%446, %150)
+    call @func.54(%446, %150)
     br bb76
 bb76:
     %2145 = const bool false
@@ -60946,7 +60685,7 @@ bb77:
     store ptr %2257, ptr %2259
     %2260 = const i64 9
     store i64 %2260, ptr %444
-    call @func.49(%443, %444)
+    call @func.44(%443, %444)
     br bb78
 bb78:
     %2261 = load i64, ptr %443
@@ -61019,10 +60758,10 @@ bb82:
     br bb180
 bb83(%151: ptr, %152: ptr, %153: ptr, %154: ptr, %155: ptr):
     %2310 = load ptr, ptr %385
-    call @func.117(%451, %151, %155, %2310)
+    call @func.104(%451, %151, %155, %2310)
     br bb84(%151, %152, %153, %154)
 bb84(%156: ptr, %157: ptr, %158: ptr, %159: ptr):
-    call @func.113(%450, %451)
+    call @func.74(%450, %451)
     br bb85(%156, %157, %158, %159)
 bb85(%160: ptr, %161: ptr, %162: ptr, %163: ptr):
     %2311 = load i64, ptr %450
@@ -61147,7 +60886,7 @@ bb86(%164: ptr, %165: ptr, %166: ptr, %167: ptr):
     %2409 = load i64, ptr %2406
     store i64 %2409, ptr %2408
     %2410 = load ptr, ptr %385
-    call @func.154(%454, %164, %449, %2410)
+    call @func.131(%454, %164, %449, %2410)
     br bb88(%164, %165, %166, %167, %2363)
 bb87:
     %2411 = const i64 8
@@ -61178,7 +60917,7 @@ bb87:
     %2432 = gep i8, ptr %452, %2431
     %2433 = load i64, ptr %2430
     store i64 %2433, ptr %2432
-    call @func.114(%0, %452)
+    call @func.103(%0, %452)
     br bb173
 bb88(%168: ptr, %169: ptr, %170: ptr, %171: ptr, %172: bool):
     store ptr %454, ptr %456
@@ -61356,11 +61095,11 @@ bb90(%173: ptr, %174: ptr, %175: ptr, %176: ptr, %177: bool):
     %2578 = load ptr, ptr %456
     %2579 = const i64 8
     %2580 = gep i8, ptr %2578, %2579
-    call @func.95(%455, %2580)
+    call @func.87(%455, %2580)
     br bb91(%173, %174, %175, %176, %177)
 bb91(%178: ptr, %179: ptr, %180: ptr, %181: ptr, %182: bool):
     %2581 = const bool true
-    call @func.83(%461)
+    call @func.77(%461)
     br bb93(%178, %179, %180, %181, %182)
 bb92(%183: bool):
     %2582 = load ptr, ptr %458
@@ -61402,7 +61141,7 @@ bb92(%183: bool):
     br bb171(%183)
 bb93(%184: ptr, %185: ptr, %186: ptr, %187: ptr, %188: bool):
     %2610 = const bool true
-    %2611 = call @func.115(%186)
+    %2611 = call @func.3(%186)
     br bb94(%184, %185, %187, %2611, %188)
 bb94(%189: ptr, %190: ptr, %191: ptr, %192: ptr, %193: bool):
     call @func.13(%462, %192)
@@ -61418,7 +61157,7 @@ bb95(%194: ptr, %195: ptr, %196: ptr, %197: bool):
     store i8 %2617, ptr %2616
     %2618 = const bool false
     %2619 = load ptr, ptr %385
-    call @func.156(%460, %2619, %461, %462, %463)
+    call @func.133(%460, %2619, %461, %462, %463)
     br bb96(%194, %196, %197)
 bb96(%198: ptr, %199: ptr, %200: bool):
     %2620 = const bool false
@@ -61428,16 +61167,16 @@ bb96(%198: ptr, %199: ptr, %200: bool):
     br bb97(%198, %2623, %200)
 bb97(%201: ptr, %202: ptr, %203: bool):
     %2624 = load u64, ptr %460
-    call @func.157(%464, %201, %202, %2624)
+    call @func.134(%464, %201, %202, %2624)
     br bb98(%201, %203)
 bb98(%204: ptr, %205: bool):
     %2625 = load ptr, ptr %385
-    call @func.117(%465, %204, %464, %2625)
+    call @func.104(%465, %204, %464, %2625)
     br bb99(%204, %205)
 bb99(%206: ptr, %207: bool):
     %2626 = const bool true
     %2627 = load ptr, ptr %385
-    call @func.159(%2627)
+    call @func.136(%2627)
     br bb100(%206, %207)
 bb100(%208: ptr, %209: bool):
     %2628 = const bool false
@@ -61497,7 +61236,7 @@ bb100(%208: ptr, %209: bool):
     %2673 = gep i8, ptr %468, %2672
     %2674 = load i64, ptr %2671
     store i64 %2674, ptr %2673
-    call @func.113(%467, %468)
+    call @func.74(%467, %468)
     br bb101(%208, %209)
 bb101(%210: ptr, %211: bool):
     %2675 = load i64, ptr %467
@@ -61622,7 +61361,7 @@ bb102(%212: ptr, %213: bool):
     %2773 = load i64, ptr %2770
     store i64 %2773, ptr %2772
     %2774 = load ptr, ptr %385
-    call @func.154(%471, %212, %466, %2774)
+    call @func.131(%471, %212, %466, %2774)
     br bb104(%213)
 bb103(%214: bool):
     %2775 = const i64 8
@@ -61653,7 +61392,7 @@ bb103(%214: bool):
     %2796 = gep i8, ptr %469, %2795
     %2797 = load i64, ptr %2794
     store i64 %2797, ptr %2796
-    call @func.114(%0, %469)
+    call @func.103(%0, %469)
     br bb188(%214)
 bb104(%215: bool):
     store ptr %471, ptr %473
@@ -61831,7 +61570,7 @@ bb106:
     %2942 = load ptr, ptr %473
     %2943 = const i64 8
     %2944 = gep i8, ptr %2942, %2943
-    call @func.95(%472, %2944)
+    call @func.87(%472, %2944)
     br bb107
 bb107:
     %2945 = const bool false
@@ -61861,7 +61600,7 @@ bb107:
     %2965 = gep i8, ptr %479, %2964
     %2966 = load i64, ptr %2963
     store i64 %2966, ptr %2965
-    call @func.160(%478, %479, %472)
+    call @func.137(%478, %479, %472)
     br bb109
 bb108(%217: bool):
     %2967 = load ptr, ptr %475
@@ -61978,10 +61717,10 @@ bb115:
     br bb180
 bb116(%218: ptr, %219: ptr, %220: ptr, %221: ptr, %222: ptr, %223: ptr):
     %3045 = load ptr, ptr %385
-    call @func.117(%482, %218, %223, %3045)
+    call @func.104(%482, %218, %223, %3045)
     br bb117(%218, %219, %220, %221, %222)
 bb117(%224: ptr, %225: ptr, %226: ptr, %227: ptr, %228: ptr):
-    call @func.113(%481, %482)
+    call @func.74(%481, %482)
     br bb118(%224, %225, %226, %227, %228)
 bb118(%229: ptr, %230: ptr, %231: ptr, %232: ptr, %233: ptr):
     %3046 = load i64, ptr %481
@@ -62106,7 +61845,7 @@ bb119(%234: ptr, %235: ptr, %236: ptr, %237: ptr, %238: ptr):
     %3144 = load i64, ptr %3141
     store i64 %3144, ptr %3143
     %3145 = load ptr, ptr %385
-    call @func.154(%485, %234, %480, %3145)
+    call @func.131(%485, %234, %480, %3145)
     br bb121(%234, %235, %236, %237, %238, %3098)
 bb120:
     %3146 = const i64 8
@@ -62137,7 +61876,7 @@ bb120:
     %3167 = gep i8, ptr %483, %3166
     %3168 = load i64, ptr %3165
     store i64 %3168, ptr %3167
-    call @func.114(%0, %483)
+    call @func.103(%0, %483)
     br bb168
 bb121(%239: ptr, %240: ptr, %241: ptr, %242: ptr, %243: ptr, %244: bool):
     %3169 = load i64, ptr %485
@@ -62354,10 +62093,10 @@ bb124(%251: bool):
     br bb166(%251)
 bb125(%252: ptr, %253: ptr, %254: ptr, %255: ptr, %256: ptr, %257: ptr, %258: bool):
     %3343 = load ptr, ptr %385
-    call @func.117(%491, %252, %257, %3343)
+    call @func.104(%491, %252, %257, %3343)
     br bb126(%252, %253, %254, %255, %256, %258)
 bb126(%259: ptr, %260: ptr, %261: ptr, %262: ptr, %263: ptr, %264: bool):
-    call @func.113(%490, %491)
+    call @func.74(%490, %491)
     br bb127(%259, %260, %261, %262, %263, %264)
 bb127(%265: ptr, %266: ptr, %267: ptr, %268: ptr, %269: ptr, %270: bool):
     %3344 = load i64, ptr %490
@@ -62514,19 +62253,19 @@ bb129(%277: bool):
     %3467 = gep i8, ptr %492, %3466
     %3468 = load i64, ptr %3465
     store i64 %3468, ptr %3467
-    call @func.114(%0, %492)
+    call @func.103(%0, %492)
     br bb189(%277)
 bb130(%278: ptr, %279: ptr, %280: ptr, %281: ptr, %282: ptr, %283: ptr, %284: ptr, %285: bool, %286: bool):
     %3469 = load ptr, ptr %385
-    %3470 = call @func.118(%278, %283, %284, %3469)
+    %3470 = call @func.105(%278, %283, %284, %3469)
     br bb131(%278, %279, %280, %281, %282, %3470, %285, %286)
 bb131(%287: ptr, %288: ptr, %289: ptr, %290: ptr, %291: ptr, %292: bool, %293: bool, %294: bool):
     condbr %292, bb132(%287, %288, %289, %290, %291, %293, %294), bb133(%289, %294)
 bb132(%295: ptr, %296: ptr, %297: ptr, %298: ptr, %299: ptr, %300: bool, %301: bool):
-    call @func.66(%500, %296)
+    call @func.60(%500, %296)
     br bb138(%295, %297, %298, %299, %300, %301)
 bb133(%302: ptr, %303: bool):
-    %3471 = call @func.115(%302)
+    %3471 = call @func.3(%302)
     br bb134(%3471, %303)
 bb134(%304: ptr, %305: bool):
     call @func.13(%496, %304)
@@ -62770,14 +62509,14 @@ bb137(%308: bool, %309: bool):
     br bb183(%308, %309)
 bb138(%310: ptr, %311: ptr, %312: ptr, %313: ptr, %314: bool, %315: bool):
     %3658 = const bool true
-    %3659 = call @func.115(%311)
+    %3659 = call @func.3(%311)
     br bb139(%310, %312, %313, %3659, %314, %315)
 bb139(%316: ptr, %317: ptr, %318: ptr, %319: ptr, %320: bool, %321: bool):
     call @func.13(%501, %319)
     br bb140(%316, %317, %318, %320, %321)
 bb140(%322: ptr, %323: ptr, %324: ptr, %325: bool, %326: bool):
     %3660 = const bool true
-    %3661 = call @func.115(%323)
+    %3661 = call @func.3(%323)
     br bb141(%322, %323, %324, %3661, %325, %326)
 bb141(%327: ptr, %328: ptr, %329: ptr, %330: ptr, %331: bool, %332: bool):
     call @func.13(%502, %330)
@@ -62786,7 +62525,7 @@ bb142(%333: ptr, %334: ptr, %335: ptr, %336: bool, %337: bool):
     %3662 = const bool false
     %3663 = const bool false
     %3664 = load ptr, ptr %385
-    call @func.169(%499, %3664, %500, %501, %502)
+    call @func.145(%499, %3664, %500, %501, %502)
     br bb143(%333, %334, %335, %336, %337)
 bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     %3665 = const bool false
@@ -62797,16 +62536,16 @@ bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     br bb144(%338, %339, %3669, %341, %342)
 bb144(%343: ptr, %344: ptr, %345: ptr, %346: bool, %347: bool):
     %3670 = load u64, ptr %499
-    call @func.157(%503, %343, %345, %3670)
+    call @func.134(%503, %343, %345, %3670)
     br bb145(%343, %344, %346, %347)
 bb145(%348: ptr, %349: ptr, %350: bool, %351: bool):
     %3671 = load ptr, ptr %385
-    call @func.117(%504, %348, %503, %3671)
+    call @func.104(%504, %348, %503, %3671)
     br bb146(%349, %350, %351)
 bb146(%352: ptr, %353: bool, %354: bool):
     %3672 = const bool true
     %3673 = load ptr, ptr %385
-    call @func.159(%3673)
+    call @func.136(%3673)
     br bb147(%352, %353, %354)
 bb147(%355: ptr, %356: bool, %357: bool):
     %3674 = const bool false
@@ -62866,7 +62605,7 @@ bb147(%355: ptr, %356: bool, %357: bool):
     %3719 = gep i8, ptr %507, %3718
     %3720 = load i64, ptr %3717
     store i64 %3720, ptr %3719
-    call @func.113(%506, %507)
+    call @func.74(%506, %507)
     br bb148(%355, %356, %357)
 bb148(%358: ptr, %359: bool, %360: bool):
     %3721 = load i64, ptr %506
@@ -63022,14 +62761,14 @@ bb150(%362: bool, %363: bool):
     %3843 = gep i8, ptr %508, %3842
     %3844 = load i64, ptr %3841
     store i64 %3844, ptr %3843
-    call @func.114(%0, %508)
+    call @func.103(%0, %508)
     br bb151(%362, %363)
 bb151(%364: bool, %365: bool):
     %3845 = const bool false
     br bb183(%364, %365)
 bb152(%366: ptr, %367: ptr):
     %3846 = load u64, ptr %499
-    call @func.170(%510, %366, %3846, %367)
+    call @func.146(%510, %366, %3846, %367)
     br bb153
 bb153:
     %3847 = load i64, ptr %510
@@ -63103,16 +62842,16 @@ bb158:
     %3895 = const bool false
     br bb180
 bb159:
-    call @func.171(%513)
+    call @func.147(%513)
     br bb162
 bb160:
-    call @func.172(%512)
+    call @func.148(%512)
     br bb161
 bb161:
-    call @func.51(%511, %512)
+    call @func.45(%511, %512)
     br bb163
 bb162:
-    call @func.51(%511, %513)
+    call @func.45(%511, %513)
     br bb163
 bb163:
     %3896 = load i64, ptr %511
@@ -63174,7 +62913,7 @@ bb163:
     br bb180
 bb164(%368: ptr, %369: ptr):
     %3942 = load ptr, ptr %385
-    call @func.117(%0, %368, %369, %3942)
+    call @func.104(%0, %368, %369, %3942)
     br bb180
 bb165(%370: bool):
     %3943 = const bool false
@@ -63239,7 +62978,7 @@ bb189(%383: bool):
 
 fn @Verifier____env___is_def_eq_blind(functy.118) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.177(%0, %1, %2, %3)
+    %5 = call @func.152(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
@@ -63450,7 +63189,7 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     %12 = const i64 32
     %13 = gep i8, ptr %1, %12
     %14 = load u64, ptr %13
-    %15 = call @func.127(%14, %2)
+    %15 = call @func.114(%14, %2)
     br bb1(%2, %15)
 bb1(%3: u64, %4: u64):
     %16 = const bool false
@@ -63577,13 +63316,13 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     br bb1
 bb1:
     %20 = const u64 11
-    %21 = call @func.180(%7, %20)
+    %21 = call @func.154(%7, %20)
     br bb2(%21)
 bb2(%3: u64):
     %22 = const i64 32
     %23 = gep i8, ptr %1, %22
     %24 = load u64, ptr %23
-    %25 = call @func.127(%24, %3)
+    %25 = call @func.114(%24, %3)
     br bb3(%25)
 bb3(%4: u64):
     %26 = const bool false
@@ -63652,7 +63391,7 @@ bb3(%4: u64):
     store ptr %49, ptr %9
     br bb4(%4)
 bb4(%5: u64):
-    call @func.121(%11, %2)
+    call @func.108(%11, %2)
     br bb5(%5)
 bb5(%6: u64):
     %77 = load ptr, ptr %9
@@ -63700,13 +63439,13 @@ bb5(%6: u64):
 fn @hash_lit(functy.123) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.181(%3)
+    call @func.155(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.185(%1, %3)
+    call @func.159(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.186(%3)
+    %4 = call @func.160(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -63715,13 +63454,13 @@ bb3(%2: u64):
 fn @hash_name(functy.124) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.181(%3)
+    call @func.155(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.188(%1, %3)
+    call @func.161(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.186(%3)
+    %4 = call @func.160(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -63730,13 +63469,13 @@ bb3(%2: u64):
 fn @hash_level(functy.125) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.181(%3)
+    call @func.155(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.192(%1, %3)
+    call @func.165(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.186(%3)
+    %4 = call @func.160(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -63748,7 +63487,7 @@ fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.126) {
 fn @mix_hash(functy.127) {
 bb0(%0: u64, %1: u64):
     %8 = const u64 14313749767032793493
-    %9 = call @func.126(%1, %8)
+    %9 = call @func.113(%1, %8)
     br bb1(%0, %9)
 bb1(%2: u64, %3: u64):
     %10 = const u32 47
@@ -63764,7 +63503,7 @@ bb2(%4: u64, %5: u64, %6: u64):
     %18 = xor u64 %16, %17
     %19 = xor u64 %4, %18
     %20 = const u64 14313749767032793493
-    %21 = call @func.126(%19, %20)
+    %21 = call @func.113(%19, %20)
     br bb3(%21)
 bb3(%7: u64):
     ret %7
@@ -63772,13 +63511,10 @@ bb4:
     unreachable
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.128) {
-}
-
 fn @ExprMeta__pack(functy.129) {
 bb0(%0: ptr, %1: u32, %2: u32, %3: u32, %4: bool, %5: bool, %6: bool, %7: bool):
     %42 = const u32 255
-    %43 = call @func.128(%3, %42)
+    %43 = call @func.82(%3, %42)
     br bb1(%1, %2, %4, %5, %6, %7, %43)
 bb1(%8: u32, %9: u32, %10: bool, %11: bool, %12: bool, %13: bool, %14: u32):
     %44 = zext u32 %8 to u64
@@ -63868,9 +63604,6 @@ bb0(%0: ptr, %1: ptr):
 fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.131) {
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.132) {
-}
-
 fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.133) {
 }
 
@@ -63882,14 +63615,14 @@ bb0(%0: ptr, %1: u64, %2: u64):
     store u64 %1, ptr %28
     store u64 %2, ptr %29
     %31 = load u64, ptr %28
-    %32 = call @func.148(%31)
+    %32 = call @func.126(%31)
     br bb1(%32)
 bb1(%3: u8):
     %33 = load u64, ptr %29
-    %34 = call @func.148(%33)
+    %34 = call @func.126(%33)
     br bb2(%3, %34)
 bb2(%4: u8, %5: u8):
-    %35 = call @func.131(%4, %5)
+    %35 = call @func.117(%4, %5)
     br bb3(%35)
 bb3(%6: u8):
     %36 = zext u8 %6 to u32
@@ -63908,23 +63641,23 @@ bb3(%6: u8):
 bb4:
     %47 = load u32, ptr %30
     %48 = const u32 255
-    %49 = call @func.132(%47, %48)
+    %49 = call @func.82(%47, %48)
     br bb5(%49)
 bb5(%7: u32):
     %50 = load u64, ptr %28
-    %51 = call @func.150(%50)
+    %51 = call @func.128(%50)
     br bb6(%7, %51)
 bb6(%8: u32, %9: u32):
     %52 = load u64, ptr %29
-    %53 = call @func.150(%52)
+    %53 = call @func.128(%52)
     br bb7(%8, %9, %53)
 bb7(%10: u32, %11: u32, %12: u32):
-    %54 = call @func.133(%11, %12)
+    %54 = call @func.118(%11, %12)
     br bb8(%10, %54)
 bb8(%13: u32, %14: u32):
     %55 = load u64, ptr %28
     %56 = load u64, ptr %29
-    %57 = call @func.127(%55, %56)
+    %57 = call @func.114(%55, %56)
     br bb9(%13, %14, %57)
 bb9(%15: u32, %16: u32, %17: u64):
     %58 = trunc u64 %17 to u32
@@ -63969,16 +63702,7 @@ bb13:
     unreachable
 }
 
-fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.135) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.136) {
-}
-
 fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.137) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.138) {
 }
 
 fn @ExprMeta__mk_binder_meta(functy.139) {
@@ -63989,14 +63713,14 @@ bb0(%0: ptr, %1: u64, %2: u64, %3: u64):
     store u64 %1, ptr %130
     store u64 %2, ptr %131
     %133 = load u64, ptr %130
-    %134 = call @func.148(%133)
+    %134 = call @func.126(%133)
     br bb1(%3, %134)
 bb1(%4: u64, %5: u8):
     %135 = load u64, ptr %131
-    %136 = call @func.148(%135)
+    %136 = call @func.126(%135)
     br bb2(%4, %5, %136)
 bb2(%6: u64, %7: u8, %8: u8):
-    %137 = call @func.135(%7, %8)
+    %137 = call @func.117(%7, %8)
     br bb3(%6, %137)
 bb3(%9: u64, %10: u8):
     %138 = zext u8 %10 to u32
@@ -64015,47 +63739,47 @@ bb3(%9: u64, %10: u8):
 bb4(%11: u64):
     %149 = load u32, ptr %132
     %150 = const u32 255
-    %151 = call @func.136(%149, %150)
+    %151 = call @func.82(%149, %150)
     br bb5(%11, %151)
 bb5(%12: u64, %13: u32):
     %152 = load u64, ptr %131
-    %153 = call @func.150(%152)
+    %153 = call @func.128(%152)
     br bb6(%12, %13, %153)
 bb6(%14: u64, %15: u32, %16: u32):
     %154 = const u32 1
-    %155 = call @func.137(%16, %154)
+    %155 = call @func.120(%16, %154)
     br bb7(%14, %15, %155)
 bb7(%17: u64, %18: u32, %19: u32):
     %156 = load u64, ptr %130
-    %157 = call @func.150(%156)
+    %157 = call @func.128(%156)
     br bb8(%17, %18, %19, %157)
 bb8(%20: u64, %21: u32, %22: u32, %23: u32):
-    %158 = call @func.138(%23, %22)
+    %158 = call @func.118(%23, %22)
     br bb9(%20, %21, %158)
 bb9(%24: u64, %25: u32, %26: u32):
     %159 = zext u32 %25 to u64
     %160 = load u64, ptr %130
-    %161 = call @func.149(%160)
+    %161 = call @func.127(%160)
     br bb10(%24, %25, %26, %159, %161)
 bb10(%27: u64, %28: u32, %29: u32, %30: u64, %31: u32):
     %162 = zext u32 %31 to u64
     %163 = load u64, ptr %131
-    %164 = call @func.149(%163)
+    %164 = call @func.127(%163)
     br bb11(%27, %28, %29, %30, %162, %164)
 bb11(%32: u64, %33: u32, %34: u32, %35: u64, %36: u64, %37: u32):
     %165 = zext u32 %37 to u64
-    %166 = call @func.127(%165, %32)
+    %166 = call @func.114(%165, %32)
     br bb12(%33, %34, %35, %36, %166)
 bb12(%38: u32, %39: u32, %40: u64, %41: u64, %42: u64):
-    %167 = call @func.127(%41, %42)
+    %167 = call @func.114(%41, %42)
     br bb13(%38, %39, %40, %167)
 bb13(%43: u32, %44: u32, %45: u64, %46: u64):
-    %168 = call @func.127(%45, %46)
+    %168 = call @func.114(%45, %46)
     br bb14(%43, %44, %168)
 bb14(%47: u32, %48: u32, %49: u64):
     %169 = trunc u64 %49 to u32
     %170 = load u64, ptr %130
-    %171 = call @func.103(%170)
+    %171 = call @func.95(%170)
     br bb15(%47, %48, %169, %171)
 bb15(%50: u32, %51: u32, %52: u32, %53: bool):
     condbr %53, bb16(%50, %51, %52), bb17(%50, %51, %52)
@@ -64064,11 +63788,11 @@ bb16(%54: u32, %55: u32, %56: u32):
     br bb18(%54, %55, %56, %172)
 bb17(%57: u32, %58: u32, %59: u32):
     %173 = load u64, ptr %131
-    %174 = call @func.103(%173)
+    %174 = call @func.95(%173)
     br bb18(%57, %58, %59, %174)
 bb18(%60: u32, %61: u32, %62: u32, %63: bool):
     %175 = load u64, ptr %130
-    %176 = call @func.101(%175)
+    %176 = call @func.93(%175)
     br bb19(%60, %61, %62, %63, %176)
 bb19(%64: u32, %65: u32, %66: u32, %67: bool, %68: bool):
     condbr %68, bb20(%64, %65, %66, %67), bb21(%64, %65, %66, %67)
@@ -64077,11 +63801,11 @@ bb20(%69: u32, %70: u32, %71: u32, %72: bool):
     br bb22(%69, %70, %71, %72, %177)
 bb21(%73: u32, %74: u32, %75: u32, %76: bool):
     %178 = load u64, ptr %131
-    %179 = call @func.101(%178)
+    %179 = call @func.93(%178)
     br bb22(%73, %74, %75, %76, %179)
 bb22(%77: u32, %78: u32, %79: u32, %80: bool, %81: bool):
     %180 = load u64, ptr %130
-    %181 = call @func.102(%180)
+    %181 = call @func.94(%180)
     br bb23(%77, %78, %79, %80, %81, %181)
 bb23(%82: u32, %83: u32, %84: u32, %85: bool, %86: bool, %87: bool):
     condbr %87, bb24(%82, %83, %84, %85, %86), bb25(%82, %83, %84, %85, %86)
@@ -64090,11 +63814,11 @@ bb24(%88: u32, %89: u32, %90: u32, %91: bool, %92: bool):
     br bb26(%88, %89, %90, %91, %92, %182)
 bb25(%93: u32, %94: u32, %95: u32, %96: bool, %97: bool):
     %183 = load u64, ptr %131
-    %184 = call @func.102(%183)
+    %184 = call @func.94(%183)
     br bb26(%93, %94, %95, %96, %97, %184)
 bb26(%98: u32, %99: u32, %100: u32, %101: bool, %102: bool, %103: bool):
     %185 = load u64, ptr %130
-    %186 = call @func.151(%185)
+    %186 = call @func.129(%185)
     br bb27(%98, %99, %100, %101, %102, %103, %186)
 bb27(%104: u32, %105: u32, %106: u32, %107: bool, %108: bool, %109: bool, %110: bool):
     condbr %110, bb28(%104, %105, %106, %107, %108, %109), bb29(%104, %105, %106, %107, %108, %109)
@@ -64103,10 +63827,10 @@ bb28(%111: u32, %112: u32, %113: u32, %114: bool, %115: bool, %116: bool):
     br bb30(%111, %112, %113, %114, %115, %116, %187)
 bb29(%117: u32, %118: u32, %119: u32, %120: bool, %121: bool, %122: bool):
     %188 = load u64, ptr %131
-    %189 = call @func.151(%188)
+    %189 = call @func.129(%188)
     br bb30(%117, %118, %119, %120, %121, %122, %189)
 bb30(%123: u32, %124: u32, %125: u32, %126: bool, %127: bool, %128: bool, %129: bool):
-    call @func.129(%0, %125, %124, %123, %126, %127, %128, %129)
+    call @func.115(%0, %125, %124, %123, %126, %127, %128, %129)
     br bb31
 bb31:
     ret
@@ -64177,7 +63901,7 @@ bb6:
     %50 = const bool false
     br bb14(%50)
 bb7(%1: ptr):
-    %51 = call @func.141(%1)
+    %51 = call @func.123(%1)
     br bb14(%51)
 bb8(%2: ptr, %3: ptr):
     %52 = load ptr, ptr %2
@@ -64185,7 +63909,7 @@ bb8(%2: ptr, %3: ptr):
     %54 = gep i8, ptr %52, %53
     br bb9(%3, %54)
 bb9(%4: ptr, %5: ptr):
-    %55 = call @func.141(%5)
+    %55 = call @func.123(%5)
     br bb10(%4, %55)
 bb10(%6: ptr, %7: bool):
     condbr %7, bb11, bb12(%6)
@@ -64198,7 +63922,7 @@ bb12(%8: ptr):
     %59 = gep i8, ptr %57, %58
     br bb13(%59)
 bb13(%9: ptr):
-    %60 = call @func.141(%9)
+    %60 = call @func.123(%9)
     br bb14(%60)
 bb14(%10: bool):
     ret %10
@@ -64208,13 +63932,13 @@ fn @hash_levels(functy.142) {
 bb0(%0: ptr):
     %7 = alloca i64, align 8
     %8 = alloca (i64, i64), align 8
-    call @func.181(%7)
+    call @func.155(%7)
     br bb1
 bb1:
     %9 = const i64 8
     %10 = gep i8, ptr %0, %9
     %11 = load u64, ptr %10
-    call @func.194(%7, %11)
+    call @func.166(%7, %11)
     br bb2
 bb2:
     %12 = const u64 0
@@ -64236,7 +63960,7 @@ bb5(%3: u64, %4: u64):
     %22 = const u64 40
     %23 = mul u64 %4, %22
     %24 = gep i8, ptr %21, %23
-    call @func.192(%24, %7)
+    call @func.165(%24, %7)
     br bb6(%3)
 bb6(%5: u64):
     %25 = const u64 1
@@ -64255,24 +63979,12 @@ bb7:
     %35 = load u64, ptr %8
     br bb3(%35)
 bb8:
-    %36 = call @func.186(%7)
+    %36 = call @func.160(%7)
     br bb9(%36)
 bb9(%6: u64):
     ret %6
 bb10:
     unreachable
-}
-
-fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.143) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.144) {
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.145) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.146) {
 }
 
 fn @ExprMeta__mk_let_meta(functy.147) {
@@ -64285,21 +63997,21 @@ bb0(%0: ptr, %1: u64, %2: u64, %3: u64):
     store u64 %2, ptr %176
     store u64 %3, ptr %177
     %179 = load u64, ptr %175
-    %180 = call @func.148(%179)
+    %180 = call @func.126(%179)
     br bb1(%180)
 bb1(%4: u8):
     %181 = load u64, ptr %176
-    %182 = call @func.148(%181)
+    %182 = call @func.126(%181)
     br bb2(%4, %182)
 bb2(%5: u8, %6: u8):
-    %183 = call @func.143(%5, %6)
+    %183 = call @func.117(%5, %6)
     br bb3(%183)
 bb3(%7: u8):
     %184 = load u64, ptr %177
-    %185 = call @func.148(%184)
+    %185 = call @func.126(%184)
     br bb4(%7, %185)
 bb4(%8: u8, %9: u8):
-    %186 = call @func.143(%8, %9)
+    %186 = call @func.117(%8, %9)
     br bb5(%186)
 bb5(%10: u8):
     %187 = zext u8 %10 to u32
@@ -64318,65 +64030,65 @@ bb5(%10: u8):
 bb6:
     %198 = load u32, ptr %178
     %199 = const u32 255
-    %200 = call @func.144(%198, %199)
+    %200 = call @func.82(%198, %199)
     br bb7(%200)
 bb7(%11: u32):
     %201 = load u64, ptr %177
-    %202 = call @func.150(%201)
+    %202 = call @func.128(%201)
     br bb8(%11, %202)
 bb8(%12: u32, %13: u32):
     %203 = const u32 1
-    %204 = call @func.145(%13, %203)
+    %204 = call @func.120(%13, %203)
     br bb9(%12, %204)
 bb9(%14: u32, %15: u32):
     %205 = load u64, ptr %175
-    %206 = call @func.150(%205)
+    %206 = call @func.128(%205)
     br bb10(%14, %15, %206)
 bb10(%16: u32, %17: u32, %18: u32):
     %207 = load u64, ptr %176
-    %208 = call @func.150(%207)
+    %208 = call @func.128(%207)
     br bb11(%16, %17, %18, %208)
 bb11(%19: u32, %20: u32, %21: u32, %22: u32):
-    %209 = call @func.146(%21, %22)
+    %209 = call @func.118(%21, %22)
     br bb12(%19, %20, %209)
 bb12(%23: u32, %24: u32, %25: u32):
-    %210 = call @func.146(%25, %24)
+    %210 = call @func.118(%25, %24)
     br bb13(%23, %210)
 bb13(%26: u32, %27: u32):
     %211 = zext u32 %26 to u64
     %212 = load u64, ptr %175
-    %213 = call @func.149(%212)
+    %213 = call @func.127(%212)
     br bb14(%26, %27, %211, %213)
 bb14(%28: u32, %29: u32, %30: u64, %31: u32):
     %214 = zext u32 %31 to u64
     %215 = load u64, ptr %176
-    %216 = call @func.149(%215)
+    %216 = call @func.127(%215)
     br bb15(%28, %29, %30, %214, %216)
 bb15(%32: u32, %33: u32, %34: u64, %35: u64, %36: u32):
     %217 = zext u32 %36 to u64
     %218 = load u64, ptr %177
-    %219 = call @func.149(%218)
+    %219 = call @func.127(%218)
     br bb16(%32, %33, %34, %35, %217, %219)
 bb16(%37: u32, %38: u32, %39: u64, %40: u64, %41: u64, %42: u32):
     %220 = zext u32 %42 to u64
-    %221 = call @func.127(%41, %220)
+    %221 = call @func.114(%41, %220)
     br bb17(%37, %38, %39, %40, %221)
 bb17(%43: u32, %44: u32, %45: u64, %46: u64, %47: u64):
-    %222 = call @func.127(%46, %47)
+    %222 = call @func.114(%46, %47)
     br bb18(%43, %44, %45, %222)
 bb18(%48: u32, %49: u32, %50: u64, %51: u64):
-    %223 = call @func.127(%50, %51)
+    %223 = call @func.114(%50, %51)
     br bb19(%48, %49, %223)
 bb19(%52: u32, %53: u32, %54: u64):
     %224 = trunc u64 %54 to u32
     %225 = load u64, ptr %175
-    %226 = call @func.103(%225)
+    %226 = call @func.95(%225)
     br bb20(%52, %53, %224, %226)
 bb20(%55: u32, %56: u32, %57: u32, %58: bool):
     condbr %58, bb23(%55, %56, %57), bb21(%55, %56, %57)
 bb21(%59: u32, %60: u32, %61: u32):
     %227 = load u64, ptr %176
-    %228 = call @func.103(%227)
+    %228 = call @func.95(%227)
     br bb22(%59, %60, %61, %228)
 bb22(%62: u32, %63: u32, %64: u32, %65: bool):
     condbr %65, bb23(%62, %63, %64), bb24(%62, %63, %64)
@@ -64385,17 +64097,17 @@ bb23(%66: u32, %67: u32, %68: u32):
     br bb25(%66, %67, %68, %229)
 bb24(%69: u32, %70: u32, %71: u32):
     %230 = load u64, ptr %177
-    %231 = call @func.103(%230)
+    %231 = call @func.95(%230)
     br bb25(%69, %70, %71, %231)
 bb25(%72: u32, %73: u32, %74: u32, %75: bool):
     %232 = load u64, ptr %175
-    %233 = call @func.101(%232)
+    %233 = call @func.93(%232)
     br bb26(%72, %73, %74, %75, %233)
 bb26(%76: u32, %77: u32, %78: u32, %79: bool, %80: bool):
     condbr %80, bb29(%76, %77, %78, %79), bb27(%76, %77, %78, %79)
 bb27(%81: u32, %82: u32, %83: u32, %84: bool):
     %234 = load u64, ptr %176
-    %235 = call @func.101(%234)
+    %235 = call @func.93(%234)
     br bb28(%81, %82, %83, %84, %235)
 bb28(%85: u32, %86: u32, %87: u32, %88: bool, %89: bool):
     condbr %89, bb29(%85, %86, %87, %88), bb30(%85, %86, %87, %88)
@@ -64404,17 +64116,17 @@ bb29(%90: u32, %91: u32, %92: u32, %93: bool):
     br bb31(%90, %91, %92, %93, %236)
 bb30(%94: u32, %95: u32, %96: u32, %97: bool):
     %237 = load u64, ptr %177
-    %238 = call @func.101(%237)
+    %238 = call @func.93(%237)
     br bb31(%94, %95, %96, %97, %238)
 bb31(%98: u32, %99: u32, %100: u32, %101: bool, %102: bool):
     %239 = load u64, ptr %175
-    %240 = call @func.102(%239)
+    %240 = call @func.94(%239)
     br bb32(%98, %99, %100, %101, %102, %240)
 bb32(%103: u32, %104: u32, %105: u32, %106: bool, %107: bool, %108: bool):
     condbr %108, bb35(%103, %104, %105, %106, %107), bb33(%103, %104, %105, %106, %107)
 bb33(%109: u32, %110: u32, %111: u32, %112: bool, %113: bool):
     %241 = load u64, ptr %176
-    %242 = call @func.102(%241)
+    %242 = call @func.94(%241)
     br bb34(%109, %110, %111, %112, %113, %242)
 bb34(%114: u32, %115: u32, %116: u32, %117: bool, %118: bool, %119: bool):
     condbr %119, bb35(%114, %115, %116, %117, %118), bb36(%114, %115, %116, %117, %118)
@@ -64423,17 +64135,17 @@ bb35(%120: u32, %121: u32, %122: u32, %123: bool, %124: bool):
     br bb37(%120, %121, %122, %123, %124, %243)
 bb36(%125: u32, %126: u32, %127: u32, %128: bool, %129: bool):
     %244 = load u64, ptr %177
-    %245 = call @func.102(%244)
+    %245 = call @func.94(%244)
     br bb37(%125, %126, %127, %128, %129, %245)
 bb37(%130: u32, %131: u32, %132: u32, %133: bool, %134: bool, %135: bool):
     %246 = load u64, ptr %175
-    %247 = call @func.151(%246)
+    %247 = call @func.129(%246)
     br bb38(%130, %131, %132, %133, %134, %135, %247)
 bb38(%136: u32, %137: u32, %138: u32, %139: bool, %140: bool, %141: bool, %142: bool):
     condbr %142, bb41(%136, %137, %138, %139, %140, %141), bb39(%136, %137, %138, %139, %140, %141)
 bb39(%143: u32, %144: u32, %145: u32, %146: bool, %147: bool, %148: bool):
     %248 = load u64, ptr %176
-    %249 = call @func.151(%248)
+    %249 = call @func.129(%248)
     br bb40(%143, %144, %145, %146, %147, %148, %249)
 bb40(%149: u32, %150: u32, %151: u32, %152: bool, %153: bool, %154: bool, %155: bool):
     condbr %155, bb41(%149, %150, %151, %152, %153, %154), bb42(%149, %150, %151, %152, %153, %154)
@@ -64442,10 +64154,10 @@ bb41(%156: u32, %157: u32, %158: u32, %159: bool, %160: bool, %161: bool):
     br bb43(%156, %157, %158, %159, %160, %161, %250)
 bb42(%162: u32, %163: u32, %164: u32, %165: bool, %166: bool, %167: bool):
     %251 = load u64, ptr %177
-    %252 = call @func.151(%251)
+    %252 = call @func.129(%251)
     br bb43(%162, %163, %164, %165, %166, %167, %252)
 bb43(%168: u32, %169: u32, %170: u32, %171: bool, %172: bool, %173: bool, %174: bool):
-    call @func.129(%0, %170, %169, %168, %171, %172, %173, %174)
+    call @func.115(%0, %170, %169, %168, %171, %172, %173, %174)
     br bb44
 bb44:
     ret
@@ -64526,16 +64238,13 @@ bb2:
     unreachable
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.152) {
-}
-
 fn @ExprMeta__mk_wrapper_meta(functy.153) {
 bb0(%0: ptr, %1: u64, %2: u64):
     %42 = alloca i64, align 8
     %43 = alloca (i32, i32), align 4
     store u64 %1, ptr %42
     %44 = load u64, ptr %42
-    %45 = call @func.148(%44)
+    %45 = call @func.126(%44)
     br bb1(%2, %45)
 bb1(%3: u64, %4: u8):
     %46 = zext u8 %4 to u32
@@ -64554,43 +64263,43 @@ bb1(%3: u64, %4: u8):
 bb2(%5: u64):
     %57 = load u32, ptr %43
     %58 = const u32 255
-    %59 = call @func.152(%57, %58)
+    %59 = call @func.82(%57, %58)
     br bb3(%5, %59)
 bb3(%6: u64, %7: u32):
     %60 = zext u32 %7 to u64
     %61 = load u64, ptr %42
-    %62 = call @func.149(%61)
+    %62 = call @func.127(%61)
     br bb4(%6, %7, %60, %62)
 bb4(%8: u64, %9: u32, %10: u64, %11: u32):
     %63 = zext u32 %11 to u64
-    %64 = call @func.127(%63, %8)
+    %64 = call @func.114(%63, %8)
     br bb5(%9, %10, %64)
 bb5(%12: u32, %13: u64, %14: u64):
-    %65 = call @func.127(%13, %14)
+    %65 = call @func.114(%13, %14)
     br bb6(%12, %65)
 bb6(%15: u32, %16: u64):
     %66 = trunc u64 %16 to u32
     %67 = load u64, ptr %42
-    %68 = call @func.150(%67)
+    %68 = call @func.128(%67)
     br bb7(%15, %66, %68)
 bb7(%17: u32, %18: u32, %19: u32):
     %69 = load u64, ptr %42
-    %70 = call @func.103(%69)
+    %70 = call @func.95(%69)
     br bb8(%17, %18, %19, %70)
 bb8(%20: u32, %21: u32, %22: u32, %23: bool):
     %71 = load u64, ptr %42
-    %72 = call @func.101(%71)
+    %72 = call @func.93(%71)
     br bb9(%20, %21, %22, %23, %72)
 bb9(%24: u32, %25: u32, %26: u32, %27: bool, %28: bool):
     %73 = load u64, ptr %42
-    %74 = call @func.102(%73)
+    %74 = call @func.94(%73)
     br bb10(%24, %25, %26, %27, %28, %74)
 bb10(%29: u32, %30: u32, %31: u32, %32: bool, %33: bool, %34: bool):
     %75 = load u64, ptr %42
-    %76 = call @func.151(%75)
+    %76 = call @func.129(%75)
     br bb11(%29, %30, %31, %32, %33, %34, %76)
 bb11(%35: u32, %36: u32, %37: u32, %38: bool, %39: bool, %40: bool, %41: bool):
-    call @func.129(%0, %36, %37, %35, %38, %39, %40, %41)
+    call @func.115(%0, %36, %37, %35, %38, %39, %40, %41)
     br bb12
 bb12:
     ret
@@ -64600,7 +64309,7 @@ bb13:
 
 fn @Verifier____env___whnf_impl(functy.154) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    call @func.197(%0, %1, %2, %3)
+    call @func.168(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
@@ -64651,7 +64360,7 @@ bb1:
     store u64 %33, ptr %36
     %37 = load ptr, ptr %5
     %38 = load u64, ptr %0
-    call @func.203(%37, %38)
+    call @func.172(%37, %38)
     br bb2
 bb2:
     %39 = load ptr, ptr %5
@@ -64897,7 +64606,7 @@ bb2:
     %236 = gep i8, ptr %231, %235
     %237 = load i8, ptr %234
     store i8 %237, ptr %236
-    call @func.155(%39, %7)
+    call @func.132(%39, %7)
     br bb3
 bb3:
     ret
@@ -64917,10 +64626,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u64):
     store i64 %10, ptr %9
     %11 = const i64 4
     store i64 %11, ptr %7
-    call @func.49(%6, %7)
+    call @func.44(%6, %7)
     br bb1(%2)
 bb1(%4: ptr):
-    call @func.166(%0, %4, %6)
+    call @func.143(%0, %4, %6)
     br bb2
 bb2:
     br bb3
@@ -64937,7 +64646,7 @@ bb0(%0: ptr):
     %2 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     store ptr %0, ptr %1
     %3 = load ptr, ptr %1
-    call @func.158(%2, %3)
+    call @func.135(%2, %3)
     br bb1
 bb1:
     br bb2
@@ -64959,7 +64668,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %52 = const bool false
     %53 = const bool true
     %54 = const bool true
-    %55 = call @func.79(%2)
+    %55 = call @func.73(%2)
     br bb1(%55, %54, %53)
 bb1(%3: bool, %4: bool, %5: bool):
     condbr %3, bb2(%4, %5), bb3(%4, %5)
@@ -64968,7 +64677,7 @@ bb2(%6: bool, %7: bool):
     store i64 %56, ptr %0
     br bb25(%6, %7)
 bb3(%8: bool, %9: bool):
-    %57 = call @func.204(%2)
+    %57 = call @func.173(%2)
     br bb4(%57, %8, %9)
 bb4(%10: bool, %11: bool, %12: bool):
     condbr %10, bb5, bb6(%11, %12)
@@ -65027,10 +64736,10 @@ bb5:
     %100 = gep i8, ptr %44, %99
     %101 = load i64, ptr %98
     store i64 %101, ptr %100
-    call @func.205(%0, %43, %44)
+    call @func.174(%0, %43, %44)
     br bb27(%80, %58)
 bb6(%13: bool, %14: bool):
-    %102 = call @func.79(%1)
+    %102 = call @func.73(%1)
     br bb7(%102, %13, %14)
 bb7(%15: bool, %16: bool, %17: bool):
     condbr %15, bb8(%17), bb9(%16, %17)
@@ -65064,13 +64773,13 @@ bb8(%18: bool):
     store i64 %124, ptr %123
     br bb25(%103, %18)
 bb9(%19: bool, %20: bool):
-    call @func.206(%46)
+    call @func.175(%46)
     br bb10(%1, %19, %20)
 bb10(%21: ptr, %22: bool, %23: bool):
-    call @func.165(%45, %46)
+    call @func.142(%45, %46)
     br bb11(%21, %22, %23)
 bb11(%24: ptr, %25: bool, %26: bool):
-    %125 = call @func.209(%24, %45)
+    %125 = call @func.178(%24, %45)
     br bb12(%125, %25, %26)
 bb12(%27: bool, %28: bool, %29: bool):
     condbr %27, bb13(%29), bb15(%28)
@@ -65108,7 +64817,7 @@ bb14(%31: bool):
 bb15(%32: bool):
     br bb16(%32)
 bb16(%33: bool):
-    %148 = call @func.209(%1, %2)
+    %148 = call @func.178(%1, %2)
     br bb17(%148, %33)
 bb17(%34: bool, %35: bool):
     condbr %34, bb18(%35), bb19
@@ -65169,7 +64878,7 @@ bb19:
     %191 = gep i8, ptr %48, %190
     %192 = load i64, ptr %189
     store i64 %192, ptr %191
-    call @func.85(%47, %48)
+    call @func.79(%47, %48)
     br bb20
 bb20:
     %193 = const bool false
@@ -65199,7 +64908,7 @@ bb20:
     %213 = gep i8, ptr %50, %212
     %214 = load i64, ptr %211
     store i64 %214, ptr %213
-    call @func.85(%49, %50)
+    call @func.79(%49, %50)
     br bb21
 bb21:
     %215 = load ptr, ptr %47
@@ -65233,7 +64942,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %6 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %7 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %8 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.211(%5, %1, %2)
+    call @func.179(%5, %1, %2)
     br bb1(%1)
 bb1(%3: ptr):
     %9 = load i64, ptr %5
@@ -65306,7 +65015,7 @@ bb4(%4: ptr):
     %60 = gep i8, ptr %6, %59
     %61 = load i64, ptr %58
     store i64 %61, ptr %60
-    call @func.212(%7, %4, %6)
+    call @func.180(%7, %4, %6)
     br bb5
 bb5:
     %62 = load i64, ptr %7
@@ -65465,7 +65174,7 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     store ptr %1, ptr %10
     store u64 %2, ptr %11
     %14 = load ptr, ptr %10
-    %15 = call @func.162(%14)
+    %15 = call @func.139(%14)
     br bb1(%15)
 bb1(%3: u64):
     %16 = const u64 0
@@ -65487,20 +65196,20 @@ bb2(%4: u64):
 bb3:
     %28 = load u64, ptr %12
     %29 = load ptr, ptr %10
-    %30 = call @func.163(%29, %28)
+    %30 = call @func.140(%29, %28)
     store ptr %30, ptr %13
     br bb4(%28)
 bb4(%5: u64):
     %31 = load ptr, ptr %13
     %32 = const i64 200
     %33 = gep i8, ptr %31, %32
-    %34 = call @func.213(%33, %11)
+    %34 = call @func.181(%33, %11)
     br bb5(%5, %34)
 bb5(%6: u64, %7: bool):
     condbr %7, bb6(%6), bb1(%6)
 bb6(%8: u64):
     %35 = load ptr, ptr %10
-    %36 = call @func.163(%35, %8)
+    %36 = call @func.140(%35, %8)
     br bb7(%36)
 bb7(%9: ptr):
     store ptr %9, ptr %0
@@ -65518,7 +65227,7 @@ bb10:
 fn @Level__succ(functy.165) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
-    call @func.85(%2, %1)
+    call @func.79(%2, %1)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -65533,7 +65242,7 @@ bb1:
 fn @Expr__instantiate(functy.166) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
     %3 = const u32 0
-    call @func.216(%0, %1, %2, %3)
+    call @func.182(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
@@ -65545,13 +65254,10 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     store u64 %2, ptr %3
     %4 = load u64, ptr %3
     %5 = const u32 0
-    call @func.218(%0, %1, %4, %5)
+    call @func.183(%0, %1, %4, %5)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE4pushBH_(functy.168) {
 }
 
 fn @LocalContext__push_let(functy.169) {
@@ -65600,7 +65306,7 @@ bb1:
     store u64 %38, ptr %41
     %42 = load ptr, ptr %6
     %43 = load u64, ptr %0
-    call @func.203(%42, %43)
+    call @func.172(%42, %43)
     br bb2
 bb2:
     %44 = load ptr, ptr %6
@@ -65960,7 +65666,7 @@ bb3(%5: ptr):
     %333 = gep i8, ptr %328, %332
     %334 = load i8, ptr %331
     store i8 %334, ptr %333
-    call @func.168(%5, %8)
+    call @func.132(%5, %8)
     br bb4
 bb4:
     ret
@@ -65998,7 +65704,7 @@ bb0(%0: ptr, %1: ptr, %2: u64, %3: ptr):
     %97 = const bool false
     %98 = const bool false
     %99 = load ptr, ptr %74
-    %100 = call @func.69(%99)
+    %100 = call @func.63(%99)
     br bb1(%3, %100)
 bb1(%4: ptr, %5: bool):
     condbr %5, bb2(%4), bb3
@@ -66080,7 +65786,7 @@ bb6(%8: ptr):
     %164 = const i64 48
     %165 = gep i8, ptr %163, %164
     %166 = const bool true
-    call @func.66(%89, %159)
+    call @func.60(%89, %159)
     br bb38(%8, %162, %165)
 bb7(%9: ptr):
     %167 = load ptr, ptr %76
@@ -66097,7 +65803,7 @@ bb7(%9: ptr):
     %178 = const i64 64
     %179 = gep i8, ptr %177, %178
     %180 = const bool true
-    call @func.66(%85, %167)
+    call @func.60(%85, %167)
     br bb30(%9, %170, %173, %176, %179)
 bb8(%10: ptr):
     %181 = load ptr, ptr %76
@@ -66158,7 +65864,7 @@ bb11(%13: ptr):
     %226 = load ptr, ptr %76
     %227 = const i64 8
     %228 = gep i8, ptr %226, %227
-    %229 = call @func.213(%228, %75)
+    %229 = call @func.181(%228, %75)
     br bb12(%13, %229)
 bb12(%14: ptr, %15: bool):
     condbr %15, bb13(%14), bb14
@@ -66172,7 +65878,7 @@ bb14:
 bb15(%17: ptr, %18: ptr, %19: ptr):
     %231 = const bool true
     %232 = load u64, ptr %75
-    call @func.170(%77, %19, %232, %17)
+    call @func.146(%77, %19, %232, %17)
     br bb16(%17, %18)
 bb16(%20: ptr, %21: ptr):
     %233 = load ptr, ptr %21
@@ -66181,11 +65887,11 @@ bb16(%20: ptr, %21: ptr):
     br bb17(%20, %235)
 bb17(%22: ptr, %23: ptr):
     %236 = load u64, ptr %75
-    call @func.170(%78, %23, %236, %22)
+    call @func.146(%78, %23, %236, %22)
     br bb18
 bb18:
     %237 = const bool false
-    call @func.56(%0, %77, %78)
+    call @func.50(%0, %77, %78)
     br bb19
 bb19:
     %238 = const bool false
@@ -66193,7 +65899,7 @@ bb19:
 bb20(%24: ptr, %25: ptr, %26: ptr):
     %239 = const bool true
     %240 = load u64, ptr %75
-    call @func.170(%80, %26, %240, %24)
+    call @func.146(%80, %26, %240, %24)
     br bb21(%24, %25)
 bb21(%27: ptr, %28: ptr):
     %241 = load ptr, ptr %28
@@ -66202,7 +65908,7 @@ bb21(%27: ptr, %28: ptr):
     br bb22(%27, %243)
 bb22(%29: ptr, %30: ptr):
     %244 = load u64, ptr %75
-    call @func.170(%81, %30, %244, %29)
+    call @func.146(%81, %30, %244, %29)
     br bb23
 bb23:
     %245 = const bool false
@@ -66214,7 +65920,7 @@ bb24:
 bb25(%31: ptr, %32: ptr, %33: ptr):
     %247 = const bool true
     %248 = load u64, ptr %75
-    call @func.170(%83, %33, %248, %31)
+    call @func.146(%83, %33, %248, %31)
     br bb26(%31, %32)
 bb26(%34: ptr, %35: ptr):
     %249 = load ptr, ptr %35
@@ -66223,11 +65929,11 @@ bb26(%34: ptr, %35: ptr):
     br bb27(%34, %251)
 bb27(%36: ptr, %37: ptr):
     %252 = load u64, ptr %75
-    call @func.170(%84, %37, %252, %36)
+    call @func.146(%84, %37, %252, %36)
     br bb28
 bb28:
     %253 = const bool false
-    call @func.53(%0, %82, %83, %84)
+    call @func.47(%0, %82, %83, %84)
     br bb29
 bb29:
     %254 = const bool false
@@ -66239,7 +65945,7 @@ bb30(%38: ptr, %39: ptr, %40: ptr, %41: ptr, %42: ptr):
     br bb31(%38, %40, %41, %42, %257)
 bb31(%43: ptr, %44: ptr, %45: ptr, %46: ptr, %47: ptr):
     %258 = load u64, ptr %75
-    call @func.170(%86, %47, %258, %43)
+    call @func.146(%86, %47, %258, %43)
     br bb32(%43, %44, %45, %46)
 bb32(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
     %259 = const bool true
@@ -66249,7 +65955,7 @@ bb32(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
     br bb33(%48, %50, %51, %262)
 bb33(%52: ptr, %53: ptr, %54: ptr, %55: ptr):
     %263 = load u64, ptr %75
-    call @func.170(%87, %55, %263, %52)
+    call @func.146(%87, %55, %263, %52)
     br bb34(%52, %53, %54)
 bb34(%56: ptr, %57: ptr, %58: ptr):
     %264 = const bool true
@@ -66259,14 +65965,14 @@ bb34(%56: ptr, %57: ptr, %58: ptr):
     br bb35(%56, %58, %267)
 bb35(%59: ptr, %60: ptr, %61: ptr):
     %268 = load u64, ptr %75
-    call @func.170(%88, %61, %268, %59)
+    call @func.146(%88, %61, %268, %59)
     br bb36(%60)
 bb36(%62: ptr):
     %269 = load bool, ptr %62
     %270 = const bool false
     %271 = const bool false
     %272 = const bool false
-    call @func.55(%0, %85, %86, %87, %88, %269)
+    call @func.49(%0, %85, %86, %87, %88, %269)
     br bb37
 bb37:
     %273 = const bool false
@@ -66281,21 +65987,21 @@ bb38(%63: ptr, %64: ptr, %65: ptr):
     br bb39(%63, %276, %279)
 bb39(%66: ptr, %67: u32, %68: ptr):
     %280 = load u64, ptr %75
-    call @func.170(%90, %68, %280, %66)
+    call @func.146(%90, %68, %280, %66)
     br bb40(%67)
 bb40(%69: u32):
     %281 = const bool false
-    call @func.219(%0, %89, %69, %90)
+    call @func.184(%0, %89, %69, %90)
     br bb41
 bb41:
     %282 = const bool false
     br bb44
 bb42(%70: ptr, %71: u32, %72: ptr):
     %283 = load u64, ptr %75
-    call @func.170(%91, %72, %283, %70)
+    call @func.146(%91, %72, %283, %70)
     br bb43(%71)
 bb43(%73: u32):
-    call @func.220(%0, %73, %91)
+    call @func.185(%0, %73, %91)
     br bb44
 bb44:
     ret
@@ -66339,7 +66045,7 @@ bb0(%0: ptr):
     %25 = gep i8, ptr %1, %24
     %26 = const u64 6
     store u64 %26, ptr %25
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -66371,7 +66077,7 @@ bb0(%0: ptr):
     %16 = gep i8, ptr %1, %15
     %17 = const u64 3
     store u64 %17, ptr %16
-    call @func.54(%0, %1)
+    call @func.48(%0, %1)
     br bb1
 bb1:
     ret
@@ -66384,9 +66090,6 @@ fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_de
 }
 
 fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.175) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.176) {
 }
 
 fn @Verifier____env___def_eq_blind_inner(functy.177) {
@@ -66452,11 +66155,11 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %268 = alloca i64, align 8
     store ptr %3, ptr %210
     %269 = load ptr, ptr %210
-    call @func.154(%211, %0, %1, %269)
+    call @func.131(%211, %0, %1, %269)
     br bb1(%0, %2)
 bb1(%4: ptr, %5: ptr):
     %270 = load ptr, ptr %210
-    call @func.154(%212, %4, %5, %270)
+    call @func.131(%212, %4, %5, %270)
     br bb2(%4)
 bb2(%6: ptr):
     %271 = const i64 72
@@ -66464,7 +66167,7 @@ bb2(%6: ptr):
     %273 = load i64, ptr %272
     store i64 %273, ptr %213
     %274 = load u64, ptr %213
-    %275 = call @func.221(%274)
+    %275 = call @func.186(%274)
     br bb3(%6, %275)
 bb3(%7: ptr, %8: u64):
     %276 = const i64 72
@@ -66472,13 +66175,13 @@ bb3(%7: ptr, %8: u64):
     %278 = load i64, ptr %277
     store i64 %278, ptr %214
     %279 = load u64, ptr %214
-    %280 = call @func.221(%279)
+    %280 = call @func.186(%279)
     br bb4(%7, %8, %280)
 bb4(%9: ptr, %10: u64, %11: u64):
     %281 = icmp eq u64 %10, %11
     condbr %281, bb5(%9), bb8(%9)
 bb5(%12: ptr):
-    %282 = call @func.226(%12, %211, %212)
+    %282 = call @func.187(%12, %211, %212)
     br bb6(%12, %282)
 bb6(%13: ptr, %14: bool):
     condbr %14, bb7, bb8(%13)
@@ -66487,7 +66190,7 @@ bb7:
     br bb81(%283)
 bb8(%15: ptr):
     %284 = load ptr, ptr %210
-    call @func.227(%215, %15, %211, %212, %284)
+    call @func.188(%215, %15, %211, %212, %284)
     br bb9(%15)
 bb9(%16: ptr):
     %285 = load i8, ptr %215
@@ -67128,7 +66831,7 @@ bb26(%32: ptr):
     %874 = load ptr, ptr %234
     %875 = const i64 48
     %876 = gep i8, ptr %874, %875
-    %877 = call @func.65(%850, %864)
+    %877 = call @func.59(%850, %864)
     br bb67(%32, %858, %876, %877)
 bb27(%33: ptr):
     %878 = load ptr, ptr %216
@@ -67145,7 +66848,7 @@ bb27(%33: ptr):
     %886 = const i64 8
     %887 = gep i8, ptr %885, %886
     store ptr %887, ptr %224
-    %888 = call @func.173(%223, %224)
+    %888 = call @func.149(%223, %224)
     br bb85(%33, %888)
 bb28(%34: ptr):
     %889 = load ptr, ptr %216
@@ -67318,7 +67021,7 @@ bb32(%38: ptr):
     %1022 = load ptr, ptr %262
     %1023 = const i64 48
     %1024 = gep i8, ptr %1022, %1023
-    %1025 = call @func.65(%1008, %1018)
+    %1025 = call @func.59(%1008, %1018)
     br bb36(%38, %1012, %1024, %1025)
 bb33(%39: ptr):
     %1026 = load ptr, ptr %216
@@ -67333,7 +67036,7 @@ bb33(%39: ptr):
     %1033 = load ptr, ptr %264
     %1034 = const i64 8
     %1035 = gep i8, ptr %1033, %1034
-    %1036 = call @func.228(%39, %1029, %1035)
+    %1036 = call @func.189(%39, %1029, %1035)
     br bb86(%39, %1036)
 bb34(%40: ptr):
     %1037 = load ptr, ptr %216
@@ -67350,7 +67053,7 @@ bb34(%40: ptr):
     %1045 = const i64 8
     %1046 = gep i8, ptr %1044, %1045
     store ptr %1046, ptr %220
-    %1047 = call @func.174(%219, %220)
+    %1047 = call @func.150(%219, %220)
     br bb87(%40, %1047)
 bb35(%41: ptr):
     %1048 = load ptr, ptr %216
@@ -67367,21 +67070,21 @@ bb35(%41: ptr):
     %1056 = const i64 8
     %1057 = gep i8, ptr %1055, %1056
     store ptr %1057, ptr %218
-    %1058 = call @func.175(%217, %218)
+    %1058 = call @func.151(%217, %218)
     br bb88(%41, %1058)
 bb36(%42: ptr, %43: ptr, %44: ptr, %45: bool):
     condbr %45, bb37(%42, %43, %44), bb38(%42)
 bb37(%46: ptr, %47: ptr, %48: ptr):
-    call @func.176(%221, %47)
+    call @func.81(%221, %47)
     br bb39(%46, %48)
 bb38(%49: ptr):
     %1059 = const bool false
     br bb76(%49, %1059)
 bb39(%50: ptr, %51: ptr):
-    call @func.176(%222, %51)
+    call @func.81(%222, %51)
     br bb40(%50)
 bb40(%52: ptr):
-    %1060 = call @func.229(%52, %221, %222)
+    %1060 = call @func.190(%52, %221, %222)
     br bb89(%52, %1060)
 bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1061 = load ptr, ptr %55
@@ -67390,7 +67093,7 @@ bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     br bb42(%53, %54, %56, %57, %1063)
 bb42(%58: ptr, %59: ptr, %60: ptr, %61: ptr, %62: ptr):
     %1064 = load ptr, ptr %210
-    %1065 = call @func.230(%58, %61, %62, %1064)
+    %1065 = call @func.191(%58, %61, %62, %1064)
     br bb43(%58, %59, %60, %1065)
 bb43(%63: ptr, %64: ptr, %65: ptr, %66: bool):
     condbr %66, bb44(%63, %64, %65), bb45(%63)
@@ -67409,7 +67112,7 @@ bb46(%71: ptr, %72: ptr, %73: ptr):
     br bb47(%71, %73, %1072)
 bb47(%74: ptr, %75: ptr, %76: ptr):
     %1073 = load ptr, ptr %210
-    %1074 = call @func.230(%74, %75, %76, %1073)
+    %1074 = call @func.191(%74, %75, %76, %1073)
     br bb90(%74, %1074)
 bb48(%77: ptr, %78: ptr, %79: ptr, %80: ptr, %81: ptr):
     %1075 = load ptr, ptr %78
@@ -67423,7 +67126,7 @@ bb49(%82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     br bb50(%82, %83, %85, %86, %1080)
 bb50(%87: ptr, %88: ptr, %89: ptr, %90: ptr, %91: ptr):
     %1081 = load ptr, ptr %210
-    %1082 = call @func.230(%87, %90, %91, %1081)
+    %1082 = call @func.191(%87, %90, %91, %1081)
     br bb51(%87, %88, %89, %1082)
 bb51(%92: ptr, %93: ptr, %94: ptr, %95: bool):
     condbr %95, bb52(%92, %93, %94), bb53(%92)
@@ -67442,7 +67145,7 @@ bb54(%100: ptr, %101: ptr, %102: ptr):
     br bb55(%100, %102, %1089)
 bb55(%103: ptr, %104: ptr, %105: ptr):
     %1090 = load ptr, ptr %210
-    %1091 = call @func.230(%103, %104, %105, %1090)
+    %1091 = call @func.191(%103, %104, %105, %1090)
     br bb91(%103, %1091)
 bb56(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr, %112: ptr):
     %1092 = load ptr, ptr %109
@@ -67451,7 +67154,7 @@ bb56(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr, %112: ptr
     br bb57(%106, %107, %108, %110, %111, %112, %1094)
 bb57(%113: ptr, %114: ptr, %115: ptr, %116: ptr, %117: ptr, %118: ptr, %119: ptr):
     %1095 = load ptr, ptr %210
-    %1096 = call @func.230(%113, %118, %119, %1095)
+    %1096 = call @func.191(%113, %118, %119, %1095)
     br bb58(%113, %114, %115, %116, %117, %1096)
 bb58(%120: ptr, %121: ptr, %122: ptr, %123: ptr, %124: ptr, %125: bool):
     condbr %125, bb59(%120, %121, %122, %123, %124), bb64(%120)
@@ -67467,7 +67170,7 @@ bb60(%131: ptr, %132: ptr, %133: ptr, %134: ptr, %135: ptr):
     br bb61(%131, %132, %134, %135, %1102)
 bb61(%136: ptr, %137: ptr, %138: ptr, %139: ptr, %140: ptr):
     %1103 = load ptr, ptr %210
-    %1104 = call @func.230(%136, %139, %140, %1103)
+    %1104 = call @func.191(%136, %139, %140, %1103)
     br bb62(%136, %137, %138, %1104)
 bb62(%141: ptr, %142: ptr, %143: ptr, %144: bool):
     condbr %144, bb63(%141, %142, %143), bb64(%141)
@@ -67486,12 +67189,12 @@ bb65(%149: ptr, %150: ptr, %151: ptr):
     br bb66(%149, %151, %1111)
 bb66(%152: ptr, %153: ptr, %154: ptr):
     %1112 = load ptr, ptr %210
-    %1113 = call @func.230(%152, %153, %154, %1112)
+    %1113 = call @func.191(%152, %153, %154, %1112)
     br bb92(%152, %1113)
 bb67(%155: ptr, %156: ptr, %157: ptr, %158: bool):
     condbr %158, bb68(%155, %156, %157), bb71(%155)
 bb68(%159: ptr, %160: ptr, %161: ptr):
-    %1114 = call @func.175(%225, %226)
+    %1114 = call @func.151(%225, %226)
     br bb69(%159, %160, %161, %1114)
 bb69(%162: ptr, %163: ptr, %164: ptr, %165: bool):
     condbr %165, bb70(%162, %163, %164), bb71(%162)
@@ -67510,7 +67213,7 @@ bb72(%170: ptr, %171: ptr, %172: ptr):
     br bb73(%170, %172, %1121)
 bb73(%173: ptr, %174: ptr, %175: ptr):
     %1122 = load ptr, ptr %210
-    %1123 = call @func.230(%173, %174, %175, %1122)
+    %1123 = call @func.191(%173, %174, %175, %1122)
     br bb93(%173, %1123)
 bb74(%176: ptr, %177: ptr, %178: ptr):
     %1124 = load ptr, ptr %177
@@ -67519,7 +67222,7 @@ bb74(%176: ptr, %177: ptr, %178: ptr):
     br bb75(%176, %178, %1126)
 bb75(%179: ptr, %180: ptr, %181: ptr):
     %1127 = load ptr, ptr %210
-    %1128 = call @func.230(%179, %180, %181, %1127)
+    %1128 = call @func.191(%179, %180, %181, %1127)
     br bb94(%179, %1128)
 bb76(%182: ptr, %183: bool):
     condbr %183, bb77, bb78(%182)
@@ -67528,7 +67231,7 @@ bb77:
     br bb81(%1129)
 bb78(%184: ptr):
     %1130 = load ptr, ptr %210
-    %1131 = call @func.231(%184, %211, %212, %1130)
+    %1131 = call @func.192(%184, %211, %212, %1130)
     br bb79(%1131)
 bb79(%185: bool):
     br bb80(%185)
@@ -67564,9 +67267,6 @@ bb94(%208: ptr, %209: bool):
     br bb76(%208, %209)
 }
 
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.178) {
-}
-
 fn @_RNvMs9_NtCs2EYQwhfuABO_4core3numj12wrapping_mul(functy.179) {
 }
 
@@ -67584,7 +67284,7 @@ bb0(%0: ptr, %1: u64):
     %160 = gep i8, ptr %0, %159
     %161 = load u64, ptr %160
     %162 = const u64 14313749767032793493
-    %163 = call @func.178(%161, %162)
+    %163 = call @func.113(%161, %162)
     br bb1(%1, %161, %163)
 bb1(%2: u64, %3: u64, %4: u64):
     %164 = xor u64 %2, %4
@@ -67687,7 +67387,7 @@ bb12(%65: u64, %66: u64, %67: u64, %68: u64, %69: u64, %70: u64):
     br bb6(%65, %66, %67, %68, %69, %70, %234)
 bb13(%71: u64, %72: u64, %73: u64, %74: u64, %75: u64):
     %235 = const u64 14313749767032793493
-    %236 = call @func.178(%75, %235)
+    %236 = call @func.113(%75, %235)
     br bb14(%71, %72, %73, %74, %236)
 bb14(%76: u64, %77: u64, %78: u64, %79: u64, %80: u64):
     %237 = const u32 47
@@ -67701,12 +67401,12 @@ bb15(%81: u64, %82: u64, %83: u64, %84: u64, %85: u64, %86: u64, %87: u32):
     %243 = lshr u64 %86, %242
     %244 = xor u64 %85, %243
     %245 = const u64 14313749767032793493
-    %246 = call @func.178(%244, %245)
+    %246 = call @func.113(%244, %245)
     br bb16(%81, %82, %83, %84, %246)
 bb16(%88: u64, %89: u64, %90: u64, %91: u64, %92: u64):
     %247 = xor u64 %89, %92
     %248 = const u64 14313749767032793493
-    %249 = call @func.178(%247, %248)
+    %249 = call @func.113(%247, %248)
     br bb17(%88, %90, %91, %249)
 bb17(%93: u64, %94: u64, %95: u64, %96: u64):
     %250 = const u64 1
@@ -67768,7 +67468,7 @@ bb23(%113: u64, %114: u64, %115: u64, %116: u64, %117: u64):
 bb24(%118: u64, %119: u64, %120: u64, %121: u64, %122: u64):
     %290 = load u64, ptr %157
     %291 = const u64 8
-    %292 = call @func.179(%290, %291)
+    %292 = call @func.153(%290, %291)
     br bb25(%118, %119, %120, %121, %122, %292)
 bb25(%123: u64, %124: u64, %125: u64, %126: u64, %127: u64, %128: u64):
     %293 = const u64 63
@@ -67799,7 +67499,7 @@ bb28(%138: u64, %139: u64, %140: u64):
     condbr %310, bb29(%139), bb31(%139)
 bb29(%141: u64):
     %311 = const u64 14313749767032793493
-    %312 = call @func.178(%141, %311)
+    %312 = call @func.113(%141, %311)
     br bb30(%312)
 bb30(%142: u64):
     br bb31(%142)
@@ -67815,7 +67515,7 @@ bb32(%144: u64, %145: u64, %146: u32):
     %319 = lshr u64 %145, %318
     %320 = xor u64 %144, %319
     %321 = const u64 14313749767032793493
-    %322 = call @func.178(%320, %321)
+    %322 = call @func.113(%320, %321)
     br bb33(%322)
 bb33(%147: u64):
     %323 = const u32 47
@@ -67858,7 +67558,7 @@ bb0(%0: ptr, %1: ptr):
     %8 = load i32, ptr %7
     %9 = sext i32 %8 to i64
     store i64 %9, ptr %6
-    call @func.182(%6, %1)
+    call @func.156(%6, %1)
     br bb1(%1)
 bb1(%2: ptr):
     %10 = load ptr, ptr %5
@@ -67871,13 +67571,13 @@ bb3(%3: ptr):
     %13 = load ptr, ptr %5
     %14 = const i64 4
     %15 = gep i8, ptr %13, %14
-    call @func.183(%15, %3)
+    call @func.157(%15, %3)
     br bb5
 bb4(%4: ptr):
     %16 = load ptr, ptr %5
     %17 = const i64 8
     %18 = gep i8, ptr %16, %17
-    call @func.184(%18, %4)
+    call @func.158(%18, %4)
     br bb5
 bb5:
     ret
@@ -67889,9 +67589,6 @@ bb0(%0: ptr):
     ret %1
 }
 
-fn @_RINvXsa_NtNtCs2EYQwhfuABO_4core4hash5implsyNtB8_4Hash4hashNtCsep0XPuQfTSm_25clean_binding_defeq_slice10KaniHasherEBW_(functy.187) {
-}
-
 fn @_Name_as_std__hash__Hash___hash(functy.188) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
@@ -67899,7 +67596,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = load ptr, ptr %2
     %4 = const i64 32
     %5 = gep i8, ptr %3, %4
-    call @func.187(%5, %1)
+    call @func.158(%5, %1)
     br bb1
 bb1:
     ret
@@ -67920,10 +67617,10 @@ bb0(%0: ptr, %1: ptr):
     %14 = alloca i64, align 8
     store ptr %0, ptr %13
     %15 = load ptr, ptr %13
-    call @func.189(%14, %15)
+    call @func.162(%14, %15)
     br bb1(%1)
 bb1(%2: ptr):
-    call @func.190(%14, %2)
+    call @func.163(%14, %2)
     br bb2(%2)
 bb2(%3: ptr):
     %16 = load ptr, ptr %13
@@ -67950,7 +67647,7 @@ bb3:
     unreachable
 bb4(%4: ptr):
     %35 = load ptr, ptr %13
-    call @func.188(%35, %4)
+    call @func.161(%35, %4)
     br bb10
 bb5(%5: ptr):
     %36 = load ptr, ptr %13
@@ -67972,19 +67669,16 @@ bb7(%7: ptr):
     %48 = load ptr, ptr %13
     %49 = const i64 8
     %50 = gep i8, ptr %48, %49
-    call @func.191(%50, %7)
+    call @func.164(%50, %7)
     br bb10
 bb8(%8: ptr, %9: ptr, %10: ptr):
-    call @func.191(%9, %8)
+    call @func.164(%9, %8)
     br bb9(%8, %10)
 bb9(%11: ptr, %12: ptr):
-    call @func.191(%12, %11)
+    call @func.164(%12, %11)
     br bb10
 bb10:
     ret
-}
-
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.193) {
 }
 
 fn @_KaniHasher_as_std__hash__Hasher___write_u64(functy.194) {
@@ -67994,14 +67688,11 @@ bb0(%0: ptr, %1: u64):
     store u64 %5, ptr %0
     %6 = load u64, ptr %0
     %7 = const u64 5871781006564002453
-    %8 = call @func.193(%6, %7)
+    %8 = call @func.113(%6, %7)
     br bb1(%0, %8)
 bb1(%2: ptr, %3: u64):
     store u64 %3, ptr %2
     ret
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.195) {
 }
 
 fn @_RNvXs4_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtB7_5clone5Clone5cloneBM_(functy.196) {
@@ -68113,7 +67804,7 @@ bb4(%8: ptr, %9: ptr):
     %192 = load i64, ptr %191
     store i64 %192, ptr %121
     %193 = load u64, ptr %121
-    call @func.164(%120, %9, %193)
+    call @func.141(%120, %9, %193)
     br bb37(%8, %9)
 bb5(%10: ptr, %11: ptr):
     %194 = load ptr, ptr %103
@@ -68122,7 +67813,7 @@ bb5(%10: ptr, %11: ptr):
     %197 = load ptr, ptr %103
     %198 = const i64 48
     %199 = gep i8, ptr %197, %198
-    call @func.211(%117, %10, %196)
+    call @func.179(%117, %10, %196)
     br bb32(%10, %11)
 bb6(%12: ptr, %13: ptr):
     %200 = load ptr, ptr %103
@@ -68148,7 +67839,7 @@ bb7(%14: ptr, %15: ptr):
     br bb8(%14, %15, %214, %217)
 bb8(%16: ptr, %17: ptr, %18: ptr, %19: ptr):
     %218 = const bool true
-    call @func.154(%104, %16, %19, %17)
+    call @func.131(%104, %16, %19, %17)
     br bb9(%16, %17, %18, %218)
 bb9(%20: ptr, %21: ptr, %22: ptr, %23: bool):
     store ptr %104, ptr %105
@@ -68336,15 +68027,15 @@ bb12(%31: ptr, %32: ptr, %33: ptr, %34: ptr, %35: bool):
     %371 = gep i8, ptr %369, %370
     br bb13(%31, %32, %34, %371, %35)
 bb13(%36: ptr, %37: ptr, %38: ptr, %39: ptr, %40: bool):
-    call @func.166(%106, %38, %39)
+    call @func.143(%106, %38, %39)
     br bb14(%36, %37, %40)
 bb14(%41: ptr, %42: ptr, %43: bool):
-    call @func.154(%0, %41, %106, %42)
+    call @func.131(%0, %41, %106, %42)
     br bb15(%43)
 bb15(%44: bool):
     br bb50(%44)
 bb16(%45: ptr, %46: ptr, %47: ptr, %48: bool):
-    call @func.195(%111, %47)
+    call @func.54(%111, %47)
     br bb17(%45, %46, %48)
 bb17(%49: ptr, %50: ptr, %51: bool):
     %372 = load ptr, ptr %109
@@ -68357,10 +68048,10 @@ bb17(%49: ptr, %50: ptr, %51: bool):
     store ptr %375, ptr %377
     %378 = const i64 7
     store i64 %378, ptr %108
-    call @func.49(%107, %108)
+    call @func.44(%107, %108)
     br bb18(%49, %50, %51)
 bb18(%52: ptr, %53: ptr, %54: bool):
-    call @func.232(%112, %52, %107)
+    call @func.193(%112, %52, %107)
     br bb19(%52, %53, %54)
 bb19(%55: ptr, %56: ptr, %57: bool):
     %379 = load i64, ptr %112
@@ -68427,12 +68118,12 @@ bb20(%58: ptr, %59: ptr):
     %429 = gep i8, ptr %113, %428
     %430 = load i64, ptr %427
     store i64 %430, ptr %429
-    call @func.154(%0, %58, %113, %59)
+    call @func.131(%0, %58, %113, %59)
     br bb21
 bb21:
     br bb46
 bb22(%60: ptr, %61: ptr, %62: bool):
-    call @func.233(%114, %60, %107)
+    call @func.194(%114, %60, %107)
     br bb23(%60, %61, %62)
 bb23(%63: ptr, %64: ptr, %65: bool):
     %431 = load i64, ptr %114
@@ -68499,7 +68190,7 @@ bb24(%66: ptr, %67: ptr):
     %481 = gep i8, ptr %115, %480
     %482 = load i64, ptr %479
     store i64 %482, ptr %481
-    call @func.154(%0, %66, %115, %67)
+    call @func.131(%0, %66, %115, %67)
     br bb25
 bb25:
     br bb46
@@ -68570,10 +68261,10 @@ bb28(%69: ptr, %70: ptr, %71: ptr, %72: ptr):
     %532 = gep i8, ptr %530, %531
     br bb29(%69, %70, %72, %532)
 bb29(%73: ptr, %74: ptr, %75: ptr, %76: ptr):
-    call @func.166(%116, %75, %76)
+    call @func.143(%116, %75, %76)
     br bb30(%73, %74)
 bb30(%77: ptr, %78: ptr):
-    call @func.154(%0, %77, %116, %78)
+    call @func.131(%0, %77, %116, %78)
     br bb31
 bb31:
     br bb48
@@ -68648,7 +68339,7 @@ bb35(%81: ptr, %82: ptr):
     %584 = gep i8, ptr %118, %583
     %585 = load i64, ptr %582
     store i64 %585, ptr %584
-    call @func.154(%0, %81, %118, %82)
+    call @func.131(%0, %81, %118, %82)
     br bb36
 bb36:
     br bb48
@@ -68670,7 +68361,7 @@ bb39(%87: ptr, %88: ptr):
     %594 = load ptr, ptr %122
     %595 = const i64 120
     %596 = gep i8, ptr %594, %595
-    call @func.196(%119, %596)
+    call @func.167(%119, %596)
     br bb40(%87, %88)
 bb40(%89: ptr, %90: ptr):
     %597 = load i64, ptr %119
@@ -68741,15 +68432,15 @@ bb42(%91: ptr, %92: ptr):
     %648 = gep i8, ptr %123, %647
     %649 = load i64, ptr %646
     store i64 %649, ptr %648
-    call @func.154(%0, %91, %123, %92)
+    call @func.131(%0, %91, %123, %92)
     br bb43
 bb43:
     br bb48
 bb44(%93: ptr, %94: ptr, %95: ptr, %96: u32, %97: ptr):
-    call @func.236(%0, %93, %95, %96, %97, %94)
+    call @func.197(%0, %93, %95, %96, %97, %94)
     br bb48
 bb45(%98: ptr, %99: ptr, %100: ptr):
-    call @func.154(%0, %98, %100, %99)
+    call @func.131(%0, %98, %100, %99)
     br bb48
 bb46:
     br bb47
@@ -68762,12 +68453,6 @@ bb49:
     br bb27
 bb50(%101: bool):
     condbr %101, bb49, bb27
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3lenBG_(functy.198) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.199) {
 }
 
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdE3lenBG_(functy.200) {
@@ -68795,21 +68480,21 @@ bb0(%0: ptr, %1: u64):
     br bb1(%44, %45)
 bb1(%2: bool, %3: u64):
     %46 = load ptr, ptr %37
-    %47 = call @func.198(%46)
+    %47 = call @func.139(%46)
     br bb2(%2, %3, %3, %47)
 bb2(%4: bool, %5: u64, %6: u64, %7: u64):
     %48 = icmp ult u64 %6, %7
     condbr %48, bb3(%4, %5), bb9(%4)
 bb3(%8: bool, %9: u64):
     %49 = load ptr, ptr %37
-    %50 = call @func.199(%49, %9)
+    %50 = call @func.140(%49, %9)
     store ptr %50, ptr %39
     br bb4(%8, %9)
 bb4(%10: bool, %11: u64):
     %51 = load ptr, ptr %39
     %52 = const i64 200
     %53 = gep i8, ptr %51, %52
-    %54 = call @func.213(%53, %38)
+    %54 = call @func.181(%53, %38)
     br bb5(%10, %11, %54)
 bb5(%12: bool, %13: u64, %14: bool):
     condbr %14, bb6, bb7(%12, %13)
@@ -68866,7 +68551,7 @@ bb13(%19: bool, %20: u64):
     %87 = load ptr, ptr %37
     %88 = const i64 24
     %89 = gep i8, ptr %87, %88
-    %90 = call @func.200(%89)
+    %90 = call @func.169(%89)
     br bb14(%19, %20, %20, %90)
 bb14(%21: bool, %22: u64, %23: u64, %24: u64):
     %91 = icmp ult u64 %23, %24
@@ -68875,10 +68560,10 @@ bb15(%25: bool, %26: u64):
     %92 = load ptr, ptr %37
     %93 = const i64 24
     %94 = gep i8, ptr %92, %93
-    %95 = call @func.201(%94, %26)
+    %95 = call @func.170(%94, %26)
     br bb16(%25, %26, %95)
 bb16(%27: bool, %28: u64, %29: ptr):
-    %96 = call @func.213(%29, %38)
+    %96 = call @func.181(%29, %38)
     br bb17(%27, %28, %96)
 bb17(%30: bool, %31: u64, %32: bool):
     condbr %32, bb18, bb19(%30, %31)
@@ -68932,7 +68617,7 @@ bb24:
     %128 = const i64 24
     %129 = gep i8, ptr %127, %128
     %130 = load u64, ptr %38
-    call @func.202(%129, %130)
+    call @func.171(%129, %130)
     br bb25
 bb25:
     ret
@@ -68992,7 +68677,7 @@ bb5:
     %45 = const bool false
     br bb12(%45)
 bb6(%1: ptr, %2: ptr):
-    %46 = call @func.204(%2)
+    %46 = call @func.173(%2)
     br bb7(%1, %46)
 bb7(%3: ptr, %4: bool):
     condbr %4, bb8, bb9(%3)
@@ -69005,10 +68690,10 @@ bb9(%5: ptr):
     %50 = gep i8, ptr %48, %49
     br bb10(%50)
 bb10(%6: ptr):
-    %51 = call @func.204(%6)
+    %51 = call @func.173(%6)
     br bb12(%51)
 bb11(%7: ptr):
-    %52 = call @func.204(%7)
+    %52 = call @func.173(%7)
     br bb12(%52)
 bb12(%8: bool):
     ret %8
@@ -69024,7 +68709,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %26 = const bool false
     %27 = const bool true
     %28 = const bool true
-    %29 = call @func.209(%1, %2)
+    %29 = call @func.178(%1, %2)
     br bb1(%29, %28, %27)
 bb1(%3: bool, %4: bool, %5: bool):
     condbr %3, bb2(%4), bb3(%4, %5)
@@ -69058,7 +68743,7 @@ bb2(%6: bool):
     store i64 %51, ptr %50
     br bb15(%6, %30)
 bb3(%7: bool, %8: bool):
-    %52 = call @func.79(%1)
+    %52 = call @func.73(%1)
     br bb4(%52, %7, %8)
 bb4(%9: bool, %10: bool, %11: bool):
     condbr %9, bb5(%11), bb6(%10)
@@ -69092,7 +68777,7 @@ bb5(%12: bool):
     store i64 %74, ptr %73
     br bb15(%53, %12)
 bb6(%13: bool):
-    %75 = call @func.79(%2)
+    %75 = call @func.73(%2)
     br bb7(%75, %13)
 bb7(%14: bool, %15: bool):
     condbr %14, bb8(%15), bb9
@@ -69153,7 +68838,7 @@ bb9:
     %118 = gep i8, ptr %22, %117
     %119 = load i64, ptr %116
     store i64 %119, ptr %118
-    call @func.85(%21, %22)
+    call @func.79(%21, %22)
     br bb10
 bb10:
     %120 = const bool false
@@ -69183,7 +68868,7 @@ bb10:
     %140 = gep i8, ptr %24, %139
     %141 = load i64, ptr %138
     store i64 %141, ptr %140
-    call @func.85(%23, %24)
+    call @func.79(%23, %24)
     br bb11
 bb11:
     %142 = load ptr, ptr %21
@@ -69263,7 +68948,7 @@ bb1(%2: ptr, %3: ptr):
     %68 = icmp eq u64 %66, %67
     condbr %68, bb28(%61), bb33
 bb2:
-    call @func.207(%40, %37)
+    call @func.176(%40, %37)
     br bb3
 bb3:
     %69 = load i64, ptr %40
@@ -69429,7 +69114,7 @@ bb11:
     %210 = load ptr, ptr %209
     store ptr %210, ptr %46
     %211 = load ptr, ptr %46
-    %212 = call @func.65(%207, %211)
+    %212 = call @func.59(%207, %211)
     br bb23(%212)
 bb12:
     %213 = load ptr, ptr %41
@@ -69510,7 +69195,7 @@ bb16(%7: ptr, %8: ptr, %9: ptr):
     %269 = const i64 8
     %270 = gep i8, ptr %42, %269
     store ptr %9, ptr %270
-    call @func.208(%7, %42)
+    call @func.177(%7, %42)
     br bb31
 bb17(%10: ptr, %11: ptr, %12: ptr, %13: ptr):
     %271 = load ptr, ptr %10
@@ -69527,7 +69212,7 @@ bb19(%19: ptr, %20: ptr, %21: ptr, %22: ptr, %23: ptr):
     %277 = const i64 8
     %278 = gep i8, ptr %43, %277
     store ptr %23, ptr %278
-    call @func.208(%21, %43)
+    call @func.177(%21, %43)
     br bb20(%19, %20)
 bb20(%24: ptr, %25: ptr):
     %279 = load ptr, ptr %24
@@ -69544,7 +69229,7 @@ bb22(%29: ptr, %30: ptr, %31: ptr):
     %285 = const i64 8
     %286 = gep i8, ptr %44, %285
     store ptr %31, ptr %286
-    call @func.208(%29, %44)
+    call @func.177(%29, %44)
     br bb32
 bb23(%32: bool):
     condbr %32, bb2, bb24
@@ -69598,9 +69283,6 @@ bb32:
     br bb2
 bb33:
     unreachable
-}
-
-fn @_RNvXs4_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtB7_5clone5Clone5cloneBM_(functy.210) {
 }
 
 fn @Verifier____env___unfold_const(functy.211) {
@@ -69664,7 +69346,7 @@ bb3(%11: ptr, %12: ptr, %13: u64, %14: u64, %15: u64):
     %70 = gep i8, ptr %67, %69
     store ptr %70, ptr %28
     %71 = load ptr, ptr %28
-    %72 = call @func.65(%71, %12)
+    %72 = call @func.59(%71, %12)
     br bb4(%11, %12, %13, %14, %72)
 bb4(%16: ptr, %17: ptr, %18: u64, %19: u64, %20: bool):
     condbr %20, bb5, bb6(%16, %17, %18, %19)
@@ -69672,7 +69354,7 @@ bb5:
     %73 = load ptr, ptr %28
     %74 = const i64 40
     %75 = gep i8, ptr %73, %74
-    call @func.210(%0, %75)
+    call @func.167(%0, %75)
     br bb9
 bb6(%21: ptr, %22: ptr, %23: u64, %24: u64):
     %76 = const u64 1
@@ -69703,10 +69385,10 @@ bb10:
 fn @Verifier____env___infer_type_blind(functy.212) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
     %5 = alloca (i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.77(%5)
+    call @func.71(%5)
     br bb1(%1, %2)
 bb1(%3: ptr, %4: ptr):
-    call @func.117(%0, %3, %4, %5)
+    call @func.104(%0, %3, %4, %5)
     br bb2
 bb2:
     br bb3
@@ -69720,12 +69402,6 @@ bb0(%0: ptr, %1: ptr):
     %3 = load u64, ptr %1
     %4 = icmp eq u64 %2, %3
     ret %4
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.214) {
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.215) {
 }
 
 fn @Expr__instantiate_at(functy.216) {
@@ -69755,7 +69431,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32):
     %128 = const bool false
     %129 = const bool false
     %130 = load ptr, ptr %107
-    %131 = call @func.237(%130)
+    %131 = call @func.198(%130)
     br bb1(%2, %3, %131)
 bb1(%4: ptr, %5: u32, %6: u32):
     %132 = icmp uge u32 %5, %6
@@ -69826,7 +69502,7 @@ bb5(%9: ptr, %10: u32):
     %186 = const i64 48
     %187 = gep i8, ptr %185, %186
     %188 = const bool true
-    call @func.66(%121, %181)
+    call @func.60(%121, %181)
     br bb42(%9, %10, %184, %187)
 bb6(%11: ptr, %12: u32):
     %189 = load ptr, ptr %108
@@ -69843,7 +69519,7 @@ bb6(%11: ptr, %12: u32):
     %200 = const i64 64
     %201 = gep i8, ptr %199, %200
     %202 = const bool true
-    call @func.66(%117, %189)
+    call @func.60(%117, %189)
     br bb33(%11, %12, %192, %195, %198, %201)
 bb7(%13: ptr, %14: u32):
     %203 = load ptr, ptr %108
@@ -69909,7 +69585,7 @@ bb10(%19: ptr, %20: u32):
     condbr %252, bb11(%19, %20), bb12(%20, %250)
 bb11(%21: ptr, %22: u32):
     %253 = const u32 0
-    call @func.239(%0, %21, %253, %22)
+    call @func.199(%0, %21, %253, %22)
     br bb46
 bb12(%23: u32, %24: ptr):
     %254 = load u32, ptr %24
@@ -69918,7 +69594,7 @@ bb12(%23: u32, %24: ptr):
 bb13(%25: ptr):
     %256 = load u32, ptr %25
     %257 = const u32 1
-    %258 = call @func.214(%256, %257)
+    %258 = call @func.120(%256, %257)
     br bb14(%258)
 bb14(%26: u32):
     call @func.21(%0, %26)
@@ -69929,7 +69605,7 @@ bb15:
     br bb46
 bb16(%27: ptr, %28: u32, %29: ptr, %30: ptr):
     %260 = const bool true
-    call @func.216(%109, %30, %27, %28)
+    call @func.182(%109, %30, %27, %28)
     br bb17(%27, %28, %29)
 bb17(%31: ptr, %32: u32, %33: ptr):
     %261 = load ptr, ptr %33
@@ -69937,18 +69613,18 @@ bb17(%31: ptr, %32: u32, %33: ptr):
     %263 = gep i8, ptr %261, %262
     br bb18(%31, %32, %263)
 bb18(%34: ptr, %35: u32, %36: ptr):
-    call @func.216(%110, %36, %34, %35)
+    call @func.182(%110, %36, %34, %35)
     br bb19
 bb19:
     %264 = const bool false
-    call @func.56(%0, %109, %110)
+    call @func.50(%0, %109, %110)
     br bb20
 bb20:
     %265 = const bool false
     br bb46
 bb21(%37: ptr, %38: u32, %39: ptr, %40: ptr):
     %266 = const bool true
-    call @func.216(%112, %40, %37, %38)
+    call @func.182(%112, %40, %37, %38)
     br bb22(%37, %38, %39)
 bb22(%41: ptr, %42: u32, %43: ptr):
     %267 = load ptr, ptr %43
@@ -69957,10 +69633,10 @@ bb22(%41: ptr, %42: u32, %43: ptr):
     br bb23(%41, %42, %269)
 bb23(%44: ptr, %45: u32, %46: ptr):
     %270 = const u32 1
-    %271 = call @func.215(%45, %270)
+    %271 = call @func.80(%45, %270)
     br bb24(%44, %46, %271)
 bb24(%47: ptr, %48: ptr, %49: u32):
-    call @func.216(%113, %48, %47, %49)
+    call @func.182(%113, %48, %47, %49)
     br bb25
 bb25:
     %272 = const bool false
@@ -69971,7 +69647,7 @@ bb26:
     br bb46
 bb27(%50: ptr, %51: u32, %52: ptr, %53: ptr):
     %274 = const bool true
-    call @func.216(%115, %53, %50, %51)
+    call @func.182(%115, %53, %50, %51)
     br bb28(%50, %51, %52)
 bb28(%54: ptr, %55: u32, %56: ptr):
     %275 = load ptr, ptr %56
@@ -69980,14 +69656,14 @@ bb28(%54: ptr, %55: u32, %56: ptr):
     br bb29(%54, %55, %277)
 bb29(%57: ptr, %58: u32, %59: ptr):
     %278 = const u32 1
-    %279 = call @func.215(%58, %278)
+    %279 = call @func.80(%58, %278)
     br bb30(%57, %59, %279)
 bb30(%60: ptr, %61: ptr, %62: u32):
-    call @func.216(%116, %61, %60, %62)
+    call @func.182(%116, %61, %60, %62)
     br bb31
 bb31:
     %280 = const bool false
-    call @func.53(%0, %114, %115, %116)
+    call @func.47(%0, %114, %115, %116)
     br bb32
 bb32:
     %281 = const bool false
@@ -69998,7 +69674,7 @@ bb33(%63: ptr, %64: u32, %65: ptr, %66: ptr, %67: ptr, %68: ptr):
     %284 = gep i8, ptr %282, %283
     br bb34(%63, %64, %66, %67, %68, %284)
 bb34(%69: ptr, %70: u32, %71: ptr, %72: ptr, %73: ptr, %74: ptr):
-    call @func.216(%118, %74, %69, %70)
+    call @func.182(%118, %74, %69, %70)
     br bb35(%69, %70, %71, %72, %73)
 bb35(%75: ptr, %76: u32, %77: ptr, %78: ptr, %79: ptr):
     %285 = const bool true
@@ -70007,7 +69683,7 @@ bb35(%75: ptr, %76: u32, %77: ptr, %78: ptr, %79: ptr):
     %288 = gep i8, ptr %286, %287
     br bb36(%75, %76, %78, %79, %288)
 bb36(%80: ptr, %81: u32, %82: ptr, %83: ptr, %84: ptr):
-    call @func.216(%119, %84, %80, %81)
+    call @func.182(%119, %84, %80, %81)
     br bb37(%80, %81, %82, %83)
 bb37(%85: ptr, %86: u32, %87: ptr, %88: ptr):
     %289 = const bool true
@@ -70017,17 +69693,17 @@ bb37(%85: ptr, %86: u32, %87: ptr, %88: ptr):
     br bb38(%85, %86, %88, %292)
 bb38(%89: ptr, %90: u32, %91: ptr, %92: ptr):
     %293 = const u32 1
-    %294 = call @func.215(%90, %293)
+    %294 = call @func.80(%90, %293)
     br bb39(%89, %91, %92, %294)
 bb39(%93: ptr, %94: ptr, %95: ptr, %96: u32):
-    call @func.216(%120, %95, %93, %96)
+    call @func.182(%120, %95, %93, %96)
     br bb40(%94)
 bb40(%97: ptr):
     %295 = load bool, ptr %97
     %296 = const bool false
     %297 = const bool false
     %298 = const bool false
-    call @func.55(%0, %117, %118, %119, %120, %295)
+    call @func.49(%0, %117, %118, %119, %120, %295)
     br bb41
 bb41:
     %299 = const bool false
@@ -70041,20 +69717,17 @@ bb42(%98: ptr, %99: u32, %100: ptr, %101: ptr):
     %305 = gep i8, ptr %303, %304
     br bb43(%98, %99, %302, %305)
 bb43(%102: ptr, %103: u32, %104: u32, %105: ptr):
-    call @func.216(%122, %105, %102, %103)
+    call @func.182(%122, %105, %102, %103)
     br bb44(%104)
 bb44(%106: u32):
     %306 = const bool false
-    call @func.219(%0, %121, %106, %122)
+    call @func.184(%0, %121, %106, %122)
     br bb45
 bb45:
     %307 = const bool false
     br bb46
 bb46:
     ret
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.217) {
 }
 
 fn @Expr__abstract_fvar_at(functy.218) {
@@ -70087,13 +69760,13 @@ bb0(%0: ptr, %1: ptr, %2: u64, %3: u32):
     %110 = const bool false
     %111 = const bool false
     %112 = load ptr, ptr %87
-    %113 = call @func.69(%112)
+    %113 = call @func.63(%112)
     br bb1(%3, %113)
 bb1(%4: u32, %5: bool):
     condbr %5, bb5(%4), bb2(%4)
 bb2(%6: u32):
     %114 = load ptr, ptr %87
-    %115 = call @func.237(%114)
+    %115 = call @func.198(%114)
     br bb3(%6, %115)
 bb3(%7: u32, %8: u32):
     %116 = icmp ult u32 %7, %8
@@ -70176,7 +69849,7 @@ bb8(%11: u32):
     %180 = const i64 48
     %181 = gep i8, ptr %179, %180
     %182 = const bool true
-    call @func.66(%102, %175)
+    call @func.60(%102, %175)
     br bb47(%11, %178, %181)
 bb9(%12: u32):
     %183 = load ptr, ptr %89
@@ -70193,7 +69866,7 @@ bb9(%12: u32):
     %194 = const i64 64
     %195 = gep i8, ptr %193, %194
     %196 = const bool true
-    call @func.66(%98, %183)
+    call @func.60(%98, %183)
     br bb38(%12, %186, %189, %192, %195)
 bb10(%13: u32):
     %197 = load ptr, ptr %89
@@ -70261,7 +69934,7 @@ bb14(%17: u32):
     %247 = load ptr, ptr %89
     %248 = const i64 8
     %249 = gep i8, ptr %247, %248
-    %250 = call @func.213(%249, %88)
+    %250 = call @func.181(%249, %88)
     br bb15(%17, %250)
 bb15(%18: u32, %19: bool):
     condbr %19, bb16(%18), bb17
@@ -70275,7 +69948,7 @@ bb17:
 bb18(%21: ptr):
     %252 = load u32, ptr %21
     %253 = const u32 1
-    %254 = call @func.217(%252, %253)
+    %254 = call @func.80(%252, %253)
     br bb19(%254)
 bb19(%22: u32):
     call @func.21(%0, %22)
@@ -70287,7 +69960,7 @@ bb20:
 bb21(%23: u32, %24: ptr, %25: ptr):
     %256 = const bool true
     %257 = load u64, ptr %88
-    call @func.218(%90, %25, %257, %23)
+    call @func.183(%90, %25, %257, %23)
     br bb22(%23, %24)
 bb22(%26: u32, %27: ptr):
     %258 = load ptr, ptr %27
@@ -70296,11 +69969,11 @@ bb22(%26: u32, %27: ptr):
     br bb23(%26, %260)
 bb23(%28: u32, %29: ptr):
     %261 = load u64, ptr %88
-    call @func.218(%91, %29, %261, %28)
+    call @func.183(%91, %29, %261, %28)
     br bb24
 bb24:
     %262 = const bool false
-    call @func.56(%0, %90, %91)
+    call @func.50(%0, %90, %91)
     br bb25
 bb25:
     %263 = const bool false
@@ -70308,7 +69981,7 @@ bb25:
 bb26(%30: u32, %31: ptr, %32: ptr):
     %264 = const bool true
     %265 = load u64, ptr %88
-    call @func.218(%93, %32, %265, %30)
+    call @func.183(%93, %32, %265, %30)
     br bb27(%30, %31)
 bb27(%33: u32, %34: ptr):
     %266 = load ptr, ptr %34
@@ -70317,11 +69990,11 @@ bb27(%33: u32, %34: ptr):
     br bb28(%33, %268)
 bb28(%35: u32, %36: ptr):
     %269 = const u32 1
-    %270 = call @func.217(%35, %269)
+    %270 = call @func.80(%35, %269)
     br bb29(%36, %270)
 bb29(%37: ptr, %38: u32):
     %271 = load u64, ptr %88
-    call @func.218(%94, %37, %271, %38)
+    call @func.183(%94, %37, %271, %38)
     br bb30
 bb30:
     %272 = const bool false
@@ -70333,7 +70006,7 @@ bb31:
 bb32(%39: u32, %40: ptr, %41: ptr):
     %274 = const bool true
     %275 = load u64, ptr %88
-    call @func.218(%96, %41, %275, %39)
+    call @func.183(%96, %41, %275, %39)
     br bb33(%39, %40)
 bb33(%42: u32, %43: ptr):
     %276 = load ptr, ptr %43
@@ -70342,15 +70015,15 @@ bb33(%42: u32, %43: ptr):
     br bb34(%42, %278)
 bb34(%44: u32, %45: ptr):
     %279 = const u32 1
-    %280 = call @func.217(%44, %279)
+    %280 = call @func.80(%44, %279)
     br bb35(%45, %280)
 bb35(%46: ptr, %47: u32):
     %281 = load u64, ptr %88
-    call @func.218(%97, %46, %281, %47)
+    call @func.183(%97, %46, %281, %47)
     br bb36
 bb36:
     %282 = const bool false
-    call @func.53(%0, %95, %96, %97)
+    call @func.47(%0, %95, %96, %97)
     br bb37
 bb37:
     %283 = const bool false
@@ -70362,7 +70035,7 @@ bb38(%48: u32, %49: ptr, %50: ptr, %51: ptr, %52: ptr):
     br bb39(%48, %50, %51, %52, %286)
 bb39(%53: u32, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %287 = load u64, ptr %88
-    call @func.218(%99, %57, %287, %53)
+    call @func.183(%99, %57, %287, %53)
     br bb40(%53, %54, %55, %56)
 bb40(%58: u32, %59: ptr, %60: ptr, %61: ptr):
     %288 = const bool true
@@ -70372,7 +70045,7 @@ bb40(%58: u32, %59: ptr, %60: ptr, %61: ptr):
     br bb41(%58, %60, %61, %291)
 bb41(%62: u32, %63: ptr, %64: ptr, %65: ptr):
     %292 = load u64, ptr %88
-    call @func.218(%100, %65, %292, %62)
+    call @func.183(%100, %65, %292, %62)
     br bb42(%62, %63, %64)
 bb42(%66: u32, %67: ptr, %68: ptr):
     %293 = const bool true
@@ -70382,18 +70055,18 @@ bb42(%66: u32, %67: ptr, %68: ptr):
     br bb43(%66, %68, %296)
 bb43(%69: u32, %70: ptr, %71: ptr):
     %297 = const u32 1
-    %298 = call @func.217(%69, %297)
+    %298 = call @func.80(%69, %297)
     br bb44(%70, %71, %298)
 bb44(%72: ptr, %73: ptr, %74: u32):
     %299 = load u64, ptr %88
-    call @func.218(%101, %73, %299, %74)
+    call @func.183(%101, %73, %299, %74)
     br bb45(%72)
 bb45(%75: ptr):
     %300 = load bool, ptr %75
     %301 = const bool false
     %302 = const bool false
     %303 = const bool false
-    call @func.55(%0, %98, %99, %100, %101, %300)
+    call @func.49(%0, %98, %99, %100, %101, %300)
     br bb46
 bb46:
     %304 = const bool false
@@ -70408,21 +70081,21 @@ bb47(%76: u32, %77: ptr, %78: ptr):
     br bb48(%76, %307, %310)
 bb48(%79: u32, %80: u32, %81: ptr):
     %311 = load u64, ptr %88
-    call @func.218(%103, %81, %311, %79)
+    call @func.183(%103, %81, %311, %79)
     br bb49(%80)
 bb49(%82: u32):
     %312 = const bool false
-    call @func.219(%0, %102, %82, %103)
+    call @func.184(%0, %102, %82, %103)
     br bb50
 bb50:
     %313 = const bool false
     br bb53
 bb51(%83: u32, %84: u32, %85: ptr):
     %314 = load u64, ptr %88
-    call @func.218(%104, %85, %314, %83)
+    call @func.183(%104, %85, %314, %83)
     br bb52(%84)
 bb52(%86: u32):
-    call @func.220(%0, %86, %104)
+    call @func.185(%0, %86, %104)
     br bb53
 bb53:
     ret
@@ -70565,7 +70238,7 @@ bb1(%4: u32):
     store ptr %108, ptr %110
     %111 = const i64 12
     store i64 %111, ptr %5
-    call @func.49(%0, %5)
+    call @func.44(%0, %5)
     br bb2
 bb2:
     ret
@@ -70653,7 +70326,7 @@ bb1(%3: u32):
     store ptr %62, ptr %64
     %65 = const i64 13
     store i64 %65, ptr %4
-    call @func.49(%0, %4)
+    call @func.44(%0, %4)
     br bb2
 bb2:
     ret
@@ -70665,18 +70338,6 @@ bb0(%0: u64):
     store u64 %0, ptr %1
     %2 = load u64, ptr %1
     ret %2
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice7LiteralNtB7_9PartialEq2eqBF_(functy.222) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdNtB7_9PartialEq2eqBF_(functy.223) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.224) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.225) {
 }
 
 fn @Verifier____env___structural_eq(functy.226) {
@@ -71364,7 +71025,7 @@ bb14(%12: ptr):
     %793 = load ptr, ptr %175
     %794 = const i64 48
     %795 = gep i8, ptr %793, %794
-    %796 = call @func.65(%769, %783)
+    %796 = call @func.59(%769, %783)
     br bb55(%12, %777, %795, %796)
 bb15:
     %797 = load ptr, ptr %157
@@ -71381,7 +71042,7 @@ bb15:
     %805 = const i64 8
     %806 = gep i8, ptr %804, %805
     store ptr %806, ptr %165
-    %807 = call @func.222(%164, %165)
+    %807 = call @func.149(%164, %165)
     br bb64(%807)
 bb16(%13: ptr):
     %808 = load ptr, ptr %157
@@ -71554,7 +71215,7 @@ bb20(%17: ptr):
     %941 = load ptr, ptr %203
     %942 = const i64 48
     %943 = gep i8, ptr %941, %942
-    %944 = call @func.65(%927, %937)
+    %944 = call @func.59(%927, %937)
     br bb24(%17, %931, %943, %944)
 bb21(%18: ptr):
     %945 = load ptr, ptr %157
@@ -71569,7 +71230,7 @@ bb21(%18: ptr):
     %952 = load ptr, ptr %205
     %953 = const i64 8
     %954 = gep i8, ptr %952, %953
-    %955 = call @func.228(%18, %948, %954)
+    %955 = call @func.189(%18, %948, %954)
     br bb64(%955)
 bb22:
     %956 = load ptr, ptr %157
@@ -71586,7 +71247,7 @@ bb22:
     %964 = const i64 8
     %965 = gep i8, ptr %963, %964
     store ptr %965, ptr %161
-    %966 = call @func.223(%160, %161)
+    %966 = call @func.150(%160, %161)
     br bb64(%966)
 bb23:
     %967 = load ptr, ptr %157
@@ -71603,21 +71264,21 @@ bb23:
     %975 = const i64 8
     %976 = gep i8, ptr %974, %975
     store ptr %976, ptr %159
-    %977 = call @func.224(%158, %159)
+    %977 = call @func.151(%158, %159)
     br bb64(%977)
 bb24(%19: ptr, %20: ptr, %21: ptr, %22: bool):
     condbr %22, bb25(%19, %20, %21), bb26
 bb25(%23: ptr, %24: ptr, %25: ptr):
-    call @func.225(%162, %24)
+    call @func.81(%162, %24)
     br bb27(%23, %25)
 bb26:
     %978 = const bool false
     br bb64(%978)
 bb27(%26: ptr, %27: ptr):
-    call @func.225(%163, %27)
+    call @func.81(%163, %27)
     br bb28(%26)
 bb28(%28: ptr):
-    %979 = call @func.229(%28, %162, %163)
+    %979 = call @func.190(%28, %162, %163)
     br bb64(%979)
 bb29(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %980 = load ptr, ptr %31
@@ -71625,7 +71286,7 @@ bb29(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %982 = gep i8, ptr %980, %981
     br bb30(%29, %30, %32, %33, %982)
 bb30(%34: ptr, %35: ptr, %36: ptr, %37: ptr, %38: ptr):
-    %983 = call @func.226(%34, %37, %38)
+    %983 = call @func.187(%34, %37, %38)
     br bb31(%34, %35, %36, %983)
 bb31(%39: ptr, %40: ptr, %41: ptr, %42: bool):
     condbr %42, bb32(%39, %40, %41), bb33
@@ -71643,7 +71304,7 @@ bb34(%46: ptr, %47: ptr, %48: ptr):
     %990 = gep i8, ptr %988, %989
     br bb35(%46, %48, %990)
 bb35(%49: ptr, %50: ptr, %51: ptr):
-    %991 = call @func.226(%49, %50, %51)
+    %991 = call @func.187(%49, %50, %51)
     br bb64(%991)
 bb36(%52: ptr, %53: ptr, %54: ptr, %55: ptr, %56: ptr):
     %992 = load ptr, ptr %53
@@ -71656,7 +71317,7 @@ bb37(%57: ptr, %58: ptr, %59: ptr, %60: ptr, %61: ptr):
     %997 = gep i8, ptr %995, %996
     br bb38(%57, %58, %60, %61, %997)
 bb38(%62: ptr, %63: ptr, %64: ptr, %65: ptr, %66: ptr):
-    %998 = call @func.226(%62, %65, %66)
+    %998 = call @func.187(%62, %65, %66)
     br bb39(%62, %63, %64, %998)
 bb39(%67: ptr, %68: ptr, %69: ptr, %70: bool):
     condbr %70, bb40(%67, %68, %69), bb41
@@ -71674,7 +71335,7 @@ bb42(%74: ptr, %75: ptr, %76: ptr):
     %1005 = gep i8, ptr %1003, %1004
     br bb43(%74, %76, %1005)
 bb43(%77: ptr, %78: ptr, %79: ptr):
-    %1006 = call @func.226(%77, %78, %79)
+    %1006 = call @func.187(%77, %78, %79)
     br bb64(%1006)
 bb44(%80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     %1007 = load ptr, ptr %83
@@ -71682,7 +71343,7 @@ bb44(%80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     %1009 = gep i8, ptr %1007, %1008
     br bb45(%80, %81, %82, %84, %85, %86, %1009)
 bb45(%87: ptr, %88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: ptr, %93: ptr):
-    %1010 = call @func.226(%87, %92, %93)
+    %1010 = call @func.187(%87, %92, %93)
     br bb46(%87, %88, %89, %90, %91, %1010)
 bb46(%94: ptr, %95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: bool):
     condbr %99, bb47(%94, %95, %96, %97, %98), bb52
@@ -71697,7 +71358,7 @@ bb48(%105: ptr, %106: ptr, %107: ptr, %108: ptr, %109: ptr):
     %1016 = gep i8, ptr %1014, %1015
     br bb49(%105, %106, %108, %109, %1016)
 bb49(%110: ptr, %111: ptr, %112: ptr, %113: ptr, %114: ptr):
-    %1017 = call @func.226(%110, %113, %114)
+    %1017 = call @func.187(%110, %113, %114)
     br bb50(%110, %111, %112, %1017)
 bb50(%115: ptr, %116: ptr, %117: ptr, %118: bool):
     condbr %118, bb51(%115, %116, %117), bb52
@@ -71715,12 +71376,12 @@ bb53(%122: ptr, %123: ptr, %124: ptr):
     %1024 = gep i8, ptr %1022, %1023
     br bb54(%122, %124, %1024)
 bb54(%125: ptr, %126: ptr, %127: ptr):
-    %1025 = call @func.226(%125, %126, %127)
+    %1025 = call @func.187(%125, %126, %127)
     br bb64(%1025)
 bb55(%128: ptr, %129: ptr, %130: ptr, %131: bool):
     condbr %131, bb56(%128, %129, %130), bb59
 bb56(%132: ptr, %133: ptr, %134: ptr):
-    %1026 = call @func.224(%166, %167)
+    %1026 = call @func.151(%166, %167)
     br bb57(%132, %133, %134, %1026)
 bb57(%135: ptr, %136: ptr, %137: ptr, %138: bool):
     condbr %138, bb58(%135, %136, %137), bb59
@@ -71738,7 +71399,7 @@ bb60(%142: ptr, %143: ptr, %144: ptr):
     %1033 = gep i8, ptr %1031, %1032
     br bb61(%142, %144, %1033)
 bb61(%145: ptr, %146: ptr, %147: ptr):
-    %1034 = call @func.226(%145, %146, %147)
+    %1034 = call @func.187(%145, %146, %147)
     br bb64(%1034)
 bb62(%148: ptr, %149: ptr, %150: ptr):
     %1035 = load ptr, ptr %149
@@ -71746,7 +71407,7 @@ bb62(%148: ptr, %149: ptr, %150: ptr):
     %1037 = gep i8, ptr %1035, %1036
     br bb63(%148, %150, %1037)
 bb63(%151: ptr, %152: ptr, %153: ptr):
-    %1038 = call @func.226(%151, %152, %153)
+    %1038 = call @func.187(%151, %152, %153)
     br bb64(%1038)
 bb64(%154: bool):
     ret %154
@@ -71763,7 +71424,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr, %4: ptr):
     %36 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %37 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %38 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.240(%33, %1, %2, %4)
+    call @func.200(%33, %1, %2, %4)
     br bb1(%1, %3, %4)
 bb1(%5: ptr, %6: ptr, %7: ptr):
     %39 = load i64, ptr %33
@@ -71892,7 +71553,7 @@ bb4(%8: ptr, %9: ptr, %10: ptr):
     %136 = gep i8, ptr %32, %135
     %137 = load i64, ptr %134
     store i64 %137, ptr %136
-    %138 = call @func.242(%8, %32)
+    %138 = call @func.201(%8, %32)
     br bb5(%8, %9, %10, %138)
 bb5(%11: ptr, %12: ptr, %13: ptr, %14: bool):
     condbr %14, bb6, bb7(%11, %12, %13)
@@ -71901,7 +71562,7 @@ bb6:
     store i8 %139, ptr %0
     br bb18
 bb7(%15: ptr, %16: ptr, %17: ptr):
-    call @func.243(%35, %15, %32, %17)
+    call @func.202(%35, %15, %32, %17)
     br bb8(%15, %16, %17)
 bb8(%18: ptr, %19: ptr, %20: ptr):
     %140 = load i8, ptr %35
@@ -71923,7 +71584,7 @@ bb11:
     store i8 %148, ptr %0
     br bb18
 bb12(%24: ptr, %25: ptr, %26: ptr):
-    call @func.240(%37, %24, %25, %26)
+    call @func.200(%37, %24, %25, %26)
     br bb13(%24, %26)
 bb13(%27: ptr, %28: ptr):
     %149 = load i64, ptr %37
@@ -72050,7 +71711,7 @@ bb15(%29: ptr, %30: ptr):
     %246 = gep i8, ptr %36, %245
     %247 = load i64, ptr %244
     store i64 %247, ptr %246
-    %248 = call @func.230(%29, %32, %36, %30)
+    %248 = call @func.191(%29, %32, %36, %30)
     br bb16(%248)
 bb16(%31: bool):
     store bool %31, ptr %0
@@ -72065,7 +71726,7 @@ bb19:
 
 fn @Verifier____env___level_eq(functy.228) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
-    %4 = call @func.245(%1, %2)
+    %4 = call @func.204(%1, %2)
     br bb1(%4)
 bb1(%3: bool):
     ret %3
@@ -72115,7 +71776,7 @@ bb6(%14: ptr, %15: u64, %16: u64, %17: ptr, %18: u64):
     %56 = const u64 40
     %57 = mul u64 %18, %56
     %58 = gep i8, ptr %55, %57
-    %59 = call @func.228(%14, %17, %58)
+    %59 = call @func.189(%14, %17, %58)
     br bb7(%14, %15, %16, %59)
 bb7(%19: ptr, %20: u64, %21: u64, %22: bool):
     condbr %22, bb8(%19, %20, %21), bb9
@@ -72149,7 +71810,7 @@ bb13:
 
 fn @Verifier____env___def_eq_blind_impl(functy.230) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.177(%0, %1, %2, %3)
+    %5 = call @func.152(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
@@ -72294,7 +71955,7 @@ bb3(%6: ptr, %7: ptr):
     %159 = load ptr, ptr %37
     %160 = const u32 0
     %161 = const u32 1
-    call @func.246(%44, %159, %160, %161)
+    call @func.205(%44, %159, %160, %161)
     br bb10(%6, %7, %158)
 bb4(%8: ptr, %9: ptr):
     %162 = load ptr, ptr %39
@@ -72310,7 +71971,7 @@ bb4(%8: ptr, %9: ptr):
     %170 = load ptr, ptr %38
     %171 = const u32 0
     %172 = const u32 1
-    call @func.246(%40, %170, %171, %172)
+    call @func.205(%40, %170, %171, %172)
     br bb5(%8, %9, %169)
 bb5(%10: ptr, %11: ptr, %12: ptr):
     %173 = const bool true
@@ -72375,7 +72036,7 @@ bb5(%10: ptr, %11: ptr, %12: ptr):
     br bb6(%10, %11, %12)
 bb6(%13: ptr, %14: ptr, %15: ptr):
     %221 = const bool false
-    call @func.56(%41, %42, %43)
+    call @func.50(%41, %42, %43)
     br bb7(%13, %14, %15)
 bb7(%16: ptr, %17: ptr, %18: ptr):
     %222 = const bool false
@@ -72384,7 +72045,7 @@ bb7(%16: ptr, %17: ptr, %18: ptr):
     %225 = gep i8, ptr %223, %224
     br bb8(%16, %17, %225)
 bb8(%19: ptr, %20: ptr, %21: ptr):
-    %226 = call @func.230(%19, %21, %41, %20)
+    %226 = call @func.191(%19, %21, %41, %20)
     br bb9(%226)
 bb9(%22: bool):
     br bb15(%22)
@@ -72451,7 +72112,7 @@ bb10(%23: ptr, %24: ptr, %25: ptr):
     br bb11(%23, %24, %25)
 bb11(%26: ptr, %27: ptr, %28: ptr):
     %275 = const bool false
-    call @func.56(%45, %46, %47)
+    call @func.50(%45, %46, %47)
     br bb12(%26, %27, %28)
 bb12(%29: ptr, %30: ptr, %31: ptr):
     %276 = const bool false
@@ -72460,7 +72121,7 @@ bb12(%29: ptr, %30: ptr, %31: ptr):
     %279 = gep i8, ptr %277, %278
     br bb13(%29, %30, %279)
 bb13(%32: ptr, %33: ptr, %34: ptr):
-    %280 = call @func.230(%32, %34, %45, %33)
+    %280 = call @func.191(%32, %34, %45, %33)
     br bb14(%280)
 bb14(%35: bool):
     br bb15(%35)
@@ -72502,10 +72163,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32, %4: ptr, %5: ptr):
     %62 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %63 = const bool false
     %64 = const bool true
-    call @func.154(%53, %1, %4, %5)
+    call @func.131(%53, %1, %4, %5)
     br bb1(%1, %2, %3, %5)
 bb1(%6: ptr, %7: ptr, %8: u32, %9: ptr):
-    call @func.248(%54, %53)
+    call @func.206(%54, %53)
     br bb2(%6, %7, %8, %9)
 bb2(%10: ptr, %11: ptr, %12: u32, %13: ptr):
     store ptr %54, ptr %55
@@ -72557,7 +72218,7 @@ bb3(%14: ptr, %15: ptr, %16: u32, %17: ptr):
     %108 = load ptr, ptr %55
     %109 = const i64 8
     %110 = gep i8, ptr %108, %109
-    call @func.249(%56, %14, %110)
+    call @func.207(%56, %14, %110)
     br bb4(%14, %15, %16, %17)
 bb4(%18: ptr, %19: ptr, %20: u32, %21: ptr):
     %111 = load i32, ptr %56
@@ -72567,7 +72228,7 @@ bb5(%22: ptr, %23: ptr, %24: u32, %25: ptr):
     %113 = const i64 4
     %114 = gep i8, ptr %56, %113
     %115 = load u32, ptr %114
-    call @func.255(%57, %53)
+    call @func.212(%57, %53)
     br bb6(%22, %23, %24, %25, %115)
 bb6(%26: ptr, %27: ptr, %28: u32, %29: ptr, %30: u32):
     %116 = zext u32 %30 to u64
@@ -72585,23 +72246,23 @@ bb6(%26: ptr, %27: ptr, %28: u32, %29: ptr, %30: u32):
     condbr %126, bb7(%26, %27, %28, %29), bb23
 bb7(%31: ptr, %32: ptr, %33: u32, %34: ptr):
     %127 = load u64, ptr %58
-    %128 = call @func.234(%57)
+    %128 = call @func.195(%57)
     br bb8(%31, %32, %33, %34, %127, %128)
 bb8(%35: ptr, %36: ptr, %37: u32, %38: ptr, %39: u64, %40: u64):
     %129 = icmp ult u64 %39, %40
     condbr %129, bb9(%35, %38, %39), bb12(%36, %37)
 bb9(%41: ptr, %42: ptr, %43: u64):
-    %130 = call @func.235(%57, %43)
+    %130 = call @func.196(%57, %43)
     br bb10(%41, %42, %130)
 bb10(%44: ptr, %45: ptr, %46: ptr):
-    call @func.154(%0, %44, %46, %45)
+    call @func.131(%0, %44, %46, %45)
     br bb11
 bb11:
     br bb18
 bb12(%47: ptr, %48: u32):
     br bb13(%47, %48)
 bb13(%49: ptr, %50: u32):
-    call @func.66(%60, %49)
+    call @func.60(%60, %49)
     br bb14(%50)
 bb14(%51: u32):
     %131 = const bool false
@@ -72767,7 +72428,7 @@ bb15(%52: u32):
     store ptr %257, ptr %259
     %260 = const i64 12
     store i64 %260, ptr %59
-    call @func.49(%0, %59)
+    call @func.44(%0, %59)
     br bb16
 bb16:
     br bb17
@@ -72797,13 +72458,10 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.150(%6)
+    %7 = call @func.128(%6)
     br bb1(%7)
 bb1(%1: u32):
     ret %1
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.238) {
 }
 
 fn @Expr__lift_at(functy.239) {
@@ -72831,7 +72489,7 @@ bb1:
     br bb31
 bb2(%4: u32, %5: u32):
     %74 = load ptr, ptr %58
-    %75 = call @func.237(%74)
+    %75 = call @func.198(%74)
     br bb3(%4, %5, %75)
 bb3(%6: u32, %7: u32, %8: u32):
     %76 = icmp uge u32 %6, %8
@@ -72955,7 +72613,7 @@ bb10(%17: u32, %18: u32):
     condbr %172, bb11(%18, %170), bb13
 bb11(%19: u32, %20: ptr):
     %173 = load u32, ptr %20
-    %174 = call @func.238(%173, %19)
+    %174 = call @func.80(%173, %19)
     br bb12(%174)
 bb12(%21: u32):
     call @func.21(%0, %21)
@@ -72966,7 +72624,7 @@ bb13:
     br bb31
 bb14(%22: u32, %23: u32, %24: ptr, %25: ptr):
     %176 = const bool true
-    call @func.239(%60, %25, %22, %23)
+    call @func.199(%60, %25, %22, %23)
     br bb15(%22, %23, %24)
 bb15(%26: u32, %27: u32, %28: ptr):
     %177 = load ptr, ptr %28
@@ -72974,18 +72632,18 @@ bb15(%26: u32, %27: u32, %28: ptr):
     %179 = gep i8, ptr %177, %178
     br bb16(%26, %27, %179)
 bb16(%29: u32, %30: u32, %31: ptr):
-    call @func.239(%61, %31, %29, %30)
+    call @func.199(%61, %31, %29, %30)
     br bb17
 bb17:
     %180 = const bool false
-    call @func.56(%0, %60, %61)
+    call @func.50(%0, %60, %61)
     br bb18
 bb18:
     %181 = const bool false
     br bb31
 bb19(%32: u32, %33: u32, %34: ptr, %35: ptr):
     %182 = const bool true
-    call @func.239(%63, %35, %32, %33)
+    call @func.199(%63, %35, %32, %33)
     br bb20(%32, %33, %34)
 bb20(%36: u32, %37: u32, %38: ptr):
     %183 = load ptr, ptr %38
@@ -72994,10 +72652,10 @@ bb20(%36: u32, %37: u32, %38: ptr):
     br bb21(%36, %37, %185)
 bb21(%39: u32, %40: u32, %41: ptr):
     %186 = const u32 1
-    %187 = call @func.238(%39, %186)
+    %187 = call @func.80(%39, %186)
     br bb22(%40, %41, %187)
 bb22(%42: u32, %43: ptr, %44: u32):
-    call @func.239(%64, %43, %44, %42)
+    call @func.199(%64, %43, %44, %42)
     br bb23
 bb23:
     %188 = const bool false
@@ -73008,7 +72666,7 @@ bb24:
     br bb31
 bb25(%45: u32, %46: u32, %47: ptr, %48: ptr):
     %190 = const bool true
-    call @func.239(%66, %48, %45, %46)
+    call @func.199(%66, %48, %45, %46)
     br bb26(%45, %46, %47)
 bb26(%49: u32, %50: u32, %51: ptr):
     %191 = load ptr, ptr %51
@@ -73017,14 +72675,14 @@ bb26(%49: u32, %50: u32, %51: ptr):
     br bb27(%49, %50, %193)
 bb27(%52: u32, %53: u32, %54: ptr):
     %194 = const u32 1
-    %195 = call @func.238(%52, %194)
+    %195 = call @func.80(%52, %194)
     br bb28(%53, %54, %195)
 bb28(%55: u32, %56: ptr, %57: u32):
-    call @func.239(%67, %56, %57, %55)
+    call @func.199(%67, %56, %57, %55)
     br bb29
 bb29:
     %196 = const bool false
-    call @func.53(%0, %65, %66, %67)
+    call @func.47(%0, %65, %66, %67)
     br bb30
 bb30:
     %197 = const bool false
@@ -73042,7 +72700,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %12 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     store ptr %3, ptr %8
     %13 = load ptr, ptr %8
-    call @func.256(%9, %1, %2, %13)
+    call @func.213(%9, %1, %2, %13)
     br bb1(%1, %2)
 bb1(%4: ptr, %5: ptr):
     %14 = load i64, ptr %9
@@ -73056,7 +72714,7 @@ bb2:
     unreachable
 bb3(%6: ptr, %7: ptr):
     %20 = load ptr, ptr %8
-    call @func.261(%11, %6, %7, %20)
+    call @func.214(%11, %6, %7, %20)
     br bb5
 bb4:
     %21 = load i64, ptr %9
@@ -73312,9 +72970,6 @@ bb10:
     ret
 }
 
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.241) {
-}
-
 fn @Verifier____env___type_is_quickly_not_in_prop(functy.242) {
 bb0(%0: ptr, %1: ptr):
     %13 = alloca i64, align 8
@@ -73378,7 +73033,7 @@ bb2:
     %65 = load ptr, ptr %14
     %66 = const i64 48
     %67 = gep i8, ptr %65, %66
-    %68 = call @func.241(%67)
+    %68 = call @func.65(%67)
     br bb4(%64, %68)
 bb3:
     %69 = const bool true
@@ -73388,10 +73043,10 @@ bb4(%2: ptr, %3: u64):
     %71 = icmp eq u64 %3, %70
     condbr %71, bb5(%2), bb14
 bb5(%4: ptr):
-    call @func.172(%15)
+    call @func.148(%15)
     br bb6(%4)
 bb6(%5: ptr):
-    %72 = call @func.65(%5, %15)
+    %72 = call @func.59(%5, %15)
     br bb7(%5, %72)
 bb7(%6: ptr, %7: bool):
     condbr %7, bb8, bb10(%6)
@@ -73403,10 +73058,10 @@ bb9:
 bb10(%8: ptr):
     br bb11(%8)
 bb11(%9: ptr):
-    call @func.171(%16)
+    call @func.147(%16)
     br bb12(%9)
 bb12(%10: ptr):
-    %74 = call @func.65(%10, %16)
+    %74 = call @func.59(%10, %16)
     br bb13(%74)
 bb13(%11: bool):
     br bb15(%11)
@@ -73428,7 +73083,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %19 = alloca i64, align 8
     store ptr %3, ptr %13
     %20 = load ptr, ptr %13
-    call @func.154(%14, %1, %2, %20)
+    call @func.131(%14, %1, %2, %20)
     br bb1(%1)
 bb1(%4: ptr):
     %21 = load i64, ptr %14
@@ -73488,7 +73143,7 @@ bb5:
     br bb18
 bb6(%9: ptr):
     %66 = load ptr, ptr %13
-    call @func.240(%16, %9, %14, %66)
+    call @func.200(%16, %9, %14, %66)
     br bb7(%9)
 bb7(%10: ptr):
     %67 = load i64, ptr %16
@@ -73618,7 +73273,7 @@ bb10(%11: ptr):
     %165 = load i64, ptr %162
     store i64 %165, ptr %164
     %166 = load ptr, ptr %13
-    call @func.154(%18, %11, %15, %166)
+    call @func.131(%18, %11, %15, %166)
     br bb11
 bb11:
     store ptr %18, ptr %19
@@ -73674,7 +73329,7 @@ bb13:
     %211 = load ptr, ptr %19
     %212 = const i64 8
     %213 = gep i8, ptr %211, %212
-    %214 = call @func.79(%213)
+    %214 = call @func.73(%213)
     br bb14(%214)
 bb14(%12: bool):
     store bool %12, ptr %0
@@ -73702,7 +73357,7 @@ bb0(%0: ptr, %1: ptr):
     %10 = alloca (i64, i64, i64, i64, i64), align 8
     store ptr %0, ptr %7
     store ptr %1, ptr %8
-    %11 = call @func.244(%7, %8)
+    %11 = call @func.203(%7, %8)
     br bb1(%11)
 bb1(%2: bool):
     condbr %2, bb2, bb3
@@ -73711,14 +73366,14 @@ bb2:
     br bb8(%12)
 bb3:
     %13 = load ptr, ptr %7
-    call @func.262(%9, %13)
+    call @func.215(%9, %13)
     br bb4
 bb4:
     %14 = load ptr, ptr %8
-    call @func.262(%10, %14)
+    call @func.215(%10, %14)
     br bb5(%9)
 bb5(%3: ptr):
-    %15 = call @func.209(%3, %10)
+    %15 = call @func.178(%3, %10)
     br bb6(%15)
 bb6(%4: bool):
     br bb7(%4)
@@ -73730,13 +73385,10 @@ bb8(%6: bool):
 
 fn @Expr__lift_from(functy.246) {
 bb0(%0: ptr, %1: ptr, %2: u32, %3: u32):
-    call @func.239(%0, %1, %2, %3)
+    call @func.199(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.247) {
 }
 
 fn @Expr__get_app_fn(functy.248) {
@@ -73854,7 +73506,7 @@ bb3:
     %95 = load ptr, ptr %5
     %96 = const i64 8
     %97 = gep i8, ptr %95, %96
-    %98 = call @func.247(%97)
+    %98 = call @func.3(%97)
     br bb4(%98)
 bb4(%2: ptr):
     call @func.13(%4, %2)
@@ -73988,7 +73640,7 @@ bb3(%11: ptr, %12: ptr, %13: u64, %14: u64, %15: u64):
     %76 = gep i8, ptr %73, %75
     store ptr %76, ptr %28
     %77 = load ptr, ptr %28
-    %78 = call @func.65(%77, %12)
+    %78 = call @func.59(%77, %12)
     br bb4(%11, %12, %13, %14, %78)
 bb4(%16: ptr, %17: ptr, %18: u64, %19: u64, %20: bool):
     condbr %20, bb5, bb6(%16, %17, %18, %19)
@@ -74032,9 +73684,6 @@ bb10:
 fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprE3newBE_(functy.250) {
 }
 
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.251) {
-}
-
 fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprE4pushBH_(functy.252) {
 }
 
@@ -74054,7 +73703,7 @@ bb0(%0: ptr, %1: ptr):
     %15 = alloca (i64, i64), align 8
     %16 = const bool false
     %17 = const bool true
-    call @func.250(%10)
+    call @func.208(%10)
     br bb1(%1)
 bb1(%2: ptr):
     call @func.13(%11, %2)
@@ -74112,16 +73761,16 @@ bb3:
     %64 = load ptr, ptr %12
     %65 = const i64 16
     %66 = gep i8, ptr %64, %65
-    %67 = call @func.251(%66)
+    %67 = call @func.3(%66)
     br bb4(%63, %10, %67)
 bb4(%3: ptr, %4: ptr, %5: ptr):
     call @func.13(%13, %5)
     br bb5(%3, %4)
 bb5(%6: ptr, %7: ptr):
-    call @func.252(%7, %13)
+    call @func.209(%7, %13)
     br bb6(%6)
 bb6(%8: ptr):
-    %68 = call @func.251(%8)
+    %68 = call @func.3(%8)
     br bb7(%68)
 bb7(%9: ptr):
     call @func.13(%14, %9)
@@ -74187,10 +73836,10 @@ bb9:
     store i64 %114, ptr %113
     br bb2
 bb10:
-    call @func.253(%15, %10)
+    call @func.210(%15, %10)
     br bb11
 bb11:
-    call @func.254(%15)
+    call @func.211(%15)
     br bb12
 bb12:
     %115 = const bool false
@@ -74218,22 +73867,10 @@ bb14:
 
 fn @Verifier____env___try_infer_type_quick_blind(functy.256) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    call @func.264(%0, %1, %2, %3)
+    call @func.216(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.257) {
-}
-
-fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.258) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.259) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.260) {
 }
 
 fn @Verifier____env___infer_type_infer_only_core_blind(functy.261) {
@@ -74455,7 +74092,7 @@ bb4(%5: ptr):
     %373 = const i64 64
     %374 = gep i8, ptr %372, %373
     %375 = const bool true
-    call @func.66(%255, %362)
+    call @func.60(%255, %362)
     br bb90(%5, %365, %368, %371)
 bb5(%6: ptr):
     %376 = load ptr, ptr %179
@@ -74482,7 +74119,7 @@ bb6(%7: ptr):
     %395 = const i64 16
     %396 = gep i8, ptr %394, %395
     %397 = const bool true
-    call @func.83(%206)
+    call @func.77(%206)
     br bb40(%7, %390, %393, %396)
 bb7(%8: ptr):
     %398 = load ptr, ptr %179
@@ -74502,13 +74139,13 @@ bb8(%9: ptr):
     %410 = load ptr, ptr %179
     %411 = const i64 48
     %412 = gep i8, ptr %410, %411
-    call @func.161(%190, %9, %409)
+    call @func.138(%190, %9, %409)
     br bb20(%409)
 bb9:
     %413 = load ptr, ptr %179
     %414 = const i64 8
     %415 = gep i8, ptr %413, %414
-    call @func.95(%189, %415)
+    call @func.87(%189, %415)
     br bb17
 bb10:
     %416 = load ptr, ptr %179
@@ -74518,7 +74155,7 @@ bb10:
     %420 = load i64, ptr %418
     store i64 %420, ptr %182
     %421 = load u64, ptr %182
-    call @func.164(%181, %419, %421)
+    call @func.141(%181, %419, %421)
     br bb12(%418)
 bb11:
     %422 = load ptr, ptr %179
@@ -74678,7 +74315,7 @@ bb16:
     store i64 %537, ptr %536
     br bb118
 bb17:
-    call @func.165(%188, %189)
+    call @func.142(%188, %189)
     br bb18
 bb18:
     call @func.32(%187, %188)
@@ -74750,7 +74387,7 @@ bb20(%12: ptr):
     %589 = select i64 %586, %587, %588
     switch %589 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.66(%193, %13)
+    call @func.60(%193, %13)
     br bb23
 bb22:
     %590 = load i64, ptr %190
@@ -74926,10 +74563,10 @@ bb23:
     br bb118
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %727 = load ptr, ptr %178
-    call @func.261(%196, %14, %16, %727)
+    call @func.214(%196, %14, %16, %727)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.257(%195, %196)
+    call @func.74(%195, %196)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %728 = load i64, ptr %195
@@ -75054,7 +74691,7 @@ bb27(%21: ptr, %22: ptr):
     %826 = load i64, ptr %823
     store i64 %826, ptr %825
     %827 = load ptr, ptr %178
-    call @func.154(%199, %21, %194, %827)
+    call @func.131(%199, %21, %194, %827)
     br bb30(%22, %780)
 bb28:
     %828 = const i64 8
@@ -75085,7 +74722,7 @@ bb28:
     %849 = gep i8, ptr %197, %848
     %850 = load i64, ptr %847
     store i64 %850, ptr %849
-    call @func.258(%0, %197)
+    call @func.103(%0, %197)
     br bb29
 bb29:
     %851 = const bool false
@@ -75279,7 +74916,7 @@ bb33(%27: ptr, %28: ptr, %29: bool):
     %1007 = gep i8, ptr %1005, %1006
     br bb34(%28, %1007, %29)
 bb34(%30: ptr, %31: ptr, %32: bool):
-    call @func.166(%201, %30, %31)
+    call @func.143(%201, %30, %31)
     br bb35(%32)
 bb35(%33: bool):
     %1008 = load i64, ptr %201
@@ -75385,7 +75022,7 @@ bb39:
     %1082 = const bool false
     br bb118
 bb40(%37: ptr, %38: ptr, %39: ptr, %40: ptr):
-    %1083 = call @func.259(%39)
+    %1083 = call @func.3(%39)
     br bb41(%37, %38, %39, %40, %1083)
 bb41(%41: ptr, %42: ptr, %43: ptr, %44: ptr, %45: ptr):
     call @func.13(%207, %45)
@@ -75401,7 +75038,7 @@ bb42(%46: ptr, %47: ptr, %48: ptr, %49: ptr):
     store i8 %1089, ptr %1088
     %1090 = const bool false
     %1091 = load ptr, ptr %178
-    call @func.156(%205, %1091, %206, %207, %208)
+    call @func.133(%205, %1091, %206, %207, %208)
     br bb43(%46, %47, %48, %49)
 bb43(%50: ptr, %51: ptr, %52: ptr, %53: ptr):
     %1092 = const bool false
@@ -75411,16 +75048,16 @@ bb43(%50: ptr, %51: ptr, %52: ptr, %53: ptr):
     br bb44(%50, %51, %52, %1095)
 bb44(%54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1096 = load u64, ptr %205
-    call @func.157(%209, %54, %57, %1096)
+    call @func.134(%209, %54, %57, %1096)
     br bb45(%54, %55, %56)
 bb45(%58: ptr, %59: ptr, %60: ptr):
     %1097 = load ptr, ptr %178
-    call @func.261(%210, %58, %209, %1097)
+    call @func.214(%210, %58, %209, %1097)
     br bb46(%59, %60)
 bb46(%61: ptr, %62: ptr):
     %1098 = const bool true
     %1099 = load ptr, ptr %178
-    call @func.159(%1099)
+    call @func.136(%1099)
     br bb47(%61, %62)
 bb47(%63: ptr, %64: ptr):
     %1100 = const bool false
@@ -75480,7 +75117,7 @@ bb47(%63: ptr, %64: ptr):
     %1145 = gep i8, ptr %213, %1144
     %1146 = load i64, ptr %1143
     store i64 %1146, ptr %1145
-    call @func.257(%212, %213)
+    call @func.74(%212, %213)
     br bb48(%63, %64)
 bb48(%65: ptr, %66: ptr):
     %1147 = load i64, ptr %212
@@ -75604,7 +75241,7 @@ bb49(%67: ptr, %68: ptr):
     %1244 = load i64, ptr %1241
     store i64 %1244, ptr %1243
     %1245 = load u64, ptr %205
-    call @func.167(%216, %211, %1245)
+    call @func.144(%216, %211, %1245)
     br bb52(%67, %68)
 bb50:
     %1246 = const i64 8
@@ -75635,7 +75272,7 @@ bb50:
     %1267 = gep i8, ptr %214, %1266
     %1268 = load i64, ptr %1265
     store i64 %1268, ptr %1267
-    call @func.258(%0, %214)
+    call @func.103(%0, %214)
     br bb51
 bb51:
     %1269 = const bool false
@@ -75650,7 +75287,7 @@ bb52(%69: ptr, %70: ptr):
     %1275 = gep i8, ptr %219, %1274
     %1276 = load i8, ptr %1273
     store i8 %1276, ptr %1275
-    call @func.260(%220, %70)
+    call @func.54(%220, %70)
     br bb53
 bb53:
     %1277 = const bool false
@@ -75799,7 +75436,7 @@ bb54:
     store ptr %1389, ptr %1391
     %1392 = const i64 9
     store i64 %1392, ptr %218
-    call @func.49(%217, %218)
+    call @func.44(%217, %218)
     br bb55
 bb55:
     %1393 = load i64, ptr %217
@@ -75865,10 +75502,10 @@ bb56:
     br bb118
 bb57(%71: ptr, %72: ptr, %73: ptr, %74: ptr, %75: ptr):
     %1441 = load ptr, ptr %178
-    call @func.261(%225, %71, %75, %1441)
+    call @func.214(%225, %71, %75, %1441)
     br bb58(%71, %72, %73, %74)
 bb58(%76: ptr, %77: ptr, %78: ptr, %79: ptr):
-    call @func.257(%224, %225)
+    call @func.74(%224, %225)
     br bb59(%76, %77, %78, %79)
 bb59(%80: ptr, %81: ptr, %82: ptr, %83: ptr):
     %1442 = load i64, ptr %224
@@ -75993,7 +75630,7 @@ bb60(%84: ptr, %85: ptr, %86: ptr, %87: ptr):
     %1540 = load i64, ptr %1537
     store i64 %1540, ptr %1539
     %1541 = load ptr, ptr %178
-    call @func.154(%228, %84, %223, %1541)
+    call @func.131(%228, %84, %223, %1541)
     br bb62(%84, %85, %86, %87, %1494)
 bb61:
     %1542 = const i64 8
@@ -76024,7 +75661,7 @@ bb61:
     %1563 = gep i8, ptr %226, %1562
     %1564 = load i64, ptr %1561
     store i64 %1564, ptr %1563
-    call @func.258(%0, %226)
+    call @func.103(%0, %226)
     br bb117
 bb62(%88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: bool):
     store ptr %228, ptr %230
@@ -76202,11 +75839,11 @@ bb64(%93: ptr, %94: ptr, %95: ptr, %96: ptr, %97: bool):
     %1709 = load ptr, ptr %230
     %1710 = const i64 8
     %1711 = gep i8, ptr %1709, %1710
-    call @func.95(%229, %1711)
+    call @func.87(%229, %1711)
     br bb65(%93, %94, %95, %96, %97)
 bb65(%98: ptr, %99: ptr, %100: ptr, %101: ptr, %102: bool):
     %1712 = const bool true
-    call @func.83(%235)
+    call @func.77(%235)
     br bb67(%98, %99, %100, %101, %102)
 bb66(%103: bool):
     %1713 = load ptr, ptr %232
@@ -76248,7 +75885,7 @@ bb66(%103: bool):
     br bb115(%103)
 bb67(%104: ptr, %105: ptr, %106: ptr, %107: ptr, %108: bool):
     %1741 = const bool true
-    %1742 = call @func.259(%106)
+    %1742 = call @func.3(%106)
     br bb68(%104, %105, %107, %1742, %108)
 bb68(%109: ptr, %110: ptr, %111: ptr, %112: ptr, %113: bool):
     call @func.13(%236, %112)
@@ -76264,7 +75901,7 @@ bb69(%114: ptr, %115: ptr, %116: ptr, %117: bool):
     store i8 %1748, ptr %1747
     %1749 = const bool false
     %1750 = load ptr, ptr %178
-    call @func.156(%234, %1750, %235, %236, %237)
+    call @func.133(%234, %1750, %235, %236, %237)
     br bb70(%114, %116, %117)
 bb70(%118: ptr, %119: ptr, %120: bool):
     %1751 = const bool false
@@ -76274,16 +75911,16 @@ bb70(%118: ptr, %119: ptr, %120: bool):
     br bb71(%118, %1754, %120)
 bb71(%121: ptr, %122: ptr, %123: bool):
     %1755 = load u64, ptr %234
-    call @func.157(%238, %121, %122, %1755)
+    call @func.134(%238, %121, %122, %1755)
     br bb72(%121, %123)
 bb72(%124: ptr, %125: bool):
     %1756 = load ptr, ptr %178
-    call @func.261(%239, %124, %238, %1756)
+    call @func.214(%239, %124, %238, %1756)
     br bb73(%124, %125)
 bb73(%126: ptr, %127: bool):
     %1757 = const bool true
     %1758 = load ptr, ptr %178
-    call @func.159(%1758)
+    call @func.136(%1758)
     br bb74(%126, %127)
 bb74(%128: ptr, %129: bool):
     %1759 = const bool false
@@ -76343,7 +75980,7 @@ bb74(%128: ptr, %129: bool):
     %1804 = gep i8, ptr %242, %1803
     %1805 = load i64, ptr %1802
     store i64 %1805, ptr %1804
-    call @func.257(%241, %242)
+    call @func.74(%241, %242)
     br bb75(%128, %129)
 bb75(%130: ptr, %131: bool):
     %1806 = load i64, ptr %241
@@ -76468,7 +76105,7 @@ bb76(%132: ptr, %133: bool):
     %1904 = load i64, ptr %1901
     store i64 %1904, ptr %1903
     %1905 = load ptr, ptr %178
-    call @func.154(%245, %132, %240, %1905)
+    call @func.131(%245, %132, %240, %1905)
     br bb78(%133)
 bb77(%134: bool):
     %1906 = const i64 8
@@ -76499,7 +76136,7 @@ bb77(%134: bool):
     %1927 = gep i8, ptr %243, %1926
     %1928 = load i64, ptr %1925
     store i64 %1928, ptr %1927
-    call @func.258(%0, %243)
+    call @func.103(%0, %243)
     br bb121(%134)
 bb78(%135: bool):
     store ptr %245, ptr %247
@@ -76677,7 +76314,7 @@ bb80:
     %2073 = load ptr, ptr %247
     %2074 = const i64 8
     %2075 = gep i8, ptr %2073, %2074
-    call @func.95(%246, %2075)
+    call @func.87(%246, %2075)
     br bb81
 bb81:
     %2076 = const bool false
@@ -76707,7 +76344,7 @@ bb81:
     %2096 = gep i8, ptr %253, %2095
     %2097 = load i64, ptr %2094
     store i64 %2097, ptr %2096
-    call @func.160(%252, %253, %246)
+    call @func.137(%252, %253, %246)
     br bb83
 bb82(%137: bool):
     %2098 = load ptr, ptr %249
@@ -76823,14 +76460,14 @@ bb89:
     %2175 = const bool false
     br bb118
 bb90(%138: ptr, %139: ptr, %140: ptr, %141: ptr):
-    %2176 = call @func.259(%139)
+    %2176 = call @func.3(%139)
     br bb91(%138, %140, %141, %2176)
 bb91(%142: ptr, %143: ptr, %144: ptr, %145: ptr):
     call @func.13(%256, %145)
     br bb92(%142, %143, %144)
 bb92(%146: ptr, %147: ptr, %148: ptr):
     %2177 = const bool true
-    %2178 = call @func.259(%147)
+    %2178 = call @func.3(%147)
     br bb93(%146, %147, %148, %2178)
 bb93(%149: ptr, %150: ptr, %151: ptr, %152: ptr):
     call @func.13(%257, %152)
@@ -76839,7 +76476,7 @@ bb94(%153: ptr, %154: ptr, %155: ptr):
     %2179 = const bool false
     %2180 = const bool false
     %2181 = load ptr, ptr %178
-    call @func.169(%254, %2181, %255, %256, %257)
+    call @func.145(%254, %2181, %255, %256, %257)
     br bb95(%153, %154, %155)
 bb95(%156: ptr, %157: ptr, %158: ptr):
     %2182 = const bool false
@@ -76850,16 +76487,16 @@ bb95(%156: ptr, %157: ptr, %158: ptr):
     br bb96(%156, %157, %2186)
 bb96(%159: ptr, %160: ptr, %161: ptr):
     %2187 = load u64, ptr %254
-    call @func.157(%258, %159, %161, %2187)
+    call @func.134(%258, %159, %161, %2187)
     br bb97(%159, %160)
 bb97(%162: ptr, %163: ptr):
     %2188 = load ptr, ptr %178
-    call @func.261(%259, %162, %258, %2188)
+    call @func.214(%259, %162, %258, %2188)
     br bb98(%163)
 bb98(%164: ptr):
     %2189 = const bool true
     %2190 = load ptr, ptr %178
-    call @func.159(%2190)
+    call @func.136(%2190)
     br bb99(%164)
 bb99(%165: ptr):
     %2191 = const bool false
@@ -76919,7 +76556,7 @@ bb99(%165: ptr):
     %2236 = gep i8, ptr %262, %2235
     %2237 = load i64, ptr %2234
     store i64 %2237, ptr %2236
-    call @func.257(%261, %262)
+    call @func.74(%261, %262)
     br bb100(%165)
 bb100(%166: ptr):
     %2238 = load i64, ptr %261
@@ -77075,14 +76712,14 @@ bb102:
     %2360 = gep i8, ptr %263, %2359
     %2361 = load i64, ptr %2358
     store i64 %2361, ptr %2360
-    call @func.258(%0, %263)
+    call @func.103(%0, %263)
     br bb103
 bb103:
     %2362 = const bool false
     br bb118
 bb104(%168: ptr, %169: ptr):
     %2363 = load u64, ptr %254
-    call @func.170(%265, %168, %2363, %169)
+    call @func.146(%265, %168, %2363, %169)
     br bb105
 bb105:
     %2364 = load i64, ptr %265
@@ -77146,16 +76783,16 @@ bb106:
     %2410 = const bool false
     br bb118
 bb107:
-    call @func.171(%268)
+    call @func.147(%268)
     br bb110
 bb108:
-    call @func.172(%267)
+    call @func.148(%267)
     br bb109
 bb109:
-    call @func.51(%266, %267)
+    call @func.45(%266, %267)
     br bb111
 bb110:
-    call @func.51(%266, %268)
+    call @func.45(%266, %268)
     br bb111
 bb111:
     %2411 = load i64, ptr %266
@@ -77217,7 +76854,7 @@ bb111:
     br bb118
 bb112(%170: ptr, %171: ptr):
     %2457 = load ptr, ptr %178
-    call @func.261(%0, %170, %171, %2457)
+    call @func.214(%0, %170, %171, %2457)
     br bb118
 bb113(%172: bool):
     %2458 = const bool false
@@ -77245,13 +76882,10 @@ bb121(%176: bool):
 
 fn @Level__normalize(functy.262) {
 bb0(%0: ptr, %1: ptr):
-    call @func.265(%0, %1)
+    call @func.217(%0, %1)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.263) {
 }
 
 fn @Verifier____env___try_infer_type_quick_inner_blind(functy.264) {
@@ -77382,7 +77016,7 @@ bb7:
     %146 = load ptr, ptr %42
     %147 = const i64 8
     %148 = gep i8, ptr %146, %147
-    call @func.95(%50, %148)
+    call @func.87(%50, %148)
     br bb15
 bb8(%10: ptr):
     %149 = load ptr, ptr %42
@@ -77391,7 +77025,7 @@ bb8(%10: ptr):
     %152 = load ptr, ptr %42
     %153 = const i64 48
     %154 = gep i8, ptr %152, %153
-    call @func.161(%0, %10, %151)
+    call @func.138(%0, %10, %151)
     br bb43
 bb9(%11: ptr):
     %155 = load ptr, ptr %42
@@ -77400,7 +77034,7 @@ bb9(%11: ptr):
     %158 = load i64, ptr %157
     store i64 %158, ptr %44
     %159 = load u64, ptr %44
-    call @func.164(%43, %11, %159)
+    call @func.141(%43, %11, %159)
     br bb10
 bb10:
     %160 = load i64, ptr %43
@@ -77483,7 +77117,7 @@ bb14:
     store i64 %216, ptr %215
     br bb43
 bb15:
-    call @func.165(%49, %50)
+    call @func.142(%49, %50)
     br bb16
 bb16:
     %217 = const i64 8
@@ -77516,7 +77150,7 @@ bb16:
     store i64 %239, ptr %238
     %240 = const i64 5
     store i64 %240, ptr %48
-    call @func.49(%47, %48)
+    call @func.44(%47, %48)
     br bb17
 bb17:
     %241 = load i64, ptr %47
@@ -77577,7 +77211,7 @@ bb17:
     store i64 %286, ptr %285
     br bb43
 bb18(%12: ptr, %13: ptr, %14: ptr, %15: ptr):
-    call @func.256(%52, %12, %15, %13)
+    call @func.213(%52, %12, %15, %13)
     br bb19(%12, %13, %14)
 bb19(%16: ptr, %17: ptr, %18: ptr):
     %287 = load i64, ptr %52
@@ -77704,7 +77338,7 @@ bb21(%19: ptr, %20: ptr, %21: ptr):
     %384 = gep i8, ptr %51, %383
     %385 = load i64, ptr %382
     store i64 %385, ptr %384
-    call @func.154(%54, %19, %51, %20)
+    call @func.131(%54, %19, %51, %20)
     br bb22(%21)
 bb22(%22: ptr):
     store ptr %54, ptr %55
@@ -77770,7 +77404,7 @@ bb25(%24: ptr, %25: ptr):
     %438 = gep i8, ptr %436, %437
     br bb26(%25, %438)
 bb26(%26: ptr, %27: ptr):
-    call @func.166(%56, %26, %27)
+    call @func.143(%56, %26, %27)
     br bb27
 bb27:
     %439 = load i64, ptr %56
@@ -77835,7 +77469,7 @@ bb28:
 bb29:
     br bb43
 bb30(%28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: ptr):
-    call @func.256(%58, %28, %32, %29)
+    call @func.213(%58, %28, %32, %29)
     br bb31(%30, %31)
 bb31(%33: ptr, %34: ptr):
     %485 = load i64, ptr %58
@@ -77972,7 +77606,7 @@ bb33(%35: ptr, %36: ptr):
     %590 = gep i8, ptr %61, %589
     %591 = load i8, ptr %588
     store i8 %591, ptr %590
-    %592 = call @func.263(%36)
+    %592 = call @func.3(%36)
     br bb34(%592)
 bb34(%37: ptr):
     call @func.13(%62, %37)
@@ -78035,7 +77669,7 @@ bb35:
     %638 = gep i8, ptr %63, %637
     %639 = load i64, ptr %636
     store i64 %639, ptr %638
-    call @func.53(%60, %61, %62, %63)
+    call @func.47(%60, %61, %62, %63)
     br bb36
 bb36:
     %640 = load i64, ptr %60
@@ -78097,16 +77731,16 @@ bb36:
     %686 = const bool false
     br bb43
 bb37:
-    call @func.171(%66)
+    call @func.147(%66)
     br bb40
 bb38:
-    call @func.172(%65)
+    call @func.148(%65)
     br bb39
 bb39:
-    call @func.51(%64, %65)
+    call @func.45(%64, %65)
     br bb41
 bb40:
-    call @func.51(%64, %66)
+    call @func.45(%64, %66)
     br bb41
 bb41:
     %687 = load i64, ptr %64
@@ -78167,7 +77801,7 @@ bb41:
     store i64 %732, ptr %731
     br bb43
 bb42(%38: ptr, %39: ptr, %40: ptr):
-    call @func.256(%0, %38, %40, %39)
+    call @func.213(%0, %38, %40, %39)
     br bb43
 bb43:
     ret
@@ -78189,7 +77823,7 @@ bb0(%0: ptr, %1: ptr):
     %43 = alloca (i64, i64, i64, i64, i64), align 8
     %44 = const bool false
     %45 = const bool false
-    call @func.267(%33, %1)
+    call @func.218(%33, %1)
     br bb1
 bb1:
     %46 = load ptr, ptr %33
@@ -78221,7 +77855,7 @@ bb2:
     unreachable
 bb3(%2: u32):
     %69 = load ptr, ptr %32
-    call @func.276(%0, %69, %2)
+    call @func.223(%0, %69, %2)
     br bb31
 bb4(%3: u32):
     %70 = load ptr, ptr %32
@@ -78236,7 +77870,7 @@ bb4(%3: u32):
     br bb17(%3, %75, %78)
 bb5:
     %79 = load ptr, ptr %32
-    call @func.95(%0, %79)
+    call @func.87(%0, %79)
     br bb31
 bb6(%4: u32):
     %80 = load ptr, ptr %32
@@ -78266,7 +77900,7 @@ bb7(%5: u32):
     br bb11(%5)
 bb8(%6: u32):
     %101 = load ptr, ptr %32
-    call @func.66(%35, %101)
+    call @func.60(%35, %101)
     br bb10(%6)
 bb9(%7: u32):
     %102 = const bool true
@@ -78336,7 +77970,7 @@ bb13(%12: u32, %13: u32):
     %148 = gep i8, ptr %37, %147
     %149 = load i64, ptr %146
     store i64 %149, ptr %148
-    call @func.165(%36, %37)
+    call @func.142(%36, %37)
     br bb14(%12, %13)
 bb14(%14: u32, %15: u32):
     %150 = const bool true
@@ -78413,7 +78047,7 @@ bb16:
     br bb31
 bb17(%17: u32, %18: ptr, %19: ptr):
     %206 = const bool true
-    call @func.265(%39, %19)
+    call @func.217(%39, %19)
     br bb18(%17, %18)
 bb18(%20: u32, %21: ptr):
     %207 = load ptr, ptr %21
@@ -78421,7 +78055,7 @@ bb18(%20: u32, %21: ptr):
     %209 = gep i8, ptr %207, %208
     br bb19(%20, %209)
 bb19(%22: u32, %23: ptr):
-    call @func.265(%40, %23)
+    call @func.217(%40, %23)
     br bb20(%22)
 bb20(%24: u32):
     %210 = const bool false
@@ -78451,7 +78085,7 @@ bb20(%24: u32):
     %230 = gep i8, ptr %42, %229
     %231 = load i64, ptr %228
     store i64 %231, ptr %230
-    call @func.160(%41, %42, %40)
+    call @func.137(%41, %42, %40)
     br bb21(%24)
 bb21(%25: u32):
     %232 = load i64, ptr %41
@@ -78482,15 +78116,15 @@ bb23(%27: u32):
 bb24(%28: u32, %29: bool):
     condbr %29, bb25(%28), bb28(%28)
 bb25(%30: u32):
-    call @func.277(%43, %41, %30)
+    call @func.224(%43, %41, %30)
     br bb26
 bb26:
-    call @func.265(%0, %43)
+    call @func.217(%0, %43)
     br bb27
 bb27:
     br bb29
 bb28(%31: u32):
-    call @func.277(%0, %41, %31)
+    call @func.224(%0, %41, %31)
     br bb32
 bb29:
     br bb30
@@ -78503,9 +78137,6 @@ bb32:
     br bb29
 bb33:
     unreachable
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.266) {
 }
 
 fn @Level__get_offset(functy.267) {
@@ -78540,7 +78171,7 @@ bb2(%3: u32):
     %31 = const i64 8
     %32 = gep i8, ptr %30, %31
     %33 = const u32 1
-    %34 = call @func.266(%3, %33)
+    %34 = call @func.80(%3, %33)
     br bb3(%32, %34)
 bb3(%4: ptr, %5: u32):
     %35 = load ptr, ptr %4
@@ -78559,22 +78190,10 @@ bb5(%8: u32):
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.268) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.269) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.270) {
-}
-
 fn @_RNvXs8_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref8DerefMut9deref_mutBH_(functy.271) {
 }
 
 fn @_RNvMNtCs2EYQwhfuABO_4core5sliceSNtCsep0XPuQfTSm_25clean_binding_defeq_slice5Level4swapBw_(functy.272) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.273) {
 }
 
 fn @_RNvXsd_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index8IndexMutjE9index_mutBH_(functy.274) {
@@ -78602,31 +78221,31 @@ bb0(%0: ptr, %1: ptr, %2: u32):
     %115 = alloca (i64, i64), align 8
     %116 = alloca (i64, i64), align 8
     %117 = const bool false
-    call @func.268(%101)
+    call @func.10(%101)
     br bb1(%1, %2)
 bb1(%3: ptr, %4: u32):
-    call @func.281(%3, %101)
+    call @func.225(%3, %101)
     br bb2(%4)
 bb2(%5: u32):
-    call @func.268(%102)
+    call @func.10(%102)
     br bb3(%5)
 bb3(%6: u32):
     %118 = const u64 0
     br bb4(%6, %118)
 bb4(%7: u32, %8: u64):
-    %119 = call @func.269(%101)
+    %119 = call @func.65(%101)
     br bb5(%7, %8, %8, %119)
 bb5(%9: u32, %10: u64, %11: u64, %12: u64):
     %120 = icmp ult u64 %11, %12
     condbr %120, bb6(%9, %10), bb11(%9)
 bb6(%13: u32, %14: u64):
-    %121 = call @func.270(%101, %14)
+    %121 = call @func.66(%101, %14)
     br bb7(%13, %14, %121)
 bb7(%15: u32, %16: u64, %17: ptr):
-    call @func.265(%103, %17)
+    call @func.217(%103, %17)
     br bb8(%15, %16)
 bb8(%18: u32, %19: u64):
-    call @func.281(%103, %102)
+    call @func.225(%103, %102)
     br bb9(%18, %19)
 bb9(%20: u32, %21: u64):
     %122 = const u64 1
@@ -78648,7 +78267,7 @@ bb11(%23: u32):
     %133 = const u64 1
     br bb12(%23, %133)
 bb12(%24: u32, %25: u64):
-    %134 = call @func.269(%102)
+    %134 = call @func.65(%102)
     br bb13(%24, %25, %25, %134)
 bb13(%26: u32, %27: u64, %28: u64, %29: u64):
     %135 = icmp ult u64 %28, %29
@@ -78660,7 +78279,7 @@ bb15(%32: u32, %33: u64, %34: u64):
     %137 = icmp ugt u64 %34, %136
     condbr %137, bb16(%32, %33, %34), bb26(%32, %33)
 bb16(%35: u32, %36: u64, %37: u64):
-    %138 = call @func.270(%102, %37)
+    %138 = call @func.66(%102, %37)
     br bb17(%35, %36, %37, %138)
 bb17(%38: u32, %39: u64, %40: u64, %41: ptr):
     %139 = const u64 1
@@ -78677,15 +78296,15 @@ bb17(%38: u32, %39: u64, %40: u64, %41: ptr):
     condbr %148, bb18(%38, %39, %40, %41, %102), bb53
 bb18(%42: u32, %43: u64, %44: u64, %45: ptr, %46: ptr):
     %149 = load u64, ptr %105
-    %150 = call @func.270(%46, %149)
+    %150 = call @func.66(%46, %149)
     br bb19(%42, %43, %44, %45, %150)
 bb19(%47: u32, %48: u64, %49: u64, %50: ptr, %51: ptr):
-    %151 = call @func.285(%50, %51)
+    %151 = call @func.228(%50, %51)
     br bb20(%47, %48, %49, %151)
 bb20(%52: u32, %53: u64, %54: u64, %55: bool):
     condbr %55, bb21(%52, %53, %54), bb26(%52, %53)
 bb21(%56: u32, %57: u64, %58: u64):
-    call @func.271(%106, %102)
+    call @func.219(%106, %102)
     br bb22(%56, %57, %58)
 bb22(%59: u32, %60: u64, %61: u64):
     %152 = const u64 1
@@ -78702,7 +78321,7 @@ bb22(%59: u32, %60: u64, %61: u64):
     condbr %161, bb23(%59, %60, %61, %61), bb53
 bb23(%62: u32, %63: u64, %64: u64, %65: u64):
     %162 = load u64, ptr %107
-    call @func.272(%106, %65, %162)
+    call @func.220(%106, %65, %162)
     br bb24(%62, %63, %64)
 bb24(%66: u32, %67: u64, %68: u64):
     %163 = const u64 1
@@ -78737,16 +78356,16 @@ bb27(%73: u32):
     %184 = load u64, ptr %109
     br bb12(%73, %184)
 bb28(%74: u32):
-    call @func.273(%111, %102)
+    call @func.81(%111, %102)
     br bb29(%74)
 bb29(%75: u32):
-    call @func.290(%110, %111)
+    call @func.230(%110, %111)
     br bb30(%75)
 bb30(%76: u32):
-    call @func.273(%113, %110)
+    call @func.81(%113, %110)
     br bb31(%76)
 bb31(%77: u32):
-    call @func.296(%112, %113)
+    call @func.232(%112, %113)
     br bb32(%77)
 bb32(%78: u32):
     %185 = const u32 0
@@ -78756,20 +78375,20 @@ bb33(%79: u32):
     %187 = const u64 0
     br bb34(%79, %187)
 bb34(%80: u32, %81: u64):
-    %188 = call @func.269(%112)
+    %188 = call @func.65(%112)
     br bb35(%80, %81, %81, %188)
 bb35(%82: u32, %83: u64, %84: u64, %85: u64):
     %189 = icmp ult u64 %84, %85
     condbr %189, bb36(%82, %83), bb42
 bb36(%86: u32, %87: u64):
-    %190 = call @func.270(%112, %87)
+    %190 = call @func.66(%112, %87)
     br bb37(%86, %87, %190)
 bb37(%88: u32, %89: u64, %90: ptr):
-    call @func.277(%114, %90, %88)
+    call @func.224(%114, %90, %88)
     br bb38(%88, %89)
 bb38(%91: u32, %92: u64):
     %191 = const bool true
-    %192 = call @func.274(%112, %92)
+    %192 = call @func.221(%112, %92)
     br bb39(%91, %92, %192)
 bb39(%93: u32, %94: u64, %95: ptr):
     br bb40(%93, %94, %95)
@@ -78818,7 +78437,7 @@ bb41(%99: u32):
     %226 = load u64, ptr %115
     br bb34(%99, %226)
 bb42:
-    %227 = call @func.275(%112)
+    %227 = call @func.222(%112)
     br bb43(%227)
 bb43(%100: bool):
     condbr %100, bb44, bb45
@@ -78827,10 +78446,10 @@ bb44:
     store i64 %228, ptr %0
     br bb47
 bb45:
-    call @func.273(%116, %112)
+    call @func.81(%116, %112)
     br bb46
 bb46:
-    call @func.297(%0, %116)
+    call @func.233(%0, %116)
     br bb52
 bb47:
     br bb48
@@ -78856,7 +78475,7 @@ bb0(%0: ptr, %1: ptr, %2: u32):
     %14 = alloca (i32, i32), align 4
     %15 = const bool false
     %16 = const bool true
-    call @func.95(%11, %1)
+    call @func.87(%11, %1)
     br bb1(%2)
 bb1(%3: u32):
     %17 = const u32 0
@@ -78892,7 +78511,7 @@ bb3(%6: u32, %7: u32):
     %39 = gep i8, ptr %13, %38
     %40 = load i64, ptr %37
     store i64 %40, ptr %39
-    call @func.165(%12, %13)
+    call @func.142(%12, %13)
     br bb4(%6, %7)
 bb4(%8: u32, %9: u32):
     %41 = const bool true
@@ -78971,15 +78590,6 @@ bb7:
     unreachable
 }
 
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3popBH_(functy.278) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBI_(functy.279) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.280) {
-}
-
 fn @Level__push_max_args(functy.281) {
 bb0(%0: ptr, %1: ptr):
     %27 = alloca (i64, i64, i64), align 8
@@ -79002,7 +78612,7 @@ bb1(%2: ptr, %3: ptr):
     %41 = icmp eq u64 %39, %40
     condbr %41, bb13(%2, %3, %34), bb18
 bb2(%4: ptr):
-    call @func.278(%29, %27)
+    call @func.97(%29, %27)
     br bb3(%4)
 bb3(%5: ptr):
     %42 = load i64, ptr %29
@@ -79037,7 +78647,7 @@ bb4(%6: ptr):
     switch %67 [ 2: bb6(%6) default: bb5(%6) ]
 bb5(%7: ptr):
     %68 = load ptr, ptr %30
-    call @func.95(%31, %68)
+    call @func.87(%31, %68)
     br bb10(%7)
 bb6(%8: ptr):
     %69 = load ptr, ptr %30
@@ -79051,7 +78661,7 @@ bb6(%8: ptr):
     %77 = gep i8, ptr %75, %76
     br bb7(%8, %71, %27, %77)
 bb7(%9: ptr, %10: ptr, %11: ptr, %12: ptr):
-    call @func.279(%11, %12)
+    call @func.98(%11, %12)
     br bb8(%9, %10)
 bb8(%13: ptr, %14: ptr):
     %78 = load ptr, ptr %14
@@ -79059,10 +78669,10 @@ bb8(%13: ptr, %14: ptr):
     %80 = gep i8, ptr %78, %79
     br bb9(%13, %27, %80)
 bb9(%15: ptr, %16: ptr, %17: ptr):
-    call @func.279(%16, %17)
+    call @func.98(%16, %17)
     br bb16(%15)
 bb10(%18: ptr):
-    call @func.280(%18, %31)
+    call @func.11(%18, %31)
     br bb17(%18)
 bb11:
     br bb12
@@ -79103,9 +78713,6 @@ bb18:
     unreachable
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.282) {
-}
-
 fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2neBF_(functy.283) {
 }
 
@@ -79137,7 +78744,7 @@ bb0(%0: ptr, %1: ptr):
     store ptr %1, ptr %29
     br bb1
 bb1:
-    %47 = call @func.282(%28, %29)
+    %47 = call @func.203(%28, %29)
     br bb2(%47)
 bb2(%2: bool):
     condbr %2, bb3, bb4
@@ -79146,7 +78753,7 @@ bb3:
     br bb31(%48)
 bb4:
     %49 = load ptr, ptr %28
-    call @func.267(%31, %49)
+    call @func.218(%31, %49)
     br bb5
 bb5:
     %50 = load ptr, ptr %31
@@ -79155,7 +78762,7 @@ bb5:
     %52 = gep i8, ptr %31, %51
     %53 = load u32, ptr %52
     %54 = load ptr, ptr %29
-    call @func.267(%33, %54)
+    call @func.218(%33, %54)
     br bb6(%53)
 bb6(%3: u32):
     %55 = load ptr, ptr %33
@@ -79163,28 +78770,28 @@ bb6(%3: u32):
     %56 = const i64 8
     %57 = gep i8, ptr %33, %56
     %58 = load u32, ptr %57
-    %59 = call @func.283(%30, %32)
+    %59 = call @func.226(%30, %32)
     br bb7(%3, %58, %59)
 bb7(%4: u32, %5: u32, %6: bool):
     condbr %6, bb8, bb30(%4, %5)
 bb8:
     %60 = load ptr, ptr %30
-    %61 = call @func.298(%60)
+    %61 = call @func.234(%60)
     br bb9(%61)
 bb9(%7: u8):
     %62 = load ptr, ptr %32
-    %63 = call @func.298(%62)
+    %63 = call @func.234(%62)
     br bb10(%7, %63)
 bb10(%8: u8, %9: u8):
     %64 = icmp ne u8 %8, %9
     condbr %64, bb11, bb14
 bb11:
     %65 = load ptr, ptr %30
-    %66 = call @func.298(%65)
+    %66 = call @func.234(%65)
     br bb12(%66)
 bb12(%10: u8):
     %67 = load ptr, ptr %32
-    %68 = call @func.298(%67)
+    %68 = call @func.234(%67)
     br bb13(%10, %68)
 bb13(%11: u8, %12: u8):
     %69 = icmp ult u8 %11, %12
@@ -79353,10 +78960,10 @@ bb21:
     %201 = load ptr, ptr %200
     store ptr %201, ptr %46
     %202 = load ptr, ptr %46
-    %203 = call @func.303(%198, %202)
+    %203 = call @func.238(%198, %202)
     br bb31(%203)
 bb22(%13: ptr, %14: ptr):
-    %204 = call @func.284(%35, %36)
+    %204 = call @func.227(%35, %36)
     br bb23(%13, %14, %204)
 bb23(%15: ptr, %16: ptr, %17: bool):
     condbr %17, bb24, bb27(%15, %16)
@@ -79397,15 +79004,6 @@ bb31(%27: bool):
     ret %27
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.286) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.287) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.288) {
-}
-
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3popBG_(functy.289) {
 }
 
@@ -79428,7 +79026,7 @@ bb0(%0: ptr, %1: ptr):
     %92 = alloca (i64, i64, i64, i64, i64), align 8
     %93 = alloca (i64, i64, i64, i64, i64), align 8
     %94 = alloca (i64, i64), align 8
-    call @func.286(%78)
+    call @func.10(%78)
     br bb1
 bb1:
     %95 = const u64 0
@@ -79442,7 +79040,7 @@ bb2(%2: u64, %3: u64):
     %101 = const u64 40
     %102 = mul u64 %3, %101
     %103 = gep i8, ptr %100, %102
-    %104 = call @func.304(%103)
+    %104 = call @func.239(%103)
     br bb3(%2, %104)
 bb3(%4: u64, %5: bool):
     condbr %5, bb4(%4), bb25(%4)
@@ -79491,7 +79089,7 @@ bb8(%10: u64, %11: u64):
     %136 = const u64 40
     %137 = mul u64 %11, %136
     %138 = gep i8, ptr %135, %137
-    %139 = call @func.304(%138)
+    %139 = call @func.239(%138)
     br bb9(%10, %139)
 bb9(%12: u64, %13: bool):
     condbr %13, bb10(%12), bb12(%12)
@@ -79522,7 +79120,7 @@ bb13(%16: u64, %17: u64):
     %156 = const u64 40
     %157 = mul u64 %17, %156
     %158 = gep i8, ptr %155, %157
-    call @func.267(%82, %158)
+    call @func.218(%82, %158)
     br bb14(%16)
 bb14(%18: u64):
     %159 = const i64 8
@@ -79560,7 +79158,7 @@ bb18(%27: u64, %28: u32, %29: u64, %30: u64):
     %182 = const u64 40
     %183 = mul u64 %30, %182
     %184 = gep i8, ptr %181, %183
-    call @func.267(%84, %184)
+    call @func.218(%84, %184)
     br bb19(%27, %28, %29)
 bb19(%31: u64, %32: u32, %33: u64):
     %185 = const i64 8
@@ -79623,10 +79221,10 @@ bb27(%44: u64, %45: ptr, %46: u64):
     %224 = const u64 40
     %225 = mul u64 %46, %224
     %226 = gep i8, ptr %223, %225
-    call @func.95(%87, %226)
+    call @func.87(%87, %226)
     br bb28(%44, %45)
 bb28(%47: u64, %48: ptr):
-    call @func.287(%48, %87)
+    call @func.11(%48, %87)
     br bb29(%47)
 bb29(%49: u64):
     %227 = const i64 8
@@ -79639,7 +79237,7 @@ bb30(%50: u64, %51: u64):
     %232 = const u64 40
     %233 = mul u64 %51, %232
     %234 = gep i8, ptr %231, %233
-    call @func.267(%88, %234)
+    call @func.218(%88, %234)
     br bb31(%50)
 bb31(%52: u64):
     %235 = const u64 1
@@ -79674,10 +79272,10 @@ bb35(%55: u64, %56: u64):
     %255 = const u64 40
     %256 = mul u64 %56, %255
     %257 = gep i8, ptr %254, %256
-    call @func.267(%90, %257)
+    call @func.218(%90, %257)
     br bb36(%55)
 bb36(%57: u64):
-    %258 = call @func.288(%88, %90)
+    %258 = call @func.203(%88, %90)
     br bb37(%57, %258)
 bb37(%58: u64, %59: bool):
     condbr %59, bb38(%58), bb44(%58)
@@ -79699,7 +79297,7 @@ bb39(%61: u64):
     %270 = gep i8, ptr %88, %269
     %271 = load i64, ptr %268
     store i64 %271, ptr %270
-    call @func.289(%91, %78)
+    call @func.229(%91, %78)
     br bb40(%61)
 bb40(%62: u64):
     br bb41(%62)
@@ -79714,10 +79312,10 @@ bb42(%64: u64, %65: ptr, %66: u64):
     %277 = const u64 40
     %278 = mul u64 %66, %277
     %279 = gep i8, ptr %276, %278
-    call @func.95(%92, %279)
+    call @func.87(%92, %279)
     br bb43(%64, %65)
 bb43(%67: u64, %68: ptr):
-    call @func.287(%68, %92)
+    call @func.11(%68, %92)
     br bb50(%67)
 bb44(%69: u64):
     %280 = load i64, ptr %90
@@ -79738,10 +79336,10 @@ bb45(%70: u64, %71: ptr, %72: u64):
     %291 = const u64 40
     %292 = mul u64 %72, %291
     %293 = gep i8, ptr %290, %292
-    call @func.95(%93, %293)
+    call @func.87(%93, %293)
     br bb46(%70, %71)
 bb46(%73: u64, %74: ptr):
-    call @func.287(%74, %93)
+    call @func.11(%74, %93)
     br bb51(%73)
 bb47(%75: u64):
     %294 = const u64 1
@@ -79786,18 +79384,6 @@ bb52:
 fn @_RNvMNtCskTzINo8ZBH9_5alloc5sliceSNtCsep0XPuQfTSm_25clean_binding_defeq_slice5Level6to_vecBx_(functy.291) {
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.292) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.293) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.294) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.295) {
-}
-
 fn @Level__subsume_max_args(functy.296) {
 bb0(%0: ptr, %1: ptr):
     %219 = alloca (i64, i64), align 8
@@ -79820,7 +79406,7 @@ bb0(%0: ptr, %1: ptr):
     %236 = icmp ule u64 %234, %235
     condbr %236, bb1, bb2
 bb1:
-    call @func.291(%0, %1)
+    call @func.231(%0, %1)
     br bb66
 bb2:
     %237 = const bool false
@@ -79843,7 +79429,7 @@ bb5(%6: bool, %7: u64, %8: u64):
     %248 = const u64 40
     %249 = mul u64 %8, %248
     %250 = gep i8, ptr %247, %249
-    call @func.267(%219, %250)
+    call @func.218(%219, %250)
     br bb6(%6, %7)
 bb6(%9: bool, %10: u64):
     %251 = load ptr, ptr %219
@@ -79896,10 +79482,10 @@ bb12(%20: bool):
 bb13(%21: bool):
     condbr %21, bb15, bb14
 bb14:
-    call @func.291(%0, %1)
+    call @func.231(%0, %1)
     br bb66
 bb15:
-    call @func.292(%221)
+    call @func.10(%221)
     br bb16
 bb16:
     %284 = const u64 0
@@ -79921,7 +79507,7 @@ bb19(%24: u64, %25: u64):
     %294 = const u64 40
     %295 = mul u64 %25, %294
     %296 = gep i8, ptr %293, %295
-    call @func.267(%222, %296)
+    call @func.218(%222, %296)
     br bb20(%24, %296)
 bb20(%26: u64, %27: ptr):
     %297 = load ptr, ptr %222
@@ -79955,16 +79541,16 @@ bb23(%32: u64, %33: ptr, %34: bool):
     %319 = const u64 0
     br bb24(%32, %33, %34, %318, %319)
 bb24(%35: u64, %36: ptr, %37: bool, %38: bool, %39: u64):
-    %320 = call @func.293(%221)
+    %320 = call @func.65(%221)
     br bb25(%35, %36, %37, %38, %39, %39, %320)
 bb25(%40: u64, %41: ptr, %42: bool, %43: bool, %44: u64, %45: u64, %46: u64):
     %321 = icmp ult u64 %45, %46
     condbr %321, bb26(%40, %41, %42, %43, %44), bb38(%40, %41, %42, %43)
 bb26(%47: u64, %48: ptr, %49: bool, %50: bool, %51: u64):
-    %322 = call @func.294(%221, %51)
+    %322 = call @func.66(%221, %51)
     br bb27(%47, %48, %49, %50, %51, %322)
 bb27(%52: u64, %53: ptr, %54: bool, %55: bool, %56: u64, %57: ptr):
-    call @func.267(%223, %57)
+    call @func.218(%223, %57)
     br bb28(%52, %53, %54, %55, %56, %57)
 bb28(%58: u64, %59: ptr, %60: bool, %61: bool, %62: u64, %63: ptr):
     %323 = load ptr, ptr %223
@@ -79998,7 +79584,7 @@ bb31(%76: u64, %77: ptr, %78: bool, %79: bool, %80: u64, %81: ptr, %82: bool):
 bb32(%83: u64, %84: ptr, %85: bool, %86: bool, %87: u64, %88: ptr, %89: bool):
     condbr %89, bb33(%83, %84, %85, %86, %87, %88), bb36(%83, %84, %85, %86, %87)
 bb33(%90: u64, %91: ptr, %92: bool, %93: bool, %94: u64, %95: ptr):
-    %344 = call @func.308(%95, %91)
+    %344 = call @func.240(%95, %91)
     br bb34(%90, %91, %92, %93, %94, %344)
 bb34(%96: u64, %97: ptr, %98: bool, %99: bool, %100: u64, %101: bool):
     condbr %101, bb35(%96, %97, %98), bb36(%96, %97, %98, %99, %100)
@@ -80073,7 +79659,7 @@ bb45(%136: u64, %137: ptr, %138: bool, %139: bool, %140: u64, %141: u64):
     %389 = const u64 40
     %390 = mul u64 %141, %389
     %391 = gep i8, ptr %388, %390
-    call @func.267(%227, %391)
+    call @func.218(%227, %391)
     br bb46(%136, %137, %138, %139, %140, %391)
 bb46(%142: u64, %143: ptr, %144: bool, %145: bool, %146: u64, %147: ptr):
     %392 = load ptr, ptr %227
@@ -80107,12 +79693,12 @@ bb49(%160: u64, %161: ptr, %162: bool, %163: bool, %164: u64, %165: ptr, %166: b
 bb50(%167: u64, %168: ptr, %169: bool, %170: bool, %171: u64, %172: ptr, %173: bool):
     condbr %173, bb51(%167, %168, %169, %170, %171, %172), bb56(%167, %168, %169, %170, %171)
 bb51(%174: u64, %175: ptr, %176: bool, %177: bool, %178: u64, %179: ptr):
-    %413 = call @func.308(%179, %175)
+    %413 = call @func.240(%179, %175)
     br bb52(%174, %175, %176, %177, %178, %179, %413)
 bb52(%180: u64, %181: ptr, %182: bool, %183: bool, %184: u64, %185: ptr, %186: bool):
     condbr %186, bb53(%180, %181, %182, %183, %184, %185), bb56(%180, %181, %182, %183, %184)
 bb53(%187: u64, %188: ptr, %189: bool, %190: bool, %191: u64, %192: ptr):
-    %414 = call @func.308(%188, %192)
+    %414 = call @func.240(%188, %192)
     br bb54(%187, %188, %189, %190, %191, %414)
 bb54(%193: u64, %194: ptr, %195: bool, %196: bool, %197: u64, %198: bool):
     condbr %198, bb56(%193, %194, %195, %196, %197), bb55(%193, %194)
@@ -80154,10 +79740,10 @@ bb60:
     %437 = load u64, ptr %229
     br bb17(%437)
 bb61(%214: u64, %215: ptr):
-    call @func.95(%230, %215)
+    call @func.87(%230, %215)
     br bb62(%214, %221)
 bb62(%216: u64, %217: ptr):
-    call @func.295(%217, %230)
+    call @func.11(%217, %230)
     br bb63(%216)
 bb63(%218: u64):
     %438 = const u64 1
@@ -80232,7 +79818,7 @@ bb2(%2: u64):
     %38 = const u64 40
     %39 = mul u64 %2, %38
     %40 = gep i8, ptr %37, %39
-    call @func.95(%0, %40)
+    call @func.87(%0, %40)
     br bb21
 bb3:
     %41 = const i64 8
@@ -80262,10 +79848,10 @@ bb5(%3: u64):
     %60 = const u64 40
     %61 = mul u64 %3, %60
     %62 = gep i8, ptr %59, %61
-    call @func.95(%14, %62)
+    call @func.87(%14, %62)
     br bb6
 bb6:
-    call @func.85(%13, %14)
+    call @func.79(%13, %14)
     br bb7
 bb7:
     %63 = const i64 8
@@ -80295,10 +79881,10 @@ bb9(%4: u64):
     %82 = const u64 40
     %83 = mul u64 %4, %82
     %84 = gep i8, ptr %81, %83
-    call @func.95(%17, %84)
+    call @func.87(%17, %84)
     br bb10
 bb10:
-    call @func.85(%16, %17)
+    call @func.79(%16, %17)
     br bb11
 bb11:
     %85 = const bool true
@@ -80359,10 +79945,10 @@ bb16(%7: u64, %8: u64):
     %125 = const u64 40
     %126 = mul u64 %8, %125
     %127 = gep i8, ptr %124, %126
-    call @func.95(%23, %127)
+    call @func.87(%23, %127)
     br bb17(%7)
 bb17(%9: u64):
-    call @func.85(%22, %23)
+    call @func.79(%22, %23)
     br bb18(%9)
 bb18(%10: u64):
     %128 = const bool false
@@ -80392,7 +79978,7 @@ bb18(%10: u64):
     %148 = gep i8, ptr %25, %147
     %149 = load i64, ptr %146
     store i64 %149, ptr %148
-    call @func.85(%24, %25)
+    call @func.79(%24, %25)
     br bb19(%10)
 bb19(%11: u64):
     %150 = load ptr, ptr %22
@@ -80520,9 +80106,6 @@ fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecRNtCsep0XPuQfTSm_25clean_binding
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecRNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3popBH_(functy.301) {
 }
 
-fn @_RNvXsw_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArceENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.302) {
-}
-
 fn @name_cmp_is_lt(functy.303) {
 bb0(%0: ptr, %1: ptr):
     %29 = alloca (i64, i64, i64), align 8
@@ -80543,7 +80126,7 @@ bb0(%0: ptr, %1: ptr):
     %44 = alloca i64, align 8
     %45 = alloca i64, align 8
     %46 = alloca i64, align 8
-    call @func.299(%29)
+    call @func.235(%29)
     br bb1(%0, %1)
 bb1(%2: ptr, %3: ptr):
     store ptr %2, ptr %30
@@ -80561,17 +80144,17 @@ bb4(%5: ptr):
     %51 = const i64 16
     %52 = gep i8, ptr %50, %51
     %53 = load ptr, ptr %30
-    call @func.300(%29, %53)
+    call @func.236(%29, %53)
     br bb9(%5, %52)
 bb5(%6: ptr):
     %54 = load ptr, ptr %31
     %55 = const i64 8
     %56 = gep i8, ptr %54, %55
     %57 = load ptr, ptr %30
-    call @func.300(%29, %57)
+    call @func.236(%29, %57)
     br bb7(%6, %56)
 bb6(%7: ptr):
-    call @func.299(%32)
+    call @func.235(%32)
     br bb11(%7)
 bb7(%8: ptr, %9: ptr):
     %58 = load ptr, ptr %9
@@ -80603,14 +80186,14 @@ bb13:
     %68 = const i64 16
     %69 = gep i8, ptr %67, %68
     %70 = load ptr, ptr %33
-    call @func.300(%32, %70)
+    call @func.236(%32, %70)
     br bb17(%69)
 bb14:
     %71 = load ptr, ptr %34
     %72 = const i64 8
     %73 = gep i8, ptr %71, %72
     %74 = load ptr, ptr %33
-    call @func.300(%32, %74)
+    call @func.236(%32, %74)
     br bb15(%73)
 bb15(%17: ptr):
     %75 = load ptr, ptr %17
@@ -80629,10 +80212,10 @@ bb18(%20: ptr):
     store ptr %20, ptr %33
     br bb12
 bb19:
-    call @func.301(%35, %29)
+    call @func.237(%35, %29)
     br bb20
 bb20:
-    call @func.301(%36, %32)
+    call @func.237(%36, %32)
     br bb21
 bb21:
     %81 = load ptr, ptr %35
@@ -80724,7 +80307,7 @@ bb32:
     %137 = load ptr, ptr %44
     %138 = const i64 16
     %139 = gep i8, ptr %137, %138
-    call @func.302(%41, %133)
+    call @func.58(%41, %133)
     br bb35(%139)
 bb33:
     %140 = load ptr, ptr %40
@@ -80749,10 +80332,10 @@ bb34(%21: ptr, %22: ptr):
     %155 = icmp ult u64 %153, %154
     br bb39(%155)
 bb35(%23: ptr):
-    call @func.302(%42, %23)
+    call @func.58(%42, %23)
     br bb36
 bb36:
-    %156 = call @func.309(%41, %42)
+    %156 = call @func.241(%41, %42)
     br bb37(%156)
 bb37(%24: i32):
     %157 = const i32 0
@@ -80773,7 +80356,7 @@ bb41(%28: bool):
 fn @Level__is_explicit(functy.304) {
 bb0(%0: ptr):
     %2 = alloca (i64, i64), align 8
-    call @func.267(%2, %0)
+    call @func.218(%2, %0)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -80804,15 +80387,6 @@ bb3:
     br bb4(%23)
 bb4(%1: bool):
     ret %1
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecTRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelBF_EE3popBI_(functy.305) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.306) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecTRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelBG_EE4pushBJ_(functy.307) {
 }
 
 fn @Level__is_geq_core(functy.308) {
@@ -80852,7 +80426,7 @@ bb1(%2: ptr, %3: ptr):
     %80 = icmp eq u64 %78, %79
     condbr %80, bb47(%73), bb54
 bb2:
-    call @func.305(%56, %53)
+    call @func.176(%56, %53)
     br bb3
 bb3:
     %81 = load i64, ptr %56
@@ -80869,19 +80443,19 @@ bb4:
     %89 = gep i8, ptr %56, %88
     %90 = load ptr, ptr %89
     store ptr %90, ptr %58
-    %91 = call @func.306(%57, %58)
+    %91 = call @func.203(%57, %58)
     br bb5(%91)
 bb5(%4: bool):
     condbr %4, bb2, bb6
 bb6:
     %92 = load ptr, ptr %58
-    %93 = call @func.79(%92)
+    %93 = call @func.73(%92)
     br bb7(%93)
 bb7(%5: bool):
     condbr %5, bb2, bb8
 bb8:
     %94 = load ptr, ptr %57
-    call @func.267(%60, %94)
+    call @func.218(%60, %94)
     br bb9
 bb9:
     %95 = load ptr, ptr %60
@@ -80895,7 +80469,7 @@ bb9:
 bb10(%6: u32):
     %101 = load ptr, ptr %59
     %102 = load ptr, ptr %58
-    %103 = call @func.209(%101, %102)
+    %103 = call @func.178(%101, %102)
     br bb11(%6, %103)
 bb11(%7: u32, %8: bool):
     condbr %8, bb2, bb12(%7)
@@ -80958,7 +80532,7 @@ bb15(%11: ptr, %12: ptr, %13: ptr):
     %152 = const i64 8
     %153 = gep i8, ptr %61, %152
     store ptr %13, ptr %153
-    call @func.307(%12, %61)
+    call @func.177(%12, %61)
     br bb16(%11)
 bb16(%14: ptr):
     %154 = load ptr, ptr %14
@@ -80971,7 +80545,7 @@ bb17(%15: ptr, %16: ptr):
     %158 = const i64 8
     %159 = gep i8, ptr %62, %158
     store ptr %16, ptr %159
-    call @func.307(%15, %62)
+    call @func.177(%15, %62)
     br bb50
 bb18(%17: u32):
     %160 = load ptr, ptr %58
@@ -81007,7 +80581,7 @@ bb19:
     br bb20(%184, %187)
 bb20(%18: ptr, %19: ptr):
     %188 = load ptr, ptr %58
-    %189 = call @func.311(%19, %188)
+    %189 = call @func.242(%19, %188)
     br bb21(%18, %189)
 bb21(%20: ptr, %21: bool):
     condbr %21, bb2, bb22(%20)
@@ -81018,7 +80592,7 @@ bb22(%22: ptr):
     br bb23(%192)
 bb23(%23: ptr):
     %193 = load ptr, ptr %58
-    %194 = call @func.311(%23, %193)
+    %194 = call @func.242(%23, %193)
     br bb24(%194)
 bb24(%24: bool):
     condbr %24, bb2, bb25
@@ -81063,7 +80637,7 @@ bb28(%26: ptr, %27: ptr, %28: ptr):
     %225 = const i64 8
     %226 = gep i8, ptr %63, %225
     store ptr %28, ptr %226
-    call @func.307(%27, %63)
+    call @func.177(%27, %63)
     br bb29(%26)
 bb29(%29: ptr):
     %227 = load ptr, ptr %29
@@ -81076,11 +80650,11 @@ bb30(%30: ptr, %31: ptr):
     %231 = const i64 8
     %232 = gep i8, ptr %64, %231
     store ptr %31, ptr %232
-    call @func.307(%30, %64)
+    call @func.177(%30, %64)
     br bb51
 bb31(%32: u32):
     %233 = load ptr, ptr %58
-    call @func.267(%67, %233)
+    call @func.218(%67, %233)
     br bb34(%32)
 bb32:
     %234 = load ptr, ptr %57
@@ -81096,7 +80670,7 @@ bb33(%33: ptr, %34: ptr):
     %241 = const i64 8
     %242 = gep i8, ptr %65, %241
     store ptr %240, ptr %242
-    call @func.307(%33, %65)
+    call @func.177(%33, %65)
     br bb52
 bb34(%35: u32):
     %243 = load ptr, ptr %67
@@ -81104,13 +80678,13 @@ bb34(%35: u32):
     %244 = const i64 8
     %245 = gep i8, ptr %67, %244
     %246 = load u32, ptr %245
-    %247 = call @func.306(%59, %66)
+    %247 = call @func.203(%59, %66)
     br bb35(%35, %246, %247)
 bb35(%36: u32, %37: u32, %38: bool):
     condbr %38, bb38(%36, %37), bb36(%36, %37)
 bb36(%39: u32, %40: u32):
     %248 = load ptr, ptr %66
-    %249 = call @func.79(%248)
+    %249 = call @func.73(%248)
     br bb37(%39, %40, %249)
 bb37(%41: u32, %42: u32, %43: bool):
     condbr %43, bb38(%41, %42), bb40(%41, %42)
@@ -81134,7 +80708,7 @@ bb42:
     %257 = const i64 8
     %258 = gep i8, ptr %68, %257
     store ptr %256, ptr %258
-    call @func.307(%53, %68)
+    call @func.177(%53, %68)
     br bb53
 bb43:
     %259 = const bool false
@@ -81328,9 +80902,6 @@ bb21:
     unreachable
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.310) {
-}
-
 fn @Level__is_geq_leaf(functy.311) {
 bb0(%0: ptr, %1: ptr):
     %20 = alloca i64, align 8
@@ -81341,13 +80912,13 @@ bb0(%0: ptr, %1: ptr):
     %25 = alloca (i64, i64), align 8
     store ptr %0, ptr %20
     store ptr %1, ptr %21
-    %26 = call @func.310(%20, %21)
+    %26 = call @func.203(%20, %21)
     br bb1(%26)
 bb1(%2: bool):
     condbr %2, bb4, bb2
 bb2:
     %27 = load ptr, ptr %21
-    %28 = call @func.79(%27)
+    %28 = call @func.73(%27)
     br bb3(%28)
 bb3(%3: bool):
     condbr %3, bb4, bb5
@@ -81356,7 +80927,7 @@ bb4:
     br bb17(%29)
 bb5:
     %30 = load ptr, ptr %20
-    call @func.267(%23, %30)
+    call @func.218(%23, %30)
     br bb6
 bb6:
     %31 = load ptr, ptr %23
@@ -81370,7 +80941,7 @@ bb6:
 bb7(%4: u32):
     %37 = load ptr, ptr %22
     %38 = load ptr, ptr %21
-    %39 = call @func.209(%37, %38)
+    %39 = call @func.178(%37, %38)
     br bb8(%4, %39)
 bb8(%5: u32, %6: bool):
     condbr %6, bb9, bb10(%5)
@@ -81379,7 +80950,7 @@ bb9:
     br bb17(%40)
 bb10(%7: u32):
     %41 = load ptr, ptr %21
-    call @func.267(%25, %41)
+    call @func.218(%25, %41)
     br bb11(%7)
 bb11(%8: u32):
     %42 = load ptr, ptr %25
@@ -81387,13 +80958,13 @@ bb11(%8: u32):
     %43 = const i64 8
     %44 = gep i8, ptr %25, %43
     %45 = load u32, ptr %44
-    %46 = call @func.310(%22, %24)
+    %46 = call @func.203(%22, %24)
     br bb12(%8, %45, %46)
 bb12(%9: u32, %10: u32, %11: bool):
     condbr %11, bb15(%9, %10), bb13(%9, %10)
 bb13(%12: u32, %13: u32):
     %47 = load ptr, ptr %24
-    %48 = call @func.79(%47)
+    %48 = call @func.73(%47)
     br bb14(%12, %13, %48)
 bb14(%14: u32, %15: u32, %16: bool):
     condbr %16, bb15(%14, %15), bb16
@@ -83216,7 +82787,7 @@ bb86(%233: ptr, %234: ptr, %235: u64):
     %2053 = or u64 %235, %2052
     br bb87(%233, %234, %2053)
 bb87(%236: ptr, %237: ptr, %238: u64):
-    %2054 = call @func.32(%1207, %1272, %1278, %1261)
+    %2054 = call @func.30(%1207, %1272, %1278, %1261)
     br bb88(%236, %237, %238, %2054)
 bb88(%239: ptr, %240: ptr, %241: u64, %242: bool):
     condbr %242, bb90(%239, %240, %241), bb89(%239, %240, %241)
@@ -83243,7 +82814,7 @@ bb94(%258: ptr, %259: ptr, %260: u64):
     br bb95(%258, %259, %260)
 bb95(%261: ptr, %262: ptr, %263: u64):
     %2059 = const bool false
-    call @func.33(%1288, %1289, %1290, %1291)
+    call @func.31(%1288, %1289, %1290, %1291)
     br bb96(%261, %262, %263)
 bb96(%264: ptr, %265: ptr, %266: u64):
     %2060 = const bool true
@@ -83277,7 +82848,7 @@ bb102(%282: ptr, %283: ptr, %284: u64):
     br bb103(%282, %283, %284)
 bb103(%285: ptr, %286: ptr, %287: u64):
     %2069 = const bool false
-    %2070 = call @func.32(%1207, %1284, %1293, %1261)
+    %2070 = call @func.30(%1207, %1284, %1293, %1261)
     br bb104(%285, %286, %287, %2070)
 bb104(%288: ptr, %289: ptr, %290: u64, %291: bool):
     condbr %291, bb105(%288, %289, %290), bb106(%288, %289, %290)
@@ -83503,12 +83074,12 @@ bb115(%315: ptr, %316: ptr):
     br bb116(%315, %316)
 bb116(%317: ptr, %318: ptr):
     %2231 = const bool false
-    call @func.33(%1300, %1301, %1302, %1303)
+    call @func.31(%1300, %1301, %1302, %1303)
     br bb117(%317, %318)
 bb117(%319: ptr, %320: ptr):
     %2232 = const bool true
     %2233 = const bool false
-    call @func.34(%1305)
+    call @func.32(%1305)
     br bb118(%319, %320)
 bb118(%321: ptr, %322: ptr):
     call @func.15(%1306)
@@ -83520,23 +83091,23 @@ bb119(%323: ptr, %324: ptr):
     br bb120(%323, %324)
 bb120(%325: ptr, %326: ptr):
     %2236 = const bool false
-    call @func.33(%1304, %1305, %1306, %1307)
+    call @func.31(%1304, %1305, %1306, %1307)
     br bb121(%325, %326)
 bb121(%327: ptr, %328: ptr):
     %2237 = const bool false
     %2238 = const u64 0
-    call @func.35(%1308, %1300)
+    call @func.33(%1308, %1300)
     br bb122(%327, %328, %2238)
 bb122(%329: ptr, %330: ptr, %331: u64):
     %2239 = load u64, ptr %1308
-    %2240 = call @func.36(%2239)
+    %2240 = call @func.34(%2239)
     br bb123(%329, %330, %331, %2240)
 bb123(%332: ptr, %333: ptr, %334: u64, %335: u64):
-    call @func.35(%1309, %1304)
+    call @func.33(%1309, %1304)
     br bb124(%332, %333, %334, %335)
 bb124(%336: ptr, %337: ptr, %338: u64, %339: u64):
     %2241 = load u64, ptr %1309
-    %2242 = call @func.36(%2241)
+    %2242 = call @func.34(%2241)
     br bb125(%336, %337, %338, %339, %2242)
 bb125(%340: ptr, %341: ptr, %342: u64, %343: u64, %344: u64):
     %2243 = icmp eq u64 %343, %344
@@ -83546,7 +83117,7 @@ bb126(%345: ptr, %346: ptr, %347: u64):
     %2245 = or u64 %347, %2244
     br bb127(%345, %346, %2245)
 bb127(%348: ptr, %349: ptr, %350: u64):
-    %2246 = call @func.42(%1300, %1304)
+    %2246 = call @func.40(%1300, %1304)
     br bb128(%348, %349, %350, %2246)
 bb128(%351: ptr, %352: ptr, %353: u64, %354: bool):
     condbr %354, bb130(%351, %352, %353), bb129(%351, %352, %353)
@@ -83564,7 +83135,7 @@ bb132(%365: ptr, %366: ptr, %367: u64):
     %2251 = or u64 %367, %2250
     br bb133(%365, %366, %2251)
 bb133(%368: ptr, %369: ptr, %370: u64):
-    %2252 = call @func.43(%1207, %1300, %1304, %1299)
+    %2252 = call @func.41(%1207, %1300, %1304, %1299)
     br bb134(%368, %369, %370, %2252)
 bb134(%371: ptr, %372: ptr, %373: u64, %374: bool):
     condbr %374, bb135(%371, %372, %373), bb136(%371, %372, %373)
@@ -83598,7 +83169,7 @@ bb140(%390: ptr, %391: ptr, %392: u64):
     %2263 = const bool false
     %2264 = const bool false
     %2265 = const bool false
-    call @func.44(%1310, %1311, %1313, %1314, %1315, %2265)
+    call @func.42(%1310, %1311, %1313, %1314, %1315, %2265)
     br bb141(%390, %391, %392)
 bb141(%393: ptr, %394: ptr, %395: u64):
     %2266 = const bool false
@@ -83629,24 +83200,24 @@ bb145(%405: ptr, %406: ptr, %407: u64):
     %2277 = const bool false
     %2278 = const bool false
     %2279 = const bool false
-    call @func.44(%1316, %1317, %1319, %1320, %1321, %2279)
+    call @func.42(%1316, %1317, %1319, %1320, %1321, %2279)
     br bb146(%405, %406, %407)
 bb146(%408: ptr, %409: ptr, %410: u64):
     %2280 = const bool false
     %2281 = const bool false
     %2282 = const bool false
-    call @func.35(%1322, %1310)
+    call @func.33(%1322, %1310)
     br bb147(%408, %409, %410)
 bb147(%411: ptr, %412: ptr, %413: u64):
     %2283 = load u64, ptr %1322
-    %2284 = call @func.36(%2283)
+    %2284 = call @func.34(%2283)
     br bb148(%411, %412, %413, %2284)
 bb148(%414: ptr, %415: ptr, %416: u64, %417: u64):
-    call @func.35(%1323, %1316)
+    call @func.33(%1323, %1316)
     br bb149(%414, %415, %416, %417)
 bb149(%418: ptr, %419: ptr, %420: u64, %421: u64):
     %2285 = load u64, ptr %1323
-    %2286 = call @func.36(%2285)
+    %2286 = call @func.34(%2285)
     br bb150(%418, %419, %420, %421, %2286)
 bb150(%422: ptr, %423: ptr, %424: u64, %425: u64, %426: u64):
     %2287 = icmp eq u64 %425, %426
@@ -83656,7 +83227,7 @@ bb151(%427: ptr, %428: ptr, %429: u64):
     %2289 = or u64 %429, %2288
     br bb152(%427, %428, %2289)
 bb152(%430: ptr, %431: ptr, %432: u64):
-    %2290 = call @func.42(%1310, %1316)
+    %2290 = call @func.40(%1310, %1316)
     br bb153(%430, %431, %432, %2290)
 bb153(%433: ptr, %434: ptr, %435: u64, %436: bool):
     condbr %436, bb155(%433, %434, %435), bb154(%433, %434, %435)
@@ -83665,7 +83236,7 @@ bb154(%437: ptr, %438: ptr, %439: u64):
     %2292 = or u64 %439, %2291
     br bb155(%437, %438, %2292)
 bb155(%440: ptr, %441: ptr, %442: u64):
-    %2293 = call @func.43(%1207, %1310, %1316, %1299)
+    %2293 = call @func.41(%1207, %1310, %1316, %1299)
     br bb156(%440, %441, %442, %2293)
 bb156(%443: ptr, %444: ptr, %445: u64, %446: bool):
     condbr %446, bb157(%443, %444, %445), bb158(%443, %444, %445)
@@ -83999,7 +83570,7 @@ bb184(%517: ptr, %518: ptr, %519: ptr):
 bb185(%520: ptr, %521: ptr, %522: ptr):
     %2496 = const bool false
     %2497 = const bool false
-    call @func.46(%1351, %522, %1352, %1354, %1355)
+    call @func.43(%1351, %522, %1352, %1354, %1355)
     br bb186(%520, %521)
 bb186(%523: ptr, %524: ptr):
     %2498 = const bool false
@@ -84257,7 +83828,7 @@ bb234(%664: ptr, %665: ptr, %666: u64, %667: ptr):
 bb235(%668: ptr, %669: ptr, %670: u64, %671: ptr):
     %2587 = const bool false
     %2588 = const bool false
-    call @func.46(%1408, %671, %1409, %1411, %1412)
+    call @func.43(%1408, %671, %1409, %1411, %1412)
     br bb236(%668, %669, %670)
 bb236(%672: ptr, %673: ptr, %674: u64):
     %2589 = const bool false
@@ -84368,7 +83939,7 @@ bb258(%739: ptr, %740: ptr, %741: u64):
     %2626 = const i64 24
     %2627 = gep i8, ptr %1210, %2626
     store u64 %741, ptr %2627
-    call @func.47(%1434, %1207, %1413, %1376)
+    call @func.44(%1434, %1207, %1413, %1376)
     br bb259(%739, %740)
 bb259(%742: ptr, %743: ptr):
     %2628 = load i64, ptr %1434
@@ -85009,7 +84580,7 @@ bb342(%951: ptr, %952: ptr):
     br bb343(%951, %952)
 bb343(%953: ptr, %954: ptr):
     %2977 = const bool false
-    call @func.33(%1493, %1494, %1495, %1499)
+    call @func.31(%1493, %1494, %1495, %1499)
     br bb344(%953, %954)
 bb344(%955: ptr, %956: ptr):
     %2978 = const bool true
@@ -85403,7 +84974,7 @@ bb384(%1076: ptr, %1077: ptr, %1078: ptr):
 bb385(%1079: ptr, %1080: ptr, %1081: ptr):
     %3208 = const bool false
     %3209 = const bool false
-    call @func.46(%1532, %1081, %1533, %1535, %1536)
+    call @func.43(%1532, %1081, %1533, %1535, %1536)
     br bb386(%1079, %1080)
 bb386(%1082: ptr, %1083: ptr):
     %3210 = const bool false
@@ -85491,7 +85062,7 @@ bb404(%1118: ptr, %1119: ptr):
 bb405(%1120: ptr, %1121: ptr):
     %3234 = const bool false
     %3235 = const u64 0
-    %3236 = call @func.43(%1207, %1539, %1548, %1507)
+    %3236 = call @func.41(%1207, %1539, %1548, %1507)
     br bb406(%1120, %1121, %3235, %3236)
 bb406(%1122: ptr, %1123: ptr, %1124: u64, %1125: bool):
     condbr %1125, bb407(%1122, %1123, %1124), bb408(%1122, %1123, %1124)
@@ -85527,7 +85098,7 @@ bb413(%1146: ptr, %1147: ptr, %1148: u64, %1149: ptr):
 bb414(%1150: ptr, %1151: ptr, %1152: u64, %1153: ptr):
     %3247 = const bool false
     %3248 = const bool false
-    call @func.46(%1557, %1153, %1558, %1560, %1561)
+    call @func.43(%1557, %1153, %1558, %1560, %1561)
     br bb415(%1150, %1151, %1152)
 bb415(%1154: ptr, %1155: ptr, %1156: u64):
     %3249 = const bool false
@@ -85821,7 +85392,7 @@ bb0(%0: ptr):
     call @func.6(%6)
     br bb1
 bb1:
-    call @func.48(%8)
+    call @func.45(%8)
     br bb2(%6)
 bb2(%1: ptr):
     call @func.16(%11)
@@ -85836,7 +85407,7 @@ bb4(%3: ptr):
     br bb5(%3)
 bb5(%4: ptr):
     %17 = const bool false
-    call @func.33(%10, %11, %12, %13)
+    call @func.31(%10, %11, %12, %13)
     br bb6(%4)
 bb6(%5: ptr):
     %18 = const bool false
@@ -86003,7 +85574,7 @@ bb7:
 fn @rsucc(functy.9) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
-    call @func.49(%2, %1)
+    call @func.46(%2, %1)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -86114,10 +85685,10 @@ bb2:
 fn @nm1(functy.14) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca (i64, i64, i64, i64, i64), align 8
-    call @func.50(%2)
+    call @func.47(%2)
     br bb1
 bb1:
-    call @func.51(%0, %2, %1)
+    call @func.48(%0, %2, %1)
     br bb2
 bb2:
     ret
@@ -86221,7 +85792,7 @@ bb1:
     store u64 %33, ptr %36
     %37 = load ptr, ptr %5
     %38 = load u64, ptr %0
-    call @func.57(%37, %38)
+    call @func.53(%37, %38)
     br bb2
 bb2:
     %39 = load ptr, ptr %5
@@ -86479,7 +86050,7 @@ fn @Expr__from_kind(functy.19) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
     %3 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.63(%2, %1)
+    call @func.58(%2, %1)
     br bb1
 bb1:
     %4 = load i64, ptr %1
@@ -86596,13 +86167,13 @@ bb0(%0: ptr, %1: ptr):
     %4 = alloca i64, align 8
     store ptr %1, ptr %2
     %5 = load ptr, ptr %2
-    call @func.66(%3, %5)
+    call @func.60(%3, %5)
     br bb1
 bb1:
     %6 = load ptr, ptr %2
     %7 = const i64 72
     %8 = gep i8, ptr %6, %7
-    call @func.67(%4, %8)
+    call @func.61(%4, %8)
     br bb2
 bb2:
     %9 = load i64, ptr %3
@@ -87448,7 +87019,7 @@ bb19(%61: ptr, %62: u64, %63: bool, %64: ptr):
     %482 = gep i8, ptr %480, %481
     br bb20(%61, %62, %63, %64, %482)
 bb20(%65: ptr, %66: u64, %67: bool, %68: ptr, %69: ptr):
-    %483 = call @func.42(%68, %69)
+    %483 = call @func.40(%68, %69)
     br bb21(%65, %66, %67, %483)
 bb21(%70: ptr, %71: u64, %72: bool, %73: bool):
     condbr %73, bb28(%70, %71, %72), bb22(%70, %71, %72)
@@ -87464,13 +87035,13 @@ bb23(%77: ptr, %78: u64, %79: bool, %80: ptr):
     br bb24(%77, %78, %79, %80, %489)
 bb24(%81: ptr, %82: u64, %83: bool, %84: ptr, %85: ptr):
     %490 = load ptr, ptr %246
-    %491 = call @func.68(%81, %84, %85, %490)
+    %491 = call @func.62(%81, %84, %85, %490)
     br bb25(%81, %82, %83, %491)
 bb25(%86: ptr, %87: u64, %88: bool, %89: bool):
     condbr %89, bb28(%86, %87, %88), bb26(%87)
 bb26(%90: u64):
     %492 = load ptr, ptr %246
-    call @func.71(%492, %90)
+    call @func.64(%492, %90)
     br bb27
 bb27:
     %493 = const bool false
@@ -87481,7 +87052,7 @@ bb28(%91: ptr, %92: u64, %93: bool):
     %496 = gep i8, ptr %494, %495
     br bb29(%91, %92, %93, %496)
 bb29(%94: ptr, %95: u64, %96: bool, %97: ptr):
-    %497 = call @func.72(%97)
+    %497 = call @func.65(%97)
     br bb30(%94, %95, %96, %497)
 bb30(%98: ptr, %99: u64, %100: bool, %101: bool):
     condbr %101, bb39(%98, %99, %100), bb31(%98, %99, %100)
@@ -87491,7 +87062,7 @@ bb31(%102: ptr, %103: u64, %104: bool):
     %500 = gep i8, ptr %498, %499
     br bb32(%102, %103, %104, %500)
 bb32(%105: ptr, %106: u64, %107: bool, %108: ptr):
-    %501 = call @func.72(%108)
+    %501 = call @func.65(%108)
     br bb33(%105, %106, %107, %501)
 bb33(%109: ptr, %110: u64, %111: bool, %112: bool):
     condbr %112, bb39(%109, %110, %111), bb34(%109, %110)
@@ -87507,16 +87078,16 @@ bb35(%115: ptr, %116: u64, %117: ptr):
     br bb36(%115, %116, %117, %507)
 bb36(%118: ptr, %119: u64, %120: ptr, %121: ptr):
     %508 = load ptr, ptr %246
-    %509 = call @func.68(%118, %120, %121, %508)
+    %509 = call @func.62(%118, %120, %121, %508)
     br bb37(%119, %509)
 bb37(%122: u64, %123: bool):
     %510 = load ptr, ptr %246
-    call @func.71(%510, %122)
+    call @func.64(%510, %122)
     br bb38(%123)
 bb38(%124: bool):
     br bb74(%124)
 bb39(%125: ptr, %126: u64, %127: bool):
-    call @func.50(%264)
+    call @func.47(%264)
     br bb40(%125, %126, %127)
 bb40(%128: ptr, %129: u64, %130: bool):
     %511 = const bool true
@@ -87538,7 +87109,7 @@ bb43(%138: ptr, %139: u64, %140: bool):
     br bb44(%138, %139, %140, %518)
 bb44(%141: ptr, %142: u64, %143: bool, %144: ptr):
     %519 = load u64, ptr %263
-    call @func.73(%266, %141, %144, %519)
+    call @func.66(%266, %141, %144, %519)
     br bb45(%141, %142, %143)
 bb45(%145: ptr, %146: u64, %147: bool):
     %520 = const bool true
@@ -87548,7 +87119,7 @@ bb45(%145: ptr, %146: u64, %147: bool):
     br bb46(%145, %146, %147, %523)
 bb46(%148: ptr, %149: u64, %150: bool, %151: ptr):
     %524 = load u64, ptr %263
-    call @func.73(%267, %148, %151, %524)
+    call @func.66(%267, %148, %151, %524)
     br bb47(%148, %149, %150)
 bb47(%152: ptr, %153: u64, %154: bool):
     %525 = const bool true
@@ -87995,11 +87566,11 @@ bb65(%216: ptr, %217: u64, %218: bool):
     br bb69(%216, %217, %218)
 bb66(%219: ptr, %220: u64):
     %890 = load ptr, ptr %246
-    %891 = call @func.68(%219, %266, %267, %890)
+    %891 = call @func.62(%219, %266, %267, %890)
     br bb67(%220, %891)
 bb67(%221: u64, %222: bool):
     %892 = load ptr, ptr %246
-    call @func.71(%892, %221)
+    call @func.64(%892, %221)
     br bb68(%222)
 bb68(%223: bool):
     br bb72(%223)
@@ -88035,16 +87606,10 @@ bb81(%242: ptr, %243: u64, %244: bool):
 
 fn @Verifier____env___is_def_eq_blind(functy.29) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.78(%0, %1, %2, %3)
+    %5 = call @func.67(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.30) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.31) {
 }
 
 fn @Verifier____env___is_def_eq_binding_distinct_control(functy.32) {
@@ -88210,10 +87775,10 @@ bb9(%27: ptr, %28: u64, %29: bool):
     %393 = gep i8, ptr %391, %392
     br bb10(%27, %28, %29, %390, %393)
 bb10(%30: ptr, %31: u64, %32: bool, %33: ptr, %34: ptr):
-    call @func.30(%266, %33)
+    call @func.26(%266, %33)
     br bb11(%30, %31, %32, %34)
 bb11(%35: ptr, %36: u64, %37: bool, %38: ptr):
-    call @func.30(%267, %38)
+    call @func.26(%267, %38)
     br bb12(%35, %36, %37)
 bb12(%39: ptr, %40: u64, %41: bool):
     %394 = load ptr, ptr %266
@@ -88307,10 +87872,10 @@ bb16(%48: ptr, %49: u64, %50: bool, %51: ptr, %52: ptr, %53: ptr):
     %468 = gep i8, ptr %273, %467
     %469 = load i8, ptr %466
     store i8 %469, ptr %468
-    call @func.30(%274, %52)
+    call @func.26(%274, %52)
     br bb17(%48, %49, %50, %53)
 bb17(%54: ptr, %55: u64, %56: bool, %57: ptr):
-    call @func.30(%275, %57)
+    call @func.26(%275, %57)
     br bb18(%54, %55, %56)
 bb18(%58: ptr, %59: u64, %60: bool):
     %470 = const i64 8
@@ -88355,7 +87920,7 @@ bb19(%61: ptr, %62: u64, %63: bool, %64: ptr):
     %499 = gep i8, ptr %497, %498
     br bb20(%61, %62, %63, %64, %499)
 bb20(%65: ptr, %66: u64, %67: bool, %68: ptr, %69: ptr):
-    %500 = call @func.42(%68, %69)
+    %500 = call @func.40(%68, %69)
     br bb21(%65, %66, %67, %500)
 bb21(%70: ptr, %71: u64, %72: bool, %73: bool):
     condbr %73, bb28(%70, %71, %72), bb22(%70, %71, %72)
@@ -88371,13 +87936,13 @@ bb23(%77: ptr, %78: u64, %79: bool, %80: ptr):
     br bb24(%77, %78, %79, %80, %506)
 bb24(%81: ptr, %82: u64, %83: bool, %84: ptr, %85: ptr):
     %507 = load ptr, ptr %259
-    %508 = call @func.68(%81, %84, %85, %507)
+    %508 = call @func.62(%81, %84, %85, %507)
     br bb25(%81, %82, %83, %508)
 bb25(%86: ptr, %87: u64, %88: bool, %89: bool):
     condbr %89, bb28(%86, %87, %88), bb26(%87)
 bb26(%90: u64):
     %509 = load ptr, ptr %259
-    call @func.71(%509, %90)
+    call @func.64(%509, %90)
     br bb27
 bb27:
     %510 = const bool false
@@ -88388,7 +87953,7 @@ bb28(%91: ptr, %92: u64, %93: bool):
     %513 = gep i8, ptr %511, %512
     br bb29(%91, %92, %93, %513)
 bb29(%94: ptr, %95: u64, %96: bool, %97: ptr):
-    %514 = call @func.72(%97)
+    %514 = call @func.65(%97)
     br bb30(%94, %95, %96, %514)
 bb30(%98: ptr, %99: u64, %100: bool, %101: bool):
     condbr %101, bb39(%98, %99, %100), bb31(%98, %99, %100)
@@ -88398,7 +87963,7 @@ bb31(%102: ptr, %103: u64, %104: bool):
     %517 = gep i8, ptr %515, %516
     br bb32(%102, %103, %104, %517)
 bb32(%105: ptr, %106: u64, %107: bool, %108: ptr):
-    %518 = call @func.72(%108)
+    %518 = call @func.65(%108)
     br bb33(%105, %106, %107, %518)
 bb33(%109: ptr, %110: u64, %111: bool, %112: bool):
     condbr %112, bb39(%109, %110, %111), bb34(%109, %110)
@@ -88414,20 +87979,20 @@ bb35(%115: ptr, %116: u64, %117: ptr):
     br bb36(%115, %116, %117, %524)
 bb36(%118: ptr, %119: u64, %120: ptr, %121: ptr):
     %525 = load ptr, ptr %259
-    %526 = call @func.68(%118, %120, %121, %525)
+    %526 = call @func.62(%118, %120, %121, %525)
     br bb37(%119, %526)
 bb37(%122: u64, %123: bool):
     %527 = load ptr, ptr %259
-    call @func.71(%527, %122)
+    call @func.64(%527, %122)
     br bb38(%123)
 bb38(%124: bool):
     br bb78(%124)
 bb39(%125: ptr, %126: u64, %127: bool):
-    call @func.50(%277)
+    call @func.47(%277)
     br bb40(%125, %126, %127)
 bb40(%128: ptr, %129: u64, %130: bool):
     %528 = const bool true
-    %529 = call @func.31(%269)
+    %529 = call @func.27(%269)
     br bb41(%128, %129, %130, %529)
 bb41(%131: ptr, %132: u64, %133: bool, %134: ptr):
     call @func.20(%278, %134)
@@ -88439,11 +88004,11 @@ bb42(%135: ptr, %136: u64, %137: bool):
     br bb43(%135, %136, %137)
 bb43(%138: ptr, %139: u64, %140: bool):
     %532 = const bool false
-    call @func.50(%280)
+    call @func.47(%280)
     br bb44(%138, %139, %140)
 bb44(%141: ptr, %142: u64, %143: bool):
     %533 = const bool true
-    %534 = call @func.31(%269)
+    %534 = call @func.27(%269)
     br bb45(%141, %142, %143, %534)
 bb45(%144: ptr, %145: u64, %146: bool, %147: ptr):
     call @func.20(%281, %147)
@@ -88461,7 +88026,7 @@ bb47(%151: ptr, %152: u64, %153: bool):
     br bb48(%151, %152, %153, %540)
 bb48(%154: ptr, %155: u64, %156: bool, %157: ptr):
     %541 = load u64, ptr %276
-    call @func.73(%282, %154, %157, %541)
+    call @func.66(%282, %154, %157, %541)
     br bb49(%154, %155, %156)
 bb49(%158: ptr, %159: u64, %160: bool):
     %542 = const bool true
@@ -88471,7 +88036,7 @@ bb49(%158: ptr, %159: u64, %160: bool):
     br bb50(%158, %159, %160, %545)
 bb50(%161: ptr, %162: u64, %163: bool, %164: ptr):
     %546 = load u64, ptr %279
-    call @func.73(%283, %161, %164, %546)
+    call @func.66(%283, %161, %164, %546)
     br bb51(%161, %162, %163)
 bb51(%165: ptr, %166: u64, %167: bool):
     %547 = const bool true
@@ -88918,11 +88483,11 @@ bb69(%229: ptr, %230: u64, %231: bool):
     br bb73(%229, %230, %231)
 bb70(%232: ptr, %233: u64):
     %912 = load ptr, ptr %259
-    %913 = call @func.68(%232, %282, %283, %912)
+    %913 = call @func.62(%232, %282, %283, %912)
     br bb71(%233, %913)
 bb71(%234: u64, %235: bool):
     %914 = load ptr, ptr %259
-    call @func.71(%914, %234)
+    call @func.64(%914, %234)
     br bb72(%235)
 bb72(%236: bool):
     br bb76(%236)
@@ -89301,7 +88866,7 @@ bb0(%0: ptr, %1: ptr):
     %229 = load i64, ptr %228
     store i64 %229, ptr %165
     %230 = load u64, ptr %165
-    %231 = call @func.36(%230)
+    %231 = call @func.34(%230)
     br bb1(%231)
 bb1(%2: u64):
     %232 = load ptr, ptr %164
@@ -89310,7 +88875,7 @@ bb1(%2: u64):
     %235 = load i64, ptr %234
     store i64 %235, ptr %166
     %236 = load u64, ptr %166
-    %237 = call @func.36(%236)
+    %237 = call @func.34(%236)
     br bb2(%2, %237)
 bb2(%3: u64, %4: u64):
     %238 = icmp ne u64 %3, %4
@@ -89955,7 +89520,7 @@ bb18:
     %833 = load ptr, ptr %187
     %834 = const i64 48
     %835 = gep i8, ptr %833, %834
-    %836 = call @func.80(%809, %823)
+    %836 = call @func.69(%809, %823)
     br bb65(%813, %817, %829, %835, %836)
 bb19:
     %837 = load ptr, ptr %167
@@ -89972,7 +89537,7 @@ bb19:
     %845 = const i64 8
     %846 = gep i8, ptr %844, %845
     store ptr %846, ptr %177
-    %847 = call @func.37(%176, %177)
+    %847 = call @func.35(%176, %177)
     br bb75(%847)
 bb20:
     %848 = load ptr, ptr %167
@@ -90031,7 +89596,7 @@ bb20:
     %891 = load ptr, ptr %199
     %892 = const i64 64
     %893 = gep i8, ptr %891, %892
-    %894 = call @func.80(%849, %869)
+    %894 = call @func.69(%849, %869)
     br bb50(%853, %857, %861, %865, %875, %881, %887, %893, %894)
 bb21:
     %895 = load ptr, ptr %167
@@ -90163,7 +89728,7 @@ bb24:
     %995 = load ptr, ptr %219
     %996 = const i64 48
     %997 = gep i8, ptr %995, %996
-    %998 = call @func.80(%981, %991)
+    %998 = call @func.69(%981, %991)
     br bb28(%985, %997, %998)
 bb25:
     %999 = load ptr, ptr %167
@@ -90180,7 +89745,7 @@ bb25:
     %1007 = const i64 8
     %1008 = gep i8, ptr %1006, %1007
     store ptr %1008, ptr %173
-    %1009 = call @func.38(%172, %173)
+    %1009 = call @func.36(%172, %173)
     br bb75(%1009)
 bb26:
     %1010 = load ptr, ptr %167
@@ -90197,7 +89762,7 @@ bb26:
     %1018 = const i64 8
     %1019 = gep i8, ptr %1017, %1018
     store ptr %1019, ptr %171
-    %1020 = call @func.39(%170, %171)
+    %1020 = call @func.37(%170, %171)
     br bb75(%1020)
 bb27:
     %1021 = load ptr, ptr %167
@@ -90214,21 +89779,21 @@ bb27:
     %1029 = const i64 8
     %1030 = gep i8, ptr %1028, %1029
     store ptr %1030, ptr %169
-    %1031 = call @func.40(%168, %169)
+    %1031 = call @func.38(%168, %169)
     br bb75(%1031)
 bb28(%5: ptr, %6: ptr, %7: bool):
     condbr %7, bb29(%5, %6), bb30
 bb29(%8: ptr, %9: ptr):
-    call @func.41(%174, %8)
+    call @func.39(%174, %8)
     br bb31(%9)
 bb30:
     %1032 = const bool false
     br bb75(%1032)
 bb31(%10: ptr):
-    call @func.41(%175, %10)
+    call @func.39(%175, %10)
     br bb32
 bb32:
-    %1033 = call @func.81(%174, %175)
+    %1033 = call @func.70(%174, %175)
     br bb75(%1033)
 bb33(%11: ptr, %12: ptr, %13: ptr, %14: ptr):
     %1034 = load ptr, ptr %12
@@ -90236,7 +89801,7 @@ bb33(%11: ptr, %12: ptr, %13: ptr, %14: ptr):
     %1036 = gep i8, ptr %1034, %1035
     br bb34(%11, %13, %14, %1036)
 bb34(%15: ptr, %16: ptr, %17: ptr, %18: ptr):
-    %1037 = call @func.42(%17, %18)
+    %1037 = call @func.40(%17, %18)
     br bb35(%15, %16, %1037)
 bb35(%19: ptr, %20: ptr, %21: bool):
     condbr %21, bb36(%19, %20), bb37
@@ -90254,7 +89819,7 @@ bb38(%24: ptr, %25: ptr):
     %1044 = gep i8, ptr %1042, %1043
     br bb39(%25, %1044)
 bb39(%26: ptr, %27: ptr):
-    %1045 = call @func.42(%26, %27)
+    %1045 = call @func.40(%26, %27)
     br bb75(%1045)
 bb40(%28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %1046 = load u8, ptr %28
@@ -90281,7 +89846,7 @@ bb43(%44: ptr, %45: ptr, %46: ptr, %47: ptr):
     %1061 = gep i8, ptr %1059, %1060
     br bb44(%44, %46, %47, %1061)
 bb44(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
-    %1062 = call @func.42(%50, %51)
+    %1062 = call @func.40(%50, %51)
     br bb45(%48, %49, %1062)
 bb45(%52: ptr, %53: ptr, %54: bool):
     condbr %54, bb46(%52, %53), bb47
@@ -90299,7 +89864,7 @@ bb48(%57: ptr, %58: ptr):
     %1069 = gep i8, ptr %1067, %1068
     br bb49(%58, %1069)
 bb49(%59: ptr, %60: ptr):
-    %1070 = call @func.42(%59, %60)
+    %1070 = call @func.40(%59, %60)
     br bb75(%1070)
 bb50(%61: ptr, %62: ptr, %63: ptr, %64: ptr, %65: ptr, %66: ptr, %67: ptr, %68: ptr, %69: bool):
     condbr %69, bb51(%61, %62, %63, %64, %65, %66, %67, %68), bb64
@@ -90314,7 +89879,7 @@ bb52(%78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: 
     %1076 = gep i8, ptr %1074, %1075
     br bb53(%78, %79, %80, %82, %83, %84, %85, %1076)
 bb53(%86: ptr, %87: ptr, %88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: ptr, %93: ptr):
-    %1077 = call @func.42(%92, %93)
+    %1077 = call @func.40(%92, %93)
     br bb54(%86, %87, %88, %89, %90, %91, %1077)
 bb54(%94: ptr, %95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: ptr, %100: bool):
     condbr %100, bb55(%94, %95, %96, %97, %98, %99), bb64
@@ -90329,7 +89894,7 @@ bb56(%107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr, %112: ptr):
     %1083 = gep i8, ptr %1081, %1082
     br bb57(%107, %108, %110, %111, %112, %1083)
 bb57(%113: ptr, %114: ptr, %115: ptr, %116: ptr, %117: ptr, %118: ptr):
-    %1084 = call @func.42(%117, %118)
+    %1084 = call @func.40(%117, %118)
     br bb58(%113, %114, %115, %116, %1084)
 bb58(%119: ptr, %120: ptr, %121: ptr, %122: ptr, %123: bool):
     condbr %123, bb59(%119, %120, %121, %122), bb64
@@ -90344,7 +89909,7 @@ bb60(%128: ptr, %129: ptr, %130: ptr, %131: ptr):
     %1090 = gep i8, ptr %1088, %1089
     br bb61(%128, %130, %131, %1090)
 bb61(%132: ptr, %133: ptr, %134: ptr, %135: ptr):
-    %1091 = call @func.42(%134, %135)
+    %1091 = call @func.40(%134, %135)
     br bb62(%132, %133, %1091)
 bb62(%136: ptr, %137: ptr, %138: bool):
     condbr %138, bb63(%136, %137), bb64
@@ -90377,7 +89942,7 @@ bb69(%152: ptr, %153: ptr):
     %1105 = gep i8, ptr %1103, %1104
     br bb70(%153, %1105)
 bb70(%154: ptr, %155: ptr):
-    %1106 = call @func.42(%154, %155)
+    %1106 = call @func.40(%154, %155)
     br bb75(%1106)
 bb71(%156: ptr, %157: ptr):
     %1107 = load ptr, ptr %156
@@ -90393,7 +89958,7 @@ bb73(%158: ptr, %159: ptr):
     %1113 = gep i8, ptr %1111, %1112
     br bb74(%159, %1113)
 bb74(%160: ptr, %161: ptr):
-    %1114 = call @func.42(%160, %161)
+    %1114 = call @func.40(%160, %161)
     br bb75(%1114)
 bb75(%162: bool):
     ret %162
@@ -90403,7 +89968,7 @@ bb76:
 
 fn @Verifier____env___is_def_eq(functy.43) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.86(%0, %1, %2, %3)
+    %5 = call @func.71(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
@@ -90816,9 +90381,6 @@ bb4:
     ret
 }
 
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE4pushBH_(functy.45) {
-}
-
 fn @LocalContext__push_let(functy.46) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr, %4: ptr):
     %6 = alloca i64, align 8
@@ -90865,7 +90427,7 @@ bb1:
     store u64 %38, ptr %41
     %42 = load ptr, ptr %6
     %43 = load u64, ptr %0
-    call @func.57(%42, %43)
+    call @func.53(%42, %43)
     br bb2
 bb2:
     %44 = load ptr, ptr %6
@@ -91225,7 +90787,7 @@ bb3(%5: ptr):
     %333 = gep i8, ptr %328, %332
     %334 = load i8, ptr %331
     store i8 %334, ptr %333
-    call @func.45(%5, %8)
+    call @func.17(%5, %8)
     br bb4
 bb4:
     ret
@@ -91235,7 +90797,7 @@ bb5:
 
 fn @Verifier____env___whnf_impl(functy.47) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    call @func.89(%0, %1, %2, %3)
+    call @func.73(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
@@ -91348,7 +90910,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %6 = alloca (i64, i64, i64, i64, i64), align 8
     %7 = const bool false
     %8 = const bool true
-    call @func.90(%4, %2)
+    call @func.74(%4, %2)
     br bb1
 bb1:
     %9 = load bool, ptr %4
@@ -91384,7 +90946,7 @@ bb2(%3: u64):
     %33 = gep i8, ptr %5, %32
     %34 = load i64, ptr %31
     store i64 %34, ptr %33
-    call @func.91(%0, %5, %3)
+    call @func.75(%0, %5, %3)
     br bb5
 bb3:
     %35 = const bool false
@@ -91414,7 +90976,7 @@ bb3:
     %55 = gep i8, ptr %6, %54
     %56 = load i64, ptr %53
     store i64 %56, ptr %55
-    call @func.93(%0, %6, %2)
+    call @func.77(%0, %6, %2)
     br bb6
 bb4:
     ret
@@ -91422,9 +90984,6 @@ bb5:
     br bb4
 bb6:
     br bb4
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3lenBG_(functy.52) {
 }
 
 fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.53) {
@@ -91455,21 +91014,21 @@ bb0(%0: ptr, %1: u64):
     br bb1(%44, %45)
 bb1(%2: bool, %3: u64):
     %46 = load ptr, ptr %37
-    %47 = call @func.52(%46)
+    %47 = call @func.24(%46)
     br bb2(%2, %3, %3, %47)
 bb2(%4: bool, %5: u64, %6: u64, %7: u64):
     %48 = icmp ult u64 %6, %7
     condbr %48, bb3(%4, %5), bb9(%4)
 bb3(%8: bool, %9: u64):
     %49 = load ptr, ptr %37
-    %50 = call @func.53(%49, %9)
+    %50 = call @func.49(%49, %9)
     store ptr %50, ptr %39
     br bb4(%8, %9)
 bb4(%10: bool, %11: u64):
     %51 = load ptr, ptr %39
     %52 = const i64 200
     %53 = gep i8, ptr %51, %52
-    %54 = call @func.94(%53, %38)
+    %54 = call @func.78(%53, %38)
     br bb5(%10, %11, %54)
 bb5(%12: bool, %13: u64, %14: bool):
     condbr %14, bb6, bb7(%12, %13)
@@ -91526,7 +91085,7 @@ bb13(%19: bool, %20: u64):
     %87 = load ptr, ptr %37
     %88 = const i64 24
     %89 = gep i8, ptr %87, %88
-    %90 = call @func.54(%89)
+    %90 = call @func.50(%89)
     br bb14(%19, %20, %20, %90)
 bb14(%21: bool, %22: u64, %23: u64, %24: u64):
     %91 = icmp ult u64 %23, %24
@@ -91535,10 +91094,10 @@ bb15(%25: bool, %26: u64):
     %92 = load ptr, ptr %37
     %93 = const i64 24
     %94 = gep i8, ptr %92, %93
-    %95 = call @func.55(%94, %26)
+    %95 = call @func.51(%94, %26)
     br bb16(%25, %26, %95)
 bb16(%27: bool, %28: u64, %29: ptr):
-    %96 = call @func.94(%29, %38)
+    %96 = call @func.78(%29, %38)
     br bb17(%27, %28, %96)
 bb17(%30: bool, %31: u64, %32: bool):
     condbr %32, bb18, bb19(%30, %31)
@@ -91592,7 +91151,7 @@ bb24:
     %128 = const i64 24
     %129 = gep i8, ptr %127, %128
     %130 = load u64, ptr %38
-    call @func.56(%129, %130)
+    call @func.52(%129, %130)
     br bb25
 bb25:
     ret
@@ -91601,9 +91160,6 @@ bb26:
 }
 
 fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.58) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.59) {
 }
 
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.60) {
@@ -91706,7 +91262,7 @@ bb4:
     %284 = load ptr, ptr %207
     %285 = const i64 8
     %286 = gep i8, ptr %284, %285
-    %287 = call @func.95(%286)
+    %287 = call @func.79(%286)
     br bb61(%287)
 bb5:
     %288 = load ptr, ptr %207
@@ -91729,13 +91285,13 @@ bb6:
     %303 = load ptr, ptr %207
     %304 = const i64 48
     %305 = gep i8, ptr %303, %304
-    %306 = call @func.96(%302)
+    %306 = call @func.80(%302)
     br bb32(%305, %306)
 bb7:
     %307 = load ptr, ptr %207
     %308 = const i64 8
     %309 = gep i8, ptr %307, %308
-    %310 = call @func.97(%309)
+    %310 = call @func.81(%309)
     br bb28(%309, %310)
 bb8:
     %311 = load ptr, ptr %207
@@ -91743,7 +91299,7 @@ bb8:
     %313 = gep i8, ptr %311, %312
     %314 = load u64, ptr %313
     %315 = const u64 13
-    %316 = call @func.99(%315, %314)
+    %316 = call @func.83(%315, %314)
     br bb27(%316)
 bb9:
     %317 = load ptr, ptr %207
@@ -91791,13 +91347,13 @@ bb12:
     %353 = load u32, ptr %352
     %354 = zext u32 %353 to u64
     %355 = const u64 7
-    %356 = call @func.99(%355, %354)
+    %356 = call @func.83(%355, %354)
     br bb13(%352, %356)
 bb13(%2: ptr, %3: u64):
     %357 = trunc u64 %3 to u32
     %358 = load u32, ptr %2
     %359 = const u32 1
-    %360 = call @func.58(%358, %359)
+    %360 = call @func.54(%358, %359)
     br bb14(%357, %360)
 bb14(%4: u32, %5: u32):
     %361 = const u32 0
@@ -91805,10 +91361,10 @@ bb14(%4: u32, %5: u32):
     %363 = const bool false
     %364 = const bool false
     %365 = const bool false
-    call @func.101(%0, %4, %5, %361, %362, %363, %364, %365)
+    call @func.84(%0, %4, %5, %361, %362, %363, %364, %365)
     br bb80
 bb15(%6: ptr, %7: ptr):
-    call @func.35(%208, %7)
+    call @func.33(%208, %7)
     br bb16(%6)
 bb16(%8: ptr):
     %366 = load ptr, ptr %8
@@ -91816,15 +91372,15 @@ bb16(%8: ptr):
     %368 = gep i8, ptr %366, %367
     br bb17(%368)
 bb17(%9: ptr):
-    call @func.35(%209, %9)
+    call @func.33(%209, %9)
     br bb18
 bb18:
     %369 = load u64, ptr %208
     %370 = load u64, ptr %209
-    call @func.105(%0, %369, %370)
+    call @func.87(%0, %369, %370)
     br bb80
 bb19(%10: ptr, %11: ptr):
-    call @func.35(%210, %11)
+    call @func.33(%210, %11)
     br bb20(%10)
 bb20(%12: ptr):
     %371 = load ptr, ptr %12
@@ -91832,16 +91388,16 @@ bb20(%12: ptr):
     %373 = gep i8, ptr %371, %372
     br bb21(%373)
 bb21(%13: ptr):
-    call @func.35(%211, %13)
+    call @func.33(%211, %13)
     br bb22
 bb22:
     %374 = load u64, ptr %210
     %375 = load u64, ptr %211
     %376 = const u64 0
-    call @func.110(%0, %374, %375, %376)
+    call @func.89(%0, %374, %375, %376)
     br bb80
 bb23(%14: ptr, %15: ptr):
-    call @func.35(%212, %15)
+    call @func.33(%212, %15)
     br bb24(%14)
 bb24(%16: ptr):
     %377 = load ptr, ptr %16
@@ -91849,13 +91405,13 @@ bb24(%16: ptr):
     %379 = gep i8, ptr %377, %378
     br bb25(%379)
 bb25(%17: ptr):
-    call @func.35(%213, %17)
+    call @func.33(%213, %17)
     br bb26
 bb26:
     %380 = load u64, ptr %212
     %381 = load u64, ptr %213
     %382 = const u64 1
-    call @func.110(%0, %380, %381, %382)
+    call @func.89(%0, %380, %381, %382)
     br bb80
 bb27(%18: u64):
     %383 = trunc u64 %18 to u32
@@ -91865,47 +91421,47 @@ bb27(%18: u64):
     %387 = const bool false
     %388 = const bool false
     %389 = const bool false
-    call @func.101(%0, %383, %384, %385, %386, %387, %388, %389)
+    call @func.84(%0, %383, %384, %385, %386, %387, %388, %389)
     br bb80
 bb28(%19: ptr, %20: u64):
     %390 = const u64 11
-    %391 = call @func.99(%390, %20)
+    %391 = call @func.83(%390, %20)
     br bb29(%19, %391)
 bb29(%21: ptr, %22: u64):
     %392 = trunc u64 %22 to u32
-    %393 = call @func.111(%21)
+    %393 = call @func.90(%21)
     br bb30(%21, %392, %393)
 bb30(%23: ptr, %24: u32, %25: bool):
-    %394 = call @func.112(%23)
+    %394 = call @func.91(%23)
     br bb31(%24, %25, %394)
 bb31(%26: u32, %27: bool, %28: bool):
     %395 = const u32 0
     %396 = const u32 0
     %397 = const bool false
     %398 = const bool false
-    call @func.101(%0, %26, %395, %396, %397, %398, %27, %28)
+    call @func.84(%0, %26, %395, %396, %397, %398, %27, %28)
     br bb80
 bb32(%29: ptr, %30: u64):
-    call @func.59(%214, %29)
+    call @func.39(%214, %29)
     br bb33(%29, %30)
 bb33(%31: ptr, %32: u64):
-    %399 = call @func.113(%214)
+    %399 = call @func.92(%214)
     br bb34(%31, %32, %399)
 bb34(%33: ptr, %34: u64, %35: u64):
     %400 = const bool false
     %401 = const u64 0
     br bb35(%33, %34, %35, %400, %401)
 bb35(%36: ptr, %37: u64, %38: u64, %39: bool, %40: u64):
-    %402 = call @func.60(%36)
+    %402 = call @func.55(%36)
     br bb36(%36, %37, %38, %39, %40, %40, %402)
 bb36(%41: ptr, %42: u64, %43: u64, %44: bool, %45: u64, %46: u64, %47: u64):
     %403 = icmp ult u64 %46, %47
     condbr %403, bb37(%41, %42, %43, %44, %45), bb43(%41, %42, %43, %44)
 bb37(%48: ptr, %49: u64, %50: u64, %51: bool, %52: u64):
-    %404 = call @func.61(%48, %52)
+    %404 = call @func.56(%48, %52)
     br bb38(%48, %49, %50, %51, %52, %404)
 bb38(%53: ptr, %54: u64, %55: u64, %56: bool, %57: u64, %58: ptr):
-    %405 = call @func.112(%58)
+    %405 = call @func.91(%58)
     br bb39(%53, %54, %55, %56, %57, %405)
 bb39(%59: ptr, %60: u64, %61: u64, %62: bool, %63: u64, %64: bool):
     condbr %64, bb40(%59, %60, %61), bb41(%59, %60, %61, %62, %63)
@@ -91933,16 +91489,16 @@ bb43(%77: ptr, %78: u64, %79: u64, %80: bool):
     %419 = const u64 0
     br bb44(%77, %78, %79, %80, %418, %419)
 bb44(%81: ptr, %82: u64, %83: u64, %84: bool, %85: bool, %86: u64):
-    %420 = call @func.60(%81)
+    %420 = call @func.55(%81)
     br bb45(%81, %82, %83, %84, %85, %86, %86, %420)
 bb45(%87: ptr, %88: u64, %89: u64, %90: bool, %91: bool, %92: u64, %93: u64, %94: u64):
     %421 = icmp ult u64 %93, %94
     condbr %421, bb46(%87, %88, %89, %90, %91, %92), bb52(%88, %89, %90, %91)
 bb46(%95: ptr, %96: u64, %97: u64, %98: bool, %99: bool, %100: u64):
-    %422 = call @func.61(%95, %100)
+    %422 = call @func.56(%95, %100)
     br bb47(%95, %96, %97, %98, %99, %100, %422)
 bb47(%101: ptr, %102: u64, %103: u64, %104: bool, %105: bool, %106: u64, %107: ptr):
-    %423 = call @func.111(%107)
+    %423 = call @func.90(%107)
     br bb48(%101, %102, %103, %104, %105, %106, %423)
 bb48(%108: ptr, %109: u64, %110: u64, %111: bool, %112: bool, %113: u64, %114: bool):
     condbr %114, bb49(%109, %110, %111), bb50(%108, %109, %110, %111, %112, %113)
@@ -91966,11 +91522,11 @@ bb51(%124: ptr, %125: u64, %126: u64, %127: bool, %128: bool):
     %435 = load u64, ptr %216
     br bb44(%124, %125, %126, %127, %128, %435)
 bb52(%129: u64, %130: u64, %131: bool, %132: bool):
-    %436 = call @func.99(%129, %130)
+    %436 = call @func.83(%129, %130)
     br bb53(%131, %132, %436)
 bb53(%133: bool, %134: bool, %135: u64):
     %437 = const u64 5
-    %438 = call @func.99(%437, %135)
+    %438 = call @func.83(%437, %135)
     br bb54(%133, %134, %438)
 bb54(%136: bool, %137: bool, %138: u64):
     %439 = trunc u64 %138 to u32
@@ -91978,10 +91534,10 @@ bb54(%136: bool, %137: bool, %138: u64):
     %441 = const u32 0
     %442 = const bool false
     %443 = const bool false
-    call @func.101(%0, %439, %440, %441, %442, %443, %137, %136)
+    call @func.84(%0, %439, %440, %441, %442, %443, %137, %136)
     br bb80
 bb55(%139: ptr, %140: ptr, %141: ptr):
-    call @func.35(%217, %141)
+    call @func.33(%217, %141)
     br bb56(%139, %140)
 bb56(%142: ptr, %143: ptr):
     %444 = load ptr, ptr %142
@@ -91989,7 +91545,7 @@ bb56(%142: ptr, %143: ptr):
     %446 = gep i8, ptr %444, %445
     br bb57(%143, %446)
 bb57(%144: ptr, %145: ptr):
-    call @func.35(%218, %145)
+    call @func.33(%218, %145)
     br bb58(%144)
 bb58(%146: ptr):
     %447 = load ptr, ptr %146
@@ -91997,17 +91553,17 @@ bb58(%146: ptr):
     %449 = gep i8, ptr %447, %448
     br bb59(%449)
 bb59(%147: ptr):
-    call @func.35(%219, %147)
+    call @func.33(%219, %147)
     br bb60
 bb60:
     %450 = load u64, ptr %217
     %451 = load u64, ptr %218
     %452 = load u64, ptr %219
-    call @func.118(%0, %450, %451, %452)
+    call @func.93(%0, %450, %451, %452)
     br bb80
 bb61(%148: u64):
     %453 = const u64 3
-    %454 = call @func.99(%453, %148)
+    %454 = call @func.83(%453, %148)
     br bb62(%454)
 bb62(%149: u64):
     %455 = trunc u64 %149 to u32
@@ -92017,14 +91573,14 @@ bb62(%149: u64):
     %459 = const bool false
     %460 = const bool false
     %461 = const bool false
-    call @func.101(%0, %455, %456, %457, %458, %459, %460, %461)
+    call @func.84(%0, %455, %456, %457, %458, %459, %460, %461)
     br bb80
 bb63(%150: ptr, %151: ptr, %152: ptr):
-    call @func.35(%220, %152)
+    call @func.33(%220, %152)
     br bb64(%150, %151)
 bb64(%153: ptr, %154: ptr):
     %462 = load u64, ptr %220
-    %463 = call @func.119(%462)
+    %463 = call @func.94(%462)
     br bb65(%153, %154, %463)
 bb65(%155: ptr, %156: ptr, %157: u8):
     %464 = zext u8 %157 to u32
@@ -92043,67 +91599,64 @@ bb65(%155: ptr, %156: ptr, %157: u8):
 bb66(%158: ptr, %159: ptr):
     %475 = load u32, ptr %221
     %476 = const u32 255
-    %477 = call @func.62(%475, %476)
+    %477 = call @func.57(%475, %476)
     br bb67(%158, %159, %477)
 bb67(%160: ptr, %161: ptr, %162: u32):
     %478 = zext u32 %162 to u64
-    %479 = call @func.96(%160)
+    %479 = call @func.80(%160)
     br bb68(%161, %162, %478, %479)
 bb68(%163: ptr, %164: u32, %165: u64, %166: u64):
     %480 = load u32, ptr %163
     %481 = zext u32 %480 to u64
     %482 = load u64, ptr %220
-    %483 = call @func.120(%482)
+    %483 = call @func.95(%482)
     br bb69(%164, %165, %166, %481, %483)
 bb69(%167: u32, %168: u64, %169: u64, %170: u64, %171: u32):
     %484 = zext u32 %171 to u64
-    %485 = call @func.99(%170, %484)
+    %485 = call @func.83(%170, %484)
     br bb70(%167, %168, %169, %485)
 bb70(%172: u32, %173: u64, %174: u64, %175: u64):
-    %486 = call @func.99(%174, %175)
+    %486 = call @func.83(%174, %175)
     br bb71(%172, %173, %486)
 bb71(%176: u32, %177: u64, %178: u64):
-    %487 = call @func.99(%177, %178)
+    %487 = call @func.83(%177, %178)
     br bb72(%176, %487)
 bb72(%179: u32, %180: u64):
     %488 = trunc u64 %180 to u32
     %489 = load u64, ptr %220
-    %490 = call @func.121(%489)
+    %490 = call @func.96(%489)
     br bb73(%179, %488, %490)
 bb73(%181: u32, %182: u32, %183: u32):
     %491 = load u64, ptr %220
-    %492 = call @func.122(%491)
+    %492 = call @func.97(%491)
     br bb74(%181, %182, %183, %492)
 bb74(%184: u32, %185: u32, %186: u32, %187: bool):
     %493 = load u64, ptr %220
-    %494 = call @func.123(%493)
+    %494 = call @func.98(%493)
     br bb75(%184, %185, %186, %187, %494)
 bb75(%188: u32, %189: u32, %190: u32, %191: bool, %192: bool):
     %495 = load u64, ptr %220
-    %496 = call @func.124(%495)
+    %496 = call @func.99(%495)
     br bb76(%188, %189, %190, %191, %192, %496)
 bb76(%193: u32, %194: u32, %195: u32, %196: bool, %197: bool, %198: bool):
     %497 = load u64, ptr %220
-    %498 = call @func.125(%497)
+    %498 = call @func.100(%497)
     br bb77(%193, %194, %195, %196, %197, %198, %498)
 bb77(%199: u32, %200: u32, %201: u32, %202: bool, %203: bool, %204: bool, %205: bool):
-    call @func.101(%0, %200, %201, %199, %202, %203, %204, %205)
+    call @func.84(%0, %200, %201, %199, %202, %203, %204, %205)
     br bb80
 bb78(%206: ptr):
-    call @func.35(%222, %206)
+    call @func.33(%222, %206)
     br bb79
 bb79:
     %499 = load u64, ptr %222
     %500 = const u64 0
-    call @func.127(%0, %499, %500)
+    call @func.101(%0, %499, %500)
     br bb80
 bb80:
     ret
 bb81:
     unreachable
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.64) {
 }
 
 fn @_RNvXsa_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBH_(functy.65) {
@@ -92187,7 +91740,7 @@ bb2:
     %92 = const i64 8
     %93 = gep i8, ptr %91, %92
     %94 = load u32, ptr %90
-    call @func.64(%44, %93)
+    call @func.26(%44, %93)
     br bb32(%94)
 bb3:
     %95 = load ptr, ptr %24
@@ -92199,13 +91752,13 @@ bb3:
     %101 = load ptr, ptr %24
     %102 = const i64 48
     %103 = gep i8, ptr %101, %102
-    call @func.128(%42, %97)
+    call @func.102(%42, %97)
     br bb30(%100, %103)
 bb4:
     %104 = load ptr, ptr %24
     %105 = const i64 8
     %106 = gep i8, ptr %104, %105
-    call @func.129(%41, %106)
+    call @func.103(%41, %106)
     br bb29
 bb5:
     %107 = load ptr, ptr %24
@@ -92221,7 +91774,7 @@ bb5:
     %117 = load ptr, ptr %24
     %118 = const i64 64
     %119 = gep i8, ptr %117, %118
-    call @func.128(%37, %107)
+    call @func.102(%37, %107)
     br bb25(%110, %113, %116, %119)
 bb6:
     %120 = load ptr, ptr %24
@@ -92233,7 +91786,7 @@ bb6:
     %126 = load ptr, ptr %24
     %127 = const i64 16
     %128 = gep i8, ptr %126, %127
-    call @func.130(%34, %122)
+    call @func.104(%34, %122)
     br bb22(%125, %128)
 bb7:
     %129 = load ptr, ptr %24
@@ -92245,7 +91798,7 @@ bb7:
     %135 = load ptr, ptr %24
     %136 = const i64 16
     %137 = gep i8, ptr %135, %136
-    call @func.130(%31, %131)
+    call @func.104(%31, %131)
     br bb19(%134, %137)
 bb8:
     %138 = load ptr, ptr %24
@@ -92254,7 +91807,7 @@ bb8:
     %141 = load ptr, ptr %24
     %142 = const i64 16
     %143 = gep i8, ptr %141, %142
-    call @func.64(%29, %140)
+    call @func.26(%29, %140)
     br bb17(%143)
 bb9:
     %144 = load ptr, ptr %24
@@ -92263,19 +91816,19 @@ bb9:
     %147 = load ptr, ptr %24
     %148 = const i64 48
     %149 = gep i8, ptr %147, %148
-    call @func.128(%27, %146)
+    call @func.102(%27, %146)
     br bb15(%149)
 bb10:
     %150 = load ptr, ptr %24
     %151 = const i64 8
     %152 = gep i8, ptr %150, %151
-    call @func.132(%26, %152)
+    call @func.106(%26, %152)
     br bb14
 bb11:
     %153 = load ptr, ptr %24
     %154 = const i64 8
     %155 = gep i8, ptr %153, %154
-    call @func.133(%25, %155)
+    call @func.107(%25, %155)
     br bb13
 bb12:
     %156 = load ptr, ptr %24
@@ -92329,7 +91882,7 @@ bb14:
     store i64 %190, ptr %0
     br bb33
 bb15(%2: ptr):
-    call @func.65(%28, %2)
+    call @func.59(%28, %2)
     br bb16
 bb16:
     %191 = const i64 8
@@ -92380,7 +91933,7 @@ bb16:
     store i64 %227, ptr %0
     br bb33
 bb17(%3: ptr):
-    call @func.64(%30, %3)
+    call @func.26(%30, %3)
     br bb18
 bb18:
     %228 = load ptr, ptr %29
@@ -92395,10 +91948,10 @@ bb18:
     store i64 %234, ptr %0
     br bb33
 bb19(%4: ptr, %5: ptr):
-    call @func.64(%32, %4)
+    call @func.26(%32, %4)
     br bb20(%5)
 bb20(%6: ptr):
-    call @func.64(%33, %6)
+    call @func.26(%33, %6)
     br bb21
 bb21:
     %235 = const i64 24
@@ -92423,10 +91976,10 @@ bb21:
     store i64 %249, ptr %0
     br bb33
 bb22(%7: ptr, %8: ptr):
-    call @func.64(%35, %7)
+    call @func.26(%35, %7)
     br bb23(%8)
 bb23(%9: ptr):
-    call @func.64(%36, %9)
+    call @func.26(%36, %9)
     br bb24
 bb24:
     %250 = const i64 24
@@ -92451,13 +92004,13 @@ bb24:
     store i64 %264, ptr %0
     br bb33
 bb25(%10: ptr, %11: ptr, %12: ptr, %13: ptr):
-    call @func.64(%38, %10)
+    call @func.26(%38, %10)
     br bb26(%11, %12, %13)
 bb26(%14: ptr, %15: ptr, %16: ptr):
-    call @func.64(%39, %14)
+    call @func.26(%39, %14)
     br bb27(%15, %16)
 bb27(%17: ptr, %18: ptr):
-    call @func.64(%40, %17)
+    call @func.26(%40, %17)
     br bb28(%18)
 bb28(%19: ptr):
     %265 = load bool, ptr %19
@@ -92519,7 +92072,7 @@ bb29:
     br bb33
 bb30(%20: ptr, %21: ptr):
     %307 = load u32, ptr %20
-    call @func.64(%43, %21)
+    call @func.26(%43, %21)
     br bb31(%307)
 bb31(%22: u32):
     %308 = const i64 8
@@ -92584,13 +92137,10 @@ bb0(%0: ptr, %1: ptr):
 
 fn @Verifier____env___def_eq_impl(functy.68) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.86(%0, %1, %2, %3)
+    %5 = call @func.71(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3lenBG_(functy.69) {
 }
 
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3popBG_(functy.70) {
@@ -92604,14 +92154,14 @@ bb0(%0: ptr, %1: u64):
     br bb1(%1)
 bb1(%2: u64):
     %9 = load ptr, ptr %7
-    %10 = call @func.69(%9)
+    %10 = call @func.24(%9)
     br bb2(%2, %10)
 bb2(%3: u64, %4: u64):
     %11 = icmp ugt u64 %4, %3
     condbr %11, bb3(%3), bb5
 bb3(%5: u64):
     %12 = load ptr, ptr %7
-    call @func.70(%8, %12)
+    call @func.63(%8, %12)
     br bb4(%5)
 bb4(%6: u64):
     br bb1(%6)
@@ -92627,7 +92177,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.134(%6)
+    %7 = call @func.108(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -92648,24 +92198,12 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u64):
     call @func.19(%6, %7)
     br bb1(%2)
 bb1(%4: ptr):
-    call @func.135(%0, %4, %6)
+    call @func.109(%0, %4, %6)
     br bb2
 bb2:
     br bb3
 bb3:
     ret
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice7LiteralNtB7_9PartialEq2eqBF_(functy.74) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdNtB7_9PartialEq2eqBF_(functy.75) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.76) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.77) {
 }
 
 fn @Verifier____env___def_eq_blind_inner(functy.78) {
@@ -92731,11 +92269,11 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %268 = alloca i64, align 8
     store ptr %3, ptr %210
     %269 = load ptr, ptr %210
-    call @func.47(%211, %0, %1, %269)
+    call @func.44(%211, %0, %1, %269)
     br bb1(%0, %2)
 bb1(%4: ptr, %5: ptr):
     %270 = load ptr, ptr %210
-    call @func.47(%212, %4, %5, %270)
+    call @func.44(%212, %4, %5, %270)
     br bb2(%4)
 bb2(%6: ptr):
     %271 = const i64 72
@@ -92743,7 +92281,7 @@ bb2(%6: ptr):
     %273 = load i64, ptr %272
     store i64 %273, ptr %213
     %274 = load u64, ptr %213
-    %275 = call @func.36(%274)
+    %275 = call @func.34(%274)
     br bb3(%6, %275)
 bb3(%7: ptr, %8: u64):
     %276 = const i64 72
@@ -92751,13 +92289,13 @@ bb3(%7: ptr, %8: u64):
     %278 = load i64, ptr %277
     store i64 %278, ptr %214
     %279 = load u64, ptr %214
-    %280 = call @func.36(%279)
+    %280 = call @func.34(%279)
     br bb4(%7, %8, %280)
 bb4(%9: ptr, %10: u64, %11: u64):
     %281 = icmp eq u64 %10, %11
     condbr %281, bb5(%9), bb8(%9)
 bb5(%12: ptr):
-    %282 = call @func.140(%12, %211, %212)
+    %282 = call @func.110(%12, %211, %212)
     br bb6(%12, %282)
 bb6(%13: ptr, %14: bool):
     condbr %14, bb7, bb8(%13)
@@ -92766,7 +92304,7 @@ bb7:
     br bb81(%283)
 bb8(%15: ptr):
     %284 = load ptr, ptr %210
-    call @func.141(%215, %15, %211, %212, %284)
+    call @func.111(%215, %15, %211, %212, %284)
     br bb9(%15)
 bb9(%16: ptr):
     %285 = load i8, ptr %215
@@ -93407,7 +92945,7 @@ bb26(%32: ptr):
     %874 = load ptr, ptr %234
     %875 = const i64 48
     %876 = gep i8, ptr %874, %875
-    %877 = call @func.80(%850, %864)
+    %877 = call @func.69(%850, %864)
     br bb67(%32, %858, %876, %877)
 bb27(%33: ptr):
     %878 = load ptr, ptr %216
@@ -93424,7 +92962,7 @@ bb27(%33: ptr):
     %886 = const i64 8
     %887 = gep i8, ptr %885, %886
     store ptr %887, ptr %224
-    %888 = call @func.74(%223, %224)
+    %888 = call @func.35(%223, %224)
     br bb85(%33, %888)
 bb28(%34: ptr):
     %889 = load ptr, ptr %216
@@ -93597,7 +93135,7 @@ bb32(%38: ptr):
     %1022 = load ptr, ptr %262
     %1023 = const i64 48
     %1024 = gep i8, ptr %1022, %1023
-    %1025 = call @func.80(%1008, %1018)
+    %1025 = call @func.69(%1008, %1018)
     br bb36(%38, %1012, %1024, %1025)
 bb33(%39: ptr):
     %1026 = load ptr, ptr %216
@@ -93612,7 +93150,7 @@ bb33(%39: ptr):
     %1033 = load ptr, ptr %264
     %1034 = const i64 8
     %1035 = gep i8, ptr %1033, %1034
-    %1036 = call @func.142(%39, %1029, %1035)
+    %1036 = call @func.112(%39, %1029, %1035)
     br bb86(%39, %1036)
 bb34(%40: ptr):
     %1037 = load ptr, ptr %216
@@ -93629,7 +93167,7 @@ bb34(%40: ptr):
     %1045 = const i64 8
     %1046 = gep i8, ptr %1044, %1045
     store ptr %1046, ptr %220
-    %1047 = call @func.75(%219, %220)
+    %1047 = call @func.37(%219, %220)
     br bb87(%40, %1047)
 bb35(%41: ptr):
     %1048 = load ptr, ptr %216
@@ -93646,21 +93184,21 @@ bb35(%41: ptr):
     %1056 = const i64 8
     %1057 = gep i8, ptr %1055, %1056
     store ptr %1057, ptr %218
-    %1058 = call @func.76(%217, %218)
+    %1058 = call @func.38(%217, %218)
     br bb88(%41, %1058)
 bb36(%42: ptr, %43: ptr, %44: ptr, %45: bool):
     condbr %45, bb37(%42, %43, %44), bb38(%42)
 bb37(%46: ptr, %47: ptr, %48: ptr):
-    call @func.77(%221, %47)
+    call @func.39(%221, %47)
     br bb39(%46, %48)
 bb38(%49: ptr):
     %1059 = const bool false
     br bb76(%49, %1059)
 bb39(%50: ptr, %51: ptr):
-    call @func.77(%222, %51)
+    call @func.39(%222, %51)
     br bb40(%50)
 bb40(%52: ptr):
-    %1060 = call @func.143(%52, %221, %222)
+    %1060 = call @func.113(%52, %221, %222)
     br bb89(%52, %1060)
 bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1061 = load ptr, ptr %55
@@ -93669,7 +93207,7 @@ bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     br bb42(%53, %54, %56, %57, %1063)
 bb42(%58: ptr, %59: ptr, %60: ptr, %61: ptr, %62: ptr):
     %1064 = load ptr, ptr %210
-    %1065 = call @func.144(%58, %61, %62, %1064)
+    %1065 = call @func.114(%58, %61, %62, %1064)
     br bb43(%58, %59, %60, %1065)
 bb43(%63: ptr, %64: ptr, %65: ptr, %66: bool):
     condbr %66, bb44(%63, %64, %65), bb45(%63)
@@ -93688,7 +93226,7 @@ bb46(%71: ptr, %72: ptr, %73: ptr):
     br bb47(%71, %73, %1072)
 bb47(%74: ptr, %75: ptr, %76: ptr):
     %1073 = load ptr, ptr %210
-    %1074 = call @func.144(%74, %75, %76, %1073)
+    %1074 = call @func.114(%74, %75, %76, %1073)
     br bb90(%74, %1074)
 bb48(%77: ptr, %78: ptr, %79: ptr, %80: ptr, %81: ptr):
     %1075 = load ptr, ptr %78
@@ -93702,7 +93240,7 @@ bb49(%82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     br bb50(%82, %83, %85, %86, %1080)
 bb50(%87: ptr, %88: ptr, %89: ptr, %90: ptr, %91: ptr):
     %1081 = load ptr, ptr %210
-    %1082 = call @func.144(%87, %90, %91, %1081)
+    %1082 = call @func.114(%87, %90, %91, %1081)
     br bb51(%87, %88, %89, %1082)
 bb51(%92: ptr, %93: ptr, %94: ptr, %95: bool):
     condbr %95, bb52(%92, %93, %94), bb53(%92)
@@ -93721,7 +93259,7 @@ bb54(%100: ptr, %101: ptr, %102: ptr):
     br bb55(%100, %102, %1089)
 bb55(%103: ptr, %104: ptr, %105: ptr):
     %1090 = load ptr, ptr %210
-    %1091 = call @func.144(%103, %104, %105, %1090)
+    %1091 = call @func.114(%103, %104, %105, %1090)
     br bb91(%103, %1091)
 bb56(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr, %112: ptr):
     %1092 = load ptr, ptr %109
@@ -93730,7 +93268,7 @@ bb56(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr, %112: ptr
     br bb57(%106, %107, %108, %110, %111, %112, %1094)
 bb57(%113: ptr, %114: ptr, %115: ptr, %116: ptr, %117: ptr, %118: ptr, %119: ptr):
     %1095 = load ptr, ptr %210
-    %1096 = call @func.144(%113, %118, %119, %1095)
+    %1096 = call @func.114(%113, %118, %119, %1095)
     br bb58(%113, %114, %115, %116, %117, %1096)
 bb58(%120: ptr, %121: ptr, %122: ptr, %123: ptr, %124: ptr, %125: bool):
     condbr %125, bb59(%120, %121, %122, %123, %124), bb64(%120)
@@ -93746,7 +93284,7 @@ bb60(%131: ptr, %132: ptr, %133: ptr, %134: ptr, %135: ptr):
     br bb61(%131, %132, %134, %135, %1102)
 bb61(%136: ptr, %137: ptr, %138: ptr, %139: ptr, %140: ptr):
     %1103 = load ptr, ptr %210
-    %1104 = call @func.144(%136, %139, %140, %1103)
+    %1104 = call @func.114(%136, %139, %140, %1103)
     br bb62(%136, %137, %138, %1104)
 bb62(%141: ptr, %142: ptr, %143: ptr, %144: bool):
     condbr %144, bb63(%141, %142, %143), bb64(%141)
@@ -93765,12 +93303,12 @@ bb65(%149: ptr, %150: ptr, %151: ptr):
     br bb66(%149, %151, %1111)
 bb66(%152: ptr, %153: ptr, %154: ptr):
     %1112 = load ptr, ptr %210
-    %1113 = call @func.144(%152, %153, %154, %1112)
+    %1113 = call @func.114(%152, %153, %154, %1112)
     br bb92(%152, %1113)
 bb67(%155: ptr, %156: ptr, %157: ptr, %158: bool):
     condbr %158, bb68(%155, %156, %157), bb71(%155)
 bb68(%159: ptr, %160: ptr, %161: ptr):
-    %1114 = call @func.76(%225, %226)
+    %1114 = call @func.38(%225, %226)
     br bb69(%159, %160, %161, %1114)
 bb69(%162: ptr, %163: ptr, %164: ptr, %165: bool):
     condbr %165, bb70(%162, %163, %164), bb71(%162)
@@ -93789,7 +93327,7 @@ bb72(%170: ptr, %171: ptr, %172: ptr):
     br bb73(%170, %172, %1121)
 bb73(%173: ptr, %174: ptr, %175: ptr):
     %1122 = load ptr, ptr %210
-    %1123 = call @func.144(%173, %174, %175, %1122)
+    %1123 = call @func.114(%173, %174, %175, %1122)
     br bb93(%173, %1123)
 bb74(%176: ptr, %177: ptr, %178: ptr):
     %1124 = load ptr, ptr %177
@@ -93798,7 +93336,7 @@ bb74(%176: ptr, %177: ptr, %178: ptr):
     br bb75(%176, %178, %1126)
 bb75(%179: ptr, %180: ptr, %181: ptr):
     %1127 = load ptr, ptr %210
-    %1128 = call @func.144(%179, %180, %181, %1127)
+    %1128 = call @func.114(%179, %180, %181, %1127)
     br bb94(%179, %1128)
 bb76(%182: ptr, %183: bool):
     condbr %183, bb77, bb78(%182)
@@ -93807,7 +93345,7 @@ bb77:
     br bb81(%1129)
 bb78(%184: ptr):
     %1130 = load ptr, ptr %210
-    %1131 = call @func.145(%184, %211, %212, %1130)
+    %1131 = call @func.115(%184, %211, %212, %1130)
     br bb79(%1131)
 bb79(%185: bool):
     br bb80(%185)
@@ -93961,16 +93499,16 @@ bb9:
     %103 = load ptr, ptr %35
     %104 = const i64 16
     %105 = gep i8, ptr %103, %104
-    call @func.79(%26, %93)
+    call @func.68(%26, %93)
     br bb11(%89, %99, %105)
 bb10:
     %106 = const bool true
     br bb22(%106)
 bb11(%4: ptr, %5: ptr, %6: ptr):
-    call @func.79(%27, %6)
+    call @func.68(%27, %6)
     br bb12(%4, %5)
 bb12(%7: ptr, %8: ptr):
-    %107 = call @func.146(%26, %27)
+    %107 = call @func.116(%26, %27)
     br bb13(%7, %8, %107)
 bb13(%9: ptr, %10: ptr, %11: bool):
     condbr %11, bb14(%9, %10), bb15
@@ -94058,7 +93596,7 @@ bb6(%6: u64, %7: ptr, %8: u64):
     %40 = const u64 40
     %41 = mul u64 %8, %40
     %42 = gep i8, ptr %39, %41
-    %43 = call @func.149(%7, %42)
+    %43 = call @func.119(%7, %42)
     br bb7(%6, %43)
 bb7(%9: u64, %10: bool):
     condbr %10, bb8(%9), bb9
@@ -94088,18 +93626,6 @@ bb12(%12: bool):
     ret %12
 bb13:
     unreachable
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice7LiteralNtB7_9PartialEq2eqBF_(functy.82) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdNtB7_9PartialEq2eqBF_(functy.83) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.84) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.85) {
 }
 
 fn @Verifier____env___def_eq_inner(functy.86) {
@@ -94154,11 +93680,11 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %227 = alloca i64, align 8
     store ptr %3, ptr %180
     %228 = load ptr, ptr %180
-    call @func.47(%181, %0, %1, %228)
+    call @func.44(%181, %0, %1, %228)
     br bb1(%0, %2)
 bb1(%4: ptr, %5: ptr):
     %229 = load ptr, ptr %180
-    call @func.47(%182, %4, %5, %229)
+    call @func.44(%182, %4, %5, %229)
     br bb2(%4)
 bb2(%6: ptr):
     %230 = const i64 72
@@ -94166,7 +93692,7 @@ bb2(%6: ptr):
     %232 = load i64, ptr %231
     store i64 %232, ptr %183
     %233 = load u64, ptr %183
-    %234 = call @func.36(%233)
+    %234 = call @func.34(%233)
     br bb3(%6, %234)
 bb3(%7: ptr, %8: u64):
     %235 = const i64 72
@@ -94174,13 +93700,13 @@ bb3(%7: ptr, %8: u64):
     %237 = load i64, ptr %236
     store i64 %237, ptr %184
     %238 = load u64, ptr %184
-    %239 = call @func.36(%238)
+    %239 = call @func.34(%238)
     br bb4(%7, %8, %239)
 bb4(%9: ptr, %10: u64, %11: u64):
     %240 = icmp eq u64 %10, %11
     condbr %240, bb5(%9), bb8(%9)
 bb5(%12: ptr):
-    %241 = call @func.140(%12, %181, %182)
+    %241 = call @func.110(%12, %181, %182)
     br bb6(%12, %241)
 bb6(%13: ptr, %14: bool):
     condbr %14, bb7, bb8(%13)
@@ -94238,7 +93764,7 @@ bb8(%15: ptr):
     switch %287 [ 5: bb10(%15) 6: bb11(%15) default: bb9(%15) ]
 bb9(%16: ptr):
     %288 = load ptr, ptr %180
-    call @func.150(%186, %16, %181, %182, %288)
+    call @func.120(%186, %16, %181, %182, %288)
     br bb13(%16)
 bb10(%17: ptr):
     %289 = const i64 8
@@ -94883,7 +94409,7 @@ bb28(%34: ptr):
     %880 = load ptr, ptr %205
     %881 = const i64 48
     %882 = gep i8, ptr %880, %881
-    %883 = call @func.80(%856, %870)
+    %883 = call @func.69(%856, %870)
     br bb59(%34, %864, %882, %883)
 bb29(%35: ptr):
     %884 = load ptr, ptr %187
@@ -94900,7 +94426,7 @@ bb29(%35: ptr):
     %892 = const i64 8
     %893 = gep i8, ptr %891, %892
     store ptr %893, ptr %195
-    %894 = call @func.82(%194, %195)
+    %894 = call @func.35(%194, %195)
     br bb78(%35, %894)
 bb30(%36: ptr):
     %895 = load ptr, ptr %187
@@ -94997,7 +94523,7 @@ bb32(%38: ptr):
     %968 = load ptr, ptr %221
     %969 = const i64 48
     %970 = gep i8, ptr %968, %969
-    %971 = call @func.80(%954, %964)
+    %971 = call @func.69(%954, %964)
     br bb36(%38, %958, %970, %971)
 bb33(%39: ptr):
     %972 = load ptr, ptr %187
@@ -95012,7 +94538,7 @@ bb33(%39: ptr):
     %979 = load ptr, ptr %223
     %980 = const i64 8
     %981 = gep i8, ptr %979, %980
-    %982 = call @func.142(%39, %975, %981)
+    %982 = call @func.112(%39, %975, %981)
     br bb79(%39, %982)
 bb34(%40: ptr):
     %983 = load ptr, ptr %187
@@ -95029,7 +94555,7 @@ bb34(%40: ptr):
     %991 = const i64 8
     %992 = gep i8, ptr %990, %991
     store ptr %992, ptr %191
-    %993 = call @func.83(%190, %191)
+    %993 = call @func.37(%190, %191)
     br bb80(%40, %993)
 bb35(%41: ptr):
     %994 = load ptr, ptr %187
@@ -95046,21 +94572,21 @@ bb35(%41: ptr):
     %1002 = const i64 8
     %1003 = gep i8, ptr %1001, %1002
     store ptr %1003, ptr %189
-    %1004 = call @func.84(%188, %189)
+    %1004 = call @func.38(%188, %189)
     br bb81(%41, %1004)
 bb36(%42: ptr, %43: ptr, %44: ptr, %45: bool):
     condbr %45, bb37(%42, %43, %44), bb38(%42)
 bb37(%46: ptr, %47: ptr, %48: ptr):
-    call @func.85(%192, %47)
+    call @func.39(%192, %47)
     br bb39(%46, %48)
 bb38(%49: ptr):
     %1005 = const bool false
     br bb68(%49, %1005)
 bb39(%50: ptr, %51: ptr):
-    call @func.85(%193, %51)
+    call @func.39(%193, %51)
     br bb40(%50)
 bb40(%52: ptr):
-    %1006 = call @func.143(%52, %192, %193)
+    %1006 = call @func.113(%52, %192, %193)
     br bb82(%52, %1006)
 bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1007 = load ptr, ptr %55
@@ -95069,7 +94595,7 @@ bb41(%53: ptr, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     br bb42(%53, %54, %56, %57, %1009)
 bb42(%58: ptr, %59: ptr, %60: ptr, %61: ptr, %62: ptr):
     %1010 = load ptr, ptr %180
-    %1011 = call @func.68(%58, %61, %62, %1010)
+    %1011 = call @func.62(%58, %61, %62, %1010)
     br bb43(%58, %59, %60, %1011)
 bb43(%63: ptr, %64: ptr, %65: ptr, %66: bool):
     condbr %66, bb44(%63, %64, %65), bb45(%63)
@@ -95088,7 +94614,7 @@ bb46(%71: ptr, %72: ptr, %73: ptr):
     br bb47(%71, %73, %1018)
 bb47(%74: ptr, %75: ptr, %76: ptr):
     %1019 = load ptr, ptr %180
-    %1020 = call @func.68(%74, %75, %76, %1019)
+    %1020 = call @func.62(%74, %75, %76, %1019)
     br bb83(%74, %1020)
 bb48(%77: ptr, %78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr, %83: ptr):
     %1021 = load ptr, ptr %80
@@ -95097,7 +94623,7 @@ bb48(%77: ptr, %78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr, %83: ptr):
     br bb49(%77, %78, %79, %81, %82, %83, %1023)
 bb49(%84: ptr, %85: ptr, %86: ptr, %87: ptr, %88: ptr, %89: ptr, %90: ptr):
     %1024 = load ptr, ptr %180
-    %1025 = call @func.68(%84, %89, %90, %1024)
+    %1025 = call @func.62(%84, %89, %90, %1024)
     br bb50(%84, %85, %86, %87, %88, %1025)
 bb50(%91: ptr, %92: ptr, %93: ptr, %94: ptr, %95: ptr, %96: bool):
     condbr %96, bb51(%91, %92, %93, %94, %95), bb56(%91)
@@ -95113,7 +94639,7 @@ bb52(%102: ptr, %103: ptr, %104: ptr, %105: ptr, %106: ptr):
     br bb53(%102, %103, %105, %106, %1031)
 bb53(%107: ptr, %108: ptr, %109: ptr, %110: ptr, %111: ptr):
     %1032 = load ptr, ptr %180
-    %1033 = call @func.68(%107, %110, %111, %1032)
+    %1033 = call @func.62(%107, %110, %111, %1032)
     br bb54(%107, %108, %109, %1033)
 bb54(%112: ptr, %113: ptr, %114: ptr, %115: bool):
     condbr %115, bb55(%112, %113, %114), bb56(%112)
@@ -95132,12 +94658,12 @@ bb57(%120: ptr, %121: ptr, %122: ptr):
     br bb58(%120, %122, %1040)
 bb58(%123: ptr, %124: ptr, %125: ptr):
     %1041 = load ptr, ptr %180
-    %1042 = call @func.68(%123, %124, %125, %1041)
+    %1042 = call @func.62(%123, %124, %125, %1041)
     br bb84(%123, %1042)
 bb59(%126: ptr, %127: ptr, %128: ptr, %129: bool):
     condbr %129, bb60(%126, %127, %128), bb63(%126)
 bb60(%130: ptr, %131: ptr, %132: ptr):
-    %1043 = call @func.84(%196, %197)
+    %1043 = call @func.38(%196, %197)
     br bb61(%130, %131, %132, %1043)
 bb61(%133: ptr, %134: ptr, %135: ptr, %136: bool):
     condbr %136, bb62(%133, %134, %135), bb63(%133)
@@ -95156,7 +94682,7 @@ bb64(%141: ptr, %142: ptr, %143: ptr):
     br bb65(%141, %143, %1050)
 bb65(%144: ptr, %145: ptr, %146: ptr):
     %1051 = load ptr, ptr %180
-    %1052 = call @func.68(%144, %145, %146, %1051)
+    %1052 = call @func.62(%144, %145, %146, %1051)
     br bb85(%144, %1052)
 bb66(%147: ptr, %148: ptr, %149: ptr):
     %1053 = load ptr, ptr %148
@@ -95165,7 +94691,7 @@ bb66(%147: ptr, %148: ptr, %149: ptr):
     br bb67(%147, %149, %1055)
 bb67(%150: ptr, %151: ptr, %152: ptr):
     %1056 = load ptr, ptr %180
-    %1057 = call @func.68(%150, %151, %152, %1056)
+    %1057 = call @func.62(%150, %151, %152, %1056)
     br bb86(%150, %1057)
 bb68(%153: ptr, %154: bool):
     condbr %154, bb69, bb70(%153)
@@ -95174,7 +94700,7 @@ bb69:
     br bb73(%1058)
 bb70(%155: ptr):
     %1059 = load ptr, ptr %180
-    %1060 = call @func.151(%155, %181, %182, %1059)
+    %1060 = call @func.121(%155, %181, %182, %1059)
     br bb71(%1060)
 bb71(%156: bool):
     br bb72(%156)
@@ -95208,9 +94734,6 @@ bb85(%176: ptr, %177: bool):
     br bb68(%176, %177)
 bb86(%178: ptr, %179: bool):
     br bb68(%178, %179)
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.87) {
 }
 
 fn @_RNvXs4_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtB7_5clone5Clone5cloneBM_(functy.88) {
@@ -95322,7 +94845,7 @@ bb4(%8: ptr, %9: ptr):
     %192 = load i64, ptr %191
     store i64 %192, ptr %121
     %193 = load u64, ptr %121
-    call @func.154(%120, %9, %193)
+    call @func.122(%120, %9, %193)
     br bb37(%8, %9)
 bb5(%10: ptr, %11: ptr):
     %194 = load ptr, ptr %103
@@ -95331,7 +94854,7 @@ bb5(%10: ptr, %11: ptr):
     %197 = load ptr, ptr %103
     %198 = const i64 48
     %199 = gep i8, ptr %197, %198
-    call @func.156(%117, %10, %196)
+    call @func.123(%117, %10, %196)
     br bb32(%10, %11)
 bb6(%12: ptr, %13: ptr):
     %200 = load ptr, ptr %103
@@ -95357,7 +94880,7 @@ bb7(%14: ptr, %15: ptr):
     br bb8(%14, %15, %214, %217)
 bb8(%16: ptr, %17: ptr, %18: ptr, %19: ptr):
     %218 = const bool true
-    call @func.47(%104, %16, %19, %17)
+    call @func.44(%104, %16, %19, %17)
     br bb9(%16, %17, %18, %218)
 bb9(%20: ptr, %21: ptr, %22: ptr, %23: bool):
     store ptr %104, ptr %105
@@ -95545,15 +95068,15 @@ bb12(%31: ptr, %32: ptr, %33: ptr, %34: ptr, %35: bool):
     %371 = gep i8, ptr %369, %370
     br bb13(%31, %32, %34, %371, %35)
 bb13(%36: ptr, %37: ptr, %38: ptr, %39: ptr, %40: bool):
-    call @func.135(%106, %38, %39)
+    call @func.109(%106, %38, %39)
     br bb14(%36, %37, %40)
 bb14(%41: ptr, %42: ptr, %43: bool):
-    call @func.47(%0, %41, %106, %42)
+    call @func.44(%0, %41, %106, %42)
     br bb15(%43)
 bb15(%44: bool):
     br bb50(%44)
 bb16(%45: ptr, %46: ptr, %47: ptr, %48: bool):
-    call @func.87(%111, %47)
+    call @func.26(%111, %47)
     br bb17(%45, %46, %48)
 bb17(%49: ptr, %50: ptr, %51: bool):
     %372 = load ptr, ptr %109
@@ -95569,7 +95092,7 @@ bb17(%49: ptr, %50: ptr, %51: bool):
     call @func.19(%107, %108)
     br bb18(%49, %50, %51)
 bb18(%52: ptr, %53: ptr, %54: bool):
-    call @func.157(%112, %52, %107)
+    call @func.124(%112, %52, %107)
     br bb19(%52, %53, %54)
 bb19(%55: ptr, %56: ptr, %57: bool):
     %379 = load i64, ptr %112
@@ -95636,12 +95159,12 @@ bb20(%58: ptr, %59: ptr):
     %429 = gep i8, ptr %113, %428
     %430 = load i64, ptr %427
     store i64 %430, ptr %429
-    call @func.47(%0, %58, %113, %59)
+    call @func.44(%0, %58, %113, %59)
     br bb21
 bb21:
     br bb46
 bb22(%60: ptr, %61: ptr, %62: bool):
-    call @func.158(%114, %60, %107)
+    call @func.125(%114, %60, %107)
     br bb23(%60, %61, %62)
 bb23(%63: ptr, %64: ptr, %65: bool):
     %431 = load i64, ptr %114
@@ -95708,7 +95231,7 @@ bb24(%66: ptr, %67: ptr):
     %481 = gep i8, ptr %115, %480
     %482 = load i64, ptr %479
     store i64 %482, ptr %481
-    call @func.47(%0, %66, %115, %67)
+    call @func.44(%0, %66, %115, %67)
     br bb25
 bb25:
     br bb46
@@ -95779,10 +95302,10 @@ bb28(%69: ptr, %70: ptr, %71: ptr, %72: ptr):
     %532 = gep i8, ptr %530, %531
     br bb29(%69, %70, %72, %532)
 bb29(%73: ptr, %74: ptr, %75: ptr, %76: ptr):
-    call @func.135(%116, %75, %76)
+    call @func.109(%116, %75, %76)
     br bb30(%73, %74)
 bb30(%77: ptr, %78: ptr):
-    call @func.47(%0, %77, %116, %78)
+    call @func.44(%0, %77, %116, %78)
     br bb31
 bb31:
     br bb48
@@ -95857,7 +95380,7 @@ bb35(%81: ptr, %82: ptr):
     %584 = gep i8, ptr %118, %583
     %585 = load i64, ptr %582
     store i64 %585, ptr %584
-    call @func.47(%0, %81, %118, %82)
+    call @func.44(%0, %81, %118, %82)
     br bb36
 bb36:
     br bb48
@@ -95879,7 +95402,7 @@ bb39(%87: ptr, %88: ptr):
     %594 = load ptr, ptr %122
     %595 = const i64 120
     %596 = gep i8, ptr %594, %595
-    call @func.88(%119, %596)
+    call @func.72(%119, %596)
     br bb40(%87, %88)
 bb40(%89: ptr, %90: ptr):
     %597 = load i64, ptr %119
@@ -95950,15 +95473,15 @@ bb42(%91: ptr, %92: ptr):
     %648 = gep i8, ptr %123, %647
     %649 = load i64, ptr %646
     store i64 %649, ptr %648
-    call @func.47(%0, %91, %123, %92)
+    call @func.44(%0, %91, %123, %92)
     br bb43
 bb43:
     br bb48
 bb44(%93: ptr, %94: ptr, %95: ptr, %96: u32, %97: ptr):
-    call @func.161(%0, %93, %95, %96, %97, %94)
+    call @func.128(%0, %93, %95, %96, %97, %94)
     br bb48
 bb45(%98: ptr, %99: ptr, %100: ptr):
-    call @func.47(%0, %98, %100, %99)
+    call @func.44(%0, %98, %100, %99)
     br bb48
 bb46:
     br bb47
@@ -96178,7 +95701,7 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     %12 = const i64 32
     %13 = gep i8, ptr %1, %12
     %14 = load u64, ptr %13
-    %15 = call @func.99(%14, %2)
+    %15 = call @func.83(%14, %2)
     br bb1(%2, %15)
 bb1(%3: u64, %4: u64):
     %16 = const bool false
@@ -96305,13 +95828,13 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     br bb1
 bb1:
     %20 = const u64 11
-    %21 = call @func.164(%7, %20)
+    %21 = call @func.130(%7, %20)
     br bb2(%21)
 bb2(%3: u64):
     %22 = const i64 32
     %23 = gep i8, ptr %1, %22
     %24 = load u64, ptr %23
-    %25 = call @func.99(%24, %3)
+    %25 = call @func.83(%24, %3)
     br bb3(%25)
 bb3(%4: u64):
     %26 = const bool false
@@ -96380,7 +95903,7 @@ bb3(%4: u64):
     store ptr %49, ptr %9
     br bb4(%4)
 bb4(%5: u64):
-    call @func.92(%11, %2)
+    call @func.76(%11, %2)
     br bb5(%5)
 bb5(%6: u64):
     %77 = load ptr, ptr %9
@@ -96436,13 +95959,13 @@ bb0(%0: ptr, %1: ptr):
 fn @hash_lit(functy.95) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.165(%3)
+    call @func.131(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.169(%1, %3)
+    call @func.135(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.170(%3)
+    %4 = call @func.136(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -96451,13 +95974,13 @@ bb3(%2: u64):
 fn @hash_name(functy.96) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.165(%3)
+    call @func.131(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.172(%1, %3)
+    call @func.137(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.170(%3)
+    %4 = call @func.136(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -96466,13 +95989,13 @@ bb3(%2: u64):
 fn @hash_level(functy.97) {
 bb0(%0: ptr):
     %3 = alloca i64, align 8
-    call @func.165(%3)
+    call @func.131(%3)
     br bb1(%0)
 bb1(%1: ptr):
-    call @func.176(%1, %3)
+    call @func.141(%1, %3)
     br bb2
 bb2:
-    %4 = call @func.170(%3)
+    %4 = call @func.136(%3)
     br bb3(%4)
 bb3(%2: u64):
     ret %2
@@ -96484,7 +96007,7 @@ fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.98) {
 fn @mix_hash(functy.99) {
 bb0(%0: u64, %1: u64):
     %8 = const u64 14313749767032793493
-    %9 = call @func.98(%1, %8)
+    %9 = call @func.82(%1, %8)
     br bb1(%0, %9)
 bb1(%2: u64, %3: u64):
     %10 = const u32 47
@@ -96500,7 +96023,7 @@ bb2(%4: u64, %5: u64, %6: u64):
     %18 = xor u64 %16, %17
     %19 = xor u64 %4, %18
     %20 = const u64 14313749767032793493
-    %21 = call @func.98(%19, %20)
+    %21 = call @func.82(%19, %20)
     br bb3(%21)
 bb3(%7: u64):
     ret %7
@@ -96508,13 +96031,10 @@ bb4:
     unreachable
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.100) {
-}
-
 fn @ExprMeta__pack(functy.101) {
 bb0(%0: ptr, %1: u32, %2: u32, %3: u32, %4: bool, %5: bool, %6: bool, %7: bool):
     %42 = const u32 255
-    %43 = call @func.100(%3, %42)
+    %43 = call @func.57(%3, %42)
     br bb1(%1, %2, %4, %5, %6, %7, %43)
 bb1(%8: u32, %9: u32, %10: bool, %11: bool, %12: bool, %13: bool, %14: u32):
     %44 = zext u32 %8 to u64
@@ -96595,9 +96115,6 @@ bb8:
 fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.102) {
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.103) {
-}
-
 fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.104) {
 }
 
@@ -96609,14 +96126,14 @@ bb0(%0: ptr, %1: u64, %2: u64):
     store u64 %1, ptr %28
     store u64 %2, ptr %29
     %31 = load u64, ptr %28
-    %32 = call @func.119(%31)
+    %32 = call @func.94(%31)
     br bb1(%32)
 bb1(%3: u8):
     %33 = load u64, ptr %29
-    %34 = call @func.119(%33)
+    %34 = call @func.94(%33)
     br bb2(%3, %34)
 bb2(%4: u8, %5: u8):
-    %35 = call @func.102(%4, %5)
+    %35 = call @func.85(%4, %5)
     br bb3(%35)
 bb3(%6: u8):
     %36 = zext u8 %6 to u32
@@ -96635,23 +96152,23 @@ bb3(%6: u8):
 bb4:
     %47 = load u32, ptr %30
     %48 = const u32 255
-    %49 = call @func.103(%47, %48)
+    %49 = call @func.57(%47, %48)
     br bb5(%49)
 bb5(%7: u32):
     %50 = load u64, ptr %28
-    %51 = call @func.121(%50)
+    %51 = call @func.96(%50)
     br bb6(%7, %51)
 bb6(%8: u32, %9: u32):
     %52 = load u64, ptr %29
-    %53 = call @func.121(%52)
+    %53 = call @func.96(%52)
     br bb7(%8, %9, %53)
 bb7(%10: u32, %11: u32, %12: u32):
-    %54 = call @func.104(%11, %12)
+    %54 = call @func.86(%11, %12)
     br bb8(%10, %54)
 bb8(%13: u32, %14: u32):
     %55 = load u64, ptr %28
     %56 = load u64, ptr %29
-    %57 = call @func.99(%55, %56)
+    %57 = call @func.83(%55, %56)
     br bb9(%13, %14, %57)
 bb9(%15: u32, %16: u32, %17: u64):
     %58 = trunc u64 %17 to u32
@@ -96696,16 +96213,7 @@ bb13:
     unreachable
 }
 
-fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.106) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.107) {
-}
-
 fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.108) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.109) {
 }
 
 fn @ExprMeta__mk_binder_meta(functy.110) {
@@ -96716,14 +96224,14 @@ bb0(%0: ptr, %1: u64, %2: u64, %3: u64):
     store u64 %1, ptr %130
     store u64 %2, ptr %131
     %133 = load u64, ptr %130
-    %134 = call @func.119(%133)
+    %134 = call @func.94(%133)
     br bb1(%3, %134)
 bb1(%4: u64, %5: u8):
     %135 = load u64, ptr %131
-    %136 = call @func.119(%135)
+    %136 = call @func.94(%135)
     br bb2(%4, %5, %136)
 bb2(%6: u64, %7: u8, %8: u8):
-    %137 = call @func.106(%7, %8)
+    %137 = call @func.85(%7, %8)
     br bb3(%6, %137)
 bb3(%9: u64, %10: u8):
     %138 = zext u8 %10 to u32
@@ -96742,47 +96250,47 @@ bb3(%9: u64, %10: u8):
 bb4(%11: u64):
     %149 = load u32, ptr %132
     %150 = const u32 255
-    %151 = call @func.107(%149, %150)
+    %151 = call @func.57(%149, %150)
     br bb5(%11, %151)
 bb5(%12: u64, %13: u32):
     %152 = load u64, ptr %131
-    %153 = call @func.121(%152)
+    %153 = call @func.96(%152)
     br bb6(%12, %13, %153)
 bb6(%14: u64, %15: u32, %16: u32):
     %154 = const u32 1
-    %155 = call @func.108(%16, %154)
+    %155 = call @func.88(%16, %154)
     br bb7(%14, %15, %155)
 bb7(%17: u64, %18: u32, %19: u32):
     %156 = load u64, ptr %130
-    %157 = call @func.121(%156)
+    %157 = call @func.96(%156)
     br bb8(%17, %18, %19, %157)
 bb8(%20: u64, %21: u32, %22: u32, %23: u32):
-    %158 = call @func.109(%23, %22)
+    %158 = call @func.86(%23, %22)
     br bb9(%20, %21, %158)
 bb9(%24: u64, %25: u32, %26: u32):
     %159 = zext u32 %25 to u64
     %160 = load u64, ptr %130
-    %161 = call @func.120(%160)
+    %161 = call @func.95(%160)
     br bb10(%24, %25, %26, %159, %161)
 bb10(%27: u64, %28: u32, %29: u32, %30: u64, %31: u32):
     %162 = zext u32 %31 to u64
     %163 = load u64, ptr %131
-    %164 = call @func.120(%163)
+    %164 = call @func.95(%163)
     br bb11(%27, %28, %29, %30, %162, %164)
 bb11(%32: u64, %33: u32, %34: u32, %35: u64, %36: u64, %37: u32):
     %165 = zext u32 %37 to u64
-    %166 = call @func.99(%165, %32)
+    %166 = call @func.83(%165, %32)
     br bb12(%33, %34, %35, %36, %166)
 bb12(%38: u32, %39: u32, %40: u64, %41: u64, %42: u64):
-    %167 = call @func.99(%41, %42)
+    %167 = call @func.83(%41, %42)
     br bb13(%38, %39, %40, %167)
 bb13(%43: u32, %44: u32, %45: u64, %46: u64):
-    %168 = call @func.99(%45, %46)
+    %168 = call @func.83(%45, %46)
     br bb14(%43, %44, %168)
 bb14(%47: u32, %48: u32, %49: u64):
     %169 = trunc u64 %49 to u32
     %170 = load u64, ptr %130
-    %171 = call @func.122(%170)
+    %171 = call @func.97(%170)
     br bb15(%47, %48, %169, %171)
 bb15(%50: u32, %51: u32, %52: u32, %53: bool):
     condbr %53, bb16(%50, %51, %52), bb17(%50, %51, %52)
@@ -96791,11 +96299,11 @@ bb16(%54: u32, %55: u32, %56: u32):
     br bb18(%54, %55, %56, %172)
 bb17(%57: u32, %58: u32, %59: u32):
     %173 = load u64, ptr %131
-    %174 = call @func.122(%173)
+    %174 = call @func.97(%173)
     br bb18(%57, %58, %59, %174)
 bb18(%60: u32, %61: u32, %62: u32, %63: bool):
     %175 = load u64, ptr %130
-    %176 = call @func.123(%175)
+    %176 = call @func.98(%175)
     br bb19(%60, %61, %62, %63, %176)
 bb19(%64: u32, %65: u32, %66: u32, %67: bool, %68: bool):
     condbr %68, bb20(%64, %65, %66, %67), bb21(%64, %65, %66, %67)
@@ -96804,11 +96312,11 @@ bb20(%69: u32, %70: u32, %71: u32, %72: bool):
     br bb22(%69, %70, %71, %72, %177)
 bb21(%73: u32, %74: u32, %75: u32, %76: bool):
     %178 = load u64, ptr %131
-    %179 = call @func.123(%178)
+    %179 = call @func.98(%178)
     br bb22(%73, %74, %75, %76, %179)
 bb22(%77: u32, %78: u32, %79: u32, %80: bool, %81: bool):
     %180 = load u64, ptr %130
-    %181 = call @func.124(%180)
+    %181 = call @func.99(%180)
     br bb23(%77, %78, %79, %80, %81, %181)
 bb23(%82: u32, %83: u32, %84: u32, %85: bool, %86: bool, %87: bool):
     condbr %87, bb24(%82, %83, %84, %85, %86), bb25(%82, %83, %84, %85, %86)
@@ -96817,11 +96325,11 @@ bb24(%88: u32, %89: u32, %90: u32, %91: bool, %92: bool):
     br bb26(%88, %89, %90, %91, %92, %182)
 bb25(%93: u32, %94: u32, %95: u32, %96: bool, %97: bool):
     %183 = load u64, ptr %131
-    %184 = call @func.124(%183)
+    %184 = call @func.99(%183)
     br bb26(%93, %94, %95, %96, %97, %184)
 bb26(%98: u32, %99: u32, %100: u32, %101: bool, %102: bool, %103: bool):
     %185 = load u64, ptr %130
-    %186 = call @func.125(%185)
+    %186 = call @func.100(%185)
     br bb27(%98, %99, %100, %101, %102, %103, %186)
 bb27(%104: u32, %105: u32, %106: u32, %107: bool, %108: bool, %109: bool, %110: bool):
     condbr %110, bb28(%104, %105, %106, %107, %108, %109), bb29(%104, %105, %106, %107, %108, %109)
@@ -96830,10 +96338,10 @@ bb28(%111: u32, %112: u32, %113: u32, %114: bool, %115: bool, %116: bool):
     br bb30(%111, %112, %113, %114, %115, %116, %187)
 bb29(%117: u32, %118: u32, %119: u32, %120: bool, %121: bool, %122: bool):
     %188 = load u64, ptr %131
-    %189 = call @func.125(%188)
+    %189 = call @func.100(%188)
     br bb30(%117, %118, %119, %120, %121, %122, %189)
 bb30(%123: u32, %124: u32, %125: u32, %126: bool, %127: bool, %128: bool, %129: bool):
-    call @func.101(%0, %125, %124, %123, %126, %127, %128, %129)
+    call @func.84(%0, %125, %124, %123, %126, %127, %128, %129)
     br bb31
 bb31:
     ret
@@ -96904,7 +96412,7 @@ bb6:
     %50 = const bool false
     br bb14(%50)
 bb7(%1: ptr):
-    %51 = call @func.112(%1)
+    %51 = call @func.91(%1)
     br bb14(%51)
 bb8(%2: ptr, %3: ptr):
     %52 = load ptr, ptr %2
@@ -96912,7 +96420,7 @@ bb8(%2: ptr, %3: ptr):
     %54 = gep i8, ptr %52, %53
     br bb9(%3, %54)
 bb9(%4: ptr, %5: ptr):
-    %55 = call @func.112(%5)
+    %55 = call @func.91(%5)
     br bb10(%4, %55)
 bb10(%6: ptr, %7: bool):
     condbr %7, bb11, bb12(%6)
@@ -96925,7 +96433,7 @@ bb12(%8: ptr):
     %59 = gep i8, ptr %57, %58
     br bb13(%59)
 bb13(%9: ptr):
-    %60 = call @func.112(%9)
+    %60 = call @func.91(%9)
     br bb14(%60)
 bb14(%10: bool):
     ret %10
@@ -96935,13 +96443,13 @@ fn @hash_levels(functy.113) {
 bb0(%0: ptr):
     %7 = alloca i64, align 8
     %8 = alloca (i64, i64), align 8
-    call @func.165(%7)
+    call @func.131(%7)
     br bb1
 bb1:
     %9 = const i64 8
     %10 = gep i8, ptr %0, %9
     %11 = load u64, ptr %10
-    call @func.178(%7, %11)
+    call @func.142(%7, %11)
     br bb2
 bb2:
     %12 = const u64 0
@@ -96963,7 +96471,7 @@ bb5(%3: u64, %4: u64):
     %22 = const u64 40
     %23 = mul u64 %4, %22
     %24 = gep i8, ptr %21, %23
-    call @func.176(%24, %7)
+    call @func.141(%24, %7)
     br bb6(%3)
 bb6(%5: u64):
     %25 = const u64 1
@@ -96982,24 +96490,12 @@ bb7:
     %35 = load u64, ptr %8
     br bb3(%35)
 bb8:
-    %36 = call @func.170(%7)
+    %36 = call @func.136(%7)
     br bb9(%36)
 bb9(%6: u64):
     ret %6
 bb10:
     unreachable
-}
-
-fn @_RNvYhNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.114) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.115) {
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.116) {
-}
-
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3maxCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.117) {
 }
 
 fn @ExprMeta__mk_let_meta(functy.118) {
@@ -97012,21 +96508,21 @@ bb0(%0: ptr, %1: u64, %2: u64, %3: u64):
     store u64 %2, ptr %176
     store u64 %3, ptr %177
     %179 = load u64, ptr %175
-    %180 = call @func.119(%179)
+    %180 = call @func.94(%179)
     br bb1(%180)
 bb1(%4: u8):
     %181 = load u64, ptr %176
-    %182 = call @func.119(%181)
+    %182 = call @func.94(%181)
     br bb2(%4, %182)
 bb2(%5: u8, %6: u8):
-    %183 = call @func.114(%5, %6)
+    %183 = call @func.85(%5, %6)
     br bb3(%183)
 bb3(%7: u8):
     %184 = load u64, ptr %177
-    %185 = call @func.119(%184)
+    %185 = call @func.94(%184)
     br bb4(%7, %185)
 bb4(%8: u8, %9: u8):
-    %186 = call @func.114(%8, %9)
+    %186 = call @func.85(%8, %9)
     br bb5(%186)
 bb5(%10: u8):
     %187 = zext u8 %10 to u32
@@ -97045,65 +96541,65 @@ bb5(%10: u8):
 bb6:
     %198 = load u32, ptr %178
     %199 = const u32 255
-    %200 = call @func.115(%198, %199)
+    %200 = call @func.57(%198, %199)
     br bb7(%200)
 bb7(%11: u32):
     %201 = load u64, ptr %177
-    %202 = call @func.121(%201)
+    %202 = call @func.96(%201)
     br bb8(%11, %202)
 bb8(%12: u32, %13: u32):
     %203 = const u32 1
-    %204 = call @func.116(%13, %203)
+    %204 = call @func.88(%13, %203)
     br bb9(%12, %204)
 bb9(%14: u32, %15: u32):
     %205 = load u64, ptr %175
-    %206 = call @func.121(%205)
+    %206 = call @func.96(%205)
     br bb10(%14, %15, %206)
 bb10(%16: u32, %17: u32, %18: u32):
     %207 = load u64, ptr %176
-    %208 = call @func.121(%207)
+    %208 = call @func.96(%207)
     br bb11(%16, %17, %18, %208)
 bb11(%19: u32, %20: u32, %21: u32, %22: u32):
-    %209 = call @func.117(%21, %22)
+    %209 = call @func.86(%21, %22)
     br bb12(%19, %20, %209)
 bb12(%23: u32, %24: u32, %25: u32):
-    %210 = call @func.117(%25, %24)
+    %210 = call @func.86(%25, %24)
     br bb13(%23, %210)
 bb13(%26: u32, %27: u32):
     %211 = zext u32 %26 to u64
     %212 = load u64, ptr %175
-    %213 = call @func.120(%212)
+    %213 = call @func.95(%212)
     br bb14(%26, %27, %211, %213)
 bb14(%28: u32, %29: u32, %30: u64, %31: u32):
     %214 = zext u32 %31 to u64
     %215 = load u64, ptr %176
-    %216 = call @func.120(%215)
+    %216 = call @func.95(%215)
     br bb15(%28, %29, %30, %214, %216)
 bb15(%32: u32, %33: u32, %34: u64, %35: u64, %36: u32):
     %217 = zext u32 %36 to u64
     %218 = load u64, ptr %177
-    %219 = call @func.120(%218)
+    %219 = call @func.95(%218)
     br bb16(%32, %33, %34, %35, %217, %219)
 bb16(%37: u32, %38: u32, %39: u64, %40: u64, %41: u64, %42: u32):
     %220 = zext u32 %42 to u64
-    %221 = call @func.99(%41, %220)
+    %221 = call @func.83(%41, %220)
     br bb17(%37, %38, %39, %40, %221)
 bb17(%43: u32, %44: u32, %45: u64, %46: u64, %47: u64):
-    %222 = call @func.99(%46, %47)
+    %222 = call @func.83(%46, %47)
     br bb18(%43, %44, %45, %222)
 bb18(%48: u32, %49: u32, %50: u64, %51: u64):
-    %223 = call @func.99(%50, %51)
+    %223 = call @func.83(%50, %51)
     br bb19(%48, %49, %223)
 bb19(%52: u32, %53: u32, %54: u64):
     %224 = trunc u64 %54 to u32
     %225 = load u64, ptr %175
-    %226 = call @func.122(%225)
+    %226 = call @func.97(%225)
     br bb20(%52, %53, %224, %226)
 bb20(%55: u32, %56: u32, %57: u32, %58: bool):
     condbr %58, bb23(%55, %56, %57), bb21(%55, %56, %57)
 bb21(%59: u32, %60: u32, %61: u32):
     %227 = load u64, ptr %176
-    %228 = call @func.122(%227)
+    %228 = call @func.97(%227)
     br bb22(%59, %60, %61, %228)
 bb22(%62: u32, %63: u32, %64: u32, %65: bool):
     condbr %65, bb23(%62, %63, %64), bb24(%62, %63, %64)
@@ -97112,17 +96608,17 @@ bb23(%66: u32, %67: u32, %68: u32):
     br bb25(%66, %67, %68, %229)
 bb24(%69: u32, %70: u32, %71: u32):
     %230 = load u64, ptr %177
-    %231 = call @func.122(%230)
+    %231 = call @func.97(%230)
     br bb25(%69, %70, %71, %231)
 bb25(%72: u32, %73: u32, %74: u32, %75: bool):
     %232 = load u64, ptr %175
-    %233 = call @func.123(%232)
+    %233 = call @func.98(%232)
     br bb26(%72, %73, %74, %75, %233)
 bb26(%76: u32, %77: u32, %78: u32, %79: bool, %80: bool):
     condbr %80, bb29(%76, %77, %78, %79), bb27(%76, %77, %78, %79)
 bb27(%81: u32, %82: u32, %83: u32, %84: bool):
     %234 = load u64, ptr %176
-    %235 = call @func.123(%234)
+    %235 = call @func.98(%234)
     br bb28(%81, %82, %83, %84, %235)
 bb28(%85: u32, %86: u32, %87: u32, %88: bool, %89: bool):
     condbr %89, bb29(%85, %86, %87, %88), bb30(%85, %86, %87, %88)
@@ -97131,17 +96627,17 @@ bb29(%90: u32, %91: u32, %92: u32, %93: bool):
     br bb31(%90, %91, %92, %93, %236)
 bb30(%94: u32, %95: u32, %96: u32, %97: bool):
     %237 = load u64, ptr %177
-    %238 = call @func.123(%237)
+    %238 = call @func.98(%237)
     br bb31(%94, %95, %96, %97, %238)
 bb31(%98: u32, %99: u32, %100: u32, %101: bool, %102: bool):
     %239 = load u64, ptr %175
-    %240 = call @func.124(%239)
+    %240 = call @func.99(%239)
     br bb32(%98, %99, %100, %101, %102, %240)
 bb32(%103: u32, %104: u32, %105: u32, %106: bool, %107: bool, %108: bool):
     condbr %108, bb35(%103, %104, %105, %106, %107), bb33(%103, %104, %105, %106, %107)
 bb33(%109: u32, %110: u32, %111: u32, %112: bool, %113: bool):
     %241 = load u64, ptr %176
-    %242 = call @func.124(%241)
+    %242 = call @func.99(%241)
     br bb34(%109, %110, %111, %112, %113, %242)
 bb34(%114: u32, %115: u32, %116: u32, %117: bool, %118: bool, %119: bool):
     condbr %119, bb35(%114, %115, %116, %117, %118), bb36(%114, %115, %116, %117, %118)
@@ -97150,17 +96646,17 @@ bb35(%120: u32, %121: u32, %122: u32, %123: bool, %124: bool):
     br bb37(%120, %121, %122, %123, %124, %243)
 bb36(%125: u32, %126: u32, %127: u32, %128: bool, %129: bool):
     %244 = load u64, ptr %177
-    %245 = call @func.124(%244)
+    %245 = call @func.99(%244)
     br bb37(%125, %126, %127, %128, %129, %245)
 bb37(%130: u32, %131: u32, %132: u32, %133: bool, %134: bool, %135: bool):
     %246 = load u64, ptr %175
-    %247 = call @func.125(%246)
+    %247 = call @func.100(%246)
     br bb38(%130, %131, %132, %133, %134, %135, %247)
 bb38(%136: u32, %137: u32, %138: u32, %139: bool, %140: bool, %141: bool, %142: bool):
     condbr %142, bb41(%136, %137, %138, %139, %140, %141), bb39(%136, %137, %138, %139, %140, %141)
 bb39(%143: u32, %144: u32, %145: u32, %146: bool, %147: bool, %148: bool):
     %248 = load u64, ptr %176
-    %249 = call @func.125(%248)
+    %249 = call @func.100(%248)
     br bb40(%143, %144, %145, %146, %147, %148, %249)
 bb40(%149: u32, %150: u32, %151: u32, %152: bool, %153: bool, %154: bool, %155: bool):
     condbr %155, bb41(%149, %150, %151, %152, %153, %154), bb42(%149, %150, %151, %152, %153, %154)
@@ -97169,10 +96665,10 @@ bb41(%156: u32, %157: u32, %158: u32, %159: bool, %160: bool, %161: bool):
     br bb43(%156, %157, %158, %159, %160, %161, %250)
 bb42(%162: u32, %163: u32, %164: u32, %165: bool, %166: bool, %167: bool):
     %251 = load u64, ptr %177
-    %252 = call @func.125(%251)
+    %252 = call @func.100(%251)
     br bb43(%162, %163, %164, %165, %166, %167, %252)
 bb43(%168: u32, %169: u32, %170: u32, %171: bool, %172: bool, %173: bool, %174: bool):
-    call @func.101(%0, %170, %169, %168, %171, %172, %173, %174)
+    call @func.84(%0, %170, %169, %168, %171, %172, %173, %174)
     br bb44
 bb44:
     ret
@@ -97319,16 +96815,13 @@ bb2:
     unreachable
 }
 
-fn @_RNvYmNtNtCs2EYQwhfuABO_4core3cmp3Ord3minCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.126) {
-}
-
 fn @ExprMeta__mk_wrapper_meta(functy.127) {
 bb0(%0: ptr, %1: u64, %2: u64):
     %42 = alloca i64, align 8
     %43 = alloca (i32, i32), align 4
     store u64 %1, ptr %42
     %44 = load u64, ptr %42
-    %45 = call @func.119(%44)
+    %45 = call @func.94(%44)
     br bb1(%2, %45)
 bb1(%3: u64, %4: u8):
     %46 = zext u8 %4 to u32
@@ -97347,43 +96840,43 @@ bb1(%3: u64, %4: u8):
 bb2(%5: u64):
     %57 = load u32, ptr %43
     %58 = const u32 255
-    %59 = call @func.126(%57, %58)
+    %59 = call @func.57(%57, %58)
     br bb3(%5, %59)
 bb3(%6: u64, %7: u32):
     %60 = zext u32 %7 to u64
     %61 = load u64, ptr %42
-    %62 = call @func.120(%61)
+    %62 = call @func.95(%61)
     br bb4(%6, %7, %60, %62)
 bb4(%8: u64, %9: u32, %10: u64, %11: u32):
     %63 = zext u32 %11 to u64
-    %64 = call @func.99(%63, %8)
+    %64 = call @func.83(%63, %8)
     br bb5(%9, %10, %64)
 bb5(%12: u32, %13: u64, %14: u64):
-    %65 = call @func.99(%13, %14)
+    %65 = call @func.83(%13, %14)
     br bb6(%12, %65)
 bb6(%15: u32, %16: u64):
     %66 = trunc u64 %16 to u32
     %67 = load u64, ptr %42
-    %68 = call @func.121(%67)
+    %68 = call @func.96(%67)
     br bb7(%15, %66, %68)
 bb7(%17: u32, %18: u32, %19: u32):
     %69 = load u64, ptr %42
-    %70 = call @func.122(%69)
+    %70 = call @func.97(%69)
     br bb8(%17, %18, %19, %70)
 bb8(%20: u32, %21: u32, %22: u32, %23: bool):
     %71 = load u64, ptr %42
-    %72 = call @func.123(%71)
+    %72 = call @func.98(%71)
     br bb9(%20, %21, %22, %23, %72)
 bb9(%24: u32, %25: u32, %26: u32, %27: bool, %28: bool):
     %73 = load u64, ptr %42
-    %74 = call @func.124(%73)
+    %74 = call @func.99(%73)
     br bb10(%24, %25, %26, %27, %28, %74)
 bb10(%29: u32, %30: u32, %31: u32, %32: bool, %33: bool, %34: bool):
     %75 = load u64, ptr %42
-    %76 = call @func.125(%75)
+    %76 = call @func.100(%75)
     br bb11(%29, %30, %31, %32, %33, %34, %76)
 bb11(%35: u32, %36: u32, %37: u32, %38: bool, %39: bool, %40: bool, %41: bool):
-    call @func.101(%0, %36, %37, %35, %38, %39, %40, %41)
+    call @func.84(%0, %36, %37, %35, %38, %39, %40, %41)
     br bb12
 bb12:
     ret
@@ -97397,7 +96890,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = alloca (i64, i64, i64, i64), align 8
     store ptr %1, ptr %2
     %4 = load ptr, ptr %2
-    call @func.181(%3, %4)
+    call @func.145(%3, %4)
     br bb1
 bb1:
     %5 = load ptr, ptr %2
@@ -97516,7 +97009,7 @@ bb1:
     unreachable
 bb2:
     %30 = load ptr, ptr %4
-    call @func.128(%10, %30)
+    call @func.102(%10, %30)
     br bb12
 bb3:
     %31 = load ptr, ptr %4
@@ -97525,7 +97018,7 @@ bb3:
     %34 = load ptr, ptr %4
     %35 = const i64 16
     %36 = gep i8, ptr %34, %35
-    call @func.131(%8, %33)
+    call @func.105(%8, %33)
     br bb10(%36)
 bb4:
     %37 = load ptr, ptr %4
@@ -97534,13 +97027,13 @@ bb4:
     %40 = load ptr, ptr %4
     %41 = const i64 16
     %42 = gep i8, ptr %40, %41
-    call @func.131(%6, %39)
+    call @func.105(%6, %39)
     br bb8(%42)
 bb5:
     %43 = load ptr, ptr %4
     %44 = const i64 8
     %45 = gep i8, ptr %43, %44
-    call @func.131(%5, %45)
+    call @func.105(%5, %45)
     br bb7
 bb6:
     %46 = const i64 3
@@ -97555,7 +97048,7 @@ bb7:
     store i64 %50, ptr %0
     br bb13
 bb8(%2: ptr):
-    call @func.131(%7, %2)
+    call @func.105(%7, %2)
     br bb9
 bb9:
     %51 = load ptr, ptr %6
@@ -97570,7 +97063,7 @@ bb9:
     store i64 %57, ptr %0
     br bb13
 bb10(%3: ptr):
-    call @func.131(%9, %3)
+    call @func.105(%9, %3)
     br bb11
 bb11:
     %58 = load ptr, ptr %8
@@ -97628,7 +97121,7 @@ bb0(%0: u64):
     %2 = alloca i64, align 8
     store u64 %0, ptr %2
     %3 = load u64, ptr %2
-    %4 = call @func.121(%3)
+    %4 = call @func.96(%3)
     br bb1(%4)
 bb1(%1: u32):
     %5 = const u32 0
@@ -97639,22 +97132,10 @@ bb1(%1: u32):
 fn @Expr__instantiate(functy.135) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
     %3 = const u32 0
-    call @func.184(%0, %1, %2, %3)
+    call @func.146(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice7LiteralNtB7_9PartialEq2eqBF_(functy.136) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice6FVarIdNtB7_9PartialEq2eqBF_(functy.137) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.138) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.139) {
 }
 
 fn @Verifier____env___structural_eq(functy.140) {
@@ -98342,7 +97823,7 @@ bb14(%12: ptr):
     %793 = load ptr, ptr %175
     %794 = const i64 48
     %795 = gep i8, ptr %793, %794
-    %796 = call @func.80(%769, %783)
+    %796 = call @func.69(%769, %783)
     br bb55(%12, %777, %795, %796)
 bb15:
     %797 = load ptr, ptr %157
@@ -98359,7 +97840,7 @@ bb15:
     %805 = const i64 8
     %806 = gep i8, ptr %804, %805
     store ptr %806, ptr %165
-    %807 = call @func.136(%164, %165)
+    %807 = call @func.35(%164, %165)
     br bb64(%807)
 bb16(%13: ptr):
     %808 = load ptr, ptr %157
@@ -98532,7 +98013,7 @@ bb20(%17: ptr):
     %941 = load ptr, ptr %203
     %942 = const i64 48
     %943 = gep i8, ptr %941, %942
-    %944 = call @func.80(%927, %937)
+    %944 = call @func.69(%927, %937)
     br bb24(%17, %931, %943, %944)
 bb21(%18: ptr):
     %945 = load ptr, ptr %157
@@ -98547,7 +98028,7 @@ bb21(%18: ptr):
     %952 = load ptr, ptr %205
     %953 = const i64 8
     %954 = gep i8, ptr %952, %953
-    %955 = call @func.142(%18, %948, %954)
+    %955 = call @func.112(%18, %948, %954)
     br bb64(%955)
 bb22:
     %956 = load ptr, ptr %157
@@ -98564,7 +98045,7 @@ bb22:
     %964 = const i64 8
     %965 = gep i8, ptr %963, %964
     store ptr %965, ptr %161
-    %966 = call @func.137(%160, %161)
+    %966 = call @func.37(%160, %161)
     br bb64(%966)
 bb23:
     %967 = load ptr, ptr %157
@@ -98581,21 +98062,21 @@ bb23:
     %975 = const i64 8
     %976 = gep i8, ptr %974, %975
     store ptr %976, ptr %159
-    %977 = call @func.138(%158, %159)
+    %977 = call @func.38(%158, %159)
     br bb64(%977)
 bb24(%19: ptr, %20: ptr, %21: ptr, %22: bool):
     condbr %22, bb25(%19, %20, %21), bb26
 bb25(%23: ptr, %24: ptr, %25: ptr):
-    call @func.139(%162, %24)
+    call @func.39(%162, %24)
     br bb27(%23, %25)
 bb26:
     %978 = const bool false
     br bb64(%978)
 bb27(%26: ptr, %27: ptr):
-    call @func.139(%163, %27)
+    call @func.39(%163, %27)
     br bb28(%26)
 bb28(%28: ptr):
-    %979 = call @func.143(%28, %162, %163)
+    %979 = call @func.113(%28, %162, %163)
     br bb64(%979)
 bb29(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %980 = load ptr, ptr %31
@@ -98603,7 +98084,7 @@ bb29(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr):
     %982 = gep i8, ptr %980, %981
     br bb30(%29, %30, %32, %33, %982)
 bb30(%34: ptr, %35: ptr, %36: ptr, %37: ptr, %38: ptr):
-    %983 = call @func.140(%34, %37, %38)
+    %983 = call @func.110(%34, %37, %38)
     br bb31(%34, %35, %36, %983)
 bb31(%39: ptr, %40: ptr, %41: ptr, %42: bool):
     condbr %42, bb32(%39, %40, %41), bb33
@@ -98621,7 +98102,7 @@ bb34(%46: ptr, %47: ptr, %48: ptr):
     %990 = gep i8, ptr %988, %989
     br bb35(%46, %48, %990)
 bb35(%49: ptr, %50: ptr, %51: ptr):
-    %991 = call @func.140(%49, %50, %51)
+    %991 = call @func.110(%49, %50, %51)
     br bb64(%991)
 bb36(%52: ptr, %53: ptr, %54: ptr, %55: ptr, %56: ptr):
     %992 = load ptr, ptr %53
@@ -98634,7 +98115,7 @@ bb37(%57: ptr, %58: ptr, %59: ptr, %60: ptr, %61: ptr):
     %997 = gep i8, ptr %995, %996
     br bb38(%57, %58, %60, %61, %997)
 bb38(%62: ptr, %63: ptr, %64: ptr, %65: ptr, %66: ptr):
-    %998 = call @func.140(%62, %65, %66)
+    %998 = call @func.110(%62, %65, %66)
     br bb39(%62, %63, %64, %998)
 bb39(%67: ptr, %68: ptr, %69: ptr, %70: bool):
     condbr %70, bb40(%67, %68, %69), bb41
@@ -98652,7 +98133,7 @@ bb42(%74: ptr, %75: ptr, %76: ptr):
     %1005 = gep i8, ptr %1003, %1004
     br bb43(%74, %76, %1005)
 bb43(%77: ptr, %78: ptr, %79: ptr):
-    %1006 = call @func.140(%77, %78, %79)
+    %1006 = call @func.110(%77, %78, %79)
     br bb64(%1006)
 bb44(%80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     %1007 = load ptr, ptr %83
@@ -98660,7 +98141,7 @@ bb44(%80: ptr, %81: ptr, %82: ptr, %83: ptr, %84: ptr, %85: ptr, %86: ptr):
     %1009 = gep i8, ptr %1007, %1008
     br bb45(%80, %81, %82, %84, %85, %86, %1009)
 bb45(%87: ptr, %88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: ptr, %93: ptr):
-    %1010 = call @func.140(%87, %92, %93)
+    %1010 = call @func.110(%87, %92, %93)
     br bb46(%87, %88, %89, %90, %91, %1010)
 bb46(%94: ptr, %95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: bool):
     condbr %99, bb47(%94, %95, %96, %97, %98), bb52
@@ -98675,7 +98156,7 @@ bb48(%105: ptr, %106: ptr, %107: ptr, %108: ptr, %109: ptr):
     %1016 = gep i8, ptr %1014, %1015
     br bb49(%105, %106, %108, %109, %1016)
 bb49(%110: ptr, %111: ptr, %112: ptr, %113: ptr, %114: ptr):
-    %1017 = call @func.140(%110, %113, %114)
+    %1017 = call @func.110(%110, %113, %114)
     br bb50(%110, %111, %112, %1017)
 bb50(%115: ptr, %116: ptr, %117: ptr, %118: bool):
     condbr %118, bb51(%115, %116, %117), bb52
@@ -98693,12 +98174,12 @@ bb53(%122: ptr, %123: ptr, %124: ptr):
     %1024 = gep i8, ptr %1022, %1023
     br bb54(%122, %124, %1024)
 bb54(%125: ptr, %126: ptr, %127: ptr):
-    %1025 = call @func.140(%125, %126, %127)
+    %1025 = call @func.110(%125, %126, %127)
     br bb64(%1025)
 bb55(%128: ptr, %129: ptr, %130: ptr, %131: bool):
     condbr %131, bb56(%128, %129, %130), bb59
 bb56(%132: ptr, %133: ptr, %134: ptr):
-    %1026 = call @func.138(%166, %167)
+    %1026 = call @func.38(%166, %167)
     br bb57(%132, %133, %134, %1026)
 bb57(%135: ptr, %136: ptr, %137: ptr, %138: bool):
     condbr %138, bb58(%135, %136, %137), bb59
@@ -98716,7 +98197,7 @@ bb60(%142: ptr, %143: ptr, %144: ptr):
     %1033 = gep i8, ptr %1031, %1032
     br bb61(%142, %144, %1033)
 bb61(%145: ptr, %146: ptr, %147: ptr):
-    %1034 = call @func.140(%145, %146, %147)
+    %1034 = call @func.110(%145, %146, %147)
     br bb64(%1034)
 bb62(%148: ptr, %149: ptr, %150: ptr):
     %1035 = load ptr, ptr %149
@@ -98724,7 +98205,7 @@ bb62(%148: ptr, %149: ptr, %150: ptr):
     %1037 = gep i8, ptr %1035, %1036
     br bb63(%148, %150, %1037)
 bb63(%151: ptr, %152: ptr, %153: ptr):
-    %1038 = call @func.140(%151, %152, %153)
+    %1038 = call @func.110(%151, %152, %153)
     br bb64(%1038)
 bb64(%154: bool):
     ret %154
@@ -98741,7 +98222,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr, %4: ptr):
     %36 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %37 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %38 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.185(%33, %1, %2, %4)
+    call @func.147(%33, %1, %2, %4)
     br bb1(%1, %3, %4)
 bb1(%5: ptr, %6: ptr, %7: ptr):
     %39 = load i64, ptr %33
@@ -98870,7 +98351,7 @@ bb4(%8: ptr, %9: ptr, %10: ptr):
     %136 = gep i8, ptr %32, %135
     %137 = load i64, ptr %134
     store i64 %137, ptr %136
-    %138 = call @func.187(%8, %32)
+    %138 = call @func.148(%8, %32)
     br bb5(%8, %9, %10, %138)
 bb5(%11: ptr, %12: ptr, %13: ptr, %14: bool):
     condbr %14, bb6, bb7(%11, %12, %13)
@@ -98879,7 +98360,7 @@ bb6:
     store i8 %139, ptr %0
     br bb18
 bb7(%15: ptr, %16: ptr, %17: ptr):
-    call @func.188(%35, %15, %32, %17)
+    call @func.149(%35, %15, %32, %17)
     br bb8(%15, %16, %17)
 bb8(%18: ptr, %19: ptr, %20: ptr):
     %140 = load i8, ptr %35
@@ -98901,7 +98382,7 @@ bb11:
     store i8 %148, ptr %0
     br bb18
 bb12(%24: ptr, %25: ptr, %26: ptr):
-    call @func.185(%37, %24, %25, %26)
+    call @func.147(%37, %24, %25, %26)
     br bb13(%24, %26)
 bb13(%27: ptr, %28: ptr):
     %149 = load i64, ptr %37
@@ -99028,7 +98509,7 @@ bb15(%29: ptr, %30: ptr):
     %246 = gep i8, ptr %36, %245
     %247 = load i64, ptr %244
     store i64 %247, ptr %246
-    %248 = call @func.144(%29, %32, %36, %30)
+    %248 = call @func.114(%29, %32, %36, %30)
     br bb16(%248)
 bb16(%31: bool):
     store bool %31, ptr %0
@@ -99043,7 +98524,7 @@ bb19:
 
 fn @Verifier____env___level_eq(functy.142) {
 bb0(%0: ptr, %1: ptr, %2: ptr):
-    %4 = call @func.190(%1, %2)
+    %4 = call @func.150(%1, %2)
     br bb1(%4)
 bb1(%3: bool):
     ret %3
@@ -99093,7 +98574,7 @@ bb6(%14: ptr, %15: u64, %16: u64, %17: ptr, %18: u64):
     %56 = const u64 40
     %57 = mul u64 %18, %56
     %58 = gep i8, ptr %55, %57
-    %59 = call @func.142(%14, %17, %58)
+    %59 = call @func.112(%14, %17, %58)
     br bb7(%14, %15, %16, %59)
 bb7(%19: ptr, %20: u64, %21: u64, %22: bool):
     condbr %22, bb8(%19, %20, %21), bb9
@@ -99127,7 +98608,7 @@ bb13:
 
 fn @Verifier____env___def_eq_blind_impl(functy.144) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    %5 = call @func.78(%0, %1, %2, %3)
+    %5 = call @func.67(%0, %1, %2, %3)
     br bb1(%5)
 bb1(%4: bool):
     ret %4
@@ -99272,7 +98753,7 @@ bb3(%6: ptr, %7: ptr):
     %159 = load ptr, ptr %37
     %160 = const u32 0
     %161 = const u32 1
-    call @func.191(%44, %159, %160, %161)
+    call @func.151(%44, %159, %160, %161)
     br bb10(%6, %7, %158)
 bb4(%8: ptr, %9: ptr):
     %162 = load ptr, ptr %39
@@ -99288,7 +98769,7 @@ bb4(%8: ptr, %9: ptr):
     %170 = load ptr, ptr %38
     %171 = const u32 0
     %172 = const u32 1
-    call @func.191(%40, %170, %171, %172)
+    call @func.151(%40, %170, %171, %172)
     br bb5(%8, %9, %169)
 bb5(%10: ptr, %11: ptr, %12: ptr):
     %173 = const bool true
@@ -99362,7 +98843,7 @@ bb7(%16: ptr, %17: ptr, %18: ptr):
     %225 = gep i8, ptr %223, %224
     br bb8(%16, %17, %225)
 bb8(%19: ptr, %20: ptr, %21: ptr):
-    %226 = call @func.144(%19, %21, %41, %20)
+    %226 = call @func.114(%19, %21, %41, %20)
     br bb9(%226)
 bb9(%22: bool):
     br bb15(%22)
@@ -99438,7 +98919,7 @@ bb12(%29: ptr, %30: ptr, %31: ptr):
     %279 = gep i8, ptr %277, %278
     br bb13(%29, %30, %279)
 bb13(%32: ptr, %33: ptr, %34: ptr):
-    %280 = call @func.144(%32, %34, %45, %33)
+    %280 = call @func.114(%32, %34, %45, %33)
     br bb14(%280)
 bb14(%35: bool):
     br bb15(%35)
@@ -99587,7 +99068,7 @@ bb1(%2: ptr, %3: ptr):
     %68 = icmp eq u64 %66, %67
     condbr %68, bb28(%61), bb33
 bb2:
-    call @func.147(%40, %37)
+    call @func.117(%40, %37)
     br bb3
 bb3:
     %69 = load i64, ptr %40
@@ -99753,7 +99234,7 @@ bb11:
     %210 = load ptr, ptr %209
     store ptr %210, ptr %46
     %211 = load ptr, ptr %46
-    %212 = call @func.80(%207, %211)
+    %212 = call @func.69(%207, %211)
     br bb23(%212)
 bb12:
     %213 = load ptr, ptr %41
@@ -99834,7 +99315,7 @@ bb16(%7: ptr, %8: ptr, %9: ptr):
     %269 = const i64 8
     %270 = gep i8, ptr %42, %269
     store ptr %9, ptr %270
-    call @func.148(%7, %42)
+    call @func.118(%7, %42)
     br bb31
 bb17(%10: ptr, %11: ptr, %12: ptr, %13: ptr):
     %271 = load ptr, ptr %10
@@ -99851,7 +99332,7 @@ bb19(%19: ptr, %20: ptr, %21: ptr, %22: ptr, %23: ptr):
     %277 = const i64 8
     %278 = gep i8, ptr %43, %277
     store ptr %23, ptr %278
-    call @func.148(%21, %43)
+    call @func.118(%21, %43)
     br bb20(%19, %20)
 bb20(%24: ptr, %25: ptr):
     %279 = load ptr, ptr %24
@@ -99868,7 +99349,7 @@ bb22(%29: ptr, %30: ptr, %31: ptr):
     %285 = const i64 8
     %286 = gep i8, ptr %44, %285
     store ptr %31, ptr %286
-    call @func.148(%29, %44)
+    call @func.118(%29, %44)
     br bb32
 bb23(%32: bool):
     condbr %32, bb2, bb24
@@ -99933,7 +99414,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr, %4: ptr):
     %36 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %37 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %38 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.192(%33, %1, %2, %4)
+    call @func.152(%33, %1, %2, %4)
     br bb1(%1, %3, %4)
 bb1(%5: ptr, %6: ptr, %7: ptr):
     %39 = load i64, ptr %33
@@ -100062,7 +99543,7 @@ bb4(%8: ptr, %9: ptr, %10: ptr):
     %136 = gep i8, ptr %32, %135
     %137 = load i64, ptr %134
     store i64 %137, ptr %136
-    %138 = call @func.187(%8, %32)
+    %138 = call @func.148(%8, %32)
     br bb5(%8, %9, %10, %138)
 bb5(%11: ptr, %12: ptr, %13: ptr, %14: bool):
     condbr %14, bb6, bb7(%11, %12, %13)
@@ -100071,7 +99552,7 @@ bb6:
     store i8 %139, ptr %0
     br bb18
 bb7(%15: ptr, %16: ptr, %17: ptr):
-    call @func.193(%35, %15, %32, %17)
+    call @func.153(%35, %15, %32, %17)
     br bb8(%15, %16, %17)
 bb8(%18: ptr, %19: ptr, %20: ptr):
     %140 = load i8, ptr %35
@@ -100093,7 +99574,7 @@ bb11:
     store i8 %148, ptr %0
     br bb18
 bb12(%24: ptr, %25: ptr, %26: ptr):
-    call @func.192(%37, %24, %25, %26)
+    call @func.152(%37, %24, %25, %26)
     br bb13(%24, %26)
 bb13(%27: ptr, %28: ptr):
     %149 = load i64, ptr %37
@@ -100220,7 +99701,7 @@ bb15(%29: ptr, %30: ptr):
     %246 = gep i8, ptr %36, %245
     %247 = load i64, ptr %244
     store i64 %247, ptr %246
-    %248 = call @func.68(%29, %32, %36, %30)
+    %248 = call @func.62(%29, %32, %36, %30)
     br bb16(%248)
 bb16(%31: bool):
     store bool %31, ptr %0
@@ -100372,7 +99853,7 @@ bb3(%6: ptr, %7: ptr):
     %159 = load ptr, ptr %37
     %160 = const u32 0
     %161 = const u32 1
-    call @func.191(%44, %159, %160, %161)
+    call @func.151(%44, %159, %160, %161)
     br bb10(%6, %7, %158)
 bb4(%8: ptr, %9: ptr):
     %162 = load ptr, ptr %39
@@ -100388,7 +99869,7 @@ bb4(%8: ptr, %9: ptr):
     %170 = load ptr, ptr %38
     %171 = const u32 0
     %172 = const u32 1
-    call @func.191(%40, %170, %171, %172)
+    call @func.151(%40, %170, %171, %172)
     br bb5(%8, %9, %169)
 bb5(%10: ptr, %11: ptr, %12: ptr):
     %173 = const bool true
@@ -100462,7 +99943,7 @@ bb7(%16: ptr, %17: ptr, %18: ptr):
     %225 = gep i8, ptr %223, %224
     br bb8(%16, %17, %225)
 bb8(%19: ptr, %20: ptr, %21: ptr):
-    %226 = call @func.68(%19, %21, %41, %20)
+    %226 = call @func.62(%19, %21, %41, %20)
     br bb9(%226)
 bb9(%22: bool):
     br bb15(%22)
@@ -100538,18 +100019,12 @@ bb12(%29: ptr, %30: ptr, %31: ptr):
     %279 = gep i8, ptr %277, %278
     br bb13(%29, %30, %279)
 bb13(%32: ptr, %33: ptr, %34: ptr):
-    %280 = call @func.68(%32, %34, %45, %33)
+    %280 = call @func.62(%32, %34, %45, %33)
     br bb14(%280)
 bb14(%35: bool):
     br bb15(%35)
 bb15(%36: bool):
     ret %36
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3lenBG_(functy.152) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.153) {
 }
 
 fn @LocalContext__get(functy.154) {
@@ -100561,7 +100036,7 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     store ptr %1, ptr %10
     store u64 %2, ptr %11
     %14 = load ptr, ptr %10
-    %15 = call @func.152(%14)
+    %15 = call @func.24(%14)
     br bb1(%15)
 bb1(%3: u64):
     %16 = const u64 0
@@ -100583,20 +100058,20 @@ bb2(%4: u64):
 bb3:
     %28 = load u64, ptr %12
     %29 = load ptr, ptr %10
-    %30 = call @func.153(%29, %28)
+    %30 = call @func.49(%29, %28)
     store ptr %30, ptr %13
     br bb4(%28)
 bb4(%5: u64):
     %31 = load ptr, ptr %13
     %32 = const i64 200
     %33 = gep i8, ptr %31, %32
-    %34 = call @func.94(%33, %11)
+    %34 = call @func.78(%33, %11)
     br bb5(%5, %34)
 bb5(%6: u64, %7: bool):
     condbr %7, bb6(%6), bb1(%6)
 bb6(%8: u64):
     %35 = load ptr, ptr %10
-    %36 = call @func.153(%35, %8)
+    %36 = call @func.49(%35, %8)
     br bb7(%36)
 bb7(%9: ptr):
     store ptr %9, ptr %0
@@ -100609,9 +100084,6 @@ bb9:
     ret
 bb10:
     unreachable
-}
-
-fn @_RNvXs4_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtB7_5clone5Clone5cloneBM_(functy.155) {
 }
 
 fn @Verifier____env___unfold_const(functy.156) {
@@ -100675,7 +100147,7 @@ bb3(%11: ptr, %12: ptr, %13: u64, %14: u64, %15: u64):
     %70 = gep i8, ptr %67, %69
     store ptr %70, ptr %28
     %71 = load ptr, ptr %28
-    %72 = call @func.80(%71, %12)
+    %72 = call @func.69(%71, %12)
     br bb4(%11, %12, %13, %14, %72)
 bb4(%16: ptr, %17: ptr, %18: u64, %19: u64, %20: bool):
     condbr %20, bb5, bb6(%16, %17, %18, %19)
@@ -100683,7 +100155,7 @@ bb5:
     %73 = load ptr, ptr %28
     %74 = const i64 40
     %75 = gep i8, ptr %73, %74
-    call @func.155(%0, %75)
+    call @func.72(%0, %75)
     br bb9
 bb6(%21: ptr, %22: ptr, %23: u64, %24: u64):
     %76 = const u64 1
@@ -100745,10 +100217,10 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32, %4: ptr, %5: ptr):
     %62 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %63 = const bool false
     %64 = const bool true
-    call @func.47(%53, %1, %4, %5)
+    call @func.44(%53, %1, %4, %5)
     br bb1(%1, %2, %3, %5)
 bb1(%6: ptr, %7: ptr, %8: u32, %9: ptr):
-    call @func.195(%54, %53)
+    call @func.154(%54, %53)
     br bb2(%6, %7, %8, %9)
 bb2(%10: ptr, %11: ptr, %12: u32, %13: ptr):
     store ptr %54, ptr %55
@@ -100800,7 +100272,7 @@ bb3(%14: ptr, %15: ptr, %16: u32, %17: ptr):
     %108 = load ptr, ptr %55
     %109 = const i64 8
     %110 = gep i8, ptr %108, %109
-    call @func.196(%56, %14, %110)
+    call @func.155(%56, %14, %110)
     br bb4(%14, %15, %16, %17)
 bb4(%18: ptr, %19: ptr, %20: u32, %21: ptr):
     %111 = load i32, ptr %56
@@ -100810,7 +100282,7 @@ bb5(%22: ptr, %23: ptr, %24: u32, %25: ptr):
     %113 = const i64 4
     %114 = gep i8, ptr %56, %113
     %115 = load u32, ptr %114
-    call @func.202(%57, %53)
+    call @func.160(%57, %53)
     br bb6(%22, %23, %24, %25, %115)
 bb6(%26: ptr, %27: ptr, %28: u32, %29: ptr, %30: u32):
     %116 = zext u32 %30 to u64
@@ -100828,23 +100300,23 @@ bb6(%26: ptr, %27: ptr, %28: u32, %29: ptr, %30: u32):
     condbr %126, bb7(%26, %27, %28, %29), bb23
 bb7(%31: ptr, %32: ptr, %33: u32, %34: ptr):
     %127 = load u64, ptr %58
-    %128 = call @func.159(%57)
+    %128 = call @func.126(%57)
     br bb8(%31, %32, %33, %34, %127, %128)
 bb8(%35: ptr, %36: ptr, %37: u32, %38: ptr, %39: u64, %40: u64):
     %129 = icmp ult u64 %39, %40
     condbr %129, bb9(%35, %38, %39), bb12(%36, %37)
 bb9(%41: ptr, %42: ptr, %43: u64):
-    %130 = call @func.160(%57, %43)
+    %130 = call @func.127(%57, %43)
     br bb10(%41, %42, %130)
 bb10(%44: ptr, %45: ptr, %46: ptr):
-    call @func.47(%0, %44, %46, %45)
+    call @func.44(%0, %44, %46, %45)
     br bb11
 bb11:
     br bb18
 bb12(%47: ptr, %48: u32):
     br bb13(%47, %48)
 bb13(%49: ptr, %50: u32):
-    call @func.128(%60, %49)
+    call @func.102(%60, %49)
     br bb14(%50)
 bb14(%51: u32):
     %131 = const bool false
@@ -101032,9 +100504,6 @@ bb23:
     unreachable
 }
 
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.162) {
-}
-
 fn @_RNvMs9_NtCs2EYQwhfuABO_4core3numj12wrapping_mul(functy.163) {
 }
 
@@ -101052,7 +100521,7 @@ bb0(%0: ptr, %1: u64):
     %160 = gep i8, ptr %0, %159
     %161 = load u64, ptr %160
     %162 = const u64 14313749767032793493
-    %163 = call @func.162(%161, %162)
+    %163 = call @func.82(%161, %162)
     br bb1(%1, %161, %163)
 bb1(%2: u64, %3: u64, %4: u64):
     %164 = xor u64 %2, %4
@@ -101155,7 +100624,7 @@ bb12(%65: u64, %66: u64, %67: u64, %68: u64, %69: u64, %70: u64):
     br bb6(%65, %66, %67, %68, %69, %70, %234)
 bb13(%71: u64, %72: u64, %73: u64, %74: u64, %75: u64):
     %235 = const u64 14313749767032793493
-    %236 = call @func.162(%75, %235)
+    %236 = call @func.82(%75, %235)
     br bb14(%71, %72, %73, %74, %236)
 bb14(%76: u64, %77: u64, %78: u64, %79: u64, %80: u64):
     %237 = const u32 47
@@ -101169,12 +100638,12 @@ bb15(%81: u64, %82: u64, %83: u64, %84: u64, %85: u64, %86: u64, %87: u32):
     %243 = lshr u64 %86, %242
     %244 = xor u64 %85, %243
     %245 = const u64 14313749767032793493
-    %246 = call @func.162(%244, %245)
+    %246 = call @func.82(%244, %245)
     br bb16(%81, %82, %83, %84, %246)
 bb16(%88: u64, %89: u64, %90: u64, %91: u64, %92: u64):
     %247 = xor u64 %89, %92
     %248 = const u64 14313749767032793493
-    %249 = call @func.162(%247, %248)
+    %249 = call @func.82(%247, %248)
     br bb17(%88, %90, %91, %249)
 bb17(%93: u64, %94: u64, %95: u64, %96: u64):
     %250 = const u64 1
@@ -101236,7 +100705,7 @@ bb23(%113: u64, %114: u64, %115: u64, %116: u64, %117: u64):
 bb24(%118: u64, %119: u64, %120: u64, %121: u64, %122: u64):
     %290 = load u64, ptr %157
     %291 = const u64 8
-    %292 = call @func.163(%290, %291)
+    %292 = call @func.129(%290, %291)
     br bb25(%118, %119, %120, %121, %122, %292)
 bb25(%123: u64, %124: u64, %125: u64, %126: u64, %127: u64, %128: u64):
     %293 = const u64 63
@@ -101267,7 +100736,7 @@ bb28(%138: u64, %139: u64, %140: u64):
     condbr %310, bb29(%139), bb31(%139)
 bb29(%141: u64):
     %311 = const u64 14313749767032793493
-    %312 = call @func.162(%141, %311)
+    %312 = call @func.82(%141, %311)
     br bb30(%312)
 bb30(%142: u64):
     br bb31(%142)
@@ -101283,7 +100752,7 @@ bb32(%144: u64, %145: u64, %146: u32):
     %319 = lshr u64 %145, %318
     %320 = xor u64 %144, %319
     %321 = const u64 14313749767032793493
-    %322 = call @func.162(%320, %321)
+    %322 = call @func.82(%320, %321)
     br bb33(%322)
 bb33(%147: u64):
     %323 = const u32 47
@@ -101326,7 +100795,7 @@ bb0(%0: ptr, %1: ptr):
     %8 = load i32, ptr %7
     %9 = sext i32 %8 to i64
     store i64 %9, ptr %6
-    call @func.166(%6, %1)
+    call @func.132(%6, %1)
     br bb1(%1)
 bb1(%2: ptr):
     %10 = load ptr, ptr %5
@@ -101339,13 +100808,13 @@ bb3(%3: ptr):
     %13 = load ptr, ptr %5
     %14 = const i64 4
     %15 = gep i8, ptr %13, %14
-    call @func.167(%15, %3)
+    call @func.133(%15, %3)
     br bb5
 bb4(%4: ptr):
     %16 = load ptr, ptr %5
     %17 = const i64 8
     %18 = gep i8, ptr %16, %17
-    call @func.168(%18, %4)
+    call @func.134(%18, %4)
     br bb5
 bb5:
     ret
@@ -101357,9 +100826,6 @@ bb0(%0: ptr):
     ret %1
 }
 
-fn @_RINvXsa_NtNtCs2EYQwhfuABO_4core4hash5implsyNtB8_4Hash4hashNtCsep0XPuQfTSm_25clean_binding_defeq_slice10KaniHasherEBW_(functy.171) {
-}
-
 fn @_Name_as_std__hash__Hash___hash(functy.172) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
@@ -101367,7 +100833,7 @@ bb0(%0: ptr, %1: ptr):
     %3 = load ptr, ptr %2
     %4 = const i64 32
     %5 = gep i8, ptr %3, %4
-    call @func.171(%5, %1)
+    call @func.134(%5, %1)
     br bb1
 bb1:
     ret
@@ -101388,10 +100854,10 @@ bb0(%0: ptr, %1: ptr):
     %14 = alloca i64, align 8
     store ptr %0, ptr %13
     %15 = load ptr, ptr %13
-    call @func.173(%14, %15)
+    call @func.138(%14, %15)
     br bb1(%1)
 bb1(%2: ptr):
-    call @func.174(%14, %2)
+    call @func.139(%14, %2)
     br bb2(%2)
 bb2(%3: ptr):
     %16 = load ptr, ptr %13
@@ -101418,7 +100884,7 @@ bb3:
     unreachable
 bb4(%4: ptr):
     %35 = load ptr, ptr %13
-    call @func.172(%35, %4)
+    call @func.137(%35, %4)
     br bb10
 bb5(%5: ptr):
     %36 = load ptr, ptr %13
@@ -101440,19 +100906,16 @@ bb7(%7: ptr):
     %48 = load ptr, ptr %13
     %49 = const i64 8
     %50 = gep i8, ptr %48, %49
-    call @func.175(%50, %7)
+    call @func.140(%50, %7)
     br bb10
 bb8(%8: ptr, %9: ptr, %10: ptr):
-    call @func.175(%9, %8)
+    call @func.140(%9, %8)
     br bb9(%8, %10)
 bb9(%11: ptr, %12: ptr):
-    call @func.175(%12, %11)
+    call @func.140(%12, %11)
     br bb10
 bb10:
     ret
-}
-
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.177) {
 }
 
 fn @_KaniHasher_as_std__hash__Hasher___write_u64(functy.178) {
@@ -101462,7 +100925,7 @@ bb0(%0: ptr, %1: u64):
     store u64 %5, ptr %0
     %6 = load u64, ptr %0
     %7 = const u64 5871781006564002453
-    %8 = call @func.177(%6, %7)
+    %8 = call @func.82(%6, %7)
     br bb1(%0, %8)
 bb1(%2: ptr, %3: u64):
     store u64 %3, ptr %2
@@ -101494,7 +100957,7 @@ bb2:
     %13 = load ptr, ptr %4
     %14 = const i64 8
     %15 = gep i8, ptr %13, %14
-    call @func.179(%7, %12)
+    call @func.143(%7, %12)
     br bb7(%15)
 bb3:
     %16 = load ptr, ptr %4
@@ -101503,14 +100966,14 @@ bb3:
     %19 = load ptr, ptr %4
     %20 = const i64 16
     %21 = gep i8, ptr %19, %20
-    call @func.179(%5, %18)
+    call @func.143(%5, %18)
     br bb5(%21)
 bb4:
     %22 = const i64 0
     store i64 %22, ptr %0
     br bb8
 bb5(%2: ptr):
-    call @func.180(%6, %2)
+    call @func.144(%6, %2)
     br bb6
 bb6:
     %23 = load ptr, ptr %5
@@ -101546,12 +101009,6 @@ bb8:
     ret
 }
 
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_sub(functy.182) {
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.183) {
-}
-
 fn @Expr__instantiate_at(functy.184) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32):
     %107 = alloca i64, align 8
@@ -101579,7 +101036,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: u32):
     %128 = const bool false
     %129 = const bool false
     %130 = load ptr, ptr %107
-    %131 = call @func.203(%130)
+    %131 = call @func.161(%130)
     br bb1(%2, %3, %131)
 bb1(%4: ptr, %5: u32, %6: u32):
     %132 = icmp uge u32 %5, %6
@@ -101650,7 +101107,7 @@ bb5(%9: ptr, %10: u32):
     %186 = const i64 48
     %187 = gep i8, ptr %185, %186
     %188 = const bool true
-    call @func.128(%121, %181)
+    call @func.102(%121, %181)
     br bb42(%9, %10, %184, %187)
 bb6(%11: ptr, %12: u32):
     %189 = load ptr, ptr %108
@@ -101667,7 +101124,7 @@ bb6(%11: ptr, %12: u32):
     %200 = const i64 64
     %201 = gep i8, ptr %199, %200
     %202 = const bool true
-    call @func.128(%117, %189)
+    call @func.102(%117, %189)
     br bb33(%11, %12, %192, %195, %198, %201)
 bb7(%13: ptr, %14: u32):
     %203 = load ptr, ptr %108
@@ -101733,7 +101190,7 @@ bb10(%19: ptr, %20: u32):
     condbr %252, bb11(%19, %20), bb12(%20, %250)
 bb11(%21: ptr, %22: u32):
     %253 = const u32 0
-    call @func.205(%0, %21, %253, %22)
+    call @func.162(%0, %21, %253, %22)
     br bb46
 bb12(%23: u32, %24: ptr):
     %254 = load u32, ptr %24
@@ -101742,7 +101199,7 @@ bb12(%23: u32, %24: ptr):
 bb13(%25: ptr):
     %256 = load u32, ptr %25
     %257 = const u32 1
-    %258 = call @func.182(%256, %257)
+    %258 = call @func.88(%256, %257)
     br bb14(%258)
 bb14(%26: u32):
     call @func.22(%0, %26)
@@ -101753,7 +101210,7 @@ bb15:
     br bb46
 bb16(%27: ptr, %28: u32, %29: ptr, %30: ptr):
     %260 = const bool true
-    call @func.184(%109, %30, %27, %28)
+    call @func.146(%109, %30, %27, %28)
     br bb17(%27, %28, %29)
 bb17(%31: ptr, %32: u32, %33: ptr):
     %261 = load ptr, ptr %33
@@ -101761,7 +101218,7 @@ bb17(%31: ptr, %32: u32, %33: ptr):
     %263 = gep i8, ptr %261, %262
     br bb18(%31, %32, %263)
 bb18(%34: ptr, %35: u32, %36: ptr):
-    call @func.184(%110, %36, %34, %35)
+    call @func.146(%110, %36, %34, %35)
     br bb19
 bb19:
     %264 = const bool false
@@ -101772,7 +101229,7 @@ bb20:
     br bb46
 bb21(%37: ptr, %38: u32, %39: ptr, %40: ptr):
     %266 = const bool true
-    call @func.184(%112, %40, %37, %38)
+    call @func.146(%112, %40, %37, %38)
     br bb22(%37, %38, %39)
 bb22(%41: ptr, %42: u32, %43: ptr):
     %267 = load ptr, ptr %43
@@ -101781,21 +101238,21 @@ bb22(%41: ptr, %42: u32, %43: ptr):
     br bb23(%41, %42, %269)
 bb23(%44: ptr, %45: u32, %46: ptr):
     %270 = const u32 1
-    %271 = call @func.183(%45, %270)
+    %271 = call @func.54(%45, %270)
     br bb24(%44, %46, %271)
 bb24(%47: ptr, %48: ptr, %49: u32):
-    call @func.184(%113, %48, %47, %49)
+    call @func.146(%113, %48, %47, %49)
     br bb25
 bb25:
     %272 = const bool false
-    call @func.33(%0, %111, %112, %113)
+    call @func.31(%0, %111, %112, %113)
     br bb26
 bb26:
     %273 = const bool false
     br bb46
 bb27(%50: ptr, %51: u32, %52: ptr, %53: ptr):
     %274 = const bool true
-    call @func.184(%115, %53, %50, %51)
+    call @func.146(%115, %53, %50, %51)
     br bb28(%50, %51, %52)
 bb28(%54: ptr, %55: u32, %56: ptr):
     %275 = load ptr, ptr %56
@@ -101804,10 +101261,10 @@ bb28(%54: ptr, %55: u32, %56: ptr):
     br bb29(%54, %55, %277)
 bb29(%57: ptr, %58: u32, %59: ptr):
     %278 = const u32 1
-    %279 = call @func.183(%58, %278)
+    %279 = call @func.54(%58, %278)
     br bb30(%57, %59, %279)
 bb30(%60: ptr, %61: ptr, %62: u32):
-    call @func.184(%116, %61, %60, %62)
+    call @func.146(%116, %61, %60, %62)
     br bb31
 bb31:
     %280 = const bool false
@@ -101822,7 +101279,7 @@ bb33(%63: ptr, %64: u32, %65: ptr, %66: ptr, %67: ptr, %68: ptr):
     %284 = gep i8, ptr %282, %283
     br bb34(%63, %64, %66, %67, %68, %284)
 bb34(%69: ptr, %70: u32, %71: ptr, %72: ptr, %73: ptr, %74: ptr):
-    call @func.184(%118, %74, %69, %70)
+    call @func.146(%118, %74, %69, %70)
     br bb35(%69, %70, %71, %72, %73)
 bb35(%75: ptr, %76: u32, %77: ptr, %78: ptr, %79: ptr):
     %285 = const bool true
@@ -101831,7 +101288,7 @@ bb35(%75: ptr, %76: u32, %77: ptr, %78: ptr, %79: ptr):
     %288 = gep i8, ptr %286, %287
     br bb36(%75, %76, %78, %79, %288)
 bb36(%80: ptr, %81: u32, %82: ptr, %83: ptr, %84: ptr):
-    call @func.184(%119, %84, %80, %81)
+    call @func.146(%119, %84, %80, %81)
     br bb37(%80, %81, %82, %83)
 bb37(%85: ptr, %86: u32, %87: ptr, %88: ptr):
     %289 = const bool true
@@ -101841,17 +101298,17 @@ bb37(%85: ptr, %86: u32, %87: ptr, %88: ptr):
     br bb38(%85, %86, %88, %292)
 bb38(%89: ptr, %90: u32, %91: ptr, %92: ptr):
     %293 = const u32 1
-    %294 = call @func.183(%90, %293)
+    %294 = call @func.54(%90, %293)
     br bb39(%89, %91, %92, %294)
 bb39(%93: ptr, %94: ptr, %95: ptr, %96: u32):
-    call @func.184(%120, %95, %93, %96)
+    call @func.146(%120, %95, %93, %96)
     br bb40(%94)
 bb40(%97: ptr):
     %295 = load bool, ptr %97
     %296 = const bool false
     %297 = const bool false
     %298 = const bool false
-    call @func.44(%0, %117, %118, %119, %120, %295)
+    call @func.42(%0, %117, %118, %119, %120, %295)
     br bb41
 bb41:
     %299 = const bool false
@@ -101865,11 +101322,11 @@ bb42(%98: ptr, %99: u32, %100: ptr, %101: ptr):
     %305 = gep i8, ptr %303, %304
     br bb43(%98, %99, %302, %305)
 bb43(%102: ptr, %103: u32, %104: u32, %105: ptr):
-    call @func.184(%122, %105, %102, %103)
+    call @func.146(%122, %105, %102, %103)
     br bb44(%104)
 bb44(%106: u32):
     %306 = const bool false
-    call @func.206(%0, %121, %106, %122)
+    call @func.163(%0, %121, %106, %122)
     br bb45
 bb45:
     %307 = const bool false
@@ -101887,7 +101344,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %12 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     store ptr %3, ptr %8
     %13 = load ptr, ptr %8
-    call @func.207(%9, %1, %2, %13)
+    call @func.164(%9, %1, %2, %13)
     br bb1(%1, %2)
 bb1(%4: ptr, %5: ptr):
     %14 = load i64, ptr %9
@@ -101901,7 +101358,7 @@ bb2:
     unreachable
 bb3(%6: ptr, %7: ptr):
     %20 = load ptr, ptr %8
-    call @func.212(%11, %6, %7, %20)
+    call @func.167(%11, %6, %7, %20)
     br bb5
 bb4:
     %21 = load i64, ptr %9
@@ -102157,9 +101614,6 @@ bb10:
     ret
 }
 
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.186) {
-}
-
 fn @Verifier____env___type_is_quickly_not_in_prop(functy.187) {
 bb0(%0: ptr, %1: ptr):
     %13 = alloca i64, align 8
@@ -102223,7 +101677,7 @@ bb2:
     %65 = load ptr, ptr %14
     %66 = const i64 48
     %67 = gep i8, ptr %65, %66
-    %68 = call @func.186(%67)
+    %68 = call @func.55(%67)
     br bb4(%64, %68)
 bb3:
     %69 = const bool true
@@ -102233,10 +101687,10 @@ bb4(%2: ptr, %3: u64):
     %71 = icmp eq u64 %3, %70
     condbr %71, bb5(%2), bb14
 bb5(%4: ptr):
-    call @func.213(%15)
+    call @func.168(%15)
     br bb6(%4)
 bb6(%5: ptr):
-    %72 = call @func.80(%5, %15)
+    %72 = call @func.69(%5, %15)
     br bb7(%5, %72)
 bb7(%6: ptr, %7: bool):
     condbr %7, bb8, bb10(%6)
@@ -102248,10 +101702,10 @@ bb9:
 bb10(%8: ptr):
     br bb11(%8)
 bb11(%9: ptr):
-    call @func.214(%16)
+    call @func.169(%16)
     br bb12(%9)
 bb12(%10: ptr):
-    %74 = call @func.80(%10, %16)
+    %74 = call @func.69(%10, %16)
     br bb13(%74)
 bb13(%11: bool):
     br bb15(%11)
@@ -102273,7 +101727,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %19 = alloca i64, align 8
     store ptr %3, ptr %13
     %20 = load ptr, ptr %13
-    call @func.47(%14, %1, %2, %20)
+    call @func.44(%14, %1, %2, %20)
     br bb1(%1)
 bb1(%4: ptr):
     %21 = load i64, ptr %14
@@ -102333,7 +101787,7 @@ bb5:
     br bb18
 bb6(%9: ptr):
     %66 = load ptr, ptr %13
-    call @func.185(%16, %9, %14, %66)
+    call @func.147(%16, %9, %14, %66)
     br bb7(%9)
 bb7(%10: ptr):
     %67 = load i64, ptr %16
@@ -102463,7 +101917,7 @@ bb10(%11: ptr):
     %165 = load i64, ptr %162
     store i64 %165, ptr %164
     %166 = load ptr, ptr %13
-    call @func.47(%18, %11, %15, %166)
+    call @func.44(%18, %11, %15, %166)
     br bb11
 bb11:
     store ptr %18, ptr %19
@@ -102519,7 +101973,7 @@ bb13:
     %211 = load ptr, ptr %19
     %212 = const i64 8
     %213 = gep i8, ptr %211, %212
-    %214 = call @func.215(%213)
+    %214 = call @func.170(%213)
     br bb14(%214)
 bb14(%12: bool):
     store bool %12, ptr %0
@@ -102536,9 +101990,6 @@ bb19:
     ret
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.189) {
-}
-
 fn @Level__is_def_eq(functy.190) {
 bb0(%0: ptr, %1: ptr):
     %7 = alloca i64, align 8
@@ -102547,7 +101998,7 @@ bb0(%0: ptr, %1: ptr):
     %10 = alloca (i64, i64, i64, i64, i64), align 8
     store ptr %0, ptr %7
     store ptr %1, ptr %8
-    %11 = call @func.189(%7, %8)
+    %11 = call @func.36(%7, %8)
     br bb1(%11)
 bb1(%2: bool):
     condbr %2, bb2, bb3
@@ -102556,14 +102007,14 @@ bb2:
     br bb8(%12)
 bb3:
     %13 = load ptr, ptr %7
-    call @func.216(%9, %13)
+    call @func.171(%9, %13)
     br bb4
 bb4:
     %14 = load ptr, ptr %8
-    call @func.216(%10, %14)
+    call @func.171(%10, %14)
     br bb5(%9)
 bb5(%3: ptr):
-    %15 = call @func.149(%3, %10)
+    %15 = call @func.119(%3, %10)
     br bb6(%15)
 bb6(%4: bool):
     br bb7(%4)
@@ -102575,7 +102026,7 @@ bb8(%6: bool):
 
 fn @Expr__lift_from(functy.191) {
 bb0(%0: ptr, %1: ptr, %2: u32, %3: u32):
-    call @func.205(%0, %1, %2, %3)
+    call @func.162(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
@@ -102590,7 +102041,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %12 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     store ptr %3, ptr %8
     %13 = load ptr, ptr %8
-    call @func.217(%9, %1, %2, %13)
+    call @func.172(%9, %1, %2, %13)
     br bb1(%1, %2)
 bb1(%4: ptr, %5: ptr):
     %14 = load i64, ptr %9
@@ -102604,7 +102055,7 @@ bb2:
     unreachable
 bb3(%6: ptr, %7: ptr):
     %20 = load ptr, ptr %8
-    call @func.222(%11, %6, %7, %20)
+    call @func.173(%11, %6, %7, %20)
     br bb5
 bb4:
     %21 = load i64, ptr %9
@@ -102871,7 +102322,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
     %19 = alloca i64, align 8
     store ptr %3, ptr %13
     %20 = load ptr, ptr %13
-    call @func.47(%14, %1, %2, %20)
+    call @func.44(%14, %1, %2, %20)
     br bb1(%1)
 bb1(%4: ptr):
     %21 = load i64, ptr %14
@@ -102931,7 +102382,7 @@ bb5:
     br bb18
 bb6(%9: ptr):
     %66 = load ptr, ptr %13
-    call @func.192(%16, %9, %14, %66)
+    call @func.152(%16, %9, %14, %66)
     br bb7(%9)
 bb7(%10: ptr):
     %67 = load i64, ptr %16
@@ -103061,7 +102512,7 @@ bb10(%11: ptr):
     %165 = load i64, ptr %162
     store i64 %165, ptr %164
     %166 = load ptr, ptr %13
-    call @func.47(%18, %11, %15, %166)
+    call @func.44(%18, %11, %15, %166)
     br bb11
 bb11:
     store ptr %18, ptr %19
@@ -103117,7 +102568,7 @@ bb13:
     %211 = load ptr, ptr %19
     %212 = const i64 8
     %213 = gep i8, ptr %211, %212
-    %214 = call @func.215(%213)
+    %214 = call @func.170(%213)
     br bb14(%214)
 bb14(%12: bool):
     store bool %12, ptr %0
@@ -103132,9 +102583,6 @@ bb18:
     br bb19
 bb19:
     ret
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.194) {
 }
 
 fn @Expr__get_app_fn(functy.195) {
@@ -103252,7 +102700,7 @@ bb3:
     %95 = load ptr, ptr %5
     %96 = const i64 8
     %97 = gep i8, ptr %95, %96
-    %98 = call @func.194(%97)
+    %98 = call @func.27(%97)
     br bb4(%98)
 bb4(%2: ptr):
     call @func.20(%4, %2)
@@ -103386,7 +102834,7 @@ bb3(%11: ptr, %12: ptr, %13: u64, %14: u64, %15: u64):
     %76 = gep i8, ptr %73, %75
     store ptr %76, ptr %28
     %77 = load ptr, ptr %28
-    %78 = call @func.80(%77, %12)
+    %78 = call @func.69(%77, %12)
     br bb4(%11, %12, %13, %14, %78)
 bb4(%16: ptr, %17: ptr, %18: u64, %19: u64, %20: bool):
     condbr %20, bb5, bb6(%16, %17, %18, %19)
@@ -103430,9 +102878,6 @@ bb10:
 fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprE3newBE_(functy.197) {
 }
 
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.198) {
-}
-
 fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprE4pushBH_(functy.199) {
 }
 
@@ -103452,7 +102897,7 @@ bb0(%0: ptr, %1: ptr):
     %15 = alloca (i64, i64), align 8
     %16 = const bool false
     %17 = const bool true
-    call @func.197(%10)
+    call @func.156(%10)
     br bb1(%1)
 bb1(%2: ptr):
     call @func.20(%11, %2)
@@ -103510,16 +102955,16 @@ bb3:
     %64 = load ptr, ptr %12
     %65 = const i64 16
     %66 = gep i8, ptr %64, %65
-    %67 = call @func.198(%66)
+    %67 = call @func.27(%66)
     br bb4(%63, %10, %67)
 bb4(%3: ptr, %4: ptr, %5: ptr):
     call @func.20(%13, %5)
     br bb5(%3, %4)
 bb5(%6: ptr, %7: ptr):
-    call @func.199(%7, %13)
+    call @func.157(%7, %13)
     br bb6(%6)
 bb6(%8: ptr):
-    %68 = call @func.198(%8)
+    %68 = call @func.27(%8)
     br bb7(%68)
 bb7(%9: ptr):
     call @func.20(%14, %9)
@@ -103585,10 +103030,10 @@ bb9:
     store i64 %114, ptr %113
     br bb2
 bb10:
-    call @func.200(%15, %10)
+    call @func.158(%15, %10)
     br bb11
 bb11:
-    call @func.201(%15)
+    call @func.159(%15)
     br bb12
 bb12:
     %115 = const bool false
@@ -103622,13 +103067,10 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.121(%6)
+    %7 = call @func.96(%6)
     br bb1(%7)
 bb1(%1: u32):
     ret %1
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.204) {
 }
 
 fn @Expr__lift_at(functy.205) {
@@ -103656,7 +103098,7 @@ bb1:
     br bb31
 bb2(%4: u32, %5: u32):
     %74 = load ptr, ptr %58
-    %75 = call @func.203(%74)
+    %75 = call @func.161(%74)
     br bb3(%4, %5, %75)
 bb3(%6: u32, %7: u32, %8: u32):
     %76 = icmp uge u32 %6, %8
@@ -103780,7 +103222,7 @@ bb10(%17: u32, %18: u32):
     condbr %172, bb11(%18, %170), bb13
 bb11(%19: u32, %20: ptr):
     %173 = load u32, ptr %20
-    %174 = call @func.204(%173, %19)
+    %174 = call @func.54(%173, %19)
     br bb12(%174)
 bb12(%21: u32):
     call @func.22(%0, %21)
@@ -103791,7 +103233,7 @@ bb13:
     br bb31
 bb14(%22: u32, %23: u32, %24: ptr, %25: ptr):
     %176 = const bool true
-    call @func.205(%60, %25, %22, %23)
+    call @func.162(%60, %25, %22, %23)
     br bb15(%22, %23, %24)
 bb15(%26: u32, %27: u32, %28: ptr):
     %177 = load ptr, ptr %28
@@ -103799,7 +103241,7 @@ bb15(%26: u32, %27: u32, %28: ptr):
     %179 = gep i8, ptr %177, %178
     br bb16(%26, %27, %179)
 bb16(%29: u32, %30: u32, %31: ptr):
-    call @func.205(%61, %31, %29, %30)
+    call @func.162(%61, %31, %29, %30)
     br bb17
 bb17:
     %180 = const bool false
@@ -103810,7 +103252,7 @@ bb18:
     br bb31
 bb19(%32: u32, %33: u32, %34: ptr, %35: ptr):
     %182 = const bool true
-    call @func.205(%63, %35, %32, %33)
+    call @func.162(%63, %35, %32, %33)
     br bb20(%32, %33, %34)
 bb20(%36: u32, %37: u32, %38: ptr):
     %183 = load ptr, ptr %38
@@ -103819,21 +103261,21 @@ bb20(%36: u32, %37: u32, %38: ptr):
     br bb21(%36, %37, %185)
 bb21(%39: u32, %40: u32, %41: ptr):
     %186 = const u32 1
-    %187 = call @func.204(%39, %186)
+    %187 = call @func.54(%39, %186)
     br bb22(%40, %41, %187)
 bb22(%42: u32, %43: ptr, %44: u32):
-    call @func.205(%64, %43, %44, %42)
+    call @func.162(%64, %43, %44, %42)
     br bb23
 bb23:
     %188 = const bool false
-    call @func.33(%0, %62, %63, %64)
+    call @func.31(%0, %62, %63, %64)
     br bb24
 bb24:
     %189 = const bool false
     br bb31
 bb25(%45: u32, %46: u32, %47: ptr, %48: ptr):
     %190 = const bool true
-    call @func.205(%66, %48, %45, %46)
+    call @func.162(%66, %48, %45, %46)
     br bb26(%45, %46, %47)
 bb26(%49: u32, %50: u32, %51: ptr):
     %191 = load ptr, ptr %51
@@ -103842,10 +103284,10 @@ bb26(%49: u32, %50: u32, %51: ptr):
     br bb27(%49, %50, %193)
 bb27(%52: u32, %53: u32, %54: ptr):
     %194 = const u32 1
-    %195 = call @func.204(%52, %194)
+    %195 = call @func.54(%52, %194)
     br bb28(%53, %54, %195)
 bb28(%55: u32, %56: ptr, %57: u32):
-    call @func.205(%67, %56, %57, %55)
+    call @func.162(%67, %56, %57, %55)
     br bb29
 bb29:
     %196 = const bool false
@@ -104003,7 +103445,7 @@ bb2:
 
 fn @Verifier____env___try_infer_type_quick_blind(functy.207) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    call @func.224(%0, %1, %2, %3)
+    call @func.174(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
@@ -104013,12 +103455,6 @@ fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_bin
 }
 
 fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.209) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.210) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.211) {
 }
 
 fn @Verifier____env___infer_type_infer_only_core_blind(functy.212) {
@@ -104240,7 +103676,7 @@ bb4(%5: ptr):
     %373 = const i64 64
     %374 = gep i8, ptr %372, %373
     %375 = const bool true
-    call @func.128(%255, %362)
+    call @func.102(%255, %362)
     br bb90(%5, %365, %368, %371)
 bb5(%6: ptr):
     %376 = load ptr, ptr %179
@@ -104267,7 +103703,7 @@ bb6(%7: ptr):
     %395 = const i64 16
     %396 = gep i8, ptr %394, %395
     %397 = const bool true
-    call @func.50(%206)
+    call @func.47(%206)
     br bb40(%7, %390, %393, %396)
 bb7(%8: ptr):
     %398 = load ptr, ptr %179
@@ -104287,13 +103723,13 @@ bb8(%9: ptr):
     %410 = load ptr, ptr %179
     %411 = const i64 48
     %412 = gep i8, ptr %410, %411
-    call @func.225(%190, %9, %409)
+    call @func.175(%190, %9, %409)
     br bb20(%409)
 bb9:
     %413 = load ptr, ptr %179
     %414 = const i64 8
     %415 = gep i8, ptr %413, %414
-    call @func.132(%189, %415)
+    call @func.106(%189, %415)
     br bb17
 bb10:
     %416 = load ptr, ptr %179
@@ -104303,7 +103739,7 @@ bb10:
     %420 = load i64, ptr %418
     store i64 %420, ptr %182
     %421 = load u64, ptr %182
-    call @func.154(%181, %419, %421)
+    call @func.122(%181, %419, %421)
     br bb12(%418)
 bb11:
     %422 = load ptr, ptr %179
@@ -104463,7 +103899,7 @@ bb16:
     store i64 %537, ptr %536
     br bb118
 bb17:
-    call @func.226(%188, %189)
+    call @func.176(%188, %189)
     br bb18
 bb18:
     call @func.10(%187, %188)
@@ -104535,7 +103971,7 @@ bb20(%12: ptr):
     %589 = select i64 %586, %587, %588
     switch %589 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.128(%193, %13)
+    call @func.102(%193, %13)
     br bb23
 bb22:
     %590 = load i64, ptr %190
@@ -104711,10 +104147,10 @@ bb23:
     br bb118
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %727 = load ptr, ptr %178
-    call @func.212(%196, %14, %16, %727)
+    call @func.167(%196, %14, %16, %727)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.208(%195, %196)
+    call @func.165(%195, %196)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %728 = load i64, ptr %195
@@ -104839,7 +104275,7 @@ bb27(%21: ptr, %22: ptr):
     %826 = load i64, ptr %823
     store i64 %826, ptr %825
     %827 = load ptr, ptr %178
-    call @func.47(%199, %21, %194, %827)
+    call @func.44(%199, %21, %194, %827)
     br bb30(%22, %780)
 bb28:
     %828 = const i64 8
@@ -104870,7 +104306,7 @@ bb28:
     %849 = gep i8, ptr %197, %848
     %850 = load i64, ptr %847
     store i64 %850, ptr %849
-    call @func.209(%0, %197)
+    call @func.166(%0, %197)
     br bb29
 bb29:
     %851 = const bool false
@@ -105064,7 +104500,7 @@ bb33(%27: ptr, %28: ptr, %29: bool):
     %1007 = gep i8, ptr %1005, %1006
     br bb34(%28, %1007, %29)
 bb34(%30: ptr, %31: ptr, %32: bool):
-    call @func.135(%201, %30, %31)
+    call @func.109(%201, %30, %31)
     br bb35(%32)
 bb35(%33: bool):
     %1008 = load i64, ptr %201
@@ -105170,7 +104606,7 @@ bb39:
     %1082 = const bool false
     br bb118
 bb40(%37: ptr, %38: ptr, %39: ptr, %40: ptr):
-    %1083 = call @func.210(%39)
+    %1083 = call @func.27(%39)
     br bb41(%37, %38, %39, %40, %1083)
 bb41(%41: ptr, %42: ptr, %43: ptr, %44: ptr, %45: ptr):
     call @func.20(%207, %45)
@@ -105196,16 +104632,16 @@ bb43(%50: ptr, %51: ptr, %52: ptr, %53: ptr):
     br bb44(%50, %51, %52, %1095)
 bb44(%54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1096 = load u64, ptr %205
-    call @func.73(%209, %54, %57, %1096)
+    call @func.66(%209, %54, %57, %1096)
     br bb45(%54, %55, %56)
 bb45(%58: ptr, %59: ptr, %60: ptr):
     %1097 = load ptr, ptr %178
-    call @func.212(%210, %58, %209, %1097)
+    call @func.167(%210, %58, %209, %1097)
     br bb46(%59, %60)
 bb46(%61: ptr, %62: ptr):
     %1098 = const bool true
     %1099 = load ptr, ptr %178
-    call @func.228(%1099)
+    call @func.177(%1099)
     br bb47(%61, %62)
 bb47(%63: ptr, %64: ptr):
     %1100 = const bool false
@@ -105265,7 +104701,7 @@ bb47(%63: ptr, %64: ptr):
     %1145 = gep i8, ptr %213, %1144
     %1146 = load i64, ptr %1143
     store i64 %1146, ptr %1145
-    call @func.208(%212, %213)
+    call @func.165(%212, %213)
     br bb48(%63, %64)
 bb48(%65: ptr, %66: ptr):
     %1147 = load i64, ptr %212
@@ -105389,7 +104825,7 @@ bb49(%67: ptr, %68: ptr):
     %1244 = load i64, ptr %1241
     store i64 %1244, ptr %1243
     %1245 = load u64, ptr %205
-    call @func.229(%216, %211, %1245)
+    call @func.178(%216, %211, %1245)
     br bb52(%67, %68)
 bb50:
     %1246 = const i64 8
@@ -105420,7 +104856,7 @@ bb50:
     %1267 = gep i8, ptr %214, %1266
     %1268 = load i64, ptr %1265
     store i64 %1268, ptr %1267
-    call @func.209(%0, %214)
+    call @func.166(%0, %214)
     br bb51
 bb51:
     %1269 = const bool false
@@ -105435,7 +104871,7 @@ bb52(%69: ptr, %70: ptr):
     %1275 = gep i8, ptr %219, %1274
     %1276 = load i8, ptr %1273
     store i8 %1276, ptr %1275
-    call @func.211(%220, %70)
+    call @func.26(%220, %70)
     br bb53
 bb53:
     %1277 = const bool false
@@ -105650,10 +105086,10 @@ bb56:
     br bb118
 bb57(%71: ptr, %72: ptr, %73: ptr, %74: ptr, %75: ptr):
     %1441 = load ptr, ptr %178
-    call @func.212(%225, %71, %75, %1441)
+    call @func.167(%225, %71, %75, %1441)
     br bb58(%71, %72, %73, %74)
 bb58(%76: ptr, %77: ptr, %78: ptr, %79: ptr):
-    call @func.208(%224, %225)
+    call @func.165(%224, %225)
     br bb59(%76, %77, %78, %79)
 bb59(%80: ptr, %81: ptr, %82: ptr, %83: ptr):
     %1442 = load i64, ptr %224
@@ -105778,7 +105214,7 @@ bb60(%84: ptr, %85: ptr, %86: ptr, %87: ptr):
     %1540 = load i64, ptr %1537
     store i64 %1540, ptr %1539
     %1541 = load ptr, ptr %178
-    call @func.47(%228, %84, %223, %1541)
+    call @func.44(%228, %84, %223, %1541)
     br bb62(%84, %85, %86, %87, %1494)
 bb61:
     %1542 = const i64 8
@@ -105809,7 +105245,7 @@ bb61:
     %1563 = gep i8, ptr %226, %1562
     %1564 = load i64, ptr %1561
     store i64 %1564, ptr %1563
-    call @func.209(%0, %226)
+    call @func.166(%0, %226)
     br bb117
 bb62(%88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: bool):
     store ptr %228, ptr %230
@@ -105987,11 +105423,11 @@ bb64(%93: ptr, %94: ptr, %95: ptr, %96: ptr, %97: bool):
     %1709 = load ptr, ptr %230
     %1710 = const i64 8
     %1711 = gep i8, ptr %1709, %1710
-    call @func.132(%229, %1711)
+    call @func.106(%229, %1711)
     br bb65(%93, %94, %95, %96, %97)
 bb65(%98: ptr, %99: ptr, %100: ptr, %101: ptr, %102: bool):
     %1712 = const bool true
-    call @func.50(%235)
+    call @func.47(%235)
     br bb67(%98, %99, %100, %101, %102)
 bb66(%103: bool):
     %1713 = load ptr, ptr %232
@@ -106033,7 +105469,7 @@ bb66(%103: bool):
     br bb115(%103)
 bb67(%104: ptr, %105: ptr, %106: ptr, %107: ptr, %108: bool):
     %1741 = const bool true
-    %1742 = call @func.210(%106)
+    %1742 = call @func.27(%106)
     br bb68(%104, %105, %107, %1742, %108)
 bb68(%109: ptr, %110: ptr, %111: ptr, %112: ptr, %113: bool):
     call @func.20(%236, %112)
@@ -106059,16 +105495,16 @@ bb70(%118: ptr, %119: ptr, %120: bool):
     br bb71(%118, %1754, %120)
 bb71(%121: ptr, %122: ptr, %123: bool):
     %1755 = load u64, ptr %234
-    call @func.73(%238, %121, %122, %1755)
+    call @func.66(%238, %121, %122, %1755)
     br bb72(%121, %123)
 bb72(%124: ptr, %125: bool):
     %1756 = load ptr, ptr %178
-    call @func.212(%239, %124, %238, %1756)
+    call @func.167(%239, %124, %238, %1756)
     br bb73(%124, %125)
 bb73(%126: ptr, %127: bool):
     %1757 = const bool true
     %1758 = load ptr, ptr %178
-    call @func.228(%1758)
+    call @func.177(%1758)
     br bb74(%126, %127)
 bb74(%128: ptr, %129: bool):
     %1759 = const bool false
@@ -106128,7 +105564,7 @@ bb74(%128: ptr, %129: bool):
     %1804 = gep i8, ptr %242, %1803
     %1805 = load i64, ptr %1802
     store i64 %1805, ptr %1804
-    call @func.208(%241, %242)
+    call @func.165(%241, %242)
     br bb75(%128, %129)
 bb75(%130: ptr, %131: bool):
     %1806 = load i64, ptr %241
@@ -106253,7 +105689,7 @@ bb76(%132: ptr, %133: bool):
     %1904 = load i64, ptr %1901
     store i64 %1904, ptr %1903
     %1905 = load ptr, ptr %178
-    call @func.47(%245, %132, %240, %1905)
+    call @func.44(%245, %132, %240, %1905)
     br bb78(%133)
 bb77(%134: bool):
     %1906 = const i64 8
@@ -106284,7 +105720,7 @@ bb77(%134: bool):
     %1927 = gep i8, ptr %243, %1926
     %1928 = load i64, ptr %1925
     store i64 %1928, ptr %1927
-    call @func.209(%0, %243)
+    call @func.166(%0, %243)
     br bb121(%134)
 bb78(%135: bool):
     store ptr %245, ptr %247
@@ -106462,7 +105898,7 @@ bb80:
     %2073 = load ptr, ptr %247
     %2074 = const i64 8
     %2075 = gep i8, ptr %2073, %2074
-    call @func.132(%246, %2075)
+    call @func.106(%246, %2075)
     br bb81
 bb81:
     %2076 = const bool false
@@ -106492,7 +105928,7 @@ bb81:
     %2096 = gep i8, ptr %253, %2095
     %2097 = load i64, ptr %2094
     store i64 %2097, ptr %2096
-    call @func.230(%252, %253, %246)
+    call @func.179(%252, %253, %246)
     br bb83
 bb82(%137: bool):
     %2098 = load ptr, ptr %249
@@ -106608,14 +106044,14 @@ bb89:
     %2175 = const bool false
     br bb118
 bb90(%138: ptr, %139: ptr, %140: ptr, %141: ptr):
-    %2176 = call @func.210(%139)
+    %2176 = call @func.27(%139)
     br bb91(%138, %140, %141, %2176)
 bb91(%142: ptr, %143: ptr, %144: ptr, %145: ptr):
     call @func.20(%256, %145)
     br bb92(%142, %143, %144)
 bb92(%146: ptr, %147: ptr, %148: ptr):
     %2177 = const bool true
-    %2178 = call @func.210(%147)
+    %2178 = call @func.27(%147)
     br bb93(%146, %147, %148, %2178)
 bb93(%149: ptr, %150: ptr, %151: ptr, %152: ptr):
     call @func.20(%257, %152)
@@ -106624,7 +106060,7 @@ bb94(%153: ptr, %154: ptr, %155: ptr):
     %2179 = const bool false
     %2180 = const bool false
     %2181 = load ptr, ptr %178
-    call @func.46(%254, %2181, %255, %256, %257)
+    call @func.43(%254, %2181, %255, %256, %257)
     br bb95(%153, %154, %155)
 bb95(%156: ptr, %157: ptr, %158: ptr):
     %2182 = const bool false
@@ -106635,16 +106071,16 @@ bb95(%156: ptr, %157: ptr, %158: ptr):
     br bb96(%156, %157, %2186)
 bb96(%159: ptr, %160: ptr, %161: ptr):
     %2187 = load u64, ptr %254
-    call @func.73(%258, %159, %161, %2187)
+    call @func.66(%258, %159, %161, %2187)
     br bb97(%159, %160)
 bb97(%162: ptr, %163: ptr):
     %2188 = load ptr, ptr %178
-    call @func.212(%259, %162, %258, %2188)
+    call @func.167(%259, %162, %258, %2188)
     br bb98(%163)
 bb98(%164: ptr):
     %2189 = const bool true
     %2190 = load ptr, ptr %178
-    call @func.228(%2190)
+    call @func.177(%2190)
     br bb99(%164)
 bb99(%165: ptr):
     %2191 = const bool false
@@ -106704,7 +106140,7 @@ bb99(%165: ptr):
     %2236 = gep i8, ptr %262, %2235
     %2237 = load i64, ptr %2234
     store i64 %2237, ptr %2236
-    call @func.208(%261, %262)
+    call @func.165(%261, %262)
     br bb100(%165)
 bb100(%166: ptr):
     %2238 = load i64, ptr %261
@@ -106860,14 +106296,14 @@ bb102:
     %2360 = gep i8, ptr %263, %2359
     %2361 = load i64, ptr %2358
     store i64 %2361, ptr %2360
-    call @func.209(%0, %263)
+    call @func.166(%0, %263)
     br bb103
 bb103:
     %2362 = const bool false
     br bb118
 bb104(%168: ptr, %169: ptr):
     %2363 = load u64, ptr %254
-    call @func.231(%265, %168, %2363, %169)
+    call @func.180(%265, %168, %2363, %169)
     br bb105
 bb105:
     %2364 = load i64, ptr %265
@@ -106931,16 +106367,16 @@ bb106:
     %2410 = const bool false
     br bb118
 bb107:
-    call @func.214(%268)
+    call @func.169(%268)
     br bb110
 bb108:
-    call @func.213(%267)
+    call @func.168(%267)
     br bb109
 bb109:
-    call @func.233(%266, %267)
+    call @func.182(%266, %267)
     br bb111
 bb110:
-    call @func.233(%266, %268)
+    call @func.182(%266, %268)
     br bb111
 bb111:
     %2411 = load i64, ptr %266
@@ -107002,7 +106438,7 @@ bb111:
     br bb118
 bb112(%170: ptr, %171: ptr):
     %2457 = load ptr, ptr %178
-    call @func.212(%0, %170, %171, %2457)
+    call @func.167(%0, %170, %171, %2457)
     br bb118
 bb113(%172: bool):
     %2458 = const bool false
@@ -107156,7 +106592,7 @@ bb5:
     %45 = const bool true
     br bb12(%45)
 bb6(%1: ptr, %2: ptr):
-    %46 = call @func.215(%2)
+    %46 = call @func.170(%2)
     br bb7(%1, %46)
 bb7(%3: ptr, %4: bool):
     condbr %4, bb8(%3), bb9
@@ -107169,10 +106605,10 @@ bb9:
     %50 = const bool false
     br bb12(%50)
 bb10(%6: ptr):
-    %51 = call @func.215(%6)
+    %51 = call @func.170(%6)
     br bb12(%51)
 bb11(%7: ptr):
-    %52 = call @func.215(%7)
+    %52 = call @func.170(%7)
     br bb12(%52)
 bb12(%8: bool):
     ret %8
@@ -107180,7 +106616,7 @@ bb12(%8: bool):
 
 fn @Level__normalize(functy.216) {
 bb0(%0: ptr, %1: ptr):
-    call @func.234(%0, %1)
+    call @func.183(%0, %1)
     br bb1
 bb1:
     ret
@@ -107188,22 +106624,10 @@ bb1:
 
 fn @Verifier____env___try_infer_type_quick(functy.217) {
 bb0(%0: ptr, %1: ptr, %2: ptr, %3: ptr):
-    call @func.236(%0, %1, %2, %3)
+    call @func.184(%0, %1, %2, %3)
     br bb1
 bb1:
     ret
-}
-
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.218) {
-}
-
-fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.219) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.220) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.221) {
 }
 
 fn @Verifier____env___infer_type_infer_only_core(functy.222) {
@@ -107425,7 +106849,7 @@ bb4(%5: ptr):
     %373 = const i64 64
     %374 = gep i8, ptr %372, %373
     %375 = const bool true
-    call @func.128(%255, %362)
+    call @func.102(%255, %362)
     br bb90(%5, %365, %368, %371)
 bb5(%6: ptr):
     %376 = load ptr, ptr %179
@@ -107452,7 +106876,7 @@ bb6(%7: ptr):
     %395 = const i64 16
     %396 = gep i8, ptr %394, %395
     %397 = const bool true
-    call @func.50(%206)
+    call @func.47(%206)
     br bb40(%7, %390, %393, %396)
 bb7(%8: ptr):
     %398 = load ptr, ptr %179
@@ -107472,13 +106896,13 @@ bb8(%9: ptr):
     %410 = load ptr, ptr %179
     %411 = const i64 48
     %412 = gep i8, ptr %410, %411
-    call @func.237(%190, %9, %409)
+    call @func.185(%190, %9, %409)
     br bb20(%409)
 bb9:
     %413 = load ptr, ptr %179
     %414 = const i64 8
     %415 = gep i8, ptr %413, %414
-    call @func.132(%189, %415)
+    call @func.106(%189, %415)
     br bb17
 bb10:
     %416 = load ptr, ptr %179
@@ -107488,7 +106912,7 @@ bb10:
     %420 = load i64, ptr %418
     store i64 %420, ptr %182
     %421 = load u64, ptr %182
-    call @func.154(%181, %419, %421)
+    call @func.122(%181, %419, %421)
     br bb12(%418)
 bb11:
     %422 = load ptr, ptr %179
@@ -107648,7 +107072,7 @@ bb16:
     store i64 %537, ptr %536
     br bb118
 bb17:
-    call @func.226(%188, %189)
+    call @func.176(%188, %189)
     br bb18
 bb18:
     call @func.10(%187, %188)
@@ -107720,7 +107144,7 @@ bb20(%12: ptr):
     %589 = select i64 %586, %587, %588
     switch %589 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.128(%193, %13)
+    call @func.102(%193, %13)
     br bb23
 bb22:
     %590 = load i64, ptr %190
@@ -107896,10 +107320,10 @@ bb23:
     br bb118
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %727 = load ptr, ptr %178
-    call @func.222(%196, %14, %16, %727)
+    call @func.173(%196, %14, %16, %727)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.218(%195, %196)
+    call @func.165(%195, %196)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %728 = load i64, ptr %195
@@ -108024,7 +107448,7 @@ bb27(%21: ptr, %22: ptr):
     %826 = load i64, ptr %823
     store i64 %826, ptr %825
     %827 = load ptr, ptr %178
-    call @func.47(%199, %21, %194, %827)
+    call @func.44(%199, %21, %194, %827)
     br bb30(%22, %780)
 bb28:
     %828 = const i64 8
@@ -108055,7 +107479,7 @@ bb28:
     %849 = gep i8, ptr %197, %848
     %850 = load i64, ptr %847
     store i64 %850, ptr %849
-    call @func.219(%0, %197)
+    call @func.166(%0, %197)
     br bb29
 bb29:
     %851 = const bool false
@@ -108249,7 +107673,7 @@ bb33(%27: ptr, %28: ptr, %29: bool):
     %1007 = gep i8, ptr %1005, %1006
     br bb34(%28, %1007, %29)
 bb34(%30: ptr, %31: ptr, %32: bool):
-    call @func.135(%201, %30, %31)
+    call @func.109(%201, %30, %31)
     br bb35(%32)
 bb35(%33: bool):
     %1008 = load i64, ptr %201
@@ -108355,7 +107779,7 @@ bb39:
     %1082 = const bool false
     br bb118
 bb40(%37: ptr, %38: ptr, %39: ptr, %40: ptr):
-    %1083 = call @func.220(%39)
+    %1083 = call @func.27(%39)
     br bb41(%37, %38, %39, %40, %1083)
 bb41(%41: ptr, %42: ptr, %43: ptr, %44: ptr, %45: ptr):
     call @func.20(%207, %45)
@@ -108381,16 +107805,16 @@ bb43(%50: ptr, %51: ptr, %52: ptr, %53: ptr):
     br bb44(%50, %51, %52, %1095)
 bb44(%54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %1096 = load u64, ptr %205
-    call @func.73(%209, %54, %57, %1096)
+    call @func.66(%209, %54, %57, %1096)
     br bb45(%54, %55, %56)
 bb45(%58: ptr, %59: ptr, %60: ptr):
     %1097 = load ptr, ptr %178
-    call @func.222(%210, %58, %209, %1097)
+    call @func.173(%210, %58, %209, %1097)
     br bb46(%59, %60)
 bb46(%61: ptr, %62: ptr):
     %1098 = const bool true
     %1099 = load ptr, ptr %178
-    call @func.228(%1099)
+    call @func.177(%1099)
     br bb47(%61, %62)
 bb47(%63: ptr, %64: ptr):
     %1100 = const bool false
@@ -108450,7 +107874,7 @@ bb47(%63: ptr, %64: ptr):
     %1145 = gep i8, ptr %213, %1144
     %1146 = load i64, ptr %1143
     store i64 %1146, ptr %1145
-    call @func.218(%212, %213)
+    call @func.165(%212, %213)
     br bb48(%63, %64)
 bb48(%65: ptr, %66: ptr):
     %1147 = load i64, ptr %212
@@ -108574,7 +107998,7 @@ bb49(%67: ptr, %68: ptr):
     %1244 = load i64, ptr %1241
     store i64 %1244, ptr %1243
     %1245 = load u64, ptr %205
-    call @func.229(%216, %211, %1245)
+    call @func.178(%216, %211, %1245)
     br bb52(%67, %68)
 bb50:
     %1246 = const i64 8
@@ -108605,7 +108029,7 @@ bb50:
     %1267 = gep i8, ptr %214, %1266
     %1268 = load i64, ptr %1265
     store i64 %1268, ptr %1267
-    call @func.219(%0, %214)
+    call @func.166(%0, %214)
     br bb51
 bb51:
     %1269 = const bool false
@@ -108620,7 +108044,7 @@ bb52(%69: ptr, %70: ptr):
     %1275 = gep i8, ptr %219, %1274
     %1276 = load i8, ptr %1273
     store i8 %1276, ptr %1275
-    call @func.221(%220, %70)
+    call @func.26(%220, %70)
     br bb53
 bb53:
     %1277 = const bool false
@@ -108835,10 +108259,10 @@ bb56:
     br bb118
 bb57(%71: ptr, %72: ptr, %73: ptr, %74: ptr, %75: ptr):
     %1441 = load ptr, ptr %178
-    call @func.222(%225, %71, %75, %1441)
+    call @func.173(%225, %71, %75, %1441)
     br bb58(%71, %72, %73, %74)
 bb58(%76: ptr, %77: ptr, %78: ptr, %79: ptr):
-    call @func.218(%224, %225)
+    call @func.165(%224, %225)
     br bb59(%76, %77, %78, %79)
 bb59(%80: ptr, %81: ptr, %82: ptr, %83: ptr):
     %1442 = load i64, ptr %224
@@ -108963,7 +108387,7 @@ bb60(%84: ptr, %85: ptr, %86: ptr, %87: ptr):
     %1540 = load i64, ptr %1537
     store i64 %1540, ptr %1539
     %1541 = load ptr, ptr %178
-    call @func.47(%228, %84, %223, %1541)
+    call @func.44(%228, %84, %223, %1541)
     br bb62(%84, %85, %86, %87, %1494)
 bb61:
     %1542 = const i64 8
@@ -108994,7 +108418,7 @@ bb61:
     %1563 = gep i8, ptr %226, %1562
     %1564 = load i64, ptr %1561
     store i64 %1564, ptr %1563
-    call @func.219(%0, %226)
+    call @func.166(%0, %226)
     br bb117
 bb62(%88: ptr, %89: ptr, %90: ptr, %91: ptr, %92: bool):
     store ptr %228, ptr %230
@@ -109172,11 +108596,11 @@ bb64(%93: ptr, %94: ptr, %95: ptr, %96: ptr, %97: bool):
     %1709 = load ptr, ptr %230
     %1710 = const i64 8
     %1711 = gep i8, ptr %1709, %1710
-    call @func.132(%229, %1711)
+    call @func.106(%229, %1711)
     br bb65(%93, %94, %95, %96, %97)
 bb65(%98: ptr, %99: ptr, %100: ptr, %101: ptr, %102: bool):
     %1712 = const bool true
-    call @func.50(%235)
+    call @func.47(%235)
     br bb67(%98, %99, %100, %101, %102)
 bb66(%103: bool):
     %1713 = load ptr, ptr %232
@@ -109218,7 +108642,7 @@ bb66(%103: bool):
     br bb115(%103)
 bb67(%104: ptr, %105: ptr, %106: ptr, %107: ptr, %108: bool):
     %1741 = const bool true
-    %1742 = call @func.220(%106)
+    %1742 = call @func.27(%106)
     br bb68(%104, %105, %107, %1742, %108)
 bb68(%109: ptr, %110: ptr, %111: ptr, %112: ptr, %113: bool):
     call @func.20(%236, %112)
@@ -109244,16 +108668,16 @@ bb70(%118: ptr, %119: ptr, %120: bool):
     br bb71(%118, %1754, %120)
 bb71(%121: ptr, %122: ptr, %123: bool):
     %1755 = load u64, ptr %234
-    call @func.73(%238, %121, %122, %1755)
+    call @func.66(%238, %121, %122, %1755)
     br bb72(%121, %123)
 bb72(%124: ptr, %125: bool):
     %1756 = load ptr, ptr %178
-    call @func.222(%239, %124, %238, %1756)
+    call @func.173(%239, %124, %238, %1756)
     br bb73(%124, %125)
 bb73(%126: ptr, %127: bool):
     %1757 = const bool true
     %1758 = load ptr, ptr %178
-    call @func.228(%1758)
+    call @func.177(%1758)
     br bb74(%126, %127)
 bb74(%128: ptr, %129: bool):
     %1759 = const bool false
@@ -109313,7 +108737,7 @@ bb74(%128: ptr, %129: bool):
     %1804 = gep i8, ptr %242, %1803
     %1805 = load i64, ptr %1802
     store i64 %1805, ptr %1804
-    call @func.218(%241, %242)
+    call @func.165(%241, %242)
     br bb75(%128, %129)
 bb75(%130: ptr, %131: bool):
     %1806 = load i64, ptr %241
@@ -109438,7 +108862,7 @@ bb76(%132: ptr, %133: bool):
     %1904 = load i64, ptr %1901
     store i64 %1904, ptr %1903
     %1905 = load ptr, ptr %178
-    call @func.47(%245, %132, %240, %1905)
+    call @func.44(%245, %132, %240, %1905)
     br bb78(%133)
 bb77(%134: bool):
     %1906 = const i64 8
@@ -109469,7 +108893,7 @@ bb77(%134: bool):
     %1927 = gep i8, ptr %243, %1926
     %1928 = load i64, ptr %1925
     store i64 %1928, ptr %1927
-    call @func.219(%0, %243)
+    call @func.166(%0, %243)
     br bb121(%134)
 bb78(%135: bool):
     store ptr %245, ptr %247
@@ -109647,7 +109071,7 @@ bb80:
     %2073 = load ptr, ptr %247
     %2074 = const i64 8
     %2075 = gep i8, ptr %2073, %2074
-    call @func.132(%246, %2075)
+    call @func.106(%246, %2075)
     br bb81
 bb81:
     %2076 = const bool false
@@ -109677,7 +109101,7 @@ bb81:
     %2096 = gep i8, ptr %253, %2095
     %2097 = load i64, ptr %2094
     store i64 %2097, ptr %2096
-    call @func.230(%252, %253, %246)
+    call @func.179(%252, %253, %246)
     br bb83
 bb82(%137: bool):
     %2098 = load ptr, ptr %249
@@ -109793,14 +109217,14 @@ bb89:
     %2175 = const bool false
     br bb118
 bb90(%138: ptr, %139: ptr, %140: ptr, %141: ptr):
-    %2176 = call @func.220(%139)
+    %2176 = call @func.27(%139)
     br bb91(%138, %140, %141, %2176)
 bb91(%142: ptr, %143: ptr, %144: ptr, %145: ptr):
     call @func.20(%256, %145)
     br bb92(%142, %143, %144)
 bb92(%146: ptr, %147: ptr, %148: ptr):
     %2177 = const bool true
-    %2178 = call @func.220(%147)
+    %2178 = call @func.27(%147)
     br bb93(%146, %147, %148, %2178)
 bb93(%149: ptr, %150: ptr, %151: ptr, %152: ptr):
     call @func.20(%257, %152)
@@ -109809,7 +109233,7 @@ bb94(%153: ptr, %154: ptr, %155: ptr):
     %2179 = const bool false
     %2180 = const bool false
     %2181 = load ptr, ptr %178
-    call @func.46(%254, %2181, %255, %256, %257)
+    call @func.43(%254, %2181, %255, %256, %257)
     br bb95(%153, %154, %155)
 bb95(%156: ptr, %157: ptr, %158: ptr):
     %2182 = const bool false
@@ -109820,16 +109244,16 @@ bb95(%156: ptr, %157: ptr, %158: ptr):
     br bb96(%156, %157, %2186)
 bb96(%159: ptr, %160: ptr, %161: ptr):
     %2187 = load u64, ptr %254
-    call @func.73(%258, %159, %161, %2187)
+    call @func.66(%258, %159, %161, %2187)
     br bb97(%159, %160)
 bb97(%162: ptr, %163: ptr):
     %2188 = load ptr, ptr %178
-    call @func.222(%259, %162, %258, %2188)
+    call @func.173(%259, %162, %258, %2188)
     br bb98(%163)
 bb98(%164: ptr):
     %2189 = const bool true
     %2190 = load ptr, ptr %178
-    call @func.228(%2190)
+    call @func.177(%2190)
     br bb99(%164)
 bb99(%165: ptr):
     %2191 = const bool false
@@ -109889,7 +109313,7 @@ bb99(%165: ptr):
     %2236 = gep i8, ptr %262, %2235
     %2237 = load i64, ptr %2234
     store i64 %2237, ptr %2236
-    call @func.218(%261, %262)
+    call @func.165(%261, %262)
     br bb100(%165)
 bb100(%166: ptr):
     %2238 = load i64, ptr %261
@@ -110045,14 +109469,14 @@ bb102:
     %2360 = gep i8, ptr %263, %2359
     %2361 = load i64, ptr %2358
     store i64 %2361, ptr %2360
-    call @func.219(%0, %263)
+    call @func.166(%0, %263)
     br bb103
 bb103:
     %2362 = const bool false
     br bb118
 bb104(%168: ptr, %169: ptr):
     %2363 = load u64, ptr %254
-    call @func.231(%265, %168, %2363, %169)
+    call @func.180(%265, %168, %2363, %169)
     br bb105
 bb105:
     %2364 = load i64, ptr %265
@@ -110116,16 +109540,16 @@ bb106:
     %2410 = const bool false
     br bb118
 bb107:
-    call @func.214(%268)
+    call @func.169(%268)
     br bb110
 bb108:
-    call @func.213(%267)
+    call @func.168(%267)
     br bb109
 bb109:
-    call @func.233(%266, %267)
+    call @func.182(%266, %267)
     br bb111
 bb110:
-    call @func.233(%266, %268)
+    call @func.182(%266, %268)
     br bb111
 bb111:
     %2411 = load i64, ptr %266
@@ -110187,7 +109611,7 @@ bb111:
     br bb118
 bb112(%170: ptr, %171: ptr):
     %2457 = load ptr, ptr %178
-    call @func.222(%0, %170, %171, %2457)
+    call @func.173(%0, %170, %171, %2457)
     br bb118
 bb113(%172: bool):
     %2458 = const bool false
@@ -110211,9 +109635,6 @@ bb120:
     br bb117
 bb121(%176: bool):
     br bb113(%176)
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.223) {
 }
 
 fn @Verifier____env___try_infer_type_quick_inner_blind(functy.224) {
@@ -110344,7 +109765,7 @@ bb7:
     %146 = load ptr, ptr %42
     %147 = const i64 8
     %148 = gep i8, ptr %146, %147
-    call @func.132(%50, %148)
+    call @func.106(%50, %148)
     br bb15
 bb8(%10: ptr):
     %149 = load ptr, ptr %42
@@ -110353,7 +109774,7 @@ bb8(%10: ptr):
     %152 = load ptr, ptr %42
     %153 = const i64 48
     %154 = gep i8, ptr %152, %153
-    call @func.225(%0, %10, %151)
+    call @func.175(%0, %10, %151)
     br bb43
 bb9(%11: ptr):
     %155 = load ptr, ptr %42
@@ -110362,7 +109783,7 @@ bb9(%11: ptr):
     %158 = load i64, ptr %157
     store i64 %158, ptr %44
     %159 = load u64, ptr %44
-    call @func.154(%43, %11, %159)
+    call @func.122(%43, %11, %159)
     br bb10
 bb10:
     %160 = load i64, ptr %43
@@ -110445,7 +109866,7 @@ bb14:
     store i64 %216, ptr %215
     br bb43
 bb15:
-    call @func.226(%49, %50)
+    call @func.176(%49, %50)
     br bb16
 bb16:
     %217 = const i64 8
@@ -110539,7 +109960,7 @@ bb17:
     store i64 %286, ptr %285
     br bb43
 bb18(%12: ptr, %13: ptr, %14: ptr, %15: ptr):
-    call @func.207(%52, %12, %15, %13)
+    call @func.164(%52, %12, %15, %13)
     br bb19(%12, %13, %14)
 bb19(%16: ptr, %17: ptr, %18: ptr):
     %287 = load i64, ptr %52
@@ -110666,7 +110087,7 @@ bb21(%19: ptr, %20: ptr, %21: ptr):
     %384 = gep i8, ptr %51, %383
     %385 = load i64, ptr %382
     store i64 %385, ptr %384
-    call @func.47(%54, %19, %51, %20)
+    call @func.44(%54, %19, %51, %20)
     br bb22(%21)
 bb22(%22: ptr):
     store ptr %54, ptr %55
@@ -110732,7 +110153,7 @@ bb25(%24: ptr, %25: ptr):
     %438 = gep i8, ptr %436, %437
     br bb26(%25, %438)
 bb26(%26: ptr, %27: ptr):
-    call @func.135(%56, %26, %27)
+    call @func.109(%56, %26, %27)
     br bb27
 bb27:
     %439 = load i64, ptr %56
@@ -110797,7 +110218,7 @@ bb28:
 bb29:
     br bb43
 bb30(%28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: ptr):
-    call @func.207(%58, %28, %32, %29)
+    call @func.164(%58, %28, %32, %29)
     br bb31(%30, %31)
 bb31(%33: ptr, %34: ptr):
     %485 = load i64, ptr %58
@@ -110934,7 +110355,7 @@ bb33(%35: ptr, %36: ptr):
     %590 = gep i8, ptr %61, %589
     %591 = load i8, ptr %588
     store i8 %591, ptr %590
-    %592 = call @func.223(%36)
+    %592 = call @func.27(%36)
     br bb34(%592)
 bb34(%37: ptr):
     call @func.20(%62, %37)
@@ -111059,16 +110480,16 @@ bb36:
     %686 = const bool false
     br bb43
 bb37:
-    call @func.214(%66)
+    call @func.169(%66)
     br bb40
 bb38:
-    call @func.213(%65)
+    call @func.168(%65)
     br bb39
 bb39:
-    call @func.233(%64, %65)
+    call @func.182(%64, %65)
     br bb41
 bb40:
-    call @func.233(%64, %66)
+    call @func.182(%64, %66)
     br bb41
 bb41:
     %687 = load i64, ptr %64
@@ -111129,7 +110550,7 @@ bb41:
     store i64 %732, ptr %731
     br bb43
 bb42(%38: ptr, %39: ptr, %40: ptr):
-    call @func.207(%0, %38, %40, %39)
+    call @func.164(%0, %38, %40, %39)
     br bb43
 bb43:
     ret
@@ -111141,7 +110562,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %6 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %7 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %8 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.156(%5, %1, %2)
+    call @func.123(%5, %1, %2)
     br bb1(%1)
 bb1(%3: ptr):
     %9 = load i64, ptr %5
@@ -111214,7 +110635,7 @@ bb4(%4: ptr):
     %60 = gep i8, ptr %6, %59
     %61 = load i64, ptr %58
     store i64 %61, ptr %60
-    call @func.238(%7, %4, %6)
+    call @func.186(%7, %4, %6)
     br bb5
 bb5:
     %62 = load i64, ptr %7
@@ -111361,7 +110782,7 @@ bb11:
 fn @Level__succ(functy.226) {
 bb0(%0: ptr, %1: ptr):
     %2 = alloca i64, align 8
-    call @func.49(%2, %1)
+    call @func.46(%2, %1)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -111373,16 +110794,13 @@ bb1:
     ret
 }
 
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice9LocalDeclE3popBG_(functy.227) {
-}
-
 fn @LocalContext__pop(functy.228) {
 bb0(%0: ptr):
     %1 = alloca i64, align 8
     %2 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     store ptr %0, ptr %1
     %3 = load ptr, ptr %1
-    call @func.227(%2, %3)
+    call @func.63(%2, %3)
     br bb1
 bb1:
     br bb2
@@ -111396,7 +110814,7 @@ bb0(%0: ptr, %1: ptr, %2: u64):
     store u64 %2, ptr %3
     %4 = load u64, ptr %3
     %5 = const u32 0
-    call @func.240(%0, %1, %4, %5)
+    call @func.187(%0, %1, %4, %5)
     br bb1
 bb1:
     ret
@@ -111416,7 +110834,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %52 = const bool false
     %53 = const bool true
     %54 = const bool true
-    %55 = call @func.215(%2)
+    %55 = call @func.170(%2)
     br bb1(%55, %54, %53)
 bb1(%3: bool, %4: bool, %5: bool):
     condbr %3, bb2(%4, %5), bb3(%4, %5)
@@ -111425,7 +110843,7 @@ bb2(%6: bool, %7: bool):
     store i64 %56, ptr %0
     br bb25(%6, %7)
 bb3(%8: bool, %9: bool):
-    %57 = call @func.241(%2)
+    %57 = call @func.188(%2)
     br bb4(%57, %8, %9)
 bb4(%10: bool, %11: bool, %12: bool):
     condbr %10, bb5, bb6(%11, %12)
@@ -111484,10 +110902,10 @@ bb5:
     %100 = gep i8, ptr %44, %99
     %101 = load i64, ptr %98
     store i64 %101, ptr %100
-    call @func.242(%0, %43, %44)
+    call @func.189(%0, %43, %44)
     br bb27(%80, %58)
 bb6(%13: bool, %14: bool):
-    %102 = call @func.215(%1)
+    %102 = call @func.170(%1)
     br bb7(%102, %13, %14)
 bb7(%15: bool, %16: bool, %17: bool):
     condbr %15, bb8(%17), bb9(%16, %17)
@@ -111521,13 +110939,13 @@ bb8(%18: bool):
     store i64 %124, ptr %123
     br bb25(%103, %18)
 bb9(%19: bool, %20: bool):
-    call @func.243(%46)
+    call @func.190(%46)
     br bb10(%1, %19, %20)
 bb10(%21: ptr, %22: bool, %23: bool):
-    call @func.226(%45, %46)
+    call @func.176(%45, %46)
     br bb11(%21, %22, %23)
 bb11(%24: ptr, %25: bool, %26: bool):
-    %125 = call @func.149(%24, %45)
+    %125 = call @func.119(%24, %45)
     br bb12(%125, %25, %26)
 bb12(%27: bool, %28: bool, %29: bool):
     condbr %27, bb13(%29), bb15(%28)
@@ -111565,7 +110983,7 @@ bb14(%31: bool):
 bb15(%32: bool):
     br bb16(%32)
 bb16(%33: bool):
-    %148 = call @func.149(%1, %2)
+    %148 = call @func.119(%1, %2)
     br bb17(%148, %33)
 bb17(%34: bool, %35: bool):
     condbr %34, bb18(%35), bb19
@@ -111626,7 +111044,7 @@ bb19:
     %191 = gep i8, ptr %48, %190
     %192 = load i64, ptr %189
     store i64 %192, ptr %191
-    call @func.49(%47, %48)
+    call @func.46(%47, %48)
     br bb20
 bb20:
     %193 = const bool false
@@ -111656,7 +111074,7 @@ bb20:
     %213 = gep i8, ptr %50, %212
     %214 = load i64, ptr %211
     store i64 %214, ptr %213
-    call @func.49(%49, %50)
+    call @func.46(%49, %50)
     br bb21
 bb21:
     %215 = load ptr, ptr %47
@@ -111714,7 +111132,7 @@ bb0(%0: ptr, %1: ptr, %2: u64, %3: ptr):
     %97 = const bool false
     %98 = const bool false
     %99 = load ptr, ptr %74
-    %100 = call @func.244(%99)
+    %100 = call @func.191(%99)
     br bb1(%3, %100)
 bb1(%4: ptr, %5: bool):
     condbr %5, bb2(%4), bb3
@@ -111796,7 +111214,7 @@ bb6(%8: ptr):
     %164 = const i64 48
     %165 = gep i8, ptr %163, %164
     %166 = const bool true
-    call @func.128(%89, %159)
+    call @func.102(%89, %159)
     br bb38(%8, %162, %165)
 bb7(%9: ptr):
     %167 = load ptr, ptr %76
@@ -111813,7 +111231,7 @@ bb7(%9: ptr):
     %178 = const i64 64
     %179 = gep i8, ptr %177, %178
     %180 = const bool true
-    call @func.128(%85, %167)
+    call @func.102(%85, %167)
     br bb30(%9, %170, %173, %176, %179)
 bb8(%10: ptr):
     %181 = load ptr, ptr %76
@@ -111874,7 +111292,7 @@ bb11(%13: ptr):
     %226 = load ptr, ptr %76
     %227 = const i64 8
     %228 = gep i8, ptr %226, %227
-    %229 = call @func.94(%228, %75)
+    %229 = call @func.78(%228, %75)
     br bb12(%13, %229)
 bb12(%14: ptr, %15: bool):
     condbr %15, bb13(%14), bb14
@@ -111888,7 +111306,7 @@ bb14:
 bb15(%17: ptr, %18: ptr, %19: ptr):
     %231 = const bool true
     %232 = load u64, ptr %75
-    call @func.231(%77, %19, %232, %17)
+    call @func.180(%77, %19, %232, %17)
     br bb16(%17, %18)
 bb16(%20: ptr, %21: ptr):
     %233 = load ptr, ptr %21
@@ -111897,7 +111315,7 @@ bb16(%20: ptr, %21: ptr):
     br bb17(%20, %235)
 bb17(%22: ptr, %23: ptr):
     %236 = load u64, ptr %75
-    call @func.231(%78, %23, %236, %22)
+    call @func.180(%78, %23, %236, %22)
     br bb18
 bb18:
     %237 = const bool false
@@ -111909,7 +111327,7 @@ bb19:
 bb20(%24: ptr, %25: ptr, %26: ptr):
     %239 = const bool true
     %240 = load u64, ptr %75
-    call @func.231(%80, %26, %240, %24)
+    call @func.180(%80, %26, %240, %24)
     br bb21(%24, %25)
 bb21(%27: ptr, %28: ptr):
     %241 = load ptr, ptr %28
@@ -111918,11 +111336,11 @@ bb21(%27: ptr, %28: ptr):
     br bb22(%27, %243)
 bb22(%29: ptr, %30: ptr):
     %244 = load u64, ptr %75
-    call @func.231(%81, %30, %244, %29)
+    call @func.180(%81, %30, %244, %29)
     br bb23
 bb23:
     %245 = const bool false
-    call @func.33(%0, %79, %80, %81)
+    call @func.31(%0, %79, %80, %81)
     br bb24
 bb24:
     %246 = const bool false
@@ -111930,7 +111348,7 @@ bb24:
 bb25(%31: ptr, %32: ptr, %33: ptr):
     %247 = const bool true
     %248 = load u64, ptr %75
-    call @func.231(%83, %33, %248, %31)
+    call @func.180(%83, %33, %248, %31)
     br bb26(%31, %32)
 bb26(%34: ptr, %35: ptr):
     %249 = load ptr, ptr %35
@@ -111939,7 +111357,7 @@ bb26(%34: ptr, %35: ptr):
     br bb27(%34, %251)
 bb27(%36: ptr, %37: ptr):
     %252 = load u64, ptr %75
-    call @func.231(%84, %37, %252, %36)
+    call @func.180(%84, %37, %252, %36)
     br bb28
 bb28:
     %253 = const bool false
@@ -111955,7 +111373,7 @@ bb30(%38: ptr, %39: ptr, %40: ptr, %41: ptr, %42: ptr):
     br bb31(%38, %40, %41, %42, %257)
 bb31(%43: ptr, %44: ptr, %45: ptr, %46: ptr, %47: ptr):
     %258 = load u64, ptr %75
-    call @func.231(%86, %47, %258, %43)
+    call @func.180(%86, %47, %258, %43)
     br bb32(%43, %44, %45, %46)
 bb32(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
     %259 = const bool true
@@ -111965,7 +111383,7 @@ bb32(%48: ptr, %49: ptr, %50: ptr, %51: ptr):
     br bb33(%48, %50, %51, %262)
 bb33(%52: ptr, %53: ptr, %54: ptr, %55: ptr):
     %263 = load u64, ptr %75
-    call @func.231(%87, %55, %263, %52)
+    call @func.180(%87, %55, %263, %52)
     br bb34(%52, %53, %54)
 bb34(%56: ptr, %57: ptr, %58: ptr):
     %264 = const bool true
@@ -111975,14 +111393,14 @@ bb34(%56: ptr, %57: ptr, %58: ptr):
     br bb35(%56, %58, %267)
 bb35(%59: ptr, %60: ptr, %61: ptr):
     %268 = load u64, ptr %75
-    call @func.231(%88, %61, %268, %59)
+    call @func.180(%88, %61, %268, %59)
     br bb36(%60)
 bb36(%62: ptr):
     %269 = load bool, ptr %62
     %270 = const bool false
     %271 = const bool false
     %272 = const bool false
-    call @func.44(%0, %85, %86, %87, %88, %269)
+    call @func.42(%0, %85, %86, %87, %88, %269)
     br bb37
 bb37:
     %273 = const bool false
@@ -111997,21 +111415,21 @@ bb38(%63: ptr, %64: ptr, %65: ptr):
     br bb39(%63, %276, %279)
 bb39(%66: ptr, %67: u32, %68: ptr):
     %280 = load u64, ptr %75
-    call @func.231(%90, %68, %280, %66)
+    call @func.180(%90, %68, %280, %66)
     br bb40(%67)
 bb40(%69: u32):
     %281 = const bool false
-    call @func.206(%0, %89, %69, %90)
+    call @func.163(%0, %89, %69, %90)
     br bb41
 bb41:
     %282 = const bool false
     br bb44
 bb42(%70: ptr, %71: u32, %72: ptr):
     %283 = load u64, ptr %75
-    call @func.231(%91, %72, %283, %70)
+    call @func.180(%91, %72, %283, %70)
     br bb43(%71)
 bb43(%73: u32):
-    call @func.245(%0, %73, %91)
+    call @func.192(%0, %73, %91)
     br bb44
 bb44:
     ret
@@ -112051,7 +111469,7 @@ bb0(%0: ptr, %1: ptr):
     %24 = gep i8, ptr %3, %23
     %25 = load i64, ptr %22
     store i64 %25, ptr %24
-    call @func.232(%4)
+    call @func.181(%4)
     br bb1
 bb1:
     %26 = const i64 8
@@ -112122,7 +111540,7 @@ bb0(%0: ptr, %1: ptr):
     %43 = alloca (i64, i64, i64, i64, i64), align 8
     %44 = const bool false
     %45 = const bool false
-    call @func.247(%33, %1)
+    call @func.193(%33, %1)
     br bb1
 bb1:
     %46 = load ptr, ptr %33
@@ -112154,7 +111572,7 @@ bb2:
     unreachable
 bb3(%2: u32):
     %69 = load ptr, ptr %32
-    call @func.256(%0, %69, %2)
+    call @func.198(%0, %69, %2)
     br bb31
 bb4(%3: u32):
     %70 = load ptr, ptr %32
@@ -112169,7 +111587,7 @@ bb4(%3: u32):
     br bb17(%3, %75, %78)
 bb5:
     %79 = load ptr, ptr %32
-    call @func.132(%0, %79)
+    call @func.106(%0, %79)
     br bb31
 bb6(%4: u32):
     %80 = load ptr, ptr %32
@@ -112199,7 +111617,7 @@ bb7(%5: u32):
     br bb11(%5)
 bb8(%6: u32):
     %101 = load ptr, ptr %32
-    call @func.128(%35, %101)
+    call @func.102(%35, %101)
     br bb10(%6)
 bb9(%7: u32):
     %102 = const bool true
@@ -112269,7 +111687,7 @@ bb13(%12: u32, %13: u32):
     %148 = gep i8, ptr %37, %147
     %149 = load i64, ptr %146
     store i64 %149, ptr %148
-    call @func.226(%36, %37)
+    call @func.176(%36, %37)
     br bb14(%12, %13)
 bb14(%14: u32, %15: u32):
     %150 = const bool true
@@ -112346,7 +111764,7 @@ bb16:
     br bb31
 bb17(%17: u32, %18: ptr, %19: ptr):
     %206 = const bool true
-    call @func.234(%39, %19)
+    call @func.183(%39, %19)
     br bb18(%17, %18)
 bb18(%20: u32, %21: ptr):
     %207 = load ptr, ptr %21
@@ -112354,7 +111772,7 @@ bb18(%20: u32, %21: ptr):
     %209 = gep i8, ptr %207, %208
     br bb19(%20, %209)
 bb19(%22: u32, %23: ptr):
-    call @func.234(%40, %23)
+    call @func.183(%40, %23)
     br bb20(%22)
 bb20(%24: u32):
     %210 = const bool false
@@ -112384,7 +111802,7 @@ bb20(%24: u32):
     %230 = gep i8, ptr %42, %229
     %231 = load i64, ptr %228
     store i64 %231, ptr %230
-    call @func.230(%41, %42, %40)
+    call @func.179(%41, %42, %40)
     br bb21(%24)
 bb21(%25: u32):
     %232 = load i64, ptr %41
@@ -112415,15 +111833,15 @@ bb23(%27: u32):
 bb24(%28: u32, %29: bool):
     condbr %29, bb25(%28), bb28(%28)
 bb25(%30: u32):
-    call @func.257(%43, %41, %30)
+    call @func.199(%43, %41, %30)
     br bb26
 bb26:
-    call @func.234(%0, %43)
+    call @func.183(%0, %43)
     br bb27
 bb27:
     br bb29
 bb28(%31: u32):
-    call @func.257(%0, %41, %31)
+    call @func.199(%0, %41, %31)
     br bb32
 bb29:
     br bb30
@@ -112436,9 +111854,6 @@ bb32:
     br bb29
 bb33:
     unreachable
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.235) {
 }
 
 fn @Verifier____env___try_infer_type_quick_inner(functy.236) {
@@ -112569,7 +111984,7 @@ bb7:
     %146 = load ptr, ptr %42
     %147 = const i64 8
     %148 = gep i8, ptr %146, %147
-    call @func.132(%50, %148)
+    call @func.106(%50, %148)
     br bb15
 bb8(%10: ptr):
     %149 = load ptr, ptr %42
@@ -112578,7 +111993,7 @@ bb8(%10: ptr):
     %152 = load ptr, ptr %42
     %153 = const i64 48
     %154 = gep i8, ptr %152, %153
-    call @func.237(%0, %10, %151)
+    call @func.185(%0, %10, %151)
     br bb43
 bb9(%11: ptr):
     %155 = load ptr, ptr %42
@@ -112587,7 +112002,7 @@ bb9(%11: ptr):
     %158 = load i64, ptr %157
     store i64 %158, ptr %44
     %159 = load u64, ptr %44
-    call @func.154(%43, %11, %159)
+    call @func.122(%43, %11, %159)
     br bb10
 bb10:
     %160 = load i64, ptr %43
@@ -112670,7 +112085,7 @@ bb14:
     store i64 %216, ptr %215
     br bb43
 bb15:
-    call @func.226(%49, %50)
+    call @func.176(%49, %50)
     br bb16
 bb16:
     %217 = const i64 8
@@ -112764,7 +112179,7 @@ bb17:
     store i64 %286, ptr %285
     br bb43
 bb18(%12: ptr, %13: ptr, %14: ptr, %15: ptr):
-    call @func.217(%52, %12, %15, %13)
+    call @func.172(%52, %12, %15, %13)
     br bb19(%12, %13, %14)
 bb19(%16: ptr, %17: ptr, %18: ptr):
     %287 = load i64, ptr %52
@@ -112891,7 +112306,7 @@ bb21(%19: ptr, %20: ptr, %21: ptr):
     %384 = gep i8, ptr %51, %383
     %385 = load i64, ptr %382
     store i64 %385, ptr %384
-    call @func.47(%54, %19, %51, %20)
+    call @func.44(%54, %19, %51, %20)
     br bb22(%21)
 bb22(%22: ptr):
     store ptr %54, ptr %55
@@ -112957,7 +112372,7 @@ bb25(%24: ptr, %25: ptr):
     %438 = gep i8, ptr %436, %437
     br bb26(%25, %438)
 bb26(%26: ptr, %27: ptr):
-    call @func.135(%56, %26, %27)
+    call @func.109(%56, %26, %27)
     br bb27
 bb27:
     %439 = load i64, ptr %56
@@ -113022,7 +112437,7 @@ bb28:
 bb29:
     br bb43
 bb30(%28: ptr, %29: ptr, %30: ptr, %31: ptr, %32: ptr):
-    call @func.217(%58, %28, %32, %29)
+    call @func.172(%58, %28, %32, %29)
     br bb31(%30, %31)
 bb31(%33: ptr, %34: ptr):
     %485 = load i64, ptr %58
@@ -113159,7 +112574,7 @@ bb33(%35: ptr, %36: ptr):
     %590 = gep i8, ptr %61, %589
     %591 = load i8, ptr %588
     store i8 %591, ptr %590
-    %592 = call @func.235(%36)
+    %592 = call @func.27(%36)
     br bb34(%592)
 bb34(%37: ptr):
     call @func.20(%62, %37)
@@ -113284,16 +112699,16 @@ bb36:
     %686 = const bool false
     br bb43
 bb37:
-    call @func.214(%66)
+    call @func.169(%66)
     br bb40
 bb38:
-    call @func.213(%65)
+    call @func.168(%65)
     br bb39
 bb39:
-    call @func.233(%64, %65)
+    call @func.182(%64, %65)
     br bb41
 bb40:
-    call @func.233(%64, %66)
+    call @func.182(%64, %66)
     br bb41
 bb41:
     %687 = load i64, ptr %64
@@ -113354,7 +112769,7 @@ bb41:
     store i64 %732, ptr %731
     br bb43
 bb42(%38: ptr, %39: ptr, %40: ptr):
-    call @func.217(%0, %38, %40, %39)
+    call @func.172(%0, %38, %40, %39)
     br bb43
 bb43:
     ret
@@ -113366,7 +112781,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %6 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %7 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
     %8 = alloca (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64), align 8
-    call @func.156(%5, %1, %2)
+    call @func.123(%5, %1, %2)
     br bb1(%1)
 bb1(%3: ptr):
     %9 = load i64, ptr %5
@@ -113439,7 +112854,7 @@ bb4(%4: ptr):
     %60 = gep i8, ptr %6, %59
     %61 = load i64, ptr %58
     store i64 %61, ptr %60
-    call @func.258(%7, %4, %6)
+    call @func.200(%7, %4, %6)
     br bb5
 bb5:
     %62 = load i64, ptr %7
@@ -113589,15 +113004,12 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     call @func.13(%5)
     br bb1(%1, %2)
 bb1(%3: ptr, %4: ptr):
-    call @func.263(%0, %3, %4, %5)
+    call @func.201(%0, %3, %4, %5)
     br bb2
 bb2:
     br bb3
 bb3:
     ret
-}
-
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.239) {
 }
 
 fn @Expr__abstract_fvar_at(functy.240) {
@@ -113630,13 +113042,13 @@ bb0(%0: ptr, %1: ptr, %2: u64, %3: u32):
     %110 = const bool false
     %111 = const bool false
     %112 = load ptr, ptr %87
-    %113 = call @func.244(%112)
+    %113 = call @func.191(%112)
     br bb1(%3, %113)
 bb1(%4: u32, %5: bool):
     condbr %5, bb5(%4), bb2(%4)
 bb2(%6: u32):
     %114 = load ptr, ptr %87
-    %115 = call @func.203(%114)
+    %115 = call @func.161(%114)
     br bb3(%6, %115)
 bb3(%7: u32, %8: u32):
     %116 = icmp ult u32 %7, %8
@@ -113719,7 +113131,7 @@ bb8(%11: u32):
     %180 = const i64 48
     %181 = gep i8, ptr %179, %180
     %182 = const bool true
-    call @func.128(%102, %175)
+    call @func.102(%102, %175)
     br bb47(%11, %178, %181)
 bb9(%12: u32):
     %183 = load ptr, ptr %89
@@ -113736,7 +113148,7 @@ bb9(%12: u32):
     %194 = const i64 64
     %195 = gep i8, ptr %193, %194
     %196 = const bool true
-    call @func.128(%98, %183)
+    call @func.102(%98, %183)
     br bb38(%12, %186, %189, %192, %195)
 bb10(%13: u32):
     %197 = load ptr, ptr %89
@@ -113804,7 +113216,7 @@ bb14(%17: u32):
     %247 = load ptr, ptr %89
     %248 = const i64 8
     %249 = gep i8, ptr %247, %248
-    %250 = call @func.94(%249, %88)
+    %250 = call @func.78(%249, %88)
     br bb15(%17, %250)
 bb15(%18: u32, %19: bool):
     condbr %19, bb16(%18), bb17
@@ -113818,7 +113230,7 @@ bb17:
 bb18(%21: ptr):
     %252 = load u32, ptr %21
     %253 = const u32 1
-    %254 = call @func.239(%252, %253)
+    %254 = call @func.54(%252, %253)
     br bb19(%254)
 bb19(%22: u32):
     call @func.22(%0, %22)
@@ -113830,7 +113242,7 @@ bb20:
 bb21(%23: u32, %24: ptr, %25: ptr):
     %256 = const bool true
     %257 = load u64, ptr %88
-    call @func.240(%90, %25, %257, %23)
+    call @func.187(%90, %25, %257, %23)
     br bb22(%23, %24)
 bb22(%26: u32, %27: ptr):
     %258 = load ptr, ptr %27
@@ -113839,7 +113251,7 @@ bb22(%26: u32, %27: ptr):
     br bb23(%26, %260)
 bb23(%28: u32, %29: ptr):
     %261 = load u64, ptr %88
-    call @func.240(%91, %29, %261, %28)
+    call @func.187(%91, %29, %261, %28)
     br bb24
 bb24:
     %262 = const bool false
@@ -113851,7 +113263,7 @@ bb25:
 bb26(%30: u32, %31: ptr, %32: ptr):
     %264 = const bool true
     %265 = load u64, ptr %88
-    call @func.240(%93, %32, %265, %30)
+    call @func.187(%93, %32, %265, %30)
     br bb27(%30, %31)
 bb27(%33: u32, %34: ptr):
     %266 = load ptr, ptr %34
@@ -113860,15 +113272,15 @@ bb27(%33: u32, %34: ptr):
     br bb28(%33, %268)
 bb28(%35: u32, %36: ptr):
     %269 = const u32 1
-    %270 = call @func.239(%35, %269)
+    %270 = call @func.54(%35, %269)
     br bb29(%36, %270)
 bb29(%37: ptr, %38: u32):
     %271 = load u64, ptr %88
-    call @func.240(%94, %37, %271, %38)
+    call @func.187(%94, %37, %271, %38)
     br bb30
 bb30:
     %272 = const bool false
-    call @func.33(%0, %92, %93, %94)
+    call @func.31(%0, %92, %93, %94)
     br bb31
 bb31:
     %273 = const bool false
@@ -113876,7 +113288,7 @@ bb31:
 bb32(%39: u32, %40: ptr, %41: ptr):
     %274 = const bool true
     %275 = load u64, ptr %88
-    call @func.240(%96, %41, %275, %39)
+    call @func.187(%96, %41, %275, %39)
     br bb33(%39, %40)
 bb33(%42: u32, %43: ptr):
     %276 = load ptr, ptr %43
@@ -113885,11 +113297,11 @@ bb33(%42: u32, %43: ptr):
     br bb34(%42, %278)
 bb34(%44: u32, %45: ptr):
     %279 = const u32 1
-    %280 = call @func.239(%44, %279)
+    %280 = call @func.54(%44, %279)
     br bb35(%45, %280)
 bb35(%46: ptr, %47: u32):
     %281 = load u64, ptr %88
-    call @func.240(%97, %46, %281, %47)
+    call @func.187(%97, %46, %281, %47)
     br bb36
 bb36:
     %282 = const bool false
@@ -113905,7 +113317,7 @@ bb38(%48: u32, %49: ptr, %50: ptr, %51: ptr, %52: ptr):
     br bb39(%48, %50, %51, %52, %286)
 bb39(%53: u32, %54: ptr, %55: ptr, %56: ptr, %57: ptr):
     %287 = load u64, ptr %88
-    call @func.240(%99, %57, %287, %53)
+    call @func.187(%99, %57, %287, %53)
     br bb40(%53, %54, %55, %56)
 bb40(%58: u32, %59: ptr, %60: ptr, %61: ptr):
     %288 = const bool true
@@ -113915,7 +113327,7 @@ bb40(%58: u32, %59: ptr, %60: ptr, %61: ptr):
     br bb41(%58, %60, %61, %291)
 bb41(%62: u32, %63: ptr, %64: ptr, %65: ptr):
     %292 = load u64, ptr %88
-    call @func.240(%100, %65, %292, %62)
+    call @func.187(%100, %65, %292, %62)
     br bb42(%62, %63, %64)
 bb42(%66: u32, %67: ptr, %68: ptr):
     %293 = const bool true
@@ -113925,18 +113337,18 @@ bb42(%66: u32, %67: ptr, %68: ptr):
     br bb43(%66, %68, %296)
 bb43(%69: u32, %70: ptr, %71: ptr):
     %297 = const u32 1
-    %298 = call @func.239(%69, %297)
+    %298 = call @func.54(%69, %297)
     br bb44(%70, %71, %298)
 bb44(%72: ptr, %73: ptr, %74: u32):
     %299 = load u64, ptr %88
-    call @func.240(%101, %73, %299, %74)
+    call @func.187(%101, %73, %299, %74)
     br bb45(%72)
 bb45(%75: ptr):
     %300 = load bool, ptr %75
     %301 = const bool false
     %302 = const bool false
     %303 = const bool false
-    call @func.44(%0, %98, %99, %100, %101, %300)
+    call @func.42(%0, %98, %99, %100, %101, %300)
     br bb46
 bb46:
     %304 = const bool false
@@ -113951,21 +113363,21 @@ bb47(%76: u32, %77: ptr, %78: ptr):
     br bb48(%76, %307, %310)
 bb48(%79: u32, %80: u32, %81: ptr):
     %311 = load u64, ptr %88
-    call @func.240(%103, %81, %311, %79)
+    call @func.187(%103, %81, %311, %79)
     br bb49(%80)
 bb49(%82: u32):
     %312 = const bool false
-    call @func.206(%0, %102, %82, %103)
+    call @func.163(%0, %102, %82, %103)
     br bb50
 bb50:
     %313 = const bool false
     br bb53
 bb51(%83: u32, %84: u32, %85: ptr):
     %314 = load u64, ptr %88
-    call @func.240(%104, %85, %314, %83)
+    call @func.187(%104, %85, %314, %83)
     br bb52(%84)
 bb52(%86: u32):
-    call @func.245(%0, %86, %104)
+    call @func.192(%0, %86, %104)
     br bb53
 bb53:
     ret
@@ -114023,7 +113435,7 @@ bb5:
     %45 = const bool false
     br bb12(%45)
 bb6(%1: ptr, %2: ptr):
-    %46 = call @func.241(%2)
+    %46 = call @func.188(%2)
     br bb7(%1, %46)
 bb7(%3: ptr, %4: bool):
     condbr %4, bb8, bb9(%3)
@@ -114036,10 +113448,10 @@ bb9(%5: ptr):
     %50 = gep i8, ptr %48, %49
     br bb10(%50)
 bb10(%6: ptr):
-    %51 = call @func.241(%6)
+    %51 = call @func.188(%6)
     br bb12(%51)
 bb11(%7: ptr):
-    %52 = call @func.241(%7)
+    %52 = call @func.188(%7)
     br bb12(%52)
 bb12(%8: bool):
     ret %8
@@ -114055,7 +113467,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     %26 = const bool false
     %27 = const bool true
     %28 = const bool true
-    %29 = call @func.149(%1, %2)
+    %29 = call @func.119(%1, %2)
     br bb1(%29, %28, %27)
 bb1(%3: bool, %4: bool, %5: bool):
     condbr %3, bb2(%4), bb3(%4, %5)
@@ -114089,7 +113501,7 @@ bb2(%6: bool):
     store i64 %51, ptr %50
     br bb15(%6, %30)
 bb3(%7: bool, %8: bool):
-    %52 = call @func.215(%1)
+    %52 = call @func.170(%1)
     br bb4(%52, %7, %8)
 bb4(%9: bool, %10: bool, %11: bool):
     condbr %9, bb5(%11), bb6(%10)
@@ -114123,7 +113535,7 @@ bb5(%12: bool):
     store i64 %74, ptr %73
     br bb15(%53, %12)
 bb6(%13: bool):
-    %75 = call @func.215(%2)
+    %75 = call @func.170(%2)
     br bb7(%75, %13)
 bb7(%14: bool, %15: bool):
     condbr %14, bb8(%15), bb9
@@ -114184,7 +113596,7 @@ bb9:
     %118 = gep i8, ptr %22, %117
     %119 = load i64, ptr %116
     store i64 %119, ptr %118
-    call @func.49(%21, %22)
+    call @func.46(%21, %22)
     br bb10
 bb10:
     %120 = const bool false
@@ -114214,7 +113626,7 @@ bb10:
     %140 = gep i8, ptr %24, %139
     %141 = load i64, ptr %138
     store i64 %141, ptr %140
-    call @func.49(%23, %24)
+    call @func.46(%23, %24)
     br bb11
 bb11:
     %142 = load ptr, ptr %21
@@ -114255,7 +113667,7 @@ bb0(%0: ptr):
     %5 = load i64, ptr %4
     store i64 %5, ptr %2
     %6 = load u64, ptr %2
-    %7 = call @func.122(%6)
+    %7 = call @func.97(%6)
     br bb1(%7)
 bb1(%1: bool):
     ret %1
@@ -114349,9 +113761,6 @@ bb2:
     ret
 }
 
-fn @_RNvMs6_NtCs2EYQwhfuABO_4core3numm14saturating_add(functy.246) {
-}
-
 fn @Level__get_offset(functy.247) {
 bb0(%0: ptr, %1: ptr):
     %9 = alloca i64, align 8
@@ -114384,7 +113793,7 @@ bb2(%3: u32):
     %31 = const i64 8
     %32 = gep i8, ptr %30, %31
     %33 = const u32 1
-    %34 = call @func.246(%3, %33)
+    %34 = call @func.54(%3, %33)
     br bb3(%32, %34)
 bb3(%4: ptr, %5: u32):
     %35 = load ptr, ptr %4
@@ -114403,22 +113812,10 @@ bb5(%8: u32):
     ret
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.248) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.249) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.250) {
-}
-
 fn @_RNvXs8_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref8DerefMut9deref_mutBH_(functy.251) {
 }
 
 fn @_RNvMNtCs2EYQwhfuABO_4core5sliceSNtCsep0XPuQfTSm_25clean_binding_defeq_slice5Level4swapBw_(functy.252) {
-}
-
-fn @_RNvXs7_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefBH_(functy.253) {
 }
 
 fn @_RNvXsd_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index8IndexMutjE9index_mutBH_(functy.254) {
@@ -114446,31 +113843,31 @@ bb0(%0: ptr, %1: ptr, %2: u32):
     %115 = alloca (i64, i64), align 8
     %116 = alloca (i64, i64), align 8
     %117 = const bool false
-    call @func.248(%101)
+    call @func.181(%101)
     br bb1(%1, %2)
 bb1(%3: ptr, %4: u32):
-    call @func.267(%3, %101)
+    call @func.205(%3, %101)
     br bb2(%4)
 bb2(%5: u32):
-    call @func.248(%102)
+    call @func.181(%102)
     br bb3(%5)
 bb3(%6: u32):
     %118 = const u64 0
     br bb4(%6, %118)
 bb4(%7: u32, %8: u64):
-    %119 = call @func.249(%101)
+    %119 = call @func.55(%101)
     br bb5(%7, %8, %8, %119)
 bb5(%9: u32, %10: u64, %11: u64, %12: u64):
     %120 = icmp ult u64 %11, %12
     condbr %120, bb6(%9, %10), bb11(%9)
 bb6(%13: u32, %14: u64):
-    %121 = call @func.250(%101, %14)
+    %121 = call @func.56(%101, %14)
     br bb7(%13, %14, %121)
 bb7(%15: u32, %16: u64, %17: ptr):
-    call @func.234(%103, %17)
+    call @func.183(%103, %17)
     br bb8(%15, %16)
 bb8(%18: u32, %19: u64):
-    call @func.267(%103, %102)
+    call @func.205(%103, %102)
     br bb9(%18, %19)
 bb9(%20: u32, %21: u64):
     %122 = const u64 1
@@ -114492,7 +113889,7 @@ bb11(%23: u32):
     %133 = const u64 1
     br bb12(%23, %133)
 bb12(%24: u32, %25: u64):
-    %134 = call @func.249(%102)
+    %134 = call @func.55(%102)
     br bb13(%24, %25, %25, %134)
 bb13(%26: u32, %27: u64, %28: u64, %29: u64):
     %135 = icmp ult u64 %28, %29
@@ -114504,7 +113901,7 @@ bb15(%32: u32, %33: u64, %34: u64):
     %137 = icmp ugt u64 %34, %136
     condbr %137, bb16(%32, %33, %34), bb26(%32, %33)
 bb16(%35: u32, %36: u64, %37: u64):
-    %138 = call @func.250(%102, %37)
+    %138 = call @func.56(%102, %37)
     br bb17(%35, %36, %37, %138)
 bb17(%38: u32, %39: u64, %40: u64, %41: ptr):
     %139 = const u64 1
@@ -114521,15 +113918,15 @@ bb17(%38: u32, %39: u64, %40: u64, %41: ptr):
     condbr %148, bb18(%38, %39, %40, %41, %102), bb53
 bb18(%42: u32, %43: u64, %44: u64, %45: ptr, %46: ptr):
     %149 = load u64, ptr %105
-    %150 = call @func.250(%46, %149)
+    %150 = call @func.56(%46, %149)
     br bb19(%42, %43, %44, %45, %150)
 bb19(%47: u32, %48: u64, %49: u64, %50: ptr, %51: ptr):
-    %151 = call @func.271(%50, %51)
+    %151 = call @func.208(%50, %51)
     br bb20(%47, %48, %49, %151)
 bb20(%52: u32, %53: u64, %54: u64, %55: bool):
     condbr %55, bb21(%52, %53, %54), bb26(%52, %53)
 bb21(%56: u32, %57: u64, %58: u64):
-    call @func.251(%106, %102)
+    call @func.194(%106, %102)
     br bb22(%56, %57, %58)
 bb22(%59: u32, %60: u64, %61: u64):
     %152 = const u64 1
@@ -114546,7 +113943,7 @@ bb22(%59: u32, %60: u64, %61: u64):
     condbr %161, bb23(%59, %60, %61, %61), bb53
 bb23(%62: u32, %63: u64, %64: u64, %65: u64):
     %162 = load u64, ptr %107
-    call @func.252(%106, %65, %162)
+    call @func.195(%106, %65, %162)
     br bb24(%62, %63, %64)
 bb24(%66: u32, %67: u64, %68: u64):
     %163 = const u64 1
@@ -114581,16 +113978,16 @@ bb27(%73: u32):
     %184 = load u64, ptr %109
     br bb12(%73, %184)
 bb28(%74: u32):
-    call @func.253(%111, %102)
+    call @func.39(%111, %102)
     br bb29(%74)
 bb29(%75: u32):
-    call @func.276(%110, %111)
+    call @func.210(%110, %111)
     br bb30(%75)
 bb30(%76: u32):
-    call @func.253(%113, %110)
+    call @func.39(%113, %110)
     br bb31(%76)
 bb31(%77: u32):
-    call @func.282(%112, %113)
+    call @func.212(%112, %113)
     br bb32(%77)
 bb32(%78: u32):
     %185 = const u32 0
@@ -114600,20 +113997,20 @@ bb33(%79: u32):
     %187 = const u64 0
     br bb34(%79, %187)
 bb34(%80: u32, %81: u64):
-    %188 = call @func.249(%112)
+    %188 = call @func.55(%112)
     br bb35(%80, %81, %81, %188)
 bb35(%82: u32, %83: u64, %84: u64, %85: u64):
     %189 = icmp ult u64 %84, %85
     condbr %189, bb36(%82, %83), bb42
 bb36(%86: u32, %87: u64):
-    %190 = call @func.250(%112, %87)
+    %190 = call @func.56(%112, %87)
     br bb37(%86, %87, %190)
 bb37(%88: u32, %89: u64, %90: ptr):
-    call @func.257(%114, %90, %88)
+    call @func.199(%114, %90, %88)
     br bb38(%88, %89)
 bb38(%91: u32, %92: u64):
     %191 = const bool true
-    %192 = call @func.254(%112, %92)
+    %192 = call @func.196(%112, %92)
     br bb39(%91, %92, %192)
 bb39(%93: u32, %94: u64, %95: ptr):
     br bb40(%93, %94, %95)
@@ -114662,7 +114059,7 @@ bb41(%99: u32):
     %226 = load u64, ptr %115
     br bb34(%99, %226)
 bb42:
-    %227 = call @func.255(%112)
+    %227 = call @func.197(%112)
     br bb43(%227)
 bb43(%100: bool):
     condbr %100, bb44, bb45
@@ -114671,10 +114068,10 @@ bb44:
     store i64 %228, ptr %0
     br bb47
 bb45:
-    call @func.253(%116, %112)
+    call @func.39(%116, %112)
     br bb46
 bb46:
-    call @func.283(%0, %116)
+    call @func.213(%0, %116)
     br bb52
 bb47:
     br bb48
@@ -114700,7 +114097,7 @@ bb0(%0: ptr, %1: ptr, %2: u32):
     %14 = alloca (i32, i32), align 4
     %15 = const bool false
     %16 = const bool true
-    call @func.132(%11, %1)
+    call @func.106(%11, %1)
     br bb1(%2)
 bb1(%3: u32):
     %17 = const u32 0
@@ -114736,7 +114133,7 @@ bb3(%6: u32, %7: u32):
     %39 = gep i8, ptr %13, %38
     %40 = load i64, ptr %37
     store i64 %40, ptr %39
-    call @func.226(%12, %13)
+    call @func.176(%12, %13)
     br bb4(%6, %7)
 bb4(%8: u32, %9: u32):
     %41 = const bool true
@@ -114821,24 +114218,12 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     call @func.13(%5)
     br bb1(%1, %2)
 bb1(%3: ptr, %4: ptr):
-    call @func.288(%0, %3, %4, %5)
+    call @func.214(%0, %3, %4, %5)
     br bb2
 bb2:
     br bb3
 bb3:
     ret
-}
-
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.259) {
-}
-
-fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.260) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.261) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.262) {
 }
 
 fn @Verifier____env___infer_type_core_blind(functy.263) {
@@ -115151,13 +114536,13 @@ bb8(%9: ptr):
     %663 = load ptr, ptr %386
     %664 = const i64 48
     %665 = gep i8, ptr %663, %664
-    call @func.225(%397, %9, %662)
+    call @func.175(%397, %9, %662)
     br bb20(%662)
 bb9:
     %666 = load ptr, ptr %386
     %667 = const i64 8
     %668 = gep i8, ptr %666, %667
-    call @func.132(%396, %668)
+    call @func.106(%396, %668)
     br bb17
 bb10:
     %669 = load ptr, ptr %386
@@ -115167,7 +114552,7 @@ bb10:
     %673 = load i64, ptr %671
     store i64 %673, ptr %389
     %674 = load u64, ptr %389
-    call @func.154(%388, %672, %674)
+    call @func.122(%388, %672, %674)
     br bb12(%671)
 bb11:
     %675 = load ptr, ptr %386
@@ -115327,7 +114712,7 @@ bb16:
     store i64 %790, ptr %789
     br bb180
 bb17:
-    call @func.226(%395, %396)
+    call @func.176(%395, %396)
     br bb18
 bb18:
     call @func.10(%394, %395)
@@ -115399,7 +114784,7 @@ bb20(%12: ptr):
     %842 = select i64 %839, %840, %841
     switch %842 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.128(%400, %13)
+    call @func.102(%400, %13)
     br bb23
 bb22:
     %843 = load i64, ptr %397
@@ -115575,10 +114960,10 @@ bb23:
     br bb180
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %980 = load ptr, ptr %385
-    call @func.263(%403, %14, %16, %980)
+    call @func.201(%403, %14, %16, %980)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.259(%402, %403)
+    call @func.165(%402, %403)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %981 = load i64, ptr %402
@@ -115703,7 +115088,7 @@ bb27(%21: ptr, %22: ptr):
     %1079 = load i64, ptr %1076
     store i64 %1079, ptr %1078
     %1080 = load ptr, ptr %385
-    call @func.47(%406, %21, %401, %1080)
+    call @func.44(%406, %21, %401, %1080)
     br bb30(%21, %22, %1033)
 bb28:
     %1081 = const i64 8
@@ -115734,7 +115119,7 @@ bb28:
     %1102 = gep i8, ptr %404, %1101
     %1103 = load i64, ptr %1100
     store i64 %1103, ptr %1102
-    call @func.260(%0, %404)
+    call @func.166(%0, %404)
     br bb29
 bb29:
     %1104 = const bool false
@@ -115924,10 +115309,10 @@ bb32(%26: ptr, %27: ptr, %28: bool):
     br bb33(%26, %27, %1251, %1254, %1257, %28)
 bb33(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr, %34: bool):
     %1258 = load ptr, ptr %385
-    call @func.263(%410, %29, %33, %1258)
+    call @func.201(%410, %29, %33, %1258)
     br bb34(%29, %30, %31, %32, %34)
 bb34(%35: ptr, %36: ptr, %37: ptr, %38: ptr, %39: bool):
-    call @func.259(%409, %410)
+    call @func.165(%409, %410)
     br bb35(%35, %36, %37, %38, %39)
 bb35(%40: ptr, %41: ptr, %42: ptr, %43: ptr, %44: bool):
     %1259 = load i64, ptr %409
@@ -116084,7 +115469,7 @@ bb37:
     %1382 = gep i8, ptr %411, %1381
     %1383 = load i64, ptr %1380
     store i64 %1383, ptr %1382
-    call @func.260(%0, %411)
+    call @func.166(%0, %411)
     br bb187
 bb38(%50: ptr, %51: ptr, %52: ptr, %53: ptr, %54: ptr, %55: ptr, %56: bool):
     %1384 = load ptr, ptr %385
@@ -116098,7 +115483,7 @@ bb40(%62: ptr, %63: ptr, %64: bool):
     %1388 = gep i8, ptr %1386, %1387
     br bb46(%62, %1388, %64)
 bb41(%65: ptr):
-    %1389 = call @func.261(%65)
+    %1389 = call @func.27(%65)
     br bb42(%1389)
 bb42(%66: ptr):
     call @func.20(%415, %66)
@@ -116346,7 +115731,7 @@ bb46(%67: ptr, %68: ptr, %69: bool):
     %1578 = gep i8, ptr %1576, %1577
     br bb47(%68, %1578, %69)
 bb47(%70: ptr, %71: ptr, %72: bool):
-    call @func.135(%418, %70, %71)
+    call @func.109(%418, %70, %71)
     br bb48(%72)
 bb48(%73: bool):
     %1579 = load i64, ptr %418
@@ -116456,10 +115841,10 @@ bb53:
     br bb180
 bb54(%78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr):
     %1655 = load ptr, ptr %385
-    call @func.263(%424, %78, %82, %1655)
+    call @func.201(%424, %78, %82, %1655)
     br bb55(%78, %79, %80, %81)
 bb55(%83: ptr, %84: ptr, %85: ptr, %86: ptr):
-    call @func.259(%423, %424)
+    call @func.165(%423, %424)
     br bb56(%83, %84, %85, %86)
 bb56(%87: ptr, %88: ptr, %89: ptr, %90: ptr):
     %1656 = load i64, ptr %423
@@ -116584,7 +115969,7 @@ bb57(%91: ptr, %92: ptr, %93: ptr, %94: ptr):
     %1754 = load i64, ptr %1751
     store i64 %1754, ptr %1753
     %1755 = load ptr, ptr %385
-    call @func.47(%427, %91, %422, %1755)
+    call @func.44(%427, %91, %422, %1755)
     br bb59(%91, %92, %93, %94, %1708)
 bb58:
     %1756 = const i64 8
@@ -116615,7 +116000,7 @@ bb58:
     %1777 = gep i8, ptr %425, %1776
     %1778 = load i64, ptr %1775
     store i64 %1778, ptr %1777
-    call @func.260(%0, %425)
+    call @func.166(%0, %425)
     br bb176
 bb59(%95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: bool):
     %1779 = load i64, ptr %427
@@ -116788,7 +116173,7 @@ bb60:
     store ptr %1869, ptr %429
     br bb62(%1821)
 bb61(%100: ptr, %101: ptr, %102: ptr, %103: ptr, %104: bool):
-    call @func.50(%432)
+    call @func.47(%432)
     br bb63(%100, %101, %102, %103, %104)
 bb62(%105: bool):
     %1922 = load ptr, ptr %429
@@ -116830,7 +116215,7 @@ bb62(%105: bool):
     br bb174(%105)
 bb63(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: bool):
     %1950 = const bool true
-    %1951 = call @func.261(%108)
+    %1951 = call @func.27(%108)
     br bb64(%106, %107, %108, %109, %1951, %110)
 bb64(%111: ptr, %112: ptr, %113: ptr, %114: ptr, %115: ptr, %116: bool):
     call @func.20(%433, %115)
@@ -116856,16 +116241,16 @@ bb66(%122: ptr, %123: ptr, %124: ptr, %125: ptr, %126: bool):
     br bb67(%122, %123, %124, %1963, %126)
 bb67(%127: ptr, %128: ptr, %129: ptr, %130: ptr, %131: bool):
     %1964 = load u64, ptr %431
-    call @func.73(%435, %127, %130, %1964)
+    call @func.66(%435, %127, %130, %1964)
     br bb68(%127, %128, %129, %131)
 bb68(%132: ptr, %133: ptr, %134: ptr, %135: bool):
     %1965 = load ptr, ptr %385
-    call @func.263(%436, %132, %435, %1965)
+    call @func.201(%436, %132, %435, %1965)
     br bb69(%133, %134, %135)
 bb69(%136: ptr, %137: ptr, %138: bool):
     %1966 = const bool true
     %1967 = load ptr, ptr %385
-    call @func.228(%1967)
+    call @func.177(%1967)
     br bb70(%136, %137, %138)
 bb70(%139: ptr, %140: ptr, %141: bool):
     %1968 = const bool false
@@ -116925,7 +116310,7 @@ bb70(%139: ptr, %140: ptr, %141: bool):
     %2013 = gep i8, ptr %439, %2012
     %2014 = load i64, ptr %2011
     store i64 %2014, ptr %2013
-    call @func.259(%438, %439)
+    call @func.165(%438, %439)
     br bb71(%139, %140, %141)
 bb71(%142: ptr, %143: ptr, %144: bool):
     %2015 = load i64, ptr %438
@@ -117049,7 +116434,7 @@ bb72(%145: ptr, %146: ptr):
     %2112 = load i64, ptr %2109
     store i64 %2112, ptr %2111
     %2113 = load u64, ptr %431
-    call @func.229(%442, %437, %2113)
+    call @func.178(%442, %437, %2113)
     br bb75(%145, %146)
 bb73(%147: bool):
     %2114 = const i64 8
@@ -117080,7 +116465,7 @@ bb73(%147: bool):
     %2135 = gep i8, ptr %440, %2134
     %2136 = load i64, ptr %2133
     store i64 %2136, ptr %2135
-    call @func.260(%0, %440)
+    call @func.166(%0, %440)
     br bb74(%147)
 bb74(%148: bool):
     %2137 = const bool false
@@ -117095,7 +116480,7 @@ bb75(%149: ptr, %150: ptr):
     %2143 = gep i8, ptr %445, %2142
     %2144 = load i8, ptr %2141
     store i8 %2144, ptr %2143
-    call @func.262(%446, %150)
+    call @func.26(%446, %150)
     br bb76
 bb76:
     %2145 = const bool false
@@ -117317,10 +116702,10 @@ bb82:
     br bb180
 bb83(%151: ptr, %152: ptr, %153: ptr, %154: ptr, %155: ptr):
     %2310 = load ptr, ptr %385
-    call @func.263(%451, %151, %155, %2310)
+    call @func.201(%451, %151, %155, %2310)
     br bb84(%151, %152, %153, %154)
 bb84(%156: ptr, %157: ptr, %158: ptr, %159: ptr):
-    call @func.259(%450, %451)
+    call @func.165(%450, %451)
     br bb85(%156, %157, %158, %159)
 bb85(%160: ptr, %161: ptr, %162: ptr, %163: ptr):
     %2311 = load i64, ptr %450
@@ -117445,7 +116830,7 @@ bb86(%164: ptr, %165: ptr, %166: ptr, %167: ptr):
     %2409 = load i64, ptr %2406
     store i64 %2409, ptr %2408
     %2410 = load ptr, ptr %385
-    call @func.47(%454, %164, %449, %2410)
+    call @func.44(%454, %164, %449, %2410)
     br bb88(%164, %165, %166, %167, %2363)
 bb87:
     %2411 = const i64 8
@@ -117476,7 +116861,7 @@ bb87:
     %2432 = gep i8, ptr %452, %2431
     %2433 = load i64, ptr %2430
     store i64 %2433, ptr %2432
-    call @func.260(%0, %452)
+    call @func.166(%0, %452)
     br bb173
 bb88(%168: ptr, %169: ptr, %170: ptr, %171: ptr, %172: bool):
     store ptr %454, ptr %456
@@ -117654,11 +117039,11 @@ bb90(%173: ptr, %174: ptr, %175: ptr, %176: ptr, %177: bool):
     %2578 = load ptr, ptr %456
     %2579 = const i64 8
     %2580 = gep i8, ptr %2578, %2579
-    call @func.132(%455, %2580)
+    call @func.106(%455, %2580)
     br bb91(%173, %174, %175, %176, %177)
 bb91(%178: ptr, %179: ptr, %180: ptr, %181: ptr, %182: bool):
     %2581 = const bool true
-    call @func.50(%461)
+    call @func.47(%461)
     br bb93(%178, %179, %180, %181, %182)
 bb92(%183: bool):
     %2582 = load ptr, ptr %458
@@ -117700,7 +117085,7 @@ bb92(%183: bool):
     br bb171(%183)
 bb93(%184: ptr, %185: ptr, %186: ptr, %187: ptr, %188: bool):
     %2610 = const bool true
-    %2611 = call @func.261(%186)
+    %2611 = call @func.27(%186)
     br bb94(%184, %185, %187, %2611, %188)
 bb94(%189: ptr, %190: ptr, %191: ptr, %192: ptr, %193: bool):
     call @func.20(%462, %192)
@@ -117726,16 +117111,16 @@ bb96(%198: ptr, %199: ptr, %200: bool):
     br bb97(%198, %2623, %200)
 bb97(%201: ptr, %202: ptr, %203: bool):
     %2624 = load u64, ptr %460
-    call @func.73(%464, %201, %202, %2624)
+    call @func.66(%464, %201, %202, %2624)
     br bb98(%201, %203)
 bb98(%204: ptr, %205: bool):
     %2625 = load ptr, ptr %385
-    call @func.263(%465, %204, %464, %2625)
+    call @func.201(%465, %204, %464, %2625)
     br bb99(%204, %205)
 bb99(%206: ptr, %207: bool):
     %2626 = const bool true
     %2627 = load ptr, ptr %385
-    call @func.228(%2627)
+    call @func.177(%2627)
     br bb100(%206, %207)
 bb100(%208: ptr, %209: bool):
     %2628 = const bool false
@@ -117795,7 +117180,7 @@ bb100(%208: ptr, %209: bool):
     %2673 = gep i8, ptr %468, %2672
     %2674 = load i64, ptr %2671
     store i64 %2674, ptr %2673
-    call @func.259(%467, %468)
+    call @func.165(%467, %468)
     br bb101(%208, %209)
 bb101(%210: ptr, %211: bool):
     %2675 = load i64, ptr %467
@@ -117920,7 +117305,7 @@ bb102(%212: ptr, %213: bool):
     %2773 = load i64, ptr %2770
     store i64 %2773, ptr %2772
     %2774 = load ptr, ptr %385
-    call @func.47(%471, %212, %466, %2774)
+    call @func.44(%471, %212, %466, %2774)
     br bb104(%213)
 bb103(%214: bool):
     %2775 = const i64 8
@@ -117951,7 +117336,7 @@ bb103(%214: bool):
     %2796 = gep i8, ptr %469, %2795
     %2797 = load i64, ptr %2794
     store i64 %2797, ptr %2796
-    call @func.260(%0, %469)
+    call @func.166(%0, %469)
     br bb188(%214)
 bb104(%215: bool):
     store ptr %471, ptr %473
@@ -118129,7 +117514,7 @@ bb106:
     %2942 = load ptr, ptr %473
     %2943 = const i64 8
     %2944 = gep i8, ptr %2942, %2943
-    call @func.132(%472, %2944)
+    call @func.106(%472, %2944)
     br bb107
 bb107:
     %2945 = const bool false
@@ -118159,7 +117544,7 @@ bb107:
     %2965 = gep i8, ptr %479, %2964
     %2966 = load i64, ptr %2963
     store i64 %2966, ptr %2965
-    call @func.230(%478, %479, %472)
+    call @func.179(%478, %479, %472)
     br bb109
 bb108(%217: bool):
     %2967 = load ptr, ptr %475
@@ -118276,10 +117661,10 @@ bb115:
     br bb180
 bb116(%218: ptr, %219: ptr, %220: ptr, %221: ptr, %222: ptr, %223: ptr):
     %3045 = load ptr, ptr %385
-    call @func.263(%482, %218, %223, %3045)
+    call @func.201(%482, %218, %223, %3045)
     br bb117(%218, %219, %220, %221, %222)
 bb117(%224: ptr, %225: ptr, %226: ptr, %227: ptr, %228: ptr):
-    call @func.259(%481, %482)
+    call @func.165(%481, %482)
     br bb118(%224, %225, %226, %227, %228)
 bb118(%229: ptr, %230: ptr, %231: ptr, %232: ptr, %233: ptr):
     %3046 = load i64, ptr %481
@@ -118404,7 +117789,7 @@ bb119(%234: ptr, %235: ptr, %236: ptr, %237: ptr, %238: ptr):
     %3144 = load i64, ptr %3141
     store i64 %3144, ptr %3143
     %3145 = load ptr, ptr %385
-    call @func.47(%485, %234, %480, %3145)
+    call @func.44(%485, %234, %480, %3145)
     br bb121(%234, %235, %236, %237, %238, %3098)
 bb120:
     %3146 = const i64 8
@@ -118435,7 +117820,7 @@ bb120:
     %3167 = gep i8, ptr %483, %3166
     %3168 = load i64, ptr %3165
     store i64 %3168, ptr %3167
-    call @func.260(%0, %483)
+    call @func.166(%0, %483)
     br bb168
 bb121(%239: ptr, %240: ptr, %241: ptr, %242: ptr, %243: ptr, %244: bool):
     %3169 = load i64, ptr %485
@@ -118652,10 +118037,10 @@ bb124(%251: bool):
     br bb166(%251)
 bb125(%252: ptr, %253: ptr, %254: ptr, %255: ptr, %256: ptr, %257: ptr, %258: bool):
     %3343 = load ptr, ptr %385
-    call @func.263(%491, %252, %257, %3343)
+    call @func.201(%491, %252, %257, %3343)
     br bb126(%252, %253, %254, %255, %256, %258)
 bb126(%259: ptr, %260: ptr, %261: ptr, %262: ptr, %263: ptr, %264: bool):
-    call @func.259(%490, %491)
+    call @func.165(%490, %491)
     br bb127(%259, %260, %261, %262, %263, %264)
 bb127(%265: ptr, %266: ptr, %267: ptr, %268: ptr, %269: ptr, %270: bool):
     %3344 = load i64, ptr %490
@@ -118812,7 +118197,7 @@ bb129(%277: bool):
     %3467 = gep i8, ptr %492, %3466
     %3468 = load i64, ptr %3465
     store i64 %3468, ptr %3467
-    call @func.260(%0, %492)
+    call @func.166(%0, %492)
     br bb189(%277)
 bb130(%278: ptr, %279: ptr, %280: ptr, %281: ptr, %282: ptr, %283: ptr, %284: ptr, %285: bool, %286: bool):
     %3469 = load ptr, ptr %385
@@ -118821,10 +118206,10 @@ bb130(%278: ptr, %279: ptr, %280: ptr, %281: ptr, %282: ptr, %283: ptr, %284: pt
 bb131(%287: ptr, %288: ptr, %289: ptr, %290: ptr, %291: ptr, %292: bool, %293: bool, %294: bool):
     condbr %292, bb132(%287, %288, %289, %290, %291, %293, %294), bb133(%289, %294)
 bb132(%295: ptr, %296: ptr, %297: ptr, %298: ptr, %299: ptr, %300: bool, %301: bool):
-    call @func.128(%500, %296)
+    call @func.102(%500, %296)
     br bb138(%295, %297, %298, %299, %300, %301)
 bb133(%302: ptr, %303: bool):
-    %3471 = call @func.261(%302)
+    %3471 = call @func.27(%302)
     br bb134(%3471, %303)
 bb134(%304: ptr, %305: bool):
     call @func.20(%496, %304)
@@ -119068,14 +118453,14 @@ bb137(%308: bool, %309: bool):
     br bb183(%308, %309)
 bb138(%310: ptr, %311: ptr, %312: ptr, %313: ptr, %314: bool, %315: bool):
     %3658 = const bool true
-    %3659 = call @func.261(%311)
+    %3659 = call @func.27(%311)
     br bb139(%310, %312, %313, %3659, %314, %315)
 bb139(%316: ptr, %317: ptr, %318: ptr, %319: ptr, %320: bool, %321: bool):
     call @func.20(%501, %319)
     br bb140(%316, %317, %318, %320, %321)
 bb140(%322: ptr, %323: ptr, %324: ptr, %325: bool, %326: bool):
     %3660 = const bool true
-    %3661 = call @func.261(%323)
+    %3661 = call @func.27(%323)
     br bb141(%322, %323, %324, %3661, %325, %326)
 bb141(%327: ptr, %328: ptr, %329: ptr, %330: ptr, %331: bool, %332: bool):
     call @func.20(%502, %330)
@@ -119084,7 +118469,7 @@ bb142(%333: ptr, %334: ptr, %335: ptr, %336: bool, %337: bool):
     %3662 = const bool false
     %3663 = const bool false
     %3664 = load ptr, ptr %385
-    call @func.46(%499, %3664, %500, %501, %502)
+    call @func.43(%499, %3664, %500, %501, %502)
     br bb143(%333, %334, %335, %336, %337)
 bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     %3665 = const bool false
@@ -119095,16 +118480,16 @@ bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     br bb144(%338, %339, %3669, %341, %342)
 bb144(%343: ptr, %344: ptr, %345: ptr, %346: bool, %347: bool):
     %3670 = load u64, ptr %499
-    call @func.73(%503, %343, %345, %3670)
+    call @func.66(%503, %343, %345, %3670)
     br bb145(%343, %344, %346, %347)
 bb145(%348: ptr, %349: ptr, %350: bool, %351: bool):
     %3671 = load ptr, ptr %385
-    call @func.263(%504, %348, %503, %3671)
+    call @func.201(%504, %348, %503, %3671)
     br bb146(%349, %350, %351)
 bb146(%352: ptr, %353: bool, %354: bool):
     %3672 = const bool true
     %3673 = load ptr, ptr %385
-    call @func.228(%3673)
+    call @func.177(%3673)
     br bb147(%352, %353, %354)
 bb147(%355: ptr, %356: bool, %357: bool):
     %3674 = const bool false
@@ -119164,7 +118549,7 @@ bb147(%355: ptr, %356: bool, %357: bool):
     %3719 = gep i8, ptr %507, %3718
     %3720 = load i64, ptr %3717
     store i64 %3720, ptr %3719
-    call @func.259(%506, %507)
+    call @func.165(%506, %507)
     br bb148(%355, %356, %357)
 bb148(%358: ptr, %359: bool, %360: bool):
     %3721 = load i64, ptr %506
@@ -119320,14 +118705,14 @@ bb150(%362: bool, %363: bool):
     %3843 = gep i8, ptr %508, %3842
     %3844 = load i64, ptr %3841
     store i64 %3844, ptr %3843
-    call @func.260(%0, %508)
+    call @func.166(%0, %508)
     br bb151(%362, %363)
 bb151(%364: bool, %365: bool):
     %3845 = const bool false
     br bb183(%364, %365)
 bb152(%366: ptr, %367: ptr):
     %3846 = load u64, ptr %499
-    call @func.231(%510, %366, %3846, %367)
+    call @func.180(%510, %366, %3846, %367)
     br bb153
 bb153:
     %3847 = load i64, ptr %510
@@ -119401,16 +118786,16 @@ bb158:
     %3895 = const bool false
     br bb180
 bb159:
-    call @func.214(%513)
+    call @func.169(%513)
     br bb162
 bb160:
-    call @func.213(%512)
+    call @func.168(%512)
     br bb161
 bb161:
-    call @func.233(%511, %512)
+    call @func.182(%511, %512)
     br bb163
 bb162:
-    call @func.233(%511, %513)
+    call @func.182(%511, %513)
     br bb163
 bb163:
     %3896 = load i64, ptr %511
@@ -119472,7 +118857,7 @@ bb163:
     br bb180
 bb164(%368: ptr, %369: ptr):
     %3942 = load ptr, ptr %385
-    call @func.263(%0, %368, %369, %3942)
+    call @func.201(%0, %368, %369, %3942)
     br bb180
 bb165(%370: bool):
     %3943 = const bool false
@@ -119566,7 +118951,7 @@ bb1(%2: ptr, %3: ptr):
     %41 = icmp eq u64 %39, %40
     condbr %41, bb13(%2, %3, %34), bb18
 bb2(%4: ptr):
-    call @func.264(%29, %27)
+    call @func.202(%29, %27)
     br bb3(%4)
 bb3(%5: ptr):
     %42 = load i64, ptr %29
@@ -119601,7 +118986,7 @@ bb4(%6: ptr):
     switch %67 [ 2: bb6(%6) default: bb5(%6) ]
 bb5(%7: ptr):
     %68 = load ptr, ptr %30
-    call @func.132(%31, %68)
+    call @func.106(%31, %68)
     br bb10(%7)
 bb6(%8: ptr):
     %69 = load ptr, ptr %30
@@ -119615,7 +119000,7 @@ bb6(%8: ptr):
     %77 = gep i8, ptr %75, %76
     br bb7(%8, %71, %27, %77)
 bb7(%9: ptr, %10: ptr, %11: ptr, %12: ptr):
-    call @func.265(%11, %12)
+    call @func.203(%11, %12)
     br bb8(%9, %10)
 bb8(%13: ptr, %14: ptr):
     %78 = load ptr, ptr %14
@@ -119623,10 +119008,10 @@ bb8(%13: ptr, %14: ptr):
     %80 = gep i8, ptr %78, %79
     br bb9(%13, %27, %80)
 bb9(%15: ptr, %16: ptr, %17: ptr):
-    call @func.265(%16, %17)
+    call @func.203(%16, %17)
     br bb16(%15)
 bb10(%18: ptr):
-    call @func.266(%18, %31)
+    call @func.204(%18, %31)
     br bb17(%18)
 bb11:
     br bb12
@@ -119667,9 +119052,6 @@ bb18:
     unreachable
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.268) {
-}
-
 fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2neBF_(functy.269) {
 }
 
@@ -119701,7 +119083,7 @@ bb0(%0: ptr, %1: ptr):
     store ptr %1, ptr %29
     br bb1
 bb1:
-    %47 = call @func.268(%28, %29)
+    %47 = call @func.36(%28, %29)
     br bb2(%47)
 bb2(%2: bool):
     condbr %2, bb3, bb4
@@ -119710,7 +119092,7 @@ bb3:
     br bb31(%48)
 bb4:
     %49 = load ptr, ptr %28
-    call @func.247(%31, %49)
+    call @func.193(%31, %49)
     br bb5
 bb5:
     %50 = load ptr, ptr %31
@@ -119719,7 +119101,7 @@ bb5:
     %52 = gep i8, ptr %31, %51
     %53 = load u32, ptr %52
     %54 = load ptr, ptr %29
-    call @func.247(%33, %54)
+    call @func.193(%33, %54)
     br bb6(%53)
 bb6(%3: u32):
     %55 = load ptr, ptr %33
@@ -119727,28 +119109,28 @@ bb6(%3: u32):
     %56 = const i64 8
     %57 = gep i8, ptr %33, %56
     %58 = load u32, ptr %57
-    %59 = call @func.269(%30, %32)
+    %59 = call @func.206(%30, %32)
     br bb7(%3, %58, %59)
 bb7(%4: u32, %5: u32, %6: bool):
     condbr %6, bb8, bb30(%4, %5)
 bb8:
     %60 = load ptr, ptr %30
-    %61 = call @func.289(%60)
+    %61 = call @func.215(%60)
     br bb9(%61)
 bb9(%7: u8):
     %62 = load ptr, ptr %32
-    %63 = call @func.289(%62)
+    %63 = call @func.215(%62)
     br bb10(%7, %63)
 bb10(%8: u8, %9: u8):
     %64 = icmp ne u8 %8, %9
     condbr %64, bb11, bb14
 bb11:
     %65 = load ptr, ptr %30
-    %66 = call @func.289(%65)
+    %66 = call @func.215(%65)
     br bb12(%66)
 bb12(%10: u8):
     %67 = load ptr, ptr %32
-    %68 = call @func.289(%67)
+    %68 = call @func.215(%67)
     br bb13(%10, %68)
 bb13(%11: u8, %12: u8):
     %69 = icmp ult u8 %11, %12
@@ -119917,10 +119299,10 @@ bb21:
     %201 = load ptr, ptr %200
     store ptr %201, ptr %46
     %202 = load ptr, ptr %46
-    %203 = call @func.294(%198, %202)
+    %203 = call @func.219(%198, %202)
     br bb31(%203)
 bb22(%13: ptr, %14: ptr):
-    %204 = call @func.270(%35, %36)
+    %204 = call @func.207(%35, %36)
     br bb23(%13, %14, %204)
 bb23(%15: ptr, %16: ptr, %17: bool):
     condbr %17, bb24, bb27(%15, %16)
@@ -119961,15 +119343,6 @@ bb31(%27: bool):
     ret %27
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.272) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.273) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.274) {
-}
-
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3popBG_(functy.275) {
 }
 
@@ -119992,7 +119365,7 @@ bb0(%0: ptr, %1: ptr):
     %92 = alloca (i64, i64, i64, i64, i64), align 8
     %93 = alloca (i64, i64, i64, i64, i64), align 8
     %94 = alloca (i64, i64), align 8
-    call @func.272(%78)
+    call @func.181(%78)
     br bb1
 bb1:
     %95 = const u64 0
@@ -120006,7 +119379,7 @@ bb2(%2: u64, %3: u64):
     %101 = const u64 40
     %102 = mul u64 %3, %101
     %103 = gep i8, ptr %100, %102
-    %104 = call @func.295(%103)
+    %104 = call @func.220(%103)
     br bb3(%2, %104)
 bb3(%4: u64, %5: bool):
     condbr %5, bb4(%4), bb25(%4)
@@ -120055,7 +119428,7 @@ bb8(%10: u64, %11: u64):
     %136 = const u64 40
     %137 = mul u64 %11, %136
     %138 = gep i8, ptr %135, %137
-    %139 = call @func.295(%138)
+    %139 = call @func.220(%138)
     br bb9(%10, %139)
 bb9(%12: u64, %13: bool):
     condbr %13, bb10(%12), bb12(%12)
@@ -120086,7 +119459,7 @@ bb13(%16: u64, %17: u64):
     %156 = const u64 40
     %157 = mul u64 %17, %156
     %158 = gep i8, ptr %155, %157
-    call @func.247(%82, %158)
+    call @func.193(%82, %158)
     br bb14(%16)
 bb14(%18: u64):
     %159 = const i64 8
@@ -120124,7 +119497,7 @@ bb18(%27: u64, %28: u32, %29: u64, %30: u64):
     %182 = const u64 40
     %183 = mul u64 %30, %182
     %184 = gep i8, ptr %181, %183
-    call @func.247(%84, %184)
+    call @func.193(%84, %184)
     br bb19(%27, %28, %29)
 bb19(%31: u64, %32: u32, %33: u64):
     %185 = const i64 8
@@ -120187,10 +119560,10 @@ bb27(%44: u64, %45: ptr, %46: u64):
     %224 = const u64 40
     %225 = mul u64 %46, %224
     %226 = gep i8, ptr %223, %225
-    call @func.132(%87, %226)
+    call @func.106(%87, %226)
     br bb28(%44, %45)
 bb28(%47: u64, %48: ptr):
-    call @func.273(%48, %87)
+    call @func.204(%48, %87)
     br bb29(%47)
 bb29(%49: u64):
     %227 = const i64 8
@@ -120203,7 +119576,7 @@ bb30(%50: u64, %51: u64):
     %232 = const u64 40
     %233 = mul u64 %51, %232
     %234 = gep i8, ptr %231, %233
-    call @func.247(%88, %234)
+    call @func.193(%88, %234)
     br bb31(%50)
 bb31(%52: u64):
     %235 = const u64 1
@@ -120238,10 +119611,10 @@ bb35(%55: u64, %56: u64):
     %255 = const u64 40
     %256 = mul u64 %56, %255
     %257 = gep i8, ptr %254, %256
-    call @func.247(%90, %257)
+    call @func.193(%90, %257)
     br bb36(%55)
 bb36(%57: u64):
-    %258 = call @func.274(%88, %90)
+    %258 = call @func.36(%88, %90)
     br bb37(%57, %258)
 bb37(%58: u64, %59: bool):
     condbr %59, bb38(%58), bb44(%58)
@@ -120263,7 +119636,7 @@ bb39(%61: u64):
     %270 = gep i8, ptr %88, %269
     %271 = load i64, ptr %268
     store i64 %271, ptr %270
-    call @func.275(%91, %78)
+    call @func.209(%91, %78)
     br bb40(%61)
 bb40(%62: u64):
     br bb41(%62)
@@ -120278,10 +119651,10 @@ bb42(%64: u64, %65: ptr, %66: u64):
     %277 = const u64 40
     %278 = mul u64 %66, %277
     %279 = gep i8, ptr %276, %278
-    call @func.132(%92, %279)
+    call @func.106(%92, %279)
     br bb43(%64, %65)
 bb43(%67: u64, %68: ptr):
-    call @func.273(%68, %92)
+    call @func.204(%68, %92)
     br bb50(%67)
 bb44(%69: u64):
     %280 = load i64, ptr %90
@@ -120302,10 +119675,10 @@ bb45(%70: u64, %71: ptr, %72: u64):
     %291 = const u64 40
     %292 = mul u64 %72, %291
     %293 = gep i8, ptr %290, %292
-    call @func.132(%93, %293)
+    call @func.106(%93, %293)
     br bb46(%70, %71)
 bb46(%73: u64, %74: ptr):
-    call @func.273(%74, %93)
+    call @func.204(%74, %93)
     br bb51(%73)
 bb47(%75: u64):
     %294 = const u64 1
@@ -120350,18 +119723,6 @@ bb52:
 fn @_RNvMNtCskTzINo8ZBH9_5alloc5sliceSNtCsep0XPuQfTSm_25clean_binding_defeq_slice5Level6to_vecBx_(functy.277) {
 }
 
-fn @_RNvMNtCskTzINo8ZBH9_5alloc3vecINtB2_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3newBE_(functy.278) {
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE3lenBG_(functy.279) {
-}
-
-fn @_RNvXsc_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelEINtNtNtCs2EYQwhfuABO_4core3ops5index5IndexjE5indexBH_(functy.280) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelE4pushBH_(functy.281) {
-}
-
 fn @Level__subsume_max_args(functy.282) {
 bb0(%0: ptr, %1: ptr):
     %219 = alloca (i64, i64), align 8
@@ -120384,7 +119745,7 @@ bb0(%0: ptr, %1: ptr):
     %236 = icmp ule u64 %234, %235
     condbr %236, bb1, bb2
 bb1:
-    call @func.277(%0, %1)
+    call @func.211(%0, %1)
     br bb66
 bb2:
     %237 = const bool false
@@ -120407,7 +119768,7 @@ bb5(%6: bool, %7: u64, %8: u64):
     %248 = const u64 40
     %249 = mul u64 %8, %248
     %250 = gep i8, ptr %247, %249
-    call @func.247(%219, %250)
+    call @func.193(%219, %250)
     br bb6(%6, %7)
 bb6(%9: bool, %10: u64):
     %251 = load ptr, ptr %219
@@ -120460,10 +119821,10 @@ bb12(%20: bool):
 bb13(%21: bool):
     condbr %21, bb15, bb14
 bb14:
-    call @func.277(%0, %1)
+    call @func.211(%0, %1)
     br bb66
 bb15:
-    call @func.278(%221)
+    call @func.181(%221)
     br bb16
 bb16:
     %284 = const u64 0
@@ -120485,7 +119846,7 @@ bb19(%24: u64, %25: u64):
     %294 = const u64 40
     %295 = mul u64 %25, %294
     %296 = gep i8, ptr %293, %295
-    call @func.247(%222, %296)
+    call @func.193(%222, %296)
     br bb20(%24, %296)
 bb20(%26: u64, %27: ptr):
     %297 = load ptr, ptr %222
@@ -120519,16 +119880,16 @@ bb23(%32: u64, %33: ptr, %34: bool):
     %319 = const u64 0
     br bb24(%32, %33, %34, %318, %319)
 bb24(%35: u64, %36: ptr, %37: bool, %38: bool, %39: u64):
-    %320 = call @func.279(%221)
+    %320 = call @func.55(%221)
     br bb25(%35, %36, %37, %38, %39, %39, %320)
 bb25(%40: u64, %41: ptr, %42: bool, %43: bool, %44: u64, %45: u64, %46: u64):
     %321 = icmp ult u64 %45, %46
     condbr %321, bb26(%40, %41, %42, %43, %44), bb38(%40, %41, %42, %43)
 bb26(%47: u64, %48: ptr, %49: bool, %50: bool, %51: u64):
-    %322 = call @func.280(%221, %51)
+    %322 = call @func.56(%221, %51)
     br bb27(%47, %48, %49, %50, %51, %322)
 bb27(%52: u64, %53: ptr, %54: bool, %55: bool, %56: u64, %57: ptr):
-    call @func.247(%223, %57)
+    call @func.193(%223, %57)
     br bb28(%52, %53, %54, %55, %56, %57)
 bb28(%58: u64, %59: ptr, %60: bool, %61: bool, %62: u64, %63: ptr):
     %323 = load ptr, ptr %223
@@ -120562,7 +119923,7 @@ bb31(%76: u64, %77: ptr, %78: bool, %79: bool, %80: u64, %81: ptr, %82: bool):
 bb32(%83: u64, %84: ptr, %85: bool, %86: bool, %87: u64, %88: ptr, %89: bool):
     condbr %89, bb33(%83, %84, %85, %86, %87, %88), bb36(%83, %84, %85, %86, %87)
 bb33(%90: u64, %91: ptr, %92: bool, %93: bool, %94: u64, %95: ptr):
-    %344 = call @func.299(%95, %91)
+    %344 = call @func.221(%95, %91)
     br bb34(%90, %91, %92, %93, %94, %344)
 bb34(%96: u64, %97: ptr, %98: bool, %99: bool, %100: u64, %101: bool):
     condbr %101, bb35(%96, %97, %98), bb36(%96, %97, %98, %99, %100)
@@ -120637,7 +119998,7 @@ bb45(%136: u64, %137: ptr, %138: bool, %139: bool, %140: u64, %141: u64):
     %389 = const u64 40
     %390 = mul u64 %141, %389
     %391 = gep i8, ptr %388, %390
-    call @func.247(%227, %391)
+    call @func.193(%227, %391)
     br bb46(%136, %137, %138, %139, %140, %391)
 bb46(%142: u64, %143: ptr, %144: bool, %145: bool, %146: u64, %147: ptr):
     %392 = load ptr, ptr %227
@@ -120671,12 +120032,12 @@ bb49(%160: u64, %161: ptr, %162: bool, %163: bool, %164: u64, %165: ptr, %166: b
 bb50(%167: u64, %168: ptr, %169: bool, %170: bool, %171: u64, %172: ptr, %173: bool):
     condbr %173, bb51(%167, %168, %169, %170, %171, %172), bb56(%167, %168, %169, %170, %171)
 bb51(%174: u64, %175: ptr, %176: bool, %177: bool, %178: u64, %179: ptr):
-    %413 = call @func.299(%179, %175)
+    %413 = call @func.221(%179, %175)
     br bb52(%174, %175, %176, %177, %178, %179, %413)
 bb52(%180: u64, %181: ptr, %182: bool, %183: bool, %184: u64, %185: ptr, %186: bool):
     condbr %186, bb53(%180, %181, %182, %183, %184, %185), bb56(%180, %181, %182, %183, %184)
 bb53(%187: u64, %188: ptr, %189: bool, %190: bool, %191: u64, %192: ptr):
-    %414 = call @func.299(%188, %192)
+    %414 = call @func.221(%188, %192)
     br bb54(%187, %188, %189, %190, %191, %414)
 bb54(%193: u64, %194: ptr, %195: bool, %196: bool, %197: u64, %198: bool):
     condbr %198, bb56(%193, %194, %195, %196, %197), bb55(%193, %194)
@@ -120718,10 +120079,10 @@ bb60:
     %437 = load u64, ptr %229
     br bb17(%437)
 bb61(%214: u64, %215: ptr):
-    call @func.132(%230, %215)
+    call @func.106(%230, %215)
     br bb62(%214, %221)
 bb62(%216: u64, %217: ptr):
-    call @func.281(%217, %230)
+    call @func.204(%217, %230)
     br bb63(%216)
 bb63(%218: u64):
     %438 = const u64 1
@@ -120796,7 +120157,7 @@ bb2(%2: u64):
     %38 = const u64 40
     %39 = mul u64 %2, %38
     %40 = gep i8, ptr %37, %39
-    call @func.132(%0, %40)
+    call @func.106(%0, %40)
     br bb21
 bb3:
     %41 = const i64 8
@@ -120826,10 +120187,10 @@ bb5(%3: u64):
     %60 = const u64 40
     %61 = mul u64 %3, %60
     %62 = gep i8, ptr %59, %61
-    call @func.132(%14, %62)
+    call @func.106(%14, %62)
     br bb6
 bb6:
-    call @func.49(%13, %14)
+    call @func.46(%13, %14)
     br bb7
 bb7:
     %63 = const i64 8
@@ -120859,10 +120220,10 @@ bb9(%4: u64):
     %82 = const u64 40
     %83 = mul u64 %4, %82
     %84 = gep i8, ptr %81, %83
-    call @func.132(%17, %84)
+    call @func.106(%17, %84)
     br bb10
 bb10:
-    call @func.49(%16, %17)
+    call @func.46(%16, %17)
     br bb11
 bb11:
     %85 = const bool true
@@ -120923,10 +120284,10 @@ bb16(%7: u64, %8: u64):
     %125 = const u64 40
     %126 = mul u64 %8, %125
     %127 = gep i8, ptr %124, %126
-    call @func.132(%23, %127)
+    call @func.106(%23, %127)
     br bb17(%7)
 bb17(%9: u64):
-    call @func.49(%22, %23)
+    call @func.46(%22, %23)
     br bb18(%9)
 bb18(%10: u64):
     %128 = const bool false
@@ -120956,7 +120317,7 @@ bb18(%10: u64):
     %148 = gep i8, ptr %25, %147
     %149 = load i64, ptr %146
     store i64 %149, ptr %148
-    call @func.49(%24, %25)
+    call @func.46(%24, %25)
     br bb19(%10)
 bb19(%11: u64):
     %150 = load ptr, ptr %22
@@ -121031,18 +120392,6 @@ bb21:
     ret
 bb22:
     unreachable
-}
-
-fn @_RNvXsp_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorENtNtNtB7_3ops9try_trait3Try6branchBM_(functy.284) {
-}
-
-fn @_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprNtBM_9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleB1w_EE13from_residualBM_(functy.285) {
-}
-
-fn @_RNvXs1j_NtCskTzINo8ZBH9_5alloc4syncINtB6_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprEINtNtCs2EYQwhfuABO_4core7convert5AsRefBH_E6as_refBJ_(functy.286) {
-}
-
-fn @_RNvXsu_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArcNtCsep0XPuQfTSm_25clean_binding_defeq_slice4ExprENtNtCs2EYQwhfuABO_4core5clone5Clone5cloneBI_(functy.287) {
 }
 
 fn @Verifier____env___infer_type_core(functy.288) {
@@ -121355,13 +120704,13 @@ bb8(%9: ptr):
     %663 = load ptr, ptr %386
     %664 = const i64 48
     %665 = gep i8, ptr %663, %664
-    call @func.237(%397, %9, %662)
+    call @func.185(%397, %9, %662)
     br bb20(%662)
 bb9:
     %666 = load ptr, ptr %386
     %667 = const i64 8
     %668 = gep i8, ptr %666, %667
-    call @func.132(%396, %668)
+    call @func.106(%396, %668)
     br bb17
 bb10:
     %669 = load ptr, ptr %386
@@ -121371,7 +120720,7 @@ bb10:
     %673 = load i64, ptr %671
     store i64 %673, ptr %389
     %674 = load u64, ptr %389
-    call @func.154(%388, %672, %674)
+    call @func.122(%388, %672, %674)
     br bb12(%671)
 bb11:
     %675 = load ptr, ptr %386
@@ -121531,7 +120880,7 @@ bb16:
     store i64 %790, ptr %789
     br bb180
 bb17:
-    call @func.226(%395, %396)
+    call @func.176(%395, %396)
     br bb18
 bb18:
     call @func.10(%394, %395)
@@ -121603,7 +120952,7 @@ bb20(%12: ptr):
     %842 = select i64 %839, %840, %841
     switch %842 [ 0: bb21(%12) 1: bb22 default: bb13 ]
 bb21(%13: ptr):
-    call @func.128(%400, %13)
+    call @func.102(%400, %13)
     br bb23
 bb22:
     %843 = load i64, ptr %397
@@ -121779,10 +121128,10 @@ bb23:
     br bb180
 bb24(%14: ptr, %15: ptr, %16: ptr):
     %980 = load ptr, ptr %385
-    call @func.288(%403, %14, %16, %980)
+    call @func.214(%403, %14, %16, %980)
     br bb25(%14, %15)
 bb25(%17: ptr, %18: ptr):
-    call @func.284(%402, %403)
+    call @func.165(%402, %403)
     br bb26(%17, %18)
 bb26(%19: ptr, %20: ptr):
     %981 = load i64, ptr %402
@@ -121907,7 +121256,7 @@ bb27(%21: ptr, %22: ptr):
     %1079 = load i64, ptr %1076
     store i64 %1079, ptr %1078
     %1080 = load ptr, ptr %385
-    call @func.47(%406, %21, %401, %1080)
+    call @func.44(%406, %21, %401, %1080)
     br bb30(%21, %22, %1033)
 bb28:
     %1081 = const i64 8
@@ -121938,7 +121287,7 @@ bb28:
     %1102 = gep i8, ptr %404, %1101
     %1103 = load i64, ptr %1100
     store i64 %1103, ptr %1102
-    call @func.285(%0, %404)
+    call @func.166(%0, %404)
     br bb29
 bb29:
     %1104 = const bool false
@@ -122128,10 +121477,10 @@ bb32(%26: ptr, %27: ptr, %28: bool):
     br bb33(%26, %27, %1251, %1254, %1257, %28)
 bb33(%29: ptr, %30: ptr, %31: ptr, %32: ptr, %33: ptr, %34: bool):
     %1258 = load ptr, ptr %385
-    call @func.288(%410, %29, %33, %1258)
+    call @func.214(%410, %29, %33, %1258)
     br bb34(%29, %30, %31, %32, %34)
 bb34(%35: ptr, %36: ptr, %37: ptr, %38: ptr, %39: bool):
-    call @func.284(%409, %410)
+    call @func.165(%409, %410)
     br bb35(%35, %36, %37, %38, %39)
 bb35(%40: ptr, %41: ptr, %42: ptr, %43: ptr, %44: bool):
     %1259 = load i64, ptr %409
@@ -122288,11 +121637,11 @@ bb37:
     %1382 = gep i8, ptr %411, %1381
     %1383 = load i64, ptr %1380
     store i64 %1383, ptr %1382
-    call @func.285(%0, %411)
+    call @func.166(%0, %411)
     br bb187
 bb38(%50: ptr, %51: ptr, %52: ptr, %53: ptr, %54: ptr, %55: ptr, %56: bool):
     %1384 = load ptr, ptr %385
-    %1385 = call @func.43(%50, %54, %55, %1384)
+    %1385 = call @func.41(%50, %54, %55, %1384)
     br bb39(%51, %52, %53, %1385, %56)
 bb39(%57: ptr, %58: ptr, %59: ptr, %60: bool, %61: bool):
     condbr %60, bb40(%57, %59, %61), bb41(%58)
@@ -122302,7 +121651,7 @@ bb40(%62: ptr, %63: ptr, %64: bool):
     %1388 = gep i8, ptr %1386, %1387
     br bb46(%62, %1388, %64)
 bb41(%65: ptr):
-    %1389 = call @func.286(%65)
+    %1389 = call @func.27(%65)
     br bb42(%1389)
 bb42(%66: ptr):
     call @func.20(%415, %66)
@@ -122550,7 +121899,7 @@ bb46(%67: ptr, %68: ptr, %69: bool):
     %1578 = gep i8, ptr %1576, %1577
     br bb47(%68, %1578, %69)
 bb47(%70: ptr, %71: ptr, %72: bool):
-    call @func.135(%418, %70, %71)
+    call @func.109(%418, %70, %71)
     br bb48(%72)
 bb48(%73: bool):
     %1579 = load i64, ptr %418
@@ -122660,10 +122009,10 @@ bb53:
     br bb180
 bb54(%78: ptr, %79: ptr, %80: ptr, %81: ptr, %82: ptr):
     %1655 = load ptr, ptr %385
-    call @func.288(%424, %78, %82, %1655)
+    call @func.214(%424, %78, %82, %1655)
     br bb55(%78, %79, %80, %81)
 bb55(%83: ptr, %84: ptr, %85: ptr, %86: ptr):
-    call @func.284(%423, %424)
+    call @func.165(%423, %424)
     br bb56(%83, %84, %85, %86)
 bb56(%87: ptr, %88: ptr, %89: ptr, %90: ptr):
     %1656 = load i64, ptr %423
@@ -122788,7 +122137,7 @@ bb57(%91: ptr, %92: ptr, %93: ptr, %94: ptr):
     %1754 = load i64, ptr %1751
     store i64 %1754, ptr %1753
     %1755 = load ptr, ptr %385
-    call @func.47(%427, %91, %422, %1755)
+    call @func.44(%427, %91, %422, %1755)
     br bb59(%91, %92, %93, %94, %1708)
 bb58:
     %1756 = const i64 8
@@ -122819,7 +122168,7 @@ bb58:
     %1777 = gep i8, ptr %425, %1776
     %1778 = load i64, ptr %1775
     store i64 %1778, ptr %1777
-    call @func.285(%0, %425)
+    call @func.166(%0, %425)
     br bb176
 bb59(%95: ptr, %96: ptr, %97: ptr, %98: ptr, %99: bool):
     %1779 = load i64, ptr %427
@@ -122992,7 +122341,7 @@ bb60:
     store ptr %1869, ptr %429
     br bb62(%1821)
 bb61(%100: ptr, %101: ptr, %102: ptr, %103: ptr, %104: bool):
-    call @func.50(%432)
+    call @func.47(%432)
     br bb63(%100, %101, %102, %103, %104)
 bb62(%105: bool):
     %1922 = load ptr, ptr %429
@@ -123034,7 +122383,7 @@ bb62(%105: bool):
     br bb174(%105)
 bb63(%106: ptr, %107: ptr, %108: ptr, %109: ptr, %110: bool):
     %1950 = const bool true
-    %1951 = call @func.286(%108)
+    %1951 = call @func.27(%108)
     br bb64(%106, %107, %108, %109, %1951, %110)
 bb64(%111: ptr, %112: ptr, %113: ptr, %114: ptr, %115: ptr, %116: bool):
     call @func.20(%433, %115)
@@ -123060,16 +122409,16 @@ bb66(%122: ptr, %123: ptr, %124: ptr, %125: ptr, %126: bool):
     br bb67(%122, %123, %124, %1963, %126)
 bb67(%127: ptr, %128: ptr, %129: ptr, %130: ptr, %131: bool):
     %1964 = load u64, ptr %431
-    call @func.73(%435, %127, %130, %1964)
+    call @func.66(%435, %127, %130, %1964)
     br bb68(%127, %128, %129, %131)
 bb68(%132: ptr, %133: ptr, %134: ptr, %135: bool):
     %1965 = load ptr, ptr %385
-    call @func.288(%436, %132, %435, %1965)
+    call @func.214(%436, %132, %435, %1965)
     br bb69(%133, %134, %135)
 bb69(%136: ptr, %137: ptr, %138: bool):
     %1966 = const bool true
     %1967 = load ptr, ptr %385
-    call @func.228(%1967)
+    call @func.177(%1967)
     br bb70(%136, %137, %138)
 bb70(%139: ptr, %140: ptr, %141: bool):
     %1968 = const bool false
@@ -123129,7 +122478,7 @@ bb70(%139: ptr, %140: ptr, %141: bool):
     %2013 = gep i8, ptr %439, %2012
     %2014 = load i64, ptr %2011
     store i64 %2014, ptr %2013
-    call @func.284(%438, %439)
+    call @func.165(%438, %439)
     br bb71(%139, %140, %141)
 bb71(%142: ptr, %143: ptr, %144: bool):
     %2015 = load i64, ptr %438
@@ -123253,7 +122602,7 @@ bb72(%145: ptr, %146: ptr):
     %2112 = load i64, ptr %2109
     store i64 %2112, ptr %2111
     %2113 = load u64, ptr %431
-    call @func.229(%442, %437, %2113)
+    call @func.178(%442, %437, %2113)
     br bb75(%145, %146)
 bb73(%147: bool):
     %2114 = const i64 8
@@ -123284,7 +122633,7 @@ bb73(%147: bool):
     %2135 = gep i8, ptr %440, %2134
     %2136 = load i64, ptr %2133
     store i64 %2136, ptr %2135
-    call @func.285(%0, %440)
+    call @func.166(%0, %440)
     br bb74(%147)
 bb74(%148: bool):
     %2137 = const bool false
@@ -123299,7 +122648,7 @@ bb75(%149: ptr, %150: ptr):
     %2143 = gep i8, ptr %445, %2142
     %2144 = load i8, ptr %2141
     store i8 %2144, ptr %2143
-    call @func.287(%446, %150)
+    call @func.26(%446, %150)
     br bb76
 bb76:
     %2145 = const bool false
@@ -123521,10 +122870,10 @@ bb82:
     br bb180
 bb83(%151: ptr, %152: ptr, %153: ptr, %154: ptr, %155: ptr):
     %2310 = load ptr, ptr %385
-    call @func.288(%451, %151, %155, %2310)
+    call @func.214(%451, %151, %155, %2310)
     br bb84(%151, %152, %153, %154)
 bb84(%156: ptr, %157: ptr, %158: ptr, %159: ptr):
-    call @func.284(%450, %451)
+    call @func.165(%450, %451)
     br bb85(%156, %157, %158, %159)
 bb85(%160: ptr, %161: ptr, %162: ptr, %163: ptr):
     %2311 = load i64, ptr %450
@@ -123649,7 +122998,7 @@ bb86(%164: ptr, %165: ptr, %166: ptr, %167: ptr):
     %2409 = load i64, ptr %2406
     store i64 %2409, ptr %2408
     %2410 = load ptr, ptr %385
-    call @func.47(%454, %164, %449, %2410)
+    call @func.44(%454, %164, %449, %2410)
     br bb88(%164, %165, %166, %167, %2363)
 bb87:
     %2411 = const i64 8
@@ -123680,7 +123029,7 @@ bb87:
     %2432 = gep i8, ptr %452, %2431
     %2433 = load i64, ptr %2430
     store i64 %2433, ptr %2432
-    call @func.285(%0, %452)
+    call @func.166(%0, %452)
     br bb173
 bb88(%168: ptr, %169: ptr, %170: ptr, %171: ptr, %172: bool):
     store ptr %454, ptr %456
@@ -123858,11 +123207,11 @@ bb90(%173: ptr, %174: ptr, %175: ptr, %176: ptr, %177: bool):
     %2578 = load ptr, ptr %456
     %2579 = const i64 8
     %2580 = gep i8, ptr %2578, %2579
-    call @func.132(%455, %2580)
+    call @func.106(%455, %2580)
     br bb91(%173, %174, %175, %176, %177)
 bb91(%178: ptr, %179: ptr, %180: ptr, %181: ptr, %182: bool):
     %2581 = const bool true
-    call @func.50(%461)
+    call @func.47(%461)
     br bb93(%178, %179, %180, %181, %182)
 bb92(%183: bool):
     %2582 = load ptr, ptr %458
@@ -123904,7 +123253,7 @@ bb92(%183: bool):
     br bb171(%183)
 bb93(%184: ptr, %185: ptr, %186: ptr, %187: ptr, %188: bool):
     %2610 = const bool true
-    %2611 = call @func.286(%186)
+    %2611 = call @func.27(%186)
     br bb94(%184, %185, %187, %2611, %188)
 bb94(%189: ptr, %190: ptr, %191: ptr, %192: ptr, %193: bool):
     call @func.20(%462, %192)
@@ -123930,16 +123279,16 @@ bb96(%198: ptr, %199: ptr, %200: bool):
     br bb97(%198, %2623, %200)
 bb97(%201: ptr, %202: ptr, %203: bool):
     %2624 = load u64, ptr %460
-    call @func.73(%464, %201, %202, %2624)
+    call @func.66(%464, %201, %202, %2624)
     br bb98(%201, %203)
 bb98(%204: ptr, %205: bool):
     %2625 = load ptr, ptr %385
-    call @func.288(%465, %204, %464, %2625)
+    call @func.214(%465, %204, %464, %2625)
     br bb99(%204, %205)
 bb99(%206: ptr, %207: bool):
     %2626 = const bool true
     %2627 = load ptr, ptr %385
-    call @func.228(%2627)
+    call @func.177(%2627)
     br bb100(%206, %207)
 bb100(%208: ptr, %209: bool):
     %2628 = const bool false
@@ -123999,7 +123348,7 @@ bb100(%208: ptr, %209: bool):
     %2673 = gep i8, ptr %468, %2672
     %2674 = load i64, ptr %2671
     store i64 %2674, ptr %2673
-    call @func.284(%467, %468)
+    call @func.165(%467, %468)
     br bb101(%208, %209)
 bb101(%210: ptr, %211: bool):
     %2675 = load i64, ptr %467
@@ -124124,7 +123473,7 @@ bb102(%212: ptr, %213: bool):
     %2773 = load i64, ptr %2770
     store i64 %2773, ptr %2772
     %2774 = load ptr, ptr %385
-    call @func.47(%471, %212, %466, %2774)
+    call @func.44(%471, %212, %466, %2774)
     br bb104(%213)
 bb103(%214: bool):
     %2775 = const i64 8
@@ -124155,7 +123504,7 @@ bb103(%214: bool):
     %2796 = gep i8, ptr %469, %2795
     %2797 = load i64, ptr %2794
     store i64 %2797, ptr %2796
-    call @func.285(%0, %469)
+    call @func.166(%0, %469)
     br bb188(%214)
 bb104(%215: bool):
     store ptr %471, ptr %473
@@ -124333,7 +123682,7 @@ bb106:
     %2942 = load ptr, ptr %473
     %2943 = const i64 8
     %2944 = gep i8, ptr %2942, %2943
-    call @func.132(%472, %2944)
+    call @func.106(%472, %2944)
     br bb107
 bb107:
     %2945 = const bool false
@@ -124363,7 +123712,7 @@ bb107:
     %2965 = gep i8, ptr %479, %2964
     %2966 = load i64, ptr %2963
     store i64 %2966, ptr %2965
-    call @func.230(%478, %479, %472)
+    call @func.179(%478, %479, %472)
     br bb109
 bb108(%217: bool):
     %2967 = load ptr, ptr %475
@@ -124480,10 +123829,10 @@ bb115:
     br bb180
 bb116(%218: ptr, %219: ptr, %220: ptr, %221: ptr, %222: ptr, %223: ptr):
     %3045 = load ptr, ptr %385
-    call @func.288(%482, %218, %223, %3045)
+    call @func.214(%482, %218, %223, %3045)
     br bb117(%218, %219, %220, %221, %222)
 bb117(%224: ptr, %225: ptr, %226: ptr, %227: ptr, %228: ptr):
-    call @func.284(%481, %482)
+    call @func.165(%481, %482)
     br bb118(%224, %225, %226, %227, %228)
 bb118(%229: ptr, %230: ptr, %231: ptr, %232: ptr, %233: ptr):
     %3046 = load i64, ptr %481
@@ -124608,7 +123957,7 @@ bb119(%234: ptr, %235: ptr, %236: ptr, %237: ptr, %238: ptr):
     %3144 = load i64, ptr %3141
     store i64 %3144, ptr %3143
     %3145 = load ptr, ptr %385
-    call @func.47(%485, %234, %480, %3145)
+    call @func.44(%485, %234, %480, %3145)
     br bb121(%234, %235, %236, %237, %238, %3098)
 bb120:
     %3146 = const i64 8
@@ -124639,7 +123988,7 @@ bb120:
     %3167 = gep i8, ptr %483, %3166
     %3168 = load i64, ptr %3165
     store i64 %3168, ptr %3167
-    call @func.285(%0, %483)
+    call @func.166(%0, %483)
     br bb168
 bb121(%239: ptr, %240: ptr, %241: ptr, %242: ptr, %243: ptr, %244: bool):
     %3169 = load i64, ptr %485
@@ -124856,10 +124205,10 @@ bb124(%251: bool):
     br bb166(%251)
 bb125(%252: ptr, %253: ptr, %254: ptr, %255: ptr, %256: ptr, %257: ptr, %258: bool):
     %3343 = load ptr, ptr %385
-    call @func.288(%491, %252, %257, %3343)
+    call @func.214(%491, %252, %257, %3343)
     br bb126(%252, %253, %254, %255, %256, %258)
 bb126(%259: ptr, %260: ptr, %261: ptr, %262: ptr, %263: ptr, %264: bool):
-    call @func.284(%490, %491)
+    call @func.165(%490, %491)
     br bb127(%259, %260, %261, %262, %263, %264)
 bb127(%265: ptr, %266: ptr, %267: ptr, %268: ptr, %269: ptr, %270: bool):
     %3344 = load i64, ptr %490
@@ -125016,19 +124365,19 @@ bb129(%277: bool):
     %3467 = gep i8, ptr %492, %3466
     %3468 = load i64, ptr %3465
     store i64 %3468, ptr %3467
-    call @func.285(%0, %492)
+    call @func.166(%0, %492)
     br bb189(%277)
 bb130(%278: ptr, %279: ptr, %280: ptr, %281: ptr, %282: ptr, %283: ptr, %284: ptr, %285: bool, %286: bool):
     %3469 = load ptr, ptr %385
-    %3470 = call @func.43(%278, %283, %284, %3469)
+    %3470 = call @func.41(%278, %283, %284, %3469)
     br bb131(%278, %279, %280, %281, %282, %3470, %285, %286)
 bb131(%287: ptr, %288: ptr, %289: ptr, %290: ptr, %291: ptr, %292: bool, %293: bool, %294: bool):
     condbr %292, bb132(%287, %288, %289, %290, %291, %293, %294), bb133(%289, %294)
 bb132(%295: ptr, %296: ptr, %297: ptr, %298: ptr, %299: ptr, %300: bool, %301: bool):
-    call @func.128(%500, %296)
+    call @func.102(%500, %296)
     br bb138(%295, %297, %298, %299, %300, %301)
 bb133(%302: ptr, %303: bool):
-    %3471 = call @func.286(%302)
+    %3471 = call @func.27(%302)
     br bb134(%3471, %303)
 bb134(%304: ptr, %305: bool):
     call @func.20(%496, %304)
@@ -125272,14 +124621,14 @@ bb137(%308: bool, %309: bool):
     br bb183(%308, %309)
 bb138(%310: ptr, %311: ptr, %312: ptr, %313: ptr, %314: bool, %315: bool):
     %3658 = const bool true
-    %3659 = call @func.286(%311)
+    %3659 = call @func.27(%311)
     br bb139(%310, %312, %313, %3659, %314, %315)
 bb139(%316: ptr, %317: ptr, %318: ptr, %319: ptr, %320: bool, %321: bool):
     call @func.20(%501, %319)
     br bb140(%316, %317, %318, %320, %321)
 bb140(%322: ptr, %323: ptr, %324: ptr, %325: bool, %326: bool):
     %3660 = const bool true
-    %3661 = call @func.286(%323)
+    %3661 = call @func.27(%323)
     br bb141(%322, %323, %324, %3661, %325, %326)
 bb141(%327: ptr, %328: ptr, %329: ptr, %330: ptr, %331: bool, %332: bool):
     call @func.20(%502, %330)
@@ -125288,7 +124637,7 @@ bb142(%333: ptr, %334: ptr, %335: ptr, %336: bool, %337: bool):
     %3662 = const bool false
     %3663 = const bool false
     %3664 = load ptr, ptr %385
-    call @func.46(%499, %3664, %500, %501, %502)
+    call @func.43(%499, %3664, %500, %501, %502)
     br bb143(%333, %334, %335, %336, %337)
 bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     %3665 = const bool false
@@ -125299,16 +124648,16 @@ bb143(%338: ptr, %339: ptr, %340: ptr, %341: bool, %342: bool):
     br bb144(%338, %339, %3669, %341, %342)
 bb144(%343: ptr, %344: ptr, %345: ptr, %346: bool, %347: bool):
     %3670 = load u64, ptr %499
-    call @func.73(%503, %343, %345, %3670)
+    call @func.66(%503, %343, %345, %3670)
     br bb145(%343, %344, %346, %347)
 bb145(%348: ptr, %349: ptr, %350: bool, %351: bool):
     %3671 = load ptr, ptr %385
-    call @func.288(%504, %348, %503, %3671)
+    call @func.214(%504, %348, %503, %3671)
     br bb146(%349, %350, %351)
 bb146(%352: ptr, %353: bool, %354: bool):
     %3672 = const bool true
     %3673 = load ptr, ptr %385
-    call @func.228(%3673)
+    call @func.177(%3673)
     br bb147(%352, %353, %354)
 bb147(%355: ptr, %356: bool, %357: bool):
     %3674 = const bool false
@@ -125368,7 +124717,7 @@ bb147(%355: ptr, %356: bool, %357: bool):
     %3719 = gep i8, ptr %507, %3718
     %3720 = load i64, ptr %3717
     store i64 %3720, ptr %3719
-    call @func.284(%506, %507)
+    call @func.165(%506, %507)
     br bb148(%355, %356, %357)
 bb148(%358: ptr, %359: bool, %360: bool):
     %3721 = load i64, ptr %506
@@ -125524,14 +124873,14 @@ bb150(%362: bool, %363: bool):
     %3843 = gep i8, ptr %508, %3842
     %3844 = load i64, ptr %3841
     store i64 %3844, ptr %3843
-    call @func.285(%0, %508)
+    call @func.166(%0, %508)
     br bb151(%362, %363)
 bb151(%364: bool, %365: bool):
     %3845 = const bool false
     br bb183(%364, %365)
 bb152(%366: ptr, %367: ptr):
     %3846 = load u64, ptr %499
-    call @func.231(%510, %366, %3846, %367)
+    call @func.180(%510, %366, %3846, %367)
     br bb153
 bb153:
     %3847 = load i64, ptr %510
@@ -125605,16 +124954,16 @@ bb158:
     %3895 = const bool false
     br bb180
 bb159:
-    call @func.214(%513)
+    call @func.169(%513)
     br bb162
 bb160:
-    call @func.213(%512)
+    call @func.168(%512)
     br bb161
 bb161:
-    call @func.233(%511, %512)
+    call @func.182(%511, %512)
     br bb163
 bb162:
-    call @func.233(%511, %513)
+    call @func.182(%511, %513)
     br bb163
 bb163:
     %3896 = load i64, ptr %511
@@ -125676,7 +125025,7 @@ bb163:
     br bb180
 bb164(%368: ptr, %369: ptr):
     %3942 = load ptr, ptr %385
-    call @func.288(%0, %368, %369, %3942)
+    call @func.214(%0, %368, %369, %3942)
     br bb180
 bb165(%370: bool):
     %3943 = const bool false
@@ -125790,9 +125139,6 @@ fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecRNtCsep0XPuQfTSm_25clean_binding
 fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecRNtCsep0XPuQfTSm_25clean_binding_defeq_slice4NameE3popBH_(functy.292) {
 }
 
-fn @_RNvXsw_NtCskTzINo8ZBH9_5alloc4syncINtB5_3ArceENtNtNtCs2EYQwhfuABO_4core3ops5deref5Deref5derefCsep0XPuQfTSm_25clean_binding_defeq_slice(functy.293) {
-}
-
 fn @name_cmp_is_lt(functy.294) {
 bb0(%0: ptr, %1: ptr):
     %29 = alloca (i64, i64, i64), align 8
@@ -125813,7 +125159,7 @@ bb0(%0: ptr, %1: ptr):
     %44 = alloca i64, align 8
     %45 = alloca i64, align 8
     %46 = alloca i64, align 8
-    call @func.290(%29)
+    call @func.216(%29)
     br bb1(%0, %1)
 bb1(%2: ptr, %3: ptr):
     store ptr %2, ptr %30
@@ -125831,17 +125177,17 @@ bb4(%5: ptr):
     %51 = const i64 16
     %52 = gep i8, ptr %50, %51
     %53 = load ptr, ptr %30
-    call @func.291(%29, %53)
+    call @func.217(%29, %53)
     br bb9(%5, %52)
 bb5(%6: ptr):
     %54 = load ptr, ptr %31
     %55 = const i64 8
     %56 = gep i8, ptr %54, %55
     %57 = load ptr, ptr %30
-    call @func.291(%29, %57)
+    call @func.217(%29, %57)
     br bb7(%6, %56)
 bb6(%7: ptr):
-    call @func.290(%32)
+    call @func.216(%32)
     br bb11(%7)
 bb7(%8: ptr, %9: ptr):
     %58 = load ptr, ptr %9
@@ -125873,14 +125219,14 @@ bb13:
     %68 = const i64 16
     %69 = gep i8, ptr %67, %68
     %70 = load ptr, ptr %33
-    call @func.291(%32, %70)
+    call @func.217(%32, %70)
     br bb17(%69)
 bb14:
     %71 = load ptr, ptr %34
     %72 = const i64 8
     %73 = gep i8, ptr %71, %72
     %74 = load ptr, ptr %33
-    call @func.291(%32, %74)
+    call @func.217(%32, %74)
     br bb15(%73)
 bb15(%17: ptr):
     %75 = load ptr, ptr %17
@@ -125899,10 +125245,10 @@ bb18(%20: ptr):
     store ptr %20, ptr %33
     br bb12
 bb19:
-    call @func.292(%35, %29)
+    call @func.218(%35, %29)
     br bb20
 bb20:
-    call @func.292(%36, %32)
+    call @func.218(%36, %32)
     br bb21
 bb21:
     %81 = load ptr, ptr %35
@@ -125994,7 +125340,7 @@ bb32:
     %137 = load ptr, ptr %44
     %138 = const i64 16
     %139 = gep i8, ptr %137, %138
-    call @func.293(%41, %133)
+    call @func.68(%41, %133)
     br bb35(%139)
 bb33:
     %140 = load ptr, ptr %40
@@ -126019,10 +125365,10 @@ bb34(%21: ptr, %22: ptr):
     %155 = icmp ult u64 %153, %154
     br bb39(%155)
 bb35(%23: ptr):
-    call @func.293(%42, %23)
+    call @func.68(%42, %23)
     br bb36
 bb36:
-    %156 = call @func.300(%41, %42)
+    %156 = call @func.222(%41, %42)
     br bb37(%156)
 bb37(%24: i32):
     %157 = const i32 0
@@ -126043,7 +125389,7 @@ bb41(%28: bool):
 fn @Level__is_explicit(functy.295) {
 bb0(%0: ptr):
     %2 = alloca (i64, i64), align 8
-    call @func.247(%2, %0)
+    call @func.193(%2, %0)
     br bb1
 bb1:
     %3 = load ptr, ptr %2
@@ -126074,15 +125420,6 @@ bb3:
     br bb4(%23)
 bb4(%1: bool):
     ret %1
-}
-
-fn @_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecTRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelBF_EE3popBI_(functy.296) {
-}
-
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.297) {
-}
-
-fn @_RNvMsF_NtCskTzINo8ZBH9_5alloc3vecINtB5_3VecTRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelBG_EE4pushBJ_(functy.298) {
 }
 
 fn @Level__is_geq_core(functy.299) {
@@ -126122,7 +125459,7 @@ bb1(%2: ptr, %3: ptr):
     %80 = icmp eq u64 %78, %79
     condbr %80, bb47(%73), bb54
 bb2:
-    call @func.296(%56, %53)
+    call @func.117(%56, %53)
     br bb3
 bb3:
     %81 = load i64, ptr %56
@@ -126139,19 +125476,19 @@ bb4:
     %89 = gep i8, ptr %56, %88
     %90 = load ptr, ptr %89
     store ptr %90, ptr %58
-    %91 = call @func.297(%57, %58)
+    %91 = call @func.36(%57, %58)
     br bb5(%91)
 bb5(%4: bool):
     condbr %4, bb2, bb6
 bb6:
     %92 = load ptr, ptr %58
-    %93 = call @func.215(%92)
+    %93 = call @func.170(%92)
     br bb7(%93)
 bb7(%5: bool):
     condbr %5, bb2, bb8
 bb8:
     %94 = load ptr, ptr %57
-    call @func.247(%60, %94)
+    call @func.193(%60, %94)
     br bb9
 bb9:
     %95 = load ptr, ptr %60
@@ -126165,7 +125502,7 @@ bb9:
 bb10(%6: u32):
     %101 = load ptr, ptr %59
     %102 = load ptr, ptr %58
-    %103 = call @func.149(%101, %102)
+    %103 = call @func.119(%101, %102)
     br bb11(%6, %103)
 bb11(%7: u32, %8: bool):
     condbr %8, bb2, bb12(%7)
@@ -126228,7 +125565,7 @@ bb15(%11: ptr, %12: ptr, %13: ptr):
     %152 = const i64 8
     %153 = gep i8, ptr %61, %152
     store ptr %13, ptr %153
-    call @func.298(%12, %61)
+    call @func.118(%12, %61)
     br bb16(%11)
 bb16(%14: ptr):
     %154 = load ptr, ptr %14
@@ -126241,7 +125578,7 @@ bb17(%15: ptr, %16: ptr):
     %158 = const i64 8
     %159 = gep i8, ptr %62, %158
     store ptr %16, ptr %159
-    call @func.298(%15, %62)
+    call @func.118(%15, %62)
     br bb50
 bb18(%17: u32):
     %160 = load ptr, ptr %58
@@ -126277,7 +125614,7 @@ bb19:
     br bb20(%184, %187)
 bb20(%18: ptr, %19: ptr):
     %188 = load ptr, ptr %58
-    %189 = call @func.302(%19, %188)
+    %189 = call @func.223(%19, %188)
     br bb21(%18, %189)
 bb21(%20: ptr, %21: bool):
     condbr %21, bb2, bb22(%20)
@@ -126288,7 +125625,7 @@ bb22(%22: ptr):
     br bb23(%192)
 bb23(%23: ptr):
     %193 = load ptr, ptr %58
-    %194 = call @func.302(%23, %193)
+    %194 = call @func.223(%23, %193)
     br bb24(%194)
 bb24(%24: bool):
     condbr %24, bb2, bb25
@@ -126333,7 +125670,7 @@ bb28(%26: ptr, %27: ptr, %28: ptr):
     %225 = const i64 8
     %226 = gep i8, ptr %63, %225
     store ptr %28, ptr %226
-    call @func.298(%27, %63)
+    call @func.118(%27, %63)
     br bb29(%26)
 bb29(%29: ptr):
     %227 = load ptr, ptr %29
@@ -126346,11 +125683,11 @@ bb30(%30: ptr, %31: ptr):
     %231 = const i64 8
     %232 = gep i8, ptr %64, %231
     store ptr %31, ptr %232
-    call @func.298(%30, %64)
+    call @func.118(%30, %64)
     br bb51
 bb31(%32: u32):
     %233 = load ptr, ptr %58
-    call @func.247(%67, %233)
+    call @func.193(%67, %233)
     br bb34(%32)
 bb32:
     %234 = load ptr, ptr %57
@@ -126366,7 +125703,7 @@ bb33(%33: ptr, %34: ptr):
     %241 = const i64 8
     %242 = gep i8, ptr %65, %241
     store ptr %240, ptr %242
-    call @func.298(%33, %65)
+    call @func.118(%33, %65)
     br bb52
 bb34(%35: u32):
     %243 = load ptr, ptr %67
@@ -126374,13 +125711,13 @@ bb34(%35: u32):
     %244 = const i64 8
     %245 = gep i8, ptr %67, %244
     %246 = load u32, ptr %245
-    %247 = call @func.297(%59, %66)
+    %247 = call @func.36(%59, %66)
     br bb35(%35, %246, %247)
 bb35(%36: u32, %37: u32, %38: bool):
     condbr %38, bb38(%36, %37), bb36(%36, %37)
 bb36(%39: u32, %40: u32):
     %248 = load ptr, ptr %66
-    %249 = call @func.215(%248)
+    %249 = call @func.170(%248)
     br bb37(%39, %40, %249)
 bb37(%41: u32, %42: u32, %43: bool):
     condbr %43, bb38(%41, %42), bb40(%41, %42)
@@ -126404,7 +125741,7 @@ bb42:
     %257 = const i64 8
     %258 = gep i8, ptr %68, %257
     store ptr %256, ptr %258
-    call @func.298(%53, %68)
+    call @func.118(%53, %68)
     br bb53
 bb43:
     %259 = const bool false
@@ -126598,9 +125935,6 @@ bb21:
     unreachable
 }
 
-fn @_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRNtCsep0XPuQfTSm_25clean_binding_defeq_slice5LevelNtB7_9PartialEq2eqBF_(functy.301) {
-}
-
 fn @Level__is_geq_leaf(functy.302) {
 bb0(%0: ptr, %1: ptr):
     %20 = alloca i64, align 8
@@ -126611,13 +125945,13 @@ bb0(%0: ptr, %1: ptr):
     %25 = alloca (i64, i64), align 8
     store ptr %0, ptr %20
     store ptr %1, ptr %21
-    %26 = call @func.301(%20, %21)
+    %26 = call @func.36(%20, %21)
     br bb1(%26)
 bb1(%2: bool):
     condbr %2, bb4, bb2
 bb2:
     %27 = load ptr, ptr %21
-    %28 = call @func.215(%27)
+    %28 = call @func.170(%27)
     br bb3(%28)
 bb3(%3: bool):
     condbr %3, bb4, bb5
@@ -126626,7 +125960,7 @@ bb4:
     br bb17(%29)
 bb5:
     %30 = load ptr, ptr %20
-    call @func.247(%23, %30)
+    call @func.193(%23, %30)
     br bb6
 bb6:
     %31 = load ptr, ptr %23
@@ -126640,7 +125974,7 @@ bb6:
 bb7(%4: u32):
     %37 = load ptr, ptr %22
     %38 = load ptr, ptr %21
-    %39 = call @func.149(%37, %38)
+    %39 = call @func.119(%37, %38)
     br bb8(%4, %39)
 bb8(%5: u32, %6: bool):
     condbr %6, bb9, bb10(%5)
@@ -126649,7 +125983,7 @@ bb9:
     br bb17(%40)
 bb10(%7: u32):
     %41 = load ptr, ptr %21
-    call @func.247(%25, %41)
+    call @func.193(%25, %41)
     br bb11(%7)
 bb11(%8: u32):
     %42 = load ptr, ptr %25
@@ -126657,13 +125991,13 @@ bb11(%8: u32):
     %43 = const i64 8
     %44 = gep i8, ptr %25, %43
     %45 = load u32, ptr %44
-    %46 = call @func.301(%22, %24)
+    %46 = call @func.36(%22, %24)
     br bb12(%8, %45, %46)
 bb12(%9: u32, %10: u32, %11: bool):
     condbr %11, bb15(%9, %10), bb13(%9, %10)
 bb13(%12: u32, %13: u32):
     %47 = load ptr, ptr %24
-    %48 = call @func.215(%47)
+    %48 = call @func.170(%47)
     br bb14(%12, %13, %48)
 bb14(%14: u32, %15: u32, %16: bool):
     condbr %16, bb15(%14, %15), bb16
@@ -126687,12 +126021,18 @@ bb17(%19: bool):
 //    Vec<&T>::pop (the cfg-selected shim variants below). Regenerated with:
 //    trust_ir_mir <slice> --crate-type=lib -C panic=abort \
 //      -C overflow-checks=off -C debug-assertions=off --mir-emit-closure <root>.
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const BD_GATE_TRUST_IR: &str = include_str!("clean_binding_defeq.gate.trust.tir");
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(kernel_fixture_ae9_linux)]
+const BD_GATE_TRUST_IR: &str = include_str!("fixtures/ae9-linux/clean_binding_defeq.gate.tir");
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const BD_BLIND_TRUST_IR: &str = include_str!("clean_binding_defeq.blind.trust.tir");
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(kernel_fixture_ae9_linux)]
+const BD_BLIND_TRUST_IR: &str = include_str!("fixtures/ae9-linux/clean_binding_defeq.blind.tir");
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const BD_PROBE_TRUST_IR: &str = include_str!("clean_binding_defeq.probe.trust.tir");
+#[cfg(kernel_fixture_ae9_linux)]
+const BD_PROBE_TRUST_IR: &str = include_str!("fixtures/ae9-linux/clean_binding_defeq.probe.tir");
 
 // ════════════════════════════════════════════════════════════════════════════
 // Native mirror — the slice source itself, compiled natively in this test
@@ -131651,11 +130991,17 @@ fn norm_extern(name: &str) -> String {
 // JIT never sees a data relocation. If a future regen reintroduces a global, the
 // binding loop below fails LOUD with UnresolvedSymbol at compile.
 
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_module(
     text: &str,
     what: &str,
     externs: &HashMap<String, *const u8>,
 ) -> trust_cg_codegen::jit::ExecutableBuffer {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_module");
     let module = parse_and_validate(text, what);
     // Build a normalized index of the shim table so drifting v0 disambiguators
     // (crate/impl tags) between the frozen stable fixture and the re-emitted
@@ -131697,6 +131043,7 @@ fn jit_module(
     }
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &resolved)
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -131707,17 +131054,6 @@ fn bind(buffer: &trust_cg_codegen::jit::ExecutableBuffer, sym: &str) -> *const u
         .get_fn_ptr_bound(sym)
         .unwrap_or_else(|| panic!("JIT symbol `{sym}` not found"))
         .as_ptr()
-}
-
-fn run_with_watchdog<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    match rx.recv_timeout(Duration::from_secs(480)) {
-        Ok(v) => v,
-        Err(_) => panic!("WATCHDOG: `{what}` did not complete within 480s (JIT hang?)"),
-    }
 }
 
 // ── the shims (faithful native bodies; Arc/Vec ops LEAK — the landed model) ──
@@ -134121,4 +133457,13 @@ fn bd_armed_module_corruption_diverges() {
     );
 
     drop(buffer);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

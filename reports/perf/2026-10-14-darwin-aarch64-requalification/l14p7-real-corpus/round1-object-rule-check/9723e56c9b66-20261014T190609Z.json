@@ -1,0 +1,1755 @@
+{
+ "aggregates": {
+  "bridge": {
+   "by_kind": {
+    "real-crate": {
+     "completed": 1,
+     "completion_pct": 16.7,
+     "rows": 6
+    }
+   },
+   "completed": 1,
+   "completed_with_code": 0,
+   "completion_pct": 16.7,
+   "completion_with_code_pct": 0.0,
+   "counts": {
+    "BASELINE-FAILED": 0,
+    "COMPILED": 1,
+    "ERROR": 4,
+    "INCOMPLETE": 1,
+    "INVALID-INPUT": 0,
+    "MATCH": 0,
+    "MISMATCH": 0,
+    "NONDET-FAILCLOSED": 0,
+    "TIMEOUT": 0,
+    "UNAVAILABLE": 0
+   },
+   "lane": "bridge",
+   "ratios": {
+    "compile_cpu_s": {
+     "geomean": 1.6296296296296295,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.6296296296296295
+    },
+    "compile_instructions": {
+     "geomean": 1.1768014566548344,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.1768014566548344
+    },
+    "compile_maxrss_bytes": {
+     "geomean": 1.2063780768764398,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.2063780768764398
+    },
+    "compile_wall_s": {
+     "geomean": 1.0901270603779138,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.0901270603779138
+    }
+   },
+   "refused_rows_by_code": {
+    "[TCG-MIR-UNSUPPORTED]": 1,
+    "[TCG-PROOF-465]": 1
+   },
+   "rows": 6,
+   "unclassified": [],
+   "vacuous_completed": [
+    "crate/unicode-ident-1.0.24"
+   ]
+  },
+  "diagnostic": {
+   "by_kind": {
+    "real-crate": {
+     "completed": 2,
+     "completion_pct": 33.3,
+     "rows": 6
+    }
+   },
+   "completed": 2,
+   "completed_with_code": 1,
+   "completion_pct": 33.3,
+   "completion_with_code_pct": 16.7,
+   "counts": {
+    "BASELINE-FAILED": 0,
+    "COMPILED": 2,
+    "ERROR": 4,
+    "INCOMPLETE": 0,
+    "INVALID-INPUT": 0,
+    "MATCH": 0,
+    "MISMATCH": 0,
+    "NONDET-FAILCLOSED": 0,
+    "TIMEOUT": 0,
+    "UNAVAILABLE": 0
+   },
+   "lane": "diagnostic",
+   "ratios": {
+    "code_bytes": {
+     "geomean": 1.4285714285714286,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.4285714285714286
+    },
+    "compile_cpu_s": {
+     "geomean": 1.5092308563562362,
+     "missing": [],
+     "rows": 2,
+     "worst": 1.5185185185185186
+    },
+    "compile_instructions": {
+     "geomean": 1.139454546723467,
+     "missing": [],
+     "rows": 2,
+     "worst": 1.1434621238023346
+    },
+    "compile_maxrss_bytes": {
+     "geomean": 1.0722007616567488,
+     "missing": [],
+     "rows": 2,
+     "worst": 1.1034315508669819
+    },
+    "compile_wall_s": {
+     "geomean": 1.0336462344992576,
+     "missing": [],
+     "rows": 2,
+     "worst": 1.036304309661172
+    }
+   },
+   "refused_rows_by_code": {},
+   "rows": 6,
+   "unclassified": [],
+   "vacuous_completed": [
+    "crate/unicode-ident-1.0.24"
+   ]
+  }
+ },
+ "eligible": false,
+ "ineligible_reasons": [
+  "stale bridge backend measured (--allow-stale-dylib)",
+  "corpus subset (--only/--kinds)"
+ ],
+ "provenance": {
+  "affinity": {
+   "core": null,
+   "cpu_capacity": null,
+   "heterogeneous": true,
+   "method": null,
+   "policy": "none",
+   "selection": null,
+   "topology_source": "sysctl hw.nperflevels 2"
+  },
+  "backend_load_failures": [],
+  "cache": {
+   "XDG_CACHE_HOME": null,
+   "mode": "warm (the host's own trust-cg caches)"
+  },
+  "cargo_home": "$HOME/.cargo",
+  "cc_version": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "cpu_features": [
+   "arm.AdvSIMD",
+   "arm.AdvSIMD_HPFPCvt",
+   "arm.FEAT_AES",
+   "arm.FEAT_AFP",
+   "arm.FEAT_BF16",
+   "arm.FEAT_BTI",
+   "arm.FEAT_CRC32",
+   "arm.FEAT_CSV2",
+   "arm.FEAT_CSV3",
+   "arm.FEAT_DIT",
+   "arm.FEAT_DPB",
+   "arm.FEAT_DPB2",
+   "arm.FEAT_DotProd",
+   "arm.FEAT_ECV",
+   "arm.FEAT_FCMA",
+   "arm.FEAT_FHM",
+   "arm.FEAT_FP16",
+   "arm.FEAT_FPAC",
+   "arm.FEAT_FPACCOMBINE",
+   "arm.FEAT_FRINTTS",
+   "arm.FEAT_FlagM",
+   "arm.FEAT_FlagM2",
+   "arm.FEAT_I8MM",
+   "arm.FEAT_JSCVT",
+   "arm.FEAT_LRCPC",
+   "arm.FEAT_LRCPC2",
+   "arm.FEAT_LSE",
+   "arm.FEAT_LSE2",
+   "arm.FEAT_PACIMP",
+   "arm.FEAT_PAuth",
+   "arm.FEAT_PAuth2",
+   "arm.FEAT_PMULL",
+   "arm.FEAT_RDM",
+   "arm.FEAT_RPRES",
+   "arm.FEAT_SB",
+   "arm.FEAT_SHA1",
+   "arm.FEAT_SHA256",
+   "arm.FEAT_SHA3",
+   "arm.FEAT_SHA512",
+   "arm.FEAT_SME",
+   "arm.FEAT_SME2",
+   "arm.FEAT_SME_F64F64",
+   "arm.FEAT_SME_I16I64",
+   "arm.FEAT_WFxT",
+   "arm.FP_SyncExceptions",
+   "arm.SME_B16F32",
+   "arm.SME_BI32I32",
+   "arm.SME_F16F32",
+   "arm.SME_F32F32",
+   "arm.SME_I16I32",
+   "arm.SME_I8I32",
+   "arm64",
+   "armv8_1_atomics",
+   "armv8_2_fhm",
+   "armv8_2_sha3",
+   "armv8_2_sha512",
+   "armv8_3_compnum",
+   "armv8_crc32",
+   "armv8_gpi",
+   "floatingpoint",
+   "neon",
+   "neon_fp16",
+   "neon_hpfp",
+   "ucnormal_mem"
+  ],
+  "cpu_features_sha256": "8109e26100af753c673ddc26c96e39495d05c26d9da560724815fba35df70f5c",
+  "cpu_features_source": "sysctl hw.optional / machdep.cpu",
+  "diagnostic_lane": true,
+  "driver": {
+   "commit": "321aaeda75478038420d97830f14724c33c8dc39",
+   "compiler": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc",
+   "compiler_flags": [
+    "-Ztrust-verify=off"
+   ],
+   "host": "aarch64-apple-darwin",
+   "lane": "unverified",
+   "lane_label": "diagnostic: explicit unverified Trust lane (-Ztrust-verify=off for direct compiles, targo --unverified for builds); no Trust-verified compilation claim",
+   "release": "1.99.0-dev",
+   "selection": "explicit-driver",
+   "sysroot": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192",
+   "targo": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo",
+   "version": "rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)"
+  },
+  "dylib_mtime": "2026-10-14T13:38:24+00:00",
+  "dylib_path": "$HOME/trust-cg-w19/perf-requalification-L14-P1/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib",
+  "dylib_sha256": "55cc7f2f8bf46d677004b1ba2284733fc6cea2d7ebd0e8b935802c700e0ce395",
+  "dylib_stale_override": true,
+  "dylib_stale_source": "$HOME/trust-cg-w19/perf-requalification-L14-P1/Cargo.toml",
+  "full_corpus": false,
+  "git_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "git_dirty": false,
+  "git_sha": "9723e56c9b66456e2ae5edf21993df79a926b242",
+  "harness": "benchmarks/real-corpus/run.py",
+  "host_arch": "arm64",
+  "host_model": "Apple M4 Max",
+  "host_model_source": "sysctl machdep.cpu.brand_string",
+  "host_name": "m110-macbook-M4-Max-48GB-1TB.local",
+  "legacy_host_model": "Mac16,5",
+  "linker_version": "@(#)PROGRAM:ld PROJECT:ld-27037.1",
+  "load_threshold": 8.0,
+  "load_threshold_overridden": false,
+  "loadavg_after": [
+   6.38,
+   7.15,
+   8.16
+  ],
+  "loadavg_before": [
+   5.86,
+   7.08,
+   8.16
+  ],
+  "machine_model": "Mac16,5",
+  "manifest": {
+   "committed_sha256": "e8883a23acd04082bb1e2e78f0933e67549ef989a6174e3fcaa2b318e9e88a8b",
+   "corpus": "l14-real-corpus",
+   "is_committed": true,
+   "path": "benchmarks/real-corpus/manifest.json",
+   "sha256": "e8883a23acd04082bb1e2e78f0933e67549ef989a6174e3fcaa2b318e9e88a8b",
+   "version": "1.0.0"
+  },
+  "n_compile": 3,
+  "n_run": 5,
+  "ncpu": 16,
+  "os": "Darwin 25.6.0 arm64",
+  "proof_checker": {
+   "candidates": [
+    {
+     "path": "$HOME/Library/Application Support/aterm/pkg/store/clean/8606/bin/clean",
+     "probe": "--version",
+     "returncode": 0,
+     "route": "aterm-packaged",
+     "runs": true,
+     "sha256": "9c594e838ff7e73815977c2d675238828f82417e77986abfe38d75b8ab060e16",
+     "version": "clean 0.9.0"
+    },
+    {
+     "path": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/clean",
+     "probe": "--version",
+     "returncode": 0,
+     "route": "toolchain-sysroot",
+     "runs": true,
+     "sha256": "53937293d4bc49d6ccd4aa57b7739f3a02b27aa478f1c6e295f2ab9f0394e822",
+     "version": "clean 0.9.0"
+    }
+   ],
+   "order": "aterm-packaged (PATH <prefix>/bin), then the driver's sysroot bin/clean",
+   "tool": "clean"
+  },
+  "proof_checker_degraded": [],
+  "python": "3.14.5",
+  "runaway_processes": [],
+  "sampler": {
+   "cpu": "user+sys of the command and every waited-for descendant",
+   "instructions_cycles": "the compiler/program process itself (Darwin proc rusage), not its children",
+   "maxrss": "largest single process of the tree (rusage of reaped children)",
+   "wall": "harness monotonic clock around the wrapped command",
+   "wrapper": "/usr/bin/time -l"
+  },
+  "schema": "trust-cg-real-corpus-results-v1",
+  "selection": {
+   "kinds": null,
+   "only": [
+    "crate/either-1.18.0",
+    "crate/fnv-1.0.7",
+    "crate/rustc-hash-2.1.2",
+    "crate/scopeguard-1.2.0",
+    "crate/unicode-ident-1.0.24",
+    "crate/arrayvec-0.7.8"
+   ]
+  },
+  "target": "aarch64-apple-darwin",
+  "target_selection": "driver host",
+  "tcg_env": {},
+  "timestamp_utc": "2026-10-14T19:05:50+00:00",
+  "trust_checkout": null,
+  "untracked_count": 1
+ },
+ "rows": [
+  {
+   "crate_type": "lib",
+   "diagnostic_outcome": "COMPILED",
+   "edition": "2018",
+   "features": [
+    "std"
+   ],
+   "id": "crate/arrayvec-0.7.8",
+   "kind": "real-crate",
+   "lanes": {
+    "bridge": {
+     "attempts": [
+      {
+       "cycles": 1909108756,
+       "first_error": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling):",
+       "footprint_bytes": 105087912,
+       "instructions": 5379330055,
+       "maxrss_bytes": 205160448,
+       "returncode": 1,
+       "stderr_sha256": "5f269956fe2e5fb8521b0d2cca55a4f9bfa4f01f9a8f53596c7aa00209c193f7",
+       "stderr_tail": "[trust-cg] proof checker $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/clean skipped (it was built WITHOUT the `carcara-verify` cargo feature, so it rejects every Alethe proof regardless of validity); using $HOME/Library/Application Support/aterm/pkg/store/clean/8606/bin/clean\nnote: compiled WITHOUT Trust verification \u2014 0 obligations checked\n\nerror: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling):\n         - _RNvNtCs4x6Kbu4VOIT_8arrayvec8arrayvec12extend_panic (reachable Rust-internal monomorphization, not a std-internal shim): [TCG-PROOF-465] rustc_codegen_trust_cg: Trust Codegen object emission failed: proof promotion rejected for target Aarch64: non_verified proof entry opcode_inventory_instruction_0 in _RNvNtCs4x6Kbu4VOIT_8arrayvec8arrayvec12extend_panic: emitted opcode inventory found 8 uncovered non-pseudo opcode(s) across 6 distinct opcode(s) [AArch64::AddRI, AArch64::MOVXrr, AArch64::Adrp, AArch64::AddPCRel, AArch64::Movz, AArch64::Bl]; first in _RNvNtCs4x6Kbu4VOIT_8arrayvec8arrayvec12extend_panic[25] is AArch64::AddRI (no complete evidence: statistical sampling is not proof credit: `RECONSTRUCTED Iadd_64 -> AddRI (real-operand)` found no counterexample in 100000 sampled inputs)\n\nerror: aborting due to 1 previous error\n",
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "tcg_codes": [
+        "[TCG-MIR-UNSUPPORTED]",
+        "[TCG-PROOF-465]"
+       ],
+       "timed_out": false,
+       "user_s": 0.57,
+       "wall_s": 0.497438
+      },
+      {
+       "cycles": 1889615613,
+       "first_error": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling):",
+       "footprint_bytes": 105350080,
+       "instructions": 5376437208,
+       "maxrss_bytes": 205389824,
+       "returncode": 1,
+       "stderr_sha256": "5f269956fe2e5fb8521b0d2cca55a4f9bfa4f01f9a8f53596c7aa00209c193f7",
+       "stderr_tail": "[trust-cg] proof checker $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/clean skipped (it was built WITHOUT the `carcara-verify` cargo feature, so it rejects every Alethe proof regardless of validity); using $HOME/Library/Application Support/aterm/pkg/store/clean/8606/bin/clean\nnote: compiled WITHOUT Trust verification \u2014 0 obligations checked\n\nerror: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling):\n         - _RNvNtCs4x6Kbu4VOIT_8arrayvec8arrayvec12extend_panic (reachable Rust-internal monomorphization, not a std-internal shim): [TCG-PROOF-465] rustc_codegen_trust_cg: Trust Codegen object emission failed: proof promotion rejected for target Aarch64: non_verified proof entry opcode_inventory_instruction_0 in _RNvNtCs4x6Kbu4VOIT_8arrayvec8arrayvec12extend_panic: emitted opcode inventory found 8 uncovered non-pseudo opcode(s) across 6 distinct opcode(s) [AArch64::AddRI, AArch64::MOVXrr, AArch64::Adrp, AArch64::AddPCRel, AArch64::Movz, AArch64::Bl]; first in _RNvNtCs4x6Kbu4VOIT_8arrayvec8arrayvec12extend_panic[25] is AArch64::AddRI (no complete evidence: statistical sampling is not proof credit: `RECONSTRUCTED Iadd_64 -> AddRI (real-operand)` found no counterexample in 100000 sampled inputs)\n\nerror: aborting due to 1 previous error\n",
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "tcg_codes": [
+        "[TCG-MIR-UNSUPPORTED]",
+        "[TCG-PROOF-465]"
+       ],
+       "timed_out": false,
+       "user_s": 0.57,
+       "wall_s": 0.47504
+      }
+     ],
+     "refusal_instructions": 5376437208,
+     "refusal_wall_s": 0.47504,
+     "samples": [],
+     "tcg_codes": [
+      "[TCG-MIR-UNSUPPORTED]",
+      "[TCG-PROOF-465]"
+     ]
+    },
+    "diagnostic": {
+     "attempts": [
+      {
+       "code_bytes": 40,
+       "cycles": 1852204968,
+       "footprint_bytes": 85590928,
+       "instructions": 5164534680,
+       "maxrss_bytes": 193642496,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.44,
+       "wall_s": 0.344202
+      }
+     ],
+     "code_bytes": 40,
+     "samples": [
+      {
+       "code_bytes": 40,
+       "cycles": 1895891407,
+       "footprint_bytes": 85476216,
+       "instructions": 5186793534,
+       "maxrss_bytes": 193691648,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.05,
+       "timed_out": false,
+       "user_s": 0.44,
+       "wall_s": 0.35432
+      },
+      {
+       "code_bytes": 40,
+       "cycles": 1856125013,
+       "footprint_bytes": 85525368,
+       "instructions": 5173358612,
+       "maxrss_bytes": 193740800,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.43,
+       "wall_s": 0.342056
+      },
+      {
+       "code_bytes": 40,
+       "cycles": 1859134411,
+       "footprint_bytes": 85656464,
+       "instructions": 5182674191,
+       "maxrss_bytes": 193724416,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.44,
+       "wall_s": 0.342368
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.48,
+      "cycles": 1859134411,
+      "footprint_bytes": 85525368,
+      "instructions": 5182674191,
+      "maxrss_bytes": 193724416,
+      "n": 3,
+      "wall_s": 0.342368
+     }
+    },
+    "llvm": {
+     "code_bytes": 28,
+     "samples": [
+      {
+       "code_bytes": 28,
+       "cycles": 1290329180,
+       "footprint_bytes": 81920816,
+       "instructions": 4561824428,
+       "maxrss_bytes": 186269696,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.31,
+       "wall_s": 0.329929
+      },
+      {
+       "code_bytes": 28,
+       "cycles": 1293426779,
+       "footprint_bytes": 80954160,
+       "instructions": 4571883292,
+       "maxrss_bytes": 185679872,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.31,
+       "wall_s": 0.330374
+      },
+      {
+       "code_bytes": 28,
+       "cycles": 1283614837,
+       "footprint_bytes": 82002712,
+       "instructions": 4564378804,
+       "maxrss_bytes": 185942016,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.32,
+       "wall_s": 0.338303
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.32,
+      "cycles": 1290329180,
+      "footprint_bytes": 81920816,
+      "instructions": 4564378804,
+      "maxrss_bytes": 185942016,
+      "n": 3,
+      "wall_s": 0.330374
+     }
+    }
+   },
+   "lines": 3535,
+   "loadavg_end": [
+    5.86,
+    7.08,
+    8.16
+   ],
+   "loadavg_start": [
+    5.86,
+    7.08,
+    8.16
+   ],
+   "opt_level": "3",
+   "outcome": "INCOMPLETE",
+   "ratios": {
+    "diagnostic": {
+     "code_bytes": 1.4285714285714286,
+     "compile_cpu_s": 1.5,
+     "compile_instructions": 1.1354610152992026,
+     "compile_maxrss_bytes": 1.0418539078332893,
+     "compile_wall_s": 1.036304309661172
+    }
+   },
+   "refusal_cost_vs_llvm": 1.4378855478942048,
+   "source": {
+    "name": "arrayvec",
+    "sha256": "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56",
+    "type": "crates-io",
+    "version": "0.7.8"
+   },
+   "source_sha256": "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56",
+   "timeout_s": 900.0,
+   "vacuous": false
+  },
+  {
+   "crate_type": "lib",
+   "diagnostic_outcome": "ERROR",
+   "edition": "2021",
+   "features": [
+    "std"
+   ],
+   "id": "crate/either-1.18.0",
+   "kind": "real-crate",
+   "lanes": {
+    "bridge": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1810728331,
+       "footprint_bytes": 86541224,
+       "instructions": 5202658382,
+       "maxrss_bytes": 177045504,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.43,
+       "wall_s": 0.324417
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1826066969,
+       "footprint_bytes": 85230504,
+       "instructions": 5209012509,
+       "maxrss_bytes": 175734784,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.43,
+       "wall_s": 0.328043
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1822331181,
+       "footprint_bytes": 86459280,
+       "instructions": 5217126324,
+       "maxrss_bytes": 176979968,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.43,
+       "wall_s": 0.333043
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1827131653,
+       "footprint_bytes": 86295464,
+       "instructions": 5217739574,
+       "maxrss_bytes": 176799744,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.43,
+       "wall_s": 0.330897
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.47,
+      "cycles": 1826066969,
+      "footprint_bytes": 86295464,
+      "instructions": 5217126324,
+      "maxrss_bytes": 176799744,
+      "n": 3,
+      "wall_s": 0.330897
+     }
+    },
+    "diagnostic": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1790241176,
+       "footprint_bytes": 76497808,
+       "instructions": 5095943212,
+       "maxrss_bytes": 164282368,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.42,
+       "wall_s": 0.325034
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1793347407,
+       "footprint_bytes": 75400104,
+       "instructions": 5102200334,
+       "maxrss_bytes": 163168256,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.42,
+       "wall_s": 0.325461
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1796006597,
+       "footprint_bytes": 75645864,
+       "instructions": 5102896267,
+       "maxrss_bytes": 163414016,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.42,
+       "wall_s": 0.325886
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1852446822,
+       "footprint_bytes": 76399504,
+       "instructions": 5117645133,
+       "maxrss_bytes": 164184064,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.05,
+       "timed_out": false,
+       "user_s": 0.42,
+       "wall_s": 0.340032
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.44999999999999996,
+      "cycles": 1796006597,
+      "footprint_bytes": 75645864,
+      "instructions": 5102896267,
+      "maxrss_bytes": 163414016,
+      "n": 3,
+      "wall_s": 0.325886
+     }
+    },
+    "llvm": {
+     "code_bytes": 0,
+     "samples": [
+      {
+       "code_bytes": 0,
+       "cycles": 1251130600,
+       "footprint_bytes": 74023776,
+       "instructions": 4547185757,
+       "maxrss_bytes": 160808960,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.3,
+       "wall_s": 0.320411
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1237712100,
+       "footprint_bytes": 75203400,
+       "instructions": 4540753566,
+       "maxrss_bytes": 162004992,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.31,
+       "wall_s": 0.328575
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1245706589,
+       "footprint_bytes": 75006816,
+       "instructions": 4539362055,
+       "maxrss_bytes": 161792000,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.3,
+       "wall_s": 0.3213
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.31,
+      "cycles": 1245706589,
+      "footprint_bytes": 75006816,
+      "instructions": 4540753566,
+      "maxrss_bytes": 161792000,
+      "n": 3,
+      "wall_s": 0.3213
+     }
+    }
+   },
+   "lines": 2423,
+   "loadavg_end": [
+    7.15,
+    7.33,
+    8.24
+   ],
+   "loadavg_start": [
+    5.86,
+    7.08,
+    8.16
+   ],
+   "opt_level": "3",
+   "outcome": "ERROR",
+   "ratios": {},
+   "reason": "the compile exited 0 but wrote no object",
+   "refusal_cost_vs_llvm": null,
+   "source": {
+    "name": "either",
+    "sha256": "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34",
+    "type": "crates-io",
+    "version": "1.18.0"
+   },
+   "source_sha256": "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34",
+   "timeout_s": 900.0,
+   "vacuous": true
+  },
+  {
+   "crate_type": "lib",
+   "diagnostic_outcome": "ERROR",
+   "edition": "2015",
+   "features": [
+    "std"
+   ],
+   "id": "crate/fnv-1.0.7",
+   "kind": "real-crate",
+   "lanes": {
+    "bridge": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1623674810,
+       "footprint_bytes": 71287744,
+       "instructions": 4567805885,
+       "maxrss_bytes": 151764992,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.275952
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1634585156,
+       "footprint_bytes": 71222160,
+       "instructions": 4567274057,
+       "maxrss_bytes": 148963328,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.28084
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1626477865,
+       "footprint_bytes": 71926696,
+       "instructions": 4564790597,
+       "maxrss_bytes": 152420352,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.278126
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1610819827,
+       "footprint_bytes": 71369640,
+       "instructions": 4557963560,
+       "maxrss_bytes": 151846912,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.273982
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.41000000000000003,
+      "cycles": 1626477865,
+      "footprint_bytes": 71369640,
+      "instructions": 4564790597,
+      "maxrss_bytes": 151846912,
+      "n": 3,
+      "wall_s": 0.278126
+     }
+    },
+    "diagnostic": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1596509025,
+       "footprint_bytes": 61490064,
+       "instructions": 4460033519,
+       "maxrss_bytes": 139264000,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.37,
+       "wall_s": 0.27548
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1597245452,
+       "footprint_bytes": 61752184,
+       "instructions": 4460860931,
+       "maxrss_bytes": 139542528,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.37,
+       "wall_s": 0.276078
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1617940130,
+       "footprint_bytes": 61391736,
+       "instructions": 4469339371,
+       "maxrss_bytes": 139182080,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.291117
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1615139078,
+       "footprint_bytes": 61096824,
+       "instructions": 4469152595,
+       "maxrss_bytes": 138887168,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.285602
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.42,
+      "cycles": 1615139078,
+      "footprint_bytes": 61391736,
+      "instructions": 4469152595,
+      "maxrss_bytes": 139182080,
+      "n": 3,
+      "wall_s": 0.285602
+     }
+    },
+    "llvm": {
+     "code_bytes": 0,
+     "samples": [
+      {
+       "code_bytes": 0,
+       "cycles": 1059635416,
+       "footprint_bytes": 60211968,
+       "instructions": 3897210066,
+       "maxrss_bytes": 135823360,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.25,
+       "wall_s": 0.273883
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1056951851,
+       "footprint_bytes": 60130072,
+       "instructions": 3893833498,
+       "maxrss_bytes": 135741440,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.25,
+       "wall_s": 0.271582
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1059971544,
+       "footprint_bytes": 60048152,
+       "instructions": 3903301602,
+       "maxrss_bytes": 135823360,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.25,
+       "wall_s": 0.272353
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.26,
+      "cycles": 1059635416,
+      "footprint_bytes": 60130072,
+      "instructions": 3897210066,
+      "maxrss_bytes": 135823360,
+      "n": 3,
+      "wall_s": 0.272353
+     }
+    }
+   },
+   "lines": 367,
+   "loadavg_end": [
+    6.9,
+    7.28,
+    8.21
+   ],
+   "loadavg_start": [
+    7.15,
+    7.33,
+    8.24
+   ],
+   "opt_level": "3",
+   "outcome": "ERROR",
+   "ratios": {},
+   "reason": "the compile exited 0 but wrote no object",
+   "refusal_cost_vs_llvm": null,
+   "source": {
+    "name": "fnv",
+    "sha256": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1",
+    "type": "crates-io",
+    "version": "1.0.7"
+   },
+   "source_sha256": "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1",
+   "timeout_s": 900.0,
+   "vacuous": true
+  },
+  {
+   "crate_type": "lib",
+   "diagnostic_outcome": "ERROR",
+   "edition": "2021",
+   "features": [
+    "std"
+   ],
+   "id": "crate/rustc-hash-2.1.2",
+   "kind": "real-crate",
+   "lanes": {
+    "bridge": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1655312939,
+       "footprint_bytes": 76071824,
+       "instructions": 4654004439,
+       "maxrss_bytes": 164020224,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.286568
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1666292286,
+       "footprint_bytes": 74924968,
+       "instructions": 4661047122,
+       "maxrss_bytes": 162840576,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.288959
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1657139629,
+       "footprint_bytes": 74957712,
+       "instructions": 4661466758,
+       "maxrss_bytes": 160235520,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.286855
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1658845670,
+       "footprint_bytes": 76383120,
+       "instructions": 4654559292,
+       "maxrss_bytes": 164331520,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.286746
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.42000000000000004,
+      "cycles": 1658845670,
+      "footprint_bytes": 74957712,
+      "instructions": 4661047122,
+      "maxrss_bytes": 162840576,
+      "n": 3,
+      "wall_s": 0.286855
+     }
+    },
+    "diagnostic": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1651583057,
+       "footprint_bytes": 66175888,
+       "instructions": 4546941288,
+       "maxrss_bytes": 151371776,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.289809
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1638459968,
+       "footprint_bytes": 66126712,
+       "instructions": 4539679832,
+       "maxrss_bytes": 151355392,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.285742
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1630268564,
+       "footprint_bytes": 65569680,
+       "instructions": 4548006792,
+       "maxrss_bytes": 150781952,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.284316
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1631013778,
+       "footprint_bytes": 66143120,
+       "instructions": 4547517671,
+       "maxrss_bytes": 151339008,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.28451
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.41000000000000003,
+      "cycles": 1631013778,
+      "footprint_bytes": 66126712,
+      "instructions": 4547517671,
+      "maxrss_bytes": 151339008,
+      "n": 3,
+      "wall_s": 0.28451
+     }
+    },
+    "llvm": {
+     "code_bytes": 0,
+     "samples": [
+      {
+       "code_bytes": 0,
+       "cycles": 1082142779,
+       "footprint_bytes": 63521584,
+       "instructions": 3989127660,
+       "maxrss_bytes": 146980864,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.27,
+       "wall_s": 0.28957
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1079616736,
+       "footprint_bytes": 64799560,
+       "instructions": 3989449093,
+       "maxrss_bytes": 148946944,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.26,
+       "wall_s": 0.284974
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1100656642,
+       "footprint_bytes": 64815920,
+       "instructions": 3999078824,
+       "maxrss_bytes": 148324352,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.26,
+       "wall_s": 0.286169
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.27,
+      "cycles": 1082142779,
+      "footprint_bytes": 64799560,
+      "instructions": 3989449093,
+      "maxrss_bytes": 148324352,
+      "n": 3,
+      "wall_s": 0.286169
+     }
+    }
+   },
+   "lines": 675,
+   "loadavg_end": [
+    6.9,
+    7.28,
+    8.21
+   ],
+   "loadavg_start": [
+    6.9,
+    7.28,
+    8.21
+   ],
+   "opt_level": "3",
+   "outcome": "ERROR",
+   "ratios": {},
+   "reason": "the compile exited 0 but wrote no object",
+   "refusal_cost_vs_llvm": null,
+   "source": {
+    "name": "rustc-hash",
+    "sha256": "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe",
+    "type": "crates-io",
+    "version": "2.1.2"
+   },
+   "source_sha256": "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe",
+   "timeout_s": 900.0,
+   "vacuous": true
+  },
+  {
+   "crate_type": "lib",
+   "diagnostic_outcome": "ERROR",
+   "edition": "2015",
+   "features": [
+    "use_std"
+   ],
+   "id": "crate/scopeguard-1.2.0",
+   "kind": "real-crate",
+   "lanes": {
+    "bridge": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1652339054,
+       "footprint_bytes": 74449832,
+       "instructions": 4611174091,
+       "maxrss_bytes": 155893760,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.283082
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1638087158,
+       "footprint_bytes": 74875816,
+       "instructions": 4611211839,
+       "maxrss_bytes": 156319744,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.281902
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1651999771,
+       "footprint_bytes": 74875792,
+       "instructions": 4617544387,
+       "maxrss_bytes": 156319744,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.285358
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1639254008,
+       "footprint_bytes": 74662872,
+       "instructions": 4611798462,
+       "maxrss_bytes": 156073984,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.281502
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.41000000000000003,
+      "cycles": 1639254008,
+      "footprint_bytes": 74875792,
+      "instructions": 4611798462,
+      "maxrss_bytes": 156319744,
+      "n": 3,
+      "wall_s": 0.281902
+     }
+    },
+    "diagnostic": {
+     "attempts": [
+      {
+       "code_bytes": null,
+       "cycles": 1615232415,
+       "footprint_bytes": 64652152,
+       "instructions": 4512385576,
+       "maxrss_bytes": 143392768,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.281964
+      }
+     ],
+     "code_bytes": null,
+     "error": "the compile exited 0 but wrote no object",
+     "samples": [
+      {
+       "code_bytes": null,
+       "cycles": 1626015599,
+       "footprint_bytes": 64979856,
+       "instructions": 4507479614,
+       "maxrss_bytes": 143687680,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.283294
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1633112882,
+       "footprint_bytes": 64979856,
+       "instructions": 4499202448,
+       "maxrss_bytes": 143687680,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.284177
+      },
+      {
+       "code_bytes": null,
+       "cycles": 1604901670,
+       "footprint_bytes": 64865168,
+       "instructions": 4494743965,
+       "maxrss_bytes": 143589376,
+       "objects": 0,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.278817
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.41000000000000003,
+      "cycles": 1626015599,
+      "footprint_bytes": 64979856,
+      "instructions": 4499202448,
+      "maxrss_bytes": 143687680,
+      "n": 3,
+      "wall_s": 0.283294
+     }
+    },
+    "llvm": {
+     "code_bytes": 0,
+     "samples": [
+      {
+       "code_bytes": 0,
+       "cycles": 1071859601,
+       "footprint_bytes": 63456000,
+       "instructions": 3941925173,
+       "maxrss_bytes": 140378112,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.26,
+       "wall_s": 0.279044
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1084794059,
+       "footprint_bytes": 63439640,
+       "instructions": 3951982360,
+       "maxrss_bytes": 140525568,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.26,
+       "wall_s": 0.282411
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1067269076,
+       "footprint_bytes": 63374080,
+       "instructions": 3942296628,
+       "maxrss_bytes": 140312576,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.26,
+       "wall_s": 0.277615
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.27,
+      "cycles": 1071859601,
+      "footprint_bytes": 63439640,
+      "instructions": 3942296628,
+      "maxrss_bytes": 140378112,
+      "n": 3,
+      "wall_s": 0.279044
+     }
+    }
+   },
+   "lines": 624,
+   "loadavg_end": [
+    6.59,
+    7.21,
+    8.18
+   ],
+   "loadavg_start": [
+    6.9,
+    7.28,
+    8.21
+   ],
+   "opt_level": "3",
+   "outcome": "ERROR",
+   "ratios": {},
+   "reason": "the compile exited 0 but wrote no object",
+   "refusal_cost_vs_llvm": null,
+   "source": {
+    "name": "scopeguard",
+    "sha256": "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49",
+    "type": "crates-io",
+    "version": "1.2.0"
+   },
+   "source_sha256": "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49",
+   "timeout_s": 900.0,
+   "vacuous": true
+  },
+  {
+   "crate_type": "lib",
+   "diagnostic_outcome": "COMPILED",
+   "edition": "2021",
+   "features": [],
+   "id": "crate/unicode-ident-1.0.24",
+   "kind": "real-crate",
+   "lanes": {
+    "bridge": {
+     "attempts": [
+      {
+       "code_bytes": 16,
+       "cycles": 1699113500,
+       "footprint_bytes": 73122704,
+       "instructions": 4746470097,
+       "maxrss_bytes": 162955264,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.4,
+       "wall_s": 0.308471
+      }
+     ],
+     "code_bytes": 16,
+     "samples": [
+      {
+       "code_bytes": 16,
+       "cycles": 1678956439,
+       "footprint_bytes": 73417616,
+       "instructions": 4744864530,
+       "maxrss_bytes": 163233792,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.04,
+       "timed_out": false,
+       "user_s": 0.4,
+       "wall_s": 0.303632
+      },
+      {
+       "code_bytes": 16,
+       "cycles": 1768590229,
+       "footprint_bytes": 73171856,
+       "instructions": 4767818011,
+       "maxrss_bytes": 162971648,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.06,
+       "timed_out": false,
+       "user_s": 0.4,
+       "wall_s": 0.321622
+      },
+      {
+       "code_bytes": 16,
+       "cycles": 1665940405,
+       "footprint_bytes": 73204624,
+       "instructions": 4737151024,
+       "maxrss_bytes": 163004416,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.293202
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.44,
+      "cycles": 1678956439,
+      "footprint_bytes": 73204624,
+      "instructions": 4744864530,
+      "maxrss_bytes": 163004416,
+      "n": 3,
+      "wall_s": 0.303632
+     }
+    },
+    "diagnostic": {
+     "attempts": [
+      {
+       "code_bytes": 16,
+       "cycles": 1629183202,
+       "footprint_bytes": 63095648,
+       "instructions": 4614114290,
+       "maxrss_bytes": 149045248,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.285022
+      }
+     ],
+     "code_bytes": 16,
+     "samples": [
+      {
+       "code_bytes": 16,
+       "cycles": 1637888081,
+       "footprint_bytes": 63161208,
+       "instructions": 4611835121,
+       "maxrss_bytes": 149094400,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.287162
+      },
+      {
+       "code_bytes": 16,
+       "cycles": 1628265265,
+       "footprint_bytes": 63161208,
+       "instructions": 4610434639,
+       "maxrss_bytes": 149094400,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.38,
+       "wall_s": 0.285089
+      },
+      {
+       "code_bytes": 16,
+       "cycles": 1642326219,
+       "footprint_bytes": 63030136,
+       "instructions": 4610440310,
+       "maxrss_bytes": 148963328,
+       "objects": 4,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.03,
+       "timed_out": false,
+       "user_s": 0.39,
+       "wall_s": 0.288311
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.41000000000000003,
+      "cycles": 1637888081,
+      "footprint_bytes": 63161208,
+      "instructions": 4610440310,
+      "maxrss_bytes": 149094400,
+      "n": 3,
+      "wall_s": 0.287162
+     }
+    },
+    "llvm": {
+     "code_bytes": 0,
+     "samples": [
+      {
+       "code_bytes": 0,
+       "cycles": 1080631171,
+       "footprint_bytes": 61784856,
+       "instructions": 4030834033,
+       "maxrss_bytes": 135118848,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.26,
+       "wall_s": 0.277749
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1071823442,
+       "footprint_bytes": 61834008,
+       "instructions": 4032000898,
+       "maxrss_bytes": 135118848,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.26,
+       "wall_s": 0.278529
+      },
+      {
+       "code_bytes": 0,
+       "cycles": 1090410205,
+       "footprint_bytes": 62538496,
+       "instructions": 4038977275,
+       "maxrss_bytes": 135856128,
+       "objects": 1,
+       "returncode": 0,
+       "stdout_bytes": 0,
+       "sys_s": 0.01,
+       "timed_out": false,
+       "user_s": 0.27,
+       "wall_s": 0.294769
+      }
+     ],
+     "summary": {
+      "cpu_s": 0.27,
+      "cycles": 1080631171,
+      "footprint_bytes": 61834008,
+      "instructions": 4032000898,
+      "maxrss_bytes": 135118848,
+      "n": 3,
+      "wall_s": 0.278529
+     }
+    }
+   },
+   "lines": 2085,
+   "loadavg_end": [
+    6.38,
+    7.15,
+    8.16
+   ],
+   "loadavg_start": [
+    6.59,
+    7.21,
+    8.18
+   ],
+   "opt_level": "3",
+   "outcome": "COMPILED",
+   "ratios": {
+    "bridge": {
+     "compile_cpu_s": 1.6296296296296295,
+     "compile_instructions": 1.1768014566548344,
+     "compile_maxrss_bytes": 1.2063780768764398,
+     "compile_wall_s": 1.0901270603779138
+    },
+    "diagnostic": {
+     "compile_cpu_s": 1.5185185185185186,
+     "compile_instructions": 1.1434621238023346,
+     "compile_maxrss_bytes": 1.1034315508669819,
+     "compile_wall_s": 1.0309949771837041
+    }
+   },
+   "source": {
+    "name": "unicode-ident",
+    "sha256": "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75",
+    "type": "crates-io",
+    "version": "1.0.24"
+   },
+   "source_sha256": "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75",
+   "timeout_s": 900.0,
+   "vacuous": true
+  }
+ ],
+ "schema": "trust-cg-real-corpus-results-v1"
+}

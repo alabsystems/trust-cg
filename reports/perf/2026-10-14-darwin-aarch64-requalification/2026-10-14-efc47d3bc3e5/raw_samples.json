@@ -1,0 +1,632 @@
+{
+ "b1_mispredict": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.309,
+    0.308,
+    0.308
+   ],
+   "llvm_o2": [
+    0.324,
+    0.321,
+    0.32
+   ],
+   "llvm_o3": [
+    0.319,
+    0.32,
+    0.319
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h1_vec_push_sum": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.308,
+    0.307,
+    0.308
+   ],
+   "llvm_o2": [
+    0.322,
+    0.321,
+    0.322
+   ],
+   "llvm_o3": [
+    0.322,
+    0.321,
+    0.322
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h2_vec_grow": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.307,
+    0.307,
+    0.306
+   ],
+   "llvm_o2": [
+    0.324,
+    0.32,
+    0.322
+   ],
+   "llvm_o3": [
+    0.322,
+    0.323,
+    0.323
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h3_box_leak": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.313,
+    0.312,
+    0.313
+   ],
+   "llvm_o2": [
+    0.324,
+    0.325,
+    0.326
+   ],
+   "llvm_o3": [
+    0.326,
+    0.331,
+    0.328
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h4_vec_dropper": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.311,
+    0.312,
+    0.31
+   ],
+   "llvm_o2": [
+    0.326,
+    0.325,
+    0.328
+   ],
+   "llvm_o3": [
+    0.327,
+    0.326,
+    0.328
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "m1_call_chain": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.305,
+    0.306,
+    0.305
+   ],
+   "llvm_o2": [
+    0.313,
+    0.312,
+    0.317
+   ],
+   "llvm_o3": [
+    0.332,
+    0.326,
+    0.318
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "m2_call_heavy": {
+  "cold_cache_entries_after": [
+   18
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.305,
+    0.305,
+    0.304
+   ],
+   "llvm_o2": [
+    0.309,
+    0.31,
+    0.312
+   ],
+   "llvm_o3": [
+    0.314,
+    0.312,
+    0.31
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p1_xorshift": {
+  "cold_cache_entries_after": [
+   14
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.303,
+    0.301,
+    0.302
+   ],
+   "llvm_o2": [
+    0.312,
+    0.312,
+    0.312
+   ],
+   "llvm_o3": [
+    0.314,
+    0.312,
+    0.313
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p2_collatz": {
+  "cold_cache_entries_after": [
+   14
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.305,
+    0.303,
+    0.303
+   ],
+   "llvm_o2": [
+    0.311,
+    0.312,
+    0.31
+   ],
+   "llvm_o3": [
+    0.313,
+    0.312,
+    0.311
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p3_gcd": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.304,
+    0.304,
+    0.303
+   ],
+   "llvm_o2": [
+    0.311,
+    0.311,
+    0.311
+   ],
+   "llvm_o3": [
+    0.311,
+    0.312,
+    0.311
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p4_matmul": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.314,
+    0.314,
+    0.313
+   ],
+   "llvm_o2": [
+    0.328,
+    0.332,
+    0.331
+   ],
+   "llvm_o3": [
+    0.333,
+    0.332,
+    0.33
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p5_struct_acc": {
+  "cold_cache_entries_after": [
+   14
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.303,
+    0.304,
+    0.303
+   ],
+   "llvm_o2": [
+    0.313,
+    0.312,
+    0.312
+   ],
+   "llvm_o3": [
+    0.313,
+    0.312,
+    0.313
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p6_branch_match": {
+  "cold_cache_entries_after": [
+   18
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.306,
+    0.305,
+    0.305
+   ],
+   "llvm_o2": [
+    0.314,
+    0.313,
+    0.319
+   ],
+   "llvm_o3": [
+    0.313,
+    0.314,
+    0.312
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p7_sieve": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.305,
+    0.303,
+    0.314
+   ],
+   "llvm_o2": [
+    0.33,
+    0.326,
+    0.326
+   ],
+   "llvm_o3": [
+    0.351,
+    0.352,
+    0.354
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p8_closure_nest": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.304,
+    0.303,
+    0.302
+   ],
+   "llvm_o2": [
+    0.312,
+    0.312,
+    0.311
+   ],
+   "llvm_o3": [
+    0.312,
+    0.312,
+    0.314
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "v1_saxpy": {
+  "cold_cache_entries_after": [
+   17
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.303,
+    0.303,
+    0.305
+   ],
+   "llvm_o2": [
+    0.315,
+    0.313,
+    0.315
+   ],
+   "llvm_o3": [
+    0.315,
+    0.316,
+    0.317
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "v2_memfill": {
+  "cold_cache_entries_after": [
+   18
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.31,
+    0.31,
+    0.314
+   ],
+   "llvm_o2": [
+    0.316,
+    0.315,
+    0.315
+   ],
+   "llvm_o3": [
+    0.315,
+    0.316,
+    0.314
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "v3_popcount": {
+  "cold_cache_entries_after": [
+   19
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.304,
+    0.303,
+    0.304
+   ],
+   "llvm_o2": [
+    0.315,
+    0.319,
+    0.324
+   ],
+   "llvm_o3": [
+    0.328,
+    0.321,
+    0.323
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "emitted_size": {},
+  "emitted_size_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ }
+}

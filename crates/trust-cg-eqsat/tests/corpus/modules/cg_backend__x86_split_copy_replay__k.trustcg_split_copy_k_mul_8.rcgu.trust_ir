@@ -1,0 +1,171 @@
+; TrustIr text format v1
+module "trustcg_split_copy_k_mul_8"
+target "x86_64-apple-darwin" 8 little
+
+functy.0 = (&(u64, u64, u64, u64, u64, u64, u64, u64)) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @trustcg_split_copy_k_mul_8(functy.0) {
+bb0(%1: &(u64, u64, u64, u64, u64, u64, u64, u64)):
+    %25 = alloca [ty.3 x 8], align 8
+    %26 = load u64, ptr %1
+    %27 = const i64 8
+    %28 = ptrtoptr &(u64, u64, u64, u64, u64, u64, u64, u64) %1 to ptr
+    %29 = ptrtoint ptr %28 to i64
+    %30 = copy i64 %27
+    %31 = add i64 %29, %30
+    %32 = inttoptr i64 %31 to ptr
+    %33 = load u64, ptr %32
+    %34 = const i64 16
+    %35 = ptrtoptr &(u64, u64, u64, u64, u64, u64, u64, u64) %1 to ptr
+    %36 = ptrtoint ptr %35 to i64
+    %37 = copy i64 %34
+    %38 = add i64 %36, %37
+    %39 = inttoptr i64 %38 to ptr
+    %40 = load u64, ptr %39
+    %41 = const i64 24
+    %42 = ptrtoptr &(u64, u64, u64, u64, u64, u64, u64, u64) %1 to ptr
+    %43 = ptrtoint ptr %42 to i64
+    %44 = copy i64 %41
+    %45 = add i64 %43, %44
+    %46 = inttoptr i64 %45 to ptr
+    %47 = load u64, ptr %46
+    %48 = const i64 32
+    %49 = ptrtoptr &(u64, u64, u64, u64, u64, u64, u64, u64) %1 to ptr
+    %50 = ptrtoint ptr %49 to i64
+    %51 = copy i64 %48
+    %52 = add i64 %50, %51
+    %53 = inttoptr i64 %52 to ptr
+    %54 = load u64, ptr %53
+    %55 = const i64 40
+    %56 = ptrtoptr &(u64, u64, u64, u64, u64, u64, u64, u64) %1 to ptr
+    %57 = ptrtoint ptr %56 to i64
+    %58 = copy i64 %55
+    %59 = add i64 %57, %58
+    %60 = inttoptr i64 %59 to ptr
+    %61 = load u64, ptr %60
+    %62 = const i64 48
+    %63 = ptrtoptr &(u64, u64, u64, u64, u64, u64, u64, u64) %1 to ptr
+    %64 = ptrtoint ptr %63 to i64
+    %65 = copy i64 %62
+    %66 = add i64 %64, %65
+    %67 = inttoptr i64 %66 to ptr
+    %68 = load u64, ptr %67
+    %69 = const i64 56
+    %70 = ptrtoptr &(u64, u64, u64, u64, u64, u64, u64, u64) %1 to ptr
+    %71 = ptrtoint ptr %70 to i64
+    %72 = copy i64 %69
+    %73 = add i64 %71, %72
+    %74 = inttoptr i64 %73 to ptr
+    %75 = load u64, ptr %74
+    store u64 %26, ptr %25
+    %76 = const i64 8
+    %77 = copy ptr %25
+    %78 = ptrtoint ptr %77 to i64
+    %79 = copy i64 %76
+    %80 = add i64 %78, %79
+    %81 = inttoptr i64 %80 to ptr
+    store u64 %33, ptr %81
+    %82 = const i64 16
+    %83 = copy ptr %25
+    %84 = ptrtoint ptr %83 to i64
+    %85 = copy i64 %82
+    %86 = add i64 %84, %85
+    %87 = inttoptr i64 %86 to ptr
+    store u64 %40, ptr %87
+    %88 = const i64 24
+    %89 = copy ptr %25
+    %90 = ptrtoint ptr %89 to i64
+    %91 = copy i64 %88
+    %92 = add i64 %90, %91
+    %93 = inttoptr i64 %92 to ptr
+    store u64 %47, ptr %93
+    %94 = const i64 32
+    %95 = copy ptr %25
+    %96 = ptrtoint ptr %95 to i64
+    %97 = copy i64 %94
+    %98 = add i64 %96, %97
+    %99 = inttoptr i64 %98 to ptr
+    store u64 %54, ptr %99
+    %100 = const i64 40
+    %101 = copy ptr %25
+    %102 = ptrtoint ptr %101 to i64
+    %103 = copy i64 %100
+    %104 = add i64 %102, %103
+    %105 = inttoptr i64 %104 to ptr
+    store u64 %61, ptr %105
+    %106 = const i64 48
+    %107 = copy ptr %25
+    %108 = ptrtoint ptr %107 to i64
+    %109 = copy i64 %106
+    %110 = add i64 %108, %109
+    %111 = inttoptr i64 %110 to ptr
+    store u64 %68, ptr %111
+    %112 = const i64 56
+    %113 = copy ptr %25
+    %114 = ptrtoint ptr %113 to i64
+    %115 = copy i64 %112
+    %116 = add i64 %114, %115
+    %117 = inttoptr i64 %116 to ptr
+    store u64 %75, ptr %117
+    br bb4
+bb4:
+    %118 = const u64 0
+    %119 = const u64 0
+    %120 = const u64 0
+    br bb1(%118, %119, %120)
+bb1(%121: u64, %122: u64, %123: u64):
+    %124 = copy u64 %123
+    %126 = const u64 8
+    %125 = icmp ult u64 %124, %126
+    condbr %125, bb2, bb3
+bb3:
+    %128 = const u64 5
+    %127 = mul u64 %122, %128
+    %129 = xor u64 %121, %127
+    %130 = copy u64 %129
+    br bb5
+bb5:
+    ret %130
+bb2:
+    %131 = ptrtoptr ptr %25 to *const (u64, u64, u64, u64, u64, u64, u64, u64)
+    %132 = ptrtoptr *const (u64, u64, u64, u64, u64, u64, u64, u64) %131 to *const u64
+    %133 = copy u64 %123
+    %135 = ptrtoptr *const u64 %132 to ptr
+    %136 = ptrtoint ptr %135 to i64
+    %137 = bitcast u64 %133 to i64
+    %138 = const i64 8
+    %139 = mul i64 %137, %138
+    %140 = add i64 %136, %139
+    %141 = inttoptr i64 %140 to ptr
+    %134 = ptrtoptr ptr %141 to *const u64
+    %142 = load u64, ptr %134
+    %144 = const i32 29
+    %145 = const u64 29
+    %143 = lshr u64 %142, %145
+    %146 = xor u64 %142, %143
+    %148 = const u64 2685821657736338717
+    %147 = mul u64 %146, %148
+    %149 = add u64 %121, %147
+    %150 = copy u64 %149
+    %151 = copy u64 %123
+    %152 = copy u64 %151
+    %154 = const u64 3
+    %153 = mul u64 %152, %154
+    %156 = const u64 1
+    %155 = add u64 %153, %156
+    %157 = add u64 %122, %155
+    %158 = copy u64 %157
+    %160 = const u64 1
+    %159 = add u64 %123, %160
+    br bb1(%150, %158, %159)
+}

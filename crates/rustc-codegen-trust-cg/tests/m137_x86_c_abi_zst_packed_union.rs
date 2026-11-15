@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test — C-ABI by-value ZST-field structs, `#[repr(packed)]` structs,
 // and by-value UNIONS across a REAL `extern "C"` boundary, validated against an
@@ -34,14 +38,14 @@ mod target_dir_support;
 //      its scalar carrier in an XMM register — garbage at the boundary. Now fails
 //      closed (`[TCG-SYSV-MIXED-UNION]`). A pure-integer union still MATCHES.
 //
-// Each Rust side is compiled by BOTH trust-cg AND stock LLVM, linked against the SAME
+// Each Rust side is compiled by BOTH trust-cg AND trustc's LLVM, linked against the SAME
 // clang C object, run, and the exit codes compared. A packed/union WRONG shape must
 // make trust-cg FAIL to compile (fail-closed), NEVER produce a differing exit code.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
 // ---- clang C oracle: by-value consumers + producers ----
@@ -173,64 +177,12 @@ pub extern "C" fn main() -> i32 {
 }
 "#;
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            if let Some((_, value)) = raw_channel.split_once('=') {
-                return value.trim().trim_matches('"').to_owned();
-            }
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    for cand in [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ] {
-        if cand.exists() {
-            return cand;
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m137");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?}");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == TARGET)
-        })
-        .unwrap_or(false)
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn clang_available() -> bool {
@@ -258,11 +210,14 @@ fn compile_rust_obj(
     let out_dir = dir.join(format!("obj_{tag}"));
     let _ = std::fs::remove_dir_all(&out_dir);
     std::fs::create_dir_all(&out_dir).expect("obj dir");
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin", "--target", TARGET])
-        .args(["-Cpanic=abort", "-Coverflow-checks=off", "-Ccodegen-units=1"])
+    cmd.args(["--crate-type", "bin", "--target", TARGET])
+        .args([
+            "-Cpanic=abort",
+            "-Coverflow-checks=off",
+            "-Ccodegen-units=1",
+        ])
         .arg(format!("-Copt-level={opt_level}"))
         .arg("--emit=obj")
         .arg("--out-dir")
@@ -284,13 +239,23 @@ fn compile_rust_obj(
 }
 
 fn compile_c_oracle(dir: &Path, no_main: bool) -> PathBuf {
-    let c = dir.join(if no_main { "oracle_nomain.c" } else { "oracle_main.c" });
+    let c = dir.join(if no_main {
+        "oracle_nomain.c"
+    } else {
+        "oracle_main.c"
+    });
     std::fs::write(&c, ORACLE_C).expect("write oracle.c");
-    let obj = dir.join(if no_main { "oracle_nomain.o" } else { "oracle_main.o" });
+    let obj = dir.join(if no_main {
+        "oracle_nomain.o"
+    } else {
+        "oracle_main.o"
+    });
     let mut cmd = Command::new("clang");
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET)
         .args(["-target", TARGET, "-O2"])
-        .arg(format!("-mmacosx-version-min={MACOS_DEPLOYMENT_TARGET}"));
+        .args(host_target_support::deployment_min_flags(
+            MACOS_DEPLOYMENT_TARGET,
+        ));
     if no_main {
         cmd.arg("-DNO_MAIN");
     }
@@ -316,7 +281,7 @@ fn panic_stubs(dir: &Path, objs: &[&Path]) -> PathBuf {
     let mut seen = std::collections::HashSet::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let sym = line.trim().trim_start_matches('U').trim();
-        if sym.contains("panic") && seen.insert(sym.to_owned()) {
+        if toolchain_support::is_abort_stub_symbol(sym) && seen.insert(sym.to_owned()) {
             let c = sym.strip_prefix('_').unwrap_or(sym);
             stubs.push_str(&format!(
                 "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -334,7 +299,9 @@ fn link_and_run(dir: &Path, tag: &str, rust_obj: &Path, c_obj: &Path) -> Option<
     let status = Command::new("clang")
         .env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET)
         .args(["-target", TARGET])
-        .arg(format!("-mmacosx-version-min={MACOS_DEPLOYMENT_TARGET}"))
+        .args(host_target_support::deployment_min_flags(
+            MACOS_DEPLOYMENT_TARGET,
+        ))
         .arg("-o")
         .arg(&bin)
         .arg(rust_obj)

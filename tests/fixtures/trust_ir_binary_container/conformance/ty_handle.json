@@ -1,0 +1,384 @@
+{
+  "name": "ty_handle_v43",
+  "functions": [
+    {
+      "id": 0,
+      "name": "trust_bignum_nat_from_u64",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": "trust_bignum::Nat::from_u64",
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "trust_bignum_nat_add",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": "trust_bignum::Nat::add",
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 2,
+      "name": "trust_bignum_nat_sub",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": "trust_bignum::Nat::sub",
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 3,
+      "name": "trust_bignum_nat_is_zero",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": "trust_bignum::Nat::is_zero",
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 4,
+      "name": "pred",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Handle": {
+                  "name": "Nat",
+                  "runtime": "trust_bignum::Nat"
+                }
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Call": {
+                  "callee": 3,
+                  "args": [
+                    0
+                  ]
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 1,
+                  "then_target": 1,
+                  "then_args": [],
+                  "else_target": 2,
+                  "else_args": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U64",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    2
+                  ]
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 2,
+                  "args": [
+                    0,
+                    3
+                  ]
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": {
+        "Gated": {
+          "authority": "conformance-fixture"
+        }
+      },
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "U64"
+      ],
+      "returns": [
+        {
+          "Handle": {
+            "name": "Nat",
+            "runtime": "trust_bignum::Nat"
+          }
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        {
+          "Handle": {
+            "name": "Nat",
+            "runtime": "trust_bignum::Nat"
+          }
+        },
+        {
+          "Handle": {
+            "name": "Nat",
+            "runtime": "trust_bignum::Nat"
+          }
+        }
+      ],
+      "returns": [
+        {
+          "Handle": {
+            "name": "Nat",
+            "runtime": "trust_bignum::Nat"
+          }
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        {
+          "Handle": {
+            "name": "Nat",
+            "runtime": "trust_bignum::Nat"
+          }
+        }
+      ],
+      "returns": [
+        "Bool"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        {
+          "Handle": {
+            "name": "Nat",
+            "runtime": "trust_bignum::Nat"
+          }
+        }
+      ],
+      "returns": [
+        {
+          "Handle": {
+            "name": "Nat",
+            "runtime": "trust_bignum::Nat"
+          }
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "aapcs64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

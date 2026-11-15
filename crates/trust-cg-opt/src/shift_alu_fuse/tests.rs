@@ -588,6 +588,172 @@ fn elide_and31_before_lsrrr_and_asrrr_w() {
 }
 
 #[test]
+fn elide_shared_and31_before_lslrr_and_lsrrr_w() {
+    // Both consumers apply the same architectural `amount & 31` behavior, so
+    // the shared explicit mask is dead only after both amount reads are
+    // rewritten.
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::AndRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(31)],
+        ),
+        MachInst::new(AArch64Opcode::LslRR, vec![vreg(3), vreg(1), vreg(2)]),
+        MachInst::new(AArch64Opcode::LsrRR, vec![vreg(5), vreg(4), vreg(2)]),
+        consume(vreg(3)),
+        consume(vreg(5)),
+    ]);
+
+    assert!(ShiftAluFuse.run(&mut func));
+    let insts = &func.block(entry).insts;
+    assert_eq!(func.inst(insts[0]).opcode, AArch64Opcode::Nop);
+    assert_eq!(func.inst(insts[1]).operands[2], vreg(0));
+    assert_eq!(func.inst(insts[2]).operands[2], vreg(0));
+}
+
+#[test]
+fn no_elide_shared_mask_with_mixed_width_shift() {
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::AndRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(31)],
+        ),
+        MachInst::new(AArch64Opcode::LslRR, vec![vreg(3), vreg(1), vreg(2)]),
+        MachInst::new(AArch64Opcode::LsrRR, vec![vreg64(5), vreg64(4), vreg(2)]),
+        consume(vreg(3)),
+        consume(vreg64(5)),
+    ]);
+
+    assert!(!ShiftAluFuse.run(&mut func));
+    let insts = &func.block(entry).insts;
+    assert_eq!(func.inst(insts[0]).opcode, AArch64Opcode::AndRI);
+    assert_eq!(func.inst(insts[1]).operands[2], vreg(2));
+    assert_eq!(func.inst(insts[2]).operands[2], vreg(2));
+}
+
+#[test]
+fn no_elide_shared_mask_with_shift_data_use() {
+    // The second instruction is itself a variable shift, but it reads t as the
+    // shifted data (operand 1), not as the hardware-masked amount (operand 2).
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::AndRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(31)],
+        ),
+        MachInst::new(AArch64Opcode::LslRR, vec![vreg(3), vreg(1), vreg(2)]),
+        MachInst::new(AArch64Opcode::LsrRR, vec![vreg(5), vreg(2), vreg(4)]),
+        consume(vreg(3)),
+        consume(vreg(5)),
+    ]);
+
+    assert!(!ShiftAluFuse.run(&mut func));
+    let insts = &func.block(entry).insts;
+    assert_eq!(func.inst(insts[0]).opcode, AArch64Opcode::AndRI);
+    assert_eq!(func.inst(insts[1]).operands[2], vreg(2));
+    assert_eq!(func.inst(insts[2]).operands[1], vreg(2));
+}
+
+#[test]
+fn no_elide_shared_mask_across_blocks() {
+    let mut func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+    let entry = func.entry;
+    let successor = func.create_block();
+
+    let and_id = func.push_inst(MachInst::new(
+        AArch64Opcode::AndRI,
+        vec![vreg(2), vreg(0), MachOperand::Imm(31)],
+    ));
+    func.append_inst(entry, and_id);
+    let lsl_id = func.push_inst(MachInst::new(
+        AArch64Opcode::LslRR,
+        vec![vreg(3), vreg(1), vreg(2)],
+    ));
+    func.append_inst(entry, lsl_id);
+    let lsr_id = func.push_inst(MachInst::new(
+        AArch64Opcode::LsrRR,
+        vec![vreg(5), vreg(4), vreg(2)],
+    ));
+    func.append_inst(successor, lsr_id);
+
+    assert!(!ShiftAluFuse.run(&mut func));
+    assert_eq!(func.inst(and_id).opcode, AArch64Opcode::AndRI);
+    assert_eq!(func.inst(lsl_id).operands[2], vreg(2));
+    assert_eq!(func.inst(lsr_id).operands[2], vreg(2));
+}
+
+#[test]
+fn no_elide_shared_mask_across_t_redefinition() {
+    // Although both reads occur as shift amounts, the second reads the MovI
+    // definition rather than the AndRI definition.
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::AndRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(31)],
+        ),
+        MachInst::new(AArch64Opcode::LslRR, vec![vreg(3), vreg(1), vreg(2)]),
+        MachInst::new(AArch64Opcode::MovI, vec![vreg(2), MachOperand::Imm(5)]),
+        MachInst::new(AArch64Opcode::LsrRR, vec![vreg(5), vreg(4), vreg(2)]),
+        consume(vreg(3)),
+        consume(vreg(5)),
+    ]);
+
+    assert!(!ShiftAluFuse.run(&mut func));
+    let insts = &func.block(entry).insts;
+    assert_eq!(func.inst(insts[0]).opcode, AArch64Opcode::AndRI);
+    assert_eq!(func.inst(insts[1]).operands[2], vreg(2));
+    assert_eq!(func.inst(insts[3]).operands[2], vreg(2));
+}
+
+#[test]
+fn no_elide_shared_mask_across_amt_redefinition() {
+    // Replacing the second amount with amt would observe its new definition,
+    // not the value captured by the AndRI.
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::AndRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(31)],
+        ),
+        MachInst::new(AArch64Opcode::LslRR, vec![vreg(3), vreg(1), vreg(2)]),
+        MachInst::new(
+            AArch64Opcode::AddRI,
+            vec![vreg(0), vreg(0), MachOperand::Imm(1)],
+        ),
+        MachInst::new(AArch64Opcode::LsrRR, vec![vreg(5), vreg(4), vreg(2)]),
+        consume(vreg(3)),
+        consume(vreg(5)),
+        consume(vreg(0)),
+    ]);
+
+    assert!(!ShiftAluFuse.run(&mut func));
+    let insts = &func.block(entry).insts;
+    assert_eq!(func.inst(insts[0]).opcode, AArch64Opcode::AndRI);
+    assert_eq!(func.inst(insts[1]).operands[2], vreg(2));
+    assert_eq!(func.inst(insts[3]).operands[2], vreg(2));
+}
+
+#[test]
+fn no_elide_shared_mask_with_malformed_shift() {
+    let (mut func, entry) = single_block_func(vec![
+        MachInst::new(
+            AArch64Opcode::AndRI,
+            vec![vreg(2), vreg(0), MachOperand::Imm(31)],
+        ),
+        MachInst::new(AArch64Opcode::LslRR, vec![vreg(3), vreg(1), vreg(2)]),
+        MachInst::new(
+            AArch64Opcode::LsrRR,
+            vec![vreg(5), vreg(4), vreg(2), MachOperand::Imm(0)],
+        ),
+        consume(vreg(3)),
+        consume(vreg(5)),
+    ]);
+
+    assert!(!ShiftAluFuse.run(&mut func));
+    let insts = &func.block(entry).insts;
+    assert_eq!(func.inst(insts[0]).opcode, AArch64Opcode::AndRI);
+    assert_eq!(func.inst(insts[1]).operands[2], vreg(2));
+    assert_eq!(func.inst(insts[2]).operands[2], vreg(2));
+}
+
+#[test]
 fn elide_and63_before_lslrr_x() {
     let (mut func, entry) = single_block_func(vec![
         MachInst::new(

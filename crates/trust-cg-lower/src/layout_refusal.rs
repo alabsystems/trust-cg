@@ -6,130 +6,44 @@
 //! M0.5 refusal predicate: does the producer's struct layout agree with the
 //! layout the byte-generating path actually computes?
 //!
-//! # The defect this guards
+//! # The two authorities
 //!
 //! Two independent layout authorities exist on the Rust -> THIR -> `trust_ir`
-//! -> trust-cg path, and today nothing compares them:
+//! -> trust-cg path, and this module compares them:
 //!
 //! * **Producer (authority A).** `trust-thir-lower` reads field offsets from
-//!   rustc's **reorder-aware** layout — `tcx.layout_of(..)` then
-//!   `l.fields.offset(i).bytes()`, at
-//!   `crates/trust-thir-lower/src/lib.rs:9327-9329` (the mint site is guarded
-//!   by `layout_query_is_reentrant_safe`, `lib.rs:9263`, which leaves
-//!   `size`/`align`/every offset `None` for param/opaque types). Those offsets
-//!   land in [`trust_ir::FieldDef::offset`]
-//!   (`first-party/trust-ir/crates/trust-ir/src/ty.rs:709-712`, the `offset`
-//!   field at :712).
-//! * **Consumer (authority B).** The LIR type recomputes layout as
-//!   **declaration-ordered natural C**: [`crate::types::Type::offset_of`],
-//!   `first-party/trust-cg/crates/trust-cg-lower/src/types.rs:169-183`, walks
-//!   fields in declaration order doing
+//!   rustc's **reorder-aware** layout (`tcx.layout_of(..)` then
+//!   `l.fields.offset(i).bytes()`); its mint site leaves `size`, `align` and
+//!   every offset `None` for param/opaque types. Those offsets land in
+//!   [`trust_ir::FieldDef::offset`].
+//! * **Consumer (authority B).** The byte path's own per-`repr` LIR layout (see
+//!   "Which authority is B, per `repr`" below). The natural-C model,
+//!   [`crate::types::Type::offset_of`], walks fields in declaration order doing
 //!   `offset = align_to(offset, f.align()); offset += f.bytes()`.
 //!
 //! For `#[repr(Rust)]` rustc is free to reorder fields by alignment, so A and B
-//! diverge. The byte path never notices: `StructGep` lowers through
-//! `Type::offset_of` (`isel.rs:9306`, `x86_64_isel.rs:13208`) and the **only**
-//! non-test reader of `FieldDef::offset` in this crate is DWARF debug-info
-//! emission (`adapter.rs:16357`). So for a `repr(Rust)` struct the adapter does
-//! not otherwise reject, it **silently computes a different address than the
-//! producer specified**.
+//! can diverge. When the producer states a complete, coherent, emittable
+//! layout whose totals match the recomputation, the byte path READS it through
+//! [`crate::declared_layout`] (authority D), and [`declared_authority`] asks
+//! that module first; for such a struct this predicate is vacuous by
+//! construction, and what it still checks is the authority selection
+//! ([`tests::test_a_reordered_struct_with_coherent_totals_is_now_emitted_as_declared`]).
+//! A complete declared layout that the byte path cannot emit is refused at
+//! every layout query ([`crate::declared_layout::emitted_struct_layout`] fails
+//! with `AdapterError::DeclaredStructLayoutNotEmittable`) unless a fallback
+//! authority reproduces it exactly; this census deliberately reads such a
+//! refusal as "authority D does not own this struct", so its buckets keep
+//! their meaning. A struct with no layout or a partial one keeps the named
+//! natural-C fallback. That the declared OFFSETS reach emitted instructions is
+//! checked in `tests/declared_struct_layout.rs`.
 //!
-//! (a) DOC CLAIMS, from `designs/2026-08-03-trustir-to-lir-converter.md` §9.1
-//! and §9.3, measured 2026-08-03 over a 69-crate corpus: 166 / 2,487
-//! LIR-comparable struct defs with full producer offsets disagree (6.7%), 161
-//! of them load-bearing, 100% `repr=rust`; `clean_kernel` alone 56 / 522
-//! (10.7%). 1,039 / 5,197 struct defs (20.0%) carry no layout at all; MIXED
-//! (some fields with offsets, some without) measured **0**.
+//! [`StructLayoutDisposition::moves_bytes`] and
+//! [`StructLayoutCensus::unrefused_exposures`] exist so that a census cannot
+//! hide the disagreements that relocate a loaded or stored byte, or the
+//! `NotComparable` rows nothing blocks.
 //!
-//! (c) MEASURED 2026-08-08 by running [`census_module_struct_layouts`] over 68
-//! `trust-ir` module dumps (`cargo build --offline --release -p clean-kernel`
-//! in the Clean workspace; 6,040 struct defs). This supersedes the figures
-//! above as the live number for THIS predicate:
-//!
-//! | disposition | rows |
-//! |---|---|
-//! | `Agrees` | 3,331 |
-//! | `Disagrees`, a non-ZST FIELD moves | 204 |
-//! | `Disagrees`, no field moves | 47 (42 of them a SIZE/ALIGN divergence) |
-//! | `LayoutAbsent` | 952 |
-//! | `MixedOffsets` | 0 |
-//! | `NotComparable` | 1,506 (`AdapterRejected` 1,184, `UnstatedInterior` 313, `PackedNoSingleAuthority` 9) |
-//! | `StructIdCollision` | 0 |
-//!
-//! **That table predates the C1/C2/C3 corrections below and has NOT been
-//! re-measured against them.** Three buckets move under the corrected
-//! predicate and the direction of each is known, the magnitude is not:
-//! the 9 `PackedNoSingleAuthority` rows are re-partitioned (a packed struct
-//! whose clamp is a no-op now leaves the bucket and is compared; one matching
-//! neither authority becomes the new refusal), and `StructIdCollision` can only
-//! fall (the gate got strictly narrower). It was 0, so it stays 0. Re-running
-//! the census needs a `trust_ir` corpus dump, which is not in the tree —
-//! **not established** for this change.
-//!
-//! Two derived figures that the four headline buckets do NOT show, and that
-//! [`StructLayoutDisposition::moves_bytes`] /
-//! [`StructLayoutCensus::unrefused_exposures`] exist to make un-hideable:
-//! **246 of the 251 disagreements relocate a byte that is really loaded or
-//! stored** (only 5 are ZST-only), and **322 of the 1,506 `NotComparable` rows
-//! are emitted with nothing blocking them** — the adapter rejects only the
-//! other 1,184.
-//!
-//! Six classes are **absent from that corpus**, so their gates are sound but
-//! unexercised by it and must not be quoted as "measured working": `Ty::Record`
-//! fields (0), `Ty::Closure` fields (0, though 20 `ClosureTy` entries exist
-//! unreferenced), `Ty::Refine` (0 entries in any type table), duplicate
-//! `StructId`s (0 groups), offset-less structs that still record a size or
-//! align (0 of 952 offset-less rows), and `MixedOffsets` (0).
-//!
-//! # WHAT THE DECLARED-OFFSET REPAIR CHANGED HERE (2026-08-08, later)
-//!
-//! The defect above is **closed for the offset half**. The byte path no longer
-//! recomputes a struct's field offsets when the producer stated a complete,
-//! coherent, emittable layout whose totals already match the recomputation: it
-//! READS them, through [`crate::declared_layout`], and materialises
-//! `base + offset` explicitly because `Opcode::StructGep` cannot express
-//! anything but the recomputation. Authority D — the producer's own layout — is
-//! therefore a real emitted authority, and `recompute_layout` asks
-//! [`declared_authority`] first.
-//!
-//! Three consequences, and the third is the one to be honest about:
-//!
-//! 1. **The `Disagrees` population fell on its own.** (c) MEASURED 2026-08-08
-//!    over the same 69-module corpus (69/69 deserialized, 6,051 struct defs):
-//!    `Disagrees` **251 -> 54**, load-bearing **204 -> 12**, modules carrying at
-//!    least one disagreement **42 -> 17**. `Agrees` 3,339 -> 3,522,
-//!    `NotComparable` 1,509 -> 1,523 (rows that used to refuse at step 4 now
-//!    reach the interior gate at step 7), `LayoutAbsent` 952, `MixedOffsets` 0,
-//!    `StructIdCollision` 0 — all unchanged. No predicate gate was loosened to
-//!    get there; the byte path genuinely stopped disagreeing.
-//! 2. **Every one of the 54 survivors is a SIZE/ALIGN divergence**
-//!    (`size_disagreements` = 54 of 54). That is exactly the population the
-//!    repair's totals gate declines on purpose: the `#[repr(align(N))]` /
-//!    128-bit / `CachePadded` / NEON-vector family, whose totals are read by
-//!    consumers that only ever see the LIR `Type` (`abi::classify_params` on
-//!    `sig.params`, byval slots, the small-aggregate `<= 16` decisions). They
-//!    keep the recomputation and keep refusing.
-//! 3. **For a struct authority D owns, this predicate is now VACUOUS**, and
-//!    that is intrinsic, not hidden: the emitted layout IS the producer's, so
-//!    comparing them can only agree. What that certification is still worth is
-//!    the *authority selection* — [`declared_authority`] calls the same
-//!    function the adapter calls, so if the adapter stopped honouring declared
-//!    offsets these rows would go straight back to `Disagrees`
-//!    (machine-checked by
-//!    [`tests::test_a_reordered_struct_with_coherent_totals_is_now_emitted_as_declared`]).
-//!    The check that the OFFSETS actually reach emitted instructions lives
-//!    where it belongs, in `tests/declared_struct_layout.rs`, which reads the
-//!    opcode stream out of the public `translate_function`.
-//!
-//! Naming note: the dedicated `TrustIrAdapter::packed_field_offset` /
-//! `packed_struct_size` accessors were folded into
-//! `TrustIrAdapter::explicit_field_offset` /
-//! `TrustIrAdapter::aggregate_value_extent`, which select among all three
-//! authorities in one place. Prose and refusal reasons below still name the old
-//! accessors; they name the same authority-P path, which is otherwise
-//! unchanged — a `#[repr(packed(N))]` struct is deliberately never handed to
-//! authority D (see [`crate::declared_layout`] for why: it would close the
-//! packed OFFSET split while leaving the packed SIZE split open).
+//! Historical census tables and repair notes for this predicate are in
+//! `docs/archive/session-reports/2026-09-layout-refusal-measurements.md`.
 //!
 //! # What this module does
 //!
@@ -152,13 +66,8 @@
 //!   field's alignment to `min(natural, N)`, which is a NO-OP whenever no
 //!   field's natural alignment exceeds `N`; for those structs the two
 //!   authorities land on the identical offsets, size and alignment, there is
-//!   one emitted layout after all, and the struct is compared like any other.
-//!   Keying the gate on `repr` instead swallowed load-bearing refusals — (c)
-//!   MEASURED 2026-08-08, `#[repr(packed)] { a: u8@0, b: u8@1, c: u8@7 }` was
-//!   reported `NotComparable` while the reason it printed quoted BOTH
-//!   authorities as `offsets [0, 1, 2], size 3, align 1`, i.e. it discarded two
-//!   agreeing measurements and a producer that contradicted both. Pinned by
-//!   `test_packed_whose_clamp_is_a_noop_still_refuses_a_moved_field`.
+//!   one emitted layout after all, and the struct is compared like any other
+//!   (`test_packed_whose_clamp_is_a_noop_still_refuses_a_moved_field`).
 //!
 //!   When they DO disagree, the verdict depends on the producer:
 //!   - the producer matches exactly one authority — scoring means picking a
@@ -170,112 +79,67 @@
 //!     [`StructLayoutDisposition::PackedMatchesNeitherAuthority`], carrying
 //!     both authorities in full.
 //!
-//!   (c) MEASURED, `#[repr(packed)] struct P { a: u8 @0, b: u64 @1 }`, size 9 /
-//!   align 1 — the shape where the clamp really does bite:
-//!   - `crate::adapter::packed_struct_layout` — the authority behind
-//!     `TrustIrAdapter::packed_field_offset` (`adapter.rs:11549`, reached from
-//!     `StructGep` at `:3302`, field insert at `:6934`, field extract at
-//!     `:11654` and — since the 2026-08-08 repair — the aggregate-constant
-//!     path at `:14541`) and `packed_struct_size` (`adapter.rs:11586`, packed
-//!     array stride at `:3240` / `:6325`) — places `b` at **1**, total size
-//!     **9**.
-//!   - Natural C — `Type::bytes()` / `Type::align()` / `Type::offset_of` —
-//!     says `b` at **8**, size **16**, align **8**.
-//!
-//!   **What the 2026-08-08 repair changed, and what it did not.** Authority C
-//!   no longer emits any packed struct's FIELD OFFSETS:
-//!   `fill_aggregate_at_ptr` was the last natural-C offset site for a packed
-//!   struct and now routes through `packed_field_offset` like every other
-//!   field-addressing path (`adapter.rs:14541-14570`), so the offset half of
-//!   the split is closed. The SIZE/ALIGN half is not. Authority C survives as
-//!   a size/align authority in:
-//!   - `TrustIrAdapter::translate_alloc` (`adapter.rs:8958-8963`), which
-//!     strides an alloca element by `lir_ty.bytes()` and aligns it by
-//!     `lir_ty.align()` while `Inst::GEP` over the very same pointer strides
-//!     by `packed_struct_size` (`:6325`). (c) MEASURED: `Inst::Alloca { ty: P,
-//!     count: 2 }` reserves **32/8**; the packed authority says 9 per element.
-//!     Pinned by
-//!     `tests/packed_aggregate_constants.rs::alloca_stride_for_a_packed_struct_still_disagrees_with_gep_stride`;
-//!   - `translate_heap_alloc` (`adapter.rs:9163`), the heap twin of that
-//!     stride;
-//!   - the aggregate-constant stack SLOT (`adapter.rs:14285-14287`) and the
-//!     aggregate `Load` slot + copy length (`:8706`), which are EXTENTS rather
-//!     than placements and are deliberately left at natural C — see
-//!     **Named gaps**;
-//!   - the aggregate-field `Memmove` LENGTH on the NON-packed `InsertField`
-//!     arm (`:6989`), where the destination is a natural-C `StructGep` slot
-//!     with natural-C room for it.
-//!
-//!   **What the nested-packed repair (same day, later) changed.** Two of the
-//!   extents above moved to authority P, because they HAD to move with it: the
-//!   aggregate-field `Memmove` on the PACKED `InsertField` arm and the
-//!   aggregate `Store` arm now take their length from
-//!   `TrustIrAdapter::aggregate_value_extent`, i.e. `packed_struct_size` for a
-//!   packed struct. Before, `packed_struct_layout` advanced past a packed
-//!   interior by its natural-C extent, which put the next sibling exactly flush
-//!   against the end of the natural-C copy — `#[repr(packed)]
-//!   { h: u8, inner: P, t: u8 }` placed `t` at 17 and the 16-byte copy into
-//!   `inner` at offset 1 covered 1..17. Once the advance became `P`'s real 9
-//!   (rustc: `t@10`, size 11), a natural-C-lengthed copy would CLOBBER `t`.
-//!   Pinned by `tests/packed_nested_layout.rs`.
-//!
-//!   So for THAT struct there is still no single total size, certifying
-//!   `Agrees` would still certify a struct the compiler sizes two ways, and
-//!   this predicate still declines to pick a winner. It is now
-//!   over-conservative on the OFFSET component, in the safe direction: a
-//!   packed producer whose offsets contradict authority P is reported as the
-//!   `PackedNoSingleAuthority` non-answer where it could now be refused
-//!   outright. Tightening the predicate to score offsets against authority P
-//!   alone is the named follow-up. See **Named gaps**.
+//!   For `#[repr(packed)] struct P { a: u8, b: u64 }` the packed authority
+//!   (`crate::adapter::packed_struct_layout`, behind
+//!   `TrustIrAdapter::explicit_field_offset` and
+//!   `TrustIrAdapter::aggregate_value_extent`) places `b` at 1, size 9; natural
+//!   C places `b` at 8, size 16, align 8. Every packed field-addressing path
+//!   uses the packed authority. Natural C survives as a packed struct's
+//!   SIZE/ALIGN authority in `TrustIrAdapter::translate_alloc` and
+//!   `translate_heap_alloc` (element stride, while `Inst::GEP` strides by the
+//!   packed size;
+//!   `tests/packed_aggregate_constants.rs::alloca_stride_for_a_packed_struct_still_disagrees_with_gep_stride`),
+//!   the aggregate-constant stack slot, the aggregate `Load` slot and copy
+//!   length, and the copy length on the NON-packed `InsertField` arm. The
+//!   packed `InsertField` arm and the aggregate `Store` arm take their length
+//!   from `aggregate_value_extent` (`tests/packed_nested_layout.rs`). So a
+//!   packed struct can still be sized two ways, and this predicate declines to
+//!   pick a winner — see **Named gaps**.
 //!
 //! # Classification order (fixed, and load-bearing)
 //!
 //! 0. **[`StructLayoutDisposition::StructIdCollision`]** — `sdef.id` resolves,
-//!    under the byte path's FIRST-MATCH rule (`adapter.rs:1250`,
-//!    `structs.iter().find(|s| s.id == *sid)`), to a `StructDef` with a
+//!    under the byte path's FIRST-MATCH rule
+//!    (`structs.iter().find(|s| s.id == *sid)`), to a `StructDef` with a
 //!    *different emitted layout*. Checked before everything else because it
 //!    invalidates every subsequent measurement: no value of `sdef`'s type is
 //!    ever addressed with `sdef`'s layout, so `sdef`'s own offsets are moot.
 //!    The comparison is over `emitted_layout_identity` — `repr` plus the field
 //!    TYPE sequence — not over `StructDef: PartialEq`. See **Id collision**.
 //! 1. **Mixed offsets** — some fields `Some`, some `None`. Checked before any
-//!    conversion because it depends only on producer data. Measured 0 today;
-//!    the producer can still mint it (`trust-thir-lower/src/lib.rs:9328`,
-//!    `.filter(|l| i < l.fields.count())`
-//!    drops an offset for scalable-vector shapes), so it is detected and
-//!    reported as a defect rather than assumed away.
+//!    conversion because it depends only on producer data. The producer can
+//!    mint it (its `.filter(|l| i < l.fields.count())` drops an offset for
+//!    scalable-vector shapes), so it is detected and reported as a defect
+//!    rather than assumed away.
 //! 2. **[`StructLayoutDisposition::LayoutAbsent`]** — **nothing to compare at
 //!    all**: no field carries an offset AND the producer recorded neither
 //!    `size` nor `align`. Not an error; a distinct state the design requires.
 //!    An offset-less struct that DOES record a size or an alignment falls
-//!    through to the size/align comparison in step 4 — the producer mints all
-//!    three from one `layout` binding
-//!    (`trust-thir-lower/src/lib.rs:9269-9271`), but the offsets carry an extra
-//!    bounds check the size/align do not (`lib.rs:9328`,
-//!    `.filter(|l| i < l.fields.count())`): a struct whose layout reports FEWER
-//!    field entries than the variant has — the `#[rustc_scalable_vector]`
-//!    shape that check exists for — drops *every* offset while `size`/`align`
-//!    stay `Some`. "Sized but offset-less" is therefore mintable, and its
-//!    size divergence must not be swallowed by an early `LayoutAbsent`.
+//!    through to the size/align comparison: the producer mints all three from
+//!    one `layout` binding, but the offsets carry an extra bounds check the
+//!    size/align do not, so a struct whose layout reports FEWER field entries
+//!    than the variant has (the `#[rustc_scalable_vector]` shape) drops
+//!    *every* offset while `size`/`align` stay `Some`. "Sized but offset-less"
+//!    is therefore mintable, and its size divergence must not be swallowed by
+//!    an early `LayoutAbsent`.
 //! 3. **[`StructLayoutDisposition::NotComparable`]** — a field type that does
-//!    not convert to LIR (so authority B has nothing to say), a LIR layout that
-//!    is not representable in the byte path's `u32` arithmetic (see
-//!    **Totality** below), or a `repr(packed)` struct whose two authorities
-//!    genuinely disagree *and* whose producer matches one of them (see above).
-//!    A packed struct whose two authorities disagree and whose producer matches
-//!    NEITHER exits here instead as the refusing
+//!    not convert to LIR (so authority B has nothing to say; 3a), a LIR layout
+//!    that is not representable in the byte path's `u32` arithmetic (see
+//!    **Totality** below; 3b), or a `repr(packed)` struct whose two
+//!    authorities genuinely disagree *and* whose producer matches one of them
+//!    (3c). A packed struct whose two authorities disagree and whose producer
+//!    matches NEITHER exits here instead as the refusing
 //!    [`StructLayoutDisposition::PackedMatchesNeitherAuthority`]; a packed
-//!    struct whose two authorities AGREE does not exit here at all and
-//!    continues to step 4.
-//! 4. Compare every field offset (skipped when there are none), then the
-//!    struct's total size and alignment. Any divergence is `Disagrees`, and it
-//!    **outranks** step 5 — a measured disagreement must refuse, and
-//!    `NotComparable` does not.
-//! 5. Only if everything measurable agrees: `LayoutAbsent` when no field
+//!    struct whose two authorities AGREE continues to step 4.
+//! 4. Compare every field offset (skipped when there are none).
+//! 5. Compare the struct's total size and alignment. Any divergence in step 4
+//!    or 5 is `Disagrees`, and it **outranks** steps 6 and 7 — a measured
+//!    disagreement must refuse, and `NotComparable` does not.
+//! 6. Only if everything measurable agrees: `LayoutAbsent` when no field
 //!    carried an offset (the offsets went UNCHECKED — agreeing on the total
-//!    size says nothing about where the fields sit); otherwise `NotComparable`
-//!    for an *interior* the producer states no layout for (see **Interior
-//!    gaps** below); otherwise `Agrees`.
+//!    size says nothing about where the fields sit).
+//! 7. Otherwise `NotComparable` for an *interior* the producer states no
+//!    layout for (see **Interior gaps** below); otherwise `Agrees`.
 //!
 //! A struct with **zero fields** classifies as
 //! [`StructLayoutDisposition::Agrees`] **vacuously** — there is no field that
@@ -295,24 +159,18 @@
 //! the truth, so it is its own disposition and it **refuses**.
 //!
 //! What counts as "differ" is the **emitted** layout, not the whole
-//! `StructDef`. (b) CODE DOES: the byte path builds
-//! `Type::Struct([translate(f.ty) …])` from the resolved def's fields and picks
-//! the packed or natural-C authority from its `repr`. It never reads
-//! `StructDef::name`, `FieldDef::name`, `FieldDef::offset`, `size` or `align`
-//! to lay a value out. `StructDef: PartialEq` compares all of them
-//! (`trust-ir/src/ty.rs:689`, `:691-692`, `:710`), so using it here refused
-//! shadows that misaddress nothing — (c) MEASURED 2026-08-08: `Feet` vs
-//! `Meters` (identical fields, different struct name), `T` vs `T` (identical
-//! type and offset, different FIELD name) and `S` vs `S` (identical fields,
-//! different producer `size`/`align`) all reported `StructIdCollision` with
-//! `refusal=true` while every value of the shadowed type was addressed with a
-//! byte-identical layout. The gate now compares `emitted_layout_identity`
-//! (`repr` + the field TYPE sequence), which is exactly the condition steps 1-7
-//! need in order to be measuring what the byte path emits — see that
-//! function's docs for why nothing narrower is sound and nothing wider is
-//! honest, and why the alternative (keep full equality, add a non-refusing
-//! collision kind) was rejected: a producer offset that is wrong under a
-//! harmless shadow is still wrong and must still refuse, naming the field.
+//! `StructDef`. The byte path builds `Type::Struct([translate(f.ty) …])` from
+//! the resolved def's fields and picks the packed or natural-C authority from
+//! its `repr`; it never reads `StructDef::name`, `FieldDef::name`,
+//! `FieldDef::offset`, `size` or `align` to lay a value out. Comparing with
+//! `StructDef: PartialEq` would refuse shadows that misaddress nothing (same
+//! fields under a different struct or field name, or different producer
+//! `size`/`align`). The gate therefore compares `emitted_layout_identity`
+//! (`repr` + the field TYPE sequence) — see that function's docs for why
+//! nothing narrower is sound and nothing wider is honest, and why keeping full
+//! equality with a non-refusing collision kind was rejected: a producer offset
+//! that is wrong under a harmless shadow is still wrong and must still refuse,
+//! naming the field.
 //!
 //! Once no collision is established, `sdef` and the def `sdef.id` resolves to
 //! emit the same layout, so assembling the LIR type from `sdef`'s own fields
@@ -331,15 +189,13 @@
 //!   is 0/8 on the byte path and 8/0 in rustc; the containing struct's offsets
 //!   still agree because the sizes coincide.
 //! * `Ty::Record` — the adapter lowers it to the *identical* synthesized
-//!   `Type::Struct([field types...])` in declaration order
-//!   (`adapter.rs:1406-1433`), and [`trust_ir::RecordDef`]'s fields reuse
-//!   `FieldDef` with `offset` documented as ALWAYS `None`
-//!   (`first-party/trust-ir/crates/trust-ir/src/ty.rs:596-598`). Same gap as
-//!   `Ty::Tuple`, same synthesized aggregate.
+//!   `Type::Struct([field types...])` in declaration order, and
+//!   [`trust_ir::RecordDef`]'s fields reuse `FieldDef` with `offset`
+//!   documented as ALWAYS `None`. Same gap as `Ty::Tuple`.
 //! * `Ty::Closure` — likewise `Type::Struct([capture types...])` in capture
-//!   order (`adapter.rs:1443-1467`), and [`trust_ir::ClosureTy::captures`] is a
-//!   bare `Vec<Ty>` with no offset carrier at all. rustc reorders closure
-//!   captures exactly as it reorders `repr(Rust)` struct fields.
+//!   order, and [`trust_ir::ClosureTy::captures`] is a bare `Vec<Ty>` with no
+//!   offset carrier at all. rustc reorders closure captures exactly as it
+//!   reorders `repr(Rust)` struct fields.
 //! * `Ty::Enum` whose `EnumDef.layout` is `None` — the adapter fail-closes only
 //!   when `layout` / `discriminants` / `repr` are PRESENT, so the common enum
 //!   translates and gets LIR's canonical tagged-union layout, which is not
@@ -348,16 +204,13 @@
 //!   provably lays out TWO ways (see **Which authority is B** above). The
 //!   packed struct's own census row already declines to score itself; that says
 //!   nothing about a CONTAINER, whose own offsets can only be recomputed with
-//!   the natural-C authority. Gating only the struct's own `repr` let a
-//!   container be certified `Agrees` over an interior addressed at two
-//!   different sets of offsets.
+//!   the natural-C authority, so the container is not certified `Agrees` over
+//!   an interior addressed at two different sets of offsets.
 //! * `Ty::Refine(base, _)` over any of the above. A refinement is
-//!   REPRESENTATION-PRESERVING by construction
-//!   (`first-party/trust-ir/crates/trust-ir/src/ty.rs:183-190`) and the adapter
-//!   ERASES it, lowering the base carrier verbatim (`adapter.rs:1512-1522`).
-//!   The scan must follow that edge, charging the same one level of depth the
-//!   adapter charges it; not following it let a refinement hide any interior
-//!   gap and mint a false `Agrees`.
+//!   REPRESENTATION-PRESERVING by construction and the adapter ERASES it,
+//!   lowering the base carrier verbatim. The scan follows that edge, charging
+//!   the same one level of depth the adapter charges it, so a refinement
+//!   cannot hide an interior gap and mint a false `Agrees`.
 //!
 //! None can be *compared*, so none is reported as agreement: they are
 //! `NotComparable` / [`NotComparableKind::UnstatedInterior`] with a reason
@@ -365,58 +218,37 @@
 //!
 //! # Totality
 //!
-//! `Type::bytes()` multiplies and accumulates in unchecked `u32`
-//! (`types.rs:124` for `Array`, `types.rs:113-123` for `Struct`): debug builds
-//! abort and release builds WRAP, and a wrapped offset can mint either verdict.
-//! The predicate therefore proves the whole LIR type is representable
-//! ([`layout_is_representable`], checked `u64`) BEFORE calling into the byte
-//! path, and answers `NotComparable` otherwise. `types.rs` semantics are
-//! deliberately left unchanged — the guard lives here.
+//! `Type::bytes()` multiplies and accumulates in unchecked `u32` (the `Array`
+//! and `Struct` arms): debug builds abort and release builds WRAP, and a
+//! wrapped offset can mint either verdict. The predicate therefore proves the
+//! whole LIR type is representable ([`layout_is_representable`], checked
+//! `u64`) BEFORE calling into the byte path, and answers `NotComparable`
+//! otherwise. `types.rs` semantics are deliberately left unchanged — the guard
+//! lives here.
 //!
 //! # Named gaps
 //!
-//! * **`repr(packed)`'s SIZE still has two authorities in trust-cg** (see
-//!   above). The OFFSET half was repaired on 2026-08-08 —
-//!   `fill_aggregate_at_ptr` now routes field addressing through
-//!   `packed_struct_layout` — which closed a live wrong-value miscompile:
-//!   the aggregate-constant path wrote field 1 of `#[repr(packed)] { u8, u64 }`
-//!   at byte 8 while every read path loaded it from byte 1. Recorded in
-//!   `designs/2026-08-03-trustir-to-lir-converter.md` §10; pinned by
-//!   `tests/packed_aggregate_constants.rs`.
+//! * **`repr(packed)`'s SIZE still has two authorities in trust-cg.** Every
+//!   packed field OFFSET goes through `packed_struct_layout` (pinned by
+//!   `tests/packed_aggregate_constants.rs`; the shape it closed wrote field 1
+//!   of `#[repr(packed)] { u8, u64 }` at byte 8 while every read loaded it
+//!   from byte 1). `packed_struct_layout` recurses into a packed field's own
+//!   packed layout for both its extent and its alignment, and the packed
+//!   `InsertField` / aggregate `Store` copy lengths moved with it, since a
+//!   natural-C-lengthed copy would clobber the next sibling
+//!   (`tests/packed_nested_layout.rs`).
 //!
-//!   The SIZE half was deliberately NOT repaired in the same change, and the
-//!   reason is a memory-safety one, not an oversight. The LIR `Type` carries
-//!   no repr (`Type::Struct(Vec<Type>)`), so every consumer that measures an
-//!   EXTENT of an aggregate value measures it with `Type::bytes()`. Shrinking
-//!   the aggregate-constant slot to the packed size while those still copy the
-//!   natural size would turn a wrong-value bug into an out-of-bounds read AND
-//!   write. Keeping the slot natural is provably safe in the other direction:
+//!   The rest of the SIZE half stays natural-C for a memory-safety reason. The
+//!   LIR `Type` carries no repr (`Type::Struct(Vec<Type>)`), so every consumer
+//!   that measures an EXTENT of an aggregate value measures it with
+//!   `Type::bytes()`; shrinking a slot to the packed size while those still
+//!   copy the natural size would turn a wrong-value bug into an out-of-bounds
+//!   read AND write. Keeping the slot natural is safe in the other direction:
 //!   the packed clamp only ever LOWERS an alignment and every alignment is a
 //!   power of two, so authority P is pointwise <= authority C on offsets, size
-//!   and align — machine-checked by
-//!   [`tests::test_packed_authority_is_dominated_by_natural_c`] and, for the
-//!   nested shapes, by
-//!   `tests/packed_nested_layout.rs::the_stack_slot_for_a_nested_packed_struct_stays_at_the_natural_c_size`.
-//!
-//!   **The nested-packed repair (2026-08-08, later the same day) closed part of
-//!   the size half and named the rest.** `packed_struct_layout` itself was
-//!   wrong: it advanced its running offset by the natural-C `Type::bytes()` of
-//!   each field and clamped the natural-C `Type::align()`, so a field that was
-//!   ITSELF packed was measured with an authority that does not apply to it.
-//!   (c) MEASURED against stock `rustc 1.97.0`: `#[repr(packed)]
-//!   N { h: u8, inner: P }` was 17 where rustc says 10, and
-//!   `#[repr(C,packed(4))] { h: u8, inner: P }` placed `inner` at 4 where rustc
-//!   says 1 — so with a clamp above 1 the OFFSETS were wrong too, not only the
-//!   stride. Since the size IS the `Inst::GEP` element stride, `&[N]` indexing
-//!   strode 17 over memory rustc laid out at 10. Repaired by recursing into a
-//!   packed field's own packed layout for both its extent and its alignment.
-//!
-//!   That repair could not land alone, and the reason is the same
-//!   memory-safety one: the natural-C over-report was exactly what kept the
-//!   natural-C-lengthed aggregate-field copies inside their own field. The
-//!   packed `InsertField` arm and the aggregate `Store` arm therefore moved
-//!   onto `packed_struct_size` in the same change
-//!   (`TrustIrAdapter::aggregate_value_extent`).
+//!   and align ([`tests::test_packed_authority_is_dominated_by_natural_c`];
+//!   for nested shapes,
+//!   `tests/packed_nested_layout.rs::the_stack_slot_for_a_nested_packed_struct_stays_at_the_natural_c_size`).
 //!
 //!   STILL natural-C, and still a live two-authority exposure: the
 //!   alloca/heap element stride (`translate_alloc`, `translate_heap_alloc`),
@@ -426,8 +258,8 @@
 //!   shrunken slot under a natural-C copy is an out-of-bounds write — on the
 //!   heap path an out-of-bounds HEAP write.
 //!
-//!   Two further packed divergences from rustc are named, measured and NOT
-//!   fixed, both pinned in `tests/packed_nested_layout.rs`:
+//!   Two further packed divergences from rustc are named and NOT fixed, both
+//!   pinned in `tests/packed_nested_layout.rs`:
 //!   - an ARRAY or TUPLE of packed elements still contributes its natural-C
 //!     extent to a packed container, because its ELEMENTS are still addressed
 //!     at the natural stride by `ArrayGep`/`StructGep` on the repr-less LIR
@@ -443,66 +275,48 @@
 //!     which every NON-packed path uses, so it cannot be made without moving
 //!     non-packed output.
 //!
-//!   The bound that leaves on this predicate is narrower than "no packed
-//!   struct is ever certified and no packed struct is ever refused" — that
-//!   sentence used to sit here and was too strong in both halves. What holds
-//!   is: **this predicate never picks a winner between the two authorities.**
-//!   It certifies a packed struct only when the two authorities computed the
-//!   IDENTICAL layout (so no winner exists to pick), and it refuses one only
-//!   when the producer contradicts BOTH (so no winner needs picking). The
-//!   population left unanswered is exactly the packed structs whose authorities
-//!   disagree and whose producer matches one of them, and those are still
-//!   `NotComparable` / [`NotComparableKind::PackedNoSingleAuthority`], still a
-//!   live exposure, and still counted by
+//!   The bound this leaves on the predicate: **it never picks a winner between
+//!   the two packed authorities.** It certifies a packed struct only when the
+//!   two authorities computed the IDENTICAL layout (so no winner exists to
+//!   pick), and it refuses one only when the producer contradicts BOTH (so no
+//!   winner needs picking). The population left unanswered is exactly the
+//!   packed structs whose authorities disagree and whose producer matches one
+//!   of them, and those are `NotComparable` /
+//!   [`NotComparableKind::PackedNoSingleAuthority`], a live exposure counted by
 //!   [`StructLayoutCensus::unrefused_exposures`].
-//! * **The offset half of the packed gate is now over-conservative** — named,
-//!   not silent. Since the repair, authority C emits no packed struct's field
-//!   offsets at all, so a packed producer whose offsets match authority C and
-//!   contradict authority P states offsets NO path emits and could be refused
-//!   outright. `recompute_layout` still compares the two authorities on
-//!   offsets+size+align together, so such a row is reported as the
-//!   `PackedNoSingleAuthority` non-answer instead. That is over-conservative
-//!   in the SAFE direction (it under-refuses; it never certifies), exactly
-//!   like the interior-gate asymmetry below. Scoring offsets against authority
-//!   P alone while leaving the totals unscored needs a disposition for
-//!   "offsets compared, totals not", which is a predicate-shaped change and
-//!   was deliberately not bundled with a codegen fix.
-//! * **The two packed gates are asymmetric, deliberately and namedly.** The
-//!   struct's OWN gate (`recompute_layout`) now asks whether the two
-//!   authorities actually disagree; the INTERIOR gate (`interior_layout_gap`'s
-//!   `Ty::Struct` arm) still keys on `repr` alone, so a container of a packed
-//!   struct whose clamp is a no-op is reported `NotComparable` /
-//!   [`NotComparableKind::UnstatedInterior`] where it could be compared. That
-//!   is over-conservative in the SAFE direction and it cannot swallow a
-//!   refusal: step 4 compares the container's own offsets and size first and
-//!   **outranks** step 7, so a real container disagreement still refuses. The
-//!   cost is a slightly inflated `UnstatedInterior` / `unrefused_exposures`
-//!   figure, not a false certification. Left unchanged rather than fixed
-//!   speculatively alongside the gate that WAS swallowing refusals.
-//! * **Reachability of the packed offset defect WAS ESTABLISHED** (2026-08-03,
-//!   superseding the "NOT ESTABLISHED" note that stood here). (c) MEASURED
-//!   from real `trustc -Ztrust-dump=ir` output, two distinct producer shapes
-//!   emit `Constant::Aggregate` under a `StructRepr::Packed` type:
-//!   `seed_lane_ty`'s `Ty::Struct(sid)` arm (`trust-thir-lower/src/lib.rs`),
-//!   whose seed is then overwritten by an `InsertField` chain at packed
-//!   offsets and so was MASKED; and `finalize_valtree_to_constant`'s struct arm
-//!   (`trust-thir-lower/src/crate_module.rs:3160-3172`), which decodes a CTFE
-//!   valtree straight into the constant with NO `InsertField` chain — the
-//!   UNMASKED case. `pub const K: P = P { a: 7, b: 0x1122334455667788 };
-//!   pub fn read_k() -> u64 { K.b }` stored the u64 at slot+8 and loaded it
-//!   from slot+1, returning seven never-written stack bytes. That is the
-//!   miscompile the 2026-08-08 repair closes. Whether the 69-crate corpus
-//!   contains such a constant is still a corpus measurement not run here — no
-//!   `trust_ir` corpus dump exists in the tree to grep — so no corpus-visible
-//!   improvement is claimed.
+//! * **The offset half of the packed gate is over-conservative.** Authority C
+//!   emits no packed struct's field offsets, so a packed producer whose offsets
+//!   match authority C and contradict authority P states offsets NO path emits
+//!   and could be refused outright. `recompute_layout` still compares the two
+//!   authorities on offsets+size+align together, so such a row is reported as
+//!   the `PackedNoSingleAuthority` non-answer instead. That under-refuses; it
+//!   never certifies. Scoring offsets against authority P alone while leaving
+//!   the totals unscored needs a disposition for "offsets compared, totals
+//!   not", which is a predicate-shaped change.
+//! * **The two packed gates are asymmetric.** The struct's OWN gate
+//!   (`recompute_layout`) asks whether the two authorities actually disagree;
+//!   the INTERIOR gate (`interior_layout_gap`'s `Ty::Struct` arm) keys on
+//!   `repr` alone, so a container of a packed struct whose clamp is a no-op is
+//!   reported `NotComparable` / [`NotComparableKind::UnstatedInterior`] where
+//!   it could be compared. That is over-conservative in the SAFE direction and
+//!   cannot swallow a refusal: steps 4-5 compare the container's own offsets
+//!   and size first and **outrank** step 7, so a real container disagreement
+//!   still refuses. The cost is a slightly inflated `UnstatedInterior` /
+//!   `unrefused_exposures` figure, not a false certification.
+//! * **The packed offset defect is reachable from real producer output.** Two
+//!   producer shapes emit `Constant::Aggregate` under a `StructRepr::Packed`
+//!   type: `seed_lane_ty`'s `Ty::Struct(sid)` arm, whose seed an `InsertField`
+//!   chain then overwrites at packed offsets (masked), and
+//!   `finalize_valtree_to_constant`'s struct arm, which decodes a CTFE valtree
+//!   straight into the constant (unmasked). `pub const K: P = P { a: 7, b:
+//!   0x1122334455667788 }; pub fn read_k() -> u64 { K.b }` stored the u64 at
+//!   slot+8 and loaded it from slot+1 before the packed-offset repair.
 //! * `NotComparable` and `LayoutAbsent` are census rows, not refusals;
 //!   `StructIdCollision` is a refusal — see
-//!   [`StructLayoutDisposition::is_refusal`]. That non-refusal used to be
-//!   justified with "an unconvertible struct is already rejected by the
-//!   adapter's own type translation", which is FALSE for three of the four
-//!   [`NotComparableKind`]s and measurably so — only
-//!   [`NotComparableKind::AdapterRejected`] has that property. The kind is now
-//!   carried on the disposition and
+//!   [`StructLayoutDisposition::is_refusal`]. Only
+//!   [`NotComparableKind::AdapterRejected`] is also rejected by the adapter's
+//!   own type translation; the other [`NotComparableKind`]s are not, so the
+//!   kind is carried on the disposition and
 //!   [`StructLayoutCensus::unrefused_exposures`] counts the rows nothing
 //!   blocks.
 //! * A `Disagrees` in which no FIELD moves is NOT the mild case.
@@ -516,21 +330,19 @@
 //!   this struct's layout. It does not recurse into `Ty::Enum` variant
 //!   payloads either: a descriptor-less enum is already the whole gap, and a
 //!   descriptor-bearing one is refused by the adapter's own translation.
-//! * The scan terminates on [`MAX_INTERIOR_SCAN_DEPTH`] alone. That bound now
-//!   **fails CLOSED** (depth exhaustion reports a gap; it used to report "no
-//!   gap", the one answer that certifies), and it is *defined as* the adapter's
+//! * The scan terminates on [`MAX_INTERIOR_SCAN_DEPTH`] alone. That bound
+//!   **fails CLOSED** (depth exhaustion reports a gap, never "no gap", the one
+//!   answer that certifies), and it is *defined as* the adapter's
 //!   `MAX_TYPE_TRANSLATION_DEPTH` rather than copied from it, with
 //!   `test_the_interior_scan_bound_is_the_adapter_translation_bound` pinning
-//!   the coupling the unreachability argument rests on. It remains
-//!   **unreachable in normal classification**:
-//!   every edge the scan follows is also an edge the adapter's type translation
-//!   follows, so a cyclic or over-deep type graph blows
-//!   `MAX_TYPE_TRANSLATION_DEPTH` at step 3a first — measured, by neutering the
-//!   bound and finding the suite (including a 200-deep struct chain) still
-//!   green with no hang. It is kept as a *structural* totality guarantee, so
-//!   `interior_layout_gap` is total without depending on the adapter, and it is
-//!   deliberately not claimed as covered. What IS pinned is that step 3a is the
-//!   authority that answers a cyclic struct
+//!   the coupling the unreachability argument rests on. It is **unreachable in
+//!   normal classification**: every edge the scan follows is also an edge the
+//!   adapter's type translation follows, so a cyclic or over-deep type graph
+//!   exceeds `MAX_TYPE_TRANSLATION_DEPTH` at step 3a first. It is kept as a
+//!   *structural* totality guarantee, so `interior_layout_gap` is total
+//!   without depending on the adapter, and it is deliberately not claimed as
+//!   covered. What IS pinned is that step 3a is the authority that answers a
+//!   cyclic struct
 //!   (`test_a_self_referential_struct_is_answered_by_the_translation_depth_limit`).
 
 use trust_ir::{Module, StructDef, StructId, StructRepr, Ty};
@@ -1606,10 +1418,12 @@ fn natural_authority(field_count: usize, lir_ty: &Type) -> Option<AuthorityLayou
 /// function `TrustIrAdapter::explicit_field_offset` and
 /// `TrustIrAdapter::aggregate_value_extent` ask — rather than reading
 /// `sdef.offset` directly, so the answer is "what is emitted", not "what was
-/// declared". `None` whenever that function falls back: an incomplete declared
-/// layout, one whose fields do not fit or overlap under the emitted interior
-/// extents, or one that exceeds the natural-C recomputation and so would not
-/// fit the room the unreached extent consumers reserve.
+/// declared". `None` whenever that function does not answer with authority D:
+/// an incomplete declared layout (the named fallback), or — since WS7.8 — a
+/// complete one it REFUSES (`DeclaredStructLayoutNotEmittable`: fields that do
+/// not fit or overlap under the emitted interior extents, totals that differ
+/// from the natural-C recomputation, a packed layout authority P does not
+/// reproduce).
 fn declared_authority(sdef: &StructDef, module: &Module) -> Option<AuthorityLayout> {
     let layout = emitted_struct_layout(
         sdef,
@@ -1726,7 +1540,7 @@ fn recompute_layout(sdef: &StructDef, lir_ty: &Type, module: &Module) -> LayoutA
     };
 
     // Both authorities in full. See the module docs and
-    // `designs/2026-08-03-trustir-to-lir-converter.md` §10.
+    // clean `designs/2026-08-03-trustir-to-lir-converter.md` §10.
     let Some(packed) = packed_authority(sdef, module) else {
         return LayoutAuthority::Split(split_reason(
             sdef,
@@ -1861,6 +1675,7 @@ mod tests {
 
     fn struct_def(name: &str, fields: Vec<FieldDef>) -> StructDef {
         StructDef {
+            origin: None,
             id: StructId::new(0),
             name: name.to_string(),
             fields,
@@ -2120,6 +1935,7 @@ mod tests {
     fn test_census_counts_every_disposition_and_refuses_on_disagreement() {
         let mut module = Module::new("census");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Agreeing".to_string(),
             fields: vec![field("a", Ty::U64, Some(0)), field("b", Ty::U64, Some(8))],
@@ -2136,6 +1952,7 @@ mod tests {
         // one; the byte path emits the producer's offsets for it. See
         // `test_a_reordered_struct_with_coherent_totals_is_now_emitted_as_declared`.
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "Unaligned".to_string(),
             fields: vec![field("a", Ty::U64, Some(0)), field("b", Ty::U64, Some(4))],
@@ -2144,6 +1961,7 @@ mod tests {
             repr: StructRepr::Rust,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(2),
             name: "Generic".to_string(),
             fields: vec![field("t", Ty::U64, None)],
@@ -2152,6 +1970,7 @@ mod tests {
             repr: StructRepr::Rust,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(3),
             name: "Opaque".to_string(),
             fields: vec![field("rc", Ty::Rc(Box::new(Ty::U64)), Some(0))],
@@ -2160,6 +1979,7 @@ mod tests {
             repr: StructRepr::Rust,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(4),
             name: "Half".to_string(),
             fields: vec![field("a", Ty::U64, Some(0)), field("b", Ty::U64, None)],
@@ -2195,6 +2015,7 @@ mod tests {
     #[test]
     fn test_a_reordered_struct_with_coherent_totals_is_now_emitted_as_declared() {
         let sdef = StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Reordered".to_string(),
             fields: vec![
@@ -2243,6 +2064,7 @@ mod tests {
     fn test_census_all_agreeing_module_does_not_refuse() {
         let mut module = Module::new("census_clean");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "A".to_string(),
             fields: vec![field("x", Ty::U32, Some(0)), field("y", Ty::U32, Some(4))],
@@ -2251,6 +2073,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "B".to_string(),
             fields: vec![field("only", Ty::Ptr, Some(0))],
@@ -2272,6 +2095,7 @@ mod tests {
 
     fn sized_struct(name: &str, fields: Vec<FieldDef>, size: u64, align: u64) -> StructDef {
         StructDef {
+            origin: None,
             id: StructId::new(0),
             name: name.to_string(),
             fields,
@@ -2392,6 +2216,7 @@ mod tests {
             ],
         ));
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "HoldsOption".to_string(),
             // rustc niche-optimises this to 8 bytes; LIR synthesizes 16.
@@ -2509,6 +2334,7 @@ mod tests {
             ],
         ));
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "HasEnum".to_string(),
             fields: vec![
@@ -2555,6 +2381,7 @@ mod tests {
         // `Module::add_struct` honours declared ids verbatim with NO collision
         // check (trust-ir/src/lib.rs:1010-1014), so two defs can share an id.
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "First".to_string(),
             fields: vec![field("x", Ty::U64, Some(0)), field("y", Ty::U8, Some(8))],
@@ -2563,6 +2390,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Second".to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U8, Some(1))],
@@ -2619,6 +2447,7 @@ mod tests {
     fn test_classify_byte_identical_duplicate_id_is_not_a_collision() {
         let mut module = Module::new("identical_dup");
         let twin = |name: &str| StructDef {
+            origin: None,
             id: StructId::new(0),
             name: name.to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U8, Some(1))],
@@ -2655,6 +2484,7 @@ mod tests {
     fn test_struct_id_collision_outranks_the_shadowed_defs_own_defects() {
         let mut module = Module::new("collision_mixed");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Owner".to_string(),
             fields: vec![field("x", Ty::U64, Some(0))],
@@ -2663,6 +2493,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "ShadowedAndMixed".to_string(),
             fields: vec![field("a", Ty::U64, Some(0)), field("b", Ty::U64, None)],
@@ -2698,6 +2529,7 @@ mod tests {
     fn test_distinct_struct_ids_are_never_reported_as_a_collision() {
         let mut module = Module::new("distinct_ids");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "A".to_string(),
             fields: vec![field("x", Ty::U64, Some(0))],
@@ -2706,6 +2538,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "B".to_string(),
             fields: vec![field("y", Ty::U8, Some(0))],
@@ -2735,6 +2568,7 @@ mod tests {
 
     fn packed_struct(name: &str, n: u32, fields: Vec<FieldDef>) -> StructDef {
         StructDef {
+            origin: None,
             id: StructId::new(0),
             name: name.to_string(),
             fields,
@@ -2987,8 +2821,11 @@ mod tests {
     #[test]
     fn test_classify_overflowing_array_field_is_not_comparable_not_a_panic() {
         let mut module = Module::new("huge");
-        let elem = module.add_type(Ty::U64);
+        let elem = module
+            .add_type(Ty::U64)
+            .expect("Module::add_type: test fixture");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Huge".to_string(),
             fields: vec![
@@ -3025,6 +2862,7 @@ mod tests {
     fn test_a_self_referential_struct_is_answered_by_the_translation_depth_limit() {
         let mut module = Module::new("cyclic");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Node".to_string(),
             fields: vec![
@@ -3082,6 +2920,7 @@ mod tests {
                 .collect(),
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "HasRecord".to_string(),
             fields: vec![
@@ -3102,6 +2941,7 @@ mod tests {
             captures,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "HasClosure".to_string(),
             fields: vec![
@@ -3190,6 +3030,7 @@ mod tests {
         let mut module = module_with_record(vec![Ty::U8, Ty::U64]);
         // `HasRecord` is id 0; wrap it.
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "Outer".to_string(),
             fields: vec![
@@ -3223,6 +3064,7 @@ mod tests {
     #[test]
     fn test_classify_size_divergence_is_reported_even_with_no_offsets() {
         let disposition = classify(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "SizedButOffsetless".to_string(),
             fields: vec![field("a", Ty::U64, None), field("b", Ty::U8, None)],
@@ -3258,6 +3100,7 @@ mod tests {
     #[test]
     fn test_classify_agreeing_size_with_no_offsets_is_absent_not_agrees() {
         let disposition = classify(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "SizedOffsetless".to_string(),
             fields: vec![field("a", Ty::U64, None), field("b", Ty::U8, None)],
@@ -3295,6 +3138,7 @@ mod tests {
     #[test]
     fn test_classify_align_only_divergence_with_no_offsets_is_reported() {
         let disposition = classify(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "OverAlignedOffsetless".to_string(),
             fields: vec![field("a", Ty::U32, None)],
@@ -3317,6 +3161,7 @@ mod tests {
     fn test_classify_tuple_nested_inside_an_inner_struct_is_not_comparable() {
         let mut module = Module::new("nested_tuple");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Inner".to_string(),
             fields: vec![field("t", Ty::Tuple(vec![Ty::U8, Ty::U64]), Some(0))],
@@ -3325,6 +3170,7 @@ mod tests {
             repr: StructRepr::Rust,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "Outer".to_string(),
             fields: vec![
@@ -3353,6 +3199,7 @@ mod tests {
     fn test_classify_nested_struct_field_uses_the_byte_paths_layout() {
         let mut module = Module::new("nested");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Inner".to_string(),
             fields: vec![field("a", Ty::U32, Some(0)), field("b", Ty::U32, Some(4))],
@@ -3361,6 +3208,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "Outer".to_string(),
             fields: vec![
@@ -3411,11 +3259,15 @@ mod tests {
     /// producer offsets natural-C computes so nothing else can catch it.
     fn module_with_refined_field(base: Ty, after_offset: u64) -> Module {
         let mut module = Module::new("refine_interior");
-        let base_id = module.add_type(base);
+        let base_id = module
+            .add_type(base)
+            .expect("Module::add_type: test fixture");
         let pred = module
             .intern_pred(Pred::Top)
+            .expect("Module::intern_pred: test fixture")
             .expect("`Pred::Top` is always internable");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Refined".to_string(),
             fields: vec![
@@ -3454,6 +3306,7 @@ mod tests {
     fn test_classify_refinement_over_a_struct_still_reaches_the_interior() {
         let mut module = Module::new("refine_over_struct");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Inner".to_string(),
             fields: vec![field("t", Ty::Tuple(vec![Ty::U8, Ty::U64]), Some(0))],
@@ -3461,9 +3314,15 @@ mod tests {
             align: Some(8),
             repr: StructRepr::Rust,
         });
-        let base_id = module.add_type(Ty::Struct(StructId::new(0)));
-        let pred = module.intern_pred(Pred::Top).expect("Top interns");
+        let base_id = module
+            .add_type(Ty::Struct(StructId::new(0)))
+            .expect("Module::add_type: test fixture");
+        let pred = module
+            .intern_pred(Pred::Top)
+            .expect("Module::intern_pred: test fixture")
+            .expect("Top interns");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "Outer".to_string(),
             fields: vec![
@@ -3514,6 +3373,7 @@ mod tests {
     fn test_classify_container_of_a_packed_struct_is_not_comparable() {
         let mut module = Module::new("packed_interior");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "P".to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U64, Some(1))],
@@ -3522,6 +3382,7 @@ mod tests {
             repr: StructRepr::Packed(1),
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "Container".to_string(),
             fields: vec![
@@ -3557,6 +3418,7 @@ mod tests {
     fn test_classify_container_of_a_non_packed_struct_is_unaffected() {
         let mut module = Module::new("c_interior");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "P".to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U64, Some(8))],
@@ -3565,6 +3427,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "Container".to_string(),
             fields: vec![
@@ -3619,8 +3482,11 @@ mod tests {
         //     the per-type gate cannot see from a field: each field fits the
         //     u32 carrier on its own, and their SUM does not. 3e9 + 3e9 = 6e9.
         let mut overflow = Module::new("overflow");
-        let elem = overflow.add_type(Ty::U8);
+        let elem = overflow
+            .add_type(Ty::U8)
+            .expect("Module::add_type: test fixture");
         overflow.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Huge".to_string(),
             fields: vec![
@@ -3708,6 +3574,7 @@ mod tests {
             vec![field("inner", Ty::Rc(Box::new(Ty::U64)), Some(0))],
         ));
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "HasTuple".to_string(),
             fields: vec![
@@ -3719,6 +3586,7 @@ mod tests {
             repr: StructRepr::Rust,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(2),
             name: "Packed".to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U64, Some(1))],
@@ -3871,6 +3739,7 @@ mod tests {
         // incoherent, so the recomputation stands and `b` really is addressed
         // at 8 instead of 4.
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "Unaligned".to_string(),
             fields: vec![field("a", Ty::U64, Some(0)), field("b", Ty::U64, Some(4))],
@@ -3880,6 +3749,7 @@ mod tests {
         });
         // A size-only divergence: no field moves.
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "TrailPad".to_string(),
             fields: vec![field("a", Ty::U64, Some(0)), field("b", Ty::U8, Some(8))],
@@ -3891,6 +3761,7 @@ mod tests {
         // off the end of the declared size, so the containment gate declines
         // the layout and the recomputation (marker@8) stands.
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(2),
             name: "WithMarker".to_string(),
             fields: vec![
@@ -4296,6 +4167,7 @@ mod tests {
     fn test_census_counts_a_packed_row_that_matches_neither_authority() {
         let mut module = Module::new("packed_neither");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "MatchesP".to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U64, Some(1))],
@@ -4304,6 +4176,7 @@ mod tests {
             repr: StructRepr::Packed(1),
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(1),
             name: "MatchesNeither".to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U64, Some(4))],
@@ -4348,6 +4221,7 @@ mod tests {
         let mut module = Module::new("shadow");
         for (name, field_name, size, align) in [first, second] {
             module.add_struct(StructDef {
+                origin: None,
                 id: StructId::new(0),
                 name: name.to_string(),
                 fields: vec![field(field_name, Ty::U64, Some(0))],
@@ -4417,6 +4291,7 @@ mod tests {
         let mut module = Module::new("shadow_offsets");
         for offsets in [[0u64, 8u64], [0, 1]] {
             module.add_struct(StructDef {
+                origin: None,
                 id: StructId::new(0),
                 name: "S".to_string(),
                 fields: vec![
@@ -4447,6 +4322,7 @@ mod tests {
     fn test_same_id_differing_in_a_field_type_is_still_a_collision() {
         let mut module = Module::new("shadow_ty");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "S".to_string(),
             fields: vec![field("v", Ty::U8, Some(0))],
@@ -4455,6 +4331,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "S".to_string(),
             fields: vec![field("v", Ty::U64, Some(0))],
@@ -4478,6 +4355,7 @@ mod tests {
     fn test_same_id_differing_only_in_repr_is_still_a_collision() {
         let mut module = Module::new("shadow_repr");
         let def = |repr| StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "S".to_string(),
             fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U64, Some(8))],
@@ -4502,6 +4380,7 @@ mod tests {
     fn test_same_id_differing_in_field_count_is_still_a_collision() {
         let mut module = Module::new("shadow_count");
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "S".to_string(),
             fields: vec![field("a", Ty::U64, Some(0))],
@@ -4510,6 +4389,7 @@ mod tests {
             repr: StructRepr::C,
         });
         module.add_struct(StructDef {
+            origin: None,
             id: StructId::new(0),
             name: "S".to_string(),
             fields: vec![field("a", Ty::U64, Some(0)), field("b", Ty::U64, Some(8))],

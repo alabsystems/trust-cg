@@ -11,8 +11,6 @@
 //!
 //! End-to-end survival through the optimization pipeline (O0/O1/O2/O3)
 //! is covered by `crates/trust-cg-opt/tests/aggregate_pipeline.rs`.
-//!
-//! Design: `designs/2026-04-18-aggregate-lowering.md`.
 
 use trust_cg_lower::function::Signature;
 use trust_cg_lower::instructions::{Block, Instruction, Opcode, Value};
@@ -27,6 +25,7 @@ fn make_isel_ptr_index() -> (InstructionSelector, Block) {
         returns: vec![],
     };
     let mut isel = InstructionSelector::new("aggregate_test".to_string(), sig.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     let entry = Block(0);
     isel.lower_formal_arguments(&sig, entry).unwrap();
     (isel, entry)
@@ -39,6 +38,7 @@ fn make_isel_ptr() -> (InstructionSelector, Block) {
         returns: vec![],
     };
     let mut isel = InstructionSelector::new("aggregate_test".to_string(), sig.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     let entry = Block(0);
     isel.lower_formal_arguments(&sig, entry).unwrap();
     (isel, entry)

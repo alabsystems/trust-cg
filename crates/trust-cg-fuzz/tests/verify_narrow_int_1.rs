@@ -45,6 +45,7 @@ fn jit_run(m: &trust_ir::Module, opt: OptLevel, fast: bool, row: &[i64; 4]) -> R
 
     let compiled = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         Compiler::new(cfg)
+            .with_codegen_license(permit_unlicensed())
             .compile_module_to_jit(m, &ext)
             .map_err(Box::new)
     }));
@@ -99,7 +100,7 @@ fn build_module_srem(nty: Ty) -> trust_ir::Module {
     let wide = fb.sext(nty, Ty::I64, r);
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn check(label: &str, nty: Ty, a: i64, b: i64, expect_correct: i64) -> Vec<String> {
@@ -167,4 +168,13 @@ fn verify_narrow_int_1_srem_signedness() {
         eprintln!("DEFECT: {d}");
     }
     assert!(defects.is_empty(), "narrow_int SRem defects: {defects:#?}");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

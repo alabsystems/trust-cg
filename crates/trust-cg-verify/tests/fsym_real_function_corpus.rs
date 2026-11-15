@@ -425,12 +425,42 @@ fn actual_solver_statuses(
         .collect()
 }
 
+/// Every unknown hands the solver an explicit candidate — except one the
+/// scanner records BY NAME because there is no modeled input to hand over: a
+/// call whose memory effects are unsummarized, an operand whose value is not
+/// modeled (loaded from memory), or a site past an unmodeled branch. Those
+/// must NOT carry a typed candidate, which could only treat the unmodeled
+/// value as a free input.
 fn assert_unknowns_have_solver_handoffs(summary: &FsymSummary, fixture: &str) {
     for unknown in summary
         .functions
         .iter()
         .flat_map(|function| function.unknown_obligations.iter())
     {
+        // By name: no modeled quantity decides it (fsym-r3 adds the
+        // obligations of a pointer with no tracked provenance, and the
+        // lifetime / initialization / free classes, which have no solver
+        // encoding).
+        if matches!(
+            unknown.kind,
+            FsymTrustIrDiagnosticKind::UnsummarizedCall
+                | FsymTrustIrDiagnosticKind::UseAfterFree
+                | FsymTrustIrDiagnosticKind::InvalidFree
+                | FsymTrustIrDiagnosticKind::Uninitialized
+                | FsymTrustIrDiagnosticKind::ScanBound
+        ) || unknown.reason.contains("not modeled")
+            || unknown.reason.contains("passes the unmodeled")
+            || unknown.reason.contains("no tracked provenance")
+            || unknown.reason.contains("unavailable")
+        {
+            assert!(
+                unknown.solver_candidate.is_none(),
+                "by-name unknown carries a solver candidate for {} in {}",
+                unknown.function,
+                fixture
+            );
+            continue;
+        }
         assert!(
             unknown.candidate_expression.is_some(),
             "missing candidate expression for {} in {}",
@@ -442,6 +472,8 @@ fn assert_unknowns_have_solver_handoffs(summary: &FsymSummary, fixture: &str) {
             FsymTrustIrDiagnosticKind::NullDeref
                 | FsymTrustIrDiagnosticKind::Arithmetic
                 | FsymTrustIrDiagnosticKind::OutOfBounds
+                | FsymTrustIrDiagnosticKind::PointerArithmetic
+                | FsymTrustIrDiagnosticKind::Misaligned
         ) {
             assert!(
                 unknown.solver_candidate.is_some(),
@@ -496,6 +528,7 @@ fn skip_reason_tag(reason: FsymTrustIrSkipReason) -> &'static str {
         FsymTrustIrSkipReason::MalformedCfg => "malformed-cfg",
         FsymTrustIrSkipReason::UnsupportedTerminator => "unsupported-terminator",
         FsymTrustIrSkipReason::UnsupportedInstruction => "unsupported-instruction",
+        FsymTrustIrSkipReason::PointerWidth => "pointer-width",
     }
 }
 
@@ -505,5 +538,13 @@ fn kind_tag(kind: FsymTrustIrDiagnosticKind) -> &'static str {
         FsymTrustIrDiagnosticKind::Arithmetic => "arithmetic",
         FsymTrustIrDiagnosticKind::OutOfBounds => "bounds",
         FsymTrustIrDiagnosticKind::UseAfterFree => "use-after-free",
+        FsymTrustIrDiagnosticKind::Overlap => "overlap",
+        FsymTrustIrDiagnosticKind::UnsummarizedCall => "unsummarized-call",
+        FsymTrustIrDiagnosticKind::InvalidFree => "invalid-free",
+        FsymTrustIrDiagnosticKind::PointerArithmetic => "pointer-arithmetic",
+        FsymTrustIrDiagnosticKind::Misaligned => "misaligned",
+        FsymTrustIrDiagnosticKind::Uninitialized => "uninitialized-read",
+        FsymTrustIrDiagnosticKind::UnreachableReached => "unreachable-reached",
+        FsymTrustIrDiagnosticKind::ScanBound => "scan-bound",
     }
 }

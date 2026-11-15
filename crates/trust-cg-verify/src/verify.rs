@@ -23,7 +23,7 @@
 //! |-------|---------------|-----------|-----------|
 //! | [`VerificationStrength::Exhaustive`] | Concrete evaluation of all inputs | **Complete** for that bit-width | Widths <= 8, inputs <= 2 |
 //! | [`VerificationStrength::Statistical`] | Edge cases + N random samples | **Probabilistic** (configurable N, default 100K) | Widths > 8 (32-bit, 64-bit) |
-//! | [`VerificationStrength::Formal`] | External SMT solver (ay/Z3) | Complete for the represented obligation | Via [`crate::ay_bridge`] when a solver is on `PATH` |
+//! | [`VerificationStrength::Formal`] | AY + independent Clean checking | Complete for the represented obligation | Via [`crate::ay_bridge`] with identity-admitted AY and a capable Clean checker |
 //!
 //! ## Current status
 //!
@@ -31,20 +31,24 @@
 //! strength depending on bit-width. The 32/64-bit proofs use statistical
 //! verification with 100,000 random samples (configurable via
 //! [`crate::lowering_proof::VerificationConfig`]). This provides high
-//! confidence but is not a formal proof. Solver-backed tests call the external
-//! solver path in v0.1.0.
+//! confidence but is not a formal proof. Supported solver-backed obligations
+//! use the external AY/Clean proof route.
 //!
 //! ## Formal verification backends
 //!
 //! 1. **Evaluation testing**: Fast, catches regressions and
 //!    most bugs. Exhaustive for 8-bit, statistical for 32/64-bit.
 //!    No external solver required.
-//! 2. **ay CLI**: Proof obligations serialized to SMT-LIB2 via
-//!    [`crate::lowering_proof::ProofObligation::to_smt2`] and verified with
-//!    an external z3/ay solver. See [`crate::ay_bridge::verify_with_ay`].
-//!    Always available when a solver binary is on PATH.
-//!    Use [`crate::verification_runner::VerificationRunner::run_auto`] to select
-//!    the strongest available v0.1.0 backend.
+//! 2. **AY CLI**: Proof obligations serialized to SMT-LIB2 and discharged by
+//!    the external AY whose executable bytes match the build-time toolchain
+//!    record. Formal credit requires independent Clean acceptance of the
+//!    exact query's proof. See [`crate::ay_bridge::verify_with_ay`] and
+//!    [`crate::ay_identity`].
+//!
+//! [`crate::verification_runner::VerificationRunner::run_auto`] selects the
+//! available diagnostic route and can fall back to evaluation. A formal
+//! requirement uses [`crate::proof_gate::GateConfig::strict`], which refuses
+//! unavailable authority, timeout, unknown, or an unchecked UNSAT verdict.
 
 use std::collections::HashMap;
 
@@ -79,10 +83,9 @@ use crate::smt::SmtExpr;
 ///   Structured or adversarial bugs could theoretically hide in the untested
 ///   input space.
 ///
-/// - **Formal**: An SMT solver (ay/z3) proved the property for ALL inputs
+/// - **Formal**: AY produced an independently Clean-checked proof for ALL inputs
 ///   of the represented bit-width. This is available via
-///   [`crate::ay_bridge::verify_with_ay`] when a supported external solver is
-///   present.
+///   [`crate::ay_bridge::verify_with_ay`] when both proof tools are capable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationStrength {
     /// Complete enumeration of all inputs. Proof is exhaustive for the
@@ -93,14 +96,17 @@ pub enum VerificationStrength {
     /// proof. Used for 32/64-bit proofs. The sample count is configurable
     /// via [`VerificationConfig`].
     ///
-    /// The `sample_count` field records how many random trials were used.
+    /// This field describes the configured random-trial strategy. For a
+    /// favorable checked scalar FCMP result, all of these attempts were run;
+    /// precondition-inapplicable points are attempts, not compared pairs.
+    /// Early Invalid/Unknown results may stop sooner. Other legacy FP routes
+    /// still use edge-only evaluation and are not repaired by this accounting.
     Statistical {
-        /// Number of random samples that were tested (excludes edge cases).
+        /// Configured random attempts, excluding the separate edge battery.
         sample_count: u64,
     },
 
-    /// SMT solver provided a complete formal proof for all inputs.
-    /// Available via an external ay/Z3-compatible solver in v0.1.0.
+    /// AY provided an independently Clean-checked proof for all represented inputs.
     Formal,
 }
 
@@ -111,16 +117,22 @@ impl VerificationStrength {
         Self::for_obligation_with_config(obligation, &VerificationConfig::default())
     }
 
-    /// Determine the verification strength for a proof obligation with
-    /// a custom configuration.
+    /// Determine the configured strategy, not an execution receipt. Failed
+    /// checks can stop early; this classifier does not count observations.
     pub fn for_obligation_with_config(
         obligation: &ProofObligation,
         config: &VerificationConfig,
     ) -> Self {
-        let width = obligation.inputs.first().map(|(_, w)| *w).unwrap_or(32);
-        let num_inputs = obligation.inputs.len();
-
-        if num_inputs <= 2 && width <= config.exhaustive_threshold {
+        // Checked scalar FP samples raw F32/F64 operands; raising
+        // an integer exhaustive threshold cannot turn its finite run into a
+        // complete proof. A favorable run performs exactly sample_count random
+        // attempts in addition to IEEE edges, with applicability tracked apart.
+        if crate::lowering_proof::uses_checked_scalar_fp_evaluation(obligation) {
+            return VerificationStrength::Statistical {
+                sample_count: config.sample_count,
+            };
+        }
+        if crate::lowering_proof::exhaustive_input_count(obligation, config).is_some() {
             VerificationStrength::Exhaustive
         } else {
             VerificationStrength::Statistical {
@@ -1148,6 +1160,7 @@ fn unsupported_opcode_reason(role: &str, index: usize, opcode: &Opcode) -> Strin
             prefix
         ),
         Opcode::GlobalRef { .. }
+        | Opcode::FunctionAddr { .. }
         | Opcode::ExternRef { .. }
         | Opcode::TlsRef { .. }
         | Opcode::StackAddr { .. }
@@ -1628,11 +1641,20 @@ mod tests {
             "expected >= 48 memory proofs, got {}",
             report.total()
         );
-        assert!(
-            report.all_valid(),
-            "Memory proofs failed:\n{}",
-            report.summary()
-        );
+        // Every memory proof is Valid by evaluation, the two symbolic
+        // non-interference proofs included: only the sweep's
+        // precondition-directed trials reach their aligned address pairs
+        // (`memory_proofs::tests` pins that evidence).
+        for r in &report.results {
+            assert!(
+                r.is_valid(),
+                "Memory proof '{}' failed: {:?}\n{}",
+                r.name,
+                r.result,
+                report.summary()
+            );
+        }
+        assert_eq!(report.unknown(), 0, "Memory proofs:\n{}", report.summary());
     }
 
     #[test]

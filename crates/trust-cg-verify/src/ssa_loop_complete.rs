@@ -474,6 +474,13 @@ pub fn block_successors(block: &Block) -> Vec<BlockId> {
 struct Dominators {
     /// Immediate dominator of each reachable block (entry maps to itself).
     idom: HashMap<BlockId, BlockId>,
+    /// Preorder entry and exit numbers of each block in a depth-first walk of
+    /// the dominator tree `idom` describes, so that a block dominates another
+    /// exactly when its interval contains the other's. [`Dominators::dominates`]
+    /// answers from these in O(1) instead of walking the idom chain, which made
+    /// `back_edges` and `check_ssa` quadratic in a straight chain of blocks (a
+    /// `main` of 2,400 calls: 114 ms of a bridge compile, measured 2026-10-01).
+    interval: HashMap<BlockId, (u32, u32)>,
 }
 
 impl Dominators {
@@ -509,7 +516,8 @@ impl Dominators {
             }
         }
 
-        Dominators { idom }
+        let interval = dominator_tree_intervals(cfg.entry, &rpo, &idom);
+        Dominators { idom, interval }
     }
 
     fn is_reachable(&self, b: BlockId) -> bool {
@@ -525,8 +533,21 @@ impl Dominators {
         if !self.is_reachable(b) {
             return false;
         }
-        // Walk up b's idom chain; `a` dominates `b` iff it appears strictly
-        // above `b`. The chain terminates at the entry (idom[entry] == entry).
+        // `a` is a proper ancestor of `b` in the dominator tree exactly when
+        // its walk interval strictly contains `b`'s. A block the walk did not
+        // number (none, for a tree the fixpoint above builds) takes the chain.
+        if let (Some(&(a_in, a_out)), Some(&(b_in, b_out))) =
+            (self.interval.get(&a), self.interval.get(&b))
+        {
+            return a_in < b_in && b_out <= a_out;
+        }
+        self.dominates_by_chain(a, b)
+    }
+
+    /// [`Dominators::dominates`] for a reachable `b != a`, by walking `b`'s
+    /// idom chain: `a` dominates `b` iff it appears strictly above `b`.
+    fn dominates_by_chain(&self, a: BlockId, b: BlockId) -> bool {
+        // The chain terminates at the entry (idom[entry] == entry).
         let mut cur = b;
         loop {
             let next = self.idom[&cur];
@@ -540,6 +561,54 @@ impl Dominators {
             cur = next;
         }
     }
+}
+
+/// Preorder entry and exit numbers of a depth-first walk of the dominator tree
+/// `idom` (children taken in `rpo` order), from `entry`. A block's interval
+/// `(in, out)` holds `in` of every block in its subtree, itself included, and
+/// `out` is the largest `in` there, so `a` is a proper ancestor of `b` iff
+/// `a.in < b.in && b.out <= a.out`. Blocks the walk cannot reach from `entry`
+/// through `idom` get no interval.
+fn dominator_tree_intervals(
+    entry: BlockId,
+    rpo: &[BlockId],
+    idom: &HashMap<BlockId, BlockId>,
+) -> HashMap<BlockId, (u32, u32)> {
+    let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for &block in rpo {
+        if let Some(&parent) = idom.get(&block)
+            && parent != block
+        {
+            children.entry(parent).or_default().push(block);
+        }
+    }
+    let mut interval: HashMap<BlockId, (u32, u32)> = HashMap::new();
+    if !idom.contains_key(&entry) {
+        return interval;
+    }
+    let mut next: u32 = 0;
+    interval.insert(entry, (next, next));
+    // (block, index of the next child to visit)
+    let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
+    while let Some(&mut (block, ref mut child)) = stack.last_mut() {
+        let kids = children.get(&block).map(Vec::as_slice).unwrap_or(&[]);
+        if let Some(&kid) = kids.get(*child) {
+            *child += 1;
+            if interval.contains_key(&kid) {
+                continue;
+            }
+            next += 1;
+            interval.insert(kid, (next, next));
+            stack.push((kid, 0));
+        } else {
+            stack.pop();
+            let out = next;
+            if let Some(slot) = interval.get_mut(&block) {
+                slot.1 = out;
+            }
+        }
+    }
+    interval
 }
 
 /// Walk up the dominator tree from the higher-RPO node until the two pointers
@@ -814,12 +883,56 @@ fn check_loop_completeness(
         // is the reaching definition of slot j's loop variable.
         let param_derivations: Vec<(ValueId, BTreeSet<ValueId>)> = header_params
             .iter()
-            .map(|&p| (p, in_loop_derivations(function, &loop_blocks, p)))
+            .map(|&p| (p, in_loop_derivations(function, &loop_blocks, p, None)))
             .collect();
         let belongs_to = |arg: ValueId, idx: usize| -> bool {
             let (p, derivs) = &param_derivations[idx];
             arg == *p || derivs.contains(&arg)
         };
+        // The OWN-slot membership additionally enters the params of in-loop
+        // JOIN blocks (never the header's: those are the slots) whose incoming
+        // edge arguments are ALL slot k's value or its in-loop redefinitions.
+        // Such a param is slot k's variable on every path, so a value computed
+        // from it is a redefinition of slot k exactly as the same computation
+        // over `p_k` in straight-line code is: `overflow |= t` after an `if`
+        // that may also update `overflow` threads slot k's own next value. A
+        // join that merges slot k's value with any other value (for instance
+        // another slot's update that merely reads `p_k`) is not entered, so the
+        // widening never turns another slot's variable into slot k's; the
+        // other-slot evidence below is unchanged.
+        let own_slot_derivations: Vec<BTreeSet<ValueId>> = header_params
+            .iter()
+            .map(|&p| in_loop_derivations(function, &loop_blocks, p, Some(header)))
+            .collect();
+        let belongs_to_own = |arg: ValueId, idx: usize| -> bool {
+            belongs_to(arg, idx) || own_slot_derivations[idx].contains(&arg)
+        };
+        // Copy-chain closure per param: the values that ARE param j's value
+        // (identity preserved through `Copy` only), plus a per-slot
+        // "carried unchanged" flag (its own back-edge arg is the param
+        // itself — an invariant phi this back-edge). The anti-swap's
+        // OTHER-slot test distinguishes two evidence strengths:
+        //   * VERBATIM / copy-chain cross-slot args are ALWAYS a misroute
+        //     (another slot's exact value in this position);
+        //   * COMPUTED derivations are a misroute only when the source
+        //     slot itself CHANGED this back-edge — a computed value that
+        //     merely reads an invariant phi (`a = f(t2_slot, ...)` where
+        //     the t2 slot re-threads unchanged) is a legitimate fresh
+        //     update of its own slot, the doc's "freshly-computed value
+        //     ... never flagged" promise, which the plain closure broke
+        //     (the bridge-fuzz diamond false-positive family). Genuine
+        //     swaps thread CHANGED values across slots (`br H(%6,%5)`
+        //     with both updates crossed) and stay flagged.
+        let param_copy_chains: Vec<(ValueId, BTreeSet<ValueId>)> = header_params
+            .iter()
+            .map(|&p| (p, in_loop_copy_chain(function, &loop_blocks, p)))
+            .collect();
+        let is_value_of = |arg: ValueId, idx: usize| -> bool {
+            let (p, copies) = &param_copy_chains[idx];
+            arg == *p || copies.contains(&arg)
+        };
+        let slot_unchanged =
+            |idx: usize| -> bool { back_args.get(idx).copied() == Some(header_params[idx]) };
 
         // (2) POSITIONAL anti-SWAP check (fixes the set-membership logic bug,
         //     finding #2). For slot k, the back-edge arg a_k is the next-iteration
@@ -837,11 +950,12 @@ fn check_loop_completeness(
                 // Arity is enforced by invariant 1; nothing to position-check.
                 continue;
             };
-            if belongs_to(arg, slot) {
+            if belongs_to_own(arg, slot) {
                 continue; // a_k is p_k or its in-loop redefinition: correct slot.
             }
-            let swapped_from_other =
-                (0..param_derivations.len()).any(|j| j != slot && belongs_to(arg, j));
+            let swapped_from_other = (0..param_copy_chains.len()).any(|j| {
+                j != slot && (is_value_of(arg, j) || (belongs_to(arg, j) && !slot_unchanged(j)))
+            });
             if swapped_from_other {
                 out.push(SsaViolation::LoopCarriedSlotMisthreaded {
                     header,
@@ -939,6 +1053,20 @@ fn check_loop_completeness(
     }
 }
 
+/// TRUE iff `value` is never used (as an instruction operand or an edge
+/// argument) anywhere in `function` — i.e. the value is DEAD in the trust-ir.
+///
+/// Exported for the bridge's shape-A gate rescue: a
+/// [`SsaViolation::LoopCarriedValueNotThreaded`] whose value is dead AND
+/// positively attributable to write-only MIR locals is a false positive of
+/// sub-check (3)'s dropped-update heuristic (the node merely READS a
+/// loop-invariant; nothing can observe staleness because nothing reads the
+/// result). The deadness half of that predicate lives here so the bridge
+/// tests it against the same use model the check itself used.
+pub fn value_is_dead(function: &Function, value: ValueId) -> bool {
+    !collect_all_uses(function).contains(&value)
+}
+
 /// All values that appear as a use (plain operand or edge argument) anywhere in
 /// the function.
 fn collect_all_uses(function: &Function) -> HashSet<ValueId> {
@@ -958,6 +1086,43 @@ fn collect_all_uses(function: &Function) -> HashSet<ValueId> {
     uses
 }
 
+/// The in-loop COPY-CHAIN of `seed`: every value that holds `seed`'s exact
+/// value via `Copy` nodes inside the loop (identity preserved; no other
+/// instruction kind extends the chain). The anti-swap's other-slot test uses
+/// this instead of the full computational closure — see the call site.
+fn in_loop_copy_chain(
+    function: &Function,
+    loop_blocks: &HashSet<BlockId>,
+    seed: ValueId,
+) -> BTreeSet<ValueId> {
+    let mut reachable: HashSet<ValueId> = HashSet::from([seed]);
+    let mut chain: BTreeSet<ValueId> = BTreeSet::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block_id in loop_blocks {
+            let Some(block) = function_block(function, *block_id) else {
+                continue;
+            };
+            for node in &block.body {
+                let Inst::Copy { operand, .. } = &node.inst else {
+                    continue;
+                };
+                if !reachable.contains(operand) {
+                    continue;
+                }
+                for r in &node.results {
+                    if reachable.insert(*r) {
+                        chain.insert(*r);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    chain
+}
+
 /// In-loop values transitively derived from `seed` through in-loop operands.
 ///
 /// Starting from `seed`, repeatedly add any non-terminator instruction result
@@ -966,16 +1131,60 @@ fn collect_all_uses(function: &Function) -> HashSet<ValueId> {
 /// redefinitions of the variable that `seed` names (its reaching definitions at
 /// the latch are a subset of this). Block params are not instruction results, so
 /// a header param is reached only through the instructions that consume it.
+///
+/// With `through_joins = Some(header)` the closure also enters the param of an
+/// in-loop block other than `header` (a join inside the loop body) when EVERY
+/// edge argument flowing into that param, from any predecessor, is already
+/// reachable: the merged value is then `seed`'s variable on every path. A param
+/// that merges `seed`'s value with anything else (another slot's value, a
+/// constant, an out-of-loop value) is not entered, and a param with no incoming
+/// edge is not entered. Header params are the slots themselves and are never
+/// entered.
 fn in_loop_derivations(
     function: &Function,
     loop_blocks: &HashSet<BlockId>,
     seed: ValueId,
+    through_joins: Option<BlockId>,
 ) -> BTreeSet<ValueId> {
+    // Every in-loop join param with the full list of edge arguments that flow
+    // into it (collected over all blocks, so an out-of-loop predecessor keeps
+    // the param out of the closure).
+    let mut join_incoming: Vec<(ValueId, Vec<ValueId>)> = Vec::new();
+    if let Some(header) = through_joins {
+        for join in &function.blocks {
+            if join.id == header || !loop_blocks.contains(&join.id) {
+                continue;
+            }
+            for (index, (param, _)) in join.params.iter().enumerate() {
+                let mut incoming = Vec::new();
+                for pred in &function.blocks {
+                    for (target, args) in terminator_edges(pred) {
+                        if target == join.id
+                            && let Some(arg) = args.get(index)
+                        {
+                            incoming.push(*arg);
+                        }
+                    }
+                }
+                join_incoming.push((*param, incoming));
+            }
+        }
+    }
     let mut reachable: HashSet<ValueId> = HashSet::from([seed]);
     let mut derived: BTreeSet<ValueId> = BTreeSet::new();
     let mut changed = true;
     while changed {
         changed = false;
+        for (param, incoming) in &join_incoming {
+            if !incoming.is_empty()
+                && !reachable.contains(param)
+                && incoming.iter().all(|arg| reachable.contains(arg))
+            {
+                reachable.insert(*param);
+                derived.insert(*param);
+                changed = true;
+            }
+        }
         for block_id in loop_blocks {
             let Some(block) = function_block(function, *block_id) else {
                 continue;
@@ -1231,7 +1440,41 @@ pub fn non_terminator_value_uses(inst: &Inst) -> Vec<ValueId> {
         Inst::BinOp { lhs, rhs, .. }
         | Inst::Overflow { lhs, rhs, .. }
         | Inst::ICmp { lhs, rhs, .. }
-        | Inst::FCmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+        | Inst::FCmp { lhs, rhs, .. }
+        | Inst::TensorContract { lhs, rhs, .. } => vec![*lhs, *rhs],
+        Inst::TensorMap { args, .. } => args.clone(),
+        Inst::TensorGather { data, coords, .. } => std::iter::once(*data)
+            .chain(coords.iter().copied())
+            .collect(),
+        Inst::TensorScatter {
+            init, src, coords, ..
+        } => [*init, *src]
+            .into_iter()
+            .chain(coords.iter().copied())
+            .collect(),
+        Inst::TensorReduce { src, .. } => vec![*src],
+        Inst::TensorView {
+            src, params, fill, ..
+        } => {
+            let mut uses = Vec::with_capacity(1 + params.len() + usize::from(fill.is_some()));
+            uses.push(*src);
+            uses.extend(params.iter().copied());
+            uses.extend(fill.iter().copied());
+            uses
+        }
+
+        // trust-ir WS3.5 `Inst::MakeAggregate` (F-049): one operand per declared
+        // lane, and they ARE value uses. This must not fall to a wildcard — a
+        // use that this function does not report is a use the SSA/liveness
+        // analysis cannot see, which is the exact failure the header warns
+        // about ("New variants must be added here").
+        Inst::MakeAggregate { fields, .. } => fields.clone(),
+        // The function and closure type are module references, while every
+        // capture is an SSA read in declaration order (duplicates included).
+        Inst::MakeClosure { captures, .. } => captures.clone(),
+        // trust-ir v50 `Inst::ArraySplat`: ONE value use, the element, however
+        // many lanes repeat it.
+        Inst::ArraySplat { value, .. } => vec![*value],
 
         Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } | Inst::Copy { operand, .. } => {
             vec![*operand]
@@ -1239,6 +1482,12 @@ pub fn non_terminator_value_uses(inst: &Inst) -> Vec<ValueId> {
 
         Inst::Load { ptr, .. } => vec![*ptr],
         Inst::Store { ptr, value, .. } => vec![*ptr, *value],
+        // trust-ir WS3.20 bulk memory: both pointers (or the pointer and the
+        // fill byte) and the dynamic count are value uses.
+        Inst::MemCopy {
+            dst, src, bytes, ..
+        } => vec![*dst, *src, *bytes],
+        Inst::MemSet { dst, byte, bytes } => vec![*dst, *byte, *bytes],
         Inst::Alloca { count, .. } | Inst::HeapAlloc { count, .. } => {
             count.iter().copied().collect()
         }
@@ -1260,12 +1509,16 @@ pub fn non_terminator_value_uses(inst: &Inst) -> Vec<ValueId> {
             desired,
             ..
         } => vec![*ptr, *expected, *desired],
+        // v47: the dropped POINTER is a real value use.
+        Inst::Drop { ptr, .. } => vec![*ptr],
         Inst::Fence { .. } => vec![],
 
         // Call is a non-terminator in trust-ir (only Br/CondBr/Switch/Return/
         // Unreachable terminate). CallIndirect's callee is also a value use.
-        Inst::Call { args, .. } => args.clone(),
-        Inst::CallIndirect { callee, args, .. } => {
+        // v53: the non-propagating boundary twins carry the same operands.
+        Inst::Call { args, .. } | Inst::CallCannotUnwind { args, .. } => args.clone(),
+        Inst::CallIndirect { callee, args, .. }
+        | Inst::CallIndirectCannotUnwind { callee, args, .. } => {
             let mut v = vec![*callee];
             v.extend(args.iter().copied());
             v
@@ -1283,7 +1536,18 @@ pub fn non_terminator_value_uses(inst: &Inst) -> Vec<ValueId> {
             ..
         } => vec![*array, *index, *value],
 
-        Inst::Assume { cond } | Inst::Assert { cond } => vec![*cond],
+        Inst::Assume { cond } => vec![*cond],
+        // v52 panic payloads are real SSA uses, even though execution reads
+        // them only on the failed-check path. Do not lose them to `..`.
+        // v54: a sited check's run-time (`Value`) location is a use too.
+        Inst::Assert { cond, kind, site } => {
+            let mut uses = vec![*cond];
+            if let Some(operands) = kind.operands() {
+                uses.extend(operands);
+            }
+            uses.extend(site.as_ref().and_then(trust_ir::PanicSite::location_value));
+            uses
+        }
         Inst::Select {
             cond,
             then_val,
@@ -1328,6 +1592,28 @@ pub fn non_terminator_value_uses(inst: &Inst) -> Vec<ValueId> {
         // is a terminator whose `exn` is a plain use. A `LandingPad` is a
         // non-terminator block entry that PRODUCES values and has no operands.
         Inst::Invoke { args, .. } => args.clone(),
+        // v54: `AssertInvoke` is a terminator; its condition, kind operands
+        // and run-time location are plain uses, its `normal_args` EDGE args.
+        Inst::AssertInvoke {
+            cond, kind, site, ..
+        } => {
+            let mut uses = vec![*cond];
+            if let Some(operands) = kind.operands() {
+                uses.extend(operands);
+            }
+            uses.extend(site.location_value());
+            uses
+        }
+        // v55 (amendment D): `DropInvoke` is a terminator; the dropped
+        // pointer is a plain use, its `normal_args` EDGE args.
+        Inst::DropInvoke { ptr, .. } => vec![*ptr],
+        // v56: `InvokeIndirect` is a terminator; the callee and the call
+        // `args` are plain uses, its `normal_args` EDGE args (as `Invoke`'s).
+        Inst::InvokeIndirect { callee, args, .. } => {
+            let mut uses = vec![*callee];
+            uses.extend(args.iter().copied());
+            uses
+        }
         Inst::Resume { exn } => vec![*exn],
         Inst::LandingPad { .. } => vec![],
         Inst::Br { .. } | Inst::Unreachable => vec![],
@@ -1375,7 +1661,40 @@ pub fn terminator_edges(block: &Block) -> Vec<(BlockId, Vec<ValueId>)> {
             (*normal_dest, normal_args.clone()),
             (*unwind_dest, Vec::new()),
         ],
-        _ => Vec::new(),
+        // v54: a sited check with an unwind edge has `Invoke`'s successor
+        // discipline: the passing check's continuation, and the landing pad.
+        // v55 `DropInvoke` and v56 `InvokeIndirect` take it verbatim too.
+        Inst::AssertInvoke {
+            normal_dest,
+            normal_args,
+            unwind_dest,
+            ..
+        }
+        | Inst::DropInvoke {
+            normal_dest,
+            normal_args,
+            unwind_dest,
+            ..
+        }
+        | Inst::InvokeIndirect {
+            normal_dest,
+            normal_args,
+            unwind_dest,
+            ..
+        } => vec![
+            (*normal_dest, normal_args.clone()),
+            (*unwind_dest, Vec::new()),
+        ],
+        // Every other instruction: trust-ir's EXHAUSTIVE control-flow accessor
+        // (no wildcard; trust-ir 4c721f3e), so a terminator a later pin adds
+        // contributes its edges here instead of reading as a sink. It answers
+        // empty for `Return`, `Resume`, `Unreachable`, `CoroSuspend` and every
+        // non-terminator.
+        other => other
+            .successor_edges()
+            .into_iter()
+            .map(|edge| (edge.target, edge.args.to_vec()))
+            .collect(),
     }
 }
 
@@ -1443,6 +1762,82 @@ mod tests {
 
     fn empty_fn() -> Function {
         Function::new(FuncId::new(0), "test", FuncTyId::new(0), b(0))
+    }
+
+    #[test]
+    fn runtime_closure_value_uses_keep_capture_order_and_duplicates() {
+        for captures in [vec![], vec![v(4), v(2), v(4)]] {
+            let inst = Inst::MakeClosure {
+                ty: trust_ir::ClosureTyId::new(8),
+                func: FuncId::new(77),
+                captures: captures.clone(),
+            };
+            assert_eq!(non_terminator_value_uses(&inst), captures);
+        }
+    }
+
+    #[test]
+    fn runtime_closure_undefined_capture_is_an_ssa_error_even_when_unused() {
+        let mut function = empty_fn();
+        let mut entry = Block::new(b(0));
+        entry.body.push(
+            InstrNode::new(Inst::MakeClosure {
+                ty: trust_ir::ClosureTyId::new(0),
+                func: FuncId::new(77),
+                captures: vec![v(99)],
+            })
+            .with_result(v(0)),
+        );
+        entry
+            .body
+            .push(InstrNode::new(Inst::Return { values: vec![] }));
+        function.blocks.push(entry);
+        assert!(check_function(&function).is_err());
+    }
+
+    #[test]
+    fn call_boundary_value_uses_keep_arguments_and_indirect_callee() {
+        let direct = Inst::CallCannotUnwind {
+            callee: FuncId::new(7),
+            args: vec![v(2), v(4), v(2)],
+        };
+        let indirect = Inst::CallIndirectCannotUnwind {
+            callee: v(9),
+            sig: FuncTyId::new(3),
+            args: vec![v(2), v(4), v(2)],
+            calling_conv: trust_ir::CallingConv::C,
+        };
+        assert_eq!(non_terminator_value_uses(&direct), vec![v(2), v(4), v(2)]);
+        assert_eq!(
+            non_terminator_value_uses(&indirect),
+            vec![v(9), v(2), v(4), v(2)]
+        );
+    }
+
+    #[test]
+    fn call_boundary_undefined_operands_fail_ssa_including_dead_calls() {
+        for inst in [
+            Inst::CallCannotUnwind {
+                callee: FuncId::new(7),
+                args: vec![v(99)],
+            },
+            Inst::CallIndirectCannotUnwind {
+                callee: v(99),
+                sig: FuncTyId::new(0),
+                args: vec![],
+                calling_conv: trust_ir::CallingConv::C,
+            },
+        ] {
+            let mut function = empty_fn();
+            let mut entry = Block::new(b(0));
+            // No result is consumed; the call's operands are still SSA uses.
+            entry.body.push(InstrNode::new(inst));
+            entry
+                .body
+                .push(InstrNode::new(Inst::Return { values: vec![] }));
+            function.blocks.push(entry);
+            assert!(check_function(&function).is_err());
+        }
     }
 
     /// Build the CORRECTLY-THREADED scalar loop (the `z1`/`z2` shape).
@@ -2311,5 +2706,97 @@ mod tests {
 
     fn v_lit(n: u32) -> ValueId {
         ValueId::new(n)
+    }
+
+    /// A CFG over blocks `0..n` from an explicit successor list.
+    fn cfg_of(n: u32, entry: u32, edges: &[(u32, u32)]) -> Cfg {
+        let blocks: Vec<BlockId> = (0..n).map(b).collect();
+        let mut successors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for &id in &blocks {
+            successors.entry(id).or_default();
+            predecessors.entry(id).or_default();
+        }
+        for &(from, to) in edges {
+            successors.entry(b(from)).or_default().push(b(to));
+            predecessors.entry(b(to)).or_default().push(b(from));
+        }
+        Cfg {
+            entry: b(entry),
+            blocks,
+            successors,
+            predecessors,
+        }
+    }
+
+    /// The interval answer of `Dominators::dominates` equals the idom-chain
+    /// walk it replaced, for every ordered pair of blocks of 600 generated
+    /// CFGs (chains, diamonds, loops, unreachable blocks, self-loops,
+    /// duplicate edges), and every reachable block is numbered.
+    #[test]
+    fn interval_dominance_matches_the_idom_chain_walk() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |bound: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % u64::from(bound)) as u32
+        };
+        for case in 0..600u32 {
+            let n = 1 + next(24);
+            let mut edges = Vec::new();
+            for from in 0..n {
+                // A forward chain most of the time, plus random edges
+                // (backward ones make loops, repeats make duplicate edges).
+                if from + 1 < n && next(4) != 0 {
+                    edges.push((from, from + 1));
+                }
+                for _ in 0..next(3) {
+                    edges.push((from, next(n)));
+                }
+            }
+            let entry = if case % 7 == 0 { next(n) } else { 0 };
+            let cfg = cfg_of(n, entry, &edges);
+            let dominators = Dominators::compute(&cfg);
+            for x in 0..n {
+                if dominators.is_reachable(b(x)) {
+                    assert!(
+                        dominators.interval.contains_key(&b(x)),
+                        "case {case}: reachable bb{x} has no interval"
+                    );
+                }
+                for y in 0..n {
+                    let (a, c) = (b(x), b(y));
+                    let expected = a == c
+                        || (dominators.is_reachable(c) && dominators.dominates_by_chain(a, c));
+                    assert_eq!(
+                        dominators.dominates(a, c),
+                        expected,
+                        "case {case}: dominates(bb{x}, bb{y}) over edges {edges:?} from bb{entry}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A straight chain of blocks is the shape that made the chain walk
+    /// quadratic: every block still dominates every later one, and none an
+    /// earlier one.
+    #[test]
+    fn interval_dominance_on_a_long_chain() {
+        let n = 3_000u32;
+        let edges: Vec<(u32, u32)> = (0..n - 1).map(|i| (i, i + 1)).collect();
+        let cfg = cfg_of(n, 0, &edges);
+        let dominators = Dominators::compute(&cfg);
+        for (x, y) in [(0, n - 1), (17, 2_999), (1_500, 1_501), (2_999, 2_999)] {
+            assert!(dominators.dominates(b(x), b(y)), "bb{x} dominates bb{y}");
+        }
+        for (x, y) in [(n - 1, 0), (1_501, 1_500), (2_000, 17)] {
+            assert!(
+                !dominators.dominates(b(x), b(y)),
+                "bb{x} does not dominate bb{y}"
+            );
+        }
+        assert!(back_edges(&cfg, &dominators).is_empty());
     }
 }

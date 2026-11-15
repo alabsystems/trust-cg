@@ -21,14 +21,12 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 /// A pending external-process invocation. Build with `Spawn::new`, chain
-/// `.arg(..)` / `.env(..)`, then call `.run()` or `.capture()`.
+/// `.arg(..)` / `.args(..)` / `.cwd(..)`, then call `.run()` or `.capture()`.
 #[derive(Debug)]
 pub struct Spawn {
     program: OsString,
     args: Vec<OsString>,
-    envs: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
-    inherit_stderr: bool,
 }
 
 /// Captured stdout/stderr + exit status from an external invocation.
@@ -57,9 +55,7 @@ impl Spawn {
         Self {
             program: program.into(),
             args: Vec::new(),
-            envs: Vec::new(),
             cwd: None,
-            inherit_stderr: false,
         }
     }
 
@@ -81,13 +77,6 @@ impl Spawn {
         self
     }
 
-    /// Set an environment variable.
-    #[must_use]
-    pub fn env(mut self, key: impl Into<OsString>, val: impl Into<OsString>) -> Self {
-        self.envs.push((key.into(), val.into()));
-        self
-    }
-
     /// Set the working directory for the child.
     #[must_use]
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
@@ -95,20 +84,9 @@ impl Spawn {
         self
     }
 
-    /// When set, stderr streams to this process's stderr instead of being
-    /// captured.
-    #[must_use]
-    pub fn inherit_stderr(mut self) -> Self {
-        self.inherit_stderr = true;
-        self
-    }
-
     fn to_command(&self) -> Command {
         let mut c = Command::new(&self.program);
         c.args(&self.args);
-        for (k, v) in &self.envs {
-            c.env(k, v);
-        }
         if let Some(cwd) = &self.cwd {
             c.current_dir(cwd);
         }
@@ -131,11 +109,7 @@ impl Spawn {
         let program = self.program.clone();
         let mut cmd = self.to_command();
         cmd.stdout(Stdio::piped());
-        cmd.stderr(if self.inherit_stderr {
-            Stdio::inherit()
-        } else {
-            Stdio::piped()
-        });
+        cmd.stderr(Stdio::piped());
         let output = cmd
             .output()
             .with_context(|| format!("failed to spawn {}", program.to_string_lossy()))?;

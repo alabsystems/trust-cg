@@ -1,0 +1,46 @@
+=== 01-beat-llvm-evidence-warm-cold: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --retain-dir $HOME/trust-cg-w19/perf-requalification-L14-P1/reports/perf/2026-10-14-darwin-aarch64-requalification
+01-beat-llvm-evidence-warm-cold	exit=0	wall_s=367.9
+evidence results: benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T135816Z.json
+=== 02-perf-ratchet-require-current: python3 scripts/check_perf_ratchet.py --require-current benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T135816Z.json
+02-perf-ratchet-require-current	exit=3	wall_s=0.3
+=== 03-check-gates-evidence: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T135816Z.json
+03-check-gates-evidence	exit=2	wall_s=0.1
+campaign done 2026-10-14T13:58:18Z
+=== 01-beat-llvm-evidence-warm-cold: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --retain-dir $HOME/trust-cg-w19/perf-requalification-L14-P1/reports/perf/2026-10-14-darwin-aarch64-requalification
+01-beat-llvm-evidence-warm-cold	exit=0	wall_s=353.9
+evidence results: benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T140910Z.json
+=== 02-perf-ratchet-require-current: python3 scripts/check_perf_ratchet.py --require-current benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T140910Z.json
+02-perf-ratchet-require-current	exit=3	wall_s=0.2
+=== 03-check-gates-evidence: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T140910Z.json
+03-check-gates-evidence	exit=2	wall_s=0.0
+campaign done 2026-10-14T14:09:12Z
+=== 01-beat-llvm-evidence-warm-cold: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --retain-dir $HOME/trust-cg-w19/perf-requalification-L14-P1/reports/perf/2026-10-14-darwin-aarch64-requalification
+01-beat-llvm-evidence-warm-cold	exit=0	wall_s=341.2
+evidence results: benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T142054Z.json
+=== 02-perf-ratchet-require-current: python3 scripts/check_perf_ratchet.py --require-current benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T142054Z.json
+02-perf-ratchet-require-current	exit=0	wall_s=0.2
+=== 03-check-gates-evidence: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T142054Z.json
+03-check-gates-evidence	exit=0	wall_s=0.1
+campaign done 2026-10-14T14:20:56Z
+=== 04-beat-llvm-diagnostic-no-proof-certs: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --bridge-cg-arg no-proof-certs --retain-dir $HOME/trust-cg-w19/perf-requalification-L14-P1/reports/perf/2026-10-14-darwin-aarch64-requalification/diagnostic-no-proof-certs
+04-beat-llvm-diagnostic-no-proof-certs	exit=0	wall_s=375.5
+diagnostic results: benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T150057Z.json
+=== 05-check-gates-diagnostic: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T150057Z.json
+05-check-gates-diagnostic	exit=2	wall_s=0.1
+campaign done 2026-10-14T15:00:59Z
+=== 14-loadrobust-diagnostic: python3 $HOME/trust-cg-w19/perf-requalification-L14-P1/reports/perf/2026-10-14-darwin-aarch64-requalification/commands/loadrobust.py --repo $HOME/trust-cg-w19/perf-requalification-L14-P1 --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --work $HOME/trust-cg-w19/scratch/perf-requalification-L14-P1/scaling-work/loadrobust --out $HOME/trust-cg-w19/perf-requalification-L14-P1/reports/perf/2026-10-14-darwin-aarch64-requalification/loadrobust.json
+14-loadrobust-diagnostic	exit=0	wall_s=225.2
+campaign done 2026-10-14T15:36:47Z
+=== 06-scale-gate-rss: python3 benchmarks/beat-llvm/scale_gate.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --rss
+06-scale-gate-rss	exit=0	wall_s=40.0
+=== 07-compile-scaling: python3 benchmarks/compile-scaling/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --out-dir $HOME/trust-cg-w19/scratch/perf-requalification-L14-P1/scaling-work
+07-compile-scaling	exit=0	wall_s=37.5
+campaign done 2026-10-14T15:44:07Z
+=== 08-compile-time-canary: bash scripts/compile_time_canary.sh --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc
+08-compile-time-canary	exit=1	wall_s=3.3
+=== 09-determinism-sentinel: bash scripts/compile_determinism_sentinel.sh 5 --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc
+09-determinism-sentinel	exit=2	wall_s=9.6
+campaign done 2026-10-14T15:44:22Z
+=== 13-perf-ratchet-require-current-append: python3 scripts/check_perf_ratchet.py --require-current --append benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T142054Z.json
+13-perf-ratchet-require-current-append	exit=0	wall_s=0.2
+campaign done 2026-10-14T15:44:35Z

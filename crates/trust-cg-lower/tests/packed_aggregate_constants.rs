@@ -37,7 +37,6 @@
 //! * the stack slot deliberately stays at the LIR type's natural-C size (see
 //!   `slot_for_a_packed_aggregate_const_stays_at_the_lir_type_size`).
 
-use trust_cg_lower::adapter::translate_function;
 use trust_cg_lower::instructions::Opcode;
 use trust_cg_lower::types::Type;
 use trust_ir::{
@@ -71,6 +70,7 @@ fn field(name: &str, ty: Ty, offset: Option<u64>) -> FieldDef {
 /// `offsets [0, 8] size 16 align 8`.
 fn u8_u64_struct(name: &str, repr: StructRepr, offsets: [Option<u64>; 2]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: name.to_string(),
         fields: vec![
@@ -89,11 +89,14 @@ fn const_then_return(sdef: StructDef) -> TrustIrModule {
     let struct_ty = Ty::Struct(sdef.id);
     let mut module = TrustIrModule::new("k");
     module.structs = vec![sdef];
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![struct_ty.clone()],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![struct_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "k", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -110,7 +113,9 @@ fn const_then_return(sdef: StructDef) -> TrustIrModule {
             InstrNode::new(Inst::Return { values: vec![v(0)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -120,7 +125,8 @@ fn lower(module: &TrustIrModule) -> Vec<Opcode> {
         .first()
         .expect("the fixture module holds exactly one function");
     let (lir_func, _proofs) =
-        translate_function(func, module).expect("adapter must accept the aggregate constant");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter must accept the aggregate constant");
     let entry = lir_func.entry_block;
     lir_func.blocks[&entry]
         .instructions
@@ -153,13 +159,16 @@ fn packed_aggregate_const_addresses_fields_at_packed_offsets() {
          it with natural-C `Type::offset_of`. Got {opcodes:?}"
     );
 
-    // An OFFSET constant is an `Iconst` consumed by the following `Iadd`;
+    // An OFFSET constant is an `Iconst` consumed by the following byte-stride
+    // `ArrayGep { elem_ty: I8 }` (a numeric `Iadd` before b79533c9c);
     // filtering on `Iconst { ty: I64 }` alone would also collect the u64 field
     // VALUE, which is not an address.
     let offsets: Vec<i64> = opcodes
         .windows(2)
         .filter_map(|w| match (&w[0], &w[1]) {
-            (Opcode::Iconst { ty: Type::I64, imm }, Opcode::Iadd) => Some(*imm),
+            (Opcode::Iconst { ty: Type::I64, imm }, Opcode::ArrayGep { elem_ty: Type::I8 }) => {
+                Some(*imm)
+            }
             _ => None,
         })
         .collect();
@@ -183,11 +192,14 @@ fn packed_aggregate_const_addresses_fields_at_packed_offsets() {
          packed InsertField path (`adapter.rs:6963`) does. Got {opcodes:?}"
     );
 
-    let iadds = opcodes
+    let byte_stride_geps = opcodes
         .iter()
-        .filter(|op| matches!(op, Opcode::Iadd))
+        .filter(|op| matches!(op, Opcode::ArrayGep { .. }))
         .count();
-    assert_eq!(iadds, 2, "one base+offset Iadd per field, got {opcodes:?}");
+    assert_eq!(
+        byte_stride_geps, 2,
+        "one base+offset byte-stride ArrayGep per field, got {opcodes:?}"
+    );
 }
 
 /// A packed struct NESTED inside a packed struct. `fill_aggregate_at_ptr`
@@ -203,6 +215,7 @@ fn packed_aggregate_const_addresses_fields_at_packed_offsets() {
 #[test]
 fn nested_packed_aggregate_const_composes_packed_offsets() {
     let inner = StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "P".to_string(),
         fields: vec![field("a", Ty::U8, Some(0)), field("b", Ty::U64, Some(1))],
@@ -211,6 +224,7 @@ fn nested_packed_aggregate_const_composes_packed_offsets() {
         repr: StructRepr::Packed(1),
     };
     let outer = StructDef {
+        origin: None,
         id: StructId::new(1),
         name: "N".to_string(),
         fields: vec![
@@ -225,11 +239,14 @@ fn nested_packed_aggregate_const_composes_packed_offsets() {
 
     let mut module = TrustIrModule::new("n");
     module.structs = vec![inner, outer];
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![outer_ty.clone()],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![outer_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "n", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -249,7 +266,9 @@ fn nested_packed_aggregate_const_composes_packed_offsets() {
             InstrNode::new(Inst::Return { values: vec![v(0)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let opcodes = lower(&module);
     assert!(
@@ -258,11 +277,14 @@ fn nested_packed_aggregate_const_composes_packed_offsets() {
             .any(|op| matches!(op, Opcode::StructGep { .. })),
         "neither the outer nor the inner packed struct may use StructGep, got {opcodes:?}"
     );
-    // The inner base is `N + 1`; the inner fields then add 0 and 1 to THAT.
+    // The inner base is `N + 1`; the inner fields then add 0 and 1 to THAT,
+    // each through a byte-stride `ArrayGep { elem_ty: I8 }`.
     let offsets: Vec<i64> = opcodes
         .windows(2)
         .filter_map(|w| match (&w[0], &w[1]) {
-            (Opcode::Iconst { ty: Type::I64, imm }, Opcode::Iadd) => Some(*imm),
+            (Opcode::Iconst { ty: Type::I64, imm }, Opcode::ArrayGep { elem_ty: Type::I8 }) => {
+                Some(*imm)
+            }
             _ => None,
         })
         .collect();
@@ -285,6 +307,8 @@ fn nested_packed_aggregate_const_composes_packed_offsets() {
 
 /// The full emitted stream for the packed case, pinned exactly. Any future
 /// change to the packed aggregate-constant shape has to come through here.
+/// Each field address is `slot + offset` through a byte-stride
+/// `ArrayGep { elem_ty: I8 }` (b79533c9c moved it off the numeric `Iadd`).
 #[test]
 fn packed_aggregate_const_full_stream() {
     let opcodes = lower(&const_then_return(u8_u64_struct(
@@ -298,7 +322,7 @@ fn packed_aggregate_const_full_stream() {
             ty: Type::I64,
             imm: 0,
         },
-        Opcode::Iadd,
+        Opcode::ArrayGep { elem_ty: Type::I8 },
         Opcode::Iconst {
             ty: Type::I8,
             imm: 7,
@@ -311,7 +335,7 @@ fn packed_aggregate_const_full_stream() {
             ty: Type::I64,
             imm: 1,
         },
-        Opcode::Iadd,
+        Opcode::ArrayGep { elem_ty: Type::I8 },
         Opcode::Iconst {
             ty: Type::I64,
             imm: 0x1122_3344_5566_7788,
@@ -351,11 +375,14 @@ fn packed_const_write_address_equals_packed_read_address() {
     let struct_ty = Ty::Struct(sdef.id);
     let mut module = TrustIrModule::new("read_k");
     module.structs = vec![sdef];
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::U64],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::U64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "read_k", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -378,16 +405,23 @@ fn packed_const_write_address_equals_packed_read_address() {
             InstrNode::new(Inst::Return { values: vec![v(1)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
-    let (lir_func, _proofs) =
-        translate_function(module.functions.first().expect("one function"), &module)
-            .expect("adapter must accept const-aggregate + packed field extract");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        module.functions.first().expect("one function"),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must accept const-aggregate + packed field extract");
     let bb = &lir_func.blocks[&lir_func.entry_block];
 
     // The slot base is the single `StackAddr` result; every field address is
-    // `base + Iconst`. Walk the stream resolving each `Iadd` on the base into
-    // the byte offset its `Iconst` operand carries.
+    // `base + Iconst`, a byte-stride `ArrayGep { elem_ty: I8 }` (a numeric
+    // `Iadd` before b79533c9c). Walk the stream resolving each such address on
+    // the base into the byte offset its `Iconst` operand carries; an address
+    // spelled any other way (a wider element, an `Iadd`) resolves to `None`.
     let base = bb
         .instructions
         .iter()
@@ -406,7 +440,7 @@ fn packed_const_write_address_equals_packed_read_address() {
                     const_of_value.insert(*r, *imm);
                 }
             }
-            Opcode::Iadd => {
+            Opcode::ArrayGep { elem_ty: Type::I8 } => {
                 if let (Some(&a), Some(&b), Some(r)) =
                     (inst.args.first(), inst.args.get(1), inst.results.first())
                     && a == base
@@ -508,11 +542,14 @@ fn non_packed_aggregate_const_stream_is_unchanged() {
 fn tuple_aggregate_const_stream_is_unchanged() {
     let tuple_ty = Ty::Tuple(vec![Ty::U8, Ty::U64]);
     let mut module = TrustIrModule::new("t");
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![tuple_ty.clone()],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![tuple_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "t", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -526,7 +563,9 @@ fn tuple_aggregate_const_stream_is_unchanged() {
             InstrNode::new(Inst::Return { values: vec![v(0)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let opcodes = lower(&module);
     assert_eq!(
@@ -583,7 +622,9 @@ fn slot_for_a_packed_aggregate_const_stays_at_the_lir_type_size() {
         [Some(0), Some(1)],
     ));
     let func = module.functions.first().expect("one function");
-    let (lir_func, _proofs) = translate_function(func, &module).expect("adapter must accept");
+    let (lir_func, _proofs) =
+        trust_cg_lower::translate_function_with_license(func, &module, &permit_unlicensed())
+            .expect("adapter must accept");
     assert_eq!(lir_func.stack_slots.len(), 1);
     assert_eq!(
         (lir_func.stack_slots[0].size, lir_func.stack_slots[0].align),
@@ -617,11 +658,14 @@ fn alloca_stride_for_a_packed_struct_still_disagrees_with_gep_stride() {
     let struct_ty = Ty::Struct(sdef.id);
     let mut module = TrustIrModule::new("alloc2");
     module.structs = vec![sdef];
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "alloc2", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -641,11 +685,16 @@ fn alloca_stride_for_a_packed_struct_still_disagrees_with_gep_stride() {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
-    let (lir_func, _proofs) =
-        translate_function(module.functions.first().expect("one function"), &module)
-            .expect("adapter must accept the alloca");
+    let (lir_func, _proofs) = trust_cg_lower::translate_function_with_license(
+        module.functions.first().expect("one function"),
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must accept the alloca");
     assert_eq!(
         (lir_func.stack_slots[0].size, lir_func.stack_slots[0].align),
         (32, 8),
@@ -653,4 +702,13 @@ fn alloca_stride_for_a_packed_struct_still_disagrees_with_gep_stride() {
          authority says 9, and `Inst::GEP` over the same pointer uses 9. Two size authorities \
          survive this repair"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

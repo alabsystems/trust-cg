@@ -3,7 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use std::fs::File;
 use std::io;
@@ -82,15 +82,9 @@ fn output_with_timeout(
     }
 }
 
-fn scratch_dir(test_name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "trust_cg_cli_ty_replay_{}_{}",
-        test_name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+/// A new scratch directory, removed when the returned guard is dropped.
+fn scratch_dir(test_name: &str) -> scratch::ScratchDir {
+    scratch::create(&format!("trust_cg_cli_ty_replay_{test_name}_"))
 }
 
 fn ty_replay_jit_probe_bin() -> PathBuf {
@@ -232,7 +226,7 @@ fn make_ty_parent_loop_module() -> TrustIrModule {
     fb.ret(vec![done_status]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -242,6 +236,10 @@ fn ty_replay_jit_probe_invokes_parent_loop_abi() {
 
     let mut command = Command::new(ty_replay_jit_probe_bin());
     command
+        // The replay artifact carries no codegen license (TY stamps none);
+        // it is refused by default (WS7.5, DG-73), so the probe states the
+        // disclosed legacy permit.
+        .arg("--permit-unlicensed")
         .arg("--trust_ir-json")
         .arg(&module_path)
         .arg("--symbol")
@@ -297,3 +295,6 @@ fn ty_replay_jit_probe_invokes_parent_loop_abi() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[path = "common/scratch.rs"]
+mod scratch;

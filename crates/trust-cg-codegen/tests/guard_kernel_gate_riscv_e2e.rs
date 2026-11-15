@@ -59,13 +59,18 @@ const EBREAK_WORD: u32 = 0x0010_0073;
 /// module obligation of the given `status`. Mirrors the x86 e2e fixture exactly.
 fn build_module(status: ProofStatus, with_proof_ref: bool) -> (Module, TrustIrFunction) {
     let mut module = Module::new("guard_kernel_gate_riscv_e2e");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "proven_extract_riscv", ft, BlockId::new(0));
     let mut node = InstrNode::new(Inst::ExtractElement {
@@ -98,7 +103,9 @@ fn build_module(status: ProofStatus, with_proof_ref: bool) -> (Module, TrustIrFu
         ));
     }
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (module, func)
 }
 
@@ -116,7 +123,8 @@ struct ProducerGuard {
 /// — the exact opcode the (future) RISC-V ISel will lower into the carrier via `emit_riscv_*`.
 fn lower_to_producer(func: &TrustIrFunction, module: &Module) -> (ProducerGuard, Vec<u64>) {
     let (lir_func, proof_ctx): (LirFunction, LirProofContext) =
-        trust_cg_lower::translate_function(func, module).expect("adapter translate");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translate");
 
     let mut found: Option<ProducerGuard> = None;
     for block in lir_func.blocks.values() {
@@ -217,8 +225,10 @@ fn build_carrier_obligation_map(func: &RiscVISelFunction) -> HashMap<u128, (u128
 
 fn ebreak_count(bytes: &[u8]) -> usize {
     bytes
-        .chunks_exact(4)
-        .filter(|w| *w == EBREAK_WORD.to_le_bytes())
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|w| **w == EBREAK_WORD.to_le_bytes())
         .count()
 }
 
@@ -415,4 +425,13 @@ fn riscv_carrier_fingerprint_round_trips_through_kernel() {
         isel_func.guard_obligations.contains_key(&fp),
         "kernel-recomputed binding key must match the recorded key"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

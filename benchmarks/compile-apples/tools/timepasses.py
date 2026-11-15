@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""rustc -Z time-passes, LLVM vs bridge, min-of-N per pass, on one program.
+"""trustc -Z time-passes, LLVM vs bridge, min-of-N per pass, on one program.
 Shows which rustc-level phases differ (the backend's compile_module is only
 21-47ms of a 117-148ms compile; this attributes the REST).
-usage: timepasses.py N DYLIB PROG.rs"""
+usage: timepasses.py [--driver TRUSTC] N DYLIB PROG.rs   (driver: see _trust_driver.py)"""
 import os, subprocess, sys, re, collections
+from _trust_driver import resolve_from_argv
+home = os.path.expanduser("~")
+# STOCK EXCEPTION (Trust lacks rust-lld/gcc-ld; measured: no lib/rustlib/<host>/bin/{rust-lld,gcc-ld} in the Trust sysroot): the Linux linker shim comes from the stock stable toolchain's gcc-ld; the compilers come from the Trust package.
+os.environ["PATH"] = f"{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
+DRIVER = resolve_from_argv(sys.argv)
 n = int(sys.argv[1]); dylib = sys.argv[2]; prog = sys.argv[3]
 if n < 1:
     raise SystemExit("N must be at least 1")
-home = os.path.expanduser("~")
-os.environ["PATH"] = f"{home}/.cargo/bin:{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
-rustc = subprocess.check_output(["rustup", "which", "--toolchain", "nightly-2026-04-20", "rustc"], text=True).strip()
-flags = ["--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3", "-Ztime-passes"]
+rustc = DRIVER["compiler"]
+flags = [*DRIVER["compiler_flags"], "--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3", "-Ztime-passes"]
 pat = re.compile(r"time:\s+([0-9.]+);\s+rss:\s+\S+\s+->\s+\S+\s+\(\s*[+-]?\d+MB\)\s+(\S.*?)\s*$")
 def run(backend):
     best = {}

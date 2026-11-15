@@ -8,10 +8,17 @@
 //! No HashMap for blocks/values — Vec + index only (cache-friendly).
 
 use crate::inst::{MachInst, ProofAnnotation};
-use crate::provenance::{LoweringProvenance, LoweringProvenanceCoverage, TrustIrVarId};
+use crate::provenance::{
+    LoweringProvenance, LoweringProvenanceCoverage, SourceInstId, TrustIrVarId,
+};
+use crate::target_machine::{AArch64IsaFeature, TargetFeatureSet};
 use crate::types::{BlockId, InstId, StackSlotId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+mod eh_edge_census;
+pub use eh_edge_census::EhEdgeCensus;
 
 /// A basic block of machine instructions.
 #[derive(Debug, Clone)]
@@ -108,10 +115,10 @@ impl EnumTagWidth {
 
 /// Type information for function signatures and stack slots.
 ///
-/// Scalar types (I8..I128, F16..F64, B1, Ptr), the V128 SIMD vector type, and
+/// Scalar types (I8..I128, F16..F64, B1, Ptr), SIMD vector types, and
 /// aggregate types used by machine-level function signatures and stack slots.
-/// V128 is intentionally distinct from I128: they have the same storage width,
-/// but different ABI and register-class semantics.
+/// V64/V128 are intentionally distinct from I64/I128: matching storage widths
+/// do not imply matching ABI or register-class semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     I8,
@@ -142,6 +149,12 @@ pub enum Type {
     /// and has 16-byte natural alignment. This variant is deliberately appended
     /// so existing variant discriminants—and derived type hashes—do not drift.
     V128,
+    /// Opaque 64-bit SIMD vector carrier, held in AArch64 D registers.
+    ///
+    /// Has 8-byte size and natural alignment, but a floating-point/vector
+    /// register class rather than I64's general-purpose register class.
+    /// Appended to preserve existing variant discriminants and type hashes.
+    V64,
 }
 
 impl Type {
@@ -180,7 +193,7 @@ impl Type {
             Self::I8 | Self::B1 => 1,
             Self::I16 | Self::F16 => 2,
             Self::I32 | Self::F32 => 4,
-            Self::I64 | Self::F64 | Self::Ptr => 8,
+            Self::I64 | Self::F64 | Self::Ptr | Self::V64 => 8,
             Self::I128 | Self::V128 => 16,
             Self::Struct(fields) => {
                 let mut offset: u32 = 0;
@@ -339,7 +352,7 @@ impl Type {
 
     /// Returns true if this is a SIMD vector type.
     pub fn is_vector(&self) -> bool {
-        matches!(self, Self::V128)
+        matches!(self, Self::V64 | Self::V128)
     }
 
     /// Returns true if this is a scalar (non-aggregate) type.
@@ -523,6 +536,215 @@ pub struct EhCallSiteEntry {
     pub landing_pad_block: Option<BlockId>,
 }
 
+/// The exact selected call that owns one invoke's exceptional continuation.
+///
+/// IDs describe the current machine arena. An arena-rebuilding owner must
+/// transport the instruction identity explicitly; matching a callee spelling
+/// or choosing another call in the block cannot replace this binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EhInvokeBinding {
+    /// The protected call in the current instruction arena.
+    pub call_inst: InstId,
+    /// Its unique laid-out instruction owner.
+    pub call_block: BlockId,
+    /// The original invoke's exceptional destination.
+    pub landing_pad_block: BlockId,
+}
+
+/// How semantic handler rows bind their protected calls.
+///
+/// Legacy rows require exactly one eligible call in their block. Modern
+/// selection uses exact identities, including an explicitly empty vector when
+/// a required binding is missing; emptiness never requests legacy inference.
+/// The vector retains duplicate/orphan records for checked refusal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum EhCallSiteBindings {
+    /// Explicit compatibility state: one eligible call per handler block.
+    #[default]
+    LegacyBlocks,
+    /// Modern custody: every handler row needs one exact selected call.
+    ExactInstructions(Vec<EhInvokeBinding>),
+}
+
+/// A function's EH type table: entry `k - 1` is the linker-level typeinfo
+/// symbol bound to catch type index `k` (trust-ir landing pads carry only the
+/// indices).
+///
+/// trust-ir v50 (`SPEC_RATIFICATIONS` §3.1) spells a table whose entries all
+/// name ONE typeinfo as `Constant::Splat { elem, len }`. This type keeps that
+/// spelling, so such a table holds one symbol whatever its length, and its
+/// length, lookup and clone cost O(1). A list is shared behind an [`Arc`], so
+/// every function that catches a typed exception carries the module's one
+/// table without copying it.
+///
+/// The representation is canonical, as trust-ir's is: two or more equal
+/// entries are always the splat and a splat always has two or more entries,
+/// so two tables are equal exactly when their representations are.
+#[derive(Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "EhTypeTableWire")]
+pub struct EhTypeTable(EhTypeTableRepr);
+
+#[derive(Clone, PartialEq, Eq, Default)]
+enum EhTypeTableRepr {
+    #[default]
+    Empty,
+    /// One or more entries, not all equal when two or more.
+    List(Arc<[String]>),
+    /// `len >= 2` copies of `symbol`.
+    Splat { symbol: Arc<str>, len: u64 },
+}
+
+/// The two spellings of an [`EhTypeTable`], borrowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EhTypeTableEntries<'a> {
+    /// Every entry, in catch-type-index order (possibly none).
+    List(&'a [String]),
+    /// `len >= 2` entries, every one `symbol`.
+    Splat {
+        /// The typeinfo symbol every entry names.
+        symbol: &'a str,
+        /// The number of entries.
+        len: u64,
+    },
+}
+
+/// Serialized spelling: a list is the plain symbol sequence it always was; a
+/// splat is `{ "splat": symbol, "len": len }`. Deserializing canonicalizes.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EhTypeTableWire {
+    List(Vec<String>),
+    Splat { splat: String, len: u64 },
+}
+
+impl From<EhTypeTableWire> for EhTypeTable {
+    fn from(wire: EhTypeTableWire) -> Self {
+        match wire {
+            EhTypeTableWire::List(symbols) => Self::from_symbols(symbols),
+            EhTypeTableWire::Splat { splat, len } => Self::splat(splat, len),
+        }
+    }
+}
+
+impl Serialize for EhTypeTable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self.entries() {
+            EhTypeTableEntries::List(symbols) => symbols.serialize(serializer),
+            EhTypeTableEntries::Splat { symbol, len } => {
+                let mut state = serializer.serialize_struct("EhTypeTableSplat", 2)?;
+                state.serialize_field("splat", symbol)?;
+                state.serialize_field("len", &len)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for EhTypeTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.entries() {
+            EhTypeTableEntries::List(symbols) => f.debug_list().entries(symbols).finish(),
+            EhTypeTableEntries::Splat { symbol, len } => write!(f, "splat[{symbol:?}; {len}]"),
+        }
+    }
+}
+
+impl EhTypeTable {
+    /// The empty table (a function that catches no typed exception).
+    pub const fn new() -> Self {
+        Self(EhTypeTableRepr::Empty)
+    }
+
+    /// The table whose entry `k - 1` is `symbols[k - 1]`. Two or more equal
+    /// entries become the splat (one comparison per entry given).
+    pub fn from_symbols(symbols: Vec<String>) -> Self {
+        match symbols.as_slice() {
+            [] => Self::new(),
+            [first, rest @ ..] if !rest.is_empty() && rest.iter().all(|s| s == first) => {
+                let len = symbols.len() as u64;
+                let mut symbols = symbols;
+                Self::splat(symbols.swap_remove(0), len)
+            }
+            _ => Self(EhTypeTableRepr::List(Arc::from(symbols))),
+        }
+    }
+
+    /// The table of `len` entries that all name `symbol`, in O(1) whatever
+    /// `len` is. Fewer than two entries are the list.
+    pub fn splat(symbol: String, len: u64) -> Self {
+        match len {
+            0 => Self::new(),
+            1 => Self(EhTypeTableRepr::List(Arc::from(vec![symbol]))),
+            len => Self(EhTypeTableRepr::Splat {
+                symbol: Arc::from(symbol),
+                len,
+            }),
+        }
+    }
+
+    /// The number of entries (the largest catch type index it binds).
+    pub fn len(&self) -> u64 {
+        match &self.0 {
+            EhTypeTableRepr::Empty => 0,
+            EhTypeTableRepr::List(symbols) => symbols.len() as u64,
+            EhTypeTableRepr::Splat { len, .. } => *len,
+        }
+    }
+
+    /// Whether the table binds no catch type index.
+    pub fn is_empty(&self) -> bool {
+        matches!(self.0, EhTypeTableRepr::Empty)
+    }
+
+    /// The symbol at zero-based `position` (catch type index `position + 1`),
+    /// or `None` past the end. O(1).
+    pub fn get(&self, position: u64) -> Option<&str> {
+        match &self.0 {
+            EhTypeTableRepr::Empty => None,
+            EhTypeTableRepr::List(symbols) => usize::try_from(position)
+                .ok()
+                .and_then(|position| symbols.get(position))
+                .map(String::as_str),
+            EhTypeTableRepr::Splat { symbol, len } => (position < *len).then_some(&**symbol),
+        }
+    }
+
+    /// The symbol bound to catch type index `index` (`1..=len`); `None` for
+    /// the catch-all index `0` and for an index the table does not bind.
+    pub fn symbol_for_catch_index(&self, index: u32) -> Option<&str> {
+        index
+            .checked_sub(1)
+            .and_then(|position| self.get(u64::from(position)))
+    }
+
+    /// Whether `self` and `other` are clones of ONE table (they share its
+    /// storage). Two empty tables are. Equal tables read separately are not.
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (EhTypeTableRepr::Empty, EhTypeTableRepr::Empty) => true,
+            (EhTypeTableRepr::List(a), EhTypeTableRepr::List(b)) => Arc::ptr_eq(a, b),
+            (
+                EhTypeTableRepr::Splat { symbol: a, len: m },
+                EhTypeTableRepr::Splat { symbol: b, len: n },
+            ) => m == n && Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// The table's spelling, borrowed: a list's entries, or a splat's one
+    /// symbol and length.
+    pub fn entries(&self) -> EhTypeTableEntries<'_> {
+        match &self.0 {
+            EhTypeTableRepr::Empty => EhTypeTableEntries::List(&[]),
+            EhTypeTableRepr::List(symbols) => EhTypeTableEntries::List(&symbols[..]),
+            EhTypeTableRepr::Splat { symbol, len } => {
+                EhTypeTableEntries::Splat { symbol, len: *len }
+            }
+        }
+    }
+}
+
 /// Exception handling metadata for a function.
 ///
 /// Collected during ISel and consumed by the codegen pipeline to generate
@@ -540,6 +762,13 @@ pub struct ExceptionHandlingMetadata {
     pub landing_pads: Vec<LandingPadEntry>,
     /// Call site entries (invoke regions mapped to landing pads).
     pub call_sites: Vec<EhCallSiteEntry>,
+    /// Selected-call custody, independent of layout offsets and filler rows.
+    pub call_site_bindings: EhCallSiteBindings,
+    /// EH type table: entry `k - 1` is the linker-level typeinfo symbol bound
+    /// to catch type index `k` of every landing pad in this function (trust-ir
+    /// carries only indices). The LSDA emitter relocates each typed slot to
+    /// the named symbol. Empty unless a pad catches a typed exception.
+    pub eh_type_table: EhTypeTable,
 }
 
 impl ExceptionHandlingMetadata {
@@ -550,7 +779,10 @@ impl ExceptionHandlingMetadata {
 
     /// Returns true if this function has exception handling metadata.
     pub fn has_eh_info(&self) -> bool {
-        self.personality.is_some() || !self.landing_pads.is_empty() || !self.call_sites.is_empty()
+        self.personality.is_some()
+            || !self.landing_pads.is_empty()
+            || !self.call_sites.is_empty()
+            || matches!(&self.call_site_bindings, EhCallSiteBindings::ExactInstructions(bindings) if !bindings.is_empty())
     }
 
     /// Add a landing pad entry.
@@ -587,6 +819,17 @@ pub struct JumpTableData {
     /// block to jump to for case value `min_val + i`. Holes map to the
     /// default block.
     pub targets: Vec<BlockId>,
+}
+
+/// Custody of a scratch-free local table-address expansion. The keyed ADR
+/// now has its actual low-byte immediate; `add` is the immediately following
+/// ADD-immediate LSL12 on that same 64-bit register. These are measurement
+/// metadata, not a certificate: final-byte checks must independently bind the
+/// composed address to `table` in the final layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JumpTableAddressExpansion {
+    pub table: u32,
+    pub add: InstId,
 }
 
 /// Scalar debug type used by DWARF metadata.
@@ -672,6 +915,12 @@ pub struct DebugLocalVariable {
 pub struct FunctionDebugMeta {
     /// Source file name (e.g., "main.rs"). `None` if unknown.
     pub source_file: Option<String>,
+    /// The producer's human name for the function (trust-ir
+    /// `Function::display_path`, e.g. `crate::module::item`), which DWARF uses
+    /// as the subprogram's `DW_AT_name` in place of the object symbol. `None`
+    /// keeps the object symbol as the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Source line where the function is declared (1-based, 0 = unknown).
     pub decl_line: u32,
     /// Parameter names (from trust_ir signature or generated as "arg0", "arg1", ...).
@@ -702,6 +951,144 @@ impl StackProtectorMode {
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::None)
     }
+}
+
+/// Where a U10 prologue stack-limit check reads its limit `L`
+/// (`docs/u10-prologue-stack-limit.md` §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StackLimitSource {
+    /// The request's parameter holds `L` itself.
+    Value,
+    /// The request's parameter points at a little-endian u64 `L` at byte
+    /// `offset` (8-aligned, at most [`STACK_LIMIT_MAX_POINTEE_OFFSET`]). The
+    /// producer guarantees that word is readable on every entry.
+    Pointee {
+        /// Byte offset of `L` from the pointer.
+        offset: u16,
+    },
+}
+
+/// Largest `Pointee` offset a request tag can carry (`off/8` in 12 bits).
+pub const STACK_LIMIT_MAX_POINTEE_OFFSET: u16 = 4095 * 8;
+
+/// What a U10 stack-limit check does when the frame would cross `L`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StackLimitOverflow {
+    /// Undo the callee-saved stores and tail-call `symbol`, the module's
+    /// handler for this function's `FuncTy`, with the entry arguments intact.
+    Handler {
+        /// The handler's symbol name.
+        symbol: String,
+    },
+    /// Execute `brk #`[`STACK_LIMIT_TRAP_IMM`] with the frame intact.
+    Trap,
+}
+
+/// The `BRK` immediate a U10 `Trap` overflow executes (ASCII "SL").
+pub const STACK_LIMIT_TRAP_IMM: u16 = 0x534c;
+
+/// A function's U10 prologue stack-limit request, decoded and validated from
+/// its producer tags by the trust-ir adapter.
+///
+/// The request is a *requirement*: a backend that cannot emit and verify the
+/// check refuses the function, never drops the request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StackLimitRequest {
+    /// Index of the signature parameter that holds or points at `L`. It is a
+    /// parameter index, not a register number: the target's signature
+    /// lowering resolves the register.
+    pub param: u8,
+    /// How the parameter supplies `L`.
+    pub source: StackLimitSource,
+    /// The overflow action.
+    pub overflow: StackLimitOverflow,
+}
+
+/// A [`StackLimitRequest`] after AArch64 signature lowering resolved its
+/// parameter to one X register (X0-X7) that holds the parameter's full entry
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MachStackLimit {
+    /// The source request.
+    pub request: StackLimitRequest,
+    /// The X register that carries parameter `request.param` at entry.
+    pub limit_reg: crate::regs::PReg,
+    /// Every register the function's formal arguments arrive in, in
+    /// signature order: the implicit uses of the overflow `TailCall`, which
+    /// hands the handler the requester's entry arguments unchanged.
+    pub arg_regs: Vec<crate::regs::PReg>,
+}
+
+/// The callee-saved register set a call's convention preserves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CalleeSavedSet {
+    /// The AAPCS64 / DarwinPCS set: X19-X28, FP and the low 64 bits of
+    /// V8-V15. Every convention instruction selection lowers (C, Fast, Cold,
+    /// Rust and the scalar Swift subset) preserves exactly this set, which is
+    /// also the set every lowered function preserves for its own caller.
+    Aapcs64,
+}
+
+/// One outgoing stack-argument store a call site's classification requires:
+/// `bytes` bytes at `offset` from the stack pointer at the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StackArgStore {
+    /// Byte offset in the outgoing argument area.
+    pub offset: i64,
+    /// Store width in bytes.
+    pub bytes: u8,
+}
+
+/// One trap carrier and the instructions its late expansion left in the
+/// function (`trust-cg-codegen` `lower::expand_trap_*`).
+///
+/// `carrier` is the guard as instruction selection emitted it and register
+/// allocation rewrote it (`TrapNullIfZero ptr`, `TrapBoundsCheckExact base,
+/// index, bound`, ...): it names the trap condition of the source operation.
+/// `insts` are the expansion's instructions in stream order, the last being
+/// the `BRK`. The verifier and the per-compile decode check judge these words
+/// against that condition (`trust_cg_verify::aarch64_trap_expansion`). A
+/// carrier the expansion degraded to a bare trap (a malformed carrier) has no
+/// record.
+#[derive(Debug, Clone)]
+pub struct TrapExpansionRecord {
+    /// The carrier before its expansion.
+    pub carrier: MachInst,
+    /// The expansion's instructions, in stream order.
+    pub insts: Vec<InstId>,
+}
+
+/// ABI facts of one AArch64 call site, recorded by instruction selection
+/// where the target calling convention classified every argument.
+///
+/// Consumers (sibling tail-call eligibility) read these instead of guessing
+/// from operand counts. They describe the call as selected; a pass that
+/// rewrites or clones a call does not inherit them (see
+/// [`MachFunction::call_abi_facts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallAbiFacts {
+    /// Direct callee symbol; `None` for an indirect call.
+    pub callee: Option<String>,
+    /// End of the highest outgoing stack-argument byte the call writes
+    /// (0 when every argument is passed in registers).
+    pub stack_arg_bytes: u32,
+    /// The scalar stack-argument stores instruction selection emitted for
+    /// this call, one entry per store.
+    pub stack_stores: Vec<StackArgStore>,
+    /// Some stack argument is an aggregate copied by a sequence that is not
+    /// a list of scalar stores.
+    pub aggregate_stack_args: bool,
+    /// The call passes a hidden result pointer in X8: the callee returns a
+    /// large aggregate through caller-provided memory.
+    pub hidden_result_pointer: bool,
+    /// Some argument is a composite passed by reference (AAPCS64 B.4, kept
+    /// by DarwinPCS): its register or stack slot holds the address of a
+    /// copy in the caller's frame, which the callee owns for the call.
+    pub by_reference_argument_copies: bool,
+    /// The callee is variadic.
+    pub variadic: bool,
+    /// Callee-saved registers the callee's convention preserves.
+    pub callee_saved: CalleeSavedSet,
 }
 
 /// A complete machine-level function, ready for register allocation and encoding.
@@ -746,6 +1133,14 @@ pub struct MachFunction {
     pub stack_protector: StackProtectorMode,
     /// Stack slot reserved for the saved guard value after frame preparation.
     pub stack_protector_slot: Option<StackSlotId>,
+    /// U10 prologue stack-limit requirement, copied from the source LIR
+    /// function with its limit register resolved. `None` for every function
+    /// that did not request one; frame lowering then emits nothing new.
+    pub stack_limit: Option<MachStackLimit>,
+    /// The overflow block frame insertion built for [`Self::stack_limit`]
+    /// (`None` before frame insertion, or when the check was elided for a
+    /// zero frame). Block layout keeps it cold.
+    pub stack_limit_overflow_block: Option<BlockId>,
     /// Jump tables for switch lowering. Each `Adr` instruction that loads
     /// a jump table base address carries a
     /// [`MachOperand::JumpTableIndex`](crate::operand::MachOperand::JumpTableIndex)
@@ -753,6 +1148,9 @@ pub struct MachFunction {
     /// the table entries after the function body and patches the `Adr`
     /// with the correct PC-relative byte offset.
     pub jump_tables: Vec<JumpTableData>,
+    /// Long local table addresses, keyed by the original ADR's stable arena ID.
+    /// Instructions and their block/EH ownership remain in place.
+    pub jump_table_address_expansions: BTreeMap<InstId, JumpTableAddressExpansion>,
     /// Virtual-register ids of pointer parameters marked `noalias` in trust_ir.
     ///
     /// Populated by the compilation pipeline (`apply_proof_annotations`) from the
@@ -761,15 +1159,17 @@ pub struct MachFunction {
     /// Empty for functions with no noalias pointer parameters (the default) and
     /// for any construction path that does not thread param attributes.
     ///
-    /// SOUNDNESS: a value in this list is a *distinct* formal-argument pointer
-    /// that trust_ir proved does not alias any other pointer visible to the
-    /// callee. Two distinct ids in this list therefore name provably-disjoint
-    /// memory regions. The `neon-map` store-vectorizer is the only consumer; it
+    /// These ids transport source `ParamAttrs::noalias` claims, not independently
+    /// replayed alias proofs or caller/storage authority. The source attribute
+    /// states non-aliasing with other arguments; populating this list does not
+    /// authenticate object bounds or arbitrary address descendants. The
+    /// `neon-map` store-vectorizer is the only consumer; it
     /// requires the store base pointer to appear here (and every load base to be
     /// either the identical vreg, in-place, or another entry, disjoint) before it
     /// will vectorize a memory MAP loop. Under-population is safe (the pass merely
-    /// BAILS to the scalar loop); over-population would be unsound, so it is only
-    /// ever written from a proven trust_ir `noalias` param attribute.
+    /// BAILS to the scalar loop); over-population would be unsound. This list is
+    /// written only from the corresponding source attribute, whose truth remains
+    /// a producer/caller obligation.
     pub noalias_params: Vec<u32>,
     /// Required start alignment (log2 bytes) of this function's code within
     /// its text section. Default 2 (AArch64 instruction alignment).
@@ -808,6 +1208,57 @@ pub struct MachFunction {
     /// misattribution is not. See the schema comment in
     /// [`crate::provenance`] (LoweringProvenance section).
     pub lowering_provenance: BTreeMap<InstId, LoweringProvenance>,
+    /// TV-3 fusion edges recorded by instruction selection: each key is a
+    /// lowering-input instruction that emitted nothing of its own, mapped to
+    /// the source instruction whose stamped machine instruction represents it.
+    ///
+    /// Populated by the ISel->MachFunction adapter from the selector's own
+    /// edges. The AArch64 selector records one only after an exact idiom match
+    /// has proved the fused effect unobservable (today: the stores of a
+    /// private stack slot folded into a bit-reverse `RBIT`). The raw TV-3
+    /// check follows these edges to an emitted witness; an effectful source
+    /// with no edge stays unwitnessed and fails closed. Keyed by source
+    /// coordinates, so no machine pass can invalidate an entry; passes neither
+    /// read nor write it.
+    pub source_fusion_targets: BTreeMap<SourceInstId, SourceInstId>,
+    /// Call-site ABI facts, keyed by the call's arena [`InstId`].
+    ///
+    /// Populated by the ISel->MachFunction adapter for the calls instruction
+    /// selection classified. Keyed like [`Self::lowering_provenance`] because
+    /// the arena is append-only. A call without an entry (pass-created,
+    /// pass-cloned or test-constructed) has no classified facts, and a
+    /// consumer must treat it as unknown -- never as register-only. Each entry
+    /// names its callee, so a consumer also checks that the instruction still
+    /// calls that symbol.
+    pub call_abi_facts: BTreeMap<InstId, CallAbiFacts>,
+    /// End of this function's own incoming stack-argument area as classified
+    /// by instruction selection (0 when every parameter arrives in
+    /// registers); `None` when no selector recorded it.
+    pub incoming_stack_arg_bytes: Option<u32>,
+    /// Optional AArch64 features this function's own source attribute
+    /// (trust-ir `FuncAttrs.target_features`, rustc's
+    /// `#[target_feature(enable = ...)]`) admits beyond the target profile,
+    /// for this function alone. Empty for a function without such an
+    /// attribute and for every non-AArch64 function.
+    ///
+    /// Instruction selection reads it to choose feature instructions (LSE,
+    /// CRC32, FP16, ...) only here; output-feature checks validate this
+    /// function's instructions against the profile plus this set
+    /// (`TargetMachine::for_function`); the JIT install gate refuses a set
+    /// the executing host does not implement.
+    pub function_target_features: TargetFeatureSet<AArch64IsaFeature>,
+    /// Trap carriers the late expansion rewrote, and the instructions each
+    /// expansion left (see [`TrapExpansionRecord`]). Empty until the
+    /// expansion runs. Keyed by arena [`InstId`]s like
+    /// [`Self::lowering_provenance`]; a pass that removes an expansion's
+    /// instructions must remove all of them or the per-compile check refuses
+    /// the function.
+    pub trap_expansions: Vec<TrapExpansionRecord>,
+    /// L10-P5 allocation-time identity admission (see
+    /// [`crate::id_admission`]): whether the next allocation must first
+    /// re-derive every live identity, and a sticky refusal. Opaque in `Debug`,
+    /// so `Debug` equality remains IR equality.
+    pub(crate) id_admission: crate::id_admission::IdAdmissionCell,
 }
 
 impl MachFunction {
@@ -829,34 +1280,186 @@ impl MachFunction {
             debug_meta: FunctionDebugMeta::default(),
             stack_protector: StackProtectorMode::None,
             stack_protector_slot: None,
+            stack_limit: None,
+            stack_limit_overflow_block: None,
             jump_tables: Vec::new(),
+            jump_table_address_expansions: BTreeMap::new(),
             noalias_params: Vec::new(),
             text_align_log2: 2,
             profile_ordered: false,
             lowering_provenance: BTreeMap::new(),
+            source_fusion_targets: BTreeMap::new(),
+            call_abi_facts: BTreeMap::new(),
+            incoming_stack_arg_bytes: None,
+            function_target_features: TargetFeatureSet::EMPTY,
+            trap_expansions: Vec::new(),
+            id_admission: crate::id_admission::IdAdmissionCell::ADMITTED,
         }
     }
 
-    /// Allocate a new virtual register ID.
-    pub fn alloc_vreg(&mut self) -> u32 {
-        let id = self.next_vreg;
-        self.next_vreg += 1;
-        id
+    /// The local table this address producer names. Expanded pairs keep the
+    /// table identity here while both real instructions use literal immediates.
+    pub fn jump_table_at_address(&self, id: crate::InstId) -> Option<u32> {
+        let inst = self.insts.get(id.0 as usize)?;
+        if inst.opcode != crate::AArch64Opcode::Adr {
+            return None;
+        }
+        self.jump_table_address_expansions
+            .get(&id)
+            .map(|row| row.table)
+            .or_else(|| {
+                inst.operands
+                    .get(1)
+                    .and_then(crate::MachOperand::as_jump_table_index)
+            })
     }
 
-    /// Add an instruction to the arena and return its InstId.
+    /// Allocate a new virtual register ID (legacy infallible API).
+    ///
+    /// The ID is fresh while `next_vreg` exceeds every register the function
+    /// references. After a pipeline boundary (each optimizer pass entry,
+    /// [`Self::require_id_admission_before_allocation`]) the first allocation
+    /// of any kind re-derives every live identity
+    /// ([`Self::admit_id_counters`]); a stale counter becomes a sticky
+    /// refusal the pipeline reports by name, so the function is never emitted.
+    /// On exhaustion this never wraps: it returns the sentinel `u32::MAX` and
+    /// leaves the counter there, and since no counter can exceed `u32::MAX`
+    /// the next admission refuses any function that uses the sentinel
+    /// (`[TCG-MIR-ID-EXHAUSTED]`). Use [`Self::try_alloc_vreg`] to handle
+    /// exhaustion and refusal at the call site instead.
+    pub fn alloc_vreg(&mut self) -> u32 {
+        self.admit_before_allocation();
+        match self.next_vreg.checked_add(1) {
+            Some(next) => {
+                let id = self.next_vreg;
+                self.next_vreg = next;
+                id
+            }
+            None => u32::MAX,
+        }
+    }
+
+    /// Allocate one virtual-register ID, or leave the counter unchanged on
+    /// exhaustion or a refused identity admission (see [`Self::alloc_vreg`]).
+    /// `u32::MAX` represents an exhausted counter, not an ID this allocator
+    /// can issue: the next unused ID must remain representable.
+    ///
+    /// Freshness against direct mutation of the public IR fields is checked
+    /// only by the first allocation after a marked boundary; between
+    /// boundaries this checks numeric capacity, so callers that insert
+    /// register operands directly must first synchronize `next_vreg` above
+    /// those IDs.
+    pub fn try_alloc_vreg(&mut self) -> Option<u32> {
+        if !self.admit_before_allocation() {
+            return None;
+        }
+        let next = self.next_vreg.checked_add(1)?;
+        let id = self.next_vreg;
+        self.next_vreg = next;
+        Some(id)
+    }
+
+    /// Allocate `count` consecutive virtual-register IDs at once, or none:
+    /// the counter is unchanged on exhaustion (the range end must remain a
+    /// representable counter, as for [`Self::try_alloc_vreg`]) or a refused
+    /// identity admission. The admission runs even for `count == 0`.
+    ///
+    /// For a pass that plans its new registers before it can mutate the
+    /// function (SROA numbers its shadow registers while the function is
+    /// borrowed for analysis): it reads `next_vreg`, numbers from it, and
+    /// allocates exactly that range here before any operand names one. An
+    /// admitted counter is the one the numbering read when nothing changed
+    /// the function in between, so the caller can check
+    /// `range.start == planned_first`.
+    pub fn try_alloc_vreg_range(&mut self, count: u32) -> Option<core::ops::Range<u32>> {
+        if !self.admit_before_allocation() {
+            return None;
+        }
+        let first = self.next_vreg;
+        let end = first.checked_add(count)?;
+        self.next_vreg = end;
+        Some(first..end)
+    }
+
+    /// Synchronize the counter with all register operands in the arena and
+    /// noalias parameter identities, including detached instructions. This
+    /// scans once and jumps over sparse IDs instead of allocating through the
+    /// numeric gap. Refusal leaves the counter unchanged.
+    ///
+    /// Call once before a sequence of checked allocations; subsequent direct
+    /// mutation of public operands/metadata requires another synchronization.
+    pub fn try_sync_vreg_counter(&mut self) -> Option<()> {
+        let highest = self
+            .insts
+            .iter()
+            .flat_map(|inst| inst.operands.iter())
+            .filter_map(|operand| operand.as_vreg().map(|reg| reg.id))
+            .chain(self.noalias_params.iter().copied())
+            .max();
+        if let Some(highest) = highest {
+            let next = highest.checked_add(1)?;
+            self.next_vreg = self.next_vreg.max(next);
+        }
+        Some(())
+    }
+
+    /// Add an instruction to the arena and return its InstId (legacy
+    /// infallible API). The arena length is the counter, so the ID is fresh
+    /// while no block or sidecar names an instruction past the arena, which
+    /// the allocation-time admission checks as for [`Self::alloc_vreg`]. An
+    /// index past the u32 ID domain never narrows into an existing ID's
+    /// range: the sentinel `InstId(u32::MAX)` is returned and the next
+    /// admission refuses the oversized arena. Use `try_push_inst` to refuse
+    /// at the call site.
     pub fn push_inst(&mut self, inst: MachInst) -> InstId {
-        let id = InstId(self.insts.len() as u32);
+        self.admit_before_allocation();
+        let id = Self::checked_inst_id(self.insts.len()).unwrap_or(InstId(u32::MAX));
         self.insts.push(inst);
         id
     }
 
-    /// Create a new basic block and return its BlockId.
+    /// Append an instruction only when its arena index fits the ID domain and
+    /// the identity admission accepts the function. Refusal leaves the arena
+    /// unchanged. Unlike the register counter, the arena length can represent
+    /// one past the final u32 ID on 64-bit hosts.
+    pub fn try_push_inst(&mut self, inst: MachInst) -> Option<InstId> {
+        if !self.admit_before_allocation() {
+            return None;
+        }
+        let id = Self::checked_inst_id(self.insts.len())?;
+        self.insts.push(inst);
+        Some(id)
+    }
+
+    fn checked_inst_id(index: usize) -> Option<InstId> {
+        u32::try_from(index).ok().map(InstId)
+    }
+
+    /// Create a new basic block and return its BlockId (legacy infallible
+    /// API; freshness and exhaustion as for [`Self::push_inst`]). Use
+    /// [`Self::try_create_block`] to refuse at the call site.
     pub fn create_block(&mut self) -> BlockId {
-        let id = BlockId(self.blocks.len() as u32);
+        self.admit_before_allocation();
+        let id = Self::checked_block_id(self.blocks.len()).unwrap_or(BlockId(u32::MAX));
         self.blocks.push(MachBlock::new());
         self.block_order.push(id);
         id
+    }
+
+    /// Create a block only if its index fits the ID domain. ID refusal leaves
+    /// both the block arena and layout unchanged; this does not bound memory.
+    pub fn try_create_block(&mut self) -> Option<BlockId> {
+        if !self.admit_before_allocation() {
+            return None;
+        }
+        let id = Self::checked_block_id(self.blocks.len())?;
+        self.blocks.push(MachBlock::new());
+        self.block_order.push(id);
+        Some(id)
+    }
+
+    fn checked_block_id(index: usize) -> Option<BlockId> {
+        u32::try_from(index).ok().map(BlockId)
     }
 
     /// Append an instruction to a block.
@@ -864,11 +1467,30 @@ impl MachFunction {
         self.blocks[block.0 as usize].insts.push(inst_id);
     }
 
-    /// Add a stack slot and return its ID.
+    /// Add a stack slot and return its ID (legacy infallible API; freshness
+    /// and exhaustion as for [`Self::push_inst`]). Use
+    /// [`Self::try_alloc_stack_slot`] for fallible ID allocation.
     pub fn alloc_stack_slot(&mut self, slot: StackSlot) -> StackSlotId {
-        let id = StackSlotId(self.stack_slots.len() as u32);
+        self.admit_before_allocation();
+        let id =
+            Self::checked_stack_slot_id(self.stack_slots.len()).unwrap_or(StackSlotId(u32::MAX));
         self.stack_slots.push(slot);
         id
+    }
+
+    /// Append a stack slot only if its index fits the ID domain. ID refusal
+    /// leaves the arena unchanged; slot layout validity is a separate concern.
+    pub fn try_alloc_stack_slot(&mut self, slot: StackSlot) -> Option<StackSlotId> {
+        if !self.admit_before_allocation() {
+            return None;
+        }
+        let id = Self::checked_stack_slot_id(self.stack_slots.len())?;
+        self.stack_slots.push(slot);
+        Some(id)
+    }
+
+    fn checked_stack_slot_id(index: usize) -> Option<StackSlotId> {
+        u32::try_from(index).ok().map(StackSlotId)
     }
 
     /// TV-1: record which lowering-input instruction produced `id`.
@@ -893,6 +1515,13 @@ impl MachFunction {
             .get(&id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// TV-3: the source instruction whose stamped machine instruction
+    /// represents the fused, emission-free `source`, if selection recorded
+    /// one (see [`Self::source_fusion_targets`]).
+    pub fn source_fusion_target(&self, source: SourceInstId) -> Option<SourceInstId> {
+        self.source_fusion_targets.get(&source).copied()
     }
 
     /// TV-1: per-opcode stamping-coverage report over all block-linked
@@ -996,6 +1625,7 @@ mod tests {
     use super::*;
     use crate::inst::{AArch64Opcode, MachInst};
     use crate::operand::MachOperand;
+    use crate::regs::{RegClass, VReg};
     use crate::types::BlockId;
 
     // ---- MachBlock tests ----
@@ -1126,6 +1756,34 @@ mod tests {
     }
 
     #[test]
+    fn type_v64_preserves_vector_identity_layout_and_register_class() {
+        use crate::regs::RegClass;
+
+        assert!(Type::V64.is_vector());
+        assert!(!Type::V64.is_int());
+        assert!(!Type::V64.is_float());
+        assert!(!Type::I64.is_vector());
+        assert_ne!(Type::V64, Type::I64);
+        assert_ne!(Type::V64, Type::F64);
+        assert_ne!(Type::V64, Type::V128);
+        assert_eq!(Type::V64.bytes(), 8);
+        assert_eq!(Type::V64.align(), 8);
+        assert_eq!(RegClass::for_type(&Type::V64), RegClass::Fpr64);
+        assert_eq!(RegClass::for_type(&Type::I64), RegClass::Gpr64);
+
+        let structure = Type::Struct(vec![Type::I8, Type::V64, Type::I8]);
+        assert_eq!(structure.offset_of(1), Some(8));
+        assert_eq!(structure.offset_of(2), Some(16));
+        assert_eq!(structure.align(), 8);
+        assert_eq!(structure.bytes(), 24);
+
+        let array = Type::Array(Box::new(Type::V64), 3);
+        assert_eq!(array.offset_of(2), Some(16));
+        assert_eq!(array.align(), 8);
+        assert_eq!(array.bytes(), 24);
+    }
+
+    #[test]
     fn type_b1_is_neither_int_nor_float() {
         assert!(!Type::B1.is_int());
         assert!(!Type::B1.is_float());
@@ -1182,6 +1840,9 @@ mod tests {
             hash_value(&Type::I128),
             "machine-IR type fingerprints must not collapse vector and integer carriers",
         );
+        assert_ne!(hash_value(&Type::V64), hash_value(&Type::I64));
+        assert_ne!(hash_value(&Type::V64), hash_value(&Type::F64));
+        assert_ne!(hash_value(&Type::V64), hash_value(&Type::V128));
     }
 
     // ---- Signature tests ----
@@ -1291,8 +1952,8 @@ mod tests {
 
     /// Covers the promoted (always-on) `unit_size > 0` assert in
     /// `new_dynamic_with_unit`. Must panic in BOTH profiles: run under
-    /// `cargo test` and `cargo test --release` — a regression back to
-    /// `debug_assert!` fails the release-profile run.
+    /// `scripts/trust_cargo.sh test` and `scripts/trust_cargo.sh test --release`
+    /// — a regression back to `debug_assert!` fails the release-profile run.
     #[test]
     #[should_panic(expected = "runtime slot unit size must be non-zero")]
     fn stack_slot_dynamic_zero_unit_size_panics() {
@@ -1326,6 +1987,110 @@ mod tests {
     }
 
     #[test]
+    fn machfunction_try_alloc_vreg_ordinary_ids() {
+        let mut func = MachFunction::new("f".into(), Signature::new(vec![], vec![]));
+        assert_eq!(func.try_alloc_vreg(), Some(0));
+        assert_eq!(func.try_alloc_vreg(), Some(1));
+        assert_eq!(func.try_alloc_vreg(), Some(2));
+        assert_eq!(func.next_vreg, 3);
+    }
+
+    #[test]
+    fn machfunction_try_alloc_vreg_exhaustion_is_stable() {
+        let mut func = MachFunction::new("f".into(), Signature::new(vec![], vec![]));
+        func.next_vreg = u32::MAX - 1;
+        assert_eq!(func.try_alloc_vreg(), Some(u32::MAX - 1));
+        assert_eq!(func.next_vreg, u32::MAX);
+        for _ in 0..3 {
+            assert_eq!(func.try_alloc_vreg(), None);
+            assert_eq!(func.next_vreg, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn machfunction_checked_sync_jumps_sparse_detached_and_noalias_ids() {
+        let mut func = MachFunction::new("sparse".into(), Signature::new(vec![], vec![]));
+        let detached = MachInst::new(
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(VReg::new(1_000_000_000, RegClass::Gpr64))],
+        );
+        func.insts.push(detached);
+        func.noalias_params.push(1_000_000_007);
+        func.next_vreg = 3;
+        assert_eq!(func.try_sync_vreg_counter(), Some(()));
+        assert_eq!(func.next_vreg, 1_000_000_008);
+        assert_eq!(func.try_alloc_vreg(), Some(1_000_000_008));
+        assert_eq!(func.try_sync_vreg_counter(), Some(()));
+        assert_eq!(
+            func.next_vreg, 1_000_000_009,
+            "synchronization must not rewind reserved IDs"
+        );
+    }
+
+    #[test]
+    fn machfunction_checked_sync_preserves_empty_and_exhausted_state() {
+        let mut func = MachFunction::new("bounded".into(), Signature::new(vec![], vec![]));
+        func.next_vreg = 17;
+        assert_eq!(func.try_sync_vreg_counter(), Some(()));
+        assert_eq!(func.next_vreg, 17);
+        func.noalias_params.push(u32::MAX);
+        let before = format!("{func:?}");
+        for _ in 0..3 {
+            assert_eq!(func.try_sync_vreg_counter(), None);
+            assert_eq!(format!("{func:?}"), before);
+        }
+        func.noalias_params[0] = u32::MAX - 1;
+        assert_eq!(func.try_sync_vreg_counter(), Some(()));
+        assert_eq!(func.next_vreg, u32::MAX);
+        assert_eq!(func.try_alloc_vreg(), None);
+    }
+
+    #[test]
+    fn machfunction_checked_sync_rejects_maximum_arena_operand() {
+        let mut func = MachFunction::new("operand".into(), Signature::new(vec![], vec![]));
+        func.insts.push(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(VReg::new(u32::MAX, RegClass::Gpr64))],
+        ));
+        let before = format!("{func:?}");
+        assert_eq!(func.try_sync_vreg_counter(), None);
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn machfunction_checked_block_and_slot_allocation_preserves_order() {
+        let mut func = MachFunction::new("arenas".into(), Signature::new(vec![], vec![]));
+        assert_eq!(func.try_create_block(), Some(BlockId(1)));
+        assert_eq!(func.try_create_block(), Some(BlockId(2)));
+        assert_eq!(func.block_order, [BlockId(0), BlockId(1), BlockId(2)]);
+        assert_eq!(func.blocks.len(), 3);
+        let a = StackSlot::new(8, 8);
+        let b = StackSlot::new(16, 16);
+        assert_eq!(func.try_alloc_stack_slot(a), Some(StackSlotId(0)));
+        assert_eq!(func.try_alloc_stack_slot(b), Some(StackSlotId(1)));
+        assert_eq!(func.stack_slots, [a, b]);
+    }
+
+    #[test]
+    fn machfunction_checked_block_and_slot_indices_cannot_narrow() {
+        assert_eq!(
+            MachFunction::checked_block_id(u32::MAX as usize),
+            Some(BlockId(u32::MAX))
+        );
+        assert_eq!(
+            MachFunction::checked_stack_slot_id(u32::MAX as usize),
+            Some(StackSlotId(u32::MAX))
+        );
+        // Test the exact projection without attempting multi-billion-entry arenas.
+        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
+            for index in [overflow, usize::MAX] {
+                assert_eq!(MachFunction::checked_block_id(index), None);
+                assert_eq!(MachFunction::checked_stack_slot_id(index), None);
+            }
+        }
+    }
+
+    #[test]
     fn machfunction_push_inst() {
         let sig = Signature::new(vec![], vec![]);
         let mut func = MachFunction::new("f".to_string(), sig);
@@ -1338,6 +2103,40 @@ mod tests {
         let id2 = func.push_inst(inst2);
         assert_eq!(id2, InstId(1));
         assert_eq!(func.num_insts(), 2);
+    }
+
+    #[test]
+    fn machfunction_try_push_inst_preserves_ordinary_order() {
+        let mut function =
+            MachFunction::new("checked_arena".into(), Signature::new(vec![], vec![]));
+        assert_eq!(
+            function.try_push_inst(MachInst::new(AArch64Opcode::Nop, vec![])),
+            Some(InstId(0))
+        );
+        assert_eq!(
+            function.try_push_inst(MachInst::new(AArch64Opcode::Ret, vec![])),
+            Some(InstId(1))
+        );
+        assert_eq!(
+            function
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect::<Vec<_>>(),
+            [AArch64Opcode::Nop, AArch64Opcode::Ret]
+        );
+    }
+
+    #[test]
+    fn machfunction_checked_inst_id_accepts_last_index_and_rejects_narrowing() {
+        assert_eq!(
+            MachFunction::checked_inst_id(u32::MAX as usize),
+            Some(InstId(u32::MAX))
+        );
+        if let Some(overflow) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(MachFunction::checked_inst_id(overflow), None);
+            assert_eq!(MachFunction::checked_inst_id(usize::MAX), None);
+        }
     }
 
     #[test]
@@ -1506,6 +2305,70 @@ mod tests {
         assert_eq!(ss, crate::types::StackSlotId(0));
     }
 
+    // ---- EhTypeTable tests ----
+
+    #[test]
+    fn eh_type_table_splat_is_constant_size_whatever_its_length() {
+        for len in [2u64, 3, 1 << 20, 1 << 40, u64::MAX] {
+            let table = EhTypeTable::splat("_ZTIi".to_string(), len);
+            assert_eq!(table.len(), len);
+            assert!(!table.is_empty());
+            assert_eq!(table.get(0), Some("_ZTIi"));
+            assert_eq!(table.get(len - 1), Some("_ZTIi"));
+            assert_eq!(table.get(len), None);
+            assert_eq!(table.symbol_for_catch_index(0), None);
+            assert_eq!(table.symbol_for_catch_index(1), Some("_ZTIi"));
+            assert_eq!(
+                table.entries(),
+                EhTypeTableEntries::Splat {
+                    symbol: "_ZTIi",
+                    len
+                }
+            );
+            // A clone shares the one symbol; it copies no entry.
+            assert!(table.clone().shares_storage_with(&table));
+            assert!(!EhTypeTable::splat("_ZTIi".to_string(), len).shares_storage_with(&table));
+        }
+    }
+
+    #[test]
+    fn eh_type_table_spelling_is_canonical() {
+        assert!(EhTypeTable::splat("_ZTIi".to_string(), 0).is_empty());
+        assert_eq!(EhTypeTable::from_symbols(Vec::new()), EhTypeTable::new());
+        let one = EhTypeTable::splat("_ZTIi".to_string(), 1);
+        assert_eq!(one, EhTypeTable::from_symbols(vec!["_ZTIi".to_string()]));
+        assert_eq!(
+            one.entries(),
+            EhTypeTableEntries::List(&["_ZTIi".to_string()])
+        );
+        let equal = EhTypeTable::from_symbols(vec!["_ZTIi".to_string(); 3]);
+        assert_eq!(equal, EhTypeTable::splat("_ZTIi".to_string(), 3));
+        let mixed = EhTypeTable::from_symbols(vec!["_ZTIi".to_string(), "_ZTId".to_string()]);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed.get(1), Some("_ZTId"));
+        assert_eq!(mixed.get(2), None);
+        assert_eq!(mixed.symbol_for_catch_index(2), Some("_ZTId"));
+        assert_ne!(mixed, equal);
+    }
+
+    #[test]
+    fn eh_type_table_serde_keeps_the_list_spelling_and_the_splat_small() {
+        let list = EhTypeTable::from_symbols(vec!["_ZTIi".to_string(), "_ZTId".to_string()]);
+        let text = serde_json::to_string(&list).unwrap();
+        assert_eq!(text, r#"["_ZTIi","_ZTId"]"#);
+        assert_eq!(serde_json::from_str::<EhTypeTable>(&text).unwrap(), list);
+
+        let splat = EhTypeTable::splat("_ZTIi".to_string(), 1 << 40);
+        let text = serde_json::to_string(&splat).unwrap();
+        assert_eq!(text, r#"{"splat":"_ZTIi","len":1099511627776}"#);
+        assert_eq!(serde_json::from_str::<EhTypeTable>(&text).unwrap(), splat);
+        // A list of equal entries deserializes to the canonical splat.
+        assert_eq!(
+            serde_json::from_str::<EhTypeTable>(r#"["_ZTIi","_ZTIi"]"#).unwrap(),
+            EhTypeTable::splat("_ZTIi".to_string(), 2)
+        );
+    }
+
     // ---- ExceptionHandlingMetadata tests ----
 
     #[test]
@@ -1619,6 +2482,7 @@ mod tests {
         let mut func = MachFunction::new("test_func".to_string(), Signature::new(vec![], vec![]));
         func.debug_meta = FunctionDebugMeta {
             source_file: Some("main.rs".to_string()),
+            display_name: None,
             decl_line: 42,
             param_names: vec!["arg0".to_string(), "arg1".to_string()],
             local_variables: vec![],

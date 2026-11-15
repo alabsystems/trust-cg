@@ -217,6 +217,15 @@ fn all_reconstructable() -> Vec<X86Opcode> {
         // Cmovcc/Cmovcc32: the implicit RFLAGS condition as a genuine CMP+CMOV pair.
         X86Opcode::Cmovcc,
         X86Opcode::Cmovcc32,
+        // Narrow LOCK CMPXCHG: the implicit PARTIAL accumulator (AL/AX) with the
+        // conditional store, the adjacent-cell width pin and ZF. See the
+        // `cmpxchg_narrow` module at the end of this file for the controls.
+        X86Opcode::Cmpxchg8,
+        X86Opcode::Cmpxchg16,
+        // LOCK CMPXCHG16B (the 128-bit atomic load): implicit RDX:RAX/RCX:RBX,
+        // the general CAS and the zero-comparand load as eleven facets. See
+        // the `cmpxchg16b` module at the end of this file for the controls.
+        X86Opcode::AtomicLoadCmpxchg16b,
     ]
 }
 
@@ -1600,6 +1609,70 @@ mod packed_128bit_moves {
     }
 
     #[test]
+    fn movdqu_sib_opcodes_reconstruct_valid_and_carry_no_alignment_precondition() {
+        // The SCALED-INDEX packed pair (MovdquRMSib / MovdquMRSib), which the SIB
+        // address fold emits for every vector body: `LeaSib pc,[base+iv*s]` +
+        // `MOVDQU [pc+0]` collapses to one `MOVDQU [base+iv*s]`. They must route
+        // to the SAME two-half V128 reconstruction as MovdquRM/MovdquMR — the
+        // whole point is that only the EA SHAPE changed, and the EA is the half
+        // the independent encoder already reconstructs. UNALIGNED, so there must
+        // be NO alignment precondition (there is deliberately no MOVDQA sibling:
+        // re-forming the address as base+index*scale is exactly the rewrite that
+        // could invalidate `ea % 16 == 0`).
+        for inst in [
+            X86ISelInst::new(X86Opcode::MovdquRMSib, vec![xmm128(0), sib(1, 2, 1, 0)]),
+            X86ISelInst::new(X86Opcode::MovdquRMSib, vec![xmm128(0), sib(1, 2, 4, 16)]),
+            X86ISelInst::new(X86Opcode::MovdquMRSib, vec![sib(0, 1, 1, 0), xmm128(2)]),
+            X86ISelInst::new(X86Opcode::MovdquMRSib, vec![sib(0, 1, 8, -32), xmm128(2)]),
+        ] {
+            let ob = reconstruct_x86_alu_obligation(&inst)
+                .unwrap_or_else(|| panic!("{:?} must reconstruct", inst.opcode));
+            assert!(
+                ob.is_reconstructed(),
+                "{:?} obligation must carry Reconstructed provenance",
+                inst.opcode
+            );
+            assert!(
+                is_valid(&ob),
+                "a faithful {:?} (matching two-half SIB EAs) must reconstruct Valid",
+                inst.opcode
+            );
+            assert!(
+                ob.preconditions.is_empty(),
+                "{:?} is UNALIGNED and must carry no ea%16==0 precondition",
+                inst.opcode
+            );
+        }
+    }
+
+    #[test]
+    fn movdqu_mr_sib_binds_both_value_halves_and_the_index_register() {
+        // The store binds both 64-bit value halves (a swapped/dropped half
+        // refutes — see store_swapped_value_halves_refutes / the dropped-half
+        // control, which exercise this very obligation shape) AND the SIB index
+        // register as an input, so a wrong index/scale/disp perturbs the EA and
+        // refutes through the address half.
+        let inst = X86ISelInst::new(X86Opcode::MovdquMRSib, vec![sib(0, 1, 4, 8), xmm128(2)]);
+        let ob = reconstruct_x86_alu_obligation(&inst).expect("must reconstruct");
+        assert!(
+            ob.inputs
+                .iter()
+                .any(|(n, w)| n == "recon_value_lo" && *w == 64)
+        );
+        assert!(
+            ob.inputs
+                .iter()
+                .any(|(n, w)| n == "recon_value_hi" && *w == 64)
+        );
+        assert!(
+            ob.inputs.len() >= 4,
+            "a SIB store must bind base AND index in addition to the two value \
+             halves, got inputs {:?}",
+            ob.inputs
+        );
+    }
+
+    #[test]
     fn post_regalloc_xmm_preg_stackslot_spill_shape_reconstructs_valid() {
         // COMPLETENESS: the ACTUAL spill/reload shape the codegen pipeline emits for
         // a whole-Fpr128 value is `MovdquRM xmm_preg, [StackSlot]` (reload) and
@@ -2283,12 +2356,10 @@ fn cmpsd_unord_mask_is_non_vacuous() {
             arity: 2,
         },
     };
+    let result = verify_by_evaluation(&ob);
     assert!(
-        matches!(
-            verify_by_evaluation(&ob),
-            VerificationResult::Invalid { .. }
-        ),
-        "a constant-0 mask must REFUTE the UNORD compare (NaN input → all-ones expected)"
+        matches!(result, VerificationResult::Invalid { .. }),
+        "a constant-0 mask must REFUTE the UNORD compare (NaN input → all-ones expected): {result:?}"
     );
 }
 
@@ -3589,6 +3660,1485 @@ mod implicit_operand {
                 VerificationResult::Invalid { .. }
             ),
             "wrong SIB scale must REFUTE (different loaded factor)"
+        );
+    }
+}
+
+// ===========================================================================
+// NARROW (8/16-bit) LOCK CMPXCHG — `Cmpxchg8` / `Cmpxchg16`
+// ===========================================================================
+//
+// The width of these two opcodes lives ONLY in the opcode: `reg_class_for_type`
+// maps BOTH i8 and i16 to a Gpr32 carrier, so operand 0 cannot disambiguate
+// them. The cheap implementation — pointing them at the existing 32/64-bit
+// `encode_cmpxchg` — would bind a BYTE compare-and-swap to the `Cmpxchg_I32`
+// proofs and could not even STATE the partial-register facts.
+// `cmpxchg_narrow_class_trap_32_bit_model_refutes` (below) and
+// `x86_64_function_verifier.rs`'s unit test
+// `narrow_cmpxchg_never_binds_the_wide_cmpxchg_proofs` exist to make that route
+// fail.
+//
+// The obligation is ONE `64 + 2w + 9`-bit concat of six facets (high to low):
+// RAX[63:w] preserved, returns-old in AL/AX, the conditional store, the
+// ADJACENT cell untouched, a WINDOWED FRAME PROBE byte untouched, and
+// ZF == success. Every control below mutates exactly ONE field of the REAL
+// machine effect (or, for the carrier control, one facet of the source claim)
+// and must REFUTE.
+//
+// THIS FILE IS A GATE TARGET. `scripts/soundness_check.sh` TRUST_CG_GATES runs
+// `reconstruction_x86`, and the manifest entry `CAS-x86-narrow-controls`
+// requires it to. Before that, every control here could be deleted or defeated
+// while the local meta-gate stayed green — measured, not hypothesised.
+
+mod cmpxchg_narrow {
+    use super::*;
+    use trust_cg_verify::memory_proofs::{encode_load_le, encode_store_le};
+    use trust_cg_verify::x86_64_semantics::{
+        X86CmpxchgNarrowEffect, encode_int_cmp_flags, encode_lock_cmpxchg_narrow,
+    };
+    use trust_cg_verify::{
+        CmpxchgNarrowPrestate, x86_cmpxchg_narrow_prestate, x86_cmpxchg_narrow_sides,
+    };
+
+    fn r32(id: u32) -> X86ISelOperand {
+        X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr32))
+    }
+
+    /// The real emitted shape: `LOCK CMPXCHG [base+disp], src32`.
+    fn inst(op: X86Opcode, disp: i32) -> X86ISelInst {
+        X86ISelInst::new(
+            op,
+            vec![
+                r32(0),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(r64(1)),
+                    disp,
+                },
+            ],
+        )
+    }
+
+    fn width_of(op: X86Opcode) -> u32 {
+        match op {
+            X86Opcode::Cmpxchg8 => 8,
+            X86Opcode::Cmpxchg16 => 16,
+            other => panic!("not a narrow CMPXCHG: {other:?}"),
+        }
+    }
+
+    /// The REAL prestate + the REAL machine effect for `op` at `disp`.
+    fn real(op: X86Opcode, disp: i32) -> (u32, CmpxchgNarrowPrestate, X86CmpxchgNarrowEffect) {
+        let w = width_of(op);
+        let pre = x86_cmpxchg_narrow_prestate(&inst(op, disp), w)
+            .unwrap_or_else(|| panic!("{op:?} must build a prestate"));
+        let effect =
+            encode_lock_cmpxchg_narrow(w, &pre.mem0, &pre.machine_ea, &pre.rax_pre, &pre.src_reg);
+        (w, pre, effect)
+    }
+
+    /// Wrap a (possibly mutated) machine effect back into an obligation against
+    /// the REAL source side.
+    fn obligation(
+        name: &str,
+        pre: &CmpxchgNarrowPrestate,
+        w: u32,
+        effect: &X86CmpxchgNarrowEffect,
+    ) -> ProofObligation {
+        let (trust_ir_expr, machine_expr) = x86_cmpxchg_narrow_sides(pre, w, effect);
+        raw_obligation(name, pre, trust_ir_expr, machine_expr)
+    }
+
+    fn raw_obligation(
+        name: &str,
+        pre: &CmpxchgNarrowPrestate,
+        trust_ir_expr: SmtExpr,
+        machine_expr: SmtExpr,
+    ) -> ProofObligation {
+        ProofObligation {
+            name: name.to_string(),
+            trust_ir_expr,
+            aarch64_expr: machine_expr,
+            inputs: pre.inputs.clone(),
+            preconditions: pre.preconditions.clone(),
+            fp_inputs: vec![],
+            category: None,
+            machine_side_provenance: MachineSideProvenance::Reconstructed {
+                from_opcode: "buggy".to_string(),
+                arity: 2,
+            },
+        }
+    }
+
+    fn assert_refutes(label: &str, ob: &ProofObligation) {
+        assert!(
+            matches!(verify_by_evaluation(ob), VerificationResult::Invalid { .. }),
+            "{label} must REFUTE — a control that does not refute means the \
+             obligation is not faithful"
+        );
+    }
+
+    fn assert_valid(label: &str, ob: &ProofObligation) {
+        assert!(
+            matches!(verify_by_evaluation(ob), VerificationResult::Valid),
+            "{label} must discharge Valid"
+        );
+    }
+
+    const NARROW: [X86Opcode; 2] = [X86Opcode::Cmpxchg8, X86Opcode::Cmpxchg16];
+
+    // -- positive: the real reconstruction discharges at both displacements ---
+
+    #[test]
+    fn cmpxchg_narrow_reconstructs_valid_at_both_displacements() {
+        for op in NARROW {
+            for disp in [0i32, -24] {
+                let ob = reconstruct_x86_alu_obligation(&inst(op, disp))
+                    .unwrap_or_else(|| panic!("{op:?} disp={disp} must reconstruct"));
+                assert!(ob.is_reconstructed(), "{op:?} must be Reconstructed");
+                assert!(
+                    ob.is_genuinely_proven(),
+                    "{op:?} must be STRUCTURALLY DISTINCT on the two sides — the \
+                     credit must not rest on Reconstructed provenance alone"
+                );
+                assert_valid(&format!("{op:?} disp={disp}"), &ob);
+            }
+        }
+    }
+
+    /// The joint obligation is exactly `64 + 2w + 9` bits: no facet is masked
+    /// off or truncated inside the concat. This is also the WIDTH BINDING's
+    /// last line of defence — a reconstructor that took its machine width from
+    /// the opcode TABLE instead of the opcode would still produce a Valid,
+    /// structurally distinct, `Reconstructed` obligation, and only the joint
+    /// width would name it (`Cmpxchg16` credited with an 89-bit byte-CAS
+    /// theorem instead of the 105-bit word one).
+    #[test]
+    fn cmpxchg_narrow_joint_width_is_64_plus_2w_plus_9() {
+        for op in NARROW {
+            let w = width_of(op);
+            let ob = reconstruct_x86_alu_obligation(&inst(op, 0)).unwrap();
+            let expect = 64 + 2 * w + 9;
+            assert_eq!(
+                ob.trust_ir_expr.bv_width(),
+                expect,
+                "{op:?} source side must be {expect} bits"
+            );
+            assert_eq!(
+                ob.aarch64_expr.bv_width(),
+                expect,
+                "{op:?} machine side must be {expect} bits"
+            );
+        }
+    }
+
+    // -------- NC1 / NC2 / NC6 / NC7: the RAX (accumulator) facets -----------
+
+    /// NC1 — a ZERO-EXTENDING accumulator merge. `CMPXCHG r/m8` writes AL only,
+    /// so RAX[63:8] survives a failed CAS. The dirty `recon_rax_hi` leaf makes
+    /// the difference observable.
+    #[test]
+    fn cmpxchg_narrow_zero_extending_rax_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let dest = encode_load_le(&pre.mem0, &pre.machine_ea, w / 8);
+            let mut bad = real_effect;
+            bad.rax_after = SmtExpr::ite(
+                bad.flags.zf.clone(),
+                pre.rax_pre.clone(),
+                dest.zero_ext(64 - w),
+            );
+            assert_refutes(
+                &format!("NC1 {op:?} zero-extending RAX"),
+                &obligation("NC1 zero-extending RAX", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC2 — the 32-bit-operand-size model: RAX[63:32] zeroed on write-back.
+    /// This is what reusing the `Cmpxchg` (i32) semantics would produce.
+    #[test]
+    fn cmpxchg_narrow_32_bit_write_model_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let dest = encode_load_le(&pre.mem0, &pre.machine_ea, w / 8);
+            let eax_new = pre.rax_pre.clone().extract(31, w).concat(dest);
+            let mut bad = real_effect;
+            bad.rax_after = SmtExpr::ite(
+                bad.flags.zf.clone(),
+                pre.rax_pre.clone(),
+                eax_new.zero_ext(32),
+            );
+            assert_refutes(
+                &format!("NC2 {op:?} 32-bit write model"),
+                &obligation("NC2 32-bit write", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC6 — a returns-DESIRED accumulator (the low w bits become SRC).
+    #[test]
+    fn cmpxchg_narrow_returns_desired_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let mut bad = real_effect;
+            bad.rax_after = pre
+                .rax_pre
+                .clone()
+                .extract(63, w)
+                .concat(pre.src_reg.clone().extract(w - 1, 0));
+            assert_refutes(
+                &format!("NC6 {op:?} returns desired"),
+                &obligation("NC6 returns desired", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC7 — no failure write-back: RAX is left alone in both branches.
+    #[test]
+    fn cmpxchg_narrow_no_failure_load_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let mut bad = real_effect;
+            bad.rax_after = pre.rax_pre.clone();
+            assert_refutes(
+                &format!("NC7 {op:?} no failure load"),
+                &obligation("NC7 no failure load", &pre, w, &bad),
+            );
+        }
+    }
+
+    // ------------------ NC3a / NC3b: the WIDTH controls ---------------------
+
+    /// NC3a — the OPCODE MIX-UP. Build the machine side at the OTHER narrow
+    /// width against this width's source claim, in both directions.
+    #[test]
+    fn cmpxchg_narrow_wrong_machine_width_refutes() {
+        for op in NARROW {
+            let (w, pre, _) = real(op, 0);
+            let other = if w == 8 { 16 } else { 8 };
+            let bad = encode_lock_cmpxchg_narrow(
+                other,
+                &pre.mem0,
+                &pre.machine_ea,
+                &pre.rax_pre,
+                &pre.src_reg,
+            );
+            assert_refutes(
+                &format!("NC3a {op:?} machine width {other} for source width {w}"),
+                &obligation("NC3a wrong machine width", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC3b — the REGISTER-CLASS TRAP: operand 0 is a Gpr32, so a width taken
+    /// from the register class answers 32. That model compares and stores over
+    /// FOUR bytes and zero-extends RAX. This is exactly what
+    /// `atomic_rmw_cas_loop_generic_width` would have answered, which is why
+    /// the reconstructor takes its width from the OPCODE instead.
+    #[test]
+    fn cmpxchg_narrow_class_trap_32_bit_model_refutes() {
+        for op in NARROW {
+            let (w, pre, _) = real(op, 0);
+            let dest32 = encode_load_le(&pre.mem0, &pre.machine_ea, 4);
+            let flags32 =
+                encode_int_cmp_flags(32, pre.rax_pre.clone().extract(31, 0), dest32.clone());
+            let new32 = SmtExpr::ite(flags32.zf.clone(), pre.src_reg.clone(), dest32.clone());
+            let mem_after = encode_store_le(&pre.mem0, &pre.machine_ea, &new32, 4);
+            let rax_after =
+                SmtExpr::ite(flags32.zf.clone(), pre.rax_pre.clone(), dest32.zero_ext(32));
+            let bad = X86CmpxchgNarrowEffect {
+                rax_after,
+                mem_after,
+                flags: flags32,
+            };
+            assert_refutes(
+                &format!("NC3b {op:?} Gpr32-class 32-bit model"),
+                &obligation("NC3b class trap", &pre, w, &bad),
+            );
+        }
+    }
+
+    // ------------------- NC4 / NC5 / NC11 / NC12 / NC13: the store ----------
+
+    /// NC4 — an UNCONDITIONAL store. Refutes on the failure branch.
+    #[test]
+    fn cmpxchg_narrow_unconditional_store_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let src_low = pre.src_reg.clone().extract(w - 1, 0);
+            let mut bad = real_effect;
+            bad.mem_after = encode_store_le(&pre.mem0, &pre.machine_ea, &src_low, w / 8);
+            assert_refutes(
+                &format!("NC4 {op:?} unconditional store"),
+                &obligation("NC4 unconditional store", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC5 — a SUPPRESSED store (memory never changes). Refutes on the SUCCESS
+    /// branch. It is a WEAK sampling canary on its own: the 36 edge-case
+    /// combinations reach the success branch even when the random half of the
+    /// sweep never does, so this control stays green through a branch selector
+    /// that is frozen. `cmpxchg_narrow_both_branches_are_reached_by_random_
+    /// points` is the control that actually pins the parameterisation.
+    #[test]
+    fn cmpxchg_narrow_suppressed_store_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let mut bad = real_effect;
+            bad.mem_after = pre.mem0.clone();
+            assert_refutes(
+                &format!("NC5 {op:?} suppressed store (SAMPLING canary)"),
+                &obligation("NC5 suppressed store", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC11 — SWAPPED roles: the comparand is taken from the source register
+    /// and the stored value from the accumulator.
+    #[test]
+    fn cmpxchg_narrow_swapped_comparand_and_source_refutes() {
+        for op in NARROW {
+            let (w, pre, _) = real(op, 0);
+            let s = w / 8;
+            let dest = encode_load_le(&pre.mem0, &pre.machine_ea, s);
+            let flags =
+                encode_int_cmp_flags(w, pre.src_reg.clone().extract(w - 1, 0), dest.clone());
+            let new = SmtExpr::ite(
+                flags.zf.clone(),
+                pre.rax_pre.clone().extract(w - 1, 0),
+                dest.clone(),
+            );
+            let mem_after = encode_store_le(&pre.mem0, &pre.machine_ea, &new, s);
+            let rax_after = SmtExpr::ite(
+                flags.zf.clone(),
+                pre.rax_pre.clone(),
+                pre.rax_pre.clone().extract(63, w).concat(dest),
+            );
+            let bad = X86CmpxchgNarrowEffect {
+                rax_after,
+                mem_after,
+                flags,
+            };
+            assert_refutes(
+                &format!("NC11 {op:?} swapped roles"),
+                &obligation("NC11 swapped roles", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC12 — the WRONG SOURCE BYTE (the AH/CH/DH/BH trap): `SRC` is taken from
+    /// bits [15:8] of the carrier instead of [7:0]. This states the hazard at
+    /// the MODEL level. The byte-level guard is ENC-3's decoder, which now
+    /// COVERS these two opcodes and reports a high-byte register whenever the
+    /// forced REX is missing (it allowlisted them until the narrow-CAS credit
+    /// was repaired).
+    #[test]
+    fn cmpxchg_narrow_wrong_source_byte_refutes() {
+        let op = X86Opcode::Cmpxchg8;
+        let (w, pre, real_effect) = real(op, 0);
+        let dest = encode_load_le(&pre.mem0, &pre.machine_ea, 1);
+        let wrong_src = pre.src_reg.clone().extract(15, 8);
+        let new = SmtExpr::ite(real_effect.flags.zf.clone(), wrong_src, dest);
+        let mut bad = real_effect;
+        bad.mem_after = encode_store_le(&pre.mem0, &pre.machine_ea, &new, 1);
+        assert_refutes(
+            "NC12 Cmpxchg8 wrong source byte (AH-style)",
+            &obligation("NC12 wrong source byte", &pre, w, &bad),
+        );
+    }
+
+    /// NC13 — a store whose BYTE ORDER disagrees with the model's LOAD order:
+    /// the 16-bit cell is written high byte first.
+    ///
+    /// SAID EXACTLY, because the obvious reading is wrong. This does NOT pin
+    /// the CAS's byte layout against anything outside the model. The seeding,
+    /// `encode_lock_cmpxchg_narrow`'s load/store and the read-back in
+    /// `x86_cmpxchg_narrow_sides` all go through the SAME crate-wide
+    /// `encode_store_le`/`encode_load_le` pair, which are exact inverses, so
+    /// flipping BOTH to big-endian cancels and every facet still discharges.
+    /// Little-endianness is trust base here, exactly as the SDM transcription
+    /// is. What DOES refute — and is worth a control — is a store that
+    /// disagrees with the model's own load: that is a real class of model bug
+    /// (and of encoder bug, for a store-width or lane-order mistake).
+    #[test]
+    fn cmpxchg_narrow_store_byte_order_refutes() {
+        let op = X86Opcode::Cmpxchg16;
+        let (w, pre, real_effect) = real(op, 0);
+        let dest = encode_load_le(&pre.mem0, &pre.machine_ea, 2);
+        let new = SmtExpr::ite(
+            real_effect.flags.zf.clone(),
+            pre.src_reg.clone().extract(15, 0),
+            dest,
+        );
+        let swapped = new.clone().extract(7, 0).concat(new.extract(15, 8));
+        let mut bad = real_effect;
+        bad.mem_after = encode_store_le(&pre.mem0, &pre.machine_ea, &swapped, 2);
+        assert_refutes(
+            "NC13 Cmpxchg16 store byte order disagreeing with the load order",
+            &obligation("NC13 store byte order", &pre, w, &bad),
+        );
+    }
+
+    /// The ADJACENT-CELL facet is live: a model that writes the neighbour
+    /// refutes even though the CAS cell itself is correct.
+    #[test]
+    fn cmpxchg_narrow_neighbour_clobber_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let s = w / 8;
+            let adjacent = pre
+                .machine_ea
+                .clone()
+                .bvadd(SmtExpr::bv_const(u64::from(s), 64));
+            let mut bad = real_effect;
+            bad.mem_after = encode_store_le(&bad.mem_after, &adjacent, &SmtExpr::bv_const(0, w), s);
+            assert_refutes(
+                &format!("NC16(adjacent) {op:?} neighbour clobber"),
+                &obligation("adjacent-cell clobber", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC17 — THE MEMORY FRAME, not just the store width. The adjacent-cell
+    /// facet pins how many bytes the CAS writes AT the effective address; it
+    /// says nothing about a second store somewhere ELSE. This control performs
+    /// the CORRECT compare-and-swap and additionally stores at `EA + 64` — far
+    /// outside the two modeled cells, and the exact attack the two-cell
+    /// read-back could not see. It refutes because the joint obligation carries
+    /// a windowed frame probe at `EA + sext(recon_probe_off)`: `+64` is one of
+    /// the 256 offsets that 8-bit leaf takes, so the statistical sweep hits it.
+    #[test]
+    fn cmpxchg_narrow_rogue_store_inside_the_probe_window_refutes() {
+        for op in NARROW {
+            for offset in [64u64, 8, 100] {
+                let (w, pre, real_effect) = real(op, 0);
+                let rogue = pre.machine_ea.clone().bvadd(SmtExpr::bv_const(offset, 64));
+                let mut bad = real_effect;
+                bad.mem_after =
+                    encode_store_le(&bad.mem_after, &rogue, &SmtExpr::bv_const(0xA5, 8), 1);
+                assert_refutes(
+                    &format!("NC17 {op:?} rogue store at EA+{offset}"),
+                    &obligation("NC17 rogue store in the frame window", &pre, w, &bad),
+                );
+            }
+        }
+    }
+
+    /// NC17b — the frame probe must also see a rogue store BELOW the effective
+    /// address; the probe offset is SIGNED for exactly this reason.
+    #[test]
+    fn cmpxchg_narrow_rogue_store_below_the_address_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let rogue = pre
+                .machine_ea
+                .clone()
+                .bvadd(SmtExpr::bv_const((-40i64) as u64, 64));
+            let mut bad = real_effect;
+            bad.mem_after = encode_store_le(&bad.mem_after, &rogue, &SmtExpr::bv_const(0x5A, 8), 1);
+            assert_refutes(
+                &format!("NC17b {op:?} rogue store at EA-40"),
+                &obligation("NC17b rogue store below the address", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC17c — THE WHOLE WINDOW, offset by offset. The frame facet is only
+    /// worth its name if EVERY byte it claims is actually reachable by the
+    /// sweep, so this plants a rogue store at each of the 256 signed offsets in
+    /// `[-128, 127]` (skipping the two/four bytes the modeled cells already
+    /// own) and requires every one to REFUTE.
+    ///
+    /// This control exists because the first version of the facet silently
+    /// covered HALF its window. The statistical sweep fills each input from the
+    /// LOW bits of an LCG that advances once per input per sample, so every
+    /// input's low bit is CONSTANT whenever the input count is even — an 8-bit
+    /// offset leaf reached 128 of 256 values and the 129 refuting offsets were
+    /// exactly the odd ones plus two edge-sweep values. The offset is now the
+    /// TOP byte of a 16-bit leaf, and this test is what would catch the next
+    /// such regression, whoever changes the leaf list.
+    #[test]
+    fn cmpxchg_narrow_every_probe_offset_in_the_window_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let cells = i64::from(2 * (w / 8));
+            let mut survivors = Vec::new();
+            for offset in -128i64..=127 {
+                if (0..cells).contains(&offset) {
+                    continue; // the CAS cell and its neighbour, already modeled
+                }
+                let rogue = pre
+                    .machine_ea
+                    .clone()
+                    .bvadd(SmtExpr::bv_const(offset as u64, 64));
+                let mut bad = real_effect.clone();
+                bad.mem_after =
+                    encode_store_le(&bad.mem_after, &rogue, &SmtExpr::bv_const(0xA5, 8), 1);
+                let ob = obligation("window sweep", &pre, w, &bad);
+                if !matches!(
+                    verify_by_evaluation(&ob),
+                    VerificationResult::Invalid { .. }
+                ) {
+                    survivors.push(offset);
+                }
+            }
+            assert!(
+                survivors.is_empty(),
+                "{op:?}: a rogue store SURVIVED at {} of the window's offsets: \
+                 {survivors:?} — the frame probe does not cover the window it \
+                 claims",
+                survivors.len()
+            );
+        }
+    }
+
+    /// THE PROBE EXCLUSION AT THE TOP OF MEMORY. The no-wrap bound admits a
+    /// two-cell window that ends exactly at 2^64 (`ir_ea = 2^64 - 2*size`),
+    /// where `ir_ea + 2*size` wraps to 0. The exclusion was spelled
+    /// `ir_ea <=u probe_ea <u ir_ea + 2*size`, false for every probe there, so
+    /// a probe ON the CAS cell was admitted and the frame claim ("the probe
+    /// byte is untouched") is false at that point: the multi-input sweep's
+    /// directed trials refuted the real reconstruction with `recon_base =
+    /// 2^64 - 2` and probe offset 0 (the exclusion now bounds the INCLUSIVE
+    /// last byte). `cmpxchg_narrow_probe_precondition_holds_at_the_wrap_boundary`
+    /// pins that one point; here, for both widths, every probe inside the
+    /// cells must be excluded there, every probe outside them admitted, and
+    /// the real reconstruction must discharge.
+    #[test]
+    fn cmpxchg_narrow_probe_exclusion_holds_at_the_top_of_memory() {
+        use trust_cg_verify::smt::EvalEnv;
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let cells = 2 * u64::from(w / 8);
+            let top = 0u64.wrapping_sub(cells);
+            for offset in -128i64..=127 {
+                let mut env = EvalEnv::default();
+                for (name, _) in &pre.inputs {
+                    env.insert(name.clone(), 0);
+                }
+                env.insert("recon_base".to_string(), top);
+                // The probe offset is the TOP byte of the 16-bit leaf.
+                env.insert("recon_probe_off".to_string(), ((offset as u8) as u64) << 8);
+                let admitted = pre.preconditions.iter().all(|pre| {
+                    pre.try_eval(&env)
+                        .unwrap_or_else(|error| panic!("{op:?}: {error}"))
+                        .as_bool()
+                });
+                let inside = (0..cells as i64).contains(&offset);
+                assert_eq!(
+                    admitted,
+                    !inside,
+                    "{op:?} at ir_ea = 2^64 - {cells}, probe offset {offset}: a probe \
+                     {} the two cells must be {}",
+                    if inside { "inside" } else { "outside" },
+                    if inside { "excluded" } else { "admitted" },
+                );
+            }
+            assert_valid(
+                &format!("{op:?} real reconstruction"),
+                &obligation("top of memory", &pre, w, &real_effect),
+            );
+        }
+    }
+
+    /// BOTH CAS BRANCHES ARE REACHED BY RANDOM POINTS, not only by the 36
+    /// edge-case combinations.
+    ///
+    /// A `Valid` verdict cannot say this. On the multi-input sampled path a
+    /// `Valid` says only that no counterexample was found and that at least ONE
+    /// sampled point satisfied the preconditions (an all-excluded sweep is the
+    /// vacuous-sample `Unknown`) — not which branch that point took, nor
+    /// whether it was an edge point or a random one. So the probe has to be a
+    /// REFUTATION: a counterexample is a witnessed point that satisfies every
+    /// precondition, which is exactly the existence claim wanted.
+    ///
+    /// Each direction takes a machine effect that is wrong on ONE branch only —
+    /// a suppressed store (wrong iff ZF=1, the SUCCESS branch) and an
+    /// unconditional store (wrong iff ZF=0, the FAILURE branch) — and adds
+    /// preconditions excluding every value `fill_env_edge` can hand an 8-bit
+    /// input (`0, 1, 0x7F, 0x80, 0xFE, 0xFF`). An edge point sets EVERY input
+    /// to one of those six, so a surviving counterexample came from the RANDOM
+    /// half of the sweep.
+    ///
+    /// MEASURED with the pre-repair 1-bit `recon_sel` leaf: the success
+    /// direction does not refute, because the sweep freezes a 1-bit input at a
+    /// single value for all 100,000 random samples when the input count is
+    /// even.
+    #[test]
+    fn cmpxchg_narrow_both_branches_are_reached_by_random_points() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let probe_val = SmtExpr::var("recon_probe_val", 8);
+            let s = w / 8;
+            let src_low = pre.src_reg.clone().extract(w - 1, 0);
+
+            let mut suppressed = real_effect.clone();
+            suppressed.mem_after = pre.mem0.clone();
+            let mut unconditional = real_effect;
+            unconditional.mem_after = encode_store_le(&pre.mem0, &pre.machine_ea, &src_low, s);
+
+            for (branch, bad) in [("SUCCESS", &suppressed), ("FAILURE", &unconditional)] {
+                let mut ob = obligation("branch reach", &pre, w, bad);
+                for edge in [0u64, 1, 0x7F, 0x80, 0xFE, 0xFF] {
+                    ob.preconditions.push(
+                        probe_val
+                            .clone()
+                            .eq_expr(SmtExpr::bv_const(edge, 8))
+                            .not_expr(),
+                    );
+                }
+                assert!(
+                    matches!(
+                        verify_by_evaluation(&ob),
+                        VerificationResult::Invalid { .. }
+                    ),
+                    "{op:?}: a model wrong ONLY on the {branch} branch survived every \
+                     NON-EDGE sampled point — that branch is never exercised by a \
+                     random sample, so the branch parameterisation is not doing what \
+                     it claims"
+                );
+            }
+        }
+    }
+
+    /// The probe facet is PRESENT in the joint value and the faithful effect
+    /// still discharges with it live.
+    ///
+    /// Note what the `Valid` here does NOT say: on the multi-input sampled path
+    /// it witnesses at least one sampled point satisfying both preconditions (a
+    /// sweep that no point satisfies is the vacuous-sample `Unknown`), but not
+    /// that every probe offset in the window is reachable. The evidence for
+    /// that is `cmpxchg_narrow_every_probe_offset_in_the_window_refutes`,
+    /// where a refutation at each offset is a WITNESSED satisfying point.
+    #[test]
+    fn cmpxchg_narrow_probe_facet_is_present_and_satisfiable() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let (src_side, machine_side) = x86_cmpxchg_narrow_sides(&pre, w, &real_effect);
+            assert_eq!(src_side.bv_width(), 64 + 2 * w + 9);
+            assert_eq!(machine_side.bv_width(), 64 + 2 * w + 9);
+            assert!(
+                pre.inputs
+                    .iter()
+                    .any(|(n, bits)| n == "recon_probe_off" && *bits == 16),
+                "{op:?} must declare the probe offset leaf at 16 bits — the \
+                 offset is its TOP byte, because the sweep freezes the LOW bit \
+                 of every input at an even input count"
+            );
+            assert!(
+                pre.inputs
+                    .iter()
+                    .any(|(n, bits)| n == "recon_sel" && *bits == 16),
+                "{op:?} must declare the branch selector leaf at 16 bits, for \
+                 the same reason"
+            );
+            assert!(
+                pre.inputs
+                    .iter()
+                    .any(|(n, bits)| n == "recon_probe_val" && *bits == 8),
+                "{op:?} must declare the probe byte leaf"
+            );
+            assert_eq!(
+                pre.preconditions.len(),
+                2,
+                "{op:?} must carry BOTH the no-wrap and the probe-disjointness \
+                 preconditions"
+            );
+            assert_valid(
+                &format!("{op:?} faithful effect with the frame probe live"),
+                &obligation("frame probe positive", &pre, w, &real_effect),
+            );
+        }
+    }
+
+    /// FACET LIVENESS above bit 64. The joint value is 89/105 bits wide, so it
+    /// is carried as a 128-bit evaluator result. This control corrupts ONLY
+    /// `RAX[63:48]`, which lands ENTIRELY above bit 64 of the concat (RAX bit
+    /// `i` sits at concat position `2w + 9 + i`), and must still refute — so
+    /// nothing in the evaluation pipeline truncates the joint value to 64 bits
+    /// and silently drops the top facets.
+    #[test]
+    fn cmpxchg_narrow_high_bits_above_64_are_compared() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            // RAX bit 48 maps to concat position 2w + 9 + 48 >= 65.
+            assert!(2 * w + 9 + 48 > 64);
+            let mut bad = real_effect;
+            bad.rax_after = bad
+                .rax_after
+                .clone()
+                .bvxor(SmtExpr::bv_const(0xFFFF << 48, 64));
+            assert_refutes(
+                &format!("{op:?} corruption confined to concat bits > 64"),
+                &obligation("high-bit facet liveness", &pre, w, &bad),
+            );
+        }
+    }
+
+    // ------------------ NC8 / NC9 / NC10: the ZF facet ----------------------
+
+    /// NC8 — a BACKWARDS success flag (only the REPORTED bit is flipped; the
+    /// store and accumulator stay faithful, so this isolates the ZF facet).
+    #[test]
+    fn cmpxchg_narrow_backwards_zf_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let mut bad = real_effect;
+            bad.flags.zf = bad.flags.zf.clone().not_expr();
+            assert_refutes(
+                &format!("NC8 {op:?} backwards ZF"),
+                &obligation("NC8 backwards ZF", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC9 — a WIDE-COMPARE flag: ZF computed over the whole 32-bit carrier
+    /// rather than AL/AX. Refutes whenever EAX[31:w] is dirty while AL equals
+    /// the cell. This is the width-specific flag hazard.
+    #[test]
+    fn cmpxchg_narrow_wide_compare_zf_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let dest = encode_load_le(&pre.mem0, &pre.machine_ea, w / 8);
+            let wide = encode_int_cmp_flags(
+                32,
+                pre.rax_pre.clone().extract(31, 0),
+                dest.zero_ext(32 - w),
+            );
+            let mut bad = real_effect;
+            bad.flags.zf = wide.zf;
+            assert_refutes(
+                &format!("NC9 {op:?} wide-compare ZF"),
+                &obligation("NC9 wide-compare ZF", &pre, w, &bad),
+            );
+        }
+    }
+
+    /// NC10 — the WRONG FLAG BIT: CF reported as the success flag.
+    #[test]
+    fn cmpxchg_narrow_wrong_flag_bit_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let mut bad = real_effect;
+            bad.flags.zf = bad.flags.cf.clone();
+            assert_refutes(
+                &format!("NC10 {op:?} CF-for-ZF"),
+                &obligation("NC10 CF for ZF", &pre, w, &bad),
+            );
+        }
+    }
+
+    // ---------------------- NC14: the effective address ---------------------
+
+    /// NC14 — a WRONG effective address, both as an off-by-one displacement and
+    /// as an entirely different address. Both refute because the load-backs are
+    /// taken at the SOURCE address.
+    #[test]
+    fn cmpxchg_narrow_wrong_effective_address_refutes() {
+        for op in NARROW {
+            let (w, pre, _) = real(op, 0);
+            let off_by_one = pre.machine_ea.clone().bvadd(SmtExpr::bv_const(1, 64));
+            let bad =
+                encode_lock_cmpxchg_narrow(w, &pre.mem0, &off_by_one, &pre.rax_pre, &pre.src_reg);
+            assert_refutes(
+                &format!("NC14a {op:?} disp+1"),
+                &obligation("NC14a disp+1", &pre, w, &bad),
+            );
+
+            let elsewhere = SmtExpr::bv_const(0x1000, 64);
+            let bad =
+                encode_lock_cmpxchg_narrow(w, &pre.mem0, &elsewhere, &pre.rax_pre, &pre.src_reg);
+            assert_refutes(
+                &format!("NC14b {op:?} different address"),
+                &obligation("NC14b different address", &pre, w, &bad),
+            );
+        }
+    }
+
+    // ------------- NC15: a SOURCE-side claim that is not true ---------------
+
+    /// NC15 — the CLEAN-CARRIER claim. Pit the FAITHFUL machine effect against
+    /// a source claim that RAX is zero above the operation width. The carrier
+    /// is dirty by architecture (a narrow CMPXCHG leaves RAX[63:w] alone), so
+    /// this must refute — it is what pins the direction of the frame facet.
+    #[test]
+    fn cmpxchg_narrow_clean_carrier_source_claim_refutes() {
+        for op in NARROW {
+            let (w, pre, real_effect) = real(op, 0);
+            let (real_src, machine) = x86_cmpxchg_narrow_sides(&pre, w, &real_effect);
+            // Replace ONLY the top (64 - w) bits of the source claim with zeros.
+            // The low bits are loaded ++ stored ++ neighbor ++ probe ++ zf =
+            // 3w + 8 + 1.
+            let low = real_src.clone().extract(3 * w + 8, 0);
+            let clean = SmtExpr::bv_const(0, 64 - w).concat(low);
+            assert_eq!(clean.bv_width(), real_src.bv_width());
+            assert_refutes(
+                &format!("NC15 {op:?} clean-carrier source claim"),
+                &raw_obligation("NC15 clean carrier", &pre, clean, machine),
+            );
+        }
+    }
+
+    // ------------- NC18: fail-closed shape checks (no SMT) ------------------
+
+    #[test]
+    fn cmpxchg_narrow_rejects_unmodeled_shapes() {
+        use trust_cg_ir::x86_64_regs::{EAX, RAX};
+
+        // SIB memory operand: the encoder reads only base+disp for these
+        // opcodes and would silently drop the index.
+        let sib = X86ISelInst::new(
+            X86Opcode::Cmpxchg8,
+            vec![
+                r32(0),
+                X86ISelOperand::SibMemAddr {
+                    base: Box::new(r64(1)),
+                    index: Box::new(r64(2)),
+                    scale: 1,
+                    disp: 0,
+                },
+            ],
+        );
+        assert!(
+            reconstruct_x86_alu_obligation(&sib).is_none(),
+            "SibMemAddr must fail closed"
+        );
+
+        // A 64-bit source register is not the emitted carrier shape.
+        let wide_src = X86ISelInst::new(
+            X86Opcode::Cmpxchg8,
+            vec![
+                r64(0),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(r64(1)),
+                    disp: 0,
+                },
+            ],
+        );
+        assert!(
+            reconstruct_x86_alu_obligation(&wide_src).is_none(),
+            "a non-Gpr32 source must fail closed"
+        );
+
+        // An RAX-aliasing source register would not be an independent leaf.
+        let aliased = X86ISelInst::new(
+            X86Opcode::Cmpxchg8,
+            vec![
+                X86ISelOperand::PReg(EAX),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(r64(1)),
+                    disp: 0,
+                },
+            ],
+        );
+        assert!(
+            reconstruct_x86_alu_obligation(&aliased).is_none(),
+            "an RAX-aliased source must fail closed"
+        );
+
+        // An RAX base would alias the accumulator leaf too.
+        let aliased_base = X86ISelInst::new(
+            X86Opcode::Cmpxchg8,
+            vec![
+                r32(0),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::PReg(RAX)),
+                    disp: 0,
+                },
+            ],
+        );
+        assert!(
+            reconstruct_x86_alu_obligation(&aliased_base).is_none(),
+            "an RAX base must fail closed"
+        );
+
+        // Wrong operand count.
+        let one_operand = X86ISelInst::new(X86Opcode::Cmpxchg16, vec![r32(0)]);
+        assert!(
+            reconstruct_x86_alu_obligation(&one_operand).is_none(),
+            "a one-operand CMPXCHG must fail closed"
+        );
+
+        // A TABLE-vs-EMISSION width disagreement never reaches the encoder: the
+        // prestate builder rejects any width that is not 8 or 16, and the
+        // reconstructor re-derives the width from `inst.opcode`.
+        assert!(
+            x86_cmpxchg_narrow_prestate(&inst(X86Opcode::Cmpxchg8, 0), 32).is_none(),
+            "a 32-bit width claim must fail closed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The 128-bit atomic-load pseudo (`AtomicLoadCmpxchg16b`: four zeroing XORs,
+// then LOCK CMPXCHG16B). The REAL reconstruction discharges at both
+// displacements, the control harness rebuilds exactly the obligation the
+// reconstructor returns, and every single-field mutation of the REAL machine
+// effect — of the bare CMPXCHG16B at general inputs, or of the whole pseudo
+// over the incoming registers — must REFUTE. In particular a model that skips
+// ANY ONE of the four zeroings refutes: the precondition that makes the
+// compare-exchange a load is part of the obligation.
+// ---------------------------------------------------------------------------
+
+mod cmpxchg16b {
+    use super::*;
+    use trust_cg_verify::memory_proofs::encode_store_le;
+    use trust_cg_verify::x86_64_function_verifier::{
+        Cmpxchg16bPrestate, x86_cmpxchg16b_facets, x86_cmpxchg16b_prestate, x86_cmpxchg16b_sides,
+    };
+    use trust_cg_verify::x86_64_semantics::{
+        X86Cmpxchg16bEffect, encode_atomic_load_cmpxchg16b, encode_lock_cmpxchg16b,
+    };
+
+    /// The real emitted shape: the pseudo over `[base + disp]`.
+    fn inst(disp: i32) -> X86ISelInst {
+        X86ISelInst::new(
+            X86Opcode::AtomicLoadCmpxchg16b,
+            vec![X86ISelOperand::MemAddr {
+                base: Box::new(r64(0)),
+                disp,
+            }],
+        )
+    }
+
+    fn cas_effect(pre: &Cmpxchg16bPrestate, ea: &SmtExpr) -> X86Cmpxchg16bEffect {
+        encode_lock_cmpxchg16b(
+            &pre.mem0,
+            ea,
+            &pre.expected.clone().extract(63, 0),
+            &pre.expected.clone().extract(127, 64),
+            &pre.desired.clone().extract(63, 0),
+            &pre.desired.clone().extract(127, 64),
+        )
+    }
+
+    /// The whole pseudo over the prestate's INCOMING registers.
+    fn load_effect(pre: &Cmpxchg16bPrestate, ea: &SmtExpr) -> X86Cmpxchg16bEffect {
+        encode_atomic_load_cmpxchg16b(
+            &pre.mem0_load,
+            ea,
+            &pre.rax_in,
+            &pre.rdx_in,
+            &pre.rbx_in,
+            &pre.rcx_in,
+        )
+    }
+
+    /// A pseudo model that ZEROES only the registers named in `zeroed` (RAX,
+    /// RDX, RBX, RCX order) and hands the others to CMPXCHG16B with their
+    /// incoming values — a dropped zeroing, as a control.
+    fn load_effect_zeroing(pre: &Cmpxchg16bPrestate, zeroed: [bool; 4]) -> X86Cmpxchg16bEffect {
+        let zero = SmtExpr::bv_const(0, 64);
+        let pick = |keep_zero: bool, incoming: &SmtExpr| {
+            if keep_zero {
+                zero.clone()
+            } else {
+                incoming.clone()
+            }
+        };
+        encode_lock_cmpxchg16b(
+            &pre.mem0_load,
+            &pre.machine_ea,
+            &pick(zeroed[0], &pre.rax_in),
+            &pick(zeroed[1], &pre.rdx_in),
+            &pick(zeroed[2], &pre.rbx_in),
+            &pick(zeroed[3], &pre.rcx_in),
+        )
+    }
+
+    /// The REAL prestate and the REAL effects of both instances.
+    fn real(disp: i32) -> (Cmpxchg16bPrestate, X86Cmpxchg16bEffect, X86Cmpxchg16bEffect) {
+        let pre = x86_cmpxchg16b_prestate(&inst(disp))
+            .expect("AtomicLoadCmpxchg16b must build a prestate");
+        let cas = cas_effect(&pre, &pre.machine_ea);
+        let load = load_effect(&pre, &pre.machine_ea);
+        (pre, cas, load)
+    }
+
+    fn obligation(
+        name: &str,
+        pre: &Cmpxchg16bPrestate,
+        cas: &X86Cmpxchg16bEffect,
+        load: &X86Cmpxchg16bEffect,
+    ) -> ProofObligation {
+        let facets = x86_cmpxchg16b_facets(pre, cas, load);
+        let (trust_ir_expr, machine_expr) = x86_cmpxchg16b_sides(&facets);
+        ProofObligation {
+            name: name.to_string(),
+            trust_ir_expr,
+            aarch64_expr: machine_expr,
+            inputs: pre.inputs.clone(),
+            preconditions: pre.preconditions.clone(),
+            fp_inputs: vec![],
+            category: None,
+            machine_side_provenance: MachineSideProvenance::Reconstructed {
+                from_opcode: "control".to_string(),
+                arity: 1,
+            },
+        }
+    }
+
+    fn assert_refutes(label: &str, ob: &ProofObligation) {
+        assert!(
+            matches!(verify_by_evaluation(ob), VerificationResult::Invalid { .. }),
+            "{label} must REFUTE — a control that does not refute means the obligation \
+             is not faithful"
+        );
+    }
+
+    #[test]
+    fn cmpxchg16b_reconstructs_valid_at_both_displacements() {
+        for disp in [0i32, -24] {
+            let ob = reconstruct_x86_alu_obligation(&inst(disp))
+                .unwrap_or_else(|| panic!("AtomicLoadCmpxchg16b disp={disp} must reconstruct"));
+            assert!(ob.is_reconstructed(), "must be Reconstructed");
+            assert!(
+                ob.is_genuinely_proven(),
+                "the two sides must be STRUCTURALLY DISTINCT"
+            );
+            assert_eq!(ob.trust_ir_expr.bv_width(), 11, "eleven facet bits");
+            assert_eq!(ob.aarch64_expr.bv_width(), 11, "eleven facet bits");
+            let verdict = verify_by_evaluation(&ob);
+            assert!(
+                matches!(verdict, VerificationResult::Valid),
+                "disp={disp} must discharge Valid, got {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmpxchg16b_control_harness_rebuilds_the_real_obligation() {
+        let (pre, cas, load) = real(0);
+        let control = obligation("real", &pre, &cas, &load);
+        let reconstructed = reconstruct_x86_alu_obligation(&inst(0)).expect("reconstructs");
+        assert_eq!(control.trust_ir_expr, reconstructed.trust_ir_expr);
+        assert_eq!(control.aarch64_expr, reconstructed.aarch64_expr);
+        assert_eq!(control.inputs, reconstructed.inputs);
+        assert_eq!(control.inputs.len() % 2, 1, "an ODD input count");
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_swapped_result_halves_refute() {
+        let (pre, mut cas, load) = real(0);
+        std::mem::swap(&mut cas.rax_after, &mut cas.rdx_after);
+        assert_refutes("RAX/RDX swapped", &obligation("swap", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_returns_desired_refutes() {
+        let (pre, mut cas, load) = real(0);
+        cas.rax_after = pre.desired.clone().extract(63, 0);
+        cas.rdx_after = pre.desired.clone().extract(127, 64);
+        assert_refutes("returns desired", &obligation("desired", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_unconditional_store_refutes() {
+        let (pre, mut cas, load) = real(0);
+        cas.mem_after = encode_store_le(&pre.mem0, &pre.ir_ea, &pre.desired, 16);
+        assert_refutes(
+            "unconditional store",
+            &obligation("always", &pre, &cas, &load),
+        );
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_suppressed_store_refutes() {
+        let (pre, mut cas, load) = real(0);
+        cas.mem_after = pre.mem0.clone();
+        assert_refutes("suppressed store", &obligation("never", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_eight_byte_store_refutes() {
+        // CMPXCHG8B's width: only the low qword of the new value is written.
+        let (pre, mut cas, load) = real(0);
+        let new_dest = SmtExpr::ite(cas.zf.clone(), pre.desired.clone(), pre.old.clone());
+        cas.mem_after = encode_store_le(&pre.mem0, &pre.ir_ea, &new_dest.extract(63, 0), 8);
+        assert_refutes("8-byte store", &obligation("cx8", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_backwards_zf_refutes() {
+        let (pre, mut cas, load) = real(0);
+        cas.zf = cas.zf.clone().not_expr();
+        assert_refutes("backwards ZF", &obligation("zf", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_neighbour_clobber_refutes() {
+        let (pre, mut cas, load) = real(0);
+        let above = pre.ir_ea.clone().bvadd(SmtExpr::bv_const(16, 64));
+        cas.mem_after = encode_store_le(
+            &cas.mem_after,
+            &above,
+            &SmtExpr::bv_const(0x5555_5555_5555_5555, 64),
+            8,
+        );
+        assert_refutes(
+            "clobbered upper neighbour",
+            &obligation("nb", &pre, &cas, &load),
+        );
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_rogue_store_in_the_probe_window_refutes() {
+        let (pre, mut cas, load) = real(0);
+        let rogue = pre.ir_ea.clone().bvadd(SmtExpr::bv_const(64, 64));
+        cas.mem_after = encode_store_le(&cas.mem_after, &rogue, &SmtExpr::bv_const(0xA5, 8), 1);
+        assert_refutes(
+            "rogue store at ea+64",
+            &obligation("probe", &pre, &cas, &load),
+        );
+    }
+
+    #[test]
+    fn cmpxchg16b_cas_wrong_address_refutes() {
+        let (pre, _cas, load) = real(0);
+        let wrong = pre.machine_ea.clone().bvadd(SmtExpr::bv_const(16, 64));
+        let cas = cas_effect(&pre, &wrong);
+        assert_refutes("CAS at ea+16", &obligation("ea", &pre, &cas, &load));
+    }
+
+    /// THE PRECONDITION IS BOUND. The load facets' machine side is the WHOLE
+    /// pseudo over the incoming registers, so a model that skips any one of
+    /// the four zeroing XORs — or all of them — refutes: skipping RAX or RDX
+    /// makes a cell equal to the partly-incoming comparand get overwritten with
+    /// `RCX:RBX`; skipping RBX or RCX overwrites a zero cell with the incoming
+    /// replacement. Before the zeroing was part of the pseudo, these registers
+    /// were constant zeros in the model and nothing obligated them.
+    #[test]
+    fn cmpxchg16b_load_every_dropped_zeroing_refutes() {
+        let (pre, cas, _load) = real(0);
+        for (label, zeroed) in [
+            ("XOR EAX,EAX skipped", [false, true, true, true]),
+            ("XOR EDX,EDX skipped", [true, false, true, true]),
+            ("XOR EBX,EBX skipped", [true, true, false, true]),
+            ("XOR ECX,ECX skipped", [true, true, true, false]),
+            ("no zeroing at all", [false, false, false, false]),
+        ] {
+            let load = load_effect_zeroing(&pre, zeroed);
+            assert_refutes(label, &obligation(label, &pre, &cas, &load));
+        }
+        // ...while zeroing all four is exactly the real pseudo's effect.
+        let all = load_effect_zeroing(&pre, [true, true, true, true]);
+        assert!(
+            matches!(
+                verify_by_evaluation(&obligation("all four", &pre, &cas, &all)),
+                VerificationResult::Valid
+            ),
+            "a model with all four zeros must discharge"
+        );
+    }
+
+    /// A ZEROING THAT CLEARS ONLY THE LOW BITS refutes too, for each of the
+    /// four registers and each narrower width: a non-zero-extending
+    /// `XOR EAX,EAX` transcription (low 32), an `XOR AX,AX` (low 16) or an
+    /// `XOR AL,AL` (low 8). For RBX/RCX the kept upper bits are stored into a
+    /// zero cell. For RAX/RDX they stay in the comparand, which only refutes on
+    /// a cell EQUAL to it: the prestate seeds that upper-bits-only cell
+    /// (`Cmpxchg16bPrestate::old_load`). Without those cells the RAX/RDX rows
+    /// here discharged Valid, and the width of the comparand zeroing was bound
+    /// only by ENC-3's byte comparison.
+    #[test]
+    fn cmpxchg16b_load_partial_width_zeroing_refutes() {
+        let (pre, cas, _load) = real(0);
+        let incoming = [&pre.rax_in, &pre.rdx_in, &pre.rbx_in, &pre.rcx_in];
+        let names = ["RAX", "RDX", "RBX", "RCX"];
+        // `reg` with only its low `bits` cleared.
+        let partial = |reg: &SmtExpr, bits: u32| {
+            reg.clone()
+                .extract(63, bits)
+                .concat(SmtExpr::bv_const(0, bits))
+        };
+        let zero = SmtExpr::bv_const(0, 64);
+        for bits in [32u32, 16, 8] {
+            for (which, name) in names.iter().enumerate() {
+                let z = |i: usize| {
+                    if i == which {
+                        partial(incoming[i], bits)
+                    } else {
+                        zero.clone()
+                    }
+                };
+                let load = encode_lock_cmpxchg16b(
+                    &pre.mem0_load,
+                    &pre.machine_ea,
+                    &z(0),
+                    &z(1),
+                    &z(2),
+                    &z(3),
+                );
+                let label = format!("{name} zeroed only in its low {bits} bits");
+                assert_refutes(&label, &obligation(&label, &pre, &cas, &load));
+            }
+            // All four narrowed at once (the non-zero-extending transcription
+            // of the whole expansion, at `bits` = 32).
+            let load = encode_lock_cmpxchg16b(
+                &pre.mem0_load,
+                &pre.machine_ea,
+                &partial(&pre.rax_in, bits),
+                &partial(&pre.rdx_in, bits),
+                &partial(&pre.rbx_in, bits),
+                &partial(&pre.rcx_in, bits),
+            );
+            let label = format!("all four zeroed only in their low {bits} bits");
+            assert_refutes(&label, &obligation(&label, &pre, &cas, &load));
+        }
+    }
+
+    /// The modeled expansion TRANSCRIBES the four XORs over the incoming
+    /// registers instead of assuming zeros. This is STRUCTURAL: a model that
+    /// ignores the incoming registers and hands CMPXCHG16B four constant zeros
+    /// is semantically the same function and discharges Valid, so no
+    /// refutation can see that regression. What the test pins:
+    ///
+    /// * The SDM model itself: every output of `encode_atomic_load_cmpxchg16b`
+    ///   over four fresh distinct leaves mentions all four of them.
+    /// * The reconstruction uses it: the obligation's machine side mentions
+    ///   `recon_rbx_in` and `recon_rcx_in`, which its SOURCE side never reads
+    ///   (the source reads `recon_rax_in`/`recon_rdx_in` through the seeded
+    ///   cell, so for those two only the model check above is informative), and
+    ///   `cmpxchg16b_control_harness_rebuilds_the_real_obligation` pins that the
+    ///   reconstruction is built from this model over the prestate's incoming
+    ///   registers.
+    ///
+    /// The declared inputs are NOT evidence: the prestate declares all four
+    /// leaves unconditionally, whatever the machine side reads.
+    #[test]
+    fn cmpxchg16b_load_model_reads_the_incoming_registers() {
+        let leaves = ["in_rax", "in_rdx", "in_rbx", "in_rcx"];
+        let vars: Vec<SmtExpr> = leaves.iter().map(|n| SmtExpr::var(*n, 64)).collect();
+        let effect = encode_atomic_load_cmpxchg16b(
+            &trust_cg_verify::memory_proofs::zeroed_memory(),
+            &SmtExpr::var("in_ea", 64),
+            &vars[0],
+            &vars[1],
+            &vars[2],
+            &vars[3],
+        );
+        let mut mentioned = effect.mem_after.free_vars();
+        mentioned.extend(effect.rax_after.free_vars());
+        mentioned.extend(effect.rdx_after.free_vars());
+        mentioned.extend(effect.zf.free_vars());
+        for leaf in leaves {
+            assert!(
+                mentioned.iter().any(|v| v == leaf),
+                "encode_atomic_load_cmpxchg16b no longer reads its incoming {leaf}: the \
+                 XOR transcription was replaced by an assumed zero"
+            );
+        }
+        // The CAS a skipped XOR leaves is visibly different: the constant-zero
+        // model mentions none of the four.
+        let zero = SmtExpr::bv_const(0, 64);
+        let constant = encode_lock_cmpxchg16b(
+            &trust_cg_verify::memory_proofs::zeroed_memory(),
+            &SmtExpr::var("in_ea", 64),
+            &zero,
+            &zero,
+            &zero,
+            &zero,
+        );
+        assert!(
+            leaves
+                .iter()
+                .all(|leaf| !constant.mem_after.free_vars().iter().any(|v| v == leaf)),
+            "control: a constant-zero model reads no incoming register"
+        );
+
+        let ob = reconstruct_x86_alu_obligation(&inst(0)).expect("reconstructs");
+        let source = ob.trust_ir_expr.free_vars();
+        let machine = ob.aarch64_expr.free_vars();
+        for leaf in ["recon_rbx_in", "recon_rcx_in"] {
+            assert!(
+                !source.iter().any(|v| v == leaf),
+                "{leaf} must not be read by the SOURCE side, or this check says nothing"
+            );
+            assert!(
+                machine.iter().any(|v| v == leaf),
+                "the reconstruction's machine side no longer reads the incoming {leaf}"
+            );
+        }
+        assert_eq!(ob.inputs.len(), 17, "base + 16 leaves (odd)");
+    }
+
+    #[test]
+    fn cmpxchg16b_load_dropped_high_limb_refutes() {
+        let (pre, cas, mut load) = real(0);
+        load.rdx_after = SmtExpr::bv_const(0, 64);
+        assert_refutes("RDX not read back", &obligation("rdx", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_load_swapped_limbs_refute() {
+        let (pre, cas, mut load) = real(0);
+        std::mem::swap(&mut load.rax_after, &mut load.rdx_after);
+        assert_refutes("RAX/RDX swapped", &obligation("limbs", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_load_wrong_address_refutes() {
+        let (pre, cas, _load) = real(0);
+        let wrong = pre.machine_ea.clone().bvadd(SmtExpr::bv_const(8, 64));
+        let load = load_effect(&pre, &wrong);
+        assert_refutes("load at ea+8", &obligation("lea", &pre, &cas, &load));
+    }
+
+    #[test]
+    fn cmpxchg16b_unsupported_shapes_fail_closed() {
+        // A base in one of the four implicit registers.
+        for fixed in [
+            trust_cg_ir::x86_64_regs::RAX,
+            trust_cg_ir::x86_64_regs::RBX,
+            trust_cg_ir::x86_64_regs::RCX,
+            trust_cg_ir::x86_64_regs::RDX,
+        ] {
+            let aliased = X86ISelInst::new(
+                X86Opcode::AtomicLoadCmpxchg16b,
+                vec![X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::PReg(fixed)),
+                    disp: 0,
+                }],
+            );
+            assert!(
+                reconstruct_x86_alu_obligation(&aliased).is_none(),
+                "a {fixed:?} base must fail closed"
+            );
+        }
+        // A register operand, a SIB operand, a second operand.
+        for operands in [
+            vec![r64(0)],
+            vec![X86ISelOperand::SibMemAddr {
+                base: Box::new(r64(0)),
+                index: Box::new(r64(1)),
+                scale: 1,
+                disp: 0,
+            }],
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(r64(0)),
+                    disp: 0,
+                },
+                r64(1),
+            ],
+        ] {
+            let bad = X86ISelInst::new(X86Opcode::AtomicLoadCmpxchg16b, operands);
+            assert!(
+                reconstruct_x86_alu_obligation(&bad).is_none(),
+                "{:?} must fail closed",
+                bad.operands
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The no-wrap BOUNDARY of the CMPXCHG frame windows. At the largest start the
+// preconditions admit, the window's EXCLUSIVE end `start + len` wraps to 0, so
+// a "probe is inside the window" test written as `probe <u end` was false for
+// every probe: a probe byte seeded over the cell or a neighbour was admitted,
+// and the obligation refuted a CORRECT model. The sampler found it for
+// CMPXCHG16B (a zero base at displacement -24 is exactly that start); the
+// narrow rows carried the same bound. Both now use the inclusive last byte.
+// These evaluate the obligation at the boundary point itself, so they do not
+// depend on the sampler reaching it.
+// ---------------------------------------------------------------------------
+
+mod wrap_boundary {
+    use super::*;
+    use trust_cg_verify::smt::EvalEnv;
+
+    /// `(preconditions admitted, both sides equal)` at one concrete point.
+    fn at(ob: &ProofObligation, point: &[(&str, u64)]) -> (bool, bool) {
+        let mut env = EvalEnv::default();
+        for (name, _) in &ob.inputs {
+            env.insert(name.clone(), 0);
+        }
+        for (name, value) in point {
+            assert!(
+                ob.inputs.iter().any(|(input, _)| input == name),
+                "{name} is not an input of {}",
+                ob.name
+            );
+            env.insert((*name).to_string(), *value);
+        }
+        let admitted = ob.preconditions.iter().all(|p| {
+            p.try_eval(&env)
+                .unwrap_or_else(|e| panic!("precondition does not evaluate: {e:?}"))
+                .as_bool()
+        });
+        let source = ob.trust_ir_expr.try_eval(&env).expect("source evaluates");
+        let machine = ob.aarch64_expr.try_eval(&env).expect("machine evaluates");
+        (admitted, source == machine)
+    }
+
+    /// The sampler's own counterexample for the CMPXCHG16B load pseudo at
+    /// displacement -24, verbatim: `ir_ea = 2^64 - 24` and the probe one byte
+    /// BELOW the cell (inside the lower neighbour). It must be excluded.
+    #[test]
+    fn cmpxchg16b_probe_precondition_holds_at_the_wrap_boundary() {
+        let inst = X86ISelInst::new(
+            X86Opcode::AtomicLoadCmpxchg16b,
+            vec![X86ISelOperand::MemAddr {
+                base: Box::new(r64(0)),
+                disp: -24,
+            }],
+        );
+        let ob = reconstruct_x86_alu_obligation(&inst).expect("reconstructs");
+        let m = u64::MAX - 1;
+        let (admitted, equal) = at(
+            &ob,
+            &[
+                ("recon_base", 0),
+                ("recon_old_lo", m),
+                ("recon_delta_lo", m),
+                ("recon_sel", 65534),
+                ("recon_desired_lo", m),
+                ("recon_below", m),
+                ("recon_probe_off", 65534),
+                ("recon_rax_in", m),
+                ("recon_rbx_in", m),
+            ],
+        );
+        assert!(
+            !equal,
+            "the point is a real frame violation (a probe inside the window)"
+        );
+        assert!(
+            !admitted,
+            "a probe inside the modeled window must be excluded at the wrap boundary"
+        );
+    }
+
+    /// The narrow CMPXCHG at its largest admitted start (`2^64 - 2` for the
+    /// byte form), with the probe ON the cell: excluded now, admitted before.
+    #[test]
+    fn cmpxchg_narrow_probe_precondition_holds_at_the_wrap_boundary() {
+        let inst = X86ISelInst::new(
+            X86Opcode::Cmpxchg8,
+            vec![
+                X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr32)),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(r64(1)),
+                    disp: 0,
+                },
+            ],
+        );
+        let ob = reconstruct_x86_alu_obligation(&inst).expect("reconstructs");
+        let (admitted, equal) = at(
+            &ob,
+            &[
+                ("recon_base", u64::MAX - 1),
+                ("recon_old", 1),
+                ("recon_probe_off", 0),
+                ("recon_probe_val", 2),
+            ],
+        );
+        assert!(!equal, "the probe is seeded over the cell");
+        assert!(
+            !admitted,
+            "a probe on the cell must be excluded at the wrap boundary"
         );
     }
 }

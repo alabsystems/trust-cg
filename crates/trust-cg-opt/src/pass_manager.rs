@@ -21,15 +21,17 @@
 //!     └── run_to_fixpoint(func, max_iters) → repeats until stable
 //! ```
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use trust_cg_ir::{MachFunction, MachOperand, ProvenanceMap};
+use trust_cg_ir::{BlockId, MachFunction, MachIdRefusal, MachOperand, ProvenanceMap};
 
 use crate::dom::DomTree;
 use crate::loops::LoopAnalysis;
+use crate::pass_validation::{
+    FunctionInterfaceDigest, PassValidationConfig, PassValidationHook, PassValidationSummary,
+};
 use crate::proof_opts::{OptCertificate, ProofOptimizationMetadata};
 
 /// Local result status for a certified pass run recorded by `trust-cg-opt`.
@@ -118,6 +120,7 @@ impl CertifiedPassRunRecord {
 }
 
 /// Lightweight observability for cached analysis reuse.
+/// Counters saturate at u32::MAX; they never authorize an analysis cache hit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AnalysisCacheStats {
     /// Number of dominator tree computations performed by this cache.
@@ -126,7 +129,7 @@ pub struct AnalysisCacheStats {
     pub loop_analysis_computations: u32,
     /// Changed passes whose CFG fingerprint stayed stable.
     pub cfg_preservations: u32,
-    /// Changed passes whose CFG fingerprint changed and invalidated analyses.
+    /// Invalidation requests from the driver or a stale graph detected at lookup.
     pub cfg_invalidations: u32,
 }
 
@@ -134,87 +137,127 @@ pub struct AnalysisCacheStats {
 ///
 /// Avoids redundant recomputation of dominator trees and loop analysis
 /// when multiple passes need them within a single fixpoint iteration.
-/// The cache is invalidated only when a changed pass also changes the CFG
-/// fingerprint; non-CFG rewrites preserve these analyses.
+/// Every lookup compares the exact graph inputs used by these analyses. A
+/// changed entry, layout, block domain, or predecessor/successor list invalidates
+/// both results, including direct reuse with another function. Non-CFG edits
+/// preserve them. Returned analyses are snapshots: callers must not assume an
+/// already-borrowed result updates when they subsequently mutate the function.
 pub struct AnalysisCache {
+    cfg: Option<AnalysisCfg>,
     domtree: Option<DomTree>,
     loop_analysis: Option<LoopAnalysis>,
     stats: AnalysisCacheStats,
+}
+
+/// Exact inputs read by DomTree and LoopAnalysis (not a digest or pointer key).
+/// Instruction data is deliberately absent: those analyses read CFG metadata,
+/// whose consistency with branch instructions is checked at other boundaries.
+struct AnalysisCfg {
+    entry: BlockId,
+    block_order: Vec<BlockId>,
+    blocks: Vec<(Vec<BlockId>, Vec<BlockId>)>,
+}
+
+impl AnalysisCfg {
+    fn capture(func: &MachFunction) -> Self {
+        Self {
+            entry: func.entry,
+            block_order: func.block_order.clone(),
+            blocks: func
+                .blocks
+                .iter()
+                .map(|block| (block.preds.to_vec(), block.succs.to_vec()))
+                .collect(),
+        }
+    }
+
+    fn matches(&self, func: &MachFunction) -> bool {
+        self.entry == func.entry
+            && self.block_order == func.block_order
+            && self.blocks.len() == func.blocks.len()
+            && self
+                .blocks
+                .iter()
+                .zip(func.blocks.iter())
+                .all(|((preds, succs), block)| {
+                    preds.as_slice() == block.preds.as_slice()
+                        && succs.as_slice() == block.succs.as_slice()
+                })
+    }
 }
 
 impl AnalysisCache {
     /// Create an empty analysis cache.
     pub fn new() -> Self {
         Self {
+            cfg: None,
             domtree: None,
             loop_analysis: None,
             stats: AnalysisCacheStats::default(),
         }
     }
 
+    fn ensure_current_cfg(&mut self, func: &MachFunction) {
+        if self.cfg.as_ref().is_some_and(|cfg| cfg.matches(func)) {
+            return;
+        }
+        if self.cfg.is_some() {
+            self.invalidate();
+        }
+        self.cfg = Some(AnalysisCfg::capture(func));
+    }
+
     /// Get the dominator tree, computing and caching it if necessary.
     pub fn domtree(&mut self, func: &MachFunction) -> &DomTree {
-        if self.domtree.is_none() {
-            self.domtree = Some(DomTree::compute(func));
-            self.stats.domtree_computations += 1;
-        }
-        self.domtree.as_ref().unwrap()
+        self.ensure_current_cfg(func);
+        self.domtree.get_or_insert_with(|| {
+            let dom = DomTree::compute(func);
+            self.stats.domtree_computations = self.stats.domtree_computations.saturating_add(1);
+            dom
+        })
     }
 
     /// Get the loop analysis, computing and caching it if necessary.
     /// This also ensures the dominator tree is cached.
     pub fn loop_analysis(&mut self, func: &MachFunction) -> &LoopAnalysis {
-        if self.loop_analysis.is_none() {
-            // Ensure domtree is computed first.
-            if self.domtree.is_none() {
-                self.domtree = Some(DomTree::compute(func));
-                self.stats.domtree_computations += 1;
-            }
-            let dom = self.domtree.as_ref().unwrap();
-            self.loop_analysis = Some(LoopAnalysis::compute(func, dom));
-            self.stats.loop_analysis_computations += 1;
-        }
-        self.loop_analysis.as_ref().unwrap()
+        self.domtree_and_loops(func).1
     }
 
-    /// Current cache reuse statistics.
     /// Both CFG analyses from one borrow, so a pass can hold the dominator
     /// tree and the loop analysis together while it mutates the function
     /// (the analyses belong to the cache, not to the function).
     pub fn domtree_and_loops(&mut self, func: &MachFunction) -> (&DomTree, &LoopAnalysis) {
-        // Fill each slot in place and hand back the reference the fill
-        // produces, so "both analyses are present" is carried by the data
-        // flow rather than re-checked with `unwrap`. Order and bookkeeping
-        // match `loop_analysis`: the dominator tree is computed first (loop
-        // analysis consumes it), and each slot is computed at most once per
-        // `invalidate` window, bumping its counter only when it is computed.
-        // The closures borrow `self.stats` while the slots are borrowed
-        // mutably; those are disjoint fields, so no aliasing is involved.
+        self.ensure_current_cfg(func);
+        // Loop analysis consumes this exact graph's dominator tree. Filling
+        // slots in place returns their references without a second lookup.
         let dom: &DomTree = self.domtree.get_or_insert_with(|| {
-            self.stats.domtree_computations += 1;
+            self.stats.domtree_computations = self.stats.domtree_computations.saturating_add(1);
             DomTree::compute(func)
         });
         let loops: &LoopAnalysis = self.loop_analysis.get_or_insert_with(|| {
-            self.stats.loop_analysis_computations += 1;
+            self.stats.loop_analysis_computations =
+                self.stats.loop_analysis_computations.saturating_add(1);
             LoopAnalysis::compute(func, dom)
         });
         (dom, loops)
     }
 
+    /// Current cache reuse statistics.
     pub fn stats(&self) -> AnalysisCacheStats {
         self.stats
     }
 
     /// Record that a changed pass preserved the CFG, so analyses remain valid.
     pub fn preserve_for_unchanged_cfg(&mut self) {
-        self.stats.cfg_preservations += 1;
+        self.stats.cfg_preservations = self.stats.cfg_preservations.saturating_add(1);
     }
 
     /// Invalidate all cached analyses. Called when a pass changes the CFG.
     pub fn invalidate(&mut self) {
+        self.cfg = None;
         self.domtree = None;
         self.loop_analysis = None;
-        self.stats.cfg_invalidations += 1;
+        self.stats.cfg_invalidations = self.stats.cfg_invalidations.saturating_add(1);
     }
 }
 
@@ -328,6 +371,11 @@ pub trait MachinePass {
 pub struct PassStats {
     /// Number of times each pass was run.
     pub runs: Vec<(String, u32)>,
+    /// Number of runs of each pass that reported a change, parallel to
+    /// [`PassStats::runs`] (same names, same order, zero when the pass never
+    /// changed the function). A pass absent from both lists was not
+    /// scheduled.
+    pub changed_runs: Vec<(String, u32)>,
     /// Total number of passes that reported changes.
     pub changes: u32,
     /// Number of fixed-point iterations.
@@ -345,22 +393,72 @@ pub struct PassStats {
     /// production caller must treat `Err` as a fatal compile error (parity with
     /// the x86 inline re-check).
     pub kernel_recheck: Result<(), String>,
+    /// L10-P5 identity admission verdict. Every driver re-derives the
+    /// function's live register/instruction/block/slot/jump-table IDs
+    /// ([`MachFunction::admit_id_counters`]) before the first pass and after
+    /// the last, and marks each pass entry so that the pass's first
+    /// allocation re-derives them before issuing any ID
+    /// ([`MachFunction::require_id_admission_before_allocation`]). It stops at
+    /// the first refusal and names where it happened: no allocator then issues
+    /// an ID inside a pass from a counter that was not re-derived after the
+    /// pass began. A production caller must treat `Err` as a fatal compile
+    /// error; no pass ran after the refused one.
+    pub id_admission: Result<(), MachIdRefusal>,
+    /// Per-pass translation-validation verdicts for this run
+    /// ([`crate::pass_validation`]). Empty when validation is off.
+    pub pass_validation: PassValidationSummary,
 }
 
 impl Default for PassStats {
     fn default() -> Self {
         Self {
             runs: Vec::new(),
+            changed_runs: Vec::new(),
             changes: 0,
             iterations: 0,
             proof_optimization_certificates: Vec::new(),
             certified_pass_runs: Vec::new(),
             kernel_recheck: Ok(()),
+            id_admission: Ok(()),
+            pass_validation: PassValidationSummary::default(),
         }
     }
 }
 
 impl PassStats {
+    /// Empty statistics for `passes`, every run and change count zero.
+    fn for_passes(
+        passes: &[Box<dyn MachinePass>],
+        iterations: u32,
+        validation: PassValidationConfig,
+    ) -> Self {
+        let names = || {
+            passes
+                .iter()
+                .map(|pass| (pass.name().to_string(), 0))
+                .collect()
+        };
+        Self {
+            runs: names(),
+            changed_runs: names(),
+            iterations,
+            pass_validation: PassValidationSummary::new(validation),
+            ..Self::default()
+        }
+    }
+
+    /// How many runs of the pass named `name` reported a change, or `None`
+    /// when no pass of that name was scheduled.
+    pub fn changed_run_count(&self, name: &str) -> Option<u32> {
+        let mut found = None;
+        for (pass, count) in &self.changed_runs {
+            if pass == name {
+                found = Some(found.unwrap_or(0) + count);
+            }
+        }
+        found
+    }
+
     /// Total number of individual pass executions across all iterations.
     ///
     /// For a single-iteration run this equals the number of registered passes.
@@ -377,6 +475,58 @@ impl PassStats {
     pub fn kernel_recheck(&self) -> Result<(), String> {
         self.kernel_recheck.clone()
     }
+
+    /// The L10-P5 identity-admission verdict for this run (see
+    /// [`PassStats::id_admission`]).
+    pub fn id_admission(&self) -> Result<(), MachIdRefusal> {
+        self.id_admission.clone()
+    }
+}
+
+/// L10-P5 admission before the first pass of a driver runs. The refusal names
+/// the entry of the pass that would have run first.
+fn admit_ids_at_entry(
+    func: &mut MachFunction,
+    passes: &[Box<dyn MachinePass>],
+) -> Result<(), MachIdRefusal> {
+    func.admit_id_counters_at(|| match passes.first() {
+        Some(pass) => format!("entry of pass `{}`", pass.name()),
+        None => "entry of an empty pass manager".to_string(),
+    })
+}
+
+/// L10-P5: the verdict of `pass`'s allocation-time admission. Its entry
+/// marked the function, so its first allocation re-derived every live
+/// identity; a refusal there is sticky and is reported here, at the pass's
+/// exit, before anything else reads the function.
+fn admitted_pass_allocations(
+    func: &MachFunction,
+    pass: &dyn MachinePass,
+    iteration: u32,
+) -> Result<(), MachIdRefusal> {
+    match func.id_admission_refusal() {
+        None => Ok(()),
+        Some(error) => Err(MachIdRefusal {
+            function: func.name.clone(),
+            boundary: format!(
+                "the first allocation in pass `{}` (iteration {iteration})",
+                pass.name()
+            ),
+            error,
+        }),
+    }
+}
+
+/// L10-P5 admission after the last pass of a driver ran: the function leaves
+/// the pass manager re-derived, whichever passes allocated.
+fn admit_ids_at_exit(
+    func: &mut MachFunction,
+    last: Option<&dyn MachinePass>,
+) -> Result<(), MachIdRefusal> {
+    func.admit_id_counters_at(|| match last {
+        Some(pass) => format!("pass-manager exit (after pass `{}`)", pass.name()),
+        None => "pass-manager exit".to_string(),
+    })
 }
 
 /// Manages and executes a pipeline of optimization passes.
@@ -386,7 +536,35 @@ impl PassStats {
 pub struct PassManager {
     passes: Vec<Box<dyn MachinePass>>,
     proof_optimization_metadata: ProofOptimizationMetadata,
+    boundary_observer: Option<PassBoundaryObserver>,
+    validation: PassValidationConfig,
+    /// Record a [`crate::pass_validation::PassTransition`] for every run that
+    /// changes the function's interface.
+    transitions: Option<FunctionInterfaceDigest>,
 }
+
+/// A boundary the pass manager admitted (L10-P5), as reported to a
+/// [`PassBoundaryObserver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassBoundary<'a> {
+    /// Before the first pass, after the entry admission.
+    Entry,
+    /// After `pass` ran in `iteration` (1-based) and its allocations were
+    /// admitted.
+    AfterPass {
+        /// The pass's name.
+        pass: &'a str,
+        /// The fixpoint iteration (1 for the single-run drivers).
+        iteration: u32,
+    },
+    /// After the last pass, after the exit admission.
+    Exit,
+}
+
+/// Read-only observer of every boundary a driver admitted: an audit and test
+/// hook (the identity-freshness property tests use it). It runs only on
+/// admitted boundaries and cannot change the function.
+pub type PassBoundaryObserver = Box<dyn FnMut(&MachFunction, PassBoundary<'_>)>;
 
 fn should_time_passes() -> bool {
     // Cached once: the env var is read a single time for the process lifetime, so
@@ -410,8 +588,14 @@ fn function_shape(func: &MachFunction) -> (usize, usize) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CfgFingerprint(u64);
 
+/// Digest of the function's CFG shape.
+///
+/// The digest is only a hint for when the driver drops cached analyses eagerly:
+/// [`AnalysisCache`] compares the exact graph inputs on every lookup, so a
+/// spurious match or mismatch changes cache statistics, never an analysis.
+/// That is why a fast non-cryptographic hasher is enough.
 fn cfg_fingerprint(func: &MachFunction) -> CfgFingerprint {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = crate::fast_hash::FxHasher::default();
 
     func.entry.hash(&mut hasher);
     func.block_order.hash(&mut hasher);
@@ -434,7 +618,13 @@ fn cfg_terminators_hash<H: Hasher>(
 ) {
     let mut count = 0usize;
     for &inst_id in insts {
-        let inst = func.inst(inst_id);
+        // A block naming an instruction past the arena is a function the
+        // L10-P5 admission refuses by name; hashing a marker keeps this
+        // fingerprint from panicking first.
+        let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+            u32::MAX.hash(state);
+            continue;
+        };
         if !inst.is_branch() && !inst.is_terminator() {
             continue;
         }
@@ -465,8 +655,9 @@ fn cfg_terminators_hash<H: Hasher>(
 /// The cached value is valid across a pass that reported `changed = false`
 /// because such a pass did not mutate the function — the same contract the
 /// eager scheme relied on, since the before-fingerprint was only ever consulted
-/// for passes that reported `changed = true`. A pass that mutates while
-/// reporting false corrupts the analysis cache under EITHER scheme.
+/// for passes that reported `changed = true`. A false unchanged report can
+/// leave this driver's fingerprint stale; analysis accessors independently
+/// compare the exact graph before returning cached results.
 fn update_cache_after_changed_pass(
     func: &MachFunction,
     cache: &mut AnalysisCache,
@@ -646,7 +837,44 @@ impl PassManager {
         Self {
             passes: Vec::new(),
             proof_optimization_metadata: ProofOptimizationMetadata::new(),
+            boundary_observer: None,
+            validation: PassValidationConfig::off(),
+            transitions: None,
         }
+    }
+
+    /// Validate every pass run under `config` ([`crate::pass_validation`]).
+    /// The verdicts land in [`PassStats::pass_validation`]. A new pass
+    /// manager validates nothing.
+    pub fn set_pass_validation(&mut self, config: PassValidationConfig) {
+        self.validation = config;
+    }
+
+    /// Validate every pass run under `config` (builder pattern).
+    pub fn with_pass_validation(mut self, config: PassValidationConfig) -> Self {
+        self.set_pass_validation(config);
+        self
+    }
+
+    /// Record every run that changes the function's interface under
+    /// `digest` in [`PassValidationSummary::transitions`], validating each for
+    /// the record ([`crate::pass_validation`]'s transitions); `None` records
+    /// none.
+    pub fn set_transition_digest(&mut self, digest: Option<FunctionInterfaceDigest>) {
+        self.transitions = digest;
+    }
+
+    /// Report every admitted boundary of later runs to `observer` (builder
+    /// pattern).
+    pub fn with_boundary_observer(mut self, observer: PassBoundaryObserver) -> Self {
+        self.boundary_observer = Some(observer);
+        self
+    }
+
+    /// Take the registered passes in pipeline order, e.g. to drive one pass
+    /// of a built pipeline on its own.
+    pub fn into_passes(self) -> Vec<Box<dyn MachinePass>> {
+        self.passes
     }
 
     /// Add a pass to the end of the pipeline.
@@ -688,32 +916,72 @@ impl PassManager {
 
     /// Run all passes once in order.
     ///
-    /// Returns `true` if any pass modified the function.
-    pub fn run_once(&mut self, func: &mut MachFunction) -> bool {
+    /// Returns whether any pass modified the function, or the first refused
+    /// L10-P5 identity admission (no pass runs after it).
+    pub fn run_once(&mut self, func: &mut MachFunction) -> Result<bool, MachIdRefusal> {
+        admit_ids_at_entry(func, &self.passes)?;
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Entry);
+        }
         let mut changed = false;
         for pass in &mut self.passes {
+            func.require_id_admission_before_allocation();
             if pass.run(func) {
                 changed = true;
             }
+            admitted_pass_allocations(func, pass.as_ref(), 1)?;
+            if let Some(observe) = self.boundary_observer.as_mut() {
+                observe(
+                    func,
+                    PassBoundary::AfterPass {
+                        pass: pass.name(),
+                        iteration: 1,
+                    },
+                );
+            }
         }
-        changed
+        admit_ids_at_exit(func, self.passes.last().map(|pass| pass.as_ref()))?;
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Exit);
+        }
+        Ok(changed)
     }
 
     /// Run all passes once with access to a provenance map.
     ///
-    /// Returns `true` if any pass modified the function.
+    /// Returns whether any pass modified the function, or the first refused
+    /// L10-P5 identity admission (no pass runs after it).
     pub fn run_once_with_provenance(
         &mut self,
         func: &mut MachFunction,
         provenance: &mut ProvenanceMap,
-    ) -> bool {
+    ) -> Result<bool, MachIdRefusal> {
+        admit_ids_at_entry(func, &self.passes)?;
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Entry);
+        }
         let mut changed = false;
         for pass in &mut self.passes {
+            func.require_id_admission_before_allocation();
             if pass.run_with_provenance(func, provenance) {
                 changed = true;
             }
+            admitted_pass_allocations(func, pass.as_ref(), 1)?;
+            if let Some(observe) = self.boundary_observer.as_mut() {
+                observe(
+                    func,
+                    PassBoundary::AfterPass {
+                        pass: pass.name(),
+                        iteration: 1,
+                    },
+                );
+            }
         }
-        changed
+        admit_ids_at_exit(func, self.passes.last().map(|pass| pass.as_ref()))?;
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Exit);
+        }
+        Ok(changed)
     }
 
     /// Run all passes repeatedly until no pass reports changes, or
@@ -725,18 +993,17 @@ impl PassManager {
     ///
     /// Returns statistics about the run.
     pub fn run_to_fixpoint(&mut self, func: &mut MachFunction, max_iterations: u32) -> PassStats {
-        let mut stats = PassStats {
-            runs: self
-                .passes
-                .iter()
-                .map(|p| (p.name().to_string(), 0))
-                .collect(),
-            changes: 0,
-            iterations: 0,
-            proof_optimization_certificates: Vec::new(),
-            certified_pass_runs: Vec::new(),
-            kernel_recheck: Ok(()),
-        };
+        let mut stats = PassStats::for_passes(&self.passes, 0, self.validation);
+        let mut validation =
+            PassValidationHook::new(self.validation).with_transitions(self.transitions);
+        // L10-P5: refuse a stale counter before anything indexes the arenas.
+        if let Err(refusal) = admit_ids_at_entry(func, &self.passes) {
+            stats.id_admission = Err(refusal);
+            return stats;
+        }
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Entry);
+        }
 
         let should_dump = should_dump_mir(func);
         if should_dump {
@@ -757,6 +1024,8 @@ impl PassManager {
         // over the corpus already enforces for every change this session.
         let mut mutation_epoch: u64 = 0;
         let mut nochange_epoch: Vec<Option<u64>> = vec![None; self.passes.len()];
+        // The pass that ran last, named by the exit admission.
+        let mut last_run: Option<usize> = None;
         // Every label consumer is env-gated and off by default; see `pass_labels`.
         // The TCG_DIAG_CHANGED path prints `pass_name` too, so it counts as a
         // consumer here.
@@ -796,9 +1065,35 @@ impl PassManager {
                 // on 2026-08-13 (zero false claims — the tail is genuine
                 // progressive enabling), kept for the next suspect.
                 let diag_pre = diag_changed_enabled().then(|| format!("{func:?}"));
+                let snapshot = validation.snapshot(pass.name(), func);
                 let timer = log_pass_start(func, iteration + 1, &pass_name);
+                func.require_id_admission_before_allocation();
                 let pass_changed = pass.run_with_analyses(func, &mut cache);
                 log_pass_end(func, iteration + 1, &pass_name, pass_changed, timer);
+                last_run = Some(i);
+                // L10-P5: before the pass validator, the CFG fingerprint or any
+                // dump reads it.
+                if let Err(refusal) = admitted_pass_allocations(func, pass.as_ref(), iteration + 1)
+                {
+                    stats.id_admission = Err(refusal);
+                    return stats;
+                }
+                validation.conclude(
+                    pass.name(),
+                    snapshot,
+                    pass_changed,
+                    func,
+                    &mut stats.pass_validation,
+                );
+                if let Some(observe) = self.boundary_observer.as_mut() {
+                    observe(
+                        func,
+                        PassBoundary::AfterPass {
+                            pass: pass.name(),
+                            iteration: iteration + 1,
+                        },
+                    );
+                }
                 if let Some(pre) = diag_pre {
                     let post = format!("{func:?}");
                     if pass_changed && pre == post {
@@ -830,6 +1125,7 @@ impl PassManager {
                 if pass_changed {
                     any_changed = true;
                     stats.changes += 1;
+                    stats.changed_runs[i].1 += 1;
                     mutation_epoch += 1;
                     // The pass has not seen its own output; leave it eligible.
                     nochange_epoch[i] = None;
@@ -855,6 +1151,13 @@ impl PassManager {
             }
         }
 
+        let last = last_run.map(|index| self.passes[index].as_ref());
+        stats.id_admission = admit_ids_at_exit(func, last);
+        if stats.id_admission.is_ok()
+            && let Some(observe) = self.boundary_observer.as_mut()
+        {
+            observe(func, PassBoundary::Exit);
+        }
         stats
     }
 
@@ -869,18 +1172,17 @@ impl PassManager {
         provenance: &mut ProvenanceMap,
         max_iterations: u32,
     ) -> PassStats {
-        let mut stats = PassStats {
-            runs: self
-                .passes
-                .iter()
-                .map(|p| (p.name().to_string(), 0))
-                .collect(),
-            changes: 0,
-            iterations: 0,
-            proof_optimization_certificates: Vec::new(),
-            certified_pass_runs: Vec::new(),
-            kernel_recheck: Ok(()),
-        };
+        let mut stats = PassStats::for_passes(&self.passes, 0, self.validation);
+        let mut validation =
+            PassValidationHook::new(self.validation).with_transitions(self.transitions);
+        // L10-P5: refuse a stale counter before anything indexes the arenas.
+        if let Err(refusal) = admit_ids_at_entry(func, &self.passes) {
+            stats.id_admission = Err(refusal);
+            return stats;
+        }
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Entry);
+        }
 
         let should_dump = should_dump_mir(func);
         if should_dump {
@@ -901,6 +1203,8 @@ impl PassManager {
         // over the corpus already enforces for every change this session.
         let mut mutation_epoch: u64 = 0;
         let mut nochange_epoch: Vec<Option<u64>> = vec![None; self.passes.len()];
+        // The pass that ran last, named by the exit admission.
+        let mut last_run: Option<usize> = None;
         // Every label consumer is env-gated and off by default; see `pass_labels`.
         let want_labels = should_time_passes() || should_dump;
 
@@ -923,10 +1227,34 @@ impl PassManager {
                 stats.runs[i].1 += 1;
                 let (pass_name, bk_name) = pass_labels(pass.as_ref(), want_labels);
                 let before_cfg = current_cfg;
+                let snapshot = validation.snapshot(pass.name(), func);
                 let timer = log_pass_start(func, iteration + 1, &pass_name);
+                func.require_id_admission_before_allocation();
                 let pass_changed =
                     pass.run_with_analyses_and_provenance(func, &mut cache, provenance);
                 log_pass_end(func, iteration + 1, &pass_name, pass_changed, timer);
+                last_run = Some(i);
+                if let Err(refusal) = admitted_pass_allocations(func, pass.as_ref(), iteration + 1)
+                {
+                    stats.id_admission = Err(refusal);
+                    return stats;
+                }
+                validation.conclude(
+                    pass.name(),
+                    snapshot,
+                    pass_changed,
+                    func,
+                    &mut stats.pass_validation,
+                );
+                if let Some(observe) = self.boundary_observer.as_mut() {
+                    observe(
+                        func,
+                        PassBoundary::AfterPass {
+                            pass: pass.name(),
+                            iteration: iteration + 1,
+                        },
+                    );
+                }
                 let bk = log_pass_start(func, iteration + 1, &bk_name);
                 collect_proof_optimization_certificates(&mut stats, pass.as_mut());
                 collect_certified_pass_runs(&mut stats, pass.as_mut());
@@ -935,6 +1263,7 @@ impl PassManager {
                 if pass_changed {
                     any_changed = true;
                     stats.changes += 1;
+                    stats.changed_runs[i].1 += 1;
                     mutation_epoch += 1;
                     // The pass has not seen its own output; leave it eligible.
                     nochange_epoch[i] = None;
@@ -960,6 +1289,13 @@ impl PassManager {
             }
         }
 
+        let last = last_run.map(|index| self.passes[index].as_ref());
+        stats.id_admission = admit_ids_at_exit(func, last);
+        if stats.id_admission.is_ok()
+            && let Some(observe) = self.boundary_observer.as_mut()
+        {
+            observe(func, PassBoundary::Exit);
+        }
         stats
     }
 
@@ -968,18 +1304,17 @@ impl PassManager {
     /// Uses an [`AnalysisCache`] to avoid redundant domtree/loop analysis
     /// recomputation across passes.
     pub fn run_once_with_stats(&mut self, func: &mut MachFunction) -> PassStats {
-        let mut stats = PassStats {
-            runs: self
-                .passes
-                .iter()
-                .map(|p| (p.name().to_string(), 0))
-                .collect(),
-            changes: 0,
-            iterations: 1,
-            proof_optimization_certificates: Vec::new(),
-            certified_pass_runs: Vec::new(),
-            kernel_recheck: Ok(()),
-        };
+        let mut stats = PassStats::for_passes(&self.passes, 1, self.validation);
+        let mut validation =
+            PassValidationHook::new(self.validation).with_transitions(self.transitions);
+        // L10-P5: refuse a stale counter before anything indexes the arenas.
+        if let Err(refusal) = admit_ids_at_entry(func, &self.passes) {
+            stats.id_admission = Err(refusal);
+            return stats;
+        }
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Entry);
+        }
 
         let should_dump = should_dump_mir(func);
         if should_dump {
@@ -997,9 +1332,31 @@ impl PassManager {
             stats.runs[i].1 = 1;
             let (pass_name, bk_name) = pass_labels(pass.as_ref(), want_labels);
             let before_cfg = current_cfg;
+            let snapshot = validation.snapshot(pass.name(), func);
             let timer = log_pass_start(func, 1, &pass_name);
+            func.require_id_admission_before_allocation();
             let pass_changed = pass.run_with_analyses(func, &mut cache);
             log_pass_end(func, 1, &pass_name, pass_changed, timer);
+            if let Err(refusal) = admitted_pass_allocations(func, pass.as_ref(), 1) {
+                stats.id_admission = Err(refusal);
+                return stats;
+            }
+            validation.conclude(
+                pass.name(),
+                snapshot,
+                pass_changed,
+                func,
+                &mut stats.pass_validation,
+            );
+            if let Some(observe) = self.boundary_observer.as_mut() {
+                observe(
+                    func,
+                    PassBoundary::AfterPass {
+                        pass: pass.name(),
+                        iteration: 1,
+                    },
+                );
+            }
             let bk = log_pass_start(func, 1, &bk_name);
             collect_proof_optimization_certificates(&mut stats, pass.as_mut());
             collect_certified_pass_runs(&mut stats, pass.as_mut());
@@ -1007,6 +1364,7 @@ impl PassManager {
             log_pass_end(func, 1, &bk_name, false, bk);
             if pass_changed {
                 stats.changes += 1;
+                stats.changed_runs[i].1 += 1;
                 current_cfg = update_cache_after_changed_pass(func, &mut cache, before_cfg);
                 if should_dump {
                     eprintln!("=== after pass [{}] ===", pass_name);
@@ -1017,6 +1375,13 @@ impl PassManager {
             }
         }
 
+        let last = self.passes.last().map(|pass| pass.as_ref());
+        stats.id_admission = admit_ids_at_exit(func, last);
+        if stats.id_admission.is_ok()
+            && let Some(observe) = self.boundary_observer.as_mut()
+        {
+            observe(func, PassBoundary::Exit);
+        }
         stats
     }
 
@@ -1029,18 +1394,17 @@ impl PassManager {
         func: &mut MachFunction,
         provenance: &mut ProvenanceMap,
     ) -> PassStats {
-        let mut stats = PassStats {
-            runs: self
-                .passes
-                .iter()
-                .map(|p| (p.name().to_string(), 0))
-                .collect(),
-            changes: 0,
-            iterations: 1,
-            proof_optimization_certificates: Vec::new(),
-            certified_pass_runs: Vec::new(),
-            kernel_recheck: Ok(()),
-        };
+        let mut stats = PassStats::for_passes(&self.passes, 1, self.validation);
+        let mut validation =
+            PassValidationHook::new(self.validation).with_transitions(self.transitions);
+        // L10-P5: refuse a stale counter before anything indexes the arenas.
+        if let Err(refusal) = admit_ids_at_entry(func, &self.passes) {
+            stats.id_admission = Err(refusal);
+            return stats;
+        }
+        if let Some(observe) = self.boundary_observer.as_mut() {
+            observe(func, PassBoundary::Entry);
+        }
 
         let should_dump = should_dump_mir(func);
         if should_dump {
@@ -1058,9 +1422,31 @@ impl PassManager {
             stats.runs[i].1 = 1;
             let (pass_name, bk_name) = pass_labels(pass.as_ref(), want_labels);
             let before_cfg = current_cfg;
+            let snapshot = validation.snapshot(pass.name(), func);
             let timer = log_pass_start(func, 1, &pass_name);
+            func.require_id_admission_before_allocation();
             let pass_changed = pass.run_with_analyses_and_provenance(func, &mut cache, provenance);
             log_pass_end(func, 1, &pass_name, pass_changed, timer);
+            if let Err(refusal) = admitted_pass_allocations(func, pass.as_ref(), 1) {
+                stats.id_admission = Err(refusal);
+                return stats;
+            }
+            validation.conclude(
+                pass.name(),
+                snapshot,
+                pass_changed,
+                func,
+                &mut stats.pass_validation,
+            );
+            if let Some(observe) = self.boundary_observer.as_mut() {
+                observe(
+                    func,
+                    PassBoundary::AfterPass {
+                        pass: pass.name(),
+                        iteration: 1,
+                    },
+                );
+            }
             let bk = log_pass_start(func, 1, &bk_name);
             collect_proof_optimization_certificates(&mut stats, pass.as_mut());
             collect_certified_pass_runs(&mut stats, pass.as_mut());
@@ -1068,6 +1454,7 @@ impl PassManager {
             log_pass_end(func, 1, &bk_name, false, bk);
             if pass_changed {
                 stats.changes += 1;
+                stats.changed_runs[i].1 += 1;
                 current_cfg = update_cache_after_changed_pass(func, &mut cache, before_cfg);
                 if should_dump {
                     eprintln!("=== after pass [{}] ===", pass_name);
@@ -1078,6 +1465,13 @@ impl PassManager {
             }
         }
 
+        let last = self.passes.last().map(|pass| pass.as_ref());
+        stats.id_admission = admit_ids_at_exit(func, last);
+        if stats.id_admission.is_ok()
+            && let Some(observe) = self.boundary_observer.as_mut()
+        {
+            observe(func, PassBoundary::Exit);
+        }
         stats
     }
 }
@@ -1335,7 +1729,7 @@ mod tests {
     fn test_empty_pass_manager() {
         let mut pm = PassManager::new();
         let mut func = make_empty_func();
-        assert!(!pm.run_once(&mut func));
+        assert_eq!(pm.run_once(&mut func), Ok(false));
     }
 
     #[test]
@@ -1343,7 +1737,7 @@ mod tests {
         let mut pm = PassManager::new();
         pm.add_pass(Box::new(NoOpPass));
         let mut func = make_empty_func();
-        assert!(!pm.run_once(&mut func));
+        assert_eq!(pm.run_once(&mut func), Ok(false));
     }
 
     #[test]
@@ -1356,6 +1750,52 @@ mod tests {
         // Should run 4 iterations: 3 with changes + 1 that detects fixpoint
         assert_eq!(stats.iterations, 4);
         assert_eq!(stats.changes, 3);
+    }
+
+    /// `changed_runs` counts, per pass and in `runs` order, the runs that
+    /// reported a change, in every driver; `changed_run_count` separates a
+    /// scheduled pass that never changed (`Some(0)`) from an unscheduled one
+    /// (`None`).
+    #[test]
+    fn changed_runs_count_each_pass_in_every_driver() {
+        fn manager() -> PassManager {
+            PassManager::new()
+                .with_pass(Box::new(NoOpPass))
+                .with_pass(Box::new(CountingPass { remaining: 2 }))
+        }
+        let expected_once = vec![("no-op".to_string(), 0), ("counting".to_string(), 1)];
+        let expected_fixpoint = vec![("no-op".to_string(), 0), ("counting".to_string(), 2)];
+
+        let stats = manager().run_once_with_stats(&mut make_empty_func());
+        assert_eq!(stats.changed_runs, expected_once);
+        let mut provenance = ProvenanceMap::new();
+        let stats =
+            manager().run_once_with_stats_and_provenance(&mut make_empty_func(), &mut provenance);
+        assert_eq!(stats.changed_runs, expected_once);
+
+        let stats = manager().run_to_fixpoint(&mut make_empty_func(), 10);
+        assert_eq!(stats.changed_runs, expected_fixpoint);
+        assert_eq!(stats.changes, 2);
+        let mut provenance = ProvenanceMap::new();
+        let stats =
+            manager().run_to_fixpoint_with_provenance(&mut make_empty_func(), &mut provenance, 10);
+        assert_eq!(stats.changed_runs, expected_fixpoint);
+
+        assert_eq!(stats.changed_run_count("counting"), Some(2));
+        assert_eq!(stats.changed_run_count("no-op"), Some(0));
+        assert_eq!(stats.changed_run_count("absent"), None);
+        assert_eq!(
+            stats
+                .runs
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            stats
+                .changed_runs
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1385,7 +1825,10 @@ mod tests {
         let mut provenance = ProvenanceMap::new();
         provenance.record_lowering(TrustIrInstId(0), &[InstId(0)], PassId::new("isel"));
 
-        assert!(pm.run_once_with_provenance(&mut func, &mut provenance));
+        assert_eq!(
+            pm.run_once_with_provenance(&mut func, &mut provenance),
+            Ok(true)
+        );
 
         let entry = provenance.get_entry(InstId(0)).unwrap();
         assert_eq!(
@@ -1426,6 +1869,8 @@ mod tests {
         let mut pm = PassManager::new().with_pass(Box::new(ProofOptimization::new()));
         let mut func = make_no_overflow_func();
 
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = pm.run_once_with_stats(&mut func);
 
         assert_eq!(stats.changes, 1);
@@ -1457,6 +1902,150 @@ mod tests {
     }
 
     #[test]
+    fn analysis_cache_refreshes_dominators_for_another_function() {
+        let (first, _, entry, old_target, new_target) = make_redirectable_branch_func();
+        let (mut second, branch, _, _, _) = make_redirectable_branch_func();
+        let mut cache = AnalysisCache::new();
+        assert!(cache.loop_analysis(&first).is_empty());
+        assert_eq!(cache.domtree(&first).idom(old_target), Some(entry));
+        assert_eq!(cache.domtree(&first).idom(new_target), None);
+        assert!(
+            BranchRedirectPass {
+                branch,
+                from: entry,
+                old_target,
+                new_target
+            }
+            .run(&mut second)
+        );
+        assert_eq!(cache.domtree(&second).idom(new_target), Some(entry));
+        assert_eq!(cache.domtree(&second).idom(old_target), None);
+        assert!(cache.loop_analysis(&second).is_empty());
+        assert_eq!(cache.stats().domtree_computations, 2);
+        assert_eq!(cache.stats().loop_analysis_computations, 2);
+        assert_eq!(cache.stats().cfg_invalidations, 1);
+    }
+
+    #[test]
+    fn analysis_cache_refreshes_loops_after_direct_cfg_mutation() {
+        let (mut func, _, _, target, _) = make_redirectable_branch_func();
+        let mut cache = AnalysisCache::new();
+        assert!(cache.loop_analysis(&func).is_empty());
+        add_analysis_self_loop(&mut func, target);
+        assert!(!cache.loop_analysis(&func).is_empty());
+        assert_eq!(cache.stats().domtree_computations, 2);
+        assert_eq!(cache.stats().loop_analysis_computations, 2);
+        assert_eq!(cache.stats().cfg_invalidations, 1);
+    }
+
+    #[test]
+    fn analysis_cache_paired_accessor_refreshes_both_results() {
+        let (mut func, branch, entry, old_target, new_target) = make_redirectable_branch_func();
+        let mut cache = AnalysisCache::new();
+        let (dom, loops) = cache.domtree_and_loops(&func);
+        assert_eq!(dom.idom(old_target), Some(entry));
+        assert!(loops.is_empty());
+        assert!(
+            BranchRedirectPass {
+                branch,
+                from: entry,
+                old_target,
+                new_target
+            }
+            .run(&mut func)
+        );
+        add_analysis_self_loop(&mut func, new_target);
+        let (dom, loops) = cache.domtree_and_loops(&func);
+        assert_eq!(dom.idom(new_target), Some(entry));
+        assert_eq!(dom.idom(old_target), None);
+        assert!(!loops.is_empty());
+        assert_eq!(cache.stats().domtree_computations, 2);
+        assert_eq!(cache.stats().loop_analysis_computations, 2);
+    }
+
+    #[test]
+    fn analysis_cache_keeps_results_for_non_cfg_edits() {
+        let (mut func, add) = make_analysis_func();
+        let mut cache = AnalysisCache::new();
+        cache.domtree_and_loops(&func);
+        func.name = "same graph, different name".into();
+        func.inst_mut(add).operands[2] = imm(99);
+        cache.domtree_and_loops(&func);
+        assert_eq!(
+            cache.stats(),
+            AnalysisCacheStats {
+                domtree_computations: 1,
+                loop_analysis_computations: 1,
+                cfg_preservations: 0,
+                cfg_invalidations: 0,
+            }
+        );
+    }
+
+    fn add_analysis_self_loop(func: &mut MachFunction, block: BlockId) {
+        let terminator = *func.block(block).insts.last().unwrap();
+        *func.inst_mut(terminator) =
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(block)]);
+        func.add_edge(block, block);
+    }
+
+    #[test]
+    fn analysis_cache_key_compares_every_graph_input_exactly() {
+        let (func, _, entry, target, _) = make_redirectable_branch_func();
+        let snapshot = AnalysisCfg::capture(&func);
+        assert!(snapshot.matches(&func));
+        for changed_field in 0..5 {
+            let mut changed = func.clone();
+            match changed_field {
+                0 => changed.entry = target,
+                1 => changed.block_order.reverse(),
+                2 => {
+                    changed.create_block();
+                }
+                3 => changed.block_mut(target).preds.clear(),
+                4 => changed.block_mut(entry).succs.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !snapshot.matches(&changed),
+                "unbound graph field {changed_field}"
+            );
+        }
+    }
+
+    #[test]
+    fn analysis_cache_explicit_invalidation_clears_the_graph_binding() {
+        let (func, _) = make_analysis_func();
+        let mut cache = AnalysisCache::new();
+        cache.domtree_and_loops(&func);
+        cache.invalidate();
+        assert!(cache.cfg.is_none());
+        cache.domtree_and_loops(&func);
+        assert_eq!(cache.stats().domtree_computations, 2);
+        assert_eq!(cache.stats().loop_analysis_computations, 2);
+        assert_eq!(cache.stats().cfg_invalidations, 1);
+    }
+
+    #[test]
+    fn analysis_cache_statistics_saturate() {
+        let (func, _) = make_analysis_func();
+        let mut cache = AnalysisCache::new();
+        let full = AnalysisCacheStats {
+            domtree_computations: u32::MAX,
+            loop_analysis_computations: u32::MAX,
+            cfg_preservations: u32::MAX,
+            cfg_invalidations: u32::MAX,
+        };
+        cache.stats = full;
+        cache.domtree_and_loops(&func);
+        cache.preserve_for_unchanged_cfg();
+        cache.invalidate();
+        cache.domtree(&func);
+        cache.loop_analysis(&func);
+        assert_eq!(cache.stats(), full);
+    }
+
+    #[test]
     fn test_analysis_cache_preserved_for_non_cfg_change() {
         let (mut func, add) = make_analysis_func();
         let samples = Rc::new(RefCell::new(Vec::new()));
@@ -1469,6 +2058,8 @@ mod tests {
                 samples: Rc::clone(&samples),
             }));
 
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = pm.run_once_with_stats(&mut func);
 
         assert_eq!(stats.changes, 1);
@@ -1633,6 +2224,8 @@ mod tests {
         pass.enable_kernel_gate(evidence, obligations);
 
         let mut pm = PassManager::new().with_pass(Box::new(pass));
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = pm.run_to_fixpoint(&mut func, 4);
 
         // The carrier was eliminated (guard removed; ldr + ret remain) ...

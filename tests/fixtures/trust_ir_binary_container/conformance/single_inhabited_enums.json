@@ -1,0 +1,118 @@
+{
+  "name": "single_inhabited_enums",
+  "functions": [],
+  "structs": [],
+  "enums": [
+    {
+      "id": 0,
+      "name": "NominalVoid",
+      "variants": [],
+      "discriminants": [],
+      "repr": null,
+      "layout": null
+    },
+    {
+      "id": 1,
+      "name": "Selected0",
+      "variants": [
+        {
+          "name": "Value",
+          "fields": [
+            "U32"
+          ],
+          "field_names": []
+        },
+        {
+          "name": "Absent",
+          "fields": [
+            {
+              "Enum": 0
+            }
+          ],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        7,
+        23
+      ],
+      "repr": null,
+      "layout": {
+        "encoding": {
+          "SingleInhabited": {
+            "variant": 0
+          }
+        },
+        "size": 4,
+        "align": 4,
+        "variant_field_offsets": [
+          [
+            0
+          ],
+          []
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "name": "Selected1",
+      "variants": [
+        {
+          "name": "Absent",
+          "fields": [
+            {
+              "Enum": 0
+            }
+          ],
+          "field_names": []
+        },
+        {
+          "name": "Value",
+          "fields": [
+            "U32"
+          ],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        7,
+        23
+      ],
+      "repr": null,
+      "layout": {
+        "encoding": {
+          "SingleInhabited": {
+            "variant": 1
+          }
+        },
+        "size": 4,
+        "align": 4,
+        "variant_field_offsets": [
+          [],
+          [
+            0
+          ]
+        ]
+      }
+    }
+  ],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

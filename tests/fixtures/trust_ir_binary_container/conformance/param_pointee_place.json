@@ -1,0 +1,406 @@
+{
+  "name": "param_pointee_place",
+  "functions": [
+    {
+      "id": 0,
+      "name": "bump",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Ref": "U64"
+              }
+            ],
+            [
+              1,
+              {
+                "RefMut": "U64"
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Load": {
+                  "ty": "U64",
+                  "ptr": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U64",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "U64",
+                  "lhs": 2,
+                  "rhs": 3
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": "U64",
+                  "ptr": 1,
+                  "value": 4,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "U64",
+                  "ptr": 0,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    5
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [
+          {
+            "schema": "smtlib2",
+            "payload": "(bvult p_entry limit)",
+            "smtlib": "(bvult p_entry limit)",
+            "sort": "Bool",
+            "bindings": [
+              [
+                "p_entry",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "ParamPointeeEntry": {
+                      "index": 1
+                    }
+                  }
+                }
+              ],
+              [
+                "limit",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "ParamPointeeEntry": {
+                      "index": 0
+                    }
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "ensures": [
+          {
+            "schema": "smtlib2",
+            "payload": "(and (= p_exit (bvadd p_entry #x0000000000000001)) (= result limit))",
+            "smtlib": "(and (= p_exit (bvadd p_entry #x0000000000000001)) (= result limit))",
+            "sort": "Bool",
+            "bindings": [
+              [
+                "p_exit",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "MutParamExit": {
+                      "index": 1
+                    }
+                  }
+                }
+              ],
+              [
+                "p_entry",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "ParamPointeeEntry": {
+                      "index": 1
+                    }
+                  }
+                }
+              ],
+              [
+                "result",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "ResultSlot": {
+                      "index": 0
+                    }
+                  }
+                }
+              ],
+              [
+                "limit",
+                {
+                  "sort": {
+                    "BitVec": 64
+                  },
+                  "place": {
+                    "ParamPointeeEntry": {
+                      "index": 0
+                    }
+                  }
+                }
+              ]
+            ]
+          }
+        ],
+        "params": [
+          "limit",
+          "p"
+        ],
+        "proved": false,
+        "decreases": [],
+        "backed_by": null
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "Ref": "U64"
+        },
+        {
+          "RefMut": "U64"
+        }
+      ],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "Precondition",
+      "status": "Pending",
+      "description": "requires clause 0 of 'bump': *p < *limit at entry",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(bvult p_entry limit)",
+        "smtlib": "(bvult p_entry limit)",
+        "sort": "Bool",
+        "bindings": [
+          [
+            "p_entry",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "ParamPointeeEntry": {
+                  "index": 1
+                }
+              }
+            }
+          ],
+          [
+            "limit",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "ParamPointeeEntry": {
+                  "index": 0
+                }
+              }
+            }
+          ]
+        ]
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 1,
+      "kind": "Postcondition",
+      "status": "Pending",
+      "description": "ensures clause 0 of 'bump': *p is incremented and *limit returned",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(and (= p_exit (bvadd p_entry #x0000000000000001)) (= result limit))",
+        "smtlib": "(and (= p_exit (bvadd p_entry #x0000000000000001)) (= result limit))",
+        "sort": "Bool",
+        "bindings": [
+          [
+            "p_exit",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "MutParamExit": {
+                  "index": 1
+                }
+              }
+            }
+          ],
+          [
+            "p_entry",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "ParamPointeeEntry": {
+                  "index": 1
+                }
+              }
+            }
+          ],
+          [
+            "result",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "ResultSlot": {
+                  "index": 0
+                }
+              }
+            }
+          ],
+          [
+            "limit",
+            {
+              "sort": {
+                "BitVec": 64
+              },
+              "place": {
+                "ParamPointeeEntry": {
+                  "index": 0
+                }
+              }
+            }
+          ]
+        ]
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    }
+  ],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

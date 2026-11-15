@@ -75,13 +75,30 @@ const MIN_ROTATE_LOOP_INSTS: usize = 8;
 /// Loop rotation / pure-test jump threading for x86-64 ISel functions.
 pub struct X86LoopRotate;
 
+static LOOP_ROTATE_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install this pass's opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-loop-rotate`). DEFAULT ON. `TCG_NO_X86_ROTATE`
+/// remains the in-process channel for tests; `trustc` refuses it.
+pub fn set_loop_rotate_disabled(disabled: bool) -> bool {
+    match LOOP_ROTATE_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LOOP_ROTATE_DISABLED.get() == Some(&requested),
+    }
+}
+
+fn loop_rotate_disabled() -> bool {
+    LOOP_ROTATE_DISABLED.get().copied().unwrap_or(false)
+        || std::env::var_os("TCG_NO_X86_ROTATE").is_some()
+}
+
 impl X86MachinePass for X86LoopRotate {
     fn name(&self) -> &str {
         "x86-loop-rotate"
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
-        if std::env::var_os("TCG_NO_X86_ROTATE").is_some() {
+        if loop_rotate_disabled() {
             return false;
         }
         run_impl(func)
@@ -117,9 +134,36 @@ fn is_threadable_opcode(op: X86Opcode) -> bool {
     )
 }
 
+/// The register `inst` defines: operand 0 of a value producer.
+fn defined_vreg(inst: &X86ISelInst) -> Option<VReg> {
+    if !crate::effects::x86_produces_value(inst.opcode) {
+        return None;
+    }
+    match inst.operands.first() {
+        Some(X86ISelOperand::VReg(d)) => Some(*d),
+        _ => None,
+    }
+}
+
+/// Whether a value producer of the threadable set reads its operand 0. This is
+/// `x86_operand0_may_be_read`, made exact for the three-operand
+/// register-immediate form: `AndRI [d, s, imm]` writes `d` and reads `s` (the
+/// two-address fixup copies operand 1 into the destination,
+/// `x86_two_address_lhs_operand_index` in trust-cg-codegen's x86-64 pipeline),
+/// while `effects` keeps that form as an over-approximation for other passes.
+/// The tied forms (`AndRI [d, imm]`, `AddRR`/`SubRR [d, s]`) read it.
+fn reads_operand0(inst: &X86ISelInst) -> bool {
+    match inst.opcode {
+        X86Opcode::AndRI if inst.operands.len() >= 3 => false,
+        _ => crate::effects::x86_operand0_may_be_read(inst),
+    }
+}
+
 /// A header eligible for threading: `insts[..n-2]` all threadable pure
 /// compute over VReg/Imm/CondCode operands only, terminated by exactly
-/// `Jcc cc, T` then `Jmp F`.
+/// `Jcc cc, T` then `Jmp F`, whose every read `rename_copy` can copy exactly:
+/// it reads either a register the header never defines or the latest earlier
+/// definition inside the header, and no value producer reads its own operand 0.
 fn threadable_header(func: &X86ISelFunction, h: Block) -> Option<Vec<X86ISelInst>> {
     let block = func.blocks.get(&h)?;
     let n = block.insts.len();
@@ -148,12 +192,35 @@ fn threadable_header(func: &X86ISelFunction, h: Block) -> Option<Vec<X86ISelInst
     // (a) read by any other block, or (b) also defined elsewhere (a
     // loop-carried vreg being updated in the header), would be stale or
     // skipped on the threaded path. Refuse such headers.
-    let mut h_defs: Vec<VReg> = Vec::new();
+    let h_defs: Vec<VReg> = block.insts[..n - 2]
+        .iter()
+        .filter_map(defined_vreg)
+        .collect();
+    // RENAMING SAFETY: the copy renames every definition, so each read must
+    // see the value the header itself would see at that position. Two shapes
+    // cannot be copied that way and are refused:
+    // (a) a value producer that reads its own operand 0 (a tied form):
+    //     renaming its destination would sever that read;
+    // (b) a read of a register the header defines only LATER: a value carried
+    //     around the loop through the header itself, which on the rotated
+    //     path would read the header's last definition instead of the copy's.
+    let mut defined_so_far: Vec<VReg> = Vec::new();
     for inst in &block.insts[..n - 2] {
-        if crate::effects::x86_produces_value(inst.opcode)
-            && let Some(X86ISelOperand::VReg(d)) = inst.operands.first()
-        {
-            h_defs.push(*d);
+        let def = defined_vreg(inst);
+        if def.is_some() && reads_operand0(inst) {
+            return None;
+        }
+        let reads = inst.operands.iter().skip(usize::from(def.is_some()));
+        for op in reads {
+            if let X86ISelOperand::VReg(v) = op
+                && h_defs.contains(v)
+                && !defined_so_far.contains(v)
+            {
+                return None;
+            }
+        }
+        if let Some(d) = def {
+            defined_so_far.push(d);
         }
     }
     if !h_defs.is_empty() {
@@ -179,9 +246,9 @@ fn threadable_header(func: &X86ISelFunction, h: Block) -> Option<Vec<X86ISelInst
                     if !in_header {
                         return None; // used or defined outside H
                     }
-                    // Inside H a hit is fine UNLESS it is a SECOND def of the
-                    // same vreg... multiple defs within H are handled by the
-                    // sequential rename; only external references matter.
+                    // Inside H a hit is the renaming-safety scan's (above):
+                    // a register H defines twice is read at its latest
+                    // definition, which `rename_copy` renames in step.
                     let _ = idx;
                 }
             }
@@ -190,33 +257,34 @@ fn threadable_header(func: &X86ISelFunction, h: Block) -> Option<Vec<X86ISelInst
     Some(block.insts.clone())
 }
 
-/// Copy the header instruction sequence, renaming every DEF to a fresh vreg
-/// (sequentially, so intra-copy uses of a renamed def pick up the new name).
-/// Uses of vregs not defined inside the copy keep their names — they read the
-/// same live values the original header would have read.
+/// Copy the header instruction sequence, renaming every definition to a fresh
+/// vreg. Each read goes through the renaming of its register's latest earlier
+/// definition in the copy; a read of a register the header never defines keeps
+/// its name and reads the same live value the header would. The renaming is
+/// keyed on the ORIGINAL register, so a register the header defines twice
+/// (ISel's `Setcc d; Movzx d, d`) is read at its second definition afterwards.
+/// `threadable_header` refuses the reads this cannot copy exactly (a tied read
+/// of operand 0; a read before the header's own definition).
 fn rename_copy(func: &mut X86ISelFunction, insts: &[X86ISelInst]) -> Vec<X86ISelInst> {
     let mut map: HashMap<VReg, VReg> = HashMap::new();
     let mut out = Vec::with_capacity(insts.len());
     for inst in insts {
         let mut cloned = inst.clone();
-        // Rewrite USES first (operands beyond the def position, and the def
-        // position too when the opcode reads it — conservatively rewrite all
-        // operand vregs through the current map), then mint the def.
-        for op in cloned.operands.iter_mut() {
+        let def = defined_vreg(inst);
+        // Operand 0 of a value producer is its destination only
+        // (`threadable_header` refused a tied read of it); every other
+        // operand is a read.
+        for op in cloned.operands.iter_mut().skip(usize::from(def.is_some())) {
             if let X86ISelOperand::VReg(v) = op
                 && let Some(nv) = map.get(v)
             {
                 *v = *nv;
             }
         }
-        if crate::effects::x86_produces_value(cloned.opcode)
-            && let Some(X86ISelOperand::VReg(d)) = cloned.operands.first().cloned()
-        {
+        if let Some(d) = def {
             let fresh = fresh_vreg(func, d.class);
             map.insert(d, fresh);
-            if let Some(X86ISelOperand::VReg(slot)) = cloned.operands.first_mut() {
-                *slot = fresh;
-            }
+            cloned.operands[0] = X86ISelOperand::VReg(fresh);
         }
         out.push(cloned);
     }
@@ -739,5 +807,287 @@ mod tests {
         func.push_inst(Block(3), X86ISelInst::new(X86Opcode::Ret, vec![]));
 
         assert!(!run_impl(&mut func), "memory-reading header must refuse");
+    }
+
+    fn gpr(id: u32, class: RegClass) -> X86ISelOperand {
+        X86ISelOperand::VReg(VReg { id, class })
+    }
+
+    /// The latch filler: it defines `v1` and reads `v0`, both registers the
+    /// headers below only read (their live-ins), so no header definition is
+    /// referenced outside the header.
+    const FILLER: usize = MIN_ROTATE_LOOP_INSTS;
+
+    /// preheader(0) -> header(1){`header`; Jcc NE -> latch(2); Jmp exit(3)};
+    /// the latch runs `FILLER` rows, then `Jmp header`.
+    fn header_loop(header: &[X86ISelInst]) -> X86ISelFunction {
+        let mut func = empty_func("rot_copy");
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(1)];
+        for inst in header {
+            func.push_inst(Block(1), inst.clone());
+        }
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::NE),
+                    X86ISelOperand::Block(Block(2)),
+                ],
+            ),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(3))]),
+        );
+        func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(2), Block(3)];
+        for _ in 0..FILLER {
+            func.push_inst(
+                Block(2),
+                X86ISelInst::new(X86Opcode::AddRR, vec![vr(1), vr(1), vr(0)]),
+            );
+        }
+        func.push_inst(
+            Block(2),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.blocks.get_mut(&Block(2)).unwrap().successors = vec![Block(1)];
+        func.push_inst(Block(3), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.next_vreg = 100;
+        func
+    }
+
+    /// The value one read sees: `Def(k)` is the value instruction `k` of the
+    /// sequence defined, `LiveIn(v)` the register `v` before the sequence.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Seen {
+        LiveIn(VReg),
+        Def(usize),
+    }
+
+    /// The values each instruction of `insts` reads, read independently of
+    /// the pass: a value producer's operand 0 is read only in the tied forms
+    /// `AndRI [d, imm]` and `AddRR`/`SubRR [d, s]`; every other operand is a
+    /// read.
+    fn reads_seen(insts: &[X86ISelInst]) -> Vec<Vec<Seen>> {
+        let mut held: HashMap<VReg, usize> = HashMap::new();
+        let mut out = Vec::new();
+        for (k, inst) in insts.iter().enumerate() {
+            let produces = crate::effects::x86_produces_value(inst.opcode);
+            let tied = matches!(
+                inst.opcode,
+                X86Opcode::AndRI | X86Opcode::AddRR | X86Opcode::SubRR
+            ) && inst.operands.len() == 2;
+            let mut reads = Vec::new();
+            for (j, op) in inst.operands.iter().enumerate() {
+                if j == 0 && produces && !tied {
+                    continue;
+                }
+                if let X86ISelOperand::VReg(v) = op {
+                    reads.push(held.get(v).map_or(Seen::LiveIn(*v), |&i| Seen::Def(i)));
+                }
+            }
+            out.push(reads);
+            if produces && let Some(X86ISelOperand::VReg(d)) = inst.operands.first() {
+                held.insert(*d, k);
+            }
+        }
+        out
+    }
+
+    /// Whether some read of `header` sees a register the header defines only
+    /// later: a value carried around the loop through the header itself.
+    fn carries_through_itself(header: &[X86ISelInst]) -> bool {
+        let defs: Vec<VReg> = header
+            .iter()
+            .filter(|i| crate::effects::x86_produces_value(i.opcode))
+            .filter_map(|i| match i.operands.first() {
+                Some(X86ISelOperand::VReg(d)) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        reads_seen(header)
+            .iter()
+            .flatten()
+            .any(|s| matches!(s, Seen::LiveIn(v) if defs.contains(v)))
+    }
+
+    /// The copy the pass appended to the latch, when it threaded the header.
+    fn threaded_copy(header: &[X86ISelInst]) -> Option<Vec<X86ISelInst>> {
+        let mut func = header_loop(header);
+        if !run_legacy_sweep(&mut func) {
+            return None;
+        }
+        let latch = &func.blocks[&Block(2)].insts;
+        assert_eq!(latch.len(), FILLER + header.len() + 2, "{header:?}");
+        Some(latch[FILLER..FILLER + header.len()].to_vec())
+    }
+
+    /// A threaded copy is exact: the same opcodes and non-register operands
+    /// position by position, every read seeing the same value the header's
+    /// read at that position sees, and every definition a register the
+    /// function did not mention before.
+    fn assert_exact_copy(header: &[X86ISelInst], copy: &[X86ISelInst]) {
+        assert!(
+            !carries_through_itself(header),
+            "a header that reads its own later definition was threaded: {header:?}"
+        );
+        for (o, c) in header.iter().zip(copy) {
+            assert_eq!(o.opcode, c.opcode, "{header:?}");
+            assert_eq!(o.operands.len(), c.operands.len(), "{header:?}");
+            for (a, b) in o.operands.iter().zip(&c.operands) {
+                if !matches!(a, X86ISelOperand::VReg(_)) {
+                    assert_eq!(a, b, "{header:?}");
+                }
+            }
+            if crate::effects::x86_produces_value(c.opcode)
+                && let Some(X86ISelOperand::VReg(d)) = c.operands.first()
+            {
+                assert!(
+                    d.id >= 100,
+                    "the copy's definition {d:?} is not fresh: {header:?}"
+                );
+            }
+        }
+        assert_eq!(
+            reads_seen(header),
+            reads_seen(copy),
+            "the copy reads other values than the header: {header:?} copied as {copy:?}"
+        );
+    }
+
+    /// ISel's materialized compare (`x86_64_isel.rs`, the B1 compare result:
+    /// `Setcc d; Movzx d, d`) defines `d` twice; a later read must see the
+    /// zero-extended second definition, not the `setcc` byte.
+    #[test]
+    fn copy_reads_a_redefined_register_at_its_latest_definition() {
+        let d = gpr(10, RegClass::Gpr32);
+        let header = [
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vr(0), vr(1)]),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![
+                    d.clone(),
+                    X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::L),
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::Movzx, vec![d.clone(), d.clone()]),
+            X86ISelInst::new(X86Opcode::TestRR, vec![d.clone(), d]),
+        ];
+        let copy = threaded_copy(&header).expect("the materialized compare header threads");
+        assert_exact_copy(&header, &copy);
+        assert_eq!(copy[3].operands[0], copy[2].operands[0]);
+        assert_eq!(copy[3].operands[1], copy[2].operands[0]);
+    }
+
+    /// A tied `AndRI [d, imm]` reads `d`; renaming its destination would
+    /// sever that read, so the header is not threaded.
+    #[test]
+    fn refuses_a_header_with_a_tied_read_of_its_own_definition() {
+        let d = vr(10);
+        let header = [
+            X86ISelInst::new(X86Opcode::MovRR, vec![d.clone(), vr(0)]),
+            X86ISelInst::new(X86Opcode::AndRI, vec![d.clone(), X86ISelOperand::Imm(1)]),
+            X86ISelInst::new(X86Opcode::TestRR, vec![d.clone(), d]),
+        ];
+        assert!(threaded_copy(&header).is_none(), "a tied read must refuse");
+    }
+
+    /// A header that reads a register before defining it carries a value
+    /// around the loop through itself; the rotated path would read the
+    /// header's own last definition, so it is not threaded.
+    #[test]
+    fn refuses_a_header_that_reads_its_own_later_definition() {
+        let d = vr(10);
+        let header = [
+            X86ISelInst::new(X86Opcode::CmpRI, vec![d.clone(), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![d, vr(0)]),
+        ];
+        assert!(
+            threaded_copy(&header).is_none(),
+            "a carried read must refuse"
+        );
+    }
+
+    /// Every header of up to three threadable instructions over two live-in
+    /// and two header-local registers: when the pass threads it, the copy is
+    /// exact. The enumeration includes redefinitions, tied forms and reads
+    /// before a definition; the counts keep it non-vacuous.
+    #[test]
+    fn every_threaded_short_header_is_copied_exactly() {
+        let srcs = [0u32, 1, 10, 11];
+        let mut forms: Vec<X86ISelInst> = Vec::new();
+        for d in [10u32, 11] {
+            for s in srcs {
+                forms.push(X86ISelInst::new(X86Opcode::MovRR, vec![vr(d), vr(s)]));
+                forms.push(X86ISelInst::new(X86Opcode::Movzx, vec![vr(d), vr(s)]));
+                forms.push(X86ISelInst::new(
+                    X86Opcode::AndRI,
+                    vec![vr(d), vr(s), X86ISelOperand::Imm(3)],
+                ));
+                forms.push(X86ISelInst::new(X86Opcode::AddRR, vec![vr(d), vr(s)]));
+            }
+            for (a, b) in [(0, 10), (10, 11), (11, 1)] {
+                forms.push(X86ISelInst::new(
+                    X86Opcode::AddRR,
+                    vec![vr(d), vr(a), vr(b)],
+                ));
+            }
+            forms.push(X86ISelInst::new(
+                X86Opcode::AndRI,
+                vec![vr(d), X86ISelOperand::Imm(1)],
+            ));
+            forms.push(X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vr(d), X86ISelOperand::CondCode(trust_cg_ir::X86CondCode::E)],
+            ));
+        }
+        for s in srcs {
+            forms.push(X86ISelInst::new(
+                X86Opcode::CmpRI,
+                vec![vr(s), X86ISelOperand::Imm(7)],
+            ));
+            forms.push(X86ISelInst::new(X86Opcode::TestRR, vec![vr(s), vr(s)]));
+        }
+        let mut headers: Vec<Vec<X86ISelInst>> = forms.iter().map(|f| vec![f.clone()]).collect();
+        for len in 2..=3 {
+            let shorter: Vec<Vec<X86ISelInst>> = headers
+                .iter()
+                .filter(|h| h.len() == len - 1)
+                .cloned()
+                .collect();
+            for h in shorter {
+                for f in &forms {
+                    let mut longer = h.clone();
+                    longer.push(f.clone());
+                    headers.push(longer);
+                }
+            }
+        }
+        let (mut threaded, mut redefined, mut refused) = (0usize, 0usize, 0usize);
+        for header in &headers {
+            match threaded_copy(header) {
+                Some(copy) => {
+                    assert_exact_copy(header, &copy);
+                    threaded += 1;
+                    let defs: Vec<_> = header
+                        .iter()
+                        .filter(|i| crate::effects::x86_produces_value(i.opcode))
+                        .map(|i| i.operands[0].clone())
+                        .collect();
+                    if (1..defs.len()).any(|i| defs[..i].contains(&defs[i])) {
+                        redefined += 1;
+                    }
+                }
+                None => refused += 1,
+            }
+        }
+        assert!(threaded > 1000, "threaded {threaded}");
+        assert!(redefined > 100, "threaded with a redefinition {redefined}");
+        assert!(refused > 1000, "refused {refused}");
     }
 }

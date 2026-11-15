@@ -48,6 +48,14 @@ struct Cli {
     /// Comma-separated parent inputs for `--invoke-ty-parent-loop`.
     #[arg(long, value_delimiter = ',', value_name = "CSV")]
     parent_inputs: Vec<u64>,
+
+    /// Compile function bodies that carry NO codegen license (`body_gate`
+    /// absent), which are refused by default (roadmap WS7.5, DG-73). TY
+    /// replay artifacts carry none today; each probe under this flag prints a
+    /// disclosure line naming the unlicensed bodies it compiled, exactly as
+    /// `trust-cg --permit-unlicensed` does.
+    #[arg(long = "permit-unlicensed")]
+    permit_unlicensed: bool,
 }
 
 fn main() {
@@ -64,8 +72,28 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = cli.opt_level;
 
+    let mut license = trust_cg_codegen::CodegenLicensePolicy::default();
+    if cli.permit_unlicensed {
+        license = license.with_unlicensed_permit_exception(
+            trust_cg_codegen::UnlicensedPermitException::LegacyCorpusFlag,
+        );
+        let permitted = license.unlicensed_bodies_permitted(&module);
+        if !permitted.is_empty() {
+            eprintln!(
+                "ty_replay_jit_probe: note: --permit-unlicensed: '{}': compiling {} function \
+                 bod{} with NO codegen license (`body_gate` absent; refused by default): {}",
+                cli.trust_ir_json.display(),
+                permitted.len(),
+                if permitted.len() == 1 { "y" } else { "ies" },
+                permitted.join(", ")
+            );
+        }
+    }
+
     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
-    let result = Compiler::new(config).compile_module_to_jit(&module, &extern_symbols)?;
+    let result = Compiler::new(config)
+        .with_codegen_license(license)
+        .compile_module_to_jit(&module, &extern_symbols)?;
     let public_allocated_size = result.buffer.allocated_size();
     let pointer = result
         .buffer

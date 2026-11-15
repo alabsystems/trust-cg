@@ -34,7 +34,7 @@ UNALLOCATED, so the i64 multiply value must stay scalar and correct).
 
 usage: condstorefuzz.py <trust-cg-binary> [--quick]
 """
-import sys, os, subprocess, tempfile
+import atexit, shutil, sys, os, subprocess, tempfile
 
 raise SystemExit(
     "condstorefuzz.py is dormant: typed function/base/range ownership "
@@ -355,7 +355,7 @@ def compile_tcg(tir, obj, contract=False, disable=None):
         raise RuntimeError("typed condstore ownership authority is not wired")
     if disable:
         env["TRUST_CG_DISABLE_PASSES"] = disable
-    r = run([TCG, "--format=text", "--target", "aarch64", "-O2", "-c", tir, "-o", obj], env=env)
+    r = run([TCG, "--format=text", "--permit-unlicensed", "--target", "aarch64", "-O2", "-c", tir, "-o", obj], env=env)
     if r.returncode != 0:
         print(r.stderr)
         raise SystemExit(f"tcg compile failed: {tir}")
@@ -374,6 +374,12 @@ def vectorized64(obj):
 
 def main():
     wd = tempfile.mkdtemp(prefix="condstorefuzz")
+    # The work directory is removed when the run ends, unless
+    # TRUST_CG_KEEP_TEST_OBJECTS asks to keep it for inspection.
+    if os.environ.get("TRUST_CG_KEEP_TEST_OBJECTS"):
+        print(f"work directory kept: {wd}")
+    else:
+        atexit.register(shutil.rmtree, wd, ignore_errors=True)
     total = fails = 0
     vec_fired = 0
     for name in KERNELS:

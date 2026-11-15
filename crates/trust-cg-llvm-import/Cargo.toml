@@ -35,9 +35,10 @@ serde_json = { workspace = true }
 trust-ir = { workspace = true }
 thiserror = { workspace = true }
 
-# Binary helper used by scripts/run_llvm_test_suite.sh. Takes a .ll on
-# disk and writes a .o (Mach-O) through the codegen pipeline, exiting
-# with `unsupported:` on stderr if the importer hits an Error::Unsupported.
+# Binary helper used by the trust-cg-fuzz csmith/yarpgen drivers and the PGO
+# runtime. Takes a .ll on disk and writes a .o (Mach-O) through the codegen
+# pipeline, exiting with `unsupported:` on stderr if the importer hits an
+# Error::Unsupported.
 
 [[bin]]
 name = "trust-cg-ws2-import"

@@ -23,13 +23,17 @@
 
 use std::collections::{HashMap, HashSet};
 
+use trust_cg_ir::fast_hash::FxHashMap;
+
 use crate::function::{
     BasicBlock, EhCallSite, EhFunctionInfo, EhLandingPad, Function as LirFunction, Signature,
     StackSlotInfo,
 };
 use crate::instructions::{
-    AtomicOrdering, AtomicRmwOp, Block, FloatCC, Instruction, IntCC, Opcode, Value,
+    AtomicOrdering, AtomicRmwOp, Block, DirectCallBinding, FloatCC, Instruction, IntCC, Opcode,
+    Value,
 };
+use crate::runtime_calls::RuntimeSymbol;
 use crate::types::Type;
 use thiserror::Error;
 
@@ -41,8 +45,8 @@ use trust_cg_ir::provenance::{
 use trust_cg_ir::regs::{RegClass, VReg};
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
 use trust_cg_ir::x86_64_regs::{
-    self, AL, R8, R9, RAX, RBP, RCX, RDI, RDX, RSI, RSP, X86_ARG_GPRS, X86_ARG_XMMS, X86_RET_GPRS,
-    X86_RET_XMMS, X86PReg,
+    self, AL, R8, R9, RAX, RBP, RCX, RDI, RDX, RSI, RSP, X86_ARG_GPRS, X86_ARG_XMMS,
+    X86_INTERNAL_RET_GPRS, X86_INTERNAL_RET_XMMS, X86_RET_GPRS, X86_RET_XMMS, X86PReg,
 };
 use trust_cg_ir::{GuardKind, GuardOperandRef, TlsModel, fingerprint_for_kind};
 
@@ -85,6 +89,8 @@ fn x86_isel_operand_guard_ref(op: &X86ISelOperand) -> Option<GuardOperandRef> {
 /// Errors during x86-64 instruction selection.
 #[derive(Debug, Error)]
 pub enum X86ISelError {
+    #[error("x86-64 synthetic block identity space is exhausted")]
+    BlockIdExhausted,
     #[error("value {0:?} not defined before use")]
     UndefinedValue(Value),
     #[error("unsupported type for Fconst: {0:?} (expected F32 or F64)")]
@@ -103,6 +109,12 @@ pub enum X86ISelError {
         expected: String,
         actual: String,
     },
+    /// A classified System V aggregate lane whose live-byte count has no
+    /// width-exact load/store decomposition. The classifier admits only 1..=8
+    /// live bytes, so this names a classifier/lowering disagreement instead of
+    /// letting instruction selection read or write past the aggregate.
+    #[error("x86-64 aggregate lane with {valid_bytes} live bytes has no width-exact decomposition")]
+    AggregateLaneUndecomposable { valid_bytes: u32 },
     #[error(
         "unsupported x86-64 aggregate ABI for {position} {index}: {ty} ({size} bytes) under {abi:?}"
     )]
@@ -282,6 +294,15 @@ struct X86SysVAggregateLane {
     class: X86SysVAggregateLaneClass,
     ty: Type,
     offset: i32,
+    /// How many bytes of this eightbyte are LIVE — 8 for a full one, fewer for
+    /// a trailing partial one.
+    ///
+    /// Every access to this lane must cover exactly this many bytes. System V
+    /// leaves the bytes beyond an aggregate UNSPECIFIED, so a wider access is a
+    /// read or write the program never authorised; see
+    /// [`sysv_lane_byte_accesses`], which turns this into the width-exact
+    /// access sequence.
+    valid_bytes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -459,6 +480,43 @@ fn collect_sysv_aggregate_leaves(
     }
 }
 
+/// Whether producer-observed outer field offsets keep the register classes
+/// described by this LIR carrier. Matching size/alignment alone cannot establish
+/// this: swapping a double and an integer swaps their SysV register files.
+/// Unsupported changed images remain refused, never classified by guesswork.
+pub(crate) fn declared_aggregate_preserves_sysv_classes(carrier: &Type, offsets: &[u64]) -> bool {
+    let Type::Struct(fields) = carrier else {
+        return false;
+    };
+    if fields.len() != offsets.len() {
+        return false;
+    }
+    let natural: Option<Vec<u64>> = (0..fields.len())
+        .map(|i| carrier.offset_of(i).map(u64::from))
+        .collect();
+    if natural.as_deref() == Some(offsets) {
+        return true;
+    }
+    // SysV transports these by memory, whose extent is checked separately.
+    if carrier.checked_bytes().is_some_and(|size| size > 16) {
+        return true;
+    }
+    let mut logical = [None, None];
+    if collect_sysv_aggregate_leaves(carrier, 0, &mut logical).is_none() {
+        return false;
+    }
+    let mut observed = [None, None];
+    for (field, offset) in fields.iter().zip(offsets) {
+        let Ok(offset) = u32::try_from(*offset) else {
+            return false;
+        };
+        if collect_sysv_aggregate_leaves(field, offset, &mut observed).is_none() {
+            return false;
+        }
+    }
+    observed == logical
+}
+
 /// Representative store/load type for one eightbyte of an INTEGER/SSE class
 /// with `valid_bytes` live bytes (8 for a full eightbyte, fewer for a partial
 /// trailing eightbyte such as the second eightbyte of a 12-byte `{i32,i32,i32}`).
@@ -478,12 +536,56 @@ fn collect_sysv_aggregate_leaves(
 /// width, so the two classifiers stay in lockstep. Power-of-two widths only:
 /// 3/5/6/7-byte partial eightbytes have no single non-over-reading GPR access and
 /// stay fail-closed.
+/// The width-exact memory accesses that move `valid_bytes` bytes of an INTEGER
+/// eightbyte, as `(type, byte offset within the eightbyte)` in ascending order.
+///
+/// A partial eightbyte has no single GPR access covering exactly its live
+/// bytes: a 3-byte lane moved with one 4-byte access reads or writes one byte
+/// PAST the object, and System V leaves the bytes beyond an aggregate
+/// UNSPECIFIED — the caller may only READ the object's own bytes, and the
+/// callee may only WRITE its own allocation. So a partial lane is moved as
+/// several accesses whose widths sum exactly to `valid_bytes`:
+///
+/// ```text
+///   3 -> I16@+0, I8@+2          5 -> I32@+0, I8@+4
+///   6 -> I32@+0, I16@+4         7 -> I32@+0, I16@+4, I8@+6
+/// ```
+///
+/// Power-of-two widths keep their single access, so this is the identity for
+/// every lane the classifier already admitted and no existing lowering changes
+/// shape.
+///
+/// Returns `None` for a width with no decomposition (0, or > 8), which fails
+/// closed rather than guessing.
+fn sysv_lane_byte_accesses(valid_bytes: u32) -> Option<Vec<(Type, u32)>> {
+    match valid_bytes {
+        8 => Some(vec![(Type::I64, 0)]),
+        7 => Some(vec![(Type::I32, 0), (Type::I16, 4), (Type::I8, 6)]),
+        6 => Some(vec![(Type::I32, 0), (Type::I16, 4)]),
+        5 => Some(vec![(Type::I32, 0), (Type::I8, 4)]),
+        4 => Some(vec![(Type::I32, 0)]),
+        3 => Some(vec![(Type::I16, 0), (Type::I8, 2)]),
+        2 => Some(vec![(Type::I16, 0)]),
+        1 => Some(vec![(Type::I8, 0)]),
+        _ => None,
+    }
+}
+
 fn sysv_eightbyte_lane_type(class: X86SysVAggregateLaneClass, valid_bytes: u32) -> Option<Type> {
     match (class, valid_bytes) {
         (X86SysVAggregateLaneClass::Integer, 8) => Some(Type::I64),
         (X86SysVAggregateLaneClass::Integer, 4) => Some(Type::I32),
         (X86SysVAggregateLaneClass::Integer, 2) => Some(Type::I16),
         (X86SysVAggregateLaneClass::Integer, 1) => Some(Type::I8),
+        // PARTIAL eightbytes (3/5/6/7 live bytes). The carrier is the GPR the
+        // eightbyte is passed in; the bytes are moved by
+        // `sysv_lane_byte_accesses`, never by one access of this width, so
+        // nothing reads or writes past the object. Admitting them here is safe
+        // ONLY because every site that moves a lane assembles/disassembles it:
+        // `load_sysv_aggregate_lane_to_preg`, `store_sysv_aggregate_from_stack`
+        // and the `SysVAggregateReg` formal materialization.
+        (X86SysVAggregateLaneClass::Integer, 3) => Some(Type::I32),
+        (X86SysVAggregateLaneClass::Integer, 5..=7) => Some(Type::I64),
         (X86SysVAggregateLaneClass::Sse, 8) => Some(Type::F64),
         (X86SysVAggregateLaneClass::Sse, 4) => Some(Type::F32),
         _ => None,
@@ -531,6 +633,7 @@ fn classify_sysv_register_aggregate(ty: &Type, abi: X86CallAbi) -> Option<X86Sys
                 class: X86SysVAggregateLaneClass::Sse,
                 ty: Type::V128,
                 offset: 0,
+                valid_bytes: size.min(16),
             }],
             size,
         });
@@ -551,6 +654,7 @@ fn classify_sysv_register_aggregate(ty: &Type, abi: X86CallAbi) -> Option<X86Sys
             class,
             ty: lane_ty,
             offset: (idx as i32) * 8,
+            valid_bytes,
         });
     }
 
@@ -582,10 +686,6 @@ fn is_two_i64_x86_gpr_aggregate(ty: &Type) -> bool {
         Type::Array(elem, 2) => matches!(elem.as_ref(), Type::I64),
         _ => false,
     }
-}
-
-fn is_sysv_two_i64_gpr_aggregate(ty: &Type, abi: X86CallAbi) -> bool {
-    abi == X86CallAbi::SystemV && is_two_i64_x86_gpr_aggregate(ty)
 }
 
 fn is_windows_x64_two_i64_byref_aggregate(ty: &Type, abi: X86CallAbi) -> bool {
@@ -621,10 +721,275 @@ fn sysv_stack_eightbytes_for_type(ty: &Type) -> i64 {
     i64::from(ty.bytes().max(8).div_ceil(8))
 }
 
-fn align_sysv_formal_stack_offset_for_type(stack_offset: &mut i64, ty: &Type) {
-    if sysv_stack_arg_requires_16byte_alignment(ty) && *stack_offset % 16 != 0 {
-        *stack_offset += 8;
+/// Where ONE System V AMD64 argument value lives at the call edge, as
+/// [`x86_sysv_param_locations`] decides it.
+///
+/// Register indexes are positions in the argument register files
+/// (`RDI, RSI, RDX, RCX, R8, R9` and `XMM0..=XMM7`), not machine encodings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum X86ParamLocation {
+    /// One integer argument register.
+    Gpr(u8),
+    /// An `I128` in two CONSECUTIVE integer argument registers, low half first.
+    GprPair { lo: u8, hi: u8 },
+    /// One vector argument register (`F16`/`F32`/`F64`/`V128`).
+    Xmm(u8),
+    /// A register-passed aggregate, one entry per eightbyte.
+    Lanes(Vec<X86ParamLane>),
+    /// The outgoing argument area. `offset` is the byte offset from its start
+    /// (the caller's `RSP` after the argument area is allocated, the callee's
+    /// `RBP + 16`). `eightbytes` is how many eightbytes the argument CONSUMES —
+    /// what the next argument's offset advances past. `copy_bytes` is how many
+    /// bytes of the VALUE are moved there: the value's own size, never the
+    /// rounded slot, because System V leaves the bytes past an aggregate
+    /// unspecified and the caller may only read the object's own bytes.
+    Stack {
+        offset: i64,
+        eightbytes: u32,
+        copy_bytes: u32,
+    },
+}
+
+/// One eightbyte of a register-passed System V aggregate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X86ParamLane {
+    /// `true` = an SSE eightbyte in an XMM register, `false` = INTEGER in a GPR.
+    pub sse: bool,
+    /// Position in the argument register file of the lane's class.
+    pub index: u8,
+    /// Byte offset of the eightbyte within the aggregate.
+    pub offset: u32,
+    /// Live bytes of the eightbyte (8, or fewer for a trailing partial one).
+    pub valid_bytes: u32,
+}
+
+impl X86ParamLocation {
+    /// The eightbytes of the outgoing argument area this location ends at, or
+    /// 0 for a register location.
+    fn stack_end_eightbytes(&self) -> i64 {
+        match self {
+            X86ParamLocation::Stack {
+                offset, eightbytes, ..
+            } => offset / 8 + i64::from(*eightbytes),
+            _ => 0,
+        }
     }
+
+    /// How many XMM argument registers this location's value reaches up to
+    /// (one past the highest index), or 0.
+    fn xmm_end(&self) -> usize {
+        match self {
+            X86ParamLocation::Xmm(index) => usize::from(*index) + 1,
+            X86ParamLocation::Lanes(lanes) => lanes
+                .iter()
+                .filter(|lane| lane.sse)
+                .map(|lane| usize::from(lane.index) + 1)
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+}
+
+/// THE System V AMD64 argument placement of this selector: for each argument
+/// VALUE of `params`, in order, the register(s) or outgoing-stack bytes it
+/// occupies. `has_sret` reserves `RDI` for the hidden return-buffer pointer
+/// (the argument list then starts at `RSI`).
+///
+/// This is the ONE statement of the rule. The call side (`lower_call_inner`'s
+/// Pass 1), the formal side (`lower_formal_arguments_inner`) and the rustc
+/// bridge's whole-signature placement check all read it, so a caller and a
+/// callee this backend compiles cannot place an argument differently, and the
+/// bridge compares rustc's `FnAbi` against the placement the selector really
+/// performs rather than against a mirror of it.
+///
+/// The rules, by argument kind (psABI §3.2.3, as this selector implements it):
+///
+/// * `I128`: two consecutive GPRs if two remain, else the stack (16-aligned,
+///   two eightbytes) — never split across the boundary;
+/// * `F16`/`F32`/`F64`/`V128`: the next XMM, else the stack (`V128`
+///   16-aligned);
+/// * a register-classifiable aggregate (`classify_sysv_register_aggregate`,
+///   1..=16 bytes): one register per eightbyte of its class if ALL of them
+///   remain, else wholly on the stack (all-or-nothing);
+/// * a MEMORY-class aggregate (over 16 bytes): the stack, by value;
+/// * every other value (integers, pointers, `B1`, single-GPR aggregates such as
+///   `{i32}` or `[i64; 1]`): the next GPR, else one eightbyte of stack.
+///
+/// A register-placed argument never moves a later one: the register counters
+/// only advance, so a value that fits a register after an earlier one went to
+/// the stack still takes that register (the "back-fill" of the psABI).
+///
+/// An aggregate the selector has no System V rule for is an error, the same
+/// refusal (`UnsupportedAggregateAbi`) both sides already raise for it.
+pub fn x86_sysv_param_locations(
+    params: &[Type],
+    has_sret: bool,
+) -> Result<Vec<X86ParamLocation>, X86ISelError> {
+    x86_sysv_param_locations_at(params, &[], has_sret, "argument")
+}
+
+/// [`x86_sysv_param_locations`] where the values flagged in `byval` are passed
+/// BY VALUE IN MEMORY whatever their class — LLVM's `byval` attribute, which
+/// rustc's `PassMode::Indirect { on_stack: true }` lowers to: the value takes
+/// the next stack slot of its size and alignment and no register, and every
+/// other value is placed by the one rule above. The selector itself never
+/// forces a value to memory; this is how a caller states what an LLVM call
+/// passes, so it can be compared with what the selector does
+/// (`abi_reg_lanes`' whole-signature placement check). `byval` shorter than
+/// `params` is padded with `false`.
+pub fn x86_sysv_param_locations_with_byval(
+    params: &[Type],
+    byval: &[bool],
+    has_sret: bool,
+) -> Result<Vec<X86ParamLocation>, X86ISelError> {
+    x86_sysv_param_locations_at(params, byval, has_sret, "argument")
+}
+
+/// Where a System V callee finds its first stack-passed argument: `[RBP + 16]`,
+/// past the saved `RBP` and the return address. A [`X86ParamLocation::Stack`]
+/// offset is relative to it.
+const SYSV_INCOMING_ARGS_RBP_OFFSET: i64 = 16;
+
+/// [`x86_sysv_param_locations`], naming `position` ("formal parameter", "call
+/// argument") in the refusal of an aggregate it has no rule for.
+fn x86_sysv_param_locations_at(
+    params: &[Type],
+    byval: &[bool],
+    has_sret: bool,
+    position: &'static str,
+) -> Result<Vec<X86ParamLocation>, X86ISelError> {
+    let abi = X86CallAbi::SystemV;
+    let mut out = Vec::with_capacity(params.len());
+    let mut gpr_idx: usize = usize::from(has_sret);
+    let mut xmm_idx: usize = 0;
+    // The outgoing argument area, in eightbytes.
+    let mut stack_count: i64 = 0;
+    let index_u8 = |index: usize| u8::try_from(index).expect("argument register index fits u8");
+    for (arg_index, ty) in params.iter().enumerate() {
+        if !byval.get(arg_index).copied().unwrap_or(false)
+            && single_x86_gpr_aggregate_lane_type(ty).is_none()
+            && classify_sysv_register_aggregate(ty, abi).is_none()
+            && !is_sysv_memory_byval_aggregate(ty, abi)
+        {
+            reject_x86_aggregate_abi(ty, arg_index, position, abi)?;
+        }
+        let stack = |stack_count: &mut i64, eightbytes: i64, ty: &Type| {
+            align_sysv_stack_arg_for_type(stack_count, ty);
+            let location = X86ParamLocation::Stack {
+                offset: *stack_count * 8,
+                eightbytes: u32::try_from(eightbytes).expect("stack eightbytes fit u32"),
+                copy_bytes: ty.bytes(),
+            };
+            *stack_count += eightbytes;
+            location
+        };
+        if byval.get(arg_index).copied().unwrap_or(false) {
+            out.push(stack(
+                &mut stack_count,
+                sysv_stack_eightbytes_for_type(ty),
+                ty,
+            ));
+        } else if *ty == Type::I128 {
+            if gpr_idx + 1 < X86_ARG_GPRS.len() {
+                out.push(X86ParamLocation::GprPair {
+                    lo: index_u8(gpr_idx),
+                    hi: index_u8(gpr_idx + 1),
+                });
+                gpr_idx += 2;
+            } else {
+                out.push(stack(&mut stack_count, 2, ty));
+            }
+        } else if is_xmm_abi_value_type(ty, abi) {
+            if xmm_idx < X86_ARG_XMMS.len() {
+                out.push(X86ParamLocation::Xmm(index_u8(xmm_idx)));
+                xmm_idx += 1;
+            } else {
+                out.push(stack(
+                    &mut stack_count,
+                    sysv_stack_eightbytes_for_type(ty),
+                    ty,
+                ));
+            }
+        } else if let Some(layout) = classify_sysv_register_aggregate(ty, abi) {
+            if gpr_idx + layout.gpr_count() <= X86_ARG_GPRS.len()
+                && xmm_idx + layout.xmm_count() <= X86_ARG_XMMS.len()
+            {
+                let mut lanes = Vec::with_capacity(layout.lanes.len());
+                for lane in &layout.lanes {
+                    let (sse, index) = match lane.class {
+                        X86SysVAggregateLaneClass::Integer => {
+                            gpr_idx += 1;
+                            (false, gpr_idx - 1)
+                        }
+                        X86SysVAggregateLaneClass::Sse => {
+                            xmm_idx += 1;
+                            (true, xmm_idx - 1)
+                        }
+                    };
+                    lanes.push(X86ParamLane {
+                        sse,
+                        index: index_u8(index),
+                        offset: u32::try_from(lane.offset).expect("lane offset is non-negative"),
+                        valid_bytes: lane.valid_bytes,
+                    });
+                }
+                out.push(X86ParamLocation::Lanes(lanes));
+            } else {
+                out.push(stack(&mut stack_count, layout.eightbyte_count(), ty));
+            }
+        } else if is_sysv_memory_byval_aggregate(ty, abi) {
+            out.push(stack(
+                &mut stack_count,
+                sysv_stack_eightbytes_for_type(ty),
+                ty,
+            ));
+        } else if gpr_idx < X86_ARG_GPRS.len() {
+            out.push(X86ParamLocation::Gpr(index_u8(gpr_idx)));
+            gpr_idx += 1;
+        } else {
+            out.push(stack(&mut stack_count, 1, ty));
+        }
+    }
+    Ok(out)
+}
+
+/// The eightbyte lanes of a register-placed System V aggregate paired with the
+/// physical registers [`x86_sysv_param_locations`] gave them. The lanes are
+/// the classifier's own (`classify_sysv_register_aggregate`), so each keeps its
+/// carrier type and live width; a location that does not describe the same
+/// eightbytes is an internal inconsistency and fails closed.
+fn sysv_aggregate_lane_registers(
+    ty: &Type,
+    lanes: &[X86ParamLane],
+) -> Result<Vec<(X86SysVAggregateLane, X86PReg)>, X86ISelError> {
+    let mismatch = || {
+        X86ISelError::UnsupportedOpcode(format!(
+            "System V placement of `{ty:?}` names eightbytes {lanes:?} its register classification \
+             does not have; failing closed"
+        ))
+    };
+    let layout = classify_sysv_register_aggregate(ty, X86CallAbi::SystemV).ok_or_else(mismatch)?;
+    if layout.lanes.len() != lanes.len() {
+        return Err(mismatch());
+    }
+    layout
+        .lanes
+        .into_iter()
+        .zip(lanes)
+        .map(|(lane, placed)| {
+            let sse = lane.class == X86SysVAggregateLaneClass::Sse;
+            if placed.sse != sse
+                || i64::from(placed.offset) != i64::from(lane.offset)
+                || placed.valid_bytes != lane.valid_bytes
+            {
+                return Err(mismatch());
+            }
+            let file: &[X86PReg] = if sse { &X86_ARG_XMMS } else { &X86_ARG_GPRS };
+            let reg = *file.get(usize::from(placed.index)).ok_or_else(mismatch)?;
+            Ok((lane, reg))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +1145,8 @@ pub enum X86ISelOperand {
     CondCode(X86CondCode),
     /// Global symbol name (for CALL relocations, RIP-relative addressing).
     Symbol(String),
+    /// Exact retained module-function name, never an import or spelling alias.
+    ExactModuleSymbol(String),
     /// Stack slot index (resolved during frame lowering).
     StackSlot(u32),
     /// Memory address: base register + displacement.
@@ -832,6 +1199,17 @@ pub struct X86CallResultReg {
 impl X86CallResultReg {
     pub const fn new(reg: X86PReg, defined_bits: u16) -> Self {
         Self { reg, defined_bits }
+    }
+
+    /// Whether this result travels in an SSE register (`XMM0`/`XMM1`) rather
+    /// than a general-purpose one (`RAX`/`RDX`). The register FILE is the ABI
+    /// fact a cross-backend caller must agree on; a consumer that only has the
+    /// canonical register needs no `trust_cg_ir` register tables to read it.
+    pub fn is_sse(&self) -> bool {
+        matches!(
+            self.reg.reg_class(),
+            trust_cg_ir::x86_64_regs::X86RegClass::Xmm128
+        )
     }
 }
 
@@ -911,6 +1289,30 @@ pub struct X86ISelInst {
     /// instead of assuming every conventional return register (or every bit
     /// in its carrier) is defined by every call.
     pub call_result_regs: Option<Vec<X86CallResultReg>>,
+    /// Result registers this RET delivers BEYOND System V's C return file
+    /// (RAX,RDX / XMM0,XMM1): the part of TrustCG's internal multi-result
+    /// convention ([`x86_internal_multi_result_regs`]) this function's return
+    /// signature uses, with the low-bit width each defines.
+    ///
+    /// Empty on every instruction except the `ret` of a function whose scalar
+    /// results exhaust the C file, so every other function's instruction
+    /// stream, fingerprint and liveness are exactly what they were before the
+    /// extension existed. Post-RA liveness has always modeled a `ret` as
+    /// reading RAX,RDX and XMM0,XMM1 (an over-approximation of the C file);
+    /// these registers are read IN ADDITION, so a result placed in RCX..R9 or
+    /// XMM2..XMM7 stays live into the `ret` and no post-RA pass may treat its
+    /// setup move as dead. Set by `lower_return` from the one return
+    /// classifier.
+    ///
+    /// The register allocator's input is deliberately unchanged: like RAX and
+    /// RDX, these registers are not return sinks there (the x86 conversion
+    /// spells a fixed register as an implicit operand, which the allocation
+    /// validator's return-sink check does not accept as a producer). Soundness
+    /// in the return-move window rests instead on `lower_return` resolving
+    /// every source before its first fixed-register write: each value read in
+    /// the window is live across every earlier result register's def, which
+    /// the allocator's implicit-def reservation keeps it out of.
+    pub internal_return_regs: Vec<X86CallResultReg>,
     /// TV-1: which lowering-input (LIR) instruction produced this machine
     /// instruction.
     ///
@@ -954,6 +1356,7 @@ impl X86ISelInst {
             proof_origin: None,
             call_arg_regs: Vec::new(),
             call_result_regs,
+            internal_return_regs: Vec::new(),
             lowering_provenance: LoweringProvenance::UNATTRIBUTED,
         }
     }
@@ -967,6 +1370,7 @@ impl X86ISelInst {
             proof_origin: None,
             call_arg_regs: Vec::new(),
             call_result_regs,
+            internal_return_regs: Vec::new(),
             lowering_provenance: LoweringProvenance::UNATTRIBUTED,
         }
     }
@@ -988,6 +1392,13 @@ impl X86ISelInst {
     /// Record the exact physical result registers defined by this call.
     pub fn with_call_result_regs(mut self, call_result_regs: Vec<X86CallResultReg>) -> Self {
         self.call_result_regs = Some(call_result_regs);
+        self
+    }
+
+    /// Record the internal multi-result registers this RET delivers beyond
+    /// the System V C return file. See [`Self::internal_return_regs`].
+    pub fn with_internal_return_regs(mut self, regs: Vec<X86CallResultReg>) -> Self {
+        self.internal_return_regs = regs;
         self
     }
 }
@@ -1069,6 +1480,301 @@ pub struct X86JumpTableData {
 }
 
 // ---------------------------------------------------------------------------
+// TV-1 EXTENDED: source-operand correspondence
+// ---------------------------------------------------------------------------
+
+/// How one LIR SSA `Value` of one source instruction resolved to a machine
+/// operand during selection (TV-1 EXTENDED).
+///
+/// TV-1 records WHICH source instruction an emitted machine instruction came
+/// from; it does not record which machine operand each of that instruction's
+/// SSA operands became, so a verifier holding the stamp can bind the emitted
+/// instruction to a source instruction but not its symbolic inputs to that
+/// instruction's exact operands (`SourceInstDigest` is opcode + arities only).
+/// This is the missing correspondence.
+///
+/// It is recorded at the TWO selection chokepoints that resolve SSA values —
+/// [`X86InstructionSelector::use_value`] (operand reads) and
+/// [`X86InstructionSelector::define_value`] (result writes) — not at the ~432
+/// `push_inst` emission sites, so it cannot drift per emitting arm.
+///
+/// [`Self::Ambiguous`] is recorded, rather than the entry dropped, when the
+/// SAME `(source instruction, value)` pair resolved to DIFFERENT machine
+/// operands while that one source instruction was being lowered (e.g. an
+/// `Iconst` rematerialized mid-dispatch). A verifier must refuse to bind an
+/// ambiguous pair: which of the two operands a given emitted instruction read
+/// is exactly what is not recorded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum X86SourceOperandBinding {
+    /// The value resolved to exactly this machine operand, at this ISel-known
+    /// source WIDTH when one was recorded.
+    Exact {
+        /// The machine operand the value resolved to.
+        operand: X86ISelOperand,
+        /// The value's ISel-known source width in bits, when selection knew a
+        /// type for it. `None` for a value whose type ISel never recorded; a
+        /// verifier that needs width exactness must then refuse the binding.
+        ///
+        /// WIDTH, not the `Type`. The width is the whole of what the consumer
+        /// reads (`operand_matches` compares `bits` against the width the
+        /// obligation was built at), and one entry is recorded per resolved SSA
+        /// operand of every source instruction, so a deep-cloned `Type` — which
+        /// for a struct or array clones its entire field vector — was paying an
+        /// allocation per operand for a `u32`. It also keeps the
+        /// verifier-input identity CO-EXTENSIVE with what is consumed: two
+        /// selections that differ only in a recorded type of the same width are
+        /// indistinguishable to the binder, and now indistinguishable in the
+        /// identity too, rather than forking a certificate key on a difference
+        /// no check can see.
+        bits: Option<u32>,
+    },
+    /// The pair resolved to more than one distinct machine operand while the
+    /// source instruction was being lowered. Never bindable.
+    Ambiguous,
+}
+
+/// TV-1 EXTENDED table: `(source instruction, LIR value) -> machine operand`.
+///
+/// Empty for any function built outside the selector (hand-built proof
+/// fixtures, post-ISel reconstruction), so a consumer that requires an exact
+/// binding fails closed on those rather than guessing.
+///
+/// SCOPE (the same scoping TV-1 itself declares): entries describe the RAW
+/// pre-pass selection. Post-ISel passes that rewrite operands do not update
+/// this table, so a rewritten instruction's operands simply stop matching and
+/// the binding is refused. That is fail-closed: a stale entry can only WITHHOLD
+/// an exact binding, never manufacture one, because the check compares the
+/// EMITTED operand against the recorded one.
+#[derive(Debug, Clone, Default)]
+pub struct X86SourceOperandBindings {
+    map: HashMap<(SourceInstId, Value), X86SourceOperandBinding>,
+}
+
+impl X86SourceOperandBindings {
+    /// Record `value -> operand` for `source`, or mark the pair ambiguous when
+    /// a DIFFERENT operand was already recorded for it.
+    ///
+    /// First write wins for the operand; a conflicting second write poisons the
+    /// pair permanently (an ambiguous pair never returns to Exact).
+    ///
+    /// This is the selector's recording entry point (and the constructor a
+    /// verifier test uses to state a hypothetical selection). The table is
+    /// DECLARED selection metadata: it is authoritative only because every
+    /// consumer compares an entry against the EMITTED operand, so an entry that
+    /// does not describe the emission withholds a binding rather than
+    /// manufacturing one.
+    pub fn record(
+        &mut self,
+        source: SourceInstId,
+        value: Value,
+        operand: &X86ISelOperand,
+        ty: Option<&Type>,
+    ) {
+        use std::collections::hash_map::Entry;
+        // Only the WIDTH is retained; see `X86SourceOperandBinding::Exact::bits`
+        // for why that is both the whole of what a consumer reads and the
+        // cheaper thing to keep.
+        let bits = ty.map(Type::bits);
+        match self.map.entry((source, value)) {
+            Entry::Vacant(slot) => {
+                slot.insert(X86SourceOperandBinding::Exact {
+                    operand: operand.clone(),
+                    bits,
+                });
+            }
+            Entry::Occupied(mut slot) => {
+                let conflicting = match slot.get() {
+                    X86SourceOperandBinding::Exact {
+                        operand: existing, ..
+                    } => existing != operand,
+                    X86SourceOperandBinding::Ambiguous => false,
+                };
+                if conflicting {
+                    slot.insert(X86SourceOperandBinding::Ambiguous);
+                }
+            }
+        }
+    }
+
+    /// The recorded correspondence for `(source, value)`, if any.
+    pub fn get(&self, source: SourceInstId, value: Value) -> Option<&X86SourceOperandBinding> {
+        self.map.get(&(source, value))
+    }
+
+    /// Number of recorded pairs (ambiguous ones included).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether nothing was recorded at all.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Every recorded pair, in `(source, value)` key order — the deterministic
+    /// rendering the verifier-input identity needs.
+    pub fn sorted_entries(&self) -> Vec<((SourceInstId, Value), &X86SourceOperandBinding)> {
+        let mut entries: Vec<_> = self.map.iter().map(|(key, value)| (*key, value)).collect();
+        entries.sort_by_key(|((source, value), _)| (*source, value.0));
+        entries
+    }
+}
+
+/// TV-1 EXTENDED, ABI half: which SIGNATURE RETURN VALUE one return ABI move
+/// materializes, and under which convention.
+///
+/// The mirror image of [`X86FormalArgumentBinding`], for the other end of the
+/// function. A return move is stamped with the LIR `Return` it lowers, so the
+/// VALUE it copies IS a recorded operand of that instruction
+/// ([`X86SourceOperandBindings`] names it) — but its DESTINATION is a physical
+/// ABI register that no operand of the `Return` determines, and the destination
+/// is where a return move's whole claim lives. This records which return index
+/// the move materializes so a verifier can RE-DERIVE the register from the
+/// DECLARED signature and convention and check the emission against it.
+///
+/// DECLARED INPUTS, on the same terms as the formal-argument half: the
+/// signature and the convention are inputs to the compilation, and re-deriving
+/// from them does not establish that the convention is the right one for the
+/// target or that any caller honoured it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct X86ReturnAbiBinding {
+    /// Index into the signature's `returns`.
+    pub return_index: u32,
+    /// The return value's declared type.
+    pub ty: Type,
+    /// The calling convention selection classified the return file under.
+    pub abi: X86CallAbi,
+}
+
+/// TV-1 EXTENDED, ABI half: `destination return register -> return binding`.
+///
+/// Keyed by the DESTINATION physical register, which the scalar return
+/// convention assigns one-to-one to a return index, so the key identifies the
+/// return slot regardless of how many `Ret` sites the function has. Empty for a
+/// function built outside the selector.
+///
+/// Only the SINGLE-REGISTER scalar returns are recorded. An `i128` return
+/// occupies the whole `RAX:RDX` pair through two moves for ONE value, and an
+/// aggregate return is an sret store or a multi-lane sequence; neither is
+/// determined by a return index plus one register, so both are deliberately
+/// absent and a consumer requiring an exact binding refuses them.
+#[derive(Debug, Clone, Default)]
+pub struct X86ReturnAbiBindings {
+    map: HashMap<X86PReg, X86ReturnAbiBinding>,
+}
+
+impl X86ReturnAbiBindings {
+    /// Record the return binding of the move whose destination is `reg`.
+    /// Declared selection metadata on the same terms as
+    /// [`X86SourceOperandBindings::record`].
+    pub fn record(&mut self, reg: X86PReg, binding: X86ReturnAbiBinding) {
+        self.map.insert(reg, binding);
+    }
+
+    /// The return binding of the move targeting `reg`, if any.
+    pub fn get(&self, reg: X86PReg) -> Option<&X86ReturnAbiBinding> {
+        self.map.get(&reg)
+    }
+
+    /// Whether nothing was recorded at all.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Every recorded binding in register-encoding order — the deterministic
+    /// rendering the verifier-input identity needs.
+    pub fn sorted_entries(&self) -> Vec<(X86PReg, &X86ReturnAbiBinding)> {
+        let mut entries: Vec<_> = self.map.iter().map(|(key, value)| (*key, value)).collect();
+        entries.sort_by_key(|(reg, _)| reg.encoding());
+        entries
+    }
+}
+
+/// Where selection read a formal argument from, at function entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X86FormalArgumentLocation {
+    /// The argument arrived in this physical register, already width-aliased to
+    /// the parameter's type.
+    Register(X86PReg),
+    /// The argument arrived in the caller's outgoing-argument area, at
+    /// `[RBP + rbp_disp]`.
+    IncomingStack { rbp_disp: i32 },
+}
+
+/// TV-1 EXTENDED, ABI half: which SIGNATURE PARAMETER one formal-argument ABI
+/// move materializes, and from where.
+///
+/// A formal-argument move is stamped
+/// [`trust_cg_ir::provenance::SyntheticReason::FormalArguments`] precisely
+/// because it has no single source instruction — so the source-instruction
+/// operand correspondence ([`X86SourceOperandBindings`]) cannot name its
+/// operands, and a verifier holding only the stamp knows nothing about them at
+/// all. Its operands are nevertheless FULLY determined: by the function
+/// signature, the calling convention, and the parameter's index. This records
+/// exactly that, so a verifier can RE-DERIVE the location from the declared
+/// signature and check the emitted move against it.
+#[derive(Debug, Clone)]
+pub struct X86FormalArgumentBinding {
+    /// Index into the signature's `params`.
+    pub param_index: u32,
+    /// The parameter's declared type.
+    pub ty: Type,
+    /// The ABI location selection read the argument from.
+    pub location: X86FormalArgumentLocation,
+    /// The calling convention selection classified under. DECLARED INPUT, like
+    /// the signature itself: a verifier re-derives the location FROM it, and
+    /// does not establish that this convention was the right one for the
+    /// compilation target.
+    pub abi: X86CallAbi,
+    /// Whether the signature also carries a `returns`-driven hidden sret
+    /// pointer, which consumes the first integer argument register.
+    pub sret_return: bool,
+}
+
+/// TV-1 EXTENDED, ABI half: `destination vreg -> formal-argument binding`.
+///
+/// Keyed by the DESTINATION virtual register, which is freshly created for each
+/// materialized formal argument, so the key identifies the one move that
+/// defines it. Empty for a function built outside the selector.
+///
+/// Only the SCALAR parameter forms are recorded (a single register or a single
+/// incoming-stack slot). Aggregate parameters are materialized through stack
+/// slots by a multi-instruction sequence whose individual moves are not
+/// determined by the parameter index alone; they are deliberately absent, so a
+/// consumer requiring an exact binding refuses them.
+#[derive(Debug, Clone, Default)]
+pub struct X86FormalArgumentBindings {
+    map: HashMap<VReg, X86FormalArgumentBinding>,
+}
+
+impl X86FormalArgumentBindings {
+    /// Record the formal-argument binding of the move defining `vreg`. Declared
+    /// selection metadata on the same terms as
+    /// [`X86SourceOperandBindings::record`].
+    pub fn record(&mut self, vreg: VReg, binding: X86FormalArgumentBinding) {
+        self.map.insert(vreg, binding);
+    }
+
+    /// The formal-argument binding of the move that defines `vreg`, if any.
+    pub fn get(&self, vreg: VReg) -> Option<&X86FormalArgumentBinding> {
+        self.map.get(&vreg)
+    }
+
+    /// Whether nothing was recorded at all.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Every recorded binding in `VReg` order — the deterministic rendering the
+    /// verifier-input identity needs.
+    pub fn sorted_entries(&self) -> Vec<(VReg, &X86FormalArgumentBinding)> {
+        let mut entries: Vec<_> = self.map.iter().map(|(key, value)| (*key, value)).collect();
+        entries.sort_by_key(|(vreg, _)| *vreg);
+        entries
+    }
+}
+
+// ---------------------------------------------------------------------------
 // x86-64 ISel function
 // ---------------------------------------------------------------------------
 
@@ -1077,7 +1783,10 @@ pub struct X86JumpTableData {
 pub struct X86ISelFunction {
     pub name: String,
     pub sig: Signature,
-    pub blocks: HashMap<Block, X86ISelBlock>,
+    /// Keyed by the dense `u32` block id and probed by every pass, so it
+    /// uses the fixed-seed hasher (`trust_cg_ir::fast_hash`): no emitted byte
+    /// depends on this map's iteration order.
+    pub blocks: FxHashMap<Block, X86ISelBlock>,
     pub block_order: Vec<Block>,
     pub next_vreg: u32,
     /// Stack slot metadata propagated from LIR.
@@ -1174,6 +1883,194 @@ pub struct X86ISelFunction {
     /// so an accidentally dropped Store/Call/Atomic remains unwitnessed and
     /// fails closed.
     source_fusion_targets: HashMap<SourceInstId, SourceInstId>,
+    /// TV-1 EXTENDED: per source instruction, which machine operand each of
+    /// its LIR SSA operands resolved to during selection. See
+    /// [`X86SourceOperandBindings`] for what it is for and its scoping.
+    source_operand_bindings: X86SourceOperandBindings,
+    /// TV-1 EXTENDED, ABI half: per formal-argument ABI move, which signature
+    /// parameter it materializes and from where. See
+    /// [`X86FormalArgumentBindings`].
+    formal_argument_bindings: X86FormalArgumentBindings,
+    /// TV-1 EXTENDED, ABI half: per return ABI move, which signature return
+    /// value it materializes. See [`X86ReturnAbiBindings`].
+    return_abi_bindings: X86ReturnAbiBindings,
+}
+
+impl X86ISelFunction {
+    /// Canonical identity of everything supplied to the x86 proof verifier.
+    ///
+    /// The emitted byte stream alone omits symbol names, exact/interposable
+    /// binding, proof origins, implicit call registers, and TV-1 provenance.
+    /// This snapshot formats ordered fields directly and appends hash-backed
+    /// fields in key order. It is therefore complete for the current verifier
+    /// input without sacrificing deterministic warm-cache hits to per-process
+    /// `HashMap` seeding.
+    pub fn canonical_verifier_identity_bytes(&self) -> Result<Vec<u8>, std::fmt::Error> {
+        let mut out = String::new();
+        self.write_canonical_verifier_identity(&mut out)?;
+        Ok(out.into_bytes())
+    }
+
+    /// Stream [`Self::canonical_verifier_identity_bytes`] without cloning the
+    /// ISel function or constructing a whole-function string.
+    pub fn write_canonical_verifier_identity(
+        &self,
+        out: &mut impl std::fmt::Write,
+    ) -> std::fmt::Result {
+        // v5: the TV-1 EXTENDED operand table records a WIDTH rather than a
+        // `Type` (see `X86SourceOperandBinding::Exact::bits`), so its rendering
+        // in this snapshot changed. v6 adds the verifier-consumed return-ABI
+        // bindings. The tag moves with every change to the rendering or the
+        // field set, so a warm verdict keyed on an older spelling can never be
+        // served for a newer input.
+        // Every field by name, with no `..`: a new field, public or not,
+        // breaks this build until it is rendered here, so the identity stays
+        // complete for every consumer that compares two functions through it
+        // (the certificate cache; slice 24a's merged-chain quotient check in
+        // trust-cg-verify, which compares the crate-private tables only this
+        // way).
+        let Self {
+            name,
+            sig,
+            blocks,
+            block_order,
+            next_vreg,
+            stack_slots,
+            const_pool_entries,
+            jump_tables,
+            max_outgoing_call_bytes,
+            vreg_nominal_widths,
+            guard_obligations,
+            eh_info,
+            current_lowering_provenance,
+            source_mir_inst_count,
+            source_fusion_targets,
+            source_operand_bindings,
+            formal_argument_bindings,
+            return_abi_bindings,
+        } = self;
+        writeln!(out, "trust-cg.x86-isel.verifier-input.v6")?;
+        writeln!(out, "name={name:?}")?;
+        writeln!(out, "signature={sig:#?}")?;
+        writeln!(out, "block_order={block_order:?}")?;
+        writeln!(out, "next_vreg={next_vreg}")?;
+        writeln!(out, "stack_slots={stack_slots:#?}")?;
+        writeln!(out, "const_pool_entries={const_pool_entries:#?}")?;
+        writeln!(out, "jump_tables={jump_tables:#?}")?;
+        writeln!(out, "max_outgoing_call_bytes={max_outgoing_call_bytes}")?;
+        writeln!(out, "eh_info={eh_info:#?}")?;
+        writeln!(
+            out,
+            "current_lowering_provenance={current_lowering_provenance:#?}"
+        )?;
+        writeln!(out, "source_mir_inst_count={source_mir_inst_count}")?;
+
+        let mut blocks: Vec<_> = blocks.iter().collect();
+        blocks.sort_by_key(|(block, _)| **block);
+        writeln!(out, "blocks={}", blocks.len())?;
+        let mut float_payload_index = 0usize;
+        for (block, body) in blocks {
+            writeln!(out, "block[{block:?}]={body:#?}")?;
+            for instruction in &body.insts {
+                for operand in &instruction.operands {
+                    write_x86_float_payload_bits(out, operand, &mut float_payload_index)?;
+                }
+            }
+        }
+        writeln!(out, "float_payloads={float_payload_index}")?;
+
+        let mut vreg_nominal_widths: Vec<_> = vreg_nominal_widths.iter().collect();
+        vreg_nominal_widths.sort_by_key(|(vreg, _)| **vreg);
+        writeln!(out, "vreg_nominal_widths={}", vreg_nominal_widths.len())?;
+        for (vreg, width) in vreg_nominal_widths {
+            writeln!(out, "vreg_nominal_width[{vreg:?}]={width}")?;
+        }
+
+        let mut guard_obligations: Vec<_> = guard_obligations.iter().collect();
+        guard_obligations.sort_by_key(|(fingerprint, _)| **fingerprint);
+        writeln!(out, "guard_obligations={}", guard_obligations.len())?;
+        for (fingerprint, obligation) in guard_obligations {
+            writeln!(out, "guard_obligation[{fingerprint:#034x}]={obligation}")?;
+        }
+
+        let mut source_fusion_targets: Vec<_> = source_fusion_targets.iter().collect();
+        source_fusion_targets.sort_by_key(|(source, _)| **source);
+        writeln!(out, "source_fusion_targets={}", source_fusion_targets.len())?;
+        for (source, target) in source_fusion_targets {
+            writeln!(out, "source_fusion[{source:?}]={target:?}")?;
+        }
+
+        // TV-1 EXTENDED. This table is VERIFIER-CONSUMED (an exact operand
+        // binding is decided from it), so it MUST be part of the verifier-input
+        // identity: without it two functions that differ only in their recorded
+        // operand correspondence would share a certificate-cache verdict, and a
+        // warm hit could serve a bound verdict for an unbound input.
+        let source_operand_bindings = source_operand_bindings.sorted_entries();
+        writeln!(
+            out,
+            "source_operand_bindings={}",
+            source_operand_bindings.len()
+        )?;
+        for ((source, value), binding) in source_operand_bindings {
+            writeln!(out, "source_operand[{source:?}][{value:?}]={binding:?}")?;
+        }
+
+        // TV-1 EXTENDED, ABI half — verifier-consumed for the same reason, and
+        // bound into the identity for the same reason. Both halves: the entry
+        // parameter bindings and the return bindings.
+        let return_abi_bindings = return_abi_bindings.sorted_entries();
+        writeln!(out, "return_abi_bindings={}", return_abi_bindings.len())?;
+        for (reg, binding) in return_abi_bindings {
+            writeln!(out, "return_abi[{:?}]={binding:?}", reg.encoding())?;
+        }
+
+        let formal_argument_bindings = formal_argument_bindings.sorted_entries();
+        writeln!(
+            out,
+            "formal_argument_bindings={}",
+            formal_argument_bindings.len()
+        )?;
+        for (vreg, binding) in formal_argument_bindings {
+            writeln!(out, "formal_argument[{vreg:?}]={binding:?}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Append every verifier-visible IEEE payload in deterministic structural
+/// traversal order. Derived `Debug` collapses distinct NaN payloads, so it is
+/// not by itself a complete semantic identity for floating immediates.
+fn write_x86_float_payload_bits(
+    out: &mut impl std::fmt::Write,
+    operand: &X86ISelOperand,
+    index: &mut usize,
+) -> std::fmt::Result {
+    match operand {
+        X86ISelOperand::FImm(value) => {
+            writeln!(out, "float_payload[{index}]={:016x}", value.to_bits())?;
+            *index += 1;
+        }
+        X86ISelOperand::MemAddr { base, .. } => {
+            write_x86_float_payload_bits(out, base, index)?;
+        }
+        X86ISelOperand::SibMemAddr {
+            base, index: rhs, ..
+        } => {
+            write_x86_float_payload_bits(out, base, index)?;
+            write_x86_float_payload_bits(out, rhs, index)?;
+        }
+        X86ISelOperand::VReg(_)
+        | X86ISelOperand::PReg(_)
+        | X86ISelOperand::Imm(_)
+        | X86ISelOperand::Block(_)
+        | X86ISelOperand::CondCode(_)
+        | X86ISelOperand::Symbol(_)
+        | X86ISelOperand::ExactModuleSymbol(_)
+        | X86ISelOperand::StackSlot(_)
+        | X86ISelOperand::ConstPoolEntry(_)
+        | X86ISelOperand::JumpTableIndex(_) => {}
+    }
+    Ok(())
 }
 
 /// Nominal (pre-carrier) source bit width of a GPR-carried scalar integer/bool
@@ -1200,7 +2097,10 @@ fn nominal_width_for_type(ty: &Type) -> Option<u32> {
 /// physical return register. This is source-type authority, not carrier width:
 /// narrow integers do not bless the rest of RAX, and scalar FP values do not
 /// bless the rest of an XMM register. B1 follows this backend's established
-/// clean 32-bit boolean carrier convention.
+/// clean 32-bit boolean carrier convention: the width its own returns
+/// produce and the width a callee reads of a `bool` argument. A caller of
+/// another function's `bool` result relies on AL only (`lower_call_inner`
+/// narrows that call-site declaration to 8 bits and re-extends from AL).
 fn x86_call_result_defined_bits(ty: &Type) -> Option<u16> {
     match ty {
         Type::I8 => Some(8),
@@ -1219,10 +2119,11 @@ fn x86_call_result_defined_bits(ty: &Type) -> Option<u16> {
 ///
 /// The internal TrustIR multi-result convention allocates integer and XMM
 /// result registers from independent sequences, matching the established
-/// aggregate classifier and AArch64 return classifier. `I128` consumes the
-/// complete RAX:RDX pair. Keeping this as one classifier is load-bearing: call
-/// metadata, caller extraction, and callee emission must never disagree about
-/// which register carries a result.
+/// aggregate classifier and AArch64 return classifier. `I128` consumes two
+/// consecutive integer result registers (RAX:RDX when it is the first integer
+/// result). Keeping this as one classifier is load-bearing: call metadata,
+/// caller extraction, callee emission and the `ret`'s liveness metadata must
+/// never disagree about which register carries a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X86ScalarReturnLocation {
     Gpr { reg: X86PReg, defined_bits: u16 },
@@ -1243,27 +2144,134 @@ impl X86ScalarReturnLocation {
     }
 }
 
+/// The C RETURN register file of this x86-64 ABI, as `(integer, SSE)`.
+///
+/// The two ABIs on this ISA do NOT have the same return file, and the classifier
+/// below used to index System V's under both:
+///
+/// * **System V AMD64** returns the first two INTEGER-class components in
+///   RAX,RDX and the first two SSE-class ones in XMM0,XMM1 — `X86_RET_GPRS` /
+///   `X86_RET_XMMS` exactly.
+/// * **Windows x64** has NO second return register in either class. A scalar
+///   result comes back in RAX or XMM0 and anything wider than one register goes
+///   through a hidden sret pointer; RDX and XMM1 are ordinary volatile
+///   registers there, not results.
+///
+/// Expressed as a PREFIX of the SysV file rather than as a separate array
+/// because that is the actual relationship: the two ABIs agree on the first
+/// register of each class and differ only in how far the file extends. A
+/// Windows-x64 compile of a two-component scalar return previously emitted a
+/// second `mov` into RDX (or XMM1) that no Win64 caller reads — witnessed by
+/// disassembling the emitted COFF, not inferred. There is no Win64 placement to
+/// emit instead, so the classifier now fails closed.
+fn x86_c_return_file(abi: X86CallAbi) -> (&'static [X86PReg], &'static [X86PReg]) {
+    match abi {
+        X86CallAbi::SystemV => (&X86_RET_GPRS[..], &X86_RET_XMMS[..]),
+        X86CallAbi::WindowsX64 => (&X86_RET_GPRS[..1], &X86_RET_XMMS[..1]),
+    }
+}
+
+/// The register file [`classify_x86_scalar_return_locations`] allocates
+/// scalar results from, as `(integer, SSE)`.
+///
+/// * **System V**: TrustCG's internal multi-result file
+///   ([`X86_INTERNAL_RET_GPRS`] RAX,RDX,RCX,RSI,RDI,R8,R9 and
+///   [`X86_INTERNAL_RET_XMMS`] XMM0-XMM7). Its first two registers of each
+///   class ARE the C file, and allocation runs from the front, so every
+///   sequence the C file places is placed identically; only a sequence that
+///   exhausts the C file uses the extension. The adapter admits that only on
+///   an edge whose calling convention is TrustCG's own, `Fast` or `Cold`
+///   (`[TCG-X86-MULTI-RESULT]`), which is what makes a non-C placement sound
+///   there.
+/// * **Windows x64**: the C file, RAX / XMM0 alone. No internal extension is
+///   defined for it, so everything wider still fails closed.
+fn x86_scalar_return_file(abi: X86CallAbi) -> (&'static [X86PReg], &'static [X86PReg]) {
+    match abi {
+        X86CallAbi::SystemV => (&X86_INTERNAL_RET_GPRS[..], &X86_INTERNAL_RET_XMMS[..]),
+        X86CallAbi::WindowsX64 => x86_c_return_file(abi),
+    }
+}
+
+/// Why this ABI ran out of INTEGER return registers, in that ABI's own terms.
+fn x86_int_return_exhausted_reason(abi: X86CallAbi) -> &'static str {
+    match abi {
+        X86CallAbi::SystemV => {
+            "integer result register capacity is exhausted: TrustCG's internal System V \
+             multi-result file is RAX,RDX,RCX,RSI,RDI,R8,R9; never alias an earlier result"
+        }
+        X86CallAbi::WindowsX64 => {
+            "Windows x64 returns a single integer scalar in RAX and everything wider through a \
+             hidden sret pointer, so it has no second integer result register; never alias an \
+             earlier result"
+        }
+    }
+}
+
+/// Why this ABI ran out of SSE return registers, in that ABI's own terms.
+fn x86_sse_return_exhausted_reason(abi: X86CallAbi) -> &'static str {
+    match abi {
+        X86CallAbi::SystemV => {
+            "XMM result register capacity is exhausted: TrustCG's internal System V \
+             multi-result file is XMM0-XMM7; never alias an earlier result"
+        }
+        X86CallAbi::WindowsX64 => {
+            "Windows x64 returns a single FP scalar in XMM0 and everything wider through a hidden \
+             sret pointer, so it has no second XMM result register; never alias an earlier result"
+        }
+    }
+}
+
 fn classify_x86_scalar_return_locations(
     returns: &[Type],
     abi: X86CallAbi,
 ) -> Result<Vec<X86ScalarReturnLocation>, X86ISelError> {
+    classify_x86_scalar_returns_in(returns, abi, x86_scalar_return_file(abi)).map_err(|refusal| {
+        X86ISelError::UnsupportedScalarReturnAbi {
+            index: refusal.index,
+            ty: returns[refusal.index].clone(),
+            abi,
+            reason: refusal.reason,
+        }
+    })
+}
+
+/// Why [`classify_x86_scalar_returns_in`] placed no location for result
+/// `index`: the register file ran out (`exhausted`), or the type has no scalar
+/// placement at all.
+struct X86ScalarReturnRefusal {
+    index: usize,
+    exhausted: bool,
+    reason: &'static str,
+}
+
+/// The one scalar return classifier, over an explicit `(integer, SSE)` file.
+/// Production allocates from [`x86_scalar_return_file`]; the C file is passed
+/// only to ask whether a signature leaves it
+/// ([`x86_sysv_returns_exceed_c_return_file`]).
+fn classify_x86_scalar_returns_in(
+    returns: &[Type],
+    abi: X86CallAbi,
+    (ret_gprs, ret_xmms): (&[X86PReg], &[X86PReg]),
+) -> Result<Vec<X86ScalarReturnLocation>, X86ScalarReturnRefusal> {
     let mut gpr_idx = 0usize;
     let mut xmm_idx = 0usize;
     let mut locations = Vec::with_capacity(returns.len());
 
     for (index, ty) in returns.iter().enumerate() {
-        let unsupported = |reason| X86ISelError::UnsupportedScalarReturnAbi {
+        let unsupported = |reason| X86ScalarReturnRefusal {
             index,
-            ty: ty.clone(),
-            abi,
+            exhausted: false,
+            reason,
+        };
+        let exhausted = |reason| X86ScalarReturnRefusal {
+            index,
+            exhausted: true,
             reason,
         };
         match ty {
             Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
-                let Some(&reg) = X86_RET_GPRS.get(gpr_idx) else {
-                    return Err(unsupported(
-                        "integer result register capacity is exhausted; never alias an earlier result",
-                    ));
+                let Some(&reg) = ret_gprs.get(gpr_idx) else {
+                    return Err(exhausted(x86_int_return_exhausted_reason(abi)));
                 };
                 let defined_bits = x86_call_result_defined_bits(ty).ok_or_else(|| {
                     unsupported("scalar result has no exact physical-register width")
@@ -1277,9 +2285,10 @@ fn classify_x86_scalar_return_locations(
                         "Windows x64 i128 return placement is not implemented",
                     ));
                 }
-                let Some(pair) = X86_RET_GPRS.get(gpr_idx..gpr_idx + 2) else {
-                    return Err(unsupported(
-                        "i128 needs the complete RAX:RDX pair, but integer result register capacity is exhausted",
+                let Some(pair) = ret_gprs.get(gpr_idx..gpr_idx + 2) else {
+                    return Err(exhausted(
+                        "i128 needs two consecutive integer result registers, but integer result \
+                         register capacity is exhausted",
                     ));
                 };
                 locations.push(X86ScalarReturnLocation::GprPair {
@@ -1289,10 +2298,8 @@ fn classify_x86_scalar_return_locations(
                 gpr_idx += 2;
             }
             Type::F32 | Type::F64 => {
-                let Some(&reg) = X86_RET_XMMS.get(xmm_idx) else {
-                    return Err(unsupported(
-                        "XMM result register capacity is exhausted; never alias an earlier result",
-                    ));
+                let Some(&reg) = ret_xmms.get(xmm_idx) else {
+                    return Err(exhausted(x86_sse_return_exhausted_reason(abi)));
                 };
                 let defined_bits = x86_call_result_defined_bits(ty).ok_or_else(|| {
                     unsupported("scalar result has no exact physical-register width")
@@ -1306,10 +2313,8 @@ fn classify_x86_scalar_return_locations(
                 ));
             }
             Type::V128 if abi == X86CallAbi::SystemV => {
-                let Some(&reg) = X86_RET_XMMS.get(xmm_idx) else {
-                    return Err(unsupported(
-                        "XMM result register capacity is exhausted; never alias an earlier result",
-                    ));
+                let Some(&reg) = ret_xmms.get(xmm_idx) else {
+                    return Err(exhausted(x86_sse_return_exhausted_reason(abi)));
                 };
                 locations.push(X86ScalarReturnLocation::Xmm {
                     reg,
@@ -1359,12 +2364,64 @@ pub fn x86_scalar_return_result_regs(
     Some(regs)
 }
 
+/// Whether a physical result register lies OUTSIDE System V's C return file
+/// (RAX,RDX / XMM0,XMM1) — i.e. in TrustCG's internal multi-result extension.
+fn x86_is_internal_multi_result_reg(reg: X86PReg) -> bool {
+    !X86_RET_GPRS.contains(&reg) && !X86_RET_XMMS.contains(&reg)
+}
+
+/// The result registers a scalar return of `returns` under `abi` places
+/// OUTSIDE the System V C return file — TrustCG's internal multi-result
+/// extension (RCX,RSI,RDI,R8,R9 / XMM2-XMM7) — from the SAME classifier call
+/// metadata, caller extraction and callee emission use.
+///
+/// Empty for every sequence the C file places — every scalar return this
+/// backend placed before the extension existed — and for every shape the
+/// scalar classifier refuses or does not own (sret, aggregate lanes, Windows x64 beyond one register): those
+/// keep their existing lowering and diagnostics. `lower_return` stamps this
+/// set on the `ret` ([`X86ISelInst::internal_return_regs`]) so post-RA liveness
+/// sees those registers live into the return.
+#[must_use]
+pub fn x86_internal_multi_result_regs(returns: &[Type], abi: X86CallAbi) -> Vec<X86CallResultReg> {
+    x86_scalar_return_result_regs(returns, abi)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|result| x86_is_internal_multi_result_reg(result.reg))
+        .collect()
+}
+
+/// Whether System V's C return file (RAX,RDX / XMM0,XMM1) runs out of
+/// registers for a scalar return of `returns` — i.e. whether the signature
+/// leaves the C ABI and needs TrustCG's internal multi-result convention.
+///
+/// The adapter's `[TCG-X86-MULTI-RESULT]` admission asks exactly this before
+/// lowering. It is answered by the one return classifier run over the C file,
+/// not by a second count that could drift from it, and it is `true` even when
+/// the internal file runs out too, so a C-convention signature is refused by
+/// its convention rather than by the internal file's capacity. `false` for a
+/// shape the scalar classifier does not own (aggregates, `f16`, `V64`): those
+/// keep their own lowering and diagnostics.
+#[must_use]
+pub fn x86_sysv_returns_exceed_c_return_file(returns: &[Type]) -> bool {
+    matches!(
+        classify_x86_scalar_returns_in(
+            returns,
+            X86CallAbi::SystemV,
+            x86_c_return_file(X86CallAbi::SystemV),
+        ),
+        Err(X86ScalarReturnRefusal {
+            exhausted: true,
+            ..
+        })
+    )
+}
+
 impl X86ISelFunction {
     pub fn new(name: String, sig: Signature) -> Self {
         Self {
             name,
             sig,
-            blocks: HashMap::new(),
+            blocks: FxHashMap::default(),
             block_order: Vec::new(),
             next_vreg: 0,
             stack_slots: Vec::new(),
@@ -1377,6 +2434,9 @@ impl X86ISelFunction {
             current_lowering_provenance: LoweringProvenance::UNATTRIBUTED,
             source_mir_inst_count: 0,
             source_fusion_targets: HashMap::new(),
+            source_operand_bindings: X86SourceOperandBindings::default(),
+            return_abi_bindings: X86ReturnAbiBindings::default(),
+            formal_argument_bindings: X86FormalArgumentBindings::default(),
         }
     }
 
@@ -1396,6 +2456,52 @@ impl X86ISelFunction {
     pub fn record_vreg_nominal_width(&mut self, vreg: VReg, ty: &Type) {
         if let Some(bits) = nominal_width_for_type(ty) {
             self.vreg_nominal_widths.insert(vreg, bits);
+        }
+    }
+
+    /// TV-1 EXTENDED: the recorded `(source instruction, value) -> operand`
+    /// correspondence for this function. Empty for a function not built by the
+    /// selector, so an exact-binding consumer fails closed on those.
+    pub fn source_operand_bindings(&self) -> &X86SourceOperandBindings {
+        &self.source_operand_bindings
+    }
+
+    /// TV-1 EXTENDED, ABI half: the recorded formal-argument bindings.
+    pub fn formal_argument_bindings(&self) -> &X86FormalArgumentBindings {
+        &self.formal_argument_bindings
+    }
+
+    /// TV-1 EXTENDED, ABI half: record the formal-argument binding of the move
+    /// that defines `vreg`.
+    fn record_formal_argument_binding(&mut self, vreg: VReg, binding: X86FormalArgumentBinding) {
+        self.formal_argument_bindings.record(vreg, binding);
+    }
+
+    /// TV-1 EXTENDED, ABI half: the recorded return-ABI bindings.
+    pub fn return_abi_bindings(&self) -> &X86ReturnAbiBindings {
+        &self.return_abi_bindings
+    }
+
+    /// TV-1 EXTENDED, ABI half: record the return binding of the move whose
+    /// destination is `reg`.
+    fn record_return_abi_binding(&mut self, reg: X86PReg, binding: X86ReturnAbiBinding) {
+        self.return_abi_bindings.record(reg, binding);
+    }
+
+    /// TV-1 EXTENDED: record that `value` resolved to `operand` while the
+    /// CURRENT source instruction was being lowered. A no-op outside a
+    /// source-instruction stamping window (synthetic ABI glue, post-ISel
+    /// emission) — those instructions have no source instruction whose operands
+    /// could be named, and under-recording is always safe here.
+    fn record_source_operand_binding(
+        &mut self,
+        value: Value,
+        operand: &X86ISelOperand,
+        ty: Option<&Type>,
+    ) {
+        if let Some(source) = self.current_lowering_provenance.source_id() {
+            self.source_operand_bindings
+                .record(source, value, operand, ty);
         }
     }
 
@@ -1528,7 +2634,7 @@ enum X86UnaryOp {
 }
 
 enum X86CallTarget<'a> {
-    Direct(&'a str),
+    Direct { name: &'a str, exact_module: bool },
     Indirect(X86ISelOperand),
 }
 
@@ -1618,6 +2724,12 @@ pub struct X86InstructionSelector {
     /// must still satisfy SSA dominance and continue to error via
     /// `X86ISelError::UndefinedValue`.
     iconst_origins: HashMap<Value, (Type, i64)>,
+    /// `Iconst128 { lo, hi }` results of the same pre-scan, as `(lo, hi)`.
+    /// Read ONLY as a 128-bit shift's constant amount
+    /// ([`Self::i128_const_shift_amount`]); never rematerialized (a use of an
+    /// `Iconst128` result outside its definition's region still fails as
+    /// `UndefinedValue`, as before).
+    iconst128_origins: HashMap<Value, (i64, i64)>,
     /// Block currently being selected, used as the rematerialization site for
     /// cross-block `iconst` lookups. Set by `select_block` and cleared at the
     /// end of selection.
@@ -1643,6 +2755,53 @@ pub struct X86InstructionSelector {
     /// analysis via `seed_pure_callees`. Mirrors the AArch64 `isel.rs`
     /// `pure_callees` plumbing.
     pure_callees: HashSet<String>,
+    /// This function's own hidden return-buffer (`sret`) parameter index, from
+    /// `Function::abi_sret_param`.
+    ///
+    /// System V x86-64 passes the indirect-result address as an ordinary
+    /// LEADING integer argument (in `RDI`), which is exactly where a leading
+    /// pointer parameter already lands — so unlike AAPCS64 this selector needs
+    /// no special placement and the structural shape is correct by
+    /// construction. The index is carried anyway so the fact is CHECKED here
+    /// rather than assumed: it is refused if it would collide with the
+    /// signature's own `returns`-driven sret reservation (which also claims
+    /// `RDI`), or if the parameter is not the pointer carrier.
+    sret_param_index: Option<u32>,
+    /// Direct-call callee symbols whose ARGUMENT 0 is a hidden return-buffer
+    /// (`sret`) pointer, from `Function::sret_arg_callees`. Used only to REFUSE
+    /// a call that would claim `RDI` twice; the placement itself is the
+    /// ordinary leading-integer-argument rule.
+    sret_arg_callees: HashSet<String>,
+    /// Indirect-call callee VALUES whose ARGUMENT 0 is a hidden return-buffer
+    /// pointer, from `Function::sret_arg_indirect_callees`. Same use as
+    /// `sret_arg_callees`: refuse a `CallIndirect` that would also expect a
+    /// result; the placement is the ordinary leading-integer-argument rule.
+    sret_arg_indirect_callees: HashSet<Value>,
+    /// Registers this selector defined with a WHOLE-register write whose bits
+    /// at and above the recorded count are zero: the destination of a
+    /// zero-extending load (`MovzxRM8`/`MovzxRM16`, plain, volatile or
+    /// atomic: 8 or 16) and a loaded bool's `(m + 255) >> 8` (1). Each such
+    /// register is the fresh destination of exactly one selected instruction
+    /// and no selection rewrites it, so the fact holds at every use. A
+    /// consumer that would re-extend the value from at least that width
+    /// (`movzx` from 8 or 16 bits, a bool's `and 1`) copies it instead
+    /// ([`Self::zero_extension_is_redundant`]).
+    zero_extended_vregs: HashMap<VReg, u32>,
+    /// Every block parameter of the function being selected, when the caller
+    /// seeded the whole function ([`Self::seed_function_value_use_counts`]).
+    /// A block parameter is written by a copy in EACH predecessor, so a copy
+    /// into one never carries a zero-extension fact; without the seed no copy
+    /// does (a parameter's first copy may be lowered before its block, when
+    /// it still looks like a fresh destination).
+    block_param_values: Option<HashSet<Value>>,
+    /// Whether a 128-bit shift by a defined constant amount takes the folded
+    /// immediate form ([`Self::emit_i128_const_shift`], ruling OD-215) rather
+    /// than the general CL/CMOV path. DEFAULT ON; `TCG_NO_X86_I128_CONST_SHIFT`
+    /// (any value but `0`) opts a standalone compile out, and
+    /// [`Self::set_i128_const_shift_fold`] sets it per selector (the
+    /// fails-before tests and the body theorem's golden custody render the old
+    /// path).
+    fold_i128_const_shifts: bool,
 }
 
 impl X86InstructionSelector {
@@ -1677,11 +2836,26 @@ impl X86InstructionSelector {
             v128_boolean_mask_values: HashSet::new(),
             scalarize_v4i32_imul_with_sse2: false,
             iconst_origins: HashMap::new(),
+            iconst128_origins: HashMap::new(),
             current_block: None,
             i128_high_map: HashMap::new(),
             store_leaf_v4i32_mul_results: HashSet::new(),
             pure_callees: HashSet::new(),
+            sret_param_index: None,
+            sret_arg_callees: HashSet::new(),
+            sret_arg_indirect_callees: HashSet::new(),
+            zero_extended_vregs: HashMap::new(),
+            block_param_values: None,
+            fold_i128_const_shifts: x86_i128_const_shift_fold_enabled(),
         }
+    }
+
+    /// Fold (`true`, the default) or keep on the general CL/CMOV path
+    /// (`false`) every 128-bit shift by a defined constant amount this
+    /// selector lowers (OD-215). The general path is the one every amount
+    /// took before the fold, byte for byte.
+    pub fn set_i128_const_shift_fold(&mut self, enabled: bool) {
+        self.fold_i128_const_shifts = enabled;
     }
 
     /// Seed the set of callee symbol names proven pure by the module-level
@@ -1690,6 +2864,49 @@ impl X86InstructionSelector {
     pub fn seed_pure_callees(&mut self, names: &HashSet<String>) {
         for name in names {
             self.pure_callees.insert(name.clone());
+        }
+    }
+
+    /// Seed this function's own hidden return-buffer (`sret`) parameter, from
+    /// `Function::abi_sret_param`. Only a LEADING hidden parameter is lowered:
+    /// System V's rule is "as if it were the first integer argument", and any
+    /// other position is a convention this selector does not implement.
+    pub fn seed_sret_param(
+        &mut self,
+        param: Option<crate::function::AbiSretParam>,
+    ) -> Result<(), X86ISelError> {
+        match param {
+            None => {
+                self.sret_param_index = None;
+                Ok(())
+            }
+            Some(p) if p.param_index == 0 => {
+                self.sret_param_index = Some(0);
+                Ok(())
+            }
+            Some(p) => Err(X86ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] hidden return-buffer parameter at index {} is not lowered: \
+                 System V passes the indirect-result pointer as the FIRST integer argument \
+                 and this selector implements only that position. Failing closed.",
+                p.param_index
+            ))),
+        }
+    }
+
+    /// Seed the direct-call callee symbols whose argument 0 is a hidden
+    /// return-buffer (`sret`) pointer, from `Function::sret_arg_callees`.
+    pub fn seed_sret_arg_callees(&mut self, names: &HashSet<String>) {
+        for name in names {
+            self.sret_arg_callees.insert(name.clone());
+        }
+    }
+
+    /// Seed the indirect-call callee values whose argument 0 is a hidden
+    /// return-buffer (`sret`) pointer, from
+    /// `Function::sret_arg_indirect_callees`.
+    pub fn seed_sret_arg_indirect_callees(&mut self, callees: &HashSet<Value>) {
+        for callee in callees {
+            self.sret_arg_indirect_callees.insert(*callee);
         }
     }
 
@@ -1776,6 +2993,10 @@ impl X86InstructionSelector {
         if let X86ISelOperand::VReg(vreg) = &operand {
             self.func.record_vreg_nominal_width(*vreg, &ty);
         }
+        // TV-1 EXTENDED: a result written while a source instruction is being
+        // lowered is that instruction's result operand.
+        self.func
+            .record_source_operand_binding(val, &operand, Some(&ty));
         self.value_map.insert(val, operand);
         self.value_types.insert(val, ty);
     }
@@ -1802,6 +3023,12 @@ impl X86InstructionSelector {
     /// Seed use counts from a complete LIR function.
     pub fn seed_function_value_use_counts(&mut self, func: &LirFunction) {
         self.value_use_counts = Some(Self::function_value_use_counts(func.blocks.values()));
+        self.block_param_values = Some(
+            func.blocks
+                .values()
+                .flat_map(|block| block.params.iter().map(|(value, _)| *value))
+                .collect(),
+        );
     }
 
     /// Set stack slot metadata from the LIR function.
@@ -1819,11 +3046,19 @@ impl X86InstructionSelector {
     /// the producer to dominate every consumer.
     pub fn use_value(&mut self, val: &Value) -> Result<X86ISelOperand, X86ISelError> {
         if let Some(operand) = self.value_map.get(val).cloned() {
+            // TV-1 EXTENDED: this is the operand the CURRENT source
+            // instruction's lowering reads for `val`. The recorded type is read
+            // by reference and reduced to its width on the spot, so a wide
+            // aggregate type is not cloned once per resolved operand.
+            self.func
+                .record_source_operand_binding(*val, &operand, self.value_types.get(val));
             return Ok(operand);
         }
         if let Some((ty, imm)) = self.iconst_origins.get(val).cloned()
             && let Some(block) = self.current_block
         {
+            // `rematerialize_iconst` routes through `define_value`, which
+            // records the correspondence for the freshly materialized operand.
             return Ok(self.rematerialize_iconst(*val, ty, imm, block));
         }
         Err(X86ISelError::UndefinedValue(*val))
@@ -1841,6 +3076,11 @@ impl X86InstructionSelector {
                     && let Some(result) = inst.results.first()
                 {
                     self.iconst_origins.insert(*result, (ty.clone(), *imm));
+                }
+                if let Opcode::Iconst128 { lo, hi } = &inst.opcode
+                    && let Some(result) = inst.results.first()
+                {
+                    self.iconst128_origins.insert(*result, (*lo, *hi));
                 }
             }
         }
@@ -3054,7 +4294,23 @@ impl X86InstructionSelector {
         Ok(Some(26))
     }
 
-    fn v4i32_mask_shuffle_imm(lane_values: [i64; 4]) -> i64 {
+    /// The PSHUFD `imm8` this selector emits for a `v4i32` all-ones/zero mask
+    /// constant, packed selector by selector.
+    ///
+    /// The seed register holds `[-1, 0, 0, 0]`, so lane `l` selects source
+    /// doubleword 0 for an all-ones lane and doubleword 1 for a zero one, and
+    /// the selector goes in ORDER field `l` — `imm[2l+1:2l]` — which is the
+    /// SDM's convention for PSHUFD.
+    ///
+    /// PUBLIC on purpose: this is the only PSHUFD immediate the backend
+    /// COMPUTES rather than spelling literally, and the SSE lane proof family
+    /// (`trust-cg-verify`'s `x86_sse_lane_gate`) pins this packing against the
+    /// SDM's ORDER-field convention. Its obligation compares a permutation
+    /// unpacked from the emitted byte against one recorded as the intent, and
+    /// for the literal immediates BOTH sides are transcribed from isel, so the
+    /// comparison cannot see an isel-side packing bug. This entry point is what
+    /// makes the computed family an exception; do not inline it away.
+    pub fn v4i32_mask_shuffle_imm(lane_values: [i64; 4]) -> i64 {
         lane_values
             .into_iter()
             .enumerate()
@@ -4061,8 +5317,8 @@ impl X86InstructionSelector {
         block: Block,
     ) -> X86ISelOperand {
         let opcode = match ty {
-            Type::I8 => X86Opcode::Movzx,
-            Type::I16 => X86Opcode::MovzxW,
+            Type::I8 => self.narrow_zero_extend_opcode(&operand, 8),
+            Type::I16 => self.narrow_zero_extend_opcode(&operand, 16),
             // I32/I64 already occupy their native carrier width; B1 is {0,1}.
             _ => return operand,
         };
@@ -4704,21 +5960,21 @@ impl X86InstructionSelector {
             }
             Opcode::Memcpy => self.select_memory_intrinsic_call(
                 "Memcpy",
-                "memcpy",
+                RuntimeSymbol::Memcpy,
                 [Type::I64, Type::I64, Type::I64],
                 inst,
                 block,
             )?,
             Opcode::Memmove => self.select_memory_intrinsic_call(
                 "Memmove",
-                "memmove",
+                RuntimeSymbol::Memmove,
                 [Type::I64, Type::I64, Type::I64],
                 inst,
                 block,
             )?,
             Opcode::Memset => self.select_memory_intrinsic_call(
                 "Memset",
-                "memset",
+                RuntimeSymbol::Memset,
                 [Type::I64, Type::I32, Type::I64],
                 inst,
                 block,
@@ -4744,6 +6000,11 @@ impl X86InstructionSelector {
             } => self.select_struct_gep(struct_ty.clone(), *field_index, inst, block)?,
             Opcode::ArrayGep { elem_ty } => self.select_array_gep(elem_ty.clone(), inst, block)?,
             Opcode::GlobalRef { name } => self.select_global_ref(name, inst, block)?,
+            Opcode::FunctionAddr { name, .. } => self.select_symbol_address(
+                X86ISelOperand::ExactModuleSymbol(name.clone()),
+                inst,
+                block,
+            )?,
             Opcode::ExternRef { name } => self.select_extern_ref(name, inst, block)?,
             Opcode::TlsRef {
                 name,
@@ -4760,7 +6021,9 @@ impl X86InstructionSelector {
                 ..
             } => self.select_condbranch(inst, *then_dest, *else_dest, block)?,
             Opcode::Return => self.lower_return(inst, block)?,
-            Opcode::Call { name } => self.lower_call(name, inst, block)?,
+            Opcode::Call { name, binding } => {
+                self.lower_call_with_binding(name, *binding, inst, block)?
+            }
             Opcode::CallIndirect => self.lower_call_indirect(inst, block)?,
             Opcode::CallVariadic { name, fixed_args } => {
                 self.lower_variadic_call(name, *fixed_args as usize, inst, block)?
@@ -4794,10 +6057,11 @@ impl X86InstructionSelector {
             // Exception handling (EH x86 Lane 1). These arms lower the three
             // TrustIr EH primitives to their System V / Itanium x86-64 forms.
             Opcode::Invoke {
+                binding,
                 name,
                 normal_dest,
                 unwind_dest,
-            } => self.select_invoke(name, *normal_dest, *unwind_dest, inst, block)?,
+            } => self.select_invoke(name, *binding, *normal_dest, *unwind_dest, inst, block)?,
             Opcode::LandingPad {
                 is_cleanup,
                 catch_type_indices,
@@ -4836,13 +6100,25 @@ impl X86InstructionSelector {
     fn select_invoke(
         &mut self,
         name: &str,
+        binding: DirectCallBinding,
         normal_dest: Block,
         unwind_dest: Block,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), X86ISelError> {
+        // Closed native dependency fixups do not model protected Invoke sites.
+        // Even a sealed Call selector may not silently use a symbol for one.
+        if matches!(
+            binding,
+            DirectCallBinding::DeclaredExternalFunction { .. }
+                | DirectCallBinding::NativeDependency { .. }
+        ) {
+            return Err(X86ISelError::UnsupportedOpcode(format!(
+                "authenticated invoke {binding:?} requires a closed native/EH dependency pipeline"
+            )));
+        }
         // 1. Lower the throwing call exactly like a normal Call.
-        self.lower_call(name, inst, block)?;
+        self.lower_call_with_binding(name, binding, inst, block)?;
 
         // 2. Branch to the normal (non-throwing) continuation. `select_branch`
         //    emits the `JMP normal_dest` AND records `normal_dest` as a
@@ -4956,7 +6232,9 @@ impl X86InstructionSelector {
             block,
             X86ISelInst::new(
                 X86Opcode::Call,
-                vec![X86ISelOperand::Symbol("_Unwind_Resume".to_string())],
+                vec![X86ISelOperand::Symbol(
+                    RuntimeSymbol::UnwindResume.name().to_string(),
+                )],
             )
             .with_call_arg_regs(vec![X86CallArgReg::new(RDI, 64)])
             .with_call_result_regs(vec![]),
@@ -4997,6 +6275,11 @@ impl X86InstructionSelector {
     /// obligation ONLY from a real `ProofAnnotation::DivNonZero`). An unproven /
     /// unbound carrier is KEPT by the kernel and restored to the same eager trap by
     /// the expansion — exactly the pre-S5 behaviour.
+    ///
+    /// An I128 divisor is a `(lo, hi)` register pair, and `TEST` of either half
+    /// alone is not a zero test of the value (`1 << 64` has `lo == 0`), so the
+    /// carrier operand is then a fresh `OR d, lo, hi`: zero iff the whole 128-bit
+    /// divisor is zero, the predicate `GuardDivZero` states.
     fn select_guard_div_zero(
         &mut self,
         inst: &Instruction,
@@ -5005,7 +6288,7 @@ impl X86InstructionSelector {
     ) -> Result<(), X86ISelError> {
         Self::require_args(inst, 1, "GuardDivZero")?;
 
-        let divisor = self.use_value(&inst.args[0])?;
+        let divisor = self.guard_div_zero_operand(&inst.args[0], block)?;
 
         // Sentinel: record this carrier's discharged-obligation binding, keyed by
         // the SAME operand fingerprint the Certified-Elimination Kernel computes
@@ -5030,6 +6313,32 @@ impl X86InstructionSelector {
         );
 
         Ok(())
+    }
+
+    /// The single GPR operand whose zero test is the zero test of the divisor `dv`.
+    ///
+    /// A scalar divisor is its own operand. An I128 divisor (typed I128, or bound
+    /// as a register pair) is folded to `OR d, lo, hi` in a fresh GPR64, and a
+    /// missing high half fails closed with `UndefinedValue` rather than testing
+    /// the low half alone.
+    fn guard_div_zero_operand(
+        &mut self,
+        dv: &Value,
+        block: Block,
+    ) -> Result<X86ISelOperand, X86ISelError> {
+        let is_i128 = self.value_type(dv) == Type::I128
+            || self.i128_high_map.contains_key(dv)
+            || matches!(self.iconst_origins.get(dv), Some((Type::I128, _)));
+        if !is_i128 {
+            return self.use_value(dv);
+        }
+        let (lo, hi) = self.use_i128_value(dv)?;
+        let any_bit = X86ISelOperand::VReg(self.new_vreg(RegClass::Gpr64));
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(X86Opcode::OrRR, vec![any_bit.clone(), lo, hi]),
+        );
+        Ok(any_bit)
     }
 
     /// Select proof-only null guard.
@@ -5253,12 +6562,16 @@ impl X86InstructionSelector {
         let cond_ty = self.value_type(&cond_val);
         let cond_op = self.use_value(&cond_val)?;
         self.emit_condition_zero_test(&cond_ty, IntCC::Equal, cond_op, block);
-        self.emit_conditional_trap_edge(block, X86CondCode::E);
+        self.emit_conditional_trap_edge(block, X86CondCode::E)?;
         Ok(())
     }
 
-    fn emit_conditional_trap_edge(&mut self, block: Block, cc: X86CondCode) -> Block {
-        let trap_block = self.emit_synthetic_trap_block();
+    fn emit_conditional_trap_edge(
+        &mut self,
+        block: Block,
+        cc: X86CondCode,
+    ) -> Result<Block, X86ISelError> {
+        let trap_block = self.emit_synthetic_trap_block()?;
         self.func.push_inst(
             block,
             X86ISelInst::new(
@@ -5270,32 +6583,36 @@ impl X86InstructionSelector {
             ),
         );
         self.func.add_successor(block, trap_block);
-        trap_block
+        Ok(trap_block)
     }
 
-    fn emit_synthetic_trap_block(&mut self) -> Block {
-        let trap_block = self.fresh_synthetic_block();
+    fn emit_synthetic_trap_block(&mut self) -> Result<Block, X86ISelError> {
+        let trap_block = self
+            .fresh_synthetic_block()
+            .ok_or(X86ISelError::BlockIdExhausted)?;
         self.func.ensure_block(trap_block);
         self.func
             .push_inst(trap_block, X86ISelInst::new(X86Opcode::Ud2, vec![]));
-        trap_block
+        Ok(trap_block)
     }
 
-    fn fresh_synthetic_block(&self) -> Block {
-        let mut id = self
+    fn fresh_synthetic_block(&self) -> Option<Block> {
+        let max_id = self
             .func
             .blocks
             .keys()
             .map(|block| block.0)
             .max()
-            .unwrap_or(0)
-            .saturating_add(1);
-        while self.func.blocks.contains_key(&Block(id)) {
-            id = id
-                .checked_add(1)
-                .expect("exhausted x86 synthetic block ids");
+            .unwrap_or(0);
+        if let Some(id) = max_id.checked_add(1) {
+            return Some(Block(id));
         }
-        Block(id)
+        // Sparse public LIR block IDs may include u32::MAX. That does not
+        // exhaust the domain: reuse a free identity below the existing maximum.
+        // At most blocks.len() occupied candidates are visited before a hole.
+        (0..u32::MAX)
+            .find(|id| !self.func.blocks.contains_key(&Block(*id)))
+            .map(Block)
     }
 
     // -----------------------------------------------------------------------
@@ -5440,6 +6757,14 @@ impl X86InstructionSelector {
                 "aggregate call-arg temp source must be an address carrier, not an immediate"
             );
             self.define_value(result_val, src, dest_ty);
+            // This arm's own comment states the fact: "The value IS an
+            // address". Record it, so a consumer that admits only values this
+            // selector defined from an address-producing opcode (an aggregate
+            // `Select` arm, an sret source) sees the alias as the pointer it
+            // is instead of as an untracked aggregate.
+            if self.pointer_values.contains(&src_val) {
+                self.pointer_values.insert(result_val);
+            }
             return Ok(());
         }
 
@@ -5491,11 +6816,31 @@ impl X86InstructionSelector {
 
         let src = self.use_value(&src_val)?;
 
-        let dst = if let Some(X86ISelOperand::VReg(v)) = self.value_map.get(&result_val) {
-            *v
+        let existing = if let Some(X86ISelOperand::VReg(v)) = self.value_map.get(&result_val) {
+            Some(*v)
         } else {
+            None
+        };
+        let dst = existing.unwrap_or_else(|| {
             let class = reg_class_for_type(&ty);
             self.new_vreg(class)
+        });
+
+        // A copy of a register known to be zero-extended from `bits` bits into
+        // a FRESH register (the copy's only definition) carries the fact: the
+        // copy preserves the low 32 bits (and a 32-bit write zeroes the rest).
+        // A block parameter's register is written by every predecessor's copy,
+        // so it learns nothing from one of them, and only a seeded block
+        // parameter set can rule that out.
+        let is_block_param = self
+            .block_param_values
+            .as_ref()
+            .is_none_or(|params| params.contains(&result_val));
+        let copied_zero_extension = match (&src, existing) {
+            (X86ISelOperand::VReg(source), None) if !is_block_param => {
+                self.zero_extended_vregs.get(source).copied()
+            }
+            _ => None,
         };
 
         self.func.push_inst(
@@ -5505,8 +6850,23 @@ impl X86InstructionSelector {
                 vec![X86ISelOperand::VReg(dst), src],
             ),
         );
+        if let Some(bits) = copied_zero_extension {
+            self.zero_extended_vregs.insert(dst, bits);
+        }
 
         self.define_value(result_val, X86ISelOperand::VReg(dst), ty);
+        // A register copy of a known address is a known address: the copy
+        // moves the pointer bits and nothing else, on every type that reaches
+        // here (an aggregate copies as a Gpr64 `MovRR` of its storage
+        // address). Without this the fact dies at the first `Copy`, and a
+        // consumer that requires a known address — an aggregate `Select` arm,
+        // an sret source — refuses a value the selector itself had just
+        // proven to be one. `existing.is_some()` is a block parameter written
+        // by EVERY predecessor, so one predecessor's copy does not establish
+        // the fact for the join and it is deliberately not propagated there.
+        if existing.is_none() && self.pointer_values.contains(&src_val) {
+            self.pointer_values.insert(result_val);
+        }
         Ok(())
     }
 
@@ -5535,8 +6895,19 @@ impl X86InstructionSelector {
         let ty = self.value_type(&lhs_val);
         let rhs_ty = self.value_type(&rhs_val);
         if ty != rhs_ty {
+            // Name the OPCODE and the OPERANDS, not just their types. The
+            // types alone read as "x86-64 cannot do struct arithmetic", which
+            // sends a reader to the type table; the actual question is which
+            // LIR instruction produced an `Iadd`/`Isub`/`Imul` whose operands
+            // disagree, because a mismatch here is a malformed operand pair
+            // rather than a missing capability
+            // (DR-X86-STRUCT-ARITHMETIC-GAP-20261016).
             return Err(X86ISelError::UnsupportedOpcode(format!(
-                "Arithmetic lhs={ty:?} rhs={rhs_ty:?}; x86-64 arithmetic supports matching scalar integer operands and typed V128 vector arithmetic"
+                "in `{}`: Arithmetic {:?} lhs={ty:?} ({lhs_val:?}) rhs={rhs_ty:?} \
+                 ({rhs_val:?}) -> {result_val:?}; operand types must match. x86-64 \
+                 arithmetic supports matching scalar integer operands and typed V128 \
+                 vector arithmetic",
+                self.func.name, inst.opcode
             )));
         }
         if !matches!(
@@ -6329,8 +7700,29 @@ impl X86InstructionSelector {
             return self.select_extend_to_i128(signed, from_ty, inst, block);
         }
 
-        // Accept widenings into I16/I32/I64 from a strictly narrower integer
-        // carrier. I16 destinations (`i8 as i16` / `u8 as u16`) live in the same
+        // The sign extension of a `bool` (LLVM's `sext i1`) makes `true` all
+        // ones at every width, `I8` included: trust-ir reads a `Bool` operand
+        // of an integer resize as the 1-bit integer `InterpretInt { bits: 1 }`
+        // and widens `as_signed()` of it (`interpret.rs`,
+        // `expect_integer_resize_value` and `CastOp::SExt`), which is -1 for
+        // `true`. A `movsx` of the 0/1 byte yields +1, so the cast is
+        // `-zext(b)` ([`Self::emit_bool_sign_extension`]).
+        if signed && *from_ty == Type::B1 {
+            if !matches!(to_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64) {
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "{:?}",
+                    inst.opcode
+                )));
+            }
+            let src = self.use_value(&inst.args[0])?;
+            let result = self.emit_bool_sign_extension(src, reg_class_for_type(to_ty), block);
+            self.define_value(inst.results[0], X86ISelOperand::VReg(result), to_ty.clone());
+            return Ok(());
+        }
+
+        // Accept widenings into I16/I32/I64, including identity extensions,
+        // and the zero extension of a `B1` into an `I8`.
+        // I16 destinations (`i8 as i16` / `u8 as u16`) live in the same
         // 32-bit carrier as I32, so a MOVSX/MOVZX of the source byte yields the
         // correct low-16-bit value (consumers that read above bit 15 re-extend —
         // see the narrow-carrier hygiene of `select_shift`/`select_div`).
@@ -6346,7 +7738,14 @@ impl X86InstructionSelector {
             (Some(f), Some(t)) => f <= t,
             _ => false,
         };
-        if !matches!(to_ty, Type::I16 | Type::I32 | Type::I64) || !widening {
+        // A `bool` also zero-extends into an `I8` (`bool as u8`, e.g.
+        // `u8::carrying_add`'s `carry as u8`). A `B1` holds 0 or 1 in its low
+        // byte (the backend's clean 32-bit bool), and the arm below
+        // zero-extends exactly that byte, as for the wider targets: the result
+        // is the 0/1 byte in a carrier clean above it. (Its sign extension
+        // took the arm above.)
+        let bool_to_byte = !signed && *from_ty == Type::B1 && *to_ty == Type::I8;
+        if !(matches!(to_ty, Type::I16 | Type::I32 | Type::I64) || bool_to_byte) || !widening {
             return Err(X86ISelError::UnsupportedOpcode(format!(
                 "{:?}",
                 inst.opcode
@@ -6361,18 +7760,20 @@ impl X86InstructionSelector {
 
         let opcode = if signed {
             match from_ty {
-                Type::B1 | Type::I8 => X86Opcode::MovsxB,
+                Type::I8 => X86Opcode::MovsxB,
                 Type::I16 => X86Opcode::MovsxW,
                 Type::I32 if *to_ty == Type::I64 => X86Opcode::Movsx,
                 Type::I32 => Self::gpr_copy_opcode_for_type(to_ty),
+                Type::I64 => X86Opcode::MovRR,
                 _ => unreachable!("extend source type was checked above"),
             }
         } else {
             match from_ty {
-                Type::B1 | Type::I8 => X86Opcode::Movzx,
-                Type::I16 => X86Opcode::MovzxW,
+                Type::B1 | Type::I8 => self.narrow_zero_extend_opcode(&src, 8),
+                Type::I16 => self.narrow_zero_extend_opcode(&src, 16),
                 Type::I32 if *to_ty == Type::I64 => X86Opcode::MovRR32,
                 Type::I32 => Self::gpr_copy_opcode_for_type(to_ty),
+                Type::I64 => X86Opcode::MovRR,
                 _ => unreachable!("extend source type was checked above"),
             }
         };
@@ -6409,30 +7810,38 @@ impl X86InstructionSelector {
         let result_val = inst.results[0];
 
         // First materialize the 64-bit-wide value in dst_lo.
-        let dst_lo = self.new_vreg(RegClass::Gpr64);
-        let dst_lo_op = X86ISelOperand::VReg(dst_lo);
-        let widen_opcode = if signed {
-            match from_ty {
-                Type::B1 | Type::I8 => X86Opcode::MovsxB,
-                Type::I16 => X86Opcode::MovsxW,
-                Type::I32 => X86Opcode::Movsx,
-                Type::I64 => X86Opcode::MovRR,
-                _ => unreachable!("from_ty checked above"),
-            }
+        let dst_lo = if signed && *from_ty == Type::B1 {
+            // A `bool`'s sign extension is all ones in BOTH halves for `true`
+            // (see `select_extend`): the low half is `-zext(b)` at 64 bits,
+            // and the sign fill below copies it into the high half.
+            self.emit_bool_sign_extension(src, RegClass::Gpr64, block)
         } else {
-            match from_ty {
-                Type::B1 | Type::I8 => X86Opcode::Movzx,
-                Type::I16 => X86Opcode::MovzxW,
-                // i32 -> i64 zero-extends implicitly via 32-bit MOV.
-                Type::I32 => X86Opcode::MovRR32,
-                Type::I64 => X86Opcode::MovRR,
-                _ => unreachable!("from_ty checked above"),
-            }
+            let dst_lo = self.new_vreg(RegClass::Gpr64);
+            let widen_opcode = if signed {
+                match from_ty {
+                    Type::I8 => X86Opcode::MovsxB,
+                    Type::I16 => X86Opcode::MovsxW,
+                    Type::I32 => X86Opcode::Movsx,
+                    Type::I64 => X86Opcode::MovRR,
+                    _ => unreachable!("from_ty checked above"),
+                }
+            } else {
+                match from_ty {
+                    Type::B1 | Type::I8 => self.narrow_zero_extend_opcode(&src, 8),
+                    Type::I16 => self.narrow_zero_extend_opcode(&src, 16),
+                    // i32 -> i64 zero-extends implicitly via 32-bit MOV.
+                    Type::I32 => X86Opcode::MovRR32,
+                    Type::I64 => X86Opcode::MovRR,
+                    _ => unreachable!("from_ty checked above"),
+                }
+            };
+            self.func.push_inst(
+                block,
+                X86ISelInst::new(widen_opcode, vec![X86ISelOperand::VReg(dst_lo), src]),
+            );
+            dst_lo
         };
-        self.func.push_inst(
-            block,
-            X86ISelInst::new(widen_opcode, vec![dst_lo_op.clone(), src]),
-        );
+        let dst_lo_op = X86ISelOperand::VReg(dst_lo);
 
         // High half.
         let dst_hi = self.new_vreg(RegClass::Gpr64);
@@ -6467,6 +7876,44 @@ impl X86InstructionSelector {
 
         self.define_i128_value(result_val, dst_lo, dst_hi);
         Ok(())
+    }
+
+    /// The sign extension of the `B1` operand `src` into a fresh register of
+    /// `class` (`Gpr32` for an `I8`/`I16`/`I32` result, `Gpr64` for `I64` and
+    /// the low half of an `I128`): `-zext(b)`, 0 for `false` and all ones for
+    /// `true`, which is trust-ir's `SExt` of a `Bool`.
+    ///
+    /// The zero extension reads the bool's low byte exactly as `Uextend` from
+    /// `B1` does (`movzx r, r/m8`, or the 32-bit copy of a register already
+    /// zero-extended from at most 8 bits, such as a System V `bool`
+    /// parameter's entry `movzx`): the backend's clean 32-bit bool and a
+    /// System V caller's `bool` (bit 0 its value, bits 1..7 clear) both hold 0
+    /// or 1 there, and nothing above bit 7 is read. `neg` at the register's
+    /// width then makes 1 all ones.
+    fn emit_bool_sign_extension(
+        &mut self,
+        src: X86ISelOperand,
+        class: RegClass,
+        block: Block,
+    ) -> VReg {
+        let zero_extended = self.new_vreg(class);
+        let opcode = self.narrow_zero_extend_opcode(&src, 8);
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(opcode, vec![X86ISelOperand::VReg(zero_extended), src]),
+        );
+        let mask = self.new_vreg(class);
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(
+                X86Opcode::Neg,
+                vec![
+                    X86ISelOperand::VReg(mask),
+                    X86ISelOperand::VReg(zero_extended),
+                ],
+            ),
+        );
+        mask
     }
 
     /// Select integer truncation by preserving the low bits in a clean GPR.
@@ -6607,7 +8054,11 @@ impl X86InstructionSelector {
         let src_ty = self.value_type(&src_val);
         let src_class = reg_class_for_type(&src_ty);
         let dst_class = reg_class_for_type(&to_ty);
-        if src_ty.bytes() != to_ty.bytes() {
+        // A `B1` is one bit held as a clean 32-bit 0/1, not the byte its
+        // `bytes()` reports: a same-register move from an 8-bit carrier would
+        // define a bool from the carrier's undefined upper bits and from byte
+        // values other than 0/1. A `B1` source keeps its clean value.
+        if src_ty.bytes() != to_ty.bytes() || (to_ty == Type::B1 && src_ty != Type::B1) {
             return Err(X86ISelError::UnsupportedOpcode(format!(
                 "Bitcast {src_ty:?} -> {to_ty:?}"
             )));
@@ -8012,6 +9463,25 @@ impl X86InstructionSelector {
         )
     }
 
+    /// Refuse a SIGNED order of a `B1` (an `Icmp` of two bools, or a `Select`
+    /// testing a bool against zero). trust-ir orders a `Bool` as the 1-bit
+    /// signed integer it is: `true` is -1 (`eval_bool_icmp` compares
+    /// `as_signed()` of `InterpretInt { bits: 1 }`), so `true <s false` holds,
+    /// and a compare of the 0/1 carriers ([`Self::normalize_condition_operand`]
+    /// zero-extends a `B1`) computes the reverse. The adapter admits only
+    /// `Eq`/`Ne` of a `Bool` (`validate_icmp_shape`) and a `Select` only on a
+    /// nonzero test, so no translated LIR reaches this: it is refused by name
+    /// rather than ordered on the wrong values.
+    fn refuse_signed_bool_order(ty: &Type, cond: IntCC, what: &str) -> Result<(), X86ISelError> {
+        if *ty == Type::B1 && Self::intcc_uses_signed_order(cond) {
+            return Err(X86ISelError::UnsupportedOpcode(format!(
+                "{what} {cond:?} of a B1: a bool's signed order makes true -1, which a \
+                 compare of its 0/1 carrier does not compute"
+            )));
+        }
+        Ok(())
+    }
+
     fn narrow_condition_extend_opcode(ty: &Type, cond: IntCC) -> Option<X86Opcode> {
         match ty {
             Type::B1 => Some(X86Opcode::Movzx),
@@ -8031,12 +9501,26 @@ impl X86InstructionSelector {
         block: Block,
     ) -> X86ISelOperand {
         if let Some(opcode) = Self::narrow_condition_extend_opcode(cond_ty, cond) {
+            // A zero-extension (and a bool's `and 1`) of a register already
+            // zero-extended from at most that many bits is a copy.
+            let from_bits = match cond_ty {
+                Type::B1 => 1,
+                Type::I8 => 8,
+                _ => 16,
+            };
+            let opcode = if matches!(opcode, X86Opcode::Movzx | X86Opcode::MovzxW)
+                && self.zero_extension_is_redundant(&cond_op, from_bits)
+            {
+                X86Opcode::MovRR32
+            } else {
+                opcode
+            };
             let normalized = X86ISelOperand::VReg(self.new_vreg(RegClass::Gpr64));
             self.func.push_inst(
                 block,
                 X86ISelInst::new(opcode, vec![normalized.clone(), cond_op]),
             );
-            if *cond_ty == Type::B1 {
+            if *cond_ty == Type::B1 && opcode != X86Opcode::MovRR32 {
                 self.func.push_inst(
                     block,
                     X86ISelInst::new(
@@ -8157,6 +9641,7 @@ impl X86InstructionSelector {
         let result_ty = self.value_type(&true_val);
         let false_ty = self.value_type(&false_val);
         let cond_is_v128_mask = cond_ty == Type::V128;
+        Self::refuse_signed_bool_order(&cond_ty, cond, "Select")?;
 
         let cond_is_scalar_integer = matches!(
             cond_ty,
@@ -8264,10 +9749,124 @@ impl X86InstructionSelector {
             return Ok(());
         }
 
+        // An aggregate-typed `Select` whose BOTH arms this selector itself
+        // knows to be addresses: select the address, in one 64-bit CMOV.
+        //
+        // In this LIR an aggregate "value" is the address of its storage —
+        // `StackAddr` and `StructGep`/`ArrayGep` define their results as
+        // `Type::I64` and record them in `pointer_values`, while the adapter's
+        // `Function::value_types` still carries the AGGREGATE type the storage
+        // holds. Every other consumer here already reads such a value as an
+        // address: `StructGep`'s base, `Memcpy`'s source, a `Store` address.
+        // So the only thing a `Select` between two of them has to choose is
+        // WHICH address, and a Gpr64 `Cmovcc` is exactly that.
+        //
+        // THE ADMISSION IS `pointer_values`, NOT THE TYPE. Membership is a
+        // fact this selector recorded when it emitted an address-producing
+        // opcode, so an arbitrary aggregate-typed value with no address behind
+        // it is still refused below. The result is defined `Type::I64` and
+        // joins `pointer_values`, the same contract every address-producing
+        // arm follows, so its consumers see a pointer and not a 16-byte value
+        // in a register that does not exist.
+        //
+        // BOUNDARY: selecting the address is the aggregate's value only while
+        // the adapter keeps `InsertField`/`InsertElement` in VALUE form —
+        // copying to fresh storage instead of updating the operand's storage
+        // in place (WS7.1/F-111). Were an in-place update to return, a
+        // selected address would alias its arm, and this arm would carry that
+        // aliasing. It is not a proof route: the check on these bytes is
+        // WS7.2's `trust_ir_interp_differential`, which runs every aggregate
+        // family natively at O0-O3 against the trust-ir reference interpreter.
+        //
+        // The two arms' RECORDED types need not agree, and requiring that they
+        // do would refuse a program this one compiles: a pointer carrier is
+        // spelled `I64` when the selector defined it (a GEP result), and with
+        // the aggregate type when the adapter's `value_types` named the
+        // storage (a `StackAddr`, a seeded call-arg temp). At O3 the two
+        // spellings meet on one `Select` — measured on the generated corpus's
+        // seed `0x5`, `true=I64 false=Struct([I64, I64])`. Both are addresses;
+        // the SPELLING is not the fact, `pointer_values` is. What is required
+        // of each arm is that it be a pointer CARRIER (64-bit: `I64` or an
+        // aggregate held by address) and a proven address.
+        let is_aggregate =
+            |ty: &Type| matches!(ty, Type::Struct(_) | Type::Array(_, _) | Type::Enum { .. });
+        // `I64 x I64` is deliberately NOT this arm: the ordinary scalar path
+        // below already selects it, and leaving it there keeps every program
+        // that does not involve an aggregate byte-identical.
+        let arms_are_aggregates = is_aggregate(&result_ty) || is_aggregate(&false_ty);
+        let is_pointer_carrier = |ty: &Type| matches!(ty, Type::I64) || is_aggregate(ty);
+        let arms_are_pointer_carriers =
+            is_pointer_carrier(&result_ty) && is_pointer_carrier(&false_ty);
+        if arms_are_aggregates
+            && arms_are_pointer_carriers
+            && cond_is_scalar_integer
+            && self.pointer_values.contains(&true_val)
+            && self.pointer_values.contains(&false_val)
+        {
+            let cond_op = self.use_value(&cond_val)?;
+            let true_op = self.use_value(&true_val)?;
+            let false_op = self.use_value(&false_val)?;
+            let dst = self.new_vreg(RegClass::Gpr64);
+            let dst_op = X86ISelOperand::VReg(dst);
+            self.func.push_inst(
+                block,
+                X86ISelInst::new(
+                    Self::gpr_copy_opcode_for_type(&Type::I64),
+                    vec![dst_op.clone(), false_op],
+                ),
+            );
+            self.emit_condition_zero_test(&cond_ty, cond, cond_op, block);
+            self.func.push_inst(
+                block,
+                X86ISelInst::new(
+                    X86Opcode::Cmovcc,
+                    vec![
+                        dst_op.clone(),
+                        true_op,
+                        X86ISelOperand::CondCode(x86cc_from_intcc(cond)),
+                    ],
+                ),
+            );
+            self.define_value(result_val, dst_op, Type::I64);
+            self.pointer_values.insert(result_val);
+            return Ok(());
+        }
+
         if result_ty != false_ty
             || !(cond_is_scalar_integer || cond_is_v128_mask)
             || !(result_is_scalar_integer || result_is_scalar_fp)
         {
+            // An aggregate arm reaches here when it is NOT a known address:
+            // say so, because "unsupported opcode" on a `Struct` reads as "no
+            // aggregate select at all" when the real refusal is that this
+            // selector never saw an address-producing definition for the arm.
+            if arms_are_aggregates {
+                // Name WHICH requirement the arm missed. "unsupported opcode"
+                // on a `Struct` reads as "no aggregate select at all", while
+                // the two real causes are different fixes: a non-carrier type
+                // is a malformed operand, an unproven address is a missing
+                // `pointer_values` propagation somewhere upstream of here.
+                let unproven: Vec<String> = [(true_val, &result_ty), (false_val, &false_ty)]
+                    .into_iter()
+                    .filter(|(value, _)| !self.pointer_values.contains(value))
+                    .map(|(value, ty)| format!("{value:?} ({ty:?})"))
+                    .collect();
+                let cause = if unproven.is_empty() {
+                    format!("neither arm is a 64-bit pointer carrier ({result_ty:?}, {false_ty:?})")
+                } else {
+                    format!(
+                        "{} is not a value this selector defined from an address-producing \
+                         opcode",
+                        unproven.join(" and ")
+                    )
+                };
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "in `{}`: Select {cond:?} cond={cond_ty:?} true={result_ty:?} \
+                     ({true_val:?}) false={false_ty:?} ({false_val:?}): an aggregate arm is \
+                     selected only as the ADDRESS of its storage, and {cause}",
+                    self.func.name
+                )));
+            }
             return Err(X86ISelError::UnsupportedOpcode(format!(
                 "Select {cond:?} cond={cond_ty:?} true={result_ty:?} false={false_ty:?}"
             )));
@@ -8498,7 +10097,15 @@ impl X86InstructionSelector {
             X86ISelInst::new(opc, vec![X86ISelOperand::VReg(dst), src]),
         );
 
-        self.define_value(result_val, X86ISelOperand::VReg(dst), ty);
+        // A `B1` is a clean 32-bit bool (0 or 1) wherever the backend defines
+        // one, and `not r32` of 0/1 is 0xFFFFFFFF/0xFFFFFFFE: the result is
+        // masked to bit 0, as `select_binary_not_logic` masks its `B1` result.
+        let result = if ty == Type::B1 {
+            self.emit_and_mask(&ty, X86ISelOperand::VReg(dst), 1, block)
+        } else {
+            X86ISelOperand::VReg(dst)
+        };
+        self.define_value(result_val, result, ty);
         Ok(())
     }
 
@@ -8817,13 +10424,6 @@ impl X86InstructionSelector {
     ) -> Result<bool, X86ISelError> {
         use crate::magic_udiv::{MagicWidth, magics, smagic_band_holds};
 
-        // Kill switch: `TCG_NO_MAGIC_SDIV` (any value) falls back to hardware
-        // IDIV. Mirrors `TCG_NO_X86_SROA` / `TCG_NO_VECTORIZE`; also the A/B
-        // handle to confirm the magic sequence beats IDIV on div-heavy code.
-        if std::env::var_os("TCG_NO_MAGIC_SDIV").is_some() {
-            return Ok(false);
-        }
-
         let width = match ty {
             Type::I32 => MagicWidth::W32,
             Type::I64 => MagicWidth::W64,
@@ -9045,10 +10645,10 @@ impl X86InstructionSelector {
         // exactly as AArch64 does. See `select_i128_div_libcall`.
         if ty == Type::I128 {
             let symbol = match (is_signed, is_rem) {
-                (true, false) => "__divti3",
-                (false, false) => "__udivti3",
-                (true, true) => "__modti3",
-                (false, true) => "__umodti3",
+                (true, false) => RuntimeSymbol::Divti3,
+                (false, false) => RuntimeSymbol::Udivti3,
+                (true, true) => RuntimeSymbol::Modti3,
+                (false, true) => RuntimeSymbol::Umodti3,
             };
             return self.select_i128_div_libcall(symbol, inst, block);
         }
@@ -9318,15 +10918,21 @@ impl X86InstructionSelector {
     /// - divisor  `b`: RDX (lo), RCX (hi)
     ///   and returns the 128-bit result in RAX (lo), RDX (hi).
     ///
-    /// TRUST ASSUMPTION: i128 division correctness rests on the external
-    /// compiler-rt implementation of `__divti3`/`__udivti3`/`__modti3`/
-    /// `__umodti3`. This is NOT covered by an SMT lowering proof — like every
-    /// libcall (and like the AArch64 i128 division path) it is verified by
-    /// DIFFERENTIAL execution against clang's `__int128` operators, whose
-    /// runtime resolves the same compiler-rt symbols at link time.
+    /// TRUST ASSUMPTION: i128 division correctness rests on the routine the
+    /// link binds to `__divti3`/`__udivti3`/`__modti3`/`__umodti3` (for a Rust
+    /// program `compiler_builtins`', for a C link the platform's compiler-rt).
+    /// The x86-64 body theorem (ruling OD-202) states this lowering as the
+    /// routine's call and checks the argument and result placement and the
+    /// symbol; the routine's VALUE on trust-ir's defined domain is trusted,
+    /// with statistical evidence only: a native differential of both bindings
+    /// against an independent bit-serial reference (`slice22::
+    /// the_i128_division_routines_match_an_independent_reference` and the
+    /// slice-22 report's `native/run_diff.sh`). `e2e_x86_64_i128_div`, which
+    /// compares this lowering with clang's `__int128` operators, is evidence
+    /// for the lowering only: both sides link the same routine.
     fn select_i128_div_libcall(
         &mut self,
-        symbol: &'static str,
+        symbol: RuntimeSymbol,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), X86ISelError> {
@@ -9349,11 +10955,22 @@ impl X86InstructionSelector {
         // relocation mechanism as the memcpy/memmove/memset intrinsic calls:
         // a `Symbol` operand on `X86Opcode::Call` becomes a branch/PLT
         // relocation resolved by the linker (cc/clang link in compiler-rt).
+        // The four argument registers are declared as every other call
+        // declares its own (`call_arg_regs`, 64 bits each): the register
+        // allocator reads them as the call's implicit uses (MISCOMPILE #53:
+        // without them each setup `mov` above looks like a dead def), and the
+        // x86-64 body theorem checks them against the System V table.
         self.func.push_inst(
             block,
             X86ISelInst::new(
                 X86Opcode::Call,
-                vec![X86ISelOperand::Symbol(symbol.to_string())],
+                vec![X86ISelOperand::Symbol(symbol.name().to_string())],
+            )
+            .with_call_arg_regs(
+                [RDI, RSI, RDX, RCX]
+                    .into_iter()
+                    .map(|reg| X86CallArgReg::new(reg, 64))
+                    .collect(),
             )
             .with_call_result_regs(vec![
                 X86CallResultReg::new(RAX, 64),
@@ -9645,6 +11262,16 @@ impl X86InstructionSelector {
             let lhs_lane = self.new_vreg(RegClass::Gpr32);
             let rhs_lane = self.new_vreg(RegClass::Gpr32);
             let shifted_lane = self.new_vreg(RegClass::Gpr32);
+            // These lane carriers are never `define_value`-d (they carry no
+            // trust_ir value), so their nominal width is recorded here: MOVD
+            // r32, xmm writes the whole 32-bit carrier with the i32 lane, and
+            // the 32-bit shift writes the whole carrier with its i32 result.
+            // Without the record the carrier-hygiene verifier treats the
+            // MOVD-defined lane as unknown and refuses the wide-reading
+            // SHR/SAR fail-closed (as it must for an unrecorded Gpr32).
+            for lane_vreg in [lhs_lane, rhs_lane, shifted_lane] {
+                self.func.record_vreg_nominal_width(lane_vreg, &Type::I32);
+            }
 
             self.emit_v4i32_extract_lane_to_gpr(
                 block,
@@ -10822,8 +12449,8 @@ impl X86InstructionSelector {
         let normalized = self.new_vreg(RegClass::Gpr32);
         let normalized_op = X86ISelOperand::VReg(normalized);
         let normalize_opcode = match src_ty {
-            Type::I8 => X86Opcode::Movzx,
-            Type::I16 => X86Opcode::MovzxW,
+            Type::I8 => self.narrow_zero_extend_opcode(&src, 8),
+            Type::I16 => self.narrow_zero_extend_opcode(&src, 16),
             Type::I32 => X86Opcode::MovRR32,
             _ => unreachable!("source type was checked by caller"),
         };
@@ -11060,11 +12687,12 @@ impl X86InstructionSelector {
 
         // JUMP-TABLE lowering (O(1) dense-switch dispatch, LLVM's idiom): claims a
         // dense switch (>=4 arms, density > 0.4 per `choose_strategy`) BEFORE the
-        // BST. Opt-in via `TCG_X86_JUMP_TABLE`, global kill via `TCG_NO_JUMP_TABLE`.
+        // BST. Default-on; `no-x86-jump-table` (tracked) or standalone
+        // `TCG_NO_X86_JUMP_TABLE` opts out. `TCG_NO_JUMP_TABLE` is the global kill.
         // `emit_x86_jump_table` FAIL-SAFE declines (returns false) on any shape it
         // cannot lower soundly (wide i32 range, duplicate, #62 gate miss), falling
         // through to the always-correct BST / linear chain below.
-        if std::env::var_os("TCG_X86_JUMP_TABLE").is_some()
+        if x86_jump_table_enabled()
             && std::env::var_os("TCG_NO_JUMP_TABLE").is_none()
             && matches!(
                 crate::switch::choose_strategy(cases),
@@ -11097,7 +12725,7 @@ impl X86InstructionSelector {
             // Reject duplicate case values defensively (a well-formed SwitchInt
             // has none; a BST assumes strict ordering).
             if sorted.windows(2).all(|w| w[0].0 != w[1].0) {
-                self.emit_switch_bst(&sorted, &selector, default, block);
+                self.emit_switch_bst(&sorted, &selector, default, block)?;
                 return Ok(());
             }
         }
@@ -11206,7 +12834,7 @@ impl X86InstructionSelector {
         selector: &X86ISelOperand,
         default: Block,
         block: Block,
-    ) {
+    ) -> Result<(), X86ISelError> {
         let jmp_default = |this: &mut Self| {
             this.func.push_inst(
                 block,
@@ -11233,9 +12861,13 @@ impl X86InstructionSelector {
                 // Not equal: JL -> lower half (all values < mval), else the
                 // upper half. Allocate `lo` and register it BEFORE allocating
                 // `hi` so the two ids cannot collide.
-                let lo = self.fresh_synthetic_block();
+                let lo = self
+                    .fresh_synthetic_block()
+                    .ok_or(X86ISelError::BlockIdExhausted)?;
                 self.func.ensure_block(lo);
-                let hi = self.fresh_synthetic_block();
+                let hi = self
+                    .fresh_synthetic_block()
+                    .ok_or(X86ISelError::BlockIdExhausted)?;
                 self.func.ensure_block(hi);
                 self.func.push_inst(
                     block,
@@ -11253,10 +12885,11 @@ impl X86InstructionSelector {
                     X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(hi)]),
                 );
                 self.func.add_successor(block, hi);
-                self.emit_switch_bst(&cases[..mid], selector, default, lo);
-                self.emit_switch_bst(&cases[mid + 1..], selector, default, hi);
+                self.emit_switch_bst(&cases[..mid], selector, default, lo)?;
+                self.emit_switch_bst(&cases[mid + 1..], selector, default, hi)?;
             }
         }
+        Ok(())
     }
 
     /// Emit an O(1) JUMP-TABLE dispatch for a dense switch (the LLVM idiom):
@@ -11280,7 +12913,7 @@ impl X86InstructionSelector {
     /// is a hole); the entry block separately carries the out-of-range `default`
     /// edge, so TV-5 sees every reachable edge without over-approximating.
     ///
-    /// Wired into `select_switch` behind `TCG_X86_JUMP_TABLE` (opt-in); the
+    /// Used by default for eligible dense switches in `select_switch`; the
     /// codegen pipeline resolves the `JumpTableIndex` LeaRip to the table it
     /// appends after the function body.
     fn emit_x86_jump_table(
@@ -11331,12 +12964,28 @@ impl X86InstructionSelector {
         if crate::switch::check_jump_table_preserved(cases, default, min_val, &targets).is_err() {
             return false;
         }
+        let Some(in_range) = self.fresh_synthetic_block() else {
+            return false;
+        };
 
         // --- Bounds check: norm = selector - min ; if (unsigned) norm > range -> default. ---
+        //
+        // A 32-bit selector (an `I32`, which `normalize_condition_operand`
+        // leaves as it is) is a `Gpr32` vreg, whose bits above 31 this stream
+        // does not define. The bound check and the table index are 64-bit, so
+        // the selector is copied with the zero-extending 32-bit `mov`. The
+        // earlier 64-bit `mov` read those undefined bits, which the slice-14
+        // body theorem refutes (OD-181); natively it returned the right
+        // values in the contexts measured (`e2e_x86_64_jump_table_selector_width`):
+        // this hardens the pre-RA stream, it fixes no observed miscompile.
         let norm = X86ISelOperand::VReg(self.new_vreg(RegClass::Gpr64));
+        let copy = match &selector {
+            X86ISelOperand::VReg(vreg) if vreg.class == RegClass::Gpr32 => X86Opcode::MovRR32,
+            _ => X86Opcode::MovRR,
+        };
         self.func.push_inst(
             block,
-            X86ISelInst::new(X86Opcode::MovRR, vec![norm.clone(), selector.clone()]),
+            X86ISelInst::new(copy, vec![norm.clone(), selector.clone()]),
         );
         if min_val != 0 {
             self.func.push_inst(
@@ -11354,7 +13003,6 @@ impl X86InstructionSelector {
                 vec![norm.clone(), X86ISelOperand::Imm(range as i64)],
             ),
         );
-        let in_range = self.fresh_synthetic_block();
         self.func.ensure_block(in_range);
         // JA default (unsigned above => out of [min,max], incl. selector<min which
         // wraps to a huge unsigned value). MUST be unsigned (A), never signed (G).
@@ -11639,6 +13287,7 @@ impl X86InstructionSelector {
                 "Icmp {cond:?} lhs={lhs_ty:?} rhs={rhs_ty:?}"
             )));
         }
+        Self::refuse_signed_bool_order(&lhs_ty, cond, "Icmp")?;
 
         if lhs_ty == Type::V128 {
             return self.select_v128_i32_comparison(cond, lhs_val, rhs_val, result_val, block);
@@ -12096,14 +13745,51 @@ impl X86InstructionSelector {
         Ok(())
     }
 
-    /// Look up an i128 shift amount as a single scalar operand.
+    /// Look up an i128 shift amount as ONE Gpr64 operand.
     ///
-    /// trust_ir may type the shift amount as i128; only the low 64 bits matter
-    /// for a shift count (a count >= 128 is UB in trust_ir, and the lowering
-    /// already handles >= 64 explicitly). Use the low half of an i128 pair, or
-    /// the scalar value directly otherwise.
-    fn use_i128_shift_amount(&mut self, val: &Value) -> Result<X86ISelOperand, X86ISelError> {
-        self.use_value(val)
+    /// The count reaches the i128 shift lowering in whatever width the source
+    /// gave it — `u32` for `<u128>::unchecked_shl` / `checked_shl` / `rotate_*`
+    /// (seven `library/core` roots on x86-64), `i128` when trust_ir types it as
+    /// the operand's own width — while every consumer here (`SubRR [neg, c64,
+    /// shift]`, `CmpRI [shift, 64]`, the `MovRR` into RCX) is a 64-bit
+    /// two-address op. Handing it a Gpr32 vreg is a latent hazard the post-RA
+    /// dataflow validator (TV-5) is right to refuse: `fixup_two_address` bridges
+    /// the mixed-width pair with a 32-bit copy, so the 64-bit SUB reads upper
+    /// lanes the Gpr32 value never defined (`tied-operand-value-mismatch`,
+    /// measured 2026-09-22 on `core`). A narrow count is therefore ZERO-extended
+    /// into a fresh Gpr64 FIRST — the `Movzx` / `MovzxW` / `MovRR32` widening
+    /// `select_extend_to_i128` uses — so every operand the shift lowering
+    /// touches is 64 bits wide (the checker is right; the selector was wrong).
+    /// Only the low 64 bits of an i128 count matter (a count >= 128 is UB in
+    /// trust_ir, and >= 64 is handled explicitly), so an i128 count contributes
+    /// its low limb. Any other count type fails closed.
+    fn use_i128_shift_amount(
+        &mut self,
+        block: Block,
+        val: &Value,
+    ) -> Result<X86ISelOperand, X86ISelError> {
+        match self.value_type(val) {
+            Type::I128 => Ok(self.use_i128_value(val)?.0),
+            Type::I64 => self.use_value(val),
+            narrow @ (Type::B1 | Type::I8 | Type::I16 | Type::I32) => {
+                let src = self.use_value(val)?;
+                let widened = self.new_vreg(RegClass::Gpr64);
+                let widened_op = X86ISelOperand::VReg(widened);
+                let widen_opcode = match narrow {
+                    Type::B1 | Type::I8 => self.narrow_zero_extend_opcode(&src, 8),
+                    Type::I16 => self.narrow_zero_extend_opcode(&src, 16),
+                    _ => X86Opcode::MovRR32,
+                };
+                self.func.push_inst(
+                    block,
+                    X86ISelInst::new(widen_opcode, vec![widened_op.clone(), src]),
+                );
+                Ok(widened_op)
+            }
+            other => Err(X86ISelError::UnsupportedOpcode(format!(
+                "i128 shift count of type {other:?} is not an integer scalar"
+            ))),
+        }
     }
 
     /// Materialize a fresh GPR64 holding `imm`.
@@ -12157,7 +13843,196 @@ impl X86InstructionSelector {
         dst_op
     }
 
+    /// The amount of a 128-bit shift when it is a compile-time constant that
+    /// trust-ir DEFINES, or `None`.
+    ///
+    /// trust-ir's shift is undefined at an amount of the width or more
+    /// (`interpret::shift_amount`: `rhs.raw >= bits` is undefined behavior), so
+    /// a defined constant amount lies in `[0, 127]` exactly and needs no
+    /// reduction. The amount is the `Iconst`'s value AT ITS OWN TYPE, as the
+    /// general path reads it: an `I8`/`I16`/`I32` immediate masked to that
+    /// width (the general path's `movzx`/32-bit copy), an `I64` immediate as
+    /// is, an `I128` immediate's sign extension (LIR `Iconst { ty: I128 }`),
+    /// so a negative one is an amount of at least 2^127, and an `Iconst128`'s
+    /// two halves (the adapter's spelling of a bit intrinsic's amount at 128
+    /// bits: a rotate, a byte or bit reverse). An amount trust-ir leaves
+    /// undefined (128 or more), a `B1` count, and a count that is no constant
+    /// of the function (the whole-function `iconst_origins` /
+    /// `iconst128_origins` pre-scan) keep the general CL/CMOV path, byte for
+    /// byte as before: the fold never picks a meaning for an undefined shift
+    /// (ruling OD-215). AArch64's fold reduces its amount modulo 128 instead
+    /// (`isel.rs` `i128_const_shift_amount`); the two agree on every defined
+    /// amount.
+    fn i128_const_shift_amount(&self, count: Value) -> Option<u32> {
+        if !self.fold_i128_const_shifts {
+            return None;
+        }
+        if let Some((lo, hi)) = self.iconst128_origins.get(&count) {
+            let amount = *lo as u64;
+            return (*hi == 0 && amount < 128).then_some(amount as u32);
+        }
+        let (ty, imm) = self.iconst_origins.get(&count)?;
+        let bits = *imm as u64;
+        let amount = match ty {
+            Type::I8 => bits & 0xff,
+            Type::I16 => bits & 0xffff,
+            Type::I32 => bits & 0xffff_ffff,
+            Type::I64 => bits,
+            Type::I128 if *imm >= 0 => bits,
+            _ => return None,
+        };
+        (amount < 128).then_some(amount as u32)
+    }
+
+    /// `dst = src op imm` (`ShlRI`/`ShrRI`/`SarRI`) into a fresh Gpr64. `count`
+    /// is in `1..=63`: never 0 or 64, which the CPU's 6-bit count mask would
+    /// read as a shift by nothing.
+    fn emit_i128_imm_shift(
+        &mut self,
+        block: Block,
+        op: X86Opcode,
+        src: X86ISelOperand,
+        count: u32,
+    ) -> X86ISelOperand {
+        debug_assert!((1..64).contains(&count), "limb shift count {count}");
+        let dst = X86ISelOperand::VReg(self.new_vreg(RegClass::Gpr64));
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(
+                op,
+                vec![dst.clone(), src, X86ISelOperand::Imm(i64::from(count))],
+            ),
+        );
+        dst
+    }
+
+    /// `dst = a | b` into a fresh Gpr64.
+    fn emit_i128_or64(
+        &mut self,
+        block: Block,
+        a: X86ISelOperand,
+        b: X86ISelOperand,
+    ) -> X86ISelOperand {
+        let dst = X86ISelOperand::VReg(self.new_vreg(RegClass::Gpr64));
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(X86Opcode::OrRR, vec![dst.clone(), a, b]),
+        );
+        dst
+    }
+
+    /// Emit a 128-bit shift by the defined constant `amount` (`< 128`,
+    /// [`Self::i128_const_shift_amount`]) as straight-line immediate limb
+    /// shifts, with no count register, compare or `cmov` (ruling OD-215).
+    /// Mirrors AArch64's `emit_i128_const_shift`; x86-64 has no SHLD/SHRD in
+    /// the selector's vocabulary, so the funnel is two shifts and an `or`.
+    ///
+    /// `src = hi:lo`, limbs of 64 bits; `k = amount`:
+    ///
+    /// ```text
+    /// SHL  k == 0      : lo' = lo                 hi' = hi
+    ///      0 < k < 64  : lo' = lo << k            hi' = (hi << k) | (lo >> (64 - k))
+    ///      k == 64     : lo' = 0                  hi' = lo
+    ///      64 < k < 128: lo' = 0                  hi' = lo << (k - 64)
+    /// SHR  k == 0      : lo' = lo                 hi' = hi
+    ///      0 < k < 64  : lo' = (lo >> k) | (hi << (64 - k))    hi' = hi >> k
+    ///      k == 64     : lo' = hi                 hi' = fill
+    ///      64 < k < 128: lo' = hi >> (k - 64)     hi' = fill
+    /// ```
+    ///
+    /// For `Sar` every shift of `hi` is arithmetic and `fill = hi >>a 63` (the
+    /// sign, all zeros or all ones); for `Shr` they are logical and `fill = 0`.
+    /// The low limb's own right shift and every left shift are logical in both.
+    /// Every limb count is in `1..=63`, so the hardware's 6-bit count mask is
+    /// the identity on it. The rows are `MovRR`, `MovRI`, `ShlRI`, `ShrRI`,
+    /// `SarRI` and `OrRR` (all 64-bit), each already in the x86-64 opcode
+    /// inventory and admitted by the source-bound body theorem.
+    fn emit_i128_const_shift(
+        &mut self,
+        op: X86ShiftOp,
+        result: Value,
+        block: Block,
+        src_lo: X86ISelOperand,
+        src_hi: X86ISelOperand,
+        amount: u32,
+    ) {
+        debug_assert!(amount < 128, "undefined i128 shift amount {amount}");
+        let (dst_lo, dst_hi) = match op {
+            X86ShiftOp::Shl => match amount {
+                0 => (
+                    self.emit_i128_copy64(block, src_lo),
+                    self.emit_i128_copy64(block, src_hi),
+                ),
+                1..=63 => {
+                    let lo =
+                        self.emit_i128_imm_shift(block, X86Opcode::ShlRI, src_lo.clone(), amount);
+                    let spill =
+                        self.emit_i128_imm_shift(block, X86Opcode::ShrRI, src_lo, 64 - amount);
+                    let hi_shifted =
+                        self.emit_i128_imm_shift(block, X86Opcode::ShlRI, src_hi, amount);
+                    let hi = self.emit_i128_or64(block, hi_shifted, spill);
+                    (lo, hi)
+                }
+                64 => (
+                    self.emit_i128_const64(block, 0),
+                    self.emit_i128_copy64(block, src_lo),
+                ),
+                _ => (
+                    self.emit_i128_const64(block, 0),
+                    self.emit_i128_imm_shift(block, X86Opcode::ShlRI, src_lo, amount - 64),
+                ),
+            },
+            X86ShiftOp::Shr | X86ShiftOp::Sar => {
+                let arithmetic = matches!(op, X86ShiftOp::Sar);
+                let hi_op = if arithmetic {
+                    X86Opcode::SarRI
+                } else {
+                    X86Opcode::ShrRI
+                };
+                match amount {
+                    0 => (
+                        self.emit_i128_copy64(block, src_lo),
+                        self.emit_i128_copy64(block, src_hi),
+                    ),
+                    1..=63 => {
+                        let lo_shifted =
+                            self.emit_i128_imm_shift(block, X86Opcode::ShrRI, src_lo, amount);
+                        let spill = self.emit_i128_imm_shift(
+                            block,
+                            X86Opcode::ShlRI,
+                            src_hi.clone(),
+                            64 - amount,
+                        );
+                        let lo = self.emit_i128_or64(block, lo_shifted, spill);
+                        let hi = self.emit_i128_imm_shift(block, hi_op, src_hi, amount);
+                        (lo, hi)
+                    }
+                    _ => {
+                        let lo = if amount == 64 {
+                            self.emit_i128_copy64(block, src_hi.clone())
+                        } else {
+                            self.emit_i128_imm_shift(block, hi_op, src_hi.clone(), amount - 64)
+                        };
+                        let fill = if arithmetic {
+                            self.emit_i128_imm_shift(block, X86Opcode::SarRI, src_hi, 63)
+                        } else {
+                            self.emit_i128_const64(block, 0)
+                        };
+                        (lo, fill)
+                    }
+                }
+            }
+        };
+        let dst_lo = Self::i128_operand_vreg(&dst_lo);
+        let dst_hi = Self::i128_operand_vreg(&dst_hi);
+        self.define_i128_value(result, dst_lo, dst_hi);
+    }
+
     /// Select i128 left shift via a branchless register decomposition.
+    ///
+    /// A defined constant amount ([`Self::i128_const_shift_amount`]) takes the
+    /// folded immediate form instead ([`Self::emit_i128_const_shift`], OD-215);
+    /// every other amount takes the general form below.
     ///
     /// ```text
     /// neg       = 64 - shift
@@ -12177,7 +14052,19 @@ impl X86InstructionSelector {
         Self::require_result(inst, "i128 shl")?;
 
         let (src_lo, src_hi) = self.use_i128_value(&inst.args[0])?;
-        let shift = self.use_i128_shift_amount(&inst.args[1])?;
+        // A defined constant amount: the folded immediate form (OD-215).
+        if let Some(amount) = self.i128_const_shift_amount(inst.args[1]) {
+            self.emit_i128_const_shift(
+                X86ShiftOp::Shl,
+                inst.results[0],
+                block,
+                src_lo,
+                src_hi,
+                amount,
+            );
+            return Ok(());
+        }
+        let shift = self.use_i128_shift_amount(block, &inst.args[1])?;
 
         let zero = self.emit_i128_const64(block, 0);
         let c64 = self.emit_i128_const64(block, 64);
@@ -12295,6 +14182,10 @@ impl X86InstructionSelector {
 
     /// Shared right-shift lowering for lshr (logical) and ashr (arithmetic).
     ///
+    /// A defined constant amount ([`Self::i128_const_shift_amount`]) takes the
+    /// folded immediate form instead ([`Self::emit_i128_const_shift`], OD-215);
+    /// every other amount takes the general form below.
+    ///
     /// ```text
     /// neg       = 64 - shift
     /// hi_spill  = src_hi << neg
@@ -12325,7 +14216,17 @@ impl X86InstructionSelector {
         };
 
         let (src_lo, src_hi) = self.use_i128_value(&inst.args[0])?;
-        let shift = self.use_i128_shift_amount(&inst.args[1])?;
+        // A defined constant amount: the folded immediate form (OD-215).
+        if let Some(amount) = self.i128_const_shift_amount(inst.args[1]) {
+            let op = if arithmetic {
+                X86ShiftOp::Sar
+            } else {
+                X86ShiftOp::Shr
+            };
+            self.emit_i128_const_shift(op, inst.results[0], block, src_lo, src_hi, amount);
+            return Ok(());
+        }
+        let shift = self.use_i128_shift_amount(block, &inst.args[1])?;
 
         let zero = self.emit_i128_const64(block, 0);
         let c64 = self.emit_i128_const64(block, 64);
@@ -12502,10 +14403,15 @@ impl X86InstructionSelector {
     // Memory operations
     // -----------------------------------------------------------------------
 
+    /// The one access of a scalar atomic load. A byte or word is read with
+    /// the zero-extending `movzx r32, m8/m16`: still exactly one access of the
+    /// object's width (single-copy atomic for an aligned byte or word, like
+    /// LLVM's `movzbl`/`movzwl` for `load atomic i8/i16`), and it defines the
+    /// whole register instead of merging into its old bits.
     fn scalar_atomic_load_opcode(ty: &Type) -> Option<X86Opcode> {
         match ty {
-            Type::B1 | Type::I8 => Some(X86Opcode::MovRM8),
-            Type::I16 => Some(X86Opcode::MovRM16),
+            Type::B1 | Type::I8 => Some(X86Opcode::MovzxRM8),
+            Type::I16 => Some(X86Opcode::MovzxRM16),
             Type::I32 => Some(X86Opcode::MovRM32),
             Type::I64 => Some(X86Opcode::MovRM),
             _ => None,
@@ -12535,10 +14441,17 @@ impl X86InstructionSelector {
         }
     }
 
+    /// The load of a `ty` from memory. A byte or word (`B1`/`I8`/`I16`) is the
+    /// zero-extending `movzx r32, m8/m16` (`MovzxRM8`/`MovzxRM16`): it reads
+    /// exactly the object's bytes and writes the WHOLE register, bits 8 (16)
+    /// and up zero. The merging `mov r8/r16, m` forms wrote only the low
+    /// bits, which kept a dependency on the register's previous value (a
+    /// loop-carried chain when the allocator reuses the register the last
+    /// iteration wrote) and left the bits above as whatever it held.
     fn memory_load_opcode(ty: &Type, align: Option<u32>) -> X86Opcode {
         match ty {
-            Type::B1 | Type::I8 => X86Opcode::MovRM8,
-            Type::I16 => X86Opcode::MovRM16,
+            Type::B1 | Type::I8 => X86Opcode::MovzxRM8,
+            Type::I16 => X86Opcode::MovzxRM16,
             Type::I32 => X86Opcode::MovRM32,
             Type::F32 => X86Opcode::MovssRM,
             Type::F64 => X86Opcode::MovsdRM,
@@ -12562,6 +14475,28 @@ impl X86InstructionSelector {
         block: Block,
     ) -> Result<X86ISelOperand, X86ISelError> {
         let src = self.use_value(value_val)?;
+        // The register FILE the value's vreg lives in against the file the
+        // store's opcode reads. A general-register store (`MovMR*`) of an XMM
+        // vreg encodes the XMM register's NUMBER as a general register
+        // (`xmm0` is stored as `rax`), and an XMM store of a general register
+        // likewise: a silent store of an unrelated value. trust-ir validation
+        // keeps a Store's value at its own type (`OperandTypeMismatch`), but a
+        // producer that skips it reached this: measured 2026-10-08, the rustc
+        // bridge stored an `f64` closure environment as an `i64`, and the
+        // x86-64 binary wrote the slot's own address into the slot. Refused,
+        // never encoded.
+        if let X86ISelOperand::VReg(vreg) = &src {
+            let general = |class: RegClass| matches!(class, RegClass::Gpr32 | RegClass::Gpr64);
+            if general(vreg.class) != general(reg_class_for_type(store_ty)) {
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "x86-64 Store of a value held in a {:?} register as {store_ty:?}: the \
+                     store's opcode reads the other register file, so it would write an \
+                     unrelated register; failing closed (a producer must store a value at \
+                     its own type)",
+                    vreg.class
+                )));
+            }
+        }
         let src_ty = self.value_type(value_val);
         let src_class = reg_class_for_type(&src_ty);
         let target_class = reg_class_for_type(store_ty);
@@ -12600,6 +14535,15 @@ impl X86InstructionSelector {
     ) -> Result<(), X86ISelError> {
         Self::require_args(inst, 1, "Load")?;
         Self::require_result(inst, "Load")?;
+
+        // An aggregate is its address in LIR; the scalar path below would load
+        // the aggregate's first eight bytes (`memory_load_opcode`'s `MovRM`)
+        // and bind them as that address (see
+        // `Type::whole_aggregate_memory_access_refusal`). Refused before any
+        // operand is used or instruction emitted.
+        if let Some(refusal) = ty.whole_aggregate_memory_access_refusal(false, volatile) {
+            return Err(X86ISelError::UnsupportedOpcode(refusal));
+        }
 
         let addr_val = inst.args[0];
         let result_val = inst.results[0];
@@ -12674,8 +14618,8 @@ impl X86InstructionSelector {
 
         let opc = if volatile {
             match ty {
-                Type::B1 | Type::I8 => X86Opcode::VolatileMovRM8,
-                Type::I16 => X86Opcode::VolatileMovRM16,
+                Type::B1 | Type::I8 => X86Opcode::VolatileMovzxRM8,
+                Type::I16 => X86Opcode::VolatileMovzxRM16,
                 Type::I32 => X86Opcode::VolatileMovRM32,
                 Type::I64 => X86Opcode::VolatileMovRM,
                 Type::F32 => X86Opcode::VolatileMovssRM,
@@ -12706,8 +14650,118 @@ impl X86InstructionSelector {
             ),
         );
 
-        self.define_value(result_val, X86ISelOperand::VReg(dst), ty);
+        let result = self.loaded_memory_value(&ty, dst, block);
+        self.define_value(result_val, X86ISelOperand::VReg(result), ty);
         Ok(())
+    }
+
+    /// The register that holds the value a LIR `Load`/`VolatileLoad`/
+    /// `AtomicLoad` of `ty` defines, given the register `loaded` its one
+    /// memory access wrote.
+    ///
+    /// A byte or word access is the zero-extending `movzx r32, m8/m16`
+    /// ([`Self::memory_load_opcode`]), so `loaded` holds the bytes
+    /// zero-extended to 64 bits; that is recorded, and a consumer that would
+    /// re-extend them copies instead ([`Self::zero_extension_is_redundant`]).
+    ///
+    /// A `B1` load reads the byte `m` and defines the bool `m != 0`: that is
+    /// trust-ir's `Load Bool` (its reference interpreter decodes a stored bool
+    /// byte as `byte != 0`), which the adapter lowers to LIR `Load B1`
+    /// unchanged, and no trust-ir or LIR rule says the byte is 0 or 1. The
+    /// value is also the backend's clean 32-bit bool (0 or 1 in the low 32
+    /// bits), which it returns in EAX and passes as a 32-bit call argument (an
+    /// LLVM callee of a `bool` argument reads all of it: `fn(b: bool) -> u32 {
+    /// b as u32 }` is `movl %edi, %eax`). Hence
+    ///
+    /// ```text
+    /// movzx z, m8      z = m                  (0..=255, bits 8..63 clear)
+    /// add   t, z, 255  t = m + 255            (255..=510: bit 8 set iff m != 0)
+    /// shr   b, t, 8    b = (m + 255) >> 8 = (m != 0)
+    /// ```
+    ///
+    /// two register operations after the one memory access, which keeps its
+    /// opcode, width and proof origin (a volatile or atomic load stays exactly
+    /// one architectural access). The access itself zero-extends, so nothing
+    /// merges into the load's register and no register `movzx` is needed. The
+    /// flag writes of `add`/`shr` are dead: no selection keeps RFLAGS live
+    /// across a LIR instruction. `I8`/`I16` are the loaded register itself;
+    /// their consumers still extend wherever they read past the value's width,
+    /// and the extension is a copy when the register is already extended.
+    fn loaded_memory_value(&mut self, ty: &Type, loaded: VReg, block: Block) -> VReg {
+        let loaded_bits = match ty {
+            Type::B1 | Type::I8 => 8,
+            Type::I16 => 16,
+            _ => return loaded,
+        };
+        self.zero_extended_vregs.insert(loaded, loaded_bits);
+        if *ty != Type::B1 {
+            return loaded;
+        }
+        let byte = loaded;
+        let biased = self.new_vreg(RegClass::Gpr32);
+        let truth = self.new_vreg(RegClass::Gpr32);
+        // Both are genuine 32-bit values (never a narrow carrier), which the
+        // carrier-hygiene checker needs to see: `shr` reads all 32 bits of
+        // `biased`.
+        self.func.vreg_nominal_widths.insert(biased, 32);
+        self.func.vreg_nominal_widths.insert(truth, 32);
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![
+                    X86ISelOperand::VReg(biased),
+                    X86ISelOperand::VReg(byte),
+                    X86ISelOperand::Imm(0xFF),
+                ],
+            ),
+        );
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(
+                X86Opcode::ShrRI,
+                vec![
+                    X86ISelOperand::VReg(truth),
+                    X86ISelOperand::VReg(biased),
+                    X86ISelOperand::Imm(8),
+                ],
+            ),
+        );
+        // `(m + 255) >> 8` is 0 or 1: every bit from 1 up is zero.
+        self.zero_extended_vregs.insert(truth, 1);
+        truth
+    }
+
+    /// Whether `operand` is a register this selector defined WHOLE with every
+    /// bit at and above `bits` zero ([`Self::zero_extended_vregs`]), so that
+    /// zero-extending its low `bits` bits is the identity on it.
+    ///
+    /// Only a register defined by one selected instruction qualifies (a
+    /// zero-extending load's destination, a loaded bool's `shr`), and the
+    /// caller still emits an explicit copy into its own fresh destination: the
+    /// copy is what the value's consumer reads, so every machine row keeps one
+    /// definition and the register allocator's coalescer can remove it.
+    fn zero_extension_is_redundant(&self, operand: &X86ISelOperand, bits: u32) -> bool {
+        matches!(
+            operand,
+            X86ISelOperand::VReg(vreg)
+                if self.zero_extended_vregs.get(vreg).is_some_and(|&known| known <= bits)
+        )
+    }
+
+    /// The opcode that zero-extends the low `bits` (8 or 16) of `src` into a
+    /// fresh register: `Movzx`/`MovzxW`, or the 32-bit copy `MovRR32` when
+    /// `src` is already zero-extended from at most `bits` bits. A 32-bit
+    /// register copy into a 64-bit destination zero-extends bits 32..63, so
+    /// the copy denotes the same value in either destination width.
+    fn narrow_zero_extend_opcode(&self, src: &X86ISelOperand, bits: u32) -> X86Opcode {
+        if self.zero_extension_is_redundant(src, bits) {
+            X86Opcode::MovRR32
+        } else if bits == 8 {
+            X86Opcode::Movzx
+        } else {
+            X86Opcode::MovzxW
+        }
     }
 
     /// Select memory store: MOV [base + 0], value.
@@ -12723,6 +14777,13 @@ impl X86InstructionSelector {
         block: Block,
     ) -> Result<(), X86ISelError> {
         Self::require_args(inst, 2, "Store")?;
+
+        // See the aggregate gate in `select_memory_load`: the scalar path below
+        // would store one 64-bit register — the aggregate's ADDRESS — over its
+        // bytes.
+        if let Some(refusal) = ty.whole_aggregate_memory_access_refusal(true, volatile) {
+            return Err(X86ISelError::UnsupportedOpcode(refusal));
+        }
 
         let value_val = inst.args[0];
         let addr_val = inst.args[1];
@@ -12826,7 +14887,7 @@ impl X86InstructionSelector {
     fn select_memory_intrinsic_call(
         &mut self,
         context: &'static str,
-        symbol: &'static str,
+        symbol: RuntimeSymbol,
         abi_arg_types: [Type; 3],
         inst: &Instruction,
         block: Block,
@@ -12878,7 +14939,7 @@ impl X86InstructionSelector {
             block,
             X86ISelInst::new(
                 X86Opcode::Call,
-                vec![X86ISelOperand::Symbol(symbol.to_string())],
+                vec![X86ISelOperand::Symbol(symbol.name().to_string())],
             )
             .with_call_arg_regs(call_arg_regs)
             .with_call_result_regs(Vec::new()),
@@ -12890,7 +14951,9 @@ impl X86InstructionSelector {
     ///
     /// x86-64 TSO gives plain aligned integer MOV loads acquire-compatible
     /// ordering. Volatile trust_ir loads use the distinct `VolatileMov*` path
-    /// above, so this handles only true non-RMW atomic loads.
+    /// above, so this handles only true non-RMW atomic loads. A 128-bit load
+    /// has no single-copy-atomic plain MOV and is a zeroed `LOCK CMPXCHG16B`
+    /// (see [`Self::select_atomic_load_i128`]).
     pub fn select_atomic_load(
         &mut self,
         ty: Type,
@@ -12900,6 +14963,10 @@ impl X86InstructionSelector {
     ) -> Result<(), X86ISelError> {
         Self::require_args(inst, 1, "AtomicLoad")?;
         Self::require_result(inst, "AtomicLoad")?;
+
+        if ty == Type::I128 {
+            return self.select_atomic_load_i128(inst, block);
+        }
 
         let opcode = Self::scalar_atomic_load_opcode(&ty)
             .ok_or_else(|| X86ISelError::UnsupportedOpcode(format!("{:?}", inst.opcode)))?;
@@ -12926,7 +14993,110 @@ impl X86InstructionSelector {
             .with_proof_origin(X86ProofOrigin::AtomicLoad),
         );
 
-        self.define_value(result_val, X86ISelOperand::VReg(dst), ty);
+        // A `B1`'s normalization is plain register operations after the one
+        // atomic access; the proof origin stays on the load.
+        let result = self.loaded_memory_value(&ty, dst, block);
+        self.define_value(result_val, X86ISelOperand::VReg(result), ty);
+        Ok(())
+    }
+
+    /// Select a 128-bit atomic load: the `AtomicLoadCmpxchg16b` pseudo, which
+    /// the encoder expands to `XOR EAX,EAX; XOR EDX,EDX; XOR EBX,EBX;
+    /// XOR ECX,ECX; LOCK CMPXCHG16B [addr]`.
+    ///
+    /// No plain 16-byte load is single-copy atomic on a CX16-only x86-64 (Intel
+    /// guarantees 16-byte `MOVDQA` atomicity only on AVX-enumerating
+    /// processors), so the load is a locked compare-exchange. With
+    /// `RDX:RAX == RCX:RBX == 0` both SDM branches leave `RDX:RAX` equal to the
+    /// value the 16 bytes held, and memory keeps that value: on a match the
+    /// stored `RCX:RBX` IS that value (0); on a mismatch the destination is
+    /// written back. This is LLVM's own lowering of `load atomic i128` on a CX16
+    /// target (measured on `core::sync::atomic::atomic_load::<u128>` at O2:
+    /// `xor eax,eax; xor edx,edx; xor ecx,ecx; xor ebx,ebx; lock cmpxchg16b
+    /// (%rdi)`), so it is mutually atomic with LLVM-compiled code on the same
+    /// object. It WRITES memory: an `AtomicU128` in read-only memory faults here
+    /// exactly as under LLVM. The 16-byte alignment the instruction requires
+    /// (#GP otherwise) is the natural alignment of the trust-ir element type.
+    ///
+    /// The four zeros are part of the pseudo rather than separate `MOV PReg`
+    /// copies: the compare-exchange is a correct LOAD only with all four
+    /// registers zero, and a zero that lived in its own instruction could be
+    /// deleted or rewritten by a later pass with nothing per compile noticing
+    /// (a cell equal to the comparand would then be overwritten with `RCX:RBX`).
+    /// As one pseudo the precondition is bound by construction: the
+    /// reconstruction models the whole expansion and ENC-3 decodes all five
+    /// emitted instructions.
+    ///
+    /// Every valid load ordering (Relaxed/Acquire/SeqCst) selects the same
+    /// sequence: a LOCKed instruction is a full barrier (over-strong, never
+    /// weaker). RBX is callee-saved; the pseudo's implicit defs name it, and the
+    /// codegen frame saves every callee-saved register a fixed def writes
+    /// (`x86_merge_fixed_callee_saved_gpr_defs`).
+    ///
+    /// Reached only for a trust-ir function that claims the `cmpxchg16b`
+    /// target feature: the adapter's module floor refuses an x86-64 128-bit
+    /// atomic in any function that does not, before any function reaches ISel.
+    fn select_atomic_load_i128(
+        &mut self,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), X86ISelError> {
+        let addr_val = inst.args[0];
+        let result_val = inst.results[0];
+        self.require_memory_address_type(&addr_val, "AtomicLoad")?;
+
+        // The address must survive the pseudo's four zeroing writes, so it is
+        // held in a Gpr64 VReg: the allocator's interference with the fixed
+        // RAX/RDX/RBX/RCX clobbers keeps it out of all four (the encoder refuses
+        // a base in any of them as a second line).
+        let addr = match self.use_value(&addr_val)? {
+            X86ISelOperand::VReg(v) if v.class == RegClass::Gpr64 => X86ISelOperand::VReg(v),
+            other @ X86ISelOperand::PReg(_) => {
+                let copy = self.new_vreg(RegClass::Gpr64);
+                self.func.record_vreg_nominal_width(copy, &Type::I64);
+                self.func.push_inst(
+                    block,
+                    X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::VReg(copy), other]),
+                );
+                X86ISelOperand::VReg(copy)
+            }
+            other => {
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "128-bit AtomicLoad address operand {other:?} is not a 64-bit register"
+                )));
+            }
+        };
+
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(
+                X86Opcode::AtomicLoadCmpxchg16b,
+                vec![X86ISelOperand::MemAddr {
+                    base: Box::new(addr),
+                    disp: 0,
+                }],
+            ),
+        );
+        // RDX:RAX holds the loaded value: RAX the low limb, RDX the high limb
+        // (the SysV i128 eightbyte order `define_i128_value` tracks).
+        let lo = self.new_vreg(RegClass::Gpr64);
+        let hi = self.new_vreg(RegClass::Gpr64);
+        self.func.record_vreg_nominal_width(hi, &Type::I64);
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(lo), X86ISelOperand::PReg(RAX)],
+            ),
+        );
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(hi), X86ISelOperand::PReg(RDX)],
+            ),
+        );
+        self.define_i128_value(result_val, lo, hi);
         Ok(())
     }
 
@@ -12934,10 +15104,20 @@ impl X86InstructionSelector {
     ///
     /// x86-64 TSO gives plain aligned integer MOV stores release-compatible
     /// ordering. RMW/CAS/fence atomics use their own typed paths below.
+    /// Select an atomic store: a plain `MOV` to memory, followed for `SeqCst`
+    /// by `MFENCE`.
+    ///
+    /// x86 TSO keeps stores in order with earlier loads and stores, so a
+    /// Relaxed or Release store is a plain `MOV`. The one reordering TSO
+    /// performs is a store with a LATER load (the store buffer), which a
+    /// sequentially consistent store must forbid: `MOV; MFENCE` is the C++11
+    /// x86 mapping that does (the alternative, a locked `XCHG`, has no proof
+    /// row here; see `select_atomic_rmw`). The `MFENCE` is the same row
+    /// `select_fence` emits for a `SeqCst` fence, with its proof origin.
     pub fn select_atomic_store(
         &mut self,
         ty: Type,
-        _ordering: AtomicOrdering,
+        ordering: AtomicOrdering,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), X86ISelError> {
@@ -12966,6 +15146,13 @@ impl X86InstructionSelector {
             )
             .with_proof_origin(X86ProofOrigin::AtomicStore),
         );
+        if ordering == AtomicOrdering::SeqCst {
+            self.func.push_inst(
+                block,
+                X86ISelInst::new(X86Opcode::Mfence, vec![])
+                    .with_proof_origin(X86ProofOrigin::FenceSeqCst),
+            );
+        }
 
         Ok(())
     }
@@ -13405,19 +15592,22 @@ impl X86InstructionSelector {
         inst: &Instruction,
         block: Block,
     ) -> Result<(), X86ISelError> {
+        self.select_symbol_address(X86ISelOperand::Symbol(name.to_string()), inst, block)
+    }
+
+    fn select_symbol_address(
+        &mut self,
+        symbol: X86ISelOperand,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), X86ISelError> {
         Self::require_result(inst, "GlobalRef")?;
 
         let result_val = inst.results[0];
         let dst = self.new_vreg(RegClass::Gpr64);
         self.func.push_inst(
             block,
-            X86ISelInst::new(
-                X86Opcode::LeaRip,
-                vec![
-                    X86ISelOperand::VReg(dst),
-                    X86ISelOperand::Symbol(name.to_string()),
-                ],
-            ),
+            X86ISelInst::new(X86Opcode::LeaRip, vec![X86ISelOperand::VReg(dst), symbol]),
         );
 
         self.define_value(result_val, X86ISelOperand::VReg(dst), Type::I64);
@@ -13747,6 +15937,134 @@ impl X86InstructionSelector {
         self.load_gpr_aggregate_lane(block, dst, aggregate_addr, lane_ty, 0);
     }
 
+    /// ASSEMBLE one GPR from the `valid_bytes` live bytes of a partial
+    /// eightbyte at `aggregate_addr + base_disp`.
+    ///
+    /// Emits one width-exact load per piece of `sysv_lane_byte_accesses` and
+    /// shifts each into place, so the register ends up holding exactly the
+    /// object's bytes and NOTHING past them. Each byte/word piece is
+    /// zero-extended before it is shifted, so the bytes above `valid_bytes`
+    /// are zero, which System V permits: the callee may not read them.
+    ///
+    /// A power-of-two width decomposes to a single access and this reduces to
+    /// the plain load, so the emitted code for every shape that already worked
+    /// is unchanged.
+    fn assemble_gpr_lane_from_memory(
+        &mut self,
+        block: Block,
+        dst: X86ISelOperand,
+        aggregate_addr: X86ISelOperand,
+        valid_bytes: u32,
+        base_disp: i32,
+    ) -> Option<()> {
+        let accesses = sysv_lane_byte_accesses(valid_bytes)?;
+        if let [(ty, 0)] = accesses.as_slice() {
+            self.load_gpr_aggregate_lane(block, dst, aggregate_addr, ty, base_disp);
+            return Some(());
+        }
+
+        // Accumulate into the destination, lowest piece first.
+        for (index, (ty, byte_offset)) in accesses.iter().enumerate() {
+            let loaded = self.new_vreg(RegClass::Gpr64);
+            self.load_gpr_aggregate_lane(
+                block,
+                X86ISelOperand::VReg(loaded),
+                aggregate_addr.clone(),
+                ty,
+                base_disp + *byte_offset as i32,
+            );
+            // Every piece's load writes the whole register: a byte or word is
+            // the zero-extending `movzx r32, m8/m16` and a dword `mov r32, m32`,
+            // both of which clear the bits above the piece. Nothing stale is
+            // shifted onto the next piece's bytes.
+            debug_assert!(matches!(ty, Type::I8 | Type::I16 | Type::I32));
+            let piece = loaded;
+            if index == 0 {
+                self.func.push_inst(
+                    block,
+                    X86ISelInst::new(
+                        X86Opcode::MovRR,
+                        vec![dst.clone(), X86ISelOperand::VReg(piece)],
+                    ),
+                );
+                continue;
+            }
+            // Shift this piece to its byte position and OR it in.
+            self.func.push_inst(
+                block,
+                X86ISelInst::new(
+                    X86Opcode::ShlRI,
+                    vec![
+                        X86ISelOperand::VReg(piece),
+                        X86ISelOperand::Imm(i64::from(*byte_offset) * 8),
+                    ],
+                ),
+            );
+            self.func.push_inst(
+                block,
+                X86ISelInst::new(
+                    X86Opcode::OrRR,
+                    vec![dst.clone(), X86ISelOperand::VReg(piece)],
+                ),
+            );
+        }
+        Some(())
+    }
+
+    /// DISASSEMBLE one GPR into the `valid_bytes` live bytes of a partial
+    /// eightbyte at `aggregate_addr + base_disp`.
+    ///
+    /// The mirror of [`Self::assemble_gpr_lane_from_memory`]: one width-exact
+    /// STORE per piece, so the callee writes exactly its own allocation and
+    /// never a byte past it. `src` is consumed by value into a scratch register
+    /// because the shifts are destructive.
+    fn disassemble_gpr_lane_to_memory(
+        &mut self,
+        block: Block,
+        aggregate_addr: X86ISelOperand,
+        valid_bytes: u32,
+        base_disp: i32,
+        src: X86ISelOperand,
+    ) -> Option<()> {
+        let accesses = sysv_lane_byte_accesses(valid_bytes)?;
+        if let [(ty, 0)] = accesses.as_slice() {
+            self.store_gpr_aggregate_lane_from_operand(block, aggregate_addr, ty, base_disp, src);
+            return Some(());
+        }
+
+        let scratch = self.new_vreg(RegClass::Gpr64);
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::VReg(scratch), src]),
+        );
+        let mut shifted = 0u32;
+        for (ty, byte_offset) in &accesses {
+            // Bring this piece down to the low bits before storing it.
+            let want_shift = *byte_offset * 8;
+            if want_shift > shifted {
+                self.func.push_inst(
+                    block,
+                    X86ISelInst::new(
+                        X86Opcode::ShrRI,
+                        vec![
+                            X86ISelOperand::VReg(scratch),
+                            X86ISelOperand::Imm(i64::from(want_shift - shifted)),
+                        ],
+                    ),
+                );
+                shifted = want_shift;
+            }
+            self.store_gpr_aggregate_lane_from_operand(
+                block,
+                aggregate_addr.clone(),
+                ty,
+                base_disp + *byte_offset as i32,
+                X86ISelOperand::VReg(scratch),
+            );
+        }
+        Some(())
+    }
+
     fn load_gpr_aggregate_lane(
         &mut self,
         block: Block,
@@ -13755,10 +16073,37 @@ impl X86InstructionSelector {
         lane_ty: &Type,
         disp: i32,
     ) {
+        let opcode = Self::memory_load_opcode(lane_ty, None);
+        // A byte or word lane is the zero-extending `movzx r32, m8/m16`, which
+        // writes the whole register: a physical destination is named by its
+        // 32-bit alias, the register the instruction actually writes (the
+        // ABI lane width says how many of its bits the callee reads, not what
+        // the load defines).
+        let dst = match dst {
+            X86ISelOperand::PReg(reg)
+                if matches!(opcode, X86Opcode::MovzxRM8 | X86Opcode::MovzxRM16) =>
+            {
+                let gpr64 = if reg.is_gpr8() {
+                    x86_64_regs::x86_gpr8_to_gpr64(reg)
+                } else if reg.is_gpr16() {
+                    x86_64_regs::x86_gpr16_to_gpr64(reg)
+                } else if reg.is_gpr32() {
+                    x86_64_regs::x86_gpr32_to_gpr64(reg)
+                } else {
+                    Some(reg)
+                };
+                X86ISelOperand::PReg(
+                    gpr64
+                        .and_then(x86_64_regs::x86_gpr64_to_gpr32)
+                        .expect("an aggregate lane register is a GPR with a 32-bit alias"),
+                )
+            }
+            other => other,
+        };
         self.func.push_inst(
             block,
             X86ISelInst::new(
-                Self::memory_load_opcode(lane_ty, None),
+                opcode,
                 vec![
                     dst,
                     X86ISelOperand::MemAddr {
@@ -13787,58 +16132,48 @@ impl X86InstructionSelector {
         );
     }
 
-    fn load_two_gpr_aggregate_lanes_to_pregs(
-        &mut self,
-        block: Block,
-        aggregate_addr: X86ISelOperand,
-        lane0: X86PReg,
-        lane1: X86PReg,
-    ) {
-        self.load_gpr_aggregate_lane(
-            block,
-            X86ISelOperand::PReg(lane0),
-            aggregate_addr.clone(),
-            &Type::I64,
-            0,
-        );
-        self.load_gpr_aggregate_lane(
-            block,
-            X86ISelOperand::PReg(lane1),
-            aggregate_addr,
-            &Type::I64,
-            8,
-        );
-    }
-
     fn load_sysv_aggregate_lane_to_preg(
         &mut self,
         block: Block,
         aggregate_addr: X86ISelOperand,
         lane: &X86SysVAggregateLane,
         dst: X86PReg,
-    ) {
+    ) -> Result<(), X86ISelError> {
         match lane.class {
-            X86SysVAggregateLaneClass::Integer => self.load_gpr_aggregate_lane_to_preg(
-                block,
-                aggregate_addr,
-                &lane.ty,
-                lane.offset,
-                dst,
-            ),
-            X86SysVAggregateLaneClass::Sse => self.func.push_inst(
-                block,
-                X86ISelInst::new(
-                    Self::memory_load_opcode(&lane.ty, None),
-                    vec![
-                        X86ISelOperand::PReg(dst),
-                        X86ISelOperand::MemAddr {
-                            base: Box::new(aggregate_addr),
-                            disp: lane.offset,
-                        },
-                    ],
-                ),
-            ),
+            X86SysVAggregateLaneClass::Integer => {
+                // A PARTIAL eightbyte is assembled from width-exact loads: the
+                // caller may read the object's own bytes and nothing past them.
+                // A full one decomposes to a single load, so this is the plain
+                // path for every shape that already worked.
+                let dst_reg = Self::physical_gpr_for_aggregate_lane_type(dst, &lane.ty);
+                self.assemble_gpr_lane_from_memory(
+                    block,
+                    X86ISelOperand::PReg(dst_reg),
+                    aggregate_addr,
+                    lane.valid_bytes,
+                    lane.offset,
+                )
+                .ok_or(X86ISelError::AggregateLaneUndecomposable {
+                    valid_bytes: lane.valid_bytes,
+                })?;
+            }
+            X86SysVAggregateLaneClass::Sse => {
+                self.func.push_inst(
+                    block,
+                    X86ISelInst::new(
+                        Self::memory_load_opcode(&lane.ty, None),
+                        vec![
+                            X86ISelOperand::PReg(dst),
+                            X86ISelOperand::MemAddr {
+                                base: Box::new(aggregate_addr),
+                                disp: lane.offset,
+                            },
+                        ],
+                    ),
+                );
+            }
         }
+        Ok(())
     }
 
     fn store_sysv_aggregate_lane_from_preg(
@@ -13847,15 +16182,52 @@ impl X86InstructionSelector {
         aggregate_addr: X86ISelOperand,
         lane: &X86SysVAggregateLane,
         src: X86PReg,
-    ) {
+    ) -> Result<(), X86ISelError> {
         match lane.class {
-            X86SysVAggregateLaneClass::Integer => self.store_gpr_aggregate_lane_from_gpr(
-                block,
-                aggregate_addr,
-                &lane.ty,
-                lane.offset,
-                src,
-            ),
+            // A call RESULT's partial eightbyte is written with width-exact
+            // stores, like every other site that moves a lane: the returned
+            // register's bytes past the object are unspecified, and the result
+            // slot's neighbours are live. One `lane.ty` store (4 bytes for a
+            // 3-byte lane) wrote one byte into the adjacent stack slot.
+            X86SysVAggregateLaneClass::Integer
+                if sysv_lane_byte_accesses(lane.valid_bytes).is_some_and(|a| a.len() == 1) =>
+            {
+                self.store_gpr_aggregate_lane_from_gpr(
+                    block,
+                    aggregate_addr,
+                    &lane.ty,
+                    lane.offset,
+                    src,
+                )
+            }
+            X86SysVAggregateLaneClass::Integer => {
+                // Copy the result out at the LANE's width first, as the formal
+                // materialization does: the call defines only `lane.ty`'s bytes of
+                // the return register (`EAX` for a 3-byte lane), and a 64-bit read
+                // of it would read caller-clobbered bytes. A 32-bit copy
+                // zero-extends, so the scratch the disassembly shifts is defined.
+                let lane_value = self.new_vreg(reg_class_for_type(&lane.ty));
+                self.func.push_inst(
+                    block,
+                    X86ISelInst::new(
+                        Self::gpr_copy_opcode_for_type(&lane.ty),
+                        vec![
+                            X86ISelOperand::VReg(lane_value),
+                            X86ISelOperand::PReg(Self::physical_gpr_for_type(src, &lane.ty)),
+                        ],
+                    ),
+                );
+                self.disassemble_gpr_lane_to_memory(
+                    block,
+                    aggregate_addr,
+                    lane.valid_bytes,
+                    lane.offset,
+                    X86ISelOperand::VReg(lane_value),
+                )
+                .ok_or(X86ISelError::AggregateLaneUndecomposable {
+                    valid_bytes: lane.valid_bytes,
+                })?;
+            }
             X86SysVAggregateLaneClass::Sse => self.func.push_inst(
                 block,
                 X86ISelInst::new(
@@ -13870,6 +16242,7 @@ impl X86InstructionSelector {
                 ),
             ),
         }
+        Ok(())
     }
 
     fn sysv_return_regs_for_aggregate_layout(
@@ -13901,10 +16274,11 @@ impl X86InstructionSelector {
         block: Block,
         aggregate_addr: X86ISelOperand,
         layout: &X86SysVAggregateLayout,
-    ) {
+    ) -> Result<(), X86ISelError> {
         for (lane, reg) in Self::sysv_return_regs_for_aggregate_layout(layout) {
-            self.load_sysv_aggregate_lane_to_preg(block, aggregate_addr.clone(), &lane, reg);
+            self.load_sysv_aggregate_lane_to_preg(block, aggregate_addr.clone(), &lane, reg)?;
         }
+        Ok(())
     }
 
     fn store_sysv_aggregate_lanes_from_return_regs(
@@ -13912,10 +16286,11 @@ impl X86InstructionSelector {
         block: Block,
         aggregate_addr: X86ISelOperand,
         layout: &X86SysVAggregateLayout,
-    ) {
+    ) -> Result<(), X86ISelError> {
         for (lane, reg) in Self::sysv_return_regs_for_aggregate_layout(layout) {
-            self.store_sysv_aggregate_lane_from_preg(block, aggregate_addr.clone(), &lane, reg);
+            self.store_sysv_aggregate_lane_from_preg(block, aggregate_addr.clone(), &lane, reg)?;
         }
+        Ok(())
     }
 
     fn materialize_windows_x64_byref_aggregate_argument(
@@ -13982,7 +16357,7 @@ impl X86InstructionSelector {
         aggregate_addr: X86ISelOperand,
         layout: &X86SysVAggregateLayout,
         stack_offset: i64,
-    ) {
+    ) -> Result<(), X86ISelError> {
         for lane in &layout.lanes {
             let tmp = self.new_vreg(reg_class_for_type(&lane.ty));
             self.func.push_inst(
@@ -13999,13 +16374,21 @@ impl X86InstructionSelector {
                 ),
             );
             match lane.class {
-                X86SysVAggregateLaneClass::Integer => self.store_gpr_aggregate_lane_from_operand(
-                    block,
-                    aggregate_addr.clone(),
-                    &lane.ty,
-                    lane.offset,
-                    X86ISelOperand::VReg(tmp),
-                ),
+                // A PARTIAL eightbyte is written with width-exact stores: the
+                // callee may write its own allocation and nothing past it. A
+                // full one decomposes to a single store.
+                X86SysVAggregateLaneClass::Integer => {
+                    self.disassemble_gpr_lane_to_memory(
+                        block,
+                        aggregate_addr.clone(),
+                        lane.valid_bytes,
+                        lane.offset,
+                        X86ISelOperand::VReg(tmp),
+                    )
+                    .ok_or(X86ISelError::AggregateLaneUndecomposable {
+                        valid_bytes: lane.valid_bytes,
+                    })?;
+                }
                 X86SysVAggregateLaneClass::Sse => self.func.push_inst(
                     block,
                     X86ISelInst::new(
@@ -14021,8 +16404,8 @@ impl X86InstructionSelector {
                 ),
             }
         }
+        Ok(())
     }
-
     fn emit_memory_copy(
         &mut self,
         block: Block,
@@ -14102,8 +16485,11 @@ impl X86InstructionSelector {
         let (load_opcode, store_opcode, class) = match width {
             8 => (X86Opcode::MovRM, X86Opcode::MovMR, RegClass::Gpr64),
             4 => (X86Opcode::MovRM32, X86Opcode::MovMR32, RegClass::Gpr32),
-            2 => (X86Opcode::MovRM16, X86Opcode::MovMR16, RegClass::Gpr32),
-            1 => (X86Opcode::MovRM8, X86Opcode::MovMR8, RegClass::Gpr32),
+            // Byte and word chunks load with the zero-extending `movzx r32,
+            // m8/m16`: the store writes the same low bytes, and the load does
+            // not merge into (or wait for) the register's previous value.
+            2 => (X86Opcode::MovzxRM16, X86Opcode::MovMR16, RegClass::Gpr32),
+            1 => (X86Opcode::MovzxRM8, X86Opcode::MovMR8, RegClass::Gpr32),
             _ => unreachable!("unsupported x86 aggregate copy width"),
         };
         let tmp = self.new_vreg(class);
@@ -14147,8 +16533,11 @@ impl X86InstructionSelector {
         let (load_opcode, store_opcode, class) = match width {
             8 => (X86Opcode::MovRM, X86Opcode::MovMR, RegClass::Gpr64),
             4 => (X86Opcode::MovRM32, X86Opcode::MovMR32, RegClass::Gpr32),
-            2 => (X86Opcode::MovRM16, X86Opcode::MovMR16, RegClass::Gpr32),
-            1 => (X86Opcode::MovRM8, X86Opcode::MovMR8, RegClass::Gpr32),
+            // Byte and word chunks load with the zero-extending `movzx r32,
+            // m8/m16`: the store writes the same low bytes, and the load does
+            // not merge into (or wait for) the register's previous value.
+            2 => (X86Opcode::MovzxRM16, X86Opcode::MovMR16, RegClass::Gpr32),
+            1 => (X86Opcode::MovzxRM8, X86Opcode::MovMR8, RegClass::Gpr32),
             _ => unreachable!("unsupported x86 aggregate copy width"),
         };
         let tmp = self.new_vreg(class);
@@ -14205,8 +16594,30 @@ impl X86InstructionSelector {
         inst: &Instruction,
         block: Block,
     ) -> Result<(), X86ISelError> {
+        self.lower_call_with_binding(name, DirectCallBinding::Interposable, inst, block)
+    }
+
+    fn lower_call_with_binding(
+        &mut self,
+        name: &str,
+        binding: DirectCallBinding,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), X86ISelError> {
+        if matches!(
+            binding,
+            DirectCallBinding::DeclaredExternalFunction { .. }
+                | DirectCallBinding::NativeDependency { .. }
+        ) {
+            return Err(X86ISelError::UnsupportedOpcode(format!(
+                "native dependency call {binding:?} requires the future closed Core fixup pipeline"
+            )));
+        }
         self.lower_call_inner(
-            X86CallTarget::Direct(name),
+            X86CallTarget::Direct {
+                name,
+                exact_module: binding.is_exact_module(),
+            },
             inst,
             block,
             false,
@@ -14265,6 +16676,48 @@ impl X86InstructionSelector {
                 && !is_sysv_memory_byval_aggregate(&ty, self.abi)
             {
                 reject_x86_aggregate_abi(&ty, idx, "call argument", self.abi)?;
+            }
+        }
+        // A callee whose ARGUMENT 0 is the hidden return-buffer pointer must
+        // return nothing: on System V that pointer IS the first integer
+        // argument, so a call that ALSO has an aggregate result would reserve
+        // the same register twice. Refuse instead. Variadic is refused for the
+        // same reason the AArch64 selector refuses it — composing the two
+        // register-numbering rules would be an invention, not a lowering.
+        let sret_callee = match &target {
+            X86CallTarget::Direct { name, .. } if self.sret_arg_callees.contains(*name) => {
+                Some(format!("`{name}`"))
+            }
+            X86CallTarget::Indirect(_)
+                if inst
+                    .args
+                    .first()
+                    .is_some_and(|callee| self.sret_arg_indirect_callees.contains(callee)) =>
+            {
+                Some(format!("the function pointer {:?}", inst.args[0]))
+            }
+            _ => None,
+        };
+        if let Some(name) = sret_callee {
+            if call_args.first().map(|value| self.value_type(value)) != Some(Type::I64) {
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "[TCG-SRET-ABI] call to {name} requires a leading I64 hidden return-buffer argument"
+                )));
+            }
+            if !inst.results.is_empty() {
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "[TCG-SRET-ABI] call to {name} passes a hidden return-buffer argument AND \
+                     expects {} result value(s); the buffer is the return, so this shape would \
+                     claim the indirect-result register twice. Failing closed.",
+                    inst.results.len()
+                )));
+            }
+            if is_variadic {
+                return Err(X86ISelError::UnsupportedOpcode(format!(
+                    "[TCG-SRET-ABI] variadic call to {name} with a hidden return-buffer \
+                     argument is not lowered; failing closed rather than composing the \
+                     indirect-result reservation with the variadic argument rules by guess"
+                )));
             }
         }
         let call_result_types = inst
@@ -14328,10 +16781,6 @@ impl X86InstructionSelector {
             /// the outgoing stack at `[RSP + offset]` (lo) and `[RSP + offset+8]`
             /// (hi), 16-byte aligned. Used when the argument GPRs are exhausted.
             I128Stack(i64),
-            TwoGprAggregate {
-                lane0: X86PReg,
-                lane1: X86PReg,
-            },
             SysVAggregate {
                 lanes: Vec<(X86SysVAggregateLane, X86PReg)>,
             },
@@ -14342,7 +16791,6 @@ impl X86InstructionSelector {
             },
             ByrefGpr(X86PReg),
             ByrefStack(i64),
-            TwoGprAggregateStack(i64),
             SysVAggregateStack {
                 offset: i64,
                 size: u32,
@@ -14356,111 +16804,57 @@ impl X86InstructionSelector {
 
         match self.abi {
             X86CallAbi::SystemV => {
-                let mut gpr_idx: usize = usize::from(sret_call_result.is_some());
-                let mut xmm_idx: usize = 0;
-
-                for val in call_args {
-                    let ty = self.value_type(val);
-                    let is_xmm = is_xmm_abi_value_type(&ty, self.abi);
-
-                    if ty == Type::I128 {
-                        // SysV: a 128-bit integer is two INTEGER eightbytes
-                        // passed in a consecutive GPR pair (low first). Both
-                        // eightbytes must fit in the remaining argument GPRs;
-                        // the psABI forbids splitting one eightbyte to a
-                        // register and the other to the stack. If two GPRs are
-                        // not available the whole value is passed on the stack.
-                        if gpr_idx + 1 < X86_ARG_GPRS.len() {
-                            arg_locs.push(ArgLoc::I128Pair {
-                                lo: X86_ARG_GPRS[gpr_idx],
-                                hi: X86_ARG_GPRS[gpr_idx + 1],
-                            });
-                            gpr_idx += 2;
-                        } else {
-                            // Argument GPRs exhausted: the whole i128 is MEMORY
-                            // class (two eightbytes on the stack), 16-byte
-                            // aligned. Symmetric to the formal-param stack path.
-                            align_sysv_stack_arg_for_type(&mut stack_count, &ty);
-                            arg_locs.push(ArgLoc::I128Stack(stack_count * 8));
-                            stack_count += 2;
+                // THE one System V placement (`x86_sysv_param_locations`),
+                // shared with `lower_formal_arguments_inner` and the rustc
+                // bridge's signature check; this arm only maps each location to
+                // the move it needs.
+                let tys: Vec<Type> = call_args.iter().map(|val| self.value_type(val)).collect();
+                let locations = x86_sysv_param_locations_at(
+                    &tys,
+                    &[],
+                    sret_call_result.is_some(),
+                    "call argument",
+                )?;
+                for (ty, location) in tys.iter().zip(locations) {
+                    stack_count = stack_count.max(location.stack_end_eightbytes());
+                    xmm_count = xmm_count.max(location.xmm_end());
+                    arg_locs.push(match location {
+                        X86ParamLocation::Gpr(index) => {
+                            ArgLoc::Gpr(X86_ARG_GPRS[usize::from(index)])
                         }
-                    } else if is_xmm {
-                        if xmm_idx < X86_ARG_XMMS.len() {
-                            arg_locs.push(ArgLoc::Xmm(X86_ARG_XMMS[xmm_idx]));
-                            xmm_idx += 1;
-                        } else {
-                            align_sysv_stack_arg_for_type(&mut stack_count, &ty);
-                            arg_locs.push(ArgLoc::Stack(stack_count * 8));
-                            stack_count += sysv_stack_eightbytes_for_type(&ty);
+                        X86ParamLocation::GprPair { lo, hi } => ArgLoc::I128Pair {
+                            lo: X86_ARG_GPRS[usize::from(lo)],
+                            hi: X86_ARG_GPRS[usize::from(hi)],
+                        },
+                        X86ParamLocation::Xmm(index) => {
+                            ArgLoc::Xmm(X86_ARG_XMMS[usize::from(index)])
                         }
-                    } else if let Some(layout) = classify_sysv_register_aggregate(&ty, self.abi) {
-                        let needed_gprs = layout.gpr_count();
-                        let needed_xmms = layout.xmm_count();
-                        if gpr_idx + needed_gprs <= X86_ARG_GPRS.len()
-                            && xmm_idx + needed_xmms <= X86_ARG_XMMS.len()
-                        {
-                            let mut next_gpr_idx = gpr_idx;
-                            let mut next_xmm_idx = xmm_idx;
-                            let mut lanes = Vec::with_capacity(layout.lanes.len());
-                            for lane in &layout.lanes {
-                                let reg = match lane.class {
-                                    X86SysVAggregateLaneClass::Integer => {
-                                        let reg = X86_ARG_GPRS[next_gpr_idx];
-                                        next_gpr_idx += 1;
-                                        reg
-                                    }
-                                    X86SysVAggregateLaneClass::Sse => {
-                                        let reg = X86_ARG_XMMS[next_xmm_idx];
-                                        next_xmm_idx += 1;
-                                        reg
-                                    }
-                                };
-                                lanes.push((lane.clone(), reg));
+                        X86ParamLocation::Lanes(lanes) => ArgLoc::SysVAggregate {
+                            lanes: sysv_aggregate_lane_registers(ty, &lanes)?,
+                        },
+                        X86ParamLocation::Stack {
+                            offset, copy_bytes, ..
+                        } => {
+                            if *ty == Type::I128 {
+                                ArgLoc::I128Stack(offset)
+                            } else if classify_sysv_register_aggregate(ty, self.abi).is_some()
+                                || is_sysv_memory_byval_aggregate(ty, self.abi)
+                            {
+                                // The aggregate's OWN bytes: a 12-byte register
+                                // aggregate that overflowed to the stack is copied
+                                // as 12 bytes into its two-eightbyte slot, never
+                                // as 16 (the slot's last four bytes are not the
+                                // object's, and System V leaves them unspecified).
+                                ArgLoc::SysVAggregateStack {
+                                    offset,
+                                    size: copy_bytes,
+                                }
+                            } else {
+                                ArgLoc::Stack(offset)
                             }
-                            arg_locs.push(ArgLoc::SysVAggregate { lanes });
-                            gpr_idx = next_gpr_idx;
-                            xmm_idx = next_xmm_idx;
-                        } else {
-                            align_sysv_stack_arg_for_type(&mut stack_count, &ty);
-                            arg_locs.push(ArgLoc::SysVAggregateStack {
-                                offset: stack_count * 8,
-                                size: layout.eightbyte_count() as u32 * 8,
-                            });
-                            stack_count += layout.eightbyte_count();
                         }
-                    } else if is_sysv_memory_byval_aggregate(&ty, self.abi) {
-                        // MEMORY class (>16 bytes): pass entirely on the stack.
-                        // The caller copies the aggregate bytes into the outgoing
-                        // argument area at an 8-byte (16 for >=16-byte aligned
-                        // types) slot; the callee reads them from its incoming
-                        // frame region. Reuses the same byte-copy + stack-slot
-                        // machinery as the register-aggregate overflow path.
-                        align_sysv_stack_arg_for_type(&mut stack_count, &ty);
-                        arg_locs.push(ArgLoc::SysVAggregateStack {
-                            offset: stack_count * 8,
-                            size: ty.bytes(),
-                        });
-                        stack_count += sysv_stack_eightbytes_for_type(&ty);
-                    } else if is_sysv_two_i64_gpr_aggregate(&ty, self.abi) {
-                        if gpr_idx + 1 < X86_ARG_GPRS.len() {
-                            arg_locs.push(ArgLoc::TwoGprAggregate {
-                                lane0: X86_ARG_GPRS[gpr_idx],
-                                lane1: X86_ARG_GPRS[gpr_idx + 1],
-                            });
-                            gpr_idx += 2;
-                        } else {
-                            arg_locs.push(ArgLoc::TwoGprAggregateStack(stack_count * 8));
-                            stack_count += 2;
-                        }
-                    } else if gpr_idx < X86_ARG_GPRS.len() {
-                        arg_locs.push(ArgLoc::Gpr(X86_ARG_GPRS[gpr_idx]));
-                        gpr_idx += 1;
-                    } else {
-                        arg_locs.push(ArgLoc::Stack(stack_count * 8));
-                        stack_count += 1;
-                    }
+                    });
                 }
-                xmm_count = xmm_idx;
             }
             X86CallAbi::WindowsX64 => {
                 for (arg_idx, val) in call_args.iter().enumerate() {
@@ -14577,32 +16971,6 @@ impl X86InstructionSelector {
                         ),
                     );
                 }
-                ArgLoc::TwoGprAggregateStack(offset) => {
-                    let src = self.use_value(val)?;
-                    for disp in [0, 8] {
-                        let tmp = self.new_vreg(RegClass::Gpr64);
-                        self.load_gpr_aggregate_lane(
-                            block,
-                            X86ISelOperand::VReg(tmp),
-                            src.clone(),
-                            &Type::I64,
-                            disp,
-                        );
-                        self.func.push_inst(
-                            block,
-                            X86ISelInst::new(
-                                X86Opcode::MovMR,
-                                vec![
-                                    X86ISelOperand::MemAddr {
-                                        base: Box::new(X86ISelOperand::PReg(RSP)),
-                                        disp: (*offset + i64::from(disp)) as i32,
-                                    },
-                                    X86ISelOperand::VReg(tmp),
-                                ],
-                            ),
-                        );
-                    }
-                }
                 ArgLoc::I128Stack(offset) => {
                     // A stack-passed i128 is a register PAIR (not address-
                     // represented): store lo to [RSP + offset], hi to +8.
@@ -14672,7 +17040,6 @@ impl X86InstructionSelector {
                 }
                 ArgLoc::Gpr(_)
                 | ArgLoc::I128Pair { .. }
-                | ArgLoc::TwoGprAggregate { .. }
                 | ArgLoc::SysVAggregate { .. }
                 | ArgLoc::Xmm(_)
                 | ArgLoc::XmmAndGpr { .. } => {}
@@ -14735,14 +17102,10 @@ impl X86InstructionSelector {
                         X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::PReg(*hi), hi_src]),
                     );
                 }
-                ArgLoc::TwoGprAggregate { lane0, lane1 } => {
-                    let src = self.use_value(val)?;
-                    self.load_two_gpr_aggregate_lanes_to_pregs(block, src, *lane0, *lane1);
-                }
                 ArgLoc::SysVAggregate { lanes } => {
                     let src = self.use_value(val)?;
                     for (lane, reg) in lanes {
-                        self.load_sysv_aggregate_lane_to_preg(block, src.clone(), lane, *reg);
+                        self.load_sysv_aggregate_lane_to_preg(block, src.clone(), lane, *reg)?;
                     }
                 }
                 ArgLoc::Xmm(reg) => {
@@ -14787,7 +17150,6 @@ impl X86InstructionSelector {
                     );
                 }
                 ArgLoc::ByrefStack(_)
-                | ArgLoc::TwoGprAggregateStack(_)
                 | ArgLoc::I128Stack(_)
                 | ArgLoc::SysVAggregateStack { .. }
                 | ArgLoc::Stack(_) => {}
@@ -14871,10 +17233,6 @@ impl X86InstructionSelector {
                     push_unique_x86_call_arg_isel(&mut call_arg_regs, X86CallArgReg::new(*lo, 64));
                     push_unique_x86_call_arg_isel(&mut call_arg_regs, X86CallArgReg::new(*hi, 64));
                 }
-                ArgLoc::TwoGprAggregate { lane0, lane1 } => {
-                    push_unique_x86_call_arg_isel(&mut call_arg_regs, X86CallArgReg::full(*lane0));
-                    push_unique_x86_call_arg_isel(&mut call_arg_regs, X86CallArgReg::full(*lane1));
-                }
                 ArgLoc::SysVAggregate { lanes } => {
                     // Each eightbyte lane is read at its own declared lane
                     // width (a narrow tail lane -- e.g. the u8 of {u64,u8} --
@@ -14896,7 +17254,6 @@ impl X86InstructionSelector {
                     push_unique_x86_call_arg_isel(&mut call_arg_regs, scalar_arg(gpr, &ty));
                 }
                 ArgLoc::ByrefStack(_)
-                | ArgLoc::TwoGprAggregateStack(_)
                 | ArgLoc::I128Stack(_)
                 | ArgLoc::SysVAggregateStack { .. }
                 | ArgLoc::Stack(_) => {}
@@ -14935,8 +17292,23 @@ impl X86InstructionSelector {
                 ));
             }
         } else {
-            for location in &scalar_return_locations {
-                location.append_call_result_regs(&mut call_result_regs);
+            debug_assert_eq!(scalar_return_locations.len(), call_result_types.len());
+            for (location, ty) in scalar_return_locations.iter().zip(&call_result_types) {
+                match (*location, ty) {
+                    // A callee defines only AL of a `bool` result: the psABI
+                    // makes bit 0 the value and bits 1..7 zero, and says
+                    // nothing above them; an LLVM callee returns it with
+                    // `setcc %al`, leaving EAX bits 8..31 as they were
+                    // (measured, trustc stage-1 / LLVM 22.1.2,
+                    // x86_64-apple-darwin -O3). The caller reads that byte
+                    // only and re-extends it below. A `bool` lane of a
+                    // multi-result call is the same byte, of which only bit 0
+                    // is defined (see the extraction below).
+                    (X86ScalarReturnLocation::Gpr { reg, .. }, Type::B1) => {
+                        call_result_regs.push(X86CallResultReg::new(reg, 8));
+                    }
+                    (location, _) => location.append_call_result_regs(&mut call_result_regs),
+                }
             }
         }
 
@@ -14945,10 +17317,19 @@ impl X86InstructionSelector {
         // stamped `PURE_CALL_HOISTABLE` (metadata only). Its side-effect/barrier
         // flags are left intact — only the gated x86 LICM cluster-hoist tier
         // reads this bit; no implicit DCE/reordering is enabled by it.
-        let is_pure_hoistable_call =
-            matches!(&target, X86CallTarget::Direct(name) if self.pure_callees.contains(*name));
+        let is_pure_hoistable_call = matches!(
+            &target,
+            X86CallTarget::Direct { name, .. } if self.pure_callees.contains(*name)
+        );
+        let exact_module_call = matches!(
+            &target,
+            X86CallTarget::Direct {
+                exact_module: true,
+                ..
+            }
+        );
         let (opcode, operands) = match target {
-            X86CallTarget::Direct(name) => (
+            X86CallTarget::Direct { name, .. } => (
                 X86Opcode::Call,
                 vec![X86ISelOperand::Symbol(name.to_string())],
             ),
@@ -14959,6 +17340,9 @@ impl X86InstructionSelector {
             .with_call_result_regs(call_result_regs);
         if is_pure_hoistable_call {
             call_inst.flags.insert(InstFlags::PURE_CALL_HOISTABLE);
+        }
+        if exact_module_call {
+            call_inst.flags.insert(InstFlags::EXACT_MODULE_CALL);
         }
         self.func.push_inst(block, call_inst);
 
@@ -14995,7 +17379,7 @@ impl X86InstructionSelector {
                 block,
                 aggregate_addr.clone(),
                 &layout,
-            );
+            )?;
             self.define_value(result_val, aggregate_addr, ret_ty);
             return Ok(());
         }
@@ -15021,8 +17405,23 @@ impl X86InstructionSelector {
                     // integer returns. Reading EAX/EDX directly would launder the
                     // call-clobbered upper bits into a supposedly clean Gpr32
                     // value. Extract and zero-extend the exact declared width.
+                    // A `bool` result is AL = 0/1 (see the result metadata
+                    // above); re-extending it restores the backend's clean
+                    // 32-bit bool carrier, which its own returns and bool
+                    // arguments are held to.
+                    //
+                    // A `bool` lane of a multi-result call defines bit 0
+                    // alone, so it is also masked: rustc returns a
+                    // `ScalarPair` as the LLVM struct `{ T, i1 }` / `{ i1, T }`,
+                    // whose `i1` carries no `zeroext`, and LLVM any-extends it
+                    // (`(x, transmute::<u8, bool>(x as u8 & 1))` returns with
+                    // `movl %eax, %edx`, leaving bits 1..7 of DL as those of
+                    // `x`; trustc stage-1 d7f143f3b / LLVM 22.1.2,
+                    // x86_64-apple-darwin -O3). The x86 body theorem models the
+                    // lane the same way (`Carrier::call_result_bits`).
+                    let mask_bool_lane = ret_ty == Type::B1 && inst.results.len() > 1;
                     let (copy_opcode, ret_gpr) = match ret_ty {
-                        Type::I8 => (
+                        Type::I8 | Type::B1 => (
                             X86Opcode::Movzx,
                             x86_64_regs::x86_gpr64_to_gpr8(reg)
                                 .expect("return GPR must have an 8-bit alias"),
@@ -15044,6 +17443,19 @@ impl X86InstructionSelector {
                             vec![X86ISelOperand::VReg(dst), X86ISelOperand::PReg(ret_gpr)],
                         ),
                     );
+                    if mask_bool_lane {
+                        self.func.push_inst(
+                            block,
+                            X86ISelInst::new(
+                                X86Opcode::AndRI,
+                                vec![
+                                    X86ISelOperand::VReg(dst),
+                                    X86ISelOperand::VReg(dst),
+                                    X86ISelOperand::Imm(1),
+                                ],
+                            ),
+                        );
+                    }
                     self.define_value(*result_val, X86ISelOperand::VReg(dst), ret_ty);
                 }
                 X86ScalarReturnLocation::GprPair { lo, hi } => {
@@ -15089,7 +17501,10 @@ impl X86InstructionSelector {
         block: Block,
     ) -> Result<(), X86ISelError> {
         self.lower_call_inner(
-            X86CallTarget::Direct(name),
+            X86CallTarget::Direct {
+                name,
+                exact_module: false,
+            },
             inst,
             block,
             true,
@@ -15112,6 +17527,31 @@ impl X86InstructionSelector {
         let actual = inst.args.len();
         if expected != actual {
             return Err(X86ISelError::ReturnArityMismatch { expected, actual });
+        }
+
+        // THE INDIRECT-RETURN CONVENTION, callee half, System V x86-64. The
+        // value has already been written through the hidden buffer parameter, so
+        // there is nothing to place in a return register — but the AMD64 psABI
+        // §3.2.3 additionally requires the callee to RETURN THE BUFFER ADDRESS in
+        // `%rax`. LLVM emits that (`movq -0x8(%rbp), %rax` before its `ret`), and
+        // the `returns`-driven sret path below does too (`MovRR RAX, dst`); the
+        // hidden-parameter shape returns void and would otherwise leave `%rax`
+        // holding whatever the body last computed. A rustc-generated caller does
+        // not read it, but a clang-generated one may, and "nobody looks" is not
+        // an ABI.
+        //
+        // AAPCS64 has no counterpart: §6.9 makes X8 an input to the callee only,
+        // and LLVM's AArch64 output likewise leaves X0 alone. So this is
+        // deliberately here and not in the shared path.
+        if self.sret_param_index.is_some() && sig_returns.is_empty() {
+            let buffer = self.use_value(&Value(0))?;
+            self.func.push_inst(
+                block,
+                X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::PReg(RAX), buffer]),
+            );
+            self.func
+                .push_inst(block, X86ISelInst::new(X86Opcode::Ret, vec![]));
+            return Ok(());
         }
 
         for (i, val) in inst.args.iter().enumerate() {
@@ -15211,22 +17651,73 @@ impl X86InstructionSelector {
 
         if let Some(layout) = classify_sysv_register_aggregate_returns(&sig_returns, self.abi) {
             let src = self.use_value(&inst.args[0])?;
-            self.load_sysv_aggregate_lanes_to_return_regs(block, src, &layout);
+            self.load_sysv_aggregate_lanes_to_return_regs(block, src, &layout)?;
             self.func
                 .push_inst(block, X86ISelInst::new(X86Opcode::Ret, vec![]));
             return Ok(());
         }
 
-        let return_locations = classify_x86_scalar_return_locations(&sig_returns, self.abi)?;
+        let abi = self.abi;
+        let return_locations = classify_x86_scalar_return_locations(&sig_returns, abi)?;
         debug_assert_eq!(inst.args.len(), return_locations.len());
+
+        // RESOLVE EVERY SOURCE BEFORE THE FIRST FIXED-REGISTER WRITE.
+        //
+        // `use_value` may EMIT code (a cross-block constant is rematerialized
+        // into a fresh vreg in this block). Interleaved with the return moves,
+        // such a vreg would be defined AFTER an earlier move had already
+        // written its result register, and nothing then keeps that register
+        // live to the `ret`, so the allocator could colour the new vreg into it
+        // and overwrite a placed result. With every source resolved first,
+        // the return-move window below contains only fixed-register writes of
+        // already-live values: each value read there is live across every
+        // earlier move's register def, which the allocator's implicit-def
+        // reservation already keeps it out of. Pure reordering: when no source
+        // emits code (the common case) the instruction stream is unchanged.
+        enum ReturnSource {
+            Single(X86ISelOperand),
+            Pair(X86ISelOperand, X86ISelOperand),
+        }
+        let mut sources = Vec::with_capacity(return_locations.len());
+        for (val, location) in inst.args.iter().zip(&return_locations) {
+            sources.push(match *location {
+                X86ScalarReturnLocation::Gpr { .. } | X86ScalarReturnLocation::Xmm { .. } => {
+                    ReturnSource::Single(self.use_value(val)?)
+                }
+                X86ScalarReturnLocation::GprPair { .. } => {
+                    let (lo, hi) = self.use_i128_value(val)?;
+                    ReturnSource::Pair(lo, hi)
+                }
+            });
+        }
 
         // Move each return value into the exact physical location shared with
         // caller extraction and post-RA call-result metadata.
-        for ((val, ty), location) in inst.args.iter().zip(&sig_returns).zip(&return_locations) {
-            match *location {
-                X86ScalarReturnLocation::Gpr { reg, .. } => {
-                    let src = self.use_value(val)?;
+        for (((index, source), ty), location) in sources
+            .into_iter()
+            .enumerate()
+            .zip(&sig_returns)
+            .zip(&return_locations)
+        {
+            // TV-1 EXTENDED, ABI half: which return index this move
+            // materializes. Recorded for the single-register scalar forms only
+            // — `GprPair` below is two moves for ONE value and is deliberately
+            // left unrecorded, so a consumer requiring an exact binding refuses
+            // an `i128` return.
+            let record_return = |func: &mut X86ISelFunction, reg: X86PReg| {
+                func.record_return_abi_binding(
+                    reg,
+                    X86ReturnAbiBinding {
+                        return_index: index as u32,
+                        ty: ty.clone(),
+                        abi,
+                    },
+                );
+            };
+            match (*location, source) {
+                (X86ScalarReturnLocation::Gpr { reg, .. }, ReturnSource::Single(src)) => {
                     let ret_gpr = Self::physical_gpr_for_type(reg, ty);
+                    record_return(&mut self.func, ret_gpr);
                     self.func.push_inst(
                         block,
                         X86ISelInst::new(
@@ -15235,8 +17726,8 @@ impl X86InstructionSelector {
                         ),
                     );
                 }
-                X86ScalarReturnLocation::Xmm { reg, .. } => {
-                    let src = self.use_value(val)?;
+                (X86ScalarReturnLocation::Xmm { reg, .. }, ReturnSource::Single(src)) => {
+                    record_return(&mut self.func, reg);
                     self.func.push_inst(
                         block,
                         X86ISelInst::new(
@@ -15245,9 +17736,11 @@ impl X86InstructionSelector {
                         ),
                     );
                 }
-                X86ScalarReturnLocation::GprPair { lo, hi } => {
+                (
+                    X86ScalarReturnLocation::GprPair { lo, hi },
+                    ReturnSource::Pair(lo_src, hi_src),
+                ) => {
                     debug_assert_eq!(ty, &Type::I128);
-                    let (lo_src, hi_src) = self.use_i128_value(val)?;
                     self.func.push_inst(
                         block,
                         X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::PReg(lo), lo_src]),
@@ -15257,12 +17750,27 @@ impl X86InstructionSelector {
                         X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::PReg(hi), hi_src]),
                     );
                 }
+                _ => unreachable!("each return source was resolved for its own location"),
             }
         }
 
-        // Emit RET
-        self.func
-            .push_inst(block, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        // Emit RET, stamped with the result registers it delivers beyond the
+        // C return file (empty — the historical `ret` — unless this signature
+        // exhausts RAX,RDX / XMM0,XMM1).
+        let internal_return_regs: Vec<X86CallResultReg> = return_locations
+            .iter()
+            .flat_map(|location| {
+                let mut regs = Vec::new();
+                location.append_call_result_regs(&mut regs);
+                regs
+            })
+            .filter(|result| x86_is_internal_multi_result_reg(result.reg))
+            .collect();
+        self.func.push_inst(
+            block,
+            X86ISelInst::new(X86Opcode::Ret, vec![])
+                .with_internal_return_regs(internal_return_regs),
+        );
         Ok(())
     }
 
@@ -15339,18 +17847,40 @@ impl X86InstructionSelector {
         }
 
         let has_sret_return = is_supported_x86_sret_returns(&self.func.sig.returns, self.abi);
-        let mut gpr_idx: usize = if self.abi == X86CallAbi::SystemV && has_sret_return {
-            1
-        } else {
-            0
-        };
-        let mut xmm_idx: usize = 0;
-        // SysV: first stack arg is [RBP+16]. Windows x64: [RBP+16..+47] is
-        // caller shadow space, so the first stack arg is [RBP+48].
-        let mut stack_offset: i64 = match self.abi {
-            X86CallAbi::SystemV => 16,
-            X86CallAbi::WindowsX64 => 16 + WINDOWS_X64_SHADOW_SPACE,
-        };
+        // A hidden return-buffer PARAMETER and a `returns`-driven sret return
+        // both claim the indirect-result register (RDI on System V, RCX on
+        // Windows x64). One signature cannot have both — refuse rather than
+        // silently let the parameter and the return alias the same register.
+        if self.sret_param_index.is_some() {
+            if !self.func.sig.returns.is_empty() {
+                return Err(X86ISelError::UnsupportedOpcode(
+                    "[TCG-SRET-ABI] a hidden return-buffer parameter requires an empty return \
+                     list; refusing competing return conventions."
+                        .to_string(),
+                ));
+            }
+            match self.func.sig.params.first() {
+                Some(Type::I64) => {}
+                Some(other) => {
+                    return Err(X86ISelError::UnsupportedOpcode(format!(
+                        "[TCG-SRET-ABI] hidden return-buffer parameter has type {other:?}, not \
+                         the I64 pointer carrier; refusing rather than passing a non-pointer \
+                         as the indirect-result address"
+                    )));
+                }
+                None => {
+                    return Err(X86ISelError::UnsupportedOpcode(
+                        "[TCG-SRET-ABI] signature declares a hidden return-buffer parameter \
+                         but has no parameters at all"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        // Windows x64 only (System V reads `x86_sysv_param_locations` below):
+        // [RBP+16..+47] is caller shadow space, so the first stack arg is
+        // [RBP+48].
+        let mut stack_offset: i64 = 16 + WINDOWS_X64_SHADOW_SPACE;
 
         if has_sret_return {
             let sret_vreg = self.new_vreg(RegClass::Gpr64);
@@ -15368,6 +17898,47 @@ impl X86InstructionSelector {
         }
 
         let mut materializations = Vec::new();
+
+        // The XMM moves below cover F32/F64/V128 only; an `f16` formal has no
+        // x86 selection, so it is refused by name instead of reaching them.
+        if sig.params.contains(&Type::F16) {
+            return Err(X86ISelError::UnsupportedOpcode(
+                "[TCG-X86-F16-ABI] f16 formal parameter: x86-64 has no f16 argument lowering"
+                    .to_string(),
+            ));
+        }
+
+        // THE one System V placement (`x86_sysv_param_locations`), shared with
+        // the call side; every System V arm below reads its parameter's
+        // location from it instead of keeping counters of its own. The
+        // counters above stay for Windows x64 only.
+        let sysv_locations = if self.abi == X86CallAbi::SystemV {
+            Some(x86_sysv_param_locations_at(
+                &sig.params,
+                &[],
+                has_sret_return,
+                "formal parameter",
+            )?)
+        } else {
+            None
+        };
+        let sysv_location = |i: usize| -> Result<X86ParamLocation, X86ISelError> {
+            sysv_locations
+                .as_ref()
+                .and_then(|locations| locations.get(i))
+                .cloned()
+                .ok_or_else(|| {
+                    X86ISelError::UnsupportedOpcode(format!(
+                        "System V formal parameter {i} has no placement; failing closed"
+                    ))
+                })
+        };
+        let placement_mismatch = |i: usize, ty: &Type, location: &X86ParamLocation| {
+            X86ISelError::UnsupportedOpcode(format!(
+                "System V formal parameter {i} `{ty:?}` was placed at {location:?}, which its \
+                 kind cannot occupy; failing closed"
+            ))
+        };
 
         for (i, ty) in sig.params.iter().enumerate() {
             if let Some(lane_ty) = single_x86_gpr_aggregate_lane_type(ty) {
@@ -15405,36 +17976,40 @@ impl X86InstructionSelector {
                         });
                         stack_offset += 8;
                     }
-                } else if gpr_idx < X86_ARG_GPRS.len() {
-                    let src_vreg = self.new_vreg(reg_class_for_type(&lane_ty));
-                    self.func.push_inst(
-                        entry_block,
-                        X86ISelInst::new(
-                            Self::gpr_copy_opcode_for_type(&lane_ty),
-                            vec![
-                                X86ISelOperand::VReg(src_vreg),
-                                X86ISelOperand::PReg(Self::physical_gpr_for_type(
-                                    X86_ARG_GPRS[gpr_idx],
-                                    &lane_ty,
-                                )),
-                            ],
-                        ),
-                    );
-                    materializations.push(FormalMaterialization::SingleGprAggregateReg {
-                        val,
-                        ty: ty.clone(),
-                        lane_ty,
-                        src: X86ISelOperand::VReg(src_vreg),
-                    });
-                    gpr_idx += 1;
                 } else {
-                    materializations.push(FormalMaterialization::SingleGprAggregateStack {
-                        val,
-                        ty: ty.clone(),
-                        lane_ty,
-                        stack_offset,
-                    });
-                    stack_offset += 8;
+                    match sysv_location(i)? {
+                        X86ParamLocation::Gpr(index) => {
+                            let src_vreg = self.new_vreg(reg_class_for_type(&lane_ty));
+                            self.func.push_inst(
+                                entry_block,
+                                X86ISelInst::new(
+                                    Self::gpr_copy_opcode_for_type(&lane_ty),
+                                    vec![
+                                        X86ISelOperand::VReg(src_vreg),
+                                        X86ISelOperand::PReg(Self::physical_gpr_for_type(
+                                            X86_ARG_GPRS[usize::from(index)],
+                                            &lane_ty,
+                                        )),
+                                    ],
+                                ),
+                            );
+                            materializations.push(FormalMaterialization::SingleGprAggregateReg {
+                                val,
+                                ty: ty.clone(),
+                                lane_ty,
+                                src: X86ISelOperand::VReg(src_vreg),
+                            });
+                        }
+                        X86ParamLocation::Stack { offset, .. } => {
+                            materializations.push(FormalMaterialization::SingleGprAggregateStack {
+                                val,
+                                ty: ty.clone(),
+                                lane_ty,
+                                stack_offset: SYSV_INCOMING_ARGS_RBP_OFFSET + offset,
+                            });
+                        }
+                        other => return Err(placement_mismatch(i, ty, &other)),
+                    }
                 }
 
                 continue;
@@ -15443,27 +18018,16 @@ impl X86InstructionSelector {
             if let Some(layout) = classify_sysv_register_aggregate(ty, self.abi) {
                 let val = Value(i as u32);
 
-                let needed_gprs = layout.gpr_count();
-                let needed_xmms = layout.xmm_count();
-                if gpr_idx + needed_gprs <= X86_ARG_GPRS.len()
-                    && xmm_idx + needed_xmms <= X86_ARG_XMMS.len()
-                {
-                    let mut next_gpr_idx = gpr_idx;
-                    let mut next_xmm_idx = xmm_idx;
+                let location = sysv_location(i)?;
+                if let X86ParamLocation::Lanes(placed) = &location {
                     let mut lanes = Vec::with_capacity(layout.lanes.len());
-                    for lane in &layout.lanes {
+                    for (lane, reg) in sysv_aggregate_lane_registers(ty, placed)? {
                         let (src, opcode) = match lane.class {
-                            X86SysVAggregateLaneClass::Integer => {
-                                let reg = X86_ARG_GPRS[next_gpr_idx];
-                                next_gpr_idx += 1;
-                                (
-                                    Self::physical_gpr_for_type(reg, &lane.ty),
-                                    Self::gpr_copy_opcode_for_type(&lane.ty),
-                                )
-                            }
+                            X86SysVAggregateLaneClass::Integer => (
+                                Self::physical_gpr_for_type(reg, &lane.ty),
+                                Self::gpr_copy_opcode_for_type(&lane.ty),
+                            ),
                             X86SysVAggregateLaneClass::Sse => {
-                                let reg = X86_ARG_XMMS[next_xmm_idx];
-                                next_xmm_idx += 1;
                                 (reg, Self::xmm_copy_opcode_for_type(&lane.ty))
                             }
                         };
@@ -15475,24 +18039,22 @@ impl X86InstructionSelector {
                                 vec![X86ISelOperand::VReg(src_vreg), X86ISelOperand::PReg(src)],
                             ),
                         );
-                        lanes.push((lane.clone(), X86ISelOperand::VReg(src_vreg)));
+                        lanes.push((lane, X86ISelOperand::VReg(src_vreg)));
                     }
                     materializations.push(FormalMaterialization::SysVAggregateReg {
                         val,
                         ty: ty.clone(),
                         lanes,
                     });
-                    gpr_idx = next_gpr_idx;
-                    xmm_idx = next_xmm_idx;
-                } else {
-                    align_sysv_formal_stack_offset_for_type(&mut stack_offset, ty);
+                } else if let X86ParamLocation::Stack { offset, .. } = location {
                     materializations.push(FormalMaterialization::SysVAggregateStack {
                         val,
                         ty: ty.clone(),
                         layout: layout.clone(),
-                        stack_offset,
+                        stack_offset: SYSV_INCOMING_ARGS_RBP_OFFSET + offset,
                     });
-                    stack_offset += layout.eightbyte_count() * 8;
+                } else {
+                    return Err(placement_mismatch(i, ty, &location));
                 }
 
                 continue;
@@ -15504,13 +18066,14 @@ impl X86InstructionSelector {
                 // a fresh local slot so field accesses read the right bytes and a
                 // mutation of the parameter cannot corrupt the caller's storage.
                 let val = Value(i as u32);
-                align_sysv_formal_stack_offset_for_type(&mut stack_offset, ty);
+                let X86ParamLocation::Stack { offset, .. } = sysv_location(i)? else {
+                    return Err(placement_mismatch(i, ty, &sysv_location(i)?));
+                };
                 materializations.push(FormalMaterialization::SysVMemoryStack {
                     val,
                     ty: ty.clone(),
-                    stack_offset,
+                    stack_offset: SYSV_INCOMING_ARGS_RBP_OFFSET + offset,
                 });
-                stack_offset += sysv_stack_eightbytes_for_type(ty) * 8;
                 continue;
             }
 
@@ -15560,7 +18123,8 @@ impl X86InstructionSelector {
                             .to_string(),
                     ));
                 }
-                if gpr_idx + 1 < X86_ARG_GPRS.len() {
+                let location = sysv_location(i)?;
+                if let X86ParamLocation::GprPair { lo, hi } = location {
                     let vreg_lo = self.new_vreg(RegClass::Gpr64);
                     let vreg_hi = self.new_vreg(RegClass::Gpr64);
                     self.func.push_inst(
@@ -15569,7 +18133,7 @@ impl X86InstructionSelector {
                             X86Opcode::MovRR,
                             vec![
                                 X86ISelOperand::VReg(vreg_lo),
-                                X86ISelOperand::PReg(X86_ARG_GPRS[gpr_idx]),
+                                X86ISelOperand::PReg(X86_ARG_GPRS[usize::from(lo)]),
                             ],
                         ),
                     );
@@ -15579,22 +18143,21 @@ impl X86InstructionSelector {
                             X86Opcode::MovRR,
                             vec![
                                 X86ISelOperand::VReg(vreg_hi),
-                                X86ISelOperand::PReg(X86_ARG_GPRS[gpr_idx + 1]),
+                                X86ISelOperand::PReg(X86_ARG_GPRS[usize::from(hi)]),
                             ],
                         ),
                     );
-                    gpr_idx += 2;
                     self.define_i128_value(val, vreg_lo, vreg_hi);
-                } else {
+                } else if let X86ParamLocation::Stack { offset, .. } = location {
                     // SysV: a stack-passed i128 occupies two consecutive
                     // eightbytes — lo at [RBP + off], hi at [RBP + off + 8] —
                     // 16-byte aligned. Load both halves into a GPR pair. Note a
                     // PARTIALLY-in-register i128 (one half in the last GPR, the
                     // other on the stack) does NOT occur in SysV: an aggregate
                     // that would split across the register/stack boundary is
-                    // passed entirely on the stack, so `gpr_idx + 1 >= len`
+                    // passed entirely on the stack, so a stack location
                     // means BOTH halves are on the stack.
-                    align_sysv_formal_stack_offset_for_type(&mut stack_offset, ty);
+                    let stack_offset = SYSV_INCOMING_ARGS_RBP_OFFSET + offset;
                     let vreg_lo = self.new_vreg(RegClass::Gpr64);
                     let vreg_hi = self.new_vreg(RegClass::Gpr64);
                     self.func.push_inst(
@@ -15623,8 +18186,9 @@ impl X86InstructionSelector {
                             ],
                         ),
                     );
-                    stack_offset += sysv_stack_eightbytes_for_type(ty) * 8;
                     self.define_i128_value(val, vreg_lo, vreg_hi);
+                } else {
+                    return Err(placement_mismatch(i, ty, &location));
                 }
                 continue;
             }
@@ -15634,6 +18198,9 @@ impl X86InstructionSelector {
             let vreg = self.new_vreg(class);
             let is_fp = matches!(ty, Type::F16 | Type::F32 | Type::F64);
             let is_sysv_xmm = is_xmm_abi_value_type(ty, self.abi);
+            // TV-1 EXTENDED, ABI half: the location this SCALAR parameter was
+            // read from, recorded per branch below.
+            let formal_location: X86FormalArgumentLocation;
 
             if self.abi == X86CallAbi::WindowsX64 {
                 let abi_param_idx = i + usize::from(has_sret_return);
@@ -15655,6 +18222,7 @@ impl X86InstructionSelector {
                             vec![X86ISelOperand::VReg(vreg), X86ISelOperand::PReg(preg)],
                         ),
                     );
+                    formal_location = X86FormalArgumentLocation::Register(preg);
                 } else {
                     let opcode = Self::memory_load_opcode(ty, None);
                     self.func.push_inst(
@@ -15670,69 +18238,119 @@ impl X86InstructionSelector {
                             ],
                         ),
                     );
+                    formal_location = X86FormalArgumentLocation::IncomingStack {
+                        rbp_disp: stack_offset as i32,
+                    };
                     stack_offset += 8;
                 }
-            } else if is_sysv_xmm {
-                if xmm_idx < X86_ARG_XMMS.len() {
-                    // FP/vector arg in XMM register.
-                    self.func.push_inst(
-                        entry_block,
-                        X86ISelInst::new(
-                            Self::xmm_copy_opcode_for_type(ty),
-                            vec![
-                                X86ISelOperand::VReg(vreg),
-                                X86ISelOperand::PReg(X86_ARG_XMMS[xmm_idx]),
-                            ],
-                        ),
-                    );
-                    xmm_idx += 1;
-                } else {
-                    // FP/vector arg on stack.
-                    align_sysv_formal_stack_offset_for_type(&mut stack_offset, ty);
-                    self.func.push_inst(
-                        entry_block,
-                        X86ISelInst::new(
-                            Self::sysv_formal_stack_load_opcode(ty),
-                            vec![
-                                X86ISelOperand::VReg(vreg),
-                                X86ISelOperand::MemAddr {
-                                    base: Box::new(X86ISelOperand::PReg(RBP)),
-                                    disp: stack_offset as i32,
-                                },
-                            ],
-                        ),
-                    );
-                    stack_offset += sysv_stack_eightbytes_for_type(ty) * 8;
-                }
-            } else if gpr_idx < X86_ARG_GPRS.len() {
-                // Integer arg in GPR
-                let arg_gpr = Self::physical_gpr_for_type(X86_ARG_GPRS[gpr_idx], ty);
-                self.func.push_inst(
-                    entry_block,
-                    X86ISelInst::new(
-                        Self::gpr_copy_opcode_for_type(ty),
-                        vec![X86ISelOperand::VReg(vreg), X86ISelOperand::PReg(arg_gpr)],
-                    ),
-                );
-                gpr_idx += 1;
             } else {
-                // Integer arg on stack: MOV vreg, [RBP + stack_offset]
-                self.func.push_inst(
-                    entry_block,
-                    X86ISelInst::new(
-                        Self::memory_load_opcode(ty, None),
-                        vec![
-                            X86ISelOperand::VReg(vreg),
-                            X86ISelOperand::MemAddr {
-                                base: Box::new(X86ISelOperand::PReg(RBP)),
-                                disp: stack_offset as i32,
-                            },
-                        ],
-                    ),
-                );
-                stack_offset += 8;
+                let location = sysv_location(i)?;
+                match location {
+                    X86ParamLocation::Xmm(index) if is_sysv_xmm => {
+                        // FP/vector arg in XMM register.
+                        let xmm = X86_ARG_XMMS[usize::from(index)];
+                        self.func.push_inst(
+                            entry_block,
+                            X86ISelInst::new(
+                                Self::xmm_copy_opcode_for_type(ty),
+                                vec![X86ISelOperand::VReg(vreg), X86ISelOperand::PReg(xmm)],
+                            ),
+                        );
+                        formal_location = X86FormalArgumentLocation::Register(xmm);
+                    }
+                    X86ParamLocation::Gpr(index) if !is_sysv_xmm => {
+                        // Integer arg in GPR
+                        let arg_gpr =
+                            Self::physical_gpr_for_type(X86_ARG_GPRS[usize::from(index)], ty);
+                        // A System V `bool` argument defines bit 0 and clears
+                        // bits 1..7 only; bits 8..63 are unspecified (psABI
+                        // §3.2.3). The backend's own `B1` is the clean 32-bit
+                        // bool, which it returns and forwards as an argument, so
+                        // the parameter is the zero extension of the register's
+                        // low byte (`movzx r32, r/m8` of its 32-bit alias: the
+                        // low byte, DIL..R9B), never the 32-bit register a psABI
+                        // caller may leave dirty above bit 7. (LLVM's and the
+                        // backend's own callers pass a clean 32-bit bool, which
+                        // this leaves unchanged.)
+                        let opcode = if *ty == Type::B1 && self.abi == X86CallAbi::SystemV {
+                            self.zero_extended_vregs.insert(vreg, 8);
+                            X86Opcode::Movzx
+                        } else {
+                            Self::gpr_copy_opcode_for_type(ty)
+                        };
+                        self.func.push_inst(
+                            entry_block,
+                            X86ISelInst::new(
+                                opcode,
+                                vec![X86ISelOperand::VReg(vreg), X86ISelOperand::PReg(arg_gpr)],
+                            ),
+                        );
+                        formal_location = X86FormalArgumentLocation::Register(arg_gpr);
+                    }
+                    X86ParamLocation::Stack { offset, .. } => {
+                        // FP/vector or integer arg on stack: MOV vreg, [RBP + disp]
+                        let disp = SYSV_INCOMING_ARGS_RBP_OFFSET + offset;
+                        let opcode = if is_sysv_xmm {
+                            Self::sysv_formal_stack_load_opcode(ty)
+                        } else {
+                            Self::memory_load_opcode(ty, None)
+                        };
+                        self.func.push_inst(
+                            entry_block,
+                            X86ISelInst::new(
+                                opcode,
+                                vec![
+                                    X86ISelOperand::VReg(vreg),
+                                    X86ISelOperand::MemAddr {
+                                        base: Box::new(X86ISelOperand::PReg(RBP)),
+                                        disp: disp as i32,
+                                    },
+                                ],
+                            ),
+                        );
+                        formal_location = X86FormalArgumentLocation::IncomingStack {
+                            rbp_disp: disp as i32,
+                        };
+                    }
+                    other => return Err(placement_mismatch(i, ty, &other)),
+                }
             }
 
+            // TV-1 EXTENDED, ABI half: this move materializes signature
+            // parameter `i` from `formal_location`. Recorded here (one site, at
+            // the end of the scalar arm) rather than inside each branch's emit,
+            // so the recorded location and the emitted operand cannot disagree
+            // by construction of separate code paths.
+            // A `B1`/`I8`/`I16` read from the incoming stack area is the
+            // zero-extending `movzx r32, m8/m16` (`memory_load_opcode`): the
+            // loaded register is already the clean 32-bit bool (the caller's
+            // convention makes the byte 0 or 1; the parameter is a value, not
+            // a trust-ir `Load`) or the zero-extended integer.
+            if matches!(
+                formal_location,
+                X86FormalArgumentLocation::IncomingStack { .. }
+            ) {
+                match ty {
+                    Type::B1 | Type::I8 => {
+                        self.zero_extended_vregs.insert(vreg, 8);
+                    }
+                    Type::I16 => {
+                        self.zero_extended_vregs.insert(vreg, 16);
+                    }
+                    _ => {}
+                }
+            }
+            let abi = self.abi;
+            self.func.record_formal_argument_binding(
+                vreg,
+                X86FormalArgumentBinding {
+                    param_index: i as u32,
+                    ty: ty.clone(),
+                    location: formal_location,
+                    abi,
+                    sret_return: has_sret_return,
+                },
+            );
             self.define_value(val, X86ISelOperand::VReg(vreg), ty.clone());
         }
 
@@ -15774,14 +18392,22 @@ impl X86InstructionSelector {
                     let aggregate_addr = self.allocate_stack_slot_addr(&ty, entry_block);
                     for (lane, src) in lanes {
                         match lane.class {
+                            // A PARTIAL eightbyte is written with width-exact
+                            // stores; the callee writes its own allocation and
+                            // nothing past it.
                             X86SysVAggregateLaneClass::Integer => {
-                                self.store_gpr_aggregate_lane_from_operand(
+                                self.disassemble_gpr_lane_to_memory(
                                     entry_block,
                                     aggregate_addr.clone(),
-                                    &lane.ty,
+                                    lane.valid_bytes,
                                     lane.offset,
                                     src,
-                                );
+                                )
+                                .ok_or(
+                                    X86ISelError::AggregateLaneUndecomposable {
+                                        valid_bytes: lane.valid_bytes,
+                                    },
+                                )?;
                             }
                             X86SysVAggregateLaneClass::Sse => self.func.push_inst(
                                 entry_block,
@@ -15813,7 +18439,7 @@ impl X86InstructionSelector {
                         aggregate_addr.clone(),
                         &layout,
                         stack_offset,
-                    );
+                    )?;
                     self.define_value(val, aggregate_addr, ty);
                     self.pointer_values.insert(val);
                 }
@@ -15966,6 +18592,42 @@ impl X86InstructionSelector {
         Ok(func)
     }
 }
+static X86_JUMP_TABLE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the x86 dense-switch JUMP TABLE opt-OUT from a TRACKED compiler option,
+/// once (`-Ztrust-ir-cg-args=no-x86-jump-table`). `true` disables the jump table.
+///
+/// Default-on for eligible dense switches. Dated host-specific A/B measurements
+/// are retained in `reports/perf/2026-09-29-x86-jump-table/README.md`; they do not
+/// qualify other programs, hosts or proof routes. Both measured proof arms
+/// refused an earlier `MovRR` obligation, which says nothing about whether the
+/// later computed branch target is proved. Its obligation remains distinct from
+/// a direct branch; neither this option nor the case-map check grants that proof.
+/// Reinstallation is accepted only for the identical policy.
+pub fn set_x86_jump_table_disabled(disabled: bool) -> bool {
+    match X86_JUMP_TABLE_ENABLED.set(!disabled) {
+        Ok(()) => true,
+        Err(requested) => X86_JUMP_TABLE_ENABLED.get() == Some(&requested),
+    }
+}
+
+/// True unless `TCG_NO_X86_I128_CONST_SHIFT` is set to anything but `0`: the
+/// standalone opt-out of the constant-amount 128-bit shift fold (OD-215). The
+/// default selector folds.
+fn x86_i128_const_shift_fold_enabled() -> bool {
+    !std::env::var_os("TCG_NO_X86_I128_CONST_SHIFT").is_some_and(|value| value != "0")
+}
+
+/// True iff dense x86 switches may use a jump table. DEFAULT ON; the forensic
+/// opt-outs are `-Ztrust-ir-cg-args=no-x86-jump-table` and, standalone,
+/// `TCG_NO_X86_JUMP_TABLE` (unset or `0` keeps tables enabled; any other value
+/// disables them). An installed tracked policy takes precedence.
+fn x86_jump_table_enabled() -> bool {
+    if let Some(enabled) = X86_JUMP_TABLE_ENABLED.get() {
+        return *enabled;
+    }
+    !std::env::var_os("TCG_NO_X86_JUMP_TABLE").is_some_and(|value| value != "0")
+}
 
 // ===========================================================================
 // Tests
@@ -15973,15 +18635,273 @@ impl X86InstructionSelector {
 
 #[cfg(test)]
 mod tests {
+
+    /// The partial-eightbyte decomposition moves EXACTLY the live bytes.
+    ///
+    /// This is the property the whole partial-lane lowering rests on: System V
+    /// leaves the bytes beyond an aggregate UNSPECIFIED, so an access that
+    /// reaches past `valid_bytes` is a read or write the program never
+    /// authorised. Checked as arithmetic rather than by inspection.
+    #[test]
+    fn sysv_lane_decomposition_covers_exactly_the_live_bytes() {
+        for valid in 1u32..=8 {
+            let accesses = sysv_lane_byte_accesses(valid)
+                .unwrap_or_else(|| panic!("{valid} live bytes must decompose"));
+            assert!(!accesses.is_empty(), "{valid}: empty decomposition");
+
+            // Widths sum to exactly the live bytes: nothing dropped, nothing
+            // past the end.
+            let total: u32 = accesses.iter().map(|(ty, _)| ty.bytes()).sum();
+            assert_eq!(
+                total, valid,
+                "{valid} live bytes decomposed to {total} bytes: {accesses:?}"
+            );
+
+            // Contiguous and ascending from 0, so the accesses tile the lane
+            // without a gap or an overlap.
+            let mut cursor = 0u32;
+            for (ty, offset) in &accesses {
+                assert_eq!(
+                    *offset, cursor,
+                    "{valid}: access at +{offset} leaves a gap or overlaps (expected +{cursor})"
+                );
+                cursor += ty.bytes();
+            }
+            assert_eq!(cursor, valid);
+
+            // Every access is a real GPR width.
+            for (ty, _) in &accesses {
+                assert!(
+                    matches!(ty, Type::I8 | Type::I16 | Type::I32 | Type::I64),
+                    "{valid}: {ty:?} is not a single GPR access width"
+                );
+            }
+        }
+    }
+
+    /// A power-of-two lane keeps its SINGLE access, so admitting partial lanes
+    /// changes the shape of nothing that already worked.
+    #[test]
+    fn sysv_lane_decomposition_is_the_identity_for_power_of_two_widths() {
+        for (valid, want) in [
+            (1u32, Type::I8),
+            (2, Type::I16),
+            (4, Type::I32),
+            (8, Type::I64),
+        ] {
+            assert_eq!(
+                sysv_lane_byte_accesses(valid),
+                Some(vec![(want.clone(), 0)]),
+                "{valid} live bytes must stay a single {want:?} access"
+            );
+        }
+    }
+
+    /// Widths with no decomposition fail closed rather than guessing.
+    #[test]
+    fn sysv_lane_decomposition_refuses_impossible_widths() {
+        assert_eq!(sysv_lane_byte_accesses(0), None, "a zero-byte lane");
+        assert_eq!(sysv_lane_byte_accesses(9), None, "wider than an eightbyte");
+        assert_eq!(sysv_lane_byte_accesses(16), None);
+    }
+
     use super::*;
     use crate::instructions::{
         AtomicOrdering, AtomicRmwOp, Block, Instruction, IntCC, Opcode, Value,
     };
     use crate::types::Type;
     use trust_cg_ir::x86_64_regs::{
-        EAX, ECX, EDI, EDX, ESI, R8, R8D, R9, R9D, RAX, RBP, RCX, RDI, RDX, RSI, RSP, XMM0, XMM1,
-        XMM3,
+        DL, EAX, ECX, EDI, EDX, ESI, R8, R8D, R9, R9D, RAX, RBP, RCX, RDI, RDX, RSI, RSP, XMM0,
+        XMM1, XMM3,
     };
+
+    #[test]
+    fn canonical_identity_stream_and_buffer_agree_and_propagate_write_errors() {
+        struct RefusingWriter;
+        impl std::fmt::Write for RefusingWriter {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+        let function = X86ISelFunction::new("identity".into(), Signature::default());
+        let mut streamed = String::new();
+        function
+            .write_canonical_verifier_identity(&mut streamed)
+            .unwrap();
+        assert_eq!(
+            function.canonical_verifier_identity_bytes().unwrap(),
+            streamed.into_bytes()
+        );
+        assert_eq!(
+            function.write_canonical_verifier_identity(&mut RefusingWriter),
+            Err(std::fmt::Error)
+        );
+    }
+
+    #[test]
+    fn canonical_verifier_identity_is_hash_order_independent_and_semantic() {
+        fn build(reverse: bool) -> X86ISelFunction {
+            let mut function = X86ISelFunction::new("canonical".to_string(), Signature::default());
+            function.block_order = vec![Block(0), Block(1)];
+            let blocks = if reverse {
+                [Block(1), Block(0)]
+            } else {
+                [Block(0), Block(1)]
+            };
+            for block in blocks {
+                function.blocks.insert(block, X86ISelBlock::default());
+            }
+            let widths = if reverse {
+                [
+                    (VReg::new(2, RegClass::Gpr32), 8),
+                    (VReg::new(1, RegClass::Gpr64), 64),
+                ]
+            } else {
+                [
+                    (VReg::new(1, RegClass::Gpr64), 64),
+                    (VReg::new(2, RegClass::Gpr32), 8),
+                ]
+            };
+            for (vreg, width) in widths {
+                function.vreg_nominal_widths.insert(vreg, width);
+            }
+            let guards = if reverse {
+                [(2u128, 22u64), (1u128, 11u64)]
+            } else {
+                [(1u128, 11u64), (2u128, 22u64)]
+            };
+            for (fingerprint, obligation) in guards {
+                function.guard_obligations.insert(fingerprint, obligation);
+            }
+            let sources = [
+                (
+                    SourceInstId { block: 1, index: 0 },
+                    SourceInstId { block: 1, index: 1 },
+                ),
+                (
+                    SourceInstId { block: 2, index: 0 },
+                    SourceInstId { block: 2, index: 1 },
+                ),
+            ];
+            if reverse {
+                for (source, target) in sources.into_iter().rev() {
+                    function.source_fusion_targets.insert(source, target);
+                }
+            } else {
+                for (source, target) in sources {
+                    function.source_fusion_targets.insert(source, target);
+                }
+            }
+            function
+        }
+
+        let forward = build(false);
+        let reverse = build(true);
+        assert_eq!(
+            forward.canonical_verifier_identity_bytes(),
+            reverse.canonical_verifier_identity_bytes()
+        );
+
+        let mut changed = reverse;
+        changed
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .insts
+            .push(X86ISelInst::new(X86Opcode::Nop, vec![]));
+        assert_ne!(
+            forward.canonical_verifier_identity_bytes(),
+            changed.canonical_verifier_identity_bytes()
+        );
+
+        let mut first_nan = build(false);
+        first_nan
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .insts
+            .push(X86ISelInst::new(
+                X86Opcode::Nop,
+                vec![X86ISelOperand::FImm(f64::from_bits(0x7ff8_0000_0000_0001))],
+            ));
+        let mut second_nan = first_nan.clone();
+        second_nan.blocks.get_mut(&Block(0)).unwrap().insts[0].operands[0] =
+            X86ISelOperand::FImm(f64::from_bits(0x7ff8_0000_0000_0002));
+        assert_ne!(
+            first_nan.canonical_verifier_identity_bytes(),
+            second_nan.canonical_verifier_identity_bytes()
+        );
+    }
+
+    #[test]
+    fn same_width_i64_extension_is_an_identity_move() {
+        for signed in [false, true] {
+            let (mut selector, entry) = make_empty_isel();
+            define_vreg(&mut selector, Value(0), Type::I64);
+            let opcode = if signed {
+                Opcode::Sextend {
+                    from_ty: Type::I64,
+                    to_ty: Type::I64,
+                }
+            } else {
+                Opcode::Uextend {
+                    from_ty: Type::I64,
+                    to_ty: Type::I64,
+                }
+            };
+            selector
+                .select_instruction(
+                    &Instruction {
+                        opcode,
+                        args: vec![Value(0)],
+                        results: vec![Value(1)],
+                    },
+                    entry,
+                )
+                .unwrap();
+            assert_eq!(selector.value_type(&Value(1)), Type::I64);
+            let function = selector.finalize();
+            assert_eq!(function.blocks[&entry].insts.len(), 1);
+            assert_eq!(function.blocks[&entry].insts[0].opcode, X86Opcode::MovRR);
+        }
+    }
+
+    #[test]
+    fn sparse_maximum_lir_block_id_still_allows_synthetic_traps() {
+        let mut selector =
+            X86InstructionSelector::new("sparse_blocks".into(), Signature::default());
+        selector
+            .select_block(
+                Block(u32::MAX),
+                &[
+                    Instruction {
+                        opcode: Opcode::Iconst {
+                            ty: Type::B1,
+                            imm: 1,
+                        },
+                        args: vec![],
+                        results: vec![Value(0)],
+                    },
+                    Instruction {
+                        opcode: Opcode::Assert,
+                        args: vec![Value(0)],
+                        results: vec![],
+                    },
+                ],
+            )
+            .unwrap();
+        let function = selector.finalize();
+        let source = &function.blocks[&Block(u32::MAX)];
+        let trap = source.successors[0];
+        assert_ne!(trap, Block(u32::MAX));
+        assert_eq!(function.blocks[&trap].insts[0].opcode, X86Opcode::Ud2);
+        assert!(
+            source
+                .insts
+                .iter()
+                .any(|inst| inst.opcode == X86Opcode::Jcc)
+        );
+    }
 
     /// Helper: create an empty instruction selector and entry block.
     fn make_empty_isel() -> (X86InstructionSelector, Block) {
@@ -16074,6 +18994,27 @@ mod tests {
         assert_unsupported_aggregate_abi(err, "return", 0, size, abi);
     }
 
+    /// An `f16` formal parameter is refused by name under both ABIs, before
+    /// any argument move is emitted (it used to panic in the XMM copy).
+    #[test]
+    fn test_f16_formal_parameter_is_refused_by_name() {
+        for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
+            let sig = Signature {
+                params: vec![Type::I32, Type::F16],
+                returns: vec![Type::I32],
+            };
+            let mut isel =
+                X86InstructionSelector::with_abi("test_fn".to_string(), sig.clone(), abi);
+            let entry = Block(0);
+            let err = isel.lower_formal_arguments(&sig, entry).unwrap_err();
+            assert!(
+                err.to_string().contains("[TCG-X86-F16-ABI]"),
+                "{abi:?}: {err}"
+            );
+            assert!(isel.func.blocks[&entry].insts.is_empty());
+        }
+    }
+
     fn assert_formal_rejects_aggregate(aggregate_ty: Type, abi: X86CallAbi) {
         let size = aggregate_ty.bytes();
         let sig = Signature {
@@ -16150,6 +19091,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![Value(0)],
                     results: vec![],
@@ -16184,6 +19126,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0)],
                 results: vec![],
@@ -16233,6 +19176,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![],
                     results: vec![Value(0)],
@@ -17243,6 +20187,193 @@ mod tests {
         }
     }
 
+    /// The unsigned narrow compares, EXECUTED rather than counted: the
+    /// sequence ISel emits for each of the eight unsigned `V16I8Icmp` /
+    /// `V8I16Icmp` cells is evaluated on this selector's three-address form
+    /// (`dst, src1, src2`; `pcmpgt*` is `src1 > src2` per signed lane, the
+    /// operand order the signed tests above pin) and compared with the
+    /// unsigned predicate: on every `u8` pair for `v16_i8`, and on every pair
+    /// of a boundary set for `v8_i16`. It checks the bias and the operand
+    /// ORDER, which the opcode-list test above cannot, on any host (the x86
+    /// JIT execution tests are `cfg(x86_64)`). The opcode model is this
+    /// test's own reading of the SSE2 definitions, and the two-address
+    /// rewrite after ISel is not covered: a test, not a proof.
+    ///
+    /// MUTATION CONTROL (recorded when this landed): swapping `gt_lhs` and
+    /// `gt_rhs` for `UnsignedLessThan` in
+    /// `emit_narrow_unsigned_vector_comparison` fails this test on `ult`.
+    #[test]
+    fn test_select_narrow_v128_icmp_unsigned_sign_bias_computes_the_unsigned_predicate() {
+        type Xmm = [u8; 16];
+
+        fn lanes(a: Xmm, b: Xmm, width: usize, holds: impl Fn(i64, i64) -> bool) -> Xmm {
+            let signed = |v: Xmm, at: usize| -> i64 {
+                match width {
+                    1 => i64::from(v[at] as i8),
+                    2 => i64::from(i16::from_le_bytes([v[at], v[at + 1]])),
+                    _ => unreachable!("narrow lanes only"),
+                }
+            };
+            let mut out = [0u8; 16];
+            for at in (0..16).step_by(width) {
+                if holds(signed(a, at), signed(b, at)) {
+                    out[at..at + width].fill(0xff);
+                }
+            }
+            out
+        }
+
+        /// Runs `insts` with `inputs` bound and returns the XMM value of
+        /// `result`. An opcode outside the modelled seven panics.
+        fn run(
+            insts: &[X86ISelInst],
+            inputs: [(X86ISelOperand, Xmm); 2],
+            result: &X86ISelOperand,
+        ) -> Xmm {
+            let mut xmm: Vec<(X86ISelOperand, Xmm)> = inputs.to_vec();
+            let mut gpr: Vec<(X86ISelOperand, u32)> = Vec::new();
+            let read = |xmm: &[(X86ISelOperand, Xmm)], op: &X86ISelOperand| -> Xmm {
+                xmm.iter()
+                    .rev()
+                    .find(|(defined, _)| defined == op)
+                    .map(|(_, value)| *value)
+                    .unwrap_or_else(|| panic!("read of undefined {op:?}"))
+            };
+            for inst in insts {
+                let ops = &inst.operands;
+                let value = match inst.opcode {
+                    X86Opcode::MovRI => {
+                        let X86ISelOperand::Imm(imm) = ops[1] else {
+                            panic!("MovRI source is not an immediate: {inst:?}")
+                        };
+                        // A 32-bit move: the low half of the immediate.
+                        gpr.push((ops[0].clone(), imm as u32));
+                        continue;
+                    }
+                    X86Opcode::MovdToXmm => {
+                        let word = gpr
+                            .iter()
+                            .rev()
+                            .find(|(defined, _)| *defined == ops[1])
+                            .map(|(_, value)| *value)
+                            .expect("MOVD reads a defined GPR");
+                        let mut out = [0u8; 16];
+                        out[..4].copy_from_slice(&word.to_le_bytes());
+                        out
+                    }
+                    X86Opcode::Pshufd => {
+                        let source = read(&xmm, &ops[1]);
+                        let X86ISelOperand::Imm(control) = ops[2] else {
+                            panic!("PSHUFD control is not an immediate: {inst:?}")
+                        };
+                        let mut out = [0u8; 16];
+                        for dword in 0..4 {
+                            let from = ((control >> (2 * dword)) & 3) as usize;
+                            out[4 * dword..4 * dword + 4]
+                                .copy_from_slice(&source[4 * from..4 * from + 4]);
+                        }
+                        out
+                    }
+                    X86Opcode::Pxor | X86Opcode::Por => {
+                        let (a, b) = (read(&xmm, &ops[1]), read(&xmm, &ops[2]));
+                        std::array::from_fn(|at| {
+                            if inst.opcode == X86Opcode::Pxor {
+                                a[at] ^ b[at]
+                            } else {
+                                a[at] | b[at]
+                            }
+                        })
+                    }
+                    X86Opcode::Pcmpgtb => {
+                        lanes(read(&xmm, &ops[1]), read(&xmm, &ops[2]), 1, |a, b| a > b)
+                    }
+                    X86Opcode::Pcmpgtw => {
+                        lanes(read(&xmm, &ops[1]), read(&xmm, &ops[2]), 2, |a, b| a > b)
+                    }
+                    X86Opcode::Pcmpeqb => {
+                        lanes(read(&xmm, &ops[1]), read(&xmm, &ops[2]), 1, |a, b| a == b)
+                    }
+                    X86Opcode::Pcmpeqw => {
+                        lanes(read(&xmm, &ops[1]), read(&xmm, &ops[2]), 2, |a, b| a == b)
+                    }
+                    other => panic!("opcode outside the modelled sign-bias sequence: {other:?}"),
+                };
+                xmm.push((ops[0].clone(), value));
+            }
+            read(&xmm, result)
+        }
+
+        const U16_BOUNDARY: [u16; 12] = [
+            0, 1, 2, 0x00ff, 0x0100, 0x1234, 0x7ffe, 0x7fff, 0x8000, 0x8001, 0xfffe, 0xffff,
+        ];
+        type UnsignedPredicate = fn(u64, u64) -> bool;
+        let unsigned: [(IntCC, UnsignedPredicate); 4] = [
+            (IntCC::UnsignedLessThan, |a, b| a < b),
+            (IntCC::UnsignedLessThanOrEqual, |a, b| a <= b),
+            (IntCC::UnsignedGreaterThan, |a, b| a > b),
+            (IntCC::UnsignedGreaterThanOrEqual, |a, b| a >= b),
+        ];
+        for width in [1usize, 2] {
+            // Every (a, b) lane pair to check, packed 16 / width per vector.
+            let pairs: Vec<(u64, u64)> = if width == 1 {
+                (0..=u8::MAX)
+                    .flat_map(|a| (0..=u8::MAX).map(move |b| (u64::from(a), u64::from(b))))
+                    .collect()
+            } else {
+                U16_BOUNDARY
+                    .iter()
+                    .flat_map(|&a| {
+                        U16_BOUNDARY
+                            .iter()
+                            .map(move |&b| (u64::from(a), u64::from(b)))
+                    })
+                    .collect()
+            };
+            for (cond, predicate) in unsigned {
+                let opcode = if width == 1 {
+                    Opcode::V16I8Icmp { cond }
+                } else {
+                    Opcode::V8I16Icmp { cond }
+                };
+                let (mut isel, entry) = make_empty_isel();
+                let lhs = X86ISelOperand::VReg(define_vreg(&mut isel, Value(0), Type::V128));
+                let rhs = X86ISelOperand::VReg(define_vreg(&mut isel, Value(1), Type::V128));
+                isel.select_instruction(
+                    &Instruction {
+                        opcode: opcode.clone(),
+                        args: vec![Value(0), Value(1)],
+                        results: vec![Value(2)],
+                    },
+                    entry,
+                )
+                .unwrap();
+                let result = isel.value_map[&Value(2)].clone();
+                let insts = &isel.func.blocks[&entry].insts;
+                let per_vector = 16 / width;
+                for chunk in pairs.chunks(per_vector) {
+                    let mut a = [0u8; 16];
+                    let mut b = [0u8; 16];
+                    for (lane, (x, y)) in chunk.iter().enumerate() {
+                        let at = lane * width;
+                        a[at..at + width].copy_from_slice(&x.to_le_bytes()[..width]);
+                        b[at..at + width].copy_from_slice(&y.to_le_bytes()[..width]);
+                    }
+                    let mask = run(insts, [(lhs.clone(), a), (rhs.clone(), b)], &result);
+                    for (lane, (x, y)) in chunk.iter().enumerate() {
+                        let at = lane * width;
+                        let expected = if predicate(*x, *y) { 0xff } else { 0 };
+                        assert!(
+                            mask[at..at + width].iter().all(|byte| *byte == expected),
+                            "{opcode:?}: lane {lane} with a={x:#x} b={y:#x} gave {:02x?}, \
+                             expected all {expected:#04x}",
+                            &mask[at..at + width]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_select_v4i32_icmp_supported_conditions_use_sse2_packed_compares() {
         for (cond, expected_opcodes) in [
@@ -17307,7 +20438,8 @@ mod tests {
 
         assert!(
             matches!(err, X86ISelError::UnsupportedOpcode(ref message)
-                if message.contains("Arithmetic lhs=V128 rhs=I64")),
+                if message.contains("Arithmetic Iadd lhs=V128 (Value(0)) rhs=I64 (Value(1)) -> Value(2)")
+                    && message.contains("operand types must match")),
             "unexpected vector arithmetic error: {err:?}"
         );
         assert!(isel.func.blocks[&entry].insts.is_empty());
@@ -20705,6 +23837,289 @@ mod tests {
         }
     }
 
+    /// `bool as u8` (`Uextend B1 -> I8`, `u8::carrying_add`'s `carry as u8`)
+    /// zero-extends the bool's low byte into a fresh 32-bit carrier, exactly
+    /// as `B1 -> I32` does: `movzx r32, r8` of a bool of unknown provenance,
+    /// and a 32-bit copy of a System V `bool` parameter, which entry already
+    /// `movzx`ed from its argument byte. An identity `I8 -> I8` and a
+    /// narrowing `I16 -> I8`, zero or sign, stay refused, emitting nothing.
+    #[test]
+    fn a_bool_zero_extends_into_a_byte_through_its_low_byte() {
+        let uextend = Opcode::Uextend {
+            from_ty: Type::B1,
+            to_ty: Type::I8,
+        };
+        let extend = |opcode: Opcode| Instruction {
+            opcode,
+            args: vec![Value(0)],
+            results: vec![Value(1)],
+        };
+
+        // A bool of unknown provenance: `movzx r32, r8` of its low byte.
+        let (mut isel, entry) = make_empty_isel();
+        let bool_reg = define_vreg(&mut isel, Value(0), Type::B1);
+        isel.select_instruction(&extend(uextend.clone()), entry)
+            .unwrap();
+        assert_eq!(isel.value_type(&Value(1)), Type::I8);
+        let result = isel.use_value(&Value(1)).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(insts.len(), 1, "{insts:?}");
+        assert_eq!(insts[0].opcode, X86Opcode::Movzx);
+        assert_eq!(insts[0].operands[1], X86ISelOperand::VReg(bool_reg));
+        assert_eq!(insts[0].operands[0], result);
+        assert!(matches!(
+            result,
+            X86ISelOperand::VReg(VReg {
+                class: RegClass::Gpr32,
+                ..
+            })
+        ));
+        assert_ne!(result, X86ISelOperand::VReg(bool_reg), "a fresh register");
+
+        // A System V `bool` parameter: entry's `movzx` of DIL already cleared
+        // every bit from 8 up, so the extension is a 32-bit copy of it.
+        let sig = Signature {
+            params: vec![Type::B1],
+            returns: vec![],
+        };
+        let mut isel = X86InstructionSelector::with_abi(
+            "bool_param".to_string(),
+            sig.clone(),
+            X86CallAbi::SystemV,
+        );
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        let param = isel.use_value(&Value(0)).unwrap();
+        isel.select_instruction(&extend(uextend), entry).unwrap();
+        let result = isel.use_value(&Value(1)).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let opcodes: Vec<X86Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(opcodes, [X86Opcode::Movzx, X86Opcode::MovRR32], "{insts:?}");
+        assert_eq!(insts[0].operands[0], param);
+        assert_eq!(insts[1].operands, vec![result, param]);
+
+        // Still refused, with nothing emitted.
+        for (from_ty, signed) in [
+            (Type::I8, false),
+            (Type::I16, false),
+            (Type::I8, true),
+            (Type::I16, true),
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), from_ty.clone());
+            let opcode = if signed {
+                Opcode::Sextend {
+                    from_ty: from_ty.clone(),
+                    to_ty: Type::I8,
+                }
+            } else {
+                Opcode::Uextend {
+                    from_ty: from_ty.clone(),
+                    to_ty: Type::I8,
+                }
+            };
+            let error = isel.select_instruction(&extend(opcode), entry).unwrap_err();
+            assert!(
+                matches!(&error, X86ISelError::UnsupportedOpcode(message)
+                    if message.contains("to_ty: I8")),
+                "{from_ty:?} signed={signed}: {error:?}"
+            );
+            assert!(
+                isel.func.blocks[&entry].insts.is_empty(),
+                "{from_ty:?} signed={signed}: nothing is emitted"
+            );
+        }
+    }
+
+    /// The sign extension of a `bool` (`Sextend` from `B1`, LLVM's `sext i1`)
+    /// is `-zext(b)` at every width: trust-ir makes `true` all ones (its
+    /// interpreter widens `as_signed()` of the 1-bit value), which the
+    /// `movsx` of the 0/1 byte this selector emitted before (+1 for `true`,
+    /// and `(1, 0)` for an `I128`) did not compute. The zero extension reads
+    /// the bool's low byte as `Uextend` does (`movzx`, or the 32-bit copy of
+    /// a System V parameter entry already `movzx`ed), and `neg` at the
+    /// destination carrier's width makes 1 all ones; an `I128`'s high half is
+    /// the sign fill of that low half. No `movsx` remains.
+    #[test]
+    fn a_bool_sign_extends_to_all_ones_through_its_low_byte() {
+        let sextend = |to_ty: Type| Instruction {
+            opcode: Opcode::Sextend {
+                from_ty: Type::B1,
+                to_ty,
+            },
+            args: vec![Value(0)],
+            results: vec![Value(1)],
+        };
+        let carrier = |operand: &X86ISelOperand| match operand {
+            X86ISelOperand::VReg(vreg) => vreg.class,
+            other => panic!("not a register: {other:?}"),
+        };
+
+        for (to_ty, class) in [
+            (Type::I8, RegClass::Gpr32),
+            (Type::I16, RegClass::Gpr32),
+            (Type::I32, RegClass::Gpr32),
+            (Type::I64, RegClass::Gpr64),
+        ] {
+            // A bool of unknown provenance: `movzx` of its low byte, `neg`.
+            let (mut isel, entry) = make_empty_isel();
+            let bool_reg = define_vreg(&mut isel, Value(0), Type::B1);
+            isel.select_instruction(&sextend(to_ty.clone()), entry)
+                .unwrap();
+            assert_eq!(isel.value_type(&Value(1)), to_ty);
+            let result = isel.use_value(&Value(1)).unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let opcodes: Vec<X86Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+            assert_eq!(opcodes, [X86Opcode::Movzx, X86Opcode::Neg], "{to_ty:?}");
+            assert_eq!(insts[0].operands[1], X86ISelOperand::VReg(bool_reg));
+            assert_eq!(insts[1].operands[1], insts[0].operands[0], "{to_ty:?}");
+            assert_eq!(insts[1].operands[0], result, "{to_ty:?}");
+            assert_eq!(carrier(&insts[0].operands[0]), class, "{to_ty:?}");
+            assert_eq!(carrier(&result), class, "{to_ty:?}");
+
+            // A System V `bool` parameter: the 32-bit copy of its entry
+            // `movzx`, then `neg`.
+            let sig = Signature {
+                params: vec![Type::B1],
+                returns: vec![],
+            };
+            let mut isel = X86InstructionSelector::with_abi(
+                "bool_param".to_string(),
+                sig.clone(),
+                X86CallAbi::SystemV,
+            );
+            let entry = Block(0);
+            isel.lower_formal_arguments(&sig, entry).unwrap();
+            let param = isel.use_value(&Value(0)).unwrap();
+            isel.select_instruction(&sextend(to_ty.clone()), entry)
+                .unwrap();
+            let result = isel.use_value(&Value(1)).unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let opcodes: Vec<X86Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+            assert_eq!(
+                opcodes,
+                [X86Opcode::Movzx, X86Opcode::MovRR32, X86Opcode::Neg],
+                "{to_ty:?}"
+            );
+            assert_eq!(insts[1].operands[1], param);
+            assert_eq!(
+                insts[2].operands,
+                vec![result, insts[1].operands[0].clone()]
+            );
+        }
+
+        // `I128`: the low half is `-zext(b)` at 64 bits, the high half its
+        // sign fill (`mov; sar 63`), so `true` is all ones in both.
+        let (mut isel, entry) = make_empty_isel();
+        let bool_reg = define_vreg(&mut isel, Value(0), Type::B1);
+        isel.select_instruction(&sextend(Type::I128), entry)
+            .unwrap();
+        let (lo, hi) = isel.use_i128_value(&Value(1)).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let opcodes: Vec<X86Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            opcodes,
+            [
+                X86Opcode::Movzx,
+                X86Opcode::Neg,
+                X86Opcode::MovRR,
+                X86Opcode::SarRI
+            ]
+        );
+        assert_eq!(insts[0].operands[1], X86ISelOperand::VReg(bool_reg));
+        assert_eq!(carrier(&insts[0].operands[0]), RegClass::Gpr64);
+        assert_eq!(
+            insts[1].operands,
+            vec![lo.clone(), insts[0].operands[0].clone()]
+        );
+        assert_eq!(carrier(&lo), RegClass::Gpr64);
+        assert_eq!(insts[2].operands, vec![hi.clone(), lo]);
+        assert_eq!(
+            insts[3].operands,
+            vec![hi.clone(), hi, X86ISelOperand::Imm(63)]
+        );
+    }
+
+    /// A SIGNED order of a `B1` is refused by name with nothing emitted:
+    /// trust-ir makes `true` -1 there (`true <s false`), which a compare of
+    /// the 0/1 carriers reverses. The adapter never emits one (it admits only
+    /// `Eq`/`Ne` of a `Bool`, and a `Select` only on a nonzero test); the
+    /// unsigned orders and equality still lower.
+    #[test]
+    fn a_signed_order_of_a_bool_is_refused() {
+        for cond in [
+            IntCC::SignedLessThan,
+            IntCC::SignedLessThanOrEqual,
+            IntCC::SignedGreaterThan,
+            IntCC::SignedGreaterThanOrEqual,
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::B1);
+            define_vreg(&mut isel, Value(1), Type::B1);
+            let error = isel
+                .select_instruction(
+                    &Instruction {
+                        opcode: Opcode::Icmp { cond },
+                        args: vec![Value(0), Value(1)],
+                        results: vec![Value(2)],
+                    },
+                    entry,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&error, X86ISelError::UnsupportedOpcode(message)
+                    if message.contains("of a B1")),
+                "Icmp {cond:?}: {error:?}"
+            );
+            assert!(isel.func.blocks[&entry].insts.is_empty(), "Icmp {cond:?}");
+
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::B1);
+            define_vreg(&mut isel, Value(1), Type::I32);
+            define_vreg(&mut isel, Value(2), Type::I32);
+            let error = isel
+                .select_instruction(
+                    &Instruction {
+                        opcode: Opcode::Select { cond },
+                        args: vec![Value(0), Value(1), Value(2)],
+                        results: vec![Value(3)],
+                    },
+                    entry,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&error, X86ISelError::UnsupportedOpcode(message)
+                    if message.contains("of a B1")),
+                "Select {cond:?}: {error:?}"
+            );
+            assert!(isel.func.blocks[&entry].insts.is_empty(), "Select {cond:?}");
+        }
+        for cond in [
+            IntCC::Equal,
+            IntCC::NotEqual,
+            IntCC::UnsignedLessThan,
+            IntCC::UnsignedGreaterThanOrEqual,
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::B1);
+            define_vreg(&mut isel, Value(1), Type::B1);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Icmp { cond },
+                    args: vec![Value(0), Value(1)],
+                    results: vec![Value(2)],
+                },
+                entry,
+            )
+            .unwrap_or_else(|error| panic!("Icmp {cond:?}: {error:?}"));
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Unary
     // -----------------------------------------------------------------------
@@ -21949,8 +25364,8 @@ mod tests {
     #[test]
     fn test_select_load_uses_memory_type_width() {
         for (ty, expected_opcode) in [
-            (Type::I8, X86Opcode::MovRM8),
-            (Type::I16, X86Opcode::MovRM16),
+            (Type::I8, X86Opcode::MovzxRM8),
+            (Type::I16, X86Opcode::MovzxRM16),
             (Type::I32, X86Opcode::MovRM32),
             (Type::I64, X86Opcode::MovRM),
         ] {
@@ -22020,6 +25435,212 @@ mod tests {
                 if message.contains("I128 store") && message.contains("two 64-bit accesses"))
         );
         assert!(store_isel.func.blocks[&entry].insts.is_empty());
+    }
+
+    /// Aggregates wider than the 64-bit `MOV` the scalar path emitted (16
+    /// bytes: it moved only field 0), of an odd size (3 bytes), and narrower
+    /// than it (4 bytes: the store wrote four bytes past the object).
+    fn whole_aggregate_refusal_types() -> [Type; 3] {
+        [
+            Type::Struct(vec![Type::I64, Type::I64]),
+            Type::Array(Box::new(Type::I8), 3),
+            Type::Struct(vec![Type::I32]),
+        ]
+    }
+
+    fn assert_whole_aggregate_refusal(err: &X86ISelError, ty: &Type, store: bool, volatile: bool) {
+        let expected = ty
+            .whole_aggregate_memory_access_refusal(store, volatile)
+            .expect("an aggregate type has a refusal");
+        assert!(
+            matches!(err, X86ISelError::UnsupportedOpcode(message) if *message == expected),
+            "{ty:?} store={store} volatile={volatile}: {err:?}"
+        );
+        for contract in [
+            "an aggregate value is its address in LIR",
+            "one register-width access",
+            "copy its bytes with Memcpy",
+        ] {
+            assert!(expected.contains(contract), "{expected}");
+        }
+    }
+
+    /// A Store whose value's vreg lives in the other register file than the
+    /// store type's (an XMM value as an integer, a general register as a
+    /// float) is refused rather than encoded with the vreg's number in the
+    /// wrong file.
+    #[test]
+    fn store_across_register_files_is_refused_instead_of_encoding_another_register() {
+        // An XMM value stored as an integer, and a general-register value
+        // stored as a float: each opcode would encode the vreg's number in the
+        // other file (measured: an `f64` stored as `i64` wrote `rax`).
+        for (value_ty, store_ty) in [
+            (Type::F64, Type::I64),
+            (Type::F32, Type::I32),
+            (Type::I64, Type::F64),
+            (Type::I32, Type::F32),
+        ] {
+            for volatile in [false, true] {
+                let (mut isel, entry) = make_empty_isel();
+                define_vreg(&mut isel, Value(0), value_ty.clone());
+                define_vreg(&mut isel, Value(1), Type::I64);
+                let opcode = if volatile {
+                    Opcode::VolatileStore {
+                        ty: store_ty.clone(),
+                        align: None,
+                    }
+                } else {
+                    Opcode::Store {
+                        ty: store_ty.clone(),
+                        align: None,
+                    }
+                };
+                let err = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode,
+                            args: vec![Value(0), Value(1)],
+                            results: vec![],
+                        },
+                        entry,
+                    )
+                    .expect_err("a store across register files must be refused");
+                assert!(
+                    format!("{err}").contains("the store's opcode reads the other register file"),
+                    "{value_ty:?} as {store_ty:?}: {err}"
+                );
+                assert!(
+                    isel.func.blocks[&entry].insts.is_empty(),
+                    "{value_ty:?} as {store_ty:?}"
+                );
+            }
+        }
+        // Same-file stores are untouched, a narrowing integer store included.
+        for (value_ty, store_ty) in [
+            (Type::F64, Type::F64),
+            (Type::I64, Type::I64),
+            (Type::I64, Type::I32),
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), value_ty.clone());
+            define_vreg(&mut isel, Value(1), Type::I64);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Store {
+                        ty: store_ty.clone(),
+                        align: None,
+                    },
+                    args: vec![Value(0), Value(1)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap_or_else(|err| panic!("{value_ty:?} as {store_ty:?}: {err}"));
+        }
+    }
+
+    /// A whole-aggregate Load/Store is refused rather than selected as one
+    /// 64-bit `MOV`. The non-aggregate widths keep their selections, pinned by
+    /// `select_i128_load_emits_two_movrm_and_defines_pair`,
+    /// `select_i128_store_emits_two_movmr_lo_then_hi` and
+    /// `test_select_v128_load_store_and_copy_use_xmm_moves`, and by the I64
+    /// round trip at the end of this test.
+    #[test]
+    fn whole_aggregate_load_and_store_are_refused_instead_of_one_register_width_mov() {
+        for ty in whole_aggregate_refusal_types() {
+            for volatile in [false, true] {
+                let (mut isel, entry) = make_empty_isel();
+                define_vreg(&mut isel, Value(0), Type::I64);
+                let opcode = if volatile {
+                    Opcode::VolatileLoad {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                } else {
+                    Opcode::Load {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                };
+                let err = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode,
+                            args: vec![Value(0)],
+                            results: vec![Value(1)],
+                        },
+                        entry,
+                    )
+                    .expect_err("a whole-aggregate load must be refused");
+                assert_whole_aggregate_refusal(&err, &ty, false, volatile);
+                assert!(isel.func.blocks[&entry].insts.is_empty(), "{ty:?}");
+                assert!(!isel.value_map.contains_key(&Value(1)), "{ty:?}");
+
+                let (mut isel, entry) = make_empty_isel();
+                // The stored value is the aggregate's address carrier.
+                define_vreg(&mut isel, Value(0), ty.clone());
+                define_vreg(&mut isel, Value(1), Type::I64);
+                let opcode = if volatile {
+                    Opcode::VolatileStore {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                } else {
+                    Opcode::Store {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                };
+                let err = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode,
+                            args: vec![Value(0), Value(1)],
+                            results: vec![],
+                        },
+                        entry,
+                    )
+                    .expect_err("a whole-aggregate store must be refused");
+                assert_whole_aggregate_refusal(&err, &ty, true, volatile);
+                assert!(isel.func.blocks[&entry].insts.is_empty(), "{ty:?}");
+            }
+        }
+
+        let (mut isel, entry) = make_empty_isel();
+        define_vreg(&mut isel, Value(0), Type::I64);
+        for opcode in [
+            Opcode::Load {
+                ty: Type::I64,
+                align: None,
+            },
+            Opcode::Store {
+                ty: Type::I64,
+                align: None,
+            },
+        ] {
+            let (args, results) = if matches!(opcode, Opcode::Load { .. }) {
+                (vec![Value(0)], vec![Value(1)])
+            } else {
+                (vec![Value(1), Value(0)], vec![])
+            };
+            isel.select_instruction(
+                &Instruction {
+                    opcode,
+                    args,
+                    results,
+                },
+                entry,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            isel.func.blocks[&entry]
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect::<Vec<_>>(),
+            vec![X86Opcode::MovRM, X86Opcode::MovMR]
+        );
     }
 
     #[test]
@@ -22209,9 +25830,9 @@ mod tests {
     #[test]
     fn test_select_atomic_load_scalar_integer_widths() {
         for (ty, expected_opcode) in [
-            (Type::B1, X86Opcode::MovRM8),
-            (Type::I8, X86Opcode::MovRM8),
-            (Type::I16, X86Opcode::MovRM16),
+            (Type::B1, X86Opcode::MovzxRM8),
+            (Type::I8, X86Opcode::MovzxRM8),
+            (Type::I16, X86Opcode::MovzxRM16),
             (Type::I32, X86Opcode::MovRM32),
             (Type::I64, X86Opcode::MovRM),
         ] {
@@ -22236,6 +25857,593 @@ mod tests {
             assert_eq!(inst.opcode, expected_opcode);
             assert_eq!(inst.operands.len(), 2); // dst, memaddr
             assert_eq!(inst.proof_origin, Some(X86ProofOrigin::AtomicLoad));
+        }
+    }
+
+    /// `Bnot` of a `B1` is `not r32` masked to bit 0: `not` of 0/1 alone is
+    /// 0xFFFFFFFF/0xFFFFFFFE. The value is the masked register.
+    #[test]
+    fn b1_not_defines_a_masked_clean_bool() {
+        let (mut isel, entry) = make_empty_isel();
+        let src = define_vreg(&mut isel, Value(0), Type::B1);
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Bnot,
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .unwrap();
+        let result = isel.use_value(&Value(1)).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(
+            insts.iter().map(|inst| inst.opcode).collect::<Vec<_>>(),
+            vec![X86Opcode::Not, X86Opcode::MovRI, X86Opcode::AndRR],
+            "{insts:?}"
+        );
+        let (not, mask, and) = (&insts[0], &insts[1], &insts[2]);
+        assert_eq!(not.operands[1], X86ISelOperand::VReg(src));
+        assert_eq!(mask.operands[1], X86ISelOperand::Imm(1));
+        assert_eq!(and.operands[1], not.operands[0], "the mask reads the NOT");
+        assert_eq!(and.operands[2], mask.operands[0]);
+        assert_eq!(
+            result, and.operands[0],
+            "the bool value is the masked register"
+        );
+        let X86ISelOperand::VReg(clean) = result else {
+            panic!("the masked bool is a virtual register: {result:?}");
+        };
+        assert_eq!(clean.class, RegClass::Gpr32);
+
+        // Integer NOT is unchanged: one `not`, and its register is the value.
+        for ty in [Type::I8, Type::I16, Type::I32, Type::I64] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), ty.clone());
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Bnot,
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap();
+            let result = isel.use_value(&Value(1)).unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(insts.len(), 1, "{ty:?}: {insts:?}");
+            assert_eq!(insts[0].opcode, X86Opcode::Not, "{ty:?}");
+            assert_eq!(result, insts[0].operands[0], "{ty:?}");
+        }
+    }
+
+    /// A `Bitcast` defines a `B1` only from a `B1`: from an 8-bit carrier a
+    /// register move would make a bool of undefined upper bits and of byte
+    /// values other than 0/1. A `B1` source still casts to a byte.
+    #[test]
+    fn bitcast_into_b1_is_refused_except_from_b1() {
+        for src_ty in [Type::I8, Type::I16, Type::I32] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), src_ty.clone());
+            let error = isel
+                .select_instruction(
+                    &Instruction {
+                        opcode: Opcode::Bitcast { to_ty: Type::B1 },
+                        args: vec![Value(0)],
+                        results: vec![Value(1)],
+                    },
+                    entry,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&error, X86ISelError::UnsupportedOpcode(message)
+                    if message.contains("Bitcast") && message.contains("B1")),
+                "{src_ty:?}: {error:?}"
+            );
+            assert!(
+                isel.func.blocks[&entry].insts.is_empty(),
+                "{src_ty:?}: nothing is emitted"
+            );
+        }
+        for to_ty in [Type::B1, Type::I8] {
+            let (mut isel, entry) = make_empty_isel();
+            let src = define_vreg(&mut isel, Value(0), Type::B1);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Bitcast {
+                        to_ty: to_ty.clone(),
+                    },
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap();
+            let insts = &isel.func.blocks[&entry].insts;
+            assert_eq!(insts.len(), 1, "{to_ty:?}: {insts:?}");
+            assert_eq!(insts[0].opcode, X86Opcode::MovRR32, "{to_ty:?}");
+            assert_eq!(insts[0].operands[1], X86ISelOperand::VReg(src), "{to_ty:?}");
+        }
+    }
+
+    /// A `B1` load defines trust-ir's `Load Bool`, the loaded byte `m` read as
+    /// `m != 0`, as the backend's clean 32-bit bool: `mov r8, m` (its opcode
+    /// and proof origin unchanged, one access), then `movzx z, r8; add t, z,
+    /// 255; shr b, t, 8` into fresh 32-bit registers, and `b` is the value.
+    /// The selected rows after the load are executed for every byte, with
+    /// every bit above it in the load's register set, and must yield exactly
+    /// `(m != 0) as u32` (the zero extension alone yields `m`).
+    #[test]
+    fn b1_loads_define_the_nonzero_test_of_the_loaded_byte() {
+        let cases = [
+            (
+                Opcode::Load {
+                    ty: Type::B1,
+                    align: None,
+                },
+                X86Opcode::MovzxRM8,
+                None,
+            ),
+            (
+                Opcode::VolatileLoad {
+                    ty: Type::B1,
+                    align: None,
+                },
+                X86Opcode::VolatileMovzxRM8,
+                None,
+            ),
+            (
+                Opcode::AtomicLoad {
+                    ty: Type::B1,
+                    ordering: AtomicOrdering::Acquire,
+                },
+                X86Opcode::MovzxRM8,
+                Some(X86ProofOrigin::AtomicLoad),
+            ),
+        ];
+        for (opcode, load_opcode, origin) in cases {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::I64);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: opcode.clone(),
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap();
+            let result = isel.use_value(&Value(1)).unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let load = &insts[0];
+            assert_eq!(load.opcode, load_opcode, "{opcode:?}: {insts:?}");
+            assert_eq!(load.proof_origin, origin, "{opcode:?}");
+            assert_eq!(
+                insts
+                    .iter()
+                    .filter(|inst| inst.flags.contains(InstFlags::READS_MEMORY))
+                    .count(),
+                1,
+                "{opcode:?}: exactly one memory access: {insts:?}"
+            );
+            let X86ISelOperand::VReg(loaded) = load.operands[0] else {
+                panic!("{opcode:?}: the load defines a virtual register: {load:?}");
+            };
+            // The access is the zero-extending `movzx r32, m8`: it writes the
+            // whole register, so no register `movzx` follows and nothing
+            // merges into the old bits of the register the allocator picks.
+            let opcodes: Vec<X86Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+            assert_eq!(
+                opcodes,
+                [load_opcode, X86Opcode::AddRI, X86Opcode::ShrRI],
+                "{opcode:?}"
+            );
+            let mut written = vec![loaded];
+            for inst in &insts[1..] {
+                assert_eq!(inst.proof_origin, None, "{opcode:?}: {inst:?}");
+                let X86ISelOperand::VReg(dst) = inst.operands[0] else {
+                    panic!("{opcode:?}: a virtual destination: {inst:?}");
+                };
+                assert_eq!(dst.class, RegClass::Gpr32, "{opcode:?}: {inst:?}");
+                assert!(
+                    !written.contains(&dst),
+                    "{opcode:?}: a fresh register, not a merge: {inst:?}"
+                );
+                assert_eq!(
+                    inst.operands[1],
+                    X86ISelOperand::VReg(*written.last().unwrap()),
+                    "{opcode:?}: each row reads the previous one: {inst:?}"
+                );
+                written.push(dst);
+            }
+            assert_eq!(
+                result,
+                X86ISelOperand::VReg(*written.last().unwrap()),
+                "{opcode:?}: the bool value is the last register"
+            );
+            for byte in 0..=u8::MAX {
+                let mut regs: HashMap<VReg, u64> = HashMap::new();
+                // The register the load lands in held `0xA5..`; `movzx r32, m8`
+                // writes all of it (a `mov r8, m` would have kept those bits).
+                let old = 0xA5A5_A5A5_A5A5_A5A5u64;
+                let loaded_value = match load.opcode {
+                    X86Opcode::MovzxRM8 | X86Opcode::VolatileMovzxRM8 => u64::from(byte),
+                    X86Opcode::MovRM8 | X86Opcode::VolatileMovRM8 => {
+                        (old & !0xFF) | u64::from(byte)
+                    }
+                    other => panic!("{opcode:?}: unexpected load {other:?}"),
+                };
+                regs.insert(loaded, loaded_value);
+                for inst in &insts[1..] {
+                    let X86ISelOperand::VReg(dst) = inst.operands[0] else {
+                        unreachable!()
+                    };
+                    let X86ISelOperand::VReg(src) = inst.operands[1] else {
+                        panic!("{opcode:?}: a register source: {inst:?}");
+                    };
+                    let src = regs[&src];
+                    let imm = |i: usize| match inst.operands[i] {
+                        X86ISelOperand::Imm(imm) => imm,
+                        ref other => panic!("{opcode:?}: an immediate, got {other:?}"),
+                    };
+                    // 32-bit writes zero-extend into bits 32..63.
+                    let value = match inst.opcode {
+                        X86Opcode::Movzx => src & 0xFF,
+                        X86Opcode::AddRI => {
+                            u64::from((src as u32).wrapping_add(imm(2) as i32 as u32))
+                        }
+                        X86Opcode::ShrRI => u64::from((src as u32) >> (imm(2) & 31)),
+                        other => panic!("{opcode:?}: unexpected {other:?}"),
+                    };
+                    regs.insert(dst, value);
+                }
+                assert_eq!(
+                    regs[written.last().unwrap()],
+                    u64::from(byte != 0),
+                    "{opcode:?}: byte {byte:#04x}"
+                );
+            }
+        }
+    }
+
+    /// An `I8`/`I16` load is ONE zero-extending access (`movzx r32, m8/m16`,
+    /// plain, volatile or atomic) whose register IS the value: the whole
+    /// register is written, bits 8 (16) and up zero, so it depends on nothing
+    /// the register held before. The merging `mov r8/r16, m` is never selected.
+    #[test]
+    fn narrow_integer_loads_are_one_zero_extending_access() {
+        for ty in [Type::I8, Type::I16] {
+            for opcode in [
+                Opcode::Load {
+                    ty: ty.clone(),
+                    align: None,
+                },
+                Opcode::VolatileLoad {
+                    ty: ty.clone(),
+                    align: None,
+                },
+                Opcode::AtomicLoad {
+                    ty: ty.clone(),
+                    ordering: AtomicOrdering::Acquire,
+                },
+            ] {
+                let (mut isel, entry) = make_empty_isel();
+                define_vreg(&mut isel, Value(0), Type::I64);
+                isel.select_instruction(
+                    &Instruction {
+                        opcode: opcode.clone(),
+                        args: vec![Value(0)],
+                        results: vec![Value(1)],
+                    },
+                    entry,
+                )
+                .unwrap();
+                let result = isel.use_value(&Value(1)).unwrap();
+                let mfunc = isel.finalize();
+                let insts = &mfunc.blocks[&entry].insts;
+                assert_eq!(insts.len(), 1, "{opcode:?}: {insts:?}");
+                assert_eq!(result, insts[0].operands[0], "{opcode:?}");
+                let expected = match (&opcode, &ty) {
+                    (Opcode::VolatileLoad { .. }, Type::I8) => X86Opcode::VolatileMovzxRM8,
+                    (Opcode::VolatileLoad { .. }, _) => X86Opcode::VolatileMovzxRM16,
+                    (_, Type::I8) => X86Opcode::MovzxRM8,
+                    _ => X86Opcode::MovzxRM16,
+                };
+                assert_eq!(insts[0].opcode, expected, "{opcode:?}");
+                assert!(
+                    !insts.iter().any(|inst| matches!(
+                        inst.opcode,
+                        X86Opcode::MovRM8
+                            | X86Opcode::MovRM16
+                            | X86Opcode::VolatileMovRM8
+                            | X86Opcode::VolatileMovRM16
+                    )),
+                    "{opcode:?}: no merging narrow load: {insts:?}"
+                );
+            }
+        }
+    }
+
+    /// A zero-extension of a value a zero-extending load produced is a COPY:
+    /// the load already cleared every bit above the access, so the consumer's
+    /// `movzx` (or a bool's `movzx; and 1`) becomes `MovRR32` into its fresh
+    /// register. Covered consumers: `Uextend` to 32 and 64 bits, an unsigned
+    /// `Ushr` (whose 32-bit SHR reads the whole carrier), an unsigned narrow
+    /// compare, and a branch on a loaded bool (the `(m + 255) >> 8` value is 0
+    /// or 1). A signed consumer still sign-extends, and a narrow value that did
+    /// NOT come from a zero-extending load still gets its `movzx`.
+    #[test]
+    fn a_zero_extension_of_a_zero_extending_load_is_a_copy() {
+        let load = |ty: Type| Instruction {
+            opcode: Opcode::Load { ty, align: None },
+            args: vec![Value(0)],
+            results: vec![Value(1)],
+        };
+        let select = |ty: Type, consumer: Opcode, args: Vec<Value>| -> Vec<X86Opcode> {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::I64);
+            isel.select_instruction(&load(ty.clone()), entry).unwrap();
+            if args.contains(&Value(5)) {
+                define_vreg(&mut isel, Value(5), ty);
+            }
+            isel.select_instruction(
+                &Instruction {
+                    opcode: consumer,
+                    args,
+                    results: vec![Value(2)],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            mfunc.blocks[&entry]
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect()
+        };
+        use X86Opcode::{MovRR32, MovsxB, Movzx, MovzxRM8, MovzxRM16};
+        for (ty, load_op, to_ty) in [
+            (Type::I8, MovzxRM8, Type::I64),
+            (Type::I8, MovzxRM8, Type::I32),
+            (Type::I16, MovzxRM16, Type::I64),
+            (Type::I16, MovzxRM16, Type::I32),
+            (Type::B1, MovzxRM8, Type::I64),
+        ] {
+            let opcodes = select(
+                ty.clone(),
+                Opcode::Uextend {
+                    from_ty: ty.clone(),
+                    to_ty: to_ty.clone(),
+                },
+                vec![Value(1)],
+            );
+            let expected: Vec<X86Opcode> = if ty == Type::B1 {
+                vec![load_op, X86Opcode::AddRI, X86Opcode::ShrRI, MovRR32]
+            } else {
+                vec![load_op, MovRR32]
+            };
+            assert_eq!(opcodes, expected, "Uextend {ty:?} -> {to_ty:?}");
+        }
+        // A signed extension of the same load still sign-extends.
+        assert_eq!(
+            select(
+                Type::I8,
+                Opcode::Sextend {
+                    from_ty: Type::I8,
+                    to_ty: Type::I64
+                },
+                vec![Value(1)]
+            ),
+            vec![MovzxRM8, MovsxB]
+        );
+        // An unsigned compare and an unsigned shift of a loaded byte, against
+        // the SAME consumer of a byte that did not come from a load: exactly
+        // one `movzx` becomes a `MovRR32` copy, and nothing else changes.
+        let count = |ops: &[X86Opcode], op: X86Opcode| ops.iter().filter(|o| **o == op).count();
+        for consumer in [
+            Opcode::Icmp {
+                cond: IntCC::UnsignedLessThan,
+            },
+            Opcode::Ushr,
+        ] {
+            let loaded = select(Type::I8, consumer.clone(), vec![Value(1), Value(5)]);
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(1), Type::I8);
+            define_vreg(&mut isel, Value(5), Type::I8);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: consumer.clone(),
+                    args: vec![Value(1), Value(5)],
+                    results: vec![Value(2)],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let plain: Vec<X86Opcode> = mfunc.blocks[&entry]
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect();
+            assert_eq!(loaded[0], MovzxRM8, "{consumer:?}: {loaded:?}");
+            assert_eq!(
+                count(&loaded, Movzx) + 1,
+                count(&plain, Movzx),
+                "{consumer:?}: {loaded:?} vs {plain:?}"
+            );
+            assert_eq!(
+                count(&loaded, MovRR32),
+                count(&plain, MovRR32) + 1,
+                "{consumer:?}: {loaded:?} vs {plain:?}"
+            );
+            assert_eq!(loaded.len(), plain.len() + 1, "{consumer:?}");
+        }
+    }
+
+    /// A `Copy` of a zero-extended register into a fresh register carries the
+    /// fact (the bridge copies MIR locals), so the extension after it is a
+    /// copy too. A copy into a BLOCK PARAMETER does not (another predecessor
+    /// writes the same register), and neither does any copy when the selector
+    /// was not seeded with the function's block parameters.
+    #[test]
+    fn a_copy_keeps_the_zero_extension_unless_it_writes_a_block_parameter() {
+        let select = |block_params: Option<HashSet<Value>>| -> Vec<X86Opcode> {
+            let (mut isel, entry) = make_empty_isel();
+            isel.block_param_values = block_params;
+            define_vreg(&mut isel, Value(0), Type::I64);
+            for inst in [
+                Instruction {
+                    opcode: Opcode::Load {
+                        ty: Type::B1,
+                        align: None,
+                    },
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                Instruction {
+                    opcode: Opcode::Copy,
+                    args: vec![Value(1)],
+                    results: vec![Value(2)],
+                },
+                Instruction {
+                    opcode: Opcode::Uextend {
+                        from_ty: Type::B1,
+                        to_ty: Type::I64,
+                    },
+                    args: vec![Value(2)],
+                    results: vec![Value(3)],
+                },
+            ] {
+                isel.select_instruction(&inst, entry).unwrap();
+            }
+            let mfunc = isel.finalize();
+            mfunc.blocks[&entry]
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect()
+        };
+        use X86Opcode::{AddRI, MovRR32, Movzx, MovzxRM8, ShrRI};
+        assert_eq!(
+            select(Some(HashSet::new())),
+            [MovzxRM8, AddRI, ShrRI, MovRR32, MovRR32]
+        );
+        assert_eq!(
+            select(Some(HashSet::from([Value(2)]))),
+            [MovzxRM8, AddRI, ShrRI, MovRR32, Movzx]
+        );
+        assert_eq!(select(None), [MovzxRM8, AddRI, ShrRI, MovRR32, Movzx]);
+    }
+
+    /// A branch on a loaded bool tests the 0/1 `(m + 255) >> 8` register: its
+    /// zero test needs no `movzx` and no `and 1` (both were the identity on a
+    /// value whose bits from 1 up are zero).
+    #[test]
+    fn a_branch_on_a_loaded_bool_tests_the_clean_value() {
+        let (mut isel, entry) = make_empty_isel();
+        let then_block = Block(1);
+        let else_block = Block(2);
+        isel.func.ensure_block(then_block);
+        isel.func.ensure_block(else_block);
+        define_vreg(&mut isel, Value(0), Type::I64);
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Load {
+                    ty: Type::B1,
+                    align: None,
+                },
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .unwrap();
+        isel.select_condbranch(
+            &Instruction {
+                opcode: Opcode::Brif {
+                    cond: Value(1),
+                    then_dest: then_block,
+                    else_dest: else_block,
+                },
+                args: vec![Value(1)],
+                results: vec![],
+            },
+            then_block,
+            else_block,
+            entry,
+        )
+        .unwrap();
+        let mfunc = isel.finalize();
+        let opcodes: Vec<X86Opcode> = mfunc.blocks[&entry]
+            .insts
+            .iter()
+            .map(|inst| inst.opcode)
+            .collect();
+        assert_eq!(
+            opcodes,
+            [
+                X86Opcode::MovzxRM8,
+                X86Opcode::AddRI,
+                X86Opcode::ShrRI,
+                X86Opcode::MovRR32,
+                X86Opcode::CmpRI,
+                X86Opcode::Jcc,
+                X86Opcode::Jmp
+            ]
+        );
+    }
+
+    /// A `B1` parameter read from the incoming stack area is ONE zero-extending
+    /// load (`movzx r32, m8` from `[rbp + disp]`) whose register is the clean
+    /// bool: the caller's convention makes the byte 0 or 1, and the load writes
+    /// the whole register, so no register `movzx` follows and the entry block's
+    /// run of formal copies and stack loads is a single prologue group.
+    #[test]
+    fn stack_passed_b1_formals_are_one_zero_extending_load() {
+        for (abi, leading, stack_disp) in [
+            (X86CallAbi::SystemV, 6usize, 16i32),
+            (X86CallAbi::WindowsX64, 4usize, 48i32),
+        ] {
+            let mut params = vec![Type::I64; leading];
+            params.push(Type::B1);
+            params.push(Type::F64);
+            let sig = Signature {
+                params,
+                returns: vec![],
+            };
+            let mut isel =
+                X86InstructionSelector::with_abi("stack_bool".to_string(), sig.clone(), abi);
+            let entry = Block(0);
+            isel.lower_formal_arguments(&sig, entry).unwrap();
+            let bool_value = isel.use_value(&Value(leading as u32)).unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let load = insts
+                .iter()
+                .position(|inst| {
+                    inst.opcode == X86Opcode::MovzxRM8
+                        && inst.operands[1]
+                            == X86ISelOperand::MemAddr {
+                                base: Box::new(X86ISelOperand::PReg(RBP)),
+                                disp: stack_disp,
+                            }
+                })
+                .unwrap_or_else(|| panic!("{abi:?}: no stack bool load: {insts:?}"));
+            assert_eq!(bool_value, insts[load].operands[0], "{abi:?}");
+            assert_eq!(
+                count_x86_isel_opcode(insts, X86Opcode::Movzx),
+                0,
+                "{abi:?}: {insts:?}"
+            );
+            assert_eq!(
+                count_x86_isel_opcode(insts, X86Opcode::MovRM8),
+                0,
+                "{abi:?}: {insts:?}"
+            );
         }
     }
 
@@ -22270,6 +26478,52 @@ mod tests {
             assert_eq!(inst.opcode, expected_opcode);
             assert_eq!(inst.operands.len(), 2); // memaddr, value
             assert_eq!(inst.proof_origin, Some(X86ProofOrigin::AtomicStore));
+        }
+    }
+
+    /// A sequentially consistent store must not be reordered with a later
+    /// load, which x86 TSO allows for a plain store: `SeqCst` is `MOV; MFENCE`,
+    /// while Relaxed and Release (ordered by TSO) stay a single `MOV`.
+    #[test]
+    fn test_select_atomic_store_seqcst_is_followed_by_mfence() {
+        for (ordering, fenced) in [
+            (AtomicOrdering::Relaxed, false),
+            (AtomicOrdering::Release, false),
+            (AtomicOrdering::SeqCst, true),
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::I64);
+            define_vreg(&mut isel, Value(1), Type::I64);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::AtomicStore {
+                        ty: Type::I64,
+                        ordering,
+                    },
+                    args: vec![Value(0), Value(1)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let opcodes: Vec<X86Opcode> = mfunc.blocks[&entry]
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect();
+            let expected: Vec<X86Opcode> = if fenced {
+                vec![X86Opcode::MovMR, X86Opcode::Mfence]
+            } else {
+                vec![X86Opcode::MovMR]
+            };
+            assert_eq!(opcodes, expected, "{ordering:?}");
+            if fenced {
+                assert_eq!(
+                    mfunc.blocks[&entry].insts[1].proof_origin,
+                    Some(X86ProofOrigin::FenceSeqCst)
+                );
+            }
         }
     }
 
@@ -22308,10 +26562,14 @@ mod tests {
         let (mut isel, entry) = make_empty_isel();
         define_vreg(&mut isel, Value(0), Type::I64); // address
 
+        // An F64 atomic load has no x86 lowering. (An I128 load is selected as
+        // the zeroing LOCK CMPXCHG16B pseudo — see
+        // `test_select_atomic_load_i128_emits_one_zeroing_cmpxchg16b_pseudo`;
+        // the I128 STORE below stays refused.)
         let load_result = isel.select_instruction(
             &Instruction {
                 opcode: Opcode::AtomicLoad {
-                    ty: Type::I128,
+                    ty: Type::F64,
                     ordering: AtomicOrdering::SeqCst,
                 },
                 args: vec![Value(0)],
@@ -22343,6 +26601,193 @@ mod tests {
             store_result,
             Err(X86ISelError::UnsupportedOpcode(_))
         ));
+    }
+
+    /// The 128-bit atomic load is ONE pseudo followed by the two read-back
+    /// copies. No instruction before it writes RAX/RDX/RBX/RCX: the zeroing the
+    /// compare-exchange needs to act as a load lives INSIDE the pseudo, so no
+    /// later pass can delete or rewrite one zero apart from the CMPXCHG16B.
+    #[test]
+    fn test_select_atomic_load_i128_emits_one_zeroing_cmpxchg16b_pseudo() {
+        for ordering in [
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Acquire,
+            AtomicOrdering::SeqCst,
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::I64); // address
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::AtomicLoad {
+                        ty: Type::I128,
+                        ordering,
+                    },
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .expect("an I128 AtomicLoad selects the zeroing LOCK CMPXCHG16B pseudo");
+            let insts = &isel.func.blocks[&entry].insts;
+            let opcodes: Vec<X86Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+            assert_eq!(
+                opcodes,
+                vec![
+                    X86Opcode::AtomicLoadCmpxchg16b,
+                    X86Opcode::MovRR,
+                    X86Opcode::MovRR,
+                ],
+                "{ordering:?}: the pseudo (zeroing included) and two result copies — no \
+                 separate zeroing instruction"
+            );
+            assert!(
+                matches!(
+                    insts[0].operands.as_slice(),
+                    [X86ISelOperand::MemAddr { disp: 0, base }]
+                        if matches!(**base, X86ISelOperand::VReg(v) if v.class == RegClass::Gpr64)
+                ),
+                "the pseudo carries exactly the [base + 0] memory operand: {:?}",
+                insts[0].operands
+            );
+            assert!(
+                insts[0].proof_origin.is_none(),
+                "no proof origin: the reconstruction is the credit route"
+            );
+            assert!(
+                matches!(insts[1].operands[0], X86ISelOperand::VReg(v) if v.class == RegClass::Gpr64)
+                    && insts[1].operands[1] == X86ISelOperand::PReg(RAX),
+                "low limb from RAX: {:?}",
+                insts[1].operands
+            );
+            assert!(
+                matches!(insts[2].operands[0], X86ISelOperand::VReg(v) if v.class == RegClass::Gpr64)
+                    && insts[2].operands[1] == X86ISelOperand::PReg(RDX),
+                "high limb from RDX: {:?}",
+                insts[2].operands
+            );
+            assert_eq!(isel.value_types[&Value(1)], Type::I128);
+        }
+    }
+
+    /// The CMPXCHG16B pseudo's reconstruction takes only the emitted
+    /// instruction and states its SOURCE as trust-ir `AtomicLoad I128`; TV-2
+    /// ties the emitted pseudo back to its LIR instruction only by op CLASS
+    /// (`Atomic`, shared by every atomic opcode and `Fence`). What keeps the two
+    /// honest is that no OTHER 128-bit atomic operation selects anything: every
+    /// I128 store, read-modify-write (each op) and compare-exchange is refused,
+    /// so the pseudo can only come from an I128 `AtomicLoad`. This pins that
+    /// (see NOT-CLAIMED item 10 of `reconstruct_x86_cmpxchg16b`).
+    #[test]
+    fn test_only_an_i128_atomic_load_selects_the_cmpxchg16b_pseudo() {
+        let refused = |opcode: Opcode, args: Vec<Value>, results: Vec<Value>| {
+            let (mut isel, entry) = make_empty_isel();
+            define_vreg(&mut isel, Value(0), Type::I128);
+            define_vreg(&mut isel, Value(1), Type::I128);
+            define_vreg(&mut isel, Value(2), Type::I64); // address
+            let result = isel.select_instruction(
+                &Instruction {
+                    opcode: opcode.clone(),
+                    args,
+                    results,
+                },
+                entry,
+            );
+            assert!(
+                result.is_err(),
+                "{opcode:?} must be refused by x86 ISel (no 128-bit lowering but the load)"
+            );
+            let emitted = isel.func.blocks[&entry]
+                .insts
+                .iter()
+                .any(|inst| inst.opcode == X86Opcode::AtomicLoadCmpxchg16b);
+            assert!(
+                !emitted,
+                "{opcode:?} left an AtomicLoadCmpxchg16b pseudo behind"
+            );
+        };
+        refused(
+            Opcode::AtomicStore {
+                ty: Type::I128,
+                ordering: AtomicOrdering::SeqCst,
+            },
+            vec![Value(0), Value(2)],
+            vec![],
+        );
+        for op in [
+            AtomicRmwOp::Add,
+            AtomicRmwOp::Sub,
+            AtomicRmwOp::And,
+            AtomicRmwOp::Or,
+            AtomicRmwOp::Xor,
+            AtomicRmwOp::Xchg,
+            AtomicRmwOp::Max,
+            AtomicRmwOp::Min,
+            AtomicRmwOp::UMax,
+            AtomicRmwOp::UMin,
+        ] {
+            refused(
+                Opcode::AtomicRmw {
+                    op,
+                    ty: Type::I128,
+                    ordering: AtomicOrdering::SeqCst,
+                },
+                vec![Value(0), Value(2)],
+                vec![Value(3)],
+            );
+        }
+        refused(
+            Opcode::CmpXchg {
+                ty: Type::I128,
+                success: AtomicOrdering::SeqCst,
+                failure: AtomicOrdering::SeqCst,
+            },
+            vec![Value(0), Value(1), Value(2)],
+            vec![Value(3)],
+        );
+    }
+
+    /// An address that arrives in a PHYSICAL register is copied into a Gpr64
+    /// VReg first, so the allocator — not the selector — decides where the base
+    /// lives, and its interference with the pseudo's four clobbers keeps the
+    /// base out of RAX/RDX/RBX/RCX.
+    #[test]
+    fn test_select_atomic_load_i128_copies_a_physical_address_into_a_vreg() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.define_value(Value(0), X86ISelOperand::PReg(RDX), Type::I64);
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::AtomicLoad {
+                    ty: Type::I128,
+                    ordering: AtomicOrdering::SeqCst,
+                },
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .expect("a physical-register address is copied, not refused");
+        let insts = &isel.func.blocks[&entry].insts;
+        let opcodes: Vec<X86Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                X86Opcode::MovRR,
+                X86Opcode::AtomicLoadCmpxchg16b,
+                X86Opcode::MovRR,
+                X86Opcode::MovRR,
+            ]
+        );
+        assert_eq!(insts[0].operands[1], X86ISelOperand::PReg(RDX));
+        let copy = insts[0].operands[0].clone();
+        assert!(matches!(copy, X86ISelOperand::VReg(v) if v.class == RegClass::Gpr64));
+        assert!(
+            matches!(
+                insts[1].operands.as_slice(),
+                [X86ISelOperand::MemAddr { disp: 0, base }] if **base == copy
+            ),
+            "the pseudo addresses through the copy: {:?}",
+            insts[1].operands
+        );
     }
 
     #[test]
@@ -22886,6 +27331,51 @@ mod tests {
     // Call / Return
     // -----------------------------------------------------------------------
 
+    /// Fallible sibling of [`lowered_call_result_metadata`]: the two x86-64 C
+    /// ABIs do NOT have the same return file, so a shape that lowers under
+    /// System V must be able to be REFUSED under Windows x64 without the
+    /// helper panicking on the way.
+    fn try_lowered_call_result_metadata(
+        abi: X86CallAbi,
+        result_tys: Vec<Type>,
+    ) -> Result<Vec<X86CallResultReg>, X86ISelError> {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = X86InstructionSelector::with_abi("caller".to_string(), sig, abi);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        let result_values: Vec<Value> = (0..result_tys.len() as u32).map(Value).collect();
+        isel.seed_value_types(
+            &result_values
+                .iter()
+                .copied()
+                .zip(result_tys)
+                .collect::<HashMap<_, _>>(),
+        );
+        isel.lower_call(
+            "callee",
+            &Instruction {
+                opcode: Opcode::Call {
+                    name: "callee".to_string(),
+                    binding: Default::default(),
+                },
+                args: vec![],
+                results: result_values,
+            },
+            entry,
+        )?;
+        Ok(isel.finalize().blocks[&entry]
+            .insts
+            .iter()
+            .find(|inst| inst.opcode == X86Opcode::Call)
+            .expect("lowered call")
+            .call_result_regs
+            .clone()
+            .expect("every call has explicit result metadata"))
+    }
+
     fn lowered_call_result_metadata(
         abi: X86CallAbi,
         result_tys: Vec<Type>,
@@ -22910,6 +27400,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![],
                 results: result_values,
@@ -22927,8 +27418,12 @@ mod tests {
             .expect("every call has explicit result metadata")
     }
 
+    /// The FIRST register of each class is where the two x86-64 C ABIs AGREE:
+    /// a lone integer scalar comes back in RAX and a lone FP scalar in XMM0
+    /// under System V and under Windows x64 alike. That agreement is what the
+    /// `for abi in ...` loop here is entitled to assert.
     #[test]
-    fn test_call_result_metadata_is_exact_for_void_scalar_and_multireg_both_abis() {
+    fn test_call_result_metadata_is_exact_for_void_and_single_scalar_both_abis() {
         for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
             assert_eq!(lowered_call_result_metadata(abi, vec![]), vec![]);
             assert_eq!(
@@ -22947,33 +27442,79 @@ mod tests {
                 lowered_call_result_metadata(abi, vec![Type::F64]),
                 vec![X86CallResultReg::new(XMM0, 64)]
             );
-            assert_eq!(
-                lowered_call_result_metadata(abi, vec![Type::I64, Type::I64]),
+        }
+    }
+
+    /// The SECOND register of each class is where they DIVERGE, and this test
+    /// is the unit-level statement of that divergence.
+    ///
+    /// System V AMD64 has a second return register in each class (RDX, XMM1),
+    /// so a two-component scalar result is a real placement. Windows x64 has
+    /// NEITHER: a result wider than one register goes through a hidden sret
+    /// pointer, so a two-component register result has no Win64 placement at
+    /// all and must fail closed.
+    ///
+    /// This test previously ran both ABIs through the SAME expectations and
+    /// passed, because `classify_x86_scalar_return_locations` indexed System
+    /// V's file under both. A Win64 compile of a two-`i64` return therefore
+    /// emitted a second `mov` into RDX that no Win64 caller reads.
+    #[test]
+    fn test_call_result_metadata_second_component_is_sysv_only() {
+        let two_component_shapes: [(Vec<Type>, Vec<X86CallResultReg>); 4] = [
+            (
+                vec![Type::I64, Type::I64],
                 vec![
                     X86CallResultReg::new(RAX, 64),
                     X86CallResultReg::new(RDX, 64),
-                ]
-            );
-            assert_eq!(
-                lowered_call_result_metadata(abi, vec![Type::I8, Type::I16]),
+                ],
+            ),
+            (
+                vec![Type::I8, Type::I16],
                 vec![
                     X86CallResultReg::new(RAX, 8),
                     X86CallResultReg::new(RDX, 16),
-                ]
-            );
-            assert_eq!(
-                lowered_call_result_metadata(abi, vec![Type::F64, Type::F64]),
+                ],
+            ),
+            (
+                vec![Type::F64, Type::F64],
                 vec![
                     X86CallResultReg::new(XMM0, 64),
                     X86CallResultReg::new(XMM1, 64),
-                ]
-            );
-            assert_eq!(
-                lowered_call_result_metadata(abi, vec![Type::F32, Type::F64]),
+                ],
+            ),
+            (
+                vec![Type::F32, Type::F64],
                 vec![
                     X86CallResultReg::new(XMM0, 32),
                     X86CallResultReg::new(XMM1, 64),
-                ]
+                ],
+            ),
+        ];
+        for (shape, sysv_regs) in two_component_shapes {
+            assert_eq!(
+                try_lowered_call_result_metadata(X86CallAbi::SystemV, shape.clone())
+                    .unwrap_or_else(|e| panic!("System V places {shape:?}: {e:?}")),
+                sysv_regs,
+                "System V's second return register of each class is RDX / XMM1"
+            );
+            let error = try_lowered_call_result_metadata(X86CallAbi::WindowsX64, shape.clone())
+                .expect_err(
+                    "Windows x64 has no second return register in either class, so a \
+                     two-component register result must fail closed rather than borrow System \
+                     V's RDX / XMM1",
+                );
+            assert!(
+                matches!(
+                    &error,
+                    X86ISelError::UnsupportedScalarReturnAbi {
+                        index: 1,
+                        abi: X86CallAbi::WindowsX64,
+                        reason,
+                        ..
+                    } if reason.contains("Windows x64")
+                ),
+                "{shape:?}: the Win64 refusal must name the index and the ABI's own reason: \
+                 {error:?}"
             );
         }
     }
@@ -22981,7 +27522,11 @@ mod tests {
     #[test]
     fn test_lower_call_mixed_scalar_results_use_independent_return_sequences() {
         let result_types = [Type::I64, Type::F64, Type::I32, Type::F32];
-        for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
+        // System V ONLY. Four register result components need a second
+        // register in each class; Windows x64 has neither, and is covered by
+        // `test_call_result_metadata_second_component_is_sysv_only`.
+        {
+            let abi = X86CallAbi::SystemV;
             let sig = Signature {
                 params: vec![],
                 returns: vec![],
@@ -23003,6 +27548,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![],
                     results: result_values.to_vec(),
@@ -23032,14 +27578,606 @@ mod tests {
         }
     }
 
+    /// The rows that extract the results of one call with `result_types`,
+    /// after the CALL row.
+    fn lowered_call_result_extraction(result_types: &[Type]) -> Vec<X86ISelInst> {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel =
+            X86InstructionSelector::with_abi("caller".to_string(), sig, X86CallAbi::SystemV);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        let result_values: Vec<Value> = (0..result_types.len() as u32).map(Value).collect();
+        isel.seed_value_types(
+            &result_values
+                .iter()
+                .copied()
+                .zip(result_types.iter().cloned())
+                .collect(),
+        );
+        isel.lower_call(
+            "callee",
+            &Instruction {
+                opcode: Opcode::Call {
+                    name: "callee".to_string(),
+                    binding: Default::default(),
+                },
+                args: vec![],
+                results: result_values,
+            },
+            entry,
+        )
+        .unwrap();
+        let insts = isel.finalize().blocks[&entry].insts.clone();
+        assert_eq!(insts[0].opcode, X86Opcode::Call, "{insts:?}");
+        insts[1..].to_vec()
+    }
+
+    /// A `bool` lane of a two-result call defines bit 0 of its byte alone:
+    /// rustc returns a `ScalarPair` as `{ T, i1 }` with no `zeroext`, and LLVM
+    /// leaves bits 1..7 of DL (or AL) as they were. The caller masks the
+    /// lane after re-extending the byte. The only `bool` result of a call is
+    /// AL = 0/1 and is re-extended without a mask.
     #[test]
-    fn test_lower_call_rejects_third_same_class_result_without_aliasing() {
-        let cases = [
-            (vec![Type::I64, Type::I32, Type::I8], Type::I8),
-            (vec![Type::F64, Type::F32, Type::F64], Type::F64),
+    fn test_lower_call_masks_a_bool_lane_of_a_multi_result_call() {
+        let is_mask_of = |row: &X86ISelInst, dst: &X86ISelOperand| {
+            row.opcode == X86Opcode::AndRI
+                && row.operands == vec![dst.clone(), dst.clone(), X86ISelOperand::Imm(1)]
+        };
+        // (u64, bool): RAX copied, DL re-extended and masked.
+        let rows = lowered_call_result_extraction(&[Type::I64, Type::B1]);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].operands[1], X86ISelOperand::PReg(RAX));
+        assert_eq!(rows[1].opcode, X86Opcode::Movzx);
+        assert_eq!(rows[1].operands[1], X86ISelOperand::PReg(DL));
+        assert!(is_mask_of(&rows[2], &rows[1].operands[0]), "{rows:?}");
+        // (bool, u64): AL re-extended and masked, then RDX copied.
+        let rows = lowered_call_result_extraction(&[Type::B1, Type::I64]);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].opcode, X86Opcode::Movzx);
+        assert_eq!(rows[0].operands[1], X86ISelOperand::PReg(AL));
+        assert!(is_mask_of(&rows[1], &rows[0].operands[0]), "{rows:?}");
+        assert_eq!(rows[2].operands[1], X86ISelOperand::PReg(RDX));
+        // (u64, u8): a byte lane is the whole byte, never masked.
+        let rows = lowered_call_result_extraction(&[Type::I64, Type::I8]);
+        assert_eq!(
+            rows.iter().map(|row| row.opcode).collect::<Vec<_>>(),
+            vec![X86Opcode::MovRR, X86Opcode::Movzx]
+        );
+        // The only `bool` result: AL re-extended, no mask.
+        let rows = lowered_call_result_extraction(&[Type::B1]);
+        assert_eq!(
+            rows.iter().map(|row| row.opcode).collect::<Vec<_>>(),
+            vec![X86Opcode::Movzx]
+        );
+        assert_eq!(rows[0].operands[1], X86ISelOperand::PReg(AL));
+    }
+
+    /// The class file runs out — and where it runs out is ABI-specific.
+    ///
+    /// System V has two registers per class, so the THIRD same-class result is
+    /// the one refused (index 2). Windows x64 has one, so the SECOND is
+    /// (index 1). Both must refuse before emitting the call or any partial
+    /// result extraction.
+    /// Eight integer results: one past TrustCG's internal System V file
+    /// (RAX,RDX,RCX,RSI,RDI,R8,R9), so index 7 is the one refused.
+    fn sysv_integer_results_past_the_file() -> Vec<Type> {
+        vec![
+            Type::I64,
+            Type::I32,
+            Type::I8,
+            Type::I64,
+            Type::I16,
+            Type::B1,
+            Type::I64,
+            Type::I32,
+        ]
+    }
+
+    /// Nine FP results: one past XMM0-XMM7, so index 8 is the one refused.
+    fn sysv_fp_results_past_the_file() -> Vec<Type> {
+        vec![
+            Type::F64,
+            Type::F32,
+            Type::F64,
+            Type::F32,
+            Type::F64,
+            Type::F32,
+            Type::F64,
+            Type::F32,
+            Type::F64,
+        ]
+    }
+
+    /// EXECUTABLE SPECIFICATION of the placement this backend used before the
+    /// internal multi-result extension: independent per-class counters over
+    /// the System V C file (RAX,RDX / XMM0,XMM1), `I128` taking two
+    /// consecutive integer registers, anything else not a scalar placement.
+    fn c_file_placement(returns: &[Type]) -> Option<Vec<X86CallResultReg>> {
+        let mut gpr = 0usize;
+        let mut xmm = 0usize;
+        let mut regs = Vec::new();
+        for ty in returns {
+            match ty {
+                Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
+                    regs.push(X86CallResultReg::new(
+                        *X86_RET_GPRS.get(gpr)?,
+                        x86_call_result_defined_bits(ty)?,
+                    ));
+                    gpr += 1;
+                }
+                Type::I128 => {
+                    let pair = X86_RET_GPRS.get(gpr..gpr + 2)?;
+                    regs.push(X86CallResultReg::new(pair[0], 64));
+                    regs.push(X86CallResultReg::new(pair[1], 64));
+                    gpr += 2;
+                }
+                Type::F32 | Type::F64 => {
+                    regs.push(X86CallResultReg::new(
+                        *X86_RET_XMMS.get(xmm)?,
+                        x86_call_result_defined_bits(ty)?,
+                    ));
+                    xmm += 1;
+                }
+                _ => return None,
+            }
+        }
+        Some(regs)
+    }
+
+    /// Every scalar return sequence of up to four components over the
+    /// integer, FP and `I128` carriers: the C file places it EXACTLY as
+    /// before and marks no internal register; every sequence the C file could
+    /// not place is placed from the internal file as a strict prefix
+    /// extension (the C-file part unchanged per class) or refused past it.
+    #[test]
+    fn test_internal_multi_result_file_is_a_prefix_extension_of_the_c_file() {
+        let carriers = [
+            Type::I64,
+            Type::I32,
+            Type::I8,
+            Type::B1,
+            Type::I128,
+            Type::F64,
+            Type::F32,
         ];
+        let mut sequences: Vec<Vec<Type>> = vec![vec![]];
+        let mut frontier: Vec<Vec<Type>> = vec![vec![]];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for ty in &carriers {
+                    let mut seq = prefix.clone();
+                    seq.push(ty.clone());
+                    next.push(seq);
+                }
+            }
+            sequences.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let (mut unchanged, mut extended, mut refused) = (0usize, 0usize, 0usize);
+        for returns in &sequences {
+            let placed = x86_scalar_return_result_regs(returns, X86CallAbi::SystemV);
+            let internal = x86_internal_multi_result_regs(returns, X86CallAbi::SystemV);
+            match c_file_placement(returns) {
+                Some(before) => {
+                    assert_eq!(
+                        placed.as_ref(),
+                        Some(&before),
+                        "{returns:?}: a C-file placement must not move"
+                    );
+                    assert!(
+                        internal.is_empty() && !x86_sysv_returns_exceed_c_return_file(returns),
+                        "{returns:?}: a C-file placement uses no internal register"
+                    );
+                    unchanged += 1;
+                }
+                None => {
+                    let gprs_needed: usize = returns
+                        .iter()
+                        .map(|ty| match ty {
+                            Type::I128 => 2,
+                            Type::F32 | Type::F64 => 0,
+                            _ => 1,
+                        })
+                        .sum();
+                    assert!(
+                        x86_sysv_returns_exceed_c_return_file(returns),
+                        "{returns:?}: the C file cannot place it, so it leaves the C ABI"
+                    );
+                    if gprs_needed > X86_INTERNAL_RET_GPRS.len() {
+                        // Four i128 results need eight GPRs: refused past R9,
+                        // never aliased.
+                        assert!(placed.is_none() && internal.is_empty(), "{returns:?}");
+                        refused += 1;
+                        continue;
+                    }
+                    let placed = placed.unwrap_or_else(|| {
+                        panic!("{returns:?}: needs {gprs_needed} GPRs, within the 7-GPR file")
+                    });
+                    assert!(
+                        !internal.is_empty(),
+                        "{returns:?}: exceeding the C file must use an internal register"
+                    );
+                    // Per class, the placement is a PREFIX of the internal file,
+                    // in order — so its first two registers are the C file's.
+                    let gprs: Vec<X86PReg> = placed
+                        .iter()
+                        .map(|r| r.reg)
+                        .filter(|r| !r.is_xmm())
+                        .collect();
+                    let xmms: Vec<X86PReg> = placed
+                        .iter()
+                        .map(|r| r.reg)
+                        .filter(|r| r.is_xmm())
+                        .collect();
+                    assert_eq!(gprs, X86_INTERNAL_RET_GPRS[..gprs.len()], "{returns:?}");
+                    assert_eq!(xmms, X86_INTERNAL_RET_XMMS[..xmms.len()], "{returns:?}");
+                    assert!(
+                        internal
+                            .iter()
+                            .all(|r| !X86_RET_GPRS.contains(&r.reg)
+                                && !X86_RET_XMMS.contains(&r.reg)),
+                        "{returns:?}: the internal set is exactly the registers past the C file"
+                    );
+                    extended += 1;
+                }
+            }
+            // Windows x64 never reaches the extension.
+            assert!(
+                x86_internal_multi_result_regs(returns, X86CallAbi::WindowsX64).is_empty(),
+                "{returns:?}"
+            );
+        }
+        // NON-VACUITY: every arm ran over a real population.
+        assert!(
+            unchanged > 50 && extended > 1000 && refused == 1,
+            "{unchanged} unchanged / {extended} extended / {refused} refused"
+        );
+    }
+
+    /// Caller side: call metadata and extraction read the internal registers,
+    /// each at the width its result defines, from the one classifier.
+    #[test]
+    fn test_lower_call_internal_multi_result_metadata_and_extraction() {
+        let result_types = vec![
+            Type::I64,
+            Type::I32,
+            Type::F64,
+            Type::I8,
+            Type::B1,
+            Type::F32,
+            Type::I64,
+            Type::F64,
+            Type::I16,
+            Type::I64,
+        ];
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel =
+            X86InstructionSelector::with_abi("caller".to_string(), sig, X86CallAbi::SystemV);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        let result_values: Vec<Value> = (0..result_types.len() as u32).map(Value).collect();
+        isel.seed_value_types(
+            &result_values
+                .iter()
+                .copied()
+                .zip(result_types.iter().cloned())
+                .collect(),
+        );
+        isel.lower_call(
+            "callee",
+            &Instruction {
+                opcode: Opcode::Call {
+                    name: "callee".to_string(),
+                    binding: Default::default(),
+                },
+                args: vec![],
+                results: result_values.clone(),
+            },
+            entry,
+        )
+        .expect("ten mixed results fit the internal System V file (7 GPRs, 8 XMMs)");
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(insts[0].opcode, X86Opcode::Call);
+        assert_eq!(
+            insts[0].call_result_regs,
+            Some(vec![
+                X86CallResultReg::new(RAX, 64),
+                X86CallResultReg::new(RDX, 32),
+                X86CallResultReg::new(XMM0, 64),
+                X86CallResultReg::new(RCX, 8),
+                X86CallResultReg::new(RSI, 8),
+                X86CallResultReg::new(XMM1, 32),
+                X86CallResultReg::new(RDI, 64),
+                X86CallResultReg::new(x86_64_regs::XMM2, 64),
+                X86CallResultReg::new(R8, 16),
+                X86CallResultReg::new(R9, 64),
+            ])
+        );
+        // One extraction per result, reading exactly its register view, and
+        // one mask: the `bool` lane (SIL) defines bit 0 alone, as every `bool`
+        // lane of a multi-result call does.
+        let rows = &insts[1..];
+        let masks: Vec<usize> = (0..rows.len())
+            .filter(|row| rows[*row].opcode == X86Opcode::AndRI)
+            .collect();
+        assert_eq!(masks, vec![5], "{rows:?}");
+        let bool_lane = rows[4].operands[0].clone();
+        assert_eq!(rows[4].opcode, X86Opcode::Movzx);
+        assert_eq!(
+            rows[5].operands,
+            vec![bool_lane.clone(), bool_lane, X86ISelOperand::Imm(1)]
+        );
+        let reads: Vec<X86ISelOperand> = rows
+            .iter()
+            .filter(|inst| inst.opcode != X86Opcode::AndRI)
+            .map(|inst| inst.operands[1].clone())
+            .collect();
+        assert_eq!(
+            reads,
+            vec![
+                X86ISelOperand::PReg(RAX),
+                X86ISelOperand::PReg(x86_64_regs::EDX),
+                X86ISelOperand::PReg(XMM0),
+                X86ISelOperand::PReg(x86_64_regs::CL),
+                X86ISelOperand::PReg(x86_64_regs::SIL),
+                X86ISelOperand::PReg(XMM1),
+                X86ISelOperand::PReg(RDI),
+                X86ISelOperand::PReg(x86_64_regs::XMM2),
+                X86ISelOperand::PReg(x86_64_regs::R8W),
+                X86ISelOperand::PReg(R9),
+            ]
+        );
+    }
+
+    /// Callee side: the return moves write the internal registers, the `ret`
+    /// carries exactly the registers past the C file, and the TV-1 return
+    /// bindings name every scalar result's index.
+    #[test]
+    fn test_lower_return_internal_multi_result_moves_and_ret_metadata() {
+        let return_types = vec![
+            Type::I64,
+            Type::F64,
+            Type::I32,
+            Type::F32,
+            Type::I64,
+            Type::F64,
+            Type::B1,
+            Type::I64,
+            Type::I64,
+        ];
+        let sig = Signature {
+            params: vec![],
+            returns: return_types.clone(),
+        };
+        let mut isel =
+            X86InstructionSelector::with_abi("five_plus".to_string(), sig, X86CallAbi::SystemV);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        for (index, ty) in return_types.iter().cloned().enumerate() {
+            define_vreg(&mut isel, Value(index as u32), ty);
+        }
+        isel.lower_return(
+            &Instruction {
+                opcode: Opcode::Return,
+                args: (0..return_types.len() as u32).map(Value).collect(),
+                results: vec![],
+            },
+            entry,
+        )
+        .expect("nine mixed results fit the internal System V file");
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(insts.len(), return_types.len() + 1, "{insts:?}");
+        let written: Vec<X86ISelOperand> = insts[..return_types.len()]
+            .iter()
+            .map(|inst| inst.operands[0].clone())
+            .collect();
+        assert_eq!(
+            written,
+            vec![
+                X86ISelOperand::PReg(RAX),
+                X86ISelOperand::PReg(XMM0),
+                X86ISelOperand::PReg(x86_64_regs::EDX),
+                X86ISelOperand::PReg(XMM1),
+                X86ISelOperand::PReg(RCX),
+                X86ISelOperand::PReg(x86_64_regs::XMM2),
+                X86ISelOperand::PReg(x86_64_regs::ESI),
+                X86ISelOperand::PReg(RDI),
+                X86ISelOperand::PReg(R8),
+            ]
+        );
+        let ret = insts.last().unwrap();
+        assert_eq!(ret.opcode, X86Opcode::Ret);
+        assert_eq!(
+            ret.internal_return_regs,
+            vec![
+                X86CallResultReg::new(RCX, 64),
+                X86CallResultReg::new(x86_64_regs::XMM2, 64),
+                // The callee returns a `bool` in a clean 32-bit carrier; the
+                // CALLER's metadata narrows it to the 8 bits the psABI promises.
+                X86CallResultReg::new(RSI, 32),
+                X86CallResultReg::new(RDI, 64),
+                X86CallResultReg::new(R8, 64),
+            ]
+        );
+        assert_eq!(
+            Some(ret.internal_return_regs.clone()),
+            Some(x86_internal_multi_result_regs(
+                &return_types,
+                X86CallAbi::SystemV
+            )),
+            "the ret metadata and the public classifier view must agree"
+        );
+        for (index, reg) in [(4u32, RCX), (7, RDI), (8, R8)] {
+            let binding = mfunc
+                .return_abi_bindings()
+                .get(reg)
+                .unwrap_or_else(|| panic!("return {index} in {reg} must carry a TV-1 binding"));
+            assert_eq!(binding.return_index, index);
+        }
+    }
+
+    /// A C-shaped return is emitted exactly as before: same moves, and a
+    /// `ret` that carries no internal-return metadata.
+    #[test]
+    fn test_lower_return_c_shaped_ret_carries_no_internal_metadata() {
+        for return_types in [
+            vec![Type::I64],
+            vec![Type::I64, Type::I32],
+            vec![Type::F64, Type::F64],
+            vec![Type::I64, Type::F64, Type::I32, Type::F32],
+            vec![Type::I128],
+        ] {
+            let sig = Signature {
+                params: vec![],
+                returns: return_types.clone(),
+            };
+            let mut isel =
+                X86InstructionSelector::with_abi("c_shaped".to_string(), sig, X86CallAbi::SystemV);
+            let entry = Block(0);
+            isel.func.ensure_block(entry);
+            for (index, ty) in return_types.iter().cloned().enumerate() {
+                if ty == Type::I128 {
+                    define_i128_vreg(&mut isel, Value(index as u32));
+                } else {
+                    define_vreg(&mut isel, Value(index as u32), ty);
+                }
+            }
+            isel.lower_return(
+                &Instruction {
+                    opcode: Opcode::Return,
+                    args: (0..return_types.len() as u32).map(Value).collect(),
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let ret = mfunc.blocks[&entry].insts.last().unwrap();
+            assert_eq!(ret.opcode, X86Opcode::Ret);
+            assert!(ret.internal_return_regs.is_empty(), "{return_types:?}");
+        }
+    }
+
+    /// An `i128` past the C file takes the next two consecutive internal
+    /// registers.
+    #[test]
+    fn test_i128_result_past_the_c_file_takes_a_consecutive_internal_pair() {
+        assert_eq!(
+            x86_scalar_return_result_regs(&[Type::I64, Type::I128], X86CallAbi::SystemV),
+            Some(vec![
+                X86CallResultReg::new(RAX, 64),
+                X86CallResultReg::new(RDX, 64),
+                X86CallResultReg::new(RCX, 64),
+            ])
+        );
+        assert_eq!(
+            x86_scalar_return_result_regs(
+                &[Type::I128, Type::I128, Type::I128],
+                X86CallAbi::SystemV
+            ),
+            Some(vec![
+                X86CallResultReg::new(RAX, 64),
+                X86CallResultReg::new(RDX, 64),
+                X86CallResultReg::new(RCX, 64),
+                X86CallResultReg::new(RSI, 64),
+                X86CallResultReg::new(RDI, 64),
+                X86CallResultReg::new(R8, 64),
+            ])
+        );
+        // A fourth pair would need R9 plus a register past the file.
+        assert_eq!(
+            x86_scalar_return_result_regs(&vec![Type::I128; 4], X86CallAbi::SystemV),
+            None
+        );
+    }
+
+    /// Every return source is resolved BEFORE the first fixed-register write:
+    /// a cross-block constant rematerialized for the return lands ahead of all
+    /// return moves, so no value is defined inside the return-move window.
+    #[test]
+    fn test_lower_return_resolves_sources_before_fixed_register_writes() {
+        let return_types = vec![Type::I64, Type::I64, Type::I64];
+        let sig = Signature {
+            params: vec![],
+            returns: return_types.clone(),
+        };
+        let mut isel =
+            X86InstructionSelector::with_abi("remat_ret".to_string(), sig, X86CallAbi::SystemV);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        define_vreg(&mut isel, Value(0), Type::I64);
+        define_vreg(&mut isel, Value(1), Type::I64);
+        let constant = Value(100);
+        let consumer = vec![Instruction {
+            opcode: Opcode::Return,
+            args: vec![Value(0), constant, Value(1)],
+            results: vec![],
+        }];
+        let producer = vec![Instruction {
+            opcode: Opcode::Iconst {
+                ty: Type::I64,
+                imm: 7,
+            },
+            args: vec![],
+            results: vec![constant],
+        }];
+        isel.seed_iconst_origins([producer.as_slice(), consumer.as_slice()]);
+        isel.select_block(entry, &consumer).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let first_fixed_write = insts
+            .iter()
+            .position(|inst| matches!(inst.operands.first(), Some(X86ISelOperand::PReg(_))))
+            .expect("return moves");
+        assert!(
+            insts[..first_fixed_write]
+                .iter()
+                .any(|inst| inst.opcode == X86Opcode::MovRI),
+            "the constant is rematerialized ahead of the return moves: {insts:?}"
+        );
+        assert!(
+            insts[first_fixed_write..]
+                .iter()
+                .all(|inst| inst.opcode == X86Opcode::Ret
+                    || matches!(inst.operands.first(), Some(X86ISelOperand::PReg(_)))),
+            "only fixed-register writes and the ret follow the first return move: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn test_lower_call_rejects_past_the_class_file_without_aliasing() {
         for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
-            for (result_types, rejected_type) in &cases {
+            // (result types, refused index, the substring that ABI's own
+            // exhaustion reason must carry). System V's file is TrustCG's
+            // internal multi-result file (7 GPRs, 8 XMMs), so the 8th integer
+            // and the 9th FP result are refused; Windows x64 has one register
+            // per class, so the 2nd is.
+            let cases: Vec<(Vec<Type>, usize, &str)> = match abi {
+                X86CallAbi::SystemV => vec![
+                    (
+                        sysv_integer_results_past_the_file(),
+                        7,
+                        "capacity is exhausted",
+                    ),
+                    (sysv_fp_results_past_the_file(), 8, "capacity is exhausted"),
+                ],
+                X86CallAbi::WindowsX64 => vec![
+                    (vec![Type::I64, Type::I32, Type::I8], 1, "Windows x64"),
+                    (vec![Type::F64, Type::F32, Type::F64], 1, "Windows x64"),
+                ],
+            };
+            for (result_types, rejected_index, reason_marker) in &cases {
+                let (rejected_index, reason_marker) = (*rejected_index, *reason_marker);
+                let rejected_type = &result_types[rejected_index];
                 let sig = Signature {
                     params: vec![],
                     returns: vec![],
@@ -23047,7 +28185,7 @@ mod tests {
                 let mut isel = X86InstructionSelector::with_abi("caller".to_string(), sig, abi);
                 let entry = Block(0);
                 isel.func.ensure_block(entry);
-                let result_values = [Value(0), Value(1), Value(2)];
+                let result_values: Vec<Value> = (0..result_types.len() as u32).map(Value).collect();
                 isel.seed_value_types(
                     &result_values
                         .iter()
@@ -23062,6 +28200,7 @@ mod tests {
                         &Instruction {
                             opcode: Opcode::Call {
                                 name: "callee".to_string(),
+                                binding: Default::default(),
                             },
                             args: vec![],
                             results: result_values.to_vec(),
@@ -23070,17 +28209,22 @@ mod tests {
                     )
                     .unwrap_err();
 
-                assert!(matches!(
-                    error,
-                    X86ISelError::UnsupportedScalarReturnAbi {
-                        index: 2,
-                        ty,
-                        abi: actual_abi,
-                        reason,
-                    } if actual_abi == abi
-                        && ty == *rejected_type
-                        && reason.contains("capacity is exhausted")
-                ));
+                assert!(
+                    matches!(
+                        &error,
+                        X86ISelError::UnsupportedScalarReturnAbi {
+                            index,
+                            ty,
+                            abi: actual_abi,
+                            reason,
+                        } if *index == rejected_index
+                            && *actual_abi == abi
+                            && ty == rejected_type
+                            && reason.contains(reason_marker)
+                    ),
+                    "{abi:?} {result_types:?}: expected a refusal at result {rejected_index} \
+                     ({rejected_type:?}) naming `{reason_marker}`, got {error:?}"
+                );
                 assert!(
                     isel.func.blocks[&entry].insts.is_empty(),
                     "{abi:?} {result_types:?} must reject before emitting a call or partial extraction"
@@ -23155,6 +28299,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0), Value(1)],
                 results: vec![Value(2)],
@@ -23269,6 +28414,31 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_exact_function_address_uses_distinct_learip_operand() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::FunctionAddr {
+                    name: "callee".to_string(),
+                    function: 137,
+                },
+                args: vec![],
+                results: vec![Value(0)],
+            },
+            entry,
+        )
+        .unwrap();
+        let function = isel.finalize();
+        let instructions = &function.blocks[&entry].insts;
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].opcode, X86Opcode::LeaRip);
+        assert_eq!(
+            instructions[0].operands[1],
+            X86ISelOperand::ExactModuleSymbol("callee".into())
+        );
+    }
+
+    #[test]
     fn test_lower_global_ref_uses_learip_symbol_operand() {
         let (mut isel, entry) = make_empty_isel();
 
@@ -23344,6 +28514,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0)],
                 results: vec![Value(1)],
@@ -23373,6 +28544,10 @@ mod tests {
             for (ty, expected_opcode, expected_src, defined_bits) in [
                 (Type::I8, X86Opcode::Movzx, x86_64_regs::AL, 8),
                 (Type::I16, X86Opcode::MovzxW, x86_64_regs::AX, 16),
+                // A callee defines only AL of a `bool` (psABI; LLVM returns
+                // `setcc %al`): the caller re-extends it to the clean
+                // 32-bit carrier instead of copying EAX's stale bits 8..31.
+                (Type::B1, X86Opcode::Movzx, x86_64_regs::AL, 8),
             ] {
                 let sig = Signature {
                     params: vec![],
@@ -23387,6 +28562,7 @@ mod tests {
                     &Instruction {
                         opcode: Opcode::Call {
                             name: "callee".to_string(),
+                            binding: Default::default(),
                         },
                         args: vec![],
                         results: vec![Value(0)],
@@ -23663,6 +28839,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![Value(0)],
                     results: vec![],
@@ -23719,6 +28896,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0), Value(1)],
                 results: vec![],
@@ -23766,6 +28944,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0), Value(1)],
                 results: vec![],
@@ -23815,6 +28994,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0), Value(1), Value(2)],
                 results: vec![],
@@ -23881,6 +29061,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args,
                 results: vec![],
@@ -23950,6 +29131,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args,
                 results: vec![],
@@ -24033,6 +29215,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args,
                 results: vec![],
@@ -24115,6 +29298,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args,
                 results: vec![],
@@ -24288,6 +29472,7 @@ mod tests {
                     &Instruction {
                         opcode: Opcode::Call {
                             name: "callee".to_string(),
+                            binding: Default::default(),
                         },
                         args: vec![Value(0)],
                         results: vec![],
@@ -24355,6 +29540,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![Value(0), Value(1)],
                     results: vec![],
@@ -24430,6 +29616,7 @@ mod tests {
                     &Instruction {
                         opcode: Opcode::Call {
                             name: "callee".to_string(),
+                            binding: Default::default(),
                         },
                         args,
                         results: vec![],
@@ -24504,6 +29691,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..=6).map(Value).collect(),
                 results: vec![],
@@ -24563,6 +29751,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..=7).map(Value).collect(),
                 results: vec![],
@@ -24628,6 +29817,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![Value(0), Value(1)],
                     results: vec![],
@@ -24695,6 +29885,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args,
                 results: vec![],
@@ -24770,6 +29961,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0)],
                 results: vec![],
@@ -24857,6 +30049,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0), Value(1), Value(2), Value(3), aggregate_value],
                 results: vec![],
@@ -24932,6 +30125,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![],
                 results: vec![Value(0)],
@@ -24995,6 +30189,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![],
                     results: vec![Value(0)],
@@ -25050,6 +30245,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![],
                     results: vec![Value(0)],
@@ -25077,6 +30273,143 @@ mod tests {
         }
     }
 
+    /// A call RESULT whose last eightbyte is PARTIAL (3/5/6/7 live bytes) is
+    /// stored with width-exact stores: every store stays inside the object and
+    /// the stores cover it exactly. One `lane.ty` store (4 bytes for a 3-byte
+    /// lane) wrote one byte into the adjacent stack slot.
+    #[test]
+    fn test_lower_call_sysv_partial_eightbyte_result_stores_only_live_bytes() {
+        for size in [3u32, 5, 6, 7, 11, 15] {
+            let aggregate_ty = Type::Array(Box::new(Type::I8), size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![],
+            };
+            let mut isel =
+                X86InstructionSelector::with_abi("caller".to_string(), sig, X86CallAbi::SystemV);
+            let entry = Block(0);
+            isel.func.ensure_block(entry);
+            isel.seed_value_types(&HashMap::from([(Value(0), aggregate_ty.clone())]));
+            isel.lower_call(
+                "callee",
+                &Instruction {
+                    opcode: Opcode::Call {
+                        name: "callee".to_string(),
+                        binding: Default::default(),
+                    },
+                    args: vec![],
+                    results: vec![Value(0)],
+                },
+                entry,
+            )
+            .unwrap();
+
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let aggregate_addr = insts[0].operands[0].clone();
+            let mut stored = 0u32;
+            for inst in insts {
+                let width = match inst.opcode {
+                    X86Opcode::MovMR8 => 1,
+                    X86Opcode::MovMR16 => 2,
+                    X86Opcode::MovMR32 => 4,
+                    X86Opcode::MovMR => 8,
+                    _ => continue,
+                };
+                let X86ISelOperand::MemAddr { base, disp } = &inst.operands[0] else {
+                    panic!("{aggregate_ty:?}: store without a memory destination: {inst:?}");
+                };
+                assert_eq!(
+                    **base, aggregate_addr,
+                    "{aggregate_ty:?}: store outside the result"
+                );
+                assert!(
+                    *disp >= 0 && (*disp as u32) + width <= size,
+                    "{aggregate_ty:?}: a {width}-byte store at +{disp} writes past the \
+                     {size}-byte result: {insts:?}"
+                );
+                stored += width;
+            }
+            assert_eq!(
+                stored, size,
+                "{aggregate_ty:?}: the result stores must cover exactly its bytes: {insts:?}"
+            );
+        }
+    }
+
+    /// An ARGUMENT lane assembled from a partial eightbyte zero-extends every
+    /// byte/word piece before shifting and ORing it. `MOV r8/r16, [mem]` writes
+    /// only the low bits of its register; the stale bits above would land on the
+    /// NEXT piece's bytes (a `[u8; 3]` returned through `black_box` read back
+    /// 214 or 9 instead of 148).
+    #[test]
+    fn test_lower_call_sysv_partial_eightbyte_arg_zero_extends_narrow_pieces() {
+        for size in [3u32, 5, 6, 7, 11] {
+            let aggregate_ty = Type::Array(Box::new(Type::I8), size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![],
+            };
+            let mut isel =
+                X86InstructionSelector::with_abi("caller".to_string(), sig, X86CallAbi::SystemV);
+            let entry = Block(0);
+            isel.func.ensure_block(entry);
+            isel.set_stack_slots(vec![StackSlotInfo::new(16, 1)]);
+            isel.seed_value_types(&HashMap::from([(Value(0), aggregate_ty.clone())]));
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::StackAddr { slot: 0 },
+                    args: vec![],
+                    results: vec![Value(0)],
+                },
+                entry,
+            )
+            .unwrap();
+            isel.lower_call(
+                "callee",
+                &Instruction {
+                    opcode: Opcode::Call {
+                        name: "callee".to_string(),
+                        binding: Default::default(),
+                    },
+                    args: vec![Value(0)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            // Every byte/word piece is read by the zero-extending `movzx r32,
+            // m8/m16`, which clears the bits above the piece itself: nothing
+            // stale is shifted onto the next piece's bytes, and the merging
+            // `mov r8/r16, m` never appears.
+            assert!(
+                !insts
+                    .iter()
+                    .any(|inst| matches!(inst.opcode, X86Opcode::MovRM8 | X86Opcode::MovRM16)),
+                "{aggregate_ty:?}: no merging narrow load: {insts:?}"
+            );
+            let narrow_loads = insts
+                .iter()
+                .filter(|inst| matches!(inst.opcode, X86Opcode::MovzxRM8 | X86Opcode::MovzxRM16))
+                .count();
+            let expected = sysv_lane_byte_accesses(size % 8)
+                .map(|accesses| {
+                    accesses
+                        .iter()
+                        .filter(|(ty, _)| matches!(ty, Type::I8 | Type::I16))
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(
+                narrow_loads, expected,
+                "{aggregate_ty:?}: one narrow load per byte/word piece: {insts:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_lower_call_windows_two_i64_aggregate_result_uses_sret_slot() {
         let aggregate_ty = Type::Struct(vec![Type::I64, Type::I64]);
@@ -25095,6 +30428,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![],
                 results: vec![Value(0)],
@@ -25153,6 +30487,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0)],
                 results: vec![Value(1)],
@@ -25244,6 +30579,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![],
                     results: vec![Value(0)],
@@ -25330,6 +30666,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![],
                     results: vec![Value(0)],
@@ -25383,6 +30720,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "callee".to_string(),
+                        binding: Default::default(),
                     },
                     args: vec![],
                     results: vec![Value(0)],
@@ -25442,6 +30780,7 @@ mod tests {
                     &Instruction {
                         opcode: Opcode::Call {
                             name: "callee".to_string(),
+                            binding: Default::default(),
                         },
                         args: vec![],
                         results: vec![Value(0)],
@@ -25523,6 +30862,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![],
                 results: vec![Value(0)],
@@ -25560,6 +30900,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..6).map(Value).collect(),
                 results: vec![Value(6)],
@@ -25610,6 +30951,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..4).map(Value).collect(),
                 results: vec![Value(4)],
@@ -25659,6 +31001,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "target".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0), Value(1), Value(2), Value(3), Value(4)],
                 results: vec![],
@@ -25710,6 +31053,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "small".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0)],
                 results: vec![],
@@ -25722,6 +31066,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "large".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..6).map(Value).collect(),
                 results: vec![],
@@ -25754,6 +31099,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "target".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0)],
                 results: vec![],
@@ -25798,6 +31144,7 @@ mod tests {
                 &Instruction {
                     opcode: Opcode::Call {
                         name: "target".to_string(),
+                        binding: Default::default(),
                     },
                     args: (0..7).map(Value).collect(),
                     results: vec![],
@@ -25840,6 +31187,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "target".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..arg_tys.len()).map(|idx| Value(idx as u32)).collect(),
                 results: vec![],
@@ -25901,6 +31249,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "target".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0), Value(1), Value(2), Value(3), Value(4), Value(5)],
                 results: vec![],
@@ -25989,9 +31338,9 @@ mod tests {
     #[test]
     fn test_lower_formal_arguments_windows_x64_stack_integer_uses_value_width() {
         for (ty, expected_opcode) in [
-            (Type::B1, X86Opcode::MovRM8),
-            (Type::I8, X86Opcode::MovRM8),
-            (Type::I16, X86Opcode::MovRM16),
+            (Type::B1, X86Opcode::MovzxRM8),
+            (Type::I8, X86Opcode::MovzxRM8),
+            (Type::I16, X86Opcode::MovzxRM16),
             (Type::I32, X86Opcode::MovRM32),
         ] {
             let mut params = vec![Type::I64; 4];
@@ -26086,7 +31435,11 @@ mod tests {
     #[test]
     fn test_lower_return_mixed_scalars_use_independent_return_sequences() {
         let return_types = vec![Type::I64, Type::F64, Type::I32, Type::F32];
-        for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
+        // System V ONLY: this shape needs a SECOND register in each class
+        // (RDX, XMM1), which Windows x64 does not have. The Win64 half of this
+        // shape is `test_lower_return_second_component_is_sysv_only`.
+        {
+            let abi = X86CallAbi::SystemV;
             let sig = Signature {
                 params: vec![],
                 returns: return_types.clone(),
@@ -26119,14 +31472,104 @@ mod tests {
         }
     }
 
+    /// The RETURN direction of the Windows x64 divergence.
+    ///
+    /// A two-component scalar RETURN needs the second register of a class. Under
+    /// System V that is RDX (integer) or XMM1 (SSE). Windows x64 has neither, so
+    /// the function must fail closed instead of writing a register the caller
+    /// will not read. Before this, a `x86_64-pc-windows-msvc` compile of a
+    /// two-`i64` return produced a COFF object ending
+    /// `movq %rcx,%rax ; movq %rbx,%rdx ; retq` — verified by disassembling the
+    /// emitted object, and wrong for every convention, not only for `Swift`.
     #[test]
-    fn test_lower_return_rejects_third_same_class_without_partial_emission() {
-        let cases = [
-            (vec![Type::I64, Type::I32, Type::I8], Type::I8),
-            (vec![Type::F64, Type::F32, Type::F64], Type::F64),
-        ];
+    fn test_lower_return_second_component_is_sysv_only() {
+        for return_types in [
+            vec![Type::I64, Type::I64],
+            vec![Type::I8, Type::I16],
+            vec![Type::F64, Type::F64],
+            vec![Type::F32, Type::F64],
+        ] {
+            for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
+                let sig = Signature {
+                    params: vec![],
+                    returns: return_types.clone(),
+                };
+                let mut isel =
+                    X86InstructionSelector::with_abi("two_component".to_string(), sig, abi);
+                let entry = Block(0);
+                isel.func.ensure_block(entry);
+                for (index, ty) in return_types.iter().cloned().enumerate() {
+                    define_vreg(&mut isel, Value(index as u32), ty);
+                }
+                let outcome = isel.lower_return(
+                    &Instruction {
+                        opcode: Opcode::Return,
+                        args: vec![Value(0), Value(1)],
+                        results: vec![],
+                    },
+                    entry,
+                );
+                match abi {
+                    X86CallAbi::SystemV => {
+                        outcome.unwrap_or_else(|e| {
+                            panic!("System V places {return_types:?} in RAX,RDX / XMM0,XMM1: {e:?}")
+                        });
+                        let mfunc = isel.finalize();
+                        let insts = &mfunc.blocks[&entry].insts;
+                        // Two moves plus RET: the second component is a real
+                        // placement here, which is what makes the Win64
+                        // refusal below a DIVERGENCE and not a blanket rule.
+                        assert_eq!(insts.len(), 3, "{return_types:?}: {insts:?}");
+                    }
+                    X86CallAbi::WindowsX64 => {
+                        let error = outcome.expect_err(
+                            "Windows x64 has no second return register in either class, so a \
+                             two-component register return must fail closed",
+                        );
+                        assert!(
+                            matches!(
+                                &error,
+                                X86ISelError::UnsupportedScalarReturnAbi {
+                                    index: 1,
+                                    abi: X86CallAbi::WindowsX64,
+                                    reason,
+                                    ..
+                                } if reason.contains("Windows x64")
+                            ),
+                            "{return_types:?}: {error:?}"
+                        );
+                        assert!(
+                            isel.func.blocks[&entry].insts.is_empty(),
+                            "{return_types:?} must reject before emitting a partial return move"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The RETURN twin of `test_lower_call_rejects_past_the_class_file_without_aliasing`:
+    /// System V refuses the THIRD same-class component, Windows x64 the SECOND.
+    #[test]
+    fn test_lower_return_rejects_past_the_class_file_without_partial_emission() {
         for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
-            for (return_types, rejected_type) in &cases {
+            let cases: Vec<(Vec<Type>, usize, &str)> = match abi {
+                X86CallAbi::SystemV => vec![
+                    (
+                        sysv_integer_results_past_the_file(),
+                        7,
+                        "capacity is exhausted",
+                    ),
+                    (sysv_fp_results_past_the_file(), 8, "capacity is exhausted"),
+                ],
+                X86CallAbi::WindowsX64 => vec![
+                    (vec![Type::I64, Type::I32, Type::I8], 1, "Windows x64"),
+                    (vec![Type::F64, Type::F32, Type::F64], 1, "Windows x64"),
+                ],
+            };
+            for (return_types, rejected_index, reason_marker) in &cases {
+                let (rejected_index, reason_marker) = (*rejected_index, *reason_marker);
+                let rejected_type = &return_types[rejected_index];
                 let sig = Signature {
                     params: vec![],
                     returns: return_types.clone(),
@@ -26143,24 +31586,29 @@ mod tests {
                     .lower_return(
                         &Instruction {
                             opcode: Opcode::Return,
-                            args: vec![Value(0), Value(1), Value(2)],
+                            args: (0..return_types.len() as u32).map(Value).collect(),
                             results: vec![],
                         },
                         entry,
                     )
                     .unwrap_err();
 
-                assert!(matches!(
-                    error,
-                    X86ISelError::UnsupportedScalarReturnAbi {
-                        index: 2,
-                        ty,
-                        abi: actual_abi,
-                        reason,
-                    } if actual_abi == abi
-                        && ty == *rejected_type
-                        && reason.contains("capacity is exhausted")
-                ));
+                assert!(
+                    matches!(
+                        &error,
+                        X86ISelError::UnsupportedScalarReturnAbi {
+                            index,
+                            ty,
+                            abi: actual_abi,
+                            reason,
+                        } if *index == rejected_index
+                            && *actual_abi == abi
+                            && ty == rejected_type
+                            && reason.contains(reason_marker)
+                    ),
+                    "{abi:?} {return_types:?}: expected a refusal at result {rejected_index} \
+                     ({rejected_type:?}) naming `{reason_marker}`, got {error:?}"
+                );
                 assert!(
                     isel.func.blocks[&entry].insts.is_empty(),
                     "{abi:?} {return_types:?} must reject before emitting partial return-register moves"
@@ -26794,9 +32242,9 @@ mod tests {
     #[test]
     fn test_lower_formal_arguments_sysv_stack_integer_uses_value_width() {
         for (ty, expected_opcode) in [
-            (Type::B1, X86Opcode::MovRM8),
-            (Type::I8, X86Opcode::MovRM8),
-            (Type::I16, X86Opcode::MovRM16),
+            (Type::B1, X86Opcode::MovzxRM8),
+            (Type::I8, X86Opcode::MovzxRM8),
+            (Type::I16, X86Opcode::MovzxRM16),
             (Type::I32, X86Opcode::MovRM32),
         ] {
             let mut params = vec![Type::I64; 6];
@@ -26822,6 +32270,42 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// A System V `bool` register parameter is the zero extension of its
+    /// register's low byte: a psABI caller defines only bits 0..7 of it (bit 0
+    /// the value, bits 1..7 zero), and the backend forwards and returns a
+    /// `bool` as the clean 32-bit bool. A Win64 `bool` keeps the 32-bit copy.
+    #[test]
+    fn test_lower_formal_arguments_sysv_bool_register_is_movzx_of_the_low_byte() {
+        let sig = Signature {
+            params: vec![Type::I64, Type::B1],
+            returns: vec![],
+        };
+        let mut isel = X86InstructionSelector::new("sysv_formal_bool".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[1].opcode, X86Opcode::Movzx);
+        assert_eq!(insts[1].operands[1], X86ISelOperand::PReg(ESI));
+
+        let sig = Signature {
+            params: vec![Type::B1],
+            returns: vec![],
+        };
+        let mut isel = X86InstructionSelector::with_abi(
+            "windows_formal_bool".to_string(),
+            sig.clone(),
+            X86CallAbi::WindowsX64,
+        );
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(insts.len(), 1);
+        assert_eq!(insts[0].opcode, X86Opcode::MovRR32);
+        assert_eq!(insts[0].operands[1], X86ISelOperand::PReg(ECX));
     }
 
     #[test]
@@ -27329,46 +32813,74 @@ mod tests {
     }
 
     #[test]
-    fn test_sysv_sub_word_tail_aggregates_fail_closed_all_positions() {
-        // Aggregates whose final eightbyte ends on an ODD sub-word tail of 3/5/6/7
-        // valid bytes. There is no single non-over-reading GPR access for such a
-        // tail, so `sysv_eightbyte_lane_type` returns `None` for it and these must
-        // FAIL CLOSED at EVERY position on SysV (return, call-result, formal-arg,
-        // call-arg) rather than guess a lane width and silently miscompile.
+    fn test_sysv_odd_tail_aggregates_lower_by_width_exact_decomposition() {
+        // Aggregates whose final eightbyte ends on an ODD sub-word tail of
+        // 3/5/6/7 valid bytes. These used to FAIL CLOSED at every SysV
+        // position, and that was the correct behaviour at the time: there is no
+        // single non-over-reading GPR access for such a tail, and guessing a
+        // wider one would read or write past the object.
+        //
+        // They now LOWER, because the lane COPY is decomposed into width-exact
+        // accesses (`sysv_lane_byte_accesses`) on both sides — the caller
+        // assembles the register from the object's own bytes, the callee writes
+        // only its own allocation. The clang differentials in
+        // `e2e_x86_64_aggregate_abi.rs` hold the RESULTS to the platform ABI;
+        // this pins the CLASSIFICATION and the decomposition's exactness.
+        //
         // Byte-granular (`align 1`) shapes keep the size from padding up to a
         // representable width.
-        //
-        // (1/2-byte and 1/2-byte-tail aggregates DO lower for the return/result
-        // ABI — see `test_sysv_subdword_returns_supported_args_fail_closed`.)
-        for aggregate_ty in [
-            Type::Struct(vec![Type::I8, Type::I8, Type::I8]), // 3 bytes
-            Type::Array(Box::new(Type::I8), 3),               // 3 bytes
-            Type::Array(Box::new(Type::I8), 5),               // 5 bytes
-            Type::Array(Box::new(Type::I8), 6),               // 6 bytes
-            Type::Array(Box::new(Type::I8), 7),               // 7 bytes
-            Type::Array(Box::new(Type::I8), 11),              // 11 bytes (2nd eb 3 valid bytes)
+        for (aggregate_ty, size) in [
+            (Type::Struct(vec![Type::I8, Type::I8, Type::I8]), 3u32),
+            (Type::Array(Box::new(Type::I8), 3), 3),
+            (Type::Array(Box::new(Type::I8), 5), 5),
+            (Type::Array(Box::new(Type::I8), 6), 6),
+            (Type::Array(Box::new(Type::I8), 7), 7),
+            // 11 bytes: a FULL first eightbyte and a 3-valid-byte second one.
+            (Type::Array(Box::new(Type::I8), 11), 11),
         ] {
-            // The eightbyte classifier must refuse these on SysV at BOTH the
-            // argument ABI (no sub-dword) and the return/result ABI (the odd tail
-            // has no representable lane).
-            assert!(
-                classify_sysv_register_aggregate(&aggregate_ty, X86CallAbi::SystemV).is_none(),
-                "{aggregate_ty:?} has an odd sub-word tail and must not classify as a SysV \
-                 register aggregate (fail-closed, not a guessed lane width)"
+            let layout = classify_sysv_register_aggregate(&aggregate_ty, X86CallAbi::SystemV)
+                .unwrap_or_else(|| {
+                    panic!("{aggregate_ty:?} must classify now that partial lanes decompose")
+                });
+
+            // Every lane's decomposition must cover EXACTLY its live bytes.
+            // This is the property that makes admitting the shape safe at all.
+            let mut covered = 0u32;
+            for lane in &layout.lanes {
+                let accesses = sysv_lane_byte_accesses(lane.valid_bytes).unwrap_or_else(|| {
+                    panic!(
+                        "{aggregate_ty:?}: lane with {} live bytes",
+                        lane.valid_bytes
+                    )
+                });
+                let total: u32 = accesses.iter().map(|(ty, _)| ty.bytes()).sum();
+                assert_eq!(
+                    total, lane.valid_bytes,
+                    "{aggregate_ty:?}: a lane's accesses must sum to its live bytes, or the \
+                     lowering reads or writes past the object"
+                );
+                covered += lane.valid_bytes;
+            }
+            assert_eq!(
+                covered, size,
+                "{aggregate_ty:?}: the lanes together must cover the whole aggregate"
             );
+
+            // The return ABI classifies them too.
             assert!(
                 classify_sysv_register_aggregate_returns(
                     core::slice::from_ref(&aggregate_ty),
                     X86CallAbi::SystemV
                 )
-                .is_none(),
-                "{aggregate_ty:?} odd sub-word tail must not classify for the return ABI either"
+                .is_some(),
+                "{aggregate_ty:?} must classify for the return ABI as well"
             );
-            // And every lowering position must fail closed, not miscompile.
-            assert_formal_rejects_aggregate(aggregate_ty.clone(), X86CallAbi::SystemV);
-            assert_call_arg_rejects_aggregate(aggregate_ty.clone(), X86CallAbi::SystemV);
-            assert_return_rejects_aggregate(aggregate_ty.clone(), X86CallAbi::SystemV);
-            assert_call_result_rejects_aggregate(aggregate_ty, X86CallAbi::SystemV);
+
+            // Windows x64 still has no eightbyte register-aggregate ABI.
+            assert!(
+                classify_sysv_register_aggregate(&aggregate_ty, X86CallAbi::WindowsX64).is_none(),
+                "{aggregate_ty:?} must NOT classify under the Windows x64 ABI"
+            );
         }
     }
 
@@ -27926,6 +33438,110 @@ mod tests {
         assert_eq!(insts[0].operands[1], X86ISelOperand::PReg(RDI));
         assert_eq!(insts[1].opcode, X86Opcode::MovRR);
         assert_eq!(insts[1].operands[1], X86ISelOperand::PReg(RSI));
+    }
+
+    // -----------------------------------------------------------------------
+    // The indirect-return (`sret`) convention on System V x86-64.
+    //
+    // Unlike AAPCS64, System V passes the hidden return-buffer pointer as an
+    // ordinary LEADING integer argument (RDI) — exactly where a leading pointer
+    // parameter already lands — so the structural shape is correct here by
+    // construction. These tests pin that it IS correct, and that the two ways of
+    // claiming the indirect-result register cannot both fire.
+    // -----------------------------------------------------------------------
+
+    /// The hidden parameter lands in RDI and the first REAL argument in RSI —
+    /// i.e. it consumes an integer argument slot, which is the System V rule and
+    /// the opposite of AAPCS64's reserved X8.
+    #[test]
+    fn sysv_sret_parameter_takes_rdi_and_shifts_the_real_argument_to_rsi() {
+        let sig = Signature {
+            params: vec![Type::I64, Type::I64],
+            returns: vec![],
+        };
+        let mut isel = X86InstructionSelector::new("sret_param_sysv".to_string(), sig.clone());
+        isel.seed_sret_param(Some(crate::function::AbiSretParam { param_index: 0 }))
+            .expect("a leading hidden parameter is lowered");
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[0].operands[1], X86ISelOperand::PReg(RDI));
+        assert_eq!(insts[1].operands[1], X86ISelOperand::PReg(RSI));
+    }
+
+    /// A hidden PARAMETER and a `returns`-list aggregate that this ABI also
+    /// returns indirectly would both claim RDI. Refuse rather than alias them.
+    #[test]
+    fn sysv_sret_parameter_colliding_with_an_sret_return_is_refused() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![Type::Struct(vec![Type::I64, Type::I64, Type::I64])],
+        };
+        let mut isel = X86InstructionSelector::new("sret_collision".to_string(), sig.clone());
+        isel.seed_sret_param(Some(crate::function::AbiSretParam { param_index: 0 }))
+            .unwrap();
+        let err = isel
+            .lower_formal_arguments(&sig, Block(0))
+            .expect_err("two indirect-result claims must fail closed");
+        assert!(
+            matches!(&err, X86ISelError::UnsupportedOpcode(msg) if msg.contains("[TCG-SRET-ABI]")),
+            "expected a named refusal, got {err:?}"
+        );
+    }
+
+    /// AMD64 psABI §3.2.3: the callee also RETURNS the buffer address in `%rax`.
+    /// The hidden-parameter shape returns void, so this has to be emitted
+    /// explicitly — LLVM does it, and a clang-generated caller may read it.
+    #[test]
+    fn sysv_sret_callee_returns_the_buffer_address_in_rax() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![],
+        };
+        let mut isel = X86InstructionSelector::new("sret_rax".to_string(), sig.clone());
+        isel.seed_sret_param(Some(crate::function::AbiSretParam { param_index: 0 }))
+            .unwrap();
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        isel.select_block(
+            entry,
+            &[Instruction {
+                opcode: Opcode::Return,
+                args: vec![],
+                results: vec![],
+            }],
+        )
+        .expect("a void sret return lowers");
+
+        let insts = &isel.func.blocks[&entry].insts;
+        let ret_at = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::Ret)
+            .expect("a Ret is emitted");
+        assert!(ret_at > 0, "the RAX move must precede the Ret");
+        let before = &insts[ret_at - 1];
+        assert_eq!(before.opcode, X86Opcode::MovRR);
+        assert_eq!(before.operands[0], X86ISelOperand::PReg(RAX));
+    }
+
+    /// A hidden parameter at any position but 0 is refused, not placed.
+    #[test]
+    fn sysv_sret_parameter_at_a_nonzero_index_is_refused() {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = X86InstructionSelector::new("sret_mid_sysv".to_string(), sig);
+        let err = isel
+            .seed_sret_param(Some(crate::function::AbiSretParam { param_index: 1 }))
+            .expect_err("only a LEADING hidden parameter is lowered");
+        assert!(
+            matches!(&err, X86ISelError::UnsupportedOpcode(msg) if msg.contains("[TCG-SRET-ABI]")),
+            "expected a named refusal, got {err:?}"
+        );
     }
 
     #[test]
@@ -28899,6 +34515,20 @@ mod tests {
                 assert_eq!(insts[cursor].operands[1], lhs_lane);
                 let shifted = insts[cursor].operands[0].clone();
                 cursor += 1;
+                // The per-lane Gpr32 carriers carry no trust_ir value, so the
+                // scalarization must record their i32 width itself; the
+                // carrier-hygiene verifier refuses an unrecorded wide-reader
+                // source (the SHR/SAR lane) fail-closed.
+                for lane_carrier in [&lhs_lane, &rhs_lane, &shifted] {
+                    let X86ISelOperand::VReg(vreg) = lane_carrier else {
+                        panic!("scalarized lane operand must be a VReg: {lane_carrier:?}");
+                    };
+                    assert_eq!(
+                        isel.func.vreg_nominal_widths().get(vreg),
+                        Some(&32),
+                        "scalarized v4i32 shift lane {lane} carrier {vreg:?} must record its i32 width"
+                    );
+                }
 
                 shifted_lanes.push(shifted);
             }
@@ -30140,6 +35770,129 @@ mod tests {
     }
 
     #[test]
+    fn test_select_switch_jump_table_policy_in_isolated_processes() {
+        const CASE: &str = "TRUST_CG_JUMP_TABLE_TEST_CASE";
+        const TEST: &str =
+            "x86_64_isel::tests::test_select_switch_jump_table_policy_in_isolated_processes";
+        let Ok(case) = std::env::var(CASE) else {
+            // The policy is process-global. Child environments test the actual
+            // public selector without mutating this test runner's environment
+            // or permanently installing a policy that affects other tests.
+            for case in [
+                "default",
+                "off",
+                "zero",
+                "empty",
+                "tracked-on",
+                "tracked-off",
+                "global-off",
+            ] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(CASE, case)
+                    .env_remove("TCG_NO_X86_JUMP_TABLE")
+                    .env_remove("TCG_X86_JUMP_TABLE")
+                    .env_remove("TCG_NO_JUMP_TABLE")
+                    .env_remove("TCG_NO_SWITCH_BST");
+                match case {
+                    "off" | "tracked-on" => {
+                        command.env("TCG_NO_X86_JUMP_TABLE", "1");
+                    }
+                    "zero" | "tracked-off" => {
+                        command.env("TCG_NO_X86_JUMP_TABLE", "0");
+                    }
+                    "empty" => {
+                        command.env("TCG_NO_X86_JUMP_TABLE", "");
+                    }
+                    "global-off" => {
+                        command.env("TCG_NO_JUMP_TABLE", "1");
+                    }
+                    _ => {}
+                }
+                let output = command.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "{case}: {stdout}\n{stderr}");
+                assert!(
+                    stdout.contains("1 passed; 0 failed"),
+                    "{case}: child test absent: {stdout}"
+                );
+            }
+            return;
+        };
+        if case.starts_with("tracked-") {
+            let disabled = case == "tracked-off";
+            assert!(set_x86_jump_table_disabled(disabled));
+            assert!(set_x86_jump_table_disabled(disabled));
+            assert!(!set_x86_jump_table_disabled(!disabled));
+        }
+        let enabled = matches!(case.as_str(), "default" | "zero" | "tracked-on");
+        let (mut isel, entry) = make_empty_isel();
+        let targets = [Block(1), Block(2), Block(3), Block(4), Block(5)];
+        let default = Block(6);
+        for target in targets.iter().chain(std::iter::once(&default)) {
+            isel.func.ensure_block(*target);
+        }
+        define_vreg(&mut isel, Value(0), Type::I64);
+        let cases: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, target)| (10 + i as i64, *target))
+            .collect();
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Switch { cases, default },
+                args: vec![Value(0)],
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+        let function = isel.finalize();
+        assert_eq!(function.jump_tables.len(), usize::from(enabled), "{case}");
+        let dispatches: Vec<_> = function
+            .blocks
+            .values()
+            .filter(|block| {
+                block
+                    .insts
+                    .iter()
+                    .any(|inst| inst.opcode == X86Opcode::JmpR)
+            })
+            .collect();
+        assert_eq!(dispatches.len(), usize::from(enabled), "{case}");
+        if enabled {
+            assert_eq!(function.jump_tables[0].min_val, 10);
+            assert_eq!(function.jump_tables[0].targets, targets);
+            assert_eq!(dispatches[0].successors.len(), targets.len());
+            for target in targets {
+                assert!(dispatches[0].successors.contains(&target));
+            }
+            assert!(!dispatches[0].successors.contains(&default));
+            assert!(function.blocks[&entry].successors.contains(&default));
+        }
+    }
+
+    /// A 32-bit selector is zero-extended into the 64-bit index (a 32-bit
+    /// `mov`): a `Gpr32` vreg's bits above 31 are not defined in this stream.
+    #[test]
+    fn test_emit_x86_jump_table_zero_extends_a_32_bit_selector() {
+        let (mut isel, entry) = make_empty_isel();
+        let targets = [Block(1), Block(2), Block(3), Block(4)];
+        let default = Block(5);
+        for b in targets.iter().chain(std::iter::once(&default)) {
+            isel.func.ensure_block(*b);
+        }
+        let sel = X86ISelOperand::VReg(isel.new_vreg(RegClass::Gpr32));
+        let cases: Vec<(i64, Block)> = (0..4).map(|i| (i as i64, targets[i])).collect();
+        assert!(isel.emit_x86_jump_table(&cases, &sel, default, entry));
+        let ent = &isel.func.blocks[&entry].insts;
+        assert_eq!(ent[0].opcode, X86Opcode::MovRR32);
+        assert_eq!(ent[0].operands[1], sel);
+    }
+
+    #[test]
     fn test_emit_x86_jump_table_dense_sequence() {
         let (mut isel, entry) = make_empty_isel();
         // 5 dense case values 10..=14 -> targets b1..b5, default b6.
@@ -30843,6 +36596,98 @@ mod tests {
         assert!(!mfunc.guard_obligations.contains_key(&null_fp));
     }
 
+    /// An I128 divisor is a `(lo, hi)` register pair, and `TEST lo, lo` is not a
+    /// zero test of the value: `1 << 64` has `lo == 0`. The carrier must test
+    /// `OR d, lo, hi`, and the obligation binding must follow the operand the
+    /// carrier actually tests. Covers wide constants whose low word is zero and
+    /// a runtime pair.
+    #[test]
+    fn select_guard_div_zero_i128_carrier_tests_both_halves() {
+        use trust_cg_ir::{GuardKind, GuardOperandRef, fingerprint_for_kind};
+
+        let wide_constants: [(i64, i64); 5] = [(0, 1), (0, 3), (0, -1), (0, i64::MIN), (0, 0)];
+        let mut shapes: Vec<Option<(i64, i64)>> = wide_constants.into_iter().map(Some).collect();
+        shapes.push(None);
+        for shape in shapes {
+            let (mut isel, entry) = make_empty_isel();
+            let prefix = match shape {
+                Some((lo, hi)) => {
+                    isel.select_instruction(
+                        &Instruction {
+                            opcode: Opcode::Iconst128 { lo, hi },
+                            args: vec![],
+                            results: vec![Value(0)],
+                        },
+                        entry,
+                    )
+                    .unwrap();
+                    2
+                }
+                None => {
+                    let lo = isel.new_vreg(RegClass::Gpr64);
+                    let hi = isel.new_vreg(RegClass::Gpr64);
+                    isel.define_i128_value(Value(0), lo, hi);
+                    0
+                }
+            };
+            let (lo, hi) = isel.use_i128_value(&Value(0)).unwrap();
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::GuardDivZero {
+                        obligation: Some(42),
+                    },
+                    args: vec![Value(0)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(insts.len(), prefix + 2, "{shape:?}: {insts:?}");
+            let or = &insts[prefix];
+            assert_eq!(or.opcode, X86Opcode::OrRR, "{shape:?}");
+            let X86ISelOperand::VReg(any_bit) = or.operands[0].clone() else {
+                panic!("{shape:?}: the OR must define a fresh vreg: {or:?}");
+            };
+            assert_eq!(any_bit.class, RegClass::Gpr64);
+            assert_eq!(
+                or.operands,
+                vec![X86ISelOperand::VReg(any_bit), lo.clone(), hi.clone()]
+            );
+            assert_ne!(X86ISelOperand::VReg(any_bit), lo);
+            assert_ne!(X86ISelOperand::VReg(any_bit), hi);
+            let carrier = &insts[prefix + 1];
+            assert_eq!(carrier.opcode, X86Opcode::TrapDivZeroExact);
+            assert_eq!(carrier.operands, vec![X86ISelOperand::VReg(any_bit)]);
+
+            let fp = fingerprint_for_kind(GuardKind::DivZero, &[GuardOperandRef::Reg(any_bit.id)]);
+            assert_eq!(mfunc.guard_obligations.get(&fp), Some(&42));
+            assert_eq!(mfunc.guard_obligations.len(), 1);
+        }
+    }
+
+    /// A value typed I128 without a recorded high half has no full-width zero
+    /// test. The guard fails closed instead of testing the low half alone.
+    #[test]
+    fn select_guard_div_zero_i128_without_high_half_fails_closed() {
+        let (mut isel, entry) = make_empty_isel();
+        define_vreg(&mut isel, Value(0), Type::I128);
+        let result = isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::GuardDivZero { obligation: None },
+                args: vec![Value(0)],
+                results: vec![],
+            },
+            entry,
+        );
+        assert!(
+            matches!(result, Err(X86ISelError::UndefinedValue(Value(0)))),
+            "got {result:?}"
+        );
+    }
+
     #[test]
     fn select_guard_null_emits_proof_only_carrier() {
         // Sentinel S5: GuardNull now lowers to the proof-only carrier
@@ -31151,6 +36996,168 @@ mod tests {
         let carrier = &entry_block.insts[0];
         assert_eq!(carrier.opcode, X86Opcode::TrapBoundsCheckExact);
         assert_eq!(carrier.operands[2], X86ISelOperand::Imm(bound as i64));
+    }
+
+    /// An aggregate `Select` whose arms are stack-slot addresses lowers to one
+    /// 64-bit `Cmovcc`, and its result is itself a known address — so a second
+    /// `Select` can take it as an arm.
+    ///
+    /// Before this, every aggregate `Select` refused, and WS7.2's trust-ir ->
+    /// native differential recorded 52 of its 240 x86 object rows as missing
+    /// support (DR-X86-AGGREGATE-SELECT-20261020).
+    #[test]
+    fn aggregate_select_of_two_slot_addresses_is_one_cmov() {
+        let (mut isel, entry) = make_empty_isel();
+        let aggregate = Type::Struct(vec![Type::I64, Type::I64]);
+        isel.set_stack_slots(vec![StackSlotInfo::new(16, 8), StackSlotInfo::new(16, 8)]);
+        // The arms as the adapter spells them: a StackAddr whose result type is
+        // the AGGREGATE the storage holds, not a pointer type.
+        for (slot, value) in [(0u32, Value(0)), (1, Value(1))] {
+            isel.value_types.insert(value, aggregate.clone());
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::StackAddr { slot },
+                    args: vec![],
+                    results: vec![value],
+                },
+                entry,
+            )
+            .unwrap();
+        }
+        define_vreg(&mut isel, Value(2), Type::B1);
+        let before = isel.func.blocks[&entry].insts.len();
+
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Select {
+                    cond: IntCC::NotEqual,
+                },
+                args: vec![Value(2), Value(0), Value(1)],
+                results: vec![Value(3)],
+            },
+            entry,
+        )
+        .unwrap();
+
+        let emitted = &isel.func.blocks[&entry].insts[before..];
+        assert_eq!(
+            count_x86_isel_opcode(emitted, X86Opcode::Cmovcc),
+            1,
+            "one 64-bit CMOV picks the address: {emitted:?}"
+        );
+        assert_eq!(
+            count_x86_isel_opcode(emitted, X86Opcode::Cmovcc32),
+            0,
+            "an address is 64 bits: {emitted:?}"
+        );
+        // The result carries the address contract every address-producing arm
+        // follows, so a consumer that requires a known address accepts it.
+        assert_eq!(isel.value_type(&Value(3)), Type::I64);
+        assert!(isel.pointer_values.contains(&Value(3)));
+
+        // A second Select over the first one's result: the fact chains.
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Select {
+                    cond: IntCC::NotEqual,
+                },
+                args: vec![Value(2), Value(3), Value(0)],
+                results: vec![Value(4)],
+            },
+            entry,
+        )
+        .unwrap();
+        assert!(isel.pointer_values.contains(&Value(4)));
+    }
+
+    /// The admission is `pointer_values`, not the type: an aggregate-typed
+    /// value this selector never defined from an address-producing opcode is
+    /// still refused, and the refusal NAMES which arm and why.
+    #[test]
+    fn aggregate_select_refuses_an_arm_that_is_not_a_known_address() {
+        let (mut isel, entry) = make_empty_isel();
+        let aggregate = Type::Struct(vec![Type::I64, Type::I64]);
+        isel.set_stack_slots(vec![StackSlotInfo::new(16, 8)]);
+        isel.value_types.insert(Value(0), aggregate.clone());
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::StackAddr { slot: 0 },
+                args: vec![],
+                results: vec![Value(0)],
+            },
+            entry,
+        )
+        .unwrap();
+        // Value(1) is aggregate-TYPED but holds no address this selector
+        // established.
+        define_vreg(&mut isel, Value(1), aggregate);
+        define_vreg(&mut isel, Value(2), Type::B1);
+
+        let error = isel
+            .select_instruction(
+                &Instruction {
+                    opcode: Opcode::Select {
+                        cond: IntCC::NotEqual,
+                    },
+                    args: vec![Value(2), Value(0), Value(1)],
+                    results: vec![Value(3)],
+                },
+                entry,
+            )
+            .expect_err("an arm with no established address must be refused");
+        let text = error.to_string();
+        assert!(text.contains("Value(1)"), "{text}");
+        assert!(
+            text.contains("address-producing opcode"),
+            "the refusal must name the missing fact, not just the type: {text}"
+        );
+    }
+
+    /// A `Copy` of a known address is a known address. Without this the fact
+    /// died at the first copy, and the adapter emits one for every aggregate it
+    /// hands on (`Copy` of a `StackAddr`), which is how the generated corpus's
+    /// aggregate `Select`s were refused with one arm proven and one not.
+    #[test]
+    fn copy_of_an_address_stays_an_address() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.set_stack_slots(vec![StackSlotInfo::new(16, 8)]);
+        isel.value_types
+            .insert(Value(0), Type::Struct(vec![Type::I64, Type::I64]));
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::StackAddr { slot: 0 },
+                args: vec![],
+                results: vec![Value(0)],
+            },
+            entry,
+        )
+        .unwrap();
+        assert!(isel.pointer_values.contains(&Value(0)));
+
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Copy,
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .unwrap();
+        assert!(isel.pointer_values.contains(&Value(1)));
+
+        // And a copy of an ordinary integer is NOT an address: the propagation
+        // is conditional on the source, not on reaching this arm.
+        define_vreg(&mut isel, Value(2), Type::I64);
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Copy,
+                args: vec![Value(2)],
+                results: vec![Value(3)],
+            },
+            entry,
+        )
+        .unwrap();
+        assert!(!isel.pointer_values.contains(&Value(3)));
     }
 
     #[test]
@@ -32297,6 +38304,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "target".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..7).map(Value).collect(),
                 results: vec![],
@@ -32363,6 +38371,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "target".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..8).map(Value).collect(),
                 results: vec![],
@@ -32412,6 +38421,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "target".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..6).map(Value).collect(),
                 results: vec![],
@@ -32452,6 +38462,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "ay_sat_contains4_masked".to_string(),
+                    binding: Default::default(),
                 },
                 args: (0..6).map(Value).collect(),
                 results: vec![Value(6)],
@@ -33197,6 +39208,502 @@ mod tests {
         assert!(isel.i128_high_map.contains_key(&Value(2)));
     }
 
+    /// The shift COUNT arrives as a NARROW scalar (`u32` in
+    /// `<u128>::unchecked_shl`): it must be zero-extended into a Gpr64 before
+    /// the 64-bit two-address `SubRR` / `CmpRI` consume it, or the post-RA
+    /// validator refutes the mixed-width tie (`tied-operand-value-mismatch`).
+    /// Pins: exactly one widening copy, placed before the first `SubRR`, and no
+    /// `SubRR` / `CmpRI` operand is the raw 32-bit count register.
+    #[test]
+    fn select_i128_shl_widens_a_narrow_shift_count_before_the_64bit_ops() {
+        let (mut isel, entry) = make_empty_isel();
+        define_i128_vreg(&mut isel, Value(0));
+        let count = define_vreg(&mut isel, Value(1), Type::I32);
+
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Ishl,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            entry,
+        )
+        .unwrap();
+
+        let insts = &isel.func.blocks[&entry].insts;
+        assert_eq!(
+            count_opcode(insts, X86Opcode::MovRR32),
+            1,
+            "one zero-extending 32->64 copy of the count"
+        );
+        let widen_idx = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::MovRR32)
+            .unwrap();
+        assert!(
+            matches!(&insts[widen_idx].operands[1], X86ISelOperand::VReg(v) if *v == count),
+            "the widening reads the raw count: {:?}",
+            insts[widen_idx].operands
+        );
+        let first_sub = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::SubRR)
+            .expect("the shl lowering subtracts the count from 64");
+        assert!(
+            widen_idx < first_sub,
+            "the widening must precede the 64-bit SubRR"
+        );
+        for inst in insts
+            .iter()
+            .filter(|inst| matches!(inst.opcode, X86Opcode::SubRR | X86Opcode::CmpRI))
+        {
+            assert!(
+                !inst
+                    .operands
+                    .iter()
+                    .any(|op| matches!(op, X86ISelOperand::VReg(v) if *v == count)),
+                "a 64-bit op reads the raw Gpr32 count: {:?}",
+                inst.operands
+            );
+        }
+        assert!(isel.i128_high_map.contains_key(&Value(2)));
+    }
+
+    // -----------------------------------------------------------------------
+    // i128 shifts by a constant amount (ruling OD-215)
+    // -----------------------------------------------------------------------
+
+    /// `Value(2) = opcode Value(0), Value(1)` with `Value(1)` the
+    /// `Iconst { ty: count_ty, imm }` the whole-function pre-scan records,
+    /// selected first as in a block, and the fold on or off. Returns the
+    /// selector, every row (the count's materialization included), the rows
+    /// the shift alone emitted, and the shifted value's (lo, hi) vregs.
+    fn select_i128_const_shift(
+        opcode: Opcode,
+        count_ty: Type,
+        imm: i64,
+        fold: bool,
+    ) -> (
+        X86InstructionSelector,
+        Vec<X86ISelInst>,
+        Vec<X86ISelInst>,
+        (VReg, VReg),
+    ) {
+        let (mut isel, entry) = make_empty_isel();
+        isel.set_i128_const_shift_fold(fold);
+        let lo = isel.new_vreg(RegClass::Gpr64);
+        let hi = isel.new_vreg(RegClass::Gpr64);
+        isel.define_i128_value(Value(0), lo, hi);
+        let count = Instruction {
+            opcode: Opcode::Iconst { ty: count_ty, imm },
+            args: vec![],
+            results: vec![Value(1)],
+        };
+        isel.seed_iconst_origins([std::slice::from_ref(&count)]);
+        isel.select_instruction(&count, entry).unwrap();
+        let before = isel.func.blocks[&entry].insts.len();
+        isel.select_instruction(
+            &Instruction {
+                opcode,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            entry,
+        )
+        .unwrap();
+        let all = isel.func.blocks[&entry].insts.clone();
+        let shift_rows = all[before..].to_vec();
+        (isel, all, shift_rows, (lo, hi))
+    }
+
+    /// A concrete evaluator of the rows the i128 shift lowerings emit, with the
+    /// Intel SDM meaning of each and independent of trust-cg-verify's SMT
+    /// transcription: `mov`, `mov imm` (a 32-bit destination zero-extends),
+    /// `movzx`, the 32-bit copy, `sub`, `or`, `shl`/`shr`/`sar` by an imm8 or
+    /// by CL (the count masked to 6 bits), `cmp r, imm` (ZF and CF) and
+    /// `cmove`/`cmovae`. Any other row, operand or condition panics.
+    fn eval_i128_shift_rows(rows: &[X86ISelInst], inputs: &[(VReg, u64)]) -> HashMap<VReg, u64> {
+        let mut vregs: HashMap<VReg, u64> = inputs.iter().copied().collect();
+        let (mut rcx, mut zf, mut cf) = (None::<u64>, None::<bool>, None::<bool>);
+        let read = |vregs: &HashMap<VReg, u64>, rcx: Option<u64>, op: &X86ISelOperand| match op {
+            X86ISelOperand::VReg(v) => *vregs
+                .get(v)
+                .unwrap_or_else(|| panic!("read of undefined {v:?}")),
+            X86ISelOperand::PReg(p) if *p == RCX => rcx.expect("RCX read before a write"),
+            X86ISelOperand::Imm(imm) => *imm as u64,
+            other => panic!("unexpected operand {other:?}"),
+        };
+        let width = |op: &X86ISelOperand| match op {
+            X86ISelOperand::VReg(VReg {
+                class: RegClass::Gpr32,
+                ..
+            }) => u64::from(u32::MAX),
+            X86ISelOperand::VReg(VReg {
+                class: RegClass::Gpr64,
+                ..
+            })
+            | X86ISelOperand::PReg(_) => u64::MAX,
+            other => panic!("unexpected destination {other:?}"),
+        };
+        for row in rows {
+            let ops = &row.operands;
+            let value = match (row.opcode, ops.as_slice()) {
+                (X86Opcode::MovRR | X86Opcode::MovRI, [_, src]) => read(&vregs, rcx, src),
+                (X86Opcode::MovRR32, [_, src]) => read(&vregs, rcx, src) & u64::from(u32::MAX),
+                (X86Opcode::Movzx, [_, src]) => read(&vregs, rcx, src) & 0xff,
+                (X86Opcode::MovzxW, [_, src]) => read(&vregs, rcx, src) & 0xffff,
+                (X86Opcode::SubRR, [_, a, b]) => {
+                    read(&vregs, rcx, a).wrapping_sub(read(&vregs, rcx, b))
+                }
+                (X86Opcode::OrRR, [_, a, b]) => read(&vregs, rcx, a) | read(&vregs, rcx, b),
+                (
+                    X86Opcode::ShlRI | X86Opcode::ShrRI | X86Opcode::SarRI,
+                    [_, src, X86ISelOperand::Imm(count)],
+                ) => {
+                    let (x, k) = (read(&vregs, rcx, src), (*count as u32) & 63);
+                    match row.opcode {
+                        X86Opcode::ShlRI => x << k,
+                        X86Opcode::ShrRI => x >> k,
+                        _ => ((x as i64) >> k) as u64,
+                    }
+                }
+                (X86Opcode::ShlRR | X86Opcode::ShrRR | X86Opcode::SarRR, [dst]) => {
+                    let (x, k) = (
+                        read(&vregs, rcx, dst),
+                        (rcx.expect("CL read before a write") as u32) & 63,
+                    );
+                    match row.opcode {
+                        X86Opcode::ShlRR => x << k,
+                        X86Opcode::ShrRR => x >> k,
+                        _ => ((x as i64) >> k) as u64,
+                    }
+                }
+                (X86Opcode::CmpRI, [a, b]) => {
+                    let (a, b) = (read(&vregs, rcx, a), read(&vregs, rcx, b));
+                    zf = Some(a == b);
+                    cf = Some(a < b);
+                    continue;
+                }
+                (X86Opcode::Cmovcc, [dst, src, X86ISelOperand::CondCode(cc)]) => {
+                    let taken = match cc {
+                        X86CondCode::E => zf.expect("ZF read before a cmp"),
+                        X86CondCode::AE => !cf.expect("CF read before a cmp"),
+                        other => panic!("unexpected condition {other:?}"),
+                    };
+                    if taken {
+                        read(&vregs, rcx, src)
+                    } else {
+                        read(&vregs, rcx, dst)
+                    }
+                }
+                _ => panic!("unexpected row {row:?}"),
+            };
+            let dst = &ops[0];
+            let value = value & width(dst);
+            match dst {
+                X86ISelOperand::VReg(v) => {
+                    vregs.insert(*v, value);
+                }
+                X86ISelOperand::PReg(p) if *p == RCX => rcx = Some(value),
+                other => panic!("unexpected destination {other:?}"),
+            }
+        }
+        vregs
+    }
+
+    /// Run `rows` with the shifted value `x` in `(lo, hi)` and read the
+    /// 128-bit `Value(2)` back from the selector's pair.
+    fn run_i128_shift(
+        isel: &X86InstructionSelector,
+        rows: &[X86ISelInst],
+        (lo, hi): (VReg, VReg),
+        x: u128,
+    ) -> u128 {
+        let vregs = eval_i128_shift_rows(rows, &[(lo, x as u64), (hi, (x >> 64) as u64)]);
+        let half = |op: &X86ISelOperand| match op {
+            X86ISelOperand::VReg(v) => vregs[v],
+            other => panic!("{other:?}"),
+        };
+        let lo = half(&isel.value_map[&Value(2)]);
+        let hi = half(&isel.i128_high_map[&Value(2)]);
+        (u128::from(hi) << 64) | u128::from(lo)
+    }
+
+    /// Edge and patterned 128-bit values: every sign bit (bit 127 and the
+    /// low limb's bit 63) set and clear, the limb boundary, and patterns.
+    fn i128_shift_values() -> Vec<u128> {
+        let mut values = vec![
+            0,
+            1,
+            u128::MAX,
+            1 << 127,
+            (1 << 127) - 1,
+            (1 << 127) | 1,
+            1 << 63,
+            1 << 64,
+            (1 << 64) - 1,
+            (1 << 127) | (1 << 63),
+            u128::MAX ^ (1 << 63),
+            0x5555_5555_5555_5555_5555_5555_5555_5555,
+            0xaaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa,
+            0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+            0xfedc_ba98_7654_3210_0123_4567_89ab_cdef,
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u128;
+        for _ in 0..9 {
+            state = state
+                .wrapping_mul(0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645)
+                .wrapping_add(0x5851_f42d_4c95_7f2d);
+            values.push(state);
+        }
+        values
+    }
+
+    fn rust_i128_shift(opcode: &Opcode, x: u128, amount: u32) -> u128 {
+        match opcode {
+            Opcode::Ishl => x << amount,
+            Opcode::Ushr => x >> amount,
+            Opcode::Sshr => ((x as i128) >> amount) as u128,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// FAILS BEFORE OD-215. `Ushr x, 64` (the high-limb extraction of every
+    /// u128 `widening_mul`, `carrying_mul`, Display and the adapter's i128
+    /// switch) took the general count-in-RCX path: 25 rows with three `cmov`s
+    /// and four shifts by CL. It is now one move of the high half and a zero.
+    #[test]
+    fn i128_ushr_by_64_is_a_move_of_halves_not_the_cl_cmov_ladder() {
+        let (isel, _, rows, (_, hi)) = select_i128_const_shift(Opcode::Ushr, Type::I128, 64, true);
+        let opcodes: Vec<X86Opcode> = rows.iter().map(|row| row.opcode).collect();
+        assert_eq!(opcodes, [X86Opcode::MovRR, X86Opcode::MovRI], "{rows:?}");
+        assert_eq!(rows[0].operands[1], X86ISelOperand::VReg(hi));
+        assert_eq!(rows[1].operands[1], X86ISelOperand::Imm(0));
+        assert_eq!(isel.value_map[&Value(2)], rows[0].operands[0]);
+        assert_eq!(isel.i128_high_map[&Value(2)], rows[1].operands[0]);
+
+        // The general path the fold replaces, as every amount took it before.
+        let (_, _, ladder, _) = select_i128_const_shift(Opcode::Ushr, Type::I128, 64, false);
+        assert_eq!(ladder.len(), 25, "{ladder:?}");
+        assert_eq!(count_opcode(&ladder, X86Opcode::Cmovcc), 3);
+        assert_eq!(count_opcode(&ladder, X86Opcode::ShrRR), 3);
+        assert_eq!(count_opcode(&ladder, X86Opcode::ShlRR), 1);
+        assert!(
+            ladder
+                .iter()
+                .any(|row| row.operands.first() == Some(&X86ISelOperand::PReg(RCX)))
+        );
+    }
+
+    /// Every defined amount (0 through 127) of every 128-bit shift, by an
+    /// `I128`, `I64`, `I32` or `I8` constant: the folded rows are the
+    /// documented case split (two rows at 0, 64 and above, four below 64;
+    /// only `mov`, `mov imm`, `shl`/`shr`/`sar imm` and `or` of fresh 64-bit
+    /// registers, no count register), and they compute Rust's 128-bit shift
+    /// on every value of [`i128_shift_values`], as the general path does.
+    /// Exhaustive in the amount and the operation; sampled in the value.
+    #[test]
+    fn i128_constant_shifts_compute_rusts_shift_at_every_defined_amount() {
+        let values = i128_shift_values();
+        let mut checked = 0usize;
+        for opcode in [Opcode::Ishl, Opcode::Ushr, Opcode::Sshr] {
+            for amount in 0u32..128 {
+                for count_ty in [Type::I128, Type::I64, Type::I32, Type::I8] {
+                    let what = format!("{opcode:?} by {count_ty:?} {amount}");
+                    let (isel, all, rows, pair) = select_i128_const_shift(
+                        opcode.clone(),
+                        count_ty.clone(),
+                        amount.into(),
+                        true,
+                    );
+                    let expected_rows = if amount != 0 && amount < 64 { 4 } else { 2 };
+                    assert_eq!(rows.len(), expected_rows, "{what}: {rows:?}");
+                    for row in &rows {
+                        assert!(
+                            matches!(
+                                row.opcode,
+                                X86Opcode::MovRR
+                                    | X86Opcode::MovRI
+                                    | X86Opcode::ShlRI
+                                    | X86Opcode::ShrRI
+                                    | X86Opcode::SarRI
+                                    | X86Opcode::OrRR
+                            ),
+                            "{what}: {row:?}"
+                        );
+                        for operand in &row.operands {
+                            assert!(
+                                !matches!(operand, X86ISelOperand::PReg(_)),
+                                "{what}: {row:?}"
+                            );
+                            if let X86ISelOperand::VReg(v) = operand {
+                                assert_eq!(v.class, RegClass::Gpr64, "{what}: {row:?}");
+                            }
+                        }
+                        if let [_, _, X86ISelOperand::Imm(count)] = row.operands.as_slice() {
+                            assert!((1..64).contains(count), "{what}: {row:?}");
+                        }
+                    }
+                    let (ladder_isel, ladder_all, _, ladder_pair) = select_i128_const_shift(
+                        opcode.clone(),
+                        count_ty.clone(),
+                        amount.into(),
+                        false,
+                    );
+                    for &x in &values {
+                        let want = rust_i128_shift(&opcode, x, amount);
+                        assert_eq!(
+                            run_i128_shift(&isel, &all, pair, x),
+                            want,
+                            "{what} of {x:#x}"
+                        );
+                        assert_eq!(
+                            run_i128_shift(&ladder_isel, &ladder_all, ladder_pair, x),
+                            want,
+                            "{what} of {x:#x} (general path)"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 128 * 4 * values.len());
+    }
+
+    /// A narrow count's immediate is read at its own width, as the general
+    /// path's zero extension reads it: an `I8` 0x140 is 64, an `I16` 0x10041
+    /// is 65, an `I32` 2^32 + 1 is 1, and the folded and general paths agree.
+    #[test]
+    fn a_narrow_constant_count_is_read_at_its_width() {
+        let values = i128_shift_values();
+        for (count_ty, imm, amount) in [
+            (Type::I8, 0x140, 64),
+            (Type::I16, 0x1_0041, 65),
+            (Type::I32, 0x1_0000_0001, 1),
+            (Type::I8, -1, 255),
+        ] {
+            for opcode in [Opcode::Ishl, Opcode::Ushr, Opcode::Sshr] {
+                let (isel, all, rows, pair) =
+                    select_i128_const_shift(opcode.clone(), count_ty.clone(), imm, true);
+                let (ladder_isel, ladder_all, _, ladder_pair) =
+                    select_i128_const_shift(opcode.clone(), count_ty.clone(), imm, false);
+                if amount >= 128 {
+                    assert_eq!(count_opcode(&rows, X86Opcode::Cmovcc), 3, "{rows:?}");
+                    continue;
+                }
+                for &x in &values {
+                    let want = rust_i128_shift(&opcode, x, amount);
+                    assert_eq!(run_i128_shift(&isel, &all, pair, x), want);
+                    assert_eq!(
+                        run_i128_shift(&ladder_isel, &ladder_all, ladder_pair, x),
+                        want
+                    );
+                }
+            }
+        }
+    }
+
+    /// An amount trust-ir leaves undefined (128 or more at the count's own
+    /// type) and a `B1` count are not folded: their rows are the general
+    /// path's, byte for byte, with the fold on or off.
+    #[test]
+    fn undefined_or_untracked_constant_amounts_keep_the_general_path_byte_for_byte() {
+        for (count_ty, imm) in [
+            (Type::I128, 128),
+            (Type::I128, -1),
+            (Type::I128, i64::MAX),
+            (Type::I64, 128),
+            (Type::I64, -64),
+            (Type::I32, 200),
+            (Type::I32, -1),
+            (Type::I16, 0x80),
+            (Type::I8, -128),
+            (Type::B1, 1),
+        ] {
+            for opcode in [Opcode::Ishl, Opcode::Ushr, Opcode::Sshr] {
+                let (_, folded, rows, _) =
+                    select_i128_const_shift(opcode.clone(), count_ty.clone(), imm, true);
+                let (_, general, _, _) =
+                    select_i128_const_shift(opcode.clone(), count_ty.clone(), imm, false);
+                assert_eq!(
+                    format!("{folded:?}"),
+                    format!("{general:?}"),
+                    "{opcode:?} by {count_ty:?} {imm}"
+                );
+                assert_eq!(count_opcode(&rows, X86Opcode::Cmovcc), 3, "{rows:?}");
+            }
+        }
+    }
+
+    /// `Ushr x, Iconst128 { lo, hi }` (the adapter's spelling of a bit
+    /// intrinsic's 128-bit amount): folded exactly when the 128-bit value
+    /// `hi:lo` is below 128, as Rust's shift there; general otherwise.
+    #[test]
+    fn a_wide_constant_count_folds_only_when_its_128_bit_value_is_defined() {
+        let values = i128_shift_values();
+        for (lo, hi, folds) in [
+            (64, 0, true),
+            (0, 0, true),
+            (127, 0, true),
+            (128, 0, false),
+            (64, 1, false),
+            (-1, -1, false),
+        ] {
+            for fold in [true, false] {
+                let (mut isel, entry) = make_empty_isel();
+                isel.set_i128_const_shift_fold(fold);
+                let (x_lo, x_hi) = (
+                    isel.new_vreg(RegClass::Gpr64),
+                    isel.new_vreg(RegClass::Gpr64),
+                );
+                isel.define_i128_value(Value(0), x_lo, x_hi);
+                let count = Instruction {
+                    opcode: Opcode::Iconst128 { lo, hi },
+                    args: vec![],
+                    results: vec![Value(1)],
+                };
+                isel.seed_iconst_origins([std::slice::from_ref(&count)]);
+                isel.select_instruction(&count, entry).unwrap();
+                isel.select_instruction(
+                    &Instruction {
+                        opcode: Opcode::Ushr,
+                        args: vec![Value(0), Value(1)],
+                        results: vec![Value(2)],
+                    },
+                    entry,
+                )
+                .unwrap();
+                let all = isel.func.blocks[&entry].insts.clone();
+                let cmovs = count_opcode(&all, X86Opcode::Cmovcc);
+                assert_eq!(
+                    cmovs,
+                    if folds && fold { 0 } else { 3 },
+                    "{lo} {hi}: {all:?}"
+                );
+                if folds {
+                    for &x in &values {
+                        assert_eq!(
+                            run_i128_shift(&isel, &all, (x_lo, x_hi), x),
+                            x >> (lo as u32),
+                            "{lo} {hi} of {x:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `TCG_NO_X86_I128_CONST_SHIFT` reads as the jump table's opt-out does:
+    /// unset or `0` folds. (The variable is not set in the test process.)
+    #[test]
+    fn the_constant_shift_fold_is_on_by_default() {
+        if std::env::var_os("TCG_NO_X86_I128_CONST_SHIFT").is_none() {
+            assert!(x86_i128_const_shift_fold_enabled());
+            let (isel, _) = make_empty_isel();
+            assert!(isel.fold_i128_const_shifts);
+        }
+    }
+
     /// i128 sdiv/udiv/srem/urem lower to the corresponding SysV compiler-rt
     /// libcall: the (lo, hi) operand pairs are placed into RDI:RSI / RDX:RCX,
     /// a CALL to the libcall symbol is emitted, and the RAX:RDX result pair is
@@ -33238,6 +39745,18 @@ mod tests {
                 X86CallResultReg::new(RAX, 64),
                 X86CallResultReg::new(RDX, 64),
             ])
+        );
+        // The four argument registers are the call's declared implicit uses,
+        // as for every other call (the allocator's MISCOMPILE #53 guard and
+        // the x86-64 body theorem's call check read them).
+        assert_eq!(
+            insts[call_idx].call_arg_regs,
+            vec![
+                X86CallArgReg::new(RDI, 64),
+                X86CallArgReg::new(RSI, 64),
+                X86CallArgReg::new(RDX, 64),
+                X86CallArgReg::new(RCX, 64),
+            ]
         );
 
         // Argument register-pair moves precede the CALL: dividend in RDI:RSI,
@@ -33519,6 +40038,7 @@ mod tests {
         isel.select_instruction(
             &Instruction {
                 opcode: Opcode::Invoke {
+                    binding: crate::instructions::DirectCallBinding::Interposable,
                     name: "may_throw".to_string(),
                     normal_dest,
                     unwind_dest,
@@ -33599,6 +40119,7 @@ mod tests {
         isel.select_instruction(
             &Instruction {
                 opcode: Opcode::Invoke {
+                    binding: crate::instructions::DirectCallBinding::Interposable,
                     name: "void_throwing".to_string(),
                     normal_dest,
                     unwind_dest,
@@ -33797,5 +40318,529 @@ mod tests {
         );
 
         assert!(result.is_err(), "Resume with no args should fail closed");
+    }
+
+    // -----------------------------------------------------------------------
+    // THE System V argument placement (`x86_sysv_param_locations`) and the two
+    // sides that read it.
+    // -----------------------------------------------------------------------
+
+    fn sysv_locations(params: &[Type], sret: bool) -> Vec<X86ParamLocation> {
+        x86_sysv_param_locations(params, sret).expect("supported System V signature")
+    }
+
+    fn stack_at(offset: i64, eightbytes: u32, copy_bytes: u32) -> X86ParamLocation {
+        X86ParamLocation::Stack {
+            offset,
+            eightbytes,
+            copy_bytes,
+        }
+    }
+
+    fn gpr_lanes(indexes_and_bytes: &[(u8, u32)]) -> X86ParamLocation {
+        X86ParamLocation::Lanes(
+            indexes_and_bytes
+                .iter()
+                .enumerate()
+                .map(|(eightbyte, (index, valid_bytes))| X86ParamLane {
+                    sse: false,
+                    index: *index,
+                    offset: eightbyte as u32 * 8,
+                    valid_bytes: *valid_bytes,
+                })
+                .collect(),
+        )
+    }
+
+    /// Each row is stated from the System V AMD64 psABI §3.2.3 (and what LLVM
+    /// emits for the same IR), not read off the implementation.
+    #[test]
+    fn x86_sysv_param_locations_table() {
+        let i64s = |n: usize| vec![Type::I64; n];
+        let with = |mut head: Vec<Type>, tail: &[Type]| {
+            head.extend_from_slice(tail);
+            head
+        };
+        let pair = Type::Struct(vec![Type::I64, Type::I64]);
+
+        // A two-eightbyte INTEGER aggregate that exactly fits the last two
+        // GPRs takes them (R8, R9).
+        let locs = sysv_locations(&with(i64s(4), std::slice::from_ref(&pair)), false);
+        assert_eq!(locs[4], gpr_lanes(&[(4, 8), (5, 8)]));
+
+        // With ONE GPR left it goes wholly to the stack (never split), R9 stays
+        // free, and a later INTEGER scalar back-fills R9.
+        let locs = sysv_locations(&with(i64s(5), &[pair.clone(), Type::I64]), false);
+        assert_eq!(locs[5], stack_at(0, 2, 16));
+        assert_eq!(locs[6], X86ParamLocation::Gpr(5));
+
+        // `{i64, i64}` and `[i64; 2]` are ordinary two-lane register
+        // aggregates: no separate two-GPR rule exists.
+        assert_eq!(
+            sysv_locations(std::slice::from_ref(&pair), false)[0],
+            gpr_lanes(&[(0, 8), (1, 8)])
+        );
+        assert_eq!(
+            sysv_locations(&[Type::Array(Box::new(Type::I64), 2)], false)[0],
+            gpr_lanes(&[(0, 8), (1, 8)])
+        );
+
+        // An i128 with one GPR left goes to the stack, 16-aligned (the
+        // eightbyte before it is skipped), and the scalar after it follows.
+        let locs = sysv_locations(&with(i64s(5), &[Type::I64, Type::I128, Type::I64]), false);
+        assert_eq!(locs[5], X86ParamLocation::Gpr(5));
+        let locs = sysv_locations(&with(i64s(7), &[Type::I128, Type::I64]), false);
+        assert_eq!(locs[6], stack_at(0, 1, 8));
+        assert_eq!(locs[7], stack_at(16, 2, 16));
+        assert_eq!(locs[8], stack_at(32, 1, 8));
+        // In registers it takes two consecutive GPRs, low half first.
+        assert_eq!(
+            sysv_locations(&[Type::I64, Type::I128], false)[1],
+            X86ParamLocation::GprPair { lo: 1, hi: 2 }
+        );
+
+        // Eight doubles fill XMM0-7; the ninth float argument takes one
+        // eightbyte of stack and the next one the eightbyte after it.
+        let mut floats = vec![Type::F64; 8];
+        floats.extend([Type::F32, Type::F64, Type::V128]);
+        let locs = sysv_locations(&floats, false);
+        assert_eq!(locs[7], X86ParamLocation::Xmm(7));
+        assert_eq!(locs[8], stack_at(0, 1, 4));
+        assert_eq!(locs[9], stack_at(8, 1, 8));
+        // A V128 on the stack is 16-aligned and two eightbytes.
+        assert_eq!(locs[10], stack_at(16, 2, 16));
+
+        // A mixed `{f64, i64}` needs one XMM AND one GPR: with the GPRs
+        // exhausted it goes wholly to the stack while XMM0 stays free, and a
+        // later double back-fills XMM0.
+        let mixed = Type::Struct(vec![Type::F64, Type::I64]);
+        let locs = sysv_locations(&with(i64s(6), &[mixed.clone(), Type::F64]), false);
+        assert_eq!(locs[6], stack_at(0, 2, 16));
+        assert_eq!(locs[7], X86ParamLocation::Xmm(0));
+        // In registers its SSE eightbyte takes an XMM and its INTEGER one a GPR.
+        assert_eq!(
+            sysv_locations(&[mixed], false)[0],
+            X86ParamLocation::Lanes(vec![
+                X86ParamLane {
+                    sse: true,
+                    index: 0,
+                    offset: 0,
+                    valid_bytes: 8
+                },
+                X86ParamLane {
+                    sse: false,
+                    index: 0,
+                    offset: 8,
+                    valid_bytes: 8
+                },
+            ])
+        );
+
+        // The hidden return buffer takes RDI, so the first argument is RSI.
+        assert_eq!(
+            sysv_locations(&[Type::I64], true)[0],
+            X86ParamLocation::Gpr(1)
+        );
+        // ... and the aggregate fit counts it: four I64 after the buffer leave
+        // only R9 for a two-eightbyte aggregate.
+        let locs = sysv_locations(&with(i64s(4), &[pair.clone(), Type::I64]), true);
+        assert_eq!(locs[4], stack_at(0, 2, 16));
+        assert_eq!(locs[5], X86ParamLocation::Gpr(5));
+
+        // A 24-byte MEMORY-class aggregate is copied onto the stack, 8-aligned,
+        // and takes no register; the next INTEGER argument still gets RDI.
+        let memory = Type::Struct(vec![Type::I64, Type::I64, Type::I64]);
+        let locs = sysv_locations(&[memory, Type::I64], false);
+        assert_eq!(locs[0], stack_at(0, 3, 24));
+        assert_eq!(locs[1], X86ParamLocation::Gpr(0));
+
+        // A 16-aligned MEMORY-class aggregate is 16-aligned on the stack.
+        let aligned = Type::Struct(vec![Type::I128, Type::I64]);
+        assert_eq!(aligned.bytes(), 32);
+        let locs = sysv_locations(&with(i64s(7), &[aligned]), false);
+        assert_eq!(locs[6], stack_at(0, 1, 8));
+        assert_eq!(locs[7], stack_at(16, 4, 32));
+
+        // A single-GPR aggregate at exhaustion is one eightbyte of stack whose
+        // only live bytes are its own four.
+        let locs = sysv_locations(&with(i64s(6), &[Type::Struct(vec![Type::I32])]), false);
+        assert_eq!(locs[6], stack_at(0, 1, 4));
+
+        // A 12-byte register aggregate that overflows CONSUMES two eightbytes
+        // but only its own 12 bytes are the object's.
+        let three = Type::Struct(vec![Type::I32, Type::I32, Type::I32]);
+        let locs = sysv_locations(&with(i64s(6), &[three.clone(), Type::I32]), false);
+        assert_eq!(locs[6], stack_at(0, 2, 12));
+        assert_eq!(locs[7], stack_at(16, 1, 4));
+        // In registers it is one full and one 4-byte INTEGER eightbyte.
+        assert_eq!(
+            sysv_locations(&[three], false)[0],
+            gpr_lanes(&[(0, 8), (1, 4)])
+        );
+
+        // LLVM `byval` (rustc `Indirect { on_stack: true }`): the flagged value
+        // takes the next stack slot whatever its class — a 16-byte INTEGER pair
+        // with every register free included — and consumes no register, so the
+        // next INTEGER value still gets RDI.
+        let locs = x86_sysv_param_locations_with_byval(&[pair.clone(), Type::I64], &[true], false)
+            .unwrap();
+        assert_eq!(locs[0], stack_at(0, 2, 16));
+        assert_eq!(locs[1], X86ParamLocation::Gpr(0));
+        // A 16-aligned byval at an odd eightbyte skips to the next 16 bytes.
+        let aligned = Type::Struct(vec![Type::I128, Type::I64]);
+        let locs = x86_sysv_param_locations_with_byval(
+            &with(i64s(7), &[aligned, Type::I64]),
+            &[false, false, false, false, false, false, false, true],
+            false,
+        )
+        .unwrap();
+        assert_eq!(locs[6], stack_at(0, 1, 8));
+        assert_eq!(locs[7], stack_at(16, 4, 32));
+        assert_eq!(locs[8], stack_at(48, 1, 8));
+    }
+
+    /// A System V caller copies a stack-passed aggregate as ITS OWN bytes.
+    ///
+    /// The psABI leaves the bytes past an aggregate unspecified: the caller
+    /// may read only the object's own bytes. A 12-byte register aggregate that
+    /// overflows to the stack consumes two eightbytes of the argument area, and
+    /// the copy must still read bytes 0..12 of the object — never 16, which
+    /// reads four bytes past it (measured before the fix: two 8-byte loads at
+    /// +0 and +8).
+    #[test]
+    fn register_aggregate_stack_overflow_copies_only_its_bytes() {
+        let aggregate_ty = Type::Struct(vec![Type::I32, Type::I32, Type::I32]);
+        assert_eq!(aggregate_ty.bytes(), 12);
+        let caller_sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel =
+            X86InstructionSelector::with_abi("caller".to_string(), caller_sig, X86CallAbi::SystemV);
+        let entry = Block(0);
+        let aggregate_value = Value(6);
+        isel.func.ensure_block(entry);
+        isel.set_stack_slots(vec![StackSlotInfo::new(12, 4)]);
+        isel.seed_value_types(&HashMap::from([(aggregate_value, aggregate_ty)]));
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::StackAddr { slot: 0 },
+                args: vec![],
+                results: vec![aggregate_value],
+            },
+            entry,
+        )
+        .unwrap();
+        for i in 0..6u32 {
+            define_vreg(&mut isel, Value(i), Type::I64);
+        }
+        let args: Vec<Value> = (0..7u32).map(Value).collect();
+        isel.lower_call(
+            "callee",
+            &Instruction {
+                opcode: Opcode::Call {
+                    name: "callee".to_string(),
+                    binding: Default::default(),
+                },
+                args,
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let aggregate_addr = insts[0].operands[0].clone();
+        let mut read = Vec::new();
+        for inst in insts {
+            if let Some(X86ISelOperand::MemAddr { base, disp }) = inst.operands.get(1)
+                && **base == aggregate_addr
+            {
+                let width = sysv_test_memory_access_bytes(inst.opcode)
+                    .unwrap_or_else(|| panic!("unclassified load {inst:?}"));
+                read.push((*disp, width));
+            }
+        }
+        read.sort_unstable();
+        assert_eq!(
+            read,
+            vec![(0, 8), (8, 4)],
+            "the call side must read exactly the 12 bytes of the aggregate: {insts:?}"
+        );
+    }
+
+    /// The byte width of a plain move to or from memory, for the placement
+    /// tests below. `None` for an opcode they do not classify, which the tests
+    /// turn into a failure rather than guess.
+    fn sysv_test_memory_access_bytes(opcode: X86Opcode) -> Option<i64> {
+        Some(match opcode {
+            X86Opcode::MovMR8 | X86Opcode::MovRM8 => 1,
+            X86Opcode::MovMR16 | X86Opcode::MovRM16 => 2,
+            X86Opcode::MovMR32 | X86Opcode::MovRM32 | X86Opcode::MovssMR | X86Opcode::MovssRM => 4,
+            X86Opcode::MovMR | X86Opcode::MovRM | X86Opcode::MovsdMR | X86Opcode::MovsdRM => 8,
+            X86Opcode::MovdqaMR
+            | X86Opcode::MovdquMR
+            | X86Opcode::MovdqaRM
+            | X86Opcode::MovdquRM => 16,
+            _ => return None,
+        })
+    }
+
+    /// The argument registers and outgoing/incoming stack bytes one placement
+    /// occupies: `(GPR64 / XMM registers, stack byte offsets)`.
+    fn sysv_expected_homes(
+        locations: &[X86ParamLocation],
+        sret: bool,
+    ) -> (HashSet<X86PReg>, HashSet<i64>) {
+        let mut regs = HashSet::new();
+        let mut bytes = HashSet::new();
+        if sret {
+            regs.insert(RDI);
+        }
+        for location in locations {
+            match location {
+                X86ParamLocation::Gpr(index) => {
+                    regs.insert(X86_ARG_GPRS[usize::from(*index)]);
+                }
+                X86ParamLocation::GprPair { lo, hi } => {
+                    regs.insert(X86_ARG_GPRS[usize::from(*lo)]);
+                    regs.insert(X86_ARG_GPRS[usize::from(*hi)]);
+                }
+                X86ParamLocation::Xmm(index) => {
+                    regs.insert(X86_ARG_XMMS[usize::from(*index)]);
+                }
+                X86ParamLocation::Lanes(lanes) => {
+                    for lane in lanes {
+                        let file: &[X86PReg] = if lane.sse {
+                            &X86_ARG_XMMS
+                        } else {
+                            &X86_ARG_GPRS
+                        };
+                        regs.insert(file[usize::from(lane.index)]);
+                    }
+                }
+                X86ParamLocation::Stack {
+                    offset, copy_bytes, ..
+                } => {
+                    bytes.extend(*offset..*offset + i64::from(*copy_bytes));
+                }
+            }
+        }
+        (regs, bytes)
+    }
+
+    fn sysv_argument_register(reg: X86PReg) -> Option<X86PReg> {
+        if X86_ARG_XMMS.contains(&reg) {
+            return Some(reg);
+        }
+        trust_cg_ir::x86_64_regs::x86_containing_gpr64(reg).filter(|r| X86_ARG_GPRS.contains(r))
+    }
+
+    /// Both sides of the selector place every argument where
+    /// `x86_sysv_param_locations` says, over random System V signatures.
+    ///
+    /// For each signature this lowers a CALL and a callee's FORMALS and reads
+    /// what each emitted: the argument registers the call writes and the
+    /// outgoing stack bytes it stores (base `RSP`), and the argument registers
+    /// the callee reads and the incoming stack it touches (base `RBP`, from
+    /// offset 16). Each must equal the one placement's answer. The placement
+    /// function itself is held to the psABI by `x86_sysv_param_locations_table`;
+    /// this holds the two emitters to it.
+    #[test]
+    fn x86_sysv_placement_matches_both_sides_randomized() {
+        let pool: Vec<Type> = vec![
+            Type::I8,
+            Type::I16,
+            Type::I32,
+            Type::I64,
+            Type::I128,
+            Type::F32,
+            Type::F64,
+            Type::V128,
+            Type::B1,
+            Type::Struct(vec![Type::I32]),
+            Type::Array(Box::new(Type::I64), 1),
+            Type::Struct(vec![Type::I8, Type::I8]),
+            Type::Struct(vec![Type::I64, Type::I64]),
+            Type::Array(Box::new(Type::I64), 2),
+            Type::Struct(vec![Type::I64, Type::F64]),
+            Type::Struct(vec![Type::F64, Type::I64]),
+            Type::Struct(vec![Type::F64, Type::F64]),
+            Type::Struct(vec![Type::F32, Type::F32]),
+            Type::Struct(vec![Type::I32, Type::I32, Type::I32]),
+            Type::Struct(vec![Type::F32, Type::F32, Type::F32]),
+            Type::Struct(vec![Type::I64, Type::I64, Type::I64]),
+            Type::Array(Box::new(Type::I8), 40),
+            Type::Struct(vec![Type::I128]),
+            Type::Struct(vec![Type::I128, Type::I64]),
+            Type::Struct(vec![Type::I8, Type::I16]),
+            Type::Array(Box::new(Type::I8), 3),
+            Type::Array(Box::new(Type::I8), 5),
+            Type::Array(Box::new(Type::I32), 3),
+            Type::Struct(vec![Type::V128]),
+        ];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |n: usize| -> usize {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+        let is_aggregate =
+            |ty: &Type| matches!(ty, Type::Struct(_) | Type::Array(_, _) | Type::Enum { .. });
+        let mut checked = (0usize, 0usize);
+        for trial in 0..4000 {
+            let len = next(15);
+            let params: Vec<Type> = (0..len).map(|_| pool[next(pool.len())].clone()).collect();
+            let sret = next(4) == 0;
+            let ret_ty = Type::Struct(vec![Type::I64, Type::I64, Type::I64]);
+            let locations = sysv_locations(&params, sret);
+            let (want_regs, want_bytes) = sysv_expected_homes(&locations, sret);
+            let context =
+                format!("trial {trial}: sret={sret} params={params:?} placement={locations:?}");
+
+            // Formal side.
+            let sig = Signature {
+                params: params.clone(),
+                returns: if sret { vec![ret_ty.clone()] } else { vec![] },
+            };
+            let mut isel = X86InstructionSelector::with_abi(
+                format!("formal_{trial}"),
+                sig.clone(),
+                X86CallAbi::SystemV,
+            );
+            isel.lower_formal_arguments(&sig, Block(0))
+                .unwrap_or_else(|e| panic!("{context}: formals refused: {e:?}"));
+            let mut read_regs = HashSet::new();
+            let mut read_starts = HashSet::new();
+            for inst in &isel.func.blocks[&Block(0)].insts {
+                if let Some(X86ISelOperand::PReg(reg)) = inst.operands.get(1)
+                    && let Some(arg) = sysv_argument_register(*reg)
+                {
+                    read_regs.insert(arg);
+                }
+                for operand in &inst.operands {
+                    if let X86ISelOperand::MemAddr { base, disp } = operand
+                        && **base == X86ISelOperand::PReg(RBP)
+                    {
+                        read_starts.insert(i64::from(*disp) - SYSV_INCOMING_ARGS_RBP_OFFSET);
+                    }
+                }
+            }
+            assert_eq!(read_regs, want_regs, "{context}: formal argument registers");
+            // Every incoming stack access starts on a byte the placement gives
+            // an argument, and every stack-placed argument is reached.
+            for start in &read_starts {
+                assert!(
+                    want_bytes.contains(start),
+                    "{context}: formal reads [RBP+16+{start}]"
+                );
+            }
+            for location in &locations {
+                if let X86ParamLocation::Stack { offset, .. } = location {
+                    assert!(
+                        read_starts.contains(offset),
+                        "{context}: no formal access to the stack argument at +{offset}"
+                    );
+                }
+            }
+            checked.0 += 1;
+
+            // Call side.
+            let mut isel = X86InstructionSelector::with_abi(
+                format!("call_{trial}"),
+                Signature {
+                    params: vec![],
+                    returns: vec![],
+                },
+                X86CallAbi::SystemV,
+            );
+            let entry = Block(0);
+            isel.func.ensure_block(entry);
+            let mut slots = Vec::new();
+            let mut types = HashMap::new();
+            let mut aggregates = Vec::new();
+            for (i, ty) in params.iter().enumerate() {
+                if is_aggregate(ty) {
+                    aggregates.push((Value(i as u32), slots.len()));
+                    slots.push(StackSlotInfo::new(ty.bytes().max(1), ty.align().max(1)));
+                    types.insert(Value(i as u32), ty.clone());
+                }
+            }
+            let result = Value(1000);
+            if sret {
+                types.insert(result, ret_ty.clone());
+            }
+            isel.set_stack_slots(slots);
+            isel.seed_value_types(&types);
+            for (v, slot) in &aggregates {
+                isel.select_instruction(
+                    &Instruction {
+                        opcode: Opcode::StackAddr { slot: *slot as u32 },
+                        args: vec![],
+                        results: vec![*v],
+                    },
+                    entry,
+                )
+                .unwrap();
+            }
+            for (i, ty) in params.iter().enumerate() {
+                let v = Value(i as u32);
+                if is_aggregate(ty) {
+                    continue;
+                }
+                if *ty == Type::I128 {
+                    let lo = isel.new_vreg(RegClass::Gpr64);
+                    let hi = isel.new_vreg(RegClass::Gpr64);
+                    isel.define_i128_value(v, lo, hi);
+                } else {
+                    define_vreg(&mut isel, v, ty.clone());
+                }
+            }
+            isel.lower_call(
+                "callee",
+                &Instruction {
+                    opcode: Opcode::Call {
+                        name: "callee".to_string(),
+                        binding: Default::default(),
+                    },
+                    args: (0..params.len() as u32).map(Value).collect(),
+                    results: if sret { vec![result] } else { vec![] },
+                },
+                entry,
+            )
+            .unwrap_or_else(|e| panic!("{context}: call refused: {e:?}"));
+            let insts = &isel.func.blocks[&entry].insts;
+            let call_at = insts
+                .iter()
+                .position(|inst| inst.opcode == X86Opcode::Call)
+                .unwrap_or_else(|| panic!("{context}: no CALL emitted"));
+            let mut written_regs = HashSet::new();
+            let mut written_bytes = HashSet::new();
+            for inst in &insts[..call_at] {
+                if let Some(X86ISelOperand::PReg(reg)) = inst.operands.first()
+                    && let Some(arg) = sysv_argument_register(*reg)
+                {
+                    written_regs.insert(arg);
+                }
+                if let Some(X86ISelOperand::MemAddr { base, disp }) = inst.operands.first()
+                    && **base == X86ISelOperand::PReg(RSP)
+                {
+                    let width = sysv_test_memory_access_bytes(inst.opcode)
+                        .unwrap_or_else(|| panic!("{context}: unclassified store {inst:?}"));
+                    written_bytes.extend(i64::from(*disp)..i64::from(*disp) + width);
+                }
+            }
+            assert_eq!(
+                written_regs, want_regs,
+                "{context}: call argument registers"
+            );
+            assert_eq!(
+                written_bytes, want_bytes,
+                "{context}: call outgoing stack bytes"
+            );
+            checked.1 += 1;
+        }
+        assert_eq!(checked, (4000, 4000));
     }
 }

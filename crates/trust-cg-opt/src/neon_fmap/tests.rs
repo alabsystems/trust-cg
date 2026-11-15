@@ -4,7 +4,9 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use super::*;
+use trust_cg_ir::MachInst;
 use trust_cg_ir::Signature;
+mod candidate;
 
 fn v(id: u32) -> MachOperand {
     MachOperand::VReg(VReg::new(id, RegClass::Gpr32))
@@ -39,7 +41,7 @@ fn count_bcond(func: &MachFunction, cc: i64) -> usize {
         .flat_map(|blk| blk.insts.iter().copied())
         .filter(|&id| {
             let inst = func.inst(id);
-            inst.opcode == AArch64Opcode::BCond && imm_of(&inst.operands[0]) == Some(cc)
+            inst.opcode == AArch64Opcode::BCond && inst.operands[0].as_imm() == Some(cc)
         })
         .count()
 }
@@ -54,7 +56,11 @@ fn count_addri_imm(func: &MachFunction, imm_val: i64) -> usize {
         .filter(|&id| {
             let inst = func.inst(id);
             inst.opcode == AArch64Opcode::AddRI
-                && inst.operands.last().and_then(imm_of) == Some(imm_val)
+                && inst
+                    .operands
+                    .last()
+                    .and_then(trust_cg_ir::MachOperand::as_imm)
+                    == Some(imm_val)
         })
         .count()
 }
@@ -929,8 +935,8 @@ fn rotated_saxpy_vectorizes_via_regime_c_versioning() {
     );
     assert_eq!(
         count_bcond(&func, CC_GE),
-        1,
-        "remainder-0 tail guard present"
+        2,
+        "rotated entry check + remainder-0 tail guard present"
     );
 }
 
@@ -951,8 +957,8 @@ fn rotated_saxpy_with_noalias_skips_versioning() {
     );
     assert_eq!(
         count_bcond(&func, CC_GE),
-        1,
-        "remainder-0 tail guard still present"
+        2,
+        "rotated entry check + remainder-0 tail guard still present"
     );
 }
 
@@ -974,8 +980,8 @@ fn rotated_sscal_vectorizes_regime_a_no_versioning() {
     );
     assert_eq!(
         count_bcond(&func, CC_GE),
-        1,
-        "remainder-0 tail guard present"
+        2,
+        "rotated entry check + remainder-0 tail guard present"
     );
     // Only the store base is loaded: UNROLL/2 LDP pairs (main); 1 LD1 (remainder).
     assert_eq!(count(&func, AArch64Opcode::NeonLdpQPost), UNROLL / 2);
@@ -1000,9 +1006,80 @@ fn rotated_pmul_two_inputs_versions_both() {
     );
     assert_eq!(
         count_bcond(&func, CC_GE),
-        1,
-        "remainder-0 tail guard present"
+        2,
+        "rotated entry check + remainder-0 tail guard present"
     );
+}
+
+/// The compare feeding each regime-C `b.ls` disjointness test.
+fn disjointness_compares(func: &MachFunction) -> Vec<&MachInst> {
+    let mut compares = Vec::new();
+    for blk in &func.blocks {
+        let insts: Vec<&MachInst> = blk.insts.iter().map(|&id| func.inst(id)).collect();
+        for pair in insts.windows(2) {
+            if pair[1].opcode == AArch64Opcode::BCond && pair[1].operands[0].as_imm() == Some(CC_LS)
+            {
+                assert_eq!(pair[0].opcode, AArch64Opcode::CmpRR);
+                compares.push(pair[0]);
+            }
+        }
+    }
+    compares
+}
+
+/// The instruction defining `v` (each fixture register has one definition).
+fn def_of(func: &MachFunction, v: VReg) -> &MachInst {
+    func.blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter().copied())
+        .map(|id| func.inst(id))
+        .find(|inst| inst.operands.first().and_then(MachOperand::as_vreg) == Some(v))
+        .unwrap_or_else(|| panic!("no definition of {v:?}"))
+}
+
+/// Regime C compares the ranges the loop accesses. From a negative start the
+/// MIXED loop reads and writes below its base pointers, so each range starts
+/// at `base + sxtw(iv)*elem`: neither side of a disjointness compare is a bare
+/// base. The i64 path keeps ranges from the bases, which its `n >= width`
+/// precheck makes sound from any start.
+#[test]
+fn regime_c_ranges_start_at_the_entry_index() {
+    let (y, x) = (VReg::new(0, RegClass::Gpr64), VReg::new(1, RegClass::Gpr64));
+    let iv = VReg::new(8, RegClass::Gpr64);
+    let mut func = build_rotated_fmap(0);
+    assert!(NeonFMapPass::new().run(&mut func), "mixed saxpy fires");
+    let compares = disjointness_compares(&func);
+    assert_eq!(compares.len(), 2, "one input base: two compares");
+    // `start` operand of each range: `base + lo` with `lo = sxtw(iv) << 2`.
+    let start_of = |v: VReg| -> VReg {
+        let add = def_of(&func, v);
+        assert_eq!(add.opcode, AArch64Opcode::AddRR, "{v:?} is base + lo");
+        let lo = def_of(&func, add.operands[2].as_vreg().unwrap());
+        assert_eq!(lo.opcode, AArch64Opcode::LslRI);
+        assert_eq!(lo.operands[2].as_imm(), Some(2), "f32: lo = start * 4");
+        let start = def_of(&func, lo.operands[1].as_vreg().unwrap());
+        assert_eq!(start.opcode, AArch64Opcode::Sxtw);
+        assert_eq!(start.operands[1].as_vreg(), Some(iv));
+        add.operands[1].as_vreg().unwrap()
+    };
+    // c1: `y + hi <=u x + lo`; c2: `x + hi <=u y + lo`.
+    assert_eq!(start_of(compares[0].operands[1].as_vreg().unwrap()), x);
+    assert_eq!(start_of(compares[1].operands[1].as_vreg().unwrap()), y);
+    for cmp in &compares {
+        for operand in &cmp.operands {
+            assert!(
+                operand.as_vreg() != Some(x) && operand.as_vreg() != Some(y),
+                "a range bound is a bare base pointer"
+            );
+        }
+    }
+
+    let mut func = build_rotated_fmap_i64bound(0);
+    assert!(NeonFMapPass::new().run(&mut func), "i64 saxpy fires");
+    let compares = disjointness_compares(&func);
+    assert_eq!(compares.len(), 2);
+    assert_eq!(compares[0].operands[1].as_vreg(), Some(x), "i64: from x");
+    assert_eq!(compares[1].operands[1].as_vreg(), Some(y), "i64: from y");
 }
 
 #[test]
@@ -1133,7 +1210,11 @@ fn rotated_i64_bound_saxpy_vectorizes_with_precheck() {
         1,
         "bound < 2^31 gate CBNZ"
     );
-    assert_eq!(count_bcond(&func, CC_GE), 1, "remainder-0 tail guard");
+    assert_eq!(
+        count_bcond(&func, CC_GE),
+        2,
+        "rotated entry check + remainder-0 tail guard"
+    );
     // NO sxtw anywhere on the pure-i64 path (a 64-bit index must never be
     // truncated/sign-extended from 32 bits) — the remainder reuses the i64 iv.
     assert_eq!(
@@ -1162,7 +1243,166 @@ fn rotated_i64_bound_sscal_regime_a() {
         5,
         "precheck + main/remainder header AND rotated-latch guards"
     );
-    assert_eq!(count_bcond(&func, CC_GE), 1);
+    assert_eq!(
+        count_bcond(&func, CC_GE),
+        2,
+        "rotated entry check + remainder-0 tail guard"
+    );
+}
+
+/// The instructions of `block`.
+fn block_insts(func: &MachFunction, block: BlockId) -> Vec<&MachInst> {
+    func.block(block)
+        .insts
+        .iter()
+        .map(|&id| func.inst(id))
+        .collect()
+}
+
+/// A rotated map runs its body once even when entered at or past its bound,
+/// and from such a start the vector exit `iv >=s bound -> exit` skipped it.
+/// So the vector code is entered only through `cmp iv, bound; b.ge <do-while>;
+/// b <vector entry>`, at the induction's width: the MIXED fixture (i64
+/// induction, `uxtw(n)` bound) compares against the preheader's `sxtw(n)`,
+/// the i64-bound fixture against the bound itself.
+///
+/// The MIXED vector code reads the induction as `sxtw(iv)`, so its entry
+/// first sends an induction outside i32 range to the do-while:
+/// `sxtw t, iv; cmp iv, t; b.ne <do-while>; b <next check>`. It compares with
+/// `sxtw(n)`, which the fixture's `uxtw(n)` equals only for `n >= 0`, so a
+/// sign check follows: `cmp sxtw(n), #0; b.lt <do-while>; b <bound check>`.
+#[test]
+fn rotated_map_enters_through_a_start_below_bound_check() {
+    for (label, mut func) in [
+        ("mixed", build_rotated_fmap(1)),
+        ("i64 bound", build_rotated_fmap_i64bound(1)),
+    ] {
+        let guard = func.block(func.entry).succs[0];
+        let header = func.block(guard).succs[0];
+        let iv = VReg::new(8, RegClass::Gpr64);
+        assert!(NeonFMapPass::new().run(&mut func), "{label}: fires");
+        let &guard_term = func.block(guard).insts.last().unwrap();
+        let mut entry = branch_targets(func.inst(guard_term))[0];
+        if label == "mixed" {
+            let width = block_insts(&func, entry);
+            assert_eq!(width.len(), 4, "mixed: sxtw; cmp; b.ne; b");
+            assert_eq!(width[0].opcode, AArch64Opcode::Sxtw);
+            assert_eq!(width[0].operands[1].as_vreg(), Some(iv));
+            let low = width[0].operands[0].as_vreg();
+            assert_eq!(width[1].opcode, AArch64Opcode::CmpRR);
+            assert_eq!(width[1].operands[0].as_vreg(), Some(iv));
+            assert_eq!(width[1].operands[1].as_vreg(), low);
+            assert_eq!(width[2].opcode, AArch64Opcode::BCond);
+            assert_eq!(width[2].operands[0].as_imm(), Some(CC_NE));
+            assert_eq!(branch_targets(width[2]), vec![header]);
+            assert_eq!(width[3].opcode, AArch64Opcode::B);
+            entry = branch_targets(width[3])[0];
+            let sign = block_insts(&func, entry);
+            assert_eq!(sign.len(), 3, "mixed: cmp #0; b.lt; b");
+            assert_eq!(sign[0].opcode, AArch64Opcode::CmpRI);
+            assert_eq!(sign[0].operands[1].as_imm(), Some(0));
+            assert_eq!(sign[1].opcode, AArch64Opcode::BCond);
+            assert_eq!(sign[1].operands[0].as_imm(), Some(CC_LT));
+            assert_eq!(branch_targets(sign[1]), vec![header]);
+            assert_eq!(sign[2].opcode, AArch64Opcode::B);
+            let sign_operand = sign[0].operands[0].as_vreg();
+            entry = branch_targets(sign[2])[0];
+            let bound_check = block_insts(&func, entry);
+            assert_eq!(
+                bound_check[0].operands[1].as_vreg(),
+                sign_operand,
+                "mixed: the sign check reads the compared sxtw(n)"
+            );
+        }
+        let insts: Vec<&MachInst> = func
+            .block(entry)
+            .insts
+            .iter()
+            .map(|&id| func.inst(id))
+            .collect();
+        assert_eq!(insts.len(), 3, "{label}: cmp; b.ge; b");
+        assert_eq!(insts[0].opcode, AArch64Opcode::CmpRR, "{label}");
+        assert_eq!(
+            insts[0].operands[0].as_vreg(),
+            Some(iv),
+            "{label}: compares the induction"
+        );
+        let rhs = insts[0].operands[1].as_vreg().unwrap();
+        if label == "mixed" {
+            let sxtw = func
+                .blocks
+                .iter()
+                .flat_map(|blk| blk.insts.iter().copied())
+                .map(|id| func.inst(id))
+                .find(|inst| {
+                    inst.opcode == AArch64Opcode::Sxtw && inst.operands[0].as_vreg() == Some(rhs)
+                })
+                .expect("mixed: the bound operand is an sxtw");
+            assert_eq!(
+                sxtw.operands[1].as_vreg(),
+                Some(VReg::new(3, RegClass::Gpr32))
+            );
+        } else {
+            assert_eq!(rhs, VReg::new(6, RegClass::Gpr64), "{label}");
+        }
+        assert_eq!(insts[1].opcode, AArch64Opcode::BCond, "{label}");
+        assert_eq!(insts[1].operands[0].as_imm(), Some(CC_GE), "{label}");
+        assert_eq!(branch_targets(insts[1]), vec![header], "{label}");
+        assert_eq!(insts[2].opcode, AArch64Opcode::B, "{label}");
+    }
+}
+
+/// The MIXED fixture with its guard's bound widening replaced by `opcode`,
+/// or, for `None`, with the header comparing the i32 `n` itself.
+fn build_rotated_fmap_bound_widened_by(opcode: Option<AArch64Opcode>) -> MachFunction {
+    let mut func = build_rotated_fmap(1);
+    let ids: Vec<InstId> = func
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter().copied())
+        .collect();
+    for id in ids {
+        let inst = func.inst_mut(id);
+        match opcode {
+            Some(opcode) if inst.opcode == AArch64Opcode::Uxtw => inst.opcode = opcode,
+            None if inst.opcode == AArch64Opcode::CmpRR
+                && inst.operands[1].as_vreg() == Some(VReg::new(6, RegClass::Gpr64)) =>
+            {
+                inst.operands[1] = v(3);
+            }
+            _ => {}
+        }
+    }
+    func
+}
+
+/// The MIXED entry checks follow how the loop widens its i32 bound. With
+/// `sxtw(n)` the vector code's bound is the compared one, so the width check
+/// leads straight to the bound check; with `uxtw(n)` a sign check sits
+/// between them (`rotated_map_enters_through_a_start_below_bound_check`).
+/// A header that compares the i64 induction with the i32 `n` itself has no
+/// known i64 bound, and the loop stays scalar.
+#[test]
+fn mixed_entry_checks_follow_the_bound_widening() {
+    let mut func = build_rotated_fmap_bound_widened_by(Some(AArch64Opcode::Sxtw));
+    let guard = func.block(func.entry).succs[0];
+    assert!(NeonFMapPass::new().run(&mut func), "sxtw: fires");
+    let &guard_term = func.block(guard).insts.last().unwrap();
+    let width = branch_targets(func.inst(guard_term))[0];
+    let width_insts = block_insts(&func, width);
+    assert_eq!(width_insts[0].opcode, AArch64Opcode::Sxtw);
+    let bound_check = branch_targets(width_insts[3])[0];
+    let bound_insts = block_insts(&func, bound_check);
+    assert_eq!(bound_insts.len(), 3, "sxtw: cmp iv, sxtw(n); b.ge; b");
+    assert_eq!(bound_insts[0].opcode, AArch64Opcode::CmpRR);
+    assert_eq!(bound_insts[1].operands[0].as_imm(), Some(CC_GE));
+    assert_eq!(count(&func, AArch64Opcode::CmpRI), 0, "sxtw: no sign check");
+
+    let mut func = build_rotated_fmap_bound_widened_by(None);
+    assert!(
+        !NeonFMapPass::new().run(&mut func),
+        "an unwidened i32 bound under an i64 induction declines"
+    );
 }
 
 #[test]
@@ -1249,4 +1489,91 @@ fn second_run_is_a_no_op() {
         assert_eq!(func.insts.len(), insts, "run {again} added instructions");
         assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the map loops reproduce only
+// `iv`, the count loop `iv` and its counter.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build, VReg); 3] = [
+        (
+            "native f32 map",
+            || {
+                let mut func = build_fmap_loop(0, false);
+                func.noalias_params = vec![0, 2];
+                func
+            },
+            VReg::new(5, RegClass::Gpr32),
+        ),
+        (
+            "rotated saxpy",
+            || build_rotated_fmap(0),
+            VReg::new(8, RegClass::Gpr64),
+        ),
+        (
+            "f32 count-above",
+            || build_fcount_loop(CC_GT, false),
+            VReg::new(5, RegClass::Gpr32),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, build, iv) in shapes {
+        assert!(NeonFMapPass::new().run(&mut build()), "{name}: plain fires");
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if NeonFMapPass::new().run(&mut carried) {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if NeonFMapPass::new().run(&mut live_out) {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// A rotated map's vector exit branches straight to the loop exit holding
+/// `iv = bound`, one past the do-while's exit value `bound - 1`, so a rotated
+/// map whose exit reads `iv` declines. A native map's vector code hands off
+/// only to its scalar top test, so the same read keeps it vectorizing.
+#[test]
+fn a_rotated_map_whose_exit_reads_the_induction_declines() {
+    use crate::loop_contract::test_support::add_exit_read;
+    let iv = VReg::new(8, RegClass::Gpr64);
+    let rotated: [(&str, MachFunction); 3] = [
+        ("rotated saxpy", build_rotated_fmap(0)),
+        ("rotated sscal", build_rotated_fmap(1)),
+        ("i64-bound sscal", build_rotated_fmap_i64bound(1)),
+    ];
+    for (label, plain) in rotated {
+        assert!(
+            NeonFMapPass::new().run(&mut plain.clone()),
+            "{label}: plain fires"
+        );
+        let mut reads = plain;
+        add_exit_read(&mut reads, iv);
+        let before = format!("{reads:?}");
+        assert!(
+            !NeonFMapPass::new().run(&mut reads),
+            "{label}: fired with the exit reading iv"
+        );
+        assert_eq!(
+            format!("{reads:?}"),
+            before,
+            "{label}: declined but changed"
+        );
+    }
+    let mut native = build_fmap_loop(0, false);
+    native.noalias_params = vec![0, 2];
+    add_exit_read(&mut native, VReg::new(5, RegClass::Gpr32));
+    assert!(NeonFMapPass::new().run(&mut native), "native: still fires");
 }

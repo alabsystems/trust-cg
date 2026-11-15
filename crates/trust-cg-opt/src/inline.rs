@@ -21,22 +21,37 @@
 //!    except the trailing `Ret`, replacing the call with the inlined body,
 //!    and advancing `caller.next_vreg` past the callee's namespace.
 //!
+//! # Identity admission (L10-P5)
+//!
+//! The splice imports a foreign function's identities, so it is planned in
+//! full before the caller is touched and declines (inlines nothing) unless:
+//! the callee passes [`MachFunction::admit_id_counters`] (every callee
+//! register is below the callee's own counter, so every renumbered register
+//! is below the caller's advanced counter); the caller's counter plus the
+//! callee's fits `u32`; the caller's instruction arena can name every copied
+//! instruction; and the body names no stack slot or frame index (the copy
+//! keeps those verbatim, so they would name the CALLER's slots).
+//!
 //! # Limitations (v1)
 //!
 //! - Only single-block callees are inlined.
 //! - Indirect calls (`BLR`/`Blr`) are not inlined.
 //! - No parameter/return value remapping beyond vreg renumbering.
 //! - Recursive calls are unconditionally skipped.
+//! - A callee whose block has a successor, a `Block` operand or a
+//!   `JumpTableIndex` operand is skipped: those name the callee's own blocks
+//!   and tables, which the copy does not remap.
 //!
 //! Reference: LLVM `InlineFunction.cpp`, `InlineCost.cpp`
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
-    AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
-    VReg,
+    AArch64Opcode, BlockId, InstFlags, InstId, MachFunction, MachInst, MachOperand, PassId,
+    ProvenanceMap, VReg,
 };
 
+use crate::mach_util::clone_reproduces_out_edges;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 use crate::pgo::ProfileHotness;
 
@@ -67,7 +82,7 @@ impl FunctionInlining {
     /// Create a new inlining pass with default settings.
     pub fn new() -> Self {
         Self {
-            callees: HashMap::new(),
+            callees: HashMap::default(),
             max_callee_size: DEFAULT_MAX_CALLEE_SIZE,
             profile_hotness: None,
         }
@@ -131,8 +146,30 @@ impl FunctionInlining {
             None => return false,
         };
 
+        // This splice does not transport a callee's exceptional identities.
+        if callee.eh_metadata.has_eh_info() {
+            return false;
+        }
+
         // Single-block only in v1.
         if callee.num_blocks() != 1 {
+            return false;
+        }
+
+        // The body is copied with only its vregs renumbered, so a `Block`
+        // operand would name a block of the CALLER and a `JumpTableIndex`
+        // would index the caller's `jump_tables`. Copy only a block with no
+        // out-edge and no block- or table-addressing operand.
+        if !callee.block(callee.entry).succs.is_empty()
+            || !clone_reproduces_out_edges(callee, callee.entry)
+        {
+            return false;
+        }
+
+        // A callee selected under its own target features (CRC32, LSE, ...)
+        // may contain instructions the caller's admission does not include:
+        // never splice it (the LIR inliner applies the same rule).
+        if !callee.function_target_features.is_empty() {
             return false;
         }
 
@@ -147,22 +184,25 @@ impl FunctionInlining {
     }
 
     /// Remap a single operand: if it is a VReg, add the offset to its id.
-    fn remap_operand(op: &MachOperand, vreg_offset: u32) -> MachOperand {
-        match op {
-            MachOperand::VReg(v) => MachOperand::VReg(VReg::new(v.id + vreg_offset, v.class)),
+    /// `None` when the renumbered id leaves the `u32` domain.
+    fn remap_operand(op: &MachOperand, vreg_offset: u32) -> Option<MachOperand> {
+        Some(match op {
+            MachOperand::VReg(v) => {
+                MachOperand::VReg(VReg::new(v.id.checked_add(vreg_offset)?, v.class))
+            }
             other => other.clone(),
-        }
+        })
     }
 
     /// Clone a callee instruction with remapped vreg IDs.
-    fn remap_inst(inst: &MachInst, vreg_offset: u32) -> MachInst {
-        let remapped_operands: Vec<MachOperand> = inst
+    fn remap_inst(inst: &MachInst, vreg_offset: u32) -> Option<MachInst> {
+        let remapped_operands = inst
             .operands
             .iter()
             .map(|op| Self::remap_operand(op, vreg_offset))
-            .collect();
+            .collect::<Option<Vec<MachOperand>>>()?;
 
-        MachInst {
+        Some(MachInst {
             opcode: inst.opcode,
             operands: remapped_operands,
             implicit_defs: inst.implicit_defs,
@@ -170,7 +210,34 @@ impl FunctionInlining {
             flags: inst.flags,
             proof: inst.proof,
             source_loc: inst.source_loc,
+        })
+    }
+
+    /// L10-P5 splice admission (see the module documentation): the caller's
+    /// advanced register counter, or `None` when the splice could alias a
+    /// caller identity.
+    fn admit_splice(caller: &MachFunction, callee: &MachFunction, copied: usize) -> Option<u32> {
+        callee.admit_id_counters().ok()?;
+        let entry = callee.blocks.get(callee.entry.0 as usize)?;
+        let names_a_slot = entry.insts.iter().any(|&inst| {
+            callee.insts[inst.0 as usize]
+                .operands
+                .iter()
+                .any(|operand| {
+                    matches!(
+                        operand,
+                        MachOperand::StackSlot(_) | MachOperand::FrameIndex(_)
+                    )
+                })
+        });
+        if names_a_slot {
+            return None;
         }
+        let last_index = caller.insts.len().checked_add(copied)?.checked_sub(1);
+        if last_index.is_some_and(|index| u32::try_from(index).is_err()) {
+            return None;
+        }
+        caller.next_vreg.checked_add(callee.next_vreg)
     }
 
     fn record_inlined_inst_provenance(
@@ -228,25 +295,33 @@ impl FunctionInlining {
         let caller_inst_count_before_inline = caller.insts.len();
         let call_source_loc = caller.inst(call_inst_id).source_loc;
         let callee_entry = callee.block(callee.entry);
+        let advanced_next_vreg =
+            Self::admit_splice(caller, callee, Self::cloneable_inst_count(callee))?;
+
+        // Build the whole renumbered body before touching the caller, so a
+        // refusal publishes nothing. Skip the trailing Ret: the caller's
+        // control flow continues after the inlined body. The callee itself is
+        // not mutated, so any Ret provenance remains valid in the callee.
+        let mut copies = Vec::new();
+        for &callee_inst_id in &callee_entry.insts {
+            let callee_inst = callee.inst(callee_inst_id);
+            if callee_inst.is_return() {
+                continue;
+            }
+            let mut remapped = Self::remap_inst(callee_inst, vreg_offset)?;
+            if remapped.source_loc.is_none() {
+                remapped.source_loc = call_source_loc;
+            }
+            copies.push((callee_inst_id, remapped));
+        }
 
         // Collect inlined instruction IDs.
         let mut inlined_ids = Vec::new();
 
-        for &callee_inst_id in &callee_entry.insts {
-            let callee_inst = callee.inst(callee_inst_id);
-
-            // Skip the trailing Ret instruction — the caller's control flow
-            // continues after the inlined body. The callee function itself is
-            // not mutated, so any Ret provenance remains valid in the callee.
-            if callee_inst.is_return() {
-                continue;
-            }
-
-            let mut remapped = Self::remap_inst(callee_inst, vreg_offset);
-            if remapped.source_loc.is_none() {
-                remapped.source_loc = call_source_loc;
-            }
-            let new_id = caller.push_inst(remapped);
+        for (callee_inst_id, remapped) in copies {
+            // `admit_splice` proved every copy an ID; a refusal here would be
+            // an arena that changed underneath this pass.
+            let new_id = caller.try_push_inst(remapped)?;
             if let Some(provenance) = provenance.as_deref_mut() {
                 Self::record_inlined_inst_provenance(
                     provenance,
@@ -264,9 +339,7 @@ impl FunctionInlining {
         }
 
         // Advance the caller's vreg counter past the callee's namespace.
-        if callee.next_vreg > 0 {
-            caller.next_vreg += callee.next_vreg;
-        }
+        caller.next_vreg = advanced_next_vreg;
 
         Some(inlined_ids)
     }
@@ -276,6 +349,7 @@ impl FunctionInlining {
         func: &mut MachFunction,
         mut provenance: Option<&mut ProvenanceMap>,
     ) -> bool {
+        let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
         let mut changed = false;
         let caller_name = func.name.clone();
 
@@ -294,7 +368,10 @@ impl FunctionInlining {
                 let inst = func.inst(inst_id);
 
                 // Check if this is a direct call (Bl or BL) with a Symbol operand.
-                let callee_name = if matches!(inst.opcode, AArch64Opcode::Bl | AArch64Opcode::BL) {
+                let callee_name = if matches!(inst.opcode, AArch64Opcode::Bl | AArch64Opcode::BL)
+                    && !inst.flags.contains(InstFlags::EXACT_MODULE_CALL)
+                    && !protected.contains(inst_id)
+                {
                     inst.operands.iter().find_map(|op| {
                         if let MachOperand::Symbol(s) = op {
                             Some(s.clone())
@@ -366,6 +443,7 @@ impl MachinePass for FunctionInlining {
 
 #[cfg(test)]
 mod tests {
+    mod eh_call_custody_tests;
     use super::*;
     use crate::pass_manager::{AnalysisCache, MachinePass};
     use crate::pgo::{BlockProfile, FunctionProfile, ProfData, ProfileHotness};
@@ -484,6 +562,28 @@ mod tests {
 
         // next_vreg should have advanced: 5 + 3 = 8
         assert_eq!(caller.next_vreg, 8);
+    }
+
+    /// A callee compiled under its own target features keeps them: its CRC32
+    /// word is never spliced into a caller.
+    #[test]
+    fn test_inline_skips_callee_with_own_target_features() {
+        let crc = MachInst::new(AArch64Opcode::Crc32Cx, vec![vreg(0), vreg(1), vreg(2)]);
+        let mut callee = make_callee("crc_fn", vec![crc], 3);
+        callee.function_target_features = trust_cg_ir::TargetFeatureSet::from_aarch64_features([
+            trust_cg_ir::AArch64IsaFeature::Crc,
+        ]);
+        let call = MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("crc_fn".to_string())],
+        );
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let mut caller = make_func_with_insts("main", vec![call, ret]);
+        caller.next_vreg = 5;
+        let mut pass = FunctionInlining::new().with_callee("crc_fn".to_string(), callee);
+        assert!(!pass.run(&mut caller));
+        let block = caller.block(caller.entry);
+        assert_eq!(caller.inst(block.insts[0]).opcode, AArch64Opcode::Bl);
     }
 
     #[test]
@@ -688,6 +788,119 @@ mod tests {
 
         let block = caller.block(caller.entry);
         assert_eq!(block.insts.len(), 2);
+    }
+
+    /// A single-block callee that loops on itself (`Cbnz v0, entry`): the copy
+    /// would keep `Block(entry)`, which in the caller names the CALLER's entry
+    /// block. Skip it.
+    #[test]
+    fn test_inline_skips_a_callee_with_a_block_operand() {
+        let mut callee = make_callee(
+            "spin",
+            vec![
+                MachInst::new(AArch64Opcode::SubRI, vec![vreg(0), vreg(0), imm(1)]),
+                MachInst::new(
+                    AArch64Opcode::Cbnz,
+                    vec![vreg(0), MachOperand::Block(BlockId(0))],
+                ),
+            ],
+            1,
+        );
+        let entry = callee.entry;
+        callee.add_edge(entry, entry);
+        let call = MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("spin".to_string())],
+        );
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let mut caller = make_func_with_insts("main", vec![call, ret]);
+        let mut pass = FunctionInlining::new().with_callee("spin".to_string(), callee);
+        assert!(!pass.run(&mut caller));
+        let block = caller.block(caller.entry);
+        assert_eq!(caller.inst(block.insts[0]).opcode, AArch64Opcode::Bl);
+    }
+
+    /// A callee instruction that reads the callee's jump table: in the caller
+    /// `JumpTableIndex(0)` would index the CALLER's `jump_tables`. Skip it.
+    #[test]
+    fn test_inline_skips_a_callee_that_reads_a_jump_table() {
+        let mut callee = make_callee(
+            "table",
+            vec![MachInst::new(
+                AArch64Opcode::Adr,
+                vec![vreg(0), MachOperand::JumpTableIndex(0)],
+            )],
+            1,
+        );
+        callee
+            .jump_tables
+            .push(trust_cg_ir::function::JumpTableData {
+                min_val: 0,
+                targets: vec![callee.entry],
+            });
+        let call = MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("table".to_string())],
+        );
+        let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+        let mut caller = make_func_with_insts("main", vec![call, ret]);
+        let mut pass = FunctionInlining::new().with_callee("table".to_string(), callee);
+        assert!(!pass.run(&mut caller));
+        let block = caller.block(caller.entry);
+        assert_eq!(caller.inst(block.insts[0]).opcode, AArch64Opcode::Bl);
+    }
+
+    /// L10-P5: the splice imports the callee's identities only when every
+    /// renumbered one stays fresh in the caller. Each refusal inlines nothing
+    /// and leaves the caller exactly as it was.
+    #[test]
+    fn test_inline_declines_a_splice_that_could_alias_caller_identities() {
+        fn caller_calling(callee: &str) -> MachFunction {
+            let call = MachInst::new(
+                AArch64Opcode::Bl,
+                vec![MachOperand::Symbol(callee.to_string())],
+            );
+            let mut caller = make_func_with_insts(
+                "main",
+                vec![call, MachInst::new(AArch64Opcode::Ret, vec![])],
+            );
+            caller.next_vreg = 5;
+            caller
+        }
+        fn declines(callee: MachFunction, mut caller: MachFunction) {
+            let before = format!("{caller:?}");
+            let name = callee.name.clone();
+            let mut pass = FunctionInlining::new().with_callee(name.clone(), callee);
+            assert!(!pass.run(&mut caller), "{name} was spliced");
+            assert_eq!(format!("{caller:?}"), before, "{name} touched the caller");
+        }
+
+        // The callee's counter (3) does not exceed its v7: renumbered, v12
+        // would land past the caller's advanced counter (8) and the caller's
+        // next allocation would alias it.
+        let add = MachInst::new(AArch64Opcode::AddRR, vec![vreg(7), vreg(1), vreg(2)]);
+        declines(
+            make_callee("stale_fn", vec![add], 3),
+            caller_calling("stale_fn"),
+        );
+
+        // A stack slot or frame index is copied verbatim and would name the
+        // caller's slot.
+        for operand in [
+            MachOperand::StackSlot(trust_cg_ir::StackSlotId(0)),
+            MachOperand::FrameIndex(trust_cg_ir::FrameIdx(0)),
+        ] {
+            let load = MachInst::new(AArch64Opcode::LdrRI, vec![vreg(0), operand, imm(0)]);
+            let mut callee = make_callee("slot_fn", vec![load], 1);
+            callee.alloc_stack_slot(trust_cg_ir::StackSlot::new(8, 8));
+            declines(callee, caller_calling("slot_fn"));
+        }
+
+        // The caller's counter plus the callee's would leave the u32 domain.
+        let add = MachInst::new(AArch64Opcode::AddRR, vec![vreg(0), vreg(1), vreg(2)]);
+        let mut caller = caller_calling("wide_fn");
+        caller.next_vreg = u32::MAX - 1;
+        declines(make_callee("wide_fn", vec![add], 3), caller);
     }
 
     #[test]

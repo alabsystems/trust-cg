@@ -1,0 +1,76 @@
+# Rules GNU ld 2.42 (BFD, binutils 2.42) applies to an ELF section by NAME,
+# outside the default linker script (gnu-ld-2.42-aarch64linux.xdw), for an
+# allocated PROGBITS/NOBITS data section on AArch64. Read by
+# object_sections::tests::elf_name_rules_match_the_gnu_ld_2_42_default_script,
+# which checks the GNU column of object_sections::ELF_NAME_RULES against this
+# list and the script: a by-name placement in the table must come from a row
+# here, and every row here must be in the table (or be writer-owned).
+#
+# Fields (whitespace separated): <glob> <effect> [<argument>]
+#   The glob uses `*` for any run of characters (possibly empty).
+#   parsed <what>   BFD reads every INPUT section whose name matches as
+#                   <what>, wherever the script places it (ParsedByName).
+#   typed <sh_type> BFD's special-section table types an OUTPUT section of
+#                   that name <sh_type>; it decides an orphan's type
+#                   (TypedByName). Inside a script statement the statement
+#                   decides the placement.
+#   owned           the object writer's reserved names already cover it
+#                   (object_sections::elf_reserved_reason).
+#   inert           BFD has a by-name rule, but it touches only
+#                   non-allocated sections, or a NOBITS type that an output
+#                   with contents drops, so allocated data keeps its flags.
+# First match wins. Rows marked `probe` were linked with trust-cg's section
+# type and flags under GNU ld 2.42 as PIE, -no-pie, -z norelro and -shared
+# (reports/perf/2026-09-23-linux-explicit-section-write-faults/README.md; its
+# records/repair logs are in git history at ea8492fd9315).
+#
+# binutils 2.42 source of each rule:
+#   .eh_frame_entry*  bfd/elflink.c _bfd_elf_parse_eh_frame_entries:
+#                     startswith (sec->name, ".eh_frame_entry"), then
+#                     bfd/elf-eh-frame.c: "compact frame descriptions
+#                     incompatible with DWARF2 .eh_frame" (probe: every
+#                     spelling fails the link; .eh_frame_entq links)
+#   .eh_frame         bfd/elflink.c bfd_elf_discard_info parses the inputs of
+#                     the `.eh_frame` output as CIE/FDE records
+#   .rela* .rel .rel.* .relr.dyn   bfd/elf.c special_sections_r (".rela" -1,
+#                     ".rel" -2, ".relr.dyn" 0) (probe: .rela_x, .relax,
+#                     .relative typed RELA, -shared store faults; .rel.rox
+#                     typed REL and .relr.dyn typed RELR, -shared library
+#                     unusable; .relx, .relro, .relr, .relr.dynx stay PROGBITS)
+#   .stab*str         bfd/elf.c special_sections_s { ".stabstr", 5, 3 }
+#                     (prefix `.stab`, suffix `str`) (probe: .stabqstr,
+#                     .stabxstr typed STRTAB)
+#   .gnu.warning* .gnu.linkonce* .gnu.lto_* .note* .debug* .zdebug* .comment
+#                     bfd/elflink.c elf_link_add_object_symbols (.gnu.warning.),
+#                     bfd/elf.c _bfd_elf_make_section_from_shdr (.gnu.linkonce,
+#                     .debug, .zdebug), special_sections_n (.note -1 SHT_NOTE),
+#                     plugin/LTO (.gnu.lto_), special_sections_c (.comment)
+#   .line* .stab* .gdb_index   bfd/elf.c _bfd_elf_make_section_from_shdr sets
+#                     SEC_DEBUGGING by name for NON-allocated sections only
+#                     (probe: .linex, .stabx, .gdb_index allocated data runs)
+#   .noinit .persistent .persistent.bss .gnu_object_only .ctf
+#                     bfd/elf.c special_sections_{n,p,g,c}; an allocated
+#                     output with contents keeps SHT_PROGBITS (probe: all run,
+#                     values intact)
+
+.eh_frame_entry*	parsed	compact unwind entries	probe
+.eh_frame	owned
+.rela*	typed	SHT_RELA	probe
+.rel	owned
+.rel.*	owned
+.relr.dyn	typed	SHT_RELR	probe
+.stab*str	typed	SHT_STRTAB	probe
+.gnu.warning*	owned
+.gnu.linkonce*	owned
+.gnu.lto_*	owned
+.note*	owned
+.debug*	owned
+.zdebug*	owned
+.comment	owned
+.line*	inert	probe
+.stab*	inert	probe
+.gdb_index	inert	probe
+.noinit*	inert	probe
+.persistent*	inert	probe
+.gnu_object_only*	inert	probe
+.ctf*	inert	probe

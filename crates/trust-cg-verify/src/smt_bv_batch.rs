@@ -768,11 +768,11 @@ pub fn build_smt_bv_batch_template_manifest(
         proof_hashes,
         solver_route: SmtBvSolverRoute {
             backend: "ay-cli".to_string(),
-            route_kind: if config.solver_path.is_some() {
-                "config-override".to_string()
-            } else {
-                "ay-bridge-auto".to_string()
-            },
+            route_kind: config
+                .solver
+                .as_ref()
+                .map_or("ay-bridge-auto", |solver| solver.route().as_str())
+                .to_string(),
             solver: solver.clone(),
             logics: logics.into_iter().collect(),
             config_signature: cfg_sig.clone(),
@@ -1060,7 +1060,10 @@ fn extract_logic(smt2: &str) -> String {
 }
 
 fn solver_descriptor(config: &AYConfig) -> String {
-    config.solver_path.clone().unwrap_or_else(solver_info)
+    config
+        .solver
+        .as_ref()
+        .map_or_else(solver_info, |solver| solver.describe())
 }
 
 fn sanitize_id(raw: &str) -> String {

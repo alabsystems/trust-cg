@@ -174,7 +174,8 @@ impl AppleSiliconCostModel {
 
             // ===== i128 multi-register arithmetic =====
             // ADC/SBC: 1-cycle ALU, reads carry from preceding ADDS/SUBS.
-            Adc | Sbc => (1, m4_int_tp),
+            // ADCS/SBCS are the same ALU op with the S bit set.
+            Adc | Sbc | Adcs | Sbcs => (1, m4_int_tp),
             // UMULH: unsigned multiply high, 3-cycle latency (same as MUL).
             Umulh => (3, 2.0),
             // SMULH: signed multiply high, 3-cycle latency (same as MUL/UMULH).
@@ -220,6 +221,12 @@ impl AppleSiliconCostModel {
             // branch predictor + call return stack.
             Bl | BL => (1, 1.0),
             Blr | BLR => (1, 1.0),
+            // TLSDESC resolver call: the unexpanded sequence is four
+            // instructions (ADRP, LDR, ADD, BLR) plus the resolver itself;
+            // charge the load latency on top of the call.
+            TlsDescCall => (5, 1.0),
+            BlrTlsdesc => (1, 1.0),
+            AddTlsdescLo12 => (1, 4.0),
             Ret => (1, 1.0),
 
             // ===== Load (L1 hit: 4 cycles, 2 load/store units) =====
@@ -244,6 +251,7 @@ impl AppleSiliconCostModel {
             LdrGot => (4, 2.0),
             LdrTlvp => (4, 2.0),
             LdrGottprel => (4, 2.0),
+            LdrTlsdesc => (4, 2.0),
 
             // ===== Store (1-cycle dispatch, 2 load/store units) =====
             // Stores complete out of order; effective latency is 1 for dispatch.
@@ -282,7 +290,11 @@ impl AppleSiliconCostModel {
             FabsRR => (1, 2.0),              // Simple bit clear, uses FP unit
             // FRINTM/FRINTP/FRINTZ round-to-integral: ~3-cycle FP op (not a
             // trivial bit-op like FNEG/FABS), one of the FP units.
-            FrintmRR | FrintpRR | FrintzRR => (3, 2.0),
+            FrintnRR | FrintmRR | FrintpRR | FrintzRR => (3, 2.0),
+            // FEAT_CRC32: a 3-cycle integer op on one complex-integer pipe
+            // (Apple's published Firestorm/Avalanche tables list CRC32 at
+            // 3 cycles, 1 per cycle), whatever the data width.
+            Crc32B | Crc32H | Crc32W | Crc32X | Crc32Cb | Crc32Ch | Crc32Cw | Crc32Cx => (3, 1.0),
             FsqrtRR => (12, 0.25), // Single: ~9, Double: ~12-16 cycles, 1 unit
             Fcmp => (3, 2.0),
             FmovImm => (2, 2.0),
@@ -424,8 +436,17 @@ impl AppleSiliconCostModel {
             // CAS: ~8 cycles (compare + conditional store).
             Cas | Casa | Casal | Casl => (8, 0.5),
             // LL/SC exclusive: similar to LSE but may require retry loop.
-            Ldaxr => (4, 1.0),
-            Stlxr => (4, 0.5),
+            Ldaxr | Ldxr | Ldxrb | Ldxrh | Ldaxrb | Ldaxrh | Ldxp | Ldaxp => (4, 1.0),
+            Stlxr | Stxr | Stxrb | Stxrh | Stlxrb | Stlxrh | Stxp | Stlxp => (4, 0.5),
+            // CLREX: a local-monitor clear, no data dependence.
+            Clrex => (1, 1.0),
+            // Opaque LL/SC pseudos: at least one uncontended load-exclusive,
+            // ALU step, store-exclusive and retry branch.
+            LlscRmw8 | LlscRmw16 | LlscRmw32 | LlscRmw64 => (10, 0.25),
+            LlscCmpSwap8 | LlscCmpSwap16 | LlscCmpSwap32 | LlscCmpSwap64 => (12, 0.25),
+            LlscLoad128 | LlscStore128 => (10, 0.25),
+            LlscRmw128 => (12, 0.25),
+            LlscCmpSwap128 => (14, 0.25),
             // Barriers: pipeline flush overhead.
             Dmb => (4, 0.5),
             Dsb => (8, 0.25),
@@ -1190,8 +1211,6 @@ pub enum Precision {
 /// Below these thresholds, NEON is faster than GPU dispatch.
 /// Values derived from: dispatch overhead ~10K cycles, NEON 4-way FP/SIMD,
 /// GPU 256-512 ALU ops/cycle, transfer overhead ~10K cycles round-trip.
-///
-/// Source: designs/2026-04-14-profitability-thresholds.md
 #[derive(Debug, Clone, Copy)]
 pub struct GpuThresholds {
     /// Minimum elements for element-wise operations (add, mul, etc.)
@@ -1233,8 +1252,6 @@ impl Default for GpuThresholds {
 ///
 /// ANE has very high dispatch overhead (CoreML compilation) but extreme
 /// throughput for supported operations. Only profitable for large workloads.
-///
-/// Source: designs/2026-04-14-profitability-thresholds.md
 #[derive(Debug, Clone, Copy)]
 pub struct AneThresholds {
     /// Minimum FLOP count for standalone GEMM.
@@ -1310,8 +1327,6 @@ pub enum OperationCategory {
 /// verification perspective) and the cost model (which determines what is
 /// CHEAPEST). This analyzer filters out legal-but-unprofitable targets and
 /// checks hardware-level operation support.
-///
-/// Source: designs/2026-04-14-profitability-thresholds.md
 #[derive(Debug, Clone, Copy)]
 pub struct ProfitabilityAnalyzer {
     gpu_thresholds: GpuThresholds,

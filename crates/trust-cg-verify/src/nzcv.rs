@@ -7,7 +7,6 @@
 // subtraction results. Used to verify comparison and branch lowering rules.
 //
 // Reference: ARM Architecture Reference Manual (DDI 0487), Section C5.2.9
-// Reference: designs/2026-04-13-verification-architecture.md, "NZCV Flag Correctness"
 
 //! AArch64 NZCV flag model and condition code evaluation.
 //!
@@ -222,6 +221,135 @@ pub fn encode_cset(cc: AArch64CC, flags: &NzcvFlags) -> SmtExpr {
 pub fn encode_cmp_cset(rn: SmtExpr, rm: SmtExpr, width: u32, cc: AArch64CC) -> SmtExpr {
     let flags = encode_cmp(rn, rm, width);
     encode_cset(cc, &flags)
+}
+
+/// The Arm ARM `AddWithCarry(x, y, carry_in)` pseudo-code (DDI 0487,
+/// J1.1.3 shared/functions/integer/AddWithCarry), returning the `width`-bit
+/// result and the NZCV it produces.
+///
+/// This is a separate transcription from [`encode_cmp`]: C and V come from a
+/// `width + 1`-bit unsigned and signed sum, exactly as the pseudo-code states
+/// them (`C = UInt(result) != unsigned_sum`, `V = SInt(result) != signed_sum`),
+/// not from the full-adder carry identity `encode_cmp` uses. The flag-setting
+/// producers ADDS/SUBS/CMP/ADCS/SBCS and the carry readers ADC/SBC are all
+/// instances; `tests/aarch64_nzcv_silicon_bridge.rs` replays them against
+/// facts recorded natively on Apple silicon.
+///
+/// `carry_in` must be a 1-bit bitvector. `width` must be 32 or 64.
+pub fn add_with_carry(
+    x: SmtExpr,
+    y: SmtExpr,
+    carry_in: SmtExpr,
+    width: u32,
+) -> (SmtExpr, NzcvFlags) {
+    let carry = carry_in.zero_ext(width);
+    let unsigned_sum = x
+        .clone()
+        .zero_ext(1)
+        .bvadd(y.clone().zero_ext(1))
+        .bvadd(carry.clone());
+    let signed_sum = x.sign_ext(1).bvadd(y.sign_ext(1)).bvadd(carry);
+    let result = unsigned_sum.clone().extract(width - 1, 0);
+    let one = SmtExpr::bv_const(1, 1);
+    let n = result
+        .clone()
+        .extract(width - 1, width - 1)
+        .eq_expr(one.clone());
+    let z = result.clone().eq_expr(SmtExpr::bv_const(0, width));
+    // C: the width+1-bit unsigned sum differs from the zero-extended result
+    // exactly when its top bit is set.
+    let c = unsigned_sum.extract(width, width).eq_expr(one);
+    // V: the width+1-bit signed sum differs from the sign-extended result
+    // exactly when its top two bits disagree.
+    let v = signed_sum
+        .clone()
+        .extract(width, width)
+        .eq_expr(signed_sum.extract(width - 1, width - 1))
+        .not_expr();
+    (result, NzcvFlags { n, z, c, v })
+}
+
+fn all_ones(width: u32) -> SmtExpr {
+    SmtExpr::bv_const(
+        if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        },
+        width,
+    )
+}
+
+/// The C flag of `flags` as a 1-bit bitvector (`PSTATE.C` as an adder input).
+pub fn carry_bit(flags: &NzcvFlags) -> SmtExpr {
+    SmtExpr::ite(
+        flags.c.clone(),
+        SmtExpr::bv_const(1, 1),
+        SmtExpr::bv_const(0, 1),
+    )
+}
+
+/// `ADDS Rd, Rn, Rm`: `AddWithCarry(Rn, Rm, 0)`.
+pub fn encode_adds(rn: SmtExpr, rm: SmtExpr, width: u32) -> (SmtExpr, NzcvFlags) {
+    add_with_carry(rn, rm, SmtExpr::bv_const(0, 1), width)
+}
+
+/// `SUBS Rd, Rn, Rm` (and `CMP Rn, Rm` with the result discarded):
+/// `AddWithCarry(Rn, NOT(Rm), 1)`.
+pub fn encode_subs(rn: SmtExpr, rm: SmtExpr, width: u32) -> (SmtExpr, NzcvFlags) {
+    add_with_carry(
+        rn,
+        rm.bvxor(all_ones(width)),
+        SmtExpr::bv_const(1, 1),
+        width,
+    )
+}
+
+/// `ADCS Rd, Rn, Rm`: `AddWithCarry(Rn, Rm, PSTATE.C)`. `carry_in` is the
+/// incoming C flag as a 1-bit bitvector (see [`carry_bit`]).
+pub fn encode_adcs(
+    rn: SmtExpr,
+    rm: SmtExpr,
+    carry_in: SmtExpr,
+    width: u32,
+) -> (SmtExpr, NzcvFlags) {
+    add_with_carry(rn, rm, carry_in, width)
+}
+
+/// `SBCS Rd, Rn, Rm`: `AddWithCarry(Rn, NOT(Rm), PSTATE.C)`.
+pub fn encode_sbcs(
+    rn: SmtExpr,
+    rm: SmtExpr,
+    carry_in: SmtExpr,
+    width: u32,
+) -> (SmtExpr, NzcvFlags) {
+    add_with_carry(rn, rm.bvxor(all_ones(width)), carry_in, width)
+}
+
+/// `ADC Rd, Rn, Rm`: the `ADCS` value; NZCV is not written.
+pub fn encode_adc(rn: SmtExpr, rm: SmtExpr, carry_in: SmtExpr, width: u32) -> SmtExpr {
+    encode_adcs(rn, rm, carry_in, width).0
+}
+
+/// `SBC Rd, Rn, Rm`: the `SBCS` value; NZCV is not written.
+pub fn encode_sbc(rn: SmtExpr, rm: SmtExpr, carry_in: SmtExpr, width: u32) -> SmtExpr {
+    encode_sbcs(rn, rm, carry_in, width).0
+}
+
+/// Pack Bool flags into the architectural 4-bit `N:Z:C:V` value (N = bit 3),
+/// the layout `MRS Xt, NZCV` returns in bits 31:28.
+pub fn pack_nzcv(flags: &NzcvFlags) -> SmtExpr {
+    let bit = |flag: &SmtExpr| {
+        SmtExpr::ite(
+            flag.clone(),
+            SmtExpr::bv_const(1, 1),
+            SmtExpr::bv_const(0, 1),
+        )
+    };
+    bit(&flags.n)
+        .concat(bit(&flags.z))
+        .concat(bit(&flags.c))
+        .concat(bit(&flags.v))
 }
 
 #[cfg(test)]
@@ -517,5 +645,115 @@ mod tests {
         // 0 - 1 = max (negative in signed) -> N=true
         let result = flags.n.eval(&env(&[("rn", 0), ("rm", 1)]));
         assert_eq!(result, EvalResult::Bool(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // AddWithCarry producers (ADDS/SUBS/ADCS/SBCS, ADC/SBC values)
+    // -----------------------------------------------------------------------
+
+    fn packed(flags: &NzcvFlags, bindings: &HashMap<String, u64>) -> u64 {
+        match pack_nzcv(flags).eval(bindings) {
+            EvalResult::Bv(value) => value,
+            other => panic!("packed NZCV evaluated to {other:?}"),
+        }
+    }
+
+    /// Independent integer oracle for AddWithCarry at `width` bits.
+    fn oracle(x: u64, y: u64, carry: u64, width: u32) -> (u64, u64) {
+        let mask = (1u128 << width) - 1;
+        let (x, y) = (u128::from(x) & mask, u128::from(y) & mask);
+        let unsigned = x + y + u128::from(carry);
+        let result = unsigned & mask;
+        let signed = |v: u128| -> i128 {
+            if v >> (width - 1) & 1 == 1 {
+                v as i128 - (1i128 << width)
+            } else {
+                v as i128
+            }
+        };
+        let signed_sum = signed(x) + signed(y) + carry as i128;
+        let n = (result >> (width - 1)) as u64;
+        let z = u64::from(result == 0);
+        let c = u64::from(unsigned != result);
+        let v = u64::from(signed_sum != signed(result));
+        (result as u64, (n << 3) | (z << 2) | (c << 1) | v)
+    }
+
+    #[test]
+    fn add_with_carry_matches_an_integer_oracle_exhaustively_at_8_bits() {
+        let mut cases = 0;
+        let x = SmtExpr::var("x", 8);
+        let y = SmtExpr::var("y", 8);
+        let c = SmtExpr::var("c", 1);
+        let (result, flags) = add_with_carry(x, y, c, 8);
+        for a in 0..=255u64 {
+            for b in 0..=255u64 {
+                for carry in 0..=1u64 {
+                    let bindings = env(&[("x", a), ("y", b), ("c", carry)]);
+                    let (want_result, want_flags) = oracle(a, b, carry, 8);
+                    assert_eq!(result.eval(&bindings), EvalResult::Bv(want_result));
+                    assert_eq!(packed(&flags, &bindings), want_flags, "{a} {b} {carry}");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 131_072);
+    }
+
+    /// SUBS/CMP via AddWithCarry(Rn, NOT Rm, 1) and the full-adder `encode_cmp`
+    /// are separate transcriptions; they must agree on every 8-bit pair.
+    #[test]
+    fn subs_and_encode_cmp_agree_exhaustively_at_8_bits() {
+        let rn = SmtExpr::var("rn", 8);
+        let rm = SmtExpr::var("rm", 8);
+        let (result, subs) = encode_subs(rn.clone(), rm.clone(), 8);
+        let cmp = encode_cmp(rn, rm, 8);
+        for a in 0..=255u64 {
+            for b in 0..=255u64 {
+                let bindings = env(&[("rn", a), ("rm", b)]);
+                assert_eq!(packed(&subs, &bindings), packed(&cmp, &bindings));
+                assert_eq!(
+                    result.eval(&bindings),
+                    EvalResult::Bv(a.wrapping_sub(b) & 0xff)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn carry_readers_use_the_incoming_c_flag_and_wide_values() {
+        let rn = SmtExpr::var("rn", 64);
+        let rm = SmtExpr::var("rm", 64);
+        let carry = SmtExpr::var("c", 1);
+        let adc = encode_adc(rn.clone(), rm.clone(), carry.clone(), 64);
+        let sbc = encode_sbc(rn.clone(), rm.clone(), carry.clone(), 64);
+        let (_, adcs) = encode_adcs(rn.clone(), rm.clone(), carry.clone(), 64);
+        let (_, sbcs) = encode_sbcs(rn, rm, carry, 64);
+        for (a, b) in [
+            (u64::MAX, 0),
+            (u64::MAX, u64::MAX),
+            (0x7fff_ffff_ffff_ffff, 0),
+            (0, 0),
+            (0x8000_0000_0000_0000, 1),
+        ] {
+            for c in 0..=1u64 {
+                let bindings = env(&[("rn", a), ("rm", b), ("c", c)]);
+                let (want_adc, want_adcs) = oracle(a, b, c, 64);
+                let (want_sbc, want_sbcs) = oracle(a, !b, c, 64);
+                assert_eq!(adc.eval(&bindings), EvalResult::Bv(want_adc));
+                assert_eq!(sbc.eval(&bindings), EvalResult::Bv(want_sbc));
+                assert_eq!(packed(&adcs, &bindings), want_adcs);
+                assert_eq!(packed(&sbcs, &bindings), want_sbcs);
+            }
+        }
+        // The C flag round-trips as a 1-bit adder input.
+        let flags = NzcvFlags {
+            n: SmtExpr::bool_const(false),
+            z: SmtExpr::bool_const(false),
+            c: SmtExpr::bool_const(true),
+            v: SmtExpr::bool_const(false),
+        };
+        assert_eq!(carry_bit(&flags).eval(&env(&[])), EvalResult::Bv(1));
+        assert_eq!(packed(&flags, &env(&[])), 0b0010);
     }
 }

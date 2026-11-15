@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Differential regression test for MISCOMPILE #102: a loop-carried accumulator
 // reassigned by a GENERIC TRAIT-METHOD `Call` rvalue was dropped at -O3.
@@ -49,65 +53,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m102 test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -125,7 +78,7 @@ fn write_panic_stubs(dir: &Path, objs: &[PathBuf]) -> PathBuf {
         let nm = Command::new("nm").arg("-u").arg(obj).output().expect("nm");
         for line in String::from_utf8_lossy(&nm.stdout).lines() {
             let sym = line.trim().trim_start_matches('U').trim();
-            if sym.contains("panic") && seen.insert(sym.to_owned()) {
+            if toolchain_support::is_abort_stub_symbol(sym) && seen.insert(sym.to_owned()) {
                 let c = sym.strip_prefix('_').unwrap_or(sym);
                 stubs.push_str(&format!(
                     "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -147,10 +100,8 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> O
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
@@ -162,7 +113,7 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> O
         .arg("--out-dir")
         .arg(&dir)
         .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() {
         // The trust-cg backend is allowed to fail CLOSED (e.g. an unsupported MIR
         // shape skipped, so a required symbol is missing). That is match-or-fail-
@@ -185,7 +136,11 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> O
     if objs.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
         // No object: a fail-closed skip on the trust path is acceptable.
-        return if dylib.is_some() { None } else { panic!("{stem} (opt={opt}, LLVM): no object") };
+        return if dylib.is_some() {
+            None
+        } else {
+            panic!("{stem} (opt={opt}, LLVM): no object")
+        };
     }
 
     let stubs_path = write_panic_stubs(&dir, &objs);
@@ -233,8 +188,8 @@ fn differential_program(stem: &str, body: &str, expected: i32) {
          #[panic_handler]\nfn ph(_: &core::panic::PanicInfo) -> ! {{ loop {{}} }}\n{body}\n"
     );
     for opt in ["0", "3"] {
-        let llvm = compile_link_run(stem, &src, opt, None)
-            .expect("LLVM oracle must compile and run");
+        let llvm =
+            compile_link_run(stem, &src, opt, None).expect("LLVM oracle must compile and run");
         assert_eq!(
             llvm, expected,
             "{stem} (opt={opt}): LLVM oracle returned {llvm}, expected {expected}"
@@ -252,21 +207,17 @@ fn differential_program(stem: &str, body: &str, expected: i32) {
     }
 }
 
-const SUMV: &str =
-    "use core::ops::Add;\n\
+const SUMV: &str = "use core::ops::Add;\n\
      #[inline(never)] fn sumv<T: Add<Output=T> + Copy>(v:&[T], init:T)->T{ \
         let mut s=init; for &x in v { s = s + x; } s }\n";
-const PRODV: &str =
-    "use core::ops::Mul;\n\
+const PRODV: &str = "use core::ops::Mul;\n\
      #[inline(never)] fn prodv<T: Mul<Output=T> + Copy>(v:&[T], init:T)->T{ \
         let mut s=init; for &x in v { s = s * x; } s }\n";
-const SUBV: &str =
-    "use core::ops::Sub;\n\
+const SUBV: &str = "use core::ops::Sub;\n\
      #[inline(never)] fn subv<T: Sub<Output=T> + Copy>(v:&[T], init:T)->T{ \
         let mut s=init; for &x in v { s = s - x; } s }\n";
 // A user-defined trait (not a std operator) — same loop-carried-via-Call shape.
-const COMBV: &str =
-    "trait Combine { fn comb(self, o:Self)->Self; }\n\
+const COMBV: &str = "trait Combine { fn comb(self, o:Self)->Self; }\n\
      impl Combine for i32 { #[inline(never)] fn comb(self,o:i32)->i32 { \
         self.wrapping_mul(2).wrapping_add(o) } }\n\
      #[inline(never)] fn combv<T: Combine + Copy>(v:&[T], init:T)->T{ \
@@ -277,8 +228,10 @@ const COMBV: &str =
 fn m102_generic_add_single_element_matches_llvm() {
     differential_program(
         "add_single",
-        &format!("{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            (sumv(&[40i32], 5) % 120) as i32 }}"),
+        &format!(
+            "{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            (sumv(&[40i32], 5) % 120) as i32 }}"
+        ),
         45,
     );
 }
@@ -288,8 +241,10 @@ fn m102_generic_add_single_element_matches_llvm() {
 fn m102_generic_add_multi_element_matches_llvm() {
     differential_program(
         "add_multi",
-        &format!("{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            sumv(&[1i32,2,3,4,5], 100) }}"),
+        &format!(
+            "{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            sumv(&[1i32,2,3,4,5], 100) }}"
+        ),
         // 100 + 1+2+3+4+5 = 115
         115,
     );
@@ -300,8 +255,10 @@ fn m102_generic_add_multi_element_matches_llvm() {
 fn m102_generic_mul_accumulator_matches_llvm() {
     differential_program(
         "mul_acc",
-        &format!("{PRODV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            prodv(&[2i32,3,4], 1) }}"),
+        &format!(
+            "{PRODV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            prodv(&[2i32,3,4], 1) }}"
+        ),
         // 1 * 2*3*4 = 24
         24,
     );
@@ -312,8 +269,10 @@ fn m102_generic_mul_accumulator_matches_llvm() {
 fn m102_generic_sub_accumulator_matches_llvm() {
     differential_program(
         "sub_acc",
-        &format!("{SUBV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            subv(&[1i32,2,3], 100) }}"),
+        &format!(
+            "{SUBV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            subv(&[1i32,2,3], 100) }}"
+        ),
         // 100 - 1 - 2 - 3 = 94
         94,
     );
@@ -324,8 +283,10 @@ fn m102_generic_sub_accumulator_matches_llvm() {
 fn m102_custom_trait_accumulator_matches_llvm() {
     differential_program(
         "custom_trait",
-        &format!("{COMBV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            combv(&[1i32,2,3], 0) }}"),
+        &format!(
+            "{COMBV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            combv(&[1i32,2,3], 0) }}"
+        ),
         // ((0*2+1)*2+2)*2+3 = (1)*2+2=4; 4*2+3 = 11
         11,
     );
@@ -336,8 +297,10 @@ fn m102_custom_trait_accumulator_matches_llvm() {
 fn m102_generic_add_i64_accumulator_matches_llvm() {
     differential_program(
         "add_i64",
-        &format!("{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            sumv(&[10i64,20,30], 0i64) as i32 }}"),
+        &format!(
+            "{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            sumv(&[10i64,20,30], 0i64) as i32 }}"
+        ),
         // 0 + 10+20+30 = 60
         60,
     );
@@ -348,8 +311,10 @@ fn m102_generic_add_i64_accumulator_matches_llvm() {
 fn m102_generic_add_empty_slice_keeps_init_matches_llvm() {
     differential_program(
         "add_empty",
-        &format!("{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            sumv(&[] as &[i32], 7) }}"),
+        &format!(
+            "{SUMV}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            sumv(&[] as &[i32], 7) }}"
+        ),
         7,
     );
 }

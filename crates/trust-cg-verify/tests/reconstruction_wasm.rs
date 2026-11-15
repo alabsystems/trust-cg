@@ -544,8 +544,11 @@ fn non_reconstructable_opcodes_do_not_reconstruct() {
         WasmOpcode::Call,
         WasmOpcode::CallIndirect,
         WasmOpcode::I32Const,
-        // f.min/f.max never selected
+        // f.min/f.max are emitted only inside the FMin/FMax sequence, whose
+        // evidence is the emitted body (wasm_float_binop_proofs), never a
+        // per-opcode reconstruction: the bare opcode propagates NaN.
         WasmOpcode::F32Min,
+        WasmOpcode::F64Max,
         // STRUCTURAL v128 (memory + materialization families) — NOT value ops, so
         // NOT reconstructable. (The 4 v128 LANE-WISE value ops i32x4.add/mul,
         // f32x4.add/mul ARE reconstructable — see mod simd_v128.)
@@ -1153,4 +1156,650 @@ mod simd_v128 {
             "correct f32x4.add lane must equal fp.add"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// copysign — reconstructed over the operands' IEEE-754 BIT PATTERNS
+// ---------------------------------------------------------------------------
+
+mod copysign {
+    use super::*;
+    use trust_cg_verify::trust_ir_semantics::encode_trust_ir_fcopysign;
+    use trust_cg_verify::wasm_semantics::{WasmCopysignOp, decode_copysign, encode_copysign};
+
+    fn refutes(ob: &ProofObligation) -> bool {
+        matches!(verify_by_evaluation(ob), VerificationResult::Invalid { .. })
+    }
+
+    fn sign(width: u32) -> SmtExpr {
+        SmtExpr::bv_const(1u64 << (width - 1), width)
+    }
+
+    /// Both widths reconstruct Valid, Reconstructed, from their real bytes.
+    #[test]
+    fn copysign_reconstructs_valid_at_both_widths() {
+        for (op, width) in [(WasmOpcode::F32Copysign, 32), (WasmOpcode::F64Copysign, 64)] {
+            let inst = representative_wasm_reconstructable_inst(op)
+                .unwrap_or_else(|| panic!("{op:?} must have a representative"));
+            assert_eq!(inst.operand_width_bits, width);
+            let ob = reconstruct_wasm_alu_obligation(&inst)
+                .unwrap_or_else(|| panic!("{op:?} must reconstruct"));
+            assert!(ob.is_reconstructed());
+            assert_eq!(ob.inputs.len(), 2, "two bit-pattern leaves");
+            assert!(
+                ob.fp_inputs.is_empty(),
+                "compared as bit patterns, not FP values"
+            );
+            assert!(
+                matches!(verify_by_evaluation(&ob), VerificationResult::Valid),
+                "{op:?} must be Valid"
+            );
+        }
+    }
+
+    /// The decoder is typed: each byte names its width, a byte of the other
+    /// width fails the reconstruction closed, and a neighbouring FP byte is not
+    /// copysign.
+    #[test]
+    fn copysign_decode_is_typed_and_fails_closed() {
+        assert_eq!(decode_copysign(0x98), Some(WasmCopysignOp::F32));
+        assert_eq!(decode_copysign(0xa6), Some(WasmCopysignOp::F64));
+        for byte in [0x8b, 0x8c, 0x96, 0x97, 0x99, 0x9a, 0xa4, 0xa5] {
+            assert_eq!(decode_copysign(byte), None, "0x{byte:02x}");
+        }
+        assert!(
+            reconstruct_wasm_alu_obligation(&WasmISelInst::new(WasmOpcode::F32Copysign, 64))
+                .is_none(),
+            "an f32.copysign byte at 64-bit operands must fail closed"
+        );
+        assert!(
+            reconstruct_wasm_alu_obligation(&WasmISelInst::new(WasmOpcode::F64Copysign, 32))
+                .is_none(),
+            "an f64.copysign byte at 32-bit operands must fail closed"
+        );
+    }
+
+    /// REFUTE: the operands swapped — `copysign(sign, magnitude)`.
+    #[test]
+    fn swapped_operands_refute() {
+        for width in [32, 64] {
+            let a = SmtExpr::var("recon_a", width);
+            let b = SmtExpr::var("recon_b", width);
+            let ob = buggy_binary(
+                "FCopySign -> copysign with swapped operands (INJECTED)",
+                "Copysign",
+                encode_trust_ir_fcopysign(a.clone(), b.clone()),
+                encode_copysign(b, a, width),
+                width,
+            );
+            assert!(
+                refutes(&ob),
+                "swapped copysign operands must REFUTE at {width}"
+            );
+        }
+    }
+
+    /// REFUTE: `fabs` of the magnitude operand in place of copysign.
+    #[test]
+    fn fabs_for_copysign_refutes() {
+        for width in [32, 64] {
+            let a = SmtExpr::var("recon_a", width);
+            let b = SmtExpr::var("recon_b", width);
+            let all = SmtExpr::bv_const(u64::MAX >> (64 - width), width);
+            let fabs = a.clone().bvand(sign(width).bvxor(all));
+            let ob = buggy_binary(
+                "FCopySign -> fabs (INJECTED)",
+                "Copysign",
+                encode_trust_ir_fcopysign(a, b),
+                fabs,
+                width,
+            );
+            assert!(refutes(&ob), "fabs for copysign must REFUTE at {width}");
+        }
+    }
+
+    /// REFUTE: `fneg` of the magnitude operand in place of copysign.
+    #[test]
+    fn fneg_for_copysign_refutes() {
+        for width in [32, 64] {
+            let a = SmtExpr::var("recon_a", width);
+            let b = SmtExpr::var("recon_b", width);
+            let fneg = a.clone().bvxor(sign(width));
+            let ob = buggy_binary(
+                "FCopySign -> fneg (INJECTED)",
+                "Copysign",
+                encode_trust_ir_fcopysign(a, b),
+                fneg,
+                width,
+            );
+            assert!(refutes(&ob), "fneg for copysign must REFUTE at {width}");
+        }
+    }
+
+    /// REFUTE: a machine side that replaces a NaN magnitude by the canonical
+    /// NaN (keeping only the transferred sign). trust-ir copySign keeps the
+    /// payload, and the bit-pattern obligation sees the difference, which an
+    /// NaN-equals-NaN FP comparison would not.
+    #[test]
+    fn canonicalizing_a_nan_payload_refutes() {
+        let width = 32;
+        let a = SmtExpr::var("recon_a", width);
+        let b = SmtExpr::var("recon_b", width);
+        let exp = SmtExpr::bv_const(0x7f80_0000, width);
+        let frac = SmtExpr::bv_const(0x007f_ffff, width);
+        let is_nan = a.clone().bvand(exp.clone()).eq_expr(exp).and_expr(
+            a.clone()
+                .bvand(frac)
+                .eq_expr(SmtExpr::bv_const(0, width))
+                .not_expr(),
+        );
+        let canonical = SmtExpr::bv_const(0x7fc0_0000, width).bvor(b.clone().bvand(sign(width)));
+        let machine = SmtExpr::ite(
+            is_nan,
+            canonical,
+            encode_copysign(a.clone(), b.clone(), width),
+        );
+        let ob = buggy_binary(
+            "FCopySign -> copysign that canonicalizes a NaN magnitude (INJECTED)",
+            "F32Copysign",
+            encode_trust_ir_fcopysign(a, b),
+            machine,
+            width,
+        );
+        assert!(refutes(&ob), "a NaN-canonicalizing copysign must REFUTE");
+    }
+
+    /// The captured emitted bodies fix the operand order the representative
+    /// reconstruction assumes (magnitude deeper than sign): the body credit
+    /// stands for both widths, and swapping the body's operands refutes.
+    #[test]
+    fn copysign_body_credit_stands_and_its_controls_refute() {
+        use trust_cg_verify::wasm_float_binop_proofs::{
+            EMITTED_FLOAT_BINOP_BODIES, float_binop_body_discharges_valid,
+            float_binop_credit_failures,
+        };
+        for byte in [0x98u8, 0xa6] {
+            assert!(float_binop_body_discharges_valid(byte), "0x{byte:02x}");
+            assert!(float_binop_credit_failures(byte, EMITTED_FLOAT_BINOP_BODIES).is_empty());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// f.min / f.max — credited by the emitted FMin/FMax BODY, never per opcode
+// ---------------------------------------------------------------------------
+
+mod fminmax_body {
+    use trust_cg_verify::wasm_float_binop_proofs::{
+        EMITTED_FLOAT_BINOP_BODIES, EmittedFloatBinopBody, FloatBinopControl, FloatBinopKind,
+        InputClass, NanChoice, TieReading, check_float_binop_body,
+        float_binop_body_discharges_valid, float_binop_credit_failures, run_float_binop_body,
+        trust_ir_float_binop_allows,
+    };
+
+    fn body(kind: FloatBinopKind, width: u32) -> &'static [u8] {
+        EMITTED_FLOAT_BINOP_BODIES
+            .iter()
+            .find(|(k, w, _)| *k == kind && *w == width)
+            .map(|(_, _, e)| *e)
+            .expect("captured")
+    }
+
+    /// The four rows credit, and every control of every row refutes at its
+    /// stated input class (the hook itself demands that).
+    #[test]
+    fn min_max_rows_credit_with_every_control_refuting() {
+        for byte in [0x96u8, 0x97, 0xa4, 0xa5] {
+            let failures = float_binop_credit_failures(byte, EMITTED_FLOAT_BINOP_BODIES);
+            assert!(failures.is_empty(), "0x{byte:02x}: {failures:#?}");
+            assert!(float_binop_body_discharges_valid(byte));
+        }
+        // Not a float binop row.
+        assert!(!float_binop_body_discharges_valid(0x92));
+    }
+
+    /// The body's semantics on the cases trust-ir pins: a lone NaN yields the
+    /// other operand bit-exactly under every wasm NaN choice, two NaNs yield a
+    /// NaN, and the signed-zero tie yields wasm's `-0.0` for min / `+0.0` for
+    /// max, which the contract admits (either operand).
+    #[test]
+    fn body_semantics_at_the_pinned_cases() {
+        let (qnan, snan) = (0x7fc0_0000u64, 0xff80_0011u64);
+        let (neg_zero, one) = (0x8000_0000u64, 0x3f80_0000u64);
+        for nan in NanChoice::ALL {
+            let min = body(FloatBinopKind::Min, 32);
+            assert_eq!(run_float_binop_body(min, 32, qnan, one, nan), Ok(one));
+            assert_eq!(run_float_binop_body(min, 32, one, snan, nan), Ok(one));
+            let both = run_float_binop_body(min, 32, qnan, snan, nan).expect("runs");
+            assert_eq!(both, snan, "two NaNs: the body returns b, a NaN");
+            assert_eq!(
+                run_float_binop_body(min, 32, 0, neg_zero, nan),
+                Ok(neg_zero)
+            );
+            assert_eq!(
+                run_float_binop_body(min, 32, neg_zero, 0, nan),
+                Ok(neg_zero)
+            );
+            let max = body(FloatBinopKind::Max, 32);
+            assert_eq!(run_float_binop_body(max, 32, 0, neg_zero, nan), Ok(0));
+            assert_eq!(run_float_binop_body(max, 32, neg_zero, 0, nan), Ok(0));
+        }
+        assert!(
+            trust_ir_float_binop_allows(
+                FloatBinopKind::Min,
+                32,
+                neg_zero,
+                0,
+                neg_zero,
+                TieReading::EitherOperand
+            )
+            .is_ok()
+        );
+    }
+
+    /// The tie is REACHED: pinned to the second operand, the real body refutes
+    /// at the signed-zero tie and nowhere else.
+    #[test]
+    fn a_pinned_tie_reading_refutes_only_at_the_tie() {
+        for (kind, width) in [
+            (FloatBinopKind::Min, 32),
+            (FloatBinopKind::Max, 32),
+            (FloatBinopKind::Min, 64),
+            (FloatBinopKind::Max, 64),
+        ] {
+            let v =
+                check_float_binop_body(kind, width, body(kind, width), TieReading::SecondOperand);
+            assert_eq!(
+                v.refuted_classes.into_iter().collect::<Vec<_>>(),
+                vec![InputClass::SignedZeroTie],
+                "{kind:?} f{width}"
+            );
+        }
+    }
+
+    /// The hook refuses a doctored corpus: a body with the opposite op, a
+    /// missing body, and a duplicated body.
+    #[test]
+    fn the_hook_refuses_a_doctored_corpus() {
+        let mut swapped: Vec<EmittedFloatBinopBody> = EMITTED_FLOAT_BINOP_BODIES.to_vec();
+        let at = swapped
+            .iter()
+            .position(|(k, w, _)| *k == FloatBinopKind::Min && *w == 32)
+            .expect("captured");
+        swapped[at].2 = body(FloatBinopKind::Max, 32);
+        assert!(!float_binop_credit_failures(0x96, &swapped).is_empty());
+
+        let missing: Vec<EmittedFloatBinopBody> = EMITTED_FLOAT_BINOP_BODIES
+            .iter()
+            .copied()
+            .filter(|(k, w, _)| !(*k == FloatBinopKind::Max && *w == 64))
+            .collect();
+        assert!(!float_binop_credit_failures(0xa5, &missing).is_empty());
+
+        let mut doubled: Vec<EmittedFloatBinopBody> = EMITTED_FLOAT_BINOP_BODIES.to_vec();
+        doubled.push(doubled[at]);
+        assert!(!float_binop_credit_failures(0x96, &doubled).is_empty());
+    }
+
+    /// Each min/max control, built from the captured body, refutes at its
+    /// stated class.
+    #[test]
+    fn each_min_max_control_refutes_at_its_stated_class() {
+        for (kind, width) in [
+            (FloatBinopKind::Min, 32),
+            (FloatBinopKind::Max, 32),
+            (FloatBinopKind::Min, 64),
+            (FloatBinopKind::Max, 64),
+        ] {
+            for control in FloatBinopControl::ALL {
+                if !control.applies_to(kind) {
+                    continue;
+                }
+                let (mutated, tie) = control
+                    .build(kind, width, body(kind, width))
+                    .unwrap_or_else(|| panic!("{control:?} builds on {kind:?} f{width}"));
+                let v = check_float_binop_body(kind, width, &mutated, tie);
+                let class = control
+                    .stated_class()
+                    .expect("min/max controls state a class");
+                assert!(
+                    v.refusal.is_none() && v.refuted_classes.contains(&class),
+                    "{control:?} on {kind:?} f{width}: {v:#?}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The decoded byte is the byte the backend writes
+// ---------------------------------------------------------------------------
+
+/// Every reconstruction decodes `WasmOpcode::opcode_byte()` (and, for a
+/// `0xfc` form, `trunc_sat_sub_opcode()` / `bulk_memory_sub_opcode()`), while
+/// the wasm encoder writes its own `trust_cg_codegen::wasm::encode::op`
+/// constants and never consults that table. A disagreement (say
+/// `I32_ROTL = 0x78`, or `I32_TRUNC_SAT_F64_S = 3`) would emit one opcode for
+/// every instance while the credit stays green on the other, so the two tables
+/// are compared here: every single-byte `WasmOpcode` against the encoder
+/// constant of the same name, and every `0xfc` form as the FULL (prefix,
+/// sub-index) pair — the sub-index as the value AND as the LEB128 bytes the
+/// encoder writes after the prefix. Every reconstructable opcode must be in one
+/// of the two comparisons, and so must every emitted `0xfc` form. The `0xfd`
+/// SIMD forms have no encoder constant: the lowerer never selects a v128 value.
+#[test]
+fn decoded_opcode_bytes_match_the_encoder_constants() {
+    use WasmOpcode as O;
+    use trust_cg_codegen::wasm::encode::op;
+    use trust_cg_verify::coverage_gate::ALL_WASM_OPCODES;
+
+    let single_byte: &[(WasmOpcode, u8)] = &[
+        (O::I32Add, op::I32_ADD),
+        (O::I64Add, op::I64_ADD),
+        (O::I32Sub, op::I32_SUB),
+        (O::I64Sub, op::I64_SUB),
+        (O::I32Mul, op::I32_MUL),
+        (O::I64Mul, op::I64_MUL),
+        (O::I32DivS, op::I32_DIV_S),
+        (O::I64DivS, op::I64_DIV_S),
+        (O::I32DivU, op::I32_DIV_U),
+        (O::I64DivU, op::I64_DIV_U),
+        (O::I32RemS, op::I32_REM_S),
+        (O::I64RemS, op::I64_REM_S),
+        (O::I32RemU, op::I32_REM_U),
+        (O::I64RemU, op::I64_REM_U),
+        (O::I32And, op::I32_AND),
+        (O::I64And, op::I64_AND),
+        (O::I32Or, op::I32_OR),
+        (O::I64Or, op::I64_OR),
+        (O::I32Xor, op::I32_XOR),
+        (O::I64Xor, op::I64_XOR),
+        (O::I32Shl, op::I32_SHL),
+        (O::I64Shl, op::I64_SHL),
+        (O::I32ShrS, op::I32_SHR_S),
+        (O::I64ShrS, op::I64_SHR_S),
+        (O::I32ShrU, op::I32_SHR_U),
+        (O::I64ShrU, op::I64_SHR_U),
+        (O::I32Popcnt, op::I32_POPCNT),
+        (O::I64Popcnt, op::I64_POPCNT),
+        (O::I32Clz, op::I32_CLZ),
+        (O::I64Clz, op::I64_CLZ),
+        (O::I32Ctz, op::I32_CTZ),
+        (O::I64Ctz, op::I64_CTZ),
+        (O::I32Rotl, op::I32_ROTL),
+        (O::I64Rotl, op::I64_ROTL),
+        (O::I32Rotr, op::I32_ROTR),
+        (O::I64Rotr, op::I64_ROTR),
+        (O::I32Eq, op::I32_EQ),
+        (O::I64Eq, op::I64_EQ),
+        (O::I32Ne, op::I32_NE),
+        (O::I64Ne, op::I64_NE),
+        (O::I32LtS, op::I32_LT_S),
+        (O::I64LtS, op::I64_LT_S),
+        (O::I32LtU, op::I32_LT_U),
+        (O::I64LtU, op::I64_LT_U),
+        (O::I32GtS, op::I32_GT_S),
+        (O::I64GtS, op::I64_GT_S),
+        (O::I32GtU, op::I32_GT_U),
+        (O::I64GtU, op::I64_GT_U),
+        (O::I32LeS, op::I32_LE_S),
+        (O::I64LeS, op::I64_LE_S),
+        (O::I32LeU, op::I32_LE_U),
+        (O::I64LeU, op::I64_LE_U),
+        (O::I32GeS, op::I32_GE_S),
+        (O::I64GeS, op::I64_GE_S),
+        (O::I32GeU, op::I32_GE_U),
+        (O::I64GeU, op::I64_GE_U),
+        (O::I32Eqz, op::I32_EQZ),
+        (O::I64Eqz, op::I64_EQZ),
+        (O::F32Add, op::F32_ADD),
+        (O::F64Add, op::F64_ADD),
+        (O::F32Sub, op::F32_SUB),
+        (O::F64Sub, op::F64_SUB),
+        (O::F32Mul, op::F32_MUL),
+        (O::F64Mul, op::F64_MUL),
+        (O::F32Div, op::F32_DIV),
+        (O::F64Div, op::F64_DIV),
+        (O::F32Min, op::F32_MIN),
+        (O::F64Min, op::F64_MIN),
+        (O::F32Max, op::F32_MAX),
+        (O::F64Max, op::F64_MAX),
+        (O::F32Copysign, op::F32_COPYSIGN),
+        (O::F64Copysign, op::F64_COPYSIGN),
+        (O::F32Eq, op::F32_EQ),
+        (O::F64Eq, op::F64_EQ),
+        (O::F32Ne, op::F32_NE),
+        (O::F64Ne, op::F64_NE),
+        (O::F32Lt, op::F32_LT),
+        (O::F64Lt, op::F64_LT),
+        (O::F32Gt, op::F32_GT),
+        (O::F64Gt, op::F64_GT),
+        (O::F32Le, op::F32_LE),
+        (O::F64Le, op::F64_LE),
+        (O::F32Ge, op::F32_GE),
+        (O::F64Ge, op::F64_GE),
+        (O::F32Abs, op::F32_ABS),
+        (O::F64Abs, op::F64_ABS),
+        (O::F32Neg, op::F32_NEG),
+        (O::F64Neg, op::F64_NEG),
+        (O::F32Sqrt, op::F32_SQRT),
+        (O::F64Sqrt, op::F64_SQRT),
+        (O::F32Ceil, op::F32_CEIL),
+        (O::F64Ceil, op::F64_CEIL),
+        (O::F32Floor, op::F32_FLOOR),
+        (O::F64Floor, op::F64_FLOOR),
+        (O::F32Trunc, op::F32_TRUNC),
+        (O::F64Trunc, op::F64_TRUNC),
+        (O::I32WrapI64, op::I32_WRAP_I64),
+        (O::I64ExtendI32S, op::I64_EXTEND_I32_S),
+        (O::I64ExtendI32U, op::I64_EXTEND_I32_U),
+        (O::F32DemoteF64, op::F32_DEMOTE_F64),
+        (O::F64PromoteF32, op::F64_PROMOTE_F32),
+        (O::F32ConvertI32S, op::F32_CONVERT_I32_S),
+        (O::F32ConvertI32U, op::F32_CONVERT_I32_U),
+        (O::F32ConvertI64S, op::F32_CONVERT_I64_S),
+        (O::F32ConvertI64U, op::F32_CONVERT_I64_U),
+        (O::F64ConvertI32S, op::F64_CONVERT_I32_S),
+        (O::F64ConvertI32U, op::F64_CONVERT_I32_U),
+        (O::F64ConvertI64S, op::F64_CONVERT_I64_S),
+        (O::F64ConvertI64U, op::F64_CONVERT_I64_U),
+        (O::I32ReinterpretF32, op::I32_REINTERPRET_F32),
+        (O::I64ReinterpretF64, op::I64_REINTERPRET_F64),
+        (O::F32ReinterpretI32, op::F32_REINTERPRET_I32),
+        (O::F64ReinterpretI64, op::F64_REINTERPRET_I64),
+        (O::I32Const, op::I32_CONST),
+        (O::I64Const, op::I64_CONST),
+        (O::F32Const, op::F32_CONST),
+        (O::F64Const, op::F64_CONST),
+        (O::LocalGet, op::LOCAL_GET),
+        (O::LocalSet, op::LOCAL_SET),
+        (O::LocalTee, op::LOCAL_TEE),
+        (O::GlobalGet, op::GLOBAL_GET),
+        (O::GlobalSet, op::GLOBAL_SET),
+        (O::I32Load, op::I32_LOAD),
+        (O::I64Load, op::I64_LOAD),
+        (O::I32Store, op::I32_STORE),
+        (O::I64Store, op::I64_STORE),
+        (O::Unreachable, op::UNREACHABLE),
+        (O::Nop, op::NOP),
+        (O::Block, op::BLOCK),
+        (O::Loop, op::LOOP),
+        (O::If, op::IF),
+        (O::Else, op::ELSE),
+        (O::End, op::END),
+        (O::Br, op::BR),
+        (O::BrIf, op::BR_IF),
+        (O::BrTable, op::BR_TABLE),
+        (O::Return, op::RETURN),
+        (O::Drop, op::DROP),
+        (O::Select, op::SELECT),
+        (O::Call, op::CALL),
+        (O::CallIndirect, op::CALL_INDIRECT),
+    ];
+    for &(opcode, written) in single_byte {
+        assert_eq!(
+            opcode.opcode_byte(),
+            written,
+            "{opcode:?}: the reconstruction decodes {:#04x} but the encoder writes {written:#04x}",
+            opcode.opcode_byte()
+        );
+    }
+    let fc_forms: &[(WasmOpcode, u32)] = &[
+        (O::I32TruncSatF32S, op::I32_TRUNC_SAT_F32_S),
+        (O::I32TruncSatF32U, op::I32_TRUNC_SAT_F32_U),
+        (O::I32TruncSatF64S, op::I32_TRUNC_SAT_F64_S),
+        (O::I32TruncSatF64U, op::I32_TRUNC_SAT_F64_U),
+        (O::I64TruncSatF32S, op::I64_TRUNC_SAT_F32_S),
+        (O::I64TruncSatF32U, op::I64_TRUNC_SAT_F32_U),
+        (O::I64TruncSatF64S, op::I64_TRUNC_SAT_F64_S),
+        (O::I64TruncSatF64U, op::I64_TRUNC_SAT_F64_U),
+        (O::MemoryCopy, op::MEMORY_COPY),
+        (O::MemoryFill, op::MEMORY_FILL),
+    ];
+    for &(opcode, written_sub) in fc_forms {
+        let decoded_sub = opcode
+            .trunc_sat_sub_opcode()
+            .or(opcode.bulk_memory_sub_opcode());
+        let mut written = vec![op::FC_PREFIX];
+        trust_cg_codegen::wasm::encode::write_uleb128(&mut written, u64::from(written_sub));
+        let mut decoded = vec![opcode.opcode_byte()];
+        if let Some(sub) = decoded_sub {
+            trust_cg_codegen::wasm::encode::write_uleb128(&mut decoded, u64::from(sub));
+        }
+        assert_eq!(
+            decoded, written,
+            "{opcode:?}: the reconstruction decodes {decoded:02x?} (0xfc sub-index \
+             {decoded_sub:?}) but the encoder writes {written:02x?}"
+        );
+    }
+    for &opcode in ALL_WASM_OPCODES {
+        let reconstructed = representative_wasm_reconstructable_inst(opcode).is_some();
+        match opcode.opcode_byte() {
+            0xfc => assert!(
+                fc_forms.iter().any(|&(o, _)| o == opcode),
+                "{opcode:?} is a 0xfc form with no (prefix, sub-index) encoder cross-check"
+            ),
+            0xfd => {}
+            _ if reconstructed => assert!(
+                single_byte.iter().any(|&(o, _)| o == opcode),
+                "{opcode:?} is reconstructed from its byte but has no encoder cross-check"
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// The cross-check above has teeth: a (prefix, sub-index) pair whose sub-index
+/// is the other signedness (the swap of `I32_TRUNC_SAT_F64_S` and `_U`) differs
+/// from the pair the reconstruction decodes, as does a sub-index of the other
+/// width, while the 0xfc prefix alone is identical for all of them.
+#[test]
+fn a_swapped_trunc_sat_sub_index_is_seen_by_the_full_pair() {
+    use trust_cg_codegen::wasm::encode::{op, write_uleb128};
+    let pair = |sub: u32| {
+        let mut v = vec![op::FC_PREFIX];
+        write_uleb128(&mut v, u64::from(sub));
+        v
+    };
+    let decoded = |o: WasmOpcode| {
+        let mut v = vec![o.opcode_byte()];
+        write_uleb128(&mut v, u64::from(o.trunc_sat_sub_opcode().unwrap()));
+        v
+    };
+    assert_ne!(
+        decoded(WasmOpcode::I32TruncSatF64S),
+        pair(op::I32_TRUNC_SAT_F64_U)
+    );
+    assert_ne!(
+        decoded(WasmOpcode::I64TruncSatF32S),
+        pair(op::I64_TRUNC_SAT_F32_U)
+    );
+    assert_ne!(
+        decoded(WasmOpcode::I32TruncSatF32S),
+        pair(op::I64_TRUNC_SAT_F32_S)
+    );
+    assert_eq!(
+        WasmOpcode::I32TruncSatF64S.opcode_byte(),
+        WasmOpcode::I32TruncSatF64U.opcode_byte(),
+        "the prefix alone cannot tell the forms apart"
+    );
+}
+
+/// The conversions' SOURCE side is the opcode NAME's intent, not the byte
+/// table the machine side decodes, so a table that decoded a signed form as
+/// unsigned (both tables swapped consistently, which the encoder cross-check
+/// cannot see) REFUTES, and one that decoded another width fails closed.
+#[test]
+fn a_conversion_whose_decoded_signedness_is_not_its_names_refutes() {
+    use trust_cg_verify::trust_ir_semantics::{
+        encode_trust_ir_fcvt_to_sint, encode_trust_ir_fcvt_to_uint,
+    };
+    use trust_cg_verify::wasm_function_verifier::{intended_convert, intended_trunc_sat};
+    use trust_cg_verify::wasm_semantics::{encode_trunc_sat_s, encode_trunc_sat_u};
+
+    // Every conversion has a name-derived intent, and the byte tables agree
+    // with it today.
+    for &opcode in trust_cg_verify::coverage_gate::ALL_WASM_OPCODES {
+        if let Some(i) = intended_trunc_sat(opcode) {
+            let d = decode_trunc_sat(opcode.opcode_byte(), opcode.trunc_sat_sub_opcode().unwrap())
+                .expect("decodes");
+            assert_eq!(
+                (d.fp_width, d.int_width, d.signed),
+                (i.fp_width, i.int_width, i.signed),
+                "{opcode:?}"
+            );
+        }
+        if let Some(i) = intended_convert(opcode) {
+            let d = decode_convert(opcode.opcode_byte()).expect("decodes");
+            assert_eq!(
+                (d.src_width, d.fp_width, d.signed),
+                (i.int_width, i.fp_width, i.signed),
+                "{opcode:?}"
+            );
+        }
+    }
+    // The obligation a swapped table would build for I64TruncSatF32S: the
+    // machine side decoded as UNSIGNED, the source side the name's SIGNED.
+    let a = SmtExpr::var("recon_a", 32);
+    let ob = ProofObligation {
+        name: "I64TruncSatF32S decoded as _u (INJECTED)".to_string(),
+        trust_ir_expr: encode_trust_ir_fcvt_to_sint(64, a.clone()),
+        aarch64_expr: encode_trunc_sat_u(a.clone(), 64),
+        inputs: vec![],
+        fp_inputs: vec![("recon_a".to_string(), 8, 24)],
+        preconditions: vec![],
+        category: None,
+        machine_side_provenance:
+            trust_cg_verify::lowering_proof::MachineSideProvenance::Reconstructed {
+                from_opcode: "I64TruncSatF32S".to_string(),
+                arity: 1,
+            },
+    };
+    assert!(
+        matches!(
+            verify_by_evaluation(&ob),
+            VerificationResult::Invalid { .. }
+        ),
+        "a signed trunc_sat decoded as unsigned must REFUTE"
+    );
+    // And the honest pairing stays Valid.
+    let ok = ProofObligation {
+        name: "I64TruncSatF32S (sanity)".to_string(),
+        trust_ir_expr: encode_trust_ir_fcvt_to_uint(64, a.clone()),
+        aarch64_expr: encode_trunc_sat_u(a.clone(), 64),
+        ..ob.clone()
+    };
+    assert!(matches!(
+        verify_by_evaluation(&ok),
+        VerificationResult::Valid
+    ));
+    // The reconstruction itself builds the honest pairing from the name.
+    let inst = representative_wasm_reconstructable_inst(WasmOpcode::I64TruncSatF32S)
+        .expect("representative");
+    let built = reconstruct_wasm_alu_obligation(&inst).expect("reconstructs");
+    assert_eq!(
+        built.trust_ir_expr,
+        encode_trust_ir_fcvt_to_sint(64, a.clone())
+    );
+    assert_eq!(built.aarch64_expr, encode_trunc_sat_s(a, 64));
 }

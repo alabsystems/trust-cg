@@ -3,8 +3,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: designs/2026-04-13-heterogeneous-compute.md (Computation Graph Analysis)
-//
 // Builds a computation graph from trust_ir programs: a DAG of ComputeNodes
 // connected by DataEdges. Each node represents a group of instructions
 // that can be assigned to a compute target (CPU, SIMD, GPU, ANE). Edges
@@ -77,6 +75,45 @@ impl fmt::Display for ComputeNodeId {
 /// Unique identifier for an edge in the computation graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DataEdgeId(pub u32);
+
+/// Identity namespace whose input cardinality exceeded its representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphIdentityDomain {
+    Function,
+    Instruction,
+    NodeValue,
+    Node,
+}
+
+/// A graph cannot alias identities when its input exceeds a `u32` namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ComputeGraphError {
+    #[error("computation graph {domain:?} identity namespace is exhausted")]
+    IdentityOverflow { domain: GraphIdentityDomain },
+}
+
+fn checked_identity(index: usize, domain: GraphIdentityDomain) -> Result<u32, ComputeGraphError> {
+    u32::try_from(index).map_err(|_| ComputeGraphError::IdentityOverflow { domain })
+}
+
+fn validate_identity_count(
+    count: usize,
+    domain: GraphIdentityDomain,
+) -> Result<(), ComputeGraphError> {
+    if let Some(last_index) = count.checked_sub(1) {
+        checked_identity(last_index, domain)?;
+    }
+    Ok(())
+}
+
+fn validate_node_value_count(consumed: usize, produced: usize) -> Result<(), ComputeGraphError> {
+    let count = consumed
+        .checked_add(produced)
+        .ok_or(ComputeGraphError::IdentityOverflow {
+            domain: GraphIdentityDomain::NodeValue,
+        })?;
+    validate_identity_count(count, GraphIdentityDomain::NodeValue)
+}
 
 // ---------------------------------------------------------------------------
 // Instruction identifier within trust_ir
@@ -919,6 +956,11 @@ fn binop_to_op_name(op: &BinOp) -> &'static str {
         BinOp::FRem => "FDIV", // closest equivalent
         BinOp::FMin => "FMIN",
         BinOp::FMax => "FMAX",
+        // trust-ir WS3.20: AArch64 has one rotate instruction (ROR; a left
+        // rotate is ROR by `w - n`). copySign has no single mnemonic, so its
+        // name matches no cost table and takes the conservative default.
+        BinOp::RotL | BinOp::RotR => "ROR",
+        BinOp::FCopySign => "FCOPYSIGN",
     }
 }
 
@@ -1084,11 +1126,11 @@ impl ComputeGraph {
         module: &TrustIrModule,
         proof_ctx: TargetProofContext,
         analyzer: &ProofAnalyzer,
-    ) -> Self {
+    ) -> Result<Self, ComputeGraphError> {
         let mut builder = GraphBuilder::new(analyzer.clone(), proof_ctx);
-        let mut graph = builder.build_from_module(module);
+        let mut graph = builder.build_from_module(module)?;
         graph.profitability = Some(ProfitabilityAnalyzer::new(CostModelGen::M1));
-        graph
+        Ok(graph)
     }
 
     /// Build a graph from a trust_ir module with proof context and a custom
@@ -1098,11 +1140,11 @@ impl ComputeGraph {
         proof_ctx: TargetProofContext,
         analyzer: &ProofAnalyzer,
         profitability: ProfitabilityAnalyzer,
-    ) -> Self {
+    ) -> Result<Self, ComputeGraphError> {
         let mut builder = GraphBuilder::new(analyzer.clone(), proof_ctx);
-        let mut graph = builder.build_from_module(module);
+        let mut graph = builder.build_from_module(module)?;
         graph.profitability = Some(profitability);
-        graph
+        Ok(graph)
     }
 
     /// Return per-node target recommendations using stored proof-guided legality
@@ -1253,7 +1295,12 @@ impl ComputeGraph {
         module: &TrustIrModule,
         proof_ctx: &TargetProofContext,
         analyzer: &ProofAnalyzer,
-    ) {
+    ) -> Result<(), ComputeGraphError> {
+        // Validate every namespace before changing any node's proof metadata.
+        validate_identity_count(module.functions.len(), GraphIdentityDomain::Function)?;
+        for node in &self.nodes {
+            validate_node_value_count(node.consumed_values.len(), node.produced_values.len())?;
+        }
         for node in &mut self.nodes {
             let subgraph_id = SubgraphId(node.id.0);
 
@@ -1275,9 +1322,7 @@ impl ComputeGraph {
             // Collect type information from the module for these values.
             let mut value_types_map: HashMap<TrustIrValueId, Ty> = HashMap::new();
             for (func_idx, func) in module.functions.iter().enumerate() {
-                let func_idx = u32::try_from(func_idx).expect(
-                    "TrustIR module function count exceeds the u32 function-identity domain",
-                );
+                let func_idx = checked_identity(func_idx, GraphIdentityDomain::Function)?;
                 for block in func.blocks.iter() {
                     for (vid, ty) in &block.params {
                         let scoped = TrustIrValueId::new(func_idx, *vid);
@@ -1324,10 +1369,7 @@ impl ComputeGraph {
             // Map ValueIds -> internal Values for the analyzer.
             let mut lir_values = Vec::new();
             for (i, vid) in all_values.iter().enumerate() {
-                let val =
-                    Value(u32::try_from(i).expect(
-                        "compute-node value count exceeds the u32 analyzer identity domain",
-                    ));
+                let val = Value(checked_identity(i, GraphIdentityDomain::NodeValue)?);
                 lir_values.push(val);
                 if let Some(ty) = value_types_map.get(vid)
                     && let Some(lir_ty) = trust_ir_ty_to_lir_type_for_analyzer(ty)
@@ -1367,6 +1409,7 @@ impl ComputeGraph {
 
             node.target_legality = Some(legality);
         }
+        Ok(())
     }
 }
 
@@ -1707,7 +1750,7 @@ pub struct GraphBuilder {
     /// Proof context for the module.
     proof_ctx: TargetProofContext,
     /// Next node ID.
-    next_node_id: u32,
+    next_node_id: Option<u32>,
 }
 
 impl GraphBuilder {
@@ -1716,7 +1759,7 @@ impl GraphBuilder {
         Self {
             analyzer,
             proof_ctx,
-            next_node_id: 0,
+            next_node_id: Some(0),
         }
     }
 
@@ -1729,10 +1772,14 @@ impl GraphBuilder {
     }
 
     /// Allocate a fresh node ID.
-    fn fresh_node_id(&mut self) -> ComputeNodeId {
-        let id = ComputeNodeId(self.next_node_id);
-        self.next_node_id += 1;
-        id
+    fn fresh_node_id(&mut self) -> Result<ComputeNodeId, ComputeGraphError> {
+        let id = self
+            .next_node_id
+            .ok_or(ComputeGraphError::IdentityOverflow {
+                domain: GraphIdentityDomain::Node,
+            })?;
+        self.next_node_id = id.checked_add(1);
+        Ok(ComputeNodeId(id))
     }
 
     /// Build a computation graph from a trust_ir module.
@@ -1740,7 +1787,24 @@ impl GraphBuilder {
     /// Each basic block becomes one or more computation nodes. Sequential
     /// scalar ops are grouped together. Data-parallel and matrix-heavy
     /// patterns are split into their own nodes.
-    pub fn build_from_module(&mut self, module: &TrustIrModule) -> ComputeGraph {
+    /// Returns an error without consuming node identities if a namespace is exhausted.
+    pub fn build_from_module(
+        &mut self,
+        module: &TrustIrModule,
+    ) -> Result<ComputeGraph, ComputeGraphError> {
+        let saved_next_node_id = self.next_node_id;
+        let result = self.build_from_module_inner(module);
+        if result.is_err() {
+            self.next_node_id = saved_next_node_id;
+        }
+        result
+    }
+
+    fn build_from_module_inner(
+        &mut self,
+        module: &TrustIrModule,
+    ) -> Result<ComputeGraph, ComputeGraphError> {
+        validate_identity_count(module.functions.len(), GraphIdentityDomain::Function)?;
         let mut graph = ComputeGraph::new();
 
         // Check module verification status using trust_ir's proof summary API.
@@ -1759,8 +1823,7 @@ impl GraphBuilder {
             // TrustIrValueId reserves exactly 32 bits for the owning function.
             // Reject an unrepresentable module instead of truncating and
             // aliasing values from two functions.
-            let func_idx = u32::try_from(func_idx)
-                .expect("TrustIR module function count exceeds the u32 function-identity domain");
+            let func_idx = checked_identity(func_idx, GraphIdentityDomain::Function)?;
             // Collect type information for all values in the function
             let mut value_types: HashMap<ValueId, Ty> = HashMap::new();
             for block in func.blocks.iter() {
@@ -1813,7 +1876,7 @@ impl GraphBuilder {
                     &block.params,
                     func.blocks.len() == 1 && func.entry == block.id,
                     &value_types,
-                );
+                )?;
 
                 for node in nodes {
                     // Track value producers
@@ -1887,7 +1950,7 @@ impl GraphBuilder {
         // Build edges based on data dependencies
         self.build_edges(&mut graph, &value_to_nodes);
 
-        graph
+        Ok(graph)
     }
 
     /// Build computation nodes for a single basic block.
@@ -1904,10 +1967,11 @@ impl GraphBuilder {
         block_params: &[(ValueId, Ty)],
         is_closed_single_block_function: bool,
         value_types: &HashMap<ValueId, Ty>,
-    ) -> Vec<ComputeNode> {
+    ) -> Result<Vec<ComputeNode>, ComputeGraphError> {
         if body.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
+        validate_identity_count(body.len(), GraphIdentityDomain::Instruction)?;
 
         // Collect instruction references for pattern detection
         let instr_refs: Vec<&InstrNode> = body.iter().collect();
@@ -1917,7 +1981,7 @@ impl GraphBuilder {
 
         // For now, group entire block into one node (future: split into
         // multiple nodes when different patterns are detected within a block)
-        let node_id = self.fresh_node_id();
+        let node_id = self.fresh_node_id()?;
         let subgraph_id = SubgraphId(node_id.0);
 
         // Collect TrustIrInstIds, produced/consumed values, and data size
@@ -1930,9 +1994,7 @@ impl GraphBuilder {
             instructions.push(TrustIrInstId {
                 func_idx,
                 block_id: block_id.0,
-                inst_idx: u32::try_from(inst_idx).expect(
-                    "TrustIR block instruction count exceeds the u32 instruction-identity domain",
-                ),
+                inst_idx: checked_identity(inst_idx, GraphIdentityDomain::Instruction)?,
             });
 
             // Track produced values
@@ -1966,6 +2028,20 @@ impl GraphBuilder {
                 Inst::Store { ptr, value, .. } => {
                     consumed_values.push(TrustIrValueId::new(func_idx, *ptr));
                     consumed_values.push(TrustIrValueId::new(func_idx, *value));
+                }
+                // trust-ir WS3.20 bulk memory: the two pointers (or pointer
+                // and fill byte) and the dynamic count.
+                Inst::MemCopy {
+                    dst, src, bytes, ..
+                } => {
+                    consumed_values.push(TrustIrValueId::new(func_idx, *dst));
+                    consumed_values.push(TrustIrValueId::new(func_idx, *src));
+                    consumed_values.push(TrustIrValueId::new(func_idx, *bytes));
+                }
+                Inst::MemSet { dst, byte, bytes } => {
+                    consumed_values.push(TrustIrValueId::new(func_idx, *dst));
+                    consumed_values.push(TrustIrValueId::new(func_idx, *byte));
+                    consumed_values.push(TrustIrValueId::new(func_idx, *bytes));
                 }
                 Inst::Br { args, .. } => {
                     consumed_values.extend(
@@ -2013,9 +2089,15 @@ impl GraphBuilder {
                     consumed_values.push(TrustIrValueId::new(func_idx, *array));
                     consumed_values.push(TrustIrValueId::new(func_idx, *index));
                 }
+                // trust-ir v50: one operand, whatever the lane count.
+                Inst::ArraySplat { value, .. } => {
+                    consumed_values.push(TrustIrValueId::new(func_idx, *value));
+                }
                 _ => {}
             }
         }
+
+        validate_node_value_count(consumed_values.len(), produced_values.len())?;
 
         // Accelerator semantics are derived from the exact typed TrustIR
         // shape, independently of heuristic workload classification.  A
@@ -2054,10 +2136,7 @@ impl GraphBuilder {
             .chain(produced_values.iter())
             .enumerate()
         {
-            let val = Value(
-                u32::try_from(i)
-                    .expect("compute-node value count exceeds the u32 analyzer identity domain"),
-            );
+            let val = Value(checked_identity(i, GraphIdentityDomain::NodeValue)?);
             lir_values.push(val);
             if let Some(ty) = value_types.get(&vid.value_id)
                 && let Some(lir_ty) = trust_ir_ty_to_lir_type_for_analyzer(ty)
@@ -2105,7 +2184,7 @@ impl GraphBuilder {
             None
         };
 
-        vec![ComputeNode {
+        Ok(vec![ComputeNode {
             id: node_id,
             instructions,
             costs,
@@ -2117,7 +2196,7 @@ impl GraphBuilder {
             dominant_op,
             target_legality: Some(legality),
             matmul_shape,
-        }]
+        }])
     }
 
     /// Build data dependency edges between nodes.
@@ -2270,19 +2349,22 @@ fn trust_ir_ty_to_lir_type_for_analyzer(ty: &Ty) -> Option<LirType> {
 
 impl ComputeGraph {
     /// Build a graph from a trust_ir module with default configuration.
-    pub fn from_module(module: &TrustIrModule) -> Self {
+    pub fn from_module(module: &TrustIrModule) -> Result<Self, ComputeGraphError> {
         let mut builder = GraphBuilder::with_defaults();
         builder.build_from_module(module)
     }
 
     /// Build a graph with a custom proof context.
     /// Attaches a default M1 ProfitabilityAnalyzer for GPU/ANE dispatch.
-    pub fn from_module_with_proofs(module: &TrustIrModule, proof_ctx: TargetProofContext) -> Self {
+    pub fn from_module_with_proofs(
+        module: &TrustIrModule,
+        proof_ctx: TargetProofContext,
+    ) -> Result<Self, ComputeGraphError> {
         let analyzer = ProofAnalyzer::with_defaults();
         let mut builder = GraphBuilder::new(analyzer, proof_ctx);
-        let mut graph = builder.build_from_module(module);
+        let mut graph = builder.build_from_module(module)?;
         graph.profitability = Some(ProfitabilityAnalyzer::new(CostModelGen::M1));
-        graph
+        Ok(graph)
     }
 
     /// Add a node manually (for testing).
@@ -2308,6 +2390,62 @@ mod tests {
         Function as TrustIrFunction, Inst, InstrNode, Linkage, Module, Ty, TyId, ValueId,
     };
 
+    #[test]
+    fn graph_identity_boundaries_reject_overflow_without_large_allocations() {
+        for domain in [
+            GraphIdentityDomain::Function,
+            GraphIdentityDomain::Instruction,
+            GraphIdentityDomain::NodeValue,
+            GraphIdentityDomain::Node,
+        ] {
+            assert_eq!(checked_identity(u32::MAX as usize, domain), Ok(u32::MAX));
+            assert_eq!(validate_identity_count(0, domain), Ok(()));
+            if let Some(full_domain_count) = (u32::MAX as usize).checked_add(1) {
+                assert_eq!(validate_identity_count(full_domain_count, domain), Ok(()));
+                assert_eq!(
+                    checked_identity(full_domain_count, domain),
+                    Err(ComputeGraphError::IdentityOverflow { domain })
+                );
+                assert_eq!(
+                    validate_identity_count(full_domain_count + 1, domain),
+                    Err(ComputeGraphError::IdentityOverflow { domain })
+                );
+            }
+        }
+        assert_eq!(
+            validate_node_value_count(usize::MAX, 1),
+            Err(ComputeGraphError::IdentityOverflow {
+                domain: GraphIdentityDomain::NodeValue
+            })
+        );
+    }
+
+    #[test]
+    fn exhausted_graph_builder_rolls_back_and_never_aliases_node_ids() {
+        let mut builder = GraphBuilder::with_defaults();
+        builder.next_node_id = Some(u32::MAX);
+        assert!(matches!(
+            builder.build_from_module(&build_two_block_module()),
+            Err(ComputeGraphError::IdentityOverflow {
+                domain: GraphIdentityDomain::Node
+            })
+        ));
+        // The first node of the failed graph did not consume the final identity.
+        assert_eq!(builder.next_node_id, Some(u32::MAX));
+        let graph = builder
+            .build_from_module(&build_scalar_add_module())
+            .unwrap();
+        assert_eq!(graph.nodes[0].id, ComputeNodeId(u32::MAX));
+        assert_eq!(builder.next_node_id, None);
+        assert!(matches!(
+            builder.build_from_module(&build_scalar_add_module()),
+            Err(ComputeGraphError::IdentityOverflow {
+                domain: GraphIdentityDomain::Node
+            })
+        ));
+        assert_eq!(builder.next_node_id, None);
+    }
+
     // -------------------------------------------------------------------
     // Test helpers
     // -------------------------------------------------------------------
@@ -2315,13 +2453,22 @@ mod tests {
     /// Build a simple trust_ir module: fn add(a: i32, b: i32) -> i32 { a + b }
     fn build_scalar_add_module() -> Module {
         Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "scalar_add".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "add".to_string(),
@@ -2367,6 +2514,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -2379,6 +2527,9 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -2426,13 +2577,22 @@ mod tests {
             scope: None,
         });
         Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "exact_u32x4".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "map2".to_string(),
@@ -2457,6 +2617,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![vector_ty.clone(), vector_ty.clone()],
                 returns: vec![vector_ty],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -2469,6 +2630,9 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -2497,6 +2661,7 @@ mod tests {
         });
         GraphBuilder::new(analyzer, proof_ctx)
             .build_from_module(&build_exact_u32x4_module(op, false))
+            .expect("bounded test graph")
     }
 
     #[test]
@@ -2602,7 +2767,9 @@ mod tests {
             ane_launch_threshold_bytes: u64::MAX,
             simd_threshold_bytes: 0,
         });
-        let graph = GraphBuilder::new(analyzer, proof_ctx).build_from_module(&module);
+        let graph = GraphBuilder::new(analyzer, proof_ctx)
+            .build_from_module(&module)
+            .expect("bounded test graph");
 
         assert_eq!(graph.nodes.len(), 2);
         assert!(
@@ -2648,7 +2815,8 @@ mod tests {
 
     #[test]
     fn forged_target_judgment_cannot_upgrade_sealed_recipe_authority() {
-        let mut graph = ComputeGraph::from_module(&build_exact_u32x4_module(BinOp::Add, false));
+        let mut graph = ComputeGraph::from_module(&build_exact_u32x4_module(BinOp::Add, false))
+            .expect("bounded test graph");
         let node = &mut graph.nodes[0];
         let legality = node.target_legality.as_mut().unwrap();
         legality
@@ -2669,7 +2837,7 @@ mod tests {
             build_exact_u32x4_module(BinOp::UDiv, false),
             build_exact_u32x4_module(BinOp::Add, true),
         ] {
-            let graph = ComputeGraph::from_module(&module);
+            let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
             assert!(matches!(
                 graph.nodes[0].validated_accelerator_recipe(AcceleratorBackend::Metal),
                 Err(AcceleratorBindingError::MissingCompilerBinding { .. })
@@ -2680,13 +2848,22 @@ mod tests {
     /// Build a trust_ir module with array FAdd operations (data-parallel pattern).
     fn build_data_parallel_module() -> Module {
         Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "data_parallel".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "vec_add".to_string(),
@@ -2735,6 +2912,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -2747,19 +2925,31 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
     /// Build a trust_ir module with FMul+FAdd pattern (matrix-heavy / MAC).
     fn build_matrix_heavy_module() -> Module {
         Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "matrix_heavy".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "dot_product".to_string(),
@@ -2823,6 +3013,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -2835,6 +3026,9 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -2842,13 +3036,22 @@ mod tests {
     /// Workload large enough for GPU profitability thresholds.
     fn build_large_data_parallel_module() -> Module {
         Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "large_data_parallel".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "large_vec_add".to_string(),
@@ -2897,6 +3100,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -2909,6 +3113,9 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -2916,13 +3123,22 @@ mod tests {
     /// Workload large enough for GPU/ANE profitability thresholds.
     fn build_large_matrix_heavy_module() -> Module {
         Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "large_matrix_heavy".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "large_dot_product".to_string(),
@@ -2986,6 +3202,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -2998,6 +3215,9 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -3005,13 +3225,22 @@ mod tests {
     /// (second function consumes values from the first).
     fn build_two_block_module() -> Module {
         Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "two_block".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "two_blocks".to_string(),
@@ -3089,6 +3318,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![Ty::I32, Ty::I32],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -3101,6 +3331,9 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         }
     }
 
@@ -3226,6 +3459,7 @@ mod tests {
         module.func_types[0] = FuncTy {
             params: vec![Ty::Bool, Ty::I32, Ty::I32],
             returns: vec![Ty::I32],
+            abi: None,
             is_vararg: false,
         };
         module
@@ -3238,7 +3472,7 @@ mod tests {
     #[test]
     fn test_scalar_module_produces_scalar_node() {
         let module = build_scalar_add_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 1);
         assert_eq!(graph.nodes[0].kind, NodeKind::Scalar);
@@ -3256,7 +3490,7 @@ mod tests {
     #[test]
     fn test_data_parallel_detection() {
         let module = build_data_parallel_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 1);
         assert_eq!(graph.nodes[0].kind, NodeKind::DataParallel);
@@ -3269,7 +3503,7 @@ mod tests {
     #[test]
     fn test_matrix_heavy_detection() {
         let module = build_matrix_heavy_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 1);
         assert_eq!(graph.nodes[0].kind, NodeKind::MatrixHeavy);
@@ -3282,7 +3516,7 @@ mod tests {
     #[test]
     fn test_two_block_produces_edges() {
         let module = build_two_block_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         // Two blocks -> two nodes
         assert_eq!(graph.num_nodes(), 2);
@@ -3302,7 +3536,7 @@ mod tests {
 
     #[test]
     fn diamond_join_preserves_every_incoming_parameter_producer() {
-        let graph = ComputeGraph::from_module(&build_diamond_module());
+        let graph = ComputeGraph::from_module(&build_diamond_module()).expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 4);
         let incoming = graph
@@ -3325,7 +3559,7 @@ mod tests {
     #[test]
     fn test_partition_cost_all_cpu() {
         let module = build_scalar_add_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         let mut assignment = HashMap::new();
         assignment.insert(ComputeNodeId(0), ComputeTarget::CpuScalar);
@@ -3345,7 +3579,7 @@ mod tests {
     #[test]
     fn test_partition_cost_illegal_target() {
         let module = build_scalar_add_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         // Without proofs, GPU is not legal for scalar ops
         let mut assignment = HashMap::new();
@@ -3362,7 +3596,7 @@ mod tests {
     #[test]
     fn test_partition_cost_missing_node() {
         let module = build_scalar_add_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         let assignment: HashMap<ComputeNodeId, ComputeTarget> = HashMap::new();
         let cost = graph.partition_cost(&assignment);
@@ -3445,7 +3679,7 @@ mod tests {
     #[test]
     fn test_partition_cost_with_transfer() {
         let module = build_two_block_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         // Both on CpuScalar: no transfer cost
         let mut all_cpu = HashMap::new();
@@ -3492,7 +3726,7 @@ mod tests {
     #[test]
     fn test_empty_module_empty_graph() {
         let module = Module::new("empty");
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
         assert_eq!(graph.num_nodes(), 0);
         assert_eq!(graph.num_edges(), 0);
     }
@@ -3539,7 +3773,7 @@ mod tests {
     #[test]
     fn test_graph_edge_queries() {
         let module = build_two_block_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         if graph.num_edges() > 0 {
             let outgoing = graph.outgoing_edges(ComputeNodeId(0));
@@ -3706,7 +3940,7 @@ mod tests {
         };
         *ty = huge_array;
 
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
         assert_eq!(graph.nodes[0].data_size_bytes, u64::MAX);
         assert_eq!(
             estimate_type_bytes(&Ty::Array(TyId::new(0), u64::MAX)),
@@ -3960,14 +4194,23 @@ mod tests {
     #[test]
     fn test_multiple_functions_produce_nodes() {
         let module = Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "multi".to_string(),
             functions: vec![
                 TrustIrFunction {
+                    section: None,
+                    visibility: Default::default(),
+                    retained: false,
                     summary: None,
                     producer: None,
                     value_names: None,
                     scopes: None,
                     source_provenance: None,
+                    body_gate: None,
+                    display_path: None,
                     attrs: Default::default(),
                     id: FuncId::new(0),
                     name: "foo".to_string(),
@@ -3992,11 +4235,16 @@ mod tests {
                     linkage: Linkage::default(),
                 },
                 TrustIrFunction {
+                    section: None,
+                    visibility: Default::default(),
+                    retained: false,
                     summary: None,
                     producer: None,
                     value_names: None,
                     scopes: None,
                     source_provenance: None,
+                    body_gate: None,
+                    display_path: None,
                     attrs: Default::default(),
                     id: FuncId::new(1),
                     name: "bar".to_string(),
@@ -4028,6 +4276,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -4040,9 +4289,12 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         };
 
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
         assert_eq!(
             graph.num_nodes(),
             2,
@@ -4107,7 +4359,8 @@ mod tests {
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 1);
         let node = &graph.nodes[0];
@@ -4135,7 +4388,7 @@ mod tests {
     #[test]
     fn test_without_proofs_cpu_only() {
         let module = build_data_parallel_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 1);
         let node = &graph.nodes[0];
@@ -4164,7 +4417,8 @@ mod tests {
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
         let recs = graph.target_recommendations();
 
         assert_eq!(recs.len(), 1);
@@ -4194,7 +4448,7 @@ mod tests {
     #[test]
     fn test_target_recommendations_no_proofs_cpu() {
         let module = build_scalar_add_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
         let recs = graph.target_recommendations();
 
         assert_eq!(recs.len(), 1);
@@ -4219,7 +4473,8 @@ mod tests {
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
         let cost = graph.proof_guided_partition_cost();
 
         assert!(cost.is_some(), "Should produce a valid partition cost");
@@ -4247,7 +4502,8 @@ mod tests {
         let proof_ctx = full_gpu_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
 
         let node = &graph.nodes[0];
         let legality = node.target_legality.as_ref().unwrap();
@@ -4269,7 +4525,8 @@ mod tests {
         let proof_ctx = full_gpu_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
         let recs = graph.target_recommendations();
 
         assert_eq!(recs.len(), 1);
@@ -4288,7 +4545,7 @@ mod tests {
         let module = build_data_parallel_module();
 
         // Build graph without proofs first.
-        let mut graph = ComputeGraph::from_module(&module);
+        let mut graph = ComputeGraph::from_module(&module).expect("bounded test graph");
         assert!(
             !graph.nodes[0].legal_targets.contains(&ComputeTarget::Gpu),
             "GPU should be illegal before annotation"
@@ -4297,7 +4554,9 @@ mod tests {
         // Now annotate with full proofs.
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
-        graph.annotate_with_proofs(&module, &proof_ctx, &analyzer);
+        graph
+            .annotate_with_proofs(&module, &proof_ctx, &analyzer)
+            .expect("bounded test graph");
 
         assert!(
             graph.nodes[0].legal_targets.contains(&ComputeTarget::Gpu),
@@ -4334,7 +4593,8 @@ mod tests {
         ctx.add_subgraph_proof(SubgraphId(0), SubgraphProof::Pure);
 
         let analyzer = ProofAnalyzer::with_defaults();
-        let graph = ComputeGraph::with_proof_context(&module, ctx, &analyzer);
+        let graph =
+            ComputeGraph::with_proof_context(&module, ctx, &analyzer).expect("bounded test graph");
         let recs = graph.target_recommendations();
 
         assert_eq!(recs.len(), 1);
@@ -4359,7 +4619,8 @@ mod tests {
         let module = build_data_parallel_module();
         let proof_ctx = full_proof_context();
 
-        let graph = ComputeGraph::from_module_with_proofs(&module, proof_ctx);
+        let graph =
+            ComputeGraph::from_module_with_proofs(&module, proof_ctx).expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 1);
         // from_module_with_proofs uses the default analyzer, but passes proofs.
@@ -4376,7 +4637,8 @@ mod tests {
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
 
         // Compute proof-guided cost (should pick GPU for data-parallel).
         let guided_cost = graph.proof_guided_partition_cost().unwrap();
@@ -4406,7 +4668,8 @@ mod tests {
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
         let node = &graph.nodes[0];
         let legality = node.target_legality.as_ref().unwrap();
 
@@ -4731,13 +4994,22 @@ mod tests {
         // A module with 2-element arrays should be classified as Scalar
         // (below the MIN_VECTORIZABLE_ELEMENTS threshold)
         let module = Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "small_array".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "tiny_add".to_string(),
@@ -4786,6 +5058,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -4798,9 +5071,12 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         };
 
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
         assert_eq!(graph.num_nodes(), 1);
         assert_eq!(
             graph.nodes[0].kind,
@@ -4822,7 +5098,8 @@ mod tests {
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
         let recs = graph.target_recommendations();
 
         assert_eq!(recs.len(), 1);
@@ -4855,7 +5132,8 @@ mod tests {
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
         let recs = graph.target_recommendations();
 
         assert_eq!(recs.len(), 1);
@@ -4873,13 +5151,22 @@ mod tests {
         // Build a module with bitwise operations (AND).
         // ANE does not support bitwise ops per ProfitabilityAnalyzer::target_legality.
         let module = Module {
+            closure_layouts: Vec::new(),
+            blobs: Vec::new(),
+            completeness: None,
+            drop_glue: Vec::new(),
             name: "bitwise".to_string(),
             functions: vec![TrustIrFunction {
+                section: None,
+                visibility: Default::default(),
+                retained: false,
                 summary: None,
                 producer: None,
                 value_names: None,
                 scopes: None,
                 source_provenance: None,
+                body_gate: None,
+                display_path: None,
                 attrs: Default::default(),
                 id: FuncId::new(0),
                 name: "bitwise_and".to_string(),
@@ -4928,6 +5215,7 @@ mod tests {
             func_types: vec![FuncTy {
                 params: vec![],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             }],
             types: vec![],
@@ -4940,13 +5228,17 @@ mod tests {
             spec_modules: vec![],
             universes: vec![],
             predicates: vec![],
+            global_asm: Vec::new(),
+            tuple_layouts: Vec::new(),
+            imports: Vec::new(),
         };
 
         // Give full proofs so GPU/ANE are at least proof-legal.
         let proof_ctx = full_proof_context();
         let analyzer = ProofAnalyzer::with_defaults();
 
-        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer);
+        let graph = ComputeGraph::with_proof_context(&module, proof_ctx, &analyzer)
+            .expect("bounded test graph");
         let recs = graph.target_recommendations();
 
         assert_eq!(recs.len(), 1);
@@ -4970,7 +5262,9 @@ mod tests {
 
         // Build graph WITHOUT profitability analyzer.
         let mut builder = GraphBuilder::new(analyzer.clone(), proof_ctx.clone());
-        let mut graph = builder.build_from_module(&module);
+        let mut graph = builder
+            .build_from_module(&module)
+            .expect("bounded test graph");
 
         // Without profitability: GPU should appear in recommendations
         // (it's proof-legal and has lowest latency).
@@ -5001,7 +5295,7 @@ mod tests {
     fn test_dominant_op_derived_from_instructions() {
         // Build modules and verify the dominant_op field is set correctly.
         let module = build_data_parallel_module();
-        let graph = ComputeGraph::from_module(&module);
+        let graph = ComputeGraph::from_module(&module).expect("bounded test graph");
 
         assert_eq!(graph.num_nodes(), 1);
         // data_parallel module has a single FAdd -> dominant op is "FADD"
@@ -5013,7 +5307,7 @@ mod tests {
         // Matrix-heavy module has FMul + FAdd -> dominant is tied,
         // HashMap iteration order is nondeterministic but both are valid.
         let mat_module = build_matrix_heavy_module();
-        let mat_graph = ComputeGraph::from_module(&mat_module);
+        let mat_graph = ComputeGraph::from_module(&mat_module).expect("bounded test graph");
 
         assert_eq!(mat_graph.num_nodes(), 1);
         let dom = &mat_graph.nodes[0].dominant_op;

@@ -22,7 +22,7 @@
 // certificate (the t-silicon route-1 milestone).
 //
 // Regenerate fixtures after an intentional blaster/solver change with:
-//   TRUST_CG_BLESS_SAT_FIXTURES=1 cargo test -p trust-cg-verify \
+//   TRUST_CG_BLESS_SAT_FIXTURES=1 scripts/trust_cargo.sh test -p trust-cg-verify \
 //     --test t_silicon_sat_export
 //
 // TRUST BOUNDARY: everything in this file is UNTRUSTED producer plumbing.
@@ -185,7 +185,7 @@ fn run_positive_chain(rule: &AluRule) {
     enable_drat_output(&drat_path).expect("enable drat");
     let rc = run_microsat(&cnf_path);
     flush_drat_output().expect("flush drat");
-    disable_drat_output();
+    disable_drat_output().expect("finalize drat output");
     assert_eq!(
         rc,
         sys::UNSAT,

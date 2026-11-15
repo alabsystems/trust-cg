@@ -1,0 +1,4 @@
+perf-ratchet: NOT CURRENT: results are not headline-eligible evidence (recomputed from provenance)
+perf-ratchet: efc47d3bc3e5-20261014T140910Z.json is not current-source eligible evidence; rerun benchmarks/beat-llvm/run.py on a quiet machine from the clean candidate checkout
+perf-ratchet: row is NOT evidence (load, source, provenance, configuration or sampling) — it cannot become a baseline, but it is still regression-checked: a regression is RED whether or not the row is evidence.
+perf-ratchet: OK efc47d3bc3e5-20261014T140910Z.json (evidence=False, coverage 0.0%, runtime geomean None, warm-vs-O2 None, mismatches 0)

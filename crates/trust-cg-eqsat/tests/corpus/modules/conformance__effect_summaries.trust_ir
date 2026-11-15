@@ -1,0 +1,45 @@
+; TrustIr text format v1
+module "effect_summaries"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (*mut u64, *mut u64) -> ()
+
+functy.1 = (u64, u64) -> (u64)
+
+functy.2 = (*mut u64) -> ()
+
+global internal mut @COUNTER u64 = 0
+
+fn @set(functy.0) {
+    ; #body-gate: ungated
+    ; #summary: unproved params ["p", "q"]
+    ; #ensures: formula "smtlib2" "(= (select after #x0000000000000000) (select before #x0000000000000000))" smtlib "(= (select after #x0000000000000000) (select before #x0000000000000000))" sort "Bool" bind "before" array(bv(64), bv(64)) world_pre bind "after" array(bv(64), bv(64)) world_post
+    ; #effects: reads nothing writes places [param(0), global(0)] allocates false frees false may_unwind false io false
+bb0(%0: *mut u64, %1: *mut u64):
+    %2 = const u64 7
+    store u64 %2, ptr %0
+    %3 = global_addr @global.0
+    store u64 %2, ptr %3
+    ret
+}
+
+fn @add(functy.1) {
+    ; #body-gate: ungated
+    ; #summary: unproved params []
+    ; #effects: reads nothing writes nothing allocates false frees false may_unwind false io false
+bb0(%0: u64, %1: u64):
+    %2 = add u64 %0, %1
+    ret %2
+}
+
+fn @ext(functy.2) {
+}
+
+fn @caller(functy.2) {
+    ; #body-gate: ungated
+    ; #summary: unproved params []
+    ; #effects: reads everything writes everything allocates true frees true may_unwind true io true
+bb0(%0: *mut u64):
+    call @func.2(%0)
+    ret
+}

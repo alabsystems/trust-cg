@@ -4,9 +4,10 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
 // Provides verify_riscv_function(): given a RiscVISelFunction, walk every
-// instruction, map each RiscVOpcode to a proof obligation from the
-// ProofDatabase, run the proof, and produce a FunctionVerificationReport
-// with per-instruction results.
+// instruction, discharge the obligation reconstructed from that instruction's
+// opcode and operands, and produce a FunctionVerificationReport with
+// per-instruction results. Registry theorems selected by name are never
+// instruction credit.
 //
 // Mirror of [`crate::x86_64_function_verifier`]. The three paths (AArch64,
 // x86-64, RISC-V) share the same [`InstructionVerificationResult`] cert shape
@@ -26,11 +27,14 @@
 
 //! RISC-V (RV64) function-level verification pipeline.
 //!
-//! [`verify_riscv_function`] walks a [`RiscVISelFunction`] and verifies each
-//! instruction against its corresponding RISC-V lowering proof obligation from
-//! [`ProofDatabase`]. Produces a [`FunctionVerificationReport`] (shared with the
-//! AArch64 / x86-64 paths) so the public proof-certificate API stays
-//! target-agnostic.
+//! [`verify_riscv_function`] walks a [`RiscVISelFunction`] and credits an
+//! instruction only with an obligation reconstructed from its emitted opcode
+//! and operands and discharged completely; a sampled discharge is reported but
+//! never credited. There is no registry-name arm on this backend:
+//! [`RiscVFunctionVerifier::opcode_to_proof_query`] has named no theorem for any
+//! opcode since the #62 retraction. Produces a
+//! [`FunctionVerificationReport`] (shared with the AArch64 / x86-64 paths) so
+//! the public proof-certificate API stays target-agnostic.
 
 use trust_cg_ir::{RegClass, RiscVOpcode, VReg};
 
@@ -40,7 +44,7 @@ use crate::function_verifier::{
 use crate::lowering_proof::{
     MachineSideProvenance, ProofObligation, VerificationConfig, verify_by_evaluation_with_config,
 };
-use crate::proof_database::{ProofCategory, ProofDatabase};
+use crate::proof_database::ProofCategory;
 use crate::riscv_semantics::RiscVOperandSize;
 use crate::smt::SmtExpr;
 use crate::verify::{VerificationResult, VerificationStrength};
@@ -455,7 +459,8 @@ pub fn reconstruct_alu_obligation(inst: &RiscVISelInst) -> Option<ProofObligatio
 /// This is the opcode-complete entry point the COVERAGE GATE uses: the gate has
 /// only an opcode, so it synthesizes a representative instance (the generic RV64
 /// register form `[rd, rs1, rs2]`, all 64-bit), reconstructs the obligation, and
-/// credits the opcode COVERED iff that obligation discharges `Valid`.
+/// marks the opcode covered in its inventory iff that obligation discharges
+/// `Valid` (inventory only, never instruction credit).
 pub fn representative_reconstructable_inst(opcode: RiscVOpcode) -> Option<RiscVISelInst> {
     // Only opcodes the reconstructor handles get a representative instance.
     opcode_to_source_op(opcode)?;
@@ -464,13 +469,18 @@ pub fn representative_reconstructable_inst(opcode: RiscVOpcode) -> Option<RiscVI
 }
 
 /// Does a representative reconstructed obligation for `opcode` discharge `Valid`
-/// under `config`? Used by the COVERAGE GATE to CREDIT a reconstructable RISC-V
-/// opcode as covered. Mirrors `function_verifier::reconstruction_discharges_valid`.
+/// under `config`? Used by the COVERAGE GATE to mark a reconstructable RISC-V
+/// opcode as covered in its inventory. Mirrors
+/// `function_verifier::reconstruction_discharges_valid`.
 ///
 /// Returns `false` (NOT covered) for any opcode that is not reconstructable, has
 /// no representative instance, fails to reconstruct, is not tagged Reconstructed,
-/// or whose reconstructed obligation does not discharge `Valid` — the exact dual
-/// `is_reconstructed() && Valid` criterion the per-instruction walk uses.
+/// or whose reconstructed obligation does not discharge `Valid` for its
+/// synthesized representative instance, where a sampled sweep counts as
+/// `Valid`. That is NOT the per-instruction walk's credit rule: since E0.2 the
+/// walk credits an emitted instruction only from its own obligation with a
+/// complete (exhaustive) discharge and reports a sampled one as unverified. A
+/// `true` here is never instruction credit.
 pub fn reconstruction_discharges_valid(opcode: RiscVOpcode, config: &VerificationConfig) -> bool {
     let Some(inst) = representative_reconstructable_inst(opcode) else {
         return false;
@@ -493,7 +503,6 @@ pub fn reconstruction_discharges_valid(opcode: RiscVOpcode, config: &Verificatio
 
 /// Verifier that maps RiscVISelFunction instructions to proof obligations.
 pub struct RiscVFunctionVerifier {
-    db: ProofDatabase,
     config: VerificationConfig,
 }
 
@@ -501,41 +510,28 @@ impl RiscVFunctionVerifier {
     /// Create a new RISC-V function verifier with default configuration.
     pub fn new() -> Self {
         Self {
-            db: ProofDatabase::new(),
             config: VerificationConfig::default(),
         }
     }
 
     /// Create a new RISC-V function verifier with a custom configuration.
     pub fn with_config(config: VerificationConfig) -> Self {
-        Self {
-            db: ProofDatabase::new(),
-            config,
-        }
+        Self { config }
     }
 
-    /// Map a RISC-V opcode to a proof search substring.
+    /// Map a RISC-V opcode to a registry search substring.
     ///
-    /// Returns `Some(name_substring)` for opcodes covered by
-    /// [`crate::riscv_lowering_proofs::all_riscv_proofs`], or `None` for opcodes
-    /// that have no registered lowering proof (branches/jumps, loads/stores, the
-    /// structural/address roles, the dead never-emitted variants, and the
-    /// pseudos/traps).
+    /// Returns `None` for EVERY opcode, and has since the #62 retraction: the
+    /// static `"riscv: <op> -> <INSN>"` theorems were degenerate X==X and were
+    /// retracted, so no RISC-V opcode names a registry theorem. It survives as
+    /// the (empty) mapping the coverage gate audits against, so that a future
+    /// mapping has one place to land and the gate reports `NoProofMapping`
+    /// rather than inventing one.
     ///
-    /// The substring is matched (case-SENSITIVE — mirroring the x86 verifier and
-    /// the `MatchCase::Sensitive` the coverage gate uses for RISC-V) against the
-    /// proof obligation `name` field, which follows the canonical form
-    /// `"riscv: Iadd_I64 -> ADD"` etc. Each query is a UNIQUE substring of
-    /// exactly one registered proof name, so a single category lookup resolves
-    /// the opcode to its proof unambiguously.
-    ///
-    /// HONESTY: only the clean dataflow ALU/comparison ops proven in
-    /// `riscv_lowering_proofs` map here. Multi-role ADDI maps to its value-role
-    /// (`rs1 + imm`) proof, which is the only dataflow role; its structural roles
-    /// (call-arg moves, SP frame alloc, return move) are covered elsewhere
-    /// (frame/call lowering), exactly as the gate allowlist documents. Structural
-    /// and dead opcodes return `None` and are classified `FailClosedAllowlisted`
-    /// in `coverage_gate::classify_riscv` — never bound to a mismatched proof.
+    /// [`Self::verify`] does not consult it: a registry theorem selected by
+    /// name is never per-instruction credit (E0.2), so the walk has no registry
+    /// arm on this backend at all. Structural and dead opcodes are classified
+    /// `FailClosedAllowlisted` in `coverage_gate::classify_riscv`.
     pub fn opcode_to_proof_query(_opcode: RiscVOpcode) -> Option<&'static str> {
         // #62 retraction (group b): the 1:1 dataflow ALU/shift/imm/cmp opcodes
         // (Add/Sub/Mul/And/Or/Xor/Sll/Srl/Sra/Slli/Srli/Addi/Slt/Sltu) previously
@@ -556,17 +552,6 @@ impl RiscVFunctionVerifier {
         None
     }
 
-    /// Map an individual RISC-V instruction to the best proof search substring.
-    ///
-    /// RISC-V proof binding is purely opcode-level (no per-instance width/scale
-    /// polymorphism like x86 MOVSX/LEA), so this is a thin wrapper over
-    /// [`Self::opcode_to_proof_query`]. Kept as a separate fn for parity with the
-    /// x86 verifier's `instruction_to_proof_query` so the `verify` walk reads the
-    /// same on all three backends.
-    pub fn instruction_to_proof_query(inst: &RiscVISelInst) -> Option<String> {
-        Self::opcode_to_proof_query(inst.opcode).map(str::to_string)
-    }
-
     /// Reason an opcode is skipped as a real trap instruction (not a pseudo).
     ///
     /// `Ebreak` is the RISC-V analogue of x86 `Ud2` / AArch64 `Brk`: a real trap
@@ -583,16 +568,19 @@ impl RiscVFunctionVerifier {
     /// Mirrors `FunctionVerifier::try_reconstruct_pilot` exactly.
     ///
     /// - `Some(Verified { degenerate: false, .. })` when the opcode is
-    ///   reconstructable AND the reconstructed obligation discharges `Valid`.
-    ///   Credited (`degenerate: false`) because its provenance is `Reconstructed`
-    ///   — the machine side came from the REAL instruction, so a wrong
-    ///   opcode/wiring would have refuted, even though a *correct* commutative
-    ///   lowering reconstructs to `bvadd == bvadd`.
+    ///   reconstructable AND the reconstructed obligation discharges `Valid`
+    ///   with complete (`Exhaustive`) evidence. Credited (`degenerate: false`)
+    ///   because its provenance is `Reconstructed` — the machine side came from
+    ///   the REAL instruction, so a wrong opcode/wiring would have refuted, even
+    ///   though a *correct* commutative lowering reconstructs to
+    ///   `bvadd == bvadd`.
+    /// - `Some(Unverified { .. })` when it discharges only by sampling:
+    ///   statistical evidence is reported, never credited.
     /// - `Some(Failed { .. })` when the reconstructed obligation REFUTES (wrong
     ///   isel opcode/wiring). This is the content of the mechanism.
     /// - `None` when the opcode is NOT reconstructable, or the instruction has no
-    ///   reconstructable operand shape (e.g. an opcode-only stub). The caller
-    ///   falls through to the existing DB-substring path unchanged.
+    ///   reconstructable operand shape (e.g. an opcode-only stub). Such an
+    ///   instruction has no instruction-built obligation and is never credited.
     ///
     /// The credit rule keys on [`ProofObligation::is_reconstructed`], never on a
     /// `name.contains` lookup — the binding is a typed exhaustive opcode match
@@ -606,32 +594,19 @@ impl RiscVFunctionVerifier {
 
         let strength = VerificationStrength::for_obligation_with_config(&obligation, &self.config);
         let vresult = verify_by_evaluation_with_config(&obligation, &self.config);
-        Some(match vresult {
-            VerificationResult::Valid => {
-                debug_assert!(
-                    obligation.is_reconstructed(),
-                    "reconstruct_alu_obligation must tag Reconstructed provenance"
-                );
-                InstructionVerificationResult::Verified {
-                    proof_name: obligation.name.clone(),
-                    category: ProofCategory::RiscVLowering,
-                    strength,
-                    // Credited: a reconstructed obligation is the genuine
-                    // (non-degenerate) credit even when structurally X==X.
-                    degenerate: !obligation.is_reconstructed(),
-                }
-            }
-            VerificationResult::Invalid { counterexample } => {
-                InstructionVerificationResult::Failed {
-                    proof_name: obligation.name.clone(),
-                    detail: counterexample,
-                }
-            }
-            VerificationResult::Unknown { reason } => InstructionVerificationResult::Failed {
-                proof_name: obligation.name.clone(),
-                detail: format!("Unknown: {reason}"),
-            },
-        })
+        debug_assert!(
+            obligation.is_reconstructed(),
+            "reconstruct_alu_obligation must tag Reconstructed provenance"
+        );
+        Some(InstructionVerificationResult::from_discharge(
+            &obligation.name,
+            ProofCategory::RiscVLowering,
+            vresult,
+            strength,
+            // Credited: a reconstructed obligation is the genuine
+            // (non-degenerate) credit even when structurally X==X.
+            !obligation.is_reconstructed(),
+        ))
     }
 
     /// Verify every instruction in a RISC-V ISel function.
@@ -654,71 +629,17 @@ impl RiscVFunctionVerifier {
                 // PHASE-2 OPERAND RECONSTRUCTION (RISC-V, task #63).
                 //
                 // The 14 reconstructable ALU/shift/compare opcodes with a real
-                // operand shape are routed through reconstruction BEFORE the
-                // DB-substring path. The machine side is rebuilt from the REAL
-                // emitted opcode+operands, so a wrong isel choice (e.g. SUB for
-                // Iadd, SLL for Ushr) or wrong operand wiring on a non-commutative
-                // op (SUB/shifts/SLT) REFUTES. Credited Verified IFF
-                // `is_reconstructed() && Valid`.
-                //
-                // `try_reconstruct` returns `None` when the opcode is not
-                // reconstructable OR the instruction does not carry a
-                // reconstructable operand shape (e.g. an opcode-only stub); the
-                // existing DB-substring path below then runs unchanged.
+                // operand shape are routed through reconstruction. The machine
+                // side is rebuilt from the REAL emitted opcode+operands, so a
+                // wrong isel choice (e.g. SUB for Iadd, SLL for Ushr) or wrong
+                // operand wiring on a non-commutative op (SUB/shifts/SLT)
+                // REFUTES. Credited Verified IFF `is_reconstructed() && Valid`
+                // with complete evidence.
                 recon_result
-            } else if let Some(query) = Self::instruction_to_proof_query(inst) {
-                // All RISC-V lowering proofs live under a single category. The
-                // RISC-V verifier matches case-SENSITIVELY (`name.contains`), so
-                // mirror that exactly (and mirror it in the coverage gate's
-                // `MatchCase::Sensitive` audit_riscv path).
-                let candidates = self.db.by_category(ProofCategory::RiscVLowering);
-                let proof = candidates
-                    .iter()
-                    .find(|p| p.obligation.name.contains(query.as_str()));
-
-                match proof {
-                    Some(cp) => {
-                        let strength = VerificationStrength::for_obligation_with_config(
-                            &cp.obligation,
-                            &self.config,
-                        );
-                        match verify_by_evaluation_with_config(&cp.obligation, &self.config) {
-                            // The per-instruction `Verified` records the discharged
-                            // lowering-proof BINDING. STRICT proven-honesty (task
-                            // #61) is applied at the TALLY via the `degenerate`
-                            // flag: the 14 RISC-V ALU proofs are X==X self-equalities
-                            // (degenerate -> credited ZERO in genuine counts); the 8
-                            // comparison/shift idioms are non-degenerate and DO
-                            // count toward genuinely_verified.
-                            VerificationResult::Valid => InstructionVerificationResult::Verified {
-                                proof_name: cp.obligation.name.clone(),
-                                category: ProofCategory::RiscVLowering,
-                                strength,
-                                degenerate: cp.obligation.is_degenerate(),
-                            },
-                            VerificationResult::Invalid { counterexample } => {
-                                InstructionVerificationResult::Failed {
-                                    proof_name: cp.obligation.name.clone(),
-                                    detail: counterexample,
-                                }
-                            }
-                            VerificationResult::Unknown { reason } => {
-                                InstructionVerificationResult::Failed {
-                                    proof_name: cp.obligation.name.clone(),
-                                    detail: format!("Unknown: {reason}"),
-                                }
-                            }
-                        }
-                    }
-                    None => InstructionVerificationResult::Unverified {
-                        reason: format!(
-                            "no RISC-V proof matching '{}' in category {}",
-                            query,
-                            ProofCategory::RiscVLowering.name()
-                        ),
-                    },
-                }
             } else {
+                // No registry arm: `opcode_to_proof_query` names no theorem for
+                // any RISC-V opcode (#62), and a theorem found by name would not
+                // be credit anyway (E0.2).
                 InstructionVerificationResult::Unverified {
                     reason: format!("no proof mapping for RISC-V opcode {:?}", inst.opcode),
                 }
@@ -733,6 +654,7 @@ impl RiscVFunctionVerifier {
 
         FunctionVerificationReport {
             function_name: func.name.clone(),
+            precondition_failure: None,
             instructions,
         }
     }
@@ -799,13 +721,51 @@ mod tests {
         f
     }
 
+    /// The walk has no registry-name arm on RISC-V, and no opcode could reach
+    /// one: `opcode_to_proof_query` names no theorem for ANY opcode (#62), so
+    /// every opcode-only instruction is either skipped (pseudo/trap) or refused
+    /// with "no proof mapping", never a registry lookup and never `Verified`.
+    /// A future mapping must turn this red and be decided explicitly.
+    #[test]
+    fn no_riscv_opcode_reaches_a_registry_name_lookup() {
+        let all = crate::coverage_gate::ALL_RISCV_OPCODES;
+        assert!(all.len() > 50, "the exhaustive opcode list must be real");
+        for &op in all {
+            assert_eq!(
+                RiscVFunctionVerifier::opcode_to_proof_query(op),
+                None,
+                "{op:?}"
+            );
+        }
+        let report = verify_riscv_function(&func_with(all));
+        assert_eq!(report.instructions.len(), all.len());
+        assert_eq!(report.verified_count(), 0, "{report:?}");
+        assert_eq!(report.registry_name_lookup_count(), 0, "{report:?}");
+        let mut refused = 0;
+        for r in &report.instructions {
+            match &r.result {
+                InstructionVerificationResult::Skipped { .. } => {}
+                InstructionVerificationResult::Unverified { reason } => {
+                    assert!(
+                        reason.starts_with("no proof mapping for RISC-V opcode"),
+                        "{}: {reason}",
+                        r.opcode
+                    );
+                    refused += 1;
+                }
+                other => panic!("{}: opcode-only row must not be {other:?}", r.opcode),
+            }
+        }
+        assert!(refused > 0, "{report:?}");
+    }
+
     #[test]
     fn clean_alu_opcodes_unverified_without_operands_after_static_proof_retraction() {
         // #62: the degenerate static-DB "riscv: <op> -> <INSN>" X==X proofs were
         // RETRACTED. Opcode-only stubs (no operands) DO NOT reconstruct and now have
         // no static fallback, so they are Unverified. (With REAL operands they route
-        // through reconstruction and are GENUINELY verified — see the companion test
-        // `clean_alu_opcodes_reconstruct_and_are_genuinely_verified`.)
+        // through reconstruction, whose sampled RV64 discharge is reported but not
+        // credited — see `clean_alu_opcodes_reconstruct_but_sampling_is_not_credited`.)
         let report = verify_riscv_function(&func_with(&all_alu_reconstructable()));
         for r in &report.instructions {
             assert!(
@@ -817,33 +777,35 @@ mod tests {
         }
     }
 
+    /// E0.2 (statistical credit withdrawn) on RISC-V: with REAL operands every
+    /// one of the 14 ALU/shift/compare opcodes still routes through
+    /// reconstruction, but each RV64 instance discharges only by sampling, so
+    /// all 14 are reported with their sample counts and none is credited.
     #[test]
-    fn clean_alu_opcodes_reconstruct_and_are_genuinely_verified() {
-        // With REAL operands, every one of the 14 ALU/shift/compare opcodes routes
-        // through reconstruction and is credited GENUINELY (non-degenerate) — the
-        // honest rise from 0.
+    fn clean_alu_opcodes_reconstruct_but_sampling_is_not_credited() {
         let report = verify_riscv_function(&func_with_operands(&all_alu_reconstructable()));
-        assert_eq!(
-            report.genuinely_verified_count(),
-            14,
-            "all 14 must be genuine"
-        );
+        assert_eq!(report.genuinely_verified_count(), 0, "{report:?}");
+        assert_eq!(report.verified_count(), 0, "{report:?}");
+        assert_eq!(report.sampled_uncredited_count(), 14, "{report:?}");
         for r in &report.instructions {
             match &r.result {
-                InstructionVerificationResult::Verified {
-                    degenerate,
-                    proof_name,
-                    ..
-                } => {
-                    assert!(!*degenerate, "{} must be reconstructed (genuine)", r.opcode);
-                    assert!(proof_name.contains("RECONSTRUCTED"), "{}", proof_name);
+                InstructionVerificationResult::Unverified { reason } => {
+                    assert!(
+                        reason.starts_with(
+                            crate::function_verifier::STATISTICAL_EVIDENCE_IS_NOT_CREDIT
+                        ),
+                        "{}: {reason}",
+                        r.opcode
+                    );
+                    assert!(reason.contains("RECONSTRUCTED"), "{}: {reason}", r.opcode);
                 }
                 other => panic!(
-                    "{} expected reconstructed Verified, got {other:?}",
+                    "{} expected uncredited sampled reconstruction, got {other:?}",
                     r.opcode
                 ),
             }
         }
+        assert!(!report.emitted_opcode_inventory().is_promotable());
     }
 
     #[test]
@@ -889,9 +851,10 @@ mod tests {
     fn alu_opcodes_have_no_static_query_and_are_reconstruction_credited() {
         // #62: the 14 dataflow ALU/shift/imm/cmp opcodes' static "riscv: <op> ->
         // <INSN>" proofs were degenerate X==X and were RETRACTED. They now have NO
-        // opcode_to_proof_query mapping (None) — coverage is the GENUINE operand-
-        // reconstruction credit (see `clean_alu_opcodes_reconstruct_and_are_
-        // genuinely_verified`). The only registered RiscVLowering proofs are the 8
+        // opcode_to_proof_query mapping (None) — their only route is operand
+        // reconstruction, credited only with complete evidence (see
+        // `clean_alu_opcodes_reconstruct_but_sampling_is_not_credited`). The only
+        // registered RiscVLowering proofs are the 8
         // GENUINE multi-instruction comparison idioms.
         for op in [
             RiscVOpcode::Add,
@@ -915,7 +878,7 @@ mod tests {
             );
         }
 
-        let db = ProofDatabase::new();
+        let db = crate::proof_database::ProofDatabase::new();
         let proofs = db.by_category(ProofCategory::RiscVLowering);
         assert_eq!(
             proofs.len(),

@@ -25,7 +25,8 @@ default = ["verify"]
 # can never ship: it passes the same always-on translation validator greedy does
 # and falls back to greedy on any rejection/timeout/oversize.
 ay-regalloc = ["trust-cg-regalloc/ay-regalloc"]
-# WP-2 — forward the decidable-lattice guard-elision authority. DEFAULT OFF.
+# WP-2 experimental lane, DEFAULT OFF. OD-27 requires a replayed refinement
+# premise; enabling the feature alone cannot remove a guard.
 # With the feature off, a refinement-carrying module compiles to byte-identical
 # code: the capability is minted and reported, but never becomes authority.
 lattice-guard-elision = [
@@ -40,12 +41,19 @@ lattice-guard-elision = [
 # only enables the extra, solver-flavoured code paths gated on `cfg(feature =
 # "verify")` throughout `compiler.rs`.
 verify = []
+# Additional checked source/Core entry composition, selected by its actual
+# consumer. Ordinary verification retains its historical dependency graph.
+source-defined-call = ["verify", "trust-cg-verify/source-defined-call"]
+# Test-only mutation knobs, forwarded to `trust-cg-lower/mutation-knobs`
+# (`trust_cg_lower::mutation_knobs`). NEVER enabled by a shipped build.
+mutation-knobs = ["trust-cg-lower/mutation-knobs"]
 
 [dependencies]
 trust-cg-ir = { workspace = true }
 trust-cg-dialect = { workspace = true }
 trust-cg-lower = { workspace = true }
 trust-cg-opt = { workspace = true }
+trust-cg-irmid = { workspace = true }
 trust-cg-process-env = { workspace = true }
 trust-cg-regalloc = { workspace = true }
 # Non-optional, `default-features = false`: the carrier-hygiene and pass
@@ -63,7 +71,11 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 rayon = "1.10"
 
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+tempfile = "3"
 # The AArch64 on-host correctness harness (`tests/common/a64_interp.rs`) decodes
 # the emitted AArch64 `__text` bytes with the real leaf disassembler and
 # interprets the integer/compare/branch/FP subset, so AArch64 codegen
@@ -86,6 +98,18 @@ num-traits = "0.2"
 # pass an independent spec validator, not only our own encoder's invariants.
 # Dev-only; the emission path MUST NOT gain dependencies.
 wasmparser = "0.240.0"
+# trust-ir's must-refuse corpus runner (KIND 4), consumed by
+# `tests/must_refuse_corpus.rs`: every artifact row of the pinned trust-ir's
+# corpus is driven through THIS crate's real admission paths. Dev-only; the
+# production graph MUST NOT gain it.
+trust-ir-conformance = { workspace = true }
+# The INDEPENDENT oracle of `tests/trust_ir_corpus_roundtrip.rs`: the pinned
+# trust-ir conformance corpus ships every module as MessagePack too, a codec
+# trust-cg's reader never uses, so a trust-cg-side mis-read of the binary, JSON
+# or text form cannot agree with it by sharing a bug. Dev-only (already in the
+# lock through trust-cg-verify's dev graph); the production graph MUST NOT
+# gain it.
+rmp-serde = { workspace = true }
 
 [[bench]]
 name = "compile_bench"

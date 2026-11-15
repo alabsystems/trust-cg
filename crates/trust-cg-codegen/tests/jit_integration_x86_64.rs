@@ -15,7 +15,7 @@
 //
 // This entire file is gated on `#[cfg(all(target_arch = "x86_64", unix))]`.
 // On AArch64 hosts (the primary dev platform) and Windows x86_64 hosts, this
-// Unix mmap/mprotect smoke is skipped at compile time. `cargo check --tests`
+// Unix mmap/mprotect smoke is skipped at compile time. `targo --unverified check --tests`
 // still validates its syntax via the outer file-level `#![cfg]` attribute
 // (rustc parses and attribute-filters the contents before type-checking). The
 // test body runs only on Unix x86-64 hosts (Linux x86_64, macOS Intel).
@@ -61,6 +61,8 @@
 
 #![cfg(all(target_arch = "x86_64", unix))]
 
+mod common;
+
 use std::collections::HashMap;
 
 use std::arch::x86_64::__m128i;
@@ -75,7 +77,7 @@ use trust_cg_codegen::x86_64::{
 };
 use trust_cg_ir::x86_64_ops::X86Opcode;
 use trust_cg_ir::x86_64_regs::{RDI, RDX, RSI, X86PReg, XMM0, XMM1};
-use trust_cg_lower::adapter::translate_function;
+
 use trust_cg_lower::function::{BasicBlock, Function as LirFunction, Signature, StackSlotInfo};
 use trust_cg_lower::instructions::{Block, Instruction, IntCC, Opcode, Value};
 use trust_cg_lower::types::Type;
@@ -229,12 +231,19 @@ fn compile_lir_leaf(func: &LirFunction) -> Vec<u8> {
         .expect("x86-64 compile_trust_ir_function should succeed for the smoke test")
 }
 
+/// The raw x86 pipeline under the SAME profile the public host JIT selects:
+/// `CompilerConfig::for_host_jit` is `jit_fast`, whose
+/// `enable_jit_fast_regalloc` picks `X86PipelineConfig::host_jit_fast` (the
+/// LinearScan core with the detected host features). A raw compile under the
+/// default Greedy/generic profile can legitimately differ from the public JIT
+/// by a register choice (one REX byte), which is not the disagreement the
+/// "matches raw pipeline" tests exist to catch.
 fn compile_lir_host_jit_o0_raw(func: &LirFunction) -> Vec<u8> {
     let pipeline = X86Pipeline::new(X86PipelineConfig {
         opt_level: X86OptLevel::O0,
         emit_frame: true,
         output_format: X86OutputFormat::RawBytes,
-        ..X86PipelineConfig::default()
+        ..X86PipelineConfig::host_jit_fast()
     });
     pipeline
         .compile_trust_ir_function(func)
@@ -272,8 +281,8 @@ fn compile_isel_o0_raw_with_features(
 }
 
 fn single_translated_lir_function(module: &TrustIrModule) -> LirFunction {
-    let mut translated = trust_cg_lower::translate_module(module)
-        .expect("test trust_ir helper must translate to LIR");
+    let mut translated =
+        permit_translate_module(module).expect("test trust_ir helper must translate to LIR");
     assert_eq!(
         translated.len(),
         1,
@@ -340,31 +349,15 @@ fn contains_sse41_0f3a_opcode(code: &[u8], opcode: u8) -> bool {
         })
 }
 
-fn is_legacy_pmovmskb_modrm_byte(code: &[u8], idx: usize) -> bool {
-    if idx < 3 || code.get(idx - 1) != Some(&0xD7) || code.get(idx - 2) != Some(&0x0F) {
-        return false;
-    }
-    code.get(idx - 3) == Some(&0x66)
-        || (idx >= 4 && (0x40..=0x4F).contains(&code[idx - 3]) && code.get(idx - 4) == Some(&0x66))
-}
-
-fn contains_vex_prefix_byte(code: &[u8]) -> bool {
-    code.iter()
-        .enumerate()
-        .any(|(idx, byte)| matches!(byte, 0xC4 | 0xC5) && !is_legacy_pmovmskb_modrm_byte(code, idx))
-}
-
-fn contains_vex_instruction_prefix(code: &[u8]) -> bool {
-    code.iter().enumerate().any(|(idx, byte)| match byte {
-        0xC4 if !is_legacy_pmovmskb_modrm_byte(code, idx) => {
-            let Some(vex_m) = code.get(idx + 1) else {
-                return false;
-            };
-            matches!(vex_m & 0x1F, 0x01..=0x03) && code.get(idx + 3).is_some()
-        }
-        0xC5 if !is_legacy_pmovmskb_modrm_byte(code, idx) => code.get(idx + 2).is_some(),
-        _ => false,
-    })
+/// Panic unless `code` is legacy-encoded end to end: an instruction-boundary
+/// walk (`common::x86_insn`), never a byte scan, because 0xC4/0xC5 are
+/// ordinary operand bytes inside legacy instructions (`66 0F 6F C5` is
+/// `movdqa %xmm5,%xmm0`; `48 83 C4 08` is `addq $8,%rsp`) and are VEX only
+/// at an instruction boundary. A stream whose boundaries cannot be
+/// established fails the assertion rather than passing it, and on hosts with
+/// GNU objdump every boundary is cross-checked against it.
+fn assert_legacy_encoded(code: &[u8], label: &str) {
+    common::x86_insn::assert_legacy_encoded(code, label);
 }
 
 fn assert_no_scalar_lane_fallback(
@@ -413,7 +406,7 @@ fn host_jit_o0_compiler() -> Compiler {
     // dedicated jit_validation_modes_x86_64 suite.
     let mut config = CompilerConfig::for_host_jit_unchecked();
     config.opt_level = OptLevel::O0;
-    Compiler::new(config)
+    Compiler::new(config).with_codegen_license(permit_unlicensed())
 }
 
 fn v2i64_ty() -> TrustIrTy {
@@ -448,6 +441,7 @@ fn func_ty(params: Vec<TrustIrTy>, returns: Vec<TrustIrTy>) -> FuncTy {
     FuncTy {
         params,
         returns,
+        abi: None,
         is_vararg: false,
     }
 }
@@ -460,10 +454,14 @@ fn single_function_module(
 ) -> TrustIrModule {
     let entry = blocks.first().expect("module must have a block").id;
     let mut module = TrustIrModule::new(format!("{}_module", name));
-    let func_ty_id: FuncTyId = module.add_func_type(ty);
+    let func_ty_id: FuncTyId = module
+        .add_func_type(ty)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(func_id), name, func_ty_id, entry);
     func.blocks = blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -475,10 +473,14 @@ fn add_function_to_module(
     blocks: Vec<TrustIrBlock>,
 ) {
     let entry = blocks.first().expect("function must have a block").id;
-    let func_ty_id: FuncTyId = module.add_func_type(ty);
+    let func_ty_id: FuncTyId = module
+        .add_func_type(ty)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(func_id), name, func_ty_id, entry);
     func.blocks = blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn metrics_for<'a>(result: &'a JitCompilationResult, name: &str) -> &'a FunctionQualityMetrics {
@@ -660,6 +662,85 @@ fn assert_inst_vector_fixture_payloads(module: &TrustIrModule) {
     );
 }
 
+/// The canonical fixture returns eight values, four of them `<4 x i32>` or
+/// `<2 x i64>`. System V has two SSE return registers, and trust-cg's scalar
+/// return placement refuses the third vector result rather than alias XMM1
+/// (`classify_x86_scalar_return_locations`: "never alias an earlier result";
+/// the code it replaced indexed `X86_RET_XMMS[i.min(1)]`, a wrong-code shape).
+/// The x86-64 replay therefore runs on this derivation: the same body, every
+/// dialect op still live, folded into the four results System V places —
+/// `<4 x i32>` (XMM0), `<2 x i64>` (XMM1), `i32` (RAX) and `i64` (RDX). The
+/// two extract_lane scalars are added into the two mask_to_bits scalars so
+/// no op becomes dead.
+fn x86_64_sysv_placeable_vector_dialect_module(canonical: &TrustIrModule) -> TrustIrModule {
+    let mut module = canonical.clone();
+    let canonical_ty = portable_vector_dialect_function(canonical).ty;
+    let params = module
+        .func_type(canonical_ty)
+        .expect("canonical fixture function type")
+        .params
+        .clone();
+    let placeable_ty = module
+        .add_func_type(func_ty(
+            params,
+            vec![v4i32_ty(), v2i64_ty(), TrustIrTy::I32, TrustIrTy::I64],
+        ))
+        .expect("Module::add_func_type: test fixture");
+    let function = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == PORTABLE_VECTOR_DIALECT_FN)
+        .expect("derivation must keep the fixture function");
+    function.ty = placeable_ty;
+    let entry = function.entry;
+    let block = function
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == entry)
+        .expect("fixture entry block");
+    let ret = block
+        .body
+        .iter()
+        .position(|node| matches!(node.inst, Inst::Return { .. }))
+        .expect("fixture return");
+    let Inst::Return { values } = &block.body[ret].inst else {
+        unreachable!("position matched Inst::Return");
+    };
+    assert_eq!(
+        values,
+        &[v(10), v(11), v(12), v(13), v(14), v(15), v(17), v(19)],
+        "the derivation is written against the vendored fixture's return list"
+    );
+    block.body.splice(
+        ret..,
+        [
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Add,
+                ty: TrustIrTy::I32,
+                lhs: v(17),
+                rhs: v(11),
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::BinOp {
+                op: BinOp::Add,
+                ty: TrustIrTy::I64,
+                lhs: v(19),
+                rhs: v(14),
+            })
+            .with_result(v(21)),
+            InstrNode::new(Inst::Return {
+                values: vec![v(12), v(15), v(20), v(21)],
+            }),
+        ],
+    );
+    let errors = trust_ir_build::validate_module(&module);
+    assert!(
+        errors.is_empty(),
+        "placeable derivation must validate: {errors:?}"
+    );
+    module
+}
+
 fn portable_vector_dialect_function(module: &TrustIrModule) -> &TrustIrFunction {
     module
         .functions
@@ -738,16 +819,44 @@ fn assert_inst_vector_fixture_lir_direct_paths(lir_func: &LirFunction) {
 
 #[test]
 fn test_x86_64_jit_replays_trust_ir_inst_vector_dialect_fixture() {
-    let module = load_inst_vector_dialect_fixture();
-    assert_inst_vector_fixture_payloads(&module);
+    let canonical = load_inst_vector_dialect_fixture();
+    assert_inst_vector_fixture_payloads(&canonical);
 
-    let (lir_func, _) = translate_function(portable_vector_dialect_function(&module), &module)
-        .expect("adapter must translate canonical inst_vector_dialect fixture");
+    let (lir_func, _) = trust_cg_lower::translate_function_with_license(
+        portable_vector_dialect_function(&canonical),
+        &canonical,
+        &permit_unlicensed(),
+    )
+    .expect("adapter must translate canonical inst_vector_dialect fixture");
     assert_inst_vector_fixture_lir_direct_paths(&lir_func);
 
+    // The canonical eight-result signature is not System V placeable; the
+    // return classifier must refuse it by name rather than alias XMM1.
+    let refusal = host_jit_o0_compiler()
+        .compile_module_to_jit(&canonical, &HashMap::new())
+        .expect_err("x86-64 host JIT must refuse the canonical fixture's four vector results");
+    let refusal = format!("{refusal:?}");
+    // The branch this test came from asserted the September wording
+    // ("unsupported x86-64 scalar return ABI for result 3 (V128) under
+    // SystemV" / "XMM result register capacity is exhausted"). Main has since
+    // moved the refusal earlier and made it more specific: the signature is
+    // now rejected on the MULTI-RESULT ground, naming the C return file it
+    // overflows. The test's intent is unchanged — the fixture must be refused
+    // BY NAME rather than silently aliasing XMM1 — so it is retargeted at the
+    // current message rather than at the one that no longer exists.
+    assert!(
+        refusal.contains("[TCG-X86-MULTI-RESULT]")
+            && refusal.contains("System V AMD64's C return file holds"),
+        "the refusal must name the multi-result ground and the exhausted C return file: {refusal}"
+    );
+
+    let module = x86_64_sysv_placeable_vector_dialect_module(&canonical);
+    assert_inst_vector_fixture_payloads(&module);
     let result = host_jit_o0_compiler()
         .compile_module_to_jit(&module, &HashMap::new())
-        .expect("x86-64 host JIT must compile canonical inst_vector_dialect fixture");
+        .expect(
+            "x86-64 host JIT must compile the System V placeable inst_vector_dialect derivation",
+        );
     assert_eq!(result.metrics.function_count, 1);
     assert_metrics_code_size_matches_replay(&result, PORTABLE_VECTOR_DIALECT_FN);
     assert!(
@@ -1521,7 +1630,7 @@ fn build_jit_opcode_evidence_module() -> TrustIrModule {
     let v4_i32_ops = v4i32_ty();
     add_function_to_module(
         &mut module,
-        8836,
+        8843,
         "jit_evidence_v4_i32_arith_logic",
         func_ty(vec![TrustIrTy::Ptr, TrustIrTy::Ptr, TrustIrTy::Ptr], vec![]),
         vec![TrustIrBlock {
@@ -1588,11 +1697,31 @@ fn build_jit_opcode_evidence_module() -> TrustIrModule {
                     rhs: v(14),
                 })
                 .with_result(v(17)),
+                // The compare result is a logical `<4 x bool>`, not a `<4 x i32>`
+                // operand; a typed select over all-ones/zero materializes the
+                // lane mask the XOR consumes.
+                InstrNode::new(Inst::Const {
+                    ty: v4_i32_ops.clone(),
+                    value: Constant::Vector(vec![Constant::Int(-1); 4]),
+                })
+                .with_result(v(19)),
+                InstrNode::new(Inst::Const {
+                    ty: v4_i32_ops.clone(),
+                    value: Constant::Vector(vec![Constant::Int(0); 4]),
+                })
+                .with_result(v(20)),
+                InstrNode::new(Inst::Select {
+                    ty: v4_i32_ops.clone(),
+                    cond: v(15),
+                    then_val: v(19),
+                    else_val: v(20),
+                })
+                .with_result(v(21)),
                 InstrNode::new(Inst::BinOp {
                     op: BinOp::Xor,
                     ty: v4_i32_ops.clone(),
                     lhs: v(17),
-                    rhs: v(15),
+                    rhs: v(21),
                 })
                 .with_result(v(18)),
                 InstrNode::new(Inst::Store {
@@ -1651,17 +1780,46 @@ fn build_jit_opcode_evidence_module() -> TrustIrModule {
                     volatile: false,
                 })
                 .with_result(v(12)),
-                InstrNode::new(Inst::Select {
+                // A loaded `<4 x i32>` is a physical mask, not a `<4 x bool>`
+                // select condition (trust-ir's `Ty::select_condition_ty`), so
+                // the bit-select is written out: `(mask & a) | (~mask & b)`.
+                InstrNode::new(Inst::BinOp {
+                    op: BinOp::And,
                     ty: v4_i32_bitselect.clone(),
-                    cond: v(10),
-                    then_val: v(11),
-                    else_val: v(12),
+                    lhs: v(10),
+                    rhs: v(11),
                 })
                 .with_result(v(13)),
+                InstrNode::new(Inst::Const {
+                    ty: v4_i32_bitselect.clone(),
+                    value: Constant::Vector(vec![Constant::Int(-1); 4]),
+                })
+                .with_result(v(14)),
+                InstrNode::new(Inst::BinOp {
+                    op: BinOp::Xor,
+                    ty: v4_i32_bitselect.clone(),
+                    lhs: v(10),
+                    rhs: v(14),
+                })
+                .with_result(v(15)),
+                InstrNode::new(Inst::BinOp {
+                    op: BinOp::And,
+                    ty: v4_i32_bitselect.clone(),
+                    lhs: v(15),
+                    rhs: v(12),
+                })
+                .with_result(v(16)),
+                InstrNode::new(Inst::BinOp {
+                    op: BinOp::Or,
+                    ty: v4_i32_bitselect.clone(),
+                    lhs: v(13),
+                    rhs: v(16),
+                })
+                .with_result(v(17)),
                 InstrNode::new(Inst::Store {
                     ty: v4_i32_bitselect,
                     ptr: v(3),
-                    value: v(13),
+                    value: v(17),
                     align: None,
                     volatile: false,
                 }),
@@ -1885,6 +2043,12 @@ fn build_v2i64_cmp_mask_module(func_id: u32, name: &str, op: ICmpOp) -> TrustIrM
     )
 }
 
+/// `select ptr` under a `<2 x i64>` compare: the pointer is taken when ANY
+/// lane compares true. trust-ir requires a scalar `bool` condition for a
+/// scalar select (`Ty::select_condition_ty`; `validate_module` reports
+/// `SelectConditionTypeMismatch` for a `<2 x bool>` condition), so the compare
+/// mask is folded to its lane bits with `bitfield.v2i64_bool_mask_extract`
+/// (PMOVMSKB on x86) and compared against zero.
 fn build_v2i64_cmp_pointer_select_module(func_id: u32, name: &str, op: ICmpOp) -> TrustIrModule {
     let vector_ty = v2i64_ty();
     single_function_module(
@@ -1916,9 +2080,28 @@ fn build_v2i64_cmp_pointer_select_module(func_id: u32, name: &str, op: ICmpOp) -
                     rhs: v(11),
                 })
                 .with_result(v(12)),
+                InstrNode::new(Inst::DialectOp(Box::new(
+                    trust_cg_lower::bitfield_dialect::v2i64_bool_mask_extract(
+                        v(12),
+                        TrustIrTy::I32,
+                    ),
+                )))
+                .with_result(v(13)),
+                InstrNode::new(Inst::Const {
+                    ty: TrustIrTy::I32,
+                    value: Constant::Int(0),
+                })
+                .with_result(v(14)),
+                InstrNode::new(Inst::ICmp {
+                    op: ICmpOp::Ne,
+                    ty: TrustIrTy::I32,
+                    lhs: v(13),
+                    rhs: v(14),
+                })
+                .with_result(v(16)),
                 InstrNode::new(Inst::Select {
                     ty: TrustIrTy::Ptr,
-                    cond: v(12),
+                    cond: v(16),
                     then_val: v(0),
                     else_val: v(1),
                 })
@@ -3804,14 +3987,17 @@ fn test_x86_64_jit_v2i64_compare_code_size_no_local_frame_matches_raw_pipeline()
     let lir_func = single_translated_lir_function(&module);
     let raw_code = compile_lir_host_jit_o0_raw(&lir_func);
 
-    // Both the raw pipeline and the public JIT now emit the same 41-byte
-    // PCMPGTQ+PTEST+CMOV select with a single MOVDQA staging copy; the prior
-    // 44-byte golden predated the redundant-move cleanup in the x86 pipeline.
-    // The point of this test is that the two paths agree (asserted below), and
-    // they do: raw == public == 41 bytes.
+    // Both the raw pipeline and the public JIT emit the same 83-byte
+    // PCMPGTQ + PMOVMSKB mask fold + scalar compare + CMOV select under the
+    // host_jit_fast profile: the well-typed `select ptr` takes a scalar
+    // `bool`, so the `<2 x bool>` mask is folded to its lane bits and tested
+    // against zero (the earlier 41-byte PCMPGTQ+PTEST+CMOV golden belonged to
+    // a select whose condition was the raw vector mask, which trust-ir does
+    // not type). The point of this test is that the two paths agree (asserted
+    // below), and they do: raw == public == 83 bytes.
     assert_eq!(
         raw_code.len(),
-        41,
+        83,
         "native v2i64 compare helper code size changed, code={raw_code:02X?}"
     );
     assert!(
@@ -3863,14 +4049,16 @@ fn test_x86_64_jit_v2i64_compare_code_size_no_local_frame_matches_raw_pipeline()
         .unwrap_or_else(|| panic!("{name} per-function metrics should be present"));
 
     assert_eq!(result.metrics.function_count, 1);
+    let public_code = jit_symbol_code_bytes(&result, name);
     assert_eq!(
         metrics.code_size_bytes,
         raw_code.len(),
-        "per-symbol metrics should expose the helper byte size"
+        "per-symbol metrics should expose the helper byte size; public={public_code:02X?} \
+         raw={raw_code:02X?}"
     );
     assert!(
-        metrics.x86_machine_code.ptest_count >= 1,
-        "per-symbol metrics should expose PTEST evidence: {:?}",
+        metrics.x86_machine_code.pcmpgtq_count >= 1 && metrics.x86_machine_code.pmovmskb_count >= 1,
+        "per-symbol metrics should expose the PCMPGTQ compare and the PMOVMSKB mask fold: {:?}",
         metrics.x86_machine_code
     );
     assert_eq!(
@@ -4030,9 +4218,9 @@ fn test_x86_64_jit_feature_chc() {
     );
     assert_eq!(sse4_evidence.machine_code.target_features, host);
     assert_eq!(sse4_evidence.machine_code.pcmpgtq_count, 1);
-    assert!(
-        !contains_vex_prefix_byte(&sse4_code),
-        "SSE4 canary must not emit VEX/YMM lowering even when AVX is detected: {sse4_code:02X?}"
+    assert_legacy_encoded(
+        &sse4_code,
+        "SSE4 canary must not emit VEX/YMM lowering even when AVX is detected",
     );
 
     let jit_result = host_jit_o0_compiler()
@@ -4279,9 +4467,13 @@ fn test_x86_64_public_jit_opcode_evidence_metrics_cover_sse_lane_ops() {
         "v2i64 repeated constant should avoid PINSRQ: {:?}",
         v2_repeated_const.x86_machine_code
     );
+    // The typed pointer select folds the `<2 x bool>` compare mask to its lane
+    // bits (PMOVMSKB) before the scalar select; PTEST belonged to the untyped
+    // vector-condition select trust-ir does not admit.
     assert!(
-        ptest_select.x86_machine_code.ptest_count >= 1,
-        "v2i64 pointer select should expose PTEST evidence: {:?}",
+        ptest_select.x86_machine_code.pcmpgtq_count >= 1
+            && ptest_select.x86_machine_code.pmovmskb_count >= 1,
+        "v2i64 pointer select should expose PCMPGTQ and PMOVMSKB evidence: {:?}",
         ptest_select.x86_machine_code
     );
     assert_eq!(
@@ -4467,11 +4659,14 @@ fn test_x86_64_public_jit_opcode_evidence_metrics_cover_sse_lane_ops() {
         "v4i32 arith/logic evidence should expose final MOVDQU load/store counts: {:?}",
         v4_arith_logic.x86_machine_code
     );
+    // `(mask & a) | (~mask & b)` written out: two PANDs, the PXOR that forms
+    // `~mask`, and the POR. PANDN belonged to the untyped select under a
+    // loaded mask, which trust-ir does not admit as a condition.
     assert!(
-        v4_bitselect.x86_machine_code.pand_count >= 1
-            && v4_bitselect.x86_machine_code.pandn_count >= 1
+        v4_bitselect.x86_machine_code.pand_count >= 2
+            && v4_bitselect.x86_machine_code.pxor_count >= 1
             && v4_bitselect.x86_machine_code.por_count >= 1,
-        "loaded-mask v4i32 select should expose SSE2 bitselect PAND/PANDN/POR: {:?}",
+        "loaded-mask v4i32 bit-select should expose SSE2 PAND/PXOR/POR: {:?}",
         v4_bitselect.x86_machine_code
     );
     assert!(
@@ -4627,9 +4822,9 @@ fn test_x86_64_jit_packed_compare_multiply_rhs_spill_fold_canary() {
             folded_evidence.machine_code.movdqu_load_count + 1,
             "{name} folded memory-RHS code should remove the explicit MOVDQU reload"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&folded_code),
-            "{name} folded canary must stay on legacy SSE encodings: {folded_code:02X?}"
+        assert_legacy_encoded(
+            &folded_code,
+            &format!("{name} folded canary must stay on legacy SSE encodings"),
         );
 
         match opcode {
@@ -4718,9 +4913,9 @@ fn test_x86_64_jit_pshufd_rhs_spill_fold_preserves_lane_shuffle_result() {
         contains_sse2_opcode(&folded_code, 0x70),
         "folded PSHUFD canary must encode legacy 66 0F 70 bytes: {folded_code:02X?}"
     );
-    assert!(
-        !contains_vex_instruction_prefix(&folded_code),
-        "folded PSHUFD canary must stay on legacy SSE encodings: {folded_code:02X?}"
+    assert_legacy_encoded(
+        &folded_code,
+        "folded PSHUFD canary must stay on legacy SSE encodings",
     );
 
     let folded_page = ExecPage::new(&folded_code);
@@ -4822,10 +5017,7 @@ fn test_x86_64_jit_narrow_i8_i16_add_sub_mul_use_legacy_sse2_without_vex() {
             contains_sse2_opcode(&code, sse2_opcode),
             "{name} must encode legacy SSE2 packed byte arithmetic, code={code:02X?}"
         );
-        assert!(
-            !code.contains(&0xC4) && !code.contains(&0xC5),
-            "{name} must not require VEX/YMM encoding, code={code:02X?}"
-        );
+        assert_legacy_encoded(&code, &format!("{name} must not require VEX/YMM encoding"));
 
         let page = ExecPage::new(&code);
         // SAFETY: `page` contains a leaf System V function taking three
@@ -4861,10 +5053,7 @@ fn test_x86_64_jit_narrow_i8_i16_add_sub_mul_use_legacy_sse2_without_vex() {
             contains_sse2_opcode(&code, sse2_opcode),
             "{name} must encode legacy SSE2 packed word arithmetic, code={code:02X?}"
         );
-        assert!(
-            !code.contains(&0xC4) && !code.contains(&0xC5),
-            "{name} must not require VEX/YMM encoding, code={code:02X?}"
-        );
+        assert_legacy_encoded(&code, &format!("{name} must not require VEX/YMM encoding"));
 
         let page = ExecPage::new(&code);
         // SAFETY: `page` contains a leaf System V function taking three
@@ -4920,8 +5109,7 @@ fn test_x86_64_jit_narrow_i8_i16_bitwise_ops_preserve_lane_values() {
     .enumerate()
     {
         let name = format!("v16i8_{suffix}_bitwise_lane_values");
-        let module =
-            build_narrow_bitwise_store_module(8920 + index as u32, &name, v16i8_ty(), op.clone());
+        let module = build_narrow_bitwise_store_module(8920 + index as u32, &name, v16i8_ty(), op);
         let result = host_jit_o0_compiler()
             .compile_module_to_jit(&module, &HashMap::new())
             .unwrap_or_else(|err| panic!("x86-64 host JIT should compile {name}: {err}"));
@@ -4954,9 +5142,9 @@ fn test_x86_64_jit_narrow_i8_i16_bitwise_ops_preserve_lane_values() {
             contains_sse2_opcode(code, sse2_opcode),
             "{name} must encode legacy SSE2 bitwise opcode {sse2_opcode:#04x}: {code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(code),
-            "{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {code:02X?}"
+        assert_legacy_encoded(
+            code,
+            &format!("{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
         );
 
         let run: extern "C" fn(*const i8, *const i8, *mut i8) = unsafe {
@@ -4992,8 +5180,7 @@ fn test_x86_64_jit_narrow_i8_i16_bitwise_ops_preserve_lane_values() {
     .enumerate()
     {
         let name = format!("v8i16_{suffix}_bitwise_lane_values");
-        let module =
-            build_narrow_bitwise_store_module(8923 + index as u32, &name, v8i16_ty(), op.clone());
+        let module = build_narrow_bitwise_store_module(8923 + index as u32, &name, v8i16_ty(), op);
         let result = host_jit_o0_compiler()
             .compile_module_to_jit(&module, &HashMap::new())
             .unwrap_or_else(|err| panic!("x86-64 host JIT should compile {name}: {err}"));
@@ -5026,9 +5213,9 @@ fn test_x86_64_jit_narrow_i8_i16_bitwise_ops_preserve_lane_values() {
             contains_sse2_opcode(code, sse2_opcode),
             "{name} must encode legacy SSE2 bitwise opcode {sse2_opcode:#04x}: {code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(code),
-            "{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {code:02X?}"
+        assert_legacy_encoded(
+            code,
+            &format!("{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
         );
 
         let run: extern "C" fn(*const i16, *const i16, *mut i16) = unsafe {
@@ -5111,9 +5298,9 @@ fn test_x86_64_jit_narrow_i8_i16_eq_ne_masks_use_pcmpeq_legacy_sse2() {
             contains_sse2_opcode(&code, expected_pcmpeq_opcode),
             "{name} must encode legacy PCMPEQB/PCMPEQW bytes, code={code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&code),
-            "{name} must not emit VEX/YMM instructions under generic SSE2, code={code:02X?}"
+        assert_legacy_encoded(
+            &code,
+            &format!("{name} must not emit VEX/YMM instructions under generic SSE2"),
         );
 
         match opcode {
@@ -5297,9 +5484,9 @@ fn test_x86_64_jit_narrow_i8_i16_eq_ne_mask_to_bits_lane_order_and_upper_zero() 
             contains_sse2_opcode(&raw_code, 0x74) && contains_sse2_opcode(&raw_code, 0xD7),
             "{name} must encode legacy PCMPEQB plus PMOVMSKB bytes: {raw_code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&raw_code),
-            "{name} raw mask_to_bits path must stay on legacy XMM/SSE encodings: {raw_code:02X?}"
+        assert_legacy_encoded(
+            &raw_code,
+            &format!("{name} raw mask_to_bits path must stay on legacy XMM/SSE encodings"),
         );
 
         let result = host_jit_o0_compiler()
@@ -5318,9 +5505,9 @@ fn test_x86_64_jit_narrow_i8_i16_eq_ne_mask_to_bits_lane_order_and_upper_zero() 
         assert_eq!(metrics.x86_machine_code.pinsrq_count, 0);
         assert_eq!(metrics.x86_machine_code.pextrd_count, 0);
         assert_eq!(metrics.x86_machine_code.pextrq_count, 0);
-        assert!(
-            !contains_vex_instruction_prefix(jit_code),
-            "{name} JIT mask_to_bits path must stay on legacy XMM/SSE encodings: {jit_code:02X?}"
+        assert_legacy_encoded(
+            jit_code,
+            &format!("{name} JIT mask_to_bits path must stay on legacy XMM/SSE encodings"),
         );
 
         let run: extern "C" fn(*const i8, *const i8) -> u32 = unsafe {
@@ -5389,9 +5576,9 @@ fn test_x86_64_jit_narrow_i8_i16_eq_ne_mask_to_bits_lane_order_and_upper_zero() 
             contains_sse2_opcode(&raw_code, 0x75) && contains_sse2_opcode(&raw_code, 0xD7),
             "{name} must encode legacy PCMPEQW plus PMOVMSKB bytes: {raw_code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&raw_code),
-            "{name} raw mask_to_bits path must stay on legacy XMM/SSE encodings: {raw_code:02X?}"
+        assert_legacy_encoded(
+            &raw_code,
+            &format!("{name} raw mask_to_bits path must stay on legacy XMM/SSE encodings"),
         );
 
         let result = host_jit_o0_compiler()
@@ -5410,9 +5597,9 @@ fn test_x86_64_jit_narrow_i8_i16_eq_ne_mask_to_bits_lane_order_and_upper_zero() 
         assert_eq!(metrics.x86_machine_code.pinsrq_count, 0);
         assert_eq!(metrics.x86_machine_code.pextrd_count, 0);
         assert_eq!(metrics.x86_machine_code.pextrq_count, 0);
-        assert!(
-            !contains_vex_instruction_prefix(jit_code),
-            "{name} JIT mask_to_bits path must stay on legacy XMM/SSE encodings: {jit_code:02X?}"
+        assert_legacy_encoded(
+            jit_code,
+            &format!("{name} JIT mask_to_bits path must stay on legacy XMM/SSE encodings"),
         );
 
         let run: extern "C" fn(*const i16, *const i16) -> u32 = unsafe {
@@ -5493,9 +5680,11 @@ fn test_x86_64_jit_canonical_bool_constant_mask_to_bits_lane_order_and_upper_zer
             contains_sse2_opcode(&raw_code, 0xD7),
             "{name} raw path must encode legacy PMOVMSKB bytes: {raw_code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&raw_code),
-            "{name} raw path must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {raw_code:02X?}"
+        assert_legacy_encoded(
+            &raw_code,
+            &format!(
+                "{name} raw path must stay on legacy XMM/SSE encodings without VEX/YMM lowering"
+            ),
         );
 
         let result = host_jit_o0_compiler()
@@ -5525,9 +5714,9 @@ fn test_x86_64_jit_canonical_bool_constant_mask_to_bits_lane_order_and_upper_zer
             contains_sse2_opcode(jit_code, 0xD7),
             "{name} must encode legacy PMOVMSKB bytes: {jit_code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(jit_code),
-            "{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {jit_code:02X?}"
+        assert_legacy_encoded(
+            jit_code,
+            &format!("{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
         );
 
         let run: extern "C" fn() -> u32 = unsafe {
@@ -5589,9 +5778,11 @@ fn test_x86_64_jit_v4_v2_canonical_bool_constant_mask_to_bits_lane_order_and_upp
             contains_sse2_opcode(&raw_code, 0xD7),
             "{name} raw path must encode legacy PMOVMSKB bytes: {raw_code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&raw_code),
-            "{name} raw path must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {raw_code:02X?}"
+        assert_legacy_encoded(
+            &raw_code,
+            &format!(
+                "{name} raw path must stay on legacy XMM/SSE encodings without VEX/YMM lowering"
+            ),
         );
 
         let result = host_jit_o0_compiler()
@@ -5613,9 +5804,9 @@ fn test_x86_64_jit_v4_v2_canonical_bool_constant_mask_to_bits_lane_order_and_upp
             contains_sse2_opcode(jit_code, 0xD7),
             "{name} must encode legacy PMOVMSKB bytes: {jit_code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(jit_code),
-            "{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {jit_code:02X?}"
+        assert_legacy_encoded(
+            jit_code,
+            &format!("{name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
         );
 
         let run: extern "C" fn() -> u32 = unsafe {
@@ -5704,9 +5895,9 @@ fn test_x86_64_jit_canonical_bool_constant_select_lane_values() {
             "{v16_name} should encode legacy SSE2 PAND/PANDN/POR: {v16_code:02X?}"
         );
     }
-    assert!(
-        !contains_vex_instruction_prefix(v16_code),
-        "{v16_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {v16_code:02X?}"
+    assert_legacy_encoded(
+        v16_code,
+        &format!("{v16_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
     );
 
     let run_v16: extern "C" fn(*const i8, *const i8, *mut i8) = unsafe {
@@ -5789,9 +5980,9 @@ fn test_x86_64_jit_canonical_bool_constant_select_lane_values() {
             "{v8_name} should encode legacy SSE2 PAND/PANDN/POR: {v8_code:02X?}"
         );
     }
-    assert!(
-        !contains_vex_instruction_prefix(v8_code),
-        "{v8_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {v8_code:02X?}"
+    assert_legacy_encoded(
+        v8_code,
+        &format!("{v8_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
     );
 
     let run_v8: extern "C" fn(*const i16, *const i16, *mut i16) = unsafe {
@@ -6005,9 +6196,9 @@ fn test_x86_64_jit_v4_v2_compare_vector_select_lane_values() {
         v4_metrics.x86_machine_code
     );
     assert_no_scalar_lane_fallback(&v4_metrics.x86_machine_code, v4_name);
-    assert!(
-        !contains_vex_instruction_prefix(v4_code),
-        "{v4_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {v4_code:02X?}"
+    assert_legacy_encoded(
+        v4_code,
+        &format!("{v4_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
     );
 
     let run_v4: extern "C" fn(*const i32, *const i32, *const i32, *const i32, *mut i32) = unsafe {
@@ -6062,9 +6253,9 @@ fn test_x86_64_jit_v4_v2_compare_vector_select_lane_values() {
         v2_metrics.x86_machine_code
     );
     assert_no_scalar_lane_fallback(&v2_metrics.x86_machine_code, v2_name);
-    assert!(
-        !contains_vex_instruction_prefix(v2_code),
-        "{v2_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering: {v2_code:02X?}"
+    assert_legacy_encoded(
+        v2_code,
+        &format!("{v2_name} must stay on legacy XMM/SSE encodings without VEX/YMM lowering"),
     );
 
     let run_v2: extern "C" fn(*const i64, *const i64, *const i64, *const i64, *mut i64) = unsafe {
@@ -6138,9 +6329,9 @@ fn test_x86_64_jit_narrow_i8_i16_signed_ordered_masks_use_pcmpgt_legacy_sse2() {
                 "{name} must encode PCMPGTB + PCMPEQB + POR, code={code:02X?}"
             );
         }
-        assert!(
-            !contains_vex_instruction_prefix(&code),
-            "{name} must not emit VEX/YMM instructions under generic SSE2, code={code:02X?}"
+        assert_legacy_encoded(
+            &code,
+            &format!("{name} must not emit VEX/YMM instructions under generic SSE2"),
         );
 
         let page = ExecPage::new(&code);
@@ -6236,9 +6427,9 @@ fn test_x86_64_jit_narrow_i8_i16_signed_ordered_masks_use_pcmpgt_legacy_sse2() {
                 "{name} must encode PCMPGTW + PCMPEQW + POR, code={code:02X?}"
             );
         }
-        assert!(
-            !contains_vex_instruction_prefix(&code),
-            "{name} must not emit VEX/YMM instructions under generic SSE2, code={code:02X?}"
+        assert_legacy_encoded(
+            &code,
+            &format!("{name} must not emit VEX/YMM instructions under generic SSE2"),
         );
 
         let page = ExecPage::new(&code);
@@ -6302,9 +6493,9 @@ fn test_x86_64_jit_narrow_i8_i16_unsigned_ordered_masks_use_sse2_sign_bias() {
             contains_sse2_opcode(&code, 0x64) && contains_sse2_opcode(&code, 0xEF),
             "{name} must encode legacy PCMPGTB plus PXOR sign-bias bytes, code={code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&code),
-            "{name} must not emit VEX/YMM instructions under generic SSE2, code={code:02X?}"
+        assert_legacy_encoded(
+            &code,
+            &format!("{name} must not emit VEX/YMM instructions under generic SSE2"),
         );
 
         let page = ExecPage::new(&code);
@@ -6397,9 +6588,9 @@ fn test_x86_64_jit_narrow_i8_i16_unsigned_ordered_masks_use_sse2_sign_bias() {
             contains_sse2_opcode(&code, 0x65) && contains_sse2_opcode(&code, 0xEF),
             "{name} must encode legacy PCMPGTW plus PXOR sign-bias bytes, code={code:02X?}"
         );
-        assert!(
-            !contains_vex_instruction_prefix(&code),
-            "{name} must not emit VEX/YMM instructions under generic SSE2, code={code:02X?}"
+        assert_legacy_encoded(
+            &code,
+            &format!("{name} must not emit VEX/YMM instructions under generic SSE2"),
         );
 
         let page = ExecPage::new(&code);
@@ -6470,9 +6661,9 @@ fn test_x86_64_jit_v128_i32_bitwise_ops_use_legacy_sse2_without_vex() {
             contains_sse2_opcode(&code, sse2_opcode),
             "V128 {name} must encode native legacy SSE2 bytes, code={code:02X?}"
         );
-        assert!(
-            !code.contains(&0xC4) && !code.contains(&0xC5),
-            "V128 {name} should not require VEX/YMM encoding, code={code:02X?}"
+        assert_legacy_encoded(
+            &code,
+            &format!("V128 {name} should not require VEX/YMM encoding"),
         );
 
         let page = ExecPage::new(&code);
@@ -6508,12 +6699,8 @@ fn test_x86_64_jit_v4i32_uniform_const_shifts_use_sse2_immediates_counts_0_1_7_3
     for count in [0, 1, 7, 31] {
         for (op_name, op, subopcode) in &cases {
             let name = format!("v4i32_uniform_const_shift_{op_name}_{count}");
-            let module = build_v4i32_uniform_const_shift_module(
-                8920 + count as u32,
-                &name,
-                op.clone(),
-                count,
-            );
+            let module =
+                build_v4i32_uniform_const_shift_module(8920 + count as u32, &name, *op, count);
             let result = host_jit_o0_compiler()
                 .compile_module_to_jit(&module, &HashMap::new())
                 .unwrap_or_else(|err| panic!("x86-64 host JIT should compile {name}: {err}"));
@@ -6548,9 +6735,9 @@ fn test_x86_64_jit_v4i32_uniform_const_shifts_use_sse2_immediates_counts_0_1_7_3
                 "{name} should not reassemble qword pairs with PUNPCKLQDQ: {:?}",
                 metrics.x86_machine_code
             );
-            assert!(
-                !contains_vex_instruction_prefix(code),
-                "{name} should stay on legacy SSE encodings without VEX/YMM lowering: {code:02X?}"
+            assert_legacy_encoded(
+                code,
+                &format!("{name} should stay on legacy SSE encodings without VEX/YMM lowering"),
             );
 
             let run: extern "C" fn(*const i32, *mut i32) = unsafe {
@@ -6698,4 +6885,28 @@ fn test_x86_64_jit_v2i64_sub_uses_psubq_with_wrapping_lanes() {
         output,
         [lhs[0].wrapping_sub(rhs[0]), lhs[1].wrapping_sub(rhs[1]),]
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

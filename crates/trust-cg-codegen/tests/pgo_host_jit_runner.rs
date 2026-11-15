@@ -17,12 +17,65 @@ use trust_cg_codegen::{
     HostJitPgoRunnerError, TRUST_CG_HOST_JIT_PGO_PROFILE_AUTHORITY_EVIDENCE_SCHEMA,
     TRUST_CG_HOST_JIT_PGO_PROFILE_AUTHORITY_MANIFEST_SCHEMA,
     TRUST_CG_HOST_JIT_PGO_PROVENANCE_DESCRIPTOR_SCHEMA, TRUST_CG_PROFILE_REPORT_SCHEMA_V1, Target,
-    TyParentLoopSummary, compile_host_jit_with_profile_use, host_jit_pgo_provenance_descriptor,
-    pgo_cache_key, pgo_target_cpu, pgo_target_triple, run_host_jit_pgo,
+    TyParentLoopSummary, host_jit_pgo_provenance_descriptor, pgo_cache_key, pgo_target_cpu,
+    pgo_target_triple,
 };
 use trust_cg_opt::pgo::{FunctionProfile, ProfDataError, enforce_fresh, read_from_path};
 use trust_ir::{BinOp, ICmpOp, Ty, ValueId};
 use trust_ir_build::{FunctionBuilder, ModuleBuilder};
+
+/// The runner's fixture is hand-built and carries no codegen license
+/// (`body_gate: None`), which the runner's DEFAULT policy refuses (roadmap
+/// WS7.5, DG-73). These tests are about PGO, so they state `Permit` through
+/// the runner's license twins.
+fn permit() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
+}
+
+/// `run_host_jit_pgo` under [`permit`].
+#[allow(clippy::result_large_err)] // Test helper returns the runner's own error type unchanged.
+fn run_host_jit_pgo(
+    module: &trust_ir::Module,
+    trust_ir_bytes: &[u8],
+    config: &CompilerConfig,
+    target_spec: TargetSpec,
+    profile_path: &std::path::Path,
+    entry: HostJitPgoEntry,
+) -> Result<trust_cg_codegen::HostJitPgoGenerateResult, HostJitPgoRunnerError> {
+    trust_cg_codegen::run_host_jit_pgo_with_symbols_and_license(
+        module,
+        trust_ir_bytes,
+        config,
+        target_spec,
+        profile_path,
+        entry,
+        &std::collections::HashMap::new(),
+        &permit(),
+    )
+}
+
+/// `compile_host_jit_with_profile_use` under [`permit`].
+#[allow(clippy::result_large_err)] // Test helper returns the runner's own error type unchanged.
+fn compile_host_jit_with_profile_use(
+    module: &trust_ir::Module,
+    trust_ir_bytes: &[u8],
+    config: &CompilerConfig,
+    target_spec: TargetSpec,
+    profile: trust_cg_opt::pgo::ProfData,
+    profile_path: Option<&std::path::Path>,
+) -> Result<trust_cg_codegen::HostJitPgoUseResult, HostJitPgoRunnerError> {
+    trust_cg_codegen::compile_host_jit_with_profile_use_and_symbols_and_license(
+        module,
+        trust_ir_bytes,
+        config,
+        target_spec,
+        profile,
+        profile_path,
+        &std::collections::HashMap::new(),
+        &permit(),
+    )
+}
 
 const ENTRY_NAME: &str = "pgo_host_jit_ty_parent_loop";
 const SUMMARY_SLOTS: usize = 5;
@@ -196,7 +249,7 @@ fn build_parent_loop_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_unsupported_abi_module() -> trust_ir::Module {
@@ -213,7 +266,7 @@ fn build_unsupported_abi_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn host_config(opt_level: OptLevel) -> CompilerConfig {

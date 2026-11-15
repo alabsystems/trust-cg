@@ -24,6 +24,13 @@ name = "ty_replay_jit_probe"
 path = "src/bin/ty_replay_jit_probe.rs"
 
 [dependencies]
+# `src/emit_proofs.rs` digests each SMT-LIB part, and
+# `tests/print_ay_identity.rs` digests executables to check the report. It was
+# a dev-dependency until src started using it, which left the `trust-cg`
+# BINARY unable to see it ("unresolved module or unlinked crate `sha2`") while
+# the test targets built fine — so four trust-cg-cli gate legs reported
+# `0 captured passes` rather than a compile error anyone would read.
+sha2 = "0.10"
 trust-cg-codegen = { workspace = true }
 trust-cg-opt = { workspace = true }
 trust-cg-verify = { workspace = true }
@@ -31,6 +38,8 @@ trust-ir = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
+same-file = "1"
+tempfile = "3"
 
 [dev-dependencies]
 # Only `tests/pgo_profile_use.rs` names trust-cg-ir directly; the binaries
@@ -43,6 +52,11 @@ trust-ir-build = { workspace = true }
 # an independent implementation of the spec rather than checking the magic
 # header. Dev-only; the CLI's production graph MUST NOT gain this dependency.
 wasmparser = "0.240.0"
+# trust-ir's must-refuse corpus runner (KIND 4), consumed by
+# `tests/must_refuse_corpus.rs`: every artifact row is written to disk and
+# handed to the REAL `trust-cg` binary. Dev-only; the CLI's production graph
+# MUST NOT gain it.
+trust-ir-conformance = { workspace = true }
 
 [lints]
 workspace = true

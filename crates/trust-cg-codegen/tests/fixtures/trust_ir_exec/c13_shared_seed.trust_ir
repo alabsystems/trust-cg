@@ -1,0 +1,59 @@
+; TrustIr text format v1
+module "c13-shared-seed"
+
+struct @Pt { u64, u64 } id=0
+
+functy.0 = (u64, u64) -> (u64)
+
+functy.1 = (u64) -> (u64)
+
+functy.2 = (u64, u64, u64) -> (u64)
+
+fn @two_inserts(functy.0) {
+    ; #producer: clean
+    ; #body-gate: gated "c13-repro"
+bb0(%0: u64, %1: u64):
+    %2 = const struct.0 { 0, 0 }
+    %3 = insertfield struct.0 %2, 0, %0
+    %4 = insertfield struct.0 %2, 0, %1
+    %5 = extractfield u64 %3, 0
+    %6 = extractfield u64 %4, 0
+    %7 = const u64 1000
+    %8 = mul u64 %5, %7
+    %9 = add u64 %8, %6
+    ret %9
+}
+
+fn @seed_survives(functy.1) {
+    ; #producer: clean
+    ; #body-gate: gated "c13-repro"
+bb0(%0: u64):
+    %1 = const struct.0 { 7, 9 }
+    %2 = insertfield struct.0 %1, 0, %0
+    %3 = extractfield u64 %1, 0
+    %4 = extractfield u64 %2, 0
+    %5 = const u64 1000
+    %6 = mul u64 %3, %5
+    %7 = add u64 %6, %4
+    ret %7
+}
+
+fn @nonconst_base(functy.2) {
+    ; #producer: clean
+    ; #body-gate: gated "c13-repro"
+bb0(%0: u64, %1: u64, %2: u64):
+    %3 = const struct.0 { 0, 0 }
+    %4 = insertfield struct.0 %3, 1, %2
+    %5 = insertfield struct.0 %4, 0, %0
+    %6 = insertfield struct.0 %4, 0, %1
+    %7 = extractfield u64 %5, 0
+    %8 = extractfield u64 %5, 1
+    %9 = extractfield u64 %6, 0
+    %10 = extractfield u64 %6, 1
+    %11 = add u64 %7, %8
+    %12 = add u64 %9, %10
+    %13 = const u64 1000
+    %14 = mul u64 %11, %13
+    %15 = add u64 %14, %12
+    ret %15
+}

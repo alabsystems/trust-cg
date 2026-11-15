@@ -39,26 +39,17 @@ Options:
       --shard <NAME>
           Shard of a crate to run (e.g. `aarch64`, `macho`). Requires `--crate`
 
+  -q, --quiet
+          Log errors only (sets the stderr log level to `error`)
+
       --since <REF>
           Only run tests changed since the given git ref
-
-      --timeout <SECS>
-          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
 
       --compare <PATH>
           Caller-supplied baseline JSON file to diff the run against
 
-      --parallel <N>
-          Worker count (honors cargo-serialization lock). Default: auto
-
-  -q, --quiet
-          Suppress progress bars; errors still go to stderr
-
   -v, --verbose...
           Show debug-level events. Repeat for more: -vv, -vvv
-
-      --no-cache
-          Ignore proof / corpus caches
 
       --dry-run
           Print what would run without executing external tools

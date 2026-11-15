@@ -1,0 +1,52 @@
+; TrustIr text format v1
+module "_RNvCsw1O1J6e5LV_20s15_fill_merge_value4fill"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (*mut u8, u64, u32) -> ()
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCsw1O1J6e5LV_20s15_fill_merge_value4fill(functy.0) {
+bb0(%1: *mut u8, %2: u64, %3: u32):
+    switch %3 [ 0: bb3 1: bb2 default: bb1 ]
+bb3:
+    %11 = const u8 3
+    br bb4(%11)
+bb2:
+    %12 = const u8 5
+    br bb4(%12)
+bb1:
+    %13 = const u8 7
+    br bb4(%13)
+bb4(%14: u8):
+    %15 = const u64 0
+    br bb5(%14, %15)
+bb5(%16: u8, %17: u64):
+    %18 = copy u64 %17
+    %19 = icmp ult u64 %18, %2
+    condbr %19, bb6, bb7
+bb7:
+    ret
+bb6:
+    %20 = copy u8 %16
+    %21 = copy u64 %17
+    %23 = ptrtoptr *mut u8 %1 to ptr
+    %24 = ptrtoint ptr %23 to i64
+    %25 = bitcast u64 %21 to i64
+    %26 = add i64 %24, %25
+    %27 = inttoptr i64 %26 to ptr
+    %22 = ptrtoptr ptr %27 to *mut u8
+    %28 = copy u8 %20
+    store u8 %28, ptr %22
+    %30 = const u64 1
+    %29 = add u64 %17, %30
+    br bb5(%16, %29)
+}

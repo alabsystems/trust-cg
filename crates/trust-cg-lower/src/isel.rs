@@ -15,7 +15,6 @@
 // There is no code overlap between them.
 //
 // Reference: LLVM AArch64ISelLowering.cpp (tree-pattern matching + late combines)
-// Reference: designs/2026-04-12-aarch64-backend.md (two-phase ISel architecture)
 
 //! AArch64 instruction selection: trust_ir SSA IR -> AArch64 MachIR with virtual registers.
 //!
@@ -30,15 +29,32 @@
 //! (`isel_to_ir` in `trust-cg-codegen/pipeline.rs`) converts between them.
 //!
 //! Phase 2 (trust-cg-opt late combines): Address-mode formation, cmp+branch
-//! fusing, csel/cset formation. Those depend on one-use analysis not available
-//! during tree matching.
+//! fusing and csel/cset formation. Adjacent integer compare/branch pairs are
+//! selected here when a complete function-use inventory proves the boolean
+//! has no other consumer; wider combinations remain late machine combines.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+mod arithmetic_admission_tests;
+mod branch_compare;
+mod eh_call_identity;
+#[cfg(test)]
+mod eh_call_identity_tests;
 
-use crate::abi::{AArch64AbiVariant, AppleAArch64ABI, ArgLocation, HfaBaseType, PReg, gpr};
+pub use eh_call_identity::ISelEhInvokeBinding;
+
+use crate::aggregate_call_transport::{
+    AggregateCallIntent, AggregateCallIntents, AggregateFieldMaterializationPlan,
+    AggregateMaterializationPlan, MappedAggregateMaterialization,
+};
+use crate::runtime_calls::RuntimeSymbol;
+use std::collections::BTreeMap;
+use trust_cg_ir::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use crate::abi::{AArch64AbiVariant, AppleAArch64ABI, ArgLocation, PReg, gpr};
 use crate::function::{EhCallSite, EhFunctionInfo, EhLandingPad, Signature, StackSlotInfo};
 use crate::instructions::{
-    AtomicOrdering, AtomicRmwOp, Block, FloatCC, Instruction, IntCC, Opcode, Value,
+    AtomicOrdering, AtomicRmwOp, Block, DirectCallBinding, FloatCC, Instruction, IntCC, Opcode,
+    Value,
 };
 use crate::lattice_guard::{LatticeBoundsCapability, LatticeGuardCarrierBinding};
 use crate::overflow_idiom::{OverflowAnalysis, OverflowKind, detect_overflow_idioms};
@@ -48,6 +64,7 @@ use thiserror::Error;
 
 // Import canonical register types from trust-cg-ir.
 use trust_cg_ir::function::{StackSlotAllocationKind, StackSlotSizeSource};
+use trust_cg_ir::inst::intern_pregs;
 use trust_cg_ir::provenance::{
     LoweringProvenance, LoweringProvenanceCoverage, SourceInstId, SyntheticReason,
 };
@@ -140,6 +157,13 @@ const FP_ARRANGEMENT_2D: i64 = 2;
 /// grows one load/store pair per residual lane) stops paying for itself.
 const INLINE_MEMCPY_MAX_BYTES: i64 = 32;
 
+/// Largest by-reference composite argument selection copies itself
+/// (`stage_by_reference_argument_copies`). Its largest LDP/STP lane offset is
+/// 240 and its largest residual lane offset 255, both inside one base's
+/// encodable ranges (504 for an X pair, 255 unscaled), and the copy is at
+/// most 16 pairs.
+const BY_REFERENCE_INLINE_COPY_MAX_BYTES: u32 = 256;
+
 /// Decompose a non-negative constant byte offset into the single AArch64
 /// `ADD (immediate)` form that materializes it, if one exists.
 ///
@@ -181,6 +205,8 @@ pub enum ISelError {
         "LIR block id {block} is in the selector-synthesized id range (>= 2^31); refusing to select it (fail-closed id-space guard)"
     )]
     BlockIdInSyntheticRange { block: u32 },
+    #[error("AArch64 synthetic block identity namespace is exhausted")]
+    SyntheticBlockIdExhausted,
     #[error(
         "block {block} already contains instructions at first selection — a synthesized block (switch BST node / trap block) aliased a real LIR block id; refusing to merge control flow (fail-closed, A64-4/JIT-2 class)"
     )]
@@ -195,6 +221,17 @@ pub enum ISelError {
     UnsupportedOpcode(String),
     #[error("unsupported integer type for {op}: {ty:?}")]
     UnsupportedIntegerType { op: &'static str, ty: Type },
+    #[error(
+        "invalid AArch64 {operation} operands: {lhs:?}: {lhs_ty:?}, {rhs:?}: {rhs_ty:?} -> {result:?}; expected supported scalar integer operands"
+    )]
+    IntegerArithmeticOperands {
+        operation: &'static str,
+        lhs: Value,
+        lhs_ty: Type,
+        rhs: Value,
+        rhs_ty: Type,
+        result: Value,
+    },
     #[error(
         "unsupported AArch64 CmpXchg for {ty:?} with success {success:?} and failure {failure:?}: {reason}"
     )]
@@ -334,6 +371,14 @@ struct BitReverseIdiom {
     src: Value,
     result: Value,
     ty: Type,
+    /// In-block indices of the private-slot stores this idiom folds away
+    /// (empty for the register form). Selecting the root records a TV-3
+    /// fusion edge from each of them to the root's `RBIT`.
+    fused_stores: Vec<usize>,
+    /// The private stack slots whose every access this idiom folds away
+    /// (empty for the register form). No machine instruction addresses them
+    /// once the root is selected.
+    fused_slots: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +412,84 @@ struct VectorLaneIndex {
 struct VectorExtractResult {
     class: RegClass,
     ty: Type,
+}
+
+/// Function-wide facts about the values that address stack slots.
+///
+/// In the LIR a stack slot's memory is reachable only through the address a
+/// `StackAddr { slot }` instruction produces. These facts count, over every
+/// block of the function, each slot's address definitions and every
+/// occurrence of each address value as an operand (instruction arguments and
+/// a `Brif` condition), so a caller can prove that a set of in-block accesses
+/// is the COMPLETE set of accesses to a slot.
+#[derive(Debug, Default, Clone)]
+struct StackSlotAddressFacts {
+    /// Number of `StackAddr { slot }` instructions per slot.
+    addr_defs: HashMap<u32, usize>,
+    /// The slot each `StackAddr` result value addresses.
+    addr_values: HashMap<Value, u32>,
+    /// Occurrences of each address value as an operand, function-wide.
+    addr_value_uses: HashMap<Value, usize>,
+    /// Slots whose address has an unrecognized shape (a `StackAddr` with
+    /// arguments or without exactly one result) or whose address value is
+    /// defined more than once (another result or a block parameter). No
+    /// access set is ever complete for a poisoned slot.
+    poisoned: HashSet<u32>,
+}
+
+impl StackSlotAddressFacts {
+    fn scan<'a>(blocks: impl IntoIterator<Item = &'a crate::function::BasicBlock> + Clone) -> Self {
+        let mut facts = Self::default();
+        for block in blocks.clone() {
+            for inst in &block.instructions {
+                let Opcode::StackAddr { slot } = inst.opcode else {
+                    continue;
+                };
+                *facts.addr_defs.entry(slot).or_insert(0) += 1;
+                if !inst.args.is_empty() || inst.results.len() != 1 {
+                    facts.poisoned.insert(slot);
+                    continue;
+                }
+                if let Some(previous) = facts.addr_values.insert(inst.results[0], slot) {
+                    facts.poisoned.insert(previous);
+                    facts.poisoned.insert(slot);
+                }
+            }
+        }
+        if facts.addr_values.is_empty() {
+            return facts;
+        }
+        let mut addr_value_defs: HashMap<Value, usize> = HashMap::default();
+        for block in blocks {
+            for (param, _) in &block.params {
+                if facts.addr_values.contains_key(param) {
+                    *addr_value_defs.entry(*param).or_insert(0) += 1;
+                }
+            }
+            for inst in &block.instructions {
+                for result in &inst.results {
+                    if facts.addr_values.contains_key(result) {
+                        *addr_value_defs.entry(*result).or_insert(0) += 1;
+                    }
+                }
+                let brif_cond = match &inst.opcode {
+                    Opcode::Brif { cond, .. } => Some(cond),
+                    _ => None,
+                };
+                for operand in inst.args.iter().chain(brif_cond) {
+                    if facts.addr_values.contains_key(operand) {
+                        *facts.addr_value_uses.entry(*operand).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        for (value, slot) in &facts.addr_values {
+            if addr_value_defs.get(value).copied() != Some(1) {
+                facts.poisoned.insert(*slot);
+            }
+        }
+        facts
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -495,42 +618,6 @@ fn select_fold_disabled() -> bool {
     })
 }
 
-/// `TCG_NO_INLINE_MEMSET=1` disables the inline zero-register expansion of
-/// small constant-length `memset(p, 0, n)` (falls back to the libcall) — a
-/// runtime kill-switch and the A/B differential lever. Read once, then cached.
-fn inline_memset_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var_os("TCG_NO_INLINE_MEMSET").is_some_and(|v| v != "0" && !v.is_empty())
-    })
-}
-
-/// `TCG_NO_SMULL_DIV=1` disables the W32 widening-multiply magic-division path
-/// (SMULL/UMULL fold the 32->64 widen and run the tail at 32 bits, matching
-/// clang) — falls back to the SXTW/UXTW + 64-bit-multiply sequence. A runtime
-/// kill-switch and the A/B differential lever. Read once, then cached.
-fn smull_div_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var_os("TCG_NO_SMULL_DIV").is_some_and(|v| v != "0" && !v.is_empty())
-    })
-}
-
-/// `TCG_NO_LOGIC_IMM=1` disables folding a compile-time constant operand of a
-/// scalar `And`/`Orr`/`Eor` into the immediate (`AndRI`/`OrrRI`/`EorRI`) form —
-/// falls back to materializing the constant into a register and emitting the
-/// register-register form. A runtime kill-switch and the A/B differential
-/// lever. Read once, then cached.
-fn logic_imm_fold_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var_os("TCG_NO_LOGIC_IMM").is_some_and(|v| v != "0" && !v.is_empty())
-    })
-}
-
 /// Returns `true` iff `raw`, interpreted at the given register width, is a
 /// valid AArch64 bitmask (logical) immediate — i.e. the codegen encoder's
 /// `encode_logical_imm_fields` would accept it.
@@ -605,7 +692,7 @@ fn logical_immediate_encodable(raw: i64, width_is_32: bool) -> bool {
 pub enum ISelOperand {
     /// Virtual register.
     VReg(VReg),
-    /// Physical register (for ABI constraints, e.g. X0 for return).
+    /// Physical register (for ABI constraints, e.g. W0/X0 for return).
     PReg(PReg),
     /// Immediate integer.
     Imm(i64),
@@ -617,6 +704,8 @@ pub enum ISelOperand {
     CondCode(AArch64CC),
     /// Global symbol name (for ADRP/ADD relocations).
     Symbol(String),
+    /// Exact module function symbol; never interposable or spelling-aliased.
+    ExactModuleSymbol(String),
     /// Stack slot index (resolved during frame lowering).
     StackSlot(u32),
     /// Jump table data for switch lowering (legacy, pre-registration).
@@ -788,6 +877,21 @@ pub struct ISelInst {
     /// libcall; see `LirFunction::libm_pure_callees`). Converted to
     /// `InstFlags::LIBM_PURE_CALL` by `to_ir_func()`. Metadata only.
     pub libm_pure_call: bool,
+    /// Exact validated module-call binding. Converted to
+    /// `InstFlags::EXACT_MODULE_CALL` without changing instruction bytes.
+    pub exact_module_call: bool,
+    /// A call whose target cannot unwind whatever register holds it (the
+    /// Darwin TLV descriptor thunk). Converted to
+    /// `InstFlags::CANNOT_UNWIND_CALL` by `to_ir_func()`. Metadata only.
+    pub cannot_unwind_call: bool,
+    /// A `Bl` this selector makes to the C library routine its symbol names,
+    /// for a LIR `Memcpy`/`Memmove`/`Memset`: never a source call. Converted
+    /// to `InstFlags::LIBRARY_ROUTINE_CALL` by `to_ir_func()`. Metadata only.
+    pub library_routine_call: bool,
+    /// Classified ABI facts of a call instruction (stack-argument bytes and
+    /// stores, hidden result pointer, callee-saved set). Converted to the
+    /// `MachFunction::call_abi_facts` sidecar by `to_ir_func()`.
+    pub call_abi: Option<trust_cg_ir::CallAbiFacts>,
 }
 
 impl ISelInst {
@@ -800,7 +904,17 @@ impl ISelInst {
             is_call_arg_setup: false,
             fmuladd_may_unfuse: false,
             libm_pure_call: false,
+            exact_module_call: false,
+            cannot_unwind_call: false,
+            library_routine_call: false,
+            call_abi: None,
         }
+    }
+
+    /// Attach the call's classified ABI facts.
+    pub fn with_call_abi(mut self, facts: trust_cg_ir::CallAbiFacts) -> Self {
+        self.call_abi = Some(facts);
+        self
     }
 
     pub fn with_implicit_uses(mut self, uses: Vec<PReg>) -> Self {
@@ -831,6 +945,21 @@ impl ISelInst {
     /// `InstFlags::LIBM_PURE_CALL`, read solely by `loop-dead-pure-sink`.
     pub fn as_libm_pure_call(mut self) -> Self {
         self.libm_pure_call = true;
+        self
+    }
+
+    /// Require this direct call to bind to the validated in-module function.
+    pub fn as_exact_module_call(mut self) -> Self {
+        self.exact_module_call = true;
+        self
+    }
+
+    /// Mark a call whose target cannot unwind whatever register holds it.
+    /// Metadata only: becomes `InstFlags::CANNOT_UNWIND_CALL`, read by the
+    /// non-unwinding frame's call-site region rule and by pass validation's
+    /// semantic effect key (`flags_key`, OD-UNWIND-CALL-VALIDATION-20261010).
+    pub fn as_cannot_unwind_call(mut self) -> Self {
+        self.cannot_unwind_call = true;
         self
     }
 }
@@ -945,11 +1074,21 @@ pub struct ISelFunction {
     /// populates it only after a source-bound [`LatticeBoundsCapability`] exactly matches the
     /// current function and LIR base/index pair. The codegen replay gate consumes it read-only.
     lattice_guard_bindings: Vec<LatticeGuardCarrierBinding>,
+    aggregate_materializations: Vec<AggregateMaterializationPlan>,
     /// Exception-handling structure (Invoke/LandingPad), forwarded from the LIR
     /// `Function::eh_info`. `to_ir_func()` translates it into the resulting
     /// `MachFunction.eh_metadata` (still keyed by block; the codegen pipeline
     /// resolves byte offsets after layout). Empty for non-EH functions.
     pub eh_info: crate::function::EhFunctionInfo,
+    /// Sparse exact coordinates of calls emitted for actual Invoke opcodes.
+    /// Selection appends instructions; conversion transports these coordinates
+    /// into machine-arena IDs without selecting a call by adjacency or symbol.
+    pub eh_invoke_bindings: Vec<ISelEhInvokeBinding>,
+    /// EH type table forwarded from `Function::eh_type_table` into
+    /// `MachFunction.eh_metadata.eh_type_table` by `to_ir_func()`: entry
+    /// `k - 1` is the typeinfo symbol of catch type index `k`. Forwarding is
+    /// an O(1) clone (a list is shared, a splat is one symbol).
+    pub eh_type_table: crate::function::EhTypeTable,
     /// TV-1: the lowering provenance recorded for every instruction emitted
     /// through the `push_inst*` family (the emission chokepoints).
     ///
@@ -960,6 +1099,27 @@ pub struct ISelFunction {
     /// `push_inst*` can never inherit a stale source stamp. Mirrors the x86
     /// `X86ISelFunction::current_lowering_provenance` design.
     pub current_lowering_provenance: LoweringProvenance,
+    /// End of the function's incoming stack-argument area as classified by
+    /// `lower_formal_arguments` (0 when every parameter arrives in
+    /// registers). Copied to `MachFunction::incoming_stack_arg_bytes`.
+    pub incoming_stack_arg_bytes: Option<u32>,
+    /// TV-3 fusion edges: an effectful LIR instruction that an exact idiom
+    /// match folded away (emitting nothing of its own), mapped to the source
+    /// instruction whose stamped machine instruction represents it. Copied to
+    /// `MachFunction::source_fusion_targets` by `to_ir_func()`.
+    ///
+    /// Only the selector writes it, and only after the idiom's exact match
+    /// has proved the folded effect unobservable: today, the stores of a
+    /// private stack slot folded into a bit-reverse `RBIT` (see
+    /// `InstructionSelector::bitreverse_stack_slots_are_private`). Ordinary
+    /// per-instruction selection never adds an edge, so an accidentally
+    /// dropped store/call/atomic stays unwitnessed and TV-3 fails closed.
+    source_fusion_targets: BTreeMap<SourceInstId, SourceInstId>,
+    /// The function's own optional AArch64 features (its source's stated
+    /// target features), set by the owning pipeline. Copied to
+    /// `MachFunction::function_target_features` by `to_ir_func()`, where the
+    /// output-feature checks read it.
+    pub function_target_features: trust_cg_ir::TargetFeatureSet<trust_cg_ir::AArch64IsaFeature>,
 }
 
 /// Jump table data carried on an [`ISelFunction`]. Mirrors
@@ -979,16 +1139,28 @@ impl ISelFunction {
         Self {
             name,
             sig,
-            blocks: HashMap::new(),
+            blocks: HashMap::default(),
             block_order: Vec::new(),
             next_vreg: 0,
             stack_slots: Vec::new(),
             jump_tables: Vec::new(),
             guard_obligations: std::collections::HashMap::new(),
             lattice_guard_bindings: Vec::new(),
+            aggregate_materializations: Vec::new(),
             eh_info: crate::function::EhFunctionInfo::default(),
+            eh_invoke_bindings: Vec::new(),
+            eh_type_table: crate::function::EhTypeTable::new(),
             current_lowering_provenance: LoweringProvenance::UNATTRIBUTED,
+            incoming_stack_arg_bytes: None,
+            source_fusion_targets: BTreeMap::new(),
+            function_target_features: trust_cg_ir::TargetFeatureSet::EMPTY,
         }
+    }
+
+    /// The source instruction whose stamped machine instruction represents
+    /// the fused, emission-free `source`, if the selector recorded one.
+    pub fn source_fusion_target(&self, source: SourceInstId) -> Option<SourceInstId> {
+        self.source_fusion_targets.get(&source).copied()
     }
 
     /// Selector-issued exact carrier bindings for lattice replay.
@@ -1136,6 +1308,21 @@ impl ISelFunction {
     /// Successor edges are copied directly; predecessor edges are computed from
     /// successors after construction.
     pub fn to_ir_func(&self) -> trust_cg_ir::MachFunction {
+        self.to_ir_func_with_aggregate_materializations().0
+    }
+
+    pub fn aggregate_materializations(&self) -> &[AggregateMaterializationPlan] {
+        &self.aggregate_materializations
+    }
+
+    /// Preserve exact emission coordinates through THIS arena conversion.
+    /// The returned bindings establish no storage or native proof authority.
+    pub fn to_ir_func_with_aggregate_materializations(
+        &self,
+    ) -> (
+        trust_cg_ir::MachFunction,
+        Vec<MappedAggregateMaterialization>,
+    ) {
         use trust_cg_ir::function::{JumpTableData, MachBlock as IrBlock, MachFunction as IrFunc};
         use trust_cg_ir::inst::MachInst as IrInst;
         use trust_cg_ir::types::BlockId;
@@ -1143,6 +1330,28 @@ impl ISelFunction {
         let ir_sig: trust_cg_ir::function::Signature = (&self.sig).into();
         let mut ir_func = IrFunc::new(self.name.clone(), ir_sig);
         ir_func.next_vreg = self.next_vreg;
+        ir_func.incoming_stack_arg_bytes = self.incoming_stack_arg_bytes;
+        ir_func.function_target_features = self.function_target_features;
+        let mut selected_calls: HashMap<(Block, usize), Option<trust_cg_ir::InstId>> = self
+            .eh_invoke_bindings
+            .iter()
+            .map(|binding| ((binding.call_block, binding.call_index), None))
+            .collect();
+        for plan in &self.aggregate_materializations {
+            for index in [
+                plan.call_instruction(),
+                plan.address_instruction(),
+                plan.store_instructions()[0],
+                plan.store_instructions()[1],
+            ] {
+                selected_calls.entry((plan.block(), index)).or_insert(None);
+            }
+            for field in plan.fields() {
+                for index in [field.address_instruction(), field.load_instruction()] {
+                    selected_calls.entry((plan.block(), index)).or_insert(None);
+                }
+            }
+        }
 
         // Clear the default entry block that MachFunction::new creates.
         ir_func.blocks.clear();
@@ -1213,8 +1422,26 @@ impl ISelFunction {
                         debug_assert_eq!(isel_inst.opcode, AArch64Opcode::Bl);
                         ir_inst.flags.insert(trust_cg_ir::InstFlags::LIBM_PURE_CALL);
                     }
-                    ir_inst.implicit_uses = leak_pregs(&isel_inst.implicit_uses);
-                    ir_inst.implicit_defs = leak_pregs(&isel_inst.implicit_defs);
+                    if isel_inst.exact_module_call {
+                        debug_assert_eq!(isel_inst.opcode, AArch64Opcode::Bl);
+                        ir_inst
+                            .flags
+                            .insert(trust_cg_ir::InstFlags::EXACT_MODULE_CALL);
+                    }
+                    if isel_inst.cannot_unwind_call {
+                        debug_assert_eq!(isel_inst.opcode, AArch64Opcode::Blr);
+                        ir_inst
+                            .flags
+                            .insert(trust_cg_ir::InstFlags::CANNOT_UNWIND_CALL);
+                    }
+                    if isel_inst.library_routine_call {
+                        debug_assert_eq!(isel_inst.opcode, AArch64Opcode::Bl);
+                        ir_inst
+                            .flags
+                            .insert(trust_cg_ir::InstFlags::LIBRARY_ROUTINE_CALL);
+                    }
+                    ir_inst.implicit_uses = intern_pregs(&isel_inst.implicit_uses);
+                    ir_inst.implicit_defs = intern_pregs(&isel_inst.implicit_defs);
                     // Propagate source location from ISel to MachInst for DWARF.
                     if let Some(loc) = isel_block.source_locs.get(idx).copied().flatten() {
                         ir_inst.source_loc = Some(loc);
@@ -1226,6 +1453,13 @@ impl ISelFunction {
                         ir_inst.proof = Some(proof);
                     }
                     let inst_id = ir_func.push_inst(ir_inst);
+                    if let Some(selected) = selected_calls.get_mut(&(block_ref, idx)) {
+                        *selected = Some(inst_id);
+                    }
+                    if let Some(facts) = &isel_inst.call_abi {
+                        debug_assert!(ir_func.insts[inst_id.0 as usize].is_call());
+                        ir_func.call_abi_facts.insert(inst_id, facts.clone());
+                    }
                     // TV-1: carry the lowering provenance through the
                     // ISel->MachFunction adapter (same as source_loc).
                     // Missing entries (manually-built test blocks) are
@@ -1264,13 +1498,17 @@ impl ISelFunction {
             ir_func.blocks[i].preds = preds;
         }
 
+        // TV-3 fusion edges are keyed by source coordinates, not by machine
+        // instruction ids, so they carry over unchanged.
+        ir_func.source_fusion_targets = self.source_fusion_targets.clone();
+
         // Propagate stack slot metadata from the ISel function to the IR function.
         for slot_info in &self.stack_slots {
             ir_func.alloc_stack_slot(slot_info.to_ir_stack_slot());
         }
 
-        // Propagate exception-handling structure into `MachFunction.eh_metadata`
-        // as BlockId-keyed entries. The byte offsets (`offset`, `start_offset`,
+        // Propagate exception-handling structure and exact selected-call IDs
+        // into `MachFunction.eh_metadata`. The byte offsets (`offset`, `start_offset`,
         // `length`) are filled by the codegen pipeline AFTER block layout
         // (`resolve_eh_offsets`), at which point the throwing
         // `Bl`'s byte position and the landing-pad block's offset are known.
@@ -1278,6 +1516,7 @@ impl ISelFunction {
         if !self.eh_info.is_empty() {
             use trust_cg_ir::function::{EhCallSiteEntry, LandingPadEntry};
             ir_func.eh_metadata.personality = self.eh_info.personality.clone();
+            ir_func.eh_metadata.eh_type_table = self.eh_type_table.clone();
             for lp in &self.eh_info.landing_pads {
                 ir_func.eh_metadata.add_landing_pad(LandingPadEntry {
                     block: BlockId(lp.block.0),
@@ -1295,16 +1534,85 @@ impl ISelFunction {
                 });
             }
         }
-
-        ir_func
+        ir_func.eh_metadata.call_site_bindings = self.machine_eh_call_bindings(&selected_calls);
+        let aggregate = self
+            .aggregate_materializations
+            .iter()
+            .map(|plan| {
+                let ids = [
+                    plan.call_instruction(),
+                    plan.address_instruction(),
+                    plan.store_instructions()[0],
+                    plan.store_instructions()[1],
+                ]
+                .map(|index| {
+                    selected_calls
+                        .get(&(plan.block(), index))
+                        .copied()
+                        .flatten()
+                        .unwrap_or(trust_cg_ir::InstId(u32::MAX))
+                });
+                let fields = plan
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        [field.address_instruction(), field.load_instruction()].map(|index| {
+                            selected_calls
+                                .get(&(plan.block(), index))
+                                .copied()
+                                .flatten()
+                                .unwrap_or(trust_cg_ir::InstId(u32::MAX))
+                        })
+                    })
+                    .collect();
+                MappedAggregateMaterialization::converted(plan.clone(), ids, fields)
+            })
+            .collect();
+        (ir_func, aggregate)
     }
-}
 
-fn leak_pregs(pregs: &[PReg]) -> &'static [PReg] {
-    if pregs.is_empty() {
-        &[]
-    } else {
-        Box::leak(pregs.to_vec().into_boxed_slice())
+    /// [`Self::to_ir_func`] behind the L10-P5 identity admission: the
+    /// instruction-selection exit refuses, by name, a function in which some
+    /// register, block, stack-slot or jump-table ID is not below the counter
+    /// that issues that domain's next fresh ID (a stale `next_vreg`, a
+    /// successor naming a block that was never laid out, an exhausted
+    /// counter), so no later allocation can alias it.
+    pub fn try_to_ir_func_with_aggregate_materializations(
+        &self,
+    ) -> Result<
+        (
+            trust_cg_ir::MachFunction,
+            Vec<MappedAggregateMaterialization>,
+        ),
+        trust_cg_ir::MachIdRefusal,
+    > {
+        let (mut function, bindings) = self.to_ir_func_with_aggregate_materializations();
+        function.admit_id_counters_at(|| {
+            "instruction-selection aggregate transport exit".to_string()
+        })?;
+        Ok((function, bindings))
+    }
+
+    pub fn try_to_ir_func(&self) -> Result<trust_cg_ir::MachFunction, trust_cg_ir::MachIdRefusal> {
+        let mut ir_func = self.to_ir_func();
+        ir_func.admit_id_counters_at(|| "instruction-selection exit".to_string())?;
+        Ok(ir_func)
+    }
+
+    /// Issue one fresh virtual-register ID from `next_vreg`, the counter
+    /// every selector allocation goes through. Exhaustion never wraps: it
+    /// returns the sentinel `u32::MAX` (the counter stays there), which the
+    /// identity admission at the selection exit refuses
+    /// (`[TCG-MIR-ID-EXHAUSTED]`) instead of letting the counter restart at 0.
+    pub fn alloc_vreg_id(&mut self) -> u32 {
+        match self.next_vreg.checked_add(1) {
+            Some(next) => {
+                let id = self.next_vreg;
+                self.next_vreg = next;
+                id
+            }
+            None => u32::MAX,
+        }
     }
 }
 
@@ -1335,11 +1643,64 @@ fn call_implicit_uses(arg_locs: &[ArgLocation], arg_types: &[Type]) -> Vec<PReg>
                     append_unique_preg(&mut uses, PReg::new(ptr_reg.encoding() + 1));
                 }
             }
-            ArgLocation::Stack { .. } => {}
+            ArgLocation::Ignore | ArgLocation::Stack { .. } => {}
         }
     }
 
     uses
+}
+
+/// Whether the AArch64 classification passes this argument by reference: a
+/// composite over 16 bytes that is not an HFA/HVA (AAPCS64 §6.8.2 B.4, kept
+/// by DarwinPCS). `classify_params_with` puts the pointer in a GPR
+/// (`Indirect`) or, once X0-X7 are used, in an 8-byte stack slot; this is
+/// the same test `select_aggregate_arg`'s `Stack` arm uses to store a
+/// pointer instead of the bytes.
+fn aarch64_arg_passed_by_reference(ty: &Type, loc: &ArgLocation) -> bool {
+    if !ty.is_aggregate() {
+        return false;
+    }
+    match loc {
+        ArgLocation::Indirect { .. } => true,
+        ArgLocation::Stack { .. } => AppleAArch64ABI::passes_composite_by_reference(ty),
+        ArgLocation::Ignore
+        | ArgLocation::Reg(_)
+        | ArgLocation::RegPair(_, _)
+        | ArgLocation::RegSequence(_) => false,
+    }
+}
+
+/// ABI facts of a runtime helper call whose arguments the selector placed
+/// in registers only (the i128 division and conversion libcalls).
+fn register_only_call_abi(name: &str) -> trust_cg_ir::CallAbiFacts {
+    trust_cg_ir::CallAbiFacts {
+        callee: Some(name.to_string()),
+        stack_arg_bytes: 0,
+        stack_stores: Vec::new(),
+        aggregate_stack_args: false,
+        hidden_result_pointer: false,
+        by_reference_argument_copies: false,
+        variadic: false,
+        callee_saved: trust_cg_ir::CalleeSavedSet::Aapcs64,
+    }
+}
+
+/// End of the highest stack byte a classified parameter list occupies (0
+/// when every parameter is in registers).
+fn stack_argument_extent(locations: &[ArgLocation]) -> Result<u32, ISelError> {
+    let extent = locations
+        .iter()
+        .filter_map(|location| match location {
+            ArgLocation::Stack { offset, size } => Some(offset + i64::from(*size)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    u32::try_from(extent).map_err(|_| {
+        ISelError::UnsupportedOpcode(format!(
+            "incoming stack-argument area of {extent} bytes is not representable"
+        ))
+    })
 }
 
 fn call_implicit_defs() -> Vec<PReg> {
@@ -1359,7 +1720,7 @@ fn abi_location_pregs(loc: &ArgLocation, _ty: &Type) -> Vec<PReg> {
         ArgLocation::RegPair(lo_preg, hi_preg) => vec![*lo_preg, *hi_preg],
         ArgLocation::RegSequence(regs) => regs.clone(),
         ArgLocation::Indirect { ptr_reg } => vec![*ptr_reg],
-        ArgLocation::Stack { .. } => Vec::new(),
+        ArgLocation::Ignore | ArgLocation::Stack { .. } => Vec::new(),
     }
 }
 
@@ -1374,7 +1735,9 @@ fn aarch64_returns_via_sret(returns: &[Type]) -> bool {
     let locs = AppleAArch64ABI::classify_returns(returns);
     returns.iter().enumerate().any(|(i, ty)| {
         matches!(locs.get(i), Some(ArgLocation::Indirect { .. }))
-            || (ty.is_aggregate() && AppleAArch64ABI::classify_hfa(ty).is_none() && ty.bytes() > 16)
+            || (ty.is_aggregate()
+                && AppleAArch64ABI::classify_homogeneous_aggregate(ty).is_none()
+                && ty.bytes() > 16)
     })
 }
 
@@ -1427,6 +1790,7 @@ pub fn convert_isel_operand_to_ir(op: &ISelOperand) -> trust_cg_ir::MachOperand 
             IrOp::Imm(encoding)
         }
         ISelOperand::Symbol(name) => IrOp::Symbol(name.clone()),
+        ISelOperand::ExactModuleSymbol(name) => IrOp::ExactModuleSymbol(name.clone()),
         ISelOperand::StackSlot(idx) => IrOp::StackSlot(trust_cg_ir::types::StackSlotId(*idx)),
         ISelOperand::JumpTable { .. } => {
             // Legacy path: when `JumpTable` reaches this standalone
@@ -1469,6 +1833,31 @@ pub fn convert_isel_operand_to_ir(op: &ISelOperand) -> trust_cg_ir::MachOperand 
 /// small contiguous ids.
 pub(crate) const SYNTHETIC_BLOCK_ID_BASE: u32 = 1 << 31;
 
+/// Advance a synthetic cursor only when a free identity is available.
+/// `u32::MAX` is the exhausted-cursor sentinel, not an allocatable identity.
+pub(crate) fn allocate_synthetic_block_id(
+    next: &mut u32,
+    is_reserved: impl Fn(Block) -> bool,
+) -> Result<Block, ISelError> {
+    let mut candidate = *next;
+    loop {
+        let successor = candidate
+            .checked_add(1)
+            .ok_or(ISelError::SyntheticBlockIdExhausted)?;
+        if !is_reserved(Block(candidate)) {
+            *next = successor;
+            return Ok(Block(candidate));
+        }
+        candidate = successor;
+    }
+}
+
+struct PendingAggregateCall {
+    intent: AggregateCallIntent,
+    binding: DirectCallBinding,
+    call_instruction: Option<usize>,
+}
+
 /// AArch64 instruction selector.
 ///
 /// Walks trust_ir blocks in order, selects each instruction into one or more
@@ -1477,7 +1866,7 @@ pub(crate) const SYNTHETIC_BLOCK_ID_BASE: u32 = 1 << 31;
 pub struct InstructionSelector {
     func: ISelFunction,
     /// trust_ir Value -> machine operand mapping.
-    value_map: HashMap<Value, ISelOperand>,
+    value_map: std::collections::HashMap<Value, ISelOperand>,
     /// Type of each value, tracked for selecting correct instruction width.
     value_types: HashMap<Value, Type>,
     /// High-half register for i128 values.
@@ -1536,6 +1925,20 @@ pub struct InstructionSelector {
     /// in the block. The same 3-source instruction family also covers
     /// `acc - coeff * scale` as `MSUB` and `0 - coeff * scale` as `MNEG`.
     mul_add_analysis: MulAddAnalysis,
+    /// Per-block `Urem`/`Srem` results whose only use (whole-function count)
+    /// is a later `Trunc` to `I32` in the same block, mapped to that
+    /// truncation's result. When the remainder takes the constant-divisor
+    /// path at 64 bits, [`Self::finish_const_div_rem`] writes its last
+    /// instruction (`MSUB`, or the shifted add/sub of a `2^k +- 1` divisor) as
+    /// the W form straight into the truncation's result, as clang does: the
+    /// low 32 bits of a 64-bit `x - q*c` are the 32-bit `x - q*c` of the low
+    /// halves (reduction modulo `2^32` is a ring homomorphism). The 64-bit
+    /// remainder is then never bound, and the truncation emits nothing
+    /// ([`Self::prenarrowed_truncs`]).
+    rem_trunc_i32_folds: HashMap<Value, Value>,
+    /// `Trunc` results already defined by a narrowed remainder tail; their
+    /// `select_trunc` emits nothing.
+    prenarrowed_truncs: HashSet<Value>,
     /// Per-block bitreverse expansion analysis.
     ///
     /// The LLVM importer currently lowers `llvm.bitreverse.i32/i64` to a
@@ -1566,6 +1969,47 @@ pub struct InstructionSelector {
     /// `InstFlags::LIBM_PURE_CALL` (metadata; read only by the gated
     /// `loop-dead-pure-sink` machine pass).
     libm_pure_callees: HashSet<String>,
+    /// This function's own hidden return-buffer (`sret`) parameter index, from
+    /// `Function::abi_sret_param`.
+    ///
+    /// AAPCS64 §6.9 passes the indirect-result pointer in **X8**, which is not
+    /// an argument register at all. So a signature that carries the buffer
+    /// address as an ordinary leading pointer parameter would, classified
+    /// naively, read it from X0 and shift every real argument one register
+    /// along — a silent ABI divergence from every independently-compiled
+    /// caller. When this is set, `lower_formal_arguments` places that parameter
+    /// at X8 and classifies the REMAINING parameters as if it were absent.
+    sret_param_index: Option<u32>,
+    /// Direct-call callee symbols whose ARGUMENT 0 is a hidden return-buffer
+    /// (`sret`) pointer, from `Function::sret_arg_callees`.
+    ///
+    /// The caller half of `sret_param_index`: the buffer address is staged into
+    /// X8 rather than X0, and the remaining arguments are classified as if it
+    /// were absent. Under-seeding is NOT safe here (it would emit the wrong
+    /// convention), which is why the adapter fails closed rather than omit an
+    /// entry it cannot key. Read only through
+    /// [`Self::direct_callee_passes_sret`], which refuses an entry naming a
+    /// routine this backend also calls on its own.
+    sret_arg_callees: HashSet<String>,
+    /// Indirect-call callee VALUES whose ARGUMENT 0 is a hidden return-buffer
+    /// (`sret`) pointer, from `Function::sret_arg_indirect_callees`: the
+    /// `CallIndirect` half of `sret_arg_callees`, keyed by the callee's SSA
+    /// value because a `BLR` target has no symbol. Same convention: the
+    /// buffer address is staged into X8 and the remaining arguments are
+    /// classified as if it were absent.
+    sret_arg_indirect_callees: HashSet<Value>,
+    /// Admit catalog-bound native calls retained by a policy-qualified Core
+    /// compilation plan.
+    ///
+    /// The public LIR carrier is not authority by itself, so ordinary selector
+    /// construction leaves this false.  The closed Core compiler enables it
+    /// only after authenticating the retained LIR against the sealed native
+    /// catalog, and later correlates the resulting `Bl` one-to-one with the
+    /// exact source occurrence and encoder fixup site.
+    sealed_core_native_calls: bool,
+    aggregate_call_intents: AggregateCallIntents,
+    pending_aggregate_call: Option<PendingAggregateCall>,
+    aggregate_field_addresses: HashMap<(Block, usize), usize>,
     /// Constant origins for cross-block rematerialization.
     ///
     /// Populated by `seed_iconst_origins` from a whole-function pre-scan.
@@ -1578,6 +2022,14 @@ pub struct InstructionSelector {
     /// must still satisfy SSA dominance and continue to error via
     /// `ISelError::UndefinedValue`.
     iconst_origins: HashMap<Value, (Type, i64)>,
+    /// Wide `Opcode::Iconst128` results, as their raw `(lo, hi)` 64-bit halves.
+    ///
+    /// Populated by `seed_iconst_origins` from the same whole-function
+    /// pre-scan. Kept apart from `iconst_origins` because that map's single
+    /// sign-extended `i64` cannot express these values, and `use_value` never
+    /// rematerializes from it: it is read only as constant knowledge (the
+    /// divisor-guard elision), never as a value definition.
+    iconst128_origins: HashMap<Value, (i64, i64)>,
     /// `<4 x i32>` packed values that are a *uniform* constant in `[0, 31]`,
     /// mapped to that constant.
     ///
@@ -1608,6 +2060,14 @@ pub struct InstructionSelector {
     /// fall back to block-local counts — exact for single-block functions.
     /// Multi-block production drivers (pipeline `run_isel`) must seed this.
     value_use_counts: Option<HashMap<Value, usize>>,
+    /// Whole-function stack-slot address facts, seeded alongside
+    /// [`Self::value_use_counts`] by [`Self::seed_function_value_use_counts`].
+    ///
+    /// An idiom that elides the stores of a stack slot needs an exact,
+    /// function-wide account of every instruction that can reach that slot's
+    /// memory. When `None`, no slot is provably private and such idioms keep
+    /// their loads and stores.
+    stack_slot_address_facts: Option<StackSlotAddressFacts>,
     /// Source-bound decidable-lattice capabilities supplied by the adapter.
     ///
     /// These are consulted only while selecting `GuardBoundsCheck`. A raw lattice-range
@@ -1646,19 +2106,33 @@ pub struct InstructionSelector {
     sret_return_ptr: Option<ISelOperand>,
     /// Which AArch64 C calling convention to classify arguments with.
     ///
-    /// Defaults to Darwin for backwards compatibility with every existing
-    /// caller; the production pipeline overrides it from the target triple.
-    /// The CALLER side (`select_call*`) and the CALLEE side
-    /// (`lower_formal_arguments`) both read this field, so they cannot drift
-    /// apart within a function. See [`AArch64AbiVariant`].
-    abi_variant: AArch64AbiVariant,
+    /// `None` until [`Self::set_abi_variant`] names the target convention;
+    /// the production pipeline sets it from the target triple. Every
+    /// classification that needs it refuses with `[TCG-TARGET-ABI]` while it
+    /// is unset instead of assuming DarwinPCS. The CALLER side
+    /// (`select_call*`) and the CALLEE side (`lower_formal_arguments`) both
+    /// read this field, so they cannot drift apart within a function. See
+    /// [`AArch64AbiVariant`].
+    abi_variant: Option<AArch64AbiVariant>,
     /// Whether the resolved target profile authorizes ARMv8.1-A LSE atomics.
     ///
-    /// Generic AArch64 deliberately defaults to `false`. `AtomicRmw` and
-    /// `CmpXchg` currently lower through LSE instructions; until a proven LL/SC
-    /// retry-loop lowering exists they must fail closed unless the owning
-    /// codegen pipeline explicitly admits LSE for its target or JIT host.
+    /// Generic AArch64 deliberately defaults to `false`. With LSE admitted,
+    /// `AtomicRmw` and `CmpXchg` lower to single LSE instructions; without it
+    /// they select the opaque `LlscRmw*` / `LlscCmpSwap*` pseudos that the
+    /// codegen pipeline expands into LDXR/STXR retry loops after register
+    /// allocation. LSE opcodes are never emitted unless the owning pipeline
+    /// explicitly admits LSE for its target or JIT host.
     lse_enabled: bool,
+    /// Whether the resolved target profile authorizes the FEAT_LSE2 ATOMICITY
+    /// RULES — i.e. whether an ALIGNED `LDP` may be relied on as SINGLE-COPY
+    /// ATOMIC.
+    ///
+    /// Distinct from [`Self::lse_enabled`], which is the ARMv8.1-A RMW
+    /// instruction set; a target may have one without the other. Generic
+    /// AArch64 defaults to `false` and fails closed, exactly as LSE does: a
+    /// 128-bit `LDP` on a pre-LSE2 part can TEAR, and a torn read is invisible
+    /// to every differential test (it only manifests under concurrency).
+    lse2_enabled: bool,
     /// Whether the resolved target profile authorizes FEAT_FP16 scalar forms.
     ///
     /// AArch64's base FP extension includes half-precision loads/stores and
@@ -1666,6 +2140,14 @@ pub struct InstructionSelector {
     /// conversions, or `FMOV` forms. Those instructions must fail closed on a
     /// generic target unless the owning pipeline explicitly admits FEAT_FP16.
     fp16_enabled: bool,
+    /// Whether this function's admission includes FEAT_CRC32.
+    ///
+    /// With it, `Opcode::Crc32` (the `llvm.aarch64.crc32*` intrinsics) selects
+    /// one `CRC32*`/`CRC32C*` instruction; without it, the same function is
+    /// expanded from baseline shifts, masks and XORs (bit-serial, reflected).
+    /// Default `false`: no CRC32 word is emitted unless the owning pipeline
+    /// admits the feature for this function.
+    crc_enabled: bool,
     /// Per-block flags-consuming compare fold plan (icmp -> C/FCSEL). Computed
     /// by [`Self::detect_select_cond_folds`] at the start of each block, keyed
     /// on the block-local instruction index, consulted by `select_csel` and by
@@ -1711,9 +2193,9 @@ impl InstructionSelector {
     pub fn new(name: String, sig: Signature) -> Self {
         Self {
             func: ISelFunction::new(name, sig),
-            value_map: HashMap::new(),
-            value_types: HashMap::new(),
-            i128_high_map: HashMap::new(),
+            value_map: std::collections::HashMap::new(),
+            value_types: HashMap::default(),
+            i128_high_map: HashMap::default(),
             next_block_id: SYNTHETIC_BLOCK_ID_BASE,
             current_source_loc: None,
             current_trust_ir_origin: None,
@@ -1721,20 +2203,33 @@ impl InstructionSelector {
             smulh_analysis: SmulhAnalysis::default(),
             current_inst_idx: 0,
             mul_add_analysis: MulAddAnalysis::default(),
+            rem_trunc_i32_folds: HashMap::default(),
+            prenarrowed_truncs: HashSet::default(),
             bitreverse_analysis: BitReverseAnalysis::default(),
             pending_v_flag: std::collections::HashSet::new(),
-            pure_callees: HashSet::new(),
-            libm_pure_callees: HashSet::new(),
-            iconst_origins: HashMap::new(),
-            uniform_v4i32_shift_imm_values: HashMap::new(),
+            pure_callees: HashSet::default(),
+            libm_pure_callees: HashSet::default(),
+            sret_param_index: None,
+            sret_arg_callees: HashSet::default(),
+            sret_arg_indirect_callees: HashSet::default(),
+            sealed_core_native_calls: false,
+            aggregate_call_intents: AggregateCallIntents::default(),
+            pending_aggregate_call: None,
+            aggregate_field_addresses: HashMap::default(),
+            iconst_origins: HashMap::default(),
+            iconst128_origins: HashMap::default(),
+            uniform_v4i32_shift_imm_values: HashMap::default(),
             value_use_counts: None,
+            stack_slot_address_facts: None,
             lattice_bounds_capabilities: Vec::new(),
             current_block: None,
             formal_args_block: None,
             sret_return_ptr: None,
-            abi_variant: AArch64AbiVariant::default(),
+            abi_variant: None,
             lse_enabled: false,
+            lse2_enabled: false,
             fp16_enabled: false,
+            crc_enabled: false,
             select_cond_fold_analysis: SelectCondFoldAnalysis::default(),
         }
     }
@@ -1745,7 +2240,31 @@ impl InstructionSelector {
     /// selected: it decides where stack arguments live, and the caller and
     /// callee sides must agree. See [`AArch64AbiVariant`].
     pub fn set_abi_variant(&mut self, variant: AArch64AbiVariant) {
-        self.abi_variant = variant;
+        self.abi_variant = Some(variant);
+    }
+
+    /// Unit-test constructor with DarwinPCS selected, the convention the
+    /// historical selector tests were written against. Production code uses
+    /// [`Self::new`] followed by [`Self::set_abi_variant`].
+    #[cfg(test)]
+    pub(crate) fn new_darwin_test(name: String, signature: Signature) -> Self {
+        let mut selector = Self::new(name, signature);
+        selector.set_abi_variant(AArch64AbiVariant::Darwin);
+        selector
+    }
+
+    /// The selected AArch64 calling convention, or a typed refusal when no
+    /// caller selected one.
+    fn abi_variant(&self) -> Result<AArch64AbiVariant, ISelError> {
+        self.abi_variant.ok_or_else(|| {
+            ISelError::UnsupportedOpcode(
+                "[TCG-TARGET-ABI] no AArch64 calling convention was selected for this \
+                 instruction selector; argument placement differs between DarwinPCS and \
+                 AAPCS64, so it is refused rather than defaulted (call set_abi_variant with the \
+                 variant resolved from the target triple)"
+                    .to_string(),
+            )
+        })
     }
 
     /// Admit ARMv8.1-A LSE instructions for this selection run.
@@ -1756,12 +2275,54 @@ impl InstructionSelector {
         self.lse_enabled = enabled;
     }
 
+    /// Admit the FEAT_LSE2 atomicity rules for this function's selection.
+    ///
+    /// Set from the resolved target profile by the owning pipeline, never
+    /// inferred here. Default `false` fails closed.
+    pub fn set_lse2_enabled(&mut self, enabled: bool) {
+        self.lse2_enabled = enabled;
+    }
+
     /// Admit FEAT_FP16 scalar instructions for this selection run.
     ///
     /// This is a target capability, not an optimization preference. Callers
     /// must bind the resolved value into any reusable artifact identity.
     pub fn set_fp16_enabled(&mut self, enabled: bool) {
         self.fp16_enabled = enabled;
+    }
+
+    /// Admit FEAT_CRC32 instructions for this selection run.
+    ///
+    /// A function admission, not an optimization preference: callers set it
+    /// from the profile plus the function's own target features and must
+    /// bind it into any reusable artifact identity.
+    pub fn set_crc_enabled(&mut self, enabled: bool) {
+        self.crc_enabled = enabled;
+    }
+
+    /// Record the function's own optional features on the selected function
+    /// (read by the output-feature checks after selection).
+    pub fn set_function_target_features(
+        &mut self,
+        features: trust_cg_ir::TargetFeatureSet<trust_cg_ir::AArch64IsaFeature>,
+    ) {
+        self.func.function_target_features = features;
+    }
+
+    /// Admit already-sealed [`DirectCallBinding::NativeDependency`] calls.
+    ///
+    /// This switch only keeps the typed carrier alive through instruction
+    /// selection; it grants no catalog or address authority.  Callers must
+    /// independently authenticate and correlate every resulting machine
+    /// fixup.  Compatibility pipelines intentionally never enable it.
+    pub fn enable_sealed_core_native_calls(&mut self) {
+        self.sealed_core_native_calls = true;
+    }
+
+    pub fn seed_aggregate_call_intents(&mut self, intents: &AggregateCallIntents) {
+        if !intents.truncated() && intents.caller_name() == self.func.name {
+            self.aggregate_call_intents = intents.clone();
+        }
     }
 
     /// Seed whole-function value use counts from a complete LIR function.
@@ -1771,8 +2332,12 @@ impl InstructionSelector {
     /// of a value that escapes to another block (edge-copy branch args),
     /// which later fails `use_value` with `UndefinedValue`. Call before
     /// `select_block*` on any multi-block function.
+    ///
+    /// Also seeds [`Self::stack_slot_address_facts`], the function-wide
+    /// account of every stack-slot address that store-eliding idioms consult.
     pub fn seed_function_value_use_counts(&mut self, func: &crate::function::Function) {
         self.value_use_counts = Some(Self::function_value_use_counts(func.blocks.values()));
+        self.stack_slot_address_facts = Some(StackSlotAddressFacts::scan(func.blocks.values()));
     }
 
     /// Seed exact source-bound lattice capabilities produced by the adapter.
@@ -1786,7 +2351,7 @@ impl InstructionSelector {
     pub fn function_value_use_counts<'a>(
         blocks: impl IntoIterator<Item = &'a crate::function::BasicBlock>,
     ) -> HashMap<Value, usize> {
-        let mut counts = HashMap::new();
+        let mut counts = HashMap::default();
         for block in blocks {
             for inst in &block.instructions {
                 for arg in &inst.args {
@@ -1826,7 +2391,10 @@ impl InstructionSelector {
     /// Call this before `select_block*` so that `value_type()` lookups
     /// during selection return the correct type instead of the I64
     /// fallback.
-    pub fn seed_value_types(&mut self, types: &HashMap<Value, Type>) {
+    pub fn seed_value_types<S: std::hash::BuildHasher>(
+        &mut self,
+        types: &std::collections::HashMap<Value, Type, S>,
+    ) {
         for (val, ty) in types {
             self.value_types.insert(*val, ty.clone());
         }
@@ -1839,7 +2407,10 @@ impl InstructionSelector {
     /// When `select_call` emits `Bl` with a symbol in this set, the `Bl`
     /// carries `Some(ProofAnnotation::Pure)` through to the canonical
     /// `MachInst.proof` so SROA can apply partial-escape (#456).
-    pub fn seed_pure_callees(&mut self, names: &HashSet<String>) {
+    pub fn seed_pure_callees<S: std::hash::BuildHasher>(
+        &mut self,
+        names: &std::collections::HashSet<String, S>,
+    ) {
         for name in names {
             self.pure_callees.insert(name.clone());
         }
@@ -1851,10 +2422,171 @@ impl InstructionSelector {
     /// Under-seeding is safe (the flag simply never appears and the consuming
     /// pass never fires); over-seeding would be unsound, so this is only ever
     /// populated from the importer's licensed set.
-    pub fn seed_libm_pure_callees(&mut self, names: &HashSet<String>) {
+    pub fn seed_libm_pure_callees<S: std::hash::BuildHasher>(
+        &mut self,
+        names: &std::collections::HashSet<String, S>,
+    ) {
         for name in names {
             self.libm_pure_callees.insert(name.clone());
         }
+    }
+
+    /// Seed this function's own hidden return-buffer (`sret`) parameter, from
+    /// `Function::abi_sret_param`.
+    ///
+    /// Only a LEADING hidden parameter is lowered. Any other index is refused
+    /// rather than guessed at: AAPCS64 names exactly one indirect-result
+    /// register, and placing the pointer anywhere else would be an invention.
+    pub fn seed_sret_param(
+        &mut self,
+        param: Option<crate::function::AbiSretParam>,
+    ) -> Result<(), ISelError> {
+        match param {
+            None => {
+                self.sret_param_index = None;
+                Ok(())
+            }
+            Some(p) if p.param_index == 0 => {
+                self.sret_param_index = Some(0);
+                Ok(())
+            }
+            Some(p) => Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] hidden return-buffer parameter at index {} is not lowered: \
+                 AAPCS64 passes the indirect-result pointer in X8 and this selector places \
+                 only a LEADING hidden parameter there. Failing closed rather than choosing \
+                 a register for it.",
+                p.param_index
+            ))),
+        }
+    }
+
+    /// Seed the direct-call callee symbols whose argument 0 is a hidden
+    /// return-buffer (`sret`) pointer, from `Function::sret_arg_callees`.
+    pub fn seed_sret_arg_callees<S: std::hash::BuildHasher>(
+        &mut self,
+        names: &std::collections::HashSet<String, S>,
+    ) {
+        for name in names {
+            self.sret_arg_callees.insert(name.clone());
+        }
+    }
+
+    /// Seed the indirect-call callee values whose argument 0 is a hidden
+    /// return-buffer (`sret`) pointer, from
+    /// `Function::sret_arg_indirect_callees`.
+    pub fn seed_sret_arg_indirect_callees<S: std::hash::BuildHasher>(
+        &mut self,
+        callees: &std::collections::HashSet<Value, S>,
+    ) {
+        for callee in callees {
+            self.sret_arg_indirect_callees.insert(*callee);
+        }
+    }
+
+    /// Whether a DIRECT call of `callee_name` passes argument 0 as a hidden
+    /// return-buffer pointer (`sret_arg_callees`): the one reading of that
+    /// set, shared by every direct caller lowering (ordinary, variadic, the
+    /// invoke's call, and the bulk-memory routine call this selector makes).
+    ///
+    /// The set is keyed by symbol NAME, which is exact only for symbols no
+    /// one but the source calls. This backend also calls the routines of
+    /// [`RuntimeSymbol`] on its own, at their C convention (`memcpy` for a
+    /// LIR `Memcpy`, `fmod` for `frem`, the i128 helpers, the allocators, the
+    /// Clean RC entries); a hidden-buffer fact under such a name would move
+    /// that call's first argument into X8 as well (LD-100 rule 11: a
+    /// `memcpy` declared `void (ptr sret, ptr, i64)` and called once made
+    /// the same function's `@llvm.memcpy` call pass its destination in X8,
+    /// and the program crashed where llc's build copies). Refused by name.
+    fn direct_callee_passes_sret(&self, callee_name: &str) -> Result<bool, ISelError> {
+        if !self.sret_arg_callees.contains(callee_name) {
+            return Ok(false);
+        }
+        if RuntimeSymbol::from_name(callee_name).is_some() {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] `{callee_name}` is called with a hidden return-buffer argument, \
+                 but this backend also calls a routine of that name on its own, at its C \
+                 convention, and the hidden-buffer fact is keyed by the symbol's name: it would \
+                 move that call's first argument into X8 too; refusing a module that declares a \
+                 runtime routine's name with `sret` (LD-100 rule 11)"
+            )));
+        }
+        Ok(true)
+    }
+
+    /// Classify the arguments of a call whose argument 0 is a hidden
+    /// return-buffer pointer: that pointer goes in **X8** (AAPCS64 §6.9), a
+    /// register outside the argument bank, and the remaining arguments are
+    /// numbered as if it were absent. `classify_tail` classifies that
+    /// remainder (the fixed rule for an ordinary call, the fixed/anonymous
+    /// rule for a variadic one). Shared by the direct, indirect and variadic
+    /// caller lowerings so the three cannot drift.
+    fn classify_sret_call_args(
+        &self,
+        callee: &str,
+        arg_types: &[Type],
+        result_vals: &[Value],
+        result_types: &[Type],
+        classify_tail: impl FnOnce(&[Type]) -> Vec<ArgLocation>,
+    ) -> Result<Vec<ArgLocation>, ISelError> {
+        if !result_vals.is_empty() || !result_types.is_empty() {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] call to {callee} passes a hidden return-buffer argument and expects result values; refusing competing return conventions"
+            )));
+        }
+        let Some(sret_ty) = arg_types.first() else {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] call to {callee} declares a hidden return-buffer argument but \
+                 passes no arguments at all"
+            )));
+        };
+        if *sret_ty != Type::I64 {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] hidden return-buffer argument to {callee} has type {sret_ty:?}, \
+                 not the I64 pointer carrier; refusing rather than staging a non-pointer \
+                 through X8"
+            )));
+        }
+        let mut locs = Vec::with_capacity(arg_types.len());
+        locs.push(ArgLocation::Reg(gpr::X8));
+        locs.extend(classify_tail(&arg_types[1..]));
+        Ok(locs)
+    }
+
+    /// Classify formal parameters, honouring a hidden return-buffer (`sret`)
+    /// parameter if this function has one.
+    ///
+    /// AAPCS64 §6.9: the caller passes the indirect-result address in **X8**,
+    /// a register outside the X0-X7 argument bank, and the ordinary arguments
+    /// are numbered as if the hidden one did not exist. So the hidden parameter
+    /// is placed at X8 explicitly and the rest are classified from the tail of
+    /// the parameter list — never by classifying the whole list and hoping the
+    /// first slot happens to be right.
+    ///
+    /// The hidden parameter must be a pointer carrier (`I64` after type
+    /// translation). Anything else is refused rather than copied into X8.
+    fn classify_formal_params(&self, params: &[Type]) -> Result<Vec<ArgLocation>, ISelError> {
+        let variant = self.abi_variant()?;
+        let Some(index) = self.sret_param_index else {
+            return Ok(AppleAArch64ABI::classify_params_with(variant, params));
+        };
+        debug_assert_eq!(index, 0, "seed_sret_param admits only a leading parameter");
+        let Some(sret_ty) = params.first() else {
+            return Err(ISelError::UnsupportedOpcode(
+                "[TCG-SRET-ABI] signature declares a hidden return-buffer parameter but has \
+                 no parameters at all"
+                    .to_string(),
+            ));
+        };
+        if *sret_ty != Type::I64 {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] hidden return-buffer parameter has type {sret_ty:?}, not the \
+                 I64 pointer carrier; refusing rather than staging a non-pointer through X8"
+            )));
+        }
+        let mut locs = Vec::with_capacity(params.len());
+        locs.push(ArgLocation::Reg(gpr::X8));
+        locs.extend(AppleAArch64ABI::classify_params_with(variant, &params[1..]));
+        Ok(locs)
     }
 
     /// Seed the `iconst_origins` map by scanning every block for `Iconst` defs.
@@ -1862,17 +2594,25 @@ impl InstructionSelector {
     /// Recorded entries describe `Value -> (Type, immediate)` pairs that
     /// `use_value` may rematerialize at the use site when the SSA definition
     /// does not dominate the consuming block. See the doc comment on
-    /// `iconst_origins`.
+    /// `iconst_origins`. Wide `Iconst128` defs are recorded in
+    /// `iconst128_origins`, which is constant knowledge only.
     pub fn seed_iconst_origins<'a, I>(&mut self, blocks: I)
     where
         I: IntoIterator<Item = &'a [Instruction]>,
     {
         for instructions in blocks {
             for inst in instructions {
-                if let Opcode::Iconst { ty, imm } = &inst.opcode
-                    && let Some(result) = inst.results.first()
-                {
-                    self.iconst_origins.insert(*result, (ty.clone(), *imm));
+                let Some(result) = inst.results.first() else {
+                    continue;
+                };
+                match &inst.opcode {
+                    Opcode::Iconst { ty, imm } => {
+                        self.iconst_origins.insert(*result, (ty.clone(), *imm));
+                    }
+                    Opcode::Iconst128 { lo, hi } => {
+                        self.iconst128_origins.insert(*result, (*lo, *hi));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1970,9 +2710,10 @@ impl InstructionSelector {
 
     /// Allocate a fresh virtual register.
     fn new_vreg(&mut self, class: RegClass) -> VReg {
-        let id = self.func.next_vreg;
-        self.func.next_vreg += 1;
-        VReg { id, class }
+        VReg {
+            id: self.func.alloc_vreg_id(),
+            class,
+        }
     }
 
     /// Record a mapping from trust_ir Value to machine operand.
@@ -2025,15 +2766,6 @@ impl InstructionSelector {
         self.emit_iconst_materialization(block, dst, &ty, imm);
         self.define_value(val, ISelOperand::VReg(dst), ty);
         ISelOperand::VReg(dst)
-    }
-
-    /// Get the type of a trust_ir Value.
-    #[allow(dead_code)]
-    fn local_type_lookup(&self, val: &Value, local: &HashMap<Value, Type>) -> Option<Type> {
-        local
-            .get(val)
-            .cloned()
-            .or_else(|| self.value_types.get(val).cloned())
     }
 
     fn value_type(&self, val: &Value) -> Type {
@@ -2119,9 +2851,9 @@ impl InstructionSelector {
     /// `w1`). i64 arguments have always taken the `Copy X1 <- v` path; this
     /// makes i32 arguments symmetric.
     ///
-    /// Scoped to call arguments only: return values keep the `Uxtw` shape via
-    /// [`Self::emit_abi_register_copy`] (the narrow-return ABI path is pinned
-    /// by its own tests and gains nothing on the hot path here).
+    /// Scoped to call arguments only: width-precise I8/I16/I32 return locations
+    /// are already classified as W registers, so [`Self::emit_abi_register_copy`]
+    /// naturally emits their coalescible `Copy Wn <- v` form.
     fn emit_abi_call_arg_copy(&mut self, block: Block, dst_preg: PReg, src: ISelOperand) {
         let src_class = match &src {
             ISelOperand::VReg(vreg) => Some(vreg.class),
@@ -2203,6 +2935,28 @@ impl InstructionSelector {
         Ok(ISelOperand::VReg(dst))
     }
 
+    /// The register a proof-only guard carrier tests for `val`.
+    ///
+    /// A narrow (`I8`/`I16`) value lives in a 32-bit register whose bits above
+    /// its width are unspecified (arithmetic wraps there without masking, and
+    /// AAPCS64 leaves them unspecified for a narrow argument), while the
+    /// guard's condition is about the narrow value itself. Testing the raw
+    /// register lets a divisor that is zero at its width pass `CBNZ` (the
+    /// following `UDIV`/`SDIV` reads the extended zero and returns 0 instead of
+    /// trapping), and makes an in-range index or shift amount trap. The
+    /// carrier therefore tests the value zero-extended to 32 bits: zero exactly
+    /// when the narrow value is, and the unsigned value the bounds and
+    /// shift-range comparisons are stated over. Wider values are used as they
+    /// are.
+    fn guard_operand(&mut self, val: Value, block: Block) -> Result<ISelOperand, ISelError> {
+        let ty = self.value_type(&val);
+        if matches!(ty, Type::I8 | Type::I16) {
+            self.extend_narrow_for_width_op(val, &ty, false, block)
+        } else {
+            self.use_value(&val)
+        }
+    }
+
     fn default_int_to_float_result_type(src_ty: &Type) -> Type {
         match src_ty {
             Type::I16 => Type::F16,
@@ -2234,6 +2988,76 @@ impl InstructionSelector {
         }
     }
 
+    /// Numeric operands have a modeled width; aggregate address carriers do
+    /// not acquire a numeric interpretation merely by occupying a GPR.
+    fn integer_arithmetic_result_type(op: AArch64BinOp, lhs: &Type, rhs: &Type) -> Option<Type> {
+        let integer = |ty: &Type| {
+            matches!(
+                ty,
+                Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+            )
+        };
+        if !integer(lhs) || !integer(rhs) {
+            return None;
+        }
+        if lhs == rhs {
+            Some(lhs.clone())
+        } else {
+            Self::mixed_int_binop_result_type(op, lhs, rhs)
+        }
+    }
+
+    fn integer_arithmetic_error(
+        op: AArch64BinOp,
+        inst: &Instruction,
+        lhs_ty: Type,
+        rhs_ty: Type,
+    ) -> ISelError {
+        ISelError::IntegerArithmeticOperands {
+            operation: match op {
+                AArch64BinOp::Add => "Iadd",
+                AArch64BinOp::Sub => "Isub",
+                AArch64BinOp::Mul => "Imul",
+                AArch64BinOp::Sdiv => "Sdiv",
+                AArch64BinOp::Udiv => "Udiv",
+            },
+            lhs: inst.args[0],
+            lhs_ty,
+            rhs: inst.args[1],
+            rhs_ty,
+            result: inst.results[0],
+        }
+    }
+
+    fn ensure_integer_arithmetic_admitted_with<F>(
+        inst: &Instruction,
+        value_type: F,
+    ) -> Result<(), ISelError>
+    where
+        F: Fn(&Value) -> Option<Type>,
+    {
+        let op = match inst.opcode {
+            Opcode::Iadd => AArch64BinOp::Add,
+            Opcode::Isub => AArch64BinOp::Sub,
+            Opcode::Imul => AArch64BinOp::Mul,
+            Opcode::Sdiv => AArch64BinOp::Sdiv,
+            Opcode::Udiv => AArch64BinOp::Udiv,
+            _ => return Ok(()),
+        };
+        // Keep the existing arity and missing-SSA diagnostics authoritative.
+        if inst.args.len() < 2 || inst.results.is_empty() {
+            return Ok(());
+        }
+        let (Some(lhs_ty), Some(rhs_ty)) = (value_type(&inst.args[0]), value_type(&inst.args[1]))
+        else {
+            return Ok(());
+        };
+        if Self::integer_arithmetic_result_type(op, &lhs_ty, &rhs_ty).is_none() {
+            return Err(Self::integer_arithmetic_error(op, inst, lhs_ty, rhs_ty));
+        }
+        Ok(())
+    }
+
     fn infer_block_value_types<'a>(
         instructions: &[Instruction],
         global: &'a HashMap<Value, Type>,
@@ -2258,7 +3082,7 @@ impl InstructionSelector {
         // an in-block insert shadows the global entry exactly as it did when
         // inserted into the copy.
         let mut types = BlockTypes {
-            local: HashMap::new(),
+            local: HashMap::default(),
             global,
         };
 
@@ -2322,6 +3146,7 @@ impl InstructionSelector {
                     }
                 }
                 Opcode::GlobalRef { .. }
+                | Opcode::FunctionAddr { .. }
                 | Opcode::ExternRef { .. }
                 | Opcode::TlsRef { .. }
                 | Opcode::StackAddr { .. }
@@ -2356,9 +3181,9 @@ impl InstructionSelector {
                         Opcode::Imul => AArch64BinOp::Mul,
                         _ => unreachable!(),
                     };
-                    let ty =
-                        Self::mixed_int_binop_result_type(op, &lhs_ty, &rhs_ty).unwrap_or(lhs_ty);
-                    types.insert(*result, ty);
+                    if let Some(ty) = Self::integer_arithmetic_result_type(op, &lhs_ty, &rhs_ty) {
+                        types.insert(*result, ty);
+                    }
                 }
                 Opcode::Copy
                 | Opcode::Udiv
@@ -2412,16 +3237,6 @@ impl InstructionSelector {
         }
 
         types
-    }
-
-    /// Source floating-point width carried on FP-to-int conversion pseudos.
-    fn fp_source_width_hint(ty: &Type) -> i64 {
-        match ty {
-            Type::F16 => 16,
-            Type::F32 => 32,
-            Type::F64 => 64,
-            _ => 64,
-        }
     }
 
     /// Return the FEAT_FP16 scalar family required by `inst`, if any.
@@ -2617,6 +3432,15 @@ impl InstructionSelector {
         let block_value_types = Self::infer_block_value_types(instructions, &self.value_types);
         let _t_infer = _t3.elapsed();
 
+        // Check source arithmetic before a fusion can skip its instructions.
+        // The overlay knows block-local definitions without mutating live SSA
+        // bindings or manufacturing a fallback type for malformed operands.
+        for inst in instructions {
+            Self::ensure_integer_arithmetic_admitted_with(inst, |value| {
+                block_value_types.get(value).cloned()
+            })?;
+        }
+
         let _t4 = std::time::Instant::now();
         self.bitreverse_analysis = self.detect_bitreverse_idioms(instructions, &block_value_types);
         let _t_bitrev = _t4.elapsed();
@@ -2624,6 +3448,7 @@ impl InstructionSelector {
         let _t5 = std::time::Instant::now();
         self.mul_add_analysis = self.detect_mul_add_idioms(instructions, &block_value_types);
         let _t_muladd = _t5.elapsed();
+        self.rem_trunc_i32_folds = self.detect_rem_trunc_i32_folds(instructions);
 
         // Flags-consuming compare fold plan (icmp -> C/FCSEL). Runs AFTER the
         // idiom analyses so it can honor their skips: a compare feeding a select
@@ -2634,9 +3459,11 @@ impl InstructionSelector {
             self.detect_select_cond_folds(instructions, &block_value_types);
 
         self.pending_v_flag.clear();
+        let direct_branches = self.direct_branch_compares(instructions, &block_value_types);
 
         let _t_loop_start = std::time::Instant::now();
         for (i, inst) in instructions.iter().enumerate() {
+            let emitted_start = self.func.blocks.get(&block).map_or(0, |b| b.insts.len());
             self.current_source_loc = source_locs.get(i).copied().flatten();
             self.current_trust_ir_origin = trust_ir_origins.get(i).copied().flatten();
             self.current_inst_idx = i;
@@ -2671,7 +3498,25 @@ impl InstructionSelector {
             {
                 continue;
             }
-            self.select_instruction(inst, block)?;
+            if let Some(&cond) = direct_branches.get(&(i + 1)) {
+                // Emit under this comparison's own source identity. The next
+                // source instruction is its sole consumer, so NZCV cannot be
+                // overwritten between production and consumption.
+                self.select_cmp_flags(cond, inst, block)?;
+            } else if let Some(&cond) = direct_branches.get(&i) {
+                let Opcode::Brif {
+                    then_dest,
+                    else_dest,
+                    ..
+                } = inst.opcode
+                else {
+                    unreachable!("direct branch plan requires Brif")
+                };
+                self.select_brif_flags(AArch64CC::from_intcc(cond), then_dest, else_dest, block);
+            } else {
+                self.select_instruction(inst, block)?;
+            }
+            self.capture_aggregate_field(block, i, emitted_start)?;
         }
         let _t_loop = _t_loop_start.elapsed();
 
@@ -2688,6 +3533,8 @@ impl InstructionSelector {
         self.smulh_analysis = SmulhAnalysis::default();
         self.bitreverse_analysis = BitReverseAnalysis::default();
         self.mul_add_analysis = MulAddAnalysis::default();
+        self.rem_trunc_i32_folds.clear();
+        self.prenarrowed_truncs.clear();
         self.select_cond_fold_analysis = SelectCondFoldAnalysis::default();
         self.pending_v_flag.clear();
         self.current_source_loc = None;
@@ -2699,6 +3546,7 @@ impl InstructionSelector {
 
     /// Select a single trust_ir instruction, emitting ISelInsts into the block.
     fn select_instruction(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
+        Self::ensure_integer_arithmetic_admitted_with(inst, |value| Some(self.value_type(value)))?;
         self.ensure_fp16_instruction_admitted_with(inst, |value| {
             self.value_types.get(value).cloned()
         })?;
@@ -3391,7 +4239,34 @@ impl InstructionSelector {
             Opcode::Fmul => self.select_fp_binop(AArch64FpBinOp::Fmul, inst, block)?,
             Opcode::Fdiv => self.select_fp_binop(AArch64FpBinOp::Fdiv, inst, block)?,
             Opcode::Fma => self.select_fp_fma(inst, block, false)?,
+            Opcode::Aarch64FmaddAsm | Opcode::Aarch64FsqrtAsm | Opcode::Aarch64FrintnAsm => {
+                let arity = if inst.opcode == Opcode::Aarch64FmaddAsm {
+                    3
+                } else {
+                    1
+                };
+                Self::require_exact_args(inst, arity, "AArch64 FP asm")?;
+                let ty = self.value_type(&inst.args[0]);
+                if inst.results.len() != 1
+                    || !matches!(ty, Type::F32 | Type::F64)
+                    || inst.args.iter().any(|arg| self.value_type(arg) != ty)
+                {
+                    return Err(ISelError::UnsupportedOpcode(
+                        "AArch64 FP asm requires matching f32/f64 inputs and one result".into(),
+                    ));
+                }
+                match inst.opcode {
+                    Opcode::Aarch64FmaddAsm => self.select_fp_fma(inst, block, false)?,
+                    Opcode::Aarch64FsqrtAsm => {
+                        self.select_fp_unaryop(AArch64Opcode::FsqrtRR, inst, block)?
+                    }
+                    _ => self.select_fp_unaryop(AArch64Opcode::FrintnRR, inst, block)?,
+                }
+            }
             Opcode::Fmuladd => self.select_fp_fma(inst, block, true)?,
+            Opcode::Crc32 { bytes, castagnoli } => {
+                self.select_crc32(*bytes, *castagnoli, inst, block)?
+            }
             Opcode::Fcmp { cond } => self.select_fcmp(*cond, inst, block)?,
             Opcode::FcvtToInt { dst_ty } => {
                 self.select_fcvt_to_int(dst_ty.clone(), inst, block)?;
@@ -3403,6 +4278,13 @@ impl InstructionSelector {
             // Addressing
             Opcode::GlobalRef { name } => {
                 self.select_global_ref(name, inst, block)?;
+            }
+            Opcode::FunctionAddr { name, .. } => {
+                self.select_symbol_address(
+                    ISelOperand::ExactModuleSymbol(name.clone()),
+                    inst,
+                    block,
+                )?;
             }
             Opcode::ExternRef { name } => {
                 self.select_extern_ref(name, inst, block)?;
@@ -3430,8 +4312,8 @@ impl InstructionSelector {
             Opcode::Assert => self.select_assert(inst, block)?,
             Opcode::Trap => self.select_trap(block)?,
             Opcode::Return => self.select_return(inst, block)?,
-            Opcode::Call { name } => {
-                self.select_call_from_lir(name, inst, block)?;
+            Opcode::Call { name, binding } => {
+                self.select_call_from_lir(name, *binding, inst, block)?;
             }
             Opcode::CallIndirect => {
                 self.select_call_indirect_from_lir(inst, block)?;
@@ -3443,11 +4325,12 @@ impl InstructionSelector {
                 self.select_switch(cases, *default, inst, block)?;
             }
             Opcode::Invoke {
+                binding,
                 name,
                 normal_dest,
                 unwind_dest,
             } => {
-                self.select_invoke(name, *normal_dest, *unwind_dest, inst, block)?;
+                self.select_invoke(name, *binding, *normal_dest, *unwind_dest, inst, block)?;
             }
             Opcode::LandingPad {
                 is_cleanup,
@@ -3525,6 +4408,16 @@ impl InstructionSelector {
                 field_index,
             } => {
                 self.select_struct_gep(struct_ty.clone(), *field_index, inst, block)?;
+            }
+            // A byte-stride address whose offset is a fused one-use product
+            // (`detect_mul_add_idioms`): `base + index * stride` as one MADD.
+            Opcode::ArrayGep { elem_ty: Type::I8 }
+                if self
+                    .mul_add_analysis
+                    .root_idiom(self.current_inst_idx)
+                    .is_some() =>
+            {
+                self.select_mul_add(inst, block)?
             }
             Opcode::ArrayGep { elem_ty } => {
                 self.select_array_gep(elem_ty.clone(), inst, block)?;
@@ -3705,10 +4598,6 @@ impl InstructionSelector {
         let dst = self.new_vreg(class);
         let result = &inst.results[0];
 
-        if !matches!(ty, Type::F16 | Type::F32 | Type::F64) {
-            return Err(ISelError::UnsupportedFconstType(ty));
-        }
-
         // The AArch64 scalar FMOV-immediate form only encodes a small set of
         // values (±2^[-3..4] × 1.defgh). Emit it only for an exactly encodable
         // value; otherwise materialize the IEEE bits in a GPR and FMOV them
@@ -3723,11 +4612,19 @@ impl InstructionSelector {
         // that rounds to the encodable half value 1.0; feeding the original to
         // FmovImm would be worse, because the hardware can only materialize the
         // rounded half value.
-        let f16_bits_and_value = (ty == Type::F16).then(|| {
-            let bits = Self::f64_to_binary16_bits(imm);
-            (bits, Self::binary16_bits_to_f64(bits))
-        });
-        let immediate_value = f16_bits_and_value.map_or(imm, |(_, value)| value);
+        let (immediate_value, bits, gpr_class) = match ty {
+            Type::F16 => {
+                let bits = Self::f64_to_binary16_bits(imm);
+                (
+                    Self::binary16_bits_to_f64(bits),
+                    u64::from(bits),
+                    RegClass::Gpr32,
+                )
+            }
+            Type::F32 => (imm, u64::from((imm as f32).to_bits()), RegClass::Gpr32),
+            Type::F64 => (imm, imm.to_bits(), RegClass::Gpr64),
+            _ => return Err(ISelError::UnsupportedFconstType(ty)),
+        };
 
         if Self::fmov_imm8_encodable(immediate_value) {
             self.emit(
@@ -3738,15 +4635,6 @@ impl InstructionSelector {
                 ),
             );
         } else {
-            let (bits, gpr_class) = match ty {
-                Type::F16 => (
-                    u64::from(f16_bits_and_value.expect("F16 bits computed above").0),
-                    RegClass::Gpr32,
-                ),
-                Type::F32 => (u64::from((imm as f32).to_bits()), RegClass::Gpr32),
-                // F64 (F16/F32 handled above, others rejected above).
-                _ => (imm.to_bits(), RegClass::Gpr64),
-            };
             let gpr = self.new_vreg(gpr_class);
             Self::emit_movz_movk_sequence(&mut self.func, block, gpr, bits);
             self.emit(
@@ -4076,7 +4964,7 @@ impl InstructionSelector {
         instructions: &[Instruction],
         types: &BlockTypes<'_>,
     ) -> BitReverseAnalysis {
-        let mut def_site: HashMap<Value, usize> = HashMap::new();
+        let mut def_site: HashMap<Value, usize> = HashMap::default();
         for (idx, inst) in instructions.iter().enumerate() {
             if inst.results.len() == 1 {
                 def_site.insert(inst.results[0], idx);
@@ -4096,7 +4984,7 @@ impl InstructionSelector {
                 continue;
             };
 
-            let mut matched_indices = HashSet::new();
+            let mut matched_indices = HashSet::default();
             let (mut current, matched_steps) = if let Some(current) = Self::match_bitreverse_final(
                 instructions,
                 &def_site,
@@ -4161,6 +5049,13 @@ impl InstructionSelector {
             if !self.bitreverse_intermediates_are_local(instructions, root_idx, &matched_indices) {
                 continue;
             }
+            // The stack form reads its state back from a stack slot and skips
+            // the slot's stores. That is sound only when the matched loads and
+            // stores are the slot's ENTIRE access set; otherwise select the
+            // ladder instruction by instruction and keep every store.
+            if !self.bitreverse_stack_slots_are_private(instructions, &matched_indices, ty) {
+                continue;
+            }
             if matched_indices
                 .iter()
                 .any(|idx| analysis.skip_indices.contains(idx))
@@ -4168,6 +5063,21 @@ impl InstructionSelector {
                 continue;
             }
 
+            let mut fused_stores: Vec<usize> = matched_indices
+                .iter()
+                .copied()
+                .filter(|idx| matches!(instructions[*idx].opcode, Opcode::Store { .. }))
+                .collect();
+            fused_stores.sort_unstable();
+            let mut fused_slots: Vec<u32> = matched_indices
+                .iter()
+                .filter_map(|idx| match instructions[*idx].opcode {
+                    Opcode::StackAddr { slot } => Some(slot),
+                    _ => None,
+                })
+                .collect();
+            fused_slots.sort_unstable();
+            fused_slots.dedup();
             analysis.skip_indices.extend(matched_indices);
             analysis.by_root.insert(
                 root_idx,
@@ -4176,6 +5086,8 @@ impl InstructionSelector {
                     src: current,
                     result,
                     ty: ty.clone(),
+                    fused_stores,
+                    fused_slots,
                 },
             );
         }
@@ -4815,14 +5727,14 @@ impl InstructionSelector {
         root_idx: usize,
         matched_indices: &HashSet<usize>,
     ) -> bool {
-        let mut internal_values = HashSet::new();
+        let mut internal_values = HashSet::default();
         for idx in matched_indices {
             for result in &instructions[*idx].results {
                 internal_values.insert(*result);
             }
         }
 
-        let mut in_block_uses: HashMap<Value, usize> = HashMap::new();
+        let mut in_block_uses: HashMap<Value, usize> = HashMap::default();
         for (idx, inst) in instructions.iter().enumerate() {
             let is_pattern_consumer = idx == root_idx || matched_indices.contains(&idx);
             for arg in &inst.args {
@@ -4851,6 +5763,113 @@ impl InstructionSelector {
         true
     }
 
+    /// Whether every stack slot the matched bit-reverse window touches is
+    /// private to that window, so skipping the window's stores and replacing
+    /// its loads by the register value they read back is exact.
+    ///
+    /// For each slot addressed by a matched `StackAddr`, the whole-function
+    /// facts ([`StackSlotAddressFacts`]) must show that:
+    ///
+    /// 1. every `StackAddr` of the slot in the function is in the window
+    ///    (no other block or instruction can form the address);
+    /// 2. every occurrence of every such address value is the address operand
+    ///    of a matched `Load`/`Store` of exactly the idiom's type — never data
+    ///    stored to memory, a call or branch argument, or any other operand —
+    ///    so the address does not escape and nothing outside the window reads
+    ///    or writes the slot;
+    /// 3. the slot is fixed-size and covers the access width.
+    ///
+    /// With those facts, each matched load reads exactly the latest matched
+    /// store before it in the block (the matcher's store choice), and the
+    /// window's stores have no other reader. A window with no `StackAddr` is
+    /// the register form and has no slot to prove. Without seeded facts no
+    /// slot is provably private.
+    fn bitreverse_stack_slots_are_private(
+        &self,
+        instructions: &[Instruction],
+        matched_indices: &HashSet<usize>,
+        ty: &Type,
+    ) -> bool {
+        let mut window_addr_defs: HashMap<u32, usize> = HashMap::default();
+        let mut window_addr_values: HashMap<Value, u32> = HashMap::default();
+        for idx in matched_indices {
+            let inst = &instructions[*idx];
+            if let Opcode::StackAddr { slot } = inst.opcode {
+                if !inst.args.is_empty() || inst.results.len() != 1 {
+                    return false;
+                }
+                *window_addr_defs.entry(slot).or_insert(0) += 1;
+                window_addr_values.insert(inst.results[0], slot);
+            }
+        }
+
+        let mut window_addr_uses: HashMap<Value, usize> = HashMap::default();
+        for idx in matched_indices {
+            let inst = &instructions[*idx];
+            match &inst.opcode {
+                Opcode::StackAddr { .. } => {}
+                Opcode::Load { ty: load_ty, .. } => {
+                    if load_ty != ty
+                        || inst.args.len() != 1
+                        || inst.results.len() != 1
+                        || !window_addr_values.contains_key(&inst.args[0])
+                    {
+                        return false;
+                    }
+                    *window_addr_uses.entry(inst.args[0]).or_insert(0) += 1;
+                }
+                Opcode::Store { ty: store_ty, .. } => {
+                    if store_ty != ty
+                        || inst.args.len() != 2
+                        || !inst.results.is_empty()
+                        || !window_addr_values.contains_key(&inst.args[1])
+                        || window_addr_values.contains_key(&inst.args[0])
+                    {
+                        return false;
+                    }
+                    *window_addr_uses.entry(inst.args[1]).or_insert(0) += 1;
+                }
+                _ => {
+                    if inst
+                        .args
+                        .iter()
+                        .any(|arg| window_addr_values.contains_key(arg))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        if window_addr_defs.is_empty() {
+            return true;
+        }
+
+        let Some(facts) = &self.stack_slot_address_facts else {
+            return false;
+        };
+        let Some(access_bytes) = Self::bitreverse_width(ty).map(|bits| u32::from(bits / 8)) else {
+            return false;
+        };
+        for (slot, window_defs) in &window_addr_defs {
+            if facts.poisoned.contains(slot)
+                || facts.addr_defs.get(slot).copied().unwrap_or(0) != *window_defs
+            {
+                return false;
+            }
+            let Some(info) = self.func.stack_slots.get(*slot as usize) else {
+                return false;
+            };
+            if info.is_runtime_sized() || info.size < access_bytes {
+                return false;
+            }
+        }
+        window_addr_values.keys().all(|value| {
+            facts.addr_values.get(value) == window_addr_values.get(value)
+                && facts.addr_value_uses.get(value).copied().unwrap_or(0)
+                    == window_addr_uses.get(value).copied().unwrap_or(0)
+        })
+    }
+
     fn select_bitreverse(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
         Self::require_args(inst, 2, "BitReverse")?;
         Self::require_result(inst, "BitReverse")?;
@@ -4869,6 +5888,35 @@ impl InstructionSelector {
             block,
             ISelInst::new(AArch64Opcode::Rbit, vec![ISelOperand::VReg(dst), src]),
         );
+        // The RBIT is stamped with the root's source coordinate. Link each
+        // folded private-slot store to it so TV-3 sees the store represented
+        // rather than dropped. Without that exact stamp no edge is recorded
+        // and the stores stay unwitnessed (fail closed).
+        let root = SourceInstId {
+            block: block.0,
+            index: idiom.root_idx as u32,
+        };
+        if self.func.current_lowering_provenance.source_id() == Some(root) {
+            for store_idx in &idiom.fused_stores {
+                self.func.source_fusion_targets.insert(
+                    SourceInstId {
+                        block: block.0,
+                        index: *store_idx as u32,
+                    },
+                    root,
+                );
+            }
+        }
+        // The private-slot proof showed that this window holds every
+        // `StackAddr` of these slots and every use of their addresses, and the
+        // whole window is skipped, so no machine instruction addresses them.
+        // Keep each slot's id (slot numbering and debug variables are keyed by
+        // it) but release its storage.
+        for slot in &idiom.fused_slots {
+            if let Some(info) = self.func.stack_slots.get_mut(*slot as usize) {
+                *info = StackSlotInfo::new(0, 1);
+            }
+        }
         self.define_value(idiom.result, ISelOperand::VReg(dst), idiom.ty);
         Ok(())
     }
@@ -4878,8 +5926,8 @@ impl InstructionSelector {
         instructions: &[Instruction],
         types: &BlockTypes<'_>,
     ) -> MulAddAnalysis {
-        let mut def_site: HashMap<Value, usize> = HashMap::new();
-        let mut use_count: HashMap<Value, usize> = HashMap::new();
+        let mut def_site: HashMap<Value, usize> = HashMap::default();
+        let mut use_count: HashMap<Value, usize> = HashMap::default();
 
         for (idx, inst) in instructions.iter().enumerate() {
             if inst.results.len() == 1 {
@@ -4892,7 +5940,14 @@ impl InstructionSelector {
 
         let mut analysis = MulAddAnalysis::default();
         for (root_idx, root) in instructions.iter().enumerate() {
-            if !matches!(root.opcode, Opcode::Iadd | Opcode::Isub)
+            // A byte-stride `ArrayGep` is the adapter's spelling of every
+            // `base + offset` address (a GEP's `base + index * stride` among
+            // them), so an address whose offset is a one-use product is the
+            // same `MADD` an `Iadd` root selects. Only its offset can be the
+            // product, and the type check below holds it to a numeric I64
+            // base: an aggregate address carrier keeps `select_array_gep`.
+            let byte_address = matches!(root.opcode, Opcode::ArrayGep { elem_ty: Type::I8 });
+            if !(byte_address || matches!(root.opcode, Opcode::Iadd | Opcode::Isub))
                 || root.args.len() != 2
                 || root.results.len() != 1
             {
@@ -4906,6 +5961,10 @@ impl InstructionSelector {
                 Opcode::Iadd => [
                     Some((root.args[0], Some(root.args[1]), MulAddKind::Add)),
                     Some((root.args[1], Some(root.args[0]), MulAddKind::Add)),
+                ],
+                Opcode::ArrayGep { .. } => [
+                    Some((root.args[1], Some(root.args[0]), MulAddKind::Add)),
+                    None,
                 ],
                 Opcode::Isub => {
                     let kind = if Self::is_zero_const(root.args[0], instructions, &def_site) {
@@ -4944,10 +6003,19 @@ impl InstructionSelector {
                 let Some(addend_ty) = types.get(&addend) else {
                     continue;
                 };
-                if matches!(mul_lhs_ty, Type::I128) {
+                if !matches!(
+                    mul_lhs_ty,
+                    Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64
+                ) {
                     continue;
                 }
                 if mul_lhs_ty != mul_rhs_ty || mul_lhs_ty != addend_ty {
+                    continue;
+                }
+                // An address is 64 bits: a narrower `MADD` would drop its high
+                // half, and an aggregate base never reaches here (its type is
+                // not the product's).
+                if byte_address && *mul_lhs_ty != Type::I64 {
                     continue;
                 }
 
@@ -5112,8 +6180,8 @@ impl InstructionSelector {
         if select_fold_disabled() {
             return SelectCondFoldAnalysis::default();
         }
-        let mut def_site: HashMap<Value, usize> = HashMap::new();
-        let mut use_count: HashMap<Value, usize> = HashMap::new();
+        let mut def_site: HashMap<Value, usize> = HashMap::default();
+        let mut use_count: HashMap<Value, usize> = HashMap::default();
         for (idx, inst) in instructions.iter().enumerate() {
             if inst.results.len() == 1 {
                 def_site.insert(inst.results[0], idx);
@@ -5363,6 +6431,12 @@ impl InstructionSelector {
         debug_assert_eq!(idiom.result, inst.results[0]);
 
         let ty = idiom.ty.clone();
+        if !matches!(ty, Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64) {
+            return Err(ISelError::UnsupportedIntegerType {
+                op: "MADD/MSUB",
+                ty,
+            });
+        }
         let dst = self.new_vreg(reg_class_for_type(&ty));
         let lhs = self.use_value(&idiom.mul_lhs)?;
         let rhs = self.use_value(&idiom.mul_rhs)?;
@@ -5401,7 +6475,6 @@ impl InstructionSelector {
     }
 
     /// Internal enum for selecting the right opcode variant.
-    #[allow(dead_code)]
     fn select_binop(
         &mut self,
         op: AArch64BinOp,
@@ -5417,8 +6490,11 @@ impl InstructionSelector {
 
         let lhs_ty = self.value_type(&lhs_val);
         let rhs_ty = self.value_type(&rhs_val);
-        let ty = Self::mixed_int_binop_result_type(op, &lhs_ty, &rhs_ty)
-            .unwrap_or_else(|| lhs_ty.clone());
+        let ty = Self::integer_arithmetic_result_type(op, &lhs_ty, &rhs_ty)
+            .filter(|ty| *ty != Type::I128)
+            .ok_or_else(|| {
+                Self::integer_arithmetic_error(op, inst, lhs_ty.clone(), rhs_ty.clone())
+            })?;
         let is_32 = Self::is_32bit(&ty);
 
         // Fold `x + const` into a single `ADD (immediate)` when the constant is
@@ -5429,10 +6505,11 @@ impl InstructionSelector {
         // single-use result is then folded on into the consuming LDR/STR
         // `[base, #off]` addressing mode by the `addr-mode` pass (O1+).
         //
-        // Only `Add` (commutative) folds, and only a NON-NEGATIVE imm12(<<12)
-        // constant — a negative or wider constant drops to the register path
-        // below, preserving today's SUB/materialize semantics. The constant is
-        // read from the `Iconst` pre-scan so no dead MOVZ is emitted. A `0xFADE`
+        // `Add` is commutative, so either single constant operand may fold.
+        // The constant is read from the `Iconst` pre-scan, so the fold itself
+        // materializes nothing. `select_iconst` still emits the constant's own
+        // MOVZ/MOVN; when this add is its only use, that definition is dead and
+        // is left for dead-definition removal. A `0xFADE`
         // global-address stub never reaches ISel as a plain `Iconst` (the
         // adapter decodes it to a `GlobalRef`/`ExternRef` first) and its
         // magnitude is far past the imm12(<<12) ceiling regardless, so the
@@ -5489,6 +6566,43 @@ impl InstructionSelector {
                 self.define_value(result_val, ISelOperand::VReg(dst), ty);
                 return Ok(());
             }
+        }
+
+        // Fold `x - const` into `SUB (immediate)` for the directly encodable
+        // non-negative imm12 range. Unlike addition, subtraction is not
+        // commutative: only the RHS constant may become the immediate. Keep
+        // two-constant expressions on the general path for the constant-fold
+        // pass, and keep negative / shifted-immediate-sized constants on the
+        // register path rather than changing the operation or inventing a
+        // `SubRIShift12` opcode. Reading the pre-scanned origin before
+        // `use_value` avoids materializing the now-implicit RHS constant.
+        if matches!(op, AArch64BinOp::Sub)
+            && !self.iconst_origins.contains_key(&lhs_val)
+            && let Some(imm) = self
+                .iconst_origins
+                .get(&rhs_val)
+                .map(|(_, imm)| *imm)
+                .filter(|imm| (0..=0xFFF).contains(imm))
+        {
+            let class = reg_class_for_type(&ty);
+            // Match the general register path below: mixed i32/i64 arithmetic
+            // zero-extends a narrow runtime-allocation size before the 64-bit
+            // subtract.
+            let lhs = if class == RegClass::Gpr64 && Self::is_int32ish(&lhs_ty) {
+                self.runtime_alloc_size_operand(lhs_val, block)?
+            } else {
+                self.use_value(&lhs_val)?
+            };
+            let dst = self.new_vreg(class);
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::SubRI,
+                    vec![ISelOperand::VReg(dst), lhs, ISelOperand::Imm(imm)],
+                ),
+            );
+            self.define_value(result_val, ISelOperand::VReg(dst), ty);
+            return Ok(());
         }
 
         // Strength-reduce a divide by a compile-time constant to a magic
@@ -5554,10 +6668,13 @@ impl InstructionSelector {
 
     /// Select proof-only divide-by-zero guard.
     ///
-    /// The emitted `TrapDivZeroIfZero divisor` carries the exact divisor operand to proof binding and
-    /// expands late to `CBNZ divisor, +2; BRK #1` if not removed — the exact DivZero mirror of
-    /// `select_guard_null`'s `TrapNullIfZero ptr`. The guard has no LIR result; proven non-zero
-    /// divisors let O2 remove it.
+    /// The emitted `TrapDivZeroIfZero d` expands late to `CBNZ d, +2; BRK #1` if not removed — the
+    /// DivZero mirror of `select_guard_null`'s `TrapNullIfZero ptr`. For a divisor that fits one
+    /// GPR, `d` is the divisor's own operand. An I128 divisor is a `(lo, hi)` register pair, and a
+    /// zero test of either half alone is not a zero test of the value (`1 << 64` has `lo == 0`), so
+    /// `d` is a fresh `ORR d, lo, hi`: zero iff the whole 128-bit divisor is zero, which is the
+    /// predicate `GuardDivZero` states and its bound `DivNonZero` obligation discharges. The guard
+    /// has no LIR result; proven non-zero divisors let O2 remove it.
     fn select_guard_div_zero(
         &mut self,
         inst: &Instruction,
@@ -5568,13 +6685,15 @@ impl InstructionSelector {
 
         // DEAD-GUARD ELISION: when the divisor is a compile-time NONZERO
         // constant, the div-by-zero trap is provably dead — emit NOTHING (LLVM
-        // parity). We consult the `Iconst` pre-scan BEFORE `use_value` (which
+        // parity). We consult the constant pre-scans BEFORE `use_value` (which
         // would otherwise rematerialize the constant into a dead MOV) and check
         // the literal is nonzero AT THE DIVISOR'S WIDTH (a value whose low
         // `width` bits are all zero — e.g. 256 at I8 — is a genuine zero divisor
-        // and MUST keep its trap). A zero-at-width constant or a non-constant
-        // (runtime) divisor falls through to the eliminable carrier below,
-        // preserving the hardware-total x/0 trap semantics unchanged.
+        // and MUST keep its trap). An `Iconst` I128 is its immediate's sign
+        // extension, so it is zero iff the immediate is; an `Iconst128` is zero
+        // iff both halves are. A zero-at-width constant or a non-constant
+        // (runtime) divisor falls through to the carrier below, preserving the
+        // x/0 trap semantics unchanged.
         let dv = inst.args[0];
         if let Some((cty, imm)) = self.iconst_origins.get(&dv).cloned() {
             let width: u32 = match cty {
@@ -5592,8 +6711,13 @@ impl InstructionSelector {
                 return Ok(());
             }
         }
+        if let Some(&(lo, hi)) = self.iconst128_origins.get(&dv)
+            && (lo | hi) != 0
+        {
+            return Ok(());
+        }
 
-        let divisor = self.use_value(&inst.args[0])?;
+        let divisor = self.guard_div_zero_operand(&dv, block)?;
 
         // Sentinel: record this carrier's discharged-obligation binding, keyed by the SAME operand
         // fingerprint the Certified-Elimination Kernel computes from the emitted MachIR carrier
@@ -5616,6 +6740,37 @@ impl InstructionSelector {
         );
 
         Ok(())
+    }
+
+    /// The single GPR operand whose zero test is the zero test of the divisor `dv`.
+    ///
+    /// A scalar divisor is its own operand, a narrow one zero-extended
+    /// (`guard_operand`). An I128 divisor (typed I128, or bound as a register
+    /// pair) is folded to `ORR d, lo, hi` in a fresh GPR64, and a missing high half fails closed
+    /// with `UndefinedValue` rather than testing the low half alone.
+    fn guard_div_zero_operand(
+        &mut self,
+        dv: &Value,
+        block: Block,
+    ) -> Result<ISelOperand, ISelError> {
+        let is_i128 = self.value_type(dv) == Type::I128
+            || self.i128_high_map.contains_key(dv)
+            || matches!(self.iconst_origins.get(dv), Some((Type::I128, _)));
+        if !is_i128 {
+            // A narrow divisor is tested zero-extended (`guard_operand`): its
+            // register may hold bits above its width.
+            return self.guard_operand(*dv, block);
+        }
+        let (lo, hi) = self.use_i128_value(dv)?;
+        let any_bit = self.new_vreg(RegClass::Gpr64);
+        self.emit(
+            block,
+            ISelInst::new(
+                AArch64Opcode::OrrRR,
+                vec![ISelOperand::VReg(any_bit), lo, hi],
+            ),
+        );
+        Ok(ISelOperand::VReg(any_bit))
     }
 
     /// Select proof-only null-pointer guard.
@@ -5670,7 +6825,7 @@ impl InstructionSelector {
     ) -> Result<(), ISelError> {
         Self::require_args(inst, 1, "GuardShiftRange")?;
 
-        let amount = self.use_value(&inst.args[0])?;
+        let amount = self.guard_operand(inst.args[0], block)?;
 
         // Sentinel: record this carrier's discharged-obligation binding, keyed by the SAME operand
         // fingerprint the Certified-Elimination Kernel computes from the emitted MachIR carrier
@@ -5768,7 +6923,7 @@ impl InstructionSelector {
         Self::require_args(inst, 2, "GuardBoundsCheck")?;
 
         let base = self.use_value(&inst.args[0])?;
-        let index = self.use_value(&inst.args[1])?;
+        let index = self.guard_operand(inst.args[1], block)?;
 
         // Sentinel: record this carrier's discharged-obligation binding, keyed by the SAME operand
         // fingerprint the Certified-Elimination Kernel computes from the emitted MachIR carrier
@@ -5831,8 +6986,8 @@ impl InstructionSelector {
         Self::require_args(inst, 3, "GuardBoundsCheckDyn")?;
 
         let base = self.use_value(&inst.args[0])?;
-        let index = self.use_value(&inst.args[1])?;
-        let len = self.use_value(&inst.args[2])?;
+        let index = self.guard_operand(inst.args[1], block)?;
+        let len = self.guard_operand(inst.args[2], block)?;
 
         // Same fingerprint discipline as the constant case, with the bound
         // recorded as a REGISTER ref. `GuardOperandRef::Reg` already exists and
@@ -5889,25 +7044,16 @@ impl InstructionSelector {
     }
 
     fn emit_synthetic_trap_block(&mut self) -> Result<Block, ISelError> {
-        let trap_block = self.fresh_synthetic_block();
+        let trap_block = self.fresh_synthetic_block()?;
         self.func.ensure_block(trap_block);
         self.select_trap(trap_block)?;
         Ok(trap_block)
     }
 
-    fn fresh_synthetic_block(&mut self) -> Block {
-        while self.func.blocks.contains_key(&Block(self.next_block_id)) {
-            self.next_block_id = self
-                .next_block_id
-                .checked_add(1)
-                .expect("exhausted AArch64 synthetic block ids");
-        }
-        let block = Block(self.next_block_id);
-        self.next_block_id = self
-            .next_block_id
-            .checked_add(1)
-            .expect("exhausted AArch64 synthetic block ids");
-        block
+    fn fresh_synthetic_block(&mut self) -> Result<Block, ISelError> {
+        allocate_synthetic_block_id(&mut self.next_block_id, |block| {
+            self.func.blocks.contains_key(&block)
+        })
     }
 
     /// Select integer remainder: SDIV/UDIV + MSUB.
@@ -6073,7 +7219,10 @@ impl InstructionSelector {
         is_rem: bool,
         ty: &Type,
     ) -> Result<bool, ISelError> {
-        use crate::magic_udiv::{MagicWidth, band_holds, magics, magicu, smagic_band_holds};
+        use crate::magic_udiv::{
+            MagicWidth, band_holds, magics, magicu, magicu_preshift, preshift_band_holds,
+            smagic_band_holds,
+        };
 
         let width = match ty {
             Type::I32 => MagicWidth::W32,
@@ -6215,14 +7364,50 @@ impl InstructionSelector {
         // [2^31,2^32) => magnitude < 2^31), so the 32-bit ADD/ASR equal the
         // width-generic model. The `magic_udiv::{smull_w32,umull_w32}` tests
         // prove both sequences equal C div/rem for the full i32/u32 probe set.
-        // Kill switch `TCG_NO_SMULL_DIV=1` falls through to the 64-bit path.
-        if is_32 && !smull_div_disabled() {
+        if is_32 {
             if !is_signed {
                 let Some(m) = magicu(divisor_u, width) else {
                     return Ok(false);
                 };
                 if !band_holds(divisor_u, m, width) {
                     return Ok(false);
+                }
+                // An even divisor whose magic needs the add-back form is
+                // pre-shifted instead (`magic_udiv::MagicUPreShift`):
+                // LSR Wt, Wx, #z; UMULL; LSR #(32+s), as clang emits. Its band
+                // is checked over the reduced dividend range; a reject keeps
+                // the add-back form below.
+                if m.add
+                    && let Some(p) = magicu_preshift(divisor_u, width)
+                    && preshift_band_holds(divisor_u, p, width)
+                {
+                    let xs = self.magic_shift_imm(
+                        block,
+                        AArch64Opcode::LsrRI,
+                        gpr32,
+                        x.clone(),
+                        i64::from(p.pre_shift),
+                    );
+                    let mm =
+                        self.magic_mat(block, &Type::I32, (p.magic.magic as u32) as i32 as i64);
+                    let xp = self.magic_rr64(
+                        block,
+                        AArch64Opcode::Umull,
+                        ISelOperand::VReg(xs),
+                        ISelOperand::VReg(mm),
+                    );
+                    let q64 = self.magic_shift_imm(
+                        block,
+                        AArch64Opcode::LsrRI,
+                        gpr64,
+                        ISelOperand::VReg(xp),
+                        32 + i64::from(p.magic.shift),
+                    );
+                    let q32 = narrow(self, block, q64);
+                    return self.finish_const_div_rem(
+                        block, is_rem, is_signed, is_32, ty, result_val, x, q32, divisor_s,
+                        divisor_u,
+                    );
                 }
                 if m.add && m.shift == 0 {
                     return Ok(false);
@@ -6410,6 +7595,47 @@ impl InstructionSelector {
             };
             if !band_holds(divisor_u, m, width) {
                 return Ok(false);
+            }
+            // W64 pre-shift (see the W32 path above): an even divisor whose
+            // magic needs the add-back form becomes LSR Xt, Xx, #z; UMULH;
+            // LSR #s, one instruction and one dependent step shorter.
+            let preshift = if m.add && !is_32 {
+                magicu_preshift(divisor_u, width)
+                    .filter(|p| preshift_band_holds(divisor_u, *p, width))
+            } else {
+                None
+            };
+            if let Some(p) = preshift {
+                let xs = self.magic_shift_imm(
+                    block,
+                    AArch64Opcode::LsrRI,
+                    gpr64,
+                    x64.clone(),
+                    i64::from(p.pre_shift),
+                );
+                let mm = self.magic_mat(block, &Type::I64, p.magic.magic as i64);
+                let mh = self.magic_rr64(
+                    block,
+                    AArch64Opcode::Umulh,
+                    ISelOperand::VReg(xs),
+                    ISelOperand::VReg(mm),
+                );
+                let q = if p.magic.shift == 0 {
+                    mh
+                } else {
+                    self.magic_shift_imm(
+                        block,
+                        AArch64Opcode::LsrRI,
+                        gpr64,
+                        ISelOperand::VReg(mh),
+                        i64::from(p.magic.shift),
+                    )
+                };
+                let quotient_w = narrow(self, block, q);
+                return self.finish_const_div_rem(
+                    block, is_rem, is_signed, is_32, ty, result_val, x, quotient_w, divisor_s,
+                    divisor_u,
+                );
             }
             if m.add && m.shift == 0 {
                 return Ok(false);
@@ -6681,8 +7907,7 @@ impl InstructionSelector {
         // (SUB w,w,w,LSL#8; ADD). SOUND: `x - q*c` is evaluated mod 2^width and
         // |rem| < |c| so the wrapping value IS the true remainder; the shifted-
         // register SubRRShift/AddRRShift carry their own per-inst lowering certs
-        // (Rd = Rn ∓ (Rm << k)). Gated with the rest of this lever
-        // (`TCG_NO_SMULL_DIV=1` -> plain MSUB) so the kill switch is byte-inert.
+        // (Rd = Rn ∓ (Rm << k)).
         let opw = reg_class_for_type(ty);
         let width_bits: u32 = if is_32 { 32 } else { 64 };
         // Divisor magnitude and sign at the op width.
@@ -6705,7 +7930,7 @@ impl InstructionSelector {
                 divisor_s < 0
             });
         // Classify |c| as 2^k-1 (|c|+1 pow2) or 2^k+1 (|c|-1 pow2), 1<=k<width.
-        let mersenne: Option<(i64, bool)> = if smull_div_disabled() || a < 3 {
+        let mersenne: Option<(i64, bool)> = if a < 3 {
             None
         } else if a != u64::MAX && (a + 1).is_power_of_two() {
             let k = (a + 1).trailing_zeros();
@@ -6716,8 +7941,24 @@ impl InstructionSelector {
         } else {
             None
         };
+        // A 64-bit remainder whose only use is a `Trunc` to `I32` in this
+        // block (`rem_trunc_i32_folds`) writes its last instruction as the W
+        // form into the truncation's result; intermediates stay 64-bit and
+        // are read through their W views. The `2^k + 1` tail ends in a
+        // shifted-register op, whose W form takes only `k < 32`.
+        let narrowed_trunc = if !is_32 && *ty == Type::I64 {
+            self.rem_trunc_i32_folds.get(&result_val).copied()
+        } else {
+            None
+        }
+        .filter(|_| !matches!(mersenne, Some((k, false)) if k >= 32));
+        let dst_class = if narrowed_trunc.is_some() {
+            RegClass::Gpr32
+        } else {
+            opw
+        };
         if let Some((k, is_minus)) = mersenne {
-            let dst = self.new_vreg(opw);
+            let dst = self.new_vreg(dst_class);
             if is_minus {
                 // |c| = 2^k - 1:  t = q - (q<<k) = -q*|c|.
                 //   c>0: rem = x + t ;  c<0: rem = x - t.
@@ -6784,7 +8025,7 @@ impl InstructionSelector {
                     ),
                 );
             }
-            self.define_value(result_val, ISelOperand::VReg(dst), ty.clone());
+            self.bind_const_rem_result(result_val, narrowed_trunc, dst, ty);
             return Ok(true);
         }
         // rem = x - q*c   (MSUB Rd, Rn=q, Rm=c, Ra=x), at the op width.
@@ -6798,7 +8039,7 @@ impl InstructionSelector {
             divisor_s // same bit pattern as divisor_u at 64 bits
         };
         let c = self.magic_mat(block, ty, cimm);
-        let dst = self.new_vreg(reg_class_for_type(ty));
+        let dst = self.new_vreg(dst_class);
         self.emit(
             block,
             ISelInst::new(
@@ -6811,8 +8052,61 @@ impl InstructionSelector {
                 ],
             ),
         );
-        self.define_value(result_val, ISelOperand::VReg(dst), ty.clone());
+        self.bind_const_rem_result(result_val, narrowed_trunc, dst, ty);
         Ok(true)
+    }
+
+    /// Bind a constant-divisor remainder's last register: to the remainder
+    /// itself, or (narrowed, see `rem_trunc_i32_folds`) to the `I32`
+    /// truncation that is its only use, leaving the 64-bit remainder unbound.
+    fn bind_const_rem_result(
+        &mut self,
+        result_val: Value,
+        narrowed_trunc: Option<Value>,
+        dst: VReg,
+        ty: &Type,
+    ) {
+        match narrowed_trunc {
+            Some(trunc_val) => {
+                self.define_value(trunc_val, ISelOperand::VReg(dst), Type::I32);
+                self.prenarrowed_truncs.insert(trunc_val);
+            }
+            None => self.define_value(result_val, ISelOperand::VReg(dst), ty.clone()),
+        }
+    }
+
+    /// The per-block `Urem`/`Srem` -> `Trunc { to_ty: I32 }` pairs whose
+    /// remainder has no other use anywhere in the function (see
+    /// [`Self::rem_trunc_i32_folds`]). Requires the whole-function use
+    /// counts: without them a use in another block cannot be excluded, so
+    /// nothing is folded.
+    fn detect_rem_trunc_i32_folds(&self, instructions: &[Instruction]) -> HashMap<Value, Value> {
+        let mut folds = HashMap::default();
+        let Some(counts) = &self.value_use_counts else {
+            return folds;
+        };
+        for (i, inst) in instructions.iter().enumerate() {
+            if !matches!(inst.opcode, Opcode::Urem | Opcode::Srem) {
+                continue;
+            }
+            let ([rem], [_, _]) = (inst.results.as_slice(), inst.args.as_slice()) else {
+                continue;
+            };
+            if counts.get(rem).copied() != Some(1) {
+                continue;
+            }
+            let trunc = instructions[i + 1..]
+                .iter()
+                .find(|later| later.args.contains(rem));
+            if let Some(trunc) = trunc
+                && matches!(trunc.opcode, Opcode::Trunc { to_ty: Type::I32 })
+                && trunc.args.as_slice() == [*rem]
+                && let [trunc_val] = trunc.results.as_slice()
+            {
+                folds.insert(*rem, *trunc_val);
+            }
+        }
+        folds
     }
 
     // -----------------------------------------------------------------------
@@ -6984,6 +8278,135 @@ impl InstructionSelector {
         let result = self.emit_ctpop_swar(block, class, width, src);
         self.define_value(result_val, result, ty);
         Ok(())
+    }
+
+    /// Select one CRC-32 step (`Opcode::Crc32`, the `llvm.aarch64.crc32*`
+    /// intrinsics): `[crc (I32), data (I32, or I64 for 8 bytes)] -> I32`.
+    ///
+    /// With FEAT_CRC32 admitted for this function, one `CRC32{B,H,W,X}` or
+    /// `CRC32C{B,H,W,X}` instruction. Without it, the same function from
+    /// baseline instructions, bit-serial and reflected exactly as the
+    /// instruction defines it (Arm ARM `CRC32()` pseudocode): `crc ^= data`
+    /// over each 32-bit chunk of the `8 * bytes` data bits, then one step per
+    /// bit, `crc = (crc >> 1) ^ (POLY & -(crc & 1))`, with the bit-reversed
+    /// polynomial (0xEDB88320 for IEEE 0x04C11DB7, 0x82F63B78 for Castagnoli
+    /// 0x1EDC6F41). The fallback is five instructions per data bit; it exists
+    /// so a function that does not state `crc` still computes the intrinsic
+    /// rather than executing an instruction its CPU may lack.
+    fn select_crc32(
+        &mut self,
+        bytes: u8,
+        castagnoli: bool,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        Self::require_exact_args(inst, 2, "Crc32")?;
+        Self::require_result(inst, "Crc32")?;
+        let opcode = match (bytes, castagnoli) {
+            (1, false) => AArch64Opcode::Crc32B,
+            (2, false) => AArch64Opcode::Crc32H,
+            (4, false) => AArch64Opcode::Crc32W,
+            (8, false) => AArch64Opcode::Crc32X,
+            (1, true) => AArch64Opcode::Crc32Cb,
+            (2, true) => AArch64Opcode::Crc32Ch,
+            (4, true) => AArch64Opcode::Crc32Cw,
+            (8, true) => AArch64Opcode::Crc32Cx,
+            _ => {
+                return Err(ISelError::UnsupportedOpcode(format!(
+                    "Crc32 over {bytes} bytes: the data width must be 1, 2, 4 or 8 bytes"
+                )));
+            }
+        };
+        let data_ty = if bytes == 8 { Type::I64 } else { Type::I32 };
+        for (index, want) in [(0, Type::I32), (1, data_ty.clone())] {
+            let actual = self.value_type(&inst.args[index]);
+            if actual != want {
+                return Err(ISelError::UnsupportedOpcode(format!(
+                    "{opcode:?}: operand {index} is {actual:?}, the intrinsic takes {want:?}"
+                )));
+            }
+        }
+        let result_val = inst.results[0];
+        let crc = self.use_value(&inst.args[0])?;
+        let data = self.use_value(&inst.args[1])?;
+
+        if self.crc_enabled {
+            let dst = self.new_vreg(RegClass::Gpr32);
+            self.emit(
+                block,
+                ISelInst::new(opcode, vec![ISelOperand::VReg(dst), crc, data]),
+            );
+            self.define_value(result_val, ISelOperand::VReg(dst), Type::I32);
+            return Ok(());
+        }
+
+        let class = RegClass::Gpr32;
+        let poly = self.new_vreg(class);
+        let reflected_poly: u64 = if castagnoli { 0x82F6_3B78 } else { 0xEDB8_8320 };
+        Self::emit_movz_movk_sequence(&mut self.func, block, poly, reflected_poly);
+        // The data as 32-bit chunks, low first, each with its bit count.
+        let chunks: Vec<(ISelOperand, u32)> = match bytes {
+            1 => vec![(self.emit_int_and_imm(block, class, data, 0xff), 8)],
+            2 => vec![(self.emit_int_and_imm(block, class, data, 0xffff), 16)],
+            4 => vec![(data, 32)],
+            _ => {
+                let low = self.new_vreg(class);
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::MovR,
+                        vec![ISelOperand::VReg(low), data.clone()],
+                    ),
+                );
+                let high64 = self.emit_int_lsr_imm(block, RegClass::Gpr64, data, 32);
+                let high = self.new_vreg(class);
+                self.emit(
+                    block,
+                    ISelInst::new(AArch64Opcode::MovR, vec![ISelOperand::VReg(high), high64]),
+                );
+                vec![(ISelOperand::VReg(low), 32), (ISelOperand::VReg(high), 32)]
+            }
+        };
+        let mut crc = crc;
+        for (chunk, bits) in chunks {
+            crc = self.emit_int_binary(block, class, AArch64Opcode::EorRR, crc, chunk);
+            for _ in 0..bits {
+                let low_bit = self.emit_int_and_imm(block, class, crc.clone(), 1);
+                let mask = self.new_vreg(class);
+                self.emit(
+                    block,
+                    ISelInst::new(AArch64Opcode::Neg, vec![ISelOperand::VReg(mask), low_bit]),
+                );
+                let term = self.emit_int_binary(
+                    block,
+                    class,
+                    AArch64Opcode::AndRR,
+                    ISelOperand::VReg(mask),
+                    ISelOperand::VReg(poly),
+                );
+                let shifted = self.emit_int_lsr_imm(block, class, crc, 1);
+                crc = self.emit_int_binary(block, class, AArch64Opcode::EorRR, shifted, term);
+            }
+        }
+        self.define_value(result_val, crc, Type::I32);
+        Ok(())
+    }
+
+    /// Emit `dst = opcode lhs, rhs` for a register-register integer opcode.
+    fn emit_int_binary(
+        &mut self,
+        block: Block,
+        class: RegClass,
+        opcode: AArch64Opcode,
+        lhs: ISelOperand,
+        rhs: ISelOperand,
+    ) -> ISelOperand {
+        let dst = self.new_vreg(class);
+        self.emit(
+            block,
+            ISelInst::new(opcode, vec![ISelOperand::VReg(dst), lhs, rhs]),
+        );
+        ISelOperand::VReg(dst)
     }
 
     /// Emit the SWAR population-count sequence for a single `width`-bit value held
@@ -7236,7 +8659,7 @@ impl InstructionSelector {
         (v <= 0xFFF).then_some(v as i64)
     }
 
-    fn select_cmp(
+    fn select_cmp_flags(
         &mut self,
         cond: IntCC,
         inst: &Instruction,
@@ -7247,7 +8670,6 @@ impl InstructionSelector {
 
         let lhs_val = inst.args[0];
         let rhs_val = inst.args[1];
-        let result_val = inst.results[0];
 
         // Narrow (i8/i16) operands are NOT guaranteed canonically extended in
         // their register — LDRB/LDRH zero-extend, and Trunc / arithmetic leave
@@ -7299,12 +8721,24 @@ impl InstructionSelector {
             }
         }
 
+        Ok(())
+    }
+
+    fn select_cmp(
+        &mut self,
+        cond: IntCC,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        self.select_cmp_flags(cond, inst, block)?;
+        let result_val = inst.results[0];
+
         // CSET: materialize condition code into a register.
         // We use Gpr64 for the destination to avoid register aliasing issues
         // with the linear scan allocator, which treats W<n> and X<n> as
         // independent physical registers despite them sharing hardware.
-        // CSET writes a 32-bit result (0 or 1) that zero-extends to 64 bits,
-        // so using an X register is semantically correct.
+        // This Gpr64 destination selects X-form CSET, which writes exactly
+        // 0 or 1 regardless of whether the reaching CMP uses W or X operands.
         let cc = AArch64CC::from_intcc(cond);
         let dst = self.new_vreg(RegClass::Gpr64);
         self.emit(
@@ -7362,25 +8796,7 @@ impl InstructionSelector {
             // Consume the pending flag.
             self.pending_v_flag.remove(&cond_val);
 
-            // B.VS then_dest — overflow occurred.
-            self.emit(
-                block,
-                ISelInst::new(
-                    AArch64Opcode::BCond,
-                    vec![
-                        ISelOperand::CondCode(AArch64CC::VS),
-                        ISelOperand::Block(then_dest),
-                    ],
-                ),
-            );
-            // B else_dest — unconditional fall-through.
-            self.emit(
-                block,
-                ISelInst::new(AArch64Opcode::B, vec![ISelOperand::Block(else_dest)]),
-            );
-            let mblock = self.func.blocks.entry(block).or_default();
-            mblock.successors.push(then_dest);
-            mblock.successors.push(else_dest);
+            self.select_brif_flags(AArch64CC::VS, then_dest, else_dest, block);
             return Ok(());
         }
 
@@ -7393,15 +8809,23 @@ impl InstructionSelector {
             ISelInst::new(AArch64Opcode::CmpRI, vec![cond_op, ISelOperand::Imm(0)]),
         );
 
-        // B.NE then_block (condition was nonzero = true)
+        self.select_brif_flags(AArch64CC::NE, then_dest, else_dest, block);
+        Ok(())
+    }
+
+    fn select_brif_flags(
+        &mut self,
+        cc: AArch64CC,
+        then_dest: Block,
+        else_dest: Block,
+        block: Block,
+    ) {
+        // Branch to the true successor using the reaching comparison flags.
         self.emit(
             block,
             ISelInst::new(
                 AArch64Opcode::BCond,
-                vec![
-                    ISelOperand::CondCode(AArch64CC::NE),
-                    ISelOperand::Block(then_dest),
-                ],
+                vec![ISelOperand::CondCode(cc), ISelOperand::Block(then_dest)],
             ),
         );
 
@@ -7414,12 +8838,21 @@ impl InstructionSelector {
         let mblock = self.func.blocks.entry(block).or_default();
         mblock.successors.push(then_dest);
         mblock.successors.push(else_dest);
-        Ok(())
     }
 
     fn select_trap(&mut self, block: Block) -> Result<(), ISelError> {
-        self.select_call("abort", &[], &[], &[], block)?;
-        self.emit(block, ISelInst::new(AArch64Opcode::TrapOverflow, vec![]));
+        // A plain `Trap` is the hardware trap instruction, `BRK #1`
+        // (`0xD4200020`) — the same instruction LLVM selects for `llvm.trap`
+        // on AArch64 (and the AArch64 twin of the `UD2` the x86-64 isel
+        // selects). It used to be `call abort` followed by an unreachable
+        // `TrapOverflow` filler: that terminates the process with SIGABRT
+        // (exit 134) where an LLVM-built binary reaching the same
+        // `core::intrinsics::abort()` dies with SIGTRAP (exit 133) — a
+        // process-visible difference the trust-ir -> trust-cg bridge's
+        // differential lane measured on 2026-09-10. A `Trap` is never a
+        // libc-level abort request: `std::process::abort` reaches libc's
+        // `abort()` through a real `Call`, which this arm never sees.
+        self.emit(block, ISelInst::new(AArch64Opcode::Brk, vec![]));
         Ok(())
     }
 
@@ -7574,6 +9007,57 @@ impl InstructionSelector {
         let overflow_result = inst.results[1];
 
         let ty = self.value_type(&lhs_val);
+        if ty == Type::I128 {
+            // Multi-precision checked add/sub over a register pair:
+            //
+            //     ADDS dst_lo, lhs_lo, rhs_lo   // C = carry out of low half
+            //     ADCS dst_hi, lhs_hi, rhs_hi   // consumes C, sets NZCV for
+            //                                   // the full 128-bit sum
+            //     CSET ov, <cc>
+            //
+            // (SUBS/SBCS for subtraction.) After the flag-setting high-half
+            // op, C is the carry/not-borrow of the whole 128-bit operation
+            // and V its signed overflow, so the same condition codes as the
+            // scalar path apply. CSET must follow ADCS/SBCS with no
+            // flag-clobbering op between — same contract as the scalar path,
+            // and ADCS/SBCS themselves must directly follow the low-half op.
+            let (lhs_lo, lhs_hi) = self.use_i128_value(&lhs_val)?;
+            let (rhs_lo, rhs_hi) = self.use_i128_value(&rhs_val)?;
+
+            let dst_lo = self.new_vreg(RegClass::Gpr64);
+            let dst_hi = self.new_vreg(RegClass::Gpr64);
+            let overflow_dst = self.new_vreg(RegClass::Gpr64);
+
+            let (lo_opc, hi_opc, overflow_cc) = match kind {
+                CheckedArith::Sadd => (AArch64Opcode::AddsRR, AArch64Opcode::Adcs, AArch64CC::VS),
+                CheckedArith::Ssub => (AArch64Opcode::SubsRR, AArch64Opcode::Sbcs, AArch64CC::VS),
+                CheckedArith::Uadd => (AArch64Opcode::AddsRR, AArch64Opcode::Adcs, AArch64CC::HS),
+                CheckedArith::Usub => (AArch64Opcode::SubsRR, AArch64Opcode::Sbcs, AArch64CC::LO),
+            };
+
+            self.emit(
+                block,
+                ISelInst::new(lo_opc, vec![ISelOperand::VReg(dst_lo), lhs_lo, rhs_lo]),
+            );
+            self.emit(
+                block,
+                ISelInst::new(hi_opc, vec![ISelOperand::VReg(dst_hi), lhs_hi, rhs_hi]),
+            );
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::CSet,
+                    vec![
+                        ISelOperand::VReg(overflow_dst),
+                        ISelOperand::CondCode(overflow_cc),
+                    ],
+                ),
+            );
+
+            self.define_i128_value(value_result, dst_lo, dst_hi);
+            self.define_value(overflow_result, ISelOperand::VReg(overflow_dst), Type::B1);
+            return Ok(());
+        }
         // The adapter currently only produces these opcodes for I64; guard
         // anyway so a malformed LIR surfaces immediately rather than silently
         // mislowering (e.g. emitting a 32-bit ADDS on an I16 pair).
@@ -7581,7 +9065,7 @@ impl InstructionSelector {
             return Err(ISelError::InsufficientArgs {
                 expected: 64,
                 actual: 0,
-                context: "checked add/sub requires I32 or I64 operands",
+                context: "checked add/sub requires I32, I64, or I128 operands",
             });
         }
 
@@ -7810,12 +9294,12 @@ impl InstructionSelector {
     }
 
     /// Select return. Moves return values into ABI-specified physical registers
-    /// (X0/V0 etc.) and emits RET.
+    /// (W0 for I8/I16/I32, X0 for B1/I64, typed V0 aliases for FP) and emits RET.
     fn select_return(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
         // Validate arity against function signature. The bridge (tRust, tSwift, tC)
         // must populate `Return.args` with the function's return value(s); a void
         // function returns with `args: vec![]`. A silent empty args on a non-void
-        // function would leave the return register (X0/V0) holding garbage. See #307.
+        // function would leave the return register (W0/X0/V0) holding garbage. See #307.
         let sig_returns = self.func.sig.returns.clone();
         let expected = sig_returns.len();
         let actual = inst.args.len();
@@ -7843,16 +9327,23 @@ impl InstructionSelector {
             }
             let sig_class = reg_class_for_type(sig_ty);
             let arg_class = reg_class_for_type(&arg_ty);
-            // A narrow integer return (I8/I16) is carried, per the Apple arm64
-            // ABI, as a 32-bit sign/zero-extended value in the same GPR class:
-            // the adapter inserts the SXTB/SXTH/UXT so the caller reads a
-            // canonical value (see adapter::translate_return). Accept the wider
-            // I32 carrier for a narrow scalar sig return; the extended bits land
-            // in w0 unchanged.
+            // The adapter may represent an I8/I16 result with an explicitly
+            // extended I32 carrier (see adapter::translate_return). Accept that
+            // carrier here while retaining the signature's narrow observable
+            // width; both forms return through the W-register ABI location.
             let narrow_return_widened = matches!(sig_ty, Type::I8 | Type::I16)
                 && arg_ty == Type::I32
                 && arg_class == sig_class;
-            if (&arg_ty != sig_ty && !narrow_return_widened) || arg_class != sig_class {
+            // A B1 comparison result may also occupy a byte-wide I8 signature
+            // slot. B1 uses Gpr64 and CSET materializes canonical zero/one;
+            // copying it into W0 preserves that value. This compatibility
+            // case is separate from the adapter's Ty::Bool -> Type::B1 path.
+            // These representation checks do not grant proof authority.
+            let bool_return_materialized =
+                matches!(sig_ty, Type::I8) && arg_ty == Type::B1 && arg_class == RegClass::Gpr64;
+            if !bool_return_materialized
+                && ((&arg_ty != sig_ty && !narrow_return_widened) || arg_class != sig_class)
+            {
                 return Err(ISelError::ReturnTypeMismatch {
                     index: i,
                     expected: format!("{:?}", sig_ty),
@@ -7905,7 +9396,7 @@ impl InstructionSelector {
                     // Aggregate HFA returns are dispatched above via select_aggregate_return.
                     return Err(ISelError::UnsupportedReturnLocation);
                 }
-                ArgLocation::Stack { .. } => {
+                ArgLocation::Ignore | ArgLocation::Stack { .. } => {
                     return Err(ISelError::UnsupportedReturnLocation);
                 }
             }
@@ -7944,8 +9435,10 @@ impl InstructionSelector {
             &arg_types,
             result_vals,
             result_types,
+            false,
             block,
         )
+        .map(|_| ())
     }
 
     /// Select a function call using an explicit external-ABI type for each
@@ -7959,6 +9452,7 @@ impl InstructionSelector {
     /// registers instead of passing its address (and shift the length operand),
     /// a silent miscompile. Keeping the override scoped to the intrinsic call
     /// preserves normal by-value aggregate call classification.
+    #[allow(clippy::too_many_arguments)]
     fn select_call_with_arg_types(
         &mut self,
         callee_name: &str,
@@ -7966,13 +9460,80 @@ impl InstructionSelector {
         arg_types: &[Type],
         result_vals: &[Value],
         result_types: &[Type],
+        exact_module_call: bool,
         block: Block,
-    ) -> Result<(), ISelError> {
+    ) -> Result<usize, ISelError> {
         debug_assert_eq!(arg_vals.len(), arg_types.len());
 
-        // Classify argument locations.
-        let arg_locs = AppleAArch64ABI::classify_params_with(self.abi_variant, arg_types);
-        let mut implicit_uses = call_implicit_uses(&arg_locs, arg_types);
+        // Classify argument locations. A callee that returns through a hidden
+        // caller-allocated buffer takes that buffer's address in **X8** (AAPCS64
+        // §6.9), NOT in X0: X8 sits outside the argument bank, and the real
+        // arguments are numbered as if the hidden one were absent. This is the
+        // caller half of `classify_formal_params`; the two must place the same
+        // pointer in the same register or every such call is an ABI divergence.
+        let variant = self.abi_variant()?;
+        let passes_sret = self.direct_callee_passes_sret(callee_name)?;
+        let arg_locs = if passes_sret {
+            self.classify_sret_call_args(
+                &format!("`{callee_name}`"),
+                arg_types,
+                result_vals,
+                result_types,
+                |tail| AppleAArch64ABI::classify_params_with(variant, tail),
+            )?
+        } else {
+            AppleAArch64ABI::classify_params_with(variant, arg_types)
+        };
+        self.select_call_with_arg_locations(
+            callee_name,
+            arg_vals,
+            arg_types,
+            &arg_locs,
+            result_vals,
+            result_types,
+            exact_module_call,
+            false,
+            passes_sret,
+            block,
+        )
+    }
+
+    /// Shared direct/variadic caller marshalling after target ABI classification.
+    /// Keep full-width stack stores, aggregate copies and result handling on one
+    /// path so a variadic call cannot drop an i128 limb or use a different copy
+    /// width from a nonvariadic call with the same ABI location.
+    /// `passes_sret` is the caller's [`Self::direct_callee_passes_sret`]
+    /// reading, recorded on the `Bl` (`hidden_result_pointer`).
+    #[allow(clippy::too_many_arguments)]
+    fn select_call_with_arg_locations(
+        &mut self,
+        callee_name: &str,
+        arg_vals: &[Value],
+        arg_types: &[Type],
+        arg_locs: &[ArgLocation],
+        result_vals: &[Value],
+        result_types: &[Type],
+        exact_module_call: bool,
+        variadic: bool,
+        passes_sret: bool,
+        block: Block,
+    ) -> Result<usize, ISelError> {
+        debug_assert_eq!(arg_vals.len(), arg_types.len());
+        debug_assert_eq!(arg_vals.len(), arg_locs.len());
+        let mut implicit_uses = call_implicit_uses(arg_locs, arg_types);
+        // The classified ABI facts of this call site, recorded on the `Bl` so
+        // machine passes (sibling tail-call eligibility) read the callee's
+        // real stack-argument, hidden-result and callee-saved requirements
+        // instead of guessing from operand counts.
+        let mut stack_stores: Vec<trust_cg_ir::StackArgStore> = Vec::new();
+        let mut aggregate_stack_args = false;
+        let mut stack_extent: i64 = 0;
+
+        // A composite passed by reference gets a copy of its own before any
+        // argument register is written (see `stage_by_reference_argument_copies`).
+        let mut by_reference_copies =
+            self.stage_by_reference_argument_copies(arg_vals, arg_types, arg_locs, block)?;
+        let by_reference_argument_copies = by_reference_copies.iter().any(Option::is_some);
 
         // sret CALLER side (audit P0/G1): a callee returning a >16-byte
         // aggregate writes the result through the AAPCS64 indirect-result
@@ -7992,13 +9553,51 @@ impl InstructionSelector {
 
         // Move arguments to ABI locations
         for (i, (val, loc)) in arg_vals.iter().zip(arg_locs.iter()).enumerate() {
-            let src = self.use_value(val)?;
+            let src = match by_reference_copies[i].take() {
+                Some(copy) => copy,
+                None => self.use_value(val)?,
+            };
             let ty = arg_types[i].clone();
 
             // Dispatch aggregate arguments to specialized handler
             if ty.is_aggregate() {
+                if let ArgLocation::Stack { offset, size } = loc {
+                    aggregate_stack_args = true;
+                    stack_extent = stack_extent.max(offset + i64::from(*size));
+                }
                 self.select_aggregate_arg(src, &ty, loc, block)?;
                 continue;
+            }
+
+            if let ArgLocation::Stack { offset, .. } = loc {
+                let widths: &[(i64, u8)] = match ty {
+                    Type::I128 => &[(0, 8), (8, 8)],
+                    Type::B1 | Type::I8 => &[(0, 1)],
+                    Type::I16 => &[(0, 2)],
+                    _ => &[],
+                };
+                let natural;
+                let widths = if widths.is_empty() {
+                    natural = [(
+                        0i64,
+                        u8::try_from(ty.bytes()).map_err(|_| {
+                            ISelError::UnsupportedOpcode(format!(
+                                "stack argument of {} bytes has no scalar store",
+                                ty.bytes()
+                            ))
+                        })?,
+                    )];
+                    &natural[..]
+                } else {
+                    widths
+                };
+                for &(delta, bytes) in widths {
+                    stack_stores.push(trust_cg_ir::StackArgStore {
+                        offset: offset + delta,
+                        bytes,
+                    });
+                    stack_extent = stack_extent.max(offset + delta + i64::from(bytes));
+                }
             }
 
             match loc {
@@ -8072,7 +9671,7 @@ impl InstructionSelector {
                             .as_call_arg_setup(),
                     );
                 }
-                ArgLocation::RegSequence(_) => {
+                ArgLocation::Ignore | ArgLocation::RegSequence(_) => {
                     // HFA: aggregate types are dispatched above via select_aggregate_arg.
                     // Scalar types should never receive RegSequence classification.
                     return Err(ISelError::UnsupportedArgLocation);
@@ -8102,6 +9701,37 @@ impl InstructionSelector {
         // (HAS_SIDE_EFFECTS/READS_MEMORY/WRITES_MEMORY) are left intact.
         if self.libm_pure_callees.contains(callee_name) {
             bl_inst = bl_inst.as_libm_pure_call();
+        }
+        if exact_module_call {
+            bl_inst = bl_inst.as_exact_module_call();
+        }
+        let hidden_result_pointer = passes_sret || sret_addrs.iter().any(Option::is_some);
+        bl_inst = bl_inst.with_call_abi(trust_cg_ir::CallAbiFacts {
+            callee: Some(callee_name.to_string()),
+            stack_arg_bytes: u32::try_from(stack_extent).map_err(|_| {
+                ISelError::UnsupportedOpcode(format!(
+                    "call to `{callee_name}` needs {stack_extent} bytes of outgoing stack arguments"
+                ))
+            })?,
+            stack_stores,
+            aggregate_stack_args,
+            hidden_result_pointer,
+            by_reference_argument_copies,
+            variadic,
+            callee_saved: trust_cg_ir::CalleeSavedSet::Aapcs64,
+        });
+        // The emitter owns this exact append coordinate. It is returned to
+        // Invoke selection, never inferred by searching the completed block.
+        // `emit_with_proof` creates a block on its first instruction, so a
+        // call that opens a block (no argument marshalling before it) lands
+        // at index 0 of a block that does not exist yet.
+        let call_index = self
+            .func
+            .blocks
+            .get(&block)
+            .map_or(0, |isel_block| isel_block.insts.len());
+        if let Some(pending) = &mut self.pending_aggregate_call {
+            pending.call_instruction = Some(call_index);
         }
         self.emit_with_proof(block, bl_inst, bl_proof);
 
@@ -8165,12 +9795,114 @@ impl InstructionSelector {
                     );
                     self.define_i128_value(*val, dst_lo, dst_hi);
                 }
-                ArgLocation::Stack { .. } => {
+                ArgLocation::Ignore | ArgLocation::Stack { .. } => {
                     return Err(ISelError::UnsupportedReturnLocation);
                 }
             }
         }
+        self.normalize_bool_call_results(result_vals, result_types, block)?;
+        Ok(call_index)
+    }
+
+    /// AAPCS64 Bool is an unsigned byte with canonical values 0/1, but bits
+    /// above that byte in a return register are unspecified. The internal B1
+    /// carrier is Gpr64, so capture all ABI results before zero-extending Bool
+    /// values into fresh carriers. This retains the existing physical-register
+    /// capture order (including later I128/aggregate lanes) and copy hints.
+    fn normalize_bool_call_results(
+        &mut self,
+        result_vals: &[Value],
+        result_types: &[Type],
+        block: Block,
+    ) -> Result<(), ISelError> {
+        for (value, ty) in result_vals.iter().zip(result_types) {
+            if *ty == Type::B1 {
+                let raw = self.use_value(value)?;
+                let canonical = self.new_vreg(RegClass::Gpr64);
+                // Uxtb encodes a W-register write: bits 63:8 become zero even
+                // though B1 uses a Gpr64 carrier. Do not normalize arbitrary
+                // nonzero bytes: bytes 2..255 are not valid Bool ABI inputs.
+                self.emit(
+                    block,
+                    ISelInst::new(AArch64Opcode::Uxtb, vec![ISelOperand::VReg(canonical), raw]),
+                );
+                self.define_value(*value, ISelOperand::VReg(canonical), Type::B1);
+            }
+        }
         Ok(())
+    }
+
+    /// Caller-owned copies of the composites a call passes by reference,
+    /// shared by the direct, variadic, invoke and indirect call lowerings.
+    ///
+    /// AAPCS64 §6.8.2 B.4 (DarwinPCS keeps the rule): a composite larger than
+    /// 16 bytes that is not an HFA/HVA is copied to memory the CALLER
+    /// allocates, and the argument becomes a pointer to that copy. The callee
+    /// owns the copy for the call and may write it; a C callee that assigns
+    /// to its parameter does. The trust-ir adapter already passes every such
+    /// argument as an `I64` pointer to storage the callee may own
+    /// (`TrustIrAdapter::pass_composites_by_reference`), so an aggregate-typed
+    /// by-reference argument reaches selection only from another LIR
+    /// producer. It is still the address of storage the caller may read
+    /// again, so this is the backstop: a fresh slot in the caller's frame,
+    /// aligned to the type (at least 8), filled with an inline copy of the
+    /// type's size. The copy is bounded (at most
+    /// [`BY_REFERENCE_INLINE_COPY_MAX_BYTES`]); a larger one is refused by
+    /// name rather than unrolled, because code size and the quadratic
+    /// per-block passes would grow with the aggregate, and a `memcpy` call
+    /// here would put a second call in an invoke's protected block.
+    ///
+    /// The copies are emitted before the sret buffer setup and before any
+    /// argument register or outgoing stack slot is written, so the copy
+    /// temporaries cannot interfere with the marshalled arguments. The
+    /// returned vector holds the copy's address for each by-reference
+    /// argument and `None` for every other one.
+    fn stage_by_reference_argument_copies(
+        &mut self,
+        arg_vals: &[Value],
+        arg_types: &[Type],
+        arg_locs: &[ArgLocation],
+        block: Block,
+    ) -> Result<Vec<Option<ISelOperand>>, ISelError> {
+        let mut copies = vec![None; arg_vals.len()];
+        for (i, (val, loc)) in arg_vals.iter().zip(arg_locs).enumerate() {
+            let Some(ty) = arg_types.get(i) else {
+                continue;
+            };
+            if !aarch64_arg_passed_by_reference(ty, loc) {
+                continue;
+            }
+            let size = ty.bytes();
+            if size > BY_REFERENCE_INLINE_COPY_MAX_BYTES {
+                return Err(ISelError::UnsupportedOpcode(format!(
+                    "[TCG-BYREF-COPY] argument {i} is a {size}-byte composite passed by \
+                     reference (AAPCS64 B.4) as an aggregate value; selection copies at most \
+                     {BY_REFERENCE_INLINE_COPY_MAX_BYTES} bytes inline, and a larger copy must be \
+                     made before the call (the trust-ir adapter passes such an argument as a \
+                     pointer to its own copy)"
+                )));
+            }
+            let src = self.use_value(val)?;
+            let slot = self.func.stack_slots.len() as u32;
+            self.func
+                .stack_slots
+                .push(StackSlotInfo::new(size.max(1), ty.align().max(8)));
+            let copy = self.new_vreg(RegClass::Gpr64);
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::AddPCRel,
+                    vec![
+                        ISelOperand::VReg(copy),
+                        ISelOperand::PReg(SP),
+                        ISelOperand::StackSlot(slot),
+                    ],
+                ),
+            );
+            self.emit_inline_memcpy(block, ISelOperand::VReg(copy), src, u64::from(size));
+            copies[i] = Some(ISelOperand::VReg(copy));
+        }
+        Ok(copies)
     }
 
     /// sret CALLER-side result-buffer setup (audit P0/G1), shared by the direct,
@@ -8255,7 +9987,7 @@ impl InstructionSelector {
                 self.define_value(val, addr, ty.clone());
                 return Ok(());
             }
-            ArgLocation::Stack { .. } => {
+            ArgLocation::Ignore | ArgLocation::Stack { .. } => {
                 return Err(ISelError::UnsupportedReturnLocation);
             }
             ArgLocation::RegSequence(regs) if regs.is_empty() => {
@@ -8268,13 +10000,16 @@ impl InstructionSelector {
             ArgLocation::Reg(_) => ty.bytes().max(8),
             ArgLocation::RegPair(_, _) => ty.bytes().max(16),
             ArgLocation::RegSequence(_) => ty.bytes().max(1),
-            ArgLocation::Indirect { .. } | ArgLocation::Stack { .. } => unreachable!(),
+            ArgLocation::Ignore | ArgLocation::Indirect { .. } | ArgLocation::Stack { .. } => {
+                unreachable!()
+            }
         };
         let slot = self.func.stack_slots.len() as u32;
         self.func
             .stack_slots
             .push(StackSlotInfo::new(slot_size, ty.align().max(8)));
         let dst = self.new_vreg(RegClass::Gpr64);
+        let address_instruction = self.func.blocks.get(&block).map_or(0, |b| b.insts.len());
         self.emit(
             block,
             ISelInst::new(
@@ -8286,6 +10021,7 @@ impl InstructionSelector {
                 ],
             ),
         );
+        let mut store_instructions = [None; 2];
 
         match loc {
             ArgLocation::Reg(preg) => {
@@ -8302,6 +10038,7 @@ impl InstructionSelector {
                 );
             }
             ArgLocation::RegPair(lo_preg, hi_preg) => {
+                store_instructions[0] = Some(self.func.blocks[&block].insts.len());
                 self.emit(
                     block,
                     ISelInst::new(
@@ -8313,6 +10050,7 @@ impl InstructionSelector {
                         ],
                     ),
                 );
+                store_instructions[1] = Some(self.func.blocks[&block].insts.len());
                 self.emit(
                     block,
                     ISelInst::new(
@@ -8326,17 +10064,15 @@ impl InstructionSelector {
                 );
             }
             ArgLocation::RegSequence(regs) => {
-                let Some((hfa_base, hfa_count)) = AppleAArch64ABI::classify_hfa(ty) else {
+                let Some((hfa_base, hfa_count)) =
+                    AppleAArch64ABI::classify_homogeneous_aggregate(ty)
+                else {
                     return Err(ISelError::UnsupportedReturnLocation);
                 };
                 if hfa_count != regs.len() {
                     return Err(ISelError::UnsupportedReturnLocation);
                 }
-                let elem_size = match hfa_base {
-                    HfaBaseType::F16 => 2,
-                    HfaBaseType::F32 => 4,
-                    HfaBaseType::F64 => 8,
-                };
+                let elem_size = hfa_base.element_bytes();
                 for (index, preg) in regs.iter().enumerate() {
                     self.emit(
                         block,
@@ -8351,10 +10087,34 @@ impl InstructionSelector {
                     );
                 }
             }
-            ArgLocation::Indirect { .. } | ArgLocation::Stack { .. } => unreachable!(),
+            ArgLocation::Ignore | ArgLocation::Indirect { .. } | ArgLocation::Stack { .. } => {
+                unreachable!()
+            }
         }
 
         self.define_value(val, ISelOperand::VReg(dst), ty.clone());
+        if let Some(pending) = &self.pending_aggregate_call
+            && pending.intent.lir_result() == val
+            && pending.intent.layout().carrier() == *ty
+            && let (Some(call), ArgLocation::RegPair(a, b), [Some(first), Some(second)]) =
+                (pending.call_instruction, loc, store_instructions)
+        {
+            let plan = AggregateMaterializationPlan::emitted(
+                pending.intent.clone(),
+                pending.binding,
+                self.abi_variant()?,
+                block,
+                call,
+                address_instruction,
+                [first, second],
+                slot,
+                dst,
+                [*a, *b],
+                &self.func,
+            )
+            .map_err(|reason| ISelError::UnsupportedOpcode(reason.to_string()))?;
+            self.func.aggregate_materializations.push(plan);
+        }
         Ok(())
     }
 
@@ -8381,14 +10141,38 @@ impl InstructionSelector {
     fn select_invoke(
         &mut self,
         name: &str,
+        binding: DirectCallBinding,
         normal_dest: Block,
         unwind_dest: Block,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), ISelError> {
+        // Closed native dependency fixups do not model protected Invoke sites.
+        // Even a sealed Call selector may not silently use a symbol for one.
+        if matches!(
+            binding,
+            DirectCallBinding::DeclaredExternalFunction { .. }
+                | DirectCallBinding::NativeDependency { .. }
+        ) {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "authenticated invoke {binding:?} requires a closed native/EH dependency pipeline"
+            )));
+        }
         // Lower the call exactly like a normal Call.
+        // The call index keys the protected call-site record below; the exact
+        // module binding the adapter authenticated decides the call's
+        // resolution exactly as it does for a plain Call.
         let result_types: Vec<Type> = inst.results.iter().map(|v| self.value_type(v)).collect();
-        self.select_call(name, &inst.args, &inst.results, &result_types, block)?;
+        let arg_types: Vec<Type> = inst.args.iter().map(|v| self.value_type(v)).collect();
+        let call_index = self.select_call_with_arg_types(
+            name,
+            &inst.args,
+            &arg_types,
+            &inst.results,
+            &result_types,
+            binding.is_exact_module(),
+            block,
+        )?;
 
         // Add a branch to normal_dest (the non-exception path).
         self.emit(
@@ -8415,6 +10199,11 @@ impl InstructionSelector {
         // Invoke into a machine function that appears to be non-EH.
         self.func.eh_info.call_sites.push(EhCallSite {
             call_block: block,
+            landing_pad_block: unwind_dest,
+        });
+        self.func.eh_invoke_bindings.push(ISelEhInvokeBinding {
+            call_block: block,
+            call_index,
             landing_pad_block: unwind_dest,
         });
 
@@ -8495,6 +10284,7 @@ impl InstructionSelector {
     /// Lowered to a call to `_Unwind_Resume(exception_ptr)`:
     /// - Move args[0] (exception pointer) to X0
     /// - BL _Unwind_Resume
+    /// - BRK #1 (fail closed if the noreturn call returns)
     ///
     /// `_Unwind_Resume` does not return (it transfers control to the next
     /// frame's landing pad or terminates).
@@ -8519,11 +10309,106 @@ impl InstructionSelector {
             block,
             ISelInst::new(
                 AArch64Opcode::Bl,
-                vec![ISelOperand::Symbol("_Unwind_Resume".to_string())],
+                vec![ISelOperand::Symbol(
+                    RuntimeSymbol::UnwindResume.name().to_string(),
+                )],
             )
             .with_implicit_uses(vec![gpr::X0]),
         );
 
+        // `_Unwind_Resume` is specified not to return. Materialize that
+        // control-flow fact in the machine stream, as the x86-64 selector does
+        // with UD2: without a hard terminator the final-layout CFG gives this
+        // block a fallthrough edge into the next laid-out block, contradicting
+        // the source `Resume` terminator. The frame net then merges the pad's
+        // state into that block and refuses a normal-path read of a
+        // callee-saved register the pad never wrote. BRK also makes an
+        // ABI-violating return fail closed.
+        self.emit(block, ISelInst::new(AArch64Opcode::Brk, vec![]));
+
+        Ok(())
+    }
+
+    // Retain the actual emission start at BOTH selector invocations; never
+    // recover field IDs by guessing adjacency in a later instruction stream.
+    fn capture_aggregate_field(
+        &mut self,
+        block: Block,
+        index: usize,
+        start: usize,
+    ) -> Result<(), ISelError> {
+        if !self.sealed_core_native_calls {
+            return Ok(());
+        }
+        let fields = self
+            .aggregate_call_intents
+            .fields()
+            .iter()
+            .filter(|f| {
+                f.lir_block() == block
+                    && (f.lir_instruction() == index || f.lir_instruction() + 1 == index)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for field in fields {
+            if Some(field.source_origin()) != self.current_trust_ir_origin {
+                return Err(ISelError::UnsupportedOpcode(
+                    "aggregate field source origin differs".into(),
+                ));
+            }
+            let end = self.func.blocks.get(&block).map_or(0, |b| b.insts.len());
+            if end != start + 1 {
+                return Err(ISelError::UnsupportedOpcode(
+                    "aggregate field selection shape".into(),
+                ));
+            }
+            if field.lir_instruction() == index {
+                if self
+                    .aggregate_field_addresses
+                    .insert((block, index), start)
+                    .is_some()
+                {
+                    return Err(ISelError::UnsupportedOpcode(
+                        "duplicate aggregate field address capture".into(),
+                    ));
+                }
+            } else {
+                let address = self
+                    .aggregate_field_addresses
+                    .remove(&(block, field.lir_instruction()))
+                    .ok_or_else(|| {
+                        ISelError::UnsupportedOpcode(
+                            "missing aggregate field address capture".into(),
+                        )
+                    })?;
+                let call = self
+                    .aggregate_call_intents
+                    .calls()
+                    .get(field.call())
+                    .ok_or_else(|| {
+                        ISelError::UnsupportedOpcode("foreign aggregate field owner".into())
+                    })?;
+                let owner = self
+                    .func
+                    .aggregate_materializations
+                    .iter()
+                    .position(|p| p.intent() == call)
+                    .ok_or_else(|| {
+                        ISelError::UnsupportedOpcode(
+                            "missing aggregate materialization owner".into(),
+                        )
+                    })?;
+                let emitted = AggregateFieldMaterializationPlan::emitted(
+                    field,
+                    address,
+                    start,
+                    &self.func.aggregate_materializations[owner],
+                    &self.func,
+                )
+                .map_err(|s| ISelError::UnsupportedOpcode(s.into()))?;
+                self.func.aggregate_materializations[owner].record_field(emitted);
+            }
+        }
         Ok(())
     }
 
@@ -8535,24 +10420,72 @@ impl InstructionSelector {
     fn select_call_from_lir(
         &mut self,
         name: &str,
+        binding: DirectCallBinding,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), ISelError> {
+        if matches!(binding, DirectCallBinding::DeclaredExternalFunction { .. })
+            || matches!(binding, DirectCallBinding::NativeDependency { .. })
+                && !self.sealed_core_native_calls
+        {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "native dependency call {binding:?} requires the closed Core fixup pipeline"
+            )));
+        }
         let result_types: Vec<Type> = inst.results.iter().map(|v| self.value_type(v)).collect();
-        self.select_call(name, &inst.args, &inst.results, &result_types, block)
+        let arg_types: Vec<Type> = inst.args.iter().map(|v| self.value_type(v)).collect();
+        self.pending_aggregate_call = None;
+        if self.sealed_core_native_calls
+            && matches!(binding, DirectCallBinding::NativeDependency { .. })
+            && self.abi_variant()? == AArch64AbiVariant::Darwin
+        {
+            let mut matching = self.aggregate_call_intents.calls().iter().filter(|intent| {
+                intent.matches_lir(
+                    block,
+                    self.current_inst_idx,
+                    self.current_trust_ir_origin,
+                    inst,
+                )
+            });
+            if let Some(intent) = matching.next() {
+                if matching.next().is_some() {
+                    return Err(ISelError::UnsupportedOpcode(
+                        "ambiguous aggregate call intent".into(),
+                    ));
+                }
+                if result_types == [intent.layout().carrier()]
+                    && arg_types.iter().all(|ty| *ty == Type::I64)
+                {
+                    self.pending_aggregate_call = Some(PendingAggregateCall {
+                        intent: intent.clone(),
+                        binding,
+                        call_instruction: None,
+                    });
+                }
+            }
+        }
+        let result = self.select_call_with_arg_types(
+            name,
+            &inst.args,
+            &arg_types,
+            &inst.results,
+            &result_types,
+            binding.is_exact_module(),
+            block,
+        );
+        self.pending_aggregate_call = None;
+        result.map(|_| ())
     }
 
     // -----------------------------------------------------------------------
-    // Variadic calls (Apple AArch64 ABI)
+    // Variadic calls
     // -----------------------------------------------------------------------
 
-    /// Select a variadic function call (e.g., printf, NSLog).
+    /// Select a variadic call using the target's calling convention.
     ///
-    /// Apple AArch64 ABI variadic convention:
-    /// - Fixed args (0..fixed_count) use normal register/stack classification
-    /// - ALL variadic args (fixed_count..) go on the stack, 8-byte aligned
-    ///
-    /// This differs from standard AAPCS64, where variadic args can use registers.
+    /// The producer supplies language-level argument promotions. Base AAPCS64
+    /// uses its ordinary register/stack rules for the complete argument list;
+    /// Darwin places anonymous arguments on the stack.
     pub fn select_variadic_call(
         &mut self,
         callee_name: &str,
@@ -8562,168 +10495,68 @@ impl InstructionSelector {
         result_types: &[Type],
         block: Block,
     ) -> Result<(), ISelError> {
-        // Classify argument locations using variadic ABI rules
         let arg_types: Vec<Type> = arg_vals.iter().map(|v| self.value_type(v)).collect();
-        let arg_locs = AppleAArch64ABI::classify_params_variadic(fixed_count, &arg_types);
-        let mut implicit_uses = call_implicit_uses(&arg_locs, &arg_types);
-
-        // sret CALLER side (audit P0/G1): allocate a result buffer for any
-        // >16-byte aggregate return and stage its address in X8 before the call.
-        // See `setup_sret_result_buffers`.
-        let ret_locs = AppleAArch64ABI::classify_returns(result_types);
-        let sret_addrs = self.setup_sret_result_buffers(
-            &ret_locs,
-            result_types,
-            result_vals.len(),
-            &mut implicit_uses,
-            block,
-        );
-
-        // Move arguments to ABI locations
-        for (i, (val, loc)) in arg_vals.iter().zip(arg_locs.iter()).enumerate() {
-            let src = self.use_value(val)?;
-            let ty = arg_types[i].clone();
-
-            // Dispatch aggregate arguments to specialized handler
-            if ty.is_aggregate() {
-                self.select_aggregate_arg(src, &ty, loc, block)?;
-                continue;
-            }
-
-            match loc {
-                ArgLocation::Reg(preg) => {
-                    self.emit_abi_call_arg_copy(block, *preg, src);
-                }
-                ArgLocation::Stack { offset, size: _ } => {
-                    // STR to [SP + offset] — used for both fixed overflow and
-                    // variadic arguments (Apple ABI puts all varargs on stack).
-                    self.emit(
-                        block,
-                        ISelInst::new(
-                            AArch64Opcode::StrRI,
-                            vec![src, ISelOperand::PReg(SP), ISelOperand::Imm(*offset)],
-                        ),
-                    );
-                }
-                ArgLocation::Indirect { ptr_reg } => {
-                    // Large aggregate indirect: pass pointer in register
-                    self.emit(
-                        block,
-                        ISelInst::new(AArch64Opcode::MovR, vec![ISelOperand::PReg(*ptr_reg), src])
-                            .as_call_arg_setup(),
-                    );
-                }
-                ArgLocation::RegPair(lo_preg, hi_preg) => {
-                    // i128 register pair argument: copy both halves
-                    let (lo, hi) = self.use_i128_value(val)?;
-                    self.emit(
-                        block,
-                        ISelInst::new(AArch64Opcode::Copy, vec![ISelOperand::PReg(*lo_preg), lo])
-                            .as_call_arg_setup(),
-                    );
-                    self.emit(
-                        block,
-                        ISelInst::new(AArch64Opcode::Copy, vec![ISelOperand::PReg(*hi_preg), hi])
-                            .as_call_arg_setup(),
-                    );
-                }
-                ArgLocation::RegSequence(_) => {
-                    // HFA: aggregate types dispatched above via select_aggregate_arg
-                    return Err(ISelError::UnsupportedArgLocation);
-                }
-            }
+        // A VARIADIC callee that also returns through a hidden buffer (legal C:
+        // `struct Big f(int n, ...)`) composes the two rules without overlap:
+        // AAPCS64 §6.9 reserves X8 for the indirect-result address outside the
+        // argument bank, so the fixed tail and the anonymous arguments are
+        // classified exactly as for a variadic callee without the hidden
+        // parameter. The hidden pointer is the FIRST fixed argument, so the
+        // tail's fixed count is one less.
+        let passes_sret = self.direct_callee_passes_sret(callee_name)?;
+        if passes_sret && fixed_count == 0 {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-SRET-ABI] variadic call to `{callee_name}` declares a hidden return-buffer \
+                 argument but no fixed parameter to carry it"
+            )));
         }
-
-        // Emit BL (direct call) with the callee symbol for relocation.
-        // If the callee was tagged `ProofAnnotation::Pure` in the trust_ir source
-        // (propagated via `Function::pure_callees` → `seed_pure_callees`),
-        // stamp the Bl with `Some(Pure)` so SROA partial-escape (#456) can
-        // see that the call does not escape its pointer arguments.
-        let bl_proof = if self.pure_callees.contains(callee_name) {
-            Some(trust_cg_ir::ProofAnnotation::Pure)
+        // The Darwin anonymous tail models only inline stack slots. A
+        // by-reference anonymous aggregate (>16-byte non-homogeneous) would be
+        // read by the callee as a pointer, and a short-vector HVA has no
+        // placement that clang's caller and va_arg agree on. Refuse both.
+        let variant = self.abi_variant()?;
+        if variant == AArch64AbiVariant::Darwin
+            && let Some((index, ty, reason)) = arg_types
+                .iter()
+                .enumerate()
+                .skip(fixed_count)
+                .find_map(|(index, ty)| {
+                    crate::abi::darwin_anonymous_vararg_refusal(ty)
+                        .map(|reason| (index, ty, reason))
+                })
+        {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "[TCG-VARARG-ABI] variadic call to `{callee_name}` passes anonymous argument \
+                 {index} ({ty:?}, {} bytes): {reason}; the call fails closed",
+                ty.bytes()
+            )));
+        }
+        let arg_locs = if passes_sret {
+            self.classify_sret_call_args(
+                &format!("`{callee_name}`"),
+                &arg_types,
+                result_vals,
+                result_types,
+                |tail| {
+                    AppleAArch64ABI::classify_params_variadic_with(variant, fixed_count - 1, tail)
+                },
+            )?
         } else {
-            None
+            AppleAArch64ABI::classify_params_variadic_with(variant, fixed_count, &arg_types)
         };
-        let mut bl_inst = ISelInst::new(
-            AArch64Opcode::Bl,
-            vec![ISelOperand::Symbol(callee_name.to_string())],
+        self.select_call_with_arg_locations(
+            callee_name,
+            arg_vals,
+            &arg_types,
+            &arg_locs,
+            result_vals,
+            result_types,
+            false,
+            true,
+            passes_sret,
+            block,
         )
-        .with_implicit_uses(implicit_uses)
-        .with_implicit_defs(call_implicit_defs());
-        // Importer-licensed libm-pure callee (intrinsic-origin math libcall):
-        // stamp `InstFlags::LIBM_PURE_CALL` (metadata; consumed only by the
-        // gated `loop-dead-pure-sink` machine pass). Conservative call flags
-        // (HAS_SIDE_EFFECTS/READS_MEMORY/WRITES_MEMORY) are left intact.
-        if self.libm_pure_callees.contains(callee_name) {
-            bl_inst = bl_inst.as_libm_pure_call();
-        }
-        self.emit_with_proof(block, bl_inst, bl_proof);
-
-        // Copy results from ABI return registers to vregs
-        let ret_locs = AppleAArch64ABI::classify_returns(result_types);
-        for (i, (val, loc)) in result_vals.iter().zip(ret_locs.iter()).enumerate() {
-            let ty = result_types[i].clone();
-            if ty.is_aggregate() {
-                let sret_addr = sret_addrs.get(i).cloned().flatten();
-                self.materialize_aggregate_call_result(*val, &ty, loc, sret_addr, block)?;
-                continue;
-            }
-            match loc {
-                ArgLocation::Reg(preg) => {
-                    let class = reg_class_for_type(&ty);
-                    let dst = self.new_vreg(class);
-                    // Use Copy pseudo for ALL register moves (GPR and FPR).
-                    // lower_copies() dispatches to MovR (GPR) or FmovFprFpr (FPR).
-                    self.emit(
-                        block,
-                        ISelInst::new(
-                            AArch64Opcode::Copy,
-                            vec![ISelOperand::VReg(dst), ISelOperand::PReg(*preg)],
-                        ),
-                    );
-                    self.define_value(*val, ISelOperand::VReg(dst), ty);
-                }
-                ArgLocation::RegSequence(regs) => {
-                    let _ = regs;
-                    return Err(ISelError::UnsupportedReturnLocation);
-                }
-                ArgLocation::Indirect { ptr_reg } => {
-                    let dst = self.new_vreg(RegClass::Gpr64);
-                    self.emit(
-                        block,
-                        ISelInst::new(
-                            AArch64Opcode::MovR,
-                            vec![ISelOperand::VReg(dst), ISelOperand::PReg(*ptr_reg)],
-                        ),
-                    );
-                    self.define_value(*val, ISelOperand::VReg(dst), ty);
-                }
-                ArgLocation::RegPair(lo_preg, hi_preg) => {
-                    // i128 register pair return from variadic call
-                    let dst_lo = self.new_vreg(RegClass::Gpr64);
-                    let dst_hi = self.new_vreg(RegClass::Gpr64);
-                    self.emit(
-                        block,
-                        ISelInst::new(
-                            AArch64Opcode::Copy,
-                            vec![ISelOperand::VReg(dst_lo), ISelOperand::PReg(*lo_preg)],
-                        ),
-                    );
-                    self.emit(
-                        block,
-                        ISelInst::new(
-                            AArch64Opcode::Copy,
-                            vec![ISelOperand::VReg(dst_hi), ISelOperand::PReg(*hi_preg)],
-                        ),
-                    );
-                    self.define_i128_value(*val, dst_lo, dst_hi);
-                }
-                ArgLocation::Stack { .. } => {
-                    return Err(ISelError::UnsupportedReturnLocation);
-                }
-            }
-        }
-        Ok(())
+        .map(|_| ())
     }
 
     /// Select a variadic call from LIR `Opcode::CallVariadic`.
@@ -8770,10 +10603,37 @@ impl InstructionSelector {
         result_types: &[Type],
         block: Block,
     ) -> Result<(), ISelError> {
-        // Classify argument locations (excluding the function pointer)
+        // Classify argument locations (excluding the function pointer). A
+        // callee value the adapter established as taking a hidden return
+        // buffer (see `Function::sret_arg_indirect_callees`) gets that pointer
+        // in X8 and the rest numbered as if it were absent, exactly like the
+        // direct-call arm; the `BLR` then carries X8 as an implicit use.
         let arg_types: Vec<Type> = arg_vals.iter().map(|v| self.value_type(v)).collect();
-        let arg_locs = AppleAArch64ABI::classify_params_with(self.abi_variant, &arg_types);
+        let variant = self.abi_variant()?;
+        let arg_locs = if self.sret_arg_indirect_callees.contains(fn_ptr_val) {
+            self.classify_sret_call_args(
+                &format!("the function pointer {fn_ptr_val:?}"),
+                &arg_types,
+                result_vals,
+                result_types,
+                |tail| AppleAArch64ABI::classify_params_with(variant, tail),
+            )?
+        } else {
+            AppleAArch64ABI::classify_params_with(variant, &arg_types)
+        };
         let mut implicit_uses = call_implicit_uses(&arg_locs, &arg_types);
+        // Record the same classified outgoing ABI facts as direct calls.
+        // The target remains unknown; consumers must still decide whether
+        // an indirect call is eligible for their transformation.
+        let mut stack_stores: Vec<trust_cg_ir::StackArgStore> = Vec::new();
+        let mut aggregate_stack_args = false;
+        let mut stack_extent: i64 = 0;
+
+        // By-reference composites are copied first, exactly as for a direct
+        // call (`stage_by_reference_argument_copies`).
+        let mut by_reference_copies =
+            self.stage_by_reference_argument_copies(arg_vals, &arg_types, &arg_locs, block)?;
+        let by_reference_argument_copies = by_reference_copies.iter().any(Option::is_some);
 
         // sret CALLER side (audit P0/G1): allocate a result buffer for any
         // >16-byte aggregate return and stage its address in X8 before the
@@ -8789,12 +10649,50 @@ impl InstructionSelector {
 
         // Move arguments to ABI locations (same as direct call)
         for (i, (val, loc)) in arg_vals.iter().zip(arg_locs.iter()).enumerate() {
-            let src = self.use_value(val)?;
+            let src = match by_reference_copies[i].take() {
+                Some(copy) => copy,
+                None => self.use_value(val)?,
+            };
             let ty = arg_types[i].clone();
 
             if ty.is_aggregate() {
+                if let ArgLocation::Stack { offset, size } = loc {
+                    aggregate_stack_args = true;
+                    stack_extent = stack_extent.max(offset + i64::from(*size));
+                }
                 self.select_aggregate_arg(src, &ty, loc, block)?;
                 continue;
+            }
+
+            if let ArgLocation::Stack { offset, .. } = loc {
+                let widths: &[(i64, u8)] = match ty {
+                    Type::I128 => &[(0, 8), (8, 8)],
+                    Type::B1 | Type::I8 => &[(0, 1)],
+                    Type::I16 => &[(0, 2)],
+                    _ => &[],
+                };
+                let natural;
+                let widths = if widths.is_empty() {
+                    natural = [(
+                        0i64,
+                        u8::try_from(ty.bytes()).map_err(|_| {
+                            ISelError::UnsupportedOpcode(format!(
+                                "stack argument of {} bytes has no scalar store",
+                                ty.bytes()
+                            ))
+                        })?,
+                    )];
+                    &natural[..]
+                } else {
+                    widths
+                };
+                for &(delta, bytes) in widths {
+                    stack_stores.push(trust_cg_ir::StackArgStore {
+                        offset: offset + delta,
+                        bytes,
+                    });
+                    stack_extent = stack_extent.max(offset + delta + i64::from(bytes));
+                }
             }
 
             match loc {
@@ -8802,11 +10700,34 @@ impl InstructionSelector {
                     self.emit_abi_call_arg_copy(block, *preg, src);
                 }
                 ArgLocation::Stack { offset, size: _ } => {
-                    // AArch64 StrRI handles all widths; register class determines size.
+                    // Match direct calls: a stack-passed i128 occupies both
+                    // 64-bit limbs, and narrow scalars use width-precise stores.
+                    if ty == Type::I128 {
+                        let (lo, hi) = self.use_i128_value(val)?;
+                        for (limb, delta) in [(lo, 0), (hi, 8)] {
+                            self.emit(
+                                block,
+                                ISelInst::new(
+                                    AArch64Opcode::StrRI,
+                                    vec![
+                                        limb,
+                                        ISelOperand::PReg(SP),
+                                        ISelOperand::Imm(*offset + delta),
+                                    ],
+                                ),
+                            );
+                        }
+                        continue;
+                    }
+                    let store_opc = match ty {
+                        Type::B1 | Type::I8 => AArch64Opcode::StrbRI,
+                        Type::I16 => AArch64Opcode::StrhRI,
+                        _ => AArch64Opcode::StrRI,
+                    };
                     self.emit(
                         block,
                         ISelInst::new(
-                            AArch64Opcode::StrRI,
+                            store_opc,
                             vec![src, ISelOperand::PReg(SP), ISelOperand::Imm(*offset)],
                         ),
                     );
@@ -8832,7 +10753,7 @@ impl InstructionSelector {
                             .as_call_arg_setup(),
                     );
                 }
-                ArgLocation::RegSequence(_) => {
+                ArgLocation::Ignore | ArgLocation::RegSequence(_) => {
                     // HFA: aggregate types dispatched above via select_aggregate_arg
                     return Err(ISelError::UnsupportedArgLocation);
                 }
@@ -8844,11 +10765,27 @@ impl InstructionSelector {
         // Emit BLR through the function-pointer value. Keeping the callee as
         // a normal register-allocation operand prevents late spill reloads
         // from clobbering a fixed IP scratch register immediately before BLR.
+        let hidden_result_pointer = self.sret_arg_indirect_callees.contains(fn_ptr_val)
+            || sret_addrs.iter().any(Option::is_some);
         self.emit(
             block,
             ISelInst::new(AArch64Opcode::Blr, vec![fn_ptr])
                 .with_implicit_uses(implicit_uses)
-                .with_implicit_defs(call_implicit_defs()),
+                .with_implicit_defs(call_implicit_defs())
+                .with_call_abi(trust_cg_ir::CallAbiFacts {
+                    callee: None,
+                    stack_arg_bytes: u32::try_from(stack_extent).map_err(|_| {
+                        ISelError::UnsupportedOpcode(format!(
+                            "call to the function pointer {fn_ptr_val:?} needs {stack_extent} bytes of outgoing stack arguments"
+                        ))
+                    })?,
+                    stack_stores,
+                    aggregate_stack_args,
+                    hidden_result_pointer,
+                    by_reference_argument_copies,
+                    variadic: false,
+                    callee_saved: trust_cg_ir::CalleeSavedSet::Aapcs64,
+                }),
         );
 
         // Copy results from ABI return registers to vregs
@@ -8910,11 +10847,12 @@ impl InstructionSelector {
                     );
                     self.define_i128_value(*val, dst_lo, dst_hi);
                 }
-                ArgLocation::Stack { .. } => {
+                ArgLocation::Ignore | ArgLocation::Stack { .. } => {
                     return Err(ISelError::UnsupportedReturnLocation);
                 }
             }
         }
+        self.normalize_bool_call_results(result_vals, result_types, block)?;
         Ok(())
     }
 
@@ -9099,23 +11037,21 @@ impl InstructionSelector {
         let is_32 = Self::is_32bit(&sel_ty);
         let selector = self.clean_switch_selector(selector, &sel_ty, block);
 
-        // For each case: CMP selector, #case_val then B.EQ target
-        for (case_val, target) in cases {
-            // Materialize the case value as an immediate comparison.
-            // AArch64 CMP immediate (CMPri) supports 12-bit unsigned values.
-            // For values outside that range, materialize into a register first.
-            let case_fits_imm12 = *case_val >= 0 && *case_val <= 0xFFF;
-
-            if case_fits_imm12 {
-                self.emit(
-                    block,
-                    ISelInst::new(
-                        AArch64Opcode::CmpRI,
-                        vec![selector.clone(), ISelOperand::Imm(*case_val)],
-                    ),
-                );
-            } else {
-                // Materialize case value into a register, then CMP reg, reg.
+        // AArch64 CMP immediate (CMPri) takes a 12-bit unsigned value; any
+        // other case value is compared against a register. Every such register
+        // is materialized HERE, before the first `B.EQ`: an instruction after
+        // a mid-block exit runs only on the paths that did not take it, yet
+        // GVN and CSE treat a value defined in this block as available in
+        // every block it dominates. A case constant materialized between two
+        // `B.EQ`s was merged into an equal constant in the switch's join block
+        // and read there on the paths that skipped it (a `#[repr(u16)]`
+        // enum's `65535` case at -O2).
+        let case_regs: Vec<Option<VReg>> = cases
+            .iter()
+            .map(|(case_val, _)| {
+                if (0..=0xFFF).contains(case_val) {
+                    return None;
+                }
                 let class = if is_32 {
                     RegClass::Gpr32
                 } else {
@@ -9123,14 +11059,27 @@ impl InstructionSelector {
                 };
                 let case_vreg = self.new_vreg(class);
                 self.emit_iconst_materialization(block, case_vreg, &sel_ty, *case_val);
+                Some(case_vreg)
+            })
+            .collect();
 
-                self.emit(
+        // For each case: CMP selector, case then B.EQ target
+        for ((case_val, target), case_reg) in cases.iter().zip(case_regs) {
+            match case_reg {
+                None => self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::CmpRI,
+                        vec![selector.clone(), ISelOperand::Imm(*case_val)],
+                    ),
+                ),
+                Some(case_vreg) => self.emit(
                     block,
                     ISelInst::new(
                         AArch64Opcode::CmpRR,
                         vec![selector.clone(), ISelOperand::VReg(case_vreg)],
                     ),
-                );
+                ),
             }
 
             // B.EQ target_block
@@ -9187,6 +11136,14 @@ impl InstructionSelector {
     ) -> Result<(), ISelError> {
         Self::require_args(inst, 1, "Load")?;
         Self::require_result(inst, "Load")?;
+
+        // An aggregate is its address in LIR; the scalar path below would load
+        // the aggregate's first eight bytes and bind them as that address (see
+        // `Type::whole_aggregate_memory_access_refusal`). Refused before any
+        // operand is used or instruction emitted.
+        if let Some(refusal) = ty.whole_aggregate_memory_access_refusal(false, volatile) {
+            return Err(ISelError::UnsupportedOpcode(refusal));
+        }
 
         let addr_val = inst.args[0];
         let result_val = inst.results[0];
@@ -9272,8 +11229,55 @@ impl InstructionSelector {
             self.emit(block, inst);
         }
 
-        self.define_value(result_val, ISelOperand::VReg(dst), ty);
+        let result = self.loaded_memory_value(&ty, dst, block);
+        self.define_value(result_val, ISelOperand::VReg(result), ty);
         Ok(())
+    }
+
+    /// The register that holds the value a LIR `Load`/`VolatileLoad`/
+    /// `AtomicLoad` of `ty` defines, given the register `loaded` its one
+    /// memory access wrote.
+    ///
+    /// A `B1` load reads the byte `m` and defines the bool `m != 0`: that is
+    /// trust-ir's `Load Bool` (its reference interpreter decodes a stored bool
+    /// byte as `byte != 0`), which the adapter lowers to LIR `Load B1`
+    /// unchanged, and no trust-ir or LIR rule says the byte is 0 or 1. LDRB
+    /// and LDARB return the byte itself, so
+    ///
+    /// ```text
+    /// tst  x, #0xff    Z = (m == 0), reading exactly the low byte
+    /// cset b, ne       b = (m != 0), 0 or 1 in the whole register
+    /// ```
+    ///
+    /// after the one memory access, which keeps its opcode (a volatile or
+    /// atomic load stays exactly one architectural access). The NZCV write is
+    /// dead: no selection keeps NZCV live across a LIR instruction (the i128
+    /// overflow idiom's deferred `B.VS` requires that nothing but its own
+    /// skipped intermediates lies between its `ADDS` and the branch). Every
+    /// other type is the loaded register itself.
+    fn loaded_memory_value(&mut self, ty: &Type, loaded: VReg, block: Block) -> VReg {
+        if *ty != Type::B1 {
+            return loaded;
+        }
+        self.emit(
+            block,
+            ISelInst::new(
+                AArch64Opcode::Tst,
+                vec![ISelOperand::VReg(loaded), ISelOperand::Imm(0xFF)],
+            ),
+        );
+        let truth = self.new_vreg(reg_class_for_type(&Type::B1));
+        self.emit(
+            block,
+            ISelInst::new(
+                AArch64Opcode::CSet,
+                vec![
+                    ISelOperand::VReg(truth),
+                    ISelOperand::CondCode(AArch64CC::NE),
+                ],
+            ),
+        );
+        truth
     }
 
     /// Select a memory store.
@@ -9286,6 +11290,12 @@ impl InstructionSelector {
         block: Block,
     ) -> Result<(), ISelError> {
         Self::require_args(inst, 2, "Store")?;
+
+        // See the aggregate gate in `select_load`: the scalar path below would
+        // store one X register — the aggregate's ADDRESS — over its bytes.
+        if let Some(refusal) = ty.whole_aggregate_memory_access_refusal(true, volatile) {
+            return Err(ISelError::UnsupportedOpcode(refusal));
+        }
 
         let value_val = inst.args[0];
         let addr_val = inst.args[1];
@@ -9367,29 +11377,124 @@ impl InstructionSelector {
     fn select_atomic_load(
         &mut self,
         ty: Type,
-        _ordering: AtomicOrdering,
+        ordering: AtomicOrdering,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), ISelError> {
         Self::require_args(inst, 1, "AtomicLoad")?;
         Self::require_result(inst, "AtomicLoad")?;
 
+        // A 128-bit atomic load: ONE paired access plus the ordering barriers.
+        //
+        // This is NOT the `LDAR` shape and cannot be. `LDAR` carries acquire
+        // ordering in the instruction, which is why every ordering below maps to
+        // it; `LDP` carries NONE, so the ordering comes from SEPARATE barriers:
+        //     Relaxed   ldp
+        //     Acquire   ldp + dmb ishld
+        //     SeqCst    dmb ish + ldp + dmb ish
+        // The trailing barrier is `select_fence`'s map for the ordering.
+        //
+        // The LEADING `dmb ish` of the SeqCst form is deliberately stronger
+        // than LLVM's `ldp; dmb ish`. A SeqCst load must be ordered after every
+        // earlier SeqCst store of the same thread. This backend's SeqCst stores
+        // end in a store-release (STLR, or the STLXP of the 128-bit LL/SC loop)
+        // with no trailing barrier, and a store-release orders a later read
+        // only when that read is itself a load-acquire. A plain `LDP` is not,
+        // so without the leading barrier the store-buffering outcome SeqCst
+        // forbids is allowed — and it was observed on this host's M4 with the
+        // backend's own SeqCst 128-bit store (L03-P3; see
+        // `trust_cg_verify::aarch64_memory_order`, which refuses the
+        // barrier-free form as `MissingSeqCstEntry`).
+        //
+        // SINGLE-COPY ATOMICITY is what makes the paired access legitimate, and
+        // it is CONDITIONAL: an aligned `LDP` is single-copy atomic only under
+        // FEAT_LSE2. Without it the pair can TEAR, and a torn read is invisible
+        // to every differential test here — it only manifests under concurrency.
+        // So this path is taken ONLY when the resolved target profile admits LSE2
+        // (every Apple core does — `APPLE_ARM64` admits it, and that is what LLVM
+        // emits there); without it the LDXP/STXP pair pseudo below is single-copy
+        // atomic on every profile, at the cost of an exclusive pair instead of one
+        // plain LDP. Both lowerings are measured against LLVM; this is the fast
+        // path and the pseudo is the portable one.
+        // The obligation that the LOWERING is one access rather than two is
+        // `AtomicLoad_I128: single-copy (one paired access)` in `atomic_proofs`,
+        // whose negative control (a split lowering) is REFUTED.
+        if ty == Type::I128 && self.lse2_enabled {
+            // The same fail-closed preconditions `select_atomic_load128` applies
+            // on every other profile, checked BEFORE emission: Release/AcqRel
+            // are not load orderings (`select_fence` would otherwise accept them
+            // and emit a load with a release barrier), and LDP's base must be a register.
+            if !ordering.is_legal_for_load() {
+                return Err(ISelError::UnsupportedOpcode(format!(
+                    "AtomicLoad I128 with {ordering:?}: not a valid load ordering — fail closed"
+                )));
+            }
+            let addr_val = inst.args[0];
+            let result_val = inst.results[0];
+            let addr = self.use_value(&addr_val)?;
+            if !Self::llsc_register_operand(&addr) {
+                return Err(ISelError::UnsupportedOpcode(
+                    "AtomicLoad I128: LDP address must be a register — fail closed".into(),
+                ));
+            }
+            let lo = self.new_vreg(RegClass::Gpr64);
+            let hi = self.new_vreg(RegClass::Gpr64);
+            if ordering == AtomicOrdering::SeqCst {
+                // The SeqCst entry barrier (see above): orders every earlier
+                // access, a store-release included, before the paired read.
+                self.select_fence(AtomicOrdering::SeqCst, block)?;
+            }
+            // `LdpRI` operands are [Rt, Rt2, Rn] with an optional offset; the
+            // atomic form is at offset 0. LDP takes INDEPENDENT destination
+            // registers (the even/odd pair constraint belongs to `CASP`).
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::LdpRI,
+                    vec![ISelOperand::VReg(lo), ISelOperand::VReg(hi), addr],
+                ),
+            );
+            // The ordering half. `Relaxed` emits nothing, matching LLVM.
+            self.select_fence(ordering, block)?;
+            self.define_i128_value(result_val, lo, hi);
+            return Ok(());
+        }
+        if ty == Type::I128 {
+            // Single-copy-atomic 128-bit read on armv8.0: LDXP/STXP write-back
+            // loop through the opaque `LlscLoad128` pseudo (every profile without
+            // FEAT_LSE2; the LDP fast path above took the rest).
+            return self.select_atomic_load128(ordering, inst, block);
+        }
+
         // Only integer memory widths (b1/i8/i16/i32/i64) have a sound LDAR
         // lowering. Fail closed for every other type rather than fall through to
         // the `_ => Ldar` arm below:
-        //   * I128/V128 need single-copy-atomic 128-bit access (LDXP/CASP);
-        //     a 64-bit LDAR is wrong atomic semantics (and V128 the wrong bank).
+        //   * I128 returned above through the LDXP/STXP pair pseudo. V128 has
+        //     no atomic lowering: a 64-bit LDAR is wrong atomic semantics and
+        //     the wrong register bank.
         //   * A float type (F16/F32/F64) is classified into an FPR vreg by
         //     `reg_class_for_type`, but LDAR has no FP form; the encoder writes
         //     the FPR hw number into LDAR's GPR field with no bank check, so
         //     `LDAR S5` would encode bit-identically as `LDAR X5` — the wrong
         //     register file. (Mirror of the AtomicRmw integer-only coverage.)
         //   * Aggregates have no atomic-load lowering at all.
+
         if !matches!(ty, Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64) {
             return Err(ISelError::UnsupportedOpcode(format!(
                 "AtomicLoad {ty:?}: only integer memory widths (b1/i8/i16/i32/i64) are lowered; \
-                 128-bit needs LDXP/CASP and a float/vector atomic would encode into LDAR's GPR \
+                 i128 uses the LDXP/STXP pair pseudo and a float/vector atomic would encode into LDAR's GPR \
                  field (wrong register file) — fail closed"
+            )));
+        }
+
+        // Release/AcqRel are not load orderings: the C11/Rust -> AArch64
+        // mapping has no row for them, so they are refused by name here
+        // rather than silently selected as LDAR (the adapter refuses them
+        // first; this keeps a direct LIR caller fail-closed too).
+        if !ordering.is_legal_for_load() {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "AtomicLoad {ty:?} with {ordering:?}: not a valid load ordering (no C11/Rust \
+                 -> AArch64 mapping row) — fail closed"
             )));
         }
 
@@ -9416,7 +11521,10 @@ impl InstructionSelector {
             ISelInst::new(opc, vec![ISelOperand::VReg(dst), addr]),
         );
 
-        self.define_value(result_val, ISelOperand::VReg(dst), ty);
+        // A `B1`'s normalization is register operations after the one
+        // acquire access.
+        let result = self.loaded_memory_value(&ty, dst, block);
+        self.define_value(result_val, ISelOperand::VReg(result), ty);
         Ok(())
     }
 
@@ -9428,17 +11536,24 @@ impl InstructionSelector {
     fn select_atomic_store(
         &mut self,
         ty: Type,
-        _ordering: AtomicOrdering,
+        ordering: AtomicOrdering,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), ISelError> {
         Self::require_args(inst, 2, "AtomicStore")?;
 
+        if ty == Type::I128 {
+            // Single-copy-atomic 128-bit write on armv8.0: LDXP/STXP retry
+            // loop through the opaque `LlscStore128` pseudo (every profile).
+            return self.select_atomic_store128(ordering, inst, block);
+        }
+
         // Only integer memory widths (b1/i8/i16/i32/i64) have a sound STLR
         // lowering. Fail closed for every other type rather than fall through to
         // `_ => Stlr` below:
-        //   * I128/V128 need STXP/CASP (single-copy-atomic 128-bit access); a
-        //     64-bit STLR stores only the low half (and V128 from the wrong bank).
+        //   * I128 returned above through the LDXP/STXP pair pseudo. V128 has
+        //     no atomic lowering: a 64-bit STLR stores only the low half, from
+        //     the wrong register bank.
         //   * A float type (F16/F32/F64) is classified into an FPR vreg by
         //     `reg_class_for_type`, but STLR has no FP form; the encoder writes
         //     the FPR hw number into STLR's GPR field with no bank check, so
@@ -9448,8 +11563,17 @@ impl InstructionSelector {
         if !matches!(ty, Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64) {
             return Err(ISelError::UnsupportedOpcode(format!(
                 "AtomicStore {ty:?}: only integer memory widths (b1/i8/i16/i32/i64) are lowered; \
-                 128-bit needs STXP/CASP and a float/vector atomic would encode into STLR's GPR \
+                 i128 uses the LDXP/STXP pair pseudo and a float/vector atomic would encode into STLR's GPR \
                  field (wrong register file) — fail closed"
+            )));
+        }
+
+        // Acquire/AcqRel are not store orderings: no mapping row, refused by
+        // name (mirror of the load gate above and of the 128-bit path).
+        if !ordering.is_legal_for_store() {
+            return Err(ISelError::UnsupportedOpcode(format!(
+                "AtomicStore {ty:?} with {ordering:?}: not a valid store ordering (no C11/Rust \
+                 -> AArch64 mapping row) — fail closed"
             )));
         }
 
@@ -9485,14 +11609,17 @@ impl InstructionSelector {
         Self::require_args(inst, 2, "AtomicRmw")?;
         Self::require_result(inst, "AtomicRmw")?;
 
+        if ty == Type::I128 {
+            // No admitted profile has a single-instruction 128-bit RMW; every
+            // profile uses the LDXP/STXP pair pseudo.
+            return self.select_atomic_rmw128(op, ordering, inst, block);
+        }
         Self::require_aarch64_atomic_rmw_lse_coverage(op, &ty, ordering)?;
         if !self.lse_enabled {
-            return Err(ISelError::UnsupportedAtomicRmw {
-                op,
-                ty,
-                ordering,
-                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
-            });
+            // Baseline armv8.0: no single-instruction atomics. Select the
+            // opaque LL/SC pseudo; it is expanded into a retry loop only
+            // after register allocation (see `trust_cg_ir::llsc`).
+            return self.select_atomic_rmw_llsc(op, ty, ordering, inst, block);
         }
 
         let val_val = inst.args[0];
@@ -9614,13 +11741,407 @@ impl InstructionSelector {
         // i32/i64 omit it and the encoder derives the size from the register.
         let mut operands = vec![actual_val, ISelOperand::VReg(dst), addr];
         match ty {
-            Type::I8 => operands.push(ISelOperand::Imm(0)),
+            Type::B1 | Type::I8 => operands.push(ISelOperand::Imm(0)),
             Type::I16 => operands.push(ISelOperand::Imm(1)),
             _ => {}
         }
         self.emit(block, ISelInst::new(opc, operands));
 
         self.define_value(result_val, ISelOperand::VReg(dst), ty);
+        Ok(())
+    }
+
+    /// Width of an LL/SC atomic memory access for an admitted integer carrier.
+    /// `B1` is one byte in memory even though its value carrier is Gpr64.
+    fn llsc_width_for_type(ty: &Type) -> Option<trust_cg_ir::llsc::LlscWidth> {
+        use trust_cg_ir::llsc::LlscWidth;
+        match ty {
+            Type::B1 | Type::I8 => Some(LlscWidth::B8),
+            Type::I16 => Some(LlscWidth::B16),
+            Type::I32 => Some(LlscWidth::B32),
+            Type::I64 => Some(LlscWidth::B64),
+            _ => None,
+        }
+    }
+
+    /// The acquire/release choice for an LL/SC loop. SeqCst uses the
+    /// LDAXR/STLXR pair, the armv8.0 mapping LLVM and GCC emit (both
+    /// exclusives are RCsc); no extra DMB is added or required.
+    fn llsc_ordering(ordering: AtomicOrdering) -> trust_cg_ir::llsc::LlscOrdering {
+        use trust_cg_ir::llsc::LlscOrdering;
+        match ordering {
+            AtomicOrdering::Relaxed => LlscOrdering::RELAXED,
+            AtomicOrdering::Acquire => LlscOrdering::ACQUIRE,
+            AtomicOrdering::Release => LlscOrdering::RELEASE,
+            AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => LlscOrdering::ACQ_REL,
+        }
+    }
+
+    /// An LL/SC pseudo operand must already be a register: the post-RA
+    /// expansion encodes it directly into exclusive/ALU instructions.
+    fn llsc_register_operand(operand: &ISelOperand) -> bool {
+        matches!(operand, ISelOperand::VReg(_) | ISelOperand::PReg(_))
+    }
+
+    /// Baseline (non-LSE) `AtomicRmw`: one opaque `LlscRmw{8,16,32,64}`
+    /// pseudo `[old, new, status, value, addr, op, ordering]`. The three
+    /// leading operands are fresh definitions, so the allocator's def/use
+    /// interference keeps them distinct from the value and address inputs
+    /// the retry loop re-reads on every iteration.
+    fn select_atomic_rmw_llsc(
+        &mut self,
+        op: AtomicRmwOp,
+        ty: Type,
+        ordering: AtomicOrdering,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        use trust_cg_ir::llsc::{LlscPseudo, LlscRmwOp};
+        // The caller's coverage check already limits Bool to xchg/and/or/xor.
+        let Some(width) = Self::llsc_width_for_type(&ty) else {
+            return Err(ISelError::UnsupportedAtomicRmw {
+                op,
+                ty,
+                ordering,
+                reason: "LL/SC AtomicRmw is only lowered for b1/i8/i16/i32/i64 memory widths",
+            });
+        };
+        let llsc_op = match op {
+            AtomicRmwOp::Add => LlscRmwOp::Add,
+            AtomicRmwOp::Sub => LlscRmwOp::Sub,
+            AtomicRmwOp::And => LlscRmwOp::And,
+            AtomicRmwOp::Or => LlscRmwOp::Or,
+            AtomicRmwOp::Xor => LlscRmwOp::Xor,
+            AtomicRmwOp::Xchg => LlscRmwOp::Xchg,
+            AtomicRmwOp::Max => LlscRmwOp::Smax,
+            AtomicRmwOp::Min => LlscRmwOp::Smin,
+            AtomicRmwOp::UMax => LlscRmwOp::Umax,
+            AtomicRmwOp::UMin => LlscRmwOp::Umin,
+        };
+
+        let value = self.use_value(&inst.args[0])?;
+        let addr = self.use_value(&inst.args[1])?;
+        if !Self::llsc_register_operand(&value) || !Self::llsc_register_operand(&addr) {
+            return Err(ISelError::UnsupportedAtomicRmw {
+                op,
+                ty,
+                ordering,
+                reason: "LL/SC AtomicRmw value and address must be register operands",
+            });
+        }
+        let class = reg_class_for_type(&ty);
+        let old = self.new_vreg(class);
+        let new = self.new_vreg(class);
+        let status = self.new_vreg(RegClass::Gpr32);
+        self.emit(
+            block,
+            ISelInst::new(
+                LlscPseudo::Rmw(width).opcode(),
+                vec![
+                    ISelOperand::VReg(old),
+                    ISelOperand::VReg(new),
+                    ISelOperand::VReg(status),
+                    value,
+                    addr,
+                    ISelOperand::Imm(llsc_op.to_imm()),
+                    ISelOperand::Imm(Self::llsc_ordering(ordering).to_imm()),
+                ],
+            ),
+        );
+        self.define_value(inst.results[0], ISelOperand::VReg(old), ty);
+        Ok(())
+    }
+
+    /// Baseline (non-LSE) `CmpXchg`: one opaque `LlscCmpSwap{8,16,32,64}`
+    /// pseudo `[old, status, expected, desired, addr, ordering]`. The caller
+    /// has already validated the failure ordering; the success ordering is
+    /// lifted to cover it, so the load is acquiring whenever either path
+    /// requires acquire and the store is releasing whenever success does.
+    fn select_cmpxchg_llsc(
+        &mut self,
+        ty: Type,
+        success: AtomicOrdering,
+        failure: AtomicOrdering,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        use trust_cg_ir::llsc::LlscPseudo;
+        let Some(width) = Self::llsc_width_for_type(&ty) else {
+            return Err(ISelError::UnsupportedCmpXchg {
+                ty,
+                success,
+                failure,
+                reason: "LL/SC compare-exchange is only lowered for b1/i8/i16/i32/i64 memory widths",
+            });
+        };
+        let lifted = success.lift_for_cmpxchg_failure(failure);
+        let expected = self.use_value(&inst.args[0])?;
+        let desired = self.use_value(&inst.args[1])?;
+        let addr = self.use_value(&inst.args[2])?;
+        if ![&expected, &desired, &addr]
+            .into_iter()
+            .all(Self::llsc_register_operand)
+        {
+            return Err(ISelError::UnsupportedCmpXchg {
+                ty,
+                success,
+                failure,
+                reason: "LL/SC compare-exchange operands must be registers",
+            });
+        }
+        let old = self.new_vreg(reg_class_for_type(&ty));
+        let status = self.new_vreg(RegClass::Gpr32);
+        self.emit(
+            block,
+            ISelInst::new(
+                LlscPseudo::CmpSwap(width).opcode(),
+                vec![
+                    ISelOperand::VReg(old),
+                    ISelOperand::VReg(status),
+                    expected,
+                    desired,
+                    addr,
+                    ISelOperand::Imm(Self::llsc_ordering(lifted).to_imm()),
+                ],
+            ),
+        );
+        self.define_value(inst.results[0], ISelOperand::VReg(old), ty);
+        Ok(())
+    }
+
+    /// Pair operands of an i128 value, required to be registers.
+    fn llsc_i128_operands(
+        &mut self,
+        value: &Value,
+    ) -> Result<Option<(ISelOperand, ISelOperand)>, ISelError> {
+        let (lo, hi) = self.use_i128_value(value)?;
+        Ok(
+            (Self::llsc_register_operand(&lo) && Self::llsc_register_operand(&hi))
+                .then_some((lo, hi)),
+        )
+    }
+
+    /// 128-bit atomic load: `LlscLoad128 [lo, hi, status, addr, ordering]`.
+    /// Relaxed uses LDXP/STXP, Acquire LDAXP/STXP and SeqCst LDAXP/STLXP,
+    /// the LLVM armv8.0 mapping. Release/AcqRel are not load orderings.
+    fn select_atomic_load128(
+        &mut self,
+        ordering: AtomicOrdering,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        use trust_cg_ir::llsc::{LlscOrdering, LlscPseudo};
+        let llsc_ordering = match ordering {
+            AtomicOrdering::Relaxed => LlscOrdering::RELAXED,
+            AtomicOrdering::Acquire => LlscOrdering::ACQUIRE,
+            AtomicOrdering::SeqCst => LlscOrdering::ACQ_REL,
+            AtomicOrdering::Release | AtomicOrdering::AcqRel => {
+                return Err(ISelError::UnsupportedOpcode(format!(
+                    "AtomicLoad I128 with {ordering:?}: not a valid load ordering — fail closed"
+                )));
+            }
+        };
+        let addr = self.use_value(&inst.args[0])?;
+        if !Self::llsc_register_operand(&addr) {
+            return Err(ISelError::UnsupportedOpcode(
+                "AtomicLoad I128: LL/SC address must be a register — fail closed".into(),
+            ));
+        }
+        let lo = self.new_vreg(RegClass::Gpr64);
+        let hi = self.new_vreg(RegClass::Gpr64);
+        let status = self.new_vreg(RegClass::Gpr32);
+        self.emit(
+            block,
+            ISelInst::new(
+                LlscPseudo::Load128.opcode(),
+                vec![
+                    ISelOperand::VReg(lo),
+                    ISelOperand::VReg(hi),
+                    ISelOperand::VReg(status),
+                    addr,
+                    ISelOperand::Imm(llsc_ordering.to_imm()),
+                ],
+            ),
+        );
+        self.define_i128_value(inst.results[0], lo, hi);
+        Ok(())
+    }
+
+    /// 128-bit atomic store: `LlscStore128 [scratch_lo, scratch_hi, status,
+    /// value_lo, value_hi, addr, ordering]`. Relaxed uses LDXP/STXP, Release
+    /// LDXP/STLXP and SeqCst LDAXP/STLXP. Acquire/AcqRel are not store
+    /// orderings.
+    fn select_atomic_store128(
+        &mut self,
+        ordering: AtomicOrdering,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        use trust_cg_ir::llsc::{LlscOrdering, LlscPseudo};
+        let llsc_ordering = match ordering {
+            AtomicOrdering::Relaxed => LlscOrdering::RELAXED,
+            AtomicOrdering::Release => LlscOrdering::RELEASE,
+            AtomicOrdering::SeqCst => LlscOrdering::ACQ_REL,
+            AtomicOrdering::Acquire | AtomicOrdering::AcqRel => {
+                return Err(ISelError::UnsupportedOpcode(format!(
+                    "AtomicStore I128 with {ordering:?}: not a valid store ordering — fail closed"
+                )));
+            }
+        };
+        let Some((value_lo, value_hi)) = self.llsc_i128_operands(&inst.args[0])? else {
+            return Err(ISelError::UnsupportedOpcode(
+                "AtomicStore I128: LL/SC value halves must be registers — fail closed".into(),
+            ));
+        };
+        let addr = self.use_value(&inst.args[1])?;
+        if !Self::llsc_register_operand(&addr) {
+            return Err(ISelError::UnsupportedOpcode(
+                "AtomicStore I128: LL/SC address must be a register — fail closed".into(),
+            ));
+        }
+        let scratch_lo = self.new_vreg(RegClass::Gpr64);
+        let scratch_hi = self.new_vreg(RegClass::Gpr64);
+        let status = self.new_vreg(RegClass::Gpr32);
+        self.emit(
+            block,
+            ISelInst::new(
+                LlscPseudo::Store128.opcode(),
+                vec![
+                    ISelOperand::VReg(scratch_lo),
+                    ISelOperand::VReg(scratch_hi),
+                    ISelOperand::VReg(status),
+                    value_lo,
+                    value_hi,
+                    addr,
+                    ISelOperand::Imm(llsc_ordering.to_imm()),
+                ],
+            ),
+        );
+        Ok(())
+    }
+
+    /// 128-bit `AtomicRmw`: `LlscRmw128 [old_lo, old_hi, new_lo, new_hi,
+    /// status, value_lo, value_hi, addr, op, ordering]`.
+    fn select_atomic_rmw128(
+        &mut self,
+        op: AtomicRmwOp,
+        ordering: AtomicOrdering,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        use trust_cg_ir::llsc::{LlscPseudo, LlscRmwOp, LlscWidth};
+        let llsc_op = match op {
+            AtomicRmwOp::Add => LlscRmwOp::Add,
+            AtomicRmwOp::Sub => LlscRmwOp::Sub,
+            AtomicRmwOp::And => LlscRmwOp::And,
+            AtomicRmwOp::Or => LlscRmwOp::Or,
+            AtomicRmwOp::Xor => LlscRmwOp::Xor,
+            AtomicRmwOp::Xchg => LlscRmwOp::Xchg,
+            AtomicRmwOp::Max => LlscRmwOp::Smax,
+            AtomicRmwOp::Min => LlscRmwOp::Smin,
+            AtomicRmwOp::UMax => LlscRmwOp::Umax,
+            AtomicRmwOp::UMin => LlscRmwOp::Umin,
+        };
+        let Some((value_lo, value_hi)) = self.llsc_i128_operands(&inst.args[0])? else {
+            return Err(ISelError::UnsupportedAtomicRmw {
+                op,
+                ty: Type::I128,
+                ordering,
+                reason: "LL/SC 128-bit AtomicRmw value halves must be registers",
+            });
+        };
+        let addr = self.use_value(&inst.args[1])?;
+        if !Self::llsc_register_operand(&addr) {
+            return Err(ISelError::UnsupportedAtomicRmw {
+                op,
+                ty: Type::I128,
+                ordering,
+                reason: "LL/SC 128-bit AtomicRmw address must be a register",
+            });
+        }
+        let old_lo = self.new_vreg(RegClass::Gpr64);
+        let old_hi = self.new_vreg(RegClass::Gpr64);
+        let new_lo = self.new_vreg(RegClass::Gpr64);
+        let new_hi = self.new_vreg(RegClass::Gpr64);
+        let status = self.new_vreg(RegClass::Gpr32);
+        self.emit(
+            block,
+            ISelInst::new(
+                LlscPseudo::Rmw(LlscWidth::B128).opcode(),
+                vec![
+                    ISelOperand::VReg(old_lo),
+                    ISelOperand::VReg(old_hi),
+                    ISelOperand::VReg(new_lo),
+                    ISelOperand::VReg(new_hi),
+                    ISelOperand::VReg(status),
+                    value_lo,
+                    value_hi,
+                    addr,
+                    ISelOperand::Imm(llsc_op.to_imm()),
+                    ISelOperand::Imm(Self::llsc_ordering(ordering).to_imm()),
+                ],
+            ),
+        );
+        self.define_i128_value(inst.results[0], old_lo, old_hi);
+        Ok(())
+    }
+
+    /// 128-bit `CmpXchg`: `LlscCmpSwap128 [old_lo, old_hi, status,
+    /// expected_lo, expected_hi, desired_lo, desired_hi, addr, ordering]`
+    /// with the success ordering lifted to cover the (validated) failure
+    /// ordering.
+    fn select_cmpxchg128(
+        &mut self,
+        success: AtomicOrdering,
+        failure: AtomicOrdering,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
+        use trust_cg_ir::llsc::{LlscPseudo, LlscWidth};
+        let lifted = success.lift_for_cmpxchg_failure(failure);
+        let closed = |reason| ISelError::UnsupportedCmpXchg {
+            ty: Type::I128,
+            success,
+            failure,
+            reason,
+        };
+        let Some((expected_lo, expected_hi)) = self.llsc_i128_operands(&inst.args[0])? else {
+            return Err(closed(
+                "LL/SC 128-bit compare-exchange operands must be registers",
+            ));
+        };
+        let Some((desired_lo, desired_hi)) = self.llsc_i128_operands(&inst.args[1])? else {
+            return Err(closed(
+                "LL/SC 128-bit compare-exchange operands must be registers",
+            ));
+        };
+        let addr = self.use_value(&inst.args[2])?;
+        if !Self::llsc_register_operand(&addr) {
+            return Err(closed(
+                "LL/SC 128-bit compare-exchange operands must be registers",
+            ));
+        }
+        let old_lo = self.new_vreg(RegClass::Gpr64);
+        let old_hi = self.new_vreg(RegClass::Gpr64);
+        let status = self.new_vreg(RegClass::Gpr32);
+        self.emit(
+            block,
+            ISelInst::new(
+                LlscPseudo::CmpSwap(LlscWidth::B128).opcode(),
+                vec![
+                    ISelOperand::VReg(old_lo),
+                    ISelOperand::VReg(old_hi),
+                    ISelOperand::VReg(status),
+                    expected_lo,
+                    expected_hi,
+                    desired_lo,
+                    desired_hi,
+                    addr,
+                    ISelOperand::Imm(Self::llsc_ordering(lifted).to_imm()),
+                ],
+            ),
+        );
+        self.define_i128_value(inst.results[0], old_lo, old_hi);
         Ok(())
     }
 
@@ -9635,12 +12156,29 @@ impl InstructionSelector {
             // the encoder uses for the `size` field, since the W register class
             // alone cannot distinguish byte/half/word.
             Type::I8 | Type::I16 | Type::I32 | Type::I64 => {}
+            // Bool is one byte in memory holding 0 or 1. Exchange and the
+            // bitwise ops keep that invariant for 0/1 operands and lower as
+            // byte atomics (Gpr64 value carrier, byte access size); the
+            // arithmetic and min/max ops have no Rust/LLVM Bool meaning.
+            Type::B1
+                if matches!(
+                    op,
+                    AtomicRmwOp::Xchg | AtomicRmwOp::And | AtomicRmwOp::Or | AtomicRmwOp::Xor
+                ) => {}
+            Type::B1 => {
+                return Err(ISelError::UnsupportedAtomicRmw {
+                    op,
+                    ty: ty.clone(),
+                    ordering,
+                    reason: "Bool AtomicRmw admits only xchg/and/or/xor",
+                });
+            }
             Type::I128 => {
                 return Err(ISelError::UnsupportedAtomicRmw {
                     op,
                     ty: ty.clone(),
                     ordering,
-                    reason: "128-bit AtomicRmw needs paired-register atomic lowering and proof coverage",
+                    reason: "128-bit AtomicRmw is lowered only through the LL/SC pair pseudo",
                 });
             }
             _ => {
@@ -9689,11 +12227,26 @@ impl InstructionSelector {
         Self::require_args(inst, 3, "CmpXchg")?;
         Self::require_result(inst, "CmpXchg")?;
 
+        if ty == Type::I128 {
+            if !failure.is_valid_cmpxchg_failure() {
+                return Err(ISelError::UnsupportedCmpXchg {
+                    ty,
+                    success,
+                    failure,
+                    reason: "invalid compare-exchange failure ordering",
+                });
+            }
+            // CASP is not used: every profile lowers 128-bit compare-exchange
+            // through the LDXP/STXP pair pseudo with a write-back on failure.
+            return self.select_cmpxchg128(success, failure, inst, block);
+        }
+
         // Only integer memory widths (b1/i8/i16/i32/i64) have a sound CAS
         // lowering. Fail closed for every other type rather than let the body
         // below emit a CAS over the wrong data:
-        //   * I128/V128 need CASP (or an LDXP/STXP loop); a 64-bit CAS compares
-        //     only the low halves — wrong atomic semantics.
+        //   * I128 returned above through the LDXP/STXP pair pseudo. V128 has
+        //     no compare-exchange lowering; a 64-bit CAS compares only the low
+        //     halves — wrong atomic semantics.
         //   * A float type (F16/F32/F64) is classified into an FPR vreg by
         //     `reg_class_for_type`, but CAS has no FP form; the encoder writes
         //     the FPR hw number into CAS's GPR fields with no bank check — the
@@ -9705,8 +12258,9 @@ impl InstructionSelector {
                 ty,
                 success,
                 failure,
-                reason: "only integer memory widths (b1/i8/i16/i32/i64) are lowered; 128-bit needs \
-                         CASP and a float/vector compare-exchange would use the wrong register file",
+                reason: "only integer memory widths (b1/i8/i16/i32/i64) are lowered; i128 uses the \
+                         LDXP/STXP pair pseudo and a float/vector compare-exchange would use the \
+                         wrong register file",
             });
         }
 
@@ -9726,12 +12280,9 @@ impl InstructionSelector {
         }
 
         if !self.lse_enabled {
-            return Err(ISelError::UnsupportedCmpXchg {
-                ty,
-                success,
-                failure,
-                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
-            });
+            // Baseline armv8.0: select the opaque LL/SC compare-and-swap
+            // pseudo, expanded into a retry loop after register allocation.
+            return self.select_cmpxchg_llsc(ty, success, failure, inst, block);
         }
 
         // The CAS-family opcode choice below assumes `failure <= success`:
@@ -9789,12 +12340,13 @@ impl InstructionSelector {
         };
 
         // CAS Rs, Rt, [Xn]: Rs (expected/result), Rt (desired), Xn (address).
-        // Narrow (i8/i16) memory widths append an access-size immediate
-        // (0=byte, 1=half) for the encoder, since Rs/Rt are W registers for
-        // i8/i16/i32 alike — see select_atomic_rmw.
+        // Boolean/byte/half memory widths append an access-size immediate
+        // (0=byte, 1=half). B1 deliberately uses Gpr64 for its value carrier,
+        // but its memory representation is one byte, not an eight-byte CAS.
+        // I8/I16/I32 likewise share a register class despite different widths.
         let mut operands = vec![ISelOperand::VReg(dst), desired, addr];
         match ty {
-            Type::I8 => operands.push(ISelOperand::Imm(0)),
+            Type::B1 | Type::I8 => operands.push(ISelOperand::Imm(0)),
             Type::I16 => operands.push(ISelOperand::Imm(1)),
             _ => {}
         }
@@ -9807,17 +12359,31 @@ impl InstructionSelector {
 
     /// Select a memory fence: DMB.
     ///
-    /// DMB with option field:
-    ///   - SeqCst/AcqRel: DMB ISH (0xB) — inner-shareable full barrier
-    ///   - Acquire: DMB ISHLD (0x9) — inner-shareable load barrier
-    ///   - Release: DMB ISHST (0xA) — inner-shareable store barrier
-    ///   - Relaxed: NOP (no barrier needed)
+    /// The barrier must order every access pair the C11/Rust fence orders:
+    ///
+    /// | fence   | orders                     | barrier            |
+    /// |---------|----------------------------|--------------------|
+    /// | Acquire | R->R, R->W                 | DMB ISHLD (0x9)    |
+    /// | Release | R->W, W->W                 | DMB ISH   (0xB)    |
+    /// | AcqRel  | R->R, R->W, W->W           | DMB ISH   (0xB)    |
+    /// | SeqCst  | all four, W->R included    | DMB ISH   (0xB)    |
+    /// | Relaxed | nothing                    | no instruction     |
+    ///
+    /// A RELEASE fence is DMB ISH, never DMB ISHST: ISHST orders only
+    /// W->W, so a load before the fence could be satisfied after a store
+    /// that follows it, which `fence(Release)` forbids (the load-buffering
+    /// shape). This is the mapping LLVM implements (`dmb ish` for release,
+    /// measured with Apple clang 21 on this target). The decoded-word
+    /// conformance check is `trust_cg_verify::aarch64_memory_order` (L03-P3).
+    ///
+    /// `compiler_fence` has no separate trust-ir instruction (the bridge
+    /// lowers it to `Inst::Fence`), so it gets the same hardware barrier:
+    /// stronger than a single-thread fence needs, never weaker.
     fn select_fence(&mut self, ordering: AtomicOrdering, block: Block) -> Result<(), ISelError> {
         let option = match ordering {
-            AtomicOrdering::SeqCst | AtomicOrdering::AcqRel => 0x0B, // ISH
-            AtomicOrdering::Acquire => 0x09,                         // ISHLD
-            AtomicOrdering::Release => 0x0A,                         // ISHST
-            AtomicOrdering::Relaxed => return Ok(()),                // No barrier needed
+            AtomicOrdering::SeqCst | AtomicOrdering::AcqRel | AtomicOrdering::Release => 0x0B, // ISH
+            AtomicOrdering::Acquire => 0x09,          // ISHLD
+            AtomicOrdering::Relaxed => return Ok(()), // No barrier needed
         };
 
         self.emit(
@@ -9830,12 +12396,6 @@ impl InstructionSelector {
     // -----------------------------------------------------------------------
     // Aggregate operations
     // -----------------------------------------------------------------------
-
-    /// Select a struct field address computation (GEP-like).
-    ///
-    /// Given a pointer to a struct and a field index, compute:
-    ///   result = base + offset_of(struct_ty, field_index)
-    ///
 
     /// `dst = base + off` for a NON-NEGATIVE constant byte offset, choosing an
     /// encodable form.
@@ -9853,13 +12413,12 @@ impl InstructionSelector {
     /// which the bridge surfaces as a hard compile decline. `[i64; 576]` reaches
     /// it: element 512 sits at byte 4096. The four forms, in order of cost:
     ///
-    ///   * `off == 0`                  -> `MOV`
-    ///   * one `ADD #imm{, LSL #12}`   -> via `aarch64_add_imm12_form`
-    ///   * both 12-bit halves set      -> `ADD #hi, LSL #12` then `ADD #lo`,
-    ///                                    the same two-add shape the local-exec
-    ///                                    TLS path uses, good to 24 bits
-    ///   * anything larger             -> materialize with `MOVZ`/`MOVK` into a
-    ///                                    scratch and `ADD` registers
+    ///   * `off == 0` -> `MOV`
+    ///   * one `ADD #imm{, LSL #12}` -> via `aarch64_add_imm12_form`
+    ///   * both 12-bit halves set -> `ADD #hi, LSL #12` then `ADD #lo`, the
+    ///     same two-add shape the local-exec TLS path uses, good to 24 bits
+    ///   * anything larger -> materialize with `MOVZ`/`MOVK` into a scratch
+    ///     and `ADD` registers
     ///
     /// The last case only arises for an aggregate over 16 MiB, but it is what
     /// makes this total: there is no offset this cannot encode, so no caller has
@@ -9919,6 +12478,11 @@ impl InstructionSelector {
         );
     }
 
+    /// Select a struct field address computation (GEP-like).
+    ///
+    /// Given a pointer to a struct and a field index, compute:
+    ///   result = base + offset_of(struct_ty, field_index)
+    ///
     /// For zero offset (field 0 with no padding), emits a MOV.
     /// Otherwise emits ADD Xd, base, #offset.
     fn select_struct_gep(
@@ -9970,8 +12534,7 @@ impl InstructionSelector {
     /// stride (elem_size == 1), emits a single `AddRR`. Otherwise emits
     /// `Movz` (materialise size), `MulRR`, `AddRR`.
     ///
-    /// Phase 1 aggregate lowering — see
-    /// `designs/2026-04-18-aggregate-lowering.md`.
+    /// Phase 1 aggregate lowering.
     fn select_array_gep(
         &mut self,
         elem_ty: Type,
@@ -10139,14 +12702,49 @@ impl InstructionSelector {
         // authoritative here: an aggregate value is represented by its address
         // in LIR, so its source value type must not trigger by-value aggregate
         // ABI expansion at this pointer-taking boundary.
-        self.select_call_with_arg_types(
-            "memcpy",
+        self.select_library_routine_call(
+            RuntimeSymbol::Memcpy,
             &inst.args,
             &[Type::I64, Type::I64, Type::I64],
-            &[],
-            &[],
             block,
         )
+    }
+
+    /// Call the C library routine `routine` for a LIR bulk-memory opcode and
+    /// mark the `Bl` `library_routine_call` (`InstFlags::LIBRARY_ROUTINE_CALL`):
+    /// this call is the routine, where a source call of a function that is
+    /// only named like it (an ordinary `Opcode::Call`) is not, and SROA's
+    /// memcpy-fill match reads the mark, not the symbol alone.
+    fn select_library_routine_call(
+        &mut self,
+        routine: RuntimeSymbol,
+        args: &[Value],
+        arg_types: &[Type],
+        block: Block,
+    ) -> Result<(), ISelError> {
+        let call_index = self.select_call_with_arg_types(
+            routine.name(),
+            args,
+            arg_types,
+            &[],
+            &[],
+            false,
+            block,
+        )?;
+        let call = self
+            .func
+            .blocks
+            .get_mut(&block)
+            .and_then(|isel_block| isel_block.insts.get_mut(call_index))
+            .filter(|call| call.opcode == AArch64Opcode::Bl)
+            .ok_or_else(|| {
+                ISelError::UnsupportedOpcode(format!(
+                    "the `{}` call this selector emitted is not at its recorded position",
+                    routine.name()
+                ))
+            })?;
+        call.library_routine_call = true;
+        Ok(())
     }
 
     /// Emit an inline, EXACT-width forward copy of `len` bytes from `src` to
@@ -10255,12 +12853,10 @@ impl InstructionSelector {
     fn select_memmove(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
         Self::require_exact_args(inst, 3, "Memmove")?;
         Self::require_no_results(inst, "Memmove")?;
-        self.select_call_with_arg_types(
-            "memmove",
+        self.select_library_routine_call(
+            RuntimeSymbol::Memmove,
             &inst.args,
             &[Type::I64, Type::I64, Type::I64],
-            &[],
-            &[],
             block,
         )
     }
@@ -10278,7 +12874,6 @@ impl InstructionSelector {
     /// dominates a tiny memset — e.g. a constructor zeroing a 16-byte node,
     /// where clang emits a single `stp xzr, xzr, [x0]`. Non-zero fill values
     /// and non-constant lengths keep the libcall.
-    /// Kill switch: `TCG_NO_INLINE_MEMSET=1`.
     fn select_memset(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
         Self::require_exact_args(inst, 3, "Memset")?;
         Self::require_no_results(inst, "Memset")?;
@@ -10294,8 +12889,7 @@ impl InstructionSelector {
             .iconst_origins
             .get(&inst.args[1])
             .is_some_and(|(_, imm)| *imm == 0);
-        if !inline_memset_disabled()
-            && fill_is_zero
+        if fill_is_zero
             && let Some(len) = self.iconst_origins.get(&inst.args[2]).map(|(_, imm)| *imm)
             && (0..=INLINE_MEMCPY_MAX_BYTES).contains(&len)
         {
@@ -10308,12 +12902,10 @@ impl InstructionSelector {
         }
 
         // Lower as a regular call to libc memset. Void return, no results.
-        self.select_call_with_arg_types(
-            "memset",
+        self.select_library_routine_call(
+            RuntimeSymbol::Memset,
             &inst.args,
             &[Type::I64, Type::I32, Type::I64],
-            &[],
-            &[],
             block,
         )
     }
@@ -10415,17 +13007,9 @@ impl InstructionSelector {
         let size = agg_ty.bytes();
 
         // Check for HFA first: return in consecutive typed FPR registers.
-        if let Some((hfa_base, count)) = AppleAArch64ABI::classify_hfa(agg_ty) {
-            let elem_size = match hfa_base {
-                HfaBaseType::F16 => 2u32,
-                HfaBaseType::F32 => 4u32,
-                HfaBaseType::F64 => 8u32,
-            };
-            let typed_regs: &[PReg] = match hfa_base {
-                HfaBaseType::F16 => AppleAArch64ABI::h_arg_regs(),
-                HfaBaseType::F32 => AppleAArch64ABI::s_arg_regs(),
-                HfaBaseType::F64 => AppleAArch64ABI::d_arg_regs(),
-            };
+        if let Some((hfa_base, count)) = AppleAArch64ABI::classify_homogeneous_aggregate(agg_ty) {
+            let elem_size = hfa_base.element_bytes();
+            let typed_regs = hfa_base.argument_registers();
             // Load each HFA member from memory into the corresponding FPR.
             for i in 0..count {
                 if i < typed_regs.len() {
@@ -10449,13 +13033,29 @@ impl InstructionSelector {
         if size <= 8 {
             // Small aggregate: load its exact memory width into X0. Avoid
             // widening non-padded arrays such as [i8; 3] into an 8-byte load.
-            self.emit_exact_aggregate_return_lane(block, gpr::X0, src, 0, size)?;
+            self.emit_exact_aggregate_return_lane(block, gpr::X0, src, 0, size, false)?;
         } else if size <= 16 {
             // Medium aggregate: low lane is 8 bytes, high lane is exact tail
             // width. This avoids reading past semantic storage for 9/10/12
             // byte aggregates while keeping padded 16-byte structs fast.
-            self.emit_exact_aggregate_return_lane(block, gpr::X0, src.clone(), 0, 8)?;
-            self.emit_exact_aggregate_return_lane(block, gpr::X1, src, 8, size - 8)?;
+            //
+            // A tail whose width has no single load (3/5/6/7 bytes) is
+            // COMPOSED into a virtual register BEFORE X0 is defined, so no
+            // scratch register of the composition can be placed over an
+            // already-loaded X0 lane. `src` is live across the X0 load in the
+            // same way on the single-load path.
+            if Self::aggregate_return_lane_needs_composition(size - 8) {
+                let tail = self.emit_exact_width_zext_load(block, &src, 8, size - 8)?;
+                self.emit_exact_aggregate_return_lane(block, gpr::X0, src, 0, 8, false)?;
+                self.emit_abi_register_copy(
+                    block,
+                    ISelOperand::PReg(gpr::X1),
+                    ISelOperand::VReg(tail),
+                );
+            } else {
+                self.emit_exact_aggregate_return_lane(block, gpr::X0, src.clone(), 0, 8, false)?;
+                self.emit_exact_aggregate_return_lane(block, gpr::X1, src, 8, size - 8, false)?;
+            }
         } else {
             // Large aggregate: store through the sret pointer.
             // NOT the physical X8: it is call-clobbered and does not survive
@@ -10578,6 +13178,39 @@ impl InstructionSelector {
         Ok(())
     }
 
+    /// Load exactly `width` bytes from `[src + offset]` into the ABI register
+    /// `dst`, touching NO byte the aggregate does not own.
+    ///
+    /// Serves BOTH register lanes of the AAPCS64 aggregate ABI — the return
+    /// lanes of [`Self::select_aggregate_return`] and the call-argument lanes
+    /// of [`Self::select_aggregate_arg`] — because they have exactly the same
+    /// obligation: an aggregate in registers is an aggregate READ FROM MEMORY,
+    /// and the read may not run past the object.
+    ///
+    /// Reading past the object is not a harmless over-approximation. A tight
+    /// alloca or the tail of a larger object can end at a page boundary, and
+    /// an 8-byte `LDR` over a 5-byte object then faults; where it does not
+    /// fault it puts bytes the caller does not own into the high half of an
+    /// argument register.
+    ///
+    /// The architectural loads give exact 1/2/4/8-byte reads, and nothing
+    /// else: the access width of `LdrRI` is DERIVED FROM THE TRANSFER
+    /// REGISTER'S CLASS (`aarch64::encode::scalar_transfer_scale`:
+    /// Gpr64 -> 8, Gpr32 -> 4), so a 4-byte lane must name the W alias of
+    /// `dst` — `LdrRI` with an X register is an 8-byte load. `LdrbRI` /
+    /// `LdrhRI` fix their width in the opcode and zero-extend through the W
+    /// write, so they are exact whichever alias is named.
+    ///
+    /// Widths 3/5/6/7 have no single exact load. They are COMPOSED from exact
+    /// lanes (3 = 2+1, 5 = 4+1, 6 = 4+2, 7 = 4+2+1), each zero-extended,
+    /// shifted to its byte position and OR-ed together, then moved into `dst`.
+    /// Widening them to one 8-byte load would be the very over-read above.
+    ///
+    /// `call_arg_setup` marks the single instruction that DEFINES `dst` as
+    /// semantic call-argument setup. Only that one may be marked: the
+    /// post-RA repair pass (`pipeline::aarch64_call_arg_setups_in_current_region`)
+    /// fails closed on a marked instruction that does not define exactly one
+    /// ABI argument register, and the composition's scratch loads define none.
     fn emit_exact_aggregate_return_lane(
         &mut self,
         block: Block,
@@ -10585,21 +13218,256 @@ impl InstructionSelector {
         src: ISelOperand,
         offset: u32,
         width: u32,
+        call_arg_setup: bool,
     ) -> Result<(), ISelError> {
-        let opcode = match width {
-            1 => AArch64Opcode::LdrbRI,
-            2 => AArch64Opcode::LdrhRI,
-            4 | 8 => AArch64Opcode::LdrRI,
-            _ => return Err(ISelError::UnsupportedReturnLocation),
+        // Single-instruction lanes: an exact architectural access width.
+        let single = match width {
+            1 => Some((AArch64Opcode::LdrbRI, dst)),
+            2 => Some((AArch64Opcode::LdrhRI, dst)),
+            // `LdrRI` reads 8 bytes for an X transfer register and 4 for a W
+            // one, so the 4-byte lane MUST name the W alias. A W write
+            // zero-extends the whole X register, so `dst` still holds exactly
+            // the aggregate's four bytes.
+            4 => Some((
+                AArch64Opcode::LdrRI,
+                trust_cg_ir::aarch64_regs::gpr64_to_gpr32(dst)
+                    .ok_or(ISelError::UnsupportedReturnLocation)?,
+            )),
+            8 => Some((AArch64Opcode::LdrRI, dst)),
+            _ => None,
         };
-        self.emit(
-            block,
-            ISelInst::new(
+        if let Some((opcode, transfer_reg)) = single {
+            let inst = ISelInst::new(
                 opcode,
-                vec![ISelOperand::PReg(dst), src, ISelOperand::Imm(offset as i64)],
-            ),
+                vec![
+                    ISelOperand::PReg(transfer_reg),
+                    src,
+                    ISelOperand::Imm(offset as i64),
+                ],
+            );
+            self.emit(
+                block,
+                if call_arg_setup {
+                    inst.as_call_arg_setup()
+                } else {
+                    inst
+                },
+            );
+            return Ok(());
+        }
+
+        // A 3/5/6/7-byte lane has no single AArch64 load. rustc returns such a
+        // `BackendRepr::Memory` aggregate as `PassMode::Cast` to ONE integer
+        // register of exactly that many bytes (i24/i40/i48/i56 in x0 —
+        // `Option<[u8; 2]>`, `Option<Ipv4Addr>`, `([u8; 4], Range<u8>)`), and
+        // LLVM composes it from exact-width loads (`ldrh`+`ldrb`,
+        // `orr .., lsl #16`). Compose it the same way: exact loads, so no byte
+        // past the value is read, zero-extended, shifted into place. The
+        // register's bits above `width` are unspecified by AAPCS64 §5.4, so
+        // zeroes there are conformant, and the placement itself (one X
+        // register) is what the `[TCG-RET-ABI]` gate already compared against
+        // rustc's `FnAbi` before this code runs.
+        //
+        // Composed lanes. A zero-width lane has no register representation
+        // here (the aggregate return path has always refused it), and a lane
+        // wider than 8 is not a single-register ABI location at all.
+        if width == 0 || width > 8 {
+            return Err(ISelError::UnsupportedReturnLocation);
+        }
+
+        let mut acc: Option<VReg> = None;
+        let mut covered: u32 = 0;
+        // Descending exact cover of 3/5/6/7 over {4, 2, 1}: each lane is taken
+        // at most once and only when it still fits, which is precisely the
+        // binary decomposition of the residual width.
+        for lane in [4u32, 2, 1] {
+            if covered + lane > width {
+                continue;
+            }
+            let lane_opcode = match lane {
+                1 => AArch64Opcode::LdrbRI,
+                2 => AArch64Opcode::LdrhRI,
+                // A Gpr32 transfer register makes this a 4-byte read.
+                _ => AArch64Opcode::LdrRI,
+            };
+            let lane_w = self.new_vreg(RegClass::Gpr32);
+            self.emit(
+                block,
+                ISelInst::new(
+                    lane_opcode,
+                    vec![
+                        ISelOperand::VReg(lane_w),
+                        src.clone(),
+                        ISelOperand::Imm((offset + covered) as i64),
+                    ],
+                ),
+            );
+            // Widen explicitly into the 64-bit accumulator carrier: a 7-byte
+            // aggregate does not fit 32 bits.
+            let lane_x = self.new_vreg(RegClass::Gpr64);
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::Uxtw,
+                    vec![ISelOperand::VReg(lane_x), ISelOperand::VReg(lane_w)],
+                ),
+            );
+            let placed = if covered == 0 {
+                lane_x
+            } else {
+                let shifted = self.new_vreg(RegClass::Gpr64);
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::LslRI,
+                        vec![
+                            ISelOperand::VReg(shifted),
+                            ISelOperand::VReg(lane_x),
+                            ISelOperand::Imm((covered * 8) as i64),
+                        ],
+                    ),
+                );
+                shifted
+            };
+            acc = Some(match acc {
+                None => placed,
+                Some(prev) => {
+                    let combined = self.new_vreg(RegClass::Gpr64);
+                    self.emit(
+                        block,
+                        ISelInst::new(
+                            AArch64Opcode::OrrRR,
+                            vec![
+                                ISelOperand::VReg(combined),
+                                ISelOperand::VReg(prev),
+                                ISelOperand::VReg(placed),
+                            ],
+                        ),
+                    );
+                    combined
+                }
+            });
+            covered += lane;
+        }
+        debug_assert_eq!(
+            covered, width,
+            "composed aggregate lane covered {covered} of {width} bytes"
         );
+        let acc = acc.ok_or(ISelError::UnsupportedReturnLocation)?;
+        if call_arg_setup {
+            self.emit_abi_call_arg_copy(block, dst, ISelOperand::VReg(acc));
+        } else {
+            self.emit_abi_register_copy(block, ISelOperand::PReg(dst), ISelOperand::VReg(acc));
+        }
         Ok(())
+    }
+
+    /// Whether an aggregate-return register lane of `width` bytes has no single
+    /// exact-width AArch64 load and must be composed
+    /// ([`Self::emit_exact_width_zext_load`]).
+    fn aggregate_return_lane_needs_composition(width: u32) -> bool {
+        matches!(width, 3 | 5 | 6 | 7)
+    }
+
+    /// Load EXACTLY `width` (1..=8) bytes at `[src + offset]` into a fresh
+    /// `Gpr64` virtual register, zero-extended, reading no byte outside
+    /// `offset..offset + width`.
+    ///
+    /// 1/2-byte loads are `ldrb`/`ldrh` (a W write, which zero-extends), a
+    /// 4-byte load is a 32-bit `ldr` followed by an explicit `Uxtw`, an 8-byte
+    /// load is a 64-bit `ldr`. Any other width is the zero-extended low part
+    /// (4 bytes above 4, else 2) OR the high part shifted left by the low part's
+    /// bit width — little-endian byte order, which is the only order AArch64
+    /// Apple targets use. Recursion depth is at most two (7 = 4 + (2 + 1)).
+    fn emit_exact_width_zext_load(
+        &mut self,
+        block: Block,
+        src: &ISelOperand,
+        offset: u32,
+        width: u32,
+    ) -> Result<VReg, ISelError> {
+        let load = |isel: &mut Self, opcode: AArch64Opcode, dst: VReg| {
+            isel.emit(
+                block,
+                ISelInst::new(
+                    opcode,
+                    vec![
+                        ISelOperand::VReg(dst),
+                        src.clone(),
+                        ISelOperand::Imm(offset as i64),
+                    ],
+                ),
+            );
+        };
+        match width {
+            1 | 2 => {
+                let dst = self.new_vreg(RegClass::Gpr32);
+                let opcode = if width == 1 {
+                    AArch64Opcode::LdrbRI
+                } else {
+                    AArch64Opcode::LdrhRI
+                };
+                load(self, opcode, dst);
+                let wide = self.new_vreg(RegClass::Gpr64);
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::Uxtw,
+                        vec![ISelOperand::VReg(wide), ISelOperand::VReg(dst)],
+                    ),
+                );
+                Ok(wide)
+            }
+            4 => {
+                let dst = self.new_vreg(RegClass::Gpr32);
+                load(self, AArch64Opcode::LdrRI, dst);
+                let wide = self.new_vreg(RegClass::Gpr64);
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::Uxtw,
+                        vec![ISelOperand::VReg(wide), ISelOperand::VReg(dst)],
+                    ),
+                );
+                Ok(wide)
+            }
+            8 => {
+                let dst = self.new_vreg(RegClass::Gpr64);
+                load(self, AArch64Opcode::LdrRI, dst);
+                Ok(dst)
+            }
+            3 | 5 | 6 | 7 => {
+                let low = if width > 4 { 4 } else { 2 };
+                let lo = self.emit_exact_width_zext_load(block, src, offset, low)?;
+                let hi = self.emit_exact_width_zext_load(block, src, offset + low, width - low)?;
+                let shifted = self.new_vreg(RegClass::Gpr64);
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::LslRI,
+                        vec![
+                            ISelOperand::VReg(shifted),
+                            ISelOperand::VReg(hi),
+                            ISelOperand::Imm(i64::from(low * 8)),
+                        ],
+                    ),
+                );
+                let dst = self.new_vreg(RegClass::Gpr64);
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::OrrRR,
+                        vec![
+                            ISelOperand::VReg(dst),
+                            ISelOperand::VReg(lo),
+                            ISelOperand::VReg(shifted),
+                        ],
+                    ),
+                );
+                Ok(dst)
+            }
+            _ => Err(ISelError::UnsupportedReturnLocation),
+        }
     }
 
     /// Select aggregate argument passing for a call.
@@ -10607,9 +13475,11 @@ impl InstructionSelector {
     /// Apple AArch64 ABI:
     /// - Small (<=8 bytes): load into a single GPR
     /// - Medium (<=16 bytes): load into two consecutive GPRs
-    /// - Large (>16 bytes): allocate stack space, store aggregate, pass pointer
+    /// - Large (>16 bytes, not an HFA/HVA): pass a pointer to a caller-owned
+    ///   copy, in a GPR or an outgoing stack slot
     ///
-    /// `src` is the pointer to the aggregate in memory.
+    /// `src` is the pointer to the aggregate in memory; for a by-reference
+    /// argument it must be the copy `stage_by_reference_argument_copies` made.
     /// `preg` is the physical register assigned by the ABI classifier.
     fn select_aggregate_arg(
         &mut self,
@@ -10621,16 +13491,40 @@ impl InstructionSelector {
         let size = agg_ty.bytes();
 
         match loc {
+            ArgLocation::Ignore => {
+                if !matches!(agg_ty, Type::Struct(fields) if fields.is_empty()) {
+                    return Err(ISelError::UnsupportedArgLocation);
+                }
+                // The value was evaluated and remains logically typed, but
+                // no byte or address crosses this argument boundary.
+            }
             ArgLocation::Reg(preg) => {
-                // Small aggregate (<=8 bytes): load as single value into register
-                self.emit(
-                    block,
-                    ISelInst::new(
-                        AArch64Opcode::LdrRI,
-                        vec![ISelOperand::PReg(*preg), src, ISelOperand::Imm(0)],
-                    )
-                    .as_call_arg_setup(),
-                );
+                // Small aggregate (<=8 bytes) passed in ONE register. This used
+                // to be an unconditional 8-byte `LDR` whatever `size` was, so a
+                // 1..7-byte aggregate read bytes it does not own: a fault when
+                // the object ends at a page boundary, and another object's
+                // bytes in the register's high half when it does not. The
+                // return side of this same ABI already refuses to widen for
+                // exactly that reason (`select_aggregate_return`); the argument
+                // side now reads its exact width through the same helper.
+                if size == 0 {
+                    // A zero-sized aggregate owns no bytes at all, so there is
+                    // nothing to load: define the ABI register from XZR. (A
+                    // load would read 8 bytes from a place that has none —
+                    // for a Rust ZST, typically a dangling-but-aligned
+                    // address.) `Copy dst <- XZR` keeps the single-instruction
+                    // shape the post-RA call-argument repair pass requires.
+                    self.emit(
+                        block,
+                        ISelInst::new(
+                            AArch64Opcode::Copy,
+                            vec![ISelOperand::PReg(*preg), ISelOperand::PReg(XZR)],
+                        )
+                        .as_call_arg_setup(),
+                    );
+                } else {
+                    self.emit_exact_aggregate_return_lane(block, *preg, src, 0, size, true)?;
+                }
             }
             ArgLocation::RegSequence(regs) => {
                 // HFA (Homogeneous Floating-point Aggregate): load each member
@@ -10642,20 +13536,14 @@ impl InstructionSelector {
                 //
                 // `src` is a pointer to the aggregate in memory. Each member is
                 // loaded from `[src + i * element_size]`.
-                let elem_size = if regs.is_empty() {
-                    4 // fallback; shouldn't happen
-                } else {
-                    // Determine element size from HFA classification.
-                    if let Some((hfa_base, _)) = AppleAArch64ABI::classify_hfa(agg_ty) {
-                        match hfa_base {
-                            HfaBaseType::F16 => 2,
-                            HfaBaseType::F32 => 4,
-                            HfaBaseType::F64 => 8,
-                        }
-                    } else {
-                        size / regs.len() as u32
-                    }
+                let Some((base, count)) = AppleAArch64ABI::classify_homogeneous_aggregate(agg_ty)
+                else {
+                    return Err(ISelError::UnsupportedArgLocation);
                 };
+                if count != regs.len() {
+                    return Err(ISelError::UnsupportedArgLocation);
+                }
+                let elem_size = base.element_bytes();
                 for (i, preg) in regs.iter().enumerate() {
                     let byte_offset = i as u32 * elem_size;
                     // LDR Sn/Dn, [src, #offset]
@@ -10674,32 +13562,19 @@ impl InstructionSelector {
                 }
             }
             ArgLocation::RegPair(lo_preg, hi_preg) => {
-                // Medium aggregate passed as a register pair.
-                self.emit(
-                    block,
-                    ISelInst::new(
-                        AArch64Opcode::LdrRI,
-                        vec![
-                            ISelOperand::PReg(*lo_preg),
-                            src.clone(),
-                            ISelOperand::Imm(0),
-                        ],
-                    )
-                    .as_call_arg_setup(),
-                );
-                self.emit(
-                    block,
-                    ISelInst::new(
-                        AArch64Opcode::LdrRI,
-                        vec![ISelOperand::PReg(*hi_preg), src, ISelOperand::Imm(8)],
-                    )
-                    .as_call_arg_setup(),
-                );
+                // Medium aggregate (9..=16 bytes) passed as a register pair.
+                // The low lane is a full 8 bytes; the HIGH lane is the exact
+                // tail width, which is 1..=8. Loading 8 bytes for the high lane
+                // of a 9-byte aggregate is the same over-read the single-register
+                // arm above had, seven bytes past the object — the return side's
+                // medium lane has read the exact tail since it was written.
+                self.emit_exact_aggregate_return_lane(block, *lo_preg, src.clone(), 0, 8, true)?;
+                self.emit_exact_aggregate_return_lane(block, *hi_preg, src, 8, size - 8, true)?;
             }
             ArgLocation::Indirect { ptr_reg } => {
-                // Large aggregate: pass pointer to the aggregate.
-                // The caller has already placed the aggregate in memory;
-                // just pass the pointer in the designated register.
+                // Large aggregate: pass the address of the caller-owned copy
+                // (`stage_by_reference_argument_copies`) in the designated
+                // register.
                 self.emit(
                     block,
                     ISelInst::new(AArch64Opcode::MovR, vec![ISelOperand::PReg(*ptr_reg), src])
@@ -10711,15 +13586,16 @@ impl InstructionSelector {
                 size: slot_size,
             } => {
                 // A large (>16B) NON-HFA aggregate is passed INDIRECTLY: when the
-                // GPRs are exhausted the caller spills a POINTER to its in-memory
-                // copy (classify_params emits Stack{size:8} for it). Store `src`
+                // GPRs are exhausted the caller spills a POINTER to its
+                // caller-owned copy (classify_params emits Stack{size:8} for it;
+                // `stage_by_reference_argument_copies` made the copy). Store `src`
                 // (that pointer), not the aggregate data — the callee reads the
                 // slot as a base pointer. (Previously the field-by-field copy
                 // below wrote 8 DATA bytes here, so the callee dereferenced
                 // struct contents as an address — a silent miscompile.) An HFA,
                 // however large, and every <=16B aggregate are passed BY VALUE
                 // and fall through to the data copy below.
-                let is_hfa = AppleAArch64ABI::classify_hfa(agg_ty).is_some();
+                let is_hfa = AppleAArch64ABI::classify_homogeneous_aggregate(agg_ty).is_some();
                 if size > 16 && !is_hfa {
                     self.emit(
                         block,
@@ -10852,6 +13728,11 @@ impl InstructionSelector {
     /// For each parameter, emit a COPY from the physical register (or stack
     /// location) designated by the ABI to a fresh virtual register. This
     /// establishes the initial value_map for the function body.
+    ///
+    /// The copies go at the top of `entry_block`, so they run every time
+    /// control enters it. `entry_block` must therefore not be a branch target;
+    /// a function whose entry block heads a loop uses
+    /// [`Self::lower_formal_arguments_before_reentered_entry`].
     pub fn lower_formal_arguments(
         &mut self,
         sig: &Signature,
@@ -10868,17 +13749,53 @@ impl InstructionSelector {
         result
     }
 
+    /// Lower formal arguments for a function whose entry block `entry_block`
+    /// is also a branch target, so it heads a loop.
+    ///
+    /// The incoming ABI registers and stack slots hold the arguments only
+    /// when the function is called. Formal copies at the top of a re-entered
+    /// `entry_block` would run again on every back edge and overwrite the
+    /// block arguments that edge had just written with whatever those
+    /// registers held then. They go instead into a fresh block that is laid
+    /// out first, which makes it the function entry, and that ends in an
+    /// unconditional branch to `entry_block`. The parameter values keep the
+    /// virtual registers the formal copies define, so `entry_block` is an
+    /// ordinary loop header: its parameters hold the formals on the first
+    /// iteration and the back edge's copies after that.
+    ///
+    /// Returns the new entry block.
+    pub fn lower_formal_arguments_before_reentered_entry(
+        &mut self,
+        sig: &Signature,
+        entry_block: Block,
+    ) -> Result<Block, ISelError> {
+        let pre_entry = self.fresh_synthetic_block()?;
+        self.func.ensure_block(pre_entry);
+        // `to_ir_func` takes the first block in layout as the function entry.
+        self.func.block_order.retain(|&block| block != pre_entry);
+        self.func.block_order.insert(0, pre_entry);
+        self.lower_formal_arguments(sig, pre_entry)?;
+        self.select_jump(entry_block, pre_entry)?;
+        Ok(pre_entry)
+    }
+
     fn lower_formal_arguments_inner(
         &mut self,
         sig: &Signature,
         entry_block: Block,
     ) -> Result<(), ISelError> {
+        if self.sret_param_index.is_some() && !sig.returns.is_empty() {
+            return Err(ISelError::UnsupportedOpcode(
+                "[TCG-SRET-ABI] a hidden return-buffer parameter requires an empty return list; refusing competing return conventions".to_string(),
+            ));
+        }
         self.func.ensure_block(entry_block);
         // The entry block now (legitimately) holds ABI copies before its
         // selection — exempt it from the `BlockAlreadyPopulated` backstop.
         self.formal_args_block = Some(entry_block);
 
-        let param_locs = AppleAArch64ABI::classify_params_with(self.abi_variant, &sig.params);
+        let param_locs = self.classify_formal_params(&sig.params)?;
+        self.func.incoming_stack_arg_bytes = Some(stack_argument_extent(&param_locs)?);
         let formal_pregs_by_param: Vec<Vec<PReg>> = sig
             .params
             .iter()
@@ -10953,6 +13870,30 @@ impl InstructionSelector {
             let vreg = self.new_vreg(class);
 
             match loc {
+                ArgLocation::Ignore => {
+                    if !matches!(ty, Type::Struct(fields) if fields.is_empty()) {
+                        return Err(ISelError::UnsupportedArgLocation);
+                    }
+                    // Keep the original logical value/address available to
+                    // the body, independently of any incoming ABI register.
+                    let slot = self.func.stack_slots.len() as u32;
+                    self.func.stack_slots.push(StackSlotInfo::new(1, 1));
+                    self.emit(
+                        entry_block,
+                        append_formal_livein_uses(
+                            ISelInst::new(
+                                AArch64Opcode::AddPCRel,
+                                vec![
+                                    ISelOperand::VReg(vreg),
+                                    ISelOperand::PReg(SP),
+                                    ISelOperand::StackSlot(slot),
+                                ],
+                            ),
+                            &livein_after[i],
+                            &[],
+                        ),
+                    );
+                }
                 ArgLocation::Reg(preg) => {
                     if ty.is_aggregate() {
                         let slot = self.func.stack_slots.len() as u32;
@@ -10992,13 +13933,21 @@ impl InstructionSelector {
                         self.define_value(val, ISelOperand::VReg(vreg), ty.clone());
                         continue;
                     }
-                    // COPY from physical to virtual register
+                    // AAPCS64 leaves bits above the Bool's unsigned byte
+                    // unspecified. Normalize at ingress, before any internal
+                    // B1 compare, branch, widening cast, or outgoing use. Uxtb
+                    // zeroes the full Gpr64 carrier through its W write.
+                    let opcode = if *ty == Type::B1 {
+                        AArch64Opcode::Uxtb
+                    } else {
+                        AArch64Opcode::Copy
+                    };
                     let consumed = [*preg];
                     self.emit(
                         entry_block,
                         append_formal_livein_uses(
                             ISelInst::new(
-                                AArch64Opcode::Copy,
+                                opcode,
                                 vec![ISelOperand::VReg(vreg), ISelOperand::PReg(*preg)],
                             ),
                             &livein_after[i],
@@ -11022,7 +13971,7 @@ impl InstructionSelector {
                     //     POINTER to its copy of the aggregate, so LOAD it (the
                     //     8-byte value IS the base pointer).
                     if ty.is_aggregate() {
-                        let is_hfa = AppleAArch64ABI::classify_hfa(ty).is_some();
+                        let is_hfa = AppleAArch64ABI::classify_homogeneous_aggregate(ty).is_some();
                         let by_value = is_hfa || ty.bytes() <= 16;
                         let opc = if by_value {
                             AArch64Opcode::AddRI
@@ -11129,17 +14078,15 @@ impl InstructionSelector {
                     if !ty.is_aggregate() {
                         return Err(ISelError::UnsupportedArgLocation);
                     }
-                    let Some((hfa_base, hfa_count)) = AppleAArch64ABI::classify_hfa(ty) else {
+                    let Some((hfa_base, hfa_count)) =
+                        AppleAArch64ABI::classify_homogeneous_aggregate(ty)
+                    else {
                         return Err(ISelError::UnsupportedArgLocation);
                     };
                     if hfa_count != regs.len() {
                         return Err(ISelError::UnsupportedArgLocation);
                     }
-                    let elem_size = match hfa_base {
-                        HfaBaseType::F16 => 2,
-                        HfaBaseType::F32 => 4,
-                        HfaBaseType::F64 => 8,
-                    };
+                    let elem_size = hfa_base.element_bytes() as usize;
                     let slot = self.func.stack_slots.len() as u32;
                     self.func
                         .stack_slots
@@ -11180,8 +14127,12 @@ impl InstructionSelector {
                     continue;
                 }
                 ArgLocation::Indirect { ptr_reg } => {
-                    // Large aggregate: load pointer from register, then load data
-                    // For scaffold: just copy the pointer register
+                    // Large aggregate passed by reference (AAPCS64 B.4): the
+                    // register holds the address of the copy the caller made,
+                    // which this function owns for the call, so that address
+                    // is the parameter's storage. Passing the parameter on to
+                    // another by-reference call copies it again
+                    // (`stage_by_reference_argument_copies`).
                     let consumed = [*ptr_reg];
                     self.emit(
                         entry_block,
@@ -11452,7 +14403,6 @@ impl InstructionSelector {
         // encoding) or a type/op without an RI form falls through to the RR
         // path below, which keeps the constant in a register. This runs BEFORE
         // the operand `use_value`s so a folded constant is never materialized.
-        // Kill switch: `TCG_NO_LOGIC_IMM=1`.
         let ri_opc = match op {
             AArch64LogicOp::And => Some(AArch64Opcode::AndRI),
             AArch64LogicOp::Orr => Some(AArch64Opcode::OrrRI),
@@ -11466,7 +14416,6 @@ impl InstructionSelector {
         let scalar_gpr = matches!(ty, Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64);
         if let Some(ri_opc) = ri_opc
             && scalar_gpr
-            && !logic_imm_fold_disabled()
         {
             // The encoder derives `sf` from the destination register class, so
             // encodability MUST be checked at that width (`B1` is Gpr64).
@@ -11514,10 +14463,29 @@ impl InstructionSelector {
                 AArch64LogicOp::Orr => AArch64Opcode::NeonOrrV,
                 AArch64LogicOp::Eor => AArch64Opcode::NeonEorV,
                 AArch64LogicOp::Bic => AArch64Opcode::NeonBicV,
+                // OR-NOT `a | !b` (L04-P6): NOT of the second operand into a
+                // fresh register of the same class, then ORR. Both NeonNotV
+                // and NeonOrrV are credited, model-checked against silicon
+                // rows; a single ORN is not needed for correctness.
                 AArch64LogicOp::Orn => {
-                    return Err(ISelError::UnsupportedOpcode(format!(
-                        "BorNot {ty:?}; AArch64 {ty:?} OR-NOT is not lowered"
-                    )));
+                    let class = reg_class_for_type(&ty);
+                    let inverted = self.new_vreg(class);
+                    self.emit(
+                        block,
+                        ISelInst::new(
+                            AArch64Opcode::NeonNotV,
+                            vec![ISelOperand::VReg(inverted), rhs],
+                        ),
+                    );
+                    self.emit(
+                        block,
+                        ISelInst::new(
+                            AArch64Opcode::NeonOrrV,
+                            vec![ISelOperand::VReg(dst), lhs, ISelOperand::VReg(inverted)],
+                        ),
+                    );
+                    self.define_value(result_val, ISelOperand::VReg(dst), ty);
+                    return Ok(());
                 }
             };
 
@@ -11635,7 +14603,8 @@ impl InstructionSelector {
                     Type::I8 => Some(AArch64Opcode::Sxtb),
                     Type::I16 => Some(AArch64Opcode::Sxth),
                     Type::I32 => Some(AArch64Opcode::Sxtw),
-                    _ => None, // I64 / B1: value already occupies the low 64 bits
+                    // I64: already the low 64 bits (B1 takes the SBFM below).
+                    _ => None,
                 }
             } else {
                 match from_ty {
@@ -11645,12 +14614,34 @@ impl InstructionSelector {
                     _ => None,
                 }
             };
-            match lo_opc {
-                Some(opc) => self.emit(block, ISelInst::new(opc, vec![ISelOperand::VReg(lo), src])),
-                None => self.emit(
+            if signed && *from_ty == Type::B1 {
+                // A bool's sign extension is all ones in BOTH halves for
+                // `true` (trust-ir widens `as_signed()` of the 1-bit value;
+                // see the `B1` arm below): `SBFM Xd, Xn, #0, #0` sign-extends
+                // bit 0 across the low half, and `ASR #63` copies it into the
+                // high half. A copy of the 0/1 value made `(1, 0)`.
+                self.emit(
                     block,
-                    ISelInst::new(AArch64Opcode::Copy, vec![ISelOperand::VReg(lo), src]),
-                ),
+                    ISelInst::new(
+                        AArch64Opcode::Sbfm,
+                        vec![
+                            ISelOperand::VReg(lo),
+                            src,
+                            ISelOperand::Imm(0),
+                            ISelOperand::Imm(0),
+                        ],
+                    ),
+                );
+            } else {
+                match lo_opc {
+                    Some(opc) => {
+                        self.emit(block, ISelInst::new(opc, vec![ISelOperand::VReg(lo), src]))
+                    }
+                    None => self.emit(
+                        block,
+                        ISelInst::new(AArch64Opcode::Copy, vec![ISelOperand::VReg(lo), src]),
+                    ),
+                }
             }
             let hi = self.new_vreg(RegClass::Gpr64);
             if signed {
@@ -12183,8 +15174,9 @@ impl InstructionSelector {
         // iteration for every `splat (i32 K)` operand clang emits.
         let is_splat = inst.args.iter().all(|arg| *arg == inst.args[0]);
         if !is_splat {
-            for lane in 1..4 {
-                let lane_value = self.use_value(&inst.args[lane])?;
+            for (offset, argument) in inst.args[1..4].iter().enumerate() {
+                let lane = offset + 1;
+                let lane_value = self.use_value(argument)?;
                 self.emit(
                     block,
                     ISelInst::new(
@@ -12312,8 +15304,9 @@ impl InstructionSelector {
         // follows. hashbrown's control-byte broadcast takes this fast path.
         let is_splat = inst.args.iter().all(|arg| *arg == inst.args[0]);
         if !is_splat {
-            for lane in 1..8 {
-                let lane_value = self.use_value(&inst.args[lane])?;
+            for (offset, argument) in inst.args[1..8].iter().enumerate() {
+                let lane = offset + 1;
+                let lane_value = self.use_value(argument)?;
                 self.emit(
                     block,
                     ISelInst::new(
@@ -12379,8 +15372,9 @@ impl InstructionSelector {
         // splat otherwise costs FIFTEEN redundant `ins`.
         let is_splat = inst.args.iter().all(|arg| *arg == inst.args[0]);
         if !is_splat {
-            for lane in 1..lane_count {
-                let lane_value = self.use_value(&inst.args[lane])?;
+            for (offset, argument) in inst.args[1..lane_count].iter().enumerate() {
+                let lane = offset + 1;
+                let lane_value = self.use_value(argument)?;
                 self.emit(
                     block,
                     ISelInst::new(
@@ -13205,10 +16199,9 @@ impl InstructionSelector {
         // + `FCSEL dst, tval, fval, cc`. FCSEL selects the source register
         // bit-for-bit (no FP arithmetic), so NaN payloads, signed zeros and
         // denormals pass through exactly. Its encoder is fail-closed on any
-        // non-FPR operand — the bank check the integer GPR `Csel` encoder lacks
-        // (a `Csel` over FPR operands would silently encode as a CSEL on the
-        // collided *GPRs*, FPR hw 0-31 aliasing GPR hw 0-31 — the audit P0/G2 the
-        // old FMOV->CSEL->FMOV route fail-closed around). This replaces the
+        // non-FPR operand; integer CSEL separately requires GPR operands.
+        // Their overlapping hardware register indices do not make the banks
+        // interchangeable. This replaces the
         // per-select FMOV(FPR->GPR)x2 + integer CSEL + FMOV(GPR->FPR) cross-bank
         // round trip (~6cy each way) that clogged FP-select-heavy kernels (perlin).
         if matches!(class, RegClass::Fpr32 | RegClass::Fpr64) {
@@ -13231,12 +16224,9 @@ impl InstructionSelector {
         }
 
         // Floating-point `Select` over f16 (the FEAT_FP16 scalar FCSEL form is
-        // deliberately NOT modeled). AArch64 has no CSEL on FPRs, and the GPR
-        // `Csel` encoder writes the register number straight into the GPR field
-        // with NO bank check — so a `Csel` over FPR operands would encode
-        // bit-identically as a CSEL on the collided *GPRs*, reading unrelated
-        // integer registers and never writing the FP destination (silent garbage
-        // — audit P0/G2). Route f16 selects through GPRs: FMOV each source FPR to
+        // deliberately NOT modeled). AArch64 has no integer CSEL on FPRs;
+        // the GPR encoder rejects that bank mismatch. Route f16 selects
+        // through GPRs: FMOV each source FPR to
         // a GPR, `Csel` on the GPRs, FMOV the winner back to an FPR. FMOV
         // general<->vector is a bit-preserving reinterpret, so NaN payloads and
         // signed zeros survive exactly. Mirrors the x86_64 MOVD->CMOV->MOVD path.
@@ -13599,21 +16589,19 @@ impl InstructionSelector {
         let src_val = inst.args[0];
         let result_val = inst.results[0];
 
-        let src_ty = self.value_type(&src_val);
         let src = self.use_value(&src_val)?;
 
         let dst_class = reg_class_for_type(&dst_ty);
         let dst = self.new_vreg(dst_class);
 
-        // Operands: [dst, src, src_type_hint]
-        // The src_type_hint records the source FP width for post-selection checks.
-        let src_hint = Self::fp_source_width_hint(&src_ty);
+        // Canonical scalar conversion operands are [integer dst, FP src].
+        // The source's Fpr16/Fpr32/Fpr64 class carries its actual precision;
+        // the destination's Gpr32/Gpr64 class carries the integer register width.
+        // Both survive conversion to MachIR and allocation. No immediate width
+        // hint is accepted by the encoder or reconstruction verifier.
         self.emit(
             block,
-            ISelInst::new(
-                AArch64Opcode::FcvtzsRR,
-                vec![ISelOperand::VReg(dst), src, ISelOperand::Imm(src_hint)],
-            ),
+            ISelInst::new(AArch64Opcode::FcvtzsRR, vec![ISelOperand::VReg(dst), src]),
         );
 
         self.define_value(result_val, ISelOperand::VReg(dst), dst_ty);
@@ -13643,12 +16631,12 @@ impl InstructionSelector {
         // See tests/e2e_int_to_fp_rounding.rs i128_to_float_* (was fail-closed; now a
         // correctly-rounded clean bill vs Rust `as`).
         if matches!(src_ty, Type::I128) {
-            let name = if matches!(dst_ty, Type::F32) {
-                "__floattisf"
+            let symbol = if matches!(dst_ty, Type::F32) {
+                RuntimeSymbol::Floattisf
             } else {
-                "__floattidf"
+                RuntimeSymbol::Floattidf
             };
-            return self.select_i128_to_float_libcall(name, inst, block, dst_ty);
+            return self.select_i128_to_float_libcall(symbol, inst, block, dst_ty);
         }
 
         let src_val = inst.args[0];
@@ -13719,19 +16707,16 @@ impl InstructionSelector {
         let src_val = inst.args[0];
         let result_val = inst.results[0];
 
-        let src_ty = self.value_type(&src_val);
         let src = self.use_value(&src_val)?;
 
         let dst_class = reg_class_for_type(&dst_ty);
         let dst = self.new_vreg(dst_class);
 
-        let src_hint = Self::fp_source_width_hint(&src_ty);
+        // As for FCVTZS, widths are carried by the two register classes, not
+        // by a trailing pseudo-operand that the final encoder would reject.
         self.emit(
             block,
-            ISelInst::new(
-                AArch64Opcode::FcvtzuRR,
-                vec![ISelOperand::VReg(dst), src, ISelOperand::Imm(src_hint)],
-            ),
+            ISelInst::new(AArch64Opcode::FcvtzuRR, vec![ISelOperand::VReg(dst), src]),
         );
 
         self.define_value(result_val, ISelOperand::VReg(dst), dst_ty);
@@ -13756,12 +16741,12 @@ impl InstructionSelector {
         // AAPCS64/compiler-rt helper `__floatunti{d,s}f` (correctly-rounded RNE over the
         // full 128 bits, LLVM's lowering). See select_fcvt_from_int for the full note.
         if matches!(src_ty, Type::I128) {
-            let name = if matches!(dst_ty, Type::F32) {
-                "__floatuntisf"
+            let symbol = if matches!(dst_ty, Type::F32) {
+                RuntimeSymbol::Floatuntisf
             } else {
-                "__floatuntidf"
+                RuntimeSymbol::Floatuntidf
             };
-            return self.select_i128_to_float_libcall(name, inst, block, dst_ty);
+            return self.select_i128_to_float_libcall(symbol, inst, block, dst_ty);
         }
 
         let src_val = inst.args[0];
@@ -13915,6 +16900,16 @@ impl InstructionSelector {
         let src_val = inst.args[0];
         let result_val = inst.results[0];
 
+        // The remainder tail already wrote this truncation's value as a W
+        // register (`rem_trunc_i32_folds`); the 64-bit remainder was never
+        // bound, so there is nothing to move.
+        if *to_ty == Type::I32
+            && self.prenarrowed_truncs.contains(&result_val)
+            && self.value_map.contains_key(&result_val)
+        {
+            return Ok(());
+        }
+
         let src = self.use_value(&src_val)?;
 
         let dst_class = reg_class_for_type(to_ty);
@@ -13933,6 +16928,19 @@ impl InstructionSelector {
                 self.emit(
                     block,
                     ISelInst::new(AArch64Opcode::Uxth, vec![ISelOperand::VReg(dst), src]),
+                );
+            }
+            Type::B1 => {
+                // trust-ir: truncating a wider integer to `Bool` keeps its LOW
+                // BIT. A `B1` register holds exactly 0 or 1 (branches, `ZExt`
+                // and ABI boundaries read it whole), so the bit is isolated:
+                // AND Wd, Wn, #1. A bare move would make `trunc(2)` true.
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::AndRI,
+                        vec![ISelOperand::VReg(dst), src, ISelOperand::Imm(1)],
+                    ),
                 );
             }
             _ => {
@@ -14049,6 +17057,15 @@ impl InstructionSelector {
         inst: &Instruction,
         block: Block,
     ) -> Result<(), ISelError> {
+        self.select_symbol_address(ISelOperand::Symbol(name.to_string()), inst, block)
+    }
+
+    fn select_symbol_address(
+        &mut self,
+        symbol: ISelOperand,
+        inst: &Instruction,
+        block: Block,
+    ) -> Result<(), ISelError> {
         Self::require_result(inst, "GlobalRef")?;
 
         let result_val = inst.results[0];
@@ -14071,10 +17088,7 @@ impl InstructionSelector {
             block,
             ISelInst::new(
                 AArch64Opcode::Adrp,
-                vec![
-                    ISelOperand::VReg(page),
-                    ISelOperand::Symbol(name.to_string()),
-                ],
+                vec![ISelOperand::VReg(page), symbol.clone()],
             ),
         );
 
@@ -14083,11 +17097,7 @@ impl InstructionSelector {
             block,
             ISelInst::new(
                 AArch64Opcode::AddPCRel,
-                vec![
-                    ISelOperand::VReg(dst),
-                    ISelOperand::VReg(page),
-                    ISelOperand::Symbol(name.to_string()),
-                ],
+                vec![ISelOperand::VReg(dst), ISelOperand::VReg(page), symbol],
             ),
         );
 
@@ -14315,12 +17325,15 @@ impl InstructionSelector {
 
             // BLR thunk. The thunk reads x0 (descriptor) and returns the
             // variable address in x0. Model it as a call: x0 is implicitly used,
-            // the caller-saved set is implicitly defined.
+            // the caller-saved set is implicitly defined. The thunk never
+            // raises, so a non-unwinding frame's call-site table treats the
+            // call as one that cannot unwind (`CANNOT_UNWIND_CALL`).
             self.emit(
                 block,
                 ISelInst::new(AArch64Opcode::Blr, vec![ISelOperand::VReg(thunk)])
                     .with_implicit_uses(vec![gpr::X0])
-                    .with_implicit_defs(call_implicit_defs()),
+                    .with_implicit_defs(call_implicit_defs())
+                    .as_cannot_unwind_call(),
             );
 
             // Copy the returned variable address (x0) into the result vreg.
@@ -14389,28 +17402,70 @@ impl InstructionSelector {
                     ],
                 ),
             );
+        } else if matches!(model, TlsModel::GeneralDynamic | TlsModel::LocalDynamic) {
+            // AOT ELF general-dynamic through a TLS descriptor (TLSDESC), the
+            // model a shared object (`pic`) needs for TLS that may live in a
+            // module loaded by `dlopen`. Local-dynamic reuses the same
+            // per-symbol descriptor sequence: it is a code-size optimization of
+            // general-dynamic for module-local TLS, not a different result.
+            //
+            // The canonical sequence (clang/gcc `-fPIC`) is
+            //
+            //   ADRP x0, :tlsdesc:sym             ; R_AARCH64_TLSDESC_ADR_PAGE21
+            //   LDR  x1, [x0, #:tlsdesc_lo12:sym] ; R_AARCH64_TLSDESC_LD64_LO12
+            //   ADD  x0, x0, #:tlsdesc_lo12:sym   ; R_AARCH64_TLSDESC_ADD_LO12
+            //   BLR  x1                           ; R_AARCH64_TLSDESC_CALL
+            //     -> x0 = TPREL(sym) for the calling thread
+            //   MRS  Xt, TPIDR_EL0
+            //   ADD  Xd, Xt, x0
+            //
+            // The four TLSDESC slots use FIXED registers (the static linker
+            // rewrites them in place when it relaxes to IE/LE), so ISel emits
+            // one call-like `TlsDescCall` that regalloc treats as a call with
+            // the conservative AAPCS64 clobber set; frame lowering expands it
+            // into the four slots after every pass that could separate them.
+            // Object emission maps the slots to the ELF TLSDESC relocations and
+            // fails closed on Mach-O (`FixupError::ElfOnlyFixupKind`); the
+            // JIT has no TLSDESC resolver (`is_jit_compatible() == false`).
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::TlsDescCall,
+                    vec![ISelOperand::Symbol(name.to_string())],
+                )
+                .with_implicit_defs(call_implicit_defs()),
+            );
+            let offset = self.new_vreg(RegClass::Gpr64);
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::Copy,
+                    vec![ISelOperand::VReg(offset), ISelOperand::PReg(gpr::X0)],
+                ),
+            );
+            let tp = self.new_vreg(RegClass::Gpr64);
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::Mrs,
+                    vec![ISelOperand::VReg(tp), ISelOperand::Imm(TPIDR_EL0_SYSREG)],
+                ),
+            );
+            self.emit(
+                block,
+                ISelInst::new(
+                    AArch64Opcode::AddRR,
+                    vec![
+                        ISelOperand::VReg(dst),
+                        ISelOperand::VReg(tp),
+                        ISelOperand::VReg(offset),
+                    ],
+                ),
+            );
         } else {
-            // VERDICT (evidence-based, 2026-07): GeneralDynamic/LocalDynamic
-            // stay FAIL-CLOSED — unreachable-by-lane, like f16/f128. GD/LD
-            // exist to resolve TLS for modules loaded AFTER program start
-            // (`dlopen`), via a `__tls_get_addr`/TLSDESC runtime call.
-            // trust-cg emits objects for MAIN EXECUTABLES only: no dylib/
-            // dlopen production lane exists anywhere in the t* stack (no
-            // driver emits a shared object, and the ELF link model is a
-            // static/main-image link, where the linker itself relaxes GD to
-            // IE/LE). Every TLS reference a trust-cg object can legally make
-            // is therefore covered by LocalExec (image-local TLS) and
-            // InitialExec (GOT-indirect TPREL, above). Wiring GD/LD would add
-            // an unverifiable runtime-call path with no producer able to
-            // reach it; if a dylib lane ever materializes, implement TLSDESC
-            // with its own AY relocation proof rows first. See the roadmap
-            // note in `designs/` (aarch64 TLS models).
             return Err(ISelError::UnsupportedTlsRefModel {
                 model,
-                reason: "GeneralDynamic/LocalDynamic TLS resolve dlopen'd-module TLS via a \
-                         __tls_get_addr/TLSDESC runtime call; trust-cg emits main-executable \
-                         objects only (no dylib/dlopen production lane exists), so these \
-                         models are unreachable-by-lane and stay fail-closed",
+                reason: "this TLS model has no AArch64 ELF or Mach-O access sequence",
             });
         }
 
@@ -14432,6 +17487,17 @@ impl InstructionSelector {
 
         let result_val = inst.results[0];
         let dst = self.new_vreg(RegClass::Gpr64);
+        // Aggregate loads are materialized as a fresh StackAddr + Memmove.
+        // Their value is address-carried, but its seeded ABI type remains the
+        // aggregate. Erasing it here makes subsequent calls pass a pointer
+        // instead of the aggregate's registers/stack image. Bare stack
+        // addresses retain the normal I64 carrier type.
+        let result_ty = self
+            .value_types
+            .get(&result_val)
+            .filter(|ty| ty.is_aggregate())
+            .cloned()
+            .unwrap_or(Type::I64);
 
         let runtime_slot =
             self.func
@@ -14466,7 +17532,7 @@ impl InstructionSelector {
                     ],
                 ),
             );
-            self.define_value(result_val, ISelOperand::VReg(dst), Type::I64);
+            self.define_value(result_val, ISelOperand::VReg(dst), result_ty);
             return Ok(());
         }
 
@@ -14482,7 +17548,7 @@ impl InstructionSelector {
             ),
         );
 
-        self.define_value(result_val, ISelOperand::VReg(dst), Type::I64);
+        self.define_value(result_val, ISelOperand::VReg(dst), result_ty);
         Ok(())
     }
 
@@ -14540,7 +17606,7 @@ impl InstructionSelector {
     pub fn define_block_params(&mut self, params: &[(Value, Type)]) {
         for (val, ty) in params {
             // Skip values already defined by copies in predecessor blocks.
-            // The adapter emits single-arg Iadd (copy) instructions in
+            // The adapter emits explicit Copy instructions in
             // predecessor blocks that define block parameter values before
             // the target block is processed.
             if self.value_map.contains_key(val) {
@@ -14564,7 +17630,9 @@ impl InstructionSelector {
     /// The value map is needed by the pipeline to propagate proof
     /// annotations from the adapter's [`ProofContext`](crate::adapter::ProofContext)
     /// onto the machine instructions that define each value.
-    pub fn finalize_with_value_map(mut self) -> (ISelFunction, HashMap<Value, ISelOperand>) {
+    pub fn finalize_with_value_map(
+        mut self,
+    ) -> (ISelFunction, std::collections::HashMap<Value, ISelOperand>) {
         Self::normalize_synthetic_block_ids(&mut self.func);
         (self.func, self.value_map)
     }
@@ -14580,6 +17648,7 @@ impl InstructionSelector {
         source: &EhFunctionInfo,
     ) -> Result<ISelFunction, ISelError> {
         Self::normalize_synthetic_block_ids(&mut self.func);
+        self.func.validate_eh_invoke_bindings()?;
         if source.is_empty() != self.func.eh_info.is_empty()
             || !source.structurally_matches(&self.func.eh_info)
         {
@@ -14597,8 +17666,9 @@ impl InstructionSelector {
     pub fn finalize_with_value_map_and_eh_info(
         mut self,
         source: &EhFunctionInfo,
-    ) -> Result<(ISelFunction, HashMap<Value, ISelOperand>), ISelError> {
+    ) -> Result<(ISelFunction, std::collections::HashMap<Value, ISelOperand>), ISelError> {
         Self::normalize_synthetic_block_ids(&mut self.func);
+        self.func.validate_eh_invoke_bindings()?;
         if source.is_empty() != self.func.eh_info.is_empty()
             || !source.structurally_matches(&self.func.eh_info)
         {
@@ -14681,15 +17751,12 @@ impl InstructionSelector {
             }
         }
 
+        // At most 2^31 distinct map keys lie in the synthetic upper half.
+        // max_real lies in the lower half, so the remaining u32 range always
+        // contains every compacted identity (even at both domain endpoints).
         let map: HashMap<u32, u32> = synthetic_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                let compact = max_real
-                    .checked_add(1 + i as u32)
-                    .expect("block id space exhausted while compacting synthetic blocks");
-                (*id, compact)
-            })
+            .into_iter()
+            .zip(max_real + 1..=u32::MAX)
             .collect();
         let remap = |b: &mut Block| {
             if let Some(n) = map.get(&b.0) {
@@ -16131,30 +19198,30 @@ impl InstructionSelector {
     /// - divisor:  X2 (lo), X3 (hi)
     /// - result:   X0 (lo), X1 (hi)
     fn select_i128_udiv(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
-        self.select_i128_div_libcall("__udivti3", inst, block)
+        self.select_i128_div_libcall(RuntimeSymbol::Udivti3, inst, block)
     }
 
     /// Select i128 signed division via libcall to `__divti3`.
     fn select_i128_sdiv(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
-        self.select_i128_div_libcall("__divti3", inst, block)
+        self.select_i128_div_libcall(RuntimeSymbol::Divti3, inst, block)
     }
 
     /// Select i128 unsigned remainder via libcall to `__umodti3`. Same
     /// register-pair ABI as division (the helper returns the remainder in the
     /// X0:X1 pair); signedness is carried entirely by the symbol.
     fn select_i128_urem(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
-        self.select_i128_div_libcall("__umodti3", inst, block)
+        self.select_i128_div_libcall(RuntimeSymbol::Umodti3, inst, block)
     }
 
     /// Select i128 signed remainder via libcall to `__modti3`.
     fn select_i128_srem(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
-        self.select_i128_div_libcall("__modti3", inst, block)
+        self.select_i128_div_libcall(RuntimeSymbol::Modti3, inst, block)
     }
 
     /// Common implementation for i128 division/remainder libcalls.
     fn select_i128_div_libcall(
         &mut self,
-        name: &str,
+        symbol: RuntimeSymbol,
         inst: &Instruction,
         block: Block,
     ) -> Result<(), ISelError> {
@@ -16192,9 +19259,10 @@ impl InstructionSelector {
             block,
             ISelInst::new(
                 AArch64Opcode::Bl,
-                vec![ISelOperand::Symbol(name.to_string())],
+                vec![ISelOperand::Symbol(symbol.name().to_string())],
             )
-            .with_implicit_uses(vec![gpr::X0, gpr::X1, gpr::X2, gpr::X3]),
+            .with_implicit_uses(vec![gpr::X0, gpr::X1, gpr::X2, gpr::X3])
+            .with_call_abi(register_only_call_abi(symbol.name())),
         );
 
         // Copy results from X0:X1 via Copy pseudo
@@ -16229,7 +19297,7 @@ impl InstructionSelector {
     /// libcall mechanism as the i128 div/rem helpers above.
     fn select_i128_to_float_libcall(
         &mut self,
-        name: &str,
+        symbol: RuntimeSymbol,
         inst: &Instruction,
         block: Block,
         dst_ty: Type,
@@ -16254,10 +19322,11 @@ impl InstructionSelector {
             block,
             ISelInst::new(
                 AArch64Opcode::Bl,
-                vec![ISelOperand::Symbol(name.to_string())],
+                vec![ISelOperand::Symbol(symbol.name().to_string())],
             )
             .with_implicit_uses(vec![gpr::X0, gpr::X1])
-            .with_implicit_defs(call_implicit_defs()),
+            .with_implicit_defs(call_implicit_defs())
+            .with_call_abi(register_only_call_abi(symbol.name())),
         );
         // Copy the float result out of the ABI return register (D0/S0 for f64/f32).
         let ret_locs = AppleAArch64ABI::classify_returns(std::slice::from_ref(&dst_ty));
@@ -16353,13 +19422,163 @@ mod tests {
     };
     use trust_cg_ir::function::{StackSlotAllocationKind, StackSlotSizeSource};
 
+    #[test]
+    fn exhausted_synthetic_trap_cursor_returns_error_without_mutation() {
+        let (mut selector, _) = make_add_isel();
+        for cursor in [u32::MAX - 1, u32::MAX] {
+            selector.next_block_id = cursor;
+            selector.func.ensure_block(Block(u32::MAX - 1));
+            let block_count = selector.func.blocks.len();
+            assert!(matches!(
+                selector.emit_synthetic_trap_block(),
+                Err(ISelError::SyntheticBlockIdExhausted)
+            ));
+            assert_eq!(selector.next_block_id, cursor);
+            assert_eq!(selector.func.blocks.len(), block_count);
+        }
+    }
+
+    #[test]
+    fn synthetic_compaction_preserves_domain_endpoint_references() {
+        let (mut selector, _) = make_add_isel();
+        let real = Block(SYNTHETIC_BLOCK_ID_BASE - 1);
+        let synthetic = [Block(SYNTHETIC_BLOCK_ID_BASE), Block(u32::MAX)];
+        selector.func.ensure_block(real);
+        for target in synthetic {
+            selector.func.ensure_block(target);
+            selector.func.push_inst(
+                real,
+                ISelInst::new(AArch64Opcode::B, vec![ISelOperand::Block(target)]),
+            );
+        }
+        InstructionSelector::normalize_synthetic_block_ids(&mut selector.func);
+        let compact = [
+            Block(SYNTHETIC_BLOCK_ID_BASE),
+            Block(SYNTHETIC_BLOCK_ID_BASE + 1),
+        ];
+        for (inst, target) in selector.func.blocks[&real].insts.iter().zip(compact) {
+            assert_eq!(inst.operands, vec![ISelOperand::Block(target)]);
+            assert!(selector.func.blocks.contains_key(&target));
+        }
+        assert!(!selector.func.blocks.contains_key(&Block(u32::MAX)));
+    }
+
+    /// Every classified call records its ABI facts on the `Bl`, and the
+    /// function records its own incoming stack-argument area; both reach the
+    /// machine IR sidecars. Narrow stack arguments are natural-width stores
+    /// at packed DarwinPCS offsets and eight-byte AAPCS64 slots.
+    #[test]
+    fn classified_calls_record_their_abi_facts() {
+        use trust_cg_ir::{CalleeSavedSet, StackArgStore};
+
+        let mut params = vec![Type::I64; 8];
+        params.extend([Type::I8, Type::I16, Type::I64]);
+        let sig = Signature {
+            params: params.clone(),
+            returns: vec![],
+        };
+        for (variant, stores, bytes) in [
+            (
+                AArch64AbiVariant::Darwin,
+                vec![(0, 1), (2, 2), (8, 8)],
+                16u32,
+            ),
+            (
+                AArch64AbiVariant::Aapcs64,
+                vec![(0, 1), (8, 2), (16, 8)],
+                24u32,
+            ),
+        ] {
+            let mut isel = InstructionSelector::new("caller".to_string(), sig.clone());
+            isel.set_abi_variant(variant);
+            let entry = Block(0);
+            isel.lower_formal_arguments(&sig, entry).unwrap();
+            let args: Vec<Value> = (0..params.len() as u32).map(Value).collect();
+            isel.select_call("callee", &args, &[], &[], entry).unwrap();
+            let ir = isel.finalize().to_ir_func();
+
+            assert_eq!(ir.incoming_stack_arg_bytes, Some(bytes), "{variant:?}");
+            assert_eq!(ir.call_abi_facts.len(), 1, "{variant:?}");
+            let (&call, facts) = ir.call_abi_facts.iter().next().unwrap();
+            assert_eq!(ir.inst(call).opcode, AArch64Opcode::Bl);
+            assert_eq!(facts.callee.as_deref(), Some("callee"));
+            assert_eq!(facts.stack_arg_bytes, bytes, "{variant:?}");
+            let mut recorded = facts.stack_stores.clone();
+            recorded.sort_unstable();
+            let expected: Vec<StackArgStore> = stores
+                .iter()
+                .map(|&(offset, bytes)| StackArgStore { offset, bytes })
+                .collect();
+            assert_eq!(recorded, expected, "{variant:?}");
+            assert!(!facts.hidden_result_pointer && !facts.variadic);
+            assert!(!facts.aggregate_stack_args);
+            assert_eq!(facts.callee_saved, CalleeSavedSet::Aapcs64);
+        }
+
+        // A register-only call records zero stack bytes; an sret callee
+        // records its hidden result pointer.
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new("caller".to_string(), sig.clone());
+        isel.set_abi_variant(AArch64AbiVariant::Aapcs64);
+        isel.lower_formal_arguments(&sig, Block(0)).unwrap();
+        isel.seed_sret_arg_callees(&HashSet::from_iter(["sret_callee".to_string()]));
+        isel.select_call("plain", &[Value(0)], &[], &[], Block(0))
+            .unwrap();
+        isel.select_call("sret_callee", &[Value(0)], &[], &[], Block(0))
+            .unwrap();
+        let ir = isel.finalize().to_ir_func();
+        assert_eq!(ir.incoming_stack_arg_bytes, Some(0));
+        let facts: Vec<_> = ir.call_abi_facts.values().collect();
+        assert_eq!(facts.len(), 2);
+        let plain = facts
+            .iter()
+            .find(|f| f.callee.as_deref() == Some("plain"))
+            .unwrap();
+        assert_eq!(plain.stack_arg_bytes, 0);
+        assert!(plain.stack_stores.is_empty() && !plain.hidden_result_pointer);
+        let sret = facts
+            .iter()
+            .find(|f| f.callee.as_deref() == Some("sret_callee"))
+            .unwrap();
+        assert!(sret.hidden_result_pointer);
+    }
+
+    /// A selector with no calling convention selected refuses the ABI
+    /// classification instead of assuming DarwinPCS; selecting either
+    /// variant admits the same signature.
+    #[test]
+    fn unselected_abi_variant_refuses_formal_and_call_classification() {
+        let sig = Signature {
+            params: vec![Type::I64, Type::I8],
+            returns: vec![],
+        };
+        let mut unset = InstructionSelector::new("no_abi".to_string(), sig.clone());
+        let error = unset
+            .lower_formal_arguments(&sig, Block(0))
+            .expect_err("formal lowering must not default the AArch64 convention");
+        assert!(
+            error.to_string().contains("[TCG-TARGET-ABI]"),
+            "unexpected refusal: {error}"
+        );
+        for variant in [AArch64AbiVariant::Darwin, AArch64AbiVariant::Aapcs64] {
+            let mut selected = InstructionSelector::new("abi".to_string(), sig.clone());
+            selected.set_abi_variant(variant);
+            selected
+                .lower_formal_arguments(&sig, Block(0))
+                .expect("an explicit convention admits the signature");
+        }
+    }
+
     /// Helper: create a simple isel for fn(i32, i32) -> i32.
     fn make_add_isel() -> (InstructionSelector, Block) {
         let sig = Signature {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("add".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("add".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         (isel, entry)
@@ -16371,7 +19590,7 @@ mod tests {
             params: vec![Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("op64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("op64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         (isel, entry)
@@ -16382,10 +19601,50 @@ mod tests {
             params: vec![Type::I64, Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("mul_add64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("mul_add64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         (isel, entry)
+    }
+
+    /// A B1 comparison result returned against a byte-wide I8 signature slot
+    /// (the bridge's `Ty::Bool` carrier) must SELECT, not ReturnTypeMismatch:
+    /// CSET materializes B1 as a fully zero-extended 0/1, which is exactly the
+    /// Rust ABI `Zext` bool-return contract. The trust-utf/trust-hex blocker.
+    #[test]
+    fn select_return_of_b1_cmp_against_i8_signature() {
+        let sig = Signature {
+            params: vec![Type::I32, Type::I32],
+            returns: vec![Type::I8],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("is_lt".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        let instructions = vec![
+            Instruction {
+                opcode: Opcode::Icmp {
+                    cond: IntCC::UnsignedLessThan,
+                },
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Return,
+                args: vec![Value(2)],
+                results: vec![],
+            },
+        ];
+        isel.select_block(entry, &instructions)
+            .expect("B1 cmp returned through an I8 (bool-carrier) slot must select");
+        let mfunc = isel.finalize();
+        let mblock = &mfunc.blocks[&entry];
+        assert!(
+            mblock
+                .insts
+                .iter()
+                .any(|i| matches!(i.opcode, AArch64Opcode::CSet)),
+            "the returned bool must be CSET-materialized (zero-extended 0/1)"
+        );
     }
 
     #[test]
@@ -16529,7 +19788,7 @@ mod tests {
             params: vec![Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("mul_neg64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("mul_neg64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -16649,7 +19908,8 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("mixed_addr_add".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("mixed_addr_add".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -16707,7 +19967,8 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("mixed_addr_sub".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("mixed_addr_sub".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -16762,7 +20023,8 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("mixed_const_addr_add".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("mixed_const_addr_add".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -16826,7 +20088,8 @@ mod tests {
             params: vec![Type::I64, Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("mixed_trunc_addr_add".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("mixed_trunc_addr_add".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -16884,7 +20147,8 @@ mod tests {
             params: vec![],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("i32_const_mul_add".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("i32_const_mul_add".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17011,7 +20275,7 @@ mod tests {
             params: vec![Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fpop".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fpop".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         (isel, entry)
@@ -17023,7 +20287,7 @@ mod tests {
             params: vec![Type::F32, Type::F32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("fpop32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fpop32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         (isel, entry)
@@ -17035,7 +20299,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("test".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("test".to_string(), sig);
         // Most selector unit tests exercise concrete ARMv8.1-A opcode shapes.
         // Production/default selector construction remains generic and
         // fail-closed; capability-default coverage below constructs directly.
@@ -17068,12 +20332,87 @@ mod tests {
     }
 
     #[test]
+    fn formal_arguments_of_a_re_entered_entry_block_run_ahead_of_it() {
+        // `entry(a, b)` is its own back-edge target: `br entry(b, a)`.
+        let sig = Signature {
+            params: vec![Type::I64, Type::I64],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("entry_loop".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments_before_reentered_entry(&sig, entry)
+            .unwrap();
+        let back_edge = [
+            Instruction {
+                opcode: Opcode::Copy,
+                args: vec![Value(1)],
+                results: vec![Value(2)],
+            },
+            Instruction {
+                opcode: Opcode::Copy,
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            Instruction {
+                opcode: Opcode::Copy,
+                args: vec![Value(2)],
+                results: vec![Value(0)],
+            },
+            Instruction {
+                opcode: Opcode::Jump { dest: entry },
+                args: vec![],
+                results: vec![],
+            },
+        ];
+        isel.select_block(entry, &back_edge).unwrap();
+        let mfunc = isel.finalize();
+
+        let pre_entry = mfunc.block_order[0];
+        assert_ne!(pre_entry, entry, "the formals get a block of their own");
+        assert_eq!(mfunc.block_order, vec![pre_entry, entry]);
+        let pre = &mfunc.blocks[&pre_entry];
+        let opcodes: Vec<_> = pre.insts.iter().map(|inst| inst.opcode).collect();
+        assert_eq!(
+            opcodes,
+            [AArch64Opcode::Copy, AArch64Opcode::Copy, AArch64Opcode::B]
+        );
+        assert_eq!(pre.insts[0].operands[1], ISelOperand::PReg(gpr::X0));
+        assert_eq!(pre.insts[1].operands[1], ISelOperand::PReg(gpr::X1));
+        assert_eq!(pre.insts[2].operands, [ISelOperand::Block(entry)]);
+        assert_eq!(pre.successors, [entry]);
+        assert!(
+            mfunc.blocks[&entry]
+                .insts
+                .iter()
+                .all(|inst| !inst.operands.iter().any(
+                    |op| matches!(op, ISelOperand::PReg(p) if *p == gpr::X0 || *p == gpr::X1)
+                )),
+            "the re-entered block must not read the incoming registers"
+        );
+        // The back edge writes the formals' own registers, which the entry
+        // block reads as its parameters.
+        let formals = [&pre.insts[0].operands[0], &pre.insts[1].operands[0]];
+        let written: Vec<_> = mfunc.blocks[&entry]
+            .insts
+            .iter()
+            .filter(|inst| inst.opcode == AArch64Opcode::MovR)
+            .map(|inst| &inst.operands[0])
+            .collect();
+        assert!(formals.iter().all(|formal| written.contains(formal)));
+
+        let ir = mfunc.to_ir_func();
+        assert_eq!(ir.entry.0, pre_entry.0, "the formal block is the entry");
+        assert!(ir.blocks[ir.entry.0 as usize].preds.is_empty());
+    }
+
+    #[test]
     fn lower_formal_arguments_small_i64_struct_materializes_register_to_slot() {
         let sig = Signature {
             params: vec![Type::Struct(vec![Type::I64])],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("small_struct_formal".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("small_struct_formal".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17105,8 +20444,10 @@ mod tests {
             params: vec![Type::Struct(vec![Type::I64]), Type::I64],
             returns: vec![],
         };
-        let mut isel =
-            InstructionSelector::new("small_struct_then_scalar_formal".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test(
+            "small_struct_then_scalar_formal".to_string(),
+            sig.clone(),
+        );
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17142,7 +20483,8 @@ mod tests {
             params: vec![Type::Struct(vec![Type::I64, Type::I32])],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("medium_struct_formal".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("medium_struct_formal".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17177,8 +20519,10 @@ mod tests {
             params: vec![Type::Struct(vec![Type::I64, Type::I32]), Type::I64],
             returns: vec![],
         };
-        let mut isel =
-            InstructionSelector::new("medium_struct_then_scalar_formal".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test(
+            "medium_struct_then_scalar_formal".to_string(),
+            sig.clone(),
+        );
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17224,7 +20568,8 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("scalar_f32_formal".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("scalar_f32_formal".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17241,7 +20586,8 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("scalar_f64_formal".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("scalar_f64_formal".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17259,7 +20605,8 @@ mod tests {
             params: vec![hfa_ty],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("hfa_f32_formal".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("hfa_f32_formal".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17298,8 +20645,10 @@ mod tests {
             params: vec![Type::Struct(vec![Type::F64, Type::F64]), Type::F64],
             returns: vec![],
         };
-        let mut isel =
-            InstructionSelector::new("hfa_f64_then_scalar_formal".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test(
+            "hfa_f64_then_scalar_formal".to_string(),
+            sig.clone(),
+        );
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17348,7 +20697,8 @@ mod tests {
             ],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("mixed_width_formals".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("mixed_width_formals".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17377,7 +20727,8 @@ mod tests {
             params: vec![Type::I128, Type::I64],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("i128_then_i64_formals".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("i128_then_i64_formals".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17429,7 +20780,8 @@ mod tests {
             ],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("stack_then_fpr_formal".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("stack_then_fpr_formal".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17517,7 +20869,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::B1],
         };
-        let mut isel = InstructionSelector::new("cmp_fold".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("cmp_fold".to_string(), sig);
         let entry = Block(0);
         isel.value_types.insert(Value(0), Type::I32);
         isel.value_types.insert(Value(2), Type::B1);
@@ -17619,12 +20971,14 @@ mod tests {
         let mfunc = isel.finalize();
         let mblock = &mfunc.blocks[&entry];
         assert_eq!(mblock.insts.len(), 4);
-        assert_eq!(mblock.insts[2].operands[0], ISelOperand::PReg(PReg::new(0))); // X0
+        assert_eq!(mblock.insts[2].opcode, AArch64Opcode::Copy);
+        assert_eq!(mblock.insts[2].operands[0], ISelOperand::PReg(gpr::W0));
         assert_eq!(mblock.insts[3].opcode, AArch64Opcode::Ret);
         assert!(
-            mblock.insts[3].implicit_uses.contains(&gpr::X0),
-            "RET must keep the ABI integer return register live"
+            mblock.insts[3].implicit_uses.contains(&gpr::W0),
+            "RET must keep the width-precise ABI integer return register live"
         );
+        assert!(!mblock.insts[3].implicit_uses.contains(&gpr::X0));
 
         let ir_func = mfunc.to_ir_func();
         let ir_ret = ir_func
@@ -17633,9 +20987,10 @@ mod tests {
             .find(|inst| inst.opcode == AArch64Opcode::Ret)
             .expect("IR should preserve RET");
         assert!(
-            ir_ret.implicit_uses.contains(&gpr::X0),
-            "IR RET must preserve the ABI integer return register use"
+            ir_ret.implicit_uses.contains(&gpr::W0),
+            "IR RET must preserve the width-precise ABI integer return register use"
         );
+        assert!(!ir_ret.implicit_uses.contains(&gpr::X0));
     }
 
     #[test]
@@ -17644,7 +20999,7 @@ mod tests {
             params: vec![Type::F16],
             returns: vec![Type::F16],
         };
-        let mut isel = InstructionSelector::new("ret_f16".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ret_f16".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17677,7 +21032,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("ret_void".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ret_void".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17707,7 +21062,7 @@ mod tests {
             params: vec![],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("ret_i32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ret_i32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17737,7 +21092,8 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("ret_void_bad".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("ret_void_bad".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -17767,7 +21123,7 @@ mod tests {
             params: vec![],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("ret_f32".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_f32".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -17852,7 +21208,7 @@ mod tests {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("add".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("add".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         isel.select_instruction(
@@ -17879,7 +21235,8 @@ mod tests {
         assert_eq!(mblock.insts[0].opcode, AArch64Opcode::Copy);
         assert_eq!(mblock.insts[1].opcode, AArch64Opcode::Copy);
         assert_eq!(mblock.insts[2].opcode, AArch64Opcode::AddRR);
-        assert_eq!(mblock.insts[3].opcode, AArch64Opcode::Uxtw); // return value zero-extend
+        assert_eq!(mblock.insts[3].opcode, AArch64Opcode::Copy); // width-precise W0 return
+        assert_eq!(mblock.insts[3].operands[0], ISelOperand::PReg(gpr::W0));
         assert_eq!(mblock.insts[4].opcode, AArch64Opcode::Ret);
         assert_eq!(mfunc.name, "add");
         assert_eq!(mfunc.next_vreg, 3);
@@ -18352,7 +21709,8 @@ mod tests {
                 params: vec![Type::V128, Type::V128],
                 returns: vec![Type::V128],
             };
-            let mut isel = InstructionSelector::new("v128_logic".to_string(), sig.clone());
+            let mut isel =
+                InstructionSelector::new_darwin_test("v128_logic".to_string(), sig.clone());
             let entry = Block(0);
             isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18373,18 +21731,22 @@ mod tests {
         }
     }
 
+    /// V128 and V64 OR-NOT (`a | !b`, L04-P6) lower to a NOT of the second
+    /// operand into a fresh register of the destination's class, then an ORR
+    /// of the first operand with it: never a lane-width-blind scalar ORN, and
+    /// never the operands swapped.
     #[test]
-    fn select_v128_bor_not_stays_fail_closed() {
-        let sig = Signature {
-            params: vec![Type::V128, Type::V128],
-            returns: vec![Type::V128],
-        };
-        let mut isel = InstructionSelector::new("v128_bornot".to_string(), sig.clone());
-        let entry = Block(0);
-        isel.lower_formal_arguments(&sig, entry).unwrap();
-
-        let err = isel
-            .select_instruction(
+    fn select_vector_bor_not_lowers_to_not_then_orr() {
+        for (ty, class) in [(Type::V128, RegClass::Fpr128), (Type::V64, RegClass::Fpr64)] {
+            let sig = Signature {
+                params: vec![ty.clone(), ty.clone()],
+                returns: vec![ty.clone()],
+            };
+            let mut isel =
+                InstructionSelector::new_darwin_test("vector_bornot".to_string(), sig.clone());
+            let entry = Block(0);
+            isel.lower_formal_arguments(&sig, entry).unwrap();
+            isel.select_instruction(
                 &Instruction {
                     opcode: Opcode::BorNot,
                     args: vec![Value(0), Value(1)],
@@ -18392,13 +21754,24 @@ mod tests {
                 },
                 entry,
             )
-            .expect_err("V128 BorNot should remain fail-closed");
+            .unwrap_or_else(|err| panic!("{ty:?} BorNot must lower: {err:?}"));
 
-        assert!(
-            matches!(err, ISelError::UnsupportedOpcode(ref message)
-                if message.contains("V128 OR-NOT is not lowered")),
-            "unexpected V128 BorNot diagnostic: {err:?}"
-        );
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let (not, orr) = (&insts[2], &insts[3]);
+            assert_eq!(not.opcode, AArch64Opcode::NeonNotV, "{ty:?}");
+            assert_eq!(orr.opcode, AArch64Opcode::NeonOrrV, "{ty:?}");
+            let (lhs, rhs) = (insts[0].operands[0].clone(), insts[1].operands[0].clone());
+            // NOT reads the SECOND operand; ORR reads the first and the NOT.
+            assert_eq!(not.operands.len(), 2, "{ty:?}");
+            assert_eq!(not.operands[1], rhs, "{ty:?}: NOT must invert b");
+            assert_eq!(orr.operands[1], lhs, "{ty:?}: ORR must read a");
+            assert_eq!(orr.operands[2], not.operands[0], "{ty:?}: ORR must read !b");
+            match &not.operands[0] {
+                ISelOperand::VReg(vreg) => assert_eq!(vreg.class, class, "{ty:?}"),
+                other => panic!("{ty:?}: NOT destination {other:?}"),
+            }
+        }
     }
 
     // =======================================================================
@@ -18412,7 +21785,7 @@ mod tests {
             params: vec![Type::I8],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("sextb".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("sextb".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18442,7 +21815,7 @@ mod tests {
             params: vec![Type::I16],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("sexth".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("sexth".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18469,7 +21842,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("sxtw".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("sxtw".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18490,13 +21863,70 @@ mod tests {
         assert_eq!(mfunc.blocks[&entry].insts[1].opcode, AArch64Opcode::Sxtw);
     }
 
+    /// The sign extension of a `bool` makes `true` all ones (trust-ir widens
+    /// `as_signed()` of the 1-bit value): `SBFM #0, #0` sign-extends bit 0
+    /// into the destination, and for an `I128` into the low half, whose
+    /// `ASR #63` is the high half. The `I128` low half was a copy of the 0/1
+    /// value, so `true` widened to `(1, 0)`.
+    #[test]
+    fn select_sext_bool_sign_extends_bit_zero_into_every_width() {
+        for to_ty in [Type::I32, Type::I64, Type::I128] {
+            let sig = Signature {
+                params: vec![Type::B1],
+                returns: vec![to_ty.clone()],
+            };
+            let mut isel =
+                InstructionSelector::new_darwin_test("sext_bool".to_string(), sig.clone());
+            let entry = Block(0);
+            isel.lower_formal_arguments(&sig, entry).unwrap();
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Sextend {
+                        from_ty: Type::B1,
+                        to_ty: to_ty.clone(),
+                    },
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            // 1 COPY (formal arg), then the extension.
+            let sbfm = &insts[1];
+            assert_eq!(sbfm.opcode, AArch64Opcode::Sbfm, "{to_ty:?}: {insts:?}");
+            assert_eq!(sbfm.operands[1], insts[0].operands[0], "{to_ty:?}");
+            assert_eq!(sbfm.operands[2], ISelOperand::Imm(0), "{to_ty:?}");
+            assert_eq!(sbfm.operands[3], ISelOperand::Imm(0), "{to_ty:?}");
+            if to_ty == Type::I128 {
+                assert!(
+                    matches!(
+                        sbfm.operands[0],
+                        ISelOperand::VReg(VReg {
+                            class: RegClass::Gpr64,
+                            ..
+                        })
+                    ),
+                    "the low half is a 64-bit SBFM: {insts:?}"
+                );
+                assert_eq!(insts.len(), 3, "{insts:?}");
+                assert_eq!(insts[2].opcode, AArch64Opcode::AsrRI);
+                assert_eq!(insts[2].operands[1], sbfm.operands[0]);
+                assert_eq!(insts[2].operands[2], ISelOperand::Imm(63));
+            } else {
+                assert_eq!(insts.len(), 2, "{to_ty:?}: {insts:?}");
+            }
+        }
+    }
+
     #[test]
     fn select_uxtb_to_i32() {
         let sig = Signature {
             params: vec![Type::I8],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("uxtb".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("uxtb".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18523,7 +21953,7 @@ mod tests {
             params: vec![Type::I16],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("uxth".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("uxth".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18552,7 +21982,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("uxtw".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("uxtw".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18588,7 +22018,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("ubfm".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ubfm".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -18617,7 +22047,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("sbfm".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("sbfm".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -20011,7 +23441,7 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("csel".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("csel".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -20047,7 +23477,7 @@ mod tests {
             params: vec![Type::I32, Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("csel64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("csel64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -20086,7 +23516,7 @@ mod tests {
                 params: vec![Type::I32, fty.clone(), fty.clone()],
                 returns: vec![fty.clone()],
             };
-            let mut isel = InstructionSelector::new("fpsel".to_string(), sig.clone());
+            let mut isel = InstructionSelector::new_darwin_test("fpsel".to_string(), sig.clone());
             let entry = Block(0);
             isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -20146,7 +23576,7 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fold_rr".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_rr".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20211,7 +23641,7 @@ mod tests {
             params: vec![Type::I32, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fold_ri".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_ri".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20268,7 +23698,7 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("fold_eq".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_eq".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20316,7 +23746,7 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("fold_multi".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_multi".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20389,7 +23819,8 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("fold_multi_data".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("fold_multi_data".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20444,7 +23875,7 @@ mod tests {
             params: vec![Type::F64, Type::F64, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fold_fcmp".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_fcmp".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20508,7 +23939,8 @@ mod tests {
             params: vec![Type::F64, Type::F64, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fold_fcmp_eq".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("fold_fcmp_eq".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20556,7 +23988,8 @@ mod tests {
                 params: vec![Type::F64, Type::F64, Type::F64, Type::F64],
                 returns: vec![Type::F64],
             };
-            let mut isel = InstructionSelector::new("fold_fcmp_2cc".to_string(), sig.clone());
+            let mut isel =
+                InstructionSelector::new_darwin_test("fold_fcmp_2cc".to_string(), sig.clone());
             let entry = Block(0);
             isel.lower_formal_arguments(&sig, entry).unwrap();
             let instructions = vec![
@@ -20604,7 +24037,7 @@ mod tests {
             params: vec![Type::F64, Type::F64, Type::F64, Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("fold_idamax".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_idamax".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20701,7 +24134,7 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fold_tst".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_tst".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20765,7 +24198,7 @@ mod tests {
             params: vec![Type::I32, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fold_andc".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fold_andc".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20848,7 +24281,8 @@ mod tests {
             params: vec![Type::I32, Type::I32, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fold_between".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("fold_between".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = vec![
@@ -20937,7 +24371,7 @@ mod tests {
                 params: vec![Type::I32, Type::I32, Type::I64, Type::I64],
                 returns: vec![Type::I64],
             };
-            let mut isel = InstructionSelector::new("fold_cc".to_string(), sig.clone());
+            let mut isel = InstructionSelector::new_darwin_test("fold_cc".to_string(), sig.clone());
             let entry = Block(0);
             isel.lower_formal_arguments(&sig, entry).unwrap();
             let instructions = vec![
@@ -20977,7 +24411,7 @@ mod tests {
             params: vec![Type::V128, Type::V128, Type::V128],
             returns: vec![Type::V128],
         };
-        let mut isel = InstructionSelector::new("csel_v128".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("csel_v128".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -21006,7 +24440,8 @@ mod tests {
             params: vec![Type::V128, Type::V128, Type::V128],
             returns: vec![Type::V128],
         };
-        let mut isel = InstructionSelector::new("csel_v128_eq".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("csel_v128_eq".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -21149,7 +24584,7 @@ mod tests {
             params: vec![Type::V128, Type::V128, Type::V128],
             returns: vec![Type::V128],
         };
-        let mut isel = InstructionSelector::new("vfmuladd".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("vfmuladd".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         isel.select_instruction(
@@ -21176,7 +24611,7 @@ mod tests {
                 params: vec![Type::V128],
                 returns: vec![Type::F64],
             };
-            let mut isel = InstructionSelector::new("ext".to_string(), sig.clone());
+            let mut isel = InstructionSelector::new_darwin_test("ext".to_string(), sig.clone());
             let entry = Block(0);
             isel.lower_formal_arguments(&sig, entry).unwrap();
             isel.select_instruction(
@@ -21219,7 +24654,7 @@ mod tests {
             params: vec![Type::V128],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("ext".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ext".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         // `<2 x f64>` has lanes 0..=1; the encoder rejects lane > 1, so ISel
@@ -21293,7 +24728,7 @@ mod tests {
             params: vec![Type::V128, Type::F64, Type::V128],
             returns: vec![Type::V128],
         };
-        let mut isel = InstructionSelector::new("bad".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bad".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let err = isel.select_instruction(
@@ -21316,7 +24751,7 @@ mod tests {
             params: vec![Type::V128, Type::V128],
             returns: vec![Type::V128],
         };
-        let mut isel = InstructionSelector::new("bad".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bad".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let err = isel.select_instruction(
@@ -21334,13 +24769,65 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_fp_asm_lir_rejects_bad_arity_and_non_float_inputs() {
+        for opcode in [
+            Opcode::Aarch64FmaddAsm,
+            Opcode::Aarch64FsqrtAsm,
+            Opcode::Aarch64FrintnAsm,
+        ] {
+            let arity = if opcode == Opcode::Aarch64FmaddAsm {
+                3
+            } else {
+                1
+            };
+            for ty in [Type::I64, Type::F16, Type::F32, Type::F64] {
+                for extra in [false, true] {
+                    let sig = Signature {
+                        params: vec![ty.clone(); arity + 1],
+                        returns: vec![ty.clone()],
+                    };
+                    let mut isel =
+                        InstructionSelector::new_darwin_test("fp_asm".into(), sig.clone());
+                    let entry = Block(0);
+                    isel.lower_formal_arguments(&sig, entry).unwrap();
+                    let result = isel.select_instruction(
+                        &Instruction {
+                            opcode: opcode.clone(),
+                            args: (0..arity + usize::from(extra))
+                                .map(|i| Value(i as u32))
+                                .collect(),
+                            results: vec![Value(10)],
+                        },
+                        entry,
+                    );
+                    let valid = !extra && matches!(ty, Type::F32 | Type::F64);
+                    assert_eq!(
+                        result.is_ok(),
+                        valid,
+                        "{opcode:?} {ty:?} extra={extra}: {result:?}"
+                    );
+                    if valid {
+                        let func = isel.finalize();
+                        assert!(
+                            func.blocks[&entry]
+                                .insts
+                                .iter()
+                                .all(|inst| !inst.fmuladd_may_unfuse)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn select_fma_emits_fmadd_with_abc_operand_order() {
         // Fma(a, b, c) = a*b + c -> FMADD Rd, Rn=a, Rm=b, Ra=c.
         let sig = Signature {
             params: vec![Type::F64, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fma".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fma".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         isel.select_instruction(
@@ -21373,7 +24860,7 @@ mod tests {
             params: vec![Type::F64, Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fmuladd".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fmuladd".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         isel.select_instruction(
@@ -21457,7 +24944,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("fcvt2i".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fcvt2i".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -21484,7 +24971,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("i2f".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("i2f".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -21525,7 +25012,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("i642f64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("i642f64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -21617,7 +25104,7 @@ mod tests {
     }
 
     #[test]
-    fn select_fcvt_to_int_f16_to_i16_uses_half_source_hint() {
+    fn select_fcvt_to_int_f16_to_i16_preserves_half_source_register() {
         let (mut isel, entry) = make_empty_isel();
         let src = Value(0);
         let result = Value(1);
@@ -21646,7 +25133,8 @@ mod tests {
         let mfunc = isel.finalize();
         let inst = &mfunc.blocks[&entry].insts[0];
         assert_eq!(inst.opcode, AArch64Opcode::FcvtzsRR);
-        assert_eq!(inst.operands[2], ISelOperand::Imm(16));
+        assert_eq!(inst.operands.len(), 2);
+        assert_eq!(inst.operands[1], ISelOperand::VReg(src_vreg));
     }
 
     // =======================================================================
@@ -21682,6 +25170,42 @@ mod tests {
             mblock.insts[1].operands[2],
             ISelOperand::Symbol("my_global".to_string())
         );
+    }
+
+    #[test]
+    fn select_exact_function_address_preserves_binding_in_both_machine_operands() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::FunctionAddr {
+                    name: "target".into(),
+                    function: 9001,
+                },
+                args: vec![],
+                results: vec![Value(0)],
+            },
+            entry,
+        )
+        .unwrap();
+        let selected = isel.finalize();
+        let block = &selected.blocks[&entry];
+        assert_eq!(
+            block.insts[0].operands[1],
+            ISelOperand::ExactModuleSymbol("target".into())
+        );
+        assert_eq!(
+            block.insts[1].operands[2],
+            ISelOperand::ExactModuleSymbol("target".into())
+        );
+        let machine = selected.to_ir_func();
+        let symbols = machine
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .flat_map(|id| &machine.inst(*id).operands)
+            .filter_map(|operand| operand.as_exact_module_symbol())
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, ["target", "target"]);
     }
 
     #[test]
@@ -21761,45 +25285,85 @@ mod tests {
         // The thunk is called indirectly; x0 is an implicit use (the arg).
         assert_eq!(mblock.insts[4].opcode, AArch64Opcode::Blr);
         assert!(mblock.insts[4].implicit_uses.contains(&gpr::X0));
+        // The thunk never raises: a non-unwinding frame's table reads the call
+        // as one that cannot unwind (`InstFlags::CANNOT_UNWIND_CALL`). No other
+        // instruction of the sequence carries the mark.
+        assert!(mblock.insts[4].cannot_unwind_call);
+        assert_eq!(
+            mblock
+                .insts
+                .iter()
+                .filter(|inst| inst.cannot_unwind_call)
+                .count(),
+            1
+        );
         // The returned variable address (x0) is copied into the result.
         assert_eq!(mblock.insts[5].opcode, AArch64Opcode::Copy);
         assert_eq!(mblock.insts[5].operands[1], ISelOperand::PReg(gpr::X0));
+
+        // Observe the actual shared machine-IR boundary as well as the
+        // selector sidecar. Dropping this bit here changes EH classification
+        // even when every emitted opcode and operand remains identical.
+        let machine = mfunc.to_ir_func();
+        let block = machine.block(machine.entry);
+        assert_eq!(block.insts.len(), 6);
+        for (index, &id) in block.insts.iter().enumerate() {
+            let inst = machine.inst(id);
+            assert_eq!(
+                inst.flags
+                    .contains(trust_cg_ir::InstFlags::CANNOT_UNWIND_CALL),
+                index == 4,
+                "TLV instruction {index}"
+            );
+        }
+        assert_eq!(machine.inst(block.insts[4]).opcode, AArch64Opcode::Blr);
     }
 
+    /// General-dynamic (and local-dynamic, which reuses it) lowers to the
+    /// single call-like TLSDESC form plus the thread-pointer add: frame
+    /// lowering later expands the call into the fixed ADRP/LDR/ADD/BLR slots.
     #[test]
-    fn select_tls_ref_dynamic_models_fail_closed() {
-        // GD/LD stay fail-closed by VERDICT (unreachable-by-lane): they exist
-        // for dlopen'd-module TLS and trust-cg emits main-executable objects
-        // only. InitialExec is no longer in this list — it lowers to the
-        // GOT-indirect TPREL sequence (see the test below).
+    fn select_tls_ref_dynamic_models_emit_tlsdesc_call() {
         for model in [TlsModel::GeneralDynamic, TlsModel::LocalDynamic] {
             let (mut isel, entry) = make_empty_isel();
-            let err = isel
-                .select_instruction(
-                    &Instruction {
-                        opcode: Opcode::TlsRef {
-                            name: "thread_local_var".to_string(),
-                            model,
-                            local_exec_offset: None,
-                        },
-                        args: vec![],
-                        results: vec![Value(0)],
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::TlsRef {
+                        name: "thread_local_var".to_string(),
+                        model,
+                        local_exec_offset: None,
                     },
-                    entry,
-                )
-                .expect_err("GD/LD TLS models must not lower");
+                    args: vec![],
+                    results: vec![Value(0)],
+                },
+                entry,
+            )
+            .unwrap_or_else(|err| panic!("{model:?} must lower through TLSDESC: {err}"));
 
-            assert!(
-                matches!(
-                    err,
-                    ISelError::UnsupportedTlsRefModel {
-                        model: rejected,
-                        reason
-                    } if rejected == model
-                        && reason.contains("unreachable-by-lane")
-                ),
-                "unexpected error for {model:?}: {err}"
+            let mfunc = isel.finalize();
+            let mblock = &mfunc.blocks[&entry];
+            //   [0] TlsDescCall sym      (call; clobbers the AAPCS64 caller-saved set)
+            //   [1] Copy off, x0         (x0 = TPREL(sym))
+            //   [2] MRS  tp, TPIDR_EL0
+            //   [3] ADD  dst, tp, off
+            assert_eq!(mblock.insts.len(), 4, "{model:?}");
+            assert_eq!(mblock.insts[0].opcode, AArch64Opcode::TlsDescCall);
+            assert_eq!(
+                mblock.insts[0].operands,
+                vec![ISelOperand::Symbol("thread_local_var".to_string())]
             );
+            for clobbered in [gpr::X0, gpr::X1, gpr::LR] {
+                assert!(
+                    mblock.insts[0].implicit_defs.contains(&clobbered),
+                    "{model:?}: the resolver call must clobber {clobbered:?}"
+                );
+            }
+            assert_eq!(mblock.insts[1].opcode, AArch64Opcode::Copy);
+            assert_eq!(mblock.insts[1].operands[1], ISelOperand::PReg(gpr::X0));
+            assert_eq!(mblock.insts[2].opcode, AArch64Opcode::Mrs);
+            assert_eq!(mblock.insts[3].opcode, AArch64Opcode::AddRR);
+            assert_eq!(mblock.insts[3].operands[1], mblock.insts[2].operands[0]);
+            assert_eq!(mblock.insts[3].operands[2], mblock.insts[1].operands[0]);
         }
     }
 
@@ -22101,6 +25665,139 @@ mod tests {
         assert_eq!(ir_func.stack_slots[1].align, 16);
     }
 
+    /// L10-P5: the instruction-selection exit refuses, by name, a function
+    /// whose register counter does not exceed a register it references, and a
+    /// successor naming a block that was never laid out; a fresh ID from
+    /// either counter would alias it.
+    #[test]
+    fn try_to_ir_func_refuses_stale_identity_counters_by_name() {
+        use trust_cg_ir::{MachIdAdmissionError, MachIdDomain, MachIdSite};
+
+        let (mut isel, entry) = make_empty_isel();
+        let value = isel.new_vreg(RegClass::Gpr64);
+        isel.emit(
+            entry,
+            ISelInst::new(
+                AArch64Opcode::MovI,
+                vec![ISelOperand::VReg(value), ISelOperand::Imm(1)],
+            ),
+        );
+        isel.emit(entry, ISelInst::new(AArch64Opcode::Ret, vec![]));
+        let mut func = isel.finalize();
+        assert_eq!(func.try_to_ir_func().map(|f| f.next_vreg), Ok(1));
+
+        func.next_vreg = 0;
+        let refusal = func.try_to_ir_func().expect_err("stale register counter");
+        assert_eq!(refusal.boundary, "instruction-selection exit");
+        assert_eq!(
+            refusal.error,
+            MachIdAdmissionError::StaleCounter {
+                domain: MachIdDomain::VReg,
+                counter: 0,
+                live_id: 0,
+                site: MachIdSite::Operand {
+                    inst: 0,
+                    operand: 0
+                },
+            }
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("[TCG-MIR-STALE-ID-COUNTER] vreg counter 0"),
+            "{refusal}"
+        );
+
+        func.next_vreg = 1;
+        func.blocks
+            .get_mut(&entry)
+            .expect("entry block")
+            .successors
+            .push(Block(57));
+        let refusal = func.try_to_ir_func().expect_err("dangling successor");
+        assert!(matches!(
+            refusal.error,
+            MachIdAdmissionError::StaleCounter {
+                domain: MachIdDomain::Block,
+                live_id: 57,
+                site: MachIdSite::BlockEdge { block: 0 },
+                ..
+            }
+        ));
+    }
+
+    /// L10-P5: the selector's register counter never wraps. Exhaustion issues
+    /// the sentinel `u32::MAX` (which no counter can exceed) instead of
+    /// restarting at `v0`, and the selection exit refuses a function that uses
+    /// it as `[TCG-MIR-ID-EXHAUSTED]`.
+    #[test]
+    fn selector_register_allocation_saturates_and_the_sentinel_is_refused() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.func.next_vreg = u32::MAX - 1;
+        assert_eq!(isel.new_vreg(RegClass::Gpr64).id, u32::MAX - 1);
+        for _ in 0..3 {
+            assert_eq!(isel.new_vreg(RegClass::Gpr64).id, u32::MAX);
+            assert_eq!(isel.func.next_vreg, u32::MAX);
+        }
+        isel.emit(
+            entry,
+            ISelInst::new(
+                AArch64Opcode::MovI,
+                vec![
+                    ISelOperand::VReg(VReg::new(u32::MAX, RegClass::Gpr64)),
+                    ISelOperand::Imm(1),
+                ],
+            ),
+        );
+        isel.emit(entry, ISelInst::new(AArch64Opcode::Ret, vec![]));
+        let refusal = isel
+            .finalize()
+            .try_to_ir_func()
+            .expect_err("the exhausted-counter sentinel is refused");
+        assert!(matches!(
+            refusal.error,
+            trust_cg_ir::MachIdAdmissionError::Exhausted {
+                domain: trust_cg_ir::MachIdDomain::VReg,
+                ..
+            }
+        ));
+        assert!(refusal.to_string().contains("[TCG-MIR-ID-EXHAUSTED]"));
+    }
+
+    /// Converting a selected function used to leak a fresh copy of every
+    /// instruction's implicit register lists (LeakSanitizer under the
+    /// `fuzz_compile_function` libFuzzer target, L13-P7). Equal lists now share
+    /// one interned copy, however many functions carry them.
+    #[test]
+    fn to_ir_func_shares_implicit_register_lists_across_functions() {
+        let convert = || {
+            let (mut isel, entry) = make_empty_isel();
+            isel.emit(
+                entry,
+                ISelInst::new(
+                    AArch64Opcode::Bl,
+                    vec![ISelOperand::Symbol("callee".into())],
+                )
+                .with_implicit_uses(vec![gpr::X0, gpr::X1])
+                .with_implicit_defs(vec![gpr::X0, gpr::X1, gpr::X2]),
+            );
+            isel.emit(
+                entry,
+                ISelInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(vec![gpr::X0]),
+            );
+            isel.finalize().to_ir_func()
+        };
+        let (first, second) = (convert(), convert());
+        assert_eq!(first.insts.len(), 2);
+        assert_eq!(first.insts[0].implicit_uses, &[gpr::X0, gpr::X1]);
+        assert_eq!(first.insts[0].implicit_defs, &[gpr::X0, gpr::X1, gpr::X2]);
+        assert_eq!(first.insts[1].implicit_uses, &[gpr::X0]);
+        for (a, b) in first.insts.iter().zip(&second.insts) {
+            assert!(std::ptr::eq(a.implicit_uses, b.implicit_uses));
+            assert!(std::ptr::eq(a.implicit_defs, b.implicit_defs));
+        }
+    }
+
     // =======================================================================
     // New tests: FloatCC mapping
     // =======================================================================
@@ -22203,13 +25900,14 @@ mod tests {
         // 2: LslRR vreg2 <- vreg0, vreg1
         // 3: Movz vreg3 <- 0xFF
         // 4: ANDWrr vreg4 <- vreg2, vreg3
-        // 5: Uxtw X0 <- vreg4 (return value zero-extend)
+        // 5: COPY W0 <- vreg4 (width-precise return)
         // 6: RET
         assert_eq!(mblock.insts.len(), 7);
         assert_eq!(mblock.insts[2].opcode, AArch64Opcode::LslRR);
         assert_eq!(mblock.insts[3].opcode, AArch64Opcode::Movz);
         assert_eq!(mblock.insts[4].opcode, AArch64Opcode::AndRR);
-        assert_eq!(mblock.insts[5].opcode, AArch64Opcode::Uxtw);
+        assert_eq!(mblock.insts[5].opcode, AArch64Opcode::Copy);
+        assert_eq!(mblock.insts[5].operands[0], ISelOperand::PReg(gpr::W0));
         assert_eq!(mblock.insts[6].opcode, AArch64Opcode::Ret);
     }
 
@@ -22220,7 +25918,7 @@ mod tests {
             params: vec![Type::F64, Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fadd64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fadd64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -22272,6 +25970,7 @@ mod tests {
             &Instruction {
                 opcode: Opcode::Call {
                     name: "my_callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(0)],
                 results: vec![Value(1)],
@@ -22299,12 +25998,65 @@ mod tests {
     }
 
     #[test]
-    fn select_return_i32_to_abi_x0_zero_extends() {
+    fn native_dependency_calls_require_the_explicit_sealed_core_selector_mode() {
+        let native_call = Instruction {
+            opcode: Opcode::Call {
+                name: "runtime_inc".to_owned(),
+                binding: DirectCallBinding::NativeDependency {
+                    function: 7,
+                    dependency: trust_cg_ir::NativeDependencyId::new(3),
+                },
+            },
+            args: vec![],
+            results: vec![],
+        };
+
+        let (mut compatibility, entry) = make_empty_isel();
+        assert!(matches!(
+            compatibility.select_instruction(&native_call, entry),
+            Err(ISelError::UnsupportedOpcode(_))
+        ));
+
+        let (mut sealed_core, entry) = make_empty_isel();
+        sealed_core.enable_sealed_core_native_calls();
+        sealed_core
+            .select_instruction(&native_call, entry)
+            .expect("the Core owner performs the independent catalog/site checks");
+        let selected = sealed_core.finalize();
+        let call = selected.blocks[&entry]
+            .insts
+            .iter()
+            .find(|inst| inst.opcode == AArch64Opcode::Bl)
+            .expect("sealed native call must remain a symbolic BL");
+        assert_eq!(
+            call.operands,
+            [ISelOperand::Symbol("runtime_inc".to_owned())]
+        );
+        assert!(!call.exact_module_call);
+
+        let declared_call = Instruction {
+            opcode: Opcode::Call {
+                name: "runtime_inc".to_owned(),
+                binding: DirectCallBinding::DeclaredExternalFunction { function: 7 },
+            },
+            args: vec![],
+            results: vec![],
+        };
+        let (mut still_pending, entry) = make_empty_isel();
+        still_pending.enable_sealed_core_native_calls();
+        assert!(matches!(
+            still_pending.select_instruction(&declared_call, entry),
+            Err(ISelError::UnsupportedOpcode(_))
+        ));
+    }
+
+    #[test]
+    fn select_return_i32_uses_width_precise_w0_copy() {
         let sig = Signature {
             params: vec![],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("ret_i32".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_i32".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -22323,13 +26075,53 @@ mod tests {
 
         let mfunc = isel.finalize();
         let insts = &mfunc.blocks[&entry].insts;
-        assert_eq!(insts[0].opcode, AArch64Opcode::Uxtw);
-        assert_eq!(insts[0].operands[0], ISelOperand::PReg(gpr::X0));
+        assert_eq!(insts[0].opcode, AArch64Opcode::Copy);
+        assert_eq!(insts[0].operands[0], ISelOperand::PReg(gpr::W0));
         assert!(
             matches!(insts[0].operands[1], ISelOperand::VReg(v) if v.class == RegClass::Gpr32),
-            "i32 ABI return must zero-extend the Gpr32 source into X0"
+            "i32 ABI return must copy the Gpr32 source into W0"
         );
         assert_eq!(insts[1].opcode, AArch64Opcode::Ret);
+        assert_eq!(insts[1].implicit_uses, vec![gpr::W0]);
+    }
+
+    #[test]
+    fn select_integer_return_location_tracks_scalar_carrier_width() {
+        for (ty, class, expected_preg) in [
+            (Type::B1, RegClass::Gpr64, gpr::X0),
+            (Type::I8, RegClass::Gpr32, gpr::W0),
+            (Type::I16, RegClass::Gpr32, gpr::W0),
+            (Type::I32, RegClass::Gpr32, gpr::W0),
+            (Type::I64, RegClass::Gpr64, gpr::X0),
+        ] {
+            let sig = Signature {
+                params: vec![],
+                returns: vec![ty.clone()],
+            };
+            let mut isel = InstructionSelector::new_darwin_test(format!("ret_{ty:?}"), sig);
+            let entry = Block(0);
+            isel.func.ensure_block(entry);
+
+            let vreg = isel.new_vreg(class);
+            isel.define_value(Value(0), ISelOperand::VReg(vreg), ty.clone());
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Return,
+                    args: vec![Value(0)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(insts.len(), 2, "unexpected return sequence for {ty:?}");
+            assert_eq!(insts[0].opcode, AArch64Opcode::Copy);
+            assert_eq!(insts[0].operands[0], ISelOperand::PReg(expected_preg));
+            assert_eq!(insts[1].opcode, AArch64Opcode::Ret);
+            assert_eq!(insts[1].implicit_uses, vec![expected_preg]);
+        }
     }
 
     #[test]
@@ -22576,6 +26368,119 @@ mod tests {
         assert_eq!(bl.implicit_uses, vec![gpr::X0, gpr::X1, gpr::X2, gpr::X3]);
     }
 
+    /// Direct and indirect calls store both i128 limbs and preserve narrow
+    /// neighbours. Their classified facts describe the actual stores and
+    /// survive conversion to machine IR under both AArch64 conventions.
+    #[test]
+    fn select_call_indirect_stack_i128_and_narrow_args_match_direct_call() {
+        use trust_cg_ir::{CalleeSavedSet, StackArgStore};
+
+        for (variant, half_offset, tail_offset, stack_bytes) in [
+            (AArch64AbiVariant::Darwin, 2, 33, 34),
+            (AArch64AbiVariant::Aapcs64, 8, 40, 41),
+        ] {
+            for indirect in [false, true] {
+                let (mut isel, entry) = make_empty_isel();
+                isel.set_abi_variant(variant);
+                let fn_ptr = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(0), ISelOperand::VReg(fn_ptr), Type::I64);
+                let mut args = Vec::new();
+                for index in 1..=8u32 {
+                    let vreg = isel.new_vreg(RegClass::Gpr64);
+                    isel.define_value(Value(index), ISelOperand::VReg(vreg), Type::I64);
+                    args.push(Value(index));
+                }
+                let narrow = isel.new_vreg(RegClass::Gpr32);
+                isel.define_value(Value(9), ISelOperand::VReg(narrow), Type::I8);
+                let half = isel.new_vreg(RegClass::Gpr32);
+                isel.define_value(Value(10), ISelOperand::VReg(half), Type::I16);
+                let lo = isel.new_vreg(RegClass::Gpr64);
+                let hi = isel.new_vreg(RegClass::Gpr64);
+                isel.define_i128_value(Value(11), lo, hi);
+                let flag = isel.new_vreg(RegClass::Gpr32);
+                isel.define_value(Value(12), ISelOperand::VReg(flag), Type::B1);
+                let tail = isel.new_vreg(RegClass::Gpr32);
+                isel.define_value(Value(13), ISelOperand::VReg(tail), Type::I8);
+                args.extend((9..=13).map(Value));
+
+                if indirect {
+                    isel.select_call_indirect(&Value(0), &args, &[], &[], entry)
+                        .unwrap();
+                } else {
+                    isel.select_call("callee", &args, &[], &[], entry).unwrap();
+                }
+                let mfunc = isel.finalize();
+                let insts = &mfunc.blocks[&entry].insts;
+                let stores: Vec<_> = insts
+                    .iter()
+                    .filter(|inst| {
+                        matches!(
+                            inst.opcode,
+                            AArch64Opcode::StrRI | AArch64Opcode::StrbRI | AArch64Opcode::StrhRI
+                        ) && inst.operands.get(1) == Some(&ISelOperand::PReg(SP))
+                    })
+                    .map(|inst| {
+                        let ISelOperand::Imm(offset) = inst.operands[2] else {
+                            panic!("stack store without an immediate offset: {inst:?}");
+                        };
+                        (inst.opcode, inst.operands[0].clone(), offset)
+                    })
+                    .collect();
+                assert_eq!(
+                    stores,
+                    vec![
+                        (AArch64Opcode::StrbRI, ISelOperand::VReg(narrow), 0),
+                        (AArch64Opcode::StrhRI, ISelOperand::VReg(half), half_offset),
+                        (AArch64Opcode::StrRI, ISelOperand::VReg(lo), 16),
+                        (AArch64Opcode::StrRI, ISelOperand::VReg(hi), 24),
+                        (AArch64Opcode::StrbRI, ISelOperand::VReg(flag), 32),
+                        (AArch64Opcode::StrbRI, ISelOperand::VReg(tail), tail_offset),
+                    ],
+                    "{variant:?} indirect={indirect}"
+                );
+                let call = insts.last().unwrap();
+                assert_eq!(
+                    call.opcode,
+                    if indirect {
+                        AArch64Opcode::Blr
+                    } else {
+                        AArch64Opcode::Bl
+                    }
+                );
+                if indirect {
+                    assert_eq!(call.operands, vec![ISelOperand::VReg(fn_ptr)]);
+                }
+                let facts = call.call_abi.as_ref().expect("classified call ABI facts");
+                assert_eq!(
+                    facts.callee.as_deref(),
+                    if indirect { None } else { Some("callee") }
+                );
+                assert_eq!(facts.stack_arg_bytes, stack_bytes);
+                let expected: Vec<StackArgStore> = [
+                    (0, 1),
+                    (half_offset, 2),
+                    (16, 8),
+                    (24, 8),
+                    (32, 1),
+                    (tail_offset, 1),
+                ]
+                .into_iter()
+                .map(|(offset, bytes)| StackArgStore { offset, bytes })
+                .collect();
+                assert_eq!(facts.stack_stores, expected);
+                assert!(!facts.aggregate_stack_args && !facts.by_reference_argument_copies);
+                assert!(!facts.hidden_result_pointer && !facts.variadic);
+                assert_eq!(facts.callee_saved, CalleeSavedSet::Aapcs64);
+
+                let ir = mfunc.to_ir_func();
+                assert_eq!(ir.call_abi_facts.len(), 1);
+                let (&call_id, recorded) = ir.call_abi_facts.iter().next().unwrap();
+                assert_eq!(ir.inst(call_id).opcode, call.opcode);
+                assert_eq!(recorded, facts);
+            }
+        }
+    }
+
     #[test]
     fn select_call_indirect_records_abi_arg_implicit_uses() {
         let (mut isel, entry) = make_empty_isel();
@@ -22768,6 +26673,403 @@ mod tests {
         assert_eq!(mblock.insts[3].opcode, AArch64Opcode::Msub);
     }
 
+    /// Select one block as the production driver does: whole-function use
+    /// counts (when `seed_counts`) and the `Iconst` origins seeded first.
+    fn select_const_divrem_block(
+        sig: Signature,
+        instructions: Vec<Instruction>,
+        seed_counts: bool,
+    ) -> ISelFunction {
+        let entry = Block(0);
+        let mut function = crate::function::Function::new("divrem", sig.clone());
+        function.block_order.push(entry);
+        function.blocks.insert(
+            entry,
+            crate::function::BasicBlock {
+                params: vec![],
+                instructions: instructions.clone(),
+                source_locs: vec![],
+            },
+        );
+        let mut isel = InstructionSelector::new_darwin_test("divrem".to_string(), sig.clone());
+        if seed_counts {
+            isel.seed_function_value_use_counts(&function);
+        }
+        isel.seed_iconst_origins([instructions.as_slice()]);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        isel.select_block(entry, &instructions).unwrap();
+        isel.finalize()
+    }
+
+    /// `Value(0)` is the parameter; `op Value(0), iconst(divisor)` then the
+    /// given tail (which may read `Value(2)`, the div/rem result).
+    fn const_divrem_instructions(
+        op: Opcode,
+        ty: Type,
+        divisor: i64,
+        tail: Vec<Instruction>,
+    ) -> Vec<Instruction> {
+        let mut instructions = vec![
+            Instruction {
+                opcode: Opcode::Iconst { ty, imm: divisor },
+                args: vec![],
+                results: vec![Value(1)],
+            },
+            Instruction {
+                opcode: op,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+        ];
+        instructions.extend(tail);
+        instructions
+    }
+
+    fn ret_of(value: u32) -> Instruction {
+        Instruction {
+            opcode: Opcode::Return,
+            args: vec![Value(value)],
+            results: vec![],
+        }
+    }
+
+    fn opcodes_of(mfunc: &ISelFunction) -> Vec<AArch64Opcode> {
+        mfunc.blocks[&Block(0)]
+            .insts
+            .iter()
+            .map(|i| i.opcode)
+            .collect()
+    }
+
+    fn imm_of(inst: &ISelInst) -> Option<i64> {
+        inst.operands.iter().find_map(|o| match o {
+            ISelOperand::Imm(v) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// The magic-division sequence's instructions after the parameter copy:
+    /// those whose first operand is a fresh virtual register (constant
+    /// materialization included).
+    fn vreg_def_class(inst: &ISelInst) -> Option<RegClass> {
+        match inst.operands.first() {
+            Some(ISelOperand::VReg(v)) => Some(v.class),
+            _ => None,
+        }
+    }
+
+    /// `x % 126` at 64 bits (every corpus program's `done`): the even divisor
+    /// needs the add-back form at full range, so the dividend is pre-shifted
+    /// (`LSR #1; UMULH; LSR #5`, clang's sequence) and no add-back
+    /// `SUB`/`ADD` is emitted.
+    #[test]
+    fn select_urem_i64_by_126_preshifts_the_even_divisor() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![Type::I64],
+        };
+        let mfunc = select_const_divrem_block(
+            sig,
+            const_divrem_instructions(Opcode::Urem, Type::I64, 126, vec![ret_of(2)]),
+            true,
+        );
+        let insts = &mfunc.blocks[&Block(0)].insts;
+        let ops = opcodes_of(&mfunc);
+        assert!(!ops.contains(&AArch64Opcode::UDiv), "{ops:?}");
+        assert!(
+            !ops.contains(&AArch64Opcode::SubRR),
+            "add-back SUB: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&AArch64Opcode::AddRR),
+            "add-back ADD: {ops:?}"
+        );
+        let umulh = ops
+            .iter()
+            .position(|o| *o == AArch64Opcode::Umulh)
+            .expect("UMULH");
+        let pre = ops[..umulh]
+            .iter()
+            .rposition(|o| *o == AArch64Opcode::LsrRI)
+            .expect("pre-shift LSR before UMULH");
+        assert_eq!(
+            imm_of(&insts[pre]),
+            Some(1),
+            "pre-shift by trailing_zeros(126)"
+        );
+        assert_eq!(
+            insts[umulh].operands[1], insts[pre].operands[0],
+            "UMULH reads x >> 1"
+        );
+        let post = umulh
+            + 1
+            + ops[umulh + 1..]
+                .iter()
+                .position(|o| *o == AArch64Opcode::LsrRI)
+                .expect("post-shift");
+        assert_eq!(imm_of(&insts[post]), Some(5));
+        assert_eq!(insts[post].operands[1], insts[umulh].operands[0]);
+        let msub = ops
+            .iter()
+            .position(|o| *o == AArch64Opcode::Msub)
+            .expect("MSUB");
+        assert_eq!(
+            insts[msub].operands[1], insts[post].operands[0],
+            "MSUB reads q"
+        );
+        assert_eq!(vreg_def_class(&insts[msub]), Some(RegClass::Gpr64));
+    }
+
+    /// Negative controls for the pre-shift: an odd divisor that needs the
+    /// add-back form (7) keeps it, and an even divisor whose full-range magic
+    /// fits (10) keeps the plain `UMULH; LSR`, both with no pre-shift.
+    #[test]
+    fn select_udiv_i64_preshift_negative_controls() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![Type::I64],
+        };
+        for (divisor, add_back) in [(7i64, true), (10, false)] {
+            let mfunc = select_const_divrem_block(
+                sig.clone(),
+                const_divrem_instructions(Opcode::Udiv, Type::I64, divisor, vec![ret_of(2)]),
+                true,
+            );
+            let insts = &mfunc.blocks[&Block(0)].insts;
+            let ops = opcodes_of(&mfunc);
+            let umulh = ops
+                .iter()
+                .position(|o| *o == AArch64Opcode::Umulh)
+                .expect("UMULH");
+            assert!(
+                !ops[..umulh].contains(&AArch64Opcode::LsrRI),
+                "d={divisor}: no pre-shift expected: {ops:?}"
+            );
+            // UMULH reads the parameter's register directly.
+            assert!(
+                insts[..umulh]
+                    .iter()
+                    .all(|i| i.operands.first() != Some(&insts[umulh].operands[1])
+                        || i.opcode != AArch64Opcode::LsrRI),
+                "d={divisor}"
+            );
+            assert_eq!(
+                ops.contains(&AArch64Opcode::SubRR) && ops.contains(&AArch64Opcode::AddRR),
+                add_back,
+                "d={divisor}: add-back form {add_back} expected: {ops:?}"
+            );
+        }
+    }
+
+    /// `x % 14` at 32 bits: the W32 path pre-shifts too (`LSR Wt, Wx, #1;
+    /// UMULL; LSR #34`, clang's sequence) instead of the add-back tail.
+    #[test]
+    fn select_urem_i32_by_14_preshifts_before_umull() {
+        let sig = Signature {
+            params: vec![Type::I32],
+            returns: vec![Type::I32],
+        };
+        let mfunc = select_const_divrem_block(
+            sig,
+            const_divrem_instructions(Opcode::Urem, Type::I32, 14, vec![ret_of(2)]),
+            true,
+        );
+        let insts = &mfunc.blocks[&Block(0)].insts;
+        let ops = opcodes_of(&mfunc);
+        assert!(!ops.contains(&AArch64Opcode::UDiv), "{ops:?}");
+        assert!(
+            !ops.contains(&AArch64Opcode::SubRR),
+            "add-back SUB: {ops:?}"
+        );
+        let umull = ops
+            .iter()
+            .position(|o| *o == AArch64Opcode::Umull)
+            .expect("UMULL");
+        let pre = ops[..umull]
+            .iter()
+            .rposition(|o| *o == AArch64Opcode::LsrRI)
+            .expect("pre-shift LSR before UMULL");
+        assert_eq!(imm_of(&insts[pre]), Some(1));
+        assert_eq!(vreg_def_class(&insts[pre]), Some(RegClass::Gpr32));
+        assert_eq!(insts[umull].operands[1], insts[pre].operands[0]);
+        let post = umull
+            + 1
+            + ops[umull + 1..]
+                .iter()
+                .position(|o| *o == AArch64Opcode::LsrRI)
+                .expect("post-shift");
+        assert_eq!(imm_of(&insts[post]), Some(34), "32 + s for 7 over 31 bits");
+    }
+
+    /// `(x % 126) as i32`: the remainder's only use is the truncation, so the
+    /// `MSUB` is written in the W form straight into the truncation's result
+    /// and no `MOV Wd, Wn` narrowing move is emitted (clang's
+    /// `msub w0, w8, w9, w0`); the same for a signed remainder.
+    #[test]
+    fn select_rem_i64_trunc_i32_writes_w_form_msub() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![Type::I32],
+        };
+        for op in [Opcode::Urem, Opcode::Srem] {
+            let trunc = Instruction {
+                opcode: Opcode::Trunc { to_ty: Type::I32 },
+                args: vec![Value(2)],
+                results: vec![Value(3)],
+            };
+            let mfunc = select_const_divrem_block(
+                sig.clone(),
+                const_divrem_instructions(op.clone(), Type::I64, 126, vec![trunc, ret_of(3)]),
+                true,
+            );
+            let insts = &mfunc.blocks[&Block(0)].insts;
+            let msub = insts
+                .iter()
+                .find(|i| i.opcode == AArch64Opcode::Msub)
+                .unwrap_or_else(|| panic!("{op:?}: MSUB"));
+            assert_eq!(
+                vreg_def_class(msub),
+                Some(RegClass::Gpr32),
+                "{op:?}: W-form MSUB"
+            );
+            let narrowing_moves = insts
+                .iter()
+                .filter(|i| {
+                    i.opcode == AArch64Opcode::MovR
+                        && matches!(
+                            (i.operands.first(), i.operands.get(1)),
+                            (Some(ISelOperand::VReg(d)), Some(ISelOperand::VReg(s)))
+                                if d.class == RegClass::Gpr32 && s.class == RegClass::Gpr64
+                        )
+                })
+                .count();
+            assert_eq!(narrowing_moves, 0, "{op:?}: the truncation emits nothing");
+        }
+    }
+
+    /// Negative controls for the W-form remainder: without whole-function use
+    /// counts, with a second use of the remainder, or with a truncation to
+    /// `I16`, the `MSUB` stays 64-bit and the truncation emits its own move.
+    #[test]
+    fn select_rem_i64_trunc_narrowing_negative_controls() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![Type::I32],
+        };
+        let trunc_to = |to_ty: Type| Instruction {
+            opcode: Opcode::Trunc { to_ty },
+            args: vec![Value(2)],
+            results: vec![Value(3)],
+        };
+        let second_use = Instruction {
+            opcode: Opcode::Iadd,
+            args: vec![Value(2), Value(0)],
+            results: vec![Value(4)],
+        };
+        let cases: Vec<(&str, Vec<Instruction>, bool, AArch64Opcode)> = vec![
+            (
+                "unseeded counts",
+                vec![trunc_to(Type::I32), ret_of(3)],
+                false,
+                AArch64Opcode::MovR,
+            ),
+            (
+                "second use",
+                vec![trunc_to(Type::I32), second_use, ret_of(3)],
+                true,
+                AArch64Opcode::MovR,
+            ),
+            (
+                "trunc to i16",
+                vec![trunc_to(Type::I16), ret_of(3)],
+                true,
+                AArch64Opcode::Uxth,
+            ),
+        ];
+        for (name, tail, seed, trunc_opcode) in cases {
+            let sig = if trunc_opcode == AArch64Opcode::Uxth {
+                Signature {
+                    params: vec![Type::I64],
+                    returns: vec![Type::I16],
+                }
+            } else {
+                sig.clone()
+            };
+            let mfunc = select_const_divrem_block(
+                sig,
+                const_divrem_instructions(Opcode::Urem, Type::I64, 126, tail),
+                seed,
+            );
+            let insts = &mfunc.blocks[&Block(0)].insts;
+            let msub = insts
+                .iter()
+                .position(|i| i.opcode == AArch64Opcode::Msub)
+                .expect("MSUB");
+            assert_eq!(
+                vreg_def_class(&insts[msub]),
+                Some(RegClass::Gpr64),
+                "{name}"
+            );
+            assert!(
+                insts[msub + 1..].iter().any(|i| i.opcode == trunc_opcode
+                    && i.operands.get(1) == insts[msub].operands.first()),
+                "{name}: the truncation reads the 64-bit remainder"
+            );
+        }
+    }
+
+    /// The `2^k +- 1` remainder tails narrow too (`x % 255`: the final `ADD`
+    /// is the W form), except a `2^k + 1` divisor with `k >= 32`, whose final
+    /// shifted-register `SUB` has no W form for that shift: it stays 64-bit
+    /// and the truncation keeps its move.
+    #[test]
+    fn select_rem_i64_trunc_i32_mersenne_tails() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![Type::I32],
+        };
+        let trunc = || Instruction {
+            opcode: Opcode::Trunc { to_ty: Type::I32 },
+            args: vec![Value(2)],
+            results: vec![Value(3)],
+        };
+        for (divisor, last, narrowed) in [
+            (255i64, AArch64Opcode::AddRR, true),
+            (257, AArch64Opcode::SubRRShift, true),
+            ((1i64 << 33) + 1, AArch64Opcode::SubRRShift, false),
+        ] {
+            let mfunc = select_const_divrem_block(
+                sig.clone(),
+                const_divrem_instructions(
+                    Opcode::Urem,
+                    Type::I64,
+                    divisor,
+                    vec![trunc(), ret_of(3)],
+                ),
+                true,
+            );
+            let insts = &mfunc.blocks[&Block(0)].insts;
+            assert!(
+                !insts.iter().any(|i| i.opcode == AArch64Opcode::Msub),
+                "d={divisor}"
+            );
+            let tail = insts
+                .iter()
+                .rposition(|i| i.opcode == last)
+                .unwrap_or_else(|| panic!("d={divisor}: {last:?}"));
+            let class = if narrowed {
+                RegClass::Gpr32
+            } else {
+                RegClass::Gpr64
+            };
+            assert_eq!(vreg_def_class(&insts[tail]), Some(class), "d={divisor}");
+            let moves = insts[tail + 1..].iter().any(|i| {
+                i.opcode == AArch64Opcode::MovR && i.operands.get(1) == insts[tail].operands.first()
+            });
+            assert_eq!(moves, !narrowed, "d={divisor}: narrowing move");
+        }
+    }
+
     /// Shape pin for the W32 SMULL magic path on ReedSolomon's `x % 255`: the
     /// exact clang-parity sequence SMULL; LSR #32; ADD; ASR #7; LSR #31; ADD;
     /// then the Mersenne remainder tail `q - (q<<8)` + ADD (no SDIV/MSUB, no
@@ -22895,7 +27197,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("neg32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("neg32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -22923,7 +27225,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("neg64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("neg64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -22947,7 +27249,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("not32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("not32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -22986,7 +27288,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("not64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("not64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23022,7 +27324,7 @@ mod tests {
             params: vec![Type::V128],
             returns: vec![Type::V128],
         };
-        let mut isel = InstructionSelector::new("not_v128".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("not_v128".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23048,7 +27350,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fneg64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fneg64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23075,7 +27377,7 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("fneg32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fneg32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23317,14 +27619,15 @@ mod tests {
     }
 
     #[test]
-    fn select_i128_atomics_fail_closed() {
-        // 128-bit single-copy atomicity (LDXP/STXP/CASP) is not lowered, for the
-        // I128 register-pair OR the V128 vector form. Each must fail CLOSED —
-        // silently emitting a 64-bit atomic op over the low half (and, for V128,
-        // from the wrong register file) would be a wrong-atomic-semantics
-        // miscompile. (The guards return before any operand is read, so
-        // undefined placeholder operands are fine.)
-        for ty in [Type::I128, Type::V128] {
+    fn select_vector_and_float_atomics_fail_closed() {
+        // I128 atomics lower through the LDXP/STXP pair pseudos (see
+        // i128_atomics_select_pair_llsc_pseudos_on_every_profile). The V128
+        // vector and scalar float forms have no atomic lowering: emitting a
+        // GPR atomic over an FPR value (or over the low half of a vector) would
+        // be a wrong-register-file / wrong-atomic-semantics miscompile, so each
+        // op must fail CLOSED. (The guards return before any operand is read,
+        // so undefined placeholder operands are fine.)
+        for ty in [Type::V128, Type::F32] {
             {
                 let (mut isel, entry) = make_empty_isel();
                 let err = isel
@@ -23624,7 +27927,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("bitrev32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bitrev32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23660,7 +27963,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("bitrev64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bitrev64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23679,80 +27982,416 @@ mod tests {
         }
     }
 
-    #[test]
-    fn select_bitreverse_i32_stack_byte_swap_ladder_emits_rbit() {
+    /// Select `blocks` as one function the way the production driver does:
+    /// the adapter's slot metadata is set and the whole-function use counts
+    /// and stack-slot address facts are seeded before any block is selected.
+    fn select_seeded_function(
+        name: &str,
+        ty: &Type,
+        blocks: Vec<(Block, Vec<Instruction>)>,
+        slots: Vec<StackSlotInfo>,
+    ) -> ISelFunction {
         let sig = Signature {
-            params: vec![Type::I32],
-            returns: vec![Type::I32],
+            params: vec![ty.clone()],
+            returns: vec![ty.clone()],
         };
-        let mut isel = InstructionSelector::new("bitrev32_stack".to_string(), sig.clone());
-        let entry = Block(0);
-        isel.lower_formal_arguments(&sig, entry).unwrap();
+        select_seeded_function_with_sig(name, sig, blocks, slots)
+    }
 
-        let instrs = bitreverse_stack_byte_swap_ladder(Type::I32, Value(0), Value(1));
-        isel.select_block(entry, &instrs).unwrap();
+    fn select_seeded_function_with_sig(
+        name: &str,
+        sig: Signature,
+        blocks: Vec<(Block, Vec<Instruction>)>,
+        slots: Vec<StackSlotInfo>,
+    ) -> ISelFunction {
+        let mut function = crate::function::Function::new(name, sig.clone());
+        for (block, instructions) in &blocks {
+            function.block_order.push(*block);
+            function.blocks.insert(
+                *block,
+                crate::function::BasicBlock {
+                    params: vec![],
+                    instructions: instructions.clone(),
+                    source_locs: vec![],
+                },
+            );
+        }
+        let mut isel = InstructionSelector::new_darwin_test(name.to_string(), sig.clone());
+        isel.set_stack_slots(slots);
+        isel.seed_function_value_use_counts(&function);
+        isel.lower_formal_arguments(&sig, blocks[0].0).unwrap();
+        for (block, instructions) in &blocks {
+            isel.select_block(*block, instructions).unwrap();
+        }
+        isel.finalize()
+    }
 
-        let mfunc = isel.finalize();
-        let insts = &mfunc.blocks[&entry].insts;
-        let rbits: Vec<_> = insts
+    /// The adapter's slot for a scalar local of `ty`.
+    fn bitreverse_scalar_slot(ty: &Type) -> StackSlotInfo {
+        StackSlotInfo::new(ty.bytes(), ty.bytes())
+    }
+
+    fn bitreverse_return(value: Value) -> Instruction {
+        Instruction {
+            opcode: Opcode::Return,
+            args: vec![value],
+            results: vec![],
+        }
+    }
+
+    /// The stack-slot ladder of `ty` reversing `Value(0)` into `Value(1)`,
+    /// with `tail` appended after its root. Returns the instructions, the
+    /// root's index and the indices of the ladder's slot stores.
+    fn bitreverse_stack_ladder_with_tail(
+        ty: &Type,
+        tail: Vec<Instruction>,
+    ) -> (Vec<Instruction>, usize, Vec<usize>) {
+        let mut instrs = bitreverse_stack_byte_swap_ladder(ty.clone(), Value(0), Value(1));
+        let root = instrs.len() - 1;
+        assert_eq!(instrs[root].results, vec![Value(1)]);
+        let stores = instrs
             .iter()
-            .filter(|inst| inst.opcode == AArch64Opcode::Rbit)
+            .enumerate()
+            .filter(|(_, inst)| matches!(inst.opcode, Opcode::Store { .. }))
+            .map(|(idx, _)| idx)
             .collect();
-        assert_eq!(rbits.len(), 1, "expected one RBIT, got {insts:?}");
-        assert!(
-            !insts.iter().any(|inst| matches!(
-                inst.opcode,
-                AArch64Opcode::LdrRI
-                    | AArch64Opcode::StrRI
-                    | AArch64Opcode::LsrRI
-                    | AArch64Opcode::LslRI
-                    | AArch64Opcode::AndRI
-                    | AArch64Opcode::OrrRR
-            )),
-            "stack-local bitreverse ladder should be skipped after RBIT selection: {insts:?}"
+        instrs.extend(tail);
+        (instrs, root, stores)
+    }
+
+    fn count_opcode(func: &ISelFunction, block: Block, opcode: AArch64Opcode) -> usize {
+        func.blocks[&block]
+            .insts
+            .iter()
+            .filter(|inst| inst.opcode == opcode)
+            .count()
+    }
+
+    #[test]
+    fn select_bitreverse_stack_ladder_folds_private_slot_and_links_stores_to_rbit() {
+        for (ty, class) in [(Type::I32, RegClass::Gpr32), (Type::I64, RegClass::Gpr64)] {
+            let (instrs, root, stores) =
+                bitreverse_stack_ladder_with_tail(&ty, vec![bitreverse_return(Value(1))]);
+            assert_eq!(
+                stores.len(),
+                4,
+                "{ty:?}: the initial store and three swap stores"
+            );
+            let entry = Block(0);
+            let mfunc = select_seeded_function(
+                "bitrev_stack",
+                &ty,
+                vec![(entry, instrs)],
+                vec![bitreverse_scalar_slot(&ty)],
+            );
+            let block = &mfunc.blocks[&entry];
+            let rbits: Vec<usize> = block
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, inst)| inst.opcode == AArch64Opcode::Rbit)
+                .map(|(idx, _)| idx)
+                .collect();
+            assert_eq!(
+                rbits.len(),
+                1,
+                "{ty:?}: expected one RBIT: {:?}",
+                block.insts
+            );
+            match block.insts[rbits[0]].operands[0] {
+                ISelOperand::VReg(vreg) => assert_eq!(vreg.class, class, "{ty:?}"),
+                ref other => panic!("{ty:?}: expected a VReg RBIT destination, got {other:?}"),
+            }
+            assert!(
+                !block.insts.iter().any(|inst| matches!(
+                    inst.opcode,
+                    AArch64Opcode::LdrRI
+                        | AArch64Opcode::StrRI
+                        | AArch64Opcode::LsrRI
+                        | AArch64Opcode::LslRI
+                        | AArch64Opcode::AndRI
+                        | AArch64Opcode::OrrRR
+                )),
+                "{ty:?}: the private-slot ladder should be folded into RBIT: {:?}",
+                block.insts
+            );
+            let root_id = SourceInstId {
+                block: 0,
+                index: root as u32,
+            };
+            assert_eq!(
+                block.lowering_provenance[rbits[0]].source_id(),
+                Some(root_id),
+                "{ty:?}: the RBIT is stamped with the ladder's root"
+            );
+            let ir = mfunc.to_ir_func();
+            for store in &stores {
+                let source = SourceInstId {
+                    block: 0,
+                    index: *store as u32,
+                };
+                assert_eq!(mfunc.source_fusion_target(source), Some(root_id), "{ty:?}");
+                assert_eq!(ir.source_fusion_target(source), Some(root_id), "{ty:?}");
+            }
+            assert_eq!(
+                ir.source_fusion_targets.len(),
+                stores.len(),
+                "{ty:?}: only the folded stores carry fusion edges"
+            );
+            assert_eq!(
+                mfunc.stack_slots,
+                vec![StackSlotInfo::new(0, 1)],
+                "{ty:?}: the folded slot keeps its id but no storage"
+            );
+        }
+    }
+
+    /// Every negative control keeps each ladder instruction, including all
+    /// four slot stores, records no fusion edge and keeps the slot's storage.
+    fn assert_stack_ladder_not_fused(func: &ISelFunction, ty: &Type, slots: usize, what: &str) {
+        let entry = Block(0);
+        assert_eq!(
+            count_opcode(func, entry, AArch64Opcode::Rbit),
+            0,
+            "{what}: must not fold the ladder: {:?}",
+            func.blocks[&entry].insts
         );
-        match rbits[0].operands[0] {
-            ISelOperand::VReg(vreg) => assert_eq!(vreg.class, RegClass::Gpr32),
-            ref other => panic!("expected Gpr32 RBIT destination, got {other:?}"),
+        assert!(
+            count_opcode(func, entry, AArch64Opcode::StrRI) >= 4,
+            "{what}: every slot store must be emitted: {:?}",
+            func.blocks[&entry].insts
+        );
+        assert!(func.source_fusion_targets.is_empty(), "{what}");
+        assert_eq!(func.stack_slots.len(), slots, "{what}");
+        assert_eq!(func.stack_slots[0], bitreverse_scalar_slot(ty), "{what}");
+    }
+
+    /// A second address of the ladder's slot 0, outside the matched window.
+    fn bitreverse_other_slot_addr() -> Instruction {
+        Instruction {
+            opcode: Opcode::StackAddr { slot: 0 },
+            args: vec![],
+            results: vec![Value(900)],
         }
     }
 
     #[test]
-    fn select_bitreverse_i64_stack_byte_swap_ladder_emits_rbit() {
-        let sig = Signature {
-            params: vec![Type::I64],
-            returns: vec![Type::I64],
+    fn select_bitreverse_stack_ladder_keeps_stores_when_the_slot_is_read_elsewhere() {
+        let ty = Type::I32;
+        let (instrs, _, _) = bitreverse_stack_ladder_with_tail(
+            &ty,
+            vec![
+                bitreverse_other_slot_addr(),
+                Instruction {
+                    opcode: Opcode::Load {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    args: vec![Value(900)],
+                    results: vec![Value(901)],
+                },
+                Instruction {
+                    opcode: Opcode::Bxor,
+                    args: vec![Value(1), Value(901)],
+                    results: vec![Value(902)],
+                },
+                bitreverse_return(Value(902)),
+            ],
+        );
+        let func = select_seeded_function(
+            "other_load",
+            &ty,
+            vec![(Block(0), instrs)],
+            vec![bitreverse_scalar_slot(&ty)],
+        );
+        assert_stack_ladder_not_fused(&func, &ty, 1, "another load of the slot");
+    }
+
+    #[test]
+    fn select_bitreverse_stack_ladder_keeps_stores_when_the_slot_is_written_elsewhere() {
+        let ty = Type::I32;
+        let (instrs, _, _) = bitreverse_stack_ladder_with_tail(
+            &ty,
+            vec![
+                bitreverse_other_slot_addr(),
+                Instruction {
+                    opcode: Opcode::Store {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    args: vec![Value(1), Value(900)],
+                    results: vec![],
+                },
+                bitreverse_return(Value(1)),
+            ],
+        );
+        let func = select_seeded_function(
+            "other_store",
+            &ty,
+            vec![(Block(0), instrs)],
+            vec![bitreverse_scalar_slot(&ty)],
+        );
+        assert_stack_ladder_not_fused(&func, &ty, 1, "another store to the slot");
+        assert_eq!(count_opcode(&func, Block(0), AArch64Opcode::StrRI), 5);
+    }
+
+    #[test]
+    fn select_bitreverse_stack_ladder_keeps_stores_when_the_address_escapes() {
+        let ty = Type::I32;
+        // To a callee.
+        let (instrs, _, _) = bitreverse_stack_ladder_with_tail(
+            &ty,
+            vec![
+                bitreverse_other_slot_addr(),
+                Instruction {
+                    opcode: Opcode::Call {
+                        name: "observe".to_string(),
+                        binding: DirectCallBinding::Interposable,
+                    },
+                    args: vec![Value(900)],
+                    results: vec![],
+                },
+                bitreverse_return(Value(1)),
+            ],
+        );
+        let func = select_seeded_function(
+            "escaped_to_call",
+            &ty,
+            vec![(Block(0), instrs)],
+            vec![bitreverse_scalar_slot(&ty)],
+        );
+        assert_stack_ladder_not_fused(&func, &ty, 1, "an address passed to a call");
+        assert_eq!(count_opcode(&func, Block(0), AArch64Opcode::Bl), 1);
+
+        // Into memory, stored as data.
+        let (instrs, _, _) = bitreverse_stack_ladder_with_tail(
+            &ty,
+            vec![
+                bitreverse_other_slot_addr(),
+                Instruction {
+                    opcode: Opcode::StackAddr { slot: 1 },
+                    args: vec![],
+                    results: vec![Value(903)],
+                },
+                Instruction {
+                    opcode: Opcode::Store {
+                        ty: Type::I64,
+                        align: None,
+                    },
+                    args: vec![Value(900), Value(903)],
+                    results: vec![],
+                },
+                bitreverse_return(Value(1)),
+            ],
+        );
+        let func = select_seeded_function(
+            "escaped_to_memory",
+            &ty,
+            vec![(Block(0), instrs)],
+            vec![bitreverse_scalar_slot(&ty), StackSlotInfo::new(8, 8)],
+        );
+        assert_stack_ladder_not_fused(&func, &ty, 2, "an address stored to memory");
+    }
+
+    #[test]
+    fn select_bitreverse_stack_ladder_keeps_stores_when_another_block_reads_the_slot() {
+        // Only the whole-function facts can see an access in another block.
+        let ty = Type::I32;
+        let (mut instrs, _, _) = bitreverse_stack_ladder_with_tail(&ty, vec![]);
+        instrs.push(Instruction {
+            opcode: Opcode::Jump { dest: Block(1) },
+            args: vec![],
+            results: vec![],
+        });
+        let other_block = vec![
+            bitreverse_other_slot_addr(),
+            Instruction {
+                opcode: Opcode::Load {
+                    ty: ty.clone(),
+                    align: None,
+                },
+                args: vec![Value(900)],
+                results: vec![Value(901)],
+            },
+            bitreverse_return(Value(901)),
+        ];
+        let func = select_seeded_function(
+            "other_block_load",
+            &ty,
+            vec![(Block(0), instrs), (Block(1), other_block)],
+            vec![bitreverse_scalar_slot(&ty)],
+        );
+        assert_stack_ladder_not_fused(&func, &ty, 1, "a load of the slot in another block");
+    }
+
+    #[test]
+    fn select_bitreverse_stack_ladder_keeps_stores_on_width_mismatch() {
+        let ty = Type::I32;
+
+        // An i64 argument enters an 8-byte slot through an i64 store and the
+        // 32-bit ladder reads its low half back: well defined, but the
+        // initial store is not the ladder's width.
+        let (mut instrs, _, stores) =
+            bitreverse_stack_ladder_with_tail(&ty, vec![bitreverse_return(Value(1))]);
+        instrs[stores[0]].opcode = Opcode::Store {
+            ty: Type::I64,
+            align: None,
         };
-        let mut isel = InstructionSelector::new("bitrev64_stack".to_string(), sig.clone());
+        let func = select_seeded_function_with_sig(
+            "wide_store",
+            Signature {
+                params: vec![Type::I64],
+                returns: vec![ty.clone()],
+            },
+            vec![(Block(0), instrs)],
+            vec![StackSlotInfo::new(8, 8)],
+        );
+        let entry = Block(0);
+        assert_eq!(count_opcode(&func, entry, AArch64Opcode::Rbit), 0);
+        assert!(count_opcode(&func, entry, AArch64Opcode::StrRI) >= 4);
+        assert!(func.source_fusion_targets.is_empty());
+        assert_eq!(func.stack_slots, vec![StackSlotInfo::new(8, 8)]);
+
+        // The slot is narrower than the ladder's 32-bit accesses.
+        let (instrs, _, _) =
+            bitreverse_stack_ladder_with_tail(&ty, vec![bitreverse_return(Value(1))]);
+        let func = select_seeded_function(
+            "narrow_slot",
+            &ty,
+            vec![(Block(0), instrs)],
+            vec![StackSlotInfo::new(2, 2)],
+        );
+        assert_eq!(count_opcode(&func, entry, AArch64Opcode::Rbit), 0);
+        assert!(count_opcode(&func, entry, AArch64Opcode::StrRI) >= 4);
+        assert!(func.source_fusion_targets.is_empty());
+        assert_eq!(func.stack_slots, vec![StackSlotInfo::new(2, 2)]);
+    }
+
+    #[test]
+    fn select_bitreverse_stack_ladder_without_function_facts_keeps_stores() {
+        // A block-at-a-time driver that never seeded whole-function facts
+        // cannot prove any slot private, so the ladder stays unfused.
+        let ty = Type::I32;
+        let sig = Signature {
+            params: vec![ty.clone()],
+            returns: vec![ty.clone()],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("unseeded".to_string(), sig.clone());
+        isel.set_stack_slots(vec![bitreverse_scalar_slot(&ty)]);
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
-
-        let instrs = bitreverse_stack_byte_swap_ladder(Type::I64, Value(0), Value(1));
+        let (instrs, _, _) =
+            bitreverse_stack_ladder_with_tail(&ty, vec![bitreverse_return(Value(1))]);
         isel.select_block(entry, &instrs).unwrap();
-
-        let mfunc = isel.finalize();
-        let insts = &mfunc.blocks[&entry].insts;
-        let rbit = insts
-            .iter()
-            .find(|inst| inst.opcode == AArch64Opcode::Rbit)
-            .expect("expected RBIT for i64 stack-local bitreverse ladder");
-        match rbit.operands[0] {
-            ISelOperand::VReg(vreg) => assert_eq!(vreg.class, RegClass::Gpr64),
-            ref other => panic!("expected Gpr64 RBIT destination, got {other:?}"),
-        }
+        let func = isel.finalize();
+        assert_stack_ladder_not_fused(&func, &ty, 1, "unseeded function facts");
     }
 
     #[test]
     fn select_bitreverse_stack_byte_swap_rejects_wrong_final_mask() {
-        let sig = Signature {
-            params: vec![Type::I32],
-            returns: vec![Type::I32],
-        };
-        let mut isel = InstructionSelector::new("bitrev32_bad_mask".to_string(), sig.clone());
-        let entry = Block(0);
-        isel.lower_formal_arguments(&sig, entry).unwrap();
-
-        let mut instrs = bitreverse_stack_byte_swap_ladder(Type::I32, Value(0), Value(1));
+        let ty = Type::I32;
+        let (mut instrs, _, _) =
+            bitreverse_stack_ladder_with_tail(&ty, vec![bitreverse_return(Value(1))]);
         let mask = instrs
             .iter_mut()
             .rev()
@@ -23763,16 +28402,15 @@ mod tests {
             .expect("expected low-byte final mask");
         *mask = 0xfe;
 
-        isel.select_block(entry, &instrs).unwrap();
-
-        let mfunc = isel.finalize();
-        let insts = &mfunc.blocks[&entry].insts;
-        assert!(
-            !insts.iter().any(|inst| inst.opcode == AArch64Opcode::Rbit),
-            "must not fuse byte-swap ladder with an incorrect final mask"
+        let func = select_seeded_function(
+            "bitrev32_bad_mask",
+            &ty,
+            vec![(Block(0), instrs)],
+            vec![bitreverse_scalar_slot(&ty)],
         );
+        assert_stack_ladder_not_fused(&func, &ty, 1, "an incorrect final mask");
         assert!(
-            insts.iter().any(|inst| inst.opcode == AArch64Opcode::LdrRI),
+            count_opcode(&func, Block(0), AArch64Opcode::LdrRI) > 0,
             "unfused stack-local ladder should still contain loads"
         );
     }
@@ -23783,7 +28421,8 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("bitrev_escape".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("bitrev_escape".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23816,7 +28455,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("negate".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("negate".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23844,11 +28483,12 @@ mod tests {
 
         let mfunc = isel.finalize();
         let mblock = &mfunc.blocks[&entry];
-        // COPY (arg) + Neg + Uxtw (to X0) + RET
+        // COPY (arg) + Neg + Copy (to W0) + RET
         assert_eq!(mblock.insts.len(), 4);
         assert_eq!(mblock.insts[0].opcode, AArch64Opcode::Copy);
         assert_eq!(mblock.insts[1].opcode, AArch64Opcode::Neg);
-        assert_eq!(mblock.insts[2].opcode, AArch64Opcode::Uxtw);
+        assert_eq!(mblock.insts[2].opcode, AArch64Opcode::Copy);
+        assert_eq!(mblock.insts[2].operands[0], ISelOperand::PReg(gpr::W0));
         assert_eq!(mblock.insts[3].opcode, AArch64Opcode::Ret);
     }
 
@@ -23859,7 +28499,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fneg_fn".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fneg_fn".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23902,7 +28542,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("fcvt2u".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fcvt2u".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23929,7 +28569,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("fcvt2u64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fcvt2u64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -23956,7 +28596,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("u2f".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("u2f".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24007,7 +28647,7 @@ mod tests {
     }
 
     #[test]
-    fn select_fcvt_to_uint_f16_to_u16_uses_half_source_hint() {
+    fn select_fcvt_to_uint_f16_to_u16_preserves_half_source_register() {
         let (mut isel, entry) = make_empty_isel();
         let src = Value(0);
         let result = Value(1);
@@ -24036,7 +28676,8 @@ mod tests {
         let mfunc = isel.finalize();
         let inst = &mfunc.blocks[&entry].insts[0];
         assert_eq!(inst.opcode, AArch64Opcode::FcvtzuRR);
-        assert_eq!(inst.operands[2], ISelOperand::Imm(16));
+        assert_eq!(inst.operands.len(), 2);
+        assert_eq!(inst.operands[1], ISelOperand::VReg(src_vreg));
     }
 
     #[test]
@@ -24045,7 +28686,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("u642f64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("u642f64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24102,7 +28743,7 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fpext".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fpext".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24126,7 +28767,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("fptrunc".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fptrunc".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24154,7 +28795,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("trunc64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("trunc64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24179,7 +28820,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I16],
         };
-        let mut isel = InstructionSelector::new("trunc16".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("trunc16".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24198,13 +28839,43 @@ mod tests {
         assert_eq!(mfunc.blocks[&entry].insts[1].opcode, AArch64Opcode::Uxth);
     }
 
+    /// trust-ir `Trunc` to `Bool` keeps the LOW BIT of the source, and a `B1`
+    /// register holds exactly 0 or 1: the selector must isolate bit 0, never
+    /// move the source (which made `trunc(2)` a true Bool with value 2 and
+    /// passed it unnormalized across the C boundary).
+    #[test]
+    fn select_trunc_i64_to_bool_isolates_the_low_bit() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![Type::B1],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("trunc1".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Trunc { to_ty: Type::B1 },
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .unwrap();
+
+        let mfunc = isel.finalize();
+        let trunc = &mfunc.blocks[&entry].insts[1];
+        assert_eq!(trunc.opcode, AArch64Opcode::AndRI);
+        assert_eq!(trunc.operands.last(), Some(&ISelOperand::Imm(1)));
+    }
+
     #[test]
     fn select_trunc_i64_to_i8() {
         let sig = Signature {
             params: vec![Type::I64],
             returns: vec![Type::I8],
         };
-        let mut isel = InstructionSelector::new("trunc8".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("trunc8".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24233,7 +28904,8 @@ mod tests {
             params: vec![Type::I8],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("select_uxtb_to_i64".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("select_uxtb_to_i64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24260,7 +28932,8 @@ mod tests {
             params: vec![Type::I16],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("select_uxth_to_i64".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("select_uxth_to_i64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24287,7 +28960,8 @@ mod tests {
             params: vec![Type::I8],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("select_sextb_to_i64".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("select_sextb_to_i64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24314,7 +28988,8 @@ mod tests {
             params: vec![Type::I16],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("select_sexth_to_i32".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("select_sexth_to_i32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24341,7 +29016,10 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::I16],
         };
-        let mut isel = InstructionSelector::new("select_trunc_i64_to_i16".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test(
+            "select_trunc_i64_to_i16".to_string(),
+            sig.clone(),
+        );
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24365,7 +29043,8 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I8],
         };
-        let mut isel = InstructionSelector::new("select_trunc_i32_to_i8".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("select_trunc_i32_to_i8".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24390,7 +29069,8 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("select_same_width_copy".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("select_same_width_copy".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24421,7 +29101,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("bc_i2f".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bc_i2f".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24480,7 +29160,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("bc_i642f64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bc_i642f64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24508,7 +29188,7 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("bc_f2i".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bc_f2i".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24536,7 +29216,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("bc_f642i64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("bc_f642i64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -24917,7 +29597,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_small".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_small".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -24965,7 +29645,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_med".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_med".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -25019,7 +29699,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_med_9".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_med_9".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -25082,7 +29762,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("sret_saved".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("sret_saved".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -25144,6 +29824,256 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Exact-width aggregate register lanes (S2 + L3).
+    //
+    // ONE invariant, two lanes: an aggregate that travels in registers is an
+    // aggregate READ FROM MEMORY, and the read may not run past the object.
+    // `aggregate_lane_bytes_read` below re-derives each emitted load's access
+    // width the way the encoder does (`aarch64::encode::scalar_transfer_scale`:
+    // the width of `LdrRI` follows the TRANSFER REGISTER's class, Gpr64 -> 8,
+    // Gpr32 -> 4; `LdrbRI`/`LdrhRI` fix 1/2 in the opcode), so the assertion is
+    // about the machine access, not about which opcode was chosen.
+    // ---------------------------------------------------------------------
+
+    /// Access width in bytes of an emitted scalar load, or `None` if the
+    /// instruction is not one. Mirrors the encoder's own derivation.
+    fn aggregate_lane_load_width(inst: &ISelInst) -> Option<u32> {
+        let transfer_class = match inst.operands.first() {
+            Some(ISelOperand::VReg(v)) => v.class,
+            Some(ISelOperand::PReg(p)) => preg_class(*p),
+            _ => return None,
+        };
+        match inst.opcode {
+            AArch64Opcode::LdrbRI => Some(1),
+            AArch64Opcode::LdrhRI => Some(2),
+            AArch64Opcode::LdrRI => Some(match transfer_class {
+                RegClass::Gpr32 => 4,
+                RegClass::Gpr64 => 8,
+                _ => return None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The highest byte offset (exclusive) any emitted load reads from `base`.
+    fn highest_byte_read_from(insts: &[ISelInst], base: &ISelOperand) -> u32 {
+        let mut high = 0u32;
+        for inst in insts {
+            let Some(width) = aggregate_lane_load_width(inst) else {
+                continue;
+            };
+            if inst.operands.get(1) != Some(base) {
+                continue;
+            }
+            let offset = match inst.operands.get(2) {
+                Some(ISelOperand::Imm(i)) => *i as u32,
+                _ => 0,
+            };
+            high = high.max(offset + width);
+        }
+        high
+    }
+
+    fn agg_of_bytes(n: u32) -> Type {
+        Type::Array(Box::new(Type::I8), n)
+    }
+
+    /// S2. The single-register call-argument lane used to emit ONE 8-byte
+    /// `LDR` whatever the aggregate's size was, so every aggregate narrower
+    /// than 8 bytes read memory the object does not own — a fault when the
+    /// object ends at a page boundary, and another object's bytes in the
+    /// argument register's high half when it does not.
+    #[test]
+    fn byval_aggregate_arg_reads_no_byte_past_the_object() {
+        for size in 1u32..=8 {
+            let agg = agg_of_bytes(size);
+            assert_eq!(agg.bytes(), size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![],
+            };
+            let mut isel = InstructionSelector::new_darwin_test(format!("byval_{size}"), sig);
+            let entry = Block(0);
+            let base = isel.new_vreg(RegClass::Gpr64);
+            let base_op = ISelOperand::VReg(base);
+            isel.select_aggregate_arg(base_op.clone(), &agg, &ArgLocation::Reg(gpr::X0), entry)
+                .unwrap();
+            let insts = &isel.func.blocks[&entry].insts;
+            let read = highest_byte_read_from(insts, &base_op);
+            assert_eq!(
+                read, size,
+                "a {size}-byte by-value aggregate argument must read exactly \
+                 {size} bytes, not {read}"
+            );
+        }
+    }
+
+    /// S2, high lane. A 9..15-byte aggregate travels in a register PAIR whose
+    /// high lane holds only `size - 8` bytes; reading a full 8 there runs up
+    /// to seven bytes past the object. The aggregate RETURN path has read the
+    /// exact tail since it was written.
+    #[test]
+    fn byval_aggregate_arg_pair_high_lane_reads_exact_tail() {
+        for size in 9u32..=16 {
+            let agg = agg_of_bytes(size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![],
+            };
+            let mut isel = InstructionSelector::new_darwin_test(format!("byval_pair_{size}"), sig);
+            let entry = Block(0);
+            let base = isel.new_vreg(RegClass::Gpr64);
+            let base_op = ISelOperand::VReg(base);
+            isel.select_aggregate_arg(
+                base_op.clone(),
+                &agg,
+                &ArgLocation::RegPair(gpr::X0, gpr::X1),
+                entry,
+            )
+            .unwrap();
+            let insts = &isel.func.blocks[&entry].insts;
+            let read = highest_byte_read_from(insts, &base_op);
+            assert_eq!(
+                read, size,
+                "a {size}-byte by-value aggregate argument pair must read \
+                 exactly {size} bytes, not {read}"
+            );
+        }
+    }
+
+    /// Exactly one instruction in a call-argument lane may carry the semantic
+    /// `call_arg_setup` flag — the one that DEFINES the ABI register. The
+    /// post-RA repair pass fails the compile closed on a marked instruction
+    /// that does not define exactly one ABI argument register, and the
+    /// composition's scratch loads define none.
+    #[test]
+    fn byval_aggregate_arg_marks_exactly_one_setup_instruction() {
+        for size in 1u32..=8 {
+            let agg = agg_of_bytes(size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![],
+            };
+            let mut isel = InstructionSelector::new_darwin_test(format!("byval_setup_{size}"), sig);
+            let entry = Block(0);
+            let base = isel.new_vreg(RegClass::Gpr64);
+            isel.select_aggregate_arg(
+                ISelOperand::VReg(base),
+                &agg,
+                &ArgLocation::Reg(gpr::X0),
+                entry,
+            )
+            .unwrap();
+            let insts = &isel.func.blocks[&entry].insts;
+            let marked: Vec<_> = insts.iter().filter(|i| i.is_call_arg_setup).collect();
+            assert_eq!(
+                marked.len(),
+                1,
+                "size {size}: exactly one call-argument setup instruction"
+            );
+            let defines_abi_reg = matches!(
+                marked[0].operands.first(),
+                Some(ISelOperand::PReg(p))
+                    if *p == gpr::X0 || *p == trust_cg_ir::aarch64_regs::W0
+            );
+            assert!(
+                defines_abi_reg,
+                "size {size}: the marked setup instruction must define the ABI \
+                 argument register, got {:?}",
+                marked[0].operands.first()
+            );
+        }
+    }
+
+    /// L3 ([TCG-REGALLOC-063]). The exact-width aggregate RETURN lane used to
+    /// refuse every width outside {1,2,4,8}; 3/5/6/7 are now COMPOSED from
+    /// exact lanes rather than widened to one 8-byte load.
+    #[test]
+    fn exact_width_aggregate_return_lowers_every_width_without_over_reading() {
+        for size in 1u32..=8 {
+            let agg = agg_of_bytes(size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![agg.clone()],
+            };
+            let mut isel = InstructionSelector::new_darwin_test(format!("ret_{size}"), sig);
+            let entry = Block(0);
+            let base = isel.new_vreg(RegClass::Gpr64);
+            let base_op = ISelOperand::VReg(base);
+            isel.select_aggregate_return(base_op.clone(), &agg, entry)
+                .unwrap_or_else(|e| panic!("width {size} must lower, got {e:?}"));
+            let insts = &isel.func.blocks[&entry].insts;
+            let read = highest_byte_read_from(insts, &base_op);
+            assert_eq!(
+                read, size,
+                "a {size}-byte aggregate return must read exactly {size} bytes, \
+                 not {read}"
+            );
+        }
+    }
+
+    /// L3, medium lane: 9..16 bytes ride X0:X1, and the HIGH lane is the exact
+    /// tail, which is 3/5/6/7 for 11/13/14/15-byte aggregates.
+    #[test]
+    fn exact_width_aggregate_return_medium_tail_lowers_every_width() {
+        for size in 9u32..=16 {
+            let agg = agg_of_bytes(size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![agg.clone()],
+            };
+            let mut isel = InstructionSelector::new_darwin_test(format!("ret_med_{size}"), sig);
+            let entry = Block(0);
+            let base = isel.new_vreg(RegClass::Gpr64);
+            let base_op = ISelOperand::VReg(base);
+            isel.select_aggregate_return(base_op.clone(), &agg, entry)
+                .unwrap_or_else(|e| panic!("width {size} must lower, got {e:?}"));
+            let insts = &isel.func.blocks[&entry].insts;
+            let read = highest_byte_read_from(insts, &base_op);
+            assert_eq!(
+                read, size,
+                "a {size}-byte aggregate return must read exactly {size} bytes, \
+                 not {read}"
+            );
+        }
+    }
+
+    /// CONTROL. The single-instruction lanes stay single instructions, with
+    /// the opcode they always had. Width 4 is the one that MOVED, and it moved
+    /// because it was never exact: `LdrRI` with an X transfer register is an
+    /// 8-byte access (`scalar_transfer_scale`), so the 4-byte lane has to name
+    /// the W alias. Widths 1, 2 and 8 are untouched.
+    #[test]
+    fn single_instruction_aggregate_return_lanes_keep_their_shape() {
+        let expected: [(u32, AArch64Opcode, PReg); 4] = [
+            (1, AArch64Opcode::LdrbRI, gpr::X0),
+            (2, AArch64Opcode::LdrhRI, gpr::X0),
+            (4, AArch64Opcode::LdrRI, trust_cg_ir::aarch64_regs::W0),
+            (8, AArch64Opcode::LdrRI, gpr::X0),
+        ];
+        for (size, opcode, transfer_reg) in expected {
+            let agg = agg_of_bytes(size);
+            let sig = Signature {
+                params: vec![],
+                returns: vec![agg.clone()],
+            };
+            let mut isel = InstructionSelector::new_darwin_test(format!("ret_shape_{size}"), sig);
+            let entry = Block(0);
+            let base = isel.new_vreg(RegClass::Gpr64);
+            isel.select_aggregate_return(ISelOperand::VReg(base), &agg, entry)
+                .unwrap();
+            let insts = &isel.func.blocks[&entry].insts;
+            assert_eq!(insts.len(), 1, "width {size} is a single load");
+            assert_eq!(insts[0].opcode, opcode, "width {size} opcode");
+            assert_eq!(
+                insts[0].operands.first(),
+                Some(&ISelOperand::PReg(transfer_reg)),
+                "width {size} transfer register"
+            );
+        }
+    }
+
     #[test]
     fn sret_return_base_fails_closed_when_signature_declares_no_sret() {
         // Formal arguments lowered (so we are on the production path) but the
@@ -25153,7 +30083,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("no_sret".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("no_sret".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         assert!(isel.sret_return_ptr.is_none());
@@ -25164,6 +30094,169 @@ mod tests {
             .select_aggregate_return(ISelOperand::VReg(src), &struct_ty, entry)
             .unwrap_err();
         assert!(matches!(err, ISelError::UnsupportedReturnLocation));
+    }
+
+    /// Evaluate the load/extend/shift/or/copy instructions an aggregate return
+    /// emits, over a byte buffer that holds ONLY the aggregate: a read of any
+    /// byte outside it panics. Returns the final X0/X1 register values.
+    fn eval_aggregate_return_lanes(
+        insts: &[ISelInst],
+        src: VReg,
+        bytes: &[u8],
+    ) -> (Option<u64>, Option<u64>) {
+        const BASE: u64 = 0x4000;
+        let key = |op: &ISelOperand| format!("{op:?}");
+        let mut regs: HashMap<String, u64> = HashMap::default();
+        regs.insert(key(&ISelOperand::VReg(src)), BASE);
+        let read = |regs: &HashMap<String, u64>, op: &ISelOperand| -> u64 {
+            *regs
+                .get(&key(op))
+                .unwrap_or_else(|| panic!("read of undefined {op:?}"))
+        };
+        let width_of = |op: &ISelOperand| match op {
+            ISelOperand::VReg(v) if v.class == RegClass::Gpr32 => 4u64,
+            ISelOperand::PReg(p) if preg_class(*p) == RegClass::Gpr32 => 4,
+            _ => 8,
+        };
+        for inst in insts {
+            let ops = &inst.operands;
+            let load = |regs: &HashMap<String, u64>, n: u64| -> u64 {
+                let ISelOperand::Imm(off) = ops[2] else {
+                    panic!("load without Imm offset")
+                };
+                let addr = read(regs, &ops[1]) + off as u64;
+                assert!(
+                    addr >= BASE && addr + n <= BASE + bytes.len() as u64,
+                    "{:?} reads {n} byte(s) at offset {} of a {}-byte aggregate",
+                    inst.opcode,
+                    addr - BASE,
+                    bytes.len()
+                );
+                let start = (addr - BASE) as usize;
+                let mut v = 0u64;
+                for (i, b) in bytes[start..start + n as usize].iter().enumerate() {
+                    v |= u64::from(*b) << (8 * i);
+                }
+                v
+            };
+            let value = match inst.opcode {
+                AArch64Opcode::LdrbRI => load(&regs, 1),
+                AArch64Opcode::LdrhRI => load(&regs, 2),
+                AArch64Opcode::LdrRI => load(&regs, width_of(&ops[0])),
+                AArch64Opcode::Uxtw => read(&regs, &ops[1]) & 0xffff_ffff,
+                AArch64Opcode::Copy | AArch64Opcode::MovR => read(&regs, &ops[1]),
+                AArch64Opcode::LslRI => {
+                    let ISelOperand::Imm(sh) = ops[2] else {
+                        panic!("LslRI without Imm")
+                    };
+                    read(&regs, &ops[1]) << sh
+                }
+                AArch64Opcode::OrrRR => read(&regs, &ops[1]) | read(&regs, &ops[2]),
+                other => panic!("unexpected opcode in an aggregate return lane: {other:?}"),
+            };
+            let value = if width_of(&ops[0]) == 4 {
+                value & 0xffff_ffff
+            } else {
+                value
+            };
+            regs.insert(key(&ops[0]), value);
+        }
+        (
+            regs.get(&key(&ISelOperand::PReg(gpr::X0))).copied(),
+            regs.get(&key(&ISelOperand::PReg(gpr::X1))).copied(),
+        )
+    }
+
+    #[test]
+    fn odd_width_aggregate_return_lanes_are_composed_from_exact_loads() {
+        // rustc returns a 3/5/6/7-byte `BackendRepr::Memory` aggregate as
+        // `PassMode::Cast` to ONE integer register of exactly that width
+        // (`Option<[u8; 2]>`, `Option<Ipv4Addr>`, `([u8; 4], Range<u8>)`), and an
+        // `extern "C"` 11/13/14/15-byte one as x0 + an odd-width x1 tail. These
+        // used to fail closed as "stack-passed returns are not supported" (ten
+        // `core::net` / `core::escape` / `Copied::next` roots in std). Each lane
+        // must carry the value's little-endian bytes, read NO byte outside the
+        // aggregate, and leave the bits above the lane zero.
+        for size in [3u32, 5, 6, 7, 11, 13, 14, 15] {
+            let ty = Type::Array(Box::new(Type::I8), size);
+            assert_eq!(ty.bytes(), size);
+            let bytes: Vec<u8> = (0..size)
+                .map(|i| 0x81u8.wrapping_add((i as u8).wrapping_mul(0x35)))
+                .collect();
+            let mut isel = InstructionSelector::new_darwin_test(
+                format!("odd_{size}"),
+                Signature {
+                    params: vec![],
+                    returns: vec![ty.clone()],
+                },
+            );
+            let entry = Block(0);
+            let src = isel.new_vreg(RegClass::Gpr64);
+            isel.select_aggregate_return(ISelOperand::VReg(src), &ty, entry)
+                .unwrap_or_else(|e| panic!("{size}-byte aggregate return refused: {e}"));
+            let insts = isel.func.blocks[&entry].insts.clone();
+            let (x0, x1) = eval_aggregate_return_lanes(&insts, src, &bytes);
+            let lane = |lo: usize, hi: usize| {
+                bytes[lo..hi]
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |v, (i, b)| v | u64::from(*b) << (8 * i))
+            };
+            if size <= 8 {
+                assert_eq!(x0, Some(lane(0, size as usize)), "{size}-byte x0 lane");
+                assert_eq!(x1, None, "{size}-byte return must not define x1");
+            } else {
+                assert_eq!(x0, Some(lane(0, 8)), "{size}-byte x0 lane");
+                assert_eq!(x1, Some(lane(8, size as usize)), "{size}-byte x1 lane");
+            }
+            // The composed lane is copied into its physical register exactly
+            // once, after every scratch load: no scratch computation follows a
+            // physical-register definition.
+            let last_preg_def = insts
+                .iter()
+                .rposition(|i| matches!(i.operands.first(), Some(ISelOperand::PReg(_))));
+            let last_vreg_def = insts
+                .iter()
+                .rposition(|i| matches!(i.operands.first(), Some(ISelOperand::VReg(_))));
+            if let (Some(p), Some(v)) = (last_preg_def, last_vreg_def) {
+                let first_preg_def = insts
+                    .iter()
+                    .position(|i| matches!(i.operands.first(), Some(ISelOperand::PReg(_))))
+                    .unwrap();
+                assert!(
+                    v < first_preg_def || (size > 8 && v < p),
+                    "{size}: a scratch register is defined after a physical return register"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_return_lane_width_outside_one_register_stays_refused() {
+        let mut isel = InstructionSelector::new_darwin_test(
+            "bad_lane".to_string(),
+            Signature {
+                params: vec![],
+                returns: vec![],
+            },
+        );
+        let src = isel.new_vreg(RegClass::Gpr64);
+        for width in [0u32, 9, 16] {
+            let err = isel
+                .emit_exact_aggregate_return_lane(
+                    Block(0),
+                    gpr::X0,
+                    ISelOperand::VReg(src),
+                    0,
+                    width,
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, ISelError::UnsupportedReturnLocation),
+                "width {width}"
+            );
+        }
     }
 
     #[test]
@@ -25205,7 +30298,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_large".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_large".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -25254,7 +30347,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_hfa_f16".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_hfa_f16".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -25298,7 +30391,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_hfa_f32".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_hfa_f32".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -25338,7 +30431,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_hfa_f64".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_hfa_f64".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -25666,6 +30759,440 @@ mod tests {
         assert_eq!(insts[3].operands[2], ISelOperand::Imm(8));
     }
 
+    // -----------------------------------------------------------------------
+    // By-reference composite arguments (AAPCS64 B.4, DarwinPCS): a caller-owned
+    // copy per argument, never the source's own storage.
+    // -----------------------------------------------------------------------
+
+    fn by_reference_isel(variant: AArch64AbiVariant) -> (InstructionSelector, Block) {
+        let (mut isel, entry) = make_empty_isel();
+        isel.set_abi_variant(variant);
+        (isel, entry)
+    }
+
+    /// Define `value` as a pointer-represented aggregate of type `ty` held in
+    /// a fresh Gpr64 vreg, and return that vreg.
+    fn define_aggregate(isel: &mut InstructionSelector, value: Value, ty: &Type) -> ISelOperand {
+        let vreg = ISelOperand::VReg(isel.new_vreg(RegClass::Gpr64));
+        isel.define_value(value, vreg.clone(), ty.clone());
+        vreg
+    }
+
+    /// The `[offset, offset + width)` byte ranges the block reads (`loads`)
+    /// or writes through `root`, following `AddRI` rebases of it.
+    fn accessed_ranges(insts: &[ISelInst], root: &ISelOperand, loads: bool) -> Vec<(i64, i64)> {
+        let mut bases: Vec<(ISelOperand, i64)> = vec![(root.clone(), 0)];
+        let base_of = |bases: &[(ISelOperand, i64)], operand: &ISelOperand| {
+            bases
+                .iter()
+                .find(|(base, _)| base == operand)
+                .map(|(_, offset)| *offset)
+        };
+        let mut ranges = Vec::new();
+        // A lane the copy does not use (another class, a physical register)
+        // has no width here, so an access through `root` by one leaves a
+        // gap that `assert_tiles` reports.
+        let width = |operand: &ISelOperand| match operand {
+            ISelOperand::VReg(v) if v.class == RegClass::Gpr64 => Some(8),
+            ISelOperand::VReg(v) if v.class == RegClass::Gpr32 => Some(4),
+            _ => None,
+        };
+        for inst in insts {
+            let (base, offset, bytes) = match (inst.opcode, loads) {
+                (AArch64Opcode::AddRI, _) => {
+                    if let (Some(base), ISelOperand::Imm(k)) =
+                        (base_of(&bases, &inst.operands[1]), &inst.operands[2])
+                    {
+                        bases.push((inst.operands[0].clone(), base + k));
+                    }
+                    continue;
+                }
+                (AArch64Opcode::LdpRI, true) | (AArch64Opcode::StpRI, false) => (
+                    &inst.operands[2],
+                    &inst.operands[3],
+                    width(&inst.operands[0])
+                        .zip(width(&inst.operands[1]))
+                        .map(|(lo, hi)| lo + hi),
+                ),
+                (AArch64Opcode::LdrRI, true) | (AArch64Opcode::StrRI, false) => (
+                    &inst.operands[1],
+                    &inst.operands[2],
+                    width(&inst.operands[0]),
+                ),
+                (AArch64Opcode::LdrhRI, true) | (AArch64Opcode::StrhRI, false) => {
+                    (&inst.operands[1], &inst.operands[2], Some(2))
+                }
+                (AArch64Opcode::LdrbRI, true) | (AArch64Opcode::StrbRI, false) => {
+                    (&inst.operands[1], &inst.operands[2], Some(1))
+                }
+                _ => continue,
+            };
+            let (Some(base), ISelOperand::Imm(offset), Some(bytes)) =
+                (base_of(&bases, base), offset, bytes)
+            else {
+                continue;
+            };
+            ranges.push((base + offset, base + offset + bytes));
+        }
+        ranges.sort_unstable();
+        ranges
+    }
+
+    /// Ranges that tile `[0, size)` exactly, with no gap and no overlap,
+    /// prove a complete byte copy.
+    fn assert_tiles(ranges: &[(i64, i64)], size: u32, what: &str) {
+        let mut next = 0;
+        for &(start, end) in ranges {
+            assert_eq!(start, next, "{what}: gap or overlap in {ranges:?}");
+            next = end;
+        }
+        assert_eq!(next, i64::from(size), "{what}: {ranges:?}");
+    }
+
+    /// The fresh slot address whose bytes are a complete copy of `src`'s
+    /// `ty`: an `AddPCRel` of a slot of exactly the type's size and the
+    /// type's alignment (at least 8), filled only from `src`.
+    fn by_reference_copy_of(
+        mfunc: &ISelFunction,
+        insts: &[ISelInst],
+        src: &ISelOperand,
+        ty: &Type,
+    ) -> Vec<ISelOperand> {
+        let copies: Vec<ISelOperand> = insts
+            .iter()
+            .filter(|inst| inst.opcode == AArch64Opcode::AddPCRel)
+            .filter_map(|inst| {
+                let ISelOperand::StackSlot(slot) = inst.operands[2] else {
+                    return None;
+                };
+                let info = &mfunc.stack_slots[slot as usize];
+                (info.size == ty.bytes() && info.align == ty.align().max(8))
+                    .then(|| inst.operands[0].clone())
+            })
+            // An sret buffer of the same shape is written by the callee, not
+            // here.
+            .filter(|copy| !accessed_ranges(insts, copy, false).is_empty())
+            .collect();
+        // Each copy reads the whole source once.
+        let reads = accessed_ranges(insts, src, true);
+        let mut distinct = reads.clone();
+        distinct.dedup();
+        assert_eq!(reads.len(), distinct.len() * copies.len(), "{reads:?}");
+        assert_tiles(&distinct, ty.bytes(), "source reads");
+        for copy in &copies {
+            assert_tiles(
+                &accessed_ranges(insts, copy, false),
+                ty.bytes(),
+                "copy writes",
+            );
+        }
+        copies
+    }
+
+    fn call_facts(insts: &[ISelInst]) -> &trust_cg_ir::CallAbiFacts {
+        insts
+            .iter()
+            .find(|inst| inst.opcode == AArch64Opcode::Bl)
+            .and_then(|inst| inst.call_abi.as_ref())
+            .expect("the call carries classified facts")
+    }
+
+    fn passes_in(insts: &[ISelInst], preg: PReg) -> Vec<ISelOperand> {
+        insts
+            .iter()
+            .filter(|inst| {
+                inst.opcode == AArch64Opcode::MovR
+                    && inst.is_call_arg_setup
+                    && inst.operands[0] == ISelOperand::PReg(preg)
+            })
+            .map(|inst| inst.operands[1].clone())
+            .collect()
+    }
+
+    /// Both conventions, several sizes and alignments (20 bytes with a 4-byte
+    /// tail lane, a 16-aligned `{i128, i64}`, and the 256-byte limit): X0
+    /// carries the address of a fresh copy, and the source is only read.
+    #[test]
+    fn by_reference_call_argument_passes_a_fresh_copy() {
+        let types = [
+            Type::Struct(vec![Type::I64; 3]),
+            Type::Struct(vec![Type::I32; 5]),
+            Type::Struct(vec![Type::I128, Type::I64]),
+            Type::Array(Box::new(Type::I64), 32),
+        ];
+        for variant in [AArch64AbiVariant::Aapcs64, AArch64AbiVariant::Darwin] {
+            for ty in &types {
+                let (mut isel, entry) = by_reference_isel(variant);
+                let src = define_aggregate(&mut isel, Value(0), ty);
+                isel.select_call("callee", &[Value(0)], &[], &[], entry)
+                    .unwrap();
+                let mfunc = isel.finalize();
+                let insts = &mfunc.blocks[&entry].insts;
+                let copies = by_reference_copy_of(&mfunc, insts, &src, ty);
+                assert_eq!(copies.len(), 1, "{variant:?} {ty:?}");
+                assert_eq!(passes_in(insts, gpr::X0), copies, "{variant:?} {ty:?}");
+                assert!(
+                    accessed_ranges(insts, &src, false).is_empty(),
+                    "{variant:?} {ty:?}: the source is never written"
+                );
+                assert!(call_facts(insts).by_reference_argument_copies);
+                // Every pair lane stays inside one encodable window.
+                for inst in insts.iter().filter(|inst| {
+                    matches!(inst.opcode, AArch64Opcode::LdpRI | AArch64Opcode::StpRI)
+                }) {
+                    let ISelOperand::Imm(offset) = inst.operands[3] else {
+                        panic!("pair without an offset: {inst:?}");
+                    };
+                    assert!((0..=240).contains(&offset), "{variant:?} {ty:?}: {offset}");
+                }
+                let pairs = insts
+                    .iter()
+                    .filter(|inst| inst.opcode == AArch64Opcode::StpRI)
+                    .count();
+                assert_eq!(pairs, ty.bytes() as usize / 16, "{variant:?} {ty:?}");
+            }
+        }
+    }
+
+    /// Above the inline limit selection refuses by name instead of unrolling
+    /// the copy (the adapter makes such a copy before the call).
+    #[test]
+    fn by_reference_argument_above_the_inline_limit_is_refused() {
+        for (ty, refused) in [
+            (Type::Array(Box::new(Type::I64), 32), false),
+            (Type::Array(Box::new(Type::I64), 33), true),
+            (Type::Array(Box::new(Type::I64), 9000), true),
+        ] {
+            let (mut isel, entry) = by_reference_isel(AArch64AbiVariant::Aapcs64);
+            define_aggregate(&mut isel, Value(0), &ty);
+            let result = isel.select_call("callee", &[Value(0)], &[], &[], entry);
+            match (refused, result) {
+                (false, Ok(())) => {}
+                (true, Err(ISelError::UnsupportedOpcode(message))) => {
+                    assert!(message.contains("[TCG-BYREF-COPY]"), "{message}")
+                }
+                (refused, result) => panic!("{} bytes: refused={refused} {result:?}", ty.bytes()),
+            }
+        }
+    }
+
+    /// With X0-X7 used, the by-reference pointer is an 8-byte outgoing stack
+    /// argument: the stored pointer is the copy's address.
+    #[test]
+    fn by_reference_stack_argument_stores_the_copy_address() {
+        let ty = Type::Struct(vec![Type::I64; 4]);
+        for variant in [AArch64AbiVariant::Aapcs64, AArch64AbiVariant::Darwin] {
+            let (mut isel, entry) = by_reference_isel(variant);
+            let mut args = Vec::new();
+            for index in 0..8 {
+                let reg = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(index), ISelOperand::VReg(reg), Type::I64);
+                args.push(Value(index));
+            }
+            let src = define_aggregate(&mut isel, Value(8), &ty);
+            args.push(Value(8));
+            isel.select_call("callee", &args, &[], &[], entry).unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let copies = by_reference_copy_of(&mfunc, insts, &src, &ty);
+            assert_eq!(copies.len(), 1, "{variant:?}");
+            let stored: Vec<_> = insts
+                .iter()
+                .filter(|inst| {
+                    inst.opcode == AArch64Opcode::StrRI && inst.operands[1] == ISelOperand::PReg(SP)
+                })
+                .map(|inst| (inst.operands[0].clone(), inst.operands[2].clone()))
+                .collect();
+            assert_eq!(stored, vec![(copies[0].clone(), ISelOperand::Imm(0))]);
+            let facts = call_facts(insts);
+            assert!(facts.by_reference_argument_copies && facts.aggregate_stack_args);
+        }
+    }
+
+    /// The same value passed twice gets two copies: a callee writing one
+    /// parameter must not change the other.
+    #[test]
+    fn by_reference_value_passed_twice_gets_two_copies() {
+        let ty = Type::Struct(vec![Type::I64; 4]);
+        let (mut isel, entry) = by_reference_isel(AArch64AbiVariant::Aapcs64);
+        let src = define_aggregate(&mut isel, Value(0), &ty);
+        isel.select_call("callee", &[Value(0), Value(0)], &[], &[], entry)
+            .unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let copies = by_reference_copy_of(&mfunc, insts, &src, &ty);
+        assert_eq!(copies.len(), 2);
+        assert_ne!(copies[0], copies[1]);
+        assert_eq!(passes_in(insts, gpr::X0), vec![copies[0].clone()]);
+        assert_eq!(passes_in(insts, gpr::X1), vec![copies[1].clone()]);
+    }
+
+    /// A call through a function pointer copies exactly like a direct call.
+    #[test]
+    fn by_reference_indirect_call_argument_passes_a_fresh_copy() {
+        let ty = Type::Struct(vec![Type::I64; 4]);
+        for variant in [AArch64AbiVariant::Aapcs64, AArch64AbiVariant::Darwin] {
+            let (mut isel, entry) = by_reference_isel(variant);
+            let fn_ptr = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(fn_ptr), Type::I64);
+            let src = define_aggregate(&mut isel, Value(1), &ty);
+            isel.select_call_indirect(&Value(0), &[Value(1)], &[], &[], entry)
+                .unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let copies = by_reference_copy_of(&mfunc, insts, &src, &ty);
+            assert_eq!(copies.len(), 1, "{variant:?}");
+            assert_eq!(passes_in(insts, gpr::X0), copies, "{variant:?}");
+            let facts = insts
+                .iter()
+                .find(|inst| inst.opcode == AArch64Opcode::Blr)
+                .and_then(|inst| inst.call_abi.as_ref())
+                .expect("the indirect call carries classified facts");
+            assert!(facts.by_reference_argument_copies);
+            assert!(!facts.aggregate_stack_args && !facts.hidden_result_pointer && !facts.variadic);
+            assert_eq!(facts.stack_arg_bytes, 0);
+            assert!(facts.stack_stores.is_empty());
+        }
+    }
+
+    /// A stack-passed by-reference composite and an aggregate result keep
+    /// both ownership facts, even though their copies are not scalar outgoing
+    /// argument stores and the result buffer is staged through X8.
+    #[test]
+    fn indirect_aggregate_stack_call_records_sret_and_by_reference_abi_facts() {
+        let ty = Type::Struct(vec![Type::I64; 3]);
+        for variant in [AArch64AbiVariant::Aapcs64, AArch64AbiVariant::Darwin] {
+            let (mut isel, entry) = by_reference_isel(variant);
+            let fn_ptr = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(fn_ptr), Type::I64);
+            let mut args = Vec::new();
+            for index in 1..=8u32 {
+                let vreg = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(index), ISelOperand::VReg(vreg), Type::I64);
+                args.push(Value(index));
+            }
+            let src = define_aggregate(&mut isel, Value(9), &ty);
+            args.push(Value(9));
+            isel.select_call_indirect(
+                &Value(0),
+                &args,
+                &[Value(10)],
+                std::slice::from_ref(&ty),
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(by_reference_copy_of(&mfunc, insts, &src, &ty).len(), 1);
+            let call = insts
+                .iter()
+                .find(|inst| inst.opcode == AArch64Opcode::Blr)
+                .unwrap();
+            assert_eq!(call.operands, vec![ISelOperand::VReg(fn_ptr)]);
+            assert!(call.implicit_uses.contains(&gpr::X8));
+            let facts = call
+                .call_abi
+                .as_ref()
+                .expect("classified indirect ABI facts");
+            assert!(facts.callee.is_none());
+            assert_eq!(facts.stack_arg_bytes, 8);
+            assert!(facts.stack_stores.is_empty());
+            assert!(facts.aggregate_stack_args && facts.by_reference_argument_copies);
+            assert!(facts.hidden_result_pointer && !facts.variadic);
+            let ir = mfunc.to_ir_func();
+            assert_eq!(ir.call_abi_facts.len(), 1);
+            assert_eq!(ir.call_abi_facts.values().next(), Some(facts));
+        }
+    }
+
+    /// Base AAPCS64 passes an anonymous by-reference composite like a fixed
+    /// one, so a variadic call copies it too.
+    #[test]
+    fn by_reference_variadic_argument_passes_a_fresh_copy_on_aapcs64() {
+        let ty = Type::Struct(vec![Type::I64; 4]);
+        let (mut isel, entry) = by_reference_isel(AArch64AbiVariant::Aapcs64);
+        let fixed = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(fixed), Type::I64);
+        let src = define_aggregate(&mut isel, Value(1), &ty);
+        isel.select_variadic_call("vf", 1, &[Value(0), Value(1)], &[], &[], entry)
+            .unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let copies = by_reference_copy_of(&mfunc, insts, &src, &ty);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(passes_in(insts, gpr::X1), copies);
+        let facts = call_facts(insts);
+        assert!(facts.by_reference_argument_copies && facts.variadic);
+    }
+
+    /// An sret call with a by-reference argument: the copy is made before X8
+    /// is staged, and X8 still carries the result buffer.
+    #[test]
+    fn by_reference_argument_copy_precedes_the_sret_buffer() {
+        let ty = Type::Struct(vec![Type::I64; 4]);
+        let (mut isel, entry) = by_reference_isel(AArch64AbiVariant::Aapcs64);
+        let src = define_aggregate(&mut isel, Value(0), &ty);
+        isel.select_call(
+            "callee",
+            &[Value(0)],
+            &[Value(1)],
+            std::slice::from_ref(&ty),
+            entry,
+        )
+        .unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let copies = by_reference_copy_of(&mfunc, insts, &src, &ty);
+        // The result buffer has the copy's shape but is not filled here.
+        let x8 = passes_in(insts, gpr::X8);
+        assert_eq!(x8.len(), 1);
+        assert_eq!(copies.len(), 1);
+        assert_ne!(copies[0], x8[0]);
+        assert_eq!(passes_in(insts, gpr::X0), copies);
+        let last_copy_store = insts
+            .iter()
+            .rposition(|inst| inst.opcode == AArch64Opcode::StpRI)
+            .unwrap();
+        let x8_setup = insts
+            .iter()
+            .position(|inst| {
+                inst.opcode == AArch64Opcode::MovR && inst.operands[0] == ISelOperand::PReg(gpr::X8)
+            })
+            .unwrap();
+        assert!(last_copy_store < x8_setup);
+        let facts = call_facts(insts);
+        assert!(facts.by_reference_argument_copies && facts.hidden_result_pointer);
+    }
+
+    /// Controls: composites passed by value (a 16-byte pair, a 32-byte HFA in
+    /// FPRs or, with the FPRs used, on the stack) and pointers get no copy.
+    #[test]
+    fn by_value_composites_get_no_by_reference_copy() {
+        let pair = Type::Struct(vec![Type::I64; 2]);
+        let hfa = Type::Struct(vec![Type::F64; 4]);
+        for variant in [AArch64AbiVariant::Aapcs64, AArch64AbiVariant::Darwin] {
+            for (ty, lead_fprs) in [(&pair, 0), (&hfa, 0), (&hfa, 6)] {
+                let (mut isel, entry) = by_reference_isel(variant);
+                let mut args = Vec::new();
+                for index in 0..lead_fprs {
+                    let reg = isel.new_vreg(RegClass::Fpr64);
+                    isel.define_value(Value(index), ISelOperand::VReg(reg), Type::F64);
+                    args.push(Value(index));
+                }
+                define_aggregate(&mut isel, Value(lead_fprs), ty);
+                args.push(Value(lead_fprs));
+                isel.select_call("callee", &args, &[], &[], entry).unwrap();
+                let mfunc = isel.finalize();
+                let insts = &mfunc.blocks[&entry].insts;
+                assert!(
+                    mfunc.stack_slots.is_empty(),
+                    "{variant:?} {ty:?} after {lead_fprs} FPRs"
+                );
+                assert!(!call_facts(insts).by_reference_argument_copies);
+            }
+        }
+    }
+
     #[test]
     fn select_call_f16_result_copies_from_h0_alias() {
         let (mut isel, entry) = make_empty_isel();
@@ -25797,6 +31324,90 @@ mod tests {
             AArch64Opcode::LdrbRI,
             "Load I8 should emit LDRBui (zero-extending byte load)"
         );
+    }
+
+    /// A `B1` load defines trust-ir's `Load Bool`, the loaded byte `m` read as
+    /// `m != 0`: the one byte access (LDRB, its volatile twin, or LDARB for an
+    /// atomic load), then `TST x, #0xFF; CSET b, NE` into a fresh register,
+    /// and `b` is the value. The selected rows after the load are executed
+    /// for every byte, with every bit above it in the loaded register set,
+    /// and must yield exactly `m != 0` (the raw LDRB result yields `m`).
+    #[test]
+    fn b1_loads_define_the_nonzero_test_of_the_loaded_byte() {
+        let cases = [
+            (
+                Opcode::Load {
+                    ty: Type::B1,
+                    align: None,
+                },
+                AArch64Opcode::LdrbRI,
+            ),
+            (
+                Opcode::VolatileLoad {
+                    ty: Type::B1,
+                    align: None,
+                },
+                AArch64Opcode::VolatileLdrbRI,
+            ),
+            (
+                Opcode::AtomicLoad {
+                    ty: Type::B1,
+                    ordering: AtomicOrdering::Acquire,
+                },
+                AArch64Opcode::Ldarb,
+            ),
+        ];
+        for (opcode, load_opcode) in cases {
+            let (mut isel, entry) = make_empty_isel();
+            let addr_vreg = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(addr_vreg), Type::I64);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: opcode.clone(),
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap();
+            let result = isel.use_value(&Value(1)).unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let opcodes: Vec<AArch64Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+            assert_eq!(
+                opcodes,
+                [load_opcode, AArch64Opcode::Tst, AArch64Opcode::CSet],
+                "{opcode:?}: {insts:?}"
+            );
+            let ISelOperand::VReg(loaded) = insts[0].operands[0] else {
+                panic!("{opcode:?}: the load defines a virtual register");
+            };
+            assert_eq!(
+                insts[1].operands,
+                [ISelOperand::VReg(loaded), ISelOperand::Imm(0xFF)],
+                "{opcode:?}: TST reads exactly the loaded byte"
+            );
+            let ISelOperand::VReg(truth) = insts[2].operands[0] else {
+                panic!("{opcode:?}: CSET defines a virtual register");
+            };
+            assert_ne!(truth, loaded, "{opcode:?}: a fresh register");
+            assert_eq!(
+                insts[2].operands[1],
+                ISelOperand::CondCode(AArch64CC::NE),
+                "{opcode:?}"
+            );
+            assert_eq!(result, ISelOperand::VReg(truth), "{opcode:?}");
+            for byte in 0..=u8::MAX {
+                let register = 0xA5A5_A5A5_A5A5_A500 | u64::from(byte);
+                let ISelOperand::Imm(mask) = insts[1].operands[1] else {
+                    unreachable!()
+                };
+                // TST sets Z from `register & mask`; CSET NE is !Z.
+                let z = register & (mask as u64) == 0;
+                let value = u64::from(!z);
+                assert_eq!(value, u64::from(byte != 0), "{opcode:?}: byte {byte:#04x}");
+            }
+        }
     }
 
     #[test]
@@ -26009,7 +31620,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_tail".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_tail".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -26075,7 +31686,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_hw_tail".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_hw_tail".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -26137,7 +31748,7 @@ mod tests {
             params: vec![],
             returns: vec![struct_ty.clone()],
         };
-        let mut isel = InstructionSelector::new("ret_421_tail".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("ret_421_tail".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -26381,6 +31992,62 @@ mod tests {
             _ => false,
         });
         assert!(!str_sp, "No stack stores when no varargs passed");
+    }
+
+    /// DarwinPCS passes a >16-byte non-homogeneous anonymous aggregate by
+    /// reference; the inline stack tail would hand the callee the aggregate's
+    /// first eight bytes where it reads a pointer, so the selector refuses.
+    #[test]
+    fn select_variadic_call_refuses_darwin_indirect_anonymous_aggregate() {
+        let big = Type::Struct(vec![Type::I64, Type::I64, Type::I64]);
+        let (mut isel, entry) = make_empty_isel();
+        let v0 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(v0), Type::I64);
+        let v1 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(1), ISelOperand::VReg(v1), big.clone());
+        let err = isel
+            .select_variadic_call("takev", 1, &[Value(0), Value(1)], &[], &[], entry)
+            .expect_err("Darwin by-reference anonymous aggregate must be refused");
+        assert!(err.to_string().contains("[TCG-VARARG-ABI]"), "{err}");
+
+        // A short-vector HVA has no consistent clang placement: refused too.
+        let (mut isel, entry) = make_empty_isel();
+        let v0 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(v0), Type::I64);
+        let v1 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(
+            Value(1),
+            ISelOperand::VReg(v1),
+            Type::Struct(vec![Type::V128]),
+        );
+        let err = isel
+            .select_variadic_call("takev", 1, &[Value(0), Value(1)], &[], &[], entry)
+            .expect_err("Darwin anonymous HVA must be refused");
+        assert!(err.to_string().contains("[TCG-VARARG-ABI]"), "{err}");
+
+        // A floating-point HFA of the same size is an inline block, and
+        // AAPCS64 classifies anonymous aggregates by the ordinary rules.
+        let hfa = Type::Struct(vec![Type::F64, Type::F64, Type::F64]);
+        let (mut isel, entry) = make_empty_isel();
+        let v0 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(v0), Type::I64);
+        let v1 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(1), ISelOperand::VReg(v1), hfa);
+        isel.select_variadic_call("takev", 1, &[Value(0), Value(1)], &[], &[], entry)
+            .expect("Darwin HFA anonymous block stays inline");
+        let (mut isel, entry) = make_empty_isel();
+        isel.set_abi_variant(AArch64AbiVariant::Aapcs64);
+        let v0 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(v0), Type::I64);
+        let v1 = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(1), ISelOperand::VReg(v1), big);
+        assert!(
+            isel.select_variadic_call("takev", 1, &[Value(0), Value(1)], &[], &[], entry)
+                .map_err(|error| error.to_string())
+                .err()
+                .is_none_or(|message| !message.contains("[TCG-VARARG-ABI]")),
+            "the Darwin-only refusal must not fire for AAPCS64"
+        );
     }
 
     // =======================================================================
@@ -26680,6 +32347,63 @@ mod tests {
             .iter()
             .find(|i| i.opcode == AArch64Opcode::CmpRR);
         assert!(cmp_rr.is_some(), "Large case value should use CMP reg,reg");
+    }
+
+    /// A sparse switch defines every case register before the block's first
+    /// `B.EQ`. GVN and CSE treat a value defined in a block as available in
+    /// every block that block dominates; a constant defined after a mid-block
+    /// exit was merged into an equal constant in the switch's join block and
+    /// read there on the paths that took the exit (a `#[repr(u16)]` enum's
+    /// `65535` case at -O2).
+    #[test]
+    fn select_switch_cascade_defines_case_registers_before_its_first_exit() {
+        let (mut isel, entry) = make_empty_isel();
+        let sel_vreg = isel.new_vreg(RegClass::Gpr32);
+        isel.define_value(Value(0), ISelOperand::VReg(sel_vreg), Type::I16);
+        // Three cases: `choose_strategy`'s linear-scan limit.
+        let targets: Vec<Block> = (1..=3).map(Block).collect();
+        for &block in &targets {
+            isel.func.ensure_block(block);
+        }
+        isel.func.ensure_block(Block(4));
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Switch {
+                    cases: vec![(7, targets[0]), (65535, targets[1]), (0x1234, targets[2])],
+                    default: Block(4),
+                },
+                args: vec![Value(0)],
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let first_exit = insts
+            .iter()
+            .position(|i| i.opcode == AArch64Opcode::BCond)
+            .expect("the cascade branches");
+        let constant_defs: Vec<usize> = insts
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| {
+                matches!(
+                    i.opcode,
+                    AArch64Opcode::Movz | AArch64Opcode::Movk | AArch64Opcode::Movn
+                )
+            })
+            .map(|(pos, _)| pos)
+            .collect();
+        assert_eq!(
+            constant_defs.len(),
+            2,
+            "65535 and 0x1234 each need a register"
+        );
+        assert!(
+            constant_defs.iter().all(|&pos| pos < first_exit),
+            "a case constant is defined after the first B.EQ (at {first_exit}): {constant_defs:?}"
+        );
     }
 
     #[test]
@@ -27577,6 +33301,170 @@ mod tests {
         );
     }
 
+    /// An I128 divisor is a `(lo, hi)` register pair, and `CBNZ lo` is not a zero test of the
+    /// value: `1 << 64` has `lo == 0`. The carrier must test `ORR d, lo, hi`, and the obligation
+    /// binding must follow the operand the carrier actually tests.
+    #[test]
+    fn select_guard_div_zero_i128_pair_carrier_tests_both_halves() {
+        use trust_cg_ir::guard::{GuardKind, GuardOperandRef, fingerprint_for_kind};
+
+        let (mut isel, entry) = make_i128_isel();
+        let (lo, hi) = isel.use_i128_value(&Value(1)).unwrap();
+        let obligation: u64 = 0x8000_0001;
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::GuardDivZero {
+                    obligation: Some(obligation),
+                },
+                args: vec![Value(1)],
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        assert_eq!(
+            insts.len(),
+            2,
+            "ORR of the halves, then the carrier: {insts:?}"
+        );
+        assert_eq!(insts[0].opcode, AArch64Opcode::OrrRR);
+        let ISelOperand::VReg(any_bit) = insts[0].operands[0].clone() else {
+            panic!("the ORR must define a fresh vreg: {:?}", insts[0]);
+        };
+        assert_eq!(any_bit.class, RegClass::Gpr64);
+        assert_eq!(
+            insts[0].operands,
+            vec![ISelOperand::VReg(any_bit), lo.clone(), hi.clone()]
+        );
+        assert_ne!(ISelOperand::VReg(any_bit), lo);
+        assert_ne!(ISelOperand::VReg(any_bit), hi);
+        assert_eq!(insts[1].opcode, AArch64Opcode::TrapDivZeroIfZero);
+        assert_eq!(insts[1].operands, vec![ISelOperand::VReg(any_bit)]);
+
+        let fp = fingerprint_for_kind(GuardKind::DivZero, &[GuardOperandRef::Reg(any_bit.id)]);
+        assert_eq!(mfunc.guard_obligations.get(&fp), Some(&obligation));
+        assert_eq!(mfunc.guard_obligations.len(), 1);
+    }
+
+    /// An I128 formal argument (a runtime divisor in `X2:X3`) gets the same full-width carrier.
+    #[test]
+    fn select_guard_div_zero_i128_formal_argument_tests_both_halves() {
+        let (mut isel, entry) = make_i128_param_isel();
+        let (lo, hi) = isel.use_i128_value(&Value(1)).unwrap();
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::GuardDivZero { obligation: None },
+                args: vec![Value(1)],
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+
+        let mfunc = isel.finalize();
+        let insts = &mfunc.blocks[&entry].insts;
+        let carrier = insts
+            .iter()
+            .position(|inst| inst.opcode == AArch64Opcode::TrapDivZeroIfZero)
+            .expect("a runtime divisor keeps its carrier");
+        let orr = &insts[carrier - 1];
+        assert_eq!(orr.opcode, AArch64Opcode::OrrRR);
+        assert_eq!(orr.operands[1..], [lo, hi]);
+        assert_eq!(insts[carrier].operands, vec![orr.operands[0].clone()]);
+        assert!(mfunc.guard_obligations.is_empty());
+    }
+
+    /// `Iconst128` divisors that are nonzero as 128-bit values elide the guard, including the
+    /// ones whose low word is zero (`1 << 64`, `3 << 64`, `-(1 << 64)`, `i128::MIN`). The all-zero
+    /// constant keeps a carrier, and that carrier tests both halves.
+    #[test]
+    fn select_guard_div_zero_iconst128_divisor_is_judged_by_both_halves() {
+        let cases: [(i64, i64, bool); 7] = [
+            (0, 1, true),
+            (0, 3, true),
+            (0, -1, true),
+            (0, i64::MIN, true),
+            (1, 0, true),
+            (1, 3, true),
+            (0, 0, false),
+        ];
+        for (lo, hi, nonzero) in cases {
+            let (mut isel, entry) = make_i128_isel();
+            let instructions = vec![
+                Instruction {
+                    opcode: Opcode::Iconst128 { lo, hi },
+                    args: vec![],
+                    results: vec![Value(2)],
+                },
+                Instruction {
+                    opcode: Opcode::GuardDivZero {
+                        obligation: Some(9),
+                    },
+                    args: vec![Value(2)],
+                    results: vec![],
+                },
+            ];
+            isel.seed_iconst_origins([instructions.as_slice()]);
+            for inst in &instructions {
+                isel.select_instruction(inst, entry).unwrap();
+            }
+            let (const_lo, const_hi) = isel.use_i128_value(&Value(2)).unwrap();
+
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let carriers: Vec<_> = insts
+                .iter()
+                .filter(|inst| inst.opcode == AArch64Opcode::TrapDivZeroIfZero)
+                .collect();
+            if nonzero {
+                assert!(
+                    carriers.is_empty() && mfunc.guard_obligations.is_empty(),
+                    "({lo:#x}, {hi:#x}) is a nonzero divisor: the guard is dead: {insts:?}"
+                );
+                assert!(
+                    insts.iter().all(|inst| inst.opcode != AArch64Opcode::OrrRR),
+                    "an elided guard leaves no ORR: {insts:?}"
+                );
+            } else {
+                assert_eq!(
+                    carriers.len(),
+                    1,
+                    "a zero divisor keeps its trap: {insts:?}"
+                );
+                let orr = insts
+                    .iter()
+                    .find(|inst| inst.opcode == AArch64Opcode::OrrRR)
+                    .expect("the zero constant's carrier tests the ORR of both halves");
+                assert_eq!(orr.operands[1..], [const_lo, const_hi]);
+                assert_eq!(carriers[0].operands, vec![orr.operands[0].clone()]);
+            }
+        }
+    }
+
+    /// A value typed I128 without a recorded high half has no full-width zero test. The guard
+    /// fails closed instead of testing the low half alone.
+    #[test]
+    fn select_guard_div_zero_i128_without_high_half_fails_closed() {
+        let (mut isel, entry) = make_i128_isel();
+        let lo_only = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(5), ISelOperand::VReg(lo_only), Type::I128);
+        let result = isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::GuardDivZero { obligation: None },
+                args: vec![Value(5)],
+                results: vec![],
+            },
+            entry,
+        );
+        assert!(
+            matches!(result, Err(ISelError::UndefinedValue(Value(5)))),
+            "got {result:?}"
+        );
+    }
+
     #[test]
     fn select_guard_null_emits_trap_null_if_zero_same_pointer() {
         let (mut isel, entry) = make_i64_isel();
@@ -28304,6 +34192,208 @@ mod tests {
     }
 
     // =======================================================================
+    // Whole-aggregate Load/Store: refused, never one register-width access
+    // =======================================================================
+
+    /// Aggregates wider than the X-register access the scalar path emitted
+    /// (16 bytes: it moved only field 0), of an odd size (3 bytes), and
+    /// narrower than it (4 bytes: the store wrote four bytes past the object).
+    fn whole_aggregate_refusal_types() -> [Type; 3] {
+        [
+            Type::Struct(vec![Type::I64, Type::I64]),
+            Type::Array(Box::new(Type::I8), 3),
+            Type::Struct(vec![Type::I32]),
+        ]
+    }
+
+    fn assert_whole_aggregate_refusal(err: &ISelError, ty: &Type, store: bool, volatile: bool) {
+        let expected = ty
+            .whole_aggregate_memory_access_refusal(store, volatile)
+            .expect("an aggregate type has a refusal");
+        assert!(
+            matches!(err, ISelError::UnsupportedOpcode(message) if *message == expected),
+            "{ty:?} store={store} volatile={volatile}: {err:?}"
+        );
+        for contract in [
+            "an aggregate value is its address in LIR",
+            "one register-width access",
+            "copy its bytes with Memcpy",
+        ] {
+            assert!(expected.contains(contract), "{expected}");
+        }
+    }
+
+    #[test]
+    fn whole_aggregate_load_is_refused_instead_of_one_register_width_ldr() {
+        for ty in whole_aggregate_refusal_types() {
+            for volatile in [false, true] {
+                let (mut isel, entry) = make_empty_isel();
+                let addr = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(0), ISelOperand::VReg(addr), Type::I64);
+                let opcode = if volatile {
+                    Opcode::VolatileLoad {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                } else {
+                    Opcode::Load {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                };
+                let err = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode,
+                            args: vec![Value(0)],
+                            results: vec![Value(1)],
+                        },
+                        entry,
+                    )
+                    .expect_err("a whole-aggregate load must be refused");
+                assert_whole_aggregate_refusal(&err, &ty, false, volatile);
+                assert!(
+                    isel.func.blocks[&entry].insts.is_empty(),
+                    "{ty:?}: nothing may be emitted before the refusal"
+                );
+                assert!(
+                    !isel.value_map.contains_key(&Value(1)),
+                    "{ty:?}: the refused load must not define its result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn whole_aggregate_store_is_refused_instead_of_one_register_width_str() {
+        for ty in whole_aggregate_refusal_types() {
+            for volatile in [false, true] {
+                let (mut isel, entry) = make_empty_isel();
+                // The stored value is the aggregate's address carrier, exactly
+                // as an aggregate formal or call result is bound.
+                let value = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(0), ISelOperand::VReg(value), ty.clone());
+                let addr = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(1), ISelOperand::VReg(addr), Type::I64);
+                let opcode = if volatile {
+                    Opcode::VolatileStore {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                } else {
+                    Opcode::Store {
+                        ty: ty.clone(),
+                        align: None,
+                    }
+                };
+                let err = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode,
+                            args: vec![Value(0), Value(1)],
+                            results: vec![],
+                        },
+                        entry,
+                    )
+                    .expect_err("a whole-aggregate store must be refused");
+                assert_whole_aggregate_refusal(&err, &ty, true, volatile);
+                assert!(
+                    isel.func.blocks[&entry].insts.is_empty(),
+                    "{ty:?}: nothing may be emitted before the refusal"
+                );
+            }
+        }
+    }
+
+    /// The aggregate gate leaves the non-aggregate wide and vector widths on
+    /// their width-exact selections: `I128` as two X accesses at +0/+8, and
+    /// `V128`/`V64` as one access through a Q/D register.
+    #[test]
+    fn i128_and_vector_loads_and_stores_keep_their_width_exact_selection() {
+        let (mut isel, entry) = make_empty_isel();
+        let addr = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(addr), Type::I64);
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Load {
+                    ty: Type::I128,
+                    align: None,
+                },
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .unwrap();
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Store {
+                    ty: Type::I128,
+                    align: None,
+                },
+                args: vec![Value(1), Value(0)],
+                results: vec![],
+            },
+            entry,
+        )
+        .unwrap();
+        let insts = &isel.func.blocks[&entry].insts;
+        assert_eq!(
+            insts
+                .iter()
+                .map(|inst| (inst.opcode, inst.operands[2].clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (AArch64Opcode::LdrRI, ISelOperand::Imm(0)),
+                (AArch64Opcode::LdrRI, ISelOperand::Imm(8)),
+                (AArch64Opcode::StrRI, ISelOperand::Imm(0)),
+                (AArch64Opcode::StrRI, ISelOperand::Imm(8)),
+            ],
+            "{insts:?}"
+        );
+
+        for (ty, class) in [(Type::V128, RegClass::Fpr128), (Type::V64, RegClass::Fpr64)] {
+            let (mut isel, entry) = make_empty_isel();
+            let addr = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(addr), Type::I64);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Load {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap();
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Store {
+                        ty: ty.clone(),
+                        align: None,
+                    },
+                    args: vec![Value(1), Value(0)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+            let insts = &isel.func.blocks[&entry].insts;
+            assert_eq!(insts.len(), 2, "{ty:?}: {insts:?}");
+            assert_eq!(insts[0].opcode, AArch64Opcode::LdrRI, "{ty:?}");
+            assert_eq!(insts[1].opcode, AArch64Opcode::StrRI, "{ty:?}");
+            for inst in insts {
+                assert!(
+                    matches!(inst.operands[0], ISelOperand::VReg(v) if v.class == class),
+                    "{ty:?}: the access must go through a {class:?} register: {inst:?}"
+                );
+            }
+        }
+    }
+
+    // =======================================================================
     // Coverage expansion: fconst materialization
     // =======================================================================
 
@@ -28356,6 +34446,28 @@ mod tests {
         let inst = &mfunc.blocks[&entry].insts[0];
         assert_eq!(inst.opcode, AArch64Opcode::FmovImm);
         assert_eq!(inst.operands[1], ISelOperand::FImm(1.0));
+    }
+
+    #[test]
+    fn quantized_f16_constant_keeps_its_encodable_immediate() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Fconst {
+                    ty: Type::F16,
+                    imm: 1.0 + 2f64.powi(-12),
+                },
+                args: vec![],
+                results: vec![Value(0)],
+            },
+            entry,
+        )
+        .unwrap();
+        let function = isel.finalize();
+        let instructions = &function.blocks[&entry].insts;
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].opcode, AArch64Opcode::FmovImm);
+        assert_eq!(instructions[0].operands[1], ISelOperand::FImm(1.0));
     }
 
     #[test]
@@ -28544,7 +34656,7 @@ mod tests {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("batch".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("batch".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -28581,7 +34693,7 @@ mod tests {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("add".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("add".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         isel.select_instruction(
@@ -29047,7 +35159,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fabs64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fabs64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29074,7 +35186,7 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("fabs32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fabs32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29126,7 +35238,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fabs_ty".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fabs_ty".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29166,7 +35278,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fsqrt64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fsqrt64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29192,7 +35304,7 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("fsqrt32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fsqrt32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29244,7 +35356,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("sqrtadd".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("sqrtadd".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29606,12 +35718,88 @@ mod tests {
     // -- FP-to-int conversions --
 
     #[test]
+    fn select_fp_to_integer_preserves_canonical_register_width_matrix() {
+        // I8/I16 use an architectural W carrier; they do not become a fictitious
+        // 8/16-bit FCVT. This checks shape/width, not out-of-range cast semantics.
+        for (src_ty, src_class) in [
+            (Type::F16, RegClass::Fpr16),
+            (Type::F32, RegClass::Fpr32),
+            (Type::F64, RegClass::Fpr64),
+        ] {
+            for (dst_ty, dst_class) in [
+                (Type::I8, RegClass::Gpr32),
+                (Type::I16, RegClass::Gpr32),
+                (Type::I32, RegClass::Gpr32),
+                (Type::I64, RegClass::Gpr64),
+            ] {
+                for signed in [false, true] {
+                    let (mut isel, entry) = make_empty_isel();
+                    let src = isel.new_vreg(src_class);
+                    isel.define_value(Value(0), ISelOperand::VReg(src), src_ty.clone());
+                    let opcode = if signed {
+                        Opcode::FcvtToInt {
+                            dst_ty: dst_ty.clone(),
+                        }
+                    } else {
+                        Opcode::FcvtToUint {
+                            dst_ty: dst_ty.clone(),
+                        }
+                    };
+                    isel.select_instruction(
+                        &Instruction {
+                            opcode,
+                            args: vec![Value(0)],
+                            results: vec![Value(1)],
+                        },
+                        entry,
+                    )
+                    .unwrap();
+                    assert_eq!(isel.value_types.get(&Value(1)), Some(&dst_ty));
+                    let dst = match isel.value_map.get(&Value(1)).unwrap() {
+                        ISelOperand::VReg(dst) => *dst,
+                        other => panic!("conversion must define a virtual register: {other:?}"),
+                    };
+                    assert_eq!(dst.class, dst_class);
+                    let expected_opcode = if signed {
+                        AArch64Opcode::FcvtzsRR
+                    } else {
+                        AArch64Opcode::FcvtzuRR
+                    };
+                    let selected = isel.finalize();
+                    let instructions = &selected.blocks[&entry].insts;
+                    assert_eq!(instructions.len(), 1);
+                    assert_eq!(instructions[0].opcode, expected_opcode);
+                    assert_eq!(
+                        instructions[0].operands,
+                        vec![ISelOperand::VReg(dst), ISelOperand::VReg(src)]
+                    );
+
+                    // Check the actual Phase 1 -> Phase 2 transport rather than
+                    // merely expecting the selector's local types to persist.
+                    let machine = selected.to_ir_func();
+                    let ids = &machine.block(machine.entry).insts;
+                    assert_eq!(ids.len(), 1);
+                    let inst = machine.inst(ids[0]);
+                    assert_eq!(inst.opcode, expected_opcode);
+                    assert_eq!(
+                        inst.operands,
+                        vec![
+                            trust_cg_ir::MachOperand::VReg(dst),
+                            trust_cg_ir::MachOperand::VReg(src),
+                        ]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn select_fcvt_to_int_i64_from_f64() {
         let sig = Signature {
             params: vec![Type::F64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("fcvt_i64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fcvt_i64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29638,7 +35826,7 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("f32_to_u32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("f32_to_u32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29667,7 +35855,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("i64_to_f64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("i64_to_f64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29691,7 +35879,7 @@ mod tests {
             params: vec![Type::I32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("u32_to_f32".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("u32_to_f32".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29715,7 +35903,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("u64_to_f64".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("u64_to_f64".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29741,7 +35929,7 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("fpext".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fpext".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29772,7 +35960,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("fptrunc".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("fptrunc".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -29987,7 +36175,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("abs_sqrt".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("abs_sqrt".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -30069,7 +36257,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("err".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("err".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -30092,7 +36280,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("ir_fabs".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ir_fabs".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -30122,7 +36310,7 @@ mod tests {
             params: vec![Type::F64],
             returns: vec![Type::F64],
         };
-        let mut isel = InstructionSelector::new("ir_fsqrt".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ir_fsqrt".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -30233,6 +36421,184 @@ mod tests {
         );
     }
 
+    /// The 128-bit atomic load is NOT the `LDAR` shape: it is ONE paired
+    /// `LDP [Rt=lo, Rt2=hi, Rn=addr]` (single-copy atomic only under FEAT_LSE2)
+    /// with the ordering barriers that `LDP` itself lacks: Relaxed = `ldp`,
+    /// Acquire = `ldp; dmb ishld`, SeqCst = `dmb ish; ldp; dmb ish`. The SeqCst
+    /// LEADING barrier is stronger than LLVM's `ldp; dmb ish`: without it a
+    /// plain `LDP` is not ordered after an earlier SeqCst store-release
+    /// (L03-P3). Both halves are bound the way every other i128 def is (low
+    /// half in the value map, high half in `i128_high_map`).
+    #[test]
+    fn select_atomic_load_i128_emits_ldp_then_ordering_barrier_under_lse2() {
+        for (ordering, leading, barrier) in [
+            (AtomicOrdering::Relaxed, None, None),
+            (AtomicOrdering::Acquire, None, Some(0x09)),
+            (AtomicOrdering::SeqCst, Some(0x0B), Some(0x0B)),
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            isel.set_lse2_enabled(true);
+            let addr_vreg = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(addr_vreg), Type::I64);
+
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::AtomicLoad {
+                        ty: Type::I128,
+                        ordering,
+                    },
+                    args: vec![Value(0)],
+                    results: vec![Value(1)],
+                },
+                entry,
+            )
+            .unwrap_or_else(|e| panic!("{ordering:?}: AtomicLoad I128 under LSE2 refused: {e:?}"));
+
+            let lo = match isel.use_value(&Value(1)).unwrap() {
+                ISelOperand::VReg(v) => v,
+                other => panic!("{ordering:?}: low half must be a vreg, got {other:?}"),
+            };
+            let hi = *isel
+                .i128_high_map
+                .get(&Value(1))
+                .unwrap_or_else(|| panic!("{ordering:?}: high half must be bound"));
+            assert_ne!(lo, hi, "{ordering:?}: LDP takes two DISTINCT destinations");
+            assert_eq!(lo.class, RegClass::Gpr64);
+            assert_eq!(hi.class, RegClass::Gpr64);
+
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            let ldp_at = usize::from(leading.is_some());
+            if let Some(option) = leading {
+                assert_eq!(insts[0].opcode, AArch64Opcode::Dmb, "{ordering:?}");
+                assert_eq!(
+                    insts[0].operands[0],
+                    ISelOperand::Imm(option),
+                    "{ordering:?}: SeqCst entry barrier is DMB ISH (0x0B)"
+                );
+            }
+            assert_eq!(insts[ldp_at].opcode, AArch64Opcode::LdpRI, "{ordering:?}");
+            assert_eq!(
+                insts[ldp_at].operands,
+                vec![
+                    ISelOperand::VReg(lo),
+                    ISelOperand::VReg(hi),
+                    ISelOperand::VReg(addr_vreg)
+                ],
+                "{ordering:?}: LDP operands are [Rt=lo, Rt2=hi, Rn=addr] at offset 0"
+            );
+            match barrier {
+                None => assert_eq!(
+                    insts.len(),
+                    ldp_at + 1,
+                    "{ordering:?}: a Relaxed load carries no barrier, got {insts:?}"
+                ),
+                Some(option) => {
+                    assert_eq!(
+                        insts.len(),
+                        ldp_at + 2,
+                        "{ordering:?}: LDP then ONE trailing barrier, got {insts:?}"
+                    );
+                    assert_eq!(insts[ldp_at + 1].opcode, AArch64Opcode::Dmb, "{ordering:?}");
+                    assert_eq!(
+                        insts[ldp_at + 1].operands[0],
+                        ISelOperand::Imm(option),
+                        "{ordering:?}: barrier option (0x09 = ISHLD, 0x0B = ISH)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The FEAT_LSE2 `LDP` fast path keeps the fail-closed preconditions the
+    /// LDXP/STXP pair pseudo enforces on every other profile: Release/AcqRel are
+    /// not load orderings (`select_fence` alone would accept Release and
+    /// emit a barrier for it), and LDP's base must be a register. Each refusal happens
+    /// BEFORE anything is emitted.
+    #[test]
+    fn select_atomic_load_i128_under_lse2_refuses_invalid_ordering_and_non_register_address() {
+        let load = |ordering| Instruction {
+            opcode: Opcode::AtomicLoad {
+                ty: Type::I128,
+                ordering,
+            },
+            args: vec![Value(0)],
+            results: vec![Value(1)],
+        };
+        for ordering in [AtomicOrdering::Release, AtomicOrdering::AcqRel] {
+            let (mut isel, entry) = make_empty_isel();
+            isel.set_lse2_enabled(true);
+            let addr_vreg = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(addr_vreg), Type::I64);
+            let result = isel.select_instruction(&load(ordering), entry);
+            assert!(
+                result.is_err(),
+                "{ordering:?}: an I128 load with a non-load ordering must fail closed under LSE2"
+            );
+            assert!(
+                isel.func.blocks[&entry].insts.is_empty(),
+                "{ordering:?}: the refusal must precede emission"
+            );
+            assert!(!isel.i128_high_map.contains_key(&Value(1)));
+        }
+
+        let (mut isel, entry) = make_empty_isel();
+        isel.set_lse2_enabled(true);
+        isel.define_value(Value(0), ISelOperand::Imm(0x1000), Type::I64);
+        let result = isel.select_instruction(&load(AtomicOrdering::Acquire), entry);
+        assert!(
+            result.is_err(),
+            "an LDP base that is not a register must fail closed under LSE2"
+        );
+        assert!(isel.func.blocks[&entry].insts.is_empty());
+        assert!(!isel.i128_high_map.contains_key(&Value(1)));
+    }
+
+    /// Generic AArch64 — the PRODUCTION DEFAULT selector — does not admit
+    /// FEAT_LSE2, and a 128-bit `LDP` on a pre-LSE2 part can TEAR (invisible to
+    /// every differential test; it only manifests under concurrency). The
+    /// selector must refuse BEFORE emitting anything, and the refusal must carry
+    /// the fix options. FEAT_LSE (the ARMv8.1 RMW instruction set) is a different
+    /// feature from FEAT_LSE2 (the ARMv8.4 atomicity rules): admitting the first
+    /// must not admit the second.
+    #[test]
+    fn select_atomic_load_i128_takes_the_llsc_pair_pseudo_without_lse2() {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new("generic".to_string(), sig);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        isel.set_lse_enabled(true);
+        let addr_vreg = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(addr_vreg), Type::I64);
+
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::AtomicLoad {
+                    ty: Type::I128,
+                    ordering: AtomicOrdering::Relaxed,
+                },
+                args: vec![Value(0)],
+                results: vec![Value(1)],
+            },
+            entry,
+        )
+        .expect("without FEAT_LSE2 an I128 load must still lower, through the pair pseudo");
+        let insts = &isel.func.blocks[&entry].insts;
+        assert_eq!(insts.len(), 1, "exactly the pair pseudo, got {insts:?}");
+        assert_eq!(
+            insts[0].opcode,
+            AArch64Opcode::LlscLoad128,
+            "without FEAT_LSE2 a plain LDP can TEAR, so the LDXP/STXP pair pseudo must be selected"
+        );
+        assert!(
+            isel.i128_high_map.contains_key(&Value(1)),
+            "the pseudo must bind the high half"
+        );
+    }
+
     #[test]
     fn select_atomic_store_i32_emits_stlr() {
         let (mut isel, entry) = make_empty_isel();
@@ -30325,12 +36691,12 @@ mod tests {
     }
 
     #[test]
-    fn generic_aarch64_rejects_lse_rmw_but_keeps_non_atomic_lowering() {
+    fn generic_aarch64_selects_llsc_rmw_pseudo_and_keeps_non_atomic_lowering() {
         let sig = Signature {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("generic".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("generic".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
         let lhs = isel.new_vreg(RegClass::Gpr64);
@@ -30348,37 +36714,530 @@ mod tests {
         )
         .expect("generic AArch64 must continue lowering ordinary instructions");
 
-        let err = isel
-            .select_instruction(
-                &Instruction {
-                    opcode: Opcode::AtomicRmw {
-                        op: AtomicRmwOp::Add,
-                        ty: Type::I64,
-                        ordering: AtomicOrdering::Relaxed,
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::AtomicRmw {
+                    op: AtomicRmwOp::Add,
+                    ty: Type::I64,
+                    ordering: AtomicOrdering::Relaxed,
+                },
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(3)],
+            },
+            entry,
+        )
+        .expect("generic AArch64 must select the LL/SC pseudo instead of LSE");
+
+        let func = isel.finalize();
+        let insts = &func.blocks[&entry].insts;
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[0].opcode, AArch64Opcode::AddRR);
+        let pseudo = &insts[1];
+        assert_eq!(pseudo.opcode, AArch64Opcode::LlscRmw64);
+        assert_eq!(pseudo.operands.len(), 7);
+        let defs: Vec<VReg> = pseudo.operands[..3]
+            .iter()
+            .map(|operand| match operand {
+                ISelOperand::VReg(vreg) => *vreg,
+                other => panic!("LL/SC defs must be fresh vregs, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(defs[0].class, RegClass::Gpr64);
+        assert_eq!(defs[1].class, RegClass::Gpr64);
+        assert_eq!(defs[2].class, RegClass::Gpr32, "status is a W register");
+        assert!(defs[0] != defs[1] && defs[1] != defs[2] && defs[0] != defs[2]);
+        assert_eq!(pseudo.operands[3], ISelOperand::VReg(lhs), "value");
+        assert_eq!(pseudo.operands[4], ISelOperand::VReg(rhs), "address");
+        assert_eq!(
+            pseudo.operands[5],
+            ISelOperand::Imm(trust_cg_ir::llsc::LlscRmwOp::Add.to_imm())
+        );
+        assert_eq!(
+            pseudo.operands[6],
+            ISelOperand::Imm(trust_cg_ir::llsc::LlscOrdering::RELAXED.to_imm())
+        );
+        assert!(
+            !insts
+                .iter()
+                .any(|inst| trust_cg_opt_free_is_lse(inst.opcode)),
+            "a baseline profile must never emit an LSE opcode"
+        );
+    }
+
+    /// Local mirror of the LSE opcode families (trust-cg-lower cannot depend on
+    /// trust-cg-opt): any of these on a baseline profile would be an
+    /// unadmitted-feature miscompile.
+    fn trust_cg_opt_free_is_lse(opcode: AArch64Opcode) -> bool {
+        let name = format!("{opcode:?}");
+        [
+            "Ldadd", "Ldclr", "Ldeor", "Ldset", "Ldsmax", "Ldsmin", "Ldumax", "Ldumin", "Swp",
+            "Cas",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    }
+
+    fn llsc_isel_with_values(types: &[Type]) -> (InstructionSelector, Block) {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new("llsc".to_string(), sig);
+        let entry = Block(0);
+        isel.func.ensure_block(entry);
+        for (index, ty) in types.iter().enumerate() {
+            let vreg = isel.new_vreg(reg_class_for_type(ty));
+            isel.define_value(Value(index as u32), ISelOperand::VReg(vreg), ty.clone());
+        }
+        (isel, entry)
+    }
+
+    #[test]
+    fn baseline_rmw_selects_exact_llsc_pseudo_for_every_op_width_and_ordering() {
+        use trust_cg_ir::llsc::{LlscOrdering, LlscRmwOp};
+        let ops = [
+            (AtomicRmwOp::Add, LlscRmwOp::Add),
+            (AtomicRmwOp::Sub, LlscRmwOp::Sub),
+            (AtomicRmwOp::And, LlscRmwOp::And),
+            (AtomicRmwOp::Or, LlscRmwOp::Or),
+            (AtomicRmwOp::Xor, LlscRmwOp::Xor),
+            (AtomicRmwOp::Xchg, LlscRmwOp::Xchg),
+            (AtomicRmwOp::Max, LlscRmwOp::Smax),
+            (AtomicRmwOp::Min, LlscRmwOp::Smin),
+            (AtomicRmwOp::UMax, LlscRmwOp::Umax),
+            (AtomicRmwOp::UMin, LlscRmwOp::Umin),
+        ];
+        let widths = [
+            (Type::I8, AArch64Opcode::LlscRmw8, RegClass::Gpr32),
+            (Type::I16, AArch64Opcode::LlscRmw16, RegClass::Gpr32),
+            (Type::I32, AArch64Opcode::LlscRmw32, RegClass::Gpr32),
+            (Type::I64, AArch64Opcode::LlscRmw64, RegClass::Gpr64),
+        ];
+        let orderings = [
+            (AtomicOrdering::Relaxed, LlscOrdering::RELAXED),
+            (AtomicOrdering::Acquire, LlscOrdering::ACQUIRE),
+            (AtomicOrdering::Release, LlscOrdering::RELEASE),
+            (AtomicOrdering::AcqRel, LlscOrdering::ACQ_REL),
+            (AtomicOrdering::SeqCst, LlscOrdering::ACQ_REL),
+        ];
+        let mut checked = 0;
+        for (op, llsc_op) in ops {
+            for (ty, opcode, class) in &widths {
+                for (ordering, llsc_ordering) in orderings {
+                    let (mut isel, entry) = llsc_isel_with_values(&[ty.clone(), Type::I64]);
+                    isel.select_instruction(
+                        &Instruction {
+                            opcode: Opcode::AtomicRmw {
+                                op,
+                                ty: ty.clone(),
+                                ordering,
+                            },
+                            args: vec![Value(0), Value(1)],
+                            results: vec![Value(2)],
+                        },
+                        entry,
+                    )
+                    .unwrap();
+                    let insts = &isel.func.blocks[&entry].insts;
+                    assert_eq!(insts.len(), 1, "no LSE preparation (MVN/NEG) on LL/SC");
+                    let pseudo = &insts[0];
+                    assert_eq!(pseudo.opcode, *opcode);
+                    for (index, expected) in [*class, *class, RegClass::Gpr32].iter().enumerate() {
+                        assert!(
+                            matches!(pseudo.operands[index], ISelOperand::VReg(v) if v.class == *expected),
+                            "{op:?} {ty:?} def {index}"
+                        );
+                    }
+                    assert_eq!(pseudo.operands[5], ISelOperand::Imm(llsc_op.to_imm()));
+                    assert_eq!(pseudo.operands[6], ISelOperand::Imm(llsc_ordering.to_imm()));
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 10 * 4 * 5);
+    }
+
+    #[test]
+    fn baseline_cmpxchg_selects_llsc_pseudo_with_lifted_orderings() {
+        use trust_cg_ir::llsc::LlscOrdering;
+        let pairs = [
+            (
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                LlscOrdering::RELAXED,
+            ),
+            (
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Acquire,
+                LlscOrdering::ACQUIRE,
+            ),
+            (
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::SeqCst,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Relaxed,
+                LlscOrdering::ACQUIRE,
+            ),
+            (
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Acquire,
+                LlscOrdering::ACQUIRE,
+            ),
+            (
+                AtomicOrdering::Acquire,
+                AtomicOrdering::SeqCst,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::Release,
+                AtomicOrdering::Relaxed,
+                LlscOrdering::RELEASE,
+            ),
+            (
+                AtomicOrdering::Release,
+                AtomicOrdering::Acquire,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::Release,
+                AtomicOrdering::SeqCst,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Relaxed,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::SeqCst,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::Relaxed,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::Acquire,
+                LlscOrdering::ACQ_REL,
+            ),
+            (
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+                LlscOrdering::ACQ_REL,
+            ),
+        ];
+        let widths = [
+            (Type::B1, AArch64Opcode::LlscCmpSwap8, RegClass::Gpr64),
+            (Type::I8, AArch64Opcode::LlscCmpSwap8, RegClass::Gpr32),
+            (Type::I16, AArch64Opcode::LlscCmpSwap16, RegClass::Gpr32),
+            (Type::I32, AArch64Opcode::LlscCmpSwap32, RegClass::Gpr32),
+            (Type::I64, AArch64Opcode::LlscCmpSwap64, RegClass::Gpr64),
+        ];
+        let mut checked = 0;
+        for (success, failure, expected) in pairs {
+            for (ty, opcode, class) in &widths {
+                let (mut isel, entry) = llsc_isel_with_values(&[ty.clone(), ty.clone(), Type::I64]);
+                isel.select_instruction(
+                    &Instruction {
+                        opcode: Opcode::CmpXchg {
+                            ty: ty.clone(),
+                            success,
+                            failure,
+                        },
+                        args: vec![Value(0), Value(1), Value(2)],
+                        results: vec![Value(3)],
                     },
-                    args: vec![Value(0), Value(1)],
+                    entry,
+                )
+                .unwrap();
+                let insts = &isel.func.blocks[&entry].insts;
+                assert_eq!(insts.len(), 1, "no MOV/CAS preparation on LL/SC");
+                let pseudo = &insts[0];
+                assert_eq!(pseudo.opcode, *opcode, "{ty:?}");
+                assert!(matches!(pseudo.operands[0], ISelOperand::VReg(v) if v.class == *class));
+                assert!(
+                    matches!(pseudo.operands[1], ISelOperand::VReg(v) if v.class == RegClass::Gpr32)
+                );
+                assert_eq!(
+                    pseudo.operands[5],
+                    ISelOperand::Imm(expected.to_imm()),
+                    "{success:?}/{failure:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 15 * 5);
+    }
+
+    #[test]
+    fn bool_rmw_admits_only_logical_ops_on_both_profiles() {
+        use trust_cg_ir::llsc::LlscRmwOp;
+        for lse in [false, true] {
+            for (op, llsc_op, lse_opcode) in [
+                (AtomicRmwOp::Xchg, LlscRmwOp::Xchg, AArch64Opcode::Swpal),
+                (AtomicRmwOp::And, LlscRmwOp::And, AArch64Opcode::Ldclral),
+                (AtomicRmwOp::Or, LlscRmwOp::Or, AArch64Opcode::Ldsetal),
+                (AtomicRmwOp::Xor, LlscRmwOp::Xor, AArch64Opcode::Ldeoral),
+            ] {
+                let (mut isel, entry) = llsc_isel_with_values(&[Type::B1, Type::I64]);
+                isel.set_lse_enabled(lse);
+                isel.select_instruction(
+                    &Instruction {
+                        opcode: Opcode::AtomicRmw {
+                            op,
+                            ty: Type::B1,
+                            ordering: AtomicOrdering::SeqCst,
+                        },
+                        args: vec![Value(0), Value(1)],
+                        results: vec![Value(2)],
+                    },
+                    entry,
+                )
+                .unwrap();
+                let insts = &isel.func.blocks[&entry].insts;
+                let atomic = insts.last().unwrap();
+                if lse {
+                    assert_eq!(atomic.opcode, lse_opcode, "{op:?}");
+                    assert_eq!(
+                        atomic.operands.last(),
+                        Some(&ISelOperand::Imm(0)),
+                        "Bool LSE RMW must be a byte access"
+                    );
+                } else {
+                    assert_eq!(atomic.opcode, AArch64Opcode::LlscRmw8, "{op:?}");
+                    assert_eq!(atomic.operands[5], ISelOperand::Imm(llsc_op.to_imm()));
+                    assert!(
+                        matches!(atomic.operands[0], ISelOperand::VReg(v) if v.class == RegClass::Gpr64)
+                    );
+                }
+            }
+            for op in [
+                AtomicRmwOp::Add,
+                AtomicRmwOp::Sub,
+                AtomicRmwOp::Max,
+                AtomicRmwOp::Min,
+                AtomicRmwOp::UMax,
+                AtomicRmwOp::UMin,
+            ] {
+                let (mut isel, entry) = llsc_isel_with_values(&[Type::B1, Type::I64]);
+                isel.set_lse_enabled(lse);
+                let err = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode: Opcode::AtomicRmw {
+                                op,
+                                ty: Type::B1,
+                                ordering: AtomicOrdering::SeqCst,
+                            },
+                            args: vec![Value(0), Value(1)],
+                            results: vec![Value(2)],
+                        },
+                        entry,
+                    )
+                    .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("Bool AtomicRmw admits only xchg/and/or/xor"),
+                    "{op:?}: {err}"
+                );
+                assert!(isel.func.blocks[&entry].insts.is_empty());
+            }
+        }
+    }
+
+    /// `(isel, entry, i128 lo/hi vreg pairs)` with `values` i128 values then
+    /// one i64 address value.
+    fn llsc_isel_with_i128_values(values: u32) -> (InstructionSelector, Block, Vec<(VReg, VReg)>) {
+        let (mut isel, entry) = llsc_isel_with_values(&[]);
+        let mut pairs = Vec::new();
+        for index in 0..values {
+            let lo = isel.new_vreg(RegClass::Gpr64);
+            let hi = isel.new_vreg(RegClass::Gpr64);
+            isel.define_i128_value(Value(index), lo, hi);
+            pairs.push((lo, hi));
+        }
+        let addr = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(values), ISelOperand::VReg(addr), Type::I64);
+        (isel, entry, pairs)
+    }
+
+    #[test]
+    fn i128_atomics_select_pair_llsc_pseudos_on_every_profile() {
+        use trust_cg_ir::llsc::{LlscOrdering, LlscRmwOp};
+        for lse in [false, true] {
+            // RMW: every op, exact 10-operand layout, both halves defined.
+            for (op, llsc_op) in [
+                (AtomicRmwOp::Add, LlscRmwOp::Add),
+                (AtomicRmwOp::Sub, LlscRmwOp::Sub),
+                (AtomicRmwOp::And, LlscRmwOp::And),
+                (AtomicRmwOp::Or, LlscRmwOp::Or),
+                (AtomicRmwOp::Xor, LlscRmwOp::Xor),
+                (AtomicRmwOp::Xchg, LlscRmwOp::Xchg),
+                (AtomicRmwOp::Max, LlscRmwOp::Smax),
+                (AtomicRmwOp::Min, LlscRmwOp::Smin),
+                (AtomicRmwOp::UMax, LlscRmwOp::Umax),
+                (AtomicRmwOp::UMin, LlscRmwOp::Umin),
+            ] {
+                let (mut isel, entry, pairs) = llsc_isel_with_i128_values(1);
+                isel.set_lse_enabled(lse);
+                isel.select_instruction(
+                    &Instruction {
+                        opcode: Opcode::AtomicRmw {
+                            op,
+                            ty: Type::I128,
+                            ordering: AtomicOrdering::AcqRel,
+                        },
+                        args: vec![Value(0), Value(1)],
+                        results: vec![Value(2)],
+                    },
+                    entry,
+                )
+                .unwrap();
+                let insts = &isel.func.blocks[&entry].insts;
+                assert_eq!(insts.len(), 1);
+                let pseudo = &insts[0];
+                assert_eq!(pseudo.opcode, AArch64Opcode::LlscRmw128);
+                assert_eq!(pseudo.operands.len(), 10);
+                assert_eq!(pseudo.operands[5], ISelOperand::VReg(pairs[0].0));
+                assert_eq!(pseudo.operands[6], ISelOperand::VReg(pairs[0].1));
+                assert_eq!(pseudo.operands[8], ISelOperand::Imm(llsc_op.to_imm()));
+                assert_eq!(
+                    pseudo.operands[9],
+                    ISelOperand::Imm(LlscOrdering::ACQ_REL.to_imm())
+                );
+                let ISelOperand::VReg(old_lo) = pseudo.operands[0] else {
+                    panic!("old_lo must be a fresh vreg");
+                };
+                let ISelOperand::VReg(old_hi) = pseudo.operands[1] else {
+                    panic!("old_hi must be a fresh vreg");
+                };
+                assert_eq!(isel.i128_high_map.get(&Value(2)), Some(&old_hi));
+                assert_eq!(
+                    isel.value_map.get(&Value(2)),
+                    Some(&ISelOperand::VReg(old_lo))
+                );
+            }
+
+            // CAS: lifted ordering and the expected/desired pairs in place.
+            let (mut isel, entry, pairs) = llsc_isel_with_i128_values(2);
+            isel.set_lse_enabled(lse);
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::CmpXchg {
+                        ty: Type::I128,
+                        success: AtomicOrdering::Release,
+                        failure: AtomicOrdering::Acquire,
+                    },
+                    args: vec![Value(0), Value(1), Value(2)],
                     results: vec![Value(3)],
                 },
                 entry,
             )
-            .expect_err("generic AArch64 must not emit an unadmitted LSE instruction");
-        assert!(matches!(
-            err,
-            ISelError::UnsupportedAtomicRmw {
-                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
-                ..
-            }
-        ));
+            .unwrap();
+            let pseudo = &isel.func.blocks[&entry].insts[0];
+            assert_eq!(pseudo.opcode, AArch64Opcode::LlscCmpSwap128);
+            assert_eq!(
+                pseudo.operands[3..7],
+                [
+                    ISelOperand::VReg(pairs[0].0),
+                    ISelOperand::VReg(pairs[0].1),
+                    ISelOperand::VReg(pairs[1].0),
+                    ISelOperand::VReg(pairs[1].1)
+                ]
+            );
+            assert_eq!(
+                pseudo.operands[8],
+                ISelOperand::Imm(LlscOrdering::ACQ_REL.to_imm())
+            );
 
-        let func = isel.finalize();
-        assert_eq!(func.blocks[&entry].insts.len(), 1);
-        assert_eq!(func.blocks[&entry].insts[0].opcode, AArch64Opcode::AddRR);
+            // Load and store orderings, and the invalid ones fail closed.
+            for (ordering, expected) in [
+                (AtomicOrdering::Relaxed, Some(LlscOrdering::RELAXED)),
+                (AtomicOrdering::Acquire, Some(LlscOrdering::ACQUIRE)),
+                (AtomicOrdering::SeqCst, Some(LlscOrdering::ACQ_REL)),
+                (AtomicOrdering::Release, None),
+                (AtomicOrdering::AcqRel, None),
+            ] {
+                let (mut isel, entry, _) = llsc_isel_with_i128_values(0);
+                isel.set_lse_enabled(lse);
+                let result = isel.select_instruction(
+                    &Instruction {
+                        opcode: Opcode::AtomicLoad {
+                            ty: Type::I128,
+                            ordering,
+                        },
+                        args: vec![Value(0)],
+                        results: vec![Value(1)],
+                    },
+                    entry,
+                );
+                match expected {
+                    Some(expected) => {
+                        result.unwrap();
+                        let pseudo = &isel.func.blocks[&entry].insts[0];
+                        assert_eq!(pseudo.opcode, AArch64Opcode::LlscLoad128);
+                        assert_eq!(pseudo.operands[4], ISelOperand::Imm(expected.to_imm()));
+                        assert!(isel.i128_high_map.contains_key(&Value(1)));
+                    }
+                    None => {
+                        assert!(result.is_err(), "{ordering:?} load must fail closed");
+                        assert!(isel.func.blocks[&entry].insts.is_empty());
+                    }
+                }
+            }
+            for (ordering, expected) in [
+                (AtomicOrdering::Relaxed, Some(LlscOrdering::RELAXED)),
+                (AtomicOrdering::Release, Some(LlscOrdering::RELEASE)),
+                (AtomicOrdering::SeqCst, Some(LlscOrdering::ACQ_REL)),
+                (AtomicOrdering::Acquire, None),
+                (AtomicOrdering::AcqRel, None),
+            ] {
+                let (mut isel, entry, pairs) = llsc_isel_with_i128_values(1);
+                isel.set_lse_enabled(lse);
+                let result = isel.select_instruction(
+                    &Instruction {
+                        opcode: Opcode::AtomicStore {
+                            ty: Type::I128,
+                            ordering,
+                        },
+                        args: vec![Value(0), Value(1)],
+                        results: vec![],
+                    },
+                    entry,
+                );
+                match expected {
+                    Some(expected) => {
+                        result.unwrap();
+                        let pseudo = &isel.func.blocks[&entry].insts[0];
+                        assert_eq!(pseudo.opcode, AArch64Opcode::LlscStore128);
+                        assert_eq!(pseudo.operands[3], ISelOperand::VReg(pairs[0].0));
+                        assert_eq!(pseudo.operands[4], ISelOperand::VReg(pairs[0].1));
+                        assert_eq!(pseudo.operands[6], ISelOperand::Imm(expected.to_imm()));
+                    }
+                    None => {
+                        assert!(result.is_err(), "{ordering:?} store must fail closed");
+                        assert!(isel.func.blocks[&entry].insts.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn fp16_native_admission_classifier_covers_every_scalar_h_family() {
         let f16_type = |value: &Value| match value.0 {
-            0 | 1 | 2 => Some(Type::F16),
+            0..=2 => Some(Type::F16),
             3 => Some(Type::B1),
             4 => Some(Type::I16),
             5 => Some(Type::F32),
@@ -30578,7 +37437,8 @@ mod tests {
             results: vec![Value(2)],
         };
 
-        let mut baseline = InstructionSelector::new("generic_f16".to_string(), sig.clone());
+        let mut baseline =
+            InstructionSelector::new_darwin_test("generic_f16".to_string(), sig.clone());
         let entry = Block(0);
         baseline.lower_formal_arguments(&sig, entry).unwrap();
         let err = baseline
@@ -30591,7 +37451,8 @@ mod tests {
             }
         ));
 
-        let mut admitted = InstructionSelector::new("fp16_fadd".to_string(), sig.clone());
+        let mut admitted =
+            InstructionSelector::new_darwin_test("fp16_fadd".to_string(), sig.clone());
         admitted.set_fp16_enabled(true);
         admitted.lower_formal_arguments(&sig, entry).unwrap();
         admitted
@@ -30609,7 +37470,8 @@ mod tests {
             params: vec![Type::F16],
             returns: vec![Type::F32],
         };
-        let mut ext = InstructionSelector::new("baseline_fcvt_hs".to_string(), ext_sig.clone());
+        let mut ext =
+            InstructionSelector::new_darwin_test("baseline_fcvt_hs".to_string(), ext_sig.clone());
         ext.lower_formal_arguments(&ext_sig, entry).unwrap();
         ext.value_types.insert(Value(1), Type::F32);
         ext.select_block(
@@ -30630,7 +37492,8 @@ mod tests {
             params: vec![Type::F32],
             returns: vec![Type::F16],
         };
-        let mut trunc = InstructionSelector::new("baseline_fcvt_sh".to_string(), trunc_sig.clone());
+        let mut trunc =
+            InstructionSelector::new_darwin_test("baseline_fcvt_sh".to_string(), trunc_sig.clone());
         trunc.lower_formal_arguments(&trunc_sig, entry).unwrap();
         trunc.value_types.insert(Value(1), Type::F16);
         trunc
@@ -30655,7 +37518,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("baseline_f16_copy".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("baseline_f16_copy".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
         let src = isel.new_vreg(RegClass::Fpr16);
@@ -30683,7 +37546,8 @@ mod tests {
             params: vec![Type::F16, Type::F16, Type::F32, Type::F32],
             returns: vec![Type::F32],
         };
-        let mut isel = InstructionSelector::new("folded_f16_fcmp".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("folded_f16_fcmp".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let instructions = [
@@ -30714,12 +37578,12 @@ mod tests {
     }
 
     #[test]
-    fn generic_aarch64_rejects_lse_cmpxchg() {
+    fn generic_aarch64_selects_llsc_cmpxchg_instead_of_lse() {
         let sig = Signature {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("generic_cas".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("generic_cas".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
         for value in 0..3 {
@@ -30733,28 +37597,27 @@ mod tests {
             isel.define_value(Value(value), ISelOperand::VReg(vreg), ty);
         }
 
-        let err = isel
-            .select_instruction(
-                &Instruction {
-                    opcode: Opcode::CmpXchg {
-                        ty: Type::I32,
-                        success: AtomicOrdering::SeqCst,
-                        failure: AtomicOrdering::Acquire,
-                    },
-                    args: vec![Value(0), Value(1), Value(2)],
-                    results: vec![Value(3)],
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::CmpXchg {
+                    ty: Type::I32,
+                    success: AtomicOrdering::SeqCst,
+                    failure: AtomicOrdering::Acquire,
                 },
-                entry,
-            )
-            .expect_err("generic AArch64 must not emit an unadmitted CAS instruction");
-        assert!(matches!(
-            err,
-            ISelError::UnsupportedCmpXchg {
-                reason: "LSE target capability is not enabled; generic AArch64 needs a proven LL/SC lowering",
-                ..
-            }
-        ));
-        assert!(isel.func.blocks[&entry].insts.is_empty());
+                args: vec![Value(0), Value(1), Value(2)],
+                results: vec![Value(3)],
+            },
+            entry,
+        )
+        .expect("generic AArch64 must select the LL/SC CAS pseudo");
+        let insts = &isel.func.blocks[&entry].insts;
+        assert_eq!(insts.len(), 1);
+        assert_eq!(insts[0].opcode, AArch64Opcode::LlscCmpSwap32);
+        assert!(!trust_cg_opt_free_is_lse(insts[0].opcode));
+        assert_eq!(
+            insts[0].operands[5],
+            ISelOperand::Imm(trust_cg_ir::llsc::LlscOrdering::ACQ_REL.to_imm())
+        );
     }
 
     #[test]
@@ -31176,7 +38039,9 @@ mod tests {
     }
 
     #[test]
-    fn select_atomic_rmw_i128_fails_until_paired_atomic_is_proven() {
+    fn select_atomic_rmw_i128_without_a_high_half_fails_closed() {
+        // An I128 operand whose high half was never defined must not be
+        // lowered from its low half alone.
         let (mut isel, entry) = make_empty_isel();
         let val_vreg = isel.new_vreg(RegClass::Gpr64);
         isel.define_value(Value(0), ISelOperand::VReg(val_vreg), Type::I128);
@@ -31196,15 +38061,8 @@ mod tests {
             entry,
         );
 
-        assert!(matches!(
-            result,
-            Err(ISelError::UnsupportedAtomicRmw {
-                op: AtomicRmwOp::Xchg,
-                ty: Type::I128,
-                ordering: AtomicOrdering::SeqCst,
-                reason: "128-bit AtomicRmw needs paired-register atomic lowering and proof coverage",
-            })
-        ));
+        assert!(matches!(result, Err(ISelError::UndefinedValue(Value(0)))));
+        assert!(isel.func.blocks[&entry].insts.is_empty());
     }
 
     #[test]
@@ -31335,6 +38193,164 @@ mod tests {
             AArch64Opcode::Ldaddl,
             "AtomicRmw Add with Release should emit release-only LDADDL"
         );
+    }
+
+    #[test]
+    fn select_cmpxchg_bool_and_integer_widths_preserve_all_ordering_pairs() {
+        use AtomicOrdering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+        for (ty, size) in [
+            (Type::B1, Some(0)),
+            (Type::I8, Some(0)),
+            (Type::I16, Some(1)),
+            (Type::I32, None),
+            (Type::I64, None),
+        ] {
+            for success in [Relaxed, Acquire, Release, AcqRel, SeqCst] {
+                for failure in [Relaxed, Acquire, Release, AcqRel, SeqCst] {
+                    let (mut isel, entry) = make_empty_isel();
+                    for id in [0, 1] {
+                        let reg = isel.new_vreg(reg_class_for_type(&ty));
+                        isel.define_value(Value(id), ISelOperand::VReg(reg), ty.clone());
+                    }
+                    let ptr = isel.new_vreg(RegClass::Gpr64);
+                    isel.define_value(Value(2), ISelOperand::VReg(ptr), Type::I64);
+                    let result = isel.select_instruction(
+                        &Instruction {
+                            opcode: Opcode::CmpXchg {
+                                ty: ty.clone(),
+                                success,
+                                failure,
+                            },
+                            args: vec![Value(0), Value(1), Value(2)],
+                            results: vec![Value(3)],
+                        },
+                        entry,
+                    );
+                    if matches!(failure, Release | AcqRel) {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(ISelError::UnsupportedCmpXchg {
+                                    reason: "invalid compare-exchange failure ordering",
+                                    ..
+                                })
+                            ),
+                            "{ty:?} {success:?}/{failure:?}: {result:?}"
+                        );
+                        assert!(isel.finalize().blocks[&entry].insts.is_empty());
+                        continue;
+                    }
+                    result.unwrap();
+                    let expected = if failure == SeqCst
+                        || matches!(success, AcqRel | SeqCst)
+                        || (success == Release && failure == Acquire)
+                    {
+                        AArch64Opcode::Casal
+                    } else if success == Acquire || failure == Acquire {
+                        AArch64Opcode::Casa
+                    } else if success == Release {
+                        AArch64Opcode::Casl
+                    } else {
+                        AArch64Opcode::Cas
+                    };
+                    let selected = isel.finalize();
+                    let insts = &selected.blocks[&entry].insts;
+                    assert_eq!(insts.len(), 2);
+                    assert_eq!(insts[0].opcode, AArch64Opcode::MovR);
+                    assert_eq!(insts[1].opcode, expected, "{ty:?} {success:?}/{failure:?}");
+                    assert_eq!(insts[1].operands.len(), if size.is_some() { 4 } else { 3 });
+                    if let Some(size) = size {
+                        assert_eq!(insts[1].operands[3], ISelOperand::Imm(size), "{ty:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn select_bool_atomic_load_store_are_bytes_and_rmw_is_logical_only() {
+        for (store, ordering) in [
+            (false, AtomicOrdering::Relaxed),
+            (false, AtomicOrdering::Acquire),
+            (false, AtomicOrdering::SeqCst),
+            (true, AtomicOrdering::Relaxed),
+            (true, AtomicOrdering::Release),
+            (true, AtomicOrdering::SeqCst),
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            isel.set_lse_enabled(false); // Byte load/store needs no LSE admission.
+            let ptr = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(0), ISelOperand::VReg(ptr), Type::I64);
+            let value = isel.new_vreg(RegClass::Gpr64);
+            isel.define_value(Value(1), ISelOperand::VReg(value), Type::B1);
+            let instruction = if store {
+                Instruction {
+                    opcode: Opcode::AtomicStore {
+                        ty: Type::B1,
+                        ordering,
+                    },
+                    args: vec![Value(1), Value(0)],
+                    results: vec![],
+                }
+            } else {
+                Instruction {
+                    opcode: Opcode::AtomicLoad {
+                        ty: Type::B1,
+                        ordering,
+                    },
+                    args: vec![Value(0)],
+                    results: vec![Value(2)],
+                }
+            };
+            isel.select_instruction(&instruction, entry).unwrap();
+            let selected = isel.finalize();
+            let insts = &selected.blocks[&entry].insts;
+            let opcodes: Vec<AArch64Opcode> = insts.iter().map(|inst| inst.opcode).collect();
+            // One byte access; a loaded bool is then `byte != 0` (TST, CSET),
+            // register operations only.
+            assert_eq!(
+                opcodes,
+                if store {
+                    vec![AArch64Opcode::Stlrb]
+                } else {
+                    vec![
+                        AArch64Opcode::Ldarb,
+                        AArch64Opcode::Tst,
+                        AArch64Opcode::CSet,
+                    ]
+                }
+            );
+        }
+        // Bool RMW admits exactly the logical ops (byte-sized); see
+        // bool_rmw_admits_only_logical_ops_on_both_profiles.
+        for op in [
+            AtomicRmwOp::Xchg,
+            AtomicRmwOp::And,
+            AtomicRmwOp::Or,
+            AtomicRmwOp::Xor,
+        ] {
+            InstructionSelector::require_aarch64_atomic_rmw_lse_coverage(
+                op,
+                &Type::B1,
+                AtomicOrdering::SeqCst,
+            )
+            .unwrap();
+        }
+        for op in [
+            AtomicRmwOp::Add,
+            AtomicRmwOp::Sub,
+            AtomicRmwOp::Max,
+            AtomicRmwOp::UMin,
+        ] {
+            assert!(matches!(
+                InstructionSelector::require_aarch64_atomic_rmw_lse_coverage(
+                    op,
+                    &Type::B1,
+                    AtomicOrdering::SeqCst
+                ),
+                Err(ISelError::UnsupportedAtomicRmw { .. })
+            ));
+        }
     }
 
     #[test]
@@ -31614,6 +38630,92 @@ mod tests {
         );
     }
 
+    /// A Release (and AcqRel) fence must order earlier LOADS before later
+    /// stores, which DMB ISHST (store-store only) does not: both select the
+    /// full DMB ISH, LLVM's mapping (L03-P3). Never ISHST (0x0A).
+    #[test]
+    fn select_fence_release_and_acqrel_emit_dmb_ish_never_ishst() {
+        for ordering in [AtomicOrdering::Release, AtomicOrdering::AcqRel] {
+            let (mut isel, entry) = make_empty_isel();
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Fence { ordering },
+                    args: vec![],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let insts = &mfunc.blocks[&entry].insts;
+            assert_eq!(insts.len(), 1, "{ordering:?}: one barrier, got {insts:?}");
+            assert_eq!(insts[0].opcode, AArch64Opcode::Dmb, "{ordering:?}");
+            assert_eq!(
+                insts[0].operands[0],
+                ISelOperand::Imm(0x0B),
+                "{ordering:?} fence must be DMB ISH (0xB), not ISHST (0xA)"
+            );
+        }
+    }
+
+    /// A load with a store-only ordering (Release/AcqRel) or a store with a
+    /// load-only ordering (Acquire/AcqRel) has no C11/Rust -> AArch64 mapping
+    /// row: refused by name at every width, before anything is emitted
+    /// (L03-P3), instead of being selected as LDAR/STLR.
+    #[test]
+    fn select_atomic_load_store_refuse_orderings_without_a_mapping_row() {
+        for ty in [Type::B1, Type::I8, Type::I16, Type::I32, Type::I64] {
+            for ordering in [AtomicOrdering::Release, AtomicOrdering::AcqRel] {
+                let (mut isel, entry) = make_empty_isel();
+                let addr = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(0), ISelOperand::VReg(addr), Type::I64);
+                let error = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode: Opcode::AtomicLoad {
+                                ty: ty.clone(),
+                                ordering,
+                            },
+                            args: vec![Value(0)],
+                            results: vec![Value(1)],
+                        },
+                        entry,
+                    )
+                    .expect_err("an invalid load ordering must be refused");
+                assert!(
+                    format!("{error:?}").contains("not a valid load ordering"),
+                    "{ty:?} {ordering:?}: {error:?}"
+                );
+                assert!(isel.finalize().blocks[&entry].insts.is_empty());
+            }
+            for ordering in [AtomicOrdering::Acquire, AtomicOrdering::AcqRel] {
+                let (mut isel, entry) = make_empty_isel();
+                let addr = isel.new_vreg(RegClass::Gpr64);
+                let value = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(Value(0), ISelOperand::VReg(value), ty.clone());
+                isel.define_value(Value(1), ISelOperand::VReg(addr), Type::I64);
+                let error = isel
+                    .select_instruction(
+                        &Instruction {
+                            opcode: Opcode::AtomicStore {
+                                ty: ty.clone(),
+                                ordering,
+                            },
+                            args: vec![Value(0), Value(1)],
+                            results: vec![],
+                        },
+                        entry,
+                    )
+                    .expect_err("an invalid store ordering must be refused");
+                assert!(
+                    format!("{error:?}").contains("not a valid store ordering"),
+                    "{ty:?} {ordering:?}: {error:?}"
+                );
+                assert!(isel.finalize().blocks[&entry].insts.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn select_fence_relaxed_emits_nothing() {
         let (mut isel, entry) = make_empty_isel();
@@ -31659,6 +38761,7 @@ mod tests {
         isel.select_instruction(
             &Instruction {
                 opcode: Opcode::Invoke {
+                    binding: crate::instructions::DirectCallBinding::Interposable,
                     name: "may_throw".to_string(),
                     normal_dest,
                     unwind_dest,
@@ -31723,6 +38826,7 @@ mod tests {
         isel.select_instruction(
             &Instruction {
                 opcode: Opcode::Invoke {
+                    binding: crate::instructions::DirectCallBinding::Interposable,
                     name: "void_throwing".to_string(),
                     normal_dest,
                     unwind_dest,
@@ -31751,6 +38855,7 @@ mod tests {
         isel.select_instruction(
             &Instruction {
                 opcode: Opcode::Invoke {
+                    binding: crate::instructions::DirectCallBinding::Interposable,
                     name: "void_throwing".to_string(),
                     normal_dest,
                     unwind_dest,
@@ -31895,23 +39000,27 @@ mod tests {
         let mfunc = isel.finalize();
         let insts = &mfunc.blocks[&entry].insts;
 
-        // Should emit: MOV X0, exc_ptr; BL _Unwind_Resume
+        // Should emit: MOV X0, exc_ptr; BL _Unwind_Resume; BRK
         assert!(
-            insts.len() >= 2,
-            "Resume should emit at least 2 instructions"
+            insts.len() >= 3,
+            "Resume should emit at least 3 instructions"
         );
 
-        // Last instruction should be BL to _Unwind_Resume.
-        let bl_inst = insts
-            .iter()
-            .find(|i| i.opcode == AArch64Opcode::Bl)
-            .unwrap();
+        // The BL to _Unwind_Resume is followed only by the BRK that ends the
+        // block: the noreturn call never falls through into the next block.
+        let bl_inst = &insts[insts.len() - 2];
+        assert_eq!(bl_inst.opcode, AArch64Opcode::Bl);
         assert!(
             bl_inst
                 .operands
                 .iter()
                 .any(|op| matches!(op, ISelOperand::Symbol(s) if s == "_Unwind_Resume")),
             "Resume should call _Unwind_Resume"
+        );
+        assert_eq!(
+            insts[insts.len() - 1].opcode,
+            AArch64Opcode::Brk,
+            "Resume must terminate the block if _Unwind_Resume violates its noreturn ABI"
         );
 
         // Should have a MOV to X0.
@@ -31988,6 +39097,82 @@ mod tests {
             copy_count >= 3,
             "Should have at least 3 Copies for memcpy args (dest, src, len)"
         );
+    }
+
+    /// The `bl` this selector makes for a LIR `Memcpy`/`Memmove`/`Memset` is
+    /// marked the C library routine (`library_routine_call`, which SROA's
+    /// memcpy fill requires); a source `Opcode::Call` of a function only
+    /// named `memcpy` (the adapter lowers a declaration other than C's as
+    /// one) is not.
+    #[test]
+    fn only_the_bulk_memory_call_is_marked_the_library_routine() {
+        for (opcode, symbol) in [
+            (Opcode::Memcpy, "memcpy"),
+            (Opcode::Memmove, "memmove"),
+            (Opcode::Memset, "memset"),
+            (
+                Opcode::Call {
+                    name: "memcpy".to_string(),
+                    binding: DirectCallBinding::Interposable,
+                },
+                "memcpy",
+            ),
+        ] {
+            let library = !matches!(opcode, Opcode::Call { .. });
+            let (mut isel, entry) = make_empty_isel();
+            let second_ty = if symbol == "memset" {
+                Type::I32
+            } else {
+                Type::I64
+            };
+            for (value, ty) in [(0, Type::I64), (1, second_ty), (2, Type::I64)] {
+                let class = if ty == Type::I32 {
+                    RegClass::Gpr32
+                } else {
+                    RegClass::Gpr64
+                };
+                let vreg = isel.new_vreg(class);
+                isel.define_value(Value(value), ISelOperand::VReg(vreg), ty);
+            }
+            isel.select_instruction(
+                &Instruction {
+                    opcode,
+                    args: vec![Value(0), Value(1), Value(2)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let calls: Vec<_> = mfunc.blocks[&entry]
+                .insts
+                .iter()
+                .filter(|inst| inst.opcode == AArch64Opcode::Bl)
+                .collect();
+            assert_eq!(calls.len(), 1, "{symbol}");
+            assert_eq!(
+                calls[0].operands[0],
+                ISelOperand::Symbol(symbol.to_string())
+            );
+            assert_eq!(
+                calls[0].library_routine_call, library,
+                "{symbol} (bulk-memory opcode: {library})"
+            );
+            // The mark reaches the machine instruction as its flag.
+            let machine = mfunc.to_ir_func();
+            let flagged: Vec<bool> = machine
+                .block(machine.entry)
+                .insts
+                .iter()
+                .map(|&id| machine.inst(id))
+                .filter(|inst| inst.opcode == AArch64Opcode::Bl)
+                .map(|inst| {
+                    inst.flags
+                        .contains(trust_cg_ir::InstFlags::LIBRARY_ROUTINE_CALL)
+                })
+                .collect();
+            assert_eq!(flagged, vec![library], "{symbol}");
+        }
     }
 
     #[test]
@@ -32862,6 +40047,106 @@ mod tests {
         );
     }
 
+    /// Select `Isub(a0, a1)` where one operand is a seeded constant; return
+    /// the emitted opcode sequence. `lhs_ty` and `rhs_ty` are separate so the
+    /// mixed-width operand preparation can be tested directly.
+    fn run_isub_with_const(
+        const_on_rhs: bool,
+        const_val: i64,
+        lhs_ty: Type,
+        rhs_ty: Type,
+    ) -> Vec<(AArch64Opcode, Vec<ISelOperand>)> {
+        let (mut isel, entry) = make_empty_isel();
+        let (reg_v, reg_ty, const_v, const_ty) = if const_on_rhs {
+            (Value(0), lhs_ty, Value(1), rhs_ty)
+        } else {
+            (Value(1), rhs_ty, Value(0), lhs_ty)
+        };
+        let reg = isel.new_vreg(reg_class_for_type(&reg_ty));
+        isel.define_value(reg_v, ISelOperand::VReg(reg), reg_ty.clone());
+        isel.value_types.insert(reg_v, reg_ty);
+        isel.iconst_origins
+            .insert(const_v, (const_ty.clone(), const_val));
+        isel.value_types.insert(const_v, const_ty);
+        isel.current_block = Some(entry);
+        isel.select_instruction(
+            &Instruction {
+                opcode: Opcode::Isub,
+                args: vec![Value(0), Value(1)],
+                results: vec![Value(2)],
+            },
+            entry,
+        )
+        .unwrap();
+        let mfunc = isel.finalize();
+        mfunc.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn isub_nonnegative_rhs_const_folds_to_subri() {
+        for (ty, imm) in [
+            (Type::I64, 0),
+            (Type::I64, 1),
+            (Type::I64, 0xFFF),
+            (Type::I32, 7),
+        ] {
+            let insts = run_isub_with_const(true, imm, ty.clone(), ty);
+            assert_eq!(
+                insts.len(),
+                1,
+                "one folded SUB, no constant materialization: {insts:?}"
+            );
+            assert_eq!(insts[0].0, AArch64Opcode::SubRI);
+            assert_eq!(imm_last(&insts[0].1), imm);
+        }
+    }
+
+    #[test]
+    fn isub_const_lhs_does_not_fold_noncommutatively() {
+        let insts = run_isub_with_const(false, 7, Type::I64, Type::I64);
+        assert!(
+            insts.iter().any(|(opc, _)| *opc == AArch64Opcode::SubRR),
+            "const - x must preserve operand order on the register path: {insts:?}"
+        );
+        assert!(
+            !insts.iter().any(|(opc, _)| *opc == AArch64Opcode::SubRI),
+            "const - x must not be rewritten as x - const: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn isub_unencodable_rhs_const_falls_back_to_register_sub() {
+        for imm in [-1, 0x1000] {
+            let insts = run_isub_with_const(true, imm, Type::I64, Type::I64);
+            assert!(
+                insts.iter().any(|(opc, _)| *opc == AArch64Opcode::SubRR),
+                "unencodable RHS constant must use register SUB: imm={imm}, {insts:?}"
+            );
+            assert!(
+                !insts.iter().any(|(opc, _)| *opc == AArch64Opcode::SubRI),
+                "unencodable RHS constant must not be truncated: imm={imm}, {insts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn isub_mixed_i32_lhs_i64_const_widens_before_subri() {
+        let insts = run_isub_with_const(true, 7, Type::I32, Type::I64);
+        assert_eq!(insts.len(), 2, "expected UXTW then folded SUB: {insts:?}");
+        assert_eq!(insts[0].0, AArch64Opcode::Uxtw);
+        assert_eq!(insts[1].0, AArch64Opcode::SubRI);
+        assert_eq!(imm_last(&insts[1].1), 7);
+        let ISelOperand::VReg(wide_lhs) = insts[1].1[1] else {
+            panic!("folded SUB lhs must be the widened vreg: {:?}", insts[1]);
+        };
+        assert_eq!(wide_lhs.class, RegClass::Gpr64);
+        assert_eq!(insts[0].1[0], ISelOperand::VReg(wide_lhs));
+    }
+
     /// Select an `ArrayGep(elem_ty)` with a seeded constant index; return the
     /// emitted opcode sequence. (The ArrayGep path is still reached for
     /// multi-index / ExtractElement GEPs.)
@@ -33001,7 +40286,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("i128op".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("i128op".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -33241,7 +40526,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("const128".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("const128".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -33275,7 +40560,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("const128".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("const128".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -33309,7 +40594,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("const128".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("const128".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -33353,7 +40638,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("const128".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("const128".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -33396,7 +40681,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("i128shift".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("i128shift".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -33420,7 +40705,7 @@ mod tests {
             params: vec![],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("i128cshift".to_string(), sig);
+        let mut isel = InstructionSelector::new_darwin_test("i128cshift".to_string(), sig);
         let entry = Block(0);
         isel.func.ensure_block(entry);
 
@@ -33853,7 +41138,7 @@ mod tests {
             params: vec![Type::I128, Type::I128],
             returns: vec![Type::I128],
         };
-        let mut isel = InstructionSelector::new("i128_abi".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("i128_abi".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         (isel, entry)
@@ -33909,7 +41194,7 @@ mod tests {
             params: vec![Type::I128],
             returns: vec![Type::I128],
         };
-        let mut isel = InstructionSelector::new("ret128".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ret128".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -34128,7 +41413,7 @@ mod tests {
             params: vec![Type::I128, Type::I128],
             returns: vec![Type::B1],
         };
-        let mut isel = InstructionSelector::new("cmp128".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("cmp128".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -34160,8 +41445,8 @@ mod tests {
         // 4 formal arg copies + 5 cmp (CMP+CSET+CMP+CSET+AND) + 1 ret copy + 1 RET = 11
         assert_eq!(mblock.insts.len(), 11);
         // Formal args
-        for i in 0..4 {
-            assert_eq!(mblock.insts[i].opcode, AArch64Opcode::Copy);
+        for inst in &mblock.insts[..4] {
+            assert_eq!(inst.opcode, AArch64Opcode::Copy);
         }
         // CMP sequence for i128 equal
         assert_eq!(mblock.insts[4].opcode, AArch64Opcode::CmpRR);
@@ -34182,7 +41467,7 @@ mod tests {
             params: vec![Type::I128, Type::I64],
             returns: vec![Type::I128],
         };
-        let mut isel = InstructionSelector::new("shl128".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("shl128".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -34240,7 +41525,8 @@ mod tests {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("add_with_loc".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("add_with_loc".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -34301,7 +41587,8 @@ mod tests {
             params: vec![Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("sub_with_loc".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("sub_with_loc".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -34389,7 +41676,7 @@ mod tests {
             params: vec![Type::I32, Type::I32],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("partial".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("partial".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -34444,7 +41731,8 @@ mod tests {
             params,
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("aapcs64_roundtrip".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("aapcs64_roundtrip".to_string(), sig.clone());
         isel.set_abi_variant(AArch64AbiVariant::Aapcs64);
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
@@ -34503,19 +41791,16 @@ mod tests {
             ],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("many_args".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("many_args".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let mfunc = isel.finalize();
         let mblock = &mfunc.blocks[&entry];
 
         // First 8 args: Copy from X0-X7
-        for i in 0..8 {
-            assert_eq!(mblock.insts[i].opcode, AArch64Opcode::Copy);
-            assert_eq!(
-                mblock.insts[i].operands[1],
-                ISelOperand::PReg(PReg::new(i as u16))
-            );
+        for (i, inst) in mblock.insts[..8].iter().enumerate() {
+            assert_eq!(inst.opcode, AArch64Opcode::Copy);
+            assert_eq!(inst.operands[1], ISelOperand::PReg(PReg::new(i as u16)));
         }
 
         // 9th arg: LDR from [FP, IncomingArg(0)]
@@ -34546,7 +41831,7 @@ mod tests {
             ],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("ten_args".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("ten_args".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let mfunc = isel.finalize();
@@ -34582,7 +41867,7 @@ mod tests {
             ],
             returns: vec![Type::I32],
         };
-        let mut isel = InstructionSelector::new("mixed_stack".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("mixed_stack".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
         let mfunc = isel.finalize();
@@ -34785,7 +42070,8 @@ mod tests {
             params: vec![Type::I64, Type::I64],
             returns: vec![Type::B1],
         };
-        let mut isel = InstructionSelector::new("ret_overflow".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("ret_overflow".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -35088,6 +42374,94 @@ mod tests {
         );
     }
 
+    /// Checked-i128 add/sub lower to the flag-setting carry chain with the
+    /// overflow bit read from the FINAL (high-half) NZCV:
+    ///     uadd -> ADDS lo; ADCS hi; CSET HS
+    ///     sadd -> ADDS lo; ADCS hi; CSET VS
+    ///     usub -> SUBS lo; SBCS hi; CSET LO
+    ///     ssub -> SUBS lo; SBCS hi; CSET VS
+    /// The three instructions must be strictly adjacent: ADCS/SBCS consume
+    /// the low half's carry, and CSET consumes ADCS/SBCS's flags.
+    #[test]
+    fn select_checked_add_sub_i128_emits_carry_chain_cset() {
+        for (opcode, lo_opc, hi_opc, cc) in [
+            (
+                Opcode::CheckedUadd,
+                AArch64Opcode::AddsRR,
+                AArch64Opcode::Adcs,
+                AArch64CC::HS,
+            ),
+            (
+                Opcode::CheckedSadd,
+                AArch64Opcode::AddsRR,
+                AArch64Opcode::Adcs,
+                AArch64CC::VS,
+            ),
+            (
+                Opcode::CheckedUsub,
+                AArch64Opcode::SubsRR,
+                AArch64Opcode::Sbcs,
+                AArch64CC::LO,
+            ),
+            (
+                Opcode::CheckedSsub,
+                AArch64Opcode::SubsRR,
+                AArch64Opcode::Sbcs,
+                AArch64CC::VS,
+            ),
+        ] {
+            let (mut isel, entry) = make_i128_isel();
+            isel.select_instruction(
+                &Instruction {
+                    opcode: opcode.clone(),
+                    args: vec![Value(0), Value(1)],
+                    // Results are [value_i128, overflow_b1].
+                    results: vec![Value(2), Value(3)],
+                },
+                entry,
+            )
+            .unwrap();
+            let mfunc = isel.finalize();
+            let mblock = &mfunc.blocks[&entry];
+
+            let lo_idx = mblock
+                .insts
+                .iter()
+                .position(|i| i.opcode == lo_opc)
+                .unwrap_or_else(|| panic!("{opcode:?} at I128 must emit {lo_opc:?}"));
+            assert!(
+                lo_idx + 2 < mblock.insts.len(),
+                "{opcode:?}: carry chain truncated after {lo_opc:?}"
+            );
+            let hi = &mblock.insts[lo_idx + 1];
+            assert_eq!(
+                hi.opcode, hi_opc,
+                "{opcode:?}: high half must be the flag-setting {hi_opc:?}, adjacent to {lo_opc:?}"
+            );
+            let cset = &mblock.insts[lo_idx + 2];
+            assert_eq!(cset.opcode, AArch64Opcode::CSet);
+            assert_eq!(
+                cset.operands[1],
+                ISelOperand::CondCode(cc),
+                "{opcode:?}: overflow bit must be CSET {cc:?} from the final NZCV"
+            );
+            assert!(
+                matches!(cset.operands[0], ISelOperand::VReg(_)),
+                "CSET dst must be a vreg"
+            );
+
+            // The flag-less pair chain must NOT appear: Adc/Sbc would break
+            // the final-NZCV overflow read.
+            assert!(
+                !mblock
+                    .insts
+                    .iter()
+                    .any(|i| matches!(i.opcode, AArch64Opcode::Adc | AArch64Opcode::Sbc)),
+                "{opcode:?} at I128 must use the flag-SETTING high-half op"
+            );
+        }
+    }
+
     #[test]
     fn select_checked_smul_i64_emits_mul_smulh_asr_cmp_cset_ne() {
         let (mut isel, entry) = make_i64_isel();
@@ -35331,7 +42705,8 @@ mod tests {
             params: vec![],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("cross_block_iconst".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("cross_block_iconst".to_string(), sig.clone());
         let entry = Block(0);
         let other = Block(1);
         isel.lower_formal_arguments(&sig, entry).unwrap();
@@ -35392,7 +42767,8 @@ mod tests {
             params: vec![],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("non_const_cross".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("non_const_cross".to_string(), sig.clone());
         let entry = Block(0);
         let other = Block(1);
         isel.lower_formal_arguments(&sig, entry).unwrap();
@@ -35417,6 +42793,422 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The indirect-return (`sret`) convention: AAPCS64 §6.9 passes the hidden
+    // return-buffer pointer in X8, a register OUTSIDE the X0-X7 argument bank.
+    // -----------------------------------------------------------------------
+
+    /// The hidden buffer pointer is read from X8, and the REAL arguments are
+    /// numbered as if it were not there — arg 1 must still arrive in X0.
+    ///
+    /// This is the callee half of the cross-boundary miscompile this convention
+    /// exists to close: bind the pointer from X0 instead and every real argument
+    /// shifts one register along.
+    #[test]
+    fn sret_formal_parameter_binds_x8_and_shifts_no_real_argument() {
+        let sig = Signature {
+            params: vec![Type::I64, Type::I64],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("sret_callee".to_string(), sig.clone());
+        isel.seed_sret_param(Some(crate::function::AbiSretParam { param_index: 0 }))
+            .expect("a leading hidden parameter is lowered");
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+
+        let sources: Vec<PReg> = isel.func.blocks[&entry]
+            .insts
+            .iter()
+            .filter(|inst| inst.opcode == AArch64Opcode::Copy)
+            .filter_map(|inst| match inst.operands.get(1) {
+                Some(ISelOperand::PReg(preg)) => Some(*preg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![gpr::X8, gpr::X0],
+            "parameter 0 is the hidden return buffer (X8); parameter 1 is the first REAL \
+             argument and keeps X0"
+        );
+    }
+
+    /// Without the marker the same signature is an ordinary two-pointer
+    /// function: X0, X1. The marker is what distinguishes them, and nothing
+    /// about the signature's SHAPE can.
+    #[test]
+    fn without_the_sret_marker_the_same_signature_uses_x0_x1() {
+        let sig = Signature {
+            params: vec![Type::I64, Type::I64],
+            returns: vec![],
+        };
+        let mut isel =
+            InstructionSelector::new_darwin_test("plain_callee".to_string(), sig.clone());
+        let entry = Block(0);
+        isel.lower_formal_arguments(&sig, entry).unwrap();
+        let sources: Vec<PReg> = isel.func.blocks[&entry]
+            .insts
+            .iter()
+            .filter(|inst| inst.opcode == AArch64Opcode::Copy)
+            .filter_map(|inst| match inst.operands.get(1) {
+                Some(ISelOperand::PReg(preg)) => Some(*preg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, vec![gpr::X0, gpr::X1]);
+    }
+
+    /// The caller half: argument 0 is staged into X8, argument 1 into X0.
+    #[test]
+    fn sret_call_stages_the_buffer_pointer_in_x8() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.seed_sret_arg_callees(&HashSet::from_iter(["writes_through_buffer".to_string()]));
+        let buf = isel.new_vreg(RegClass::Gpr64);
+        let arg = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(buf), Type::I64);
+        isel.define_value(Value(1), ISelOperand::VReg(arg), Type::I64);
+
+        isel.select_block(
+            entry,
+            &[Instruction {
+                opcode: Opcode::Call {
+                    name: "writes_through_buffer".to_string(),
+                    binding: DirectCallBinding::Interposable,
+                },
+                args: vec![Value(0), Value(1)],
+                results: vec![],
+            }],
+        )
+        .expect("an sret call lowers");
+
+        let dests: Vec<PReg> = isel.func.blocks[&entry]
+            .insts
+            .iter()
+            .take_while(|inst| inst.opcode != AArch64Opcode::Bl)
+            .filter_map(|inst| match inst.operands.first() {
+                Some(ISelOperand::PReg(preg)) => Some(*preg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dests,
+            vec![gpr::X8, gpr::X0],
+            "the buffer address goes to X8; the first real argument keeps X0"
+        );
+    }
+
+    /// LD-100 rule 11. `sret_arg_callees` is keyed by symbol name, and this
+    /// backend calls the routines of [`RuntimeSymbol`] on its own at their C
+    /// convention: an entry naming one made this selector's own `memcpy`
+    /// call for a LIR `Memcpy` stage its destination in X8 (the import of a
+    /// module declaring `void @memcpy(ptr sret, ptr, i64)` and calling it
+    /// once crashed where llc's build copies). Every such entry is refused at
+    /// a direct call of that name: the bulk-memory routine call, any other
+    /// call of a listed name (the lowering's `fmod`, `clean_inc`, ..., or the
+    /// source's own), and a variadic one. An entry under another name keeps
+    /// X8, and a bulk-memory call beside it keeps C's registers.
+    #[test]
+    fn a_hidden_buffer_entry_naming_a_runtime_routine_is_refused() {
+        fn refused(result: Result<(), ISelError>, what: &str) {
+            match result {
+                Err(ISelError::UnsupportedOpcode(msg)) => assert!(
+                    msg.contains("[TCG-SRET-ABI]") && msg.contains("LD-100 rule 11"),
+                    "{what}: {msg}"
+                ),
+                other => panic!("{what}: expected the named refusal, got {other:?}"),
+            }
+        }
+        fn define_args(isel: &mut InstructionSelector, tys: &[Type]) {
+            for (index, ty) in tys.iter().enumerate() {
+                let class = if *ty == Type::I32 {
+                    RegClass::Gpr32
+                } else {
+                    RegClass::Gpr64
+                };
+                let vreg = isel.new_vreg(class);
+                let value = Value(u32::try_from(index).expect("few arguments"));
+                isel.define_value(value, ISelOperand::VReg(vreg), ty.clone());
+            }
+        }
+        // The selector's own bulk-memory routine calls (a run-time count).
+        for (opcode, symbol) in [
+            (Opcode::Memcpy, RuntimeSymbol::Memcpy),
+            (Opcode::Memmove, RuntimeSymbol::Memmove),
+            (Opcode::Memset, RuntimeSymbol::Memset),
+        ] {
+            let (mut isel, entry) = make_empty_isel();
+            isel.seed_sret_arg_callees(&HashSet::from_iter([symbol.name().to_string()]));
+            let second = if symbol == RuntimeSymbol::Memset {
+                Type::I32
+            } else {
+                Type::I64
+            };
+            define_args(&mut isel, &[Type::I64, second, Type::I64]);
+            let call = Instruction {
+                opcode,
+                args: vec![Value(0), Value(1), Value(2)],
+                results: vec![],
+            };
+            refused(isel.select_instruction(&call, entry), symbol.name());
+        }
+        // Every listed name, called directly with a pointer and a second
+        // argument (the shape that reached X8 unrefused), and variadically.
+        for symbol in RuntimeSymbol::ALL {
+            let name = symbol.name();
+            let (mut isel, entry) = make_empty_isel();
+            isel.seed_sret_arg_callees(&HashSet::from_iter([name.to_string()]));
+            define_args(&mut isel, &[Type::I64, Type::I64]);
+            refused(
+                isel.select_call(name, &[Value(0), Value(1)], &[], &[], entry),
+                name,
+            );
+            refused(
+                isel.select_variadic_call(name, 1, &[Value(0), Value(1)], &[], &[], entry),
+                name,
+            );
+        }
+        // Control: another name keeps X8, and the `memcpy` beside it keeps
+        // C's registers.
+        let (mut isel, entry) = make_empty_isel();
+        isel.seed_sret_arg_callees(&HashSet::from_iter(["buffer_return".to_string()]));
+        define_args(&mut isel, &[Type::I64, Type::I64, Type::I64]);
+        isel.select_block(
+            entry,
+            &[
+                Instruction {
+                    opcode: Opcode::Call {
+                        name: "buffer_return".to_string(),
+                        binding: DirectCallBinding::Interposable,
+                    },
+                    args: vec![Value(0), Value(1)],
+                    results: vec![],
+                },
+                Instruction {
+                    opcode: Opcode::Memcpy,
+                    args: vec![Value(0), Value(1), Value(2)],
+                    results: vec![],
+                },
+            ],
+        )
+        .expect("an sret call of another name and a memcpy lower");
+        let mut staged = Vec::new();
+        let mut registers = Vec::new();
+        for inst in &isel.func.blocks[&entry].insts {
+            if inst.opcode == AArch64Opcode::Bl {
+                staged.push((inst.operands[0].clone(), std::mem::take(&mut registers)));
+            } else if let Some(ISelOperand::PReg(preg)) = inst.operands.first() {
+                registers.push(*preg);
+            }
+        }
+        assert_eq!(
+            staged,
+            vec![
+                (
+                    ISelOperand::Symbol("buffer_return".to_string()),
+                    vec![gpr::X8, gpr::X0]
+                ),
+                (
+                    ISelOperand::Symbol(RuntimeSymbol::Memcpy.name().to_string()),
+                    vec![gpr::X0, gpr::X1, gpr::X2]
+                ),
+            ]
+        );
+    }
+
+    /// A hidden parameter anywhere but position 0 is REFUSED, not placed by
+    /// guess: AAPCS64 names exactly one indirect-result register.
+    #[test]
+    fn sret_parameter_at_a_nonzero_index_is_refused() {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("sret_mid".to_string(), sig);
+        let err = isel
+            .seed_sret_param(Some(crate::function::AbiSretParam { param_index: 2 }))
+            .expect_err("only a LEADING hidden parameter is lowered");
+        assert!(
+            matches!(&err, ISelError::UnsupportedOpcode(msg) if msg.contains("[TCG-SRET-ABI]")),
+            "expected a named refusal, got {err:?}"
+        );
+    }
+
+    /// A hidden parameter that is not the pointer carrier is refused rather
+    /// than copied into X8 as if it were an address.
+    #[test]
+    fn sret_parameter_of_a_non_pointer_type_is_refused() {
+        let sig = Signature {
+            params: vec![Type::F64],
+            returns: vec![],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("sret_float".to_string(), sig.clone());
+        isel.seed_sret_param(Some(crate::function::AbiSretParam { param_index: 0 }))
+            .unwrap();
+        let err = isel
+            .lower_formal_arguments(&sig, Block(0))
+            .expect_err("a non-pointer hidden parameter must fail closed");
+        assert!(
+            matches!(&err, ISelError::UnsupportedOpcode(msg) if msg.contains("[TCG-SRET-ABI]")),
+            "expected a named refusal, got {err:?}"
+        );
+    }
+
+    /// A VARIADIC callee that also returns through a hidden buffer (legal C:
+    /// `struct Big f(int n, ...)`): the buffer address goes to X8, the fixed
+    /// count keeps W0 (numbered as if the hidden parameter were absent), and
+    /// the anonymous argument takes the first Darwin stack slot.
+    #[test]
+    fn variadic_sret_call_stages_x8_and_the_anonymous_tail_on_the_stack() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.seed_sret_arg_callees(&HashSet::from_iter(["big_vprintf_like".to_string()]));
+        let buf = isel.new_vreg(RegClass::Gpr64);
+        let count = isel.new_vreg(RegClass::Gpr32);
+        let anon = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(buf), Type::I64);
+        isel.define_value(Value(1), ISelOperand::VReg(count), Type::I32);
+        isel.define_value(Value(2), ISelOperand::VReg(anon), Type::I64);
+        isel.select_block(
+            entry,
+            &[Instruction {
+                opcode: Opcode::CallVariadic {
+                    name: "big_vprintf_like".to_string(),
+                    fixed_args: 2,
+                },
+                args: vec![Value(0), Value(1), Value(2)],
+                results: vec![],
+            }],
+        )
+        .expect("a variadic sret call lowers");
+        let insts = &isel.func.blocks[&entry].insts;
+        let bl = insts
+            .iter()
+            .find(|inst| inst.opcode == AArch64Opcode::Bl)
+            .expect("a Bl is emitted");
+        assert!(bl.implicit_uses.contains(&gpr::X8), "{bl:?}");
+        let dests: Vec<PReg> = insts
+            .iter()
+            .take_while(|inst| inst.opcode != AArch64Opcode::Bl)
+            .filter_map(|inst| match inst.operands.first() {
+                Some(ISelOperand::PReg(preg)) => Some(*preg),
+                _ => None,
+            })
+            .collect();
+        assert!(dests.contains(&gpr::X8), "{dests:?}");
+        assert!(dests.contains(&gpr::W0), "{dests:?}");
+        assert!(
+            !dests.contains(&gpr::X1) && !dests.contains(&gpr::W1),
+            "the anonymous argument must not take a register: {dests:?}"
+        );
+        assert!(
+            insts.iter().any(|inst| {
+                inst.opcode == AArch64Opcode::StrRI
+                    && inst.operands.get(1) == Some(&ISelOperand::PReg(SP))
+                    && inst.operands.get(2) == Some(&ISelOperand::Imm(0))
+            }),
+            "the anonymous argument takes the first stack slot: {insts:?}"
+        );
+    }
+
+    /// A variadic sret call whose hidden pointer has no fixed slot to ride in
+    /// is refused by name.
+    #[test]
+    fn variadic_sret_call_without_a_fixed_parameter_is_refused() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.seed_sret_arg_callees(&HashSet::from_iter(["big_vprintf_like".to_string()]));
+        let buf = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(buf), Type::I64);
+        let err = isel
+            .select_block(
+                entry,
+                &[Instruction {
+                    opcode: Opcode::CallVariadic {
+                        name: "big_vprintf_like".to_string(),
+                        fixed_args: 0,
+                    },
+                    args: vec![Value(0)],
+                    results: vec![],
+                }],
+            )
+            .expect_err("no fixed slot for the hidden pointer");
+        assert!(
+            matches!(&err, ISelError::UnsupportedOpcode(msg) if msg.contains("[TCG-SRET-ABI]")),
+            "expected a named refusal, got {err:?}"
+        );
+    }
+
+    /// The indirect half: a `CallIndirect` whose callee VALUE the adapter
+    /// established as taking a hidden buffer stages argument 0 into X8 and the
+    /// rest from X0, and the `BLR` carries X8 as an implicit use.
+    #[test]
+    fn indirect_sret_call_stages_the_buffer_pointer_in_x8() {
+        let (mut isel, entry) = make_empty_isel();
+        isel.seed_sret_arg_indirect_callees(&HashSet::from_iter([Value(0)]));
+        let fp = isel.new_vreg(RegClass::Gpr64);
+        let buf = isel.new_vreg(RegClass::Gpr64);
+        let arg = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(fp), Type::I64);
+        isel.define_value(Value(1), ISelOperand::VReg(buf), Type::I64);
+        isel.define_value(Value(2), ISelOperand::VReg(arg), Type::I64);
+        isel.select_block(
+            entry,
+            &[Instruction {
+                opcode: Opcode::CallIndirect,
+                args: vec![Value(0), Value(1), Value(2)],
+                results: vec![],
+            }],
+        )
+        .expect("an indirect sret call lowers");
+        let insts = &isel.func.blocks[&entry].insts;
+        let blr = insts
+            .iter()
+            .find(|inst| inst.opcode == AArch64Opcode::Blr)
+            .expect("a Blr is emitted");
+        assert_eq!(blr.operands[0], ISelOperand::VReg(fp));
+        assert!(blr.implicit_uses.contains(&gpr::X8), "{blr:?}");
+        let facts = blr
+            .call_abi
+            .as_ref()
+            .expect("classified indirect sret ABI facts");
+        assert!(facts.hidden_result_pointer && facts.callee.is_none());
+        assert_eq!(facts.stack_arg_bytes, 0);
+        assert!(facts.stack_stores.is_empty());
+        assert!(
+            !facts.aggregate_stack_args && !facts.by_reference_argument_copies && !facts.variadic
+        );
+        let dests: Vec<PReg> = insts
+            .iter()
+            .take_while(|inst| inst.opcode != AArch64Opcode::Blr)
+            .filter_map(|inst| match inst.operands.first() {
+                Some(ISelOperand::PReg(preg)) => Some(*preg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dests, vec![gpr::X8, gpr::X0]);
+
+        // Expecting a result as well claims two return conventions.
+        let (mut isel, entry) = make_empty_isel();
+        isel.seed_sret_arg_indirect_callees(&HashSet::from_iter([Value(0)]));
+        let fp = isel.new_vreg(RegClass::Gpr64);
+        let buf = isel.new_vreg(RegClass::Gpr64);
+        isel.define_value(Value(0), ISelOperand::VReg(fp), Type::I64);
+        isel.define_value(Value(1), ISelOperand::VReg(buf), Type::I64);
+        isel.seed_value_types(&HashMap::from_iter([(Value(5), Type::I64)]));
+        let err = isel
+            .select_block(
+                entry,
+                &[Instruction {
+                    opcode: Opcode::CallIndirect,
+                    args: vec![Value(0), Value(1)],
+                    results: vec![Value(5)],
+                }],
+            )
+            .expect_err("competing return conventions");
+        assert!(
+            matches!(&err, ISelError::UnsupportedOpcode(msg) if msg.contains("[TCG-SRET-ABI]")),
+            "expected a named refusal, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // TV-1: lowering provenance (see trust_cg_ir::provenance schema comment)
     // -----------------------------------------------------------------------
 
@@ -35427,7 +43219,8 @@ mod tests {
             params: vec![Type::I64, Type::I64],
             returns: vec![Type::I64],
         };
-        let mut isel = InstructionSelector::new("tv1_provenance".to_string(), sig.clone());
+        let mut isel =
+            InstructionSelector::new_darwin_test("tv1_provenance".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -35555,7 +43348,7 @@ mod tests {
             params: vec![Type::I64],
             returns: vec![],
         };
-        let mut isel = InstructionSelector::new("tv1_formals".to_string(), sig.clone());
+        let mut isel = InstructionSelector::new_darwin_test("tv1_formals".to_string(), sig.clone());
         let entry = Block(0);
         isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -35594,7 +43387,7 @@ mod tests {
         assert_eq!(block.insts.len(), block.lowering_provenance.len());
 
         // Error path: selection that fails part-way must still reset.
-        let mut isel2 = InstructionSelector::new(
+        let mut isel2 = InstructionSelector::new_darwin_test(
             "tv1_err".to_string(),
             Signature {
                 params: vec![],

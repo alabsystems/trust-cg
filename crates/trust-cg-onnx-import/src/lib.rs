@@ -2,10 +2,52 @@
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
-//
-// MVP ONNX graph importer for the VNN tensor trust_ir JSON contract from #538.
-// The JSON fixture path remains supported for focused tests, and raw `.onnx`
-// files are decoded through the subset of ONNX ModelProto needed by the VNN MVP.
+
+//! MVP ONNX graph importer for the standalone **VNN tensor JSON** contract
+//! from #538. The JSON fixture path remains supported for focused tests, and
+//! raw `.onnx` files are decoded through the subset of ONNX `ModelProto`
+//! needed by the VNN MVP.
+//!
+//! # FORMAT FIREWALL — this crate emits no TrustIr
+//!
+//! **The `trust_ir.` prefix in this crate's output is historical and denotes no
+//! TrustIr artifact.** Read this before believing any `trust_ir` spelling in
+//! this crate, in its emitted JSON, or in its tests:
+//!
+//! * This crate has **no `trust-ir` dependency at all**. Its entire dependency
+//!   list is `serde`, `serde_json`, `sha2`, `thiserror`; it constructs no
+//!   `trust_ir::Module`, `trust_ir::Ty`, or `trust_ir::Inst`, and it links
+//!   nothing that could.
+//! * [`VnnModule`] is a SELF-CONTAINED tensor model — shape + dtype + layout +
+//!   sha256 — serialized as its own JSON. It is not a TrustIr module, and it is
+//!   not convertible into one: TrustIr has no shaped N-d tensor type and no
+//!   tensor instruction for these ops to lower to.
+//! * [`VNN_DIALECT`] (`trust_ir.vnn`) and the [`VNN_OP_PREFIX`]-prefixed op
+//!   names (`trust_ir.vnn.conv2d`, `trust_ir.vnn.relu`, …) are LABELS inside
+//!   that JSON, not TrustIr constructs. `trust_ir::dialect` registers no
+//!   `trust_ir.vnn` dialect, so nothing in TrustIr parses, validates, lowers,
+//!   or otherwise recognizes them.
+//!
+//! ## Why the misleading strings were kept (decision, 2026-09-01)
+//!
+//! They are a **pinned output contract**: roughly 1300 lines of golden
+//! assertions in `tests/importer.rs` name them exactly, and they are the bytes
+//! any existing consumer of the emitted JSON already matches on. Renaming would
+//! churn a wire contract to buy back confusion that a doc comment removes for
+//! free — so the strings stay verbatim and the honesty fix is documentation
+//! plus the 2026-09-01 binary rename, not a silent change to serialized bytes.
+//!
+//! The decision is enforced, not merely asserted:
+//! `vnn_labels_are_pinned_and_this_crate_emits_no_trustir` in
+//! `tests/importer.rs` pins both labels and fails if a `trust-ir` dependency is
+//! ever added to this manifest. At that point the firewall above becomes false
+//! and the naming question must be re-decided rather than allowed to drift.
+//!
+//! The binary was named `trust-cg-onnx-to-vnn-trust-ir` until 2026-09-01, which
+//! made this island read as a TrustIr producer in the build graph; it is now
+//! `trust-cg-onnx-to-vnn-json`. Whether the tensor region should ever land in
+//! TrustIr proper is an open owner scoping decision — see
+//! `~/trust-ir/designs/2026-09-01-tensor-region-scoping.md`.
 
 #![forbid(unsafe_code)]
 
@@ -116,9 +158,36 @@ pub enum Layout {
     Strided,
 }
 
+/// The dialect LABEL emitted in [`VnnModule::dialect`].
+///
+/// **`trust_ir.vnn` is historical and denotes no TrustIr artifact.** It names
+/// this crate's own JSON op vocabulary. There is no `trust-ir` dependency in
+/// this crate, `trust_ir::dialect` registers no dialect by this name, and
+/// nothing in TrustIr parses, validates, or lowers it. See the FORMAT FIREWALL
+/// section in the crate documentation.
+///
+/// The value is a pinned output contract — the golden assertions in
+/// `tests/importer.rs` match it byte-for-byte. Do not change it to remove the
+/// confusion; the documentation is the fix.
+pub const VNN_DIALECT: &str = "trust_ir.vnn";
+
+/// The prefix on every op name in [`VnnOp::op`] (`VNN_DIALECT` plus a dot).
+///
+/// Carries exactly the same caveat as [`VNN_DIALECT`]: `trust_ir.vnn.conv2d`,
+/// `trust_ir.vnn.relu` and their siblings are labels in this crate's own JSON,
+/// **not** TrustIr instructions — TrustIr has no tensor instruction for them to
+/// name. Pinned output contract; documented rather than renamed.
+pub const VNN_OP_PREFIX: &str = "trust_ir.vnn.";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct VnnModule {
     pub version: u32,
+    /// Emitted dialect LABEL: always [`VNN_DIALECT`] (`trust_ir.vnn`).
+    ///
+    /// **Historical name; denotes no TrustIr artifact.** It names this JSON's
+    /// own op vocabulary; it is not a TrustIr dialect and nothing in `trust_ir`
+    /// registers or lowers it. See the FORMAT FIREWALL section in the crate
+    /// documentation before treating it as a TrustIr claim.
     pub dialect: &'static str,
     pub entry: String,
     pub tensors: BTreeMap<String, VnnTensor>,
@@ -596,7 +665,13 @@ pub fn import_graph_fixture(graph: GraphFixture) -> Result<VnnModule> {
 
     Ok(VnnModule {
         version: 1,
-        dialect: "trust_ir.vnn",
+        // `trust_ir.vnn` — a label in this crate's own JSON, NOT a TrustIr
+        // dialect. No `trust-ir` dependency exists here and `trust_ir::dialect`
+        // registers no `trust_ir.vnn`. Kept verbatim because it is the emitted
+        // output contract the fixtures pin; the honesty fix is the doc + the
+        // 2026-09-01 binary rename, not a silent change to serialized bytes.
+        // See VNN_DIALECT and the crate-level FORMAT FIREWALL section.
+        dialect: VNN_DIALECT,
         entry: graph.name.unwrap_or_else(|| "model".to_string()),
         tensors,
         initializers,
@@ -606,15 +681,33 @@ pub fn import_graph_fixture(graph: GraphFixture) -> Result<VnnModule> {
 }
 
 struct OpMapping {
+    /// The emitted [`VnnOp::op`] label. Named `trust_ir_op` for historical
+    /// reasons only — it is a string in this crate's own JSON, NOT a TrustIr
+    /// instruction. See the crate-level FORMAT FIREWALL section.
     trust_ir_op: String,
     gamma_layer_type: String,
 }
 
+/// Maps an ONNX op type onto this crate's own JSON op label.
+///
+/// **The `trust_ir.vnn.*` names in the table below are NOT TrustIr
+/// instructions.** This crate has no `trust-ir` dependency; TrustIr has no
+/// tensor instruction any of these could name, and `trust_ir::dialect`
+/// registers no `trust_ir.vnn` dialect. The prefix is historical — see
+/// [`VNN_OP_PREFIX`] and the crate-level FORMAT FIREWALL section.
+///
+/// Every literal here is a pinned output contract matched byte-for-byte by the
+/// golden assertions in `tests/importer.rs`. A new arm must keep the
+/// [`VNN_OP_PREFIX`] prefix (enforced by
+/// `vnn_labels_are_pinned_and_this_crate_emits_no_trustir`); the existing ones
+/// are documented rather than renamed, because churning a wire contract costs
+/// more than the confusion the documentation already removes.
 fn map_op_type(
     op_type: &str,
     node: &NodeFixture,
     initializer_names: &std::collections::HashSet<String>,
 ) -> Result<OpMapping> {
+    // NOT TrustIr instructions — labels in this crate's own JSON. See above.
     let (trust_ir_op, gamma_layer_type) = match op_type {
         "Conv" => ("trust_ir.vnn.conv2d", "Conv2d"),
         "BatchNormalization" => ("trust_ir.vnn.batch_norm", "BatchNorm"),
@@ -2251,18 +2344,22 @@ fn raw_tensor_values(dtype: DType, bytes: &[u8]) -> Result<Vec<Value>> {
     }
     Ok(match dtype {
         DType::F32 => bytes
-            .chunks_exact(4)
-            .map(|chunk| {
-                Value::from(f32::from_le_bytes(chunk.try_into().expect("exact chunk")) as f64)
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| Value::from(f32::from_le_bytes(*chunk) as f64))
             .collect(),
         DType::I32 => bytes
-            .chunks_exact(4)
-            .map(|chunk| Value::from(i32::from_le_bytes(chunk.try_into().expect("exact chunk"))))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| Value::from(i32::from_le_bytes(*chunk)))
             .collect(),
         DType::I64 => bytes
-            .chunks_exact(8)
-            .map(|chunk| Value::from(i64::from_le_bytes(chunk.try_into().expect("exact chunk"))))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| Value::from(i64::from_le_bytes(*chunk)))
             .collect(),
         DType::F16 if bytes.is_empty() => Vec::new(),
         DType::F16 => {
@@ -2367,8 +2464,10 @@ impl<'a> ProtoField<'a> {
                 )?;
                 Ok(self
                     .data
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("exact chunk")))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect())
             }
             _ => Err(Error::Invalid(format!(

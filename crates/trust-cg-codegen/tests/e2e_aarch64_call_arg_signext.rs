@@ -11,15 +11,16 @@
 // EXTERNAL (clang-compiled) `int observe(signed char)` that returns its arg —
 // clang, per the Apple ABI, reads the caller-extended value. With inputs where
 // `(i8)(a+b)` is negative (e.g. 100+100 -> -56), a missing caller-side extension
-// is observable as a wrong result. Runs on aarch64-apple-darwin.
+// is observable as a wrong result. Runs on macOS and Linux GNU AArch64 with
+// the native optimized C compiler and the exact target ABI. Linux permits the
+// callee to extend narrow arguments, so its run checks value interoperability,
+// not the Darwin-specific caller-extension obligation described above.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-use std::fs;
-use std::process::Command;
-
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+#[path = "common/aarch64_native.rs"]
+mod native;
 use trust_cg_codegen::pipeline::OptLevel;
 
 use trust_ir::{
@@ -28,30 +29,33 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
 fn build_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("call_arg_signext");
 
-    // External declaration: `int observe(signed char)` — no body, provided by clang.
-    let observe_ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I8],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    // External declaration: `int observe(signed char)` — provided by native C.
+    let observe_ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I8],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut observe = TrustIrFunction::new(FuncId::new(0), "observe", observe_ft, BlockId::new(0));
     observe.blocks = vec![]; // declaration / import
     observe.linkage = Linkage::External;
-    m.add_function(observe);
+    m.try_add_function(observe)
+        .expect("Module::try_add_function: test fixture");
 
     // `caller(a: i8, b: i8) -> i32 { observe((i8)(a + b)) }`
-    let caller_ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I8, Ty::I8],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let caller_ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I8, Ty::I8],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(FuncId::new(1), "caller", caller_ft, BlockId::new(0));
     caller.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -76,18 +80,13 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(caller);
+    m.try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
-fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level,
-        ..CompilerConfig::default()
-    });
-    let result = compiler.compile(module).expect("caller must compile");
-    assert!(!result.object_code.is_empty());
-    result.object_code
+fn compile_to_obj_at(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
+    native::compile(module, opt)
 }
 
 const DRIVER: &str = r#"
@@ -125,50 +124,13 @@ int main(void) {
 "#;
 
 fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: link-and-run requires an aarch64-apple-darwin host");
-        return None;
-    }
-    let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
-    let _ = fs::create_dir_all(&dir);
-    let obj_path = dir.join(format!("{tag}.o"));
-    let drv_path = dir.join("driver.c");
-    let bin_path = dir.join(format!("{tag}_bin"));
-    fs::write(&obj_path, obj).expect("write .o");
-    fs::write(&drv_path, driver).expect("write driver");
-
-    // -O2 is essential: at -O0 clang RE-narrows a `signed char` parameter
-    // (`sxtb w0,w0`), masking a missing caller-side extension. At -O2 clang
-    // trusts the Apple ABI and uses the incoming register directly, so an
-    // unextended argument is observable.
-    let link = Command::new("cc")
-        .args([
-            "-O2",
-            drv_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
-            "-o",
-            bin_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("cc available");
-    assert!(
-        link.status.success(),
-        "link failed:\n{}",
-        String::from_utf8_lossy(&link.stderr)
-    );
-
-    let run = Command::new(bin_path.to_str().unwrap())
-        .output()
-        .expect("run binary");
-    let code = run.status.code().unwrap_or(-1);
-    let _ = fs::remove_dir_all(&dir);
-    Some(code)
+    native::link_run(tag, obj, driver)
 }
 
 #[test]
 fn e2e_aarch64_caller_extends_narrow_args() {
     let module = build_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = compile_to_obj_at(&module, opt);
         let Some(code) = link_run_exit_code("call_arg_signext", &obj, DRIVER) else {
             return;

@@ -28,16 +28,24 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn build_cast(id: u32, name: &str, m: &mut TrustIrModule, op: CastOp, dst: Ty) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::F16],
-        returns: vec![dst.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::F16],
+            returns: vec![dst.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -55,7 +63,8 @@ fn build_cast(id: u32, name: &str, m: &mut TrustIrModule, op: CastOp, dst: Ty) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -69,7 +78,8 @@ fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let r = compiler
         .compile(module)
         .expect("f16->i128 module must compile");
@@ -97,8 +107,8 @@ int main(void){
 "#;
 
 fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -115,6 +125,7 @@ fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -145,4 +156,13 @@ fn e2e_aarch64_f16_to_i128() {
             "f16->i128 mismatch at {opt:?} (failing code {code})"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -38,7 +38,7 @@
 //! behind a high `-O` tier, since the PBO solve is a compile-time cost. With the
 //! feature off, or the env unset, the pipeline is byte-identical to origin.
 //! The PER-SEGMENT live-range-split model (steps 4-6 of
-//! docs/ay-regalloc-splitting-plan.md) is a second opt-in on top:
+//! docs/archive/ay-regalloc-splitting-plan.md) is a second opt-in on top:
 //! `TCG_AY_REGALLOC_SEGMENTS` (requires `TCG_AY_REGALLOC`), default OFF and
 //! byte-identical when off.
 //!
@@ -148,7 +148,7 @@ pub(crate) fn max_pairs() -> usize {
 
 /// Spill-op (reload/store) weight relative to a register move in the
 /// commensurable TRAFFIC objective — the KILLCOMMIT currency (a spill op costs
-/// ~4x a register move; docs/per-use-splitting-plan.md).
+/// ~4x a register move; docs/archive/per-use-splitting-plan.md).
 pub(crate) const SPILL_W: i128 = 4;
 /// Register-move weight in the traffic objective.
 pub(crate) const MOVE_W: i128 = 1;
@@ -1779,10 +1779,8 @@ fn add_transition_constraints(
 // an interference or place a split copy on the wrong side — a miscompile — so it
 // is validated in isolation before any encoding consumes it.
 
-/// A per-basic-block live-range segment of a modeled vreg.
-// Consumed by the split PB encoding (steps 4-6) + the segmentation unit tests;
-// allow(dead_code) until the encoding wires it into the non-test path.
-#[allow(dead_code)]
+/// A per-basic-block live-range segment of a modeled vreg, consumed by the
+/// split PB encoding and the segmentation unit tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Segment {
     /// The block this segment lives in.
@@ -1802,7 +1800,6 @@ pub(crate) struct Segment {
 /// `compute_live_intervals` assigns (walk `block_order`, then each block's
 /// `insts`), so a segment's positions line up with the `use_positions` /
 /// `def_positions` the interval carries. Empty blocks contribute no span.
-#[allow(dead_code)]
 pub(crate) fn block_spans(func: &RegAllocFunction) -> Vec<(BlockId, u32, u32)> {
     let mut spans = Vec::with_capacity(func.block_order.len());
     let mut idx = 0u32;
@@ -1825,7 +1822,6 @@ pub(crate) fn block_spans(func: &RegAllocFunction) -> Vec<(BlockId, u32, u32)> {
 /// returned segments are in ascending program order and their extents are
 /// pairwise disjoint (blocks partition the stream). Every one of `iv`'s use/def
 /// positions lands in exactly one returned segment.
-#[allow(dead_code)]
 pub(crate) fn per_bb_segments(iv: &LiveInterval, spans: &[(BlockId, u32, u32)]) -> Vec<Segment> {
     let mut segments: Vec<Segment> = Vec::new();
     for &(block, bstart, bend) in spans {
@@ -1871,9 +1867,9 @@ pub(crate) fn per_bb_segments(iv: &LiveInterval, spans: &[(BlockId, u32, u32)]) 
 
 /// The index of the segment whose covered extent `[start, end)` contains `pos`,
 /// or `None` if `pos` is in a hole. Segments are ordered and disjoint, so this is
-/// a binary search — the encoding uses it to route a use/def or an interference
-/// point to its segment.
-#[allow(dead_code)]
+/// a binary search. Test-only: the unit tests use it to check that every
+/// use/def lands in the segment that owns it.
+#[cfg(test)]
 pub(crate) fn covering_segment(segments: &[Segment], pos: u32) -> Option<usize> {
     segments
         .binary_search_by(|seg| {

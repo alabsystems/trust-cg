@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // crates/rustc-codegen-trust-cg/tests/std_breadth_x86.rs
 //
@@ -22,79 +26,26 @@ mod target_dir_support;
 //      decremented only when non-empty; an EMPTY pop is crash-safe and yields
 //      `None`, matching real `pop`).
 //
-// Each program is compiled through BOTH lanes (stock rustc/LLVM and the trust-cg
-// bridge) at -O0, run, and the exit codes must MATCH (self-validating — no
+// Each program is compiled through BOTH lanes (trustc's own LLVM backend and the
+// trust-cg bridge) at -O0, run, and the exit codes must MATCH (self-validating — no
 // hard-coded oracle). A trust-cg fail-closed is a HARD failure here (these shapes
 // MUST compile after this task); an exit-code divergence is a P0 miscompile.
 //
 // Run: cd crates/rustc-codegen-trust-cg
-//      cargo test --release --test std_breadth_x86 -- --nocapture
+//      targo --unverified test --release --test std_breadth_x86 -- --nocapture
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    for cand in [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ] {
-        if cand.exists() {
-            return cand;
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?}");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == TARGET)
-        })
-        .unwrap_or(false)
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -115,10 +66,9 @@ fn compile_run_o0(dir: &Path, name: &str, src: &str, dylib: Option<&Path>) -> Re
     let src_path = dir.join(format!("{name}.rs"));
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = dylib {
         let mut a = std::ffi::OsString::from("-Zcodegen-backend=");
         a.push(dylib);
@@ -279,5 +229,9 @@ fn main() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(failures.is_empty(), "std-breadth pins failed:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "std-breadth pins failed:\n{}",
+        failures.join("\n")
+    );
 }

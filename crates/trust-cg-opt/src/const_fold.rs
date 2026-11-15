@@ -25,6 +25,8 @@
 //! | LsrRI   | dst = src >> imm (when src is known constant, logical) |
 //! | AsrRI   | dst = src >> imm (when src is known constant, arithmetic) |
 //! | Neg     | dst = -src (when src is known constant) |
+//! | Sxtb/Sxth/Sxtw | dst = sign-extend(low 8/16/32 bits of src) to dst width |
+//! | Uxtb/Uxth/Uxtw | dst = zero-extend(low 8/16/32 bits of src) to dst width |
 //!
 //! # Implementation
 //!
@@ -59,7 +61,7 @@
 //! and records the low 16 bits. Any subsequent fold that uses v100 will
 //! silently use the wrong value (see issue #366).
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use serde::{Deserialize, Serialize};
 use trust_cg_ir::{
@@ -325,7 +327,7 @@ fn run_impl(
     for block_id in func.block_order.clone() {
         // The pass has no dataflow meet over predecessors, so cross-block
         // constant propagation is not sound for loop headers or joins.
-        let mut constants: HashMap<VReg, i64> = HashMap::new();
+        let mut constants: HashMap<VReg, i64> = HashMap::default();
         let original_insts = func.block(block_id).insts.clone();
         let mut new_insts: Vec<InstId> = Vec::with_capacity(original_insts.len());
 
@@ -890,6 +892,28 @@ fn try_fold(inst: &MachInst, constants: &HashMap<VReg, i64>) -> Option<(VReg, i6
         }
     };
 
+    // Sign/zero extension of a known constant: `[dst, src]`. The extension
+    // reads only the low `from` bits of the source, so the tracker's
+    // zero-extended Gpr32 form and a full Gpr64 value give the same input.
+    // The result is the `from`-bit field extended to the DESTINATION width
+    // (the encoder emits the X form for a 64-bit destination and the W form,
+    // whose upper half is architecturally zero, for a 32-bit one), then
+    // re-normalized to the tracker's canonical form by `norm_out`.
+    if let Some((from_bits, signed)) = extension_source_bits(opcode) {
+        if ops.len() != 2 {
+            return None;
+        }
+        let dst = ops[0].as_vreg()?;
+        let src = lookup_const(&ops[1], constants)? as u64;
+        let field = src & ((1u64 << from_bits) - 1);
+        let extended = if signed && (field >> (from_bits - 1)) & 1 == 1 {
+            (field | !((1u64 << from_bits) - 1)) as i64
+        } else {
+            field as i64
+        };
+        return Some((dst, norm_out(extended)));
+    }
+
     match category {
         // Binary register-register: dst = op(lhs, rhs)
         // Operands: [dst, lhs, rhs]
@@ -1013,6 +1037,20 @@ fn try_fold(inst: &MachInst, constants: &HashMap<VReg, i64>) -> Option<(VReg, i6
     }
 }
 
+/// Source field width and signedness of the scalar extension opcodes the fold
+/// evaluates, or `None` for every other opcode.
+fn extension_source_bits(opcode: AArch64Opcode) -> Option<(u32, bool)> {
+    match opcode {
+        AArch64Opcode::Sxtb => Some((8, true)),
+        AArch64Opcode::Sxth => Some((16, true)),
+        AArch64Opcode::Sxtw => Some((32, true)),
+        AArch64Opcode::Uxtb => Some((8, false)),
+        AArch64Opcode::Uxth => Some((16, false)),
+        AArch64Opcode::Uxtw => Some((32, false)),
+        _ => None,
+    }
+}
+
 fn effective_register_immediate(opcode: AArch64Opcode, imm: i64) -> i64 {
     match opcode {
         AArch64Opcode::AddRIShift12 => imm.wrapping_shl(12),
@@ -1072,7 +1110,7 @@ mod tests {
     /// values). Tests should compare against the reconstructed value
     /// rather than inspecting a specific slot's opcode.
     fn materialized_value(func: &MachFunction, vreg_id: u32) -> Option<i64> {
-        let mut constants: HashMap<VReg, i64> = HashMap::new();
+        let mut constants: HashMap<VReg, i64> = HashMap::default();
         for block_id in &func.block_order {
             let block = func.block(*block_id);
             for inst_id in &block.insts {
@@ -1528,9 +1566,9 @@ mod tests {
             materialization: vec!["MovI".to_string()],
         };
 
-        let mut gpr64_constants = HashMap::new();
+        let mut gpr64_constants = HashMap::default();
         gpr64_constants.insert(VReg::new(0, RegClass::Gpr64), 10);
-        let mut gpr32_constants = HashMap::new();
+        let mut gpr32_constants = HashMap::default();
         gpr32_constants.insert(VReg::new(0, RegClass::Gpr32), 10);
 
         let gpr64_hash = const_fold_obligation_hash(
@@ -1549,6 +1587,85 @@ mod tests {
         );
 
         assert_ne!(gpr64_hash, gpr32_hash);
+    }
+
+    /// Sign/zero extensions of a known constant fold to the value the
+    /// extension produces at the DESTINATION width: the low `from` bits of the
+    /// source, extended; a 32-bit destination's upper half is zero.
+    #[test]
+    fn test_fold_extensions_of_constants() {
+        let cases: [(AArch64Opcode, bool, i64, i64); 10] = [
+            // (opcode, 64-bit destination, source constant, expected)
+            (AArch64Opcode::Sxtb, false, 0x80, 0xFFFF_FF80),
+            (AArch64Opcode::Sxtb, true, 0x17F, 0x7F),
+            (AArch64Opcode::Sxtb, true, 0xFF, -1),
+            (AArch64Opcode::Uxtb, false, 0x1FF, 0xFF),
+            (AArch64Opcode::Sxth, false, 0x8000, 0xFFFF_8000),
+            (AArch64Opcode::Sxth, true, 0x1_7FFF, 0x7FFF),
+            (AArch64Opcode::Uxth, false, 0xABCD_1234, 0x1234),
+            (AArch64Opcode::Sxtw, true, 0x8000_0000, -0x8000_0000),
+            (AArch64Opcode::Uxtw, true, 0x8000_0000, 0x8000_0000),
+            (AArch64Opcode::Sxtb, false, 0, 0),
+        ];
+        for (opcode, wide, source, expected) in cases {
+            let dst = if wide { vreg(1) } else { vreg32(1) };
+            // The 32-bit source, materialized the way ISel does: MOVZ of the
+            // low half, MOVK of the high half.
+            let movz = MachInst::new(AArch64Opcode::Movz, vec![vreg32(0), imm(source & 0xFFFF)]);
+            let movk = MachInst::new(
+                AArch64Opcode::Movk,
+                vec![vreg32(0), imm((source >> 16) & 0xFFFF), imm(16)],
+            );
+            let ext = MachInst::new(opcode, vec![dst, vreg32(0)]);
+            let mut func = make_func_with_insts(vec![
+                movz,
+                movk,
+                ext,
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ]);
+            let mut constants: HashMap<VReg, i64> = HashMap::default();
+            for id in [0, 1] {
+                update_const_tracker(func.inst(trust_cg_ir::InstId(id)), &mut constants);
+            }
+            let folded = try_fold(func.inst(trust_cg_ir::InstId(2)), &constants);
+            assert_eq!(
+                folded.map(|(_, value)| value),
+                Some(expected),
+                "{opcode:?} wide={wide} source={source:#x}"
+            );
+            assert!(ConstantFolding.run(&mut func), "{opcode:?}");
+            // Replay the rewritten block: the destination now holds the value
+            // as a constant materialization of its own class.
+            let class = if wide {
+                RegClass::Gpr64
+            } else {
+                RegClass::Gpr32
+            };
+            let mut replay: HashMap<VReg, i64> = HashMap::default();
+            for id in &func.block(func.entry).insts {
+                let inst = func.inst(*id);
+                assert_ne!(inst.opcode, opcode, "the extension was not folded");
+                update_const_tracker(inst, &mut replay);
+            }
+            assert_eq!(
+                replay.get(&VReg::new(1, class)).copied(),
+                Some(expected),
+                "{opcode:?} wide={wide} source={source:#x}"
+            );
+        }
+    }
+
+    /// Negative control: an extension of a value the tracker does not know is
+    /// left alone.
+    #[test]
+    fn test_no_fold_extension_of_unknown_source() {
+        let ext = MachInst::new(AArch64Opcode::Uxtb, vec![vreg32(1), vreg32(0)]);
+        let mut func = make_func_with_insts(vec![ext, MachInst::new(AArch64Opcode::Ret, vec![])]);
+        assert!(!ConstantFolding.run(&mut func));
+        assert_eq!(
+            func.inst(trust_cg_ir::InstId(0)).opcode,
+            AArch64Opcode::Uxtb
+        );
     }
 
     #[test]
@@ -2153,7 +2270,7 @@ mod tests {
     #[test]
     fn w_register_asr_of_negative_sign_extends_before_shift() {
         // w2 = 0xFFFF_FFFF (-1 as a W register, tracker's zero-extended form)
-        let mut constants = HashMap::new();
+        let mut constants = HashMap::default();
         constants.insert(VReg::new(2, RegClass::Gpr32), 0xFFFF_FFFFi64);
         // w3 = ASR w2, #31  — architecturally 0xFFFF_FFFF, NOT 1.
         let asr = MachInst::new(AArch64Opcode::AsrRI, vec![vreg32(3), vreg32(2), imm(31)]);
@@ -2171,7 +2288,7 @@ mod tests {
     #[test]
     fn w_register_add_carry_out_is_masked() {
         // w2 = 0xFFFF_FFFF; w3 = w2 + 1 = 0 (32-bit wrap, no bit-32 leak)
-        let mut constants = HashMap::new();
+        let mut constants = HashMap::default();
         constants.insert(VReg::new(2, RegClass::Gpr32), 0xFFFF_FFFFi64);
         let add = MachInst::new(AArch64Opcode::AddRI, vec![vreg32(3), vreg32(2), imm(1)]);
         assert_eq!(
@@ -2185,7 +2302,7 @@ mod tests {
     /// 32-bit logical shift (input zero-extended, never the 64-bit pattern).
     #[test]
     fn w_register_lsr_shifts_the_32bit_value() {
-        let mut constants = HashMap::new();
+        let mut constants = HashMap::default();
         constants.insert(VReg::new(2, RegClass::Gpr32), 0xFFFF_FFFFi64);
         let lsr = MachInst::new(AArch64Opcode::LsrRI, vec![vreg32(3), vreg32(2), imm(31)]);
         assert_eq!(
@@ -2198,7 +2315,7 @@ mod tests {
     /// (no fold), never evaluate with a 64-bit shift semantics.
     #[test]
     fn w_register_shift_over_31_refuses_to_fold() {
-        let mut constants = HashMap::new();
+        let mut constants = HashMap::default();
         constants.insert(VReg::new(2, RegClass::Gpr32), 0xFFFF_FFFFi64);
         let asr = MachInst::new(AArch64Opcode::AsrRI, vec![vreg32(3), vreg32(2), imm(32)]);
         assert_eq!(try_fold(&asr, &constants), None);

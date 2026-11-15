@@ -1,0 +1,33 @@
+b1_mispredict      compile ins x O2 1.189 cpu x O2 1.564 rss x O2 1.225 | run cyc_min x O3 0.972 ins 1.185 exit_ok True load 3.86-3.95
+h1_vec_push_sum    compile ins x O2 1.181 cpu x O2 1.512 rss x O2 1.209 | run cyc_min x O3 0.986 ins 1.102 exit_ok True load 3.88-3.95
+h2_vec_grow        compile ins x O2 1.184 cpu x O2 1.525 rss x O2 1.209 | run cyc_min x O3 0.887 ins 0.962 exit_ok True load 3.88-3.89
+h3_box_leak        compile ins x O2 1.182 cpu x O2 1.550 rss x O2 1.209 | run cyc_min x O3 1.001 ins 0.959 exit_ok True load 4.2-4.22
+h4_vec_dropper     compile ins x O2 1.174 cpu x O2 1.550 rss x O2 1.208 | run cyc_min x O3 0.837 ins 0.972 exit_ok True load 4.2-4.42
+m1_call_chain      compile ins x O2 1.185 cpu x O2 1.488 rss x O2 1.214 | run cyc_min x O3 0.931 ins 1.087 exit_ok True load 4.39-4.52
+m2_call_heavy      compile ins x O2 1.186 cpu x O2 1.500 rss x O2 1.216 | run cyc_min x O3 0.911 ins 0.654 exit_ok True load 4.52-4.59
+p1_xorshift        compile ins x O2 1.172 cpu x O2 1.439 rss x O2 1.217 | run cyc_min x O3 0.963 ins 1.992 exit_ok True load 4.59-6.0
+p2_collatz         compile ins x O2 1.181 cpu x O2 1.487 rss x O2 1.215 | run cyc_min x O3 0.999 ins 1.139 exit_ok True load 6.0-6.16
+p3_gcd             compile ins x O2 1.184 cpu x O2 1.513 rss x O2 1.214 | run cyc_min x O3 1.000 ins 1.189 exit_ok True load 6.13-6.42
+p4_matmul          compile ins x O2 1.192 cpu x O2 1.500 rss x O2 1.223 | run cyc_min x O3 1.005 ins 1.076 exit_ok True load 6.5-6.55
+p5_struct_acc      compile ins x O2 1.180 cpu x O2 1.487 rss x O2 1.214 | run cyc_min x O3 0.889 ins 1.099 exit_ok True load 6.5-14.0
+p6_branch_match    compile ins x O2 1.193 cpu x O2 1.561 rss x O2 1.216 | run cyc_min x O3 1.011 ins 1.218 exit_ok True load 15.04-23.88
+p7_sieve           compile ins x O2 1.176 cpu x O2 1.500 rss x O2 1.223 | run cyc_min x O3 0.782 ins 0.977 exit_ok True load 23.88-24.45
+p8_closure_nest    compile ins x O2 1.178 cpu x O2 1.475 rss x O2 1.213 | run cyc_min x O3 0.999 ins 1.197 exit_ok True load 23.07-25.38
+v1_saxpy           compile ins x O2 1.195 cpu x O2 1.512 rss x O2 1.225 | run cyc_min x O3 0.738 ins 1.653 exit_ok True load 21.78-23.07
+v2_memfill         compile ins x O2 1.198 cpu x O2 1.564 rss x O2 1.222 | run cyc_min x O3 0.987 ins 1.140 exit_ok True load 19.74-21.78
+v3_popcount        compile ins x O2 1.201 cpu x O2 1.600 rss x O2 1.222 | run cyc_min x O3 0.688 ins 0.617 exit_ok True load 18.64-19.74
+compile_instructions_med_vs_llvm_o2: 1.1851
+compile_cpu_s_med_vs_llvm_o2: 1.5177
+compile_maxrss_bytes_med_vs_llvm_o2: 1.2163
+compile_wall_s_med_vs_llvm_o2: 1.0207
+compile_instructions_med_vs_llvm_o3: 1.1787
+compile_cpu_s_med_vs_llvm_o3: 1.5119
+compile_maxrss_bytes_med_vs_llvm_o3: 1.2168
+compile_wall_s_med_vs_llvm_o3: 1.0179
+runtime_cycles_min_vs_llvm_o3: 0.9159
+runtime_cycles_med_vs_llvm_o3: 0.9187
+runtime_instructions_med_vs_llvm_o3: 1.0859
+runtime_wall_s_min_vs_llvm_o3: 0.9265
+runtime_wall_s_med_vs_llvm_o3: 0.9291
+exit_ok_programs: 18
+programs: 18

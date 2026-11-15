@@ -5,67 +5,34 @@
 
 //! Register allocation for the proof-oriented Trust Codegen backend.
 //!
-//! This crate implements liveness analysis and register allocation for
-//! machine-level IR. The current implementation uses linear scan with
-//! spill weight computation and parallel copy resolution for phi elimination.
+//! This crate implements liveness, linear-scan and greedy allocation, optional
+//! AY-PBO candidates, and allocation validation for machine-level IR.
 //!
 //! ## Architecture
 //!
+//! Each allocation candidate follows this core pipeline (optional phases are
+//! controlled by `AllocConfig`):
+//!
 //! ```text
-//! RegAllocFunction (input, SSA with phis)
-//!      |
-//!      v
-//! +-------------------+
-//! | Critical Edge      |  split_critical_edges()
-//! | Splitting          |
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Phi Elimination    |  eliminate_phis()
-//! | (parallel copies)  |
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Liveness           |  compute_live_intervals()
-//! | Analysis           |
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Copy Coalescing    |  coalesce_copies() + apply_coalescing()
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Linear Scan        |  LinearScan::allocate()
-//! | Allocation         |
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Remat / Spill Code |  find_remat_candidates() / insert_spill_code()
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Spill Slot Reuse   |  compute_spill_slot_reuse()
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Call Save/Restore  |  insert_call_save_restore()
-//! +--------+----------+
-//!          |
-//!          v
-//! +-------------------+
-//! | Post-RA Coalesce   |  post_ra_coalesce()
-//! +--------+----------+
-//!          |
-//!          v
-//! RegAllocFunction (output, VRegs replaced with PRegs)
+//! SSA input -> move normalization -> validator snapshot
+//!     -> critical-edge splitting -> transactional phi elimination
+//!     -> liveness -> copy coalescing
+//!     -> register assignment / optional interval splitting
+//!     -> planned spill slots / optional pseudos and rematerialization
+//!     -> optional spill-slot reuse -> translation validation
+//!     -> mutated RegAllocFunction + AllocationResult (register/slot map)
 //! ```
+//!
+//! Call-clobber reservations constrain register assignment; this pipeline does
+//! not invoke the separately exported `insert_call_save_restore` helper.
+//! Physical-register rewriting and `post_ra_coalesce` belong to downstream
+//! consumers, not this core pipeline. With AY enabled, baseline and candidate
+//! run on separate snapshots; the caller receives a validated selected result.
+//!
+//! Register and stack-slot plans share checked fresh-ID arithmetic. Required
+//! phi/spill phases return an allocation error on exhaustion; optional splits
+//! can decline. Slot exhaustion does not partially commit spill metadata or
+//! pseudos, but an error from the overall pipeline need not undo earlier phases.
 //!
 //! ## Usage
 //!
@@ -79,20 +46,32 @@
 //! # }
 //! ```
 
+// Trust checks the ABI proofs and emits the scalar classifiers called by
+// call_clobber. Width-alias mapping and reserved-register policy remain Rust.
+#[path = "../../../proofs/abi_clobber_spec.lean"]
+clean mod abi_partition_proofs;
+
 #[cfg(feature = "ay-regalloc")]
 pub mod ay_regalloc;
+mod bitset;
 pub mod call_clobber;
 pub mod coalesce;
+mod error;
 pub mod greedy;
+mod independent_physical_liveness;
 pub(crate) mod killcommit;
 pub mod linear_scan;
+#[cfg(test)]
+mod linear_scan_reference;
 pub mod liveness;
 pub mod machine_types;
 pub mod phi_elim;
+mod physical_liveness;
 pub mod post_ra_coalesce;
 pub mod post_ra_opt;
 pub mod regalloc_validator;
 pub mod remat;
+mod scan_work;
 pub mod spill;
 pub mod spill_slot_reuse;
 pub mod split;
@@ -101,10 +80,9 @@ pub mod x86_adapter;
 #[cfg(feature = "ay-regalloc")]
 pub(crate) use trust_cg_process_env as env_lock;
 
+pub use error::AllocError;
 pub use greedy::{GreedyAllocator, Stage as GreedyStage};
-pub use linear_scan::{
-    AllocError, AllocationResult, LinearScan, SpillInfo, aarch64_allocatable_regs,
-};
+pub use linear_scan::{AllocationResult, LinearScan, SpillInfo, aarch64_allocatable_regs};
 pub use liveness::{LiveInterval, LiveRange, LivenessResult, compute_live_intervals};
 pub use machine_types::{
     // Backward-compatible aliases (deprecated — use RegAlloc* names):
@@ -135,11 +113,14 @@ pub use coalesce::{
 };
 pub use machine_types::{BlockId, InstId, PReg, RegClass, StackSlotId, VReg};
 pub use phi_elim::{eliminate_phis, split_critical_edges};
-pub use post_ra_coalesce::{PostRACoalesceConfig, PostRACoalesceResult, post_ra_coalesce};
+pub use post_ra_coalesce::{
+    PostRACoalesceConfig, PostRACoalesceResult, eliminate_physical_self_copies, post_ra_coalesce,
+};
 pub use post_ra_opt::{PostRAOptResult, post_ra_optimize};
 pub use remat::{
     RematCandidate, RematCost, classify_remat_cost, find_remat_candidates, populate_loop_depths,
 };
+use spill::allocate_spill_slots;
 pub use spill::insert_spill_code;
 pub use spill_slot_reuse::{SpillSlotReuseResult, compute_spill_slot_reuse};
 pub use split::{
@@ -191,26 +172,6 @@ fn regalloc_spill_stats_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("TCG_RA_SPILL_STATS").is_some())
-}
-
-/// KILL SWITCH for ABI allocation biasing on the GREEDY allocator
-/// (`TCG_NO_ABI_HINT_GREEDY=1`). Cached, same zero-cost discipline as the
-/// stats flags above. When set, the greedy arm of [`allocate_core`] builds no
-/// copy hints and no exemptions, so `GreedyAllocator` sees exactly the
-/// `config.hints`-only state it saw before this landed and the emitted object
-/// is byte-identical. See the greedy arm for the full rationale.
-fn abi_hint_greedy_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("TCG_NO_ABI_HINT_GREEDY").is_some())
-}
-
-/// `TCG_NO_CALL_CROSSING_HINTS` disables the callee-saved bias for
-/// call-crossing intervals (the paired-A/B kill switch for that wiring).
-fn call_crossing_hints_disabled() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("TCG_NO_CALL_CROSSING_HINTS").is_some())
 }
 
 /// Start a stage timer. `None` (zero-cost) unless timing is enabled.
@@ -299,25 +260,11 @@ pub struct AllocConfig {
     pub enable_spill_code: bool,
     /// Whether to enable spill slot reuse (default: true).
     pub enable_spill_slot_reuse: bool,
-    /// CALLER-SUPPLIED register hints, honored by BOTH allocators (the older
-    /// "greedy only, ignored by linear scan" note was stale).
-    ///
-    /// 🛑 **Populated today with ABI ARGUMENT hints ONLY** — the x86 pipeline
-    /// fills this from `MOV vreg, PReg` patterns so an argument register is not
-    /// clobbered before it is read (#300). Empty on aarch64.
-    ///
-    /// ⚑ This doc previously claimed the map was "populated by the x86
-    /// adapter's `compute_call_crossing_hints`, which biases intervals live
-    /// across a call toward callee-saved registers". **That was false.**
-    /// [`compute_call_crossing_hints`] has NO production call site: it is
-    /// defined, re-exported here, and unit-tested in `x86_adapter`'s `mod
-    /// tests`, but never invoked during a real compilation. Values live across
-    /// a call therefore receive no callee-saved bias on any target.
-    ///
-    /// Wiring it up is not a config-time edit: the hints are derived from live
-    /// intervals, which do not exist until inside [`allocate_core`], so the
-    /// computation has to move in there rather than be assembled next to the
-    /// argument hints above.
+    /// Caller-supplied register hints, honored by both allocation strategies.
+    /// The x86 pipeline supplies incoming-argument hints from `MOV vreg, PReg`
+    /// patterns. Separately, `allocate_core` computes call-crossing preferences
+    /// from live intervals when `callee_saved_regs` is nonempty and the runtime
+    /// kill switch permits them; these do not need to be supplied in this map.
     ///
     /// Both arms of [`allocate_core`] append the ABI copy hints from
     /// [`copy_register_hints`] AFTER these, so a caller preference is always
@@ -331,8 +278,7 @@ pub struct AllocConfig {
     /// disables the bias and reproduces the historical behavior; the x86-64
     /// and AArch64 production constructors populate it
     /// (`jit_latency_aarch64` keeps it empty — the extra crossing scan is
-    /// against that profile's latency budget). `TCG_NO_CALL_CROSSING_HINTS`
-    /// is the runtime kill switch.
+    /// against that profile's latency budget).
     pub callee_saved_regs: BTreeSet<PReg>,
     /// Target tuning for the pre-RA copy coalescer (hardened-guard-copy
     /// normalization + kill-at-def / pass-through merges). The empty default
@@ -447,6 +393,92 @@ impl AllocConfig {
 /// self-reservation at its own copy point; every other interference still holds,
 /// and the post-alloc validator is the backstop).
 type CopyHintExemptions = BTreeMap<(VReg, PReg), Vec<u32>>;
+
+/// Per vreg, the positions of `BLR` instructions that read it (the branch
+/// target) for the LAST time: its live interval ends right after the call.
+///
+/// A call's caller-saved clobbers are reserved at the call's own position
+/// (`implicit_def_reservations`), and a vreg read by the call is live there,
+/// so without this every indirect-call target was forced into a callee-saved
+/// register (`mov x19, x0; blr x19` plus an x19/x20 save pair) although `BLR
+/// Xn` reads `Xn` before the callee runs. The clobber takes effect after the
+/// read, so it cannot corrupt a value whose life ends at that read. Every
+/// OTHER reservation of the same register still binds at the earlier points
+/// of the interval: an argument register's span from its setup copy to the
+/// call, or an incoming argument's span from entry, covers at least one
+/// position before the call where the target is live too. The allocators
+/// re-check `end == position + 1` against the interval they allocate, and
+/// the translation validator applies the same carve-out
+/// (`regalloc_validator`), whose value-flow check reads the target at the
+/// call before applying the clobbers.
+///
+/// Only `BLR` (a single architectural instruction that reads its operand and
+/// then branches) is admitted; call pseudos whose expansion may write a
+/// register before reading an operand are not.
+fn dying_call_operand_positions(
+    func: &RegAllocFunction,
+    intervals: &[LiveInterval],
+    inst_numbering: &BTreeMap<InstId, u32>,
+) -> BTreeMap<VReg, Vec<u32>> {
+    let ends: BTreeMap<VReg, u32> = intervals.iter().map(|iv| (iv.vreg, iv.end())).collect();
+    let mut exempt: BTreeMap<VReg, Vec<u32>> = BTreeMap::new();
+    for block_id in &func.block_order {
+        let Some(block) = func.blocks.get(block_id.0 as usize) else {
+            continue;
+        };
+        for inst_id in &block.insts {
+            let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                continue;
+            };
+            if !is_aarch64_blr_call(inst) {
+                continue;
+            }
+            let Some(&pos) = inst_numbering.get(inst_id) else {
+                continue;
+            };
+            for vreg in inst.uses.iter().filter_map(RegAllocOperand::as_vreg) {
+                if ends.get(&vreg) == Some(&(pos + 1)) {
+                    exempt.entry(vreg).or_default().push(pos);
+                }
+            }
+        }
+    }
+    exempt
+}
+
+/// Whether `inst` is an AArch64 `BLR` call with no explicit def. Register
+/// allocation carries target opcodes as raw `u16` discriminants, and the x86-64
+/// and AArch64 enumerations overlap numerically, so the opcode alone does not
+/// name the target: an instruction that clobbers or reads an x86-64 register is
+/// never taken for a `BLR`.
+pub(crate) fn is_aarch64_blr_call(inst: &MachInst) -> bool {
+    inst.opcode == trust_cg_ir::inst::AArch64Opcode::Blr as u16
+        && inst.flags.is_call()
+        && inst.defs.is_empty()
+        && !inst
+            .implicit_defs
+            .iter()
+            .chain(inst.implicit_uses.iter())
+            .any(|preg| x86_adapter::is_x86_preg(*preg))
+}
+
+/// Drop from each call crossing the vregs that die AT that call
+/// ([`dying_call_operand_positions`]): they are read by it, not live across
+/// it, so biasing them toward a callee-saved register only costs a save pair.
+fn without_dying_call_operands(
+    mut crossings: Vec<CallCrossing>,
+    dying: &BTreeMap<VReg, Vec<u32>>,
+) -> Vec<CallCrossing> {
+    for crossing in &mut crossings {
+        crossing.live_across.retain(|vreg| {
+            !dying
+                .get(vreg)
+                .is_some_and(|positions| positions.contains(&crossing.call_inst_idx))
+        });
+    }
+    crossings.retain(|crossing| !crossing.live_across.is_empty());
+    crossings
+}
 
 fn copy_register_hints(
     func: &RegAllocFunction,
@@ -766,8 +798,8 @@ fn allocate_core(
     // The translation validator ([`regalloc_validator::validate_allocation`])
     // compares this snapshot (still carrying phis) against the post-alloc
     // function and the resulting VReg->PReg map; it is the fail-closed gate run
-    // before this function returns Ok. This clone is the only cost the always-on
-    // validator adds to the happy path.
+    // before this function returns Ok. Snapshotting and validation both add
+    // work; the timing hooks measure them separately.
     let t_snapshot = ra_stage_start();
     let pre_snapshot = func.clone();
     ra_stage_end(&func.name, use_ay, "snapshot-clone", t_snapshot);
@@ -781,7 +813,12 @@ fn allocate_core(
     }
 
     // Phase 2: Phi elimination — lower phis to copies.
-    eliminate_phis(func);
+    if let Err(error) = eliminate_phis(func) {
+        // Required phi lowering cannot fall back to an allocation with phis
+        // still present. Also undo this phase's critical-edge splits.
+        *func = pre_snapshot;
+        return Err(error);
+    }
     ra_stage_end(&func.name, use_ay, "critedge+phi-elim", t_phi);
 
     // Phase 3: Liveness analysis.
@@ -797,12 +834,9 @@ fn allocate_core(
 
     // Coalescing rewrites VReg ids in `func` (and the resulting `allocation` is
     // keyed by the coalesced representatives). The translation validator compares
-    // the pre-alloc snapshot against that coalesced namespace, so we accumulate
-    // the same VReg rewrite and replay it onto `pre_snapshot` before validating.
-    // (Coalescing is a sound, separately-tested merge of provably non-interfering
-    // vregs; replaying its rewrite onto the spec keeps the validator focused on
-    // the register-assignment / phi-realization properties it certifies — the
-    // #52/#53/#63/#64 miscompile class — without trusting the allocator.)
+    // the unchanged pre-alloc snapshot against that coalesced namespace. Keep
+    // the rewrite map as location-lookup bookkeeping for the validator; do not
+    // replay it onto the specification, which would hide incorrect merges.
     let mut coalesce_rewrites: BTreeMap<VReg, VReg> = BTreeMap::new();
 
     // Phase 4: Copy coalescing — merge non-interfering intervals from copies.
@@ -903,7 +937,7 @@ fn allocate_core(
         // whole-vreg solve AND the stats probe's input. Taken unconditionally
         // so a stale record can never leak into a later function's AY pass.
         let baseline_rec = killcommit::take_record();
-        // KILL-OR-COMMIT stats probe (docs/per-use-splitting-plan.md): solves a
+        // KILL-OR-COMMIT stats probe (docs/archive/per-use-splitting-plan.md): solves a
         // SEPARATE stats instance under a hard `<= G-1` bound, logs one line,
         // and DISCARDS the result. Runs before `try_allocate` so the
         // measurement happens even when the AY attempt itself declines. Inert
@@ -959,19 +993,26 @@ fn allocate_core(
     // every call site. Appended AFTER the ABI argument hints and the copy
     // hints in both arms, so existing preferences keep priority, and checked
     // against full interference like any other candidate — a hint can never
-    // overlay a live value. Empty `callee_saved_regs` (or the kill switch)
-    // reproduces the historical behavior exactly.
-    let call_crossing_hints = if ay_tuple.is_some()
-        || call_crossing_hints_disabled()
-        || config.callee_saved_regs.is_empty()
-    {
+    // overlay a live value. Empty `callee_saved_regs` reproduces the
+    // historical behavior exactly.
+    // Indirect-call targets read for the last time by their `BLR` (see
+    // `dying_call_operand_positions`).
+    let dying_call_operands = if ay_tuple.is_some() {
+        BTreeMap::new()
+    } else {
+        dying_call_operand_positions(func, &intervals, &inst_numbering)
+    };
+    let call_crossing_hints = if ay_tuple.is_some() || config.callee_saved_regs.is_empty() {
         BTreeMap::new()
     } else {
         // `intervals` is `intervals_map.values()` in ascending `VReg` order,
         // which is ascending id order (`VReg` orders by `id` first and liveness
         // yields one interval per id), i.e. exactly the order the former
         // `BTreeMap<u32, LiveInterval>` — a clone of every interval — iterated.
-        let crossings = find_call_crossings_in(func, &intervals, &inst_numbering);
+        let crossings = without_dying_call_operands(
+            find_call_crossings_in(func, &intervals, &inst_numbering),
+            &dying_call_operands,
+        );
         compute_call_crossing_hints(
             &crossings,
             &config.callee_saved_regs,
@@ -1010,6 +1051,7 @@ fn allocate_core(
                     }
                 }
                 scanner.set_hints(hints, hint_exempt);
+                scanner.set_call_operand_exempt(dying_call_operands.clone());
                 let result = scanner.allocate()?;
                 let spilled = scanner.spilled_vregs().to_vec();
                 // KILL-OR-COMMIT (stats-only): record the baseline whole-vreg
@@ -1051,9 +1093,7 @@ fn allocate_core(
                 }
             }
             AllocStrategy::Greedy => {
-                // ABI ALLOCATION BIASING (default ON; kill switch
-                // TCG_NO_ABI_HINT_GREEDY=1 restores the unhinted greedy and is
-                // byte-identical to it).
+                // ABI ALLOCATION BIASING.
                 //
                 // WHY THIS EXISTS. `copy_register_hints` biases every vreg that
                 // is copy-related to a fixed ABI register onto that register, so
@@ -1086,15 +1126,10 @@ fn allocate_core(
                 // validator applies the same identity-copy carve-out and rejects
                 // anything else at compile time. A bad hint can at worst leave
                 // the copy in place.
-                let abi_hints_off = abi_hint_greedy_disabled();
                 let mut hints = config.hints.clone();
-                let mut hint_exempt = CopyHintExemptions::new();
-                if !abi_hints_off {
-                    let (copy_hints, exempt) = copy_register_hints(func, &inst_numbering);
-                    for (vreg, pregs) in copy_hints {
-                        hints.entry(vreg).or_default().extend(pregs);
-                    }
-                    hint_exempt = exempt;
+                let (copy_hints, hint_exempt) = copy_register_hints(func, &inst_numbering);
+                for (vreg, pregs) in copy_hints {
+                    hints.entry(vreg).or_default().extend(pregs);
                 }
                 for (vreg, pregs) in &call_crossing_hints {
                     let entry = hints.entry(*vreg).or_default();
@@ -1111,6 +1146,7 @@ fn allocate_core(
                     reserved_regs,
                 );
                 allocator.set_hint_exempt(hint_exempt);
+                allocator.set_call_operand_exempt(dying_call_operands.clone());
                 let result = if config.enable_splitting {
                     allocator.allocate_with_splitting(func)?
                 } else {
@@ -1245,25 +1281,25 @@ fn allocate_core(
     let t_spill = ra_stage_start();
     if !spilled.is_empty() {
         if !config.enable_spill_code {
-            result.spills = allocate_spill_slots(func, &spilled);
+            result.spills = allocate_spill_slots(func, &spilled)?;
         } else if config.enable_remat {
             // Try to rematerialize cheap values instead of spilling.
             let t_remat = ra_stage_start();
             let remat_candidates = find_remat_candidates(func, &spilled);
             if !remat_candidates.is_empty() {
                 // First insert spill code for all spilled vregs.
-                let mut spill_infos = insert_spill_code(func, &spilled, &result.allocation);
+                let mut spill_infos = insert_spill_code(func, &spilled, &result.allocation)?;
                 // Then replace spill loads with rematerialized instructions.
                 remat::apply_rematerialization(func, &remat_candidates, &mut spill_infos);
                 result.spills = spill_infos;
                 ra_stage_end(&func.name, use_ay, "remat+spill-code", t_remat);
             } else {
-                let spill_infos = insert_spill_code(func, &spilled, &result.allocation);
+                let spill_infos = insert_spill_code(func, &spilled, &result.allocation)?;
                 result.spills = spill_infos;
                 ra_stage_end(&func.name, use_ay, "remat+spill-code", t_remat);
             }
         } else {
-            let spill_infos = insert_spill_code(func, &spilled, &result.allocation);
+            let spill_infos = insert_spill_code(func, &spilled, &result.allocation)?;
             result.spills = spill_infos;
         }
 
@@ -1282,12 +1318,10 @@ fn allocate_core(
     }
     ra_stage_end(&func.name, use_ay, "spill+slot-reuse", t_spill);
 
-    // Translation validation (always on, fail-closed). Prove the concrete
-    // allocation result is semantically equivalent to the SSA input
-    // (`pre_snapshot`) WITHOUT trusting the allocator — closing the regalloc /
-    // splitter miscompile class (#52 / #53 / #63 / #64). The validator is sound
-    // but conservative: it returns errors only on structures it cannot prove
-    // equivalent, never a false Ok, so a non-empty report is a hard stop.
+    // Translation validation (always on, fail-closed) checks the concrete
+    // allocation against the SSA input (`pre_snapshot`) independently of the
+    // allocator. A report containing errors is a hard stop. This is not a claim
+    // that the validator is bug-free or a replacement for emitted-code tests.
     //
     // The spec is the ORIGINAL, UNREWRITTEN pre-coalesce snapshot. The
     // coalescing rewrite map is handed to the validator as namespace
@@ -1933,7 +1967,8 @@ fn entry_is_csr_clean(func: &RegAllocFunction, allocation: &BTreeMap<VReg, PReg>
 /// rewrite every use of `arg` in the save region (blocks reachable from `s`) to a
 /// fresh vreg, and insert `fresh = COPY arg` (a `PSEUDO_COPY` split connector) as
 /// the first instruction of `s` (the recursive edge). Returns false (no change)
-/// if `arg` is redefined in the save region or is not actually used there — the
+/// if IDs are exhausted, `arg` is redefined in the save region, or it is not
+/// actually used there — the
 /// fail-closed guard that keeps the connector's single-def / dominated-use
 /// invariant the interference validator relies on.
 fn apply_arg_split_at_save_block(func: &mut RegAllocFunction, s: BlockId, arg: VReg) -> bool {
@@ -1983,7 +2018,9 @@ fn apply_arg_split_at_save_block(func: &mut RegAllocFunction, s: BlockId, arg: V
         return false;
     }
 
-    let fresh = func.alloc_vreg(arg.class);
+    let Some(fresh) = func.try_alloc_vreg(arg.class) else {
+        return false;
+    };
 
     // Rewrite every save-region USE of `arg` to `fresh`.
     for &b in &save_region {
@@ -2189,32 +2226,8 @@ fn realloc_and_score(
     Some((result2, spilled2, w2, non_reload))
 }
 
-fn allocate_spill_slots(func: &mut RegAllocFunction, spilled: &[VReg]) -> Vec<SpillInfo> {
-    spilled
-        .iter()
-        .map(|&vreg| {
-            let size = spill_slot_size(vreg.class);
-            let slot = func.alloc_stack_slot(size, size.max(1));
-            SpillInfo { vreg, slot }
-        })
-        .collect()
-}
-
-fn spill_slot_size(class: RegClass) -> u32 {
-    match class {
-        RegClass::Gpr32 | RegClass::Fpr32 => 4,
-        RegClass::Gpr64 | RegClass::Fpr64 => 8,
-        RegClass::Fpr128 => 16,
-        RegClass::Fpr16 => 2,
-        RegClass::Fpr8 => 1,
-        RegClass::System => 4,
-    }
-}
-
 fn debug_dump_intervals(label: &str, intervals: &BTreeMap<u32, LiveInterval>) {
-    if std::env::var("TRUST_CG_DEBUG_REGALLOC_INTERVALS").is_err()
-        && std::env::var("TRUST_CG_DEBUG_REGALLOC").is_err()
-    {
+    if std::env::var("TRUST_CG_DEBUG_REGALLOC").is_err() {
         return;
     }
 
@@ -2338,7 +2351,7 @@ pub(crate) fn implicit_def_reservations(
     // Unchanged tail: the span passes run on the finished map, then every
     // key's positions are sorted and deduplicated (so push ORDER above is
     // immaterial; only the key set and the position sets are).
-    reserve_implicit_use_spans(func, inst_numbering, &mut reserved);
+    reserve_physical_use_spans(func, inst_numbering, &mut reserved);
     reserve_incoming_argument_spans(func, inst_numbering, &mut reserved);
 
     for positions in reserved.values_mut() {
@@ -2441,7 +2454,7 @@ pub(crate) fn implicit_def_reservations_reference(
         }
     }
 
-    reserve_implicit_use_spans(func, inst_numbering, &mut reserved);
+    reserve_physical_use_spans_scalar(func, inst_numbering, &mut reserved);
     reserve_incoming_argument_spans(func, inst_numbering, &mut reserved);
 
     for positions in reserved.values_mut() {
@@ -2452,7 +2465,7 @@ pub(crate) fn implicit_def_reservations_reference(
     reserved
 }
 
-/// Reserve every physical implicit use from each reaching definition through
+/// Reserve every physical use from each reaching definition through
 /// every sink that consumes it, including cross-block paths.
 ///
 /// VReg liveness cannot represent a value after `Copy X0 <- v` has placed it in
@@ -2460,9 +2473,12 @@ pub(crate) fn implicit_def_reservations_reference(
 /// leave the interior free for an unrelated interval to be colored X0/W0 and
 /// clobber the result. The existing call setup repair handles the common
 /// same-block case; this CFG-aware model additionally handles a producer in a
-/// predecessor and applies to calls and non-call sinks alike.
+/// predecessor and applies to explicit operands and implicit sinks alike.
+/// In particular, after a multi-result call, an early `v0 <- X0` must not be
+/// colored X1 while the later `v1 <- X1` has yet to read that return lane.
+/// Reserving only the call and read endpoints misses this interior lifetime.
 ///
-/// For each alias class named by a sink's implicit uses, this is ordinary
+/// For each alias class named by a sink's physical uses, this is ordinary
 /// backward physical-register liveness: an explicit or implicit aliasing
 /// definition kills the successor value, then a same-instruction sink use
 /// generates the input value. The def-before-use reverse transfer is material
@@ -2471,12 +2487,25 @@ pub(crate) fn implicit_def_reservations_reference(
 /// every instruction point at which that physical value is live. Missing or
 /// ambiguous return authority is rejected independently by the translation
 /// validator; for any sink without a producer, reserving all the way to entry is
-/// the conservative allocator behavior.
-fn reserve_implicit_use_spans(
+/// the conservative allocator behavior. Correct additional reservations can
+/// increase register pressure; they are not a performance optimization.
+fn reserve_physical_use_spans(
     func: &RegAllocFunction,
     inst_numbering: &BTreeMap<InstId, u32>,
     reserved: &mut BTreeMap<PReg, Vec<u32>>,
 ) {
+    physical_liveness::reserve(func, inst_numbering, reserved);
+}
+
+/// Published scalar algorithm, independent of masks/summaries/worklist, retained
+/// only as the exact differential oracle. Counters do not affect transfers.
+#[cfg(test)]
+fn reserve_physical_use_spans_scalar(
+    func: &RegAllocFunction,
+    inst_numbering: &BTreeMap<InstId, u32>,
+    reserved: &mut BTreeMap<PReg, Vec<u32>>,
+) -> physical_liveness::WorkStats {
+    let mut stats = physical_liveness::WorkStats::default();
     let mut sink_pregs = Vec::new();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id.0 as usize) else {
@@ -2486,10 +2515,11 @@ fn reserve_implicit_use_spans(
             let Some(inst) = func.insts.get(inst_id.0 as usize) else {
                 continue;
             };
-            for &preg in &inst.implicit_uses {
+            stats.instruction();
+            for preg in regalloc_inst_physical_uses(inst) {
                 if !sink_pregs
                     .iter()
-                    .any(|&existing| greedy::allocator_pregs_overlap(existing, preg))
+                    .any(|&existing| stats.overlap(existing, preg))
                 {
                     sink_pregs.push(preg);
                 }
@@ -2497,6 +2527,12 @@ fn reserve_implicit_use_spans(
         }
     }
 
+    stats.scratch_payload_bytes = sink_pregs.capacity() * std::mem::size_of::<PReg>()
+        + if sink_pregs.is_empty() {
+            0
+        } else {
+            func.blocks.len() * 2 * std::mem::size_of::<bool>()
+        };
     for sink_preg in sink_pregs {
         let mut live_in = vec![false; func.blocks.len()];
         let mut live_out = vec![false; func.blocks.len()];
@@ -2508,6 +2544,7 @@ fn reserve_implicit_use_spans(
                 let Some(block) = func.blocks.get(block_index) else {
                     continue;
                 };
+                stats.block();
                 let out = block
                     .succs
                     .iter()
@@ -2517,13 +2554,12 @@ fn reserve_implicit_use_spans(
                     let Some(inst) = func.insts.get(inst_id.0 as usize) else {
                         continue;
                     };
-                    if regalloc_inst_defines_preg_alias(inst, sink_preg) {
+                    stats.instruction();
+                    if regalloc_inst_defines_preg_alias(inst, sink_preg, &mut stats) {
                         live = false;
                     }
-                    if inst
-                        .implicit_uses
-                        .iter()
-                        .any(|&use_preg| greedy::allocator_pregs_overlap(use_preg, sink_preg))
+                    if regalloc_inst_physical_uses(inst)
+                        .any(|use_preg| stats.overlap(use_preg, sink_preg))
                     {
                         live = true;
                     }
@@ -2553,14 +2589,13 @@ fn reserve_implicit_use_spans(
                 let Some(inst) = func.insts.get(inst_id.0 as usize) else {
                     continue;
                 };
+                stats.instruction();
                 let live_after = live;
-                if regalloc_inst_defines_preg_alias(inst, sink_preg) {
+                if regalloc_inst_defines_preg_alias(inst, sink_preg, &mut stats) {
                     live = false;
                 }
-                if inst
-                    .implicit_uses
-                    .iter()
-                    .any(|&use_preg| greedy::allocator_pregs_overlap(use_preg, sink_preg))
+                if regalloc_inst_physical_uses(inst)
+                    .any(|use_preg| stats.overlap(use_preg, sink_preg))
                 {
                     live = true;
                 }
@@ -2572,14 +2607,27 @@ fn reserve_implicit_use_spans(
             }
         }
     }
+    stats
 }
 
-fn regalloc_inst_defines_preg_alias(inst: &RegAllocInst, preg: PReg) -> bool {
+fn regalloc_inst_physical_uses(inst: &RegAllocInst) -> impl Iterator<Item = PReg> + '_ {
+    inst.uses
+        .iter()
+        .filter_map(RegAllocOperand::as_preg)
+        .chain(inst.implicit_uses.iter().copied())
+}
+
+#[cfg(test)]
+fn regalloc_inst_defines_preg_alias(
+    inst: &RegAllocInst,
+    preg: PReg,
+    stats: &mut physical_liveness::WorkStats,
+) -> bool {
     inst.defs
         .iter()
         .filter_map(RegAllocOperand::as_preg)
         .chain(inst.implicit_defs.iter().copied())
-        .any(|defined| greedy::allocator_pregs_overlap(defined, preg))
+        .any(|defined| stats.overlap(defined, preg))
 }
 
 /// Reserve each INCOMING-ARGUMENT (entry-block live-in) physical register over
@@ -2656,6 +2704,27 @@ fn reserve_incoming_argument_spans(
             .chain(inst.implicit_defs.iter().copied())
         {
             locally_defined.insert(preg);
+            // An AArch64 GPR write defines the WHOLE 64-bit register: a W
+            // write zeroes bits 63:32 of its X register. So after `Copy w3 <-
+            // v` (a 32-bit outgoing argument), the call's implicit read of X3
+            // reads the local value, not an incoming one; keyed by exact PReg
+            // it looked like a live-in read and reserved X3 from entry to the
+            // call, which barred every value in the entry block from X3/W3.
+            // x86 partial-register writes do not zero-extend in general, so
+            // only the AArch64 GPR views are paired here.
+            // Only X0-X30 / W0-W30: SP/WSP and the zero register are no
+            // value-carrying GPR views.
+            if !x86_adapter::is_x86_preg(preg) {
+                match preg.encoding() {
+                    0..=30 => {
+                        locally_defined.extend(trust_cg_ir::regs::gpr64_to_gpr32(preg));
+                    }
+                    32..=62 => {
+                        locally_defined.extend(trust_cg_ir::regs::gpr32_to_gpr64(preg));
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -2671,6 +2740,9 @@ fn reserve_incoming_argument_spans(
         }
     }
 }
+
+#[cfg(test)]
+mod physical_use_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2769,6 +2841,204 @@ mod tests {
             next_stack_slot: 0,
             stack_slots: BTreeMap::new(),
         }
+    }
+
+    /// A W write defines the whole X register (bits 63:32 are zeroed), so a
+    /// call's implicit read of X3 after `Copy W3 <- v` reads the LOCAL value.
+    /// Keyed by exact register it looked like an incoming-argument read and
+    /// reserved X3 from entry to the call, barring the whole entry block from
+    /// X3/W3. The reservation must match the X-written spelling exactly, and
+    /// a genuinely incoming X3 read stays reserved from entry.
+    #[test]
+    fn incoming_argument_spans_treat_a_w_write_as_defining_its_x_register() {
+        fn inst(opcode: u16, defs: Vec<MachOperand>, uses: Vec<MachOperand>) -> MachInst {
+            MachInst {
+                opcode,
+                defs,
+                uses,
+                implicit_defs: Vec::new(),
+                implicit_uses: Vec::new(),
+                flags: InstFlags::default(),
+                tied_operands: vec![],
+            }
+        }
+        let reservations = |arg_def: Option<PReg>| {
+            let v0 = VReg::new(0, RegClass::Gpr32);
+            let mut insts = vec![
+                inst(0x10, vec![MachOperand::VReg(v0)], vec![]),
+                inst(0x11, vec![], vec![]),
+            ];
+            if let Some(preg) = arg_def {
+                insts.push(inst(
+                    phi_elim::IR_COPY_OPCODE,
+                    vec![MachOperand::PReg(preg)],
+                    vec![MachOperand::VReg(v0)],
+                ));
+            }
+            let mut call = inst(0xC0, vec![], vec![]);
+            call.implicit_uses = vec![trust_cg_ir::regs::X3];
+            call.flags = InstFlags::IS_CALL;
+            insts.push(call);
+            let ids: Vec<InstId> = (0..insts.len() as u32).map(InstId).collect();
+            let numbering: BTreeMap<InstId, u32> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (*id, i as u32))
+                .collect();
+            let func = MachFunction {
+                name: "w_arg".into(),
+                insts,
+                blocks: vec![MachBlock {
+                    insts: ids,
+                    preds: Vec::new(),
+                    succs: Vec::new(),
+                    loop_depth: 0,
+                }],
+                block_order: vec![BlockId(0)],
+                entry_block: BlockId(0),
+                next_vreg: 1,
+                next_stack_slot: 0,
+                stack_slots: BTreeMap::new(),
+            };
+            let mut reserved = BTreeMap::new();
+            reserve_incoming_argument_spans(&func, &numbering, &mut reserved);
+            reserved
+        };
+        let via_w = reservations(Some(trust_cg_ir::regs::W3));
+        let via_x = reservations(Some(trust_cg_ir::regs::X3));
+        assert_eq!(via_w, via_x);
+        assert!(via_w.get(&trust_cg_ir::regs::X3).is_none_or(Vec::is_empty));
+        // Control: with no local write, X3 is an incoming value read at the
+        // call (position 2) and is reserved from entry up to that read.
+        let incoming = reservations(None);
+        assert_eq!(incoming.get(&trust_cg_ir::regs::X3), Some(&vec![0, 1]));
+    }
+
+    /// `FnOnce::call_once` for a `fn()` pointer: the incoming pointer is read
+    /// by the `BLR` and never again. The call's clobber of X0 takes effect
+    /// after that read, so the target may stay in X0 (both allocators, and
+    /// the always-on validator inside `allocate` accepts it). Negative
+    /// control: a target read again after the call is live across it and
+    /// must not sit in any register the call clobbers.
+    #[test]
+    fn a_call_target_that_dies_at_its_blr_may_use_a_caller_saved_register() {
+        use trust_cg_ir::inst::AArch64Opcode;
+        fn inst(opcode: AArch64Opcode, defs: Vec<MachOperand>, uses: Vec<MachOperand>) -> MachInst {
+            MachInst {
+                opcode: opcode as u16,
+                defs,
+                uses,
+                implicit_defs: Vec::new(),
+                implicit_uses: Vec::new(),
+                flags: opcode.default_flags(),
+                tied_operands: vec![],
+            }
+        }
+        let build = |reuse_after_call: bool| {
+            let v0 = VReg::new(0, RegClass::Gpr64);
+            let mut entry = inst(
+                AArch64Opcode::Copy,
+                vec![MachOperand::VReg(v0)],
+                vec![MachOperand::PReg(trust_cg_ir::regs::X0)],
+            );
+            entry.opcode = phi_elim::IR_COPY_OPCODE;
+            let mut call = inst(AArch64Opcode::Blr, vec![], vec![MachOperand::VReg(v0)]);
+            call.implicit_defs = aarch64_caller_saved_regs().into_iter().collect();
+            let mut insts = vec![entry, call];
+            if reuse_after_call {
+                let mut ret_copy = inst(
+                    AArch64Opcode::Copy,
+                    vec![MachOperand::PReg(trust_cg_ir::regs::X0)],
+                    vec![MachOperand::VReg(v0)],
+                );
+                ret_copy.opcode = phi_elim::IR_COPY_OPCODE;
+                insts.push(ret_copy);
+            }
+            let mut ret = inst(AArch64Opcode::Ret, vec![], vec![]);
+            if reuse_after_call {
+                ret.implicit_uses = vec![trust_cg_ir::regs::X0];
+            }
+            insts.push(ret);
+            let ids: Vec<InstId> = (0..insts.len() as u32).map(InstId).collect();
+            MachFunction {
+                name: "call_once_fn".into(),
+                insts,
+                blocks: vec![MachBlock {
+                    insts: ids,
+                    preds: Vec::new(),
+                    succs: Vec::new(),
+                    loop_depth: 0,
+                }],
+                block_order: vec![BlockId(0)],
+                entry_block: BlockId(0),
+                next_vreg: 1,
+                next_stack_slot: 0,
+                stack_slots: BTreeMap::new(),
+            }
+        };
+        let caller_saved = aarch64_caller_saved_regs();
+        for config in [
+            AllocConfig::default_aarch64(),
+            AllocConfig::greedy_aarch64(),
+        ] {
+            let mut func = build(false);
+            let result = allocate(&mut func, &config).expect("allocation validates");
+            let preg = result.allocation[&VReg::new(0, RegClass::Gpr64)];
+            assert_eq!(preg, trust_cg_ir::regs::X0, "{:?}", config.strategy);
+
+            let mut func = build(true);
+            let result = allocate(&mut func, &config).expect("allocation validates");
+            if let Some(preg) = result.allocation.get(&VReg::new(0, RegClass::Gpr64)) {
+                assert!(
+                    !caller_saved
+                        .iter()
+                        .any(|p| greedy::allocator_pregs_overlap(*p, *preg)),
+                    "{:?}: a target live after the call got {preg:?}",
+                    config.strategy
+                );
+            }
+        }
+    }
+
+    /// The dying-call-operand carve-out reads the opcode as a raw discriminant,
+    /// which the x86-64 enumeration reuses: an instruction carrying the `BLR`
+    /// value but clobbering x86-64 registers is never taken for a `BLR`.
+    #[test]
+    fn blr_carve_out_is_aarch64_only() {
+        use trust_cg_ir::inst::AArch64Opcode;
+        let call = |implicit_defs: Vec<PReg>| MachInst {
+            opcode: AArch64Opcode::Blr as u16,
+            defs: Vec::new(),
+            uses: vec![MachOperand::VReg(VReg::new(0, RegClass::Gpr64))],
+            implicit_defs,
+            implicit_uses: Vec::new(),
+            flags: InstFlags::IS_CALL,
+            tied_operands: vec![],
+        };
+        assert!(is_aarch64_blr_call(&call(
+            aarch64_caller_saved_regs().into_iter().collect()
+        )));
+        assert!(is_aarch64_blr_call(&call(Vec::new())));
+        assert!(!is_aarch64_blr_call(&call(vec![PReg::new(512)])));
+        let mut not_a_call = call(Vec::new());
+        not_a_call.flags = InstFlags::default();
+        assert!(!is_aarch64_blr_call(&not_a_call));
+        let mut with_def = call(Vec::new());
+        with_def.defs = vec![MachOperand::VReg(VReg::new(1, RegClass::Gpr64))];
+        assert!(!is_aarch64_blr_call(&with_def));
+    }
+
+    #[test]
+    fn id_boundary_arg_split_exhaustion_preserves_function() {
+        let mut func = make_leaf_guard_regalloc_func();
+        func.next_vreg = u32::MAX;
+        let before = format!("{func:?}");
+        assert!(!apply_arg_split_at_save_block(
+            &mut func,
+            BlockId(1),
+            VReg::new(0, RegClass::Gpr64),
+        ));
+        assert_eq!(format!("{func:?}"), before);
     }
 
     #[test]
@@ -3677,6 +3947,37 @@ mod tests {
         };
         let result = allocate(&mut func, &config).expect("allocation failed");
         assert!(result.spills.is_empty());
+    }
+
+    #[test]
+    fn slot_boundary_pipeline_propagates_spill_exhaustion_in_both_lanes() {
+        for strategy in [AllocStrategy::LinearScan, AllocStrategy::Greedy] {
+            for enable_spill_code in [false, true] {
+                for enable_remat in [false, true] {
+                    let mut func = make_straight_line(4);
+                    func.next_stack_slot = u32::MAX - 1;
+                    let mut config = fixed_def_config(strategy, vec![PReg::new(0)]);
+                    config.enable_splitting = false;
+                    config.enable_spill_code = enable_spill_code;
+                    config.enable_remat = enable_remat;
+                    assert!(
+                        matches!(
+                            allocate(&mut func, &config),
+                            Err(AllocError::StackSlotExhausted)
+                        ),
+                        "{strategy:?}, pseudos={enable_spill_code}, remat={enable_remat}"
+                    );
+                    // Earlier pipeline phases may mutate IR. This guarantee is
+                    // scoped to phase 6's slot allocation, not global rollback.
+                    assert!(func.stack_slots.is_empty());
+                    assert_eq!(func.next_stack_slot, u32::MAX - 1);
+                    assert!(!func.insts.iter().any(|inst| matches!(
+                        inst.opcode,
+                        spill::PSEUDO_SPILL_LOAD | spill::PSEUDO_SPILL_STORE
+                    )));
+                }
+            }
+        }
     }
 
     #[test]

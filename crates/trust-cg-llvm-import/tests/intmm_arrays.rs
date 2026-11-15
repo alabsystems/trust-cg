@@ -73,50 +73,44 @@ fn intmm_globals_are_flattened_to_bytes() {
     let src = r#"
 %struct.Pair = type { i32, float }
 
-@seed = common global i64 0, align 8
-@ima = common global [41 x [41 x i32]] zeroinitializer, align 4
+@seed = dso_local global i64 0, align 8
+@ima = dso_local global [41 x [41 x i32]] zeroinitializer, align 4
 @flt = internal global [2 x [3 x float]] zeroinitializer, align 4
 @pairs = internal global [4 x %struct.Pair] zeroinitializer, align 4
 "#;
     let module = import_text(src, "intmm_arrays").expect("import fixed array globals");
     assert_eq!(module.globals.len(), 4);
 
+    // A scalar stays scalar; only the aggregates are flattened to bytes.
     let seed = &module.globals[0];
     assert_eq!(seed.name, "seed");
-    assert_eq!(seed.ty, Ty::Ptr);
-    let Some(Constant::Aggregate(seed_bytes)) = &seed.initializer else {
-        panic!("expected flattened byte aggregate for @seed");
-    };
-    assert_eq!(seed_bytes.len(), 8);
-    assert!(seed_bytes.iter().all(|byte| *byte == Constant::Int(0)));
+    assert_eq!(seed.ty, Ty::I64);
+    assert_eq!(seed.initializer, Some(Constant::Int(0)));
 
+    // The aggregates are byte images in their canonical storage type, a
+    // `[u8; N]` (an all-zero one spelled as its splat).
+    let image = |index: usize| {
+        let global = &module.globals[index];
+        let initializer = global.initializer.as_ref().expect("an initialized global");
+        trust_cg_lower::global_image::flat_image_elements(&module, &global.ty, initializer)
+            .unwrap_or_else(|| panic!("{}: not a data image", global.name))
+    };
     let ima = &module.globals[1];
     assert_eq!(ima.name, "ima");
-    assert_eq!(ima.ty, Ty::Ptr);
+    assert!(matches!(ima.ty, Ty::Array(_, len) if len == 41 * 41 * 4));
     assert!(ima.mutable);
-    let Some(Constant::Aggregate(ima_bytes)) = &ima.initializer else {
-        panic!("expected flattened byte aggregate for @ima");
-    };
+    let ima_bytes = image(1);
     assert_eq!(ima_bytes.len(), 41 * 41 * 4);
     assert!(ima_bytes.iter().all(|byte| *byte == Constant::Int(0)));
 
-    let flt = &module.globals[2];
-    let Some(Constant::Aggregate(flt_bytes)) = &flt.initializer else {
-        panic!("expected flattened byte aggregate for @flt");
-    };
-    assert_eq!(flt_bytes.len(), 2 * 3 * 4);
-
-    let pairs = &module.globals[3];
-    let Some(Constant::Aggregate(pair_bytes)) = &pairs.initializer else {
-        panic!("expected flattened byte aggregate for @pairs");
-    };
-    assert_eq!(pair_bytes.len(), 4 * 8);
+    assert_eq!(image(2).len(), 2 * 3 * 4);
+    assert_eq!(image(3).len(), 4 * 8);
 }
 
 #[test]
 fn intmm_matrix_geps_use_byte_offsets_not_copy_fallback() {
     let src = r#"
-@imr = common global [41 x [41 x i32]] zeroinitializer, align 4
+@imr = dso_local global [41 x [41 x i32]] zeroinitializer, align 4
 
 define ptr @global_row(i64 %row) {
 entry:

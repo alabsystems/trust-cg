@@ -16,7 +16,7 @@
 //! lowering, optimization, encoding, and whole-function paths. Coverage and
 //! evidence strength vary by obligation: small domains can be exhaustive,
 //! wider evaluator runs are statistical, and supported obligations can be sent
-//! to an external ay/Z3-compatible SMT solver.
+//! to AY, the sole SMT solver, with independent Alethe checking by Clean.
 //!
 //! # Architecture
 //!
@@ -38,7 +38,7 @@
 //! |-------|-----------|----------|-----------|
 //! | **Exhaustive** | <= 8 (with <= 2 inputs) | All 2^(w*n) input combinations | Complete for that width |
 //! | **Statistical** | > 8 (32-bit, 64-bit) | Edge cases + 100K random samples | Probabilistic, not formal |
-//! | **Formal** | Supported represented obligation | AY SMT solver | Mathematical proof when the solver returns `Verified` |
+//! | **Formal** | Supported represented obligation | AY + Clean | AY's proof independently accepted by Clean |
 //!
 //! ## Current status
 //!
@@ -52,23 +52,27 @@
 //! **not a formal proof**. Structured or adversarial bugs could theoretically
 //! hide in the untested ~2^64 input space.
 //!
-//! The default Cargo feature set runs the evaluator lane. v0.1.0 does not
-//! expose a native-AY Cargo feature.
+//! The evaluator APIs are always available. Solver-backed verification uses
+//! the external AY bridge and needs no native-AY Cargo feature.
 //!
 //! ## Formal verification (ay)
 //!
-//! Two verification backends are available in v0.1.0:
+//! Two verification backends are available:
 //!
 //! 1. **Evaluation testing** (always available): fast, catches
 //!    regressions, exhaustive for 8-bit, statistical for 32/64-bit. This is
 //!    the baseline API path and requires no external solver.
 //! 2. **AY CLI** via [`ay_bridge`]: serialize proof obligations to
 //!    SMT-LIB2 format with [`lowering_proof::ProofObligation::to_smt2`],
-//!    pipe them to the external AY solver for formal discharge. A supported
-//!    obligation is formally proved only when the solver returns `Verified`;
+//!    pipe them to AY for formal discharge. A supported obligation is formally
+//!    proved only when independent Clean checking promotes it to `Verified`;
 //!    timeouts, `unknown`, and unsupported translations are not proofs. The
-//!    subprocess lane is available without a Cargo feature when a compatible
-//!    solver binary is on `PATH`.
+//!    subprocess lane admits only the AY executable bytes recorded from the
+//!    building Trust toolchain. Clean is selected from the owning toolchain,
+//!    then aterm's managed package, or an explicit development override; each
+//!    candidate is capability-probed and its executable identity is bound to
+//!    replay. The bridge needs no additional Cargo feature or sibling source
+//!    checkout.
 //!
 //! The native-AY experiment was retired: solver-backed verification has one
 //! maintained path through the canonical external AY binary.
@@ -107,22 +111,64 @@
 // `use rayon::prelude::*` is staged but not yet enabled).
 use rayon as _;
 
+pub mod aarch64_add_sub_immediate;
+pub mod aarch64_affine_lowering;
+pub mod aarch64_atomic_effect;
+pub mod aarch64_atomic_forms;
 pub mod aarch64_backend_proof_report;
+pub mod aarch64_conditional_frame;
+pub mod aarch64_control_decode;
+pub mod aarch64_crc32_proofs;
+pub mod aarch64_csel_semantics;
 pub mod aarch64_eh_coverage_proofs;
 pub mod aarch64_eh_lsda_proofs;
 pub mod aarch64_elf_reloc_proofs;
 pub mod aarch64_elf_tls_reloc_proofs;
+pub mod aarch64_fcvt_half;
+pub mod aarch64_flag_consumer_proofs;
+pub mod aarch64_instruction_word_proofs;
+pub mod aarch64_jump_table_address;
 pub mod aarch64_jumptable_proofs;
 pub mod aarch64_macho_call_reloc_proofs;
 pub mod aarch64_macho_data_reloc_proofs;
 pub mod aarch64_macho_tlvp_reloc_proofs;
+pub mod aarch64_memory_effect;
+pub mod aarch64_memory_order;
+pub mod aarch64_memory_source_binding;
+pub mod aarch64_neon_lane_effect;
+pub mod aarch64_neon_structure_forms;
+pub mod aarch64_pair_memory;
+pub mod aarch64_pair_memory_forms;
+pub mod aarch64_pair_memory_proofs;
+#[cfg(test)]
+pub(crate) mod aarch64_saved_pair;
+pub mod aarch64_scalar_memory_proofs;
+pub mod aarch64_select_proofs;
 pub mod aarch64_semantics;
+pub mod aarch64_source_condition;
+pub mod aarch64_stack_limit;
+pub mod aarch64_static_frame;
+pub mod aarch64_subs_imm_proofs;
+pub mod aarch64_switch_binding;
 pub mod aarch64_tlv_thunk_proofs;
-pub mod action_equiv;
+pub mod aarch64_trap_expansion;
+pub mod aarch64_trap_guard;
+pub mod aarch64_value_decode_proofs;
+// Test-only harness: nothing in the product consumes its verdict. Its unit
+// tests check the adapter's WS3.20 bit-intrinsic expansions against the
+// trust-ir interpreter host-independently.
+#[cfg(test)]
+mod action_equiv;
 pub mod addr_mode_proofs;
-pub mod ane_semantics;
+pub mod array_row_lowering;
+mod aterm_toolchain;
 pub mod atomic_proofs;
 pub mod ay_bridge;
+pub mod ay_identity;
+mod ay_identity_banner;
+pub mod bitserial_decide;
+pub mod bound_memory_authority;
+pub mod bound_memory_row_credit;
 pub mod bridge_coverage;
 pub mod call_lowering_proofs;
 pub mod canary_cert;
@@ -132,20 +178,32 @@ pub mod cegis_cache_codec;
 pub mod cegis_cache_io;
 pub mod cegis_pass;
 pub mod cegis_pass_x86;
+pub mod cert_replay_prefetch;
 pub mod certified_pass_chain;
 pub mod certified_pass_checker;
 pub mod cfg_proofs;
+pub mod checked_mul_i128_proofs;
 pub mod checked_overflow_proofs;
 pub mod cmp_combine_proofs;
+pub mod composed_transition;
 pub mod const_fold_proofs;
 pub mod const_materialize_proofs;
+#[cfg(feature = "core-byte-replay")]
+pub mod core_byte_store;
+#[cfg(feature = "source-defined-call")]
+pub mod core_defined_call_entry;
 pub mod coroutine_frame_proofs;
 pub mod coverage_gate;
 pub mod cse_licm_proofs;
 pub mod dataflow_integrity;
 pub mod definite_init;
+pub mod derived_operator_lowering;
 pub mod diag;
+mod subprocess;
+#[cfg(test)]
+mod toolchain_overlay_manifest;
 pub use trust_cg_process_env as env_lock;
+pub mod eh_obligations;
 pub mod elf_call_reloc_proofs;
 pub mod elf_data_reloc_proofs;
 pub mod ext_trunc_proofs;
@@ -154,19 +212,37 @@ pub mod field_copy_faithfulness;
 #[cfg(test)]
 mod formal_gap;
 pub mod fp_bitmodel;
+pub mod fp_bv_lowering;
 pub mod fp_convert_proofs;
+pub mod fp_ieee_evidence;
 pub mod frame_proofs;
 pub mod fsym_arith;
 pub mod fsym_bounds;
+pub mod fsym_layout;
 pub mod fsym_null;
 pub mod fsym_summary;
 pub mod fsym_trust_ir;
 pub mod fsym_uaf;
+pub mod fsym_ub_map;
+mod function_request;
+mod function_source;
+pub use function_source::{FunctionSourceModules, SourceModuleHasNoWireImage};
 pub mod function_verifier;
+pub use function_request::{
+    CapturedFunctionVerificationReport, CheckedAarch64StructuralReturn,
+    FunctionVerificationRequest, SourceBoundArithmeticObligation, SourceBoundObligationKind,
+};
+mod closed_definition_alethe;
+mod conjunctive_obligations;
 pub mod gap_classify;
+pub mod gf2_affine_decide;
 pub mod gpu_semantics;
 pub mod gvn_proofs;
+pub mod ieee754_reference;
 pub mod if_convert_proofs;
+#[cfg(test)]
+#[path = "../../test_support/legacy_module_capture.rs"]
+mod legacy_module_capture;
 pub mod loop_backedge_symexec;
 pub mod loop_opt_proofs;
 pub mod lowering_proof;
@@ -190,11 +266,16 @@ pub mod post_ra_captured_spec;
 pub mod post_ra_dataflow;
 pub mod post_ra_reaching_def;
 pub mod post_ra_spill_slots;
+pub mod post_ra_value_flow;
 pub mod post_regalloc_recheck;
+pub mod process_cost;
 pub mod proof_certificate;
 pub mod proof_database;
 pub mod proof_gate;
+pub mod proof_tool_record;
 pub mod provenance_xcheck;
+pub mod read_only_replay;
+pub mod read_only_target;
 pub mod reduction_split_proofs;
 pub mod regalloc_proofs;
 pub mod resource_limits;
@@ -205,29 +286,54 @@ pub mod riscv_lowering_proofs;
 pub mod riscv_semantics;
 pub mod rule_discovery;
 pub mod sat_blast;
+mod scalar_memory_definitions;
+mod scalar_memory_relations;
 pub mod scheduler_proofs;
 pub mod smt;
 pub mod smt_bv_batch;
+mod smt_map;
+mod smt_raw_print;
+pub mod source_bound_a64_body;
+pub(crate) mod source_bound_a64_control;
+pub(crate) mod source_bound_alu;
+pub(crate) mod source_bound_body;
+pub(crate) mod source_bound_constant;
+pub mod source_bound_defined_call;
+pub mod source_bound_frame;
+pub(crate) mod source_bound_negative_memo;
+pub(crate) mod source_bound_replay;
+pub(crate) mod source_bound_source;
+mod split_conjunct_proof;
 pub mod ssa_loop_complete;
 pub mod strength_reduce_proofs;
 pub mod switch_proofs;
 pub mod synthesis;
-#[cfg(feature = "trust-types-bridge")]
-pub mod transval_compat;
+pub mod trust_ir_bv;
+pub mod trust_ir_mid_tv;
 pub mod trust_ir_semantics;
-pub mod unified_synthesis;
 pub mod vectorization_proofs;
 pub mod verdict_db;
+pub(crate) mod verification_authority;
 pub mod verification_runner;
+#[cfg(test)]
+mod verifier_source_digest;
 pub mod verify;
+pub mod volatile_access_preservation;
 pub mod wasm_abi_proofs;
+pub mod wasm_body_fold;
+pub mod wasm_bulk_memory_proofs;
 pub mod wasm_cfg_proofs;
 pub mod wasm_encoding_proofs;
+pub mod wasm_float_binop_proofs;
 #[cfg(test)]
 mod wasm_formal;
 pub mod wasm_function_verifier;
+pub mod wasm_internal_abi;
+pub mod wasm_local_tv;
 pub mod wasm_lowering_proofs;
+pub mod wasm_memarg_offset_proofs;
 pub mod wasm_memory_proofs;
+pub mod wasm_nowrap_premise;
 pub mod wasm_semantics;
 pub mod wasm_value_domain;
 pub mod x86_64_eflags;
@@ -235,13 +341,22 @@ pub mod x86_64_eflags_proofs;
 pub mod x86_64_function_verifier;
 pub mod x86_64_lowering_proofs;
 pub mod x86_64_semantics;
+pub mod x86_addressing_proofs;
+pub mod x86_encoding_proofs;
+pub mod x86_movsxd_sib_proofs;
+pub mod x86_source_bound_body;
+pub mod x86_source_bound_envelope;
+pub mod x86_source_operand_binding;
+pub mod x86_sse_lane_proofs;
+pub mod x86_volatile_trace;
 
 pub use ay_bridge::{
     AYCategoryBreakdown, AYConfig, AYResult, BOUNDED_QUANTIFIER_EXPANSION_LIMIT,
     ProofDatabaseAYReport, encode_obligation_as_chc, expand_bounded_quantifiers,
-    expand_bounded_quantifiers_with_limit, generate_smt2_query, has_quantifiers, parse_ay_output,
-    prepare_formula_for_smt, serialize_to_smt2, solver_info, verify_proof_database_with_ay,
-    verify_with_ay, verify_with_ay_cli, verify_with_cli, z3_available,
+    expand_bounded_quantifiers_with_limit, generate_smt2_query, has_quantifiers,
+    jit_verification_authority_id_if_ready, parse_ay_output, prepare_formula_for_smt,
+    serialize_to_smt2, solver_info, verify_proof_database_with_ay, verify_with_ay,
+    verify_with_ay_cli, verify_with_cli, z3_available,
 };
 pub use cegis::{CegisLoop, CegisResult, ConcreteInput};
 pub use cegis_cache_codec::CacheCodecError;
@@ -267,13 +382,14 @@ pub use failed_proof_reducer::{
     classify_failed_admission_record, missing_product_gates,
 };
 pub use function_verifier::{
-    FunctionVerificationReport, FunctionVerifier, InstructionOpcode, InstructionReport,
-    InstructionVerificationResult, reconstruct_alu_obligation, verify_function,
+    FunctionVerificationPreconditionFailure, FunctionVerificationReport, FunctionVerifier,
+    InstructionOpcode, InstructionReport, InstructionVerificationResult,
+    reconstruct_alu_obligation, verify_function,
 };
 pub use lowering_proof::{
     DEFAULT_SAMPLE_COUNT, EXHAUSTIVE_WIDTH_THRESHOLD, MachineSideProvenance, ProofObligation,
-    TransvalCheckKind, VerificationConfig, verify_by_evaluation, verify_by_evaluation_with_config,
-    verify_fp_by_evaluation,
+    ProofReplayPolicy, TransvalCheckKind, VerificationConfig, verify_by_evaluation,
+    verify_by_evaluation_with_config, verify_fp_by_evaluation,
 };
 pub use object_inventory::{
     ObjectContainer, ObjectProofBinding, ObjectRelocationInventoryReport, ObjectRelocationKind,
@@ -335,7 +451,32 @@ pub use wasm_function_verifier::{
     representative_reconstructable_inst as representative_wasm_reconstructable_inst,
 };
 pub use x86_64_function_verifier::{
-    X86FunctionVerifier, reconstruct_alu_obligation as reconstruct_x86_alu_obligation,
+    CmpxchgNarrowPrestate, X86FunctionVerifier,
+    reconstruct_alu_obligation as reconstruct_x86_alu_obligation,
     representative_reconstructable_inst as representative_x86_reconstructable_inst,
-    verify_x86_64_function,
+    verify_x86_64_function, x86_cmpxchg_narrow_prestate, x86_cmpxchg_narrow_sides,
 };
+pub use x86_source_bound_body::{X86ModuleDefinitions, X86SourceBoundAbi};
+
+/// The codegen license the crate's unit tests compile their hand-built
+/// fixtures under. Those fixtures carry no codegen license (`body_gate:
+/// None`), which trust-cg REFUSES by default (roadmap WS7.5, decision gate
+/// DG-73), so they state `Permit` explicitly: none of them passes (or is
+/// refused) because the license silently refused it. Declared under a plain
+/// `#[cfg(test)]`, so the production `Permit` census never counts it.
+#[cfg(test)]
+pub(crate) mod license_test_support {
+    /// The default policy with claim-less bodies permitted.
+    pub(crate) fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+        trust_cg_lower::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+    }
+}
+
+// Original-goal construction and retained checked mathematical evidence.
+#[cfg(feature = "original-i128-cic")]
+pub mod i128_cic_artifact;
+#[cfg(feature = "original-i128-cic")]
+pub mod i128_cic_certificate;
+#[cfg(feature = "original-i128-cic")]
+pub mod i128_cic_reflection;

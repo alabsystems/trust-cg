@@ -251,7 +251,7 @@ def compile_obj(tcg, tir, o, wd, tag, disable_find=False):
     if disable_find:
         env["TRUST_CG_DISABLE_PASSES"] = "neon_find"
     r = subprocess.run(
-        [tcg, "--format=text", "--target", "aarch64", f"-{o}", "-c", tir, "-o", obj],
+        [tcg, "--format=text", "--permit-unlicensed", "--target", "aarch64", f"-{o}", "-c", tir, "-o", obj],
         capture_output=True, text=True, env=env)
     if r.returncode != 0:
         return None, (r.stderr or r.stdout).strip().splitlines()[-1:] or ['?']

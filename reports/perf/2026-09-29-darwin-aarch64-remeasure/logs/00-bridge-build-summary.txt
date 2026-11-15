@@ -1,0 +1,29 @@
+# bridge build: commands/build_bridge.sh <checkout> <trust 9192> (Compiling/Downloaded/fetch lines removed; 91 crates compiled)
+2026-09-29T09:13:27Z
+ 2:13  up 27 days,  6:26, 1 user, load averages: 8.74 8.92 9.49
+warning: nested explicit-unverified Targo propagation is unavailable on this platform; the outer explicit command remains authorized, but recursive `$CARGO` invocations must select their own lane
+warning: UNVERIFIED: `targo build` was explicitly authorized with Trust verification disabled; this run emits no proof claim
+note: compiled WITHOUT Trust verification — 0 obligations checked
+
+    Finished `release` profile [optimized] target(s) in 5m 25s
+      326.16 real       652.80 user        15.08 sys
+          6499876864  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             4546022  page reclaims
+               40755  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                  16  messages sent
+                  39  messages received
+                 275  signals received
+                7689  voluntary context switches
+              729673  involuntary context switches
+         18272743136  instructions retired
+          6971552733  cycles elapsed
+            88949408  peak memory footprint
+2026-09-29T09:18:53Z
+ 2:18  up 27 days,  6:32, 1 user, load averages: 13.15 12.52 11.10
+exit=0

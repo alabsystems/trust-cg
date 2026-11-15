@@ -68,7 +68,7 @@
 
 use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, VReg};
 
-use crate::effects::aarch64_def_operand_positions;
+use crate::effects::{aarch64_def_operand_positions, kills_nzcv, nzcv_unknown, reads_nzcv};
 use crate::pass_manager::MachinePass;
 use crate::reaching_const::{unique_reaching_const, unique_reaching_def};
 
@@ -81,13 +81,6 @@ const CC_GE: i64 = 10;
 /// Copy-following depth for the entry-constant resolution: `MovR iv, t` on top
 /// of the `Movz`/`Movk` chain (scalar-unroll's tail writeback) plus slack.
 const MAX_COPY_DEPTH: u32 = 4;
-
-/// Dev trace hook (`TRUST_CG_TRACE_RESIDCOLLAPSE`).
-fn trace(msg: &str) {
-    if std::env::var_os("TRUST_CG_TRACE_RESIDCOLLAPSE").is_some() {
-        eprintln!("[residcollapse] {msg}");
-    }
-}
 
 /// Single-trip residual-loop collapse pass.
 pub struct ResidTripCollapse;
@@ -308,9 +301,6 @@ fn try_block(func: &MachFunction, header: BlockId) -> Option<Plan> {
         return None;
     }
 
-    trace(&format!(
-        "hdr {header:?}: collapse (iv const {c}, step {step}, rhs {rhs_const}, cc {cc}) -> {exit:?}"
-    ));
     Some(Plan {
         header,
         exit,
@@ -462,9 +452,11 @@ fn commit(func: &mut MachFunction, plan: &Plan) {
 }
 
 /// True iff the NZCV flags are dead on entry to `start`: every path from
-/// `start` hits a flags-writing instruction before any flags-reading one.
-/// Conservative: an unknown opcode neither reads nor writes per the audited
-/// tables, so a path that ends (Ret/no succs) without a reader is dead.
+/// `start` hits a definite kill (a flag writer, or a call) before any reader
+/// (`effects::reads_nzcv`, which includes `B.cond`/`Bcc`: cmp-branch-fusion's
+/// cross-block compare elimination makes blocks that branch on their
+/// predecessor's flags) or any pseudo with an unknown expansion. A path that
+/// ends (Ret/no succs) without a reader is dead.
 fn flags_dead_from(func: &MachFunction, start: BlockId) -> bool {
     let mut visited: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
     let mut work = vec![start];
@@ -474,11 +466,11 @@ fn flags_dead_from(func: &MachFunction, start: BlockId) -> bool {
         }
         let mut killed = false;
         for &id in &func.block(b).insts {
-            let op = func.inst(id).opcode;
-            if crate::effects::reads_flags(op) {
-                return false; // a live reader — keep the compare
+            let inst = func.inst(id);
+            if reads_nzcv(inst) || nzcv_unknown(inst) {
+                return false; // a live (or possible) reader — keep the compare
             }
-            if crate::effects::writes_flags(op) {
+            if kills_nzcv(inst) {
                 killed = true;
                 break;
             }

@@ -27,11 +27,133 @@ fn count(func: &MachFunction, op: AArch64Opcode) -> usize {
         .count()
 }
 
+fn count_opcode_imm(
+    func: &MachFunction,
+    op: AArch64Opcode,
+    operand_index: usize,
+    immediate: i64,
+) -> usize {
+    func.blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter().copied())
+        .filter(|&id| {
+            let inst = func.inst(id);
+            inst.opcode == op
+                && inst
+                    .operands
+                    .get(operand_index)
+                    .and_then(trust_cg_ir::MachOperand::as_imm)
+                    == Some(immediate)
+        })
+        .count()
+}
+
+fn count_movi_imm(func: &MachFunction, immediate: i64) -> usize {
+    count_opcode_imm(func, AArch64Opcode::NeonMovi, 1, immediate)
+}
+
+/// Assert the exact mandatory-NEON replacement for `folds` UDOT operations.
+/// Each byte stream must first use arrangement 1 (`.16B -> .8H`), then
+/// arrangement 3 (`.8H -> .4S`); aggregate opcode counts alone would not catch
+/// an accidentally duplicated arrangement.
+fn assert_baseline_folds(func: &MachFunction, folds: usize) {
+    assert_eq!(
+        count(func, AArch64Opcode::NeonUdotV),
+        0,
+        "baseline target must not emit FEAT_DotProd UDOT"
+    );
+    assert_eq!(
+        count_opcode_imm(func, AArch64Opcode::NeonUaddlpV, 2, ARR_B16),
+        folds,
+        "one .16B -> .8H UADDLP per byte stream"
+    );
+    assert_eq!(
+        count_opcode_imm(func, AArch64Opcode::NeonUaddlpV, 2, ARR_H8),
+        folds,
+        "one .8H -> .4S UADDLP per byte stream"
+    );
+    assert_eq!(
+        count(func, AArch64Opcode::NeonUaddlpV),
+        2 * folds,
+        "no missing or unexpected UADDLP arrangement"
+    );
+}
+
 /// Existing transform-shape tests model an AArch64 target with FEAT_DotProd.
 /// Keep that target assumption explicit while production constructors stay
 /// fail-closed.
 fn dotprod_pass() -> NeonBytesumPass {
     NeonBytesumPass::new().with_aarch64_dotprod(true)
+}
+
+#[test]
+fn every_prepared_kernel_carries_exactly_its_required_fold_constants() {
+    for dotprod in [false, true] {
+        for (mut function, folds, predicate) in [
+            (build_bytesum_loop(Body::Popcount, 1024), 4, false),
+            (build_bytesum_loop(Body::Sum, 1024), 8, false),
+            (build_countif_loop(1, false, false, 1024), 4, true),
+            (build_maskcmp_loop(0xC0, 0x80, true, 1024, false), 4, true),
+            (build_stencil_loop(true, 1, 1024, 1), 3, true),
+            (build_hexnibble_loop(Hex::Fires, 1024), 20, false),
+        ] {
+            assert!(
+                NeonBytesumPass::new()
+                    .with_aarch64_dotprod(dotprod)
+                    .run(&mut function)
+            );
+            assert_eq!(
+                count_movi_imm(&function, 1),
+                usize::from(dotprod || predicate),
+                "{}",
+                function.name
+            );
+            if dotprod {
+                assert_eq!(count(&function, AArch64Opcode::NeonUdotV), folds);
+                assert_eq!(count(&function, AArch64Opcode::NeonUaddlpV), 0);
+            } else {
+                assert_baseline_folds(&function, folds);
+            }
+        }
+    }
+}
+
+#[test]
+fn stencil_uses_every_adjacent_load_pair_including_final_lookahead() {
+    for dotprod in [false, true] {
+        for ne in [false, true] {
+            let mut function = build_stencil_loop(ne, 1, 1024, 1);
+            assert!(
+                NeonBytesumPass::new()
+                    .with_aarch64_dotprod(dotprod)
+                    .run(&mut function)
+            );
+            let instructions: Vec<_> = function
+                .blocks
+                .iter()
+                .flat_map(|block| block.insts.iter().map(|id| function.inst(*id)))
+                .collect();
+            let loaded: Vec<_> = instructions
+                .iter()
+                .filter(|inst| inst.opcode == AArch64Opcode::NeonLdpQPost)
+                .flat_map(|inst| [&inst.operands[0], &inst.operands[1]])
+                .collect();
+            let windows: Vec<_> = instructions
+                .iter()
+                .filter(|inst| inst.opcode == AArch64Opcode::NeonExtV)
+                .map(|inst| (&inst.operands[1], &inst.operands[2]))
+                .collect();
+            assert_eq!(loaded.len(), 4);
+            assert_eq!(
+                windows,
+                loaded
+                    .iter()
+                    .copied()
+                    .zip(loaded.iter().copied().skip(1))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 /// How the reduction body should be built.
@@ -109,13 +231,13 @@ fn build_bytesum_loop(body: Body, n: i64) -> MachFunction {
     // Body: load a[iv], compute the term, reduce, advance.
     match body {
         Body::SignedByte => {
-            push(&mut func, latch, LdrbRO, vec![w(60), x(0), x(53), i(0)]);
+            push(&mut func, latch, LdrbRO, vec![w(60), x(0), x(53), i(6)]);
             push(&mut func, latch, Sxtb, vec![w(61), w(60)]);
             push(&mut func, latch, Sxtw, vec![x(85), w(61)]);
         }
         _ => {
             // LdrbRO zero-extends the byte into a Gpr64.
-            push(&mut func, latch, LdrbRO, vec![x(63), x(0), x(53), i(0)]);
+            push(&mut func, latch, LdrbRO, vec![x(63), x(0), x(53), i(6)]);
         }
     }
     if body == Body::Popcount || body == Body::PopcountStore {
@@ -234,16 +356,25 @@ fn o3_fixpoint_converges_without_regrowth() {
 }
 
 #[test]
-fn default_pass_is_inert_without_dotprod_capability() {
-    let mut func = build_bytesum_loop(Body::Sum, 4096);
-    let insts_before = func.insts.len();
-    let blocks_before = func.blocks.len();
+fn default_pass_uses_baseline_neon_without_dotprod_capability() {
+    let mut func = build_bytesum_loop(Body::Popcount, 4096);
     let mut pass = NeonBytesumPass::new();
-    assert!(!pass.run(&mut func));
-    assert_eq!(pass.fired(), 0);
-    assert_eq!(count(&func, AArch64Opcode::NeonUdotV), 0);
-    assert_eq!(func.insts.len(), insts_before);
-    assert_eq!(func.blocks.len(), blocks_before);
+    assert!(
+        pass.run(&mut func),
+        "generic AArch64 must retain the mandatory-NEON popcount vectorization"
+    );
+    assert_eq!(pass.fired(), 1);
+    assert_baseline_folds(&func, unroll(TermKind::Popcount));
+    assert_eq!(
+        count(&func, AArch64Opcode::NeonCntV),
+        unroll(TermKind::Popcount),
+        "the v3_popcount byte contribution stays vectorized"
+    );
+    assert_eq!(
+        count_movi_imm(&func, 1),
+        0,
+        "baseline popcount does not consume a ones vector"
+    );
 }
 
 #[test]
@@ -333,6 +464,34 @@ fn fires_on_plain_byte_sum_u64() {
         count(&func, AArch64Opcode::NeonUaddlpV),
         0,
         "no UADDLP chain (fused into UDOT)"
+    );
+}
+
+#[test]
+fn baseline_plain_byte_sum_keeps_a_non_divisible_scalar_tail() {
+    let vector_width = width(TermKind::ByteSum);
+    let n = vector_width + 7;
+    assert_eq!(n % vector_width, 7, "test premise: seven-byte tail");
+
+    let mut func = build_bytesum_loop(Body::Sum, n);
+    let mut pass = NeonBytesumPass::new();
+    assert!(pass.run(&mut func), "baseline byte sum should vectorize");
+    assert_eq!(pass.fired(), 1);
+    assert_baseline_folds(&func, unroll(TermKind::ByteSum));
+    assert_eq!(
+        count_movi_imm(&func, 1),
+        0,
+        "baseline byte sum does not consume a ones vector"
+    );
+    assert_eq!(
+        count_opcode_imm(&func, AArch64Opcode::AddRI, 2, vector_width),
+        1,
+        "vector latch advances by one full byte-sum width"
+    );
+    assert_eq!(
+        count(&func, AArch64Opcode::LdrbRO),
+        1,
+        "the original scalar load remains to process the seven-byte tail"
     );
 }
 
@@ -648,6 +807,24 @@ fn fires_on_count_if_eq_zero_u64() {
 }
 
 #[test]
+fn baseline_count_if_uses_widening_folds_and_retains_ones_mask() {
+    let mut func = build_countif_loop(1, false, false, 4096);
+    let mut pass = NeonBytesumPass::new();
+    assert!(pass.run(&mut func), "baseline count-if should vectorize");
+    assert_eq!(pass.fired(), 1);
+
+    let u = unroll(TermKind::PredCountEqZero);
+    assert_baseline_folds(&func, u);
+    assert_eq!(count(&func, AArch64Opcode::NeonCmeqV), u);
+    assert_eq!(count(&func, AArch64Opcode::NeonAndV), u);
+    assert_eq!(
+        count_movi_imm(&func, 1),
+        1,
+        "predicate prefix still needs one all-lanes collapse mask"
+    );
+}
+
+#[test]
 fn bails_on_count_if_ne_zero() {
     // Cbnz increments on the NON-zero arm (`!= 0`) — out of the `== 0` scope.
     let mut func = build_countif_loop(1, true, false, 4096);
@@ -688,7 +865,7 @@ fn bails_on_count_if_runtime_bound() {
     // Rewrite the `Movz v4,#N` to `Uxtw v4, w4` (an opaque, non-constant def).
     for inst in func.insts.iter_mut() {
         if inst.opcode == AArch64Opcode::Movz
-            && vreg_of(&inst.operands[0]) == Some(VReg::new(4, RegClass::Gpr64))
+            && inst.operands[0].as_vreg() == Some(VReg::new(4, RegClass::Gpr64))
         {
             *inst = MachInst::new(
                 AArch64Opcode::Uxtw,
@@ -721,8 +898,8 @@ fn count_if_ones_mask_is_all_lanes() {
         .flat_map(|blk| blk.insts.iter().copied())
         .filter_map(|id| {
             let inst = func.inst(id);
-            (inst.opcode == AArch64Opcode::NeonMovi && imm_of(&inst.operands[1]) == Some(1))
-                .then(|| vreg_of(&inst.operands[0]).unwrap())
+            (inst.opcode == AArch64Opcode::NeonMovi && inst.operands[1].as_imm() == Some(1))
+                .then(|| inst.operands[0].as_vreg().unwrap())
         })
         .collect();
     assert_eq!(ones.len(), 1, "exactly one all-lanes ones mask (MOVI #1)");
@@ -751,7 +928,7 @@ fn count_if_ones_mask_is_all_lanes() {
             func.inst(id)
                 .operands
                 .iter()
-                .any(|o| vreg_of(o) == Some(vone))
+                .any(|o| o.as_vreg() == Some(vone))
         });
     assert!(
         and_reads_vone,
@@ -904,8 +1081,8 @@ fn fires_on_u32_acc_chain_byte_sum() {
         .filter(|&id| {
             let inst = func.inst(id);
             inst.opcode == AArch64Opcode::AddRR
-                && vreg_of(&inst.operands[0]) == Some(acc)
-                && vreg_of(&inst.operands[1]) == Some(acc)
+                && inst.operands[0].as_vreg() == Some(acc)
+                && inst.operands[1].as_vreg() == Some(acc)
         })
         .count();
     assert_eq!(
@@ -920,12 +1097,50 @@ fn fires_on_u32_acc_chain_byte_sum() {
             let inst = func.inst(id);
             inst.opcode == AArch64Opcode::MovR
                 && inst.operands.len() == 2
-                && vreg_of(&inst.operands[0]).is_some_and(|d| d.class == RegClass::Gpr32)
-                && vreg_of(&inst.operands[1]).is_some_and(|s| s.class == RegClass::Gpr64)
+                && inst.operands[0]
+                    .as_vreg()
+                    .is_some_and(|d| d.class == RegClass::Gpr32)
+                && inst.operands[1]
+                    .as_vreg()
+                    .is_some_and(|s| s.class == RegClass::Gpr64)
         });
     assert!(
         trunc,
         "the u64 partial is truncated to u32 (MovR Gpr32 <- Gpr64)"
+    );
+}
+
+#[test]
+fn baseline_u32_acc_chain_uses_widening_folds_without_ones() {
+    let mut func = build_u32_chain_loop(false, 4096);
+    let mut pass = NeonBytesumPass::new();
+    assert!(
+        pass.run(&mut func),
+        "baseline should vectorize the e07 u32-acc chain byte sum"
+    );
+    assert_eq!(pass.fired(), 1);
+    assert_baseline_folds(&func, unroll(TermKind::ByteSum));
+    assert_eq!(
+        count_movi_imm(&func, 1),
+        0,
+        "baseline u32 byte sum does not consume a ones vector"
+    );
+
+    let acc = VReg::new(41, RegClass::Gpr32);
+    let fold_adds = func
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter().copied())
+        .filter(|&id| {
+            let inst = func.inst(id);
+            inst.opcode == AArch64Opcode::AddRR
+                && inst.operands[0].as_vreg() == Some(acc)
+                && inst.operands[1].as_vreg() == Some(acc)
+        })
+        .count();
+    assert_eq!(
+        fold_adds, 1,
+        "baseline vector partial is folded once into the u32 accumulator"
     );
 }
 
@@ -954,7 +1169,7 @@ fn reconstructs_movz_movk_u32_mask() {
     func.append_inst(bb0, id1);
     let def = build_def_map(&func);
     assert_eq!(
-        const_value(&func, &def, VReg::new(64, RegClass::Gpr64)),
+        copied_const(&func, &def, VReg::new(64, RegClass::Gpr64)),
         Some(0xFFFF_FFFF),
         "Movz(0xFFFF)+Movk(0xFFFF,16) == 0xFFFFFFFF"
     );
@@ -1079,7 +1294,7 @@ fn build_maskcmp_loop(mask: i64, cnst: i64, ne: bool, n: i64, acc_u32: bool) -> 
     push(&mut func, guard, B, vec![bl(latch)]);
 
     // Body: LDRB; AND #MASK; UXTB; CMP #CONST; CSET cc; reduce; advance.
-    push(&mut func, latch, LdrbRO, vec![w(60), x(0), x(53), i(0)]);
+    push(&mut func, latch, LdrbRO, vec![w(60), x(0), x(53), i(6)]);
     push(&mut func, latch, AndRI, vec![w(61), w(60), i(mask)]);
     push(&mut func, latch, Uxtb, vec![w(62), w(61)]);
     push(&mut func, latch, CmpRI, vec![w(62), i(cnst)]);
@@ -1150,7 +1365,7 @@ fn fires_on_maskcmp_ne_u64() {
             .flat_map(|b| b.insts.iter().copied())
             .any(|id| {
                 let inst = func.inst(id);
-                inst.opcode == AArch64Opcode::NeonMovi && imm_of(&inst.operands[1]) == Some(imm8)
+                inst.opcode == AArch64Opcode::NeonMovi && inst.operands[1].as_imm() == Some(imm8)
             })
     };
     assert!(has_movi(0xC0), "vmask broadcasts MASK=0xC0");
@@ -1182,6 +1397,37 @@ fn fires_on_maskcmp_eq_u64_no_invert() {
     );
     assert_eq!(count(&func, AArch64Opcode::NeonAndV), 2 * ur);
     assert_eq!(count(&func, AArch64Opcode::NeonUdotV), ur);
+}
+
+#[test]
+fn baseline_maskcmp_eq_and_ne_use_widening_folds() {
+    for ne in [false, true] {
+        let mut func = build_maskcmp_loop(0xC0, 0x80, ne, 1024, false);
+        let mut pass = NeonBytesumPass::new();
+        assert!(
+            pass.run(&mut func),
+            "baseline masked-compare form ne={ne} should vectorize"
+        );
+
+        let u = unroll(TermKind::PredMaskCmp {
+            mask: 0xC0,
+            cnst: 0x80,
+            ne,
+        });
+        assert_baseline_folds(&func, u);
+        assert_eq!(count(&func, AArch64Opcode::NeonCmeqV), u);
+        assert_eq!(count(&func, AArch64Opcode::NeonAndV), 2 * u);
+        assert_eq!(
+            count(&func, AArch64Opcode::NeonNotV),
+            if ne { u } else { 0 },
+            "only the != predicate inverts CMEQ"
+        );
+        assert_eq!(
+            count_movi_imm(&func, 1),
+            1,
+            "predicate prefix still needs one all-lanes collapse mask"
+        );
+    }
 }
 
 #[test]
@@ -1367,12 +1613,39 @@ fn fires_on_stencil_count_runs_ne() {
         let inst = func.inst(*inst);
         if inst.opcode == AArch64Opcode::NeonExtV {
             assert_eq!(
-                imm_of(&inst.operands[3]),
+                inst.operands[3].as_imm(),
                 Some(1),
                 "stencil EXT must be the FORWARD #1 window (proof_neon_extv_16b(1))"
             );
         }
     }
+}
+
+#[test]
+fn baseline_stencil_uses_widening_folds_and_forward_window() {
+    let mut func = build_stencil_loop(true, 1, 1024, 1);
+    let mut pass = NeonBytesumPass::new();
+    assert!(
+        pass.run(&mut func),
+        "baseline byte stencil should vectorize"
+    );
+
+    let u = unroll(TermKind::PredStencilCmp { ne: true });
+    assert_baseline_folds(&func, u);
+    assert_eq!(count(&func, AArch64Opcode::NeonExtV), u);
+    assert_eq!(count(&func, AArch64Opcode::NeonCmeqV), u);
+    assert_eq!(count(&func, AArch64Opcode::NeonNotV), u);
+    assert_eq!(count(&func, AArch64Opcode::NeonAndV), u);
+    assert_eq!(
+        count_movi_imm(&func, 1),
+        1,
+        "stencil predicate still needs one all-lanes collapse mask"
+    );
+    assert_eq!(
+        count_opcode_imm(&func, AArch64Opcode::NeonExtV, 3, 1),
+        u,
+        "every stencil EXT retains the proven forward-window immediate"
+    );
 }
 
 #[test]
@@ -1503,7 +1776,7 @@ fn build_hexnibble_loop(variant: Hex, n: i64) -> MachFunction {
     // Load + nibble split + diamond-1 head (nib(hi)). NOTE: body vregs use ids
     // >= 100 so no id collides with the header/guard/const ids (build_def_map keys
     // on the numeric id, ignoring register class).
-    push(&mut func, load, LdrbRO, vec![w(100), x(0), x(53), i(0)]); // b = a[iv]
+    push(&mut func, load, LdrbRO, vec![w(100), x(0), x(53), i(6)]); // b = a[iv]
     push(&mut func, load, Uxtb, vec![w(101), w(100)]);
     push(&mut func, load, LsrRI, vec![w(102), w(101), i(4)]); // hi = b >> 4
     push(&mut func, load, AndRI, vec![w(103), w(101), i(15)]); // lo = b & 15
@@ -1611,6 +1884,33 @@ fn fires_on_hex_nibble_sum() {
 }
 
 #[test]
+fn baseline_hex_nibble_sum_uses_widening_folds() {
+    let mut func = build_hexnibble_loop(Hex::Fires, 1024);
+    let mut pass = NeonBytesumPass::new();
+    assert!(
+        pass.run(&mut func),
+        "baseline AArch64 should vectorize hex sum"
+    );
+
+    let u = unroll(TermKind::HexNibbleSum);
+    assert_baseline_folds(&func, 5 * u);
+    assert!(
+        count(&func, AArch64Opcode::NeonAddV) >= 5 * u,
+        "every widened contribution is accumulated with ADD.4S"
+    );
+    assert_eq!(
+        count_movi_imm(&func, 1),
+        0,
+        "baseline hex folds do not consume a ones vector"
+    );
+    assert_eq!(
+        count(&func, AArch64Opcode::NeonMovi),
+        u + 4,
+        "zeroed accumulators plus the four hex constants"
+    );
+}
+
+#[test]
 fn bails_on_hex_nibble_wrong_const() {
     // The `>= 10` arm selects 88 (not 87) — an inexact hex map must BAIL.
     let mut func = build_hexnibble_loop(Hex::WrongConst, 1024);
@@ -1654,4 +1954,113 @@ fn bails_on_hex_nibble_below_width_floor() {
         "N=48 below the width floor must stay scalar"
     );
     assert_eq!(count(&func, AArch64Opcode::NeonUdotV), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the vector loop reproduces only
+// `iv` and `acc`, so any other carried or live-out register must refuse.
+// ---------------------------------------------------------------------------
+
+fn iv47() -> VReg {
+    VReg::new(47, RegClass::Gpr64)
+}
+
+/// The p09 sieve shape: `if a[i] == 0 { count += 1; sum += i }`. The vector
+/// loop advanced `iv` past the skipped iterations and updated only `count`, so
+/// every `sum += i` of the vector prefix was lost (p09 exited 192, oracle 198).
+#[test]
+fn bails_when_countif_arm_updates_a_second_register() {
+    let mut func = build_countif_loop(1, false, false, 4096);
+    // `sum = sum + iv` in the `+1` arm, carried through the latch, read at the
+    // exit.
+    let inc = BlockId(4);
+    let latch = BlockId(6);
+    let exit = BlockId(7);
+    let insert_at = |func: &mut MachFunction, blk: BlockId, at: usize, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.block_mut(blk).insts.insert(at, id);
+    };
+    insert_at(
+        &mut func,
+        BlockId(0),
+        0,
+        AArch64Opcode::Movz,
+        vec![x(70), i(0)],
+    );
+    insert_at(
+        &mut func,
+        inc,
+        0,
+        AArch64Opcode::AddRR,
+        vec![x(71), x(70), x(47)],
+    );
+    insert_at(&mut func, inc, 1, AArch64Opcode::MovR, vec![x(70), x(71)]);
+    insert_at(
+        &mut func,
+        exit,
+        0,
+        AArch64Opcode::AddRR,
+        vec![x(73), x(70), x(49)],
+    );
+    let _ = latch;
+    assert!(
+        !dotprod_pass().run(&mut func),
+        "a count-if loop that also carries `sum` must stay scalar"
+    );
+    assert_eq!(count(&func, AArch64Opcode::NeonCmeqV), 0);
+    assert_eq!(count(&func, AArch64Opcode::NeonUdotV), 0);
+}
+
+/// Every kernel kind refuses a second carried register and a live-out-only
+/// register, and still fires on the plain fixture (the performance side).
+#[test]
+fn every_kernel_refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let iv46 = VReg::new(46, RegClass::Gpr64);
+    let kernels: [(&str, Build, VReg); 6] = [
+        (
+            "popcount",
+            || build_bytesum_loop(Body::Popcount, 1024),
+            iv47(),
+        ),
+        ("bytesum", || build_bytesum_loop(Body::Sum, 1024), iv47()),
+        (
+            "countif",
+            || build_countif_loop(1, false, false, 1024),
+            iv47(),
+        ),
+        (
+            "maskcmp",
+            || build_maskcmp_loop(0xC0, 0x80, true, 1024, false),
+            iv47(),
+        ),
+        ("stencil", || build_stencil_loop(true, 1, 1024, 1), iv46),
+        (
+            "hexnibble",
+            || build_hexnibble_loop(Hex::Fires, 1024),
+            iv47(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, build, iv) in kernels {
+        assert!(
+            dotprod_pass().run(&mut build()),
+            "{name}: plain fixture fires"
+        );
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if dotprod_pass().run(&mut carried) {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if dotprod_pass().run(&mut live_out) {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state:\n  {}",
+        wrong.join("\n  ")
+    );
 }

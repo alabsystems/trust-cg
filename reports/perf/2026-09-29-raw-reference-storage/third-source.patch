@@ -1,0 +1,209 @@
+diff --git a/crates/rustc-codegen-trust-cg/src/lib.rs b/crates/rustc-codegen-trust-cg/src/lib.rs
+index e558b9984..79a4340f4 100644
+--- a/crates/rustc-codegen-trust-cg/src/lib.rs
++++ b/crates/rustc-codegen-trust-cg/src/lib.rs
+@@ -31760,6 +31760,25 @@ fn lower_scalar_memory_store_value<'tcx>(
+             );
+             Ok(())
+         }
++        // A reference value stored in a cell still points at the source's
++        // existing storage. This also handles a local aggregate field/element;
++        // taking its address does not load its contents or copy its padding.
++        Rvalue::Ref(_, _, source)
++            if ctx.tcx.sess.target.arch.desc() == "aarch64"
++                && ctx.tcx.sess.target.os == rustc_target::spec::Os::Linux
++                && is_pointer_like_trust_ir_ty(&ty)
++                && !matches!(source.projection.first(), Some(ProjectionElem::Deref))
++                && local_is_memory_backed(ctx, source.local)
++                && ctx
++                    .monomorphize_ty(place_rust_ty(ctx, body, source))
++                    .is_sized(ctx.tcx, ty::TypingEnv::fully_monomorphized()) =>
++        {
++            let addr = memory_place_address_raw(ctx, body, block, source)?;
++            block
++                .body
++                .push(InstrNode::new(Inst::Copy { ty, operand: addr }).with_result(value));
++            Ok(())
++        }
+         // `*place = &(*r).f…` — the stored value is the ADDRESS of a projected
+         // sub-place reached through a THIN reference: either one whose pointee is a
+         // memory-eligible aggregate, or an entry argument whose projected leaf is a
+@@ -31787,11 +31806,30 @@ fn lower_scalar_memory_store_value<'tcx>(
+                         .to_owned(),
+                 );
+             };
+-            let (addr, _leaf_ty) =
+-                memory_aggregate_ref_address(ctx, body, block, source, pointee_ty)?;
+-            block.body.push(
+-                InstrNode::new(Inst::Copy { ty, operand: addr }).with_result(value),
+-            );
++            let addr = if ctx.tcx.sess.target.arch.desc() == "aarch64"
++                && ctx.tcx.sess.target.os == rustc_target::spec::Os::Linux
++                && is_pointer_like_trust_ir_ty(&ty)
++                && ctx
++                    .monomorphize_ty(place_rust_ty(ctx, body, source))
++                    .is_sized(ctx.tcx, ty::TypingEnv::fully_monomorphized())
++            {
++                // The pointee can itself be an aggregate. A thin reference
++                // stores its address, so no scalar-leaf load is required.
++                let base = memory_aggregate_ref_base(ctx, body, block, source)?;
++                walk_memory_projection_runtime_place_address(
++                    ctx,
++                    block,
++                    base,
++                    pointee_ty,
++                    &source.projection,
++                )?
++                .0
++            } else {
++                memory_aggregate_ref_address(ctx, body, block, source, pointee_ty)?.0
++            };
++            block
++                .body
++                .push(InstrNode::new(Inst::Copy { ty, operand: addr }).with_result(value));
+             Ok(())
+         }
+         other => Err(format!(
+@@ -94567,6 +94605,16 @@ fn lower_promoted_scalar_ref_return_call<'tcx>(
+     call: &DirectCallTerminator<'_, 'tcx>,
+     callee: Instance<'tcx>,
+ ) -> Result<bool, String> {
++    // This promotion selects snapshot referent values. With real addresses,
++    // preserve pointer identity through the ordinary call and return path.
++    // In particular, an address-taken result reference must store the returned
++    // pointer in its cell, not a selected pointee value.
++    if ctx.tcx.sess.target.arch.desc() == "aarch64"
++        && ctx.tcx.sess.target.os == rustc_target::spec::Os::Linux
++        && !call_passes_borrowed_binding_arg(ctx, call.args)
++    {
++        return Ok(false);
++    }
+     let Some(promotion) = direct_scalar_ref_select_return(ctx, body, callee, call.args)? else {
+         return Ok(false);
+     };
+@@ -106929,6 +106977,17 @@ fn compute_memory_backed_locals<'tcx>(
+                                 }
+                             }
+                             Rvalue::Cast(_, op, _) => note_operand(op, &mut bare_used),
++                            // Reborrowing as a raw pointer also exposes the
++                            // referent's address, even though MIR spells the
++                            // operand with a Deref (`p = &raw const *r`).
++                            Rvalue::RawPtr(_, source)
++                                if matches!(
++                                    source.projection.first(),
++                                    Some(ProjectionElem::Deref)
++                                ) =>
++                            {
++                                bare_used.insert(source.local);
++                            }
+                             _ => {}
+                         }
+                     }
+@@ -108586,13 +108645,49 @@ fn compute_memory_backed_locals<'tcx>(
+     // raw pointer simply fails closed, so this only ever ENABLES a case. Excludes a
+     // leading `Deref` (`&raw (*r).field` borrows through a pointer — separate
+     // mechanism) and fmt-internal locals. The base must have a usable memory layout.
++    // A projected reference reborrowed as a raw pointer or stored in an
++    // aggregate needs the same address. Record the intermediate reference, so
++    // `r = &array[i]; p = &raw const *r` gives the array real storage too. At O0
++    // a tuple of references can carry the reference before the raw reborrow.
++    let mut address_exposed_refs = HashSet::new();
++    for data in body.basic_blocks.iter() {
++        for statement in &data.statements {
++            let StatementKind::Assign(boxed) = &statement.kind else {
++                continue;
++            };
++            if let Rvalue::RawPtr(_, source) = &boxed.1 {
++                if matches!(source.projection.as_ref(), [ProjectionElem::Deref])
++                    && is_thin_pointer_ref_ty(
++                        ctx.tcx,
++                        ctx.monomorphize_ty(place_rust_ty(ctx, body, &boxed.0)),
++                    )
++                {
++                    address_exposed_refs.insert(source.local);
++                }
++            }
++            if let Rvalue::Aggregate(_, operands) = &boxed.1 {
++                for operand in operands.iter() {
++                    if let Operand::Copy(source) | Operand::Move(source) = operand {
++                        if source.projection.is_empty()
++                            && is_thin_pointer_ref_ty(
++                                ctx.tcx,
++                                ctx.monomorphize_ty(local_rust_ty(ctx, body, source.local)),
++                            )
++                        {
++                            address_exposed_refs.insert(source.local);
++                        }
++                    }
++                }
++            }
++        }
++    }
+     for bb in body.basic_blocks.indices() {
+         let data = &body.basic_blocks[bb];
+         for statement in &data.statements {
+             let StatementKind::Assign(boxed) = &statement.kind else {
+                 continue;
+             };
+-            let (_dst, rvalue) = &**boxed;
++            let (dst, rvalue) = &**boxed;
+             let source = match rvalue {
+                 Rvalue::RawPtr(_, source) => source,
+                 // An aggregate field needs stable storage when borrowed: the
+@@ -108607,17 +108702,30 @@ fn compute_memory_backed_locals<'tcx>(
+                         ty::Closure(..)
+                     ) || (ctx.tcx.sess.target.arch.desc() == "aarch64"
+                         && ctx.tcx.sess.target.os == rustc_target::spec::Os::Linux
+-                        && source.projection.iter().all(|p| {
+-                            matches!(p, ProjectionElem::Field(..) | ProjectionElem::Downcast(..))
+-                        })
+-                        && {
+-                            let referent = ctx.monomorphize_ty(place_rust_ty(ctx, body, source));
+-                            box_dyn_dynamic_data(ctx.tcx, referent).is_some()
+-                                || matches!(
+-                                    memory_aggregate_layout_shared(ctx.tcx, referent),
+-                                    Ok(Some(layout)) if layout.size != 0
++                        && ((address_exposed_refs.contains(&dst.local)
++                            && source.projection.iter().all(|p| {
++                                matches!(
++                                    p,
++                                    ProjectionElem::Field(..)
++                                        | ProjectionElem::Downcast(..)
++                                        | ProjectionElem::Index(..)
++                                        | ProjectionElem::ConstantIndex { .. }
+                                 )
+-                        }) =>
++                            }))
++                            || (source.projection.iter().all(|p| {
++                                matches!(
++                                    p,
++                                    ProjectionElem::Field(..) | ProjectionElem::Downcast(..)
++                                )
++                            }) && {
++                                let referent =
++                                    ctx.monomorphize_ty(place_rust_ty(ctx, body, source));
++                                box_dyn_dynamic_data(ctx.tcx, referent).is_some()
++                                    || matches!(
++                                        memory_aggregate_layout_shared(ctx.tcx, referent),
++                                        Ok(Some(layout)) if layout.size != 0
++                                    )
++                            }))) =>
+                 {
+                     source
+                 }
+@@ -110173,7 +110281,14 @@ fn compute_scalar_cell_locals<'tcx>(
+                 ) || rust_ty_to_trust_ir_ty(ctx.tcx, referent_ty)
+                     .map(|t| t.bit_width().is_some() && !is_pointer_like_trust_ir_ty(&t))
+                     .unwrap_or(false));
+-            let is_raw_pointer_referent = matches!(referent_ty.kind(), ty::RawPtr(..))
++            // A raw address of a thin reference local points at the POINTER
++            // value, not its pointee. Give that value its own cell, just like
++            // a raw pointer local. Unaddressable reference initializers still
++            // fail closed in lower_scalar_memory_store_value.
++            let is_raw_pointer_referent = (matches!(referent_ty.kind(), ty::RawPtr(..))
++                || (ctx.tcx.sess.target.arch.desc() == "aarch64"
++                    && ctx.tcx.sess.target.os == rustc_target::spec::Os::Linux
++                    && matches!(referent_ty.kind(), ty::Ref(..))))
+                 && is_thin_pointer_ref_ty(ctx.tcx, referent_ty)
+                 && ctx.tcx.data_layout.pointer_size().bytes() == 8
+                 && layout_size_of(ctx, referent_ty)? == 8

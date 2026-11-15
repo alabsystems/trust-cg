@@ -18,8 +18,7 @@
 //!   surviving post-rewrite instructions, and
 //! - iterates to fixed point.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{InstId, MachFunction, PassId, ProvenanceMap, VReg};
 
@@ -110,14 +109,14 @@ impl RewriteEngine {
         provenance_pass: Option<&PassId>,
     ) -> u32 {
         let mut changes: u32 = 0;
-        let mut to_delete: HashSet<InstId> = HashSet::new();
+        let mut to_delete: HashSet<InstId> = HashSet::default();
 
         for block_id in func.block_order.clone() {
             // Forward reaching-definition map for this block. Start empty and
             // record a definition only after its instruction has been visited:
             // preloading the block's final writers lets a rule inspect a future
             // redefinition and is unsound in non-SSA machine IR.
-            let mut def_map = HashMap::new();
+            let mut def_map = HashMap::default();
             let inst_ids = func.block(block_id).insts.clone();
             for inst_id in inst_ids {
                 if to_delete.contains(&inst_id) {
@@ -270,7 +269,7 @@ mod tests {
         ));
         func.append_inst(entry, gpr64);
 
-        let mut def_map = HashMap::new();
+        let mut def_map = HashMap::default();
         record_definition(&mut def_map, func.inst(gpr32), gpr32);
         record_definition(&mut def_map, func.inst(gpr64), gpr64);
 

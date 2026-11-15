@@ -11,6 +11,7 @@
 //! and rejects section relocation counts that exceed the 16-bit COFF header
 //! field.
 
+pub mod reparse;
 pub mod writer;
 
 pub use writer::{

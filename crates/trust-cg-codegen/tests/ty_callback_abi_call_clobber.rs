@@ -2,20 +2,23 @@
 //
 // The generated loop carries parent-loop state across an indirect callback with
 // pointer, u32, and u64 arguments. The host callback deliberately clobbers
-// AArch64 call-volatile GPRs before writing the status-shaped result.
+// the host C ABI's call-volatile GPRs before writing the status-shaped result.
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 #[path = "common/fixture_contract.rs"]
 mod fixture_contract;
 use fixture_contract::FixtureContractLookup;
 
-use std::collections::{BTreeSet, HashMap};
+#[cfg(target_arch = "aarch64")]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use trust_cg_codegen::jit_contract::{ArtifactChecksum, ArtifactContractError, SymbolSignature};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer, Target};
+use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer};
 use trust_ir::{BinOp, CastOp, ICmpOp, Ty, ValueId};
 use trust_ir_build::{FunctionBuilder, ModuleBuilder};
 
@@ -64,10 +67,65 @@ struct LoopRun {
     calls: usize,
 }
 
+// The JIT entry receives a bare `extern "C"` callback, so the host callback
+// records into process-wide statics. libtest runs this binary's tests
+// concurrently: every test that resets, reads, or drives these observations
+// must hold a `CallbackObservations` (which owns `CALLBACK_OBSERVATION_LOCK`)
+// for its whole body, or one test's native callbacks are counted against
+// another test's "rejected before any native call" assertion.
+static CALLBACK_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
 static CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CALLBACK_LAST_LEN: AtomicU32 = AtomicU32::new(0);
 static CALLBACK_LAST_IDX: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_LAST_PARENT: AtomicU64 = AtomicU64::new(0);
+
+/// Exclusive access to the process-wide host-callback observations.
+///
+/// While a value is alive no other test in this binary can reset them or run
+/// the host callback, so `calls()` counts every callback made in the process
+/// since the last `reset()`.
+struct CallbackObservations {
+    _serial: MutexGuard<'static, ()>,
+}
+
+impl CallbackObservations {
+    /// Blocks until no other test owns the observations, then resets them.
+    /// A poisoned lock (a test panicked while holding it) is taken anyway:
+    /// the reset discards whatever that test left behind, so one failure does
+    /// not cascade into every later test.
+    fn acquire() -> Self {
+        let observations = Self {
+            _serial: CALLBACK_OBSERVATION_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        };
+        observations.reset();
+        observations
+    }
+
+    fn reset(&self) {
+        CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        CALLBACK_LAST_LEN.store(u32::MAX, Ordering::SeqCst);
+        CALLBACK_LAST_IDX.store(u64::MAX, Ordering::SeqCst);
+        CALLBACK_LAST_PARENT.store(u64::MAX, Ordering::SeqCst);
+    }
+
+    fn calls(&self) -> usize {
+        CALLBACK_CALLS.load(Ordering::SeqCst)
+    }
+
+    fn last_len(&self) -> u32 {
+        CALLBACK_LAST_LEN.load(Ordering::SeqCst)
+    }
+
+    fn last_idx(&self) -> u64 {
+        CALLBACK_LAST_IDX.load(Ordering::SeqCst)
+    }
+
+    fn last_parent(&self) -> u64 {
+        CALLBACK_LAST_PARENT.load(Ordering::SeqCst)
+    }
+}
 
 fn callback_state_value(parent: u64, idx: u64, len: u32) -> u64 {
     parent
@@ -92,45 +150,7 @@ extern "C" fn host_ty_callback_abi_clobber(
     CALLBACK_LAST_PARENT.store(parent_value, Ordering::SeqCst);
 
     unsafe {
-        core::arch::asm!(
-            "mov x0, #1",
-            "mov x1, #2",
-            "mov x2, #3",
-            "mov x3, #4",
-            "mov x4, #5",
-            "mov x5, #6",
-            "mov x6, #7",
-            "mov x7, #8",
-            "mov x8, #9",
-            "mov x9, #10",
-            "mov x10, #11",
-            "mov x11, #12",
-            "mov x12, #13",
-            "mov x13, #14",
-            "mov x14, #15",
-            "mov x15, #16",
-            "mov x16, #17",
-            "mov x17, #18",
-            out("x0") _,
-            out("x1") _,
-            out("x2") _,
-            out("x3") _,
-            out("x4") _,
-            out("x5") _,
-            out("x6") _,
-            out("x7") _,
-            out("x8") _,
-            out("x9") _,
-            out("x10") _,
-            out("x11") _,
-            out("x12") _,
-            out("x13") _,
-            out("x14") _,
-            out("x15") _,
-            out("x16") _,
-            out("x17") _,
-            options(nostack)
-        );
+        ty_contract::clobber_call_volatile_gprs();
 
         if !state_out.is_null() {
             *state_out = state_value;
@@ -184,12 +204,7 @@ fn build_callback_parent_loop_module(include_fpr_lanes: bool) -> trust_ir::Modul
         let done_status_sum = fb.add_block_param(done, Ty::U64);
 
         fb.switch_to_block(entry);
-        let callback_ptr = fb.cast(
-            CastOp::IntToPtr,
-            Ty::U64,
-            Ty::Func(callback_ty),
-            callback_raw,
-        );
+        let callback_ptr = fb.cast(CastOp::IntToPtr, Ty::U64, Ty::Ptr, callback_raw);
         let zero = fb.iconst(Ty::U64, 0);
         let initial_checksum = fb.iconst(Ty::U64, i128::from(INITIAL_CHECKSUM));
         fb.br(header, vec![zero, zero, initial_checksum, zero]);
@@ -289,13 +304,14 @@ fn build_callback_parent_loop_module(include_fpr_lanes: bool) -> trust_ir::Modul
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_to_jit(module: &trust_ir::Module, opt_level: OptLevel) -> ExecutableBuffer {
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     config.opt_level = opt_level;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|err| panic!("{opt_level:?} compile failed: {err}"))
         .buffer
@@ -306,6 +322,7 @@ fn prepare_callback_parent_loop(opt_level: OptLevel) -> ExecutableBuffer {
     compile_to_jit(&module, opt_level)
 }
 
+#[cfg(target_arch = "aarch64")]
 fn prepare_callback_parent_loop_with_fpr_frame(opt_level: OptLevel) -> ExecutableBuffer {
     let module = build_callback_parent_loop_module(true);
     compile_to_jit(&module, opt_level)
@@ -329,6 +346,7 @@ fn wrong_entry_signature(include_fpr_lanes: bool) -> SymbolSignature {
     extern_c_signature(params, vec![abi_i64()])
 }
 
+#[cfg(target_arch = "aarch64")]
 fn aarch64_callee_saved_gpr_name(reg: u8) -> Option<&'static str> {
     match reg {
         19 => Some("x19"),
@@ -345,6 +363,7 @@ fn aarch64_callee_saved_gpr_name(reg: u8) -> Option<&'static str> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn aarch64_callee_saved_fpr_name(reg: u8) -> Option<&'static str> {
     match reg {
         8 => Some("d8"),
@@ -359,6 +378,7 @@ fn aarch64_callee_saved_fpr_name(reg: u8) -> Option<&'static str> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn decode_aarch64_gpr_pair_stack_access(word: u32) -> Option<(u8, u8)> {
     let size = (word >> 30) & 0b11;
     let major = (word >> 27) & 0b111;
@@ -378,6 +398,7 @@ fn decode_aarch64_gpr_pair_stack_access(word: u32) -> Option<(u8, u8)> {
     Some((rt, rt2))
 }
 
+#[cfg(target_arch = "aarch64")]
 fn decode_aarch64_dpr_pair_stack_access(word: u32) -> Option<(u8, u8)> {
     let size = (word >> 30) & 0b11;
     let major = (word >> 27) & 0b111;
@@ -397,6 +418,7 @@ fn decode_aarch64_dpr_pair_stack_access(word: u32) -> Option<(u8, u8)> {
     Some((rt, rt2))
 }
 
+#[cfg(target_arch = "aarch64")]
 fn entry_code(buffer: &ExecutableBuffer) -> &[u8] {
     let entry_offset = buffer
         .symbols()
@@ -415,11 +437,12 @@ fn entry_code(buffer: &ExecutableBuffer) -> &[u8] {
     unsafe { std::slice::from_raw_parts(code_ptr, code_len) }
 }
 
+#[cfg(target_arch = "aarch64")]
 fn extract_used_aarch64_callee_saved_gprs(buffer: &ExecutableBuffer) -> Vec<&'static str> {
     let code = entry_code(buffer);
     let mut regs = BTreeSet::new();
-    for inst in code.chunks_exact(4) {
-        let word = u32::from_le_bytes(inst.try_into().expect("instruction is four bytes"));
+    for inst in code.as_chunks::<4>().0 {
+        let word = u32::from_le_bytes(*inst);
         if let Some((rt, rt2)) = decode_aarch64_gpr_pair_stack_access(word) {
             if let Some(name) = aarch64_callee_saved_gpr_name(rt) {
                 regs.insert(name);
@@ -432,11 +455,12 @@ fn extract_used_aarch64_callee_saved_gprs(buffer: &ExecutableBuffer) -> Vec<&'st
     regs.into_iter().collect()
 }
 
+#[cfg(target_arch = "aarch64")]
 fn extract_used_aarch64_callee_saved_fprs(buffer: &ExecutableBuffer) -> Vec<&'static str> {
     let code = entry_code(buffer);
     let mut regs = BTreeSet::new();
-    for inst in code.chunks_exact(4) {
-        let word = u32::from_le_bytes(inst.try_into().expect("instruction is four bytes"));
+    for inst in code.as_chunks::<4>().0 {
+        let word = u32::from_le_bytes(*inst);
         if let Some((rt, rt2)) = decode_aarch64_dpr_pair_stack_access(word) {
             if aarch64_callee_saved_fpr_name(rt).is_some() {
                 regs.insert(rt);
@@ -486,11 +510,8 @@ fn reference_run(parents: &[u64]) -> ([u64; 4], Vec<u64>) {
     )
 }
 
-fn run_at(opt_level: OptLevel, parents: &[u64]) -> LoopRun {
-    CALLBACK_CALLS.store(0, Ordering::SeqCst);
-    CALLBACK_LAST_LEN.store(0, Ordering::SeqCst);
-    CALLBACK_LAST_IDX.store(0, Ordering::SeqCst);
-    CALLBACK_LAST_PARENT.store(0, Ordering::SeqCst);
+fn run_at(callbacks: &CallbackObservations, opt_level: OptLevel, parents: &[u64]) -> LoopRun {
+    callbacks.reset();
 
     let buffer = prepare_callback_parent_loop(opt_level);
     let entry: EntryFn =
@@ -513,7 +534,7 @@ fn run_at(opt_level: OptLevel, parents: &[u64]) -> LoopRun {
         "{opt_level:?} returned status sum should match summary slot"
     );
     assert_eq!(
-        CALLBACK_CALLS.load(Ordering::SeqCst),
+        callbacks.calls(),
         parents.len(),
         "{opt_level:?} should call the action once per parent"
     );
@@ -521,25 +542,26 @@ fn run_at(opt_level: OptLevel, parents: &[u64]) -> LoopRun {
         .last()
         .zip(parents.len().checked_sub(1).map(|idx| idx as u64))
     {
-        assert_eq!(CALLBACK_LAST_LEN.load(Ordering::SeqCst), 1);
-        assert_eq!(CALLBACK_LAST_IDX.load(Ordering::SeqCst), last_idx);
-        assert_eq!(CALLBACK_LAST_PARENT.load(Ordering::SeqCst), last_parent);
+        assert_eq!(callbacks.last_len(), 1);
+        assert_eq!(callbacks.last_idx(), last_idx);
+        assert_eq!(callbacks.last_parent(), last_parent);
     }
 
     LoopRun {
         summary,
         states,
         callout,
-        calls: CALLBACK_CALLS.load(Ordering::SeqCst),
+        calls: callbacks.calls(),
     }
 }
 
 fn assert_contract_rejection_left_native_state_untouched(
+    callbacks: &CallbackObservations,
     states: &[u64],
     callout: &CallbackStatus,
     summary: &[u64; 4],
 ) {
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
     assert!(
         states.iter().all(|&state| state == u64::MAX),
         "state output should stay poisoned when contract lookup rejects"
@@ -550,10 +572,7 @@ fn assert_contract_rejection_left_native_state_untouched(
 
 #[test]
 fn ty_callback_contract_lookup_rejects_mismatches_before_native_writes() {
-    CALLBACK_CALLS.store(0, Ordering::SeqCst);
-    CALLBACK_LAST_LEN.store(u32::MAX, Ordering::SeqCst);
-    CALLBACK_LAST_IDX.store(u64::MAX, Ordering::SeqCst);
-    CALLBACK_LAST_PARENT.store(u64::MAX, Ordering::SeqCst);
+    let callbacks = CallbackObservations::acquire();
 
     let buffer = prepare_callback_parent_loop(OptLevel::O1);
     let signature = entry_signature(false);
@@ -575,7 +594,7 @@ fn ty_callback_contract_lookup_rejects_mismatches_before_native_writes() {
         }
         other => panic!("expected signature mismatch, got {other:?}"),
     }
-    assert_contract_rejection_left_native_state_untouched(&states, &callout, &summary);
+    assert_contract_rejection_left_native_state_untouched(&callbacks, &states, &callout, &summary);
 
     let mut wrong_layout = contract.clone();
     wrong_layout.layout_checksum = ArtifactChecksum::new(wrong_layout.layout_checksum.get() ^ 1);
@@ -588,7 +607,7 @@ fn ty_callback_contract_lookup_rejects_mismatches_before_native_writes() {
         }
         other => panic!("expected layout checksum mismatch, got {other:?}"),
     }
-    assert_contract_rejection_left_native_state_untouched(&states, &callout, &summary);
+    assert_contract_rejection_left_native_state_untouched(&callbacks, &states, &callout, &summary);
 
     let mut missing_manifest = manifest.clone();
     missing_manifest.symbols.clear();
@@ -604,7 +623,7 @@ fn ty_callback_contract_lookup_rejects_mismatches_before_native_writes() {
         }
         other => panic!("expected missing-symbol signature mismatch, got {other:?}"),
     }
-    assert_contract_rejection_left_native_state_untouched(&states, &callout, &summary);
+    assert_contract_rejection_left_native_state_untouched(&callbacks, &states, &callout, &summary);
 
     let null_symbol = "ty_callback_abi_parent_loop_missing_buffer_symbol";
     let null_manifest = ty_reducer_manifest_for_symbol(
@@ -626,9 +645,15 @@ fn ty_callback_contract_lookup_rejects_mismatches_before_native_writes() {
         }
         other => panic!("expected null symbol pointer, got {other:?}"),
     }
-    assert_contract_rejection_left_native_state_untouched(&states, &callout, &summary);
+    assert_contract_rejection_left_native_state_untouched(&callbacks, &states, &callout, &summary);
 }
 
+// AArch64 machine-code evidence: pins the exact AAPCS64 callee-saved GPR
+// (x19-x28) and lower-64 FPR (d8-d15) frame the JIT emits under live-lane
+// pressure. It has no x86-64 twin yet: SysV AMD64 preserves rbx/rbp/r12-r15
+// only and has no callee-saved XMM registers, so the FPR half needs a
+// stack-spill oracle rather than a register-frame decoder.
+#[cfg(target_arch = "aarch64")]
 #[test]
 fn ty_callback_live_values_force_aarch64_callee_save_frame_o1_o3() {
     for (opt_level, expected) in [
@@ -672,10 +697,11 @@ fn ty_callback_live_values_force_aarch64_callee_save_frame_o1_o3() {
 
 #[test]
 fn ty_indirect_callback_abi_and_call_clobbers_match_o1_o3() {
+    let callbacks = CallbackObservations::acquire();
     for parents in [&[][..], &[2, 5, 11][..]] {
         let (expected_summary, expected_states) = reference_run(parents);
         for opt_level in [OptLevel::O1, OptLevel::O3] {
-            let run = run_at(opt_level, parents);
+            let run = run_at(&callbacks, opt_level, parents);
             assert_eq!(
                 run.summary, expected_summary,
                 "{opt_level:?} summary diverged for parents={parents:?}"
@@ -693,4 +719,13 @@ fn ty_indirect_callback_abi_and_call_clobbers_match_o1_o3() {
             }
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

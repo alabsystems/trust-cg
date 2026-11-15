@@ -11,20 +11,36 @@ use trust_cg_codegen::pipeline::{Pipeline, PipelineConfig};
 use trust_cg_codegen::{JitCompiler, JitConfig, JitError};
 use trust_cg_ir::{AArch64Opcode, MachFunction, MachInst, MachOperand, Signature};
 
+/// `stp x29,x30,[sp,#-16]! ; bl <symbol> ; ldp x29,x30,[sp],#16 ; ret`: the
+/// call saves and restores the frame record as frame lowering would, since
+/// the final-stream frame net rejects a return through a clobbered LR.
 fn caller_with_unresolved_symbol(symbol: &str) -> MachFunction {
     let mut func = MachFunction::new("caller".to_string(), Signature::new(vec![], vec![]));
     let entry = func.entry;
+    let frame_record = |opcode: AArch64Opcode, offset: i64| {
+        MachInst::new(
+            opcode,
+            vec![
+                MachOperand::PReg(trust_cg_ir::aarch64_regs::X29),
+                MachOperand::PReg(trust_cg_ir::aarch64_regs::X30),
+                MachOperand::Special(trust_cg_ir::SpecialReg::SP),
+                MachOperand::Imm(offset),
+            ],
+        )
+    };
 
-    let call = MachInst::new(
-        AArch64Opcode::Bl,
-        vec![MachOperand::Symbol(symbol.to_string())],
-    );
-    let call_id = func.push_inst(call);
-    func.append_inst(entry, call_id);
-
-    let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
-    let ret_id = func.push_inst(ret);
-    func.append_inst(entry, ret_id);
+    for inst in [
+        frame_record(AArch64Opcode::StpPreIndex, -16),
+        MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol(symbol.to_string())],
+        ),
+        frame_record(AArch64Opcode::LdpPostIndex, 16),
+        MachInst::new(AArch64Opcode::Ret, vec![]),
+    ] {
+        let id = func.push_inst(inst);
+        func.append_inst(entry, id);
+    }
 
     func
 }
@@ -119,7 +135,7 @@ fn resolve_to_relocations_unresolved_named_symbol_returns_typed_error() {
 
 #[test]
 fn compile_module_unresolved_symbol_emits_undefined_external_symbol() {
-    let pipeline = Pipeline::new(PipelineConfig::default());
+    let pipeline = Pipeline::new(PipelineConfig::for_target("aarch64-apple-darwin"));
     let caller = caller_with_unresolved_symbol("missing");
 
     let bytes = pipeline
@@ -132,7 +148,7 @@ fn compile_module_unresolved_symbol_emits_undefined_external_symbol() {
 
 #[test]
 fn compile_module_parallel_unresolved_symbol_emits_undefined_external_symbol() {
-    let pipeline = Pipeline::new(PipelineConfig::default());
+    let pipeline = Pipeline::new(PipelineConfig::for_target("aarch64-apple-darwin"));
     let caller = caller_with_unresolved_symbol("missing");
     let helper = empty_helper();
 

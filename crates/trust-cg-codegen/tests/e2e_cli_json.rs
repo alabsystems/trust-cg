@@ -80,7 +80,7 @@ fn e2e_json_wire_format_return_42() {
     let result_val = fb.iconst(Ty::I64, 42);
     fb.ret(vec![result_val]);
     fb.build();
-    let module_orig = mb.build();
+    let module_orig = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // Step 2: Serialize to JSON (the wire format).
     let json_str = serde_json::to_string_pretty(&module_orig)
@@ -109,7 +109,8 @@ fn e2e_json_wire_format_return_42() {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module_rt)
         .expect("compiling JSON-deserialized trust_ir module should succeed");
@@ -244,7 +245,7 @@ fn e2e_json_wire_format_add_args() {
     let result_val = fb.binop(BinOp::Add, Ty::I64, a, b);
     fb.ret(vec![result_val]);
     fb.build();
-    let module_orig = mb.build();
+    let module_orig = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // JSON round-trip.
     let json_str =
@@ -260,7 +261,8 @@ fn e2e_json_wire_format_add_args() {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module_rt)
         .expect("compilation should succeed");
@@ -337,7 +339,7 @@ fn e2e_json_file_roundtrip_compile() {
     fb.switch_to_block(entry);
     fb.ret(vec![param0]);
     fb.build();
-    let module_orig = mb.build();
+    let module_orig = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // Write to JSON file on disk (as external tools would produce).
     let test_dir = make_test_dir("file_roundtrip");
@@ -365,7 +367,8 @@ fn e2e_json_file_roundtrip_compile() {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O2,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module_from_file)
         .expect("compilation should succeed");
@@ -416,7 +419,7 @@ fn e2e_json_multi_function_module() {
         fb2.build();
     }
 
-    let module_orig = mb.build();
+    let module_orig = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // JSON round-trip.
     let json_str =
@@ -430,7 +433,8 @@ fn e2e_json_multi_function_module() {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module_rt)
         .expect("multi-function module compilation should succeed");
@@ -509,7 +513,7 @@ fn e2e_json_multi_function_link_run() {
         fb2.build();
     }
 
-    let module_orig = mb.build();
+    let module_orig = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // JSON round-trip.
     let json_str = serde_json::to_string_pretty(&module_orig).unwrap();
@@ -519,7 +523,8 @@ fn e2e_json_multi_function_link_run() {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module_rt)
         .expect("compilation should succeed");
@@ -576,4 +581,13 @@ int main() {
     assert_eq!(run_stdout.trim(), "42");
 
     cleanup(&test_dir);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

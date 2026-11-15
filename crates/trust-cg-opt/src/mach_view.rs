@@ -54,7 +54,9 @@
 //! and sorting by [`MachIrView::block_index`]; no HashMap iteration order
 //! leaks into results.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+
+use crate::fast_hash::{FxHashMap, FxHashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 
@@ -412,7 +414,7 @@ pub struct GenericLoop<B> {
     /// header are merged into one loop (same policy as `loops.rs`).
     pub latches: Vec<B>,
     /// All blocks in the loop body (includes header and latches).
-    pub body: HashSet<B>,
+    pub body: FxHashSet<B>,
     /// Unique non-loop predecessor of the header, if one exists.
     pub preheader: Option<B>,
     /// Nesting depth (outermost = 1).
@@ -427,12 +429,12 @@ pub struct GenericLoop<B> {
 #[derive(Debug, Clone)]
 pub struct CfgAnalysis<B> {
     /// Derived predecessor map (reachable and unreachable blocks alike).
-    pub preds: HashMap<B, Vec<B>>,
+    pub preds: FxHashMap<B, Vec<B>>,
     /// Reverse postorder over reachable blocks, entry first.
     pub rpo: Vec<B>,
     /// Immediate dominators (Cooper/Harvey/Kennedy); entry maps to itself.
     /// Only reachable blocks are present.
-    pub idom: HashMap<B, B>,
+    pub idom: FxHashMap<B, B>,
     /// Natural loops, sorted by header block index.
     pub loops: Vec<GenericLoop<B>>,
 }
@@ -459,8 +461,8 @@ impl<B: Copy + Eq + Hash + Debug> CfgAnalysis<B> {
 }
 
 /// Build the predecessor map by iterating layout order (deterministic).
-pub fn predecessor_map<V: MachIrView>(view: &V) -> HashMap<V::Block, Vec<V::Block>> {
-    let mut preds: HashMap<V::Block, Vec<V::Block>> = HashMap::new();
+pub fn predecessor_map<V: MachIrView>(view: &V) -> FxHashMap<V::Block, Vec<V::Block>> {
+    let mut preds: FxHashMap<V::Block, Vec<V::Block>> = FxHashMap::default();
     for block in view.layout_order() {
         for succ in view.successors(block) {
             preds.entry(succ).or_default().push(block);
@@ -472,7 +474,7 @@ pub fn predecessor_map<V: MachIrView>(view: &V) -> HashMap<V::Block, Vec<V::Bloc
 /// Reverse postorder over reachable blocks via iterative DFS from entry.
 pub fn compute_rpo<V: MachIrView>(view: &V) -> Vec<V::Block> {
     let entry = view.entry_block();
-    let mut visited: HashSet<V::Block> = HashSet::new();
+    let mut visited: FxHashSet<V::Block> = FxHashSet::default();
     let mut postorder: Vec<V::Block> = Vec::new();
     let mut stack: Vec<(V::Block, usize)> = vec![(entry, 0)];
     visited.insert(entry);
@@ -500,17 +502,17 @@ pub fn compute_rpo<V: MachIrView>(view: &V) -> Vec<V::Block> {
 /// the given RPO. Mirrors `dom.rs` / `x86_licm.rs` exactly.
 pub fn compute_idom<V: MachIrView>(
     view: &V,
-    preds: &HashMap<V::Block, Vec<V::Block>>,
+    preds: &FxHashMap<V::Block, Vec<V::Block>>,
     rpo: &[V::Block],
-) -> HashMap<V::Block, V::Block> {
+) -> FxHashMap<V::Block, V::Block> {
     let entry = view.entry_block();
-    let rpo_number: HashMap<V::Block, u32> = rpo
+    let rpo_number: FxHashMap<V::Block, u32> = rpo
         .iter()
         .enumerate()
         .map(|(i, &b)| (b, i as u32))
         .collect();
 
-    let mut idom: HashMap<V::Block, V::Block> = HashMap::new();
+    let mut idom: FxHashMap<V::Block, V::Block> = FxHashMap::default();
     idom.insert(entry, entry);
 
     let empty: Vec<V::Block> = Vec::new();
@@ -555,8 +557,8 @@ pub fn compute_idom<V: MachIrView>(
 fn intersect<B: Copy + Eq + Hash>(
     mut b1: B,
     mut b2: B,
-    idom: &HashMap<B, B>,
-    rpo_number: &HashMap<B, u32>,
+    idom: &FxHashMap<B, B>,
+    rpo_number: &FxHashMap<B, u32>,
 ) -> B {
     while b1 != b2 {
         let n1 = rpo_number.get(&b1).copied().unwrap_or(u32::MAX);
@@ -571,7 +573,7 @@ fn intersect<B: Copy + Eq + Hash>(
 }
 
 /// True if `a` dominates `b` (reflexive), by walking the idom chain.
-pub fn dominates<B: Copy + Eq + Hash>(a: B, b: B, idom: &HashMap<B, B>) -> bool {
+pub fn dominates<B: Copy + Eq + Hash>(a: B, b: B, idom: &FxHashMap<B, B>) -> bool {
     if a == b {
         return true;
     }
@@ -597,13 +599,13 @@ pub fn dominates<B: Copy + Eq + Hash>(a: B, b: B, idom: &HashMap<B, B>) -> bool 
 /// merged. Depth = 1 + number of distinct strictly-containing loop bodies.
 pub fn find_natural_loops<V: MachIrView>(
     view: &V,
-    preds: &HashMap<V::Block, Vec<V::Block>>,
-    idom: &HashMap<V::Block, V::Block>,
+    preds: &FxHashMap<V::Block, Vec<V::Block>>,
+    idom: &FxHashMap<V::Block, V::Block>,
 ) -> Vec<GenericLoop<V::Block>> {
-    type LoopAccumulator<B> = (Vec<B>, HashSet<B>);
+    type LoopAccumulator<B> = (Vec<B>, FxHashSet<B>);
 
     // header -> (latches, body)
-    let mut raw: HashMap<V::Block, LoopAccumulator<V::Block>> = HashMap::new();
+    let mut raw: FxHashMap<V::Block, LoopAccumulator<V::Block>> = FxHashMap::default();
 
     for block in view.layout_order() {
         for succ in view.successors(block) {
@@ -611,7 +613,7 @@ pub fn find_natural_loops<V: MachIrView>(
                 let body = loop_body(preds, succ, block);
                 let entry = raw
                     .entry(succ)
-                    .or_insert_with(|| (Vec::new(), HashSet::new()));
+                    .or_insert_with(|| (Vec::new(), FxHashSet::default()));
                 entry.0.push(block);
                 entry.1.extend(body);
             }
@@ -622,7 +624,7 @@ pub fn find_natural_loops<V: MachIrView>(
         return Vec::new();
     }
 
-    let header_bodies: Vec<(V::Block, HashSet<V::Block>)> =
+    let header_bodies: Vec<(V::Block, FxHashSet<V::Block>)> =
         raw.iter().map(|(h, (_, b))| (*h, b.clone())).collect();
 
     let mut loops: Vec<GenericLoop<V::Block>> = raw
@@ -656,8 +658,12 @@ pub fn find_natural_loops<V: MachIrView>(
 
 /// Reverse-reachability loop body: header + everything that reaches the latch
 /// without passing through the header.
-fn loop_body<B: Copy + Eq + Hash>(preds: &HashMap<B, Vec<B>>, header: B, latch: B) -> HashSet<B> {
-    let mut body: HashSet<B> = HashSet::new();
+fn loop_body<B: Copy + Eq + Hash>(
+    preds: &FxHashMap<B, Vec<B>>,
+    header: B,
+    latch: B,
+) -> FxHashSet<B> {
+    let mut body: FxHashSet<B> = FxHashSet::default();
     body.insert(header);
     body.insert(latch);
     if header == latch {
@@ -678,9 +684,9 @@ fn loop_body<B: Copy + Eq + Hash>(preds: &HashMap<B, Vec<B>>, header: B, latch: 
 
 /// A preheader is the UNIQUE predecessor of the header outside the loop body.
 fn find_preheader<B: Copy + Eq + Hash>(
-    preds: &HashMap<B, Vec<B>>,
+    preds: &FxHashMap<B, Vec<B>>,
     header: B,
-    body: &HashSet<B>,
+    body: &FxHashSet<B>,
 ) -> Option<B> {
     let empty: Vec<B> = Vec::new();
     let non_loop_preds: Vec<B> = preds

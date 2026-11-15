@@ -301,13 +301,6 @@ fn width_ops(class: RegClass) -> Option<(X86Opcode, X86Opcode)> {
 /// `MovRI` materializes an immediate. Neither touches RFLAGS, so hoisting them
 /// between the header's flag-setter and the emitted `cmovcc` leaves the
 /// condition the `cmovcc` reads exactly as the deleted `jcc` would have read it.
-/// Diagnostic: why a candidate diamond was rejected. `TCG_IFCONV_TRACE=1`.
-fn ic_trace(why: &str, msg: String) {
-    if std::env::var_os("TCG_IFCONV_TRACE").is_some() {
-        eprintln!("[ifconv] DECLINE({why}) {msg}");
-    }
-}
-
 fn is_speculatable_compute_op(opcode: X86Opcode) -> bool {
     matches!(
         opcode,
@@ -664,10 +657,6 @@ impl X86IfConvert {
         for exit in &report.cond_then_jump_exits {
             // The header ends in `jcc T; jmp F` with exactly one jcc target.
             let [taken_arm] = exit.cond_targets.as_slice() else {
-                ic_trace(
-                    "multi-cond-target",
-                    format!("block={:?} targets={:?}", exit.block, exit.cond_targets),
-                );
                 continue;
             };
             let (taken_arm, nottaken_arm) = (*taken_arm, exit.jump_target);
@@ -679,17 +668,6 @@ impl X86IfConvert {
             if preds.get(&taken_arm).map(Vec::as_slice) != Some(&[exit.block])
                 || preds.get(&nottaken_arm).map(Vec::as_slice) != Some(&[exit.block])
             {
-                ic_trace(
-                    "arm-has-other-preds",
-                    format!(
-                        "hdr={:?} taken={:?} preds={:?} nottaken={:?} preds={:?}",
-                        exit.block,
-                        taken_arm,
-                        preds.get(&taken_arm),
-                        nottaken_arm,
-                        preds.get(&nottaken_arm)
-                    ),
-                );
                 continue;
             }
 
@@ -700,23 +678,9 @@ impl X86IfConvert {
             let (Some([join_t]), Some([join_f])) =
                 (taken_succ.as_deref(), nottaken_succ.as_deref())
             else {
-                ic_trace(
-                    "arm-not-single-successor",
-                    format!(
-                        "hdr={:?} taken={:?} succ={:?} nottaken={:?} succ={:?}",
-                        exit.block, taken_arm, taken_succ, nottaken_arm, nottaken_succ
-                    ),
-                );
                 continue;
             };
             if join_t != join_f {
-                ic_trace(
-                    "arms-do-not-reconverge",
-                    format!(
-                        "hdr={:?} join_t={:?} join_f={:?}",
-                        exit.block, join_t, join_f
-                    ),
-                );
                 continue;
             }
             let join = *join_t;
@@ -726,15 +690,6 @@ impl X86IfConvert {
             match preds.get(&join) {
                 Some(p) if p.len() == 2 && p.contains(&taken_arm) && p.contains(&nottaken_arm) => {}
                 _ => {
-                    ic_trace(
-                        "join-not-clean-2in",
-                        format!(
-                            "hdr={:?} join={:?} preds={:?}",
-                            exit.block,
-                            join,
-                            preds.get(&join)
-                        ),
-                    );
                     continue;
                 }
             }
@@ -754,33 +709,6 @@ impl X86IfConvert {
                 arm_speculatable_defs_impl(func, taken_arm, allow_flag_write),
                 arm_speculatable_defs_impl(func, nottaken_arm, allow_flag_write),
             ) else {
-                ic_trace(
-                    "arm-not-all-speculatable",
-                    format!(
-                        "hdr={:?} taken={:?}[{}] nottaken={:?}[{}]",
-                        exit.block,
-                        taken_arm,
-                        func.blocks
-                            .get(&taken_arm)
-                            .map(|b| b
-                                .insts
-                                .iter()
-                                .map(|i| format!("{:?}", i.opcode))
-                                .collect::<Vec<_>>()
-                                .join(","))
-                            .unwrap_or_default(),
-                        nottaken_arm,
-                        func.blocks
-                            .get(&nottaken_arm)
-                            .map(|b| b
-                                .insts
-                                .iter()
-                                .map(|i| format!("{:?}", i.opcode))
-                                .collect::<Vec<_>>()
-                                .join(","))
-                            .unwrap_or_default()
-                    ),
-                );
                 continue;
             };
             let common: Vec<VReg> = taken_defs
@@ -789,16 +717,6 @@ impl X86IfConvert {
                 .copied()
                 .collect();
             let [merge] = common.as_slice() else {
-                ic_trace(
-                    "common-defs-not-one",
-                    format!(
-                        "hdr={:?} n={} taken={:?} nottaken={:?}",
-                        exit.block,
-                        common.len(),
-                        taken_defs,
-                        nottaken_defs
-                    ),
-                );
                 continue;
             };
             let merge = *merge;
@@ -1050,7 +968,7 @@ impl X86IfConvert {
 /// unchanged so the downstream contiguity gate fails closed rather than aliasing.
 pub(crate) fn renumber_blocks_contiguous(func: &mut X86ISelFunction) {
     let len = func.block_order.len();
-    let remap: HashMap<Block, Block> = func
+    let remap: crate::fast_hash::FxHashMap<Block, Block> = func
         .block_order
         .iter()
         .enumerate()
@@ -1058,7 +976,8 @@ pub(crate) fn renumber_blocks_contiguous(func: &mut X86ISelFunction) {
         .collect();
 
     let order = std::mem::take(&mut func.block_order);
-    let mut new_blocks: HashMap<Block, X86ISelBlock> = HashMap::with_capacity(len);
+    let mut new_blocks: crate::fast_hash::FxHashMap<Block, X86ISelBlock> =
+        crate::fast_hash::FxHashMap::with_capacity_and_hasher(len, Default::default());
     for old_id in &order {
         let Some(mut blk) = func.blocks.remove(old_id) else {
             continue;

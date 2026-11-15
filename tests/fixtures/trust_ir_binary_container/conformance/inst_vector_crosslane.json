@@ -1,0 +1,388 @@
+{
+  "name": "inst_vector_crosslane",
+  "functions": [
+    {
+      "id": 0,
+      "name": "portable_vector_crosslane",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Vector": [
+                  "I32",
+                  4
+                ]
+              }
+            ],
+            [
+              1,
+              {
+                "Vector": [
+                  "I64",
+                  2
+                ]
+              }
+            ],
+            [
+              2,
+              {
+                "Vector": [
+                  "F32",
+                  4
+                ]
+              }
+            ],
+            [
+              3,
+              {
+                "Vector": [
+                  "F64",
+                  2
+                ]
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "DialectOp": {
+                  "dialect": "vector",
+                  "op": "reduce",
+                  "operands": [
+                    0
+                  ],
+                  "result_tys": [
+                    "I32"
+                  ],
+                  "attrs": [
+                    {
+                      "name": "vector_ty",
+                      "value": {
+                        "Ty": {
+                          "Vector": [
+                            "I32",
+                            4
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "name": "kind",
+                      "value": {
+                        "Str": "add"
+                      }
+                    }
+                  ],
+                  "version": 1
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "DialectOp": {
+                  "dialect": "vector",
+                  "op": "reduce",
+                  "operands": [
+                    1
+                  ],
+                  "result_tys": [
+                    "I64"
+                  ],
+                  "attrs": [
+                    {
+                      "name": "vector_ty",
+                      "value": {
+                        "Ty": {
+                          "Vector": [
+                            "I64",
+                            2
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "name": "kind",
+                      "value": {
+                        "Str": "or"
+                      }
+                    }
+                  ],
+                  "version": 1
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "DialectOp": {
+                  "dialect": "vector",
+                  "op": "shuffle",
+                  "operands": [
+                    0
+                  ],
+                  "result_tys": [
+                    {
+                      "Vector": [
+                        "I32",
+                        4
+                      ]
+                    }
+                  ],
+                  "attrs": [
+                    {
+                      "name": "indices",
+                      "value": {
+                        "Bytes": [
+                          3,
+                          2,
+                          1,
+                          0
+                        ]
+                      }
+                    }
+                  ],
+                  "version": 1
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "DialectOp": {
+                  "dialect": "vector",
+                  "op": "shuffle",
+                  "operands": [
+                    1
+                  ],
+                  "result_tys": [
+                    {
+                      "Vector": [
+                        "I64",
+                        2
+                      ]
+                    }
+                  ],
+                  "attrs": [
+                    {
+                      "name": "indices",
+                      "value": {
+                        "Bytes": [
+                          1,
+                          1
+                        ]
+                      }
+                    }
+                  ],
+                  "version": 1
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "DialectOp": {
+                  "dialect": "vector",
+                  "op": "fma",
+                  "operands": [
+                    2,
+                    2,
+                    2
+                  ],
+                  "result_tys": [
+                    {
+                      "Vector": [
+                        "F32",
+                        4
+                      ]
+                    }
+                  ],
+                  "attrs": [],
+                  "version": 1
+                }
+              },
+              "results": [
+                8
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "DialectOp": {
+                  "dialect": "vector",
+                  "op": "fma",
+                  "operands": [
+                    3,
+                    3,
+                    3
+                  ],
+                  "result_tys": [
+                    {
+                      "Vector": [
+                        "F64",
+                        2
+                      ]
+                    }
+                  ],
+                  "attrs": [],
+                  "version": 1
+                }
+              },
+              "results": [
+                9
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4,
+                    5,
+                    6,
+                    7,
+                    8,
+                    9
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "Vector": [
+            "I32",
+            4
+          ]
+        },
+        {
+          "Vector": [
+            "I64",
+            2
+          ]
+        },
+        {
+          "Vector": [
+            "F32",
+            4
+          ]
+        },
+        {
+          "Vector": [
+            "F64",
+            2
+          ]
+        }
+      ],
+      "returns": [
+        "I32",
+        "I64",
+        {
+          "Vector": [
+            "I32",
+            4
+          ]
+        },
+        {
+          "Vector": [
+            "I64",
+            2
+          ]
+        },
+        {
+          "Vector": [
+            "F32",
+            4
+          ]
+        },
+        {
+          "Vector": [
+            "F64",
+            2
+          ]
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

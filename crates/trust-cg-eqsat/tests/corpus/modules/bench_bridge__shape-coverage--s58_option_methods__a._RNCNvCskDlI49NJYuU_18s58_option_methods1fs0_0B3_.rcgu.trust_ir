@@ -1,0 +1,26 @@
+; TrustIr text format v1
+module "_RNCNvCskDlI49NJYuU_18s58_option_methods1fs0_0B3_"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (&u64) -> (bool)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNCNvCskDlI49NJYuU_18s58_option_methods1fs0_0B3_(functy.0) {
+bb0(%2: &u64):
+    %5 = load u64, ptr %2
+    %7 = const u64 2
+    %8 = const u64 1
+    %6 = and u64 %5, %8
+    %10 = const u64 0
+    %9 = icmp eq u64 %6, %10
+    ret %9
+}

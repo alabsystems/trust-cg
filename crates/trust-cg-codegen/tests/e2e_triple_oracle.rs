@@ -69,7 +69,8 @@ fn compile_trust_ir_module(module: &TrustIrModule) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("Trust Codegen compilation should succeed");
@@ -132,11 +133,14 @@ struct TestCase {
 ///   bb4 (exit): return result
 fn build_trust_ir_fibonacci_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fibonacci", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): check n <= 1
@@ -256,7 +260,9 @@ fn build_trust_ir_fibonacci_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -269,11 +275,14 @@ fn build_trust_ir_fibonacci_module() -> TrustIrModule {
 ///   bb3 (exit): return a
 fn build_trust_ir_gcd_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_gcd", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry)
@@ -344,7 +353,9 @@ fn build_trust_ir_gcd_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -356,11 +367,14 @@ fn build_trust_ir_gcd_module() -> TrustIrModule {
 /// bb3 (exit): return sum
 fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum_1_to_n", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): init sum=0, i=1
@@ -447,7 +461,9 @@ fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -462,11 +478,14 @@ fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
 ///   bb5: return acc
 fn build_trust_ir_factorial_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_factorial", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0: check n <= 1
@@ -587,7 +606,9 @@ fn build_trust_ir_factorial_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -596,11 +617,14 @@ fn build_trust_ir_factorial_module() -> TrustIrModule {
 /// bb0: if a > b -> bb1 (ret a) else bb2 (ret b)
 fn build_trust_ir_max_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_max_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -638,7 +662,9 @@ fn build_trust_ir_max_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -647,11 +673,14 @@ fn build_trust_ir_max_module() -> TrustIrModule {
 /// bb0: if x < 0 -> bb1 (ret 0-x) else bb2 (ret x)
 fn build_trust_ir_abs_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_abs_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -703,7 +732,9 @@ fn build_trust_ir_abs_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1375,4 +1406,13 @@ fn triple_oracle_test_split(
         eprintln!("  ALL THREE ORACLES AGREE");
         Ok(())
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

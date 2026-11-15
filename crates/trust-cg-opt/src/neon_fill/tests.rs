@@ -4,6 +4,7 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use super::*;
+use trust_cg_ir::MachInst;
 use trust_cg_ir::Signature;
 
 fn x(id: u32) -> MachOperand {
@@ -384,6 +385,174 @@ fn second_run_is_a_no_op_const_bound() {
     );
 }
 
+fn candidate_boundary_fixture() -> MachFunction {
+    build_fill(Cfg {
+        elem_size: 1,
+        bound: BoundK::Runtime,
+        val: Val::Invariant,
+        variant: Variant::Good,
+    })
+}
+
+fn candidate_boundary_plan(func: &MachFunction) -> Recognized {
+    let dom = DomTree::compute(func);
+    let loops = LoopAnalysis::compute(func, &dom);
+    let def = build_def_map(func);
+    let loop_state = LoopStateIndex::literal(func);
+    loops
+        .all_loops()
+        .find_map(|lp| {
+            Recognized::recognize(func, &dom, &def, &loop_state, lp.header, lp.latch, &lp.body)
+        })
+        .expect("unmodified control must be recognized")
+}
+
+fn candidate_boundary_refusal(func: &mut MachFunction, rec: &Recognized) {
+    let before = format!("{func:?}");
+    assert!(!apply(func, rec));
+    assert_eq!(
+        format!("{func:?}"),
+        before,
+        "refusal must preserve the whole function"
+    );
+}
+
+#[test]
+fn candidate_boundary_early_exhaustion() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.next_vreg = u32::MAX;
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_late_exhaustion() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.next_vreg = u32::MAX - 1;
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_metadata_exhaustion() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.noalias_params.push(u32::MAX);
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_splice_refusal() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.inst_mut(rec.preheader_term).operands.clear();
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_missing_setup() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    for block in &mut func.blocks {
+        block.insts.retain(|id| *id != rec.preheader_term);
+    }
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_missing_layout() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    // Arm the boundary after immutable recognition; not a frontend repro.
+    func.block_order.retain(|id| *id != rec.header);
+    candidate_boundary_refusal(&mut func, &rec);
+}
+
+#[test]
+fn candidate_boundary_success_snapshot() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    assert!(apply(&mut func, &rec));
+    println!("CANDIDATE_SNAPSHOT: {func:?}");
+}
+
+#[test]
+fn candidate_boundary_public_entry_points_preserve_refusal() {
+    let mut control = candidate_boundary_fixture();
+    assert!(NeonFillPass::new().run(&mut control));
+    let mut func = candidate_boundary_fixture();
+    func.next_vreg = u32::MAX;
+    let before = format!("{func:?}");
+    let mut pass = NeonFillPass::new();
+    let mut analyses = AnalysisCache::new();
+    assert!(!pass.run(&mut func));
+    assert!(!pass.run_with_analyses(&mut func, &mut analyses));
+    assert_eq!(pass.fired(), 0);
+    assert_eq!(format!("{func:?}"), before);
+}
+
+#[test]
+fn candidate_boundary_sparse_ids_include_detached_and_noalias() {
+    let mut func = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&func);
+    let old_ids: HashSet<_> = func
+        .insts
+        .iter()
+        .flat_map(|inst| &inst.operands)
+        .filter_map(|op| op.as_vreg().map(|reg| reg.id))
+        .collect();
+    func.push_inst(MachInst::new(
+        AArch64Opcode::MovR,
+        vec![MachOperand::VReg(VReg::new(1_000_000_000, RegClass::Gpr64))],
+    ));
+    func.noalias_params.push(1_000_000_007);
+    func.next_vreg = 0;
+    let old_len = func.insts.len();
+    assert!(apply(&mut func, &rec));
+    let fresh: Vec<_> = func.insts[old_len..]
+        .iter()
+        .flat_map(|inst| &inst.operands)
+        .filter_map(|op| op.as_vreg().map(|reg| reg.id))
+        .filter(|id| !old_ids.contains(id))
+        .collect();
+    assert!(!fresh.is_empty());
+    assert!(fresh.iter().all(|id| *id > 1_000_000_007));
+    assert!(func.next_vreg > 1_000_000_007);
+}
+
+#[test]
+fn candidate_boundary_last_representable_range_preserves_construction() {
+    let original = candidate_boundary_fixture();
+    let rec = candidate_boundary_plan(&original);
+    let mut ordinary = original.clone();
+    ordinary.try_sync_vreg_counter().unwrap();
+    let first = ordinary.next_vreg;
+    assert!(apply(&mut ordinary, &rec));
+    let count = ordinary.next_vreg - first;
+    assert!(count > 1);
+    let mut boundary = original.clone();
+    let boundary_first = u32::MAX - count;
+    boundary.next_vreg = boundary_first;
+    assert!(apply(&mut boundary, &rec));
+    assert_eq!(boundary.next_vreg, u32::MAX);
+    for inst in &mut boundary.insts[original.insts.len()..] {
+        for operand in &mut inst.operands {
+            if let MachOperand::VReg(reg) = operand
+                && reg.id >= boundary_first
+            {
+                reg.id = first + (reg.id - boundary_first);
+            }
+        }
+    }
+    boundary.next_vreg = ordinary.next_vreg;
+    assert_eq!(format!("{boundary:?}"), format!("{ordinary:?}"));
+}
+
 #[test]
 fn fires_on_byte_fill_helper_shape() {
     let mut func = build_fill(Cfg {
@@ -424,11 +593,11 @@ fn fires_on_byte_fill_helper_shape() {
         .unwrap();
     let ops = &func.inst(stp).operands;
     assert_eq!(
-        vreg_of(&ops[0]),
-        vreg_of(&ops[1]),
+        ops[0].as_vreg(),
+        ops[1].as_vreg(),
         "STP stores the SAME broadcast Q twice"
     );
-    assert_eq!(imm_of(&ops[3]), Some(32), "post-index is 32 bytes");
+    assert_eq!(ops[3].as_imm(), Some(32), "post-index is 32 bytes");
     // The scalar store is UNCHANGED (still present).
     assert_eq!(
         count_op(&func, AArch64Opcode::StrbRI),
@@ -442,7 +611,7 @@ fn fires_on_byte_fill_helper_shape() {
         .iter()
         .flat_map(|b| b.insts.iter().copied())
         .filter(|&id| func.inst(id).opcode == AArch64Opcode::BCond)
-        .any(|id| imm_of(&func.inst(id).operands[0]) == Some(CC_HS));
+        .any(|id| func.inst(id).operands[0].as_imm() == Some(CC_HS));
     assert!(hs, "rotated do-while must emit the iv>=bound HS exit guard");
 }
 
@@ -466,7 +635,7 @@ fn fires_widths_h_s_d() {
             .find(|&id| func.inst(id).opcode == AArch64Opcode::NeonDupGen)
             .unwrap();
         assert_eq!(
-            imm_of(&func.inst(dup).operands[2]),
+            func.inst(dup).operands[2].as_imm(),
             Some(code),
             "DUP element-size code"
         );
@@ -478,7 +647,7 @@ fn fires_widths_h_s_d() {
             .find(|&id| func.inst(id).opcode == AArch64Opcode::NeonStpQPost)
             .unwrap();
         assert_eq!(
-            imm_of(&func.inst(stp).operands[3]),
+            func.inst(stp).operands[3].as_imm(),
             Some(32),
             "STP imm 32 for width {es}"
         );
@@ -513,7 +682,7 @@ fn const_byte_fill_uses_movi() {
         .find(|&id| func.inst(id).opcode == AArch64Opcode::NeonMovi)
         .unwrap();
     assert_eq!(
-        imm_of(&func.inst(movi).operands[1]),
+        func.inst(movi).operands[1].as_imm(),
         Some(0x41),
         "MOVI immediate is the byte"
     );
@@ -806,7 +975,7 @@ fn const_value_declines_a_merge_vreg() {
     );
     let def = build_def_map(&func);
     assert_eq!(
-        const_value(&func, &def, v3),
+        copied_const(&func, &def, v3),
         None,
         "a merge vreg must not resolve to whichever arm comes last in layout",
     );
@@ -823,5 +992,395 @@ fn const_value_declines_a_merge_vreg() {
     push(&mut single, e, Movz, vec![w(3), i(3)]);
     push(&mut single, e, Ret, vec![]);
     let def1 = build_def_map(&single);
-    assert_eq!(const_value(&single, &def1, v3), Some(3));
+    assert_eq!(copied_const(&single, &def1, v3), Some(3));
+}
+
+// ---------------------------------------------------------------------------
+// L14-P6: a function with many fill loops costs linearly in them
+// ---------------------------------------------------------------------------
+
+/// `loops` top-tested byte fills in sequence, each with its own induction,
+/// value and address registers and its own constant bound, plus a detached
+/// instruction and a block outside the layout that define registers too.
+fn build_fill_chain(loops: usize) -> MachFunction {
+    let mut func = MachFunction::new("chain".to_string(), Signature::new(vec![], vec![]));
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+    use AArch64Opcode::*;
+    let mut current = func.entry;
+    for k in 0..loops as u32 {
+        let header = func.create_block();
+        let body = func.create_block();
+        let latch = func.create_block();
+        let (value, iv, next, addr) = (100 + 4 * k, 101 + 4 * k, 102 + 4 * k, 103 + 4 * k);
+        push(
+            &mut func,
+            current,
+            Movz,
+            vec![w(value), i(0x11 * i64::from(k % 7 + 1))],
+        );
+        push(&mut func, current, Movz, vec![x(iv), i(0)]);
+        push(&mut func, current, B, vec![bl(header)]);
+        func.add_edge(current, header);
+        let exit = func.create_block();
+        push(
+            &mut func,
+            header,
+            CmpRI,
+            vec![x(iv), i(64 + 16 * i64::from(k))],
+        );
+        push(&mut func, header, BCond, vec![i(CC_LT), bl(body)]);
+        push(&mut func, header, B, vec![bl(exit)]);
+        push(&mut func, body, AddRR, vec![x(addr), x(0), x(iv)]);
+        push(&mut func, body, StrbRI, vec![w(value), x(addr), i(0)]);
+        push(&mut func, body, AddRI, vec![x(next), x(iv), i(1)]);
+        push(&mut func, body, B, vec![bl(latch)]);
+        push(&mut func, latch, AddRI, vec![x(iv), x(next), i(0)]);
+        push(&mut func, latch, B, vec![bl(header)]);
+        func.add_edge(header, body);
+        func.add_edge(header, exit);
+        func.add_edge(body, latch);
+        func.add_edge(latch, header);
+        current = exit;
+    }
+    push(&mut func, current, Ret, vec![]);
+    // Outside the layout: a detached instruction and a block not in
+    // `block_order`, each defining a register the layout also defines.
+    func.push_inst(MachInst::new(Movz, vec![x(0), i(1)]));
+    let detached = func.create_block();
+    push(&mut func, detached, Movz, vec![w(100), i(9)]);
+    func.block_order.retain(|&b| b != detached);
+    func
+}
+
+/// The recognition index answers exactly what the whole-function scans it
+/// replaced answer, for every id, instruction and register of each fixture
+/// (and some that are absent).
+#[test]
+fn def_index_answers_what_the_whole_function_scans_answer() {
+    let fixtures = [
+        build_fill_chain(1),
+        build_fill_chain(4),
+        build_fill_top_tested(100),
+        build_fill(Cfg {
+            elem_size: 4,
+            bound: BoundK::Runtime,
+            val: Val::Invariant,
+            variant: Variant::Good,
+        }),
+    ];
+    for func in &fixtures {
+        let index = build_def_map(func);
+        assert_eq!(index.reaching, crate::effects::build_reaching_def_map(func));
+        let max_id = func
+            .insts
+            .iter()
+            .flat_map(|inst| &inst.operands)
+            .filter_map(|op| op.as_vreg().map(|reg| reg.id))
+            .max()
+            .unwrap_or(0);
+        for id in 0..=max_id + 2 {
+            assert_eq!(
+                index.live_def_count(func, id),
+                crate::effects::live_def_count(func, id),
+                "id {id}"
+            );
+            for class in [RegClass::Gpr32, RegClass::Gpr64] {
+                let v = VReg::new(id, class);
+                let scanned = func.block_order.iter().any(|&bid| {
+                    func.block(bid)
+                        .insts
+                        .iter()
+                        .any(|&inst| crate::effects::inst_defines_vreg(func.inst(inst), v))
+                });
+                assert_eq!(index.defined_in_layout(func, v), scanned, "{v:?}");
+            }
+        }
+        for raw in 0..func.insts.len() as u32 + 2 {
+            assert_eq!(
+                index.block_of_inst(func, InstId(raw)),
+                block_of_inst(func, InstId(raw)),
+                "inst {raw}"
+            );
+        }
+        // The first questions were answered by the scans, the rest by the
+        // indexes: both paths were compared.
+        assert!(index.layout.get().is_some() && index.block_of.get().is_some());
+    }
+}
+
+/// A function that asks few questions never builds the whole-layout indexes.
+#[test]
+fn a_def_index_asked_few_questions_builds_no_layout_index() {
+    let func = build_fill_chain(4);
+    let index = build_def_map(&func);
+    for id in 0..LITERAL_QUESTIONS {
+        assert_eq!(
+            index.live_def_count(&func, id),
+            crate::effects::live_def_count(&func, id)
+        );
+        assert_eq!(
+            index.block_of_inst(&func, InstId(id)),
+            block_of_inst(&func, InstId(id))
+        );
+    }
+    assert!(index.layout.get().is_none() && index.block_of.get().is_none());
+    index.live_def_count(&func, 0);
+    index.block_of_inst(&func, InstId(0));
+    assert!(index.layout.get().is_some() && index.block_of.get().is_some());
+}
+
+/// A function with several fill loops vectorizes them all through one
+/// private candidate, and the result is exactly what applying them one at a
+/// time gives.
+#[test]
+fn a_chain_of_fill_loops_applies_as_one_candidate_like_one_at_a_time() {
+    for loops in [2, 3, 7] {
+        let mut batched = build_fill_chain(loops);
+        let mut per_plan = batched.clone();
+        let (changed, fired) = run(&mut batched);
+        FORCE_PER_PLAN.with(|force| force.set(true));
+        let (changed_per_plan, fired_per_plan) = run(&mut per_plan);
+        FORCE_PER_PLAN.with(|force| force.set(false));
+        assert!(changed && changed_per_plan, "{loops} loops");
+        assert_eq!(fired, loops);
+        assert_eq!(fired_per_plan, loops);
+        assert_eq!(
+            format!("{batched:?}"),
+            format!("{per_plan:?}"),
+            "{loops} loops"
+        );
+    }
+}
+
+/// The loop-state checks of one recognition sweep share one index of the
+/// function, so their liveness work grows with the function, not with the
+/// function times its loops: each loop of a fill chain leaves a register dead
+/// after it, whose literal walk visits the rest of the function. With a
+/// literal (per-check) index the work reads 2,095, 32,959 and 525,055 blocks
+/// at 16, 64 and 256 loops (x15.7 per step); with the shared one each 4x step
+/// stays within x5.
+#[test]
+fn liveness_work_of_a_recognition_sweep_grows_linearly() {
+    let work = |loops: usize| {
+        let mut func = build_fill_chain(loops);
+        let before = crate::loop_contract::liveness_work();
+        let (changed, fired) = run(&mut func);
+        assert!(changed && fired == loops, "{loops} loops: every fill fires");
+        crate::loop_contract::liveness_work() - before
+    };
+    let sizes = [16usize, 64, 256];
+    let costs: Vec<u64> = sizes.iter().map(|&n| work(n)).collect();
+    for step in 0..2 {
+        let ratio = costs[step + 1] as f64 / costs[step] as f64;
+        assert!(
+            ratio <= 5.0,
+            "liveness work grew x{ratio:.2} from {} to {} loops ({costs:?})",
+            sizes[step],
+            sizes[step + 1]
+        );
+    }
+}
+
+/// Two recognized plans are valid, but only the first fits the remaining
+/// register IDs. The batch must publish nothing when its second plan runs
+/// out, and the public pass must retain exactly the old per-plan prefix.
+#[test]
+fn a_late_batch_exhaustion_rolls_back_then_preserves_the_per_plan_prefix() {
+    let mut original = build_fill_chain(2);
+    original.try_sync_vreg_counter().expect("fixture IDs fit");
+    let dom = DomTree::compute(&original);
+    let loops = LoopAnalysis::compute(&original, &dom);
+    let def = build_def_map(&original);
+    let loop_state = LoopStateIndex::amortized(&original);
+    let plans: Vec<_> = loops
+        .all_loops()
+        .filter_map(|lp| {
+            Recognized::recognize(
+                &original,
+                &dom,
+                &def,
+                &loop_state,
+                lp.header,
+                lp.latch,
+                &lp.body,
+            )
+        })
+        .collect();
+    assert_eq!(plans.len(), 2, "both loops must be recognized");
+
+    // Establish that both plans work with ordinary IDs, and measure the
+    // first plan's actual allocation demand instead of hard-coding it.
+    let mut control = original.clone();
+    assert!(apply(&mut control, &plans[0]));
+    let needed = control.next_vreg - original.next_vreg;
+    assert!(needed > 0);
+    assert!(apply(&mut control, &plans[1]));
+
+    original.next_vreg = u32::MAX - needed;
+    let before = format!("{original:?}");
+    let mut batched = original.clone();
+    assert!(!apply_all(&mut batched, &plans));
+    assert_eq!(
+        format!("{batched:?}"),
+        before,
+        "a late batch refusal must publish no earlier plan's edits"
+    );
+
+    // The previous path commits the first plan and refuses the second.
+    // Its exact result includes the CFG, operands, metadata and counters.
+    let mut per_plan = original.clone();
+    assert!(apply(&mut per_plan, &plans[0]));
+    assert_eq!(per_plan.next_vreg, u32::MAX);
+    let prefix = format!("{per_plan:?}");
+    assert!(!apply(&mut per_plan, &plans[1]));
+    assert_eq!(format!("{per_plan:?}"), prefix);
+
+    let mut public = original;
+    let mut pass = NeonFillPass::new();
+    assert!(pass.run(&mut public));
+    assert_eq!(pass.fired(), 1, "only the first valid plan fits");
+    assert_eq!(
+        format!("{public:?}"),
+        format!("{per_plan:?}"),
+        "batch refusal and fallback must preserve the old per-plan result"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the vector loop reproduces only
+// `iv`, so any other carried or live-out register must refuse. The aarch64
+// `fill_u8` / `zero_u32` rows with a carried accumulator and the `fill_last`
+// row at N = 1024 were measured wrong through the whole bridge at O2/O3.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_fill_shape_refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build); 4] = [
+        ("rotated const byte fill", || {
+            build_fill(Cfg {
+                elem_size: 1,
+                bound: BoundK::Const(1024),
+                val: Val::ConstByte(7),
+                variant: Variant::Good,
+            })
+        }),
+        ("rotated const u32 zero fill", || {
+            build_fill(Cfg {
+                elem_size: 4,
+                bound: BoundK::Const(1024),
+                val: Val::ConstByte(0),
+                variant: Variant::Good,
+            })
+        }),
+        ("rotated runtime-bound invariant fill", || {
+            build_fill(Cfg {
+                elem_size: 1,
+                bound: BoundK::Runtime,
+                val: Val::Invariant,
+                variant: Variant::Good,
+            })
+        }),
+        ("top-tested byte fill", || build_fill_top_tested(8192)),
+    ];
+    let iv = VReg::new(10, RegClass::Gpr64);
+    let mut wrong = Vec::new();
+    for (name, build) in shapes {
+        assert!(
+            NeonFillPass::default().run(&mut build()),
+            "{name}: plain fixture fires"
+        );
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if NeonFillPass::default().run(&mut carried) {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if NeonFillPass::default().run(&mut live_out) {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+        // The control clause: before it this pass filled past a `break` (and
+        // past a bounds check against a shorter slice), measured on aarch64 at
+        // O2/O3.
+        let mut early_exit = build();
+        crate::loop_contract::test_support::add_early_exit(&mut early_exit, iv);
+        if NeonFillPass::default().run(&mut early_exit) {
+            wrong.push(format!("{name}: fired with an early exit"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state or control:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// The bridge's block-parameter form of a second recurrence beside the fill
+/// (`let mut c = 0u64; for i in 0..128 { a[i] = 0x5a; c += 3 } c`): `c`'s
+/// update sits in the body and its writeback is a latch copy next to the iv's,
+/// the copy form `find_induction` scans and skips because its step is 3.
+/// ```text
+/// bb0:    w3 = 0x5a; x10 = 0; x12 = 0; B header
+/// header: cmp x10, #128; b.lt body; B exit
+/// body:   x20 = x0 + x10; strb w3, [x20]; x11 = x10 + 1; x13 = x12 + 3; B latch
+/// latch:  x10 = x11 + 0; x12 = x13 + 0; B header
+/// exit:   x21 = x12; ret
+/// ```
+/// The vector loop advances only `x10`: at N = 128 it consumes every
+/// iteration, the scalar remainder runs zero times and `c` is returned as 0
+/// instead of 384. The pass must decline and leave the function unchanged.
+/// The refusing guard is the loop-state contract (`carried = [iv]`): `x12` is
+/// live into the header. Listing `x12` as carried there makes this fire.
+#[test]
+fn top_tested_fill_with_a_block_parameter_recurrence_declines() {
+    let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = func.entry;
+    let header = func.create_block();
+    let body = func.create_block();
+    let latch = func.create_block();
+    let exit = func.create_block();
+    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
+        let id = func.push_inst(MachInst::new(op, ops));
+        func.append_inst(blk, id);
+    };
+    use AArch64Opcode::*;
+    push(&mut func, bb0, Movz, vec![w(3), i(0x5a)]);
+    push(&mut func, bb0, Movz, vec![x(10), i(0)]);
+    push(&mut func, bb0, Movz, vec![x(12), i(0)]);
+    push(&mut func, bb0, B, vec![bl(header)]);
+    push(&mut func, header, CmpRI, vec![x(10), i(128)]);
+    push(&mut func, header, BCond, vec![i(CC_LT), bl(body)]);
+    push(&mut func, header, B, vec![bl(exit)]);
+    push(&mut func, body, AddRR, vec![x(20), x(0), x(10)]);
+    push(&mut func, body, StrbRI, vec![w(3), x(20), i(0)]);
+    push(&mut func, body, AddRI, vec![x(11), x(10), i(1)]);
+    push(&mut func, body, AddRI, vec![x(13), x(12), i(3)]);
+    push(&mut func, body, B, vec![bl(latch)]);
+    push(&mut func, latch, AddRI, vec![x(10), x(11), i(0)]);
+    push(&mut func, latch, AddRI, vec![x(12), x(13), i(0)]);
+    push(&mut func, latch, B, vec![bl(header)]);
+    push(&mut func, exit, MovR, vec![x(21), x(12)]);
+    push(&mut func, exit, Ret, vec![]);
+    func.add_edge(bb0, header);
+    func.add_edge(header, body);
+    func.add_edge(header, exit);
+    func.add_edge(body, latch);
+    func.add_edge(latch, header);
+
+    let before = format!("{func:?}");
+    let (changed, fired) = run(&mut func);
+    assert!(
+        !changed && fired == 0,
+        "vectorized a fill loop whose second recurrence x12 (c += 3) the vector loop never advances \
+         (changed={changed}, fired={fired})"
+    );
+    assert_eq!(
+        format!("{func:?}"),
+        before,
+        "a declined run must leave the function unchanged"
+    );
 }

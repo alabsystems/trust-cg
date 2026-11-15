@@ -1289,7 +1289,8 @@ pub fn run_host_jit_pgo(
 }
 
 /// Compile, run, write, and report a host-JIT block-count profile with
-/// explicit external symbol bindings.
+/// explicit external symbol bindings, under the DEFAULT codegen-license
+/// policy (claim-less bodies refused, roadmap WS7.5 / DG-73).
 #[allow(clippy::too_many_arguments)]
 pub fn run_host_jit_pgo_with_symbols(
     module: &trust_ir::Module,
@@ -1300,10 +1301,36 @@ pub fn run_host_jit_pgo_with_symbols(
     entry: HostJitPgoEntry,
     extern_symbols: &HashMap<String, *const u8>,
 ) -> Result<HostJitPgoGenerateResult, HostJitPgoRunnerError> {
+    run_host_jit_pgo_with_symbols_and_license(
+        module,
+        trust_ir_bytes,
+        config,
+        target_spec,
+        profile_path,
+        entry,
+        extern_symbols,
+        &trust_cg_lower::CodegenLicensePolicy::default(),
+    )
+}
+
+/// [`run_host_jit_pgo_with_symbols`] under an explicit trust-ir
+/// codegen-license policy.
+#[allow(clippy::too_many_arguments)]
+pub fn run_host_jit_pgo_with_symbols_and_license(
+    module: &trust_ir::Module,
+    trust_ir_bytes: &[u8],
+    config: &CompilerConfig,
+    target_spec: TargetSpec,
+    profile_path: &Path,
+    entry: HostJitPgoEntry,
+    extern_symbols: &HashMap<String, *const u8>,
+    license: &trust_cg_lower::CodegenLicensePolicy,
+) -> Result<HostJitPgoGenerateResult, HostJitPgoRunnerError> {
     validate_host_target(config, target_spec)?;
     let target = resolve_target(module, &entry)?;
 
-    let compiler = Compiler::new_for_target_spec(config.clone(), target_spec);
+    let compiler = Compiler::new_for_target_spec(config.clone(), target_spec)
+        .with_codegen_license(license.clone());
     let jit = compiler.compile_module_to_jit_with_profile_hooks(
         module,
         extern_symbols,
@@ -1346,7 +1373,9 @@ pub fn compile_host_jit_with_profile_use(
     )
 }
 
-/// Profile-use compile helper with explicit external symbol bindings.
+/// Profile-use compile helper with explicit external symbol bindings, under
+/// the DEFAULT codegen-license policy (claim-less bodies refused, roadmap
+/// WS7.5 / DG-73).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_host_jit_with_profile_use_and_symbols(
     module: &trust_ir::Module,
@@ -1357,13 +1386,39 @@ pub fn compile_host_jit_with_profile_use_and_symbols(
     profile_path: Option<&Path>,
     extern_symbols: &HashMap<String, *const u8>,
 ) -> Result<HostJitPgoUseResult, HostJitPgoRunnerError> {
+    compile_host_jit_with_profile_use_and_symbols_and_license(
+        module,
+        trust_ir_bytes,
+        config,
+        target_spec,
+        profile,
+        profile_path,
+        extern_symbols,
+        &trust_cg_lower::CodegenLicensePolicy::default(),
+    )
+}
+
+/// [`compile_host_jit_with_profile_use_and_symbols`] under an explicit
+/// trust-ir codegen-license policy.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_host_jit_with_profile_use_and_symbols_and_license(
+    module: &trust_ir::Module,
+    trust_ir_bytes: &[u8],
+    config: &CompilerConfig,
+    target_spec: TargetSpec,
+    profile: trust_cg_opt::pgo::ProfData,
+    profile_path: Option<&Path>,
+    extern_symbols: &HashMap<String, *const u8>,
+    license: &trust_cg_lower::CodegenLicensePolicy,
+) -> Result<HostJitPgoUseResult, HostJitPgoRunnerError> {
     validate_host_target(config, target_spec)?;
     let profile_key = pgo_cache_key(trust_ir_bytes, config, target_spec);
     trust_cg_opt::pgo::enforce_fresh(&profile, &profile_key)?;
 
     let scheduled = profile_use_enables_optimization(config.opt_level);
     let report = profile_use_report(&profile, profile_path, scheduled);
-    let compiler = Compiler::new_for_target_spec(config.clone(), target_spec);
+    let compiler = Compiler::new_for_target_spec(config.clone(), target_spec)
+        .with_codegen_license(license.clone());
     let compiler = if scheduled {
         compiler.with_profile_use(profile)
     } else {
@@ -1753,7 +1808,7 @@ mod tests {
             ),
             (
                 AArch64IsaProfile::APPLE_ARM64,
-                vec!["+neon", "+dotprod", "+fp16", "+lse"],
+                vec!["+neon", "+dotprod", "+fp16", "+lse", "+lse2"],
             ),
         ];
 

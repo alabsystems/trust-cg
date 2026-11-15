@@ -141,8 +141,6 @@ impl X86ProofGuardElimination {
 
     /// Ask the Certified-Elimination Kernel whether one carrier may be deleted.
     ///
-    /// Set `TCG_X86_GUARD_TRACE=1` to see every ACCEPT and, more usefully,
-    /// every KEEP with the kernel's reason — see [`x86_guard_trace`].
     /// Returns the minted certificate on Eliminate, `None` on Keep.
     ///
     /// #9: this does NOT record the elimination — the caller (`run_on_function`) records it with a
@@ -168,24 +166,9 @@ impl X86ProofGuardElimination {
             proof_obligation_id,
             lineage_digest,
         };
-        let obligation = receipt.proof_obligation_id;
         match decide(&receipt, &self.kernel_evidence) {
-            EliminationVerdict::Eliminate { certificate } => {
-                x86_guard_trace(|| format!("ACCEPT kind={kind:?} obligation={obligation:?}"));
-                Some(certificate)
-            }
-            // ⚑ The Keep REASON is the diagnostic that matters. Discarding it
-            // (`Keep { .. } => None`) makes every undischarged guard look
-            // identical to one that was never a candidate, and a surviving
-            // guard is runtime work in a hot loop — measured at 37 across the
-            // 18 bench programs where LLVM keeps 0. `decide` distinguishes six
-            // causes; without this they are indistinguishable from outside.
-            EliminationVerdict::Keep { reason } => {
-                x86_guard_trace(|| {
-                    format!("KEEP   kind={kind:?} obligation={obligation:?} reason={reason}")
-                });
-                None
-            }
+            EliminationVerdict::Eliminate { certificate } => Some(certificate),
+            EliminationVerdict::Keep { .. } => None,
         }
     }
 
@@ -272,27 +255,6 @@ impl X86ProofGuardElimination {
         }
 
         changed
-    }
-}
-
-/// Emit one guard-kernel decision line when `TCG_X86_GUARD_TRACE` is set to a
-/// non-empty value other than `0`.
-///
-/// ⚑ Logs ACCEPTS **and** KEEPS. A silence-only diagnostic proves nothing: a
-/// pass that never fires and a pass with nothing to do look identical, which is
-/// how several capabilities in this backend sat dormant while measurably
-/// costing runtime. Here the KEEP reason additionally says WHICH of the
-/// kernel's six fail-safe conditions stopped the elimination, so a surviving
-/// guard can be attributed instead of guessed at.
-///
-/// Takes a closure so the formatting cost is not paid when tracing is off —
-/// this runs once per guard carrier per function.
-fn x86_guard_trace(line: impl FnOnce() -> String) {
-    let on = std::env::var("TCG_X86_GUARD_TRACE")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    if on {
-        eprintln!("[x86-guard] {}", line());
     }
 }
 

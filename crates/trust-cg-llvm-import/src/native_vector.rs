@@ -5,10 +5,9 @@
 //
 // NATIVE 128-bit VECTOR LOWERING (the contracted shapes only).
 //
-// [`crate::vector`] scalarizes EVERY vector instruction into lanes. That is
-// correct for every width and it is what bought `-O2`/`-O3` import breadth,
-// but it multiplies the dynamic instruction count and destroys the loop
-// shapes trust-cg's own NEON vectorizers key on.
+// [`crate::vector`] expands supported vector instructions into scalar lanes.
+// Native planning keeps selected shapes packed, avoiding that expansion and
+// preserving loop shapes used by the backend's vector optimizations.
 //
 // This module decides, per function, which vector SSA values can instead be
 // carried as ONE `trust_ir` value of type `Ty::Vector(elem, lanes)` — a single
@@ -18,10 +17,9 @@
 //
 // `trust-cg-lower` already models a CONTRACTED set of 128-bit shapes end to
 // end (adapter -> LIR opcode -> AArch64 ISel -> encoder), and this module is
-// deliberately a strict SUBSET of what that pipeline has already proven. It
-// introduces NO new machine opcode, NO new lowering, and NO new proof
-// obligation: every instruction it emits is one the backend already accepts
-// from `rustc_codegen_trust_cg`'s `std::simd` path.
+// deliberately uses existing backend paths. It introduces no machine opcode;
+// each emitted instruction still has to satisfy lowering, encoding, and the
+// configured evidence policy. Planner admission is not a formal-proof claim.
 //
 // Admitted shapes ([`NATIVE_SHAPES`]):
 //
@@ -564,7 +562,7 @@ fn stored_value_shape(rest: &str) -> Option<Shape> {
         return None;
     }
     let tail = peel_flags(rest[opcode.len()..].trim_start());
-    let (val_part, _) = crate::parser::split_comma(&tail)?;
+    let (val_part, _) = crate::parser::split_comma(tail)?;
     let (ty, _) = split_ty_val(&val_part)?;
     native_shape(&ty)
 }
@@ -951,21 +949,21 @@ pub(crate) fn plan_function(body: &[(Option<String>, String)], enabled: bool) ->
     // insertelement's result: the emitted `DUP` reads the scalar `%x` directly,
     // so the source vector is judged purely on its other uses (typically none,
     // in which case it costs nothing).
-    for i in 0..descs.len() {
-        if !matches!(descs[i].form, Some(NativeForm::SplatLane0 { .. })) {
+    for desc in &mut descs {
+        if !matches!(desc.form, Some(NativeForm::SplatLane0 { .. })) {
             continue;
         }
-        let token = descs[i]
+        let token = desc
             .shuffle_src
             .as_ref()
             .and_then(|src| text_of.get(src))
             .and_then(|text| insert_lane0_into_undef(text));
         match token {
             Some(splat_token) => {
-                descs[i].form = Some(NativeForm::SplatLane0 { splat_token });
-                descs[i].vec_operands.clear();
+                desc.form = Some(NativeForm::SplatLane0 { splat_token });
+                desc.vec_operands.clear();
             }
-            None => descs[i].form = None,
+            None => desc.form = None,
         }
     }
 

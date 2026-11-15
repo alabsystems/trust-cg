@@ -128,7 +128,7 @@ fn mixed_zero_jit_module() -> trust_ir::Module {
     fb.ret(vec![f64_neg_zero_else]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -137,6 +137,7 @@ fn x86_host_jit_returns_f64_neg_zero_with_f32_pos_zero_in_same_pool() {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&mixed_zero_jit_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile mixed zero constant-pool module");
 
@@ -149,4 +150,16 @@ fn x86_host_jit_returns_f64_neg_zero_with_f32_pos_zero_in_same_pool() {
     };
 
     assert_eq!(mixed_zero_runtime().to_bits(), (-0.0_f64).to_bits());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+// Its callers are target-gated tests; on a host where none of them compiles
+// the helper is unused.
+#[allow(dead_code)]
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

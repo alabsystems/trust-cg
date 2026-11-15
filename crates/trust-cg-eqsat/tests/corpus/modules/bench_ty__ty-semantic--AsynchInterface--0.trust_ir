@@ -1,0 +1,3977 @@
+; TrustIr text format v1
+module "__ty_frontend_neutral_trust_ir_module"
+target "aarch64-apple-darwin" 8 little abi="darwinpcs"
+
+struct @SemanticPredicateResultV1 { status: u64 @0, payload: i64 @8 } size=16 align=8 repr=c id=0
+
+functy.0 = (ptr, u64) -> (struct.0)
+
+functy.1 = (ptr, u64) -> (struct.0)
+
+functy.2 = (ptr, i64) -> (struct.0)
+
+functy.3 = (ptr, i64, i64) -> (struct.0)
+
+functy.4 = (ptr) -> (struct.0)
+
+functy.5 = (ptr) -> (struct.0)
+
+functy.6 = (ptr, i64, i64) -> (struct.0)
+
+functy.7 = (ptr, i64, i64) -> (struct.0)
+
+functy.8 = (ptr, u64, u64) -> (struct.0)
+
+functy.9 = (ptr, u64) -> (struct.0)
+
+functy.10 = (ptr, u64, u64) -> (struct.0)
+
+functy.11 = (ptr, u64) -> (struct.0)
+
+functy.12 = (ptr, u64, i64) -> (struct.0)
+
+functy.13 = (ptr) -> (struct.0)
+
+functy.14 = (ptr, u64) -> (struct.0)
+
+functy.15 = (ptr, u64) -> (struct.0)
+
+functy.16 = (ptr) -> (struct.0)
+
+functy.17 = (ptr, ptr, ptr) -> (ptr, u64, i64, u64, u64)
+
+functy.18 = (ptr, ptr, ptr, functy.17, ptr) -> (ptr, u64, i64, u64, u64)
+
+functy.19 = (ptr) -> (struct.0)
+
+functy.20 = (ptr, u64, i64, u64) -> (struct.0)
+
+functy.21 = (ptr, u64) -> (struct.0)
+
+functy.22 = (ptr, u64) -> (struct.0)
+
+functy.23 = (ptr, u64) -> (struct.0)
+
+functy.24 = (ptr, u64) -> (struct.0)
+
+functy.25 = (ptr, u64) -> (struct.0)
+
+functy.26 = (ptr, u64, u64, u64, u64, u64) -> (struct.0)
+
+functy.27 = (ptr) -> (struct.0)
+
+functy.28 = (ptr, u64, u64) -> (struct.0)
+
+functy.29 = (ptr, i64, i64, u64) -> (struct.0)
+
+functy.30 = (ptr, u64) -> (struct.0)
+
+functy.31 = (ptr, ptr, u64) -> (struct.0)
+
+functy.32 = (ptr, ptr, ptr, functy.17, ptr, functy.17, ptr) -> (ptr, u64, i64, u64, u64)
+
+functy.33 = (ptr, ptr) -> ()
+
+type ty.0 = u8
+
+fn @__ty_trust_ir_func_0(functy.0) {
+}
+
+fn @__ty_trust_ir_func_1(functy.1) {
+}
+
+fn @__ty_trust_ir_func_2(functy.2) {
+}
+
+fn @__ty_trust_ir_func_3(functy.3) {
+}
+
+fn @__ty_trust_ir_func_4(functy.4) {
+}
+
+fn @__ty_trust_ir_func_5(functy.5) {
+}
+
+fn @__ty_trust_ir_func_6(functy.6) {
+}
+
+fn @__ty_trust_ir_func_7(functy.7) {
+}
+
+fn @__ty_trust_ir_func_8(functy.8) {
+}
+
+fn @__ty_trust_ir_func_9(functy.9) {
+}
+
+fn @__ty_trust_ir_func_10(functy.10) {
+}
+
+fn @__ty_trust_ir_func_11(functy.11) {
+}
+
+fn @__ty_trust_ir_func_12(functy.12) {
+}
+
+fn @__ty_trust_ir_func_13(functy.13) {
+}
+
+fn @__ty_trust_ir_func_14(functy.14) {
+}
+
+fn @__ty_trust_ir_func_15(functy.15) {
+}
+
+fn @__ty_trust_ir_func_16(functy.16) {
+}
+
+fn @__ty_trust_ir_func_17(functy.19) {
+}
+
+fn @__ty_trust_ir_func_18(functy.20) {
+}
+
+fn @__ty_trust_ir_func_19(functy.21) {
+}
+
+fn @__ty_trust_ir_func_20(functy.22) {
+}
+
+fn @__ty_trust_ir_func_21(functy.23) {
+}
+
+fn @__ty_trust_ir_func_22(functy.24) {
+}
+
+fn @__ty_trust_ir_func_23(functy.25) {
+}
+
+fn @__ty_trust_ir_func_24(functy.26) {
+}
+
+fn @__ty_trust_ir_func_25(functy.27) {
+}
+
+fn @__ty_trust_ir_func_26(functy.28) {
+}
+
+internal fastcc fn @__ty_trust_ir_func_27(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %3 = ptrtoint ptr %2 to i64
+    %4 = const u64 0
+    %5 = const u64 18446744073709551615
+    ret %1, %4, %3, %5, %5
+}
+
+fn @__ty_trust_ir_func_28(functy.29) {
+}
+
+fn @__ty_trust_ir_func_29(functy.30) {
+}
+
+fn @__ty_trust_ir_func_30(functy.31) {
+}
+
+internal fastcc fn @__ty_trust_ir_func_31(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb7
+bb1:
+    %18 = const u64 0
+    %19 = const u64 3
+    %20 = call @func.8(%0, %18, %19)
+    %21 = extractfield u64 %20, 0
+    %22 = extractfield i64 %20, 1
+    %23 = const i64 10
+    %24 = const u64 15
+    %25 = const u64 18446744073709551615
+    %26 = const u64 0
+    %27 = icmp eq u64 %21, %26
+    condbr %27, bb2, bb3(%1, %21, %23, %24, %25)
+bb2:
+    %28 = const functy.17 fndef<func.33>
+    %29 = null ptr
+    %30 = null ptr
+    %31, %32, %33, %34, %35 = call @func.32(%0, %1, %30, %28, %29)
+    %36 = const u64 0
+    %37 = icmp eq u64 %32, %36
+    condbr %37, bb4, bb3(%31, %32, %33, %34, %35)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb6(%3, %4, %5, %6, %7)
+bb4:
+    %38 = call @func.16(%0)
+    %39 = extractfield u64 %38, 0
+    %40 = extractfield i64 %38, 1
+    %41 = const i64 10
+    %42 = const u64 15
+    %43 = const u64 18446744073709551615
+    %44 = const u64 0
+    %45 = icmp eq u64 %39, %44
+    condbr %45, bb5, bb3(%31, %39, %41, %42, %43)
+bb5:
+    %46 = const i64 10
+    %47 = const u64 0
+    %48 = const u64 18446744073709551615
+    br bb6(%31, %47, %46, %48, %48)
+bb6(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %49 = call @func.5(%0)
+    %50 = extractfield u64 %49, 0
+    %51 = extractfield i64 %49, 1
+    %52 = const u64 0
+    %53 = icmp eq u64 %50, %52
+    %54 = select u64 %53, %9, %50
+    ret %8, %54, %10, %11, %12
+bb7:
+    %55 = const i64 0
+    %56 = const u64 18446744073709551615
+    ret %1, %14, %55, %56, %56
+}
+
+internal fastcc fn @__ty_trust_ir_func_32(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.39>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.40(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_33(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const u64 0
+    %19 = call @func.15(%0, %18)
+    %20 = extractfield u64 %19, 0
+    %21 = extractfield i64 %19, 1
+    %22 = const i64 10
+    %23 = const u64 15
+    %24 = const u64 18446744073709551615
+    %25 = const u64 0
+    %26 = icmp eq u64 %20, %25
+    condbr %26, bb2, bb3(%1, %20, %22, %23, %24)
+bb2:
+    %27 = const i64 10
+    %28 = const u64 0
+    %29 = const u64 18446744073709551615
+    br bb4(%1, %28, %27, %29, %29)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %30 = call @func.5(%0)
+    %31 = extractfield u64 %30, 0
+    %32 = extractfield i64 %30, 1
+    %33 = const u64 0
+    %34 = icmp eq u64 %31, %33
+    %35 = select u64 %34, %9, %31
+    ret %8, %35, %10, %11, %12
+bb5:
+    %36 = const i64 0
+    %37 = const u64 18446744073709551615
+    ret %1, %14, %36, %37, %37
+}
+
+internal fastcc fn @__ty_trust_ir_func_34(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb7
+bb1:
+    %18 = const u64 1
+    %19 = const u64 3
+    %20 = call @func.8(%0, %18, %19)
+    %21 = extractfield u64 %20, 0
+    %22 = extractfield i64 %20, 1
+    %23 = const i64 10
+    %24 = const u64 61
+    %25 = const u64 18446744073709551615
+    %26 = const u64 0
+    %27 = icmp eq u64 %21, %26
+    condbr %27, bb2, bb3(%1, %21, %23, %24, %25)
+bb2:
+    %28 = const functy.17 fndef<func.36>
+    %29 = null ptr
+    %30 = null ptr
+    %31, %32, %33, %34, %35 = call @func.35(%0, %1, %30, %28, %29)
+    %36 = const u64 0
+    %37 = icmp eq u64 %32, %36
+    condbr %37, bb4, bb3(%31, %32, %33, %34, %35)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb6(%3, %4, %5, %6, %7)
+bb4:
+    %38 = call @func.16(%0)
+    %39 = extractfield u64 %38, 0
+    %40 = extractfield i64 %38, 1
+    %41 = const i64 10
+    %42 = const u64 61
+    %43 = const u64 18446744073709551615
+    %44 = const u64 0
+    %45 = icmp eq u64 %39, %44
+    condbr %45, bb5, bb3(%31, %39, %41, %42, %43)
+bb5:
+    %46 = const i64 10
+    %47 = const u64 0
+    %48 = const u64 18446744073709551615
+    br bb6(%31, %47, %46, %48, %48)
+bb6(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %49 = call @func.5(%0)
+    %50 = extractfield u64 %49, 0
+    %51 = extractfield i64 %49, 1
+    %52 = const u64 0
+    %53 = icmp eq u64 %50, %52
+    %54 = select u64 %53, %9, %50
+    ret %8, %54, %10, %11, %12
+bb7:
+    %55 = const i64 0
+    %56 = const u64 18446744073709551615
+    ret %1, %14, %55, %56, %56
+}
+
+internal fastcc fn @__ty_trust_ir_func_35(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %25 = call @func.4(%0)
+    %26 = extractfield u64 %25, 0
+    %27 = extractfield i64 %25, 1
+    %28 = const u64 0
+    %29 = icmp eq u64 %26, %28
+    condbr %29, bb1, bb14
+bb1:
+    %30 = alloca [ty.0 x 16], align 8
+    %31 = const i64 0
+    %32 = gep inbounds i8, ptr %30, %31  ; #proof: in_bounds
+    store functy.17 %3, ptr %32
+    %33 = const i64 8
+    %34 = gep inbounds i8, ptr %30, %33  ; #proof: in_bounds
+    store ptr %4, ptr %34
+    %35 = const i64 0
+    %36 = gep inbounds i8, ptr %30, %35  ; #proof: in_bounds
+    %37 = load functy.17, ptr %36
+    %38 = const i64 8
+    %39 = gep inbounds i8, ptr %30, %38  ; #proof: in_bounds
+    %40 = load ptr, ptr %39
+    %41 = call @func.13(%0)
+    %42 = extractfield u64 %41, 0
+    %43 = extractfield i64 %41, 1
+    %44 = const i64 10
+    %45 = const u64 62
+    %46 = const u64 18446744073709551615
+    %47 = bitcast i64 %43 to u64
+    %48 = const u64 0
+    %49 = icmp eq u64 %42, %48
+    condbr %49, bb2, bb3(%1, %42, %44, %45, %46)
+bb2:
+    br bb4
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb13(%5, %6, %7, %8, %9)
+bb4:
+    %50 = null ptr
+    %51, %52, %53, %54, %55 = call @func.42(%0, %1, %50, %37, %40)
+    %56 = const u64 0
+    %57 = icmp eq u64 %52, %56
+    condbr %57, bb6, bb5(%51, %52, %53, %54, %55)
+bb5(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %58 = call @func.14(%0, %47)
+    %59 = extractfield u64 %58, 0
+    %60 = extractfield i64 %58, 1
+    %61 = const i64 10
+    %62 = const u64 62
+    %63 = const u64 18446744073709551615
+    %64 = const u64 0
+    %65 = icmp eq u64 %59, %64
+    condbr %65, bb3(%10, %11, %12, %13, %14), bb3(%10, %59, %61, %62, %63)
+bb6:
+    %66 = call @func.14(%0, %47)
+    %67 = extractfield u64 %66, 0
+    %68 = extractfield i64 %66, 1
+    %69 = const i64 10
+    %70 = const u64 62
+    %71 = const u64 18446744073709551615
+    %72 = const u64 0
+    %73 = icmp eq u64 %67, %72
+    condbr %73, bb7, bb3(%51, %67, %69, %70, %71)
+bb7:
+    %74 = call @func.13(%0)
+    %75 = extractfield u64 %74, 0
+    %76 = extractfield i64 %74, 1
+    %77 = const i64 10
+    %78 = const u64 63
+    %79 = const u64 18446744073709551615
+    %80 = bitcast i64 %76 to u64
+    %81 = const u64 0
+    %82 = icmp eq u64 %75, %81
+    condbr %82, bb8, bb3(%51, %75, %77, %78, %79)
+bb8:
+    br bb9
+bb9:
+    %83 = null ptr
+    %84, %85, %86, %87, %88 = call @func.43(%0, %51, %83, %37, %40)
+    %89 = const u64 0
+    %90 = icmp eq u64 %85, %89
+    condbr %90, bb11, bb10(%84, %85, %86, %87, %88)
+bb10(%15: ptr, %16: u64, %17: i64, %18: u64, %19: u64):
+    %91 = call @func.14(%0, %80)
+    %92 = extractfield u64 %91, 0
+    %93 = extractfield i64 %91, 1
+    %94 = const i64 10
+    %95 = const u64 63
+    %96 = const u64 18446744073709551615
+    %97 = const u64 0
+    %98 = icmp eq u64 %92, %97
+    condbr %98, bb3(%15, %16, %17, %18, %19), bb3(%15, %92, %94, %95, %96)
+bb11:
+    %99 = call @func.14(%0, %80)
+    %100 = extractfield u64 %99, 0
+    %101 = extractfield i64 %99, 1
+    %102 = const i64 10
+    %103 = const u64 63
+    %104 = const u64 18446744073709551615
+    %105 = const u64 0
+    %106 = icmp eq u64 %100, %105
+    condbr %106, bb12, bb3(%84, %100, %102, %103, %104)
+bb12:
+    %107 = const i64 10
+    %108 = const u64 0
+    %109 = const u64 18446744073709551615
+    br bb13(%84, %108, %107, %109, %109)
+bb13(%20: ptr, %21: u64, %22: i64, %23: u64, %24: u64):
+    %110 = call @func.5(%0)
+    %111 = extractfield u64 %110, 0
+    %112 = extractfield i64 %110, 1
+    %113 = const u64 0
+    %114 = icmp eq u64 %111, %113
+    %115 = select u64 %114, %21, %111
+    ret %20, %115, %22, %23, %24
+bb14:
+    %116 = const i64 0
+    %117 = const u64 18446744073709551615
+    ret %1, %26, %116, %117, %117
+}
+
+internal fastcc fn @__ty_trust_ir_func_36(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const u64 0
+    %19 = call @func.15(%0, %18)
+    %20 = extractfield u64 %19, 0
+    %21 = extractfield i64 %19, 1
+    %22 = const i64 10
+    %23 = const u64 61
+    %24 = const u64 18446744073709551615
+    %25 = const u64 0
+    %26 = icmp eq u64 %20, %25
+    condbr %26, bb2, bb3(%1, %20, %22, %23, %24)
+bb2:
+    %27 = const i64 10
+    %28 = const u64 0
+    %29 = const u64 18446744073709551615
+    br bb4(%1, %28, %27, %29, %29)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %30 = call @func.5(%0)
+    %31 = extractfield u64 %30, 0
+    %32 = extractfield i64 %30, 1
+    %33 = const u64 0
+    %34 = icmp eq u64 %31, %33
+    %35 = select u64 %34, %9, %31
+    ret %8, %35, %10, %11, %12
+bb5:
+    %36 = const i64 0
+    %37 = const u64 18446744073709551615
+    ret %1, %14, %36, %37, %37
+}
+
+internal fastcc fn @__ty_trust_ir_func_37(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb6
+bb1:
+    %18 = null ptr
+    %19, %20, %21, %22, %23 = call @func.38(%0, %1, %18)
+    %24 = const u64 0
+    %25 = icmp eq u64 %20, %24
+    condbr %25, bb2, bb3(%19, %20, %21, %22, %23)
+bb2:
+    %26 = call @func.2(%0, %21)
+    %27 = extractfield u64 %26, 0
+    %28 = extractfield i64 %26, 1
+    %29 = const i64 0
+    %30 = icmp ne i64 %28, %29
+    %31 = const u64 0
+    %32 = const u64 18446744073709551615
+    %33 = const u64 0
+    %34 = icmp eq u64 %27, %33
+    condbr %34, bb4, bb3(%19, %27, %21, %31, %32)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb5(%3, %4, %5, %6, %7)
+bb4:
+    %35 = const u64 0
+    %36 = const u64 18446744073709551615
+    br bb5(%19, %35, %21, %36, %36)
+bb5(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %37 = call @func.5(%0)
+    %38 = extractfield u64 %37, 0
+    %39 = extractfield i64 %37, 1
+    %40 = const u64 0
+    %41 = icmp eq u64 %38, %40
+    %42 = select u64 %41, %9, %38
+    ret %8, %42, %10, %11, %12
+bb6:
+    %43 = const i64 0
+    %44 = const u64 18446744073709551615
+    ret %1, %14, %43, %44, %44
+}
+
+internal fastcc fn @__ty_trust_ir_func_38(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %29 = call @func.4(%0)
+    %30 = extractfield u64 %29, 0
+    %31 = extractfield i64 %29, 1
+    %32 = const u64 0
+    %33 = icmp eq u64 %30, %32
+    condbr %33, bb1, bb27
+bb1:
+    %34 = const u64 0
+    %35 = call @func.0(%0, %34)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 3
+    %39 = const u64 18446744073709551615
+    %40 = const u64 0
+    %41 = icmp eq u64 %36, %40
+    condbr %41, bb2, bb3(%1, %36, %37, %38, %39)
+bb2:
+    %42 = const u64 4
+    %43 = const u64 0
+    %44 = call @func.1(%0, %43)
+    %45 = extractfield u64 %44, 0
+    %46 = extractfield i64 %44, 1
+    %47 = const u64 0
+    %48 = icmp eq u64 %45, %47
+    condbr %48, bb29, bb28(%45, %46, %42, %42)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb26(%3, %4, %5, %6, %7)
+bb4:
+    %49 = const u64 2
+    %50 = const u64 0
+    %51 = call @func.28(%0, %37, %18, %50)
+    %52 = extractfield u64 %51, 0
+    %53 = extractfield i64 %51, 1
+    %54 = const u64 13
+    %55 = icmp eq u64 %52, %54
+    %56 = const u64 4
+    %57 = select u64 %55, %56, %49
+    %58 = const u64 9
+    %59 = icmp eq u64 %52, %58
+    %60 = const u64 4
+    %61 = select u64 %59, %60, %57
+    %62 = const u64 0
+    %63 = icmp eq u64 %52, %62
+    condbr %63, bb5, bb3(%1, %52, %53, %49, %61)
+bb5:
+    %64 = call @func.2(%0, %53)
+    %65 = extractfield u64 %64, 0
+    %66 = extractfield i64 %64, 1
+    %67 = const i64 0
+    %68 = icmp ne i64 %66, %67
+    %69 = const u64 2
+    %70 = const u64 18446744073709551615
+    %71 = const u64 0
+    %72 = icmp eq u64 %65, %71
+    condbr %72, bb6, bb3(%1, %65, %53, %69, %70)
+bb6:
+    condbr %68, bb7, bb8
+bb7:
+    %73 = const u64 1
+    %74 = call @func.0(%0, %73)
+    %75 = extractfield u64 %74, 0
+    %76 = extractfield i64 %74, 1
+    %77 = const u64 6
+    %78 = const u64 18446744073709551615
+    %79 = const u64 0
+    %80 = icmp eq u64 %75, %79
+    condbr %80, bb10, bb3(%1, %75, %76, %77, %78)
+bb8:
+    %81 = const i64 2
+    br bb9(%1, %81)
+bb9(%8: ptr, %9: i64):
+    %82 = call @func.2(%0, %9)
+    %83 = extractfield u64 %82, 0
+    %84 = extractfield i64 %82, 1
+    %85 = const i64 0
+    %86 = icmp ne i64 %84, %85
+    %87 = const u64 1
+    %88 = const u64 18446744073709551615
+    %89 = const u64 0
+    %90 = icmp eq u64 %83, %89
+    condbr %90, bb16, bb3(%8, %83, %9, %87, %88)
+bb10:
+    %91 = const u64 8
+    %92 = const i64 1
+    %93 = const u64 0
+    %94 = const u64 0
+    %95 = icmp eq u64 %93, %94
+    condbr %95, bb11, bb3(%1, %93, %92, %91, %91)
+bb11:
+    %96 = const u64 9
+    %97 = const i64 9
+    %98 = const u64 0
+    %99 = const u64 0
+    %100 = icmp eq u64 %98, %99
+    condbr %100, bb12, bb3(%1, %98, %97, %96, %96)
+bb12:
+    %101 = const u64 7
+    %102 = const u64 2
+    %103 = call @func.29(%0, %102)
+    %104 = extractfield u64 %103, 0
+    %105 = extractfield i64 %103, 1
+    %106 = const u64 0
+    %107 = icmp eq u64 %104, %106
+    %108 = const i64 0
+    condbr %107, bb31, bb30(%104, %108, %101, %101)
+bb13:
+    %109 = const u64 5
+    %110 = const u64 0
+    %111 = call @func.28(%0, %76, %22, %110)
+    %112 = extractfield u64 %111, 0
+    %113 = extractfield i64 %111, 1
+    %114 = const u64 13
+    %115 = icmp eq u64 %112, %114
+    %116 = const u64 7
+    %117 = select u64 %115, %116, %109
+    %118 = const u64 9
+    %119 = icmp eq u64 %112, %118
+    %120 = const u64 7
+    %121 = select u64 %119, %120, %117
+    %122 = const u64 0
+    %123 = icmp eq u64 %112, %122
+    condbr %123, bb14, bb3(%1, %112, %113, %109, %121)
+bb14:
+    %124 = call @func.2(%0, %113)
+    %125 = extractfield u64 %124, 0
+    %126 = extractfield i64 %124, 1
+    %127 = const i64 0
+    %128 = icmp ne i64 %126, %127
+    %129 = const u64 5
+    %130 = const u64 18446744073709551615
+    %131 = const u64 0
+    %132 = icmp eq u64 %125, %131
+    condbr %132, bb15, bb3(%1, %125, %113, %129, %130)
+bb15:
+    br bb9(%1, %113)
+bb16:
+    condbr %86, bb17, bb18
+bb17:
+    %133 = const u64 2
+    %134 = call @func.0(%0, %133)
+    %135 = extractfield u64 %134, 0
+    %136 = extractfield i64 %134, 1
+    %137 = const u64 11
+    %138 = const u64 18446744073709551615
+    %139 = const u64 0
+    %140 = icmp eq u64 %135, %139
+    condbr %140, bb20, bb3(%8, %135, %136, %137, %138)
+bb18:
+    %141 = const i64 2
+    br bb19(%8, %141)
+bb19(%10: ptr, %11: i64):
+    %142 = const u64 0
+    %143 = const u64 18446744073709551615
+    br bb26(%10, %142, %11, %143, %143)
+bb20:
+    %144 = const u64 13
+    %145 = const i64 1
+    %146 = const u64 0
+    %147 = const u64 0
+    %148 = icmp eq u64 %146, %147
+    condbr %148, bb21, bb3(%8, %146, %145, %144, %144)
+bb21:
+    %149 = const u64 14
+    %150 = const i64 9
+    %151 = const u64 0
+    %152 = const u64 0
+    %153 = icmp eq u64 %151, %152
+    condbr %153, bb22, bb3(%8, %151, %150, %149, %149)
+bb22:
+    %154 = const u64 12
+    %155 = const u64 2
+    %156 = call @func.29(%0, %155)
+    %157 = extractfield u64 %156, 0
+    %158 = extractfield i64 %156, 1
+    %159 = const u64 0
+    %160 = icmp eq u64 %157, %159
+    %161 = const i64 0
+    condbr %160, bb33, bb32(%157, %161, %154, %154)
+bb23:
+    %162 = const u64 10
+    %163 = const u64 0
+    %164 = call @func.28(%0, %136, %26, %163)
+    %165 = extractfield u64 %164, 0
+    %166 = extractfield i64 %164, 1
+    %167 = const u64 13
+    %168 = icmp eq u64 %165, %167
+    %169 = const u64 12
+    %170 = select u64 %168, %169, %162
+    %171 = const u64 9
+    %172 = icmp eq u64 %165, %171
+    %173 = const u64 12
+    %174 = select u64 %172, %173, %170
+    %175 = const u64 0
+    %176 = icmp eq u64 %165, %175
+    condbr %176, bb24, bb3(%8, %165, %166, %162, %174)
+bb24:
+    %177 = call @func.2(%0, %166)
+    %178 = extractfield u64 %177, 0
+    %179 = extractfield i64 %177, 1
+    %180 = const i64 0
+    %181 = icmp ne i64 %179, %180
+    %182 = const u64 10
+    %183 = const u64 18446744073709551615
+    %184 = const u64 0
+    %185 = icmp eq u64 %178, %184
+    condbr %185, bb25, bb3(%8, %178, %166, %182, %183)
+bb25:
+    br bb19(%8, %166)
+bb26(%12: ptr, %13: u64, %14: i64, %15: u64, %16: u64):
+    %186 = call @func.5(%0)
+    %187 = extractfield u64 %186, 0
+    %188 = extractfield i64 %186, 1
+    %189 = const u64 0
+    %190 = icmp eq u64 %187, %189
+    %191 = select u64 %190, %13, %187
+    ret %12, %191, %14, %15, %16
+bb27:
+    %192 = const i64 0
+    %193 = const u64 18446744073709551615
+    ret %1, %30, %192, %193, %193
+bb28(%17: u64, %18: i64, %19: u64, %20: u64):
+    %194 = const u64 0
+    %195 = icmp eq u64 %17, %194
+    condbr %195, bb4, bb3(%1, %17, %18, %19, %20)
+bb29:
+    %196 = const u64 0
+    br bb28(%196, %46, %42, %42)
+bb30(%21: u64, %22: i64, %23: u64, %24: u64):
+    %197 = const u64 0
+    %198 = icmp eq u64 %21, %197
+    condbr %198, bb13, bb3(%1, %21, %22, %23, %24)
+bb31:
+    %199 = inttoptr i64 %105 to ptr
+    %200 = const i64 0
+    %201 = gep i8, ptr %199, %200
+    store i64 %92, ptr %201
+    %202 = const i64 8
+    %203 = gep i8, ptr %199, %202
+    store i64 %97, ptr %203
+    %204 = call @func.30(%0, %199, %102)
+    %205 = extractfield u64 %204, 0
+    %206 = extractfield i64 %204, 1
+    br bb30(%205, %206, %101, %101)
+bb32(%25: u64, %26: i64, %27: u64, %28: u64):
+    %207 = const u64 0
+    %208 = icmp eq u64 %25, %207
+    condbr %208, bb23, bb3(%8, %25, %26, %27, %28)
+bb33:
+    %209 = inttoptr i64 %158 to ptr
+    %210 = const i64 0
+    %211 = gep i8, ptr %209, %210
+    store i64 %145, ptr %211
+    %212 = const i64 8
+    %213 = gep i8, ptr %209, %212
+    store i64 %150, ptr %213
+    %214 = call @func.30(%0, %209, %155)
+    %215 = extractfield u64 %214, 0
+    %216 = extractfield i64 %214, 1
+    br bb32(%215, %216, %154, %154)
+}
+
+internal fastcc fn @__ty_trust_ir_func_39(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.41(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_40(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.44>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.45(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_41(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb10
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 2
+    %32 = const u64 1
+    %33 = call @func.0(%0, %32)
+    %34 = extractfield u64 %33, 0
+    %35 = extractfield i64 %33, 1
+    %36 = const u64 27
+    %37 = const u64 18446744073709551615
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%1, %34, %35, %36, %37)
+bb2:
+    %40 = call @func.12(%0, %31, %35)
+    %41 = extractfield u64 %40, 0
+    %42 = extractfield i64 %40, 1
+    %43 = const u64 25
+    %44 = const u64 18446744073709551615
+    %45 = const u64 0
+    %46 = icmp eq u64 %41, %45
+    condbr %46, bb4, bb3(%1, %41, %42, %43, %44)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb9(%5, %6, %7, %8, %9)
+bb4:
+    %47 = call @func.2(%0, %42)
+    %48 = extractfield u64 %47, 0
+    %49 = extractfield i64 %47, 1
+    %50 = const i64 0
+    %51 = icmp ne i64 %49, %50
+    %52 = const u64 25
+    %53 = const u64 18446744073709551615
+    %54 = const u64 0
+    %55 = icmp eq u64 %48, %54
+    condbr %55, bb5, bb3(%1, %48, %42, %52, %53)
+bb5:
+    condbr %51, bb6, bb7
+bb6:
+    %56, %57, %58, %59, %60 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %61 = const u64 0
+    %62 = icmp eq u64 %57, %61
+    condbr %62, bb8, bb3(%56, %57, %58, %59, %60)
+bb7:
+    %63 = const i64 10
+    %64 = const u64 0
+    %65 = const u64 18446744073709551615
+    br bb9(%1, %64, %63, %65, %65)
+bb8:
+    %66 = const i64 10
+    %67 = const u64 0
+    %68 = const u64 18446744073709551615
+    br bb9(%56, %67, %66, %68, %68)
+bb9(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %69 = call @func.5(%0)
+    %70 = extractfield u64 %69, 0
+    %71 = extractfield i64 %69, 1
+    %72 = const u64 0
+    %73 = icmp eq u64 %70, %72
+    %74 = select u64 %73, %11, %70
+    ret %10, %74, %12, %13, %14
+bb10:
+    %75 = const i64 0
+    %76 = const u64 18446744073709551615
+    ret %1, %16, %75, %76, %76
+}
+
+internal fastcc fn @__ty_trust_ir_func_42(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = null ptr
+    %32, %33, %34, %35, %36 = call @func.47(%0, %1, %31, %27, %30)
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%32, %33, %34, %35, %36)
+bb2:
+    %39 = const i64 10
+    %40 = const u64 0
+    %41 = const u64 18446744073709551615
+    br bb4(%32, %40, %39, %41, %41)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %42 = call @func.5(%0)
+    %43 = extractfield u64 %42, 0
+    %44 = extractfield i64 %42, 1
+    %45 = const u64 0
+    %46 = icmp eq u64 %43, %45
+    %47 = select u64 %46, %11, %43
+    ret %10, %47, %12, %13, %14
+bb5:
+    %48 = const i64 0
+    %49 = const u64 18446744073709551615
+    ret %1, %16, %48, %49, %49
+}
+
+internal fastcc fn @__ty_trust_ir_func_43(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = null ptr
+    %32, %33, %34, %35, %36 = call @func.49(%0, %1, %31, %27, %30)
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%32, %33, %34, %35, %36)
+bb2:
+    %39 = const i64 10
+    %40 = const u64 0
+    %41 = const u64 18446744073709551615
+    br bb4(%32, %40, %39, %41, %41)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %42 = call @func.5(%0)
+    %43 = extractfield u64 %42, 0
+    %44 = extractfield i64 %42, 1
+    %45 = const u64 0
+    %46 = icmp eq u64 %43, %45
+    %47 = select u64 %46, %11, %43
+    ret %10, %47, %12, %13, %14
+bb5:
+    %48 = const i64 0
+    %49 = const u64 18446744073709551615
+    ret %1, %16, %48, %49, %49
+}
+
+internal fastcc fn @__ty_trust_ir_func_44(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.46(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_45(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %35 = call @func.4(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    condbr %39, bb1, bb36
+bb1:
+    %40 = alloca [ty.0 x 16], align 8
+    %41 = const i64 0
+    %42 = gep inbounds i8, ptr %40, %41  ; #proof: in_bounds
+    store functy.17 %3, ptr %42
+    %43 = const i64 8
+    %44 = gep inbounds i8, ptr %40, %43  ; #proof: in_bounds
+    store ptr %4, ptr %44
+    %45 = const i64 0
+    %46 = gep inbounds i8, ptr %40, %45  ; #proof: in_bounds
+    %47 = load functy.17, ptr %46
+    %48 = const i64 8
+    %49 = gep inbounds i8, ptr %40, %48  ; #proof: in_bounds
+    %50 = load ptr, ptr %49
+    %51 = const u64 0
+    %52 = call @func.11(%0, %51)
+    %53 = extractfield u64 %52, 0
+    %54 = extractfield i64 %52, 1
+    %55 = const u64 17
+    %56 = const u64 18446744073709551615
+    %57 = const u64 0
+    %58 = icmp eq u64 %53, %57
+    condbr %58, bb2, bb3(%1, %53, %54, %55, %56)
+bb2:
+    %59 = call @func.2(%0, %54)
+    %60 = extractfield u64 %59, 0
+    %61 = extractfield i64 %59, 1
+    %62 = const i64 0
+    %63 = icmp ne i64 %61, %62
+    %64 = const u64 17
+    %65 = const u64 18446744073709551615
+    %66 = const u64 0
+    %67 = icmp eq u64 %60, %66
+    condbr %67, bb4, bb3(%1, %60, %54, %64, %65)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb35(%5, %6, %7, %8, %9)
+bb4:
+    condbr %63, bb5, bb6
+bb5:
+    %68 = const u64 0
+    %69 = call @func.0(%0, %68)
+    %70 = extractfield u64 %69, 0
+    %71 = extractfield i64 %69, 1
+    %72 = const u64 18
+    %73 = const u64 18446744073709551615
+    %74 = const u64 0
+    %75 = icmp eq u64 %70, %74
+    condbr %75, bb8, bb3(%1, %70, %71, %72, %73)
+bb6:
+    %76 = call @func.25(%0)
+    %77 = extractfield u64 %76, 0
+    %78 = extractfield i64 %76, 1
+    %79 = const u64 18446744073709551615
+    %80 = const u64 18446744073709551615
+    %81 = const i64 10
+    %82 = bitcast i64 %78 to u64
+    %83 = const u64 0
+    %84 = icmp eq u64 %77, %83
+    condbr %84, bb15, bb3(%1, %77, %81, %79, %80)
+bb7(%10: ptr):
+    %85 = const i64 10
+    %86 = const u64 0
+    %87 = const u64 18446744073709551615
+    br bb35(%10, %86, %85, %87, %87)
+bb8:
+    %88 = const u64 19
+    %89 = const u64 0
+    %90 = call @func.1(%0, %89)
+    %91 = extractfield u64 %90, 0
+    %92 = extractfield i64 %90, 1
+    %93 = const u64 0
+    %94 = icmp eq u64 %91, %93
+    condbr %94, bb40, bb39(%91, %92, %88, %88)
+bb9:
+    %95 = const u64 17
+    %96 = const u64 0
+    %97 = call @func.28(%0, %71, %32, %96)
+    %98 = extractfield u64 %97, 0
+    %99 = extractfield i64 %97, 1
+    %100 = const u64 13
+    %101 = icmp eq u64 %98, %100
+    %102 = const u64 19
+    %103 = select u64 %101, %102, %95
+    %104 = const u64 9
+    %105 = icmp eq u64 %98, %104
+    %106 = const u64 19
+    %107 = select u64 %105, %106, %103
+    %108 = const u64 0
+    %109 = icmp eq u64 %98, %108
+    condbr %109, bb10, bb3(%1, %98, %99, %95, %107)
+bb10:
+    %110 = call @func.2(%0, %99)
+    %111 = extractfield u64 %110, 0
+    %112 = extractfield i64 %110, 1
+    %113 = const i64 0
+    %114 = icmp ne i64 %112, %113
+    %115 = const u64 17
+    %116 = const u64 18446744073709551615
+    %117 = const u64 0
+    %118 = icmp eq u64 %111, %117
+    condbr %118, bb11, bb3(%1, %111, %99, %115, %116)
+bb11:
+    condbr %114, bb12, bb13
+bb12:
+    %119, %120, %121, %122, %123 = call_indirect %47(functy.17)(%0, %1, %50) cc=fastcc
+    %124 = const u64 0
+    %125 = icmp eq u64 %120, %124
+    condbr %125, bb14, bb3(%119, %120, %121, %122, %123)
+bb13:
+    %126 = const i64 10
+    %127 = const u64 0
+    %128 = const u64 18446744073709551615
+    br bb35(%1, %127, %126, %128, %128)
+bb14:
+    br bb7(%119)
+bb15:
+    br bb16
+bb16:
+    %129 = const u64 19
+    %130 = const u64 0
+    %131 = call @func.1(%0, %130)
+    %132 = extractfield u64 %131, 0
+    %133 = extractfield i64 %131, 1
+    %134 = const u64 0
+    %135 = icmp eq u64 %132, %134
+    condbr %135, bb38, bb37(%132, %133, %129, %129)
+bb17(%11: ptr, %12: u64, %13: i64, %14: u64, %15: u64):
+    %136 = call @func.23(%0, %82)
+    %137 = extractfield u64 %136, 0
+    %138 = extractfield i64 %136, 1
+    %139 = const u64 18446744073709551615
+    %140 = const u64 18446744073709551615
+    %141 = const i64 10
+    %142 = const u64 0
+    %143 = icmp eq u64 %137, %142
+    condbr %143, bb3(%11, %12, %13, %14, %15), bb3(%11, %137, %141, %139, %140)
+bb18:
+    %144 = const u64 1
+    %145 = call @func.18(%0, %82, %28, %144)
+    %146 = extractfield u64 %145, 0
+    %147 = extractfield i64 %145, 1
+    %148 = const u64 19
+    %149 = const u64 18446744073709551615
+    %150 = const i64 10
+    %151 = const u64 0
+    %152 = icmp eq u64 %146, %151
+    condbr %152, bb19, bb17(%1, %146, %150, %148, %149)
+bb19:
+    %153 = call @func.19(%0, %82)
+    %154 = extractfield u64 %153, 0
+    %155 = extractfield i64 %153, 1
+    %156 = const u64 18446744073709551615
+    %157 = const u64 18446744073709551615
+    %158 = const i64 10
+    %159 = const u64 0
+    %160 = icmp eq u64 %154, %159
+    condbr %160, bb20, bb17(%1, %154, %158, %156, %157)
+bb20:
+    br bb21(%1)
+bb21(%16: ptr):
+    %161 = call @func.20(%0, %82)
+    %162 = extractfield u64 %161, 0
+    %163 = extractfield i64 %161, 1
+    %164 = const u64 18446744073709551615
+    %165 = const u64 18446744073709551615
+    %166 = const i64 10
+    %167 = bitcast i64 %163 to u64
+    %168 = const u64 0
+    %169 = icmp ne u64 %167, %168
+    %170 = const u64 0
+    %171 = icmp eq u64 %162, %170
+    condbr %171, bb24, bb17(%16, %162, %166, %164, %165)
+bb22:
+    %172 = const u64 0
+    %173 = const u64 0
+    %174 = const u64 1
+    %175 = const u64 0
+    %176 = call @func.24(%0, %167, %172, %173, %174, %175)
+    %177 = extractfield u64 %176, 0
+    %178 = extractfield i64 %176, 1
+    %179 = const u64 19
+    %180 = const u64 18446744073709551615
+    %181 = const u64 0
+    %182 = icmp eq u64 %177, %181
+    condbr %182, bb25, bb17(%16, %177, %178, %179, %180)
+bb23:
+    %183 = call @func.23(%0, %82)
+    %184 = extractfield u64 %183, 0
+    %185 = extractfield i64 %183, 1
+    %186 = const u64 18446744073709551615
+    %187 = const u64 18446744073709551615
+    %188 = const i64 10
+    %189 = const u64 0
+    %190 = icmp eq u64 %184, %189
+    condbr %190, bb34, bb3(%16, %184, %188, %186, %187)
+bb24:
+    condbr %169, bb22, bb23
+bb25:
+    %191 = call @func.26(%0, %82, %167)
+    %192 = extractfield u64 %191, 0
+    %193 = extractfield i64 %191, 1
+    %194 = const u64 18446744073709551615
+    %195 = const u64 18446744073709551615
+    %196 = const i64 10
+    %197 = const u64 0
+    %198 = icmp eq u64 %192, %197
+    condbr %198, bb26, bb17(%16, %192, %196, %194, %195)
+bb26:
+    %199 = call @func.13(%0)
+    %200 = extractfield u64 %199, 0
+    %201 = extractfield i64 %199, 1
+    %202 = const i64 10
+    %203 = const u64 17
+    %204 = const u64 18446744073709551615
+    %205 = bitcast i64 %201 to u64
+    %206 = const u64 0
+    %207 = icmp eq u64 %200, %206
+    condbr %207, bb27, bb17(%16, %200, %202, %203, %204)
+bb27:
+    br bb28
+bb28:
+    %208 = null ptr
+    %209 = const functy.17 fndef<func.27>
+    %210 = inttoptr i64 %178 to ptr
+    %211, %212, %213, %214, %215 = call @func.51(%0, %16, %208, %47, %50, %209, %210)
+    %216 = const u64 0
+    %217 = icmp eq u64 %212, %216
+    condbr %217, bb30, bb29(%211, %212, %213, %214, %215)
+bb29(%17: ptr, %18: u64, %19: i64, %20: u64, %21: u64):
+    %218 = call @func.14(%0, %205)
+    %219 = extractfield u64 %218, 0
+    %220 = extractfield i64 %218, 1
+    %221 = const i64 10
+    %222 = const u64 17
+    %223 = const u64 18446744073709551615
+    %224 = const u64 0
+    %225 = icmp eq u64 %219, %224
+    condbr %225, bb17(%17, %18, %19, %20, %21), bb17(%17, %219, %221, %222, %223)
+bb30:
+    %226 = call @func.14(%0, %205)
+    %227 = extractfield u64 %226, 0
+    %228 = extractfield i64 %226, 1
+    %229 = const i64 10
+    %230 = const u64 17
+    %231 = const u64 18446744073709551615
+    %232 = const u64 0
+    %233 = icmp eq u64 %227, %232
+    condbr %233, bb31, bb17(%211, %227, %229, %230, %231)
+bb31:
+    %234 = call @func.21(%0, %82)
+    %235 = extractfield u64 %234, 0
+    %236 = extractfield i64 %234, 1
+    %237 = const u64 18446744073709551615
+    %238 = const u64 18446744073709551615
+    %239 = const i64 10
+    %240 = const u64 0
+    %241 = icmp eq u64 %235, %240
+    condbr %241, bb32, bb17(%211, %235, %239, %237, %238)
+bb32:
+    %242 = call @func.22(%0, %167)
+    %243 = extractfield u64 %242, 0
+    %244 = extractfield i64 %242, 1
+    %245 = const u64 18446744073709551615
+    %246 = const u64 18446744073709551615
+    %247 = const i64 10
+    %248 = const u64 0
+    %249 = icmp eq u64 %243, %248
+    condbr %249, bb33, bb17(%211, %243, %247, %245, %246)
+bb33:
+    br bb21(%211)
+bb34:
+    br bb7(%16)
+bb35(%22: ptr, %23: u64, %24: i64, %25: u64, %26: u64):
+    %250 = call @func.5(%0)
+    %251 = extractfield u64 %250, 0
+    %252 = extractfield i64 %250, 1
+    %253 = const u64 0
+    %254 = icmp eq u64 %251, %253
+    %255 = select u64 %254, %23, %251
+    ret %22, %255, %24, %25, %26
+bb36:
+    %256 = const i64 0
+    %257 = const u64 18446744073709551615
+    ret %1, %36, %256, %257, %257
+bb37(%27: u64, %28: i64, %29: u64, %30: u64):
+    %258 = const u64 0
+    %259 = icmp eq u64 %27, %258
+    condbr %259, bb18, bb17(%1, %27, %28, %29, %30)
+bb38:
+    %260 = const u64 0
+    br bb37(%260, %133, %129, %129)
+bb39(%31: u64, %32: i64, %33: u64, %34: u64):
+    %261 = const u64 0
+    %262 = icmp eq u64 %31, %261
+    condbr %262, bb9, bb3(%1, %31, %32, %33, %34)
+bb40:
+    %263 = const u64 0
+    br bb39(%263, %92, %88, %88)
+}
+
+internal fastcc fn @__ty_trust_ir_func_46(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %35 = call @func.4(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    condbr %39, bb1, bb40
+bb1:
+    %40 = alloca [ty.0 x 16], align 8
+    %41 = const i64 0
+    %42 = gep inbounds i8, ptr %40, %41  ; #proof: in_bounds
+    store functy.17 %3, ptr %42
+    %43 = const i64 8
+    %44 = gep inbounds i8, ptr %40, %43  ; #proof: in_bounds
+    store ptr %4, ptr %44
+    %45 = const i64 0
+    %46 = gep inbounds i8, ptr %40, %45  ; #proof: in_bounds
+    %47 = load functy.17, ptr %46
+    %48 = const i64 8
+    %49 = gep inbounds i8, ptr %40, %48  ; #proof: in_bounds
+    %50 = load ptr, ptr %49
+    %51 = const u64 1
+    %52 = call @func.11(%0, %51)
+    %53 = extractfield u64 %52, 0
+    %54 = extractfield i64 %52, 1
+    %55 = const u64 20
+    %56 = const u64 18446744073709551615
+    %57 = const u64 0
+    %58 = icmp eq u64 %53, %57
+    condbr %58, bb2, bb3(%1, %53, %54, %55, %56)
+bb2:
+    %59 = call @func.2(%0, %54)
+    %60 = extractfield u64 %59, 0
+    %61 = extractfield i64 %59, 1
+    %62 = const i64 0
+    %63 = icmp ne i64 %61, %62
+    %64 = const u64 20
+    %65 = const u64 18446744073709551615
+    %66 = const u64 0
+    %67 = icmp eq u64 %60, %66
+    condbr %67, bb4, bb3(%1, %60, %54, %64, %65)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb39(%5, %6, %7, %8, %9)
+bb4:
+    condbr %63, bb5, bb6
+bb5:
+    %68 = const u64 1
+    %69 = call @func.0(%0, %68)
+    %70 = extractfield u64 %69, 0
+    %71 = extractfield i64 %69, 1
+    %72 = const u64 21
+    %73 = const u64 18446744073709551615
+    %74 = const u64 0
+    %75 = icmp eq u64 %70, %74
+    condbr %75, bb8, bb3(%1, %70, %71, %72, %73)
+bb6:
+    %76 = call @func.25(%0)
+    %77 = extractfield u64 %76, 0
+    %78 = extractfield i64 %76, 1
+    %79 = const u64 18446744073709551615
+    %80 = const u64 18446744073709551615
+    %81 = const i64 10
+    %82 = bitcast i64 %78 to u64
+    %83 = const u64 0
+    %84 = icmp eq u64 %77, %83
+    condbr %84, bb17, bb3(%1, %77, %81, %79, %80)
+bb7(%10: ptr):
+    %85 = const i64 10
+    %86 = const u64 0
+    %87 = const u64 18446744073709551615
+    br bb39(%10, %86, %85, %87, %87)
+bb8:
+    %88 = const u64 23
+    %89 = const i64 1
+    %90 = const u64 0
+    %91 = const u64 0
+    %92 = icmp eq u64 %90, %91
+    condbr %92, bb9, bb3(%1, %90, %89, %88, %88)
+bb9:
+    %93 = const u64 24
+    %94 = const i64 9
+    %95 = const u64 0
+    %96 = const u64 0
+    %97 = icmp eq u64 %95, %96
+    condbr %97, bb10, bb3(%1, %95, %94, %93, %93)
+bb10:
+    %98 = const u64 22
+    %99 = const u64 2
+    %100 = call @func.29(%0, %99)
+    %101 = extractfield u64 %100, 0
+    %102 = extractfield i64 %100, 1
+    %103 = const u64 0
+    %104 = icmp eq u64 %101, %103
+    %105 = const i64 0
+    condbr %104, bb44, bb43(%101, %105, %98, %98)
+bb11:
+    %106 = const u64 20
+    %107 = const u64 0
+    %108 = call @func.28(%0, %71, %32, %107)
+    %109 = extractfield u64 %108, 0
+    %110 = extractfield i64 %108, 1
+    %111 = const u64 13
+    %112 = icmp eq u64 %109, %111
+    %113 = const u64 22
+    %114 = select u64 %112, %113, %106
+    %115 = const u64 9
+    %116 = icmp eq u64 %109, %115
+    %117 = const u64 22
+    %118 = select u64 %116, %117, %114
+    %119 = const u64 0
+    %120 = icmp eq u64 %109, %119
+    condbr %120, bb12, bb3(%1, %109, %110, %106, %118)
+bb12:
+    %121 = call @func.2(%0, %110)
+    %122 = extractfield u64 %121, 0
+    %123 = extractfield i64 %121, 1
+    %124 = const i64 0
+    %125 = icmp ne i64 %123, %124
+    %126 = const u64 20
+    %127 = const u64 18446744073709551615
+    %128 = const u64 0
+    %129 = icmp eq u64 %122, %128
+    condbr %129, bb13, bb3(%1, %122, %110, %126, %127)
+bb13:
+    condbr %125, bb14, bb15
+bb14:
+    %130, %131, %132, %133, %134 = call_indirect %47(functy.17)(%0, %1, %50) cc=fastcc
+    %135 = const u64 0
+    %136 = icmp eq u64 %131, %135
+    condbr %136, bb16, bb3(%130, %131, %132, %133, %134)
+bb15:
+    %137 = const i64 10
+    %138 = const u64 0
+    %139 = const u64 18446744073709551615
+    br bb39(%1, %138, %137, %139, %139)
+bb16:
+    br bb7(%130)
+bb17:
+    br bb18
+bb18:
+    %140 = const u64 23
+    %141 = const i64 1
+    %142 = const u64 0
+    %143 = const u64 0
+    %144 = icmp eq u64 %142, %143
+    condbr %144, bb20, bb19(%1, %142, %141, %140, %140)
+bb19(%11: ptr, %12: u64, %13: i64, %14: u64, %15: u64):
+    %145 = call @func.23(%0, %82)
+    %146 = extractfield u64 %145, 0
+    %147 = extractfield i64 %145, 1
+    %148 = const u64 18446744073709551615
+    %149 = const u64 18446744073709551615
+    %150 = const i64 10
+    %151 = const u64 0
+    %152 = icmp eq u64 %146, %151
+    condbr %152, bb3(%11, %12, %13, %14, %15), bb3(%11, %146, %150, %148, %149)
+bb20:
+    %153 = const u64 24
+    %154 = const i64 9
+    %155 = const u64 0
+    %156 = const u64 0
+    %157 = icmp eq u64 %155, %156
+    condbr %157, bb21, bb19(%1, %155, %154, %153, %153)
+bb21:
+    %158 = const u64 22
+    %159 = const u64 2
+    %160 = call @func.29(%0, %159)
+    %161 = extractfield u64 %160, 0
+    %162 = extractfield i64 %160, 1
+    %163 = const u64 0
+    %164 = icmp eq u64 %161, %163
+    %165 = const i64 0
+    condbr %164, bb42, bb41(%161, %165, %158, %158)
+bb22:
+    %166 = const u64 1
+    %167 = call @func.18(%0, %82, %28, %166)
+    %168 = extractfield u64 %167, 0
+    %169 = extractfield i64 %167, 1
+    %170 = const u64 22
+    %171 = const u64 18446744073709551615
+    %172 = const i64 10
+    %173 = const u64 0
+    %174 = icmp eq u64 %168, %173
+    condbr %174, bb23, bb19(%1, %168, %172, %170, %171)
+bb23:
+    %175 = call @func.19(%0, %82)
+    %176 = extractfield u64 %175, 0
+    %177 = extractfield i64 %175, 1
+    %178 = const u64 18446744073709551615
+    %179 = const u64 18446744073709551615
+    %180 = const i64 10
+    %181 = const u64 0
+    %182 = icmp eq u64 %176, %181
+    condbr %182, bb24, bb19(%1, %176, %180, %178, %179)
+bb24:
+    br bb25(%1)
+bb25(%16: ptr):
+    %183 = call @func.20(%0, %82)
+    %184 = extractfield u64 %183, 0
+    %185 = extractfield i64 %183, 1
+    %186 = const u64 18446744073709551615
+    %187 = const u64 18446744073709551615
+    %188 = const i64 10
+    %189 = bitcast i64 %185 to u64
+    %190 = const u64 0
+    %191 = icmp ne u64 %189, %190
+    %192 = const u64 0
+    %193 = icmp eq u64 %184, %192
+    condbr %193, bb28, bb19(%16, %184, %188, %186, %187)
+bb26:
+    %194 = const u64 0
+    %195 = const u64 0
+    %196 = const u64 1
+    %197 = const u64 0
+    %198 = call @func.24(%0, %189, %194, %195, %196, %197)
+    %199 = extractfield u64 %198, 0
+    %200 = extractfield i64 %198, 1
+    %201 = const u64 22
+    %202 = const u64 18446744073709551615
+    %203 = const u64 0
+    %204 = icmp eq u64 %199, %203
+    condbr %204, bb29, bb19(%16, %199, %200, %201, %202)
+bb27:
+    %205 = call @func.23(%0, %82)
+    %206 = extractfield u64 %205, 0
+    %207 = extractfield i64 %205, 1
+    %208 = const u64 18446744073709551615
+    %209 = const u64 18446744073709551615
+    %210 = const i64 10
+    %211 = const u64 0
+    %212 = icmp eq u64 %206, %211
+    condbr %212, bb38, bb3(%16, %206, %210, %208, %209)
+bb28:
+    condbr %191, bb26, bb27
+bb29:
+    %213 = call @func.26(%0, %82, %189)
+    %214 = extractfield u64 %213, 0
+    %215 = extractfield i64 %213, 1
+    %216 = const u64 18446744073709551615
+    %217 = const u64 18446744073709551615
+    %218 = const i64 10
+    %219 = const u64 0
+    %220 = icmp eq u64 %214, %219
+    condbr %220, bb30, bb19(%16, %214, %218, %216, %217)
+bb30:
+    %221 = call @func.13(%0)
+    %222 = extractfield u64 %221, 0
+    %223 = extractfield i64 %221, 1
+    %224 = const i64 10
+    %225 = const u64 20
+    %226 = const u64 18446744073709551615
+    %227 = bitcast i64 %223 to u64
+    %228 = const u64 0
+    %229 = icmp eq u64 %222, %228
+    condbr %229, bb31, bb19(%16, %222, %224, %225, %226)
+bb31:
+    br bb32
+bb32:
+    %230 = null ptr
+    %231 = const functy.17 fndef<func.27>
+    %232 = inttoptr i64 %200 to ptr
+    %233, %234, %235, %236, %237 = call @func.52(%0, %16, %230, %47, %50, %231, %232)
+    %238 = const u64 0
+    %239 = icmp eq u64 %234, %238
+    condbr %239, bb34, bb33(%233, %234, %235, %236, %237)
+bb33(%17: ptr, %18: u64, %19: i64, %20: u64, %21: u64):
+    %240 = call @func.14(%0, %227)
+    %241 = extractfield u64 %240, 0
+    %242 = extractfield i64 %240, 1
+    %243 = const i64 10
+    %244 = const u64 20
+    %245 = const u64 18446744073709551615
+    %246 = const u64 0
+    %247 = icmp eq u64 %241, %246
+    condbr %247, bb19(%17, %18, %19, %20, %21), bb19(%17, %241, %243, %244, %245)
+bb34:
+    %248 = call @func.14(%0, %227)
+    %249 = extractfield u64 %248, 0
+    %250 = extractfield i64 %248, 1
+    %251 = const i64 10
+    %252 = const u64 20
+    %253 = const u64 18446744073709551615
+    %254 = const u64 0
+    %255 = icmp eq u64 %249, %254
+    condbr %255, bb35, bb19(%233, %249, %251, %252, %253)
+bb35:
+    %256 = call @func.21(%0, %82)
+    %257 = extractfield u64 %256, 0
+    %258 = extractfield i64 %256, 1
+    %259 = const u64 18446744073709551615
+    %260 = const u64 18446744073709551615
+    %261 = const i64 10
+    %262 = const u64 0
+    %263 = icmp eq u64 %257, %262
+    condbr %263, bb36, bb19(%233, %257, %261, %259, %260)
+bb36:
+    %264 = call @func.22(%0, %189)
+    %265 = extractfield u64 %264, 0
+    %266 = extractfield i64 %264, 1
+    %267 = const u64 18446744073709551615
+    %268 = const u64 18446744073709551615
+    %269 = const i64 10
+    %270 = const u64 0
+    %271 = icmp eq u64 %265, %270
+    condbr %271, bb37, bb19(%233, %265, %269, %267, %268)
+bb37:
+    br bb25(%233)
+bb38:
+    br bb7(%16)
+bb39(%22: ptr, %23: u64, %24: i64, %25: u64, %26: u64):
+    %272 = call @func.5(%0)
+    %273 = extractfield u64 %272, 0
+    %274 = extractfield i64 %272, 1
+    %275 = const u64 0
+    %276 = icmp eq u64 %273, %275
+    %277 = select u64 %276, %23, %273
+    ret %22, %277, %24, %25, %26
+bb40:
+    %278 = const i64 0
+    %279 = const u64 18446744073709551615
+    ret %1, %36, %278, %279, %279
+bb41(%27: u64, %28: i64, %29: u64, %30: u64):
+    %280 = const u64 0
+    %281 = icmp eq u64 %27, %280
+    condbr %281, bb22, bb19(%1, %27, %28, %29, %30)
+bb42:
+    %282 = inttoptr i64 %162 to ptr
+    %283 = const i64 0
+    %284 = gep i8, ptr %282, %283
+    store i64 %141, ptr %284
+    %285 = const i64 8
+    %286 = gep i8, ptr %282, %285
+    store i64 %154, ptr %286
+    %287 = call @func.30(%0, %282, %159)
+    %288 = extractfield u64 %287, 0
+    %289 = extractfield i64 %287, 1
+    br bb41(%288, %289, %158, %158)
+bb43(%31: u64, %32: i64, %33: u64, %34: u64):
+    %290 = const u64 0
+    %291 = icmp eq u64 %31, %290
+    condbr %291, bb11, bb3(%1, %31, %32, %33, %34)
+bb44:
+    %292 = inttoptr i64 %102 to ptr
+    %293 = const i64 0
+    %294 = gep i8, ptr %292, %293
+    store i64 %89, ptr %294
+    %295 = const i64 8
+    %296 = gep i8, ptr %292, %295
+    store i64 %94, ptr %296
+    %297 = call @func.30(%0, %292, %99)
+    %298 = extractfield u64 %297, 0
+    %299 = extractfield i64 %297, 1
+    br bb43(%298, %299, %98, %98)
+}
+
+internal fastcc fn @__ty_trust_ir_func_47(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = null ptr
+    %32, %33, %34, %35, %36 = call @func.48(%0, %1, %31, %27, %30)
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%32, %33, %34, %35, %36)
+bb2:
+    %39 = const i64 10
+    %40 = const u64 0
+    %41 = const u64 18446744073709551615
+    br bb4(%32, %40, %39, %41, %41)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %42 = call @func.5(%0)
+    %43 = extractfield u64 %42, 0
+    %44 = extractfield i64 %42, 1
+    %45 = const u64 0
+    %46 = icmp eq u64 %43, %45
+    %47 = select u64 %46, %11, %43
+    ret %10, %47, %12, %13, %14
+bb5:
+    %48 = const i64 0
+    %49 = const u64 18446744073709551615
+    ret %1, %16, %48, %49, %49
+}
+
+internal fastcc fn @__ty_trust_ir_func_48(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.53>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.54(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_49(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = null ptr
+    %32, %33, %34, %35, %36 = call @func.50(%0, %1, %31, %27, %30)
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%32, %33, %34, %35, %36)
+bb2:
+    %39 = const i64 10
+    %40 = const u64 0
+    %41 = const u64 18446744073709551615
+    br bb4(%32, %40, %39, %41, %41)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %42 = call @func.5(%0)
+    %43 = extractfield u64 %42, 0
+    %44 = extractfield i64 %42, 1
+    %45 = const u64 0
+    %46 = icmp eq u64 %43, %45
+    %47 = select u64 %46, %11, %43
+    ret %10, %47, %12, %13, %14
+bb5:
+    %48 = const i64 0
+    %49 = const u64 18446744073709551615
+    ret %1, %16, %48, %49, %49
+}
+
+internal fastcc fn @__ty_trust_ir_func_50(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.56>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.57(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_51(functy.32) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr, %5: functy.17, %6: ptr):
+    %17 = call @func.4(%0)
+    %18 = extractfield u64 %17, 0
+    %19 = extractfield i64 %17, 1
+    %20 = const u64 0
+    %21 = icmp eq u64 %18, %20
+    condbr %21, bb1, bb10
+bb1:
+    %22 = alloca [ty.0 x 32], align 8
+    %23 = const i64 0
+    %24 = gep inbounds i8, ptr %22, %23  ; #proof: in_bounds
+    store functy.17 %3, ptr %24
+    %25 = const i64 8
+    %26 = gep inbounds i8, ptr %22, %25  ; #proof: in_bounds
+    store ptr %4, ptr %26
+    %27 = const i64 16
+    %28 = gep inbounds i8, ptr %22, %27  ; #proof: in_bounds
+    store functy.17 %5, ptr %28
+    %29 = const i64 24
+    %30 = gep inbounds i8, ptr %22, %29  ; #proof: in_bounds
+    store ptr %6, ptr %30
+    %31 = const i64 0
+    %32 = gep inbounds i8, ptr %22, %31  ; #proof: in_bounds
+    %33 = load functy.17, ptr %32
+    %34 = const i64 8
+    %35 = gep inbounds i8, ptr %22, %34  ; #proof: in_bounds
+    %36 = load ptr, ptr %35
+    %37 = const i64 16
+    %38 = gep inbounds i8, ptr %22, %37  ; #proof: in_bounds
+    %39 = load functy.17, ptr %38
+    %40 = const i64 24
+    %41 = gep inbounds i8, ptr %22, %40  ; #proof: in_bounds
+    %42 = load ptr, ptr %41
+    %43, %44, %45, %46, %47 = call_indirect %39(functy.17)(%0, %1, %42) cc=fastcc
+    %48 = const u64 0
+    %49 = icmp eq u64 %44, %48
+    condbr %49, bb2, bb3(%43, %44, %45, %46, %47)
+bb2:
+    %50 = const u64 0
+    %51 = call @func.12(%0, %50, %45)
+    %52 = extractfield u64 %51, 0
+    %53 = extractfield i64 %51, 1
+    %54 = const u64 17
+    %55 = const u64 18446744073709551615
+    %56 = const u64 0
+    %57 = icmp eq u64 %52, %56
+    condbr %57, bb4, bb3(%43, %52, %53, %54, %55)
+bb3(%7: ptr, %8: u64, %9: i64, %10: u64, %11: u64):
+    br bb9(%7, %8, %9, %10, %11)
+bb4:
+    %58 = call @func.2(%0, %53)
+    %59 = extractfield u64 %58, 0
+    %60 = extractfield i64 %58, 1
+    %61 = const i64 0
+    %62 = icmp ne i64 %60, %61
+    %63 = const u64 17
+    %64 = const u64 18446744073709551615
+    %65 = const u64 0
+    %66 = icmp eq u64 %59, %65
+    condbr %66, bb5, bb3(%43, %59, %53, %63, %64)
+bb5:
+    condbr %62, bb6, bb7
+bb6:
+    %67, %68, %69, %70, %71 = call_indirect %33(functy.17)(%0, %43, %36) cc=fastcc
+    %72 = const u64 0
+    %73 = icmp eq u64 %68, %72
+    condbr %73, bb8, bb3(%67, %68, %69, %70, %71)
+bb7:
+    %74 = const i64 10
+    %75 = const u64 0
+    %76 = const u64 18446744073709551615
+    br bb9(%43, %75, %74, %76, %76)
+bb8:
+    %77 = const i64 10
+    %78 = const u64 0
+    %79 = const u64 18446744073709551615
+    br bb9(%67, %78, %77, %79, %79)
+bb9(%12: ptr, %13: u64, %14: i64, %15: u64, %16: u64):
+    %80 = call @func.5(%0)
+    %81 = extractfield u64 %80, 0
+    %82 = extractfield i64 %80, 1
+    %83 = const u64 0
+    %84 = icmp eq u64 %81, %83
+    %85 = select u64 %84, %13, %81
+    ret %12, %85, %14, %15, %16
+bb10:
+    %86 = const i64 0
+    %87 = const u64 18446744073709551615
+    ret %1, %18, %86, %87, %87
+}
+
+internal fastcc fn @__ty_trust_ir_func_52(functy.32) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr, %5: functy.17, %6: ptr):
+    %17 = call @func.4(%0)
+    %18 = extractfield u64 %17, 0
+    %19 = extractfield i64 %17, 1
+    %20 = const u64 0
+    %21 = icmp eq u64 %18, %20
+    condbr %21, bb1, bb10
+bb1:
+    %22 = alloca [ty.0 x 32], align 8
+    %23 = const i64 0
+    %24 = gep inbounds i8, ptr %22, %23  ; #proof: in_bounds
+    store functy.17 %3, ptr %24
+    %25 = const i64 8
+    %26 = gep inbounds i8, ptr %22, %25  ; #proof: in_bounds
+    store ptr %4, ptr %26
+    %27 = const i64 16
+    %28 = gep inbounds i8, ptr %22, %27  ; #proof: in_bounds
+    store functy.17 %5, ptr %28
+    %29 = const i64 24
+    %30 = gep inbounds i8, ptr %22, %29  ; #proof: in_bounds
+    store ptr %6, ptr %30
+    %31 = const i64 0
+    %32 = gep inbounds i8, ptr %22, %31  ; #proof: in_bounds
+    %33 = load functy.17, ptr %32
+    %34 = const i64 8
+    %35 = gep inbounds i8, ptr %22, %34  ; #proof: in_bounds
+    %36 = load ptr, ptr %35
+    %37 = const i64 16
+    %38 = gep inbounds i8, ptr %22, %37  ; #proof: in_bounds
+    %39 = load functy.17, ptr %38
+    %40 = const i64 24
+    %41 = gep inbounds i8, ptr %22, %40  ; #proof: in_bounds
+    %42 = load ptr, ptr %41
+    %43, %44, %45, %46, %47 = call_indirect %39(functy.17)(%0, %1, %42) cc=fastcc
+    %48 = const u64 0
+    %49 = icmp eq u64 %44, %48
+    condbr %49, bb2, bb3(%43, %44, %45, %46, %47)
+bb2:
+    %50 = const u64 1
+    %51 = call @func.12(%0, %50, %45)
+    %52 = extractfield u64 %51, 0
+    %53 = extractfield i64 %51, 1
+    %54 = const u64 20
+    %55 = const u64 18446744073709551615
+    %56 = const u64 0
+    %57 = icmp eq u64 %52, %56
+    condbr %57, bb4, bb3(%43, %52, %53, %54, %55)
+bb3(%7: ptr, %8: u64, %9: i64, %10: u64, %11: u64):
+    br bb9(%7, %8, %9, %10, %11)
+bb4:
+    %58 = call @func.2(%0, %53)
+    %59 = extractfield u64 %58, 0
+    %60 = extractfield i64 %58, 1
+    %61 = const i64 0
+    %62 = icmp ne i64 %60, %61
+    %63 = const u64 20
+    %64 = const u64 18446744073709551615
+    %65 = const u64 0
+    %66 = icmp eq u64 %59, %65
+    condbr %66, bb5, bb3(%43, %59, %53, %63, %64)
+bb5:
+    condbr %62, bb6, bb7
+bb6:
+    %67, %68, %69, %70, %71 = call_indirect %33(functy.17)(%0, %43, %36) cc=fastcc
+    %72 = const u64 0
+    %73 = icmp eq u64 %68, %72
+    condbr %73, bb8, bb3(%67, %68, %69, %70, %71)
+bb7:
+    %74 = const i64 10
+    %75 = const u64 0
+    %76 = const u64 18446744073709551615
+    br bb9(%43, %75, %74, %76, %76)
+bb8:
+    %77 = const i64 10
+    %78 = const u64 0
+    %79 = const u64 18446744073709551615
+    br bb9(%67, %78, %77, %79, %79)
+bb9(%12: ptr, %13: u64, %14: i64, %15: u64, %16: u64):
+    %80 = call @func.5(%0)
+    %81 = extractfield u64 %80, 0
+    %82 = extractfield i64 %80, 1
+    %83 = const u64 0
+    %84 = icmp eq u64 %81, %83
+    %85 = select u64 %84, %13, %81
+    ret %12, %85, %14, %15, %16
+bb10:
+    %86 = const i64 0
+    %87 = const u64 18446744073709551615
+    ret %1, %18, %86, %87, %87
+}
+
+internal fastcc fn @__ty_trust_ir_func_53(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.55(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_54(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.59>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.60(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_55(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = null ptr
+    %32 = const functy.18 fndef<func.63>
+    %33, %34, %35, %36, %37 = call_indirect %32(functy.18)(%0, %1, %31, %27, %30) cc=fastcc
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_56(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.58(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_57(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.64>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.65(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_58(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = null ptr
+    %32 = const functy.18 fndef<func.68>
+    %33, %34, %35, %36, %37 = call_indirect %32(functy.18)(%0, %1, %31, %27, %30) cc=fastcc
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_59(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.61(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_60(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.69>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.70(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_61(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb12
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 1
+    %32 = const u64 42
+    %33 = const i64 9
+    %34 = const u64 0
+    %35 = const u64 0
+    %36 = icmp eq u64 %34, %35
+    condbr %36, bb2, bb3(%1, %34, %33, %32, %32)
+bb2:
+    %37 = const u64 1
+    %38 = call @func.0(%0, %37)
+    %39 = extractfield u64 %38, 0
+    %40 = extractfield i64 %38, 1
+    %41 = const u64 43
+    %42 = const u64 18446744073709551615
+    %43 = const u64 0
+    %44 = icmp eq u64 %39, %43
+    condbr %44, bb4, bb3(%1, %39, %40, %41, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb11(%5, %6, %7, %8, %9)
+bb4:
+    %45 = call @func.6(%0, %33, %40)
+    %46 = extractfield u64 %45, 0
+    %47 = extractfield i64 %45, 1
+    %48 = const u64 41
+    %49 = const u64 42
+    %50 = const u64 43
+    %51 = const u64 2
+    %52 = icmp eq u64 %46, %51
+    %53 = select u64 %52, %49, %50
+    %54 = const u64 0
+    %55 = icmp eq u64 %46, %54
+    condbr %55, bb5, bb3(%1, %46, %47, %48, %53)
+bb5:
+    %56 = call @func.12(%0, %31, %47)
+    %57 = extractfield u64 %56, 0
+    %58 = extractfield i64 %56, 1
+    %59 = const u64 38
+    %60 = const u64 18446744073709551615
+    %61 = const u64 0
+    %62 = icmp eq u64 %57, %61
+    condbr %62, bb6, bb3(%1, %57, %58, %59, %60)
+bb6:
+    %63 = call @func.2(%0, %58)
+    %64 = extractfield u64 %63, 0
+    %65 = extractfield i64 %63, 1
+    %66 = const i64 0
+    %67 = icmp ne i64 %65, %66
+    %68 = const u64 38
+    %69 = const u64 18446744073709551615
+    %70 = const u64 0
+    %71 = icmp eq u64 %64, %70
+    condbr %71, bb7, bb3(%1, %64, %58, %68, %69)
+bb7:
+    condbr %67, bb8, bb9
+bb8:
+    %72, %73, %74, %75, %76 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %77 = const u64 0
+    %78 = icmp eq u64 %73, %77
+    condbr %78, bb10, bb3(%72, %73, %74, %75, %76)
+bb9:
+    %79 = const i64 10
+    %80 = const u64 0
+    %81 = const u64 18446744073709551615
+    br bb11(%1, %80, %79, %81, %81)
+bb10:
+    %82 = const i64 10
+    %83 = const u64 0
+    %84 = const u64 18446744073709551615
+    br bb11(%72, %83, %82, %84, %84)
+bb11(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %85 = call @func.5(%0)
+    %86 = extractfield u64 %85, 0
+    %87 = extractfield i64 %85, 1
+    %88 = const u64 0
+    %89 = icmp eq u64 %86, %88
+    %90 = select u64 %89, %11, %86
+    ret %10, %90, %12, %13, %14
+bb12:
+    %91 = const i64 0
+    %92 = const u64 18446744073709551615
+    ret %1, %16, %91, %92, %92
+}
+
+internal fastcc fn @__ty_trust_ir_func_62(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb10
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 2
+    %32 = call @func.0(%0, %31)
+    %33 = extractfield u64 %32, 0
+    %34 = extractfield i64 %32, 1
+    %35 = const u64 45
+    %36 = const u64 18446744073709551615
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%1, %33, %34, %35, %36)
+bb2:
+    %39 = const u64 2
+    %40 = call @func.12(%0, %39, %34)
+    %41 = extractfield u64 %40, 0
+    %42 = extractfield i64 %40, 1
+    %43 = const u64 45
+    %44 = const u64 18446744073709551615
+    %45 = const u64 0
+    %46 = icmp eq u64 %41, %45
+    condbr %46, bb4, bb3(%1, %41, %42, %43, %44)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb9(%5, %6, %7, %8, %9)
+bb4:
+    %47 = call @func.2(%0, %42)
+    %48 = extractfield u64 %47, 0
+    %49 = extractfield i64 %47, 1
+    %50 = const i64 0
+    %51 = icmp ne i64 %49, %50
+    %52 = const u64 45
+    %53 = const u64 18446744073709551615
+    %54 = const u64 0
+    %55 = icmp eq u64 %48, %54
+    condbr %55, bb5, bb3(%1, %48, %42, %52, %53)
+bb5:
+    condbr %51, bb6, bb7
+bb6:
+    %56, %57, %58, %59, %60 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %61 = const u64 0
+    %62 = icmp eq u64 %57, %61
+    condbr %62, bb8, bb3(%56, %57, %58, %59, %60)
+bb7:
+    %63 = const i64 10
+    %64 = const u64 0
+    %65 = const u64 18446744073709551615
+    br bb9(%1, %64, %63, %65, %65)
+bb8:
+    %66 = const i64 10
+    %67 = const u64 0
+    %68 = const u64 18446744073709551615
+    br bb9(%56, %67, %66, %68, %68)
+bb9(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %69 = call @func.5(%0)
+    %70 = extractfield u64 %69, 0
+    %71 = extractfield i64 %69, 1
+    %72 = const u64 0
+    %73 = icmp eq u64 %70, %72
+    %74 = select u64 %73, %11, %70
+    ret %10, %74, %12, %13, %14
+bb10:
+    %75 = const i64 0
+    %76 = const u64 18446744073709551615
+    ret %1, %16, %75, %76, %76
+}
+
+internal fastcc fn @__ty_trust_ir_func_63(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = null ptr
+    %21, %22, %23, %24, %25 = call @func.62(%0, %1, %20, %3, %4)
+    %26 = const u64 0
+    %27 = icmp eq u64 %22, %26
+    condbr %27, bb2, bb3(%21, %22, %23, %24, %25)
+bb2:
+    %28 = const i64 10
+    %29 = const u64 0
+    %30 = const u64 18446744073709551615
+    br bb4(%21, %29, %28, %30, %30)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %31 = call @func.5(%0)
+    %32 = extractfield u64 %31, 0
+    %33 = extractfield i64 %31, 1
+    %34 = const u64 0
+    %35 = icmp eq u64 %32, %34
+    %36 = select u64 %35, %11, %32
+    ret %10, %36, %12, %13, %14
+bb5:
+    %37 = const i64 0
+    %38 = const u64 18446744073709551615
+    ret %1, %16, %37, %38, %38
+}
+
+internal fastcc fn @__ty_trust_ir_func_64(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.66(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_65(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb11
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 1
+    %32 = call @func.0(%0, %31)
+    %33 = extractfield u64 %32, 0
+    %34 = extractfield i64 %32, 1
+    %35 = const u64 49
+    %36 = const u64 18446744073709551615
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%1, %33, %34, %35, %36)
+bb2:
+    %39 = const u64 2
+    %40 = call @func.0(%0, %39)
+    %41 = extractfield u64 %40, 0
+    %42 = extractfield i64 %40, 1
+    %43 = const u64 50
+    %44 = const u64 18446744073709551615
+    %45 = const u64 0
+    %46 = icmp eq u64 %41, %45
+    condbr %46, bb4, bb3(%1, %41, %42, %43, %44)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb10(%5, %6, %7, %8, %9)
+bb4:
+    %47 = call @func.7(%0, %34, %42)
+    %48 = extractfield u64 %47, 0
+    %49 = extractfield i64 %47, 1
+    %50 = const i64 0
+    %51 = icmp eq i64 %49, %50
+    %52 = const i64 10
+    %53 = const i64 2
+    %54 = select i64 %51, %52, %53
+    %55 = const u64 48
+    %56 = const u64 50
+    %57 = const u64 0
+    %58 = icmp eq u64 %48, %57
+    condbr %58, bb5, bb3(%1, %48, %54, %55, %56)
+bb5:
+    %59 = call @func.2(%0, %54)
+    %60 = extractfield u64 %59, 0
+    %61 = extractfield i64 %59, 1
+    %62 = const i64 0
+    %63 = icmp ne i64 %61, %62
+    %64 = const u64 48
+    %65 = const u64 18446744073709551615
+    %66 = const u64 0
+    %67 = icmp eq u64 %60, %66
+    condbr %67, bb6, bb3(%1, %60, %54, %64, %65)
+bb6:
+    condbr %63, bb7, bb8
+bb7:
+    %68, %69, %70, %71, %72 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %73 = const u64 0
+    %74 = icmp eq u64 %69, %73
+    condbr %74, bb9, bb3(%68, %69, %70, %71, %72)
+bb8:
+    %75 = const i64 10
+    %76 = const u64 0
+    %77 = const u64 18446744073709551615
+    br bb10(%1, %76, %75, %77, %77)
+bb9:
+    %78 = const i64 10
+    %79 = const u64 0
+    %80 = const u64 18446744073709551615
+    br bb10(%68, %79, %78, %80, %80)
+bb10(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %81 = call @func.5(%0)
+    %82 = extractfield u64 %81, 0
+    %83 = extractfield i64 %81, 1
+    %84 = const u64 0
+    %85 = icmp eq u64 %82, %84
+    %86 = select u64 %85, %11, %82
+    ret %10, %86, %12, %13, %14
+bb11:
+    %87 = const i64 0
+    %88 = const u64 18446744073709551615
+    ret %1, %16, %87, %88, %88
+}
+
+internal fastcc fn @__ty_trust_ir_func_66(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb12
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 2
+    %32 = const u64 55
+    %33 = const i64 9
+    %34 = const u64 0
+    %35 = const u64 0
+    %36 = icmp eq u64 %34, %35
+    condbr %36, bb2, bb3(%1, %34, %33, %32, %32)
+bb2:
+    %37 = const u64 2
+    %38 = call @func.0(%0, %37)
+    %39 = extractfield u64 %38, 0
+    %40 = extractfield i64 %38, 1
+    %41 = const u64 56
+    %42 = const u64 18446744073709551615
+    %43 = const u64 0
+    %44 = icmp eq u64 %39, %43
+    condbr %44, bb4, bb3(%1, %39, %40, %41, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb11(%5, %6, %7, %8, %9)
+bb4:
+    %45 = call @func.6(%0, %33, %40)
+    %46 = extractfield u64 %45, 0
+    %47 = extractfield i64 %45, 1
+    %48 = const u64 54
+    %49 = const u64 55
+    %50 = const u64 56
+    %51 = const u64 2
+    %52 = icmp eq u64 %46, %51
+    %53 = select u64 %52, %49, %50
+    %54 = const u64 0
+    %55 = icmp eq u64 %46, %54
+    condbr %55, bb5, bb3(%1, %46, %47, %48, %53)
+bb5:
+    %56 = call @func.12(%0, %31, %47)
+    %57 = extractfield u64 %56, 0
+    %58 = extractfield i64 %56, 1
+    %59 = const u64 51
+    %60 = const u64 18446744073709551615
+    %61 = const u64 0
+    %62 = icmp eq u64 %57, %61
+    condbr %62, bb6, bb3(%1, %57, %58, %59, %60)
+bb6:
+    %63 = call @func.2(%0, %58)
+    %64 = extractfield u64 %63, 0
+    %65 = extractfield i64 %63, 1
+    %66 = const i64 0
+    %67 = icmp ne i64 %65, %66
+    %68 = const u64 51
+    %69 = const u64 18446744073709551615
+    %70 = const u64 0
+    %71 = icmp eq u64 %64, %70
+    condbr %71, bb7, bb3(%1, %64, %58, %68, %69)
+bb7:
+    condbr %67, bb8, bb9
+bb8:
+    %72, %73, %74, %75, %76 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %77 = const u64 0
+    %78 = icmp eq u64 %73, %77
+    condbr %78, bb10, bb3(%72, %73, %74, %75, %76)
+bb9:
+    %79 = const i64 10
+    %80 = const u64 0
+    %81 = const u64 18446744073709551615
+    br bb11(%1, %80, %79, %81, %81)
+bb10:
+    %82 = const i64 10
+    %83 = const u64 0
+    %84 = const u64 18446744073709551615
+    br bb11(%72, %83, %82, %84, %84)
+bb11(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %85 = call @func.5(%0)
+    %86 = extractfield u64 %85, 0
+    %87 = extractfield i64 %85, 1
+    %88 = const u64 0
+    %89 = icmp eq u64 %86, %88
+    %90 = select u64 %89, %11, %86
+    ret %10, %90, %12, %13, %14
+bb12:
+    %91 = const i64 0
+    %92 = const u64 18446744073709551615
+    ret %1, %16, %91, %92, %92
+}
+
+internal fastcc fn @__ty_trust_ir_func_67(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const functy.17 fndef<func.72>
+    %32 = null ptr
+    %33, %34, %35, %36, %37 = call @func.73(%0, %1, %32, %31, %20)
+    %38 = const u64 0
+    %39 = icmp eq u64 %34, %38
+    condbr %39, bb2, bb3(%33, %34, %35, %36, %37)
+bb2:
+    %40 = const i64 10
+    %41 = const u64 0
+    %42 = const u64 18446744073709551615
+    br bb4(%33, %41, %40, %42, %42)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %43 = call @func.5(%0)
+    %44 = extractfield u64 %43, 0
+    %45 = extractfield i64 %43, 1
+    %46 = const u64 0
+    %47 = icmp eq u64 %44, %46
+    %48 = select u64 %47, %11, %44
+    ret %10, %48, %12, %13, %14
+bb5:
+    %49 = const i64 0
+    %50 = const u64 18446744073709551615
+    ret %1, %16, %49, %50, %50
+}
+
+internal fastcc fn @__ty_trust_ir_func_68(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb5
+bb1:
+    %20 = null ptr
+    %21, %22, %23, %24, %25 = call @func.67(%0, %1, %20, %3, %4)
+    %26 = const u64 0
+    %27 = icmp eq u64 %22, %26
+    condbr %27, bb2, bb3(%21, %22, %23, %24, %25)
+bb2:
+    %28 = const i64 10
+    %29 = const u64 0
+    %30 = const u64 18446744073709551615
+    br bb4(%21, %29, %28, %30, %30)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb4(%5, %6, %7, %8, %9)
+bb4(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %31 = call @func.5(%0)
+    %32 = extractfield u64 %31, 0
+    %33 = extractfield i64 %31, 1
+    %34 = const u64 0
+    %35 = icmp eq u64 %32, %34
+    %36 = select u64 %35, %11, %32
+    ret %10, %36, %12, %13, %14
+bb5:
+    %37 = const i64 0
+    %38 = const u64 18446744073709551615
+    ret %1, %16, %37, %38, %38
+}
+
+internal fastcc fn @__ty_trust_ir_func_69(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.71(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_70(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb11
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 1
+    %32 = call @func.0(%0, %31)
+    %33 = extractfield u64 %32, 0
+    %34 = extractfield i64 %32, 1
+    %35 = const u64 32
+    %36 = const u64 18446744073709551615
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%1, %33, %34, %35, %36)
+bb2:
+    %39 = const u64 2
+    %40 = call @func.0(%0, %39)
+    %41 = extractfield u64 %40, 0
+    %42 = extractfield i64 %40, 1
+    %43 = const u64 33
+    %44 = const u64 18446744073709551615
+    %45 = const u64 0
+    %46 = icmp eq u64 %41, %45
+    condbr %46, bb4, bb3(%1, %41, %42, %43, %44)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb10(%5, %6, %7, %8, %9)
+bb4:
+    %47 = call @func.7(%0, %34, %42)
+    %48 = extractfield u64 %47, 0
+    %49 = extractfield i64 %47, 1
+    %50 = const i64 0
+    %51 = icmp ne i64 %49, %50
+    %52 = const i64 10
+    %53 = const i64 2
+    %54 = select i64 %51, %52, %53
+    %55 = const u64 31
+    %56 = const u64 33
+    %57 = const u64 0
+    %58 = icmp eq u64 %48, %57
+    condbr %58, bb5, bb3(%1, %48, %54, %55, %56)
+bb5:
+    %59 = call @func.2(%0, %54)
+    %60 = extractfield u64 %59, 0
+    %61 = extractfield i64 %59, 1
+    %62 = const i64 0
+    %63 = icmp ne i64 %61, %62
+    %64 = const u64 31
+    %65 = const u64 18446744073709551615
+    %66 = const u64 0
+    %67 = icmp eq u64 %60, %66
+    condbr %67, bb6, bb3(%1, %60, %54, %64, %65)
+bb6:
+    condbr %63, bb7, bb8
+bb7:
+    %68, %69, %70, %71, %72 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %73 = const u64 0
+    %74 = icmp eq u64 %69, %73
+    condbr %74, bb9, bb3(%68, %69, %70, %71, %72)
+bb8:
+    %75 = const i64 10
+    %76 = const u64 0
+    %77 = const u64 18446744073709551615
+    br bb10(%1, %76, %75, %77, %77)
+bb9:
+    %78 = const i64 10
+    %79 = const u64 0
+    %80 = const u64 18446744073709551615
+    br bb10(%68, %79, %78, %80, %80)
+bb10(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %81 = call @func.5(%0)
+    %82 = extractfield u64 %81, 0
+    %83 = extractfield i64 %81, 1
+    %84 = const u64 0
+    %85 = icmp eq u64 %82, %84
+    %86 = select u64 %85, %11, %82
+    ret %10, %86, %12, %13, %14
+bb11:
+    %87 = const i64 0
+    %88 = const u64 18446744073709551615
+    ret %1, %16, %87, %88, %88
+}
+
+internal fastcc fn @__ty_trust_ir_func_71(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %35 = call @func.4(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    condbr %39, bb1, bb36
+bb1:
+    %40 = alloca [ty.0 x 16], align 8
+    %41 = const i64 0
+    %42 = gep inbounds i8, ptr %40, %41  ; #proof: in_bounds
+    store functy.17 %3, ptr %42
+    %43 = const i64 8
+    %44 = gep inbounds i8, ptr %40, %43  ; #proof: in_bounds
+    store ptr %4, ptr %44
+    %45 = const i64 0
+    %46 = gep inbounds i8, ptr %40, %45  ; #proof: in_bounds
+    %47 = load functy.17, ptr %46
+    %48 = const i64 8
+    %49 = gep inbounds i8, ptr %40, %48  ; #proof: in_bounds
+    %50 = load ptr, ptr %49
+    %51 = const u64 0
+    %52 = call @func.11(%0, %51)
+    %53 = extractfield u64 %52, 0
+    %54 = extractfield i64 %52, 1
+    %55 = const u64 34
+    %56 = const u64 18446744073709551615
+    %57 = const u64 0
+    %58 = icmp eq u64 %53, %57
+    condbr %58, bb2, bb3(%1, %53, %54, %55, %56)
+bb2:
+    %59 = call @func.2(%0, %54)
+    %60 = extractfield u64 %59, 0
+    %61 = extractfield i64 %59, 1
+    %62 = const i64 0
+    %63 = icmp ne i64 %61, %62
+    %64 = const u64 34
+    %65 = const u64 18446744073709551615
+    %66 = const u64 0
+    %67 = icmp eq u64 %60, %66
+    condbr %67, bb4, bb3(%1, %60, %54, %64, %65)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb35(%5, %6, %7, %8, %9)
+bb4:
+    condbr %63, bb5, bb6
+bb5:
+    %68 = const functy.17 fndef<func.76>
+    %69 = null ptr
+    %70, %71, %72, %73, %74 = call_indirect %68(functy.17)(%0, %1, %69) cc=fastcc
+    %75 = const u64 0
+    %76 = icmp eq u64 %71, %75
+    condbr %76, bb8, bb3(%70, %71, %72, %73, %74)
+bb6:
+    %77 = call @func.25(%0)
+    %78 = extractfield u64 %77, 0
+    %79 = extractfield i64 %77, 1
+    %80 = const u64 18446744073709551615
+    %81 = const u64 18446744073709551615
+    %82 = const i64 10
+    %83 = bitcast i64 %79 to u64
+    %84 = const u64 0
+    %85 = icmp eq u64 %78, %84
+    condbr %85, bb15, bb3(%1, %78, %82, %80, %81)
+bb7(%10: ptr):
+    %86 = const i64 10
+    %87 = const u64 0
+    %88 = const u64 18446744073709551615
+    br bb35(%10, %87, %86, %88, %88)
+bb8:
+    %89 = const u64 37
+    %90 = const u64 0
+    %91 = call @func.1(%0, %90)
+    %92 = extractfield u64 %91, 0
+    %93 = extractfield i64 %91, 1
+    %94 = const u64 0
+    %95 = icmp eq u64 %92, %94
+    condbr %95, bb40, bb39(%92, %93, %89, %89)
+bb9:
+    %96 = const u64 34
+    %97 = const u64 0
+    %98 = call @func.28(%0, %72, %32, %97)
+    %99 = extractfield u64 %98, 0
+    %100 = extractfield i64 %98, 1
+    %101 = const u64 13
+    %102 = icmp eq u64 %99, %101
+    %103 = const u64 37
+    %104 = select u64 %102, %103, %96
+    %105 = const u64 9
+    %106 = icmp eq u64 %99, %105
+    %107 = const u64 37
+    %108 = select u64 %106, %107, %104
+    %109 = const u64 0
+    %110 = icmp eq u64 %99, %109
+    condbr %110, bb10, bb3(%70, %99, %100, %96, %108)
+bb10:
+    %111 = call @func.2(%0, %100)
+    %112 = extractfield u64 %111, 0
+    %113 = extractfield i64 %111, 1
+    %114 = const i64 0
+    %115 = icmp ne i64 %113, %114
+    %116 = const u64 34
+    %117 = const u64 18446744073709551615
+    %118 = const u64 0
+    %119 = icmp eq u64 %112, %118
+    condbr %119, bb11, bb3(%70, %112, %100, %116, %117)
+bb11:
+    condbr %115, bb12, bb13
+bb12:
+    %120, %121, %122, %123, %124 = call_indirect %47(functy.17)(%0, %70, %50) cc=fastcc
+    %125 = const u64 0
+    %126 = icmp eq u64 %121, %125
+    condbr %126, bb14, bb3(%120, %121, %122, %123, %124)
+bb13:
+    %127 = const i64 10
+    %128 = const u64 0
+    %129 = const u64 18446744073709551615
+    br bb35(%70, %128, %127, %129, %129)
+bb14:
+    br bb7(%120)
+bb15:
+    br bb16
+bb16:
+    %130 = const u64 37
+    %131 = const u64 0
+    %132 = call @func.1(%0, %131)
+    %133 = extractfield u64 %132, 0
+    %134 = extractfield i64 %132, 1
+    %135 = const u64 0
+    %136 = icmp eq u64 %133, %135
+    condbr %136, bb38, bb37(%133, %134, %130, %130)
+bb17(%11: ptr, %12: u64, %13: i64, %14: u64, %15: u64):
+    %137 = call @func.23(%0, %83)
+    %138 = extractfield u64 %137, 0
+    %139 = extractfield i64 %137, 1
+    %140 = const u64 18446744073709551615
+    %141 = const u64 18446744073709551615
+    %142 = const i64 10
+    %143 = const u64 0
+    %144 = icmp eq u64 %138, %143
+    condbr %144, bb3(%11, %12, %13, %14, %15), bb3(%11, %138, %142, %140, %141)
+bb18:
+    %145 = const u64 1
+    %146 = call @func.18(%0, %83, %28, %145)
+    %147 = extractfield u64 %146, 0
+    %148 = extractfield i64 %146, 1
+    %149 = const u64 37
+    %150 = const u64 18446744073709551615
+    %151 = const i64 10
+    %152 = const u64 0
+    %153 = icmp eq u64 %147, %152
+    condbr %153, bb19, bb17(%1, %147, %151, %149, %150)
+bb19:
+    %154 = call @func.19(%0, %83)
+    %155 = extractfield u64 %154, 0
+    %156 = extractfield i64 %154, 1
+    %157 = const u64 18446744073709551615
+    %158 = const u64 18446744073709551615
+    %159 = const i64 10
+    %160 = const u64 0
+    %161 = icmp eq u64 %155, %160
+    condbr %161, bb20, bb17(%1, %155, %159, %157, %158)
+bb20:
+    br bb21(%1)
+bb21(%16: ptr):
+    %162 = call @func.20(%0, %83)
+    %163 = extractfield u64 %162, 0
+    %164 = extractfield i64 %162, 1
+    %165 = const u64 18446744073709551615
+    %166 = const u64 18446744073709551615
+    %167 = const i64 10
+    %168 = bitcast i64 %164 to u64
+    %169 = const u64 0
+    %170 = icmp ne u64 %168, %169
+    %171 = const u64 0
+    %172 = icmp eq u64 %163, %171
+    condbr %172, bb24, bb17(%16, %163, %167, %165, %166)
+bb22:
+    %173 = const u64 0
+    %174 = const u64 0
+    %175 = const u64 1
+    %176 = const u64 0
+    %177 = call @func.24(%0, %168, %173, %174, %175, %176)
+    %178 = extractfield u64 %177, 0
+    %179 = extractfield i64 %177, 1
+    %180 = const u64 37
+    %181 = const u64 18446744073709551615
+    %182 = const u64 0
+    %183 = icmp eq u64 %178, %182
+    condbr %183, bb25, bb17(%16, %178, %179, %180, %181)
+bb23:
+    %184 = call @func.23(%0, %83)
+    %185 = extractfield u64 %184, 0
+    %186 = extractfield i64 %184, 1
+    %187 = const u64 18446744073709551615
+    %188 = const u64 18446744073709551615
+    %189 = const i64 10
+    %190 = const u64 0
+    %191 = icmp eq u64 %185, %190
+    condbr %191, bb34, bb3(%16, %185, %189, %187, %188)
+bb24:
+    condbr %170, bb22, bb23
+bb25:
+    %192 = call @func.26(%0, %83, %168)
+    %193 = extractfield u64 %192, 0
+    %194 = extractfield i64 %192, 1
+    %195 = const u64 18446744073709551615
+    %196 = const u64 18446744073709551615
+    %197 = const i64 10
+    %198 = const u64 0
+    %199 = icmp eq u64 %193, %198
+    condbr %199, bb26, bb17(%16, %193, %197, %195, %196)
+bb26:
+    %200 = call @func.13(%0)
+    %201 = extractfield u64 %200, 0
+    %202 = extractfield i64 %200, 1
+    %203 = const i64 10
+    %204 = const u64 34
+    %205 = const u64 18446744073709551615
+    %206 = bitcast i64 %202 to u64
+    %207 = const u64 0
+    %208 = icmp eq u64 %201, %207
+    condbr %208, bb27, bb17(%16, %201, %203, %204, %205)
+bb27:
+    br bb28
+bb28:
+    %209 = null ptr
+    %210 = const functy.17 fndef<func.27>
+    %211 = inttoptr i64 %179 to ptr
+    %212, %213, %214, %215, %216 = call @func.75(%0, %16, %209, %47, %50, %210, %211)
+    %217 = const u64 0
+    %218 = icmp eq u64 %213, %217
+    condbr %218, bb30, bb29(%212, %213, %214, %215, %216)
+bb29(%17: ptr, %18: u64, %19: i64, %20: u64, %21: u64):
+    %219 = call @func.14(%0, %206)
+    %220 = extractfield u64 %219, 0
+    %221 = extractfield i64 %219, 1
+    %222 = const i64 10
+    %223 = const u64 34
+    %224 = const u64 18446744073709551615
+    %225 = const u64 0
+    %226 = icmp eq u64 %220, %225
+    condbr %226, bb17(%17, %18, %19, %20, %21), bb17(%17, %220, %222, %223, %224)
+bb30:
+    %227 = call @func.14(%0, %206)
+    %228 = extractfield u64 %227, 0
+    %229 = extractfield i64 %227, 1
+    %230 = const i64 10
+    %231 = const u64 34
+    %232 = const u64 18446744073709551615
+    %233 = const u64 0
+    %234 = icmp eq u64 %228, %233
+    condbr %234, bb31, bb17(%212, %228, %230, %231, %232)
+bb31:
+    %235 = call @func.21(%0, %83)
+    %236 = extractfield u64 %235, 0
+    %237 = extractfield i64 %235, 1
+    %238 = const u64 18446744073709551615
+    %239 = const u64 18446744073709551615
+    %240 = const i64 10
+    %241 = const u64 0
+    %242 = icmp eq u64 %236, %241
+    condbr %242, bb32, bb17(%212, %236, %240, %238, %239)
+bb32:
+    %243 = call @func.22(%0, %168)
+    %244 = extractfield u64 %243, 0
+    %245 = extractfield i64 %243, 1
+    %246 = const u64 18446744073709551615
+    %247 = const u64 18446744073709551615
+    %248 = const i64 10
+    %249 = const u64 0
+    %250 = icmp eq u64 %244, %249
+    condbr %250, bb33, bb17(%212, %244, %248, %246, %247)
+bb33:
+    br bb21(%212)
+bb34:
+    br bb7(%16)
+bb35(%22: ptr, %23: u64, %24: i64, %25: u64, %26: u64):
+    %251 = call @func.5(%0)
+    %252 = extractfield u64 %251, 0
+    %253 = extractfield i64 %251, 1
+    %254 = const u64 0
+    %255 = icmp eq u64 %252, %254
+    %256 = select u64 %255, %23, %252
+    ret %22, %256, %24, %25, %26
+bb36:
+    %257 = const i64 0
+    %258 = const u64 18446744073709551615
+    ret %1, %36, %257, %258, %258
+bb37(%27: u64, %28: i64, %29: u64, %30: u64):
+    %259 = const u64 0
+    %260 = icmp eq u64 %27, %259
+    condbr %260, bb18, bb17(%1, %27, %28, %29, %30)
+bb38:
+    %261 = const u64 0
+    br bb37(%261, %134, %130, %130)
+bb39(%31: u64, %32: i64, %33: u64, %34: u64):
+    %262 = const u64 0
+    %263 = icmp eq u64 %31, %262
+    condbr %263, bb9, bb3(%70, %31, %32, %33, %34)
+bb40:
+    %264 = const u64 0
+    br bb39(%264, %93, %89, %89)
+}
+
+internal fastcc fn @__ty_trust_ir_func_72(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const i64 0
+    %19 = gep i8, ptr %2, %18
+    %20 = load functy.17, ptr %19
+    %21 = const i64 8
+    %22 = gep i8, ptr %2, %21
+    %23 = load ptr, ptr %22
+    %24 = null ptr
+    %25, %26, %27, %28, %29 = call @func.74(%0, %1, %24, %20, %23)
+    %30 = const u64 0
+    %31 = icmp eq u64 %26, %30
+    condbr %31, bb2, bb3(%25, %26, %27, %28, %29)
+bb2:
+    %32 = const i64 10
+    %33 = const u64 0
+    %34 = const u64 18446744073709551615
+    br bb4(%25, %33, %32, %34, %34)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %35 = call @func.5(%0)
+    %36 = extractfield u64 %35, 0
+    %37 = extractfield i64 %35, 1
+    %38 = const u64 0
+    %39 = icmp eq u64 %36, %38
+    %40 = select u64 %39, %9, %36
+    ret %8, %40, %10, %11, %12
+bb5:
+    %41 = const i64 0
+    %42 = const u64 18446744073709551615
+    ret %1, %14, %41, %42, %42
+}
+
+internal fastcc fn @__ty_trust_ir_func_73(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb10
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 0
+    %32 = call @func.0(%0, %31)
+    %33 = extractfield u64 %32, 0
+    %34 = extractfield i64 %32, 1
+    %35 = const u64 59
+    %36 = const u64 18446744073709551615
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%1, %33, %34, %35, %36)
+bb2:
+    %39 = const u64 0
+    %40 = call @func.12(%0, %39, %34)
+    %41 = extractfield u64 %40, 0
+    %42 = extractfield i64 %40, 1
+    %43 = const u64 59
+    %44 = const u64 18446744073709551615
+    %45 = const u64 0
+    %46 = icmp eq u64 %41, %45
+    condbr %46, bb4, bb3(%1, %41, %42, %43, %44)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb9(%5, %6, %7, %8, %9)
+bb4:
+    %47 = call @func.2(%0, %42)
+    %48 = extractfield u64 %47, 0
+    %49 = extractfield i64 %47, 1
+    %50 = const i64 0
+    %51 = icmp ne i64 %49, %50
+    %52 = const u64 59
+    %53 = const u64 18446744073709551615
+    %54 = const u64 0
+    %55 = icmp eq u64 %48, %54
+    condbr %55, bb5, bb3(%1, %48, %42, %52, %53)
+bb5:
+    condbr %51, bb6, bb7
+bb6:
+    %56, %57, %58, %59, %60 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %61 = const u64 0
+    %62 = icmp eq u64 %57, %61
+    condbr %62, bb8, bb3(%56, %57, %58, %59, %60)
+bb7:
+    %63 = const i64 10
+    %64 = const u64 0
+    %65 = const u64 18446744073709551615
+    br bb9(%1, %64, %63, %65, %65)
+bb8:
+    %66 = const i64 10
+    %67 = const u64 0
+    %68 = const u64 18446744073709551615
+    br bb9(%56, %67, %66, %68, %68)
+bb9(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %69 = call @func.5(%0)
+    %70 = extractfield u64 %69, 0
+    %71 = extractfield i64 %69, 1
+    %72 = const u64 0
+    %73 = icmp eq u64 %70, %72
+    %74 = select u64 %73, %11, %70
+    ret %10, %74, %12, %13, %14
+bb10:
+    %75 = const i64 0
+    %76 = const u64 18446744073709551615
+    ret %1, %16, %75, %76, %76
+}
+
+internal fastcc fn @__ty_trust_ir_func_74(functy.18) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr):
+    %15 = call @func.4(%0)
+    %16 = extractfield u64 %15, 0
+    %17 = extractfield i64 %15, 1
+    %18 = const u64 0
+    %19 = icmp eq u64 %16, %18
+    condbr %19, bb1, bb10
+bb1:
+    %20 = alloca [ty.0 x 16], align 8
+    %21 = const i64 0
+    %22 = gep inbounds i8, ptr %20, %21  ; #proof: in_bounds
+    store functy.17 %3, ptr %22
+    %23 = const i64 8
+    %24 = gep inbounds i8, ptr %20, %23  ; #proof: in_bounds
+    store ptr %4, ptr %24
+    %25 = const i64 0
+    %26 = gep inbounds i8, ptr %20, %25  ; #proof: in_bounds
+    %27 = load functy.17, ptr %26
+    %28 = const i64 8
+    %29 = gep inbounds i8, ptr %20, %28  ; #proof: in_bounds
+    %30 = load ptr, ptr %29
+    %31 = const u64 1
+    %32 = call @func.0(%0, %31)
+    %33 = extractfield u64 %32, 0
+    %34 = extractfield i64 %32, 1
+    %35 = const u64 60
+    %36 = const u64 18446744073709551615
+    %37 = const u64 0
+    %38 = icmp eq u64 %33, %37
+    condbr %38, bb2, bb3(%1, %33, %34, %35, %36)
+bb2:
+    %39 = const u64 1
+    %40 = call @func.12(%0, %39, %34)
+    %41 = extractfield u64 %40, 0
+    %42 = extractfield i64 %40, 1
+    %43 = const u64 60
+    %44 = const u64 18446744073709551615
+    %45 = const u64 0
+    %46 = icmp eq u64 %41, %45
+    condbr %46, bb4, bb3(%1, %41, %42, %43, %44)
+bb3(%5: ptr, %6: u64, %7: i64, %8: u64, %9: u64):
+    br bb9(%5, %6, %7, %8, %9)
+bb4:
+    %47 = call @func.2(%0, %42)
+    %48 = extractfield u64 %47, 0
+    %49 = extractfield i64 %47, 1
+    %50 = const i64 0
+    %51 = icmp ne i64 %49, %50
+    %52 = const u64 60
+    %53 = const u64 18446744073709551615
+    %54 = const u64 0
+    %55 = icmp eq u64 %48, %54
+    condbr %55, bb5, bb3(%1, %48, %42, %52, %53)
+bb5:
+    condbr %51, bb6, bb7
+bb6:
+    %56, %57, %58, %59, %60 = call_indirect %27(functy.17)(%0, %1, %30) cc=fastcc
+    %61 = const u64 0
+    %62 = icmp eq u64 %57, %61
+    condbr %62, bb8, bb3(%56, %57, %58, %59, %60)
+bb7:
+    %63 = const i64 10
+    %64 = const u64 0
+    %65 = const u64 18446744073709551615
+    br bb9(%1, %64, %63, %65, %65)
+bb8:
+    %66 = const i64 10
+    %67 = const u64 0
+    %68 = const u64 18446744073709551615
+    br bb9(%56, %67, %66, %68, %68)
+bb9(%10: ptr, %11: u64, %12: i64, %13: u64, %14: u64):
+    %69 = call @func.5(%0)
+    %70 = extractfield u64 %69, 0
+    %71 = extractfield i64 %69, 1
+    %72 = const u64 0
+    %73 = icmp eq u64 %70, %72
+    %74 = select u64 %73, %11, %70
+    ret %10, %74, %12, %13, %14
+bb10:
+    %75 = const i64 0
+    %76 = const u64 18446744073709551615
+    ret %1, %16, %75, %76, %76
+}
+
+internal fastcc fn @__ty_trust_ir_func_75(functy.32) {
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: functy.17, %4: ptr, %5: functy.17, %6: ptr):
+    %17 = call @func.4(%0)
+    %18 = extractfield u64 %17, 0
+    %19 = extractfield i64 %17, 1
+    %20 = const u64 0
+    %21 = icmp eq u64 %18, %20
+    condbr %21, bb1, bb10
+bb1:
+    %22 = alloca [ty.0 x 32], align 8
+    %23 = const i64 0
+    %24 = gep inbounds i8, ptr %22, %23  ; #proof: in_bounds
+    store functy.17 %3, ptr %24
+    %25 = const i64 8
+    %26 = gep inbounds i8, ptr %22, %25  ; #proof: in_bounds
+    store ptr %4, ptr %26
+    %27 = const i64 16
+    %28 = gep inbounds i8, ptr %22, %27  ; #proof: in_bounds
+    store functy.17 %5, ptr %28
+    %29 = const i64 24
+    %30 = gep inbounds i8, ptr %22, %29  ; #proof: in_bounds
+    store ptr %6, ptr %30
+    %31 = const i64 0
+    %32 = gep inbounds i8, ptr %22, %31  ; #proof: in_bounds
+    %33 = load functy.17, ptr %32
+    %34 = const i64 8
+    %35 = gep inbounds i8, ptr %22, %34  ; #proof: in_bounds
+    %36 = load ptr, ptr %35
+    %37 = const i64 16
+    %38 = gep inbounds i8, ptr %22, %37  ; #proof: in_bounds
+    %39 = load functy.17, ptr %38
+    %40 = const i64 24
+    %41 = gep inbounds i8, ptr %22, %40  ; #proof: in_bounds
+    %42 = load ptr, ptr %41
+    %43, %44, %45, %46, %47 = call_indirect %39(functy.17)(%0, %1, %42) cc=fastcc
+    %48 = const u64 0
+    %49 = icmp eq u64 %44, %48
+    condbr %49, bb2, bb3(%43, %44, %45, %46, %47)
+bb2:
+    %50 = const u64 0
+    %51 = call @func.12(%0, %50, %45)
+    %52 = extractfield u64 %51, 0
+    %53 = extractfield i64 %51, 1
+    %54 = const u64 34
+    %55 = const u64 18446744073709551615
+    %56 = const u64 0
+    %57 = icmp eq u64 %52, %56
+    condbr %57, bb4, bb3(%43, %52, %53, %54, %55)
+bb3(%7: ptr, %8: u64, %9: i64, %10: u64, %11: u64):
+    br bb9(%7, %8, %9, %10, %11)
+bb4:
+    %58 = call @func.2(%0, %53)
+    %59 = extractfield u64 %58, 0
+    %60 = extractfield i64 %58, 1
+    %61 = const i64 0
+    %62 = icmp ne i64 %60, %61
+    %63 = const u64 34
+    %64 = const u64 18446744073709551615
+    %65 = const u64 0
+    %66 = icmp eq u64 %59, %65
+    condbr %66, bb5, bb3(%43, %59, %53, %63, %64)
+bb5:
+    condbr %62, bb6, bb7
+bb6:
+    %67, %68, %69, %70, %71 = call_indirect %33(functy.17)(%0, %43, %36) cc=fastcc
+    %72 = const u64 0
+    %73 = icmp eq u64 %68, %72
+    condbr %73, bb8, bb3(%67, %68, %69, %70, %71)
+bb7:
+    %74 = const i64 10
+    %75 = const u64 0
+    %76 = const u64 18446744073709551615
+    br bb9(%43, %75, %74, %76, %76)
+bb8:
+    %77 = const i64 10
+    %78 = const u64 0
+    %79 = const u64 18446744073709551615
+    br bb9(%67, %78, %77, %79, %79)
+bb9(%12: ptr, %13: u64, %14: i64, %15: u64, %16: u64):
+    %80 = call @func.5(%0)
+    %81 = extractfield u64 %80, 0
+    %82 = extractfield i64 %80, 1
+    %83 = const u64 0
+    %84 = icmp eq u64 %81, %83
+    %85 = select u64 %84, %13, %81
+    ret %12, %85, %14, %15, %16
+bb10:
+    %86 = const i64 0
+    %87 = const u64 18446744073709551615
+    ret %1, %18, %86, %87, %87
+}
+
+internal fastcc fn @__ty_trust_ir_func_76(functy.17) {
+bb0(%0: ptr, %1: ptr, %2: ptr):
+    %13 = call @func.4(%0)
+    %14 = extractfield u64 %13, 0
+    %15 = extractfield i64 %13, 1
+    %16 = const u64 0
+    %17 = icmp eq u64 %14, %16
+    condbr %17, bb1, bb5
+bb1:
+    %18 = const u64 1
+    %19 = const u64 0
+    %20 = call @func.10(%0, %18, %19)
+    %21 = extractfield u64 %20, 0
+    %22 = extractfield i64 %20, 1
+    %23 = const u64 36
+    %24 = const u64 18446744073709551615
+    %25 = const u64 0
+    %26 = icmp eq u64 %21, %25
+    condbr %26, bb2, bb3(%1, %21, %22, %23, %24)
+bb2:
+    %27 = const u64 0
+    %28 = const u64 18446744073709551615
+    br bb4(%1, %27, %22, %28, %28)
+bb3(%3: ptr, %4: u64, %5: i64, %6: u64, %7: u64):
+    br bb4(%3, %4, %5, %6, %7)
+bb4(%8: ptr, %9: u64, %10: i64, %11: u64, %12: u64):
+    %29 = call @func.5(%0)
+    %30 = extractfield u64 %29, 0
+    %31 = extractfield i64 %29, 1
+    %32 = const u64 0
+    %33 = icmp eq u64 %30, %32
+    %34 = select u64 %33, %9, %30
+    ret %8, %34, %10, %11, %12
+bb5:
+    %35 = const i64 0
+    %36 = const u64 18446744073709551615
+    ret %1, %14, %35, %36, %36
+}
+
+fn @__ty_trust_ir_func_77(functy.33) {
+bb0(%0: ptr, %1: ptr):
+    %2 = null ptr
+    %3, %4, %5, %6, %7 = call @func.31(%0, %0, %2)
+    %8 = const i64 0
+    %9 = gep i8, ptr %1, %8
+    store ptr %3, ptr %9
+    %10 = const i64 8
+    %11 = gep i8, ptr %1, %10
+    store u64 %4, ptr %11
+    %12 = const i64 16
+    %13 = gep i8, ptr %1, %12
+    store i64 %5, ptr %13
+    %14 = const i64 24
+    %15 = gep i8, ptr %1, %14
+    store u64 %6, ptr %15
+    %16 = const i64 32
+    %17 = gep i8, ptr %1, %16
+    store u64 %7, ptr %17
+    ret
+}
+
+fn @__ty_trust_ir_func_78(functy.33) {
+bb0(%0: ptr, %1: ptr):
+    %2 = null ptr
+    %3, %4, %5, %6, %7 = call @func.34(%0, %0, %2)
+    %8 = const i64 0
+    %9 = gep i8, ptr %1, %8
+    store ptr %3, ptr %9
+    %10 = const i64 8
+    %11 = gep i8, ptr %1, %10
+    store u64 %4, ptr %11
+    %12 = const i64 16
+    %13 = gep i8, ptr %1, %12
+    store i64 %5, ptr %13
+    %14 = const i64 24
+    %15 = gep i8, ptr %1, %14
+    store u64 %6, ptr %15
+    %16 = const i64 32
+    %17 = gep i8, ptr %1, %16
+    store u64 %7, ptr %17
+    ret
+}
+
+fn @__ty_trust_ir_func_79(functy.33) {
+bb0(%0: ptr, %1: ptr):
+    %2 = null ptr
+    %3, %4, %5, %6, %7 = call @func.37(%0, %0, %2)
+    %8 = const i64 0
+    %9 = gep i8, ptr %1, %8
+    store ptr %3, ptr %9
+    %10 = const i64 8
+    %11 = gep i8, ptr %1, %10
+    store u64 %4, ptr %11
+    %12 = const i64 16
+    %13 = gep i8, ptr %1, %12
+    store i64 %5, ptr %13
+    %14 = const i64 24
+    %15 = gep i8, ptr %1, %14
+    store u64 %6, ptr %15
+    %16 = const i64 32
+    %17 = gep i8, ptr %1, %16
+    store u64 %7, ptr %17
+    ret
+}

@@ -73,7 +73,12 @@ struct SharedPage {
 
 impl SharedPage {
     fn new(payload_len: usize) -> Result<Self, String> {
-        let len = 16 + payload_len;
+        let len = payload_len
+            .checked_add(16)
+            .filter(|len| *len <= isize::MAX as usize)
+            .ok_or_else(|| {
+                "sandbox payload length exceeds the addressable allocation size".to_string()
+            })?;
         // SAFETY: standard anonymous shared mapping; ptr validity checked below.
         let ptr = unsafe {
             libc::mmap(
@@ -227,20 +232,24 @@ where
             return decode_status(&page, status);
         }
         if w < 0 {
-            // ECHILD or interrupted: try a blocking reap once to settle.
-            // SAFETY: same child pid; valid status out-param.
-            let w2 = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if w2 == pid {
-                return decode_status(&page, status);
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return SandboxResult::SandboxError(format!("waitpid failed: {error}"));
             }
-            return SandboxResult::SandboxError("waitpid failed".to_string());
+            // EINTR says nothing about child completion. Keep the next wait
+            // nonblocking and check the deadline below; a blocking retry here
+            // would let a runaway child evade its watchdog after a signal.
         }
         if start.elapsed() >= deadline {
             // Over the per-invoke budget: kill and reap the child.
             // SAFETY: `pid` is our own child process.
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
-                let _ = libc::waitpid(pid, &mut status, 0);
+            }
+            if let Err(error) = reap_child(pid, &mut status) {
+                return SandboxResult::SandboxError(format!(
+                    "failed to reap timed-out child: {error}"
+                ));
             }
             return SandboxResult::Timeout;
         }
@@ -249,6 +258,22 @@ where
             std::hint::spin_loop();
         } else {
             std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+/// Blocking waits are only used after SIGKILL. Retry interrupted reaps so a
+/// signal cannot leave the terminated child as a zombie.
+fn reap_child(pid: libc::pid_t, status: &mut libc::c_int) -> std::io::Result<()> {
+    loop {
+        // SAFETY: pid identifies our child and status is a valid out-parameter.
+        let result = unsafe { libc::waitpid(pid, status, 0) };
+        if result == pid {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -282,6 +307,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sandbox_rejects_unrepresentable_payload_lengths() {
+        for length in [usize::MAX, isize::MAX as usize] {
+            // SAFETY: the closure is async-signal-safe; these invalid sizes
+            // must be rejected before allocation or fork.
+            let result = unsafe { run_sandboxed(length, Duration::ZERO, |_| 0) };
+            assert!(
+                matches!(result, SandboxResult::SandboxError(error) if error.contains("payload length"))
+            );
+        }
+    }
+
+    #[test]
     fn sandbox_returns_clean_value_and_payload() {
         // SAFETY: closure does only arithmetic + a byte write; no FFI fn ptr.
         let r = unsafe {
@@ -300,17 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_reports_hardware_trap_as_trapped() {
-        // Deliberately raise SIGFPE inside the child, mimicking an idiv #DE.
+    fn sandbox_reports_signal_death_as_trapped() {
+        // `decode_status` maps any signal death to `Trapped(WTERMSIG)`, and a
+        // raise() is a software signal, not an idiv #DE, so a core-dump signal
+        // proves nothing more here, while on macOS it made ReportCrash write a
+        // report on every run. SIGTERM also differs from the SIGKILL the
+        // timeout path sends, which reports `Timeout` anyway.
+        const CHILD_SIG: libc::c_int = libc::SIGTERM;
         let r = unsafe {
             run_sandboxed(0, Duration::from_secs(5), |_p: &mut [u8]| {
-                libc::raise(libc::SIGFPE);
+                libc::raise(CHILD_SIG);
                 0
             })
         };
         match r {
-            SandboxResult::Trapped(sig) => assert_eq!(sig, libc::SIGFPE),
-            other => panic!("expected Trapped(SIGFPE), got {:?}", other),
+            SandboxResult::Trapped(sig) => assert_eq!(sig, CHILD_SIG),
+            other => panic!("expected Trapped(SIGTERM), got {:?}", other),
         }
     }
 

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use trust_cg_fuzz::runlog::{Repro, RunLog};
+use trust_cg_fuzz::runlog::{Repro, RunLog, campaign_deadline};
 
 const MAX_REPROS_RECORDED: usize = 32;
 const PROGRESS_INTERVAL_SECS: u64 = 15;
@@ -172,10 +172,9 @@ fn push_repro(
     });
 }
 
-fn write_log(out_dir: &Path, file_name: &str, log: &RunLog) {
-    let json_path = out_dir.join(file_name);
-    let json = serde_json::to_string_pretty(log).expect("serialize");
-    fs::write(&json_path, json).expect("write runlog json");
+fn write_log(out_dir: &Path, file_name: &str, log: &RunLog) -> Result<(), String> {
+    log.write_to(&out_dir.join(file_name))
+        .map_err(|error| error.to_string())
 }
 
 fn find_csmith_include() -> Option<PathBuf> {
@@ -206,10 +205,15 @@ fn main() -> Result<(), String> {
     let clang_arg: String = parse_arg(&args, "--clang", "clang".to_string())?;
 
     let out_path = PathBuf::from(&out_dir);
-    fs::create_dir_all(&out_path).expect("create out_dir");
+    let deadline = campaign_deadline(duration_secs)?;
+    fs::create_dir_all(&out_path).map_err(|error| {
+        format!(
+            "cannot create output directory '{}': {error}",
+            out_path.display()
+        )
+    })?;
 
     let started_at = iso_now();
-    let deadline = Instant::now() + Duration::from_secs(duration_secs);
     let campaign_started = Instant::now();
 
     let mut log = RunLog {
@@ -224,6 +228,19 @@ fn main() -> Result<(), String> {
         repros: Vec::new(),
         started_at: started_at.clone(),
         finished_at: String::new(),
+        seed_start: None,
+        requested_runs: None,
+        planted_miscompile_seed: None,
+        rows_checked: None,
+        rows_executed: None,
+        rows_refused: None,
+        refusal_samples: Vec::new(),
+        rows_oracle_compared: None,
+        rows_cross_level_only: None,
+        oracle_error_samples: Vec::new(),
+        scalar_rows_per_seed: None,
+        seeds_incomplete: None,
+        incomplete_seed_samples: Vec::new(),
     };
 
     if !tool_exists("csmith") {
@@ -234,7 +251,7 @@ fn main() -> Result<(), String> {
                 .to_string(),
         );
         log.finished_at = iso_now();
-        write_log(&out_path, "csmith-driver.json", &log);
+        write_log(&out_path, "csmith-driver.json", &log)?;
         eprintln!("[csmith-driver] unavailable: csmith not on PATH");
         return Ok(());
     }
@@ -243,11 +260,11 @@ fn main() -> Result<(), String> {
         Some(path) => path,
         None => {
             log.reason = Some(
-                "trust-cg-ws2-import not found. Build it with: `cargo build --release -p trust-cg-llvm-import --bin trust-cg-ws2-import --features driver`."
+                "trust-cg-ws2-import not found. Build it with: `scripts/trust_cargo.sh build --release -p trust-cg-llvm-import --bin trust-cg-ws2-import --features driver`."
                     .to_string(),
             );
             log.finished_at = iso_now();
-            write_log(&out_path, "csmith-driver.json", &log);
+            write_log(&out_path, "csmith-driver.json", &log)?;
             eprintln!("[csmith-driver] unavailable: trust-cg-ws2-import missing");
             return Ok(());
         }
@@ -259,7 +276,7 @@ fn main() -> Result<(), String> {
             log.reason =
                 Some("clang --version failed. Install clang and ensure it is on PATH.".to_string());
             log.finished_at = iso_now();
-            write_log(&out_path, "csmith-driver.json", &log);
+            write_log(&out_path, "csmith-driver.json", &log)?;
             eprintln!("[csmith-driver] unavailable: clang missing or broken");
             return Ok(());
         }
@@ -470,7 +487,7 @@ fn main() -> Result<(), String> {
         log.runs, ok_count, unsupported_count, clang_fail_count, log.crashes
     ));
     log.finished_at = iso_now();
-    write_log(&out_path, "csmith-driver.json", &log);
+    write_log(&out_path, "csmith-driver.json", &log)?;
     eprintln!(
         "[csmith-driver] wrote {} runs={} ok={} unsupported={} clang_fail={} crashes={}",
         out_path.join("csmith-driver.json").display(),

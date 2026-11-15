@@ -13,7 +13,6 @@
 // functions from inputs to outputs, abstracting away the destructive update.
 //
 // Reference: Intel 64 and IA-32 Architectures Software Developer's Manual
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! x86-64 instruction semantics encoded as [`SmtExpr`] bitvector formulas.
 //!
@@ -360,8 +359,11 @@ pub fn encode_atomic_rmw_cas_loop(
 ///
 /// Parameters model that state: `mem` seeded with the current value at `addr`,
 /// the 64-bit `expected` (RAX) and `desired` (source) narrowed to the op width.
-/// `size_bytes` selects the memory width (4 or 8; the ISel restricts CMPXCHG to
-/// i32/i64). Returns `(ret, mem_after, success_flag)` where:
+/// `size_bytes` selects the memory width (4 or 8). The NARROW i8/i16 forms are
+/// NOT this encoder's business and must never be routed here: their accumulator
+/// is the PARTIAL register AL/AX, which this width-limited model cannot express.
+/// They have their own SDM transcription, [`encode_lock_cmpxchg_narrow`].
+/// Returns `(ret, mem_after, success_flag)` where:
 ///   * `ret` is the returned old value (always `old`),
 ///   * `mem_after` is memory with the CONDITIONAL store applied,
 ///   * `success_flag` is a 1-bit `(old == expected)` predicate reified to a bv.
@@ -412,6 +414,252 @@ pub fn encode_cmpxchg(
     (ret, mem_after, success_flag)
 }
 
+/// The complete single-thread architectural effect of a NARROW (8/16-bit)
+/// `LOCK CMPXCHG r/m{8,16}, r{8,16}`.
+///
+/// Unlike [`encode_cmpxchg`] — whose world is exactly `size_bytes` wide and
+/// which therefore cannot even STATE the partial-accumulator facts below — this
+/// carries the full 64-bit RAX and the whole byte-addressable memory array, so
+/// a model that reads or writes MORE than the operation width is observable.
+#[derive(Debug, Clone)]
+pub struct X86CmpxchgNarrowEffect {
+    /// RAX (all 64 bits) after the instruction.
+    pub rax_after: SmtExpr,
+    /// The whole memory array after the instruction (`Array(BV64, BV8)`).
+    pub mem_after: SmtExpr,
+    /// The RFLAGS the implicit `CMP acc, dest` sets, at the OPERATION width.
+    pub flags: IntCmpFlags,
+}
+
+/// Encode `LOCK CMPXCHG r/m8, r8` (`F0 0F B0 /r`) and
+/// `LOCK CMPXCHG r/m16, r16` (`F0 66 0F B1 /r`) — the NARROW compare-and-swap
+/// forms that back `AtomicU8`/`AtomicU16`/`AtomicI8`/`AtomicI16`
+/// `compare_exchange`.
+///
+/// TRANSCRIBED from Intel SDM Vol. 2A, `CMPXCHG—Compare and Exchange`. The
+/// SDM's operation pseudo-code for the `r/m8` / `r/m16` encodings is:
+///
+/// ```text
+///   (* accumulator = AL, AX, EAX, or RAX depending on whether a byte,
+///      word, doubleword, or quadword comparison is being performed *)
+///   TEMP  := DEST
+///   IF accumulator = TEMP
+///       THEN  ZF := 1;  DEST := SRC;
+///       ELSE  ZF := 0;  accumulator := TEMP;  DEST := TEMP;
+///   FI;
+/// ```
+///
+/// Three things in that text are WIDTH-SPECIFIC and are why the 32/64-bit
+/// [`encode_cmpxchg`] must not be reused here:
+///
+/// 1. The accumulator is **AL** (8) / **AX** (16) — a PARTIAL register. The
+///    comparison reads only `RAX[w-1:0]`; the failure write-back writes only
+///    `RAX[w-1:0]`. `RAX[63:w]` is PRESERVED. This is the opposite of a 32-bit
+///    operand-size instruction, which zero-extends into RAX[63:32].
+/// 2. `SRC` is the low `w` bits of the source register. The rest of that
+///    register is not read.
+/// 3. `DEST` is `w/8` BYTES of memory. Exactly those bytes are written; the
+///    adjacent cell is untouched.
+///
+/// The SDM further notes that the destination receives a write cycle in BOTH
+/// branches (`DEST := TEMP` on failure), which is why `mem_after` is an
+/// unconditional store of `ite(zf, src, dest)` rather than a conditional store.
+/// As a DATA-flow relation the two are identical; writing it the SDM's way
+/// keeps this a transcription rather than a paraphrase.
+///
+/// # Parameters
+/// * `width_bits` — 8 or 16. Any other width PANICS: this encoder must never
+///   silently become the 32/64-bit model.
+/// * `mem` — byte-addressable memory, `Array(BV64, BV8)`.
+/// * `ea` — the 64-bit effective address of `DEST`.
+/// * `rax_pre` — the full 64-bit RAX BEFORE the instruction.
+/// * `src_reg` — the full 32-bit source register (ISel carries the i8/i16
+///   source in a `Gpr32` carrier, so the model is handed 32 bits and must use
+///   only the low `w`).
+///
+/// # What this does NOT claim
+/// * NOT atomicity. LOCK serialization, cross-thread ordering and the legality
+///   of the `(success, failure)` ordering pair are the same Intel-SDM
+///   architectural axiom the atomic load/store/RMW/MFENCE models already rest
+///   on. This is single-thread data flow only.
+/// * NOT a claim about BYTES. Nothing HERE shows the encoder emits
+///   `F0 [REX] 0F B0 /r` or `F0 66 [REX] 0F B1 /r`, nor that a REX prefix is
+///   present so that SIL/DIL encode instead of AH..BH. That link is ENC-3's:
+///   `trust-cg-codegen`'s `x86_64/decode_check.rs` COVERS these two opcodes
+///   (it allowlisted them until the narrow-CAS credit was repaired), derives
+///   the operand width, the LOCK prefix and the byte-register identity from
+///   the emitted bytes alone, and fails the compile closed on a disagreement.
+/// * Only ZF is modeled as an OUTPUT. CMPXCHG also writes CF/PF/AF/SF/OF; those
+///   are modeled as clobbered by the post-RA flag model, and no emitted code
+///   reads them. [`IntCmpFlags`] carries them because `encode_int_cmp_flags`
+///   computes the whole `CMP` flag set; only `flags.zf` is obligated.
+pub fn encode_lock_cmpxchg_narrow(
+    width_bits: u32,
+    mem: &SmtExpr,
+    ea: &SmtExpr,
+    rax_pre: &SmtExpr,
+    src_reg: &SmtExpr,
+) -> X86CmpxchgNarrowEffect {
+    assert!(
+        width_bits == 8 || width_bits == 16,
+        "narrow LOCK CMPXCHG width must be 8 or 16 bits (32/64 is `encode_cmpxchg`)"
+    );
+    let size_bytes = width_bits / 8;
+
+    // accumulator := AL / AX — the low w bits of RAX, NOT all of it.
+    let acc = rax_pre.clone().extract(width_bits - 1, 0);
+    // TEMP := DEST — exactly w/8 bytes at the effective address.
+    let dest = crate::memory_proofs::encode_load_le(mem, ea, size_bytes);
+    // The implicit CMP the instruction performs, at the OPERATION width.
+    let flags = encode_int_cmp_flags(width_bits, acc, dest.clone());
+    // SRC — the low w bits of the source register.
+    let src = src_reg.clone().extract(width_bits - 1, 0);
+    // DEST := (ZF ? SRC : TEMP) — a write cycle in both branches.
+    let new_dest = SmtExpr::ite(flags.zf.clone(), src, dest.clone());
+    let mem_after = crate::memory_proofs::encode_store_le(mem, ea, &new_dest, size_bytes);
+    // accumulator := TEMP on failure, and RAX[63:w] is PRESERVED in both
+    // branches. On success RAX is entirely unchanged.
+    let rax_after = SmtExpr::ite(
+        flags.zf.clone(),
+        rax_pre.clone(),
+        rax_pre.clone().extract(63, width_bits).concat(dest),
+    );
+
+    X86CmpxchgNarrowEffect {
+        rax_after,
+        mem_after,
+        flags,
+    }
+}
+
+/// The complete single-thread architectural effect of `LOCK CMPXCHG16B m128`.
+///
+/// Carries RAX and RDX separately (the ISel reads the low limb from RAX and the
+/// high limb from RDX) and the whole byte-addressable memory array, so a model
+/// that swaps the halves, writes the wrong width or touches a neighbouring byte
+/// is observable.
+#[derive(Debug, Clone)]
+pub struct X86Cmpxchg16bEffect {
+    /// RAX (64 bits) after the instruction.
+    pub rax_after: SmtExpr,
+    /// RDX (64 bits) after the instruction.
+    pub rdx_after: SmtExpr,
+    /// The whole memory array after the instruction (`Array(BV64, BV8)`).
+    pub mem_after: SmtExpr,
+    /// ZF after the instruction (Bool sort): `RDX:RAX == DEST`.
+    pub zf: SmtExpr,
+}
+
+/// Encode `LOCK CMPXCHG16B m128` (`F0 REX.W 0F C7 /1`).
+///
+/// TRANSCRIBED from Intel SDM Vol. 2A, `CMPXCHG8B/CMPXCHG16B—Compare and
+/// Exchange Bytes`, 64-bit mode with a 64-bit operand size:
+///
+/// ```text
+///   TEMP128 := DEST
+///   IF (RDX:RAX = TEMP128)
+///       THEN ZF := 1; DEST := RCX:RBX;
+///       ELSE ZF := 0; RDX:RAX := TEMP128; DEST := TEMP128;
+///   FI;
+/// ```
+///
+/// `RDX:RAX` is the 128-bit value with RDX in bits 127:64 and RAX in bits 63:0
+/// (likewise `RCX:RBX`), and `DEST` is 16 little-endian bytes at `ea`. The SDM
+/// states that the destination receives a write cycle whatever the result of
+/// the comparison, so `mem_after` is an unconditional store of
+/// `ite(ZF, RCX:RBX, TEMP128)` — as a data-flow relation identical to a
+/// conditional store, written the SDM's way so this stays a transcription. On
+/// success RAX and RDX are unchanged.
+///
+/// # What this does NOT claim
+/// * NOT atomicity, LOCK serialization or ordering: the same Intel-SDM
+///   architectural axiom the other x86 atomic rows rest on. Single-thread data
+///   flow only.
+/// * NOT the #GP of an operand that is not 16-byte aligned, nor the #UD of a
+///   processor without CX16: this is the effect of an instruction that
+///   executes.
+/// * NOT CF/PF/AF/SF/OF, which the SDM leaves unaffected; the flag frame is the
+///   TV-5 post-RA flag model's.
+/// * NOT BYTES: the `F0 REX.W 0F C7 /1` link (the 16-byte width lives only in
+///   REX.W) is ENC-3's decode check, which decodes it as the last instruction
+///   of the `AtomicLoadCmpxchg16b` pseudo.
+///
+/// The pseudo itself is [`encode_atomic_load_cmpxchg16b`]; this is the bare
+/// instruction it ends in, also obligated on its own at general inputs so the
+/// transcription keeps teeth on the branches a zero comparand never reaches.
+pub fn encode_lock_cmpxchg16b(
+    mem: &SmtExpr,
+    ea: &SmtExpr,
+    rax: &SmtExpr,
+    rdx: &SmtExpr,
+    rbx: &SmtExpr,
+    rcx: &SmtExpr,
+) -> X86Cmpxchg16bEffect {
+    // TEMP128 := DEST — exactly 16 bytes at the effective address.
+    let temp = crate::memory_proofs::encode_load_le(mem, ea, 16);
+    // The implicit 128-bit comparison of RDX:RAX with DEST.
+    let comparand = rdx.clone().concat(rax.clone());
+    let zf = comparand.eq_expr(temp.clone());
+    // DEST := ZF ? RCX:RBX : TEMP128 — a write cycle in both branches.
+    let replacement = rcx.clone().concat(rbx.clone());
+    let new_dest = SmtExpr::ite(zf.clone(), replacement, temp.clone());
+    let mem_after = crate::memory_proofs::encode_store_le(mem, ea, &new_dest, 16);
+    // RDX:RAX := TEMP128 on a mismatch; unchanged on a match.
+    let rax_after = SmtExpr::ite(zf.clone(), rax.clone(), temp.clone().extract(63, 0));
+    let rdx_after = SmtExpr::ite(zf.clone(), rdx.clone(), temp.extract(127, 64));
+
+    X86Cmpxchg16bEffect {
+        rax_after,
+        rdx_after,
+        mem_after,
+        zf,
+    }
+}
+
+/// `XOR r32, r32` with the same register as both operands, as the full 64-bit
+/// register it leaves: the SDM's `DEST := DEST XOR SRC` on the low 32 bits,
+/// zero-extended (Intel SDM Vol. 1 3.4.1.1: a 32-bit operation in 64-bit mode
+/// zero-extends its result into the 64-bit register). Transcribed, not
+/// constant-folded, so a model that skips the instruction keeps `reg`'s value.
+fn encode_xor32_self_zero_extended(reg: &SmtExpr) -> SmtExpr {
+    let low = reg.clone().extract(31, 0);
+    encode_xor_rr(X86OperandSize::S32, low.clone(), low).zero_ext(32)
+}
+
+/// Encode the 128-bit atomic-load pseudo (`AtomicLoadCmpxchg16b`):
+///
+/// ```text
+///   XOR EAX,EAX ; XOR EDX,EDX ; XOR EBX,EBX ; XOR ECX,ECX
+///   LOCK CMPXCHG16B m128
+/// ```
+///
+/// over the INCOMING values of RAX, RDX, RBX and RCX. The four XORs are
+/// [`encode_xor32_self_zero_extended`] and the compare-exchange is
+/// [`encode_lock_cmpxchg16b`] on their results, so the zeroing the load's
+/// correctness depends on is part of this model rather than an assumption
+/// about the registers: a model without one of the XORs compares against, or
+/// stores, the incoming value. Returned: RAX and RDX (the loaded value), the
+/// memory and ZF after the whole expansion. RBX and RCX end at 0; their
+/// clobber is the TV-5 register frame's, not an obligation here.
+///
+/// NOT claimed, as for [`encode_lock_cmpxchg16b`]: atomicity/LOCK/ordering,
+/// alignment #GP and CX16 availability, CF/PF/AF/SF/OF, and bytes (ENC-3
+/// decodes all five emitted instructions).
+pub fn encode_atomic_load_cmpxchg16b(
+    mem: &SmtExpr,
+    ea: &SmtExpr,
+    rax_in: &SmtExpr,
+    rdx_in: &SmtExpr,
+    rbx_in: &SmtExpr,
+    rcx_in: &SmtExpr,
+) -> X86Cmpxchg16bEffect {
+    let rax = encode_xor32_self_zero_extended(rax_in);
+    let rdx = encode_xor32_self_zero_extended(rdx_in);
+    let rbx = encode_xor32_self_zero_extended(rbx_in);
+    let rcx = encode_xor32_self_zero_extended(rcx_in);
+    encode_lock_cmpxchg16b(mem, ea, &rax, &rdx, &rbx, &rcx)
+}
+
 /// Encode the SINGLE-THREAD data-flow effect of `MFENCE` (`0F AE F0`).
 ///
 /// MFENCE is a full memory-ordering barrier: it serializes the *ordering* of
@@ -451,6 +699,19 @@ pub fn encode_mfence(reg_before: &SmtExpr, mem_before: &SmtExpr) -> (SmtExpr, Sm
 /// Reference: Intel SDM Vol 2B, SHL instruction.
 pub fn encode_shl_rr(_size: X86OperandSize, src1: SmtExpr, src2: SmtExpr) -> SmtExpr {
     src1.bvshl(src2)
+}
+
+/// Encode `SHL r/m{32,64}, imm8` -- logical shift left by a CONSTANT amount.
+///
+/// Semantics: `dst = src << a` for `a` in `[1, width)`. The hardware masks the
+/// count to `width - 1` bits; in that range the mask is the identity, so the
+/// unmasked `bvshl` by the baked constant is faithful (this is the same
+/// in-range argument [`encode_shl_rr_masked`] documents for the register form).
+/// Reference: Intel SDM Vol 2B, SHL instruction.
+pub fn encode_shl_ri(size: X86OperandSize, src: SmtExpr, a: u32) -> SmtExpr {
+    let width = x86_operand_size_bits(size);
+    debug_assert!(a >= 1 && a < width, "SHL imm8 amount must be in [1, width)");
+    src.bvshl(SmtExpr::bv_const(u64::from(a), width))
 }
 
 /// Encode `ROL r/m{32,64}, imm8` -- rotate left by a constant amount.

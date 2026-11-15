@@ -74,7 +74,8 @@ fn random_walk(state: &mut BcpState, decision_seed: u64) -> usize {
 fn bench_bcp_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("bcp_baseline");
     for case in CASES {
-        let clauses = random_3sat(case.num_vars, case.num_clauses, case.seed);
+        let clauses =
+            random_3sat(case.num_vars, case.num_clauses, case.seed).expect("valid 3-SAT fixture");
         group.bench_function(case.label, |b| {
             b.iter_batched(
                 || BcpState::new(case.num_vars, clauses.clone()),

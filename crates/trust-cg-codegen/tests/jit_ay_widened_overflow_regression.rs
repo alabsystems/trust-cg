@@ -141,7 +141,7 @@ fn build_ay_checked_batch_widened_add() -> Function {
 fn prepare_o2_ay_checked_batch_add() -> trust_cg_ir::function::MachFunction {
     let config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(config);
     pipeline

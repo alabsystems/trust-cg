@@ -146,10 +146,20 @@ fn eliminate_redundant_reloads_in_block(
     // Maps stack slot -> (def VReg of the load, InstId of the load).
     // Active means the def VReg has not been redefined.
     let mut active_loads: BTreeMap<StackSlotId, (VReg, InstId)> = BTreeMap::new();
+    // The same entries keyed by def VReg, so a redefinition drops exactly the
+    // entries holding that VReg without scanning every active slot. Scanning
+    // (`retain` over `active_loads` per def) made a block with `n` reloaded
+    // slots cost `O(n)` per instruction and `O(n^2)` in all. Kept equal to
+    // `active_loads` at every step below (`remove_active_load`, the insert,
+    // the clear and the per-def removal).
+    let mut slots_by_vreg: BTreeMap<VReg, BTreeSet<StackSlotId>> = BTreeMap::new();
 
     // Collect rewrites to apply after validation. Each rewrite is bounded to
     // the value lifetime that started at the removed reload.
     let mut vreg_rewrites: Vec<BoundedVRegRewrite> = Vec::new();
+    // Where each VReg is defined in this block, built at the first redundant
+    // reload (see `BlockDefPositions`).
+    let mut def_positions = BlockDefPositions::default();
 
     for (pos, &inst_id) in block_insts.iter().enumerate() {
         let inst = &func.insts[inst_id.0 as usize];
@@ -162,7 +172,7 @@ fn eliminate_redundant_reloads_in_block(
         if inst.opcode == PSEUDO_SPILL_STORE {
             // A store to a slot invalidates the active load for that slot.
             if let Some(slot) = extract_stack_slot_from_uses(inst) {
-                active_loads.remove(&slot);
+                remove_active_load(&mut active_loads, &mut slots_by_vreg, slot);
             }
             continue;
         }
@@ -181,7 +191,8 @@ fn eliminate_redundant_reloads_in_block(
                         old_vreg: load_vreg,
                         new_vreg: prev_vreg,
                         start_pos: pos + 1,
-                        end_pos: first_exact_vreg_def_pos(func, block_insts, pos + 1, load_vreg)
+                        end_pos: def_positions
+                            .first_at_or_after(func, block_insts, pos + 1, load_vreg)
                             .unwrap_or(block_insts.len()),
                     });
                     nop_inst(&mut func.insts[inst_id.0 as usize]);
@@ -189,6 +200,7 @@ fn eliminate_redundant_reloads_in_block(
                 } else {
                     // First load from this slot in this block.
                     active_loads.insert(slot, (load_vreg, inst_id));
+                    slots_by_vreg.entry(load_vreg).or_default().insert(slot);
                 }
             }
             continue;
@@ -196,6 +208,7 @@ fn eliminate_redundant_reloads_in_block(
 
         if inst.flags.is_call() || !inst.implicit_defs.is_empty() {
             active_loads.clear();
+            slots_by_vreg.clear();
         }
 
         // For non-spill instructions: check if any def clobbers an active
@@ -204,20 +217,153 @@ fn eliminate_redundant_reloads_in_block(
 
         for def_vreg in &defs_to_check {
             // Remove any active load whose def VReg matches.
-            active_loads.retain(|_slot, (v, _)| *v != *def_vreg);
+            for slot in slots_by_vreg.remove(def_vreg).unwrap_or_default() {
+                crate::scan_work::charge(1);
+                active_loads.remove(&slot);
+            }
         }
     }
 
     // Apply VReg rewrites to all remaining instructions in the block.
     if !vreg_rewrites.is_empty() {
-        for rewrite in &vreg_rewrites {
+        apply_bounded_rewrites(func, block_insts, &vreg_rewrites);
+    }
+}
+
+/// Whether no instruction id appears twice in `block_insts`. The position
+/// indexes below assume that rewriting the instruction at one position leaves
+/// every other position's instruction unchanged.
+fn block_ids_unique(block_insts: &[InstId]) -> bool {
+    let mut seen = BTreeSet::new();
+    block_insts.iter().all(|id| seen.insert(*id))
+}
+
+/// `first_exact_vreg_def_pos` over one block, answered from a per-VReg list of
+/// def positions instead of a forward scan per query. Scanning made a block
+/// with `r` redundant reloads of never-redefined VRegs cost `O(r * n)`.
+///
+/// The index is built at the first query, from the instructions as they are
+/// then. Later queries ask only about positions after the current one, whose
+/// instructions the elimination loop has not touched yet (it NOPs only the
+/// instruction at the current position), so the index answers what the scan
+/// would. A block that lists an instruction twice keeps the scan.
+#[derive(Default)]
+struct BlockDefPositions {
+    index: Option<Option<BTreeMap<VReg, Vec<usize>>>>,
+}
+
+impl BlockDefPositions {
+    fn first_at_or_after(
+        &mut self,
+        func: &MachFunction,
+        block_insts: &[InstId],
+        start_pos: usize,
+        vreg: VReg,
+    ) -> Option<usize> {
+        let index = self.index.get_or_insert_with(|| {
+            block_ids_unique(block_insts).then(|| {
+                let mut index: BTreeMap<VReg, Vec<usize>> = BTreeMap::new();
+                crate::scan_work::charge(block_insts.len());
+                for (pos, &inst_id) in block_insts.iter().enumerate() {
+                    for def in func.insts[inst_id.0 as usize].defs.iter() {
+                        if let Some(def_vreg) = def.as_vreg() {
+                            let positions = index.entry(def_vreg).or_default();
+                            if positions.last() != Some(&pos) {
+                                positions.push(pos);
+                            }
+                        }
+                    }
+                }
+                index
+            })
+        });
+        match index {
+            Some(index) => {
+                crate::scan_work::charge(1);
+                let positions = index.get(&vreg)?;
+                positions
+                    .get(positions.partition_point(|&pos| pos < start_pos))
+                    .copied()
+            }
+            None => first_exact_vreg_def_pos(func, block_insts, start_pos, vreg),
+        }
+    }
+}
+
+/// Apply the bounded rewrites in order, visiting only the positions whose
+/// instruction uses the rewritten VReg. `rewrite_vreg_uses` changes nothing
+/// at any other position, so this is the per-position loop over every
+/// rewrite's whole range, which cost `O(r * n)` when `r` rewrites each ran to
+/// the block end. The use index follows every rewrite: a rewritten position
+/// stops using the old VReg and starts using the new one.
+fn apply_bounded_rewrites(
+    func: &mut MachFunction,
+    block_insts: &[InstId],
+    rewrites: &[BoundedVRegRewrite],
+) {
+    if !block_ids_unique(block_insts) {
+        for rewrite in rewrites {
             for &inst_id in &block_insts[rewrite.start_pos..rewrite.end_pos] {
+                crate::scan_work::charge(1);
                 let inst = &mut func.insts[inst_id.0 as usize];
                 if inst.opcode == NOP_OPCODE {
                     continue;
                 }
                 rewrite_vreg_uses(inst, rewrite.old_vreg, rewrite.new_vreg);
             }
+        }
+        return;
+    }
+
+    let mut uses_at: BTreeMap<VReg, BTreeSet<usize>> = BTreeMap::new();
+    crate::scan_work::charge(block_insts.len());
+    for (pos, &inst_id) in block_insts.iter().enumerate() {
+        let inst = &func.insts[inst_id.0 as usize];
+        if inst.opcode == NOP_OPCODE {
+            continue;
+        }
+        for op in &inst.uses {
+            if let MachOperand::VReg(vreg) = op {
+                uses_at.entry(*vreg).or_default().insert(pos);
+            }
+        }
+    }
+    for rewrite in rewrites {
+        if rewrite.old_vreg == rewrite.new_vreg {
+            continue;
+        }
+        let end = rewrite.end_pos.max(rewrite.start_pos);
+        let hits: Vec<usize> = uses_at
+            .get(&rewrite.old_vreg)
+            .map(|positions| positions.range(rewrite.start_pos..end).copied().collect())
+            .unwrap_or_default();
+        crate::scan_work::charge(1 + hits.len());
+        for pos in hits {
+            rewrite_vreg_uses(
+                &mut func.insts[block_insts[pos].0 as usize],
+                rewrite.old_vreg,
+                rewrite.new_vreg,
+            );
+            if let Some(positions) = uses_at.get_mut(&rewrite.old_vreg) {
+                positions.remove(&pos);
+            }
+            uses_at.entry(rewrite.new_vreg).or_default().insert(pos);
+        }
+    }
+}
+
+/// Drop the active load of `slot`, if any, from both views.
+fn remove_active_load(
+    active_loads: &mut BTreeMap<StackSlotId, (VReg, InstId)>,
+    slots_by_vreg: &mut BTreeMap<VReg, BTreeSet<StackSlotId>>,
+    slot: StackSlotId,
+) {
+    if let Some((vreg, _)) = active_loads.remove(&slot)
+        && let Some(slots) = slots_by_vreg.get_mut(&vreg)
+    {
+        slots.remove(&slot);
+        if slots.is_empty() {
+            slots_by_vreg.remove(&vreg);
         }
     }
 }
@@ -241,6 +387,7 @@ fn first_exact_vreg_def_pos(
         .enumerate()
         .skip(start_pos)
         .find_map(|(pos, &inst_id)| {
+            crate::scan_work::charge(1);
             let inst = &func.insts[inst_id.0 as usize];
             inst.defs
                 .iter()
@@ -450,6 +597,159 @@ mod tests {
             flags: InstFlags::IS_CALL.union(InstFlags::HAS_SIDE_EFFECTS),
             tied_operands: vec![],
         }
+    }
+
+    /// `eliminate_redundant_reloads_in_block` before active reloads were
+    /// indexed by def vreg: the differential oracle.
+    fn eliminate_redundant_reloads_in_block_reference(
+        func: &mut MachFunction,
+        block_insts: &[InstId],
+        result: &mut PostRAOptResult,
+    ) {
+        let mut active_loads: BTreeMap<StackSlotId, (VReg, InstId)> = BTreeMap::new();
+        let mut vreg_rewrites: Vec<BoundedVRegRewrite> = Vec::new();
+        for (pos, &inst_id) in block_insts.iter().enumerate() {
+            let inst = &func.insts[inst_id.0 as usize];
+            if inst.opcode == NOP_OPCODE {
+                continue;
+            }
+            if inst.opcode == PSEUDO_SPILL_STORE {
+                if let Some(slot) = extract_stack_slot_from_uses(inst) {
+                    active_loads.remove(&slot);
+                }
+                continue;
+            }
+            if inst.opcode == PSEUDO_SPILL_LOAD {
+                if let (Some(load_vreg), Some(slot)) = (
+                    inst.defs.first().and_then(|op| op.as_vreg()),
+                    extract_stack_slot_from_uses(inst),
+                ) {
+                    if let Some(&(prev_vreg, _)) = active_loads.get(&slot) {
+                        vreg_rewrites.push(BoundedVRegRewrite {
+                            old_vreg: load_vreg,
+                            new_vreg: prev_vreg,
+                            start_pos: pos + 1,
+                            end_pos: first_exact_vreg_def_pos(
+                                func,
+                                block_insts,
+                                pos + 1,
+                                load_vreg,
+                            )
+                            .unwrap_or(block_insts.len()),
+                        });
+                        nop_inst(&mut func.insts[inst_id.0 as usize]);
+                        result.redundant_reloads_removed += 1;
+                    } else {
+                        active_loads.insert(slot, (load_vreg, inst_id));
+                    }
+                }
+                continue;
+            }
+            if inst.flags.is_call() || !inst.implicit_defs.is_empty() {
+                active_loads.clear();
+            }
+            let defs: Vec<VReg> = inst.defs.iter().filter_map(|op| op.as_vreg()).collect();
+            for def_vreg in &defs {
+                active_loads.retain(|_slot, (v, _)| *v != *def_vreg);
+            }
+        }
+        for rewrite in &vreg_rewrites {
+            for &inst_id in &block_insts[rewrite.start_pos..rewrite.end_pos] {
+                let inst = &mut func.insts[inst_id.0 as usize];
+                if inst.opcode == NOP_OPCODE {
+                    continue;
+                }
+                rewrite_vreg_uses(inst, rewrite.old_vreg, rewrite.new_vreg);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_reload_elimination_matches_retain_scan() {
+        let mut state = 0xb7e1_5162_8aed_2a6bu64;
+        let mut next = move |limit: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % limit
+        };
+        let mut removed = 0u32;
+        for case in 0..400 {
+            let blocks: Vec<Vec<MachInst>> = (0..1 + next(3))
+                .map(|_| {
+                    (0..next(70))
+                        .map(|_| {
+                            let vreg = v(next(12) as u32);
+                            let slot = StackSlotId(next(8) as u32);
+                            match next(9) {
+                                0..=2 => spill_load(vreg, slot),
+                                3 => spill_store(vreg, slot),
+                                4 | 5 => def_inst(1, vreg),
+                                6 | 7 => use_inst(2, vreg),
+                                _ => call_inst(3),
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let func = make_function(blocks);
+
+            let mut indexed = func.clone();
+            let mut indexed_result = PostRAOptResult::default();
+            let mut reference = func.clone();
+            let mut reference_result = PostRAOptResult::default();
+            for block in &func.blocks {
+                eliminate_redundant_reloads_in_block(
+                    &mut indexed,
+                    &block.insts,
+                    &mut indexed_result,
+                );
+                eliminate_redundant_reloads_in_block_reference(
+                    &mut reference,
+                    &block.insts,
+                    &mut reference_result,
+                );
+            }
+            assert_eq!(indexed_result, reference_result, "case {case}");
+            assert_eq!(
+                format!("{:?}", indexed.insts),
+                format!("{:?}", reference.insts),
+                "case {case}"
+            );
+            removed += reference_result.redundant_reloads_removed;
+        }
+        assert!(removed > 1000, "redundant reloads removed: {removed}");
+    }
+
+    /// One block reloads `n` slots, then reloads each again into a fresh
+    /// vreg that is never redefined. Finding where each redundant reload's
+    /// value dies and rewriting its uses costs `O(n)` units with the per-block
+    /// def and use indexes. The forward def scan and the per-rewrite position
+    /// loop (kept for blocks that list an instruction twice) each run to the
+    /// block end per reload, `O(n^2)`, and fail this bound (see
+    /// `crate::scan_work`).
+    #[test]
+    fn reload_elimination_cost_grows_linearly() {
+        crate::scan_work::assert_near_linear("eliminate_redundant_reloads_in_block", 64, |n| {
+            let n = n as u32;
+            let mut insts = Vec::new();
+            for i in 0..n {
+                insts.push(spill_load(v(i), StackSlotId(i)));
+                insts.push(use_inst(2, v(i)));
+            }
+            for i in 0..n {
+                insts.push(spill_load(v(n + i), StackSlotId(i)));
+                insts.push(use_inst(2, v(n + i)));
+            }
+            let mut func = make_function(vec![insts]);
+            let block_insts = func.blocks[0].insts.clone();
+            let mut result = PostRAOptResult::default();
+            let ((), units) = crate::scan_work::measure(|| {
+                eliminate_redundant_reloads_in_block(&mut func, &block_insts, &mut result);
+            });
+            assert_eq!(result.redundant_reloads_removed, n);
+            units
+        });
     }
 
     /// Build a MachFunction from a list of blocks, each being a list of MachInsts.

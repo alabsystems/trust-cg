@@ -10,33 +10,34 @@
 //!
 //! # Opt-in levels
 //!
-//! | Level | Overhead | Use case |
-//! |-------|----------|----------|
-//! | [`TraceLevel::None`] | 0% | Production builds |
-//! | [`TraceLevel::Summary`] | <1% | CI/CD quality monitoring |
-//! | [`TraceLevel::Full`] | 5-15% | Development, debugging |
-//! | [`TraceLevel::Debug`] | 20-50% | Compiler development, auditing |
+//! | Level | Use case |
+//! |-------|----------|
+//! | [`TraceLevel::None`] | Disabled event collection |
+//! | [`TraceLevel::Summary`] | Local quality monitoring |
+//! | [`TraceLevel::Full`] | Development, debugging |
+//! | [`TraceLevel::Debug`] | Compiler development, auditing |
+//!
+//! Collection cost depends on event volume; no fixed overhead percentage is
+//! established by these levels.
 //!
 //! # Thread safety
 //!
 //! [`CompilationTrace`] is `Send + Sync`. Multiple passes can emit events
-//! concurrently via `Arc<Mutex<Vec<CompilationEvent>>>` with atomic sequence
-//! numbers for ordering.
+//! concurrently via one shared event buffer. Sequence assignment and publication
+//! use the same lock, including across cloned collectors and clear operations.
 //!
 //! # Serialization
 //!
 //! All event types derive `serde::Serialize` for JSON output via
 //! [`CompilationTrace::to_json`].
-//!
-//! # Design reference
-//!
-//! See `designs/2026-04-13-debugging-transparency.md` for the full design.
 
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::provenance::{PassId, TrustIrInstId};
+
+// Event indices are encoded as u64 without a lossy host-width conversion.
+const _: () = assert!(usize::BITS <= u64::BITS);
 
 // ---------------------------------------------------------------------------
 // Trace level
@@ -47,7 +48,7 @@ use crate::provenance::{PassId, TrustIrInstId};
 /// Ordered from least to most verbose: `None < Summary < Full < Debug`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Default)]
 pub enum TraceLevel {
-    /// No logging. Zero overhead. Production default.
+    /// No event collection. Production default.
     #[default]
     None = 0,
     /// Pass-level applied/rejected counts only.
@@ -143,7 +144,7 @@ pub enum Justification {
         /// Name or description of the matched pattern.
         pattern: String,
     },
-    /// An SMT solver (ay) proved semantic equivalence.
+    /// AY reported semantic equivalence; this diagnostic tag is not proof admission.
     SolverProved {
         /// Hash of the proof obligation for cross-referencing.
         proof_hash: u64,
@@ -175,7 +176,7 @@ pub struct CompilationEvent {
     pub subject: Vec<u32>,
     /// Why this decision was made.
     pub justification: Justification,
-    /// Monotonic sequence number for global event ordering.
+    /// Index in the shared event buffer; clearing the trace restarts at zero.
     pub seq: u64,
 }
 
@@ -186,12 +187,12 @@ pub struct CompilationEvent {
 /// Thread-safe collector for compilation events.
 ///
 /// Wraps an `Arc<Mutex<Vec<CompilationEvent>>>` so multiple passes can
-/// emit events concurrently. Sequence numbers are assigned atomically
-/// for consistent global ordering.
+/// emit events concurrently. The event index is its sequence number: no
+/// independently copied counter can diverge from the shared buffer.
+#[derive(Clone)]
 pub struct CompilationTrace {
     level: TraceLevel,
     events: Arc<Mutex<Vec<CompilationEvent>>>,
-    next_seq: AtomicU64,
 }
 
 impl CompilationTrace {
@@ -200,7 +201,6 @@ impl CompilationTrace {
         Self {
             level,
             events: Arc::new(Mutex::new(Vec::new())),
-            next_seq: AtomicU64::new(0),
         }
     }
 
@@ -216,7 +216,11 @@ impl CompilationTrace {
         if self.level < TraceLevel::Summary {
             return;
         }
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let mut events = self.events.lock().expect("trace lock poisoned");
+        // Supported hosts have at most 64-bit usize, and an allocated Vec's
+        // length fits isize. Assign under the publication lock so iteration
+        // order and sequence order agree even when a clone concurrently clears.
+        let seq = events.len() as u64;
         let event = CompilationEvent {
             pass,
             kind,
@@ -224,7 +228,6 @@ impl CompilationTrace {
             justification,
             seq,
         };
-        let mut events = self.events.lock().expect("trace lock poisoned");
         events.push(event);
     }
 
@@ -251,27 +254,15 @@ impl CompilationTrace {
         serde_json::to_string_pretty(&*events).expect("event serialization failed")
     }
 
-    /// Clear all recorded events and reset the sequence counter.
+    /// Clear all recorded events; the next event starts at sequence zero.
     pub fn clear(&self) {
         let mut events = self.events.lock().expect("trace lock poisoned");
         events.clear();
-        self.next_seq.store(0, Ordering::Relaxed);
     }
 
     /// Returns the current trace level.
     pub fn level(&self) -> TraceLevel {
         self.level
-    }
-}
-
-// Implement Clone manually since AtomicU64 doesn't derive Clone.
-impl Clone for CompilationTrace {
-    fn clone(&self) -> Self {
-        Self {
-            level: self.level,
-            events: Arc::clone(&self.events),
-            next_seq: AtomicU64::new(self.next_seq.load(Ordering::Relaxed)),
-        }
     }
 }
 
@@ -292,6 +283,109 @@ impl std::fmt::Debug for CompilationTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonfinite_trace_costs_serialize_as_null_without_poisoning_the_collector() {
+        let trace = CompilationTrace::new(TraceLevel::Full);
+        for cost in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            trace.emit(
+                PassId::new("cost-domain"),
+                EventKind::Spilled {
+                    vreg: 0,
+                    slot_size: 8,
+                    cost,
+                },
+                vec![0],
+                Justification::CostModel {
+                    before: cost,
+                    after: cost,
+                },
+            );
+        }
+        let events: serde_json::Value = serde_json::from_str(&trace.to_json()).unwrap();
+        assert_eq!(events.as_array().unwrap().len(), 3);
+        for event in events.as_array().unwrap() {
+            assert_eq!(
+                event.pointer("/kind/Spilled/cost"),
+                Some(&serde_json::Value::Null)
+            );
+            assert_eq!(
+                event.pointer("/justification/CostModel/before"),
+                Some(&serde_json::Value::Null)
+            );
+            assert_eq!(
+                event.pointer("/justification/CostModel/after"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+        assert_eq!(trace.events().len(), 3);
+        trace.clear();
+        assert!(trace.is_empty());
+        emit_probe(&trace);
+        assert_eq!(trace.events()[0].seq, 0);
+    }
+
+    fn emit_probe(trace: &CompilationTrace) {
+        trace.emit(
+            PassId::new("clone-order"),
+            EventKind::Rejected {
+                rule: RuleId(0),
+                reason: "probe".into(),
+            },
+            vec![],
+            Justification::PatternMatch {
+                pattern: "probe".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn cloned_collectors_share_sequence_state() {
+        let trace = CompilationTrace::new(TraceLevel::Summary);
+        let clone = trace.clone();
+        emit_probe(&trace);
+        emit_probe(&clone);
+        emit_probe(&trace);
+        assert_eq!(
+            trace
+                .events()
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        clone.clear();
+        emit_probe(&trace);
+        emit_probe(&clone);
+        assert_eq!(
+            trace
+                .events()
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn concurrent_clones_publish_in_sequence_order() {
+        let trace = CompilationTrace::new(TraceLevel::Summary);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let clone = trace.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        emit_probe(&clone);
+                    }
+                });
+            }
+        });
+        let events = trace.events();
+        assert_eq!(events.len(), 800);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.seq, index as u64);
+        }
+    }
 
     // -- TraceLevel ordering --
 

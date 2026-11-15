@@ -25,6 +25,7 @@
 use std::env::VarError;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::sync::{Mutex, OnceLock};
 
 /// Operator control for Trust Codegen-owned CPU fanout.
 pub const TRUST_CG_MAX_PARALLELISM_ENV: &str = "TRUST_CG_MAX_PARALLELISM";
@@ -166,9 +167,13 @@ impl ArtifactNeutralExecutorBudget {
 
     /// Resolve already-parsed inputs without consulting ambient state.
     ///
-    /// Known memory below one large-stack slot is rejected. `None` preserves
-    /// the conservative platform fallback for hosts without a memory probe;
-    /// actual pool/thread construction must still fail closed on allocation.
+    /// Known memory caps the large-stack width but never below one slot: the
+    /// reading is a momentary count of free and purgeable pages, not the
+    /// reservation itself, and a budget may change only how work-complete
+    /// compilation runs, never whether it can. Whether the one stack can be
+    /// reserved is decided where it is created: pool/thread construction fails
+    /// closed on allocation. `None` preserves the conservative platform
+    /// fallback for hosts without a memory probe.
     pub fn resolve(
         defaults: ArtifactNeutralExecutorDefaults,
         host: HostResourceSnapshot,
@@ -189,7 +194,7 @@ impl ArtifactNeutralExecutorBudget {
         // Keep the aggregate stack reservation representable even on a narrow
         // host, then apply the captured memory ceiling when one is available.
         let representable_slots =
-            NonZeroUsize::new(usize::MAX / defaults.large_stack_bytes_per_slot.get())
+            NonZeroUsize::new(usize::MAX / defaults.large_stack_bytes_per_slot)
                 .unwrap_or(NonZeroUsize::MIN);
         large_stack_slots = min_nonzero(large_stack_slots, representable_slots);
 
@@ -198,12 +203,7 @@ impl ArtifactNeutralExecutorBudget {
                 u64::try_from(defaults.large_stack_bytes_per_slot.get()).unwrap_or(u64::MAX);
             let memory_slots = available_memory_bytes.get() / bytes_per_slot;
             let memory_slots = usize::try_from(memory_slots).unwrap_or(usize::MAX);
-            let Some(memory_slots) = NonZeroUsize::new(memory_slots) else {
-                return Err(ResourceBudgetError::InsufficientLargeStackMemory {
-                    available_bytes: available_memory_bytes.get(),
-                    bytes_per_slot: defaults.large_stack_bytes_per_slot.get(),
-                });
-            };
+            let memory_slots = NonZeroUsize::new(memory_slots).unwrap_or(NonZeroUsize::MIN);
             large_stack_slots = min_nonzero(large_stack_slots, memory_slots);
         }
 
@@ -326,20 +326,35 @@ impl IdentityBoundSearchPolicy {
 /// Invalid artifact-neutral executor configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceBudgetError {
+    /// An immutable executor budget was already admitted under different controls.
+    InstalledPolicyConflict { key: &'static str },
+    /// A fork child cannot use an executor inherited from another process.
+    InheritedExecutorProcess { owner: u32, current: u32 },
+    /// An installed resource policy cannot be read safely after a panic.
+    InstalledPolicyPoisoned { key: &'static str },
     /// The control exists but is not valid Unicode.
     NonUnicode { key: &'static str },
     /// The control is not a positive base-10 integer representable as `usize`.
     InvalidPositiveInteger { key: &'static str },
-    /// Available host memory cannot back even one requested large stack.
-    InsufficientLargeStackMemory {
-        available_bytes: u64,
-        bytes_per_slot: usize,
-    },
 }
 
 impl fmt::Display for ResourceBudgetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InstalledPolicyConflict { key } => write!(
+                formatter,
+                "installed resource policy for {key} conflicts with current controls; refusing reconfiguration"
+            ),
+            Self::InheritedExecutorProcess { owner, current } => write!(
+                formatter,
+                "executor belongs to process {owner}; inherited use by {current} refused"
+            ),
+            Self::InstalledPolicyPoisoned { key } => {
+                write!(
+                    formatter,
+                    "installed resource policy for {key} is poisoned; refusing fallback"
+                )
+            }
             Self::NonUnicode { key } => write!(
                 formatter,
                 "{key} must be Unicode containing a positive base-10 integer"
@@ -347,27 +362,108 @@ impl fmt::Display for ResourceBudgetError {
             Self::InvalidPositiveInteger { key } => {
                 write!(formatter, "{key} must be a positive base-10 integer")
             }
-            Self::InsufficientLargeStackMemory {
-                available_bytes,
-                bytes_per_slot,
-            } => write!(
-                formatter,
-                "host reports {available_bytes} available bytes, less than one {bytes_per_slot}-byte large-stack slot"
-            ),
         }
     }
 }
 
 impl std::error::Error for ResourceBudgetError {}
 
+/// Embedder-installed values for the positive-integer resource controls.
+///
+/// An environment variable cannot carry a compiler knob that must be part of an
+/// artifact's identity: it is invisible to the crate hash, so two compilations
+/// that differ only in it hash the same. An embedding that receives these
+/// controls through a TRACKED channel instead — the rustc bridge takes them from
+/// `-Ztrust-ir-cg-args`, which is `[TRACKED]` — installs the already-validated
+/// value here, and [`capture_positive_usize_control`] prefers it over the
+/// environment.
+///
+/// A `Mutex<Vec<..>>` rather than a `OnceLock` per control because the set of
+/// controls is open and tiny. `Some(None)` is an installed default lane, distinct
+/// from no installation. A poisoned registry refuses reads and installations;
+/// it must not fall back to a different environment/default policy.
+type InstalledPositiveControls = Vec<(&'static str, Option<NonZeroUsize>)>;
+static INSTALLED_POSITIVE_USIZE_CONTROLS: OnceLock<Mutex<InstalledPositiveControls>> =
+    OnceLock::new();
+
+fn installed_positive_usize_controls() -> &'static Mutex<InstalledPositiveControls> {
+    INSTALLED_POSITIVE_USIZE_CONTROLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Install an already-validated value for one positive-integer control.
+///
+/// Returns true for a first or identical installation, false for a conflict or
+/// poisoned registry. Conflicts never replace an installed value. Embedders
+/// must check the result before using the supposedly installed policy.
+///
+/// The value is a `NonZeroUsize`, so this entry point cannot introduce a control
+/// the environment path would have rejected — validation happened in the caller,
+/// through [`parse_positive_usize_control`], which produces the SAME diagnostic.
+pub fn install_positive_usize_control(key: &'static str, value: NonZeroUsize) -> bool {
+    install_optional_positive_usize_control(key, Some(value))
+}
+
+/// Install a tracked optional positive-integer policy, including its absence.
+///
+/// An installed `None` requests the caller's default, not environment fallback.
+/// It conflicts with an installed `Some` and vice versa. Callers that never
+/// install retain the standalone environment behavior.
+pub fn install_optional_positive_usize_control(
+    key: &'static str,
+    value: Option<NonZeroUsize>,
+) -> bool {
+    let Ok(mut installed) = installed_positive_usize_controls().lock() else {
+        return false;
+    };
+    if let Some((_, previous)) = installed
+        .iter()
+        .find(|(installed_key, _)| *installed_key == key)
+    {
+        return *previous == value;
+    }
+    installed.push((key, value));
+    true
+}
+
+fn installed_positive_usize_control(
+    key: &'static str,
+) -> Result<Option<Option<NonZeroUsize>>, ResourceBudgetError> {
+    let installed = installed_positive_usize_controls()
+        .lock()
+        .map_err(|_| ResourceBudgetError::InstalledPolicyPoisoned { key })?;
+    Ok(installed
+        .iter()
+        .find(|(installed_key, _)| *installed_key == key)
+        .map(|(_, value)| *value))
+}
+
+/// Validate one positive-integer control value that did NOT come from the
+/// environment, producing the same typed error the environment path produces.
+///
+/// Exposed so a tracked-option embedding reports a malformed budget with the
+/// identical wording, under the key the operator actually typed.
+pub fn parse_positive_usize_control(
+    key: &'static str,
+    value: &str,
+) -> Result<NonZeroUsize, ResourceBudgetError> {
+    parse_positive_usize(key, value)
+}
+
 /// Capture one optional positive-integer resource control.
 ///
 /// Parsing is centralized here, but parsing does not classify a control as
 /// artifact-neutral. The caller must use the result only in an order-stable,
 /// work-complete execution lane or bind it into semantic policy identity.
+///
+/// An embedder-installed value (see [`install_positive_usize_control`]) is
+/// authoritative over the environment: it is the one that arrived through a
+/// tracked channel.
 pub fn capture_positive_usize_control(
     key: &'static str,
 ) -> Result<Option<NonZeroUsize>, ResourceBudgetError> {
+    if let Some(installed) = installed_positive_usize_control(key)? {
+        return Ok(installed);
+    }
     match crate::var(key) {
         Ok(value) => parse_positive_usize(key, &value).map(Some),
         Err(VarError::NotPresent) => Ok(None),
@@ -542,6 +638,57 @@ mod macos_memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poisoned_installed_cap_never_falls_back_to_environment() {
+        const CHILD: &str = "POLICY_INSTALL_POISON_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "resource_budget::tests::poisoned_installed_cap_never_falls_back_to_environment",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env(TRUST_CG_MAX_PARALLELISM_ENV, "64")
+                .output()
+                .unwrap();
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "poison child: {}", output.status);
+            return;
+        }
+        assert!(install_positive_usize_control(
+            TRUST_CG_MAX_PARALLELISM_ENV,
+            NonZeroUsize::new(2).unwrap()
+        ));
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = installed_positive_usize_controls().lock().unwrap();
+            panic!("deliberate installed-policy poison");
+        });
+        assert!(poisoned.is_err());
+        let captured = capture_positive_usize_control(TRUST_CG_MAX_PARALLELISM_ENV);
+        let error = ResourceBudgetError::InstalledPolicyPoisoned {
+            key: TRUST_CG_MAX_PARALLELISM_ENV,
+        };
+        assert_eq!(captured, Err(error));
+        assert_eq!(
+            ArtifactNeutralExecutorBudget::capture_for_host(
+                defaults(),
+                HostResourceSnapshot::new(nonzero(64), None),
+            ),
+            Err(error)
+        );
+        assert!(!install_optional_positive_usize_control(
+            TRUST_CG_MAX_PARALLELISM_ENV,
+            None
+        ));
+        assert!(!install_positive_usize_control(
+            TRUST_CG_MAX_PARALLELISM_ENV,
+            nonzero(2)
+        ));
+    }
     use crate::with_env_overrides;
 
     fn nonzero(value: usize) -> NonZeroUsize {
@@ -606,17 +753,21 @@ mod tests {
         });
     }
 
+    /// A memory reading below one large stack narrows the width to one slot;
+    /// it never refuses the budget, whatever the momentary reading.
     #[test]
-    fn known_memory_below_one_large_stack_fails_closed() {
-        let insufficient_host =
-            HostResourceSnapshot::new(nonzero(64), NonZeroU64::new(16 * 1024 * 1024));
-        assert_eq!(
-            ArtifactNeutralExecutorBudget::capture_for_host(defaults(), insufficient_host),
-            Err(ResourceBudgetError::InsufficientLargeStackMemory {
-                available_bytes: 16 * 1024 * 1024,
-                bytes_per_slot: PROOF_VERIFIER_STACK_BYTES,
-            })
-        );
+    fn known_memory_below_one_large_stack_still_admits_one_slot() {
+        for available in [1, 16 * 1024 * 1024, PROOF_VERIFIER_STACK_BYTES as u64 - 1] {
+            let low_memory_host =
+                HostResourceSnapshot::new(nonzero(64), NonZeroU64::new(available));
+            with_env_overrides(&[(TRUST_CG_MAX_PARALLELISM_ENV, "64")], || {
+                let budget =
+                    ArtifactNeutralExecutorBudget::capture_for_host(defaults(), low_memory_host)
+                        .expect("a low memory reading narrows the budget instead of refusing it");
+                assert_eq!(budget.cpu_slots().get(), 64);
+                assert_eq!(budget.large_stack_slots().get(), 1);
+            });
+        }
     }
 
     #[test]

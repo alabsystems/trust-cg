@@ -44,13 +44,53 @@ impl Prng {
         self.gen_range_u32(denom) < p
     }
 
-    /// i64 in `[-range, range]`.
+    /// i64 in `[-abs(range), abs(range)]`, clipped to the i64 domain.
+    /// `i64::MIN` selects the complete i64 domain.
     pub fn signed_i64(&mut self, range: i64) -> i64 {
         let r = range.unsigned_abs();
         if r == 0 {
             return 0;
         }
+        if r == 1_u64 << 63 {
+            return self.next_u64() as i64;
+        }
         let v = self.next_u64() % (2 * r + 1);
-        (v as i64) - (r as i64)
+        // Subtract before narrowing: an unsigned sample above i64::MAX is
+        // valid, but casting it first can overflow the signed subtraction.
+        (i128::from(v) - i128::from(r)) as i64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Prng;
+
+    #[test]
+    fn signed_ranges_cover_extreme_bounds_without_overflow() {
+        for range in [i64::MIN, -i64::MAX, i64::MAX, -1, 0, 1, 1024] {
+            let radius = i128::from(range).abs();
+            let mut rng = Prng::new(42);
+            for _ in 0..1000 {
+                let value = i128::from(rng.signed_i64(range));
+                assert!(value >= -radius && value <= radius);
+            }
+        }
+        let mut actual = Prng::new(42);
+        let mut expected = Prng::new(42);
+        for _ in 0..100 {
+            assert_eq!(actual.signed_i64(i64::MIN), expected.next_u64() as i64);
+        }
+    }
+
+    #[test]
+    fn ordinary_signed_sampling_preserves_seed_mapping() {
+        let mut actual = Prng::new(42);
+        let mut expected = Prng::new(42);
+        for _ in 0..100 {
+            assert_eq!(
+                actual.signed_i64(1024),
+                (expected.next_u64() % 2049) as i64 - 1024
+            );
+        }
     }
 }

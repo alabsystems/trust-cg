@@ -1,0 +1,26 @@
+# trust-cg-eqsat-check - independent derivation checker for trust-cg-eqsat (PKG-U1)
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-eqsat-check"
+description = "Independent checker of trust-cg-eqsat derivations between two trust-ir bodies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+# The checker depends on trust-ir ONLY. It must never depend on, include or
+# path-share code with trust-cg-eqsat (the engine);
+# trust-cg-eqsat/tests/eqsat_determinism_and_mutants.rs, case
+# checker_shares_no_code_with_engine, fails if it does.
+trust-ir = { workspace = true }
+
+[lints]
+workspace = true

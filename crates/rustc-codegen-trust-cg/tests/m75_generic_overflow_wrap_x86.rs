@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Differential regression test for MISCOMPILE #75: generic arithmetic via a trait
 // operator (`<T as Add/Sub/Mul/Neg>::op`) TRAPPED (SIGILL) on overflow instead of
@@ -35,65 +39,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m75 test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -108,7 +61,7 @@ fn write_panic_stubs(dir: &Path, obj: &Path) -> PathBuf {
     let mut stubs = String::from("#include <stdlib.h>\n");
     for line in String::from_utf8_lossy(&nm.stdout).lines() {
         let sym = line.trim().trim_start_matches('U').trim();
-        if sym.contains("panic") {
+        if toolchain_support::is_abort_stub_symbol(sym) {
             let c = sym.strip_prefix('_').unwrap_or(sym);
             stubs.push_str(&format!(
                 "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -125,10 +78,8 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> i
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
@@ -140,7 +91,7 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> i
         .arg("--out-dir")
         .arg(&dir)
         .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -153,7 +104,10 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> i
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "o"))
         .collect();
-    assert!(!objs.is_empty(), "{stem} (opt={opt}): no object file produced");
+    assert!(
+        !objs.is_empty(),
+        "{stem} (opt={opt}): no object file produced"
+    );
 
     let stubs_path = write_panic_stubs(&dir, &objs[0]);
 
@@ -205,9 +159,12 @@ fn differential_program(stem: &str, body: &str, expected: i32) {
     }
 }
 
-const ADD: &str = "#[inline(never)] fn add<T: Copy + core::ops::Add<Output=T>>(x: T, y: T) -> T { x + y }\n";
-const SUB: &str = "#[inline(never)] fn sub<T: Copy + core::ops::Sub<Output=T>>(x: T, y: T) -> T { x - y }\n";
-const MUL: &str = "#[inline(never)] fn mul<T: Copy + core::ops::Mul<Output=T>>(x: T, y: T) -> T { x * y }\n";
+const ADD: &str =
+    "#[inline(never)] fn add<T: Copy + core::ops::Add<Output=T>>(x: T, y: T) -> T { x + y }\n";
+const SUB: &str =
+    "#[inline(never)] fn sub<T: Copy + core::ops::Sub<Output=T>>(x: T, y: T) -> T { x - y }\n";
+const MUL: &str =
+    "#[inline(never)] fn mul<T: Copy + core::ops::Mul<Output=T>>(x: T, y: T) -> T { x * y }\n";
 const NEG: &str = "#[inline(never)] fn neg<T: Copy + core::ops::Neg<Output=T>>(x: T) -> T { -x }\n";
 
 /// Generic `add::<u8>(200, 100)` must WRAP to 44 (was SIGILL).
@@ -215,8 +172,10 @@ const NEG: &str = "#[inline(never)] fn neg<T: Copy + core::ops::Neg<Output=T>>(x
 fn m75_generic_add_u8_overflow_wraps_matches_llvm() {
     differential_program(
         "add_u8",
-        &format!("{ADD}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            (add::<u8>(bb(200u8), bb(100u8)) as i32) & 0xff }}"),
+        &format!(
+            "{ADD}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            (add::<u8>(bb(200u8), bb(100u8)) as i32) & 0xff }}"
+        ),
         44,
     );
 }
@@ -226,8 +185,10 @@ fn m75_generic_add_u8_overflow_wraps_matches_llvm() {
 fn m75_generic_neg_i32_min_wraps_matches_llvm() {
     differential_program(
         "neg_i32min",
-        &format!("{NEG}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            (neg::<i32>(bb(i32::MIN)) & 0xff) as i32 }}"),
+        &format!(
+            "{NEG}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            (neg::<i32>(bb(i32::MIN)) & 0xff) as i32 }}"
+        ),
         0,
     );
 }
@@ -237,8 +198,10 @@ fn m75_generic_neg_i32_min_wraps_matches_llvm() {
 fn m75_generic_mul_u8_overflow_wraps_matches_llvm() {
     differential_program(
         "mul_u8",
-        &format!("{MUL}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            (mul::<u8>(bb(20u8), bb(20u8)) as i32) & 0xff }}"),
+        &format!(
+            "{MUL}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            (mul::<u8>(bb(20u8), bb(20u8)) as i32) & 0xff }}"
+        ),
         // 20*20 = 400; 400 mod 256 = 144
         144,
     );
@@ -249,8 +212,10 @@ fn m75_generic_mul_u8_overflow_wraps_matches_llvm() {
 fn m75_generic_sub_u16_underflow_wraps_matches_llvm() {
     differential_program(
         "sub_u16",
-        &format!("{SUB}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            (sub::<u16>(bb(10u16), bb(50u16)) as i32) & 0xff }}"),
+        &format!(
+            "{SUB}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            (sub::<u16>(bb(10u16), bb(50u16)) as i32) & 0xff }}"
+        ),
         // 10 - 50 wraps to 65536 - 40 = 65496; 65496 & 0xff = 216
         216,
     );
@@ -276,8 +241,10 @@ fn m75_generic_composed_overflow_wraps_matches_llvm() {
 fn m75_generic_add_no_overflow_matches_llvm() {
     differential_program(
         "no_overflow",
-        &format!("{ADD}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
-            (add::<i32>(bb(20), bb(22)) & 0xff) as i32 }}"),
+        &format!(
+            "{ADD}#[no_mangle] pub extern \"C\" fn main() -> i32 {{ \
+            (add::<i32>(bb(20), bb(22)) & 0xff) as i32 }}"
+        ),
         42,
     );
 }

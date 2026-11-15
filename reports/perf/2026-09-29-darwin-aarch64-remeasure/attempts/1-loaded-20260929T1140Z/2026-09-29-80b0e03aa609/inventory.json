@@ -1,0 +1,30 @@
+{
+ "files": {
+  "80b0e03aa609-20260929T114207Z.json": {
+   "bytes": 54548,
+   "sha256": "2a3c8c169c3e54c2c849fb74ddfad7d9df881e093a6bae98ebbcbc0f9b1060b8"
+  },
+  "80b0e03aa609-20260929T114207Z.md": {
+   "bytes": 9347,
+   "sha256": "bbb4893019e672c78ae7a27918d6b12d34defc779b243dd6f128d78db89f58df"
+  },
+  "README.md": {
+   "bytes": 3061,
+   "sha256": "9582e14f01ba8096b6cb2ff86a68e47ddd754431bc436b99b3da7e05cdc09be1"
+  },
+  "outcomes.json": {
+   "bytes": 18205,
+   "sha256": "2e7e51c8c52a183cafa236e4bfd5bb27c1d717812fd93aaa4ba8b9c34a444f2e"
+  },
+  "raw_samples.json": {
+   "bytes": 8169,
+   "sha256": "e8524b3df17346af56540f957ba352e36eaab86eb02dbcc56d7aea02cd0b4f18"
+  }
+ },
+ "generated_by": "benchmarks/beat-llvm/run.py --retain-dir",
+ "git_dirty": false,
+ "git_sha": "80b0e03aa6091fdf517fb3e74940fb3cec799ca3",
+ "headline_eligible": false,
+ "source_results": "80b0e03aa609-20260929T114207Z.json",
+ "timestamp_utc": "2026-09-29T11:40:16+00:00"
+}

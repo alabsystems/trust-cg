@@ -1,0 +1,28 @@
+tcg-lrat-cert-v3
+verdict-sha256: 1e43cdee0edf1a3b42acd9d38a102f2653b76469542b13277ed20578672aa5a4
+solver-sha256: 2d62816f907f5091b12e8afae2bf9a73176f88eaee01d4d8832ce2f3726a1991
+cnf-sha256: 24f42b080ef031a661aae94764e706a11322a08431e09e290116b1481b669ce0
+obligation: ConstMat: MOVK Xd #imm16, LSL #32 splices halfword (preserves other bits)
+cnf 180
+c ay export pid 3619410 generation 5
+c ay bit-blasted QF_BV CNF (--dump-bv-cnf)
+c complete eager encoding of the current check-sat query
+p cnf 82 5
+-1 0
+-82 0
+82 0
+-1 -82 0
+1 82 0
+
+drat 2
+0
+
+smt2 401
+(set-option :timeout 30000)
+(set-option :produce-models true)
+(set-logic QF_BV)
+(declare-const base (_ BitVec 64))
+(declare-const imm16 (_ BitVec 16))
+(assert (not (= (concat ((_ extract 63 48) base) (concat imm16 ((_ extract 31 0) base))) (bvor (bvand (bvxor (_ bv18446744073709551615 64) (bvshl (_ bv65535 64) (_ bv32 64))) base) (bvshl ((_ zero_extend 48) imm16) (_ bv32 64))))))
+(check-sat)
+(exit)

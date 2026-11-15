@@ -86,8 +86,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -235,11 +246,14 @@ fn global_addr_stub(global_index: u64, offset: u32) -> i128 {
 /// `fn _use_fnptr(a) -> (&_leaf_add1)(a)`  -- function-address GlobalRef + CallIndirect
 fn build_fn_address_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("fnaddr");
-    let unary_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let unary_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // _leaf_add1(a) -> a + 1
     let mut leaf = TrustIrFunction::new(FuncId::new(0), "_leaf_add1", unary_ft, BlockId::new(0));
@@ -264,7 +278,9 @@ fn build_fn_address_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(leaf);
+    module
+        .try_add_function(leaf)
+        .expect("Module::try_add_function: test fixture");
 
     // _use_fnptr(a) -> let f = &_leaf_add1; f(a)
     let mut entry = TrustIrFunction::new(FuncId::new(1), "_use_fnptr", unary_ft, BlockId::new(0));
@@ -291,7 +307,9 @@ fn build_fn_address_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -301,16 +319,22 @@ fn build_fn_address_module() -> TrustIrModule {
 /// one with `Select`, and calls through it.
 fn build_dispatch_table_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("dispatchtbl");
-    let unary_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let dispatch_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let unary_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let dispatch_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // _double(a) -> a * 2
     let mut dbl = TrustIrFunction::new(FuncId::new(0), "_double", unary_ft, BlockId::new(0));
@@ -335,7 +359,9 @@ fn build_dispatch_table_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(dbl);
+    module
+        .try_add_function(dbl)
+        .expect("Module::try_add_function: test fixture");
 
     // _negate(a) -> 0 - a
     let mut neg = TrustIrFunction::new(FuncId::new(1), "_negate", unary_ft, BlockId::new(0));
@@ -360,7 +386,9 @@ fn build_dispatch_table_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(neg);
+    module
+        .try_add_function(neg)
+        .expect("Module::try_add_function: test fixture");
 
     // _use_dispatch(sel, a) -> (sel != 0 ? &_double : &_negate)(a)
     let mut entry = TrustIrFunction::new(
@@ -420,7 +448,9 @@ fn build_dispatch_table_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -431,29 +461,28 @@ fn build_data_global_module() -> TrustIrModule {
 
     // Little-endian i64 0x0000_0000_0000_4243 = 16963.
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "_data_answer".to_string(),
         ty: Ty::I64,
         mutable: false,
-        initializer: Some(Constant::Aggregate(vec![
-            Constant::Int(0x43),
-            Constant::Int(0x42),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-        ])),
+        // WS7.3: typed at the global's `i64` (trust-ir refuses a byte
+        // aggregate there as `ConstTypeMismatch`).
+        initializer: Some(Constant::Int(0x4243)),
         linkage: Linkage::External,
         tls: None,
         align: None,
     });
 
-    let ret_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ret_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let stub = global_addr_stub(0, 0);
     let mut entry = TrustIrFunction::new(FuncId::new(0), "_use_global", ret_ft, BlockId::new(0));
@@ -480,7 +509,9 @@ fn build_data_global_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -583,4 +614,13 @@ int main(void) {
 "#;
     let r = differential_test("data_global", &module, c_source);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

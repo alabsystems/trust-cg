@@ -33,7 +33,6 @@
 // the NEON vector op -- justifying the vectorization rewrite.
 //
 // Reference: crates/trust-cg-opt/src/vectorize.rs (scalar_to_neon_op)
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! NEON auto-vectorization lowering verification proofs.
 //!
@@ -1439,6 +1438,12 @@ mod tests {
     /// Verify that ADD with 4S arrangement (128-bit) produces the same
     /// per-lane results as ADD with 2S arrangement (64-bit) for the
     /// overlapping lower two lanes. This validates arrangement consistency.
+    ///
+    /// The 128-bit operands take the 2S operands as their lower halves
+    /// directly, rather than as separate inputs tied by `vn == vn128_lo`
+    /// preconditions: two independent 64-bit draws are never equal, so that
+    /// form left the sampled sweep with no point to compare (a vacuous
+    /// sample). Sharing the variables makes every sampled point a comparison.
     #[test]
     fn test_vectorize_add_arrangement_consistency() {
         // 2S (64-bit): two 32-bit lanes
@@ -1446,16 +1451,16 @@ mod tests {
         let vm_64 = SmtExpr::var("vm", 64);
         let add_2s = encode_neon_add(VectorArrangement::S2, &vn_64, &vm_64);
 
-        // 4S (128-bit): four 32-bit lanes, lower 64 bits = same as 2S
-        let vn_128 = var_128("vn128");
-        let vm_128 = var_128("vm128");
+        // 4S (128-bit): four 32-bit lanes whose lower 64 bits are the 2S
+        // operands and whose upper 64 bits are free.
+        let vn_128 = SmtExpr::var("vn128_hi", 64).concat(vn_64.clone());
+        let vm_128 = SmtExpr::var("vm128_hi", 64).concat(vm_64.clone());
         let add_4s = encode_neon_add(VectorArrangement::S4, &vn_128, &vm_128);
 
         // Extract lower 64 bits of the 4S result
         let lower_4s = add_4s.extract(63, 0);
 
-        // Build proof: lower 64 bits of 4S result == full 2S result,
-        // when the lower 64 bits of 128-bit inputs match the 64-bit inputs.
+        // Build proof: lower 64 bits of 4S result == full 2S result.
         let obligation = ProofObligation {
             machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
             name: "Vectorize: ADD.4S[63:0] == ADD.2S (consistency)".to_string(),
@@ -1464,16 +1469,10 @@ mod tests {
             inputs: vec![
                 ("vn".to_string(), 64),
                 ("vm".to_string(), 64),
-                ("vn128_lo".to_string(), 64),
                 ("vn128_hi".to_string(), 64),
-                ("vm128_lo".to_string(), 64),
                 ("vm128_hi".to_string(), 64),
             ],
-            // Precondition: lower halves must match
-            preconditions: vec![
-                vn_64.clone().eq_expr(SmtExpr::var("vn128_lo", 64)),
-                vm_64.clone().eq_expr(SmtExpr::var("vm128_lo", 64)),
-            ],
+            preconditions: vec![],
             fp_inputs: vec![],
             category: Some(crate::lowering_proof::TransvalCheckKind::Vectorization),
         };

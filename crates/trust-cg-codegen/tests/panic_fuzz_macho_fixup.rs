@@ -6,9 +6,6 @@
 //
 // Part of #448 (#387 follow-up) / Part of #372 (Crash-free codegen).
 //
-// Reference: `designs/2026-04-18-crash-free-codegen-plan.md` §5 (proptest
-// as primary defense) and §6 (per-crate harness).
-//
 // Contract under test: the Mach-O fixup / relocation application layer
 // must never panic on arbitrary input. The exercised boundaries are:
 //   1. `FixupList::resolve_named_symbols` with an arbitrary lookup closure.
@@ -26,9 +23,10 @@
 //      sections with non-empty reloc lists, etc.).
 //
 // Run:
-//   cargo test -p trust-cg-codegen --test panic_fuzz_macho_fixup
+//   scripts/trust_cargo.sh test -p trust-cg-codegen --test panic_fuzz_macho_fixup
 // Increase case count via env:
-//   PROPTEST_CASES=100000 cargo test -p trust-cg-codegen --test panic_fuzz_macho_fixup
+//   PROPTEST_CASES=100000 scripts/trust_cargo.sh test -p trust-cg-codegen \
+//     --test panic_fuzz_macho_fixup
 
 use std::collections::HashMap;
 use std::panic;
@@ -152,12 +150,48 @@ fn catch<F: FnOnce() + panic::UnwindSafe>(label: &str, f: F) {
 // Properties
 // ---------------------------------------------------------------------------
 
+/// The case count every property in this file runs: PROPTEST_CASES, else 256.
+fn panic_fuzz_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Positive control for the case count, as in `panic_fuzz_lower.rs`: a
+/// property with this file's case configuration counts the cases it actually
+/// ran and prints both figures on one line. The Linux floor requires the
+/// line with this file's default and the fuzz lane with its
+/// `--proptest-cases`, so a case count shrunk behind their back fails them.
+#[test]
+fn panic_fuzz_runs_its_configured_case_count() {
+    let configured = panic_fuzz_cases();
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: configured,
+        ..ProptestConfig::default()
+    });
+    let run = std::cell::Cell::new(0u32);
+    runner
+        .run(&any::<u64>(), |_| {
+            run.set(run.get() + 1);
+            Ok(())
+        })
+        .expect("the counting property cannot fail");
+    println!(
+        "panic-fuzz proptest cases: configured={configured} run={}",
+        run.get()
+    );
+    assert!(run.get() > 0, "no proptest case ran");
+    assert_eq!(
+        run.get(),
+        configured,
+        "proptest ran a different number of cases"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
+        cases: panic_fuzz_cases(),
         max_shrink_iters: 200,
         .. ProptestConfig::default()
     })]

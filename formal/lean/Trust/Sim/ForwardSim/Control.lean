@@ -55,6 +55,7 @@ import Trust.Model
 import Trust.Cert.Obligation
 import Trust.Sim.Match
 import Trust.Model.Encoder
+import Trust.Model.EncoderStep
 import Trust.Cert.Compare
 
 namespace Trust
@@ -558,9 +559,8 @@ theorem switchDefault_rip
     ## 8.  Honest gaps (classified) — what this module does NOT close.
 
     The forward-sim CONTROL case is fully discharged ABOVE for the cascade/two-way forms (no
-    `sorry` in §1–§7).  Two genuinely-separate obligations are recorded here as named statements
-    with an explicit `sorry` and a one-line classification, so the perimeter is auditable and
-    nothing downstream silently assumes them.
+    `sorry` in §1–§7). The jump-table placeholder remains explicitly non-authoritative.
+    The near conditional-branch byte round-trip is now proved by the decoder.
     ######################################################################################### -/
 
 /-- (open) Indexed JUMP-TABLE lowering: `JMP [table_base + key*8]`.  A dense switch may be lowered
@@ -577,17 +577,12 @@ theorem switchTable_forwardSim_stub
     True := by
   trivial
 
-/-- (stubbed-semantics) The branch-form byte ROUND-TRIP `decode (encode (.jcc cc rel)) = some (…)`.
-    `condBr_forwardSim` takes this as a hypothesis `hrt`; here we record WHY it is a hypothesis and
-    not a theorem: `Model.Encoder.decode`'s branch arm (the `0x0F 0x8x` two-byte-opcode + rel32
-    parser) is the stubbed arm of that decoder (classified there), so the round-trip is owned by
-    `Model.Encoder`, exactly as the arithmetic cases consume `decode_encode_regreg`.  Stated as the
-    round-trip we would discharge once that arm lands. -/
+/-- Compatibility name for the now-proved near-branch byte round-trip.
+    `condBr_forwardSim` callers can obtain their `hrt` premise directly from
+    `Model.Encoder.decode_encode_jcc`; this is a byte-model theorem. -/
 theorem decode_encode_jcc_stub (cc : Cond) (rel : BitVec 32) :
     decode (encode (.jcc cc rel)) = some (.jcc cc rel, []) := by
-  sorry  -- stubbed-semantics: needs `Model.Encoder.decode`'s branch arm (0x0F 8x + rel32 parser),
-         -- the same family as `decode_encode_regreg`.  NOT the simulation conclusion; it is the
-         -- byte-faithfulness fact, consumed as `hrt` by `condBr_forwardSim`.
+  simpa using Model.Encoder.decode_encode_jcc cc rel []
 
 end Control
 end ForwardSim

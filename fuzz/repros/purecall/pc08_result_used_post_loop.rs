@@ -1,5 +1,6 @@
 // PC08 POSITIVE: the hoisted call's result is ALSO used AFTER the loop
-// (tests result-vreg dominance/liveness past the loop exit).
+// (tests result-vreg dominance/liveness past the loop exit). The call is in
+// the loop; until 2026-11-04 it sat before it, so nothing was hoisted (OD-231).
 #![no_std]
 #![no_main]
 #[panic_handler]
@@ -10,8 +11,8 @@ fn ack(m: u64, n: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
     let mut acc: u64 = 0; let mut r: u32 = 0;
-    let v = ack(2, 5);
-    while r < 400 { acc = acc.wrapping_add(v); r += 1; }
+    let mut v: u64 = 0;
+    while r < 400 { v = ack(2, 5); acc = acc.wrapping_add(v); r += 1; }
     acc = acc.wrapping_add(v); // v used after the loop too
     ((acc ^ 0x44) & 0xff) as i32
 }

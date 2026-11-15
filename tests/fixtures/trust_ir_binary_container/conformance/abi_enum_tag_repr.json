@@ -1,0 +1,136 @@
+{
+  "name": "abi_enum_tag_repr",
+  "functions": [
+    {
+      "id": 0,
+      "name": "wide_tags",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [
+    {
+      "id": 0,
+      "name": "WideU",
+      "variants": [
+        {
+          "name": "A",
+          "fields": [],
+          "field_names": []
+        },
+        {
+          "name": "B",
+          "fields": [],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        0,
+        18446744073709551616
+      ],
+      "repr": "U128",
+      "layout": null
+    },
+    {
+      "id": 1,
+      "name": "WideI",
+      "variants": [
+        {
+          "name": "Neg",
+          "fields": [],
+          "field_names": []
+        },
+        {
+          "name": "Pos",
+          "fields": [],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        -18446744073709551616,
+        18446744073709551616
+      ],
+      "repr": "I128",
+      "layout": null
+    }
+  ],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    {
+      "Enum": 0
+    },
+    {
+      "Enum": 1
+    }
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "sysv64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

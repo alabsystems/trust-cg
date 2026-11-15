@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: `f32::round()` / `f64::round()` via the `roundf*` intrinsic.
 //
@@ -38,65 +42,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -128,9 +81,8 @@ fn try_compile(
     let src_path = dir.join(format!("{name}.rs"));
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -207,125 +159,179 @@ fn fround_match_or_fail_closed() {
         // 0.49999999999999994 MUST round to 0. The naive `trunc(x+0.5)` would give 1
         // (x+0.5 rounds UP to exactly 1.0). This is the whole reason for the exact
         // `x - trunc(x)` fractional-part compare.
-        ("f64_edge_below_half",
-         "fn main(){ let x=std::hint::black_box(0.49999999999999994f64); \
+        (
+            "f64_edge_below_half",
+            "fn main(){ let x=std::hint::black_box(0.49999999999999994f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         50),                                   // round -> 0
-        ("f64_edge_neg_below_half",
-         "fn main(){ let x=std::hint::black_box(-0.49999999999999994f64); \
+            50,
+        ), // round -> 0
+        (
+            "f64_edge_neg_below_half",
+            "fn main(){ let x=std::hint::black_box(-0.49999999999999994f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         50),                                   // round -> 0
+            50,
+        ), // round -> 0
         // ===================== f64 — ties away from zero =====================
-        ("f64_half_pos",
-         "fn main(){ let x=std::hint::black_box(0.5f64); \
+        (
+            "f64_half_pos",
+            "fn main(){ let x=std::hint::black_box(0.5f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         51),                                   // -> 1
-        ("f64_half_neg",
-         "fn main(){ let x=std::hint::black_box(-0.5f64); \
+            51,
+        ), // -> 1
+        (
+            "f64_half_neg",
+            "fn main(){ let x=std::hint::black_box(-0.5f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         49),                                   // -> -1
-        ("f64_2p5",
-         "fn main(){ let x=std::hint::black_box(2.5f64); \
+            49,
+        ), // -> -1
+        (
+            "f64_2p5",
+            "fn main(){ let x=std::hint::black_box(2.5f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         53),                                   // -> 3
-        ("f64_neg2p5",
-         "fn main(){ let x=std::hint::black_box(-2.5f64); \
+            53,
+        ), // -> 3
+        (
+            "f64_neg2p5",
+            "fn main(){ let x=std::hint::black_box(-2.5f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         47),                                   // -> -3
-        ("f64_3p7",
-         "fn main(){ let x=std::hint::black_box(3.7f64); \
+            47,
+        ), // -> -3
+        (
+            "f64_3p7",
+            "fn main(){ let x=std::hint::black_box(3.7f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         54),                                   // -> 4
-        ("f64_2p4",
-         "fn main(){ let x=std::hint::black_box(2.4f64); \
+            54,
+        ), // -> 4
+        (
+            "f64_2p4",
+            "fn main(){ let x=std::hint::black_box(2.4f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         52),                                   // -> 2
-        ("f64_neg2p4",
-         "fn main(){ let x=std::hint::black_box(-2.4f64); \
+            52,
+        ), // -> 2
+        (
+            "f64_neg2p4",
+            "fn main(){ let x=std::hint::black_box(-2.4f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         48),                                   // -> -2
+            48,
+        ), // -> -2
         // ===================== f64 — already integral / large =====================
-        ("f64_2p0",
-         "fn main(){ let x=std::hint::black_box(2.0f64); \
+        (
+            "f64_2p0",
+            "fn main(){ let x=std::hint::black_box(2.0f64); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         52),                                   // -> 2
+            52,
+        ), // -> 2
         // 1e16 is a large EXACT integer (> 2^53? no, 1e16 < 2^54 and is exactly
         // representable). round() is the identity; fold mod 126 to keep in range.
-        ("f64_1e16",
-         "fn main(){ let x=std::hint::black_box(1e16f64); \
+        (
+            "f64_1e16",
+            "fn main(){ let x=std::hint::black_box(1e16f64); \
           std::process::exit((((x.round() as i64).rem_euclid(126))) as i32); }",
-         (1e16_f64 as i64).rem_euclid(126) as i32),
+            (1e16_f64 as i64).rem_euclid(126) as i32,
+        ),
         // -0.0 round is -0.0 (LLVM). As an integer both -0.0 and +0.0 are 0; we also
         // probe the sign bit via `is_sign_negative()` so a +0.0 result would flip it.
-        ("f64_neg_zero_sign",
-         "fn main(){ let x=std::hint::black_box(-0.0f64); let r=x.round(); \
+        (
+            "f64_neg_zero_sign",
+            "fn main(){ let x=std::hint::black_box(-0.0f64); let r=x.round(); \
           std::process::exit((((r.is_sign_negative() as i64)*2 + (r==0.0) as i64) + 40) as i32); }",
-         43),                                   // -0.0: sign_negative=1, ==0.0=1 -> 40+3
-        ("f64_pos_zero_sign",
-         "fn main(){ let x=std::hint::black_box(0.0f64); let r=x.round(); \
+            43,
+        ), // -0.0: sign_negative=1, ==0.0=1 -> 40+3
+        (
+            "f64_pos_zero_sign",
+            "fn main(){ let x=std::hint::black_box(0.0f64); let r=x.round(); \
           std::process::exit((((r.is_sign_negative() as i64)*2 + (r==0.0) as i64) + 40) as i32); }",
-         41),                                   // +0.0: sign_negative=0, ==0.0=1 -> 40+1
+            41,
+        ), // +0.0: sign_negative=0, ==0.0=1 -> 40+1
         // ===================== f64 — NaN / inf via predicates =====================
-        ("f64_nan_is_nan",
-         "fn main(){ let x=std::hint::black_box(f64::NAN); \
+        (
+            "f64_nan_is_nan",
+            "fn main(){ let x=std::hint::black_box(f64::NAN); \
           std::process::exit(((x.round().is_nan() as i64) + 60) as i32); }",
-         61),                                   // round(NaN).is_nan() -> 1
-        ("f64_inf",
-         "fn main(){ let x=std::hint::black_box(f64::INFINITY); let r=x.round(); \
+            61,
+        ), // round(NaN).is_nan() -> 1
+        (
+            "f64_inf",
+            "fn main(){ let x=std::hint::black_box(f64::INFINITY); let r=x.round(); \
           std::process::exit((((r.is_infinite() as i64)*2 + (r > 0.0) as i64) + 60) as i32); }",
-         63),                                   // +inf: infinite=1, >0=1 -> 60+3
-        ("f64_neg_inf",
-         "fn main(){ let x=std::hint::black_box(f64::NEG_INFINITY); let r=x.round(); \
+            63,
+        ), // +inf: infinite=1, >0=1 -> 60+3
+        (
+            "f64_neg_inf",
+            "fn main(){ let x=std::hint::black_box(f64::NEG_INFINITY); let r=x.round(); \
           std::process::exit((((r.is_infinite() as i64)*2 + (r < 0.0) as i64) + 60) as i32); }",
-         63),                                   // -inf: infinite=1, <0=1 -> 60+3
+            63,
+        ), // -inf: infinite=1, <0=1 -> 60+3
         // ===================== f32 analogues =====================
         // 0.49999997f32 is the largest f32 strictly below 0.5 -> rounds to 0.
-        ("f32_edge_below_half",
-         "fn main(){ let x=std::hint::black_box(0.49999997f32); \
+        (
+            "f32_edge_below_half",
+            "fn main(){ let x=std::hint::black_box(0.49999997f32); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         50),                                   // -> 0
-        ("f32_half_pos",
-         "fn main(){ let x=std::hint::black_box(0.5f32); \
+            50,
+        ), // -> 0
+        (
+            "f32_half_pos",
+            "fn main(){ let x=std::hint::black_box(0.5f32); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         51),                                   // -> 1
-        ("f32_half_neg",
-         "fn main(){ let x=std::hint::black_box(-0.5f32); \
+            51,
+        ), // -> 1
+        (
+            "f32_half_neg",
+            "fn main(){ let x=std::hint::black_box(-0.5f32); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         49),                                   // -> -1
+            49,
+        ), // -> -1
         // 4.5f32 round-half-away -> 5 (NOT 4 as round-ties-even would give).
-        ("f32_4p5",
-         "fn main(){ let x=std::hint::black_box(4.5f32); \
+        (
+            "f32_4p5",
+            "fn main(){ let x=std::hint::black_box(4.5f32); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         55),                                   // -> 5
-        ("f32_neg4p5",
-         "fn main(){ let x=std::hint::black_box(-4.5f32); \
+            55,
+        ), // -> 5
+        (
+            "f32_neg4p5",
+            "fn main(){ let x=std::hint::black_box(-4.5f32); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         45),                                   // -> -5
-        ("f32_2p4",
-         "fn main(){ let x=std::hint::black_box(2.4f32); \
+            45,
+        ), // -> -5
+        (
+            "f32_2p4",
+            "fn main(){ let x=std::hint::black_box(2.4f32); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         52),                                   // -> 2
-        ("f32_3p7",
-         "fn main(){ let x=std::hint::black_box(3.7f32); \
+            52,
+        ), // -> 2
+        (
+            "f32_3p7",
+            "fn main(){ let x=std::hint::black_box(3.7f32); \
           std::process::exit(((x.round() as i64) + 50) as i32); }",
-         54),                                   // -> 4
-        ("f32_neg_zero_sign",
-         "fn main(){ let x=std::hint::black_box(-0.0f32); let r=x.round(); \
+            54,
+        ), // -> 4
+        (
+            "f32_neg_zero_sign",
+            "fn main(){ let x=std::hint::black_box(-0.0f32); let r=x.round(); \
           std::process::exit((((r.is_sign_negative() as i64)*2 + (r==0.0) as i64) + 40) as i32); }",
-         43),                                   // -0.0 preserved
-        ("f32_nan_is_nan",
-         "fn main(){ let x=std::hint::black_box(f32::NAN); \
+            43,
+        ), // -0.0 preserved
+        (
+            "f32_nan_is_nan",
+            "fn main(){ let x=std::hint::black_box(f32::NAN); \
           std::process::exit(((x.round().is_nan() as i64) + 60) as i32); }",
-         61),
-        ("f32_inf",
-         "fn main(){ let x=std::hint::black_box(f32::INFINITY); let r=x.round(); \
+            61,
+        ),
+        (
+            "f32_inf",
+            "fn main(){ let x=std::hint::black_box(f32::INFINITY); let r=x.round(); \
           std::process::exit((((r.is_infinite() as i64)*2 + (r > 0.0) as i64) + 60) as i32); }",
-         63),
+            63,
+        ),
         // ===================== CONTROL: no round, must stay correct =====================
-        ("control_no_round",
-         "fn main(){ let a=std::hint::black_box(40u32); let b=std::hint::black_box(2u32); \
+        (
+            "control_no_round",
+            "fn main(){ let a=std::hint::black_box(40u32); let b=std::hint::black_box(2u32); \
           std::process::exit((a+b) as i32); }",
-         42),
+            42,
+        ),
     ];
     assert_match_or_fail_closed(&dir, shapes);
     let _ = std::fs::remove_dir_all(&dir);

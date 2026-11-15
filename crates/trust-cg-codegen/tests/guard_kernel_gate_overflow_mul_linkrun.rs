@@ -16,7 +16,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use trust_cg_codegen::macho::MachOWriter;
 use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig, encode_function};
 use trust_cg_ir::function::MachFunction;
 use trust_cg_ir::inst::AArch64Opcode;
@@ -26,8 +25,12 @@ use trust_cg_lower::function::{BasicBlock, Function as LirFunction, Signature as
 use trust_cg_lower::instructions::{Block as LirBlock, Instruction, Opcode, Value};
 use trust_cg_lower::{Proof, ProofContext, Type as LirType};
 
-fn is_aarch64_macos() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O) can link and run the object.
+fn is_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn has_cc() -> bool {
@@ -118,7 +121,7 @@ fn prepare(func: &LirFunction, proof_ctx: &ProofContext) -> MachFunction {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O2,
         verify: false,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_target(native_host::TRIPLE)
     });
     pipeline
         .prepare_function_with_metrics(func, Some(proof_ctx))
@@ -147,12 +150,7 @@ fn make_dir(name: &str) -> PathBuf {
 
 fn emit_object(func: &MachFunction) -> Vec<u8> {
     let code = encode_function(func).expect("encode prepared mul overflow function");
-    let mut writer = MachOWriter::new();
-    writer.add_text_section(&code);
-    writer
-        .add_symbol(&format!("_{}", func.name), 1, 0, true)
-        .unwrap();
-    writer.write().unwrap()
+    native_host::naked_function_object(&func.name, &code)
 }
 
 /// Link with a C driver calling `checked_mul(a, b)`. `signed` selects the C operand type so the bit
@@ -201,15 +199,22 @@ int main(void) {{
     std::fs::write(&driver_path, driver).expect("write driver");
 
     let bin = dir.join("checked_mul_bin");
-    let status = Command::new("cc")
+    // Capture the linker's output: an inherited stderr would interleave
+    // linker warnings with libtest's per-test result lines.
+    let link = Command::new("cc")
         .arg("-o")
         .arg(&bin)
         .arg(&driver_path)
         .arg(&obj_path)
-        .arg("-Wl,-no_pie")
-        .status()
+        .arg(native_host::no_pie_link_flag())
+        .args(native_host::c_math_library_args())
+        .output()
         .expect("run cc");
-    assert!(status.success(), "linking checked_mul failed");
+    assert!(
+        link.status.success(),
+        "linking checked_mul failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
     bin
 }
 
@@ -241,8 +246,8 @@ fn signed_mul_carrier_synthesized_discharge_is_report_only_and_guarded() {
         "a downstream-synthesized Discharged status must not remove the mul overflow guard"
     );
 
-    if !is_aarch64_macos() || !has_cc() {
-        eprintln!("SKIP runtime half: not AArch64 macOS or cc unavailable");
+    if !is_aarch64_native() || !has_cc() {
+        eprintln!("SKIP runtime half: not an AArch64 Linux GNU or macOS host, or cc unavailable");
         return;
     }
 
@@ -267,8 +272,8 @@ fn signed_mul_carrier_pending_reference_traps_on_overflow_and_is_exact() {
         "an unproven signed mul carrier must be KEPT (exactly one guard Brk)"
     );
 
-    if !is_aarch64_macos() || !has_cc() {
-        eprintln!("SKIP runtime half: not AArch64 macOS or cc unavailable");
+    if !is_aarch64_native() || !has_cc() {
+        eprintln!("SKIP runtime half: not an AArch64 Linux GNU or macOS host, or cc unavailable");
         return;
     }
 
@@ -329,8 +334,8 @@ fn unsigned_mul_carrier_pending_reference_traps_on_overflow_and_is_exact() {
         "an unproven unsigned mul carrier must be KEPT (exactly one guard Brk)"
     );
 
-    if !is_aarch64_macos() || !has_cc() {
-        eprintln!("SKIP runtime half: not AArch64 macOS or cc unavailable");
+    if !is_aarch64_native() || !has_cc() {
+        eprintln!("SKIP runtime half: not an AArch64 Linux GNU or macOS host, or cc unavailable");
         return;
     }
 

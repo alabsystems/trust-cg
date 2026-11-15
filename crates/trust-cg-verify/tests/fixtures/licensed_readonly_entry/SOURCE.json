@@ -1,0 +1,38 @@
+{
+  "source": "5a01f3a015d7b537c7a2dabc0e5b6c511a9ed09a",
+  "scope": "Untrusted producer DATA only. Original source-family and initializer/effect proofs must be independently revalidated; no native or physical access authority.",
+  "files": [
+    {
+      "name": "effect.goal.dag-v2",
+      "bytes": 4687,
+      "sha256": "51dc475ca30698463439cd88d31ee2fd0c5b30f48df7bfcf910752568d18ac69"
+    },
+    {
+      "name": "effect.proof.dag-v2",
+      "bytes": 1594,
+      "sha256": "875333321b3f200361d59a43019266f004f559f94e5e21fdadf6e4d535888b80"
+    },
+    {
+      "name": "entry.goal.dag-v2",
+      "bytes": 5690,
+      "sha256": "4373b73760a672f9ffc5fecec6859493be0665be72cc3155dca8778a895d60e2"
+    },
+    {
+      "name": "entry.proof.dag-v2",
+      "bytes": 25555,
+      "sha256": "55be3f4100db77cd6f1e7423c0355c2ce6094dd4c940d23fc0840e3229acb4fa"
+    },
+    {
+      "name": "original-module.bin",
+      "bytes": 4836,
+      "sha256": "0bf054ac6fc8ef3d4d4db2f83d8ce72325f87f9c1060b4fdfa04626f56ec7f04"
+    },
+    {
+      "name": "source.island",
+      "bytes": 1204,
+      "sha256": "76dc1562c086028ead0ba0321cdaa346a1cb034295ef233e36d95505ca4d92fc"
+    }
+  ],
+  "producer_source": "https://github.com/alabsystems/trust-ir/commit/5a01f3a015d7b537c7a2dabc0e5b6c511a9ed09a",
+  "producer_test": "core_execution::readonly_indexed_call::tests::readonly_licensed_source_family_joins_complete_original_entry_and_effect"
+}

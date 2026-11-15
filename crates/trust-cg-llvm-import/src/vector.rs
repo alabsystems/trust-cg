@@ -8,17 +8,16 @@
 // clang at `-O2`/`-O3` runs the loop and SLP vectorizers, so its IR carries
 // fixed-width vector types (`<4 x i32>`, `<2 x double>`, …) and the vector
 // element operations `insertelement` / `extractelement` / `shufflevector`.
-// Before this module the importer rejected every one of them, which is why
-// only 31 of the 69 clang-importable SingleSource programs and 1049 of the
-// 1455 gcc-c-torture programs survived `-O2` (against 64 / 1118 at `-O1`).
+// This module expands supported fixed-width operations into scalar lanes.
+// Source fixtures and historical corpus counts are not current execution
+// evidence; see the audit and captured corpus reports for measured outcomes.
 //
 // # Why scalarize instead of lowering to NEON
 //
 // trust-cg's machine IR does model 128-bit vectors, but only the CONTRACTED
 // shapes `<16 x i8>`, `<8 x i16>`, `<4 x i32>`, `<2 x i64>`, `<4 x f32>`,
 // `<2 x f64>` (plus the 64-bit `<8 x i8>` / `<1 x i64>` D-register pair). The
-// measured `-O3` census over the failing corpus contains NINETEEN distinct
-// shapes, a majority of which are wider than a machine register
+// importer also encounters shapes wider than a machine register
 // (`<4 x double>`, `<8 x float>`, `<8 x i32>`, `<16 x i32>`, `<12 x i32>`,
 // `<4 x i64>`, `<16 x float>`). Mapping the contracted subset natively while
 // failing closed on the rest would leave most of the corpus unimported AND
@@ -73,8 +72,8 @@
 
 /// Upper bound on the lane count of a single vector value. Scalarization is
 /// linear in the lane count, so an unbounded width would turn one instruction
-/// into an unbounded basic block; the corpus maximum is 64 (`<64 x i8>` in
-/// gcc-c-torture `20000801-1`). Anything wider fails closed.
+/// into an unbounded basic block. This is an admission limit, not a claim
+/// about the largest shape in any current external corpus. Wider shapes fail closed.
 const MAX_LANES: u32 = 64;
 
 /// The scalar instructions one vector instruction expands into, plus the
@@ -411,10 +410,10 @@ fn expand_unary(
     let name = result.ok_or_else(|| format!("vector `{opcode}` without result"))?;
     let a = lane_ops(&operand, &elem, lanes)?;
     let mut e = Expansion::new();
-    for i in 0..lanes as usize {
+    for (i, operand) in a.iter().enumerate() {
         e.insts.push((
             Some(lane_name(name, i as u32)),
-            format!("{opcode} {flags}{elem} {}", a[i]),
+            format!("{opcode} {flags}{elem} {operand}"),
         ));
     }
     Ok(Some(e))
@@ -521,10 +520,10 @@ fn expand_cast(
             let name = result.ok_or_else(|| format!("vector `{opcode}` without result"))?;
             let a = lane_ops(&src_val, &src_elem, src_lanes)?;
             let mut e = Expansion::new();
-            for i in 0..src_lanes as usize {
+            for (i, operand) in a.iter().enumerate() {
                 e.insts.push((
                     Some(lane_name(name, i as u32)),
-                    format!("{opcode} {flags}{src_elem} {} to {dst_elem}", a[i]),
+                    format!("{opcode} {flags}{src_elem} {operand} to {dst_elem}"),
                 ));
             }
             Ok(Some(e))
@@ -775,7 +774,7 @@ fn expand_shufflevector(tail: &str, result: Option<&str>) -> Result<Expansion, S
 /// vector shape — the entry is refused otherwise, so shape-mixing forms such
 /// as `llvm.powi` (`<4 x float>, i32`) and `llvm.ctlz` (`<4 x i32>, i1`) never
 /// take this path.
-const ELEMENTWISE_INTRINSICS: &[&str] = &[
+pub(crate) const ELEMENTWISE_INTRINSICS: &[&str] = &[
     "fmuladd",
     "fma",
     "sqrt",
@@ -820,7 +819,7 @@ const ELEMENTWISE_INTRINSICS: &[&str] = &[
 /// are the SEQUENTIAL (ordered) reductions by definition, and the fold below
 /// is that definition. `fmax`/`fmin` are deliberately absent: their NaN and
 /// signed-zero behaviour does not follow from a naive fold.
-fn reduce_scalar_op(family: &str) -> Option<&'static str> {
+pub(crate) fn reduce_scalar_op(family: &str) -> Option<&'static str> {
     match family {
         "add" => Some("add"),
         "mul" => Some("mul"),
@@ -831,6 +830,42 @@ fn reduce_scalar_op(family: &str) -> Option<&'static str> {
         "fmul" => Some("fmul"),
         _ => None,
     }
+}
+
+/// The suffix LLVM 22.1.2's `Intrinsic::getName` writes for the type
+/// spelled `ty` (`getMangledTypeStr`): `v<N>` and the element's suffix for
+/// a fixed vector (`v4f32` for `<4 x float>`), the scalar's suffix
+/// otherwise ([`mangled_scalar_type`]), or `None` for a type not read here
+/// (a scalable vector among them).
+pub(crate) fn mangled_type_text(ty: &str) -> Option<String> {
+    match vector_shape(ty) {
+        Ok(Some((elem, lanes))) => Some(format!("v{lanes}{}", mangled_scalar_type(&elem)?)),
+        Ok(None) => mangled_scalar_type(ty.trim()),
+        Err(_) => None,
+    }
+}
+
+/// The suffix LLVM 22.1.2's `Intrinsic::getName` writes for the scalar type
+/// spelled `ty` (`getMangledTypeStr`), or `None` for one not read here.
+fn mangled_scalar_type(ty: &str) -> Option<String> {
+    let mangled = match ty {
+        "half" => "f16",
+        "bfloat" => "bf16",
+        "float" => "f32",
+        "double" => "f64",
+        "fp128" => "f128",
+        "x86_fp80" => "f80",
+        "ppc_fp128" => "ppcf128",
+        "ptr" => "p0",
+        _ if ty
+            .strip_prefix('i')
+            .is_some_and(|bits| !bits.is_empty() && bits.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            ty
+        }
+        _ => return None,
+    };
+    Some(mangled.to_string())
 }
 
 /// Strip a trailing `.v<N><suffix>` overload segment, returning
@@ -908,6 +943,24 @@ fn expand_call(tail: &str, result: Option<&str>) -> Result<Option<Expansion>, St
                 "`{iname}` element type `{elem}` != result type `{ret_ty}`"
             ));
         }
+        // LLVM names a reduction by its vector operand's type, renames a
+        // declaration to match, and rejects a call whose types differ from
+        // its declaration's. The fold below reads the call's own types, so a
+        // call is read only under the name they give, and a call whose types
+        // differ from its declaration's is refused here or at the declaration
+        // (`parser::check_vector_typed_intrinsic_declaration`).
+        let mangled = mangled_type_text(&vty).ok_or_else(|| {
+            format!("`{iname}` operand type `{vty}` (no type suffix read for it)")
+        })?;
+        let expected = format!("llvm.vector.reduce.{family}.{mangled}");
+        if iname != expected {
+            return Err(format!(
+                "`{iname}`: LLVM names this reduction `{expected}` by its operand's type (it \
+                 renames a declaration to match and rejects a call whose types differ from its \
+                 declaration's), while this importer reads the call's own types; refused where \
+                 the name's type suffix differs from the call's"
+            ));
+        }
         let src = lane_ops(&vval, &elem, lanes)?;
         let mut e = Expansion::new();
         let seeded_from_start = start.is_some();
@@ -959,6 +1012,18 @@ fn expand_call(tail: &str, result: Option<&str>) -> Result<Option<Expansion>, St
     if lanes != overload_lanes {
         return Err(format!(
             "`{iname}` overload lane count {overload_lanes} != result lane count {lanes}"
+        ));
+    }
+    // LLVM reads an overloaded intrinsic's types from its function type and
+    // renames it to match (`Intrinsic::remangleIntrinsicFunction`); the lane
+    // calls below are named by the suffix, so it must be the element type's.
+    let mangled = mangled_scalar_type(&elem)
+        .ok_or_else(|| format!("`{iname}` element type `{elem}` (no type suffix read for it)"))?;
+    if suffix != mangled {
+        return Err(format!(
+            "`{iname}`: LLVM reads an overloaded intrinsic's types from its function type and \
+             names this one `{prefix}.v{lanes}{mangled}`, while this importer reads it by its \
+             name; refused where the name's type suffix differs from its type's"
         ));
     }
     let name = result.ok_or_else(|| format!("`{iname}` without result"))?;
@@ -1299,6 +1364,42 @@ mod tests {
             .is_err()
         );
         assert!(expand(Some("r"), "call <4 x i32> @user_fn(<4 x i32> %a)", 0).is_err());
+    }
+
+    /// LLVM reads an overloaded intrinsic's types from its function type
+    /// and renames it to match; the lane calls are named by the suffix, so
+    /// one that is not its element type's is refused (`<2 x double>
+    /// @llvm.sin.v2f32` is `@llvm.sin.v2f64` to llc 22.1.2, whose lanes call
+    /// `sin`, not `sinf`: the seventh verifier round of L02-P15).
+    #[test]
+    fn elementwise_overloads_are_read_only_under_their_element_types_name() {
+        for (call, expected) in [
+            (
+                "call <2 x double> @llvm.sin.v2f32(<2 x double> %a)",
+                "llvm.sin.v2f64",
+            ),
+            (
+                "call <4 x i32> @llvm.smin.v4i64(<4 x i32> %a, <4 x i32> %b)",
+                "llvm.smin.v4i32",
+            ),
+            (
+                "call <2 x float> @llvm.fabs.v2f16(<2 x float> %a)",
+                "llvm.fabs.v2f32",
+            ),
+        ] {
+            let error = expand(Some("r"), call, 0).map(drop).unwrap_err();
+            assert!(
+                error.contains(&format!("names this one `{expected}`")),
+                "{call}: {error}"
+            );
+        }
+        for call in [
+            "call <2 x double> @llvm.sin.v2f64(<2 x double> %a)",
+            "call <4 x i32> @llvm.smin.v4i32(<4 x i32> %a, <4 x i32> %b)",
+            "call <8 x half> @llvm.fabs.v8f16(<8 x half> %a)",
+        ] {
+            assert!(expand(Some("r"), call, 0).unwrap().is_some(), "{call}");
+        }
     }
 
     #[test]

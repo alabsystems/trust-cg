@@ -36,16 +36,12 @@
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::manual_contains)]
 #![allow(clippy::collapsible_if)]
-// The skeleton exposes APIs that WS1-WS9 will call in follow-up PRs.
-// They appear unused here; allow that explicitly rather than littering
-// the code with per-item `#[allow]`.
-#![allow(dead_code)]
 
 //! Unified test and verification CLI for Trust Codegen.
 //!
 //! Run `trust-cg-test --help` for the command tree. Common controls include
-//! `--format {human,json,junit}`, `-o/--out`, `--timeout`, `--parallel`,
-//! `-q/--quiet`, `-v/--verbose`, `--no-cache`, and `--dry-run`.
+//! `--format {human,json,junit}`, `-o/--out`, `-q/--quiet`, `-v/--verbose`
+//! and `--dry-run`.
 
 use std::process::ExitCode;
 
@@ -56,7 +52,6 @@ mod cmd;
 mod config;
 mod corpus;
 mod external;
-mod progress;
 mod results;
 mod shell;
 
@@ -104,26 +99,13 @@ pub struct Cli {
     #[arg(short = 'o', long, value_name = "PATH", global = true)]
     pub out: Option<std::path::PathBuf>,
 
-    /// Per-unit timeout in seconds. Subcommands may apply per-unit
-    /// defaults when this is unset.
-    #[arg(long, value_name = "SECS", global = true)]
-    pub timeout: Option<u64>,
-
-    /// Worker count (honors cargo-serialization lock). Default: auto.
-    #[arg(long, value_name = "N", global = true)]
-    pub parallel: Option<usize>,
-
-    /// Suppress progress bars; errors still go to stderr.
+    /// Log errors only (sets the stderr log level to `error`).
     #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
 
     /// Show debug-level events. Repeat for more: -vv, -vvv.
     #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
-
-    /// Ignore proof / corpus caches.
-    #[arg(long, global = true)]
-    pub no_cache: bool,
 
     /// Print what would run without executing external tools.
     #[arg(long, global = true)]
@@ -253,8 +235,6 @@ pub enum Command {
                       trust-cg-test ratchet shell-isolation\n  \
                       trust-cg-test ratchet schema --format json\n  \
                       trust-cg-test ratchet tests --baseline path/to/tests-baseline.json\n  \
-                      trust-cg-test ratchet warnings\n  \
-                      trust-cg-test ratchet unwrap\n  \
                       trust-cg-test ratchet lint-linux")]
     Ratchet(cmd::ratchet::RatchetArgs),
 
@@ -272,20 +252,21 @@ pub enum Command {
 
     /// Cross-compile check for Linux `#[cfg(target_os = "linux")]` paths
     /// in `trust-cg-codegen` (issue #346). Safe on macOS-only boxes — targets
-    /// not installed via `rustup target add` are reported as `skipped`.
+    /// whose std the installed Trust package lacks are reported as `skipped`.
     #[command(
         long_about = "Cross-compile check for the Linux `#[cfg(target_os = \"linux\")]` \
-                      paths in trust-cg-codegen. Runs `cargo check --target <T> -p <P>` \
+                      paths in trust-cg-codegen. Runs `targo --unverified check --target <T> -p <P>` \
                       for each installed Linux target. Missing targets are skipped \
                       (they are environmental, not a failure) so this subcommand is \
                       safe to wire into CI on macOS-only developer boxes.\n\n\
-                      Installed targets are discovered via `rustup target list \
-                      --installed`. Install one with e.g. \
-                      `rustup target add x86_64-unknown-linux-gnu`.\n\n\
+                      A target is installed when the Trust package's sysroot ships \
+                      its std (`<trustc --print sysroot>/lib/rustlib/<T>/lib`). The \
+                      Darwin Trust package ships no Linux std today, so both \
+                      targets are skipped there.\n\n\
                       Exit codes:\n  \
                       0 — every installed target compiled (or all targets skipped).\n  \
                       1 — at least one installed target failed to compile.\n  \
-                      2 — cargo missing from PATH.\n\n\
+                      2 — targo missing from PATH.\n\n\
                       # Examples\n\n  \
                       trust-cg-test lint-linux\n  \
                       trust-cg-test lint-linux --format json\n  \
@@ -326,11 +307,8 @@ fn run(cli: Cli) -> anyhow::Result<ResultStatus> {
     let global = cmd::GlobalArgs {
         format: cli.format,
         out: cli.out,
-        timeout: cli.timeout,
-        parallel: cli.parallel,
         quiet: cli.quiet,
         verbose: cli.verbose,
-        no_cache: cli.no_cache,
         dry_run: cli.dry_run,
     };
     match cli.command {

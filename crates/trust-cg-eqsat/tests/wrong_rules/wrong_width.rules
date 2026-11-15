@@ -1,0 +1,9 @@
+; mutant-of: mul_255_neg_i8
+; mutation: wrong width (255 is -1 only at width 8; the domain is widened to 16, 32 and 64)
+; subject: i16
+(rule mul_255_neg_i8
+  (direction equiv)
+  (domain i8 u8 i16 u16 i32 u32 i64 u64)
+  (lhs (mul ?x (const 255)))
+  (rhs (neg ?x))
+  (where))

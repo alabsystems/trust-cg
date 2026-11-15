@@ -20,6 +20,8 @@ use thiserror::Error;
 pub enum FpEncodeError {
     #[error("register index {reg} out of range (max {max})")]
     RegisterOutOfRange { reg: u8, max: u8 },
+    #[error("condition code {cond} out of range (max {max})")]
+    ConditionOutOfRange { cond: u32, max: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +155,8 @@ pub enum FpUnaryOp {
     Fneg = 0b10,
     /// FSQRT — opcode = 0b11
     Fsqrt = 0b11,
+    /// FRINTN — nearest integer, ties to even, independent of FPCR rounding.
+    FrintN = 0b001000,
     /// FRINTP — round to integral, toward +inf (ceil) — opcode = 0b001001.
     FrintP = 0b001001,
     /// FRINTM — round to integral, toward -inf (floor) — opcode = 0b001010.
@@ -228,7 +232,9 @@ pub fn encode_fcsel(
     check_reg(rm, 31)?;
     check_reg(rn, 31)?;
     check_reg(rd, 31)?;
-    debug_assert!(cond < 16, "condition code must be 4 bits");
+    if cond > 15 {
+        return Err(FpEncodeError::ConditionOutOfRange { cond, max: 15 });
+    }
 
     let mut inst: u32 = 0;
     // bits[31:29] = 000
@@ -236,7 +242,7 @@ pub fn encode_fcsel(
     inst |= (fp_size as u32) << 22;
     inst |= 1 << 21;
     inst |= (rm as u32) << 16;
-    inst |= (cond & 0xF) << 12;
+    inst |= cond << 12;
     inst |= 0b11 << 10;
     inst |= (rn as u32) << 5;
     inst |= rd as u32;
@@ -707,6 +713,23 @@ mod tests {
             encode_fp_unary(FpSize::Single, FpUnaryOp::FrintZ, 0, 0).unwrap(),
             0x1E25_C000 // FRINTZ S0, S0
         );
+    }
+
+    #[test]
+    fn test_frintn_single_double_register_pins() {
+        // GNU as/objdump: frintn s0,s0; frintn d0,d0;
+        // frintn s31,s17; frintn d31,d17.
+        for (size, rn, rd, word) in [
+            (FpSize::Single, 0, 0, 0x1e24_4000),
+            (FpSize::Double, 0, 0, 0x1e64_4000),
+            (FpSize::Single, 17, 31, 0x1e24_423f),
+            (FpSize::Double, 17, 31, 0x1e64_423f),
+        ] {
+            assert_eq!(
+                encode_fp_unary(size, FpUnaryOp::FrintN, rn, rd).unwrap(),
+                word
+            );
+        }
     }
 
     #[test]

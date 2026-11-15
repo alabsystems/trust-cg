@@ -42,7 +42,9 @@ else
 fi
 
 check_status nonzero 7 "$RUNNER" 5 sh -c 'exit 7'
-check_status signaled 139 "$RUNNER" 5 sh -c 'kill -SEGV $$'
+# SIGKILL, not a core-dump signal: the runner maps any signal death to 128+N,
+# and a SEGV'd /bin/sh made macOS write a crash report every run.
+check_status signaled 137 "$RUNNER" 5 sh -c 'kill -KILL $$'
 
 mkdir "${TMP}/working-directory"
 working_directory="$(cd "${TMP}/working-directory" && pwd -P)"
@@ -137,6 +139,56 @@ check_status missing_command 127 "$RUNNER" 5 \
   "${TMP}/definitely-not-a-command"
 check_status missing_chdir 125 "$RUNNER" \
   --chdir "${TMP}/definitely-not-a-directory" 5 sh -c 'exit 0'
+
+# Resident-set ceiling: malformed ceilings are usage errors, never "no limit".
+for bad_ceiling in 0 -1 nan inf not-a-number; do
+  check_status "rss_ceiling_rejects_${bad_ceiling}" 2 "$RUNNER" \
+    --max-rss-gib "$bad_ceiling" 5 sh -c 'exit 0'
+done
+
+check_rss_receipt() {
+  local name="$1" outcome="$2"
+  if grep -Eq "^run_with_timeout: RSS_RECEIPT ceiling_gib=[0-9.e+-]+ peak_mib=[0-9]+ samples=[0-9]+ outcome=${outcome}\$" \
+      "${TMP}/${name}.err"; then
+    printf 'ok - %s retains an RSS receipt with outcome=%s\n' "$name" "$outcome"
+    PASS=$((PASS + 1))
+  else
+    printf 'not ok - %s has no RSS receipt with outcome=%s\n' "$name" "$outcome" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+rss_ran="${TMP}/rss-command-ran"
+if [ "$(uname -s)" = Linux ] && [ -r /proc/self/statm ]; then
+  check_status rss_within 0 "$RUNNER" --max-rss-gib 4 5 \
+    sh -c 'sleep 0.5; : >"$1"' sh "$rss_ran"
+  check_rss_receipt rss_within within
+  # Touch every page so the allocation is resident, then outlive the timeout
+  # by far: only the resident-set ceiling can end this command early.
+  rss_started="$(date +%s)"
+  check_status rss_exceeded 122 "$RUNNER" --grace-seconds 5 --max-rss-gib 0.0625 60 \
+    python3 -c 'import time; data = b"\x01" * (256 << 20); time.sleep(60)'
+  check_rss_receipt rss_exceeded exceeded
+  if [ $(( $(date +%s) - rss_started )) -lt 30 ]; then
+    echo 'ok - resident-set breach kills the group without waiting for the timeout'
+    PASS=$((PASS + 1))
+  else
+    echo 'not ok - resident-set breach waited for the wall-clock bound' >&2
+    FAIL=$((FAIL + 1))
+  fi
+else
+  # Without Linux /proc supervision a requested ceiling must refuse to launch
+  # rather than run the command unsupervised.
+  check_status rss_unsupported 125 "$RUNNER" --max-rss-gib 4 5 \
+    sh -c ': >"$1"' sh "$rss_ran"
+  if grep -Fq 'is unsupported on' "${TMP}/rss_unsupported.err" && [ ! -e "$rss_ran" ]; then
+    echo 'ok - unsupported resident-set ceiling refuses without running the command'
+    PASS=$((PASS + 1))
+  else
+    echo 'not ok - unsupported resident-set ceiling ran the command or lost its diagnostic' >&2
+    FAIL=$((FAIL + 1))
+  fi
+fi
 
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -47,15 +47,15 @@ use crate::verify::{VerificationResult, VerificationStrength};
 ///
 /// - [`MockOnly`]: Use mock evaluation only.
 ///   Fast but provides statistical (not formal) verification for 32/64-bit.
-/// - [`AYCli`]: Use the z3/ay CLI to attempt formal discharge of every
-///   supported represented obligation. Requires a solver binary and is slower;
-///   unavailable, timeout, and unknown results are not proofs.
+/// - [`AYCli`]: Use identity-admitted AY and independent Clean checking to
+///   attempt formal discharge of every supported represented obligation.
+///   Unavailable authority, timeout, and unknown results are not proofs.
 /// - [`MockThenAY`]: Run mock evaluation first as a fast pre-check, then
-///   verify proofs that pass mock with z3/ay for formal confirmation.
-///   Best of both worlds: fast failure detection + formal proofs.
+///   attempt AY/Clean discharge of obligations that pass evaluation.
 /// - [`Auto`]: Auto-select the best available backend at runtime.
-///   Prefers mock-plus-ay verification when a solver is available and
-///   falls back to mock-only verification otherwise.
+///   Prefers evaluation-plus-AY when AY and a capable Clean checker are
+///   admitted, and falls back to evaluation otherwise. This is diagnostic
+///   selection; a formal requirement uses [`crate::proof_gate::GateConfig`].
 ///
 /// [`MockOnly`]: AYVerificationMode::MockOnly
 /// [`AYCli`]: AYVerificationMode::AYCli
@@ -64,14 +64,14 @@ use crate::verify::{VerificationResult, VerificationStrength};
 pub enum AYVerificationMode {
     /// Use mock evaluation only.
     MockOnly,
-    /// Use z3/ay CLI for formal verification.
+    /// Use identity-admitted AY with independent Clean checking.
     AYCli(AYConfig),
     /// Use mock as fast pre-check, then ay for proofs that pass mock.
     MockThenAY(AYConfig),
     /// Auto-select the best available backend at runtime.
     ///
-    /// Uses [`MockThenAY`] with the external solver CLI when a solver binary is
-    /// available on the system, otherwise falls back to [`MockOnly`].
+    /// Uses [`MockThenAY`] when AY and a capable Clean checker are admitted,
+    /// otherwise falls back to [`MockOnly`].
     ///
     /// [`MockThenAY`]: AYVerificationMode::MockThenAY
     /// [`MockOnly`]: AYVerificationMode::MockOnly
@@ -80,11 +80,13 @@ pub enum AYVerificationMode {
 
 /// Select the best verification mode available in the current environment.
 ///
-/// Checks whether an SMT solver binary (ay or z3) is available on `PATH`
-/// or in well-known build locations. When a solver is found, returns
-/// [`AYVerificationMode::MockThenAY`] with default configuration so that
-/// mock evaluation runs as a fast pre-check followed by formal SMT proof.
-/// Otherwise returns [`AYVerificationMode::MockOnly`].
+/// Checks the central bridge's identity-admitted AY and capability-probed
+/// Clean route. When available, returns [`AYVerificationMode::MockThenAY`]
+/// with default configuration so evaluation runs before independent proof
+/// checking. Otherwise returns [`AYVerificationMode::MockOnly`]. This fallback
+/// carries its actual evidence strength; it cannot satisfy the strict formal
+/// gate in [`crate::proof_gate`]. The compatibility-named `z3_available()`
+/// below checks AY/Clean and does not search for or invoke Z3.
 pub fn select_auto_mode() -> AYVerificationMode {
     if crate::ay_bridge::z3_available() {
         AYVerificationMode::MockThenAY(AYConfig::default())
@@ -587,7 +589,7 @@ impl<'a> VerificationRunner<'a> {
         }
     }
 
-    /// Verify every proof in the database using a z3/ay CLI solver.
+    /// Attempt every database obligation through the admitted AY/Clean route.
     ///
     /// Each proof is sent to the solver as an SMT-LIB2 query. The result
     /// is mapped to [`VerificationResult`] and the strength is set to
@@ -1350,7 +1352,7 @@ mod tests {
     }
 
     // =======================================================================
-    // run_with_ay integration test (requires z3)
+    // run_with_ay integration test (requires admitted AY and capable Clean)
     // =======================================================================
 
     #[test]

@@ -18,6 +18,8 @@ fn func_with(insts: Vec<(AArch64Opcode, Vec<MachOperand>)>) -> MachFunction {
         let id = f.push_inst(MachInst::new(op, ops));
         f.append_inst(b, id);
     }
+    f.try_sync_vreg_counter()
+        .expect("bounded fixture register arena");
     f
 }
 
@@ -182,6 +184,90 @@ fn windowed_bails_when_gap_reads_the_moved_dest() {
     ]);
     assert!(!MemPairFormation.run(&mut f));
     assert_eq!(count_op(&f, AArch64Opcode::LdpRI), 0);
+}
+
+/// The load-acquire opcodes. Their effect class is only `Load`
+/// (`writes_memory()` is false), yet acquire semantics order every LATER load
+/// after them, so a later plain load must never be hoisted above one.
+const ACQUIRE_LOADS: [AArch64Opcode; 4] = [
+    AArch64Opcode::Ldar,
+    AArch64Opcode::Ldarb,
+    AArch64Opcode::Ldarh,
+    AArch64Opcode::Ldaxr,
+];
+
+/// Run the pass on `shape(acq)` for every acquire opcode and require it to
+/// leave the block unchanged; report every opcode that it does not.
+fn assert_unchanged_for_each_acquire(
+    shape: impl Fn(AArch64Opcode) -> Vec<(AArch64Opcode, Vec<MachOperand>)>,
+) {
+    let mut violations = Vec::new();
+    for acq in ACQUIRE_LOADS {
+        let insts = shape(acq);
+        let before: Vec<AArch64Opcode> = insts.iter().map(|(op, _)| *op).collect();
+        let mut f = func_with(insts);
+        let changed = MemPairFormation.run(&mut f);
+        let after = opcodes(&f);
+        if changed || after != before {
+            violations.push((acq, changed, after));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "a plain load was hoisted above an acquire: {violations:?}"
+    );
+}
+
+#[test]
+fn windowed_bails_on_intervening_load_acquire() {
+    // ldr x1,[x10,#0]; ldar x2,[x11]; ldr x3,[x10,#8]
+    // Pairing would hoist the [x10,#8] read above the acquire
+    // (`ldp x1,x3,[x10]; ldar x2,[x11]`), letting it observe a value older
+    // than the one the acquire synchronizes with. Must stay unchanged.
+    assert_unchanged_for_each_acquire(|acq| {
+        vec![
+            (AArch64Opcode::LdrRI, vec![vg(1), vg(10), imm(0)]),
+            (acq, vec![vg(2), vg(11)]),
+            (AArch64Opcode::LdrRI, vec![vg(3), vg(10), imm(8)]),
+        ]
+    });
+}
+
+#[test]
+fn windowed_bails_on_load_acquire_earlier_in_a_benign_gap() {
+    // The acquire is not adjacent to the partner: the scan must stop at the
+    // acquire rather than continue past it to a pairable load.
+    // ldr d0,[x10,#0]; ldar x2,[x11]; fmadd; ldr d4,[x10,#8]
+    assert_unchanged_for_each_acquire(|acq| {
+        vec![
+            (AArch64Opcode::LdrRI, vec![vfp(0), vg(10), imm(0)]),
+            (acq, vec![vg(2), vg(11)]),
+            (AArch64Opcode::FmaddRR, vec![vfp(5), vfp(1), vfp(2), vfp(3)]),
+            (AArch64Opcode::LdrRI, vec![vfp(4), vg(10), imm(8)]),
+        ]
+    });
+}
+
+#[test]
+fn windowed_still_pairs_when_load_acquire_precedes_both_loads() {
+    // An acquire BEFORE the anchor is not crossed by the hoist (both plain
+    // loads stay after it), so the windowed pair still forms after it.
+    // ldar x2,[x11]; ldr d0,[x10,#0]; fmadd; ldr d4,[x10,#8]
+    let mut f = func_with(vec![
+        (AArch64Opcode::Ldar, vec![vg(2), vg(11)]),
+        (AArch64Opcode::LdrRI, vec![vfp(0), vg(10), imm(0)]),
+        (AArch64Opcode::FmaddRR, vec![vfp(5), vfp(1), vfp(2), vfp(3)]),
+        (AArch64Opcode::LdrRI, vec![vfp(4), vg(10), imm(8)]),
+    ]);
+    assert!(MemPairFormation.run(&mut f));
+    assert_eq!(
+        opcodes(&f),
+        vec![
+            AArch64Opcode::Ldar,
+            AArch64Opcode::LdpRI,
+            AArch64Opcode::FmaddRR,
+        ]
+    );
 }
 
 #[test]
@@ -460,10 +546,10 @@ fn windowed_gpr_pair_over_movz_gap_keeps_dests_distinct_from_each_other_and_base
 }
 
 // ---------------------------------------------------------------------------
-// GPR cross-store sink (`TCG_NO_MEM_PAIR_XSTORE` feature): sinking an integer
-// field store past a PROVABLY-DISJOINT store to fuse with its pair partner —
-// the Stanford/Towers `Move` push-tail shape (`cellspace[el].next = ...;
-// stack[s] = el; cellspace[el].discsize = ...`).
+// GPR cross-store sink (`TCG_NO_MEM_PAIR_XSTORE` feature): retain same-base
+// disjoint intervals, but withdraw the unqualified distinct-symbol rule.
+// The Stanford/Towers push-tail capability is deliberately refused until a
+// shared contract establishes actual object identity and access bounds.
 // ---------------------------------------------------------------------------
 
 fn vg32(id: u32) -> MachOperand {
@@ -473,12 +559,16 @@ fn sym(s: &str) -> MachOperand {
     MachOperand::Symbol(s.to_string())
 }
 
-/// The Towers push tail: two same-base GPR32 field stores at #4/#0 split by a
-/// register-offset store rooted at a DIFFERENT global symbol. The first field
-/// store must sink past the disjoint store and fuse into `StpRI` at the
-/// partner's position.
+/// Capability withdrawal: the formerly accepted Towers push tail has two
+/// same-base GPR32 field stores split by a differently named symbol store.
+/// Symbol names alone neither rule out aliases nor bound the dynamic index.
+/// Keep the original shape visible instead of replacing it with a safe case.
 #[test]
-fn gpr_store_sinks_across_distinct_symbol_store() {
+fn unauthenticated_distinct_symbol_store_sink_capability_is_withdrawn() {
+    assert!(
+        xstore_sink_enabled(),
+        "the withdrawn shape is not policy-disabled"
+    );
     let mut f = func_with(vec![
         (AArch64Opcode::Adrp, vec![vg(1), sym("cellspace")]),
         (
@@ -491,30 +581,17 @@ fn gpr_store_sinks_across_distinct_symbol_store() {
         (AArch64Opcode::AddRRShift, vec![vg(5), vg(2), vg(6), imm(3)]),
         // cellspace[el].next = w20
         (AArch64Opcode::StrRI, vec![vg32(20), vg(5), imm(4)]),
-        // stack[s] = w21 (register-offset store, distinct symbol root)
+        // A differently named root is not an authenticated disjoint object.
         (AArch64Opcode::StrRO, vec![vg32(21), vg(4), vg(7)]),
         // cellspace[el].discsize = w22
         (AArch64Opcode::StrRI, vec![vg32(22), vg(5), imm(0)]),
     ]);
-    assert!(MemPairFormation.run(&mut f));
-    assert_eq!(count_op(&f, AArch64Opcode::StpRI), 1);
-    assert_eq!(count_op(&f, AArch64Opcode::StrRI), 0);
-    // The disjoint store stays put; the pair lands at the partner's position.
-    let ops = opcodes(&f);
-    let stro_pos = ops
-        .iter()
-        .position(|&o| o == AArch64Opcode::StrRO)
-        .expect("gap store kept");
-    let stp_pos = ops
-        .iter()
-        .position(|&o| o == AArch64Opcode::StpRI)
-        .expect("pair formed");
-    assert!(stro_pos < stp_pos, "pair lands at the partner position");
-    let p = f.inst(f.blocks[0].insts[stp_pos]);
-    assert_eq!(p.operands[0], vg32(22)); // lower-offset (#0) data first
-    assert_eq!(p.operands[1], vg32(20));
-    assert_eq!(p.operands[2], vg(5));
-    assert_eq!(p.operands[3], imm(0));
+    let before = opcodes(&f);
+    assert!(!MemPairFormation.run(&mut f));
+    assert_eq!(opcodes(&f), before);
+    assert_eq!(count_op(&f, AArch64Opcode::StpRI), 0);
+    assert_eq!(count_op(&f, AArch64Opcode::StrRI), 2);
+    assert_eq!(count_op(&f, AArch64Opcode::StrRO), 1);
 }
 
 /// SAME symbol root on both sides: the gap store may overlap (unknown
@@ -628,4 +705,40 @@ fn gpr_store_does_not_sink_when_gap_base_is_multi_def() {
     ]);
     assert!(!MemPairFormation.run(&mut f));
     assert_eq!(count_op(&f, AArch64Opcode::StpRI), 0);
+}
+
+/// A load is never paired across its own guard. `ldr [x10]; bounds check;
+/// ldr [x10, #8]` is `a[0]; a[1]` with the check for index 1 between: an
+/// LDP would read `a[1]` before the check, faulting where the program
+/// panics when `a` ends at an unmapped page. Found by the per-pass
+/// translation validator (`pass_validation`), which refused the paired form.
+#[test]
+fn never_pairs_a_load_across_a_trap_carrier_or_an_ordering_access() {
+    for gap in [
+        (AArch64Opcode::TrapBoundsCheckExact, vec![vg(2), vg(3)]),
+        (AArch64Opcode::TrapNullIfZero, vec![vg(10)]),
+        (AArch64Opcode::Ldar, vec![vg(6), vg(12)]),
+        (AArch64Opcode::Brk, vec![imm(1)]),
+    ] {
+        let opcode = gap.0;
+        let mut f = func_with(vec![
+            (AArch64Opcode::LdrRI, vec![vg(1), vg(10), imm(0)]),
+            gap,
+            (AArch64Opcode::LdrRI, vec![vg(4), vg(10), imm(8)]),
+        ]);
+        MemPairFormation.run(&mut f);
+        assert_eq!(
+            count_op(&f, AArch64Opcode::LdpRI),
+            0,
+            "paired across {opcode:?}"
+        );
+    }
+    // A flag-setting compare is not a guard: pairing across it is fine.
+    let mut f = func_with(vec![
+        (AArch64Opcode::LdrRI, vec![vg(1), vg(10), imm(0)]),
+        (AArch64Opcode::CmpRR, vec![vg(2), vg(3)]),
+        (AArch64Opcode::LdrRI, vec![vg(4), vg(10), imm(8)]),
+    ]);
+    assert!(MemPairFormation.run(&mut f));
+    assert_eq!(count_op(&f, AArch64Opcode::LdpRI), 1);
 }

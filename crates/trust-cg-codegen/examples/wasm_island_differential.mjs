@@ -63,13 +63,23 @@ const fail = (msg) => {
 
 /** Compile the emitted twin source with rustc for wasm32 — this is the step
  *  a generator run never took, and it is why an out-of-range table literal
- *  could ship as "success" before. */
+ *  could ship as "success" before.
+ *
+ *  STOCK EXCEPTION (Trust lacks a wasm32-unknown-unknown core/std; measured
+ *  `trustc --target wasm32-unknown-unknown` -> E0463 can't find crate for
+ *  `core`): the twin compiler is the stock rustc named by ISLAND_TWIN_RUSTC,
+ *  used for wasm32 only. It is never looked up on PATH, and no floating
+ *  toolchain channel is selected for it. */
 function buildTwin(src, extraLinkArgs = []) {
+  const twinRustc = process.env.ISLAND_TWIN_RUSTC;
+  if (!twinRustc) {
+    fail("ISLAND_TWIN_RUSTC is unset: name a stock rustc with the wasm32-unknown-unknown target");
+  }
   const dir = mkdtempSync(join(tmpdir(), "island-twin-"));
   const out = join(dir, "twin.wasm");
   try {
     execFileSync(
-      "rustc",
+      twinRustc,
       [
         "--edition",
         "2024",
@@ -86,7 +96,14 @@ function buildTwin(src, extraLinkArgs = []) {
         "-o",
         out,
       ],
-      { stdio: "pipe", env: { ...process.env, RUSTUP_TOOLCHAIN: process.env.ISLAND_TWIN_TOOLCHAIN ?? "stable" } },
+      {
+        stdio: "pipe",
+        // Only this independent LLVM twin uses the documented stock lane.
+        env: {
+          ...process.env,
+          ATERM_STOCK_REASON: "canonical independent wasm LLVM twin oracle",
+        },
+      },
     );
   } catch (e) {
     fail(`the emitted twin does not compile: ${String(e.stderr ?? e).slice(0, 800)}`);

@@ -149,7 +149,7 @@ fn imported_o0_ary3_reverse_accum_preserves_allocator_gep_facts() {
 fn imported_o0_ary3_reverse_accum_o2_fails_closed_without_replay_authority() {
     let module =
         import_text(ARY3_REVERSE_ACCUM_LL, "ary3_reverse_accum_clang_o0").expect("import fixture");
-    let lowered = trust_cg_lower::translate_module(&module).expect("lower imported fixture");
+    let lowered = permit_translate_module(&module).expect("lower imported fixture");
     let (run_case, proof_ctx) = lowered
         .iter()
         .find(|(function, _)| function.name == "run_case")
@@ -170,7 +170,7 @@ fn imported_o0_ary3_reverse_accum_o2_fails_closed_without_replay_authority() {
     );
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
     let (optimized, _metrics) = pipeline
         .prepare_function_with_metrics(run_case, Some(proof_ctx))
@@ -203,4 +203,28 @@ fn imported_o0_ary3_reverse_accum_o2_fails_closed_without_replay_authority() {
         "the fail-closed production path must retain a same-block scalar load/load/add/store \
          chain whose add consumes both loads and whose store writes the loaded destination"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

@@ -21,14 +21,17 @@
 //! in-process work must receive explicit configuration, or callers must keep
 //! override-sensitive work on the thread that owns the scope.
 
+use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::env::VarError;
 use std::ffi::{OsStr, OsString};
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+pub mod private_fs;
 pub mod resource_budget;
 
 /// Environment namespaces reserved for Trust Codegen compiler controls.
@@ -63,6 +66,273 @@ pub const ARTIFACT_REUSE_ENV_EXEMPT_KEYS: &[&str] = &[
     "TRUST_CG_COMPILE_ARTIFACT_TRUST_CG_IDENTITY",
     "TRUST_CG_COMPILE_ARTIFACT_TRUST_IR_IDENTITY",
 ];
+
+/// Immutable, digest-bound environment for verifier subprocesses.
+///
+/// Capturing an unrestricted parent environment would let unrelated compiler
+/// controls, shell state, and dynamic-loader search paths affect a solver or
+/// proof checker. [`Self::capture_verifier`] instead builds a fixed environment
+/// with these rules:
+///
+/// - `PATH` is `/usr/bin:/bin` on Unix; verifier authorities should otherwise
+///   be launched by their already-resolved exact path.
+/// - `LC_ALL` and `LANG` are always `C`, independent of the parent locale.
+/// - `TMPDIR`, `TMP`, and `TEMP` are copied when present so platform temporary
+///   storage remains usable.
+/// - `GOVERN_AY_MB`, `AY_CONCURRENCY`, `MIMALLOC_ARENA_RESERVE`,
+///   `RAYON_NUM_THREADS`, and `RUST_MIN_STACK` are the only inherited resource
+///   controls.
+/// - Windows additionally retains `SystemRoot`, `WINDIR`, `ComSpec`, and
+///   `PATHEXT`, which are operating-system process-launch resources.
+/// - The current working directory is captured, digest-bound, and explicitly
+///   applied so it cannot drift between authority capture and child spawn.
+///
+/// Every copied value is read through this crate's [`var_os`] boundary, so a
+/// request's scoped overrides are respected. In particular, arbitrary
+/// `TCG_*`, `TRUST_*`, or `AY_*` algorithm controls, home/cache directories,
+/// and `LD_*`/`DYLD_*` loader overrides are not inherited. Callers must bind an
+/// exact solver/checker executable identity separately; this digest authenticates
+/// only the child environment, not filesystem content named by an entry.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SanitizedChildEnv {
+    entries: Vec<(OsString, OsString)>,
+    working_dir: Option<PathBuf>,
+    digest: [u8; 32],
+}
+
+const VERIFIER_CHILD_ENV_DOMAIN: &[u8] = b"trust-cg/verifier-child-env/v1\0";
+
+const VERIFIER_CHILD_INHERITED_KEYS: &[&str] = &[
+    "AY_CONCURRENCY",
+    "GOVERN_AY_MB",
+    "MIMALLOC_ARENA_RESERVE",
+    "RAYON_NUM_THREADS",
+    "RUST_MIN_STACK",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+];
+
+#[cfg(windows)]
+const VERIFIER_CHILD_WINDOWS_INHERITED_KEYS: &[&str] =
+    &["ComSpec", "PATHEXT", "SystemRoot", "WINDIR"];
+
+impl SanitizedChildEnv {
+    /// Capture the exact environment permitted for a verifier subprocess.
+    pub fn capture_verifier() -> Self {
+        let mut entries = Vec::with_capacity(
+            VERIFIER_CHILD_INHERITED_KEYS.len()
+                + if cfg!(windows) { 4 } else { 0 }
+                + if cfg!(unix) { 1 } else { 0 }
+                + 2,
+        );
+        for key in VERIFIER_CHILD_INHERITED_KEYS {
+            if let Some(value) = var_os(key) {
+                entries.push((OsString::from(*key), value));
+            }
+        }
+        #[cfg(windows)]
+        for key in VERIFIER_CHILD_WINDOWS_INHERITED_KEYS {
+            if let Some(value) = var_os(key) {
+                entries.push((OsString::from(*key), value));
+            }
+        }
+
+        #[cfg(unix)]
+        entries.push((OsString::from("PATH"), OsString::from("/usr/bin:/bin")));
+        entries.push((OsString::from("LANG"), OsString::from("C")));
+        entries.push((OsString::from("LC_ALL"), OsString::from("C")));
+
+        entries.sort_by(|left, right| left.0.as_encoded_bytes().cmp(right.0.as_encoded_bytes()));
+        let working_dir = std::env::current_dir().ok();
+        let digest = sanitized_child_env_digest(&entries, working_dir.as_deref());
+        Self {
+            entries,
+            working_dir,
+            digest,
+        }
+    }
+
+    /// Return the stable SHA-256 digest of the exact sorted child environment.
+    ///
+    /// Unix names and values are hashed as their raw bytes. Windows names and
+    /// values are hashed as little-endian wide code units. Length prefixes and
+    /// a platform-specific encoding tag make the representation unambiguous;
+    /// no lossy Unicode conversion is performed.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// The working directory captured with this exact child environment.
+    /// `None` is an incomplete execution identity: applying the snapshot then
+    /// retains the command's ordinary working-directory behavior. Consumers
+    /// must not authorize reusable results from an incomplete snapshot.
+    pub fn working_dir(&self) -> Option<&Path> {
+        self.working_dir.as_deref()
+    }
+
+    /// Resolve a selected path against this snapshot, without observing a later
+    /// process working directory or canonicalizing symlink spelling.
+    pub fn anchor_path(&self, path: &Path) -> Option<PathBuf> {
+        if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else {
+            self.working_dir().map(|base| base.join(path))
+        }
+    }
+
+    /// Clear a command's inherited environment and install this exact snapshot.
+    pub fn apply_to_command(&self, command: &mut Command) {
+        command.env_clear();
+        for (key, value) in &self.entries {
+            command.env(key, value);
+        }
+        if let Some(working_dir) = &self.working_dir {
+            command.current_dir(working_dir);
+        }
+    }
+}
+
+/// Resolve one executable using the current request's effective `PATH` while
+/// preserving the exact selected spelling for process execution.
+///
+/// This is intended for callers that will subsequently `env_clear` a child:
+/// a bare command must be resolved before the inherited search path is
+/// removed. Symlinks are deliberately not canonicalized because their path
+/// can affect `argv[0]`, wrapper behavior, and sibling-resource discovery.
+/// On Unix, non-executable regular files are skipped. On Windows, `PATHEXT` is
+/// honored for both bare commands and explicit extension-less paths.
+pub fn resolve_executable_path(command: &OsStr) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return resolve_executable_candidate(command_path);
+    }
+
+    let path = var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        if let Some(resolved) = resolve_executable_candidate(&directory.join(command_path)) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// Resolve using the effective discovery PATH, but anchor every relative
+/// candidate to one already-captured child working directory. This does not
+/// reuse the sanitized child's fixed PATH as the discovery PATH.
+pub fn resolve_executable_path_with_environment(
+    command: &OsStr,
+    child_env: &SanitizedChildEnv,
+) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return resolve_executable_candidate(&child_env.anchor_path(command_path)?);
+    }
+    for directory in std::env::split_paths(&var_os("PATH")?) {
+        let Some(candidate) = child_env.anchor_path(&directory.join(command_path)) else {
+            continue;
+        };
+        if let Some(resolved) = resolve_executable_candidate(&candidate) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+fn resolve_executable_candidate(candidate: &Path) -> Option<PathBuf> {
+    if executable_file(candidate) {
+        return Some(candidate.to_path_buf());
+    }
+
+    #[cfg(windows)]
+    if candidate.extension().is_none() {
+        let pathext = var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        for extension in pathext
+            .split(';')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let extension = extension.strip_prefix('.').unwrap_or(extension);
+            let with_extension = candidate.with_extension(extension);
+            if executable_file(&with_extension) {
+                return Some(with_extension);
+            }
+        }
+    }
+
+    None
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn sanitized_child_env_digest(
+    entries: &[(OsString, OsString)],
+    working_dir: Option<&Path>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(VERIFIER_CHILD_ENV_DOMAIN);
+    #[cfg(unix)]
+    hasher.update(b"unix/raw-bytes\0");
+    #[cfg(windows)]
+    hasher.update(b"windows/wide-le\0");
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(b"other/rust-encoded-bytes\0");
+    hasher.update((entries.len() as u128).to_le_bytes());
+    for (key, value) in entries {
+        update_digest_with_os_str(&mut hasher, key);
+        update_digest_with_os_str(&mut hasher, value);
+    }
+    match working_dir {
+        Some(path) => {
+            hasher.update(b"working-dir-present\0");
+            update_digest_with_os_str(&mut hasher, path.as_os_str());
+        }
+        None => hasher.update(b"working-dir-unavailable\0"),
+    }
+    hasher.finalize().into()
+}
+
+fn update_digest_with_os_str(hasher: &mut Sha256, value: &OsStr) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = value.as_bytes();
+        hasher.update((bytes.len() as u128).to_le_bytes());
+        hasher.update(bytes);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        hasher.update((value.encode_wide().count() as u128).to_le_bytes());
+        for unit in value.encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = value.as_encoded_bytes();
+        hasher.update((bytes.len() as u128).to_le_bytes());
+        hasher.update(bytes);
+    }
+}
 
 /// Fail-closed snapshot of ambient compiler controls at an artifact boundary.
 ///
@@ -430,6 +700,90 @@ pub fn apply_to_command(command: &mut Command) {
     });
 }
 
+/// Owned snapshot of the current thread's explicit environment overrides.
+///
+/// Overrides remain thread-local by default. Compiler executors that
+/// deliberately move one logical operation to a worker thread can capture this
+/// value and install it there with [`Self::run`]. This transfers explicit
+/// configuration without mutating the process environment or leaking it to
+/// unrelated work scheduled on the same worker.
+#[derive(Debug, Clone, Default)]
+pub struct EnvOverrideSnapshot {
+    entries: Vec<(OsString, OverrideValue)>,
+}
+
+impl EnvOverrideSnapshot {
+    /// Capture the complete nested override stack on the current thread.
+    pub fn capture_current_thread() -> Self {
+        let entries = OVERRIDES.with(|overrides| {
+            overrides
+                .borrow()
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.value.clone()))
+                .collect()
+        });
+        Self { entries }
+    }
+
+    /// Run one operation with this snapshot installed on the current thread.
+    ///
+    /// Installation replaces (rather than appends to) the worker's complete
+    /// override stack. This is essential on work-stealing pools: an absent key
+    /// in this snapshot must mask an unrelated task's temporarily installed
+    /// value. The previous worker stack is restored exactly when the operation
+    /// returns or unwinds.
+    pub fn run<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let replacement = self
+            .entries
+            .iter()
+            .map(|(key, value)| OverrideEntry {
+                id: OverrideId(Rc::new(())),
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        let previous = OVERRIDES.with(|overrides| {
+            let mut overrides = overrides.borrow_mut();
+            std::mem::replace(&mut *overrides, replacement)
+        });
+        let touches_unkeyed_control = previous
+            .iter()
+            .any(|entry| artifact_reuse_key_is_unkeyed_control(&entry.key))
+            || self
+                .entries
+                .iter()
+                .any(|(key, _)| artifact_reuse_key_is_unkeyed_control(key));
+        if touches_unkeyed_control {
+            bump_unkeyed_control_mutation_epoch();
+        }
+        let restore = OverrideStackRestore {
+            previous,
+            touches_unkeyed_control,
+        };
+        let result = operation();
+        drop(restore);
+        result
+    }
+}
+
+struct OverrideStackRestore {
+    previous: Vec<OverrideEntry>,
+    touches_unkeyed_control: bool,
+}
+
+impl Drop for OverrideStackRestore {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.previous);
+        OVERRIDES.with(|overrides| {
+            let mut overrides = overrides.borrow_mut();
+            *overrides = previous;
+        });
+        if self.touches_unkeyed_control {
+            bump_unkeyed_control_mutation_epoch();
+        }
+    }
+}
+
 /// A thread-bound token that scopes guard-style overrides.
 ///
 /// [`ScopedEnvVar`] borrows this token, which makes it impossible to drop the
@@ -663,6 +1017,53 @@ mod tests {
     }
 
     #[test]
+    fn explicit_snapshot_transfers_overrides_to_one_worker_scope() {
+        let set_key = "TRUST_CG_PROCESS_ENV_SNAPSHOT_SET";
+        let removed_key = "TRUST_CG_PROCESS_ENV_SNAPSHOT_REMOVED";
+        let process_set = std::env::var_os(set_key);
+        let process_removed = std::env::var_os(removed_key);
+
+        let observed = with_env_edits(|editor| {
+            editor.set(set_key, "captured");
+            editor.remove(removed_key);
+            let snapshot = EnvOverrideSnapshot::capture_current_thread();
+            let worker_process_set = process_set.clone();
+            let worker_process_removed = process_removed.clone();
+            std::thread::spawn(move || {
+                assert_eq!(var_os(set_key), worker_process_set);
+                assert_eq!(var_os(removed_key), worker_process_removed);
+                let inside = snapshot.run(|| (var_os(set_key), var_os(removed_key)));
+                let restored = (var_os(set_key), var_os(removed_key));
+                (inside, restored)
+            })
+            .join()
+            .unwrap()
+        });
+
+        assert_eq!(observed.0.0.as_deref(), Some(OsStr::new("captured")));
+        assert_eq!(observed.0.1, None);
+        assert_eq!(observed.1, (process_set, process_removed));
+    }
+
+    #[test]
+    fn snapshot_masks_worker_only_overrides_and_restores_them() {
+        let captured_key = "TCG_PROCESS_ENV_SNAPSHOT_CAPTURED";
+        let worker_only_key = "TCG_PROCESS_ENV_SNAPSHOT_WORKER_ONLY";
+        let snapshot = with_env_overrides(&[(captured_key, "captured")], || {
+            EnvOverrideSnapshot::capture_current_thread()
+        });
+
+        with_env_overrides(&[(worker_only_key, "worker")], || {
+            snapshot.run(|| {
+                assert_eq!(var(captured_key).as_deref(), Ok("captured"));
+                assert_eq!(var_os(worker_only_key), None);
+            });
+            assert_eq!(var(worker_only_key).as_deref(), Ok("worker"));
+            assert_eq!(var_os(captured_key), None);
+        });
+    }
+
+    #[test]
     fn command_receives_set_and_removed_overrides() {
         with_env_edits(|editor| {
             editor.set("TRUST_CG_PROCESS_ENV_CHILD_SET", "value");
@@ -690,6 +1091,387 @@ mod tests {
                 key.as_os_str() == OsStr::new("TRUST_CG_PROCESS_ENV_CHILD_REMOVED")
             }));
         });
+    }
+
+    fn sanitized_entry<'a>(environment: &'a SanitizedChildEnv, key: &str) -> Option<&'a OsStr> {
+        environment
+            .entries
+            .iter()
+            .find(|(candidate, _)| keys_equal(candidate, OsStr::new(key)))
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    #[test]
+    fn sanitized_verifier_environment_is_sorted_and_deterministic() {
+        let first = SanitizedChildEnv::capture_verifier();
+        let second = SanitizedChildEnv::capture_verifier();
+
+        assert_eq!(first, second);
+        assert_eq!(first.digest(), second.digest());
+        assert!(
+            first.entries.windows(2).all(|entries| {
+                entries[0].0.as_encoded_bytes() < entries[1].0.as_encoded_bytes()
+            })
+        );
+        assert_eq!(sanitized_entry(&first, "LANG"), Some(OsStr::new("C")));
+        assert_eq!(sanitized_entry(&first, "LC_ALL"), Some(OsStr::new("C")));
+        #[cfg(unix)]
+        assert_eq!(
+            sanitized_entry(&first, "PATH"),
+            Some(OsStr::new("/usr/bin:/bin"))
+        );
+    }
+
+    #[test]
+    fn sanitized_verifier_environment_honors_scoped_allowlisted_overrides() {
+        with_env_edits(|editor| {
+            editor.set("TMPDIR", "scoped-verifier-temp");
+            editor.set("RUST_MIN_STACK", "8388608");
+            editor.set("LANG", "ambient-locale-must-not-win");
+            let environment = SanitizedChildEnv::capture_verifier();
+
+            assert_eq!(
+                sanitized_entry(&environment, "TMPDIR"),
+                Some(OsStr::new("scoped-verifier-temp"))
+            );
+            assert_eq!(
+                sanitized_entry(&environment, "RUST_MIN_STACK"),
+                Some(OsStr::new("8388608"))
+            );
+            assert_eq!(sanitized_entry(&environment, "LANG"), Some(OsStr::new("C")));
+        });
+    }
+
+    #[test]
+    fn sanitized_verifier_environment_excludes_unrelated_and_authority_knobs() {
+        with_env_edits(|editor| {
+            for key in [
+                "AY_SOLVER_PATH",
+                "HOME",
+                "LD_LIBRARY_PATH",
+                "TCG_FUTURE_ALGORITHM_KNOB",
+                "TRUST_ROOT",
+                "XDG_CACHE_HOME",
+            ] {
+                editor.set(key, "must-not-be-inherited");
+            }
+            let environment = SanitizedChildEnv::capture_verifier();
+
+            for key in [
+                "AY_SOLVER_PATH",
+                "HOME",
+                "LD_LIBRARY_PATH",
+                "TCG_FUTURE_ALGORITHM_KNOB",
+                "TRUST_ROOT",
+                "XDG_CACHE_HOME",
+            ] {
+                assert_eq!(sanitized_entry(&environment, key), None, "key={key}");
+            }
+        });
+    }
+
+    #[test]
+    fn sanitized_verifier_environment_apply_clears_prior_command_environment() {
+        let environment = SanitizedChildEnv::capture_verifier();
+        let mut command = Command::new("unused");
+        command.env("SANITIZED_CHILD_ENV_MUST_BE_CLEARED", "inherited");
+        environment.apply_to_command(&mut command);
+
+        let mut applied = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_owned(),
+                    value
+                        .expect("the sanitized snapshot contains no removals")
+                        .to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        applied.sort_by(|left, right| left.0.as_encoded_bytes().cmp(right.0.as_encoded_bytes()));
+
+        assert_eq!(applied, environment.entries);
+        assert_eq!(
+            command.get_current_dir(),
+            environment.working_dir.as_deref()
+        );
+        assert_eq!(
+            sanitized_entry(&environment, "SANITIZED_CHILD_ENV_MUST_BE_CLEARED"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_resolution_skips_non_executable_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "trust-cg-process-env-resolve-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let shadow_dir = root.join("shadow");
+        let executable_dir = root.join("executable");
+        std::fs::create_dir_all(&shadow_dir).expect("create shadow directory");
+        std::fs::create_dir_all(&executable_dir).expect("create executable directory");
+        let shadow = shadow_dir.join("ay");
+        let executable = executable_dir.join("ay");
+        std::fs::write(&shadow, b"shadow").expect("write shadow fixture");
+        std::fs::write(&executable, b"executable").expect("write executable fixture");
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644))
+            .expect("make shadow non-executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("make fixture executable");
+        let path = std::env::join_paths([shadow_dir, executable_dir]).expect("join fixture PATH");
+
+        let resolved = with_env_edits(|environment| {
+            environment.set("PATH", &path);
+            resolve_executable_path(OsStr::new("ay"))
+        });
+        assert_eq!(resolved.as_deref(), Some(executable.as_path()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sanitized_verifier_environment_digest_binds_allowlisted_values() {
+        let first = with_env_overrides(&[("TMPDIR", "verifier-temp-a")], || {
+            SanitizedChildEnv::capture_verifier()
+        });
+        let second = with_env_overrides(&[("TMPDIR", "verifier-temp-b")], || {
+            SanitizedChildEnv::capture_verifier()
+        });
+
+        assert_ne!(first, second);
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    // Captured-path controls construct snapshots directly; they never mutate
+    // the process-global CWD shared with other test threads.
+    fn captured_path_environment(working_dir: Option<PathBuf>) -> SanitizedChildEnv {
+        let mut snapshot = SanitizedChildEnv::capture_verifier();
+        snapshot.working_dir = working_dir;
+        snapshot.digest =
+            sanitized_child_env_digest(&snapshot.entries, snapshot.working_dir.as_deref());
+        snapshot
+    }
+
+    #[test]
+    fn captured_path_anchor_preserves_spelling_and_incomplete_snapshot() {
+        let current = std::env::current_dir().unwrap();
+        let captured = current.join("captured-path-diagnostic-only");
+        let snapshot = captured_path_environment(Some(captured.clone()));
+        let relative = Path::new("tools/../bin/checker");
+        let absolute = current.join("absolute-checker");
+        assert_eq!(snapshot.working_dir(), Some(captured.as_path()));
+        assert_eq!(
+            snapshot.anchor_path(relative),
+            Some(captured.join(relative))
+        );
+        assert_eq!(snapshot.anchor_path(&absolute), Some(absolute.clone()));
+        let mut command = Command::new("not-executed");
+        snapshot.apply_to_command(&mut command);
+        assert_eq!(command.get_current_dir(), Some(captured.as_path()));
+
+        let incomplete = captured_path_environment(None);
+        assert_ne!(snapshot.digest(), incomplete.digest());
+        assert!(incomplete.working_dir().is_none());
+        assert!(incomplete.anchor_path(relative).is_none());
+        assert_eq!(incomplete.anchor_path(&absolute), Some(absolute));
+        let mut command = Command::new("not-executed");
+        incomplete.apply_to_command(&mut command);
+        assert!(command.get_current_dir().is_none());
+        assert!(incomplete.working_dir().is_none());
+        assert_eq!(std::env::current_dir().unwrap(), current);
+    }
+
+    #[cfg(unix)]
+    struct CapturedPathTestDirectory(PathBuf);
+
+    #[cfg(unix)]
+    impl CapturedPathTestDirectory {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NONCE: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "trust-cg-captured-path-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NONCE.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        fn executable(&self, relative: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CapturedPathTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_path_resolver_uses_supplied_cwd_for_command_and_path_entries() {
+        let current = std::env::current_dir().unwrap();
+        let root = CapturedPathTestDirectory::new();
+        let a = root.executable("a/bin/checker");
+        let b = root.executable("b/bin/checker");
+        let a_root = root.0.join("a");
+        let b_root = root.0.join("b");
+        let snapshot_a = captured_path_environment(Some(a_root.clone()));
+        let snapshot_b = captured_path_environment(Some(b_root.clone()));
+        assert_ne!(snapshot_a.digest(), snapshot_b.digest());
+        assert_eq!(
+            resolve_executable_path_with_environment(OsStr::new("bin/checker"), &snapshot_a),
+            Some(a.clone())
+        );
+        let discovery_path =
+            std::env::join_paths([PathBuf::from("bin"), b_root.join("bin")]).unwrap();
+        with_env_edits(|editor| {
+            editor.set("PATH", &discovery_path);
+            assert_eq!(
+                resolve_executable_path_with_environment(OsStr::new("checker"), &snapshot_a),
+                Some(a.clone())
+            );
+            assert_eq!(
+                resolve_executable_path_with_environment(OsStr::new("checker"), &snapshot_b),
+                Some(b)
+            );
+        });
+        // The selected symlink spelling, not its canonical target, is retained.
+        let link = a_root.join("checker-link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        assert_eq!(
+            resolve_executable_path_with_environment(OsStr::new("./checker-link"), &snapshot_a),
+            Some(a_root.join("./checker-link"))
+        );
+        let current_entry = root.executable("a/checker");
+        with_env_overrides(&[("PATH", "")], || {
+            assert_eq!(
+                resolve_executable_path_with_environment(OsStr::new("checker"), &snapshot_a),
+                Some(current_entry)
+            );
+        });
+        assert_eq!(std::env::current_dir().unwrap(), current);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_path_resolver_incomplete_cwd_skips_relative_but_keeps_absolute_candidates() {
+        let current = std::env::current_dir().unwrap();
+        let root = CapturedPathTestDirectory::new();
+        let absolute = root.executable("absolute/checker");
+        let incomplete = captured_path_environment(None);
+        let digest = incomplete.digest();
+        assert!(
+            resolve_executable_path_with_environment(OsStr::new("relative/checker"), &incomplete)
+                .is_none()
+        );
+        with_env_overrides(&[("PATH", "relative-bin")], || {
+            assert!(
+                resolve_executable_path_with_environment(OsStr::new("checker"), &incomplete)
+                    .is_none()
+            );
+        });
+        let mixed = std::env::join_paths([
+            PathBuf::from("relative-bin"),
+            PathBuf::new(),
+            root.0.join("absolute"),
+        ])
+        .unwrap();
+        with_env_edits(|editor| {
+            editor.set("PATH", mixed);
+            assert_eq!(
+                resolve_executable_path_with_environment(OsStr::new("checker"), &incomplete),
+                Some(absolute.clone())
+            );
+        });
+        assert_eq!(
+            resolve_executable_path_with_environment(absolute.as_os_str(), &incomplete),
+            Some(absolute)
+        );
+        // Finding an absolute executable never upgrades an incomplete snapshot.
+        assert!(incomplete.working_dir().is_none());
+        assert_eq!(incomplete.digest(), digest);
+        assert_eq!(std::env::current_dir().unwrap(), current);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitized_verifier_environment_hashes_non_unicode_without_loss() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let first_value = OsString::from_vec(vec![b't', b'm', b'p', 0x80]);
+        let second_value = OsString::from_vec(vec![b't', b'm', b'p', 0x81]);
+        let unrelated_key = OsString::from_vec(b"TCG_UNRELATED_\xff".to_vec());
+        let first = with_env_edits(|editor| {
+            editor.set("TMPDIR", &first_value);
+            editor.set(&unrelated_key, "excluded");
+            SanitizedChildEnv::capture_verifier()
+        });
+        let second = with_env_edits(|editor| {
+            editor.set("TMPDIR", &second_value);
+            SanitizedChildEnv::capture_verifier()
+        });
+
+        assert_eq!(
+            sanitized_entry(&first, "TMPDIR"),
+            Some(first_value.as_os_str())
+        );
+        assert!(
+            !first
+                .entries
+                .iter()
+                .any(|(key, _)| key.as_os_str() == unrelated_key.as_os_str())
+        );
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitized_verifier_environment_hashes_unpaired_wide_units_without_loss() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let first_value = OsString::from_wide(&[b't' as u16, 0xd800]);
+        let second_value = OsString::from_wide(&[b't' as u16, 0xd801]);
+        let unrelated_key =
+            OsString::from_wide(&[b'T' as u16, b'C' as u16, b'G' as u16, b'_' as u16, 0xd800]);
+        let first = with_env_edits(|editor| {
+            editor.set("TMPDIR", &first_value);
+            editor.set(&unrelated_key, "excluded");
+            SanitizedChildEnv::capture_verifier()
+        });
+        let second = with_env_edits(|editor| {
+            editor.set("TMPDIR", &second_value);
+            SanitizedChildEnv::capture_verifier()
+        });
+
+        assert_eq!(
+            sanitized_entry(&first, "TMPDIR"),
+            Some(first_value.as_os_str())
+        );
+        assert!(
+            !first
+                .entries
+                .iter()
+                .any(|(key, _)| key.as_os_str() == unrelated_key.as_os_str())
+        );
+        assert_ne!(first.digest(), second.digest());
     }
 
     #[test]

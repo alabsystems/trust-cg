@@ -54,13 +54,18 @@ const ARRAY_LEN: u64 = 8;
 /// a single module proof obligation of the given `status`.
 fn build_module(status: ProofStatus) -> (Module, TrustIrFunction) {
     let mut module = Module::new("guard_kernel_gate_e2e");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "proven_extract", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -88,7 +93,9 @@ fn build_module(status: ProofStatus) -> (Module, TrustIrFunction) {
         "array index is in bounds",
     ));
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (module, func)
 }
 
@@ -101,13 +108,23 @@ fn lower_to_machfunction(
     module: &Module,
 ) -> (MachFunction, HashMap<u128, u64>, Vec<u64>) {
     let (lir_func, proof_ctx): (LirFunction, LirProofContext) =
-        trust_cg_lower::translate_function(func, module).expect("adapter translate");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translate");
 
     let sig = trust_cg_lower::function::Signature {
         params: lir_func.signature.params.clone(),
         returns: lir_func.signature.returns.clone(),
     };
     let mut isel = InstructionSelector::new(lir_func.name.clone(), sig.clone());
+    isel.set_abi_variant(
+        trust_cg_lower::abi::AArch64AbiVariant::from_target_triple(
+            &trust_cg_codegen::target::TargetSpec::host_for_architecture(
+                trust_cg_codegen::Target::Aarch64,
+            )
+            .triple(),
+        )
+        .expect("the AArch64 host has a modeled calling convention"),
+    );
     isel.set_stack_slots(lir_func.stack_slots.clone());
     isel.seed_value_types(&lir_func.value_types);
     isel.seed_pure_callees(&lir_func.pure_callees);
@@ -330,13 +347,18 @@ fn kernel_gate_keeps_pending_bounds_check_end_to_end() {
 /// authority from this report-only annotation.
 fn build_inbounds_only_module() -> (Module, TrustIrFunction) {
     let mut module = Module::new("guard_kernel_gate_e2e_synth");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "inbounds_only_extract", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -356,7 +378,9 @@ fn build_inbounds_only_module() -> (Module, TrustIrFunction) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (module, func)
 }
 
@@ -406,4 +430,13 @@ fn kernel_gate_keeps_inbounds_annotation_without_replayed_authority() {
     assert_eq!(pass.stats().bounds_checks_eliminated, 0);
     assert_eq!(pass.kernel_eliminations().len(), 0);
     assert!(pass.recheck_kernel_eliminations().is_ok());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

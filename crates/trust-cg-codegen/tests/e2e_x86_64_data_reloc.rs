@@ -92,8 +92,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -258,16 +269,22 @@ fn global_addr_stub(global_index: u64) -> i128 {
 /// X86_64_RELOC_UNSIGNED data relocation the linker fills in.
 fn build_vtable_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("vtable_reloc");
-    let unary_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let call_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let unary_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let call_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // fa(x) = x + 100
     let mut fa = TrustIrFunction::new(FuncId::new(0), "fa", unary_ft, BlockId::new(0));
@@ -292,7 +309,9 @@ fn build_vtable_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(fa);
+    module
+        .try_add_function(fa)
+        .expect("Module::try_add_function: test fixture");
 
     // fb(x) = x * 3
     let mut fb = TrustIrFunction::new(FuncId::new(1), "fb", unary_ft, BlockId::new(0));
@@ -317,7 +336,9 @@ fn build_vtable_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(fb);
+    module
+        .try_add_function(fb)
+        .expect("Module::try_add_function: test fixture");
 
     // fc(x) = 0 - x
     let mut fc = TrustIrFunction::new(FuncId::new(2), "fc", unary_ft, BlockId::new(0));
@@ -342,14 +363,21 @@ fn build_vtable_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(fc);
+    module
+        .try_add_function(fc)
+        .expect("Module::try_add_function: test fixture");
 
     // The vtable: a table of three function addresses. Each slot is a
     // pointer-sized relocatable element. Global index 0 (referenced by the
     // FADE stub below).
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "VTBL".to_string(),
-        ty: Ty::Ptr,
+        // WS7.3: three pointer slots are a three-lane tuple, not one `ptr`
+        // (trust-ir refuses the aggregate at `ptr` as `ConstTypeMismatch`).
+        ty: Ty::Tuple(vec![Ty::Ptr, Ty::Ptr, Ty::Ptr]),
         mutable: false,
         initializer: Some(Constant::Aggregate(vec![
             Constant::symbol_addr("fa"),
@@ -421,7 +449,9 @@ fn build_vtable_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -438,19 +468,15 @@ fn build_data_pointer_module() -> TrustIrModule {
     // G = 0x1234 = 4660 (little-endian i64).
     // global index 0
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "G".to_string(),
         ty: Ty::I64,
         mutable: false,
-        initializer: Some(Constant::Aggregate(vec![
-            Constant::Int(0x34),
-            Constant::Int(0x12),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-        ])),
+        // WS7.3: typed at the global's `i64` (trust-ir refuses a byte
+        // aggregate there as `ConstTypeMismatch`).
+        initializer: Some(Constant::Int(0x1234)),
         linkage: Linkage::Internal,
         tls: None,
         align: None,
@@ -459,20 +485,27 @@ fn build_data_pointer_module() -> TrustIrModule {
     // PG = &G  (a single relocatable pointer element)
     // global index 1
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "PG".to_string(),
         ty: Ty::Ptr,
         mutable: false,
-        initializer: Some(Constant::Aggregate(vec![Constant::symbol_addr("G")])),
+        // WS7.3: a `ptr` initializer is the address constant itself.
+        initializer: Some(Constant::symbol_addr("G")),
         linkage: Linkage::Internal,
         tls: None,
         align: None,
     });
 
-    let ret_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ret_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // deref_pg() = **(&PG)
     //   ppg = &PG       (GlobalRef to PG, global index 1)
@@ -510,7 +543,9 @@ fn build_data_pointer_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -633,7 +668,10 @@ fn elf_section_name(bytes: &[u8], i: usize) -> String {
         .to_string()
 }
 
-/// Collect every RELA entry from sections named `.rela.data` / `.rela.rodata`.
+/// Collect every RELA entry from the data sections' relocation tables:
+/// `.rela.data`, `.rela.rodata` and `.rela.data.rel.ro` (where an IMMUTABLE
+/// global whose bytes hold symbol addresses lands, so a position-independent
+/// link can relocate it without a text relocation).
 fn elf_data_relocations(bytes: &[u8]) -> Vec<(String, Elf64Rela)> {
     let sh_offset = read_u64(bytes, 40) as usize;
     let e_shnum = read_u16(bytes, 60) as usize;
@@ -645,7 +683,7 @@ fn elf_data_relocations(bytes: &[u8]) -> Vec<(String, Elf64Rela)> {
             continue;
         }
         let name = elf_section_name(bytes, i);
-        if name != ".rela.data" && name != ".rela.rodata" {
+        if name != ".rela.data" && name != ".rela.rodata" && name != ".rela.data.rel.ro" {
             continue;
         }
         let off = read_u64(bytes, shdr_off + 24) as usize;
@@ -708,6 +746,10 @@ fn test_x86_64_elf_data_relocations_shape() {
         is_import: false,
         is_weak: false,
         align: 1,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
+        section: None,
+        comdat: false,
     };
 
     let func = build_x86_const_test_function();
@@ -727,9 +769,13 @@ fn test_x86_64_elf_data_relocations_shape() {
         relocs
     );
     for (sec, rela) in &relocs {
-        assert!(
-            sec == ".rela.data" || sec == ".rela.rodata",
-            "data reloc in unexpected section {sec}"
+        // `VTBL` is immutable AND carries symbol addresses: PIE-safe placement
+        // is `.data.rel.ro`, never `.rodata` (an absolute relocation in a
+        // read-only section is a text relocation the default GNU/Linux link
+        // refuses; measured 2026-09-20 on every bridge-emitted std program).
+        assert_eq!(
+            sec, ".rela.data.rel.ro",
+            "pointer-bearing immutable global relocated in unexpected section {sec}"
         );
         assert_eq!(
             rela.reloc_type, R_X86_64_64,
@@ -753,4 +799,13 @@ fn test_x86_64_elf_data_relocations_shape() {
         g_reloc.r_addend, 16,
         "non-zero addend carried in ELF r_addend"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

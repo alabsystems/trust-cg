@@ -15,22 +15,184 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use trust_cg_lower::X86ISelFunction;
+use trust_cg_lower::x86_64_isel::{X86ISelInst, X86ISelOperand};
 
 use crate::pass_manager::PassStats;
 
 /// Statistics collected during x86 pass execution.
 pub type X86PassStats = PassStats;
 
+/// Hash one ISel operand into `hasher`, structurally.
+///
+/// Every variant contributes a distinct leading tag byte followed by ALL of its
+/// fields, so two operands hash the same input only when they agree field by
+/// field. The `f64` immediate is hashed by `to_bits`, which is strictly FINER
+/// than the previous `{:?}` rendering (it separates `+0.0`/`-0.0` and distinct
+/// NaN payloads that `Debug` collapses) — see `function_fingerprint` for why a
+/// finer fingerprint is always safe and a coarser one never is.
+///
+/// The `match` is exhaustive with NO wildcard arm on purpose: adding a variant
+/// to [`X86ISelOperand`] must be a compile error here, not a silent loss of
+/// fingerprint resolution.
+fn hash_x86_isel_operand<H: Hasher>(op: &X86ISelOperand, hasher: &mut H) {
+    match op {
+        X86ISelOperand::VReg(v) => {
+            0u8.hash(hasher);
+            v.hash(hasher);
+        }
+        X86ISelOperand::PReg(p) => {
+            1u8.hash(hasher);
+            p.hash(hasher);
+        }
+        X86ISelOperand::Imm(i) => {
+            2u8.hash(hasher);
+            i.hash(hasher);
+        }
+        X86ISelOperand::FImm(f) => {
+            3u8.hash(hasher);
+            f.to_bits().hash(hasher);
+        }
+        X86ISelOperand::Block(b) => {
+            4u8.hash(hasher);
+            b.hash(hasher);
+        }
+        X86ISelOperand::CondCode(cc) => {
+            5u8.hash(hasher);
+            cc.hash(hasher);
+        }
+        X86ISelOperand::Symbol(s) => {
+            6u8.hash(hasher);
+            s.hash(hasher);
+        }
+        X86ISelOperand::ExactModuleSymbol(s) => {
+            12u8.hash(hasher);
+            s.hash(hasher);
+        }
+        X86ISelOperand::StackSlot(s) => {
+            7u8.hash(hasher);
+            s.hash(hasher);
+        }
+        X86ISelOperand::MemAddr { base, disp } => {
+            8u8.hash(hasher);
+            hash_x86_isel_operand(base, hasher);
+            disp.hash(hasher);
+        }
+        X86ISelOperand::SibMemAddr {
+            base,
+            index,
+            scale,
+            disp,
+        } => {
+            9u8.hash(hasher);
+            hash_x86_isel_operand(base, hasher);
+            hash_x86_isel_operand(index, hasher);
+            scale.hash(hasher);
+            disp.hash(hasher);
+        }
+        X86ISelOperand::ConstPoolEntry(i) => {
+            10u8.hash(hasher);
+            i.hash(hasher);
+        }
+        X86ISelOperand::JumpTableIndex(i) => {
+            11u8.hash(hasher);
+            i.hash(hasher);
+        }
+    }
+}
+
+/// Hash one ISel instruction into `hasher`, structurally.
+///
+/// The instruction is destructured with NO `..` rest pattern: a new field on
+/// [`X86ISelInst`] must be a compile error here, so the fingerprint can never
+/// silently stop observing part of the instruction.
+fn hash_x86_isel_inst<H: Hasher>(inst: &X86ISelInst, hasher: &mut H) {
+    let X86ISelInst {
+        opcode,
+        operands,
+        flags,
+        proof_origin,
+        call_arg_regs,
+        call_result_regs,
+        internal_return_regs,
+        lowering_provenance,
+    } = inst;
+
+    opcode.hash(hasher);
+
+    operands.len().hash(hasher);
+    for op in operands {
+        hash_x86_isel_operand(op, hasher);
+    }
+
+    // `InstFlags` derives `Hash` over its whole u16 bitfield — strictly finer
+    // than its hand-written `Debug`, which renders only the named flags.
+    flags.hash(hasher);
+
+    // `X86ProofOrigin` is a field-less enum without a `Hash` derive; its
+    // discriminant carries exactly the information `Debug` prints.
+    match proof_origin {
+        None => 0u8.hash(hasher),
+        Some(origin) => {
+            1u8.hash(hasher);
+            std::mem::discriminant(origin).hash(hasher);
+        }
+    }
+
+    call_arg_regs.len().hash(hasher);
+    for arg in call_arg_regs {
+        arg.reg.hash(hasher);
+        arg.read_bits.hash(hasher);
+    }
+
+    match call_result_regs {
+        None => 0u8.hash(hasher),
+        Some(regs) => {
+            1u8.hash(hasher);
+            regs.len().hash(hasher);
+            for r in regs {
+                r.reg.hash(hasher);
+                r.defined_bits.hash(hasher);
+            }
+        }
+    }
+
+    // Hashed only when present, under its own tag, so every instruction that
+    // carries none (all but the `ret` of a signature using the internal
+    // multi-result registers) fingerprints exactly as before the field existed.
+    if !internal_return_regs.is_empty() {
+        2u8.hash(hasher);
+        internal_return_regs.len().hash(hasher);
+        for r in internal_return_regs {
+            r.reg.hash(hasher);
+            r.defined_bits.hash(hasher);
+        }
+    }
+
+    lowering_provenance.hash(hasher);
+}
+
 /// Structural fingerprint of an [`X86ISelFunction`] used by the fixpoint loop
 /// to detect non-convergence.
 ///
 /// `X86ISelInst`/`X86ISelOperand` are not `Hash` (operands carry an `f64`
-/// float immediate, so the types are not `Eq`/`Hash`). We therefore hash a
-/// deterministic `Debug` rendering of each instruction together with the block
-/// structure. This is only used as a change detector — false "different"
-/// verdicts are harmless (they cannot mask non-convergence, only fail to
-/// shortcut it), and the `Debug` rendering is total and stable for a given IR
-/// shape.
+/// float immediate, so the types are not `Eq`/`Hash`), so each instruction is
+/// hashed field by field by [`hash_x86_isel_inst`] — opcode, operands
+/// (including the float immediate's bit pattern), flags, proof origin, the
+/// call argument/result register declarations, and the lowering provenance.
+/// That is the same information the previous `format!("{:?}", inst)` rendering
+/// carried, at strictly finer resolution and without allocating a `String` per
+/// instruction (this hash was 18% of the whole x86 optimization phase at 2400
+/// functions, measured 2026-08-31).
+///
+/// # Why finer is safe and coarser is not
+///
+/// The fixpoint loop stops early when two consecutive iterations fingerprint
+/// equal. A COARSER fingerprint could report "same" for genuinely different
+/// IR and truncate optimization, changing emitted bytes. A FINER one can only
+/// fail to take a shortcut: if the IR really is unchanged then, because every
+/// pass is a deterministic function of the IR, the next iteration reproduces
+/// it exactly, so the extra iterations are no-ops and the emitted bytes are
+/// identical. Hence resolution may only ever be increased here, never reduced.
 fn function_fingerprint(func: &X86ISelFunction) -> u64 {
     let mut hasher = DefaultHasher::new();
     func.name.hash(&mut hasher);
@@ -45,9 +207,7 @@ fn function_fingerprint(func: &X86ISelFunction) -> u64 {
         };
         block.insts.len().hash(&mut hasher);
         for inst in &block.insts {
-            // `{:?}` is deterministic for a fixed IR and covers opcode,
-            // operands (including float immediates), flags, and proof origin.
-            format!("{:?}", inst).hash(&mut hasher);
+            hash_x86_isel_inst(inst, &mut hasher);
         }
         block.successors.len().hash(&mut hasher);
         for succ in &block.successors {
@@ -57,53 +217,62 @@ fn function_fingerprint(func: &X86ISelFunction) -> u64 {
     hasher.finish()
 }
 
-/// Returns true if the x86 fixpoint loop should emit non-convergence
-/// diagnostics to stderr. Controlled by `TRUST_CG_X86_FIXPOINT_LOG`; off by
-/// default so it is harmless in production runs.
-fn fixpoint_log_enabled() -> bool {
-    std::env::var_os("TRUST_CG_X86_FIXPOINT_LOG").is_some()
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC (default off, `TCG_TIME_X86PM=1`): per-pass wall time
+// ---------------------------------------------------------------------------
+//
+// `TCG_TIME`'s `x86_optimization` row is a single number covering ~16 passes
+// run to a 4-iteration fixpoint. This splits it per pass (plus the fixpoint's
+// own `function_fingerprint`) so the phase can be attributed instead of
+// guessed. Purely observational: the timers are behind a memoized env check
+// and never touch the IR or a pass verdict.
+
+fn pm_timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_TIME_X86PM").is_some())
 }
 
-/// Diagnostic IR dump hook: `TCG_X86_PM_DUMP=<substr>` dumps every function's
-/// IR to stderr after each pass whose name contains `<substr>` (empty value =
-/// every pass). `TCG_X86_PM_DUMP_FN=<substr>` additionally restricts the dump
-/// to functions whose name contains `<substr>`. Purely observational — never
-/// changes the IR or pass verdicts; off by default.
-fn dump_filter() -> Option<(String, Option<String>)> {
-    static FILTER: std::sync::OnceLock<Option<(String, Option<String>)>> =
-        std::sync::OnceLock::new();
-    FILTER
-        .get_or_init(|| {
-            std::env::var("TCG_X86_PM_DUMP")
-                .ok()
-                .map(|pass| (pass, std::env::var("TCG_X86_PM_DUMP_FN").ok()))
-        })
-        .clone()
-}
+static PM_TIMES: std::sync::Mutex<std::collections::BTreeMap<String, (u128, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-fn maybe_dump_after(pass_name: &str, func: &X86ISelFunction) {
-    let Some((pass_filter, fn_filter)) = dump_filter() else {
+fn pm_record(name: &str, elapsed: std::time::Duration) {
+    let Ok(mut table) = PM_TIMES.lock() else {
         return;
     };
-    if !pass_filter.is_empty() && !pass_name.contains(&pass_filter) {
-        return;
+    let entry = table.entry(name.to_string()).or_insert((0, 0));
+    entry.0 += elapsed.as_nanos();
+    entry.1 += 1;
+}
+
+/// Ranked per-pass timing report, or `None` unless `TCG_TIME_X86PM` is set.
+///
+/// Diagnostic only; the caller (the `TCG_TIME` trace in `trust-cg-codegen`)
+/// prints it next to the `x86_optimization` row.
+pub fn x86_pass_timing_report() -> Option<String> {
+    if !pm_timing_enabled() {
+        return None;
     }
-    if let Some(f) = &fn_filter
-        && !func.name.contains(f.as_str())
-    {
-        return;
+    let table = PM_TIMES.lock().ok()?;
+    let mut rows: Vec<(&String, u128, u64)> =
+        table.iter().map(|(k, (ns, n))| (k, *ns, *n)).collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+    let total: u128 = rows.iter().map(|r| r.1).sum();
+    let denom = total.max(1) as f64;
+    let mut out = format!(
+        "TCG_TIME_X86PM total={:.1}ms over {} entries\n",
+        total as f64 / 1e6,
+        rows.len()
+    );
+    for (name, ns, runs) in rows {
+        out.push_str(&format!(
+            "  {:<38} {:>9.1}ms {:>5.1}%  runs={}\n",
+            name,
+            ns as f64 / 1e6,
+            100.0 * ns as f64 / denom,
+            runs
+        ));
     }
-    eprintln!("=== [pm-dump] after `{}` fn `{}` ===", pass_name, func.name);
-    for block_id in &func.block_order {
-        let Some(block) = func.blocks.get(block_id) else {
-            continue;
-        };
-        eprintln!("  Block({}) succs={:?}", block_id.0, block.successors);
-        for (i, inst) in block.insts.iter().enumerate() {
-            eprintln!("    [{i}] {:?} {:?}", inst.opcode, inst.operands);
-        }
-    }
-    eprintln!("=== [pm-dump] end `{}` ===", func.name);
+    Some(out)
 }
 
 /// A single x86-64 machine pass over ISel-output instructions.
@@ -159,7 +328,6 @@ impl X86PassManager {
             if pass.run(func) {
                 changed = true;
             }
-            maybe_dump_after(pass.name(), func);
         }
         changed
     }
@@ -168,13 +336,19 @@ impl X86PassManager {
     pub fn run_once_with_stats(&mut self, func: &mut X86ISelFunction) -> X86PassStats {
         let mut stats = self.empty_stats();
         stats.iterations = 1;
+        let timing = pm_timing_enabled();
 
         for (i, pass) in self.passes.iter_mut().enumerate() {
             stats.runs[i].1 = 1;
-            if pass.run(func) {
-                stats.changes += 1;
+            let started = timing.then(std::time::Instant::now);
+            let changed = pass.run(func);
+            if let Some(started) = started {
+                pm_record(pass.name(), started.elapsed());
             }
-            maybe_dump_after(pass.name(), func);
+            if changed {
+                stats.changes += 1;
+                stats.changed_runs[i].1 += 1;
+            }
         }
 
         stats
@@ -186,25 +360,16 @@ impl X86PassManager {
     /// # Convergence
     ///
     /// The loop stops as soon as a full iteration reports no changes (a fixed
-    /// point). Two failure modes are detected and reported rather than being
-    /// silently truncated:
+    /// point), or at the stable-state guard: a pass may return `true` ("changed")
+    /// while leaving the IR byte-for-byte identical — e.g. a rewrite that toggles a
+    /// form back and forth, or a `changed` flag that does not reflect a real edit.
+    /// Left unchecked this burns the entire iteration budget on a no-op. After each
+    /// iteration we compare a structural `function_fingerprint`; if the IR is
+    /// unchanged from the previous iteration we treat the function as converged and
+    /// stop early.
     ///
-    /// 1. **Stable-state guard.** A pass may return `true` ("changed") while
-    ///    leaving the IR byte-for-byte identical — e.g. a rewrite that toggles
-    ///    a form back and forth, or a `changed` flag that does not reflect a
-    ///    real edit. Left unchecked this burns the entire iteration budget on a
-    ///    no-op. After each iteration we compare a structural
-    ///    `function_fingerprint`; if the IR is unchanged from the previous
-    ///    iteration we treat the function as converged, stop early, and (under
-    ///    `TRUST_CG_X86_FIXPOINT_LOG`) report the spurious-change cycle.
-    ///
-    /// 2. **Budget exhaustion.** If we run all `max_iterations` and the last
-    ///    iteration still reported a change *and* still mutated the IR, the
-    ///    function did not reach a fixed point within budget. We report this
-    ///    (under `TRUST_CG_X86_FIXPOINT_LOG`) so non-convergence is visible.
-    ///
-    /// Either way the function is returned in its last state; detection never
-    /// changes the optimization result, only surfaces diagnostics.
+    /// A function still changing after `max_iterations` is returned in its
+    /// last state; `stats.iterations` then equals the budget.
     pub fn run_to_fixpoint(
         &mut self,
         func: &mut X86ISelFunction,
@@ -216,8 +381,12 @@ impl X86PassManager {
             return stats;
         }
 
+        let timing = pm_timing_enabled();
+        let fp_started = timing.then(std::time::Instant::now);
         let mut prev_fingerprint = function_fingerprint(func);
-        let mut converged = false;
+        if let Some(started) = fp_started {
+            pm_record("<function_fingerprint>", started.elapsed());
+        }
 
         for iteration in 0..max_iterations {
             stats.iterations = iteration + 1;
@@ -225,15 +394,19 @@ impl X86PassManager {
 
             for (i, pass) in self.passes.iter_mut().enumerate() {
                 stats.runs[i].1 += 1;
-                if pass.run(func) {
+                let started = timing.then(std::time::Instant::now);
+                let changed = pass.run(func);
+                if let Some(started) = started {
+                    pm_record(pass.name(), started.elapsed());
+                }
+                if changed {
                     any_changed = true;
                     stats.changes += 1;
+                    stats.changed_runs[i].1 += 1;
                 }
-                maybe_dump_after(pass.name(), func);
             }
 
             if !any_changed {
-                converged = true;
                 break;
             }
 
@@ -241,49 +414,40 @@ impl X86PassManager {
             // structurally identical to the previous iteration. This is a
             // non-progressing cycle; converge and report rather than spinning
             // the budget on a no-op.
+            let fp_started = timing.then(std::time::Instant::now);
             let fingerprint = function_fingerprint(func);
+            if let Some(started) = fp_started {
+                pm_record("<function_fingerprint>", started.elapsed());
+            }
             if fingerprint == prev_fingerprint {
-                if fixpoint_log_enabled() {
-                    eprintln!(
-                        "x86-fixpoint: function `{}` reported a change at iteration {} \
-                         without mutating the IR (spurious-change cycle); treating as \
-                         converged after {} iteration(s)",
-                        func.name,
-                        iteration + 1,
-                        stats.iterations,
-                    );
-                }
-                converged = true;
                 break;
             }
             prev_fingerprint = fingerprint;
-        }
-
-        // Budget exhaustion: ran the full budget and the IR was still changing.
-        if !converged && fixpoint_log_enabled() {
-            eprintln!(
-                "x86-fixpoint: function `{}` did not converge within the \
-                 {}-iteration budget (still changing); optimization may be \
-                 truncated",
-                func.name, max_iterations,
-            );
         }
 
         stats
     }
 
     fn empty_stats(&self) -> X86PassStats {
-        X86PassStats {
-            runs: self
-                .passes
+        let names = || {
+            self.passes
                 .iter()
                 .map(|pass| (pass.name().to_string(), 0))
-                .collect(),
+                .collect()
+        };
+        X86PassStats {
+            runs: names(),
+            changed_runs: names(),
             changes: 0,
             iterations: 0,
             proof_optimization_certificates: Vec::new(),
             certified_pass_runs: Vec::new(),
             kernel_recheck: Ok(()),
+            // The L10-P5 admission reads `trust_cg_ir::MachFunction`; x86
+            // passes run on `X86ISelFunction`, which it does not cover.
+            id_admission: Ok(()),
+            // The x86 pass manager has no per-pass validation.
+            pass_validation: crate::pass_validation::PassValidationSummary::default(),
         }
     }
 }
@@ -307,6 +471,23 @@ mod tests {
     use trust_cg_lower::instructions::Block;
     use trust_cg_lower::types::Type;
     use trust_cg_lower::{X86ISelInst, X86ISelOperand};
+
+    #[test]
+    fn exact_function_address_operand_has_distinct_fingerprint() {
+        let fingerprint = |operand| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            hash_x86_isel_operand(&operand, &mut hash);
+            hash.finish()
+        };
+        assert_ne!(
+            fingerprint(X86ISelOperand::Symbol("target".into())),
+            fingerprint(X86ISelOperand::ExactModuleSymbol("target".into()))
+        );
+        assert_ne!(
+            fingerprint(X86ISelOperand::ExactModuleSymbol("target".into())),
+            fingerprint(X86ISelOperand::ExactModuleSymbol("_target".into()))
+        );
+    }
 
     #[derive(Debug, PartialEq)]
     struct InstSnapshot {
@@ -573,9 +754,8 @@ mod tests {
     #[test]
     fn fixpoint_reports_budget_exhaustion_when_not_converged() {
         // A pass that genuinely grows the IR every run never converges; the
-        // loop must run exactly `max_iterations` and surface the truncation
-        // (here we assert the budget was fully consumed, which is the
-        // observable signal alongside the gated stderr diagnostic).
+        // loop must run exactly `max_iterations` (the budget is fully
+        // consumed).
         let runs = Rc::new(Cell::new(0));
         let mut pm =
             X86PassManager::new().with_pass(Box::new(GrowsEveryRunPass { runs: runs.clone() }));

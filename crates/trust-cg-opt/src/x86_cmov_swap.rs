@@ -4,7 +4,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-//! OPT-IN (`TCG_X86_CMOV_SWAP=1`) branchless conditional-swap for the sort
+//! Default-on branchless conditional-swap (`TCG_NO_X86_CMOV_SWAP` disables it) for the sort
 //! inner-loop diamond
 //!
 //! ```text
@@ -43,10 +43,13 @@
 //! ```
 //!
 //! Both stores execute UNCONDITIONALLY: on the not-taken path they write back
-//! the exact values just loaded from those same addresses, which is
-//! observationally equivalent for single-threaded, non-volatile memory (the
-//! sort array is an ordinary stack/heap object the original program itself
-//! writes through the same mutable place on the taken path).
+//! the exact values just loaded from those same addresses. That path gains
+//! writes the original program never performed, so a same-value write-back is
+//! only equivalent when the target is private, writable memory: a heap, global
+//! or shared object could be read-only (the store faults) or visible to another
+//! thread (the store races). The recognizer therefore admits only a fixed-size
+//! stack slot whose address never escapes, and only when a dominating bounds
+//! check keeps both accesses inside that slot (condition 7 below).
 //!
 //! # Soundness argument (why every fired conversion is equivalence-preserving)
 //!
@@ -74,7 +77,8 @@
 //!    the arm is deleted whole and flags are dead at the join (the join was
 //!    already reachable from the flag-divergent not-taken path).
 //! 3. **Every arm bounds check is provably dead**: each arm
-//!    `cmp v, imm; jcc cc CONT; jmp TRAP` (TRAP = a `Ud2`-only block) must be
+//!    `cmp v, imm; jcc cc CONT; jmp TRAP` (TRAP = a pure trap block per
+//!    `crate::x86_trap_block`: `[Ud2]` or `[Call abort, Ud2]`) must be
 //!    IDENTICAL — same value number, same immediate, same condition code,
 //!    same orientation — to a check already executed on the dominating prefix
 //!    path. On entry to the arm the check therefore passed already; removing
@@ -93,6 +97,35 @@
 //!    operands**, re-validated (their base/index vregs still value-number to
 //!    the load-time address at the guard terminator), never from the deleted
 //!    arm.
+//! 7. **Both addresses are proven private, in-bounds stack memory.** Each
+//!    guard-load base value-numbers to a fixed-size (not runtime-sized) stack
+//!    slot with metadata, and a dominating prefix check `index <u N` on the
+//!    exact SIB index bounds the whole access inside that slot. The slot's
+//!    address must not escape anywhere in the function: every mention of the
+//!    slot is either a `lea` root or the address operand of an ordinary
+//!    non-volatile load/store, and every `lea` result flows only through
+//!    single-def copies/`lea`s into load/store address operands (never stored
+//!    as a value, passed to a call, or used in arithmetic).
+//!
+//!    The escape analysis reads explicit operands only. That is complete
+//!    because no instruction reads a virtual register anywhere else: every
+//!    implicit register access in the IR is to a physical register, either one
+//!    the opcode fixes (`div` on RDX:RAX, `push` on RSP) or one a call records
+//!    (`call_arg_regs`, `call_result_regs`). Other code therefore sees the
+//!    slot's address only after an explicit instruction has put it in a
+//!    physical register or in memory: `mov rdi, vN` or `lea rdi, [slot]`
+//!    before a call, `mov [rsp+k], vN` for a stack-passed argument,
+//!    `mov rax, vN` before `ret`. The analysis rejects each of those, because
+//!    none of them is a copy into a 64-bit virtual register or a plain
+//!    load/store that uses the address only to address memory, so a call
+//!    needs no rule of its own. Two compile-time checks keep this true:
+//!    `explicit_operands` destructures `X86ISelInst` and both call register
+//!    records with no rest pattern and binds each register as an `X86PReg`,
+//!    and the operand walkers (`collect_operand_vregs`,
+//!    `operand_mentions_stack_slot`) list every operand form. A new field, a
+//!    virtual register among a call's implicit registers, or a new operand
+//!    form is therefore a compile error in this pass, where the analysis
+//!    would otherwise miss the read.
 //!
 //! Downstream, every existing fail-closed stage (regalloc + validators,
 //! per-instruction certs — `Cmovcc`/`Cmovcc32` are inside the cert-covered
@@ -101,16 +134,20 @@
 //!
 //! # Kill switch
 //!
-//! The pass is registered ONLY under `TCG_X86_CMOV_SWAP=1` (mirrors
-//! `TCG_X86_TWOADDR_EXPAND` / the pre-flip `TCG_X86_WINDOW_SCAN` staging
-//! pattern): the default pipeline is byte-identical with the variable unset.
+//! The x86 pipeline registers this pass unless `TCG_NO_X86_CMOV_SWAP` is present.
+//! The old `TCG_X86_CMOV_SWAP=1` opt-in is not the current registration policy.
+//! Each rewrite also requires room for two fresh virtual-register IDs.
 
 use std::collections::{HashMap, HashSet};
 
 use trust_cg_ir::regs::{RegClass, VReg};
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
+use trust_cg_ir::x86_64_regs::X86PReg;
 use trust_cg_lower::instructions::Block;
+use trust_cg_lower::x86_64_isel::{X86CallArgReg, X86CallResultReg};
 use trust_cg_lower::{X86ISelBlock, X86ISelFunction, X86ISelInst, X86ISelOperand};
+
+use crate::x86_trap_block::is_pure_trap_block;
 
 use crate::mach_view::predecessor_map;
 use crate::x86_pass_manager::X86MachinePass;
@@ -118,8 +155,8 @@ use crate::x86_pass_manager::X86MachinePass;
 /// Maximum blocks walked backwards from the guard (prefix chain) and forwards
 /// through the arm chain. The b06 shape needs 3 and 5 respectively.
 const MAX_CHAIN_BLOCKS: usize = 8;
-/// Maximum conversions per run (defensive bound; each conversion strictly
-/// shrinks the function so this is never hit in practice).
+/// Maximum conversions per run; additional recognized regions remain unchanged
+/// once this bound is reached.
 const MAX_CONVERSIONS: usize = 64;
 /// Depth cap for the out-of-region single-def copy-chain resolver.
 const MAX_COPY_CHAIN: usize = 16;
@@ -156,7 +193,9 @@ impl X86MachinePass for X86CmovSwap {
             let Some(plan) = find_one(func) else {
                 break;
             };
-            apply(func, &plan);
+            if !apply(func, &plan) {
+                break;
+            }
             self.last_run_conversions += 1;
             changed = true;
         }
@@ -496,15 +535,33 @@ fn inst_has_preg(inst: &X86ISelInst) -> bool {
     inst.operands.iter().any(operand_has_preg)
 }
 
+/// Every virtual register named inside `op`. The escape analysis and the
+/// arm-use scan depend on this finding all of them, so every operand form is
+/// listed (no `_` arm, no `..` in the address forms): a new form, or a new
+/// field in an address form, is a compile error here until it is classified.
 fn collect_operand_vregs(op: &X86ISelOperand, out: &mut Vec<VReg>) {
     match op {
         X86ISelOperand::VReg(v) => out.push(*v),
-        X86ISelOperand::MemAddr { base, .. } => collect_operand_vregs(base, out),
-        X86ISelOperand::SibMemAddr { base, index, .. } => {
+        X86ISelOperand::MemAddr { base, disp: _ } => collect_operand_vregs(base, out),
+        X86ISelOperand::SibMemAddr {
+            base,
+            index,
+            scale: _,
+            disp: _,
+        } => {
             collect_operand_vregs(base, out);
             collect_operand_vregs(index, out);
         }
-        _ => {}
+        X86ISelOperand::PReg(_)
+        | X86ISelOperand::Imm(_)
+        | X86ISelOperand::FImm(_)
+        | X86ISelOperand::Block(_)
+        | X86ISelOperand::CondCode(_)
+        | X86ISelOperand::Symbol(_)
+        | X86ISelOperand::ExactModuleSymbol(_)
+        | X86ISelOperand::StackSlot(_)
+        | X86ISelOperand::ConstPoolEntry(_)
+        | X86ISelOperand::JumpTableIndex(_) => {}
     }
 }
 
@@ -756,15 +813,13 @@ enum Term {
     Other,
 }
 
+/// The shared pure-trap predicate (`crate::x86_trap_block`): a no-successor
+/// block that is exactly `[Ud2]` or `[Call abort, Ud2]`. Rule 3 of the module
+/// doc identifies an arm bounds check by its terminator's trap edge into such
+/// a block; the check is then required to be IDENTICAL to a dominating one,
+/// so the trap's exact shape only serves to tell the trap edge from `cont`.
 fn is_trap_block(func: &X86ISelFunction, b: Block) -> bool {
-    match func.blocks.get(&b) {
-        Some(blk) => {
-            blk.successors.is_empty()
-                && blk.insts.len() == 1
-                && blk.insts[0].opcode == X86Opcode::Ud2
-        }
-        None => false,
-    }
+    is_pure_trap_block(func, b)
 }
 
 /// Classify a block terminator structurally (no value numbering). Returns the
@@ -844,7 +899,7 @@ fn find_one(func: &X86ISelFunction) -> Option<SwapPlan> {
 
 fn try_guard(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
     guard: Block,
 ) -> Option<SwapPlan> {
     let gblock = func.blocks.get(&guard)?;
@@ -1020,6 +1075,13 @@ fn try_guard(
     // Re-materializable address operands, still current at the guard end.
     let a_op = validate_addr_operand(&mut vn, va_id)?;
     let b_op = validate_addr_operand(&mut vn, vb_id)?;
+    // The not-taken path gains both stores: prove each target is private,
+    // writable, in-bounds stack memory (module docs, condition 7).
+    if !load_has_proven_fixed_stack_write_range(&vn, &facts, va_id, width)
+        || !load_has_proven_fixed_stack_write_range(&vn, &facts, vb_id, width)
+    {
+        return None;
+    }
 
     // --- Arm chain scan. ---------------------------------------------------
     let mut arm_blocks: Vec<Block> = Vec::new();
@@ -1182,7 +1244,311 @@ fn validate_addr_operand(vn: &mut Vn<'_>, load_id: u32) -> Option<X86ISelOperand
     Some(rec.operand)
 }
 
-fn apply(func: &mut X86ISelFunction, plan: &SwapPlan) {
+/// Prove that replaying a guard-load address as an unconditional store cannot
+/// introduce a write fault or an externally visible store. The base must be a
+/// fixed-size stack slot whose address does not escape, and a dominating
+/// unsigned check on the exact SIB index must keep the whole access inside it.
+fn load_has_proven_fixed_stack_write_range(
+    vn: &Vn<'_>,
+    facts: &HashSet<CheckFact>,
+    load_id: u32,
+    width: u8,
+) -> bool {
+    let Some(rec) = vn.load_addr_ops.get(&load_id) else {
+        return false;
+    };
+    let VKey::LeaSlot(slot_id, base_disp) = vn.key(rec.base_id) else {
+        return false;
+    };
+    let Some(slot) = vn.func.stack_slots.get(slot_id as usize) else {
+        return false;
+    };
+    if slot.is_runtime_sized() {
+        return false;
+    }
+    if !fixed_stack_slot_address_does_not_escape(vn.func, slot_id) {
+        return false;
+    }
+    let Some(index_id) = rec.index_id else {
+        return false;
+    };
+    let X86ISelOperand::SibMemAddr { scale, disp, .. } = &rec.operand else {
+        return false;
+    };
+    let access_bytes = i128::from(width / 8);
+    if access_bytes == 0 {
+        return false;
+    }
+    let first_byte = i128::from(base_disp) + i128::from(*disp);
+    if first_byte < 0 {
+        return false;
+    }
+
+    facts.iter().any(|fact| {
+        if fact.value_id != index_id
+            || fact.cc != X86CondCode::B
+            || fact.jcc_to_trap
+            || fact.imm <= 0
+        {
+            return false;
+        }
+        // The check admits index values 0..imm (unsigned), so the last byte
+        // touched is at first_byte + (imm - 1) * scale + access_bytes - 1.
+        let last_exclusive =
+            first_byte + i128::from(fact.imm - 1) * i128::from(*scale) + access_bytes;
+        last_exclusive <= i128::from(slot.size)
+    })
+}
+
+/// Whether `slot` is named inside `op`. Every operand form is listed for the
+/// same reason as in `collect_operand_vregs`: the escape scan must see every
+/// mention of the slot.
+fn operand_mentions_stack_slot(op: &X86ISelOperand, slot: u32) -> bool {
+    match op {
+        X86ISelOperand::StackSlot(candidate) => *candidate == slot,
+        X86ISelOperand::MemAddr { base, disp: _ } => operand_mentions_stack_slot(base, slot),
+        X86ISelOperand::SibMemAddr {
+            base,
+            index,
+            scale: _,
+            disp: _,
+        } => operand_mentions_stack_slot(base, slot) || operand_mentions_stack_slot(index, slot),
+        X86ISelOperand::VReg(_)
+        | X86ISelOperand::PReg(_)
+        | X86ISelOperand::Imm(_)
+        | X86ISelOperand::FImm(_)
+        | X86ISelOperand::Block(_)
+        | X86ISelOperand::CondCode(_)
+        | X86ISelOperand::Symbol(_)
+        | X86ISelOperand::ExactModuleSymbol(_)
+        | X86ISelOperand::ConstPoolEntry(_)
+        | X86ISelOperand::JumpTableIndex(_) => false,
+    }
+}
+
+fn operand_mentions_vreg_as_address(op: &X86ISelOperand, value: VReg) -> bool {
+    matches!(
+        op,
+        X86ISelOperand::MemAddr { .. } | X86ISelOperand::SibMemAddr { .. }
+    ) && {
+        let mut mentioned = Vec::new();
+        collect_operand_vregs(op, &mut mentioned);
+        mentioned.contains(&value)
+    }
+}
+
+fn operand_mentions_vreg(op: &X86ISelOperand, value: VReg) -> bool {
+    let mut mentioned = Vec::new();
+    collect_operand_vregs(op, &mut mentioned);
+    mentioned.contains(&value)
+}
+
+fn is_ordinary_nonvolatile_memory_opcode(opcode: X86Opcode) -> bool {
+    matches!(
+        opcode,
+        X86Opcode::MovRM8
+            | X86Opcode::MovRM16
+            | X86Opcode::MovRM32
+            | X86Opcode::MovRM
+            | X86Opcode::MovMR8
+            | X86Opcode::MovMR16
+            | X86Opcode::MovMR32
+            | X86Opcode::MovMR
+            | X86Opcode::MovRMSib
+            | X86Opcode::MovMRSib
+            | X86Opcode::MovRM32Sib
+            | X86Opcode::MovMR32Sib
+            | X86Opcode::MovzxRM8
+            | X86Opcode::MovzxRM16
+            | X86Opcode::MovzxRM8Sib
+    )
+}
+
+/// An ordinary load/store whose only mentions of the tracked address are
+/// inside its memory operand.
+fn is_plain_memory_access(inst: &X86ISelInst, mentions_only_in_address: bool) -> bool {
+    let effect = crate::effects::x86_inst_effect(inst);
+    inst.proof_origin.is_none()
+        && is_ordinary_nonvolatile_memory_opcode(inst.opcode)
+        && !effect.is_barrier()
+        && (effect.reads_memory() || effect.writes_memory())
+        && mentions_only_in_address
+}
+
+/// The operands of `inst`, the only place it can name a virtual register or a
+/// stack slot, and so everything the escape analysis reads.
+///
+/// That is complete only while the IR's implicit register reads and writes (a
+/// call's argument and result registers) are physical registers (module docs,
+/// condition 7). `X86ISelInst` and both register records are destructured with
+/// no rest pattern and each register is bound as an `X86PReg`, so a new field,
+/// or a virtual register among the implicit reads, is a compile error here
+/// instead of a read the analysis cannot see.
+fn explicit_operands(inst: &X86ISelInst) -> &[X86ISelOperand] {
+    let X86ISelInst {
+        opcode: _,
+        operands,
+        flags: _,
+        proof_origin: _,
+        call_arg_regs,
+        call_result_regs,
+        internal_return_regs,
+        lowering_provenance: _,
+    } = inst;
+    for &X86CallArgReg { reg, read_bits: _ } in call_arg_regs {
+        let _: X86PReg = reg;
+    }
+    for &X86CallResultReg {
+        reg,
+        defined_bits: _,
+    } in call_result_regs
+        .iter()
+        .flatten()
+        .chain(internal_return_regs)
+    {
+        let _: X86PReg = reg;
+    }
+    operands
+}
+
+/// Every mention of `slot` in the function is a `lea` root or the address of
+/// an ordinary load/store, and every `lea` root flows only into load/store
+/// addresses. A slot never materialized into a register cannot escape.
+fn fixed_stack_slot_address_does_not_escape(func: &X86ISelFunction, slot: u32) -> bool {
+    let mut def_counts: HashMap<VReg, usize> = HashMap::new();
+    let mut roots = Vec::new();
+    for block_id in &func.block_order {
+        let Some(block) = func.blocks.get(block_id) else {
+            return false;
+        };
+        for inst in &block.insts {
+            if let Some(def) = inst_def_vreg(inst) {
+                *def_counts.entry(def).or_insert(0) += 1;
+            }
+            let operands = explicit_operands(inst);
+            if !operands
+                .iter()
+                .any(|op| operand_mentions_stack_slot(op, slot))
+            {
+                continue;
+            }
+            if let (
+                X86Opcode::Lea,
+                [
+                    X86ISelOperand::VReg(dst),
+                    X86ISelOperand::MemAddr { base, .. },
+                ],
+            ) = (inst.opcode, operands)
+                && base.as_ref() == &X86ISelOperand::StackSlot(slot)
+            {
+                roots.push(*dst);
+                continue;
+            }
+            let only_in_address = operands.iter().all(|op| {
+                !operand_mentions_stack_slot(op, slot)
+                    || matches!(
+                        op,
+                        X86ISelOperand::MemAddr { .. } | X86ISelOperand::SibMemAddr { .. }
+                    )
+            });
+            if !is_plain_memory_access(inst, only_in_address) {
+                return false;
+            }
+        }
+    }
+
+    let mut traced = HashSet::new();
+    let mut active = HashSet::new();
+    roots.into_iter().all(|root| {
+        trace_non_escaping_stack_address(func, &def_counts, root, &mut traced, &mut active)
+    })
+}
+
+/// Follow every use of a single-def stack address `value`: single-def
+/// `mov`/`lea` derivations are traced recursively, and any other use must be
+/// the address operand of an ordinary load/store.
+///
+/// Every other mention is an escape: a copy into a physical register (call
+/// argument or return value setup), a call or jump operand, a stored value,
+/// arithmetic. Operand 0 is skipped only when `inst_def_vreg` reads it as a
+/// def, which `x86_produces_value` decides per opcode. An indirect
+/// `JmpR [target]` defines nothing, so its operand is a source mention and is
+/// rejected here as a use that is not an address. A tied form that reads its
+/// operand 0 (`AddRR [v, x]`) also defines `v`, and the single-def
+/// requirement rejects that second def.
+fn trace_non_escaping_stack_address(
+    func: &X86ISelFunction,
+    def_counts: &HashMap<VReg, usize>,
+    value: VReg,
+    traced: &mut HashSet<VReg>,
+    active: &mut HashSet<VReg>,
+) -> bool {
+    if traced.contains(&value) {
+        return true;
+    }
+    if def_counts.get(&value).copied() != Some(1) || !active.insert(value) {
+        return false;
+    }
+
+    for block_id in &func.block_order {
+        let Some(block) = func.blocks.get(block_id) else {
+            return false;
+        };
+        for inst in &block.insts {
+            let operands = explicit_operands(inst);
+            let source_start = usize::from(inst_def_vreg(inst).is_some());
+            let sources = operands.get(source_start..).unwrap_or(&[]);
+            if !sources.iter().any(|op| operand_mentions_vreg(op, value)) {
+                continue;
+            }
+            if inst.proof_origin.is_some() {
+                return false;
+            }
+            let derived = match (inst.opcode, operands) {
+                (X86Opcode::MovRR, [X86ISelOperand::VReg(dst), X86ISelOperand::VReg(src)])
+                    if *src == value && dst.class == RegClass::Gpr64 =>
+                {
+                    Some(*dst)
+                }
+                (
+                    X86Opcode::Lea,
+                    [
+                        X86ISelOperand::VReg(dst),
+                        X86ISelOperand::MemAddr { base, .. },
+                    ],
+                ) if base.as_ref() == &X86ISelOperand::VReg(value)
+                    && dst.class == RegClass::Gpr64 =>
+                {
+                    Some(*dst)
+                }
+                _ => None,
+            };
+            if let Some(dst) = derived {
+                if !trace_non_escaping_stack_address(func, def_counts, dst, traced, active) {
+                    return false;
+                }
+                continue;
+            }
+            let only_in_address = sources.iter().all(|op| {
+                !operand_mentions_vreg(op, value) || operand_mentions_vreg_as_address(op, value)
+            });
+            if !is_plain_memory_access(inst, only_in_address) {
+                return false;
+            }
+        }
+    }
+
+    active.remove(&value);
+    traced.insert(value);
+    true
+}
+
+fn apply(func: &mut X86ISelFunction, plan: &SwapPlan) -> bool {
+    // Reserve both IDs before any mutation; a wrapped next_vreg could reuse
+    // existing registers even though the region itself matched correctly.
+    let Some(next_vreg) = func.next_vreg.checked_add(2) else {
+        return false;
+    };
     let (mov_op, cmov_op, store_op) = if plan.width == 32 {
         (
             X86Opcode::MovRR32,
@@ -1198,8 +1564,8 @@ fn apply(func: &mut X86ISelFunction, plan: &SwapPlan) {
         RegClass::Gpr64
     };
     let lo = VReg::new(func.next_vreg, class);
-    let hi = VReg::new(func.next_vreg + 1, class);
-    func.next_vreg += 2;
+    let hi = VReg::new(next_vreg - 1, class);
+    func.next_vreg = next_vreg;
     func.vreg_nominal_widths.insert(lo, plan.width as u32);
     func.vreg_nominal_widths.insert(hi, plan.width as u32);
 
@@ -1277,6 +1643,7 @@ fn apply(func: &mut X86ISelFunction, plan: &SwapPlan) {
     for b in &plan.arm_blocks {
         assert!(!func.blocks.contains_key(b), "arm block not deleted");
     }
+    true
 }
 
 /// Renumber every block to a gap-free `0..n` range following `block_order`
@@ -1284,7 +1651,7 @@ fn apply(func: &mut X86ISelFunction, plan: &SwapPlan) {
 /// regalloc replay).
 fn renumber_blocks_contiguous(func: &mut X86ISelFunction) {
     let len = func.block_order.len();
-    let remap: HashMap<Block, Block> = func
+    let remap: crate::fast_hash::FxHashMap<Block, Block> = func
         .block_order
         .iter()
         .enumerate()
@@ -1292,7 +1659,8 @@ fn renumber_blocks_contiguous(func: &mut X86ISelFunction) {
         .collect();
 
     let order = std::mem::take(&mut func.block_order);
-    let mut new_blocks: HashMap<Block, X86ISelBlock> = HashMap::with_capacity(len);
+    let mut new_blocks: crate::fast_hash::FxHashMap<Block, X86ISelBlock> =
+        crate::fast_hash::FxHashMap::with_capacity_and_hasher(len, Default::default());
     for old_id in &order {
         let Some(mut blk) = func.blocks.remove(old_id) else {
             continue;
@@ -1345,7 +1713,9 @@ fn renumber_blocks_contiguous(func: &mut X86ISelFunction) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trust_cg_lower::function::Signature;
+    use trust_cg_ir::function::StackSlotSizeSource;
+    use trust_cg_ir::x86_64_regs::{RAX, RDI, RSP};
+    use trust_cg_lower::function::{Signature, StackSlotInfo};
 
     fn v64(id: u32) -> VReg {
         VReg::new(id, RegClass::Gpr64)
@@ -1408,6 +1778,8 @@ mod tests {
     ///        v18=copy j, v19=j*4 (imul store idx scale-1)
     fn build_b06_like() -> X86ISelFunction {
         let mut f = X86ISelFunction::new("t".into(), empty_sig());
+        // Slot 0 is the fixed 256 x i32 sort array the checks bound.
+        f.stack_slots.push(StackSlotInfo::new(256 * 4, 16));
         let base = v64(0);
         let j = v64(1);
 
@@ -1588,6 +1960,37 @@ mod tests {
         p.last_run_conversions
     }
 
+    fn assert_vreg_exhaustion_declines_without_mutation(next_vreg: u32) {
+        let mut f = build_b06_like();
+        f.next_vreg = next_vreg;
+        assert!(find_one(&f).is_some(), "control must reach the rewrite");
+        let before = format!("{f:?}");
+        let mut pass = X86CmovSwap::new();
+        assert!(!pass.run(&mut f));
+        assert_eq!(pass.last_run_conversions, 0);
+        assert_eq!(format!("{f:?}"), before);
+    }
+
+    #[test]
+    fn declines_exhausted_vreg_counter_without_mutation() {
+        assert_vreg_exhaustion_declines_without_mutation(u32::MAX);
+    }
+
+    #[test]
+    fn declines_one_remaining_vreg_without_partial_mutation() {
+        assert_vreg_exhaustion_declines_without_mutation(u32::MAX - 1);
+    }
+
+    #[test]
+    fn admits_last_representable_vreg_pair() {
+        let mut f = build_b06_like();
+        f.next_vreg = u32::MAX - 2;
+        assert_eq!(run_pass(&mut f), 1);
+        assert_eq!(f.next_vreg, u32::MAX);
+        assert_eq!(f.vreg_nominal_widths.get(&v32(u32::MAX - 2)), Some(&32));
+        assert_eq!(f.vreg_nominal_widths.get(&v32(u32::MAX - 1)), Some(&32));
+    }
+
     #[test]
     fn converts_b06_shape() {
         let mut f = build_b06_like();
@@ -1631,13 +2034,60 @@ mod tests {
     }
 
     #[test]
+    fn converts_b06_shape_with_abort_call_trap() {
+        // The arm bounds checks trap into the bridge's `[Call abort, Ud2]`
+        // panic=abort assert block: a pure trap, so the arm converts exactly
+        // as with a bare `Ud2` sink.
+        let mut f = build_b06_like();
+        f.blocks.get_mut(&Block(10)).unwrap().insts = vec![
+            inst(
+                X86Opcode::Call,
+                vec![X86ISelOperand::Symbol("abort".to_string())],
+            ),
+            inst(X86Opcode::Ud2, vec![]),
+        ];
+        let n_before = f.block_order.len();
+        assert_eq!(run_pass(&mut f), 1);
+        assert_eq!(f.block_order.len(), n_before - 4);
+        assert!(
+            f.blocks
+                .values()
+                .any(|b| b.insts.iter().any(|i| i.opcode == X86Opcode::Cmovcc32))
+        );
+    }
+
+    #[test]
+    fn rejects_b06_shape_with_other_call_trap() {
+        // `[Call exit, Ud2]` is not a pure trap: the arm's checks are not
+        // recognized as bounds-check terminators and nothing converts.
+        let mut f = build_b06_like();
+        f.blocks.get_mut(&Block(10)).unwrap().insts = vec![
+            inst(
+                X86Opcode::Call,
+                vec![X86ISelOperand::Symbol("exit".to_string())],
+            ),
+            inst(X86Opcode::Ud2, vec![]),
+        ];
+        let n_before = f.block_order.len();
+        assert_eq!(run_pass(&mut f), 0);
+        assert_eq!(f.block_order.len(), n_before);
+        assert_eq!(
+            f.blocks
+                .values()
+                .filter(|b| b.insts.iter().any(|i| i.opcode == X86Opcode::Cmovcc32))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn converts_b06_shape_folded_stackslot_base() {
         // The SIB-base address fold (TCG_X86_SIB_BASE_FOLD) rewrites each array
         // access's base from the `Lea`-result VReg to the literal StackSlot the
         // LEA addressed. cmov-swap must STILL recognize the swap diamond and fire
         // on the folded shape (the StackSlot-SIB value-numbering: StackSlot(s) is
         // modeled identically to a VReg that Leas slot s). Before the fix this
-        // regressed b06 (+55%) because the folded loads were left Unmodeled.
+        // missed this shape because the folded loads were left Unmodeled.
         let mut f = build_b06_like();
         // Simulate the fold: SibMemAddr{ base: VReg(0=the &arr Lea), .. } ->
         // base: StackSlot(0). The fold folds the LEA disp (0 here) into the SIB
@@ -1659,6 +2109,131 @@ mod tests {
             1,
             "cmov-swap must fire on the folded shape"
         );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn converts_folded_stackslot_base_without_materialized_address() {
+        // After the SIB-base fold, the `Lea` of the array slot is dead. With it
+        // removed the slot address never reaches a register, so it cannot
+        // escape; the fixed-slot range proof alone admits the rewrite.
+        let mut f = build_b06_like();
+        for b in f.blocks.values_mut() {
+            for i in &mut b.insts {
+                for op in &mut i.operands {
+                    if let X86ISelOperand::SibMemAddr { base, .. } = op
+                        && matches!(base.as_ref(), X86ISelOperand::VReg(v) if v.id == 0)
+                    {
+                        **base = X86ISelOperand::StackSlot(0);
+                    }
+                }
+            }
+        }
+        f.blocks.get_mut(&Block(0)).unwrap().insts.remove(0);
+        assert_eq!(run_pass(&mut f), 1);
+    }
+
+    #[test]
+    fn accepts_last_element_at_fixed_stack_slot_boundary() {
+        // The checked index range [0, 256) at scale 4 ends exactly at the
+        // slot's last byte.
+        let mut f = build_b06_like();
+        assert_eq!(f.stack_slots[0].size, 256 * 4);
+        assert_eq!(run_pass(&mut f), 1);
+    }
+
+    #[test]
+    fn rejects_non_stack_base_for_speculative_stores() {
+        // A base of unknown provenance (heap, global, shared memory): the
+        // not-taken path would gain a write the program never performed.
+        let mut f = build_b06_like();
+        let b0 = f.blocks.get_mut(&Block(0)).unwrap();
+        b0.insts[0] = inst(
+            X86Opcode::Lea,
+            vec![
+                ovr(v64(0)),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(ovr(v64(63))),
+                    disp: 0,
+                },
+            ],
+        );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_stack_slot_address_stored_as_value() {
+        // The slot's address is published to memory, so another thread or
+        // callee may observe the speculative store.
+        let mut f = build_b06_like();
+        let b0 = f.blocks.get_mut(&Block(0)).unwrap();
+        b0.insts.insert(
+            1,
+            inst(
+                X86Opcode::MovMR,
+                vec![
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(ovr(v64(63))),
+                        disp: 0,
+                    },
+                    ovr(v64(0)),
+                ],
+            ),
+        );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_stack_slot_address_escape_through_copy() {
+        let mut f = build_b06_like();
+        let b0 = f.blocks.get_mut(&Block(0)).unwrap();
+        b0.insts
+            .insert(1, inst(X86Opcode::MovRR, vec![ovr(v64(62)), ovr(v64(0))]));
+        b0.insts.insert(
+            2,
+            inst(
+                X86Opcode::MovMR,
+                vec![
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(ovr(v64(63))),
+                        disp: 0,
+                    },
+                    ovr(v64(62)),
+                ],
+            ),
+        );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_missing_stack_slot_metadata_for_speculative_stores() {
+        let mut f = build_b06_like();
+        f.stack_slots.clear();
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_runtime_sized_stack_slot_for_speculative_stores() {
+        let mut f = build_b06_like();
+        f.stack_slots[0] = StackSlotInfo::new_dynamic(StackSlotSizeSource::Unknown, 16);
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_stack_slot_one_byte_too_small_for_speculative_stores() {
+        let mut f = build_b06_like();
+        f.stack_slots[0] = StackSlotInfo::new(256 * 4 - 1, 16);
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_checked_index_range_that_can_escape_stack_slot() {
+        // Every check admits index 256, one element past the slot's end.
+        let mut f = build_b06_like();
+        for (block, cmp_pos) in [(1, 2), (2, 2), (5, 2), (6, 2), (7, 4)] {
+            let cmp = &mut f.blocks.get_mut(&Block(block)).unwrap().insts[cmp_pos];
+            cmp.operands[1] = imm(257);
+        }
         assert_eq!(run_pass(&mut f), 0);
     }
 
@@ -1734,5 +2309,226 @@ mod tests {
             ),
         );
         assert_eq!(run_pass(&mut f), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Call-argument and other register escapes (condition 7). A call reads its
+    // argument registers implicitly (`call_arg_regs`) and never names the
+    // virtual register that holds the address, so each escape below must be
+    // caught at the explicit instruction that fills a physical register or
+    // the outgoing stack area. These are the call-argument shapes x86 ISel
+    // emits: `mov <argreg>, src`, the sret move, and `[rsp+k]` stores.
+    // -----------------------------------------------------------------------
+
+    fn preg(r: X86PReg) -> X86ISelOperand {
+        X86ISelOperand::PReg(r)
+    }
+
+    /// A void call that reads `arg_regs` implicitly, as ISel emits it.
+    fn call_reading(arg_regs: &[X86PReg]) -> X86ISelInst {
+        X86ISelInst::new(
+            X86Opcode::Call,
+            vec![X86ISelOperand::Symbol("observe".into())],
+        )
+        .with_call_arg_regs(arg_regs.iter().copied().map(X86CallArgReg::full).collect())
+        .with_call_result_regs(Vec::new())
+    }
+
+    /// Insert `insts` in the exit block, before its `ret`: the sorted array
+    /// is handed to (or returned for) other code after the loop.
+    fn before_exit_ret(f: &mut X86ISelFunction, insts: Vec<X86ISelInst>) {
+        let exit = f.blocks.get_mut(&Block(11)).unwrap();
+        let ret = exit.insts.pop().expect("exit block ends in ret");
+        assert_eq!(ret.opcode, X86Opcode::Ret);
+        exit.insts.extend(insts);
+        exit.insts.push(ret);
+    }
+
+    /// Apply the SIB-base address fold to the array accesses (base `v0` ->
+    /// the literal slot), keeping or dropping the `lea v0, [slot0]` root. With
+    /// the fold, value numbering reads the slot straight from the SIB base and
+    /// never consults `v0`, so a rejection of the folded shape comes from the
+    /// escape analysis alone.
+    fn fold_array_base(f: &mut X86ISelFunction, keep_lea: bool) {
+        for b in f.blocks.values_mut() {
+            for i in &mut b.insts {
+                for op in &mut i.operands {
+                    if let X86ISelOperand::SibMemAddr { base, .. } = op
+                        && matches!(base.as_ref(), X86ISelOperand::VReg(v) if v.id == 0)
+                    {
+                        **base = X86ISelOperand::StackSlot(0);
+                    }
+                }
+            }
+        }
+        if !keep_lea {
+            let lea = f.blocks.get_mut(&Block(0)).unwrap().insts.remove(0);
+            assert_eq!(lea.opcode, X86Opcode::Lea);
+        }
+    }
+
+    fn lea_slot0(dst: X86ISelOperand) -> X86ISelInst {
+        inst(
+            X86Opcode::Lea,
+            vec![
+                dst,
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::StackSlot(0)),
+                    disp: 0,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn converts_when_call_argument_is_not_the_stack_address() {
+        // Control for the tests below: the same call, given the loop counter
+        // instead of the array address, leaves the conversion intact. The
+        // rejections below are caused by the address reaching the call, not by
+        // the call being present.
+        let mut f = build_b06_like();
+        before_exit_ret(
+            &mut f,
+            vec![
+                inst(X86Opcode::MovRR, vec![preg(RDI), ovr(v64(1))]),
+                call_reading(&[RDI]),
+            ],
+        );
+        assert_eq!(run_pass(&mut f), 1);
+    }
+
+    #[test]
+    fn rejects_stack_slot_address_moved_into_argument_register_for_call() {
+        // `mov rdi, v0; call observe` with RDI in `call_arg_regs`: the call
+        // does not list v0, so the copy into RDI is where the escape is seen.
+        for folded in [false, true] {
+            let mut f = build_b06_like();
+            if folded {
+                fold_array_base(&mut f, true);
+            }
+            before_exit_ret(
+                &mut f,
+                vec![
+                    inst(X86Opcode::MovRR, vec![preg(RDI), ovr(v64(0))]),
+                    call_reading(&[RDI]),
+                ],
+            );
+            assert_eq!(run_pass(&mut f), 0, "folded base: {folded}");
+        }
+    }
+
+    #[test]
+    fn rejects_stack_slot_lea_into_argument_register_for_call() {
+        // `lea rdi, [slot0]; call observe`: the address goes straight into
+        // the argument register, with no virtual register to trace.
+        let mut f = build_b06_like();
+        fold_array_base(&mut f, false);
+        assert_eq!(
+            run_pass(&mut f.clone()),
+            1,
+            "control: folded shape converts"
+        );
+        before_exit_ret(&mut f, vec![lea_slot0(preg(RDI)), call_reading(&[RDI])]);
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_bare_stack_slot_moved_into_argument_register_for_call() {
+        // The sret-style `mov rdi, <slot>` with the slot as a bare operand.
+        let mut f = build_b06_like();
+        fold_array_base(&mut f, false);
+        before_exit_ret(
+            &mut f,
+            vec![
+                inst(
+                    X86Opcode::MovRR,
+                    vec![preg(RDI), X86ISelOperand::StackSlot(0)],
+                ),
+                call_reading(&[RDI]),
+            ],
+        );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_stack_slot_address_reaching_argument_register_through_derivations() {
+        // v62 = v0; v61 = v62 + 8; mov rdi, v61; call: both derivations are
+        // traced, and the copy of the derived address into RDI is the escape.
+        let mut f = build_b06_like();
+        before_exit_ret(
+            &mut f,
+            vec![
+                inst(X86Opcode::MovRR, vec![ovr(v64(62)), ovr(v64(0))]),
+                inst(
+                    X86Opcode::Lea,
+                    vec![
+                        ovr(v64(61)),
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(ovr(v64(62))),
+                            disp: 8,
+                        },
+                    ],
+                ),
+                inst(X86Opcode::MovRR, vec![preg(RDI), ovr(v64(61))]),
+                call_reading(&[RDI]),
+            ],
+        );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_stack_slot_address_stored_to_outgoing_argument_area() {
+        // A stack-passed argument: `mov [rsp], v0; call observe`.
+        let mut f = build_b06_like();
+        before_exit_ret(
+            &mut f,
+            vec![
+                inst(
+                    X86Opcode::MovMR,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(preg(RSP)),
+                            disp: 0,
+                        },
+                        ovr(v64(0)),
+                    ],
+                ),
+                call_reading(&[]),
+            ],
+        );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_stack_slot_address_returned_in_rax() {
+        let mut f = build_b06_like();
+        before_exit_ret(
+            &mut f,
+            vec![inst(X86Opcode::MovRR, vec![preg(RAX), ovr(v64(0))])],
+        );
+        assert_eq!(run_pass(&mut f), 0);
+    }
+
+    #[test]
+    fn rejects_stack_slot_address_as_indirect_jump_target() {
+        // `JmpR [target]` defines nothing (`x86_produces_value` is false),
+        // so the trace sees its operand as a source mention that is not an
+        // address and rejects it as an escape. Pin the rejection for the root
+        // and for a derived copy.
+        for through_copy in [false, true] {
+            let mut f = build_b06_like();
+            fold_array_base(&mut f, true);
+            let mut insts = Vec::new();
+            let target = if through_copy {
+                insts.push(inst(X86Opcode::MovRR, vec![ovr(v64(62)), ovr(v64(0))]));
+                v64(62)
+            } else {
+                v64(0)
+            };
+            insts.push(inst(X86Opcode::JmpR, vec![ovr(target)]));
+            add_block(&mut f, Block(12), insts, vec![]);
+            f.block_order.push(Block(12));
+            assert_eq!(run_pass(&mut f), 0, "through copy: {through_copy}");
+        }
     }
 }

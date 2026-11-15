@@ -45,6 +45,10 @@ pub enum MachORelocationError {
     },
     #[error("Mach-O relocation storage allocation failed")]
     StorageAllocationFailed,
+    /// An ELF-only fixup kind has no Mach-O `r_type`; its discriminant does
+    /// not fit (or aliases a real type in) the 4-bit `r_type` field.
+    #[error("ELF-only relocation kind {kind:?} has no Mach-O ARM64 r_type")]
+    ElfOnlyKind { kind: AArch64RelocKind },
 }
 
 pub(crate) fn validate_macho_relocation_fields(
@@ -160,9 +164,65 @@ pub enum AArch64RelocKind {
     /// GOT slot. ELF-only; Mach-O conversion fails closed. Always carries
     /// `tls_model: Some(TlsModel::InitialExec)`.
     ElfTlsieLd64GottprelLo12Nc = 15,
+    /// ELF `R_AARCH64_TLSDESC_ADR_PAGE21` carrier: the `ADRP x0,
+    /// :tlsdesc:sym` slot of the general-dynamic TLS descriptor sequence.
+    /// ELF-only; Mach-O conversion fails closed. Always carries
+    /// `tls_model: Some(TlsModel::GeneralDynamic)`.
+    ElfTlsdescAdrPage21 = 16,
+    /// ELF `R_AARCH64_TLSDESC_LD64_LO12` carrier: the `LDR x1, [x0,
+    /// #:tlsdesc_lo12:sym]` resolver load. ELF-only. Always carries
+    /// `tls_model: Some(TlsModel::GeneralDynamic)`.
+    ElfTlsdescLd64Lo12 = 17,
+    /// ELF `R_AARCH64_TLSDESC_ADD_LO12` carrier: the `ADD x0, x0,
+    /// #:tlsdesc_lo12:sym` descriptor-address slot. ELF-only. Always carries
+    /// `tls_model: Some(TlsModel::GeneralDynamic)`.
+    ElfTlsdescAddLo12 = 18,
+    /// ELF `R_AARCH64_TLSDESC_CALL` marker on the `BLR x1` resolver call
+    /// (`.tlsdesccall sym`): it changes no bits of an unrelaxed call and
+    /// tells the static linker which slot to rewrite when it relaxes the
+    /// sequence. ELF-only. Always carries
+    /// `tls_model: Some(TlsModel::GeneralDynamic)`.
+    ElfTlsdescCall = 19,
+    /// ELF `R_AARCH64_LDST8_ABS_LO12_NC` carrier: the byte `LDR/STR Rt, [Xn,
+    /// #:lo12:sym]` half of a fused direct `ADRP` + memory-access pair. The
+    /// five `ElfLdst*` kinds are ELF-only (Mach-O conversion fails closed) and
+    /// are emitted only when the symbol's placement guarantees the access-size
+    /// alignment the scaled field requires (see
+    /// [`crate::elf::AArch64RelocType::lo12_access_size`]).
+    ElfLdst8AbsLo12Nc = 20,
+    /// ELF `R_AARCH64_LDST16_ABS_LO12_NC` carrier (halfword access).
+    ElfLdst16AbsLo12Nc = 21,
+    /// ELF `R_AARCH64_LDST32_ABS_LO12_NC` carrier (word / S-register access).
+    ElfLdst32AbsLo12Nc = 22,
+    /// ELF `R_AARCH64_LDST64_ABS_LO12_NC` carrier (doubleword / D-register access).
+    ElfLdst64AbsLo12Nc = 23,
+    /// ELF `R_AARCH64_LDST128_ABS_LO12_NC` carrier (Q-register access).
+    ElfLdst128AbsLo12Nc = 24,
 }
 
 impl AArch64RelocKind {
+    /// Whether this is an ELF-only symbolic fixup kind (the TLSLE, TLSIE and
+    /// TLSDESC carriers and the fused `ElfLdst*` lo12 memory carriers). Every
+    /// ELF-only kind's discriminant lies outside the Mach-O ARM64 `r_type`
+    /// range `0..=11`, so this is exactly the set Mach-O relocation
+    /// conversion must refuse; it must never serialize into a Mach-O
+    /// relocation record.
+    pub fn is_elf_only(self) -> bool {
+        (self as u8) > (AArch64RelocKind::AuthenticatedPointer as u8)
+    }
+
+    /// The fused lo12 memory-access carrier for an access of `size` bytes.
+    pub fn elf_ldst_lo12_for_access_size(size: u32) -> Option<Self> {
+        match size {
+            1 => Some(Self::ElfLdst8AbsLo12Nc),
+            2 => Some(Self::ElfLdst16AbsLo12Nc),
+            4 => Some(Self::ElfLdst32AbsLo12Nc),
+            8 => Some(Self::ElfLdst64AbsLo12Nc),
+            16 => Some(Self::ElfLdst128AbsLo12Nc),
+            _ => None,
+        }
+    }
+
     /// Returns whether this relocation type is PC-relative by default.
     ///
     /// Branch26 and Page21 are inherently PC-relative. Pageoff12 is not
@@ -229,6 +289,11 @@ impl Relocation {
     /// Validate that this value can be represented as an ordinary (not
     /// scattered) Mach-O `relocation_info` record.
     pub fn validate(&self) -> Result<(), MachORelocationError> {
+        // `r_type` is a 4-bit field: an ELF-only kind would encode as an
+        // invalid type (12..=15) or, from 16 up, alias a real ARM64 type.
+        if self.kind.is_elf_only() {
+            return Err(MachORelocationError::ElfOnlyKind { kind: self.kind });
+        }
         validate_macho_relocation_fields(self.offset, self.symbol_index, self.length)
     }
 
@@ -542,6 +607,83 @@ mod tests {
 
     fn encode_relocation(reloc: &Relocation) -> [u8; 8] {
         super::encode_relocation(reloc).unwrap()
+    }
+
+    /// ELF-only kinds are exactly the discriminants outside the Mach-O ARM64
+    /// `r_type` range, and a Mach-O relocation record refuses them: from 16
+    /// up they would otherwise alias `UNSIGNED`..`PAGE21` in the 4-bit field.
+    #[test]
+    fn elf_only_kinds_are_outside_the_r_type_range_and_never_encode() {
+        use AArch64RelocKind as K;
+        let all = [
+            K::Unsigned,
+            K::Subtractor,
+            K::Branch26,
+            K::Page21,
+            K::Pageoff12,
+            K::GotLoadPage21,
+            K::GotLoadPageoff12,
+            K::PointerToGot,
+            K::TlvpLoadPage21,
+            K::TlvpLoadPageoff12,
+            K::Addend,
+            K::AuthenticatedPointer,
+            K::ElfTlsleAddTprelHi12,
+            K::ElfTlsleAddTprelLo12Nc,
+            K::ElfTlsieAdrGottprelPage21,
+            K::ElfTlsieLd64GottprelLo12Nc,
+            K::ElfTlsdescAdrPage21,
+            K::ElfTlsdescLd64Lo12,
+            K::ElfTlsdescAddLo12,
+            K::ElfTlsdescCall,
+            K::ElfLdst8AbsLo12Nc,
+            K::ElfLdst16AbsLo12Nc,
+            K::ElfLdst32AbsLo12Nc,
+            K::ElfLdst64AbsLo12Nc,
+            K::ElfLdst128AbsLo12Nc,
+        ];
+        for kind in all {
+            // Exhaustive on purpose: a new kind must be classified here.
+            let elf_only = match kind {
+                K::Unsigned
+                | K::Subtractor
+                | K::Branch26
+                | K::Page21
+                | K::Pageoff12
+                | K::GotLoadPage21
+                | K::GotLoadPageoff12
+                | K::PointerToGot
+                | K::TlvpLoadPage21
+                | K::TlvpLoadPageoff12
+                | K::Addend
+                | K::AuthenticatedPointer => false,
+                K::ElfTlsleAddTprelHi12
+                | K::ElfTlsleAddTprelLo12Nc
+                | K::ElfTlsieAdrGottprelPage21
+                | K::ElfTlsieLd64GottprelLo12Nc
+                | K::ElfTlsdescAdrPage21
+                | K::ElfTlsdescLd64Lo12
+                | K::ElfTlsdescAddLo12
+                | K::ElfTlsdescCall
+                | K::ElfLdst8AbsLo12Nc
+                | K::ElfLdst16AbsLo12Nc
+                | K::ElfLdst32AbsLo12Nc
+                | K::ElfLdst64AbsLo12Nc
+                | K::ElfLdst128AbsLo12Nc => true,
+            };
+            assert_eq!(kind.is_elf_only(), elf_only, "{kind:?}");
+            assert_eq!(elf_only, kind as u8 > 11, "{kind:?}");
+            let reloc = Relocation::new(0x10, 1, kind);
+            if elf_only {
+                assert_eq!(
+                    super::encode_relocation(&reloc),
+                    Err(MachORelocationError::ElfOnlyKind { kind })
+                );
+            } else {
+                let word1 = u32::from_le_bytes(encode_relocation(&reloc)[4..8].try_into().unwrap());
+                assert_eq!(word1 >> 28, kind as u32, "{kind:?}");
+            }
+        }
     }
 
     #[test]

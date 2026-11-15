@@ -428,11 +428,14 @@ impl EliminationVerdict {
 /// pass cannot fabricate authorization. The `validation_hash` binds guard kind, operand
 /// fingerprint, obligation id, discharge status, and lineage digest, and is independently
 /// re-derivable via [`EliminationCertificate::recompute_validation_hash`].
+/// The certificate also owns the exact ordered operands. Re-checking compares
+/// those operands directly; a matching fingerprint alone grants no authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EliminationCertificate {
     certificate_id: u128,
     guard_kind: GuardKind,
     operand_fingerprint: u128,
+    operands: Box<[GuardOperandRef]>,
     obligation_id: u128,
     discharge_status: DischargeStatus,
     lineage_digest: Option<u128>,
@@ -445,6 +448,7 @@ impl EliminationCertificate {
     fn mint(
         guard_kind: GuardKind,
         operand_fingerprint: u128,
+        operands: &[GuardOperandRef],
         obligation_id: u128,
         discharge_status: DischargeStatus,
         lineage_digest: Option<u128>,
@@ -461,6 +465,7 @@ impl EliminationCertificate {
             certificate_id: validation_hash,
             guard_kind,
             operand_fingerprint,
+            operands: operands.into(),
             obligation_id,
             discharge_status,
             lineage_digest,
@@ -505,6 +510,14 @@ impl EliminationCertificate {
     pub fn is_internally_consistent(&self) -> bool {
         self.validation_hash == self.recompute_validation_hash()
             && self.certificate_id == self.validation_hash
+            && self.operand_fingerprint == fingerprint_operands(&self.operands)
+    }
+
+    /// A fingerprint is a cache, not exact operand authority. Keeping this
+    /// comparison separate also lets tests exercise the collision condition
+    /// without assuming or manufacturing a collision in the production hash.
+    fn matches_operands(&self, observed: &[GuardOperandRef], fingerprint: u128) -> bool {
+        self.operands.as_ref() == observed && self.operand_fingerprint == fingerprint
     }
 }
 
@@ -595,6 +608,7 @@ pub fn decide(
     let certificate = EliminationCertificate::mint(
         receipt.kind,
         receipt.operand_identity.fingerprint,
+        &receipt.operand_identity.operands,
         obligation_id,
         status,
         cert_lineage,
@@ -613,8 +627,9 @@ pub enum RecheckOutcome {
 
 /// Independently re-validate a certificate against the *observed* carrier operands and the
 /// evidence — the re-checker's "different path" (S4). Unlike [`decide`], this starts from the
-/// operands actually present at the elimination site and re-derives the fingerprint, so an
-/// elimination whose operands drifted (or whose obligation is not really discharged) is rejected.
+/// operands actually present at the elimination site, compares them with the exact minted
+/// operands and re-derives the fingerprint. Operand drift is rejected even if fingerprints
+/// collide. Discharge and lineage are independently rechecked below.
 pub fn recheck_elimination(
     certificate: &EliminationCertificate,
     observed_operands: &[GuardOperandRef],
@@ -635,10 +650,11 @@ pub fn recheck_elimination(
             reason: "no observed operands at elimination site",
         };
     }
-    // Re-derive the operand fingerprint from what is actually at the site.
-    if fingerprint_operands(observed_operands) != certificate.operand_fingerprint {
+    // Compare the exact ordered, tagged operands as well as their cached
+    // fingerprint. Hash collision freedom is not an operand-identity premise.
+    if !certificate.matches_operands(observed_operands, fingerprint_operands(observed_operands)) {
         return RecheckOutcome::Rejected {
-            reason: "observed operands do not match certificate fingerprint",
+            reason: "observed operands do not match certificate identity",
         };
     }
     // Re-confirm discharge status and lineage from the evidence, independently.
@@ -1106,6 +1122,53 @@ mod tests {
     }
 
     // --- Independent re-check (the S4 "different path"). ---
+
+    #[test]
+    fn exact_operand_identity_rejects_even_when_fingerprints_agree() {
+        let mut evidence = DischargedEvidenceTable::new();
+        evidence.insert(42, DischargeStatus::Discharged, None);
+        let ops = bounds_ops();
+        let receipt = GuardObligationReceipt {
+            kind: GuardKind::BoundsCheck,
+            operand_identity: ops.clone(),
+            proof_obligation_id: Some(42),
+            lineage_digest: None,
+        };
+        let cert = decide(&receipt, &evidence).certificate().cloned().unwrap();
+        assert!(cert.is_internally_consistent());
+        assert!(cert.matches_operands(&ops.operands, ops.fingerprint));
+        // Supply an agreeing fingerprint deliberately: this exercises the
+        // collision condition, without claiming to find a real FNV collision.
+        for drifted in [
+            vec![
+                GuardOperandRef::Reg(10),
+                GuardOperandRef::Reg(999),
+                GuardOperandRef::Imm(64),
+            ],
+            vec![
+                GuardOperandRef::Reg(10),
+                GuardOperandRef::Imm(11),
+                GuardOperandRef::Imm(64),
+            ],
+            vec![
+                GuardOperandRef::Reg(11),
+                GuardOperandRef::Reg(10),
+                GuardOperandRef::Imm(64),
+            ],
+            vec![GuardOperandRef::Reg(10), GuardOperandRef::Reg(11)],
+        ] {
+            assert!(!cert.matches_operands(&drifted, ops.fingerprint));
+        }
+        // Rewriting the source receipt after minting cannot retarget the
+        // certificate's owned identity.
+        let mut rewritten = receipt;
+        rewritten.operand_identity.operands[0] = GuardOperandRef::Reg(99);
+        assert!(cert.matches_operands(&ops.operands, ops.fingerprint));
+        assert_eq!(
+            recheck_elimination(&cert, &ops.operands, &evidence),
+            RecheckOutcome::Valid
+        );
+    }
 
     #[test]
     fn recheck_accepts_matching_and_rejects_drift() {

@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test (FUZZ-7): PANIC=UNWIND raise semantics on x86_64 — whole
 // std binaries compiled via the rustc_codegen_trust_cg bridge, RUN, and their
@@ -50,7 +54,8 @@ mod target_dir_support;
 //     trap under `panic=unwind`: same skipped-Drops SIGILL class. Fixed by
 //     routing the failure edge through `intercepted_bounds_check_fail_target`
 //     (raise honoring the intercepted call's unwind edge; trap kept for
-//     abort/nounwind). `subslice_oob_guard` exit 47 / `split_at_oob_guard`
+//     abort/nounwind), since replaced by std's own derived route
+//     (`std_panic_route::fail_target`, OD-58). `subslice_oob_guard` exit 47 / `split_at_oob_guard`
 //     exit 53, no-guard variants exit 101, in-bounds controls.
 //  5. [TCG-TRACK-CALLER-DIVERGE] A diverging call to a PRECOMPILED std
 //     `#[track_caller]` panic helper OUTSIDE `core::panicking`
@@ -58,7 +63,8 @@ mod target_dir_support;
 //     `&'static Location` register — the entry dereferenced it and died with
 //     SIGSEGV (exit 139) instead of panicking. PRE-EXISTING under BOTH panic
 //     strategies; fixed by lowering such calls as the synthesized raise
-//     (`unwrap_none`, `expect_err` — exit 101).
+//     (`unwrap_none`, `expect_err` — exit 101). That raise is gone: the
+//     ordinary call path passes the real Location and payload (OD-58).
 //
 // The panic message TEXT for synthesized raises is the long-accepted cosmetic
 // deviation; what these programs pin is the VALUE-OBSERVABLE raise semantics:
@@ -69,68 +75,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run panic-unwind test"
-    );
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -155,13 +107,21 @@ fn backend_arg(dylib: &Path) -> std::ffi::OsString {
 fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>, opt: &str) -> PathBuf {
     let src_path = dir.join(format!("{name}.rs"));
     std::fs::write(&src_path, src).expect("write source");
-    let bin = dir.join(format!("{name}_{opt}{}", if backend.is_some() { "_tcg" } else { "_llvm" }));
+    let bin = dir.join(format!(
+        "{name}_{opt}{}",
+        if backend.is_some() { "_tcg" } else { "_llvm" }
+    ));
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
+        // An execution differential, not a certification test: certified
+        // compiles refuse objects with exception tables ([TCG-EH-UNPROVED]),
+        // and every x86-64 object compiled under panic=unwind carries them
+        // (walk-through filler tables included), so compile without proof
+        // certificates.
+        cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
     }
     cmd.args(["--target", TARGET, "-Cpanic=unwind"])
         .arg(format!("-Copt-level={opt}"))
@@ -172,7 +132,11 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>, opt: &str)
     assert!(
         output.status.success(),
         "compile of `{name}` (O{opt}) failed ({} backend). stderr: <<<{}>>>",
-        if backend.is_some() { "trust-cg" } else { "llvm" },
+        if backend.is_some() {
+            "trust-cg"
+        } else {
+            "llvm"
+        },
         String::from_utf8_lossy(&output.stderr)
     );
     bin
@@ -598,8 +562,14 @@ fn double_panic_aborts_like_llvm() {
                fn main() { let _d = D(black_box(7u64)); panic!(\"first\"); }\n";
     let llvm_bin = compile(&dir, "dblpanic", src, None, "0");
     let tcg_bin = compile(&dir, "dblpanic", src, Some(&dylib), "0");
-    let llvm_status = Command::new(&llvm_bin).output().expect("run llvm binary").status;
-    let tcg_status = Command::new(&tcg_bin).output().expect("run tcg binary").status;
+    let llvm_status = Command::new(&llvm_bin)
+        .output()
+        .expect("run llvm binary")
+        .status;
+    let tcg_status = Command::new(&tcg_bin)
+        .output()
+        .expect("run tcg binary")
+        .status;
     assert_eq!(
         llvm_status.signal(),
         Some(libc_sigabrt()),
@@ -626,9 +596,9 @@ fn libc_sigabrt() -> i32 {
 /// direct-`panic(&str)` pass-through never fired and the raise printed the
 /// synthesized "message not lowered by trust-cg" text. Now the `Arguments` is
 /// decoded (`decode_pure_literal_fmt_arguments`) and the REAL literal is
-/// raised: the message line must BYTE-MATCH LLVM's. Formatted panics stay
-/// synthesized — pinned here as "never a WRONG/partial message" (the tcg
-/// message must not be the bare format prefix) with unchanged exit codes.
+/// raised: the message line must BYTE-MATCH LLVM's. A FORMATTED panic is no
+/// longer a panic block: it is lowered as the ordinary `panic_fmt` call with
+/// its real `Arguments`, so its message must byte-match LLVM's too.
 #[test]
 fn literal_panic_message_matches_llvm() {
     if !host_is_x86_64() {
@@ -697,9 +667,9 @@ fn literal_panic_message_matches_llvm() {
             "internal error: entered unreachable code",
             true,
         ),
-        // A FORMATTED panic (runtime placeholder): stays on the synthesized
-        // path. What is pinned: the tcg message is never the WRONG/partial
-        // literal (the bare "value " prefix), and the exit code matches.
+        // A FORMATTED panic (runtime placeholder): the real `panic_fmt` call
+        // with its real `Arguments` (`exact_panic_block_message` admits no
+        // formatted payload), so the message is exact.
         (
             "fmt_panic",
             "use std::hint::black_box;\n\
@@ -707,7 +677,7 @@ fn literal_panic_message_matches_llvm() {
                          if n > 2 { panic!(\"value {}\", n); } \
                          std::process::exit(7); }\n",
             "value 3",
-            false,
+            true,
         ),
     ];
 
@@ -735,18 +705,6 @@ fn literal_panic_message_matches_llvm() {
                     tcg_msg, llvm_msg,
                     "`{name}` (O{opt}): trust-cg literal panic message is not byte-exact"
                 );
-            } else {
-                // Synthesized is accepted; a WRONG or PARTIAL message is not.
-                assert_ne!(
-                    tcg_msg, "value ",
-                    "`{name}` (O{opt}): trust-cg printed a PARTIAL format template — \
-                     worse than the synthesized message"
-                );
-                assert!(
-                    tcg_msg == llvm_msg || tcg_msg.contains("message not lowered by trust-cg"),
-                    "`{name}` (O{opt}): formatted panic message neither exact nor the \
-                     synthesized text: <<<{tcg_msg}>>>"
-                );
             }
         }
     }
@@ -762,8 +720,8 @@ fn literal_panic_message_matches_llvm() {
 /// + exit 101), while the non-panic path silently "worked" (register never
 /// read) — a latent, reachable miscompile under BOTH panic strategies. Fixed
 /// by widening the declared FuncTy (`func_ty_for_instance`) and appending the
-/// const-eval'd call-site Location (`lower_direct_call_args` via
-/// `callee_needs_extern_caller_location`) — exactly what rustc's codegen
+/// call's Location (`lower_direct_call_args` via
+/// `instance_abi_has_caller_location`) — exactly what rustc's codegen
 /// passes when the caller is not itself `#[track_caller]`. Also covers a
 /// DIVERGING track_caller fn OUTSIDE core/std/alloc (the FUZZ-7 raise
 /// interception is std-crate-gated; the appended Location makes the real call
@@ -796,8 +754,7 @@ fn returning_track_caller_extern_rlib_matches_llvm() {
     let lib_path = dir.join("ehlib.rs");
     std::fs::write(&lib_path, lib_src).expect("write lib source");
     let rlib = dir.join("libehlib.rlib");
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "rlib", "--crate-name", "ehlib"])
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=2"])
         .arg("-o")
@@ -864,11 +821,15 @@ fn returning_track_caller_extern_rlib_matches_llvm() {
                     "{name}_{opt}{}",
                     if backend.is_some() { "_tcg" } else { "_llvm" }
                 ));
-                let mut cmd = Command::new("rustup");
-                cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-                    .args(["--crate-type", "bin"]);
+                let mut cmd = toolchain_support::rustc_command();
+                cmd.args(["--crate-type", "bin"]);
                 if let Some(dylib) = backend {
                     cmd.arg(backend_arg(dylib));
+                    // An execution differential, not a certification test:
+                    // certified compiles refuse objects with exception tables
+                    // ([TCG-EH-UNPROVED]), and every x86-64 object compiled
+                    // under panic=unwind carries them.
+                    cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
                 }
                 cmd.args(["--target", TARGET, "-Cpanic=unwind"])
                     .arg(format!("-Copt-level={opt}"))
@@ -881,7 +842,11 @@ fn returning_track_caller_extern_rlib_matches_llvm() {
                 assert!(
                     output.status.success(),
                     "compile of `{name}` (O{opt}, {} backend) failed. stderr: <<<{}>>>",
-                    if backend.is_some() { "trust-cg" } else { "llvm" },
+                    if backend.is_some() {
+                        "trust-cg"
+                    } else {
+                        "llvm"
+                    },
                     String::from_utf8_lossy(&output.stderr)
                 );
             }

@@ -1,0 +1,536 @@
+; TrustIr text format v1
+; Value-semantics corpus for aggregate InsertField / InsertElement: every
+; function reads a source aggregate after inserting into it, or carries one
+; around a loop, and C (driver.c) and the reference interpreter check every
+; returned field bit-exactly. Shared by e2e_aarch64_aggregate_insert_linux.
+module "aggregate_insert_value_semantics"
+target "aarch64-unknown-linux-gnu" 8 little abi="aapcs64"
+
+struct @PairI64 { m0: i64 @0, m1: i64 @8 } size=16 align=8 repr=c id=0
+struct @PairF32 { m0: f32 @0, m1: f32 @4 } size=8 align=4 repr=c id=1
+struct @PairF16 { m0: f16 @0, m1: f16 @2 } size=4 align=2 repr=c id=2
+struct @Quad { q0: i64 @0, q1: i64 @8, q2: i64 @16, q3: i64 @24 } size=32 align=8 repr=c id=3
+struct @Outer { inner: struct.0 @0, x: i64 @16 } size=24 align=8 repr=c id=4
+struct @Packed { a: i8 @0, b: i64 @1 } size=9 align=1 repr=packed(1) id=5
+
+functy.0 = (struct.0) -> (struct.0)
+functy.1 = (struct.1) -> (struct.1)
+functy.2 = (struct.2) -> (struct.2)
+functy.3 = (struct.0, i64) -> (struct.3)
+functy.4 = (struct.3, i64) -> (i64)
+functy.5 = (struct.3, i64) -> (struct.3)
+functy.6 = (ptr, i64) -> (struct.3)
+functy.7 = (i64) -> (struct.3)
+functy.8 = (struct.4, i64) -> (struct.3)
+functy.9 = (struct.4, struct.0) -> (struct.3)
+functy.10 = (ptr, i64, i64) -> (struct.3)
+functy.11 = (struct.0, struct.0, i64, i64) -> (struct.3)
+functy.12 = (struct.0, i64) -> (struct.0)
+functy.13 = (i64, i64) -> (struct.3)
+functy.14 = () -> (struct.0)
+functy.15 = (struct.0, ptr, i64) -> (i64)
+functy.16 = (i32) -> (struct.3)
+functy.17 = (struct.0, i64, i64) -> (struct.3)
+functy.18 = (struct.0, struct.0, i64) -> (struct.3)
+functy.19 = (f32) -> (struct.3)
+functy.20 = (ptr, i64) -> (i64)
+
+type ty.0 = i64
+
+global mut @agg_insert_global struct.0 = { 5, 6 }
+
+fn @swap_i64(functy.0) {
+bb0(%0: struct.0):
+    %1 = extractfield i64 %0, 1
+    %2 = insertfield struct.0 %0, 0, %1
+    %3 = extractfield i64 %0, 0
+    %4 = insertfield struct.0 %2, 1, %3
+    ret %4
+}
+
+fn @swap_f32(functy.1) {
+bb0(%0: struct.1):
+    %1 = extractfield f32 %0, 1
+    %2 = insertfield struct.1 %0, 0, %1
+    %3 = extractfield f32 %0, 0
+    %4 = insertfield struct.1 %2, 1, %3
+    ret %4
+}
+
+fn @swap_f16(functy.2) {
+bb0(%0: struct.2):
+    %1 = extractfield f16 %0, 1
+    %2 = insertfield struct.2 %0, 0, %1
+    %3 = extractfield f16 %0, 0
+    %4 = insertfield struct.2 %2, 1, %3
+    ret %4
+}
+
+fn @old_new(functy.3) {
+bb0(%0: struct.0, %1: i64):
+    %2 = insertfield struct.0 %0, 0, %1
+    %3 = extractfield i64 %0, 0
+    %4 = extractfield i64 %0, 1
+    %5 = extractfield i64 %2, 0
+    %6 = extractfield i64 %2, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %3
+    %92 = insertfield struct.3 %91, 1, %4
+    %93 = insertfield struct.3 %92, 2, %5
+    %94 = insertfield struct.3 %93, 3, %6
+    ret %94
+}
+
+fn @big_callee(functy.4) {
+bb0(%0: struct.3, %1: i64):
+    %2 = insertfield struct.3 %0, 2, %1
+    %3 = extractfield i64 %2, 2
+    %4 = extractfield i64 %2, 3
+    %5 = add i64 %3, %4
+    ret %5
+}
+
+fn @big_caller(functy.5) {
+bb0(%0: struct.3, %1: i64):
+    %2 = call @func.4(%0, %1)
+    %3 = extractfield i64 %0, 0
+    %4 = extractfield i64 %0, 1
+    %5 = extractfield i64 %0, 2
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %3
+    %92 = insertfield struct.3 %91, 1, %4
+    %93 = insertfield struct.3 %92, 2, %5
+    %94 = insertfield struct.3 %93, 3, %2
+    ret %94
+}
+
+fn @load_insert(functy.6) {
+bb0(%0: ptr, %1: i64):
+    %2 = load struct.0, ptr %0
+    %3 = insertfield struct.0 %2, 0, %1
+    %4 = load struct.0, ptr %0
+    %5 = extractfield i64 %2, 0
+    %6 = extractfield i64 %3, 0
+    %7 = extractfield i64 %4, 0
+    %8 = extractfield i64 %4, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %5
+    %92 = insertfield struct.3 %91, 1, %6
+    %93 = insertfield struct.3 %92, 2, %7
+    %94 = insertfield struct.3 %93, 3, %8
+    ret %94
+}
+
+fn @global_insert(functy.7) {
+bb0(%0: i64):
+    %1 = global_addr @global.0
+    %2 = load struct.0, ptr %1
+    %3 = insertfield struct.0 %2, 1, %0
+    %4 = load struct.0, ptr %1
+    %5 = extractfield i64 %2, 1
+    %6 = extractfield i64 %3, 1
+    %7 = extractfield i64 %4, 0
+    %8 = extractfield i64 %4, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %5
+    %92 = insertfield struct.3 %91, 1, %6
+    %93 = insertfield struct.3 %92, 2, %7
+    %94 = insertfield struct.3 %93, 3, %8
+    ret %94
+}
+
+fn @nested_inner(functy.8) {
+bb0(%0: struct.4, %1: i64):
+    %2 = extractfield struct.0 %0, 0
+    %3 = insertfield struct.0 %2, 1, %1
+    %4 = extractfield i64 %2, 1
+    %5 = extractfield i64 %3, 1
+    %6 = extractfield struct.0 %0, 0
+    %7 = extractfield i64 %6, 1
+    %8 = extractfield i64 %0, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %4
+    %92 = insertfield struct.3 %91, 1, %5
+    %93 = insertfield struct.3 %92, 2, %7
+    %94 = insertfield struct.3 %93, 3, %8
+    ret %94
+}
+
+fn @nested_outer(functy.9) {
+bb0(%0: struct.4, %1: struct.0):
+    %2 = insertfield struct.4 %0, 0, %1
+    %3 = extractfield struct.0 %0, 0
+    %4 = extractfield i64 %3, 0
+    %5 = extractfield struct.0 %2, 0
+    %6 = extractfield i64 %5, 0
+    %7 = extractfield i64 %3, 1
+    %8 = extractfield i64 %2, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %4
+    %92 = insertfield struct.3 %91, 1, %6
+    %93 = insertfield struct.3 %92, 2, %7
+    %94 = insertfield struct.3 %93, 3, %8
+    ret %94
+}
+
+fn @array_elem(functy.10) {
+bb0(%0: ptr, %1: i64, %2: i64):
+    %3 = load [ty.0 x 4], ptr %0
+    %4 = insertelement [ty.0 x 4] %3, %1, %2
+    %5 = extractelement i64 %3, %1
+    %6 = extractelement i64 %4, %1
+    %7 = const i64 0
+    %8 = extractelement i64 %3, %7
+    %9 = extractelement i64 %4, %7
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %5
+    %92 = insertfield struct.3 %91, 1, %6
+    %93 = insertfield struct.3 %92, 2, %8
+    %94 = insertfield struct.3 %93, 3, %9
+    ret %94
+}
+
+fn @copy_shape(functy.3) {
+bb0(%0: struct.0, %1: i64):
+    %2 = copy struct.0 %0
+    %3 = insertfield struct.0 %0, 0, %1
+    %4 = extractfield i64 %2, 0
+    %5 = extractfield i64 %2, 1
+    %6 = extractfield i64 %3, 0
+    %7 = extractfield i64 %0, 0
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %4
+    %92 = insertfield struct.3 %91, 1, %5
+    %93 = insertfield struct.3 %92, 2, %6
+    %94 = insertfield struct.3 %93, 3, %7
+    ret %94
+}
+
+fn @select_shape(functy.11) {
+bb0(%0: struct.0, %1: struct.0, %2: i64, %3: i64):
+    %4 = const i64 0
+    %5 = icmp ne i64 %2, %4
+    %6 = select struct.0 %5, %0, %1
+    %7 = insertfield struct.0 %6, 0, %3
+    %8 = extractfield i64 %0, 0
+    %9 = extractfield i64 %1, 0
+    %10 = extractfield i64 %7, 0
+    %11 = extractfield i64 %6, 0
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %8
+    %92 = insertfield struct.3 %91, 1, %9
+    %93 = insertfield struct.3 %92, 2, %10
+    %94 = insertfield struct.3 %93, 3, %11
+    ret %94
+}
+
+fn @phi_join(functy.11) {
+bb0(%0: struct.0, %1: struct.0, %2: i64, %3: i64):
+    %4 = const i64 0
+    %5 = icmp ne i64 %2, %4
+    condbr %5, bb1, bb2
+bb1:
+    br bb3(%0)
+bb2:
+    br bb3(%1)
+bb3(%6: struct.0):
+    %7 = insertfield struct.0 %6, 1, %3
+    %8 = extractfield i64 %0, 1
+    %9 = extractfield i64 %1, 1
+    %10 = extractfield i64 %6, 1
+    %11 = extractfield i64 %7, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %8
+    %92 = insertfield struct.3 %91, 1, %9
+    %93 = insertfield struct.3 %92, 2, %10
+    %94 = insertfield struct.3 %93, 3, %11
+    ret %94
+}
+
+fn @loop_prev(functy.3) {
+bb0(%0: struct.0, %1: i64):
+    %2 = const i64 0
+    br bb1(%0, %2, %2)
+bb1(%3: struct.0, %4: i64, %5: i64):
+    %6 = icmp slt i64 %4, %1
+    condbr %6, bb2, bb3
+bb2:
+    %7 = extractfield i64 %3, 1
+    %8 = add i64 %7, %4
+    %9 = insertfield struct.0 %3, 0, %8
+    %10 = extractfield i64 %3, 0
+    %11 = const i64 31
+    %12 = mul i64 %5, %11
+    %13 = add i64 %12, %10
+    %14 = insertfield struct.0 %9, 1, %10
+    %15 = const i64 1
+    %16 = add i64 %4, %15
+    br bb1(%14, %16, %13)
+bb3:
+    %17 = extractfield i64 %3, 0
+    %18 = extractfield i64 %3, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %17
+    %92 = insertfield struct.3 %91, 1, %18
+    %93 = insertfield struct.3 %92, 2, %5
+    %94 = insertfield struct.3 %93, 3, %4
+    ret %94
+}
+
+fn @loop_exit_old(functy.3) {
+bb0(%0: struct.0, %1: i64):
+    %2 = const i64 0
+    br bb1(%0, %2)
+bb1(%3: struct.0, %4: i64):
+    %5 = insertfield struct.0 %3, 0, %4
+    %6 = const i64 1
+    %7 = add i64 %4, %6
+    %8 = icmp slt i64 %7, %1
+    condbr %8, bb1(%5, %7), bb2(%3, %5)
+bb2(%9: struct.0, %10: struct.0):
+    %11 = extractfield i64 %9, 0
+    %12 = extractfield i64 %9, 1
+    %13 = extractfield i64 %10, 0
+    %14 = extractfield i64 %10, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %11
+    %92 = insertfield struct.3 %91, 1, %12
+    %93 = insertfield struct.3 %92, 2, %13
+    %94 = insertfield struct.3 %93, 3, %14
+    ret %94
+}
+
+fn @loop_swap(functy.12) {
+bb0(%0: struct.0, %1: i64):
+    %2 = const i64 0
+    br bb1(%0, %2)
+bb1(%3: struct.0, %4: i64):
+    %5 = icmp slt i64 %4, %1
+    condbr %5, bb2, bb3
+bb2:
+    %6 = extractfield i64 %3, 1
+    %7 = insertfield struct.0 %3, 0, %6
+    %8 = extractfield i64 %3, 0
+    %9 = insertfield struct.0 %7, 1, %8
+    %10 = const i64 1
+    %11 = add i64 %4, %10
+    br bb1(%9, %11)
+bb3:
+    ret %3
+}
+
+fn @const_twice(functy.13) {
+bb0(%0: i64, %1: i64):
+    %2 = const struct.0 { 1, 2 }
+    %3 = insertfield struct.0 %2, 0, %0
+    %4 = insertfield struct.0 %2, 1, %1
+    %5 = extractfield i64 %3, 0
+    %6 = extractfield i64 %3, 1
+    %7 = extractfield i64 %4, 0
+    %8 = extractfield i64 %4, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %5
+    %92 = insertfield struct.3 %91, 1, %6
+    %93 = insertfield struct.3 %92, 2, %7
+    %94 = insertfield struct.3 %93, 3, %8
+    ret %94
+}
+
+fn @make_pair(functy.14) {
+bb0:
+    %0 = const struct.0 { 7, 8 }
+    ret %0
+}
+
+fn @call_result(functy.7) {
+bb0(%0: i64):
+    %1 = call @func.18()
+    %2 = insertfield struct.0 %1, 0, %0
+    %3 = extractfield i64 %1, 0
+    %4 = extractfield i64 %1, 1
+    %5 = extractfield i64 %2, 0
+    %6 = extractfield i64 %2, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %3
+    %92 = insertfield struct.3 %91, 1, %4
+    %93 = insertfield struct.3 %92, 2, %5
+    %94 = insertfield struct.3 %93, 3, %6
+    ret %94
+}
+
+fn @store_after(functy.15) {
+bb0(%0: struct.0, %1: ptr, %2: i64):
+    %3 = insertfield struct.0 %0, 0, %2
+    store struct.0 %0, ptr %1
+    %4 = const i64 2
+    %5 = gep i64, ptr %1, %4
+    store struct.0 %3, ptr %5
+    %6 = extractfield i64 %3, 0
+    ret %6
+}
+
+fn @vec_shape(functy.16) {
+bb0(%0: i32):
+    %1 = const <4 x i32> vec[ 1, 2, 3, 4 ]
+    %2 = const i64 2
+    %3 = insertelement <4 x i32> %1, %2, %0
+    %4 = extractelement i32 %1, %2
+    %5 = extractelement i32 %3, %2
+    %6 = const i64 0
+    %7 = extractelement i32 %1, %6
+    %8 = extractelement i32 %3, %6
+    %9 = sext i32 %4 to i64
+    %10 = sext i32 %5 to i64
+    %11 = sext i32 %7 to i64
+    %12 = sext i32 %8 to i64
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %9
+    %92 = insertfield struct.3 %91, 1, %10
+    %93 = insertfield struct.3 %92, 2, %11
+    %94 = insertfield struct.3 %93, 3, %12
+    ret %94
+}
+
+fn @packed_shape(functy.6) {
+bb0(%0: ptr, %1: i64):
+    %2 = load struct.5, ptr %0
+    %3 = insertfield struct.5 %2, 1, %1
+    %4 = extractfield i64 %2, 1
+    %5 = extractfield i64 %3, 1
+    %6 = extractfield i8 %2, 0
+    %7 = extractfield i8 %3, 0
+    %8 = sext i8 %6 to i64
+    %9 = sext i8 %7 to i64
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %4
+    %92 = insertfield struct.3 %91, 1, %5
+    %93 = insertfield struct.3 %92, 2, %8
+    %94 = insertfield struct.3 %93, 3, %9
+    ret %94
+}
+
+fn @fanout(functy.17) {
+bb0(%0: struct.0, %1: i64, %2: i64):
+    %3 = insertfield struct.0 %0, 0, %1
+    %4 = insertfield struct.0 %3, 1, %2
+    %5 = extractfield i64 %3, 1
+    %6 = insertfield struct.0 %3, 0, %5
+    %7 = extractfield i64 %4, 0
+    %8 = extractfield i64 %4, 1
+    %9 = extractfield i64 %6, 0
+    %10 = extractfield i64 %6, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %7
+    %92 = insertfield struct.3 %91, 1, %8
+    %93 = insertfield struct.3 %92, 2, %9
+    %94 = insertfield struct.3 %93, 3, %10
+    ret %94
+}
+
+fn @loop_rotate(functy.18) {
+bb0(%0: struct.0, %1: struct.0, %2: i64):
+    %3 = const i64 0
+    br bb1(%0, %1, %3)
+bb1(%4: struct.0, %5: struct.0, %6: i64):
+    %7 = icmp slt i64 %6, %2
+    condbr %7, bb2, bb3
+bb2:
+    %8 = extractfield i64 %4, 0
+    %9 = const i64 1
+    %10 = add i64 %8, %6
+    %11 = insertfield struct.0 %4, 0, %10
+    %12 = add i64 %6, %9
+    br bb1(%5, %11, %12)
+bb3:
+    %13 = extractfield i64 %4, 0
+    %14 = extractfield i64 %4, 1
+    %15 = extractfield i64 %5, 0
+    %16 = extractfield i64 %5, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %13
+    %92 = insertfield struct.3 %91, 1, %14
+    %93 = insertfield struct.3 %92, 2, %15
+    %94 = insertfield struct.3 %93, 3, %16
+    ret %94
+}
+
+fn @vec_f32(functy.19) {
+bb0(%0: f32):
+    %1 = const <4 x f32> vec[ 1.0, 2.0, 3.0, 4.0 ]
+    %2 = const i64 1
+    %3 = insertelement <4 x f32> %1, %2, %0
+    %4 = extractelement f32 %1, %2
+    %5 = extractelement f32 %3, %2
+    %6 = const i64 3
+    %7 = extractelement f32 %1, %6
+    %8 = extractelement f32 %3, %6
+    %9 = bitcast f32 %4 to i32
+    %10 = bitcast f32 %5 to i32
+    %11 = bitcast f32 %7 to i32
+    %12 = bitcast f32 %8 to i32
+    %13 = zext i32 %9 to i64
+    %14 = zext i32 %10 to i64
+    %15 = zext i32 %11 to i64
+    %16 = zext i32 %12 to i64
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %13
+    %92 = insertfield struct.3 %91, 1, %14
+    %93 = insertfield struct.3 %92, 2, %15
+    %94 = insertfield struct.3 %93, 3, %16
+    ret %94
+}
+
+fn @loop_load_prev(functy.20) {
+bb0(%0: ptr, %1: i64):
+    %2 = const i64 0
+    %3 = load struct.0, ptr %0
+    br bb1(%3, %2, %2)
+bb1(%4: struct.0, %5: i64, %6: i64):
+    %7 = icmp slt i64 %5, %1
+    condbr %7, bb2, bb3
+bb2:
+    %8 = load struct.0, ptr %0
+    %9 = extractfield i64 %4, 0
+    %20 = const i64 31
+    %21 = mul i64 %6, %20
+    %10 = add i64 %21, %9
+    %11 = extractfield i64 %8, 0
+    %12 = const i64 1
+    %13 = add i64 %11, %12
+    store i64 %13, ptr %0
+    %14 = add i64 %5, %12
+    br bb1(%8, %14, %10)
+bb3:
+    ret %6
+}
+
+fn @loop_const_prev(functy.3) {
+bb0(%0: struct.0, %1: i64):
+    %2 = const i64 0
+    br bb1(%0, %2, %2)
+bb1(%3: struct.0, %4: i64, %5: i64):
+    %6 = icmp slt i64 %4, %1
+    condbr %6, bb2, bb3
+bb2:
+    %7 = const struct.0 { 0, 0 }
+    %8 = insertfield struct.0 %7, 0, %4
+    %9 = extractfield i64 %3, 0
+    %10 = extractfield i64 %3, 1
+    %11 = add i64 %9, %10
+    %12 = insertfield struct.0 %8, 1, %11
+    %13 = const i64 31
+    %14 = mul i64 %5, %13
+    %15 = add i64 %14, %9
+    %16 = const i64 1
+    %17 = add i64 %4, %16
+    br bb1(%12, %17, %15)
+bb3:
+    %18 = extractfield i64 %3, 0
+    %19 = extractfield i64 %3, 1
+    %90 = const struct.3 { 0, 0, 0, 0 }
+    %91 = insertfield struct.3 %90, 0, %18
+    %92 = insertfield struct.3 %91, 1, %19
+    %93 = insertfield struct.3 %92, 2, %5
+    %94 = insertfield struct.3 %93, 3, %4
+    ret %94
+}

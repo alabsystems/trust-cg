@@ -1,168 +1,71 @@
-// trust-cg-codegen/dialect_pipeline.rs - Pre-adapter dialect lowering
+// trust-cg-codegen/dialect_pipeline.rs - Pre-adapter dialect lowering (compatibility facade)
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: issue #433, trust_ir #428. Wires trust_ir's dialect framework into
-// the Trust Codegen compilation pipeline so that upstream dialects (currently the
-// opt-in `verif.*` contract surface used by ty) are rewritten out of
-// `Inst::DialectOp` before the trust_ir->LIR adapter runs.
+// Reference: issue #433, trust_ir #428. The pre-adapter dialect stage is now
+// the registry-driven legalization of `crate::dialect_legalization` (ledger
+// L05-P11); this module keeps the original entry points for callers that hold
+// a bare module and want the default registry.
 
-//! Pre-adapter dialect lowering.
+//! Pre-adapter dialect lowering with the backend's default registry.
 //!
-//! Runs `trust_ir::dialect::lower_module` against a [`DialectRegistry`] with at
-//! least one dialect registered (per Trust Codegen issue #433 / trust_ir #428). The goal
-//! is to catch unknown `DialectOp` instances at a known location *before*
-//! they reach [`trust_cg_lower::translate_module`] — the adapter has no
-//! `DialectOp` handler and would otherwise emit a translation error deep in
-//! the ISel stack.
+//! Every entry here runs [`crate::dialect_legalization::legalize_module`] with
+//! [`DialectLegalizationRegistry::trust_cg_default`] for the host architecture
+//! and no proof requirement, and discards the legalization report. The
+//! [`crate::compiler::Compiler`] entries call the legalization directly, with
+//! the compile's own target, proof policy and registry, and record the report
+//! on their results.
 //!
-//! The registry currently ships with trust_ir's opt-in `VerifDialect`, trust_ir's
-//! portable `vector.*` dialect, and Trust Codegen-local typed dialects that the
-//! adapter understands directly. Additional dialects can be registered here
-//! without touching the rest of the pipeline. See `default_registry()` for
-//! the hook.
+//! An unknown dialect, op or nominal type is refused by exact name before the
+//! trust_ir->LIR adapter runs; the adapter's own refusals remain the backstop
+//! for paths that skip this stage.
 
 use std::borrow::Cow;
 
-use thiserror::Error;
+use crate::dialect_legalization::{
+    DialectLegalizationRegistry, LegalizationOptions, legalize_module,
+    module_has_dialect_constructs,
+};
+pub use crate::dialect_legalization::{DialectPipelineError, MAX_LOWERING_ITERS};
 
-/// Error from pre-adapter dialect lowering.
-#[derive(Debug, Error)]
-pub enum DialectPipelineError {
-    /// trust_ir dialect framework reported a lowering failure (fixpoint not
-    /// reached, pass returned an error, or an op references an unknown
-    /// dialect).
-    #[error("trust_ir dialect lowering failed: {0}")]
-    Lowering(String),
-}
-
-/// Maximum number of lowering fixpoint iterations.
-///
-/// trust_ir's `lower_module` iterates passes until no rewrites fire, or this
-/// limit is hit. Empirically the `verif` example converges in at most 3
-/// iterations; 16 is a conservative ceiling that still cuts off runaway
-/// rewriters.
-pub const MAX_LOWERING_ITERS: usize = 16;
-
-/// Build the default [`trust_ir::dialect::DialectRegistry`] used by the
-/// Trust Codegen compile path.
-///
-/// Includes trust_ir's opt-in `VerifDialect` so that modules
-/// emitting `verif.bfs_step` / `verif.frontier_drain` /
-/// `verif.fingerprint_batch` round-trip through the pipeline, and trust_ir's
-/// portable `vector.*` dialect so Trust Codegen can lower those ops in the adapter.
-pub fn default_registry() -> trust_ir::dialect::DialectRegistry {
-    let mut reg = trust_ir::dialect::DialectRegistry::new();
-    // Feature-gated on trust_ir's `dialect-verif-example`; enabled in
-    // `[workspace.dependencies]` via `features = ["dialect-verif-example"]`.
-    reg.register(Box::new(trust_ir::dialect::examples::verif::VerifDialect));
-    // Portable vector ops are intentionally left as DialectOp nodes here:
-    // trust-cg-lower handles supported shapes directly in the trust_ir adapter.
-    // We register a THIN wrapper over trust_ir's `vector` dialect that also
-    // admits the 64-bit (D-register) `<8 x i8>` `pack_lanes` splat (see
-    // `LenientVectorDialect`); the adapter lowers it to a genuine `dup.8b`.
-    reg.register(Box::new(LenientVectorDialect));
-    // Trust Codegen-local typed surface for ops the pinned core trust_ir crate does not
-    // have yet: bitfields and compact vector mask extraction.
-    reg.register(Box::new(trust_cg_lower::bitfield_dialect::BitfieldDialect));
-    reg
-}
-
-/// Trust Codegen-local wrapper over trust_ir's `vector` dialect.
-///
-/// It behaves exactly like [`trust_ir::dialect::vector::VectorDialect`] except
-/// that its `validate` ADDITIONALLY admits the 64-bit (D-register) `<8 x i8>`
-/// `vector.pack_lanes` splat — hashbrown's `uint8x8_t` control-byte broadcast.
-/// The backend's pinned trust_ir may still gate `VectorDialect::validate` to
-/// 128-bit lane vectors only; this shim accepts the `<8 x i8>` shape here (the
-/// trust_ir->LIR adapter reads the DialectInst's raw operands + result type and
-/// lowers it to a real `dup.8b`), and delegates every other vector op to the
-/// real dialect gate. Keeps trust-cg robust regardless of which trust_ir it
-/// links against — no format-crate change or path override required.
-///
-/// Like `VectorDialect`, it contributes no lowering passes (`lowerings()`
-/// defaults to empty): supported vector ops stay `DialectOp` nodes for the
-/// adapter.
-#[derive(Debug, Clone, Copy, Default)]
-struct LenientVectorDialect;
-
-impl trust_ir::dialect::Dialect for LenientVectorDialect {
-    fn name(&self) -> &'static str {
-        trust_ir::dialect::vector::VectorDialect.name()
-    }
-
-    fn version(&self) -> u32 {
-        trust_ir::dialect::vector::VectorDialect.version()
-    }
-
-    fn ops(&self) -> &'static [&'static str] {
-        trust_ir::dialect::vector::VectorDialect.ops()
-    }
-
-    fn validate(
-        &self,
-        inst: &trust_ir::dialect::DialectInst,
-    ) -> Result<(), trust_ir::dialect::DialectError> {
-        inst.validate_names()?;
-        // Admit the V64 `<8 x i8>` pack_lanes splat that the adapter lowers to
-        // `dup.8b`; some pinned trust_ir gates `VectorDialect::validate` to
-        // 128-bit lane vectors and would reject it here.
-        if trust_ir::dialect::vector::is_pack_lanes_op(inst)
-            && let Some(trust_ir::ty::Ty::Vector(elem, 8)) = inst.result_tys.first()
-            && elem.as_ref() == &trust_ir::ty::Ty::I8
-        {
-            return Ok(());
-        }
-        trust_ir::dialect::vector::VectorDialect.validate(inst)
-    }
-}
-
-/// Return true if `module` contains at least one dialect op.
+/// Return true if `module` contains at least one dialect op or nominal
+/// dialect type.
 pub fn has_dialect_ops(module: &trust_ir::Module) -> bool {
-    module
-        .instructions()
-        .any(|node| matches!(&node.inst, trust_ir::Inst::DialectOp(_)))
+    module_has_dialect_constructs(module)
 }
 
-/// Run pre-adapter dialect lowering on `module` only when needed.
+/// Legalize `module`'s dialect constructs with the default registry only when
+/// it carries any.
 ///
 /// The common cold-start path from tRust/tSwift/tC emits core trust_ir with no
-/// dialect ops. Borrowing that module avoids an unconditional full-module clone
-/// and registry fixpoint walk before the adapter.
+/// dialect construct; that module is borrowed, not cloned. Returns the module
+/// to translate and the number of op sites rewritten.
 pub fn lower_dialects_if_needed(
     module: &trust_ir::Module,
 ) -> Result<(Cow<'_, trust_ir::Module>, usize), DialectPipelineError> {
-    if !has_dialect_ops(module) {
-        return Ok((Cow::Borrowed(module), 0));
-    }
-
-    let mut lowered = module.clone();
-    let rewrites = lower_dialects(&mut lowered)?;
-    Ok((Cow::Owned(lowered), rewrites))
+    let legalized = legalize_module(
+        module,
+        &DialectLegalizationRegistry::trust_cg_default(),
+        LegalizationOptions::host(),
+    )?;
+    let rewrites = legalized
+        .report
+        .as_ref()
+        .map_or(0, |report| report.rewritten_op_sites());
+    Ok((legalized.module, rewrites))
 }
 
-/// Run pre-adapter dialect lowering on `module`.
+/// Legalize `module` in place with the default registry.
 ///
-/// Uses [`default_registry`] to progressively rewrite any
-/// `Inst::DialectOp` in the module. Callers that do not already own a mutable
-/// module should prefer [`lower_dialects_if_needed`] to avoid cloning modules
-/// that have no dialect ops.
-///
-/// Returns the number of rewrites applied, for tracing / diagnostics.
+/// Returns the number of op sites rewritten. Callers that do not already own
+/// a mutable module should prefer [`lower_dialects_if_needed`].
 pub fn lower_dialects(module: &mut trust_ir::Module) -> Result<usize, DialectPipelineError> {
-    let registry = default_registry();
-    // Validate that every DialectOp in the module references a registered
-    // dialect. Unknown dialects are the hard error trust_ir#428 §"Dialect
-    // framework" calls out — this surfaces it at a known pipeline stage
-    // rather than letting the adapter skip over an unrecognized op.
-    registry
-        .validate_module(module)
-        .map_err(|e| DialectPipelineError::Lowering(format!("{e}")))?;
-    let result = registry
-        .lower(module, MAX_LOWERING_ITERS)
-        .map_err(|e| DialectPipelineError::Lowering(format!("{e}")))?;
-    Ok(result.rewrites_applied)
+    let (legalized, rewrites) = lower_dialects_if_needed(module)?;
+    if let Cow::Owned(legalized) = legalized {
+        *module = legalized;
+    }
+    Ok(rewrites)
 }
 
 #[cfg(test)]
@@ -202,8 +105,9 @@ mod tests {
         assert!(matches!(lowered, Cow::Borrowed(_)));
     }
 
+    /// A module whose dialect ops all stay for the adapter is not cloned.
     #[test]
-    fn lower_dialects_if_needed_owns_dialect_module() {
+    fn adapter_native_vector_ops_are_kept_and_borrowed() {
         let v4_i32 = Ty::Vector(Box::new(Ty::I32), 4);
         let func = mk_func_with_body(vec![
             InstrNode::new(Inst::DialectOp(Box::new(
@@ -226,34 +130,9 @@ mod tests {
             lower_dialects_if_needed(&module).expect("vector dialect validates");
 
         assert_eq!(rewrites, 0);
-        assert!(matches!(lowered, Cow::Owned(_)));
-    }
-
-    #[test]
-    fn vector_dialect_is_registered_for_adapter_lowering() {
-        let v4_i32 = Ty::Vector(Box::new(Ty::I32), 4);
-        let func = mk_func_with_body(vec![
-            InstrNode::new(Inst::DialectOp(Box::new(
-                trust_ir::dialect::vector::pack_lanes(
-                    v4_i32,
-                    [
-                        ValueId::new(0),
-                        ValueId::new(1),
-                        ValueId::new(2),
-                        ValueId::new(3),
-                    ],
-                ),
-            )))
-            .with_result(ValueId::new(4)),
-        ]);
-        let mut module = Module::new("vector_registered");
-        module.functions.push(func);
-
-        let n = lower_dialects(&mut module).expect("vector dialect validates");
-
-        assert_eq!(n, 0);
+        assert!(matches!(lowered, Cow::Borrowed(_)));
         assert!(matches!(
-            &module.functions[0].blocks[0].body[0].inst,
+            &lowered.functions[0].blocks[0].body[0].inst,
             Inst::DialectOp(op) if trust_ir::dialect::vector::is_pack_lanes_op(op)
         ));
     }
@@ -301,60 +180,64 @@ mod tests {
         let mut module = Module::new("bad_vector");
         module.functions.push(func);
 
-        lower_dialects(&mut module).expect_err("unsupported vector shape must be rejected");
+        let error =
+            lower_dialects(&mut module).expect_err("unsupported vector shape must be rejected");
+        assert!(
+            matches!(error, DialectPipelineError::Grammar { ref op, .. } if op == "pack_lanes"),
+            "{error}"
+        );
     }
 
-    /// Module with a `verif.frontier_drain` op lowers (pass erases it).
+    /// The default registry carries the `verif` v1 payload contract but binds
+    /// no runtime: trust-ir's illustrative lowering (an erased
+    /// `frontier_drain`, a `bfs_step` call to function id 0) is not applied,
+    /// and the op is refused by name.
     #[test]
-    fn frontier_drain_erased() {
-        let mut module = Module::new("test");
-        let func = mk_func_with_body(vec![InstrNode::new(Inst::DialectOp(Box::new(
+    fn verif_contract_ops_are_refused_unbound_by_default() {
+        for op in [
             verif::frontier_drain(ValueId::new(0)),
-        )))]);
-        module.functions.push(func);
-
-        // Before lowering: one DialectOp body entry.
-        assert_eq!(module.functions[0].blocks[0].body.len(), 1);
-        assert!(matches!(
-            module.functions[0].blocks[0].body[0].inst,
-            Inst::DialectOp(_)
-        ));
-
-        let n = lower_dialects(&mut module).expect("lower");
-        // FrontierDrainErase deletes the op.
-        assert!(n >= 1, "expected at least one rewrite, got {n}");
-        assert_eq!(module.functions[0].blocks[0].body.len(), 0);
-    }
-
-    /// Module with a `verif.bfs_step` lowers to a core `Inst::Call`.
-    #[test]
-    fn bfs_step_lowers_to_call() {
-        let mut module = Module::new("test");
-        let mut node = InstrNode::new(Inst::DialectOp(Box::new(verif::bfs_step(
-            ValueId::new(0),
-            ValueId::new(1),
-            false,
-        ))));
-        node.results = vec![ValueId::new(42)];
-        let func = mk_func_with_body(vec![node]);
-        module.functions.push(func);
-
-        let n = lower_dialects(&mut module).expect("lower");
-        assert!(n >= 2, "expected progressive lowering rewrites, got {n}");
-
-        let body = &module.functions[0].blocks[0].body;
-        assert_eq!(body.len(), 1);
-        match &body[0].inst {
-            Inst::Call { callee, args } => {
-                assert_eq!(*callee, FuncId::new(0));
-                assert_eq!(args, &vec![ValueId::new(0), ValueId::new(1)]);
+            verif::bfs_step(ValueId::new(0), ValueId::new(1), false),
+            verif::fingerprint_batch(ValueId::new(0), ValueId::new(2)),
+        ] {
+            let name = op.op.clone();
+            let has_result = !op.result_tys.is_empty();
+            let mut node = InstrNode::new(Inst::DialectOp(Box::new(op)));
+            if has_result {
+                node.results = vec![ValueId::new(3)];
             }
-            inst => panic!("expected Inst::Call after lowering, got {inst:?}"),
+            let mut module = Module::new("verif");
+            let ty = module
+                .add_func_type(trust_ir::FuncTy {
+                    params: vec![Ty::Ptr, Ty::Ptr, Ty::I64],
+                    returns: vec![],
+                    abi: None,
+                    is_vararg: false,
+                })
+                .expect("Module::add_func_type: test fixture");
+            let mut func = Function::new(FuncId::new(0), "test", ty, BlockId::new(0));
+            let mut block = Block::new(BlockId::new(0));
+            block.params = vec![
+                (ValueId::new(0), Ty::Ptr),
+                (ValueId::new(1), Ty::Ptr),
+                (ValueId::new(2), Ty::I64),
+            ];
+            block.body = vec![node, InstrNode::new(Inst::Return { values: vec![] })];
+            func.blocks.push(block);
+            module.functions.push(func);
+            let error = lower_dialects(&mut module).expect_err("unbound verif op must be refused");
+            assert!(
+                matches!(&error, DialectPipelineError::Unbound { dialect, op, .. }
+                    if dialect == "verif" && *op == name),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("[TCG-DIALECT-UNBOUND]"),
+                "{error}"
+            );
         }
-        assert_eq!(body[0].results, vec![ValueId::new(42)]);
     }
 
-    /// Unknown dialect (not registered) is rejected up front.
+    /// Unknown dialect (not registered) is rejected up front, by name.
     #[test]
     fn unknown_dialect_rejected() {
         let mut module = Module::new("bad");
@@ -366,7 +249,7 @@ mod tests {
         let err = lower_dialects(&mut module).expect_err("unknown dialect must be rejected");
         let msg = format!("{err}");
         assert!(
-            msg.contains("no_such_dialect"),
+            msg.contains("no_such_dialect") && msg.contains("[TCG-DIALECT-UNREGISTERED]"),
             "error message missing dialect name: {msg}"
         );
     }

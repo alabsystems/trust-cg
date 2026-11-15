@@ -55,7 +55,6 @@
 //! `X86ISelFunction` and the aarch64 `MachFunction`), so the same gate
 //! instantiates on both arches. Both defaults are ENFORCE; final-stream
 //! structural correctness cannot be downgraded by process environment.
-//! `TCG_TRACE_POST_RA=1` remains a diagnostics-only trace control.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -239,14 +238,6 @@ pub fn post_regalloc_recheck_mode(
     arch_default
 }
 
-/// True when `TCG_TRACE_POST_RA=1` requests per-function trace output.
-pub fn post_regalloc_trace_enabled() -> bool {
-    matches!(
-        std::env::var("TCG_TRACE_POST_RA").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
-    )
-}
-
 /// Process-wide count of post-regalloc re-verification violations observed
 /// (warn or enforce) — telemetry for the warn-only rollout and for tests.
 static VIOLATION_HITS: AtomicU64 = AtomicU64::new(0);
@@ -273,13 +264,6 @@ pub fn record_post_regalloc_violation(
     eprintln!("{tag} arch={arch} fn={function_name} kind={kind_tag}: {detail}");
 }
 
-/// Print the per-function trace summary when `TCG_TRACE_POST_RA=1`.
-pub fn trace_function_summary(arch: &str, function_name: &str, violations: usize) {
-    if post_regalloc_trace_enabled() {
-        eprintln!("[TCG-TRACE-POST-RA] arch={arch} fn={function_name} violations={violations}");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Driver (Tier 1 structural)
 // ---------------------------------------------------------------------------
@@ -302,7 +286,6 @@ pub fn evaluate<F: DataflowFunctionView>(
         return None;
     }
     let violations = check_structure(func);
-    trace_function_summary(arch, func.function_name(), violations.len());
     for v in &violations {
         record_post_regalloc_violation(arch, func.function_name(), v.kind.tag(), &v.detail, mode);
     }

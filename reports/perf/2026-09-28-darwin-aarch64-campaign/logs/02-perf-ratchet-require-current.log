@@ -1,0 +1,3 @@
+perf-ratchet: no comparable committed EVIDENCE baseline for this host/target — regression check SKIPPED loudly; this row becomes the first candidate baseline when appended.
+perf-ratchet: OK 01fc13b13608-20260928T134336Z.json (evidence=True, coverage 0.0%, runtime geomean None, warm-vs-O2 None, mismatches 0)
+perf-ratchet: CURRENT 01fc13b13608-20260928T134336Z.json measured HEAD 01fc13b13608 (eligible evidence)

@@ -1,0 +1,30 @@
+# trust-cg-irmid - Verified trust-ir -> trust-ir mid-end (wasm32 profile)
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: Apache-2.0
+
+[package]
+name = "trust-cg-irmid"
+description = "Translation-validated trust-ir to trust-ir mid-end for Trust Codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+trust-cg-ir = { workspace = true }
+trust-cg-opt = { workspace = true }
+trust-cg-verify = { workspace = true, default-features = false }
+trust-ir = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Validate the typed source/target pair in the aggregate-promotion controls.
+trust-ir-build = { workspace = true }
+
+[lints]
+workspace = true

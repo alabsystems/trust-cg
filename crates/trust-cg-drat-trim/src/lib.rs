@@ -29,6 +29,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// Cargo target triple for the bundled executable. This compile-time identity
+/// is not read from the runtime environment and does not by itself authorize
+/// checker bytes; consumers must also match their reviewed SHA-256.
+pub fn drat_trim_target_triple() -> &'static str {
+    env!("DRAT_TRIM_BUILT_TARGET")
+}
+
 /// Absolute path to the `drat-trim` executable that was compiled by
 /// this crate's `build.rs` into `OUT_DIR`.
 ///
@@ -95,6 +102,32 @@ mod tests {
         );
     }
 
+    /// Inspect the actual bundled executable, so a caller CFLAGS deployment
+    /// override cannot silently change bytes bound by checker authorization.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn executable_retains_pinned_macos_deployment_target() {
+        let out = Command::new("otool")
+            .arg("-l")
+            .arg(drat_trim_executable_path())
+            .output()
+            .expect("inspect bundled checker's Mach-O deployment target");
+        assert!(out.status.success(), "otool must inspect vendored checker");
+        let load_commands = String::from_utf8_lossy(&out.stdout);
+        let mut build_version = false;
+        let mut minimum_versions = Vec::new();
+        for line in load_commands.lines().map(str::trim) {
+            if line.starts_with("Load command ") {
+                build_version = false;
+            } else if line == "cmd LC_BUILD_VERSION" {
+                build_version = true;
+            } else if build_version && let Some(version) = line.strip_prefix("minos ") {
+                minimum_versions.push(version);
+            }
+        }
+        assert_eq!(minimum_versions, ["26.5"], "{load_commands}");
+    }
+
     /// End-to-end: hand drat-trim a trivially-unsatisfiable CNF and an
     /// empty (just the empty clause) DRAT proof, and require
     /// acceptance.
@@ -133,6 +166,27 @@ mod tests {
             "drat-trim output missing VERIFIED banner.\nstdout: {}\nstderr: {}",
             stdout,
             stderr
+        );
+    }
+
+    #[test]
+    fn rejects_empty_clause_proof_for_satisfiable_formula() {
+        let mut cnf = NamedTempFile::new().expect("tmp satisfiable cnf");
+        writeln!(cnf, "p cnf 1 1\n1 0").unwrap();
+        cnf.flush().unwrap();
+        let mut proof = NamedTempFile::new().expect("tmp invalid proof");
+        writeln!(proof, "0").unwrap();
+        proof.flush().unwrap();
+        let out = Command::new(drat_trim_executable_path())
+            .arg(cnf.path())
+            .arg(proof.path())
+            .output()
+            .expect("invoke checker on invalid empty-clause proof");
+        assert!(!out.status.success(), "invalid proof must not be accepted");
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .all(|line| line.trim() != "s VERIFIED")
         );
     }
 }

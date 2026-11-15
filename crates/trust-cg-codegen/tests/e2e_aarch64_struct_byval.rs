@@ -14,6 +14,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
+#[path = "common/field_typed.rs"]
+mod field_typed;
+
 use std::fs;
 use std::process::Command;
 
@@ -26,12 +29,18 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields: fields
@@ -53,11 +62,14 @@ fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
 // `fn sum_n(s: {i64 * n}) -> i64 { s.0 + s.1 + ... }`
 fn build_sum(m: &mut TrustIrModule, id: u32, name: &str, n: u32) {
     let agg = Ty::Struct(StructId::new(id));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     let mut body = Vec::new();
     // extract field 0..n
@@ -92,18 +104,22 @@ fn build_sum(m: &mut TrustIrModule, id: u32, name: &str, n: u32) {
         params: vec![(ValueId::new(0), agg)],
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // `fn hfa2(s: {f64,f64}) -> f64 { s.0 + s.1 }` — a homogeneous FP aggregate,
 // passed in consecutive D registers (D0:D1) per AAPCS64.
 fn build_hfa(m: &mut TrustIrModule, id: u32, name: &str) {
     let agg = Ty::Struct(StructId::new(id));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -133,18 +149,22 @@ fn build_hfa(m: &mut TrustIrModule, id: u32, name: &str) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // `fn mixed(s: {i64,f64}) -> f64 { (f64)s.0 + s.1 }` — a MIXED int/FP struct
 // (16 bytes, NOT an HFA), passed in GPRs with the f64 field's bits in a GPR.
 fn build_mixed(m: &mut TrustIrModule, id: u32, name: &str) {
     let agg = Ty::Struct(StructId::new(id));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -181,7 +201,8 @@ fn build_mixed(m: &mut TrustIrModule, id: u32, name: &str) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -200,6 +221,7 @@ fn build_module() -> TrustIrModule {
     ));
     // Packed { i8, i64 } (repr packed(1)): i64 at UNALIGNED offset 1.
     m.structs.push(StructDef {
+        origin: None,
         id: StructId::new(7),
         name: "Packed".to_string(),
         fields: vec![
@@ -220,6 +242,7 @@ fn build_module() -> TrustIrModule {
     });
     // PNest { i8, {i64,i64} } packed: the inner struct sits at packed offset 1.
     m.structs.push(StructDef {
+        origin: None,
         id: StructId::new(8),
         name: "PNest".to_string(),
         fields: vec![
@@ -247,11 +270,14 @@ fn build_module() -> TrustIrModule {
     // NESTED aggregate field (s.inner) then its scalar fields.
     let nest_ty = Ty::Struct(StructId::new(6));
     let inner_ty = Ty::Struct(StructId::new(0));
-    let nest_ft = m.add_func_type(FuncTy {
-        params: vec![nest_ty.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let nest_ft = m
+        .add_func_type(FuncTy {
+            params: vec![nest_ty.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut nf = TrustIrFunction::new(FuncId::new(6), "nest", nest_ft, BlockId::new(0));
     nf.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -300,15 +326,19 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(nf);
+    m.try_add_function(nf)
+        .expect("Module::try_add_function: test fixture");
 
     // `fn id2(s: {i64,i64}) -> {i64,i64} { s }` — struct RETURN (in + out X0:X1).
     let agg = Ty::Struct(StructId::new(0));
-    let ft = m.add_func_type(FuncTy {
-        params: vec![agg.clone()],
-        returns: vec![agg.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![agg.clone()],
+            returns: vec![agg.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(3), "id2", ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -317,16 +347,20 @@ fn build_module() -> TrustIrModule {
             values: vec![ValueId::new(0)],
         })],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 
     // `fn id3(s: {i64,i64,i64}) -> {i64,i64,i64} { s }` — 24-byte struct RETURN,
     // which is > 16 bytes so it uses the sret/x8 indirect-result convention.
     let agg3 = Ty::Struct(StructId::new(1));
-    let ft3 = m.add_func_type(FuncTy {
-        params: vec![agg3.clone()],
-        returns: vec![agg3.clone()],
-        is_vararg: false,
-    });
+    let ft3 = m
+        .add_func_type(FuncTy {
+            params: vec![agg3.clone()],
+            returns: vec![agg3.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f3 = TrustIrFunction::new(FuncId::new(4), "id3", ft3, BlockId::new(0));
     f3.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -335,16 +369,20 @@ fn build_module() -> TrustIrModule {
             values: vec![ValueId::new(0)],
         })],
     }];
-    m.add_function(f3);
+    m.try_add_function(f3)
+        .expect("Module::try_add_function: test fixture");
 
     // `fn packed(s: Packed) -> i64 { (i64)(sext s.f0) + s.f1 }` — s.f1 is an i64
     // at the UNALIGNED packed offset 1.
     let pk_ty = Ty::Struct(StructId::new(7));
-    let pk_ft = m.add_func_type(FuncTy {
-        params: vec![pk_ty.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let pk_ft = m
+        .add_func_type(FuncTy {
+            params: vec![pk_ty.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut pf = TrustIrFunction::new(FuncId::new(7), "packed", pk_ft, BlockId::new(0));
     pf.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -381,16 +419,20 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(pf);
+    m.try_add_function(pf)
+        .expect("Module::try_add_function: test fixture");
 
     // `fn pset(s: Packed, v: i64) -> i64 { s.f1 = v; return s.f1 }` — round-trips
     // a WRITE (InsertField) and a READ (ExtractField) at packed offset 1.
     let ps_ty = Ty::Struct(StructId::new(7));
-    let ps_ft = m.add_func_type(FuncTy {
-        params: vec![ps_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ps_ft = m
+        .add_func_type(FuncTy {
+            params: vec![ps_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut psf = TrustIrFunction::new(FuncId::new(8), "pset", ps_ft, BlockId::new(0));
     psf.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -414,18 +456,22 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(psf);
+    m.try_add_function(psf)
+        .expect("Module::try_add_function: test fixture");
 
     // `fn pnest(s: PNest) -> i64 { (i64)(sext s.f0) + s.f1.0 + s.f1.1 }` —
     // extracts a NESTED aggregate field (s.f1) from a PACKED struct, then its
     // scalar fields (at unaligned absolute addresses).
     let pn_ty = Ty::Struct(StructId::new(8));
     let inner_ty = Ty::Struct(StructId::new(0));
-    let pn_ft = m.add_func_type(FuncTy {
-        params: vec![pn_ty.clone()],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let pn_ft = m
+        .add_func_type(FuncTy {
+            params: vec![pn_ty.clone()],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut pnf = TrustIrFunction::new(FuncId::new(9), "pnest", pn_ft, BlockId::new(0));
     pnf.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -481,7 +527,8 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(pnf);
+    m.try_add_function(pnf)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -489,9 +536,10 @@ fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let r = compiler
-        .compile(module)
+        .compile(&field_typed::normalized(module))
         .expect("struct-by-value module must compile");
     assert!(!r.object_code.is_empty());
     r.object_code
@@ -571,8 +619,8 @@ int main(void){
 "#;
 
 fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -589,6 +637,7 @@ fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -616,4 +665,13 @@ fn e2e_aarch64_struct_byval_args() {
         };
         assert_eq!(code, 0, "struct-byval arg mismatch at {opt:?}");
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

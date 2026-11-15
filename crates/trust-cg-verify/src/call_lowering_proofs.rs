@@ -1211,6 +1211,12 @@ pub fn proof_stack_arg_passthrough_8bit() -> ProofObligation {
 /// ABI placement rule and that adjacent scalar vararg slots remain 8 bytes
 /// apart.
 ///
+/// Scope: every anonymous argument up to `vararg_index` occupies one 8-byte
+/// slot. A 16-byte-aligned anonymous argument (`i128`, `V128`, a 16-aligned
+/// non-homogeneous aggregate) starts at the next 16-aligned offset instead
+/// (abi.rs `darwin_anonymous_vararg_align`), so tails containing one are
+/// outside this obligation.
+///
 /// Reference: abi.rs `classify_params_variadic`, isel.rs `select_variadic_call`.
 pub fn proof_call_variadic_stack_slot_placement() -> ProofObligation {
     let width = 64;

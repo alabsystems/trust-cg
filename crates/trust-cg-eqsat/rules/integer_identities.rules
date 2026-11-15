@@ -1,0 +1,558 @@
+; trust-cg-eqsat: the PKG-U1 integer identity rule set (docs/eqsat-tier-e.md section 5).
+;
+; Author: Andrew Yates <andrewyates.name@gmail.com>
+; Copyright 2026 Andrew Yates | License: Apache-2.0
+;
+; Used by the tests only. These are statements, not theorems: no rule here has
+; a discharge record (PKG-U2). Variables range over defined values (never
+; poison) of the instance type, which is the only domain a graph variable has.
+; Every rule names only total operators; a rule naming udiv, sdiv, urem, srem,
+; shl, lshr or ashr is refused by both the engine and the checker.
+
+; ---- constants to the right of commutative operators ----------------------
+
+(rule add_const_right
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add (const ?c) ?x))
+  (rhs (add ?x (const ?c)))
+  (where))
+
+(rule mul_const_right
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul (const ?c) ?x))
+  (rhs (mul ?x (const ?c)))
+  (where))
+
+(rule and_const_right
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (and (const ?c) ?x))
+  (rhs (and ?x (const ?c)))
+  (where))
+
+(rule or_const_right
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (or (const ?c) ?x))
+  (rhs (or ?x (const ?c)))
+  (where))
+
+(rule xor_const_right
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (xor (const ?c) ?x))
+  (rhs (xor ?x (const ?c)))
+  (where))
+
+; ---- neutral and absorbing elements ----------------------------------------
+
+(rule add_zero
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add ?x (const 0)))
+  (rhs ?x)
+  (where))
+
+(rule sub_zero
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (sub ?x (const 0)))
+  (rhs ?x)
+  (where))
+
+(rule sub_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (sub ?x ?x))
+  (rhs (const 0))
+  (where))
+
+(rule mul_one
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x (const 1)))
+  (rhs ?x)
+  (where))
+
+; Stated one way: the rhs drops the variable entirely.
+(rule mul_zero
+  (direction refines)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x (const 0)))
+  (rhs (const 0))
+  (where))
+
+(rule mul_neg_one
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x (const -1)))
+  (rhs (neg ?x))
+  (where))
+
+; 255 is -1 only at width 8.
+(rule mul_255_neg_i8
+  (direction equiv)
+  (domain i8 u8)
+  (lhs (mul ?x (const 255)))
+  (rhs (neg ?x))
+  (where))
+
+; Stated one way: (mul ?x (const 2)) is the cheaper-to-prove direction here.
+(rule double_to_mul
+  (direction refines)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add ?x ?x))
+  (rhs (mul ?x (const 2)))
+  (where))
+
+(rule and_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (and ?x ?x))
+  (rhs ?x)
+  (where))
+
+(rule and_zero
+  (direction refines)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (and ?x (const 0)))
+  (rhs (const 0))
+  (where))
+
+(rule and_ones
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (and ?x (const -1)))
+  (rhs ?x)
+  (where))
+
+(rule or_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (or ?x ?x))
+  (rhs ?x)
+  (where))
+
+(rule or_zero
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (or ?x (const 0)))
+  (rhs ?x)
+  (where))
+
+(rule or_ones
+  (direction refines)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (or ?x (const -1)))
+  (rhs (const -1))
+  (where))
+
+(rule xor_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (xor ?x ?x))
+  (rhs (const 0))
+  (where))
+
+(rule xor_zero
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (xor ?x (const 0)))
+  (rhs ?x)
+  (where))
+
+(rule neg_neg
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (neg (neg ?x)))
+  (rhs ?x)
+  (where))
+
+(rule not_not
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (not (not ?x)))
+  (rhs ?x)
+  (where))
+
+(rule zero_sub
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (sub (const 0) ?x))
+  (rhs (neg ?x))
+  (where))
+
+(rule add_neg
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add ?x (neg ?y)))
+  (rhs (sub ?x ?y))
+  (where))
+
+(rule sub_const_to_add
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (sub ?x (const ?c)))
+  (rhs (add ?x (eval neg ?c)))
+  (where (ne ?c 0)))
+
+; A rotation by a multiple of the width is the identity.
+(rule rotl_full
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (rotl ?x (const ?c)))
+  (rhs ?x)
+  (where (zero_mod_width ?c)))
+
+(rule rotr_full
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (rotr ?x (const ?c)))
+  (rhs ?x)
+  (where (zero_mod_width ?c)))
+
+; ---- reassociation of constant chains ---------------------------------------
+
+(rule add_add_const
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add (add ?x (const ?a)) (const ?b)))
+  (rhs (add ?x (eval add ?a ?b)))
+  (where))
+
+(rule mul_mul_const
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul (mul ?x (const ?a)) (const ?b)))
+  (rhs (mul ?x (eval mul ?a ?b)))
+  (where))
+
+(rule and_and_const
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (and (and ?x (const ?a)) (const ?b)))
+  (rhs (and ?x (eval and ?a ?b)))
+  (where))
+
+(rule or_or_const
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (or (or ?x (const ?a)) (const ?b)))
+  (rhs (or ?x (eval or ?a ?b)))
+  (where))
+
+(rule xor_xor_const
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (xor (xor ?x (const ?a)) (const ?b)))
+  (rhs (xor ?x (eval xor ?a ?b)))
+  (where))
+
+; ---- comparisons and selects -----------------------------------------------
+
+(rule icmp_eq_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (icmp.eq ?x ?x))
+  (rhs true)
+  (where))
+
+(rule icmp_ne_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (icmp.ne ?x ?x))
+  (rhs false)
+  (where))
+
+(rule icmp_ult_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.ult ?x ?x))
+  (rhs false)
+  (where))
+
+(rule icmp_ule_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.ule ?x ?x))
+  (rhs true)
+  (where))
+
+(rule icmp_slt_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.slt ?x ?x))
+  (rhs false)
+  (where))
+
+(rule icmp_sle_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.sle ?x ?x))
+  (rhs true)
+  (where))
+
+(rule select_same
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (select ?c ?x ?x))
+  (rhs ?x)
+  (where))
+
+(rule select_true
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (select true ?x ?y))
+  (rhs ?x)
+  (where))
+
+(rule select_false
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (select false ?x ?y))
+  (rhs ?y)
+  (where))
+
+; ---- booleans ----------------------------------------------------------------
+
+(rule band_true
+  (direction equiv)
+  (domain bool)
+  (lhs (band ?b true))
+  (rhs ?b)
+  (where))
+
+(rule band_false
+  (direction refines)
+  (domain bool)
+  (lhs (band ?b false))
+  (rhs false)
+  (where))
+
+(rule bor_false
+  (direction equiv)
+  (domain bool)
+  (lhs (bor ?b false))
+  (rhs ?b)
+  (where))
+
+(rule bxor_false
+  (direction equiv)
+  (domain bool)
+  (lhs (bxor ?b false))
+  (rhs ?b)
+  (where))
+
+(rule bxor_self
+  (direction equiv)
+  (domain bool)
+  (lhs (bxor ?b ?b))
+  (rhs false)
+  (where))
+
+(rule bxor_true_true
+  (direction equiv)
+  (domain bool)
+  (lhs (bxor (bxor ?b true) true))
+  (rhs ?b)
+  (where))
+
+; ---- constant folding (the rhs is the operator applied, section 3) ----------
+
+(rule fold_add
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add (const ?a) (const ?b)))
+  (rhs (eval add ?a ?b))
+  (where))
+
+(rule fold_sub
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (sub (const ?a) (const ?b)))
+  (rhs (eval sub ?a ?b))
+  (where))
+
+(rule fold_mul
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul (const ?a) (const ?b)))
+  (rhs (eval mul ?a ?b))
+  (where))
+
+(rule fold_and
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (and (const ?a) (const ?b)))
+  (rhs (eval and ?a ?b))
+  (where))
+
+(rule fold_or
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (or (const ?a) (const ?b)))
+  (rhs (eval or ?a ?b))
+  (where))
+
+(rule fold_xor
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (xor (const ?a) (const ?b)))
+  (rhs (eval xor ?a ?b))
+  (where))
+
+(rule fold_rotl
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (rotl (const ?a) (const ?b)))
+  (rhs (eval rotl ?a ?b))
+  (where))
+
+(rule fold_rotr
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (rotr (const ?a) (const ?b)))
+  (rhs (eval rotr ?a ?b))
+  (where))
+
+(rule fold_neg
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (neg (const ?a)))
+  (rhs (eval neg ?a))
+  (where))
+
+(rule fold_not
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (not (const ?a)))
+  (rhs (eval not ?a))
+  (where))
+
+(rule fold_ctpop
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (ctpop (const ?a)))
+  (rhs (eval ctpop ?a))
+  (where))
+
+(rule fold_ctlz
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (ctlz (const ?a)))
+  (rhs (eval ctlz ?a))
+  (where))
+
+(rule fold_cttz
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (cttz (const ?a)))
+  (rhs (eval cttz ?a))
+  (where))
+
+(rule fold_bswap
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (bswap (const ?a)))
+  (rhs (eval bswap ?a))
+  (where))
+
+(rule fold_bitreverse
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (bitreverse (const ?a)))
+  (rhs (eval bitreverse ?a))
+  (where))
+
+(rule fold_band
+  (direction equiv)
+  (domain bool)
+  (lhs (band (const ?a) (const ?b)))
+  (rhs (eval band ?a ?b))
+  (where))
+
+(rule fold_bor
+  (direction equiv)
+  (domain bool)
+  (lhs (bor (const ?a) (const ?b)))
+  (rhs (eval bor ?a ?b))
+  (where))
+
+(rule fold_bxor
+  (direction equiv)
+  (domain bool)
+  (lhs (bxor (const ?a) (const ?b)))
+  (rhs (eval bxor ?a ?b))
+  (where))
+
+(rule fold_icmp_eq
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (icmp.eq (const ?a) (const ?b)))
+  (rhs (eval icmp.eq ?a ?b))
+  (where))
+
+(rule fold_icmp_ne
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize bool)
+  (lhs (icmp.ne (const ?a) (const ?b)))
+  (rhs (eval icmp.ne ?a ?b))
+  (where))
+
+(rule fold_icmp_ult
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.ult (const ?a) (const ?b)))
+  (rhs (eval icmp.ult ?a ?b))
+  (where))
+
+(rule fold_icmp_ule
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.ule (const ?a) (const ?b)))
+  (rhs (eval icmp.ule ?a ?b))
+  (where))
+
+(rule fold_icmp_ugt
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.ugt (const ?a) (const ?b)))
+  (rhs (eval icmp.ugt ?a ?b))
+  (where))
+
+(rule fold_icmp_uge
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.uge (const ?a) (const ?b)))
+  (rhs (eval icmp.uge ?a ?b))
+  (where))
+
+(rule fold_icmp_slt
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.slt (const ?a) (const ?b)))
+  (rhs (eval icmp.slt ?a ?b))
+  (where))
+
+(rule fold_icmp_sle
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.sle (const ?a) (const ?b)))
+  (rhs (eval icmp.sle ?a ?b))
+  (where))
+
+(rule fold_icmp_sgt
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.sgt (const ?a) (const ?b)))
+  (rhs (eval icmp.sgt ?a ?b))
+  (where))
+
+(rule fold_icmp_sge
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.sge (const ?a) (const ?b)))
+  (rhs (eval icmp.sge ?a ?b))
+  (where))

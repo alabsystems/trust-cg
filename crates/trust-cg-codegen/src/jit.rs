@@ -15,7 +15,7 @@
 //!
 //! Reuses existing phases 1-8 (ISel through AArch64 encoding), then:
 //! 1. Lay out all functions contiguously in a buffer
-//! 2. Resolve internal fixups (cross-function BL/B calls)
+//! 2. Resolve internal fixups (cross-function BL/B and local function addresses)
 //! 3. Resolve external symbols via veneer trampolines
 //! 4. Allocate executable memory, copy code, flush icache
 //! 5. Return [`ExecutableBuffer`] with symbol→offset map
@@ -395,27 +395,41 @@
 //!    allocation to drop regardless of `HashMap` resize, insertion, or
 //!    iteration. The trampoline's literal pool can therefore cache the
 //!    address at compile time and read / write it indefinitely.
-//! 3. `impl Drop for ExecutableBuffer` runs in the order:
-//!    `munmap(memory)` first (user `Drop::drop`), then Rust-driven field
-//!    drops in declaration order. Because `memory` is dropped before
-//!    `counters` / `timing_cells` / `timing_state`, the executable code —
-//!    which is the **only** holder of raw counter pointers — is unmapped
-//!    strictly before any counter Box is dropped. There is therefore no
-//!    window in which the trampoline can execute against a freed counter.
+//! 3. Teardown unmaps before it releases those cells. An immediate
+//!    `RefCounted` drop and a deferred reclamation both move the mapping and
+//!    the cells into one record that calls `munmap` first and then drops the
+//!    cells. A process-lifetime buffer keeps both alive. The executable code,
+//!    which is the **only** holder of raw counter pointers, is therefore
+//!    never mapped while a counter it references is freed.
 //!
 //! The hazardous case is **not** counter-lifetime vs buffer-lifetime
-//! (structural, as above) but **buffer-lifetime vs in-flight JIT call**:
-//! if a caller drops the [`ExecutableBuffer`] while another thread is
-//! inside a JIT-compiled function, the `munmap` invalidates the text
-//! pages (and the embedded counter pointers) mid-call, producing the
-//! same use-after-free hazard described for
-//! [`ExecutableBuffer::get_fn_ptr`] / [`ExecutableBuffer::get_fn`]. The
-//! mitigation is identical: prefer the lifetime-bound
-//! [`ExecutableBuffer::get_fn_bound`] / [`ExecutableBuffer::get_fn_ptr_bound`]
-//! APIs, or wrap the buffer in `Arc<ExecutableBuffer>` and only drop it
-//! after every call has returned. See the `SAFETY` note on
-//! [`ExecutableBuffer`]'s `Send`/`Sync` impls and issue #355 for the
-//! legacy-API hazard, and #478 / #364 / #494 for the counter extensions.
+//! (structural, as above) but **buffer-lifetime vs in-flight JIT call**.
+//! The enforced teardown policy covers calls made under an
+//! [`ExecutableBuffer::execution_lease`] or
+//! [`ExecutableBuffer::leased_symbol_ptr`]. Under the default `RefCounted`
+//! policy, dropping the buffer while leases are in flight retires the
+//! mapping, and the last lease release unmaps it. `ProcessLifetime` never
+//! unmaps. A call made through a raw pointer WITHOUT a lease
+//! ([`ExecutableBuffer::get_fn_ptr`] / [`ExecutableBuffer::get_fn`], or an
+//! escaped `JitFn::into_inner`) still has the use-after-free hazard if the
+//! buffer is dropped mid-call. Such callers must keep the buffer alive until
+//! every call returns (see the `SAFETY` note on [`ExecutableBuffer`]'s
+//! `Send`/`Sync` impls, issue #355, and #478 / #364 / #494 for the counter
+//! extensions).
+//!
+//! # Publication: W^X and cache maintenance
+//!
+//! Mappings are born read+write, receive one bulk copy, are cache-maintained
+//! and then sealed read+execute. They never return to writable, and
+//! [`ExecutableBuffer::request_page_protection`] refuses RW/RWX requests with
+//! typed errors. On AArch64 the maintenance walk covers every data- and
+//! instruction-cache line overlapping the image with the minimum line sizes
+//! from CTR_EL0 ([`jit_cache_line_geometry`]). Darwin traps EL0 CTR_EL0
+//! reads, so it uses the recorded 16-byte architectural-minimum fallback.
+//! [`flush_instruction_cache`] runs the same walk over caller-owned code.
+//! Every completed walk is recorded per thread
+//! ([`instruction_cache_walks_on_current_thread`]), so a test can check that
+//! publication ran it over the image.
 //!
 //! ## Cross-references
 //!
@@ -442,18 +456,50 @@ use crate::jit_contract::{
     ArtifactContractError, ArtifactManifestV1, HostJitSelectedCodegenProfile, SymbolLookupContract,
     TargetDescriptor, TypedSymbol,
 };
+use crate::jit_page_witness::{
+    KernelPageProtectionError, KernelPageProtectionObservation, PublicationPageWitness,
+};
 use crate::macho::fixup::{Fixup, FixupTarget};
-#[cfg(target_arch = "aarch64")]
-use crate::pipeline::encode_function_with_fixups_and_blocks;
 use crate::pipeline::{
     DispatchVerifyMode, OptLevel, Pipeline, PipelineConfig, PipelineError,
-    aarch64_inst_requires_fp16, aarch64_opcode_requires_dotprod, aarch64_opcode_requires_lse,
-    encode_function_with_fixups,
+    aarch64_inst_required_features,
 };
-use crate::target::AArch64IsaProfile;
+use crate::target::{AArch64IsaFeature, AArch64IsaProfile, TargetFeatureSet};
 use trust_cg_ir::function::MachFunction as IrMachFunction;
+
+#[path = "jit_source_inputs.rs"]
+mod source_inputs;
+use source_inputs::Aarch64JitInputs;
 #[cfg(target_arch = "aarch64")]
 use trust_cg_ir::types::BlockId;
+
+mod local_address_replay;
+use local_address_replay::LocalAddressReplay;
+
+mod installed_replay;
+pub use installed_replay::InstalledArtifactReplayRecord;
+
+mod relocatable_image;
+#[cfg(feature = "source-defined-call")]
+pub(crate) use relocatable_image::publish_checked_defined_call;
+pub use relocatable_image::{
+    RELOCATABLE_IMAGE_FORMAT_VERSION, RELOCATABLE_IMAGE_MAGIC, RelinkError, RelocatableImage,
+    RelocatableImageRefusal, extern_name_set_sha256,
+};
+#[cfg(feature = "verify")]
+pub(crate) use relocatable_image::{publish_core_artifact, publish_physically_bound_core_peer};
+
+mod data_image;
+#[cfg(feature = "verify")]
+pub mod entry_stack;
+#[cfg(feature = "verify")]
+pub mod readonly_data;
+use crate::pipeline::ObjectGlobal;
+pub use data_image::JitDataImageRecord;
+use data_image::{
+    DataAddressSite, GotLoadSite, JitDataImageLayout, JitDataRegion, patch_data_address_site,
+    patch_got_load_site,
+};
 
 // ---------------------------------------------------------------------------
 // Raw syscall interface for executable memory management.
@@ -505,6 +551,9 @@ mod sys {
         pub(super) const SYS_MPROTECT: u64 = 74;
         // MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT
         pub(super) const MAP_FLAGS: i32 = 0x0002 | 0x1000 | 0x0800;
+        // MAP_PRIVATE | MAP_ANONYMOUS: the data image is never MAP_JIT, so the
+        // per-thread write-protect toggle never covers it.
+        pub(super) const DATA_MAP_FLAGS: i32 = 0x0002 | 0x1000;
         pub(super) const PAGE_SIZE: usize = 16384; // Apple Silicon
     }
 
@@ -516,6 +565,7 @@ mod sys {
         pub(super) const SYS_MUNMAP: u64 = 215;
         pub(super) const SYS_MPROTECT: u64 = 226;
         pub(super) const MAP_FLAGS: i32 = 0x0002 | 0x0020; // MAP_PRIVATE | MAP_ANONYMOUS
+        pub(super) const DATA_MAP_FLAGS: i32 = MAP_FLAGS;
         pub(super) const PAGE_SIZE: usize = 4096;
     }
 
@@ -529,6 +579,7 @@ mod sys {
         pub(super) const SYS_MPROTECT: u64 = 0x2000000 + 74;
         // MAP_PRIVATE | MAP_ANONYMOUS (no MAP_JIT needed on x86-64)
         pub(super) const MAP_FLAGS: i32 = 0x0002 | 0x1000;
+        pub(super) const DATA_MAP_FLAGS: i32 = MAP_FLAGS;
         pub(super) const PAGE_SIZE: usize = 4096; // x86-64 uses 4K pages
     }
 
@@ -540,6 +591,7 @@ mod sys {
         pub(super) const SYS_MUNMAP: u64 = 11;
         pub(super) const SYS_MPROTECT: u64 = 10;
         pub(super) const MAP_FLAGS: i32 = 0x0002 | 0x0020; // MAP_PRIVATE | MAP_ANONYMOUS
+        pub(super) const DATA_MAP_FLAGS: i32 = MAP_FLAGS;
         pub(super) const PAGE_SIZE: usize = 4096;
     }
 
@@ -551,6 +603,7 @@ mod sys {
         pub(super) const SYS_MUNMAP: u64 = 0;
         pub(super) const SYS_MPROTECT: u64 = 0;
         pub(super) const MAP_FLAGS: i32 = 0;
+        pub(super) const DATA_MAP_FLAGS: i32 = 0;
         pub(super) const PAGE_SIZE: usize = 4096;
     }
 
@@ -570,6 +623,7 @@ mod sys {
         pub(super) const SYS_MUNMAP: u64 = 0;
         pub(super) const SYS_MPROTECT: u64 = 0;
         pub(super) const MAP_FLAGS: i32 = 0;
+        pub(super) const DATA_MAP_FLAGS: i32 = 0;
         pub(super) const PAGE_SIZE: usize = 4096;
     }
 
@@ -581,6 +635,8 @@ mod sys {
     const SYS_MPROTECT: u64 = platform::SYS_MPROTECT;
     #[cfg_attr(all(target_arch = "x86_64", target_os = "windows"), allow(dead_code))]
     const MAP_FLAGS: i32 = platform::MAP_FLAGS;
+    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows"), allow(dead_code))]
+    const DATA_MAP_FLAGS: i32 = platform::DATA_MAP_FLAGS;
     pub(in crate::jit) const PAGE_SIZE: usize = platform::PAGE_SIZE;
 
     // -- Syscall result type ---------------------------------------------------
@@ -1128,6 +1184,56 @@ mod sys {
         let _ = unsafe { syscall2(SYS_MUNMAP, addr as u64, len as u64) };
     }
 
+    /// mmap a read-write (never executable, never `MAP_JIT`) anonymous data
+    /// mapping, asking for `hint` as its address. The hint is advisory: the
+    /// kernel may place the pages elsewhere, and the caller checks reach.
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    pub(in crate::jit) unsafe fn mmap_data_rw(
+        hint: usize,
+        len: usize,
+    ) -> Result<*mut u8, std::io::Error> {
+        // SAFETY: this `unsafe fn` wraps the raw mmap syscall; the caller
+        // owns the returned pages until it unmaps them.
+        let res = unsafe {
+            syscall6(
+                SYS_MMAP,
+                hint as u64,
+                len as u64,
+                RW as u64,
+                DATA_MAP_FLAGS as u64,
+                u64::MAX, // fd: -1
+                0,        // offset: 0
+            )
+        };
+        if let Some(e) = check_error(&res) {
+            Err(e)
+        } else {
+            Ok(res.val as *mut u8)
+        }
+    }
+
+    /// Windows arm of [`mmap_data_rw`]: reserve and commit read-write pages
+    /// at `hint`, falling back to any address when the hint is taken.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    pub(in crate::jit) unsafe fn mmap_data_rw(
+        hint: usize,
+        len: usize,
+    ) -> Result<*mut u8, std::io::Error> {
+        let flags = windows::MEM_RESERVE | windows::MEM_COMMIT;
+        let mut ptr =
+            unsafe { windows::VirtualAlloc(hint as *mut _, len, flags, windows::PAGE_READWRITE) };
+        if ptr.is_null() {
+            ptr = unsafe {
+                windows::VirtualAlloc(std::ptr::null_mut(), len, flags, windows::PAGE_READWRITE)
+            };
+        }
+        if ptr.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(ptr as *mut u8)
+        }
+    }
+
     #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
     pub(in crate::jit) unsafe fn mprotect(
         addr: *mut u8,
@@ -1208,33 +1314,83 @@ mod sys {
         }
     }
 
+    /// Read CTR_EL0 where the host OS permits EL0 access.
+    ///
+    /// Linux always permits it: either SCTLR_EL1.UCT lets the `mrs` execute
+    /// directly, or the kernel traps and emulates it with the system-wide
+    /// sanitised value (the minimum line sizes across every CPU).
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub(in crate::jit) fn read_ctr_el0() -> Option<u64> {
+        let raw: u64;
+        // SAFETY: reads a cache-type identification register into a general
+        // register; no memory is accessed and no flags change.
+        unsafe {
+            core::arch::asm!(
+                "mrs {raw}, ctr_el0",
+                raw = out(reg) raw,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        Some(raw)
+    }
+
+    /// Darwin keeps SCTLR_EL1.UCT clear, so an EL0 `mrs ctr_el0` raises
+    /// SIGILL (observed on Apple M-series). The register is therefore never
+    /// read there and the caller records the architectural-minimum fallback.
+    #[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
+    pub(in crate::jit) fn read_ctr_el0() -> Option<u64> {
+        None
+    }
+
+    /// Every address visited by a cache-maintenance walk of `[start,
+    /// start + len)` with a `line`-byte stride. The walk starts at the line
+    /// containing `start`, so an unaligned range still reaches its final
+    /// partial line. `line` must be a nonzero power of two.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(in crate::jit) fn cache_line_walk(
+        start: usize,
+        len: usize,
+        line: usize,
+    ) -> impl Iterator<Item = usize> {
+        assert!(
+            line.is_power_of_two(),
+            "cache-maintenance stride {line} is not a power of two"
+        );
+        let end = start.saturating_add(len);
+        let first = start & !(line - 1);
+        (first..end).step_by(line)
+    }
+
     pub(in crate::jit) unsafe fn flush_icache(addr: *mut u8, len: usize) {
         #[cfg(target_arch = "aarch64")]
         {
-            // Walk cache lines and invalidate. Line size = 64 bytes on Apple Silicon.
-            let mut p = addr as usize;
-            let end = p + len;
+            // Clean every data-cache line and invalidate every instruction-
+            // cache line overlapping the image, stepping by the smallest line
+            // of each cache (CTR_EL0.DminLine / IminLine). A stride larger
+            // than the smallest line would skip lines on hosts with shorter
+            // lines. Without a readable CTR_EL0 the geometry is the recorded
+            // 16-byte architectural minimum, which over-maintains.
+            let geometry = super::jit_cache_line_geometry();
+            let start = addr as usize;
             // SAFETY: caller supplies a valid [addr, addr+len) range for the
             // just-written executable mapping; DC/IC/DSB/ISB are side-effect
-            // free beyond the cache/barrier semantics they document.
+            // free beyond the cache/barrier semantics they document, and
+            // every visited address lies in a line overlapping that range.
             unsafe {
-                while p < end {
+                for line in cache_line_walk(start, len, geometry.dcache_min_line_bytes) {
                     core::arch::asm!(
                         "dc cvau, {addr}",   // Clean data cache to point of unification
-                        addr = in(reg) p,
+                        addr = in(reg) line,
                         options(nostack),
                     );
-                    p += 64;
                 }
                 core::arch::asm!("dsb ish", options(nostack)); // Data sync barrier
-                p = addr as usize;
-                while p < end {
+                for line in cache_line_walk(start, len, geometry.icache_min_line_bytes) {
                     core::arch::asm!(
                         "ic ivau, {addr}",   // Invalidate instruction cache
-                        addr = in(reg) p,
+                        addr = in(reg) line,
                         options(nostack),
                     );
-                    p += 64;
                 }
                 core::arch::asm!("dsb ish", options(nostack));
                 core::arch::asm!("isb", options(nostack)); // Instruction sync barrier
@@ -1254,6 +1410,9 @@ mod sys {
             // No cache flush needed after writing code to executable memory.
             let _ = (addr, len);
         }
+        // Structural record of the completed call on this thread; the
+        // publisher-walk row of tests/jit_icache_coherence.rs reads it.
+        super::record_instruction_cache_walk(addr as usize, len);
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
@@ -1275,6 +1434,109 @@ mod sys {
     pub(in crate::jit) fn page_align(len: usize) -> usize {
         (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
     }
+
+    /// Allocation primitive, flags and raw protections every JIT mapping on
+    /// this host is created and published with (bound into installed
+    /// payload bindings and manifests as `ExecutableMemoryProtection`).
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    pub(in crate::jit) const ALLOCATOR: &str = "mmap";
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    pub(in crate::jit) const ALLOCATION_FLAGS: u64 = MAP_FLAGS as u64;
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    pub(in crate::jit) const WRITE_PHASE_PROTECTION: u64 = RW as u64;
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+    pub(in crate::jit) const PUBLISHED_PROTECTION: u64 = RX as u64;
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    pub(in crate::jit) const ALLOCATOR: &str = "virtual_alloc";
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    pub(in crate::jit) const ALLOCATION_FLAGS: u64 =
+        (windows::MEM_RESERVE | windows::MEM_COMMIT) as u64;
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    pub(in crate::jit) const WRITE_PHASE_PROTECTION: u64 = windows::PAGE_READWRITE as u64;
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    pub(in crate::jit) const PUBLISHED_PROTECTION: u64 = windows::PAGE_EXECUTE_READ as u64;
+}
+
+#[cfg(test)]
+impl ExecutableBuffer {
+    /// Test-only: overwrite the recorded page-protection state, modelling the
+    /// same bytes republished under a different protection regime. The
+    /// allocator is fixed per host and cannot be overridden, and the recorded
+    /// permission string is always derived from the forced raw protection.
+    /// The witness source and publication-time observation are forced from
+    /// `protection.page_protection_witness`; the live kernel mapping is not
+    /// touched.
+    pub(crate) fn force_executable_memory_state_for_tests(
+        &mut self,
+        protection: &crate::jit_contract::ExecutableMemoryProtection,
+    ) {
+        use crate::jit_contract::PageProtectionWitnessSource;
+        use crate::jit_page_witness::{
+            KernelMapsReader, KernelPageProtectionError, KernelPageProtectionObservation,
+            KernelPageRun,
+        };
+        assert_eq!(protection.allocator, sys::ALLOCATOR);
+        self.publication = JitPublicationContract {
+            map_jit: protection.map_jit,
+            write_protect_supported: protection.write_protect_supported,
+            published_rx: protection.published_rx,
+        };
+        self.allocation = JitAllocationRecord {
+            allocation_flags: protection.allocation_flags,
+            allocation_granule_bytes: protection.allocation_granule_bytes,
+            write_phase_protection: protection.write_phase_protection,
+            published_protection: protection.published_protection,
+            mprotect_rx_ok: protection.mprotect_rx_ok,
+        };
+        let witness = &protection.page_protection_witness;
+        let start = self.memory as u64;
+        let end = start.saturating_add(self.allocation_len_opaque() as u64);
+        self.page_witness = match (witness.source, &witness.observed_permissions) {
+            (PageProtectionWitnessSource::RecordedOnly, _) => PublicationPageWitness::RecordedOnly,
+            (PageProtectionWitnessSource::KernelProcSelfMaps, Some(observed)) => {
+                PublicationPageWitness::Observed(KernelPageProtectionObservation {
+                    start,
+                    end,
+                    runs: vec![KernelPageRun {
+                        start,
+                        end,
+                        permissions: observed.clone(),
+                    }],
+                    reader: KernelMapsReader::Injected,
+                    attempts: 1,
+                })
+            }
+            (PageProtectionWitnessSource::KernelProcSelfMaps, None) => {
+                PublicationPageWitness::Failed(KernelPageProtectionError::Unreadable {
+                    detail: "forced for tests".to_owned(),
+                })
+            }
+        };
+    }
+}
+
+/// Allocation facts recorded when a JIT mapping is created and sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JitAllocationRecord {
+    allocation_flags: u64,
+    allocation_granule_bytes: u64,
+    write_phase_protection: u64,
+    published_protection: u64,
+    /// Outcome of the publication-time RW -> RX protection change.
+    mprotect_rx_ok: bool,
+}
+
+impl JitAllocationRecord {
+    fn current_platform(mprotect_rx_ok: bool) -> Self {
+        Self {
+            allocation_flags: sys::ALLOCATION_FLAGS,
+            allocation_granule_bytes: sys::PAGE_SIZE as u64,
+            write_phase_protection: sys::WRITE_PHASE_PROTECTION,
+            published_protection: sys::PUBLISHED_PROTECTION,
+            mprotect_rx_ok,
+        }
+    }
 }
 
 /// Ensure the current thread is ready to execute JIT code.
@@ -1288,6 +1550,410 @@ pub fn ensure_jit_execute_mode() {
     // SAFETY: enabling JIT write protection does not dereference memory or
     // grant write access; it only restores the current thread's execute mode.
     unsafe { sys::set_jit_write_protect(true) };
+}
+
+/// The entitlement a hardened-runtime macOS process needs before the kernel
+/// grants it a `MAP_JIT` mapping.
+pub const ALLOW_JIT_ENTITLEMENT: &str = "com.apple.security.cs.allow-jit";
+
+/// Code-signing status of the current process as the kernel reports it
+/// (`csops(CS_OPS_STATUS)` on macOS).
+///
+/// On Apple Silicon a process running under the hardened runtime
+/// ([`Self::hardened_runtime`]) receives a `MAP_JIT` mapping only when its
+/// signature carries [`ALLOW_JIT_ENTITLEMENT`]; otherwise the kernel refuses
+/// the mapping (`EINVAL` on macOS 26.6) and the JIT reports
+/// [`JitError::MapJitRefused`]. The status flags do not name entitlements, so
+/// they explain a refusal but cannot predict one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcessCodeSigningStatus {
+    /// Raw `CS_*` status flags.
+    pub flags: u32,
+}
+
+impl ProcessCodeSigningStatus {
+    /// The signature is dynamically valid.
+    pub const CS_VALID: u32 = 0x0000_0001;
+    /// Invalid pages are not loaded.
+    pub const CS_HARD: u32 = 0x0000_0100;
+    /// The process is killed if its signature becomes invalid.
+    pub const CS_KILL: u32 = 0x0000_0200;
+    /// The hardened runtime applies.
+    pub const CS_RUNTIME: u32 = 0x0001_0000;
+    /// The signature was written by the linker.
+    pub const CS_LINKER_SIGNED: u32 = 0x0002_0000;
+
+    /// Whether the kernel considers the signature valid.
+    pub fn is_valid(self) -> bool {
+        self.flags & Self::CS_VALID != 0
+    }
+
+    /// Whether the process runs under the hardened runtime.
+    pub fn hardened_runtime(self) -> bool {
+        self.flags & Self::CS_RUNTIME != 0
+    }
+
+    /// Whether the process's signature is the linker's ad-hoc signature.
+    pub fn is_linker_signed(self) -> bool {
+        self.flags & Self::CS_LINKER_SIGNED != 0
+    }
+}
+
+impl std::fmt::Display for ProcessCodeSigningStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "code-signing flags {:#010x} (valid={}, hardened_runtime={}, linker_signed={})",
+            self.flags,
+            self.is_valid(),
+            self.hardened_runtime(),
+            self.is_linker_signed()
+        )
+    }
+}
+
+/// The current process's code-signing status, or `None` where the host has
+/// no such query (every non-macOS host) or the kernel refuses it.
+pub fn process_code_signing_status() -> Option<ProcessCodeSigningStatus> {
+    #[cfg(target_os = "macos")]
+    {
+        const CS_OPS_STATUS: u32 = 0;
+        unsafe extern "C" {
+            fn csops(pid: i32, ops: u32, useraddr: *mut core::ffi::c_void, usersize: usize) -> i32;
+        }
+        let pid = i32::try_from(std::process::id()).ok()?;
+        let mut flags = 0u32;
+        // SAFETY: CS_OPS_STATUS writes exactly one u32 into the buffer, whose
+        // size is passed alongside it; the call reads no other memory.
+        let status = unsafe {
+            csops(
+                pid,
+                CS_OPS_STATUS,
+                (&mut flags as *mut u32).cast(),
+                std::mem::size_of::<u32>(),
+            )
+        };
+        (status == 0).then_some(ProcessCodeSigningStatus { flags })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Explain a kernel `MAP_JIT` refusal from the process's code-signing status.
+fn map_jit_refusal_cause(status: &Option<ProcessCodeSigningStatus>) -> String {
+    match status {
+        Some(status) if status.hardened_runtime() => format!(
+            "the process runs under the hardened runtime ({status}), which admits MAP_JIT only \
+             with the {ALLOW_JIT_ENTITLEMENT} entitlement in its code signature"
+        ),
+        Some(status) => format!(
+            "the process is not under the hardened runtime ({status}); the refusal has another \
+             cause"
+        ),
+        None => "the process's code-signing status is unavailable".to_string(),
+    }
+}
+
+/// Classify a failed JIT `mmap`. On Apple Silicon macOS every JIT mapping is
+/// `MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT` with a nonzero length, so `EINVAL`
+/// or `EPERM` is the kernel's code-signing policy refusing `MAP_JIT` (measured
+/// as `EINVAL` for a hardened-runtime process without the entitlement on macOS
+/// 26.6), not an argument error or memory exhaustion. Every other failure,
+/// and every failure on other hosts, stays [`JitError::MemoryAlloc`].
+fn classify_mapping_error(len: usize, error: std::io::Error) -> JitError {
+    const EPERM: i32 = 1;
+    const EINVAL: i32 = 22;
+    if sys::uses_map_jit() && len > 0 && matches!(error.raw_os_error(), Some(EPERM | EINVAL)) {
+        return JitError::MapJitRefused {
+            len,
+            code_signing: process_code_signing_status(),
+            source: error,
+        };
+    }
+    JitError::MemoryAlloc(error)
+}
+
+/// Smallest cache line the AArch64 architecture permits (`CCSIDR_EL1.LineSize`
+/// encodes `log2(bytes) - 4`, so a line is never shorter than 16 bytes).
+pub const AARCH64_MIN_CACHE_LINE_BYTES: usize = 16;
+
+/// Largest cache line the AArch64 architecture permits (2 KiB). A decoded
+/// line above this is not an architectural CTR_EL0 value.
+pub const AARCH64_MAX_CACHE_LINE_BYTES: usize = 2048;
+
+/// Why the JIT publisher fell back to the architectural minimum line size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JitCacheLineFallbackReason {
+    /// The host OS does not permit EL0 reads of CTR_EL0 (Darwin traps them
+    /// with SIGILL), so the register was never read.
+    CtrEl0Unreadable,
+    /// CTR_EL0 was read but did not decode to an architectural value: bit 31
+    /// (RES1) was clear or a minimum line lay outside 16..=2048 bytes.
+    CtrEl0Invalid,
+}
+
+/// Source of the line sizes the JIT publisher uses for cache maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JitCacheLineSource {
+    /// Decoded from CTR_EL0 `DminLine` / `IminLine`.
+    CtrEl0,
+    /// Both walks use [`AARCH64_MIN_CACHE_LINE_BYTES`]; over-maintenance is
+    /// safe, a longer stride than the smallest line would not be.
+    ArchitecturalMinimumFallback(JitCacheLineFallbackReason),
+    /// x86-64 Unix: instruction fetch is coherent with data stores, so no
+    /// line walk is performed.
+    CoherentHost,
+    /// Windows: publication calls `FlushInstructionCache` for the whole image.
+    OsFlushPrimitive,
+}
+
+impl JitCacheLineSource {
+    /// Stable lower-snake-case label for replay and binding evidence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CtrEl0 => "ctr_el0",
+            Self::ArchitecturalMinimumFallback(JitCacheLineFallbackReason::CtrEl0Unreadable) => {
+                "architectural_minimum_fallback:ctr_el0_unreadable"
+            }
+            Self::ArchitecturalMinimumFallback(JitCacheLineFallbackReason::CtrEl0Invalid) => {
+                "architectural_minimum_fallback:ctr_el0_invalid"
+            }
+            Self::CoherentHost => "coherent_host",
+            Self::OsFlushPrimitive => "os_flush_primitive",
+        }
+    }
+}
+
+/// Cache-maintenance geometry used to publish JIT code on this host.
+///
+/// On AArch64 the publisher cleans the data cache and invalidates the
+/// instruction cache over the whole published image, stepping by these
+/// minimum line sizes. Line sizes are zero on hosts that perform no line walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JitCacheLineGeometry {
+    /// Smallest data-cache line in bytes (the `dc cvau` stride).
+    pub dcache_min_line_bytes: usize,
+    /// Smallest instruction-cache line in bytes (the `ic ivau` stride).
+    pub icache_min_line_bytes: usize,
+    /// Raw CTR_EL0 value when it was read.
+    pub ctr_el0: Option<u64>,
+    /// Where the line sizes came from, including any recorded fallback.
+    pub source: JitCacheLineSource,
+}
+
+impl JitCacheLineGeometry {
+    /// Decode an AArch64 CTR_EL0 value, or record the architectural-minimum
+    /// fallback when it is absent or not architecturally valid.
+    ///
+    /// `DminLine` (bits 19:16) and `IminLine` (bits 3:0) hold log2 of the
+    /// smallest line in 4-byte words, so a line is `4 << field` bytes.
+    pub const fn from_aarch64_ctr_el0(ctr_el0: Option<u64>) -> Self {
+        let Some(raw) = ctr_el0 else {
+            return Self::architectural_minimum(None, JitCacheLineFallbackReason::CtrEl0Unreadable);
+        };
+        let dline = 4usize << ((raw >> 16) & 0xf);
+        let iline = 4usize << (raw & 0xf);
+        let res1 = (raw >> 31) & 1 == 1;
+        if !res1
+            || dline < AARCH64_MIN_CACHE_LINE_BYTES
+            || dline > AARCH64_MAX_CACHE_LINE_BYTES
+            || iline < AARCH64_MIN_CACHE_LINE_BYTES
+            || iline > AARCH64_MAX_CACHE_LINE_BYTES
+        {
+            return Self::architectural_minimum(
+                Some(raw),
+                JitCacheLineFallbackReason::CtrEl0Invalid,
+            );
+        }
+        Self {
+            dcache_min_line_bytes: dline,
+            icache_min_line_bytes: iline,
+            ctr_el0: Some(raw),
+            source: JitCacheLineSource::CtrEl0,
+        }
+    }
+
+    const fn architectural_minimum(
+        ctr_el0: Option<u64>,
+        reason: JitCacheLineFallbackReason,
+    ) -> Self {
+        Self {
+            dcache_min_line_bytes: AARCH64_MIN_CACHE_LINE_BYTES,
+            icache_min_line_bytes: AARCH64_MIN_CACHE_LINE_BYTES,
+            ctr_el0,
+            source: JitCacheLineSource::ArchitecturalMinimumFallback(reason),
+        }
+    }
+
+    /// Whether the publisher is using the recorded architectural-minimum
+    /// fallback rather than a decoded CTR_EL0 geometry.
+    pub const fn is_fallback(&self) -> bool {
+        matches!(
+            self.source,
+            JitCacheLineSource::ArchitecturalMinimumFallback(_)
+        )
+    }
+}
+
+/// Cache-maintenance geometry for this process, computed once.
+///
+/// On AArch64 Linux this decodes CTR_EL0; on Darwin, where EL0 reads of
+/// CTR_EL0 trap, it is the recorded 16-byte architectural-minimum fallback.
+pub fn jit_cache_line_geometry() -> JitCacheLineGeometry {
+    static GEOMETRY: std::sync::OnceLock<JitCacheLineGeometry> = std::sync::OnceLock::new();
+    *GEOMETRY.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        {
+            JitCacheLineGeometry::from_aarch64_ctr_el0(sys::read_ctr_el0())
+        }
+        #[cfg(all(not(target_arch = "aarch64"), target_os = "windows"))]
+        {
+            JitCacheLineGeometry {
+                dcache_min_line_bytes: 0,
+                icache_min_line_bytes: 0,
+                ctr_el0: None,
+                source: JitCacheLineSource::OsFlushPrimitive,
+            }
+        }
+        #[cfg(all(not(target_arch = "aarch64"), not(target_os = "windows")))]
+        {
+            JitCacheLineGeometry {
+                dcache_min_line_bytes: 0,
+                icache_min_line_bytes: 0,
+                ctr_el0: None,
+                source: JitCacheLineSource::CoherentHost,
+            }
+        }
+    })
+}
+
+/// Run the publisher's instruction-cache maintenance walk over `[start,
+/// start + len)`.
+///
+/// This is the same function every JIT publication calls between the bulk
+/// copy and the read-execute seal, not a copy of it. On AArch64 it issues
+/// `dc cvau` for every data-cache line and `ic ivau` for every
+/// instruction-cache line overlapping the range. Each walk starts at the line
+/// containing `start` and steps by the minimum line size that
+/// [`jit_cache_line_geometry`] reports. It ends with `dsb ish; isb`. On
+/// Windows x86-64 it calls `FlushInstructionCache`, and other x86-64 hosts
+/// need no maintenance.
+///
+/// Published buffers are never rewritten. This entry point lets a native
+/// coherence control rewrite code it owns in place and then run the
+/// production walk on it. The `ic ivau` invalidation reaches every core in
+/// the inner-shareable domain. A thread on another core must still take a
+/// context-synchronisation event, such as `isb`, after it observes the
+/// rewrite and before it executes the range.
+///
+/// An empty range (`len == 0`) returns at once: no line is visited, whatever
+/// `start` is, and no walk is recorded. The walk itself starts at the line
+/// containing `start`, so without this check an empty range at an unaligned
+/// dangling address such as `NonNull::dangling()` would still maintain the
+/// line at address 0 and fault.
+///
+/// # Safety
+///
+/// When `len > 0`, `[start, start + len)` must lie inside memory that is
+/// mapped readable in this process for the whole call. The walk visits only
+/// lines overlapping that range, which lie in the same pages. The walk
+/// changes no bytes and no page protections.
+pub unsafe fn flush_instruction_cache(start: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: `len > 0` and the caller guarantees the range is mapped and
+    // readable; the maintenance walk only visits lines overlapping it.
+    unsafe { sys::flush_icache(start.cast_mut(), len) }
+}
+
+/// One completed call of the instruction-cache maintenance walk
+/// (`sys::flush_icache`, the walk publication runs before its read-execute
+/// seal): the range it was asked to maintain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstructionCacheWalk {
+    /// Address of the first byte of the range.
+    pub start: usize,
+    /// Length of the range in bytes.
+    pub len: usize,
+}
+
+/// The maintenance walks completed on the calling thread: how many, and the
+/// most recent one.
+///
+/// Publication runs the walk on the publishing thread, so a caller can read
+/// this before and after a publication and check that the walk ran over the
+/// published image. It is a structural record of the call, kept on every
+/// host (including hosts whose walk is a no-op). It says nothing about what
+/// the walk did to the caches; the native coherence rows check that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InstructionCacheWalkLog {
+    /// Walks completed on this thread since it started.
+    pub count: u64,
+    /// The most recent walk on this thread.
+    pub last: Option<InstructionCacheWalk>,
+}
+
+thread_local! {
+    static INSTRUCTION_CACHE_WALKS: std::cell::Cell<InstructionCacheWalkLog> =
+        const { std::cell::Cell::new(InstructionCacheWalkLog { count: 0, last: None }) };
+}
+
+/// The instruction-cache maintenance walks completed on the calling thread.
+/// See [`InstructionCacheWalkLog`].
+pub fn instruction_cache_walks_on_current_thread() -> InstructionCacheWalkLog {
+    INSTRUCTION_CACHE_WALKS.with(std::cell::Cell::get)
+}
+
+/// Called by `sys::flush_icache` after its walk completes.
+fn record_instruction_cache_walk(start: usize, len: usize) {
+    INSTRUCTION_CACHE_WALKS.with(|walks| {
+        let previous = walks.get();
+        walks.set(InstructionCacheWalkLog {
+            count: previous.count.wrapping_add(1),
+            last: Some(InstructionCacheWalk { start, len }),
+        });
+    });
+}
+
+/// Page protection a caller may request for a published executable buffer.
+///
+/// Published JIT memory is W^X: the only state a published buffer may be
+/// (re)asserted into is [`Self::ReadExecute`]. A writable request is refused
+/// with a typed [`JitError`] and never reaches the memory-protection syscall;
+/// patched code must be republished into a fresh mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JitPageProtection {
+    /// Readable and writable, not executable (the pre-publication write phase).
+    ReadWrite,
+    /// Readable and executable, not writable (the published state).
+    ReadExecute,
+    /// Simultaneously writable and executable. Always refused.
+    ReadWriteExecute,
+}
+
+impl JitPageProtection {
+    /// Stable label for diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWrite => "read+write",
+            Self::ReadExecute => "read+execute",
+            Self::ReadWriteExecute => "read+write+execute",
+        }
+    }
+
+    /// Whether this protection satisfies write-xor-execute.
+    pub const fn is_w_xor_x(self) -> bool {
+        !matches!(self, Self::ReadWriteExecute)
+    }
+}
+
+impl std::fmt::Display for JitPageProtection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Windows x64 unwind registration input for one JIT-published function.
@@ -1378,7 +2044,7 @@ impl Drop for WindowsJitUnwindRegistration {
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 #[derive(Default)]
-struct WindowsJitUnwindRegistration;
+struct WindowsJitUnwindRegistration {}
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 impl WindowsJitUnwindRegistration {
@@ -2002,7 +2668,8 @@ impl MappedRegion {
         // ownership of the returned pages is held by `self` until either
         // `Drop` unmaps them or `into_published_parts` transfers them to an
         // `ExecutableBuffer`.
-        let ptr = unsafe { sys::mmap(len, sys::RW).map_err(JitError::MemoryAlloc)? };
+        let ptr = unsafe { sys::mmap(len, sys::RW) }
+            .map_err(|error| classify_mapping_error(len, error))?;
         track_mapped_region_alloc(len);
         Ok(Self {
             ptr,
@@ -2065,6 +2732,24 @@ impl MappedRegion {
             });
         }
         Ok(())
+    }
+
+    /// Allocation facts of this mapping, including whether its RW -> RX
+    /// seal succeeded.
+    fn allocation_record(&self) -> JitAllocationRecord {
+        JitAllocationRecord::current_platform(self.sealed_rx)
+    }
+
+    /// The kernel's view of the whole sealed mapping, taken with this host's
+    /// witness source (`/proc/self/maps` on Linux, recorded-only elsewhere).
+    /// A failed observation is recorded, not raised: raw JIT publication is
+    /// unchanged, and the compile service refuses to bind it by name.
+    fn publication_page_witness(&self) -> PublicationPageWitness {
+        assert!(
+            self.sealed_rx,
+            "the publication page witness is taken only after the read-execute seal"
+        );
+        PublicationPageWitness::capture(self.ptr as u64, self.len as u64)
     }
 
     /// Transfer ownership of the sealed pages to the caller (the
@@ -2150,6 +2835,90 @@ mod publish_test_hooks {
 
 #[cfg(test)]
 use publish_test_hooks::corrupt_published_byte_if_requested;
+
+/// Test-only fault injection for the installed-artifact replay (L11-P2):
+/// after the seal, the cache-maintenance walk and certification, but before
+/// the replay and the hand-out, re-open the sealed mapping, change it, walk
+/// the cache again and re-seal it, so the replay reads a tampered
+/// installation from the executable mapping itself.
+#[cfg(test)]
+mod installed_replay_test_hooks {
+    use std::cell::Cell;
+
+    use super::installed_replay::InstalledReplayInventory;
+    use super::{JitError, MappedRegion, sys};
+
+    /// One tamper of the installed image. Only the AArch64 installed-replay
+    /// tests (`jit_installed_replay_tests`, AArch64 with `verify`) construct
+    /// one; on other hosts the hook only ever reads `None`.
+    #[derive(Clone, Copy, Debug)]
+    #[cfg_attr(
+        not(all(target_arch = "aarch64", feature = "verify")),
+        allow(dead_code)
+    )]
+    pub(super) enum InstalledTamper {
+        /// XOR one byte of the installed image at this offset.
+        FlipByte(usize),
+        /// Re-encode the first branch relocation one word further on: still
+        /// a valid B/BL, now to a wrong target.
+        RetargetFirstBranch,
+        /// Add 4 to the first veneer's installed 64-bit literal.
+        ShiftFirstVeneerLiteral,
+    }
+
+    thread_local! {
+        pub(super) static TAMPER_INSTALLED_IMAGE: Cell<Option<InstalledTamper>> =
+            const { Cell::new(None) };
+    }
+
+    pub(super) fn tamper_installed_image_if_requested(
+        region: &MappedRegion,
+        published_len: usize,
+        inventory: &InstalledReplayInventory,
+    ) -> Result<(), JitError> {
+        let Some(tamper) = TAMPER_INSTALLED_IMAGE.with(|slot| slot.take()) else {
+            return Ok(());
+        };
+        let base = region.as_mut_ptr();
+        // SAFETY: test-only. `region` owns the sealed mapping of `region.len`
+        // bytes; it is made writable (with the MAP_JIT write window open on
+        // this thread), changed inside `published_len`, walked and re-sealed
+        // before anything executes it.
+        unsafe {
+            let guard = sys::JitWriteGuard::enter();
+            sys::mprotect(base, region.len, sys::RW).map_err(JitError::MemoryProtect)?;
+            match tamper {
+                InstalledTamper::FlipByte(at) => {
+                    assert!(at < published_len, "tamper offset inside the image");
+                    let byte = base.add(at);
+                    byte.write(byte.read() ^ 0xa5);
+                }
+                InstalledTamper::RetargetFirstBranch => {
+                    let site = inventory
+                        .first_branch_site()
+                        .expect("the tampered publication has a branch relocation")
+                        as usize;
+                    let word = base.add(site).cast::<u32>();
+                    let old = word.read_unaligned();
+                    let imm26 = old.wrapping_add(1) & 0x03ff_ffff;
+                    word.write_unaligned((old & !0x03ff_ffff) | imm26);
+                }
+                InstalledTamper::ShiftFirstVeneerLiteral => {
+                    let at = inventory
+                        .first_veneer_literal()
+                        .expect("the tampered publication has a veneer")
+                        as usize;
+                    let literal = base.add(at).cast::<u64>();
+                    literal.write_unaligned(literal.read_unaligned().wrapping_add(4));
+                }
+            }
+            sys::flush_icache(base, published_len);
+            sys::mprotect(base, region.len, sys::RX).map_err(JitError::MemoryProtect)?;
+            drop(guard);
+        }
+        Ok(())
+    }
+}
 
 #[cfg(not(test))]
 #[inline(always)]
@@ -2243,11 +3012,14 @@ pub(crate) fn publish_raw_executable_buffer_with_profile_data(
     // On registration failure `region`'s Drop unmaps — no manual munmap.
     let windows_unwind = windows_unwind.register(region.as_mut_ptr() as u64)?;
 
+    let allocation = region.allocation_record();
+    let page_witness = region.publication_page_witness();
     let (memory, alloc_size) = region.into_published_parts();
     let allocation_cookie =
         executable_buffer_allocation_cookie(memory, alloc_size, code_len, published_len);
     Ok(ExecutableBuffer {
         memory,
+        data_region: None,
         len: alloc_size,
         len_shadow: alloc_size,
         allocation_cookie,
@@ -2256,15 +3028,25 @@ pub(crate) fn publish_raw_executable_buffer_with_profile_data(
         published_image_sha256: expected_sha256,
         host_jit_selected_codegen_profile: None,
         publication: JitPublicationContract::published_rx(),
+        allocation,
+        page_witness,
+        teardown_policy: crate::jit_contract::TeardownPolicy::RefCounted,
+        execution_gate: ExecutionGate::new_shared(),
         windows_unwind,
+        eh_frame_unwind: crate::jit_unwind::EhFrameJitUnwindRegistration::default(),
+        unwind_manifest: None,
         function_ranges,
         symbol_offsets,
+        data_symbols: HashMap::new(),
+        data_image: None,
         canonical_symbols,
         counters,
         timing_cells: HashMap::new(),
         timing_state: None,
         certificates: HashMap::new(),
+        installed_replay: None,
         proof_optimization_certificates: Vec::new(),
+        function_target_features: TargetFeatureSet::EMPTY,
     })
 }
 
@@ -2293,14 +3075,28 @@ pub(crate) fn publish_raw_executable_buffer_with_profile_data(
 /// Windows therefore requires the buffer to have been produced without
 /// unwind-info patching (which is the case for the BCP kernels).
 ///
+/// `target_contract` is the producing buffer's
+/// [`ExecutableBuffer::serialized_target_contract`]: the host-JIT contract
+/// ([`TargetDescriptor::for_trust_cg_host_jit`]) plus the target features
+/// the buffer's functions state beyond that profile (L03-P9). It must equal
+/// the live host-JIT contract except for those additional features, each of
+/// which must be a modeled AArch64 feature this CPU implements
+/// ([`crate::aarch64_dispatch::aarch64_host_features`]); otherwise nothing is
+/// mapped ([`JitError::SerializedBufferTargetMismatch`],
+/// [`JitError::SerializedBufferFeatureUnsupportedByHost`]).
+///
 /// # Safety
 ///
 /// `code` must be an authenticated Trust Codegen payload produced for the
 /// exact `target_contract`; every instruction, relocation, symbol range, and
-/// function ABI must satisfy that contract. A byte checksum is sufficient
-/// only when its domain also binds the compiler build, target triple, and full
-/// optional-feature profile. This function checks that `target_contract`
-/// equals the live host contract, but cannot infer arbitrary bytes' ISA needs.
+/// function ABI must satisfy that contract. In particular the contract must
+/// name every feature the code's functions state: the host-JIT contract
+/// alone covers only the JIT profile, and a function compiled under its own
+/// target features (a CRC32 word, say) needs them recorded here to be
+/// checked against this CPU. A byte checksum is sufficient only when its
+/// domain also binds the compiler build, target triple, and that complete
+/// feature contract. This function checks the contract against the live
+/// host, but cannot infer arbitrary bytes' ISA needs.
 pub unsafe fn publish_serialized_buffer_for_target(
     code: &[u8],
     canonical_symbols: Vec<String>,
@@ -2308,13 +3104,11 @@ pub unsafe fn publish_serialized_buffer_for_target(
     function_ranges: Vec<(String, std::ops::Range<u64>)>,
     target_contract: &TargetDescriptor,
 ) -> Result<ExecutableBuffer, JitError> {
-    let host_contract = TargetDescriptor::for_trust_cg_host_jit();
-    if target_contract != &host_contract {
-        return Err(JitError::SerializedBufferTargetMismatch {
-            serialized_target: format!("{target_contract:?}"),
-            host_target: format!("{host_contract:?}"),
-        });
-    }
+    let function_target_features = serialized_function_target_features(
+        target_contract,
+        &TargetDescriptor::for_trust_cg_host_jit(),
+        crate::aarch64_dispatch::aarch64_host_features(),
+    )?;
     // No profile counters: the empty `counters` map paired with the empty
     // `counter_patch_sites` list short-circuits the patch loop inside
     // `publish_raw_executable_buffer_with_profile_data` so no
@@ -2322,7 +3116,7 @@ pub unsafe fn publish_serialized_buffer_for_target(
     let counters: HashMap<String, Box<AtomicU64>> = HashMap::new();
     let counter_patch_sites: Vec<(usize, *const AtomicU64)> = Vec::new();
     let windows_unwind_functions: Vec<WindowsJitUnwindFunction> = Vec::new();
-    publish_raw_executable_buffer_with_profile_data(
+    let mut buffer = publish_raw_executable_buffer_with_profile_data(
         code,
         canonical_symbols,
         symbol_offsets,
@@ -2330,25 +3124,56 @@ pub unsafe fn publish_serialized_buffer_for_target(
         counters,
         counter_patch_sites,
         windows_unwind_functions,
-    )
+    )?;
+    buffer.function_target_features = function_target_features;
+    Ok(buffer)
 }
 
-/// Legacy serialized-code publication entry point.
+/// The function target features a serialized contract names beyond the
+/// host-JIT contract, checked against `host`.
 ///
-/// This source-compatible shim now fails closed because the historical API
-/// carried no target-feature or provenance authority. Authenticated caches
-/// must use [`publish_serialized_buffer_for_target`] after checking a digest
-/// whose domain binds the exact compiler and target profile.
-#[deprecated(
-    note = "unauthenticated native replay is refused; verify payload provenance and use unsafe publish_serialized_buffer_for_target"
-)]
-pub fn publish_serialized_buffer(
-    _code: &[u8],
-    _canonical_symbols: Vec<String>,
-    _symbol_offsets: HashMap<String, u64>,
-    _function_ranges: Vec<(String, std::ops::Range<u64>)>,
-) -> Result<ExecutableBuffer, JitError> {
-    Err(JitError::SerializedBufferTargetAuthorityRequired)
+/// Every field but `features` must equal `host_contract`, and the contract's
+/// features must include the host's. Each additional name must be a modeled
+/// optional AArch64 feature (on an AArch64 host contract) that `host`
+/// implements.
+fn serialized_function_target_features(
+    target_contract: &TargetDescriptor,
+    host_contract: &TargetDescriptor,
+    host: crate::aarch64_dispatch::AArch64HostFeatures,
+) -> Result<TargetFeatureSet<AArch64IsaFeature>, JitError> {
+    let mismatch = || JitError::SerializedBufferTargetMismatch {
+        serialized_target: format!("{target_contract:?}"),
+        host_target: format!("{host_contract:?}"),
+    };
+    let mut beside_features = target_contract.clone();
+    beside_features.features = host_contract.features.clone();
+    if &beside_features != host_contract
+        || !host_contract
+            .features
+            .iter()
+            .all(|feature| target_contract.features.contains(feature))
+    {
+        return Err(mismatch());
+    }
+    let mut stated = TargetFeatureSet::EMPTY;
+    for name in target_contract
+        .features
+        .iter()
+        .filter(|feature| !host_contract.features.contains(feature))
+    {
+        if host_contract.architecture != crate::jit_contract::TargetArchitecture::Aarch64 {
+            return Err(mismatch());
+        }
+        let feature = AArch64IsaFeature::from_name(name).ok_or_else(mismatch)?;
+        if !host.implements(feature) {
+            return Err(JitError::SerializedBufferFeatureUnsupportedByHost {
+                feature: feature.name(),
+                host_features: host.names(),
+            });
+        }
+        stated = stated.union(TargetFeatureSet::from_aarch64_features([feature]));
+    }
+    Ok(stated)
 }
 
 // ---------------------------------------------------------------------------
@@ -2379,11 +3204,42 @@ mod dl {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// JIT compilation / publication failure.
+///
+/// Deliberately NOT `#[non_exhaustive]`: the rustc bridge's diagnostic
+/// classifier (`classify_compile_error`) matches every variant by name so a new
+/// variant cannot compile until someone decides which layer produced it
+/// (trust-core architecture AD-8 / E0.3). An exhaustiveness escape hatch here
+/// would force that classifier back to a default arm.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum JitError {
+    #[error(transparent)]
+    IdentityEncoding(#[from] crate::jit_cert::JitIdentityEncodingError),
+    /// The source or lowered trust-ir module has no binary wire image, so the
+    /// verifier input cannot be bound to a module custody digest.
+    #[error("AArch64 JIT verifier input has no source-module custody: {0}")]
+    SourceModuleHasNoWireImage(String),
+    #[error("AArch64 JIT source count mismatch: {machine} machine functions, {lir} LIR functions")]
+    LirSourceCountMismatch { machine: usize, lir: usize },
+    #[error(
+        "AArch64 JIT source pairing mismatch at ordinal {ordinal}: machine `{machine}`, LIR `{lir}`"
+    )]
+    LirSourcePairMismatch {
+        ordinal: usize,
+        machine: String,
+        lir: String,
+    },
+    #[error("invalid execution resource budget: {0}")]
+    ResourceBudget(#[from] trust_cg_process_env::resource_budget::ResourceBudgetError),
     #[error("pipeline error: {0}")]
     Pipeline(#[from] PipelineError),
+
+    /// Block-profile instrumentation could not splice its counter / timing
+    /// trampolines into an already-encoded AArch64 body (block offsets, branch
+    /// and ADR retargeting after the splice). A JIT-instrumentation refusal,
+    /// not a pipeline encoding failure.
+    #[error("JIT block-profile splice failed: {0}")]
+    BlockProfileSplice(String),
 
     #[error("unresolved symbol: {0}")]
     UnresolvedSymbol(String),
@@ -2399,13 +3255,135 @@ pub enum JitError {
     #[error("memory allocation failed: {0}")]
     MemoryAlloc(std::io::Error),
 
+    /// The kernel refused the `MAP_JIT` mapping every Apple Silicon JIT
+    /// publication needs. A hardened-runtime process needs the
+    /// `com.apple.security.cs.allow-jit` entitlement ([`ALLOW_JIT_ENTITLEMENT`]).
+    #[error(
+        "MAP_JIT mapping of {len} bytes was refused by the kernel ({source}): {}",
+        map_jit_refusal_cause(.code_signing)
+    )]
+    MapJitRefused {
+        len: usize,
+        code_signing: Option<ProcessCodeSigningStatus>,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("memory protection failed: {0}")]
     MemoryProtect(std::io::Error),
+
+    #[error(
+        "W^X refusal: {requested} protection was requested for the published JIT mapping at {buffer_base:#x} (allocation_len={allocation_len}); writable and executable JIT pages are never granted"
+    )]
+    WritableExecutableProtectionRefused {
+        requested: JitPageProtection,
+        buffer_base: u64,
+        allocation_len: usize,
+    },
+
+    #[error(
+        "published JIT mapping at {buffer_base:#x} (allocation_len={allocation_len}) cannot return to {requested}; published code is never made writable again, so patched code must be republished into a fresh mapping"
+    )]
+    PublishedProtectionDowngradeRefused {
+        requested: JitPageProtection,
+        buffer_base: u64,
+        allocation_len: usize,
+    },
+
+    #[error(
+        "JIT executable buffer at {buffer_base:#x} cannot be released: {in_flight} leased execution(s) are still in flight"
+    )]
+    ExecutableBufferInFlight { buffer_base: u64, in_flight: usize },
+
+    #[error(
+        "JIT executable buffer at {buffer_base:#x} is retained for the process lifetime and cannot be released"
+    )]
+    ProcessLifetimeReleaseRefused { buffer_base: u64 },
+
+    #[error(
+        "teardown policy {policy} is not enforceable by Trust Codegen-owned executable memory; only ref_counted and process_lifetime are enforced"
+    )]
+    UnenforceableTeardownPolicy { policy: String },
+
+    #[error(
+        "teardown policy cannot move from {current} to {requested}: raw pointers may already rely on the stronger lifetime"
+    )]
+    TeardownPolicyDowngradeRefused { current: String, requested: String },
 
     #[error(
         "raw JIT exception handling is unsupported for `{function}`: compile_raw publishes code without registering its LSDA/personality/unwind-frame sidecar"
     )]
     RawJitEhUnsupported { function: String },
+
+    #[error(
+        "AArch64 JIT unwind tables for `{function}` have no proof evidence path: proof-grade JIT modes (AlwaysVerify, CachedVerified, emit_proofs, relocation replay) refuse exception-handling and panic-unwind publication"
+    )]
+    JitUnwindProofEvidenceUnavailable { function: String },
+
+    #[error(
+        "AArch64 JIT unwind tables for `{function}` are unsupported with profile hook mode {mode:?}: profiling prefixes and splices shift the frame the FDE and LSDA describe"
+    )]
+    JitUnwindProfileHooksUnsupported {
+        function: String,
+        mode: ProfileHookMode,
+    },
+
+    #[error(
+        "AArch64 JIT unwind tables need the frame layout of `{function}`, but none was recorded for it"
+    )]
+    JitUnwindFrameLayoutMissing { function: String },
+
+    #[error(
+        "AArch64 JIT frame of `{function}` cannot be described by the JIT unwind tables: {detail}"
+    )]
+    JitUnwindFrameShapeUnsupported { function: String, detail: String },
+
+    #[error(
+        "AArch64 JIT prologue of `{function}` does not match the frame layout its FDE describes: {detail}"
+    )]
+    JitUnwindPrologueMismatch { function: String, detail: String },
+
+    #[error(
+        "AArch64 JIT unwind tables support one personality routine per module (one CIE); found {personalities:?}"
+    )]
+    JitUnwindMultiplePersonalities { personalities: Vec<String> },
+
+    #[error(
+        "AArch64 JIT unwind tables for `{function}` cannot bind typed-catch typeinfo symbols {typeinfo_symbols:?}: the in-memory LSDA carries no typeinfo indirection slots, so typed catches are refused (catch-all and cleanup pads only)"
+    )]
+    JitUnwindTypedCatchUnsupported {
+        function: String,
+        typeinfo_symbols: Vec<String>,
+    },
+
+    #[error(
+        "AArch64 JIT personality routine `{personality}` has no explicit binding and process lookup is unavailable or not permitted"
+    )]
+    JitUnwindPersonalityUnresolved { personality: String },
+
+    #[error("AArch64 JIT unwind tables were rejected before publication: {detail}")]
+    JitUnwindTableRejected { detail: String },
+
+    #[error(
+        "AArch64 JIT unwind field at image offset {field_offset} cannot reach target offset {target_offset} with a 32-bit PC-relative value"
+    )]
+    JitUnwindRelocationOutOfRange {
+        field_offset: u64,
+        target_offset: u64,
+    },
+
+    #[error("AArch64 JIT unwind registration is unavailable: {detail}")]
+    JitUnwindRegistrationUnavailable { detail: String },
+
+    #[error(
+        "the process unwinder did not return the registered FDE for `{function}`: expected FDE {expected_fde:#x}, observed {observed_fde:#x} for function start {observed_function:#x}"
+    )]
+    JitUnwindRegistrationNotObserved {
+        function: String,
+        expected_fde: u64,
+        observed_fde: u64,
+        observed_function: u64,
+    },
 
     #[error(
         "raw JIT target mismatch for `{function}`: JitCompiler::compile_raw consumes AArch64 MachFunction instructions, but the host architecture is {host_arch}; use the typed Compiler/trust_ir JIT path for architecture-specific lowering"
@@ -2425,6 +3403,19 @@ pub enum JitError {
         host_profile: String,
     },
 
+    /// A function states target features (its own `#[target_feature]`
+    /// admission) that the executing CPU does not implement. In-process code
+    /// runs on exactly this CPU, so the function could never be called
+    /// legally; it is refused before any byte is published.
+    #[error(
+        "[TCG-TARGET-FEATURE] raw AArch64 JIT function `{function}` states target feature `{feature}`, which this host CPU does not implement (host implements {host_features:?}); in-process code cannot rely on it"
+    )]
+    RawJitFunctionFeatureUnsupportedByHost {
+        function: String,
+        feature: &'static str,
+        host_features: Vec<&'static str>,
+    },
+
     #[error(
         "serialized executable target contract does not match the current Trust Codegen host-JIT contract: serialized={serialized_target}, host={host_target}"
     )]
@@ -2433,10 +3424,16 @@ pub enum JitError {
         host_target: String,
     },
 
+    /// A serialized buffer's contract names a function target feature (one
+    /// its functions state beyond the host-JIT profile) that this CPU does not
+    /// implement. Refused before anything is mapped.
     #[error(
-        "serialized executable publication requires authenticated target/feature authority; use unsafe publish_serialized_buffer_for_target after verifying the payload provenance"
+        "[TCG-TARGET-FEATURE] serialized executable target contract requires target feature `{feature}`, which this host CPU does not implement (host implements {host_features:?})"
     )]
-    SerializedBufferTargetAuthorityRequired,
+    SerializedBufferFeatureUnsupportedByHost {
+        feature: &'static str,
+        host_features: Vec<&'static str>,
+    },
 
     #[error("Windows x64 JIT unwind metadata for `{function}` is unsupported: {reason}")]
     WindowsUnwindUnsupported { function: String, reason: String },
@@ -2458,6 +3455,42 @@ pub enum JitError {
 
     #[error("JIT compilation produced no executable code for {function_count} function(s)")]
     EmptyExecutableBuffer { function_count: usize },
+
+    #[error(
+        "JIT function range for `{function}` is invalid: {start}..{end} with code length {code_len}"
+    )]
+    InvalidFunctionRange {
+        function: String,
+        start: u64,
+        end: u64,
+        code_len: usize,
+    },
+
+    #[error(
+        "JIT validation/range count mismatch: {validation_count} validation rows for {range_count} function ranges"
+    )]
+    ValidationRangeCountMismatch {
+        validation_count: usize,
+        range_count: usize,
+    },
+
+    #[error(
+        "JIT validation/function order mismatch: validation row `{validation_function}` paired with published range `{range_function}`"
+    )]
+    ValidationFunctionNameMismatch {
+        validation_function: String,
+        range_function: String,
+    },
+
+    #[error(
+        "JIT certification input count mismatch: {functions} verifier functions, {lir_functions} LIR functions, {ranges} byte ranges, {fixup_manifests} fixup manifests"
+    )]
+    CertificationInputCountMismatch {
+        functions: usize,
+        lir_functions: usize,
+        ranges: usize,
+        fixup_manifests: usize,
+    },
 
     #[error(
         "JIT executable buffer is not published RX: buffer {buffer_base:#x}..{buffer_end:#x} (code_len={code_len}, allocation_len={allocation_len})"
@@ -2526,6 +3559,86 @@ pub enum JitError {
 
     #[error("fixup offset {offset} out of bounds (code length {code_len})")]
     FixupOutOfBounds { offset: u32, code_len: usize },
+
+    #[error(
+        "JIT fixup offset {offset:#x} plus function base {base:#x} exceeds the u32 image-offset space"
+    )]
+    FixupRebaseOutOfRange { offset: u32, base: u64 },
+
+    #[error("local function-address JIT cannot publish empty encoded body `{function}`")]
+    EmptyLocalFunctionAddressBody { function: String },
+
+    #[error(
+        "verified JIT local function-address fixup at {offset:#x} requires source-to-installed-image proof replay; concrete relocation-effect checks alone are insufficient"
+    )]
+    LocalFunctionAddressReplayUnavailable { offset: u32 },
+
+    #[error("local AArch64 address relocation replay rejected site {offset:#x}: {detail}")]
+    LocalFunctionAddressReplayRejected { offset: u32, detail: String },
+
+    /// The installed-artifact replay (ledger `L11-P2`) read the sealed
+    /// executable mapping back and found it disagreeing with the certified
+    /// words, a relocation's target, a veneer or a runtime literal. The
+    /// mapping is unmapped; no function pointer was handed out.
+    #[error(
+        "installed-artifact replay refused `{function}` at image offset {offset:#x}: {detail}; no function pointer is handed out"
+    )]
+    InstalledArtifactReplayRejected {
+        function: String,
+        offset: u64,
+        detail: String,
+    },
+
+    #[error(
+        "raw AArch64 JIT cannot bind named symbol `{symbol}` through {kind:?} fixup at offset {offset:#x}: address fixups require a local function and supported ADRP/ADD encoding"
+    )]
+    RawJitNamedSymbolAddressFixupUnsupported {
+        /// Symbol whose address-producing relocation cannot yet be patched.
+        symbol: String,
+        /// Exact relocation kind emitted by AArch64 instruction encoding.
+        kind: crate::macho::reloc::AArch64RelocKind,
+        /// Byte offset of the unsupported fixup in the raw code image.
+        offset: u32,
+    },
+
+    #[error("invalid local AArch64 function-address fixup at {offset:#x}: {detail}")]
+    InvalidLocalFunctionAddressFixup { offset: u32, detail: String },
+
+    #[error("JIT data image cannot place module global `{global}`: {reason}")]
+    JitDataImageUnsupported { global: String, reason: String },
+
+    #[error(
+        "JIT fixup at {offset:#x} names module global `{global}`, which the JIT data image does not place: {reason} (fail-closed)"
+    )]
+    JitDataGlobalUnplaceable {
+        offset: u32,
+        global: String,
+        reason: String,
+    },
+
+    #[error(
+        "verified JIT data relocation at {offset:#x} against `{symbol}` requires source-to-installed-image proof replay; no obligation models a JIT data image or GOT slot (fail-closed)"
+    )]
+    JitDataRelocationProofUnavailable { offset: u32, symbol: String },
+
+    #[error(
+        "JIT data image target `{symbol}` at {target:#x} is outside ADRP reach of code site {site:#x}: {detail}"
+    )]
+    JitDataRelocationOutOfRange {
+        symbol: String,
+        site: u64,
+        target: u64,
+        detail: String,
+    },
+
+    #[error("JIT data image mapping of {len} bytes failed: {source}")]
+    DataImageMap { len: usize, source: std::io::Error },
+
+    #[error("invalid JIT data relocation at {offset:#x}: {detail}")]
+    InvalidDataRelocation { offset: u32, detail: String },
+
+    #[error("local AArch64 page fixups require a 4KiB-aligned JIT mapping, got {base:#x}")]
+    UnalignedLocalFunctionAddressImage { base: u64 },
 
     #[error(
         "duplicate JIT symbol: `{0}` (primary name or `_`-prefixed alias collides with a previously compiled function)"
@@ -2639,6 +3752,293 @@ fn validate_veneer_ranges(
     Ok(())
 }
 
+/// Refuse named-symbol fixups the raw AArch64 JIT cannot patch by kind.
+///
+/// `patch_fixup` is intentionally only a Branch26 encoder. Local function
+/// ADRP/ADD addresses use a separate checked path backed by the shared Mach-O
+/// fixup encoders. External address and TLS fixups must never enter the
+/// branch/veneer path; external Page21/Pageoff12 targets are refused during
+/// symbol resolution below, before veneer construction or RX publication.
+/// This kind-only entry (no data image, no symbol tables) is the contract
+/// the unit tests pin; [`census_raw_jit_named_symbol_fixups`] is the
+/// data-aware production census.
+#[cfg(test)]
+fn validate_raw_jit_named_symbol_fixup_kinds(fixups: &[Fixup]) -> Result<bool, JitError> {
+    census_raw_jit_named_symbol_fixups(
+        fixups,
+        &HashMap::new(),
+        None,
+        &HashMap::new(),
+        JitExternalSymbolResolutionPolicy::ExplicitOnly,
+    )
+    .map(|census| census.has_local_function_addresses)
+}
+
+/// Where every address-producing named fixup of a raw JIT module resolves.
+struct RawFixupCensus {
+    /// At least one `Page21`/`Pageoff12` site names a local function entry.
+    has_local_function_addresses: bool,
+    /// `Page21`/`Pageoff12` sites that address a placed data-image global.
+    direct_data: Vec<DataAddressSite>,
+    /// `GotLoadPage21`/`GotLoadPageoff12` sites, in fixup order.
+    got_loads: Vec<GotLoadSite>,
+}
+
+/// Classify every named fixup by kind and target before any code patch.
+///
+/// Branch26 keeps the direct-call/veneer path. `Page21`/`Pageoff12` sites
+/// either name a placed data-image global (patched at the final addresses)
+/// or fall to the local function-address replay. `GotLoadPage21`/
+/// `GotLoadPageoff12` sites load from a JIT GOT slot that holds the address
+/// of a placed global, a data import, a local function or an explicitly or
+/// process-resolved external; an unresolvable GOT target and every other
+/// address-producing kind (TLVP, pointer-to-GOT) are refused by name. A
+/// fixup that names a global the data image does not place (thread-local,
+/// explicit section, weak import) is refused with the recorded reason.
+fn census_raw_jit_named_symbol_fixups(
+    fixups: &[Fixup],
+    func_offsets: &HashMap<String, u64>,
+    data_image: Option<&JitDataImageLayout>,
+    extern_symbols: &HashMap<String, *const u8>,
+    policy: JitExternalSymbolResolutionPolicy,
+) -> Result<RawFixupCensus, JitError> {
+    use crate::macho::reloc::AArch64RelocKind;
+
+    let mut census = RawFixupCensus {
+        has_local_function_addresses: false,
+        direct_data: Vec::new(),
+        got_loads: Vec::new(),
+    };
+    for fixup in fixups {
+        let symbol = match &fixup.target {
+            FixupTarget::NamedSymbol(symbol) | FixupTarget::ExactNamedSymbol(symbol) => symbol,
+            FixupTarget::Symbol(_)
+                if matches!(
+                    fixup.kind,
+                    crate::macho::reloc::AArch64RelocKind::Branch26
+                        | crate::macho::reloc::AArch64RelocKind::Page21
+                        | crate::macho::reloc::AArch64RelocKind::Pageoff12
+                ) =>
+            {
+                continue;
+            }
+            _ => {
+                return Err(JitError::InvalidLocalFunctionAddressFixup {
+                    offset: fixup.offset,
+                    detail: format!(
+                        "unsupported raw JIT fixup target/kind: {:?} {:?}",
+                        fixup.target, fixup.kind
+                    ),
+                });
+            }
+        };
+        let unsupported = || JitError::RawJitNamedSymbolAddressFixupUnsupported {
+            symbol: symbol.clone(),
+            kind: fixup.kind,
+            offset: fixup.offset,
+        };
+        if let Some(reason) = data_image.and_then(|image| image.refusal(symbol)) {
+            return Err(JitError::JitDataGlobalUnplaceable {
+                offset: fixup.offset,
+                global: symbol.clone(),
+                reason: reason.to_string(),
+            });
+        }
+        match fixup.kind {
+            AArch64RelocKind::Branch26 => {}
+            AArch64RelocKind::Page21 | AArch64RelocKind::Pageoff12 => {
+                match data_image {
+                    Some(image) if matches!(fixup.target, FixupTarget::NamedSymbol(_)) => {
+                        if let Some(target_offset) = image.offset_of(symbol) {
+                            if fixup.offset & 3 != 0 || fixup.tls_model.is_some() {
+                                return Err(JitError::InvalidDataRelocation {
+                                    offset: fixup.offset,
+                                    detail: "a data address relocation requires an aligned site and no TLS model".into(),
+                                });
+                            }
+                            census.direct_data.push(DataAddressSite {
+                                offset: fixup.offset,
+                                kind: fixup.kind,
+                                symbol: symbol.clone(),
+                                target_offset,
+                                addend: fixup.addend,
+                            });
+                            continue;
+                        }
+                        if image.is_import(symbol) {
+                            return Err(JitError::InvalidDataRelocation {
+                                offset: fixup.offset,
+                                detail: format!(
+                                    "direct {:?} reference to data import `{symbol}`; an import is addressed through the GOT",
+                                    fixup.kind
+                                ),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                census.has_local_function_addresses = true;
+            }
+            AArch64RelocKind::GotLoadPage21 | AArch64RelocKind::GotLoadPageoff12 => {
+                let resolvable = matches!(fixup.target, FixupTarget::NamedSymbol(_))
+                    && (data_image.is_some_and(|image| {
+                        image.offset_of(symbol).is_some() || image.is_import(symbol)
+                    }) || func_offsets.contains_key(symbol)
+                        || resolve_external_symbol(symbol, extern_symbols, policy).is_some());
+                if !resolvable || fixup.addend != 0 || fixup.tls_model.is_some() {
+                    return Err(unsupported());
+                }
+                census.got_loads.push(GotLoadSite {
+                    offset: fixup.offset,
+                    kind: fixup.kind,
+                    symbol: symbol.clone(),
+                });
+            }
+            _ => return Err(unsupported()),
+        }
+    }
+    Ok(census)
+}
+
+fn require_external_branch_fixup(fixup: &Fixup, symbol: &str) -> Result<(), JitError> {
+    if fixup.kind == crate::macho::reloc::AArch64RelocKind::Branch26 {
+        Ok(())
+    } else {
+        Err(JitError::RawJitNamedSymbolAddressFixupUnsupported {
+            symbol: symbol.into(),
+            kind: fixup.kind,
+            offset: fixup.offset,
+        })
+    }
+}
+
+/// Patch a page-address instruction using existing relocation encoders.
+/// Separate from image bounds so displacement boundaries can be tested without
+/// allocating a multi-gigabyte executable image. All addresses are image offsets.
+fn patch_local_function_address_instruction(
+    instruction: &mut [u8; 4],
+    kind: crate::macho::reloc::AArch64RelocKind,
+    offset: u32,
+    target: u64,
+) -> Result<(), JitError> {
+    use crate::macho::{
+        fixup::{apply_page21, apply_pageoff12},
+        reloc::AArch64RelocKind,
+    };
+    let invalid = |detail: String| JitError::InvalidLocalFunctionAddressFixup { offset, detail };
+    if offset & 3 != 0 || target & 3 != 0 {
+        return Err(invalid(
+            "patch site and function target must be 4-byte aligned".into(),
+        ));
+    }
+    let word = u32::from_le_bytes(*instruction);
+    match kind {
+        AArch64RelocKind::Page21 => {
+            if word & 0x9f00_0000 != 0x9000_0000 || word & 31 == 31 {
+                return Err(invalid(
+                    "Page21 requires ADRP to a general-purpose register".into(),
+                ));
+            }
+            // Unsigned page numbers fit i64 even for a u64 byte address.
+            let pages = (target >> 12) as i64 - (u64::from(offset) >> 12) as i64;
+            apply_page21(instruction, pages).map_err(|error| invalid(error.to_string()))?;
+        }
+        AArch64RelocKind::Pageoff12 => {
+            if word & 0xffc0_0000 != 0x9100_0000 || word & 31 == 31 || (word >> 5) & 31 == 31 {
+                return Err(invalid(
+                    "Pageoff12 requires unshifted 64-bit ADD with general-purpose registers".into(),
+                ));
+            }
+            // The mask guarantees <4096 and shift=0 has no alignment or
+            // scale precondition; the shared encoder cannot assert here.
+            apply_pageoff12(instruction, (target & 0xfff) as u32, 0);
+        }
+        _ => {
+            return Err(invalid(format!(
+                "unsupported function-address kind {kind:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn patch_local_function_address(
+    code: &mut [u8],
+    fixup: &Fixup,
+    target: u64,
+) -> Result<(), JitError> {
+    let invalid = |detail: String| JitError::InvalidLocalFunctionAddressFixup {
+        offset: fixup.offset,
+        detail,
+    };
+    // This contract materializes the exact callable entry, not an interior
+    // address or TLS object. Do not silently ignore or wrap signed addends.
+    if fixup.addend != 0 || fixup.tls_model.is_some() {
+        return Err(invalid(
+            "local function addresses require zero addend and no TLS model".into(),
+        ));
+    }
+    if target
+        .checked_add(4)
+        .is_none_or(|end| end > code.len() as u64)
+    {
+        return Err(invalid(format!(
+            "function target {target:#x} is outside the local code image"
+        )));
+    }
+    let offset = fixup.offset as usize;
+    let code_len = code.len();
+    let bytes: &mut [u8; 4] = code
+        .get_mut(offset..offset.saturating_add(4))
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(JitError::FixupOutOfBounds {
+            offset: fixup.offset,
+            code_len,
+        })?;
+    patch_local_function_address_instruction(bytes, fixup.kind, fixup.offset, target)
+}
+
+fn validate_local_function_address_image(base: u64) -> Result<(), JitError> {
+    if base & 0xfff != 0 {
+        Err(JitError::UnalignedLocalFunctionAddressImage { base })
+    } else {
+        Ok(())
+    }
+}
+
+fn rebase_jit_fixup_offset(offset: u32, base: u64) -> Result<u32, JitError> {
+    u32::try_from(base)
+        .ok()
+        .and_then(|base| offset.checked_add(base))
+        .ok_or(JitError::FixupRebaseOutOfRange { offset, base })
+}
+
+fn validate_local_function_address_ranges(
+    ranges: &[(String, std::ops::Range<u64>)],
+    code_len: usize,
+    empty_body: Option<String>,
+) -> Result<(), JitError> {
+    if let Some(function) = empty_body {
+        return Err(JitError::EmptyLocalFunctionAddressBody { function });
+    }
+    for (function, range) in ranges {
+        if range.start >= range.end
+            || range.end > code_len as u64
+            || range.start & 3 != 0
+            || range.end & 3 != 0
+        {
+            return Err(JitError::InvalidFunctionRange {
+                function: function.clone(),
+                start: range.start,
+                end: range.end,
+                code_len,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Entry-hook mode for JIT-compiled functions.
 ///
 /// # Granularity levels (#396 PGO workflow)
@@ -2659,7 +4059,7 @@ fn validate_veneer_ranges(
 /// [`JitCompiler::compile_raw`]. `EdgeCounts`, `BlockFrequency`, and
 /// `LoopHeads` remain reserved API variants; [`JitCompiler::compile_raw`]
 /// rejects them with [`JitError::ProfileHookModeUnimplemented`] until their
-/// trampoline work lands. See `designs/2026-04-18-pgo-workflow.md`.
+/// trampoline work lands.
 ///
 /// # Public Entry-Counter API (#478)
 ///
@@ -2687,7 +4087,7 @@ pub enum ProfileHookMode {
     /// [`JitError::ProfileHooksUnsupported`], not treat it as
     /// [`ProfileHookMode::CallCounts`].
     CallCountsAndTiming,
-    // ----- Phase 2 (#396) — API reserved, trampoline TODO ------------------
+    // ----- Block profiling modes (#396, #364) -----------------------------
     /// One counter per basic block, incremented at block prologue.
     ///
     /// Implemented for raw AArch64 JIT block trampolines and for the
@@ -2695,12 +4095,12 @@ pub enum ProfileHookMode {
     /// `--profile-generate`. Raw x86-64 [`JitCompiler::compile_raw`] requests
     /// still reject this mode with [`JitError::ProfileHooksUnsupported`].
     BlockCounts,
-    /// `BlockCounts` plus per-block wall-time timing.
+    /// `BlockCounts` plus per-block counter timing.
     ///
-    /// TODO(#396 Phase 2): as `BlockCounts`, plus timing probes on every
-    /// block prologue and epilogue. Beware: per-block timing can dwarf
-    /// the work being measured; emit only when the caller has explicitly
-    /// asked for timing.
+    /// Implemented by the AArch64 block-entry timing trampolines (#364 Phase 3).
+    /// Raw x86-64 requests return [`JitError::ProfileHooksUnsupported`].
+    /// Per-block timing can dwarf the work being measured; emit only when
+    /// the caller has explicitly asked for timing.
     BlockCountsAndTiming,
     /// One counter per CFG edge, incremented on the edge itself (after
     /// critical-edge splitting).
@@ -2796,8 +4196,8 @@ fn profile_hooks_counter_classifiers_are_disjoint(mode: ProfileHookMode) -> bool
     !(enables_function_entry_counter && enables_block_entry_counter)
 }
 
-/// Returns `true` if `mode` is a #396 Phase 2 variant whose trampoline
-/// work is still TODO. Kept in one place so the early-return in
+/// Returns `true` if `mode` is a reserved profiling variant whose trampoline
+/// work is still pending. Kept in one place so the early-return in
 /// `compile_raw` and the error-message test stay in sync.
 fn profile_hooks_is_phase2_stub(mode: ProfileHookMode) -> bool {
     // NOTE: `BlockCountsAndTiming` is intentionally NOT in this list —
@@ -2807,6 +4207,54 @@ fn profile_hooks_is_phase2_stub(mode: ProfileHookMode) -> bool {
         mode,
         ProfileHookMode::EdgeCounts | ProfileHookMode::BlockFrequency | ProfileHookMode::LoopHeads
     )
+}
+
+/// Policy for resolving JIT references that are not defined by the compiled
+/// module itself.
+///
+/// The compatibility default preserves the historical lookup order: explicit
+/// caller bindings first, followed by the current process symbol table. Core
+/// or sandboxed callers can select [`Self::ExplicitOnly`] so an absent binding
+/// fails closed without consulting `dlsym`, `GetProcAddress`, or any equivalent
+/// ambient resolver.
+///
+/// This policy constrains address lookup sources; it does not authenticate the
+/// provider, loaded image, ABI, or provenance of an explicitly supplied pointer.
+/// A null explicit pointer is never a usable binding and fails resolution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum JitExternalSymbolResolutionPolicy {
+    /// Prefer explicit bindings, then fall back to process-visible symbols.
+    #[default]
+    ExplicitThenProcess,
+    /// Resolve external symbols only from the caller-supplied binding map.
+    ExplicitOnly,
+}
+
+impl JitExternalSymbolResolutionPolicy {
+    /// Stable identity label used by cache and policy fingerprints.
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::ExplicitThenProcess => "explicit_then_process",
+            Self::ExplicitOnly => "explicit_only",
+        }
+    }
+
+    const fn permits_process_lookup(self) -> bool {
+        matches!(self, Self::ExplicitThenProcess)
+    }
+
+    /// Return the intersection of the address sources allowed by two policies.
+    ///
+    /// This is used where two existing configuration layers both carry JIT
+    /// policy. Either layer can remove ambient lookup authority; neither can
+    /// silently add it back.
+    pub(crate) const fn fail_closed_intersection(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ExplicitOnly, _) | (_, Self::ExplicitOnly) => Self::ExplicitOnly,
+            (Self::ExplicitThenProcess, Self::ExplicitThenProcess) => Self::ExplicitThenProcess,
+        }
+    }
 }
 
 /// Configuration for [`JitCompiler`].
@@ -2855,6 +4303,9 @@ pub struct JitConfig {
     /// This is a separate gate from `verify_dispatch`: it controls
     /// instruction-level verification of the lowered/optimized IR, not the
     /// heterogeneous dispatch plan.
+    /// Local function-address page fixups currently fail closed when requested:
+    /// opcode-level evidence is not exact in-memory relocation replay. Data
+    /// image and GOT sites (module globals) fail closed for the same reason.
     pub verify: bool,
     /// Policy for handling dispatch-plan verification failures.
     ///
@@ -2882,8 +4333,16 @@ pub struct JitConfig {
     /// (a cache miss still re-verifies — never skips); `AlwaysVerify` sets it
     /// false so every compile re-discharges. Default `true` so the common
     /// verifying path is warm-fast; the fail-closed guarantee is unaffected
-    /// either way because the cache is bytes-bound.
+    /// because the cache binds bytes, verifier semantics, symbolic fixups, and
+    /// verification policy.
     pub cache_certificates: bool,
+    /// Source of addresses for symbols not defined by the compiled module.
+    ///
+    /// [`JitExternalSymbolResolutionPolicy::ExplicitThenProcess`] preserves
+    /// the historical process-symbol fallback. Select
+    /// [`JitExternalSymbolResolutionPolicy::ExplicitOnly`] when every external
+    /// capability must be present in the caller-supplied map.
+    pub external_symbol_resolution: JitExternalSymbolResolutionPolicy,
 }
 
 impl JitConfig {
@@ -2914,6 +4373,7 @@ impl Default for JitConfig {
             profile_hooks: ProfileHookMode::None,
             emit_entry_counters: false,
             cache_certificates: true,
+            external_symbol_resolution: JitExternalSymbolResolutionPolicy::default(),
         }
     }
 }
@@ -3018,9 +4478,16 @@ pub fn lookup_process_symbol(_name: &str) -> Option<*const u8> {
     None
 }
 
-fn resolve_extern(name: &str, extern_symbols: &HashMap<String, *const u8>) -> Option<*const u8> {
+pub(crate) fn resolve_external_symbol(
+    name: &str,
+    extern_symbols: &HashMap<String, *const u8>,
+    policy: JitExternalSymbolResolutionPolicy,
+) -> Option<*const u8> {
     if let Some(&ptr) = extern_symbols.get(name) {
-        return Some(ptr);
+        return (!ptr.is_null()).then_some(ptr);
+    }
+    if !policy.permits_process_lookup() {
+        return None;
     }
     if let Some(ptr) = lookup_process_symbol(name) {
         return Some(ptr);
@@ -3035,7 +4502,81 @@ fn resolve_extern(name: &str, extern_symbols: &HashMap<String, *const u8>) -> Op
 }
 
 fn has_explicit_extern(name: &str, extern_symbols: &HashMap<String, *const u8>) -> bool {
-    extern_symbols.contains_key(name)
+    extern_symbols
+        .get(name)
+        .is_some_and(|pointer| !pointer.is_null())
+}
+
+/// Resolve each local fixup once. `None` is an external branch that the
+/// existing veneer path will handle, a data-image address handled by the
+/// data patcher, or a GOT load handled by the slot patcher; an external
+/// address outside those paths is still refused.
+fn resolve_raw_internal_fixup(
+    fixup: &Fixup,
+    functions: &[IrMachFunction],
+    func_offsets: &HashMap<String, u64>,
+    symbol_offsets: &HashMap<String, u64>,
+    data_image: Option<&JitDataImageLayout>,
+    extern_symbols: &HashMap<String, *const u8>,
+    policy: JitExternalSymbolResolutionPolicy,
+) -> Result<Option<u64>, JitError> {
+    if matches!(
+        fixup.kind,
+        crate::macho::reloc::AArch64RelocKind::GotLoadPage21
+            | crate::macho::reloc::AArch64RelocKind::GotLoadPageoff12
+    ) {
+        return Ok(None);
+    }
+    let address = match &fixup.target {
+        FixupTarget::NamedSymbol(name) => {
+            if has_explicit_extern(name, extern_symbols) {
+                require_external_branch_fixup(fixup, name)?;
+                return Ok(None);
+            } else if let Some(&off) = func_offsets.get(name) {
+                off
+            } else if data_image.is_some_and(|image| image.knows(name)) {
+                // A module global: addressed through the data image, never
+                // bound to a same-named process symbol.
+                if matches!(
+                    fixup.kind,
+                    crate::macho::reloc::AArch64RelocKind::Page21
+                        | crate::macho::reloc::AArch64RelocKind::Pageoff12
+                ) {
+                    return Ok(None);
+                }
+                return Err(JitError::InvalidDataRelocation {
+                    offset: fixup.offset,
+                    detail: format!(
+                        "{:?} fixup names module global `{name}`; only ADRP/ADD or GOT loads address data",
+                        fixup.kind
+                    ),
+                });
+            } else if resolve_external_symbol(name, extern_symbols, policy).is_some() {
+                require_external_branch_fixup(fixup, name)?;
+                return Ok(None);
+            } else if let Some(&off) = symbol_offsets.get(name) {
+                off
+            } else {
+                return Err(JitError::UnresolvedSymbol(name.clone()));
+            }
+        }
+        FixupTarget::ExactNamedSymbol(name) => func_offsets
+            .get(name)
+            .copied()
+            .ok_or_else(|| JitError::UnresolvedSymbol(format!("exact module function {name}")))?,
+        FixupTarget::Symbol(index) => {
+            let name = functions
+                .get(*index as usize)
+                .map(|function| &function.name)
+                .ok_or_else(|| JitError::UnresolvedSymbol(format!("index {index}")))?;
+            func_offsets
+                .get(name)
+                .copied()
+                .ok_or_else(|| JitError::UnresolvedSymbol(name.clone()))?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(address))
 }
 
 #[cfg(feature = "verify")]
@@ -3054,10 +4595,11 @@ fn jit_lowering_compiler_config_bytes(
     config: &PipelineConfig,
     profile_hooks: ProfileHookMode,
     aarch64_isa_profile: AArch64IsaProfile,
+    external_symbol_resolution: JitExternalSymbolResolutionPolicy,
 ) -> Vec<u8> {
     format!(
         concat!(
-            "trust-cg.jit.compiler_config.v2\n",
+            "trust-cg.jit.compiler_config.v3\n",
             "target={}\n",
             "aarch64_isa_profile={}\n",
             "aarch64_isa_feature_bits={}\n",
@@ -3065,6 +4607,7 @@ fn jit_lowering_compiler_config_bytes(
             "verify={}\n",
             "verify_dispatch={:?}\n",
             "profile_hooks={:?}\n",
+            "external_symbol_resolution={}\n",
             "emit_debug={}\n",
             "cegis_superopt_budget_sec={:?}\n",
             "target_triple={}\n"
@@ -3076,6 +4619,7 @@ fn jit_lowering_compiler_config_bytes(
         config.verify,
         config.verify_dispatch,
         profile_hooks,
+        external_symbol_resolution.canonical_name(),
         config.emit_debug,
         config.cegis_superopt_budget_sec,
         config.target_triple,
@@ -3084,15 +4628,13 @@ fn jit_lowering_compiler_config_bytes(
 }
 
 pub struct JitCompiler {
-    /// Pipeline constructed from the caller-supplied [`JitConfig`]. Held for
-    /// forward compatibility: `compile_raw` does not currently invoke the
-    /// pipeline, but the config (notably `verify_dispatch`, see #375) must
-    /// be preserved so future heterogeneous-aware JIT entry points inherit
-    /// the caller's policy. Also reached from unit tests via the
-    /// `#[cfg(test)] pipeline()` accessor.
-    #[allow(dead_code)]
+    /// Pipeline constructed from the caller-supplied [`JitConfig`]. The
+    /// compile paths read its config (`verify`, the target triple, the
+    /// AArch64 ISA profile) and pass it to verification and proof-evidence
+    /// collection.
     pipeline: Pipeline,
     profile_hooks: ProfileHookMode,
+    external_symbol_resolution: JitExternalSymbolResolutionPolicy,
     /// JIT-5: whether the verify branch may satisfy the obligation from the
     /// content-addressed certificate cache. Mirrors
     /// [`JitConfig::cache_certificates`]; kept on the compiler (not
@@ -3100,34 +4642,68 @@ pub struct JitCompiler {
     // Read only in the verifying cert branch (feature = "verify").
     #[cfg_attr(not(feature = "verify"), allow(dead_code))]
     cache_certificates: bool,
+    /// Optional caller-owned cache. `None` uses the bounded process-global
+    /// cache; carrying the Arc here keeps low-level AArch64 and high-level x86
+    /// injection semantics identical.
+    #[cfg_attr(not(feature = "verify"), allow(dead_code))]
+    certificate_cache: Option<std::sync::Arc<crate::jit_cert::JitCertCache>>,
 }
 
 fn ensure_raw_jit_aarch64_isa(
     functions: &[IrMachFunction],
     host_profile: AArch64IsaProfile,
 ) -> Result<(), JitError> {
+    ensure_raw_jit_aarch64_isa_on(
+        functions,
+        host_profile,
+        crate::aarch64_dispatch::aarch64_host_features(),
+    )
+}
+
+// Shared by raw machine compilation and consuming sealed-Core publication.
+fn ensure_aarch64_function_features_supported(
+    function: &str,
+    features: TargetFeatureSet<AArch64IsaFeature>,
+    host: crate::aarch64_dispatch::AArch64HostFeatures,
+) -> Result<(), JitError> {
+    if let Some(missing) = features.difference(host.features()).enabled().next() {
+        return Err(JitError::RawJitFunctionFeatureUnsupportedByHost {
+            function: function.into(),
+            feature: missing.name(),
+            host_features: host.names(),
+        });
+    }
+    Ok(())
+}
+
+/// [`ensure_raw_jit_aarch64_isa`] against an explicit host feature report.
+///
+/// Every function's own target features must be implemented by `host` (the
+/// CPU this code will run on), and every instruction's required feature must
+/// be admitted by the JIT profile or by the function's own features.
+fn ensure_raw_jit_aarch64_isa_on(
+    functions: &[IrMachFunction],
+    host_profile: AArch64IsaProfile,
+    host: crate::aarch64_dispatch::AArch64HostFeatures,
+) -> Result<(), JitError> {
     for func in functions {
+        ensure_aarch64_function_features_supported(
+            &func.name,
+            func.function_target_features,
+            host,
+        )?;
         for &block_id in &func.block_order {
             for &inst_id in &func.block(block_id).insts {
                 let inst = func.inst(inst_id);
-                let opcode = inst.opcode;
-                let required_feature = if aarch64_opcode_requires_lse(opcode)
-                    && !host_profile.permits_lse()
-                {
-                    Some("lse")
-                } else if aarch64_opcode_requires_dotprod(opcode) && !host_profile.permits_dotprod()
-                {
-                    Some("dotprod")
-                } else if aarch64_inst_requires_fp16(inst) && !host_profile.permits_fp16() {
-                    Some("fp16")
-                } else {
-                    None
-                };
-                if let Some(required_feature) = required_feature {
+                let unadmitted = aarch64_inst_required_features(inst).find(|&feature| {
+                    !host_profile.permits(feature)
+                        && !func.function_target_features.contains(feature)
+                });
+                if let Some(feature) = unadmitted {
                     return Err(JitError::RawJitIsaExtensionNotAdmitted {
                         function: func.name.clone(),
-                        opcode,
-                        required_feature,
+                        opcode: inst.opcode,
+                        required_feature: feature.name(),
                         host_profile: host_profile.canonical_name(),
                     });
                 }
@@ -3152,6 +4728,7 @@ impl JitCompiler {
         aarch64_isa_profile: AArch64IsaProfile,
     ) -> Self {
         let profile_hooks = config.effective_profile_hooks();
+        let external_symbol_resolution = config.external_symbol_resolution;
         Self {
             pipeline: Pipeline::new(PipelineConfig {
                 opt_level: config.opt_level,
@@ -3164,7 +4741,13 @@ impl JitCompiler {
                 // CEGIS superopt is not scheduled by the JIT path; the
                 // budget knob is only wired into the batch compiler (AOT).
                 cegis_superopt_budget_sec: None,
-                target_triple: String::new(),
+                // JIT code runs in this process, so its target IS the host's
+                // AArch64 OS/ABI. Derive it explicitly and record it (see
+                // `JitCompiler::aarch64_target_triple`) instead of leaving the
+                // triple empty, which the pipeline refuses; on a Linux host
+                // this selects AAPCS64 (no red zone) rather than DarwinPCS.
+                target_triple: PipelineConfig::for_host_aarch64().target_triple,
+                aarch64_force_frame_pointers: false,
                 enable_fsym_trust_ir_preflight: false,
                 // The legacy raw-MachFunction JitCompiler defaults to the
                 // full quality regalloc. The latency-tuned profile is
@@ -3178,11 +4761,52 @@ impl JitCompiler {
                 // configured Pipeline first.
                 disabled_passes_override: None,
                 contains4_scanner_batch_rewrite_override: None,
+                relocation_model: crate::RelocationModel::Static,
             })
-            .with_aarch64_isa_profile(aarch64_isa_profile),
+            .with_aarch64_isa_profile(aarch64_isa_profile)
+            .with_proof_grade_aarch64_publication_if(
+                Self::aarch64_proof_grade_publication(&config),
+            ),
             profile_hooks,
+            external_symbol_resolution,
             cache_certificates: config.cache_certificates,
+            certificate_cache: None,
         }
+    }
+
+    /// Whether a compiler built from `config` encodes at proof grade (ENC-5
+    /// and the other final-stream nets forced to enforce): exactly when the
+    /// config asks for verification.
+    fn aarch64_proof_grade_publication(config: &JitConfig) -> bool {
+        config.verify
+    }
+
+    /// The ENC-5 backing of the AArch64 bytes a compiler built from `config`
+    /// encodes ([`Pipeline::aarch64_decode_check_backing`] of its pipeline),
+    /// for a certificate lane that runs before that compiler exists.
+    #[cfg(feature = "verify")]
+    pub(crate) fn aarch64_decode_check_backing_for(
+        config: &JitConfig,
+    ) -> crate::decode_check::DecodeCheckBacking {
+        Pipeline::aarch64_decode_check_backing_if_proof_grade(
+            Self::aarch64_proof_grade_publication(config),
+        )
+    }
+
+    /// The host-derived AArch64 target triple this JIT lowers for (its
+    /// calling convention and frame policy). Recorded so callers can see that
+    /// the selection came from the host, never from an empty default.
+    pub fn aarch64_target_triple(&self) -> &str {
+        &self.pipeline.config.target_triple
+    }
+
+    /// Attach an explicit certificate cache to this low-level JIT compiler.
+    pub fn with_certificate_cache(
+        mut self,
+        cache: std::sync::Arc<crate::jit_cert::JitCertCache>,
+    ) -> Self {
+        self.certificate_cache = Some(cache);
+        self
     }
 
     /// Report what proof evidence this JIT compiler's configuration actually
@@ -3240,37 +4864,328 @@ impl JitCompiler {
         functions: &[IrMachFunction],
         extern_symbols: &HashMap<String, *const u8>,
     ) -> Result<ExecutableBuffer, JitError> {
-        self.compile_raw_inner(functions, extern_symbols, |_func, _duration| {})
+        self.compile_raw_inner(
+            Aarch64JitInputs::raw(functions),
+            extern_symbols,
+            false,
+            |_func, _duration| {},
+        )
+    }
+
+    /// [`Self::compile_raw`], also returning the link as a
+    /// [`RelocatableImage`] that another process can publish with
+    /// [`RelocatableImage::relink`].
+    ///
+    /// The returned buffer is byte-identical to `compile_raw`'s: capturing
+    /// the image reads the pre-literal code and the relocation inventory and
+    /// changes nothing the linker does. When the artifact carries process-local
+    /// content other than veneer literals, the second element names why no
+    /// image was produced ([`RelocatableImageRefusal`]); the buffer is still
+    /// returned.
+    pub fn compile_raw_relocatable(
+        &self,
+        functions: &[IrMachFunction],
+        extern_symbols: &HashMap<String, *const u8>,
+    ) -> Result<
+        (
+            ExecutableBuffer,
+            Result<RelocatableImage, RelocatableImageRefusal>,
+        ),
+        JitError,
+    > {
+        let mut captured = None;
+        let buffer = self.compile_raw_inner_capturing(
+            Aarch64JitInputs::raw(functions),
+            extern_symbols,
+            false,
+            |_func, _duration| {},
+            Some(&mut captured),
+        )?;
+        let image = captured.unwrap_or(Err(RelocatableImageRefusal::UnsupportedTarget));
+        Ok((buffer, image))
+    }
+
+    /// [`Self::compile_raw`] for functions a [`Pipeline`] prepared and sealed
+    /// ([`Pipeline::prepare_function_checked`]). Each function's final-stream
+    /// check, which its preparation already ran and passed on exactly this
+    /// stream, is not run a second time when this compiler's check is the same
+    /// one; the buffer is byte-identical to [`Self::compile_raw`]'s over
+    /// [`CheckedAarch64Functions::functions`].
+    ///
+    /// [`CheckedAarch64Functions::functions`]: crate::pipeline::CheckedAarch64Functions::functions
+    pub fn compile_raw_checked(
+        &self,
+        functions: &crate::pipeline::CheckedAarch64Functions,
+        extern_symbols: &HashMap<String, *const u8>,
+    ) -> Result<ExecutableBuffer, JitError> {
+        self.compile_raw_inner(
+            Aarch64JitInputs::checked(functions),
+            extern_symbols,
+            false,
+            |_func, _duration| {},
+        )
+    }
+
+    /// [`Self::compile_raw_relocatable`] for sealed functions (see
+    /// [`Self::compile_raw_checked`]).
+    pub fn compile_raw_checked_relocatable(
+        &self,
+        functions: &crate::pipeline::CheckedAarch64Functions,
+        extern_symbols: &HashMap<String, *const u8>,
+    ) -> Result<
+        (
+            ExecutableBuffer,
+            Result<RelocatableImage, RelocatableImageRefusal>,
+        ),
+        JitError,
+    > {
+        let mut captured = None;
+        let buffer = self.compile_raw_inner_capturing(
+            Aarch64JitInputs::checked(functions),
+            extern_symbols,
+            false,
+            |_func, _duration| {},
+            Some(&mut captured),
+        )?;
+        let image = captured.unwrap_or(Err(RelocatableImageRefusal::UnsupportedTarget));
+        Ok((buffer, image))
+    }
+
+    /// [`Self::compile_raw`] with the module's data globals.
+    ///
+    /// Every non-import, non-thread-local global is placed in a JIT-owned
+    /// read-write data image mapped beside the code; `GlobalRef`
+    /// (`Page21`/`Pageoff12`) sites address it directly and `ExternRef`
+    /// (`GotLoadPage21`/`GotLoadPageoff12`) sites load a placed global, a
+    /// data import or a function address from a JIT GOT slot. Pointer slots
+    /// inside the image (`ObjectGlobal::symbol_refs`) are relocated at the
+    /// final addresses. The image, its relocation list and every such site
+    /// are recorded in [`ExecutableBuffer::data_image`] and bound into the
+    /// buffer's identity. A verifying request refuses every data or GOT
+    /// site by name (`JitError::JitDataRelocationProofUnavailable`): this is
+    /// unchecked execution evidence, not a proof lane.
+    pub fn compile_raw_with_globals(
+        &self,
+        functions: &[IrMachFunction],
+        globals: &[ObjectGlobal],
+        extern_symbols: &HashMap<String, *const u8>,
+    ) -> Result<ExecutableBuffer, JitError> {
+        self.compile_raw_inner(
+            Aarch64JitInputs::raw(functions).with_globals(globals),
+            extern_symbols,
+            false,
+            |_func, _duration| {},
+        )
     }
 
     /// Internal variant of [`Self::compile_raw`] that also reports
     /// per-function encoding durations to the caller.
+    /// `require_relocation_replay` preserves separate high-level compiler
+    /// proof requests even if raw JIT instruction verification is disabled.
+    // Its only caller is the AArch64 raw-JIT metrics test; on an x86-64 host
+    // the workspace's `-D warnings` would otherwise refuse the lib test target.
+    #[cfg(all(test, target_arch = "aarch64"))]
     pub(crate) fn compile_raw_with_encoding_metrics(
         &self,
         functions: &[IrMachFunction],
         extern_symbols: &HashMap<String, *const u8>,
+        require_relocation_replay: bool,
     ) -> Result<(ExecutableBuffer, HashMap<String, Duration>), JitError> {
-        let mut encoding_timings = HashMap::with_capacity(functions.len());
-        let buffer = self.compile_raw_inner(functions, extern_symbols, |func, duration| {
-            encoding_timings.insert(func.name.clone(), duration);
-        })?;
+        self.compile_inputs_with_encoding_metrics(
+            Aarch64JitInputs::raw(functions),
+            extern_symbols,
+            require_relocation_replay,
+        )
+    }
+
+    /// Private continuation from the compiler's exact, replayed LIR inventory.
+    /// Shared borrows retain source ownership through request capture, proof
+    /// verification and cache identity. This does not grant proof credit itself.
+    ///
+    /// `unwind` carries the frame layouts recorded by the compiler's own
+    /// preparation. It is the only authority under which exception-handling
+    /// functions (or `panic_unwind` walk-through frames) receive in-memory
+    /// unwind tables; proof-grade requests still refuse them.
+    // The production compiler passes its module globals through the
+    // `_globals_` variant; this global-less form is kept for the unit
+    // campaigns that drive the JIT from replayed LIR alone.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn compile_with_lir_and_encoding_metrics(
+        &self,
+        functions: &[IrMachFunction],
+        lir_functions: &[(trust_cg_lower::Function, trust_cg_lower::ProofContext)],
+        original_module: &trust_ir::Module,
+        lowered_module: &trust_ir::Module,
+        extern_symbols: &HashMap<String, *const u8>,
+        require_relocation_replay: bool,
+        unwind: Option<&crate::jit_unwind::Aarch64JitUnwindRequest>,
+    ) -> Result<(ExecutableBuffer, HashMap<String, Duration>), JitError> {
+        self.compile_with_lir_globals_and_encoding_metrics(
+            functions,
+            lir_functions,
+            original_module,
+            lowered_module,
+            &[],
+            None,
+            extern_symbols,
+            require_relocation_replay,
+            unwind,
+        )
+    }
+
+    /// [`Self::compile_with_lir_and_encoding_metrics`] with the module's
+    /// data globals (see [`Self::compile_raw_with_globals`]).
+    ///
+    /// `final_stream_checks`, when given, is the check each function passed
+    /// in its preparation, by ordinal (the compiler's AArch64 JIT prepares
+    /// sealed functions): a function whose check equals the one this link
+    /// would run is not checked a second time, exactly as
+    /// [`Self::compile_raw_checked`] does; any other is checked as always.
+    /// The emitted bytes are the same either way.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_with_lir_globals_and_encoding_metrics(
+        &self,
+        functions: &[IrMachFunction],
+        lir_functions: &[(trust_cg_lower::Function, trust_cg_lower::ProofContext)],
+        original_module: &trust_ir::Module,
+        lowered_module: &trust_ir::Module,
+        globals: &[ObjectGlobal],
+        final_stream_checks: Option<&[crate::pipeline::Aarch64FinalStreamCheck]>,
+        extern_symbols: &HashMap<String, *const u8>,
+        require_relocation_replay: bool,
+        unwind: Option<&crate::jit_unwind::Aarch64JitUnwindRequest>,
+    ) -> Result<(ExecutableBuffer, HashMap<String, Duration>), JitError> {
+        #[cfg(feature = "verify")]
+        if self.pipeline.config.verify {
+            return self.compile_inputs_with_encoding_metrics(
+                Aarch64JitInputs::with_replayed_source_modules(
+                    functions,
+                    lir_functions,
+                    original_module,
+                    lowered_module,
+                )?
+                .with_final_stream_checks(final_stream_checks)
+                .with_unwind(unwind)
+                .with_globals(globals),
+                extern_symbols,
+                require_relocation_replay,
+            );
+        }
+        // No extra source walk, hashing, verifier setup or retention on the
+        // unchecked/verifier-disabled path.
+        let _ = (lir_functions, original_module, lowered_module);
+        self.compile_inputs_with_encoding_metrics(
+            Aarch64JitInputs::raw(functions)
+                .with_final_stream_checks(final_stream_checks)
+                .with_unwind(unwind)
+                .with_globals(globals),
+            extern_symbols,
+            require_relocation_replay,
+        )
+    }
+
+    fn compile_inputs_with_encoding_metrics(
+        &self,
+        inputs: Aarch64JitInputs<'_>,
+        extern_symbols: &HashMap<String, *const u8>,
+        require_relocation_replay: bool,
+    ) -> Result<(ExecutableBuffer, HashMap<String, Duration>), JitError> {
+        let mut encoding_timings = HashMap::with_capacity(inputs.functions().len());
+        let buffer = self.compile_raw_inner(
+            inputs,
+            extern_symbols,
+            require_relocation_replay,
+            |func, duration| {
+                encoding_timings.insert(func.name.clone(), duration);
+            },
+        )?;
         Ok((buffer, encoding_timings))
     }
 
     fn compile_raw_inner<F>(
         &self,
-        functions: &[IrMachFunction],
+        inputs: Aarch64JitInputs<'_>,
         extern_symbols: &HashMap<String, *const u8>,
-        mut record_encoding: F,
+        require_relocation_replay: bool,
+        record_encoding: F,
     ) -> Result<ExecutableBuffer, JitError>
     where
         F: FnMut(&IrMachFunction, Duration),
     {
-        if let Some(func) = functions.iter().find(|func| func.eh_metadata.has_eh_info()) {
+        self.compile_raw_inner_capturing(
+            inputs,
+            extern_symbols,
+            require_relocation_replay,
+            record_encoding,
+            None,
+        )
+    }
+
+    /// The raw link. When `capture` is supplied it receives the relocatable
+    /// image of this link (or the named reason there is none); capture only
+    /// READS the pre-literal code and the relocation inventory, so the
+    /// returned buffer is the same either way.
+    fn compile_raw_inner_capturing<F>(
+        &self,
+        inputs: Aarch64JitInputs<'_>,
+        extern_symbols: &HashMap<String, *const u8>,
+        require_relocation_replay: bool,
+        mut record_encoding: F,
+        capture: Option<&mut Option<Result<RelocatableImage, RelocatableImageRefusal>>>,
+    ) -> Result<ExecutableBuffer, JitError>
+    where
+        F: FnMut(&IrMachFunction, Duration),
+    {
+        let functions = inputs.functions();
+        crate::resource_limits::admit_compilation_budget()?;
+        let unwind_request = inputs.unwind();
+        let eh_function = functions.iter().find(|func| func.eh_metadata.has_eh_info());
+        if let (Some(func), None) = (eh_function, unwind_request) {
+            // Raw MachIR carries no frame-layout authority for an FDE.
             return Err(JitError::RawJitEhUnsupported {
                 function: func.name.clone(),
             });
         }
+        let emit_unwind_tables = !functions.is_empty()
+            && (eh_function.is_some() || unwind_request.is_some_and(|u| u.walk_through()));
+        if emit_unwind_tables {
+            let function = eh_function.unwrap_or(&functions[0]).name.clone();
+            if self.pipeline.config.verify || require_relocation_replay {
+                return Err(JitError::JitUnwindProofEvidenceUnavailable { function });
+            }
+            if self.profile_hooks != ProfileHookMode::None {
+                return Err(JitError::JitUnwindProfileHooksUnsupported {
+                    function,
+                    mode: self.profile_hooks,
+                });
+            }
+            let Some(request) = unwind_request else {
+                return Err(JitError::JitUnwindTableRejected {
+                    detail: "unwind tables were requested without a compiler unwind request"
+                        .to_string(),
+                });
+            };
+            if request.function_count() != functions.len() {
+                return Err(JitError::JitUnwindTableRejected {
+                    detail: format!(
+                        "{} frame layouts for {} machine functions",
+                        request.function_count(),
+                        functions.len()
+                    ),
+                });
+            }
+            if let Some((_, func)) = functions
+                .iter()
+                .enumerate()
+                .find(|(ordinal, _)| request.frame_layout(*ordinal).is_none())
+            {
+                return Err(JitError::JitUnwindFrameLayoutMissing {
+                    function: func.name.clone(),
+                });
+            }
+        }
+        // `(lsda, personality)` of each EH function, by ordinal.
+        let mut eh_sidecars: Vec<Option<(Vec<u8>, String)>> = vec![None; functions.len()];
 
         if !functions.is_empty() && !cfg!(target_arch = "aarch64") {
             return Err(JitError::RawJitTargetMismatch {
@@ -3280,6 +5195,13 @@ impl JitCompiler {
         }
 
         ensure_raw_jit_aarch64_isa(functions, self.pipeline.aarch64_isa_profile())?;
+        // Every feature a function states for itself, recorded on the buffer
+        // so a serialized replay can name them in its target contract.
+        let function_target_features = functions
+            .iter()
+            .fold(TargetFeatureSet::EMPTY, |features, func| {
+                features.union(func.function_target_features)
+            });
 
         if !sys::host_supported() {
             return Err(JitError::UnsupportedHost {
@@ -3386,9 +5308,71 @@ impl JitCompiler {
         // gated on `self.pipeline` config below.
         let mut func_ranges: Vec<(String, std::ops::Range<u64>)> =
             Vec::with_capacity(functions.len());
+        let mut empty_encoded_body = None;
+        // Verification is one bundle: the certificate cache, the verifier and
+        // the request it captured exist together or not at all.
+        #[cfg(feature = "verify")]
+        let raw_function_verifier;
+        #[cfg(feature = "verify")]
+        let verification = if self.pipeline.config.verify {
+            let certificate_cache = self
+                .certificate_cache
+                .clone()
+                .unwrap_or_else(crate::jit_cert::JitCertCache::global);
+            // Reuse the compiler's immutable source-bound-replay verifier for bound
+            // source. The request remains call-local; sharing is not authority.
+            let function_verifier = match inputs.source_verifier() {
+                Some(verifier) => verifier,
+                None => {
+                    raw_function_verifier = trust_cg_verify::FunctionVerifier::new();
+                    &raw_function_verifier
+                }
+            };
+            let verification_request = inputs.capture_request(function_verifier);
+            Some((certificate_cache, function_verifier, verification_request))
+        } else {
+            None
+        };
+        #[cfg(feature = "verify")]
+        let certificate_cache_prerequisites_met = self.pipeline.config.verify
+            && self.cache_certificates
+            && verification
+                .as_ref()
+                .is_some_and(|(cache, _, _)| cache.is_enabled())
+            && crate::jit_cert::jit_cert_cache_allowed_for_request()
+            && !crate::jit_cert::deep_verifier_override_disables_outer_cache();
+        #[cfg(feature = "verify")]
+        // The same owned request drives actual verification and cache identity.
+        // A pending identity bypasses reuse without causing an ambient recapture.
+        let verification_authority_id = certificate_cache_prerequisites_met
+            .then(|| {
+                verification
+                    .as_ref()
+                    .and_then(|(_, _, request)| request.reuse_identity())
+            })
+            .flatten();
+        #[cfg(feature = "verify")]
+        let use_certificate_cache = verification_authority_id.is_some();
+        #[cfg(feature = "verify")]
+        let collect_certificate_manifests = use_certificate_cache;
+        #[cfg(not(feature = "verify"))]
+        let collect_certificate_manifests = false;
+        let mut per_func_symbolic_fixup_manifests: Vec<Vec<u8>> = if collect_certificate_manifests {
+            Vec::with_capacity(functions.len())
+        } else {
+            Vec::new()
+        };
+
+        // Lay the module's data globals out before any code is encoded: the
+        // census below needs the placements, and a global whose name collides
+        // with a function is refused before either gets an offset.
+        let data_image = JitDataImageLayout::plan(inputs.globals(), |name| {
+            functions.iter().any(|func| func.name == name)
+        })?;
+        let data_image_manifest = data_image.as_ref().map(JitDataImageLayout::manifest);
 
         // Encode all functions into a contiguous buffer.
-        for func in functions {
+        for (ordinal, func) in functions.iter().enumerate() {
             let start = code.len() as u64;
             let mut body_start = start;
             if symbol_offsets.contains_key(func.name.as_str()) {
@@ -3439,7 +5423,7 @@ impl JitCompiler {
             }
 
             let encode_start = Instant::now();
-            let (bytes, fxs) = if profile_block_counters_enabled {
+            let (bytes, fxs, encoded_body_len) = if profile_block_counters_enabled {
                 // #364 BlockCounts path (AArch64-only at present).
                 //
                 // 1. Encode the function normally and capture per-block byte
@@ -3463,8 +5447,12 @@ impl JitCompiler {
                 #[cfg(target_arch = "aarch64")]
                 {
                     let (body_bytes, mut block_fixups, block_byte_offsets) =
-                        encode_function_with_fixups_and_blocks(func)?;
+                        crate::pipeline::encode_function_with_fixups_and_blocks_for_pipeline(
+                            &self.pipeline,
+                            func,
+                        )?;
                     record_encoding(func, encode_start.elapsed());
+                    let body_len = body_bytes.len();
 
                     // Allocate per-block counters.
                     let mut block_counter_ptrs: HashMap<BlockId, *const AtomicU64> =
@@ -3506,7 +5494,7 @@ impl JitCompiler {
                     // is mutually exclusive with BlockCounts, so body_start
                     // is still `start` here.
                     debug_assert!(!profile_counters_enabled);
-                    (spliced, block_fixups)
+                    (spliced, block_fixups, body_len)
                 }
                 #[cfg(not(target_arch = "aarch64"))]
                 {
@@ -3533,8 +5521,12 @@ impl JitCompiler {
                 #[cfg(target_arch = "aarch64")]
                 {
                     let (body_bytes, mut block_fixups, block_byte_offsets) =
-                        encode_function_with_fixups_and_blocks(func)?;
+                        crate::pipeline::encode_function_with_fixups_and_blocks_for_pipeline(
+                            &self.pipeline,
+                            func,
+                        )?;
                     record_encoding(func, encode_start.elapsed());
+                    let body_len = body_bytes.len();
 
                     // Allocate per-block timing cells. Capture raw pointers
                     // to the `count` field — the trampoline increments
@@ -3580,20 +5572,66 @@ impl JitCompiler {
                     )?;
 
                     debug_assert!(!profile_counters_enabled);
-                    (spliced, block_fixups)
+                    (spliced, block_fixups, body_len)
                 }
                 #[cfg(not(target_arch = "aarch64"))]
                 {
                     unreachable!("profile_block_timing_enabled implies target_arch = aarch64")
                 }
-            } else {
-                let (bytes, fxs) = encode_function_with_fixups(func)?;
+            } else if func.eh_metadata.has_eh_info() {
+                // Reached only with the compiler's unwind request (checked
+                // above): encode with block offsets, resolve the call-site
+                // and landing-pad offsets, and keep the exact LSDA.
+                let (bytes, fxs, lsda, personality) =
+                    crate::pipeline::encode_function_with_fixups_and_eh_sidecar(
+                        &self.pipeline,
+                        func,
+                    )?;
+                // The published image binds pointers through the manifest's
+                // relocation list, which has no typeinfo indirection slot
+                // yet; an unbound TType slot would read as a catch-all.
+                if !lsda.typeinfo_relocations.is_empty() {
+                    return Err(JitError::JitUnwindTypedCatchUnsupported {
+                        function: func.name.clone(),
+                        typeinfo_symbols: lsda
+                            .typeinfo_relocations
+                            .iter()
+                            .map(|reloc| reloc.symbol.clone())
+                            .collect(),
+                    });
+                }
                 record_encoding(func, encode_start.elapsed());
-                (bytes, fxs)
+                eh_sidecars[ordinal] = Some((lsda.bytes, personality));
+                let body_len = bytes.len();
+                (bytes, fxs, body_len)
+            } else {
+                let (bytes, fxs) =
+                    crate::pipeline::encode_function_with_fixups_for_pipeline_prechecked(
+                        &self.pipeline,
+                        func,
+                        inputs.final_stream_check(ordinal),
+                    )?;
+                record_encoding(func, encode_start.elapsed());
+                let body_len = bytes.len();
+                (bytes, fxs, body_len)
             };
+            if encoded_body_len == 0 && empty_encoded_body.is_none() {
+                empty_encoded_body = Some(func.name.clone());
+            }
+            if collect_certificate_manifests {
+                let mut manifest =
+                    crate::jit_cert::aarch64_symbolic_fixup_manifest(&fxs, body_start - start)?;
+                // The data image is module-wide: bind its identity into every
+                // function's cache key, so a verdict never outlives a change
+                // to the globals the function's fixups resolve against.
+                if let Some(data_manifest) = &data_image_manifest {
+                    manifest.extend_from_slice(data_manifest);
+                }
+                per_func_symbolic_fixup_manifests.push(manifest);
+            }
             for fx in fxs.iter() {
                 let mut adjusted = fx.clone();
-                adjusted.offset += body_start as u32;
+                adjusted.offset = rebase_jit_fixup_offset(fx.offset, body_start)?;
                 fixups.push(adjusted);
             }
             code.extend_from_slice(&bytes);
@@ -3604,32 +5642,140 @@ impl JitCompiler {
             func_ranges.push((func.name.clone(), start..end));
         }
 
-        // Resolve internal fixups.
-        for fixup in &fixups {
-            let addr = match &fixup.target {
-                FixupTarget::NamedSymbol(name) => {
-                    if has_explicit_extern(name, extern_symbols) {
-                        continue;
-                    } else if let Some(&off) = func_offsets.get(name) {
-                        off
-                    } else if resolve_extern(name, extern_symbols).is_some() {
-                        continue;
-                    } else if let Some(&off) = symbol_offsets.get(name) {
-                        off
-                    } else {
-                        return Err(JitError::UnresolvedSymbol(name.clone()));
+        let census = census_raw_jit_named_symbol_fixups(
+            &fixups,
+            &func_offsets,
+            data_image.as_ref(),
+            extern_symbols,
+            self.external_symbol_resolution,
+        )?;
+        let has_local_function_addresses = census.has_local_function_addresses;
+        // No obligation models a data image or a GOT slot: a verifying or
+        // proof-required request refuses the first such site by name.
+        if self.pipeline.config.verify || require_relocation_replay {
+            let refused = census
+                .direct_data
+                .iter()
+                .map(|site| (site.offset, site.symbol.clone()))
+                .chain(
+                    census
+                        .got_loads
+                        .iter()
+                        .map(|site| (site.offset, site.symbol.clone())),
+                )
+                .min();
+            if let Some((offset, symbol)) = refused {
+                return Err(JitError::JitDataRelocationProofUnavailable { offset, symbol });
+            }
+        }
+        // A placed image that no site addresses is still published (its
+        // pointer slots may name functions a caller reads through the
+        // symbol table); an empty module is refused below as before.
+        let direct_data_sites = census.direct_data;
+        let got_load_sites = census.got_loads;
+
+        // Capture original words and resolve all local address targets before
+        // ANY patch writes. The later independent decoder consumes this exact
+        // immutable inventory, not values supplied by the patcher.
+        let local_address_replay = if has_local_function_addresses {
+            let replay = LocalAddressReplay::capture(
+                &code,
+                &fixups,
+                &func_ranges,
+                empty_encoded_body,
+                counter_patch_sites
+                    .iter()
+                    .map(|(offset, _)| *offset)
+                    .chain(tstate_patch_sites.iter().copied()),
+                |fixup| {
+                    // A data-image site is not a local function row.
+                    if let FixupTarget::NamedSymbol(name) = &fixup.target
+                        && data_image.as_ref().is_some_and(|image| image.knows(name))
+                    {
+                        return Ok(None);
                     }
+                    resolve_raw_internal_fixup(
+                        fixup,
+                        functions,
+                        &func_offsets,
+                        &symbol_offsets,
+                        data_image.as_ref(),
+                        extern_symbols,
+                        self.external_symbol_resolution,
+                    )?
+                    .map(Some)
+                    .ok_or_else(|| {
+                        JitError::InvalidLocalFunctionAddressFixup {
+                            offset: fixup.offset,
+                            detail: "local address target did not resolve to a local function"
+                                .into(),
+                        }
+                    })
+                },
+            )?;
+            if self.pipeline.config.verify || require_relocation_replay {
+                // Concrete relocation-effect replay below is not a proof of
+                // source identity, ADD input value flow, call ABI, or compiled
+                // function semantics. Keep the proof-required boundary shut.
+                let offset = fixups
+                    .iter()
+                    .find(|fixup| {
+                        matches!(
+                            fixup.kind,
+                            crate::macho::reloc::AArch64RelocKind::Page21
+                                | crate::macho::reloc::AArch64RelocKind::Pageoff12
+                        )
+                    })
+                    .expect("the kind census found a local address fixup")
+                    .offset;
+                return Err(JitError::LocalFunctionAddressReplayUnavailable { offset });
+            }
+            Some(replay)
+        } else {
+            None
+        };
+
+        // A verifying AArch64 publication captures its relocation inventory
+        // for the installed-artifact replay (L11-P2) from the resolver, before
+        // any byte is installed; every other route skips it.
+        let mut installed_inventory = (cfg!(all(target_arch = "aarch64", feature = "verify"))
+            && self.pipeline.config.verify)
+            .then(installed_replay::InstalledReplayInventory::default);
+
+        // Branch-only modules retain the existing no-inventory fast path.
+        for fixup in &fixups {
+            if matches!(
+                fixup.kind,
+                crate::macho::reloc::AArch64RelocKind::Page21
+                    | crate::macho::reloc::AArch64RelocKind::Pageoff12
+            ) {
+                continue; // target was resolved exactly once during capture
+            }
+            if let Some(address) = resolve_raw_internal_fixup(
+                fixup,
+                functions,
+                &func_offsets,
+                &symbol_offsets,
+                data_image.as_ref(),
+                extern_symbols,
+                self.external_symbol_resolution,
+            )? {
+                if let Some(inventory) = installed_inventory.as_mut()
+                    && fixup.kind == crate::macho::reloc::AArch64RelocKind::Branch26
+                {
+                    inventory.branch(
+                        fixup.offset,
+                        installed_replay::BranchTarget::Function {
+                            name: installed_replay_target_label(&fixup.target),
+                            entry: address,
+                        },
+                    );
                 }
-                FixupTarget::Symbol(idx) => {
-                    let name = functions
-                        .get(*idx as usize)
-                        .map(|f| &f.name)
-                        .ok_or_else(|| JitError::UnresolvedSymbol(format!("index {}", idx)))?;
-                    *func_offsets.get(name.as_str()).unwrap()
-                }
-                _ => continue,
-            };
-            patch_fixup(&mut code, fixup.offset, addr)?;
+                patch_fixup(&mut code, fixup.offset, address)?;
+            }
+        }
+        if let Some(replay) = &local_address_replay {
+            replay.patch(&mut code)?;
         }
 
         // Build veneer trampolines for external calls and patch their BL sites.
@@ -3645,6 +5791,9 @@ impl JitCompiler {
         // pre-validate each external BL's distance to its veneer and return a
         // typed `VeneerOutOfRange` error instead of letting `patch_branch26`
         // emit a corrupt instruction or surface the generic `BranchOutOfRange`.
+        // End of the function image: everything appended from here on is a
+        // veneer (and, with a data image, a GOT slot).
+        let function_image_len = code.len();
         let mut veneers: HashMap<String, u64> = HashMap::new();
         // Deferred patches: (fixup_offset, veneer_offset, symbol_name). We
         // cannot patch while still emitting veneers because emitting grows
@@ -3653,11 +5802,22 @@ impl JitCompiler {
         // after all veneers are laid out.
         let mut ext_patches: Vec<(u32, u64, String)> = Vec::new();
         for fixup in &fixups {
+            // Only a branch reaches an external through a veneer; a GOT load
+            // of an external address is served by the slot table below.
+            if fixup.kind != crate::macho::reloc::AArch64RelocKind::Branch26 {
+                continue;
+            }
             let name = match &fixup.target {
                 FixupTarget::NamedSymbol(n)
                     if has_explicit_extern(n, extern_symbols)
                         || (!func_offsets.contains_key(n)
-                            && resolve_extern(n, extern_symbols).is_some()) =>
+                            && !data_image.as_ref().is_some_and(|image| image.knows(n))
+                            && resolve_external_symbol(
+                                n,
+                                extern_symbols,
+                                self.external_symbol_resolution,
+                            )
+                            .is_some()) =>
                 {
                     n
                 }
@@ -3679,8 +5839,50 @@ impl JitCompiler {
         // without emitting >128 MiB of real code.
         validate_veneer_ranges(&ext_patches, code.len())?;
 
-        for (fx_off, veneer_off, _sym) in &ext_patches {
+        for (fx_off, veneer_off, sym) in &ext_patches {
+            if let Some(inventory) = installed_inventory.as_mut() {
+                inventory.branch(
+                    *fx_off,
+                    installed_replay::BranchTarget::Veneer {
+                        symbol: sym.clone(),
+                        veneer: *veneer_off,
+                    },
+                );
+            }
             patch_fixup(&mut code, *fx_off, *veneer_off)?;
+        }
+        // Every other relocation is named, so the replay refuses one inside
+        // a certified range instead of comparing its patched word blindly.
+        if let Some(inventory) = installed_inventory.as_mut() {
+            for fixup in &fixups {
+                if !inventory.has_branch(fixup.offset) {
+                    inventory.other_relocation(fixup.offset, fixup.kind);
+                }
+            }
+        }
+
+        // JIT GOT: one 8-byte slot per distinct GOT-loaded symbol, appended
+        // after the veneers (inside the read-execute image, like a veneer
+        // literal). The ADRP/LDR sites are patched in image space now; the
+        // slot contents are absolute addresses written into the published
+        // image once the code and data bases are known.
+        let mut got_slots: Vec<(String, u64)> = Vec::new();
+        if !got_load_sites.is_empty() {
+            while code.len() % 8 != 0 {
+                code.push(0);
+            }
+            for site in &got_load_sites {
+                let slot = match got_slots.iter().find(|(name, _)| *name == site.symbol) {
+                    Some((_, slot)) => *slot,
+                    None => {
+                        let slot = code.len() as u64;
+                        code.extend_from_slice(&[0u8; 8]);
+                        got_slots.push((site.symbol.clone(), slot));
+                        slot
+                    }
+                };
+                patch_got_load_site(&mut code, site, slot)?;
+            }
         }
 
         // Zero-byte JIT artifacts are not executable artifacts. Reject before
@@ -3689,6 +5891,77 @@ impl JitCompiler {
         if code.is_empty() {
             return Err(JitError::EmptyExecutableBuffer {
                 function_count: functions.len(),
+            });
+        }
+
+        // Relocatable capture: `code` now holds every image-relative patch and
+        // nothing process-local except (below) the literal writes, which go
+        // to a copy. Capture reads; it never changes what is published.
+        if let Some(slot) = capture {
+            let refusal = if !cfg!(target_arch = "aarch64") {
+                Some(RelocatableImageRefusal::UnsupportedTarget)
+            } else if !counter_patch_sites.is_empty()
+                || !counters.is_empty()
+                || !timing_cells.is_empty()
+                || timing_state.is_some()
+                || !tstate_patch_sites.is_empty()
+            {
+                Some(RelocatableImageRefusal::ProfileHooks)
+            } else if emit_unwind_tables {
+                Some(RelocatableImageRefusal::UnwindTables)
+            } else if data_image.is_some() {
+                Some(RelocatableImageRefusal::DataImage)
+            } else if !got_slots.is_empty() {
+                Some(RelocatableImageRefusal::GotSlots)
+            } else if self.pipeline.config.verify {
+                Some(RelocatableImageRefusal::Verified)
+            } else if require_relocation_replay {
+                Some(RelocatableImageRefusal::RelocationReplayRequired)
+            } else if !function_target_features
+                .difference(
+                    self.pipeline
+                        .aarch64_isa_profile()
+                        .admitted_target_features()
+                        .as_set(),
+                )
+                .is_empty()
+            {
+                Some(RelocatableImageRefusal::FunctionTargetFeatures)
+            } else if fixups.iter().any(|fixup| {
+                // A named target that is neither explicit, nor a canonical
+                // function, nor process-resolvable was bound through the
+                // `_name` alias table: a resolution another process's symbol
+                // table could change. Only an alias-table name can be one, so
+                // the (costly) process lookup runs for those names alone.
+                matches!(&fixup.target, FixupTarget::NamedSymbol(name)
+                    if symbol_offsets.contains_key(name)
+                        && !func_offsets.contains_key(name)
+                        && !has_explicit_extern(name, extern_symbols)
+                        && resolve_external_symbol(
+                            name,
+                            extern_symbols,
+                            self.external_symbol_resolution,
+                        )
+                        .is_none())
+            }) {
+                Some(RelocatableImageRefusal::AliasResolvedInternalTarget)
+            } else {
+                None
+            };
+            *slot = Some(match refusal {
+                Some(refusal) => Err(refusal),
+                None => Ok(RelocatableImage::capture(
+                    relocatable_image::CaptureInputs {
+                        code: &code,
+                        function_image_len,
+                        veneers: &veneers,
+                        local_address_replay: local_address_replay.as_ref(),
+                        function_ranges: &func_ranges,
+                        canonical_symbols: &canonical_symbols,
+                        extern_symbols,
+                        policy: self.external_symbol_resolution,
+                    },
+                )),
             });
         }
 
@@ -3748,6 +6021,9 @@ impl JitCompiler {
             // debug_assert above verifies that `counter_ptr` lands in a `Box`
             // being transferred into the returned `ExecutableBuffer` (#494
             // invariant). Out-of-bounds slots fail closed.
+            if let Some(inventory) = installed_inventory.as_mut() {
+                inventory.literal(*patch_offset, "profile counter", *counter_ptr as u64);
+            }
             write_u64_literal_in_image(
                 &mut published_image,
                 image_len,
@@ -3763,6 +6039,9 @@ impl JitCompiler {
         if let Some(tstate) = timing_state.as_ref() {
             let tstate_ptr = &**tstate as *const TimingState as u64;
             for patch_offset in &tstate_patch_sites {
+                if let Some(inventory) = installed_inventory.as_mut() {
+                    inventory.literal(*patch_offset, "timing state", tstate_ptr);
+                }
                 write_u64_literal_in_image(
                     &mut published_image,
                     image_len,
@@ -3784,15 +6063,128 @@ impl JitCompiler {
         // slot within that veneer stub (instruction-aligned, not necessarily
         // 8-byte aligned — the image writer handles that).
         for (name, &veneer_off) in &veneers {
-            let ext_addr = resolve_extern(name, extern_symbols)
-                .ok_or_else(|| JitError::UnresolvedSymbol(name.clone()))?;
+            let ext_addr =
+                resolve_external_symbol(name, extern_symbols, self.external_symbol_resolution)
+                    .ok_or_else(|| JitError::UnresolvedSymbol(name.clone()))?;
+            let literal_offset = (veneer_off as usize)
+                .checked_add(veneer_addr_offset())
+                .ok_or_else(|| JitError::LocalFunctionAddressReplayRejected {
+                    offset: 0,
+                    detail: "veneer literal offset overflows".into(),
+                })?;
+            if let Some(replay) = &local_address_replay {
+                replay.check_appended_literal(literal_offset, image_len)?;
+            }
+            if let Some(inventory) = installed_inventory.as_mut() {
+                inventory.veneer(veneer_off, name, ext_addr as u64);
+            }
             write_u64_literal_in_image(
                 &mut published_image,
                 image_len,
-                veneer_off as usize + veneer_addr_offset(),
+                literal_offset,
                 ext_addr as u64,
             )?;
         }
+
+        // In-memory unwind tables (exception handling or panic_unwind walk
+        // frames): LSDAs, the personality slot and a terminated `.eh_frame`
+        // are appended after the code and veneers, every pointer field is
+        // bound through the manifest's relocation list, and the relocated
+        // tables are re-decoded independently before anything is mapped.
+        let unwind_manifest = if emit_unwind_tables {
+            let Some(request) = unwind_request else {
+                return Err(JitError::JitUnwindTableRejected {
+                    detail: "unwind tables were requested without a compiler unwind request"
+                        .to_string(),
+                });
+            };
+            let mut table_inputs = Vec::with_capacity(functions.len());
+            for (ordinal, (func, (range_name, range))) in
+                functions.iter().zip(func_ranges.iter()).enumerate()
+            {
+                if *range_name != func.name {
+                    return Err(JitError::JitUnwindTableRejected {
+                        detail: format!(
+                            "function range {range_name} does not pair with machine function {}",
+                            func.name
+                        ),
+                    });
+                }
+                let code_len = u32::try_from(range.end - range.start).map_err(|_| {
+                    JitError::JitUnwindTableRejected {
+                        detail: format!("function `{}` exceeds a 32-bit FDE range", func.name),
+                    }
+                })?;
+                table_inputs.push(crate::jit_unwind::JitUnwindFunctionInput {
+                    name: &func.name,
+                    code_offset: range.start,
+                    code_len,
+                    layout: request.frame_layout(ordinal).ok_or_else(|| {
+                        JitError::JitUnwindFrameLayoutMissing {
+                            function: func.name.clone(),
+                        }
+                    })?,
+                    lsda: eh_sidecars[ordinal]
+                        .as_ref()
+                        .map(|(lsda, personality)| (lsda.as_slice(), personality.as_str())),
+                });
+            }
+            let personality = match crate::jit_unwind::module_personality(&table_inputs)? {
+                None => None,
+                Some(symbol) => {
+                    let source = if has_explicit_extern(&symbol, extern_symbols) {
+                        crate::jit_unwind::JitPersonalitySource::ExplicitBinding
+                    } else {
+                        crate::jit_unwind::JitPersonalitySource::ProcessLookup
+                    };
+                    let address = resolve_external_symbol(
+                        &symbol,
+                        extern_symbols,
+                        self.external_symbol_resolution,
+                    )
+                    .ok_or_else(|| {
+                        JitError::JitUnwindPersonalityUnresolved {
+                            personality: symbol.clone(),
+                        }
+                    })?;
+                    Some(crate::jit_unwind::JitPersonalityBinding {
+                        symbol,
+                        address: address as u64,
+                        source,
+                    })
+                }
+            };
+            let manifest = crate::jit_unwind::append_aarch64_jit_unwind_tables(
+                &mut published_image,
+                &table_inputs,
+                personality,
+            )?;
+            // The exception-table obligations (L03-P14) over the bound
+            // image, before anything is mapped: testing grade, decided in
+            // process; a violation refuses the publication by name.
+            if manifest.carries_exception_handling() {
+                let mut placed = Vec::with_capacity(functions.len());
+                for (ordinal, (func, input)) in functions.iter().zip(&table_inputs).enumerate() {
+                    let layout = request.frame_layout(ordinal).ok_or_else(|| {
+                        JitError::JitUnwindFrameLayoutMissing {
+                            function: func.name.clone(),
+                        }
+                    })?;
+                    placed.push((func, input.code_offset, input.code_len, layout));
+                }
+                crate::pipeline::eh_obligation_intent::check_jit_image(
+                    &self.pipeline.eh_propagation,
+                    &placed,
+                    &published_image,
+                    &manifest,
+                )
+                .map_err(|detail| JitError::JitUnwindTableRejected { detail })?;
+            }
+            Some(manifest)
+        } else {
+            None
+        };
+        let published_len = published_image.len();
 
         // Allocate RW memory, bulk-copy the fully-patched image, then seal
         // RW->RX with the fail-closed bytes-hash publish check. On Apple
@@ -3800,21 +6192,172 @@ impl JitCompiler {
         // MAP_JIT pages into write mode and restores execute mode before the
         // returned `ExecutableBuffer` exposes function pointers. `MappedRegion`
         // owns the pages: every error path from here on unmaps via Drop.
-        let expected_sha256 = crate::jit_diagnostics::sha256_hex(&published_image);
-        let alloc_size = sys::page_align(image_len);
+        let alloc_size = sys::page_align(published_len);
         let mut region = MappedRegion::allocate_rw(alloc_size)?;
+        // The data image is mapped beside the code (never MAP_JIT, never
+        // executable). Its pointer slots and every code site that addresses
+        // it are resolved at the final bases; the ADRP reach check is the
+        // patcher's own. `JitDataRegion` unmaps on every error path.
+        let code_base = region.as_mut_ptr() as u64;
+        let mut data_symbols: HashMap<String, u64> = HashMap::new();
+        let mut data_image_record = None;
+        let data_region = match &data_image {
+            Some(layout) => {
+                let data_region = JitDataRegion::allocate_after(
+                    region.as_mut_ptr(),
+                    alloc_size,
+                    layout.bytes.len(),
+                )?;
+                let data_base = data_region.base();
+                let resolve_absolute = |symbol: &str, offset: u32| -> Result<u64, JitError> {
+                    if let Some(off) = layout.offset_of(symbol) {
+                        return Ok(data_base + off);
+                    }
+                    if let Some(&off) = func_offsets.get(symbol) {
+                        return Ok(code_base + off);
+                    }
+                    if layout.refusal(symbol).is_some() {
+                        return Err(JitError::JitDataGlobalUnplaceable {
+                            offset,
+                            global: symbol.to_string(),
+                            reason: layout.refusal(symbol).unwrap_or_default().to_string(),
+                        });
+                    }
+                    resolve_external_symbol(symbol, extern_symbols, self.external_symbol_resolution)
+                        .map(|pointer| pointer as u64)
+                        .ok_or_else(|| JitError::UnresolvedSymbol(symbol.to_string()))
+                };
+                for site in &direct_data_sites {
+                    patch_data_address_site(&mut published_image, site, code_base, data_base)?;
+                }
+                data_symbols = layout.symbol_offsets();
+                // Relocate the image's own pointer slots.
+                let mut image = layout.bytes.clone();
+                for global in &layout.placed {
+                    for sref in &global.symbol_refs {
+                        let slot = (global.offset + sref.offset) as usize;
+                        let address = resolve_absolute(&sref.symbol, 0)?;
+                        let current =
+                            u64::from_le_bytes(image[slot..slot + 8].try_into().map_err(|_| {
+                                JitError::InvalidDataRelocation {
+                                    offset: 0,
+                                    detail: format!(
+                                        "pointer slot of `{}` at {slot} is outside the image",
+                                        global.name
+                                    ),
+                                }
+                            })?);
+                        image[slot..slot + 8]
+                            .copy_from_slice(&current.wrapping_add(address).to_le_bytes());
+                    }
+                }
+                // Fill the GOT slots.
+                for (symbol, slot) in &got_slots {
+                    let site = got_load_sites
+                        .iter()
+                        .find(|site| site.symbol == *symbol)
+                        .map(|site| site.offset)
+                        .unwrap_or(0);
+                    let address = resolve_absolute(symbol, site)?;
+                    if let Some(replay) = &local_address_replay {
+                        replay.check_appended_literal(*slot as usize, image_len)?;
+                    }
+                    write_u64_literal_in_image(
+                        &mut published_image,
+                        image_len,
+                        *slot as usize,
+                        address,
+                    )?;
+                }
+                data_region.publish(&image)?;
+                data_image_record = Some(JitDataImageRecord {
+                    manifest_sha256: crate::jit_diagnostics::sha256_hex(
+                        data_image_manifest.as_deref().unwrap_or_default(),
+                    ),
+                    image_len: image.len(),
+                    global_count: layout.placed.len(),
+                    import_count: layout.import_count(),
+                    relocation_count: layout.relocation_count(),
+                    direct_site_count: direct_data_sites.len(),
+                    got_slot_count: got_slots.len(),
+                });
+                Some(data_region)
+            }
+            None => {
+                // GOT slots without a data image: local functions and
+                // externals only.
+                for (symbol, slot) in &got_slots {
+                    let address = if let Some(&off) = func_offsets.get(symbol) {
+                        code_base + off
+                    } else {
+                        resolve_external_symbol(
+                            symbol,
+                            extern_symbols,
+                            self.external_symbol_resolution,
+                        )
+                        .map(|pointer| pointer as u64)
+                        .ok_or_else(|| JitError::UnresolvedSymbol(symbol.clone()))?
+                    };
+                    if let Some(replay) = &local_address_replay {
+                        replay.check_appended_literal(*slot as usize, image_len)?;
+                    }
+                    write_u64_literal_in_image(
+                        &mut published_image,
+                        image_len,
+                        *slot as usize,
+                        address,
+                    )?;
+                }
+                if !got_slots.is_empty() {
+                    data_image_record = Some(JitDataImageRecord {
+                        manifest_sha256: crate::jit_diagnostics::sha256_hex(b""),
+                        image_len: 0,
+                        global_count: 0,
+                        import_count: 0,
+                        relocation_count: 0,
+                        direct_site_count: 0,
+                        got_slot_count: got_slots.len(),
+                    });
+                }
+                None
+            }
+        };
+        if let Some(replay) = &local_address_replay {
+            #[cfg(test)]
+            replay.corrupt_image_if_requested(&mut published_image);
+            // Decode independently at the ACTUAL mapped base, after every
+            // heap patch but before copy/RX. The mapping is dropped on failure.
+            replay.replay(&published_image[..image_len], region.as_mut_ptr() as u64)?;
+        }
+        let expected_sha256 = crate::jit_diagnostics::sha256_hex(&published_image);
         let jit_write_guard = sys::JitWriteGuard::enter();
         unsafe {
             // SAFETY: `region` owns a writable allocation of `alloc_size >=
-            // image_len` bytes; `published_image` is heap memory distinct
+            // published_len` bytes; `published_image` is heap memory distinct
             // from the fresh mapping.
-            std::ptr::copy_nonoverlapping(published_image.as_ptr(), region.as_mut_ptr(), image_len);
+            std::ptr::copy_nonoverlapping(
+                published_image.as_ptr(),
+                region.as_mut_ptr(),
+                published_len,
+            );
         }
-        corrupt_published_byte_if_requested(region.as_mut_ptr(), image_len);
+        corrupt_published_byte_if_requested(region.as_mut_ptr(), published_len);
         // Seal: icache flush (while still RW — ARM ARM ordering, #357), the
         // single RW->RX flip, then the read-back hash verification.
-        region.seal_rx_and_verify(image_len, &expected_sha256)?;
+        region.seal_rx_and_verify(published_len, &expected_sha256)?;
         drop(jit_write_guard);
+        // Witness the seal before the (possibly long) certificate block runs.
+        let page_witness = region.publication_page_witness();
+        // Register the sealed tables with the process unwinder and read every
+        // function's FDE back. Declared after `region`, so any later error
+        // path deregisters before the mapping is unmapped.
+        let eh_frame_unwind = match &unwind_manifest {
+            Some(manifest) => crate::jit_unwind::EhFrameJitUnwindRegistration::register(
+                region.as_mut_ptr(),
+                manifest,
+            )?,
+            None => crate::jit_unwind::EhFrameJitUnwindRegistration::default(),
+        };
         // NOTE: `region` intentionally stays alive across the certificate
         // block below — a panic inside `verify_function` unwinds through
         // `region`'s Drop and unmaps instead of leaking the mapping.
@@ -3825,73 +6368,97 @@ impl JitCompiler {
         // `verify_function` for each compiled function and attach a
         // `JitCertificate` (containing the full `CertificateChain` plus
         // coarse trust_ir provenance) to the `ExecutableBuffer`. Callers such
-        // as ty can then ask `buffer.certificate(name)` to prove that
-        // the JIT'd machine code was verified against its trust_ir input. The
-        // recorded byte range already includes any prepended profile
-        // trampoline so the certificate covers the full callable region.
+        // as ty can then ask `buffer.certificate(name)` for proof-grade
+        // verifier evidence over the MachFunction. The recorded byte range
+        // includes any prepended profile trampoline, whose exact bytes are
+        // integrity-bound but are not represented as a lowering obligation.
         //
         // When `verify` is off, `certificates` stays empty and the
         // `ExecutableBuffer::certificate` accessor returns `None`, keeping
         // the fast-path cost of JIT compilation unchanged.
         #[cfg(feature = "verify")]
         let certificates: HashMap<String, crate::jit_cert::JitCertificate> =
-            if self.pipeline.config.verify {
-                let compiler_config_bytes = jit_lowering_compiler_config_bytes(
-                    &self.pipeline.config,
-                    self.profile_hooks,
-                    self.pipeline.aarch64_isa_profile(),
-                );
+            if let Some((cache, verifier, request)) = verification.as_ref() {
                 // JIT-5: consult the process-global content-addressed
                 // certificate cache. The AArch64 JitCertificate path has the
-                // emitted machine bytes available at verify time, so the cache
-                // key folds those exact bytes with the config fingerprint — a
-                // warm hit reuses the verdict WITHOUT re-running
-                // `verify_function` (no solver spawn), rebound to this buffer's
-                // range. A miss verifies and populates. Nothing here can turn an
-                // unverified function into a verified one.
-                let cache = crate::jit_cert::JitCertCache::global();
-                let use_cache = self.cache_certificates && cache.is_enabled();
-                let mut certs = HashMap::with_capacity(functions.len());
-                for (func, (_name, range)) in functions.iter().zip(func_ranges.iter()) {
-                    let machine_code_bytes = &code[range.start as usize..range.end as usize];
-                    let key = crate::jit_cert::JitCertCacheKey::new(
-                        machine_code_bytes,
-                        &compiler_config_bytes,
+                // emitted machine bytes available at verify time. Its cache key
+                // binds those bytes, the complete verifier input, symbolic
+                // fixups, and compiler policy. A warm hit reuses the verdict
+                // WITHOUT re-running `verify_function`, rebound only to this
+                // buffer's range. A miss verifies and populates.
+                let use_cache = use_certificate_cache;
+                // The config bytes exist only paired with the verifier
+                // authority, so no cache key can be formed without it.
+                let cache_identity = verification_authority_id.map(|authority_id| {
+                    let compiler_config_bytes = jit_lowering_compiler_config_bytes(
+                        &self.pipeline.config,
+                        self.profile_hooks,
+                        self.pipeline.aarch64_isa_profile(),
+                        self.external_symbol_resolution,
                     );
-                    let cached = if use_cache { cache.peek(&key) } else { None };
-                    let cert = match cached {
-                        Some(v) if v.aarch64_cert.is_some() => {
+                    (compiler_config_bytes, authority_id)
+                });
+                let mut certs = HashMap::with_capacity(functions.len());
+                for (index, (func, (_name, range))) in
+                    functions.iter().zip(func_ranges.iter()).enumerate()
+                {
+                    let machine_code_bytes = &code[range.start as usize..range.end as usize];
+                    let machine_code_digest = crate::jit_cert::sha256_digest(machine_code_bytes);
+                    let verifier_input = inputs.verifier_input_digest(index)?;
+                    let key = cache_identity.as_ref().map(|(config_bytes, authority_id)| {
+                        crate::jit_cert::JitCertCacheKey::new_for_verified_function_digests(
+                            &machine_code_digest,
+                            &verifier_input,
+                            per_func_symbolic_fixup_manifests[index].as_slice(),
+                            config_bytes,
+                            authority_id,
+                        )
+                    });
+                    let cached = key
+                        .as_ref()
+                        .and_then(|key| cache.peek(key))
+                        .filter(|value| {
+                            value.verification_report.as_ref().is_some_and(|report| {
+                                report.reusable_for(request) && inputs.matches_report(index, report)
+                            })
+                        });
+                    let cert = match cached.as_ref().and_then(|v| v.aarch64_cert.as_ref()) {
+                        Some(certificate) => {
                             cache.record_hit();
-                            v.aarch64_cert
-                                .expect("peeked aarch64_cert present")
-                                .rebound(range.clone())
+                            certificate.rebound_from_cache(range.clone())
                         }
                         _ => {
                             if use_cache {
                                 cache.record_miss();
+                            } else {
+                                cache.record_uncached_verifier_run();
                             }
                             let report = crate::jit_cert::run_on_proof_verifier_stack(
                                 "trust-cg-jit-proof-verifier",
-                                || trust_cg_verify::verify_function(func),
+                                || inputs.verify(index, verifier, request),
                             );
                             let fresh = crate::jit_cert::JitCertificate::from_report(
                                 func,
-                                &report,
+                                report.report(),
                                 range.clone(),
                                 jit_lowering_target(),
-                                machine_code_bytes,
-                                &compiler_config_bytes,
-                            );
-                            if use_cache {
+                                verifier_input,
+                                machine_code_digest,
+                            )
+                            .with_checked_structural_return(&report, func, inputs.source(index))
+                            .with_request_ay_refusal_note(report.ay_refusal_note());
+                            if let Some(key) = key.filter(|_| {
+                                fresh.is_verified()
+                                    && report.reusable_for(request)
+                                    && inputs.matches_report(index, &report)
+                            }) {
                                 cache.store(
                                     key,
                                     crate::jit_cert::CachedFunctionVerdict {
-                                        verified: fresh.is_verified(),
-                                        emitted_bytes_sha256: crate::jit_diagnostics::sha256_hex(
-                                            machine_code_bytes,
-                                        ),
                                         x86_proof_certs: Vec::new(),
                                         aarch64_cert: Some(fresh.clone()),
+                                        verification_report: Some(report),
+                                        x86_envelope_report: None,
                                     },
                                 );
                             }
@@ -3908,28 +6475,84 @@ impl JitCompiler {
         #[cfg(not(feature = "verify"))]
         let certificates: HashMap<String, crate::jit_cert::JitCertificate> = HashMap::new();
 
+        // L11-P2: the installed-artifact replay. The mapping is sealed
+        // read-execute and its cache-maintenance walk has run; re-read it and
+        // re-check every certified function, its branch targets, veneers and
+        // runtime literals before any function pointer exists. A refusal
+        // unmaps the region (`MappedRegion`'s Drop).
+        let installed_replay = match installed_inventory.as_ref() {
+            Some(inventory) => {
+                #[cfg(test)]
+                installed_replay_test_hooks::tamper_installed_image_if_requested(
+                    &region,
+                    published_len,
+                    inventory,
+                )?;
+                let mut certified_ranges = Vec::with_capacity(func_ranges.len());
+                for (name, range) in &func_ranges {
+                    let certificate = certificates.get(name).ok_or_else(|| {
+                        JitError::InstalledArtifactReplayRejected {
+                            function: name.clone(),
+                            offset: range.start,
+                            detail: "the function has no certificate to replay against".into(),
+                        }
+                    })?;
+                    certified_ranges.push(installed_replay::CertifiedRange {
+                        name,
+                        range: range.clone(),
+                        certified_sha256: certificate.normalized_machine_code_sha256(),
+                    });
+                }
+                // SAFETY: `region` owns the sealed, readable mapping of at
+                // least `published_len` bytes, alive until the buffer below
+                // takes it; nothing writes it after the seal.
+                let installed = unsafe {
+                    std::slice::from_raw_parts(region.as_mut_ptr().cast_const(), published_len)
+                };
+                Some(inventory.replay(
+                    &code,
+                    installed,
+                    region.as_mut_ptr() as u64,
+                    &certified_ranges,
+                )?)
+            }
+            None => None,
+        };
+
+        let allocation = region.allocation_record();
         let (memory, alloc_size) = region.into_published_parts();
         let allocation_cookie =
-            executable_buffer_allocation_cookie(memory, alloc_size, code.len(), code.len());
+            executable_buffer_allocation_cookie(memory, alloc_size, code.len(), published_len);
         let buffer = ExecutableBuffer {
             memory,
+            data_region,
             len: alloc_size,
             len_shadow: alloc_size,
             allocation_cookie,
             code_len: code.len(),
-            published_len: code.len(),
+            published_len,
             published_image_sha256: expected_sha256,
             host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::published_rx(),
+            allocation,
+            page_witness,
+            teardown_policy: crate::jit_contract::TeardownPolicy::RefCounted,
+            execution_gate: ExecutionGate::new_shared(),
             windows_unwind: WindowsJitUnwindRegistration::default(),
+            eh_frame_unwind,
+            unwind_manifest,
             function_ranges: func_ranges,
             symbol_offsets,
+            data_symbols,
+            data_image: data_image_record,
             canonical_symbols,
             counters,
             timing_cells,
             timing_state,
             certificates,
+            installed_replay,
             proof_optimization_certificates: Vec::new(),
+            function_target_features,
         };
         debug_assert_eq!(buffer.allocation_len_opaque(), alloc_size);
         debug_assert_eq!(buffer.allocation_len_from_published_len(), alloc_size);
@@ -4202,6 +6825,11 @@ pub struct ExecutableBuffer {
     // it before the counter / timing boxes are dropped. See the struct-
     // level doc comment above for the full ordering argument.
     memory: *mut u8,
+    /// The read-write data image the code addresses (module globals), or
+    /// `None` when the module has none. Declared right after `memory`: every
+    /// teardown path unmaps or retires the code first, so no mapped code can
+    /// address a released image.
+    data_region: Option<JitDataRegion>,
     len: usize,
     // Redundant construction-time allocation extent for #734. Full-release
     // downstream LTO observed `len == 0` after `compile_raw` even though the
@@ -4225,7 +6853,24 @@ pub struct ExecutableBuffer {
     /// serialized replay, none of which supplies that evidence contract.
     host_jit_selected_codegen_profile: Option<HostJitSelectedCodegenProfile>,
     publication: JitPublicationContract,
+    /// Allocation flags, raw protections and seal outcome of the mapping.
+    allocation: JitAllocationRecord,
+    /// Kernel page-protection witness taken right after the read-execute
+    /// seal (`/proc/self/maps` on Linux, recorded-only elsewhere).
+    page_witness: PublicationPageWitness,
+    /// Enforced teardown policy: `RefCounted` (default) defers the unmap
+    /// until every [`JitExecutionLease`] is released; `ProcessLifetime` never
+    /// unmaps. Downstream/unspecified policies are refused at selection.
+    teardown_policy: crate::jit_contract::TeardownPolicy,
+    /// In-flight execution accounting shared with every outstanding lease.
+    execution_gate: std::sync::Arc<ExecutionGate>,
     windows_unwind: WindowsJitUnwindRegistration,
+    /// Live registration of the in-memory `.eh_frame` tables in the image
+    /// tail (AArch64 exception handling or panic-unwind walk frames). Every
+    /// teardown path deregisters it before the mapping is unmapped.
+    eh_frame_unwind: crate::jit_unwind::EhFrameJitUnwindRegistration,
+    /// Publisher record of those tables; `None` when none were emitted.
+    unwind_manifest: Option<crate::jit_unwind::JitUnwindManifest>,
     function_ranges: Vec<(String, std::ops::Range<u64>)>,
     /// Symbol → offset lookup table. Contains both canonical function names
     /// (as supplied by the caller) and Mach-O-style `_name` aliases pointing
@@ -4234,6 +6879,10 @@ pub struct ExecutableBuffer {
     /// Use `canonical_symbols` (via `symbols()` / `symbol_count()`) for the
     /// authoritative, de-duplicated symbol view (fix #360).
     symbol_offsets: HashMap<String, u64>,
+    /// Placed data-image globals by canonical name -> image offset.
+    data_symbols: HashMap<String, u64>,
+    /// Publisher record of the data image and GOT (identity only).
+    data_image: Option<JitDataImageRecord>,
     /// Canonical, user-provided function names in insertion order. One entry
     /// per compiled function. Distinct from `symbol_offsets` which also holds
     /// underscore-prefixed aliases.
@@ -4306,9 +6955,18 @@ pub struct ExecutableBuffer {
     /// When verification is disabled (runtime flag cleared or `verify`
     /// feature off), this map stays empty.
     certificates: HashMap<String, crate::jit_cert::JitCertificate>,
+    /// What the installed-artifact replay (L11-P2) checked: present on every
+    /// verifying AArch64 publication, `None` on every other route.
+    installed_replay: Option<InstalledArtifactReplayRecord>,
     /// Proof-optimization certificate citations emitted while preparing this
     /// executable buffer.
     proof_optimization_certificates: Vec<crate::pipeline::ProofOptimizationCertificateCitation>,
+    /// The AArch64 target features this buffer's functions state for
+    /// themselves (`MachFunction::function_target_features`, L03-P9): their
+    /// union for a raw compile, the features beyond the host-JIT contract
+    /// for a serialized replay, empty otherwise. Every one is implemented by
+    /// this CPU (the raw JIT and the replay both refuse one that is not).
+    function_target_features: TargetFeatureSet<AArch64IsaFeature>,
 }
 
 fn executable_buffer_allocation_cookie(
@@ -4334,6 +6992,333 @@ fn executable_buffer_allocation_cookie(
     if cookie == 0 { 1 } else { cookie }
 }
 
+// ---------------------------------------------------------------------------
+// Executable-memory teardown enforcement
+// ---------------------------------------------------------------------------
+
+/// Observable reclamation state of one executable buffer's mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JitReclamationState {
+    /// The owning buffer is alive.
+    Live,
+    /// The owning buffer was dropped while leased executions were in flight.
+    /// The mapping stays read-execute until the last lease is released.
+    RetiredPendingExecutions {
+        /// Leases still outstanding.
+        in_flight: usize,
+    },
+    /// The mapping has been unmapped.
+    Reclaimed,
+    /// The buffer's process-lifetime policy retained the mapping, its unwind
+    /// registration and every heap cell its code addresses at drop.
+    RetainedForProcessLifetime,
+    /// The recorded allocation extent failed validation at teardown, so the
+    /// mapping was leaked and counted by
+    /// [`executable_buffer_unmap_bailout_count`].
+    LeakedInvalidExtent,
+}
+
+/// A mapping whose owning buffer is gone but whose code may still execute.
+struct RetiredMapping {
+    memory: *mut u8,
+    allocation_len: usize,
+    /// The data image the retired code addresses; released after the code
+    /// is unmapped.
+    data_region: Option<JitDataRegion>,
+    windows_unwind: WindowsJitUnwindRegistration,
+    eh_frame_unwind: crate::jit_unwind::EhFrameJitUnwindRegistration,
+    // Ownership-only fields: the retired code addresses these cells through
+    // raw pointers baked into its literal pools, so they must live exactly
+    // until `reclaim` has unmapped that code. Rust never reads them.
+    #[allow(dead_code)]
+    counters: HashMap<String, Box<AtomicU64>>,
+    #[allow(dead_code)]
+    timing_cells: HashMap<String, Box<BlockTimingCell>>,
+    #[allow(dead_code)]
+    timing_state: Option<Box<TimingState>>,
+}
+
+// SAFETY: once retired, the read-execute mapping and the heap cells its code
+// addresses are owned exclusively by this record; nothing else frees them,
+// and moving the record between threads moves only that ownership.
+unsafe impl Send for RetiredMapping {}
+
+impl RetiredMapping {
+    /// Unmap first, then release the heap cells the code addresses (#494
+    /// order: no instant exists where mapped code can reach a freed cell).
+    fn reclaim(mut self) -> JitReclamationState {
+        // Deregister unwind tables while their bytes are still mapped.
+        self.windows_unwind.unregister();
+        self.eh_frame_unwind.unregister();
+        let state = if self.allocation_len == 0 {
+            // #734 fail-closed bail-out: never unmap a guessed extent.
+            UNMAP_BAILOUT_LEAKS.fetch_add(1, Ordering::Relaxed);
+            JitReclamationState::LeakedInvalidExtent
+        } else {
+            // SAFETY: `memory`/`allocation_len` are the validated extent of the
+            // mapping this record exclusively owns, and no lease remains, so
+            // no thread can be executing it.
+            unsafe { sys::munmap(self.memory, self.allocation_len) };
+            JitReclamationState::Reclaimed
+        };
+        self.memory = std::ptr::null_mut();
+        // The code that addressed the image is gone (or leaked with it).
+        if state == JitReclamationState::Reclaimed {
+            drop(self.data_region.take());
+        } else {
+            std::mem::forget(self.data_region.take());
+        }
+        state
+    }
+}
+
+/// Absorbing `in_flight` value: execution accounting can no longer prove that
+/// no lease is running the code, so the mapping is never reclaimed (buffer
+/// drop retires it and no release reclaims it, `try_release` refuses, and
+/// probes report this count). No valid lease sequence reaches it; see
+/// `ExecutionGate::acquire`.
+const PINNED_IN_FLIGHT: usize = usize::MAX;
+
+struct ExecutionGateState {
+    in_flight: usize,
+    retired: Option<RetiredMapping>,
+    terminal: JitReclamationState,
+}
+
+/// In-flight execution accounting shared by a buffer and its leases.
+pub(crate) struct ExecutionGate {
+    state: std::sync::Mutex<ExecutionGateState>,
+}
+
+impl ExecutionGate {
+    fn new_shared() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: std::sync::Mutex::new(ExecutionGateState {
+                in_flight: 0,
+                retired: None,
+                terminal: JitReclamationState::Live,
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ExecutionGateState> {
+        // A panic while holding the gate cannot leave the counters torn (every
+        // critical section is a few integer/Option updates), so recover the
+        // state instead of turning teardown into a second panic.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn acquire(&self) {
+        let mut state = self.lock();
+        // Every counted lease owns an `Arc` clone of this gate, and `Arc`
+        // aborts before its strong count passes `isize::MAX`, so valid leases
+        // cannot drive the count to `usize::MAX`. Saturating there lands in
+        // the absorbing pinned state rather than wrapping.
+        state.in_flight = state.in_flight.saturating_add(1);
+    }
+
+    fn release(&self) {
+        let mut state = self.lock();
+        state.in_flight = match state.in_flight {
+            // Only a lease's `Drop` releases, and every lease was counted by
+            // `acquire` when it was built, so an unmatched release has no
+            // current input. If one ever happened the count could no longer
+            // prove that no execution is in flight: pin the mapping (never
+            // reclaim) instead of panicking inside `Drop`.
+            0 | PINNED_IN_FLIGHT => PINNED_IN_FLIGHT,
+            in_flight => in_flight - 1,
+        };
+        if state.in_flight == 0
+            && let Some(retired) = state.retired.take()
+        {
+            // Deferred reclamation: the last in-flight execution has left.
+            state.terminal = retired.reclaim();
+            DEFERRED_RECLAMATIONS_COMPLETED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.lock().in_flight
+    }
+
+    fn reclamation_state(&self) -> JitReclamationState {
+        let state = self.lock();
+        if state.retired.is_some() {
+            JitReclamationState::RetiredPendingExecutions {
+                in_flight: state.in_flight,
+            }
+        } else {
+            state.terminal
+        }
+    }
+}
+
+/// Owned token for one in-flight execution of a buffer's code.
+///
+/// While any lease exists, dropping the owning [`ExecutableBuffer`] under the
+/// default `RefCounted` teardown policy retires the mapping instead of
+/// unmapping it; the last lease to be released performs the unmap. A lease is
+/// `Send + Sync + 'static`, so it can travel with a raw function pointer to
+/// another thread. Cloning a lease counts another in-flight execution.
+pub struct JitExecutionLease {
+    gate: std::sync::Arc<ExecutionGate>,
+    map_jit: bool,
+    buffer_base: u64,
+}
+
+impl JitExecutionLease {
+    /// Put the current thread into JIT execute mode when the mapping uses
+    /// Apple Silicon `MAP_JIT`; a no-op elsewhere. Call this on the thread
+    /// that will execute before invoking a leased pointer.
+    pub fn prepare_current_thread(&self) {
+        if self.map_jit {
+            ensure_jit_execute_mode();
+        }
+    }
+
+    /// Base address of the leased mapping (diagnostic identity only).
+    pub fn buffer_base(&self) -> u64 {
+        self.buffer_base
+    }
+}
+
+impl Clone for JitExecutionLease {
+    fn clone(&self) -> Self {
+        self.gate.acquire();
+        Self {
+            gate: std::sync::Arc::clone(&self.gate),
+            map_jit: self.map_jit,
+            buffer_base: self.buffer_base,
+        }
+    }
+}
+
+impl Drop for JitExecutionLease {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+impl std::fmt::Debug for JitExecutionLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitExecutionLease")
+            .field("buffer_base", &format_args!("{:#x}", self.buffer_base))
+            .field("map_jit", &self.map_jit)
+            .finish()
+    }
+}
+
+/// A raw symbol pointer that keeps its code mapped for as long as it lives.
+///
+/// Unlike [`JitPtr`], this handle does not borrow the buffer: the embedded
+/// [`JitExecutionLease`] defers reclamation of the mapping instead. It is
+/// still raw lookup (no manifest contract), for low-level cross-thread
+/// runtimes that must outlive the buffer handle they looked the symbol up in.
+#[derive(Clone, Debug)]
+pub struct JitLeasedPtr {
+    ptr: *const u8,
+    lease: JitExecutionLease,
+}
+
+// SAFETY: `ptr` addresses immutable read-execute code kept mapped by `lease`.
+unsafe impl Send for JitLeasedPtr {}
+// SAFETY: as above; sharing the address does not permit mutation.
+unsafe impl Sync for JitLeasedPtr {}
+
+impl JitLeasedPtr {
+    /// The leased code address. Valid while `self` lives.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// The lease keeping the code mapped.
+    pub fn lease(&self) -> &JitExecutionLease {
+        &self.lease
+    }
+
+    /// See [`JitExecutionLease::prepare_current_thread`].
+    pub fn prepare_current_thread(&self) {
+        self.lease.prepare_current_thread();
+    }
+}
+
+/// Reclamation observer that does not keep the mapping alive.
+#[derive(Clone)]
+pub struct JitReclamationProbe {
+    gate: std::sync::Arc<ExecutionGate>,
+}
+
+impl JitReclamationProbe {
+    /// Current reclamation state of the observed mapping.
+    pub fn state(&self) -> JitReclamationState {
+        self.gate.reclamation_state()
+    }
+
+    /// Leased executions currently in flight.
+    pub fn in_flight(&self) -> usize {
+        self.gate.in_flight()
+    }
+}
+
+impl std::fmt::Debug for JitReclamationProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitReclamationProbe")
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+/// [`ExecutableBuffer::try_release`] refused to unmap; the buffer is returned
+/// untouched.
+#[derive(Debug)]
+pub struct JitReleaseRefusal {
+    /// The buffer, still owned and still executable.
+    pub buffer: ExecutableBuffer,
+    /// Why release was refused.
+    pub error: JitError,
+}
+
+/// Stable label for a teardown policy in diagnostics and evidence.
+pub fn teardown_policy_label(policy: &crate::jit_contract::TeardownPolicy) -> String {
+    use crate::jit_contract::TeardownPolicy;
+    match policy {
+        TeardownPolicy::ProcessLifetime => "process_lifetime".to_owned(),
+        TeardownPolicy::RefCounted => "ref_counted".to_owned(),
+        TeardownPolicy::Downstream(owner) => format!("downstream:{owner}"),
+        TeardownPolicy::Unspecified => "unspecified".to_owned(),
+    }
+}
+
+/// Process-wide teardown accounting (diagnostic; per-buffer outcomes are
+/// observable through [`JitReclamationProbe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitTeardownCounters {
+    /// Drops that retired a mapping because leased executions were in flight.
+    pub deferred_reclamations: u64,
+    /// Deferred reclamations completed by the last lease release.
+    pub completed_deferred_reclamations: u64,
+    /// Drops that retained a mapping under the process-lifetime policy.
+    pub process_lifetime_retained: u64,
+    /// Drops that leaked a mapping whose recorded extent failed validation.
+    pub unmap_bailout_leaks: u64,
+}
+
+static DEFERRED_RECLAMATIONS: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_RECLAMATIONS_COMPLETED: AtomicU64 = AtomicU64::new(0);
+static PROCESS_LIFETIME_RETAINED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of this process's executable-buffer teardown accounting.
+pub fn executable_buffer_teardown_counters() -> JitTeardownCounters {
+    JitTeardownCounters {
+        deferred_reclamations: DEFERRED_RECLAMATIONS.load(Ordering::Relaxed),
+        completed_deferred_reclamations: DEFERRED_RECLAMATIONS_COMPLETED.load(Ordering::Relaxed),
+        process_lifetime_retained: PROCESS_LIFETIME_RETAINED.load(Ordering::Relaxed),
+        unmap_bailout_leaks: UNMAP_BAILOUT_LEAKS.load(Ordering::Relaxed),
+    }
+}
+
 /*
 SAFETY: After construction the mapped code buffer is immutable executable
 memory, so transferring or sharing `ExecutableBuffer` itself across threads
@@ -4346,11 +7331,13 @@ buffer while a call is still outstanding, causing use-after-free when `Drop`
 unmaps the executable pages.
 
 The lifetime-bound `get_fn_ptr_bound` / `get_fn_bound` APIs close that gap for
-new code by making outstanding pointers borrow the buffer. Callers who use the
-legacy raw APIs across threads are responsible for synchronizing buffer
-lifetime with all outstanding pointers, for example by keeping the buffer alive
-in an `Arc<ExecutableBuffer>` for the full duration of any call and only
-dropping it after all threads have returned.
+new code by making outstanding pointers borrow the buffer. Code that must
+outlive the buffer handle uses `leased_symbol_ptr` / `execution_lease`: under
+the enforced `RefCounted` policy, `Drop` retires rather than unmaps a mapping
+with leased executions in flight, and the last lease performs the unmap. A
+`ProcessLifetime` buffer never unmaps. Callers of the legacy raw APIs that
+take no lease remain responsible for keeping the buffer alive for every
+outstanding call.
 */
 unsafe impl Send for ExecutableBuffer {}
 unsafe impl Sync for ExecutableBuffer {}
@@ -4486,6 +7473,61 @@ impl ExecutableBuffer {
         self.publication
     }
 
+    /// Page-protection and allocation state this buffer was published under:
+    /// allocator, allocation flags, raw write-phase and published
+    /// protections, `MAP_JIT` / write-protect support, the published-RX flag
+    /// and the outcome of the publication-time RW -> RX change. The compile
+    /// service binds this record into installed payload bindings and requires
+    /// it to match the artifact manifest.
+    ///
+    /// Its page-protection witness pairs the permission string implied by
+    /// the recorded published protection with the kernel's permission string
+    /// for the whole allocation taken right after the seal (Linux), or
+    /// records that this host has only the recorded state (macOS, Windows).
+    pub fn executable_memory_protection(&self) -> crate::jit_contract::ExecutableMemoryProtection {
+        crate::jit_contract::ExecutableMemoryProtection {
+            allocator: sys::ALLOCATOR.to_owned(),
+            allocation_flags: self.allocation.allocation_flags,
+            allocation_granule_bytes: self.allocation.allocation_granule_bytes,
+            write_phase_protection: self.allocation.write_phase_protection,
+            published_protection: self.allocation.published_protection,
+            map_jit: self.publication.map_jit,
+            write_protect_supported: self.publication.write_protect_supported,
+            published_rx: self.publication.published_rx,
+            mprotect_rx_ok: self.allocation.mprotect_rx_ok,
+            page_protection_witness: crate::jit_contract::PageProtectionWitness {
+                source: self.page_witness.source(),
+                recorded_permissions: crate::jit_contract::recorded_page_permissions(
+                    sys::ALLOCATOR,
+                    self.allocation.allocation_flags,
+                    self.allocation.published_protection,
+                ),
+                observed_permissions: self.page_witness.observed_permissions(),
+            },
+        }
+    }
+
+    /// The page-protection witness taken right after this buffer's
+    /// read-execute seal.
+    pub fn publication_page_witness(&self) -> &PublicationPageWitness {
+        &self.page_witness
+    }
+
+    /// Read the kernel's current protection of this buffer's whole
+    /// allocation through `/proc/self/maps` (`PROCMAP_QUERY`, or the retrying
+    /// text reader on kernels without it; Linux only, other hosts return
+    /// [`KernelPageProtectionError::Unsupported`]). This is a fresh read, so
+    /// it reflects any protection change made before it. It never touches
+    /// the mapping's bytes.
+    pub fn observe_kernel_page_protection(
+        &self,
+    ) -> Result<KernelPageProtectionObservation, KernelPageProtectionError> {
+        crate::jit_page_witness::observe_kernel_page_protection(
+            self.memory as u64,
+            self.allocation_len_opaque() as u64,
+        )
+    }
+
     /// SHA-256 (lowercase hex) of the published image, computed from the
     /// compiled artifact and re-verified against the sealed RX mapping by
     /// the always-on JIT-7 publish check. Empty only for test-fabricated
@@ -4500,6 +7542,36 @@ impl ExecutableBuffer {
     /// authority.
     pub fn host_jit_selected_codegen_profile(&self) -> Option<&HostJitSelectedCodegenProfile> {
         self.host_jit_selected_codegen_profile.as_ref()
+    }
+
+    /// The AArch64 target features this buffer's functions state for
+    /// themselves (L03-P9): the union of their stated sets for a raw compile
+    /// (a stated feature may also be in the profile), the names a serialized
+    /// replay's contract adds to the host-JIT contract, and empty when no
+    /// function states any. Every one is implemented by this CPU.
+    pub fn aarch64_function_target_features(&self) -> TargetFeatureSet<AArch64IsaFeature> {
+        self.function_target_features
+    }
+
+    /// The target contract a serialized copy of this buffer must be
+    /// republished under ([`publish_serialized_buffer_for_target`]): the
+    /// host-JIT contract plus the features in
+    /// [`Self::aarch64_function_target_features`]. It equals
+    /// [`TargetDescriptor::for_trust_cg_host_jit`] when no function states a
+    /// feature beyond the JIT profile.
+    pub fn serialized_target_contract(&self) -> TargetDescriptor {
+        let host = TargetDescriptor::for_trust_cg_host_jit();
+        let features = host
+            .features
+            .iter()
+            .cloned()
+            .chain(
+                self.function_target_features
+                    .enabled()
+                    .map(|feature| feature.name().to_owned()),
+            )
+            .collect::<Vec<_>>();
+        host.with_features(features)
     }
 
     pub(crate) fn attach_host_jit_selected_codegen_profile(
@@ -4564,6 +7636,204 @@ impl ExecutableBuffer {
         self.reassert_published_executable().map(|_| ())
     }
 
+    /// Request a page protection for this published buffer.
+    ///
+    /// Only [`JitPageProtection::ReadExecute`] is granted: it reasserts the
+    /// published read-execute state exactly like
+    /// [`Self::ensure_published_executable`]. A writable+executable request is
+    /// refused with [`JitError::WritableExecutableProtectionRefused`] and a
+    /// read-write request with [`JitError::PublishedProtectionDowngradeRefused`];
+    /// neither reaches the memory-protection syscall, so a refused request
+    /// leaves the mapping read-execute.
+    pub fn request_page_protection(&self, requested: JitPageProtection) -> Result<(), JitError> {
+        let buffer_base = self.memory as u64;
+        let allocation_len = self.allocation_len_opaque();
+        match requested {
+            JitPageProtection::ReadExecute => self.ensure_published_executable(),
+            JitPageProtection::ReadWriteExecute => {
+                Err(JitError::WritableExecutableProtectionRefused {
+                    requested,
+                    buffer_base,
+                    allocation_len,
+                })
+            }
+            JitPageProtection::ReadWrite => Err(JitError::PublishedProtectionDowngradeRefused {
+                requested,
+                buffer_base,
+                allocation_len,
+            }),
+        }
+    }
+
+    /// The teardown policy this buffer enforces when it is dropped.
+    pub fn teardown_policy(&self) -> &crate::jit_contract::TeardownPolicy {
+        &self.teardown_policy
+    }
+
+    /// In-memory unwind tables published in this buffer's image tail, if the
+    /// module carried exception handling or requested panic-unwind frames.
+    pub fn unwind_tables(&self) -> Option<&crate::jit_unwind::JitUnwindManifest> {
+        self.unwind_manifest.as_ref()
+    }
+
+    /// Whether this buffer's unwind tables are registered with the process
+    /// unwinder right now.
+    pub fn unwind_tables_registered(&self) -> bool {
+        self.eh_frame_unwind.is_active()
+    }
+
+    /// Owner of this buffer's executable memory. Trust Codegen maps, retires
+    /// and unmaps every [`ExecutableBuffer`] itself.
+    pub fn executable_memory_owner(&self) -> crate::jit_contract::ExecutableMemoryOwner {
+        crate::jit_contract::ExecutableMemoryOwner::TrustCg
+    }
+
+    /// Select the enforced teardown policy.
+    ///
+    /// `RefCounted` (the default) defers unmapping until every
+    /// [`JitExecutionLease`] is released. `ProcessLifetime` never unmaps, so
+    /// raw pointers stay valid for the life of the process. A downstream or
+    /// unspecified policy cannot be enforced by Trust Codegen-owned memory and
+    /// is refused with [`JitError::UnenforceableTeardownPolicy`]; moving from
+    /// `ProcessLifetime` back to `RefCounted` is refused with
+    /// [`JitError::TeardownPolicyDowngradeRefused`] because pointers may
+    /// already rely on the process lifetime.
+    pub fn set_teardown_policy(
+        &mut self,
+        policy: crate::jit_contract::TeardownPolicy,
+    ) -> Result<(), JitError> {
+        use crate::jit_contract::TeardownPolicy;
+        match (&self.teardown_policy, &policy) {
+            (_, TeardownPolicy::Downstream(_) | TeardownPolicy::Unspecified) => {
+                Err(JitError::UnenforceableTeardownPolicy {
+                    policy: teardown_policy_label(&policy),
+                })
+            }
+            (TeardownPolicy::ProcessLifetime, TeardownPolicy::RefCounted) => {
+                Err(JitError::TeardownPolicyDowngradeRefused {
+                    current: teardown_policy_label(&self.teardown_policy),
+                    requested: teardown_policy_label(&policy),
+                })
+            }
+            _ => {
+                self.teardown_policy = policy;
+                Ok(())
+            }
+        }
+    }
+
+    /// Take an owned lease for one in-flight execution of this buffer's code.
+    ///
+    /// The lease keeps the mapping read-execute after this buffer is dropped
+    /// (see [`JitExecutionLease`]). Fails closed for an unpublished buffer or
+    /// an invalid extent.
+    pub fn execution_lease(&self) -> Result<JitExecutionLease, JitError> {
+        let buffer_base = self.memory as u64;
+        let allocation_len = self.allocation_len_opaque();
+        if self.memory.is_null() || allocation_len == 0 || self.code_len == 0 {
+            let code_len = u64::try_from(self.code_len).unwrap_or(u64::MAX);
+            return Err(JitError::InvalidExecutableBufferExtent {
+                buffer_base,
+                code_end: buffer_base.saturating_add(code_len),
+                allocation_end: buffer_base
+                    .saturating_add(u64::try_from(allocation_len).unwrap_or(u64::MAX)),
+                code_len: self.code_len,
+                allocation_len,
+            });
+        }
+        if !self.publication.published_rx {
+            let code_len = u64::try_from(self.code_len).unwrap_or(u64::MAX);
+            return Err(JitError::UnpublishedExecutableBuffer {
+                buffer_base,
+                buffer_end: buffer_base.saturating_add(code_len),
+                code_len: self.code_len,
+                allocation_len,
+            });
+        }
+        self.execution_gate.acquire();
+        Ok(JitExecutionLease {
+            gate: std::sync::Arc::clone(&self.execution_gate),
+            map_jit: self.publication.map_jit,
+            buffer_base,
+        })
+    }
+
+    /// Look up `name` and pair its code address with an execution lease.
+    ///
+    /// The returned [`JitLeasedPtr`] may be moved to another thread and used
+    /// after this buffer is dropped: the mapping is reclaimed only when the
+    /// last lease is released. This is raw lookup, not product dispatch.
+    pub fn leased_symbol_ptr(&self, name: &str) -> Result<JitLeasedPtr, JitError> {
+        let ptr = self
+            .get_fn_ptr_bound(name)
+            .ok_or_else(|| JitError::UnresolvedSymbol(name.to_owned()))?
+            .as_ptr();
+        let lease = self.execution_lease()?;
+        Ok(JitLeasedPtr { ptr, lease })
+    }
+
+    /// Leased executions currently in flight.
+    pub fn in_flight_executions(&self) -> usize {
+        self.execution_gate.in_flight()
+    }
+
+    /// Observer for this buffer's reclamation state that outlives the buffer
+    /// without keeping its mapping alive.
+    pub fn reclamation_probe(&self) -> JitReclamationProbe {
+        JitReclamationProbe {
+            gate: std::sync::Arc::clone(&self.execution_gate),
+        }
+    }
+
+    /// Unmap this buffer now, or refuse and hand it back.
+    ///
+    /// Refuses with [`JitError::ExecutableBufferInFlight`] while any lease is
+    /// outstanding, and with [`JitError::ProcessLifetimeReleaseRefused`] for a
+    /// process-lifetime buffer. On success the mapping has been unmapped.
+    pub fn try_release(self) -> Result<(), Box<JitReleaseRefusal>> {
+        let buffer_base = self.memory as u64;
+        let error = if self.teardown_policy == crate::jit_contract::TeardownPolicy::ProcessLifetime
+        {
+            Some(JitError::ProcessLifetimeReleaseRefused { buffer_base })
+        } else {
+            // No other handle can take a new lease: `self` is owned here and
+            // a lease can only be cloned from an existing one.
+            match self.in_flight_executions() {
+                0 => None,
+                in_flight => Some(JitError::ExecutableBufferInFlight {
+                    buffer_base,
+                    in_flight,
+                }),
+            }
+        };
+        match error {
+            Some(error) => Err(Box::new(JitReleaseRefusal {
+                buffer: self,
+                error,
+            })),
+            None => {
+                drop(self);
+                Ok(())
+            }
+        }
+    }
+
+    /// Move the mapping and every heap cell its code addresses out of `self`.
+    fn take_retired_mapping(&mut self, allocation_len: usize) -> RetiredMapping {
+        let retired = RetiredMapping {
+            memory: self.memory,
+            allocation_len,
+            data_region: self.data_region.take(),
+            windows_unwind: std::mem::take(&mut self.windows_unwind),
+            eh_frame_unwind: std::mem::take(&mut self.eh_frame_unwind),
+            counters: std::mem::take(&mut self.counters),
+            timing_cells: std::mem::take(&mut self.timing_cells),
+            timing_state: self.timing_state.take(),
+        };
+        self.memory = std::ptr::null_mut();
+        retired
+    }
+
     fn reassert_published_executable(&self) -> Result<(bool, bool), JitError> {
         let buffer_base = self.memory as u64;
         let code_len = u64::try_from(self.code_len).unwrap_or(u64::MAX);
@@ -4621,23 +7891,6 @@ impl ExecutableBuffer {
                 code_len: self.code_len,
                 allocation_len: self.allocation_len_opaque(),
             })
-    }
-
-    /// Reassert executable publication for a cached raw pointer after proving
-    /// that the pointer belongs to this buffer's initialized code range.
-    ///
-    /// Downstream runtimes that cache raw function pointers must use this
-    /// guard when they still have the owning [`ExecutableBuffer`] available.
-    /// A plain buffer-level publish can accidentally publish the wrong owner;
-    /// this form fails closed with range diagnostics before the unsafe call.
-    pub fn ensure_published_executable_for_ptr(
-        &self,
-        ptr: *const u8,
-        context: impl Into<String>,
-    ) -> Result<u64, JitError> {
-        let code_offset = self.checked_code_offset_for_ptr(ptr, context)?;
-        self.ensure_published_executable()?;
-        Ok(code_offset)
     }
 
     /// Reassert executable publication for a cached raw symbol pointer after
@@ -4858,6 +8111,32 @@ impl ExecutableBuffer {
         &self.canonical_symbols
     }
 
+    /// Address of a placed data-image global (a module global compiled with
+    /// [`JitCompiler::compile_raw_with_globals`] or through the typed
+    /// compiler), valid while this buffer is alive. `None` for a function,
+    /// an import, or a global the image did not place.
+    pub fn data_symbol_ptr(&self, name: &str) -> Option<*const u8> {
+        let region = self.data_region.as_ref()?;
+        let offset = *self.data_symbols.get(name)?;
+        usize::try_from(offset)
+            .ok()
+            .filter(|offset| *offset < region.len())
+            .map(|offset| (region.base() as usize + offset) as *const u8)
+    }
+
+    /// The published data image and GOT record, or `None` when the module
+    /// had no data globals and no GOT-loaded symbol.
+    pub fn data_image(&self) -> Option<&JitDataImageRecord> {
+        self.data_image.as_ref()
+    }
+
+    /// Base address and length of the data-image mapping, when one exists.
+    pub fn data_image_range(&self) -> Option<(u64, usize)> {
+        self.data_region
+            .as_ref()
+            .map(|region| (region.base(), region.len()))
+    }
+
     /// Borrow the per-function `(name, code_byte_range)` ranges captured at
     /// JIT layout time.
     pub fn function_ranges(&self) -> &[(String, std::ops::Range<u64>)] {
@@ -4909,6 +8188,52 @@ impl ExecutableBuffer {
             "jit_live_symbol_layout".to_string(),
         );
         report.proof_optimization_certificates = self.proof_optimization_certificates.clone();
+        // Publication context: protection digest (compared at installed
+        // replay), cache-maintenance geometry (including any recorded
+        // architectural-minimum fallback) and the enforced teardown policy.
+        report.properties.insert(
+            "executable_memory_protection_sha256".to_string(),
+            self.executable_memory_protection().canonical_sha256(),
+        );
+        let geometry = jit_cache_line_geometry();
+        report.properties.insert(
+            "jit_cache_line_source".to_string(),
+            geometry.source.as_str().to_string(),
+        );
+        report.properties.insert(
+            "jit_dcache_min_line_bytes".to_string(),
+            geometry.dcache_min_line_bytes.to_string(),
+        );
+        report.properties.insert(
+            "jit_icache_min_line_bytes".to_string(),
+            geometry.icache_min_line_bytes.to_string(),
+        );
+        report.properties.insert(
+            "teardown_policy".to_string(),
+            teardown_policy_label(&self.teardown_policy),
+        );
+        if let Some(record) = &self.data_image {
+            report.properties.insert(
+                "jit_data_image_manifest_sha256".to_string(),
+                format!("sha256:{}", record.manifest_sha256),
+            );
+            report.properties.insert(
+                "jit_data_image_len".to_string(),
+                record.image_len.to_string(),
+            );
+            report.properties.insert(
+                "jit_data_relocation_count".to_string(),
+                record.relocation_count.to_string(),
+            );
+            report.properties.insert(
+                "jit_data_direct_site_count".to_string(),
+                record.direct_site_count.to_string(),
+            );
+            report.properties.insert(
+                "jit_got_slot_count".to_string(),
+                record.got_slot_count.to_string(),
+            );
+        }
 
         for (name, range) in &self.function_ranges {
             let generated_alias = format!("_{}", name);
@@ -5006,6 +8331,18 @@ impl ExecutableBuffer {
             bytes.extend_from_slice(name.as_bytes());
         }
 
+        // A data image extends the identity; a buffer without one keeps the
+        // v1 byte layout exactly.
+        if let Some(record) = &self.data_image {
+            bytes.extend_from_slice(b"data-image\0");
+            bytes.extend_from_slice(&(record.manifest_sha256.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(record.manifest_sha256.as_bytes());
+            bytes.extend_from_slice(&(record.image_len as u64).to_le_bytes());
+            bytes.extend_from_slice(&(record.relocation_count as u64).to_le_bytes());
+            bytes.extend_from_slice(&(record.direct_site_count as u64).to_le_bytes());
+            bytes.extend_from_slice(&(record.got_slot_count as u64).to_le_bytes());
+        }
+
         bytes
     }
 
@@ -5027,13 +8364,12 @@ impl ExecutableBuffer {
     ///
     /// Fix #360: previous implementation filtered `symbol_offsets` by
     /// `!starts_with('_')`, which silently hid functions whose canonical
-    /// name already began with `_`. Iterating the canonical list is both
-    /// correct and O(n) without a hash probe per item.
+    /// name already began with `_`. Iterating the canonical list preserves
+    /// those names and performs one offset-map lookup per compiled function.
     pub fn symbols(&self) -> impl Iterator<Item = (&str, u64)> {
         self.canonical_symbols.iter().map(move |name| {
-            // Safety: every canonical name is inserted into `symbol_offsets`
-            // at construction time. If this unwrap ever fires we have a
-            // construction-time bug, not a user-input bug.
+            // Compilation constructs both collections together; unsafe native
+            // replay requires authenticated, consistent symbol metadata.
             let off = *self
                 .symbol_offsets
                 .get(name.as_str())
@@ -5108,27 +8444,6 @@ impl ExecutableBuffer {
         }
 
         profile
-    }
-
-    /// Snapshot function-entry JIT counters using a legacy module-hash-only
-    /// default key. New profile-generate callers should use
-    /// [`Self::entry_profdata_with_key`].
-    pub fn entry_profdata(&self, module_hash: u128) -> trust_cg_opt::pgo::ProfData {
-        let profile_key =
-            trust_cg_opt::CacheKey::new(module_hash, 0, String::new(), String::new(), Vec::new());
-        self.entry_profdata_with_key(&profile_key)
-    }
-
-    /// Write [`Self::entry_profdata`] to `path` and return the captured
-    /// profile document.
-    pub fn write_entry_profdata(
-        &self,
-        module_hash: u128,
-        path: &std::path::Path,
-    ) -> Result<trust_cg_opt::pgo::ProfData, trust_cg_opt::pgo::ProfDataError> {
-        let profile = self.entry_profdata(module_hash);
-        trust_cg_opt::pgo::write_to_path(&profile, path)?;
-        Ok(profile)
     }
 
     /// Write [`Self::entry_profdata_with_key`] to `path` and return the
@@ -5223,27 +8538,6 @@ impl ExecutableBuffer {
         }
 
         profile
-    }
-
-    /// Snapshot all JIT block counters using a legacy module-hash-only
-    /// default key. New profile-generate callers should use
-    /// [`Self::block_profdata_with_key`].
-    pub fn block_profdata(&self, module_hash: u128) -> trust_cg_opt::pgo::ProfData {
-        let profile_key =
-            trust_cg_opt::CacheKey::new(module_hash, 0, String::new(), String::new(), Vec::new());
-        self.block_profdata_with_key(&profile_key)
-    }
-
-    /// Write [`Self::block_profdata`] to `path` and return the captured
-    /// profile document.
-    pub fn write_block_profdata(
-        &self,
-        module_hash: u128,
-        path: &std::path::Path,
-    ) -> Result<trust_cg_opt::pgo::ProfData, trust_cg_opt::pgo::ProfDataError> {
-        let profile = self.block_profdata(module_hash);
-        trust_cg_opt::pgo::write_to_path(&profile, path)?;
-        Ok(profile)
     }
 
     /// Write [`Self::block_profdata_with_key`] to `path` and return the
@@ -5370,8 +8664,9 @@ impl ExecutableBuffer {
     /// [`crate::jit::JitConfig::verify`] was true at compile time and the
     /// `verify` feature is enabled in the build.
     ///
-    /// Callers such as ty use this to assert that a JIT'd function has
-    /// been formally checked against its trust_ir input. Example:
+    /// Callers such as ty use this to inspect proof-grade evidence for the
+    /// verifier-visible MachFunction. This Phase-1 certificate does not yet
+    /// assert exact TrustIR-to-MachIR provenance. Example:
     ///
     /// ```no_run
     /// # use trust_cg_codegen::jit::{JitCompiler, JitConfig};
@@ -5394,16 +8689,39 @@ impl ExecutableBuffer {
         self.certificates.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Returns true iff every attached certificate reports
-    /// [`crate::jit_cert::JitCertificate::is_verified`]. Returns `true`
-    /// vacuously when there are no certificates (e.g. verification off).
+    /// What the installed-artifact replay (ledger `L11-P2`) checked before
+    /// this buffer was handed out: the sealed mapping re-read and compared
+    /// with every certified function's certificate-bound words, its branch
+    /// targets re-derived by an independent decoder, its veneers and runtime
+    /// literals. `Some` on every verifying AArch64 publication; `None` on
+    /// every other route.
+    pub fn installed_replay(&self) -> Option<&InstalledArtifactReplayRecord> {
+        self.installed_replay.as_ref()
+    }
+
+    /// Returns true iff the non-empty published function set has exact
+    /// name-level certificate coverage and every certificate carries
+    /// checked semantic evidence: non-vacuous instruction proofs or a separately
+    /// classified exact source/ABI check for a RET-only body.
+    pub fn all_function_semantics_verified(&self) -> bool {
+        !self.function_ranges.is_empty()
+            && self.certificates.len() == self.function_ranges.len()
+            && self.function_ranges.iter().all(|(name, _)| {
+                self.certificates
+                    .get(name)
+                    .is_some_and(crate::jit_cert::JitCertificate::has_checked_semantics)
+            })
+    }
+
+    /// Compatibility spelling for [`Self::all_function_semantics_verified`].
+    /// Unlike the historical implementation, this is never vacuously true.
     pub fn all_verified(&self) -> bool {
-        self.certificates.values().all(|c| c.is_verified())
+        self.all_function_semantics_verified()
     }
 
     /// Export every attached certificate as a single JSON object mapping
     /// function name → certificate JSON. Intended for cross-system proof
-    /// composition (see `designs/2026-04-16-proof-certificate-chain.md`).
+    /// composition.
     pub fn export_proofs(&self) -> String {
         let mut out = String::from("{\n  \"functions\": {");
         for (i, (name, cert)) in self.certificates.iter().enumerate() {
@@ -5470,37 +8788,52 @@ impl ExecutableBuffer {
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         // ORDER MATTERS (#494): `munmap` must run BEFORE the counter /
-        // timing-cell / timing-state boxes are dropped. This runs first
-        // (`Drop::drop` is invoked before the compiler-generated field
-        // drops), and the counter/timing fields are declared AFTER
-        // `memory` in `ExecutableBuffer` so they drop after this returns.
-        //
-        // Consequence: once `munmap` returns, any in-flight JIT call is
-        // already a use-after-free on the text pages themselves — there
-        // is no window in which the trampoline can observe a freed
-        // counter while the text is still mapped. See the module-level
+        // timing-cell / timing-state boxes are dropped. Every path below
+        // either unmaps before those cells are released (`RetiredMapping::
+        // reclaim` unmaps, then drops the moved cells) or keeps both alive
+        // together (deferred reclamation, process-lifetime retention). There
+        // is therefore no window in which a trampoline can observe a freed
+        // counter while its text is still mapped. See the module-level
         // "Profile counter & timing-cell lifetime" section.
-        if !self.memory.is_null() {
-            // Unregister the Windows unwind table unconditionally: the table
-            // itself lives in an owned Vec, so deregistration is safe even
-            // when the mapping extent below cannot be validated. (Previously
-            // the bail-out path skipped this too.)
-            self.windows_unwind.unregister();
-            let allocation_len = self.allocation_len_for_unmap();
-            if allocation_len == 0 {
-                // #734 fail-closed bail-out: the recorded allocation extent
-                // is inconsistent and unmapping a guessed extent could tear
-                // down unrelated mappings — leaking is the sound choice, but
-                // it must never be SILENT (the accumulation failure mode of
-                // docs/jit-parallel-race-2026-06-29.md). Count it so tests
-                // and diagnostics can observe the leak.
-                UNMAP_BAILOUT_LEAKS.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            unsafe {
-                sys::munmap(self.memory, allocation_len);
-            }
+        if self.memory.is_null() {
+            return;
         }
+        if self.teardown_policy == crate::jit_contract::TeardownPolicy::ProcessLifetime {
+            // Process lifetime: the code, its unwind registration and every
+            // heap cell it addresses stay valid until the process exits.
+            // `forget` is load-bearing on x86-64 Windows, where
+            // `WindowsJitUnwindRegistration::drop` calls `RtlDeleteFunctionTable`:
+            // the retained text must keep its unwind table registered. On every
+            // other target the type is an empty stub with no `Drop`, which is the
+            // only configuration this lint sees.
+            #[allow(clippy::forget_non_drop)]
+            std::mem::forget(std::mem::take(&mut self.windows_unwind));
+            std::mem::forget(std::mem::take(&mut self.eh_frame_unwind));
+            std::mem::forget(std::mem::take(&mut self.counters));
+            std::mem::forget(std::mem::take(&mut self.timing_cells));
+            std::mem::forget(self.timing_state.take());
+            std::mem::forget(self.data_region.take());
+            self.memory = std::ptr::null_mut();
+            PROCESS_LIFETIME_RETAINED.fetch_add(1, Ordering::Relaxed);
+            self.execution_gate.lock().terminal = JitReclamationState::RetainedForProcessLifetime;
+            return;
+        }
+        // RefCounted. A zero extent is the #734 fail-closed bail-out: the
+        // recorded allocation extent is inconsistent and unmapping a guessed
+        // extent could tear down unrelated mappings, so the mapping is leaked
+        // and counted (never silently; see docs/jit-parallel-race-2026-06-29.md).
+        let allocation_len = self.allocation_len_for_unmap();
+        let gate = std::sync::Arc::clone(&self.execution_gate);
+        let mut state = gate.lock();
+        let retired = self.take_retired_mapping(allocation_len);
+        if state.in_flight > 0 {
+            // Leased executions are still running this code: retire the
+            // mapping; the last `JitExecutionLease` drop reclaims it.
+            state.retired = Some(retired);
+            DEFERRED_RECLAMATIONS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        state.terminal = retired.reclaim();
     }
 }
 
@@ -5528,6 +8861,15 @@ unsafe fn write_u64_literal_unaligned(base: *mut u8, offset: usize, value: u64) 
 // ---------------------------------------------------------------------------
 // Architecture-specific fixup patching and veneer stubs
 // ---------------------------------------------------------------------------
+
+/// The name the installed-artifact replay gives a branch relocation's target
+/// in a refusal (diagnostic text only).
+fn installed_replay_target_label(target: &FixupTarget) -> String {
+    match target {
+        FixupTarget::NamedSymbol(name) | FixupTarget::ExactNamedSymbol(name) => name.clone(),
+        other => format!("{other:?}"),
+    }
+}
 
 /// Patch a branch/call fixup at `offset` to reach `target`.
 /// Dispatches to the appropriate architecture-specific implementation.
@@ -5693,8 +9035,8 @@ fn emit_profile_trampoline_with_timing_aarch64(code: &mut Vec<u8>) -> (usize, us
 const X86_64_PROFILE_TRAMPOLINE_BYTES: usize = 16;
 
 #[cfg(target_arch = "aarch64")]
-fn block_splice_encoding_error(message: impl Into<String>) -> JitError {
-    JitError::Pipeline(PipelineError::Encoding(message.into()))
+fn block_splice_error(message: impl Into<String>) -> JitError {
+    JitError::BlockProfileSplice(message.into())
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -5759,7 +9101,7 @@ fn block_splice_byte_offset(
         .copied()
         .map(|offset| offset as usize)
         .ok_or_else(|| {
-            block_splice_encoding_error(format!(
+            block_splice_error(format!(
                 "{prefix}: block {bid:?} missing byte offset while {purpose}"
             ))
         })
@@ -5773,7 +9115,7 @@ fn block_splice_layout_index(
     purpose: &str,
 ) -> Result<usize, JitError> {
     block_layout_idx.get(&bid).copied().ok_or_else(|| {
-        block_splice_encoding_error(format!(
+        block_splice_error(format!(
             "{prefix}: block {bid:?} missing layout index while {purpose}"
         ))
     })
@@ -5790,7 +9132,7 @@ fn block_splice_trampoline_start(
         .get(&bid)
         .copied()
         .ok_or_else(|| {
-            block_splice_encoding_error(format!(
+            block_splice_error(format!(
                 "{prefix}: {role} {bid:?} has no post-splice offset"
             ))
         })
@@ -5805,7 +9147,7 @@ fn validate_block_splice_body_range(
     body_len: usize,
 ) -> Result<(), JitError> {
     if start > end || end > body_len {
-        return Err(block_splice_encoding_error(format!(
+        return Err(block_splice_error(format!(
             "{prefix}: block {bid:?} byte range {start}..{end} is outside body length {body_len}"
         )));
     }
@@ -5856,6 +9198,12 @@ fn splice_block_trampolines_aarch64(
     use trust_cg_ir::inst::AArch64Opcode;
 
     const PREFIX: &str = "block-splice";
+    if !func.jump_table_address_expansions.is_empty() {
+        return Err(JitError::BlockProfileSplice(
+            "block-splice: long local table addresses require a modeled post-splice re-layout"
+                .into(),
+        ));
+    }
     let tramp = AARCH64_PROFILE_TRAMPOLINE_BYTES;
 
     // Block layout order and per-block shift amounts. Block at layout
@@ -5917,9 +9265,7 @@ fn splice_block_trampolines_aarch64(
     }
     let insts_end_in_body = {
         let last_bid = *func.block_order.last().ok_or_else(|| {
-            JitError::Pipeline(PipelineError::Encoding(
-                "block-splice: empty block_order".to_string(),
-            ))
+            JitError::BlockProfileSplice("block-splice: empty block_order".to_string())
         })?;
         let last_block = func.block(last_bid);
         let last_non_pseudo = last_block
@@ -5935,31 +9281,31 @@ fn splice_block_trampolines_aarch64(
         )? + last_non_pseudo * 4
     };
     if insts_end_in_body > body_bytes.len() {
-        return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+        return Err(JitError::BlockProfileSplice(format!(
             "block-splice: computed insts_end_in_body {} exceeds body_bytes.len() {}",
             insts_end_in_body,
             body_bytes.len()
-        ))));
+        )));
     }
     // Sanity: if no ADR->jump-table sites were found, the jump-table tail
     // must be empty. If it's non-empty without any ADR pointing at it, we
     // cannot safely reconstruct the tail, so bail out explicitly rather
     // than silently dropping bytes.
     if jt_adr_sites.is_empty() && insts_end_in_body < body_bytes.len() {
-        return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+        return Err(JitError::BlockProfileSplice(format!(
             "block-splice: body_bytes has {} bytes of unexpected tail past instruction end \
              without any Adr(JumpTableIndex) site",
             body_bytes.len() - insts_end_in_body
-        ))));
+        )));
     }
     // Range-check every referenced jt_idx BEFORE we start writing `out`.
     for &(_, _, jt_idx) in &jt_adr_sites {
         if (jt_idx as usize) >= func.jump_tables.len() {
-            return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+            return Err(JitError::BlockProfileSplice(format!(
                 "block-splice: Adr references jump table index {} but func has only {} tables",
                 jt_idx,
                 func.jump_tables.len()
-            ))));
+            )));
         }
     }
 
@@ -6051,7 +9397,7 @@ fn splice_block_trampolines_aarch64(
                 )?;
                 let new_source = orig_inst_byte + (source_layout_idx + 1) * tramp;
                 if new_source + 4 > out.len() {
-                    return Err(block_splice_encoding_error(format!(
+                    return Err(block_splice_error(format!(
                         "{PREFIX}: branch source at post-splice offset {new_source} exceeds out buffer length {}",
                         out.len()
                     )));
@@ -6089,10 +9435,10 @@ fn splice_block_trampolines_aarch64(
                 };
                 let original_target_byte = (orig_inst_byte as i64) + signed_imm * 4;
                 if original_target_byte < 0 {
-                    return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+                    return Err(JitError::BlockProfileSplice(format!(
                         "block-splice: negative original branch target {}",
                         original_target_byte
-                    ))));
+                    )));
                 }
                 let original_target_byte = original_target_byte as u32;
 
@@ -6104,10 +9450,10 @@ fn splice_block_trampolines_aarch64(
                     .find(|&(_, &bo)| bo == original_target_byte)
                     .map(|(bid, _)| *bid)
                     .ok_or_else(|| {
-                        JitError::Pipeline(PipelineError::Encoding(format!(
+                        JitError::BlockProfileSplice(format!(
                             "block-splice: branch at original byte {} targets {} which is not a block start",
                             orig_inst_byte, original_target_byte
-                        )))
+                        ))
                     })?;
                 let new_target = block_splice_trampoline_start(
                     PREFIX,
@@ -6119,20 +9465,20 @@ fn splice_block_trampolines_aarch64(
                 // Compute new byte-distance and encode.
                 let new_dist_bytes = new_target as i64 - new_source as i64;
                 if new_dist_bytes % 4 != 0 {
-                    return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+                    return Err(JitError::BlockProfileSplice(format!(
                         "block-splice: non-4-byte-aligned branch distance {}",
                         new_dist_bytes
-                    ))));
+                    )));
                 }
                 let new_inst_units = new_dist_bytes / 4;
                 // Range-check.
                 let range = 1i64 << (imm_bits - 1);
                 if new_inst_units < -range || new_inst_units >= range {
-                    return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+                    return Err(JitError::BlockProfileSplice(format!(
                         "block-splice: branch displacement {} out of {}-bit range after \
                          trampoline insertion",
                         new_inst_units, imm_bits
-                    ))));
+                    )));
                 }
                 let new_imm = (new_inst_units as u32) & imm_mask;
                 let cleared = existing & !(imm_mask << imm_shift);
@@ -6190,20 +9536,20 @@ fn splice_block_trampolines_aarch64(
     for (orig_adr_byte, source_layout_idx, jt_idx) in jt_adr_sites {
         let new_adr = orig_adr_byte + (source_layout_idx + 1) * tramp;
         if new_adr + 4 > out.len() {
-            return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+            return Err(JitError::BlockProfileSplice(format!(
                 "block-splice: ADR site at post-splice offset {} exceeds out buffer length {}",
                 new_adr,
                 out.len()
-            ))));
+            )));
         }
 
         let new_table_base = out.len();
         let pc_relative = new_table_base as i64 - new_adr as i64;
         if !(-(1i64 << 20)..(1i64 << 20)).contains(&pc_relative) {
-            return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+            return Err(JitError::BlockProfileSplice(format!(
                 "block-splice: ADR->jump-table offset {} does not fit in imm21",
                 pc_relative
-            ))));
+            )));
         }
 
         // Re-encode the ADR, preserving Rd from the placeholder bits[4:0].
@@ -6215,7 +9561,7 @@ fn splice_block_trampolines_aarch64(
         ]);
         let rd = (placeholder_word & 0x1F) as u8;
         let patched = crate::aarch64::encoding_mem::encode_adr(pc_relative as i32, rd)
-            .map_err(|e| JitError::Pipeline(PipelineError::Encoding(e.to_string())))?;
+            .map_err(|e| JitError::BlockProfileSplice(e.to_string()))?;
         out[new_adr..new_adr + 4].copy_from_slice(&patched.to_le_bytes());
 
         // Append one table copy. (If two ADRs share the same jt_idx the
@@ -6271,6 +9617,11 @@ fn splice_block_trampolines_with_timing_aarch64(
     use trust_cg_ir::inst::AArch64Opcode;
 
     const PREFIX: &str = "timing-block-splice";
+    if !func.jump_table_address_expansions.is_empty() {
+        return Err(JitError::BlockProfileSplice(
+            "timing-block-splice: long local table addresses require a modeled post-splice re-layout".into(),
+        ));
+    }
     let tramp = AARCH64_PROFILE_TRAMPOLINE_TIMING_BYTES;
 
     // Block layout order and per-block shift amounts.
@@ -6320,9 +9671,7 @@ fn splice_block_trampolines_with_timing_aarch64(
     }
     let insts_end_in_body = {
         let last_bid = *func.block_order.last().ok_or_else(|| {
-            JitError::Pipeline(PipelineError::Encoding(
-                "timing-block-splice: empty block_order".to_string(),
-            ))
+            JitError::BlockProfileSplice("timing-block-splice: empty block_order".to_string())
         })?;
         let last_block = func.block(last_bid);
         let last_non_pseudo = last_block
@@ -6338,26 +9687,26 @@ fn splice_block_trampolines_with_timing_aarch64(
         )? + last_non_pseudo * 4
     };
     if insts_end_in_body > body_bytes.len() {
-        return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+        return Err(JitError::BlockProfileSplice(format!(
             "timing-block-splice: computed insts_end_in_body {} exceeds body_bytes.len() {}",
             insts_end_in_body,
             body_bytes.len()
-        ))));
+        )));
     }
     if jt_adr_sites.is_empty() && insts_end_in_body < body_bytes.len() {
-        return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+        return Err(JitError::BlockProfileSplice(format!(
             "timing-block-splice: body_bytes has {} bytes of unexpected tail past instruction end \
              without any Adr(JumpTableIndex) site",
             body_bytes.len() - insts_end_in_body
-        ))));
+        )));
     }
     for &(_, _, jt_idx) in &jt_adr_sites {
         if (jt_idx as usize) >= func.jump_tables.len() {
-            return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+            return Err(JitError::BlockProfileSplice(format!(
                 "timing-block-splice: Adr references jump table index {} but func has only {} tables",
                 jt_idx,
                 func.jump_tables.len()
-            ))));
+            )));
         }
     }
 
@@ -6436,7 +9785,7 @@ fn splice_block_trampolines_with_timing_aarch64(
                 )?;
                 let new_source = orig_inst_byte + (source_layout_idx + 1) * tramp;
                 if new_source + 4 > out.len() {
-                    return Err(block_splice_encoding_error(format!(
+                    return Err(block_splice_error(format!(
                         "{PREFIX}: branch source at post-splice offset {new_source} exceeds out buffer length {}",
                         out.len()
                     )));
@@ -6469,10 +9818,10 @@ fn splice_block_trampolines_with_timing_aarch64(
                 };
                 let original_target_byte = (orig_inst_byte as i64) + signed_imm * 4;
                 if original_target_byte < 0 {
-                    return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+                    return Err(JitError::BlockProfileSplice(format!(
                         "timing-block-splice: negative original branch target {}",
                         original_target_byte
-                    ))));
+                    )));
                 }
                 let original_target_byte = original_target_byte as u32;
 
@@ -6481,10 +9830,10 @@ fn splice_block_trampolines_with_timing_aarch64(
                     .find(|&(_, &bo)| bo == original_target_byte)
                     .map(|(bid, _)| *bid)
                     .ok_or_else(|| {
-                        JitError::Pipeline(PipelineError::Encoding(format!(
+                        JitError::BlockProfileSplice(format!(
                             "timing-block-splice: branch at original byte {} targets {} which is not a block start",
                             orig_inst_byte, original_target_byte
-                        )))
+                        ))
                     })?;
                 let new_target = block_splice_trampoline_start(
                     PREFIX,
@@ -6495,19 +9844,19 @@ fn splice_block_trampolines_with_timing_aarch64(
 
                 let new_dist_bytes = new_target as i64 - new_source as i64;
                 if new_dist_bytes % 4 != 0 {
-                    return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+                    return Err(JitError::BlockProfileSplice(format!(
                         "timing-block-splice: non-4-byte-aligned branch distance {}",
                         new_dist_bytes
-                    ))));
+                    )));
                 }
                 let new_inst_units = new_dist_bytes / 4;
                 let range = 1i64 << (imm_bits - 1);
                 if new_inst_units < -range || new_inst_units >= range {
-                    return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+                    return Err(JitError::BlockProfileSplice(format!(
                         "timing-block-splice: branch displacement {} out of {}-bit range after \
                          trampoline insertion (block count × 108-byte trampolines too large)",
                         new_inst_units, imm_bits
-                    ))));
+                    )));
                 }
                 let new_imm = (new_inst_units as u32) & imm_mask;
                 let cleared = existing & !(imm_mask << imm_shift);
@@ -6549,20 +9898,20 @@ fn splice_block_trampolines_with_timing_aarch64(
     for (orig_adr_byte, source_layout_idx, jt_idx) in jt_adr_sites {
         let new_adr = orig_adr_byte + (source_layout_idx + 1) * tramp;
         if new_adr + 4 > out.len() {
-            return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+            return Err(JitError::BlockProfileSplice(format!(
                 "timing-block-splice: ADR site at post-splice offset {} exceeds out buffer length {}",
                 new_adr,
                 out.len()
-            ))));
+            )));
         }
 
         let new_table_base = out.len();
         let pc_relative = new_table_base as i64 - new_adr as i64;
         if !(-(1i64 << 20)..(1i64 << 20)).contains(&pc_relative) {
-            return Err(JitError::Pipeline(PipelineError::Encoding(format!(
+            return Err(JitError::BlockProfileSplice(format!(
                 "timing-block-splice: ADR->jump-table offset {} does not fit in imm21",
                 pc_relative
-            ))));
+            )));
         }
 
         let placeholder_word = u32::from_le_bytes([
@@ -6573,7 +9922,7 @@ fn splice_block_trampolines_with_timing_aarch64(
         ]);
         let rd = (placeholder_word & 0x1F) as u8;
         let patched = crate::aarch64::encoding_mem::encode_adr(pc_relative as i32, rd)
-            .map_err(|e| JitError::Pipeline(PipelineError::Encoding(e.to_string())))?;
+            .map_err(|e| JitError::BlockProfileSplice(e.to_string()))?;
         out[new_adr..new_adr + 4].copy_from_slice(&patched.to_le_bytes());
 
         let jt = &func.jump_tables[jt_idx as usize];
@@ -6646,7 +9995,7 @@ const fn veneer_addr_offset() -> usize {
 
 /// Patch an AArch64 Branch26 fixup (B/BL instruction, imm26 field).
 #[cfg(target_arch = "aarch64")]
-fn patch_branch26(code: &mut [u8], offset: u32, target: u64) -> Result<(), JitError> {
+pub(crate) fn patch_branch26(code: &mut [u8], offset: u32, target: u64) -> Result<(), JitError> {
     let off = offset as usize;
     if off + 4 > code.len() {
         return Err(JitError::FixupOutOfBounds {
@@ -6701,6 +10050,14 @@ fn patch_rel32(code: &mut [u8], offset: u32, target: u64) -> Result<(), JitError
     code[disp_off..disp_off + 4].copy_from_slice(&(distance as i32).to_le_bytes());
     Ok(())
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "jit_refusal_layer_tests.rs"]
+mod jit_refusal_layer_tests;
+
+#[cfg(all(test, target_arch = "aarch64", feature = "verify"))]
+#[path = "jit_installed_replay_tests.rs"]
+mod jit_installed_replay_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6832,22 +10189,171 @@ mod tests {
             .expect("baseline hosts must continue accepting ordinary AArch64 machine IR");
     }
 
+    /// A function's own target features admit its feature instructions in the
+    /// raw JIT only on a host that implements them: a CRC32 word is refused
+    /// without `crc` in the profile or the function, admitted by the
+    /// function's own `crc`, and a function stating a feature the host lacks
+    /// is refused by that feature's name whatever its instructions.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn raw_jit_admits_function_features_only_on_a_host_that_implements_them() {
+        use crate::aarch64_dispatch::{AArch64FeatureSource, AArch64HostFeatures};
+        use trust_cg_ir::{AArch64IsaFeature, TargetFeatureSet};
+
+        let crc_set = TargetFeatureSet::from_aarch64_features([AArch64IsaFeature::Crc]);
+        let with_crc = AArch64HostFeatures::new(crc_set, AArch64FeatureSource::DarwinSysctl);
+        let without_crc =
+            AArch64HostFeatures::new(TargetFeatureSet::EMPTY, AArch64FeatureSource::DarwinSysctl);
+        let mut crc_func =
+            MachFunction::new("crc_step".to_string(), Signature::new(vec![], vec![]));
+        let entry = crc_func.entry;
+        let crc = crc_func.push_inst(MachInst::new(AArch64Opcode::Crc32Cx, vec![]));
+        crc_func.append_inst(entry, crc);
+
+        let err = ensure_raw_jit_aarch64_isa_on(
+            std::slice::from_ref(&crc_func),
+            AArch64IsaProfile::APPLE_ARM64,
+            with_crc,
+        )
+        .expect_err("no static profile admits CRC32");
+        assert!(matches!(
+            err,
+            JitError::RawJitIsaExtensionNotAdmitted {
+                opcode: AArch64Opcode::Crc32Cx,
+                required_feature: "crc",
+                ..
+            }
+        ));
+
+        crc_func.function_target_features = crc_set;
+        ensure_raw_jit_aarch64_isa_on(
+            std::slice::from_ref(&crc_func),
+            AArch64IsaProfile::BASELINE,
+            with_crc,
+        )
+        .expect("the function's own crc admits its CRC32 word on a crc host");
+
+        let err = ensure_raw_jit_aarch64_isa_on(
+            std::slice::from_ref(&crc_func),
+            AArch64IsaProfile::BASELINE,
+            without_crc,
+        )
+        .expect_err("a host without crc cannot run a function that states it");
+        assert!(matches!(
+            err,
+            JitError::RawJitFunctionFeatureUnsupportedByHost {
+                function,
+                feature: "crc",
+                ..
+            } if function == "crc_step"
+        ));
+
+        // Stating a feature is refused on a host without it even when the
+        // body emits no instruction of that family.
+        let mut stated_only = build_return_const_named("stated_only");
+        stated_only.function_target_features = crc_set;
+        assert!(matches!(
+            ensure_raw_jit_aarch64_isa_on(
+                std::slice::from_ref(&stated_only),
+                AArch64IsaProfile::APPLE_ARM64,
+                without_crc,
+            ),
+            Err(JitError::RawJitFunctionFeatureUnsupportedByHost { feature: "crc", .. })
+        ));
+    }
+
+    /// Serialized replay contracts (L03-P9): the host-JIT contract plus
+    /// modeled features this CPU implements is accepted and yields exactly
+    /// those features; a feature the CPU lacks is refused by name; an
+    /// unmodeled name, a missing host feature, any other field difference,
+    /// or an extra feature on a non-AArch64 contract is a target mismatch.
+    #[test]
+    fn serialized_contracts_name_function_features_the_host_must_implement() {
+        use crate::aarch64_dispatch::{AArch64FeatureSource, AArch64HostFeatures};
+        use crate::jit_contract::{Endianness, TargetArchitecture, TargetOperatingSystem};
+
+        let host_contract = TargetDescriptor::new(
+            "aarch64-apple-darwin",
+            TargetArchitecture::Aarch64,
+            TargetOperatingSystem::Macos,
+            64,
+            Endianness::Little,
+        )
+        .with_features(["dotprod", "fp16", "lse", "lse2"]);
+        let naming = |base: &TargetDescriptor, extra: &[&str]| {
+            let features = base
+                .features
+                .iter()
+                .cloned()
+                .chain(extra.iter().map(|name| (*name).to_owned()))
+                .collect::<Vec<_>>();
+            base.clone().with_features(features)
+        };
+        let crc = TargetFeatureSet::from_aarch64_features([AArch64IsaFeature::Crc]);
+        let with_crc = AArch64HostFeatures::new(crc, AArch64FeatureSource::DarwinSysctl);
+        let without_crc =
+            AArch64HostFeatures::new(TargetFeatureSet::EMPTY, AArch64FeatureSource::DarwinSysctl);
+        let check = |contract: &TargetDescriptor, host| {
+            serialized_function_target_features(contract, &host_contract, host)
+        };
+
+        assert_eq!(
+            check(&host_contract, without_crc).unwrap(),
+            TargetFeatureSet::EMPTY
+        );
+        assert_eq!(
+            check(&naming(&host_contract, &["crc"]), with_crc).unwrap(),
+            crc
+        );
+        assert!(matches!(
+            check(&naming(&host_contract, &["crc"]), without_crc),
+            Err(JitError::SerializedBufferFeatureUnsupportedByHost { feature: "crc", .. })
+        ));
+        let mismatch = |result: Result<_, JitError>| {
+            matches!(result, Err(JitError::SerializedBufferTargetMismatch { .. }))
+        };
+        assert!(mismatch(check(&naming(&host_contract, &["sve"]), with_crc)));
+        assert!(mismatch(check(
+            &naming(&host_contract, &["neon"]),
+            with_crc
+        )));
+        assert!(mismatch(check(
+            &host_contract.clone().with_features(["lse"]),
+            with_crc
+        )));
+        let mut other_triple = naming(&host_contract, &["crc"]);
+        other_triple.triple = "aarch64-unknown-linux-gnu".to_owned();
+        assert!(mismatch(check(&other_triple, with_crc)));
+        let x86 = TargetDescriptor::new(
+            "x86_64-unknown-linux-gnu",
+            TargetArchitecture::X86_64,
+            TargetOperatingSystem::Linux,
+            64,
+            Endianness::Little,
+        );
+        assert!(mismatch(serialized_function_target_features(
+            &naming(&x86, &["crc"]),
+            &x86,
+            with_crc,
+        )));
+    }
+
     #[cfg(target_arch = "aarch64")]
     fn build_zero_instruction_named(name: &str) -> MachFunction {
         MachFunction::new(name.to_string(), Signature::new(vec![], vec![]))
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn assert_encoding_error_contains<T>(result: Result<T, JitError>, needle: &str) {
+    fn assert_block_splice_error_contains<T>(result: Result<T, JitError>, needle: &str) {
         match result {
-            Err(JitError::Pipeline(PipelineError::Encoding(message))) => {
+            Err(JitError::BlockProfileSplice(message)) => {
                 assert!(
                     message.contains(needle),
-                    "expected encoding error containing {needle:?}, got {message:?}"
+                    "expected block-profile splice error containing {needle:?}, got {message:?}"
                 );
             }
-            Err(other) => panic!("expected PipelineError::Encoding, got {other:?}"),
-            Ok(_) => panic!("expected PipelineError::Encoding containing {needle:?}, got Ok"),
+            Err(other) => panic!("expected JitError::BlockProfileSplice, got {other:?}"),
+            Ok(_) => panic!("expected JitError::BlockProfileSplice containing {needle:?}, got Ok"),
         }
     }
 
@@ -6918,12 +10424,12 @@ mod tests {
         let offsets = HashMap::new();
         let mut fixups = Vec::new();
 
-        assert_encoding_error_contains(
+        assert_block_splice_error_contains(
             splice_block_trampolines_aarch64(&func, &[], &offsets, fixups.as_mut_slice()),
             "missing byte offset",
         );
 
-        assert_encoding_error_contains(
+        assert_block_splice_error_contains(
             splice_block_trampolines_with_timing_aarch64(
                 &func,
                 &[],
@@ -6940,13 +10446,13 @@ mod tests {
         let (func, offsets, body) = build_branch_to_unordered_block();
 
         let mut fixups = Vec::new();
-        assert_encoding_error_contains(
+        assert_block_splice_error_contains(
             splice_block_trampolines_aarch64(&func, &body, &offsets, fixups.as_mut_slice()),
             "branch target BlockId(1) has no post-splice offset",
         );
 
         let mut fixups = Vec::new();
-        assert_encoding_error_contains(
+        assert_block_splice_error_contains(
             splice_block_trampolines_with_timing_aarch64(
                 &func,
                 &body,
@@ -6958,6 +10464,322 @@ mod tests {
     }
 
     // -- AArch64 patch tests ---------------------------------------------------
+
+    #[test]
+    fn raw_jit_named_symbol_fixup_policy_separates_local_addresses_from_external_calls() {
+        let branch = Fixup::branch_sym(4, "ordinary_call".to_string());
+        validate_raw_jit_named_symbol_fixup_kinds(std::slice::from_ref(&branch))
+            .expect("Branch26 retains the existing direct-call JIT path");
+
+        for kind in [
+            crate::macho::reloc::AArch64RelocKind::Page21,
+            crate::macho::reloc::AArch64RelocKind::Pageoff12,
+        ] {
+            let fixup = Fixup {
+                kind,
+                ..branch.clone()
+            };
+            validate_raw_jit_named_symbol_fixup_kinds(std::slice::from_ref(&fixup)).unwrap();
+            assert!(matches!(
+                require_external_branch_fixup(&fixup, "external"),
+                Err(JitError::RawJitNamedSymbolAddressFixupUnsupported { .. })
+            ));
+        }
+        for kind in [
+            crate::macho::reloc::AArch64RelocKind::GotLoadPage21,
+            crate::macho::reloc::AArch64RelocKind::GotLoadPageoff12,
+            crate::macho::reloc::AArch64RelocKind::PointerToGot,
+            crate::macho::reloc::AArch64RelocKind::TlvpLoadPage21,
+            crate::macho::reloc::AArch64RelocKind::TlvpLoadPageoff12,
+        ] {
+            let fixup = Fixup {
+                offset: 8,
+                kind,
+                tls_model: None,
+                target: FixupTarget::NamedSymbol("address_target".to_string()),
+                addend: 0,
+            };
+            let error = validate_raw_jit_named_symbol_fixup_kinds(&[fixup])
+                .expect_err("address-producing named fixups have no raw-JIT patcher");
+            assert!(matches!(
+                error,
+                JitError::RawJitNamedSymbolAddressFixupUnsupported {
+                    ref symbol,
+                    kind: actual_kind,
+                    offset: 8,
+                } if symbol == "address_target" && actual_kind == kind
+            ));
+        }
+    }
+
+    #[test]
+    fn local_page_address_fixups_patch_positive_negative_pages_and_different_registers() {
+        use crate::macho::reloc::AArch64RelocKind::{Page21, Pageoff12};
+        for (offset, target) in [(0x1004, 0x3234), (0x3004, 0x1234)] {
+            let mut adrp = 0x9000_0007u32.to_le_bytes(); // ADRP x7
+            let mut add = 0x9100_00e9u32.to_le_bytes(); // ADD x9, x7, #0
+            patch_local_function_address_instruction(&mut adrp, Page21, offset, target).unwrap();
+            patch_local_function_address_instruction(&mut add, Pageoff12, offset + 4, target)
+                .unwrap();
+            let adrp = u32::from_le_bytes(adrp);
+            let encoded = ((adrp >> 5) & 0x7ffff) << 2 | ((adrp >> 29) & 3);
+            let pages = ((encoded << 11) as i32 >> 11) as i64;
+            let page = (i64::from(offset) & !0xfff) + (pages << 12);
+            let add = u32::from_le_bytes(add);
+            assert_eq!((page + i64::from((add >> 10) & 0xfff)) as u64, target);
+            assert_eq!(adrp & 31, 7);
+            assert_eq!((add & 31, (add >> 5) & 31), (9, 7));
+        }
+    }
+
+    #[test]
+    fn local_page_address_fixups_reject_bad_instructions_alignment_and_range() {
+        use crate::macho::reloc::AArch64RelocKind::{Page21, Pageoff12};
+        for (kind, word, offset, target) in [
+            (Page21, 0x9000_0000, 2, 0),
+            (Page21, 0x9000_0000, 0, 2),
+            (Page21, 0x1000_0000, 0, 0),          // ADR, not ADRP
+            (Page21, 0x9000_001f, 0, 0),          // discarded result
+            (Page21, 0x9000_0000, 0, 1u64 << 32), // positive 21-bit overflow
+            (Page21, 0x9000_0000, 0, u64::MAX - 3),
+            (Pageoff12, 0x9140_0000, 0, 0), // shifted ADD
+            (Pageoff12, 0x1100_0000, 0, 0), // 32-bit ADD
+            (Pageoff12, 0xf940_0000, 0, 0), // scaled load not supported here
+            (Pageoff12, 0x9100_03e0, 0, 0), // SP base
+            (Pageoff12, 0x9100_001f, 0, 0), // SP destination
+        ] {
+            let mut bytes = u32::to_le_bytes(word);
+            assert!(
+                patch_local_function_address_instruction(&mut bytes, kind, offset, target).is_err()
+            );
+            assert_eq!(bytes, word.to_le_bytes(), "failure must not patch");
+        }
+        // Largest representable positive displacement; valid negative bound.
+        for (offset, target) in [(0, (1u64 << 32) - 4096), (u32::MAX - 3, 0)] {
+            patch_local_function_address_instruction(
+                &mut 0x9000_0000u32.to_le_bytes(),
+                Page21,
+                offset,
+                target,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn local_page_address_fixups_require_exact_in_image_function_and_aligned_mapping() {
+        use crate::macho::reloc::AArch64RelocKind::Page21;
+        let original = [0x9000_0000u32.to_le_bytes(), 0xd65f_03c0u32.to_le_bytes()].concat();
+        let fixup = Fixup {
+            offset: 0,
+            kind: Page21,
+            tls_model: None,
+            target: FixupTarget::ExactNamedSymbol("local".into()),
+            addend: 0,
+        };
+        patch_local_function_address(&mut original.clone(), &fixup, 4).unwrap();
+        for target in [8, 12, u64::MAX - 3] {
+            let mut image = original.clone();
+            assert!(patch_local_function_address(&mut image, &fixup, target).is_err());
+            assert_eq!(image, original);
+        }
+        for addend in [1, -1, i64::MIN, i64::MAX] {
+            let invalid = Fixup {
+                addend,
+                ..fixup.clone()
+            };
+            assert!(patch_local_function_address(&mut original.clone(), &invalid, 4).is_err());
+        }
+        let tls = Fixup {
+            tls_model: Some(trust_cg_ir::TlsModel::Tlv),
+            ..fixup.clone()
+        };
+        assert!(patch_local_function_address(&mut original.clone(), &tls, 4).is_err());
+        for offset in [2, 8, u32::MAX] {
+            let invalid = Fixup {
+                offset,
+                ..fixup.clone()
+            };
+            assert!(patch_local_function_address(&mut original.clone(), &invalid, 4).is_err());
+        }
+        let invalid = Fixup {
+            target: FixupTarget::Section(1),
+            ..fixup
+        };
+        assert!(validate_raw_jit_named_symbol_fixup_kinds(&[invalid]).is_err());
+        validate_local_function_address_image(0x1000).unwrap();
+        validate_local_function_address_image(0x4000).unwrap();
+        for base in [1, 0x1004, 0x4fff] {
+            assert!(validate_local_function_address_image(base).is_err());
+        }
+    }
+
+    #[test]
+    fn local_page_address_fixup_rebasing_and_function_ranges_are_checked() {
+        assert_eq!(rebase_jit_fixup_offset(4, 8).unwrap(), 12);
+        assert_eq!(
+            rebase_jit_fixup_offset(3, u64::from(u32::MAX) - 3).unwrap(),
+            u32::MAX
+        );
+        for (offset, base) in [(4, u64::from(u32::MAX) - 3), (0, 1u64 << 32), (1, u64::MAX)] {
+            assert!(matches!(
+                rebase_jit_fixup_offset(offset, base),
+                Err(JitError::FixupRebaseOutOfRange { .. })
+            ));
+        }
+        validate_local_function_address_ranges(&[("valid".into(), 0..8)], 8, None).unwrap();
+        // `8..4` is a deliberately reversed range handed to the validator as
+        // data, never iterated: it covers the `start > end` half of the
+        // `start >= end` rejection that `0..0` covers only for `start == end`.
+        #[allow(clippy::reversed_empty_ranges)]
+        for range in [0..0, 0..12, 2..8, 0..7, 8..4] {
+            assert!(
+                validate_local_function_address_ranges(&[("bad".into(), range)], 8, None).is_err()
+            );
+        }
+        assert!(matches!(
+            validate_local_function_address_ranges(
+                &[("profiled_empty".into(), 0..32)],
+                32,
+                Some("profiled_empty".into())
+            ),
+            Err(JitError::EmptyLocalFunctionAddressBody { .. })
+        ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn build_local_address_function() -> MachFunction {
+        let mut func = MachFunction::new("address".into(), Signature::new(vec![], vec![Type::I64]));
+        for instruction in [
+            MachInst::new(
+                AArch64Opcode::Adrp,
+                vec![MachOperand::PReg(X0), MachOperand::Symbol("target".into())],
+            ),
+            MachInst::new(
+                AArch64Opcode::AddPCRel,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X0),
+                    MachOperand::Symbol("target".into()),
+                ],
+            ),
+            MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]),
+        ] {
+            let id = func.push_inst(instruction);
+            func.append_inst(func.entry, id);
+        }
+        func
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn local_page_address_jit_refuses_requested_verification_without_relocation_replay() {
+        for (verify, require_relocation_replay) in [(true, false), (false, true), (true, true)] {
+            let jit = JitCompiler::new(JitConfig {
+                verify,
+                ..Default::default()
+            });
+            let functions = [
+                build_local_address_function(),
+                build_return_const_named("target"),
+            ];
+            let error = jit
+                .compile_raw_with_encoding_metrics(
+                    &functions,
+                    &HashMap::new(),
+                    require_relocation_replay,
+                )
+                .expect_err("no executable buffer without relocation replay");
+            assert!(
+                matches!(
+                    error,
+                    JitError::LocalFunctionAddressReplayUnavailable { .. }
+                ),
+                "verify={verify} require={require_relocation_replay}: {error}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn local_address_replay_is_a_publication_gate_not_an_unused_diagnostic() {
+        let functions = [
+            build_local_address_function(),
+            build_return_const_named("target"),
+        ];
+        let jit = JitCompiler::new(JitConfig::default());
+        // Corrupt the ADRP immediate, destination register and opcode AFTER
+        // the actual patcher, before replay/hash/copy. Re-hashing this bad heap
+        // image would not detect the semantic relocation error by itself.
+        for mask in [1 << 5, 1, 1 << 31] {
+            local_address_replay::CORRUPT_RELOCATED_WORD.with(|slot| slot.set(Some(mask)));
+            let error = jit
+                .compile_raw(&functions, &HashMap::new())
+                .expect_err("corrupted relocation must not publish an executable buffer");
+            assert!(
+                matches!(error, JitError::LocalFunctionAddressReplayRejected { .. }),
+                "{error}"
+            );
+        }
+        jit.compile_raw(&functions, &HashMap::new()).unwrap();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn local_address_replay_accepts_disjoint_profile_literal_patches() {
+        for profile_hooks in [
+            ProfileHookMode::None,
+            ProfileHookMode::CallCounts,
+            ProfileHookMode::BlockCounts,
+            ProfileHookMode::BlockCountsAndTiming,
+        ] {
+            let jit = JitCompiler::new(JitConfig {
+                profile_hooks,
+                ..Default::default()
+            });
+            jit.compile_raw(
+                &[
+                    build_local_address_function(),
+                    build_return_const_named("target"),
+                ],
+                &HashMap::new(),
+            )
+            .unwrap_or_else(|error| panic!("{profile_hooks:?}: {error}"));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn local_page_address_jit_refuses_empty_body_even_with_profile_trampoline() {
+        for profile_hooks in [
+            ProfileHookMode::None,
+            ProfileHookMode::CallCounts,
+            ProfileHookMode::BlockCounts,
+            ProfileHookMode::BlockCountsAndTiming,
+        ] {
+            let jit = JitCompiler::new(JitConfig {
+                profile_hooks,
+                ..Default::default()
+            });
+            let empty = MachFunction::new("target".into(), Signature::new(vec![], vec![Type::I64]));
+            // A real later body ensures the empty entry's offset is within
+            // the image; without body/range checks it could alias that body.
+            let error = jit
+                .compile_raw(
+                    &[
+                        build_local_address_function(),
+                        empty,
+                        build_return_const_named("after_empty"),
+                    ],
+                    &HashMap::new(),
+                )
+                .expect_err("empty function must not acquire another body's address");
+            assert!(
+                matches!(error, JitError::EmptyLocalFunctionAddressBody { .. }),
+                "{profile_hooks:?}: {error}"
+            );
+        }
+    }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
@@ -7635,7 +11457,8 @@ mod tests {
     #[test]
     fn test_profile_hooks_none_has_no_trampoline() {
         let func = build_return_const_named("f");
-        let (bytes, fixups) = encode_function_with_fixups(&func).expect("encode should succeed");
+        let (bytes, fixups) =
+            crate::pipeline::encode_function_with_fixups(&func).expect("encode should succeed");
         assert!(
             fixups.is_empty(),
             "return-const fixture should encode without fixups"
@@ -7749,11 +11572,97 @@ mod tests {
         let mut map: HashMap<String, *const u8> = HashMap::new();
         let fake_ptr: *const u8 = 0xdead_beef_usize as *const u8;
         map.insert("malloc".to_string(), fake_ptr);
-        let resolved = resolve_extern("malloc", &map);
+        let resolved = resolve_external_symbol(
+            "malloc",
+            &map,
+            JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
+        );
         assert_eq!(
             resolved,
             Some(fake_ptr),
             "extern_symbols must override dlsym"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn explicit_only_external_resolution_rejects_process_visible_symbol() {
+        #[cfg(unix)]
+        let name = "malloc";
+        #[cfg(windows)]
+        let name = "GetCurrentProcessId";
+
+        assert!(
+            lookup_process_symbol(name).is_some(),
+            "fixture requires a process-visible symbol"
+        );
+        assert_eq!(
+            resolve_external_symbol(
+                name,
+                &HashMap::new(),
+                JitExternalSymbolResolutionPolicy::ExplicitOnly,
+            ),
+            None,
+            "ExplicitOnly must not consult the process symbol table"
+        );
+    }
+
+    #[test]
+    fn explicit_only_external_resolution_accepts_supplied_pointer() {
+        let name = "explicit_capability";
+        let pointer = 0xdead_beef_usize as *const u8;
+        let bindings = HashMap::from([(name.to_string(), pointer)]);
+
+        assert_eq!(
+            resolve_external_symbol(
+                name,
+                &bindings,
+                JitExternalSymbolResolutionPolicy::ExplicitOnly,
+            ),
+            Some(pointer)
+        );
+    }
+
+    #[test]
+    fn explicit_external_resolution_rejects_null_pointer_without_fallback() {
+        let name = "malloc";
+        let bindings = HashMap::from([(name.to_string(), std::ptr::null())]);
+
+        assert_eq!(
+            resolve_external_symbol(
+                name,
+                &bindings,
+                JitExternalSymbolResolutionPolicy::ExplicitOnly,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_external_symbol(
+                name,
+                &bindings,
+                JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
+            ),
+            None,
+            "an invalid explicit binding must not silently regain ambient authority"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn default_external_resolution_preserves_process_fallback() {
+        #[cfg(unix)]
+        let name = "malloc";
+        #[cfg(windows)]
+        let name = "GetCurrentProcessId";
+
+        let process_pointer = lookup_process_symbol(name).expect("process-visible fixture symbol");
+        assert_eq!(
+            resolve_external_symbol(
+                name,
+                &HashMap::new(),
+                JitExternalSymbolResolutionPolicy::default(),
+            ),
+            Some(process_pointer)
         );
     }
 
@@ -8772,6 +12681,9 @@ mod tests {
         symbol_offsets.insert("test".to_string(), 0u64);
         let buf = ExecutableBuffer {
             memory,
+            data_region: None,
+            data_symbols: HashMap::new(),
+            data_image: None,
             len: size,
             len_shadow: size,
             allocation_cookie: executable_buffer_allocation_cookie(memory, size, 16, 16),
@@ -8780,7 +12692,13 @@ mod tests {
             published_image_sha256: String::new(),
             host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
+            allocation: JitAllocationRecord::current_platform(false),
+            page_witness: PublicationPageWitness::NotPublished,
+            teardown_policy: crate::jit_contract::TeardownPolicy::RefCounted,
+            execution_gate: ExecutionGate::new_shared(),
             windows_unwind: WindowsJitUnwindRegistration::default(),
+            eh_frame_unwind: crate::jit_unwind::EhFrameJitUnwindRegistration::default(),
+            unwind_manifest: None,
             function_ranges: vec![("test".to_string(), 0..16)],
             symbol_offsets,
             canonical_symbols: vec!["test".to_string()],
@@ -8788,7 +12706,9 @@ mod tests {
             timing_cells: HashMap::new(),
             timing_state: None,
             certificates: HashMap::new(),
+            installed_replay: None,
             proof_optimization_certificates: Vec::new(),
+            function_target_features: TargetFeatureSet::EMPTY,
         };
         // [u8; 16] is 16 bytes, not pointer-sized (8 bytes) — should panic
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -8810,6 +12730,9 @@ mod tests {
         symbol_offsets.insert("test".to_string(), 0u64);
         let buf = ExecutableBuffer {
             memory,
+            data_region: None,
+            data_symbols: HashMap::new(),
+            data_image: None,
             len: size,
             len_shadow: size,
             allocation_cookie: executable_buffer_allocation_cookie(memory, size, 16, 16),
@@ -8818,7 +12741,13 @@ mod tests {
             published_image_sha256: String::new(),
             host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
+            allocation: JitAllocationRecord::current_platform(false),
+            page_witness: PublicationPageWitness::NotPublished,
+            teardown_policy: crate::jit_contract::TeardownPolicy::RefCounted,
+            execution_gate: ExecutionGate::new_shared(),
             windows_unwind: WindowsJitUnwindRegistration::default(),
+            eh_frame_unwind: crate::jit_unwind::EhFrameJitUnwindRegistration::default(),
+            unwind_manifest: None,
             function_ranges: vec![("test".to_string(), 0..16)],
             symbol_offsets,
             canonical_symbols: vec!["test".to_string()],
@@ -8826,7 +12755,9 @@ mod tests {
             timing_cells: HashMap::new(),
             timing_state: None,
             certificates: HashMap::new(),
+            installed_replay: None,
             proof_optimization_certificates: Vec::new(),
+            function_target_features: TargetFeatureSet::EMPTY,
         };
         // fn() is pointer-sized — should not panic
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -9022,6 +12953,9 @@ mod tests {
         }
         ExecutableBuffer {
             memory,
+            data_region: None,
+            data_symbols: HashMap::new(),
+            data_image: None,
             len: size,
             len_shadow: size,
             allocation_cookie: executable_buffer_allocation_cookie(
@@ -9035,7 +12969,13 @@ mod tests {
             published_image_sha256: String::new(),
             host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
+            allocation: JitAllocationRecord::current_platform(false),
+            page_witness: PublicationPageWitness::NotPublished,
+            teardown_policy: crate::jit_contract::TeardownPolicy::RefCounted,
+            execution_gate: ExecutionGate::new_shared(),
             windows_unwind: WindowsJitUnwindRegistration::default(),
+            eh_frame_unwind: crate::jit_unwind::EhFrameJitUnwindRegistration::default(),
+            unwind_manifest: None,
             function_ranges,
             symbol_offsets,
             canonical_symbols,
@@ -9043,7 +12983,9 @@ mod tests {
             timing_cells: HashMap::new(),
             timing_state: None,
             certificates: HashMap::new(),
+            installed_replay: None,
             proof_optimization_certificates: Vec::new(),
+            function_target_features: TargetFeatureSet::EMPTY,
         }
     }
 
@@ -9652,6 +13594,271 @@ mod tests {
         }
     }
 
+    /// The live publication record of a published buffer is exactly the
+    /// contract table's prediction for the host target, and its digest is
+    /// carried in replay metadata alongside the cache-line source.
+    #[cfg(unix)]
+    #[test]
+    fn published_buffer_protection_matches_the_host_target_contract() {
+        if !sys::host_supported() {
+            return;
+        }
+        let buf = jit7_publish_sample("f").expect("publish sample");
+        let live = buf.executable_memory_protection();
+        assert_eq!(
+            Some(live.clone()),
+            crate::jit_contract::ExecutableMemoryProtection::for_trust_cg_target(
+                &TargetDescriptor::for_trust_cg_host_jit()
+            )
+        );
+        assert!(live.published_rx && live.mprotect_rx_ok);
+        assert_eq!(live.map_jit, sys::uses_map_jit());
+        let replay = buf.replay_report_metadata();
+        assert_eq!(
+            replay.properties.get("executable_memory_protection_sha256"),
+            Some(&live.canonical_sha256())
+        );
+        assert_eq!(
+            replay
+                .properties
+                .get("jit_cache_line_source")
+                .map(String::as_str),
+            Some(jit_cache_line_geometry().source.as_str())
+        );
+        assert_eq!(
+            replay.properties.get("teardown_policy").map(String::as_str),
+            Some("ref_counted")
+        );
+    }
+
+    /// Leases are only issued for published read-execute buffers.
+    #[cfg(unix)]
+    #[test]
+    fn execution_lease_fails_closed_for_an_unpublished_buffer() {
+        let buf = make_buf_with_symbols(&["f"]);
+        assert!(matches!(
+            buf.execution_lease(),
+            Err(JitError::UnpublishedExecutableBuffer { .. })
+        ));
+        assert!(matches!(
+            buf.leased_symbol_ptr("f"),
+            Err(JitError::UnpublishedExecutableBuffer { .. })
+        ));
+        assert!(matches!(
+            buf.leased_symbol_ptr("missing"),
+            Err(JitError::UnresolvedSymbol(_))
+        ));
+        assert_eq!(buf.in_flight_executions(), 0);
+        let probe = buf.reclamation_probe();
+        drop(buf);
+        assert_eq!(probe.state(), JitReclamationState::Reclaimed);
+    }
+
+    /// Execution accounting neither panics nor under-counts: an unmatched
+    /// release and a saturated count both pin the gate (its mapping can never
+    /// reach the zero count that reclaims it), while matched acquire/release
+    /// pairs are unaffected.
+    #[test]
+    fn execution_gate_pins_instead_of_panicking_on_broken_accounting() {
+        let gate = ExecutionGate::new_shared();
+        gate.acquire();
+        gate.acquire();
+        assert_eq!(gate.in_flight(), 2);
+        gate.release();
+        gate.release();
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(gate.reclamation_state(), JitReclamationState::Live);
+
+        // An unmatched release pins the gate, and it stays pinned.
+        gate.release();
+        assert_eq!(gate.in_flight(), PINNED_IN_FLIGHT);
+        gate.acquire();
+        gate.release();
+        assert_eq!(gate.in_flight(), PINNED_IN_FLIGHT);
+
+        // A count at the ceiling saturates instead of wrapping back to zero.
+        let saturated = ExecutionGate::new_shared();
+        saturated.lock().in_flight = PINNED_IN_FLIGHT - 1;
+        saturated.acquire();
+        saturated.acquire();
+        assert_eq!(saturated.in_flight(), PINNED_IN_FLIGHT);
+        saturated.release();
+        assert_eq!(saturated.in_flight(), PINNED_IN_FLIGHT);
+    }
+
+    /// Cache maintenance: a walk with any architectural stride visits a line
+    /// covering every byte of an unaligned range, starts no earlier than the
+    /// line containing the first byte, and never runs past the last byte.
+    /// The former fixed 64-byte walk started at the unaligned address and
+    /// could skip the range's final partial line.
+    #[test]
+    fn cache_line_walk_covers_every_byte_of_unaligned_ranges() {
+        let base = 0x1_0000usize;
+        let mut line = AARCH64_MIN_CACHE_LINE_BYTES;
+        while line <= AARCH64_MAX_CACHE_LINE_BYTES {
+            for start_skew in [0usize, 4, line / 2, line - 4] {
+                for len in [1usize, 4, line - 4, line, line + 4, 3 * line + 12] {
+                    let start = base + start_skew;
+                    let visited: Vec<usize> = sys::cache_line_walk(start, len, line).collect();
+                    assert!(visited.iter().all(|addr| addr % line == 0));
+                    assert_eq!(visited.first(), Some(&(start & !(line - 1))));
+                    assert!(visited.iter().all(|addr| *addr < start + len));
+                    for byte in start..start + len {
+                        assert!(
+                            visited
+                                .iter()
+                                .any(|addr| (*addr..*addr + line).contains(&byte)),
+                            "line {line}, start {start:#x}, len {len}: byte {byte:#x} unmaintained"
+                        );
+                    }
+                }
+            }
+            line *= 2;
+        }
+        assert_eq!(sys::cache_line_walk(base, 0, 64).count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a power of two")]
+    fn cache_line_walk_rejects_non_power_of_two_stride() {
+        let _ = sys::cache_line_walk(0x1000, 64, 48).count();
+    }
+
+    /// CTR_EL0 decoding: DminLine/IminLine are log2 words, so a field of `n`
+    /// is `4 << n` bytes; anything that is not an architectural register
+    /// value falls back to the recorded 16-byte minimum.
+    #[test]
+    fn ctr_el0_decoding_and_recorded_fallbacks() {
+        // Common Cortex/Neoverse encoding: 64-byte I and D minimum lines.
+        let typical = JitCacheLineGeometry::from_aarch64_ctr_el0(Some(0x8444_c004));
+        assert_eq!(typical.source, JitCacheLineSource::CtrEl0);
+        assert_eq!(typical.dcache_min_line_bytes, 64);
+        assert_eq!(typical.icache_min_line_bytes, 64);
+        assert_eq!(typical.ctr_el0, Some(0x8444_c004));
+        assert!(!typical.is_fallback());
+
+        // Distinct strides are honoured independently (D=16, I=128).
+        let mixed = JitCacheLineGeometry::from_aarch64_ctr_el0(Some(0x8000_0000 | (2 << 16) | 5));
+        assert_eq!(mixed.source, JitCacheLineSource::CtrEl0);
+        assert_eq!(mixed.dcache_min_line_bytes, 16);
+        assert_eq!(mixed.icache_min_line_bytes, 128);
+
+        let unreadable = JitCacheLineGeometry::from_aarch64_ctr_el0(None);
+        assert_eq!(
+            unreadable.source,
+            JitCacheLineSource::ArchitecturalMinimumFallback(
+                JitCacheLineFallbackReason::CtrEl0Unreadable
+            )
+        );
+        assert_eq!(unreadable.ctr_el0, None);
+
+        for invalid in [
+            0u64,                          // RES1 bit 31 clear
+            0x0444_c004,                   // RES1 bit 31 clear, lines plausible
+            0x8000_0000 | (1 << 16) | 4,   // 8-byte D line
+            0x8000_0000 | (4 << 16) | 1,   // 8-byte I line
+            0x8000_0000 | (10 << 16) | 4,  // 4 KiB D line
+            0x8000_0000 | (4 << 16) | 0xf, // 128 KiB I line
+        ] {
+            let geometry = JitCacheLineGeometry::from_aarch64_ctr_el0(Some(invalid));
+            assert_eq!(
+                geometry.source,
+                JitCacheLineSource::ArchitecturalMinimumFallback(
+                    JitCacheLineFallbackReason::CtrEl0Invalid
+                ),
+                "{invalid:#x}"
+            );
+            assert_eq!(geometry.ctr_el0, Some(invalid));
+            assert_eq!(geometry.dcache_min_line_bytes, AARCH64_MIN_CACHE_LINE_BYTES);
+            assert_eq!(geometry.icache_min_line_bytes, AARCH64_MIN_CACHE_LINE_BYTES);
+            assert!(geometry.is_fallback());
+        }
+    }
+
+    /// Discriminating coherence control for the maintenance walk itself.
+    ///
+    /// Fresh mappings receive fresh physical pages whose kernel-side setup
+    /// can hide a missing flush (on Apple M4 the republication integration
+    /// control still passed with instruction-cache invalidation removed), so
+    /// this control rewrites the SAME physical page in place through a
+    /// test-only RX -> RW -> RX cycle that published buffers never take, and
+    /// relies solely on `sys::flush_icache` between the rewrite and the next
+    /// fetch. Removing the `ic ivau` walk, or widening its stride to 128
+    /// bytes, makes round 1 return stale sums on Apple M4. On Linux the
+    /// required-floor target `jit_icache_coherence` has its own in-place rows
+    /// that run this walk through `flush_instruction_cache`. Every instruction
+    /// is `ADD X0, X0, #imm12` over a range that starts mid-line and spans
+    /// several pages, so any line left stale changes the returned sum.
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn in_place_rewrite_is_coherent_only_through_the_maintenance_walk() {
+        const WORDS: usize = 2 * 16 * 1024 / 4 + 37;
+        const START_WORD: usize = 3; // image begins 12 bytes into a line
+        fn image(round: u32) -> Vec<u8> {
+            let mut words: Vec<u32> = (0..WORDS as u32 - 1)
+                .map(|i| 0x9100_0000 | ((((i * 11 + round * 5) % 200) + round * 256) << 10))
+                .collect();
+            words.push(0xd65f_03c0); // RET
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        }
+        fn expected(round: u32) -> u64 {
+            (0..WORDS as u32 - 1)
+                .map(|i| u64::from(((i * 11 + round * 5) % 200) + round * 256))
+                .sum()
+        }
+        let len = WORDS * 4;
+        let offset = START_WORD * 4;
+        let size = sys::page_align(offset + len);
+        unsafe {
+            let ptr = sys::mmap(size, sys::RW).expect("mmap");
+            let entry = ptr.add(offset);
+            for round in 0..14u32 {
+                if round > 0 {
+                    sys::mprotect(ptr, size, sys::RW).expect("RX -> RW for in-place rewrite");
+                }
+                {
+                    let _write = sys::JitWriteGuard::enter();
+                    std::ptr::copy_nonoverlapping(image(round).as_ptr(), entry, len);
+                }
+                sys::flush_icache(entry, len);
+                sys::mprotect(ptr, size, sys::RX).expect("RW -> RX");
+                ensure_jit_execute_mode();
+                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(entry);
+                assert_eq!(
+                    f(7),
+                    7 + expected(round),
+                    "round {round}: stale instruction-cache line survived the maintenance walk"
+                );
+            }
+            sys::munmap(ptr, size);
+        }
+    }
+
+    /// The host geometry the publisher actually uses: CTR_EL0 on Linux, the
+    /// recorded fallback on Darwin (whose EL0 CTR_EL0 read traps).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn host_cache_line_geometry_matches_the_os_access_rule() {
+        let geometry = jit_cache_line_geometry();
+        assert_eq!(geometry, jit_cache_line_geometry(), "computed once");
+        for line in [
+            geometry.dcache_min_line_bytes,
+            geometry.icache_min_line_bytes,
+        ] {
+            assert!(line.is_power_of_two());
+            assert!((AARCH64_MIN_CACHE_LINE_BYTES..=AARCH64_MAX_CACHE_LINE_BYTES).contains(&line));
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(geometry.source, JitCacheLineSource::CtrEl0);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            geometry.source,
+            JitCacheLineSource::ArchitecturalMinimumFallback(
+                JitCacheLineFallbackReason::CtrEl0Unreadable
+            )
+        );
+    }
+
     /// W^X state machine: an unsealed (still-writable) mapping can never be
     /// released into an `ExecutableBuffer`.
     #[cfg(unix)]
@@ -9710,6 +13917,9 @@ mod tests {
         let before = executable_buffer_unmap_bailout_count();
         let buf = ExecutableBuffer {
             memory,
+            data_region: None,
+            data_symbols: HashMap::new(),
+            data_image: None,
             len: size,
             // Shadow disagrees with primary and the cookie validates
             // neither: allocation_len_for_unmap() returns 0 -> bail-out.
@@ -9720,7 +13930,13 @@ mod tests {
             published_image_sha256: String::new(),
             host_jit_selected_codegen_profile: None,
             publication: JitPublicationContract::unpublished_for_tests(),
+            allocation: JitAllocationRecord::current_platform(false),
+            page_witness: PublicationPageWitness::NotPublished,
+            teardown_policy: crate::jit_contract::TeardownPolicy::RefCounted,
+            execution_gate: ExecutionGate::new_shared(),
             windows_unwind: WindowsJitUnwindRegistration::default(),
+            eh_frame_unwind: crate::jit_unwind::EhFrameJitUnwindRegistration::default(),
+            unwind_manifest: None,
             function_ranges: Vec::new(),
             symbol_offsets: HashMap::new(),
             canonical_symbols: Vec::new(),
@@ -9728,7 +13944,9 @@ mod tests {
             timing_cells: HashMap::new(),
             timing_state: None,
             certificates: HashMap::new(),
+            installed_replay: None,
             proof_optimization_certificates: Vec::new(),
+            function_target_features: TargetFeatureSet::EMPTY,
         };
         drop(buf);
         assert!(
@@ -9786,5 +14004,84 @@ mod tests {
                 "a failed publish retained MappedRegion ownership"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod map_jit_refusal_tests {
+    use super::*;
+
+    const EPERM: i32 = 1;
+    const EINVAL: i32 = 22;
+    const ENOMEM: i32 = 12;
+
+    fn classify(len: usize, errno: i32) -> JitError {
+        classify_mapping_error(len, std::io::Error::from_raw_os_error(errno))
+    }
+
+    #[test]
+    fn map_jit_policy_refusals_are_named_and_other_failures_stay_memory_alloc() {
+        for errno in [EINVAL, EPERM] {
+            match classify(16384, errno) {
+                JitError::MapJitRefused { len, source, .. } if sys::uses_map_jit() => {
+                    assert_eq!(len, 16384);
+                    assert_eq!(source.raw_os_error(), Some(errno));
+                }
+                JitError::MemoryAlloc(source) if !sys::uses_map_jit() => {
+                    assert_eq!(source.raw_os_error(), Some(errno));
+                }
+                other => panic!("errno {errno} classified as {other:?}"),
+            }
+        }
+        // Exhaustion and a zero-length request are never policy refusals.
+        assert!(matches!(classify(16384, ENOMEM), JitError::MemoryAlloc(_)));
+        assert!(matches!(classify(0, EINVAL), JitError::MemoryAlloc(_)));
+    }
+
+    #[test]
+    fn map_jit_refusal_names_the_entitlement_only_under_the_hardened_runtime() {
+        let refusal = |flags| JitError::MapJitRefused {
+            len: 16384,
+            code_signing: Some(ProcessCodeSigningStatus { flags }),
+            source: std::io::Error::from_raw_os_error(EINVAL),
+        };
+        // Flags measured under `codesign -s - --options runtime` (macOS 26.6).
+        let hardened = refusal(0x2201_1311).to_string();
+        assert!(hardened.contains("hardened runtime"), "{hardened}");
+        assert!(hardened.contains(ALLOW_JIT_ENTITLEMENT), "{hardened}");
+        assert!(hardened.contains("hardened_runtime=true"), "{hardened}");
+        // Flags measured for an ld64 linker-signed test binary.
+        let plain = refusal(0x2202_0201).to_string();
+        assert!(plain.contains("not under the hardened runtime"), "{plain}");
+        assert!(!plain.contains(ALLOW_JIT_ENTITLEMENT), "{plain}");
+        let unknown = JitError::MapJitRefused {
+            len: 16384,
+            code_signing: None,
+            source: std::io::Error::from_raw_os_error(EINVAL),
+        }
+        .to_string();
+        assert!(unknown.contains("status is unavailable"), "{unknown}");
+        assert!(std::error::Error::source(&refusal(0)).is_some());
+    }
+
+    #[test]
+    fn process_code_signing_status_reports_this_test_binary() {
+        let status = process_code_signing_status();
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            // Cargo's arm64 test binaries are ld64 linker-signed, not hardened.
+            let status = status.expect("csops(CS_OPS_STATUS) succeeds for this process");
+            assert!(status.is_valid(), "{status}");
+            assert!(!status.hardened_runtime(), "{status}");
+        } else if cfg!(target_os = "macos") {
+            assert!(status.is_some());
+        } else {
+            assert_eq!(status, None);
+        }
+        let flags = ProcessCodeSigningStatus {
+            flags: ProcessCodeSigningStatus::CS_VALID
+                | ProcessCodeSigningStatus::CS_RUNTIME
+                | ProcessCodeSigningStatus::CS_LINKER_SIGNED,
+        };
+        assert!(flags.is_valid() && flags.hardened_runtime() && flags.is_linker_signed());
     }
 }

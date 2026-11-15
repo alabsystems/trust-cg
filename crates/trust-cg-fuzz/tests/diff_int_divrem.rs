@@ -47,6 +47,7 @@ fn jit_run(m: &trust_ir::Module, opt: OptLevel, fast: bool, row: &[i64; 4]) -> R
 
     let compile = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         Compiler::new(cfg)
+            .with_codegen_license(permit_unlicensed())
             .compile_module_to_jit(m, &ext)
             .map_err(Box::new)
     }));
@@ -152,7 +153,7 @@ fn shape_i64_dyn_dyn(op: DOp) -> trust_ir::Module {
     let r = fb.binop(op.binop(), Ty::I64, a, div);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 2: i64 divrem with constant divisor (varied constants).
@@ -170,7 +171,7 @@ fn shape_i64_const_div(op: DOp, divisor: i64) -> trust_ir::Module {
     let r = fb.binop(op.binop(), Ty::I64, a, k);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 3: i64 divrem with constant numerator, dynamic divisor (safe).
@@ -189,7 +190,7 @@ fn shape_i64_const_num(op: DOp, num: i64) -> trust_ir::Module {
     let r = fb.binop(op.binop(), Ty::I64, k, div);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 4: i32 divrem, dynamic operands (truncated from i64 args), result sext to i64.
@@ -211,7 +212,7 @@ fn shape_i32_dyn_dyn(op: DOp) -> trust_ir::Module {
     let r64 = fb.sext(Ty::I32, Ty::I64, r);
     fb.ret(vec![r64]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 5: i32 divrem with constant divisor, result zext to i64.
@@ -231,7 +232,7 @@ fn shape_i32_const_div(op: DOp, divisor: i32) -> trust_ir::Module {
     let r64 = fb.zext(Ty::I32, Ty::I64, r);
     fb.ret(vec![r64]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 6: divrem nested in a loop. accumulator += (a / (i|1)) over c iterations (bounded).
@@ -278,7 +279,7 @@ fn shape_i64_loop(op: DOp) -> trust_ir::Module {
     fb.switch_to_block(exit);
     fb.ret(vec![res]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 7: quotient kept live across a call. q = a/(b|1); helper(q) = q*3; return q + helper(q).
@@ -314,7 +315,7 @@ fn shape_i64_quotient_across_call(op: DOp) -> trust_ir::Module {
     let r = fb.binop(BinOp::Add, Ty::I64, q, h);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 8: chained divrem — combine two ops: (a / (b|1)) % ((c|1)) at i64.
@@ -334,7 +335,7 @@ fn shape_i64_chained(op1: DOp, op2: DOp) -> trust_ir::Module {
     let r = fb.binop(op2.binop(), Ty::I64, t, div2);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 9: high register pressure — many simultaneous divrem ops summed.
@@ -362,7 +363,7 @@ fn shape_i64_pressure(op: DOp) -> trust_ir::Module {
     }
     fb.ret(vec![acc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 10 (EDGE): div-by-zero / INT_MIN-by-(-1) probe WITHOUT |1 guard.
@@ -380,7 +381,7 @@ fn shape_i64_raw(op: DOp) -> trust_ir::Module {
     let r = fb.binop(op.binop(), Ty::I64, a, b);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 11 (EDGE): i32 raw div without guard, sext result.
@@ -400,7 +401,7 @@ fn shape_i32_raw(op: DOp) -> trust_ir::Module {
     let r64 = fb.sext(Ty::I32, Ty::I64, r);
     fb.ret(vec![r64]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 12 (ORACLE-COMPARABLE narrow div): i32 UDiv/URem with operands masked
@@ -434,7 +435,135 @@ fn shape_i32_masked_oracle(op: DOp) -> trust_ir::Module {
     let r64 = fb.zext(Ty::I32, Ty::I64, r);
     fb.ret(vec![r64]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
+}
+
+// ---------------------------------------------------------------------------
+// Host-arithmetic oracle for constant divisors and narrowing remainders
+// ---------------------------------------------------------------------------
+//
+// The constant-divisor lowering pre-shifts an even divisor whose magic needs
+// the add-back form (`x / 126 == ((x >> 1) * M) >> 69`), and a 64-bit
+// remainder whose only use is a truncation to `i32` is written in the W form.
+// The interpreter oracle cannot model narrow casts, so these shapes compare
+// every JIT configuration with the host's own `u64`/`i64`/`u32`/`i32`
+// arithmetic (the Rust operators, compiled by LLVM), over the input rows and
+// a deterministic pseudo-random spread.
+
+/// Shape 13: `(a op d) as i32`, zero- or sign-extended back to `i64`: the
+/// remainder's only use is the truncation.
+fn shape_i64_const_rem_trunc(op: DOp, divisor: i64, sext: bool) -> trust_ir::Module {
+    let mut mb = ModuleBuilder::new("m");
+    let entry_ty = mb.add_func_type(vec![Ty::I64; 4], vec![Ty::I64]);
+    let mut fb = mb.function(ENTRY, entry_ty);
+    let e = fb.create_block();
+    let a = fb.add_block_param(e, Ty::I64);
+    let _b = fb.add_block_param(e, Ty::I64);
+    let _c = fb.add_block_param(e, Ty::I64);
+    let _d = fb.add_block_param(e, Ty::I64);
+    fb.switch_to_block(e);
+    let k = fb.iconst(Ty::I64, divisor as i128);
+    let r = fb.binop(op.binop(), Ty::I64, a, k);
+    let r32 = fb.trunc(Ty::I64, Ty::I32, r);
+    let r64 = if sext {
+        fb.sext(Ty::I32, Ty::I64, r32)
+    } else {
+        fb.zext(Ty::I32, Ty::I64, r32)
+    };
+    fb.ret(vec![r64]);
+    fb.build();
+    mb.build().expect("ModuleBuilder::build: test fixture")
+}
+
+/// The 64-bit result of `op` on `a` and the nonzero `d` as the host computes it.
+fn host_i64(op: DOp, a: i64, d: i64) -> i64 {
+    match op {
+        DOp::UDiv => ((a as u64) / (d as u64)) as i64,
+        DOp::URem => ((a as u64) % (d as u64)) as i64,
+        DOp::SDiv => a.wrapping_div(d),
+        DOp::SRem => a.wrapping_rem(d),
+    }
+}
+
+/// The 32-bit result of `op` on `a as i32` and `d`, zero-extended.
+fn host_i32_zext(op: DOp, a: i64, d: i32) -> i64 {
+    let (a, d) = (a as i32, d);
+    let r = match op {
+        DOp::UDiv => ((a as u32) / (d as u32)) as i32,
+        DOp::URem => ((a as u32) % (d as u32)) as i32,
+        DOp::SDiv => a.wrapping_div(d),
+        DOp::SRem => a.wrapping_rem(d),
+    };
+    i64::from(r as u32)
+}
+
+/// The input rows plus 256 pseudo-random first arguments (both halves of the
+/// 64-bit range, including the top bit).
+fn host_oracle_rows() -> Vec<[i64; 4]> {
+    let mut rows = input_rows();
+    let mut st: u64 = 0x9E37_79B9_7F4A_7C15;
+    for _ in 0..256 {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        rows.push([st as i64, 0, 0, 0]);
+    }
+    rows
+}
+
+/// Compile `m` once per configuration and compare every row with `expect`.
+/// Returns the number of configurations run.
+fn check_against_host(
+    label: &str,
+    m: &trust_ir::Module,
+    rows: &[[i64; 4]],
+    expect: impl Fn(&[i64; 4]) -> i64,
+    defects: &mut Vec<String>,
+) -> u64 {
+    let mut configs = 0u64;
+    for &opt in &OPTS {
+        for &fast in &[false, true] {
+            configs += 1;
+            let ext: HashMap<String, *const u8> = HashMap::new();
+            let mut cfg = if fast {
+                CompilerConfig::jit_fast(Target::host())
+            } else {
+                let mut c = CompilerConfig::for_host_jit();
+                c.enable_jit_fast_regalloc = false;
+                c
+            };
+            cfg.opt_level = opt;
+            let clabel = format!("{opt:?}/{}", if fast { "fast" } else { "full" });
+            let buf = match Compiler::new(cfg)
+                .with_codegen_license(permit_unlicensed())
+                .compile_module_to_jit(m, &ext)
+            {
+                Ok(r) => r.buffer,
+                Err(e) => {
+                    defects.push(format!("{label}: COMPILE_ERR config={clabel}: {e}"));
+                    continue;
+                }
+            };
+            let Some(f) =
+                (unsafe { buf.get_fn_bound::<extern "C" fn(i64, i64, i64, i64) -> i64>(ENTRY) })
+            else {
+                defects.push(format!("{label}: SYMBOL_MISSING config={clabel}"));
+                continue;
+            };
+            let f = f.into_inner();
+            for row in rows {
+                let got = f(row[0], row[1], row[2], row[3]);
+                let want = expect(row);
+                if got != want {
+                    defects.push(format!(
+                        "{label} row={row:?}: HOST_MISMATCH config={clabel} jit={got} host={want}"
+                    ));
+                }
+            }
+            drop(buf);
+        }
+    }
+    configs
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +883,84 @@ fn diff_int_divrem_sweep() {
         }
     }
 
+    // --- Host-arithmetic oracle: even divisors and narrowing remainders ---
+
+    let host_rows = host_oracle_rows();
+    // Shape 2b: i64 constant divisors, including the even ones whose magic
+    // needs the add-back form at full range (14, 28, 100, 126, 1000, ...) and
+    // so are pre-shifted, and ones that are not (6, 7, 10).
+    let even_i64: [i64; 12] = [
+        6,
+        7,
+        10,
+        14,
+        28,
+        100,
+        126,
+        1000,
+        1_000_000_006,
+        3 << 40,
+        0x7FFF_FFFF_FFFF_FFFE,
+        -126,
+    ];
+    for op in ALL_DOPS {
+        for &dv in &even_i64 {
+            let m = shape_i64_const_div(op, dv);
+            configs_tested += check_against_host(
+                &format!("i64_const_div_host[{}][d={}]", op.name(), dv),
+                &m,
+                &host_rows,
+                |row| host_i64(op, row[0], dv),
+                &mut defects,
+            );
+        }
+    }
+    // Shape 5b: i32 constant divisors (the W32 `UMULL` path pre-shifts 14,
+    // 28, 126; 6, 100 and 1000 need no add-back).
+    let even_i32: [i32; 8] = [6, 7, 14, 28, 100, 126, 1000, 0x7FFF_FFFE];
+    for op in ALL_DOPS {
+        for &dv in &even_i32 {
+            let m = shape_i32_const_div(op, dv);
+            configs_tested += check_against_host(
+                &format!("i32_const_div_host[{}][d={}]", op.name(), dv),
+                &m,
+                &host_rows,
+                |row| host_i32_zext(op, row[0], dv),
+                &mut defects,
+            );
+        }
+    }
+    // Shape 13: `(a % d) as i32` (and `/`), zero- and sign-extended: the
+    // W-form remainder tail (`MSUB`, the `2^k - 1` add, the `2^k + 1`
+    // shifted subtract) and its `k >= 32` exclusion.
+    let trunc_divs: [i64; 8] = [7, 14, 100, 126, 255, 257, (1 << 33) + 1, -126];
+    for op in ALL_DOPS {
+        for &dv in &trunc_divs {
+            for sext in [false, true] {
+                let m = shape_i64_const_rem_trunc(op, dv, sext);
+                configs_tested += check_against_host(
+                    &format!(
+                        "i64_const_trunc_host[{}][d={}][{}]",
+                        op.name(),
+                        dv,
+                        if sext { "sext" } else { "zext" }
+                    ),
+                    &m,
+                    &host_rows,
+                    |row| {
+                        let r = host_i64(op, row[0], dv) as i32;
+                        if sext {
+                            i64::from(r)
+                        } else {
+                            i64::from(r as u32)
+                        }
+                    },
+                    &mut defects,
+                );
+            }
+        }
+    }
+
     eprintln!(
         "int_divrem: {} configs, {} defects",
         configs_tested,
@@ -769,4 +976,13 @@ fn diff_int_divrem_sweep() {
         defects.len(),
         defects.join("\n")
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

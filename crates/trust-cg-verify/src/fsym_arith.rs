@@ -35,6 +35,104 @@ pub enum ArithUbKind {
     Smul,
     /// Signed integer negation: UB when negating INT_MIN.
     Sneg,
+    /// `shl` / `lshr` / `ashr`: UB when the amount (`rhs`, read unsigned) is
+    /// not below the bit width. trust-ir's `ShiftInRange` obligation
+    /// (ub-numerics-policy section 1: an out-of-range amount is UB / poison,
+    /// NOT masked); the reference interpreter reports "shift amount N is out
+    /// of range". `lhs` is carried but plays no part in the condition.
+    ShiftAmount,
+    /// An access at byte offset `lhs` from a base aligned to (at least)
+    /// `align` bytes: UB when `lhs & (align - 1) != 0`. Unary: `rhs` is
+    /// ignored.
+    Misaligned { align: u64 },
+    /// GEP offset arithmetic exactly as trust-ir's reference interpreter
+    /// performs it. `lhs` is the index widened to 64 bits (sign-extended when
+    /// `signed_index`), `rhs` the 64-bit base it is added to (the byte offset
+    /// within a tracked object, or an exact address). UB when a signed index
+    /// is negative, or when `index * elem_size + base` exceeds `limit`:
+    /// `u64::MAX` for an offset or a 64-bit address ("GEP: negative index",
+    /// "byte offset overflow", "pointer offset overflow"), the target's
+    /// highest address (`2^32 - 1` on a 32-bit target) for an exact address
+    /// there ("address is outside the target's address space"). Width is
+    /// always 64. The limit is part of the kind so that every consumer of it
+    /// — the evaluator and every solver candidate — decides the TARGET's
+    /// condition, never only the 64-bit one.
+    GepOffset {
+        elem_size: u64,
+        signed_index: bool,
+        limit: u64,
+    },
+}
+
+impl ArithUbKind {
+    /// True for a kind whose side condition reads only `lhs`.
+    pub fn is_unary(self) -> bool {
+        matches!(self, ArithUbKind::Sneg | ArithUbKind::Misaligned { .. })
+    }
+}
+
+/// Decide the UB side condition of one of the pointer / shift kinds
+/// (`ShiftAmount`, `Misaligned`, `GepOffset`) on concrete `width`-bit
+/// operands. `None` for any other kind, a missing `rhs`, or a width the kind
+/// is not defined at.
+pub fn memory_arith_ub_on_values(
+    kind: ArithUbKind,
+    lhs: u64,
+    rhs: Option<u64>,
+    width: u32,
+) -> Option<bool> {
+    if !(1..=64).contains(&width) {
+        return None;
+    }
+    match kind {
+        ArithUbKind::ShiftAmount => Some(u128::from(mask(rhs?, width)) >= u128::from(width)),
+        ArithUbKind::Misaligned { align } => {
+            if align == 0 || !align.is_power_of_two() {
+                return None;
+            }
+            Some(mask(lhs, width) & (align - 1) != 0)
+        }
+        ArithUbKind::GepOffset {
+            elem_size,
+            signed_index,
+            limit,
+        } => {
+            if width != 64 {
+                return None;
+            }
+            if signed_index && (lhs as i64) < 0 {
+                return Some(true);
+            }
+            let end = u128::from(lhs) * u128::from(elem_size) + u128::from(rhs?);
+            Some(end > u128::from(limit))
+        }
+        ArithUbKind::Udiv
+        | ArithUbKind::Sdiv
+        | ArithUbKind::Urem
+        | ArithUbKind::Srem
+        | ArithUbKind::Sadd
+        | ArithUbKind::Ssub
+        | ArithUbKind::Smul
+        | ArithUbKind::Sneg => None,
+    }
+}
+
+/// The memory/shift kinds, decided in one environment: `Some(true)` UB,
+/// `Some(false)` no UB, `None` an operand did not evaluate.
+fn memory_arith_ub_in(op: &ArithOp, env: &HashMap<String, u64>) -> Option<bool> {
+    // A shift's condition reads only the amount: the shifted value may stay
+    // symbolic.
+    let lhs = if op.kind == ArithUbKind::ShiftAmount {
+        0
+    } else {
+        eval_bv(&op.lhs, env)?
+    };
+    let rhs = if op.kind.is_unary() {
+        None
+    } else {
+        Some(eval_bv(&op.rhs, env)?)
+    };
+    memory_arith_ub_on_values(op.kind, lhs, rhs, op.width)
 }
 
 /// Metadata about an arithmetic operation being checked.
@@ -133,7 +231,13 @@ fn signed_overflow(kind: ArithUbKind, lhs: u64, rhs: Option<u64>, width: u32) ->
             outside_signed_range(lhs * rhs, width)
         }
         ArithUbKind::Sneg => outside_signed_range(-lhs, width),
-        ArithUbKind::Udiv | ArithUbKind::Sdiv | ArithUbKind::Urem | ArithUbKind::Srem => None,
+        ArithUbKind::Udiv
+        | ArithUbKind::Sdiv
+        | ArithUbKind::Urem
+        | ArithUbKind::Srem
+        | ArithUbKind::ShiftAmount
+        | ArithUbKind::Misaligned { .. }
+        | ArithUbKind::GepOffset { .. } => None,
     }
 }
 
@@ -178,6 +282,9 @@ fn has_ub_witness(op: &ArithOp, env: &HashMap<String, u64>) -> bool {
         ArithUbKind::Sadd | ArithUbKind::Ssub | ArithUbKind::Smul | ArithUbKind::Sneg => {
             has_signed_overflow_witness(op, env)
         }
+        ArithUbKind::ShiftAmount
+        | ArithUbKind::Misaligned { .. }
+        | ArithUbKind::GepOffset { .. } => memory_arith_ub_in(op, env) == Some(true),
     }
 }
 
@@ -205,7 +312,13 @@ fn div_rem_trivially_safe(op: &ArithOp, empty_env: &HashMap<String, u64>) -> boo
             };
             !signed_min_div_minus_one(op.kind, lhs, rhs, op.width)
         }
-        ArithUbKind::Sadd | ArithUbKind::Ssub | ArithUbKind::Smul | ArithUbKind::Sneg => false,
+        ArithUbKind::Sadd
+        | ArithUbKind::Ssub
+        | ArithUbKind::Smul
+        | ArithUbKind::Sneg
+        | ArithUbKind::ShiftAmount
+        | ArithUbKind::Misaligned { .. }
+        | ArithUbKind::GepOffset { .. } => false,
     }
 }
 
@@ -235,7 +348,81 @@ fn trivially_safe(op: &ArithOp) -> bool {
         ArithUbKind::Sadd | ArithUbKind::Ssub | ArithUbKind::Smul | ArithUbKind::Sneg => {
             signed_overflow_trivially_safe(op, &empty_env)
         }
+        ArithUbKind::Misaligned { align } => {
+            memory_arith_ub_in(op, &empty_env) == Some(false)
+                || (align.is_power_of_two()
+                    && known_trailing_zeros(&op.lhs) >= align.trailing_zeros())
+        }
+        ArithUbKind::ShiftAmount => {
+            memory_arith_ub_in(op, &empty_env) == Some(false)
+                || known_unsigned_max(&op.rhs).is_some_and(|max| max < u64::from(op.width))
+        }
+        ArithUbKind::GepOffset { .. } => memory_arith_ub_in(op, &empty_env) == Some(false),
     }
+}
+
+/// An upper bound on `expr`'s unsigned value under every assignment, from its
+/// structure, when one is known: `x & 63` is at most 63 (the masked shift
+/// amount Rust emits), `x % 8` at most 7, a zero-extended `u8` at most 255.
+pub fn known_unsigned_max(expr: &SmtExpr) -> Option<u64> {
+    match expr {
+        SmtExpr::BvConst { value, .. } => Some(*value),
+        SmtExpr::BvAnd { lhs, rhs, .. } => match (known_unsigned_max(lhs), known_unsigned_max(rhs))
+        {
+            (Some(lhs), Some(rhs)) => Some(lhs.min(rhs)),
+            (bound, None) | (None, bound) => bound,
+        },
+        SmtExpr::BvURem { lhs, rhs, .. } => {
+            let by_divisor = match rhs.as_ref() {
+                SmtExpr::BvConst { value, .. } if *value > 0 => Some(*value - 1),
+                _ => None,
+            };
+            match (known_unsigned_max(lhs), by_divisor) {
+                (Some(lhs), Some(rhs)) => Some(lhs.min(rhs)),
+                (bound, None) | (None, bound) => bound,
+            }
+        }
+        SmtExpr::BvLshr { lhs, rhs, width } => match rhs.as_ref() {
+            SmtExpr::BvConst { value, .. } if *value < u64::from(*width) => {
+                let max = known_unsigned_max(lhs).unwrap_or_else(|| mask(u64::MAX, *width));
+                Some(max >> value)
+            }
+            _ => None,
+        },
+        SmtExpr::ZeroExtend { operand, .. } => known_unsigned_max(operand).or_else(|| {
+            let width = operand.try_bv_width().ok()?;
+            (width < 64).then(|| mask(u64::MAX, width))
+        }),
+        _ => None,
+    }
+}
+
+/// A lower bound on the trailing zero bits of `expr`'s value under every
+/// assignment, from its structure: `i * 8 + 16` has at least 3. Wrapping
+/// arithmetic keeps the bound (multiplying or adding modulo `2^w` never sets a
+/// bit below the operands' common trailing zeros).
+pub fn known_trailing_zeros(expr: &SmtExpr) -> u32 {
+    let width = expr.try_bv_width().unwrap_or(0);
+    let bound = match expr {
+        SmtExpr::BvConst { value, width } => value.trailing_zeros().min(*width),
+        SmtExpr::BvMul { lhs, rhs, .. } => {
+            known_trailing_zeros(lhs).saturating_add(known_trailing_zeros(rhs))
+        }
+        SmtExpr::BvAdd { lhs, rhs, .. } | SmtExpr::BvSub { lhs, rhs, .. } => {
+            known_trailing_zeros(lhs).min(known_trailing_zeros(rhs))
+        }
+        SmtExpr::BvShl { lhs, rhs, .. } => match rhs.as_ref() {
+            SmtExpr::BvConst { value, .. } => {
+                known_trailing_zeros(lhs).saturating_add(u32::try_from(*value).unwrap_or(u32::MAX))
+            }
+            _ => known_trailing_zeros(lhs),
+        },
+        SmtExpr::ZeroExtend { operand, .. } | SmtExpr::SignExtend { operand, .. } => {
+            known_trailing_zeros(operand)
+        }
+        _ => 0,
+    };
+    bound.min(width)
 }
 
 /// Check one arithmetic operation against its path context.
@@ -283,9 +470,13 @@ pub fn check_div_rem_ub(op: &ArithOp, ctx: &PathContext) -> FsymVerdict {
         ArithUbKind::Udiv | ArithUbKind::Sdiv | ArithUbKind::Urem | ArithUbKind::Srem => {
             check_arith_ub(op, ctx)
         }
-        ArithUbKind::Sadd | ArithUbKind::Ssub | ArithUbKind::Smul | ArithUbKind::Sneg => {
-            no_witness_found()
-        }
+        ArithUbKind::Sadd
+        | ArithUbKind::Ssub
+        | ArithUbKind::Smul
+        | ArithUbKind::Sneg
+        | ArithUbKind::ShiftAmount
+        | ArithUbKind::Misaligned { .. }
+        | ArithUbKind::GepOffset { .. } => no_witness_found(),
     }
 }
 
@@ -295,9 +486,13 @@ pub fn check_signed_overflow_ub(op: &ArithOp, ctx: &PathContext) -> FsymVerdict 
         ArithUbKind::Sadd | ArithUbKind::Ssub | ArithUbKind::Smul | ArithUbKind::Sneg => {
             check_arith_ub(op, ctx)
         }
-        ArithUbKind::Udiv | ArithUbKind::Sdiv | ArithUbKind::Urem | ArithUbKind::Srem => {
-            no_witness_found()
-        }
+        ArithUbKind::Udiv
+        | ArithUbKind::Sdiv
+        | ArithUbKind::Urem
+        | ArithUbKind::Srem
+        | ArithUbKind::ShiftAmount
+        | ArithUbKind::Misaligned { .. }
+        | ArithUbKind::GepOffset { .. } => no_witness_found(),
     }
 }
 
@@ -312,7 +507,10 @@ pub fn run_arith_ub_scan(ops: &[ArithOp], ctx: &PathContext) -> Vec<(String, Fsy
 
 #[cfg(test)]
 mod tests {
-    use super::{ArithOp, ArithUbKind, check_div_rem_ub, check_signed_overflow_ub};
+    use super::{
+        ArithOp, ArithUbKind, check_arith_ub, check_div_rem_ub, check_signed_overflow_ub,
+        known_trailing_zeros,
+    };
     use crate::fsym_null::{FsymVerdict, PathContext};
     use crate::smt::SmtExpr;
     use std::collections::HashMap;
@@ -811,5 +1009,114 @@ mod tests {
             check_signed_overflow_ub(&add, &fork.else_ctx),
             FsymVerdict::Ub { witness }
         );
+    }
+
+    #[test]
+    fn shift_amount_is_ub_at_or_past_the_width() {
+        let shift = |amount: u64| {
+            check_arith_ub(
+                &op(
+                    ArithUbKind::ShiftAmount,
+                    SmtExpr::var("x", 64),
+                    SmtExpr::bv_const(amount, 64),
+                    64,
+                ),
+                &ctx(vec![], vec![]),
+            )
+        };
+        // The shifted value plays no part: a symbolic one is still decided.
+        assert_eq!(shift(63), FsymVerdict::Safe);
+        assert!(matches!(shift(64), FsymVerdict::Ub { .. }));
+        assert!(matches!(shift(u64::MAX), FsymVerdict::Ub { .. }));
+    }
+
+    #[test]
+    fn masked_shift_amount_is_proven_in_range() {
+        use super::known_unsigned_max;
+        let masked = SmtExpr::var("n", 64).bvand(SmtExpr::bv_const(63, 64));
+        assert_eq!(known_unsigned_max(&masked), Some(63));
+        assert_eq!(
+            check_arith_ub(
+                &op(
+                    ArithUbKind::ShiftAmount,
+                    SmtExpr::bv_const(1, 64),
+                    masked,
+                    64,
+                ),
+                &ctx(vec![], vec![]),
+            ),
+            FsymVerdict::Safe
+        );
+        // `n & 64` may be 64: not proven.
+        let wide = SmtExpr::var("n", 64).bvand(SmtExpr::bv_const(64, 64));
+        assert_eq!(
+            check_arith_ub(
+                &op(ArithUbKind::ShiftAmount, SmtExpr::bv_const(1, 64), wide, 64),
+                &ctx(vec![], vec![]),
+            ),
+            unknown()
+        );
+    }
+
+    #[test]
+    fn gep_offset_is_ub_on_negative_index_or_64_bit_overflow() {
+        let gep_at = |index: u64, base: u64, signed_index: bool, limit: u64| {
+            check_arith_ub(
+                &op(
+                    ArithUbKind::GepOffset {
+                        elem_size: 8,
+                        signed_index,
+                        limit,
+                    },
+                    SmtExpr::bv_const(index, 64),
+                    SmtExpr::bv_const(base, 64),
+                    64,
+                ),
+                &ctx(vec![], vec![]),
+            )
+        };
+        let gep = |index, base, signed_index| gep_at(index, base, signed_index, u64::MAX);
+        assert_eq!(gep(3, 16, true), FsymVerdict::Safe);
+        assert!(matches!(gep(u64::MAX, 16, true), FsymVerdict::Ub { .. }));
+        // The same bits as an unsigned index overflow instead.
+        assert!(matches!(gep(u64::MAX, 16, false), FsymVerdict::Ub { .. }));
+        assert!(matches!(gep(1, u64::MAX - 7, true), FsymVerdict::Ub { .. }));
+        assert_eq!(gep(1, u64::MAX - 8, true), FsymVerdict::Safe);
+        // A 32-bit target's limit is its highest address.
+        let limit = u64::from(u32::MAX);
+        assert_eq!(gep_at(1, limit - 8, true, limit), FsymVerdict::Safe);
+        assert!(matches!(
+            gep_at(1, limit - 7, true, limit),
+            FsymVerdict::Ub { .. }
+        ));
+    }
+
+    #[test]
+    fn alignment_is_proven_from_known_trailing_zeros() {
+        let aligned = |offset: SmtExpr| {
+            check_arith_ub(
+                &op(
+                    ArithUbKind::Misaligned { align: 8 },
+                    offset,
+                    SmtExpr::bv_const(0, 64),
+                    64,
+                ),
+                &ctx(vec![], vec![]),
+            )
+        };
+        assert_eq!(aligned(SmtExpr::bv_const(16, 64)), FsymVerdict::Safe);
+        assert!(matches!(
+            aligned(SmtExpr::bv_const(12, 64)),
+            FsymVerdict::Ub { .. }
+        ));
+        // `i * 8 + 16`: three trailing zeros whatever `i` is.
+        let scaled = SmtExpr::var("i", 64)
+            .bvmul(SmtExpr::bv_const(8, 64))
+            .bvadd(SmtExpr::bv_const(16, 64));
+        assert_eq!(known_trailing_zeros(&scaled), 3);
+        assert_eq!(aligned(scaled), FsymVerdict::Safe);
+        // `i * 4` proves only 4-byte alignment.
+        let quad = SmtExpr::var("i", 64).bvmul(SmtExpr::bv_const(4, 64));
+        assert_eq!(aligned(quad), unknown());
     }
 }

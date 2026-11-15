@@ -1,0 +1,22 @@
+; TrustIr text format v1
+module "fresh_generation_loop"
+
+functy.0 = (i64) -> (i64)
+
+fn @main(functy.0) {
+bb0(%0: i64):
+    %1 = const i32 0
+    br bb1(%1)
+bb1(%2: i32):
+    %3 = open_frame #0 "iteration" {x: i64}
+    %4 = bind_slot %3, 0, %0
+    %5 = load_slot i64 %4, 0
+    close_frame %4
+    %6 = const i32 1
+    %7 = add i32 %2, %6
+    %8 = const i32 2
+    %9 = icmp ult i32 %7, %8
+    condbr %9, bb1(%7), bb2(%5)
+bb2(%10: i64):
+    ret %10
+}

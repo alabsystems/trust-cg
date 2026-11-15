@@ -655,10 +655,23 @@ fn transfer(
         }
 
         // Loads define exactly the loaded width with the documented extension.
-        // 8/16/32-bit narrow loads zero-fill the rest of the carrier; the
-        // wide load fills the whole 64-bit carrier.
-        X86Opcode::MovRM8 => HighBits::ZeroExt(8),
-        X86Opcode::MovRM16 => HighBits::ZeroExt(16),
+        // The zero-extending `movzx r32, m8/m16` writes the whole register with
+        // bits 8 (16) and up zero; a 32-bit load zero-fills bits 32..63; the
+        // wide load fills the whole 64-bit carrier. The merging `mov r8/r16, m`
+        // writes only the low byte/word and keeps whatever the register held
+        // above it (register allocation treats its destination as a pure
+        // definition, so that is any value): nothing is known there. The
+        // selector emits none of those any more; they are modelled honestly
+        // rather than as the zero extension they are not.
+        X86Opcode::MovzxRM8 | X86Opcode::MovzxRM8Sib | X86Opcode::VolatileMovzxRM8 => {
+            HighBits::ZeroExt(8)
+        }
+        X86Opcode::MovzxRM16 | X86Opcode::VolatileMovzxRM16 => HighBits::ZeroExt(16),
+        X86Opcode::MovRM8
+        | X86Opcode::MovRM16
+        | X86Opcode::MovRM8Sib
+        | X86Opcode::VolatileMovRM8
+        | X86Opcode::VolatileMovRM16 => HighBits::Top,
         X86Opcode::MovRM32 => HighBits::ZeroExt(32),
         X86Opcode::MovRM | X86Opcode::MovRMSib | X86Opcode::MovRipRel => HighBits::Full(width),
 

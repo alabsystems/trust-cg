@@ -38,7 +38,23 @@
 //!     $S/bin/cargo run --bin trust_ir_mir -- <slice.rs> \
 //!     --crate-type=lib -C overflow-checks=off -C debug-assertions=off \
 //!     --mir-emit-closure <root> <out.tir>
-//!   x86_class_props_root: 26320 bytes, 12 members, validate 0, re-parse OK, EXTERN-FREE
+//!   x86_class_props_root: 26303 bytes, 12 members, validate 0, re-parse OK, EXTERN-FREE
+//!     (`x86_writes_flags` re-pinned to production 10f0b0d4c, which dropped
+//!     `Not`. Re-emitted on aarch64 Linux with trust-ir frontend 00c45ab9d built
+//!     by the `trust` toolchain a62ae50d8 under `-Ztrust-verify=off`; that
+//!     frontend reproduces the previous fixture from the previous slice, and
+//!     the new emit equals this text byte for byte once its `; #loc:` comments
+//!     are stripped and the original `aarch64-apple-darwin` target line kept.
+//!     The only change is the dropped `22: bb2` switch key.)
+//!     (`x86_produces_value` re-pinned to production, which now answers `true`
+//!     for `StackAlloc` (tag 119): `StackAlloc [dst, count, unit, align]`
+//!     writes `dst`. The slice drops `StackAlloc` from the no-value list.
+//!     Re-emitted on aarch64 macOS with a `trust_ir_mir` built 2026-09-24 from
+//!     trust-ir 964bf99d and linked to the `trust` toolchain 321aaeda7, run as
+//!     `--sysroot <that toolchain>`; that frontend reproduces the previous
+//!     fixture from the previous slice, and the new emit equals this text
+//!     byte for byte once its `; #loc:` comments are stripped. The only change
+//!     is the dropped `119: bb2` key of `x86_produces_value`.)
 //!   sr_props_root:         2725 bytes,  4 members, validate 0, re-parse OK, EXTERN-FREE
 //!   (F4-pinned, validate 0 but UnresolvedSymbol at JIT link:)
 //!   movn_props_root:       4316 bytes,  2 members ; chunks_root: 5685 bytes, 2 members
@@ -102,6 +118,7 @@ fn jit_module(text: &str, what: &str) -> trust_cg_codegen::jit::ExecutableBuffer
         .unwrap_or_else(|e| panic!("MIR-emitted `{what}` trust-ir text must parse: {e:?}"));
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -115,7 +132,10 @@ fn jit_compile_err(text: &str, what: &str) -> String {
     let module = trust_ir::parser::parse_module(text)
         .unwrap_or_else(|e| panic!("F4-pin `{what}` trust-ir text must still parse: {e:?}"));
     let config = CompilerConfig::jit_fast(Target::Aarch64);
-    match Compiler::new(config).compile_module_to_jit(&module, &HashMap::new()) {
+    match Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
+        .compile_module_to_jit(&module, &HashMap::new())
+    {
         Ok(_) => panic!(
             "F4-PIN AUTO-FIRE: `{what}` now JIT-COMPILES — the empty-bodied leaf (array-iterator / \
              numeric intrinsic) appears host-linked. Promote this function to full native==JIT \
@@ -523,6 +543,11 @@ fn trust_x86_opcode_class_all193_production_eq_jit() {
     assert_eq!(wrf(23), 1, "ShlRR writes flags");
     assert_eq!(wrf(49), 1, "CmpRR writes flags");
     assert_eq!(wrf(29), 0, "MovRR does NOT write flags");
+    assert_eq!(
+        wrf(22),
+        0,
+        "Not does NOT write flags (x86 NOT: Flags Affected: None; 10f0b0d4c)"
+    );
     assert_eq!(wrf(44), 0, "Lea does NOT write flags");
     assert_eq!(wrf(176), 1, "AdcRR writes flags");
     assert_eq!(rdf(94), 1, "Cmovcc reads flags");
@@ -552,6 +577,11 @@ fn trust_x86_opcode_class_all193_production_eq_jit() {
         produces(125),
         0,
         "Mul produces NO value (fixed-reg implicit writes)"
+    );
+    assert_eq!(
+        produces(119),
+        1,
+        "StackAlloc produces a value (it writes the allocated address to operand 0)"
     );
 
     // Cross-invariant #1: every x86-removable opcode is memory-pure.
@@ -589,6 +619,49 @@ fn trust_x86_opcode_class_all193_production_eq_jit() {
         0,
         "production correctly rejects AddRR removal"
     );
+}
+
+/// The x86 classifier module compiled at EVERY optimization level, each
+/// exhaustively equal to the linked production classifiers. Its
+/// `MemoryEffect::reads_memory` is a two-key switch sharing the `true` arm
+/// through a join parameter, which O2/O3 refused from 6eafd20a8 until the
+/// if-conversion recognizers required their branch to be the header's only
+/// block exit (`if_convert::header_branch_is_sole_block_exit`).
+#[test]
+fn trust_x86_opcode_class_all193_production_eq_jit_at_every_opt_level() {
+    use trust_cg_codegen::pipeline::OptLevel;
+
+    for opt_level in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+        let expected = X86_COUNT as usize;
+        let rows = run_watchdogged::<(u32, [u32; 9])>("x86_class opt level", expected, move |tx| {
+            let module = trust_ir::parser::parse_module(X86_CLASS_IR)
+                .expect("MIR-emitted `x86_class` trust-ir text must parse");
+            let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+            config.opt_level = opt_level;
+            let buffer = Compiler::new(config)
+                .with_codegen_license(permit_unlicensed())
+                .compile_module_to_jit(&module, &HashMap::new())
+                .unwrap_or_else(|e| panic!("x86_class JIT compile at {opt_level:?} failed: {e:?}"))
+                .buffer;
+            // SAFETY: machine code for functy.0 = (u32, ptr) -> ().
+            let f: unsafe extern "C" fn(u32, *mut X86ClassPropsC) =
+                unsafe { std::mem::transmute(bind(&buffer, "x86_class_props_root")) };
+            for tag in 0..X86_COUNT {
+                let mut out = X86ClassPropsC::poisoned();
+                unsafe { f(tag, &mut out) };
+                if tx.send((tag, out.as_row())).is_err() {
+                    return;
+                }
+            }
+        });
+        for &(tag, row) in &rows {
+            let expect = native_x86_row(tag);
+            assert_eq!(
+                row, expect,
+                "x86_class(tag={tag}) at {opt_level:?}: JIT {row:?} != production {expect:?}"
+            );
+        }
+    }
 }
 
 /// ARMED CONTROL (x86 module): patch the UNIQUE `x86_reads_flags` switch in the
@@ -962,7 +1035,7 @@ fn trust_is_power_of_two_peephole_pinned_f4_unresolved_trailing_zeros() {
 
 /// VERBATIM MIR-closure emit of `x86_class_props_root`. x86-64 opcode classifier
 /// layer (trust-cg-ir X86Opcode[repr(u8), B4/F5] + trust-cg-opt effects); slice
-/// trust_x86_opcode_class_slice.rs. 26320 bytes; 12 members; validate 0;
+/// trust_x86_opcode_class_slice.rs. 26303 bytes; 12 members; validate 0;
 /// re-parse OK; EXTERN-FREE.
 const X86_CLASS_IR: &str = r####"; TrustIr text format v1
 module "mir::closure::x86_class_props_root"
@@ -2118,7 +2191,7 @@ bb0(%0: u8):
     store u8 %0, ptr %2
     %3 = load i8, ptr %2
     %4 = bitcast i8 %3 to u8
-    switch %4 [ 0: bb2 1: bb2 2: bb2 3: bb2 4: bb2 5: bb2 6: bb2 7: bb2 8: bb2 9: bb2 10: bb2 11: bb2 12: bb2 13: bb2 16: bb2 17: bb2 18: bb2 19: bb2 20: bb2 21: bb2 22: bb2 23: bb2 24: bb2 25: bb2 26: bb2 27: bb2 28: bb2 49: bb2 50: bb2 51: bb2 52: bb2 53: bb2 54: bb2 55: bb2 71: bb2 83: bb2 102: bb2 103: bb2 104: bb2 105: bb2 106: bb2 107: bb2 110: bb2 125: bb2 129: bb2 130: bb2 131: bb2 155: bb2 159: bb2 162: bb2 171: bb2 172: bb2 176: bb2 177: bb2 default: bb1 ]
+    switch %4 [ 0: bb2 1: bb2 2: bb2 3: bb2 4: bb2 5: bb2 6: bb2 7: bb2 8: bb2 9: bb2 10: bb2 11: bb2 12: bb2 13: bb2 16: bb2 17: bb2 18: bb2 19: bb2 20: bb2 21: bb2 23: bb2 24: bb2 25: bb2 26: bb2 27: bb2 28: bb2 49: bb2 50: bb2 51: bb2 52: bb2 53: bb2 54: bb2 55: bb2 71: bb2 83: bb2 102: bb2 103: bb2 104: bb2 105: bb2 106: bb2 107: bb2 110: bb2 125: bb2 129: bb2 130: bb2 131: bb2 155: bb2 159: bb2 162: bb2 171: bb2 172: bb2 176: bb2 177: bb2 default: bb1 ]
 bb1:
     %5 = const bool false
     br bb3(%5)
@@ -2152,7 +2225,7 @@ bb0(%0: u8):
     store u8 %0, ptr %2
     %3 = load i8, ptr %2
     %4 = bitcast i8 %3 to u8
-    switch %4 [ 9: bb2 10: bb2 14: bb2 15: bb2 35: bb2 36: bb2 37: bb2 38: bb2 47: bb2 49: bb2 50: bb2 51: bb2 52: bb2 53: bb2 54: bb2 55: bb2 56: bb2 57: bb2 58: bb2 59: bb2 60: bb2 61: bb2 70: bb2 71: bb2 73: bb2 82: bb2 83: bb2 107: bb2 110: bb2 111: bb2 116: bb2 119: bb2 120: bb2 121: bb2 125: bb2 126: bb2 142: bb2 159: bb2 189: bb2 190: bb2 191: bb2 192: bb2 default: bb1 ]
+    switch %4 [ 9: bb2 10: bb2 14: bb2 15: bb2 35: bb2 36: bb2 37: bb2 38: bb2 47: bb2 49: bb2 50: bb2 51: bb2 52: bb2 53: bb2 54: bb2 55: bb2 56: bb2 57: bb2 58: bb2 59: bb2 60: bb2 61: bb2 70: bb2 71: bb2 73: bb2 82: bb2 83: bb2 107: bb2 110: bb2 111: bb2 116: bb2 120: bb2 121: bb2 125: bb2 126: bb2 142: bb2 159: bb2 189: bb2 190: bb2 191: bb2 192: bb2 default: bb1 ]
 bb1:
     %5 = const bool false
     br bb3(%5)
@@ -2760,3 +2833,12 @@ bb5:
     ret
 }
 "####;
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}

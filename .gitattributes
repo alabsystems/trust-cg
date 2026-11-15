@@ -9,3 +9,14 @@
 # by canary_certs/manifest.v1 for exactly the same reason.
 *.lratcert binary
 crates/trust-cg-verify/verdict_db/canary_certs/manifest.v1 binary
+# The bound-memory form certificates are committed zstd-compressed and their
+# manifest is include_str!-embedded and SHA-256-bound into the replay
+# authority's identity (verdict_db/README.md, "Bound-memory form certificates").
+*.lratcert.zst binary
+crates/trust-cg-verify/verdict_db/bound_memory_certs/manifest.v1 binary
+crates/trust-cg-verify/verdict_db/atomic_memory_certs/manifest.v1 binary
+crates/trust-cg-verify/verdict_db/neon_memory_certs/manifest.v1 binary
+# The x86 split-copy replay fixtures are embedded with include_bytes! and
+# SHA-256-pinned by their README (tests/e2e_x86_64_split_copy_replay.rs), so no
+# checkout may rewrite their line endings.
+crates/trust-cg-codegen/tests/fixtures/x86_split_copy_replay/* -text

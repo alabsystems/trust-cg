@@ -196,6 +196,14 @@ if [[ "$LANE" == "nightly" && "$SKIP_CARGO_FUZZ" -eq 1 ]]; then
 fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+# The proptest families build and run with the installed Trust package's targo
+# (scripts/trust_cargo.sh; owner directive 2026-09-28), which hands the
+# TRUST_CG_* controls to the tests but never to trustc.
+TRUST_CARGO="$REPO_ROOT/scripts/trust_cargo.sh"
+# STOCK EXCEPTION (Trust lacks cargo-fuzz and an ASan runtime; measured on the
+# Darwin Trust package: `trustc -Zsanitizer=address` -> "ld: library
+# 'rustc-trust_rt.asan' not found", no cargo-fuzz): CARGO_BIN is a stock cargo
+# with cargo-fuzz, used ONLY for the `fuzz` subcommands below.
 CARGO_BIN="${CARGO_BIN:-cargo}"
 export PROPTEST_CASES="$CASES"
 : "${CARGO_SKIP_CACHE:=1}"
@@ -319,7 +327,7 @@ run_timed_logged() {
 }
 
 echo "[panic-fuzz] repo=$REPO_ROOT"
-echo "[panic-fuzz] cargo=$CARGO_BIN"
+echo "[panic-fuzz] tests=$TRUST_CARGO (Trust) cargo-fuzz=$CARGO_BIN (stock exception)"
 echo "[panic-fuzz] lane=$LANE"
 echo "[panic-fuzz] PROPTEST_CASES=$PROPTEST_CASES"
 echo "[panic-fuzz] fuzz_seconds_per_target=$FUZZ_SECONDS"
@@ -338,7 +346,7 @@ if [[ "$NEGATIVE_CONTROL" -eq 1 ]]; then
     echo "[panic-fuzz] running deliberate-panic negative control"
     NEGATIVE_LOG="$(mktemp -t trust-cg-panic-fuzz-negative.XXXXXX)"
     set +e
-    TRUST_CG_PANIC_FUZZ_NEGATIVE_CONTROL=1 "$CARGO_BIN" test \
+    TRUST_CG_PANIC_FUZZ_NEGATIVE_CONTROL=1 "$TRUST_CARGO" test \
         -p trust-cg-lower \
         --test panic_fuzz_lower \
         panic_fuzz_negative_control_fails_when_enabled \
@@ -395,7 +403,7 @@ for family in "${FAMILIES[@]}"; do
         log_path="$ARTIFACT_DIR/logs/proptest-$test_target.log"
     fi
     run_timed_logged "$TEST_TIMEOUT_SECONDS" "$log_path" \
-        "$CARGO_BIN" test -p "$package" --test "$test_target"
+        "$TRUST_CARGO" test -p "$package" --test "$test_target"
 done
 
 if [[ "$LANE" == "nightly" ]]; then

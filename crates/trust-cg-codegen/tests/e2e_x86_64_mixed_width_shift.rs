@@ -1,129 +1,298 @@
 // trust-cg-codegen/tests/e2e_x86_64_mixed_width_shift.rs
-//   x86-64 mixed-width variable shift: differential + triple oracle vs clang
+//   x86-64 shifts whose amount starts at another integer width: differential +
+//   triple oracle vs clang, and the refusal of the unconverted spelling
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Regression for the x86-64 ISel gap where `select_shift` rejected any shift
-// whose shift-amount operand had a different integer width than the shifted
-// value ("Shift lhs=I64 rhs=I32 ... require matching scalar integer operands").
+// A source shift's AMOUNT carries its own type: C's `a << (int)b` shifts a
+// `long` by an `int`, Rust's `x << n` shifts a `u64` by an `i32` or `usize`.
+// trust-ir requires both operands of a shift to have the shifted value's type
+// (trust-ir-build `check_binop_operand`: `BinOpTypeMismatch` and a role-tagged
+// `OperandTypeMismatch`), and every trust-cg ingestion entry refuses what that
+// validator refuses (WS7.3). A producer therefore spells such an amount at the
+// value's type before the shift, as the rustc bridge does
+// (`shift_amount_spelling`, rustc's own `cast_shift_expr_rhs`): a NARROWER
+// amount is zero-extended, a WIDER one truncated. Either conversion keeps every
+// bit below the value's width, and the shift reads no other bit, so the result
+// is the source's for every amount the source defines.
 //
-// On x86-64 the shift COUNT is taken from CL (the low 8 bits of RCX) regardless
-// of the count operand's declared width, and is masked mod the shifted operand's
-// width (mod 64 for r64, mod 32 for r32). A 32-bit shift amount for a 64-bit
-// shift is therefore well-defined: the amount is moved into the matching RCX
-// subregister (ECX zeroes the high bits) and the hardware reads CL. This is the
-// exact shape the Rust front end (the rustc bridge) emits for `i64 << (x as
-// u32)`-style MIR: `BinOp { op: Shl, ty: I64, lhs: <i64>, rhs: <i32> }` with the
-// shift amount carried in a narrower I32 value.
+// The fixtures below are spelled that way:
 //
-// The fix relaxed the operand-width acceptance only; the emitted machine
-// sequence (move count -> CL, then SHL/SHR/SAR r, CL) is the same already-proven
-// CL-shift lowering verified by trust-cg-verify's proof_x86_{ishl,ushr,sshr}_i64
-// obligations, so no new proof was required.
+// * `long f(long a, long b) { return a OP (int)b; }` truncates `b` to an I32
+//   amount (the C cast) and zero-extends it back to I64 (the conversion) before
+//   the I64 `shl`/`lshr`/`ashr`;
+// * `int f(long a, long b) { return (int)a << b; }` truncates the I64 amount to
+//   the I32 value's type before the I32 `shl`.
 //
-// These tests build the modules inline (mirroring the rustc-bridge shape) and
-// hold x86-64 codegen to the clang oracle (differential) and the interpreter +
-// clang oracles (triple). They early-return on non-x86-64 hosts.
+// The backend lowers the conversion and then the variable-count shift: x86-64
+// takes the count from CL (the low 8 bits of RCX) and masks it mod the operand
+// width (mod 64 for r64, mod 32 for r32), so the amount is moved into RCX/ECX
+// and `SHL/SHR/SAR r, CL` executes. Each test holds that lowering, at O0, to
+// clang (differential) or to clang and the trust-ir interpreter (triple
+// oracle) on the inputs below. The x86-64 oracle tests return early where no
+// x86-64 executor exists (see `x86_64_oracle_enabled`).
+//
+// The other spelling, the amount left at its own type as the shift's `rhs`
+// (`BinOp { ty: I64, lhs: <I64>, rhs: <I32> }`), is ill-typed trust-ir and is
+// refused at ingestion before any lowering;
+// `an_amount_at_its_own_type_is_refused_by_name_at_ingestion` pins that
+// refusal, by trust-ir's named findings, on every host.
 
 mod common;
 use common::x86_64_corpus::{
-    TripleOracleCase, x86_64_differential_test, x86_64_oracle_enabled, x86_64_triple_oracle_test,
+    TripleOracleCase, compile_trust_ir_module_x86_64, x86_64_differential_test,
+    x86_64_oracle_enabled, x86_64_triple_oracle_test,
 };
 
+use trust_cg_codegen::compiler::{CompileError, Compiler, CompilerConfig};
+use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::Target;
+use trust_cg_lower::AdmissionStage;
 use trust_ir::{BinOp, CastOp, Inst, InstrNode};
 use trust_ir::{
     Block as TrustIrBlock, FuncTy, Function as TrustIrFunction, Module as TrustIrModule, Ty,
 };
 use trust_ir::{BlockId, FuncId, ValueId};
+use trust_ir_build::ValidationError;
 
 // =============================================================================
-// Inline trust_ir builders (rustc-bridge-shaped mixed-width variable shifts)
+// Inline trust_ir builders
 // =============================================================================
 
-/// `long NAME(long a, long b) { return a OP (int)b; }`
-///
-/// The shifted value `a` is I64; the shift amount is `b` truncated to I32, so
-/// the emitted `BinOp { op, ty: I64, lhs: <I64 a>, rhs: <I32 amt> }` is a
-/// genuine mixed-width shift (the shape that previously failed ISel). `op` is
-/// `Shl`/`LShr`/`AShr`. Single block, no proofs (unguarded => mask semantics,
-/// which the interpreter, clang, and x86 hardware all share).
-fn build_i64_shift_by_i32_amount_module(name: &str, op: BinOp) -> TrustIrModule {
+/// How a fixture spells its shift amount.
+#[derive(Clone, Copy, Debug)]
+enum AmountSpelling {
+    /// Converted to the shifted value's type first (`ZExt` from a narrower
+    /// amount, `Trunc` from a wider one): valid trust-ir, the bridge's form.
+    AtValueType,
+    /// Left at its own type as the shift's `rhs`: ill-typed trust-ir, refused
+    /// at ingestion.
+    AtOwnType,
+}
+
+/// A single-block `(i64, i64) -> returns` function `name` whose body is
+/// `body`, in a module named `test`.
+fn single_block_module(name: &str, returns: Ty, body: Vec<InstrNode>) -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![returns],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
         params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
-        body: vec![
-            // amt: i32 = (i32) b   -- the narrower shift-amount operand
-            InstrNode::new(Inst::Cast {
-                op: CastOp::Trunc,
-                src_ty: Ty::I64,
-                dst_ty: Ty::I32,
-                operand: ValueId::new(1),
-            })
-            .with_result(ValueId::new(2)),
-            // r: i64 = a OP amt    -- I64 lhs, I32 shift amount
-            InstrNode::new(Inst::BinOp {
-                op,
-                ty: Ty::I64,
-                lhs: ValueId::new(0),
-                rhs: ValueId::new(2),
-            })
-            .with_result(ValueId::new(3)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(3)],
-            }),
-        ],
+        body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
-/// `int NAME(long a, long b) { return (int)a << b; }` — the *wider* shape:
-/// an I32 shifted value with an I64 shift amount. x86-64 moves the I64 amount
-/// into the full RCX and the 32-bit SHL reads CL. Returns I32. This mirrors
-/// MIR where a 32-bit value is shifted by a 64-bit (`usize`) amount.
+fn cast(op: CastOp, src_ty: Ty, dst_ty: Ty, operand: u32, result: u32) -> InstrNode {
+    InstrNode::new(Inst::Cast {
+        op,
+        src_ty,
+        dst_ty,
+        operand: ValueId::new(operand),
+    })
+    .with_result(ValueId::new(result))
+}
+
+/// `long NAME(long a, long b) { return a OP (int)b; }`
+///
+/// The shifted value `a` is I64; the source amount is `b` truncated to I32.
+/// [`AmountSpelling::AtValueType`] zero-extends that I32 amount back to I64
+/// and shifts `I64 OP I64`; [`AmountSpelling::AtOwnType`] shifts by the I32
+/// value directly. `op` is `Shl`/`LShr`/`AShr`. Single block, no proofs
+/// (unguarded => mask semantics, which the interpreter, clang, and x86
+/// hardware all share on these inputs).
+fn i64_shift_by_i32_amount_module(
+    name: &str,
+    op: BinOp,
+    spelling: AmountSpelling,
+) -> TrustIrModule {
+    // amt: i32 = (i32) b   -- the source's narrower shift amount
+    let mut body = vec![cast(CastOp::Trunc, Ty::I64, Ty::I32, 1, 2)];
+    let amount = match spelling {
+        AmountSpelling::AtValueType => {
+            // amt64: i64 = zext amt   -- the amount at the value's type
+            body.push(cast(CastOp::ZExt, Ty::I32, Ty::I64, 2, 3));
+            ValueId::new(3)
+        }
+        AmountSpelling::AtOwnType => ValueId::new(2),
+    };
+    body.push(
+        // r: i64 = a OP amount
+        InstrNode::new(Inst::BinOp {
+            op,
+            ty: Ty::I64,
+            lhs: ValueId::new(0),
+            rhs: amount,
+        })
+        .with_result(ValueId::new(4)),
+    );
+    body.push(InstrNode::new(Inst::Return {
+        values: vec![ValueId::new(4)],
+    }));
+    single_block_module(name, Ty::I64, body)
+}
+
+/// `int NAME(long a, long b) { return (int)a << b; }` — the *wider* shape: an
+/// I32 shifted value with an I64 source amount (MIR shifting a 32-bit value by
+/// a 64-bit `usize`). [`AmountSpelling::AtValueType`] truncates the amount to
+/// I32 and shifts `I32 << I32`; [`AmountSpelling::AtOwnType`] shifts by the
+/// I64 value directly. Returns I32.
+fn i32_shift_by_i64_amount_module(name: &str, spelling: AmountSpelling) -> TrustIrModule {
+    // val: i32 = (i32) a   -- the shifted value
+    let mut body = vec![cast(CastOp::Trunc, Ty::I64, Ty::I32, 0, 2)];
+    let amount = match spelling {
+        AmountSpelling::AtValueType => {
+            // amt32: i32 = trunc b   -- the amount at the value's type
+            body.push(cast(CastOp::Trunc, Ty::I64, Ty::I32, 1, 3));
+            ValueId::new(3)
+        }
+        AmountSpelling::AtOwnType => ValueId::new(1),
+    };
+    body.push(
+        // r: i32 = val << amount
+        InstrNode::new(Inst::BinOp {
+            op: BinOp::Shl,
+            ty: Ty::I32,
+            lhs: ValueId::new(2),
+            rhs: amount,
+        })
+        .with_result(ValueId::new(4)),
+    );
+    body.push(InstrNode::new(Inst::Return {
+        values: vec![ValueId::new(4)],
+    }));
+    single_block_module(name, Ty::I32, body)
+}
+
+/// The I64 fixture every oracle test below compiles: valid trust-ir.
+fn build_i64_shift_by_i32_amount_module(name: &str, op: BinOp) -> TrustIrModule {
+    i64_shift_by_i32_amount_module(name, op, AmountSpelling::AtValueType)
+}
+
+/// The I32 fixture the oracle test below compiles: valid trust-ir.
 fn build_i32_shift_by_i64_amount_module(name: &str) -> TrustIrModule {
-    let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
-    let mut func = TrustIrFunction::new(FuncId::new(0), name, ft_id, BlockId::new(0));
-    func.blocks = vec![TrustIrBlock {
-        id: BlockId::new(0),
-        params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
-        body: vec![
-            // val: i32 = (i32) a   -- the shifted value
-            InstrNode::new(Inst::Cast {
-                op: CastOp::Trunc,
-                src_ty: Ty::I64,
-                dst_ty: Ty::I32,
-                operand: ValueId::new(0),
-            })
-            .with_result(ValueId::new(2)),
-            // r: i32 = val << b    -- I32 lhs, I64 shift amount (wider)
-            InstrNode::new(Inst::BinOp {
-                op: BinOp::Shl,
-                ty: Ty::I32,
-                lhs: ValueId::new(2),
-                rhs: ValueId::new(1),
-            })
-            .with_result(ValueId::new(3)),
-            InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(3)],
-            }),
-        ],
-    }];
-    module.add_function(func);
-    module
+    i32_shift_by_i64_amount_module(name, AmountSpelling::AtValueType)
+}
+
+/// Every shape this file covers, spelled `spelling`, with its shift's
+/// `(op token, value type, source amount type)`.
+fn every_shape(spelling: AmountSpelling) -> Vec<(TrustIrModule, &'static str, Ty, Ty)> {
+    let mut shapes: Vec<_> = [
+        (BinOp::Shl, "shl"),
+        (BinOp::LShr, "lshr"),
+        (BinOp::AShr, "ashr"),
+    ]
+    .into_iter()
+    .map(|(op, token)| {
+        (
+            i64_shift_by_i32_amount_module(&format!("_i64_{token}_i32amt"), op, spelling),
+            token,
+            Ty::I64,
+            Ty::I32,
+        )
+    })
+    .collect();
+    shapes.push((
+        i32_shift_by_i64_amount_module("_i32_shl_i64amt", spelling),
+        "shl",
+        Ty::I32,
+        Ty::I64,
+    ));
+    shapes
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). The refusal test's compile states `Permit`, as the
+/// oracle harness's does, so no refusal here is the license's.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+// =============================================================================
+// Admission: the converted spelling is admitted, the unconverted one refused
+// =============================================================================
+
+/// Every fixture the oracle tests compile is valid trust-ir: trust-ir's
+/// codegen admission has no finding for it, and the x86-64 backend compiles
+/// it (on every host; executing it is the oracle tests' part).
+#[test]
+fn every_fixture_spells_its_amount_at_the_value_type() {
+    for (module, token, value_ty, amount_ty) in every_shape(AmountSpelling::AtValueType) {
+        assert_eq!(
+            trust_cg_lower::admission_findings(&module, &permit_unlicensed(), &[]),
+            Vec::<ValidationError>::new(),
+            "{token} {value_ty} by a {amount_ty} amount, converted: trust-ir must admit it"
+        );
+        compile_trust_ir_module_x86_64(&module);
+    }
+}
+
+/// The unconverted spelling — the shift's `rhs` left at the source amount's
+/// type — is refused by every x86-64 compile at ingestion, before lowering,
+/// with exactly trust-ir's two named findings for the shift: the operands
+/// disagree (`BinOpTypeMismatch`) and the `rhs` is not the declared type
+/// (`OperandTypeMismatch`). trust-ir's own admission reports the same two, so
+/// the refusal is trust-ir's rule and not a backend arm.
+#[test]
+fn an_amount_at_its_own_type_is_refused_by_name_at_ingestion() {
+    for (module, token, value_ty, amount_ty) in every_shape(AmountSpelling::AtOwnType) {
+        let label = format!("{token} {value_ty} by a {amount_ty} amount, unconverted");
+        let expected = vec![
+            ValidationError::BinOpTypeMismatch {
+                block: 0,
+                op: token.to_string(),
+                lhs_ty: value_ty.to_string(),
+                rhs_ty: amount_ty.to_string(),
+            },
+            ValidationError::OperandTypeMismatch {
+                block: 0,
+                op: token.to_string(),
+                role: "rhs".to_string(),
+                expected: value_ty.to_string(),
+                actual: amount_ty.to_string(),
+            },
+        ];
+        assert_eq!(
+            trust_cg_lower::admission_findings(&module, &permit_unlicensed(), &[]),
+            expected,
+            "{label}: trust-ir's admission findings"
+        );
+        let error = Compiler::new(CompilerConfig {
+            opt_level: OptLevel::O0,
+            target: Target::X86_64,
+            ..CompilerConfig::default()
+        })
+        .with_codegen_license(permit_unlicensed())
+        .compile(&module)
+        .err()
+        .unwrap_or_else(|| panic!("{label}: the x86-64 compile must refuse it"));
+        match error {
+            CompileError::InvalidTrustIr(refusal) => {
+                assert_eq!(refusal.module, "test", "{label}");
+                assert_eq!(
+                    refusal.stage,
+                    AdmissionStage::Received,
+                    "{label}: refused as received"
+                );
+                assert_eq!(refusal.errors, expected, "{label}: the refusal's findings");
+            }
+            other => panic!("{label}: expected CompileError::InvalidTrustIr, got {other:?}"),
+        }
+    }
 }
 
 // =============================================================================

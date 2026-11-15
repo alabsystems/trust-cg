@@ -54,11 +54,14 @@ use common::a64_interp::{A64Interp, extract_text, symbol_addrs, text_branch_relo
 ///          wrong hoist would compute BOUND*last² instead of Σ i²).
 fn build_pure_call_loop(bound: i128, arg_val: u32) -> M {
     let mut module = M::new("pure_call_hoist_e2e");
-    let ft_sq = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_sq = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // _sq(x) = x * x   (FuncId 0)
     let mut sq = trust_ir::Function::new(FuncId::new(0), "_sq", ft_sq, BlockId::new(0));
@@ -80,11 +83,14 @@ fn build_pure_call_loop(bound: i128, arg_val: u32) -> M {
     }];
 
     // _driver(_n) (FuncId 1)
-    let ft_drv = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_drv = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut drv = trust_ir::Function::new(FuncId::new(1), "_driver", ft_drv, BlockId::new(0));
 
     let c = |v: i128, r: u32| {
@@ -170,8 +176,12 @@ fn build_pure_call_loop(bound: i128, arg_val: u32) -> M {
         },
     ];
 
-    module.add_function(sq);
-    module.add_function(drv);
+    module
+        .try_add_function(sq)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(drv)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -189,7 +199,8 @@ fn compile_a64(m: &M, opt: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     c.compile(m).expect("aarch64 compile").object_code
 }
 
@@ -287,4 +298,13 @@ fn check_pair(m: &M, want: i128, bound: i128) -> bool {
         "O0 result bound={bound}: got {got_o0} want {want}"
     );
     obj_o2 != obj_o0
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

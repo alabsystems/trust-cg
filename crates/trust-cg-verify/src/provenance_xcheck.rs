@@ -49,14 +49,14 @@
 //!   class-preserving; `x86_strength_reduce` rewrites ImulRR/ImulRRI→MovRR
 //!   in place (kept `Imul` stamp on an emitted register copy — glue-exempt,
 //!   the exact x86 analogue of the AArch64 `strength_reduce` Mul→Copy
-//!   below); and every pass-constructed instruction goes through
-//!   `X86ISelInst::new`/`with_flags` which resets provenance to
-//!   `UNATTRIBUTED` (verified: no `lowering_provenance` reference exists in
-//!   `trust-cg-opt`). On AArch64 the in-place rewrites are
-//!   `strength_reduce`/`sroa` Mul→Copy/MovR (Copy is glue-exempt),
-//!   `addr_mode` load→load / store→store (class-preserving) and
-//!   `loop_latch_layout` B↔BCond (no definite class), so kept stamps are
-//!   class-stable there too.
+//!   below); and pass-constructed x86 instructions use
+//!   `X86ISelInst::new`/`with_flags`, which resets provenance to
+//!   `UNATTRIBUTED`. On AArch64, `strength_reduce`/`sroa` Mul→Copy/MovR
+//!   is glue-exempt, `addr_mode` load→load / store→store is class-preserving,
+//!   and `loop_latch_layout` B↔BCond has no definite class. Declarative
+//!   rewrites also run in place: source-attributed AddRR→LslRI and
+//!   MulRR→Neg are suppressed until they have a checked source-class
+//!   rebind. Every surviving source stamp is cross-checked after these passes.
 //! * The COMPATIBILITY relation is deliberately coarse (op classes, not exact
 //!   opcodes) and seeded permissively for multi-instruction expansions and
 //!   idiom-anchor stamps (a fused sequence stamps its ANCHOR source
@@ -119,6 +119,10 @@ pub enum OpClass {
     Extend,
     /// Bit counting (popcount / leading / trailing zeros).
     BitCount,
+    /// One CRC-32 step (`Crc32`, the `llvm.aarch64.crc32*` intrinsics): a
+    /// FEAT_CRC32 instruction, or its baseline mask/negate/shift/XOR
+    /// expansion when the function does not admit the feature.
+    Checksum,
     /// Bitfield extract/insert.
     BitField,
     /// Truncation / bitcast (same-size reinterpretation).
@@ -188,7 +192,16 @@ pub fn classify_lir_opcode(opcode: &LirOpcode) -> OpClass {
         | O::Assert => OpClass::Guard,
         O::Bnot | O::Band | O::Bor | O::Bxor | O::BandNot | O::BorNot => OpClass::Bitwise,
         O::CtPop => OpClass::BitCount,
-        O::Fneg | O::Fabs | O::Fsqrt | O::Ffloor | O::Fceil | O::Ftrunc => OpClass::FpArith,
+        O::Crc32 { .. } => OpClass::Checksum,
+        O::Fneg
+        | O::Fabs
+        | O::Fsqrt
+        | O::Ffloor
+        | O::Fceil
+        | O::Ftrunc
+        | O::Aarch64FmaddAsm
+        | O::Aarch64FsqrtAsm
+        | O::Aarch64FrintnAsm => OpClass::FpArith,
         O::Ishl | O::Ushr | O::Sshr => OpClass::Shift,
         O::Sextend { .. } | O::Uextend { .. } => OpClass::Extend,
         O::ExtractBits { .. } | O::SextractBits { .. } | O::InsertBits { .. } => OpClass::BitField,
@@ -257,6 +270,7 @@ pub fn classify_lir_opcode(opcode: &LirOpcode) -> OpClass {
         | O::FPTrunc => OpClass::FpConvert,
         O::Trunc { .. } | O::Bitcast { .. } => OpClass::Reinterpret,
         O::GlobalRef { .. }
+        | O::FunctionAddr { .. }
         | O::ExternRef { .. }
         | O::TlsRef { .. }
         | O::StackAddr { .. }
@@ -326,6 +340,9 @@ pub fn classify_lir_opcode(opcode: &LirOpcode) -> OpClass {
 ///   idioms for fabs/fneg and min/max NaN blends).
 /// * Vector sources are permissive except `IntDiv`: baseline SSE2 lowerings
 ///   scalarize lanes through scalar mul/add/shift/pack sequences.
+/// * `Extend` allows `IntNeg`: the sign extension of a `B1` (`Sextend` from
+///   `B1`, LLVM's `sext i1`) makes `true` all ones, which x86-64 selects as
+///   `-zext(b)`, a `movzx` and a `neg` both stamped with the extension.
 /// * `Const`/`Copy` sources allow NO definite-class emission: materializing
 ///   a constant or renaming a value never needs semantic arithmetic beyond
 ///   the exempted glue.
@@ -352,12 +369,18 @@ pub fn compatible(source: OpClass, emitted: OpClass) -> bool {
         ),
         Bitwise => matches!(emitted, Bitwise | VecBitwise | IntNeg),
         Shift => matches!(emitted, Shift | Bitwise | IntSub | Select),
-        Extend => matches!(emitted, Bitwise | Shift),
+        // `IntNeg`: a `bool`'s sign extension is `-zext(b)` (x86-64 `movzx;
+        // neg`, `select_extend`), the negation stamped with the `Sextend`.
+        Extend => matches!(emitted, Bitwise | Shift | IntNeg),
         BitCount => matches!(
             emitted,
             BitCount | Shift | Bitwise | IntAdd | IntSub | IntMul
         ),
         BitField => matches!(emitted, Shift | Bitwise),
+        // The CRC32 instruction has no definite emitted class (it is checked
+        // by attribution alone); its baseline expansion is per bit
+        // `AND #1`, `NEG`, `AND poly`, `LSR #1`, `EOR`.
+        Checksum => matches!(emitted, Checksum | Bitwise | Shift | IntNeg | IntSub),
         Reinterpret => matches!(emitted, Bitwise | Shift | FpConvert),
         IntCmp => matches!(emitted, IntSub | Bitwise | Select),
         Overflow => matches!(
@@ -374,17 +397,40 @@ pub fn compatible(source: OpClass, emitted: OpClass) -> bool {
             emitted,
             FpConvert | FpArith | FpCmp | IntAdd | IntSub | Shift | Bitwise | Select | VecBitwise
         ),
-        VecInt | VecFp => !matches!(emitted, IntDiv),
+        // `Atomic` is excluded for the same reason it is excluded everywhere
+        // outside the `Atomic` row: a vector LIR instruction never lowers to a
+        // LOCK compare-and-swap. This row is written as a NEGATIVE match, so
+        // before the exclusion it silently admitted every class the x86 mapper
+        // might ever report — including `Atomic`, the moment `CmpxchgNarrow`
+        // started reporting it. A blanket accept is exactly where a new emitted
+        // class hides.
+        VecInt | VecFp => !matches!(emitted, IntDiv | Atomic),
         // IntSub belongs here for the same reason it is in the MemLoad/MemStore
         // rows: a StackAddr materializes as FP MINUS offset (`SubRI`) whenever
         // the slot sits below the frame pointer, so a subtract is a legitimate
-        // address-calculation lowering, not a misattribution.
-        AddrCalc => matches!(emitted, IntAdd | IntSub | IntMul | Shift),
+        // address-calculation lowering, not a misattribution. `FusedMulAdd`:
+        // a byte-stride `ArrayGep` whose offset is a one-use `Imul` selects
+        // `base + index * stride` as one AArch64 MADD stamped with the
+        // address (the IntMul and IntAdd this row already admits, fused).
+        AddrCalc => matches!(emitted, IntAdd | IntSub | IntMul | Shift | FusedMulAdd),
         MemLoad | MemStore => matches!(
             emitted,
             IntAdd | IntSub | IntMul | Shift | Bitwise | VecInt | VecBitwise | VecFp
         ),
-        Atomic => matches!(emitted, IntAdd | IntSub | IntNeg | Bitwise | Shift | Select),
+        // `Atomic` belongs in its OWN row: the x86 narrow `Cmpxchg8`/`Cmpxchg16`
+        // reconstruction reports a DEFINITE `Atomic` emitted class, and an
+        // atomic LIR instruction lowering to an atomic machine instruction is
+        // the canonical case. Every other source row REJECTS `Atomic` — but
+        // only since the `VecInt | VecFp` row's blanket `!matches!(…, IntDiv)`
+        // was narrowed above; as first written it admitted a narrow CAS
+        // stamped from a vector instruction, so "no other row gains Atomic"
+        // was a false guarantee about true-by-luck code. `tv2_no_non_atomic_
+        // source_admits_an_atomic_emission` now enumerates the whole column
+        // instead of trusting the prose.
+        Atomic => matches!(
+            emitted,
+            Atomic | IntAdd | IntSub | IntNeg | Bitwise | Shift | Select
+        ),
         MemIntrinsic => matches!(
             emitted,
             IntAdd | IntSub | Shift | Bitwise | VecInt | VecBitwise | VecFp | Select
@@ -402,8 +448,8 @@ pub fn compatible(source: OpClass, emitted: OpClass) -> bool {
 // Replayed-LIR source index
 // ---------------------------------------------------------------------------
 
-/// One indexed LIR source instruction: recomputed digest + class + a display
-/// name for diagnostics.
+/// One indexed LIR source instruction: recomputed digest + class + the typed
+/// opcode + a display name for diagnostics.
 #[derive(Debug, Clone)]
 pub struct LirSourceInst {
     /// Recomputed [`trust_cg_lower::instructions::Instruction::lowering_digest`].
@@ -412,6 +458,97 @@ pub struct LirSourceInst {
     pub class: OpClass,
     /// `Debug` rendering of the opcode, for mismatch diagnostics.
     pub opcode_debug: String,
+    /// The TYPED source opcode, carried verbatim.
+    ///
+    /// TV-2's [`OpClass`] is deliberately coarse, and that coarseness is the
+    /// hole a condition-carrying emission falls through: `Icmp { cond: SLT }`
+    /// and `Icmp { cond: UGT }` are BOTH `OpClass::IntCmp`, so a consumer that
+    /// reads the condition off the EMITTED instruction and then looks up a
+    /// theorem for that condition never compares it against the source at all
+    /// — it self-attests. The typed opcode is what lets a per-arch binding
+    /// require that the emitted condition is one a correct lowering of THIS
+    /// source instruction can carry.
+    ///
+    /// The digest covers only the opcode's `Debug` rendering and the operand
+    /// ARITIES, so it identifies the instruction but does not let a consumer
+    /// read its operation back out. TV-1-EXTENDED operand binding likewise
+    /// needs the typed opcode on the SPEC side: a reconstruction that puts the
+    /// source operation on the trust-ir side by inferring it FROM the emitted
+    /// opcode cannot refute a wrong selection, and this is what lets the
+    /// verifier require the inferred operation to equal the replayed one.
+    pub opcode: LirOpcode,
+    /// For a `Select`, the opcode DEFINING its boolean condition operand in the
+    /// same block, when there is one.
+    ///
+    /// AArch64 ISel may FOLD that defining compare into the select's own flag
+    /// test (`detect_select_cond_folds`), in which case the emitted `CSEL`
+    /// carries the FOLDED compare's condition code rather than the `Select`'s
+    /// own — so a binding that wants to attest a CSEL's condition needs the
+    /// defining compare, not just the select. Only the same-block definition is
+    /// recorded, because that is the only one ISel's fold analysis can see.
+    pub cond_def_opcode: Option<LirOpcode>,
+    /// The replayed source instruction's argument values, in order.
+    pub args: Vec<trust_cg_lower::instructions::Value>,
+    /// The replayed source instruction's result values, in order.
+    pub results: Vec<trust_cg_lower::instructions::Value>,
+    /// Where each ARGUMENT of this instruction comes from and where its single
+    /// RESULT goes — the LIR half of anchoring a MULTI-REGISTER value's limbs
+    /// without asking instruction selection which register holds which limb.
+    /// See [`LirValueFlow`].
+    pub value_flow: LirValueFlow,
+}
+
+/// Where a LIR value comes from, as far as [`LirValueFlow`] records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LirValueOrigin {
+    /// The `index`-th FORMAL PARAMETER of the function: a parameter of its
+    /// ENTRY block. A parameter of any other block is a join, not a formal,
+    /// and is [`Self::Unknown`].
+    Formal {
+        /// Position in the entry block's parameter list, which is the
+        /// function signature's parameter order.
+        index: u32,
+    },
+    /// The single result of the instruction at these TV-1 coordinates.
+    Def {
+        /// The defining instruction.
+        id: SourceInstId,
+    },
+    /// Anything else — a join parameter, one of several results, or a value
+    /// with no definition in this function. Bindings must fail closed on it.
+    Unknown,
+}
+
+/// The value-flow facts of ONE LIR instruction, read off the exact LIR
+/// function handed to instruction selection.
+///
+/// # Why a binding needs this
+///
+/// The AArch64 machine IR does not label which register holds which LIMB of a
+/// multi-register value: `select_i128_*` records `lo`/`hi` only in the
+/// selector's private value map, which is the very thing under test. A binding
+/// that credits a whole-chain i128 theorem must therefore derive, from outside
+/// ISel, that the chain READS the source operand's limbs and WRITES the result's
+/// limbs in the roles the theorem names — the arm-pair swap `2e194289f`
+/// disclosed exchanges exactly those roles while every per-instruction fact
+/// stays true. The LIR side of that derivation is here: which formal parameter
+/// or defining instruction each argument is, and whether the result's ONLY use
+/// is the function's `Return` of exactly that value (whose limb registers the
+/// calling convention, not ISel, fixes).
+#[derive(Debug, Clone, Default)]
+pub struct LirValueFlow {
+    /// Per argument, in order.
+    pub args: Vec<LirValueOrigin>,
+    /// Per argument, its LIR type: recorded, a block parameter's, or inferred
+    /// by an unambiguous typing rule (see `LirSourceIndex::build`); `None`
+    /// when none of those applies.
+    pub arg_types: Vec<Option<trust_cg_lower::Type>>,
+    /// `Some(id)` when this instruction has exactly ONE result, that result
+    /// has exactly ONE use in the whole function, and that use is the
+    /// `Return` at `id` whose argument list is exactly `[result]`.
+    pub sole_result_returned_by: Option<SourceInstId>,
+    /// The function's signature, shared by every instruction of it.
+    pub signature: std::sync::Arc<trust_cg_lower::function::Signature>,
 }
 
 /// Index of the EXACT LIR function that was handed to instruction selection,
@@ -425,34 +562,214 @@ pub struct LirSourceInst {
 pub struct LirSourceIndex {
     /// Name of the indexed LIR function (guards caller-side zip alignment).
     pub function_name: String,
+    /// The LIR entry block's coordinate (`SourceInstId::block`).
+    entry_block: u32,
     insts: HashMap<(u32, u32), LirSourceInst>,
 }
 
 impl LirSourceIndex {
     /// Build the index from the LIR function that was handed to ISel.
     pub fn build(func: &trust_cg_lower::Function) -> Self {
+        use trust_cg_lower::instructions::Value;
         let mut insts = HashMap::new();
+        // Function-wide value flow, for `LirValueFlow`. Built once; each
+        // instruction then reads its own arguments and result out of it.
+        let signature = std::sync::Arc::new(func.signature.clone());
+        let formal: HashMap<Value, u32> = func
+            .blocks
+            .get(&func.entry_block)
+            .map(|entry| {
+                entry
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (value, _))| (*value, index as u32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut single_def: HashMap<Value, SourceInstId> = HashMap::new();
+        let mut uses: HashMap<Value, Vec<SourceInstId>> = HashMap::new();
         for (block, bb) in &func.blocks {
             for (index, inst) in bb.instructions.iter().enumerate() {
+                let id = SourceInstId {
+                    block: block.0,
+                    index: index as u32,
+                };
+                if let [result] = inst.results.as_slice() {
+                    single_def.insert(*result, id);
+                }
+                for arg in &inst.args {
+                    uses.entry(*arg).or_default().push(id);
+                }
+                // A value carried in an opcode PAYLOAD is a use too. Counting
+                // it even when it is also listed in `args` can only make a
+                // result look MORE used, which fails the sole-use test closed.
+                if let LirOpcode::Brif { cond, .. } = &inst.opcode {
+                    uses.entry(*cond).or_default().push(id);
+                }
+            }
+        }
+        // Block parameters carry their own types (a formal's type lives on the
+        // entry block's parameter); `value_types` carries what the frontend
+        // recorded. A production LIR records NO type for most instruction
+        // results (measured: the `Band` feeding `<u128>::unchecked_shl`'s
+        // shift has none), so a result's type is otherwise INFERRED — but only
+        // by a typing rule that needs no guesswork: an `Iconst` states its
+        // type, and the same-typed integer operations take their operands'
+        // one type, required to agree when there are two. Anything else stays
+        // unknown, and a binding that needs the type refuses.
+        let mut known: HashMap<Value, trust_cg_lower::Type> = func
+            .blocks
+            .values()
+            .flat_map(|bb| bb.params.iter().map(|(value, ty)| (*value, ty.clone())))
+            .collect();
+        for (value, ty) in &func.value_types {
+            known.insert(*value, ty.clone());
+        }
+        // Definitions precede uses within a block but not across the block
+        // map's order, so iterate to a fixpoint (bounded by the block count).
+        for _ in 0..=func.blocks.len() {
+            let mut grew = false;
+            for bb in func.blocks.values() {
+                for inst in &bb.instructions {
+                    let [result] = inst.results.as_slice() else {
+                        continue;
+                    };
+                    if known.contains_key(result) {
+                        continue;
+                    }
+                    let inferred = match &inst.opcode {
+                        LirOpcode::Iconst { ty, .. } => Some(ty.clone()),
+                        LirOpcode::Copy
+                        | LirOpcode::Iadd
+                        | LirOpcode::Isub
+                        | LirOpcode::Imul
+                        | LirOpcode::Udiv
+                        | LirOpcode::Sdiv
+                        | LirOpcode::Urem
+                        | LirOpcode::Srem
+                        | LirOpcode::Ineg
+                        | LirOpcode::Bnot
+                        | LirOpcode::Band
+                        | LirOpcode::Bor
+                        | LirOpcode::Bxor
+                        | LirOpcode::BandNot
+                        | LirOpcode::BorNot => {
+                            let mut types = inst.args.iter().map(|arg| known.get(arg));
+                            match (types.next(), types.next(), types.next()) {
+                                (Some(Some(a)), None, None) => Some(a.clone()),
+                                (Some(Some(a)), Some(Some(b)), None) if a == b => Some(a.clone()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(ty) = inferred {
+                        known.insert(*result, ty);
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let type_of = |value: &Value| known.get(value).cloned();
+        let origin = |value: &Value| {
+            if let Some(index) = formal.get(value) {
+                LirValueOrigin::Formal { index: *index }
+            } else if let Some(id) = single_def.get(value) {
+                LirValueOrigin::Def { id: *id }
+            } else {
+                LirValueOrigin::Unknown
+            }
+        };
+        let sole_return = |inst: &trust_cg_lower::instructions::Instruction| {
+            let [result] = inst.results.as_slice() else {
+                return None;
+            };
+            let [user] = uses.get(result)?.as_slice() else {
+                return None;
+            };
+            let returning = func
+                .blocks
+                .get(&trust_cg_lower::instructions::Block(user.block))?
+                .instructions
+                .get(user.index as usize)?;
+            (matches!(returning.opcode, LirOpcode::Return)
+                && returning.args.as_slice() == [*result])
+            .then_some(*user)
+        };
+        for (block, bb) in &func.blocks {
+            // Per-BLOCK single-result def sites, for `cond_def_opcode`. Block
+            // scope is not a shortcut: AArch64's select-condition fold analysis
+            // resolves the condition's def through its own per-block
+            // `def_site` map and skips a condition "defined in another block —
+            // not foldable", so a cross-block definition cannot be the one that
+            // was folded. Matching that scope keeps the recorded fact exactly
+            // as strong as the ISel decision it must attest.
+            let mut def_site: HashMap<trust_cg_lower::instructions::Value, usize> = HashMap::new();
+            for (index, inst) in bb.instructions.iter().enumerate() {
+                if inst.results.len() == 1 {
+                    def_site.insert(inst.results[0], index);
+                }
+            }
+            for (index, inst) in bb.instructions.iter().enumerate() {
+                let cond_def_opcode = inst.args.first().and_then(|arg| {
+                    def_site
+                        .get(arg)
+                        .filter(|&&def| def < index)
+                        .map(|&def| bb.instructions[def].opcode.clone())
+                });
                 insts.insert(
                     (block.0, index as u32),
                     LirSourceInst {
                         digest: inst.lowering_digest(),
                         class: classify_lir_opcode(&inst.opcode),
                         opcode_debug: format!("{:?}", inst.opcode),
+                        opcode: inst.opcode.clone(),
+                        cond_def_opcode,
+                        args: inst.args.clone(),
+                        results: inst.results.clone(),
+                        value_flow: LirValueFlow {
+                            args: inst.args.iter().map(origin).collect(),
+                            arg_types: inst.args.iter().map(type_of).collect(),
+                            sole_result_returned_by: sole_return(inst),
+                            signature: signature.clone(),
+                        },
                     },
                 );
             }
         }
         Self {
             function_name: func.name.clone(),
+            entry_block: func.entry_block.0,
             insts,
         }
+    }
+
+    /// The LIR entry block's TV-1 block coordinate.
+    pub fn entry_block(&self) -> u32 {
+        self.entry_block
     }
 
     /// Look up the source instruction at TV-1 coordinates.
     pub fn get(&self, id: SourceInstId) -> Option<&LirSourceInst> {
         self.insts.get(&(id.block, id.index))
+    }
+
+    /// Every indexed source instruction with its TV-1 coordinates, in
+    /// `(block, index)` order. A consumer that must account for each source
+    /// instruction of a kind (the trap-guard source accounting) enumerates
+    /// the spec side here rather than trusting what the machine side stamps.
+    pub fn sorted(&self) -> Vec<(SourceInstId, &LirSourceInst)> {
+        let mut entries: Vec<_> = self
+            .insts
+            .iter()
+            .map(|(&(block, index), inst)| (SourceInstId { block, index }, inst))
+            .collect();
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        entries
     }
 }
 
@@ -593,7 +910,7 @@ pub const AARCH64_PROVENANCE_XCHECK_DEFAULT: ProvenanceXCheckMode = ProvenanceXC
 /// (`off`/`0`/`false`, `warn`, `enforce`/`on`/`1`/`true`); unset or
 /// unrecognized values use the per-arch default.
 pub fn provenance_xcheck_mode(arch_default: ProvenanceXCheckMode) -> ProvenanceXCheckMode {
-    match std::env::var("TCG_PROVENANCE_XCHECK") {
+    match trust_cg_process_env::var("TCG_PROVENANCE_XCHECK") {
         Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
             "off" | "0" | "false" => ProvenanceXCheckMode::Off,
             "warn" | "warn-only" | "warnonly" => ProvenanceXCheckMode::Warn,
@@ -642,6 +959,42 @@ pub fn record_provenance_xcheck_hit(
     );
 }
 
+/// True when `TCG_TRACE_PROVENANCE=rows` requests one line PER EMITTED
+/// INSTRUCTION (stamp + verdict strength) rather than only the per-function
+/// attributed/synthetic counts.
+///
+/// This is the diagnostic that answers "which residual statistical rows even
+/// HAVE a source instruction to bind to": `TCG_TRACE_STATISTICAL` names the
+/// obligation but not the stamp, so a route that needs exact source/operand
+/// provenance cannot tell an attributed row from ABI glue without it.
+pub fn provenance_row_trace_enabled() -> bool {
+    matches!(std::env::var("TCG_TRACE_PROVENANCE").as_deref(), Ok("rows"))
+}
+
+/// One `[TCG-TRACE-PROVENANCE-ROW]` line for a single emitted instruction.
+/// `strength` is the caller's rendering of the verdict the row carries.
+pub fn trace_instruction_row(
+    arch: &str,
+    function_name: &str,
+    inst_index: usize,
+    opcode_debug: &str,
+    provenance: &LoweringProvenance,
+    verdict: &str,
+) {
+    if !provenance_row_trace_enabled() {
+        return;
+    }
+    let stamp = match provenance {
+        LoweringProvenance::SourceInst { id, digest, .. } => {
+            format!("source={id} digest={:#018x}", digest.0)
+        }
+        LoweringProvenance::Synthetic { reason } => format!("synthetic={reason:?}"),
+    };
+    eprintln!(
+        "[TCG-TRACE-PROVENANCE-ROW] arch={arch} fn={function_name} inst#{inst_index}          opcode={opcode_debug} {stamp} verdict={verdict}"
+    );
+}
+
 /// Print the per-function trace summary when `TCG_TRACE_PROVENANCE=1`.
 pub fn trace_function_summary(
     arch: &str,
@@ -668,6 +1021,201 @@ mod tests {
     use trust_cg_lower::function::Signature;
     use trust_cg_lower::instructions::{Block, Instruction, Value};
     use trust_cg_lower::types::Type;
+
+    /// Every [`OpClass`] that can appear in SOURCE position, so the `Atomic`
+    /// column can be enumerated instead of asserted in prose.
+    const ALL_OP_CLASSES: &[OpClass] = &[
+        OpClass::Const,
+        OpClass::Copy,
+        OpClass::IntAdd,
+        OpClass::IntSub,
+        OpClass::IntMul,
+        OpClass::IntNeg,
+        OpClass::IntDiv,
+        OpClass::Bitwise,
+        OpClass::Shift,
+        OpClass::Extend,
+        OpClass::BitCount,
+        OpClass::Checksum,
+        OpClass::BitField,
+        OpClass::Reinterpret,
+        OpClass::IntCmp,
+        OpClass::Overflow,
+        OpClass::Select,
+        OpClass::FusedMulAdd,
+        OpClass::FpArith,
+        OpClass::FpCmp,
+        OpClass::FpConvert,
+        OpClass::VecInt,
+        OpClass::VecBitwise,
+        OpClass::VecFp,
+        OpClass::AddrCalc,
+        OpClass::MemLoad,
+        OpClass::MemStore,
+        OpClass::Atomic,
+        OpClass::MemIntrinsic,
+        OpClass::CallLike,
+        OpClass::ControlFlow,
+        OpClass::Guard,
+    ];
+
+    /// `LirValueFlow` reads each argument's origin and type, and a result's
+    /// sole use, off the LIR — including a type the frontend did NOT record,
+    /// inferred by the operation's own typing rule (the production shape: a
+    /// masked shift count with no `value_types` entry).
+    #[test]
+    fn value_flow_reads_origins_types_and_the_sole_return() {
+        let mut func = trust_cg_lower::Function::new(
+            "flow",
+            Signature {
+                params: vec![Type::I128, Type::I32],
+                returns: vec![Type::I128],
+            },
+        );
+        let inst = |opcode, args: Vec<Value>, results: Vec<Value>| Instruction {
+            opcode,
+            args,
+            results,
+        };
+        func.blocks.insert(
+            Block(0),
+            trust_cg_lower::function::BasicBlock {
+                params: vec![(Value(0), Type::I128), (Value(1), Type::I32)],
+                instructions: vec![
+                    inst(
+                        LirOpcode::Iconst {
+                            ty: Type::I32,
+                            imm: 127,
+                        },
+                        vec![],
+                        vec![Value(4)],
+                    ),
+                    inst(LirOpcode::Band, vec![Value(1), Value(4)], vec![Value(5)]),
+                    inst(LirOpcode::Ishl, vec![Value(0), Value(5)], vec![Value(6)]),
+                    inst(LirOpcode::Return, vec![Value(6)], vec![]),
+                ],
+                ..Default::default()
+            },
+        );
+        func.block_order = vec![Block(0)];
+        assert!(func.value_types.is_empty());
+        let index = LirSourceIndex::build(&func);
+        let shift = index.get(SourceInstId { block: 0, index: 2 }).unwrap();
+        assert_eq!(
+            shift.value_flow.args,
+            vec![
+                LirValueOrigin::Formal { index: 0 },
+                LirValueOrigin::Def {
+                    id: SourceInstId { block: 0, index: 1 }
+                }
+            ]
+        );
+        assert_eq!(
+            shift.value_flow.arg_types,
+            vec![Some(Type::I128), Some(Type::I32)]
+        );
+        assert_eq!(
+            shift.value_flow.sole_result_returned_by,
+            Some(SourceInstId { block: 0, index: 3 })
+        );
+        // A second use of the result: no longer the sole return.
+        func.blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .instructions
+            .insert(3, inst(LirOpcode::Copy, vec![Value(6)], vec![Value(7)]));
+        let index = LirSourceIndex::build(&func);
+        let shift = index.get(SourceInstId { block: 0, index: 2 }).unwrap();
+        assert_eq!(shift.value_flow.sole_result_returned_by, None);
+        // Operands of DIFFERENT types give no inferred type.
+        let mut mixed = func.clone();
+        mixed.blocks.get_mut(&Block(0)).unwrap().instructions[0].opcode = LirOpcode::Iconst {
+            ty: Type::I64,
+            imm: 127,
+        };
+        let index = LirSourceIndex::build(&mixed);
+        let shift = index.get(SourceInstId { block: 0, index: 2 }).unwrap();
+        assert_eq!(shift.value_flow.arg_types[1], None);
+    }
+
+    /// TV-2: `Atomic` is a DEFINITE emitted class only since the x86 narrow
+    /// `Cmpxchg8`/`Cmpxchg16` credit started reporting it, and the guarantee
+    /// written above the `Atomic` row — "no OTHER source row gains `Atomic`" —
+    /// is only true if EVERY other row rejects it. The `VecInt | VecFp` row is
+    /// written as a negative match and admitted it until that row was
+    /// narrowed, so this enumerates the column rather than trusting the prose.
+    /// A new source row that accepts `Atomic` has to say so here.
+    #[test]
+    fn tv2_no_non_atomic_source_admits_an_atomic_emission() {
+        for &source in ALL_OP_CLASSES {
+            let admitted = compatible(source, OpClass::Atomic);
+            if source == OpClass::Atomic {
+                assert!(
+                    admitted,
+                    "an ATOMIC LIR source lowering to an atomic machine \
+                     instruction is the canonical case and must stay admitted"
+                );
+            } else {
+                assert!(
+                    !admitted,
+                    "{source:?} must NOT admit an emitted Atomic: a LOCK CMPXCHG \
+                     stamped from a {source:?} LIR instruction is a \
+                     misattribution and must fail the TV-2 cross-check closed"
+                );
+            }
+        }
+    }
+
+    /// The sweep above is only worth anything if `ALL_OP_CLASSES` is COMPLETE.
+    /// The match below has no wildcard, so ADDING an `OpClass` variant is a
+    /// COMPILE error here; the length pin then forces it into the list too. A
+    /// new class therefore cannot enter the matrix without someone deciding
+    /// whether it may emit an `Atomic`.
+    #[test]
+    fn tv2_op_class_enumeration_is_exhaustive() {
+        for &c in ALL_OP_CLASSES {
+            match c {
+                OpClass::Const
+                | OpClass::Copy
+                | OpClass::IntAdd
+                | OpClass::IntSub
+                | OpClass::IntMul
+                | OpClass::IntNeg
+                | OpClass::IntDiv
+                | OpClass::Bitwise
+                | OpClass::Shift
+                | OpClass::Extend
+                | OpClass::BitCount
+                | OpClass::Checksum
+                | OpClass::BitField
+                | OpClass::Reinterpret
+                | OpClass::IntCmp
+                | OpClass::Overflow
+                | OpClass::Select
+                | OpClass::FusedMulAdd
+                | OpClass::FpArith
+                | OpClass::FpCmp
+                | OpClass::FpConvert
+                | OpClass::VecInt
+                | OpClass::VecBitwise
+                | OpClass::VecFp
+                | OpClass::AddrCalc
+                | OpClass::MemLoad
+                | OpClass::MemStore
+                | OpClass::Atomic
+                | OpClass::MemIntrinsic
+                | OpClass::CallLike
+                | OpClass::ControlFlow
+                | OpClass::Guard => {}
+            }
+        }
+        assert_eq!(
+            ALL_OP_CLASSES.len(),
+            32,
+            "OpClass gained or lost a variant: extend ALL_OP_CLASSES (and decide \
+             whether the new source class may emit an Atomic)"
+        );
+    }
 
     fn lir_with_iconst_imul() -> trust_cg_lower::Function {
         let mut func = trust_cg_lower::Function::new(
@@ -744,6 +1292,40 @@ mod tests {
         assert!(cross_check_inst(&stamp, Some(OpClass::Shift), "ShlRI", &index).is_none());
         // No definite emitted class: only integrity checks run, which pass.
         assert!(cross_check_inst(&stamp, None, "CmpRR", &index).is_none());
+    }
+
+    /// AArch64 selects a GEP's `Imul` feeding a byte-stride `ArrayGep` as one
+    /// MADD stamped with the `ArrayGep` (LD-96).
+    #[test]
+    fn madd_stamped_with_a_byte_address_passes() {
+        let mut lir = lir_with_iconst_imul();
+        let block = lir.blocks.get_mut(&Block(0)).expect("block 0");
+        block.instructions.insert(
+            2,
+            Instruction {
+                opcode: LirOpcode::ArrayGep { elem_ty: Type::I8 },
+                args: vec![Value(0), Value(2)],
+                results: vec![Value(3)],
+            },
+        );
+        block.instructions[3].args = vec![Value(3)];
+        let index = LirSourceIndex::build(&lir);
+        let address = source_stamp(&lir, 0, 2);
+        assert!(
+            cross_check_inst(&address, Some(OpClass::FusedMulAdd), "Madd", &index).is_none(),
+            "MADD computes the address its ArrayGep names"
+        );
+        let divide = cross_check_inst(&address, Some(OpClass::IntDiv), "SDiv", &index)
+            .expect("an address never divides");
+        assert_eq!(divide.kind, ProvenanceMismatchKind::ClassMismatch);
+        let constant = cross_check_inst(
+            &source_stamp(&lir, 0, 0),
+            Some(OpClass::FusedMulAdd),
+            "Madd",
+            &index,
+        )
+        .expect("a constant never needs a MADD");
+        assert_eq!(constant.kind, ProvenanceMismatchKind::ClassMismatch);
     }
 
     #[test]
@@ -828,14 +1410,20 @@ mod tests {
         // The class the emission implements must relate to the source.
         assert!(compatible(IntAdd, IntAdd));
         assert!(!compatible(IntAdd, IntMul)); // scalar mul under a plain add
+        assert!(!compatible(IntAdd, Shift)); // add-self rewrite needs a checked rebind
         assert!(compatible(IntAdd, FusedMulAdd)); // aarch64 MADD anchor at the Iadd
+        assert!(compatible(AddrCalc, FusedMulAdd)); // aarch64 MADD anchor at a byte ArrayGep
+        assert!(!compatible(AddrCalc, IntDiv)); // an address never divides
         assert!(compatible(IntMul, Shift)); // power-of-two strength reduction
         assert!(compatible(IntMul, IntAdd)); // i128 multiply partial-product accumulation
+        assert!(!compatible(IntMul, IntNeg)); // mul by -1 rewrite needs a checked rebind
         assert!(!compatible(IntMul, IntDiv)); // a divide cannot implement a multiply
         assert!(!compatible(IntMul, FpArith)); // an FP op cannot implement an integer multiply
         assert!(compatible(Shift, IntSub)); // i128 var-shift: 64 - count / count - 64
         assert!(compatible(Shift, Select)); // i128 var-shift: CMOV half/zero selection
         assert!(!compatible(Shift, IntMul)); // a shift never needs a multiply
+        assert!(compatible(Extend, IntNeg)); // a bool's sign extension: movzx; neg
+        assert!(!compatible(Extend, IntAdd)); // an extension never adds
         assert!(compatible(IntDiv, IntMul)); // magic-number division
         assert!(!compatible(Bitwise, IntAdd));
         assert!(compatible(Bitwise, VecBitwise)); // v128-typed Band -> PAND

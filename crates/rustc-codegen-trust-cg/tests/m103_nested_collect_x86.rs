@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: the `Vec<T>` `collect` element-type guard.
 //
@@ -46,65 +50,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run nested-collect test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -135,9 +88,8 @@ fn try_compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -155,7 +107,11 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>, opt: &str)
     assert!(
         output.status.success(),
         "compile of `{name}` failed ({} backend, -Copt-level={opt}). stderr: <<<{}>>>",
-        if backend.is_some() { "trust-cg" } else { "llvm" },
+        if backend.is_some() {
+            "trust-cg"
+        } else {
+            "llvm"
+        },
         String::from_utf8_lossy(&output.stderr)
     );
     bin
@@ -271,7 +227,11 @@ fn non_integer_scalar_collect_fails_closed() {
     ];
     for (name, src, expected) in float_ok {
         let llvm = compile(&dir, &format!("{name}_llvm"), src, None, "3");
-        assert_eq!(run_exit_code(&llvm), *expected, "LLVM `{name}` should be {expected}");
+        assert_eq!(
+            run_exit_code(&llvm),
+            *expected,
+            "LLVM `{name}` should be {expected}"
+        );
         for opt in ["0", "3"] {
             let tcg = compile(&dir, &format!("{name}_o{opt}_tcg"), src, Some(&dylib), opt);
             assert_eq!(
@@ -313,7 +273,9 @@ fn single_level_integer_collect_still_matches_llvm_o0() {
         ),
         (
             "map_i64",
-            format!("fn main() {{ let v: Vec<i64> = (0..10i64).map(|x| x * 2).collect(); {sum_idx} }}"),
+            format!(
+                "fn main() {{ let v: Vec<i64> = (0..10i64).map(|x| x * 2).collect(); {sum_idx} }}"
+            ),
         ),
         (
             "filter_i64",
@@ -323,15 +285,21 @@ fn single_level_integer_collect_still_matches_llvm_o0() {
         ),
         (
             "i32_collect",
-            format!("fn main() {{ let v: Vec<i32> = (0..12i32).map(|x| x + 1).collect(); {sum_idx} }}"),
+            format!(
+                "fn main() {{ let v: Vec<i32> = (0..12i32).map(|x| x + 1).collect(); {sum_idx} }}"
+            ),
         ),
         (
             "u32_collect",
-            format!("fn main() {{ let v: Vec<u32> = (0..12u32).map(|x| x + 1).collect(); {sum_idx} }}"),
+            format!(
+                "fn main() {{ let v: Vec<u32> = (0..12u32).map(|x| x + 1).collect(); {sum_idx} }}"
+            ),
         ),
         (
             "u8_collect",
-            format!("fn main() {{ let v: Vec<u8> = (0..10u8).map(|x| x + 1).collect(); {sum_idx} }}"),
+            format!(
+                "fn main() {{ let v: Vec<u8> = (0..10u8).map(|x| x + 1).collect(); {sum_idx} }}"
+            ),
         ),
         (
             "copied_slice",

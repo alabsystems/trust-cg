@@ -1215,7 +1215,7 @@ impl AsyncCompileService {
             if !plan_aware && queued.requires_plan_worker {
                 return None;
             }
-            let queued = self.queued.pop_front().expect("queued front exists");
+            let queued = self.queued.pop_front()?;
             let requires_plan_worker = queued.requires_plan_worker;
             let plan = queued.plan;
             let request = plan.request();

@@ -1,8 +1,7 @@
-# The ordinary developer and public-release lane is deterministic and usable,
-# but makes no Trust-verification claim. Trust verification remains an explicit
-# gate until scripts/check_trust_default_authority.py certifies one immutable
-# sysroot and strict, non-deauthorized policy for every compiled unit.
+# Owner directive 2026-09-28: ALab systems build with the Trust toolchain.
+# This file only selects the compiler; targo chooses each invocation's lane
+# (`targo --unverified` or `targo trust`), so it makes no verification claim
+# (scripts/check_trust_default_authority.py: a Trust toolchain selection).
+# The stock 1.97.1 pin it replaces: git show f16cc44e0:rust-toolchain.toml
 [toolchain]
-channel = "1.97.1"
-profile = "minimal"
-components = ["rustfmt", "clippy"]
+channel = "trust"

@@ -8,7 +8,12 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use super::*;
-use trust_cg_ir::{BlockId, RegClass, Signature, VReg};
+use trust_cg_ir::llsc::{LlscOrdering, LlscRmwOp};
+use trust_cg_ir::regs::NZCV;
+use trust_cg_ir::{
+    BlockId, InstFlags, LoweringProvenance, RegClass, Signature, SourceInstDigest, SourceInstId,
+    SourceLoc, TransformKind, TrustIrInstId, VReg,
+};
 
 fn vreg64(id: u32) -> MachOperand {
     MachOperand::VReg(VReg::new(id, RegClass::Gpr64))
@@ -467,4 +472,250 @@ fn rr_arm_refuses_when_the_and_result_is_still_live() {
         assert!(!pass.run(&mut func), "masked value still live: must refuse");
         assert!(!fused(&func));
     });
+}
+
+// These controls exercise the public pass, not just the effects classifier.
+// Their annotations are custody bookkeeping, not checked semantic evidence.
+fn nzcv_observer_fixture(
+    observers: Vec<MachInst>,
+    successor: bool,
+    condition: i64,
+) -> (MachFunction, Vec<InstId>) {
+    let mut func = MachFunction::new("nzcv_observer".into(), Signature::new(vec![], vec![]));
+    let entry = func.entry;
+    let mut ids = Vec::new();
+    for inst in [
+        MachInst::new(AArch64Opcode::AndRI, vec![vreg64(2), vreg64(0), imm(1)]),
+        MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(2), imm(0)]),
+    ] {
+        let id = func.push_inst(inst);
+        func.append_inst(entry, id);
+        ids.push(id);
+    }
+    let observer_block = if successor {
+        let block = func.create_block();
+        let id = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(block)],
+        ));
+        func.append_inst(entry, id);
+        ids.push(id);
+        func.add_edge(entry, block);
+        block
+    } else {
+        entry
+    };
+    for inst in observers.into_iter().chain([
+        MachInst::new(AArch64Opcode::CSet, vec![vreg32(5), imm(condition)]),
+        // A genuine architectural writer bounds the observation interval.
+        MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(9), imm(3)]),
+        MachInst::new(AArch64Opcode::Ret, vec![]),
+    ]) {
+        let id = func.push_inst(inst);
+        func.append_inst(observer_block, id);
+        ids.push(id);
+    }
+    func.try_sync_vreg_counter().expect("bounded fixture arena");
+    (func, ids)
+}
+
+fn nzcv_annotate(func: &mut MachFunction, ids: &[InstId]) -> ProvenanceMap {
+    let mut provenance = ProvenanceMap::new();
+    for (index, &id) in ids.iter().enumerate() {
+        let index = index as u32;
+        let block = func
+            .block_order
+            .iter()
+            .copied()
+            .find(|&block| func.block(block).insts.contains(&id))
+            .expect("every fixture instruction has one block owner");
+        func.set_inst_lowering_provenance(
+            id,
+            LoweringProvenance::SourceInst {
+                id: SourceInstId {
+                    block: block.0,
+                    index,
+                },
+                digest: SourceInstDigest::compute_debug(
+                    &func.inst(id).opcode,
+                    func.inst(id).operands.len(),
+                    0,
+                ),
+                trust_ir_inst: Some(TrustIrInstId(100 + index)),
+            },
+        );
+        func.inst_mut(id).source_loc = Some(SourceLoc {
+            file: 7,
+            line: 20 + index,
+            col: 2,
+        });
+        provenance.record_lowering(
+            TrustIrInstId(100 + index),
+            &[id],
+            PassId::new("original-isel"),
+        );
+    }
+    provenance
+}
+
+fn nzcv_same_provenance(actual: &ProvenanceMap, before: &ProvenanceMap, ids: &[InstId]) {
+    assert_eq!(actual.num_trust_ir_entries(), before.num_trust_ir_entries());
+    assert_eq!(actual.num_mach_entries(), before.num_mach_entries());
+    assert_eq!(actual.num_encoded(), before.num_encoded());
+    for (index, &id) in ids.iter().enumerate() {
+        assert_eq!(
+            format!("{:?}", actual.get_entry(id)),
+            format!("{:?}", before.get_entry(id))
+        );
+        assert_eq!(actual.get_offset(id), before.get_offset(id));
+        let origin = TrustIrInstId(100 + index as u32);
+        assert_eq!(actual.get_mach_insts(origin), before.get_mach_insts(origin));
+    }
+}
+
+fn nzcv_refused_unchanged(mut func: MachFunction, ids: &[InstId]) {
+    let mut provenance = nzcv_annotate(&mut func, ids);
+    let before = format!("{func:?}");
+    let before_provenance = provenance.clone();
+    let mut plain = func.clone();
+    assert!(!AndCmpFuse.run(&mut plain));
+    assert!(!fused(&plain));
+    assert_eq!(format!("{plain:?}"), before);
+    assert!(!AndCmpFuse.run_with_provenance(&mut func, &mut provenance));
+    assert!(!fused(&func));
+    // Includes arena, links, CFG, VReg counter, source locations and lowering
+    // histories; an observer refusal must not partially retire the candidate.
+    assert_eq!(format!("{func:?}"), before);
+    nzcv_same_provenance(&provenance, &before_provenance, ids);
+}
+
+#[test]
+fn public_pass_refuses_mrs_nzcv_and_tpidr_in_same_or_successor_block() {
+    for successor in [false, true] {
+        // NZCV observes the changed carry directly. TPIDR_EL0 does not, but
+        // MRS remains conservatively opaque rather than interpreting sysregs.
+        for system_register in [0xda10, 0xde82] {
+            for stripped_flags in [false, true] {
+                let mut observer =
+                    MachInst::new(AArch64Opcode::Mrs, vec![vreg64(6), imm(system_register)]);
+                if stripped_flags {
+                    observer.flags = InstFlags::EMPTY;
+                }
+                // Keep the MRS result observable through an actual memory
+                // effect, rather than an unused destination. In the NZCV
+                // case the stored C bit would differ after unsafe fusion.
+                let store =
+                    MachInst::new(AArch64Opcode::StrRI, vec![vreg64(6), vreg64(15), imm(0)]);
+                let (func, ids) = nzcv_observer_fixture(vec![observer, store], successor, EQ);
+                nzcv_refused_unchanged(func, &ids);
+            }
+        }
+    }
+}
+
+#[test]
+fn public_pass_never_treats_llsc_add_may_write_as_a_definite_kill() {
+    for successor in [false, true] {
+        for stripped_flags in [false, true] {
+            let mut observer = MachInst::new(
+                AArch64Opcode::LlscRmw64,
+                vec![
+                    vreg64(10),
+                    vreg64(11),
+                    vreg32(12),
+                    vreg64(13),
+                    vreg64(14),
+                    imm(LlscRmwOp::Add.to_imm()),
+                    imm(LlscOrdering::ACQ_REL.to_imm()),
+                ],
+            );
+            if stripped_flags {
+                observer.flags = InstFlags::EMPTY;
+            }
+            assert!(crate::effects::writes_flags(observer.opcode));
+            assert!(!crate::effects::definitely_writes_flags(observer.opcode));
+            let (func, ids) = nzcv_observer_fixture(vec![observer], successor, HS);
+            nzcv_refused_unchanged(func, &ids);
+        }
+    }
+}
+
+#[test]
+fn public_pass_refuses_implicit_nzcv_reads_and_defs_before_killers() {
+    for successor in [false, true] {
+        for observer in [
+            MachInst::new(AArch64Opcode::AddRR, vec![vreg64(6), vreg64(7), vreg64(8)])
+                .with_implicit_uses(&[NZCV]),
+            // A definite writer still reads its incoming flags through this
+            // explicit metadata; the writer classification cannot bypass it.
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(6), imm(1)])
+                .with_implicit_uses(&[NZCV]),
+            MachInst::new(AArch64Opcode::AddRR, vec![vreg64(6), vreg64(7), vreg64(8)])
+                .with_implicit_defs(&[NZCV]),
+            // Opaque metadata also precedes the definite-writer exit.
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg64(6), imm(1)])
+                .with_implicit_defs(&[NZCV]),
+        ] {
+            let (func, ids) = nzcv_observer_fixture(vec![observer], successor, EQ);
+            nzcv_refused_unchanged(func, &ids);
+        }
+    }
+}
+
+#[test]
+fn public_pass_fuses_paired_eq_controls_with_exact_provenance() {
+    for successor in [false, true] {
+        for observers in [
+            vec![],
+            vec![MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![vreg64(6), vreg64(7), vreg64(8)],
+            )],
+        ] {
+            let (mut func, ids) = nzcv_observer_fixture(observers, successor, EQ);
+            let mut provenance = nzcv_annotate(&mut func, &ids);
+            let before_provenance = provenance.clone();
+            let mut expected = func.clone();
+            let mut tst = MachInst::new(AArch64Opcode::Tst, vec![vreg64(0), imm(1)]);
+            tst.source_loc = expected.inst(ids[1]).source_loc;
+            *expected.inst_mut(ids[0]) = MachInst::new(AArch64Opcode::Nop, vec![]);
+            *expected.inst_mut(ids[1]) = tst;
+            let mut plain = func.clone();
+            // Mandatory positives catch a disabled pass or blanket refusal.
+            assert!(AndCmpFuse.run(&mut plain));
+            assert_eq!(format!("{plain:?}"), format!("{expected:?}"));
+            assert!(AndCmpFuse.run_with_provenance(&mut func, &mut provenance));
+            assert_eq!(format!("{func:?}"), format!("{expected:?}"));
+            for origin in [TrustIrInstId(100), TrustIrInstId(101)] {
+                assert_eq!(provenance.get_mach_insts(origin), Some([ids[1]].as_slice()));
+            }
+            assert!(provenance.get_entry(ids[0]).is_none());
+            let merged = provenance.get_entry(ids[1]).expect("merged CMP origin");
+            assert!(merged.is_active());
+            assert_eq!(
+                merged.trust_ir_origins,
+                [TrustIrInstId(100), TrustIrInstId(101)]
+            );
+            let transform = merged.transforms.last().expect("fusion history");
+            assert_eq!(transform.pass, PassId::new("and-cmp-fuse"));
+            assert_eq!(
+                transform.kind,
+                TransformKind::Merged {
+                    sources: vec![ids[0], ids[1]],
+                }
+            );
+            assert_eq!(provenance.num_trust_ir_entries(), ids.len());
+            assert_eq!(provenance.num_mach_entries(), ids.len() - 1);
+            for (index, &id) in ids.iter().enumerate().skip(2) {
+                assert_eq!(
+                    format!("{:?}", provenance.get_entry(id)),
+                    format!("{:?}", before_provenance.get_entry(id))
+                );
+                assert_eq!(
+                    provenance.get_mach_insts(TrustIrInstId(100 + index as u32)),
+                    Some([id].as_slice())
+                );
+            }
+        }
+    }
 }

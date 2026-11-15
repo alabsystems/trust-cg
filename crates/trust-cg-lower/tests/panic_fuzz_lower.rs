@@ -6,9 +6,6 @@
 //
 // Part of #387 (proptest panic-fuzz) / Part of #372 (Crash-free codegen).
 //
-// Reference: `designs/2026-04-18-crash-free-codegen-plan.md` §5 (proptest
-// as primary defense) and §6 (per-crate harness).
-//
 // Contract under test: for *any* trust_ir function, `translate_function` must
 // either return `Ok(..)` or `Err(AdapterError)` — it must NEVER panic,
 // abort, or underflow in debug. Phase 1 of #372 converted the known
@@ -21,14 +18,14 @@
 // this is exactly what a buggy frontend would produce.
 //
 // Run:
-//   cargo test -p trust-cg-lower --test panic_fuzz_lower
+//   scripts/trust_cargo.sh test -p trust-cg-lower --test panic_fuzz_lower
 // Increase case count via env:
-//   PROPTEST_CASES=100000 cargo test -p trust-cg-lower --test panic_fuzz_lower
+//   PROPTEST_CASES=100000 scripts/trust_cargo.sh test -p trust-cg-lower --test panic_fuzz_lower
 
 use std::panic;
 
 use proptest::prelude::*;
-use trust_cg_lower::{AdapterError, translate_function};
+use trust_cg_lower::AdapterError;
 use trust_ir::{
     BinOp, Block as TrustIrBlock, BlockId, Constant, FuncId, FuncTy, FuncTyId,
     Function as TrustIrFunction, ICmpOp, Inst, InstrNode, Module as TrustIrModule, SwitchCase, Ty,
@@ -224,11 +221,14 @@ fn func_spec_strategy(malformed: bool) -> impl Strategy<Value = FuncSpec> {
 fn materialise(spec: &FuncSpec) -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("_panic_fuzz");
     let params: Vec<Ty> = vec![Ty::I64; spec.num_params as usize];
-    let ft_id = module.add_func_type(FuncTy {
-        params: params.clone(),
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: params.clone(),
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // If bad_func_ty is set, use a FuncTyId that was not registered.
     let used_ft_id = if spec.bad_func_ty {
         FuncTyId::new(9999)
@@ -602,7 +602,7 @@ fn assert_no_panic(func: &TrustIrFunction, module: &TrustIrModule) {
     let f = func.clone();
     let m = module.clone();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
-        let _ = translate_function(&f, &m);
+        let _ = trust_cg_lower::translate_function_with_license(&f, &m, &permit_unlicensed());
     }));
     if let Err(payload) = result {
         let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -621,14 +621,53 @@ fn assert_no_panic(func: &TrustIrFunction, module: &TrustIrModule) {
     }
 }
 
-/// Opt-in evidence that the panic-fuzz lane fails loudly when the catch
-/// wrapper observes a real panic. Normal test runs leave this disabled.
+/// The case count every property in this file runs: PROPTEST_CASES, else 256.
+fn panic_fuzz_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Positive control for the case count. A property with this file's case
+/// configuration counts the cases it actually ran and prints both figures on
+/// one line. The Linux floor and the fuzz lane require that line with the
+/// count they configured (the floor: the 256 default; the lane: its
+/// `--proptest-cases`), so a case count shrunk behind their back, by an
+/// ambient variable or a Cargo `[env]` entry, fails them even though every
+/// property here would still pass. A count of zero fails here.
+#[test]
+fn panic_fuzz_runs_its_configured_case_count() {
+    let configured = panic_fuzz_cases();
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: configured,
+        ..ProptestConfig::default()
+    });
+    let run = std::cell::Cell::new(0u32);
+    runner
+        .run(&any::<u64>(), |_| {
+            run.set(run.get() + 1);
+            Ok(())
+        })
+        .expect("the counting property cannot fail");
+    println!(
+        "panic-fuzz proptest cases: configured={configured} run={}",
+        run.get()
+    );
+    assert!(run.get() > 0, "no proptest case ran");
+    assert_eq!(
+        run.get(),
+        configured,
+        "proptest ran a different number of cases"
+    );
+}
+
+/// The catch wrapper every property here relies on must observe a real panic
+/// and its payload. With TRUST_CG_PANIC_FUZZ_NEGATIVE_CONTROL set, the test
+/// then fails loudly: the negative control of the panic-fuzz lanes
+/// (scripts/run_linux_fuzz_lane.py, scripts/run_panic_fuzz_evidence.sh).
 #[test]
 fn panic_fuzz_negative_control_fails_when_enabled() {
-    if std::env::var_os("TRUST_CG_PANIC_FUZZ_NEGATIVE_CONTROL").is_none() {
-        return;
-    }
-
     fn deliberate_panic() {
         panic!("deliberate panic-fuzz negative control");
     }
@@ -642,15 +681,15 @@ fn panic_fuzz_negative_control_fails_when_enabled() {
     } else {
         "<non-string panic payload>".to_string()
     };
-    panic!("panic-fuzz negative control observed deliberate panic: {msg}");
+    assert_eq!(msg, "deliberate panic-fuzz negative control");
+    if std::env::var_os("TRUST_CG_PANIC_FUZZ_NEGATIVE_CONTROL").is_some() {
+        panic!("panic-fuzz negative control observed deliberate panic: {msg}");
+    }
 }
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
+        cases: panic_fuzz_cases(),
         max_shrink_iters: 500,
         .. ProptestConfig::default()
     })]
@@ -691,11 +730,14 @@ proptest! {
 fn regression_unregistered_func_ty_panics() {
     let mut module = TrustIrModule::new("_panic_fuzz");
     // Register ONE func type (id 0).
-    let _ = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let _ = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // Construct a function that *references* FuncTyId(9999), which is
     // unregistered.
     let bad_ft = FuncTyId::new(9999);
@@ -705,7 +747,7 @@ fn regression_unregistered_func_ty_panics() {
         params: vec![],
         body: vec![InstrNode::new(Inst::Return { values: vec![] })],
     }];
-    let err = translate_function(&func, &module)
+    let err = trust_cg_lower::translate_function_with_license(&func, &module, &permit_unlicensed())
         .expect_err("unregistered FuncTyId must be rejected, not panic");
     assert!(
         matches!(err, AdapterError::InvalidFuncTyId(9999)),
@@ -719,11 +761,14 @@ fn regression_unregistered_func_ty_panics() {
 #[test]
 fn regression_out_of_range_entry_returns_err() {
     let mut module = TrustIrModule::new("_panic_fuzz");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let bad_entry = BlockId::new(u32::MAX);
     let mut func = TrustIrFunction::new(FuncId::new(0), "_bad_entry", ft_id, bad_entry);
     func.blocks = vec![TrustIrBlock {
@@ -733,5 +778,14 @@ fn regression_out_of_range_entry_returns_err() {
     }];
     // Acceptable outcomes: Ok (adapter silently picks some block) or Err.
     // The NOT-acceptable outcome is a panic, which is what this test pins.
-    let _ = translate_function(&func, &module);
+    let _ = trust_cg_lower::translate_function_with_license(&func, &module, &permit_unlicensed());
+}
+
+/// The generated functions carry no `body_gate`, which trust-cg REFUSES by
+/// default (roadmap WS7.5, DG-73). Under the default every case would stop at
+/// the license and this harness would pass VACUOUSLY; it states `Permit` so
+/// every case reaches the lowering it fuzzes.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

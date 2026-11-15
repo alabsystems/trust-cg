@@ -173,8 +173,12 @@ fn compile_trust_ir(
     module: &TrustIrModule,
     opt_level: OptLevel,
 ) -> Result<Vec<u8>, String> {
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
-        .map_err(|e| format!("adapter: {}", e))?;
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+        trust_ir_func,
+        module,
+        &permit_unlicensed(),
+    )
+    .map_err(|e| format!("adapter: {}", e))?;
     let config = PipelineConfig {
         target_triple: host_aarch64_triple().to_string(),
         opt_level,
@@ -269,11 +273,14 @@ fn fp_to_si_i64(vid: &mut VidCounter, operand: ValueId) -> (ValueId, InstrNode) 
 
 fn build_sum10_i64() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("abi_sum10_i64");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64; 10],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 10],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = b(0);
     let mut func = TrustIrFunction::new(FuncId::new(0), "sum10_i64", ft_id, entry);
@@ -301,7 +308,9 @@ fn build_sum10_i64() -> (TrustIrFunction, TrustIrModule) {
         body,
     }];
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -406,11 +415,14 @@ fn run_sum10_i64_o0_o2_semantics(test_name: &str) {
 
 fn build_sum20_i64() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("abi_sum20_i64");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64; 20],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 20],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = b(0);
     let mut func = TrustIrFunction::new(FuncId::new(0), "sum20_i64", ft_id, entry);
@@ -434,7 +446,9 @@ fn build_sum20_i64() -> (TrustIrFunction, TrustIrModule) {
         body,
     }];
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -548,11 +562,14 @@ fn build_mixed_4i64_10f64() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("abi_mixed_4i64_10f64");
     let mut params_ty: Vec<Ty> = vec![Ty::I64; 4];
     params_ty.extend(std::iter::repeat_n(Ty::F64, 10));
-    let ft_id = module.add_func_type(FuncTy {
-        params: params_ty,
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: params_ty,
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = b(0);
     let mut func = TrustIrFunction::new(FuncId::new(0), "mixed_4i64_10f64", ft_id, entry);
@@ -594,7 +611,9 @@ fn build_mixed_4i64_10f64() -> (TrustIrFunction, TrustIrModule) {
         body,
     }];
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -670,11 +689,14 @@ fn build_mixed_10i64_10f64_alt() -> (TrustIrFunction, TrustIrModule) {
         params_ty.push(Ty::I64);
         params_ty.push(Ty::F64);
     }
-    let ft_id = module.add_func_type(FuncTy {
-        params: params_ty,
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: params_ty,
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = b(0);
     let mut func = TrustIrFunction::new(FuncId::new(0), "mixed_10i64_10f64_alt", ft_id, entry);
@@ -715,7 +737,9 @@ fn build_mixed_10i64_10f64_alt() -> (TrustIrFunction, TrustIrModule) {
         body,
     }];
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -928,4 +952,13 @@ fn test_mixed_10i64_10f64_alt_e2e_correctness() {
 #[test]
 fn test_mixed_10i64_10f64_alt_e2e_correctness_o2() {
     run_mixed_10i64_10f64_alt_e2e(OptLevel::O2, "mixed_10i64_10f64_alt_e2e_o2");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

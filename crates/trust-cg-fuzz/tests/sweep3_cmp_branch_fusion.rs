@@ -46,13 +46,14 @@
 //      but we keep flag idioms entirely on the JIT-agreement + Rust-truth path to
 //      avoid any ambiguity.
 //
-//  (C) The interpreter's widthless cast model leaves `sext Bool -> i64` true as
-//      raw `1`, while native one-bit sign extension yields `-1`. Such shapes use
-//      the shared domain-checked projection for native truth. A direct self-check
-//      below pins raw interpreter false/true to 0/1 and native projection to
-//      0/-1. Modules that combine Bool SExt with unsupported memory operations
-//      remain on the cross-JIT + native-truth lane rather than claiming oracle
-//      comparability.
+//  (C) `sext Bool -> i64` makes true all ones (`-1`): trust-ir's meaning and
+//      LLVM's `sext i1`. The interpreter computes it directly since
+//      `1d65e8e64` (before, it returned the raw Bool `1`, which this file
+//      projected). A direct self-check below pins the interpreter's false/true
+//      to 0/-1 and checks them with the shared Bool SExt domain check, which
+//      refuses the retired `1`. Modules that combine Bool SExt with
+//      unsupported memory operations remain on the cross-JIT + native-truth
+//      lane rather than claiming oracle comparability.
 //
 // ============================ ANTI-FALSE-POSITIVE ===========================
 //   * All arithmetic is wrapping (Rust ground truth uses wrapping_*).
@@ -76,7 +77,7 @@ use std::panic;
 use trust_cg_codegen::Target;
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_fuzz::jit_diff::{project_widthless_bool_sext_i64, run_oracle_one};
+use trust_cg_fuzz::jit_diff::{bool_sext_i64_oracle_result, run_oracle_one};
 use trust_ir::{BinOp, ICmpOp, OverflowOp, Ty};
 use trust_ir_build::{FunctionBuilder, ModuleBuilder};
 
@@ -120,7 +121,7 @@ fn jit_run(module: &trust_ir::Module, opt: OptLevel, jit_fast: bool, row: &[i64;
             c
         };
         config.opt_level = opt;
-        let compiler = Compiler::new(config);
+        let compiler = Compiler::new(config).with_codegen_license(permit_unlicensed());
         let buf = match compiler.compile_module_to_jit(module, &externs) {
             Ok(r) => r.buffer,
             Err(_) => return Run::CompileErr,
@@ -229,7 +230,7 @@ where
     fb.switch_to_block(entry);
     body(&mut fb, entry, [a, b, c, d]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Mask an i64 param down to a small non-negative value (0..=0xffff) that is
@@ -307,7 +308,7 @@ fn selfcheck_oracle_live_and_sensitive() {
 }
 
 #[test]
-fn bool_sext_oracle_model_is_live_and_projected() {
+fn bool_sext_oracle_model_is_live_and_domain_checked() {
     // Keep this module memory-free so the interpreter actually executes the
     // Bool SExt. The store/reload sweep below is intentionally oracle-free
     // because the lightweight interpreter does not implement alloca memory.
@@ -319,17 +320,20 @@ fn bool_sext_oracle_model_is_live_and_projected() {
         fb.ret(vec![w]);
     });
 
+    // True sign-extends from one bit to all ones (trust-ir, LLVM `sext i1`).
     let true_row = [1i64, 2, 0, 0];
     let raw_true =
-        run_oracle_one(&m, &true_row).expect("widthless interpreter must accept true Bool SExt");
-    assert_eq!(raw_true, 1, "widthless interpreter true changed");
-    assert_eq!(project_widthless_bool_sext_i64(raw_true), Some(-1));
+        run_oracle_one(&m, &true_row).expect("the interpreter must accept true Bool SExt");
+    assert_eq!(raw_true, -1, "the interpreter's true Bool SExt changed");
+    assert_eq!(bool_sext_i64_oracle_result(raw_true), Some(-1));
+    // The retired widthless `1` is refused, not normalized.
+    assert_eq!(bool_sext_i64_oracle_result(1), None);
 
     let false_row = [2i64, 1, 0, 0];
     let raw_false =
-        run_oracle_one(&m, &false_row).expect("widthless interpreter must accept false Bool SExt");
-    assert_eq!(raw_false, 0, "widthless interpreter false changed");
-    assert_eq!(project_widthless_bool_sext_i64(raw_false), Some(0));
+        run_oracle_one(&m, &false_row).expect("the interpreter must accept false Bool SExt");
+    assert_eq!(raw_false, 0, "the interpreter's false Bool SExt changed");
+    assert_eq!(bool_sext_i64_oracle_result(raw_false), Some(0));
 
     for (label, row, want) in [
         ("bool-sext-true", true_row, -1),
@@ -570,12 +574,12 @@ fn bool_materialize_store_reload() {
             let label = format!("bool_store {op:?} sext={sext}");
             for row in ROWS {
                 let taken = eval_icmp_rs(op, r_canon(row[0]), r_canon(row[1]));
-                let raw_bool = i64::from(taken);
+                // Native truth of the one-bit extension: zext is 0/1, sext is
+                // 0/-1 (true is all ones).
                 let w = if sext {
-                    project_widthless_bool_sext_i64(raw_bool)
-                        .expect("comparison truth must remain in the Bool domain")
+                    -i64::from(taken)
                 } else {
-                    raw_bool
+                    i64::from(taken)
                 };
                 let want = w.wrapping_add(row[2]);
                 // The lightweight interpreter does not implement the alloca
@@ -1064,4 +1068,13 @@ fn report(name: &str, configs: usize, defects: &[String]) {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -1,0 +1,831 @@
+{
+  "name": "image_scalars.b42a751d6e1cd10-cgu.0",
+  "functions": [
+    {
+      "id": 0,
+      "name": "image_array",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": {
+                      "Tuple": [
+                        "U16",
+                        "U16",
+                        "U16"
+                      ]
+                    }
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_array.const.alloc15",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": {
+                      "Tuple": [
+                        "U16",
+                        "U16",
+                        "U16"
+                      ]
+                    }
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": {
+                      "Tuple": [
+                        "U16",
+                        "U16",
+                        "U16"
+                      ]
+                    }
+                  },
+                  "dst_ty": {
+                    "PtrConst": {
+                      "Tuple": [
+                        "U16",
+                        "U16",
+                        "U16"
+                      ]
+                    }
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    },
+    {
+      "id": 1,
+      "name": "image_bool",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": "Bool"
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_bool.const.alloc7",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": "Bool"
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": "Bool"
+                  },
+                  "dst_ty": {
+                    "PtrConst": "Bool"
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    },
+    {
+      "id": 2,
+      "name": "image_char",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": "U32"
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_char.const.alloc9",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": "U32"
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": "U32"
+                  },
+                  "dst_ty": {
+                    "PtrConst": "U32"
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    },
+    {
+      "id": 3,
+      "name": "image_f32",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": "F32"
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_f32.const.alloc11",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": "F32"
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": "F32"
+                  },
+                  "dst_ty": {
+                    "PtrConst": "F32"
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    },
+    {
+      "id": 4,
+      "name": "image_f64",
+      "ty": 4,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": "F64"
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_f64.const.alloc13",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": "F64"
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": "F64"
+                  },
+                  "dst_ty": {
+                    "PtrConst": "F64"
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    },
+    {
+      "id": 5,
+      "name": "image_i64",
+      "ty": 5,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": "I64"
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_i64.const.alloc2",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": "I64"
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": "I64"
+                  },
+                  "dst_ty": {
+                    "PtrConst": "I64"
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "image_array.const.alloc15",
+      "ty": {
+        "Tuple": [
+          "U16",
+          "U16",
+          "U16"
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 1
+          },
+          {
+            "Int": 65535
+          },
+          {
+            "Int": 4660
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 2,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "image_bool.const.alloc7",
+      "ty": "Bool",
+      "mutable": false,
+      "initializer": {
+        "Bool": true
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 1,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "image_char.const.alloc9",
+      "ty": "U32",
+      "mutable": false,
+      "initializer": {
+        "Int": 129408
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 4,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "image_f32.const.alloc11",
+      "ty": "F32",
+      "mutable": false,
+      "initializer": {
+        "Float": {
+          "bits": 9223372036854775808
+        }
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 4,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "image_f64.const.alloc13",
+      "ty": "F64",
+      "mutable": false,
+      "initializer": {
+        "Float": {
+          "bits": 4631178160564600832
+        }
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 8,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "image_i64.const.alloc2",
+      "ty": "I64",
+      "mutable": false,
+      "initializer": {
+        "Int": -123
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 8,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": {
+            "Tuple": [
+              "U16",
+              "U16",
+              "U16"
+            ]
+          }
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": "Bool"
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": "U32"
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": "F32"
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": "F64"
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": "I64"
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "I8",
+    "I16",
+    "I32",
+    "I64",
+    "I128",
+    "U8"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-unknown-linux-gnu",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "Unclassified"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": []
+}

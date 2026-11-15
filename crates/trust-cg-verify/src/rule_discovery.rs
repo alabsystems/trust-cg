@@ -8,9 +8,6 @@
 // verifies semantic equivalence. Proven rules are added to a persistent
 // database. Incorrect proposals are rejected with counterexamples.
 //
-// This implements Section 5 ("Automatic Rule Discovery") of
-// designs/2026-04-13-ai-native-compilation.md
-//
 // Reference: Alive2 (PLDI 2021), Souper (arXiv:1711.04422)
 
 //! AI-native automatic rule discovery.
@@ -29,12 +26,17 @@
 //!   │ encode → CEGIS verify
 //!   ├─ Equivalent   → ProvenRule → RuleDatabase
 //!   ├─ NotEquivalent → Rejected(counterexample)
-//!   └─ Timeout       → Inconclusive
+//!   └─ Timeout, or no certified proof → Inconclusive
+//!      (the evaluator may still reject; it never accepts)
 //! ```
 //!
 //! # Example
 //!
-//! ```rust
+//! Acceptance needs AY with a capable independent Clean/Carcara checker (see
+//! `ay_bridge::z3_available`); without one the same proposal is
+//! `Inconclusive`, so the example is compiled but not run.
+//!
+//! ```rust,no_run
 //! use trust_cg_verify::smt::SmtExpr;
 //! use trust_cg_verify::rule_discovery::{RuleDiscovery, RuleProposal, RuleResult};
 //!
@@ -272,8 +274,13 @@ pub enum RuleResult {
         found_by_concrete: bool,
     },
 
-    /// Verification timed out — neither proven nor disproven.
-    Inconclusive,
+    /// Neither proven nor disproven: CEGIS timed out, or produced no
+    /// independently certified proof (no solver, AY's `unknown`, a rejected
+    /// proof) and the evaluator found no disagreement. Carries the CEGIS
+    /// verdict (`Timeout`, `MaxIterationsReached` or `Error`) so a caller can
+    /// tell a missing solver or AY's disclosed proof hole from a rejected
+    /// proof.
+    Inconclusive(CegisResult),
 
     /// Proposal was a duplicate of an existing proven rule.
     Duplicate,
@@ -494,7 +501,8 @@ impl RuleDiscovery {
     /// 2. CEGIS verification (concrete evaluation + solver)
     /// 3. If proven, add to database and return Accepted
     /// 4. If disproven, return Rejected with counterexample
-    /// 5. If timeout, return Inconclusive
+    /// 5. If timeout, or no certified proof and no evaluated disagreement,
+    ///    return Inconclusive
     pub fn propose_rule(&mut self, proposal: RuleProposal) -> RuleResult {
         self.database.stats.total_proposed += 1;
 
@@ -516,6 +524,26 @@ impl RuleDiscovery {
             .cegis
             .verify(&proposal.pattern, &proposal.replacement, &vars);
 
+        self.settle(proposal, &vars, result)
+    }
+
+    /// Turn the CEGIS verdict on `proposal` into a [`RuleResult`], recording it
+    /// in the database and the stats.
+    ///
+    /// Only [`CegisResult::Equivalent`] (AY's `unsat`, independently certified)
+    /// accepts a rule: an accepted rule becomes an `AYEquivalenceProof` record
+    /// in `rewrite_admission`, so nothing else may reach `Accepted`. When CEGIS
+    /// returns an error — no solver, AY's `unknown`, and in particular a
+    /// working checker's or AY's own self-check rejection of AY's proof — the
+    /// evaluator may still REJECT the rule on an input where the two sides
+    /// disagree, but agreement on sampled inputs proves nothing, so the rule is
+    /// `Inconclusive`.
+    fn settle(
+        &mut self,
+        proposal: RuleProposal,
+        vars: &[(String, u32)],
+        result: CegisResult,
+    ) -> RuleResult {
         match result {
             CegisResult::Equivalent {
                 proof_hash,
@@ -556,38 +584,14 @@ impl RuleDiscovery {
                     found_by_concrete,
                 }
             }
-            CegisResult::Timeout | CegisResult::MaxIterationsReached { .. } => {
+            undecided @ (CegisResult::Timeout | CegisResult::MaxIterationsReached { .. }) => {
                 self.database.stats.total_inconclusive += 1;
-                RuleResult::Inconclusive
+                RuleResult::Inconclusive(undecided)
             }
-            CegisResult::Error(_) => {
-                // Solver error — fall back to evaluation-based verification
-                let fallback = self.verify_by_evaluation_fallback(&proposal, &vars);
-                match fallback {
-                    Some(true) => {
-                        // Evaluation-based verification passed
-                        let name = proposal.name.unwrap_or_else(|| {
-                            format!("{} => {}", proposal.pattern, proposal.replacement)
-                        });
-                        let cost_delta = proposal.cost_estimate.unwrap_or_else(|| {
-                            estimate_expr_cost(&proposal.pattern)
-                                - estimate_expr_cost(&proposal.replacement)
-                        });
-
-                        let rule = DiscoveredRule {
-                            name,
-                            pattern: proposal.pattern,
-                            replacement: proposal.replacement,
-                            preconditions: proposal.preconditions,
-                            proof_hash: proposal_hash,
-                            cost_delta,
-                            verified_width: self.width,
-                            cegis_iterations: 0,
-                        };
-                        self.database.add_discovered(rule.clone());
-                        self.database.stats.total_accepted += 1;
-                        RuleResult::Accepted(rule)
-                    }
+            error @ CegisResult::Error(_) => {
+                // No certified proof. The evaluator may refute the rule; it can
+                // never prove it.
+                match self.verify_by_evaluation_fallback(&proposal, vars) {
                     Some(false) => {
                         self.database.stats.total_rejected += 1;
                         RuleResult::Rejected {
@@ -595,9 +599,9 @@ impl RuleDiscovery {
                             found_by_concrete: true,
                         }
                     }
-                    None => {
+                    Some(true) | None => {
                         self.database.stats.total_inconclusive += 1;
-                        RuleResult::Inconclusive
+                        RuleResult::Inconclusive(error)
                     }
                 }
             }
@@ -627,11 +631,12 @@ impl RuleDiscovery {
         self.cegis.counterexample_count()
     }
 
-    /// Fallback: verify using evaluation-based testing (no solver).
+    /// Fallback when CEGIS produced no verdict: evaluation-based testing.
     ///
     /// Uses the existing `verify_by_evaluation` infrastructure from
-    /// lowering_proof.rs. Returns Some(true) if valid, Some(false) if
-    /// invalid, None if inconclusive.
+    /// lowering_proof.rs. Returns Some(true) if every sampled input agreed,
+    /// Some(false) if one disagreed, None if inconclusive. Only `Some(false)`
+    /// decides anything (see [`RuleDiscovery::settle`]).
     fn verify_by_evaluation_fallback(
         &self,
         proposal: &RuleProposal,
@@ -1037,6 +1042,113 @@ mod tests {
     // RuleDiscovery — acceptance tests (known-good rules)
     // -----------------------------------------------------------------------
 
+    /// A known-good proposal's verdict. With the proof authority installed it
+    /// must be `Accepted`, and the only other verdict that does not fail the
+    /// test is AY's disclosed proof hole, which skips loudly
+    /// (`crate::formal_gap`); a rejected proof, any other `unknown`, a timeout
+    /// and a solver error fail. Without the authority the test skips by name,
+    /// and the verdict must be `Inconclusive`: no rule is accepted without a
+    /// proof. `Some(rule)` only when accepted.
+    fn expect_accepted<'a>(test: &str, result: &'a RuleResult) -> Option<&'a DiscoveredRule> {
+        if crate::formal_gap::proof_authority_present(test) {
+            match result {
+                RuleResult::Accepted(rule) => Some(rule),
+                other => {
+                    let gap = match other {
+                        RuleResult::Inconclusive(cegis) => {
+                            crate::formal_gap::cegis_gap_reason(cegis)
+                        }
+                        RuleResult::Accepted(_)
+                        | RuleResult::Rejected { .. }
+                        | RuleResult::Duplicate => None,
+                    };
+                    let Some(reason) = gap else {
+                        panic!(
+                            "{test}: proof authority was available but the known-good rule was \
+                             not accepted: {other:?}"
+                        )
+                    };
+                    crate::formal_gap::print_gap_skip(test, reason);
+                    None
+                }
+            }
+        } else {
+            assert!(
+                matches!(result, RuleResult::Inconclusive(_)),
+                "{test}: without proof authority a known-good rule is Inconclusive, got {result:?}"
+            );
+            None
+        }
+    }
+
+    fn cegis_unknown(reason: &str) -> CegisResult {
+        CegisResult::Error(format!("{}{reason}", crate::cegis::SOLVER_UNKNOWN_PREFIX))
+    }
+
+    /// No CEGIS error accepts a rule. A rejected AY proof (AY's own
+    /// self-check, or a working checker's rejection), the disclosed proof hole
+    /// and a missing solver each leave a TRUE rule `Inconclusive` and out of
+    /// the database, although every sampled input agrees; before this, the
+    /// evaluator's agreement accepted it, and `rewrite_admission` recorded that
+    /// as an `AYEquivalenceProof`. The evaluator still rejects a false rule.
+    #[test]
+    fn a_cegis_error_never_accepts_a_rule() {
+        let true_rule = || {
+            RuleProposal::new(
+                SmtExpr::var("x", 8).bvadd(SmtExpr::bv_const(0, 8)),
+                SmtExpr::var("x", 8),
+            )
+        };
+        let vars = vec![("x".to_string(), 8)];
+        for error in [
+            cegis_unknown("(:reason-unknown (incomplete self-check-rejected))"),
+            cegis_unknown(
+                "AY reported UNSAT but /pkg/clean/bin/clean — which verified a known-good \
+                 control proof, so it is a working checker — rejected or could not fully \
+                 verify THIS Alethe proof",
+            ),
+            cegis_unknown(
+                "incomplete AY proof certificate: c ay.proof.certificate path=/tmp/q.alethe \
+                 unproved_steps=1 foreign_assumes=no trust_free=no ay_self_checkable=yes",
+            ),
+            CegisResult::Error(
+                "solver returned UNSAT without an independently accepted proof".into(),
+            ),
+            CegisResult::Error("AY solver not found".to_string()),
+        ] {
+            let mut discovery = RuleDiscovery::new(8);
+            let result = discovery.settle(true_rule(), &vars, error.clone());
+            assert!(
+                matches!(&result, RuleResult::Inconclusive(carried)
+                    if format!("{carried:?}") == format!("{error:?}")),
+                "{error:?} must leave the rule Inconclusive, carrying the CEGIS verdict, \
+                 got {result:?}"
+            );
+            assert_eq!(discovery.stats().total_accepted, 0, "{error:?}");
+            assert_eq!(discovery.stats().total_inconclusive, 1, "{error:?}");
+            assert!(
+                !discovery.database.is_known(true_rule().proposal_hash()),
+                "{error:?}"
+            );
+            assert!(discovery.database.discovered_rules.is_empty(), "{error:?}");
+        }
+
+        let false_rule = RuleProposal::new(
+            SmtExpr::var("x", 8).bvadd(SmtExpr::bv_const(1, 8)),
+            SmtExpr::var("x", 8),
+        );
+        let mut discovery = RuleDiscovery::new(8);
+        let result = discovery.settle(
+            false_rule,
+            &vars,
+            cegis_unknown("(:reason-unknown (incomplete self-check-rejected))"),
+        );
+        assert!(
+            result.is_rejected(),
+            "the evaluator must still reject x+1 => x, got {result:?}"
+        );
+    }
+
     #[test]
     fn test_discover_add_zero_identity() {
         let mut discovery = RuleDiscovery::new(8);
@@ -1049,16 +1161,10 @@ mod tests {
 
         let result = discovery.propose_rule(proposal);
 
-        match &result {
-            RuleResult::Accepted(rule) => {
-                assert_eq!(rule.name, "add_zero_identity");
-                assert_eq!(rule.verified_width, 8);
-                assert!(rule.cost_delta > 0, "Eliding ADD should be profitable");
-            }
-            RuleResult::Inconclusive => {
-                // Solver not available — acceptable in test, fall through
-            }
-            other => panic!("Expected Accepted or Inconclusive, got {:?}", other),
+        if let Some(rule) = expect_accepted("test_discover_add_zero_identity", &result) {
+            assert_eq!(rule.name, "add_zero_identity");
+            assert_eq!(rule.verified_width, 8);
+            assert!(rule.cost_delta > 0, "Eliding ADD should be profitable");
         }
     }
 
@@ -1073,11 +1179,7 @@ mod tests {
         .with_name("sub_zero_identity");
 
         let result = discovery.propose_rule(proposal);
-        assert!(
-            result.is_accepted() || matches!(result, RuleResult::Inconclusive),
-            "SUB x, 0 => x should be accepted or inconclusive, got {:?}",
-            result
-        );
+        expect_accepted("test_discover_sub_zero_identity", &result);
     }
 
     #[test]
@@ -1092,14 +1194,10 @@ mod tests {
 
         let result = discovery.propose_rule(proposal);
 
-        match &result {
-            RuleResult::Accepted(rule) => {
-                assert_eq!(rule.name, "mul2_to_lsl1");
-                // MUL cost 3, LSL cost 1, delta = 2
-                assert!(rule.cost_delta > 0, "MUL->LSL should be profitable");
-            }
-            RuleResult::Inconclusive => {}
-            other => panic!("Expected Accepted or Inconclusive, got {:?}", other),
+        if let Some(rule) = expect_accepted("test_discover_mul_to_shift", &result) {
+            assert_eq!(rule.name, "mul2_to_lsl1");
+            // MUL cost 3, LSL cost 1, delta = 2
+            assert!(rule.cost_delta > 0, "MUL->LSL should be profitable");
         }
     }
 
@@ -1114,11 +1212,7 @@ mod tests {
         .with_name("xor_self_zero");
 
         let result = discovery.propose_rule(proposal);
-        assert!(
-            result.is_accepted() || matches!(result, RuleResult::Inconclusive),
-            "XOR x, x => 0 should be accepted or inconclusive, got {:?}",
-            result
-        );
+        expect_accepted("test_discover_xor_self_zero", &result);
     }
 
     #[test]
@@ -1132,11 +1226,7 @@ mod tests {
         .with_name("and_self_identity");
 
         let result = discovery.propose_rule(proposal);
-        assert!(
-            result.is_accepted() || matches!(result, RuleResult::Inconclusive),
-            "AND x, x => x should be accepted or inconclusive, got {:?}",
-            result
-        );
+        expect_accepted("test_discover_and_self_identity", &result);
     }
 
     #[test]
@@ -1150,11 +1240,7 @@ mod tests {
         .with_name("or_self_identity");
 
         let result = discovery.propose_rule(proposal);
-        assert!(
-            result.is_accepted() || matches!(result, RuleResult::Inconclusive),
-            "OR x, x => x should be accepted or inconclusive, got {:?}",
-            result
-        );
+        expect_accepted("test_discover_or_self_identity", &result);
     }
 
     #[test]
@@ -1166,11 +1252,7 @@ mod tests {
                 .with_name("double_negation");
 
         let result = discovery.propose_rule(proposal);
-        assert!(
-            result.is_accepted() || matches!(result, RuleResult::Inconclusive),
-            "NEG(NEG(x)) => x should be accepted or inconclusive, got {:?}",
-            result
-        );
+        expect_accepted("test_discover_double_negation", &result);
     }
 
     // -----------------------------------------------------------------------
@@ -1208,7 +1290,7 @@ mod tests {
                 }
                 let _ = found_by_concrete; // may be either
             }
-            RuleResult::Inconclusive => {
+            RuleResult::Inconclusive(_) => {
                 // Solver not available — still acceptable
             }
             other => panic!("Expected Rejected or Inconclusive, got {:?}", other),
@@ -1228,7 +1310,7 @@ mod tests {
 
         let result = discovery.propose_rule(proposal);
         assert!(
-            result.is_rejected() || matches!(result, RuleResult::Inconclusive),
+            result.is_rejected() || matches!(result, RuleResult::Inconclusive(_)),
             "x * y => x + y should be rejected, got {:?}",
             result
         );
@@ -1243,7 +1325,7 @@ mod tests {
 
         let result = discovery.propose_rule(proposal);
         assert!(
-            result.is_rejected() || matches!(result, RuleResult::Inconclusive),
+            result.is_rejected() || matches!(result, RuleResult::Inconclusive(_)),
             "NEG(x) => x should be rejected, got {:?}",
             result
         );
@@ -1274,14 +1356,17 @@ mod tests {
 
         let result2 = discovery.propose_rule(proposal2);
 
-        // First should be accepted (or inconclusive if no solver),
-        // second should be duplicate if first was accepted
-        if result1.is_accepted() {
+        // The first is accepted (with proof authority), and then the second
+        // is a duplicate. When the first was not accepted nothing is known, so
+        // the second is decided afresh and held to the same rule.
+        if expect_accepted("test_deduplication", &result1).is_some() {
             assert!(
                 matches!(result2, RuleResult::Duplicate),
                 "Duplicate proposal should be detected, got {:?}",
                 result2
             );
+        } else {
+            expect_accepted("test_deduplication (resubmission)", &result2);
         }
     }
 
@@ -1318,9 +1403,12 @@ mod tests {
 
         assert_eq!(results.len(), 3);
 
-        // The bad rule should be rejected
+        // The good rules are proven; the bad rule is rejected by the
+        // edge-case seeds, with or without a solver.
+        expect_accepted("test_batch_discovery (add_zero)", &results[0]);
+        expect_accepted("test_batch_discovery (sub_zero)", &results[2]);
         assert!(
-            results[1].is_rejected() || matches!(results[1], RuleResult::Inconclusive),
+            results[1].is_rejected(),
             "add_one should be rejected, got {:?}",
             results[1]
         );
@@ -1338,7 +1426,7 @@ mod tests {
         let mut discovery = RuleDiscovery::new(8);
 
         // Propose a good rule
-        let _ = discovery.propose_rule(RuleProposal::new(
+        let good = discovery.propose_rule(RuleProposal::new(
             SmtExpr::var("x", 8).bvadd(SmtExpr::bv_const(0, 8)),
             SmtExpr::var("x", 8),
         ));
@@ -1355,6 +1443,12 @@ mod tests {
         // At least one should have a definitive result (accepted or rejected)
         let definitive = stats.total_accepted + stats.total_rejected + stats.total_inconclusive;
         assert_eq!(definitive, 2, "All proposals should have results");
+        // The bad rule is rejected by the edge-case seeds either way; the good
+        // one is accepted exactly when the proof authority is installed.
+        assert_eq!(stats.total_rejected, 1);
+        let accepted = u64::from(expect_accepted("test_stats_tracking", &good).is_some());
+        assert_eq!(stats.total_accepted, accepted);
+        assert_eq!(stats.total_inconclusive, 1 - accepted);
     }
 
     // -----------------------------------------------------------------------
@@ -1372,11 +1466,7 @@ mod tests {
         .with_name("add_zero_32bit");
 
         let result = discovery.propose_rule(proposal);
-        assert!(
-            result.is_accepted() || matches!(result, RuleResult::Inconclusive),
-            "32-bit add_zero should be accepted or inconclusive, got {:?}",
-            result
-        );
+        expect_accepted("test_discover_32bit_add_zero", &result);
     }
 
     #[test]
@@ -1390,11 +1480,7 @@ mod tests {
         .with_name("mul2_to_lsl1_32bit");
 
         let result = discovery.propose_rule(proposal);
-        assert!(
-            result.is_accepted() || matches!(result, RuleResult::Inconclusive),
-            "32-bit mul2->lsl1 should be accepted or inconclusive, got {:?}",
-            result
-        );
+        expect_accepted("test_discover_32bit_mul_to_shift", &result);
     }
 
     // -----------------------------------------------------------------------

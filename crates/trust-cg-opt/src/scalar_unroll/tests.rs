@@ -230,7 +230,7 @@ fn split_fires_on_i64_mul_reduction() {
         .flat_map(|blk| blk.insts.iter())
         .filter(|&&id| {
             let inst = f.inst(id);
-            inst.opcode == AArch64Opcode::Movz && imm_of(&inst.operands[1]) == Some(1)
+            inst.opcode == AArch64Opcode::Movz && inst.operands[1].as_imm() == Some(1)
         })
         .count();
     assert_eq!(ones, 3 + 2); // 3 seeds + the pre-existing #1 step consts (iv step + acc init)
@@ -331,8 +331,8 @@ fn serial_fires_on_f32_sum_preserving_order() {
     };
     assert_eq!(fadds.len(), 4);
     // Chain: first reads the live acc (v7); each next reads the previous def.
-    let acc_operand = |id: InstId| vreg_of(&f.inst(id).operands[1]).unwrap();
-    let def_of = |id: InstId| vreg_of(&f.inst(id).operands[0]).unwrap();
+    let acc_operand = |id: InstId| f.inst(id).operands[1].as_vreg().unwrap();
+    let def_of = |id: InstId| f.inst(id).operands[0].as_vreg().unwrap();
     assert_eq!(acc_operand(fadds[0]).id, 7);
     for k in 1..4 {
         assert_eq!(acc_operand(fadds[k]), def_of(fadds[k - 1]));
@@ -429,11 +429,11 @@ fn serial_fires_on_fnv_compound_update() {
         .filter(|&id| f.inst(id).opcode == AArch64Opcode::MulRR)
         .collect();
     // eor_k reads mul_{k-1}'s def (the chained accumulator); eor_0 reads v7.
-    assert_eq!(vreg_of(&f.inst(eors[0]).operands[1]).unwrap().id, 7);
+    assert_eq!(f.inst(eors[0]).operands[1].as_vreg().unwrap().id, 7);
     for k in 1..4 {
         assert_eq!(
-            vreg_of(&f.inst(eors[k]).operands[1]).unwrap(),
-            vreg_of(&f.inst(muls[k - 1]).operands[0]).unwrap()
+            f.inst(eors[k]).operands[1].as_vreg().unwrap(),
+            f.inst(muls[k - 1]).operands[0].as_vreg().unwrap()
         );
     }
 }
@@ -553,13 +553,13 @@ fn serial_fires_on_iterative_fib() {
     assert_eq!(sums.len(), 4);
     // The 4 sum-adds form ONE serial chain: each reads the previous lane's def
     // (no reassociation). sum_k's `total` operand is derived from sum_{k-1}.
-    let def = |id: InstId| vreg_of(&f.inst(id).operands[0]).unwrap();
+    let def = |id: InstId| f.inst(id).operands[0].as_vreg().unwrap();
     for k in 1..4 {
         let ops = &f.inst(sums[k]).operands;
         let reads_prev = ops
             .iter()
             .skip(1)
-            .filter_map(vreg_of)
+            .filter_map(trust_cg_ir::MachOperand::as_vreg)
             .any(|v| v == def(sums[k - 1]));
         assert!(reads_prev, "lane {k} sum must chain off lane {}", k - 1);
     }
@@ -602,8 +602,8 @@ fn bails_on_direct_carried_var_writeback_source() {
         for id in ids {
             let inst = f.inst_mut(id);
             if inst.opcode == AArch64Opcode::AddRI
-                && vreg_of(&inst.operands[0]).map(|v| v.id) == Some(7)
-                && vreg_of(&inst.operands[1]).map(|v| v.id) == Some(10)
+                && inst.operands[0].as_vreg().map(|v| v.id) == Some(7)
+                && inst.operands[1].as_vreg().map(|v| v.id) == Some(10)
             {
                 inst.operands[1] = v32(6); // a' = b (carried source, not a temp)
             }
@@ -739,7 +739,7 @@ fn bails_on_step_two() {
     let ids = f.block(bb0).insts.clone();
     for id in ids {
         let inst = f.inst_mut(id);
-        if inst.opcode == AArch64Opcode::Movz && vreg_of(&inst.operands[0]).map(|v| v.id) == Some(3)
+        if inst.opcode == AArch64Opcode::Movz && inst.operands[0].as_vreg().map(|v| v.id) == Some(3)
         {
             inst.operands[1] = i(2);
         }
@@ -832,7 +832,7 @@ fn split_guard_structure_i64() {
         .flat_map(|blk| blk.insts.iter())
         .filter(|&&id| {
             let inst = f.inst(id);
-            inst.opcode == AArch64Opcode::BCond && imm_of(&inst.operands[0]) == Some(CC_LO)
+            inst.opcode == AArch64Opcode::BCond && inst.operands[0].as_imm() == Some(CC_LO)
         })
         .count();
     assert_eq!(lo_bconds, 1);
@@ -956,7 +956,7 @@ fn full_unroll_fires_on_constant_trip_10() {
         .insts
         .iter()
         .filter(|&&id| f.inst(id).opcode == AArch64Opcode::LdrRI)
-        .filter_map(|&id| imm_of(&f.inst(id).operands[2]))
+        .filter_map(|&id| f.inst(id).operands[2].as_imm())
         .collect();
     imms.sort();
     let mut expect: Vec<i64> = (1..=9)
@@ -989,8 +989,8 @@ fn full_unroll_preserves_fp_accumulator_chain() {
         .collect();
     assert_eq!(fmadds.len(), 9);
     for w in fmadds.windows(2) {
-        let prev_dst = vreg_of(&f.inst(w[0]).operands[0]).unwrap();
-        let next_acc = vreg_of(&f.inst(w[1]).operands[3]).unwrap(); // addend = accumulator
+        let prev_dst = f.inst(w[0]).operands[0].as_vreg().unwrap();
+        let next_acc = f.inst(w[1]).operands[3].as_vreg().unwrap(); // addend = accumulator
         assert_eq!(
             prev_dst, next_acc,
             "single serial accumulator chain (no reassociation)"
@@ -1134,6 +1134,131 @@ fn cmpri_large_constant_trip_restores_4wide_unroll() {
     );
 }
 
+/// A loop whose HEADER dispatches through a five-entry jump table, the shape a
+/// coroutine resume loop takes (state 0 -> 3 -> 4 -> exit, states 1 and 2 and
+/// anything past the table leave through `bad`):
+///
+/// ```text
+/// bb0:    v10 = Movz #0; B header
+/// header: CmpRI v10, #4; BCond(HI, bad); v11 = Adr JumpTableIndex(0);
+///         v12 = LdrswRO [v11, v10]; v13 = AddRR v11, v12; Br v13
+/// arm_k:  v10 = Movz #next; B header        (arm 4: B exit; arms 1, 2: B bad)
+/// ```
+///
+/// With `dispatch == false` the header ends `B arm0` instead of the table
+/// dispatch (arm 0 is the only arm wired), so the same `CmpRI #4; B.HI
+/// <outside>` is a loop-leaving guard the normalizer rewrites: the control
+/// that the dispatch, and nothing else, keeps the bound.
+fn build_jump_table_header(dispatch: bool) -> MachFunction {
+    use AArch64Opcode::*;
+    let mut f = MachFunction::new("resume".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = f.entry;
+    let header = f.create_block();
+    let arms: Vec<BlockId> = (0..5).map(|_| f.create_block()).collect();
+    let bad = f.create_block();
+    let exit = f.create_block();
+    push(&mut f, bb0, Movz, vec![v64(10), i(0)]);
+    push(&mut f, bb0, B, vec![b(header)]);
+    push(&mut f, header, CmpRI, vec![v64(10), i(4)]);
+    push(&mut f, header, BCond, vec![i(8), b(bad)]); // HI
+    if dispatch {
+        f.jump_tables.push(trust_cg_ir::function::JumpTableData {
+            min_val: 0,
+            targets: arms.clone(),
+        });
+        push(
+            &mut f,
+            header,
+            Adr,
+            vec![v64(11), MachOperand::JumpTableIndex(0)],
+        );
+        push(&mut f, header, LdrswRO, vec![v64(12), v64(11), v64(10)]);
+        push(&mut f, header, AddRR, vec![v64(13), v64(11), v64(12)]);
+        push(&mut f, header, Br, vec![v64(13)]);
+        for &arm in &arms {
+            f.add_edge(header, arm);
+        }
+    } else {
+        push(&mut f, header, B, vec![b(arms[0])]);
+        f.add_edge(header, arms[0]);
+    }
+    f.add_edge(bb0, header);
+    f.add_edge(header, bad);
+    // Without the dispatch only arm 0 is reachable; the other arms stay empty
+    // and unwired so the loop has the one back edge arm 0 -> header.
+    let wired = if dispatch { arms.len() } else { 1 };
+    for (state, &arm) in arms.iter().enumerate().take(wired) {
+        match state {
+            0 | 3 => {
+                let next = if state == 0 { 3 } else { 4 };
+                push(&mut f, arm, Movz, vec![v64(10), i(next)]);
+                push(&mut f, arm, B, vec![b(header)]);
+                f.add_edge(arm, header);
+            }
+            4 => {
+                push(&mut f, arm, B, vec![b(exit)]);
+                f.add_edge(arm, exit);
+            }
+            _ => {
+                push(&mut f, arm, B, vec![b(bad)]);
+                f.add_edge(arm, bad);
+            }
+        }
+    }
+    push(&mut f, bad, Ret, vec![]);
+    push(&mut f, exit, Ret, vec![]);
+    f
+}
+
+fn normalize(func: &mut MachFunction) -> bool {
+    let dom = DomTree::compute(func);
+    let loops = LoopAnalysis::compute(func, &dom);
+    normalize_const_trip_guards(func, &loops)
+}
+
+#[test]
+fn a_jump_table_dispatch_header_keeps_its_bounds_immediate() {
+    // The switch binder binds a table's bound only inside the dispatch block;
+    // hoisting it into the preheader made the bridge refuse a coroutine's
+    // resume loop at O2/O3 ([TCG-A64-SWITCH-BIND]).
+    let mut f = build_jump_table_header(true);
+    assert!(
+        !normalize(&mut f),
+        "a jump-table dispatch header is not a trip guard"
+    );
+    assert_eq!(
+        count(&f, AArch64Opcode::CmpRI),
+        1,
+        "the bound stays an immediate"
+    );
+    assert_eq!(count(&f, AArch64Opcode::CmpRR), 0);
+    assert_eq!(
+        count(&f, AArch64Opcode::Movz),
+        3,
+        "no bound hoisted into the preheader"
+    );
+    assert_eq!(
+        run(&mut f),
+        0,
+        "the unroll pass's own normalization declines it too"
+    );
+    assert_eq!(count(&f, AArch64Opcode::CmpRI), 1);
+
+    // Control: the same guard without the dispatch is rewritten.
+    let mut control = build_jump_table_header(false);
+    assert!(
+        normalize(&mut control),
+        "the guard without a dispatch is normalized"
+    );
+    assert_eq!(count(&control, AArch64Opcode::CmpRI), 0);
+    assert_eq!(count(&control, AArch64Opcode::CmpRR), 1);
+    assert_eq!(
+        count(&control, AArch64Opcode::Movz),
+        3,
+        "bound hoisted beside the init"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // FULL-UNROLL of TWO-LEVEL AFFINE GATHERS — the Shootout `matrix` k-loop
 // `val += m1[i][k] * m2[k][j]` (int accumulator, pointer-array matrices).
@@ -1258,7 +1383,7 @@ fn ldr_imms(f: &MachFunction) -> Vec<i64> {
         .iter()
         .flat_map(|blk| blk.insts.iter().copied())
         .filter(|&id| f.inst(id).opcode == AArch64Opcode::LdrRI)
-        .filter_map(|id| imm_of(&f.inst(id).operands[2]))
+        .filter_map(|id| f.inst(id).operands[2].as_imm())
         .collect()
 }
 
@@ -1297,8 +1422,8 @@ fn full_unroll_fires_on_two_level_gather() {
         if inst.opcode != AArch64Opcode::LdrRI {
             continue;
         }
-        let imm = imm_of(&inst.operands[2]).unwrap();
-        match vreg_of(&inst.operands[0]).unwrap().class {
+        let imm = inst.operands[2].as_imm().unwrap();
+        match inst.operands[0].as_vreg().unwrap().class {
             RegClass::Gpr64 => row_imms.push(imm),
             _ => m1_imms.push(imm),
         }
@@ -1340,8 +1465,8 @@ fn full_unroll_gather_threads_row_load_into_dependent_base() {
         .insts
         .iter()
         .filter(|&&id| f.inst(id).opcode == AArch64Opcode::LdrRI)
-        .filter(|&&id| vreg_of(&f.inst(id).operands[0]).unwrap().class == RegClass::Gpr64)
-        .map(|&id| vreg_of(&f.inst(id).operands[0]).unwrap().id)
+        .filter(|&&id| f.inst(id).operands[0].as_vreg().unwrap().class == RegClass::Gpr64)
+        .map(|&id| f.inst(id).operands[0].as_vreg().unwrap().id)
         .collect();
     // Dependent element loads: Gpr32 LdrRI at #0 whose base is a Madd reading a
     // ROW def. There must be exactly 9 (one per folded copy).
@@ -1349,20 +1474,20 @@ fn full_unroll_gather_threads_row_load_into_dependent_base() {
     for &id in &f.block(ub).insts {
         let inst = f.inst(id);
         if inst.opcode != AArch64Opcode::LdrRI
-            || vreg_of(&inst.operands[0]).unwrap().class != RegClass::Gpr32
-            || imm_of(&inst.operands[2]) != Some(0)
+            || inst.operands[0].as_vreg().unwrap().class != RegClass::Gpr32
+            || inst.operands[2].as_imm() != Some(0)
         {
             continue;
         }
-        let base = vreg_of(&inst.operands[1]).unwrap();
+        let base = inst.operands[1].as_vreg().unwrap();
         let madd = f
             .block(ub)
             .insts
             .iter()
             .map(|&x| f.inst(x))
-            .find(|i| i.opcode == AArch64Opcode::Madd && vreg_of(&i.operands[0]) == Some(base));
+            .find(|i| i.opcode == AArch64Opcode::Madd && i.operands[0].as_vreg() == Some(base));
         if let Some(madd) = madd
-            && let Some(addend) = vreg_of(&madd.operands[3])
+            && let Some(addend) = madd.operands[3].as_vreg()
             && row_defs.contains(&addend.id)
         {
             dep_count += 1;
@@ -1394,9 +1519,9 @@ fn full_unroll_collapses_zero_fold_bases() {
         .iter()
         .filter(|&&id| {
             let inst = f.inst(id);
-            inst.opcode == AArch64Opcode::Movz && imm_of(&inst.operands[1]) == Some(0)
+            inst.opcode == AArch64Opcode::Movz && inst.operands[1].as_imm() == Some(0)
         })
-        .filter_map(|&id| vreg_of(&f.inst(id).operands[0]).map(|v| v.id))
+        .filter_map(|&id| f.inst(id).operands[0].as_vreg().map(|v| v.id))
         .collect();
     // Every `Movz #0` that remains must still be used (no dead materialised zero).
     let used: std::collections::HashSet<u32> = f
@@ -1404,7 +1529,7 @@ fn full_unroll_collapses_zero_fold_bases() {
         .iter()
         .flat_map(|blk| blk.insts.iter())
         .flat_map(|&id| f.inst(id).operands.iter().skip(1))
-        .filter_map(vreg_of)
+        .filter_map(trust_cg_ir::MachOperand::as_vreg)
         .map(|v| v.id)
         .collect();
     for z in &zero_defs {
@@ -1417,7 +1542,7 @@ fn full_unroll_collapses_zero_fold_bases() {
         let inst = f.inst(id);
         if matches!(inst.opcode, AArch64Opcode::Madd | AArch64Opcode::AddRR) {
             for op in inst.operands.iter().skip(1) {
-                if let Some(v) = vreg_of(op) {
+                if let Some(v) = op.as_vreg() {
                     assert!(
                         !zero_defs.contains(&v.id),
                         "fast-path {:?} still combines a materialised zero",
@@ -1437,9 +1562,9 @@ fn full_unroll_collapses_zero_fold_bases() {
         if inst.opcode != AArch64Opcode::LdrRI {
             continue;
         }
-        let base = vreg_of(&inst.operands[1]).unwrap().id;
-        let imm = imm_of(&inst.operands[2]).unwrap();
-        match vreg_of(&inst.operands[0]).unwrap().class {
+        let base = inst.operands[1].as_vreg().unwrap().id;
+        let imm = inst.operands[2].as_imm().unwrap();
+        match inst.operands[0].as_vreg().unwrap().class {
             RegClass::Gpr64 => assert_eq!(base, 2, "ROW fold addresses m2base directly"),
             RegClass::Gpr32 if imm != 0 => assert_eq!(base, 1, "m1 fold addresses m1row directly"),
             _ => {}
@@ -1465,13 +1590,13 @@ fn full_unroll_gather_preserves_accumulator_chain() {
         .copied()
         .filter(|&id| {
             f.inst(id).opcode == AArch64Opcode::Madd
-                && vreg_of(&f.inst(id).operands[0]).unwrap().class == RegClass::Gpr32
+                && f.inst(id).operands[0].as_vreg().unwrap().class == RegClass::Gpr32
         })
         .collect();
     assert_eq!(accs.len(), 9);
     for w in accs.windows(2) {
-        let prev_dst = vreg_of(&f.inst(w[0]).operands[0]).unwrap();
-        let next_acc = vreg_of(&f.inst(w[1]).operands[3]).unwrap();
+        let prev_dst = f.inst(w[0]).operands[0].as_vreg().unwrap();
+        let next_acc = f.inst(w[1]).operands[3].as_vreg().unwrap();
         assert_eq!(
             prev_dst, next_acc,
             "single serial accumulator chain (no reassociation)"
@@ -1693,4 +1818,851 @@ fn second_run_is_a_no_op() {
         assert_eq!(f.insts.len(), insts, "run {again} added instructions");
         assert_eq!(f.blocks.len(), blocks, "run {again} added blocks");
     }
+}
+
+// A real constant-trip SERIAL loop, rather than a direct call to the address
+// recognizer. Its four iterations use IV=1,2,3,4. The compound integer
+// accumulator prevents reassociation into SPLIT mode. The LSL/SXTX halfword S
+// bit multiplies the COMPLETE index by two. Low-32-bit extension modes have
+// separate no-fullfold controls below; this positive control does not require
+// distributing extension across arbitrary wrap/sign boundaries.
+fn build_narrow_ro_full_unroll(
+    opcode: AArch64Opcode,
+    mode: Option<i64>,
+    addend: i64,
+) -> (MachFunction, BlockId) {
+    use AArch64Opcode::*;
+    let mut f = MachFunction::new(
+        "narrow_ro_scale".to_string(),
+        Signature::new(vec![], vec![]),
+    );
+    let preheader = f.entry;
+    let header = f.create_block();
+    let exit = f.create_block();
+    let latch = f.create_block();
+    for (reg, value) in [(1, 5), (3, 1), (5, 1), (6, 1), (7, 257)] {
+        push(&mut f, preheader, Movz, vec![v64(reg), i(value)]);
+    }
+    push(&mut f, preheader, B, vec![b(header)]);
+    push(&mut f, header, AddRI, vec![v64(10), v64(5), i(addend)]);
+    let mut load_ops = vec![v64(12), v64(0), v64(10)];
+    if let Some(mode) = mode {
+        load_ops.push(i(mode));
+    }
+    push(&mut f, header, opcode, load_ops);
+    push(&mut f, header, EorRR, vec![v64(13), v64(6), v64(12)]);
+    push(&mut f, header, MulRR, vec![v64(15), v64(13), v64(7)]);
+    push(&mut f, header, AddRR, vec![v64(16), v64(5), v64(3)]);
+    push(&mut f, header, CmpRR, vec![v64(16), v64(1)]);
+    push(&mut f, header, BCond, vec![i(CC_EQ), b(exit)]);
+    push(&mut f, header, B, vec![b(latch)]);
+    push(&mut f, exit, Ret, vec![]);
+    push(&mut f, latch, MovR, vec![v64(5), v64(16)]);
+    push(&mut f, latch, MovR, vec![v64(6), v64(15)]);
+    push(&mut f, latch, B, vec![b(header)]);
+    f.add_edge(preheader, header);
+    f.add_edge(header, exit);
+    f.add_edge(header, latch);
+    f.add_edge(latch, header);
+    (f, header)
+}
+
+// Execute only the emitted straight-line integer address expressions, without
+// borrowing the pass's affine recognizer, mem_scale_of, or LoadFold. Load
+// results and accumulator expressions remain unknown; an unknown address is
+// a hard test failure, never silently interpreted as zero. No memory is read.
+fn narrow_ro_folded_addresses(f: &MachFunction, ub: BlockId) -> Vec<u64> {
+    use AArch64Opcode::*;
+    let mut values = HashMap::from_iter([(0u32, 0x4000u64)]);
+    let mut addresses = Vec::new();
+    for block in [f.entry, ub] {
+        for &id in &f.block(block).insts {
+            let inst = f.inst(id);
+            let read = |operand: &MachOperand| {
+                operand
+                    .as_vreg()
+                    .and_then(|reg| values.get(&reg.id).copied())
+            };
+            let value = match (inst.opcode, inst.operands.as_slice()) {
+                (Movz, [_, MachOperand::Imm(value)]) => Some(*value as u64),
+                (MovR | Copy, [_, source]) => read(source),
+                (AddRI, [_, source, MachOperand::Imm(value)]) => {
+                    read(source).map(|source| source.wrapping_add(*value as u64))
+                }
+                (AddRR, [_, lhs, rhs]) => read(lhs)
+                    .zip(read(rhs))
+                    .map(|(lhs, rhs)| lhs.wrapping_add(rhs)),
+                (LslRI, [_, source, MachOperand::Imm(shift)]) if (0..64).contains(shift) => {
+                    read(source).map(|source| source << *shift as u32)
+                }
+                (Uxtw, [_, source]) => read(source).map(|source| source as u32 as u64),
+                (Sxtw, [_, source]) => {
+                    read(source).map(|source| source as u32 as i32 as i64 as u64)
+                }
+                (LdrRI | LdrbRI | LdrhRI, [_, base, MachOperand::Imm(offset)]) => {
+                    let base = read(base).expect("every emitted folded address must be known");
+                    addresses.push(base.wrapping_add(*offset as u64));
+                    None
+                }
+                (B, [MachOperand::Block(_)]) => continue,
+                _ => None,
+            };
+            if let Some(dst) = inst
+                .operands
+                .first()
+                .and_then(trust_cg_ir::MachOperand::as_vreg)
+            {
+                values.remove(&dst.id);
+                if let Some(value) = value {
+                    values.insert(dst.id, value);
+                }
+            }
+        }
+    }
+    addresses
+}
+
+fn check_narrow_ro_full_unroll_addresses(scaled_half: bool) {
+    use AArch64Opcode::*;
+    let mut cases = 0;
+    let mut addresses_checked = 0;
+    let mut mismatches = Vec::new();
+    for opcode in [LdrbRO, LdrhRO] {
+        for mode in [None, Some(6), Some(7), Some(14), Some(15)] {
+            let scaled = opcode == LdrhRO && matches!(mode, Some(7 | 15));
+            if scaled != scaled_half {
+                continue;
+            }
+            for addend in [0, 3] {
+                let (mut f, header) = build_narrow_ro_full_unroll(opcode, mode, addend);
+                let original: Vec<_> = f
+                    .block(header)
+                    .insts
+                    .iter()
+                    .map(|&id| {
+                        let inst = f.inst(id);
+                        (inst.opcode, inst.operands.clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    run(&mut f),
+                    1,
+                    "actual pass must fire: {opcode:?}/{mode:?}/{addend}"
+                );
+                let ri = if opcode == LdrhRO { LdrhRI } else { LdrbRI };
+                assert_eq!(count(&f, ri), 3, "three folded iterations must be present");
+                assert_eq!(
+                    count(&f, opcode),
+                    1,
+                    "the fourth iteration retains the original load"
+                );
+                let after: Vec<_> = f
+                    .block(header)
+                    .insts
+                    .iter()
+                    .map(|&id| {
+                        let inst = f.inst(id);
+                        (inst.opcode, inst.operands.clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    after, original,
+                    "the tail's original address intent must survive"
+                );
+                assert_eq!(f.block(f.entry).succs.len(), 1);
+                let ub = f.block(f.entry).succs[0];
+                assert_ne!(ub, header, "the actual preheader must enter the fast path");
+                assert_eq!(f.block(ub).succs, vec![header]);
+                assert_eq!(
+                    f.inst(*f.block(ub).insts.last().unwrap()).operands,
+                    vec![b(header)]
+                );
+                let actual = narrow_ro_folded_addresses(&f, ub);
+                let byte_scale = if scaled { 2u64 } else { 1 };
+                let expected: Vec<_> = (1..=3u64)
+                    .map(|iv| 0x4000 + (iv + addend as u64) * byte_scale)
+                    .collect();
+                assert_eq!(actual.len(), 3);
+                assert!(expected.windows(2).all(|pair| pair[0] != pair[1]));
+                cases += 1;
+                addresses_checked += actual.len();
+                if actual != expected {
+                    mismatches.push(format!("{opcode:?}/{mode:?}/addend={addend}: actual={actual:?}, expected={expected:?}"));
+                }
+            }
+        }
+    }
+    let expected_cases = if scaled_half { 4 } else { 16 };
+    assert_eq!(cases, expected_cases);
+    assert_eq!(addresses_checked, 3 * expected_cases);
+    eprintln!(
+        "narrow RO full unroll: cases={cases}, addresses={addresses_checked}, mismatching_cases={}",
+        mismatches.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "actual folded address mismatches:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+// These are address-transform controls, not loaded-value arithmetic tests:
+// the full-width load remains in the actual transformed loop, while the serial
+// integer recurrence uses an invariant term. This avoids inventing H/Q integer
+// arithmetic or a cross-bank use just to exercise a memory address.
+#[test]
+fn narrow_ro_full_unroll_preserves_fullwidth_load_scales() {
+    use AArch64Opcode::*;
+    let mut cases = 0;
+    let mut addresses_checked = 0;
+    let mut mismatches = Vec::new();
+    for (class, bytes) in [
+        (RegClass::Gpr32, 4u64),
+        (RegClass::Gpr64, 8),
+        (RegClass::Fpr16, 2),
+        (RegClass::Fpr32, 4),
+        (RegClass::Fpr64, 8),
+        (RegClass::Fpr128, 16),
+    ] {
+        for mode in [None, Some(6), Some(7), Some(14), Some(15)] {
+            for addend in [0, 3] {
+                let (mut f, header) = build_narrow_ro_full_unroll(LdrRO, mode, addend);
+                let load_id = f.block(header).insts[1];
+                f.inst_mut(load_id).operands[0] = MachOperand::VReg(VReg::new(12, class));
+                let eor_id = f.block(header).insts[2];
+                f.inst_mut(eor_id).operands[2] = v64(7);
+                let original: Vec<_> = f
+                    .block(header)
+                    .insts
+                    .iter()
+                    .map(|&id| {
+                        let inst = f.inst(id);
+                        (inst.opcode, inst.operands.clone())
+                    })
+                    .collect();
+                assert_eq!(
+                    run(&mut f),
+                    1,
+                    "actual full-width pass: {class:?}/{mode:?}/{addend}"
+                );
+                assert_eq!(count(&f, LdrRI), 3);
+                assert_eq!(count(&f, LdrRO), 1);
+                let after: Vec<_> = f
+                    .block(header)
+                    .insts
+                    .iter()
+                    .map(|&id| {
+                        let inst = f.inst(id);
+                        (inst.opcode, inst.operands.clone())
+                    })
+                    .collect();
+                assert_eq!(after, original);
+                assert_eq!(f.block(f.entry).succs.len(), 1);
+                let ub = f.block(f.entry).succs[0];
+                assert_ne!(ub, header);
+                assert_eq!(f.block(ub).succs, vec![header]);
+                for &id in &f.block(ub).insts {
+                    let inst = f.inst(id);
+                    if inst.opcode == LdrRI {
+                        assert_eq!(inst.operands.len(), 3);
+                        assert_eq!(inst.operands[0].as_vreg().unwrap().class, class);
+                    }
+                }
+                let actual = narrow_ro_folded_addresses(&f, ub);
+                let scale = if matches!(mode, Some(7 | 15)) {
+                    bytes
+                } else {
+                    1
+                };
+                let expected: Vec<_> = (1..=3u64)
+                    .map(|iv| 0x4000 + (iv + addend as u64) * scale)
+                    .collect();
+                assert_eq!(actual.len(), 3);
+                cases += 1;
+                addresses_checked += actual.len();
+                if actual != expected {
+                    mismatches.push(format!("{class:?}/{mode:?}/addend={addend}: actual={actual:?}, expected={expected:?}"));
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 60);
+    assert_eq!(addresses_checked, 180);
+    eprintln!(
+        "fullwidth RO scale: cases={cases}, addresses={addresses_checked}, mismatching_cases={}",
+        mismatches.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "full-width address folding mismatch:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn narrow_ro_full_unroll_checks_dependent_32bit_index_slices() {
+    use AArch64Opcode::*;
+    let mut cases = 0;
+    let mut mismatches = Vec::new();
+    for extension in [Sxtw, Uxtw] {
+        for mode in [6, 7] {
+            for shape in ["direct", "unknown_rest", "shift31"] {
+                let (mut f, header) = build_narrow_ro_full_unroll(LdrhRO, Some(mode), 0);
+                // All induction, step, bound and increment operands use the
+                // SAME W class; there is no invented X/W view of one VReg.
+                for inst in &mut f.insts {
+                    for operand in &mut inst.operands {
+                        if let MachOperand::VReg(reg) = operand
+                            && [1, 3, 5, 16].contains(&reg.id)
+                        {
+                            reg.class = RegClass::Gpr32;
+                        }
+                    }
+                }
+                let index_id = f.block(header).insts[0];
+                let source = if shape == "direct" {
+                    v32(5)
+                } else {
+                    let arithmetic = if shape == "unknown_rest" {
+                        MachInst::new(AddRR, vec![v32(31), v32(5), v32(30)])
+                    } else {
+                        MachInst::new(LslRI, vec![v32(31), v32(5), i(31)])
+                    };
+                    let arithmetic_id = f.push_inst(arithmetic);
+                    f.block_mut(header).insts.insert(0, arithmetic_id);
+                    v32(31)
+                };
+                *f.inst_mut(index_id) = MachInst::new(extension, vec![v64(10), source]);
+                if shape == "shift31" {
+                    // Independent W-arithmetic witness: IV 1,2,3 produces
+                    // 0x80000000,0,0x80000000, not a modulo64 affine sequence.
+                    let words: Vec<_> = (1..=3u32).map(|iv| iv.wrapping_shl(31)).collect();
+                    assert_eq!(words, vec![0x8000_0000, 0, 0x8000_0000]);
+                    let extended: Vec<_> = words
+                        .iter()
+                        .map(|&word| {
+                            if extension == Sxtw {
+                                word as i32 as i64 as u64
+                            } else {
+                                word as u64
+                            }
+                        })
+                        .collect();
+                    assert_ne!(
+                        extended[1].wrapping_sub(extended[0]),
+                        extended[2].wrapping_sub(extended[1])
+                    );
+                } else if shape == "unknown_rest" {
+                    // A genuine unknown W live-in may place the dependent
+                    // addition across the wrap/sign boundary even at IV 1..3.
+                    let wrap: Vec<_> = (1..=3u32)
+                        .map(|iv| 0xffff_fffeu32.wrapping_add(iv))
+                        .collect();
+                    let sign: Vec<_> = (1..=3u32)
+                        .map(|iv| 0x7fff_fffeu32.wrapping_add(iv) as i32)
+                        .collect();
+                    assert_eq!(wrap, vec![u32::MAX, 0, 1]);
+                    assert_eq!(sign, vec![i32::MAX, i32::MIN, i32::MIN + 1]);
+                }
+                // Direct extension of IV=1..4 has an actual safe range.
+                // Sxtw currently folds and remains a positive control.
+                // Uxtw may already fail the closed body whitelist; if admitted
+                // in future, it must fold correctly, not invent a mode error.
+                // The two composed expressions may already decline folding.
+                let fired = run(&mut f);
+                assert!(fired <= 1);
+                let loads: Vec<_> = f
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.insts.iter())
+                    .map(|&id| f.inst(id))
+                    .filter(|inst| inst.opcode == LdrhRO)
+                    .collect();
+                let modes_exact = loads
+                    .iter()
+                    .all(|inst| inst.operands.len() == 4 && inst.operands[3] == i(mode));
+                cases += 1;
+                if shape == "direct" {
+                    if extension == Sxtw {
+                        assert_eq!(fired, 1, "safe direct Sxtw IV must still optimize");
+                    }
+                    if fired == 0 {
+                        assert_eq!(extension, Uxtw);
+                        assert_eq!(loads.len(), 1);
+                        assert_eq!(count(&f, LdrhRI), 0);
+                        assert!(modes_exact);
+                    } else if count(&f, LdrhRI) == 3 && loads.len() == 1 && modes_exact {
+                        let ub = f.block(f.entry).succs[0];
+                        assert_ne!(ub, header);
+                        assert_eq!(f.block(ub).succs, vec![header]);
+                        let actual = narrow_ro_folded_addresses(&f, ub);
+                        let scale = if mode == 7 { 2 } else { 1 };
+                        let expected: Vec<_> = (1..=3u64).map(|iv| 0x4000 + iv * scale).collect();
+                        if actual != expected {
+                            mismatches.push(format!("{extension:?}/{mode}/direct: actual={actual:?}, expected={expected:?}"));
+                        }
+                    } else {
+                        mismatches.push(format!(
+                            "{extension:?}/{mode}/direct: RI={}, RO={}, modes_exact={modes_exact}",
+                            count(&f, LdrhRI),
+                            loads.len()
+                        ));
+                    }
+                    continue;
+                }
+                let expected_ro = if fired == 0 { 1 } else { 5 };
+                if count(&f, LdrhRI) != 0 || loads.len() != expected_ro || !modes_exact {
+                    mismatches.push(format!("{extension:?}/{mode}/{shape}: fired={fired}, RI={}, RO={}, modes_exact={modes_exact}", count(&f, LdrhRI), loads.len()));
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 12);
+    eprintln!(
+        "dependent 32-bit RO slices: cases={cases}, mismatching_cases={}",
+        mismatches.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "unsupported dependent index slice was folded:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn narrow_ro_full_unroll_preserves_identity_address_modes() {
+    check_narrow_ro_full_unroll_addresses(false);
+}
+
+#[test]
+fn narrow_ro_full_unroll_preserves_scaled_halfword_addresses() {
+    check_narrow_ro_full_unroll_addresses(true);
+}
+
+#[test]
+fn narrow_ro_full_unroll_retains_low32_modes_with_unknown_rest() {
+    use AArch64Opcode::*;
+    let mut cases = 0;
+    let mut mismatches = Vec::new();
+    for opcode in [LdrbRO, LdrhRO] {
+        for mode in [4, 5, 12, 13] {
+            let (mut f, header) = build_narrow_ro_full_unroll(opcode, Some(mode), 0);
+            let index_id = f.block(header).insts[0];
+            // The base is v0; REST is a separate unknown Gpr64 live-in v30.
+            // A small IV bound does not constrain this affine expression.
+            *f.inst_mut(index_id) = MachInst::new(AddRR, vec![v64(10), v64(5), v64(30)]);
+            let shift = u32::from(opcode == LdrhRO && mode & 1 == 1);
+            let mut distinct_witnesses = 0;
+            for rest in [0x1_0000_0000u64, 0xffff_fffe, 0x7fff_fffe] {
+                let mut differs = false;
+                for iv in 1..=3u64 {
+                    let index = rest.wrapping_add(iv);
+                    let extended = if mode < 8 {
+                        index as u32 as u64
+                    } else {
+                        index as u32 as i32 as i64 as u64
+                    };
+                    differs |= extended.wrapping_shl(shift) != index.wrapping_shl(shift);
+                }
+                distinct_witnesses += usize::from(differs);
+            }
+            assert!(
+                distinct_witnesses >= 2,
+                "concrete high/wrap/sign witnesses must differ"
+            );
+            let fired = run(&mut f);
+            assert!(fired <= 1);
+            let ri = if opcode == LdrhRO { LdrhRI } else { LdrbRI };
+            let ro_insts: Vec<_> = f
+                .blocks
+                .iter()
+                .flat_map(|block| block.insts.iter())
+                .map(|&id| f.inst(id))
+                .filter(|inst| inst.opcode == opcode)
+                .collect();
+            let expected_ro = if fired == 0 { 1 } else { 5 };
+            let exact_modes = ro_insts
+                .iter()
+                .all(|inst| inst.operands.len() == 4 && inst.operands[3] == i(mode));
+            cases += 1;
+            if count(&f, ri) != 0 || ro_insts.len() != expected_ro || !exact_modes {
+                mismatches.push(format!("{opcode:?}/mode={mode}: fired={fired}, RI={}, RO={}, exact_modes={exact_modes}", count(&f, ri), ro_insts.len()));
+            }
+        }
+    }
+    assert_eq!(cases, 8);
+    eprintln!(
+        "narrow RO low32 unknown REST: cases={cases}, mismatching_cases={}",
+        mismatches.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "unsupported low32 fold must preserve RO intent:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+#[test]
+fn narrow_ro_full_unroll_does_not_erase_malformed_raw_intent() {
+    use AArch64Opcode::*;
+    let tails = [vec![i(0)], vec![i((1i64 << 40) | 6)], vec![i(6), i(99)]];
+    let mut cases = 0;
+    let mut mismatches = Vec::new();
+    for opcode in [LdrbRO, LdrhRO] {
+        for tail in &tails {
+            let (mut f, header) = build_narrow_ro_full_unroll(opcode, None, 0);
+            let load_id = f.block(header).insts[1];
+            f.inst_mut(load_id).operands.extend(tail.iter().cloned());
+            let fired = run(&mut f);
+            assert!(fired <= 1);
+            let ri = if opcode == LdrhRO { LdrhRI } else { LdrbRI };
+            let ro_insts: Vec<_> = f
+                .blocks
+                .iter()
+                .flat_map(|block| block.insts.iter())
+                .map(|&id| f.inst(id))
+                .filter(|inst| inst.opcode == opcode)
+                .collect();
+            // An optimizer may decline or clone an invalid instruction for the
+            // mandatory validation boundary to reject. It may not erase the
+            // malformed mode/extra operands into a different, valid RI load.
+            let expected_ro = if fired == 0 { 1 } else { 5 };
+            let exact_tails = ro_insts
+                .iter()
+                .all(|inst| inst.operands.get(3..) == Some(tail.as_slice()));
+            cases += 1;
+            if count(&f, ri) != 0 || ro_insts.len() != expected_ro || !exact_tails {
+                mismatches.push(format!("{opcode:?}/tail={tail:?}: fired={fired}, RI={}, RO={}, exact_tails={exact_tails}", count(&f, ri), ro_insts.len()));
+            }
+        }
+    }
+    assert_eq!(cases, 6);
+    eprintln!(
+        "narrow RO malformed intent: cases={cases}, mismatching_cases={}",
+        mismatches.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "malformed raw intent was erased:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the main loop and the full
+// unroll reproduce the induction and the carried accumulators only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build, VReg); 3] = [
+        (
+            "rotated product",
+            build_prod_i64,
+            VReg::new(5, RegClass::Gpr64),
+        ),
+        ("top-tested fsum", build_fsum, VReg::new(6, RegClass::Gpr32)),
+        (
+            "clang-rotated full unroll",
+            || build_floatmm_like(11, 164),
+            VReg::new(12, RegClass::Gpr64),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, build, iv) in shapes {
+        assert_eq!(run(&mut build()), 1, "{name}: plain fixture fires");
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if run(&mut carried) != 0 {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if run(&mut live_out) != 0 {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
+/// The premise of `Handoff::Header`, claimed for the top-tested and
+/// clang-rotated shapes: the new blocks (the 4-wide main loop, or the full
+/// unroll's straight-line copies) leave only for the original loop header.
+#[test]
+fn header_shapes_hand_off_only_to_the_scalar_header() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build); 2] = [
+        ("top-tested fsum", build_fsum),
+        ("clang-rotated full unroll", || build_floatmm_like(11, 164)),
+    ];
+    for (name, build) in shapes {
+        let mut func = build();
+        let dom = DomTree::compute(&func);
+        let loops = LoopAnalysis::compute(&func, &dom);
+        let header = loops.all_loops().next().expect("one loop").header;
+        let before = func.num_blocks();
+        assert_eq!(run(&mut func), 1, "{name}: fires");
+        let created: Vec<BlockId> = (before..func.num_blocks())
+            .map(|id| BlockId(id as u32))
+            .collect();
+        assert!(!created.is_empty(), "{name}: new blocks");
+        assert!(
+            crate::loop_contract::hands_off_only_to(&func, &created, header),
+            "{name}: the rewrite must resume only at the scalar header"
+        );
+    }
+}
+
+/// A body register read directly after the loop: the last loaded `a[i]` of the
+/// top-tested `fsum`. The closed-world rule constrains what body instructions
+/// read, not what code after the loop reads, so only the loop-state contract
+/// refuses it. (A frontend usually routes such a value through a latch
+/// writeback, which this pass threads as a carried variable; stated directly,
+/// the 4-wide main loop never writes it, so an empty tail leaves it stale.)
+#[test]
+fn refuses_a_body_register_read_after_the_loop() {
+    let mut func = build_fsum();
+    // `build_fsum` creates entry, header, latch, exit in that order.
+    let exit = BlockId(3);
+    let read = func.push_inst(MachInst::new(
+        AArch64Opcode::FmovFprFpr,
+        vec![vf32(21), vf32(14)],
+    ));
+    func.block_mut(exit).insts.insert(0, read);
+    assert_eq!(
+        run(&mut func),
+        0,
+        "the loaded value read after the loop must stay scalar"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TOP-TESTED unsigned loop with header copies: `h3_box_leak`'s `acc += *v[k]`
+// ---------------------------------------------------------------------------
+
+/// Knobs for [`build_box_sum`].
+#[derive(Clone, Copy)]
+struct BoxSum {
+    /// Condition code of the header test (`LO` is the bridge's `k < len`).
+    cc: i64,
+    /// Width of the induction and the bound.
+    wide: bool,
+    /// Compare copies of `k` and `len` (`ck = MovR k ; cn = MovR len`).
+    copies: bool,
+    /// Redefine the copied `k` before the compare (the copy is then stale).
+    clobber_copy_source: bool,
+}
+
+impl BoxSum {
+    fn bridge() -> Self {
+        Self {
+            cc: CC_LO,
+            wide: true,
+            copies: true,
+            clobber_copy_source: false,
+        }
+    }
+}
+
+/// The post-pipeline TOP-TESTED shape of `h3_box_leak`'s sum loop:
+///
+/// ```text
+/// bb0:    v0=ptr v1=len v5=MovI#0(k) v6=MovI#0(acc); B header
+/// header: [v8=MovR v5 ; v9=MovR v1] ; CmpRR v8,v9 ; BCond(cc, latch) ; B exit
+/// latch:  v10=LdrRO[v0,v5,LSL #3] ; v11=LdrRI[v10,#0] ; v12=AddRR v6,v11 ;
+///         v13=AddRI v5,#1 ; v6=MovR v12 ; v5=MovR v13 ; B header
+/// exit:   v20=MovR v6
+/// ```
+fn build_box_sum(cfg: BoxSum) -> MachFunction {
+    let mut f = MachFunction::new("boxsum".to_string(), Signature::new(vec![], vec![]));
+    let bb0 = f.entry;
+    let header = f.create_block();
+    let latch = f.create_block();
+    let exit = f.create_block();
+    use AArch64Opcode::*;
+    let iv = |id| if cfg.wide { v64(id) } else { v32(id) };
+    push(&mut f, bb0, MovI, vec![iv(5), i(0)]);
+    push(&mut f, bb0, MovI, vec![v64(6), i(0)]);
+    push(&mut f, bb0, B, vec![b(header)]);
+    let (a, n) = if cfg.copies {
+        push(&mut f, header, MovR, vec![iv(8), iv(5)]);
+        if cfg.clobber_copy_source {
+            push(&mut f, header, MovR, vec![iv(5), iv(1)]);
+        }
+        push(&mut f, header, MovR, vec![iv(9), iv(1)]);
+        (iv(8), iv(9))
+    } else {
+        (iv(5), iv(1))
+    };
+    push(&mut f, header, CmpRR, vec![a, n]);
+    push(&mut f, header, BCond, vec![i(cfg.cc), b(latch)]);
+    push(&mut f, header, B, vec![b(exit)]);
+    push(&mut f, latch, LdrRO, vec![v64(10), v64(0), iv(5), i(7)]); // LSL #3
+    push(&mut f, latch, LdrRI, vec![v64(11), v64(10), i(0)]);
+    push(&mut f, latch, AddRR, vec![v64(12), v64(6), v64(11)]);
+    push(&mut f, latch, AddRI, vec![iv(13), iv(5), i(1)]);
+    push(&mut f, latch, MovR, vec![v64(6), v64(12)]);
+    push(&mut f, latch, MovR, vec![iv(5), iv(13)]);
+    push(&mut f, latch, B, vec![b(header)]);
+    push(&mut f, exit, MovR, vec![v64(20), v64(6)]);
+    f.add_edge(bb0, header);
+    f.add_edge(header, latch);
+    f.add_edge(header, exit);
+    f.add_edge(latch, header);
+    f
+}
+
+#[test]
+fn split_fires_on_unsigned_top_tested_gather_with_header_copies() {
+    let mut f = build_box_sum(BoxSum::bridge());
+    assert_eq!(run(&mut f), 1);
+    // The lanes read the pointers at `[v0 + k*8, #8k]` from one
+    // `p = v0 + iv*8` (no per-lane index registers), then deref them: 4 lane
+    // pointer loads + 4 lane derefs + the original deref as `LdrRI`, and only
+    // the original indexed load stays `LdrRO`.
+    assert_eq!(count(&f, AArch64Opcode::LdrRO), 1);
+    assert_eq!(count(&f, AArch64Opcode::LdrRI), 9);
+    assert_eq!(count(&f, AArch64Opcode::AddRRShift), 1);
+    let p = f
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter().copied())
+        .find(|&id| f.inst(id).opcode == AArch64Opcode::AddRRShift)
+        .map(|id| f.inst(id).operands.clone())
+        .unwrap();
+    assert_eq!(p[1..], [v64(0), v64(5), i(3)]);
+    let mut offsets: Vec<i64> = f
+        .blocks
+        .iter()
+        .flat_map(|blk| blk.insts.iter().copied())
+        .filter(|&id| {
+            let inst = f.inst(id);
+            inst.opcode == AArch64Opcode::LdrRI && inst.operands[1] == p[0]
+        })
+        .map(|id| f.inst(id).operands[2].as_imm().unwrap())
+        .collect();
+    offsets.sort();
+    assert_eq!(offsets, vec![0, 8, 16, 24]);
+    // No lane index register is left to compute.
+    assert!(
+        !f.blocks.iter().flat_map(|blk| blk.insts.iter()).any(|&id| {
+            let inst = f.inst(id);
+            inst.opcode == AArch64Opcode::AddRI
+                && inst.operands[1] == v64(5)
+                && inst.operands[2] != i(1)
+                && inst.operands[2] != i(4)
+        })
+    );
+    // The 64-bit main loop is guarded unsigned, as for a signed `LT` loop.
+    assert!(f.blocks.iter().flat_map(|blk| blk.insts.iter()).any(|&id| {
+        let inst = f.inst(id);
+        inst.opcode == AArch64Opcode::BCond && inst.operands[0] == i(CC_LO)
+    }));
+}
+
+#[test]
+fn split_fires_on_unsigned_top_tested_gather_without_copies() {
+    let mut f = build_box_sum(BoxSum {
+        copies: false,
+        ..BoxSum::bridge()
+    });
+    assert_eq!(run(&mut f), 1);
+}
+
+#[test]
+fn top_tested_widening_keeps_its_refusals() {
+    for (what, cfg) in [
+        (
+            "unsigned 32-bit induction: the i32 guard is signed",
+            BoxSum {
+                wide: false,
+                ..BoxSum::bridge()
+            },
+        ),
+        (
+            "unsigned <= is not a counted < loop",
+            BoxSum {
+                cc: 9, // LS
+                ..BoxSum::bridge()
+            },
+        ),
+        (
+            "a copy whose source is redefined before the compare",
+            BoxSum {
+                clobber_copy_source: true,
+                ..BoxSum::bridge()
+            },
+        ),
+    ] {
+        let mut f = build_box_sum(cfg);
+        assert_eq!(run(&mut f), 0, "{what}");
+    }
+}
+
+#[test]
+fn top_tested_copy_source_clobbered_through_its_w_view_is_refused() {
+    // `v8 = MovR x5 ; w5 = MovR w1 ; CmpRR v8, ..`: the 32-bit write of the
+    // copied induction's numeric ID redefines it before the compare, so the
+    // copy no longer names the induction. A write of an unrelated ID through
+    // the W view leaves the shape admitted.
+    for (id, fires) in [(5, 0), (30, 1)] {
+        let mut f = build_box_sum(BoxSum::bridge());
+        let header = BlockId(1);
+        let clobber = f.push_inst(MachInst::new(AArch64Opcode::MovR, vec![v32(id), v32(1)]));
+        f.block_mut(header).insts.insert(1, clobber);
+        assert_eq!(run(&mut f), fires, "W write of id {id}");
+    }
+}
+
+#[test]
+fn widened_top_test_is_split_only() {
+    // The same unsigned, copied header around a loadless two-variable
+    // recurrence (SERIAL mode) stays rolled; with a signed bare header the
+    // SERIAL unroll still fires (the pre-widening behavior).
+    let build = |widened: bool| {
+        let mut f = MachFunction::new("rec".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = f.entry;
+        let header = f.create_block();
+        let latch = f.create_block();
+        let exit = f.create_block();
+        use AArch64Opcode::*;
+        push(&mut f, bb0, MovI, vec![v64(5), i(0)]);
+        push(&mut f, bb0, MovI, vec![v64(6), i(1)]);
+        push(&mut f, bb0, MovI, vec![v64(7), i(1)]);
+        push(&mut f, bb0, B, vec![b(header)]);
+        if widened {
+            push(&mut f, header, MovR, vec![v64(8), v64(5)]);
+            push(&mut f, header, CmpRR, vec![v64(8), v64(1)]);
+            push(&mut f, header, BCond, vec![i(CC_LO), b(latch)]);
+        } else {
+            push(&mut f, header, CmpRR, vec![v64(5), v64(1)]);
+            push(&mut f, header, BCond, vec![i(CC_LT), b(latch)]);
+        }
+        push(&mut f, header, B, vec![b(exit)]);
+        // a, b = b, a + b
+        push(&mut f, latch, AddRR, vec![v64(10), v64(6), v64(7)]);
+        push(&mut f, latch, MovR, vec![v64(11), v64(7)]);
+        push(&mut f, latch, AddRI, vec![v64(13), v64(5), i(1)]);
+        push(&mut f, latch, MovR, vec![v64(6), v64(11)]);
+        push(&mut f, latch, MovR, vec![v64(7), v64(10)]);
+        push(&mut f, latch, MovR, vec![v64(5), v64(13)]);
+        push(&mut f, latch, B, vec![b(header)]);
+        push(&mut f, exit, MovR, vec![v64(20), v64(7)]);
+        f.add_edge(bb0, header);
+        f.add_edge(header, latch);
+        f.add_edge(header, exit);
+        f.add_edge(latch, header);
+        f
+    };
+    assert_eq!(
+        run(&mut build(false)),
+        1,
+        "bare signed header: SERIAL fires"
+    );
+    assert_eq!(run(&mut build(true)), 0, "widened header: SERIAL refused");
 }

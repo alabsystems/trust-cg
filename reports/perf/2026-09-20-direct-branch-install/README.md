@@ -1,0 +1,64 @@
+# Installed direct integer comparison branches — 2026-09-20
+
+> **Payload removed.** This record's logs, captures, JSON files, inventories
+> and `records/` are no longer in the tree; Markdown and reproducer sources
+> stay. The last commit that contains them is `2e07d67a791aff374037cd25494d46afa668af1d`.
+> The gzipped captures were removed earlier; their last commit is
+> `ea8492fd9315ed8863af166657fed1b75bcf2c93`.
+> Recover a file with `git show <sha>:<path>`. References below to removed
+> files describe that commit.
+
+The active local compiler package now uses clean source `eed34e14cd4087e04f498d03949951b1346c1c36`, including
+adjacent single-use integer compare/branch selection at every optimization
+level and the earlier reference/global repairs. The original dominated-bound
+Rust conditional store now compiles at O0/O1. See the
+[source and native qualification](../2026-09-20-direct-integer-branches/README.md).
+
+## Package and checks
+
+- Package: `/home/ayates/.local/lib/trust-cg/eed34e14-ay43f133d3-cleaned2a80d1`.
+- CLI SHA-256: `d98440693bc4e9a20f27c1dda9192936c4dd23f56caa3b8cd3e84f081f70553c`; stock Rust development build, 121.72 seconds.
+- Genuine Trust private backend SHA-256: `ee63ccb2ff2bf1b34a9917b0ebefc5220196c57ad9635c776b3f7fd6e65c4889`.
+- AY `93fe897aea3b4ad5d2ff50c9729c8aa097bfcf36dcbf581e21c4515bbeaf400b`
+  and Clean `680069f8d7185a8dbc0cc67e860d57a7df9ca4cf8bd8a4d8951346cbbf594dbc`
+  are unchanged.
+- All **228 preflight commands** pass before activation. At O0–O3 the existing
+  checks cover return42, twenty select functions, twenty diamond functions,
+  48 arithmetic proof exports and 6,912 native arithmetic calls. Select and
+  diamond each execute 15,360 comparisons. Existing arithmetic proof owners
+  remain intact.
+- The candidate backend freshly compiles and executes the ten qualified
+  admitted O0/O1 fixed-array/writer cases with exact object equality: 2,570
+  arena/ABI calls, sixteen arena words, eight placements and eight invalid-index
+  traps before any shared-memory store. The two newly admitted dominated-bound
+  cases also check that large out-of-range indices neither write nor trap.
+- Six O0/O1 aligned-reference, scalar/array-reference and static-data cases
+  also compile and execute before activation. Every emitted object matches its
+  qualified counterpart. The eighteen address-return variants pass 7,200 ABI
+  calls checking values, float bits, Unicode, array contents, source alignment
+  and allocation identity. Static oracles check packed pointers, function calls,
+  self-cycles and mutable cells. Earlier object-level CFI checks are retained in
+  the linked qualification; this installation repeats compilation and native
+  execution without claiming a new CFI suite.
+
+The launcher at `~/.local/bin/trust-cg` selects this package and adds its tool
+prefix to PATH. AY/Clean links use the same package. No proof-policy environment
+override is injected; previous packages remain. The included backend is selected
+explicitly with Trust's `-Zcodegen-backend`; the qualified Rust lane uses
+`-Ztrust-verify=off` while backend proof enforcement stays enabled.
+
+An activated-launcher smoke checks all tool identities, then performs an O3
+proof export, native link and execution through the installed command. Source,
+CLI and staged backend/tool identities are checked before activation. The
+resource envelope remains anchored at 16 GiB RSS, zero grace, two build jobs and
+serial preflight commands. Complete logs, proof packets, objects, oracles and
+source/tool identities are retained; large binaries are identified by hash.
+
+Unwinding, general CSet, precise CMP proof binding, reference validity and broader
+source/native proof composition remain open. This is a local development
+installation, not a signed release, verified frontend or verified self-host.
+All L01–L14 remain OPEN. No complete floor or performance result is claimed.
+
+```sh
+python3 scripts/check_evidence_archive.py reports/perf/2026-09-20-direct-branch-install
+```

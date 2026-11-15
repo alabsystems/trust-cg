@@ -136,6 +136,7 @@ mod tests {
             // No IR position: these are synthetic fixtures, and `site: None`
             // is the fail-closed reading (unbindable, never a wildcard).
             site: None,
+            spec: None,
         }
     }
 
@@ -179,6 +180,7 @@ mod tests {
                 lineage: clean_cic_lineage_digest(&obl),
                 kernel_recheck: None,
             },
+            assurance: None,
         };
         let report = build_guard_evidence_report(std::slice::from_ref(&obl), &[cert]);
         let expected_lineage = obligation_lineage_key(&obl);

@@ -103,8 +103,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -260,11 +271,14 @@ fn differential_test(
 /// sizeof(i64) = 8).
 fn build_heap_sum_squares_module(fname: &str, origin: AllocOrigin) -> TrustIrModule {
     let mut module = TrustIrModule::new("heapsumsq");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // Value ids:
     //  0  = n (param)
@@ -442,7 +456,9 @@ fn build_heap_sum_squares_module(fname: &str, origin: AllocOrigin) -> TrustIrMod
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -454,29 +470,28 @@ fn build_global_addr_module() -> TrustIrModule {
 
     // Little-endian i64 0x0000_0000_0000_4243 = 16963.
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "_heap_data_answer".to_string(),
         ty: Ty::I64,
         mutable: false,
-        initializer: Some(Constant::Aggregate(vec![
-            Constant::Int(0x43),
-            Constant::Int(0x42),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-            Constant::Int(0),
-        ])),
+        // WS7.3: typed at the global's `i64` (trust-ir refuses a byte
+        // aggregate there as `ConstTypeMismatch`).
+        initializer: Some(Constant::Int(0x4243)),
         linkage: Linkage::External,
         tls: None,
         align: None,
     });
 
-    let ret_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ret_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut entry =
         TrustIrFunction::new(FuncId::new(0), "_use_heap_global", ret_ft, BlockId::new(0));
@@ -502,7 +517,9 @@ fn build_global_addr_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -635,4 +652,13 @@ int main(void) {
 "#;
     let r = differential_test("global_addr_load", &module, c_source);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -46,6 +46,9 @@
 
 #![allow(clippy::all)]
 mod common;
+#[path = "common/field_typed.rs"]
+mod field_typed;
+
 use common::a64_interp::{A64Interp, MachoText, extract_text, symbol_addrs, text_branch_relocs};
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
@@ -72,6 +75,7 @@ fn node(inst: Inst, results: Vec<u32>) -> InstrNode {
 
 fn struct_def(id: u32, name: &str, fields: &[Ty]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields: fields
@@ -158,6 +162,13 @@ fn module(
     body: Vec<InstrNode>,
 ) -> M {
     let mut m = M {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        global_asm: vec![],
+        tuple_layouts: Vec::new(),
+        imports: vec![],
         name: name.into(),
         functions: vec![],
         structs,
@@ -177,6 +188,8 @@ fn module(
         predicates: vec![],
     };
     m.functions.push(F {
+        body_gate: None,
+        display_path: None,
         attrs: Default::default(),
         id: FuncId::new(0),
         name: fn_name.into(),
@@ -195,6 +208,9 @@ fn module(
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     });
     m
 }
@@ -212,8 +228,11 @@ fn compile(m: &M, opt: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
-    c.compile(m).expect("aarch64 compile").object_code
+    )
+    .with_codegen_license(permit_unlicensed());
+    c.compile(&field_typed::normalized(m))
+        .expect("aarch64 compile")
+        .object_code
 }
 
 /// Build an interpreter over the compiled object's `__text` and return it plus
@@ -284,6 +303,7 @@ fn hfa_f32x2_in_s0_s1() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -316,6 +336,7 @@ fn hfa_f64x2_in_d0_d1() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -350,6 +371,7 @@ fn hfa_f32x4_in_s0_s3() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -386,6 +408,7 @@ fn hfa_f64x3_in_d0_d2() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -425,6 +448,7 @@ fn mixed_i64_f64_in_x0_x1() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -460,6 +484,7 @@ fn mixed_f64_i64_in_x0_x1() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -492,6 +517,7 @@ fn small_i64x2_in_x0_x1() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -530,6 +556,7 @@ fn large_i64x3_indirect_ptr_in_x0() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -584,6 +611,7 @@ fn fp_arg_exhaustion_ninth_on_stack() {
         FuncTy {
             params: vec![Ty::F64; 9],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -627,6 +655,7 @@ fn sret_large_struct_via_x8() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![agg.clone()],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -677,6 +706,7 @@ fn hfa_with_zst_member_still_in_s0_s1() {
         FuncTy {
             params: vec![agg.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         },
         "_callee",
@@ -695,4 +725,13 @@ fn hfa_with_zst_member_still_in_s0_s1() {
             "{opt:?}: HFA with a ZST member still comes from S0/S1"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

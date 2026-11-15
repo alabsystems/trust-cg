@@ -1,0 +1,2 @@
+perf-ratchet: OK 80b0e03aa609-20260929T141257Z.json (evidence=True, coverage 0.0%, runtime geomean None, warm-vs-O2 None, mismatches 0)
+perf-ratchet: CURRENT 80b0e03aa609-20260929T141257Z.json measured HEAD 80b0e03aa609 (eligible evidence)

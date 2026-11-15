@@ -27,22 +27,35 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use trust_ir::{
     BinOp, BlockId, CallingConv, CastOp, Constant, FCmpOp, FuncId, FuncTy, FuncTyId, Function,
-    Global, ICmpOp, InstrNode, Linkage, Module, ProofAnnotation, ProofTag, SwitchCase, Ty, UnOp,
-    ValueId, inst::Inst,
+    Global, ICmpOp, InstrNode, Linkage, Module, ParamAttrs, ProofAnnotation, ProofTag, SwitchCase,
+    Ty, UnOp, ValueId, Visibility, inst::Inst,
 };
 
+use crate::attributes::{
+    AttributeRead, ProcessorTable, ReturnAddressSigning, SubtargetSelection,
+    read_function_attribute, skip_bracket_group,
+};
+use crate::lexical::Kind as LexKind;
 use crate::native_vector::{NativeForm, NativePlan, Shape};
+use crate::triple::TargetTriple;
 use crate::{Error, Result};
+use trust_cg_lower::global_image::type_flat_image;
 use trust_cg_lower::{
-    LLVM_LIBM_PURE_FUNCTION_ATTR_TAG, LLVM_STACK_PROTECTOR_FUNCTION_ATTR_TAG,
-    LLVM_STACK_PROTECTOR_REQUIRED_FUNCTION_ATTR_TAG,
+    AdapterNamedCallSemantics, DefinitionBinding, LLVM_LIBM_PURE_FUNCTION_ATTR_TAG,
+    LLVM_STACK_PROTECTOR_FUNCTION_ATTR_TAG, LLVM_STACK_PROTECTOR_REQUIRED_FUNCTION_ATTR_TAG,
+    RelocationModel, classify_adapter_named_call,
 };
 
 const MAX_IMPORTED_GLOBAL_INIT_BYTES: u64 = 64 * 1024 * 1024;
+/// Width of one relocated pointer slot in an imported data image. The importer
+/// reads LP64 IR only (AArch64 and x86-64), as its `[N x ptr]` byte sizes say.
+const IMPORTED_POINTER_BYTES: u64 = 8;
 const MAX_LLVM_IR_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 // --------------------------------------------------------------------------
@@ -51,7 +64,7 @@ const MAX_LLVM_IR_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read the file at `path` and import its LLVM IR text into a `trust_ir::Module`.
 pub fn import_module(path: &Path) -> Result<trust_ir::Module> {
-    let text = read_llvm_ir_text(path)?;
+    let text = read_module_text(path)?;
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -61,14 +74,647 @@ pub fn import_module(path: &Path) -> Result<trust_ir::Module> {
 }
 
 /// Import an in-memory LLVM IR text string into a `trust_ir::Module`.
+///
+/// The rules that depend on the compile target (the object format's symbol
+/// names, `\01` asm labels, the RISC-V calling convention) read the
+/// module's `target triple`, as llc does without `-mtriple`. A module
+/// without one is read for no known target: a `\01` label and a `.L` name
+/// are read as for a target that is not Mach-O, and `fastcc` and a feature
+/// that selects a RISC-V calling convention as for RISC-V (a RISC-V
+/// definition stating none is not read for RISC-V). A caller that compiles
+/// the module for a known target passes it to [`import_text_for_target`].
 pub fn import_text(text: &str, module_name: &str) -> Result<trust_ir::Module> {
+    import_text_with_target(text, module_name, None, None)
+}
+
+/// Import an in-memory LLVM IR text string into a `trust_ir::Module`
+/// compiled for `target_triple`, which takes the place of the module's
+/// `target triple` as llc's `-mtriple` does (an empty one names none).
+/// The triple is read as LLVM's `Triple` reads it, without the
+/// normalization llc gives `-mtriple`: pass it in normal form
+/// (`arch-vendor-os[-environment]`, as `trust-cg-codegen`'s
+/// `TargetSpec::triple` writes it).
+pub fn import_text_for_target(
+    text: &str,
+    module_name: &str,
+    target_triple: &str,
+) -> Result<trust_ir::Module> {
+    import_text_with_target(text, module_name, Some(target_triple), None)
+}
+
+/// [`import_text_for_target`] for a compile the caller also makes under
+/// `relocation_model`, llc's `-relocation-model`. The rules that depend on
+/// how llc and this backend address a `dso_local` symbol read it
+/// (`Parser::refuse_dso_local_addressing_llc_writes_otherwise`); without it
+/// ([`import_text`], [`import_text_for_target`]) they refuse what any model
+/// they cannot rule out would make differ. The caller must compile the
+/// returned module for `target_triple` under `relocation_model`: the module
+/// does not record either, so a compile under another model may address a
+/// symbol otherwise than llc for the model it was imported for.
+pub fn import_text_for_compile(
+    text: &str,
+    module_name: &str,
+    target_triple: &str,
+    relocation_model: RelocationModel,
+) -> Result<trust_ir::Module> {
+    import_text_with_target(
+        text,
+        module_name,
+        Some(target_triple),
+        Some(relocation_model),
+    )
+}
+
+fn import_text_with_target(
+    text: &str,
+    module_name: &str,
+    compile_target: Option<&str>,
+    relocation_model: Option<RelocationModel>,
+) -> Result<trust_ir::Module> {
     let mut parser = Parser::new(text, module_name.to_string());
+    parser.compile_target = compile_target
+        .filter(|triple| !triple.is_empty())
+        .map(str::to_string);
+    parser.relocation_model = relocation_model;
     parser.parse()?;
+    refuse_quoted_symbol_names(
+        &parser.module,
+        &parser.symbol_origin,
+        parser.target.is_some_and(TargetTriple::is_mach_o),
+    )?;
+    refuse_definitions_under_library_names(&parser)?;
+    // WS7.3: the module states the target it is compiled for (an FFI boundary
+    // requires it, `TargetInfoRequired`). A caller's compile target takes the
+    // place of the module's `target triple`, as it does for the reading above.
+    if let Some(triple) = parser
+        .compile_target
+        .as_deref()
+        .or(parser.target_triple.as_deref())
+    {
+        parser.module.target_info =
+            Some(target_info_of(triple, parser.target_datalayout.as_deref()));
+    }
+    // A function DEFINITION in `@llvm.used`: LLVM marks its section retained
+    // in the object (`SHF_GNU_RETAIN`, so `--gc-sections` keeps it; Mach-O
+    // `no_dead_strip`). trust-ir's `Function::retained` would carry that,
+    // but this backend's adapter refuses it, so the function is refused here
+    // by name instead of emitted collectable. A declaration has no section
+    // to retain, and `@llvm.compiler.used` asks for no linker retention.
+    //
+    // Names are compared as the symbols LLVM names (`llvm_symbol_identity`):
+    // `@"reg"` and `@reg` are one symbol to LLVM. The text reaching this
+    // point is canonical (`lexical::canonicalize` spells `@"reg"` as `@reg`),
+    // so only a `\01` asm label is still quoted here.
+    if let Some(function) = parser.module.functions.iter().find(|function| {
+        !function.blocks.is_empty()
+            && function.linkage != Linkage::AvailableExternally
+            && parser
+                .llvm_used_symbols
+                .contains(&llvm_symbol_identity(&function.name))
+    }) {
+        return Err(Error::Unsupported(format!(
+            "function `@{}` is listed in `@llvm.used`: LLVM retains its section in the object \
+             (`SHF_GNU_RETAIN`; Mach-O `no_dead_strip`), and this backend does not admit \
+             trust-ir's `Function::retained`",
+            function.name
+        )));
+    }
+    // A function DECLARATION in `@llvm.used` (bodyless, or
+    // `available_externally`, which the backend compiles as a declaration):
+    // llc's ELF writer writes nothing for the listing, so the declaration
+    // stays unmarked and is an undefined symbol exactly when something
+    // references it or its visibility or weakness puts it in the table, as
+    // with llc. llc's other writers may write it: Mach-O an
+    // `N_NO_DEAD_STRIP` undefined symbol, referenced or not
+    // (`.no_dead_strip`), COFF for an MSVC environment a `/INCLUDE:` linker
+    // directive, Wasm a no-strip undefined symbol. No emitter here writes any
+    // of them for a function (the adapter refuses `Function::retained`), so
+    // the declaration is admitted only when the compile target's object
+    // format is ELF (`Parser::target`: the caller's triple, else the
+    // module's `target triple`, read as LLVM's `Triple` reads it,
+    // `crate::triple::read`) and refused by name otherwise, with no target
+    // known included, as the `\01` label reader reads a label only for a
+    // Mach-O target. A module imported without a compile target
+    // (`import_text`) whose own triple names ELF but which is compiled for
+    // another format still loses the listing; `import_text_for_target`
+    // reads the format the module is compiled for.
+    if !parser.target.is_some_and(TargetTriple::is_elf)
+        && let Some(function) = parser.module.functions.iter().find(|function| {
+            (function.blocks.is_empty() || function.linkage == Linkage::AvailableExternally)
+                && parser
+                    .llvm_used_symbols
+                    .contains(&llvm_symbol_identity(&function.name))
+        })
+    {
+        return Err(Error::Unsupported(match parser.target {
+            Some(target) if target.is_mach_o() => format!(
+                "function declaration `@{}` is listed in `@llvm.used` in a Mach-O module: llc \
+                 writes it as an `N_NO_DEAD_STRIP` undefined symbol even when nothing \
+                 references it, and this backend writes no such symbol for a function",
+                function.name
+            ),
+            target => format!(
+                "function declaration `@{}` is listed in `@llvm.used` in a module whose \
+                 `target triple` names no ELF target ({}): llc's ELF writer writes nothing for \
+                 the listing, its other writers may write it (Mach-O an `N_NO_DEAD_STRIP` \
+                 undefined symbol, COFF for an MSVC environment a `/INCLUDE:` directive, Wasm \
+                 a no-strip undefined symbol), and this backend writes none of them for a \
+                 function",
+                function.name,
+                match target {
+                    Some(target) => format!(
+                        "the compile target's object format is {}",
+                        target.object_format.name()
+                    ),
+                    None => "no compile target is known, so the object format the module is \
+                             compiled for is not"
+                        .to_string(),
+                }
+            ),
+        }));
+    }
+    // `@llvm.used` retention (trust-ir v41), the `SHF_GNU_RETAIN` llc gives
+    // a listed definition's section. Every listed `Global` row is marked,
+    // definitions and declarations alike (an `external`/`extern_weak`
+    // declaration and an `available_externally` global, which the backend
+    // compiles as an import): the flag is LLVM's, and each object path
+    // decides it (`ObjectGlobal::retained`). For an import the ELF emitters
+    // write nothing, as llc's ELF writer does, and the Mach-O emitters refuse
+    // it, since llc's Mach-O writer gives a listed declaration an
+    // `N_NO_DEAD_STRIP` undefined symbol even when nothing references it. A
+    // listed function is no `Global` row: a definition is refused above, and
+    // a declaration is refused above unless the compile target is ELF and
+    // otherwise not marked. `@llvm.compiler.used` marks nothing: llc
+    // writes no retention for it, so a retained section would survive a
+    // `--gc-sections` link that drops llc's.
+    for g in &mut parser.module.globals {
+        if parser
+            .llvm_used_symbols
+            .contains(&llvm_symbol_identity(&g.name))
+        {
+            g.retained = true;
+        }
+    }
     Ok(parser.module)
 }
 
-fn read_llvm_ir_text(path: &Path) -> Result<String> {
-    let size = fs::metadata(path)?.len();
+/// Refuse a symbol whose name the importer would write where llc writes
+/// another, unless it is an internal or private definition, whose name
+/// stays inside its object, so no other object can name it:
+///
+/// * a name that is no plain LLVM name after LLVM's escapes (`@"a b"`,
+///   `@"012"`: still quoted in canonical text, `lexical::canonicalize`; and
+///   the name after a Mach-O `\01_` asm label that is no plain name,
+///   `@"\01_a b"`, `@"\01_1x"`, which `Parser::split_asm_label` quotes).
+///   The importer keeps such a name in its quoted spelling, which the
+///   object writer would write into the symbol table, where llc writes the
+///   decoded bytes;
+/// * a numbered symbol (`@0`, carried as `0`): LLVM's Mangler names an
+///   unnamed symbol `__unnamed_N` (`___unnamed_N` on Mach-O), numbering
+///   them in the order llc first names them, and the importer writes `0`.
+///
+/// Since the importer writes a numbered symbol by its number, a module that
+/// has one is also refused when another symbol's name holds `__unnamed_`:
+/// llc may name the numbered one alike, and then binds a call or load of
+/// the other one to it, or rejects the module.
+///
+/// Unless the compile target's object format is Mach-O (`macho`, read from
+/// the target triple as LLVM reads it, `crate::triple::read`; false when
+/// no target is known), a symbol that is not
+/// private whose name starts with `.L` is refused too, whatever its
+/// linkage. The importer reads such a module's names as ELF names, and `.L`
+/// is LLVM's private-symbol prefix for ELF
+/// (`DataLayout::getPrivateGlobalPrefix`, mangling mode `e`): llc names a
+/// private `@X` `.LX`, and its MC layer reads every symbol name starting
+/// with `.L` as an assembler temporary (`MCContext::getOrCreateSymbol`, by
+/// `MCAsmInfo`'s private prefix, `.L` on ELF). So llc
+/// binds a call or load of a declared `@.LX` to a private `@X` of the
+/// module, rejects one nothing defines ("Undefined temporary symbol"),
+/// rejects an internal `@.LX` beside a private `@X` ("already defined"),
+/// and writes an external `@.LX` definition into the symbol table only when
+/// its own object refers to it; the importer writes a private `@X` as a
+/// local `X` and every other symbol by its name. A private symbol's `.L`
+/// name meets nothing (llc writes a private `@.LX` as `.L.LX`); a
+/// definition named as a library function llc calls on its own, or as a
+/// call the importer writes in place of an intrinsic, is refused apart,
+/// whatever its linkage (`refuse_definitions_under_library_names`). On
+/// Mach-O, LLVM's private prefixes are `L` and the linker-private `l`
+/// (llc 22 wrote a private `@foo` as `l_foo`), while every other symbol the
+/// importer carries is written after the prefix `_` (a `\01` label not
+/// starting with `_` is refused), so no name the importer admits there
+/// meets a private one.
+fn refuse_quoted_symbol_names(
+    module: &Module,
+    symbol_origin: &HashMap<String, SymbolOrigin>,
+    macho: bool,
+) -> Result<()> {
+    let functions = module.functions.iter().map(|function| {
+        (
+            "function",
+            &function.name,
+            function.linkage,
+            !function.blocks.is_empty(),
+        )
+    });
+    let globals = module.globals.iter().map(|global| {
+        (
+            "global",
+            &global.name,
+            global.linkage,
+            global.initializer.is_some(),
+        )
+    });
+    let symbols: Vec<_> = functions.chain(globals).collect();
+    if let Some((numbered_what, numbered)) = symbols
+        .iter()
+        .find(|(_, name, _, _)| is_decimal_name(name))
+        .map(|(what, name, _, _)| (what, name))
+        && let Some((what, name, _, _)) = symbols
+            .iter()
+            .find(|(_, name, _, _)| name.contains("__unnamed_"))
+    {
+        return Err(Error::Unsupported(format!(
+            "{what} `@{name}` in a module with the numbered {numbered_what} `@{numbered}`: \
+             LLVM names a numbered symbol `__unnamed_N` (`___unnamed_N` on Mach-O), which may \
+             be this name, and this importer writes it by its number"
+        )));
+    }
+    if !macho
+        && let Some((what, name, _, _)) = symbols.iter().find(|(_, name, linkage, _)| {
+            *linkage != Linkage::Private && llvm_symbol_identity(name).starts_with(".L")
+        })
+    {
+        return Err(Error::Unsupported(format!(
+            "{what} `@{name}`: unless the target's object format is Mach-O, LLVM writes a \
+             private symbol `@X` as `.LX` and reads every name starting with `.L` as an \
+             assembler temporary, \
+             so llc binds a reference to `@.LX` to a private `@X`, rejects one nothing \
+             defines, and writes a definition into the symbol table only when its own object \
+             refers to it; this importer carries a `.L` name only for a private symbol"
+        )));
+    }
+    for &(what, name, linkage, defined) in &symbols {
+        if defined && matches!(linkage, Linkage::Internal | Linkage::Private) {
+            continue;
+        }
+        if is_decimal_name(name) {
+            return Err(Error::Unsupported(format!(
+                "{what} `@{name}`: a numbered symbol is carried only for an internal or \
+                 private definition, whose name stays inside the object; LLVM names any other \
+                 `__unnamed_N` (`___unnamed_N` on Mach-O, N counting the numbered symbols in \
+                 the order llc names them), and this importer would write `{name}`"
+            )));
+        }
+        if !name.starts_with('"') {
+            continue;
+        }
+        let decoded = crate::lexical::describe_quoted_name(name);
+        let (spelling, described) = match symbol_origin.get(name.as_str()) {
+            Some(origin) if origin.is_asm_label => (
+                origin.original.as_str(),
+                format!("the `\\01` asm label of the Mach-O symbol `_{decoded}`"),
+            ),
+            _ => (name.as_str(), format!("`{decoded}` after LLVM's escapes")),
+        };
+        return Err(Error::Unsupported(format!(
+            "{what} `@{spelling}` ({described}): a symbol name that is no plain LLVM name \
+             (`[-a-zA-Z$._][-a-zA-Z$._0-9]*`) is carried only for an internal or private \
+             definition, whose name stays inside the object; for any other, this importer \
+             would write the quoted spelling into the symbol the linker sees, where llc writes \
+             the decoded name"
+        )));
+    }
+    Ok(())
+}
+
+/// Library functions llc 22.1.2's code generator gives meaning to on its
+/// own for AArch64 Linux (a GNU environment) and Darwin, read in its
+/// source; each group with what llc does. llc calls such a function where
+/// the module calls none, or lowers the module's calls of it to other code
+/// (inline, an instruction, or a call of another function), so a module
+/// definition so named runs where llc's object runs the library's or other
+/// code, or the reverse; this importer's build calls the functions the
+/// module calls (and those of [`libm_intrinsic_symbol`] and
+/// `memset_patternN` for the intrinsics it rewrites,
+/// `Parser::introduced_callees`), except that its backend reads a call of a
+/// `memcpy`, `memmove` or `memset` declared with C's prototype and
+/// convention (`trust_cg_lower::adapter::classify_adapter_direct_call`) as
+/// a bulk-memory operation and may expand one with a constant count into
+/// loads and stores, calling nothing, where llc 22.1.2 keeps the call
+/// (LD-16's corrected premise, 2026-10-23; `nobuiltin` and `"no-builtin*"`
+/// are refused, `crate::attributes`; a declaration of the three that this
+/// importer would carry otherwise than LLVM reads it, `fastcc` (read as C),
+/// unprototyped `(...)`, unmodeled, absent, or a Mach-O `\01_` label, is
+/// refused, [`is_c_library_routine_read_by_prototype`]). Declared otherwise
+/// each is called.
+/// The names LLVM lists as runtime library calls for AArch64 are refused
+/// apart, by a table derived from LLVM's
+/// (`crate::llvm_runtime_libcalls`); many names here are in both.
+///
+/// * Formed: `sincos`, `sincosf` and `sincosl` (a GNU environment) and
+///   `__sincos_stret` and `__sincosf_stret` (Darwin) from a `sin` and a
+///   `cos` of one operand (`SelectionDAGLegalize::ExpandNode`, `FSINCOS`;
+///   llc 22.1.2 called `sincos` and `___sincos_stret` for
+///   `@llvm.sin.f64` and `@llvm.cos.f64` at O2, and for `memory(none)`
+///   calls of a module's own external `sin` and of `cos`); `cbrt` and
+///   `cbrtf` from `pow(x, 1/3)` with `nnan ninf nsz afn`
+///   (`DAGCombiner::visitFPOW`); `bzero` for a zero fill on Darwin
+///   (`AArch64SelectionDAGInfo`, at O0 too); `memset_pattern16` for a
+///   constant pattern fill on Darwin (`PreISelIntrinsicLowering`, by
+///   `getOrInsertLibFunc`, which takes the module's function of that name
+///   whatever its linkage); and the plain functions `CodeGenPrepare` calls
+///   in place of a fortified call whose object size is unknown
+///   (`FortifiedLibCallSimplifier`; llc called `strcpy` for
+///   `__strcpy_chk`, `memcpy` for `__mempcpy_chk` and `memccpy` for
+///   `__memccpy_chk`), `memcpy`, `memmove` and `memset` among them.
+/// * Formed and replaced: `memcmp` (`MergeICmps` forms a call from a chain
+///   of comparisons, by `getOrInsertLibFunc`; `ExpandMemCmp` and
+///   `SelectionDAGBuilder::visitCall` expand calls of it inline) and
+///   `mempcpy` (formed for `__mempcpy_chk`, lowered by `visitCall` as
+///   `memcpy`: llc called `memcpy` for a call of `mempcpy` at O2).
+/// * Replaced: the fortified functions LLVM 22.1.2's `TargetLibraryInfo`
+///   names (every `__*_chk` of `TargetLibraryInfo.td`, each of which
+///   `FortifiedLibCallSimplifier` reads): `CodeGenPrepare` replaces a call
+///   of one whose object size argument is -1 with the plain function above,
+///   at O1-O3 and for a module-local definition too (the eighth verifier
+///   round of L02-P15 and its closure audit of 2026-10-16: the import of a
+///   module's own `__strcpy_chk` writing `X` gave 88, llc's build 97, at
+///   O1-O3; of an internal `__memcpy_chk` 7 against 42). And the names
+///   `SelectionDAGBuilder::visitCall` lowers to other code on AArch64 for a
+///   function that is not module-local: `fabs` and
+///   `copysign` (an instruction), `sqrt` and its `__sqrt_finite` forms
+///   (`fsqrt`: llc 22.1.2 replaced a `memory(none)` call of a module's own
+///   external `sqrt` at O2, as `PartiallyInlineLibCalls` does), `sin` and
+///   `cos` (merged into `sincos` above), `bcmp` (expanded inline, as by
+///   `ExpandMemCmp`), `ldexp` (`FLDEXP`, an SVE `fscale` wherever the
+///   function's features or processor give SVE: llc gave 12 where the
+///   module's own `ldexp` gave 42, at O1-O3 under `+sve`, `+sve2`,
+///   `+sve2p1` or `"target-cpu"="neoverse-v2"`; refused on every target, the
+///   features not read) and `exp10` (`FEXP10`, a call of `__exp10` on
+///   Darwin, `exp10` elsewhere: llc's Darwin object at O1-O3 called
+///   `___exp10` where the import ran the module's own `exp10`; refused on
+///   every target, the OS not read), each with its `f` and `l` forms (`long
+///   double` is `double` on Darwin).
+///
+/// Not listed here: the rest of `visitCall`'s list, which AArch64 lowers to
+/// a call of the same name (`tan`, `exp2`, `log2`, ...; refused by the
+/// runtime-call table all the same) or leaves a call (`strcmp`, `strnlen`,
+/// `memchr` outside streaming functions; `strlen`, `strcpy` and `stpcpy`
+/// too, listed above as formed); `sincospi` and `__sincospi_stret`, which
+/// llc forms only for `@llvm.sincospi` (no intrinsic this importer lowers);
+/// and the vector library names (no `-vector-library` by default). A
+/// definition is refused whatever its linkage, also where the lowering
+/// above would not reach it (`visitCall` skips a module-local function;
+/// `bzero` on Linux; `ldexp` without SVE; `exp10` off Darwin): stated
+/// over-refusals. `parser::tests::library_name_table_is_complete` names
+/// every entry and derives the fortified ones from LLVM's table.
+const LLC_LIBRARY_NAMES: &[(&[&str], &str)] = &[
+    (
+        &[
+            "sincos",
+            "sincosf",
+            "sincosl",
+            "__sincos_stret",
+            "__sincosf_stret",
+            "cbrt",
+            "cbrtf",
+            "bzero",
+            "memset_pattern16",
+            "memcpy",
+            "memmove",
+            "memset",
+            "memccpy",
+            "strcpy",
+            "stpcpy",
+            "strncpy",
+            "stpncpy",
+            "strcat",
+            "strncat",
+            "strlcpy",
+            "strlcat",
+            "strlen",
+            "snprintf",
+            "sprintf",
+            "vsnprintf",
+            "vsprintf",
+        ],
+        "calls it where the module calls none (a `sin` and a `cos` of one operand as \
+         `sincos` or `__sincos_stret`, `pow(x, 1/3)` with fast-math flags as `cbrt`, a zero fill \
+         as `bzero` and a pattern fill as `memset_pattern16` on Darwin, a fortified call as the \
+         plain function)",
+    ),
+    (
+        &["memcmp", "mempcpy"],
+        "calls it where the module calls none (a chain of comparisons as `memcmp`, \
+         `__mempcpy_chk` as `mempcpy`) and lowers the module's calls of it to other code \
+         (inline, or `memcpy`)",
+    ),
+    (
+        &[
+            "__memccpy_chk",
+            "__memcpy_chk",
+            "__memmove_chk",
+            "__mempcpy_chk",
+            "__memset_chk",
+            "__snprintf_chk",
+            "__sprintf_chk",
+            "__stpcpy_chk",
+            "__stpncpy_chk",
+            "__strcat_chk",
+            "__strcpy_chk",
+            "__strlcat_chk",
+            "__strlcpy_chk",
+            "__strlen_chk",
+            "__strncat_chk",
+            "__strncpy_chk",
+            "__vsnprintf_chk",
+            "__vsprintf_chk",
+        ],
+        "replaces the module's calls of it whose object size is unknown (-1) with the plain \
+         function (`CodeGenPrepare`'s `FortifiedLibCallSimplifier`, at O1-O3 and for a \
+         module-local definition too: `__strcpy_chk` as `strcpy`)",
+    ),
+    (
+        &["ldexp", "ldexpf", "ldexpl"],
+        "lowers the module's `memory(none)` calls of it as `FLDEXP`, an SVE `fscale` where the \
+         function's features or processor give SVE (refused on every target: the features are \
+         not read)",
+    ),
+    (
+        &["exp10", "exp10f", "exp10l"],
+        "lowers the module's `memory(none)` calls of it as `FEXP10`, a call of `__exp10` or \
+         `__exp10f` on Darwin (refused on every target: the OS is not read)",
+    ),
+    (
+        &[
+            "fabs",
+            "fabsf",
+            "fabsl",
+            "copysign",
+            "copysignf",
+            "copysignl",
+            "sqrt",
+            "sqrtf",
+            "sqrtl",
+            "__sqrt_finite",
+            "__sqrtf_finite",
+            "__sqrtl_finite",
+            "sin",
+            "sinf",
+            "sinl",
+            "cos",
+            "cosf",
+            "cosl",
+            "bcmp",
+        ],
+        "lowers the module's calls of it to other code (`sqrt` as `fsqrt`, a `sin` and a `cos` \
+         of one operand as `sincos`, `bcmp` inline)",
+    ),
+];
+
+/// What llc does with the library function `name` on its own
+/// ([`LLC_LIBRARY_NAMES`]), or `None`.
+fn llc_library_name_use(name: &str) -> Option<&'static str> {
+    LLC_LIBRARY_NAMES
+        .iter()
+        .find(|(names, _)| names.contains(&name))
+        .map(|&(_, what)| what)
+}
+
+/// Refuse a module that defines a function or global, whatever its linkage
+/// (an `available_externally` body excepted: no object holds it), under a
+/// name of [`LLC_LIBRARY_NAMES`], under a runtime library call LLVM 22.1.2
+/// lists for AArch64 ([`crate::llvm_runtime_libcalls`]), or under a name
+/// this importer gives a call it writes in place of an intrinsic the module
+/// calls (`Parser::introduced_callees`: `sin` for `@llvm.sin.f64`, `powf`
+/// for `@llvm.pow.f32`, `memset_pattern4` for an `i32` pattern fill).
+///
+/// For the runtime library calls: llc's code generator calls one for an
+/// operation the module states where it does not compute the operation
+/// inline, and which it does depends on the optimization level and the
+/// operands; this backend decides otherwise, so a definition so named runs
+/// where llc's object runs other code, or the reverse (the closure audit of
+/// 2026-10-16: with a module's own `__udivti3` returning 42, an `i128`
+/// `udiv` of 100 by 3 gave 42 in llc's build at O0 and 33 at O1-O3, the
+/// import 42 at O0-O3; with a module's own `__floattidf` returning 70, the
+/// `i128` 100 converted to `double` gave 70 in the import and 100 in llc's
+/// build at O1-O3). The table holds names llc's code generator never calls
+/// on AArch64 Linux or Darwin too (`malloc`, `calloc` and `free`, which
+/// LLVM lists for its middle end and the LTO symbol table; Windows'
+/// `__chkstk`): stated over-refusals, as is every definition llc's own call
+/// would reach as the import's does.
+///
+/// For the names of calls this importer writes in place of an intrinsic:
+/// the intrinsic computes the library function (LLVM's LangRef), and llc's
+/// object calls a module definition so named only where llc lowers the
+/// intrinsic to a call of that name alone. It merges
+/// `@llvm.sin.f64` and `@llvm.cos.f64` of one operand into a call of
+/// `sincos` (the seventh verifier round of L02-P15: beside an internal
+/// `@sincos`, llc's build printed 42 and the importer's sin + cos = 1.357
+/// at O2; beside an internal `@sin`, llc's object at O2 calls libm's
+/// `sincos`), `@llvm.pow.f64` with fast-math flags into `cbrt`, and on
+/// Darwin calls `memset_pattern16` (the module's function of that name
+/// whatever its linkage) or expands a loop for a pattern fill; it names a
+/// private definition after its private prefix (`.Lsin` on ELF, `l_sin` on
+/// Mach-O), which no libcall reaches. Where llc does call it (an internal
+/// or external `@exp` beside `@llvm.exp.f64`), the refusal is a stated
+/// over-refusal. A Mach-O `\01_sin` label is read by the name it carries
+/// (`sin`), the symbol llc writes `_sin`.
+fn refuse_definitions_under_library_names(parser: &Parser) -> Result<()> {
+    let functions = parser
+        .module
+        .functions
+        .iter()
+        .filter(|function| {
+            !function.blocks.is_empty() && function.linkage != Linkage::AvailableExternally
+        })
+        .map(|function| ("function", &function.name));
+    let globals = parser
+        .module
+        .globals
+        .iter()
+        .filter(|global| {
+            global.initializer.is_some() && global.linkage != Linkage::AvailableExternally
+        })
+        .map(|global| ("global", &global.name));
+    for (what, name) in functions.chain(globals) {
+        if let Some(use_) = llc_library_name_use(name) {
+            return Err(Error::Unsupported(format!(
+                "{what} `@{name}` defined in the module: on AArch64 Linux or Darwin llc 22.1.2 \
+                 gives `{name}` library meaning on its own: it {use_}; this importer calls \
+                 exactly the functions the module calls, so the module's definition would run \
+                 where llc's object runs the library's, or the reverse (refused whatever the \
+                 definition's linkage)"
+            )));
+        }
+        if let Some(intrinsic) = parser.introduced_callees.get(name.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "{what} `@{name}` defined in a module calling `@{intrinsic}`, which this \
+                 importer calls as `{name}`: the intrinsic computes the library function, and \
+                 llc 22.1.2 calls a definition so named only where it lowers the intrinsic to \
+                 a call of `{name}` alone (it merges `sin` and `cos` into `sincos`, `pow` with \
+                 fast-math flags into `cbrt`, and expands a pattern fill or calls \
+                 `memset_pattern16`; a private definition it names apart), while this \
+                 importer's call reaches the module's definition (refused whatever its linkage)"
+            )));
+        }
+        if crate::llvm_runtime_libcalls::is_llvm_aarch64_runtime_libcall(name) {
+            return Err(Error::Unsupported(format!(
+                "{what} `@{name}` defined in the module: LLVM 22.1.2 lists `{name}` as a runtime \
+                 library call for AArch64 (`RuntimeLibcalls.td`, `AArch64SystemLibrary`): llc's \
+                 code generator calls it for an operation the module states unless it computes \
+                 the operation inline, and this backend decides that otherwise (llc at O1-O3 \
+                 divides an `i128` by a constant inline where this backend calls `__udivti3`), \
+                 so the module's definition would run where llc's object runs other code, or \
+                 the reverse (refused whatever the definition's linkage)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The trust-ir `TargetInfo` an LLVM module states by its `target triple` and
+/// (optional) `target datalayout`: the triple verbatim, the byte order of the
+/// layout's leading `e`/`E` (little when absent, LLVM's default) and the
+/// address-space-0 pointer width of its `p:`/`p0:` specification (64-bit when
+/// absent, LLVM's default). The aggregate-passing policy is the native C ABI
+/// the importer lowers calls with.
+fn target_info_of(triple: &str, datalayout: Option<&str>) -> trust_ir::TargetInfo {
+    let mut endianness = trust_ir::Endianness::Little;
+    let mut pointer_bits = 64u32;
+    for spec in datalayout.unwrap_or_default().split('-') {
+        match spec {
+            "E" => endianness = trust_ir::Endianness::Big,
+            "e" => endianness = trust_ir::Endianness::Little,
+            _ => {
+                let pointer = spec.strip_prefix("p0:").or_else(|| spec.strip_prefix("p:"));
+                if let Some(bits) = pointer
+                    .and_then(|fields| fields.split(':').next())
+                    .and_then(|bits| bits.parse::<u32>().ok())
+                {
+                    pointer_bits = bits;
+                }
+            }
+        }
+    }
+    trust_ir::TargetInfo {
+        triple: triple.to_string(),
+        pointer_size: pointer_bits / 8,
+        endianness,
+        abi: None,
+        struct_passing: trust_ir::StructPassingPolicy::NativeC,
+    }
+}
+
+/// Read UTF-8 LLVM IR with the shared 64-MiB file-input limit.
+///
+/// Metadata is only an early rejection check on the opened file. The read
+/// itself consumes at most the limit plus one sentinel byte, including when
+/// the file grows or reports no useful length. This is a byte bound, not an
+/// I/O deadline; an input stream may still block before producing those bytes.
+pub fn read_module_text(path: &Path) -> Result<String> {
+    let input = fs::File::open(path)?;
+    let size = input.metadata()?.len();
     if size > MAX_LLVM_IR_INPUT_BYTES {
         return Err(Error::Unsupported(format!(
             "LLVM IR input '{}' is {} byte(s), over importer limit {}",
@@ -78,15 +724,23 @@ fn read_llvm_ir_text(path: &Path) -> Result<String> {
         )));
     }
 
-    let text = fs::read_to_string(path)?;
-    if text.len() as u64 > MAX_LLVM_IR_INPUT_BYTES {
+    read_text_with_limit(input, path, MAX_LLVM_IR_INPUT_BYTES)
+}
+
+fn read_text_with_limit<R: Read>(reader: R, path: &Path, limit: u64) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
         return Err(Error::Unsupported(format!(
             "LLVM IR input '{}' grew over importer limit {} while reading",
             path.display(),
-            MAX_LLVM_IR_INPUT_BYTES
+            limit
         )));
     }
-    Ok(text)
+    String::from_utf8(bytes)
+        .map_err(|error| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))
 }
 
 // --------------------------------------------------------------------------
@@ -95,6 +749,11 @@ fn read_llvm_ir_text(path: &Path) -> Result<String> {
 
 struct Parser {
     module: Module,
+    /// The module's `target triple = "..."` and `target datalayout = "..."`
+    /// directives, recorded as the trust-ir `TargetInfo` the module states
+    /// (see [`target_info_of`]).
+    target_triple: Option<String>,
+    target_datalayout: Option<String>,
     /// Map from LLVM function name (without `@`) to `FuncId`.
     func_ids: HashMap<String, FuncId>,
     /// Map from LLVM function name to its `FuncTyId`.
@@ -104,8 +763,33 @@ struct Parser {
     globals: HashMap<String, usize>,
     /// Named LLVM aggregate layouts keyed by the full `%name` spelling.
     struct_layouts: HashMap<String, StructLayout>,
-    /// LLVM `attributes #N = { ... }` groups keyed by the `#N` spelling.
+    /// LLVM `attributes #N = { ... }` groups keyed by the `#N` spelling,
+    /// which is the group's number: the lexical pass refused a leading zero
+    /// (`#00` is group 0 to LLVM).
     attribute_groups: HashMap<String, FunctionAttributeSet>,
+    /// Symbols named by `@llvm.used`, as LLVM names them
+    /// ([`llvm_symbol_identity`]): LLVM marks their
+    /// sections retained in the object (`SHF_GNU_RETAIN`, Mach-O
+    /// `no_dead_strip`). Applied as `Global::retained` once every global is
+    /// parsed, because the array may precede or follow the globals it names.
+    /// `@llvm.compiler.used` only keeps its symbols through LLVM's optimizer,
+    /// which the backend (it drops no global) needs no mark for.
+    llvm_used_symbols: HashSet<String>,
+    /// trust-ir v41 attributes of the global currently being parsed, read
+    /// once in `parse_global` so every global-initializer site in it (and in
+    /// `parse_string_global`, which it delegates to) records the same
+    /// answer. Reset per global; never carried across.
+    pending_section: Option<String>,
+    pending_visibility: Visibility,
+    /// `$name = comdat <kind>` declarations: selection kind by canonical
+    /// COMDAT name. Read by a pre-scan, because a `comdat` clause may name a
+    /// COMDAT declared later in the file.
+    comdats: HashMap<String, String>,
+    /// The symbol facts each `define`/`declare` stated, by canonical name, so
+    /// a later `declare` updates a call-site placeholder and two headers that
+    /// disagree about one function are refused instead of the later one
+    /// silently winning.
+    stated_function_facts: HashMap<String, FunctionSymbolFacts>,
     /// Libm purity licensing (loop-dead-pure-sink plumbing) — per libm
     /// `llvm.<fn>.fN` intrinsic name, whether EVERY `declare` of it carried the
     /// full pure-math attribute set (`speculatable willreturn nounwind
@@ -127,6 +811,52 @@ struct Parser {
     /// on the ambiguous case where `@"\01_foo"` and a distinct `@foo` both map
     /// to the same linker symbol after de-mangling. Keyed by canonical name.
     symbol_origin: HashMap<String, SymbolOrigin>,
+    /// The triple the module is compiled for, given by the caller
+    /// ([`import_text_for_target`], llc's `-mtriple`), which takes the place
+    /// of the module's `target triple`.
+    compile_target: Option<String>,
+    /// The compile target as LLVM reads its triple (`crate::triple::read`):
+    /// [`Parser::compile_target`], or else the module's `target triple`;
+    /// `None` when neither names one. Every rule that depends on the target
+    /// reads it here: the object format (Mach-O is the one format whose
+    /// reading of a `\01` asm label [`Parser::split_asm_label`] carries,
+    /// and outside it `.L` names are refused, `refuse_quoted_symbol_names`;
+    /// ELF is the one format whose writer writes nothing for a function
+    /// declaration `@llvm.used` lists, `import_text_with_target`) and the
+    /// RISC-V width ([`Parser::riscv_target`]); with `None` each refuses
+    /// what it cannot decide.
+    target: Option<TargetTriple>,
+    /// Where the RISC-V calling convention is read, whether a named type
+    /// the module defines (`%T = type ...`) names a floating-point or
+    /// vector type: a definition may pass such a value by the type's name,
+    /// so every definition then reads as naming one
+    /// ([`RiscvDefinition::floating`]).
+    riscv_named_types_floating: bool,
+    /// The calls the importer writes in place of an intrinsic, by the
+    /// symbol called (`sin` for `@llvm.sin.f64`, `memset_pattern16` for
+    /// `@llvm.experimental.memset.pattern.*`), each with the intrinsic
+    /// (`refuse_definitions_under_library_names`).
+    introduced_callees: std::collections::BTreeMap<String, String>,
+    /// The relocation model the caller compiles the module under
+    /// ([`import_text_for_compile`], llc's `-relocation-model`), or `None`
+    /// when it names none. Only the `dso_local` rules read it
+    /// ([`Parser::refuse_dso_local_addressing_llc_writes_otherwise`]).
+    relocation_model: Option<RelocationModel>,
+    /// Every declaration for the linker whose spelled `dso_local` changes
+    /// how llc addresses it ([`SymbolPrefix::dso_local_changes_addressing`]):
+    /// a data declaration, an `available_externally` global, a function
+    /// declaration or an `available_externally` function, keyed by
+    /// canonical name, with what it is for the refusal. llc addresses such
+    /// a symbol PC-relative under every relocation model; the backend
+    /// addresses every declaration through the GOT.
+    dso_local_imports: HashMap<String, &'static str>,
+    /// Every non-local definition whose spelled `dso_local` changes how llc
+    /// addresses it (default visibility): a data or function definition of
+    /// any linkage but `internal`, `private` and `available_externally`,
+    /// keyed by canonical name, with what it is for the refusal. Under
+    /// `pic` llc binds the module's own references to it locally, where the
+    /// backend reaches it through the GOT and the PLT.
+    dso_local_definitions: HashMap<String, &'static str>,
     /// Canonical names of every symbol DEFINED or DECLARED in the module
     /// (data globals + functions), collected by a name-only pre-scan so a
     /// forward reference (a global initializer that names a symbol defined
@@ -135,8 +865,214 @@ struct Parser {
     /// fail closed on a typo'd/undeclared symbol rather than fabricate a
     /// relocation.
     known_symbol_names: HashSet<String>,
+    /// The hidden return-buffer (`sret`) parameter index each `define` /
+    /// `declare` (or the first declare-by-use call) states, by canonical
+    /// name; `None` states that the function has none. Two statements that
+    /// disagree are refused (L01-P11).
+    function_sret: HashMap<String, Option<usize>>,
+    /// Every direct call's own call-ABI facts, checked against the callee's
+    /// final statement once the module is read: LLVM lowers an argument as
+    /// the hidden buffer, or extends it, when either the call site or the
+    /// callee says so, and trust-ir carries both only on the callee.
+    call_site_abi: Vec<CallSiteAbi>,
+    /// Functions whose registered signature was first stated by a direct
+    /// call (declare-by-use) rather than by a `define` / `declare` header.
+    call_derived_signatures: HashSet<String>,
+    /// Functions declared `declare R @f(...)`: no fixed parameter and a
+    /// variadic tail, the header clang writes for an unprototyped K&R
+    /// `R f()` and for a C23 `R f(...)`. Such a header states no fixed
+    /// prefix; each call states its own function type, which LLVM places the
+    /// arguments by. trust-ir carries one signature per callee, so the
+    /// declaration takes the function type its calls state when they all
+    /// state the same one (`sign_unprototyped_declaration`), and every call
+    /// whose type differs from its callee's final signature is refused
+    /// (`check_call_site_function_types`). Such a header on a name the
+    /// backend lowers by name is refused instead (`parse_declare`,
+    /// [`backend_reads_call_by_name`]): signed from a call, it would carry a
+    /// prototype LLVM does not read.
+    unprototyped_declarations: HashSet<String>,
+    /// The `zeroext` / `signext` every `define` / `declare` header states,
+    /// checked against the function's final call-edge type once the module
+    /// is read. A declaration whose signature is not modeled is skipped, and
+    /// LLVM still applies its extensions to calls that do not repeat them.
+    header_ext: Vec<HeaderExt>,
     /// Lines of the input, for error context.
     lines: Vec<String>,
+}
+
+/// One direct call's call-ABI facts (see `Parser::call_site_abi`).
+#[derive(Clone, Debug)]
+struct CallSiteAbi {
+    callee: String,
+    sret: Option<usize>,
+    /// `zeroext` / `signext` of each argument.
+    args: Vec<IntExt>,
+    /// The importer's (signless) type of each argument.
+    arg_tys: Vec<Ty>,
+    /// `zeroext` / `signext` of the result.
+    ret: IntExt,
+    /// The function type the call itself states, result and parameters, or
+    /// `None` for an `@llvm.*` intrinsic call the importer rewrites to
+    /// operations: checked against the callee's final signature by
+    /// `check_call_site_function_types`. For a call the importer writes in
+    /// place of an intrinsic (`introduced_for`), the type the intrinsic's
+    /// lowering calls the symbol at.
+    stated: Option<CallTypeStatement>,
+    /// The intrinsic a call the importer writes itself stands for (LD-100
+    /// rule 10): `@llvm.sin.f64` for its call of `sin`,
+    /// `@llvm.experimental.memset.pattern.*` for its call of
+    /// `memset_patternN` (`Parser::introduced_callees`); `None` for a call
+    /// the module states.
+    introduced_for: Option<String>,
+    line: usize,
+}
+
+/// What one direct call states about its own function type.
+#[derive(Clone, Debug)]
+enum CallTypeStatement {
+    /// The type was read (see [`StatedCallType`]).
+    Stated(StatedCallType),
+    /// The text before the callee ends in a parenthesized group, the place
+    /// of the explicit function type, that does not read as one.
+    Unreadable(String),
+}
+
+impl CallTypeStatement {
+    /// Read the function type a direct call states from the text between
+    /// `call` and its callee (`prefix`), its result type `ret` (read from
+    /// `prefix`, `None` for `void`) and its argument types.
+    ///
+    /// LLVM prints a call's function type only when it is variadic, and
+    /// always directly before the callee (`i32 (ptr, ...) @printf`), so it
+    /// is the final parenthesized group of `prefix`; a parenthesized return
+    /// attribute (`dereferenceable(8)`) comes before the return type, and
+    /// the operand of a return type's `addrspace` (`ptr addrspace(0)`, the
+    /// only address space the lexical pass admits) is no function type.
+    /// Without one the call's type is the non-variadic type of its
+    /// arguments.
+    fn read(prefix: &str, ret: Option<&Ty>, arg_tys: &[Ty]) -> Self {
+        let prefix = prefix.trim_end();
+        let ret = ret.cloned();
+        let arguments_type = |ret| {
+            Self::Stated(StatedCallType {
+                ret,
+                params: arg_tys.to_vec(),
+                is_vararg: false,
+            })
+        };
+        if !prefix.ends_with(')') {
+            return arguments_type(ret);
+        }
+        let mut depth = 0usize;
+        let mut open = None;
+        for (index, byte) in prefix.bytes().enumerate().rev() {
+            match byte {
+                b')' => depth += 1,
+                b'(' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        open = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if open.is_some_and(|open| prefix[..open].trim_end().ends_with("addrspace")) {
+            return arguments_type(ret);
+        }
+        match open.and_then(|open| parse_explicit_call_func_type(&prefix[open..])) {
+            Some((params, is_vararg)) => Self::Stated(StatedCallType {
+                ret,
+                params: params.into_iter().map(|(_, ty)| ty).collect(),
+                is_vararg,
+            }),
+            None => Self::Unreadable(prefix.to_string()),
+        }
+    }
+
+    fn stated(&self) -> Option<&StatedCallType> {
+        match self {
+            Self::Stated(stated) => Some(stated),
+            Self::Unreadable(_) => None,
+        }
+    }
+}
+
+/// The function type one direct call states: its result type and the
+/// explicit `R (<fixed>, ...)` LLVM prints before a variadic call's callee,
+/// or, when none is printed, the non-variadic type of the call's own
+/// arguments. Types are the importer's signless ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatedCallType {
+    /// The stated result type; `None` for `void`.
+    ret: Option<Ty>,
+    /// The stated fixed parameter types, in order.
+    params: Vec<Ty>,
+    is_vararg: bool,
+}
+
+impl StatedCallType {
+    fn describe(&self) -> String {
+        describe_fixed_prefix(self.params.len(), self.is_vararg)
+    }
+
+    /// Whether this is the function type `signature` (a callee's call-edge
+    /// type) states: the same result, fixed parameters and variadic tail,
+    /// where a `zeroext` `i8`/`i16` edge is its signless type's unsigned
+    /// twin ([`call_edge_ty`]), the same LLVM type.
+    fn is_type_of(&self, signature: &FuncTy) -> bool {
+        let same = |stated: &[Ty], edges: &[Ty]| {
+            stated.len() == edges.len()
+                && stated
+                    .iter()
+                    .zip(edges)
+                    .all(|(ty, edge)| ty == edge || is_unsigned_edge_twin(ty, edge))
+        };
+        self.is_vararg == signature.is_vararg
+            && same(&self.params, &signature.params)
+            && same(self.ret.as_slice(), &signature.returns)
+    }
+
+    /// `R (P, ...)` in the importer's types, `void` for no result.
+    fn describe_type(&self) -> String {
+        describe_function_type(self.ret.as_slice(), &self.params, self.is_vararg)
+    }
+}
+
+/// A function type in the importer's types, `R (P, ...)`; `void` for no
+/// result.
+fn describe_function_type(ret: &[Ty], params: &[Ty], is_vararg: bool) -> String {
+    let ret = match ret {
+        [] => "void".to_string(),
+        [ty] => format!("{ty:?}"),
+        many => format!("{many:?}"),
+    };
+    let mut params: Vec<String> = params.iter().map(|ty| format!("{ty:?}")).collect();
+    if is_vararg {
+        params.push("...".to_string());
+    }
+    format!("{ret} ({})", params.join(", "))
+}
+
+/// `N fixed parameter(s)` plus `, variadic` when `is_vararg`.
+fn describe_fixed_prefix(fixed: usize, is_vararg: bool) -> String {
+    let tail = if is_vararg {
+        ", variadic"
+    } else {
+        ", not variadic"
+    };
+    format!("{fixed} fixed parameter(s){tail}")
+}
+
+/// The `zeroext` / `signext` one function header states (see
+/// `Parser::header_ext`).
+#[derive(Clone, Debug)]
+struct HeaderExt {
+    function: String,
+    params: Vec<IntExt>,
+    ret: IntExt,
+    what: &'static str,
 }
 
 /// Records how a canonical symbol name was first introduced (see
@@ -149,19 +1085,31 @@ struct SymbolOrigin {
     original: String,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct StructLayout {
-    /// (field_ty, byte_offset)
-    fields: Vec<(Ty, u64)>,
+    /// Full declared field layouts, shared when another named type uses them.
+    fields: Arc<[FixedStructField]>,
     /// Total size rounded up to the struct alignment.
     size: u64,
     /// Maximum field alignment, at least 1.
     align: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct FunctionAttributeSet {
+    /// The group's first attribute the importer refuses on a function or a
+    /// call (`attributes::read_attribute_group`), named when a `define`,
+    /// a `declare` or a call uses the group. A group no function or call
+    /// uses refuses nothing.
+    refused: Option<String>,
+    /// The return-address-signing attributes the group names, checked
+    /// together with the inline attributes of each function or call that
+    /// uses it (`attributes::ReturnAddressSigning`).
+    return_address_signing: ReturnAddressSigning,
+    /// The `"target-cpu"` and `"target-features"` values the group states,
+    /// read with the inline ones of each definition that uses it on a
+    /// RISC-V triple (`attributes::SubtargetSelection`).
+    subtarget: SubtargetSelection,
     stack_protector: ImportedStackProtectorAttr,
     allocsize: bool,
     /// True when the group carries the exact errno-free pure-math license set
@@ -169,7 +1117,21 @@ struct FunctionAttributeSet {
     /// the literal `memory(none)` effect. Consumed ONLY for `llvm.<fn>.fN`
     /// libm-intrinsic declarations (libm purity licensing).
     libm_pure_math: bool,
+    /// The `#pragma clang section` attributes the group sets
+    /// (`"bss-section"`, `"data-section"`, `"rodata-section"`,
+    /// `"relro-section"`), one bit each in [`GLOBAL_SECTION_ATTRIBUTES`]
+    /// order, named in the refusal of a global that uses the group.
+    global_sections: u8,
 }
+
+/// The attributes clang's `#pragma clang section` puts on a global, which
+/// LLVM's object writers read as its section.
+const GLOBAL_SECTION_ATTRIBUTES: [&str; 4] = [
+    "bss-section",
+    "data-section",
+    "rodata-section",
+    "relro-section",
+];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum ImportedStackProtectorAttr {
@@ -179,11 +1141,11 @@ enum ImportedStackProtectorAttr {
     Required,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum FixedLayout {
     Scalar(Ty),
     Struct {
-        fields: Vec<FixedStructField>,
+        fields: Arc<[FixedStructField]>,
         size: u64,
         align: u64,
     },
@@ -195,7 +1157,7 @@ enum FixedLayout {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FixedStructField {
     layout: FixedLayout,
     offset: u64,
@@ -304,6 +1266,10 @@ struct FuncScratch {
     /// 128-bit value rather than as scalar lanes. Computed once, before the
     /// body is parsed, by [`crate::native_vector::plan_function`].
     native_plan: NativePlan,
+    /// The function's (signless) return type and the call-edge type it
+    /// returns as, when they differ (a `zeroext` `i8`/`i16` return, see
+    /// `call_edge_ty`): `ret` reinterprets the value to the edge type.
+    ret_edge: Option<(Ty, Ty)>,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +1301,7 @@ impl FuncScratch {
             interned_unaliased: HashSet::new(),
             vec_uid: 0,
             native_plan: NativePlan::default(),
+            ret_edge: None,
         }
     }
 
@@ -451,10 +1418,6 @@ impl FuncScratch {
         self.blocks.push(trust_ir::Block::new(id));
         self.block_map.insert(label.to_string(), id);
         id
-    }
-
-    fn alias_block(&mut self, label: &str, id: BlockId) {
-        self.block_map.entry(label.to_string()).or_insert(id);
     }
 
     fn push_inst(&mut self, node: InstrNode) {
@@ -578,6 +1541,13 @@ impl FuncScratch {
         self.current = Some(id.as_usize());
     }
 
+    /// Whether the block being built already ends in a terminator.
+    fn current_block_terminated(&self) -> bool {
+        self.current
+            .and_then(|index| self.blocks[index].body.last())
+            .is_some_and(InstrNode::is_terminator)
+    }
+
     fn block_label(&self, id: BlockId) -> Option<String> {
         self.block_map
             .iter()
@@ -615,18 +1585,348 @@ impl Parser {
     fn new(text: &str, module_name: String) -> Self {
         Self {
             module: Module::new(module_name),
+            target_triple: None,
+            target_datalayout: None,
             func_ids: HashMap::new(),
             func_tys: HashMap::new(),
             globals: HashMap::new(),
             struct_layouts: HashMap::new(),
             attribute_groups: HashMap::new(),
+            llvm_used_symbols: HashSet::new(),
+            pending_section: None,
+            pending_visibility: Visibility::Default,
+            comdats: HashMap::new(),
+            stated_function_facts: HashMap::new(),
             libm_intrinsic_decl_pure: HashMap::new(),
             libm_rewritten_calls: std::collections::BTreeMap::new(),
             libm_plain_uses: std::cell::RefCell::new(HashSet::new()),
             symbol_origin: HashMap::new(),
+            compile_target: None,
+            target: None,
+            riscv_named_types_floating: false,
+            introduced_callees: std::collections::BTreeMap::new(),
+            relocation_model: None,
+            dso_local_imports: HashMap::new(),
+            dso_local_definitions: HashMap::new(),
             known_symbol_names: HashSet::new(),
+            function_sret: HashMap::new(),
+            call_site_abi: Vec::new(),
+            call_derived_signatures: HashSet::new(),
+            unprototyped_declarations: HashSet::new(),
+            header_ext: Vec::new(),
             lines: text.lines().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// Record the `sret` parameter a function header (or a declare-by-use
+    /// call) states for `name`, refusing a statement that disagrees with an
+    /// earlier one.
+    fn note_function_sret(&mut self, name: &str, sret: Option<usize>, how: &str) -> Result<()> {
+        match self.function_sret.get(name) {
+            Some(previous) if *previous != sret => Err(Error::Unsupported(format!(
+                "function `@{name}`: {how} states {}, but an earlier header or call stated {}; \
+                 the two lower calls with different ABIs, and trust-ir states one per function",
+                describe_sret(sret),
+                describe_sret(*previous),
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                self.function_sret.insert(name.to_owned(), sret);
+                Ok(())
+            }
+        }
+    }
+
+    /// Record the call-ABI facts a `define` / `declare` header states for
+    /// `name`: its `sret` (refusing one that disagrees with an earlier
+    /// statement) and its extensions (checked once the module is read).
+    fn note_header_abi(&mut self, name: &str, abi: &HeaderAbi, what: &'static str) -> Result<()> {
+        self.note_function_sret(name, abi.sret, &format!("this {what}"))?;
+        self.header_ext.push(HeaderExt {
+            function: name.to_owned(),
+            params: abi.params.clone(),
+            ret: abi.ret,
+            what,
+        });
+        Ok(())
+    }
+
+    /// The final call-edge type of function `name`, once registered.
+    fn registered_func_ty(&self, name: &str) -> Option<&FuncTy> {
+        let id = self.func_tys.get(name)?;
+        self.module.func_types.get(id.index() as usize)
+    }
+
+    /// Refuse a direct call whose own call-ABI facts differ from what its
+    /// callee states, and a header whose extensions its function's final
+    /// call-edge type does not carry. LLVM treats an argument as the hidden
+    /// return buffer, or extends it, when the call site OR the callee says
+    /// so, but trust-ir carries both facts only on the callee, so a call
+    /// that disagrees has no faithful spelling.
+    fn check_call_site_abi(&self) -> Result<()> {
+        for call in &self.call_site_abi {
+            let stated = self.function_sret.get(&call.callee).copied().flatten();
+            if stated != call.sret {
+                return Err(Error::Unsupported(format!(
+                    "call to `@{}` at line {}: the call site has {} but the callee has {} \
+                     (trust-ir states the hidden return buffer only on the callee)",
+                    call.callee,
+                    call.line,
+                    describe_sret(call.sret),
+                    describe_sret(stated),
+                )));
+            }
+            let Some(func_ty) = self.registered_func_ty(&call.callee) else {
+                continue;
+            };
+            for (index, &ext) in call.args.iter().enumerate() {
+                let subject = || {
+                    format!(
+                        "call to `@{}` at line {}, argument {index}",
+                        call.callee, call.line
+                    )
+                };
+                match func_ty.params.get(index) {
+                    Some(edge) => check_edge_ext(edge, ext, &subject())?,
+                    None => {
+                        let narrow = call
+                            .arg_tys
+                            .get(index)
+                            .is_some_and(|ty| matches!(ty, Ty::Bool | Ty::I8 | Ty::I16));
+                        if narrow && ext != IntExt::Unstated {
+                            return Err(Error::Unsupported(format!(
+                                "{}: {} on a narrow variadic argument, which the backend \
+                                 passes unextended (C promotes variadic arguments itself)",
+                                subject(),
+                                ext.keyword()
+                            )));
+                        }
+                    }
+                }
+            }
+            if let Some(edge) = func_ty.returns.first() {
+                check_edge_ext(
+                    edge,
+                    call.ret,
+                    &format!(
+                        "call to `@{}` at line {}, return value",
+                        call.callee, call.line
+                    ),
+                )?;
+            }
+        }
+        for header in &self.header_ext {
+            let Some(func_ty) = self.registered_func_ty(&header.function) else {
+                continue;
+            };
+            for (index, &ext) in header.params.iter().enumerate() {
+                if let Some(edge) = func_ty.params.get(index) {
+                    check_edge_ext(
+                        edge,
+                        ext,
+                        &format!(
+                            "{} of `@{}`, parameter {index}",
+                            header.what, header.function
+                        ),
+                    )?;
+                }
+            }
+            if let Some(edge) = func_ty.returns.first() {
+                check_edge_ext(
+                    edge,
+                    header.ret,
+                    &format!("{} of `@{}`, return value", header.what, header.function),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Give an unprototyped `declare R @f(...)` (see
+    /// `unprototyped_declarations`) the function type a direct call to it
+    /// states, the first time a call states one with a fixed parameter or
+    /// without a variadic tail.
+    ///
+    /// LLVM places a call's arguments by the call's own function type:
+    /// clang calls an unprototyped K&R function as `R (i32, i32, ...)` on
+    /// x86-64 (every argument fixed, `AL` set) and as the non-variadic
+    /// `R (i32, i32)` on AArch64. Left at `(...)`, the declaration would
+    /// state no fixed prefix, and the backend refuses a call through it
+    /// (`[TCG-UNSIGNED-VARIADIC]`). Every other call to the function must
+    /// state the same type, or `check_call_site_function_types` refuses it.
+    /// A call that itself states `R (...)` (a C23 `R f(...)` call) leaves the
+    /// declaration unsigned.
+    fn sign_unprototyped_declaration(
+        &mut self,
+        name: &str,
+        stated: &StatedCallType,
+        call_ext: &[IntExt],
+    ) -> Result<()> {
+        if !self.unprototyped_declarations.contains(name) {
+            return Ok(());
+        }
+        let Some(existing) = self.registered_func_ty(name) else {
+            return Ok(());
+        };
+        let still_unsigned = existing.is_vararg && existing.params.is_empty();
+        if !still_unsigned || (stated.is_vararg && stated.params.is_empty()) {
+            return Ok(());
+        }
+        let signed = FuncTy {
+            params: stated
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| {
+                    call_edge_ty(ty, call_ext.get(index).copied().unwrap_or_default())
+                })
+                .collect(),
+            returns: existing.returns.clone(),
+            abi: None,
+            is_vararg: stated.is_vararg,
+        };
+        let fid = *self.func_ids.get(name).ok_or_else(|| {
+            self.err_unsupported(&format!("function `@{name}` has a signature but no id"))
+        })?;
+        let ftid = self.module.add_func_type(signed)?;
+        self.func_tys.insert(name.to_string(), ftid);
+        for function in self
+            .module
+            .functions
+            .iter_mut()
+            .filter(|function| function.id == fid)
+        {
+            function.ty = ftid;
+        }
+        Ok(())
+    }
+
+    /// Refuse a direct call whose own function type, result and parameters,
+    /// is not its callee's final signature (LD-100
+    /// rule 9): the header's, or, for an unprototyped header or none, the
+    /// type its first call states (OD-56).
+    ///
+    /// LLVM places a call's arguments and reads its result by the call's
+    /// function type; trust-ir carries one signature per callee, and the
+    /// backend types every call by that one (`CallVariadic { fixed_args:
+    /// params.len() }` for a variadic one). A call that states another
+    /// split, for example `call i32 (i32, i32, ...) @f` against `declare
+    /// i32 @f(i32, ...)`, would pass its second argument in a register where
+    /// DarwinPCS reads it from the stack, or the reverse; a call that states
+    /// another result, `call i64 @g()` against `declare double @g()`, reads
+    /// `x0` in LLVM and `d0` here. And LLVM reads a call whose type differs
+    /// from its callee's as a call through a cast, not a call of the
+    /// declared function (`CallBase::getCalledFunction` is null), so not as
+    /// the C library routine or intrinsic its name may claim, where the
+    /// backend reads a call of such a name by the name and the header
+    /// ([`backend_reads_call_by_name`]): `call i64 @memcpy(ptr, ptr, i64 8)`
+    /// against C's `declare ptr @memcpy(ptr, ptr, i64)` was expanded where
+    /// llc calls the linked `memcpy`. Such a call has no faithful spelling
+    /// and is refused by name; so is one whose stated type does not read.
+    ///
+    /// A call this importer writes in place of an intrinsic (LD-100 rule
+    /// 10: `sin` for `@llvm.sin.f64`, `memset_patternN` for a pattern fill)
+    /// states the type the intrinsic's lowering calls the symbol at, and is
+    /// refused by name when the symbol's final signature is another: LLVM
+    /// lowers the intrinsic to a call at that type whatever the module
+    /// declares the symbol as (llc 22.1.2 read `sin`'s result from `d0`
+    /// beside `declare i64 @sin(double)`, where the backend, typing the
+    /// call by that header, read `x0`).
+    fn check_call_site_function_types(&self) -> Result<()> {
+        for call in &self.call_site_abi {
+            let Some(statement) = &call.stated else {
+                continue;
+            };
+            let Some(signature) = self.registered_func_ty(&call.callee) else {
+                continue;
+            };
+            let stated = match statement {
+                CallTypeStatement::Stated(stated) => stated,
+                CallTypeStatement::Unreadable(prefix) => {
+                    return Err(Error::Unsupported(format!(
+                        "call to `@{}` at line {}: the function type the call states \
+                         (`{prefix}`) does not read as one; LLVM places the call's arguments \
+                         and reads its result by that type, and this importer compares it with \
+                         its callee's",
+                        call.callee, call.line,
+                    )));
+                }
+            };
+            if let Some(intrinsic) = &call.introduced_for {
+                if stated.is_type_of(signature) {
+                    continue;
+                }
+                return Err(Error::Unsupported(format!(
+                    "call to `@{intrinsic}` at line {}, which this importer writes as a call of \
+                     `@{}`: the intrinsic's lowering calls `@{}` at the function type `{}` but \
+                     `@{}` is lowered with `{}`; LLVM lowers the intrinsic to a call at that \
+                     type whatever the module declares `@{}` as, while trust-ir carries one \
+                     signature per callee and the backend types this call by it (LD-100 rule \
+                     10)",
+                    call.line,
+                    call.callee,
+                    call.callee,
+                    stated.describe_type(),
+                    call.callee,
+                    describe_function_type(
+                        &signature.returns,
+                        &signature.params,
+                        signature.is_vararg
+                    ),
+                    call.callee,
+                )));
+            }
+            let relevant = signature.is_vararg
+                || stated.is_vararg
+                || self.unprototyped_declarations.contains(&call.callee);
+            if relevant
+                && (signature.is_vararg != stated.is_vararg
+                    || signature.params.len() != stated.params.len())
+            {
+                return Err(Error::Unsupported(format!(
+                    "call to `@{}` at line {}: the call states a function type with {} but \
+                     `@{}` is lowered with {}; trust-ir carries one signature per callee, and \
+                     LLVM places a call's arguments by the call's own type, so this call's \
+                     fixed/anonymous argument split has no faithful spelling",
+                    call.callee,
+                    call.line,
+                    stated.describe(),
+                    call.callee,
+                    describe_fixed_prefix(signature.params.len(), signature.is_vararg),
+                )));
+            }
+            if !stated.is_type_of(signature) {
+                let lowered = describe_function_type(
+                    &signature.returns,
+                    &signature.params,
+                    signature.is_vararg,
+                );
+                let consequence = if backend_reads_call_by_name(&call.callee) {
+                    format!(
+                        "LLVM reads a call whose type differs from its callee's as a call \
+                         through a cast, not as the library routine or intrinsic `@{}` names \
+                         (llc calls the symbol, or its verifier refuses an intrinsic's), while \
+                         this importer's backend reads a call of `@{}` by its name and header",
+                        call.callee, call.callee
+                    )
+                } else {
+                    "trust-ir carries one signature per callee and the backend types the call \
+                     by it, while LLVM places the call's arguments and reads its result by the \
+                     call's own type"
+                        .to_string()
+                };
+                return Err(Error::Unsupported(format!(
+                    "call to `@{}` at line {}: the call states the function type `{}` but \
+                     `@{}` is lowered with `{lowered}`; {consequence} \
+                     (LD-100 rule 9)",
+                    call.callee,
+                    call.line,
+                    stated.describe_type(),
+                    call.callee,
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn err_unsupported(&self, what: &str) -> Error {
@@ -637,6 +1937,17 @@ impl Parser {
         Error::Parse {
             line,
             message: msg.to_string(),
+        }
+    }
+
+    /// Where a definition's RISC-V calling convention is read: a RISC-V
+    /// compile target ([`RiscvTarget::Known`]), or no known target
+    /// ([`RiscvTarget::Unknown`], which may be RISC-V); `None` for a known
+    /// target that is not RISC-V.
+    fn riscv_target(&self) -> Option<RiscvTarget> {
+        match self.target {
+            Some(target) => target.riscv_xlen.map(RiscvTarget::Known),
+            None => Some(RiscvTarget::Unknown),
         }
     }
 
@@ -668,7 +1979,71 @@ impl Parser {
             raw_after_at
         };
         if let Some(rest) = inner.strip_prefix("\\01") {
+            // LLVM's mangler writes the name after `\01` verbatim. On ELF
+            // that is `_foo` for `@"\01_foo"` (llc 22, aarch64 Linux), while
+            // this importer's reading below yields `foo`, the right C name
+            // only where the object format prefixes `_` (Mach-O). It reads
+            // a `\01` label only when the compile target's object format,
+            // as LLVM derives it from the triple (`crate::triple::read`:
+            // `arm64-apple-macosx14.0.0-elf` is ELF), is Mach-O, and so not
+            // when no target is known.
+            if !self.target.is_some_and(TargetTriple::is_mach_o) {
+                return Err(self.err_unsupported(&format!(
+                    "`\\01` asm-label symbol `{inner}` for a target whose object format is not \
+                     Mach-O, or none known: LLVM writes the name after `\\01` verbatim \
+                     (`_foo` on ELF), and this importer carries that only as the Mach-O C name \
+                     (`foo`, which the Mach-O object writer prefixes with `_`)"
+                )));
+            }
             if let Some(sym) = rest.strip_prefix('_') {
+                // LLVM reads an intrinsic, and its reserved `llvm.` globals
+                // (`@llvm.used`, ...), by the IR name, which for a label
+                // starts with the `\01` byte (`Function::isIntrinsic` tests
+                // `llvm.` at its start): `@"\01_llvm.assume"` is the ordinary
+                // function `_llvm.assume` to llc 22, which calls it. The
+                // label is carried by the name after `\01_`, which every
+                // reader below takes for LLVM's `@llvm.assume`, so it is
+                // refused by name.
+                if sym.starts_with("llvm.") {
+                    return Err(self.err_unsupported(&format!(
+                        "`\\01` asm label `@\"{inner}\"`: LLVM reads it as the ordinary Mach-O \
+                         symbol `_{sym}` (a name starting with `\\01` is never an intrinsic or \
+                         one of LLVM's `llvm.` globals), and this importer carries a label by \
+                         the name after `\\01_`, which it would read as LLVM's `@{sym}`"
+                    )));
+                }
+                // Likewise a C library routine the backend reads by its
+                // name and prototype: LLVM's `TargetLibraryInfo` reads the
+                // IR name, so `@"\01_memcpy"` is an ordinary function to
+                // llc 22.1.2 and opt -O2, which call `_memcpy` at a constant
+                // count of 8, where carried as `memcpy` the backend reads a
+                // call of it with C's prototype as the routine and expands
+                // it (LD-100 rule 8).
+                if is_c_library_routine_read_by_prototype(sym) {
+                    return Err(self.err_unsupported(&format!(
+                        "`\\01` asm label `@\"{inner}\"`: LLVM reads it as the ordinary Mach-O \
+                         symbol `_{sym}`, not the C library's `{sym}` (it reads that by the IR \
+                         name), and this importer carries a label by the name after `\\01_`, \
+                         under which its backend reads a call with C's prototype as the \
+                         library routine"
+                    )));
+                }
+                // The text is canonical (`lexical::canonicalize`): after
+                // `\01` every byte outside `[-a-zA-Z$._0-9]` is an `\XX`
+                // escape. LLVM's Mangler writes a `\01` name verbatim after
+                // dropping the `\01`, and every other name of a non-private
+                // symbol after the Mach-O prefix `_`: `@"\01_S"` and
+                // `@"S"` are the one symbol `_S` (`_a b` for `@"\01_a b"`,
+                // `_1x` for `@"\01_1x"`). The label is therefore carried as
+                // the canonical spelling of `@"S"`: plain when `S` is a
+                // plain LLVM name, and otherwise quoted (`"a\20b"`, `"1x"`,
+                // `""`), as any other symbol name that is no plain name:
+                // only for an internal or private definition
+                // (`refuse_quoted_symbol_names`). Either way the two
+                // spellings compare equal for the collision check.
+                if !crate::lexical::is_bare_name(sym.as_bytes()) {
+                    return Ok((format!("\"{sym}\""), true));
+                }
                 return Ok((sym.to_string(), true));
             }
             return Err(self.err_unsupported(&format!(
@@ -796,18 +2171,22 @@ impl Parser {
                     let field_layout = self.parse_fixed_layout_ty(field_str.trim())?;
                     let field_align = field_layout.align();
                     let field_size = field_layout.size();
-                    offset = align_up(offset, field_align);
+                    offset = checked_align_up(offset, field_align)
+                        .ok_or_else(|| self.err_unsupported("struct field alignment overflow"))?;
                     fields.push(FixedStructField {
                         layout: field_layout,
                         offset,
                     });
-                    offset += field_size;
+                    offset = offset
+                        .checked_add(field_size)
+                        .ok_or_else(|| self.err_unsupported("struct field extent overflow"))?;
                     struct_align = struct_align.max(field_align);
                 }
             }
             return Ok(FixedLayout::Struct {
-                fields,
-                size: align_up(offset, struct_align),
+                fields: fields.into(),
+                size: checked_align_up(offset, struct_align)
+                    .ok_or_else(|| self.err_unsupported("struct tail alignment overflow"))?,
                 align: struct_align,
             });
         }
@@ -817,16 +2196,8 @@ impl Parser {
                 .struct_layouts
                 .get(trimmed)
                 .ok_or_else(|| self.err_unsupported(&format!("type `{}`", trimmed)))?;
-            let fields = layout
-                .fields
-                .iter()
-                .map(|(ty, offset)| FixedStructField {
-                    layout: FixedLayout::Scalar(ty.clone()),
-                    offset: *offset,
-                })
-                .collect();
             return Ok(FixedLayout::Struct {
-                fields,
+                fields: layout.fields.clone(),
                 size: layout.size,
                 align: layout.align,
             });
@@ -841,19 +2212,77 @@ impl Parser {
     }
 
     fn parse(&mut self) -> Result<()> {
+        // The lexical checks, before any line is read. The first lexes the
+        // module's strings, comments and address spaces as LLVM does, so
+        // every later reader meets only strings and comments that end on
+        // their own line, no block comment and only the default address
+        // space. The second lexes every token as LLVM does and refuses what
+        // the line reader would read differently: whitespace other than
+        // space, tab and line feed, glued tokens, calling conventions other
+        // than C, and more than one entity or instruction on a line
+        // (`lexical::check_module`).
+        let joined = self.lines.join("\n");
+        check_module_lexically(&joined)?;
+        // Every name in the one spelling LLVM's decoded name has
+        // (`lexical::canonicalize`): every check and reader after this point
+        // reads names as LLVM decodes them, not as they are spelled.
+        let raw_tokens = crate::lexical::lex(&joined)?;
+        let joined = crate::lexical::canonicalize(&joined, &raw_tokens)?;
+        let tokens = crate::lexical::lex(&joined)?;
+        crate::lexical::check_module(&joined, &tokens)?;
+        // Named metadata and module flags llc acts on, read or refused by
+        // name.
+        crate::metadata::check_module_metadata(&joined, &tokens)?;
+        // The compile target: the caller's (llc's `-mtriple`), or else the
+        // module's `target triple` (an empty one names none, as llc reads
+        // it), read as LLVM reads a triple.
+        let triple = match self.compile_target.clone() {
+            Some(target) => Some(target),
+            None => crate::metadata::module_triple(&joined, &tokens)?
+                .filter(|triple| !triple.is_empty()),
+        };
+        self.target = triple.as_deref().map(crate::triple::read);
+        // On RISC-V, llc lowers `fastcc` with its own convention
+        // (`CC_RISCV_FastCC`, `RISCVISelLowering.cpp`: integer arguments 9
+        // to 12 in `x28`-`x31`, floating-point ones in more registers),
+        // not as C; with no target known the module may be compiled for
+        // RISC-V. `lexical::modeled_calling_convention` reads `fastcc` as
+        // C only for the other targets.
+        if let Some(riscv) = self.riscv_target()
+            && let Some(token) = tokens
+                .iter()
+                .find(|token| token.kind == LexKind::Word && token.text(&joined) == "fastcc")
+        {
+            let target = match riscv {
+                RiscvTarget::Known(xlen) => format!("a {xlen}-bit RISC-V target"),
+                RiscvTarget::Unknown => "a module with no known target, which may be compiled \
+                                         for RISC-V"
+                    .to_string(),
+            };
+            return Err(Error::Unsupported(format!(
+                "line {}: calling convention `fastcc` on {target}: llc lowers it there with \
+                 `CC_RISCV_FastCC` (integer arguments 9 to 12 in `x28`-`x31`, more \
+                 floating-point argument registers), not as the C convention this importer \
+                 reads it as",
+                token.line
+            )));
+        }
+
         // Snapshot lines so we can iterate with look-ahead for function
         // bodies without fighting the borrow checker. Strip comments and
-        // metadata attachments up front.
-        let lines: Vec<(usize, String)> = self
-            .lines
-            .iter()
+        // metadata attachments up front. A tab outside a string or comment
+        // reads as the space LLVM takes it for.
+        let lines: Vec<(usize, String)> = crate::lexical::blank_tabs(&joined, &tokens)
+            .split('\n')
             .enumerate()
             .map(|(i, l)| (i + 1, strip_line(l)))
             .collect();
 
         for (_, raw) in &lines {
             let line = raw.trim();
-            if let Some((group, attrs)) = parse_attribute_group(line) {
+            if let Some((group, attrs)) =
+                parse_attribute_group(line, ProcessorTable::of(self.target))
+            {
                 self.attribute_groups.insert(group, attrs);
             }
         }
@@ -870,11 +2299,24 @@ impl Parser {
             .map(|(ln, raw)| (*ln, raw.trim().to_string()))
             .filter(|(_, l)| l.starts_with('%') && l.contains("= type"))
             .collect();
+        if self.riscv_target().is_some() {
+            self.riscv_named_types_floating = mentions_floating_point_or_vector("", &pending);
+        }
         while !pending.is_empty() {
             let before = pending.len();
             pending.retain(|(ln, line)| self.parse_struct_type_def(line, *ln).is_err());
             if pending.len() == before {
                 break;
+            }
+        }
+
+        // COMDAT declarations (`$name = comdat any`) before any symbol that
+        // names one: LLVM resolves a `comdat($name)` clause against a
+        // declaration anywhere in the module.
+        for (lineno, raw) in &lines {
+            let line = raw.trim();
+            if line.starts_with('$') {
+                self.parse_comdat_declaration(line, *lineno)?;
             }
         }
 
@@ -898,7 +2340,28 @@ impl Parser {
                 i += 1;
                 continue;
             }
-            if line.starts_with("target ") || line.starts_with("source_filename") {
+            if let Some(rest) = line.strip_prefix("target ") {
+                // The module's target, recorded (trust-ir requires a module
+                // with an FFI boundary to name its target, `TargetInfoRequired`,
+                // and trust-cg's ingestion refuses what trust-ir refuses, WS7.3).
+                let quoted = |directive: &str| {
+                    rest.strip_prefix(directive)
+                        .map(str::trim_start)
+                        .and_then(|value| value.strip_prefix('='))
+                        .map(str::trim)
+                        .and_then(|value| value.strip_prefix('"'))
+                        .and_then(|value| value.strip_suffix('"'))
+                        .map(str::to_string)
+                };
+                if let Some(triple) = quoted("triple") {
+                    self.target_triple = Some(triple);
+                } else if let Some(layout) = quoted("datalayout") {
+                    self.target_datalayout = Some(layout);
+                }
+                i += 1;
+                continue;
+            }
+            if line.starts_with("source_filename") {
                 // Informational only.
                 i += 1;
                 continue;
@@ -913,6 +2376,11 @@ impl Parser {
             }
             if line.starts_with('!') {
                 // Metadata definition — ignore.
+                i += 1;
+                continue;
+            }
+            if line.starts_with('$') {
+                // COMDAT declaration, read by the pre-scan above.
                 i += 1;
                 continue;
             }
@@ -947,7 +2415,348 @@ impl Parser {
         }
 
         self.apply_libm_purity_licenses();
+        self.refuse_dso_local_addressing_llc_writes_otherwise()?;
+        self.refuse_integer_constants_in_the_stub_interval()?;
+        self.call_weak_declarations_through_their_address()?;
+        self.check_call_site_abi()?;
+        self.check_call_site_function_types()?;
+        self.refuse_library_routines_without_a_header()?;
 
+        Ok(())
+    }
+
+    /// Refuse a C library routine the backend reads by its declared
+    /// prototype ([`is_c_library_routine_read_by_prototype`]) that the module
+    /// calls or names but no header declares: its signature would be the
+    /// function type a call states (declare-by-use), and a
+    /// `ptr (ptr, ptr, i64)` call of `@memcpy` would carry C's prototype, which
+    /// the backend reads as the routine. LLVM's parser refuses such a module
+    /// (llc 22.1.2: "use of undefined value '@memcpy'"). A header this reader
+    /// does not model, or an unprototyped one, is refused at the header
+    /// (`parse_declare`); LD-100 rule 8.
+    fn refuse_library_routines_without_a_header(&self) -> Result<()> {
+        let mut unheaded: Vec<&String> = self
+            .func_ids
+            .keys()
+            .filter(|name| {
+                is_c_library_routine_read_by_prototype(name)
+                    && !self.stated_function_facts.contains_key(*name)
+            })
+            .collect();
+        unheaded.sort();
+        match unheaded.first() {
+            Some(name) => Err(Error::Unsupported(format!(
+                "function `@{name}` is called or named but never declared: its signature would \
+                 be the function type a call states, and this importer's backend reads a call \
+                 of `@{name}` with C's prototype as the C library routine (LLVM's parser \
+                 refuses a module that uses an undeclared function)"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuse a `dso_local` symbol whose references llc 22 binds otherwise
+    /// than this backend under the compile's relocation model
+    /// ([`Parser::relocation_model`]), by name. LLVM's `dso_local` lets llc
+    /// assume the symbol resolves in the linked image; the importer drops it
+    /// (trust-ir has no such fact), and the backend decides its forms from
+    /// linkage, visibility and model alone. The references are read from the
+    /// imported module ([`symbol_references`]): every definition's code
+    /// ([`function_body_is_emitted`]), every global's initializer, and apart
+    /// the code of each `available_externally` body the backend may splice
+    /// into a caller under the model
+    /// ([`available_externally_body_may_be_spliced`]).
+    ///
+    /// * A `dso_local` declaration for the linker
+    ///   ([`Parser::dso_local_imports`]) whose address the code takes. llc
+    ///   addresses it PC-relative (`ADRP` and `R_AARCH64_ADR_PREL_PG_HI21`)
+    ///   under every model and the backend through the GOT. Under `pic` the
+    ///   import's reference stays preemptible where llc's binds at link time
+    ///   (the third verifier round of L02-P13 measured an `LD_PRELOAD`
+    ///   interposer taking the import's read in a shared object, 1005 for the
+    ///   definition's 12, under GNU ld, gold and LLD, where llc's object
+    ///   linked under gold alone and read 12); under `pie` GNU ld refuses
+    ///   llc's object, and gold's executable of llc's function address dies
+    ///   with `SIGILL`, where the definition is in a shared library and the
+    ///   import's links and runs. Admitted only for an AArch64 ELF compile
+    ///   target under `static`, whose objects go into non-PIE executables:
+    ///   there llc's object asks the static link for the executable's
+    ///   address (a copy relocation, or a canonical PLT entry, when a shared
+    ///   library defines the symbol) and the import's object the dynamic
+    ///   linker for the GOT's. The two are one address unless the defining
+    ///   library binds its own references inside itself (linked
+    ///   `-Bsymbolic`, or `-Bsymbolic-functions` for a function) or the
+    ///   static link exports no canonical PLT entry (gold, for a library's
+    ///   function): there llc's object takes the executable's address and the
+    ///   import's the library's. A protected definition in a shared library,
+    ///   which no linker moves into the executable, fails llc's object to
+    ///   link where the import's links and runs (LD-31's amendments of
+    ///   2026-10-15 state the measured links).
+    ///   With no model known the declaration is refused, since the model may
+    ///   be `pie` or `pic`. A direct call and a pointer in a global's
+    ///   initializer are the same in both objects (`CALL26`,
+    ///   `R_AARCH64_ABS64`) and stay admitted, as does a declaration nothing
+    ///   addresses.
+    /// * Such a declaration whose address an `available_externally` body
+    ///   takes where the backend may splice the body and the definition it
+    ///   copies may be in a shared library
+    ///   ([`spliced_body_may_bind_otherwise`]), `static` for AArch64 ELF
+    ///   included. llc's object only calls the function; the definition,
+    ///   compiled by llc from the same text, addresses the symbol
+    ///   PC-relative and so, in a shared library gold links, binds it inside
+    ///   that library, while the spliced code reads it through the GOT: an
+    ///   `LD_PRELOAD` interposer of the symbol took the splice's read (1005)
+    ///   and not the definition's (12) at O1-O3.
+    /// * Under `pic`, a `dso_local` default-visibility definition
+    ///   ([`Parser::dso_local_definitions`]) the module references at all
+    ///   (its address, a call, an initializer's pointer; in the code or in an
+    ///   `available_externally` body the backend may splice): llc binds those
+    ///   references locally (an `.L<name>$local` alias, or PC-relative for a
+    ///   `weak` or ODR one) where the backend goes through the GOT and the
+    ///   PLT, so an interposer takes the import's references and not llc's.
+    ///   Under `static` and `pie` the two forms are equal; with no model
+    ///   known such a definition stays admitted (LD-31 states the cost).
+    fn refuse_dso_local_addressing_llc_writes_otherwise(&self) -> Result<()> {
+        let model = self.relocation_model;
+        let code = symbol_references(&self.module, function_body_is_emitted);
+        let static_aarch64_elf = model == Some(RelocationModel::Static)
+            && self.target.is_some_and(TargetTriple::is_aarch64_elf);
+        let compile = match model {
+            Some(model) => format!("compiled under the `{}` relocation model", model.name()),
+            None => "with no relocation model known".to_string(),
+        };
+        if !static_aarch64_elf
+            && let Some((name, what)) = first_named(&self.dso_local_imports, |name| {
+                code.addressed.contains(name)
+            })
+        {
+            return Err(Error::Unsupported(format!(
+                "{what} `@{name}` is `dso_local` and the module's code takes its address, \
+                 {compile}: llc 22 addresses a default-visibility `dso_local` symbol \
+                 PC-relative under every relocation model (it may assume the definition is in \
+                 the linked image), while this importer drops `dso_local` and its backend \
+                 addresses every declaration through the GOT, which leaves the reference \
+                 preemptible where llc's binds at link time (admitted only for an AArch64 ELF \
+                 target under `static`, where both are one address)"
+            )));
+        }
+        let spliced =
+            |function: &Function| available_externally_body_may_be_spliced(function, model);
+        let aarch64_elf = self.target.is_some_and(TargetTriple::is_aarch64_elf);
+        if let Some((body, name, what)) = self
+            .module
+            .functions
+            .iter()
+            .filter(|function| spliced_body_may_bind_otherwise(function, model, aarch64_elf))
+            .filter_map(|body| {
+                let references = symbol_references(&self.module, |function| function.id == body.id);
+                first_named(&self.dso_local_imports, |name| {
+                    references.addressed.contains(name)
+                })
+                .map(|(name, what)| (body.name.as_str(), name, what))
+            })
+            .min()
+        {
+            return Err(Error::Unsupported(format!(
+                "{what} `@{name}` is `dso_local` and the `available_externally` body of \
+                 `@{body}` takes its address, {compile}: the backend may splice that body into \
+                 a caller, and the spliced code addresses the declaration through the GOT, \
+                 where llc's object only calls `@{body}` and the definition the body copies, \
+                 compiled by llc from the same text, addresses it PC-relative and so, in a \
+                 shared library, binds it inside that library (refused wherever the body may \
+                 be spliced and its definition may be in a shared library, `static` included)"
+            )));
+        }
+        let references = symbol_references(&self.module, |function| {
+            function_body_is_emitted(function) || spliced(function)
+        });
+        if model == Some(RelocationModel::Pic)
+            && let Some((name, what)) = first_named(&self.dso_local_definitions, |name| {
+                references.addressed.contains(name)
+                    || references.called.contains(name)
+                    || references.initializers.contains(name)
+            })
+        {
+            return Err(Error::Unsupported(format!(
+                "{what} `@{name}` is `dso_local` and the module references it, {compile}: llc \
+                 22 binds the module's own references to a default-visibility `dso_local` \
+                 definition locally (an `.L<name>$local` alias, or PC-relative), while this \
+                 importer drops `dso_local` and its backend reaches such a definition in `pic` \
+                 code through the GOT and the PLT, which another image may preempt"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse a top-level `i64` constant in the global-address stub interval
+    /// `[0xFADE << 48, 0xFADF << 48)`, spelled non-negative, by name. The
+    /// lowering adapter reads such a constant on an `i64` or pointer carrier
+    /// as the address of a module global (`decode_imported_global_addr`).
+    /// The importer writes its own stubs on `ptr` only
+    /// ([`Parser::global_addr_stub`]), spells every integer literal in its
+    /// type's signed range ([`Parser::int_literal_value`]) and every computed
+    /// `i64` in `i64`'s ([`Parser::emit_i64_const`]), where no value of the
+    /// interval lies, and refuses an integer literal for `ptr` (LLVM rejects
+    /// one), so no constant it writes from the module's text reaches the
+    /// interval: this check holds that line for every path that writes a
+    /// constant.
+    fn refuse_integer_constants_in_the_stub_interval(&self) -> Result<()> {
+        for function in &self.module.functions {
+            for node in function.blocks.iter().flat_map(|block| &block.body) {
+                if let Inst::Const {
+                    ty: Ty::I64,
+                    value: Constant::Int(value),
+                } = &node.inst
+                    && in_global_addr_stub_interval(*value)
+                {
+                    return Err(Error::Unsupported(format!(
+                        "function `@{}`: the `i64` constant {value} lies in the interval \
+                         [0xFADE << 48, 0xFADF << 48) the lowering adapter reads as a global's \
+                         address, and this importer writes `i64` constants in their signed \
+                         range",
+                        function.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Spell every direct call of an `extern_weak` declaration the one way
+    /// trust-ir admits (`Function::is_weak_declaration`): a `CallIndirect`
+    /// through the declaration's `SymbolAddr`, stating its own signature and
+    /// calling convention. LLVM calls such a function directly (clang guards
+    /// the call with a null test of the same address); a call through a null
+    /// address is undefined in both.
+    ///
+    /// The rewrite changes which lowering the call takes, so it is admitted
+    /// only where that lowering passes the same arguments as a direct call:
+    /// [`refuse_weak_call_the_indirect_lowering_would_change`] refuses, by
+    /// name, a variadic callee, a 128-bit integer argument that may be
+    /// passed on the stack, a call-ABI fact of the function the indirect
+    /// call does not carry (its hidden return buffer above all), and an
+    /// intrinsic name (LD-100 rule 12).
+    ///
+    /// It runs after the whole module is parsed because a call usually
+    /// precedes the `declare extern_weak` line that makes its callee weak.
+    fn call_weak_declarations_through_their_address(&mut self) -> Result<()> {
+        let weak: HashMap<FuncId, (String, FuncTyId, CallingConv)> = self
+            .module
+            .functions
+            .iter()
+            .filter(|function| function.is_weak_declaration())
+            .map(|function| {
+                (
+                    function.id,
+                    (function.name.clone(), function.ty, function.calling_conv),
+                )
+            })
+            .collect();
+        if weak.is_empty() {
+            return Ok(());
+        }
+        let mut called: Vec<FuncId> = self
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.body.iter())
+            .filter_map(|node| match &node.inst {
+                Inst::Call { callee, .. } if weak.contains_key(callee) => Some(*callee),
+                _ => None,
+            })
+            .collect();
+        called.sort_unstable_by_key(|callee| callee.index());
+        called.dedup();
+        for callee in &called {
+            if let Some((symbol, sig, _)) = weak.get(callee) {
+                let func_ty = self
+                    .module
+                    .func_types
+                    .get(sig.index() as usize)
+                    .ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "`extern_weak` function `@{symbol}` has no registered signature"
+                        ))
+                    })?;
+                let attrs = self
+                    .module
+                    .functions
+                    .iter()
+                    .find(|function| function.id == *callee)
+                    .map(|function| &function.attrs)
+                    .ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "`extern_weak` function `@{symbol}` has no registered function"
+                        ))
+                    })?;
+                refuse_weak_call_the_indirect_lowering_would_change(symbol, func_ty, attrs)?;
+            }
+        }
+        for function in &mut self.module.functions {
+            let calls_weak = function.blocks.iter().any(|block| {
+                block.body.iter().any(
+                    |node| matches!(&node.inst, Inst::Call { callee, .. } if weak.contains_key(callee)),
+                )
+            });
+            if !calls_weak {
+                continue;
+            }
+            let mut next_value = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block.params.iter().map(|(value, _)| *value).chain(
+                        block
+                            .body
+                            .iter()
+                            .flat_map(|node| node.results.iter().copied()),
+                    )
+                })
+                .map(|value| value.index())
+                .max()
+                .map_or(Some(0), |max| max.checked_add(1))
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "function `@{}` has no free value id for a weak-call address",
+                        function.name
+                    ))
+                })?;
+            for block in &mut function.blocks {
+                let mut body = Vec::with_capacity(block.body.len());
+                for mut node in std::mem::take(&mut block.body) {
+                    if let Inst::Call { callee, args } = &node.inst
+                        && let Some((symbol, sig, calling_conv)) = weak.get(callee)
+                    {
+                        let address = ValueId::new(next_value);
+                        next_value = next_value.checked_add(1).ok_or_else(|| {
+                            Error::Unsupported(format!(
+                                "function `@{}` has no free value id for a weak-call address",
+                                function.name
+                            ))
+                        })?;
+                        body.push(
+                            InstrNode::new(Inst::Const {
+                                ty: Ty::Ptr,
+                                value: Constant::SymbolAddr {
+                                    symbol: symbol.clone(),
+                                    addend: 0,
+                                },
+                            })
+                            .with_result(address),
+                        );
+                        node.inst = Inst::CallIndirect {
+                            callee: address,
+                            sig: *sig,
+                            args: args.clone(),
+                            calling_conv: *calling_conv,
+                        };
+                    }
+                    body.push(node);
+                }
+                block.body = body;
+            }
+        }
         Ok(())
     }
 
@@ -1027,45 +2836,62 @@ impl Parser {
             )));
         }
 
-        let inner = &body[1..body.len() - 1];
-        let mut fields = Vec::new();
-        let mut offset = 0u64;
-        let mut struct_align = 1u64;
-        if !inner.trim().is_empty() {
-            for field_str in split_call_args(inner) {
-                let fs = field_str.trim();
-                // Fields may be scalars, arrays (`[N x T]`) or earlier-defined
-                // named aggregates (`%struct.X`). `parse_fixed_layout_ty`
-                // computes the exact size/align for all three per the Apple
-                // arm64 ABI, so nested-aggregate structs lay out correctly.
-                let field_layout = self.parse_fixed_layout_ty(fs)?;
-                let field_size = field_layout.size();
-                let field_align = field_layout.align();
-                offset = align_up(offset, field_align);
-                // The stored `Ty` is only consulted for scalar fields (struct
-                // GEP reads the offset, not the type; the total struct size is
-                // tracked in `size` below). An aggregate field keeps an `i8`
-                // placeholder — a field-precise GEP into it is a separate,
-                // independently-guarded path.
-                let field_ty = match &field_layout {
-                    FixedLayout::Scalar(t) => t.clone(),
-                    _ => Ty::I8,
-                };
-                fields.push((field_ty, offset));
-                offset += field_size;
-                struct_align = struct_align.max(field_align);
-            }
-        }
-
-        let layout = StructLayout {
+        // One checked layout implementation serves named and inline structs.
+        // Keep nested field types: replacing an aggregate with an i8 placeholder
+        // loses the contract needed by initializer and nested-GEP validation.
+        let FixedLayout::Struct {
             fields,
-            size: align_up(offset, struct_align),
-            align: struct_align,
+            size,
+            align,
+        } = self.parse_fixed_layout_ty(body)?
+        else {
+            return Err(self.err_unsupported("named type did not produce a struct layout"));
         };
-        self.struct_layouts.insert(name.to_string(), layout);
+        self.struct_layouts.insert(
+            name.to_string(),
+            StructLayout {
+                fields,
+                size,
+                align,
+            },
+        );
         Ok(())
     }
 
+    /// Push global `@name` holding the flat data image `image` (one
+    /// `Constant::Int` per byte, one `SymbolAddr` per pointer slot) in its
+    /// canonical storage type. TrustIR types an initializer against its
+    /// global's declared type, so the image is a `[u8; N]` or a packed
+    /// byte-run/pointer struct ([`type_flat_image`]), never a `ptr` global.
+    fn push_image_global(
+        &mut self,
+        name: String,
+        image: Vec<Constant>,
+        mutable: bool,
+        linkage: Linkage,
+        align: Option<u32>,
+    ) -> Result<()> {
+        let typed = type_flat_image(&mut self.module, &name, image, IMPORTED_POINTER_BYTES)
+            .map_err(|reason| self.err_unsupported(&reason))?;
+        let idx = self.module.globals.len();
+        self.module.globals.push(Global {
+            name: name.clone(),
+            ty: typed.ty,
+            mutable,
+            initializer: Some(typed.initializer),
+            linkage,
+            tls: None,
+            align,
+            section: self.pending_section.clone(),
+            visibility: self.pending_visibility,
+            retained: false,
+        });
+        self.globals.insert(name, idx);
+        Ok(())
+    }
+
+    /// A `[N x i8] c"..."` global. `rest` is its type and initializer only,
+    /// so no search below reaches a clause after them.
     fn parse_string_global(
         &mut self,
         name: String,
@@ -1117,21 +2943,22 @@ impl Parser {
             .ok_or_else(|| self.err_parse(lineno, "unterminated c-string"))?;
         let raw = &init_tail[..close];
         let bytes = decode_ll_string(raw);
+        let declared = ty_body
+            .split_once(" x ")
+            .and_then(|(len, _)| len.trim().parse::<u64>().ok())
+            .ok_or_else(|| self.err_unsupported(&format!("global @{name}: array length")))?;
+        if bytes.len() as u64 != declared {
+            return Err(c_string_length_mismatch(
+                &format!("global `@{name}`"),
+                raw,
+                bytes.len(),
+                declared,
+            ));
+        }
         self.checked_global_initializer_len(&name, bytes.len() as u64)?;
 
         let elems: Vec<Constant> = bytes.iter().map(|b| Constant::Int(*b as i128)).collect();
-        let idx = self.module.globals.len();
-        self.module.globals.push(Global {
-            name: name.clone(),
-            ty: Ty::Ptr,
-            mutable,
-            initializer: Some(Constant::Aggregate(elems)),
-            linkage,
-            tls: None,
-            align,
-        });
-        self.globals.insert(name, idx);
-        Ok(())
+        self.push_image_global(name, elems, mutable, linkage, align)
     }
 
     fn parse_scalar_global_initializer(&self, ty: &Ty, tok: &str) -> Result<Constant> {
@@ -1144,10 +2971,11 @@ impl Parser {
                 let b = match tok {
                     "zeroinitializer" | "null" | "false" => false,
                     "true" => true,
+                    // A literal's low bit, as LLVM reads it for `i1`
+                    // (`int_literal_constant`: `i1 2` is false).
                     _ => match parse_int_literal(tok) {
-                        Some(0) => false,
-                        Some(1) => true,
-                        _ => {
+                        Some(n) => return self.int_literal_constant(n, ty),
+                        None => {
                             return Err(
                                 self.err_unsupported(&format!("bool global initializer `{}`", tok))
                             );
@@ -1160,23 +2988,19 @@ impl Parser {
                 if tok == "zeroinitializer" || tok == "null" {
                     return Ok(Constant::Int(0));
                 }
-                parse_int_literal(tok).map(Constant::Int).ok_or_else(|| {
+                // Read as LLVM reads it for the global's type, spelled in the
+                // signed carrier's range trust-ir's admission requires
+                // (`int_literal_constant`).
+                let n = parse_int_literal(tok).ok_or_else(|| {
                     self.err_unsupported(&format!("scalar global initializer `{}`", tok))
-                })
+                })?;
+                self.int_literal_constant(n, ty)
             }
             Ty::F16 | Ty::F32 | Ty::F64 => {
                 if tok == "zeroinitializer" {
                     return Ok(Constant::Float(0.0));
                 }
-                match parse_fp_literal(tok).ok_or_else(|| {
-                    self.err_unsupported(&format!("scalar global initializer `{}`", tok))
-                })? {
-                    FpLit::Double(d) | FpLit::Half(d) => Ok(Constant::Float(d)),
-                    FpLit::Extended(tag) => Err(self.err_unsupported(&format!(
-                        "extended-precision float literal `0x{}...` (trust_ir only has f16/f32/f64)",
-                        tag
-                    ))),
-                }
+                fp_literal_constant(tok, ty).map(Constant::Float)
             }
             Ty::Ptr => {
                 if tok == "null" || tok == "zeroinitializer" {
@@ -1199,13 +3023,31 @@ impl Parser {
     /// exact byte image — a pointer to a symbol (needs a relocation), an f16
     /// field, an unsupported type — fails CLOSED; the importer never guesses a
     /// layout.
-    fn serialize_typed_const(&self, s: &str, out: &mut Vec<u8>) -> Result<()> {
+    fn serialize_typed_const(
+        &self,
+        s: &str,
+        out: &mut Vec<u8>,
+        expected: Option<&FixedLayout>,
+        limit: usize,
+    ) -> Result<()> {
         let (ty_str, value) = split_leading_type(s.trim()).ok_or_else(|| {
             self.err_unsupported(&format!("aggregate initializer element `{}`", s.trim()))
         })?;
         let layout = self.parse_fixed_layout_ty(ty_str)?;
+        if expected.is_some_and(|expected| expected != &layout) {
+            return Err(
+                self.err_unsupported("aggregate initializer type does not match declared layout")
+            );
+        }
         let start = out.len();
-        let want_end = start + layout.size() as usize;
+        let byte_len = usize::try_from(layout.size())
+            .map_err(|_| self.err_unsupported("aggregate initializer size overflows usize"))?;
+        let want_end = start
+            .checked_add(byte_len)
+            .filter(|end| *end <= limit)
+            .ok_or_else(|| {
+                self.err_unsupported("aggregate initializer exceeds its enclosing byte limit")
+            })?;
 
         if value == "zeroinitializer" {
             out.resize(want_end, 0);
@@ -1217,12 +3059,24 @@ impl Parser {
                 let bytes = self.le_bytes_of_scalar(ty, value)?;
                 out.extend_from_slice(&bytes);
             }
-            FixedLayout::Array { len, .. } => {
+            FixedLayout::Array { len, elem, .. } => {
                 if let Some(rest) = value.strip_prefix("c\"") {
+                    if !layout.is_top_i8_array() {
+                        return Err(self.err_unsupported("string initializer requires an i8 array"));
+                    }
                     let close = find_ll_string_end(rest).ok_or_else(|| {
                         self.err_unsupported("unterminated c-string in aggregate initializer")
                     })?;
-                    out.extend_from_slice(&decode_ll_string(&rest[..close]));
+                    let bytes = decode_ll_string(&rest[..close]);
+                    if bytes.len() != byte_len {
+                        return Err(c_string_length_mismatch(
+                            "aggregate initializer",
+                            &rest[..close],
+                            bytes.len(),
+                            byte_len as u64,
+                        ));
+                    }
+                    out.extend_from_slice(&bytes);
                 } else if let Some(inner) =
                     value.strip_prefix('[').and_then(|v| v.strip_suffix(']'))
                 {
@@ -1233,7 +3087,7 @@ impl Parser {
                         ));
                     }
                     for e in &elems {
-                        self.serialize_typed_const(e, out)?;
+                        self.serialize_typed_const(e, out, Some(elem), want_end)?;
                     }
                 } else {
                     return Err(
@@ -1254,8 +3108,17 @@ impl Parser {
                 }
                 for (field, init) in fields.iter().zip(field_inits.iter()) {
                     // Pad up to this field's offset, then serialize it.
-                    out.resize(start + field.offset as usize, 0);
-                    self.serialize_typed_const(init, out)?;
+                    let field_start = usize::try_from(field.offset)
+                        .ok()
+                        .and_then(|offset| start.checked_add(offset))
+                        .filter(|offset| *offset >= out.len() && *offset <= want_end)
+                        .ok_or_else(|| {
+                            self.err_unsupported(
+                                "aggregate field overlaps or exceeds its enclosing extent",
+                            )
+                        })?;
+                    out.resize(field_start, 0);
+                    self.serialize_typed_const(init, out, Some(&field.layout), want_end)?;
                 }
             }
         }
@@ -1278,17 +3141,22 @@ impl Parser {
             // integer case to fall through: a `Ty` variant this table does not
             // name reaches the `other =>` arm below and fails CLOSED with a
             // diagnostic, instead of being silently given some default width.
-            Ty::Bool | Ty::I8 => self.le_bytes_of_int_scalar(1, value),
+            // An `i1` is stored as one byte holding 0 or 1: the literal's
+            // low bit, as LLVM reads it (`i1 2` is 0, `i1 -1` is 1).
+            Ty::Bool => self
+                .le_bytes_of_int_scalar(1, value)
+                .map(|bytes| bytes.iter().map(|byte| byte & 1).collect()),
+            Ty::I8 => self.le_bytes_of_int_scalar(1, value),
             Ty::I16 => self.le_bytes_of_int_scalar(2, value),
             Ty::I32 => self.le_bytes_of_int_scalar(4, value),
             Ty::I64 => self.le_bytes_of_int_scalar(8, value),
             Ty::I128 => self.le_bytes_of_int_scalar(16, value),
             Ty::F32 => {
-                let d = self.aggregate_float_bits(value)?;
+                let d = self.aggregate_float_bits(value, ty)?;
                 Ok((d as f32).to_bits().to_le_bytes().to_vec())
             }
             Ty::F64 => {
-                let d = self.aggregate_float_bits(value)?;
+                let d = self.aggregate_float_bits(value, ty)?;
                 Ok(d.to_bits().to_le_bytes().to_vec())
             }
             Ty::F16 => Err(self.err_unsupported("f16 aggregate field (no exact byte image yet)")),
@@ -1319,16 +3187,8 @@ impl Parser {
         Ok((0..width).map(|i| (u >> (i * 8)) as u8).collect())
     }
 
-    fn aggregate_float_bits(&self, value: &str) -> Result<f64> {
-        match parse_fp_literal(value)
-            .ok_or_else(|| self.err_unsupported(&format!("float aggregate field `{}`", value)))?
-        {
-            FpLit::Double(d) | FpLit::Half(d) => Ok(d),
-            FpLit::Extended(tag) => Err(self.err_unsupported(&format!(
-                "extended-precision float aggregate field `0x{}...`",
-                tag
-            ))),
-        }
+    fn aggregate_float_bits(&self, value: &str, ty: &Ty) -> Result<f64> {
+        fp_literal_constant(value, ty)
     }
 
     /// Serialize an explicit aggregate global initializer (`%struct.foo { ... }`
@@ -1340,18 +3200,92 @@ impl Parser {
         typed_init: &str,
     ) -> Result<Vec<Constant>> {
         let mut bytes = Vec::new();
-        self.serialize_typed_const(typed_init, &mut bytes)?;
-        self.checked_global_initializer_len(name, bytes.len() as u64)?;
+        let (ty_str, _) = split_leading_type(typed_init.trim())
+            .ok_or_else(|| self.err_unsupported("aggregate global lacks a type and initializer"))?;
+        let layout = self.parse_fixed_layout_ty(ty_str)?;
+        let byte_len = self.checked_global_initializer_len(name, layout.size())?;
+        self.serialize_typed_const(typed_init, &mut bytes, Some(&layout), byte_len)?;
         Ok(bytes
             .into_iter()
             .map(|b| Constant::Int(b as i128))
             .collect())
     }
 
+    /// Whether LLVM 22 gives the constant definition just parsed as global
+    /// `index` (which the caller has checked is `unnamed_addr`) a mergeable
+    /// section kind, as `TargetLoweringObjectFile::getKindForGlobal` decides
+    /// it: its initializer needs no relocation, and it is a null-terminated
+    /// array of `i8`, `i16` or `i32` (`IsNullTerminatedString`: the last
+    /// element is the only zero one, or a one-element `zeroinitializer`) or
+    /// its allocation size is 4, 8, 16 or 32 bytes. A shape this reader
+    /// cannot decide counts as mergeable, so the caller refuses it.
+    fn llvm_constant_is_mergeable(&self, name: &str, index: usize, after_storage: &str) -> bool {
+        let Some(initializer) = self
+            .module
+            .globals
+            .get(index)
+            .and_then(|global| global.initializer.as_ref())
+        else {
+            return true;
+        };
+        let mut relocated = false;
+        initializer.visit_constants(|constant| {
+            if matches!(
+                constant,
+                Constant::SymbolAddr { .. } | Constant::FnDef(_) | Constant::Closure { .. }
+            ) {
+                relocated = true;
+            }
+        });
+        if relocated {
+            return false;
+        }
+        let init_part = split_comma(after_storage)
+            .map(|(head, _)| head)
+            .unwrap_or_else(|| after_storage.trim().to_string());
+        let Some((ty_text, _)) = split_leading_type(init_part.trim()) else {
+            return true;
+        };
+        let Ok(layout) = self.parse_fixed_layout_ty(ty_text) else {
+            return true;
+        };
+        if let FixedLayout::Array { len, elem, .. } = &layout
+            && let FixedLayout::Scalar(elem_ty @ (Ty::I8 | Ty::I16 | Ty::I32)) = elem.as_ref()
+        {
+            let width = match elem_ty {
+                Ty::I8 => 1,
+                Ty::I16 => 2,
+                _ => 4,
+            };
+            let Ok(byte_len) = self.checked_global_initializer_len(name, layout.size()) else {
+                return true;
+            };
+            let mut bytes = Vec::new();
+            if self
+                .serialize_typed_const(init_part.trim(), &mut bytes, Some(&layout), byte_len)
+                .is_err()
+                || bytes.len() != len.saturating_mul(width)
+            {
+                return true;
+            }
+            let zero: Vec<bool> = bytes
+                .chunks(width)
+                .map(|element| element.iter().all(|byte| *byte == 0))
+                .collect();
+            if let Some((last, rest)) = zero.split_last()
+                && *last
+                && !rest.contains(&true)
+            {
+                return true;
+            }
+        }
+        matches!(layout.size(), 4 | 8 | 16 | 32)
+    }
+
     /// Serialize a `[N x ptr] [ptr @a, ptr @b, ..., ptr null]` global — an array
-    /// of pointers to module symbols (a string/function pointer table) — into a
-    /// flat `Constant::Aggregate` the codegen data-emitter turns into a byte
-    /// image plus per-slot relocations:
+    /// of pointers to module symbols (a string/function pointer table) — into
+    /// its flat image, which [`Self::push_image_global`] types as byte runs
+    /// plus one relocated pointer field per slot:
     ///   * `ptr @sym`          -> one `SymbolAddr` element (8 bytes + relocation)
     ///   * `ptr null`/`zeroinitializer` -> 8 zero `Int` bytes (a null pointer)
     ///     Every referenced `@sym` must be a KNOWN module symbol (global or function)
@@ -1489,14 +3423,14 @@ impl Parser {
                     name, literal_str
                 ))
             })?;
+            // The literal's low bits at the element's width, as LLVM reads it.
             let value_bytes =
                 integer_literal_to_le_byte_constants(value, bits).ok_or_else(|| {
                     self.err_unsupported(&format!(
-                    "explicit integer array global @{} element literal `{}` out of range for `{}`",
-                    name,
-                    literal_str,
-                    format_ty_for_array_error(elem_ty)
-                ))
+                        "explicit integer array global @{} element type `{}`",
+                        name,
+                        format_ty_for_array_error(elem_ty)
+                    ))
                 })?;
             bytes.extend(value_bytes);
         }
@@ -1505,19 +3439,202 @@ impl Parser {
 
     fn parse_global(&mut self, line: &str, lineno: usize) -> Result<()> {
         let (name, rest) = split_eq(line).ok_or_else(|| self.err_parse(lineno, "bad global"))?;
+        // `@llvm.used` / `@llvm.compiler.used` are metadata arrays, not
+        // globals: they name symbols the consumer must keep even when nothing
+        // references them (`#[used]`). Record the `@llvm.used` names for the
+        // retention pass in `import_text` and emit no global for either
+        // array.
+        if is_used_metadata_array(name) {
+            if name.trim_start_matches('@').trim() == "llvm.used" {
+                for raw in used_metadata_symbols(rest)? {
+                    let canonical = self.canon_symbol_name(&raw)?;
+                    self.llvm_used_symbols
+                        .insert(llvm_symbol_identity(&canonical));
+                }
+            }
+            return Ok(());
+        }
         // De-mangle the `\01` asm-label escape (verbatim symbol) if present, and
         // record the symbol's origin so a later collision fails closed.
         let name = self.canon_and_note_symbol(name.trim_start_matches('@').trim())?;
-        let lower = rest.to_lowercase();
-        let linkage = parse_linkage(&lower);
+        if let Some(keyword) = alias_or_ifunc_keyword(rest) {
+            return Err(self.err_unsupported(&format!(
+                "global `@{name}` is an `{keyword}` ({}); the importer imports no `alias` or \
+                 `ifunc`",
+                if keyword == "alias" {
+                    "a second symbol for another global's or function's address, which the \
+                     backend has no symbol for"
+                } else {
+                    "a GNU indirect function whose resolver the loader runs, which the backend \
+                     has no `STT_GNU_IFUNC` symbol for"
+                }
+            )));
+        }
         let (mutable, after_storage) = split_global_storage(rest).ok_or_else(|| {
             self.err_unsupported(&format!(
                 "global @{} without `global`/`constant` storage class",
                 name
             ))
         })?;
-        let align = self.parse_global_alignment(after_storage)?;
+        // The prefix before the storage class carries the linkage and
+        // visibility keywords (and the qualifiers refused by name); the tail
+        // after the initializer carries `section`, `comdat` and `align`. All
+        // are read here, once: visibility and section are consumed by every
+        // global-initializer site below and in `parse_string_global`, and the
+        // linkage is settled once the initializer is known.
+        let subject = format!("global `@{name}`");
+        let prefix = parse_symbol_prefix(
+            &global_prefix_tokens(rest, after_storage),
+            PrefixKind::Global,
+            &subject,
+        )?;
+        refuse_inexpressible_linkage(prefix, &subject)?;
+        let clauses = parse_global_clauses(after_storage, &subject, &self.attribute_groups)?;
+        // LLVM's section for its own metadata arrays: llc emits no global
+        // defined in it (`AsmPrinter::emitSpecialLLVMGlobal`), so a reference
+        // to one stays undefined in llc's object.
+        if clauses.section.as_deref() == Some("llvm.metadata") {
+            return Err(Error::Unsupported(format!(
+                "{subject}: section \"llvm.metadata\" (llc emits no global defined in LLVM's \
+                 metadata section; this importer would emit it)"
+            )));
+        }
+        let comdat = clauses.comdat;
+        self.pending_visibility = prefix.visibility;
+        let section = clauses.section.clone();
+        self.pending_section = clauses.section;
+        let align = clauses.align;
 
+        let index = self.module.globals.len();
+        let provisional = prefix
+            .linkage
+            .and_then(LlvmLinkage::trust_ir)
+            .unwrap_or(Linkage::External);
+        self.parse_global_value(
+            name.clone(),
+            lineno,
+            mutable,
+            provisional,
+            after_storage,
+            align,
+        )?;
+        let global = self
+            .module
+            .globals
+            .get_mut(index)
+            .filter(|global| global.name == name)
+            .ok_or_else(|| {
+                Error::Unsupported(format!("{subject}: the initializer parse added no global"))
+            })?;
+        let has_initializer = global.initializer.is_some();
+        let spelled = global_linkage(prefix, has_initializer, &subject)?;
+        // llc 22 states no visibility for an `available_externally` global:
+        // `AsmPrinter::emitSpecialLLVMGlobal` skips it before
+        // `emitVisibility`, so a reference to it is a `STV_DEFAULT`
+        // undefined symbol (which llc addresses PC-relative, as a dso-local
+        // one), and an unreferenced one writes nothing. The backend spells a
+        // data import's stated visibility on its undefined symbol, so the
+        // import of a hidden one would not link against a library that
+        // defines the symbol, where llc's object does, and would hide the
+        // definition a shared object supplies, which llc's exports. The
+        // visibility of an `available_externally` FUNCTION is written by
+        // llc and by the backend alike.
+        if spelled == Linkage::AvailableExternally && prefix.visibility != Visibility::Default {
+            return Err(Error::Unsupported(format!(
+                "{subject}: `available_externally` global with `{}` visibility: llc 22 writes \
+                 no visibility for an `available_externally` global (its `AsmPrinter` skips \
+                 it), so a reference to it is a default-visibility undefined symbol, where \
+                 this backend would write the stated visibility on it",
+                prefix.visibility
+            )));
+        }
+        // A data declaration or an `available_externally` global whose
+        // `dso_local` changes how llc addresses it, and such a non-local
+        // definition: read when the module is read
+        // (`Parser::refuse_dso_local_addressing_llc_writes_otherwise`).
+        if prefix.dso_local_changes_addressing() {
+            if spelled == Linkage::AvailableExternally || !has_initializer {
+                self.dso_local_imports.insert(
+                    name.clone(),
+                    if spelled == Linkage::AvailableExternally {
+                        "`available_externally` global"
+                    } else {
+                        "global declaration"
+                    },
+                );
+            } else if !spelled.is_module_local() {
+                self.dso_local_definitions
+                    .insert(name.clone(), "global definition");
+            }
+        }
+        // An `unnamed_addr` constant in an explicit section: LLVM 22 gives it
+        // a mergeable section kind (`TargetLoweringObjectFile::getKindForGlobal`),
+        // so llc writes its section `SHF_MERGE` with an entry size, apart
+        // from members of other kinds, and linkers fold equal entries. The
+        // importer drops `unnamed_addr`, trust-ir carries no such fact, and
+        // the backend places every member of a named section in one
+        // unmergeable section in declaration order, so a
+        // `__start_`/`__stop_` walk would read other members, in another
+        // order, than llc's.
+        if prefix.unnamed_addr
+            && !mutable
+            && has_initializer
+            && spelled != Linkage::AvailableExternally
+            && let Some(section) = section.as_deref()
+            && !llvm_names_elf_section_kind(section)
+            && self.llvm_constant_is_mergeable(&name, index, after_storage)
+        {
+            return Err(Error::Unsupported(format!(
+                "{subject}: `unnamed_addr` constant in section \"{section}\": LLVM 22 makes it \
+                 a mergeable constant (a null-terminated string of 1-, 2- or 4-byte elements, \
+                 or 4, 8, 16 or 32 bytes without a relocation), so llc writes its section \
+                 `SHF_MERGE` apart from the section's other members and linkers fold equal \
+                 entries; this importer drops `unnamed_addr` and keeps every member in one \
+                 unmergeable section"
+            )));
+        }
+        let global = self
+            .module
+            .globals
+            .get_mut(index)
+            .filter(|global| global.name == name)
+            .ok_or_else(|| {
+                Error::Unsupported(format!("{subject}: the initializer parse added no global"))
+            })?;
+        // The globals the backend groups: `trust-cg-codegen`'s
+        // `module_object_globals` (`comdat` for the link-once and ODR forms).
+        let grouped = matches!(
+            spelled,
+            Linkage::LinkOnce | Linkage::LinkOnceOdr | Linkage::WeakOdr
+        );
+        let is_definition = has_initializer && spelled != Linkage::AvailableExternally;
+        // Written without a `comdat` clause, LLVM places such a definition in
+        // no group: llc emits a plain weak symbol. The backend's ungrouped
+        // weak definition is `Weak`, which differs from the spelled linkage
+        // only in what the optimizer may assume (a link-once copy may be
+        // dropped when unused, and an ODR one read through): carrying it as
+        // `Weak` gives up those assumptions, never a behavior.
+        global.linkage = if grouped && comdat.is_none() {
+            Linkage::Weak
+        } else {
+            spelled
+        };
+        self.check_comdat_membership(&subject, &name, &comdat, grouped, is_definition)
+    }
+
+    /// Parse the storage type and initializer of global `@name` and push
+    /// exactly one `Global` with the provisional `linkage` (settled by the
+    /// caller once the initializer is known). Only the text before the first
+    /// clause is read here (`parse_global_clauses` reads the clauses).
+    fn parse_global_value(
+        &mut self,
+        name: String,
+        lineno: usize,
+        mutable: bool,
+        linkage: Linkage,
+        after_storage: &str,
+        align: Option<u32>,
+    ) -> Result<()> {
         let init_part_buf = split_comma(after_storage)
             .map(|(head, _)| head)
             .unwrap_or_else(|| after_storage.trim().to_string());
@@ -1529,7 +3646,7 @@ impl Parser {
             let value = value_str.trim();
             // A genuine top-level `[N x i8] c"..."` byte-string global.
             if layout.is_top_i8_array() && value.starts_with("c\"") {
-                return self.parse_string_global(name, rest, lineno, mutable, linkage, align);
+                return self.parse_string_global(name, init_part, lineno, mutable, linkage, align);
             }
             if value != "zeroinitializer" {
                 // A scalar-INTEGER-element array keeps its dedicated
@@ -1541,55 +3658,22 @@ impl Parser {
                         let elems = self.parse_explicit_integer_array_global_initializer(
                             &name, len, elem_ty, value,
                         )?;
-                        let idx = self.module.globals.len();
-                        self.module.globals.push(Global {
-                            name: name.clone(),
-                            ty: Ty::Ptr,
-                            mutable,
-                            initializer: Some(Constant::Aggregate(elems)),
-                            linkage,
-                            tls: None,
-                            align,
-                        });
-                        self.globals.insert(name, idx);
-                        return Ok(());
+                        return self.push_image_global(name, elems, mutable, linkage, align);
                     }
                     // `[N x ptr] [ptr @a, ptr @b, ...]` — an array of
                     // pointers to module symbols (a string/function table,
                     // e.g. fbench's `@refarr`). Each element is a
                     // pointer-width relocation, not a byte image, so it
-                    // needs the structured `SymbolAddr`/zero-slot form the
-                    // codegen data-emitter turns into relocations.
+                    // needs the `SymbolAddr`/zero-slot image the typed
+                    // global's pointer fields relocate.
                     if matches!(elem_ty, Ty::Ptr) {
                         let elems =
                             self.parse_pointer_array_global_initializer(&name, len, value)?;
-                        let idx = self.module.globals.len();
-                        self.module.globals.push(Global {
-                            name: name.clone(),
-                            ty: Ty::Ptr,
-                            mutable,
-                            initializer: Some(Constant::Aggregate(elems)),
-                            linkage,
-                            tls: None,
-                            align,
-                        });
-                        self.globals.insert(name, idx);
-                        return Ok(());
+                        return self.push_image_global(name, elems, mutable, linkage, align);
                     }
                 }
                 let bytes = self.serialize_named_aggregate_global(&name, init_part)?;
-                let idx = self.module.globals.len();
-                self.module.globals.push(Global {
-                    name: name.clone(),
-                    ty: Ty::Ptr,
-                    mutable,
-                    initializer: Some(Constant::Aggregate(bytes)),
-                    linkage,
-                    tls: None,
-                    align,
-                });
-                self.globals.insert(name, idx);
-                return Ok(());
+                return self.push_image_global(name, bytes, mutable, linkage, align);
             }
             if !layout.supported_zero_global() {
                 if let Some((_, elem_ty)) = layout.top_array_scalar_elem()
@@ -1606,18 +3690,13 @@ impl Parser {
                 )));
             }
             let byte_len = self.checked_global_initializer_len(&name, layout.size())?;
-            let idx = self.module.globals.len();
-            self.module.globals.push(Global {
-                name: name.clone(),
-                ty: Ty::Ptr,
+            return self.push_image_global(
+                name,
+                vec![Constant::Int(0); byte_len],
                 mutable,
-                initializer: Some(Constant::Aggregate(vec![Constant::Int(0); byte_len])),
                 linkage,
-                tls: None,
                 align,
-            });
-            self.globals.insert(name, idx);
-            return Ok(());
+            );
         }
         // Named aggregate (struct / union) global: `@g = global %struct.foo
         // <init>`. LLVM lowers a union to a struct sized to its widest member.
@@ -1633,34 +3712,18 @@ impl Parser {
                 if init_val == "zeroinitializer" {
                     // A zero image is exactly `size()` zero bytes, layout-independent.
                     let byte_len = self.checked_global_initializer_len(&name, layout.size())?;
-                    let idx = self.module.globals.len();
-                    self.module.globals.push(Global {
-                        name: name.clone(),
-                        ty: Ty::Ptr,
+                    return self.push_image_global(
+                        name,
+                        vec![Constant::Int(0); byte_len],
                         mutable,
-                        initializer: Some(Constant::Aggregate(vec![Constant::Int(0); byte_len])),
                         linkage,
-                        tls: None,
                         align,
-                    });
-                    self.globals.insert(name, idx);
-                    return Ok(());
+                    );
                 }
                 // Explicit `{ ... }` initializer: serialize the field values into
                 // the struct's exact byte image.
                 let bytes = self.serialize_named_aggregate_global(&name, init_part)?;
-                let idx = self.module.globals.len();
-                self.module.globals.push(Global {
-                    name: name.clone(),
-                    ty: Ty::Ptr,
-                    mutable,
-                    initializer: Some(Constant::Aggregate(bytes)),
-                    linkage,
-                    tls: None,
-                    align,
-                });
-                self.globals.insert(name, idx);
-                return Ok(());
+                return self.push_image_global(name, bytes, mutable, linkage, align);
             }
         }
         if let Ok(ty) = parse_ty(init_part) {
@@ -1679,6 +3742,9 @@ impl Parser {
                 linkage,
                 tls: None,
                 align,
+                section: self.pending_section.clone(),
+                visibility: self.pending_visibility,
+                retained: false,
             });
             self.globals.insert(name, idx);
             return Ok(());
@@ -1691,7 +3757,7 @@ impl Parser {
         }
 
         if after_storage.trim_start().starts_with('[') {
-            return self.parse_string_global(name, rest, lineno, mutable, linkage, align);
+            return self.parse_string_global(name, init_part, lineno, mutable, linkage, align);
         }
 
         let (ty_str, value_str) = split_ty_operand(init_part)?;
@@ -1703,38 +3769,17 @@ impl Parser {
         }
         let initializer = self.parse_scalar_global_initializer(&ty, &value_str)?;
         // A pointer global (only `null`/`zeroinitializer` reach here) is a
-        // pointer-sized zero image. Emit it as 8 zero bytes — the codegen
-        // global tree rejects an integer initializer on a `Ptr`-typed global,
-        // but accepts the byte-aggregate form used for every other zero global.
+        // pointer-sized zero image: the object writer has no integer or null
+        // initializer for a `Ptr`-typed global, so it is the 8-byte zero image
+        // every other zero global is.
         if matches!(ty, Ty::Ptr) {
-            let idx = self.module.globals.len();
-            self.module.globals.push(Global {
-                name: name.clone(),
-                ty: Ty::Ptr,
+            return self.push_image_global(
+                name,
+                vec![Constant::Int(0); 8],
                 mutable,
-                initializer: Some(Constant::Aggregate(vec![Constant::Int(0); 8])),
                 linkage,
-                tls: None,
                 align,
-            });
-            self.globals.insert(name, idx);
-            return Ok(());
-        }
-        if lower.contains("common")
-            && let Some(elems) = scalar_integer_global_to_le_byte_constants(&ty, &initializer)
-        {
-            let idx = self.module.globals.len();
-            self.module.globals.push(Global {
-                name: name.clone(),
-                ty: Ty::Ptr,
-                mutable,
-                initializer: Some(Constant::Aggregate(elems)),
-                linkage,
-                tls: None,
-                align,
-            });
-            self.globals.insert(name, idx);
-            return Ok(());
+            );
         }
         let idx = self.module.globals.len();
         self.module.globals.push(Global {
@@ -1745,52 +3790,264 @@ impl Parser {
             linkage,
             tls: None,
             align,
+            section: self.pending_section.clone(),
+            visibility: self.pending_visibility,
+            retained: false,
         });
         self.globals.insert(name, idx);
         Ok(())
     }
 
-    fn parse_global_alignment(&self, after_storage: &str) -> Result<Option<u32>> {
-        let mut align = None;
-        for attribute in split_aggregate_elems(after_storage).into_iter().skip(1) {
-            let Some(raw) = attribute.trim().strip_prefix("align ") else {
-                continue;
-            };
-            let mut tokens = raw.split_whitespace();
-            let value = tokens
-                .next()
-                .and_then(|token| token.parse::<u32>().ok())
-                .filter(|value| *value != 0 && value.is_power_of_two())
-                .ok_or_else(|| {
-                    self.err_unsupported(&format!(
-                        "global alignment `{}` (expected a nonzero power-of-two u32)",
-                        raw
-                    ))
-                })?;
-            if tokens.next().is_some() {
-                return Err(self.err_unsupported(&format!(
-                    "global alignment `{}` (unexpected trailing tokens)",
-                    raw
-                )));
+    // --- Symbol facts -------------------------------------------------------
+
+    /// Record `$name = comdat <kind>`.
+    fn parse_comdat_declaration(&mut self, line: &str, lineno: usize) -> Result<()> {
+        let (name, rest) = split_eq(line)
+            .ok_or_else(|| self.err_parse(lineno, &format!("unexpected top-level line: {line}")))?;
+        let raw_name = name.trim().trim_start_matches('$');
+        let kind = rest
+            .trim()
+            .strip_prefix("comdat")
+            .map(str::trim)
+            .filter(|kind| COMDAT_SELECTION_KINDS.contains(kind))
+            .ok_or_else(|| {
+                self.err_parse(
+                    lineno,
+                    &format!("expected `$name = comdat <selection kind>`, got `{line}`"),
+                )
+            })?;
+        let canonical = self.canon_symbol_name(raw_name)?;
+        if self
+            .comdats
+            .insert(canonical.clone(), kind.to_string())
+            .is_some()
+        {
+            return Err(self.err_parse(lineno, &format!("COMDAT `${canonical}` is declared twice")));
+        }
+        Ok(())
+    }
+
+    /// Admit the COMDAT membership `comdat` of symbol `name` (canonical) only
+    /// where this backend's own placement of the symbol is the group LLVM
+    /// describes.
+    ///
+    /// The AArch64 ELF emitters put every `grouped` definition alone in its
+    /// own section inside a `GRP_COMDAT` group whose signature is the symbol
+    /// itself (functions: `LinkOnceOdr`/`WeakOdr`; globals: `LinkOnce`,
+    /// `LinkOnceOdr`/`WeakOdr`), and never group anything else. So the one
+    /// membership admitted is: a `grouped` definition in the COMDAT named
+    /// like itself (`comdat` or `comdat($self)`) with selection kind `any`.
+    /// Mach-O has no groups; there those definitions are `N_WEAK_DEF`, which
+    /// dyld and ld64 coalesce by name, the Mach-O meaning of that group.
+    ///
+    /// Refused by name: a member of a COMDAT keyed on another symbol (a
+    /// multi-member group, such as a guard variable in its variable's group,
+    /// which one-definition-per-group placement would split), a selection
+    /// kind other than `any`, a COMDAT on a linkage the backend does not
+    /// group, an undeclared COMDAT, and a COMDAT on a declaration.
+    fn check_comdat_membership(
+        &self,
+        subject: &str,
+        name: &str,
+        comdat: &ComdatClause,
+        grouped: bool,
+        is_definition: bool,
+    ) -> Result<()> {
+        let Some(group) = comdat else {
+            return Ok(());
+        };
+        let key = match group {
+            Some(raw) => self.canon_symbol_name(raw)?,
+            None => name.to_string(),
+        };
+        let refuse = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+        let Some(kind) = self.comdats.get(&key) else {
+            return refuse(format!("COMDAT `${key}` is not declared"));
+        };
+        if !is_definition {
+            return refuse(format!(
+                "COMDAT `${key}` on a declaration (LLVM allows COMDATs only on definitions)"
+            ));
+        }
+        if key != name {
+            return refuse(format!(
+                "member of COMDAT `${key}`, which is keyed on another symbol (the backend \
+                 places each definition in a group of its own, which would split this group)"
+            ));
+        }
+        if kind != "any" {
+            return refuse(format!(
+                "COMDAT `${key}` with selection kind `{kind}` (the backend's groups select \
+                 `any`)"
+            ));
+        }
+        if !grouped {
+            return refuse(format!(
+                "COMDAT `${key}` on a linkage the backend does not emit in a COMDAT group"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The symbol facts a `define` (`is_define`) or `declare` header states
+    /// for canonical function `name`; `riscv_definition` is a definition's
+    /// compiled for a RISC-V target or for none known. A declaration for the
+    /// linker (a `declare`, or an `available_externally` definition, which
+    /// the backend compiles as a declaration) whose `dso_local` changes
+    /// llc's addressing is noted in [`Parser::dso_local_imports`].
+    fn function_symbol_facts(
+        &mut self,
+        header: &FunctionHeader<'_>,
+        name: &str,
+        is_define: bool,
+        riscv_definition: Option<RiscvDefinition>,
+    ) -> Result<FunctionSymbolFacts> {
+        let subject = format!(
+            "function {} `@{name}`",
+            if is_define {
+                "definition"
+            } else {
+                "declaration"
             }
-            if align.replace(value).is_some() {
-                return Err(self.err_unsupported("global with duplicate alignment attributes"));
+        );
+        let pre_at = split_top_level_ws(header.pre_at);
+        let prefix = parse_symbol_prefix(&pre_at, PrefixKind::Function, &subject)?;
+        // This importer reads `fastcc` as the C convention, which erases the
+        // one fact that makes a `fastcc` `memcpy`, `memmove` or `memset` an
+        // ordinary function: LLVM reads a call as the C library's only under
+        // a C-compatible convention, and llc 22.1.2 called a `fastcc`
+        // `memcpy` with C's types, where the backend reads a call of a
+        // C-convention declaration with C's prototype as the routine
+        // (`trust_cg_lower::adapter::classify_adapter_direct_call`). A
+        // definition under these names is refused already (LD-16).
+        if !is_define && is_c_library_routine_read_by_prototype(name) && pre_at.contains(&"fastcc")
+        {
+            return Err(Error::Unsupported(format!(
+                "{subject}: calling convention `fastcc` on a C library memory routine (LLVM \
+                 reads it as an ordinary function and llc calls it; this importer reads \
+                 `fastcc` as C, under which its backend reads a call of `@{name}` with C's \
+                 prototype as the library routine)"
+            )));
+        }
+        let (linkage, visibility) = function_linkage_and_visibility(prefix, is_define, &subject)?;
+        if prefix.dso_local_changes_addressing() {
+            if !is_define || linkage == Linkage::AvailableExternally {
+                self.dso_local_imports.insert(
+                    name.to_string(),
+                    if is_define {
+                        "`available_externally` function"
+                    } else {
+                        "function declaration"
+                    },
+                );
+            } else if !linkage.is_module_local() {
+                self.dso_local_definitions
+                    .insert(name.to_string(), "function definition");
             }
         }
-        Ok(align)
+        let clauses = parse_function_clauses(
+            header.attrs_after,
+            &subject,
+            &self.attribute_groups,
+            !is_define && is_intrinsic_ir_name(&header.name),
+            riscv_definition,
+            ProcessorTable::of(self.target),
+        )?;
+        // The functions the backend groups: `trust-cg-codegen`'s
+        // `FunctionSymbolBinding::trust_ir_definition_is_comdat`.
+        let grouped = matches!(linkage, Linkage::LinkOnceOdr | Linkage::WeakOdr);
+        self.check_comdat_membership(&subject, name, &clauses.comdat, grouped, is_define)?;
+        // Written without a `comdat` clause, LLVM places an ODR definition in
+        // no group: llc emits a plain weak symbol, which is the backend's
+        // `LinkOnce`/`Weak` definition. The two differ from the ODR forms only
+        // in what the optimizer may assume (that every copy is equivalent, so
+        // a call may be inlined): carrying the non-ODR twin gives that up,
+        // never a behavior.
+        let linkage = match linkage {
+            Linkage::LinkOnceOdr if clauses.comdat.is_none() => Linkage::LinkOnce,
+            Linkage::WeakOdr if clauses.comdat.is_none() => Linkage::Weak,
+            linkage => linkage,
+        };
+        Ok(FunctionSymbolFacts {
+            linkage,
+            visibility,
+            section: clauses.section,
+        })
+    }
+
+    /// Record the facts a header stated for function `name`, refusing a
+    /// second header that states different ones.
+    fn note_function_facts(&mut self, name: &str, facts: &FunctionSymbolFacts) -> Result<()> {
+        match self.stated_function_facts.get(name) {
+            Some(previous) if previous != facts => Err(Error::Unsupported(format!(
+                "function `@{name}` is declared or defined twice with different symbol facts \
+                 (first {}, then {})",
+                previous.describe(),
+                facts.describe()
+            ))),
+            Some(_) => Ok(()),
+            None => {
+                self.stated_function_facts
+                    .insert(name.to_string(), facts.clone());
+                Ok(())
+            }
+        }
     }
 
     // --- Declare / define --------------------------------------------------
 
     fn parse_declare(&mut self, line: &str, lineno: usize) -> Result<()> {
-        let sig = parse_function_signature(
-            line,
-            lineno,
-            /*is_define=*/ false,
-            &self.attribute_groups,
-        );
+        let header = split_function_header(line, lineno, /*is_define=*/ false)?;
+        let canonical = self.canon_symbol_name(&header.name)?;
+        // The symbol facts come first and are never skipped: a declaration
+        // skipped below leaves any call to its function to the declare-by-use
+        // path, which would state `external` + `default` in their place.
+        let facts =
+            self.function_symbol_facts(&header, &canonical, /*is_define=*/ false, None)?;
+        // The call-ABI parameter attributes come before the signature, whose
+        // unsupported shapes skip the declaration: LLVM applies a callee's
+        // `sret`/`byval`/... to calls that do not repeat them, so a skipped
+        // declaration would silently drop them.
+        let abi = function_param_abi(&header, &format!("function declaration `@{canonical}`"))?;
+        self.note_header_abi(&canonical, &abi, "declaration")?;
+        // A vector-typed declaration of an intrinsic read by its name is
+        // admitted only under the name LLVM gives its declared types; the
+        // signature reader below passes over a vector type.
+        check_vector_typed_intrinsic_declaration(&canonical, &header)?;
+        let sret = abi.sret;
+        let sig = parse_function_signature(&header, &self.attribute_groups);
         let mut sig = match sig {
-            Ok(sig) => sig,
+            Ok(mut sig) => {
+                sig.param_ext = abi.params;
+                sig.ret_ext = abi.ret;
+                sig
+            }
+            Err(Error::Unsupported(reason)) if facts != FunctionSymbolFacts::EXTERNAL => {
+                return Err(Error::Unsupported(format!(
+                    "function declaration `@{canonical}` states {} but its signature is not \
+                     modeled ({reason}); skipping it would let a call default them",
+                    facts.describe()
+                )));
+            }
+            // Nor is a C library routine the backend reads by its declared
+            // prototype skipped: a call of it would then sign it
+            // (declare-by-use) with the function type the call states. A
+            // header this reader does not model is not C's prototype, so LLVM
+            // reads an ordinary function and llc calls it (`declare fp128
+            // @memcpy(ptr, ptr, i64)` called as `ptr (ptr, ptr, i64)`), where
+            // the backend would read the call's C prototype as the routine
+            // and expand it (LD-100 rule 8).
+            Err(Error::Unsupported(reason))
+                if is_c_library_routine_read_by_prototype(&canonical) =>
+            {
+                return Err(Error::Unsupported(format!(
+                    "function declaration `@{canonical}`: its signature is not modeled \
+                     ({reason}); a C library memory routine's declaration is not skipped, since \
+                     a call would then state its prototype, and this importer's backend reads a \
+                     call of `@{canonical}` with C's prototype as the library routine where \
+                     LLVM reads the declaration's own type and llc calls it"
+                )));
+            }
             // A `declare` is a SIGNATURE ANNOUNCEMENT with no semantics of its
             // own, so a declaration whose types the importer does not model is
             // simply not registered instead of killing the module. This is
@@ -1811,17 +4068,48 @@ impl Parser {
         // De-mangle a `\01` asm-label callee name (e.g. `declare @"\01_fopen"`)
         // and record its origin so a later plain-`@fopen` collision fails closed.
         sig.name = self.canon_and_note_symbol(&sig.name)?;
+        // An unprototyped header `declare R @f(...)` (no fixed parameter; see
+        // `unprototyped_declarations`) on a name the backend lowers by name
+        // is refused: signed from its calls (`sign_unprototyped_declaration`),
+        // `declare ptr @memcpy(...)` called as `ptr (ptr, ptr, i64)` would
+        // carry C's prototype, which the backend reads as the routine and
+        // expands, where LLVM reads a variadic function with no fixed
+        // parameter (not the library's, nor an intrinsic's type) and llc
+        // calls it (LD-100 rule 8).
+        if sig.is_vararg && sig.params.is_empty() && backend_reads_call_by_name(&sig.name) {
+            return Err(Error::Unsupported(format!(
+                "function declaration `@{}`: an unprototyped header `(...)` (no fixed \
+                 parameter) on a name this importer's backend lowers by name; this importer \
+                 would sign it from its calls' function type, under which the backend reads a \
+                 call with the routine's or intrinsic's prototype as that operation, where LLVM \
+                 reads a variadic function and llc calls it",
+                sig.name
+            )));
+        }
+        // A declared intrinsic read by its name is admitted only under the
+        // name LLVM gives its declared type (LLVM renames it to match).
+        let declared_params: Vec<Ty> = sig.params.iter().map(|(_, ty)| ty.clone()).collect();
+        check_intrinsic_name_mangles_its_type(
+            &sig.name,
+            sig.ret.as_ref(),
+            &declared_params,
+            "declaration of",
+        )?;
         // `llvm.mem{cpy,move,set}.*` declares carry the trailing
         // `i1 <volatile>` parameter. Call sites DROP the literal-false flag
         // (see the call-argument normalization) so the registered signature
         // must match the 3-parameter `(dest, src|val, len)` form the
         // adapter/ISel contract expects — strip the trailing Bool here.
         // Volatile-true call sites fail closed at the call, so the dropped
-        // parameter can never carry information.
+        // parameter can never carry information. Only an `i1` is stripped,
+        // as only a call's `i1 false` is: a fourth parameter of another
+        // type stays, and every call, whose stated type then differs, is
+        // refused (`check_call_site_function_types`).
         if ["llvm.memcpy.", "llvm.memmove.", "llvm.memset."]
             .iter()
             .any(|p| sig.name.starts_with(p))
             && sig.params.len() == 4
+            && sig.params.last().is_some_and(|(_, ty)| *ty == Ty::Bool)
         {
             sig.params.pop();
         }
@@ -1835,18 +4123,48 @@ impl Parser {
                 .and_modify(|prior| *prior = *prior && licensed)
                 .or_insert(licensed);
         }
-        let fid = self.register_function(sig.clone())?;
-        if !self.module.functions.iter().any(|func| func.id == fid) {
-            let mut func = Function::new(
-                fid,
-                sig.name.clone(),
-                self.func_tys[&sig.name],
-                BlockId::new(0),
-            );
-            func.calling_conv = CallingConv::C;
-            func.linkage = Linkage::External;
-            apply_function_attributes(&mut func, &sig);
-            self.module.add_function(func);
+        self.note_function_facts(&sig.name, &facts)?;
+        // `declare R @f(...)` states no fixed prefix (see
+        // `unprototyped_declarations`). When a call before it already
+        // registered the function type it states, that type stands: the
+        // header adds nothing to compare it with but the return type.
+        let unprototyped = sig.is_vararg && sig.params.is_empty();
+        if unprototyped {
+            self.unprototyped_declarations.insert(sig.name.clone());
+        }
+        let header_ret: Vec<Ty> = sig.edge_ret_ty().into_iter().collect();
+        let keeps_call_signature = unprototyped
+            && self.call_derived_signatures.contains(&sig.name)
+            && self
+                .registered_func_ty(&sig.name)
+                .is_some_and(|stated| stated.returns == header_ret);
+        let fid = match self.func_ids.get(&sig.name) {
+            Some(fid) if keeps_call_signature => *fid,
+            _ => self.register_function(sig.clone())?,
+        };
+        match self.module.functions.iter_mut().find(|func| func.id == fid) {
+            // A call before this declaration installed a body-less
+            // `external` + `default` placeholder (declare-by-use); the
+            // declaration states the real facts. A definition already carries
+            // its own, which `note_function_facts` has checked agree.
+            Some(func) if func.blocks.is_empty() => {
+                facts.apply(func);
+                apply_sret(func, sret);
+            }
+            Some(_) => {}
+            None => {
+                let mut func = Function::new(
+                    fid,
+                    sig.name.clone(),
+                    self.func_tys[&sig.name],
+                    BlockId::new(0),
+                );
+                func.calling_conv = CallingConv::C;
+                facts.apply(&mut func);
+                apply_function_attributes(&mut func, &sig);
+                apply_sret(&mut func, sret);
+                self.module.try_add_function(func)?;
+            }
         }
         Ok(())
     }
@@ -1857,16 +4175,32 @@ impl Parser {
         body: &[(usize, String)],
         lineno: usize,
     ) -> Result<()> {
+        // On a RISC-V compile target, or with none known, llc's calling
+        // convention for the definition decides how it places its values
+        // (`attributes::SubtargetSelection::riscv_refusal`).
+        let riscv_definition = self.riscv_target().map(|target| RiscvDefinition {
+            target,
+            floating: self.riscv_named_types_floating
+                || mentions_floating_point_or_vector(header, body),
+        });
         // Strip trailing "{" from header.
         let header = header.trim_end_matches('{').trim();
-        let mut sig = parse_function_signature(
-            header,
-            lineno,
-            /*is_define=*/ true,
-            &self.attribute_groups,
-        )?;
+        let header = split_function_header(header, lineno, /*is_define=*/ true)?;
+        let mut sig = parse_function_signature(&header, &self.attribute_groups)?;
         // De-mangle a `\01` asm-label on the defined function's own name.
         sig.name = self.canon_and_note_symbol(&sig.name)?;
+        let abi = function_param_abi(&header, &format!("function `@{}`", sig.name))?;
+        self.note_header_abi(&sig.name, &abi, "definition")?;
+        let sret = abi.sret;
+        sig.param_ext = abi.params;
+        sig.ret_ext = abi.ret;
+        let facts = self.function_symbol_facts(
+            &header,
+            &sig.name,
+            /*is_define=*/ true,
+            riscv_definition,
+        )?;
+        self.note_function_facts(&sig.name, &facts)?;
         let fid = self.register_function(sig.clone())?;
         let existing_placeholder = self
             .module
@@ -1892,23 +4226,51 @@ impl Parser {
         // line-at-a-time walk below has not seen yet.
         scratch.native_plan = crate::native_vector::plan_function(
             &native_vector_plan_input(body),
-            !vector_import_disabled() && !crate::native_vector::native_lower_disabled(),
+            !crate::native_vector::native_lower_disabled(),
         );
 
-        // Entry block and its parameters.
-        let entry_id = scratch.intern_block("entry");
-        // Seed %0, %1, ... for parameters in order.
+        // Entry is the first block, under its actual explicit or implicit
+        // label. Reserving "entry" would alias a later ordinary block of that
+        // name to the first block and collapse their distinct CFG identities.
+        let entry_label =
+            first_block_label(body).unwrap_or_else(|| implicit_entry_block_label(&sig));
+        let entry_id = scratch.intern_block(&entry_label);
+        // Seed %0, %1, ... for parameters in order. A parameter whose call
+        // edge is typed differently (a `zeroext` `i8`/`i16`, see
+        // `call_edge_ty`) arrives at the edge type and is reinterpreted to the
+        // body's signless type before the first instruction.
+        let mut edge_params = Vec::new();
         for (i, (arg_name, ty)) in sig.params.iter().enumerate() {
             let aname = arg_name.clone().unwrap_or_else(|| format!("__param_{}", i));
-            let v = scratch.intern_value(&aname);
+            let edge_ty = sig.edge_param_ty(i).unwrap_or_else(|| ty.clone());
+            let v = if edge_ty == *ty {
+                scratch.intern_value(&aname)
+            } else {
+                let incoming = scratch.fresh_value();
+                edge_params.push((aname, incoming, edge_ty.clone(), ty.clone()));
+                incoming
+            };
             scratch.blocks[entry_id.as_usize()]
                 .params
-                .push((v, ty.clone()));
+                .push((v, edge_ty));
         }
-        if body_starts_with_implicit_entry(body) {
-            scratch.alias_block(&implicit_entry_block_label(&sig), entry_id);
-        }
+        scratch.ret_edge = match (&sig.ret, sig.edge_ret_ty()) {
+            (Some(ty), Some(edge)) if *ty != edge => Some((ty.clone(), edge)),
+            _ => None,
+        };
         scratch.set_current(entry_id);
+        for (aname, incoming, edge_ty, ty) in edge_params {
+            let v = scratch.intern_value(&aname);
+            scratch.push_inst(
+                InstrNode::new(Inst::Cast {
+                    op: CastOp::Bitcast,
+                    src_ty: edge_ty,
+                    dst_ty: ty,
+                    operand: incoming,
+                })
+                .with_result(v),
+            );
+        }
 
         let mut bi = 0usize;
         while bi < body.len() {
@@ -1931,6 +4293,24 @@ impl Parser {
                 scratch.set_current(id);
                 bi += 1;
                 continue;
+            }
+            // LLVM starts a new block at an instruction that follows a
+            // terminator, numbered like an unnamed value when it has no
+            // label (`LLParser::parseBasicBlock`). This importer reads a
+            // block only from its label, and used to append such an
+            // instruction to the terminated block (the IR validator then
+            // refused the module). A `uselistorder` line, which LLVM reads
+            // after the last block, is no instruction and is left to its
+            // reader.
+            if scratch.current_block_terminated()
+                && line.split_whitespace().next() != Some("uselistorder")
+            {
+                return Err(Error::Unsupported(format!(
+                    "`@{}`: the instruction `{line}` (line {ln}) follows its block's terminator \
+                     without a label (LLVM starts a new block there, numbered like an unnamed \
+                     value; this importer reads a block only from its label)",
+                    sig.name
+                )));
             }
             // A `switch` instruction's case-list spans multiple physical
             // lines: header `switch i32 %x, label %d [` followed by one
@@ -1998,12 +4378,9 @@ impl Parser {
         let mut func = Function::new(fid, sig.name.clone(), self.func_tys[&sig.name], entry_id);
         func.blocks = scratch.blocks;
         func.calling_conv = CallingConv::C;
-        func.linkage = if sig.internal {
-            Linkage::Internal
-        } else {
-            Linkage::External
-        };
+        facts.apply(&mut func);
         apply_function_attributes(&mut func, &sig);
+        apply_sret(&mut func, sret);
         if let Some(index) = existing_placeholder {
             // A call can precede the callee's definition. `parse_call` installs
             // a body-less external placeholder so the call always references a
@@ -2011,19 +4388,20 @@ impl Parser {
             // placeholder instead of leaving two Functions with the same id.
             self.module.functions[index] = func;
         } else {
-            self.module.add_function(func);
+            self.module.try_add_function(func)?;
         }
         Ok(())
     }
 
     fn register_function(&mut self, sig: FuncSignature) -> Result<FuncId> {
+        // The call edge's types: a `zeroext` `i8`/`i16` is its unsigned twin
+        // (see `call_edge_ty`).
         let ft = FuncTy {
-            params: sig.params.iter().map(|(_, t)| t.clone()).collect(),
-            returns: sig
-                .ret
-                .as_ref()
-                .map(|t| vec![t.clone()])
-                .unwrap_or_default(),
+            params: (0..sig.params.len())
+                .filter_map(|index| sig.edge_param_ty(index))
+                .collect(),
+            returns: sig.edge_ret_ty().into_iter().collect(),
+            abi: None,
             is_vararg: sig.is_vararg,
         };
         if let Some(existing) = self.func_ids.get(&sig.name) {
@@ -2044,6 +4422,14 @@ impl Parser {
                     ))
                 })?;
             if existing_ty != &ft {
+                if signatures_differ_only_in_extension(existing_ty, &ft) {
+                    return Err(self.err_unsupported(&format!(
+                        "function `@{}`: its headers and calls state different `zeroext` / \
+                         `signext` on one parameter or return value (first {:?}, later {:?}); \
+                         trust-ir states one extension per call edge",
+                        sig.name, existing_ty, ft
+                    )));
+                }
                 return Err(self.err_unsupported(&format!(
                     "conflicting signatures for function `@{}`: first {:?}, later {:?}",
                     sig.name, existing_ty, ft
@@ -2051,14 +4437,28 @@ impl Parser {
             }
             return Ok(*existing);
         }
-        let ftid = self.module.add_func_type(ft);
+        let ftid = self.module.add_func_type(ft)?;
         let fid = FuncId::new(self.func_ids.len() as u32);
         self.func_ids.insert(sig.name.clone(), fid);
         self.func_tys.insert(sig.name, ftid);
         Ok(fid)
     }
 
+    /// An `i64` constant of the computed `value` (a byte offset, a size, a
+    /// lane index), spelled in `i64`'s signed range when `value` is in
+    /// `[2^63, 2^64)`: the same 64 bits, and never a positive value in the
+    /// global-address stub interval the lowering adapter decodes
+    /// (`int_literal_value`). Every caller passes a value in `[-2^63,
+    /// 2^64)`: a folded GEP offset is reduced modulo `2^64`
+    /// ([`gep_offset_add`]) and an `alloca` byte size of `2^64` or more is
+    /// refused; another value would be kept, and the adapter refuses it.
     fn emit_i64_const(&self, value: i128, f: &mut FuncScratch) -> ValueId {
+        debug_assert!((-(1i128 << 63)..(1i128 << 64)).contains(&value));
+        let value = if ((1i128 << 63)..(1i128 << 64)).contains(&value) {
+            value - (1i128 << 64)
+        } else {
+            value
+        };
         let v = f.fresh_value();
         f.push_inst(
             InstrNode::new(Inst::Const {
@@ -2090,27 +4490,41 @@ impl Parser {
         dest
     }
 
-    fn coerce_int_to_i64(&self, value: ValueId, ty: &Ty, f: &mut FuncScratch) -> Result<ValueId> {
+    /// A dynamic GEP index of integer type `ty` widened to the offset's 64
+    /// bits as LLVM widens every GEP index: sign-extended, `i1` included
+    /// (an `i1` index that is true is one element back; llc 22.1.2 writes
+    /// `sbfx x8, x1, #0, #1`).
+    fn sext_gep_index_to_i64(
+        &self,
+        value: ValueId,
+        ty: &Ty,
+        f: &mut FuncScratch,
+    ) -> Result<ValueId> {
+        self.widen_int_to_i64(value, ty, CastOp::SExt, "GEP index", f)
+    }
+
+    /// A dynamic `alloca` or `memset.pattern` count of integer type `ty`
+    /// widened to 64 bits as LLVM widens it: zero-extended (llc 22.1.2's
+    /// `alloca i8, i8 %n` masks the count with `and w8, w0, #0xff`).
+    fn zext_count_to_i64(&self, value: ValueId, ty: &Ty, f: &mut FuncScratch) -> Result<ValueId> {
+        self.widen_int_to_i64(value, ty, CastOp::ZExt, "count", f)
+    }
+
+    fn widen_int_to_i64(
+        &self,
+        value: ValueId,
+        ty: &Ty,
+        op: CastOp,
+        what: &str,
+        f: &mut FuncScratch,
+    ) -> Result<ValueId> {
         match ty {
             Ty::I64 => Ok(value),
-            Ty::Bool => {
+            Ty::Bool | Ty::I8 | Ty::I16 | Ty::I32 => {
                 let widened = f.fresh_value();
                 f.push_inst(
                     InstrNode::new(Inst::Cast {
-                        op: CastOp::ZExt,
-                        src_ty: Ty::Bool,
-                        dst_ty: Ty::I64,
-                        operand: value,
-                    })
-                    .with_result(widened),
-                );
-                Ok(widened)
-            }
-            Ty::I8 | Ty::I16 | Ty::I32 => {
-                let widened = f.fresh_value();
-                f.push_inst(
-                    InstrNode::new(Inst::Cast {
-                        op: CastOp::SExt,
+                        op,
                         src_ty: ty.clone(),
                         dst_ty: Ty::I64,
                         operand: value,
@@ -2119,11 +4533,10 @@ impl Parser {
                 );
                 Ok(widened)
             }
-            Ty::I128 => Err(self.err_unsupported("dynamic struct alloca count with i128 type")),
-            other => Err(self.err_unsupported(&format!(
-                "non-integer struct alloca count type `{:?}`",
-                other
-            ))),
+            Ty::I128 => Err(self.err_unsupported(&format!("dynamic {what} with i128 type"))),
+            other => {
+                Err(self.err_unsupported(&format!("non-integer dynamic {what} type `{:?}`", other)))
+            }
         }
     }
 
@@ -2131,6 +4544,12 @@ impl Parser {
     /// return its `FuncId`, mirroring `parse_call`'s declare-by-use path so no
     /// undefined symbol escapes the module. Reused for the libSystem
     /// `memset_patternN` runtime calls the `memset.pattern` intrinsic lowers to.
+    ///
+    /// A function the module already names keeps its own signature, which
+    /// need not be `void (param_tys)`: the caller records its call as one
+    /// stating that type (`CallSiteAbi::introduced_for`), refused by name
+    /// once the module is read when the function's final signature or
+    /// hidden return buffer is another (LD-100 rule 10).
     fn register_external_void_fn(&mut self, name: &str, param_tys: &[Ty]) -> Result<FuncId> {
         if let Some(id) = self.func_ids.get(name) {
             return Ok(*id);
@@ -2140,9 +4559,10 @@ impl Parser {
             ret: None,
             params: param_tys.iter().map(|t| (None, t.clone())).collect(),
             is_vararg: false,
-            internal: false,
             stack_protector: ImportedStackProtectorAttr::None,
             libm_pure_math: false,
+            param_ext: Vec::new(),
+            ret_ext: IntExt::Unstated,
         };
         let fid = self.register_function(sig.clone())?;
         if !self.module.functions.iter().any(|func| func.id == fid) {
@@ -2155,13 +4575,22 @@ impl Parser {
             func.calling_conv = CallingConv::C;
             func.linkage = Linkage::External;
             apply_function_attributes(&mut func, &sig);
-            self.module.add_function(func);
+            self.module.try_add_function(func)?;
         }
         Ok(fid)
     }
 
-    /// Lower `@llvm.experimental.memset.pattern.p0.<ELEM>.<COUNT>` the way LLVM's
-    /// own Darwin backend does: a call to libSystem's `memset_patternN`.
+    /// Lower `@llvm.experimental.memset.pattern.p0.<ELEM>.<COUNT>` to a call of
+    /// libSystem's `memset_patternN`, which fills as llc 22.1.2's lowering does
+    /// (`PreISelIntrinsicLowering`: a call of `memset_pattern16` with the
+    /// pattern repeated to 16 bytes for a constant pattern whose size is a
+    /// power of two, otherwise a loop of stores). llc calls it only where
+    /// LLVM's `TargetLibraryInfo` has it (macOS, iOS, tvOS and watchOS:
+    /// `TargetTriple::memset_pattern_os`); elsewhere it always expands the
+    /// loop, and the call this lowering writes would name a function the
+    /// target's C library does not define, so the intrinsic is refused
+    /// there and when no target is known. A module definition named
+    /// `memset_patternN` is refused apart (`refuse_definitions_under_library_names`).
     ///
     /// Intrinsic signature (LangRef):
     ///   `void @llvm.experimental.memset.pattern(ptr <dest>, <ELEM> <value>,
@@ -2179,12 +4608,21 @@ impl Parser {
     /// element size fails closed rather than risk a wrong byte count.
     fn emit_memset_pattern(
         &mut self,
+        intrinsic: &str,
         args: &[ValueId],
         arg_tys: &[Ty],
         result: Option<String>,
         lineno: usize,
         f: &mut FuncScratch,
     ) -> Result<()> {
+        if !self.target.is_some_and(|target| target.memset_pattern_os) {
+            return Err(self.err_unsupported(&format!(
+                "call to `@{intrinsic}` for a target whose OS is not macOS, iOS, tvOS or \
+                 watchOS, or with no target known: llc 22.1.2 expands the fill as a loop there \
+                 (LLVM's `TargetLibraryInfo` has no `memset_pattern16` for it), and this \
+                 importer lowers it to a call of libSystem's `memset_patternN`"
+            )));
+        }
         if result.is_some() {
             return Err(self.err_unsupported("memset.pattern intrinsic with a result value"));
         }
@@ -2243,11 +4681,34 @@ impl Parser {
             align: None,
         }));
         // 3. len_bytes = count * sizeof(pattern).
-        let count_i64 = self.coerce_int_to_i64(count, &count_ty, f)?;
+        let count_i64 = self.zext_count_to_i64(count, &count_ty, f)?;
         let elem_const = self.emit_i64_const(elem_bytes as i128, f);
         let byte_len = self.emit_i64_binop(BinOp::Mul, count_i64, elem_const, f);
-        // 4. memset_patternN(dest, &slot, len_bytes).
-        let fid = self.register_external_void_fn(symbol, &[Ty::Ptr, Ty::Ptr, Ty::I64])?;
+        // 4. memset_patternN(dest, &slot, len_bytes), at libSystem's
+        // `void (ptr, ptr, i64)`: recorded as a call stating that type, so a
+        // module function of that name declared otherwise (another type, a
+        // hidden return buffer) is refused by name rather than called by its
+        // own header (LD-100 rule 10; beside `declare i32
+        // @memset_pattern16(ptr, ptr, i64)` llc 22.1.2's Darwin object calls
+        // no `memset_pattern16`).
+        self.introduced_callees
+            .insert(symbol.to_string(), intrinsic.to_string());
+        let lowering_params = [Ty::Ptr, Ty::Ptr, Ty::I64];
+        let fid = self.register_external_void_fn(symbol, &lowering_params)?;
+        self.call_site_abi.push(CallSiteAbi {
+            callee: symbol.to_string(),
+            sret: None,
+            args: vec![IntExt::Unstated; lowering_params.len()],
+            arg_tys: lowering_params.to_vec(),
+            ret: IntExt::Unstated,
+            stated: Some(CallTypeStatement::Stated(StatedCallType {
+                ret: None,
+                params: lowering_params.to_vec(),
+                is_vararg: false,
+            })),
+            introduced_for: Some(intrinsic.to_string()),
+            line: lineno,
+        });
         f.push_inst(InstrNode::new(Inst::Call {
             callee: fid,
             args: vec![dest, slot, byte_len],
@@ -2284,19 +4745,20 @@ impl Parser {
             return Err(self.err_unsupported(&format!("{} with i128 type", context)));
         }
 
-        let stride = i128::from(stride);
-        if let Some(index) = parse_int_literal(&index_tok) {
-            let byte_offset = index
-                .checked_mul(stride)
-                .ok_or_else(|| self.err_unsupported("fixed array GEP byte offset overflow"))?;
+        if let Some(index) = self.gep_index_literal(&index_tok, &index_ty)? {
+            // The index as LLVM reads it for its type (`i32 4294967295` and
+            // `i1 1` are -1), sign-extended to the offset's width, and the
+            // offset modulo 2^64 (`gep_offset_add`).
+            let byte_offset = gep_offset_add(0, index, stride);
             if byte_offset == 0 {
                 return Ok(None);
             }
             return Ok(Some(self.emit_i64_const(byte_offset, f)));
         }
+        let stride = i128::from(stride);
 
         let raw_index = self.lookup_operand(&index_tok, &index_ty, f)?;
-        let index = self.coerce_int_to_i64(raw_index, &index_ty, f)?;
+        let index = self.sext_gep_index_to_i64(raw_index, &index_ty, f)?;
         if stride == 1 {
             return Ok(Some(index));
         }
@@ -2401,9 +4863,10 @@ impl Parser {
         };
 
         // At -O1 and above clang prefixes calls with the tail-call marker
-        // (`tail call`, `musttail call`, `notail call`). The marker is a
-        // pure optimization hint with no bearing on semantics — dropping it
-        // is a refinement. Strip it here so dispatch sees the real opcode
+        // (`tail call`, `notail call`). Those markers are optimization hints
+        // with no bearing on semantics, so dropping them is a refinement.
+        // `musttail` guarantees the tail call and is refused by the lexical
+        // pass (`crate::lexical`) before this reader runs. Strip it here so dispatch sees the real opcode
         // (`call`) instead of bucketing the whole program as
         // `unsupported: opcode tail`.
         let rest = {
@@ -2433,33 +4896,30 @@ impl Parser {
         // vector instruction into the equivalent sequence of SCALAR textual
         // instructions, which are then parsed by the ordinary scalar paths
         // below. Anything vector-typed without a proven lane-wise expansion
-        // comes back as `Err` and fails closed here. `TCG_NO_VECTOR_IMPORT=1`
-        // restores the pre-expansion behaviour byte for byte.
-        if !vector_import_disabled() {
-            let uid = f.vec_uid;
-            match crate::vector::expand(result_name.as_deref(), rest, uid) {
-                Ok(Some(expansion)) => {
-                    let _ = f.next_vec_uid();
-                    for (name, token) in expansion.aliases {
-                        f.token_alias.insert(name, token);
-                    }
-                    for (name, text) in expansion.insts {
-                        self.dispatch_body_inst(name, &text, lineno, f)?;
-                    }
-                    // BOUNDARY (lanes -> native). This value scalarized, but
-                    // some consumer of it was planned native, so pack the lanes
-                    // into one register HERE — at the definition, where the
-                    // packed value dominates exactly what the lanes dominate.
-                    if let Some(name) = result_name.as_deref()
-                        && let Some(shape) = f.native_plan.pack_needed(name)
-                    {
-                        self.emit_pack_lanes(name, shape, f)?;
-                    }
-                    return Ok(());
+        // comes back as `Err` and fails closed here.
+        let uid = f.vec_uid;
+        match crate::vector::expand(result_name.as_deref(), rest, uid) {
+            Ok(Some(expansion)) => {
+                let _ = f.next_vec_uid();
+                for (name, token) in expansion.aliases {
+                    f.token_alias.insert(name, token);
                 }
-                Ok(None) => {}
-                Err(reason) => return Err(self.err_unsupported(&reason)),
+                for (name, text) in expansion.insts {
+                    self.dispatch_body_inst(name, &text, lineno, f)?;
+                }
+                // BOUNDARY (lanes -> native). This value scalarized, but
+                // some consumer of it was planned native, so pack the lanes
+                // into one register HERE — at the definition, where the
+                // packed value dominates exactly what the lanes dominate.
+                if let Some(name) = result_name.as_deref()
+                    && let Some(shape) = f.native_plan.pack_needed(name)
+                {
+                    self.emit_pack_lanes(name, shape, f)?;
+                }
+                return Ok(());
             }
+            Ok(None) => {}
+            Err(reason) => return Err(self.err_unsupported(&reason)),
         }
 
         self.dispatch_body_inst(result_name, rest, lineno, f)
@@ -2737,9 +5197,10 @@ impl Parser {
                 ret: Some(ty.clone()),
                 params: vec![(None, ty.clone()); 3],
                 is_vararg: false,
-                internal: false,
                 stack_protector: ImportedStackProtectorAttr::None,
                 libm_pure_math: false,
+                param_ext: Vec::new(),
+                ret_ext: IntExt::Unstated,
             };
             let fid = self.register_function(sig.clone())?;
             if !self.module.functions.iter().any(|func| func.id == fid) {
@@ -2751,7 +5212,7 @@ impl Parser {
                 );
                 func.calling_conv = CallingConv::C;
                 func.linkage = Linkage::External;
-                self.module.add_function(func);
+                self.module.try_add_function(func)?;
             }
             fid
         };
@@ -2980,7 +5441,14 @@ impl Parser {
         }
         let (ty_str, val_str) = split_ty_operand(tail)?;
         let ty = parse_ty(&ty_str)?;
-        let v = self.lookup_operand(&val_str, &ty, f)?;
+        let mut v = self.lookup_operand(&val_str, &ty, f)?;
+        // A `zeroext` `i8`/`i16` return crosses the edge as its unsigned
+        // twin (see `call_edge_ty`).
+        if let Some((body_ty, edge_ty)) = f.ret_edge.clone()
+            && body_ty == ty
+        {
+            v = emit_edge_bitcast(v, &ty, &edge_ty, f);
+        }
         f.push_inst(InstrNode::new(Inst::Return { values: vec![v] }));
         Ok(())
     }
@@ -3135,12 +5603,28 @@ impl Parser {
                     &format!("switch case value must be a constant, got `{}`", raw_val),
                 ));
             }
-            let case_val = parse_int_literal(raw_val).ok_or_else(|| {
+            // Read as LLVM reads it for the selector's type
+            // (`int_literal_value`): an `i64 18076885954311749632` case is
+            // the `i64` -369858119397801984, the canonical spelling
+            // trust-ir's admission requires. An `i1` case is 0 or 1 (`true`,
+            // `false`, or a literal's low bit), the value of the
+            // zero-extended `bool` selector the lowering adapter compares.
+            let literal = match (raw_val, &sel_ty) {
+                ("true", Ty::Bool) => Some(1),
+                ("false", Ty::Bool) => Some(0),
+                (raw, _) => parse_int_literal(raw),
+            };
+            let case_val = literal.ok_or_else(|| {
                 self.err_parse(
                     lineno,
                     &format!("switch: bad case value literal `{}`", raw_val),
                 )
             })?;
+            let case_val = if matches!(sel_ty, Ty::Bool) {
+                unsigned_low_bits(case_val, 1)
+            } else {
+                self.int_literal_value(case_val, &sel_ty)?
+            };
             if toks[i + 2] != "label" {
                 return Err(self.err_parse(
                     lineno,
@@ -3198,6 +5682,7 @@ impl Parser {
             "udiv" => BinOp::UDiv,
             "srem" => BinOp::SRem,
             "urem" => BinOp::URem,
+            // The sole caller, dispatch_body_inst, admits exactly these 13 spellings.
             _ => unreachable!(),
         };
         // Strip leading opcode and any flags like nsw / nuw / exact.
@@ -3299,6 +5784,7 @@ impl Parser {
             "fmul" => BinOp::FMul,
             "fdiv" => BinOp::FDiv,
             "frem" => BinOp::FRem,
+            // The sole caller, dispatch_body_inst, admits exactly these five spellings.
             _ => unreachable!("parse_fbinop opcode `{}`", opcode),
         };
         let tail = strip_fmath_flags(rest, opcode);
@@ -3563,16 +6049,23 @@ impl Parser {
                 );
             }
             if let Some(n) = parse_int_literal(&count_tok) {
-                if n < 0 {
-                    return Err(self.err_unsupported(&format!("{ctx} alloca with negative count")));
-                }
-                let total = (size_bytes as i128).checked_mul(n).ok_or_else(|| {
-                    self.err_unsupported(&format!("{ctx} alloca byte count overflow"))
-                })?;
+                // The count's low bits at its type's width, zero-extended as
+                // LLVM reads an `alloca` count (`i8 300` is 44 elements, `i8
+                // -56` 200).
+                let n = count_literal_value(n, &count_ty);
+                let total = (size_bytes as i128)
+                    .checked_mul(n)
+                    .filter(|total| (0..1i128 << 64).contains(total))
+                    .ok_or_else(|| {
+                        self.err_unsupported(&format!(
+                            "{ctx} alloca of {n} elements of {size_bytes} bytes: its byte size \
+                             reaches 2^64, which no stack object can have"
+                        ))
+                    })?;
                 Some(self.emit_i64_const(total, f))
             } else {
                 let raw_count = self.lookup_operand(&count_tok, &count_ty, f)?;
-                let widened_count = self.coerce_int_to_i64(raw_count, &count_ty, f)?;
+                let widened_count = self.zext_count_to_i64(raw_count, &count_ty, f)?;
                 let total = f.fresh_value();
                 f.push_inst(
                     InstrNode::new(Inst::BinOp {
@@ -3828,18 +6321,9 @@ impl Parser {
         let prefix = tail[..callee_start].trim();
         let callee_tok = tail[callee_start..paren_open].trim();
 
-        // Return type: first type-looking token in the prefix. Handles
-        // `ptr %16`, `signext i8 %19`, `void %fp`, `i32 (ptr, ...) %fp`.
-        let ret_ty_str = prefix
-            .split_whitespace()
-            .find(|t| is_type_token(t) || *t == "void")
-            .unwrap_or("")
-            .to_string();
-        let ret_ty = if ret_ty_str == "void" || ret_ty_str.is_empty() {
-            None
-        } else {
-            Some(parse_ty(&ret_ty_str)?)
-        };
+        // Return type: read token by token (`ptr %16`, `signext i8 %19`,
+        // `void %fp`, `i32 (ptr, ...) %fp`), refusing what is not read.
+        let ret_ty = call_return_type(prefix, "indirect call")?;
 
         // An explicit `(<params>, ...)` func type before the callee marks a
         // variadic indirect call, which the adapter fails closed on.
@@ -3852,18 +6336,53 @@ impl Parser {
         let paren_close_rel = find_matching_paren(&tail[paren_open..])
             .ok_or_else(|| self.err_parse(lineno, "indirect call: unbalanced parens"))?;
         let args_str = &tail[paren_open + 1..paren_open + paren_close_rel];
-        let (args, arg_tys) = self.parse_call_arg_list(args_str, lineno, f)?;
+        read_call_tail(
+            &tail[paren_open + paren_close_rel + 1..],
+            "indirect call",
+            &self.attribute_groups,
+            ProcessorTable::of(self.target),
+        )?;
+        // L01-P11: the pinned trust-ir states a hidden return buffer only on a
+        // declared callee, and a `CallIndirect` carries no attributes, so an
+        // indirect call through the buffer has no faithful spelling. The other
+        // call-ABI attributes are refused inside `call_arg_abi`.
+        let call_abi = call_arg_abi(args_str, "indirect call")?;
+        if let Some(index) = call_abi.sret {
+            return Err(self.err_unsupported(&format!(
+                "indirect call, argument {index}: a hidden return-buffer (`sret`) argument \
+                 (trust-ir states the buffer only on a declared callee; a `CallIndirect` \
+                 carries no parameter attributes)"
+            )));
+        }
+        let ret_ext = call_return_int_ext(prefix, "indirect call")?;
+        let (mut args, arg_tys) = self.parse_call_arg_list(args_str, lineno, f)?;
 
         // The callee is a code pointer (function-pointer value).
         let callee = self.lookup_operand(callee_tok, &Ty::Ptr, f)?;
 
         // Register the call signature so the adapter can validate the edge.
+        // The call site is the only statement of its extensions: a `zeroext`
+        // `i8`/`i16` crosses the edge as its unsigned twin (`call_edge_ty`).
+        let edge_params: Vec<Ty> = arg_tys
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                call_edge_ty(ty, call_abi.args.get(index).copied().unwrap_or_default())
+            })
+            .collect();
+        for ((arg, arg_ty), edge_ty) in args.iter_mut().zip(&arg_tys).zip(&edge_params) {
+            if is_unsigned_edge_twin(arg_ty, edge_ty) {
+                *arg = emit_edge_bitcast(*arg, arg_ty, edge_ty, f);
+            }
+        }
+        let edge_ret = ret_ty.as_ref().map(|ty| call_edge_ty(ty, ret_ext));
         let ft = FuncTy {
-            params: arg_tys,
-            returns: ret_ty.iter().cloned().collect(),
+            params: edge_params,
+            returns: edge_ret.iter().cloned().collect(),
+            abi: None,
             is_vararg: false,
         };
-        let sig = self.module.add_func_type(ft);
+        let sig = self.module.add_func_type(ft)?;
         let node = Inst::CallIndirect {
             callee,
             sig,
@@ -3873,7 +6392,22 @@ impl Parser {
         match result {
             Some(name) if ret_ty.is_some() => {
                 let dest = f.intern_value(&name);
-                f.push_inst(InstrNode::new(node).with_result(dest));
+                match (&ret_ty, &edge_ret) {
+                    (Some(ty), Some(edge_ty)) if is_unsigned_edge_twin(ty, edge_ty) => {
+                        let raw = f.fresh_value();
+                        f.push_inst(InstrNode::new(node).with_result(raw));
+                        f.push_inst(
+                            InstrNode::new(Inst::Cast {
+                                op: CastOp::Bitcast,
+                                src_ty: edge_ty.clone(),
+                                dst_ty: ty.clone(),
+                                operand: raw,
+                            })
+                            .with_result(dest),
+                        );
+                    }
+                    _ => f.push_inst(InstrNode::new(node).with_result(dest)),
+                }
             }
             _ => {
                 f.push_inst(InstrNode::new(node));
@@ -3918,23 +6452,17 @@ impl Parser {
         let prefix = tail[..at].trim();
         let callee_region = &tail[at..];
 
-        // Find the return type: walk `prefix` token-by-token and pick
-        // the first token recognised by `is_type_token`. This handles
-        // all three shapes:
-        //   `i32 @foo(...)`           -> "i32"
-        //   `dso_local i32 @foo(...)` -> "i32"
-        //   `i32 (ptr, ...) @printf`  -> "i32"
-        //   `void @foo(...)`          -> "void"
-        let ret_ty_str = prefix
-            .split_whitespace()
-            .find(|t| is_type_token(t) || *t == "void")
-            .unwrap_or("")
-            .to_string();
-        let ret_ty = if ret_ty_str == "void" || ret_ty_str.is_empty() {
-            None
-        } else {
-            Some(parse_ty(&ret_ty_str)?)
-        };
+        // The return type, read token by token from `prefix`
+        // (`i32 @foo(...)`, `noundef i32 @foo(...)`,
+        // `i32 (ptr, ...) @printf`, `void @foo(...)`), refusing what is not
+        // read: a return type `parse_ty` does not read is no longer taken
+        // for `void` (or, for `{ i64, i64, i64 }`, for its last `i64`).
+        let raw_callee = callee_region
+            .split('(')
+            .next()
+            .unwrap_or(callee_region)
+            .trim();
+        let ret_ty = call_return_type(prefix, &format!("call to `{raw_callee}`"))?;
 
         // callee_region is `@name(<args>) [#attrs]`.
         let paren_open = callee_region
@@ -3955,12 +6483,17 @@ impl Parser {
         // undefined `_llvm.sin.f64` symbol ever escapes. Because trust-cg and
         // clang link the identical libSystem libm, the result is bit-exact with
         // the `clang -O3` reference. The `.f64`/`.f32` suffix selects the
-        // double vs `f`-suffixed float entry point.
+        // double vs `f`-suffixed float entry point; it is the suffix LLVM
+        // gives the call's type, or the call is refused below
+        // (`check_intrinsic_name_mangles_its_type`).
+        let intrinsic_name = callee_name.clone();
         let mut was_libm_intrinsic_rewrite = false;
         if let Some(libm) = libm_intrinsic_symbol(&callee_name) {
             // Record the intrinsic origin for libm purity licensing (finalized
             // in `apply_libm_purity_licenses` once all declares/uses are seen).
             self.libm_rewritten_calls
+                .insert(libm.to_string(), callee_name.clone());
+            self.introduced_callees
                 .insert(libm.to_string(), callee_name.clone());
             callee_name = libm.to_string();
             was_libm_intrinsic_rewrite = true;
@@ -3985,7 +6518,11 @@ impl Parser {
         //     `unsupported`.
         if callee_name.starts_with("llvm.") {
             if is_droppable_intrinsic(&callee_name) {
-                return Ok(());
+                return refuse_dropped_call_signing(
+                    callee_region,
+                    &format!("call to `@{callee_name}`"),
+                    &self.attribute_groups,
+                );
             }
             if !is_lowered_passthrough_intrinsic(&callee_name)
                 && !is_importer_lowered_intrinsic(&callee_name)
@@ -4004,6 +6541,18 @@ impl Parser {
             .ok_or_else(|| self.err_parse(lineno, "call: unbalanced parens"))?;
         let args_str = &callee_region[paren_open + 1..paren_open + paren_close_rel];
         let call_attrs = callee_region[paren_open + paren_close_rel + 1..].trim();
+        read_call_tail(
+            call_attrs,
+            &format!("call to `@{callee_name}`"),
+            &self.attribute_groups,
+            ProcessorTable::of(self.target),
+        )?;
+        // The call's own call-ABI argument attributes (L01-P11): `sret` and
+        // the extensions are checked against the callee once the module is
+        // read; the others are refused here.
+        let call_abi = call_arg_abi(args_str, &format!("call to `@{callee_name}`"))?;
+        let call_sret = call_abi.sret;
+        let call_ret_ext = call_return_int_ext(prefix, &format!("call to `@{callee_name}`"))?;
 
         // `llvm.mem{cpy,move,set}.*`: the final argument is the
         // REQUIRED-immediate `i1 <volatile>` flag (LLVM LangRef). The
@@ -4044,14 +6593,99 @@ impl Parser {
         };
 
         // Split + resolve the call arguments (shared with the indirect path).
-        let (args, arg_tys) = self.parse_call_arg_list(args_str, lineno, f)?;
+        let (mut args, arg_tys) = self.parse_call_arg_list(args_str, lineno, f)?;
+        // An intrinsic read by its name is admitted only under the name LLVM
+        // gives the call's type (the declaration's, in a module llc accepts).
+        check_intrinsic_name_mangles_its_type(
+            &intrinsic_name,
+            ret_ty.as_ref(),
+            &arg_tys,
+            "call to",
+        )?;
+        // The function type this call states, result and parameters (LLVM
+        // places the arguments and reads the result by it, not by the
+        // callee's header), for every call of a callee: an ordinary call, an
+        // intrinsic the backend lowers by its name
+        // (`is_lowered_passthrough_intrinsic`) and a libm intrinsic this
+        // importer renames to its C symbol; not an intrinsic it rewrites to
+        // operations. An `llvm.mem*` call's dropped `i1 <volatile>` is
+        // dropped from the type it states too, as its declaration's is.
+        let records_stated_type = !callee_name.starts_with("llvm.")
+            || is_lowered_passthrough_intrinsic(&callee_name)
+            || was_libm_intrinsic_rewrite;
+        let stated = records_stated_type.then(|| {
+            let mut statement = CallTypeStatement::read(prefix, ret_ty.as_ref(), &arg_tys);
+            if let CallTypeStatement::Stated(stated) = &mut statement
+                && mem_prefix
+                && stated.params.len() == 4
+                && stated.params.last() == Some(&Ty::Bool)
+            {
+                stated.params.pop();
+            }
+            statement
+        });
+        // A libm intrinsic renamed to its C symbol (LD-100 rule 10): LLVM
+        // lowers it to a call of the symbol at the intrinsic's own type
+        // (`libm_intrinsic_function_type`), whatever the module declares the
+        // symbol as, so the call must state that type (llc 22.1.2 refuses
+        // any other: "Intrinsic has incorrect argument type!", "Callsite was
+        // not defined with variable arguments!", "Invalid user of intrinsic
+        // instruction!", "invalid intrinsic signature"), and the replacement
+        // call of the symbol is recorded at it, checked against the symbol's
+        // final signature like every call (`check_call_site_function_types`);
+        // it signs no unprototyped header of the symbol (below). The call is
+        // recorded under the intrinsic's name too, so a declaration of the
+        // intrinsic at another type is refused as for any callee.
+        if was_libm_intrinsic_rewrite {
+            let intrinsic_type =
+                libm_intrinsic_function_type(&intrinsic_name).ok_or_else(|| {
+                    self.err_unsupported(&format!(
+                        "call to `@{intrinsic_name}`: no function type is recorded for the libm \
+                         intrinsic this importer renames to `{callee_name}`"
+                    ))
+                })?;
+            let call_type = stated.as_ref().and_then(CallTypeStatement::stated);
+            if call_type != Some(&intrinsic_type) {
+                let what = call_type.map_or_else(
+                    || "a function type that does not read as one".to_string(),
+                    |call_type| format!("the function type `{}`", call_type.describe_type()),
+                );
+                return Err(self.err_unsupported(&format!(
+                    "call to `@{intrinsic_name}` at line {lineno}: the call states {what} but \
+                     the intrinsic's is `{}`; LLVM refuses such a call (its verifier, or its \
+                     parser for an undeclared intrinsic), and this importer would call \
+                     `@{callee_name}` at the call's type (LD-100 rule 10)",
+                    intrinsic_type.describe_type(),
+                )));
+            }
+            self.call_site_abi.push(CallSiteAbi {
+                callee: intrinsic_name.clone(),
+                sret: call_sret,
+                args: call_abi.args.clone(),
+                arg_tys: arg_tys.clone(),
+                ret: call_ret_ext,
+                stated: stated.clone(),
+                introduced_for: None,
+                line: lineno,
+            });
+        }
+        self.call_site_abi.push(CallSiteAbi {
+            callee: callee_name.clone(),
+            sret: call_sret,
+            args: call_abi.args.clone(),
+            arg_tys: arg_tys.clone(),
+            ret: call_ret_ext,
+            stated: stated.clone(),
+            introduced_for: was_libm_intrinsic_rewrite.then(|| intrinsic_name.clone()),
+            line: lineno,
+        });
 
         // Class 4: intrinsics we rewrite to primitive trust_ir ops. These are
         // EXACT lowerings (no ABI/library dependency), so they run identically
         // to LLVM's own expansion.
         if callee_name.starts_with("llvm.") {
             if is_memset_pattern_intrinsic(&callee_name) {
-                return self.emit_memset_pattern(&args, &arg_tys, result, lineno, f);
+                return self.emit_memset_pattern(&callee_name, &args, &arg_tys, result, lineno, f);
             }
             if let Some(cmp) = minmax_intrinsic_predicate(&callee_name) {
                 // `llvm.{s,u}{max,min}.iN(a, b)` == `select (icmp <cmp> a, b), a, b`.
@@ -4352,27 +6986,49 @@ impl Parser {
         }
 
         // Look up or forward-declare the callee.
-        let fid = if let Some(id) = self.func_ids.get(&callee_name) {
-            *id
+        let fid = if let Some(id) = self.func_ids.get(&callee_name).copied() {
+            // A call the module states signs an unprototyped header of its
+            // callee (OD-56); the call this importer writes for a libm
+            // intrinsic does not, so such a header before it stays `(...)`
+            // and is refused by name (LD-100 rule 10, a stated
+            // over-refusal; the backend refuses a call through an unsigned
+            // `(...)` header too, `[TCG-UNSIGNED-VARIADIC]`).
+            if !was_libm_intrinsic_rewrite
+                && let Some(stated) = stated.as_ref().and_then(CallTypeStatement::stated)
+            {
+                self.sign_unprototyped_declaration(&callee_name, stated, &call_abi.args)?;
+            }
+            id
         } else {
             // Implicit declare-by-use (common for `printf` when clang emits
             // the declaration later). Prefer the explicit function-type
             // prefix (`i32 (ptr, ...) @printf`) when present so Darwin vararg
             // lowering knows how many leading args are fixed.
-            let (params, is_vararg) = parse_explicit_call_func_type(prefix).unwrap_or_else(|| {
-                let params = arg_tys.iter().cloned().map(|ty| (None, ty)).collect();
-                (params, false)
-            });
+            let (params, is_vararg) = match stated.as_ref().and_then(CallTypeStatement::stated) {
+                Some(stated) => (
+                    stated.params.iter().cloned().map(|ty| (None, ty)).collect(),
+                    stated.is_vararg,
+                ),
+                None => parse_explicit_call_func_type(prefix).unwrap_or_else(|| {
+                    let params = arg_tys.iter().cloned().map(|ty| (None, ty)).collect();
+                    (params, false)
+                }),
+            };
+            // The call's own extensions type the placeholder's call edge; a
+            // later header that disagrees is refused by `register_function`.
+            let param_ext = call_abi.args.iter().copied().take(params.len()).collect();
             let sig = FuncSignature {
                 name: callee_name.clone(),
                 ret: ret_ty.clone(),
                 params,
                 is_vararg,
-                internal: false,
                 stack_protector: ImportedStackProtectorAttr::None,
                 libm_pure_math: false,
+                param_ext,
+                ret_ext: call_ret_ext,
             };
             let fid = self.register_function(sig.clone())?;
+            self.call_derived_signatures.insert(callee_name.clone());
             // A callee reached ONLY through declare-by-use (no explicit
             // `declare` line — e.g. a libm symbol synthesized by rewriting
             // `@llvm.sin.f64` to `sin`) still needs a body-less external
@@ -4381,6 +7037,10 @@ impl Parser {
             // external stub. (When an explicit `declare` already added it, the
             // id-existence guard makes this a no-op.)
             if !self.module.functions.iter().any(|func| func.id == fid) {
+                // Until a header says otherwise, the placeholder's hidden
+                // return buffer is the one this call passes; a later header
+                // that disagrees is refused by `note_function_sret`.
+                self.note_function_sret(&callee_name, call_sret, "this call")?;
                 let mut func = Function::new(
                     fid,
                     sig.name.clone(),
@@ -4390,7 +7050,8 @@ impl Parser {
                 func.calling_conv = CallingConv::C;
                 func.linkage = Linkage::External;
                 apply_function_attributes(&mut func, &sig);
-                self.module.add_function(func);
+                apply_sret(&mut func, call_sret);
+                self.module.try_add_function(func)?;
             }
             fid
         };
@@ -4403,13 +7064,46 @@ impl Parser {
                 .borrow_mut()
                 .insert(callee_name.clone());
         }
+        // Pass each argument, and take the result, at the type the callee's
+        // call edge states: a `zeroext` `i8`/`i16` is its unsigned twin (see
+        // `call_edge_ty`), reinterpreted here. Whether this call's own
+        // extensions agree with that edge is checked once the module is read.
+        let edge = self.registered_func_ty(&callee_name).cloned();
+        let edge_ret = edge.as_ref().and_then(|edge| edge.returns.first().cloned());
+        if let Some(edge) = &edge {
+            for ((arg, arg_ty), edge_ty) in args.iter_mut().zip(&arg_tys).zip(&edge.params) {
+                if is_unsigned_edge_twin(arg_ty, edge_ty) {
+                    *arg = emit_edge_bitcast(*arg, arg_ty, edge_ty, f);
+                }
+            }
+        }
         let node = Inst::Call { callee: fid, args };
         match (result, ret_ty) {
+            (Some(name), Some(return_ty))
+                if edge_ret
+                    .as_ref()
+                    .is_some_and(|edge_ty| is_unsigned_edge_twin(&return_ty, edge_ty)) =>
+            {
+                let dest = f.intern_value(&name);
+                let edge_ty = edge_ret.unwrap_or_else(|| return_ty.clone());
+                let raw = f.fresh_value();
+                f.push_inst(InstrNode::new(node).with_result(raw));
+                f.push_inst(
+                    InstrNode::new(Inst::Cast {
+                        op: CastOp::Bitcast,
+                        src_ty: edge_ty,
+                        dst_ty: return_ty,
+                        operand: raw,
+                    })
+                    .with_result(dest),
+                );
+            }
             (Some(name), Some(return_ty)) => {
                 let dest = f.intern_value(&name);
                 let allocation_proofs = if matches!(return_ty, Ty::Ptr) {
                     imported_allocation_result_proofs(
                         &callee_name,
+                        stated.as_ref().and_then(CallTypeStatement::stated),
                         call_attrs,
                         &self.attribute_groups,
                     )
@@ -4514,7 +7208,7 @@ impl Parser {
                     layout
                         .fields
                         .get(field_idx)
-                        .map(|(_, off)| *off)
+                        .map(|field| field.offset)
                         .ok_or_else(|| {
                             self.err_unsupported(&format!(
                                 "struct GEP field index {} out of bounds for `{}`",
@@ -4529,23 +7223,21 @@ impl Parser {
                 // struct stride, INCLUDING tail padding — `layout.size` is already
                 // rounded up to the struct alignment). It may be a constant OR a
                 // dynamic SSA value: `result = base + outer*sizeof(S) + field_off`.
-                let offset_value = match parse_int_literal(&outer_tok) {
+                let offset_value = match self.gep_index_literal(&outer_tok, &outer_ty)? {
                     Some(outer) => {
-                        // Constant outer index: fold the entire byte offset.
-                        let offset = outer
-                            .checked_mul(layout.size as i128)
-                            .and_then(|n| n.checked_add(field_offset as i128))
-                            .ok_or_else(|| {
-                                self.err_unsupported("struct GEP byte offset overflow")
-                            })?;
+                        // Constant outer index, read as LLVM reads it for its
+                        // type: fold the entire byte offset, modulo 2^64 as
+                        // LLVM computes it (`gep_offset_add`).
+                        let offset =
+                            gep_offset_add(gep_offset_add(0, outer, layout.size), 1, field_offset);
                         self.emit_i64_const(offset, f)
                     }
                     None => {
                         // Dynamic outer index: compute the byte offset at run time.
                         // GEP indices are sign-extended to pointer width, which
-                        // `coerce_int_to_i64` does (and it fails closed on i128).
+                        // `sext_gep_index_to_i64` does (and it fails closed on i128).
                         let raw_outer = self.lookup_operand(&outer_tok, &outer_ty, f)?;
-                        let outer_val = self.coerce_int_to_i64(raw_outer, &outer_ty, f)?;
+                        let outer_val = self.sext_gep_index_to_i64(raw_outer, &outer_ty, f)?;
                         let stride = self.emit_i64_const(layout.size as i128, f);
                         let scaled = self.emit_i64_binop(BinOp::Mul, outer_val, stride, f);
                         if field_offset == 0 {
@@ -4607,7 +7299,7 @@ impl Parser {
                 return Err(self.err_unsupported("scalar pointer GEP index with i128 type"));
             }
             let raw_index = self.lookup_operand(&index_tok, &index_ty, f)?;
-            let index = self.coerce_int_to_i64(raw_index, &index_ty, f)?;
+            let index = self.sext_gep_index_to_i64(raw_index, &index_ty, f)?;
             let name = result.ok_or_else(|| self.err_parse(lineno, "gep without result"))?;
             let dest = f.intern_value(&name);
             let base = self.lookup_operand(&base_tok, &Ty::Ptr, f)?;
@@ -4651,9 +7343,12 @@ impl Parser {
                         outer_ty_str
                     )));
                 }
-                let outer = parse_int_literal(&outer_tok).ok_or_else(|| {
-                    self.err_unsupported("byte array global GEP dynamic outer index")
-                })?;
+                // Read as LLVM reads it for its type (`i32 4294967296` is 0).
+                let outer = self
+                    .gep_index_literal(&outer_tok, &outer_ty)?
+                    .ok_or_else(|| {
+                        self.err_unsupported("byte array global GEP dynamic outer index")
+                    })?;
                 if outer != 0 {
                     return Err(
                         self.err_unsupported("byte array global GEP requires zero leading index")
@@ -4672,7 +7367,7 @@ impl Parser {
                     return Err(self.err_unsupported("byte array global GEP index with i128 type"));
                 }
                 let raw_index = self.lookup_operand(&index_tok, &index_ty, f)?;
-                let index = self.coerce_int_to_i64(raw_index, &index_ty, f)?;
+                let index = self.sext_gep_index_to_i64(raw_index, &index_ty, f)?;
                 let name = result.ok_or_else(|| self.err_parse(lineno, "gep without result"))?;
                 let dest = f.intern_value(&name);
                 let base = self.lookup_operand(&base_tok, &Ty::Ptr, f)?;
@@ -4773,8 +7468,7 @@ impl Parser {
                 offset
             )));
         };
-        let bits: u64 = (0xFADEu64 << 48) | ((idx as u64) << 32) | off_u32;
-        Ok(bits as i128)
+        Ok(encode_global_addr_stub(idx as u64, off_u32))
     }
 
     /// Parse an inline constant-expression GEP that addresses a module global —
@@ -4874,22 +7568,21 @@ impl Parser {
             if !is_integer_ty(&ty) {
                 return Err(self.err_unsupported("constexpr GEP index is not an integer"));
             }
-            parse_int_literal(&tok)
+            // Read as LLVM reads it for its type and sign-extended
+            // (`gep_index_literal`).
+            self.gep_index_literal(&tok, &ty)?
                 .ok_or_else(|| self.err_unsupported("constexpr GEP with non-constant index"))
         };
-        let overflow = || self.err_unsupported("constexpr GEP byte offset overflow");
-
+        // The offset is LLVM's: modulo 2^64 (`gep_offset_add`).
         let i0 = const_index(index_toks[0])?;
-        let mut offset = i0.checked_mul(layout.size() as i128).ok_or_else(overflow)?;
+        let mut offset = gep_offset_add(0, i0, layout.size());
         let mut current = layout;
         for clause in &index_toks[1..] {
             match current {
                 FixedLayout::Array { elem, .. } => {
                     let next = elem.as_ref();
                     let i = const_index(clause)?;
-                    offset = offset
-                        .checked_add(i.checked_mul(next.size() as i128).ok_or_else(overflow)?)
-                        .ok_or_else(overflow)?;
+                    offset = gep_offset_add(offset, i, next.size());
                     current = next;
                 }
                 FixedLayout::Struct { fields, .. } => {
@@ -4900,9 +7593,7 @@ impl Parser {
                     let field = fields.get(fidx as usize).ok_or_else(|| {
                         self.err_unsupported("constexpr GEP struct field index out of bounds")
                     })?;
-                    offset = offset
-                        .checked_add(field.offset as i128)
-                        .ok_or_else(overflow)?;
+                    offset = gep_offset_add(offset, 1, field.offset);
                     current = &field.layout;
                 }
                 FixedLayout::Scalar(_) => {
@@ -4954,6 +7645,7 @@ impl Parser {
             "fptoui" => CastOp::FPToUI,
             "fpext" => CastOp::FPExt,
             "fptrunc" => CastOp::FPTrunc,
+            // The sole caller, dispatch_body_inst, admits exactly these 12 spellings.
             _ => unreachable!(),
         };
         let operand = self.lookup_operand(&src_val, &src_ty, f)?;
@@ -5408,35 +8100,104 @@ impl Parser {
         if let Ty::Vector(elem, lanes) = ty {
             return self.parse_vector_constant(tok, elem, *lanes);
         }
+        let floating = matches!(ty, Ty::F16 | Ty::F32 | Ty::F64);
+        if floating && matches!(tok, "true" | "false" | "null") {
+            return Err(self.err_unsupported(&format!(
+                "`{tok}` as a floating-point constant (LLVM's parser rejects it)"
+            )));
+        }
         if tok == "true" {
             Ok(Constant::Bool(true))
         } else if tok == "false" {
             Ok(Constant::Bool(false))
         } else if tok == "null" || tok == "undef" || tok == "poison" {
-            let value = match ty {
-                Ty::F16 | Ty::F32 | Ty::F64 => Constant::Float(0.0),
-                _ => Constant::Int(0),
+            let value = if floating {
+                Constant::Float(0.0)
+            } else {
+                Constant::Int(0)
             };
             Ok(value)
-        } else if matches!(ty, Ty::F16 | Ty::F32 | Ty::F64) {
-            let parsed = parse_fp_literal(tok).ok_or_else(|| Error::Parse {
-                line: 0,
-                message: format!("unknown float operand token `{}`", tok),
-            })?;
-            match parsed {
-                FpLit::Double(d) | FpLit::Half(d) => Ok(Constant::Float(d)),
-                FpLit::Extended(tag) => Err(self.err_unsupported(&format!(
-                    "extended-precision float literal `0x{}...` (trust_ir only has f16/f32/f64)",
-                    tag
-                ))),
-            }
+        } else if floating {
+            fp_literal_constant(tok, ty).map(Constant::Float)
         } else {
             let n = parse_int_literal(tok).ok_or_else(|| Error::Parse {
                 line: 0,
                 message: format!("unknown operand token `{}`", tok),
             })?;
-            Ok(Constant::Int(n))
+            self.int_literal_constant(n, ty)
         }
+    }
+
+    /// The value LLVM 22 reads for the integer literal `n` written for type
+    /// `ty`, spelled as trust-ir spells a constant of the importer's carrier
+    /// for it. LLVM's parser keeps the literal's low `N` bits
+    /// (`LLParser`'s `APSInt::extOrTrunc` to the type's width: llc 22.1.2
+    /// compiles `ret i8 300` to 44, `ret i8 -129` to 127, `ret i32
+    /// 4294967296` to 0 and `ret i1 2` to 0), and the importer's `iN`
+    /// carriers are trust-ir's signed integers, so the value is those bits
+    /// read as a signed `N`-bit integer ([`signed_low_bits`]): `i64
+    /// 18076885954311749632` is the `i64` with bits `0xFADE000000000000`,
+    /// spelled -369858119397801984, the canonical spelling. Written as the
+    /// positive value, an `i64` constant in the interval `[0xFADE << 48,
+    /// 0xFADF << 48)` was read by the lowering adapter as the address of a
+    /// module global (the stub encoding of [`Parser::global_addr_stub`]):
+    /// the fourth verifier round of L02-P13 compiled `ret i64
+    /// 18076885954311749632` to the address of `@g`. For `i1` the value is
+    /// 0 or -1: the sign-extended value LLVM gives a GEP index (`i1 1` and
+    /// `i1 true` are one element back); an operand reads it as a `bool`
+    /// ([`Parser::int_literal_constant`]). `i128` keeps the literal's value
+    /// (every literal that parses is in its range). LLVM rejects an integer
+    /// literal for a pointer (`integer constant must have integer type`), and
+    /// so does this importer: its only pointer integers are `null` and its
+    /// own stubs.
+    fn int_literal_value(&self, n: i128, ty: &Ty) -> Result<i128> {
+        let bits = match ty {
+            Ty::Bool => 1,
+            Ty::I8 => 8,
+            Ty::I16 => 16,
+            Ty::I32 => 32,
+            Ty::I64 => 64,
+            Ty::Ptr => {
+                return Err(self.err_unsupported(&format!(
+                    "integer literal `{n}` for a pointer: LLVM's parser rejects it (`integer \
+                     constant must have integer type`), and the lowering adapter reads a pointer \
+                     constant in [0xFADE << 48, 0xFADF << 48) as a global's address"
+                )));
+            }
+            _ => return Ok(n),
+        };
+        Ok(signed_low_bits(n, bits))
+    }
+
+    /// The trust-ir constant of the integer literal `n` written for `ty`
+    /// ([`Parser::int_literal_value`]): a `bool` for `i1` (`i1 2` is
+    /// `false`, `i1 3` and `i1 -1` are `true`, as llc reads them), and an
+    /// integer spelled in the carrier's signed range otherwise.
+    fn int_literal_constant(&self, n: i128, ty: &Ty) -> Result<Constant> {
+        let value = self.int_literal_value(n, ty)?;
+        Ok(if matches!(ty, Ty::Bool) {
+            Constant::Bool(value != 0)
+        } else {
+            Constant::Int(value)
+        })
+    }
+
+    /// The constant value of the GEP index operand `tok` of integer type
+    /// `ty`, sign-extended to the offset's 64 bits as LLVM extends every GEP
+    /// index (`sext`; llc 22.1.2 writes `sbfx` for an `i1` one): a literal
+    /// read at its type's width ([`Parser::int_literal_value`]), and `true`
+    /// (-1) or `false` for `i1`. `None` for an operand that is no integer
+    /// literal.
+    fn gep_index_literal(&self, tok: &str, ty: &Ty) -> Result<Option<i128>> {
+        let n = match (tok.trim(), ty) {
+            ("true", Ty::Bool) => 1,
+            ("false", Ty::Bool) => 0,
+            (tok, _) => match parse_int_literal(tok) {
+                Some(n) => n,
+                None => return Ok(None),
+            },
+        };
+        self.int_literal_value(n, ty).map(Some)
     }
 
     // --- Operand resolution -----------------------------------------------
@@ -5530,6 +8291,12 @@ impl Parser {
                 // (preserve the historical diagnostic) rather than invent a symbol.
                 Err(self.err_unsupported(&format!("address-of undeclared global `@{}`", canon)))
             }
+        } else if matches!(ty, Ty::F16 | Ty::F32 | Ty::F64)
+            && matches!(tok, "true" | "false" | "null")
+        {
+            Err(self.err_unsupported(&format!(
+                "`{tok}` as a floating-point constant (LLVM's parser rejects it)"
+            )))
         } else if tok == "true" {
             let v = f.fresh_value();
             f.push_inst(
@@ -5575,38 +8342,30 @@ impl Parser {
             //   * Hex f16:  `0xH3C00` (bit pattern of half 1.0)
             //   * Hex f80 / f128 extended: `0xK...`, `0xL...`, `0xM...`
             //     — we reject these because trust_ir only models f16/f32/f64.
-            let parsed = parse_fp_literal(tok).ok_or_else(|| Error::Parse {
-                line: 0,
-                message: format!("unknown float operand token `{}`", tok),
-            })?;
-            match parsed {
-                FpLit::Double(d) | FpLit::Half(d) => {
-                    let v = f.fresh_value();
-                    f.push_inst(
-                        InstrNode::new(Inst::Const {
-                            ty: ty.clone(),
-                            value: Constant::Float(d),
-                        })
-                        .with_result(v),
-                    );
-                    Ok(v)
-                }
-                FpLit::Extended(tag) => Err(self.err_unsupported(&format!(
-                    "extended-precision float literal `0x{}...` (trust_ir only has f16/f32/f64)",
-                    tag
-                ))),
-            }
-        } else {
-            // Integer literal (possibly negative, possibly hex).
-            let n = parse_int_literal(tok).ok_or_else(|| Error::Parse {
-                line: 0,
-                message: format!("unknown operand token `{}`", tok),
-            })?;
+            // Each read as LLVM reads it for `ty` (`fp_literal_constant`).
+            let d = fp_literal_constant(tok, ty)?;
             let v = f.fresh_value();
             f.push_inst(
                 InstrNode::new(Inst::Const {
                     ty: ty.clone(),
-                    value: Constant::Int(n),
+                    value: Constant::Float(d),
+                })
+                .with_result(v),
+            );
+            Ok(v)
+        } else {
+            // Integer literal (decimal, possibly negative), read as LLVM
+            // reads it for `ty` (`int_literal_value`).
+            let n = parse_int_literal(tok).ok_or_else(|| Error::Parse {
+                line: 0,
+                message: format!("unknown operand token `{}`", tok),
+            })?;
+            let value = self.int_literal_constant(n, ty)?;
+            let v = f.fresh_value();
+            f.push_inst(
+                InstrNode::new(Inst::Const {
+                    ty: ty.clone(),
+                    value,
                 })
                 .with_result(v),
             );
@@ -5644,10 +8403,29 @@ fn emit_alloca_count(
     if !is_integer_ty(&count_ty) {
         return Err(parser.err_unsupported(&format!("{} count type `{}`", context, count_ty_str)));
     }
-    if parse_int_literal(&count_tok).is_some_and(|n| n < 0) {
-        return Err(parser.err_unsupported(&format!("{} with negative count", context)));
+    // LLVM zero-extends an `alloca` count to the pointer's width, after
+    // reading a literal at its type's width (`i8 200` and `i8 -56` are 200
+    // elements): a literal folds to that `i64`, a value is zero-extended to
+    // one.
+    let literal = match (count_tok.trim(), &count_ty) {
+        ("true", Ty::Bool) => Some(1),
+        ("false", Ty::Bool) => Some(0),
+        (tok, _) => parse_int_literal(tok),
+    };
+    if let Some(n) = literal {
+        let count = count_literal_value(n, &count_ty);
+        // Only an `i128` literal can lie outside `[0, 2^64)`: zero-extended,
+        // it counts 2^64 elements or more.
+        if !(0..1i128 << 64).contains(&count) {
+            return Err(parser.err_unsupported(&format!(
+                "{context} count `{count_ty_str} {}`: 2^64 or more elements, which no stack \
+                 object can have",
+                count_tok.trim()
+            )));
+        }
+        return Ok(parser.emit_i64_const(count, f));
     }
-    parser
+    let count = parser
         .lookup_operand(&count_tok, &count_ty, f)
         .map_err(|err| match err {
             Error::Parse { message, .. } => Error::Parse {
@@ -5655,7 +8433,8 @@ fn emit_alloca_count(
                 message,
             },
             other => other,
-        })
+        })?;
+    parser.zext_count_to_i64(count, &count_ty, f)
 }
 
 // --------------------------------------------------------------------------
@@ -5669,12 +8448,237 @@ struct FuncSignature {
     /// Parameters: (optional ssa name, type).
     params: Vec<(Option<String>, Ty)>,
     is_vararg: bool,
-    internal: bool,
     stack_protector: ImportedStackProtectorAttr,
     /// The header carried the libm pure-math attribute license set
     /// (`speculatable willreturn nounwind memory(none)`). Only meaningful on
     /// `llvm.<fn>.fN` libm-intrinsic declarations; false elsewhere.
     libm_pure_math: bool,
+    /// `zeroext` / `signext` of each parameter (missing entries are
+    /// unstated); they type the call edge, see [`call_edge_ty`].
+    param_ext: Vec<IntExt>,
+    /// `zeroext` / `signext` of the return value.
+    ret_ext: IntExt,
+}
+
+impl FuncSignature {
+    /// The trust-ir type parameter `index` crosses the call edge as.
+    fn edge_param_ty(&self, index: usize) -> Option<Ty> {
+        let (_, ty) = self.params.get(index)?;
+        let ext = self.param_ext.get(index).copied().unwrap_or_default();
+        Some(call_edge_ty(ty, ext))
+    }
+
+    /// The trust-ir type the return value crosses the call edge as.
+    fn edge_ret_ty(&self) -> Option<Ty> {
+        self.ret.as_ref().map(|ty| call_edge_ty(ty, self.ret_ext))
+    }
+}
+
+/// Lex the whole module text once, as LLVM's lexer does, and refuse by name
+/// what the rest of this importer, which reads one line at a time, would read
+/// differently.
+///
+/// LLVM reads a string from a `"` to the next `"`, across lines (there is no
+/// escaped quote: `\22` spells one), a `;` comment to the next newline or
+/// carriage return, and a C-style block comment (`/* ... */`) as whitespace,
+/// across lines. The rest of this importer knows only one-line strings and
+/// drops a line from its first `;` outside a string, so each of these would
+/// make it read a different module:
+///
+/// * a string containing a raw newline or carriage return ("a string
+///   spanning lines is not read by this importer"): on a continuation line
+///   that begins `;"`, LLVM closes the string and reads the rest as code,
+///   which the importer took for a comment;
+/// * a string that is never closed;
+/// * a carriage return inside a `;` comment with anything but whitespace
+///   after it on the line, which LLVM reads as code;
+/// * a `/*` outside a string and a comment (block comments are not read);
+/// * an address space other than the default one, outside strings and
+///   comments, wherever the module spells it: in a type (a parameter,
+///   argument, return, loaded, stored or GEP pointer type, a constant such
+///   as `ptr addrspace(1) null`, a cast target), on a global, on a function
+///   (its `addrspace(N)` clause) and on a call (`call addrspace(1) ...`).
+///   trust-ir has one address space; LLVM lets another differ in width and
+///   meaning (AArch64 data layouts make `addrspace(270)` a 32-bit pointer),
+///   and the readers drop the clause.
+///
+/// A clause is the word `addrspace` that starts a token
+/// (`addrspace_word_starts_a_token`, from the bytes before it on its line),
+/// followed, after any whitespace on the same line, by a parenthesized
+/// operand closed on that line. A word that ends its line, before any
+/// comment, is refused (LLVM would read its operand from the next line); a
+/// word followed by anything else (`addrspacecast`, a label `addrspace:`) is
+/// not a clause. The operand is the default address space only when it is one
+/// or more `0` digits (`addrspace(0)`, `addrspace ( 0 )`, `addrspace(00)`);
+/// every other operand is refused (`01` is address space 1; negative,
+/// out-of-range and symbolic `"A"`/`"G"`/`"P"` spaces too). This is the only
+/// place the importer decides an address space: `parse_symbol_prefix` steps
+/// over the clauses it admitted, and every other reader ignores or drops
+/// them.
+///
+/// `text` is the module's lines joined by `\n` (`str::lines` has already
+/// removed each `\r` of a `\r\n`), so line numbers are the importer's own.
+fn check_module_lexically(text: &str) -> Result<()> {
+    const KEYWORD: &[u8] = b"addrspace";
+    let bytes = text.as_bytes();
+    let refuse = |offset: usize, what: &str| {
+        let line = bytes[..offset].iter().filter(|&&b| b == b'\n').count() + 1;
+        Err(Error::Unsupported(format!("line {line}: {what}")))
+    };
+    let line_end = |from: usize| {
+        bytes[from..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |at| from + at)
+    };
+    let mut line_start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\n' => {
+                index += 1;
+                line_start = index;
+            }
+            b'"' => {
+                let close = bytes[index + 1..]
+                    .iter()
+                    .position(|&b| b == b'"')
+                    .map(|at| index + 1 + at);
+                let body = &bytes[index + 1..close.unwrap_or(bytes.len())];
+                if body.iter().any(|&b| b == b'\n' || b == b'\r') {
+                    return refuse(
+                        index,
+                        "a string spanning lines (a quoted string with a raw newline or carriage \
+                         return) is not read by this importer: it reads one line at a time",
+                    );
+                }
+                let Some(close) = close else {
+                    return refuse(index, "a string that is never closed");
+                };
+                index = close + 1;
+            }
+            b';' => {
+                let end = line_end(index);
+                let code_after_carriage_return = bytes[index..end]
+                    .iter()
+                    .position(|&b| b == b'\r')
+                    .is_some_and(|at| {
+                        bytes[index + at + 1..end]
+                            .iter()
+                            .any(|b| !b.is_ascii_whitespace())
+                    });
+                if code_after_carriage_return {
+                    return refuse(
+                        index,
+                        "a carriage return inside a `;` comment, followed by text: LLVM ends the \
+                         comment there and reads the text as code, and this importer drops the \
+                         rest of the line",
+                    );
+                }
+                index = end;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                return refuse(
+                    index,
+                    "block comment `/*` (block comments are not read by this importer: it reads \
+                     one line at a time and would read the comment's text as code)",
+                );
+            }
+            _ if bytes[index..].starts_with(KEYWORD)
+                && addrspace_word_starts_a_token(&bytes[line_start..index]) =>
+            {
+                let end = line_end(index);
+                let after = index + KEYWORD.len();
+                let mut open = after;
+                while open < end && bytes[open].is_ascii_whitespace() {
+                    open += 1;
+                }
+                match bytes[..end].get(open) {
+                    Some(b'(') => {}
+                    // The operand on a later line: LLVM reads line breaks and
+                    // comments as whitespace, but the importer reads one line
+                    // at a time, and valid IR ends no line with the bare word.
+                    None | Some(b';') => {
+                        return refuse(
+                            index,
+                            "address space clause `addrspace` has its operand on a later line \
+                             (the importer reads a clause only on one line)",
+                        );
+                    }
+                    // Not an address-space clause (a label such as
+                    // `addrspace:`): LLVM spells none without its operand.
+                    Some(_) => {
+                        index = after;
+                        continue;
+                    }
+                }
+                let Some(close) = bytes[open..end]
+                    .iter()
+                    .position(|&b| b == b')')
+                    .map(|at| open + at)
+                else {
+                    return refuse(
+                        index,
+                        &format!(
+                            "address space clause `{}` has no closing parenthesis",
+                            &text[index..end]
+                        ),
+                    );
+                };
+                let operand = text[open + 1..close].trim();
+                if operand.is_empty() || !operand.bytes().all(|b| b == b'0') {
+                    return refuse(
+                        index,
+                        &format!(
+                            "address space `{}` (only the default address space 0 is imported: \
+                             trust-ir has one address space, and a pointer in another may differ \
+                             in width or meaning)",
+                            &text[index..=close]
+                        ),
+                    );
+                }
+                index = close + 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Whether an `addrspace` word preceded on its line by `before` starts a
+/// token in LLVM's lexer, instead of continuing a name.
+///
+/// A name runs over letters, digits, `_`, `.`, `$` and `-`, so a word right
+/// after one of those, or after a `%`/`@` sigil, is part of a name
+/// (`@x_addrspace`, `%addrspace`). A run of digits is the exception: the
+/// lexer ends an integer type `iN`, a numbered ID (`%0`, `@0`, `#0`, `!0`)
+/// and an integer literal at the first non-digit, so `i8addrspace(270)*` and
+/// `%0addrspace(270)*` are pointers in address space 270. The digits end a
+/// name only when a name byte precedes them (`%v1`, `@x1`), or an `i` that
+/// itself follows a name byte or a `%`/`@` sigil (`%i8`, `@vi32`).
+fn addrspace_word_starts_a_token(before: &[u8]) -> bool {
+    let is_name_byte = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'-');
+    let continues_a_name = |b: u8| is_name_byte(b) || matches!(b, b'%' | b'@');
+    let Some(&last) = before.last() else {
+        return true;
+    };
+    if !last.is_ascii_digit() {
+        return !continues_a_name(last);
+    }
+    let digits = before
+        .iter()
+        .rev()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    match before[..before.len() - digits].split_last() {
+        // An integer literal starting the line.
+        None => true,
+        // `iN`, unless the `i` is inside a name or follows a sigil.
+        Some((b'i', rest)) => rest.last().is_none_or(|&b| !continues_a_name(b)),
+        // A numbered ID or an integer literal: none of `%`, `@`, `#`, `!`,
+        // whitespace or punctuation is a name byte.
+        Some((&b, _)) => !is_name_byte(b),
+    }
 }
 
 fn strip_line(line: &str) -> String {
@@ -5704,8 +8708,16 @@ fn strip_line(line: &str) -> String {
         None => line,
     };
     // Drop metadata attachments like `, !dbg !12` or `, !tbaa !5` that appear at
-    // the end of instruction lines — again only OUTSIDE a string literal.
+    // the end of instruction lines — again only OUTSIDE a string literal. An
+    // instruction's attachments end it (LLVM reads nothing but further
+    // attachments after the first). A GLOBAL's attachments are clauses like
+    // `section` and `align`, which may follow them, and its attributes follow
+    // them without a comma (`, align 8, !dbg !0 #0`), so a global line keeps
+    // them for `parse_global_clauses` to read by token.
     let trimmed = no_comment.trim_end();
+    if trimmed.trim_start().starts_with('@') {
+        return trimmed.to_string();
+    }
     let mut s = trimmed.to_string();
     while let Some(idx) = rfind_outside_quotes(&s, ", !") {
         s.truncate(idx);
@@ -5764,21 +8776,66 @@ fn scan_defined_symbol_name(line: &str) -> Option<&str> {
     Some(after_at)
 }
 
-fn parse_attribute_group(line: &str) -> Option<(String, FunctionAttributeSet)> {
+fn parse_attribute_group(
+    line: &str,
+    processors: ProcessorTable,
+) -> Option<(String, FunctionAttributeSet)> {
     let rest = line.strip_prefix("attributes")?.trim();
     let (group, attrs) = split_eq(rest)?;
     let group = group.trim();
     if !is_attribute_group_ref(group) {
         return None;
     }
+    let body = attrs
+        .trim()
+        .strip_prefix('{')
+        .and_then(|body| body.strip_suffix('}'));
+    let (refused, return_address_signing) = match body {
+        Some(body) => crate::attributes::read_attribute_group(body, processors),
+        None => (
+            Some("an attribute group whose body is not `{ ... }`".to_string()),
+            ReturnAddressSigning::default(),
+        ),
+    };
+    // A body LLVM's lexer rejects is refused by `read_attribute_group`.
+    let subtarget = body
+        .and_then(|body| {
+            crate::lexical::lex(body)
+                .ok()
+                .map(|tokens| SubtargetSelection::scan(body, &tokens))
+        })
+        .unwrap_or_default();
     Some((
         group.to_string(),
         FunctionAttributeSet {
+            refused,
+            return_address_signing,
+            subtarget,
             stack_protector: attr_text_stack_protector_attr(attrs),
             allocsize: attr_text_has_token(attrs, "allocsize"),
             libm_pure_math: attr_text_is_libm_pure_math(attrs),
+            global_sections: attr_text_global_sections(attrs),
         },
     ))
+}
+
+/// The `#pragma clang section` keys an attribute group's text sets, one bit
+/// each in [`GLOBAL_SECTION_ATTRIBUTES`] order. A key is matched as LLVM
+/// decodes it (`"bss\2Dsection"` is `"bss-section"`).
+fn attr_text_global_sections(text: &str) -> u8 {
+    let Ok(tokens) = crate::lexical::lex(text) else {
+        return 0;
+    };
+    GLOBAL_SECTION_ATTRIBUTES
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| {
+            tokens.iter().any(|token| {
+                token.kind == LexKind::Str
+                    && crate::lexical::string_value(token.text(text)) == key.as_bytes()
+            })
+        })
+        .fold(0, |bits, (bit, _)| bits | (1 << bit))
 }
 
 fn function_stack_protector_attr(
@@ -5860,16 +8917,37 @@ fn attr_text_or_group_has_allocsize(
         })
 }
 
-fn known_fresh_allocation_callee(name: &str) -> bool {
-    matches!(name, "calloc" | "malloc" | "reallocarray" | "aligned_alloc")
+/// C's prototype of the allocation routine `name` on this importer's LP64
+/// targets, in its signless types: `void *malloc(size_t)`, `void
+/// *calloc(size_t, size_t)`, `void *aligned_alloc(size_t, size_t)` and `void
+/// *reallocarray(void *, size_t, size_t)`; `None` for any other name.
+fn c_allocation_prototype(name: &str) -> Option<StatedCallType> {
+    let params = match name {
+        "malloc" => vec![Ty::I64],
+        "calloc" | "aligned_alloc" => vec![Ty::I64, Ty::I64],
+        "reallocarray" => vec![Ty::Ptr, Ty::I64, Ty::I64],
+        _ => return None,
+    };
+    Some(StatedCallType {
+        ret: Some(Ty::Ptr),
+        params,
+        is_vararg: false,
+    })
 }
 
+/// The fresh-allocation facts (`NoAlias`, `Aligned(16)`) of a call's result:
+/// C's allocator's, so given only to a call of one of its names that states
+/// C's prototype (`stated`; rule 9 of LD-100 holds that type to the callee's
+/// final signature, or refuses the module) and carries `allocsize`. A
+/// function only named like one, declared otherwise, is an ordinary callee
+/// whose result may alias anything (LD-100 rule 11).
 fn imported_allocation_result_proofs(
     callee_name: &str,
+    stated: Option<&StatedCallType>,
     call_attrs: &str,
     attribute_groups: &HashMap<String, FunctionAttributeSet>,
 ) -> Vec<ProofAnnotation> {
-    if !known_fresh_allocation_callee(callee_name)
+    if c_allocation_prototype(callee_name).is_none_or(|prototype| stated != Some(&prototype))
         || !attr_text_or_group_has_allocsize(call_attrs, attribute_groups)
     {
         return Vec::new();
@@ -5889,19 +8967,17 @@ fn is_attribute_group_ref(token: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The words of an attribute list outside its strings. A string runs to the
+/// next `"`, as LLVM's lexer reads it: a backslash escapes nothing there (an
+/// embedded quote is spelled `\22`), so `"C:\"` closes at its second quote.
 fn attr_text_tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut token = String::new();
     let mut in_quote = false;
-    let mut escaped = false;
 
     for ch in text.chars() {
         if in_quote {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
+            if ch == '"' {
                 in_quote = false;
             }
             continue;
@@ -5964,26 +9040,34 @@ fn collect_function_body(
     })
 }
 
-fn parse_function_signature(
-    line: &str,
-    lineno: usize,
-    is_define: bool,
-    attribute_groups: &HashMap<String, FunctionAttributeSet>,
-) -> Result<FuncSignature> {
+/// The pieces of one `define`/`declare` header line.
+struct FunctionHeader<'a> {
+    /// Everything between the keyword and `@name`: symbol keywords, calling
+    /// convention, return attributes and the return type.
+    pre_at: &'a str,
+    /// The raw name after `@` (quoted and `\01` spellings kept).
+    name: String,
+    /// The text between the parameter-list parentheses.
+    params_str: &'a str,
+    /// Everything after the parameter list: `unnamed_addr`, attribute
+    /// groups, `section`, `comdat`, `align`, `personality`, ...
+    attrs_after: &'a str,
+}
+
+fn split_function_header(line: &str, lineno: usize, is_define: bool) -> Result<FunctionHeader<'_>> {
     // Canonical shapes:
     //   define dso_local void @foo(i32 noundef %x) #0 {
     //   define internal i32 @bar(i8 %a, i8 %b) {
     //   declare i32 @printf(ptr noundef, ...) #1
     //
-    // We chop leading keyword (`define` / `declare`), trailing attributes
-    // (`#N`, `{`), then find the parenthesis boundaries to split ret-ty /
-    // name / params.
+    // We chop the leading keyword (`define` / `declare`), then find the
+    // parenthesis boundaries to split ret-ty / name / params / clauses.
     let head_kw = if is_define { "define" } else { "declare" };
-    let mut s = line.trim_start_matches(head_kw).trim().to_string();
-    if let Some(brace_idx) = s.rfind('{') {
-        s.truncate(brace_idx);
-    }
-    let s = s.trim();
+    // The caller has removed a definition's trailing body `{`; the
+    // pre-parse check (`lexical::check_module`) admitted nothing after it.
+    // A `{` still in the header belongs to it (a struct return type, a
+    // `!{...}` attachment), so the header is not cut there.
+    let s = line.trim_start_matches(head_kw).trim();
 
     // Locate the function name `@name`. We search for the first `@` at
     // nesting depth 0 so parenthesised return-value attributes — e.g.
@@ -6022,6 +9106,636 @@ fn parse_function_signature(
         })?;
     let params_str = &after_name[paren_open_rel + 1..paren_open_rel + paren_close_rel];
     let attrs_after = after_name[paren_open_rel + paren_close_rel + 1..].trim();
+    Ok(FunctionHeader {
+        pre_at,
+        name,
+        params_str,
+        attrs_after,
+    })
+}
+
+// --------------------------------------------------------------------------
+// Parameter attributes that change the call ABI (L01-P11)
+// --------------------------------------------------------------------------
+//
+// LLVM spells how an argument crosses a call edge as parameter attributes, on
+// the callee's parameters and on each call's arguments. Most are hints a
+// consumer may ignore (`noundef`, `noalias`, `nonnull`, `align`, `captures`,
+// `dereferenceable`, `writable`, `dead_on_unwind`, `returned`, ...): ignoring
+// one only forgoes an optimization. These change the machine ABI:
+//
+// * `sret` marks the caller-allocated buffer an aggregate result is returned
+//   through; AAPCS64 passes its address in X8, not in the first argument
+//   register. It is carried as `ParamAttrs::sret` on the callee `Function`
+//   (definition or declaration), which the backend lowers through X8. A call
+//   whose own `sret` disagrees with its callee's, and an indirect call with an
+//   `sret` argument, have no trust-ir spelling (the pinned trust-ir states the
+//   buffer only on a declared callee) and are refused.
+// * `byval`, `byref`, `inreg`, `inalloca`, `preallocated`, `nest`,
+//   `swiftself`, `swifterror` and `swiftasync` move an argument to the stack
+//   argument area or to a dedicated register (X18 for `nest`, X20-X22 for the
+//   Swift ones; `inreg sret` is X0 on Windows AArch64). None is carried here,
+//   so each is refused by name wherever it appears: a declaration with one is
+//   refused rather than skipped, because LLVM applies the callee's attributes
+//   to calls that do not repeat them.
+// * `zeroext` / `signext` on an `i8` or `i16` parameter, argument or return
+//   value say how the value is widened to 32 bits as it crosses the edge
+//   (DarwinPCS makes the caller extend an argument and the callee its return
+//   value, and a clang-compiled peer reads the register without
+//   re-extending). LLVM's integers are signless, so the importer otherwise
+//   types both as trust-ir `I8`/`I16`, which the backend sign-extends. The
+//   extension is carried as the signedness of the call edge's trust-ir type:
+//   a `zeroext` edge is `U8`/`U16` (the backend zero-extends it), a `signext`
+//   or unstated edge `I8`/`I16`, and a `Bitcast` reinterprets the value
+//   between the body's signless type and the edge's at the definition's
+//   entry, before a `ret`, and at each call. `zeroext i1` is trust-ir `Bool`
+//   (0 or 1); `signext i1` (true as all ones) has no trust-ir spelling and is
+//   refused, as is either attribute on a narrow variadic argument. LLVM
+//   extends a direct call's argument when the call site OR the callee says
+//   so, and trust-ir states it once, on the callee's type, so a call (or a
+//   header the importer skips) whose extension disagrees with the callee's
+//   edge type is refused by name. On `i32` and wider, both are no-ops on
+//   AArch64 (AAPCS64 and DarwinPCS promote only `i1`/`i8`/`i16`) and are not
+//   carried.
+
+/// LLVM's integer-extension attribute on one parameter, argument or return
+/// value (see the section comment above).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum IntExt {
+    /// Neither `zeroext` nor `signext`.
+    #[default]
+    Unstated,
+    /// `zeroext`.
+    Zero,
+    /// `signext`.
+    Sign,
+}
+
+impl IntExt {
+    fn keyword(self) -> &'static str {
+        match self {
+            IntExt::Unstated => "no extension attribute",
+            IntExt::Zero => "`zeroext`",
+            IntExt::Sign => "`signext`",
+        }
+    }
+}
+
+/// The call-ABI facts of one parameter or call argument.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ArgAbi {
+    /// The hidden return buffer (`sret` / `sret(<ty>)`).
+    sret: bool,
+    /// `zeroext` / `signext`.
+    ext: IntExt,
+}
+
+/// The `zeroext` / `signext` among `attribute_tokens`, refusing both at once
+/// (LLVM's verifier rejects that pair as incompatible).
+fn stated_int_ext(attribute_tokens: &[&str], subject: &str) -> Result<IntExt> {
+    let mut ext = IntExt::Unstated;
+    for token in attribute_tokens {
+        let stated = match *token {
+            "zeroext" => IntExt::Zero,
+            "signext" => IntExt::Sign,
+            _ => continue,
+        };
+        if ext != IntExt::Unstated && ext != stated {
+            return Err(Error::Unsupported(format!(
+                "{subject}: both `zeroext` and `signext`"
+            )));
+        }
+        ext = stated;
+    }
+    Ok(ext)
+}
+
+/// The trust-ir type a value of signless importer type `ty` crosses a call
+/// edge as when LLVM states `ext` on it: the unsigned twin for a `zeroext`
+/// `i8`/`i16`, `ty` itself otherwise.
+fn call_edge_ty(ty: &Ty, ext: IntExt) -> Ty {
+    match (ty, ext) {
+        (Ty::I8, IntExt::Zero) => Ty::U8,
+        (Ty::I16, IntExt::Zero) => Ty::U16,
+        _ => ty.clone(),
+    }
+}
+
+/// Whether `edge` is the unsigned call-edge twin of the importer's signless
+/// `ty` (the pair a `zeroext` edge reinterprets between).
+fn is_unsigned_edge_twin(ty: &Ty, edge: &Ty) -> bool {
+    matches!((ty, edge), (Ty::I8, Ty::U8) | (Ty::I16, Ty::U16))
+}
+
+/// Refuse an extension `ext` that a call edge typed `edge` does not carry: a
+/// `zeroext` on an edge the backend sign-extends (`I8`/`I16`), or a
+/// `signext` on one it zero-extends (`U8`/`U16`).
+fn check_edge_ext(edge: &Ty, ext: IntExt, subject: &str) -> Result<()> {
+    let carried = match ext {
+        IntExt::Unstated => true,
+        IntExt::Zero => !matches!(edge, Ty::I8 | Ty::I16),
+        IntExt::Sign => !matches!(edge, Ty::U8 | Ty::U16),
+    };
+    if carried {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "{subject}: states {} but the callee's call edge is typed `{edge:?}`, which the backend \
+         extends the other way (trust-ir states one extension per call edge, on the callee)",
+        ext.keyword()
+    )))
+}
+
+/// Reinterpret `value` from type `from` to `to` (a same-width `Bitcast`
+/// between a signless narrow integer and its call-edge twin), returning the
+/// new value.
+fn emit_edge_bitcast(value: ValueId, from: &Ty, to: &Ty, f: &mut FuncScratch) -> ValueId {
+    let dest = f.fresh_value();
+    f.push_inst(
+        InstrNode::new(Inst::Cast {
+            op: CastOp::Bitcast,
+            src_ty: from.clone(),
+            dst_ty: to.clone(),
+            operand: value,
+        })
+        .with_result(dest),
+    );
+    dest
+}
+
+/// Whether two call-edge signatures differ only in the signedness a
+/// `zeroext` gives a narrow parameter or return value.
+fn signatures_differ_only_in_extension(lhs: &FuncTy, rhs: &FuncTy) -> bool {
+    let same_or_twin =
+        |a: &Ty, b: &Ty| a == b || is_unsigned_edge_twin(a, b) || is_unsigned_edge_twin(b, a);
+    lhs.is_vararg == rhs.is_vararg
+        && lhs.params.len() == rhs.params.len()
+        && lhs.returns.len() == rhs.returns.len()
+        && lhs
+            .params
+            .iter()
+            .zip(&rhs.params)
+            .all(|(a, b)| same_or_twin(a, b))
+        && lhs
+            .returns
+            .iter()
+            .zip(&rhs.returns)
+            .all(|(a, b)| same_or_twin(a, b))
+}
+
+/// Refuse an extension trust-ir cannot state on a value of type `ty`:
+/// `signext i1` passes `true` as all ones, and trust-ir's `Bool` is 0 or 1.
+fn refuse_unspellable_int_ext(ty: &Ty, ext: IntExt, subject: &str) -> Result<()> {
+    if *ty == Ty::Bool && ext == IntExt::Sign {
+        return Err(Error::Unsupported(format!(
+            "{subject}: `signext i1` (true passed as all ones), which trust-ir's `Bool` (0 or 1) \
+             cannot state"
+        )));
+    }
+    Ok(())
+}
+
+/// The `zeroext` / `signext` of a return value: the tokens of a header's or
+/// call's prefix before the return type, with the return type's index.
+fn return_int_ext(prefix_tokens: &[&str], ret_ty_index: usize, subject: &str) -> Result<IntExt> {
+    stated_int_ext(
+        &prefix_tokens[..ret_ty_index.min(prefix_tokens.len())],
+        &format!("{subject}, return value"),
+    )
+}
+
+/// Classify the attribute tokens of one parameter or argument (its tokens
+/// between the type and the name or value). `subject` names it in a refusal.
+fn arg_abi(attribute_tokens: &[&str], subject: &str) -> Result<ArgAbi> {
+    let mut abi = ArgAbi {
+        ext: stated_int_ext(attribute_tokens, subject)?,
+        ..ArgAbi::default()
+    };
+    for token in attribute_tokens {
+        let keyword = token.split('(').next().unwrap_or(token);
+        let why = match keyword {
+            "sret" => {
+                abi.sret = true;
+                continue;
+            }
+            "byval" => {
+                "a by-value copy in the caller's stack argument area, which this importer \
+                 does not carry into trust-ir"
+            }
+            "byref" => "a by-reference aggregate whose copy rules this importer does not carry",
+            "inreg" => {
+                "a target-specific register assignment (on AArch64, `inreg sret` passes the \
+                 return buffer in X0 on Windows), which this importer does not carry"
+            }
+            "inalloca" | "preallocated" => {
+                "an argument memory block the caller preallocates (a 32-bit x86 Windows ABI), \
+                 which has no trust-ir spelling"
+            }
+            "nest" => "the static-chain register (X18 on AArch64), which has no trust-ir spelling",
+            "swiftself" | "swifterror" | "swiftasync" => {
+                "a Swift ABI register (X20-X22 on AArch64), which has no trust-ir spelling"
+            }
+            _ => continue,
+        };
+        return Err(Error::Unsupported(format!(
+            "{subject}: parameter attribute `{keyword}` ({why})"
+        )));
+    }
+    Ok(abi)
+}
+
+/// The index of the single `sret` entry of `abis`, refusing two (LLVM's
+/// verifier rejects more than one).
+fn sret_index(abis: &[ArgAbi], subject: &str) -> Result<Option<usize>> {
+    let mut marked = abis
+        .iter()
+        .enumerate()
+        .filter(|(_, abi)| abi.sret)
+        .map(|(index, _)| index);
+    let first = marked.next();
+    if marked.next().is_some() {
+        return Err(Error::Unsupported(format!(
+            "{subject}: more than one hidden return-buffer (`sret`) parameter"
+        )));
+    }
+    Ok(first)
+}
+
+/// The attribute tokens of one `<ty> [attrs...] [name-or-value]` parameter
+/// or argument, split bracket-aware (`sret({ i64, i64 })` is one token).
+fn param_attribute_tokens(param: &str) -> (Vec<&str>, Option<&str>) {
+    let tokens = split_top_level_ws(param.trim());
+    let Some((&ty, rest)) = tokens.split_first() else {
+        return (Vec::new(), None);
+    };
+    let rest = match rest.split_last() {
+        Some((last, attributes)) if last.starts_with('%') || last.starts_with('@') => attributes,
+        _ => rest,
+    };
+    (rest.to_vec(), Some(ty))
+}
+
+/// The call-ABI facts a `define`/`declare` header states.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HeaderAbi {
+    /// The hidden return-buffer (`sret`) parameter.
+    sret: Option<usize>,
+    /// `zeroext` / `signext` of each fixed parameter, in order.
+    params: Vec<IntExt>,
+    /// `zeroext` / `signext` of the return value.
+    ret: IntExt,
+}
+
+/// The call-ABI facts a `define`/`declare` header states, refusing every
+/// call-ABI attribute without a trust-ir spelling by name (see the section
+/// comment above).
+fn function_param_abi(header: &FunctionHeader<'_>, subject: &str) -> Result<HeaderAbi> {
+    let mut abis = Vec::new();
+    for (index, param) in split_call_args(header.params_str).iter().enumerate() {
+        let param = param.trim();
+        if param == "..." || param.is_empty() {
+            continue;
+        }
+        let (attributes, ty) = param_attribute_tokens(param);
+        let subject = format!("{subject}, parameter {index}");
+        let abi = arg_abi(&attributes, &subject)?;
+        if abi.sret && ty != Some("ptr") {
+            return Err(Error::Unsupported(format!(
+                "{subject}: a hidden return-buffer (`sret`) parameter must be a `ptr`, not `{}`",
+                ty.unwrap_or("")
+            )));
+        }
+        if ty == Some("i1") {
+            refuse_unspellable_int_ext(&Ty::Bool, abi.ext, &subject)?;
+        }
+        abis.push(abi);
+    }
+    let prefix = split_top_level_ws(header.pre_at);
+    let ret = match prefix
+        .iter()
+        .rposition(|token| *token == "void" || is_type_token(token))
+    {
+        Some(index) => {
+            let ret = return_int_ext(&prefix, index, subject)?;
+            if prefix[index] == "i1" {
+                refuse_unspellable_int_ext(&Ty::Bool, ret, &format!("{subject}, return value"))?;
+            }
+            ret
+        }
+        None => IntExt::Unstated,
+    };
+    Ok(HeaderAbi {
+        sret: sret_index(&abis, subject)?,
+        params: abis.iter().map(|abi| abi.ext).collect(),
+        ret,
+    })
+}
+
+/// The call-ABI facts of one call's argument list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CallArgAbi {
+    /// The hidden return-buffer (`sret`) argument.
+    sret: Option<usize>,
+    /// `zeroext` / `signext` of each argument, in order.
+    args: Vec<IntExt>,
+}
+
+/// The call-ABI facts of one call's argument list, refusing every call-ABI
+/// attribute without a trust-ir spelling by name.
+fn call_arg_abi(args_str: &str, subject: &str) -> Result<CallArgAbi> {
+    let mut abis = Vec::new();
+    for (index, arg) in split_call_args(args_str).iter().enumerate() {
+        if arg.trim().is_empty() {
+            continue;
+        }
+        let (attributes, ty) = param_attribute_tokens(arg);
+        let subject = format!("{subject}, argument {index}");
+        let abi = arg_abi(&attributes, &subject)?;
+        if ty == Some("i1") {
+            refuse_unspellable_int_ext(&Ty::Bool, abi.ext, &subject)?;
+        }
+        abis.push(abi);
+    }
+    Ok(CallArgAbi {
+        sret: sret_index(&abis, subject)?,
+        args: abis.iter().map(|abi| abi.ext).collect(),
+    })
+}
+
+/// `tokens` (a bracket-aware split of the text before a function's name)
+/// without the address-space qualifier that may follow its return type,
+/// and whether that qualifier makes the return type a typed pointer: `ptr
+/// addrspace(0)` and `ptr addrspace (0)` return `ptr`, and `i8
+/// addrspace(0)*`, `i8 addrspace (0)*` and `i8 *` return a pointer, as LLVM
+/// reads them. The lexical pass refused every address space but 0.
+fn without_trailing_address_space<'a, 'b>(tokens: &'b [&'a str]) -> (&'b [&'a str], bool) {
+    let mut end = tokens.len();
+    let mut pointer = false;
+    loop {
+        match &tokens[..end] {
+            [.., "addrspace", space] if space.starts_with('(') => {
+                pointer |= space.ends_with('*');
+                end -= 2;
+            }
+            [.., last] if last.starts_with("addrspace") => {
+                pointer |= last.ends_with('*');
+                end -= 1;
+            }
+            [.., "*"] => {
+                pointer = true;
+                end -= 1;
+            }
+            _ => return (&tokens[..end], pointer),
+        }
+    }
+}
+
+/// The return type a call's prefix states (the text between `call`, after
+/// its tail marker, and the callee), `None` for `void`. Read token by token
+/// at bracket depth 0: fast-math flags, `ccc`/`fastcc` (the lexical pass
+/// refused every other convention), return attributes (the call-ABI ones
+/// are read by [`call_return_int_ext`]; `inreg` is refused), `addrspace(0)`
+/// (the lexical pass refused every other address space), the return type,
+/// which must be `void` or a type [`parse_ty`] reads, and an explicit
+/// function type `(...)` after it. Any other token is refused by name.
+fn call_return_type(prefix: &str, subject: &str) -> Result<Option<Ty>> {
+    let unsupported = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+    let tokens = split_top_level_ws(prefix);
+    let mut ret: Option<Option<Ty>> = None;
+    let mut index = 0;
+    while let Some(&token) = tokens.get(index) {
+        index += 1;
+        // An address space (`addrspace(0)`, `addrspace (0)`), the call's
+        // before the type or a pointer's after it; with a `*` after the
+        // type it ends a typed pointer (`i8 addrspace(0)*`, `i8 *`), so the
+        // call returns a pointer.
+        let space = if token == "addrspace" {
+            match tokens.get(index) {
+                Some(space) if space.starts_with('(') => {
+                    index += 1;
+                    Some(*space)
+                }
+                _ => return unsupported("`addrspace` without its operand".to_string()),
+            }
+        } else {
+            (token.starts_with("addrspace(") || token == "*").then_some(token)
+        };
+        if let Some(space) = space {
+            if space.ends_with('*') && ret.is_some() {
+                ret = Some(Some(Ty::Ptr));
+            }
+            continue;
+        }
+        if ret.is_some() {
+            if token.starts_with('(') && token.ends_with(')') && index == tokens.len() {
+                continue;
+            }
+            return unsupported(format!("unexpected `{token}` after the call's return type"));
+        }
+        match token {
+            "fast" | "nnan" | "ninf" | "nsz" | "arcp" | "contract" | "afn" | "reassoc" => {}
+            "ccc" | "fastcc" => {}
+            "noundef" | "zeroext" | "signext" | "noext" | "noalias" | "nonnull" => {}
+            "inreg" => {
+                return unsupported(
+                    "return attribute `inreg` (a target-specific register assignment, which \
+                     this importer does not carry)"
+                        .to_string(),
+                );
+            }
+            "align" => {
+                if !tokens
+                    .get(index)
+                    .is_some_and(|value| value.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    return unsupported(
+                        "return attribute `align` without an alignment".to_string(),
+                    );
+                }
+                index += 1;
+            }
+            _ if [
+                "dereferenceable(",
+                "dereferenceable_or_null(",
+                "range(",
+                "nofpclass(",
+                "align(",
+            ]
+            .iter()
+            .any(|attribute| token.starts_with(attribute) && token.ends_with(')')) => {}
+            "void" => ret = Some(None),
+            _ if looks_like_a_type(token) => {
+                ret = Some(Some(parse_ty(token).map_err(|error| match error {
+                    Error::Unsupported(what) => {
+                        Error::Unsupported(format!("{subject}, return type: {what}"))
+                    }
+                    other => other,
+                })?));
+            }
+            _ => {
+                return unsupported(format!(
+                    "unrecognized token `{token}` before the callee (not a fast-math flag, \
+                     `ccc`/`fastcc`, a return attribute or the return type)"
+                ));
+            }
+        }
+    }
+    match ret {
+        Some(ret) => Ok(ret),
+        None => unsupported("no return type before the callee".to_string()),
+    }
+}
+
+/// Read the text after a call's argument list: function attributes, inline
+/// or through a group, each read or refused by `crate::attributes` (a group
+/// is read when every attribute in it is), and refused together when they
+/// hold `"sign-return-address-key"` without `"sign-return-address"`
+/// (`attributes::ReturnAddressSigning`). An operand bundle list
+/// (`[ "tag"(...) ]`) is refused by name: llc lowers bundles this importer
+/// would drop (`clang.arc.attachedcall` calls the retain function after the
+/// call, `kcfi` checks the callee's type, `ptrauth` authenticates it).
+/// Metadata attachments were removed with the line's `, !` tail. Any other
+/// token is refused by name.
+fn read_call_tail(
+    tail: &str,
+    subject: &str,
+    attribute_groups: &HashMap<String, FunctionAttributeSet>,
+    processors: ProcessorTable,
+) -> Result<()> {
+    let unsupported = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+    let tokens = crate::lexical::lex(tail)?;
+    let group_refusal = |group: &str| {
+        attribute_groups
+            .get(group)
+            .and_then(|attributes| attributes.refused.clone())
+    };
+    let mut signing = ReturnAddressSigning::default();
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        if token.kind == LexKind::Punct(b'[') {
+            let tag = tokens
+                .get(index + 1)
+                .filter(|tag| tag.kind == LexKind::Str)
+                .map_or("", |tag| tag.text(tail));
+            return unsupported(format!(
+                "operand bundle {tag} (llc lowers operand bundles, for example \
+                 `clang.arc.attachedcall` to a call of the retain function after this one; \
+                 this importer would drop it)"
+            ));
+        }
+        match read_function_attribute(tail, &tokens, index, &group_refusal, processors) {
+            AttributeRead::Read(next) => {
+                note_return_address_signing(&mut signing, tail, &tokens, index, attribute_groups);
+                index = next;
+            }
+            AttributeRead::Refused(why) => return unsupported(why),
+            AttributeRead::NotAnAttribute => {
+                return unsupported(format!(
+                    "unexpected `{}` after the call's arguments",
+                    token.text(tail)
+                ));
+            }
+        }
+    }
+    signing.refusal().map_or(Ok(()), unsupported)
+}
+
+/// Add the attribute read from `tokens[at]` of `text` (a string attribute's
+/// key, with its value, or an attribute group) to the return-address-signing
+/// attributes of one function or call (`attributes::ReturnAddressSigning`).
+fn note_return_address_signing(
+    signing: &mut ReturnAddressSigning,
+    text: &str,
+    tokens: &[crate::lexical::Token],
+    at: usize,
+    attribute_groups: &HashMap<String, FunctionAttributeSet>,
+) {
+    match tokens[at].kind {
+        LexKind::Str => signing.note(text, tokens, at),
+        LexKind::AttrGroup => {
+            *signing = signing.union(group_signing(tokens[at].text(text), attribute_groups))
+        }
+        _ => {}
+    }
+}
+
+/// The return-address-signing attributes of the attribute group `group`
+/// (`#N`), none when the module defines no such group.
+fn group_signing(
+    group: &str,
+    attribute_groups: &HashMap<String, FunctionAttributeSet>,
+) -> ReturnAddressSigning {
+    attribute_groups
+        .get(group)
+        .map(|group| group.return_address_signing)
+        .unwrap_or_default()
+}
+
+/// Refuse a call the importer drops (`is_droppable_intrinsic`) whose
+/// attributes after its arguments, inline or through a group, fail LLVM's
+/// return-address-signing checks (`attributes::ReturnAddressSigning`):
+/// LLVM's verifier makes them on every call, so llc rejects such a call,
+/// although it drops the intrinsic too. `callee_region` is the call's text
+/// from its callee (`@llvm.assume(i1 %c) #3`), read as LLVM's lexer splits
+/// it: the argument list and an operand bundle (`[ "align"(ptr %p, i64 8) ]`
+/// on `llvm.assume`) are bracketed groups, skipped. No other attribute of a
+/// dropped call is read.
+fn refuse_dropped_call_signing(
+    callee_region: &str,
+    subject: &str,
+    attribute_groups: &HashMap<String, FunctionAttributeSet>,
+) -> Result<()> {
+    let tokens = crate::lexical::lex(callee_region)?;
+    let signing = ReturnAddressSigning::scan(callee_region, &tokens, &|group| {
+        group_signing(group, attribute_groups)
+    });
+    match signing.refusal() {
+        Some(why) => Err(Error::Unsupported(format!("{subject}: {why}"))),
+        None => Ok(()),
+    }
+}
+
+/// The `zeroext` / `signext` of a call's return value, read from the call's
+/// prefix (the text between `call` and the callee). The return type is the
+/// first type token there, as the call parsers read it.
+fn call_return_int_ext(prefix: &str, subject: &str) -> Result<IntExt> {
+    let tokens: Vec<&str> = prefix.split_whitespace().collect();
+    let Some(index) = tokens
+        .iter()
+        .position(|token| is_type_token(token) || *token == "void")
+    else {
+        return Ok(IntExt::Unstated);
+    };
+    let ext = return_int_ext(&tokens, index, subject)?;
+    if tokens[index] == "i1" {
+        refuse_unspellable_int_ext(&Ty::Bool, ext, &format!("{subject}, return value"))?;
+    }
+    Ok(ext)
+}
+
+/// State `sret` on parameter `index` of `func` (trust-ir `ParamAttrs::sret`).
+fn apply_sret(func: &mut Function, sret: Option<usize>) {
+    if let Some(index) = sret {
+        if func.attrs.params.len() <= index {
+            func.attrs.params.resize(index + 1, ParamAttrs::default());
+        }
+        func.attrs.params[index].sret = true;
+    }
+}
+
+fn describe_sret(sret: Option<usize>) -> String {
+    match sret {
+        Some(index) => format!("a hidden return-buffer (`sret`) parameter at index {index}"),
+        None => "no hidden return-buffer (`sret`) parameter".to_owned(),
+    }
+}
+
+fn parse_function_signature(
+    header: &FunctionHeader<'_>,
+    attribute_groups: &HashMap<String, FunctionAttributeSet>,
+) -> Result<FuncSignature> {
+    let (pre_at, params_str, attrs_after) = (header.pre_at, header.params_str, header.attrs_after);
+    let name = header.name.clone();
 
     // Return type: last token before `@`, ignoring parameter/function
     // attributes like `dso_local` / `internal` / `noundef` etc. Clang emits
@@ -6032,19 +9746,37 @@ fn parse_function_signature(
     // ONE return-type token instead of the three fragments `<4` / `x` /
     // `double>` — none of which `is_type_token` recognises, so the vector
     // return silently became `void`.
-    let mut tokens: Vec<&str> = split_top_level_ws(pre_at);
-    let mut ret_ty: Option<Ty> = None;
-    while let Some(t) = tokens.pop() {
-        if t == "void" {
-            ret_ty = None;
-            break;
+    //
+    // The return type is the LAST token (an `addrspace(N)` of a pointer
+    // return type aside): `parse_symbol_prefix` read every token before
+    // it. It must be `void` or a type `parse_ty` reads. A type it does not
+    // read used to be skipped for an earlier token, so `i064`, `[3 x i64]`,
+    // `{ i64, i64, i64 }` or `%struct.S` returned `void`; a call that drops
+    // such a result then skipped the hidden result buffer a large aggregate
+    // return needs.
+    let tokens: Vec<&str> = split_top_level_ws(pre_at);
+    let (type_tokens, pointer) = without_trailing_address_space(&tokens);
+    let ret_ty = match type_tokens.last() {
+        Some(&"void") if !pointer => None,
+        Some(token) if looks_like_a_type(token) && pointer => Some(Ty::Ptr),
+        Some(token) if !looks_like_a_type(token) => {
+            return Err(Error::Unsupported(format!(
+                "function `@{name}`: `{token}` stands where its return type must (the last \
+                 token before the name)"
+            )));
         }
-        if is_type_token(t) {
-            ret_ty = Some(parse_ty(t)?);
-            break;
+        Some(token) => Some(parse_ty(token).map_err(|error| match error {
+            Error::Unsupported(what) => {
+                Error::Unsupported(format!("function `@{name}`, return type: {what}"))
+            }
+            other => other,
+        })?),
+        None => {
+            return Err(Error::Unsupported(format!(
+                "function `@{name}`: no return type before its name"
+            )));
         }
-    }
-    let internal = pre_at.contains("internal") || pre_at.contains("private");
+    };
     let stack_protector = function_stack_protector_attr(pre_at, attrs_after, attribute_groups);
     let libm_pure_math = function_libm_pure_math_attr(pre_at, attrs_after, attribute_groups);
 
@@ -6084,9 +9816,11 @@ fn parse_function_signature(
         ret: ret_ty,
         params,
         is_vararg,
-        internal,
         stack_protector,
         libm_pure_math,
+        // The caller states the header's extensions (`function_param_abi`).
+        param_ext: Vec::new(),
+        ret_ext: IntExt::Unstated,
     })
 }
 
@@ -6104,11 +9838,14 @@ fn parse_block_label(line: &str) -> Option<String> {
     Some(colon.to_string())
 }
 
-fn body_starts_with_implicit_entry(body: &[(usize, String)]) -> bool {
+/// The label of the body's FIRST block, if it carries one. Intern this actual
+/// name before attaching function parameters; an unlabelled first block uses
+/// its LLVM implicit numeric name instead.
+fn first_block_label(body: &[(usize, String)]) -> Option<String> {
     body.iter()
         .map(|(_, raw)| raw.trim())
         .find(|line| !line.is_empty() && *line != "{" && *line != "}")
-        .is_some_and(|line| parse_block_label(line).is_none())
+        .and_then(parse_block_label)
 }
 
 fn implicit_entry_block_label(sig: &FuncSignature) -> String {
@@ -6333,18 +10070,61 @@ fn strip_cast_flags(rest: &str) -> &str {
 ///   * `llvm.prefetch` — a cache hint.
 ///   * `llvm.invariant.start/end`, `llvm.experimental.noalias.scope.decl`,
 ///     `llvm.var.annotation`, `llvm.sideeffect` — analysis-only markers.
+///
+/// Each is matched as LLVM's `Intrinsic::lookupIntrinsicID` matches a name
+/// ([`names_intrinsic`]; whether each is overloaded is read from LLVM
+/// 22.1.2's `Intrinsics.td`, which defines no longer intrinsic name that
+/// extends any of them): a name LLVM 22 does not define (`llvm.assumex`,
+/// `llvm.sideeffect.x`, `llvm.dbg.custom`) is an ordinary external function
+/// to llc, which calls it, and is not dropped.
+const DROPPABLE_INTRINSICS: [(&str, bool); 14] = [
+    ("llvm.assume", false),
+    ("llvm.dbg.assign", false),
+    ("llvm.dbg.declare", false),
+    ("llvm.dbg.label", false),
+    ("llvm.dbg.value", false),
+    ("llvm.donothing", false),
+    ("llvm.experimental.noalias.scope.decl", false),
+    ("llvm.invariant.end", true),
+    ("llvm.invariant.start", true),
+    ("llvm.lifetime.end", true),
+    ("llvm.lifetime.start", true),
+    ("llvm.prefetch", true),
+    ("llvm.sideeffect", false),
+    ("llvm.var.annotation", true),
+];
+
 fn is_droppable_intrinsic(name: &str) -> bool {
-    name.starts_with("llvm.lifetime.start")
-        || name.starts_with("llvm.lifetime.end")
-        || name.starts_with("llvm.dbg.")
-        || name.starts_with("llvm.assume")
-        || name.starts_with("llvm.donothing")
-        || name.starts_with("llvm.prefetch")
-        || name.starts_with("llvm.invariant.start")
-        || name.starts_with("llvm.invariant.end")
-        || name.starts_with("llvm.experimental.noalias.scope.decl")
-        || name.starts_with("llvm.var.annotation")
-        || name.starts_with("llvm.sideeffect")
+    DROPPABLE_INTRINSICS
+        .iter()
+        .any(|&(intrinsic, overloaded)| names_intrinsic(name, intrinsic, overloaded))
+}
+
+/// Whether the function name `name` names the intrinsic `intrinsic` as
+/// LLVM's `Intrinsic::lookupIntrinsicID` reads it: exactly, or, for an
+/// overloaded intrinsic, followed by `.` and its type suffix
+/// (`llvm.lifetime.start.p0`), which LLVM's verifier checks against the
+/// call's types. The caller makes sure no longer intrinsic name LLVM
+/// defines extends `intrinsic` at a `.` (LLVM takes the longest).
+fn names_intrinsic(name: &str, intrinsic: &str, overloaded: bool) -> bool {
+    match name.strip_prefix(intrinsic) {
+        Some("") => true,
+        Some(suffix) => overloaded && suffix.starts_with('.'),
+        None => false,
+    }
+}
+
+/// Whether `name` names LLVM's `llvm.memcpy`, `llvm.memmove` or
+/// `llvm.memset` (`base`), which the adapter lowers as `memcpy`, `memmove`
+/// or `memset`: [`names_intrinsic`], but not the distinct intrinsics whose
+/// names LLVM 22.1.2 extends them with (`llvm.memcpy.inline`,
+/// `llvm.memset.inline`, and the `.element.unordered.atomic` forms, which
+/// llc expands inline or calls `__llvm_memcpy_element_unordered_atomic_N`
+/// for), nor `llvm.memcpyx`, an ordinary function to LLVM.
+fn names_memory_intrinsic(name: &str, base: &str) -> bool {
+    names_intrinsic(name, base, true)
+        && !names_intrinsic(name, &format!("{base}.inline"), true)
+        && !names_intrinsic(name, &format!("{base}.element.unordered.atomic"), true)
 }
 
 /// LLVM intrinsics that `trust-cg-lower`'s adapter recognizes by callee name and
@@ -6356,9 +10136,9 @@ fn is_droppable_intrinsic(name: &str) -> bool {
 /// intrinsic the adapter does not rewrite would survive as an unresolved symbol
 /// and fail to link, so anything not listed here stays `unsupported`.
 fn is_lowered_passthrough_intrinsic(name: &str) -> bool {
-    name.starts_with("llvm.memcpy")
-        || name.starts_with("llvm.memmove")
-        || name.starts_with("llvm.memset")
+    names_memory_intrinsic(name, "llvm.memcpy")
+        || names_memory_intrinsic(name, "llvm.memmove")
+        || names_memory_intrinsic(name, "llvm.memset")
         || name == "llvm.bitreverse.i32"
         || name == "llvm.bitreverse.i64"
         || name.starts_with("llvm.objectsize.")
@@ -6460,35 +10240,50 @@ fn funnel_shift_is_left(name: &str) -> Option<bool> {
 /// trust-cg and the `clang -O3` reference resolve these out of the SAME
 /// libSystem libm, so results are bit-exact.
 ///
+/// The suffix is read for the type because a call or declaration whose
+/// suffix is not the one LLVM gives its type is refused
+/// ([`check_intrinsic_name_mangles_its_type`]; LLVM reads the type).
+///
 /// Only transcendental / power functions that lack a native machine encoding go
 /// here. Sign/rounding/sqrt intrinsics with an exact AArch64 instruction
 /// (`fabs`, `sqrt`, `floor`, `ceil`, `trunc`) are lowered natively instead (see
 /// `fp_unary_intrinsic_op`) and MUST NOT appear in this table.
 fn libm_intrinsic_symbol(name: &str) -> Option<&'static str> {
-    // (llvm family prefix, f64 symbol, f32 symbol)
-    const TABLE: &[(&str, &str, &str)] = &[
-        ("llvm.sin.", "sin", "sinf"),
-        ("llvm.cos.", "cos", "cosf"),
-        ("llvm.tan.", "tan", "tanf"),
-        ("llvm.asin.", "asin", "asinf"),
-        ("llvm.acos.", "acos", "acosf"),
-        ("llvm.atan.", "atan", "atanf"),
-        ("llvm.atan2.", "atan2", "atan2f"),
-        ("llvm.sinh.", "sinh", "sinhf"),
-        ("llvm.cosh.", "cosh", "coshf"),
-        ("llvm.tanh.", "tanh", "tanhf"),
-        ("llvm.exp.", "exp", "expf"),
-        ("llvm.exp2.", "exp2", "exp2f"),
-        ("llvm.log.", "log", "logf"),
-        ("llvm.log2.", "log2", "log2f"),
-        ("llvm.log10.", "log10", "log10f"),
-        ("llvm.pow.", "pow", "powf"),
-    ];
-    for &(prefix, f64_sym, f32_sym) in TABLE {
+    libm_intrinsic(name).map(|(symbol, _, _)| symbol)
+}
+
+/// The libm intrinsic families [`libm_intrinsic_symbol`] renames: (LLVM
+/// family prefix, `f64` symbol, `f32` symbol, operand count). Each family
+/// takes its operands at its result's type, `llvm.atan2` and `llvm.pow` two
+/// and the others one (`Intrinsics.td`; llc 22.1.2 built a call of each at
+/// that count and refused it at the others).
+const LIBM_INTRINSICS: &[(&str, &str, &str, usize)] = &[
+    ("llvm.sin.", "sin", "sinf", 1),
+    ("llvm.cos.", "cos", "cosf", 1),
+    ("llvm.tan.", "tan", "tanf", 1),
+    ("llvm.asin.", "asin", "asinf", 1),
+    ("llvm.acos.", "acos", "acosf", 1),
+    ("llvm.atan.", "atan", "atanf", 1),
+    ("llvm.atan2.", "atan2", "atan2f", 2),
+    ("llvm.sinh.", "sinh", "sinhf", 1),
+    ("llvm.cosh.", "cosh", "coshf", 1),
+    ("llvm.tanh.", "tanh", "tanhf", 1),
+    ("llvm.exp.", "exp", "expf", 1),
+    ("llvm.exp2.", "exp2", "exp2f", 1),
+    ("llvm.log.", "log", "logf", 1),
+    ("llvm.log2.", "log2", "log2f", 1),
+    ("llvm.log10.", "log10", "log10f", 1),
+    ("llvm.pow.", "pow", "powf", 2),
+];
+
+/// The libm intrinsic `name` names, by [`LIBM_INTRINSICS`]: its C symbol,
+/// its floating-point type and its operand count, or `None`.
+fn libm_intrinsic(name: &str) -> Option<(&'static str, Ty, usize)> {
+    for &(prefix, f64_sym, f32_sym, operands) in LIBM_INTRINSICS {
         if let Some(suffix) = name.strip_prefix(prefix) {
             return match suffix {
-                "f64" => Some(f64_sym),
-                "f32" => Some(f32_sym),
+                "f64" => Some((f64_sym, Ty::F64, operands)),
+                "f32" => Some((f32_sym, Ty::F32, operands)),
                 // Other widths (f16/f128/vector `vNf..`) have no matching libm
                 // entry point here; fall through so the intrinsic classifier
                 // fails closed rather than emitting a wrong-width call.
@@ -6497,6 +10292,289 @@ fn libm_intrinsic_symbol(name: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// The function type of the libm intrinsic `name` ([`libm_intrinsic`]):
+/// `double (double)` for `llvm.sin.f64`, `float (float, float)` for
+/// `llvm.pow.f32`. LLVM lowers the intrinsic to a call of its C symbol at
+/// this type, whatever the module declares the symbol as (LD-100 rule 10).
+fn libm_intrinsic_function_type(name: &str) -> Option<StatedCallType> {
+    let (_, ty, operands) = libm_intrinsic(name)?;
+    Some(StatedCallType {
+        ret: Some(ty.clone()),
+        params: vec![ty; operands],
+        is_vararg: false,
+    })
+}
+
+/// The suffix LLVM 22.1.2's `Intrinsic::getName` writes for the overloaded
+/// type `ty` (`getMangledTypeStr`: `i32`, `f64`, `p0`), for the types a
+/// call's or declaration's reader gives an operand (`parse_ty`: a vector
+/// operand reaches the vector expander instead), or `None`, which refuses.
+fn llvm_mangled_type(ty: &Ty) -> Option<&'static str> {
+    Some(match ty {
+        Ty::Bool => "i1",
+        Ty::I8 => "i8",
+        Ty::I16 => "i16",
+        Ty::I32 => "i32",
+        Ty::I64 => "i64",
+        Ty::I128 => "i128",
+        Ty::F16 => "f16",
+        Ty::F32 => "f32",
+        Ty::F64 => "f64",
+        Ty::Ptr => "p0",
+        _ => return None,
+    })
+}
+
+/// Where an overloaded intrinsic's type is read: its result, or a
+/// parameter by index.
+#[derive(Clone, Copy, Debug)]
+enum OverloadedType {
+    Result,
+    Param(usize),
+}
+
+/// The overloaded intrinsics this importer reads (lowers, rewrites or
+/// passes to the adapter, which reads some by name: `llvm.bitreverse.i32`,
+/// `llvm.objectsize.i64.p0`, `llvm.fma.f64`), each with the types LLVM
+/// 22.1.2 writes into its name, in order (each `llvm_any*_ty` of its
+/// definition in `Intrinsics.td`). The droppable intrinsics are not read by
+/// their types and are not listed.
+/// `parser::tests::overloaded_intrinsic_table_is_complete` requires the
+/// table to hold exactly the target-independent overloaded intrinsics of
+/// `Intrinsics.td` (the committed extract,
+/// `tests/fixtures/llvm22_library_names.json`) that the call readers read
+/// under some type suffixes, each with LLVM's overloaded types.
+const OVERLOADED_INTRINSICS: &[(&str, &[OverloadedType])] = &[
+    ("llvm.sin", &[OverloadedType::Result]),
+    ("llvm.cos", &[OverloadedType::Result]),
+    ("llvm.tan", &[OverloadedType::Result]),
+    ("llvm.asin", &[OverloadedType::Result]),
+    ("llvm.acos", &[OverloadedType::Result]),
+    ("llvm.atan", &[OverloadedType::Result]),
+    ("llvm.atan2", &[OverloadedType::Result]),
+    ("llvm.sinh", &[OverloadedType::Result]),
+    ("llvm.cosh", &[OverloadedType::Result]),
+    ("llvm.tanh", &[OverloadedType::Result]),
+    ("llvm.exp", &[OverloadedType::Result]),
+    ("llvm.exp2", &[OverloadedType::Result]),
+    ("llvm.log", &[OverloadedType::Result]),
+    ("llvm.log2", &[OverloadedType::Result]),
+    ("llvm.log10", &[OverloadedType::Result]),
+    ("llvm.pow", &[OverloadedType::Result]),
+    ("llvm.fabs", &[OverloadedType::Result]),
+    ("llvm.sqrt", &[OverloadedType::Result]),
+    ("llvm.floor", &[OverloadedType::Result]),
+    ("llvm.ceil", &[OverloadedType::Result]),
+    ("llvm.trunc", &[OverloadedType::Result]),
+    ("llvm.fma", &[OverloadedType::Result]),
+    ("llvm.fmuladd", &[OverloadedType::Result]),
+    ("llvm.smax", &[OverloadedType::Result]),
+    ("llvm.smin", &[OverloadedType::Result]),
+    ("llvm.umax", &[OverloadedType::Result]),
+    ("llvm.umin", &[OverloadedType::Result]),
+    ("llvm.abs", &[OverloadedType::Result]),
+    ("llvm.fshl", &[OverloadedType::Result]),
+    ("llvm.fshr", &[OverloadedType::Result]),
+    ("llvm.bitreverse", &[OverloadedType::Result]),
+    (
+        "llvm.objectsize",
+        &[OverloadedType::Result, OverloadedType::Param(0)],
+    ),
+    (
+        "llvm.memcpy",
+        &[
+            OverloadedType::Param(0),
+            OverloadedType::Param(1),
+            OverloadedType::Param(2),
+        ],
+    ),
+    (
+        "llvm.memmove",
+        &[
+            OverloadedType::Param(0),
+            OverloadedType::Param(1),
+            OverloadedType::Param(2),
+        ],
+    ),
+    (
+        "llvm.memset",
+        &[OverloadedType::Param(0), OverloadedType::Param(2)],
+    ),
+    (
+        "llvm.experimental.memset.pattern",
+        &[
+            OverloadedType::Param(0),
+            OverloadedType::Param(1),
+            OverloadedType::Param(2),
+        ],
+    ),
+];
+
+/// Refuse an intrinsic of [`OVERLOADED_INTRINSICS`] whose name is not the
+/// one LLVM 22.1.2 gives its function type `ret (params)` (the call's, or
+/// the declaration's). LLVM reads an overloaded intrinsic by its name up to
+/// the type suffixes (`Intrinsic::lookupIntrinsicID`), reads its types
+/// from the function type, and renames it to match
+/// (`Intrinsic::remangleIntrinsicFunction`, from the parser's
+/// `UpgradeCallsToIntrinsic`; a call of an undeclared intrinsic is declared
+/// from the call's type): `declare double @llvm.sin.f32(double)` is
+/// `@llvm.sin.f64` to llc 22.1.2 (`opt -S` prints that), which calls `sin`.
+/// This importer, and the adapter after it, read an intrinsic by its name,
+/// so a name whose suffixes differ from its type's is refused (seventh
+/// verifier round of L02-P15: llc's build printed sin(0.5) = 0.479 and
+/// powf(3, 2) = 9, the importer's `sinf` 0.5 and `pow` with float
+/// arguments 0). `memcpy`, `memmove` and `memset` are matched as
+/// [`names_memory_intrinsic`] matches them; the other families have no
+/// longer intrinsic name extending them at a `.` in LLVM 22.1.2.
+fn check_intrinsic_name_mangles_its_type(
+    name: &str,
+    ret: Option<&Ty>,
+    params: &[Ty],
+    subject: &str,
+) -> Result<()> {
+    let Some((family, overloads)) = overloaded_intrinsic_family(name) else {
+        return Ok(());
+    };
+    let mut expected = family.to_string();
+    for overload in overloads {
+        let ty = match *overload {
+            OverloadedType::Result => ret,
+            OverloadedType::Param(index) => params.get(index),
+        };
+        let Some(suffix) = ty.and_then(llvm_mangled_type) else {
+            return Err(Error::Unsupported(format!(
+                "{subject} `@{name}`: its {overload:?} type is no type this importer reads as \
+                 an overloaded intrinsic's (LLVM names the intrinsic by its types, this \
+                 importer reads it by its name)"
+            )));
+        };
+        expected.push('.');
+        expected.push_str(suffix);
+    }
+    if name == expected {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "{subject} `@{name}`: LLVM reads an overloaded intrinsic's types from its function type \
+         and names this one `@{expected}` (it renames the declaration to match), while this \
+         importer reads an intrinsic by its name; refused where the name's type suffixes differ \
+         from its type's"
+    )))
+}
+
+/// The entry of [`OVERLOADED_INTRINSICS`] that `name` names, as LLVM's
+/// `Intrinsic::lookupIntrinsicID` matches a name (`memcpy`, `memmove` and
+/// `memset` as [`names_memory_intrinsic`] matches them), or `None`.
+fn overloaded_intrinsic_family(name: &str) -> Option<(&'static str, &'static [OverloadedType])> {
+    OVERLOADED_INTRINSICS
+        .iter()
+        .find(|&&(family, _)| match family {
+            "llvm.memcpy" | "llvm.memmove" | "llvm.memset" => names_memory_intrinsic(name, family),
+            _ => names_intrinsic(name, family, true),
+        })
+        .copied()
+}
+
+/// The overloaded intrinsic family `name` names among those the vector
+/// expander reads (`crate::vector`: the elementwise families, each
+/// overloaded on its result, and the `llvm.vector.reduce.*` folds it reads,
+/// each overloaded on its vector operand, the second parameter of `fadd` and
+/// `fmul`, which take a start value first), with LLVM 22.1.2's overloaded
+/// types (`parser::tests::overloaded_intrinsic_table_is_complete` reads them
+/// from `Intrinsics.td`), or `None`.
+fn vector_intrinsic_family(name: &str) -> Option<(String, Vec<OverloadedType>)> {
+    if let Some(after) = name.strip_prefix("llvm.vector.reduce.") {
+        let op = after.split('.').next().unwrap_or("");
+        let family = format!("llvm.vector.reduce.{op}");
+        if crate::vector::reduce_scalar_op(op).is_none() || !names_intrinsic(name, &family, true) {
+            return None;
+        }
+        let operand = if matches!(op, "fadd" | "fmul") { 1 } else { 0 };
+        return Some((family, vec![OverloadedType::Param(operand)]));
+    }
+    crate::vector::ELEMENTWISE_INTRINSICS
+        .iter()
+        .map(|family| format!("llvm.{family}"))
+        .find(|family| names_intrinsic(name, family, true))
+        .map(|family| (family, vec![OverloadedType::Result]))
+}
+
+/// Refuse a declaration of an overloaded intrinsic this importer reads
+/// ([`OVERLOADED_INTRINSICS`], or a family the vector expander reads,
+/// [`vector_intrinsic_family`]) whose stated types include a vector and
+/// whose name is not the one LLVM 22.1.2 gives those types
+/// (`getMangledTypeStr`: `v4f32` for `<4 x float>`). The signature reader
+/// does not read a vector type, so such a declaration was passed over and
+/// only its calls were read, by their own types: `declare <4 x float>
+/// @llvm.sin.v2f64(<4 x float>)` beside a call of `@llvm.sin.v2f64` with
+/// `<2 x double>` was admitted and ran, where LLVM renames the declaration
+/// `@llvm.sin.v4f32` and its verifier rejects the call ("Intrinsic called
+/// with incompatible signature"; the closure audit of L02-P15, 2026-10-16).
+/// A call is read under the name its own types give
+/// (`check_intrinsic_name_mangles_its_type`, `crate::vector::expand_call`),
+/// so a call whose types differ from its declaration's is refused at one of
+/// the two. Refusing a declaration no call uses, which LLVM renames, is a
+/// stated over-refusal.
+fn check_vector_typed_intrinsic_declaration(name: &str, header: &FunctionHeader<'_>) -> Result<()> {
+    if !crate::vector::mentions_vector_type(header.pre_at)
+        && !crate::vector::mentions_vector_type(header.params_str)
+    {
+        return Ok(());
+    }
+    let (family, overloads) = match overloaded_intrinsic_family(name) {
+        Some((family, overloads)) => (family.to_string(), overloads.to_vec()),
+        None => match vector_intrinsic_family(name) {
+            Some(found) => found,
+            None => return Ok(()),
+        },
+    };
+    let tokens = split_top_level_ws(header.pre_at);
+    let (type_tokens, _) = without_trailing_address_space(&tokens);
+    let ret = type_tokens
+        .last()
+        .copied()
+        .filter(|&token| token != "void")
+        .map(str::to_string);
+    let params: Vec<String> = if header.params_str.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_call_args(header.params_str)
+            .iter()
+            .map(|param| {
+                split_top_level_ws(param.trim())
+                    .first()
+                    .map_or_else(String::new, |ty| (*ty).to_string())
+            })
+            .collect()
+    };
+    let mut expected = family;
+    for overload in &overloads {
+        let ty = match *overload {
+            OverloadedType::Result => ret.as_deref(),
+            OverloadedType::Param(index) => params.get(index).map(String::as_str),
+        };
+        let Some(suffix) = ty.and_then(crate::vector::mangled_type_text) else {
+            return Err(Error::Unsupported(format!(
+                "declaration of `@{name}`: its {overload:?} type is no type this importer reads \
+                 as an overloaded intrinsic's (LLVM names the intrinsic by its types, this \
+                 importer reads it by its name)"
+            )));
+        };
+        expected.push('.');
+        expected.push_str(&suffix);
+    }
+    if name == expected {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "declaration of `@{name}`: LLVM reads an overloaded intrinsic's types from its function \
+         type and names this one `@{expected}` (it renames the declaration to match, and its \
+         verifier rejects a call of it with other types), while this importer reads the \
+         declaration's calls by their own types; refused where the name's type suffixes differ \
+         from the declared types'"
+    )))
 }
 
 /// Split a leading type token off `<type> <value>`, respecting nested
@@ -6673,46 +10751,159 @@ enum FpLit {
 ///   * Extended-precision tag:  `0xK...`, `0xL...`, `0xM...`, `0xR...`
 ///     — returned as `FpLit::Extended(tag)` so the caller can emit an
 ///     `Unsupported` error with a precise reason.
+///
+/// Only LLVM's own spellings are read (`LLLexer::LexDigitOrNegative`,
+/// `LexPositive`, `Lex0x`): a decimal needs its `.` (`2` is an integer
+/// literal), a hex pattern its lowercase `0x` and an uppercase type tag, and
+/// there are no named specials (`inf`, `nan`); anything else is `None`.
 fn parse_fp_literal(s: &str) -> Option<FpLit> {
     let s = s.trim();
-    // Named specials (rare in clang output but legal).
-    if s.eq_ignore_ascii_case("inf") || s.eq_ignore_ascii_case("+inf") {
-        return Some(FpLit::Double(f64::INFINITY));
-    }
-    if s.eq_ignore_ascii_case("-inf") {
-        return Some(FpLit::Double(f64::NEG_INFINITY));
-    }
-    if s.eq_ignore_ascii_case("nan") {
-        return Some(FpLit::Double(f64::NAN));
-    }
-
     // Hex bit patterns. LLVM uses an optional type tag after `0x`:
-    //   0x<16 hex>            → f64 bit pattern (IEEE double)
+    //   0x<hex>               → f64 bit pattern (IEEE double), at most 64 bits
     //   0xK<hex>              → x86 80-bit
     //   0xL<hex>              → ppc_fp128
     //   0xM<hex>              → IEEE f128
     //   0xH<hex>              → half (f16)
     //   0xR<hex>              → bfloat16
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        let first = rest.chars().next()?;
-        if first.is_ascii_hexdigit() {
-            // Plain 64-bit hex pattern.
-            let bits = u64::from_str_radix(rest, 16).ok()?;
-            return Some(FpLit::Double(f64::from_bits(bits)));
-        } else if matches!(first, 'H' | 'h') {
-            let bits = u16::from_str_radix(&rest[1..], 16).ok()?;
-            return Some(FpLit::Half(f16_bits_to_f64(bits)));
-        } else if matches!(first, 'K' | 'L' | 'M' | 'R' | 'k' | 'l' | 'm' | 'r') {
-            return Some(FpLit::Extended(first.to_ascii_uppercase()));
-        } else {
+    if let Some(rest) = s.strip_prefix("0x") {
+        let (tag, digits) = match rest.as_bytes().first()? {
+            tag @ (b'H' | b'K' | b'L' | b'M' | b'R') => (Some(*tag as char), &rest[1..]),
+            _ => (None, rest),
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
+        return match tag {
+            None => u64::from_str_radix(digits, 16)
+                .ok()
+                .map(|bits| FpLit::Double(f64::from_bits(bits))),
+            Some('H') => u16::from_str_radix(digits, 16)
+                .ok()
+                .map(|bits| FpLit::Half(f16_bits_to_f64(bits))),
+            Some(tag) => Some(FpLit::Extended(tag)),
+        };
     }
 
-    // Decimal.
+    // Decimal: `[-+]?[0-9]+[.][0-9]*([eE][-+]?[0-9]+)?`.
+    let unsigned = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (whole, rest) = unsigned.split_once('.')?;
+    let (fraction, exponent) = match rest.find(['e', 'E']) {
+        Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+        None => (rest, None),
+    };
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    let exponent_ok = exponent.is_none_or(|exponent| {
+        let exponent = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
+        !exponent.is_empty() && digits(exponent)
+    });
+    if whole.is_empty() || !digits(whole) || !digits(fraction) || !exponent_ok {
+        return None;
+    }
     s.parse::<f64>().ok().map(FpLit::Double)
 }
 
+/// The IEEE half encoding of `value` when converting the double `value` to
+/// half loses nothing (LLVM's `ConstantFP::isValueValidForType`), else
+/// `None`.
+fn exact_half_bits(value: f64) -> Option<u16> {
+    let bits = value.to_bits();
+    let sign = ((bits >> 63) as u16) << 15;
+    let exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let low = |count: u32| fraction & ((1u64 << count) - 1);
+    if exponent == 0x7ff {
+        if fraction == 0 {
+            return Some(sign | 0x7c00);
+        }
+        return (low(42) == 0).then_some(sign | 0x7c00 | (fraction >> 42) as u16);
+    }
+    if exponent == 0 {
+        return (fraction == 0).then_some(sign);
+    }
+    let unbiased = exponent - 1023;
+    if unbiased > 15 {
+        return None;
+    }
+    if unbiased >= -14 {
+        return (low(42) == 0)
+            .then_some(sign | (((unbiased + 15) as u16) << 10) | (fraction >> 42) as u16);
+    }
+    // A half subnormal: the significand shifted right by more than 42.
+    let shift = 42 + (-14 - unbiased) as u32;
+    if shift >= 53 {
+        return None;
+    }
+    let significand = (1u64 << 52) | fraction;
+    (significand & ((1u64 << shift) - 1) == 0).then_some(sign | (significand >> shift) as u16)
+}
+
+/// Read the floating-point literal `tok` as a constant of the floating-point
+/// type `ty`, as LLVM reads one: its lexer ([`parse_fp_literal`]), then
+/// `convertValIDToValue`, which rejects an integer literal ("integer
+/// constant must have integer type"), a `0xH` literal for a type other than
+/// `half` and a value the type cannot hold exactly ("floating point constant
+/// invalid for type": `float 0.1`, `float 0x3FB999999999999A`). A `0xH` NaN
+/// keeps its sign and payload ([`f16_bits_to_f64`]). A signaling NaN for
+/// `half` or `float`, in either spelling, is refused too: LLVM keeps it
+/// signaling, and the backend's narrowing of the double it is carried as
+/// would quiet it.
+fn fp_literal_constant(tok: &str, ty: &Ty) -> Result<f64> {
+    let tok = tok.trim();
+    let refuse = |why: &str| {
+        Err(Error::Unsupported(format!(
+            "floating-point constant `{tok}` of type `{ty:?}`: {why}"
+        )))
+    };
+    let Some(literal) = parse_fp_literal(tok) else {
+        if parse_int_literal(tok).is_some() {
+            return refuse(
+                "an integer literal (LLVM's parser rejects it: \"integer constant must have \
+                 integer type\")",
+            );
+        }
+        return refuse("not an LLVM floating-point literal");
+    };
+    let value = match (literal, ty) {
+        (FpLit::Extended(tag), _) => {
+            return refuse(&format!(
+                "an extended-precision `0x{tag}` literal (trust_ir only has f16/f32/f64)"
+            ));
+        }
+        // Exact by construction; a signaling NaN is refused below.
+        (FpLit::Half(value), Ty::F16) => value,
+        (FpLit::Half(_), _) => {
+            return refuse("a half (`0xH`) literal for another type (LLVM's parser rejects it)");
+        }
+        (FpLit::Double(value), _) => value,
+    };
+    let signaling = value.is_nan() && value.to_bits() & (1u64 << 51) == 0;
+    let exact = match ty {
+        Ty::F64 => true,
+        Ty::F32 if value.is_nan() => value.to_bits() & ((1u64 << 29) - 1) == 0,
+        Ty::F32 => f64::from(value as f32).to_bits() == value.to_bits(),
+        Ty::F16 => exact_half_bits(value).is_some(),
+        _ => return refuse("not a floating-point type"),
+    };
+    if !exact {
+        return refuse(
+            "a value the type cannot hold exactly (LLVM's parser rejects it: \"floating point \
+             constant invalid for type\")",
+        );
+    }
+    if signaling && !matches!(ty, Ty::F64) {
+        return refuse(
+            "a signaling NaN narrowed to `half` or `float` (LLVM keeps it signaling; this \
+             importer carries it as a double, whose narrowing would quiet it)",
+        );
+    }
+    Ok(value)
+}
+
+/// The double that holds the IEEE half `bits` exactly, as LLVM's `APFloat`
+/// widens it: a NaN keeps its sign, its quiet bit and its payload (the half's
+/// ten fraction bits become the double's top ten), so `0xHFE00` is a negative
+/// quiet NaN and `0xH7C01` a signaling one, which [`fp_literal_constant`]
+/// refuses as it refuses any signaling NaN narrowed to `half`.
 fn f16_bits_to_f64(bits: u16) -> f64 {
     let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
     let exp = ((bits >> 10) & 0x1f) as i32;
@@ -6721,7 +10912,9 @@ fn f16_bits_to_f64(bits: u16) -> f64 {
         0 if frac == 0 => sign * 0.0,
         0 => sign * f64::from(frac) * 2f64.powi(-24),
         0x1f if frac == 0 => sign * f64::INFINITY,
-        0x1f => f64::NAN,
+        0x1f => f64::from_bits(
+            (u64::from(bits & 0x8000) << 48) | (0x7ffu64 << 52) | (u64::from(frac) << 42),
+        ),
         _ => sign * (1.0 + f64::from(frac) / 1024.0) * 2f64.powi(exp - 15),
     }
 }
@@ -6764,21 +10957,11 @@ fn parse_ty(s: &str) -> Result<Ty> {
     }
 }
 
-/// Kill switch for lane-scalarizing vector import (`TCG_NO_VECTOR_IMPORT=1`).
-///
-/// With it set, `parse_body_line` never consults [`crate::vector`], so every
-/// vector construct falls back to the historical `parse_ty` rejection and the
-/// importer produces byte-identical objects for every program that imported
-/// before the expander existed.
-fn vector_import_disabled() -> bool {
-    std::env::var_os("TCG_NO_VECTOR_IMPORT").is_some_and(|v| v != "0")
-}
-
-fn align_up(value: u64, align: u64) -> u64 {
+fn checked_align_up(value: u64, align: u64) -> Option<u64> {
     if align <= 1 {
-        value
+        Some(value)
     } else {
-        value.div_ceil(align) * align
+        value.div_ceil(align).checked_mul(align)
     }
 }
 
@@ -6813,16 +10996,14 @@ fn format_ty_for_array_error(ty: &Ty) -> &'static str {
     }
 }
 
+/// The little-endian bytes of the integer literal `value` written for an
+/// `i{bits}` array element, as LLVM reads it: its low `bits` bits (`LLParser`'s
+/// `APSInt::extOrTrunc`; llc 22.1.2 stores `[2 x i8] [i8 300, i8 1]` as the
+/// bytes 44 and 1), whatever its range. `None` for another width.
 fn integer_literal_to_le_byte_constants(value: i128, bits: u32) -> Option<Vec<Constant>> {
     if !matches!(bits, 8 | 16 | 32 | 64) {
         return None;
     }
-    let signed_min = -(1i128 << (bits - 1));
-    let unsigned_max_exclusive = 1i128 << bits;
-    if value < signed_min || value >= unsigned_max_exclusive {
-        return None;
-    }
-
     let mask = (1u128 << bits) - 1;
     let raw = (value as u128) & mask;
     let byte_count = (bits / 8) as usize;
@@ -6832,18 +11013,6 @@ fn integer_literal_to_le_byte_constants(value: i128, bits: u32) -> Option<Vec<Co
         out.push(Constant::Int(byte));
     }
     Some(out)
-}
-
-fn scalar_integer_global_to_le_byte_constants(ty: &Ty, value: &Constant) -> Option<Vec<Constant>> {
-    let value = match value {
-        Constant::Int(v) => *v,
-        // A Bool initializer (from `parse_scalar_global_initializer`) has the
-        // same little-endian byte image as its 0/1 integer value.
-        Constant::Bool(b) => *b as i128,
-        _ => return None,
-    };
-    let bits = explicit_integer_array_elem_bits(ty)?;
-    integer_literal_to_le_byte_constants(value, bits)
 }
 
 fn is_integer_ty(ty: &Ty) -> bool {
@@ -6869,13 +11038,1586 @@ fn is_scalar_global_ty(ty: &Ty) -> bool {
     )
 }
 
-fn parse_linkage(lower: &str) -> Linkage {
-    if lower.contains("private") {
-        Linkage::Private
-    } else if lower.contains("internal") {
-        Linkage::Internal
-    } else {
-        Linkage::External
+// --------------------------------------------------------------------------
+// Symbol facts: linkage, visibility, COMDAT and section
+// --------------------------------------------------------------------------
+//
+// LLVM spells a symbol's link-time facts as keywords before a function's
+// return type or a global's storage class, and as clauses after a function's
+// parameter list or a global's initializer. Each one is carried onto the
+// trust-ir fact the backend honours, dropped where dropping it is sound (the
+// reason is stated below), or refused by name. None defaults silently.
+//
+// * Linkage. `private`, `internal`, `available_externally`, `linkonce`,
+//   `weak`, `extern_weak`, `linkonce_odr`, `weak_odr` and `external` map 1:1
+//   onto `trust_ir::Linkage` wherever LLVM allows them (`LlvmLinkage`).
+//   `common` and `appending` have no trust-ir linkage and are refused (the
+//   `@llvm.used` / `@llvm.compiler.used` metadata arrays are read before
+//   this and never become globals). A linkage LLVM forbids in the position
+//   (a declaration that is not `external`/`extern_weak`, an `extern_weak`
+//   definition, an `external` or `extern_weak` global with an initializer, a
+//   defining linkage on a global without one) is refused as well.
+// * Visibility (`default`, `hidden`, `protected`) is carried on function
+//   definitions, function declarations and globals. Non-default visibility
+//   on an `internal`/`private` symbol is refused: LLVM's verifier rejects it
+//   and trust-ir calls the pair contradictory.
+// * `dso_local` / `dso_preemptable` are dropped (trust-ir has no such fact),
+//   but for the refusals of
+//   `Parser::refuse_dso_local_addressing_llc_writes_otherwise` (LD-31).
+//   `dso_local` PERMITS a code generator to assume the symbol resolves
+//   inside the linked image, and llc 22 then addresses it PC-relative where
+//   it otherwise uses the GOT. The keyword changes llc's form only for a
+//   default-visibility symbol that is neither local nor `extern_weak`
+//   (`SymbolPrefix::dso_local_changes_addressing`). The backend decides its
+//   forms from linkage, visibility and relocation model: every declaration
+//   through the GOT, and a default-visibility definition through the GOT
+//   and the PLT in `pic` code, PC-relative otherwise. So for a declaration
+//   for the linker (a data or function declaration, an
+//   `available_externally` global or function) llc's form and the
+//   backend's differ under every relocation model; in a non-PIE executable
+//   they name one address unless the link gives the symbol two (a library
+//   binding its own references, `-Bsymbolic`, `-Bsymbolic-functions`, or
+//   gold with a library's function; protected definitions fail llc's
+//   object to link: LD-31), so one whose address the module's code takes
+//   is refused by name unless the caller states an AArch64 ELF compile
+//   under `static` (`import_text_for_compile`), and one an
+//   `available_externally` body addresses is refused where the backend may
+//   splice the body and its definition may be in a shared library; a
+//   direct call and an initializer's pointer are written alike, and stay
+//   admitted. For a
+//   definition the two forms are equal under `static` and `pie`. Under
+//   `pic` llc binds the module's own references to it locally (through an
+//   `.L<name>$local` alias for an `external` one), where the backend's go
+//   through the GOT and the PLT, which an interposer the `dso_local` promise
+//   excludes can take: a referenced one is refused under a stated `pic`,
+//   and admitted with no model stated (LIMITATIONS states the difference).
+// * `unnamed_addr` / `local_unnamed_addr` are dropped. They PERMIT merging the
+//   symbol with an equal one because its address is insignificant; the
+//   backend never merges symbols, so every address stays distinct, which an
+//   address-significant symbol would need anyway. One placement depends on
+//   `unnamed_addr`: LLVM puts such a constant in a mergeable section
+//   (`SHF_MERGE`), so linkers may fold llc's equal constants, which
+//   `unnamed_addr` permits. In an implicit section that is all; in an
+//   explicit section it also splits the members a `__start_`/`__stop_` walk
+//   reads, so a mergeable `unnamed_addr` constant with a `section` clause is
+//   refused by name (`Parser::llvm_constant_is_mergeable`).
+// * An `available_externally` global with hidden or protected visibility is
+//   refused by name: llc writes no visibility for it (see `parse_global`).
+// * `comdat` / `comdat($name)`: see `Parser::check_comdat_membership`. An
+//   ODR or link-once definition WITHOUT the clause is in no group in LLVM
+//   (llc emits a plain weak symbol), so it takes the backend's ungrouped weak
+//   linkage: a function's `LinkOnce`/`Weak`, a global's `Weak`.
+// * `section "name"` is carried (`Global::section`, v45 `Function::section`);
+//   the object path honours or refuses the name.
+// * Calling conventions: `ccc` and `fastcc` are the C convention (see
+//   `lexical::modeled_calling_convention`); every other one is refused by
+//   name, here and before any line is read.
+// * Refused by name: `dllimport`/`dllexport` (COFF only), `thread_local` (no
+//   thread-local import), `externally_initialized`, `partition`, a
+//   function's `prefix` / `prologue` data, `gc`, an `align` the backend does
+//   not honour, a function definition in `@llvm.used` (names matched as
+//   LLVM names symbols, `llvm_symbol_identity`), and attributes,
+//   `code_model` and sanitizer clauses on a global, also after a metadata
+//   attachment (`strip_line` keeps a global's attachments). Function
+//   attributes, inline or in a group a definition, declaration or call uses,
+//   are read or refused by `crate::attributes`; a call's operand bundles are
+//   refused (`read_call_tail`). A non-default address
+//   space, on a symbol or anywhere else, and a block comment are refused
+//   before any line is read (`check_module_lexically`), as is every spelling
+//   the line reader would read differently from LLVM's token-based parser
+//   (`lexical::check_module`); these readers step over the default address
+//   space and read their tokens as LLVM's lexer splits them
+//   (`lexical::lex`), refusing one they do not know.
+
+/// A linkage keyword of an LLVM function header or global prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LlvmLinkage {
+    Private,
+    Internal,
+    AvailableExternally,
+    LinkOnce,
+    Weak,
+    Common,
+    Appending,
+    ExternWeak,
+    LinkOnceOdr,
+    WeakOdr,
+    External,
+}
+
+impl LlvmLinkage {
+    const ALL: [Self; 11] = [
+        Self::Private,
+        Self::Internal,
+        Self::AvailableExternally,
+        Self::LinkOnce,
+        Self::Weak,
+        Self::Common,
+        Self::Appending,
+        Self::ExternWeak,
+        Self::LinkOnceOdr,
+        Self::WeakOdr,
+        Self::External,
+    ];
+
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Internal => "internal",
+            Self::AvailableExternally => "available_externally",
+            Self::LinkOnce => "linkonce",
+            Self::Weak => "weak",
+            Self::Common => "common",
+            Self::Appending => "appending",
+            Self::ExternWeak => "extern_weak",
+            Self::LinkOnceOdr => "linkonce_odr",
+            Self::WeakOdr => "weak_odr",
+            Self::External => "external",
+        }
+    }
+
+    fn from_keyword(token: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|linkage| linkage.keyword() == token)
+    }
+
+    /// The trust-ir linkage this keyword names, or `None` for `common` and
+    /// `appending`, which trust-ir has no linkage for.
+    fn trust_ir(self) -> Option<Linkage> {
+        Some(match self {
+            Self::Private => Linkage::Private,
+            Self::Internal => Linkage::Internal,
+            Self::AvailableExternally => Linkage::AvailableExternally,
+            Self::LinkOnce => Linkage::LinkOnce,
+            Self::Weak => Linkage::Weak,
+            Self::ExternWeak => Linkage::ExternalWeak,
+            Self::LinkOnceOdr => Linkage::LinkOnceOdr,
+            Self::WeakOdr => Linkage::WeakOdr,
+            Self::External => Linkage::External,
+            Self::Common | Self::Appending => return None,
+        })
+    }
+
+    /// Why trust-ir cannot express this keyword, for `common`/`appending`.
+    fn inexpressible_reason(self) -> &'static str {
+        match self {
+            Self::Common => {
+                "a tentative definition the linker merges with every other one of the same \
+                 name (largest size wins, a strong definition overrides it) has no trust-ir \
+                 linkage, and a strong or weak definition in its place links differently"
+            }
+            Self::Appending => {
+                "an array the linker concatenates across objects has no trust-ir linkage \
+                 (only the `@llvm.used` / `@llvm.compiler.used` retention arrays are read)"
+            }
+            _ => "it has a trust-ir linkage",
+        }
+    }
+}
+
+/// The linkage keyword and visibility an LLVM symbol prefix spells, whether
+/// it says `unnamed_addr` (not `local_unnamed_addr`: LLVM's
+/// `GlobalValue::hasGlobalUnnamedAddr`, which decides whether a constant may
+/// go in a mergeable section), and whether it says `dso_local` (not
+/// `dso_preemptable`, LLVM's default).
+#[derive(Clone, Copy, Debug, Default)]
+struct SymbolPrefix {
+    linkage: Option<LlvmLinkage>,
+    visibility: Visibility,
+    unnamed_addr: bool,
+    dso_local: bool,
+}
+
+impl SymbolPrefix {
+    /// Whether the spelled `dso_local` changes how llc 22 addresses the
+    /// symbol: LLVM already makes a local, hidden or protected symbol
+    /// dso-local (`GlobalValue::isImplicitDSOLocal`), and llc keeps an
+    /// `extern_weak` one's address in the GOT anyway (a PC-relative form
+    /// cannot read null), so only a default-visibility one of another
+    /// linkage is addressed differently for it ([`Parser::dso_local_imports`],
+    /// [`Parser::dso_local_definitions`], which also set local linkages
+    /// apart).
+    fn dso_local_changes_addressing(self) -> bool {
+        self.dso_local
+            && self.visibility == Visibility::Default
+            && self.linkage != Some(LlvmLinkage::ExternWeak)
+    }
+}
+
+/// The symbols an imported module's object names, by canonical name, read
+/// from the module itself, so every form the importer writes is read alike.
+#[derive(Debug, Default)]
+struct SymbolReferences {
+    /// Symbols whose address the code materializes: a data global's stub
+    /// constant (a read, a write, its address or an offset into it,
+    /// [`Parser::global_addr_stub`]) and a `SymbolAddr` constant (a
+    /// function's or a global's address).
+    addressed: HashSet<String>,
+    /// Functions the code calls directly.
+    called: HashSet<String>,
+    /// Symbols a global's initializer points to.
+    initializers: HashSet<String>,
+}
+
+/// Read the [`SymbolReferences`] of `module`: the body of every function for
+/// which `body_may_be_emitted` holds, and every global's initializer. A
+/// pointer constant is read as the importer writes one: `null`, a
+/// `SymbolAddr`, or a stub in `[0xFADE << 48, 0xFADF << 48)` whose bits
+/// `[47:32]` index `module.globals` (the importer writes no other pointer
+/// integer, [`Parser::int_literal_value`]).
+fn symbol_references(
+    module: &Module,
+    body_may_be_emitted: impl Fn(&Function) -> bool,
+) -> SymbolReferences {
+    let mut references = SymbolReferences::default();
+    let function_names: HashMap<FuncId, &str> = module
+        .functions
+        .iter()
+        .map(|function| (function.id, function.name.as_str()))
+        .collect();
+    for function in module
+        .functions
+        .iter()
+        .filter(|function| body_may_be_emitted(function))
+    {
+        for node in function.blocks.iter().flat_map(|block| &block.body) {
+            match &node.inst {
+                Inst::Const {
+                    ty: Ty::Ptr,
+                    value: Constant::Int(value),
+                } if in_global_addr_stub_interval(*value) => {
+                    if let Some(global) = decode_global_addr_stub(*value)
+                        .and_then(|(index, _)| module.globals.get(index))
+                    {
+                        references.addressed.insert(global.name.clone());
+                    }
+                }
+                Inst::Const { value, .. } => value.visit_constants(|constant| {
+                    if let Constant::SymbolAddr { symbol, .. } = constant {
+                        references.addressed.insert(symbol.clone());
+                    }
+                }),
+                Inst::Call { callee, .. } => {
+                    if let Some(name) = function_names.get(callee) {
+                        references.called.insert((*name).to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for initializer in module
+        .globals
+        .iter()
+        .filter_map(|global| global.initializer.as_ref())
+    {
+        initializer.visit_constants(|constant| {
+            if let Constant::SymbolAddr { symbol, .. } = constant {
+                references.initializers.insert(symbol.clone());
+            }
+        });
+    }
+    references
+}
+
+/// Whether `function` is a definition whose body the object holds: every
+/// bodied function but an `available_externally` one, whose body llc never
+/// emits ([`available_externally_body_may_be_spliced`] reads those).
+fn function_body_is_emitted(function: &Function) -> bool {
+    !function.blocks.is_empty() && function.linkage != Linkage::AvailableExternally
+}
+
+/// Whether the AOT compile may splice `function`, an `available_externally`
+/// body, into a caller of a compile under `model` (`None`: not known). Such
+/// a body is a copy of a definition another object of the image holds,
+/// which llc never emits (its object calls the function).
+/// `trust_cg_lower::translate_inline_only_bodies` withholds a body the model
+/// makes preemptible (a default-visibility one under `pic`,
+/// `RelocationModel::definition_is_preemptible`) and offers every other one
+/// to the inliner, which may splice it at O1-O3 (at O0, or where the
+/// inliner declines, it does not, which the importer cannot see). With no
+/// model known every body may be spliced, since the model may be `static`
+/// or `pie`.
+fn available_externally_body_may_be_spliced(
+    function: &Function,
+    model: Option<RelocationModel>,
+) -> bool {
+    function.linkage == Linkage::AvailableExternally
+        && !function.blocks.is_empty()
+        && model.is_none_or(|model| {
+            !model.definition_is_preemptible(
+                DefinitionBinding::for_trust_ir_linkage(function.linkage),
+                function.visibility,
+            )
+        })
+}
+
+/// Whether a splice of the `available_externally` body `function` may bind
+/// a `dso_local` declaration it addresses otherwise than the definition it
+/// copies, for a compile under `model` (`None`: not known) for an AArch64
+/// ELF target or not (`aarch64_elf`). The body must be one the backend may
+/// splice ([`available_externally_body_may_be_spliced`]); the spliced code
+/// reads the declaration through the GOT. The definition, compiled by llc
+/// from the same text, addresses it PC-relative, which in a shared library
+/// linked by gold binds it inside that library (GNU ld and LLD refuse such a
+/// reference in a shared library), and an `LD_PRELOAD` interposer of the
+/// symbol took the splice's read and not the definition's (L02-P13's sixth
+/// and seventh rounds, AArch64 Linux, O1-O3):
+///
+/// * a default-visibility body under `static` and `pie`: its definition may
+///   be in a shared library (measured: 1005 against 12 under gold);
+/// * a hidden or protected body under `pic`: its definition is in the same
+///   shared library (the same measurement);
+/// * every body with no model known, since the model may be any of them.
+///
+/// A hidden or protected body under `static` and `pie` binds in the
+/// executable: llc's program of it does not link with the definition in a
+/// shared library (GNU ld, gold and LLD), and with the definition in the
+/// executable both programs read the one copy of the symbol, interposed or
+/// not (every run equal). That holds for an AArch64 ELF target; for any
+/// other (not measured) every body the backend may splice counts.
+fn spliced_body_may_bind_otherwise(
+    function: &Function,
+    model: Option<RelocationModel>,
+    aarch64_elf: bool,
+) -> bool {
+    available_externally_body_may_be_spliced(function, model)
+        && match model {
+            Some(RelocationModel::Static | RelocationModel::Pie) if aarch64_elf => {
+                function.visibility == Visibility::Default
+            }
+            _ => true,
+        }
+}
+
+/// The first entry of `symbols`, by name, for which `referenced` holds.
+fn first_named<'a>(
+    symbols: &'a HashMap<String, &'static str>,
+    referenced: impl Fn(&str) -> bool,
+) -> Option<(&'a str, &'static str)> {
+    symbols
+        .iter()
+        .filter(|(name, _)| referenced(name))
+        .map(|(name, what)| (name.as_str(), *what))
+        .min()
+}
+
+/// The global-address stub of byte `offset` into `module.globals[index]`
+/// (`index` below `2^16`, `offset` below `2^32`, which
+/// [`Parser::global_addr_stub`] checks): tag `0xFADE` in bits `[63:48]`,
+/// the index in `[47:32]`, the offset in `[31:0]`, spelled non-negative.
+/// The lowering adapter decodes it (`decode_imported_global_addr`;
+/// `trust_cg_codegen::global_stub` is the codec's source of truth, a
+/// dependency of the `driver` feature only), and so does
+/// [`decode_global_addr_stub`], its inverse here.
+fn encode_global_addr_stub(index: u64, offset: u64) -> i128 {
+    debug_assert!(index <= 0xFFFF && offset <= 0xFFFF_FFFF);
+    ((0xFADE_u64 << 48) | (index << 32) | offset) as i128
+}
+
+/// `(index, offset)` of the global-address stub `value`
+/// ([`encode_global_addr_stub`]), as the lowering adapter decodes it: a
+/// value spelled non-negative in `[0xFADE << 48, 0xFADF << 48)`; `None`
+/// for any other value.
+fn decode_global_addr_stub(value: i128) -> Option<(usize, u64)> {
+    if !(0..=i128::from(u64::MAX)).contains(&value) {
+        return None;
+    }
+    let bits = value as u64;
+    if bits >> 48 != 0xFADE {
+        return None;
+    }
+    let index = usize::try_from((bits >> 32) & 0xFFFF).ok()?;
+    Some((index, bits & 0xFFFF_FFFF))
+}
+
+/// Whether `value`, spelled non-negative, lies in the global-address stub
+/// interval `[0xFADE << 48, 0xFADF << 48)` the lowering adapter decodes
+/// ([`decode_global_addr_stub`]).
+fn in_global_addr_stub_interval(value: i128) -> bool {
+    decode_global_addr_stub(value).is_some()
+}
+
+/// Which prefix grammar [`parse_symbol_prefix`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixKind {
+    /// The tokens between `define`/`declare` and `@name`: symbol keywords
+    /// mixed with calling-convention keywords, return attributes and the
+    /// return type, which are left to the signature parser.
+    Function,
+    /// The tokens between `=` and `global`/`constant`: symbol keywords only,
+    /// so a token this classifier does not know is refused.
+    Global,
+}
+
+/// Classify the symbol keywords among `tokens` (see the section comment
+/// above). `subject` names the symbol in diagnostics.
+fn parse_symbol_prefix(tokens: &[&str], kind: PrefixKind, subject: &str) -> Result<SymbolPrefix> {
+    let unsupported = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+    let mut prefix = SymbolPrefix::default();
+    let mut visibility_seen = false;
+    let mut tokens = tokens.iter().copied().peekable();
+    while let Some(token) = tokens.next() {
+        if let Some(linkage) = LlvmLinkage::from_keyword(token) {
+            if let Some(previous) = prefix.linkage.replace(linkage) {
+                return unsupported(format!(
+                    "two linkages (`{}` and `{}`)",
+                    previous.keyword(),
+                    linkage.keyword()
+                ));
+            }
+            continue;
+        }
+        let visibility = match token {
+            "default" => Some(Visibility::Default),
+            "hidden" => Some(Visibility::Hidden),
+            "protected" => Some(Visibility::Protected),
+            _ => None,
+        };
+        if let Some(visibility) = visibility {
+            if visibility_seen {
+                return unsupported(format!("two visibilities (second `{token}`)"));
+            }
+            visibility_seen = true;
+            prefix.visibility = visibility;
+            continue;
+        }
+        match token {
+            // Permissions the backend may ignore, except where the module's
+            // code addresses a `dso_local` declaration (section comment
+            // above).
+            "dso_local" => prefix.dso_local = true,
+            "dso_preemptable" | "local_unnamed_addr" => {}
+            "unnamed_addr" => prefix.unnamed_addr = true,
+            // An address space the pre-parse check admitted (the default
+            // one), glued (`addrspace(0)`) or spaced
+            // (`addrspace ( 0 )`, which a global's whitespace split leaves in
+            // several tokens): step over it through its closing parenthesis.
+            _ if token.starts_with("addrspace(")
+                || (token == "addrspace"
+                    && tokens.peek().is_some_and(|next| next.starts_with('('))) =>
+            {
+                let mut clause_end = token;
+                while !clause_end.contains(')') {
+                    let Some(next) = tokens.next() else { break };
+                    clause_end = next;
+                }
+            }
+            "dllimport" | "dllexport" => {
+                return unsupported(format!(
+                    "DLL storage class `{token}` (COFF only; no object path here spells it)"
+                ));
+            }
+            "externally_initialized" => {
+                return unsupported(
+                    "`externally_initialized` (its initial value may be replaced before the \
+                     program starts, which no emitted object models)"
+                        .to_string(),
+                );
+            }
+            _ if token == "thread_local" || token.starts_with("thread_local(") => {
+                return unsupported(format!(
+                    "`{token}` (thread-local globals are not imported; a plain global in its \
+                     place would be shared by every thread)"
+                ));
+            }
+            _ if kind == PrefixKind::Global => {
+                return unsupported(format!("unrecognized qualifier `{token}`"));
+            }
+            // The function prefix: a calling convention, return attributes
+            // and the return type, which the signature parser reads. Every
+            // other token is refused by name, so a keyword the reader does
+            // not know is never skipped.
+            _ if crate::lexical::modeled_calling_convention(token) => {}
+            _ if crate::lexical::is_calling_convention_keyword(token) => {
+                return unsupported(format!(
+                    "calling convention `{token}` (the importer models only `ccc` and `fastcc`, \
+                     both as the C convention)"
+                ));
+            }
+            "noundef" | "zeroext" | "signext" | "noext" | "noalias" | "nonnull" => {}
+            // A declaration's metadata attachments (`declare !dbg !5 ...`),
+            // which the importer does not read.
+            _ if token.starts_with('!') => {}
+            _ if [
+                "dereferenceable(",
+                "dereferenceable_or_null(",
+                "range(",
+                "nofpclass(",
+                "align(",
+            ]
+            .iter()
+            .any(|attribute| token.starts_with(attribute) && token.ends_with(')')) => {}
+            "align" => {
+                if !tokens
+                    .next()
+                    .is_some_and(|value| value.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    return unsupported(
+                        "return attribute `align` without an alignment".to_string(),
+                    );
+                }
+            }
+            "inreg" => {
+                return unsupported(
+                    "return attribute `inreg` (a target-specific register assignment, which this \
+                     importer does not carry)"
+                        .to_string(),
+                );
+            }
+            // The return type: the last token, but for an address-space
+            // clause the pre-parse check admitted.
+            _ if looks_like_a_type(token)
+                && tokens.clone().all(|rest| {
+                    rest.starts_with("addrspace") || rest.starts_with('(') || rest == "*"
+                }) => {}
+            _ => {
+                return unsupported(format!(
+                    "unrecognized token `{token}` before the function name (not a symbol \
+                     keyword, `ccc`/`fastcc`, a return attribute or the return type)"
+                ));
+            }
+        }
+    }
+    Ok(prefix)
+}
+
+/// Whether `token` (one bracket-aware token of a function prefix) spells an
+/// LLVM type: a primitive type keyword, `iN`, a named type, a bracketed
+/// aggregate or vector, `target(...)`, or a typed pointer (`i8*`).
+fn looks_like_a_type(token: &str) -> bool {
+    matches!(
+        token,
+        "void"
+            | "ptr"
+            | "half"
+            | "bfloat"
+            | "float"
+            | "double"
+            | "fp128"
+            | "x86_fp80"
+            | "ppc_fp128"
+            | "x86_amx"
+            | "x86_mmx"
+            | "label"
+            | "token"
+            | "metadata"
+    ) || token
+        .strip_prefix('i')
+        .is_some_and(|bits| !bits.is_empty() && bits.bytes().all(|b| b.is_ascii_digit()))
+        || token.starts_with(['{', '[', '<', '%'])
+        || token.starts_with("target(")
+        || token.ends_with('*')
+}
+
+/// The trust-ir linkage and visibility of a function DEFINITION
+/// (`is_define`) or DECLARATION spelled with `prefix`.
+fn function_linkage_and_visibility(
+    prefix: SymbolPrefix,
+    is_define: bool,
+    subject: &str,
+) -> Result<(Linkage, Visibility)> {
+    let unsupported = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+    let spelled = prefix.linkage.unwrap_or(LlvmLinkage::External);
+    let Some(linkage) = spelled.trust_ir() else {
+        return unsupported(format!(
+            "linkage `{}` (LLVM allows it only on global variables; {})",
+            spelled.keyword(),
+            spelled.inexpressible_reason()
+        ));
+    };
+    if is_define && linkage == Linkage::ExternalWeak {
+        return unsupported(
+            "linkage `extern_weak` on a definition (LLVM allows it only on a declaration)"
+                .to_string(),
+        );
+    }
+    if !is_define && !matches!(linkage, Linkage::External | Linkage::ExternalWeak) {
+        return unsupported(format!(
+            "linkage `{}` on a declaration (LLVM allows only `external` or `extern_weak` there)",
+            spelled.keyword()
+        ));
+    }
+    check_local_visibility(linkage, prefix.visibility, subject)?;
+    Ok((linkage, prefix.visibility))
+}
+
+/// Refuse, by name, a direct call of the `extern_weak` function `symbol`
+/// (signature `func_ty`, attributes `attrs`) that
+/// `Parser::call_weak_declarations_through_their_address` cannot respell as
+/// a `CallIndirect` through the function's `SymbolAddr` without changing
+/// what the call does on this backend:
+///
+/// * a variadic callee: the backend refuses every indirect call of a
+///   variadic signature (its indirect variadic ABI lowering is not proven),
+///   and trust-ir admits no other call of a weak declaration;
+/// * a 128-bit integer argument that may be passed on the stack: AArch64
+///   instruction selection stores only the low half of a stack-passed i128
+///   for a `CallIndirect`, while a direct call stores both halves (ledger
+///   L06-P15). A register-pair i128 is passed the same way by both.
+/// * a call-ABI fact of the function that the indirect call does not carry
+///   ([`abi_fact_an_indirect_call_does_not_carry`]; LD-100 rule 12). The
+///   `CallIndirect` keeps the function's signature (the same `FuncTyId`, so
+///   every argument and result type, the `zeroext` edge types of
+///   [`call_edge_ty`] among them) and its calling convention, and none of
+///   its `FuncAttrs`. The lowering adapter reads a hidden return buffer for
+///   an indirect call only through a `Const FnDef` callee
+///   (`resolve_static_indirect_sret_callee`), never through a `SymbolAddr`,
+///   so a weak `sret` callee was passed its buffer in `x0` and every
+///   argument one register later, where llc passes the buffer in `x8` (the
+///   sixth L02-P15 re-check: 12 probes, 0 of 24 configurations equal).
+/// * an LLVM intrinsic name (LD-100 rule 12): llc lowers an intrinsic by its
+///   name whatever its linkage (it copied for `declare extern_weak void
+///   @llvm.memcpy.p0.p0.i64(...)`), and the backend reads the name only on a
+///   direct call, so through its address the call reached an undefined weak
+///   symbol named after the intrinsic (null; the program faulted).
+///
+/// Import precedes target selection, so every leg applies to every target.
+/// The x86-64 selector shares one marshalling path between direct and
+/// indirect calls and passes a hidden buffer in C's first argument
+/// register, so there the `sret` refusal is a stated over-refusal (read,
+/// not run). The second leg goes with the L06-P15 fix.
+fn refuse_weak_call_the_indirect_lowering_would_change(
+    symbol: &str,
+    func_ty: &FuncTy,
+    attrs: &trust_ir::FuncAttrs,
+) -> Result<()> {
+    if func_ty.is_vararg {
+        return Err(Error::Unsupported(format!(
+            "direct call of the variadic `extern_weak` function `@{symbol}`: trust-ir admits a \
+             call of a weak declaration only through its address, and this backend does not \
+             lower an indirect variadic call"
+        )));
+    }
+    if let Some(index) = first_possibly_stack_passed_i128(&func_ty.params) {
+        return Err(Error::Unsupported(format!(
+            "direct call of the `extern_weak` function `@{symbol}` whose 128-bit integer \
+             argument {} may be passed on the stack: the call must go through the function's \
+             address, and AArch64 indirect calls store only the low half of a stack-passed \
+             128-bit integer (L06-P15)",
+            index + 1
+        )));
+    }
+    if let Some(fact) = abi_fact_an_indirect_call_does_not_carry(attrs) {
+        return Err(Error::Unsupported(format!(
+            "direct call of the `extern_weak` function `@{symbol}` whose {fact}: trust-ir admits \
+             a call of a weak declaration only through its address, and this backend's indirect \
+             call keeps the signature and calling convention but none of the function's \
+             parameter or result attributes, so it would pass the call otherwise than llc's \
+             direct call (LD-100 rule 12)"
+        )));
+    }
+    if is_intrinsic_ir_name(symbol) {
+        return Err(Error::Unsupported(format!(
+            "direct call of the `extern_weak` intrinsic `@{symbol}`: llc lowers an intrinsic by \
+             its name whatever its linkage, and trust-ir admits a call of a weak declaration \
+             only through its address, through which this backend would call a symbol named \
+             `{symbol}` that no library defines (LD-100 rule 12)"
+        )));
+    }
+    Ok(())
+}
+
+/// The first call-ABI fact `attrs` states that a `CallIndirect` through the
+/// function's address does not carry, described for a refusal, or `None`
+/// (LD-100 rule 12): a hidden return buffer (`sret`), which the lowering
+/// reads for an indirect call only through a `Const FnDef` callee, and the
+/// other placement facts trust-ir states on a slot, `byval`, an extension
+/// (`ext`) and a pass mode (`pass`), on a parameter or the result, which the
+/// indirect lowering does not read. This importer writes none of the latter
+/// three (`byval` is refused at the header by name, [`arg_abi`]; an
+/// extension is carried as the call edge type's signedness,
+/// [`call_edge_ty`], which the indirect call keeps; no pass mode is
+/// written): they are refused so that one written later is not dropped
+/// silently. The pointer hints (`nonnull`, `noalias`, `align`,
+/// `dereferenceable`, `readonly`) place nothing and are not read.
+fn abi_fact_an_indirect_call_does_not_carry(attrs: &trust_ir::FuncAttrs) -> Option<String> {
+    let slot_fact = |slot: &ParamAttrs, what: &str| {
+        if slot.sret {
+            Some(format!(
+                "{what} is a hidden return buffer (`sret`), which AArch64 passes in `x8`, \
+                 outside the argument registers"
+            ))
+        } else if slot.byval {
+            Some(format!("{what} is passed by value (`byval`)"))
+        } else if let Some(ext) = slot.ext.token() {
+            Some(format!("{what} states the extension `{ext}`"))
+        } else {
+            slot.pass
+                .as_ref()
+                .map(|pass| format!("{what} states the pass mode `{}`", pass.token()))
+        }
+    };
+    attrs
+        .params
+        .iter()
+        .enumerate()
+        .find_map(|(index, param)| slot_fact(param, &format!("parameter {index}")))
+        .or_else(|| slot_fact(&attrs.ret, "result"))
+}
+
+/// The index of the first 128-bit integer in `params` that the AArch64
+/// calling conventions (AAPCS64 and DarwinPCS) may pass on the stack, or
+/// `None` when every one is certainly passed in a register pair.
+///
+/// It keeps an upper bound of the general-purpose argument registers the
+/// earlier parameters take: one per integer, `i1` or pointer; none per
+/// `half`/`float`/`double` (SIMD registers or the stack, never x0-x7); an
+/// even-aligned pair per 128-bit integer (AAPCS64 C.10; DarwinPCS may start
+/// the pair odd, which takes no more); all eight for any other type. A pair
+/// that fits below x8 from that bound fits from the true count as well, so
+/// the answer can only call a register-passed argument "may be stack",
+/// never the reverse (the parser test
+/// `stack_passed_i128_bound_covers_the_backend_classifier` checks it against
+/// `AppleAArch64ABI::classify_params_with`).
+fn first_possibly_stack_passed_i128(params: &[Ty]) -> Option<usize> {
+    const GPR_ARGUMENT_REGISTERS: u32 = 8;
+    let mut used: u32 = 0;
+    for (index, ty) in params.iter().enumerate() {
+        match ty {
+            Ty::I128 | Ty::U128 => {
+                let pair = used.saturating_add(used % 2);
+                if pair.saturating_add(2) > GPR_ARGUMENT_REGISTERS {
+                    return Some(index);
+                }
+                used = pair.saturating_add(2);
+            }
+            Ty::Bool
+            | Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::Isize
+            | Ty::Usize
+            | Ty::Char
+            | Ty::Ptr => used = used.saturating_add(1),
+            Ty::F16 | Ty::F32 | Ty::F64 => {}
+            _ => used = GPR_ARGUMENT_REGISTERS,
+        }
+    }
+    None
+}
+
+/// The trust-ir linkage of a global spelled with `prefix`, whether or not it
+/// carries an initializer.
+fn global_linkage(prefix: SymbolPrefix, has_initializer: bool, subject: &str) -> Result<Linkage> {
+    let unsupported = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+    let Some(spelled) = prefix.linkage else {
+        // No keyword: a definition. LLVM requires `external`/`extern_weak` on
+        // a global without an initializer.
+        if !has_initializer {
+            return unsupported(
+                "no initializer and no `external`/`extern_weak` linkage (LLVM requires one of \
+                 them)"
+                    .to_string(),
+            );
+        }
+        check_local_visibility(Linkage::External, prefix.visibility, subject)?;
+        return Ok(Linkage::External);
+    };
+    let Some(linkage) = spelled.trust_ir() else {
+        return unsupported(format!(
+            "linkage `{}` ({})",
+            spelled.keyword(),
+            spelled.inexpressible_reason()
+        ));
+    };
+    let declaration_only = matches!(linkage, Linkage::External | Linkage::ExternalWeak);
+    if declaration_only && has_initializer {
+        return unsupported(format!(
+            "linkage `{}` with an initializer (LLVM spells it only on a declaration)",
+            spelled.keyword()
+        ));
+    }
+    if !declaration_only && !has_initializer {
+        return unsupported(format!(
+            "linkage `{}` without an initializer (LLVM requires one)",
+            spelled.keyword()
+        ));
+    }
+    check_local_visibility(linkage, prefix.visibility, subject)?;
+    Ok(linkage)
+}
+
+/// The qualifier tokens between a global's `=` and its storage class
+/// (`global`/`constant`), given `rest` (after `=`) and the text after the
+/// storage keyword.
+fn global_prefix_tokens<'a>(rest: &'a str, after_storage: &str) -> Vec<&'a str> {
+    let mut tokens: Vec<&str> = rest[..rest.len() - after_storage.len()]
+        .split_whitespace()
+        .collect();
+    // The storage keyword itself ends the prefix (`global`, `constant`, or
+    // `global[`/`constant[` when no space precedes the type).
+    if tokens
+        .last()
+        .is_some_and(|last| matches!(last.trim_end_matches('['), "global" | "constant"))
+    {
+        tokens.pop();
+    }
+    tokens
+}
+
+/// Whether LLVM 22's ELF object lowering replaces a global's own section kind
+/// because of its explicit section `name` (`getELFKindForNamedSection` in
+/// `TargetLoweringObjectFileImpl.cpp`): the coverage-mapping names,
+/// `.llvmbc` and `.llvmcmd` (metadata), the `.bss`/`.sbss` family (zero
+/// fill), `.tdata` and `.tbss` and their link-once spellings. A mergeable
+/// constant in such a section loses its mergeable kind.
+fn llvm_names_elf_section_kind(name: &str) -> bool {
+    const EXACT: [&str; 10] = [
+        "__llvm_covmap",
+        "__llvm_covfun",
+        "__llvm_covdata",
+        "__llvm_covnames",
+        ".llvmbc",
+        ".llvmcmd",
+        ".bss",
+        ".sbss",
+        ".tdata",
+        ".tbss",
+    ];
+    const PREFIXES: [&str; 12] = [
+        ".bss.",
+        ".gnu.linkonce.b.",
+        ".llvm.linkonce.b.",
+        ".sbss.",
+        ".gnu.linkonce.sb.",
+        ".llvm.linkonce.sb.",
+        ".tdata.",
+        ".gnu.linkonce.td.",
+        ".llvm.linkonce.td.",
+        ".tbss.",
+        ".gnu.linkonce.tb.",
+        ".llvm.linkonce.tb.",
+    ];
+    EXACT.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// Refuse `common` and `appending` before a global's initializer is read.
+fn refuse_inexpressible_linkage(prefix: SymbolPrefix, subject: &str) -> Result<()> {
+    match prefix.linkage {
+        Some(spelled) if spelled.trust_ir().is_none() => Err(Error::Unsupported(format!(
+            "{subject}: linkage `{}` ({})",
+            spelled.keyword(),
+            spelled.inexpressible_reason()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse non-default visibility on a local (`internal`/`private`) symbol:
+/// LLVM's verifier rejects it and trust-ir calls the pair contradictory.
+fn check_local_visibility(linkage: Linkage, visibility: Visibility, subject: &str) -> Result<()> {
+    if linkage.is_module_local() && visibility != Visibility::Default {
+        return Err(Error::Unsupported(format!(
+            "{subject}: visibility `{visibility}` on a local (`{}`) symbol (LLVM requires \
+             default visibility there)",
+            if linkage == Linkage::Internal {
+                "internal"
+            } else {
+                "private"
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// A `comdat` clause: `None` when absent, `Some(None)` for the implicit
+/// form (the COMDAT named like the symbol), `Some(Some(name))` for
+/// `comdat($name)` (raw spelling, without the `$`).
+type ComdatClause = Option<Option<String>>;
+
+/// The clauses after a function's parameter list that state symbol facts.
+#[derive(Debug, Default)]
+struct FunctionClauses {
+    section: Option<String>,
+    comdat: ComdatClause,
+}
+
+/// The personality functions LLVM emits for a function even when it has no
+/// landing pad (`isNoOpWithoutInvoke` is false only for the SEH ones).
+const PERSONALITIES_EMITTED_WITHOUT_LANDING_PADS: [&str; 3] = [
+    "__C_specific_handler",
+    "_except_handler3",
+    "_except_handler4",
+];
+
+/// The largest `align N` on a function that every object path honours
+/// without reading it: AArch64 functions are whole 4-byte words placed on
+/// word boundaries, and x86-64 functions start on 32- or 64-byte
+/// boundaries unless both `TCG_NO_X86_JCC_ALIGN` and
+/// `TCG_NO_X86_LOOP_HEAD_ALIGN` are set.
+const FUNCTION_ALIGN_ALWAYS_HONOURED: u64 = 4;
+
+/// The index after the metadata attachment whose `!name` is `tokens[at]`:
+/// `!name !N`, `!name !{...}` or `!name !DINode(...)`, the node forms
+/// LLVM's `parseMDNode` reads there; `None` for any other shape.
+fn metadata_attachment_end(tokens: &[crate::lexical::Token], at: usize) -> Option<usize> {
+    if tokens.get(at)?.kind != LexKind::MetadataName {
+        return None;
+    }
+    let value = tokens.get(at + 1)?;
+    match (value.kind, tokens.get(at + 2).map(|t| t.kind)) {
+        (LexKind::Punct(b'!'), Some(LexKind::Number)) => Some(at + 3),
+        (LexKind::Punct(b'!'), Some(LexKind::Punct(b'{'))) => {
+            Some(skip_bracket_group(tokens, at + 2))
+        }
+        (LexKind::MetadataName, Some(LexKind::Punct(b'('))) => {
+            Some(skip_bracket_group(tokens, at + 2))
+        }
+        _ => None,
+    }
+}
+
+/// The raw COMDAT name (without its `$`) of a `comdat` clause whose `(`
+/// is the token at `open`: `( $name )`, or `None` if it is not that shape.
+fn comdat_clause_name(text: &str, tokens: &[crate::lexical::Token], open: usize) -> Option<String> {
+    let [paren, name, close] = tokens.get(open..open + 3)? else {
+        return None;
+    };
+    (paren.kind == LexKind::Punct(b'(')
+        && name.kind == LexKind::Comdat
+        && close.kind == LexKind::Punct(b')'))
+    .then(|| name.text(text)[1..].to_string())
+}
+
+/// The decoded name of a `section "name"` string token.
+fn section_name(text: &str, token: &crate::lexical::Token, subject: &str) -> Result<String> {
+    let spelled = token.text(text);
+    decode_ll_name_string(
+        &spelled[1..spelled.len() - 1],
+        &format!("{subject}: `section`"),
+    )
+}
+
+/// Read every clause after a function's parameter list, token by token as
+/// LLVM's lexer splits them (`crate::lexical::lex`), and refuse by name
+/// each one the importer does not carry. Carried: `section` and `comdat`.
+/// Read and dropped, with the reason: `unnamed_addr`/`local_unnamed_addr`
+/// (see the section comment above), the default `addrspace(0)` (every
+/// other address space was refused before the header was read), attribute
+/// groups, inline function attributes and string attributes that
+/// `crate::attributes` reads (a group is read when every attribute in it
+/// is), metadata attachments, `align N` up to
+/// [`FUNCTION_ALIGN_ALWAYS_HONOURED`], and a `personality` LLVM itself
+/// drops without a landing pad (the importer refuses `invoke` and
+/// `landingpad`). Refused by name: `partition`, `prefix`, `prologue`, `gc`,
+/// a larger `align`, an SEH personality, every attribute `crate::attributes`
+/// refuses (inline or in a group the function uses), attributes that hold
+/// `"sign-return-address-key"` without `"sign-return-address"`
+/// (`attributes::ReturnAddressSigning`) unless they are an
+/// `intrinsic_declaration`'s (a `declare` of an `llvm.*` name, LLVM's
+/// `Function::isIntrinsic`, [`is_intrinsic_ir_name`]), and any other token.
+/// A definition compiled for a RISC-V target, or for none known
+/// (`riscv_definition`), is refused where the calling convention llc
+/// selects from its `"target-cpu"` and `"target-features"`, inline and
+/// through its groups, places its arguments otherwise than the backend's
+/// (`attributes::SubtargetSelection::riscv_refusal` and
+/// `riscv_refusal_without_target`).
+fn parse_function_clauses(
+    attrs_after: &str,
+    subject: &str,
+    attribute_groups: &HashMap<String, FunctionAttributeSet>,
+    intrinsic_declaration: bool,
+    riscv_definition: Option<RiscvDefinition>,
+    processors: ProcessorTable,
+) -> Result<FunctionClauses> {
+    let unsupported = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+    let text = attrs_after;
+    let tokens = crate::lexical::lex(text)?;
+    let group_refusal = |group: &str| {
+        attribute_groups
+            .get(group)
+            .and_then(|attributes| attributes.refused.clone())
+    };
+    let read_attribute =
+        |at: usize| read_function_attribute(text, &tokens, at, &group_refusal, processors);
+    let mut clauses = FunctionClauses::default();
+    let mut signing = ReturnAddressSigning::default();
+    let mut subtarget = SubtargetSelection::default();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        let spelled = token.text(text);
+        index += 1;
+        let next = tokens.get(index);
+        match token.kind {
+            LexKind::Word => match spelled {
+                "section" => {
+                    let Some(name) = next.filter(|name| name.kind == LexKind::Str) else {
+                        return unsupported("`section` without a quoted name".to_string());
+                    };
+                    index += 1;
+                    let name = section_name(text, name, subject)?;
+                    if clauses.section.replace(name).is_some() {
+                        return unsupported("two `section` clauses".to_string());
+                    }
+                }
+                "comdat" => {
+                    let explicit = if next.is_some_and(|t| t.kind == LexKind::Punct(b'(')) {
+                        let Some(name) = comdat_clause_name(text, &tokens, index) else {
+                            return unsupported(format!(
+                                "malformed COMDAT clause `{}`",
+                                text[token.start..].trim()
+                            ));
+                        };
+                        index += 3;
+                        Some(name)
+                    } else {
+                        None
+                    };
+                    if clauses.comdat.replace(explicit).is_some() {
+                        return unsupported("two `comdat` clauses".to_string());
+                    }
+                }
+                "partition" => {
+                    return unsupported(
+                        "`partition` (no object path here splits a program into loadable \
+                         partitions)"
+                            .to_string(),
+                    );
+                }
+                "prefix" | "prologue" => {
+                    return unsupported(format!(
+                        "`{spelled}` data (the backend emits no bytes before or at a function's \
+                         entry other than its own code)"
+                    ));
+                }
+                "gc" => {
+                    return unsupported(
+                        "`gc` strategy (the backend emits no garbage-collector stack maps or \
+                         safepoints)"
+                            .to_string(),
+                    );
+                }
+                "align" => {
+                    let alignment = next
+                        .filter(|value| value.kind == LexKind::Number)
+                        .and_then(|value| value.text(text).parse::<u64>().ok())
+                        .filter(|value| value.is_power_of_two());
+                    let Some(alignment) = alignment else {
+                        return unsupported(
+                            "function `align` without a power-of-two alignment".to_string(),
+                        );
+                    };
+                    index += 1;
+                    if alignment > FUNCTION_ALIGN_ALWAYS_HONOURED {
+                        return unsupported(format!(
+                            "function alignment `align {alignment}` (the backend places \
+                             functions on {FUNCTION_ALIGN_ALWAYS_HONOURED}-byte boundaries and \
+                             reads no per-function alignment)"
+                        ));
+                    }
+                }
+                "personality" => {
+                    let personality = match tokens.get(index..index + 2) {
+                        Some([ty, symbol])
+                            if ty.kind == LexKind::Word
+                                && ty.text(text) == "ptr"
+                                && symbol.kind == LexKind::Global =>
+                        {
+                            symbol.text(text)[1..].trim_matches('"')
+                        }
+                        _ => {
+                            return unsupported(
+                                "`personality` that is not `ptr @symbol`".to_string(),
+                            );
+                        }
+                    };
+                    index += 2;
+                    if PERSONALITIES_EMITTED_WITHOUT_LANDING_PADS.contains(&personality) {
+                        return unsupported(format!(
+                            "personality `@{personality}` (LLVM emits an SEH personality even \
+                             for a function without landing pads)"
+                        ));
+                    }
+                }
+                "unnamed_addr" | "local_unnamed_addr" => {}
+                "addrspace" => {
+                    if !next.is_some_and(|t| t.kind == LexKind::Punct(b'(')) {
+                        return unsupported("`addrspace` without its operand".to_string());
+                    }
+                    index = skip_bracket_group(&tokens, index);
+                }
+                _ => match read_attribute(index - 1) {
+                    AttributeRead::Read(next) => index = next,
+                    AttributeRead::Refused(why) => return unsupported(why),
+                    AttributeRead::NotAnAttribute => {
+                        return unsupported(format!(
+                            "unrecognized clause or attribute `{spelled}` after the parameter \
+                             list"
+                        ));
+                    }
+                },
+            },
+            // An attribute group, or a string attribute (`"key"`,
+            // `"key"="value"`).
+            LexKind::AttrGroup | LexKind::Str => match read_attribute(index - 1) {
+                AttributeRead::Read(next) => {
+                    note_return_address_signing(
+                        &mut signing,
+                        text,
+                        &tokens,
+                        index - 1,
+                        attribute_groups,
+                    );
+                    if token.kind == LexKind::Str {
+                        subtarget.note(text, &tokens, index - 1);
+                    } else if let Some(group) = attribute_groups.get(spelled) {
+                        subtarget = subtarget.union(&group.subtarget);
+                    }
+                    index = next;
+                }
+                AttributeRead::Refused(why) => return unsupported(why),
+                AttributeRead::NotAnAttribute => {
+                    return unsupported(format!("unexpected `{spelled}` after the parameter list"));
+                }
+            },
+            // `!name !N`, `!name !{...}`, `!name !DINode(...)`: metadata,
+            // which the importer does not read.
+            LexKind::MetadataName => match metadata_attachment_end(&tokens, index - 1) {
+                Some(next) => index = next,
+                None => {
+                    return unsupported(format!("metadata attachment `{spelled}` without a value"));
+                }
+            },
+            _ => {
+                return unsupported(format!("unexpected `{spelled}` after the parameter list"));
+            }
+        }
+    }
+    // LLVM's parser replaces the attributes of a declaration of an
+    // intrinsic it defines, at that intrinsic's type, with the intrinsic's
+    // own (`UpgradeIntrinsicFunction`), so `declare void @llvm.assume(i1)
+    // "sign-return-address-key"="a_key"` is accepted. This importer has no
+    // table of LLVM's intrinsics and exempts every `llvm.*` declaration,
+    // also one LLVM does not define or declared at another type, whose
+    // attributes LLVM keeps and verifies (not-a-validator; LD-05).
+    if let Some(why) = signing.refusal().filter(|_| !intrinsic_declaration) {
+        return unsupported(why);
+    }
+    if let Some(why) = riscv_definition.and_then(|definition| match definition.target {
+        RiscvTarget::Known(xlen) => subtarget.riscv_refusal(xlen, definition.floating),
+        RiscvTarget::Unknown => subtarget.riscv_refusal_without_target(definition.floating),
+    }) {
+        return unsupported(why);
+    }
+    Ok(clauses)
+}
+
+/// The compile target a definition's RISC-V calling convention is read for
+/// (`Parser::riscv_target`).
+#[derive(Clone, Copy, Debug)]
+enum RiscvTarget {
+    /// A RISC-V target of this width (`riscv32`/`riscv32be`: 32,
+    /// `riscv64`/`riscv64be`: 64, LLVM's `Triple::parseArch`).
+    Known(u32),
+    /// No target is known (no triple given or stated), which may be
+    /// RISC-V.
+    Unknown,
+}
+
+/// A function definition compiled for a RISC-V target, or for none known,
+/// for `attributes::SubtargetSelection::riscv_refusal`.
+#[derive(Clone, Copy, Debug)]
+struct RiscvDefinition {
+    /// The target ([`Parser::riscv_target`]).
+    target: RiscvTarget,
+    /// Whether the definition's text, or a named type the module defines,
+    /// names a floating-point or vector type
+    /// ([`mentions_floating_point_or_vector`]).
+    floating: bool,
+}
+
+/// LLVM 22's floating-point type keywords (`LLLexer.cpp`).
+const FLOATING_POINT_TYPES: [&str; 7] = [
+    "half",
+    "bfloat",
+    "float",
+    "double",
+    "x86_fp80",
+    "fp128",
+    "ppc_fp128",
+];
+
+/// Whether a definition's text (its header and body lines) names a
+/// floating-point or vector type, as LLVM's lexer splits it: a keyword
+/// among [`FLOATING_POINT_TYPES`], or a `<`, which opens a vector type (or a
+/// packed struct, read alike). A text the lexer rejects reads as one.
+fn mentions_floating_point_or_vector(header: &str, body: &[(usize, String)]) -> bool {
+    let mut text = header.to_string();
+    for (_, line) in body {
+        text.push('\n');
+        text.push_str(line);
+    }
+    crate::lexical::lex(&text).map_or(true, |tokens| {
+        tokens.iter().any(|token| match token.kind {
+            LexKind::Word => FLOATING_POINT_TYPES.contains(&token.text(&text)),
+            LexKind::Punct(b'<') => true,
+            _ => false,
+        })
+    })
+}
+
+/// The COMDAT selection kinds LLVM spells in `$name = comdat <kind>`.
+const COMDAT_SELECTION_KINDS: [&str; 6] = [
+    "any",
+    "exactmatch",
+    "largest",
+    "nodeduplicate",
+    "noduplicates",
+    "samesize",
+];
+
+/// The clauses after a global's initializer that the importer carries.
+#[derive(Debug, Default)]
+struct GlobalClauses {
+    section: Option<String>,
+    comdat: ComdatClause,
+    align: Option<u32>,
+}
+
+/// The words a string token may follow in a global's text: a `c"..."`
+/// initializer and the clauses whose operand is a string.
+const GLOBAL_STRING_OPERAND_WORDS: [&str; 4] = ["c", "section", "partition", "code_model"];
+
+/// Read a global's trailing clauses token by token, as LLVM's lexer splits
+/// them (`crate::lexical::lex`), from `after_storage` (the text after
+/// `global`/`constant`): the comma-separated clauses after the initializer
+/// at bracket depth 0. A string inside the initializer (`c"section "`) is
+/// one token, so no clause is found inside it. Carried: `section`,
+/// `comdat`, `align`. Refused by name: `partition`, `code_model` (the
+/// backend places and addresses every global one way), the sanitizer
+/// clauses, any other clause, and attributes on the global (`#N` groups or
+/// inline string attributes, among them clang's `#pragma clang section`
+/// attributes `"bss-section"`, `"data-section"`, `"rodata-section"` and
+/// `"relro-section"`, which LLVM's object writers read as the global's
+/// section).
+fn parse_global_clauses(
+    after_storage: &str,
+    subject: &str,
+    attribute_groups: &HashMap<String, FunctionAttributeSet>,
+) -> Result<GlobalClauses> {
+    use crate::lexical::Token;
+    let unsupported = |what: String| Err(Error::Unsupported(format!("{subject}: {what}")));
+    let text = after_storage;
+    let tokens = crate::lexical::lex(text)?;
+    // Attributes first: they may follow the initializer or the last clause
+    // without a comma, where no clause reader would see them.
+    let mut depth = 0i32;
+    for (index, token) in tokens.iter().enumerate() {
+        if depth == 0 {
+            let after_operand_word = index.checked_sub(1).is_some_and(|previous| {
+                tokens[previous].kind == LexKind::Word
+                    && GLOBAL_STRING_OPERAND_WORDS.contains(&tokens[previous].text(text))
+            });
+            let attribute = match token.kind {
+                LexKind::AttrGroup => Some(token.text(text)),
+                LexKind::Str if !after_operand_word => Some(token.text(text)),
+                _ => None,
+            };
+            if let Some(attribute) = attribute {
+                let bits = attribute_groups
+                    .get(attribute)
+                    .map_or(0, |group| group.global_sections);
+                let sections: Vec<String> = GLOBAL_SECTION_ATTRIBUTES
+                    .iter()
+                    .enumerate()
+                    .filter(|(bit, _)| bits & (1 << bit) != 0)
+                    .map(|(_, key)| format!("\"{key}\""))
+                    .collect();
+                let named = if sections.is_empty() {
+                    String::new()
+                } else {
+                    format!(", which sets {}", sections.join(", "))
+                };
+                return unsupported(format!(
+                    "attribute `{attribute}` on a global{named} (global attributes are not read; \
+                     LLVM's object writers take a section from the `#pragma clang section` \
+                     attributes)"
+                ));
+            }
+        }
+        depth += match token.kind {
+            LexKind::Punct(b'(' | b'[' | b'{' | b'<') => 1,
+            LexKind::Punct(b')' | b']' | b'}' | b'>') => -1,
+            _ => 0,
+        };
+    }
+    // The comma-separated pieces at depth 0; the first is the type and
+    // initializer.
+    let mut pieces: Vec<&[Token]> = Vec::new();
+    let mut depth = 0i32;
+    let mut piece_start = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            LexKind::Punct(b',') if depth == 0 => {
+                pieces.push(&tokens[piece_start..index]);
+                piece_start = index + 1;
+            }
+            LexKind::Punct(b'(' | b'[' | b'{' | b'<') => depth += 1,
+            LexKind::Punct(b')' | b']' | b'}' | b'>') => depth -= 1,
+            _ => {}
+        }
+    }
+    pieces.push(&tokens[piece_start..]);
+    let mut clauses = GlobalClauses::default();
+    for piece in pieces.iter().skip(1) {
+        let Some(first) = piece.first() else {
+            return unsupported("an empty clause after the initializer".to_string());
+        };
+        let raw = text[first.start..piece.last().map_or(first.end, |last| last.end)].trim();
+        let keyword = first.text(text);
+        match (first.kind, keyword) {
+            (LexKind::Word, "section") => {
+                let [_, name] = piece else {
+                    return unsupported(format!("malformed `section` clause `{raw}`"));
+                };
+                if name.kind != LexKind::Str {
+                    return unsupported(format!("malformed `section` clause `{raw}`"));
+                }
+                let name = section_name(text, name, subject)?;
+                if clauses.section.replace(name).is_some() {
+                    return unsupported("two `section` clauses".to_string());
+                }
+            }
+            (LexKind::Word, "comdat") => {
+                let group = match piece.len() {
+                    1 => None,
+                    4 => Some(comdat_clause_name(text, piece, 1).ok_or_else(|| {
+                        Error::Unsupported(format!("{subject}: malformed COMDAT clause `{raw}`"))
+                    })?),
+                    _ => return unsupported(format!("malformed COMDAT clause `{raw}`")),
+                };
+                if clauses.comdat.replace(group).is_some() {
+                    return unsupported("two `comdat` clauses".to_string());
+                }
+            }
+            (LexKind::Word, "align") => {
+                let value = &raw["align".len()..].trim();
+                // The alignment diagnostics name no symbol, as before the
+                // token reader.
+                let [_, number] = piece else {
+                    return Err(Error::Unsupported(format!(
+                        "global alignment `{value}` (unexpected trailing tokens)"
+                    )));
+                };
+                let alignment = (number.kind == LexKind::Number)
+                    .then(|| number.text(text).parse::<u32>().ok())
+                    .flatten()
+                    .filter(|alignment| *alignment != 0 && alignment.is_power_of_two());
+                let Some(alignment) = alignment else {
+                    return Err(Error::Unsupported(format!(
+                        "global alignment `{value}` (expected a nonzero power-of-two u32)"
+                    )));
+                };
+                if clauses.align.replace(alignment).is_some() {
+                    return Err(Error::Unsupported(
+                        "global with duplicate alignment attributes".to_string(),
+                    ));
+                }
+            }
+            (LexKind::Word, "partition") => {
+                return unsupported(
+                    "`partition` (no object path here splits a program into loadable \
+                     partitions)"
+                        .to_string(),
+                );
+            }
+            (LexKind::Word, "code_model") => {
+                return unsupported(format!(
+                    "`{raw}` (the backend addresses and places every global with one code \
+                     model)"
+                ));
+            }
+            (
+                LexKind::Word,
+                "no_sanitize_address"
+                | "no_sanitize_hwaddress"
+                | "sanitize_address_dyninit"
+                | "sanitize_memtag",
+            ) => {
+                return unsupported(format!(
+                    "sanitizer clause `{keyword}` (no sanitizer instrumentation is imported)"
+                ));
+            }
+            // A metadata attachment (`!dbg !5`), which the importer does not
+            // read; `strip_line` keeps a global's attachments, so the clauses
+            // after one are read too.
+            (LexKind::MetadataName, _) => {
+                if metadata_attachment_end(piece, 0) != Some(piece.len()) {
+                    return unsupported(format!("malformed metadata attachment `{raw}`"));
+                }
+            }
+            _ => {
+                return unsupported(format!("unrecognized clause `{raw}` after the initializer"));
+            }
+        }
+    }
+    Ok(clauses)
+}
+
+/// The link-time facts of one imported function: its trust-ir linkage and
+/// visibility and its v45 explicit section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionSymbolFacts {
+    linkage: Linkage,
+    visibility: Visibility,
+    section: Option<String>,
+}
+
+impl FunctionSymbolFacts {
+    /// A plain `declare`/`define` without symbol keywords or clauses.
+    const EXTERNAL: Self = Self {
+        linkage: Linkage::External,
+        visibility: Visibility::Default,
+        section: None,
+    };
+
+    fn apply(&self, function: &mut Function) {
+        function.linkage = self.linkage;
+        function.visibility = self.visibility;
+        function.section = self.section.clone();
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "linkage `{}`, visibility `{}`, section {:?}",
+            self.linkage, self.visibility, self.section
+        )
+    }
+}
+
+/// `@llvm.used` / `@llvm.compiler.used`: the metadata arrays that name
+/// `#[used]` symbols.
+fn is_used_metadata_array(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('@').trim(),
+        "llvm.used" | "llvm.compiler.used"
+    )
+}
+
+/// Every `@sym` an `@llvm.used` line lists, as spelled after the `@` (only a
+/// `\01` asm label is still quoted in canonical text): the global-name
+/// tokens of the line after
+/// its `=`, read as LLVM's lexer splits them. The array type and the
+/// `section "llvm.metadata"` clause hold none, and an element is `ptr @sym`
+/// or a typed-pointer cast around `@sym`.
+fn used_metadata_symbols(rest: &str) -> Result<Vec<String>> {
+    Ok(crate::lexical::lex(rest)?
+        .iter()
+        .filter(|token| token.kind == LexKind::Global)
+        .map(|token| token.text(rest)[1..].to_string())
+        .collect())
+}
+
+/// The symbol LLVM names by an importer symbol name: a quoted spelling
+/// without its quotes and with its `\XX` escapes decoded, so `@"reg"`,
+/// `@"\72eg"` and `@reg` are one symbol, as they are to LLVM
+/// (`lexical::canonicalize` already spells every such name plainly; a `\01`
+/// asm label is the one quoted spelling left). A name whose escapes decode
+/// to bytes that are not UTF-8 stays as spelled.
+fn llvm_symbol_identity(name: &str) -> String {
+    match name
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+    {
+        Some(inner) => decode_ll_name_string(inner, "").unwrap_or_else(|_| inner.to_string()),
+        None => name.to_string(),
+    }
+}
+
+/// Whether LLVM reads the function spelled `spelled` (the canonical text
+/// after `@`, before any `\01` asm-label reading) as an intrinsic:
+/// `Function::isIntrinsic`, true when the IR name starts with `llvm.`. A
+/// `\01` label's IR name starts with the `\01` byte, so `@"\01_llvm.assume"`
+/// is no intrinsic (`Parser::split_asm_label` refuses such a label). The
+/// name is read decoded: a quoted name LLVM decodes to one starting with
+/// `llvm.` may be an intrinsic too, since `Intrinsic::lookupIntrinsicID`
+/// reads an overloaded intrinsic by its name and a `.`, whatever follows,
+/// and LLVM's parser then remangles the name and replaces the attributes
+/// (llc 22.1.2 accepts the key alone on `declare <4 x double>
+/// @"llvm.fmuladd.a b"(<4 x double>, <4 x double>, <4 x double>)`, which
+/// it prints as `@llvm.fmuladd.v4f64`). Like a plain name LLVM does not
+/// define, a quoted one (`@"llvm.a b"`) is exempt too, where llc keeps and
+/// rejects the key alone: the importer is no validator (the sixth verifier
+/// round of L02-P15 found the fifth repair's claim that such a declaration
+/// is refused either way false where its unmodelled signature skips it).
+fn is_intrinsic_ir_name(spelled: &str) -> bool {
+    llvm_symbol_identity(spelled).starts_with("llvm.")
+}
+
+/// Whether this importer's backend lowers a direct call of the function
+/// with canonical name `name` as an operation rather than a call, by that
+/// name: `trust_cg_lower::classify_adapter_named_call`'s claim (a C library
+/// memory routine or an LLVM intrinsic the adapter reads), the one list of
+/// those names. The adapter keeps the claim only for a callee declared with
+/// the prototype it needs (`classify_adapter_direct_call`,
+/// LD-100), which reads the signature this importer
+/// gives the callee, so that signature must be the one the module's own
+/// header states (rule 8 there).
+fn backend_reads_call_by_name(name: &str) -> bool {
+    classify_adapter_named_call(name) != AdapterNamedCallSemantics::Ordinary
+}
+
+/// Whether `name` is a C library routine the backend reads by its name and
+/// declared prototype (`memcpy`, `memmove` and `memset` today): a name
+/// [`backend_reads_call_by_name`] claims that is not an LLVM intrinsic's.
+/// LLVM reads a declaration as the library's function only under that IR
+/// name, with C's prototype and a C-compatible convention, and llc calls any
+/// other; the backend reads the name and prototype this importer carries.
+/// Wherever the importer would carry them from anything but the module's
+/// own header under that name, the module is refused by name: a `fastcc`
+/// header, which it reads as C (`Parser::function_symbol_facts`); an
+/// unprototyped or unmodeled header, or none, which a call would sign
+/// (`Parser::parse_declare`,
+/// `Parser::refuse_library_routines_without_a_header`); and a Mach-O `\01_`
+/// label, carried under the plain name (`Parser::split_asm_label`).
+fn is_c_library_routine_read_by_prototype(name: &str) -> bool {
+    !name.starts_with("llvm.") && backend_reads_call_by_name(name)
+}
+
+/// `alias` or `ifunc` when the entity after `@name =` is one: the first
+/// token of `rest` that is not one of the keywords LLVM's grammar puts before
+/// the entity keyword (linkage, preemption, visibility, DLL storage class,
+/// `thread_local`, `unnamed_addr`/`local_unnamed_addr`, an address space)
+/// is `alias` or `ifunc`. A global's first such token is `global` or
+/// `constant` instead, so an initializer that spells either word
+/// (`c"alias"`) is never read here.
+fn alias_or_ifunc_keyword(rest: &str) -> Option<&'static str> {
+    let mut tokens = rest.split_whitespace();
+    let first = loop {
+        let token = tokens.next()?;
+        let prefix_keyword = LlvmLinkage::from_keyword(token).is_some()
+            || matches!(
+                token,
+                "default"
+                    | "hidden"
+                    | "protected"
+                    | "dso_local"
+                    | "dso_preemptable"
+                    | "dllimport"
+                    | "dllexport"
+                    | "unnamed_addr"
+                    | "local_unnamed_addr"
+                    | "externally_initialized"
+                    | "thread_local"
+            )
+            || token.starts_with("thread_local(")
+            || token.starts_with("addrspace(");
+        if !prefix_keyword {
+            break token;
+        }
+    };
+    match first {
+        "alias" => Some("alias"),
+        "ifunc" => Some("ifunc"),
+        _ => None,
     }
 }
 
@@ -6894,18 +12636,20 @@ fn split_global_storage(rest: &str) -> Option<(bool, &str)> {
         return Some((false, tail));
     }
 
-    let lower = rest.to_lowercase();
-    for (pat, mutable) in [
+    // The storage keyword is the EARLIEST match: the prefix before it holds
+    // only keywords, while the initializer after it may be a string that
+    // spells ` global ` (`private constant [..] c"a global"`). LLVM keywords
+    // are lower case, so `rest` is searched as written.
+    [
         (" global ", true),
         (" global[", true),
         (" constant ", false),
         (" constant[", false),
-    ] {
-        if let Some(idx) = lower.find(pat) {
-            return Some((mutable, &rest[idx + pat.len()..]));
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .filter_map(|(pat, mutable)| rest.find(pat).map(|idx| (idx, pat, mutable)))
+    .min_by_key(|(idx, ..)| *idx)
+    .map(|(idx, pat, mutable)| (mutable, &rest[idx + pat.len()..]))
 }
 
 fn parse_align_clause(s: &str) -> Option<u64> {
@@ -7090,39 +12834,102 @@ fn split_call_args(s: &str) -> Vec<String> {
     out
 }
 
+/// The end of an LLVM string token's body: LLVM's lexer (`LLLexer::ReadString`)
+/// ends a string at the next `"`, whatever precedes it. There is no `\"`
+/// escape; a quote inside a string is spelled `\22`.
 fn find_ll_string_end(s: &str) -> Option<usize> {
-    // LLVM strings terminate at an unescaped `"`. The only escape is
-    // `\\xx` (hex) — `\\` and `\"` don't occur in clang-generated string
-    // constants for our corpus. We just look for the first `"`.
     s.find('"')
 }
 
+/// Decode an LLVM string token's body (without its quotes) exactly as LLVM's
+/// `UnEscapeLexed` does: the importer's one decoder,
+/// [`crate::lexical::decode_escapes`].
 fn decode_ll_string(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                out.push(((h << 4) | l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    out
+    crate::lexical::decode_escapes(s.as_bytes())
 }
 
+/// Decode an LLVM string token that names something (a section) rather than
+/// holding data: [`decode_ll_string`], and the decoded bytes must be UTF-8,
+/// the only form trust-ir carries a name in. `subject` names the use.
+fn decode_ll_name_string(s: &str, subject: &str) -> Result<String> {
+    String::from_utf8(decode_ll_string(s)).map_err(|_| {
+        Error::Unsupported(format!(
+            "{subject}: the string \"{s}\" decodes to bytes that are not UTF-8, which a \
+             trust-ir name cannot hold"
+        ))
+    })
+}
+
+/// The refusal of a `c"..."` initializer whose decoded length is not the
+/// length of its declared `[N x i8]` type. LLVM's parser rejects the same
+/// module (a constant of the wrong type).
+fn c_string_length_mismatch(subject: &str, raw: &str, decoded: usize, declared: u64) -> Error {
+    Error::Unsupported(format!(
+        "{subject}: c-string initializer c\"{raw}\" decodes to {decoded} byte(s), but its type \
+         is [{declared} x i8] (a c-string whose decoded length differs from its declared \
+         array type)"
+    ))
+}
+
+/// An LLVM integer literal, `-?[0-9]+`. LLVM's lexer reads `0x...` as a
+/// floating-point bit pattern (an integer type rejects it: "floating point
+/// constant invalid for type"; LLVM spells a hexadecimal integer `u0x`/`s0x`),
+/// so no hexadecimal spelling is an integer here, and neither is a leading
+/// `+`.
 pub(crate) fn parse_int_literal(s: &str) -> Option<i128> {
     let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return i128::from_str_radix(hex, 16).ok();
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
     s.parse::<i128>().ok()
+}
+
+/// The low `bits` bits of `n` (two's complement), read as a signed
+/// `bits`-bit integer: `n` reduced modulo `2^bits` into `[-2^(bits-1),
+/// 2^(bits-1))`. `bits` is 1 to 64.
+fn signed_low_bits(n: i128, bits: u32) -> i128 {
+    debug_assert!((1..=64).contains(&bits));
+    let modulus = 1i128 << bits;
+    let low = n.rem_euclid(modulus);
+    if low >= modulus / 2 {
+        low - modulus
+    } else {
+        low
+    }
+}
+
+/// `offset + index * size` in a GEP's 64-bit offset arithmetic, as LLVM
+/// computes a constant GEP: the index truncated or sign-extended to 64 bits,
+/// every product and sum modulo `2^64` (two's complement wrapping; llc 22.1.2
+/// folds `getelementptr [4 x i64], ptr %p, i64 0, i64 2305843009213693953`
+/// to `p + 8`), spelled in `i64`'s signed range. `offset` is such a value.
+fn gep_offset_add(offset: i128, index: i128, size: u64) -> i128 {
+    let term = signed_low_bits(signed_low_bits(index, 64) * i128::from(size), 64);
+    signed_low_bits(offset + term, 64)
+}
+
+/// The low `bits` bits of `n` (two's complement), read as an unsigned
+/// `bits`-bit integer: `n` reduced modulo `2^bits` into `[0, 2^bits)`, the
+/// value LLVM zero-extends (an `alloca` count). `bits` is 1 to 64.
+fn unsigned_low_bits(n: i128, bits: u32) -> i128 {
+    debug_assert!((1..=64).contains(&bits));
+    n.rem_euclid(1i128 << bits)
+}
+
+/// The element count LLVM reads for the `alloca` count literal `n` of
+/// integer type `ty`: its low bits at the type's width, zero-extended
+/// ([`unsigned_low_bits`]); an `i128` count keeps the literal's value, and
+/// the callers refuse one outside `[0, 2^64)` by name.
+fn count_literal_value(n: i128, ty: &Ty) -> i128 {
+    match ty {
+        Ty::Bool => unsigned_low_bits(n, 1),
+        Ty::I8 => unsigned_low_bits(n, 8),
+        Ty::I16 => unsigned_low_bits(n, 16),
+        Ty::I32 => unsigned_low_bits(n, 32),
+        Ty::I64 => unsigned_low_bits(n, 64),
+        _ => n,
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -7131,12 +12938,166 @@ pub(crate) fn parse_int_literal(s: &str) -> Option<i128> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use trust_cg_ir::StackProtectorMode;
 
+    /// This file's fixtures are hand-built and carry no codegen license
+    /// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+    /// decision gate DG-73). Its lowerings state `Permit` explicitly, so none of
+    /// them passes (or is refused) because the license silently refused it.
+    fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+        trust_cg_lower::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+    }
+
+    #[test]
+    fn input_stream_stops_after_the_limit_sentinel() {
+        let mut input = std::io::Cursor::new(b"abcdefgh");
+        let error = read_text_with_limit(&mut input, Path::new("growing.ll"), 4)
+            .expect_err("a growing input must exceed its admitted byte budget");
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        assert_eq!(
+            input.position(),
+            5,
+            "must not drain beyond limit plus one byte"
+        );
+    }
+
+    #[test]
+    fn oversized_stream_reports_the_limit_before_utf8_errors() {
+        let mut input = std::io::Cursor::new([b'a', b'b', b'c', b'd', 0xff, b'e']);
+        let error = read_text_with_limit(&mut input, Path::new("oversized.ll"), 4)
+            .expect_err("byte limit must be checked before UTF-8 decoding");
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        assert_eq!(input.position(), 5);
+    }
+
+    #[test]
+    fn bounded_input_preserves_exact_limit_utf8_and_io_errors() {
+        let path = Path::new("input.ll");
+        assert_eq!(read_text_with_limit(&b"abcd"[..], path, 4).unwrap(), "abcd");
+        assert_eq!(read_text_with_limit(&b""[..], path, 0).unwrap(), "");
+        assert!(matches!(
+            read_text_with_limit(&b"x"[..], path, 0),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            read_text_with_limit(&[0xff][..], path, 4),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        struct BrokenRead;
+        impl std::io::Read for BrokenRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("armed input failure"))
+            }
+        }
+        let error = read_text_with_limit(BrokenRead, path, 4).unwrap_err();
+        assert!(matches!(error, Error::Io(ref io) if io.to_string() == "armed input failure"));
+    }
+
+    #[test]
+    fn struct_layout_overflow_is_a_diagnostic() {
+        let huge = u64::MAX;
+        for body in [
+            format!("{{ [{huge} x i8], i8 }}"),
+            format!("{{ [{huge} x i8], i64 }}"),
+            format!("{{ i64, [{} x i8] }}", huge - 8),
+        ] {
+            for source in [
+                format!("%Huge = type {body}\n"),
+                format!("%Outer = type {{ {body} }}\n"),
+            ] {
+                let result = import_text(&source, "overflow");
+                assert!(
+                    matches!(result, Err(Error::Unsupported(_))),
+                    "{source}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_fields_cannot_overwrite_or_pad_mismatched_typed_values() {
+        for source in [
+            "%S = type { i8, i8 }\n@g = global %S { i64 257, i8 2 }\n",
+            "%S = type { i64, i8 }\n@g = global %S { i8 1, i8 2 }\n",
+            "@g = global [1 x { i8, i8 }] [{ i8, i8 } { i64 257, i8 2 }]\n",
+            "@g = global [1 x { i8, i8 }] [{ i16 } { i16 257 }]\n",
+        ] {
+            let result = import_text(source, "typed-initializer");
+            assert!(
+                matches!(result, Err(Error::Unsupported(_))),
+                "{source}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_byte_limits_are_checked_before_growth() {
+        let parser = Parser::new("", "bounded".into());
+        let mut bytes = vec![7];
+        let error = parser
+            .serialize_typed_const("[8 x i8] zeroinitializer", &mut bytes, None, 4)
+            .expect_err("declared extent must fit before resizing");
+        assert!(matches!(error, Error::Unsupported(_)));
+        assert_eq!(bytes, [7]);
+        parser
+            .serialize_typed_const("[3 x i8] zeroinitializer", &mut bytes, None, 4)
+            .expect("exact remaining extent must fit");
+        assert_eq!(bytes, [7, 0, 0, 0]);
+
+        for length in [MAX_IMPORTED_GLOBAL_INIT_BYTES + 1, u64::MAX] {
+            let source = format!(
+                "%Large = type {{ [{length} x i8] }}\n@g = global %Large {{ [{length} x i8] zeroinitializer }}\n"
+            );
+            let error =
+                import_text(&source, "oversized").expect_err("no giant byte image allocation");
+            assert!(
+                matches!(error, Error::Unsupported(ref message) if message.contains("over importer limit")),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_nested_layouts_preserve_initializer_types_and_padding() {
+        let source = r#"
+%S = type { [2 x i32], i8 }
+@g = global [2 x %S] [%S { [2 x i32] [i32 1, i32 2], i8 3 }, %S { [2 x i32] [i32 4, i32 5], i8 6 }]
+"#;
+        let module = import_text(source, "nested").expect("complete named layouts must import");
+        assert_eq!(
+            global_bytes(&module, "g"),
+            [
+                1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0,
+            ]
+        );
+
+        let mut parser = Parser::new("%A = type { i8 }\n%B = type { %A, %A }\n", "sharing".into());
+        parser.parse().expect("named layout sharing");
+        let fields = &parser.struct_layouts["%B"].fields;
+        let (FixedLayout::Struct { fields: left, .. }, FixedLayout::Struct { fields: right, .. }) =
+            (&fields[0].layout, &fields[1].layout)
+        else {
+            panic!("nested type was erased");
+        };
+        assert!(
+            Arc::ptr_eq(left, right),
+            "repeated named uses must share immutable field trees"
+        );
+    }
+
     fn lowered_stack_protector(src: &str, function_name: &str) -> StackProtectorMode {
         let module = import_text(src, "stack-protector").expect("parse");
-        let lowered = trust_cg_lower::translate_module(&module).expect("lower");
+        let lowered = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+            &module,
+            trust_cg_lower::GuardCarrierArch::default(),
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
+        )
+        .expect("lower");
         lowered
             .into_iter()
             .find_map(|(func, _)| (func.name == function_name).then_some(func.stack_protector))
@@ -7394,19 +13355,20 @@ entry:
     }
 
     #[test]
-    fn tail_and_musttail_call_markers_are_stripped() {
-        // At -O1 clang prefixes calls with `tail`/`musttail`. The marker is an
+    fn tail_and_notail_call_markers_are_stripped() {
+        // At -O1 clang prefixes calls with `tail`/`notail`. The marker is an
         // optimization hint; dispatch must still see the `call` opcode.
+        // (`musttail` is refused: musttail_is_refused_and_the_tail_hints_are_admitted.)
         let src = r#"
 declare i32 @g(i32)
 define i32 @f(i32 %a) {
 entry:
   %r = tail call i32 @g(i32 %a)
-  %s = musttail call i32 @g(i32 %r)
+  %s = notail call i32 @g(i32 %r)
   ret i32 %s
 }
 "#;
-        let m = import_text(src, "t").expect("tail/musttail call imports");
+        let m = import_text(src, "t").expect("tail/notail call imports");
         let f = func_named(&m, "f");
         assert_eq!(
             count_insts(f, |i| matches!(i, Inst::Call { .. })),
@@ -8135,14 +14097,9 @@ entry:
 @g = global %struct.foo zeroinitializer, align 4
 "#;
         let m = import_text(src, "t").expect("named struct zero global imports");
-        let g = m.globals.iter().find(|g| g.name == "g").expect("global g");
-        match &g.initializer {
-            Some(Constant::Aggregate(bytes)) => {
-                assert_eq!(bytes.len(), 8, "{{i32,i16}} == 8 bytes (padded to align 4)");
-                assert!(bytes.iter().all(|b| matches!(b, Constant::Int(0))));
-            }
-            other => panic!("expected zero byte aggregate, got {:?}", other),
-        }
+        let bytes = image(&m, "g");
+        assert_eq!(bytes.len(), 8, "{{i32,i16}} == 8 bytes (padded to align 4)");
+        assert!(bytes.iter().all(|b| matches!(b, Constant::Int(0))));
     }
 
     #[test]
@@ -8171,10 +14128,7 @@ entry:
 @.str = private unnamed_addr constant [4 x i8] c"%d\0A\00", align 1
 "#;
         let m = import_text(src, "t").expect("string global imports");
-        match &m.globals[0].initializer {
-            Some(Constant::Aggregate(bytes)) => assert_eq!(bytes.len(), 4),
-            other => panic!("expected byte aggregate, got {:?}", other),
-        }
+        assert_eq!(image(&m, ".str").len(), 4);
     }
 
     #[test]
@@ -8907,23 +14861,24 @@ entry:
         );
     }
 
+    /// Global `name`'s flat data image (one `Int` per byte, one `SymbolAddr`
+    /// per pointer slot), read back through the typed spelling the importer
+    /// emits ([`trust_cg_lower::global_image::type_flat_image`]).
+    fn image(m: &Module, name: &str) -> Vec<Constant> {
+        let global = m.globals.iter().find(|g| g.name == name).expect("global");
+        let initializer = global.initializer.as_ref().expect("an initialized global");
+        trust_cg_lower::global_image::flat_image_elements(m, &global.ty, initializer)
+            .unwrap_or_else(|| panic!("{name}: not a data image: {:?} {initializer:?}", global.ty))
+    }
+
     fn global_bytes(m: &Module, name: &str) -> Vec<u8> {
-        match &m
-            .globals
+        image(m, name)
             .iter()
-            .find(|g| g.name == name)
-            .expect("global")
-            .initializer
-        {
-            Some(Constant::Aggregate(cs)) => cs
-                .iter()
-                .map(|c| match c {
-                    Constant::Int(v) => *v as u8,
-                    other => panic!("non-byte constant {:?}", other),
-                })
-                .collect(),
-            other => panic!("expected byte aggregate, got {:?}", other),
-        }
+            .map(|c| match c {
+                Constant::Int(v) => *v as u8,
+                other => panic!("non-byte constant {:?}", other),
+            })
+            .collect()
     }
 
     #[test]
@@ -8986,30 +14941,55 @@ entry:
 @g = global %struct.Globals zeroinitializer, align 8
 "#;
         let m = import_text(src, "t").expect("forward-referenced struct resolves");
-        let g = m.globals.iter().find(|g| g.name == "g").expect("global g");
-        match &g.initializer {
-            Some(Constant::Aggregate(bytes)) => assert_eq!(bytes.len(), 24),
-            other => panic!("expected 24 zero bytes, got {:?}", other),
-        }
+        assert_eq!(image(&m, "g").len(), 24);
     }
 
     #[test]
     fn null_pointer_global_lowers_to_pointer_sized_zero_bytes() {
-        // `@g = common global ptr null` -> 8 zero bytes (Ptr-typed), the form
-        // the codegen global tree accepts (an Int initializer on Ptr is rejected).
+        // `@g = global ptr null` -> the 8-byte zero image (the object writer
+        // has no integer or null initializer for a `Ptr`-typed global).
         let src = r#"
-@g = common local_unnamed_addr global ptr null, align 8
+@g = dso_local local_unnamed_addr global ptr null, align 8
 "#;
         let m = import_text(src, "t").expect("ptr null global imports");
         let g = m.globals.iter().find(|g| g.name == "g").expect("global g");
-        assert_eq!(g.ty, Ty::Ptr);
-        match &g.initializer {
-            Some(Constant::Aggregate(bytes)) => {
-                assert_eq!(bytes.len(), 8, "pointer == 8 bytes");
-                assert!(bytes.iter().all(|b| matches!(b, Constant::Int(0))));
-            }
-            other => panic!("expected 8 zero bytes, got {:?}", other),
-        }
+        assert!(matches!(g.ty, Ty::Array(_, 8)), "{:?}", g.ty);
+        assert_eq!(g.initializer, Some(Constant::splat(Constant::Int(0), 8)));
+        let bytes = image(&m, "g");
+        assert_eq!(bytes.len(), 8, "pointer == 8 bytes");
+        assert!(bytes.iter().all(|b| matches!(b, Constant::Int(0))));
+    }
+
+    #[test]
+    fn global_section_visibility_and_used_retention_import_faithfully() {
+        // trust-ir v41 carries section, visibility and `#[used]` retention on
+        // every global. All three come from the LLVM text, not from defaults:
+        // a `hidden` global must not import as exported, a sectioned global
+        // must keep its placement, and a symbol in `@llvm.used` must be
+        // marked retained or a conformant consumer may legally drop it. One
+        // only in `@llvm.compiler.used` is not, as llc does not retain it.
+        let src = r#"
+@a = hidden global i32 1, section ".mysec", align 4
+@b = internal global i32 2, align 4
+@c = protected constant i32 3
+@llvm.used = appending global [1 x ptr] [ptr @b], section "llvm.metadata"
+@llvm.compiler.used = appending global [1 x ptr] [ptr @c], section "llvm.metadata"
+"#;
+        let m = import_text(src, "t").expect("v41 global attributes import");
+        let g = |n: &str| m.globals.iter().find(|g| g.name == n).expect(n);
+        assert_eq!(g("a").visibility, Visibility::Hidden);
+        assert_eq!(g("a").section.as_deref(), Some(".mysec"));
+        assert!(!g("a").retained);
+        assert_eq!(g("b").visibility, Visibility::Default);
+        assert_eq!(g("b").section, None);
+        assert!(g("b").retained, "listed in @llvm.used");
+        assert_eq!(g("c").visibility, Visibility::Protected);
+        // llc writes no retention for `@llvm.compiler.used`.
+        assert!(!g("c").retained, "listed in @llvm.compiler.used only");
+        assert!(
+            !m.globals.iter().any(|g| g.name.starts_with("llvm.")),
+            "the used arrays are metadata, never globals of the module"
+        );
     }
 
     #[test]
@@ -9720,17 +15700,18 @@ entry:
     #[test]
     fn fixed_array_nested_i32_zero_global_is_parsed_as_byte_storage() {
         let src = r#"
-@ima = common global [41 x [41 x i32]] zeroinitializer, align 4
+@ima = dso_local global [41 x [41 x i32]] zeroinitializer, align 4
 "#;
         let m = import_text(src, "t").expect("parse");
         assert_eq!(m.globals.len(), 1);
         let global = &m.globals[0];
         assert_eq!(global.name, "ima");
-        assert_eq!(global.ty, Ty::Ptr);
+        assert!(
+            matches!(global.ty, Ty::Array(..)),
+            "a data image is a [u8; N] global"
+        );
         assert!(global.mutable);
-        let Some(Constant::Aggregate(elems)) = &global.initializer else {
-            panic!("expected byte aggregate initializer");
-        };
+        let elems = &image(&m, &global.name);
         assert_eq!(elems.len(), 41 * 41 * 4);
         assert!(elems.iter().all(|elem| *elem == Constant::Int(0)));
     }
@@ -9738,7 +15719,7 @@ entry:
     #[test]
     fn fixed_array_matrix_gep_uses_byte_scaled_gep_not_copy() {
         let src = r#"
-@imr = common global [41 x [41 x i32]] zeroinitializer, align 4
+@imr = dso_local global [41 x [41 x i32]] zeroinitializer, align 4
 
 define ptr @f(i64 %row) {
 entry:
@@ -9832,12 +15813,13 @@ entry:
         assert_eq!(m.globals.len(), 1);
         let global = &m.globals[0];
         assert_eq!(global.name, "main.flags");
-        assert_eq!(global.ty, Ty::Ptr);
+        assert!(
+            matches!(global.ty, Ty::Array(..)),
+            "a data image is a [u8; N] global"
+        );
         assert!(global.mutable);
         assert!(matches!(global.linkage, Linkage::Internal));
-        let Some(Constant::Aggregate(elems)) = &global.initializer else {
-            panic!("expected byte aggregate initializer");
-        };
+        let elems = &image(&m, &global.name);
         assert_eq!(elems.len(), 8193);
         assert!(elems.iter().all(|elem| *elem == Constant::Int(0)));
     }
@@ -9872,12 +15854,13 @@ entry:
         assert_eq!(m.globals.len(), 1);
         let global = &m.globals[0];
         assert_eq!(global.name, "staticData");
-        assert_eq!(global.ty, Ty::Ptr);
+        assert!(
+            matches!(global.ty, Ty::Array(..)),
+            "a data image is a [u8; N] global"
+        );
         assert!(global.mutable);
         assert!(matches!(global.linkage, Linkage::Internal));
-        let Some(Constant::Aggregate(elems)) = &global.initializer else {
-            panic!("expected byte aggregate initializer");
-        };
+        let elems = &image(&m, &global.name);
         let bytes: Vec<i128> = elems
             .iter()
             .map(|elem| match elem {
@@ -9957,26 +15940,22 @@ entry:
         let m = import_text(src, "t").expect("non-i8 zero array global imports");
         assert_eq!(m.globals.len(), 1);
         assert_eq!(m.globals[0].name, "words");
-        match &m.globals[0].initializer {
-            Some(Constant::Aggregate(bytes)) => {
-                assert_eq!(bytes.len(), 32, "16 x i16 == 32 bytes");
-                assert!(
-                    bytes.iter().all(|b| matches!(b, Constant::Int(0))),
-                    "zeroinitializer must be all zero bytes"
-                );
-            }
-            other => panic!("expected zero byte aggregate, got {:?}", other),
-        }
+        let bytes = image(&m, "words");
+        assert_eq!(bytes.len(), 32, "16 x i16 == 32 bytes");
+        assert!(
+            bytes.iter().all(|b| matches!(b, Constant::Int(0))),
+            "zeroinitializer must be all zero bytes"
+        );
     }
 
     #[test]
     fn scalar_global_float() {
         let src = r#"
-@z = global float 3.14
+@z = global float 0x40091EB860000000
 "#;
         let m = import_text(src, "t").expect("parse");
         match &m.globals[0].initializer {
-            Some(Constant::Float(v)) => assert!((*v - (314.0 / 100.0)).abs() < 1e-9),
+            Some(Constant::Float(v)) => assert_eq!(v.to_bits(), 0x4009_1EB8_6000_0000),
             other => panic!("expected float initializer, got {:?}", other),
         }
     }
@@ -10033,12 +16012,8 @@ entry:
         assert_eq!(m.globals.len(), 1);
         assert_eq!(m.globals[0].name, ".str");
         assert_eq!(m.globals[0].align, Some(1));
-        if let Some(Constant::Aggregate(elems)) = &m.globals[0].initializer {
-            assert_eq!(elems.len(), 8);
-            // "success\0" = 8 bytes.
-        } else {
-            panic!("expected Aggregate initializer");
-        }
+        // "success\0" = 8 bytes.
+        assert_eq!(image(&m, ".str").len(), 8);
     }
 
     #[test]
@@ -10107,7 +16082,7 @@ entry:
     #[test]
     fn global_address_in_call_is_materialized() {
         let src = r#"
-@.str = private unnamed_addr constant [6 x i8] c"hi!\0A\00", align 1
+@.str = private unnamed_addr constant [5 x i8] c"hi!\0A\00", align 1
 
 declare i32 @printf(ptr noundef, ...)
 
@@ -10156,7 +16131,7 @@ entry:
     #[test]
     fn forward_vararg_call_preserves_fixed_param_count() {
         let src = r#"
-@.str = private unnamed_addr constant [8 x i8] c"%d %d\0A\00", align 1
+@.str = private unnamed_addr constant [7 x i8] c"%d %d\0A\00", align 1
 
 define i32 @main() {
 entry:
@@ -10320,6 +16295,78 @@ attributes #0 = { allocsize(0,1) }
         assert!(gep_has_inbounds_and_noalias);
     }
 
+    /// LD-100 rule 11: the fresh-allocation facts are C's allocator's, so a
+    /// call of `malloc`, `calloc`, `aligned_alloc` or `reallocarray` carries
+    /// them only at C's prototype. A function only named like one (another
+    /// parameter list, or a variadic header), `allocsize` and all, is an
+    /// ordinary callee and its result carries neither fact.
+    #[test]
+    fn allocation_facts_need_the_c_prototype() {
+        let allocation_facts = |src: &str| -> (bool, bool) {
+            let m = import_text(src, "alloc_facts").expect("import the allocation fixture");
+            let caller = m
+                .functions
+                .iter()
+                .find(|func| func.name == "f")
+                .expect("the calling function");
+            let call = caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .find(|node| matches!(node.inst, Inst::Call { .. }))
+                .expect("the allocation call");
+            (
+                call.proofs.contains(&ProofAnnotation::NoAlias),
+                call.proofs.contains(&ProofAnnotation::Aligned(16)),
+            )
+        };
+        for (name, c_params, c_args, other_params, other_args) in [
+            ("malloc", "i64", "i64 %n", "i64, i64", "i64 %n, i64 4"),
+            ("calloc", "i64, i64", "i64 %n, i64 4", "i64", "i64 %n"),
+            (
+                "aligned_alloc",
+                "i64, i64",
+                "i64 16, i64 %n",
+                "i32, i64",
+                "i32 16, i64 %n",
+            ),
+            (
+                "reallocarray",
+                "ptr, i64, i64",
+                "ptr null, i64 %n, i64 4",
+                "i64, i64, i64",
+                "i64 0, i64 %n, i64 4",
+            ),
+            ("malloc", "i64", "i64 %n", "i64, ...", "i64 %n"),
+        ] {
+            let program = |params: &str, args: &str| {
+                let call_ty = if params.ends_with("...") {
+                    format!("ptr ({params})")
+                } else {
+                    "ptr".to_string()
+                };
+                format!(
+                    "declare ptr @{name}({params}) #0\n\
+                     define ptr @f(i64 %n) {{\n\
+                     entry:\n  \
+                     %p = call {call_ty} @{name}({args}) #0\n  \
+                     ret ptr %p\n}}\n\
+                     attributes #0 = {{ allocsize(0) }}\n"
+                )
+            };
+            assert_eq!(
+                allocation_facts(&program(c_params, c_args)),
+                (true, true),
+                "{name} at C's prototype"
+            );
+            assert_eq!(
+                allocation_facts(&program(other_params, other_args)),
+                (false, false),
+                "{name} declared ({other_params})"
+            );
+        }
+    }
+
     // ---- Cluster 1: `\01` asm-label (verbatim, no-mangle) symbols ----------
 
     #[test]
@@ -10327,6 +16374,7 @@ attributes #0 = { allocsize(0,1) }
         // `@"\01_clock"` is the Darwin verbatim symbol `_clock`; codegen prepends
         // `_`, so the importer must yield `clock` (strip `\01`, strip one `_`).
         let src = r#"
+target triple = "arm64-apple-macosx14.0.0"
 declare i64 @"\01_clock"()
 define i64 @second() {
 entry:
@@ -10349,6 +16397,7 @@ entry:
     #[test]
     fn asm_label_global_strips_escape_and_one_underscore() {
         let src = r#"
+target triple = "arm64-apple-macosx14.0.0"
 @"\01_myvar" = global i32 0, align 4
 "#;
         let m = import_text(src, "t").expect("asm-label global imports");
@@ -10364,6 +16413,7 @@ entry:
         // A `\01` label not starting with `_` cannot be represented on Mach-O
         // without a dedicated no-mangle flag: fail closed, never emit a wrong sym.
         let src = r#"
+target triple = "arm64-apple-macosx14.0.0"
 declare void @"\01foo"()
 define void @f() {
 entry:
@@ -10382,6 +16432,7 @@ entry:
         // `@"\01_dup"` de-mangles to `dup`, which also names the plain `@dup`;
         // two source-distinct symbols would silently merge — fail closed.
         let src = r#"
+target triple = "arm64-apple-macosx14.0.0"
 declare void @"\01_dup"()
 declare void @dup()
 "#;
@@ -10683,6 +16734,7 @@ entry:
     #[test]
     fn memset_pattern_i32_lowers_to_memset_pattern4_call() {
         let src = r#"
+target triple = "arm64-apple-macosx14.0.0"
 @file = internal global [100 x i32] zeroinitializer, align 4
 declare void @llvm.experimental.memset.pattern.p0.i32.i64(ptr, i32, i64, i1)
 define void @f() {
@@ -10720,6 +16772,7 @@ entry:
         // An i16 pattern is 2 bytes; libSystem has no `memset_pattern2`, so it
         // must fail closed rather than emit a wrong byte count.
         let src = r#"
+target triple = "arm64-apple-macosx14.0.0"
 @h = internal global [8 x i16] zeroinitializer, align 2
 declare void @llvm.experimental.memset.pattern.p0.i16.i64(ptr, i16, i64, i1)
 define void @f() {
@@ -10837,20 +16890,11 @@ entry:
 @a = private constant [2 x i8] c"x\00", align 1
 "#;
         let m = import_text(src, "t").expect("pointer array with null imports");
-        let init = m
-            .globals
-            .iter()
-            .find(|g| g.name == "tab")
-            .and_then(|g| g.initializer.clone());
-        match init {
-            Some(Constant::Aggregate(elems)) => {
-                // One SymbolAddr + eight zero bytes for the null pointer = 8 bytes.
-                assert!(matches!(&elems[0], Constant::SymbolAddr { symbol, .. } if symbol == "a"));
-                assert_eq!(elems.len(), 1 + 8, "SymbolAddr + 8 null bytes");
-                assert!(elems[1..].iter().all(|c| matches!(c, Constant::Int(0))));
-            }
-            other => panic!("expected aggregate, got {other:?}"),
-        }
+        // One SymbolAddr + eight zero bytes for the null pointer.
+        let elems = image(&m, "tab");
+        assert!(matches!(&elems[0], Constant::SymbolAddr { symbol, .. } if symbol == "a"));
+        assert_eq!(elems.len(), 1 + 8, "SymbolAddr + 8 null bytes");
+        assert!(elems[1..].iter().all(|c| matches!(c, Constant::Int(0))));
     }
 
     /// A pointer-INDUCTION-VARIABLE loop starting inside a global array
@@ -10979,11 +17023,7718 @@ entry:
 }
 "#;
         let m = import_text(src, "t").expect("zext i1 to i8 imports");
-        let lowered = trust_cg_lower::translate_module(&m);
+        let lowered = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+            &m,
+            trust_cg_lower::GuardCarrierArch::default(),
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
+        );
         assert!(
             lowered.is_ok(),
             "zext Bool->I8 must lower through the adapter, got {:?}",
             lowered.err()
         );
+    }
+
+    // L02-P13: function and global symbol facts (linkage, visibility,
+    // COMDAT, section) come from the LLVM text, never from defaults.
+
+    fn function_facts(module: &Module, name: &str) -> (Linkage, Visibility, bool) {
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("function `{name}` in {:?}", module.functions));
+        (
+            function.linkage,
+            function.visibility,
+            function.blocks.is_empty(),
+        )
+    }
+
+    fn unsupported_reason(src: &str) -> String {
+        match import_text(src, "t") {
+            Err(Error::Unsupported(reason)) => reason,
+            other => panic!("expected a named refusal for\n{src}\ngot {other:?}"),
+        }
+    }
+
+    #[test]
+    fn l02_p13_reproducer_keeps_function_linkage_and_visibility() {
+        // The ledger reproducer: every function used to import as `External`
+        // + `Default`, so a hidden function compiled `pic` was exported and
+        // interposable and a `linkonce_odr` one became a strong definition.
+        let src = r#"
+define hidden i64 @fh() {
+  ret i64 1
+}
+define protected i64 @fp() {
+  ret i64 2
+}
+define linkonce_odr hidden i64 @flo() {
+  ret i64 3
+}
+declare hidden i64 @dh()
+"#;
+        // `@flo` has no `comdat` clause, so it is in no group: llc emits a
+        // plain weak symbol, the backend's `LinkOnce` definition.
+        let m = import_text(src, "t").expect("reproducer imports");
+        assert_eq!(
+            function_facts(&m, "fh"),
+            (Linkage::External, Visibility::Hidden, false)
+        );
+        assert_eq!(
+            function_facts(&m, "fp"),
+            (Linkage::External, Visibility::Protected, false)
+        );
+        assert_eq!(
+            function_facts(&m, "flo"),
+            (Linkage::LinkOnce, Visibility::Hidden, false)
+        );
+        assert_eq!(
+            function_facts(&m, "dh"),
+            (Linkage::External, Visibility::Hidden, true)
+        );
+    }
+
+    #[test]
+    fn every_llvm_function_linkage_maps_or_is_refused_by_name() {
+        // Without a `comdat` clause the ODR forms are their ungrouped twins
+        // (`odr_definitions_without_a_comdat_clause_are_ungrouped_weak_definitions`).
+        let defined = [
+            ("", Linkage::External),
+            ("external", Linkage::External),
+            ("internal", Linkage::Internal),
+            ("private", Linkage::Private),
+            ("weak", Linkage::Weak),
+            ("weak_odr", Linkage::Weak),
+            ("linkonce", Linkage::LinkOnce),
+            ("linkonce_odr", Linkage::LinkOnce),
+            ("available_externally", Linkage::AvailableExternally),
+        ];
+        for (keyword, linkage) in defined {
+            let src = format!("define {keyword} dso_local i32 @f() {{\n  ret i32 7\n}}\n");
+            let m = import_text(&src, "t").unwrap_or_else(|e| panic!("`{keyword}`: {e:?}"));
+            assert_eq!(
+                function_facts(&m, "f"),
+                (linkage, Visibility::Default, false),
+                "define {keyword}"
+            );
+        }
+        for (keyword, linkage) in [
+            ("", Linkage::External),
+            ("external", Linkage::External),
+            ("extern_weak", Linkage::ExternalWeak),
+        ] {
+            let src = format!("declare {keyword} i32 @f()\n");
+            let m = import_text(&src, "t").unwrap_or_else(|e| panic!("`{keyword}`: {e:?}"));
+            assert_eq!(
+                function_facts(&m, "f"),
+                (linkage, Visibility::Default, true),
+                "declare {keyword}"
+            );
+        }
+        for (src, needle) in [
+            (
+                "define extern_weak i32 @f() {\n  ret i32 0\n}\n",
+                "`extern_weak` on a definition",
+            ),
+            (
+                "define common i32 @f() {\n  ret i32 0\n}\n",
+                "linkage `common`",
+            ),
+            (
+                "define appending i32 @f() {\n  ret i32 0\n}\n",
+                "linkage `appending`",
+            ),
+            ("declare weak i32 @f()\n", "linkage `weak` on a declaration"),
+            (
+                "declare linkonce_odr i32 @f()\n",
+                "linkage `linkonce_odr` on a declaration",
+            ),
+            (
+                "declare internal i32 @f()\n",
+                "linkage `internal` on a declaration",
+            ),
+            (
+                "declare available_externally i32 @f()\n",
+                "on a declaration",
+            ),
+            ("declare common i32 @f()\n", "linkage `common`"),
+            (
+                "define internal weak i32 @f() {\n  ret i32 0\n}\n",
+                "two linkages",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+            assert!(reason.contains("`@f`"), "{src} names the symbol: {reason}");
+        }
+    }
+
+    #[test]
+    fn function_visibility_is_carried_or_refused_on_local_linkage() {
+        for (keyword, visibility) in [
+            ("default", Visibility::Default),
+            ("hidden", Visibility::Hidden),
+            ("protected", Visibility::Protected),
+        ] {
+            for (linkage_keyword, linkage) in [
+                ("", Linkage::External),
+                ("weak", Linkage::Weak),
+                ("weak_odr", Linkage::Weak),
+                ("linkonce", Linkage::LinkOnce),
+                ("linkonce_odr", Linkage::LinkOnce),
+                ("available_externally", Linkage::AvailableExternally),
+            ] {
+                let src =
+                    format!("define {linkage_keyword} {keyword} i32 @f() {{\n  ret i32 7\n}}\n");
+                let m = import_text(&src, "t").expect("visible definition imports");
+                assert_eq!(
+                    function_facts(&m, "f"),
+                    (linkage, visibility, false),
+                    "{src}"
+                );
+            }
+            for (linkage_keyword, linkage) in [
+                ("", Linkage::External),
+                ("extern_weak", Linkage::ExternalWeak),
+            ] {
+                let src = format!("declare {linkage_keyword} {keyword} i32 @f()\n");
+                let m = import_text(&src, "t").expect("visible declaration imports");
+                assert_eq!(
+                    function_facts(&m, "f"),
+                    (linkage, visibility, true),
+                    "{src}"
+                );
+            }
+        }
+        for local in ["internal", "private"] {
+            for visibility in ["hidden", "protected"] {
+                let src = format!("define {local} {visibility} i32 @f() {{\n  ret i32 7\n}}\n");
+                let reason = unsupported_reason(&src);
+                assert!(
+                    reason.contains(&format!("visibility `{visibility}` on a local (`{local}`)")),
+                    "{src}: {reason}"
+                );
+            }
+        }
+        assert!(
+            unsupported_reason("declare hidden protected i32 @f()\n").contains("two visibilities")
+        );
+    }
+
+    #[test]
+    fn dso_local_and_unnamed_addr_are_dropped_without_changing_any_fact() {
+        let plain = import_text(
+            "define hidden i32 @f() {\n  ret i32 7\n}\n@g = hidden global i32 1\n",
+            "t",
+        )
+        .expect("plain imports");
+        let annotated = import_text(
+            "define dso_local hidden i32 @f() local_unnamed_addr {\n  ret i32 7\n}\n\
+             @g = dso_local hidden unnamed_addr global i32 1\n",
+            "t",
+        )
+        .expect("annotated imports");
+        assert_eq!(function_facts(&plain, "f"), function_facts(&annotated, "f"));
+        assert_eq!(plain.globals, annotated.globals);
+    }
+
+    /// A `dso_local` declaration for the linker whose address a function
+    /// body takes is refused by name: llc 22 addresses it PC-relative under
+    /// every relocation model and the backend through the GOT. A direct
+    /// call, an initializer's pointer, an unaddressed declaration and the
+    /// forms LLVM makes dso-local without the keyword (hidden, protected)
+    /// or keeps in the GOT (`extern_weak`) stay admitted, as do `dso_local`
+    /// definitions and `dso_preemptable`.
+    #[test]
+    fn dso_local_declarations_are_refused_where_code_takes_their_address() {
+        for (src, what) in [
+            (
+                "@s = external dso_local global i64\n\
+                 define i64 @u() {\n  %v = load i64, ptr @s\n  ret i64 %v\n}\n",
+                "global declaration",
+            ),
+            (
+                "@s = available_externally dso_local global i64 7\n\
+                 define ptr @u() {\n  ret ptr @s\n}\n",
+                "`available_externally` global",
+            ),
+            (
+                "declare dso_local i64 @s()\ndefine ptr @u() {\n  ret ptr @s\n}\n",
+                "function declaration",
+            ),
+            (
+                "define available_externally dso_local i64 @s() {\n  ret i64 1\n}\n\
+                 define ptr @u() {\n  ret ptr @s\n}\n",
+                "`available_externally` function",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.contains(&format!(
+                    "{what} `@s` is `dso_local` and the module's code takes its address"
+                )),
+                "{src}: {reason}"
+            );
+        }
+        for src in [
+            "declare dso_local i64 @s()\ndefine i64 @u() {\n  %r = call i64 @s()\n  ret i64 %r\n}\n",
+            "@s = external dso_local global i64\n@t = global [1 x ptr] [ptr @s]\n",
+            "@s = external dso_local global i64\ndeclare dso_local i64 @f()\n\
+             define i64 @u() {\n  ret i64 0\n}\n",
+            "@s = extern_weak dso_local global i64\n\
+             define i64 @u() {\n  %v = load i64, ptr @s\n  ret i64 %v\n}\n",
+            "@s = external dso_local hidden global i64\n\
+             define i64 @u() {\n  %v = load i64, ptr @s\n  ret i64 %v\n}\n",
+            "declare dso_local protected i64 @s()\ndefine ptr @u() {\n  ret ptr @s\n}\n",
+            "@s = external dso_preemptable global i64\n\
+             define i64 @u() {\n  %v = load i64, ptr @s\n  ret i64 %v\n}\n",
+            "@s = dso_local global i64 1\n@w = weak dso_local global i64 2\n\
+             define dso_local i64 @f() {\n  ret i64 3\n}\n\
+             define ptr @u() {\n  %v = load i64, ptr @s\n  %x = load i64, ptr @w\n  ret ptr @f\n}\n",
+        ] {
+            import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+    }
+
+    /// The `dso_local` rules read the relocation model the caller compiles
+    /// under (`import_text_for_compile`). An addressed `dso_local`
+    /// declaration is admitted only for an AArch64 ELF target under
+    /// `static` (rustc's `-C relocation-model=static` writes one for every
+    /// `extern` static, and its import equalled llc's in every non-PIE link
+    /// the fifth round of L02-P13 ran), and refused under `pie`, `pic`, for
+    /// another target, and with no model known. Under `pic` a referenced
+    /// `dso_local` definition is refused too: llc binds the module's own
+    /// references to it locally.
+    #[test]
+    fn dso_local_rules_read_the_compile_relocation_model() {
+        const LINUX: &str = "aarch64-unknown-linux-gnu";
+        let declaration = "@s = external dso_local global i64\n\
+                           define i64 @u() {\n  %v = load i64, ptr @s\n  ret i64 %v\n}\n";
+        import_text_for_compile(declaration, "t", LINUX, RelocationModel::Static)
+            .expect("an addressed dso_local declaration under static on AArch64 ELF");
+        import_text_for_compile(
+            declaration,
+            "t",
+            "arm64-unknown-linux-gnu",
+            RelocationModel::Static,
+        )
+        .expect("the arm64 spelling");
+        for (target, model, compile) in [
+            (
+                LINUX,
+                RelocationModel::Pie,
+                "compiled under the `pie` relocation model",
+            ),
+            (
+                LINUX,
+                RelocationModel::Pic,
+                "compiled under the `pic` relocation model",
+            ),
+            (
+                "x86_64-unknown-linux-gnu",
+                RelocationModel::Static,
+                "compiled under the `static` relocation model",
+            ),
+            (
+                "aarch64-apple-darwin",
+                RelocationModel::Static,
+                "compiled under the `static` relocation model",
+            ),
+            (
+                "aarch64-unknown-linux-gnu-macho",
+                RelocationModel::Static,
+                "compiled under the `static` relocation model",
+            ),
+        ] {
+            match import_text_for_compile(declaration, "t", target, model) {
+                Err(Error::Unsupported(reason)) => assert!(
+                    reason.contains(
+                        "global declaration `@s` is `dso_local` and the module's code takes its \
+                         address"
+                    ) && reason.contains(compile),
+                    "{target} {model:?}: {reason}"
+                ),
+                other => panic!("{target} {model:?}: expected a named refusal, got {other:?}"),
+            }
+        }
+        for target in [None, Some(LINUX)] {
+            let reason = match target {
+                Some(target) => import_text_for_target(declaration, "t", target),
+                None => import_text(declaration, "t"),
+            };
+            assert!(
+                matches!(&reason, Err(Error::Unsupported(reason))
+                    if reason.contains("with no relocation model known")),
+                "{target:?}: {reason:?}"
+            );
+        }
+        // Definitions: referenced under `pic` (a read, a call, an address,
+        // an initializer's pointer, and a `weak` definition) refused; the
+        // same modules admitted under `static` and `pie` and with no model.
+        for (src, what) in [
+            (
+                "@d = dso_local global i64 1\n\
+                 define i64 @u() {\n  %v = load i64, ptr @d\n  ret i64 %v\n}\n",
+                "global definition",
+            ),
+            (
+                "@d = weak dso_local global i64 1\n\
+                 define i64 @u() {\n  %v = load i64, ptr @d\n  ret i64 %v\n}\n",
+                "global definition",
+            ),
+            (
+                "define dso_local i64 @d() {\n  ret i64 3\n}\n\
+                 define i64 @u() {\n  %v = call i64 @d()\n  ret i64 %v\n}\n",
+                "function definition",
+            ),
+            (
+                "define dso_local i64 @d() {\n  ret i64 3\n}\n\
+                 define ptr @u() {\n  ret ptr @d\n}\n",
+                "function definition",
+            ),
+            (
+                "define dso_local i64 @d() {\n  ret i64 3\n}\n\
+                 @t = global [1 x ptr] [ptr @d]\n",
+                "function definition",
+            ),
+        ] {
+            match import_text_for_compile(src, "t", LINUX, RelocationModel::Pic) {
+                Err(Error::Unsupported(reason)) => assert!(
+                    reason.contains(&format!(
+                        "{what} `@d` is `dso_local` and the module references it, compiled \
+                         under the `pic` relocation model"
+                    )),
+                    "{src}: {reason}"
+                ),
+                other => panic!("{src}: expected a named refusal, got {other:?}"),
+            }
+            for model in [RelocationModel::Static, RelocationModel::Pie] {
+                import_text_for_compile(src, "t", LINUX, model)
+                    .unwrap_or_else(|error| panic!("{model:?} {src}: {error}"));
+            }
+            import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+        // Under `pic`: an unreferenced `dso_local` definition, a hidden, an
+        // internal and a plain one, referenced, stay admitted.
+        import_text_for_compile(
+            "define dso_local i64 @d() {\n  ret i64 3\n}\n\
+             @h = dso_local hidden global i64 1\n@i = internal dso_local global i64 2\n\
+             @p = global i64 3\n\
+             define internal dso_local i64 @k() {\n  ret i64 4\n}\n\
+             define i64 @u() {\n  %a = load i64, ptr @h\n  %b = load i64, ptr @i\n\
+             \x20 %c = load i64, ptr @p\n  %s = add i64 %a, %b\n  %t = add i64 %s, %c\n\
+             \x20 %k = call i64 @k()\n  %r = add i64 %t, %k\n  ret i64 %r\n}\n",
+            "t",
+            LINUX,
+            RelocationModel::Pic,
+        )
+        .expect("unreferenced, hidden, internal and plain definitions under pic");
+    }
+
+    /// A `dso_local` declaration whose address an `available_externally`
+    /// body takes is refused where the backend may splice the body into a
+    /// caller and the definition the body copies may be in a shared library
+    /// that binds the symbol inside itself, where the splice reads it
+    /// through the GOT: a default body under `static` and `pie` (the
+    /// backend withholds one under `pic`), a hidden or protected body under
+    /// `pic`, and every body with no model known. For AArch64 ELF a hidden
+    /// or protected body under `static` and `pie` binds in the executable
+    /// and is admitted; for x86-64 and Mach-O (not measured) it is refused.
+    /// The fourth verifier round's module (a default `available_externally`
+    /// `@u` reading a `dso_local` declaration, called by `@w`) is admitted
+    /// only under `pic`; its twin without `dso_local` everywhere, as is a
+    /// body that only calls a `dso_local` function declaration.
+    #[test]
+    fn available_externally_bodies_count_where_a_splice_may_bind_otherwise() {
+        const LINUX: &str = "aarch64-unknown-linux-gnu";
+        const TARGETS: [&str; 3] = [
+            LINUX,
+            "x86_64-unknown-linux-gnu",
+            "arm64-apple-macosx14.0.0",
+        ];
+        let module = |visibility: &str, dso_local: &str| {
+            format!(
+                "@s = external {dso_local}global i64\n\
+                 define available_externally {visibility}i64 @u() {{\n\
+                 \x20 %v = load i64, ptr @s\n  ret i64 %v\n}}\n\
+                 define i64 @w() {{\n  %r = call i64 @u()\n  ret i64 %r\n}}\n"
+            )
+        };
+        let refused = |result: Result<Module>, compile: &str, label: &str| {
+            assert!(
+                matches!(&result, Err(Error::Unsupported(reason))
+                    if reason.contains("global declaration `@s` is `dso_local` and the \
+                                        `available_externally` body of `@u` takes its address")
+                        && reason.contains(compile)),
+                "{label}: {result:?}"
+            );
+        };
+        for visibility in ["", "hidden ", "protected "] {
+            let src = module(visibility, "dso_local ");
+            refused(
+                import_text(&src, "t"),
+                "with no relocation model known",
+                &format!("{visibility}no model"),
+            );
+            for target in TARGETS {
+                for model in [
+                    RelocationModel::Static,
+                    RelocationModel::Pie,
+                    RelocationModel::Pic,
+                ] {
+                    let label = format!("{visibility}{target} {model:?}");
+                    let result = import_text_for_compile(&src, "t", target, model);
+                    let admitted = if visibility.is_empty() {
+                        model == RelocationModel::Pic
+                    } else {
+                        target == LINUX && model != RelocationModel::Pic
+                    };
+                    if admitted {
+                        result.unwrap_or_else(|error| panic!("{label}: {error}"));
+                    } else {
+                        refused(
+                            result,
+                            &format!("compiled under the `{}` relocation model", model.name()),
+                            &label,
+                        );
+                    }
+                    import_text_for_compile(&module(visibility, ""), "t", target, model)
+                        .unwrap_or_else(|error| panic!("{label} without dso_local: {error}"));
+                }
+            }
+            import_text(&module(visibility, ""), "t")
+                .unwrap_or_else(|error| panic!("{visibility}without dso_local: {error}"));
+        }
+        // A call is `CALL26` in both objects: a body calling a `dso_local`
+        // function declaration stays admitted under `static`.
+        import_text_for_compile(
+            "declare dso_local i64 @g()\n\
+             define available_externally i64 @u() {\n  %v = call i64 @g()\n  ret i64 %v\n}\n\
+             define i64 @w() {\n  %r = call i64 @u()\n  ret i64 %r\n}\n",
+            "t",
+            LINUX,
+            RelocationModel::Static,
+        )
+        .expect("a body that calls a dso_local declaration");
+    }
+
+    /// An integer literal is read as LLVM 22 reads it for its type: its low
+    /// bits at the type's width, spelled in the signed carrier's range.
+    /// llc 22.1.2 materializes `ret i64 18076885954311749632` as
+    /// `0xfade000000000000`, `ret i32 4294967295` as `-1`, `ret i8 300` as
+    /// 44 and `ret i1 2` as 0; written positive, the `i64` one was read by
+    /// the lowering adapter as `@g`'s address (the fourth verifier round of
+    /// L02-P13). An `i1` operand is a `bool`. An integer literal for a
+    /// pointer (which LLVM rejects) is refused by name.
+    #[test]
+    fn integer_literals_are_read_at_their_type_width() {
+        let ret_const = |src: &str| -> Constant {
+            let module = import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+            let function = module
+                .functions
+                .iter()
+                .find(|function| function.name == "f")
+                .expect("@f");
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .find_map(|node| match &node.inst {
+                    Inst::Const { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .expect("a constant")
+        };
+        for (ty, literal, value) in [
+            ("i64", "18076885954311749632", -369_858_119_397_801_984_i128),
+            ("i64", "18446744073709551615", -1),
+            ("i64", "9223372036854775808", i128::from(i64::MIN)),
+            ("i64", "9223372036854775807", i128::from(i64::MAX)),
+            ("i64", "-369858119397801984", -369_858_119_397_801_984),
+            ("i32", "4294967295", -1),
+            ("i16", "65535", -1),
+            ("i8", "255", -1),
+            ("i8", "128", -128),
+            ("i8", "127", 127),
+            ("i8", "-128", -128),
+            // Outside the type's two ranges: the low bits, as llc reads them.
+            ("i64", "18446744073709551616", 0),
+            ("i64", "18446744073709551621", 5),
+            ("i32", "4294967296", 0),
+            ("i16", "-32769", 32767),
+            ("i8", "300", 44),
+            ("i8", "-129", 127),
+        ] {
+            let src =
+                format!("@g = global i64 42\ndefine {ty} @f() {{\n  ret {ty} {literal}\n}}\n");
+            assert_eq!(ret_const(&src), Constant::Int(value), "{ty} {literal}");
+        }
+        // An `i1` literal is its low bit, a `bool`.
+        for (literal, value) in [("0", false), ("1", true), ("2", false), ("3", true)] {
+            let src = format!("define i1 @f() {{\n  ret i1 {literal}\n}}\n");
+            assert_eq!(ret_const(&src), Constant::Bool(value), "i1 {literal}");
+        }
+        assert_eq!(
+            ret_const("define i1 @f() {\n  ret i1 -1\n}\n"),
+            Constant::Bool(true),
+            "i1 -1"
+        );
+        for (src, needle) in [
+            (
+                "@g = global i64 42\ndefine ptr @f() {\n  ret ptr 18076885954311749632\n}\n",
+                "integer literal `18076885954311749632` for a pointer",
+            ),
+            (
+                "define ptr @f(i1 %c) {\nentry:\n  br i1 %c, label %a, label %b\na:\n  br label %b\n\
+                 b:\n  %p = phi ptr [ 5, %entry ], [ null, %a ]\n  ret ptr %p\n}\n",
+                "integer literal `5` for a pointer",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        // A phi's literal and an array GEP's constant index are read alike:
+        // the index `i32 4294967295` is -1, 8 bytes back, as llc reads it
+        // (the importer folded it to 34,359,738,360 bytes forward before).
+        let phi = "define i64 @f(i1 %c) {\nentry:\n  br i1 %c, label %a, label %b\n\
+                   a:\n  br label %b\n\
+                   b:\n  %v = phi i64 [ 18076885954311749632, %entry ], [ 1, %a ]\n  ret i64 %v\n}\n";
+        let module = import_text(phi, "t").expect("a phi literal");
+        assert!(
+            module.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(
+                    |node| matches!(&node.inst, Inst::Const { ty: Ty::I64, value: Constant::Int(v) }
+                    if *v == -369_858_119_397_801_984)
+                ),
+            "{:?}",
+            module.functions[0]
+        );
+        let gep = "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, \
+                   i32 4294967295\n  ret ptr %q\n}\n";
+        let module = import_text(gep, "t").expect("a GEP index literal");
+        assert!(
+            module.functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|node| matches!(
+                    &node.inst,
+                    Inst::Const {
+                        ty: Ty::I64,
+                        value: Constant::Int(-8)
+                    }
+                )),
+            "{:?}",
+            module.functions[0]
+        );
+        // A folded offset in `[2^63, 2^64)` keeps its 64 bits and is spelled
+        // signed (`emit_i64_const`): 2259610744288968704 elements of 8 bytes
+        // are 0xFADE000000000000 bytes, never the stub of global 0.
+        let far = "@g = global i64 42\ndefine ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], \
+                   ptr %p, i64 0, i64 2259610744288968704\n  ret ptr %q\n}\n";
+        // A struct GEP's constant outer index and a constant-expression
+        // GEP's index are read alike: one struct (16 bytes) back to field 1
+        // (-8), one byte back (-1).
+        for (src, offset) in [
+            (
+                "%S = type { i64, i64 }\ndefine ptr @f(ptr %p) {\n  %q = getelementptr %S, ptr %p, \
+                 i32 4294967295, i32 1\n  ret ptr %q\n}\n",
+                -8,
+            ),
+            (
+                "@b = global [4 x i8] c\"abcd\"\ndefine ptr @f() {\n  ret ptr getelementptr \
+                 (i8, ptr @b, i32 4294967295)\n}\n",
+                -1,
+            ),
+        ] {
+            let module = import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+            let f = module
+                .functions
+                .iter()
+                .find(|function| function.name == "f")
+                .expect("@f");
+            assert!(
+                f.blocks.iter().flat_map(|block| &block.body).any(
+                    |node| matches!(&node.inst, Inst::Const { ty: Ty::I64, value: Constant::Int(v) }
+                        if *v == offset)
+                ),
+                "{src}: {f:?}"
+            );
+        }
+        let module = import_text(far, "t").expect("a far GEP offset");
+        let f = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("@f");
+        assert!(
+            f.blocks.iter().flat_map(|block| &block.body).any(
+                |node| matches!(&node.inst, Inst::Const { ty: Ty::I64, value: Constant::Int(v) }
+                    if *v == -369_858_119_397_801_984)
+            ),
+            "{f:?}"
+        );
+    }
+
+    /// The other places a literal becomes a constant read it as LLVM does
+    /// (the fifth verifier round of L02-P13): a GEP index is sign-extended
+    /// at its type's width, so an `i1` index of 1 or `true`, constant or
+    /// computed, is one element back (`sbfx` in llc's object; the importer
+    /// read it +1); an `alloca` count is zero-extended (`i8 200` is 200
+    /// elements, not -56); a switch case and a scalar global's initializer
+    /// are spelled in the signed carrier's range, an `i1` case as its low
+    /// bit; an `i1` field of an aggregate initializer is stored as its low
+    /// bit (the importer wrote `i1 -1` as the byte 255); and a folded `i64`
+    /// offset in `[2^63, 2^64)` is spelled signed outside the stub interval
+    /// too.
+    #[test]
+    fn literals_outside_operands_are_read_as_llvm_reads_them() {
+        let function = |src: &str, name: &str| -> Function {
+            let module = import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+            module
+                .functions
+                .into_iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("{name} in {src}"))
+        };
+        let has = |f: &Function, test: &dyn Fn(&Inst) -> bool| {
+            f.blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .any(|node| test(&node.inst))
+        };
+        let i64_const = |value: i128| move |inst: &Inst| matches!(inst, Inst::Const { ty: Ty::I64, value: Constant::Int(v) } if *v == value);
+        // Constant `i1` GEP indices: an array element back (-8), a struct
+        // back to its second field (-16 + 8), a byte back (-1).
+        for (src, offset) in [
+            (
+                "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, i1 1\n\
+                 \x20 ret ptr %q\n}\n",
+                -8,
+            ),
+            (
+                "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, i1 true\n\
+                 \x20 ret ptr %q\n}\n",
+                -8,
+            ),
+            (
+                "%S = type { i64, i64 }\ndefine ptr @f(ptr %p) {\n  %q = getelementptr %S, ptr %p, \
+                 i1 1, i32 1\n  ret ptr %q\n}\n",
+                -8,
+            ),
+            (
+                "@b = global [4 x i8] c\"abcd\"\ndefine ptr @f() {\n  ret ptr getelementptr \
+                 (i8, ptr @b, i1 1)\n}\n",
+                -1,
+            ),
+            (
+                "@b = global [4 x i8] c\"abcd\"\ndefine ptr @f() {\n  ret ptr getelementptr \
+                 (i8, ptr @b, i1 true)\n}\n",
+                -1,
+            ),
+            // 2^61 - 1 elements of 8 bytes: 2^64 - 8, spelled -8.
+            (
+                "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, \
+                 i64 2305843009213693951\n  ret ptr %q\n}\n",
+                -8,
+            ),
+        ] {
+            let f = function(src, "f");
+            assert!(has(&f, &i64_const(offset)), "{src}: {f:?}");
+        }
+        // Computed `i1` GEP indices are sign-extended (a scalar GEP's
+        // literal `i1 1` reaches the same widening as a `bool`); an
+        // `alloca` count is zero-extended.
+        let sext_bool = |inst: &Inst| {
+            matches!(
+                inst,
+                Inst::Cast {
+                    op: CastOp::SExt,
+                    src_ty: Ty::Bool,
+                    dst_ty: Ty::I64,
+                    ..
+                }
+            )
+        };
+        for src in [
+            "define ptr @f(ptr %p, i1 %c) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, i1 %c\n\
+             \x20 ret ptr %q\n}\n",
+            "%S = type { i64, i64 }\ndefine ptr @f(ptr %p, i1 %c) {\n  %q = getelementptr %S, \
+             ptr %p, i1 %c, i32 1\n  ret ptr %q\n}\n",
+            "define ptr @f(ptr %p) {\n  %q = getelementptr i8, ptr %p, i1 true\n  ret ptr %q\n}\n",
+            "define ptr @f(ptr %p) {\n  %q = getelementptr i8, ptr %p, i1 1\n  ret ptr %q\n}\n",
+        ] {
+            let f = function(src, "f");
+            assert!(has(&f, &sext_bool), "{src}: {f:?}");
+        }
+        let f = function(
+            "define ptr @f(i8 %n) {\n  %p = alloca i8, i8 %n, align 1\n  ret ptr %p\n}\n",
+            "f",
+        );
+        assert!(
+            has(&f, &|inst: &Inst| matches!(
+                inst,
+                Inst::Cast {
+                    op: CastOp::ZExt,
+                    src_ty: Ty::I8,
+                    dst_ty: Ty::I64,
+                    ..
+                }
+            )),
+            "{f:?}"
+        );
+        let f = function(
+            "define ptr @f() {\n  %p = alloca i8, i8 200, align 1\n  ret ptr %p\n}\n",
+            "f",
+        );
+        assert!(
+            has(&f, &|inst: &Inst| matches!(
+                inst,
+                Inst::Alloca { count: Some(_), .. }
+            )) && has(&f, &i64_const(200)),
+            "{f:?}"
+        );
+        // A count literal is its low bits, zero-extended: `i8 300` is 44
+        // elements (176 bytes of `[4 x i8]`).
+        for (src, value) in [
+            (
+                "define ptr @f() {\n  %p = alloca i8, i8 300, align 1\n  ret ptr %p\n}\n",
+                44,
+            ),
+            (
+                "define ptr @f() {\n  %p = alloca [4 x i8], i8 300, align 1\n  ret ptr %p\n}\n",
+                176,
+            ),
+        ] {
+            let f = function(src, "f");
+            assert!(has(&f, &i64_const(value)), "{src}: {f:?}");
+        }
+        let zext = |src_ty: Ty| {
+            move |inst: &Inst| {
+                matches!(inst, Inst::Cast { op: CastOp::ZExt, src_ty: s, dst_ty: Ty::I64, .. }
+                    if *s == src_ty)
+            }
+        };
+        let f = function(
+            "define ptr @f(i8 %n) {\n  %p = alloca [4 x i8], i8 %n, align 1\n  ret ptr %p\n}\n",
+            "f",
+        );
+        assert!(has(&f, &zext(Ty::I8)), "{f:?}");
+        // A `memset.pattern` count too (llc's Darwin lowering: `ubfiz x2,
+        // x1, #2, #32` for an `i32` count of 4-byte patterns).
+        let module = import_text_for_target(
+            "declare void @llvm.experimental.memset.pattern.p0.i32.i32(ptr, i32, i32, i1)\n\
+             define void @f(ptr %p, i32 %n) {\n  call void \
+             @llvm.experimental.memset.pattern.p0.i32.i32(ptr %p, i32 7, i32 %n, i1 false)\n\
+             \x20 ret void\n}\n",
+            "t",
+            "arm64-apple-macosx14.0.0",
+        )
+        .expect("a memset.pattern fill for Darwin");
+        let f = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("@f");
+        assert!(has(f, &zext(Ty::I32)), "{f:?}");
+        // Switch cases.
+        for (ty, literal, value) in [
+            ("i64", "18076885954311749632", -369_858_119_397_801_984_i128),
+            ("i32", "4294967295", -1),
+            ("i8", "255", -1),
+            ("i1", "3", 1),
+            ("i1", "true", 1),
+            ("i1", "false", 0),
+        ] {
+            let src = format!(
+                "define i32 @f({ty} %x) {{\nentry:\n  switch {ty} %x, label %d [\n    \
+                 {ty} {literal}, label %a\n  ]\na:\n  ret i32 1\nd:\n  ret i32 0\n}}\n"
+            );
+            let f = function(&src, "f");
+            let cases: Vec<Constant> = f
+                .blocks
+                .iter()
+                .flat_map(|block| &block.body)
+                .filter_map(|node| match &node.inst {
+                    Inst::Switch { cases, .. } => Some(cases.iter().map(|case| case.value.clone())),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(cases, vec![Constant::Int(value)], "{ty} {literal}");
+        }
+        // Scalar global initializers, and an `i1` field of an aggregate.
+        for (src, initializer) in [
+            (
+                "@c = constant i64 18076885954311749632\n",
+                Constant::Int(-369_858_119_397_801_984),
+            ),
+            ("@c = constant i8 255\n", Constant::Int(-1)),
+            ("@c = constant i16 70000\n", Constant::Int(4464)),
+            ("@c = constant i1 2\n", Constant::Bool(false)),
+            ("@c = constant i1 -1\n", Constant::Bool(true)),
+        ] {
+            let module = import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+            assert_eq!(
+                module.globals[0].initializer.as_ref(),
+                Some(&initializer),
+                "{src}"
+            );
+        }
+        let module = import_text(
+            "%B = type { i1, i8 }\n@a = global %B { i1 -1, i8 5 }\n",
+            "t",
+        )
+        .expect("an i1 aggregate field");
+        assert_eq!(
+            module.globals[0].initializer,
+            Some(Constant::Bytes {
+                data: vec![1, 5],
+                utf8: false
+            })
+        );
+        // The seventh verifier round's shapes. `i1 false` (and `i1 0`) as a
+        // GEP index is no offset, on the array, struct-outer and constant-
+        // expression paths (its mutant read it as `true`: -8).
+        for (src, offset, not) in [
+            (
+                "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, \
+                 i1 false\n  ret ptr %q\n}\n",
+                0,
+                -8,
+            ),
+            (
+                "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, i1 0\n\
+                 \x20 ret ptr %q\n}\n",
+                0,
+                -8,
+            ),
+            (
+                "%S = type { i64, i64 }\ndefine ptr @f(ptr %p) {\n  %q = getelementptr %S, ptr %p, \
+                 i1 false, i32 1\n  ret ptr %q\n}\n",
+                8,
+                -8,
+            ),
+            (
+                "@b = global [4 x i64] zeroinitializer\ndefine ptr @f() {\n  ret ptr getelementptr \
+                 ([4 x i64], ptr @b, i64 0, i1 false)\n}\n",
+                0,
+                -8,
+            ),
+        ] {
+            let f = function(src, "f");
+            assert!(
+                !has(&f, &i64_const(not)) && (offset == 0 || has(&f, &i64_const(offset))),
+                "{src}: {f:?}"
+            );
+        }
+        // A folded offset is LLVM's modulo 2^64: 2^61 + 1 elements of 8
+        // bytes are 8 bytes forward, as are 2^64 - (2^61 - 1) * 8 back; a
+        // struct's outer index 2^60 + 1 of 16 bytes and its second field 24.
+        for (src, offset) in [
+            (
+                "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, \
+                 i64 2305843009213693953\n  ret ptr %q\n}\n",
+                8,
+            ),
+            (
+                "define ptr @f(ptr %p) {\n  %q = getelementptr [4 x i64], ptr %p, i64 0, \
+                 i64 -2305843009213693951\n  ret ptr %q\n}\n",
+                8,
+            ),
+            (
+                "%S = type { i64, i64 }\ndefine ptr @f(ptr %p) {\n  %q = getelementptr %S, ptr %p, \
+                 i64 1152921504606846977, i32 1\n  ret ptr %q\n}\n",
+                24,
+            ),
+            (
+                "@b = global [4 x i64] zeroinitializer\ndefine ptr @f() {\n  ret ptr getelementptr \
+                 ([4 x i64], ptr @b, i64 0, i64 2305843009213693953)\n}\n",
+                8,
+            ),
+        ] {
+            let f = function(src, "f");
+            assert!(has(&f, &i64_const(offset)), "{src}: {f:?}");
+        }
+        // A byte-array global GEP's leading index is read at its width: `i64
+        // 18446744073709551616` is 0.
+        function(
+            "@b = global [4 x i8] c\"abcd\"\ndefine ptr @f(i64 %i) {\n  %q = getelementptr \
+             [4 x i8], ptr @b, i64 18446744073709551616, i64 %i\n  ret ptr %q\n}\n",
+            "f",
+        );
+        // `alloca` counts: `i1 true` is one element (its mutant read none),
+        // `i8 -56` is 200 (the sixth round's head refused a negative count
+        // literal), and `[4 x i8]` of `i8 -56` 800 bytes.
+        for (src, value) in [
+            (
+                "define ptr @f() {\n  %p = alloca i64, i1 true, align 8\n  ret ptr %p\n}\n",
+                1,
+            ),
+            (
+                "define ptr @f() {\n  %p = alloca i8, i8 -56, align 1\n  ret ptr %p\n}\n",
+                200,
+            ),
+            (
+                "define ptr @f() {\n  %p = alloca [4 x i8], i8 -56, align 1\n  ret ptr %p\n}\n",
+                800,
+            ),
+        ] {
+            let f = function(src, "f");
+            assert!(
+                has(&f, &|inst: &Inst| matches!(
+                    inst,
+                    Inst::Alloca { count: Some(_), .. }
+                )) && has(&f, &i64_const(value)),
+                "{src}: {f:?}"
+            );
+        }
+        // An `i128` count of 2^64 or more elements, and an aggregate
+        // `alloca` of 2^64 bytes or more, are refused by name: no stack
+        // object has that size.
+        for (src, refusal) in [
+            (
+                "define ptr @f() {\n  %p = alloca i8, i128 18446744073709551616, align 1\n\
+                 \x20 ret ptr %p\n}\n",
+                "alloca count `i128 18446744073709551616`: 2^64 or more elements",
+            ),
+            (
+                "define ptr @f() {\n  %p = alloca i8, i128 -1, align 1\n  ret ptr %p\n}\n",
+                "alloca count `i128 -1`: 2^64 or more elements",
+            ),
+            (
+                "define ptr @f() {\n  %p = alloca [8 x i8], i64 -1, align 1\n  ret ptr %p\n}\n",
+                "array alloca of 18446744073709551615 elements of 8 bytes: its byte size \
+                 reaches 2^64",
+            ),
+        ] {
+            match import_text(src, "t") {
+                Err(Error::Unsupported(reason)) => {
+                    assert!(reason.contains(refusal), "{src}: {reason}")
+                }
+                other => panic!("{src}: expected a named refusal, got {other:?}"),
+            }
+        }
+        // An integer array initializer's literal is its low bits:
+        // `[i8 300, i8 1]` is `[i8 44, i8 1]`, and `[i16 -1, i16 65535, i16
+        // 65537]` is `[i16 -1, i16 -1, i16 1]`.
+        for (written, read) in [
+            (
+                "@a = global [2 x i8] [i8 300, i8 1]\n",
+                "@a = global [2 x i8] [i8 44, i8 1]\n",
+            ),
+            (
+                "@a = global [3 x i16] [i16 -1, i16 65535, i16 65537]\n",
+                "@a = global [3 x i16] [i16 -1, i16 -1, i16 1]\n",
+            ),
+            (
+                "@a = global [2 x i64] [i64 18446744073709551621, i64 -1]\n",
+                "@a = global [2 x i64] [i64 5, i64 -1]\n",
+            ),
+        ] {
+            let module =
+                import_text(written, "t").unwrap_or_else(|error| panic!("{written}: {error}"));
+            let expected = import_text(read, "t").unwrap_or_else(|error| panic!("{read}: {error}"));
+            assert_eq!(module.globals, expected.globals, "{written}");
+        }
+    }
+
+    /// The importer's global-address stub encoding and its decoding, which
+    /// the `dso_local` reference walk uses, invert each other for every
+    /// index field value (bits `[47:32]`, a global past the 256th included)
+    /// and offset, and nothing outside `[0xFADE << 48, 0xFADF << 48)`
+    /// decodes.
+    #[test]
+    fn global_addr_stubs_decode_to_the_index_they_encode() {
+        for index in [0_u64, 1, 0xFF, 0x100, 0x101, 0x1234, 0xFFFF] {
+            for offset in [0_u64, 4, 0xFFFF_FFFF] {
+                let stub = encode_global_addr_stub(index, offset);
+                assert_eq!(
+                    decode_global_addr_stub(stub),
+                    Some((index as usize, offset)),
+                    "{index:#x} {offset:#x}"
+                );
+                assert!(in_global_addr_stub_interval(stub));
+            }
+        }
+        for value in [
+            -1_i128,
+            0,
+            0xFADD_FFFF_FFFF_FFFF_u64 as i128,
+            0xFADF_0000_0000_0000_u64 as i128,
+            -369_858_119_397_801_984,
+            1 << 64,
+        ] {
+            assert_eq!(decode_global_addr_stub(value), None, "{value:#x}");
+        }
+    }
+
+    /// The last line against the adapter's global-address stub decoding: a
+    /// top-level `i64` constant spelled non-negative in `[0xFADE << 48,
+    /// 0xFADF << 48)` is refused by name, whatever wrote it. Every path the
+    /// importer has spells such a value negative, so the check is driven
+    /// here on a module built directly.
+    #[test]
+    fn i64_constants_in_the_stub_interval_are_refused_by_name() {
+        let mut parser = Parser::new("", "t".to_string());
+        let mut function = Function::new(
+            FuncId::new(0),
+            "f".to_string(),
+            FuncTyId::new(0),
+            BlockId::new(0),
+        );
+        let mut block = trust_ir::Block::new(BlockId::new(0));
+        for value in [
+            0xFADE_0000_0000_0000_u64 as i128,
+            0xFADE_FFFF_FFFF_FFFF_u64 as i128,
+        ] {
+            block.body.push(
+                InstrNode::new(Inst::Const {
+                    ty: Ty::I64,
+                    value: Constant::Int(value),
+                })
+                .with_result(ValueId::new(0)),
+            );
+            function.blocks = vec![block.clone()];
+            parser.module.functions = vec![function.clone()];
+            match parser.refuse_integer_constants_in_the_stub_interval() {
+                Err(Error::Unsupported(reason)) => assert!(
+                    reason.contains("lies in the interval [0xFADE << 48, 0xFADF << 48)"),
+                    "{reason}"
+                ),
+                other => panic!("{value:#x}: expected a named refusal, got {other:?}"),
+            }
+            block.body.clear();
+        }
+        for value in [
+            0xFADD_FFFF_FFFF_FFFF_u64 as i128,
+            0xFADF_0000_0000_0000_u64 as i128,
+            -369_858_119_397_801_984,
+        ] {
+            block.body.push(
+                InstrNode::new(Inst::Const {
+                    ty: Ty::I64,
+                    value: Constant::Int(value),
+                })
+                .with_result(ValueId::new(0)),
+            );
+            function.blocks = vec![block.clone()];
+            parser.module.functions = vec![function.clone()];
+            parser
+                .refuse_integer_constants_in_the_stub_interval()
+                .unwrap_or_else(|error| panic!("{value:#x}: {error}"));
+            block.body.clear();
+        }
+    }
+
+    #[test]
+    fn declaration_after_a_call_states_the_placeholder_facts() {
+        // clang prints `declare` lines after the bodies that call them, so
+        // the call installs an `external` + `default` placeholder first.
+        let src = r#"
+define i64 @caller(ptr %p) {
+  %v = call i64 @dh()
+  %w = call i64 @dw_indirect(ptr %p)
+  ret i64 %v
+}
+declare hidden i64 @dh()
+declare protected i64 @dw_indirect(ptr)
+"#;
+        let m = import_text(src, "t").expect("imports");
+        assert_eq!(
+            function_facts(&m, "dh"),
+            (Linkage::External, Visibility::Hidden, true)
+        );
+        assert_eq!(
+            function_facts(&m, "dw_indirect"),
+            (Linkage::External, Visibility::Protected, true)
+        );
+        // A weak declaration reached by a direct call keeps `extern_weak`,
+        // and the call goes through its address, the one call spelling
+        // trust-ir admits for a weak declaration.
+        let m = import_text(
+            "define void @c(i64 %x) {\n  call void @w(i64 %x)\n  ret void\n}\n\
+             declare extern_weak void @w(i64)\n",
+            "t",
+        )
+        .expect("imports");
+        assert_eq!(
+            function_facts(&m, "w"),
+            (Linkage::ExternalWeak, Visibility::Default, true)
+        );
+        let w = m.functions.iter().find(|f| f.name == "w").expect("w");
+        let caller = m.functions.iter().find(|f| f.name == "c").expect("c");
+        let body = &caller.blocks[0].body;
+        assert!(
+            !body
+                .iter()
+                .any(|node| matches!(node.inst, Inst::Call { .. })),
+            "no direct call of the weak declaration remains"
+        );
+        let call = body
+            .iter()
+            .position(|node| matches!(node.inst, Inst::CallIndirect { .. }))
+            .expect("an indirect call");
+        let Inst::CallIndirect {
+            callee,
+            sig,
+            args,
+            calling_conv,
+        } = &body[call].inst
+        else {
+            unreachable!("matched above")
+        };
+        assert_eq!((*sig, *calling_conv, args.len()), (w.ty, w.calling_conv, 1));
+        assert!(
+            body[..call].iter().any(|node| node.results == vec![*callee]
+                && node.inst
+                    == Inst::Const {
+                        ty: Ty::Ptr,
+                        value: Constant::SymbolAddr {
+                            symbol: "w".to_string(),
+                            addend: 0,
+                        },
+                    }),
+            "the callee is the declaration's own address: {body:?}"
+        );
+    }
+
+    /// A direct call of an `extern_weak` function whose respelling as a
+    /// `CallIndirect` would change the call on this backend is refused by
+    /// name: a variadic callee, and a 128-bit integer argument that may be
+    /// stack-passed (L06-P15). Register-pair 128-bit integers, stack-passed
+    /// narrower scalars and address-only uses are admitted. Every scalar the
+    /// importer admits in a signature takes part: a pointer, `i1`, `i16` or
+    /// `i32` takes a general-purpose register like an `i64`, and `half`,
+    /// `float` and `double` take none.
+    #[test]
+    fn weak_calls_the_indirect_lowering_would_change_are_refused_by_name() {
+        // `@c` has one parameter per scalar type, named after it, so a row
+        // spells each argument `<ty> %<ty>`.
+        const SCALARS: [&str; 10] = [
+            "ptr", "i1", "i8", "i16", "i32", "i64", "i128", "half", "float", "double",
+        ];
+        let weak_call = |params: &[&str]| {
+            let caller = SCALARS
+                .iter()
+                .map(|ty| format!("{ty} %{ty}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let args = params
+                .iter()
+                .map(|ty| format!("{ty} %{ty}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "declare extern_weak i64 @wf({})\n\
+                 define i64 @c({caller}) {{\n  %r = call i64 @wf({args})\n  ret i64 %r\n}}\n",
+                params.join(", ")
+            )
+        };
+        let seven_then_i128 = |ty: &'static str| {
+            let mut params = vec![ty; 7];
+            params.push("i128");
+            (params, 8)
+        };
+        // One general-purpose argument before the first pair moves the fourth
+        // pair past x7, whatever floating-point arguments come between.
+        let one_then_four_pairs = |ty: &'static str| {
+            (
+                vec![
+                    ty, "i128", "half", "i128", "float", "i128", "double", "i128",
+                ],
+                8,
+            )
+        };
+        let mut refused: Vec<(Vec<&str>, usize)> = vec![
+            ([vec!["i64"; 7], vec!["i128", "i64"]].concat(), 8),
+            (vec!["i128"; 5], 5),
+            (vec!["i64", "i128", "i64", "i128", "i64", "i128"], 6),
+            // Seven general-purpose arguments of seven types, the floating-point
+            // ones between them taking none.
+            (
+                vec![
+                    "half", "i1", "float", "ptr", "double", "i16", "half", "i32", "float", "i8",
+                    "double", "i64", "ptr", "i128",
+                ],
+                14,
+            ),
+            // `i1` and `i32` each move a later pair to an even register.
+            (
+                vec![
+                    "i128", "float", "i1", "double", "i128", "half", "i32", "i128",
+                ],
+                8,
+            ),
+        ];
+        refused.extend(["ptr", "i1", "i8", "i16", "i32", "i64"].map(seven_then_i128));
+        refused.extend(["ptr", "i1", "i8", "i16", "i32", "i64"].map(one_then_four_pairs));
+        for (params, argument) in &refused {
+            let src = weak_call(params);
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains(&format!(
+                    "`extern_weak` function `@wf` whose 128-bit integer argument {argument} may \
+                     be passed on the stack"
+                )) && reason.contains("L06-P15"),
+                "{src}: {reason}"
+            );
+        }
+        let reason = unsupported_reason(
+            "declare extern_weak i64 @wv(i64, ...)\n\
+             define i64 @c(i64 %x) {\n  \
+             %r = call i64 (i64, ...) @wv(i64 3, i64 %x, double 2.5, i64 20)\n  ret i64 %r\n}\n",
+        );
+        assert!(
+            reason.contains("direct call of the variadic `extern_weak` function `@wv`"),
+            "{reason}"
+        );
+        // Admitted: every 128-bit integer in a register pair (x6/x7 last,
+        // after six general-purpose arguments of any type), floating-point
+        // arguments that take no general-purpose register, stack-passed
+        // narrower scalars, and a signature that would be refused but is only
+        // address-taken.
+        let mut admitted: Vec<Vec<&str>> = vec![
+            vec!["i128"; 4],
+            [vec!["double"; 9], vec!["i64"; 6], vec!["i128"]].concat(),
+            [vec!["half"; 9], vec!["float"; 9], vec!["i128"; 4]].concat(),
+            [
+                vec!["i64"; 8],
+                vec!["i32", "i8", "i16", "ptr", "i1", "half", "float"],
+            ]
+            .concat(),
+            vec!["double"; 10],
+            vec![
+                "half", "i1", "float", "ptr", "double", "i16", "half", "i32", "float", "i8",
+                "double", "i64", "i128",
+            ],
+            vec![
+                "half", "i128", "float", "i128", "double", "i128", "half", "i128",
+            ],
+        ];
+        admitted.extend(
+            ["ptr", "i1", "i8", "i16", "i32", "i64"].map(|ty| [vec![ty; 6], vec!["i128"]].concat()),
+        );
+        for params in &admitted {
+            let src = weak_call(params);
+            let m = import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error:?}"));
+            let caller = m.functions.iter().find(|f| f.name == "c").expect("c");
+            assert!(
+                caller.blocks[0]
+                    .body
+                    .iter()
+                    .any(|node| matches!(node.inst, Inst::CallIndirect { .. })),
+                "{src}: the weak call goes through its address"
+            );
+        }
+        for src in [
+            "declare extern_weak i64 @wv(i64, ...)\ndefine ptr @a() {\n  ret ptr @wv\n}\n",
+            "declare extern_weak i64 @wf(i128, i128, i128, i128, i128)\n\
+             define ptr @a() {\n  ret ptr @wf\n}\n",
+        ] {
+            import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error:?}"));
+        }
+    }
+
+    /// LD-100 rule 12. A direct call of an `extern_weak` function becomes a
+    /// `CallIndirect` through its address, which carries the signature and
+    /// convention but none of the function's attributes: one with a hidden
+    /// return buffer (`sret`, at any index), and one named like an
+    /// intrinsic the backend lowers by name, is refused by name. The same
+    /// shapes declared strong keep a direct call, and the weak calls whose
+    /// facts the signature carries (extensions, hints, `fastcc`, C's
+    /// `memcpy`, an intrinsic the importer renames or rewrites) still go
+    /// through the address.
+    #[test]
+    fn weak_calls_that_would_drop_an_abi_fact_or_an_intrinsic_are_refused_by_name() {
+        // A known AArch64 target, under which `fastcc` is read as C.
+        const SRET: &str = "target triple = \"aarch64-unknown-linux-gnu\"\n\
+                            %S = type { [4 x i64] }\n";
+        let sret_call = |linkage: &str, header: &str, call: &str| {
+            format!(
+                "{SRET}declare {linkage} {header}\n\
+                 define void @c(ptr %b, i64 %x) {{\n  {call}\n  ret void\n}}\n"
+            )
+        };
+        let sret_shapes: [(&str, &str, &str); 6] = [
+            (
+                "fill_s",
+                "void @fill_s(ptr sret(%S), ptr, i64)",
+                "call void @fill_s(ptr sret(%S) %b, ptr %b, i64 %x)",
+            ),
+            (
+                "fill_s",
+                "fastcc void @fill_s(ptr sret(%S), i64)",
+                "notail call fastcc void @fill_s(ptr sret(%S) %b, i64 %x)",
+            ),
+            (
+                "mk1",
+                "void @mk1(i64, ptr sret(%S))",
+                "tail call void @mk1(i64 %x, ptr sret(%S) %b)",
+            ),
+            (
+                "memcpy",
+                "void @memcpy(ptr sret(%S), ptr, i64)",
+                "call void @memcpy(ptr sret(%S) %b, ptr %b, i64 8)",
+            ),
+            (
+                "fmod",
+                "void @fmod(ptr sret(%S), i64)",
+                "call void @fmod(ptr sret(%S) %b, i64 %x)",
+            ),
+            (
+                "w8",
+                "void @w8(ptr sret(%S), i64, i64, i64, i64, i64, i64, i64, i64)",
+                "call void @w8(ptr sret(%S) %b, i64 %x, i64 %x, i64 %x, i64 %x, i64 %x, \
+                 i64 %x, i64 %x, i64 %x)",
+            ),
+        ];
+        let rule_12 = |src: &str, symbol: &str, what: &str| {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.contains(&format!("`extern_weak` {what} `@{symbol}`"))
+                    && reason.contains("LD-100 rule 12"),
+                "{src}: {reason}"
+            );
+            reason
+        };
+        let goes_through_the_address = |src: &str, caller: &str| {
+            let m = import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error:?}"));
+            let body = &m
+                .functions
+                .iter()
+                .find(|f| f.name == caller)
+                .expect("caller")
+                .blocks[0]
+                .body;
+            (
+                body.iter()
+                    .any(|node| matches!(node.inst, Inst::CallIndirect { .. })),
+                body.iter()
+                    .any(|node| matches!(node.inst, Inst::Call { .. })),
+            )
+        };
+        for (symbol, header, call) in sret_shapes {
+            let src = sret_call("extern_weak", header, call);
+            let reason = rule_12(&src, symbol, "function");
+            assert!(reason.contains("hidden return buffer (`sret`)"), "{reason}");
+            // Declared after its call, as clang prints it.
+            let after = format!(
+                "{SRET}define void @c(ptr %b, i64 %x) {{\n  {call}\n  ret void\n}}\n\
+                 declare extern_weak {header}\n"
+            );
+            rule_12(&after, symbol, "function");
+            // Strong, the call stays direct and keeps its buffer (rule 11
+            // and the adapter decide the rest).
+            let strong = sret_call("", header, call);
+            assert_eq!(
+                goes_through_the_address(&strong, "c"),
+                (false, true),
+                "{strong}"
+            );
+        }
+        // Only the address taken: no call is rewritten.
+        import_text(
+            &format!(
+                "{SRET}declare extern_weak void @fill_s(ptr sret(%S), ptr, i64)\n\
+                      define ptr @a() {{\n  ret ptr @fill_s\n}}\n"
+            ),
+            "t",
+        )
+        .unwrap_or_else(|error| panic!("address-only: {error:?}"));
+
+        // The intrinsics the backend lowers by name, declared `extern_weak`.
+        let intrinsics: [(&str, &str, &str); 7] = [
+            (
+                "llvm.memcpy.p0.p0.i64",
+                "void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)",
+                "call void @llvm.memcpy.p0.p0.i64(ptr %b, ptr %b, i64 %x, i1 false)",
+            ),
+            (
+                "llvm.memmove.p0.p0.i64",
+                "void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1)",
+                "call void @llvm.memmove.p0.p0.i64(ptr %b, ptr %b, i64 %x, i1 false)",
+            ),
+            (
+                "llvm.memset.p0.i64",
+                "void @llvm.memset.p0.i64(ptr, i8, i64, i1)",
+                "call void @llvm.memset.p0.i64(ptr %b, i8 7, i64 %x, i1 false)",
+            ),
+            (
+                "llvm.bitreverse.i64",
+                "i64 @llvm.bitreverse.i64(i64)",
+                "%r = call i64 @llvm.bitreverse.i64(i64 %x)",
+            ),
+            (
+                "llvm.objectsize.i64.p0",
+                "i64 @llvm.objectsize.i64.p0(ptr, i1, i1, i1)",
+                "%r = call i64 @llvm.objectsize.i64.p0(ptr %b, i1 false, i1 false, i1 false)",
+            ),
+            (
+                "llvm.fma.f64",
+                "double @llvm.fma.f64(double, double, double)",
+                "%r = call double @llvm.fma.f64(double 1.0, double 2.0, double 3.0)",
+            ),
+            (
+                "llvm.fmuladd.f32",
+                "float @llvm.fmuladd.f32(float, float, float)",
+                "%r = call float @llvm.fmuladd.f32(float 1.0, float 2.0, float 3.0)",
+            ),
+        ];
+        for (symbol, header, call) in intrinsics {
+            let weak = sret_call("extern_weak", header, call);
+            let reason = rule_12(&weak, symbol, "intrinsic");
+            assert!(reason.contains("no library defines"), "{reason}");
+            let strong = sret_call("", header, call);
+            assert_eq!(
+                goes_through_the_address(&strong, "c"),
+                (false, true),
+                "{strong}"
+            );
+        }
+
+        // Admitted: weak calls whose facts the signature carries go through
+        // the address, and intrinsics the importer renames or rewrites leave
+        // no call of their own name.
+        for (header, call) in [
+            ("i32 @zx(i8 zeroext)", "%r = call i32 @zx(i8 zeroext 7)"),
+            ("signext i16 @sx(i64)", "%r = call signext i16 @sx(i64 %x)"),
+            (
+                "noundef nonnull ptr @pid(ptr noundef nonnull align 8 returned)",
+                "%r = call ptr @pid(ptr %b)",
+            ),
+            (
+                "fastcc i64 @fc(i64)",
+                "%r = tail call fastcc i64 @fc(i64 %x)",
+            ),
+            (
+                "ptr @memcpy(ptr, ptr, i64)",
+                "%r = call ptr @memcpy(ptr %b, ptr %b, i64 %x)",
+            ),
+        ] {
+            let src = sret_call("extern_weak", header, call);
+            assert_eq!(goes_through_the_address(&src, "c"), (true, false), "{src}");
+        }
+        for (header, call, renamed) in [
+            (
+                "double @llvm.sin.f64(double)",
+                "%r = call double @llvm.sin.f64(double 1.0)",
+                true,
+            ),
+            (
+                "double @llvm.fabs.f64(double)",
+                "%r = call double @llvm.fabs.f64(double -1.0)",
+                false,
+            ),
+            (
+                "i64 @llvm.smax.i64(i64, i64)",
+                "%r = call i64 @llvm.smax.i64(i64 %x, i64 5)",
+                false,
+            ),
+        ] {
+            let src = sret_call("extern_weak", header, call);
+            // `sin` is strong (declare-by-use): its call stays direct.
+            assert_eq!(
+                goes_through_the_address(&src, "c"),
+                (false, renamed),
+                "{src}"
+            );
+        }
+    }
+
+    /// Rule 12's reading of the function's attributes: every placement fact
+    /// trust-ir states on a slot that the indirect call does not carry, at
+    /// any parameter and on the result, and nothing for the pointer hints.
+    #[test]
+    fn the_abi_facts_an_indirect_call_does_not_carry_are_every_placement_fact() {
+        let hints = ParamAttrs {
+            dereferenceable: Some(8),
+            nonnull: true,
+            align: Some(8),
+            noalias: true,
+            readonly: true,
+            ..ParamAttrs::default()
+        };
+        let none = trust_ir::FuncAttrs {
+            params: vec![hints.clone(), ParamAttrs::default(), hints.clone()],
+            ret: hints.clone(),
+            ..trust_ir::FuncAttrs::default()
+        };
+        assert_eq!(abi_fact_an_indirect_call_does_not_carry(&none), None);
+        assert_eq!(
+            abi_fact_an_indirect_call_does_not_carry(&trust_ir::FuncAttrs::default()),
+            None
+        );
+        let facts: [(ParamAttrs, &str); 6] = [
+            (
+                ParamAttrs {
+                    sret: true,
+                    ..hints.clone()
+                },
+                "hidden return buffer (`sret`)",
+            ),
+            (
+                ParamAttrs {
+                    byval: true,
+                    ..ParamAttrs::default()
+                },
+                "by value (`byval`)",
+            ),
+            (
+                ParamAttrs {
+                    ext: trust_ir::ArgExt::ZeroExt,
+                    ..ParamAttrs::default()
+                },
+                "extension `zeroext`",
+            ),
+            (
+                ParamAttrs {
+                    ext: trust_ir::ArgExt::SignExt,
+                    ..ParamAttrs::default()
+                },
+                "extension `signext`",
+            ),
+            (
+                ParamAttrs {
+                    pass: Some(trust_ir::PassMode::Direct),
+                    ..ParamAttrs::default()
+                },
+                "pass mode `direct`",
+            ),
+            (
+                ParamAttrs {
+                    pass: Some(trust_ir::PassMode::Indirect { on_stack: true }),
+                    ..ParamAttrs::default()
+                },
+                "pass mode `indirect`",
+            ),
+        ];
+        for (slot, described) in facts {
+            for index in [0usize, 2] {
+                let mut attrs = none.clone();
+                attrs.params[index] = slot.clone();
+                let fact = abi_fact_an_indirect_call_does_not_carry(&attrs)
+                    .unwrap_or_else(|| panic!("parameter {index}: {slot:?}"));
+                assert!(
+                    fact.starts_with(&format!("parameter {index} ")) && fact.contains(described),
+                    "{fact}"
+                );
+            }
+            let mut attrs = none.clone();
+            attrs.ret = slot.clone();
+            let fact = abi_fact_an_indirect_call_does_not_carry(&attrs)
+                .unwrap_or_else(|| panic!("result: {slot:?}"));
+            assert!(
+                fact.starts_with("result ") && fact.contains(described),
+                "{fact}"
+            );
+        }
+    }
+
+    /// `first_possibly_stack_passed_i128` over-approximates the backend's own
+    /// AArch64 placement. The importer admits ten scalar types in a
+    /// signature (`ptr`, `i1`, `i8`, `i16`, `i32`, `i64`, `i128`, `half`,
+    /// `float`, `double`); each is read with the importer's `parse_ty` and
+    /// translated with the backend's `translate_type`. Checked: every
+    /// signature of up to six of them, and, for each of the seven types other
+    /// than `i64`, `i128` and `double`, every signature of up to nine
+    /// arguments over that type, `i64`, `i128` and `double`. Whenever
+    /// `classify_params_with` (either variant) puts a 128-bit integer on the
+    /// stack, the bound flags that argument or an earlier one; and under
+    /// AAPCS64 the argument it flags is stack-passed, so it refuses nothing a
+    /// direct call would pass in registers there. The first family alone
+    /// separates each general-purpose type from a floating-point one: one
+    /// such argument before four 128-bit integers moves the fourth to the
+    /// stack.
+    #[test]
+    fn stack_passed_i128_bound_covers_the_backend_classifier() {
+        use trust_cg_lower::{
+            AArch64AbiVariant, AppleAArch64ABI, ArgLocation, Type, translate_type,
+        };
+        let ty = |spelling: &str| parse_ty(spelling).expect("scalar type");
+        let scalars = [
+            "ptr", "i1", "i8", "i16", "i32", "i64", "i128", "half", "float", "double",
+        ]
+        .map(ty);
+        let check_all = |alphabet: &[Ty], max_length: u32| -> usize {
+            let lir: Vec<Type> = alphabet
+                .iter()
+                .map(|ty| translate_type(ty).expect("scalar translates"))
+                .collect();
+            let mut checked = 0usize;
+            for length in 0..=max_length {
+                for code in 0..alphabet.len().pow(length) {
+                    let mut rest = code;
+                    let mut params = Vec::new();
+                    let mut lir_params = Vec::new();
+                    for _ in 0..length {
+                        params.push(alphabet[rest % alphabet.len()].clone());
+                        lir_params.push(lir[rest % alphabet.len()].clone());
+                        rest /= alphabet.len();
+                    }
+                    let bound = first_possibly_stack_passed_i128(&params);
+                    for variant in [AArch64AbiVariant::Aapcs64, AArch64AbiVariant::Darwin] {
+                        let locations = AppleAArch64ABI::classify_params_with(variant, &lir_params);
+                        let first_stack_i128 =
+                            lir_params.iter().zip(&locations).position(|(ty, loc)| {
+                                *ty == Type::I128 && matches!(loc, ArgLocation::Stack { .. })
+                            });
+                        if let Some(stack) = first_stack_i128 {
+                            assert!(
+                                bound.is_some_and(|flagged| flagged <= stack),
+                                "{variant:?} {params:?}: argument {stack} is stack-passed, bound \
+                                 {bound:?}"
+                            );
+                        }
+                        if variant == AArch64AbiVariant::Aapcs64 {
+                            assert_eq!(bound, first_stack_i128, "{params:?}");
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+            checked
+        };
+        let signatures = |letters: usize, max_length: u32| -> usize {
+            (0..=max_length).map(|n| letters.pow(n)).sum()
+        };
+        assert_eq!(check_all(&scalars, 6), signatures(10, 6));
+        for spelling in ["ptr", "i1", "i8", "i16", "i32", "half", "float"] {
+            assert_eq!(
+                check_all(&[ty(spelling), Ty::I64, Ty::I128, Ty::F64], 9),
+                signatures(4, 9)
+            );
+        }
+        // The importer spells no unsigned type, but an unsigned 128-bit
+        // integer is placed like a signed one.
+        let mut params = vec![Ty::I64; 7];
+        params.push(Ty::U128);
+        assert_eq!(first_possibly_stack_passed_i128(&params), Some(7));
+        assert_eq!(first_possibly_stack_passed_i128(&params[1..]), None);
+        // A type the bound does not model (the importer does not admit one in
+        // a signature today) takes all eight registers, so any later 128-bit
+        // integer may be stack-passed.
+        let mut params = vec![Ty::Vector(Box::new(Ty::F32), 4)];
+        params.extend(std::iter::repeat_n(Ty::I64, 5));
+        params.push(Ty::I128);
+        assert_eq!(first_possibly_stack_passed_i128(&params), Some(6));
+        assert_eq!(first_possibly_stack_passed_i128(&params[1..]), None);
+    }
+
+    #[test]
+    fn conflicting_headers_for_one_function_are_refused() {
+        for src in [
+            "declare hidden i32 @f()\ndefine i32 @f() {\n  ret i32 1\n}\n",
+            "declare i32 @f()\ndefine linkonce_odr i32 @f() {\n  ret i32 1\n}\n",
+            "declare i32 @f()\ndeclare extern_weak i32 @f()\n",
+            "define internal i32 @f() {\n  ret i32 1\n}\ndeclare i32 @f()\n",
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.contains("twice with different symbol facts"),
+                "{src}: {reason}"
+            );
+        }
+        // Agreeing headers stay accepted.
+        let m = import_text(
+            "declare hidden i32 @f()\ndefine hidden i32 @f() {\n  ret i32 1\n}\n",
+            "t",
+        )
+        .expect("agreeing headers import");
+        assert_eq!(
+            function_facts(&m, "f"),
+            (Linkage::External, Visibility::Hidden, false)
+        );
+    }
+
+    #[test]
+    fn a_skipped_declaration_never_drops_stated_facts() {
+        // An unmodeled signature is still skipped when it states nothing...
+        let m = import_text("declare <3 x i7> @v(<3 x i7>)\n", "t").expect("skipped");
+        assert!(m.functions.is_empty());
+        // ...but not when a later call would default a fact it states.
+        for src in [
+            "declare hidden <3 x i7> @v(<3 x i7>)\n",
+            "declare extern_weak <3 x i7> @v(<3 x i7>)\n",
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.contains("skipping it would let a call default them"),
+                "{src}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_qualifiers_without_a_backend_spelling_are_refused_by_name() {
+        for (src, needle) in [
+            (
+                "declare dllimport i32 @f()\n",
+                "DLL storage class `dllimport`",
+            ),
+            (
+                "define dllexport i32 @f() {\n  ret i32 0\n}\n",
+                "DLL storage class `dllexport`",
+            ),
+            (
+                "@t = thread_local global i32 0\n",
+                "`thread_local` (thread-local globals are not imported",
+            ),
+            (
+                "@t = internal thread_local(initialexec) global i32 0\n",
+                "`thread_local(initialexec)` (thread-local globals are not imported",
+            ),
+            (
+                "@g = externally_initialized global i32 0\n",
+                "`externally_initialized` (its initial value may be replaced",
+            ),
+            (
+                "@g = sneaky global i32 0\n",
+                "unrecognized qualifier `sneaky`",
+            ),
+            (
+                "@g = dllimport global i32\n",
+                "DLL storage class `dllimport`",
+            ),
+            (
+                "define i32 @f() partition \"p\" {\n  ret i32 0\n}\n",
+                "`partition`",
+            ),
+            (
+                "define i32 @f() prefix i32 123 {\n  ret i32 0\n}\n",
+                "`prefix` data",
+            ),
+            (
+                "define i32 @f() prologue i32 123 {\n  ret i32 0\n}\n",
+                "`prologue` data",
+            ),
+            ("@g = global i32 0, partition \"p\"\n", "`partition`"),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+    }
+
+    /// Aliases and ifuncs are refused by their keyword, whatever linkage,
+    /// preemption, visibility or `unnamed_addr` precedes it, and a global
+    /// whose initializer spells either word is still a global.
+    #[test]
+    fn aliases_and_ifuncs_are_refused_by_keyword() {
+        let target = "@g = global i64 1\n\
+                      define i64 @f() {\n  ret i64 1\n}\n\
+                      define ptr @resolve() {\n  ret ptr @f\n}\n";
+        for (entity, keyword) in [
+            ("@a = alias i64, ptr @g\n", "alias"),
+            ("@a = weak hidden alias i64, ptr @g\n", "alias"),
+            (
+                "@a = dso_local unnamed_addr alias i64 (), ptr @f\n",
+                "alias",
+            ),
+            (
+                "@a = internal alias i8, getelementptr (i8, ptr @g, i64 4)\n",
+                "alias",
+            ),
+            ("@i = ifunc i64 (), ptr @resolve\n", "ifunc"),
+            ("@i = protected ifunc i64 (), ptr @resolve\n", "ifunc"),
+        ] {
+            let src = format!("{target}{entity}");
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains(&format!("is an `{keyword}`"))
+                    && reason.contains("imports no `alias` or `ifunc`"),
+                "{entity}: {reason}"
+            );
+        }
+        let module = import_text(
+            "@s = constant [6 x i8] c\"alias\\00\"\n@t = global [6 x i8] c\"ifunc\\00\"\n",
+            "t",
+        )
+        .expect("globals spelling the keywords import");
+        assert_eq!(module.globals.len(), 2);
+    }
+
+    /// Every address space other than the default one is refused by name,
+    /// whatever position and spelling it takes, before any line is read. The
+    /// base importer, and this one before, dropped it in a type or on a call
+    /// and imported the pointer as an ordinary 64-bit one (LLVM's AArch64
+    /// data layouts make `addrspace(270)` a 32-bit pointer). The default
+    /// address space is admitted in every spelling, and the word is not a
+    /// clause inside a name, a string, a comment or `addrspacecast`.
+    #[test]
+    fn non_default_address_spaces_are_refused_wherever_they_are_spelled() {
+        for (src, line, clause) in [
+            // Symbols: a global, a function's own clause (glued, spaced, after
+            // `unnamed_addr` and attributes), a declaration's, a return type.
+            ("@g = addrspace(1) global i32 0\n", 1, "addrspace(1)"),
+            ("@g = addrspace (1) global i32 0\n", 1, "addrspace (1)"),
+            (
+                "@g = global ptr addrspace(270) null, align 4\n",
+                1,
+                "addrspace(270)",
+            ),
+            (
+                "define i64 @f() addrspace(1) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace(1)",
+            ),
+            (
+                "define i64 @f() unnamed_addr addrspace(1) #0 {\n  ret i64 1\n}\n\
+                 attributes #0 = { nounwind }\n",
+                1,
+                "addrspace(1)",
+            ),
+            (
+                "define i64 @f() addrspace (2) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace (2)",
+            ),
+            (
+                "define i64 @f() addrspace\t(1) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace\t(1)",
+            ),
+            (
+                "define i64 @f() addrspace( 1 ) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace( 1 )",
+            ),
+            (
+                "declare i64 @h() addrspace(1)\n\
+                 define i64 @f() {\n  %v = call i64 @h()\n  ret i64 %v\n}\n",
+                1,
+                "addrspace(1)",
+            ),
+            ("declare ptr addrspace(1) @g()\n", 1, "addrspace(1)"),
+            ("declare ptr addrspace (1) @g()\n", 1, "addrspace (1)"),
+            (
+                "define ptr addrspace (1) @g(ptr %p) {\n  ret ptr %p\n}\n",
+                1,
+                "addrspace (1)",
+            ),
+            ("declare i8 addrspace (1)* @g()\n", 1, "addrspace (1)"),
+            // Operands: a parameter, a call argument, a constant, a cast
+            // target, a loaded pointer's type, a call's own clause.
+            (
+                "define i64 @f(ptr addrspace(1) %p) {\n  ret i64 3\n}\n",
+                1,
+                "addrspace(1)",
+            ),
+            (
+                "declare void @k(ptr)\ndefine void @f(ptr %p) {\n  \
+                 call void @k(ptr addrspace(1) %p)\n  ret void\n}\n",
+                3,
+                "addrspace(1)",
+            ),
+            (
+                "declare void @k(ptr)\ndefine void @f() {\n  \
+                 call void @k(ptr addrspace(257) null)\n  ret void\n}\n",
+                3,
+                "addrspace(257)",
+            ),
+            (
+                "define i64 @f(ptr %p) {\n  %q = addrspacecast ptr %p to ptr addrspace(257)\n  \
+                 ret i64 0\n}\n",
+                2,
+                "addrspace(257)",
+            ),
+            (
+                "define i64 @f(ptr %s) {\n  %p = load ptr addrspace(1), ptr %s, align 8\n  \
+                 ret i64 0\n}\n",
+                2,
+                "addrspace(1)",
+            ),
+            (
+                "define i64 @f(ptr %fp) {\n  %r = call addrspace(1) i64 %fp()\n  \
+                 ret i64 %r\n}\n",
+                2,
+                "addrspace(1)",
+            ),
+            // Spellings of a non-default operand: a leading zero (`01` is
+            // address space 1), two numbers, negative, beyond 32 bits, a
+            // symbolic data-layout space, empty.
+            (
+                "define i64 @f() addrspace(01) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace(01)",
+            ),
+            (
+                "define i64 @f() addrspace(0 1) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace(0 1)",
+            ),
+            (
+                "define i64 @f() addrspace(-1) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace(-1)",
+            ),
+            (
+                "define i64 @f() addrspace(4294967296) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace(4294967296)",
+            ),
+            (
+                "define i64 @f() addrspace(\"P\") {\n  ret i64 1\n}\n",
+                1,
+                "addrspace(\"P\")",
+            ),
+            (
+                "define i64 @f() addrspace() {\n  ret i64 1\n}\n",
+                1,
+                "addrspace()",
+            ),
+            // Glued to an integer type or a numbered ID, which LLVM's lexer
+            // ends at the first non-digit: `i8addrspace(270)*` is a pointer in
+            // address space 270 (llc reads the low 32 bits of it).
+            (
+                "define i64 @toint(i8addrspace(270)* %p) {\nentry:\n  \
+                 %i = ptrtoint i8addrspace(270)* %p to i64\n  ret i64 %i\n}\n",
+                1,
+                "addrspace(270)",
+            ),
+            (
+                "declare i64 @k(i32addrspace(1)*)\ndefine i64 @f() {\n  \
+                 %r = call i64 @k(i32addrspace(1)* null)\n  ret i64 %r\n}\n",
+                1,
+                "addrspace(1)",
+            ),
+            ("declare i8addrspace(1)* @g()\n", 1, "addrspace(1)"),
+            ("declare i128addrspace(1)* @g()\n", 1, "addrspace(1)"),
+            (
+                "@g = global i8addrspace(1)* null, align 8\n",
+                1,
+                "addrspace(1)",
+            ),
+            (
+                "%0 = type { i64 }\ndefine i64 @toint(%0addrspace(270)* %p) {\n  \
+                 ret i64 0\n}\n",
+                2,
+                "addrspace(270)",
+            ),
+            (
+                "define i64 @f() #0addrspace(1) {\n  ret i64 1\n}\n",
+                1,
+                "addrspace(1)",
+            ),
+            ("declare void @m(ptr @0addrspace(1))\n", 1, "addrspace(1)"),
+            ("!0 = !{!1addrspace(1)}\n", 1, "addrspace(1)"),
+            // An integer literal, mid-line and starting a line.
+            (
+                "define i64 @f() {\n  ret i64 0addrspace(1)\n}\n",
+                2,
+                "addrspace(1)",
+            ),
+            ("0addrspace(1)\n", 1, "addrspace(1)"),
+            // LLVM reads a type split across lines, so a line may start with
+            // the word or with an `iN` type glued to it.
+            ("declare i64 @k(ptr\naddrspace(1))\n", 2, "addrspace(1)"),
+            ("declare i64 @k(\ni8addrspace(1)*)\n", 2, "addrspace(1)"),
+            // A default clause earlier on the line does not hide a later one.
+            (
+                "declare void @k(ptr, ptr)\ndefine void @f(ptr %p) {\n  \
+                 call void @k(ptr addrspace(0) %p, ptr addrspace(3) %p)\n  ret void\n}\n",
+                3,
+                "addrspace(3)",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.starts_with(&format!(
+                    "line {line}: address space `{clause}` (only the default address space 0 is \
+                     imported"
+                )),
+                "{src}: {reason}"
+            );
+        }
+        assert!(
+            unsupported_reason("define i64 @f() addrspace(1 {\n  ret i64 1\n}\n")
+                .contains("has no closing parenthesis")
+        );
+        // LLVM reads a clause whose operand is on the next line; the importer
+        // refuses it by name rather than rely on the split line failing to
+        // parse.
+        for (src, line) in [
+            (
+                "define i64 @f() addrspace\n(1) {\nentry:\n  ret i64 1\n}\n",
+                1,
+            ),
+            ("define i64 @f() addrspace  \n  (1)\n{\n  ret i64 1\n}\n", 1),
+            ("@g = addrspace ; a comment\n(1) global i64 0\n", 1),
+            (
+                "define i64 @f() {\n  %p = inttoptr i64 1 to ptr addrspace\n(1)\n  \
+                 ret i64 0\n}\n",
+                2,
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.starts_with(&format!(
+                    "line {line}: address space clause `addrspace` has its operand on a later \
+                     line"
+                )),
+                "{src}: {reason}"
+            );
+        }
+        // The default address space, glued, spaced and with leading zeros, on
+        // a global, a function, a declaration's return type and a call
+        // argument.
+        for src in [
+            "@g = addrspace(0) global i32 0\n",
+            "@g = addrspace (0) global i32 0\n",
+            "@g = addrspace ( 0 ) global i32 0\n",
+            "@g = addrspace( 0 ) global i32 0\n",
+            "@g = addrspace\t(0) global i32 0\n",
+            "define i64 @f() addrspace(0) {\n  ret i64 1\n}\n",
+            "define i64 @f() addrspace(00) {\n  ret i64 1\n}\n",
+            "define i64 @f() unnamed_addr addrspace (0) {\n  ret i64 1\n}\n",
+            "define i64 @f() addrspace\t( 0 ) #0 {\n  ret i64 1\n}\nattributes #0 = { nounwind }\n",
+            "declare ptr addrspace(0) @g()\ndefine i64 @f() {\n  %p = call ptr @g()\n  ret i64 0\n}\n",
+            "declare ptr addrspace (0) @g()\n",
+            "declare void @k(ptr)\ndefine void @f(ptr %p) {\n  \
+             call void @k(ptr addrspace(0) %p)\n  ret void\n}\n",
+            "define i64 @toint(i8addrspace(0)* %p) {\n  %i = ptrtoint ptr %p to i64\n  \
+             ret i64 %i\n}\n",
+        ] {
+            import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error:?}"));
+        }
+        // The word inside a name, a string or a comment, or as the start of
+        // `addrspacecast`, is not an address-space clause.
+        let m = import_text(
+            "@s = constant [13 x i8] c\"addrspace(1)\\00\"\n\
+             define i64 @q(i64 %x) {\n  %\"addrspace(2)\" = add i64 %x, 0 ; addrspace(3)\n  \
+             ret i64 %\"addrspace(2)\"\n}\n\
+             declare i64 @addrspace(i64)\ndeclare i64 @x_addrspace(i64)\n\
+             define i64 @f(i64 %x) {\n  %addrspace = call i64 @addrspace(i64 %x)\n  \
+             %y = call i64 @x_addrspace(i64 %addrspace)\n  \
+             br label %addrspace\naddrspace:\n  br label %addrspace.1\n\
+             addrspace.1:\n  ret i64 %y\n}\n\
+             define i64 @g(ptr %addrspace) {\n  %r = call i64 %addrspace(i64 1)\n  \
+             ret i64 %r\n}\n\
+             declare i64 @x1addrspace(i64)\ndeclare i64 @vi32addrspace(i64)\n\
+             define i64 @h(ptr %v1addrspace, ptr %i8addrspace) {\n  \
+             %a = call i64 %v1addrspace(i64 1)\n  %b = call i64 %i8addrspace(i64 %a)\n  \
+             %c = call i64 @x1addrspace(i64 %b)\n  %d = call i64 @vi32addrspace(i64 %c)\n  \
+             ret i64 %d\n}\n",
+            "t",
+        )
+        .expect("the word outside a clause is not an address space");
+        for name in [
+            "addrspace",
+            "x_addrspace",
+            "g",
+            "h",
+            "x1addrspace",
+            "vi32addrspace",
+        ] {
+            assert!(m.functions.iter().any(|f| f.name == name), "@{name}");
+        }
+        let reason = unsupported_reason(
+            "define i64 @f(ptr %p) {\n  %q = addrspacecast ptr %p to ptr\n  ret i64 0\n}\n",
+        );
+        assert!(!reason.contains("address space `"), "{reason}");
+        // A bare word where a global qualifier belongs is still unknown.
+        assert!(
+            unsupported_reason("@g = addrspace global i32 0\n")
+                .contains("unrecognized qualifier `addrspace`")
+        );
+    }
+
+    /// The module is lexed as a whole, as LLVM's lexer reads it: a string runs
+    /// to the next quote across lines, and a `;` comment ends at a newline or
+    /// a carriage return. What the line-based importer would read differently
+    /// is refused by name before any line is read. The round-6 verifier's
+    /// `twoviews.ll` is the reason: a metadata string continued on a line
+    /// that begins `;"` hid `define ... ret i64 1 } /*` from a per-line check,
+    /// so LLVM built `@answer` returning 1 and the importer, reading the block
+    /// comment's lines as code, returning 2.
+    #[test]
+    fn strings_and_comments_are_lexed_across_lines_as_llvm_does() {
+        let spans = "a string spanning lines (a quoted string with a raw newline or carriage \
+                     return) is not read by this importer";
+        for (src, line, needle) in [
+            (
+                "!0 = !{!\"x\n;\"} define i64 @answer() { ret i64 1 } /*\n\
+                 define i64 @answer() {\nentry:\n  ret i64 2\n}\n; */\n",
+                1,
+                spans,
+            ),
+            (
+                "define i64 @answer() {\nentry:\n  ret i64 2\n}\n!0 = !{!\"x\n;\" /*\n\
+                 define i64 @answer2() {\nentry:\n  ret i64 1\n}\n; */}\n",
+                5,
+                spans,
+            ),
+            (
+                "source_filename = \"x\n;\" /*\ndefine i64 @answer() {\nentry:\n  ret i64 1\n}\n\
+                 ; */\ndefine i64 @answer() {\nentry:\n  ret i64 2\n}\n",
+                1,
+                spans,
+            ),
+            // Any string with a raw line break, even one that hides nothing.
+            ("!0 = !{!\"first\nsecond\"}\n", 1, spans),
+            ("@s = constant [3 x i8] c\"a\rb\"\n", 1, spans),
+            (
+                "define i64 @f(i64 %x) {\n  ret i64 %x\n}\n@s = constant [1 x i8] c\"\n\"\n",
+                4,
+                spans,
+            ),
+            (
+                "@s = constant [2 x i8] c\"ab",
+                1,
+                "a string that is never closed",
+            ),
+            // LLVM ends a comment at a carriage return and reads what follows.
+            (
+                "declare i64 @h(i64) ; c\raddrspace(1)\n",
+                1,
+                "a carriage return inside a `;` comment, followed by text",
+            ),
+            (
+                "; c\rdefine i64 @g() {\n  ret i64 1\n}\n",
+                1,
+                "a carriage return inside a `;` comment, followed by text",
+            ),
+            // A quote in a comment opens no string: the next line is lexed.
+            (
+                "; a \"quote\ndeclare void @k(ptr addrspace(1))\n",
+                2,
+                "address space `addrspace(1)`",
+            ),
+            ("; a \"quote\n/* x */\n", 2, "block comment `/*`"),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.starts_with(&format!("line {line}: {needle}")),
+                "{src:?}: {reason}"
+            );
+        }
+        // One-line strings holding `;`, `/*` and `addrspace(1)`, a comment
+        // holding a quote, and `\r\n` line endings (whose `\r` ends no
+        // comment early) are read as before.
+        let m = import_text(
+            "@s = constant [16 x i8] c\";/*addrspace(1)\\00\"\r\n\
+             ; a \"quote and a trailing carriage return\r\n\
+             ; a carriage return with only blanks after it\r \t\n\
+             define i64 @f(i64 %x) {\r\n  ret i64 %x ; done\r\n}\r\n",
+            "t",
+        )
+        .expect("one-line strings and comments are admitted");
+        assert!(m.functions.iter().any(|f| f.name == "f"));
+    }
+
+    /// A C-style block comment, which LLVM 22 reads as whitespace (across
+    /// lines), is refused by name before any line is read: the importer reads
+    /// one line at a time, so it would read the comment's text as code, and a
+    /// quote or `;` inside one hid an address space from the pre-parse check
+    /// (`ptr /*"*/ addrspace(270)` imported as a 64-bit pointer; llc reads
+    /// the low 32 bits). The same bytes inside a string or a `;` comment are
+    /// not a block comment.
+    #[test]
+    fn block_comments_are_refused_by_name() {
+        for (src, line) in [
+            (
+                "declare i64 @k(ptr /*\"*/ addrspace(270), i64)\n\
+                 define i64 @swap(i64 %a, ptr /*\"*/ addrspace(270) %p) {\nentry:\n  \
+                 %r = call i64 @k(ptr /*\"*/ addrspace(270) %p, i64 %a)\n  ret i64 %r\n}\n",
+                1,
+            ),
+            (
+                "define i64 @f(ptr /*\"*/ addrspace(270) %p) {\n  ret i64 0\n}\n",
+                1,
+            ),
+            (
+                "declare i64 @k(i64, ptr)\ndefine i64 @f() {\n  \
+                 %r = call i64 @k(i64 1, ptr /*\"*/ addrspace(270) null)\n  ret i64 %r\n}\n",
+                3,
+            ),
+            ("define i64 @f() /*\"*/ addrspace(1) {\n  ret i64 1\n}\n", 1),
+            (
+                "define i64 @f(ptr %fp) {\n  %r = call /*\"*/ addrspace(1) i64 %fp()\n  \
+                 ret i64 %r\n}\n",
+                2,
+            ),
+            (
+                "define i64 @f() /* ; */ addrspace(1) {\n  ret i64 1\n}\n",
+                1,
+            ),
+            ("declare i64 @h() /* ; */ addrspace(1)\n", 1),
+            // Any block comment, with or without anything it could hide, and
+            // one that spans lines.
+            ("define i64 @f(i64 %x) /* note */ {\n  ret i64 %x\n}\n", 1),
+            (
+                "define i64 @f(i64 %x) {\n  ret i64 %x\n}\n/* one\n@g = global i64 1\n*/\n",
+                4,
+            ),
+            ("@s = constant [2 x i8] c\"x\\00\" /*\"*/\n", 1),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.starts_with(&format!(
+                    "line {line}: block comment `/*` (block comments are not read by this \
+                     importer"
+                )),
+                "{src}: {reason}"
+            );
+        }
+        // The same bytes in a string, a quoted name or a `;` comment.
+        let m = import_text(
+            "@s = constant [3 x i8] c\"/*\\00\"\n\
+             define i64 @f(i64 %x) section \".text/*x\" {\n  \
+             %\"a/*b\" = add i64 %x, 1 ; /* not a block comment\n  ret i64 %\"a/*b\"\n}\n",
+            "t",
+        )
+        .expect("`/*` in a string or a `;` comment is not a block comment");
+        assert!(m.functions.iter().any(|f| f.name == "f"));
+        // In a quoted symbol name it is no block comment either: the name
+        // is carried for an internal global, and refused for an exported
+        // one, whose name this importer does not write as LLVM does.
+        import_text("@\"a/*b\" = internal global i64 1\n", "t").expect("internal");
+        let reason = unsupported_reason("@\"a/*b\" = global i64 1\n");
+        assert!(
+            reason.starts_with("global `@\"a\\2F\\2Ab\"` (`a/*b` after LLVM's escapes)"),
+            "{reason}"
+        );
+    }
+
+    /// `default` is a visibility keyword like `hidden` and `protected`, not
+    /// an unknown qualifier: it is admitted on globals and functions
+    /// (including local ones, where LLVM allows only it), and a second
+    /// visibility after it is refused.
+    #[test]
+    fn default_visibility_is_read_as_a_visibility() {
+        let m = import_text(
+            "@g = default global i32 0\n@l = internal default global i32 1\n\
+             define default i32 @f() {\n  ret i32 0\n}\n\
+             define internal default i32 @i() {\n  ret i32 0\n}\n\
+             declare default i32 @d()\n\
+             define i32 @u() {\n  %v = call i32 @d()\n  ret i32 %v\n}\n",
+            "t",
+        )
+        .expect("default visibility imports");
+        for (name, linkage) in [("g", Linkage::External), ("l", Linkage::Internal)] {
+            let global = m.globals.iter().find(|g| g.name == name).expect("global");
+            assert_eq!(
+                (global.linkage, global.visibility),
+                (linkage, Visibility::Default),
+                "@{name}"
+            );
+        }
+        assert_eq!(
+            function_facts(&m, "f"),
+            (Linkage::External, Visibility::Default, false)
+        );
+        assert_eq!(
+            function_facts(&m, "i"),
+            (Linkage::Internal, Visibility::Default, false)
+        );
+        assert_eq!(
+            function_facts(&m, "d"),
+            (Linkage::External, Visibility::Default, true)
+        );
+        for src in [
+            "@g = default hidden global i32 0\n",
+            "@g = hidden default global i32 0\n",
+            "define default protected i32 @f() {\n  ret i32 0\n}\n",
+            "declare default hidden i32 @d()\n",
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.contains("two visibilities (second `"),
+                "{src}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_section_is_carried_onto_the_definition() {
+        let src = "define hidden i32 @f() #0 section \".text.hot x\" {\n  ret i32 0\n}\n\
+                   define i32 @g() {\n  ret i32 0\n}\n";
+        let m = import_text(src, "t").expect("sectioned function imports");
+        let section = |name: &str| {
+            m.functions
+                .iter()
+                .find(|function| function.name == name)
+                .and_then(|function| function.section.clone())
+        };
+        assert_eq!(section("f").as_deref(), Some(".text.hot x"));
+        assert_eq!(section("g"), None);
+        assert!(
+            unsupported_reason("define i32 @f() section \".a\" section \".b\" {\n  ret i32 0\n}\n")
+                .contains("two `section` clauses")
+        );
+    }
+
+    #[test]
+    fn only_self_keyed_any_comdats_on_grouped_linkages_are_admitted() {
+        // Linux clang's C++ `inline` function and variable shapes.
+        let src = r#"
+$_Z3onev = comdat any
+$_ZZ3onevE1x = comdat any
+$"\71uoted" = comdat any
+
+@_ZZ3onevE1x = linkonce_odr dso_local global i32 5, comdat, align 4
+@wodr = weak_odr global i32 1, comdat($wodr_group_is_not_declared_here)
+
+define linkonce_odr dso_local i32 @_Z3onev() #0 comdat {
+  ret i32 1
+}
+"#;
+        let reason = unsupported_reason(src);
+        assert!(
+            reason.contains("COMDAT `$wodr_group_is_not_declared_here` is not declared"),
+            "{reason}"
+        );
+
+        let src = r#"
+$_Z3onev = comdat any
+$_ZZ3onevE1x = comdat any
+$wodr = comdat any
+$lo = comdat any
+$fwo = comdat any
+
+@_ZZ3onevE1x = linkonce_odr dso_local global i32 5, comdat, align 4
+@wodr = weak_odr global i32 1, comdat($wodr)
+@lo = linkonce global i32 1, comdat
+
+define linkonce_odr dso_local i32 @_Z3onev() #0 comdat {
+  ret i32 1
+}
+define weak_odr hidden i32 @fwo() comdat($fwo) {
+  ret i32 2
+}
+"#;
+        let m = import_text(src, "t").expect("self-keyed COMDATs import");
+        assert_eq!(
+            function_facts(&m, "_Z3onev"),
+            (Linkage::LinkOnceOdr, Visibility::Default, false)
+        );
+        assert_eq!(
+            function_facts(&m, "fwo"),
+            (Linkage::WeakOdr, Visibility::Hidden, false)
+        );
+        let linkage = |name: &str| m.globals.iter().find(|g| g.name == name).map(|g| g.linkage);
+        assert_eq!(linkage("_ZZ3onevE1x"), Some(Linkage::LinkOnceOdr));
+        assert_eq!(linkage("wodr"), Some(Linkage::WeakOdr));
+        assert_eq!(linkage("lo"), Some(Linkage::LinkOnce));
+
+        for (src, needle) in [
+            // A guard variable in its variable's group: a multi-member group.
+            (
+                "$x = comdat any\n@x = linkonce_odr global i32 0, comdat\n\
+                 @_ZGVx = linkonce_odr global i64 0, comdat($x)\n",
+                "keyed on another symbol",
+            ),
+            (
+                "$f = comdat largest\ndefine linkonce_odr i32 @f() comdat {\n  ret i32 0\n}\n",
+                "selection kind `largest`",
+            ),
+            (
+                "$f = comdat nodeduplicate\ndefine linkonce_odr i32 @f() comdat {\n  ret i32 0\n}\n",
+                "selection kind `nodeduplicate`",
+            ),
+            // Linkages the backend does not group.
+            (
+                "$f = comdat any\ndefine weak i32 @f() comdat {\n  ret i32 0\n}\n",
+                "does not emit in a COMDAT group",
+            ),
+            (
+                "$f = comdat any\ndefine linkonce i32 @f() comdat {\n  ret i32 0\n}\n",
+                "does not emit in a COMDAT group",
+            ),
+            (
+                "$f = comdat any\ndefine i32 @f() comdat {\n  ret i32 0\n}\n",
+                "does not emit in a COMDAT group",
+            ),
+            (
+                "$g = comdat any\n@g = weak global i32 0, comdat\n",
+                "does not emit in a COMDAT group",
+            ),
+            (
+                "$f = comdat any\ndeclare i32 @f() comdat\n",
+                "on a declaration",
+            ),
+            // An `available_externally` global's initializer is not a
+            // definition the linker sees, so it is a declaration here too.
+            (
+                "$g = comdat any\n@g = available_externally global i32 1, comdat\n",
+                "COMDAT `$g` on a declaration",
+            ),
+            (
+                "define linkonce_odr i32 @f() comdat {\n  ret i32 0\n}\n",
+                "COMDAT `$f` is not declared",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        for src in [
+            "$f = comdat bogus\n",
+            "$f = comdat any\n$f = comdat any\n",
+            "$f = something\n",
+        ] {
+            assert!(
+                matches!(import_text(src, "t"), Err(Error::Parse { .. })),
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_llvm_global_linkage_maps_or_is_refused_by_name() {
+        // Without a `comdat` clause the link-once and ODR forms are the
+        // backend's ungrouped weak definition
+        // (`odr_definitions_without_a_comdat_clause_are_ungrouped_weak_definitions`).
+        for (keyword, initializer, linkage) in [
+            ("", " 3", Linkage::External),
+            ("weak", " 3", Linkage::Weak),
+            ("weak_odr", " 3", Linkage::Weak),
+            ("linkonce", " 3", Linkage::Weak),
+            ("linkonce_odr", " 3", Linkage::Weak),
+            ("external", "", Linkage::External),
+            ("extern_weak", "", Linkage::ExternalWeak),
+        ] {
+            let src = format!("@g = {keyword} hidden global i32{initializer}, align 4\n");
+            let m = import_text(&src, "t").unwrap_or_else(|e| panic!("{src}: {e:?}"));
+            assert_eq!(m.globals.len(), 1, "{src}");
+            assert_eq!(
+                (
+                    m.globals[0].linkage,
+                    m.globals[0].visibility,
+                    m.globals[0].initializer.is_some()
+                ),
+                (linkage, Visibility::Hidden, !initializer.is_empty()),
+                "{src}"
+            );
+        }
+        for (keyword, linkage) in [
+            ("private", Linkage::Private),
+            ("internal", Linkage::Internal),
+            ("available_externally", Linkage::AvailableExternally),
+        ] {
+            let m = import_text(&format!("@g = {keyword} global i32 3\n"), "t").expect("local");
+            assert_eq!(m.globals[0].linkage, linkage);
+        }
+        // llc writes no visibility for an `available_externally` global, so
+        // a hidden or protected one is refused by name.
+        for visibility in ["hidden", "protected"] {
+            let reason = unsupported_reason(&format!(
+                "@g = available_externally {visibility} global i32 3, align 4\n"
+            ));
+            assert!(
+                reason.contains(&format!(
+                    "`available_externally` global with `{visibility}` visibility"
+                )),
+                "{reason}"
+            );
+        }
+        for (src, needle) in [
+            ("@g = common global i32 0, align 4\n", "linkage `common`"),
+            (
+                "@g = common dso_local global [4 x i8] zeroinitializer\n",
+                "linkage `common`",
+            ),
+            (
+                "@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] \
+                 [{ i32, ptr, ptr } { i32 65535, ptr @c, ptr null }]\n\
+                 define internal void @c() {\n  ret void\n}\n",
+                "linkage `appending`",
+            ),
+            (
+                "@g = external global i32 5\n",
+                "`external` with an initializer",
+            ),
+            (
+                "@g = extern_weak global i32 5\n",
+                "`extern_weak` with an initializer",
+            ),
+            ("@g = weak global i32\n", "`weak` without an initializer"),
+            (
+                "@g = available_externally global i32\n",
+                "without an initializer",
+            ),
+            (
+                "@g = global i32\n",
+                "no initializer and no `external`/`extern_weak`",
+            ),
+            (
+                "@g = internal hidden global i32 0\n",
+                "visibility `hidden` on a local (`internal`)",
+            ),
+            (
+                "@g = private protected constant i32 0\n",
+                "visibility `protected` on a local (`private`)",
+            ),
+            ("@g = weak internal global i32 0\n", "two linkages"),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+            assert!(
+                reason.contains("global `@"),
+                "{src} names the global: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_keyword_is_the_first_one_even_when_the_string_spells_another() {
+        let src = r#"
+@.str = private unnamed_addr constant [21 x i8] c"the global value %d\0A\00", align 1
+@m = internal global [10 x i8] c"a constant", align 1
+"#;
+        let m = import_text(src, "t").expect("imports");
+        let g = |n: &str| m.globals.iter().find(|g| g.name == n).expect(n);
+        assert!(!g(".str").mutable);
+        assert_eq!(g(".str").linkage, Linkage::Private);
+        assert!(g("m").mutable);
+        assert_eq!(g("m").linkage, Linkage::Internal);
+    }
+
+    #[test]
+    fn global_linkage_is_read_from_the_prefix_not_from_the_initializer() {
+        // The old reader searched the whole line after `=`, so a string that
+        // happened to spell a linkage keyword made an exported string local.
+        let src = r#"
+@a = constant [9 x i8] c"internal\00", align 1
+@b = global [8 x i8] c"private\00", align 1
+@c = dso_local global [5 x i8] c"weak\00", align 1
+"#;
+        let m = import_text(src, "t").expect("imports");
+        for global in &m.globals {
+            assert_eq!(global.linkage, Linkage::External, "{}", global.name);
+        }
+    }
+
+    /// LLVM's `UnEscapeLexed`, rule by rule (L02-P14). Each body is decoded
+    /// as a string token's contents, before any declared type is known.
+    #[test]
+    fn llvm_string_escapes_decode_exactly_as_llvm_unescape_lexed() {
+        for (body, want) in [
+            // The ledger's case: `\\` is one backslash, then `\00`.
+            (r"a\\\00", &b"a\\\0"[..]),
+            (r"\\", b"\\"),
+            (r"\\\\", b"\\\\"),
+            (r"\5C\5c", b"\\\\"),
+            // `\\` is recognized before a hex escape.
+            (r"\\41", b"\\41"),
+            (r"\\\41", b"\\A"),
+            (r"\\\\\41", b"\\\\A"),
+            // Hex digits in either case; every byte value.
+            (r"\4a\4A\00\7f\80\ff", b"JJ\0\x7f\x80\xff"),
+            // A backslash before a non-hex pair is kept as itself.
+            (r"\x41", b"\\x41"),
+            (r"\0g", b"\\0g"),
+            (r"\g0", b"\\g0"),
+            // Too few characters after the backslash for a hex escape.
+            (r"a\4", b"a\\4"),
+            (r"a\", b"a\\"),
+            (r"\", b"\\"),
+            // A quote is spelled `\22`; `;` and brackets are data.
+            (r"\22;[,]{}\00", b"\";[,]{}\0"),
+            ("", b""),
+            // Non-ASCII UTF-8 is copied byte for byte.
+            ("\u{e9}\\00", b"\xc3\xa9\0"),
+        ] {
+            assert_eq!(decode_ll_string(body), want, "c\"{body}\"");
+        }
+    }
+
+    #[test]
+    fn c_string_globals_decode_escapes_and_refuse_a_length_their_type_does_not_declare() {
+        let src = r#"
+@s = constant [3 x i8] c"a\\\00", align 1
+@t = global [3 x i8] c"\\41", align 1
+@u = constant [4 x i8] c"\x41", align 1
+@v = constant [2 x i8] c"a\", align 1
+@w = constant [1 x { i32, [3 x i8] }] [{ i32, [3 x i8] } { i32 7, [3 x i8] c"a\\\00" }], align 4
+"#;
+        let m = import_text(src, "t").expect("imports");
+        assert_eq!(global_bytes(&m, "s"), b"a\\\0");
+        assert_eq!(global_bytes(&m, "t"), b"\\41");
+        assert_eq!(global_bytes(&m, "u"), b"\\x41");
+        assert_eq!(global_bytes(&m, "v"), b"a\\");
+        assert_eq!(global_bytes(&m, "w"), b"\x07\0\0\0a\\\0\0");
+
+        for (src, want) in [
+            (
+                "@s = constant [4 x i8] c\"a\\\\\\00\", align 1\n",
+                "global `@s`: c-string initializer c\"a\\\\\\00\" decodes to 3 byte(s), but its \
+                 type is [4 x i8]",
+            ),
+            (
+                "@s = constant [2 x i8] c\"ab\\00\", align 1\n",
+                "global `@s`: c-string initializer c\"ab\\00\" decodes to 3 byte(s), but its \
+                 type is [2 x i8]",
+            ),
+            (
+                "@w = constant [1 x { i32, [4 x i8] }] [{ i32, [4 x i8] } { i32 7, [4 x i8] c\"a\\\\\\00\" }], align 4\n",
+                "aggregate initializer: c-string initializer c\"a\\\\\\00\" decodes to 3 \
+                 byte(s), but its type is [4 x i8]",
+            ),
+        ] {
+            match import_text(src, "t") {
+                Err(Error::Unsupported(reason)) => assert!(
+                    reason.starts_with(want)
+                        && reason.ends_with(
+                            "(a c-string whose decoded length differs from its declared array \
+                             type)"
+                        ),
+                    "{src}: {reason}"
+                ),
+                other => panic!("{src}: expected the named length refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// L01-P11: `sret` reaches trust-ir as `ParamAttrs::sret` on the callee,
+    /// definition and declaration alike, with clang's full attribute spelling.
+    #[test]
+    fn sret_parameters_are_carried_onto_definitions_and_declarations() {
+        let src = r#"
+%struct.big = type { i64, i64, i64 }
+declare void @c_make(ptr dead_on_unwind writable sret(%struct.big) align 8, i64 noundef)
+define void @make(ptr dead_on_unwind noalias writable writeonly sret(%struct.big) align 8 captures(none) initializes((0, 24)) %0, i64 noundef %1) {
+  store i64 %1, ptr %0, align 8
+  ret void
+}
+define i64 @user(i64 noundef %x) {
+  %buf = alloca %struct.big, align 8
+  call void @c_make(ptr dead_on_unwind nonnull writable sret(%struct.big) align 8 %buf, i64 noundef %x)
+  call void @make(ptr sret({ i64, i64, i64 }) align 8 %buf, i64 %x)
+  call void @later(ptr sret(%struct.big) %buf)
+  %v = load i64, ptr %buf, align 8
+  ret i64 %v
+}
+define void @later(ptr sret(%struct.big) %0) {
+  ret void
+}
+define void @plain(ptr noalias %p) {
+  ret void
+}
+"#;
+        let m = import_text(src, "t").expect("imports");
+        let function = |name: &str| m.functions.iter().find(|f| f.name == name).expect(name);
+        for name in ["c_make", "make", "later"] {
+            let attrs = &function(name).attrs.params;
+            assert!(attrs.first().is_some_and(|p| p.sret), "{name}: {attrs:?}");
+            assert!(attrs.iter().skip(1).all(|p| !p.sret), "{name}: {attrs:?}");
+        }
+        for name in ["user", "plain"] {
+            assert!(
+                function(name).attrs.params.iter().all(|p| !p.sret),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sret_disagreements_and_indirect_sret_calls_are_refused_by_name() {
+        let big = "%struct.big = type { i64, i64, i64 }\n";
+        for (src, want) in [
+            // The call passes a buffer the declaration does not state.
+            (
+                format!(
+                    "{big}declare void @c(ptr, i64)\n\
+                     define void @u(ptr %p) {{\n  call void @c(ptr sret(%struct.big) %p, i64 1)\n  ret void\n}}\n"
+                ),
+                "call to `@c` at line 4: the call site has a hidden return-buffer (`sret`) \
+                 parameter at index 0 but the callee has no hidden return-buffer",
+            ),
+            // The declaration states a buffer the call does not pass.
+            (
+                format!(
+                    "{big}declare void @c(ptr sret(%struct.big), i64)\n\
+                     define void @u(ptr %p) {{\n  call void @c(ptr %p, i64 1)\n  ret void\n}}\n"
+                ),
+                "call to `@c` at line 4: the call site has no hidden return-buffer (`sret`) \
+                 parameter but the callee has a hidden return-buffer (`sret`) parameter at \
+                 index 0",
+            ),
+            // A declaration and a definition that disagree.
+            (
+                format!(
+                    "{big}declare void @c(ptr sret(%struct.big))\n\
+                     define void @c(ptr %p) {{\n  ret void\n}}\n"
+                ),
+                "function `@c`: this definition states no hidden return-buffer (`sret`) \
+                 parameter, but an earlier header or call stated a hidden return-buffer \
+                 (`sret`) parameter at index 0",
+            ),
+            (
+                format!(
+                    "{big}define i64 @u(ptr %fp, ptr %p) {{\n  call void %fp(ptr sret(%struct.big) %p)\n  ret i64 0\n}}\n"
+                ),
+                "indirect call, argument 0: a hidden return-buffer (`sret`) argument",
+            ),
+            (
+                format!("{big}declare void @c(ptr sret(%struct.big), ptr sret(%struct.big))\n"),
+                "function declaration `@c`: more than one hidden return-buffer (`sret`) \
+                 parameter",
+            ),
+            (
+                format!("{big}declare void @c(i64 sret(i64))\n"),
+                "function declaration `@c`, parameter 0: a hidden return-buffer (`sret`) \
+                 parameter must be a `ptr`, not `i64`",
+            ),
+        ] {
+            match import_text(&src, "t") {
+                Err(Error::Unsupported(reason)) => {
+                    assert!(reason.starts_with(want), "{src}\n{reason}")
+                }
+                other => panic!("{src}\nexpected the named refusal `{want}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// The other call-ABI attributes are refused wherever they appear,
+    /// including on a declaration whose calls do not repeat them (LLVM applies
+    /// the callee's attributes to such a call) and on one this importer would
+    /// otherwise skip as unmodeled.
+    #[test]
+    fn byval_inreg_and_register_attributes_are_refused_by_name() {
+        for keyword in [
+            "byval(%struct.big)",
+            "byref(%struct.big)",
+            "inreg",
+            "inalloca(%struct.big)",
+            "preallocated(%struct.big)",
+            "nest",
+            "swiftself",
+            "swifterror",
+            "swiftasync",
+        ] {
+            let name = keyword.split('(').next().unwrap();
+            let declaration = format!(
+                "%struct.big = type {{ i64, i64, i64 }}\ndeclare void @c(ptr {keyword})\n\
+                 define void @u(ptr %p) {{\n  call void @c(ptr %p)\n  ret void\n}}\n"
+            );
+            let unmodeled = format!("declare <3 x i7> @c(ptr {keyword})\n");
+            let call = format!(
+                "%struct.big = type {{ i64, i64, i64 }}\ndeclare void @c(ptr)\n\
+                 define void @u(ptr %p) {{\n  call void @c(ptr {keyword} %p)\n  ret void\n}}\n"
+            );
+            let indirect = format!(
+                "define void @u(ptr %fp, ptr %p) {{\n  call void %fp(ptr {keyword} %p)\n  ret void\n}}\n"
+            );
+            for (src, subject) in [
+                (&declaration, "function declaration `@c`, parameter 0"),
+                (&unmodeled, "function declaration `@c`, parameter 0"),
+                (&call, "call to `@c`, argument 0"),
+                (&indirect, "indirect call, argument 0"),
+            ] {
+                match import_text(src, "t") {
+                    Err(Error::Unsupported(reason)) => assert!(
+                        reason.starts_with(&format!("{subject}: parameter attribute `{name}` (")),
+                        "{src}\n{reason}"
+                    ),
+                    other => panic!("{src}\nexpected the named `{name}` refusal, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section_names_decode_llvm_escapes_and_refuse_non_utf8() {
+        let src = "@g = global i32 1, section \"__DATA,__a\\5Fb\\\\c\", align 4\n\
+                   define void @f() section \"__TEXT,__t\\5Fx\" {\n  ret void\n}\n";
+        let m = import_text(src, "t").expect("imports");
+        assert_eq!(m.globals[0].section.as_deref(), Some("__DATA,__a_b\\c"));
+        assert_eq!(m.functions[0].section.as_deref(), Some("__TEXT,__t_x"));
+        for src in [
+            "@g = global i32 1, section \"\\ff\", align 4\n",
+            "define void @f() section \"\\80\" {\n  ret void\n}\n",
+        ] {
+            match import_text(src, "t") {
+                Err(Error::Unsupported(reason)) => assert!(
+                    reason.contains("`section`: the string")
+                        && reason.contains("decodes to bytes that are not UTF-8"),
+                    "{src}: {reason}"
+                ),
+                other => panic!("{src}: expected the named UTF-8 refusal, got {other:?}"),
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Token-level reading (lexical.rs): what LLVM's lexer reads one way and
+    // the line reader would read another is refused by name or read as LLVM
+    // reads it.
+    // ---------------------------------------------------------------------
+
+    /// Assert `src` is refused with a reason starting `line {line}: {needle}`.
+    fn assert_refused_at(src: &str, line: usize, needle: &str) {
+        let reason = unsupported_reason(src);
+        assert!(
+            reason.starts_with(&format!("line {line}: {needle}")),
+            "{src:?}\nexpected `line {line}: {needle}...`, got: {reason}"
+        );
+    }
+
+    /// LLVM reads NUL, carriage return, tab, space and line feed as
+    /// whitespace. A NUL glued to a keyword used to be read as part of the
+    /// word, which the prefix reader skipped: `hidden\0` and `internal\0`
+    /// imported as exported `default` functions, `linkonce_odr\0` as a
+    /// strong one, and `addrspace\0(1)` passed the address-space check.
+    #[test]
+    fn whitespace_the_line_reader_does_not_split_on_is_refused_by_name() {
+        let nul = "a NUL byte outside a string or comment";
+        for keyword in [
+            "hidden",
+            "internal",
+            "private",
+            "protected",
+            "linkonce_odr",
+            "weak_odr",
+            "available_externally",
+        ] {
+            assert_refused_at(
+                &format!("define {keyword}\0 i64 @f() {{\n  ret i64 7\n}}\n"),
+                1,
+                nul,
+            );
+        }
+        for keyword in ["extern_weak", "hidden"] {
+            assert_refused_at(&format!("declare {keyword}\0 i64 @f()\n"), 1, nul);
+        }
+        assert_refused_at("@g = hidden\0 global i64 1\n", 1, nul);
+        assert_refused_at("define i64 @f() addrspace\0(1) {\n  ret i64 1\n}\n", 1, nul);
+        // A carriage return that ends no line: LLVM reads two entities.
+        assert_refused_at(
+            "define i64 @c() {\n  %r = call i64 @dh()\n  ret i64 %r\n}\n\
+             attributes #0 = { nounwind }\rdeclare hidden i64 @dh()\n",
+            5,
+            "a carriage return that does not end a line outside a string or comment",
+        );
+        assert_refused_at("@g =\x0bglobal i64 1\n", 1, "a vertical tab");
+        assert_refused_at("@g =\x0cglobal i64 1\n", 1, "a form feed");
+        assert_refused_at("@g = global i64 1 \u{a0}\n", 1, "the non-ASCII byte 0xc2");
+        assert_refused_at(
+            "@\"a\0b\" = global i64 1\n",
+            1,
+            "a NUL byte inside a quoted name",
+        );
+        // Inside strings and comments the same bytes are data.
+        let m = import_text(
+            "@s = constant [3 x i8] c\"a\0\x0c\" ; \0 \u{a0} \x0c\n\
+             define i64 @f() {\n  ret i64 1 ; \0\n}\n",
+            "t",
+        )
+        .expect("bytes inside a string or a comment");
+        assert_eq!(global_bytes(&m, "s"), vec![b'a', 0, 0x0c]);
+    }
+
+    /// A tab outside a string reads as a space. The line reader's spelled
+    /// patterns used to miss a tab: `, align\t8` was dropped, so the global
+    /// lost its alignment.
+    #[test]
+    fn a_tab_reads_as_the_space_llvm_takes_it_for() {
+        let m = import_text(
+            "@g\t=\tinternal\tglobal\ti64\t1,\talign\t32\n\
+             @s = constant [3 x i8] c\"\t\t\\00\"\n\
+             define\thidden\ti64\t@f()\tsection\t\".t\"\t{\n\tret\ti64\t2\n}\n",
+            "t",
+        )
+        .expect("tab-separated tokens");
+        let g = m.globals.iter().find(|g| g.name == "g").expect("g");
+        assert_eq!((g.linkage, g.align), (Linkage::Internal, Some(32)));
+        assert_eq!(
+            global_bytes(&m, "s"),
+            vec![b'\t', b'\t', 0],
+            "tabs in a string"
+        );
+        assert_eq!(
+            function_facts(&m, "f"),
+            (Linkage::External, Visibility::Hidden, false)
+        );
+        assert_eq!(m.functions[0].section.as_deref(), Some(".t"));
+    }
+
+    /// LLVM ends a keyword at the first byte that is not a letter, digit or
+    /// `_`; the line reader splits on whitespace. A glued clause used to be
+    /// skipped (`section".x"` dropped the section, `prologue[...]` the
+    /// prologue, which changed the function's result) or admitted where the
+    /// spaced form is refused (`partition"p"`).
+    #[test]
+    fn glued_tokens_are_refused_by_name() {
+        for (src, line, glued) in [
+            (
+                "define i64 @f() section\".text.mine\" {\n  ret i64 1\n}\n",
+                1,
+                "`section` glued to `\".text.mine\"`",
+            ),
+            (
+                "define i64 @f() prologue[2 x i32] [i32 -763361984, i32 -698416192] {\n  \
+                 ret i64 1\n}\n",
+                1,
+                "`prologue` glued to `[`",
+            ),
+            (
+                "define i64 @f() prefix[1 x i32] [i32 0] {\n  ret i64 1\n}\n",
+                1,
+                "`prefix` glued to `[`",
+            ),
+            (
+                "define i64 @f() partition\"p1\" {\n  ret i64 1\n}\n",
+                1,
+                "`partition` glued to `\"p1\"`",
+            ),
+            (
+                "@g = global i64 2, section\"myset\", align 8\n",
+                1,
+                "`section` glued to `\"myset\"`",
+            ),
+            (
+                "@g = global i64 2, partition\"p1\"\n",
+                1,
+                "`partition` glued to `\"p1\"`",
+            ),
+            (
+                "@g = global i64 0\ndefine void @f() {\n  store i64 1, ptr@g\n  ret void\n}\n",
+                3,
+                "`ptr` glued to `@g`",
+            ),
+            (
+                "define i64 @f() {\n  ret i64-1\n}\n",
+                2,
+                "`i64` glued to `-1`",
+            ),
+            (
+                "@g = global [4x i8] zeroinitializer\n",
+                1,
+                "`4` glued to `x`",
+            ),
+            // The storage reader dropped the `[` of `global[`.
+            (
+                "@t = global[2 x i8] c\"b\\00\"\n",
+                1,
+                "`global` glued to `[`",
+            ),
+            (
+                "define i64 @f() #0nounwind {\n  ret i64 1\n}\n",
+                1,
+                "`#0` glued to `nounwind`",
+            ),
+            (
+                "define i64 @f() {\n  br label%b\nb:\n  ret i64 1\n}\n",
+                2,
+                "`label` glued to `%b`",
+            ),
+        ] {
+            assert_refused_at(src, line, glued);
+        }
+        // The glued spellings LLVM prints or the reader reads whole.
+        let m = import_text(
+            "$f = comdat any\n@s = constant [2 x i8] c\"a\\00\"\n\
+             define linkonce_odr i64 @f(i64 %x) comdat($f) {\n  ret i64 %x\n}\n\
+             define i64 @g(i8addrspace(0)* %p) {\n  %r = call i64 @f(i64 1)\n  ret i64 %r\n}\n",
+            "t",
+        )
+        .expect("LLVM's own glued spellings");
+        assert_eq!(global_bytes(&m, "s"), vec![b'a', 0]);
+    }
+
+    /// The line reader reads one top-level entity per line. A second entity
+    /// on a line used to be dropped (a `declare hidden` after an `attributes`
+    /// group: its call then stated `external` + `default`), and an entity
+    /// continued on the next line read differently.
+    #[test]
+    fn one_top_level_entity_per_line_or_a_named_refusal() {
+        let second = "a second top-level entity on one line";
+        for (prefix, starts) in [
+            ("attributes #0 = { nounwind }", "`declare`"),
+            ("!0 = !{}", "`declare`"),
+            ("source_filename = \"x\"", "`declare`"),
+            ("target triple = \"aarch64-unknown-linux-gnu\"", "`declare`"),
+            ("declare void @other()", "`declare`"),
+            ("$c = comdat any", "`declare`"),
+            ("@g = global i64 1", "`declare`"),
+            ("%T = type { i64 }", "`declare`"),
+        ] {
+            assert_refused_at(
+                &format!(
+                    "define i64 @c() {{\n  %r = call i64 @dh()\n  ret i64 %r\n}}\n\
+                     {prefix} declare hidden i64 @dh()\n"
+                ),
+                5,
+                &format!("{second} ({starts} starts it"),
+            );
+        }
+        for (src, line, starts) in [
+            ("declare void @a() @g = global i64 1\n", 1, "`@g`"),
+            ("@g = global i64 1 $c = comdat any\n", 1, "`$c`"),
+            ("@g = global i64 1 !0 = !{}\n", 1, "`!`"),
+            ("@g = global i64 1 !n = !{}\n", 1, "`!n`"),
+            ("@g = global i64 1 %T = type { i64 }\n", 1, "`%T`"),
+            (
+                "@g = global i64 1 define i64 @f() {\n  ret i64 1\n}\n",
+                1,
+                "`define`",
+            ),
+        ] {
+            assert_refused_at(src, line, &format!("{second} ({starts} starts it"));
+        }
+        // An entity continued on the next line.
+        assert_refused_at(
+            "@g = global i64 1,\n  align 8\n",
+            2,
+            "`align` continues a top-level entity from an earlier line",
+        );
+        assert_refused_at(
+            "declare i64 @f(i64,\n  i64)\n",
+            2,
+            "`i64` continues a top-level entity from an earlier line",
+        );
+    }
+
+    /// A `define`: its header on one line (only its `{` may start the next
+    /// line, alone), its body from the next line, and its closing `}` alone
+    /// on a line.
+    #[test]
+    fn function_headers_bodies_and_closing_braces_keep_to_their_lines() {
+        for (src, line, needle) in [
+            (
+                "define i64 @f() { ret i64 1 }\n",
+                1,
+                "a function body that starts on its header line",
+            ),
+            (
+                "define { i64, i64 } @f() { ret { i64, i64 } zeroinitializer }\n",
+                1,
+                "a function body that starts on its header line",
+            ),
+            (
+                "define i64 @f(i64 %a,\n  i64 %b) {\n  ret i64 %a\n}\n",
+                2,
+                "the header of the function on line 1 continues on this line",
+            ),
+            (
+                "define i64 @f()\n#0 {\n  ret i64 1\n}\n",
+                2,
+                "the header of the function on line 1 continues on this line",
+            ),
+            (
+                "define i64 @f()\n{ ret i64 1\n}\n",
+                2,
+                "the header of the function on line 1 continues on this line",
+            ),
+            (
+                "define i64 @f() {\n  ret i64 1 }\n",
+                2,
+                "the function's closing `}` shares its line with an instruction",
+            ),
+            (
+                "define i64 @f() {\n  ret i64 1\n} @g = global i64 1\n",
+                3,
+                "`@g` after the function's closing `}` on its line",
+            ),
+            (
+                "define i64 @f() {\n  ret i64 1\n",
+                1,
+                "a function body that is never closed",
+            ),
+        ] {
+            assert_refused_at(src, line, needle);
+        }
+        // A `{` alone on the next line, and a struct return type, are read.
+        let m = import_text(
+            "define i64 @f() #0\n{\n  ret i64 1\n}\nattributes #0 = { nounwind }\n",
+            "t",
+        )
+        .expect("brace on the next line");
+        assert!(m.functions.iter().any(|f| f.name == "f"));
+    }
+
+    /// The line reader reads one instruction per line. A second instruction
+    /// used to be dropped: two stores on a line returned 1 where llc
+    /// returns 2.
+    #[test]
+    fn one_instruction_per_line_or_a_named_refusal() {
+        let second = "a second instruction or entity on one line";
+        for (body, needle) in [
+            (
+                "store i64 1, ptr @g, align 8 store i64 2, ptr @g, align 8",
+                "`store` starts a second instruction",
+            ),
+            (
+                "store i64 1, ptr @g, align 8, !tbaa !0 store i64 2, ptr @g, align 8",
+                "`store` starts a second instruction",
+            ),
+            (
+                "%a = add i64 1, 2 %b = add i64 3, 4",
+                "`%b =` assigns a second value",
+            ),
+            (
+                "%a = add i64 1, 2 add i64 3, 4",
+                "`add` starts a second instruction",
+            ),
+            (
+                "%a = load i64, ptr @g, align 8 ret i64 %a",
+                "`ret` starts a second instruction",
+            ),
+            (
+                "call void @k() tail call void @k()",
+                "`tail` starts a second instruction",
+            ),
+            ("br label %next next:", "`next:` is a block label"),
+        ] {
+            assert_refused_at(
+                &format!(
+                    "@g = global i64 0\ndeclare void @k()\ndefine i64 @f() {{\n  {body}\n  \
+                     br label %next\nnext:\n  ret i64 0\n}}\n"
+                ),
+                4,
+                &format!("{second} ({needle}"),
+            );
+        }
+        assert_refused_at(
+            "define i64 @f() {\nentry: ret i64 1\n}\n",
+            2,
+            "the block label `entry:` shares its line with `ret`",
+        );
+        assert_refused_at(
+            "define i64 @f() {\n  %a = add i64 1,\n    2\n  ret i64 %a\n}\n",
+            3,
+            "`2` starts no instruction: it continues one from an earlier line",
+        );
+        assert_refused_at(
+            "declare i64 @k(i64, i64)\ndefine i64 @f() {\n  %a = call i64 @k(i64 1,\n    \
+             i64 2)\n  ret i64 %a\n}\n",
+            4,
+            "an instruction continued on this line",
+        );
+        // Opcode words in operand position, a call marker, and a multi-line
+        // `switch` case list are one instruction.
+        let m = import_text(
+            "@a = global [4 x i64] zeroinitializer\ndeclare i64 @k(ptr)\n\
+             define i64 @f(i64 %x) {\n  \
+             %r = tail call i64 @k(ptr getelementptr inbounds ([4 x i64], ptr @a, i64 0, i64 1))\n  \
+             %s = call i64 @k(ptr getelementptr inbounds nuw (i8, ptr @a, i64 8))\n  \
+             switch i64 %x, label %d [\n    i64 0, label %z\n    i64 1, label %d\n  ]\n\
+             z:\n  ret i64 %r\nd:\n  ret i64 %s\n}\n",
+            "t",
+        )
+        .expect("one instruction per line");
+        assert!(m.functions.iter().any(|f| f.name == "f"));
+        // `atomicrmw add` reaches the atomics refusal, not a second
+        // instruction.
+        assert!(
+            unsupported_reason(
+                "define i64 @f(ptr %p) {\n  %o = atomicrmw add ptr %p, i64 1 seq_cst\n  \
+                 ret i64 %o\n}\n"
+            )
+            .contains("atomics")
+        );
+    }
+
+    /// `musttail call` guarantees a tail call that the backend does not; it
+    /// is refused by name (a recursion relying on it overflowed the stack at
+    /// O0/O1 where llc's build completed). `tail` and `notail` stay hints.
+    #[test]
+    fn musttail_is_refused_and_the_tail_hints_are_admitted() {
+        let src = "define i64 @g(i64 %x) {\n  ret i64 %x\n}\n\
+                   define i64 @f(i64 %x) {\n  %r = musttail call i64 @g(i64 %x)\n  \
+                   ret i64 %r\n}\n";
+        assert_refused_at(src, 5, "`musttail call`");
+        for hint in ["tail", "notail"] {
+            let src = format!(
+                "define i64 @g(i64 %x) {{\n  ret i64 %x\n}}\n\
+                 define i64 @f(i64 %x) {{\n  %r = {hint} call i64 @g(i64 %x)\n  \
+                 ret i64 %r\n}}\n"
+            );
+            assert!(
+                import_text(&src, "tail_hint").is_ok(),
+                "{hint} call must import"
+            );
+        }
+    }
+
+    /// Calling conventions other than C are refused by name on a definition,
+    /// a declaration and a call: the importer lowers every function and call
+    /// with the C convention (`preserve_nonecc @pn` returned 1 to an llc
+    /// caller expecting 5). `ccc` and `fastcc` are read as C.
+    #[test]
+    fn calling_conventions_other_than_c_are_refused_by_name() {
+        for keyword in crate::lexical::CALLING_CONVENTION_KEYWORDS {
+            if crate::lexical::modeled_calling_convention(keyword) {
+                continue;
+            }
+            let expected = if keyword == "cc" {
+                "numbered calling convention `cc N`".to_string()
+            } else {
+                format!("calling convention `{keyword}`")
+            };
+            let operand = if keyword == "cc" { "cc 10" } else { keyword };
+            for (src, line) in [
+                (
+                    format!("define {operand} i64 @f() {{\n  ret i64 1\n}}\n"),
+                    1,
+                ),
+                (format!("declare {operand} i64 @f()\n"), 1),
+                (
+                    format!(
+                        "define i64 @f(ptr %p) {{\n  %r = call {operand} i64 %p()\n  \
+                         ret i64 %r\n}}\n"
+                    ),
+                    2,
+                ),
+            ] {
+                assert_refused_at(&src, line, &expected);
+            }
+        }
+        assert_refused_at(
+            "define cc10 i64 @f() {\n  ret i64 1\n}\n",
+            1,
+            "numbered calling convention `cc N`",
+        );
+        // The prefix reader refuses the same words by name on its own.
+        assert!(
+            parse_symbol_prefix(&["ghccc", "i64"], PrefixKind::Function, "f")
+                .is_err_and(|e| e.to_string().contains("calling convention `ghccc`"))
+        );
+        let src = "define fastcc i64 @f() {\n  %r = call fastcc i64 @g()\n  ret i64 %r\n}\n\
+                   define ccc i64 @g() {\n  ret i64 1\n}\ndeclare fastcc i64 @h()\n";
+        for target in [
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+        ] {
+            let m = import_text_for_target(src, "t", target).expect("ccc and fastcc");
+            assert!(m.functions.iter().all(|f| f.calling_conv == CallingConv::C));
+        }
+        // On RISC-V `fastcc` is not C (`CC_RISCV_FastCC`), and with no
+        // target known the module may be compiled for RISC-V.
+        for (target, expected) in [
+            (
+                Some("riscv64-unknown-linux-gnu"),
+                "on a 64-bit RISC-V target",
+            ),
+            (Some("riscv64"), "on a 64-bit RISC-V target"),
+            (None, "no known target"),
+        ] {
+            let reason = match target {
+                Some(target) => import_text_for_target(src, "t", target),
+                None => import_text(src, "t"),
+            }
+            .map(drop)
+            .expect_err("fastcc refused");
+            assert!(
+                reason
+                    .to_string()
+                    .contains("line 1: calling convention `fastcc`")
+                    && reason.to_string().contains(expected),
+                "{target:?}: {reason}"
+            );
+        }
+        // The module's own triple stands in for the compile target, and the
+        // caller's takes its place, as llc's `-mtriple` does.
+        let riscv = format!("target triple = \"riscv64-unknown-linux-gnu\"\n{src}");
+        assert!(import_text(&riscv, "t").is_err());
+        import_text_for_target(&riscv, "t", "aarch64-unknown-linux-gnu")
+            .expect("fastcc for AArch64");
+        let aarch64 = format!("target triple = \"aarch64-unknown-linux-gnu\"\n{src}");
+        import_text(&aarch64, "t").expect("fastcc for AArch64");
+        assert!(import_text_for_target(&aarch64, "t", "riscv64-unknown-unknown").is_err());
+    }
+
+    /// Every token before a function's name is a symbol keyword, `ccc` /
+    /// `fastcc`, a return attribute or the return type; any other is
+    /// refused by name instead of skipped.
+    #[test]
+    fn function_prefix_tokens_are_read_or_refused_by_name() {
+        for (src, needle) in [
+            (
+                "define bogus i64 @f() {\n  ret i64 1\n}\n",
+                "unrecognized token `bogus` before the function name",
+            ),
+            (
+                "define i64 hidden @f() {\n  ret i64 1\n}\n",
+                "`hidden` stands where its return type must",
+            ),
+            ("declare inreg i64 @f()\n", "return attribute `inreg`"),
+            (
+                "declare align i64 @f()\n",
+                "return attribute `align` without an alignment",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        let m = import_text(
+            "declare noalias noundef nonnull align 16 dereferenceable(8) ptr @a(i64)\n\
+             declare !dbg !5 zeroext range(i8 0, 2) nofpclass(nan) i8 @b()\n\
+             declare dso_local signext noext i16 @c()\n\
+             declare ptr addrspace(0) @d()\n\
+             define internal fastcc { i64, i64 } @e() {\n  ret { i64, i64 } zeroinitializer\n}\n",
+            "t",
+        );
+        // The struct return is refused later by the signature reader, not by
+        // the prefix reader.
+        match m {
+            Ok(_) => {}
+            Err(error) => assert!(
+                !error.to_string().contains("before the function name"),
+                "{error}"
+            ),
+        }
+        import_text(
+            "declare noalias noundef nonnull align 16 dereferenceable(8) ptr @a(i64)\n\
+             declare !dbg !5 zeroext range(i8 0, 2) i8 @b()\n\
+             declare dso_local signext noext i16 @c()\n\
+             declare ptr addrspace(0) @d()\n!5 = !{}\n",
+            "t",
+        )
+        .expect("return attributes and types");
+    }
+
+    /// Every clause after a function's parameter list is read as LLVM's
+    /// lexer splits it, carried, dropped with a stated reason, or refused by
+    /// name; none is skipped.
+    #[test]
+    fn function_clauses_are_read_or_refused_by_name() {
+        for (clause, needle) in [
+            ("gc \"statepoint-example\"", "`gc` strategy"),
+            ("align 8", "function alignment `align 8`"),
+            ("align 3", "without a power-of-two alignment"),
+            ("prefix i32 0", "`prefix` data"),
+            ("prologue i32 0", "`prologue` data"),
+            ("partition \"p\"", "`partition`"),
+            ("bogusattr", "unrecognized clause or attribute `bogusattr`"),
+            (
+                "personality ptr @__C_specific_handler",
+                "personality `@__C_specific_handler`",
+            ),
+            (
+                "personality i32 0",
+                "`personality` that is not `ptr @symbol`",
+            ),
+            ("section", "`section` without a quoted name"),
+            ("comdat(f)", "malformed COMDAT clause `comdat(f)`"),
+            ("@other", "unexpected `@other` after the parameter list"),
+            (
+                "\"key\"=",
+                "string attribute \"key\" without a quoted value",
+            ),
+        ] {
+            let src = format!("define i64 @f() {clause} {{\n  ret i64 1\n}}\n");
+            let reason = unsupported_reason(&src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+            assert!(
+                reason.contains("`@f`"),
+                "{src} names the function: {reason}"
+            );
+        }
+        let m = import_text(
+            "$f = comdat any\n\
+             declare i32 @__gxx_personality_v0(...)\n\
+             define linkonce_odr i64 @f() unnamed_addr addrspace(0) #0 nounwind memory(none) \
+             \"target-cpu\"=\"generic\" \"nooutline\" section  \".text.x\"  comdat ( $f )  align 4 \
+             personality ptr @__gxx_personality_v0 !dbg !5 !prof !{!\"x\"} {\n  ret i64 1\n}\n\
+             attributes #0 = { nounwind }\n!5 = !{}\n",
+            "t",
+        )
+        .expect("every admitted clause");
+        let f = m.functions.iter().find(|f| f.name == "f").expect("f");
+        assert_eq!(f.section.as_deref(), Some(".text.x"));
+        assert_eq!(f.linkage, Linkage::LinkOnceOdr, "its comdat was read");
+    }
+
+    /// A global's clauses are read token by token after its initializer, so
+    /// a string inside the initializer is no clause (`c"section "` used to
+    /// be read as a section name), and attributes on the global are refused
+    /// by name (clang's `#pragma clang section` attributes used to be
+    /// dropped, placing the global in `.data` where llc uses the named
+    /// section).
+    #[test]
+    fn global_clauses_are_read_after_the_initializer_or_refused_by_name() {
+        let m = import_text(
+            "@t = constant [2 x [8 x i8]] [[8 x i8] c\"section \", [8 x i8] c\"abcdefg\\00\"], \
+             align 1\n\
+             @u = global i64 1,  section  \"s x\" ,  align  16\n\
+             @v = global i64 1, align 8, !dbg !5\n!5 = !{}\n",
+            "t",
+        )
+        .expect("clauses after the initializer");
+        let g = |n: &str| m.globals.iter().find(|g| g.name == n).expect(n);
+        assert_eq!((g("t").section.clone(), g("t").align), (None, Some(1)));
+        assert_eq!(
+            (g("u").section.as_deref(), g("u").align),
+            (Some("s x"), Some(16))
+        );
+        let pragma = "attributes #0 = { \"bss-section\"=\"b\" \"data-section\"=\"d\" \
+                      \"rodata-section\"=\"r\" }\n";
+        for (src, needle) in [
+            (
+                format!("@g = global [4 x i8] c\"abc\\00\" #0\n{pragma}"),
+                "attribute `#0` on a global, which sets \"bss-section\", \"data-section\", \
+                 \"rodata-section\"",
+            ),
+            (
+                format!("@g = global i32 0, section \".mine\" #0\n{pragma}"),
+                "attribute `#0` on a global, which sets",
+            ),
+            // The keys as LLVM decodes them.
+            (
+                "@g = global i32 0 #0\nattributes #0 = { \"bss\\2Dsection\"=\"b\" \
+                 \"\\72odata-section\"=\"r\" }\n"
+                    .to_string(),
+                "attribute `#0` on a global, which sets \"bss-section\", \"rodata-section\"",
+            ),
+            (
+                format!("@g = global i32 0, align 4 #0\n{pragma}"),
+                "attribute `#0` on a global, which sets",
+            ),
+            (
+                "@g = global i32 0 #1\nattributes #1 = { \"x\"=\"y\" }\n".to_string(),
+                "attribute `#1` on a global (global attributes are not read",
+            ),
+            (
+                "@g = global i32 0, align 4 \"data-section\"=\"d\"\n".to_string(),
+                "attribute `\"data-section\"` on a global",
+            ),
+            (
+                "@g = global i32 0, code_model \"large\"\n".to_string(),
+                "`code_model \"large\"`",
+            ),
+            (
+                "@g = global i32 0, sanitize_memtag\n".to_string(),
+                "sanitizer clause `sanitize_memtag`",
+            ),
+            (
+                "@g = global i32 0, no_sanitize_address\n".to_string(),
+                "sanitizer clause `no_sanitize_address`",
+            ),
+            (
+                "@g = global i32 0, partition \"p\"\n".to_string(),
+                "`partition`",
+            ),
+            (
+                "@g = global i32 0, bogus 1\n".to_string(),
+                "unrecognized clause `bogus 1` after the initializer",
+            ),
+            (
+                "@g = global i32 0, section 1\n".to_string(),
+                "malformed `section` clause `section 1`",
+            ),
+            (
+                "$g = comdat any\n@g = linkonce_odr global i32 0, comdat $g\n".to_string(),
+                "malformed COMDAT clause `comdat $g`",
+            ),
+            (
+                "@g = global i32 0, section \"a\", section \"b\"\n".to_string(),
+                "two `section` clauses",
+            ),
+        ] {
+            let reason = unsupported_reason(&src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+            assert!(
+                reason.contains("global `@g`"),
+                "{src} names the global: {reason}"
+            );
+        }
+    }
+
+    /// An ODR or link-once definition written WITHOUT a `comdat` clause is in
+    /// no group in LLVM (llc emits a plain weak symbol), so it is carried as
+    /// the backend's ungrouped weak definition: a function's `LinkOnce` /
+    /// `Weak`, a global's `Weak`. With a self-keyed clause it keeps the ODR
+    /// linkage the backend groups. Before, every such definition was grouped,
+    /// and an LLVM object whose same-named group had a second member lost it
+    /// at link time.
+    #[test]
+    fn odr_definitions_without_a_comdat_clause_are_ungrouped_weak_definitions() {
+        let m = import_text(
+            "$fg = comdat any\n$wg = comdat any\n$gg = comdat any\n$og = comdat any\n\
+             $lg = comdat any\n\
+             define linkonce_odr hidden i64 @f() {\n  ret i64 1\n}\n\
+             define weak_odr i64 @w() {\n  ret i64 2\n}\n\
+             define linkonce_odr i64 @fg() comdat {\n  ret i64 3\n}\n\
+             define weak_odr i64 @wg() comdat($wg) {\n  ret i64 4\n}\n\
+             @g = linkonce_odr global i32 1\n@o = weak_odr global i32 2\n\
+             @l = linkonce global i32 3\n\
+             @gg = linkonce_odr global i32 4, comdat\n@og = weak_odr global i32 5, comdat($og)\n\
+             @lg = linkonce global i32 6, comdat\n",
+            "t",
+        )
+        .expect("ODR definitions with and without COMDATs");
+        assert_eq!(
+            function_facts(&m, "f"),
+            (Linkage::LinkOnce, Visibility::Hidden, false)
+        );
+        assert_eq!(function_facts(&m, "w").0, Linkage::Weak);
+        assert_eq!(function_facts(&m, "fg").0, Linkage::LinkOnceOdr);
+        assert_eq!(function_facts(&m, "wg").0, Linkage::WeakOdr);
+        let linkage = |n: &str| m.globals.iter().find(|g| g.name == n).expect(n).linkage;
+        for (name, expected) in [
+            ("g", Linkage::Weak),
+            ("o", Linkage::Weak),
+            ("l", Linkage::Weak),
+            ("gg", Linkage::LinkOnceOdr),
+            ("og", Linkage::WeakOdr),
+            ("lg", Linkage::LinkOnce),
+        ] {
+            assert_eq!(linkage(name), expected, "@{name}");
+        }
+    }
+
+    /// A function DEFINITION listed in `@llvm.used` is refused by name: LLVM
+    /// retains its section in the object (`SHF_GNU_RETAIN`), and trust-ir's
+    /// `Function::retained` is not admitted by this backend, so LLD
+    /// `--gc-sections` removed the imported one. A declaration, and a
+    /// function in `@llvm.compiler.used`, ask for no linker retention.
+    #[test]
+    fn functions_in_llvm_used_are_refused_by_name() {
+        let reason = unsupported_reason(
+            "@llvm.used = appending global [1 x ptr] [ptr @reg], section \"llvm.metadata\"\n\
+             define internal i32 @reg() section \"hooks\" {\n  ret i32 4242\n}\n",
+        );
+        assert!(
+            reason.contains("function `@reg` is listed in `@llvm.used`"),
+            "{reason}"
+        );
+        // A listed declaration is admitted in a module whose triple names
+        // ELF (`listed_declarations_are_marked_or_refused_by_object_format`).
+        let m = import_text(
+            "target triple = \"aarch64-unknown-linux-gnu\"\n\
+             @llvm.used = appending global [2 x ptr] [ptr @d, ptr @g], section \"llvm.metadata\"\n\
+             @llvm.compiler.used = appending global [1 x ptr] [ptr @c], \
+             section \"llvm.metadata\"\n\
+             @g = internal global i32 1\ndeclare i32 @d()\n\
+             define internal i32 @c() {\n  ret i32 1\n}\n",
+            "t",
+        )
+        .expect("a declaration and a compiler-used function");
+        assert!(m.globals.iter().any(|g| g.name == "g" && g.retained));
+        let m = import_text(
+            "@llvm.compiler.used = appending global [1 x ptr] [ptr @s], section \"llvm.metadata\"\n\
+             @s = internal global i64 77, section \"slots\", align 8\n",
+            "t",
+        )
+        .expect("a compiler-used global");
+        assert!(
+            m.globals.iter().any(|g| g.name == "s" && !g.retained),
+            "llc writes no retention for `@llvm.compiler.used`"
+        );
+    }
+
+    /// Every listed `Global` row is marked retained, declarations and
+    /// `available_externally` globals included (the backend decides an
+    /// import's flag per object format). A listed function declaration is
+    /// not marked; it is admitted only where the compile target's object
+    /// format, read as LLVM's `Triple` reads it (`crate::triple::read`), is
+    /// ELF, where llc writes nothing for the listing, and refused by name for
+    /// a Mach-O target (llc's writer gives it an `N_NO_DEAD_STRIP` undefined
+    /// symbol even when nothing references it) and for every other one, no
+    /// known target included. The caller's compile target takes the place
+    /// of the module's triple, as llc's `-mtriple` does.
+    #[test]
+    fn listed_declarations_are_marked_or_refused_by_object_format() {
+        let body = "@gd = external global i64\n@gw = extern_weak global i64\n\
+                    @gae = available_externally global i64 5\n\
+                    declare i64 @fd()\n\
+                    define available_externally i64 @fae() {\n  ret i64 1\n}\n";
+        let globals_only = format!(
+            "@llvm.used = appending global [3 x ptr] [ptr @gd, ptr @gw, ptr @gae], \
+             section \"llvm.metadata\"\n{body}"
+        );
+        for triple in ["", "target triple = \"arm64-apple-macosx14.0.0\"\n"] {
+            let m = import_text(&format!("{triple}{globals_only}"), "t")
+                .expect("listed global declarations");
+            for name in ["gd", "gw", "gae"] {
+                assert!(
+                    m.globals.iter().any(|g| g.name == name && g.retained),
+                    "{triple}`@{name}` is marked"
+                );
+            }
+        }
+        for function in ["fd", "fae"] {
+            let listed = format!(
+                "@llvm.used = appending global [1 x ptr] [ptr @{function}], \
+                 section \"llvm.metadata\"\n{body}"
+            );
+            // ELF, as LLVM 22.1.2's `Triple` reads it: a Linux OS, an `elf`
+            // ending (over an Apple or Windows OS's default), and the other
+            // OSes and bare architectures whose default format is ELF. For
+            // each, llc 22.1.2 wrote no symbol and nothing else for an
+            // unreferenced listed declaration (measured on AArch64 Linux
+            // for the AArch64 and x86-64 rows).
+            for triple in [
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-android21",
+                "riscv64-unknown-linux-gnu",
+                "aarch64-unknown-freebsd",
+                "x86_64-unknown-freebsd",
+                "aarch64-unknown-none",
+                "aarch64",
+                "arm64-apple-macosx14.0.0-elf",
+                "x86_64-pc-windows-elf",
+            ] {
+                let m = import_text(&format!("target triple = \"{triple}\"\n{listed}"), "t")
+                    .unwrap_or_else(|error| panic!("{triple} {function}: {error}"));
+                assert!(
+                    m.functions
+                        .iter()
+                        .any(|f| f.name == function && !f.retained),
+                    "{triple} {function}"
+                );
+            }
+            // Mach-O: an Apple OS's default and an explicit `-macho` ending
+            // (llc 22.1.2 wrote `.no_dead_strip _fd` for both).
+            for triple in ["arm64-apple-macosx14.0.0", "aarch64-unknown-linux-macho"] {
+                let reason = unsupported_reason(&format!("target triple = \"{triple}\"\n{listed}"));
+                assert!(
+                    reason.contains(&format!(
+                        "function declaration `@{function}` is listed in `@llvm.used` in a \
+                         Mach-O module"
+                    )) && reason.contains("N_NO_DEAD_STRIP"),
+                    "{triple} {function}: {reason}"
+                );
+            }
+            // Every other object format, and no target known. llc 22.1.2
+            // wrote `/INCLUDE:fd` for `x86_64-pc-windows-msvc` and an
+            // undefined `fd` with `.no_dead_strip` for Wasm; for MinGW COFF
+            // (`x86_64-pc-windows-gnu`) it wrote nothing, but only the ELF
+            // form was compared with this backend's, so it is refused too.
+            for (triple, why) in [
+                ("", "no compile target is known"),
+                ("target triple = \"\"\n", "no compile target is known"),
+                (
+                    "target triple = \"x86_64-pc-windows-msvc\"\n",
+                    "object format is COFF",
+                ),
+                (
+                    "target triple = \"x86_64-pc-windows-gnu\"\n",
+                    "object format is COFF",
+                ),
+                (
+                    "target triple = \"wasm32-unknown-unknown\"\n",
+                    "object format is Wasm",
+                ),
+                (
+                    "target triple = \"wasm32-unknown-linux\"\n",
+                    "object format is Wasm",
+                ),
+                (
+                    "target triple = \"aarch64-unknown-linux-coff\"\n",
+                    "object format is COFF",
+                ),
+                (
+                    "target triple = \"powerpc64-ibm-aix-xcoff\"\n",
+                    "object format is XCOFF",
+                ),
+            ] {
+                let reason = unsupported_reason(&format!("{triple}{listed}"));
+                assert!(
+                    reason.contains(&format!(
+                        "function declaration `@{function}` is listed in `@llvm.used` in a \
+                         module whose `target triple` names no ELF target"
+                    )) && reason.contains(why)
+                        && reason.contains("/INCLUDE:"),
+                    "{triple}{function}: {reason}"
+                );
+            }
+            // The caller's compile target takes the place of the module's
+            // triple, as llc's `-mtriple` does.
+            for module_triple in ["", "target triple = \"arm64-apple-macosx14.0.0\"\n"] {
+                import_text_for_target(
+                    &format!("{module_triple}{listed}"),
+                    "t",
+                    "aarch64-unknown-linux-gnu",
+                )
+                .unwrap_or_else(|error| panic!("{module_triple}{function}: {error}"));
+            }
+            match import_text_for_target(
+                &format!("target triple = \"aarch64-unknown-linux-gnu\"\n{listed}"),
+                "t",
+                "aarch64-apple-darwin",
+            ) {
+                Err(Error::Unsupported(reason)) => assert!(
+                    reason.contains("in a Mach-O module") && reason.contains("N_NO_DEAD_STRIP"),
+                    "{function}: {reason}"
+                ),
+                other => panic!("{function}: expected a named refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// The module triple's object format, read as LLVM 22.1.2's `Triple`
+    /// reads it (`crate::triple::read`), decides both the listed-declaration
+    /// rule and the `\01` label reader. llc 22.1.2 writes an ELF object for
+    /// every triple admitted below and nothing for the listing, a Mach-O
+    /// object (with an `N_NO_DEAD_STRIP` `_fd`) for the `-macho` and Apple
+    /// ones, and a COFF or Wasm object for the others (measured with
+    /// `llvm-readobj --file-headers` and `llvm-nm`). A five-component
+    /// `-gnu-macho` triple is Mach-O (LLVM splits at most three times) and
+    /// `aarch64-linux-gnu` is ELF.
+    #[test]
+    fn module_triples_are_read_as_llvm_reads_them() {
+        let listed = "@llvm.used = appending global [1 x ptr] [ptr @fd], section \
+                      \"llvm.metadata\"\ndeclare i64 @fd()\n";
+        let label = "define i64 @\"\\01_lab\"() {\n  ret i64 1\n}\n";
+        for (triple, format) in [
+            ("aarch64-unknown-linux-gnu", "elf"),
+            ("aarch64-linux-gnu", "elf"),
+            ("aarch64-unknown-linux-gnu-elf", "elf"),
+            ("aarch64-unknown-freebsd", "elf"),
+            ("aarch64-unknown-none", "elf"),
+            ("aarch64", "elf"),
+            ("aarch64-unknown-none-elf", "elf"),
+            ("arm64-apple-macosx14.0.0-elf", "elf"),
+            ("x86_64-pc-windows-msvc-elf", "elf"),
+            ("arm64-apple-macosx14.0.0", "macho"),
+            ("aarch64-unknown-linux-macho", "macho"),
+            ("aarch64-unknown-linux-gnu-macho", "macho"),
+            // Every other Darwin OS name, and `win32` (llc 22.1.2: Mach-O
+            // and COFF objects; the fourth verifier round found them
+            // decided by no test).
+            ("arm64-apple-ios17.0.0", "macho"),
+            ("arm64-apple-tvos17.0", "macho"),
+            ("arm64-apple-watchos10.0", "macho"),
+            ("arm64_32-apple-watchos10.0", "macho"),
+            ("arm64-apple-bridgeos8.0", "macho"),
+            ("arm64-apple-driverkit23.0", "macho"),
+            ("arm64-apple-xros1.0", "macho"),
+            ("arm64-apple-visionos1.0", "macho"),
+            ("x86_64-pc-win32", "other"),
+            ("x86_64-pc-windows-msvc", "other"),
+            ("wasm32-unknown-linux", "other"),
+            ("wasm32-unknown-unknown", "other"),
+            ("aarch64-unknown-linux-gnu-coff", "other"),
+        ] {
+            let header = format!("target triple = \"{triple}\"\n");
+            let listing = import_text(&format!("{header}{listed}"), "t");
+            assert_eq!(listing.is_ok(), format == "elf", "{triple}: {listing:?}");
+            let labelled = import_text(&format!("{header}{label}"), "t");
+            assert_eq!(
+                labelled.is_ok(),
+                format == "macho",
+                "{triple}: {labelled:?}"
+            );
+        }
+    }
+
+    /// An attribute string runs to the next quote, as LLVM reads it: a
+    /// backslash before the quote escapes nothing. The attribute reader used
+    /// to treat `\"` as an escaped quote and skip the rest of the group, so
+    /// `sspstrong` after `"target-cpu"="C:\"` was lost and the function got
+    /// no stack guard. That `"target-cpu"` is now refused itself (LLVM 22
+    /// defines no processor `C:\`), so the test reads `"alloc-family"`, whose
+    /// value is read whatever it is.
+    #[test]
+    fn attribute_strings_end_at_the_next_quote() {
+        let src = r#"
+define void @guarded() #0 {
+entry:
+  %buf = alloca [64 x i8], align 1
+  call void @use(ptr %buf)
+  ret void
+}
+declare void @use(ptr)
+attributes #0 = { "alloc-family"="C:\" sspstrong }
+"#;
+        assert_eq!(
+            lowered_stack_protector(src, "guarded"),
+            StackProtectorMode::StackGuard
+        );
+    }
+
+    /// `define` alone on its line, or as the module's last token, starts a
+    /// header LLVM reads from the next line. The token pass sliced the
+    /// header line's tokens without checking it held any, and panicked
+    /// (`slice index starts at 1 but ends at 0`); it is refused by name.
+    #[test]
+    fn a_define_ending_its_line_is_refused_by_name() {
+        let needle = "`define` ends its line";
+        assert_refused_at("define\ni64 @test() {\n  ret i64 1\n}\n", 1, needle);
+        assert_refused_at("define", 1, needle);
+        assert_refused_at(
+            "define ; a comment\ni64 @t() {\n  ret i64 1\n}\n",
+            1,
+            needle,
+        );
+        assert_refused_at("define i64 @a() {\n  ret i64 1\n}\ndefine\n", 4, needle);
+        assert_refused_at(
+            "declare\ni64 @f()\n",
+            2,
+            "`i64` continues a top-level entity",
+        );
+    }
+
+    /// LLVM reads a numbered ID and an integer type by the value of its
+    /// digits: `#00` is attribute group 0 and `i064` is `i64`. This importer
+    /// matches both by spelling, so a function marked `#00` lost the
+    /// `sspstrong` group `#0` sets (no stack guard; llc's build aborts on
+    /// the overflow) and `i064` was no type (the function returned
+    /// nothing). A leading zero is refused by name wherever LLVM reads one.
+    #[test]
+    fn ids_and_integer_types_spelled_with_a_leading_zero_are_refused_by_name() {
+        for (src, line, needle) in [
+            (
+                "define void @f() #00 {\n  ret void\n}\nattributes #0 = { sspstrong }\n",
+                1,
+                "attribute group ID `#00` with a leading zero (LLVM reads it by value, as `#0`",
+            ),
+            (
+                "define void @f() #0 {\n  ret void\n}\nattributes #00 = { sspstrong }\n",
+                4,
+                "attribute group ID `#00`",
+            ),
+            (
+                "define void @f() #1 {\n  ret void\n}\nattributes #01 = { sspstrong }\n",
+                4,
+                "attribute group ID `#01` with a leading zero (LLVM reads it by value, as `#1`",
+            ),
+            (
+                "define i64 @f(i64 %0) {\n  %01 = add i64 %0, 1\n  ret i64 %01\n}\n",
+                2,
+                "value ID `%01`",
+            ),
+            ("@00 = global i64 1\n", 1, "value ID `@00`"),
+            (
+                "define i064 @k() {\n  ret i64 1\n}\n",
+                1,
+                "integer type `i064`",
+            ),
+            (
+                "define i1 @k() {\n  ret i01 1\n}\n",
+                2,
+                "integer type `i01` with a leading zero (LLVM reads it by value, as `i1`",
+            ),
+            (
+                "define void @f() {\n00:\n  ret void\n}\n",
+                2,
+                "block label ID `00`",
+            ),
+            ("!00 = !{}\n", 1, "metadata ID `!00`"),
+        ] {
+            assert_refused_at(src, line, needle);
+        }
+        assert!(
+            crate::lexical::lex("^00")
+                .is_err_and(|error| error.to_string().contains("summary ID `^00`"))
+        );
+        // Without a leading zero, and where digits are no ID, nothing is
+        // refused: `#10`, `%10`, `!10`, an integer literal `007`, a quoted
+        // name of digits, and a word that starts with `i`.
+        let m = import_text(
+            "define i64 @f(i64 %0) #10 {\n  %1 = add i64 %0, 007\n  %\"012\" = add i64 %1, 0\n  \
+             ret i64 %\"012\"\n}\n\
+             attributes #10 = { nounwind }\n!10 = !{}\n",
+            "t",
+        )
+        .expect("IDs without a leading zero");
+        assert!(m.functions.iter().any(|f| f.name == "f"));
+        // A quoted symbol name of digits is no numbered ID: it is carried
+        // for an internal global and refused for an exported one, whose
+        // name this importer does not write as LLVM does (`012`), not for
+        // its leading zero.
+        import_text("@\"012\" = internal global i64 1\n", "t").expect("internal `@\"012\"`");
+        let reason = unsupported_reason("@\"012\" = global i64 1\n");
+        assert!(
+            reason.contains("global `@\"012\"`") && !reason.contains("leading zero"),
+            "{reason}"
+        );
+        assert!(crate::lexical::lex("inbounds i0").is_ok());
+    }
+
+    /// A global's metadata attachment is a clause like any other: LLVM reads
+    /// clauses after it, and its attributes after the last one without a
+    /// comma, which is how LLVM's printer writes a `clang -g` global
+    /// (`, align 8, !dbg !0 #0`). The line reader cut a global's line at its
+    /// first `, !`, so `section`, `align` and `comdat` after an attachment
+    /// were dropped and a `#pragma clang section` group was never seen.
+    #[test]
+    fn a_global_reads_every_clause_and_attribute_after_a_metadata_attachment() {
+        let m = import_text(
+            "$c = comdat any\n\
+             @g = global i64 7, !md !0, section \"mysec\", align 64\n\
+             @c = linkonce_odr global i64 7, !md !0, comdat\n\
+             @a = global i64 7, !md !0, align 4096\n\
+             @d = global i64 7, align 8, !dbg !DIGlobalVariableExpression(var: !1, expr: \
+             !DIExpression()), !md !{!\"x\"}\n\
+             @s = global [4 x i8] c\"abc\\00\", !md !0, section \"x.c\"\n\
+             !0 = !{}\n!1 = !{}\n",
+            "t",
+        )
+        .expect("clauses after metadata attachments");
+        let global = |name: &str| m.globals.iter().find(|g| g.name == name).expect(name);
+        assert_eq!(global("g").section.as_deref(), Some("mysec"));
+        assert_eq!(global("g").align, Some(64));
+        assert_eq!(global("a").align, Some(4096));
+        assert_eq!(
+            global("c").linkage,
+            Linkage::LinkOnceOdr,
+            "its comdat clause after the attachment was read (no clause gives `Weak`)"
+        );
+        assert_eq!(global("d").align, Some(8));
+        assert_eq!(global("s").section.as_deref(), Some("x.c"));
+        assert_eq!(global_bytes(&m, "s"), b"abc\0".to_vec());
+        for (tail, needle) in [
+            (
+                ", align 8, !dbg !0 #0",
+                "attribute `#0` on a global, which sets \"data-section\"",
+            ),
+            (", !dbg !0, partition \"p\"", "`partition`"),
+            (", !dbg !0, code_model \"large\"", "`code_model \"large\"`"),
+            (
+                ", !dbg !0, no_sanitize_address",
+                "sanitizer clause `no_sanitize_address`",
+            ),
+            (
+                ", !dbg !0, bogus",
+                "unrecognized clause `bogus` after the initializer",
+            ),
+            (", !dbg", "malformed metadata attachment `!dbg`"),
+            (", !dbg !0 !1", "malformed metadata attachment `!dbg !0 !1`"),
+            // LLVM rejects an MDString there; the string is refused first.
+            (", !dbg !\"s\"", "attribute `\"s\"` on a global"),
+        ] {
+            let src = format!(
+                "@g = global i64 7{tail}\nattributes #0 = {{ \"data-section\"=\"my_data\" }}\n\
+                 !0 = !{{}}\n!1 = !{{}}\n"
+            );
+            let reason = unsupported_reason(&src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+    }
+
+    /// Function attributes are read or refused by name, inline and in a
+    /// group a definition, a declaration or a call uses. Read: those that
+    /// change nothing the importer builds (`crate::attributes`). Refused:
+    /// those llc builds code, a frame or a promise for that the importer
+    /// does not (`clang -pg`'s `"instrument-function-entry-inlined"` made
+    /// llc call `mcount`), and every string attribute the allowlist does not
+    /// name. A group no function or call uses refuses nothing.
+    #[test]
+    fn function_attributes_llc_acts_on_are_refused_by_name() {
+        let define_with_group = |group: &str| {
+            format!("define i64 @f() #0 {{\n  ret i64 5\n}}\nattributes #0 = {{ {group} }}\n")
+        };
+        for (group, needle) in [
+            (
+                "noinline \"instrument-function-entry-inlined\"=\"mcount\"",
+                "attribute group `#0`: attribute `\"instrument-function-entry-inlined\"=\"mcount\"`",
+            ),
+            (
+                "\"instrument-function-entry\"=\"f\"",
+                "`\"instrument-function-entry\"=\"f\"`",
+            ),
+            (
+                "\"patchable-function-entry\"=\"2\"",
+                "`\"patchable-function-entry\"=\"2\"`",
+            ),
+            ("\"fentry-call\"=\"true\"", "`\"fentry-call\"=\"true\"`"),
+            ("\"trap-func-name\"=\"t\"", "`\"trap-func-name\"=\"t\"`"),
+            (
+                "\"zero-call-used-regs\"=\"all\"",
+                "`\"zero-call-used-regs\"=\"all\"`",
+            ),
+            (
+                "\"bogus\"",
+                "`\"bogus\"` (not a string attribute this importer reads",
+            ),
+            (
+                "\"target-features\"=\"+neon,+strict-align\"",
+                "target feature `+strict-align`",
+            ),
+            (
+                "\"target-features\"=\"+reserve-x18\"",
+                "target feature `+reserve-x18`",
+            ),
+            (
+                "\"target-features\"=\"+call-saved-x9\"",
+                "target feature `+call-saved-x9`",
+            ),
+            (
+                "\"target-features\"=\"-neon\"",
+                "target feature `-neon` forbids",
+            ),
+            (
+                "\"target-features\"=\"neon\"",
+                "target feature `neon` without a `+` or `-`",
+            ),
+            (
+                "\"stack-protector-buffer-size\"=\"4\"",
+                "stack-protector threshold",
+            ),
+            ("\"stack-probe-size\"=\"1024\"", "stack-probe interval"),
+            (
+                "\"sign-return-address\"=\"all\"",
+                "`\"sign-return-address\"=\"all\"`",
+            ),
+            (
+                "\"branch-target-enforcement\"",
+                "`\"branch-target-enforcement\"`",
+            ),
+            // llc 22 builds BTI landing pads whenever the attribute is
+            // present, `"false"` included (`AArch64FunctionInfo`).
+            (
+                "\"branch-target-enforcement\"=\"false\"",
+                "whenever this attribute is present",
+            ),
+            (
+                "\"branch-target-enforcement\"=\"true\"",
+                "whenever this attribute is present",
+            ),
+            // Keys and values are read as LLVM decodes them: `\2C` is a
+            // comma, `\2D` a hyphen.
+            (
+                "\"target-features\"=\"+v8a\\2C+call-saved-x9\"",
+                "target feature `+call-saved-x9`",
+            ),
+            (
+                "\"target-features\"=\"+v8a\\2C-fp-armv8\\2C-neon\"",
+                "target feature `-fp-armv8` forbids",
+            ),
+            (
+                "\"target\\2Dfeatures\"=\"+neon\\2c+strict-align\"",
+                "target feature `+strict-align`",
+            ),
+            (
+                "\"target-features\"=\"+neon\\5C\\2C+reserve-x18\"",
+                "target feature `+reserve-x18`",
+            ),
+            (
+                "\"branch-target\\2Denforcement\"=\"false\"",
+                "whenever this attribute is present",
+            ),
+            (
+                "\"probe-stack\"=\"inline\\2Dasm\\2C\"",
+                "stack probe method",
+            ),
+            // LLVM's verifier rejects these values.
+            (
+                "\"target-features\"=\" +neon\"",
+                "target feature ` +neon` without a `+` or `-`",
+            ),
+            (
+                "\"target-features\"=\"+neon,,+v8a\"",
+                "an empty target feature",
+            ),
+            ("\"target-features\"=\"+neon,\"", "an empty target feature"),
+            ("\"frame-pointer\"=\"some\"", "a `frame-pointer` value"),
+            ("\"frame-pointer\"", "a `frame-pointer` value"),
+            ("\"warn-stack-size\"=\"-1\"", "`warn-stack-size`"),
+            ("\"warn-stack-size\"=\"4294967296\"", "`warn-stack-size`"),
+            ("\"denormal-fp-math\"=\"flush\"", "a denormal mode"),
+            ("\"denormal-fp-math-f32\"=\"ieee,flush\"", "a denormal mode"),
+            ("\"denormal-fp-math\"=\"ieee,ieee,ieee\"", "a denormal mode"),
+            (
+                "\"sign-return-address\"=\"none\" \"sign-return-address-key\"=\"c_key\"",
+                "signing key",
+            ),
+            (
+                "\"alloc-variant-zeroed\"=\"\"",
+                "an empty `alloc-variant-zeroed`",
+            ),
+            // llc on AArch64 aborts on any probe method but `inline-asm`.
+            ("\"probe-stack\"=\"my_probe\"", "stack probe method"),
+            // LLVM reads a leading `0`, `0x` or `0b` in radix.
+            ("\"stack-probe-size\"=\"010000\"", "plain decimal"),
+            ("\"stack-probe-size\"=\"0x1000\"", "plain decimal"),
+            ("\"stack-probe-size\"=\"4095\"", "plain decimal"),
+            ("\"stack-probe-size\"", "plain decimal"),
+            (
+                "\"target-features\"=\"+neon\\FF\" \"\\FFkey\"",
+                "not UTF-8 after LLVM's escapes",
+            ),
+            (
+                "\"use-soft-float\"=\"true\"",
+                "`\"use-soft-float\"=\"true\"`",
+            ),
+            ("alignstack=16", "attribute `alignstack=16`"),
+            ("alignstack(16)", "attribute `alignstack(16)`"),
+            (
+                "bogus",
+                "`bogus` (not a function attribute this importer reads)",
+            ),
+        ] {
+            let src = define_with_group(group);
+            let reason = unsupported_reason(&src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+            assert!(
+                reason.contains("`@f`"),
+                "{src} names the function: {reason}"
+            );
+        }
+        // Every refused keyword, inline and through a group.
+        for keyword in [
+            "alignstack",
+            "fn_ret_thunk_extern",
+            "hybrid_patchable",
+            "naked",
+            "noimplicitfloat",
+            "noredzone",
+            "null_pointer_is_valid",
+            "presplitcoroutine",
+            "returns_twice",
+            "safestack",
+            "sanitize_memtag",
+            "shadowcallstack",
+            "speculative_load_hardening",
+            "strictfp",
+        ] {
+            let reason =
+                unsupported_reason(&format!("define i64 @f() {keyword} {{\n  ret i64 5\n}}\n"));
+            assert!(
+                reason.contains(&format!("attribute `{keyword}` (")),
+                "{keyword}: {reason}"
+            );
+            let reason = unsupported_reason(&define_with_group(keyword));
+            assert!(
+                reason.contains(&format!("attribute group `#0`: attribute `{keyword}` (")),
+                "{keyword}: {reason}"
+            );
+        }
+        // A declaration and a call that use a refused group (`setjmp`).
+        let reason =
+            unsupported_reason("declare i32 @setjmp(ptr) #1\nattributes #1 = { returns_twice }\n");
+        assert!(
+            reason.contains("`@setjmp`") && reason.contains("returns_twice"),
+            "{reason}"
+        );
+        let reason = unsupported_reason(
+            "declare i32 @sj(ptr)\ndefine i32 @f(ptr %b) {\n  %r = call i32 @sj(ptr %b) #1\n  \
+             ret i32 %r\n}\nattributes #1 = { returns_twice }\n",
+        );
+        assert!(
+            reason.contains("call to `@sj`: attribute group `#1`: attribute `returns_twice`"),
+            "{reason}"
+        );
+        let reason = unsupported_reason(
+            "declare void @g()\ndefine void @f() {\n  call void @g() \"trap-func-name\"=\"t\"\n  \
+             ret void\n}\n",
+        );
+        assert!(
+            reason.contains("call to `@g`: attribute `\"trap-func-name\"=\"t\"`"),
+            "{reason}"
+        );
+        // Every read keyword and string attribute, in one group, inline, and
+        // on a call; an unused group with refused attributes; LLVM's
+        // attribute-group spelling of a keyword with a value.
+        let read_group = "allockind(\"alloc\") allocsize(0) alwaysinline builtin cold convergent \
+             coro_elide_safe coro_only_destroy_when_complete denormal_fpenv(dynamic) \
+             disable_sanitizer_instrumentation hot inlinehint jumptable memory(none) minsize \
+             mustprogress nocallback nocf_check nocreateundeforpoison noduplicate \
+             nofree noinline nomerge nonlazybind noprofile norecurse noreturn nosanitize_bounds \
+             nosanitize_coverage nosync nounwind optdebug optforfuzzing optnone optsize readnone \
+             readonly sanitize_address sanitize_alloc_token sanitize_hwaddress sanitize_memory \
+             sanitize_numerical_stability sanitize_realtime sanitize_realtime_blocking \
+             sanitize_thread sanitize_type skipprofile speculatable ssp sspreq sspstrong uwtable \
+             uwtable(sync) vscale_range(1,16) willreturn writeonly \
+             \"no-trapping-math\"=\"true\" \"no-infs-fp-math\"=\"true\" \"no-nans-fp-math\"=\"true\" \
+             \"no-signed-zeros-fp-math\"=\"true\" \"unsafe-fp-math\"=\"true\" \
+             \"approx-func-fp-math\"=\"true\" \"less-precise-fpmad\"=\"true\" \
+             \"denormal-fp-math\"=\"ieee,ieee\" \"denormal-fp-math-f32\"=\"ieee,ieee\" \
+             \"reciprocal-estimates\"=\"none\" \"correctly-rounded-divide-sqrt-fp-math\"=\"false\" \
+             \"target-cpu\"=\"generic\" \"tune-cpu\"=\"generic\" \"min-legal-vector-width\"=\"0\" \
+             \"prefer-vector-width\"=\"128\" \"no-jump-tables\"=\"true\" \
+             \"disable-tail-calls\"=\"false\" \"nooutline\" \"warn-stack-size\"=\"100\" \
+             \"use-sample-profile\" \"alloc-family\"=\"malloc\" \
+             \"alloc-variant-zeroed\"=\"calloc\" \"frame-pointer\"=\"non-leaf\" \
+             \"target-features\"=\"+fp-armv8,+neon,+outline-atomics,+v8a,+zcm,-fmv\" \
+             \"stack-protector-buffer-size\"=\"8\" \"probe-stack\"=\"__chkstk_darwin\" \
+             \"stack-probe-size\"=\"4096\" \"use-soft-float\"=\"false\" \
+             \"sign-return-address\"=\"none\" \"sign-return-address-key\"=\"a_key\"";
+        import_text(
+            &format!(
+                "declare void @g()\n\
+                 define i64 @f() #0 nounwind \"frame-pointer\"=\"all\" {{\n  \
+                 call void @g() #0 nounwind \"nooutline\"\n  ret i64 5\n}}\n\
+                 attributes #0 = {{ {read_group} }}\n\
+                 attributes #1 = {{ alignstack=16 naked \"bogus\" }}\n"
+            ),
+            "t",
+        )
+        .expect("every read attribute");
+    }
+
+    /// An operand bundle on a call is refused by name: llc lowers bundles
+    /// the importer would drop (`clang.arc.attachedcall` calls the retain
+    /// function after the call; with the bundle dropped, the imported call
+    /// retained nothing). `llvm.assume`'s bundles are assumptions, dropped
+    /// with the call as llc drops them.
+    #[test]
+    fn operand_bundles_are_refused_by_name() {
+        for (call, needle) in [
+            (
+                "%r = call ptr @h() [ \"clang.arc.attachedcall\"(ptr @objc_retain) ]",
+                "call to `@h`: operand bundle \"clang.arc.attachedcall\"",
+            ),
+            (
+                "%r = call ptr %fp() [ \"kcfi\"(i32 305419896) ]",
+                "indirect call: operand bundle \"kcfi\"",
+            ),
+            (
+                "%r = call ptr @h() #1 [ \"deopt\"() ]",
+                "call to `@h`: operand bundle \"deopt\"",
+            ),
+            (
+                "%r = call ptr @h() bogus",
+                "unexpected `bogus` after the call's arguments",
+            ),
+        ] {
+            let src = format!(
+                "declare ptr @h()\ndeclare ptr @objc_retain(ptr)\n\
+                 define ptr @f(ptr %fp) {{\n  {call}\n  ret ptr %r\n}}\n\
+                 attributes #1 = {{ nounwind }}\n"
+            );
+            let reason = unsupported_reason(&src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        import_text(
+            "declare void @llvm.assume(i1)\n\
+             define void @f(ptr %p) {\n  \
+             call void @llvm.assume(i1 true) [ \"align\"(ptr %p, i64 16) ]\n  ret void\n}\n",
+            "t",
+        )
+        .expect("llvm.assume's bundles are dropped with it");
+    }
+
+    /// A return type is read where it stands, the last token before a
+    /// function's name or the callee, and must be `void` or a type the
+    /// importer reads. One it did not read used to be skipped: `{ i64, i64,
+    /// i64 }`, `[3 x i64]` or `%S` returned `void` (the call then set up no
+    /// result), and a call read `{ i64, i64, i64 }` as its last `i64`.
+    #[test]
+    fn return_types_are_read_where_they_stand_or_refused_by_name() {
+        for (src, needle) in [
+            (
+                "declare { i64, i64, i64 } @big()\ndefine i64 @f() {\n  \
+                 call { i64, i64, i64 } @big()\n  ret i64 1\n}\n",
+                "call to `@big`, return type: type `{ i64, i64, i64 }`",
+            ),
+            (
+                "%S = type { i64, i64, i64 }\ndeclare %S @g()\ndefine i64 @f() {\n  \
+                 call %S @g()\n  ret i64 1\n}\n",
+                "call to `@g`, return type: type `%S`",
+            ),
+            (
+                "define [2 x i64] @f() {\n  ret [2 x i64] zeroinitializer\n}\n",
+                "function `@f`, return type: aggregate / vector type `[2 x i64]`",
+            ),
+            (
+                "define i24 @f() {\n  ret i24 5\n}\n",
+                "function `@f`, return type: type `i24`",
+            ),
+            (
+                "define i64 @f(ptr %fp) {\n  %r = call { i64, i64 } %fp()\n  ret i64 1\n}\n",
+                "indirect call, return type: type `{ i64, i64 }`",
+            ),
+            (
+                "declare i64 @g()\ndefine i64 @f() {\n  %r = call inreg i64 @g()\n  ret i64 %r\n}\n",
+                "return attribute `inreg`",
+            ),
+            (
+                "declare i64 @g()\ndefine i64 @f() {\n  %r = call bogus i64 @g()\n  ret i64 %r\n}\n",
+                "unrecognized token `bogus` before the callee",
+            ),
+            (
+                "declare i64 @g()\ndefine i64 @f() {\n  %r = call i64 bogus @g()\n  ret i64 %r\n}\n",
+                "unexpected `bogus` after the call's return type",
+            ),
+            (
+                "declare i64 @g()\ndefine i64 @f() {\n  %r = call align @g()\n  ret i64 %r\n}\n",
+                "return attribute `align` without an alignment",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        // A declaration whose return type is not read is skipped when nothing
+        // calls it, as before.
+        let m = import_text(
+            "declare { i64, i64 } @unused()\n\
+             declare zeroext i8 @z()\ndeclare i32 @printf(ptr, ...)\n@s = constant [1 x i8] c\"\\00\"\n\
+             define i32 @f() {\n  %a = call noundef zeroext i8 @z()\n  \
+             %b = call ccc i32 (ptr, ...) @printf(ptr noundef @s)\n  \
+             %c = call fast nnan align 8 dereferenceable(8) ptr addrspace(0) @p()\n  \
+             ret i32 %b\n}\ndeclare ptr @p()\n",
+            "t",
+        )
+        .expect("return types and attributes the reader reads");
+        assert!(m.functions.iter().all(|f| f.name != "unused"));
+        // An address space after the return type, spaced or not, and the
+        // typed-pointer forms LLVM 22 still reads as `ptr`.
+        let m = import_text(
+            "declare ptr addrspace (0) @g()\ndeclare i8 addrspace(0)* @h()\n\
+             declare i8 addrspace ( 0 )* @k()\ndeclare i8 * @j()\n\
+             define ptr @f() {\n  %a = call ptr addrspace (0) @g()\n  \
+             %b = call addrspace (0) ptr @g()\n  %c = call i8 addrspace(0)* @h()\n  \
+             %d = call i8 * @j()\n  ret ptr %c\n}\n",
+            "t",
+        )
+        .expect("address spaces after a return type");
+        for name in ["g", "h", "k", "j"] {
+            let function = m.functions.iter().find(|f| f.name == name).expect(name);
+            assert_eq!(
+                m.func_types[function.ty.index() as usize].returns,
+                vec![Ty::Ptr],
+                "{name}"
+            );
+        }
+        assert!(
+            unsupported_reason(
+                "declare ptr @g()\ndefine ptr @f() {\n  %a = call ptr addrspace @g()\n  \
+                 ret ptr %a\n}\n"
+            )
+            .contains("`addrspace` without its operand")
+        );
+    }
+
+    /// `@llvm.used` names are matched as LLVM names symbols: `@"reg"` and
+    /// `@reg` are one symbol. The importer kept a quoted name's quotes, so a
+    /// function listed by one spelling and defined by the other escaped the
+    /// refusal and lost its retention (LLD `--gc-sections` dropped the hook);
+    /// a quoted global listed in the array was likewise not retained. Every
+    /// name is now read in its decoded spelling (`lexical::canonicalize`), so
+    /// `@"g"` is the global `g`. An `available_externally` definition emits
+    /// no section, so it is not refused.
+    #[test]
+    fn llvm_used_names_are_matched_as_llvm_names_symbols() {
+        for (listed, defined) in [
+            ("@\"reg_fn\"", "@\"reg_fn\""),
+            ("@reg_fn", "@\"reg_fn\""),
+            ("@\"reg_fn\"", "@reg_fn"),
+            ("@\"\\72eg_fn\"", "@reg_fn"),
+        ] {
+            let reason = unsupported_reason(&format!(
+                "@llvm.used = appending global [1 x ptr] [ptr {listed}], section \"llvm.metadata\"\n\
+                 define internal i64 {defined}() section \"tcg_hooks\" {{\n  ret i64 4242\n}}\n"
+            ));
+            assert!(
+                reason.contains("is listed in `@llvm.used`"),
+                "{listed}/{defined}: {reason}"
+            );
+        }
+        let m = import_text(
+            "target triple = \"aarch64-unknown-linux-gnu\"\n\
+             @llvm.used = appending global [2 x ptr] [ptr @g, ptr @ae], section \"llvm.metadata\"\n\
+             @\"g\" = internal global i32 1\n\
+             define available_externally i64 @ae() {\n  ret i64 1\n}\n",
+            "t",
+        )
+        .expect("a quoted global and an available_externally function");
+        assert!(
+            m.globals.iter().any(|g| g.name == "g" && g.retained),
+            "{:?}",
+            m.globals
+        );
+    }
+
+    /// The token pass's remaining refusals: a NUL in a quoted label (LLVM's
+    /// lexer rejects it), a debug record after an instruction on its line
+    /// (the line reader would drop it), and an instruction whose brackets
+    /// never close or close once too often.
+    #[test]
+    fn labels_debug_records_and_brackets_are_checked_by_token() {
+        assert_refused_at(
+            "define void @f() {\nentry:\n  br label %\"a\0b\"\n\"a\0b\":\n  ret void\n}\n",
+            3,
+            "a NUL byte inside a quoted name",
+        );
+        assert_refused_at(
+            "define void @f() {\n\"a\0b\":\n  ret void\n}\n",
+            2,
+            "a NUL byte inside a quoted name",
+        );
+        assert_refused_at(
+            "define void @f(i64 %x) {\n  %y = add i64 %x, 1 #dbg_value(i64 %y, !1, \
+             !DIExpression(), !2)\n  ret void\n}\n",
+            2,
+            "a second instruction or entity on one line (`#dbg_value` is a debug record",
+        );
+        assert_refused_at(
+            "declare void @g(i64)\ndefine void @f() {\n  call void @g(i64 1",
+            3,
+            "an instruction whose brackets are never closed",
+        );
+        assert_refused_at(
+            "define i64 @f() {\n  %x = add i64 1, 2)\n  ret i64 %x\n}\n",
+            2,
+            "unbalanced `)` in an instruction",
+        );
+    }
+
+    /// A metadata attachment whose kind llc's code generator or object
+    /// writer reads is refused by name wherever it is attached: llc gives a
+    /// global with `!exclude` an `SHF_EXCLUDE` section and one with
+    /// `!associated` an `SHF_LINK_ORDER` section, names a `!section_prefix`
+    /// function's section `.text.hot.`, and emits `!func_sanitize` words
+    /// before a function. The importer reads no metadata. A kind llc reads
+    /// only as a hint or for debug information, a kind LLVM does not
+    /// define, and named metadata that merely shares a kind's name are read.
+    #[test]
+    fn metadata_attachments_llc_acts_on_are_refused_by_name() {
+        for (src, line, kind) in [
+            (
+                "@g = global i64 2, section \"x\", !exclude !0\n!0 = !{}\n",
+                1,
+                "!exclude",
+            ),
+            (
+                "@h = global i64 1\n@g = global i64 2, !associated !0\n!0 = !{ptr @h}\n",
+                2,
+                "!associated",
+            ),
+            (
+                "@g = global i64 2, !section_prefix !0\n!0 = !{}\n",
+                1,
+                "!section_prefix",
+            ),
+            (
+                "@g = external global i8, !absolute_symbol !0\n!0 = !{}\n",
+                1,
+                "!absolute_symbol",
+            ),
+            (
+                "define void @f() !func_sanitize !0 {\n  ret void\n}\n!0 = !{}\n",
+                1,
+                "!func_sanitize",
+            ),
+            (
+                "define void @f() !kcfi_type !0 {\n  ret void\n}\n!0 = !{}\n",
+                1,
+                "!kcfi_type",
+            ),
+            (
+                "define void @f() !section_prefix !0 {\n  ret void\n}\n!0 = !{}\n",
+                1,
+                "!section_prefix",
+            ),
+            (
+                "@g = global i64 0\ndefine void @f() {\n  store i64 1, ptr @g, align 8, \
+                 !pcsections !0\n  ret void\n}\n!0 = !{}\n",
+                3,
+                "!pcsections",
+            ),
+            (
+                "@g = global i64 2, !implicit.ref !0\n!0 = !{}\n",
+                1,
+                "!implicit.ref",
+            ),
+            // llc's stack protector builds no canary for an alloca marked
+            // `!{i32 0}`, which the importer's `ssp` policy protects (the
+            // second verifier round of L02-P15 found it dropped).
+            (
+                "declare void @use(ptr)\ndefine void @f() ssp {\n  \
+                 %a = alloca [16 x i8], align 1, !stack-protector !0\n  \
+                 call void @use(ptr %a)\n  ret void\n}\n!0 = !{i32 0}\n",
+                3,
+                "!stack-protector",
+            ),
+            (
+                "define void @f() {\n  %a = alloca i64, align 8, !stack\\2Dprotector !0\n  \
+                 ret void\n}\n!0 = !{i32 1}\n",
+                2,
+                "!stack-protector",
+            ),
+        ] {
+            assert_refused_at(src, line, &format!("metadata attachment `{kind}` ("));
+        }
+        import_text(
+            "@g = global i64 2, !dbg !0, !type !0, !custom !0\n\
+             define i64 @f() !dbg !0 !prof !1 {\n  %v = load i64, ptr @g, align 8, !range !2, \
+             !noundef !0\n  ret i64 %v\n}\n\
+             !exclude = !{!0}\n!0 = !{}\n!1 = !{!\"function_entry_count\", i64 1}\n\
+             !2 = !{i64 0, i64 10}\n",
+            "t",
+        )
+        .expect("hints, debug information and named metadata");
+    }
+
+    // ---- L02-P15: names, strings and metadata read as LLVM decodes them ----
+
+    /// LLVM's `UnEscapeLexed`, the importer's one decoder: `\\` first, then
+    /// `\XX` in either case, any other backslash kept.
+    #[test]
+    fn the_one_decoder_follows_llvm_unescape_lexed() {
+        use crate::lexical::{decode_escapes, string_value};
+        for (spelled, decoded) in [
+            (&b"plain"[..], &b"plain"[..]),
+            (b"\\41\\2c\\2C", b"A,,"),
+            (b"\\\\41", b"\\41"),
+            (b"\\\\\\41", b"\\A"),
+            (b"a\\", b"a\\"),
+            (b"a\\4", b"a\\4"),
+            (b"\\4g", b"\\4g"),
+            (b"\\00\\ff", b"\x00\xff"),
+            (b"\\5C\\2C", b"\\,"),
+        ] {
+            assert_eq!(decode_escapes(spelled), decoded, "{spelled:?}");
+        }
+        assert_eq!(string_value("\"a\\2Cb\""), b"a,b");
+    }
+
+    /// A metadata attachment kind llc's object writer reads is refused in
+    /// every spelling LLVM decodes to it: the second verifier round of
+    /// L02-P13 imported `!\65xclude` (llc's section was `SHF_EXCLUDE`, the
+    /// imported one linked) and `!\6Bcfi_type` (the hash word was lost).
+    #[test]
+    fn metadata_kinds_are_read_as_llvm_decodes_them() {
+        for (src, line, kind) in [
+            (
+                "@g = global i32 1, !\\65xclude !0\n!0 = !{}\n",
+                1,
+                "!exclude",
+            ),
+            (
+                "@g = global i32 1, section \"s\", !\\65\\78clude !0\n!0 = !{}\n",
+                1,
+                "!exclude",
+            ),
+            (
+                "@g = global i32 1, section \"s1\"\n@h = global i32 2, section \"s2\", \
+                 !\\61ssociated !0\n!0 = !{ptr @g}\n",
+                2,
+                "!associated",
+            ),
+            (
+                "define i64 @f() !\\66unc_sanitize !0 {\n  ret i64 1\n}\n\
+                 !0 = !{i32 -1056584962, i32 0}\n",
+                1,
+                "!func_sanitize",
+            ),
+            (
+                "define i64 @f() !\\6bcfi_type !0 {\n  ret i64 1\n}\n!0 = !{i32 12345}\n",
+                1,
+                "!kcfi_type",
+            ),
+            (
+                "@g = global i32 1, !section\\5Fprefix !0\n!0 = !{!\"section_prefix\", !\"hot\"}\n",
+                1,
+                "!section_prefix",
+            ),
+            (
+                "@g = global i64 0\ndefine void @f() {\n  store i64 1, ptr @g, !\\70csections !0\n  \
+                 ret void\n}\n!0 = !{!\"foo\"}\n",
+                3,
+                "!pcsections",
+            ),
+            (
+                "@g = external global i8, !\\61bsolute_symbol !0\n!0 = !{i64 0, i64 256}\n",
+                1,
+                "!absolute_symbol",
+            ),
+            (
+                "@g = global i32 1\ndefine void @f() !implicit\\2Eref !0 {\n  ret void\n}\n\
+                 !0 = !{ptr @g}\n",
+                2,
+                "!implicit.ref",
+            ),
+        ] {
+            assert_refused_at(src, line, &format!("metadata attachment `{kind}` ("));
+        }
+        // A kind llc does not act on is read in any spelling; `\\` is a
+        // backslash, so `!e\\78clude` is no `!exclude`.
+        import_text(
+            "@g = global i32 1, !\\64bg !0, !e\\\\78clude !0\n!0 = !{}\n",
+            "t",
+        )
+        .expect("escaped kinds llc does not act on");
+    }
+
+    /// Quoted names are read as LLVM decodes them: `@"foo"`, `@"\66oo"` and
+    /// `@foo` are one symbol (the importer used to keep the quotes and
+    /// escapes in the symbol it wrote), `%"x"` and `%x` one value, and a
+    /// quoted intrinsic name is the intrinsic. A symbol name that is no plain
+    /// LLVM name, a name decoding to NUL and an empty name are refused.
+    #[test]
+    fn quoted_names_are_read_as_llvm_decodes_them() {
+        let m = import_text(
+            "@\"g\\6C\" = global i64 3\n\
+             declare void @\"llvm.memset.p0.i64\"(ptr, i8, i64, i1)\n\
+             define i64 @\"f\\6Fo\"(i64 %\"x\") {\n\
+             \"en\\74ry\":\n  %\"a b\" = add i64 %x, 1\n  %y = add i64 %\"a\\20b\", 1\n  \
+             br label %\"n\\65xt\"\nnext:\n  %v = load i64, ptr @gl, align 8\n  \
+             %r = add i64 %y, %v\n  ret i64 %r\n}\n\
+             define void @z(ptr %p) {\n  \
+             call void @llvm.memset.p0.i64(ptr %p, i8 0, i64 8, i1 false)\n  ret void\n}\n",
+            "t",
+        )
+        .expect("quoted names");
+        assert!(m.globals.iter().any(|g| g.name == "gl"), "{:?}", m.globals);
+        assert!(func_named(&m, "foo").blocks.len() == 2);
+        assert!(
+            !m.functions.iter().any(|f| f.name.contains('"')),
+            "no symbol keeps its quotes: {:?}",
+            m.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        // A name's bytes outside `[-a-zA-Z$._0-9]` are escaped in its
+        // canonical spelling, so the readers that split a call's arguments at
+        // commas read `%"a,b"` as one value.
+        let m = import_text(
+            "define i64 @g(i64 %x, i64 %y) {\n  %r = sub i64 %x, %y\n  ret i64 %r\n}\n\
+             define i64 @f() {\n  %\"a,b\" = add i64 5, 0\n  \
+             %r = call i64 @g(i64 %\"a,b\", i64 1)\n  ret i64 %r\n}\n",
+            "t",
+        )
+        .expect("a comma in a quoted local name");
+        assert_eq!(func_named(&m, "f").blocks.len(), 1);
+        // The rewritten name is spaced off the token LLVM splits from it:
+        // `%"a"b` is `%"a"` and `b` to LLVM (which rejects the line), never
+        // the value `%ab`.
+        import_text("@\"g\"addrspace(0) = global i64 1\n", "t")
+            .expect_err("LLVM's parser rejects an address space after a global's name");
+        import_text(
+            "define i64 @f() {\n  %\"a\"b = add i64 1, 2\n  ret i64 %ab\n}\n",
+            "t",
+        )
+        .expect_err("`%\"a\"b` is two tokens to LLVM");
+        for (src, needle) in [
+            (
+                "@\"a b\" = global i64 1\n",
+                "global `@\"a\\20b\"` (`a b` after LLVM's escapes)",
+            ),
+            (
+                "@\"a b\" = weak global i64 1\n",
+                "global `@\"a\\20b\"` (`a b` after LLVM's escapes)",
+            ),
+            (
+                "@\"a b\" = external global i64\n",
+                "global `@\"a\\20b\"` (`a b` after LLVM's escapes)",
+            ),
+            (
+                "declare i64 @\"a,b\"()\n",
+                "function `@\"a\\2Cb\"` (`a,b` after LLVM's escapes)",
+            ),
+            (
+                "define linkonce_odr i64 @\"a b\"() {\n  ret i64 1\n}\n",
+                "function `@\"a\\20b\"`",
+            ),
+            ("@\"\\00\" = global i64 1\n", "decodes to a NUL byte"),
+            ("@\"x\\00y\" = global i64 1\n", "decodes to a NUL byte"),
+            (
+                "define void @f() {\n  %\"a\\00\" = add i64 1, 1\n  ret void\n}\n",
+                "decodes to a NUL byte",
+            ),
+            (
+                "define void @f() {\n\"l\\00\":\n  ret void\n}\n",
+                "decodes to a NUL byte",
+            ),
+            ("@\"\" = global i64 1\n", "the empty quoted name"),
+            (
+                "declare void @\"\\01-[a b]\"()\n",
+                "`\\01` asm-label symbol `\\01-\\5Ba\\20b\\5D`",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+        // An internal or private definition keeps a quoted name: its name
+        // stays inside the object, and every reference reads the one
+        // canonical spelling.
+        let m = import_text(
+            "@\"a, b\" = internal global i64 4\n\
+             @\"(c)\" = private global i64 5\n\
+             define internal i64 @\"g h\"() {\n  %v = load i64, ptr @\"a\\2C\\20b\"\n  \
+             %w = load i64, ptr @\"(c)\"\n  %r = add i64 %v, %w\n  ret i64 %r\n}\n\
+             define i64 @f() {\n  %r = call i64 @\"g\\20h\"()\n  ret i64 %r\n}\n\
+             $\"a b\" = comdat any\n",
+            "t",
+        )
+        .expect("quoted internal and private names");
+        assert!(m.globals.iter().any(|g| g.name == "\"a\\2C\\20b\""));
+        assert!(m.functions.iter().any(|f| f.name == "\"g\\20h\""));
+        // A `\01` asm label keeps its spelling for the symbol readers, which
+        // read it as the Mach-O C name only under a Mach-O triple: on ELF,
+        // LLVM writes `_clock` (llc 22, aarch64 Linux) where the Mach-O
+        // reading gives `clock`.
+        let m = import_text(
+            "target triple = \"arm64-apple-macosx14.0.0\"\ndeclare i64 @\"\\01_cl\\6Fck\"()\n",
+            "t",
+        )
+        .expect("asm label");
+        assert!(m.functions.iter().any(|f| f.name == "clock"));
+        for triple in [
+            "",
+            "target triple = \"\"\n",
+            "target triple = \"aarch64-unknown-linux-gnu\"\n",
+            "target triple = \"x86_64-pc-windows-msvc\"\n",
+            "target triple = \"arm64-apple-macosx\"\ntarget triple = \"aarch64-linux-gnu\"\n",
+            // An Apple OS whose triple names the ELF format (LLVM's
+            // `getObjectFormat`; the sixth verifier round of L02-P15).
+            "target triple = \"arm64-apple-macosx14.0.0-elf\"\n",
+            "target triple = \"arm64-apple-none-elf\"\n",
+        ] {
+            let reason = unsupported_reason(&format!("{triple}declare i64 @\"\\01_clock\"()\n"));
+            assert!(
+                reason.contains("object format is not Mach-O"),
+                "{triple}: {reason}"
+            );
+        }
+        for triple in [
+            "arm64-apple-ios17.0.0",
+            "x86_64-apple-darwin23",
+            "arm64-apple-macos\\31\\34.0",
+        ] {
+            import_text(
+                &format!("target triple = \"{triple}\"\ndeclare i64 @\"\\01_clock\"()\n"),
+                "t",
+            )
+            .unwrap_or_else(|error| panic!("{triple}: {error}"));
+        }
+    }
+
+    /// Named metadata and module flags llc acts on are read or refused by
+    /// name, their names and strings as LLVM decodes them. clang's own flags
+    /// read; `!llvm.dependent-libraries` refused (llc's object made LLD link
+    /// libm, the imported one did not), and so are the `stack-protector-guard`
+    /// flags (llc read the canary from `sp_el0` and trapped; the import read
+    /// `__stack_chk_guard`).
+    #[test]
+    fn named_metadata_and_module_flags_are_read_or_refused_by_name() {
+        let flags = |list: &str, nodes: &str| {
+            format!(
+                "define i64 @f() {{\n  ret i64 1\n}}\n!llvm.module.flags = !{{{list}}}\n{nodes}"
+            )
+        };
+        // clang's flags (AArch64 Linux and Darwin, older clang's branch
+        // protection at 0), the module's identification, command line and
+        // debug compile unit, and names llc does not read.
+        import_text(
+            &format!(
+                "{}!llvm.ident = !{{!20}}\n!llvm.commandline = !{{!20}}\n\
+                 !llvm.dbg.cu = !{{!21}}\n!my.notes = !{{!20, !22}}\n!n = !{{}}\n\
+                 !20 = !{{!\"clang version 22\"}}\n\
+                 !21 = distinct !DICompileUnit(language: DW_LANG_C11, file: !22, \
+                 emissionKind: FullDebug)\n!22 = !DIFile(filename: \"a.c\", directory: \"/\")\n",
+                flags(
+                    "!0, !1, !2, !3, !4, !5, !6, !7, !8, !9, !10, !11, !12, !13, !14, !15, !16, \
+                     !17",
+                    "!0 = !{i32 1, !\"wchar_size\", i32 4}\n\
+                     !1 = !{i32 8, !\"PIC Level\", i32 2}\n\
+                     !2 = !{i32 7, !\"PIE Level\", i32 2}\n\
+                     !3 = !{i32 7, !\"uwtable\", i32 2}\n\
+                     !4 = !{i32 7, !\"frame-pointer\", i32 1}\n\
+                     !5 = !{i32 7, !\"Dwarf Version\", i32 5}\n\
+                     !6 = !{i32 2, !\"Debug Info Version\", i32 3}\n\
+                     !7 = !{i32 2, !\"SDK Version\", [2 x i32] [i32 26, i32 0]}\n\
+                     !8 = !{i32 8, !\"branch-target-enforcement\", i32 0}\n\
+                     !9 = !{i32 8, !\"sign-return-address\", i32 0}\n\
+                     !10 = !{i32 8, !\"sign-return-address-all\", i32 0}\n\
+                     !11 = !{i32 8, !\"sign-return-address-with-bkey\", i32 0}\n\
+                     !12 = !{i32 1, !\"Code Model\", i32 1}\n\
+                     !13 = !{i32 7, !\"RtLibUseGOT\", i32 1}\n\
+                     !14 = !{i32 1, !\"probe-stack\", !\"inline\\2Dasm\"}\n\
+                     !15 = !{i32 1, !\"stack-probe-size\", i32 8192}\n\
+                     !16 = !{i32 8, !\"guarded-control-stack\", i32 0}\n\
+                     !17 = !{i32 1, !\"DWARF64\", i1 false}\n",
+                )
+            ),
+            "t",
+        )
+        .expect("flags and named metadata llc builds nothing from");
+
+        for (src, needle) in [
+            // A second `!llvm.module.flags` adds its operands to the first,
+            // as LLVM's parser does.
+            (
+                "!llvm.module.flags = !{!0}\n!llvm.module.flags = !{!1}\n\
+                 !0 = !{i32 1, !\"wchar_size\", i32 4}\n!1 = !{i32 1, !\"kcfi\", i32 1}\n"
+                    .to_string(),
+                "module flag \"kcfi\"",
+            ),
+            // The verifier's reproducers.
+            (
+                flags(
+                    "!0, !1, !2",
+                    "!0 = !{i32 1, !\"stack-protector-guard\", !\"sysreg\"}\n\
+                     !1 = !{i32 1, !\"stack-protector-guard-reg\", !\"sp_el0\"}\n\
+                     !2 = !{i32 1, !\"stack-protector-guard-offset\", i32 0}\n",
+                ),
+                "module flag \"stack-protector-guard\" (llc reads the stack-protector canary",
+            ),
+            (
+                flags(
+                    "!0",
+                    "!0 = !{i32 1, !\"stack-protector\\2Dguard-offset\", i32 4096}\n",
+                ),
+                "module flag \"stack-protector-guard-offset\"",
+            ),
+            (
+                "declare double @cbrt(double)\n!llvm.dependent-libraries = !{!0}\n!0 = !{!\"m\"}\n"
+                    .to_string(),
+                "named metadata `!llvm.dependent-libraries` (llc writes the named libraries",
+            ),
+            (
+                "!llvm\\2Edependent-libraries = !{!0}\n!0 = !{!\"m\"}\n".to_string(),
+                "named metadata `!llvm.dependent-libraries`",
+            ),
+            (
+                "!llvm.linker.options = !{!0}\n!0 = !{!\"-lm\"}\n".to_string(),
+                "named metadata `!llvm.linker.options`",
+            ),
+            (
+                "!llvm.stats = !{}\n".to_string(),
+                "named metadata `!llvm.stats`",
+            ),
+            (
+                "!llvm.whatever = !{}\n".to_string(),
+                "LLVM's reserved `llvm.` namespace",
+            ),
+            (
+                "!nvvm.annotations = !{}\n".to_string(),
+                "named metadata `!nvvm.annotations`",
+            ),
+            (
+                "!llvm\\2Emodule\\2Eflags = !{!0}\n!0 = !{i32 1, !\"kcfi\", i32 1}\n".to_string(),
+                "module flag \"kcfi\"",
+            ),
+            // Branch protection on: llc writes the GNU property note (and an
+            // AArch64 triple gives every definition the attribute).
+            (
+                flags(
+                    "!0",
+                    "!0 = !{i32 8, !\"branch-target-enforcement\", i32 1}\n",
+                ),
+                "module flag \"branch-target-enforcement\" (llc builds BTI",
+            ),
+            (
+                flags("!0", "!0 = !{i32 8, !\"sign-return-address\", i32 2}\n"),
+                "module flag \"sign-return-address\"",
+            ),
+            (
+                flags("!0", "!0 = !{i32 8, !\"guarded-control-stack\", i32 1}\n"),
+                "module flag \"guarded-control-stack\"",
+            ),
+            (
+                flags(
+                    "!0",
+                    "!0 = !{i32 4, !\"branch-target-enforcement\", !\"0\"}\n",
+                ),
+                "where llc reads a constant integer",
+            ),
+            // x86 CET is read by presence, a 0 included.
+            (
+                flags("!0", "!0 = !{i32 8, !\"cf-protection-branch\", i32 0}\n"),
+                "module flag \"cf-protection-branch\" (llc builds x86 control-flow protection",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, !\"Code Model\", i32 4}\n"),
+                "a code model other than `small`",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, !\"probe-stack\", !\"__probestack\"}\n"),
+                "a stack probe method other than `inline-asm`",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, !\"stack-probe-size\", i32 1024}\n"),
+                "a stack-probe interval below",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, !\"wchar_size\", !\"4\"}\n"),
+                "where llc reads a constant integer",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, !\"Objective-C Version\", i32 2}\n"),
+                "Objective-C image info",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, !\"bogus\", i32 1}\n"),
+                "module flag \"bogus\" (not a module flag this importer reads",
+            ),
+            // What LLVM's verifier rejects.
+            (
+                flags(
+                    "!0, !1",
+                    "!0 = !{i32 1, !\"wchar_size\", i32 4}\n\
+                     !1 = !{i32 1, !\"wchar\\5Fsize\", i32 4}\n",
+                ),
+                "module flag \"wchar_size\" (listed twice",
+            ),
+            (
+                flags("!0", "!0 = !{i32 3, !\"wchar_size\", !{!\"x\", i32 1}}\n"),
+                "a `require` flag",
+            ),
+            (
+                flags("!0", "!0 = !{i32 9, !\"wchar_size\", i32 4}\n"),
+                "with behavior 9",
+            ),
+            (
+                flags("!0", "!0 = !{i32 7, !\"wchar_size\", !\"4\"}\n"),
+                "under behavior 7",
+            ),
+            (
+                flags("!0", "!0 = !{i32 8, !\"PIC Level\", i32 -1}\n"),
+                "under behavior 8",
+            ),
+            (
+                flags("!0", "!0 = !{i32 5, !\"PIC Level\", i32 2}\n"),
+                "under behavior 5",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, !\"wchar_size\"}\n"),
+                "has 2 operands",
+            ),
+            (
+                flags("!0", "!0 = !{i32 1, i32 4, i32 4}\n"),
+                "without a string key",
+            ),
+            (
+                flags("!0", "!0 = !{!\"x\", !\"wchar_size\", i32 4}\n"),
+                "without an integer behavior",
+            ),
+            (
+                flags("!0", "!0 = !DIFile(filename: \"a.c\", directory: \"/\")\n"),
+                "is not a tuple",
+            ),
+            (
+                flags("!\"x\"", ""),
+                "named metadata `!llvm.module.flags` that is not",
+            ),
+            (
+                "!llvm.ident = !{!0}\n!0 = !{!\"a\", !\"b\"}\n".to_string(),
+                "`!llvm.ident` lists an operand that is not a node holding one string (LLVM's \
+                 verifier rejects it)",
+            ),
+            // Debug information LLVM's verifier calls invalid: llc 22 drops it
+            // with a warning and builds the code (the second verifier round
+            // of L02-P15 found these reasons wrong); the importer refuses it.
+            (
+                "!llvm.dbg.cu = !{!0}\n!0 = !{}\n".to_string(),
+                "`!llvm.dbg.cu` lists an operand that is not a `!DICompileUnit` node (LLVM's \
+                 verifier calls the debug information invalid, and llc drops it with a warning",
+            ),
+            (
+                "!llvm.dbg.foo = !{}\n".to_string(),
+                "named metadata `!llvm.dbg.foo` (a name in LLVM's `llvm.dbg.` namespace other \
+                 than `llvm.dbg.cu`, which llc drops",
+            ),
+            (
+                "@g = global i32 1, !dbg !7\n".to_string(),
+                "use of undefined metadata `!7`",
+            ),
+            (
+                "!0 = !{}\n!0 = !{}\n".to_string(),
+                "metadata node `!0` defined twice",
+            ),
+        ] {
+            let reason = unsupported_reason(&src);
+            assert!(reason.contains(needle), "{src}: {reason}");
+        }
+    }
+
+    /// Module flags are read as LLVM's parser and verifier read them (the
+    /// first verifier round of L02-P15 imported three flags llc 22 rejects):
+    /// an integer is LLVM's `iN` constant (`i8 255` is -1, `i1 2` is 0, `i3
+    /// 9` is 1), and the parser's behavior upgrades (`PIC Level` from error
+    /// or max to min, `PIE Level` from error to max, branch protection from
+    /// error to min) come before the verifier's value checks. Each case was
+    /// run through llc 22 (`probe/` of the repair's scratch evidence).
+    #[test]
+    fn module_flags_are_read_after_llvm_upgrades_them() {
+        let flags = |flag: &str| {
+            format!(
+                "define i64 @f() {{\n  ret i64 1\n}}\n!llvm.module.flags = !{{!0}}\n!0 = {flag}\n"
+            )
+        };
+        for (flag, needle) in [
+            (
+                "!{i32 1, !\"PIC Level\", i32 -1}",
+                "the integer i32 -1 under behavior 8 (LLVM's parser upgrades this flag's behavior \
+                 1 to 8)",
+            ),
+            (
+                "!{i32 7, !\"PIC Level\", i32 -1}",
+                "under behavior 8 (LLVM's parser upgrades this flag's behavior 7 to 8)",
+            ),
+            (
+                "!{i32 8, !\"PIC Level\", i8 255}",
+                "the integer i8 -1 under behavior 8, which",
+            ),
+            (
+                "!{i32 1, !\"PIC Level\", i128 -1}",
+                "the integer i128 -1 under behavior 8",
+            ),
+            (
+                "!{i32 1, !\"PIE Level\", !\"x\"}",
+                "the string \"x\" under behavior 7 (LLVM's parser upgrades this flag's behavior 1 \
+                 to 7)",
+            ),
+            (
+                "!{i32 1, !\"branch-target-enforcement\", !\"0\"}",
+                "under behavior 8 (LLVM's parser upgrades this flag's behavior 1 to 8)",
+            ),
+            (
+                "!{i32 1, !\"sign-return-address-all\", i32 -1}",
+                "under behavior 8 (LLVM's parser upgrades this flag's behavior 1 to 8)",
+            ),
+            (
+                "!{i32 1, !\"sign-return-address\\58\", i32 -1}",
+                "module flag \"sign-return-addressX\" (the integer i32 -1 under behavior 8",
+            ),
+            ("!{i8 129, !\"PIC Level\", i32 1}", "with behavior 129"),
+            (
+                "!{i32 -1, !\"PIC Level\", i32 1}",
+                "with behavior 4294967295",
+            ),
+            (
+                "!{i32 1, !\"Code Model\", i32 257}",
+                "a code model other than `small`",
+            ),
+            (
+                "!{i32 1, !\"ptrauth-elf-got\", i32 1}",
+                "module flag \"ptrauth-elf-got\" (llc signs GOT entries",
+            ),
+            (
+                "!{i32 1, !\"ptrauth-sign-personality\", i2 -3}",
+                "module flag \"ptrauth-sign-personality\" (llc signs",
+            ),
+            (
+                "!{i32 1, !\"ptrauth-elf-got\", !\"0\"}",
+                "where llc reads a constant integer",
+            ),
+            (
+                "!{i32 1, !\"aarch64-elf-pauthabi-version\", i32 0}",
+                "pointer-authentication ABI",
+            ),
+            (
+                "!{i32 1, !\"stack-probe-size\", i16 65536}",
+                "a stack-probe interval below",
+            ),
+            (
+                "!{i32 1, !\"wchar_size\", i0 4}",
+                "where llc reads a constant integer",
+            ),
+            // `true` and `false` are `i1` constants only ("constant expression
+            // type mismatch" for any other width).
+            (
+                "!{i32 1, !\"wchar_size\", i32 true}",
+                "where llc reads a constant integer",
+            ),
+            (
+                "!{i32 1, !\"wchar_size\", i8 false}",
+                "where llc reads a constant integer",
+            ),
+            // The second verifier round's surviving mutants. `PIE Level` is
+            // upgraded from error alone, so under min its -1 is rejected
+            // (llc 22: "invalid value for 'min' module flag"); branch
+            // protection is upgraded from error alone, so under max its -1
+            // is read, and refused as BTI.
+            (
+                "!{i32 8, !\"PIE Level\", i32 -1}",
+                "the integer i32 -1 under behavior 8, which LLVM's verifier rejects",
+            ),
+            (
+                "!{i32 7, !\"branch-target-enforcement\", i32 -1}",
+                "module flag \"branch-target-enforcement\" (llc builds BTI",
+            ),
+            // LLVM reads a `u0x`/`s0x` integer as any other (llc 22 accepts
+            // each); the importer refuses the spelling by name.
+            (
+                "!{i32 u0x1, !\"wchar_size\", i32 4}",
+                "module flag `!0` spells an integer in hexadecimal (`u0x1`)",
+            ),
+            (
+                "!{i32 1, !\"wchar_size\", i32 s0x4}",
+                "module flag `!0` spells an integer in hexadecimal (`s0x4`)",
+            ),
+        ] {
+            let reason = unsupported_reason(&flags(flag));
+            assert!(reason.contains(needle), "{flag}: {reason}");
+        }
+        // The same flags in values and widths llc 22 accepts, and builds
+        // nothing from: `i3 9` is the behavior 1 (upgraded to min, which `i32
+        // 1` satisfies), `i1 2` and `i8 256` are 0, `i8 127` is no negative,
+        // and the pointer-authentication flags newer clang writes at 0 on
+        // every AArch64 Linux module are off.
+        for flag in [
+            "!{i3 9, !\"PIC Level\", i32 1}",
+            "!{i32 1, !\"PIC Level\", i8 127}",
+            "!{i32 7, !\"PIE Level\", i128 -1}",
+            "!{i32 8, !\"branch-target-enforcement\", i1 2}",
+            "!{i32 1, !\"sign-return-address\", i8 256}",
+            "!{i32 1, !\"Code Model\", i8 257}",
+            "!{i32 1, !\"ptrauth-elf-got\", i32 0}",
+            "!{i32 1, !\"ptrauth-sign-personality\", i1 false}",
+            "!{i32 1, !\"ptrauth\\2Delf-got\", i64 0}",
+            // The second verifier round's surviving mutants: `Code Model` is
+            // read unsigned (`i1 true` is 1, small), and `PIC Level` under
+            // warning is not upgraded, so any integer is valid there.
+            "!{i32 1, !\"Code Model\", i1 true}",
+            "!{i32 2, !\"PIC Level\", i32 -1}",
+        ] {
+            import_text(&flags(flag), "t").unwrap_or_else(|error| panic!("{flag}: {error}"));
+        }
+        // With no operand, llc writes an empty `.deplibs` or `.linker-options`
+        // section that no linker reads (and nothing on Mach-O); one operand
+        // is refused.
+        import_text(
+            "!llvm.dependent-libraries = !{}\n!llvm.linker.options = !{}\n",
+            "t",
+        )
+        .expect("empty dependent libraries and linker options");
+        let reason = unsupported_reason(
+            "!llvm.dependent-libraries = !{}\n!llvm.dependent-libraries = !{!0}\n!0 = !{!\"m\"}\n",
+        );
+        assert!(
+            reason.contains("named metadata `!llvm.dependent-libraries`"),
+            "{reason}"
+        );
+        // Named metadata outside `llvm.` that LLVM's parser or llc reads.
+        for name in [
+            "hipe.literals",
+            "wasm.custom_sections",
+            "clang.arc.retainAutoreleasedReturnValueMarker",
+        ] {
+            let reason = unsupported_reason(&format!("!{name} = !{{}}\n"));
+            assert!(
+                reason.contains(&format!("named metadata `!{name}` (")),
+                "{name}: {reason}"
+            );
+        }
+    }
+
+    /// A stack-probe interval is read as LLVM 22's `AArch64FunctionInfo`
+    /// reads it, as a `uint64_t` it asserts is positive as an `int64_t`, in
+    /// the module flag (unsigned at the constant's width) and the attribute
+    /// (a plain decimal) alike: from 4096 to `2^63 - 1`. The second verifier
+    /// round of L02-P15 imported `!{i32 1, !"stack-probe-size", i64 -4096}`
+    /// and `i64 -1`, which the base refused; with `"probe-stack"="inline-asm"`
+    /// and a 300000-byte frame, the imported build printed `f=7` where llc's
+    /// crashed (SIGSEGV), as it did for the attribute
+    /// `"18446744073709547520"`.
+    #[test]
+    fn stack_probe_intervals_llvm_reads_as_negative_are_refused() {
+        let flag = |value: &str| {
+            format!(
+                "define i64 @f() {{\n  ret i64 1\n}}\n!llvm.module.flags = !{{!0}}\n\
+                 !0 = !{{i32 1, !\"stack-probe-size\", {value}}}\n"
+            )
+        };
+        let attribute = |value: &str| {
+            format!(
+                "define i64 @f() #0 {{\n  ret i64 1\n}}\n\
+                 attributes #0 = {{ \"probe-stack\"=\"inline-asm\" \"stack-probe-size\"=\"{value}\" }}\n"
+            )
+        };
+        for value in [
+            "i64 -4096",
+            "i64 -1",
+            "i64 9223372036854775808",
+            "i64 18446744073709547520",
+            // The low 64 bits are `-4096`; `getZExtValue` asserts on the
+            // constant's width.
+            "i128 36893488147419099136",
+            // Low 64 bits of 12288, wider than 64 bits.
+            "i128 18446744073709563904",
+            "i16 4095",
+            "i16 65536",
+        ] {
+            let reason = unsupported_reason(&flag(value));
+            assert!(
+                reason.contains(
+                    "module flag \"stack-probe-size\" (a stack-probe interval below the 4096 \
+                     bytes AArch64 frames are probed at, or at or above 2^63"
+                ),
+                "{value}: {reason}"
+            );
+        }
+        let reason = unsupported_reason(&flag("!\"8192\""));
+        assert!(
+            reason.contains("where llc reads a constant integer"),
+            "{reason}"
+        );
+        for value in [
+            // `i16 61440` is 61440 to `getZExtValue` (-4096 signed), and
+            // `i32 -4096` is 4294963200.
+            "i16 61440",
+            "i32 -4096",
+            "i32 4096",
+            "i64 9223372036854775807",
+            "i128 8192",
+        ] {
+            import_text(&flag(value), "t").unwrap_or_else(|error| panic!("{value}: {error}"));
+        }
+        for value in [
+            "9223372036854775808",
+            "18446744073709547520",
+            "18446744073709551615",
+            // Above `uint64_t`: LLVM's `getAsInteger` fails.
+            "18446744073709551616",
+        ] {
+            let reason = unsupported_reason(&attribute(value));
+            assert!(
+                reason.contains("to 2^63 - 1 (LLVM reads a leading"),
+                "{value}: {reason}"
+            );
+        }
+        for value in ["4096", "9223372036854775807"] {
+            import_text(&attribute(value), "t").unwrap_or_else(|error| panic!("{value}: {error}"));
+        }
+        // The two readers share one predicate.
+        use crate::attributes::stack_probe_interval_read;
+        assert!(!stack_probe_interval_read(4095));
+        assert!(stack_probe_interval_read(4096));
+        assert!(stack_probe_interval_read((1 << 63) - 1));
+        assert!(!stack_probe_interval_read(1 << 63));
+    }
+
+    /// The nodes LLVM's parser requires `distinct` before (its three "missing
+    /// 'distinct'" errors) are refused without it, wherever they are written:
+    /// the first verifier round of L02-P15 imported a `!llvm.dbg.cu` whose
+    /// `!DICompileUnit` was not distinct. Each case was run through llc 22.
+    #[test]
+    fn nodes_llvm_requires_distinct_are_refused_without_it() {
+        let module = |node: &str| {
+            format!(
+                "define i64 @f() {{\n  ret i64 1\n}}\n!llvm.dbg.cu = !{{!2}}\n!0 = {node}\n\
+                 !1 = !DIFile(filename: \"a.c\", directory: \"/\")\n\
+                 !2 = distinct !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: \
+                 FullDebug)\n!3 = !{{!0}}\n"
+            )
+        };
+        for (node, name) in [
+            (
+                "!DISubprogram(name: \"f\", file: !1, unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, spFlags: DISPFlagDefinition | \
+                 DISPFlagOptimized, unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, spFlags: 8, unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, isDefinition: true, unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, isDefinition: false, spFlags: \
+                 DISPFlagDefinition, unit: !2)",
+                "DISubprogram",
+            ),
+            ("!DIAssignID()", "DIAssignID"),
+            (
+                "!DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)",
+                "DICompileUnit",
+            ),
+            // A field of a node written inside a field is not the outer
+            // node's: this definition has no `isDefinition` of its own.
+            (
+                "!DISubprogram(name: \"f\", unit: !2, declaration: !DISubprogram(name: \"f\", \
+                 isDefinition: false, line: 1))",
+                "DISubprogram",
+            ),
+            // `DISPFlagDefinition` is a bit among others (the second
+            // verifier round's surviving mutant read it as exactly 8), and an
+            // integer flag may be spelled `u0x` (the round imported both
+            // spellings below; llc rejects each).
+            (
+                "!DISubprogram(name: \"f\", file: !1, spFlags: 9, unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, spFlags: 24, unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, spFlags: u0x8, unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, spFlags: DISPFlagLocalToUnit | u0x8, \
+                 unit: !2)",
+                "DISubprogram",
+            ),
+            (
+                "!DISubprogram(name: \"f\", file: !1, spFlags: u0x0000000018 | 0, unit: !2)",
+                "DISubprogram",
+            ),
+        ] {
+            let reason = unsupported_reason(&module(node));
+            assert!(
+                reason.contains(&format!(
+                    "`!{name}` without `distinct` (LLVM's parser rejects it"
+                )),
+                "{node}: {reason}"
+            );
+        }
+        for node in [
+            "distinct !DISubprogram(name: \"f\", file: !1, unit: !2)",
+            "!DISubprogram(name: \"f\", file: !1, spFlags: DISPFlagOptimized)",
+            "!DISubprogram(name: \"f\", file: !1, spFlags: 16)",
+            "!DISubprogram(name: \"f\", file: !1, isDefinition: false)",
+            "!DISubprogram(name: \"f\", file: !1, isDefinition: true, spFlags: 0)",
+            "distinct !DIAssignID()",
+            "distinct !DISubprogram(name: \"f\", unit: !2, declaration: !DISubprogram(name: \
+             \"f\", isDefinition: false, line: 1))",
+            "distinct !DISubprogram(name: \"f\", file: !1, spFlags: DISPFlagLocalToUnit | u0x8, \
+             unit: !2)",
+            "!DISubprogram(name: \"f\", file: !1, spFlags: DISPFlagLocalToUnit | u0x10 | 4294967287)",
+        ] {
+            import_text(&module(node), "t").unwrap_or_else(|error| panic!("{node}: {error}"));
+        }
+        // An `spFlags` LLVM's parser rejects decides nothing and is refused,
+        // `distinct` or not: a signed integer (`s0x8`, `-8`), one above 32
+        // bits, a flag name LLVM does not define or that reads as 0, an
+        // empty piece and a floating-point `0x8`.
+        for flags in [
+            "s0x8",
+            "-8",
+            "4294967304",
+            "u0x100000008",
+            "DISPFlagBogus",
+            "DISPFlagZero",
+            "8 |",
+            "| 8",
+            "0x8",
+            "u0x8g",
+        ] {
+            for distinct in ["", "distinct "] {
+                let reason = unsupported_reason(&module(&format!(
+                    "{distinct}!DISubprogram(name: \"f\", file: !1, spFlags: {flags}, unit: !2)"
+                )));
+                assert!(
+                    reason.contains("line 5: a `!DISubprogram` `spFlags` LLVM's parser rejects"),
+                    "{distinct}{flags}: {reason}"
+                );
+            }
+        }
+        // The verifier's reproducer: the compile unit `!llvm.dbg.cu` lists.
+        let reason = unsupported_reason(
+            "define i64 @f() {\n  ret i64 1\n}\n!llvm.dbg.cu = !{!0}\n\
+             !0 = !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug)\n\
+             !1 = !DIFile(filename: \"a.c\", directory: \"/\")\n",
+        );
+        assert!(
+            reason.contains("line 5: `!DICompileUnit` without `distinct`"),
+            "{reason}"
+        );
+        // LLVM's parser reads `isDefinition` as a boolean, `true` or
+        // `false` ("expected 'true' or 'false'"), `distinct` or not, and
+        // `distinct` only right after a numbered node's `=` ("expected
+        // metadata operand" inside another node; the third verifier round
+        // of L02-P15 imported `isDefinition: 0` and an inline `unit:
+        // distinct !DICompileUnit(...)`). Each case was run through llc 22.
+        for value in ["0", "1", "TRUE", "", "true true", "\"true\""] {
+            for distinct in ["", "distinct "] {
+                let reason = unsupported_reason(&module(&format!(
+                    "{distinct}!DISubprogram(name: \"f\", file: !1, isDefinition: {value}, \
+                     unit: !2)"
+                )));
+                assert!(
+                    reason.contains("line 5: a `!DISubprogram` `isDefinition` other than"),
+                    "{distinct}{value}: {reason}"
+                );
+            }
+        }
+        let reason = unsupported_reason(&module(
+            "distinct !DISubprogram(name: \"f\", file: !1, isDefinition: 0, spFlags: 8, unit: !2)",
+        ));
+        assert!(reason.contains("`isDefinition` other than"), "{reason}");
+        // Either field written twice ("field 'X' cannot be specified more
+        // than once"); the reader took the first (fourth verifier round).
+        // One written once in each of two nested nodes is no repeat.
+        for (fields, field) in [
+            ("isDefinition: true, isDefinition: false", "isDefinition"),
+            ("isDefinition: false, isDefinition: false", "isDefinition"),
+            ("spFlags: 8, spFlags: 0", "spFlags"),
+            ("spFlags: 8, isDefinition: true, spFlags: 8", "spFlags"),
+        ] {
+            for distinct in ["", "distinct "] {
+                let reason = unsupported_reason(&module(&format!(
+                    "{distinct}!DISubprogram(name: \"f\", file: !1, {fields}, unit: !2)"
+                )));
+                assert!(
+                    reason.contains(&format!(
+                        "line 5: a `!DISubprogram` with `{field}` written twice"
+                    )),
+                    "{distinct}{fields}: {reason}"
+                );
+            }
+        }
+        import_text(
+            &module(
+                "distinct !DISubprogram(name: \"f\", isDefinition: true, unit: !2, declaration: \
+                 !DISubprogram(name: \"f\", isDefinition: false, line: 1))",
+            ),
+            "t",
+        )
+        .expect("one `isDefinition` in each of two nested nodes");
+        for (node, line) in [
+            (
+                "distinct !DISubprogram(name: \"f\", file: !1, spFlags: 8, unit: distinct \
+                 !DICompileUnit(language: DW_LANG_C11, file: !1, emissionKind: FullDebug))",
+                5,
+            ),
+            ("!{distinct !{}}", 5),
+            ("distinct distinct !{}", 5),
+            ("!{i32 0}\n!9 = !{distinct !DIAssignID()}", 6),
+        ] {
+            let reason = unsupported_reason(&module(node));
+            assert!(
+                reason.contains(&format!(
+                    "line {line}: `distinct` where LLVM's parser does not read it"
+                )),
+                "{node}: {reason}"
+            );
+        }
+        for (src, line) in [
+            ("define i64 @f() {\n  ret i64 41, !foo distinct !{}\n}\n", 2),
+            // Named metadata takes no `distinct` (LLVM: "Expected '!' here").
+            (
+                "define i64 @f() {\n  ret i64 41\n}\n!foo = distinct !{!0}\n!0 = !{}\n",
+                4,
+            ),
+            // Only `!`, a number and `=` before it make a definition's
+            // `distinct` (LLVM: "expected end of metadata node", "expected
+            // integer").
+            (
+                "define i64 @f() {\n  ret i64 41\n}\n!foo = !{!0}\n!0 = !{i32 1 = distinct !{}}\n",
+                5,
+            ),
+            (
+                "define i64 @f() {\n  ret i64 41\n}\n!foo = !{!0}\n!0 = !{! ! = distinct !{}}\n",
+                5,
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(
+                reason.contains(&format!(
+                    "line {line}: `distinct` where LLVM's parser does not read it"
+                )),
+                "{src}: {reason}"
+            );
+        }
+        import_text(
+            "!0 = distinct !{}\n!foo = !{!0}\ndefine i64 @f() {\n  ret i64 41\n}\n",
+            "t",
+        )
+        .expect("a distinct node defined first");
+        for node in [
+            "distinct !DISubprogram(name: \"f\", file: !1, isDefinition: true, unit: !2)",
+            "distinct !DISubprogram(name: \"f\", file: !1, isDefinition: false, unit: !2)",
+            "distinct !DISubprogram(name: \"f\", file: !1, isDefinition: true, spFlags: 8, \
+             unit: !2)",
+            "   distinct    !{}",
+        ] {
+            import_text(&module(node), "t").unwrap_or_else(|error| panic!("{node}: {error}"));
+        }
+    }
+
+    /// A Mach-O `\01_` asm label whose name is no plain LLVM name (a byte
+    /// outside `[-a-zA-Z$._0-9]`, a leading digit, or no byte) is carried as
+    /// any other such symbol name: in its quoted spelling, only for an
+    /// internal or private definition. llc writes the decoded bytes after
+    /// `_` (`_a b`, `_café`); the second repair of L02-P15 wrote the
+    /// canonical escapes (`_a\20b`, `_caf\C3\A9`) into the symbol table of a
+    /// definition, a global and a called declaration (third verifier round).
+    /// The third repair still read `@"\01_1x"` as `1x` and the plain
+    /// `@"1x"` as `"1x"`, two names for llc's one symbol `_1x`, so a call
+    /// llc binds to an internal `@"1x"` left an undefined `_1x` (fourth
+    /// verifier round).
+    #[test]
+    fn mach_o_asm_labels_holding_escapes_follow_the_quoted_name_rule() {
+        let apple = "target triple = \"arm64-apple-macosx14.0.0\"\n";
+        for (src, needle) in [
+            (
+                "define i64 @\"\\01_a b\"() {\n  ret i64 7\n}\n",
+                "function `@\"\\01_a\\20b\"` (the `\\01` asm label of the Mach-O symbol `_a b`)",
+            ),
+            (
+                "declare i64 @\"\\01_x y\"()\ndefine i64 @f() {\n  \
+                 %r = call i64 @\"\\01_x y\"()\n  ret i64 %r\n}\n",
+                "function `@\"\\01_x\\20y\"` (the `\\01` asm label of the Mach-O symbol `_x y`)",
+            ),
+            (
+                "@\"\\01_g v\" = global i64 7\ndefine i64 @f() {\n  \
+                 %v = load i64, ptr @\"\\01_g v\"\n  ret i64 %v\n}\n",
+                "global `@\"\\01_g\\20v\"` (the `\\01` asm label of the Mach-O symbol `_g v`)",
+            ),
+            (
+                "@\"\\01_g v\" = external global i64\n",
+                "global `@\"\\01_g\\20v\"`",
+            ),
+            (
+                "@\"\\01_g v\" = weak global i64 1\n",
+                "global `@\"\\01_g\\20v\"`",
+            ),
+            (
+                "define i64 @\"\\01_caf\\C3\\A9\"() {\n  ret i64 7\n}\n",
+                "Mach-O symbol `_café`",
+            ),
+            (
+                "define i64 @\"\\01_a\\22b\"() {\n  ret i64 7\n}\n",
+                "Mach-O symbol `_a\\\"b`",
+            ),
+            (
+                "define i64 @\"\\01_a\\5Cb\"() {\n  ret i64 7\n}\n",
+                "Mach-O symbol `_a\\\\b`",
+            ),
+            (
+                "define linkonce_odr i64 @\"\\01_a,b\"() {\n  ret i64 7\n}\n",
+                "Mach-O symbol `_a,b`",
+            ),
+            // One Mach-O symbol, `_a b`, spelled both ways.
+            (
+                "declare i64 @\"\\01_a b\"()\ndefine internal i64 @\"a b\"() {\n  ret i64 7\n}\n\
+                 define i64 @f() {\n  %r = call i64 @\"\\01_a b\"()\n  ret i64 %r\n}\n",
+                "appears both as a `\\01` asm-label",
+            ),
+            // A name after `\01_` that starts with a digit, or is empty, is
+            // no plain name either (fourth verifier round): quoted, so
+            // `@"\01_1x"` and `@"1x"`, the one Mach-O symbol `_1x`, are one
+            // name. llc binds the call below to the internal `@"1x"`.
+            (
+                "define i64 @\"\\01_1x\"() {\n  ret i64 7\n}\n",
+                "function `@\"\\01_1x\"` (the `\\01` asm label of the Mach-O symbol `_1x`)",
+            ),
+            (
+                "@\"\\01_0g\" = external global i64\n",
+                "global `@\"\\01_0g\"` (the `\\01` asm label of the Mach-O symbol `_0g`)",
+            ),
+            (
+                "define i64 @\"\\01_\"() {\n  ret i64 7\n}\n",
+                "(the `\\01` asm label of the Mach-O symbol `_`)",
+            ),
+            (
+                "define internal i64 @\"1x\"() {\n  ret i64 7\n}\ndeclare i64 @\"\\01_1x\"()\n\
+                 define i64 @f() {\n  %r = call i64 @\"\\01_1x\"()\n  ret i64 %r\n}\n",
+                "symbol `\"1x\"` appears both as a `\\01` asm-label",
+            ),
+            (
+                "define internal i64 @\"1x\"() {\n  ret i64 7\n}\n\
+                 define i64 @\"\\01_1x\"() {\n  ret i64 8\n}\n",
+                "symbol `\"1x\"` appears both as a `\\01` asm-label",
+            ),
+            (
+                "@\"0g\" = internal global i64 7\n@\"\\01_0g\" = external global i64\n\
+                 define i64 @f() {\n  %v = load i64, ptr @\"\\01_0g\"\n  ret i64 %v\n}\n",
+                "symbol `\"0g\"` appears both as a `\\01` asm-label",
+            ),
+            // llc names a private function `@"1x"` `l_1x`, apart from
+            // `_1x`; the importer, which carries both as `"1x"`, refuses
+            // them together.
+            (
+                "define private i64 @\"1x\"() {\n  ret i64 7\n}\ndeclare i64 @\"\\01_1x\"()\n",
+                "symbol `\"1x\"` appears both as a `\\01` asm-label",
+            ),
+        ] {
+            let reason = unsupported_reason(&format!("{apple}{src}"));
+            assert!(reason.contains(needle), "{src}: {reason}");
+            assert!(
+                reason.contains("is carried only for an internal or private definition")
+                    || reason.contains("appears both"),
+                "{src}: {reason}"
+            );
+        }
+        // An internal or private definition keeps the quoted name, and every
+        // reference reads it.
+        let m = import_text(
+            &format!(
+                "{apple}@\"\\01_g v\" = internal global i64 7\n\
+                 define private i64 @\"\\01_p q\"() {{\n  ret i64 2\n}}\n\
+                 define internal i64 @\"\\01_a b\"() {{\n  \
+                 %v = load i64, ptr @\"\\01_g v\"\n  %w = call i64 @\"\\01_p\\20q\"()\n  \
+                 %r = add i64 %v, %w\n  ret i64 %r\n}}\n\
+                 define i64 @f() {{\n  %r = call i64 @\"\\01_a b\"()\n  ret i64 %r\n}}\n"
+            ),
+            "t",
+        )
+        .expect("internal and private asm labels holding escapes");
+        assert!(m.globals.iter().any(|g| g.name == "\"g\\20v\""));
+        assert!(m.functions.iter().any(|f| f.name == "\"a\\20b\""));
+        assert!(m.functions.iter().any(|f| f.name == "\"p\\20q\""));
+        let m = import_text(
+            &format!(
+                "{apple}define internal i64 @\"\\01_1x\"() {{\n  ret i64 7\n}}\n\
+                 define private i64 @\"\\01_\"() {{\n  ret i64 1\n}}\n\
+                 define i64 @f() {{\n  %r = call i64 @\"\\01_1x\"()\n  \
+                 %s = call i64 @\"\\01_\"()\n  %t = add i64 %r, %s\n  ret i64 %t\n}}\n"
+            ),
+            "t",
+        )
+        .expect("internal and private labels that are no plain names");
+        assert!(m.functions.iter().any(|f| f.name == "\"1x\""));
+        assert!(m.functions.iter().any(|f| f.name == "\"\""));
+        // A label that is a plain name is read plainly, escaped or not; its
+        // Mach-O symbol is `_` and those bytes, as llc writes it.
+        for (label, name) in [
+            ("\\01_foo", "foo"),
+            ("\\01_\\66oo", "foo"),
+            ("\\01__x", "_x"),
+            ("\\01_$x", "$x"),
+            ("\\01_a.b$c-d", "a.b$c-d"),
+        ] {
+            let m = import_text(
+                &format!("{apple}define i64 @\"{label}\"() {{\n  ret i64 7\n}}\n"),
+                "t",
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert!(
+                m.functions.iter().any(|f| f.name == name),
+                "{label}: {:?}",
+                m.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+            );
+        }
+        // On ELF a `\01` label is refused whatever its name.
+        let reason = unsupported_reason(
+            "target triple = \"aarch64-unknown-linux-gnu\"\n\
+             define internal i64 @\"\\01_a b\"() {\n  ret i64 7\n}\n",
+        );
+        assert!(reason.contains("object format is not Mach-O"), "{reason}");
+    }
+
+    /// `"target-cpu"` and `"tune-cpu"` name a processor whose features llc
+    /// builds code for. Of LLVM 22.1.2's AArch64, X86 and RISCV processors,
+    /// only `thunderx3t110` implies a feature this importer refuses as a
+    /// `+feature`: `strict-align`, through its tuning list (llc 22.1.2
+    /// loads an `align 1` `i64` byte by byte for it, as either key, on
+    /// AArch64 Linux and Apple). The third verifier round of L02-P15 found
+    /// it admitted. It is refused for every compile target, none known
+    /// included. With no target known (as here) every other name but
+    /// `generic` and the empty one is refused too, as a name some
+    /// architecture the module may be compiled for does not define
+    /// (`attributes::ProcessorTable`; `tests/target_cpu_names.rs` reads each
+    /// target's names).
+    #[test]
+    fn processors_implying_a_refused_feature_are_refused_by_name() {
+        let needle = "LLVM 22's `thunderx3t110` processor implies the target feature \
+                      `strict-align`";
+        for key in ["target-cpu", "tune-cpu", "tune\\2Dcpu"] {
+            for value in ["thunderx3t110", "thunderx3t\\3110"] {
+                for (src, subject) in [
+                    (
+                        format!("define i64 @f() \"{key}\"=\"{value}\" {{\n  ret i64 5\n}}\n"),
+                        "`@f`: attribute",
+                    ),
+                    (
+                        format!(
+                            "define i64 @f() #0 {{\n  ret i64 5\n}}\n\
+                             attributes #0 = {{ nounwind \"{key}\"=\"{value}\" }}\n"
+                        ),
+                        "`@f`: attribute group `#0`",
+                    ),
+                    (
+                        format!("declare i64 @g() \"{key}\"=\"{value}\"\n"),
+                        "`@g`: attribute",
+                    ),
+                    (
+                        format!(
+                            "declare i64 @g()\ndefine i64 @f() {{\n  %r = call i64 @g() #1\n  \
+                             ret i64 %r\n}}\nattributes #1 = {{ \"{key}\"=\"{value}\" }}\n"
+                        ),
+                        "call to `@g`: attribute group `#1`",
+                    ),
+                ] {
+                    let reason = unsupported_reason(&src);
+                    assert!(
+                        reason.contains(needle) && reason.contains(subject),
+                        "{src}: {reason}"
+                    );
+                }
+            }
+        }
+        let undefined = "is not one LLVM 22 defines for every architecture a module with no \
+                         known target may be compiled for";
+        for (value, read) in [
+            ("ThunderX3T110", false),
+            ("thunderx3t110 ", false),
+            ("thunderx3", false),
+            ("thunderx2t99", false),
+            ("thunderxt88", false),
+            ("generic", true),
+            ("apple-m1", false),
+            ("x86-64", false),
+            ("generic-rv64", false),
+            ("no-such-cpu", false),
+            ("", true),
+        ] {
+            for key in ["target-cpu", "tune-cpu"] {
+                let src = format!("define i64 @f() \"{key}\"=\"{value}\" {{\n  ret i64 5\n}}\n");
+                if read {
+                    import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+                } else {
+                    let reason = unsupported_reason(&src);
+                    assert!(reason.contains(undefined), "{src}: {reason}");
+                }
+            }
+        }
+        import_text("define i64 @f() \"target-cpu\" {\n  ret i64 5\n}\n", "t")
+            .expect("a processor attribute without a value");
+    }
+
+    /// A `+feature` that implies a feature refused as `+feature` is refused
+    /// too: llc sets every feature a `+feature` implies, and
+    /// `+thunderx3t110` (the tuning feature behind that processor) sets
+    /// `strict-align`, for which llc 22.1.2 loads an `align 1` `i64` byte by
+    /// byte (fourth verifier round of L02-P15). The table is re-derived from
+    /// LLVM's own (`attributes::tests`).
+    #[test]
+    fn target_features_implying_a_refused_feature_are_refused_by_name() {
+        let needle = "target feature `+thunderx3t110` implies `strict-align` in LLVM 22";
+        for value in [
+            "+thunderx3t110",
+            "+v8a,+thunderx3t110",
+            "+neon\\2C+thunderx3t\\3110",
+        ] {
+            for (src, subject) in [
+                (
+                    format!(
+                        "define i64 @f() \"target-features\"=\"{value}\" {{\n  ret i64 5\n}}\n"
+                    ),
+                    "`@f`: attribute",
+                ),
+                (
+                    format!(
+                        "define i64 @f() #0 {{\n  ret i64 5\n}}\nattributes #0 = {{ nounwind \
+                         \"target-cpu\"=\"generic\" \"target-features\"=\"{value}\" }}\n"
+                    ),
+                    "`@f`: attribute group `#0`",
+                ),
+                (
+                    format!(
+                        "declare i64 @g()\ndefine i64 @f() {{\n  %r = call i64 @g() \
+                         \"target-features\"=\"{value}\"\n  ret i64 %r\n}}\n"
+                    ),
+                    "call to `@g`: attribute",
+                ),
+            ] {
+                let reason = unsupported_reason(&src);
+                assert!(
+                    reason.contains(needle) && reason.contains(subject),
+                    "{src}: {reason}"
+                );
+            }
+        }
+        for value in [
+            "+thunderx2t99",
+            "+thunderx3t11",
+            "+ThunderX3T110",
+            "+a64fx",
+            "+v8.3a,+lse",
+            "-fmv",
+        ] {
+            let src =
+                format!("define i64 @f() \"target-features\"=\"{value}\" {{\n  ret i64 5\n}}\n");
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+    }
+
+    /// A numbered symbol (`@0`) is named `__unnamed_N` by LLVM's Mangler
+    /// (`___unnamed_N` on Mach-O), N counting numbered symbols in the order
+    /// llc names them; the importer writes its number, so a link with llc's
+    /// objects failed to resolve it either way (fourth verifier round of
+    /// L02-P15, pre-existing). It is carried only for an internal or
+    /// private definition, and a module that has one refuses a symbol whose
+    /// name holds `__unnamed_`, which llc may give the numbered one.
+    #[test]
+    fn numbered_symbols_are_carried_only_inside_their_object() {
+        for triple in [
+            "target triple = \"aarch64-unknown-linux-gnu\"\n",
+            "target triple = \"arm64-apple-macosx14.0.0\"\n",
+        ] {
+            for (src, subject) in [
+                (
+                    "@0 = global i64 7\ndefine i64 @f() {\n  %v = load i64, ptr @0\n  \
+                     ret i64 %v\n}\n",
+                    "global `@0`",
+                ),
+                ("@0 = external global i64\n", "global `@0`"),
+                ("@0 = weak global i64 1\n", "global `@0`"),
+                (
+                    "define i64 @0() {\n  ret i64 7\n}\ndefine i64 @f() {\n  \
+                     %v = call i64 @0()\n  ret i64 %v\n}\n",
+                    "function `@0`",
+                ),
+                (
+                    "declare i64 @0()\ndefine i64 @f() {\n  %v = call i64 @0()\n  ret i64 %v\n}\n",
+                    "function `@0`",
+                ),
+                (
+                    "define linkonce_odr i64 @0() {\n  ret i64 7\n}\n",
+                    "function `@0`",
+                ),
+            ] {
+                let src = format!("{triple}{src}");
+                let reason = unsupported_reason(&src);
+                assert!(
+                    reason.contains(subject)
+                        && reason.contains("a numbered symbol is carried only for an internal"),
+                    "{src}: {reason}"
+                );
+            }
+            for (src, subject) in [
+                (
+                    "@0 = internal global i64 7\ndeclare i64 @__unnamed_1()\n\
+                     define i64 @f() {\n  %r = call i64 @__unnamed_1()\n  ret i64 %r\n}\n",
+                    "function `@__unnamed_1` in a module with the numbered global `@0`",
+                ),
+                (
+                    "define private i64 @0() {\n  ret i64 7\n}\n@.L__unnamed_1 = global i64 1\n",
+                    "global `@.L__unnamed_1` in a module with the numbered function `@0`",
+                ),
+            ] {
+                let src = format!("{triple}{src}");
+                let reason = unsupported_reason(&src);
+                assert!(reason.contains(subject), "{src}: {reason}");
+            }
+            let m = import_text(
+                &format!(
+                    "{triple}@0 = internal global i64 7\ndefine private i64 @1() {{\n  \
+                     ret i64 2\n}}\ndefine i64 @f() {{\n  %v = load i64, ptr @0\n  \
+                     %w = call i64 @1()\n  %r = add i64 %v, %w\n  ret i64 %r\n}}\n"
+                ),
+                "t",
+            )
+            .expect("internal and private numbered symbols");
+            assert!(m.globals.iter().any(|g| g.name == "0"));
+            assert!(m.functions.iter().any(|f| f.name == "1"));
+            // A quoted name of digits is no numbered symbol, and a name that
+            // holds `__unnamed_` is read in a module without one.
+            import_text(
+                &format!("{triple}@\"0\" = internal global i64 1\n@__unnamed_1 = global i64 2\n"),
+                "t",
+            )
+            .expect("`@\"0\"` with `@__unnamed_1`");
+        }
+    }
+
+    /// Outside an Apple triple, llc names a private `@X` `.LX` and its MC
+    /// layer reads every `.L` name as an assembler temporary: llc bound a
+    /// call or load of a declared `@.Lfoo` to a private `@foo` (llc's build
+    /// printed 14 where the importer's, leaving `.Lfoo` undefined, printed
+    /// 107 against a peer that defined it), rejected an undefined one and an
+    /// internal `@.Lfoo` beside a private `@foo`, and left an unreferenced
+    /// external `.L` definition out of the symbol table (fifth verifier
+    /// round of L02-P15, pre-existing). A symbol that is not private is
+    /// refused under a `.L` name, functions and globals alike; on Mach-O,
+    /// where private symbols are `l_X`/`L_X` and every other one starts
+    /// with `_`, the same texts import. Each was run through llc 22.
+    #[test]
+    fn dot_l_names_meet_llcs_private_symbols_outside_apple_triples() {
+        let needle = "this importer carries a `.L` name only for a private symbol";
+        let refused = [
+            (
+                "define private i64 @foo() {\n  ret i64 7\n}\ndeclare i64 @.Lfoo()\n\
+                 define i64 @f() {\n  %a = call i64 @foo()\n  %b = call i64 @.Lfoo()\n  \
+                 %r = add i64 %a, %b\n  ret i64 %r\n}\n",
+                "function `@.Lfoo`",
+            ),
+            (
+                "@g = private global i64 11\n@.Lg = external global i64\ndefine i64 @f() {\n  \
+                 %a = load i64, ptr @g\n  %b = load i64, ptr @.Lg\n  %r = add i64 %a, %b\n  \
+                 ret i64 %r\n}\n",
+                "global `@.Lg`",
+            ),
+            (
+                "define private i64 @foo() {\n  ret i64 7\n}\n\
+                 define internal i64 @.Lfoo() {\n  ret i64 8\n}\n",
+                "function `@.Lfoo`",
+            ),
+            (
+                "define internal i64 @.Lfoo() {\n  ret i64 7\n}\ndefine i64 @f() {\n  \
+                 %r = call i64 @.Lfoo()\n  ret i64 %r\n}\n",
+                "function `@.Lfoo`",
+            ),
+            (
+                "declare i64 @.Lext()\ndefine i64 @f() {\n  %r = call i64 @.Lext()\n  \
+                 ret i64 %r\n}\n",
+                "function `@.Lext`",
+            ),
+            (
+                "define i64 @.Lbar() {\n  ret i64 3\n}\n",
+                "function `@.Lbar`",
+            ),
+            ("@.Lg = global i64 1\n", "global `@.Lg`"),
+            ("@.Lfunc_end0 = global i64 1\n", "global `@.Lfunc_end0`"),
+            (
+                "@\"x y\" = private global i64 1\n@\".Lx y\" = global i64 2\n",
+                "global `@\".Lx\\20y\"`",
+            ),
+            // `\2E` is `.` to LLVM's lexer.
+            ("@\"\\2ELg\" = weak global i64 1\n", "global `@.Lg`"),
+        ];
+        for triple in [
+            "",
+            "target triple = \"aarch64-unknown-linux-gnu\"\n",
+            "target triple = \"x86_64-unknown-linux-gnu\"\n",
+            // An Apple OS whose triple names the ELF format: llc writes ELF
+            // (the sixth verifier round of L02-P15 ran the first text: llc's
+            // build printed 14, the importer's 107 against a peer).
+            "target triple = \"arm64-apple-macosx14.0.0-elf\"\n",
+        ] {
+            for (src, subject) in refused {
+                let src = format!("{triple}{src}");
+                let reason = unsupported_reason(&src);
+                assert!(
+                    reason.contains(needle) && reason.contains(subject),
+                    "{src}: {reason}"
+                );
+            }
+            // A private symbol's `.L` name meets nothing (llc writes
+            // `.L.Lx`), and only the prefix `.L` is LLVM's.
+            for src in [
+                "@x = private global i64 4\n@.Lx = private global i64 5\ndefine i64 @f() {\n  \
+                 %a = load i64, ptr @x\n  %b = load i64, ptr @.Lx\n  %r = add i64 %a, %b\n  \
+                 ret i64 %r\n}\n",
+                "define private i64 @.Lfoo() {\n  ret i64 7\n}\ndefine i64 @f() {\n  \
+                 %r = call i64 @.Lfoo()\n  ret i64 %r\n}\n",
+                "@.lg = global i64 1\n@_.Lg = global i64 2\n@x.Lg = global i64 3\n\
+                 @L_g = global i64 4\n",
+            ] {
+                let src = format!("{triple}{src}");
+                import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+            }
+        }
+        // Mach-O: `_` precedes every name the importer carries, and llc
+        // writes a private `@foo` as `l_foo`.
+        let apple = "target triple = \"arm64-apple-macosx14.0.0\"\n";
+        for (src, _) in &refused[..8] {
+            let src = format!("{apple}{src}");
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+        for src in [
+            "define private i64 @foo() {\n  ret i64 7\n}\ndeclare i64 @l_foo()\n\
+             declare i64 @L_foo()\ndefine i64 @f() {\n  %a = call i64 @foo()\n  \
+             %b = call i64 @l_foo()\n  %c = call i64 @L_foo()\n  %s = add i64 %a, %b\n  \
+             %r = add i64 %s, %c\n  ret i64 %r\n}\n",
+            "@g = private global i64 11\n@l_g = external global i64\n@L_g = external global i64\n\
+             define i64 @f() {\n  %a = load i64, ptr @g\n  %b = load i64, ptr @l_g\n  \
+             %c = load i64, ptr @L_g\n  %s = add i64 %a, %b\n  %r = add i64 %s, %c\n  \
+             ret i64 %r\n}\n",
+        ] {
+            let src = format!("{apple}{src}");
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+        // The compile target takes the place of the module's triple, as
+        // llc's `-mtriple` does: an Apple module compiled for Linux is ELF,
+        // and a module stating no triple, or Linux, compiled for Apple is
+        // Mach-O.
+        for (src, subject) in &refused[..8] {
+            for module_triple in ["", apple] {
+                let src = format!("{module_triple}{src}");
+                let reason = import_text_for_target(&src, "t", "aarch64-unknown-linux-gnu")
+                    .map(drop)
+                    .expect_err("ELF compile target")
+                    .to_string();
+                assert!(
+                    reason.contains(needle) && reason.contains(subject),
+                    "{src}: {reason}"
+                );
+            }
+            for module_triple in ["", "target triple = \"aarch64-unknown-linux-gnu\"\n"] {
+                let src = format!("{module_triple}{src}");
+                import_text_for_target(&src, "t", "aarch64-apple-darwin")
+                    .unwrap_or_else(|error| panic!("{src}: {error}"));
+            }
+        }
+    }
+
+    /// The rules that depend on the compile target read it as llc does: the
+    /// triple given (llc's `-mtriple`), or else the module's own, read as
+    /// LLVM's `Triple` reads it, so the object format a `-elf` ending names
+    /// decides a `\01` label, not the Apple OS alone (the sixth verifier
+    /// round of L02-P15: with `arm64-apple-macosx14.0.0-elf` llc wrote the
+    /// ELF symbol `_bar` for `@"\01_bar"`, where the importer's object called
+    /// `bar`: 5 and 9 against a C peer defining both).
+    #[test]
+    fn asm_labels_follow_the_compile_targets_object_format() {
+        let call = "declare i64 @\"\\01_bar\"()\ndefine i64 @f() {\n  \
+                    %r = call i64 @\"\\01_bar\"()\n  ret i64 %r\n}\n";
+        let needle = "object format is not Mach-O, or none known";
+        for (module_triple, target) in [
+            ("arm64-apple-macosx14.0.0-elf", None),
+            (
+                "arm64-apple-macosx14.0.0",
+                Some("aarch64-unknown-linux-gnu"),
+            ),
+            (
+                "arm64-apple-macosx14.0.0",
+                Some("aarch64-unknown-linux-gnu-elf"),
+            ),
+            ("", Some("x86_64-unknown-linux-gnu")),
+            ("", None),
+        ] {
+            let src = format!("target triple = \"{module_triple}\"\n{call}");
+            let result = match target {
+                Some(target) => import_text_for_target(&src, "t", target),
+                None => import_text(&src, "t"),
+            };
+            let reason = result.map(drop).expect_err("refused").to_string();
+            assert!(
+                reason.contains(needle),
+                "{module_triple} {target:?}: {reason}"
+            );
+        }
+        for (module_triple, target) in [
+            ("arm64-apple-macosx14.0.0", None),
+            ("arm64-apple-macosx14.0.0-macho", None),
+            ("aarch64-unknown-linux-gnu-macho", None),
+            ("", Some("aarch64-apple-darwin")),
+            ("aarch64-unknown-linux-gnu", Some("aarch64-apple-macos12.0")),
+            ("arm64-apple-macosx14.0.0-elf", Some("x86_64-apple-darwin")),
+            ("arm64-apple-macosx14.0.0", Some("")),
+        ] {
+            let src = format!("target triple = \"{module_triple}\"\n{call}");
+            let module = match target {
+                Some(target) => import_text_for_target(&src, "t", target),
+                None => import_text(&src, "t"),
+            }
+            .unwrap_or_else(|error| panic!("{module_triple} {target:?}: {error}"));
+            assert!(module.functions.iter().any(|f| f.name == "bar"));
+        }
+    }
+
+    /// llc 22.1.2 gives library functions meaning on its own
+    /// ([`LLC_LIBRARY_NAMES`]): it merged `@llvm.sin.f64` and `@llvm.cos.f64`
+    /// into a call of `sincos` that an internal `@sincos` received (42, where
+    /// the importer's sin + cos printed 1.357: the seventh verifier round of
+    /// L02-P15, pre-existing), and replaced a call of a module's own external
+    /// `sqrt` by `fsqrt`. A definition under such a name is refused whatever
+    /// its linkage, and so is one under a name this importer gives a call it
+    /// writes in place of an intrinsic the module calls (the sixth verifier
+    /// round found a private `@sin` receiving the importer's call of `sin`;
+    /// an internal one does not receive llc's `sincos`). An
+    /// `available_externally` body, a declaration, and a definition under
+    /// another name are admitted.
+    #[test]
+    fn definitions_under_library_names_are_refused() {
+        let linux = "target triple = \"aarch64-unknown-linux-gnu\"\n";
+        let apple = "target triple = \"arm64-apple-macosx14.0.0\"\n";
+        let call = |intrinsic: &str| {
+            format!(
+                "declare double @{intrinsic}(double)\ndefine double @f(double %x) {{\n  \
+                 %r = call double @{intrinsic}(double %x)\n  ret double %r\n}}\n"
+            )
+        };
+        let call2 = |intrinsic: &str| {
+            format!(
+                "declare double @{intrinsic}(double, double)\ndefine double @f(double %x) {{\n  \
+                 %r = call double @{intrinsic}(double %x, double %x)\n  ret double %r\n}}\n"
+            )
+        };
+        let define = |linkage: &str, name: &str| {
+            format!("define {linkage} double @{name}(double %x) {{\n  ret double 42.0\n}}\n")
+        };
+        let library = |name: &str| format!("gives `{name}` library meaning on its own");
+        let rewritten = |what: &str, name: &str, intrinsic: &str| {
+            format!("{what} `@{name}` defined in a module calling `@{intrinsic}`")
+        };
+        let pattern = |ty: &str| {
+            format!(
+                "declare void @llvm.experimental.memset.pattern.p0.{ty}.i64(ptr, {ty}, i64, i1)\n\
+                 define void @g(ptr %p) {{\n  call void \
+                 @llvm.experimental.memset.pattern.p0.{ty}.i64(ptr %p, {ty} 7, i64 4, i1 false)\n  \
+                 ret void\n}}\n"
+            )
+        };
+        for triple in [linux, apple, ""] {
+            let mut refused = Vec::new();
+            for linkage in ["private", "internal", "", "weak", "linkonce_odr"] {
+                for name in ["sincos", "sincosf", "__sincos_stret", "cbrt", "bzero"] {
+                    refused.push((define(linkage, name), library(name)));
+                }
+                refused.push((
+                    format!("{}{}", define(linkage, "sin"), call("llvm.cos.f64")),
+                    library("sin"),
+                ));
+                for name in ["sqrt", "fabs", "copysign", "cosf", "__sqrt_finite"] {
+                    refused.push((define(linkage, name), library(name)));
+                }
+                for name in [
+                    "memcmp", "bcmp", "mempcpy", "strlen", "strcpy", "memcpy", "memset",
+                ] {
+                    refused.push((
+                        format!(
+                            "define {linkage} i64 @{name}(ptr %a, ptr %b, i64 %n) {{\n  \
+                             ret i64 0\n}}\n"
+                        ),
+                        library(name),
+                    ));
+                }
+                refused.push((
+                    format!(
+                        "define {linkage} void @memset_pattern16(ptr %d, ptr %p, i64 %n) {{\n  \
+                         ret void\n}}\n"
+                    ),
+                    library("memset_pattern16"),
+                ));
+                for (name, intrinsic) in [("exp", "llvm.exp.f64"), ("log10", "llvm.log10.f64")] {
+                    refused.push((
+                        format!("{}{}", define(linkage, name), call(intrinsic)),
+                        rewritten("function", name, intrinsic),
+                    ));
+                }
+                refused.push((
+                    format!(
+                        "define {linkage} double @pow(double %x, double %y) {{\n  \
+                         ret double 42.0\n}}\n{}",
+                        call2("llvm.pow.f64")
+                    ),
+                    rewritten("function", "pow", "llvm.pow.f64"),
+                ));
+            }
+            for linkage in ["private", "internal", ""] {
+                refused.push((
+                    format!("@sincos = {linkage} global i64 1\n"),
+                    format!("global `@sincos` defined in the module: {}", "on AArch64"),
+                ));
+                refused.push((
+                    format!("@exp = {linkage} global i64 1\n{}", call("llvm.exp.f64")),
+                    rewritten("global", "exp", "llvm.exp.f64"),
+                ));
+            }
+            for (src, needle) in refused {
+                let src = format!("{triple}{src}");
+                let reason = unsupported_reason(&src);
+                assert!(reason.contains(&needle), "{src}: {reason}");
+            }
+            // Names llc 22 lowers on AArch64 to a call of the same name are
+            // refused all the same where LLVM lists them as runtime library
+            // calls, with or without the intrinsic the importer rewrites.
+            for (src, name) in [
+                (define("", "tan"), "tan"),
+                (define("internal", "exp2"), "exp2"),
+                (
+                    format!(
+                        "{}define double @f(double %x) {{\n  %r = call double @exp(double %x)\n  \
+                         ret double %r\n}}\n",
+                        define("internal", "exp")
+                    ),
+                    "exp",
+                ),
+            ] {
+                let src = format!("{triple}{src}");
+                let reason = unsupported_reason(&src);
+                assert!(
+                    reason.contains(&format!(
+                        "LLVM 22.1.2 lists `{name}` as a runtime library call for AArch64"
+                    )),
+                    "{src}: {reason}"
+                );
+            }
+            for src in [
+                // Another name.
+                format!("{}{}", define("internal", "mysin"), call("llvm.sin.f64")),
+                // A name llc 22 leaves a call of on AArch64, which LLVM lists
+                // as no runtime library call.
+                "define i64 @strcmp(ptr %a, ptr %b) {\n  ret i64 0\n}\n".to_string(),
+                // A declaration: llc's calls reach the library's definition.
+                format!(
+                    "declare void @sincos(double, ptr, ptr)\n{}",
+                    call("llvm.sin.f64")
+                ),
+                // An `available_externally` body: no object holds it.
+                format!(
+                    "{}define double @f(double %x) {{\n  %r = call double @sqrt(double %x)\n  \
+                     ret double %r\n}}\n",
+                    define("available_externally", "sqrt")
+                ),
+            ] {
+                let src = format!("{triple}{src}");
+                import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+            }
+        }
+        // A Mach-O `\01_` label is read by the name it carries, the symbol
+        // llc writes `_sin`.
+        for src in [
+            format!(
+                "{apple}define private double @\"\\01_sin\"(double %x) {{\n  \
+                 ret double 42.0\n}}\n{}",
+                call("llvm.sin.f64")
+            ),
+            format!(
+                "{apple}define internal double @\"\\01_sincos\"(double %x) {{\n  \
+                 ret double 42.0\n}}\n"
+            ),
+        ] {
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains("library meaning on its own"),
+                "{src}: {reason}"
+            );
+        }
+        // The importer's `memset_patternN` for a fill it lowers on Darwin.
+        for linkage in ["private", "internal", ""] {
+            let src = format!(
+                "{apple}define {linkage} void @memset_pattern4(ptr %d, ptr %p, i64 %n) {{\n  \
+                 ret void\n}}\n{}",
+                pattern("i32")
+            );
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains(&rewritten(
+                    "function",
+                    "memset_pattern4",
+                    "llvm.experimental.memset.pattern.p0.i32.i64"
+                )),
+                "{src}: {reason}"
+            );
+        }
+        // `memset_pattern8`, which the importer does not call for an `i32`
+        // fill, is a runtime library call LLVM lists for Darwin.
+        let src = format!(
+            "{apple}define internal void @memset_pattern8(ptr %d, ptr %p, i64 %n) {{\n  \
+             ret void\n}}\n{}",
+            pattern("i32")
+        );
+        let reason = unsupported_reason(&src);
+        assert!(
+            reason.contains("lists `memset_pattern8` as a runtime library call"),
+            "{src}: {reason}"
+        );
+    }
+
+    const LLVM22_LIBRARY_NAMES: &str = include_str!("../tests/fixtures/llvm22_library_names.json");
+
+    /// The names the member list of LLVM 22.1.2's `AArch64SystemLibrary`
+    /// reaches in the committed extract, whatever the availability
+    /// predicates, and the predicates seen.
+    fn derived_runtime_libcalls() -> (BTreeSet<String>, BTreeSet<String>) {
+        fn walk(
+            record: &str,
+            sets: &serde_json::Map<String, serde_json::Value>,
+            impls: &serde_json::Map<String, serde_json::Value>,
+            names: &mut BTreeSet<String>,
+            predicates: &mut BTreeSet<String>,
+        ) {
+            if let Some(name) = impls.get(record) {
+                names.insert(name.as_str().expect("an impl's name").to_string());
+                return;
+            }
+            let set = sets
+                .get(record)
+                .unwrap_or_else(|| panic!("{record} is neither a set nor an impl"));
+            predicates.insert(set["predicate"].as_str().expect("a predicate").to_string());
+            for member in set["members"].as_array().expect("members") {
+                walk(
+                    member.as_str().expect("a member"),
+                    sets,
+                    impls,
+                    names,
+                    predicates,
+                );
+            }
+        }
+        let extract: serde_json::Value =
+            serde_json::from_str(LLVM22_LIBRARY_NAMES).expect("the extract");
+        let runtime = &extract["runtime_libcalls"];
+        assert_eq!(runtime["system_library"], "AArch64SystemLibrary");
+        let (mut names, mut predicates) = (BTreeSet::new(), BTreeSet::new());
+        walk(
+            runtime["root"].as_str().expect("the root"),
+            runtime["sets"].as_object().expect("sets"),
+            runtime["impls"].as_object().expect("impls"),
+            &mut names,
+            &mut predicates,
+        );
+        (names, predicates)
+    }
+
+    /// The function names of every `TargetLibCall` of LLVM 22.1.2's
+    /// `TargetLibraryInfo.td`, from the committed extract.
+    fn target_library_call_names() -> BTreeSet<String> {
+        let extract: serde_json::Value =
+            serde_json::from_str(LLVM22_LIBRARY_NAMES).expect("the extract");
+        extract["target_library_calls"]
+            .as_object()
+            .expect("target library calls")
+            .values()
+            .map(|name| name.as_str().expect("a name").to_string())
+            .collect()
+    }
+
+    /// `crate::llvm_runtime_libcalls` is LLVM 22.1.2's AArch64 runtime
+    /// library calls, derived from the committed extract of
+    /// `RuntimeLibcalls.td` (`scripts/extract_llvm_library_names.py`): every
+    /// name the member list of `AArch64SystemLibrary` reaches, whatever its
+    /// availability predicate. Equality kills the deletion of any entry
+    /// and the addition of any other; a definition under each is refused by
+    /// name, whatever its linkage. The closure audit of 2026-10-16 ran a
+    /// module's own `__udivti3` (42 against llc's 33 at O1-O3) and
+    /// `__floattidf` (70 against 100), and llc's Darwin call of `__exp10`.
+    #[test]
+    fn runtime_libcall_table_is_llvms_aarch64_system_library() {
+        use crate::llvm_runtime_libcalls::{
+            LLVM_AARCH64_RUNTIME_LIBCALLS, is_llvm_aarch64_runtime_libcall,
+        };
+        let (derived, predicates) = derived_runtime_libcalls();
+        assert!(
+            LLVM_AARCH64_RUNTIME_LIBCALLS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "the table is sorted by byte, one entry per name"
+        );
+        let table: BTreeSet<String> = LLVM_AARCH64_RUNTIME_LIBCALLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let missing: Vec<_> = derived.difference(&table).collect();
+        let extra: Vec<_> = table.difference(&derived).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "LLVM_AARCH64_RUNTIME_LIBCALLS differs from LLVM 22.1.2's AArch64SystemLibrary: \
+             missing {missing:?}, extra {extra:?}"
+        );
+        // The predicates are not evaluated: names LLVM lists only for
+        // Darwin, Windows, OpenBSD or an SjLj exception model are in it.
+        for predicate in [
+            "isOSDarwin",
+            "darwinHasExp10",
+            "isOSWindows",
+            "ExceptionModelIsSjLj",
+        ] {
+            assert!(
+                predicates.contains(predicate),
+                "{predicate}: {predicates:?}"
+            );
+        }
+        for name in [
+            "__udivti3",
+            "__floattidf",
+            "__exp10",
+            "__exp10f",
+            "ldexp",
+            "ldexpf",
+            "exp10",
+            "fmod",
+            "bzero",
+            "__chkstk",
+            "malloc",
+            "__aarch64_cas4_acq",
+            "__stack_chk_guard",
+        ] {
+            assert!(is_llvm_aarch64_runtime_libcall(name), "{name}");
+        }
+        for name in ["strcmp", "puts", "abs", "printf", "sqrtx", ""] {
+            assert!(!is_llvm_aarch64_runtime_libcall(name), "{name}");
+        }
+        // A definition under each name is refused, a function or a global,
+        // whatever its linkage; a declaration is admitted.
+        let apple = "target triple = \"arm64-apple-macosx14.0.0\"\n";
+        let linux = "target triple = \"aarch64-unknown-linux-gnu\"\n";
+        for (index, name) in LLVM_AARCH64_RUNTIME_LIBCALLS.iter().enumerate() {
+            let triple = if index % 2 == 0 { linux } else { apple };
+            let linkage = ["internal", "", "weak", "private"][index % 4];
+            let src = if index % 3 == 0 {
+                format!("{triple}@{name} = {linkage} global i64 1\n")
+            } else {
+                format!("{triple}define {linkage} i64 @{name}(i64 %x) {{\n  ret i64 42\n}}\n")
+            };
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains(&format!("`@{name}` defined in the module")),
+                "{src}: {reason}"
+            );
+            let src = format!(
+                "{triple}declare i64 @{name}(i64)\ndefine i64 @f(i64 %x) {{\n  \
+                 %r = call i64 @{name}(i64 %x)\n  ret i64 %r\n}}\n"
+            );
+            if let Err(error) = import_text(&src, "t") {
+                // A few names are refused for another reason (a name the
+                // importer reads apart, such as an `llvm.` one); none for
+                // a library-name rule.
+                assert!(
+                    !error.to_string().contains("defined in the module"),
+                    "{src}: {error}"
+                );
+            }
+        }
+    }
+
+    /// Every entry of [`LLC_LIBRARY_NAMES`], named here with what llc 22.1.2
+    /// does with it, and the fortified functions derived from LLVM 22.1.2's
+    /// `TargetLibraryInfo.td` (the committed extract): the table must equal
+    /// them, so the deletion of any single entry fails here, and each must
+    /// be a name LLVM's library tables know. A definition under each is
+    /// refused with its group's reason.
+    #[test]
+    fn library_name_table_is_complete() {
+        // Read in llc 22.1.2's source (see `LLC_LIBRARY_NAMES`).
+        let read: &[&str] = &[
+            // `FSINCOS`, `DAGCombiner::visitFPOW`, `AArch64SelectionDAGInfo`,
+            // `PreISelIntrinsicLowering`.
+            "sincos",
+            "sincosf",
+            "sincosl",
+            "__sincos_stret",
+            "__sincosf_stret",
+            "cbrt",
+            "cbrtf",
+            "bzero",
+            "memset_pattern16",
+            // `MergeICmps`, `ExpandMemCmp`, `visitCall`.
+            "memcmp",
+            "bcmp",
+            "mempcpy",
+            // `visitCall` on AArch64.
+            "fabs",
+            "fabsf",
+            "fabsl",
+            "copysign",
+            "copysignf",
+            "copysignl",
+            "sqrt",
+            "sqrtf",
+            "sqrtl",
+            "__sqrt_finite",
+            "__sqrtf_finite",
+            "__sqrtl_finite",
+            "sin",
+            "sinf",
+            "sinl",
+            "cos",
+            "cosf",
+            "cosl",
+            "ldexp",
+            "ldexpf",
+            "ldexpl",
+            "exp10",
+            "exp10f",
+            "exp10l",
+        ];
+        let tli = target_library_call_names();
+        let (runtime, _) = derived_runtime_libcalls();
+        // The fortified functions and the plain functions they are replaced
+        // with, derived from LLVM's table.
+        let fortified: BTreeSet<String> = tli
+            .iter()
+            .filter(|name| name.starts_with("__") && name.ends_with("_chk"))
+            .cloned()
+            .collect();
+        assert_eq!(fortified.len(), 18, "{fortified:?}");
+        let plain: BTreeSet<String> = fortified
+            .iter()
+            .map(|name| name["__".len()..name.len() - "_chk".len()].to_string())
+            .collect();
+        let expected: BTreeSet<String> = read
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain(fortified.iter().cloned())
+            .chain(plain.iter().cloned())
+            .collect();
+        let mut table = BTreeSet::new();
+        for (names, _) in LLC_LIBRARY_NAMES {
+            for name in *names {
+                assert!(table.insert((*name).to_string()), "`{name}` listed twice");
+            }
+        }
+        let missing: Vec<_> = expected.difference(&table).collect();
+        let extra: Vec<_> = table.difference(&expected).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "LLC_LIBRARY_NAMES: missing {missing:?}, extra {extra:?}"
+        );
+        for name in &table {
+            assert!(
+                tli.contains(name) || runtime.contains(name),
+                "`{name}` is a name neither of LLVM's library tables holds"
+            );
+            let use_ = llc_library_name_use(name).expect("listed");
+            for linkage in ["internal", ""] {
+                let src = format!(
+                    "target triple = \"aarch64-unknown-linux-gnu\"\n\
+                     define {linkage} i64 @{name}(ptr %a, ptr %b, i64 %n) {{\n  ret i64 0\n}}\n"
+                );
+                let reason = unsupported_reason(&src);
+                assert!(
+                    reason.contains(&format!(
+                        "gives `{name}` library meaning on its own: it {use_}"
+                    )),
+                    "{src}: {reason}"
+                );
+            }
+        }
+    }
+
+    /// The overload positions LLVM 22.1.2's `Intrinsics.td` gives the
+    /// target-independent overloaded intrinsic `name`, from the committed
+    /// extract, as this importer names them.
+    fn llvm_overloads(
+        intrinsics: &serde_json::Map<String, serde_json::Value>,
+        name: &str,
+    ) -> Vec<String> {
+        let entry = intrinsics
+            .get(name)
+            .unwrap_or_else(|| panic!("`{name}` is no overloaded intrinsic of LLVM 22.1.2"));
+        let results = entry["results"].as_u64().expect("results") as usize;
+        entry["overloads"]
+            .as_array()
+            .expect("overloads")
+            .iter()
+            .map(|position| {
+                let position = position.as_u64().expect("a position") as usize;
+                if position < results {
+                    assert_eq!(results, 1, "`{name}`: a struct result");
+                    "Result".to_string()
+                } else {
+                    format!("Param({})", position - results)
+                }
+            })
+            .collect()
+    }
+
+    /// [`OVERLOADED_INTRINSICS`] is complete and exact against LLVM 22.1.2's
+    /// `Intrinsics.td` (the committed extract): every target-independent
+    /// overloaded intrinsic this importer reads, at a call, under some name
+    /// LLVM's suffixes give it (`libm_intrinsic_symbol`, the pass-through,
+    /// importer-lowered and pattern-fill classifiers; the droppable ones
+    /// are not read by their types) has an entry, no other has one, and
+    /// each entry's overloaded types are LLVM's. The deletion of any single
+    /// entry fails here (the closure audit of 2026-10-16 found 25 of 36
+    /// deletions surviving the unit tests; deleting `llvm.cos` admitted a
+    /// mis-suffixed `@llvm.cos.f32` declared `double (double)`, which ran
+    /// 0 where llc's build gave 109). The vector expander's families are
+    /// checked against the same extract.
+    #[test]
+    fn overloaded_intrinsic_table_is_complete() {
+        let extract: serde_json::Value =
+            serde_json::from_str(LLVM22_LIBRARY_NAMES).expect("the extract");
+        let intrinsics = extract["intrinsics"].as_object().expect("intrinsics");
+        const SUFFIXES: [&str; 10] = [
+            "i1", "i8", "i16", "i32", "i64", "i128", "f16", "f32", "f64", "p0",
+        ];
+        let reads = |name: &str| {
+            !is_droppable_intrinsic(name)
+                && (libm_intrinsic_symbol(name).is_some()
+                    || is_lowered_passthrough_intrinsic(name)
+                    || is_importer_lowered_intrinsic(name)
+                    || is_memset_pattern_intrinsic(name))
+        };
+        let mut read = BTreeSet::new();
+        for (name, entry) in intrinsics {
+            let arity = entry["overloads"].as_array().expect("overloads").len();
+            let mut suffixes = vec![String::new()];
+            for _ in 0..arity {
+                suffixes = suffixes
+                    .iter()
+                    .flat_map(|prefix| SUFFIXES.iter().map(move |s| format!("{prefix}.{s}")))
+                    .collect();
+            }
+            if suffixes
+                .iter()
+                .any(|suffix| reads(&format!("{name}{suffix}")))
+            {
+                read.insert(name.clone());
+            }
+        }
+        let table: BTreeSet<String> = OVERLOADED_INTRINSICS
+            .iter()
+            .map(|(family, _)| (*family).to_string())
+            .collect();
+        assert_eq!(
+            table.len(),
+            OVERLOADED_INTRINSICS.len(),
+            "an entry listed twice"
+        );
+        let missing: Vec<_> = read.difference(&table).collect();
+        let extra: Vec<_> = table.difference(&read).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "OVERLOADED_INTRINSICS: missing {missing:?}, extra {extra:?}"
+        );
+        for (family, overloads) in OVERLOADED_INTRINSICS {
+            let ours: Vec<String> = overloads.iter().map(|o| format!("{o:?}")).collect();
+            assert_eq!(ours, llvm_overloads(intrinsics, family), "{family}");
+        }
+        // The vector expander's families, under their names for `<2 x
+        // double>` and `<4 x i32>` operands.
+        for family in crate::vector::ELEMENTWISE_INTRINSICS {
+            let name = format!("llvm.{family}");
+            let (found, overloads) =
+                vector_intrinsic_family(&format!("{name}.v2f64")).expect("an elementwise family");
+            assert_eq!(found, name);
+            let ours: Vec<String> = overloads.iter().map(|o| format!("{o:?}")).collect();
+            assert_eq!(ours, llvm_overloads(intrinsics, &name), "{name}");
+        }
+        for op in ["add", "mul", "and", "or", "xor", "fadd", "fmul"] {
+            let name = format!("llvm.vector.reduce.{op}");
+            let (found, overloads) =
+                vector_intrinsic_family(&format!("{name}.v4i32")).expect("a reduction");
+            assert_eq!(found, name);
+            let ours: Vec<String> = overloads.iter().map(|o| format!("{o:?}")).collect();
+            assert_eq!(ours, llvm_overloads(intrinsics, &name), "{name}");
+        }
+        for name in ["llvm.vector.reduce.fmax.v4f32", "llvm.masked.load.v4i32.p0"] {
+            assert!(vector_intrinsic_family(name).is_none(), "{name}");
+        }
+    }
+
+    /// llc 22.1.2 lowers `@llvm.experimental.memset.pattern.*` to a call of
+    /// `memset_pattern16` only where LLVM's `TargetLibraryInfo` has it (macOS,
+    /// iOS, tvOS, watchOS), and to a loop of stores elsewhere: on Linux it
+    /// calls nothing (the seventh verifier round of L02-P15), where this
+    /// importer's call names a function glibc does not define. The intrinsic
+    /// is refused for any other target and when none is known.
+    #[test]
+    fn memset_pattern_is_lowered_only_where_llvm_calls_memset_pattern16() {
+        let fill = "declare void @llvm.experimental.memset.pattern.p0.i64.i64(ptr, i64, i64, i1)\n\
+                    define void @g(ptr %p) {\n  call void \
+                    @llvm.experimental.memset.pattern.p0.i64.i64(ptr %p, i64 7, i64 4, i1 false)\n  \
+                    ret void\n}\n";
+        let needle = "for a target whose OS is not macOS, iOS, tvOS or watchOS, or with no target \
+                      known";
+        for (module_triple, target) in [
+            ("", None),
+            ("aarch64-unknown-linux-gnu", None),
+            ("arm64-apple-xros1.0", None),
+            ("", Some("aarch64-unknown-linux-gnu")),
+            (
+                "arm64-apple-macosx14.0.0",
+                Some("aarch64-unknown-linux-gnu"),
+            ),
+        ] {
+            let src = format!("target triple = \"{module_triple}\"\n{fill}");
+            let reason = match target {
+                Some(target) => import_text_for_target(&src, "t", target),
+                None => import_text(&src, "t"),
+            }
+            .map(drop)
+            .expect_err("refused")
+            .to_string();
+            assert!(reason.contains(needle), "{src} {target:?}: {reason}");
+        }
+        for (module_triple, target) in [
+            ("arm64-apple-macosx14.0.0", None),
+            ("arm64-apple-ios17.0", None),
+            ("", Some("aarch64-apple-darwin")),
+            ("aarch64-unknown-linux-gnu", Some("aarch64-apple-darwin")),
+        ] {
+            let src = format!("target triple = \"{module_triple}\"\n{fill}");
+            let module = match target {
+                Some(target) => import_text_for_target(&src, "t", target),
+                None => import_text(&src, "t"),
+            }
+            .unwrap_or_else(|error| panic!("{src} {target:?}: {error}"));
+            assert!(
+                module.functions.iter().any(|f| f.name == "memset_pattern8"),
+                "{src} {target:?}"
+            );
+        }
+    }
+
+    /// LLVM reads an overloaded intrinsic's types from its function type
+    /// and renames it to match: `declare double @llvm.sin.f32(double)` is
+    /// `@llvm.sin.f64` to llc 22.1.2, which called `sin` (0.479426) where the
+    /// importer, reading the name, called `sinf` (0.5); `@llvm.pow.f64`
+    /// declared `float (float, float)` called `powf` (9) where the importer
+    /// called `pow` with float arguments (0) (the seventh verifier round of
+    /// L02-P15, pre-existing). Every overloaded intrinsic the importer reads
+    /// is refused, at its declaration and at a call, unless its name is the
+    /// one LLVM gives its type.
+    #[test]
+    fn intrinsic_names_are_read_only_under_the_name_llvm_gives_their_type() {
+        let needle = |expected: &str| format!("names this one `@{expected}`");
+        for (src, expected) in [
+            (
+                "declare double @llvm.sin.f32(double)\ndefine double @f(double %x) {\n  \
+                 %r = call double @llvm.sin.f32(double %x)\n  ret double %r\n}\n",
+                "llvm.sin.f64",
+            ),
+            (
+                "define double @f(double %x) {\n  \
+                 %r = call double @llvm.sin.f32(double %x)\n  ret double %r\n}\n",
+                "llvm.sin.f64",
+            ),
+            (
+                "declare float @llvm.pow.f64(float, float)\ndefine float @f(float %x) {\n  \
+                 %r = call float @llvm.pow.f64(float %x, float %x)\n  ret float %r\n}\n",
+                "llvm.pow.f32",
+            ),
+            ("declare double @llvm.sin.f32(double)\n", "llvm.sin.f64"),
+            ("declare double @llvm.sin(double)\n", "llvm.sin.f64"),
+            ("declare double @llvm.sin.f64.x(double)\n", "llvm.sin.f64"),
+            (
+                "define i64 @f(i64 %x) {\n  %r = call i64 @llvm.bitreverse.i32(i64 %x)\n  \
+                 ret i64 %r\n}\n",
+                "llvm.bitreverse.i64",
+            ),
+            (
+                "define i32 @f(i32 %x) {\n  %r = call i32 @llvm.abs.i64(i32 %x, i1 false)\n  \
+                 ret i32 %r\n}\n",
+                "llvm.abs.i32",
+            ),
+            (
+                "define i32 @f(i32 %x, i32 %y) {\n  %r = call i32 @llvm.smax.i64(i32 %x, i32 %y)\n  \
+                 ret i32 %r\n}\n",
+                "llvm.smax.i32",
+            ),
+            (
+                "define float @f(float %x) {\n  %r = call float @llvm.fma.f64(float %x, float %x, \
+                 float %x)\n  ret float %r\n}\n",
+                "llvm.fma.f32",
+            ),
+            (
+                "define double @f(double %x) {\n  %r = call double @llvm.sqrt.f32(double %x)\n  \
+                 ret double %r\n}\n",
+                "llvm.sqrt.f64",
+            ),
+            (
+                "define i64 @f(ptr %p) {\n  %r = call i64 @llvm.objectsize.i32.p0(ptr %p, i1 false, \
+                 i1 true, i1 false)\n  ret i64 %r\n}\n",
+                "llvm.objectsize.i64.p0",
+            ),
+            (
+                "define void @f(ptr %d, ptr %s) {\n  call void @llvm.memcpy.p0.p0.i32(ptr %d, \
+                 ptr %s, i64 8, i1 false)\n  ret void\n}\n",
+                "llvm.memcpy.p0.p0.i64",
+            ),
+            (
+                "declare void @llvm.memset.p0.i32(ptr, i8, i64, i1)\n",
+                "llvm.memset.p0.i64",
+            ),
+            (
+                "declare void @llvm.memmove.p0.p0(ptr, ptr, i64, i1)\n",
+                "llvm.memmove.p0.p0.i64",
+            ),
+        ] {
+            let reason = unsupported_reason(src);
+            assert!(reason.contains(&needle(expected)), "{src}: {reason}");
+        }
+        // The names LLVM gives their types, and the distinct
+        // `llvm.memcpy.inline`, are read as before.
+        for src in [
+            "declare double @llvm.sin.f64(double)\ndefine double @f(double %x) {\n  \
+             %r = call double @llvm.sin.f64(double %x)\n  ret double %r\n}\n",
+            "declare float @llvm.pow.f32(float, float)\ndefine float @f(float %x) {\n  \
+             %r = call float @llvm.pow.f32(float %x, float %x)\n  ret float %r\n}\n",
+            "define i64 @f(ptr %p) {\n  %r = call i64 @llvm.objectsize.i64.p0(ptr %p, i1 false, \
+             i1 true, i1 false)\n  ret i64 %r\n}\n",
+            "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\
+             define void @f(ptr %d, ptr %s) {\n  call void @llvm.memcpy.p0.p0.i64(ptr %d, \
+             ptr %s, i64 8, i1 false)\n  ret void\n}\n",
+            "declare void @llvm.memcpy.inline.p0.p0.i64(ptr, ptr, i64, i1)\n",
+            "define i32 @f(i32 %x) {\n  %r = call i32 @llvm.abs.i32(i32 %x, i1 false)\n  \
+             ret i32 %r\n}\n",
+        ] {
+            import_text(src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+    }
+
+    /// LLVM's parser keeps the last `target triple`, whatever its bytes;
+    /// `import_text` passed over a last triple that is not UTF-8 for an
+    /// earlier one, so a module stating an Apple triple and then
+    /// `aarch64-unknown-linux-gnu\FF` had its `\01_bar` label read as
+    /// Mach-O's `bar` where llc writes ELF's `_bar` (5 and 9: the seventh
+    /// verifier round of L02-P15). Such a triple is refused by name; with a
+    /// compile target, which takes the module triple's place, it is not read.
+    #[test]
+    fn the_last_target_triple_is_read_whatever_its_bytes() {
+        let src = "target triple = \"arm64-apple-macosx14.0.0\"\n\
+                   target triple = \"aarch64-unknown-linux-gnu\\FF\"\n\
+                   declare i64 @\"\\01_bar\"()\n\
+                   define i64 @f() {\n  %r = call i64 @\"\\01_bar\"()\n  ret i64 %r\n}\n";
+        let reason = unsupported_reason(src);
+        assert!(
+            reason.contains("the triple's bytes are not UTF-8"),
+            "{src}: {reason}"
+        );
+        let module = import_text_for_target(src, "t", "aarch64-apple-darwin")
+            .unwrap_or_else(|error| panic!("{src}: {error}"));
+        assert!(module.functions.iter().any(|f| f.name == "bar"));
+        // The last triple, not an earlier one, names the object format.
+        let src = "target triple = \"arm64-apple-macosx14.0.0\"\n\
+                   target triple = \"aarch64-unknown-linux-gnu\"\n\
+                   declare i64 @\"\\01_bar\"()\n\
+                   define i64 @f() {\n  %r = call i64 @\"\\01_bar\"()\n  ret i64 %r\n}\n";
+        let reason = unsupported_reason(src);
+        assert!(
+            reason.contains("whose object format is not Mach-O"),
+            "{src}: {reason}"
+        );
+    }
+
+    /// LLVM reads an intrinsic by its IR name (`Function::isIntrinsic`:
+    /// `llvm.` at its start), which for a `\01` asm label starts with the
+    /// `\01` byte: `@"\01_llvm.assume"` is the ordinary Mach-O function
+    /// `_llvm.assume`, which llc 22 calls. The importer carries a label by
+    /// the name after `\01_`, so it dropped such a call, lowered it as the
+    /// intrinsic or called libm's `_sin`, and exempted a declaration of one
+    /// from the signing check (fifth verifier round of L02-P15; all but the
+    /// exemption pre-existing). Such a label is refused by name.
+    #[test]
+    fn mach_o_labels_spelling_llvm_names_are_no_intrinsics() {
+        let apple = "target triple = \"arm64-apple-macosx14.0.0\"\n";
+        let needle = "LLVM reads it as the ordinary Mach-O symbol";
+        for (src, label) in [
+            (
+                "declare void @\"\\01_llvm.assume\"(i1)\ndefine i64 @f() {\n  \
+                 call void @\"\\01_llvm.assume\"(i1 true)\n  ret i64 1\n}\n",
+                "_llvm.assume",
+            ),
+            (
+                "declare double @\"\\01_llvm.sin.f64\"(double)\ndefine double @f(double %x) {\n  \
+                 %r = call double @\"\\01_llvm.sin.f64\"(double %x)\n  ret double %r\n}\n",
+                "_llvm.sin.f64",
+            ),
+            (
+                "define double @\"\\01_llvm.sin.f64\"(double %x) {\n  ret double 4.0\n}\n\
+                 define double @f(double %x) {\n  %r = call double @llvm.sin.f64(double %x)\n  \
+                 ret double %r\n}\n",
+                "_llvm.sin.f64",
+            ),
+            (
+                "declare void @\"\\01_llvm.memcpy.p0.p0.i64\"(ptr, ptr, i64, i1)\n\
+                 define void @f(ptr %d, ptr %s) {\n  \
+                 call void @\"\\01_llvm.memcpy.p0.p0.i64\"(ptr %d, ptr %s, i64 8, i1 false)\n  \
+                 ret void\n}\n",
+                "_llvm.memcpy.p0.p0.i64",
+            ),
+            (
+                "declare void @\"\\01_llvm.assume\"(i1) \"sign-return-address-key\"=\"a_key\"\n",
+                "_llvm.assume",
+            ),
+            (
+                "declare void @\"\\01_\\6Clvm.donothing\"()\ndefine i64 @f() {\n  \
+                 call void @\"\\01_\\6Clvm.donothing\"()\n  ret i64 1\n}\n",
+                "_llvm.donothing",
+            ),
+            ("@\"\\01_llvm.used\" = global i64 1\n", "_llvm.used"),
+        ] {
+            let src = format!("{apple}{src}");
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains(needle) && reason.contains(&format!("`{label}`")),
+                "{src}: {reason}"
+            );
+        }
+        // Only an IR name that starts with `llvm.` is an intrinsic's: the
+        // key alone on another declaration is still refused.
+        for name in ["x.llvm.assume", "\"\\01_x.llvm.assume\""] {
+            let src =
+                format!("{apple}declare void @{name}(i1) \"sign-return-address-key\"=\"a_key\"\n");
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains("without `\"sign-return-address\"`"),
+                "{src}: {reason}"
+            );
+        }
+        // The intrinsic itself, and a label whose name only starts alike.
+        for src in [
+            "declare void @llvm.assume(i1)\ndefine i64 @f() {\n  \
+             call void @llvm.assume(i1 true)\n  ret i64 1\n}\n",
+            "declare void @\"llvm.assume\"(i1)\ndefine i64 @f() {\n  \
+             call void @\"llvm.assume\"(i1 true)\n  ret i64 1\n}\n",
+            "declare i64 @\"\\01_llvmx\"()\ndefine i64 @f() {\n  \
+             %r = call i64 @\"\\01_llvmx\"()\n  ret i64 %r\n}\n",
+        ] {
+            let src = format!("{apple}{src}");
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+    }
+
+    /// A call the importer drops or lowers as an intrinsic names it as
+    /// LLVM's `Intrinsic::lookupIntrinsicID` does: exactly, or for an
+    /// overloaded intrinsic with `.` and a type suffix, and not a longer
+    /// intrinsic LLVM defines. llc 22 calls `llvm.assumex`,
+    /// `llvm.sideeffect.x` or `llvm.memcpyx` as ordinary external functions,
+    /// which the importer dropped or lowered as `memcpy` (fifth verifier
+    /// round of L02-P15, pre-existing); `llvm.memcpy.inline` is a distinct
+    /// intrinsic that llc expands without a call.
+    #[test]
+    fn intrinsic_calls_are_matched_as_llvm_names_them() {
+        let call = |decl: &str, call: &str| {
+            format!(
+                "target triple = \"aarch64-unknown-linux-gnu\"\n{decl}\n\
+                 define i64 @f(ptr %p, ptr %q) {{\n  {call}\n  ret i64 1\n}}\n"
+            )
+        };
+        for (decl, text, name) in [
+            (
+                "declare void @llvm.assumex(i1)",
+                "call void @llvm.assumex(i1 true)",
+                "llvm.assumex",
+            ),
+            (
+                "declare void @llvm.assume.x(i1)",
+                "call void @llvm.assume.x(i1 true)",
+                "llvm.assume.x",
+            ),
+            (
+                "declare void @llvm.donothing2()",
+                "call void @llvm.donothing2()",
+                "llvm.donothing2",
+            ),
+            (
+                "declare void @llvm.sideeffect.x()",
+                "call void @llvm.sideeffect.x()",
+                "llvm.sideeffect.x",
+            ),
+            (
+                "declare void @llvm.dbg.custom(metadata)",
+                "call void @llvm.dbg.custom(metadata i64 0)",
+                "llvm.dbg.custom",
+            ),
+            (
+                "declare void @llvm.prefetchx(ptr, i32, i32, i32)",
+                "call void @llvm.prefetchx(ptr %p, i32 0, i32 3, i32 1)",
+                "llvm.prefetchx",
+            ),
+            (
+                "declare void @llvm.lifetime.startx(ptr)",
+                "call void @llvm.lifetime.startx(ptr %p)",
+                "llvm.lifetime.startx",
+            ),
+            (
+                "declare void @llvm.memcpyx(ptr, ptr, i64)",
+                "call void @llvm.memcpyx(ptr %p, ptr %q, i64 8)",
+                "llvm.memcpyx",
+            ),
+            (
+                "declare void @llvm.memcpy.inline.p0.p0.i64(ptr, ptr, i64, i1)",
+                "call void @llvm.memcpy.inline.p0.p0.i64(ptr %p, ptr %q, i64 8, i1 false)",
+                "llvm.memcpy.inline.p0.p0.i64",
+            ),
+            (
+                "declare void @llvm.memset.inline.p0.i64(ptr, i8, i64, i1)",
+                "call void @llvm.memset.inline.p0.i64(ptr %p, i8 0, i64 8, i1 false)",
+                "llvm.memset.inline.p0.i64",
+            ),
+            (
+                "declare void @llvm.memmove.element.unordered.atomic.p0.p0.i64(ptr, ptr, i64, \
+                 i32)",
+                "call void @llvm.memmove.element.unordered.atomic.p0.p0.i64(ptr align 8 %p, \
+                 ptr align 8 %q, i64 16, i32 8)",
+                "llvm.memmove.element.unordered.atomic.p0.p0.i64",
+            ),
+        ] {
+            let src = call(decl, text);
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains(&format!(
+                    "LLVM intrinsic call `@{name}` (no intrinsic lowering)"
+                )),
+                "{src}: {reason}"
+            );
+        }
+        for (decl, text) in [
+            (
+                "declare void @llvm.assume(i1)",
+                "call void @llvm.assume(i1 true)",
+            ),
+            (
+                "declare void @llvm.donothing()",
+                "call void @llvm.donothing()",
+            ),
+            (
+                "declare void @llvm.sideeffect()",
+                "call void @llvm.sideeffect()",
+            ),
+            (
+                "declare void @llvm.lifetime.start.p0(ptr)",
+                "call void @llvm.lifetime.start.p0(ptr %p)",
+            ),
+            (
+                "declare void @llvm.prefetch.p0(ptr, i32, i32, i32)",
+                "call void @llvm.prefetch.p0(ptr %p, i32 0, i32 3, i32 1)",
+            ),
+            (
+                "declare void @llvm.var.annotation.p0.p0(ptr, ptr, ptr, i32, ptr)",
+                "call void @llvm.var.annotation.p0.p0(ptr %p, ptr %q, ptr %q, i32 1, ptr null)",
+            ),
+            (
+                "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)",
+                "call void @llvm.memcpy.p0.p0.i64(ptr %p, ptr %q, i64 8, i1 false)",
+            ),
+        ] {
+            let src = call(decl, text);
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+        assert!(names_intrinsic(
+            "llvm.lifetime.end.p0",
+            "llvm.lifetime.end",
+            true
+        ));
+        assert!(!names_intrinsic("llvm.assume.p0", "llvm.assume", false));
+        assert!(!names_intrinsic(
+            "llvm.lifetime.endx",
+            "llvm.lifetime.end",
+            true
+        ));
+    }
+
+    /// On a RISC-V triple llc 22 selects each function's calling convention
+    /// from its features (`RISCVABI::computeTargetABI` without a
+    /// `target-abi`: `e` gives `lp64e`, otherwise `d` `lp64d`, `f` `lp64f`
+    /// and neither the soft-float `lp64`), and the importer read `+e`, `+d`
+    /// and `+f` as instruction-set extensions while its backend builds
+    /// `lp64d` (fifth verifier round of L02-P15, pre-existing). `lp64e`
+    /// passes six arguments in registers, and `lp64` and `lp64f` place a
+    /// floating-point value where `lp64d` does not, while all three place
+    /// integers alike: a RISC-V definition is refused under `lp64e`, and
+    /// under `lp64` or `lp64f` when its text, or a named type of the module,
+    /// names a floating-point or vector type.
+    #[test]
+    fn riscv_definitions_are_refused_where_llcs_convention_differs() {
+        let rv64 = "target triple = \"riscv64-unknown-linux-gnu\"\n";
+        let int = |attrs: &str| format!("define i64 @f(i64 %x) {attrs} {{\n  ret i64 %x\n}}\n");
+        let dbl = |attrs: &str| {
+            format!(
+                "define double @f(double %x) {attrs} {{\n  %r = fadd double %x, %x\n  \
+                 ret double %r\n}}\n"
+            )
+        };
+        let soft = "the function with `lp64f` or the soft-float `lp64`";
+        for (src, needle) in [
+            (format!("{rv64}{}", dbl("")), soft),
+            (
+                format!("{rv64}{}", dbl("\"target-features\"=\"+m,+f\"")),
+                soft,
+            ),
+            (
+                format!("{rv64}{}", dbl("\"target-cpu\"=\"sifive-s51\"")),
+                soft,
+            ),
+            (
+                format!(
+                    "{rv64}define i64 @f(i64 %x) {{\n  %d = sitofp i64 %x to double\n  \
+                     %r = fptosi double %d to i64\n  ret i64 %r\n}}\n"
+                ),
+                soft,
+            ),
+            (
+                format!(
+                    "{rv64}define i64 @f(i64 %x) {{\n  \
+                     %v = insertelement <2 x i64> poison, i64 %x, i32 0\n  \
+                     %r = extractelement <2 x i64> %v, i32 0\n  ret i64 %r\n}}\n"
+                ),
+                soft,
+            ),
+            (
+                format!(
+                    "{rv64}declare double @g(double)\ndefine i64 @f(i64 %x) {{\n  \
+                     %r = call double @g(double 1.0)\n  ret i64 %x\n}}\n"
+                ),
+                soft,
+            ),
+            // A named type may carry a `double` into a signature by name.
+            (
+                format!("{rv64}%S = type {{ i64, double }}\n{}", int("")),
+                soft,
+            ),
+            (
+                format!("{rv64}{}", int("\"target-features\"=\"+e\"")),
+                "`+e` selects llc's `lp64e`",
+            ),
+            (
+                format!("{rv64}{}", dbl("\"target-features\"=\"+e,+d\"")),
+                "`+e` selects llc's `lp64e`",
+            ),
+            (
+                format!(
+                    "{rv64}{}attributes #0 = {{ \"target-features\"=\"+e\" }}\n",
+                    int("\"target-features\"=\"+d\" #0")
+                ),
+                "`+e` selects llc's `lp64e`",
+            ),
+            (
+                format!(
+                    "target triple = \"riscv32-unknown-elf\"\n{}",
+                    int("\"target-features\"=\"+d\"")
+                ),
+                "for a 32-bit RISC-V target",
+            ),
+            (
+                format!(
+                    "target triple = \"riscv64be-unknown-elf\"\n{}",
+                    dbl("\"tune-cpu\"=\"sifive-u74\"")
+                ),
+                soft,
+            ),
+        ] {
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains("function definition `@f`")
+                    && reason.contains(needle)
+                    && reason.contains("this importer's backend builds `lp64d`"),
+                "{src}: {reason}"
+            );
+        }
+        for src in [
+            // Integers are placed alike under `lp64`, `lp64f` and `lp64d`.
+            format!("{rv64}{}", int("")),
+            format!("{rv64}%T = type {{ i64, ptr }}\n{}", int("")),
+            format!("{rv64}{}", int("\"target-features\"=\"+m,+f\"")),
+            format!("{rv64}{}", int("\"target-cpu\"=\"sifive-s51\"")),
+            format!("{rv64}{}", dbl("\"target-features\"=\"+m,+a,+f,+d,+c\"")),
+            format!("{rv64}{}", dbl("\"target-features\"=\"+v\"")),
+            format!("{rv64}{}", dbl("\"target-cpu\"=\"sifive-u74\"")),
+            format!(
+                "{rv64}{}attributes #0 = {{ \"target-cpu\"=\"sifive-s51\" \
+                 \"target-features\"=\"+d\" }}\n",
+                dbl("#0")
+            ),
+            // A declaration builds no code: llc lowers a call by the caller's
+            // convention.
+            format!(
+                "{rv64}declare double @g(double) \"target-features\"=\"+e\"\n{}",
+                dbl("\"target-features\"=\"+d\"")
+            ),
+            // `+e` is no AArch64 feature: llc ignores it with a warning.
+            format!(
+                "target triple = \"aarch64-unknown-linux-gnu\"\n{}",
+                dbl("\"target-features\"=\"+e\"")
+            ),
+            dbl(""),
+        ] {
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+        assert!(!mentions_floating_point_or_vector(
+            "define i64 @float(i64 %double) {",
+            &[(2, "  ret i64 %double".to_string())],
+        ));
+    }
+
+    /// The RISC-V rule reads the compile target, not the module's triple
+    /// alone: a module stating no triple, compiled for `riscv64`, is built
+    /// with llc's convention for its features (the sixth verifier round of
+    /// L02-P15 found `+e` admitted there: the backend read the seventh and
+    /// eighth `i64` arguments from `a6`/`a7`, LLVM 22's `rv64e.ll` test and
+    /// LLVM 18's llc from the stack). With no target known, a definition
+    /// stating a feature that selects a RISC-V convention is read as for
+    /// 64-bit RISC-V; one stating none is left to the caller's target.
+    #[test]
+    fn riscv_definitions_are_read_for_the_compile_target() {
+        let int = |attrs: &str| format!("define i64 @f(i64 %x) {attrs} {{\n  ret i64 %x\n}}\n");
+        let dbl = |attrs: &str| {
+            format!(
+                "define double @f(double %x) {attrs} {{\n  %r = fadd double %x, %x\n  \
+                 ret double %r\n}}\n"
+            )
+        };
+        let e = int("\"target-features\"=\"+e\"");
+        let f_only = dbl("\"target-features\"=\"+m,+f\"");
+        // A floating-point value passed by a named type only: the named
+        // types are read with no target known too (the seventh verifier
+        // round of L02-P15 found a mutant reading them only for a known
+        // RISC-V target surviving).
+        let named_f = "%T = type { double }\n\
+                       define i64 @f(i64 %x) \"target-features\"=\"+m,+f\" {\n  \
+                       %p = alloca %T\n  ret i64 %x\n}\n"
+            .to_string();
+        let lp64e = "`+e` selects llc's `lp64e`";
+        let soft = "the function with `lp64f` or the soft-float `lp64`";
+        let unknown = "no target is known";
+        let undefined = "a module with no known target may be compiled for";
+        for (module_triple, target, src, needles) in [
+            ("", Some("riscv64-unknown-linux-gnu"), &e, &[lp64e][..]),
+            ("", Some("riscv64-unknown-unknown"), &e, &[lp64e]),
+            ("", Some("riscv64"), &f_only, &[soft]),
+            ("", Some("riscv64-unknown-unknown"), &dbl(""), &[soft]),
+            (
+                "aarch64-unknown-linux-gnu",
+                Some("riscv64-unknown-linux-gnu"),
+                &e,
+                &[lp64e],
+            ),
+            ("", None, &e, &[lp64e, unknown]),
+            ("", None, &f_only, &[soft, unknown]),
+            ("", None, &named_f, &[soft, unknown]),
+            ("", Some("riscv64-unknown-linux-gnu"), &named_f, &[soft]),
+            (
+                "",
+                None,
+                &dbl("\"target-features\"=\"+zfh\""),
+                &[soft, unknown],
+            ),
+            // With no target known a RISC-V processor name is refused
+            // before the convention is read: AArch64 and x86 do not define
+            // it (`attributes::ProcessorTable`).
+            (
+                "",
+                None,
+                &dbl("\"target-features\"=\"+f\" \"target-cpu\"=\"sifive-u74\""),
+                &[undefined],
+            ),
+            (
+                "",
+                None,
+                &dbl("\"target-cpu\"=\"sifive-s51\" \"target-features\"=\"+m\""),
+                &[undefined],
+            ),
+        ] {
+            let src = format!("target triple = \"{module_triple}\"\n{src}");
+            let result = match target {
+                Some(target) => import_text_for_target(&src, "t", target),
+                None => import_text(&src, "t"),
+            };
+            let reason = result.map(drop).expect_err("refused").to_string();
+            assert!(
+                needles.iter().all(|needle| reason.contains(needle)),
+                "{src} {target:?}: {reason}"
+            );
+        }
+        for (module_triple, target, src) in [
+            // llc ignores `+e`, no AArch64 or x86-64 feature, with a warning.
+            (
+                "riscv64-unknown-linux-gnu",
+                Some("aarch64-unknown-linux-gnu"),
+                e.clone(),
+            ),
+            ("", Some("x86_64-unknown-linux-gnu"), e.clone()),
+            ("", Some("aarch64-apple-darwin"), dbl("")),
+            // No target known: `d` selects `lp64d`, the backend's.
+            ("", None, dbl("\"target-features\"=\"+m,+d\"")),
+            // `sifive-u74` implies `d`.
+            (
+                "",
+                Some("riscv64-unknown-linux-gnu"),
+                dbl("\"target-features\"=\"+f\" \"target-cpu\"=\"sifive-u74\""),
+            ),
+            ("", None, int("\"target-features\"=\"+m,+f\"")),
+            // A definition stating no such feature is not read for RISC-V
+            // without a target (`import_text_for_target` reads it by its
+            // target, above).
+            ("", None, dbl("")),
+            (
+                "",
+                None,
+                dbl("\"target-cpu\"=\"generic\" \"target-features\"=\"+m\""),
+            ),
+        ] {
+            let src = format!("target triple = \"{module_triple}\"\n{src}");
+            match target {
+                Some(target) => import_text_for_target(&src, "t", target).map(drop),
+                None => import_text(&src, "t").map(drop),
+            }
+            .unwrap_or_else(|error| panic!("{src} {target:?}: {error}"));
+        }
+    }
+
+    /// LLVM 22's verifier checks one function's or call's attributes
+    /// together: `"sign-return-address-key"` without
+    /// `"sign-return-address"` is rejected, inline or through a group, on a
+    /// definition, a declaration and a call. The third verifier round of
+    /// L02-P15 found the key alone imported; each case was run through
+    /// llc 22.
+    #[test]
+    fn a_signing_key_without_its_scope_is_refused() {
+        let needle = "attribute `\"sign-return-address-key\"` without `\"sign-return-address\"`";
+        for triple in ["", "target triple = \"aarch64-unknown-linux-gnu\"\n"] {
+            for (src, subject) in [
+                (
+                    "define i64 @f() \"sign-return-address-key\"=\"a_key\" {\n  ret i64 1\n}\n",
+                    "`@f`",
+                ),
+                (
+                    "define i64 @f() #0 {\n  ret i64 1\n}\n\
+                     attributes #0 = { \"sign-return-address-key\"=\"b_key\" }\n",
+                    "`@f`",
+                ),
+                (
+                    "define i64 @f() \"sign-return-address\\2Dkey\"=\"a_key\" {\n  ret i64 1\n}\n",
+                    "`@f`",
+                ),
+                (
+                    "declare i64 @g() \"sign-return-address-key\"=\"a_key\"\n",
+                    "`@g`",
+                ),
+                (
+                    "declare i64 @g()\ndefine i64 @f() {\n  \
+                     %r = call i64 @g() \"sign-return-address-key\"=\"a_key\"\n  ret i64 %r\n}\n",
+                    "call to `@g`",
+                ),
+                (
+                    "declare i64 @g()\ndefine i64 @f() {\n  %r = call i64 @g() #0\n  \
+                     ret i64 %r\n}\nattributes #0 = { \"sign-return-address-key\"=\"a_key\" }\n",
+                    "call to `@g`",
+                ),
+                // A call's attributes are its own: the callee's scope is not
+                // among them.
+                (
+                    "declare i64 @g() \"sign-return-address\"=\"none\"\ndefine i64 @f() {\n  \
+                     %r = call i64 @g() \"sign-return-address-key\"=\"a_key\"\n  ret i64 %r\n}\n",
+                    "call to `@g`",
+                ),
+            ] {
+                let src = format!("{triple}{src}");
+                let reason = unsupported_reason(&src);
+                assert!(
+                    reason.contains(needle) && reason.contains(subject),
+                    "{src}: {reason}"
+                );
+            }
+            for src in [
+                "define i64 @f() \"sign-return-address\"=\"none\" \
+                 \"sign-return-address-key\"=\"a_key\" {\n  ret i64 1\n}\n",
+                "define i64 @f() \"sign-return-address\"=\"none\" #0 {\n  ret i64 1\n}\n\
+                 attributes #0 = { \"sign-return-address-key\"=\"a_key\" }\n",
+                "define i64 @f() #0 \"sign-return-address-key\"=\"b_key\" {\n  ret i64 1\n}\n\
+                 attributes #0 = { \"sign-return-address\"=\"none\" }\n",
+                "define i64 @f() #0 {\n  ret i64 1\n}\nattributes #0 = { \
+                 \"sign-return-address\"=\"none\" \"sign-return-address-key\"=\"a_key\" }\n",
+                "define i64 @f() \"sign-return-address\"=\"none\" {\n  ret i64 1\n}\n",
+                "declare i64 @g()\ndefine i64 @f() {\n  \
+                 %r = call i64 @g() \"sign-return-address-key\"=\"a_key\" #0\n  ret i64 %r\n}\n\
+                 attributes #0 = { \"sign-return-address\"=\"none\" }\n",
+                // A group no function or call uses refuses nothing.
+                "define i64 @f() {\n  ret i64 1\n}\n\
+                 attributes #0 = { \"sign-return-address-key\"=\"a_key\" }\n",
+            ] {
+                let src = format!("{triple}{src}");
+                import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+            }
+        }
+    }
+
+    /// LLVM's verifier checks the signing attributes of every call, a call
+    /// to an intrinsic the importer drops (`llvm.assume`, `llvm.lifetime.*`)
+    /// included, so llc rejects the key without its scope there, and a value
+    /// other than `none`/`all`/`non-leaf` or `a_key`/`b_key`; the importer,
+    /// which read no attribute of a dropped call, imported them. LLVM's
+    /// parser replaces an intrinsic declaration's attributes with the
+    /// intrinsic's own, so llc accepts the key alone on
+    /// `declare void @llvm.assume(i1)`, which the importer refused. Both
+    /// found by the fourth verifier round of L02-P15; each case was run
+    /// through llc 22.
+    #[test]
+    fn signing_checks_reach_dropped_calls_and_skip_intrinsic_declarations() {
+        let triple = "target triple = \"aarch64-unknown-linux-gnu\"\n";
+        let assume = "declare void @llvm.assume(i1)\n";
+        let lifetime = "declare void @llvm.lifetime.start.p0(ptr)\n";
+        let body = |decl: &str, call: &str, groups: &str| {
+            format!("{triple}{decl}define i64 @f(ptr %p) {{\n  {call}\n  ret i64 1\n}}\n{groups}")
+        };
+        let key_alone = "attribute `\"sign-return-address-key\"` without `\"sign-return-address\"`";
+        let bad_value = "a `\"sign-return-address\"` other than `none`, `all` or `non-leaf`";
+        for (src, needle) in [
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) \"sign-return-address-key\"=\"a_key\"",
+                    "",
+                ),
+                key_alone,
+            ),
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) #0",
+                    "attributes #0 = { \"sign-return-address-key\"=\"a_key\" }\n",
+                ),
+                key_alone,
+            ),
+            (
+                body(
+                    lifetime,
+                    "call void @llvm.lifetime.start.p0(ptr %p) \"sign-return-address-key\"=\"b_key\"",
+                    "",
+                ),
+                key_alone,
+            ),
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) \"sign-return-address-key\"=\"a_key\" \
+                     [ \"align\"(ptr %p, i64 8) ]",
+                    "",
+                ),
+                key_alone,
+            ),
+            // A refused attribute in the group stops nothing: the key is
+            // still seen.
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) #0",
+                    "attributes #0 = { \"target-cpu\"=\"thunderx3t110\" \
+                     \"sign-return-address-key\"=\"a_key\" }\n",
+                ),
+                key_alone,
+            ),
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) \"sign-return-address\"=\"none\" \
+                     \"sign-return-address-key\"=\"c_key\"",
+                    "",
+                ),
+                bad_value,
+            ),
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) \"sign-return-address\"=\"bogus\"",
+                    "",
+                ),
+                bad_value,
+            ),
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) \"sign-return-address\"",
+                    "",
+                ),
+                bad_value,
+            ),
+            (
+                body(
+                    assume,
+                    "call void @llvm.assume(i1 true) #0",
+                    "attributes #0 = { \"sign-return-address\"=\"bogus\" }\n",
+                ),
+                bad_value,
+            ),
+        ] {
+            let reason = unsupported_reason(&src);
+            assert!(
+                reason.contains(needle) && reason.contains("call to `@llvm."),
+                "{src}: {reason}"
+            );
+        }
+        for src in [
+            // Every value LLVM's verifier reads, with or without the key: a
+            // dropped call builds no code for them.
+            body(
+                assume,
+                "call void @llvm.assume(i1 true) \"sign-return-address\"=\"all\" \
+                 \"sign-return-address-key\"=\"b_key\"",
+                "",
+            ),
+            body(
+                assume,
+                "call void @llvm.assume(i1 true) \"sign-return-address\"=\"non-leaf\"",
+                "",
+            ),
+            body(
+                assume,
+                "call void @llvm.assume(i1 true) #0 \"sign-return-address-key\"=\"a_key\"",
+                "attributes #0 = { \"sign-return-address\"=\"none\" }\n",
+            ),
+            // An operand bundle's tag and an attribute's value are no keys.
+            body(
+                "declare void @llvm.donothing()\n",
+                "call void @llvm.donothing() [ \"sign-return-address-key\"(ptr %p) ]",
+                "",
+            ),
+            body(
+                assume,
+                "call void @llvm.assume(i1 true) \"note\"=\"sign-return-address-key\"",
+                "",
+            ),
+            body(
+                assume,
+                "call void @llvm.assume(i1 true) \"sign-return-address\"=\"none\" \
+                 [ \"align\"(ptr %p, i64 8) ]",
+                "",
+            ),
+            // An intrinsic declaration's attributes are replaced by LLVM's
+            // parser.
+            format!(
+                "{triple}declare void @llvm.assume(i1) \"sign-return-address-key\"=\"a_key\"\n\
+                 define i64 @f() {{\n  ret i64 1\n}}\n"
+            ),
+            format!(
+                "{triple}declare void @llvm.assume(i1) #0\ndefine i64 @f() {{\n  \
+                 call void @llvm.assume(i1 true)\n  ret i64 1\n}}\n\
+                 attributes #0 = {{ \"sign-return-address-key\"=\"a_key\" }}\n"
+            ),
+        ] {
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+        // A declaration of any other name keeps the check.
+        let reason = unsupported_reason(&format!(
+            "{triple}declare i64 @llvmassume() \"sign-return-address-key\"=\"a_key\"\n"
+        ));
+        assert!(reason.contains(key_alone), "{reason}");
+        // A quoted name is read decoded: LLVM reads an overloaded intrinsic
+        // by its name and a `.`, whatever follows, remangles it and replaces
+        // its attributes, so llc 22.1.2 accepts the key alone below (it
+        // prints `@llvm.fmuladd.v4f64`); the declaration's vector signature
+        // is not modelled, so nothing else reads it. Reading the spelled
+        // name, which starts with `"`, refuses it (sixth verifier round of
+        // L02-P15: the fifth repair's mutant `decl-ir-name-undecoded` was
+        // claimed equivalent). A plain name spelled with escapes is that
+        // plain name.
+        for decl in [
+            "declare <4 x double> @\"llvm.fmuladd.a b\"(<4 x double>, <4 x double>, \
+             <4 x double>) \"sign-return-address-key\"=\"a_key\"",
+            "declare void @\"llvm.\\61ssume\"(i1) \"sign-return-address-key\"=\"a_key\"",
+        ] {
+            let src = format!("{triple}{decl}\ndefine i64 @f() {{\n  ret i64 1\n}}\n");
+            import_text(&src, "t").unwrap_or_else(|error| panic!("{src}: {error}"));
+        }
+        // A quoted name whose signature is modelled is registered, and the
+        // quoted-name rule refuses it as an external symbol (llc accepts
+        // the overloaded one, which it remangles: a stated over-refusal).
+        let reason = unsupported_reason(&format!(
+            "{triple}declare void @\"llvm.memcpy.s_struct.a bs\"(ptr, ptr, i64, i1) \
+             \"sign-return-address-key\"=\"a_key\"\ndefine i64 @f() {{\n  ret i64 1\n}}\n"
+        ));
+        assert!(
+            reason.contains("is carried only for an internal or private definition"),
+            "{reason}"
+        );
+    }
+
+    /// Comdat names and metadata names are rewritten to LLVM's decoded
+    /// spelling (`$"\66oo"` is the comdat `$foo`, which a function's own
+    /// `comdat` names), and a decoded metadata name keeps the escape of a
+    /// leading digit: `!\30` is the named metadata `0`, never the node `!0`.
+    #[test]
+    fn comdat_and_metadata_names_are_read_as_llvm_decodes_them() {
+        let m = import_text(
+            "$\"\\66oo\" = comdat any\n$bar = comdat any\n\
+             define linkonce_odr i64 @foo() comdat {\n  ret i64 7\n}\n\
+             define linkonce_odr i64 @bar() comdat($\"b\\61r\") {\n  ret i64 8\n}\n",
+            "t",
+        )
+        .expect("escaped comdat names");
+        assert_eq!(func_named(&m, "foo").blocks.len(), 1);
+        assert_eq!(func_named(&m, "bar").blocks.len(), 1);
+        import_text(
+            "define i64 @f() {\n  ret i64 1\n}\n!\\30 = !{!0}\n!0 = !{}\n",
+            "t",
+        )
+        .expect("`!\\30` is the named metadata `0`, `!0` a node");
+        let reason = unsupported_reason("!\\30 = !{!0}\n");
+        assert!(
+            reason.contains("use of undefined metadata `!0`"),
+            "{reason}"
+        );
+    }
+
+    /// String attributes read as LLVM decodes them: an escaped spelling of a
+    /// read key or value is read, and `\\` is one backslash, so a `\2C`
+    /// after it is no comma.
+    #[test]
+    fn escaped_string_attributes_llvm_reads_alike_are_read() {
+        import_text(
+            "define i64 @f() #0 {\n  ret i64 5\n}\n\
+             attributes #0 = { \"no\\2Dtrapping-math\"=\"true\" \
+             \"stack-protector-buffer-size\"=\"\\38\" \"target-features\"=\"+neon\\2C+v8a\" \
+             \"target-features\"=\"+neon\\\\2C+strict-align\" \"probe-stack\"=\"inline\\2Dasm\" \
+             \"frame-pointer\"=\"non\\2Dleaf\" \"denormal-fp-math\"=\"preserve-sign,ieee\" \
+             \"denormal-fp-math-f32\"=\",dynamic\" \"warn-stack-size\"=\"0100\" \
+             \"sign-return-address\"=\"none\" \"sign-return-address-key\"=\"b_key\" \
+             \"target-features\"=\"\" \"stack-probe-size\"=\"65536\" }\n",
+            "t",
+        )
+        .expect("escaped spellings of read attributes");
+    }
+
+    /// Floating-point and integer literals are read as LLVM's lexer and
+    /// parser read them: the verifier's `ret double 2` and `float
+    /// 0x3FB999999999999A` imported where llc rejects them.
+    #[test]
+    fn literals_are_read_as_llvm_reads_them() {
+        let ret = |ty: &str, value: &str| format!("define {ty} @f() {{\n  ret {ty} {value}\n}}\n");
+        for (src, needle) in [
+            (ret("double", "2"), "an integer literal"),
+            (ret("float", "0x3FB999999999999A"), "cannot hold exactly"),
+            (ret("float", "0.1"), "cannot hold exactly"),
+            (ret("float", "1.0e39"), "cannot hold exactly"),
+            (ret("half", "0.1"), "cannot hold exactly"),
+            (ret("half", "65520.0"), "cannot hold exactly"),
+            (ret("half", "0x3E70000000000001"), "cannot hold exactly"),
+            (
+                ret("float", "0xH3C00"),
+                "a half (`0xH`) literal for another type",
+            ),
+            (ret("double", "inf"), "not an LLVM floating-point literal"),
+            (ret("double", "nan"), "not an LLVM floating-point literal"),
+            // LLVM's lexer splits these (`0` and a word, `1` and `e5`) or
+            // rejects them (`.5`); the token pass refuses them first.
+            (ret("double", "0X3FF0000000000000"), "LLVM's lexer"),
+            (ret("double", "0xh3C00"), "LLVM's lexer"),
+            (ret("double", "1e5"), "LLVM's lexer"),
+            (ret("double", ".5"), "LLVM's lexer"),
+            (ret("float", "0x7FF4000000000000"), "a signaling NaN"),
+            (ret("float", "0x7FF8000000000001"), "cannot hold exactly"),
+            // A `0xH` signaling NaN, positive or negative, with any payload.
+            (ret("half", "0xH7C01"), "a signaling NaN"),
+            (ret("half", "0xHFC01"), "a signaling NaN"),
+            (ret("half", "0xH7DFF"), "a signaling NaN"),
+            (ret("half", "0x7FF0040000000000"), "a signaling NaN"),
+            // A NaN payload below half's ten fraction bits, and values below
+            // half's least subnormal (2^-25 is a 53-bit shift, 1.0e-15 a
+            // shift past 64).
+            (ret("half", "0x7FF8000000000001"), "cannot hold exactly"),
+            (ret("half", "0x7FF8020000000000"), "cannot hold exactly"),
+            (ret("half", "0x3E60000000000000"), "cannot hold exactly"),
+            (ret("half", "1.0e-15"), "cannot hold exactly"),
+            (
+                ret("half", "-4.9406564584124654e-324"),
+                "cannot hold exactly",
+            ),
+            (
+                "define double @f(i1 %c) {\nentry:\n  br i1 %c, label %a, label %b\na:\n  \
+                 br label %b\nb:\n  %r = phi double [ true, %entry ], [ 1.0, %a ]\n  \
+                 ret double %r\n}\n"
+                    .to_string(),
+                "`true` as a floating-point constant",
+            ),
+            (ret("double", "true"), "as a floating-point constant"),
+            (ret("double", "null"), "as a floating-point constant"),
+            (
+                "@g = global float 3.14\n".to_string(),
+                "cannot hold exactly",
+            ),
+            ("@g = global double 2\n".to_string(), "an integer literal"),
+            (
+                "@g = global [2 x float] [float 1.0, float 0.1]\n".to_string(),
+                "cannot hold exactly",
+            ),
+            (ret("i32", "0x10"), "unknown operand token `0x10`"),
+        ] {
+            let error = import_text(&src, "t").expect_err(&src);
+            assert!(error.to_string().contains(needle), "{src}: {error}");
+        }
+        for (ty, value, expected) in [
+            ("float", "0x3FB99999A0000000", f64::from(0.1f32)),
+            ("float", "1.5e0", 1.5),
+            ("float", "+2.5", 2.5),
+            ("float", "-0.0", -0.0),
+            ("float", "0x7FF8000000000000", f64::NAN),
+            ("float", "0x47EFFFFFE0000000", f64::from(f32::MAX)),
+            ("half", "0xH3C00", 1.0),
+            // A `0xH` quiet NaN keeps its sign and payload, as the double
+            // spelling of the same NaN does: the first verifier round of
+            // L02-P15 found `0xHFE00` imported as +qNaN (`0x7e00`).
+            ("half", "0xHFE00", f64::from_bits(0xFFF8_0000_0000_0000)),
+            ("half", "0xH7E01", f64::from_bits(0x7FF8_0400_0000_0000)),
+            ("half", "0xHFFFF", f64::from_bits(0xFFFF_FC00_0000_0000)),
+            ("half", "0xH7E00", f64::from_bits(0x7FF8_0000_0000_0000)),
+            (
+                "half",
+                "0xFFF8040000000000",
+                f64::from_bits(0xFFF8_0400_0000_0000),
+            ),
+            ("half", "0xHFC00", f64::NEG_INFINITY),
+            ("half", "0xH8001", -(2f64.powi(-24))),
+            ("half", "0.5", 0.5),
+            ("half", "65504.0", 65504.0),
+            ("half", "0x3E70000000000000", 2f64.powi(-24)),
+            (
+                "double",
+                "0x7FF4000000000000",
+                f64::from_bits(0x7FF4000000000000),
+            ),
+            ("double", "1.", 1.0),
+        ] {
+            let m =
+                import_text(&ret(ty, value), "t").unwrap_or_else(|e| panic!("{ty} {value}: {e}"));
+            let found = func_named(&m, "f")
+                .blocks
+                .iter()
+                .flat_map(|b| b.body.iter())
+                .find_map(|node| match node.inst {
+                    Inst::Const {
+                        value: Constant::Float(v),
+                        ..
+                    } => Some(v),
+                    _ => None,
+                });
+            let found = found.unwrap_or_else(|| panic!("{ty} {value}: no constant"));
+            // Bit for bit: a NaN's sign and payload are part of its value.
+            assert_eq!(
+                found.to_bits(),
+                expected.to_bits(),
+                "{ty} {value}: {found} != {expected}"
+            );
+        }
+        // A global in LLVM's metadata section: llc emits none.
+        let reason = unsupported_reason("@g = global i32 1, section \"llvm.metadata\"\n");
+        assert!(reason.contains("section \"llvm.metadata\""), "{reason}");
     }
 }

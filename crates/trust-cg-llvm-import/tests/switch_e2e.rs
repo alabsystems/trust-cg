@@ -2,7 +2,9 @@
 
 // Integration tests for `switch` import, covering the full path from
 // a real clang -O0-shaped `.ll` file through the codegen pipeline to
-// AArch64 Mach-O bytes.
+// AArch64 Mach-O (aarch64-apple-darwin) and ELF (aarch64-unknown-linux-gnu)
+// objects. Both triples are explicit, so neither container depends on the
+// host running the test.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -17,7 +19,8 @@
 //     expected blocks terminated.
 //
 //  2. `switch_dispatch_full_pipeline_aarch64_o0`: the same IR compiles
-//     all the way through `trust-cg-codegen` to a non-empty Mach-O object.
+//     all the way through `trust-cg-codegen` to a non-empty Mach-O arm64
+//     object and a non-empty ELF AArch64 object.
 //     That's the "end-to-end" claim from issue #439's acceptance
 //     criteria for WS2: programs Trust Codegen did not write itself flow
 //     through the pipeline.
@@ -25,11 +28,12 @@
 //  3. `switch_narrow_widths_round_trip`: i8/i16/i32/i64 selector widths
 //     all import. The importer must not assume i32.
 
+mod common;
+
 use std::fs;
 
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
+use common::{TARGETS, assert_container, compiler_for};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::Target;
 use trust_cg_llvm_import::import_module;
 
 /// A `switch`-centric program in the shape clang -O0 emits. `dispatch`
@@ -65,17 +69,18 @@ def:
 }
 ";
 
-fn write_ll(contents: &str, name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("trust-cg-switch-e2e-{}", std::process::id()));
-    fs::create_dir_all(&dir).expect("create tmp dir");
+/// Write `contents` as `<name>.ll` in a new scratch directory; the directory
+/// is removed when the returned guard is dropped.
+fn write_ll(contents: &str, name: &str) -> (common::ScratchDir, std::path::PathBuf) {
+    let dir = common::unique_temp_dir(&format!("switch-e2e-{name}"));
     let path = dir.join(format!("{name}.ll"));
     fs::write(&path, contents).expect("write .ll");
-    path
+    (dir, path)
 }
 
 #[test]
 fn switch_dispatch_import_to_trust_ir() {
-    let path = write_ll(DISPATCH_LL, "dispatch");
+    let (_dir, path) = write_ll(DISPATCH_LL, "dispatch");
     let module = import_module(&path).expect("dispatch.ll imports");
 
     let func = module
@@ -134,34 +139,25 @@ fn switch_dispatch_import_to_trust_ir() {
 
 #[test]
 fn switch_dispatch_full_pipeline_aarch64_o0() {
-    let path = write_ll(DISPATCH_LL, "dispatch-pipeline");
+    let (_dir, path) = write_ll(DISPATCH_LL, "dispatch-pipeline");
     let module = import_module(&path).expect("dispatch.ll imports");
 
-    let cfg = CompilerConfig {
-        opt_level: OptLevel::O0,
-        target: Target::Aarch64,
-        emit_proofs: false,
-        trace_level: CompilerTraceLevel::None,
-        emit_debug: false,
-        parallel: false,
-        cegis_superopt_budget_sec: None,
-        enable_fsym_trust_ir_preflight: false,
-        enable_jit_fast_regalloc: false,
-        jit_validation_mode_override: None,
-        panic_unwind: false,
-    };
-    let compiler = Compiler::new(cfg);
-    let result = compiler.compile(&module).expect("codegen succeeds");
+    for triple in TARGETS {
+        let result = compiler_for(triple, OptLevel::O0)
+            .compile(&module)
+            .unwrap_or_else(|e| panic!("codegen for `{triple}` failed: {e}"));
 
-    // A non-trivial Mach-O object must come out. The exact byte count
-    // varies with linker versions and section alignment; we just want
-    // to assert "not empty" and "has a plausible object-sized payload"
-    // so a silent regression that emits 0 bytes is caught.
-    assert!(
-        result.object_code.len() > 64,
-        "object is suspiciously small: {} bytes",
-        result.object_code.len()
-    );
+        // A non-trivial object in the triple's container must come out. The
+        // exact byte count varies with section alignment; we just want to
+        // assert "not empty" and "has a plausible object-sized payload" so a
+        // silent regression that emits 0 bytes is caught.
+        assert_container(&result.object_code, triple, "dispatch");
+        assert!(
+            result.object_code.len() > 64,
+            "`{triple}` object is suspiciously small: {} bytes",
+            result.object_code.len()
+        );
+    }
 }
 
 /// A `switch` that routes two case values to the SAME target label, whose
@@ -190,31 +186,25 @@ def:
 
 #[test]
 fn switch_parallel_edges_to_phi_target_full_pipeline_aarch64() {
-    let path = write_ll(DUP_EDGE_LL, "dup-edge-pipeline");
+    let (_dir, path) = write_ll(DUP_EDGE_LL, "dup-edge-pipeline");
     let module = import_module(&path).expect("dup-edge switch/phi imports");
 
-    let cfg = CompilerConfig {
-        opt_level: OptLevel::O0,
-        target: Target::Aarch64,
-        emit_proofs: false,
-        trace_level: CompilerTraceLevel::None,
-        emit_debug: false,
-        parallel: false,
-        cegis_superopt_budget_sec: None,
-        enable_fsym_trust_ir_preflight: false,
-        enable_jit_fast_regalloc: false,
-        jit_validation_mode_override: None,
-        panic_unwind: false,
-    };
-    let compiler = Compiler::new(cfg);
-    let result = compiler
-        .compile(&module)
-        .expect("parallel-edge switch/phi lowers through the adapter to codegen");
-    assert!(
-        result.object_code.len() > 64,
-        "object is suspiciously small: {} bytes",
-        result.object_code.len()
-    );
+    for triple in TARGETS {
+        let result = compiler_for(triple, OptLevel::O0)
+            .compile(&module)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "parallel-edge switch/phi must lower through the adapter to codegen for \
+                     `{triple}`: {e}"
+                )
+            });
+        assert_container(&result.object_code, triple, "dup");
+        assert!(
+            result.object_code.len() > 64,
+            "`{triple}` object is suspiciously small: {} bytes",
+            result.object_code.len()
+        );
+    }
 }
 
 #[test]
@@ -238,7 +228,7 @@ fn switch_narrow_widths_round_trip() {
              d:\n  ret {ty} 0\n\
              }}\n"
         );
-        let path = write_ll(&ll, &format!("narrow-{ty}"));
+        let (_dir, path) = write_ll(&ll, &format!("narrow-{ty}"));
         import_module(&path).unwrap_or_else(|e| {
             panic!("selector width {ty} / case {case_ty} {case_val} failed: {e:?}")
         });

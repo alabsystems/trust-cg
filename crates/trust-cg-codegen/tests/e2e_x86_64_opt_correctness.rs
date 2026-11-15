@@ -51,7 +51,8 @@ fn compile_module_x86_64(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8>
         opt_level,
         target: Target::X86_64,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("Trust Codegen x86-64 compilation should succeed");
@@ -199,11 +200,14 @@ fn differential_at_opt(
 /// miscompile the 64-bit read.
 fn build_zext_highbit_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_zext_highbit", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -236,7 +240,9 @@ fn build_zext_highbit_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -250,11 +256,14 @@ fn build_zext_highbit_module() -> TrustIrModule {
 /// of an add fold, to cover the shift constant-fold path.
 fn build_zext_shift_highbit_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(
         FuncId::new(0),
         "_zext_shift_highbit",
@@ -295,7 +304,9 @@ fn build_zext_shift_highbit_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -534,7 +545,13 @@ fn compile_isel_link_run(
     driver_src: &str,
 ) -> Result<(i32, String), String> {
     let config = X86PipelineConfig {
-        output_format: X86OutputFormat::MachO,
+        // The host's native object format: Mach-O on macOS, ELF on Linux, so
+        // the system `cc` links what this pipeline emitted.
+        output_format: if cfg!(target_os = "macos") {
+            X86OutputFormat::MachO
+        } else {
+            X86OutputFormat::Elf
+        },
         emit_frame: true,
         opt_level: trust_cg_opt::OptLevel::O2,
         ..X86PipelineConfig::default()
@@ -627,4 +644,13 @@ int main(void) {
     );
     // Pin the exact expected value so the regression is unambiguous.
     assert_eq!(stdout.trim(), "isel_zext_or=2147483649");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

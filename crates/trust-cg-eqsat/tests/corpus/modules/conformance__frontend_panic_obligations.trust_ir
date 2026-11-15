@@ -1,0 +1,25 @@
+; TrustIr text format v1
+module "frontend_panic_obligations"
+file 0 "examples/panic_checks.rs"
+
+functy.0 = (u64, u64, i32) -> (i32)
+
+fn @checked_index(functy.0) {
+bb0(%0: u64, %1: u64, %2: i32):
+    %4 = icmp ult u64 %1, %0  ; #loc: 0 7 13
+    condbr %4, bb1, bb3  ; #loc: 0 7 13
+bb1:
+    %5 = const i32 1  ; #loc: 0 8 9
+    %6, %7 = add.overflow i32 %2, %5  ; #loc: 0 8 9
+    condbr %7, bb3, bb2(%6)  ; #loc: 0 8 9
+bb2(%3: i32):
+    ret %3  ; #loc: 0 9 5
+bb3:
+    unreachable  ; #loc: 0 9 5
+}
+
+obligation 0 bounds_check pending "rustc MIR Assert (bounds_check) at bb0 of `checked_index`: index is in bounds. RECORDED BY THE FRONTEND, NOT PROVED." function 0 source "trust-ir-frontend/mir-assert@1" assertion "checked_index#bb0#bounds_check" range 0 7 13 7 26 site f0/bb0#1
+
+obligation 1 arithmetic_safety pending "rustc MIR Assert (overflow) at bb1 of `checked_index`: arithmetic does not overflow. RECORDED BY THE FRONTEND, NOT PROVED." function 0 source "trust-ir-frontend/mir-assert@1" assertion "checked_index#bb1#overflow" range 0 8 9 9 4 site f0/bb1#2
+
+obligation 2 panic_freedom pending "rustc MIR Assert (resumed_after_return) at bb2 of `checked_index`: coroutine is not resumed after returning. RECORDED BY THE FRONTEND, NOT PROVED." function 0 source "trust-ir-frontend/mir-assert@1" assertion "checked_index#bb2#resumed_after_return"

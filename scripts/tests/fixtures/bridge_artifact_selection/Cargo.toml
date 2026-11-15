@@ -1,0 +1,21 @@
+[package]
+name = "bridge-artifact-selection-contract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[lib]
+name = "rustc_codegen_trust_cg"
+crate-type = ["dylib"]
+
+[[test]]
+name = "selection"
+path = "selection.rs"
+
+[profile.artifact-contract]
+inherits = "dev"

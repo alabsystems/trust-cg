@@ -17,63 +17,113 @@
 //! 1. Compute reverse postorder (RPO) numbering via DFS from entry.
 //! 2. Iteratively compute immediate dominators using the "intersect" operation.
 //! 3. Derive the dominator tree from idom[].
-//! 4. Compute dominance frontiers from the tree (for future SSA passes).
+//! 4. Compute Euler-tour stamps for dominance queries. Frontiers are computed
+//!    separately on demand.
 //!
 //! # Complexity
 //!
-//! Almost linear in practice (O(N * alpha(N)) for structured programs).
-//!
-//! Reference: LLVM `llvm/include/llvm/Support/GenericDomTree.h`
+//! Construction work depends on graph traversal and fixpoint convergence.
+//! Historical benchmark timings are not a bound on arbitrary input graphs.
 
 use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Cumulative DomTree::compute cost (TCG_TIME_DOM=1).
-pub static DOM_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static DOM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Cumulative DomTree::compute cost (TCG_TIME_DOM=1), saturating at u64::MAX.
+pub static DOM_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static DOM_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn add_timing_counter(counter: &AtomicU64, amount: u64) -> u64 {
+    let mut previous = counter.load(Ordering::Relaxed);
+    loop {
+        let next = previous.saturating_add(amount);
+        match counter.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
+}
 
 use trust_cg_ir::{BlockId, MachFunction};
 
 /// Dominator tree for a machine function.
 ///
-/// Provides O(1) immediate-dominator queries and O(depth) dominance
-/// checks. Also computes dominance frontiers for SSA construction.
+/// Provides immediate-dominator lookups, constant-time interval comparisons
+/// for dominance, and on-demand dominance frontiers for SSA construction.
 #[derive(Debug, Clone)]
 pub struct DomTree {
-    /// Immediate dominator for each block. Entry block maps to itself.
-    idom: HashMap<BlockId, BlockId>,
-    /// Children in the dominator tree (block -> dominated children).
-    children: HashMap<BlockId, Vec<BlockId>>,
-    /// Reverse postorder numbering (block -> RPO index). Lower = earlier.
-    rpo_number: HashMap<BlockId, u32>,
+    /// Immediate dominator of each block, indexed by `BlockId.0`. The entry
+    /// block maps to itself; a block unreachable from the entry (or outside
+    /// the function) has none.
+    ///
+    /// Every per-block table here is a dense array, not a hash map: `BlockId.0`
+    /// indexes `func.blocks` throughout this backend, and the rewrite drivers
+    /// rebuild this tree once per rewrite (the loop-latch-layout driver once
+    /// per rotated loop), where materializing five hash maps per build was
+    /// most of the cost of a build.
+    idom: Vec<Option<BlockId>>,
+    /// Children in the dominator tree, in RPO order, indexed by `BlockId.0`.
+    children: Vec<Vec<BlockId>>,
+    /// Reverse postorder number of each block (lower = earlier), indexed by
+    /// `BlockId.0`; [`NO_RPO_NUMBER`] for a block not in the RPO.
+    rpo_number: Vec<u32>,
     /// Reverse postorder sequence of blocks.
     rpo_order: Vec<BlockId>,
     /// Euler-tour entry/exit stamps over the dominator tree, giving O(1)
     /// dominance queries. `a` dominates `b` iff `b`'s interval is nested inside
-    /// `a`'s: `tin[a] <= tin[b] && tout[b] <= tout[a]`.
+    /// `a`'s: `tin[a] <= tin[b] && tout[b] <= tout[a]`. Indexed by `BlockId.0`.
     ///
-    /// Blocks unreachable from entry get no stamp and are absent, which keeps
+    /// Blocks unreachable from entry get no stamp ([`NO_STAMP`]), which keeps
     /// the fail-closed behaviour of the previous chain walk (an unstamped block
     /// dominates nothing and is dominated by nothing but itself).
-    tin: HashMap<BlockId, u32>,
-    tout: HashMap<BlockId, u32>,
+    // A tour has two events per node; a u32 BlockId domain therefore needs
+    // more than u32 event positions. Each distinct ID is visited at most once.
+    tin: Vec<u64>,
+    tout: Vec<u64>,
+}
+
+/// [`DomTree::rpo_number`]'s "not in the RPO".
+const NO_RPO_NUMBER: u32 = u32::MAX;
+/// [`DomTree`]'s Euler-tour "no stamp".
+const NO_STAMP: u64 = u64::MAX;
+
+/// The entry of a dense per-block table, if `block` indexes one.
+#[inline]
+fn dense_at<T: Copy>(table: &[T], block: BlockId) -> Option<T> {
+    table.get(block.0 as usize).copied()
+}
+
+/// DIAGNOSTIC gate for the `TCG_TIME_DOM` cumulative timer.
+///
+/// Cached once for the process to avoid repeated environment lookups. Shared
+/// analysis caches can reuse a tree; explicit rewrite drivers can rebuild it.
+///
+/// Memoizing is sound for this gate specifically because it is PURE TIMING: it
+/// selects only whether the call is wrapped in an `Instant`, never what tree is
+/// returned. The semantic (behaviour-selecting) env gates elsewhere in this
+/// crate are deliberately left uncached — a test that flips one in-process must
+/// still see the next call observe it.
+fn time_dom_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TCG_TIME_DOM").is_some())
 }
 
 impl DomTree {
     /// Compute the dominator tree for a machine function.
     pub fn compute(func: &MachFunction) -> Self {
         // DIAGNOSTIC (default off, TCG_TIME_DOM=1): cumulative cost + calls.
-        if std::env::var_os("TCG_TIME_DOM").is_some() {
+        if time_dom_enabled() {
             let t = std::time::Instant::now();
             let r = Self::compute_inner(func);
-            DOM_NANOS.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                std::sync::atomic::Ordering::Relaxed,
+            add_timing_counter(
+                &DOM_NANOS,
+                u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
-            let c = DOM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if c % 500 == 0 {
+            let c = add_timing_counter(&DOM_CALLS, 1);
+            if c.is_multiple_of(500) {
                 eprintln!(
                     "TCG_TIME_DOM cum={}us calls={}",
-                    DOM_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+                    DOM_NANOS.load(Ordering::Relaxed) / 1000,
                     c
                 );
             }
@@ -90,12 +140,8 @@ impl DomTree {
 
         // DENSE working state for the fixpoint. `BlockId.0` indexes
         // `func.blocks` everywhere in this backend, so both maps below are
-        // arrays, not hash tables. This matters because the Cooper/Harvey/
-        // Kennedy inner loop (`intersect`) probes BOTH per step, and
-        // `DomTree::compute` is rebuilt once per rewrite by the loop-rotation
-        // driver — 300 times on the `loops` scaling shape at n=120. The
-        // hash-map versions are still materialized once at the end, so every
-        // field of the built tree, and every consumer, is unchanged.
+        // arrays, not hash tables. The intersection walk probes both per step.
+        // Map forms for public queries are materialized after convergence.
         let block_count = func.blocks.len();
         let mut rpo_num: Vec<u32> = vec![u32::MAX; block_count];
         for (i, &block) in rpo_order.iter().enumerate() {
@@ -153,66 +199,62 @@ impl DomTree {
             }
         }
 
-        // Materialize the map forms the tree stores and its consumers read.
-        let mut idom: HashMap<BlockId, BlockId> = HashMap::default();
-        for &block in &rpo_order {
-            if let Some(d) = idom_at(&idom_of, block) {
-                idom.insert(block, d);
-            }
-        }
-        let mut rpo_number: HashMap<BlockId, u32> = HashMap::default();
+        // The RPO numbers and children the tree stores. Children are pushed in
+        // RPO order, which is the order the tour below visits them in.
+        let mut rpo_number: Vec<u32> = vec![NO_RPO_NUMBER; block_count];
         for (i, &block) in rpo_order.iter().enumerate() {
-            rpo_number.insert(block, i as u32);
-        }
-
-        // Step 4: Build children map from idom.
-        let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
-        for (&block, &dom) in &idom {
-            if block != dom {
-                children.entry(dom).or_default().push(block);
+            if let Some(slot) = rpo_number.get_mut(block.0 as usize) {
+                *slot = i as u32;
             }
         }
-        // Sort children by RPO order for deterministic traversal.
-        for kids in children.values_mut() {
-            kids.sort_by_key(|b| rpo_number.get(b).copied().unwrap_or(u32::MAX));
+
+        // Step 4: Build children from idom.
+        let mut children: Vec<Vec<BlockId>> = vec![Vec::new(); block_count];
+        for &block in &rpo_order {
+            if let Some(dom) = idom_at(&idom_of, block)
+                && block != dom
+                && let Some(kids) = children.get_mut(dom.0 as usize)
+            {
+                kids.push(block);
+            }
         }
 
-        // Step 6: Euler-tour stamps over the dominator tree.
-        //
-        // `dominates` was an idom-CHAIN WALK: O(tree depth) with a SipHash
-        // lookup per level. CSE calls it once per candidate instruction, and on
-        // block-dense code the tree is deep (an if/else ladder gives a chain),
-        // so the pass was O(depth x instructions) — the measured quadratic in
-        // the `branchy` shape. An ancestor test over a tree is exactly an
-        // interval-containment test, so one DFS makes every later query O(1).
-        //
-        // Iterative DFS: recursion would blow the stack on the 1202-block
-        // functions this is meant to speed up.
+        // Step 5: Euler-tour stamps replace repeated ancestor-chain walks with
+        // interval comparisons. Iterative traversal avoids recursion depth
+        // proportional to the tree; it does not make allocation failure recoverable.
         let (tin, tout) = {
-            let mut tin: HashMap<BlockId, u32> = HashMap::default();
-            let mut tout: HashMap<BlockId, u32> = HashMap::default();
-            let mut timer: u32 = 0;
+            let mut tin: Vec<u64> = vec![NO_STAMP; block_count];
+            let mut tout: Vec<u64> = vec![NO_STAMP; block_count];
+            let mut timer: u64 = 0;
             // (block, next child index to visit)
             let mut stack: Vec<(BlockId, usize)> = Vec::new();
-            tin.insert(entry, timer);
-            timer += 1;
-            stack.push((entry, 0));
+            if let Some(slot) = tin.get_mut(entry.0 as usize) {
+                *slot = timer;
+                timer += 1;
+                stack.push((entry, 0));
+            }
             while let Some(&mut (block, ref mut next)) = stack.last_mut() {
-                let kids = children.get(&block);
-                let kid = kids.and_then(|k| k.get(*next)).copied();
+                let kid = children
+                    .get(block.0 as usize)
+                    .and_then(|k| k.get(*next))
+                    .copied();
                 match kid {
                     Some(child) => {
                         *next += 1;
                         // A malformed tree could in principle revisit a node;
                         // stamping only once keeps the intervals well-formed.
-                        if !tin.contains_key(&child) {
-                            tin.insert(child, timer);
+                        if let Some(slot) = tin.get_mut(child.0 as usize)
+                            && *slot == NO_STAMP
+                        {
+                            *slot = timer;
                             timer += 1;
                             stack.push((child, 0));
                         }
                     }
                     None => {
-                        tout.insert(block, timer);
+                        if let Some(slot) = tout.get_mut(block.0 as usize) {
+                            *slot = timer;
+                        }
                         timer += 1;
                         stack.pop();
                     }
@@ -222,7 +264,7 @@ impl DomTree {
         };
 
         Self {
-            idom,
+            idom: idom_of,
             children,
             rpo_number,
             rpo_order,
@@ -234,15 +276,14 @@ impl DomTree {
     /// Returns the immediate dominator of `block`.
     /// The entry block's idom is itself.
     pub fn idom(&self, block: BlockId) -> Option<BlockId> {
-        self.idom.get(&block).copied()
+        idom_at(&self.idom, block)
     }
 
     /// Returns true if `a` dominates `b`.
     ///
     /// Every block dominates itself. O(1): an ancestor test on the dominator
     /// tree is an interval-containment test on the Euler-tour stamps computed
-    /// in [`DomTree::compute`]. This replaced an O(depth) idom chain walk that
-    /// made CSE quadratic on block-dense functions.
+    /// in [`DomTree::compute`], rather than a repeated idom-chain walk.
     ///
     /// Identical verdicts to the chain walk. `a` dominates `b` exactly when `a`
     /// is an ancestor of `b` in the dominator tree, and the DFS visits a
@@ -254,10 +295,12 @@ impl DomTree {
         if a == b {
             return true;
         }
-        let (Some(&a_in), Some(&a_out)) = (self.tin.get(&a), self.tout.get(&a)) else {
-            return false;
+        let stamps = |block: BlockId| {
+            let tin = dense_at(&self.tin, block).filter(|&t| t != NO_STAMP)?;
+            let tout = dense_at(&self.tout, block).filter(|&t| t != NO_STAMP)?;
+            Some((tin, tout))
         };
-        let (Some(&b_in), Some(&b_out)) = (self.tin.get(&b), self.tout.get(&b)) else {
+        let (Some((a_in, a_out)), Some((b_in, b_out))) = (stamps(a), stamps(b)) else {
             return false;
         };
         a_in <= b_in && b_out <= a_out
@@ -270,23 +313,17 @@ impl DomTree {
 
     /// Returns the children of `block` in the dominator tree.
     pub fn children(&self, block: BlockId) -> &[BlockId] {
-        self.children.get(&block).map_or(&[], |v| v.as_slice())
+        self.children
+            .get(block.0 as usize)
+            .map_or(&[], |v| v.as_slice())
     }
 
     /// Returns the dominance frontier of `block`, computed ON DEMAND.
     ///
-    /// This used to be computed EAGERLY in `compute` and stored. Nothing in the
-    /// compiler ever read it -- the only callers are this module's own tests --
-    /// and `DomTree::compute` is hot: the loop-rotation driver rebuilds it once
-    /// per rewrite, so on the `loops` scaling shape at n=120 the frontiers cost
-    /// 71ms across 300 builds, about 9% of the whole optimization phase, for a
-    /// result that was then dropped.
-    ///
     /// Computing here needs `func` for the predecessor lists, which the tree
-    /// does not retain. It recomputes every frontier per call and returns an
-    /// owned set; that is fine for the test-only usage, and if a real consumer
-    /// ever appears it should cache the whole map rather than call this per
-    /// block.
+    /// does not retain. Supply the same CFG snapshot used to compute the tree.
+    /// It recomputes every frontier per call and returns an owned set; repeated
+    /// all-block queries therefore repeat that work.
     #[must_use]
     pub fn dominance_frontier(
         &self,
@@ -303,7 +340,7 @@ impl DomTree {
 
     /// Returns the RPO number for a block (lower = earlier in RPO).
     pub fn rpo_number(&self, block: BlockId) -> Option<u32> {
-        self.rpo_number.get(&block).copied()
+        dense_at(&self.rpo_number, block).filter(|&n| n != NO_RPO_NUMBER)
     }
 }
 
@@ -345,10 +382,16 @@ fn intersect(
 
 /// Compute reverse postorder via iterative DFS from entry.
 fn compute_rpo(func: &MachFunction, entry: BlockId) -> Vec<BlockId> {
-    let mut visited: HashSet<BlockId> = HashSet::default();
+    // Dense visited marks. An id outside `func.blocks` is never marked, so it
+    // is pushed and `func.block` panics on it, as the hash set version did.
+    let mut visited: Vec<bool> = vec![false; func.blocks.len()];
+    let mut first_visit = |block: BlockId| match visited.get_mut(block.0 as usize) {
+        Some(seen) => !std::mem::replace(seen, true),
+        None => true,
+    };
     let mut postorder: Vec<BlockId> = Vec::new();
     let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
-    visited.insert(entry);
+    first_visit(entry);
 
     while let Some((block, next_succ_idx)) = stack.last_mut() {
         let block_id = *block;
@@ -356,7 +399,7 @@ fn compute_rpo(func: &MachFunction, entry: BlockId) -> Vec<BlockId> {
         if *next_succ_idx < succs.len() {
             let succ = succs[*next_succ_idx];
             *next_succ_idx += 1;
-            if visited.insert(succ) {
+            if first_visit(succ) {
                 stack.push((succ, 0));
             }
         } else {
@@ -376,7 +419,7 @@ fn compute_rpo(func: &MachFunction, entry: BlockId) -> Vec<BlockId> {
 /// All blocks on those walks (excluding the idom) have the join point in
 /// their dominance frontier.
 fn compute_dominance_frontiers(
-    idom: &HashMap<BlockId, BlockId>,
+    idom: &[Option<BlockId>],
     func: &MachFunction,
     rpo_order: &[BlockId],
 ) -> HashMap<BlockId, HashSet<BlockId>> {
@@ -389,9 +432,9 @@ fn compute_dominance_frontiers(
         }
         for &pred in preds {
             let mut runner = pred;
-            while runner != *idom.get(&block).unwrap_or(&block) {
+            while runner != idom_at(idom, block).unwrap_or(block) {
                 df.entry(runner).or_default().insert(block);
-                let next = idom.get(&runner).copied().unwrap_or(runner);
+                let next = idom_at(idom, runner).unwrap_or(runner);
                 if next == runner {
                     break; // reached root
                 }
@@ -407,6 +450,310 @@ fn compute_dominance_frontiers(
 mod tests {
     use super::*;
     use trust_cg_ir::{AArch64Opcode, MachFunction, MachInst, MachOperand, Signature};
+
+    #[test]
+    fn diagnostic_counters_saturate_without_wrapping_or_panicking() {
+        let calls = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(add_timing_counter(&calls, 1), u64::MAX);
+        assert_eq!(add_timing_counter(&calls, 1), u64::MAX);
+        assert_eq!(calls.load(Ordering::Relaxed), u64::MAX);
+        let nanos = AtomicU64::new(u64::MAX - 5);
+        assert_eq!(add_timing_counter(&nanos, 10), u64::MAX);
+        assert_eq!(nanos.load(Ordering::Relaxed), u64::MAX);
+        let ordinary = AtomicU64::new(0);
+        assert_eq!(add_timing_counter(&ordinary, 10), 10);
+        assert_eq!(ordinary.load(Ordering::Relaxed), 10);
+    }
+
+    /// The hash-map DomTree this module stored before its tables became
+    /// dense arrays, kept verbatim (its own RPO, fixpoint and materialization)
+    /// as the oracle for `dense_tree_answers_what_the_map_tree_answered`.
+    struct MapTree {
+        idom: HashMap<BlockId, BlockId>,
+        children: HashMap<BlockId, Vec<BlockId>>,
+        rpo_number: HashMap<BlockId, u32>,
+        rpo_order: Vec<BlockId>,
+        tin: HashMap<BlockId, u64>,
+        tout: HashMap<BlockId, u64>,
+    }
+
+    fn map_tree(func: &MachFunction) -> MapTree {
+        let entry = func.entry;
+        let rpo_order = {
+            let mut visited: HashSet<BlockId> = HashSet::default();
+            let mut postorder: Vec<BlockId> = Vec::new();
+            let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
+            visited.insert(entry);
+            while let Some((block, next_succ_idx)) = stack.last_mut() {
+                let block_id = *block;
+                let succs = &func.block(block_id).succs;
+                if *next_succ_idx < succs.len() {
+                    let succ = succs[*next_succ_idx];
+                    *next_succ_idx += 1;
+                    if visited.insert(succ) {
+                        stack.push((succ, 0));
+                    }
+                } else {
+                    postorder.push(block_id);
+                    stack.pop();
+                }
+            }
+            postorder.reverse();
+            postorder
+        };
+        let block_count = func.blocks.len();
+        let mut rpo_num: Vec<u32> = vec![u32::MAX; block_count];
+        for (i, &block) in rpo_order.iter().enumerate() {
+            if let Some(slot) = rpo_num.get_mut(block.0 as usize) {
+                *slot = i as u32;
+            }
+        }
+        let mut idom_of: Vec<Option<BlockId>> = vec![None; block_count];
+        if let Some(slot) = idom_of.get_mut(entry.0 as usize) {
+            *slot = Some(entry);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &block in &rpo_order {
+                if block == entry {
+                    continue;
+                }
+                let preds = &func.block(block).preds;
+                let mut new_idom = None;
+                for &pred in preds {
+                    if idom_at(&idom_of, pred).is_some() {
+                        new_idom = Some(pred);
+                        break;
+                    }
+                }
+                let Some(mut new_idom_val) = new_idom else {
+                    continue;
+                };
+                for &pred in preds {
+                    if pred == new_idom_val {
+                        continue;
+                    }
+                    if idom_at(&idom_of, pred).is_some() {
+                        new_idom_val = intersect(pred, new_idom_val, &idom_of, &rpo_num);
+                    }
+                }
+                if idom_at(&idom_of, block) != Some(new_idom_val) {
+                    if let Some(slot) = idom_of.get_mut(block.0 as usize) {
+                        *slot = Some(new_idom_val);
+                    }
+                    changed = true;
+                }
+            }
+        }
+        let mut idom: HashMap<BlockId, BlockId> = HashMap::default();
+        for &block in &rpo_order {
+            if let Some(d) = idom_at(&idom_of, block) {
+                idom.insert(block, d);
+            }
+        }
+        let mut rpo_number: HashMap<BlockId, u32> = HashMap::default();
+        for (i, &block) in rpo_order.iter().enumerate() {
+            rpo_number.insert(block, i as u32);
+        }
+        let mut children: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
+        for (&block, &dom) in &idom {
+            if block != dom {
+                children.entry(dom).or_default().push(block);
+            }
+        }
+        for kids in children.values_mut() {
+            kids.sort_by_key(|b| rpo_number.get(b).copied().unwrap_or(u32::MAX));
+        }
+        let mut tin: HashMap<BlockId, u64> = HashMap::default();
+        let mut tout: HashMap<BlockId, u64> = HashMap::default();
+        let mut timer: u64 = 0;
+        let mut stack: Vec<(BlockId, usize)> = Vec::new();
+        tin.insert(entry, timer);
+        timer += 1;
+        stack.push((entry, 0));
+        while let Some(&mut (block, ref mut next)) = stack.last_mut() {
+            let kid = children.get(&block).and_then(|k| k.get(*next)).copied();
+            match kid {
+                Some(child) => {
+                    *next += 1;
+                    if let std::collections::hash_map::Entry::Vacant(e) = tin.entry(child) {
+                        e.insert(timer);
+                        timer += 1;
+                        stack.push((child, 0));
+                    }
+                }
+                None => {
+                    tout.insert(block, timer);
+                    timer += 1;
+                    stack.pop();
+                }
+            }
+        }
+        MapTree {
+            idom,
+            children,
+            rpo_number,
+            rpo_order,
+            tin,
+            tout,
+        }
+    }
+
+    /// The map-tree dominance frontier, verbatim.
+    fn map_tree_frontiers(
+        idom: &HashMap<BlockId, BlockId>,
+        func: &MachFunction,
+        rpo_order: &[BlockId],
+    ) -> HashMap<BlockId, HashSet<BlockId>> {
+        let mut df: HashMap<BlockId, HashSet<BlockId>> = HashMap::default();
+        for &block in rpo_order {
+            let preds = &func.block(block).preds;
+            if preds.len() < 2 {
+                continue;
+            }
+            for &pred in preds {
+                let mut runner = pred;
+                while runner != *idom.get(&block).unwrap_or(&block) {
+                    df.entry(runner).or_default().insert(block);
+                    let next = idom.get(&runner).copied().unwrap_or(runner);
+                    if next == runner {
+                        break;
+                    }
+                    runner = next;
+                }
+            }
+        }
+        df
+    }
+
+    /// A deterministic CFG: a chain most of the time plus random edges (loops,
+    /// self-loops, duplicate edges), a random entry, unreachable blocks.
+    fn generated_cfg(seed: u64) -> MachFunction {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let mut func = MachFunction::new(format!("cfg{seed}"), Signature::new(vec![], vec![]));
+        let n = 1 + next(30) as u32;
+        for _ in 1..n {
+            func.create_block();
+        }
+        for from in 0..n {
+            if from + 1 < n && next(4) != 0 {
+                func.add_edge(BlockId(from), BlockId(from + 1));
+            }
+            for _ in 0..next(3) {
+                func.add_edge(BlockId(from), BlockId(next(u64::from(n)) as u32));
+            }
+        }
+        if seed.is_multiple_of(5) {
+            func.entry = BlockId(next(u64::from(n)) as u32);
+        }
+        func
+    }
+
+    /// Every query of the dense tree answers what the hash-map tree answered:
+    /// idom, dominance over every ordered pair, children, RPO order and
+    /// numbers, the tour stamps and every dominance frontier, on 1,500
+    /// generated CFGs.
+    #[test]
+    fn dense_tree_answers_what_the_map_tree_answered() {
+        for seed in 0..1_500u64 {
+            let func = generated_cfg(seed);
+            let dense = DomTree::compute(&func);
+            let map = map_tree(&func);
+            assert_eq!(
+                dense.rpo_order(),
+                map.rpo_order.as_slice(),
+                "seed {seed}: rpo"
+            );
+            let frontiers = map_tree_frontiers(&map.idom, &func, &map.rpo_order);
+            // One id past the function too: absent everywhere.
+            let blocks: Vec<BlockId> = (0..=func.blocks.len() as u32).map(BlockId).collect();
+            for &a in &blocks {
+                assert_eq!(
+                    dense.idom(a),
+                    map.idom.get(&a).copied(),
+                    "seed {seed}: idom {a:?}"
+                );
+                assert_eq!(
+                    dense.rpo_number(a),
+                    map.rpo_number.get(&a).copied(),
+                    "seed {seed}: rpo number {a:?}"
+                );
+                assert_eq!(
+                    dense.children(a),
+                    map.children.get(&a).map_or(&[][..], |k| k.as_slice()),
+                    "seed {seed}: children {a:?}"
+                );
+                let stamp = |table: &[u64]| dense_at(table, a).filter(|&t| t != NO_STAMP);
+                assert_eq!(
+                    stamp(&dense.tin),
+                    map.tin.get(&a).copied(),
+                    "seed {seed}: tin"
+                );
+                assert_eq!(
+                    stamp(&dense.tout),
+                    map.tout.get(&a).copied(),
+                    "seed {seed}: tout"
+                );
+                if (a.0 as usize) < func.blocks.len() {
+                    assert_eq!(
+                        dense.dominance_frontier(&func, a),
+                        frontiers.get(&a).cloned(),
+                        "seed {seed}: frontier {a:?}"
+                    );
+                }
+                for &b in &blocks {
+                    let map_dominates = a == b
+                        || match (
+                            map.tin.get(&a),
+                            map.tout.get(&a),
+                            map.tin.get(&b),
+                            map.tout.get(&b),
+                        ) {
+                            (Some(ai), Some(ao), Some(bi), Some(bo)) => ai <= bi && bo <= ao,
+                            _ => false,
+                        };
+                    assert_eq!(
+                        dense.dominates(a, b),
+                        map_dominates,
+                        "seed {seed}: dominates({a:?}, {b:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dominance_queries_preserve_stamps_above_u32() {
+        let func = make_diamond();
+        let mut dom = DomTree::compute(&func);
+        let expected: Vec<_> = func
+            .block_order
+            .iter()
+            .flat_map(|&a| func.block_order.iter().map(move |&b| (a, b)))
+            .map(|(a, b)| (a, b, dom.dominates(a, b)))
+            .collect();
+        // A tour needs two events per block, more than the BlockId domain.
+        for stamp in dom
+            .tin
+            .iter_mut()
+            .chain(dom.tout.iter_mut())
+            .filter(|stamp| **stamp != NO_STAMP)
+        {
+            *stamp = stamp
+                .checked_add(u32::MAX.into())
+                .expect("tour event fits stamp domain");
+        }
+        for (a, b, dominated) in expected {
+            assert_eq!(dom.dominates(a, b), dominated);
+        }
+    }
 
     /// Build a diamond CFG:
     ///

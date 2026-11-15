@@ -2733,26 +2733,36 @@ pub fn all_x86_64_v2i64_lane_proofs() -> Vec<ProofObligation> {
 // V128 boolean mask lowering proofs
 // ===========================================================================
 
-const X86_V128_SIGNED_COMPARE_CONDS: [trust_cg_lower::instructions::IntCC; 6] = [
-    trust_cg_lower::instructions::IntCC::Equal,
-    trust_cg_lower::instructions::IntCC::NotEqual,
-    trust_cg_lower::instructions::IntCC::SignedLessThan,
-    trust_cg_lower::instructions::IntCC::SignedLessThanOrEqual,
-    trust_cg_lower::instructions::IntCC::SignedGreaterThan,
-    trust_cg_lower::instructions::IntCC::SignedGreaterThanOrEqual,
+/// The x86 vector-compare predicates registered for `v16_i8`, `v8_i16` and
+/// `v4_i32` (and, through [`X86_V128_SIGNED_COMPARE_OPS`], for `v2_i64`'s
+/// SSE4 forms), in registration order.
+const X86_V128_I32_OR_NARROW_COMPARE_OPS: [trust_ir::ICmpOp; 10] = [
+    trust_ir::ICmpOp::Eq,
+    trust_ir::ICmpOp::Ne,
+    trust_ir::ICmpOp::Slt,
+    trust_ir::ICmpOp::Sle,
+    trust_ir::ICmpOp::Sgt,
+    trust_ir::ICmpOp::Sge,
+    trust_ir::ICmpOp::Ult,
+    trust_ir::ICmpOp::Ule,
+    trust_ir::ICmpOp::Ugt,
+    trust_ir::ICmpOp::Uge,
 ];
 
-const X86_V128_I32_OR_NARROW_COMPARE_CONDS: [trust_cg_lower::instructions::IntCC; 10] = [
-    trust_cg_lower::instructions::IntCC::Equal,
-    trust_cg_lower::instructions::IntCC::NotEqual,
-    trust_cg_lower::instructions::IntCC::SignedLessThan,
-    trust_cg_lower::instructions::IntCC::SignedLessThanOrEqual,
-    trust_cg_lower::instructions::IntCC::SignedGreaterThan,
-    trust_cg_lower::instructions::IntCC::SignedGreaterThanOrEqual,
-    trust_cg_lower::instructions::IntCC::UnsignedLessThan,
-    trust_cg_lower::instructions::IntCC::UnsignedLessThanOrEqual,
-    trust_cg_lower::instructions::IntCC::UnsignedGreaterThan,
-    trust_cg_lower::instructions::IntCC::UnsignedGreaterThanOrEqual,
+const X86_V128_SIGNED_COMPARE_OPS: [trust_ir::ICmpOp; 6] = [
+    trust_ir::ICmpOp::Eq,
+    trust_ir::ICmpOp::Ne,
+    trust_ir::ICmpOp::Slt,
+    trust_ir::ICmpOp::Sle,
+    trust_ir::ICmpOp::Sgt,
+    trust_ir::ICmpOp::Sge,
+];
+
+const X86_V2I64_UNSIGNED_COMPARE_OPS: [trust_ir::ICmpOp; 4] = [
+    trust_ir::ICmpOp::Ult,
+    trust_ir::ICmpOp::Ule,
+    trust_ir::ICmpOp::Ugt,
+    trust_ir::ICmpOp::Uge,
 ];
 
 fn x86_v128_from_u64_halves(prefix: &str) -> (SmtExpr, Vec<(String, u32)>) {
@@ -2763,108 +2773,208 @@ fn x86_v128_from_u64_halves(prefix: &str) -> (SmtExpr, Vec<(String, u32)>) {
     (hi.concat(lo), vec![(lo_name, 64), (hi_name, 64)])
 }
 
-fn x86_v128_compare_cond_bool(
-    cond: trust_cg_lower::instructions::IntCC,
-    lhs: SmtExpr,
-    rhs: SmtExpr,
-) -> SmtExpr {
-    use trust_cg_lower::instructions::IntCC;
-
-    match cond {
-        IntCC::Equal => lhs.eq_expr(rhs),
-        IntCC::NotEqual => lhs.eq_expr(rhs).not_expr(),
-        IntCC::SignedLessThan => lhs.bvslt(rhs),
-        IntCC::SignedLessThanOrEqual => lhs.bvsle(rhs),
-        IntCC::SignedGreaterThan => lhs.bvsgt(rhs),
-        IntCC::SignedGreaterThanOrEqual => lhs.bvsge(rhs),
-        IntCC::UnsignedLessThan => lhs.bvult(rhs),
-        IntCC::UnsignedLessThanOrEqual => lhs.bvule(rhs),
-        IntCC::UnsignedGreaterThan => lhs.bvugt(rhs),
-        IntCC::UnsignedGreaterThanOrEqual => lhs.bvuge(rhs),
-    }
-}
-
-fn x86_v128_lane_mask(cond: SmtExpr, lane_bits: u32) -> SmtExpr {
-    SmtExpr::ite(
-        cond,
-        SmtExpr::bv_const(crate::smt::mask(u64::MAX, lane_bits), lane_bits),
-        SmtExpr::bv_const(0, lane_bits),
-    )
-}
-
-fn encode_trust_ir_v128_compare_mask(
-    cond: trust_cg_lower::instructions::IntCC,
+/// The spec side of the x86-64 vector-compare cell `icmp.<op>` at
+/// `arrangement`: trust-ir's statement (`trust_ir::chc_x86_vector_icmp_spec`),
+/// printed by [`crate::trust_ir_bv::SmtAlgebra`]. This backend keeps no copy of
+/// what a vector `ICmp` means (trust-ir `docs/SPEC_RATIFICATIONS.md`, "Integer
+/// compare has one bit-vector statement").
+fn x86_vector_icmp_spec(
+    op: trust_ir::ICmpOp,
     arrangement: crate::smt::VectorArrangement,
     lhs: &SmtExpr,
     rhs: &SmtExpr,
 ) -> SmtExpr {
-    let lane_bits = arrangement.lane_bits();
-    crate::smt::map_lanes_binary(lhs, rhs, arrangement, |a, b| {
-        x86_v128_lane_mask(x86_v128_compare_cond_bool(cond, a, b), lane_bits)
+    crate::trust_ir_bv::chc_x86_vector_icmp_spec(
+        arrangement.lane_bits(),
+        arrangement.lane_count(),
+        op,
+        lhs,
+        rhs,
+    )
+    .unwrap_or_else(|| {
+        panic!("{arrangement:?}: no chc_x86 descriptor governs this shape, so it has no cell spec")
     })
 }
 
-fn encode_x86_v128_compare_mask_lowering(
+/// One x86 instruction model a vector-compare composition applies: the
+/// mnemonic trust-ir's published `native_instructions` spells it with, and
+/// this backend's SMT model of it (`x86_64_semantics.rs`).
+#[derive(Clone, Copy)]
+struct X86Model {
+    mnemonic: &'static str,
+    model: fn(SmtExpr, SmtExpr) -> SmtExpr,
+}
+
+const PCMPEQB: X86Model = X86Model {
+    mnemonic: "pcmpeqb",
+    model: crate::x86_64_semantics::encode_pcmpeqb,
+};
+const PCMPEQW: X86Model = X86Model {
+    mnemonic: "pcmpeqw",
+    model: crate::x86_64_semantics::encode_pcmpeqw,
+};
+const PCMPEQD: X86Model = X86Model {
+    mnemonic: "pcmpeqd",
+    model: crate::x86_64_semantics::encode_pcmpeqd,
+};
+const PCMPEQQ: X86Model = X86Model {
+    mnemonic: "pcmpeqq",
+    model: crate::x86_64_semantics::encode_pcmpeqq,
+};
+const PCMPGTB: X86Model = X86Model {
+    mnemonic: "pcmpgtb",
+    model: crate::x86_64_semantics::encode_pcmpgtb,
+};
+const PCMPGTW: X86Model = X86Model {
+    mnemonic: "pcmpgtw",
+    model: crate::x86_64_semantics::encode_pcmpgtw,
+};
+const PCMPGTD: X86Model = X86Model {
+    mnemonic: "pcmpgtd",
+    model: crate::x86_64_semantics::encode_pcmpgtd,
+};
+const PCMPGTQ: X86Model = X86Model {
+    mnemonic: "pcmpgtq",
+    model: crate::x86_64_semantics::encode_pcmpgtq,
+};
+const PXOR: X86Model = X86Model {
+    mnemonic: "pxor",
+    model: crate::x86_64_semantics::encode_pxor,
+};
+const POR: X86Model = X86Model {
+    mnemonic: "por",
+    model: crate::x86_64_semantics::encode_por,
+};
+const PAND: X86Model = X86Model {
+    mnemonic: "pand",
+    model: crate::x86_64_semantics::encode_pand,
+};
+
+/// How a vector-compare composition applies its instruction models. The
+/// registered obligations use [`X86EncodeModels`] (the models themselves);
+/// [`x86_vector_icmp_cell_composition`] uses [`X86RecordingModels`], which
+/// also lists what was applied, so a test can hold the composition's models to
+/// trust-ir's published `native_instructions` for the cell.
+trait X86IcmpModels {
+    fn binary(&mut self, model: X86Model, lhs: SmtExpr, rhs: SmtExpr) -> SmtExpr;
+    fn pshufd(&mut self, src: SmtExpr, imm: u8) -> SmtExpr;
+}
+
+/// The instruction models, applied.
+struct X86EncodeModels;
+
+impl X86IcmpModels for X86EncodeModels {
+    fn binary(&mut self, model: X86Model, lhs: SmtExpr, rhs: SmtExpr) -> SmtExpr {
+        (model.model)(lhs, rhs)
+    }
+
+    fn pshufd(&mut self, src: SmtExpr, imm: u8) -> SmtExpr {
+        crate::x86_64_semantics::encode_pshufd(src, imm)
+    }
+}
+
+/// The instruction models, applied and listed by mnemonic in application
+/// order.
+#[derive(Default)]
+struct X86RecordingModels {
+    applied: Vec<&'static str>,
+}
+
+impl X86IcmpModels for X86RecordingModels {
+    fn binary(&mut self, model: X86Model, lhs: SmtExpr, rhs: SmtExpr) -> SmtExpr {
+        self.applied.push(model.mnemonic);
+        X86EncodeModels.binary(model, lhs, rhs)
+    }
+
+    fn pshufd(&mut self, src: SmtExpr, imm: u8) -> SmtExpr {
+        self.applied.push("pshufd");
+        X86EncodeModels.pshufd(src, imm)
+    }
+}
+
+/// The x86 compare-mask composition for `cond`, with `bias` as the vector
+/// the unsigned predicates `pxor` into both operands before the signed
+/// compare (signed predicates ignore it). The registered obligations pass
+/// [`x86_v128_sign_bit_bias_vector`]; a test passes zero to show that each
+/// unsigned obligation refutes without its bias.
+fn encode_x86_v128_compare_mask_lowering_with_bias(
+    models: &mut dyn X86IcmpModels,
     cond: trust_cg_lower::instructions::IntCC,
-    arrangement: crate::smt::VectorArrangement,
     lhs: SmtExpr,
     rhs: SmtExpr,
-    eq_op: fn(SmtExpr, SmtExpr) -> SmtExpr,
-    gt_op: fn(SmtExpr, SmtExpr) -> SmtExpr,
+    eq: X86Model,
+    gt: X86Model,
+    bias: &SmtExpr,
 ) -> SmtExpr {
-    use crate::x86_64_semantics::{encode_pcmpeqd, encode_por, encode_pxor};
     use trust_cg_lower::instructions::IntCC;
 
     match cond {
-        IntCC::Equal => eq_op(lhs, rhs),
+        IntCC::Equal => models.binary(eq, lhs, rhs),
         IntCC::NotEqual => {
-            let eq = eq_op(lhs.clone(), rhs);
-            let all_ones = encode_pcmpeqd(lhs.clone(), lhs);
-            encode_pxor(eq, all_ones)
+            let equal = models.binary(eq, lhs.clone(), rhs);
+            let all_ones = models.binary(PCMPEQD, lhs.clone(), lhs);
+            models.binary(PXOR, equal, all_ones)
         }
-        IntCC::SignedGreaterThan => gt_op(lhs, rhs),
-        IntCC::SignedLessThan => gt_op(rhs, lhs),
+        IntCC::SignedGreaterThan => models.binary(gt, lhs, rhs),
+        IntCC::SignedLessThan => models.binary(gt, rhs, lhs),
         IntCC::SignedGreaterThanOrEqual => {
-            let gt = gt_op(lhs.clone(), rhs.clone());
-            let eq = eq_op(lhs, rhs);
-            encode_por(gt, eq)
+            let greater = models.binary(gt, lhs.clone(), rhs.clone());
+            let equal = models.binary(eq, lhs, rhs);
+            models.binary(POR, greater, equal)
         }
         IntCC::SignedLessThanOrEqual => {
-            let gt = gt_op(rhs.clone(), lhs.clone());
-            let eq = eq_op(lhs, rhs);
-            encode_por(gt, eq)
+            let greater = models.binary(gt, rhs.clone(), lhs.clone());
+            let equal = models.binary(eq, lhs, rhs);
+            models.binary(POR, greater, equal)
         }
         IntCC::UnsignedGreaterThan => {
-            let bias = x86_v128_sign_bit_bias_vector(arrangement);
-            gt_op(encode_pxor(lhs, bias.clone()), encode_pxor(rhs, bias))
+            let lhs_biased = models.binary(PXOR, lhs, bias.clone());
+            let rhs_biased = models.binary(PXOR, rhs, bias.clone());
+            models.binary(gt, lhs_biased, rhs_biased)
         }
         IntCC::UnsignedLessThan => {
-            let bias = x86_v128_sign_bit_bias_vector(arrangement);
-            gt_op(encode_pxor(rhs, bias.clone()), encode_pxor(lhs, bias))
+            let rhs_biased = models.binary(PXOR, rhs, bias.clone());
+            let lhs_biased = models.binary(PXOR, lhs, bias.clone());
+            models.binary(gt, rhs_biased, lhs_biased)
         }
         IntCC::UnsignedGreaterThanOrEqual => {
-            let bias = x86_v128_sign_bit_bias_vector(arrangement);
-            let gt = gt_op(
-                encode_pxor(lhs.clone(), bias.clone()),
-                encode_pxor(rhs.clone(), bias),
-            );
-            let eq = eq_op(lhs, rhs);
-            encode_por(gt, eq)
+            let lhs_biased = models.binary(PXOR, lhs.clone(), bias.clone());
+            let rhs_biased = models.binary(PXOR, rhs.clone(), bias.clone());
+            let greater = models.binary(gt, lhs_biased, rhs_biased);
+            let equal = models.binary(eq, lhs, rhs);
+            models.binary(POR, greater, equal)
         }
         IntCC::UnsignedLessThanOrEqual => {
-            let bias = x86_v128_sign_bit_bias_vector(arrangement);
-            let gt = gt_op(
-                encode_pxor(rhs.clone(), bias.clone()),
-                encode_pxor(lhs.clone(), bias),
-            );
-            let eq = eq_op(lhs, rhs);
-            encode_por(gt, eq)
+            let rhs_biased = models.binary(PXOR, rhs.clone(), bias.clone());
+            let lhs_biased = models.binary(PXOR, lhs.clone(), bias.clone());
+            let greater = models.binary(gt, rhs_biased, lhs_biased);
+            let equal = models.binary(eq, lhs, rhs);
+            models.binary(POR, greater, equal)
         }
     }
 }
 
+/// The 128-bit sign-bit bias of an unsigned x86 vector compare: every lane of
+/// `arrangement` holds `1 << (lane_bits - 1)`, so `pxor` with it maps unsigned
+/// lane order onto the signed order `pcmpgt*` decides. Spelled per lane, one
+/// `concat` per lane constant, as the lowering materializes it
+/// (`x86_v128_sign_bit_bias_is_the_per_lane_sign_bit`).
+///
+/// From 2026-09-27 (`65c99316a`) until the trust-ir pin move that adopted
+/// `trust_ir::CHC_X86_ICMP_CERTIFICATE_RULE`, this value was spelled as two
+/// 64-bit halves to work around AY `f28345ff`'s proof-producing bit-blast
+/// checker, which sized a term as a tree with no sharing and declined one
+/// over 4096 nodes, so the `v16_i8` unsigned proofs carried a `hole`. The
+/// rule's AY sizes terms by distinct nodes (the root fix `d73917a2b`,
+/// `07ed7966a`, `d472057f9`, `652bcca94`), and certifies the per-lane queries
+/// hole-free.
 fn x86_v128_sign_bit_bias_vector(arrangement: crate::smt::VectorArrangement) -> SmtExpr {
     let lane_bits = arrangement.lane_bits();
+    assert_eq!(
+        lane_bits * arrangement.lane_count(),
+        128,
+        "the sign-bit bias is a 128-bit vector"
+    );
     let lanes = vec![
         SmtExpr::bv_const(1_u64 << (lane_bits - 1), lane_bits);
         arrangement.lane_count() as usize
@@ -2872,74 +2982,143 @@ fn x86_v128_sign_bit_bias_vector(arrangement: crate::smt::VectorArrangement) -> 
     crate::smt::concat_lanes(&lanes, arrangement)
 }
 
-fn x86_v128_compare_cond_name(cond: trust_cg_lower::instructions::IntCC) -> &'static str {
-    use trust_cg_lower::instructions::IntCC;
+fn x86_v128_compare_cond_name(op: trust_ir::ICmpOp) -> &'static str {
+    use trust_ir::ICmpOp;
 
-    match cond {
-        IntCC::Equal => "Eq",
-        IntCC::NotEqual => "Ne",
-        IntCC::SignedLessThan => "Slt",
-        IntCC::SignedLessThanOrEqual => "Sle",
-        IntCC::SignedGreaterThan => "Sgt",
-        IntCC::SignedGreaterThanOrEqual => "Sge",
-        IntCC::UnsignedLessThan => "Ult",
-        IntCC::UnsignedLessThanOrEqual => "Ule",
-        IntCC::UnsignedGreaterThan => "Ugt",
-        IntCC::UnsignedGreaterThanOrEqual => "Uge",
+    match op {
+        ICmpOp::Eq => "Eq",
+        ICmpOp::Ne => "Ne",
+        ICmpOp::Slt => "Slt",
+        ICmpOp::Sle => "Sle",
+        ICmpOp::Sgt => "Sgt",
+        ICmpOp::Sge => "Sge",
+        ICmpOp::Ult => "Ult",
+        ICmpOp::Ule => "Ule",
+        ICmpOp::Ugt => "Ugt",
+        ICmpOp::Uge => "Uge",
     }
 }
 
-fn x86_v128_compare_lowering_name(
-    cond: trust_cg_lower::instructions::IntCC,
-    eq_name: &str,
-    gt_name: &str,
-) -> String {
-    use trust_cg_lower::instructions::IntCC;
+fn x86_v128_compare_lowering_name(op: trust_ir::ICmpOp, eq: X86Model, gt: X86Model) -> String {
+    use trust_ir::ICmpOp;
 
-    match cond {
-        IntCC::Equal => eq_name.to_string(),
-        IntCC::NotEqual => format!("{eq_name}+PCMPEQD+PXOR"),
-        IntCC::SignedGreaterThan => gt_name.to_string(),
-        IntCC::SignedLessThan => format!("{gt_name}(swapped)"),
-        IntCC::SignedGreaterThanOrEqual => format!("{gt_name}+{eq_name}+POR"),
-        IntCC::SignedLessThanOrEqual => format!("{gt_name}(swapped)+{eq_name}+POR"),
-        IntCC::UnsignedGreaterThan => format!("PXOR(sign-bias)+{gt_name}"),
-        IntCC::UnsignedLessThan => format!("PXOR(sign-bias)+{gt_name}(swapped)"),
-        IntCC::UnsignedGreaterThanOrEqual => format!("PXOR(sign-bias)+{gt_name}+{eq_name}+POR"),
-        IntCC::UnsignedLessThanOrEqual => {
-            format!("PXOR(sign-bias)+{gt_name}(swapped)+{eq_name}+POR")
-        }
+    let eq_name = eq.mnemonic.to_ascii_uppercase();
+    let gt_name = gt.mnemonic.to_ascii_uppercase();
+    match op {
+        ICmpOp::Eq => eq_name,
+        ICmpOp::Ne => format!("{eq_name}+PCMPEQD+PXOR"),
+        ICmpOp::Sgt => gt_name,
+        ICmpOp::Slt => format!("{gt_name}(swapped)"),
+        ICmpOp::Sge => format!("{gt_name}+{eq_name}+POR"),
+        ICmpOp::Sle => format!("{gt_name}(swapped)+{eq_name}+POR"),
+        ICmpOp::Ugt => format!("PXOR(sign-bias)+{gt_name}"),
+        ICmpOp::Ult => format!("PXOR(sign-bias)+{gt_name}(swapped)"),
+        ICmpOp::Uge => format!("PXOR(sign-bias)+{gt_name}+{eq_name}+POR"),
+        ICmpOp::Ule => format!("PXOR(sign-bias)+{gt_name}(swapped)+{eq_name}+POR"),
     }
+}
+
+/// The `pcmpeq*` / `pcmpgt*` pair and the obligation shape name of the
+/// `chc_x86` descriptor at `arrangement`.
+fn x86_v128_compare_family(
+    arrangement: crate::smt::VectorArrangement,
+) -> (&'static str, X86Model, X86Model) {
+    use crate::smt::VectorArrangement;
+
+    match arrangement {
+        VectorArrangement::B16 => ("V16I8", PCMPEQB, PCMPGTB),
+        VectorArrangement::H8 => ("V8I16", PCMPEQW, PCMPGTW),
+        VectorArrangement::S4 => ("V4I32", PCMPEQD, PCMPGTD),
+        VectorArrangement::D2 => ("V2I64", PCMPEQQ, PCMPGTQ),
+        other => panic!("{other:?}: not a chc_x86 vector-compare descriptor"),
+    }
+}
+
+/// The registered machine side of the x86-64 vector-compare cell `icmp.<op>`
+/// at `arrangement`, applied through `models`: the one-instruction or
+/// composite sequence for every predicate of `v16_i8` / `v8_i16` / `v4_i32`
+/// and every signed `v2_i64` predicate, the SSE2 dword-halves sequence for an
+/// unsigned `v2_i64` predicate.
+fn x86_vector_icmp_lowering(
+    models: &mut dyn X86IcmpModels,
+    op: trust_ir::ICmpOp,
+    arrangement: crate::smt::VectorArrangement,
+    lhs: SmtExpr,
+    rhs: SmtExpr,
+) -> SmtExpr {
+    let cond = trust_cg_lower::instructions::intcc_of_icmp(op);
+    if arrangement == crate::smt::VectorArrangement::D2
+        && X86_V2I64_UNSIGNED_COMPARE_OPS.contains(&op)
+    {
+        return encode_x86_v2i64_unsigned_sse2_compare_mask_with_bias(
+            models,
+            cond,
+            lhs,
+            rhs,
+            &x86_v128_sign_bit_bias_vector(crate::smt::VectorArrangement::S4),
+        );
+    }
+    let (_, eq, gt) = x86_v128_compare_family(arrangement);
+    encode_x86_v128_compare_mask_lowering_with_bias(
+        models,
+        cond,
+        lhs,
+        rhs,
+        eq,
+        gt,
+        &x86_v128_sign_bit_bias_vector(arrangement),
+    )
+}
+
+/// The registered composition of the x86-64 vector-compare cell `icmp.<op>`
+/// over `<lane_count x i<lane_bits>>` on the obligations' operands, and the
+/// instruction models it applies, by mnemonic, in application order: `None`
+/// for a shape no `chc_x86` descriptor names. The bias materialization
+/// (`mov_imm_sign_bit;movd_to_xmm;pshufd`) is a constant here, not a model
+/// application: it is outside the certificate (trust-ir `docs/dialects.md`,
+/// the per-cell rule's clause 2). `tests/x86_icmp_manifest_cells.rs` holds the
+/// list to trust-ir's published `native_instructions` for each available cell
+/// (`chc_x86_vector_icmp_lowering_row`) and the term to the registered
+/// obligation's machine side.
+#[must_use]
+pub fn x86_vector_icmp_cell_composition(
+    lane_bits: u32,
+    lane_count: u32,
+    op: trust_ir::ICmpOp,
+) -> Option<(SmtExpr, Vec<&'static str>)> {
+    use crate::smt::VectorArrangement;
+
+    let arrangement = match (lane_bits, lane_count) {
+        (8, 16) => VectorArrangement::B16,
+        (16, 8) => VectorArrangement::H8,
+        (32, 4) => VectorArrangement::S4,
+        (64, 2) => VectorArrangement::D2,
+        _ => return None,
+    };
+    let (lhs, _) = x86_v128_from_u64_halves("lhs");
+    let (rhs, _) = x86_v128_from_u64_halves("rhs");
+    let mut models = X86RecordingModels::default();
+    let lowered = x86_vector_icmp_lowering(&mut models, op, arrangement, lhs, rhs);
+    Some((lowered, models.applied))
 }
 
 fn proof_x86_v128_compare_mask(
-    shape: &str,
     arrangement: crate::smt::VectorArrangement,
-    cond: trust_cg_lower::instructions::IntCC,
-    eq_name: &str,
-    gt_name: &str,
-    eq_op: fn(SmtExpr, SmtExpr) -> SmtExpr,
-    gt_op: fn(SmtExpr, SmtExpr) -> SmtExpr,
+    op: trust_ir::ICmpOp,
 ) -> ProofObligation {
     let (lhs, mut inputs) = x86_v128_from_u64_halves("lhs");
     let (rhs, rhs_inputs) = x86_v128_from_u64_halves("rhs");
     inputs.extend(rhs_inputs);
 
-    let cond_name = x86_v128_compare_cond_name(cond);
-    let lowering = x86_v128_compare_lowering_name(cond, eq_name, gt_name);
+    let (shape, eq, gt) = x86_v128_compare_family(arrangement);
+    let cond_name = x86_v128_compare_cond_name(op);
+    let lowering = x86_v128_compare_lowering_name(op, eq, gt);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: format!("x86_64: {shape}Icmp_{cond_name} -> {lowering}"),
-        trust_ir_expr: encode_trust_ir_v128_compare_mask(cond, arrangement, &lhs, &rhs),
-        aarch64_expr: encode_x86_v128_compare_mask_lowering(
-            cond,
-            arrangement,
-            lhs,
-            rhs,
-            eq_op,
-            gt_op,
-        ),
+        trust_ir_expr: x86_vector_icmp_spec(op, arrangement, &lhs, &rhs),
+        aarch64_expr: x86_vector_icmp_lowering(&mut X86EncodeModels, op, arrangement, lhs, rhs),
         inputs,
         preconditions: vec![],
         fp_inputs: vec![],
@@ -2947,114 +3126,73 @@ fn proof_x86_v128_compare_mask(
     }
 }
 
-fn proof_x86_v4i32_compare_mask(cond: trust_cg_lower::instructions::IntCC) -> ProofObligation {
-    use crate::x86_64_semantics::{encode_pcmpeqd, encode_pcmpgtd};
-
-    proof_x86_v128_compare_mask(
-        "V4I32",
-        crate::smt::VectorArrangement::S4,
-        cond,
-        "PCMPEQD",
-        "PCMPGTD",
-        encode_pcmpeqd,
-        encode_pcmpgtd,
-    )
+fn proof_x86_v4i32_compare_mask(op: trust_ir::ICmpOp) -> ProofObligation {
+    proof_x86_v128_compare_mask(crate::smt::VectorArrangement::S4, op)
 }
 
-fn proof_x86_v16i8_compare_mask(cond: trust_cg_lower::instructions::IntCC) -> ProofObligation {
-    use crate::x86_64_semantics::{encode_pcmpeqb, encode_pcmpgtb};
-
-    proof_x86_v128_compare_mask(
-        "V16I8",
-        crate::smt::VectorArrangement::B16,
-        cond,
-        "PCMPEQB",
-        "PCMPGTB",
-        encode_pcmpeqb,
-        encode_pcmpgtb,
-    )
+fn proof_x86_v16i8_compare_mask(op: trust_ir::ICmpOp) -> ProofObligation {
+    proof_x86_v128_compare_mask(crate::smt::VectorArrangement::B16, op)
 }
 
-fn proof_x86_v8i16_compare_mask(cond: trust_cg_lower::instructions::IntCC) -> ProofObligation {
-    use crate::x86_64_semantics::{encode_pcmpeqw, encode_pcmpgtw};
-
-    proof_x86_v128_compare_mask(
-        "V8I16",
-        crate::smt::VectorArrangement::H8,
-        cond,
-        "PCMPEQW",
-        "PCMPGTW",
-        encode_pcmpeqw,
-        encode_pcmpgtw,
-    )
+fn proof_x86_v8i16_compare_mask(op: trust_ir::ICmpOp) -> ProofObligation {
+    proof_x86_v128_compare_mask(crate::smt::VectorArrangement::H8, op)
 }
 
-fn proof_x86_v2i64_compare_mask(cond: trust_cg_lower::instructions::IntCC) -> ProofObligation {
-    use crate::x86_64_semantics::{encode_pcmpeqq, encode_pcmpgtq};
-
-    proof_x86_v128_compare_mask(
-        "V2I64",
-        crate::smt::VectorArrangement::D2,
-        cond,
-        "PCMPEQQ",
-        "PCMPGTQ",
-        encode_pcmpeqq,
-        encode_pcmpgtq,
-    )
+fn proof_x86_v2i64_compare_mask(op: trust_ir::ICmpOp) -> ProofObligation {
+    proof_x86_v128_compare_mask(crate::smt::VectorArrangement::D2, op)
 }
 
-fn encode_x86_v2i64_unsigned_sse2_compare_mask(
+/// The SSE2 dword-halves `v2_i64` unsigned compare, with `bias` as the dword
+/// sign-bit bias vector (see [`encode_x86_v128_compare_mask_lowering_with_bias`]).
+fn encode_x86_v2i64_unsigned_sse2_compare_mask_with_bias(
+    models: &mut dyn X86IcmpModels,
     cond: trust_cg_lower::instructions::IntCC,
     lhs: SmtExpr,
     rhs: SmtExpr,
+    bias: &SmtExpr,
 ) -> SmtExpr {
-    use crate::x86_64_semantics::{
-        encode_pand, encode_pcmpeqd, encode_pcmpgtd, encode_por, encode_pshufd, encode_pxor,
-    };
     use trust_cg_lower::instructions::IntCC;
 
-    let bias = x86_v128_sign_bit_bias_vector(crate::smt::VectorArrangement::S4);
-    let lhs_biased = encode_pxor(lhs.clone(), bias.clone());
-    let rhs_biased = encode_pxor(rhs.clone(), bias);
+    let lhs_biased = models.binary(PXOR, lhs.clone(), bias.clone());
+    let rhs_biased = models.binary(PXOR, rhs.clone(), bias.clone());
     let (gt_lhs, gt_rhs) = match cond {
         IntCC::UnsignedGreaterThan | IntCC::UnsignedGreaterThanOrEqual => (lhs_biased, rhs_biased),
         IntCC::UnsignedLessThan | IntCC::UnsignedLessThanOrEqual => (rhs_biased, lhs_biased),
         other => panic!("unsupported V2I64 unsigned compare proof condition: {other:?}"),
     };
 
-    let dword_gt = encode_pcmpgtd(gt_lhs, gt_rhs);
-    let dword_eq = encode_pcmpeqd(lhs, rhs);
-    let hi_gt = encode_pshufd(dword_gt.clone(), 0xF5);
-    let lo_gt = encode_pshufd(dword_gt, 0xA0);
-    let hi_eq = encode_pshufd(dword_eq.clone(), 0xF5);
-    let strict = encode_por(hi_gt, encode_pand(hi_eq.clone(), lo_gt));
+    let dword_gt = models.binary(PCMPGTD, gt_lhs, gt_rhs);
+    let dword_eq = models.binary(PCMPEQD, lhs, rhs);
+    let hi_gt = models.pshufd(dword_gt.clone(), 0xF5);
+    let lo_gt = models.pshufd(dword_gt, 0xA0);
+    let hi_eq = models.pshufd(dword_eq.clone(), 0xF5);
+    let hi_eq_and_lo_gt = models.binary(PAND, hi_eq.clone(), lo_gt);
+    let strict = models.binary(POR, hi_gt, hi_eq_and_lo_gt);
 
     match cond {
         IntCC::UnsignedGreaterThan | IntCC::UnsignedLessThan => strict,
         IntCC::UnsignedGreaterThanOrEqual | IntCC::UnsignedLessThanOrEqual => {
-            let lo_eq = encode_pshufd(dword_eq, 0xA0);
-            let eq = encode_pand(hi_eq, lo_eq);
-            encode_por(strict, eq)
+            let lo_eq = models.pshufd(dword_eq, 0xA0);
+            let eq = models.binary(PAND, hi_eq, lo_eq);
+            models.binary(POR, strict, eq)
         }
         other => panic!("unsupported V2I64 unsigned compare proof condition: {other:?}"),
     }
 }
 
-fn proof_x86_v2i64_unsigned_compare_mask(
-    cond: trust_cg_lower::instructions::IntCC,
-) -> ProofObligation {
+fn proof_x86_v2i64_unsigned_compare_mask(op: trust_ir::ICmpOp) -> ProofObligation {
     let (lhs, mut inputs) = x86_v128_from_u64_halves("lhs");
     let (rhs, rhs_inputs) = x86_v128_from_u64_halves("rhs");
     inputs.extend(rhs_inputs);
 
-    let cond_name = x86_v128_compare_cond_name(cond);
+    let cond_name = x86_v128_compare_cond_name(op);
     let arrangement = crate::smt::VectorArrangement::D2;
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: format!("x86_64: V2I64Icmp_{cond_name} -> SSE2-dword-halves"),
-        trust_ir_expr: encode_trust_ir_v128_compare_mask(cond, arrangement, &lhs, &rhs),
-        aarch64_expr: encode_x86_v2i64_unsigned_sse2_compare_mask(cond, lhs, rhs),
+        trust_ir_expr: x86_vector_icmp_spec(op, arrangement, &lhs, &rhs),
+        aarch64_expr: x86_vector_icmp_lowering(&mut X86EncodeModels, op, arrangement, lhs, rhs),
         inputs,
         preconditions: vec![],
         fp_inputs: vec![],
@@ -3064,7 +3202,7 @@ fn proof_x86_v2i64_unsigned_compare_mask(
 
 /// Return all x86 V4I32 compare-mask proof obligations.
 pub fn all_x86_64_v4i32_compare_mask_proofs() -> Vec<ProofObligation> {
-    X86_V128_I32_OR_NARROW_COMPARE_CONDS
+    X86_V128_I32_OR_NARROW_COMPARE_OPS
         .into_iter()
         .map(proof_x86_v4i32_compare_mask)
         .collect()
@@ -3073,28 +3211,23 @@ pub fn all_x86_64_v4i32_compare_mask_proofs() -> Vec<ProofObligation> {
 /// Return all x86 V16I8/V8I16 compare-mask proof obligations.
 pub fn all_x86_64_narrow_compare_mask_proofs() -> Vec<ProofObligation> {
     let mut proofs = Vec::new();
-    for cond in X86_V128_I32_OR_NARROW_COMPARE_CONDS {
-        proofs.push(proof_x86_v16i8_compare_mask(cond));
-        proofs.push(proof_x86_v8i16_compare_mask(cond));
+    for op in X86_V128_I32_OR_NARROW_COMPARE_OPS {
+        proofs.push(proof_x86_v16i8_compare_mask(op));
+        proofs.push(proof_x86_v8i16_compare_mask(op));
     }
     proofs
 }
 
 /// Return all x86 V2I64 compare-mask proof obligations for #1114.
 pub fn all_x86_64_v2i64_compare_mask_proofs() -> Vec<ProofObligation> {
-    let mut proofs: Vec<ProofObligation> = X86_V128_SIGNED_COMPARE_CONDS
+    let mut proofs: Vec<ProofObligation> = X86_V128_SIGNED_COMPARE_OPS
         .into_iter()
         .map(proof_x86_v2i64_compare_mask)
         .collect();
     proofs.extend(
-        [
-            trust_cg_lower::instructions::IntCC::UnsignedLessThan,
-            trust_cg_lower::instructions::IntCC::UnsignedLessThanOrEqual,
-            trust_cg_lower::instructions::IntCC::UnsignedGreaterThan,
-            trust_cg_lower::instructions::IntCC::UnsignedGreaterThanOrEqual,
-        ]
-        .into_iter()
-        .map(proof_x86_v2i64_unsigned_compare_mask),
+        X86_V2I64_UNSIGNED_COMPARE_OPS
+            .into_iter()
+            .map(proof_x86_v2i64_unsigned_compare_mask),
     );
     proofs
 }
@@ -3106,6 +3239,11 @@ pub fn all_x86_64_v128_compare_mask_proofs() -> Vec<ProofObligation> {
     proofs
 }
 
+/// The canonical mask vector of `mask_bits` (bit `i` set exactly when lane `i`
+/// is true): each lane the hardware contracts' physical mask lane
+/// (`trust_ir::physical_mask_lane`, printed by
+/// [`crate::trust_ir_bv::SmtAlgebra`]). This is the carrier's input domain, not
+/// an instruction model, so it may share trust-ir's statement (design §3.5).
 fn x86_canonical_mask_vector_from_bits(
     bits: &SmtExpr,
     arrangement: crate::smt::VectorArrangement,
@@ -3113,7 +3251,8 @@ fn x86_canonical_mask_vector_from_bits(
     let lanes: Vec<SmtExpr> = (0..arrangement.lane_count())
         .map(|i| {
             let bit = bits.clone().extract(i, i);
-            x86_v128_lane_mask(
+            trust_ir::physical_mask_lane(
+                &mut crate::trust_ir_bv::SmtAlgebra,
                 bit.eq_expr(SmtExpr::bv_const(1, 1)),
                 arrangement.lane_bits(),
             )
@@ -4832,25 +4971,18 @@ fn proof_x86_fcmp_generic(
         (Type::F64, X86FPSize::Double, 11u32, 53u32)
     };
 
-    let a = if is_f32 {
-        SmtExpr::fp32_const(0.0)
-    } else {
-        SmtExpr::fp64_const(0.0)
-    };
-    let b = if is_f32 {
-        SmtExpr::fp32_const(0.0)
-    } else {
-        SmtExpr::fp64_const(0.0)
-    };
+    let width = eb + sb;
+    let a = SmtExpr::bv_bits_to_fp(SmtExpr::var("a_bits", width), eb, sb);
+    let b = SmtExpr::bv_bits_to_fp(SmtExpr::var("b_bits", width), eb, sb);
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
         name: name.to_string(),
         trust_ir_expr: encode_trust_ir_fcmp(&cond, ty, a.clone(), b.clone()),
         aarch64_expr: encode_fp_cmp_strategy(fp_size, a, b, x86_float_cmp_strategy(cond)),
-        inputs: vec![],
+        inputs: vec![("a_bits".into(), width), ("b_bits".into(), width)],
         preconditions: vec![],
-        fp_inputs: vec![("a".to_string(), eb, sb), ("b".to_string(), eb, sb)],
+        fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
 }
@@ -6529,14 +6661,6 @@ pub fn proof_x86_learip_wrong_field_end_refutes() -> ProofObligation {
     }
 }
 
-/// Positive RIP-relative symbol-address proofs registered in the database.
-pub fn x86_64_riprel_symbol_proofs() -> Vec<ProofObligation> {
-    vec![
-        proof_x86_learip_symbol_riprel(),
-        proof_x86_movriprel_got_eff_addr(),
-    ]
-}
-
 /// Negative-control RIP-relative obligations (each is REFUTABLE — a wrong
 /// encoding). NOT registered; used by tests to show the positives are real
 /// equivalences and not tautologies.
@@ -6865,22 +6989,6 @@ fn proof_x86_atomic_load(width_bits: u32) -> ProofObligation {
     }
 }
 
-pub fn proof_x86_atomic_load_i8() -> ProofObligation {
-    proof_x86_atomic_load(8)
-}
-
-pub fn proof_x86_atomic_load_i16() -> ProofObligation {
-    proof_x86_atomic_load(16)
-}
-
-pub fn proof_x86_atomic_load_i32() -> ProofObligation {
-    proof_x86_atomic_load(32)
-}
-
-pub fn proof_x86_atomic_load_i64() -> ProofObligation {
-    proof_x86_atomic_load(64)
-}
-
 fn proof_x86_atomic_store(width_bits: u32) -> ProofObligation {
     let size_bytes = x86_atomic_memory_size_bytes(width_bits);
     let addr = SmtExpr::var("addr", 64);
@@ -6906,22 +7014,6 @@ fn proof_x86_atomic_store(width_bits: u32) -> ProofObligation {
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
     }
-}
-
-pub fn proof_x86_atomic_store_i8() -> ProofObligation {
-    proof_x86_atomic_store(8)
-}
-
-pub fn proof_x86_atomic_store_i16() -> ProofObligation {
-    proof_x86_atomic_store(16)
-}
-
-pub fn proof_x86_atomic_store_i32() -> ProofObligation {
-    proof_x86_atomic_store(32)
-}
-
-pub fn proof_x86_atomic_store_i64() -> ProofObligation {
-    proof_x86_atomic_store(64)
 }
 
 /// Proof: x86-64 SeqCst fence lowers to `MFENCE` and MFENCE preserves the
@@ -8449,6 +8541,179 @@ pub(crate) fn x86_rol_wrong_controls(
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Const-multiply strength reduction: IMUL r,r,2^a±1 -> SHL ; ADD/SUB
+// ---------------------------------------------------------------------------
+//
+// The `x86_peephole` const-multiply arm rewrites `d = s * (2^a ± 1)` into
+// `SHL d, s, a ; ADD/SUB d, d, s`. Every opcode involved (`ShlRI`, `AddRR`,
+// `SubRR`) is pre-existing emittable surface already verified per-instruction
+// by `x86_64_function_verifier`, so NO new opcode enters the perimeter here.
+// What these obligations discharge is the ALGEBRAIC identity the rewrite
+// rests on — the step the existing `3|5|9|7` LEA arms carry only as a hand
+// proof in a comment.
+//
+// FAITHFULNESS / NON-DEGENERACY. The two sides are STRUCTURALLY DISTINCT:
+//   * SOURCE  = `x * (2^a ± 1)`   — a bvMUL by the BAKED constant, i.e. what
+//               `ImulRRI` means; and
+//   * MACHINE = `(x << a) ± x`    — a bvSHL composed with bvADD / bvSUB via
+//               the REAL instruction encoders.
+// `bvmul != bvshl` structurally, so `is_genuinely_proven` holds and this is
+// not the vacuous `X == X` that `is_degenerate` exists to catch. It is the
+// same bvmul-vs-bvshl construction the AArch64 side records for the identical
+// rewrite (`lowering_proof::proof_add_lsl_shift` / `proof_sub_lsl_shift`),
+// and the multiply is by a baked constant — the in-house evaluator discharges
+// it, it is NOT solver-hard.
+//
+// `a = 1` covers `x*3 == (x<<1) + x`, which retroactively supplies
+// machine-checked evidence for the identity behind the shipping `3` LEA arm.
+
+/// One `2^a + 1` obligation at `size`, shift amount `a` in `[1, width)`.
+/// SOURCE = `x * (2^a + 1)` (bvmul); MACHINE = `(x << a) + x` (bvshl + bvadd).
+pub fn proof_x86_constmul_shift_add(
+    size: crate::x86_64_semantics::X86OperandSize,
+    a: u32,
+) -> ProofObligation {
+    use crate::x86_64_semantics::{encode_add_rr, encode_shl_ri, x86_operand_size_bits};
+    let width = x86_operand_size_bits(size);
+    debug_assert!(a >= 1 && a < width);
+    let x = SmtExpr::var("x", width);
+    let c = (1u64 << a).wrapping_add(1);
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: format!(
+            "x86_64: ConstMul_Shift_Add_I{width} a={a} -> SHL+ADD: \
+             x*(2^{a}+1) == (x<<{a}) + x"
+        ),
+        trust_ir_expr: x.clone().bvmul(SmtExpr::bv_const(c, width)),
+        aarch64_expr: encode_add_rr(size, encode_shl_ri(size, x.clone(), a), x),
+        inputs: vec![("x".to_string(), width)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+    }
+}
+
+/// One `2^a - 1` obligation at `size`, shift amount `a` in `[1, width)`.
+/// SOURCE = `x * (2^a - 1)` (bvmul); MACHINE = `(x << a) - x` (bvshl + bvsub).
+/// The subtraction is non-commutative, so operand order is load-bearing — see
+/// control C3.
+pub fn proof_x86_constmul_shift_sub(
+    size: crate::x86_64_semantics::X86OperandSize,
+    a: u32,
+) -> ProofObligation {
+    use crate::x86_64_semantics::{encode_shl_ri, encode_sub_rr, x86_operand_size_bits};
+    let width = x86_operand_size_bits(size);
+    debug_assert!(a >= 1 && a < width);
+    let x = SmtExpr::var("x", width);
+    let c = (1u64 << a).wrapping_sub(1);
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: format!(
+            "x86_64: ConstMul_Shift_Sub_I{width} a={a} -> SHL+SUB: \
+             x*(2^{a}-1) == (x<<{a}) - x"
+        ),
+        trust_ir_expr: x.clone().bvmul(SmtExpr::bv_const(c, width)),
+        aarch64_expr: encode_sub_rr(size, encode_shl_ri(size, x.clone(), a), x),
+        inputs: vec![("x".to_string(), width)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+    }
+}
+
+/// The const-multiply shift obligations across representative amounts:
+/// 7 at 32-bit + 8 at 64-bit, per family (ADD, SUB) = 30. Both boundaries
+/// (`a = 1`, `a = width - 1`) are covered, along with the two amounts the
+/// beat-llvm suite actually needs (`a = 5`, i.e. `×31`).
+pub fn all_x86_constmul_shift_proofs() -> Vec<ProofObligation> {
+    use crate::x86_64_semantics::X86OperandSize;
+    let mut out = Vec::new();
+    for a in [1u32, 2, 3, 5, 7, 16, 31] {
+        out.push(proof_x86_constmul_shift_add(X86OperandSize::S32, a));
+        out.push(proof_x86_constmul_shift_sub(X86OperandSize::S32, a));
+    }
+    for a in [1u32, 2, 3, 5, 7, 9, 32, 63] {
+        out.push(proof_x86_constmul_shift_add(X86OperandSize::S64, a));
+        out.push(proof_x86_constmul_shift_sub(X86OperandSize::S64, a));
+    }
+    out
+}
+
+/// NEGATIVE CONTROLS for the const-multiply shift obligations — each perturbs
+/// the MACHINE side and MUST be refuted, else the positives are decoration.
+///
+/// * C1 WRONG AMOUNT      — shift by `a + 1`.
+/// * C2 WRONG OP          — `+ x` against the `2^a - 1` source (and the dual).
+/// * C3 OPERAND-SWAPPED   — `x - (x << a)` instead of `(x << a) - x`; the SUB
+///   is non-commutative, so this is the wiring error that matters.
+/// * C4 SHIFT HALF DROPPED — machine `= x` / `x - x`.
+#[cfg(test)]
+pub(crate) fn x86_constmul_shift_wrong_controls(
+    size: crate::x86_64_semantics::X86OperandSize,
+    a: u32,
+) -> Vec<ProofObligation> {
+    use crate::x86_64_semantics::{
+        encode_add_rr, encode_shl_ri, encode_sub_rr, x86_operand_size_bits,
+    };
+    let width = x86_operand_size_bits(size);
+    debug_assert!(a >= 1 && a + 1 < width);
+    let x = SmtExpr::var("x", width);
+    let add_src = proof_x86_constmul_shift_add(size, a).trust_ir_expr;
+    let sub_src = proof_x86_constmul_shift_sub(size, a).trust_ir_expr;
+    let mk = |name: &str, source: SmtExpr, machine: SmtExpr| ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: format!("x86_64 CONTROL (must refute): {name}"),
+        trust_ir_expr: source,
+        aarch64_expr: machine,
+        inputs: vec![("x".to_string(), width)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::InstructionLowering),
+    };
+    vec![
+        // C1 wrong amount, both families.
+        mk(
+            &format!("constmul add a={a}: shift by a+1"),
+            add_src.clone(),
+            encode_add_rr(size, encode_shl_ri(size, x.clone(), a + 1), x.clone()),
+        ),
+        mk(
+            &format!("constmul sub a={a}: shift by a+1"),
+            sub_src.clone(),
+            encode_sub_rr(size, encode_shl_ri(size, x.clone(), a + 1), x.clone()),
+        ),
+        // C2 wrong op, both directions.
+        mk(
+            &format!("constmul sub a={a}: ADD machine against SUB source"),
+            sub_src.clone(),
+            encode_add_rr(size, encode_shl_ri(size, x.clone(), a), x.clone()),
+        ),
+        mk(
+            &format!("constmul add a={a}: SUB machine against ADD source"),
+            add_src.clone(),
+            encode_sub_rr(size, encode_shl_ri(size, x.clone(), a), x.clone()),
+        ),
+        // C3 operand-swapped SUB.
+        mk(
+            &format!("constmul sub a={a}: operand-swapped x - (x<<a)"),
+            sub_src.clone(),
+            encode_sub_rr(size, x.clone(), encode_shl_ri(size, x.clone(), a)),
+        ),
+        // C4 shift half dropped.
+        mk(
+            &format!("constmul add a={a}: shift half dropped (machine = x)"),
+            add_src,
+            x.clone(),
+        ),
+        mk(
+            &format!("constmul sub a={a}: shift half dropped (machine = x - x)"),
+            sub_src,
+            encode_sub_rr(size, x.clone(), x),
+        ),
+    ]
+}
+
 /// Return all x86-64 lowering proof obligations.
 ///
 /// This provides a single entry point for running all x86-64 verification
@@ -8756,6 +9021,10 @@ pub fn all_x86_64_proofs() -> Vec<ProofObligation> {
     // ROL (rotate-left by constant) — see the FAITHFULNESS note above. Added
     // BEFORE the retraction filter so the same hygiene applies to it.
     proofs.extend(all_x86_rol_proofs());
+    // Const-multiply strength reduction `x*(2^a±1) == (x<<a)±x` — the
+    // algebraic step behind the `x86_peephole` IMUL -> SHL+ADD/SUB arm. Same
+    // placement rationale as ROL: before the retraction filter.
+    proofs.extend(all_x86_constmul_shift_proofs());
     proofs.retain(|p| !X86_RETRACTED_DEGENERATE.contains(&p.name.as_str()));
 
     proofs
@@ -8820,6 +9089,52 @@ mod tests {
         for size in [X86OperandSize::S32, X86OperandSize::S64] {
             for c in super::x86_rol_wrong_controls(size, 9) {
                 assert!(!c.is_degenerate(), "{} unexpectedly degenerate", c.name);
+            }
+        }
+    }
+
+    /// The const-multiply obligations must (a) DISCHARGE, (b) be
+    /// NON-DEGENERATE, and (c) have every perturbation REFUTED. Without (b)
+    /// and (c) a passing (a) establishes nothing about the rewrite.
+    #[test]
+    fn x86_constmul_shift_proofs_are_faithful_and_non_degenerate() {
+        use crate::lowering_proof::verify_by_evaluation;
+        use crate::verify::VerificationResult;
+        use crate::x86_64_semantics::X86OperandSize;
+
+        let positives = super::all_x86_constmul_shift_proofs();
+        assert_eq!(
+            positives.len(),
+            30,
+            "7 amounts at 32-bit + 8 at 64-bit, x {{ADD, SUB}}"
+        );
+        for p in &positives {
+            assert!(
+                !p.is_degenerate(),
+                "{} is X==X — SOURCE must be the bvmul by the baked constant",
+                p.name
+            );
+            assert!(
+                matches!(verify_by_evaluation(p), VerificationResult::Valid),
+                "{} did not discharge",
+                p.name
+            );
+        }
+
+        for size in [X86OperandSize::S32, X86OperandSize::S64] {
+            for a in [1u32, 5, 7] {
+                let controls = super::x86_constmul_shift_wrong_controls(size, a);
+                assert_eq!(controls.len(), 7, "C1 x2, C2 x2, C3, C4 x2");
+                for c in controls {
+                    assert!(!c.is_degenerate(), "{} unexpectedly degenerate", c.name);
+                    assert!(
+                        !matches!(verify_by_evaluation(&c), VerificationResult::Valid),
+                        "NEGATIVE control '{}' was VALIDATED — a wrong shift \
+                         amount / op / operand order must REFUTE, else the \
+                         positive obligation is vacuous",
+                        c.name
+                    );
+                }
             }
         }
     }
@@ -9633,6 +9948,151 @@ mod tests {
         for obligation in all_x86_64_v2i64_compare_mask_proofs() {
             assert_x86_proof_valid(obligation);
         }
+    }
+
+    /// The sign-bit bias is spelled per lane (one `concat` per lane constant,
+    /// as the lowering materializes it) and has the written-out 128-bit value
+    /// for every arrangement an unsigned compare obligation uses (B16, H8, S4
+    /// directly; S4 again for the `v2_i64` SSE2 dword-halves sequence; D2 for
+    /// completeness). The expected values are written out, not derived.
+    #[test]
+    fn x86_v128_sign_bit_bias_is_the_per_lane_sign_bit() {
+        use crate::smt::{EvalResult, VectorArrangement};
+
+        let env = std::collections::HashMap::<String, u64>::new();
+        for (arrangement, lane_bits, want) in [
+            (
+                VectorArrangement::B16,
+                8,
+                0x8080_8080_8080_8080_8080_8080_8080_8080_u128,
+            ),
+            (
+                VectorArrangement::H8,
+                16,
+                0x8000_8000_8000_8000_8000_8000_8000_8000_u128,
+            ),
+            (
+                VectorArrangement::S4,
+                32,
+                0x8000_0000_8000_0000_8000_0000_8000_0000_u128,
+            ),
+            (
+                VectorArrangement::D2,
+                64,
+                0x8000_0000_0000_0000_8000_0000_0000_0000_u128,
+            ),
+        ] {
+            let bias = x86_v128_sign_bit_bias_vector(arrangement);
+            assert_eq!(bias.bv_width(), 128, "{arrangement:?}");
+            assert_eq!(
+                bias.eval(&env),
+                EvalResult::Bv128(want),
+                "{arrangement:?}: the sign-bit bias value"
+            );
+            // The spelling itself: lane 0 least significant, one constant per
+            // lane, each the lane's sign bit.
+            let lane = SmtExpr::bv_const(1_u64 << (lane_bits - 1), lane_bits);
+            let mut per_lane = lane.clone();
+            for _ in 1..arrangement.lane_count() {
+                per_lane = lane.clone().concat(per_lane);
+            }
+            assert_eq!(
+                bias, per_lane,
+                "{arrangement:?}: the bias is not spelled per lane"
+            );
+        }
+    }
+
+    /// Every registered unsigned compare obligation (4 predicates x `v16_i8`,
+    /// `v8_i16`, `v4_i32`, `v2_i64`) is the bias-parameterised composition at
+    /// the sign-bit bias, holds under evaluation, and REFUTES with the bias
+    /// dropped (a zero bias makes each `pxor` the identity): the bias is
+    /// load-bearing in all 16, so none of them is vacuous.
+    #[test]
+    fn x86_v128_unsigned_compare_obligations_refute_without_the_sign_bit_bias() {
+        use crate::smt::VectorArrangement;
+
+        let zero_bias = SmtExpr::bv_const(0, 64).concat(SmtExpr::bv_const(0, 64));
+        let (lhs, _) = x86_v128_from_u64_halves("lhs");
+        let (rhs, _) = x86_v128_from_u64_halves("rhs");
+        let registered_names: std::collections::BTreeSet<String> = all_x86_64_proofs()
+            .into_iter()
+            .map(|obligation| obligation.name)
+            .collect();
+
+        let mut checked = Vec::new();
+        let mut check =
+            |registered: ProofObligation, bias: SmtExpr, lower: &dyn Fn(&SmtExpr) -> SmtExpr| {
+                let name = registered.name.clone();
+                assert!(
+                    registered_names.contains(&name),
+                    "{name}: not registered in all_x86_64_proofs()"
+                );
+                assert_eq!(
+                    registered.aarch64_expr,
+                    lower(&bias),
+                    "{name}: the registered lowering is not the composition at the sign-bit bias"
+                );
+                assert!(
+                    matches!(verify_by_evaluation(&registered), VerificationResult::Valid),
+                    "{name}: the obligation does not hold with its bias"
+                );
+                let mut mutant = registered;
+                mutant.aarch64_expr = lower(&zero_bias);
+                assert!(!mutant.is_degenerate(), "{name}: bias-dropped mutant");
+                let verdict = verify_by_evaluation(&mutant);
+                assert!(
+                    matches!(verdict, VerificationResult::Invalid { .. }),
+                    "{name}: with the bias dropped the obligation must REFUTE, got {verdict:?}"
+                );
+                checked.push(name);
+            };
+
+        for op in X86_V2I64_UNSIGNED_COMPARE_OPS {
+            let cond = trust_cg_lower::instructions::intcc_of_icmp(op);
+            for arrangement in [
+                VectorArrangement::B16,
+                VectorArrangement::H8,
+                VectorArrangement::S4,
+            ] {
+                let (_, eq, gt) = x86_v128_compare_family(arrangement);
+                check(
+                    proof_x86_v128_compare_mask(arrangement, op),
+                    x86_v128_sign_bit_bias_vector(arrangement),
+                    &|bias| {
+                        encode_x86_v128_compare_mask_lowering_with_bias(
+                            &mut X86EncodeModels,
+                            cond,
+                            lhs.clone(),
+                            rhs.clone(),
+                            eq,
+                            gt,
+                            bias,
+                        )
+                    },
+                );
+            }
+            check(
+                proof_x86_v2i64_unsigned_compare_mask(op),
+                x86_v128_sign_bit_bias_vector(VectorArrangement::S4),
+                &|bias| {
+                    encode_x86_v2i64_unsigned_sse2_compare_mask_with_bias(
+                        &mut X86EncodeModels,
+                        cond,
+                        lhs.clone(),
+                        rhs.clone(),
+                        bias,
+                    )
+                },
+            );
+        }
+        checked.sort();
+        checked.dedup();
+        assert_eq!(
+            checked.len(),
+            X86_V2I64_UNSIGNED_COMPARE_OPS.len() * 4,
+            "one obligation per unsigned predicate per descriptor: {checked:?}"
+        );
     }
 
     #[test]
@@ -11654,7 +12114,14 @@ mod tests {
         // and THREE refuting controls per width are asserted by
         // `x86_rol_proofs_are_faithful_and_non_degenerate` and
         // `test_ay_batch_verify_x86_rol_proofs`.
-        assert_eq!(proofs.len(), 543, "Expected 543 x86-64 proof obligations");
+        // +30 (543->573): the const-multiply strength-reduction identity
+        // `x*(2^a±1) == (x<<a)±x` — 7 amounts at 32-bit + 8 at 64-bit, each in
+        // an ADD and a SUB family. SOURCE is a bvmul by the baked constant and
+        // MACHINE a bvshl composed with the real ADD/SUB encoders, so the
+        // sides are structurally distinct (not X==X); non-degeneracy and SEVEN
+        // refuting controls per amount are asserted by
+        // `x86_constmul_shift_proofs_are_faithful_and_non_degenerate`.
+        assert_eq!(proofs.len(), 573, "Expected 573 x86-64 proof obligations");
 
         // Each obligation is independent and every statistical evaluator uses
         // a name-seeded deterministic PRNG. Fan out on a small dedicated pool;

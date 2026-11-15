@@ -220,7 +220,8 @@ impl<P> JitCompileCache<P> {
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            order: VecDeque::with_capacity(max_entries.max(1)),
+            // Capacity is an eviction policy, not an up-front allocation.
+            order: VecDeque::new(),
             max_entries: max_entries.max(1),
             disk_backed: true,
         }
@@ -399,7 +400,7 @@ impl<P> JitCompileCache<P> {
     /// On a cold compile, or when the module builder rejects an L3 payload and
     /// returns freshly encoded IR, that text is persisted atomically. An
     /// accepted L3 payload is not rewritten. The freshly compiled buffer is
-    /// offered to the guarded L2 writer, which is a no-op in production and is
+    /// optionally serialized for the guarded L2 writer, which is a no-op in production and is
     /// usable only through the explicitly unsafe, process-private
     /// test/benchmark hook.
     ///
@@ -408,6 +409,9 @@ impl<P> JitCompileCache<P> {
     /// (`BcpArena`, `BcpWatchedArena`, parent-loop) and entry symbol.
     /// Only the caller can reconstruct a provider from a deserialized
     /// buffer.
+    /// The module builder returns `None` for buffer bytes when serialization
+    /// is unavailable or the optional executable cache is disabled; this does
+    /// not prevent returning the live provider or caching semantic IR text.
     pub fn get_or_compile_with_buffer_disk<E, BuildBuf, BuildMod>(
         &mut self,
         hash: u64,
@@ -418,7 +422,7 @@ impl<P> JitCompileCache<P> {
     ) -> Result<Arc<P>, E>
     where
         BuildBuf: FnOnce(ExecutableBuffer) -> Result<P, E>,
-        BuildMod: FnOnce(Option<String>) -> Result<(P, Vec<u8>, String), E>,
+        BuildMod: FnOnce(Option<String>) -> Result<(P, Option<Vec<u8>>, String), E>,
     {
         let reuse_permit = self.prepare_artifact_reuse();
         // Verify-on-hit (see `get_or_compile`).
@@ -476,11 +480,13 @@ impl<P> JitCompileCache<P> {
             }
             // Offered to the quarantined L2 writer. Production calls are
             // intentionally discarded until relocation-aware replay exists.
-            crate::executable_buffer_cache::write_buffer_bytes_to_disk(
-                hash,
-                &disk_kernel,
-                &buffer_bytes,
-            );
+            if let Some(buffer_bytes) = buffer_bytes {
+                crate::executable_buffer_cache::write_buffer_bytes_to_disk(
+                    hash,
+                    &disk_kernel,
+                    &buffer_bytes,
+                );
+            }
         }
 
         let arc = Arc::new(provider);
@@ -584,6 +590,13 @@ mod tests {
 
     fn small_formula() -> (usize, Vec<Vec<i32>>) {
         (3, vec![vec![1, 2], vec![-2, 3]])
+    }
+
+    #[test]
+    fn maximum_cache_capacity_does_not_allocate_before_any_entry_exists() {
+        let cache = JitCompileCache::<()>::new(usize::MAX);
+        assert!(cache.is_empty());
+        assert_eq!(cache.order.capacity(), 0);
     }
 
     fn other_formula() -> (usize, Vec<Vec<i32>>) {
@@ -842,7 +855,7 @@ mod tests {
         // and warm itself should be under 100 microseconds. We use
         // 500 microseconds as the upper bound to be robust to noisy
         // CI hardware. The eprintln makes the cold/warm numbers
-        // visible in `cargo test -- --nocapture` so the report's
+        // visible in `targo --unverified test -- --nocapture` so the report's
         // headline ("cache hit ~Xus, miss ~Yms") can be quoted
         // directly without a separate microbench binary.
         eprintln!(

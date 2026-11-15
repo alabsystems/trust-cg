@@ -26,16 +26,40 @@
 //!   calls/barriers cannot clobber the address, so any invariant load is
 //!   value-stable. Tier (b): when the loop DOES write memory, the load is
 //!   admitted only when a cheap static predicate proves it disjoint from
-//!   every in-loop store (distinct globals, distinct stack slots, or
-//!   stack-vs-global — see `addr_bases_disjoint`); any store we cannot
-//!   classify fails the loop closed.
+//!   every in-loop store (bounded accesses in distinct fixed stack slots —
+//!   see `addr_bases_disjoint`); symbol names and ADRP pages are not object
+//!   authority, and any store we cannot
+//!   classify fails the loop closed. Both tiers reason only about this
+//!   thread's writes, so a loop containing a load-acquire (`Ldar*`/`Ldaxr`)
+//!   counts as an opaque writer and admits no load: after the acquire the
+//!   thread may observe what another thread published before the matching
+//!   release, and a hoisted load would have read before it.
 //! - **Speculation (fault) safety.** Hoisting to the preheader must not
-//!   introduce a fault on a zero-trip or early-exit path. The load is
-//!   admitted only when it is GUARANTEED TO EXECUTE: its block dominates
-//!   EVERY latch (back-edge source, not just the cached `lp.latch`) and every
-//!   loop-exiting block, AND the preheader unconditionally
-//!   enters the loop (so reaching the preheader implies the loop body runs at
-//!   least once). See `load_guaranteed_to_execute`.
+//!   introduce a fault on a zero-trip, early-exit or non-terminating path. The
+//!   load is admitted only when it is GUARANTEED TO EXECUTE: its block
+//!   dominates EVERY latch (back-edge source, not just the cached `lp.latch`)
+//!   and every loop-exiting block, nothing the first iteration runs before it
+//!   can stop it (an earlier branch in its block, or an in-loop guard carrier,
+//!   `BRK` or call on the way to it) or spin in an inner cycle before it (an
+//!   inner loop, reducible or not, between the header and the load's block),
+//!   AND the preheader unconditionally enters the loop (so reaching the
+//!   preheader implies the first iteration reaches the load unless an earlier
+//!   access of that iteration faults). See `load_guaranteed_to_execute`. A
+//!   load that is NOT guaranteed to execute is still admitted when its
+//!   address is a **dereferenceable frame access**: the base resolves, through
+//!   copies and immediate offsets, to one fixed-size stack slot's address and
+//!   the accessed bytes lie inside that slot (`frame_access_in_bounds`). The
+//!   frame is mapped for the whole activation, so executing such a load early
+//!   cannot fault. This is the AArch64 port of the x86 invariant-load tier's
+//!   speculation argument (`x86_licm.rs`).
+//! - **Placement.** The value-stability tiers examine in-loop writers only, so
+//!   a hoisted load must read memory in the state the loop is entered with:
+//!   it is inserted after every preheader store, call and mid-block trap guard,
+//!   right before the preheader's branch tail (`preheader_insert_pos`). The
+//!   loaded value then equals what the original load would read on every
+//!   iteration, and it is used only where the original load ran. A preheader
+//!   whose call an exception can leave through (an invoke block) is refused:
+//!   code after that call does not run on the edge to the landing pad.
 //! - **Excluded load forms.** Pre/post-index writeback loads (they redefine
 //!   the base), load-pairs (two defs), register-offset and GOT/TLS/literal
 //!   loads, and acquire/atomic loads (`Ldar*`) are never hoisted.
@@ -71,9 +95,10 @@
 //!
 //! Reference: LLVM `LICM.cpp`
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::aarch64_regs::{X0, gpr32_to_gpr64, preg_class};
+use trust_cg_ir::function::StackSlotAllocationKind;
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PReg, ProofAnnotation,
     ProvenanceMap, RegClass, StackSlotId, VReg,
@@ -81,15 +106,44 @@ use trust_cg_ir::{
 
 use crate::dom::DomTree;
 use crate::effects::{
-    aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg, opcode_effect,
-    produces_value, reads_flags, single_inst_def, writes_flags,
+    aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg, is_load_acquire,
+    opcode_effect, produces_value, reads_flags, single_inst_def, writes_flags,
 };
 use crate::interfaces::OpInterfaces;
-use crate::loops::{LoopAnalysis, NaturalLoop};
+use crate::loops::{LoopAnalysis, NaturalLoop, blocks_before_first_reaching};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// Loop-Invariant Code Motion pass.
-pub struct LoopInvariantCodeMotion;
+#[derive(Clone, Copy, Debug)]
+pub struct LoopInvariantCodeMotion {
+    /// Admit loop-invariant loads that are not guaranteed to execute when they
+    /// read inside one fixed-size stack slot (see the module docs). The
+    /// pipeline turns this off for the `licmframespec` disable-list key.
+    frame_speculation: bool,
+}
+
+impl Default for LoopInvariantCodeMotion {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoopInvariantCodeMotion {
+    /// The pass with every tier on (the default pipeline configuration).
+    pub const fn new() -> Self {
+        Self {
+            frame_speculation: true,
+        }
+    }
+
+    /// The pass without the dereferenceable-frame speculation of loads that
+    /// are not guaranteed to execute (the load rules before 2026-09-28).
+    pub const fn without_frame_speculation() -> Self {
+        Self {
+            frame_speculation: false,
+        }
+    }
+}
 
 impl MachinePass for LoopInvariantCodeMotion {
     fn name(&self) -> &str {
@@ -99,7 +153,7 @@ impl MachinePass for LoopInvariantCodeMotion {
     fn run(&mut self, func: &mut MachFunction) -> bool {
         let dom = DomTree::compute(func);
         let loop_analysis = LoopAnalysis::compute(func, &dom);
-        Self::run_with_loop_analysis(func, &dom, &loop_analysis)
+        Self::run_with_loop_analysis(func, &dom, &loop_analysis, self.frame_speculation)
     }
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
@@ -107,7 +161,7 @@ impl MachinePass for LoopInvariantCodeMotion {
         // cache's tree and loops are the ones computed for this CFG, which no
         // pass since has changed (the manager invalidates them when it does).
         let (dom, loop_analysis) = analyses.domtree_and_loops(func);
-        Self::run_with_loop_analysis(func, dom, loop_analysis)
+        Self::run_with_loop_analysis(func, dom, loop_analysis, self.frame_speculation)
     }
 
     fn run_with_provenance(
@@ -133,7 +187,7 @@ impl MachinePass for LoopInvariantCodeMotion {
         // cache's tree and loops are the ones computed for this CFG, which no
         // pass since has changed (the manager invalidates them when it does).
         let (dom, loop_analysis) = analyses.domtree_and_loops(func);
-        Self::run_with_loop_analysis(func, dom, loop_analysis)
+        Self::run_with_loop_analysis(func, dom, loop_analysis, self.frame_speculation)
     }
 }
 
@@ -142,6 +196,7 @@ impl LoopInvariantCodeMotion {
         func: &mut MachFunction,
         dom: &DomTree,
         loop_analysis: &LoopAnalysis,
+        frame_speculation: bool,
     ) -> bool {
         if loop_analysis.is_empty() {
             return false;
@@ -196,13 +251,27 @@ impl LoopInvariantCodeMotion {
         // and the one instruction it creates is a `B` branch with no modeled
         // definition positions, so it is absent from both maps.
         let def_counts = build_def_counts(func);
-        let def_map = build_def_map(func);
+        let def_map = crate::effects::build_reaching_def_map_by_vreg(func);
+        // Each block's position in `block_order`, so a loop visits its own
+        // body blocks in layout order without walking the whole layout (see
+        // `body_blocks_in_layout`). The instruction tiers below never change
+        // the layout, so one map, built by the second loop that asks, serves
+        // every later loop.
+        let layout = LayoutPositions::new();
 
         // Built lazily by the first loop that reaches the constant-chain tier,
-        // shared by the rest, dropped after any loop that hoisted.
+        // shared by the rest, and brought up to date after any loop that
+        // hoisted (`ConstChainIndex::refresh`).
         let mut chain_index: Option<ConstChainIndex> = None;
-        for lp in &loops {
-            if std::env::var_os("TCG_DUMP_CHAINS").is_some() {
+        // Def-site index shared by frame speculation and bounded-stack alias
+        // admission: built on demand, shared by later loops, and dropped after
+        // any loop that hoisted (a move changes def positions).
+        let mut frame_defs: Option<FrameDefSites> = None;
+        // Invoke blocks are refused as preheaders (`hoist_loop_invariants`).
+        // The tiers below move no call, so one collection serves every loop.
+        let unwind_exits = crate::eh_call_custody::UnwindExits::collect(func);
+        for (loop_index, lp) in loops.iter().enumerate() {
+            if dump_chains_enabled() {
                 let mut b: Vec<u32> = lp.body.iter().map(|x| x.0).collect();
                 b.sort_unstable();
                 eprintln!(
@@ -213,9 +282,31 @@ impl LoopInvariantCodeMotion {
                     b
                 );
             }
-            if hoist_loop_invariants(func, lp, &dom, &def_counts, &def_map, &mut chain_index) {
+            let mut touched: Vec<BlockId> = Vec::new();
+            if hoist_loop_invariants(
+                func,
+                lp,
+                dom,
+                &unwind_exits,
+                &def_counts,
+                &def_map,
+                &layout,
+                &mut chain_index,
+                &mut frame_defs,
+                frame_speculation,
+                &mut touched,
+            ) {
                 changed = true;
-                chain_index = None;
+                // After the last loop nothing reads the index again.
+                let later_loops = loop_index + 1 < loops.len();
+                if let Some(index) = &mut chain_index
+                    && (!later_loops
+                        || force_chain_index_rebuild()
+                        || !index.refresh(func, &touched))
+                {
+                    chain_index = None;
+                }
+                frame_defs = None;
             }
         }
 
@@ -228,9 +319,10 @@ impl LoopInvariantCodeMotion {
         // preheader, never mutating the CFG or the whole-function single-def
         // counts (so the freshly recomputed `def_counts` stays valid).
         if pure_call_hoist_enabled() {
+            let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
             let def_counts = build_def_counts(func);
             for lp in &loops {
-                if hoist_pure_call_clusters(func, lp, &def_counts, &dom) {
+                if hoist_pure_call_clusters(func, lp, &def_counts, dom, &protected) {
                     changed = true;
                 }
             }
@@ -243,13 +335,19 @@ impl LoopInvariantCodeMotion {
 /// Hoist loop-invariant instructions from a single loop to its preheader.
 ///
 /// Returns true if any instructions were hoisted.
+#[allow(clippy::too_many_arguments)]
 fn hoist_loop_invariants(
     func: &mut MachFunction,
     lp: &NaturalLoop,
     dom: &DomTree,
+    unwind_exits: &crate::eh_call_custody::UnwindExits,
     def_counts: &HashMap<VReg, usize>,
     def_map: &HashMap<VReg, InstId>,
+    layout: &LayoutPositions,
     chain_index: &mut Option<ConstChainIndex>,
+    frame_defs: &mut Option<FrameDefSites>,
+    frame_speculation: bool,
+    touched: &mut Vec<BlockId>,
 ) -> bool {
     // LICM currently hoists by physically moving instructions into an existing
     // preheader block. Creating a synthetic preheader here is not sound yet:
@@ -272,6 +370,21 @@ fn hoist_loop_invariants(
         return false;
     }
 
+    // An invoke block is not a preheader to hoist into. Its call leaves the
+    // block for a landing pad in the middle, and hoisted code goes after every
+    // preheader call (`preheader_insert_pos`), so it would not run on that
+    // edge although the block dominates the pad. Two readers would then see a
+    // register the unwind path never wrote. CSE or GVN can reuse the hoisted
+    // def in a pad outside the loop; their mid-block exit rule covers that.
+    // When the pad is itself the loop header (a catch-and-retry loop, entered
+    // only over exception edges, whose preheader is therefore always an
+    // invoke block), the loop reads the hoisted def directly, and only this
+    // refusal keeps the O2/O3 code right. Hoisting ahead of the call is no
+    // remedy: a load must read memory after the call's writes.
+    if unwind_exits.leaves_mid_block(preheader) {
+        return false;
+    }
+
     // Build def maps before classifying invariants. Trust Codegen machine IR is not
     // guaranteed to be strict SSA after lowering: block-argument copies and
     // materialization chains can reuse VRegs along different paths. LICM's
@@ -280,13 +393,18 @@ fn hoist_loop_invariants(
     // `def_counts` and `def_map` are supplied by the caller and built ONCE per
     // pass run — see `run_with_loop_analysis`.
 
+    // The body's blocks in `block_order` order: every scan of the body below
+    // visits them in that order, as filtering `block_order` did.
+    let body_blocks = layout.body_blocks_in_layout(func, &lp.body);
+
     // Build a map: VReg -> (inst_id, block_id) for definitions inside the loop.
-    let loop_defs = build_loop_defs(func, &lp.body);
+    let loop_defs = build_loop_defs(func, &body_blocks);
 
     // Per-loop memory-write facts drive load admission: whether the loop writes
     // memory at all (tier a vs b), whether any writer is opaque (fails tier b
     // closed), and the classified base of every simple in-loop store.
-    let mem_facts = compute_loop_memory_facts(func, lp, &def_map, &def_counts);
+    let mem_facts =
+        compute_loop_memory_facts(func, dom, &body_blocks, def_map, def_counts, frame_defs);
 
     // A hoisted load lands in the preheader, which executes unconditionally.
     // That is fault-safe against a zero-trip loop ONLY if reaching the preheader
@@ -300,7 +418,7 @@ fn hoist_loop_invariants(
     };
 
     // Set of VRegs known to be loop-invariant.
-    let mut invariant_vregs: HashSet<VReg> = HashSet::new();
+    let mut invariant_vregs: HashSet<VReg> = HashSet::default();
 
     // Instructions to hoist: (inst_id, source_block).
     let mut to_hoist: Vec<(InstId, BlockId)> = Vec::new();
@@ -330,95 +448,42 @@ fn hoist_loop_invariants(
     // STILL inside a loop, the move is close to free, and every chain length is
     // admitted. At `lp.depth == 1` the move is the final "pull out of the
     // OUTERMOST loop" step, which shrinks a single hot loop's body and perturbs
-    // downstream passes (see ★ below), so a chain-length FLOOR applies there.
+    // downstream passes, so a chain-length FLOOR applies there.
     // `depth` is 1-based (outermost == 1). Deeply-nested kernels (perlin's
     // fade/lerp coefficients, live in the depth-3/4 inner loops) lift across every
     // inner level and out of the hottest loops regardless of that floor.
     //
-    // DEPTH-1 FLOOR: chains of >= 3 instructions hoist BY DEFAULT;
-    // `TCG_LICM_DEPTH1_MULTI` lowers the floor to >= 2. The default exists because
-    // a 4-instruction 64-bit magic reciprocal rebuilt every iteration cost
-    // p6_branch_match its entire ~2% vs LLVM (200M iterations; binary-patching the
-    // chain out of the loop reproduced LLVM parity exactly, 1380 -> 1330ms), and
-    // the same rematerialized-constant class is p3_gcd's residual. Measured
-    // old-vs-new, interleaved min-of-7: p6 0.989 (1.021 -> 1.011 vs LLVM), b1
-    // collateral 1.022 -> 0.997 vs LLVM, p3 neutral 0.998; 13/18 corpus programs
-    // at or below LLVM runtime parity.
-    //
-    // WHY THE FLOOR IS 3, AND WHY LOWERING IT TO 2 STAYS OPT-IN.
-    // The blanket depth-1 hoist was tried and reverted (475d949b): it regressed
-    // flops-1 by 8% and flops-7 by 2.3%. That revert note attributed the loss to
-    // "fetch-alignment effects when a single hot loop's body shrinks", and this
-    // comment used to claim that requiring `chain.len() >= 2` "keeps the reverted
-    // single-instruction case excluded while admitting the shape where the win is
-    // large."
-    //
-    // ★ BOTH HALVES OF THAT CLAIM ARE FALSE — measured 2026-08-15, whole corpus,
-    // tcg-vs-tcg (same .ll, same driver object, interleaved, min of 13, with a
-    // byte-identical null arm on every row):
-    //
-    //   * A floor of 2 does NOT exclude the reverted regressions. flops-1 still
-    //     loses 8.15% and flops-7 1.73% WITH `chain.len() >= 2` in force — flops-1
-    //     reproducing the cited 8% almost exactly. The chain it hoists there is a
-    //     2-instruction `mov`+`movk` of the loop bound 0x12a05f20, admitted by
-    //     precisely that guard. (It IS excluded by the >= 3 default above; that is
-    //     why the default is 3 and the floor-2 arm is behind an env var.)
-    //   * It is NOT a fetch-alignment effect. Re-run under
-    //     TCG_NO_LOOP_HEAD_ALIGN=1 the numbers are unchanged (flops-1 1.0815 vs
-    //     1.0810, flops-3 0.7969 vs 0.7987, misr 1.0187 vs 1.0188), so R3 clears
-    //     alignment as the cause. (Independently: 32-byte head alignment was
-    //     priced at ZERO benefit on this target — see loop_align.rs.)
-    //
-    // What the floor-2 arm actually does is PERTURB DOWNSTREAM PASSES. On flops-3
-    // the hoist suppresses a 4x unroll (`add x1,#4` -> `add x0,#1`), and the
-    // un-unrolled form is 20% FASTER (0.7980/0.7997). Both flops programs run a
-    // fixed 312.5M iterations (this llvm-test-suite copy is truncated to Module 1
-    // with its outputs stabilized to `0 * 1e-30`, so `loops` never recalibrates),
-    // giving exact per-iteration deltas: flops-1 -2 insts/iter for +8% cycles,
-    // flops-3 +4 insts/iter for -20% cycles. Instruction count does not predict
-    // the sign, let alone the size.
-    //
-    // ⇒ At floor 2 the tier is a SHAPE LOTTERY, not a cost/benefit the guard can
-    // be tuned to capture. Corpus verdict over the 40 programs that arm changes:
-    // geomean 1.0014 min / 1.0022 tmed against a null arm of 1.0002 / 1.0017 —
-    // inside the instrument's own envelope, i.e. nothing. `TCG_LICM_DEPTH1_MULTI`
-    // is kept OPT-IN for that reason, NOT because floor 2 is safe. Note precisely
-    // what this does and does not say about the DEFAULT: the flops-1 regressor is
-    // a 2-instruction chain and the >= 3 floor excludes it, but the floor-3 arm
-    // was priced on the 18-program corpus above, not on these 65. Treat any new
-    // depth-1 regression as this class first, and re-price before lowering the
-    // floor.
-    //
-    // A movz+movk... chain is a different trade from a single-instruction lift:
-    // 2-4 instructions per iteration, and on p4_matmul's initialization loop a
-    // 4-instruction 64-bit magic constant is rebuilt every iteration inside a
-    // ~10-instruction body (measured: 12 movz/movk in `main` against LLVM's 6,
-    // LLVM hoisting the same constant). Real wins do exist in the set — almabench
-    // 0.9945/0.9964 in both alignment regimes — but at floor 2 they are
-    // outnumbered by same-size losses.
+    // DEPTH-1 FLOOR: chains of >= 3 instructions hoist BY DEFAULT (a
+    // 4-instruction 64-bit magic reciprocal rebuilt every iteration is the
+    // motivating shape). `TCG_LICM_DEPTH1_MULTI` lowers the floor to >= 2 and
+    // stays OPT-IN: a 2-instruction hoist perturbs downstream passes (for
+    // example it can suppress an unroll), the sign of the effect is not
+    // predicted by instruction count, and the corpus result of floor 2 is
+    // within measurement noise. The effect is not fetch alignment; it
+    // reproduces with `TCG_NO_LOOP_HEAD_ALIGN=1`. Treat any new depth-1
+    // regression as this downstream-perturbation class first, and re-price
+    // (`tools/perf_sweep_interleaved.py`) before lowering the floor. The
+    // measurements are in commit `90b28b615`.
     let depth1_floor = if crate::env_lock::var_os("TCG_LICM_DEPTH1_MULTI").is_some() {
         2
     } else {
         3
     };
-    if const_chain_hoist_enabled() {
-        let chains = {
-            let index = chain_index.get_or_insert_with(|| ConstChainIndex::build(func));
-            find_hoistable_constant_chains(func, &lp.body, def_counts, index)
-        };
-        for (carrier, chain) in chains {
-            // At depth 1 admit only chains long enough that the removed
-            // per-iteration fetches dominate the downstream-pass perturbation the
-            // move causes (it is NOT a fetch-alignment effect — see the R3 control
-            // in the tier note above).
-            if lp.depth == 1 && chain.len() < depth1_floor {
-                continue;
-            }
-            invariant_vregs.insert(carrier);
-            constant_chains.push((carrier, chain.iter().map(|(id, _)| *id).collect()));
-            for site in chain {
-                to_hoist.push(site);
-            }
+    let chains = {
+        let index = chain_index.get_or_insert_with(|| ConstChainIndex::build(func));
+        find_hoistable_constant_chains(func, &lp.body, def_counts, index)
+    };
+    for (carrier, chain) in chains {
+        // At depth 1 admit only chains long enough that the removed
+        // per-iteration fetches dominate the downstream-pass perturbation the
+        // move causes (see DEPTH-1 FLOOR above).
+        if lp.depth == 1 && chain.len() < depth1_floor {
+            continue;
+        }
+        invariant_vregs.insert(carrier);
+        constant_chains.push((carrier, chain.iter().map(|(id, _)| *id).collect()));
+        for site in chain {
+            to_hoist.push(site);
         }
     }
 
@@ -428,13 +493,9 @@ fn hoist_loop_invariants(
     while found_new {
         found_new = false;
 
-        for &block_id in &func.block_order {
-            if !lp.body.contains(&block_id) {
-                continue;
-            }
-
+        for &block_id in &body_blocks {
             let block = func.block(block_id);
-            for &inst_id in &block.insts {
+            for (inst_pos, &inst_id) in block.insts.iter().enumerate() {
                 // Skip instructions already marked for hoisting.
                 if to_hoist.iter().any(|(id, _)| *id == inst_id) {
                     continue;
@@ -510,7 +571,7 @@ fn hoist_loop_invariants(
                 let mut all_invariant = true;
                 aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
                     if !inst.operands.get(pos).is_some_and(|op| {
-                        is_operand_loop_invariant(op, &loop_defs, &invariant_vregs, &def_counts)
+                        is_operand_loop_invariant(op, &loop_defs, &invariant_vregs, def_counts)
                     }) {
                         all_invariant = false;
                     }
@@ -528,12 +589,14 @@ fn hoist_loop_invariants(
                         func,
                         dom,
                         lp,
-                        block_id,
+                        (block_id, inst_pos),
                         inst,
                         preheader_enters_loop,
                         &mem_facts,
-                        &def_map,
-                        &def_counts,
+                        def_map,
+                        def_counts,
+                        frame_defs,
+                        frame_speculation,
                     )
                 {
                     continue;
@@ -551,27 +614,15 @@ fn hoist_loop_invariants(
         return false;
     }
 
-    // Hoist instructions to the preheader.
-    // Insert before the preheader's ENTIRE branch tail — not merely before its
-    // last instruction. A rotated loop's preheader is the guard block, whose
-    // tail is `CmpRR; BCond(cc, header); B exit`: inserting at `len - 1` places
-    // the hoisted instruction BETWEEN the BCond and the B, where it executes
-    // only on the fall-through (loop-skipped) path — the loop body then reads
-    // an undefined register, a MISCOMPILE (found by revmapfuzz: `x ^ x` in the
-    // body rewritten to `MovI 0`, hoisted as invariant, sunk below the guard's
-    // BCond). The correct position is before the FIRST branch/terminator:
-    // every path out of the preheader (including into the loop) executes it,
-    // and every vreg the hoisted instruction reads is still defined earlier
-    // (preheader vreg defs precede the tail — branches and bare compares
-    // define none; loop-external defs dominate the preheader; earlier-hoisted
-    // invariants were inserted at this same position before it). Defensively
-    // also step back over a preceding NON-value-producing flag-setter (the
-    // `CmpRR/CmpRI` feeding the BCond) so hoisted code never sits between a
-    // compare and its conditional branch — hoisted instructions are flag-free
-    // today (`is_pure` rejects NZCV writers), but placement before the compare
-    // keeps this correct even if that ever changed. Value-producing
-    // flag-setters (`AddsRR`) are NOT stepped over: a hoisted instruction
-    // could legitimately read their result.
+    // Hoist instructions to the preheader, each right before its control-
+    // transfer tail (`preheader_insert_pos` states the placement rule). The
+    // blocks whose instruction lists change are reported to the caller.
+    touched.push(preheader);
+    for (_, source_block) in &to_hoist {
+        if !touched.contains(source_block) {
+            touched.push(*source_block);
+        }
+    }
     for (inst_id, source_block) in &to_hoist {
         // Remove from source block.
         let block = func.block_mut(*source_block);
@@ -579,34 +630,77 @@ fn hoist_loop_invariants(
 
         // Recompute per insertion (immutable borrows) so successive hoists
         // land in discovery order: each before the tail, after its deps.
-        let ph_insts = &func.block(preheader).insts;
-        let first_term = ph_insts
-            .iter()
-            .position(|&id| {
-                let inst = func.inst(id);
-                inst.is_branch() || inst.is_terminator()
-            })
-            .unwrap_or(ph_insts.len());
-        let insert_pos = if first_term > 0 {
-            let prev = func.inst(ph_insts[first_term - 1]);
-            if prev.has_side_effects() && !produces_value(prev.opcode) {
-                first_term - 1
-            } else {
-                first_term
-            }
-        } else {
-            0
-        };
+        let insert_pos = preheader_insert_pos(func, preheader);
         func.block_mut(preheader).insts.insert(insert_pos, *inst_id);
     }
 
     // X5 value-level nets: ordinary moved values use the single-def check;
     // MOVZ/MOVK materialization carriers are intentionally multi-def and use a
     // separate tied-chain order/consumer check.
-    verify_preheader_defs_precede_uses(func, preheader, &def_counts);
+    verify_preheader_defs_precede_uses(func, preheader, def_counts);
     verify_preheader_constant_chains(func, preheader, &constant_chains);
 
     true
+}
+
+/// Where an instruction hoisted out of a loop is inserted into its preheader:
+/// right before the block's control-transfer tail, after every other
+/// instruction of the block.
+///
+/// Placement is part of LICM's soundness argument, not a layout choice:
+///
+/// * Every path out of the preheader, including the edge into the loop, must
+///   execute the hoisted instruction. Inserting at `len - 1` of a rotated
+///   loop's guard preheader (`CmpRR; BCond(cc, header); B exit`) put it
+///   between the `BCond` and the `B`, on the loop-skipped path only — a
+///   miscompile revmapfuzz found (`x ^ x` rewritten to `MovI 0`, hoisted,
+///   sunk below the guard's `BCond`). The tail therefore starts at the FIRST
+///   real branch or terminator. An exception edge leaves earlier, at a call:
+///   `hoist_loop_invariants` refuses a preheader that holds a call an
+///   exception can leave through (an invoke block, `UnwindExits`).
+/// * A hoisted load must read memory in the state the loop is entered with:
+///   the value-stability tiers of `load_is_admissible` examine in-loop writers
+///   only. The insertion point therefore stays after every preheader store and
+///   call. It also stays after every mid-block trap guard
+///   ([`AArch64Opcode::is_falls_through_trap_pseudo`]: `TrapBoundsCheckExact`
+///   and the other carriers that are flagged `IS_BRANCH | IS_TERMINATOR` but
+///   fall through to live code in the same block), so a hoisted load never
+///   runs before a guard that would trap first, and never before the stores
+///   behind that guard. Placing it before such a carrier, or stepping back over
+///   a store that ends the preheader, read a stack slot before the preheader
+///   wrote it (the dereferenceable-frame tier hoisting `acc += a[2]` above
+///   `a[x & 3] = x + 4`: `e2e_aarch64_vec_len_guard_differential`'s
+///   preheader-writer rows).
+/// * The one instruction the point steps back over is a flag-only compare
+///   (no register result, no memory access: `CmpRR`/`CmpRI`/`Tst`/`Fcmp` and
+///   their spellings) right before the tail, so hoisted code never sits
+///   between a compare and its conditional branch. Hoisted instructions are
+///   flag-free today (`is_pure` rejects NZCV writers), so this is defensive.
+///   Value-producing flag setters (`AddsRR`) are not stepped over: a hoisted
+///   instruction may read their result.
+///
+/// Every vreg a hoisted instruction reads is defined before this point:
+/// preheader defs precede the tail (branches and bare compares define none),
+/// loop-external defs dominate the preheader, and earlier-hoisted invariants
+/// were inserted at this same position before it.
+fn preheader_insert_pos(func: &MachFunction, preheader: BlockId) -> usize {
+    let insts = &func.block(preheader).insts;
+    let tail = insts
+        .iter()
+        .position(|&id| {
+            let inst = func.inst(id);
+            (inst.is_branch() || inst.is_terminator())
+                && !inst.opcode.is_falls_through_trap_pseudo()
+        })
+        .unwrap_or(insts.len());
+    let steps_over_compare = tail
+        .checked_sub(1)
+        .and_then(|prev| insts.get(prev))
+        .is_some_and(|&id| {
+            let opcode = func.inst(id).opcode;
+            writes_flags(opcode) && !produces_value(opcode) && opcode_effect(opcode).is_pure()
+        });
+    if steps_over_compare { tail - 1 } else { tail }
 }
 
 // ===========================================================================
@@ -789,6 +883,7 @@ fn hoist_pure_call_clusters(
     lp: &NaturalLoop,
     def_counts: &HashMap<VReg, usize>,
     dom: &DomTree,
+    protected: &crate::eh_call_custody::ProtectedCalls,
 ) -> bool {
     // Only hoist when a natural preheader exists (we never synthesize one — the
     // same conservatism as the value-producer and load tiers above).
@@ -834,16 +929,22 @@ fn hoist_pure_call_clusters(
         }
     }
 
-    let loop_defs = build_loop_defs(func, &lp.body);
+    let body_blocks: Vec<BlockId> = func
+        .block_order
+        .iter()
+        .copied()
+        .filter(|b| lp.body.contains(b))
+        .collect();
+    let loop_defs = build_loop_defs(func, &body_blocks);
     // v1 does not chain a hoisted cluster's result into a later cluster's
     // invariance, so the invariant seed stays empty: argument sources must be
     // defined OUTSIDE the loop.
-    let invariant_vregs: HashSet<VReg> = HashSet::new();
+    let invariant_vregs: HashSet<VReg> = HashSet::default();
 
     // Discover clusters in deterministic order (block_order, then ascending
     // in-block index). `claimed` guards against overlapping `InstId` ranges.
     let mut clusters: Vec<Vec<InstId>> = Vec::new();
-    let mut claimed: HashSet<InstId> = HashSet::new();
+    let mut claimed: HashSet<InstId> = HashSet::default();
     for &block_id in &func.block_order {
         if !lp.body.contains(&block_id) {
             continue;
@@ -856,6 +957,7 @@ fn hoist_pure_call_clusters(
                 inst.opcode == AArch64Opcode::Bl && inst.proof == Some(ProofAnnotation::Pure)
             };
             if is_pure_call
+                && !protected.contains(iid)
                 && let Some(cluster) = recognize_pure_call_cluster(
                     func,
                     block_id,
@@ -901,30 +1003,15 @@ fn hoist_pure_call_clusters(
             .retain(|id| !to_remove.contains(id));
     }
 
-    // Insert before the preheader's ENTIRE branch tail (same placement rule as
-    // the value-producer splice at the top of this file): every path out of the
-    // preheader — including into the loop — executes the cluster, and a flag-free
-    // cluster never lands between a compare and its conditional branch. The
-    // hoisted cluster's argument sources are loop-invariant (defined outside the
-    // loop), so they dominate the preheader and are defined before this point.
-    let ph_insts = &func.block(preheader).insts;
-    let first_term = ph_insts
-        .iter()
-        .position(|&id| {
-            let inst = func.inst(id);
-            inst.is_branch() || inst.is_terminator()
-        })
-        .unwrap_or(ph_insts.len());
-    let insert_pos = if first_term > 0 {
-        let prev = func.inst(ph_insts[first_term - 1]);
-        if prev.has_side_effects() && !produces_value(prev.opcode) {
-            first_term - 1
-        } else {
-            first_term
-        }
-    } else {
-        0
-    };
+    // Insert before the preheader's control-transfer tail (the placement rule
+    // of `preheader_insert_pos`, shared with the value-producer splice at the
+    // top of this file): every path out of the preheader — including into the
+    // loop — executes the cluster after every preheader store, call and trap
+    // guard, and a flag-free cluster never lands between a compare and its
+    // conditional branch. The hoisted cluster's argument sources are
+    // loop-invariant (defined outside the loop), so they dominate the
+    // preheader and are defined before this point.
+    let insert_pos = preheader_insert_pos(func, preheader);
     for (offset, iid) in ordered.into_iter().enumerate() {
         func.block_mut(preheader)
             .insts
@@ -952,8 +1039,20 @@ fn inst_touches_fixed_register(inst: &MachInst) -> bool {
         || inst.operands.iter().any(operand_touches_fixed_register)
 }
 
+/// Cached `TCG_DUMP_CHAINS` gate.
+///
+/// PURE DIAGNOSTIC: it selects only whether the chain trace prints. It is read
+/// once per natural loop in the hoist driver and once per multi-def carrier in
+/// the chain scan, so uncached it was a `getenv` proportional to the function's
+/// loop and carrier counts on every compile with the consumer off.
+fn dump_chains_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TCG_DUMP_CHAINS").is_some())
+}
+
 fn build_def_counts(func: &MachFunction) -> HashMap<VReg, usize> {
-    let mut counts: HashMap<VReg, usize> = HashMap::new();
+    let mut counts: HashMap<VReg, usize> = HashMap::default();
 
     for &block_id in &func.block_order {
         let block = func.block(block_id);
@@ -972,14 +1071,11 @@ fn build_def_counts(func: &MachFunction) -> HashMap<VReg, usize> {
 /// inside the loop body.
 fn build_loop_defs(
     func: &MachFunction,
-    body: &HashSet<BlockId>,
+    body_blocks: &[BlockId],
 ) -> HashMap<VReg, (InstId, BlockId)> {
-    let mut defs: HashMap<VReg, (InstId, BlockId)> = HashMap::new();
+    let mut defs: HashMap<VReg, (InstId, BlockId)> = HashMap::default();
 
-    for &block_id in &func.block_order {
-        if !body.contains(&block_id) {
-            continue;
-        }
+    for &block_id in body_blocks {
         let block = func.block(block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
@@ -1037,7 +1133,10 @@ fn is_operand_loop_invariant(
         // plus an already-invariant base) hoist out of the loop. A jump-table
         // `Adr` carries a `JumpTableIndex`, not a `Symbol`, so it stays in the
         // `_ => false` arm and is never hoisted.
-        MachOperand::Imm(_) | MachOperand::FImm(_) | MachOperand::Symbol(_) => true,
+        MachOperand::Imm(_)
+        | MachOperand::FImm(_)
+        | MachOperand::Symbol(_)
+        | MachOperand::ExactModuleSymbol(_) => true,
         _ => false,
     }
 }
@@ -1045,22 +1144,6 @@ fn is_operand_loop_invariant(
 // ===========================================================================
 // Constant-chain hoisting: lift `MOVZ/MOVK` immediate materialization chains
 // ===========================================================================
-
-/// Bisect kill switch for the constant-chain hoist tier. Set
-/// `TCG_NO_LICM_CONST_CHAIN` to fall back to the single-instruction-only LICM
-/// behaviour (encodable `FmovImm`/`Movz` constants still lift; multi-`MOVK`
-/// chains and their consuming `FMOV Dn, Xv` stay in the loop).
-fn const_chain_hoist_enabled() -> bool {
-    std::env::var_os("TCG_NO_LICM_CONST_CHAIN").is_none()
-}
-
-/// Bisect kill switch for the INTEGER widening of the constant-chain tier.
-/// Set `TCG_NO_LICM_INT_CONST_CHAIN` to restrict the tier to its original
-/// FP-literal scope (chains consumed by an `FMOV Dn, Xv` only); multi-`MOVK`
-/// integer constants — srem/sdiv magic reciprocals — then stay in the loop.
-fn int_const_chain_hoist_enabled() -> bool {
-    std::env::var_os("TCG_NO_LICM_INT_CONST_CHAIN").is_none()
-}
 
 /// Whether `opcode` heads an integer-constant materialization chain: a
 /// stand-alone immediate move whose result is the constant so far.
@@ -1111,13 +1194,12 @@ fn const_chain_operands_are_immediate(inst: &MachInst) -> bool {
 ///   hoist (`MOVK` is tied def-use, the carrier is multiply-defined); a
 ///   single-def `MOVZ`/`MOVN` head with no patches already lifts on the
 ///   ordinary single-def path, so admitting it here would only reorder
-///   existing hoists. Behind its own kill switch
-///   (`TCG_NO_LICM_INT_CONST_CHAIN`) and the depth-1 chain-length floor at the
+///   existing hoists. Behind the depth-1 chain-length floor at the
 ///   call site (>= 3 instructions by default, >= 2 under
 ///   `TCG_LICM_DEPTH1_MULTI`), which keeps the documented short-chain
 ///   "pull out of the OUTERMOST loop" regression class (flops-1/2/7) excluded
 ///   for integer chains too. That class is downstream-pass perturbation, not
-///   fetch alignment — see the R3 control in the tier note at the call site.
+///   fetch alignment — see the DEPTH-1 FLOOR note at the call site.
 ///
 /// # Soundness
 /// * **`V` holds a single value.** Requiring the whole def set to be one head
@@ -1133,14 +1215,16 @@ fn const_chain_operands_are_immediate(inst: &MachInst) -> bool {
 /// * **No partial-value hazard.** Contiguity guarantees no non-chain
 ///   instruction observes `V` between the head and the final `MOVK`, so lifting
 ///   the run cannot change any value an intermediate reader would have seen.
+///
 /// The loop-INDEPENDENT half of `find_hoistable_constant_chains`, built once
 /// per LICM run and shared by every loop of the function: it reads only
 /// `block_order`, each block's instruction list and each instruction's
 /// opcode/operands, so between two loops that hoisted nothing it is
 /// bit-for-bit what a rebuild would produce. A hoist moves instructions
-/// (in-block indices change), so the caller drops it after any loop that
-/// returned `true` and the next loop rebuilds it — exactly the per-loop
-/// rebuild it replaces.
+/// (in-block indices change) between the blocks it reports, so after any loop
+/// that returned `true` the caller brings the index up to date for exactly
+/// those blocks ([`Self::refresh`]); rebuilding it for every such loop made a
+/// function with many hoisting loops quadratic in them (L14-P6).
 struct ConstChainIndex {
     /// Whole-function def sites of each vreg: (block, index-in-block, inst).
     defs: HashMap<VReg, Vec<(BlockId, usize, InstId)>>,
@@ -1152,14 +1236,14 @@ struct ConstChainIndex {
 
 impl ConstChainIndex {
     fn build(func: &MachFunction) -> Self {
-        let mut defs: HashMap<VReg, Vec<(BlockId, usize, InstId)>> = HashMap::new();
-        let mut fmov_gpr_sources: HashSet<VReg> = HashSet::new();
+        let mut defs: HashMap<VReg, Vec<(BlockId, usize, InstId)>> = HashMap::default();
+        let mut fmov_gpr_sources: HashSet<VReg> = HashSet::default();
         // Position of each block in the (deterministic) `block_order`, so the
         // returned chains can be sorted into a stable program order below — the
         // `defs` HashMap iteration order is nondeterministic and would otherwise
         // leak into which chain lands first in the preheader (a reproducibility
         // break for a verified compiler; cf. LoopAnalysis's BTreeMap rationale).
-        let mut block_pos: HashMap<BlockId, usize> = HashMap::new();
+        let mut block_pos: HashMap<BlockId, usize> = HashMap::default();
         for (pos, &block_id) in func.block_order.iter().enumerate() {
             block_pos.insert(block_id, pos);
         }
@@ -1186,6 +1270,111 @@ impl ConstChainIndex {
             block_pos,
         }
     }
+
+    /// Make the index what [`Self::build`] would build now, after a hoist
+    /// that moved instructions only between the blocks in `touched` (the
+    /// preheader and the loop's source blocks). `false` when this cannot be
+    /// done exactly (a block appears twice in `block_order`, or a touched
+    /// block is not in it); the caller then drops the index.
+    ///
+    /// The instructions inside `touched` are the same before and after such a
+    /// hoist, only their blocks and positions differ, so the def sites to
+    /// replace are exactly those of the vregs defined in `touched` now, and
+    /// the FMOV sources (a set over all instructions of the layout) and the
+    /// block positions do not change. Each touched vreg's sites are rebuilt
+    /// from the touched blocks' current lists and put back in (layout
+    /// position, index) order, the order `build` records them in.
+    fn refresh(&mut self, func: &MachFunction, touched: &[BlockId]) -> bool {
+        if self.block_pos.len() != func.block_order.len()
+            || touched.iter().any(|b| !self.block_pos.contains_key(b))
+        {
+            return false;
+        }
+        let touched_set: HashSet<BlockId> = touched.iter().copied().collect();
+        let mut fresh: HashMap<VReg, Vec<(BlockId, usize, InstId)>> = HashMap::default();
+        for &block_id in touched {
+            for (idx, &inst_id) in func.block(block_id).insts.iter().enumerate() {
+                for_each_inst_def(func.inst(inst_id), |def| {
+                    fresh.entry(def).or_default().push((block_id, idx, inst_id));
+                });
+            }
+        }
+        for (vreg, sites) in fresh {
+            let entry = self.defs.entry(vreg).or_default();
+            entry.retain(|(block_id, _, _)| !touched_set.contains(block_id));
+            entry.extend(sites);
+            let block_pos = &self.block_pos;
+            entry.sort_by_key(|&(block_id, idx, _)| (block_pos[&block_id], idx));
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests set this to drop the constant-chain index after every hoisting
+    /// loop (the per-loop rebuild `ConstChainIndex::refresh` replaces).
+    static FORCE_CHAIN_INDEX_REBUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn force_chain_index_rebuild() -> bool {
+    #[cfg(test)]
+    return FORCE_CHAIN_INDEX_REBUILD.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
+/// Each block's position in `block_order` (`None` when a block appears there
+/// twice), built by the second [`Self::body_blocks_in_layout`] question: a
+/// function with one loop pays only the literal filter, as it did before.
+struct LayoutPositions {
+    positions: std::cell::OnceCell<Option<HashMap<BlockId, usize>>>,
+    literal_answers: std::cell::Cell<u32>,
+}
+
+impl LayoutPositions {
+    fn new() -> Self {
+        Self {
+            positions: std::cell::OnceCell::new(),
+            literal_answers: std::cell::Cell::new(0),
+        }
+    }
+
+    fn of(func: &MachFunction) -> Option<HashMap<BlockId, usize>> {
+        let mut positions: HashMap<BlockId, usize> = HashMap::default();
+        for (position, &block_id) in func.block_order.iter().enumerate() {
+            if positions.insert(block_id, position).is_some() {
+                return None;
+            }
+        }
+        Some(positions)
+    }
+
+    /// `block_order` filtered by membership in `body`: sorted from the
+    /// positions when the layout lists each block once, the literal filter
+    /// for the first question and when a block is listed twice.
+    fn body_blocks_in_layout(&self, func: &MachFunction, body: &HashSet<BlockId>) -> Vec<BlockId> {
+        let literal = || {
+            func.block_order
+                .iter()
+                .copied()
+                .filter(|b| body.contains(b))
+                .collect()
+        };
+        if self.positions.get().is_none() && self.literal_answers.get() == 0 {
+            self.literal_answers.set(1);
+            return literal();
+        }
+        let Some(positions) = self.positions.get_or_init(|| Self::of(func)) else {
+            return literal();
+        };
+        let mut blocks: Vec<(usize, BlockId)> = body
+            .iter()
+            .filter_map(|b| positions.get(b).map(|&position| (position, *b)))
+            .collect();
+        blocks.sort_unstable();
+        blocks.into_iter().map(|(_, b)| b).collect()
+    }
 }
 
 fn find_hoistable_constant_chains(
@@ -1207,11 +1396,10 @@ fn find_hoistable_constant_chains(
     } = index;
     type ConstantChain = ((usize, usize), VReg, Vec<(InstId, BlockId)>);
 
-    let int_chains = int_const_chain_hoist_enabled();
     // DIAGNOSTIC (default off, TCG_DUMP_CHAINS=1): why each multi-def carrier
     // was declined. Only multi-def carriers are reported — single-def vregs are
     // the overwhelming majority and are not chain candidates.
-    let dump = std::env::var_os("TCG_DUMP_CHAINS").is_some();
+    let dump = dump_chains_enabled();
     let mut chains: Vec<ConstantChain> = Vec::new();
     for (&carrier, sites) in defs.iter() {
         macro_rules! decline {
@@ -1231,7 +1419,7 @@ fn find_hoistable_constant_chains(
         // to an `FMOV Dn, Xv`) at any length, integer carriers only as
         // multi-def chains (head + >=1 `MOVK`) — the shape the ordinary
         // single-def path can never hoist.
-        if !(fmov_gpr_sources.contains(&carrier) || int_chains && sites.len() >= 2) {
+        if !(fmov_gpr_sources.contains(&carrier) || sites.len() >= 2) {
             decline!("scope: not FP-literal and (int chains disabled or < 2 defs)");
         }
         // Sanity: our def collection must agree with the pass-wide count.
@@ -1244,7 +1432,7 @@ fn find_hoistable_constant_chains(
             decline!("defs span multiple blocks");
         }
         if !body.contains(&block_id) {
-            if std::env::var_os("TCG_DUMP_CHAINS").is_some() && sites.len() >= 2 {
+            if dump_chains_enabled() && sites.len() >= 2 {
                 let mut body_sorted: Vec<u32> = body.iter().map(|b| b.0).collect();
                 body_sorted.sort_unstable();
                 let blk = func.block(block_id);
@@ -1359,54 +1547,89 @@ fn simple_store_base(inst: &MachInst) -> Option<&MachOperand> {
 /// accesses cannot alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AddrBase {
-    /// Derives directly from a named global symbol via `Adrp`/`AddPCRel`.
-    /// Distinct symbols name distinct, non-overlapping link-time objects.
-    Global(String),
-    /// Derives directly from a specific stack slot via `AddPCRel base, ss#`.
-    /// Distinct slots are distinct frame allocations that never overlap.
+    /// A complete access inside a real fixed slot, through a direct reaching
+    /// `AddPCRel dst, SP, StackSlot` definition. Frame layout places distinct
+    /// positive-sized fixed slots separately; an unbounded offset is not one.
     Stack(StackSlotId),
     /// Anything we cannot prove — an arbitrary pointer. Fails disjointness.
     Unknown,
 }
 
-/// Classify the provenance of an address held in `base_op`.
-///
-/// Only a single-def base register whose defining instruction is *directly* an
-/// `Adrp`/`AddPCRel` of a symbol, or an `AddPCRel` of a stack slot, is trusted.
-/// Any runtime arithmetic on the address (an intervening `AddRR`/`AddRI`, a
-/// value loaded from memory, a call result, …) yields `Unknown` — this is the
-/// "direct symbol/slot + immediate form only" conservatism that keeps the
-/// disjointness facts rock-solid.
+/// Classify only a complete, bounded direct-frame access. Symbol spellings do
+/// not bind link-time object identity or size, and ADRP supplies only a page.
+/// Copies, pointer/integer casts and arithmetic get no new alias permission.
 fn classify_addr_base(
     func: &MachFunction,
-    base_op: &MachOperand,
+    dom: &DomTree,
+    at: (BlockId, usize),
+    access: &MachInst,
     def_map: &HashMap<VReg, InstId>,
     def_counts: &HashMap<VReg, usize>,
+    frame_defs: &mut Option<FrameDefSites>,
 ) -> AddrBase {
-    let MachOperand::VReg(base) = base_op else {
+    if access.flags != access.opcode.default_flags()
+        || !access.implicit_defs.is_empty()
+        || !access.implicit_uses.is_empty()
+    {
+        return AddrBase::Unknown;
+    }
+    let [
+        MachOperand::VReg(_),
+        MachOperand::VReg(base),
+        MachOperand::Imm(off),
+    ] = access.operands.as_slice()
+    else {
         return AddrBase::Unknown;
     };
-    if def_counts.get(base).copied().unwrap_or(0) != 1 {
+    if base.class != RegClass::Gpr64
+        || base.id >= func.next_vreg
+        || def_counts.get(base).copied() != Some(1)
+    {
         return AddrBase::Unknown;
     }
     let Some(&def_inst) = def_map.get(base) else {
         return AddrBase::Unknown;
     };
     let inst = func.inst(def_inst);
-    match inst.opcode {
-        // `AddPCRel dst, page, :lo12:sym`  -> global symbol address
-        // `AddPCRel dst, SP,  ss#`         -> stack-slot address
-        AArch64Opcode::AddPCRel => match inst.operands.get(2) {
-            Some(MachOperand::Symbol(s)) => AddrBase::Global(s.clone()),
-            Some(MachOperand::StackSlot(id)) => AddrBase::Stack(*id),
-            _ => AddrBase::Unknown,
-        },
-        // `Adrp dst, sym` -> page address of a global symbol.
-        AArch64Opcode::Adrp => match inst.operands.get(1) {
-            Some(MachOperand::Symbol(s)) => AddrBase::Global(s.clone()),
-            _ => AddrBase::Unknown,
-        },
-        _ => AddrBase::Unknown,
+    if inst.opcode != AArch64Opcode::AddPCRel
+        || inst.flags != inst.opcode.default_flags()
+        || !inst.implicit_defs.is_empty()
+        || !inst.implicit_uses.is_empty()
+        || !matches!(inst.operands.as_slice(),
+            [MachOperand::VReg(dst), sp, MachOperand::StackSlot(_)]
+                if dst == base && is_stack_pointer(sp))
+    {
+        return AddrBase::Unknown;
+    }
+    let width = plain_load_width(access).or_else(|| plain_store_width(access));
+    let Some(width) = width else {
+        return AddrBase::Unknown;
+    };
+    let sites = frame_defs.get_or_insert_with(|| FrameDefSites::build(func));
+    // The older frame-speculation resolver remains unchanged; ONLY this new
+    // tier checks numeric W/X definition aliases in addition to typed sites.
+    if sites.numeric_definition_count(func, base.id) != 1 {
+        return AddrBase::Unknown;
+    }
+    let Some((slot, base_off)) = resolve_frame_address(func, dom, sites, *base, at, 1) else {
+        return AddrBase::Unknown;
+    };
+    let Some(info) = func.stack_slots.get(slot.0 as usize) else {
+        return AddrBase::Unknown;
+    };
+    if !info.align.is_power_of_two()
+        || i32::try_from(info.size).is_err()
+        || i32::try_from(info.align).is_err()
+    {
+        return AddrBase::Unknown;
+    }
+    let Some(start) = base_off.checked_add(*off) else {
+        return AddrBase::Unknown;
+    };
+    if fixed_frame_interval_in_bounds(func, slot, start, width) {
+        AddrBase::Stack(slot)
+    } else {
+        AddrBase::Unknown
     }
 }
 
@@ -1417,22 +1640,19 @@ fn addr_bases_disjoint(load: &AddrBase, store: &AddrBase) -> bool {
         (AddrBase::Unknown, _) | (_, AddrBase::Unknown) => false,
         // Distinct stack slots are distinct frame allocations.
         (AddrBase::Stack(a), AddrBase::Stack(b)) => a != b,
-        // Distinct global symbols are distinct link-time objects.
-        (AddrBase::Global(a), AddrBase::Global(b)) => a != b,
-        // The stack and the data segment are disjoint address ranges.
-        (AddrBase::Stack(_), AddrBase::Global(_)) | (AddrBase::Global(_), AddrBase::Stack(_)) => {
-            true
-        }
     }
 }
 
 /// Per-loop memory-write summary consumed by [`load_is_admissible`].
 struct LoopMemFacts {
-    /// Any body instruction writes memory / calls / is a barrier.
+    /// Any body instruction writes memory / calls / is a barrier, or is a
+    /// load-acquire (after which this thread may observe other threads'
+    /// writes).
     writes_memory: bool,
     /// Some memory writer is not a simple, classifiable base+immediate store
-    /// (a call, barrier, atomic, store-pair, writeback store, …). When set,
-    /// tier (b) admits nothing: we cannot bound what the loop clobbers.
+    /// (a call, barrier, atomic, store-pair, writeback store, load-acquire,
+    /// …). When set, tier (b) admits nothing: we cannot bound what the loop
+    /// clobbers.
     opaque_writer: bool,
     /// Classified base of every simple in-loop store (only meaningful when
     /// `opaque_writer` is false).
@@ -1442,65 +1662,119 @@ struct LoopMemFacts {
 /// Summarize the memory writes of a loop body in one pass.
 fn compute_loop_memory_facts(
     func: &MachFunction,
-    lp: &NaturalLoop,
+    dom: &DomTree,
+    body_blocks: &[BlockId],
     def_map: &HashMap<VReg, InstId>,
     def_counts: &HashMap<VReg, usize>,
+    frame_defs: &mut Option<FrameDefSites>,
 ) -> LoopMemFacts {
     let mut writes_memory = false;
-    let mut opaque_writer = false;
     let mut store_bases: Vec<AddrBase> = Vec::new();
+    // This summary has one consumer: load admission. One opaque or unknown
+    // writer makes every tier-(b) load impossible; no later writer can restore
+    // permission. Drop partial rows, but keep any shared frame cache intact.
+    // The separate instruction-motion scan still visits the complete body.
+    let opaque = || LoopMemFacts {
+        writes_memory: true,
+        opaque_writer: true,
+        store_bases: Vec::new(),
+    };
 
-    for &block_id in &func.block_order {
-        if !lp.body.contains(&block_id) {
-            continue;
-        }
-        for &inst_id in &func.block(block_id).insts {
+    for &block_id in body_blocks {
+        for (pos, &inst_id) in func.block(block_id).insts.iter().enumerate() {
             let inst = func.inst(inst_id);
+            // A load-acquire writes nothing (effect class `Load`), yet once it
+            // reads a value a release wrote, this thread may observe every
+            // write another thread made before that release. A plain load
+            // hoisted to the preheader reads before every in-loop acquire, so
+            // no store base can bound what the acquire makes visible.
+            if is_load_acquire(inst.opcode) {
+                return opaque();
+            }
             let eff = opcode_effect(inst.opcode);
             // `writes_memory()` already covers stores, calls and barriers
             // (all `MemoryEffect::Call`); `is_barrier()` is included for
             // explicitness.
             if eff.writes_memory() || eff.is_barrier() {
                 writes_memory = true;
-                match simple_store_base(inst) {
-                    Some(base) => {
-                        store_bases.push(classify_addr_base(func, base, def_map, def_counts));
-                    }
-                    None => opaque_writer = true,
+                if simple_store_base(inst).is_none() {
+                    return opaque();
                 }
+                let base = classify_addr_base(
+                    func,
+                    dom,
+                    (block_id, pos),
+                    inst,
+                    def_map,
+                    def_counts,
+                    frame_defs,
+                );
+                if matches!(base, AddrBase::Unknown) {
+                    return opaque();
+                }
+                store_bases.push(base);
             }
         }
     }
 
     LoopMemFacts {
         writes_memory,
-        opaque_writer,
+        opaque_writer: false,
         store_bases,
     }
 }
 
-/// The classic LICM "guaranteed to execute" (a.k.a. must-execute) test for the
-/// block containing a candidate load: the load runs on every path that enters
-/// the loop, so hoisting it to the preheader introduces no fault that the
-/// original program did not already have.
+/// The classic LICM "guaranteed to execute" (a.k.a. must-execute) test for a
+/// candidate load at `load_pos` in `load_block`: the first iteration of every
+/// entry into the loop reaches the load, so hoisting it to the preheader
+/// introduces no fault that the original program did not already have.
 ///
-/// Two conditions:
-/// - **Dominates EVERY latch** — i.e. every back-edge source, not merely the
-///   one `lp.latch` happens to cache. The load then runs on every complete
-///   iteration (which is also what rules out a load buried in a conditional
-///   inside an infinite loop with no exiting block, where the exit test below
-///   is vacuous).
-/// - **Dominates every loop-exiting block** — the load runs before control can
-///   leave the loop, so it is not skipped on an early-exit path.
+/// Four conditions:
+/// - **Its block dominates EVERY latch** — i.e. every back-edge source, not
+///   merely the one `lp.latch` happens to cache. The load then runs on every
+///   complete iteration (which is also what rules out a load buried in a
+///   conditional inside an infinite loop with no exiting block, where the exit
+///   test below is vacuous).
+/// - **Its block dominates every loop-exiting block** — the load runs before
+///   control can leave the loop, so it is not skipped on an early-exit path.
+/// - **Nothing the first iteration runs before it can stop it.** Dominance is
+///   block-granular and sees only CFG edges, but the first iteration can stop
+///   before the load inside a block: at an earlier branch in the load's own
+///   block (`select_assert`'s mid-block `b.eq trap`), or at an instruction
+///   that ends the program or leaves the loop with no CFG edge
+///   ([`stops_without_cfg_edge`]: a guard carrier such as
+///   `TrapBoundsCheckExact`) anywhere in the load's block before it or in a
+///   loop block the header reaches without passing through the load's block.
+///   Hoisting past such a stop turns a program that trapped (`BRK`) before the
+///   load into one that faults on the hoisted load. The blocks before the
+///   load's block need no branch check: a CFG exit from one of them already
+///   fails the dominance condition above.
+/// - **Nothing the first iteration runs before it can spin.** The blocks the
+///   header reaches without passing through the load's block
+///   ([`blocks_before_first_reaching`]) contain no cycle. A cycle there is an
+///   inner loop, reducible or not, that the first iteration can enter before
+///   the load and may never leave. Rust and trust-ir do not assume forward
+///   progress, so that non-termination is the program's behavior, and hoisting
+///   the load turns it into a fault. Dominance cannot see such a cycle: it
+///   neither leaves the loop nor returns to the header, so it adds no exiting
+///   block and no latch. Without a cycle every path from the header through
+///   those blocks is finite, and since none of them is a latch or an exiting
+///   block (each is reached avoiding the load's block, which dominates all of
+///   those), it ends by entering the load's block.
 ///
 /// The caller separately requires the preheader to unconditionally enter the
-/// loop, which together with this test guarantees the load ran at least once in
-/// the original whenever the preheader executes.
-fn load_guaranteed_to_execute(
+/// loop. Together: whenever the preheader executes, the original program's
+/// first iteration reaches the load, unless an earlier memory access of that
+/// iteration faults first, in which case the hoisted program faults on the
+/// hoisted load instead.
+///
+/// This is the one must-execute test for loads: LICM's guaranteed tier and
+/// alias-versioned load hoisting ([`crate::alias_hoist`]) both call it.
+pub(crate) fn load_guaranteed_to_execute(
     func: &MachFunction,
     dom: &DomTree,
     lp: &NaturalLoop,
-    load_block: BlockId,
+    (load_block, load_pos): (BlockId, usize),
 ) -> bool {
     // Defense in depth: the cached representative latch must be dominated even
     // if `lp.body` were somehow stale and missed it in the sweep below.
@@ -1517,7 +1791,42 @@ fn load_guaranteed_to_execute(
             return false;
         }
     }
-    true
+    // The load's block before the load: any branch, terminator or stop.
+    let before_load = func.block(load_block).insts.iter().take(load_pos);
+    if before_load
+        .map(|&id| func.inst(id))
+        .any(|inst| inst.is_branch() || inst.is_terminator() || stops_without_cfg_edge(inst))
+    {
+        return false;
+    }
+    // Every loop block the header reaches without passing through the load's
+    // block (none when the load is in the header): no cycle, and no stop.
+    let Some(before_block) = blocks_before_first_reaching(func, lp, load_block) else {
+        return false;
+    };
+    !before_block.iter().any(|&b| {
+        func.block(b)
+            .insts
+            .iter()
+            .any(|&id| stops_without_cfg_edge(func.inst(id)))
+    })
+}
+
+/// Whether `inst` can end the program or leave the loop without a CFG edge,
+/// so that the dominance conditions of [`load_guaranteed_to_execute`] cannot
+/// see it:
+/// - every `Trap*` guard carrier ([`AArch64Opcode::is_trap_pseudo`]). The
+///   falls-through ones (`TrapBoundsCheckExact`, `TrapNullIfZero`, ...) trap
+///   only when their condition holds and continue to live code in the same
+///   block; none of them adds a successor.
+/// - `BRK`, which is flagged `HAS_SIDE_EFFECTS` only, not as a terminator.
+/// - a call, which need not return. Both callers of
+///   [`load_guaranteed_to_execute`] already refuse every loop that calls (the
+///   value-stability tiers of [`load_is_admissible`], and alias hoisting's
+///   store bounding); this keeps the must-execute argument from depending on
+///   that.
+fn stops_without_cfg_edge(inst: &MachInst) -> bool {
+    inst.opcode.is_trap_pseudo() || inst.opcode == AArch64Opcode::Brk || inst.is_call()
 }
 
 /// Decide whether a loop-invariant plain load may be hoisted out of `lp`.
@@ -1532,24 +1841,34 @@ fn load_is_admissible(
     func: &MachFunction,
     dom: &DomTree,
     lp: &NaturalLoop,
-    load_block: BlockId,
+    (load_block, load_pos): (BlockId, usize),
     inst: &MachInst,
     preheader_enters_loop: bool,
     mem_facts: &LoopMemFacts,
     def_map: &HashMap<VReg, InstId>,
     def_counts: &HashMap<VReg, usize>,
+    frame_defs: &mut Option<FrameDefSites>,
+    frame_speculation: bool,
 ) -> bool {
     // (1) Speculation guard — do not introduce a fault on a zero-trip or
-    // early-exit path.
-    if !preheader_enters_loop {
-        return false;
-    }
-    if !load_guaranteed_to_execute(func, dom, lp, load_block) {
-        return false;
+    // early-exit path. Either the load runs on every entry into the loop, or
+    // it reads inside one fixed-size stack slot and so cannot fault wherever
+    // it executes (only when frame speculation is enabled).
+    let guaranteed =
+        preheader_enters_loop && load_guaranteed_to_execute(func, dom, lp, (load_block, load_pos));
+    if !guaranteed {
+        if !frame_speculation {
+            return false;
+        }
+        let sites = frame_defs.get_or_insert_with(|| FrameDefSites::build(func));
+        if !frame_access_in_bounds(func, dom, sites, (load_block, load_pos), inst) {
+            return false;
+        }
     }
 
     // (2a) Tier (a): a loop that never writes memory (no stores, no calls, no
-    // barriers) cannot clobber the invariant address, so the load is stable.
+    // barriers, no load-acquires) cannot clobber the invariant address, so
+    // the load is stable.
     if !mem_facts.writes_memory {
         return true;
     }
@@ -1560,10 +1879,15 @@ fn load_is_admissible(
     if mem_facts.opaque_writer {
         return false;
     }
-    let Some(base) = inst.operands.get(1) else {
-        return false;
-    };
-    let load_base = classify_addr_base(func, base, def_map, def_counts);
+    let load_base = classify_addr_base(
+        func,
+        dom,
+        (load_block, load_pos),
+        inst,
+        def_map,
+        def_counts,
+        frame_defs,
+    );
     if matches!(load_base, AddrBase::Unknown) {
         return false;
     }
@@ -1573,11 +1897,305 @@ fn load_is_admissible(
         .all(|store_base| addr_bases_disjoint(&load_base, store_base))
 }
 
-/// Build a whole-function map from each value-producing VReg to its defining
-/// [`InstId`]. Only meaningful for single-def VRegs (the caller pairs this with
-/// `def_counts` to reject multi-def carriers).
-fn build_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
-    crate::effects::build_reaching_def_map_by_vreg(func)
+/// Every definition site `(block, position, inst)` of every VReg, in block
+/// order. Built lazily and reused until a hoist changes instruction positions.
+struct FrameDefSites {
+    sites: HashMap<VReg, Vec<(BlockId, usize, InstId)>>,
+    /// All stored definition references, including other W/X views and blocks
+    /// outside layout. Used ONLY by the direct-slot tier-(b) admission.
+    numeric_counts: Option<HashMap<u32, usize>>,
+}
+
+impl FrameDefSites {
+    fn build(func: &MachFunction) -> Self {
+        let mut sites: HashMap<VReg, Vec<(BlockId, usize, InstId)>> = HashMap::default();
+        for &block_id in &func.block_order {
+            for (pos, &inst_id) in func.block(block_id).insts.iter().enumerate() {
+                for_each_inst_def(func.inst(inst_id), |def| {
+                    sites.entry(def).or_default().push((block_id, pos, inst_id));
+                });
+            }
+        }
+        Self {
+            sites,
+            numeric_counts: None,
+        }
+    }
+
+    fn numeric_definition_count(&mut self, func: &MachFunction, id: u32) -> usize {
+        let counts = self.numeric_counts.get_or_insert_with(|| {
+            let mut counts = HashMap::default();
+            for block in &func.blocks {
+                for &inst in &block.insts {
+                    for_each_inst_def(func.inst(inst), |def| {
+                        *counts.entry(def.id).or_default() += 1;
+                    });
+                }
+            }
+            counts
+        });
+        counts.get(&id).copied().unwrap_or(0)
+    }
+}
+
+/// Most copy / immediate-offset links [`resolve_frame_address`] follows.
+const FRAME_ADDRESS_FUEL: u32 = 8;
+
+/// Bytes a plain hoistable load reads, or `None` for a shape this rule does
+/// not model (the width of an `LdrRI` is its destination register's).
+fn plain_load_width(inst: &MachInst) -> Option<i64> {
+    match inst.opcode {
+        AArch64Opcode::LdrbRI | AArch64Opcode::LdrsbRI => Some(1),
+        AArch64Opcode::LdrhRI | AArch64Opcode::LdrshRI => Some(2),
+        AArch64Opcode::LdrRI => match inst.operands.first() {
+            Some(MachOperand::VReg(dst)) => match dst.class {
+                RegClass::Gpr64
+                | RegClass::Gpr32
+                | RegClass::Fpr128
+                | RegClass::Fpr64
+                | RegClass::Fpr32
+                | RegClass::Fpr16
+                | RegClass::Fpr8 => Some(i64::from(dst.class.size_bytes())),
+                RegClass::System => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Bytes a simple scalar store writes, using the opcode's narrow width or
+/// its value carrier's width exactly as the ordinary memory lowering does.
+fn plain_store_width(inst: &MachInst) -> Option<i64> {
+    match inst.opcode {
+        AArch64Opcode::StrbRI => Some(1),
+        AArch64Opcode::StrhRI => Some(2),
+        AArch64Opcode::StrRI => match inst.operands.first() {
+            Some(MachOperand::VReg(src)) if src.class != RegClass::System => {
+                Some(i64::from(src.class.size_bytes()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The stack pointer, in either operand spelling (`PReg` 31 or `Special(SP)`).
+fn is_stack_pointer(op: &MachOperand) -> bool {
+    match op {
+        MachOperand::PReg(p) => *p == trust_cg_ir::regs::SP,
+        MachOperand::Special(s) => *s == trust_cg_ir::SpecialReg::SP,
+        _ => false,
+    }
+}
+
+/// `MovR v, v` / `Copy v, v`: a definition that never changes `v`.
+fn is_self_copy(inst: &MachInst, v: VReg) -> bool {
+    matches!(inst.opcode, AArch64Opcode::MovR | AArch64Opcode::Copy)
+        && matches!(
+            inst.operands.as_slice(),
+            [MachOperand::VReg(d), MachOperand::VReg(s)] if *d == v && *s == v
+        )
+}
+
+/// The one definition of `v` that can change its value, when it reaches the use
+/// at `(use_block, use_pos)` on every path: every other definition of `v` is a
+/// self-copy, and this one lies in a block that strictly dominates `use_block`
+/// or earlier in `use_block`. `None` for a register with no definition (a
+/// parameter), two value-changing definitions, or one that does not reach.
+fn reaching_value_def(
+    func: &MachFunction,
+    dom: &DomTree,
+    sites: &FrameDefSites,
+    v: VReg,
+    (use_block, use_pos): (BlockId, usize),
+) -> Option<(BlockId, usize, InstId)> {
+    let mut changing = sites
+        .sites
+        .get(&v)?
+        .iter()
+        .filter(|&&(_, _, id)| !is_self_copy(func.inst(id), v));
+    let &(def_block, def_pos, def_id) = changing.next()?;
+    if changing.next().is_some() {
+        return None;
+    }
+    let reaches_use = if def_block == use_block {
+        def_pos < use_pos
+    } else {
+        dom.dominates(def_block, use_block)
+    };
+    reaches_use.then_some((def_block, def_pos, def_id))
+}
+
+/// The constant `v` holds at the use, when its reaching value definition is a
+/// plain `Movz dst, #imm` (no shift) or `MovI dst, #imm`.
+fn frame_offset_constant(
+    func: &MachFunction,
+    dom: &DomTree,
+    sites: &FrameDefSites,
+    v: VReg,
+    at: (BlockId, usize),
+) -> Option<i64> {
+    let (_, _, def_id) = reaching_value_def(func, dom, sites, v, at)?;
+    let def = func.inst(def_id);
+    match (def.opcode, def.operands.as_slice()) {
+        (
+            AArch64Opcode::Movz | AArch64Opcode::MovI,
+            [MachOperand::VReg(d), MachOperand::Imm(c)],
+        ) if *d == v => Some(*c),
+        _ => None,
+    }
+}
+
+/// Resolve the value `v` holds at `at = (use_block, use_pos)` to a stack slot
+/// and a byte offset from its start, or `None` when that is not provable.
+///
+/// The value comes from its [`reaching_value_def`], which must be the slot
+/// address itself (`AddPCRel dst, SP, StackSlot`), a full-width copy of a
+/// resolvable register, `AddRI` / `SubRI` of one with an immediate, `AddRR`
+/// of one with a constant register, or `Madd dst, x, y, base` (a
+/// constant-index GEP) of one with `x` and `y` constants
+/// ([`frame_offset_constant`]). Anything else (a loaded pointer, a call
+/// result, a parameter, other register arithmetic) is unresolved.
+fn resolve_frame_address(
+    func: &MachFunction,
+    dom: &DomTree,
+    sites: &FrameDefSites,
+    v: VReg,
+    at: (BlockId, usize),
+    fuel: u32,
+) -> Option<(StackSlotId, i64)> {
+    if fuel == 0 || v.class != RegClass::Gpr64 {
+        return None;
+    }
+    let (def_block, def_pos, def_id) = reaching_value_def(func, dom, sites, v, at)?;
+    let def = func.inst(def_id);
+    let at_def = (def_block, def_pos);
+    match (def.opcode, def.operands.as_slice()) {
+        (AArch64Opcode::AddPCRel, [MachOperand::VReg(d), base, MachOperand::StackSlot(slot)])
+            if *d == v && is_stack_pointer(base) =>
+        {
+            Some((*slot, 0))
+        }
+        (
+            AArch64Opcode::MovR | AArch64Opcode::Copy,
+            [MachOperand::VReg(d), MachOperand::VReg(src)],
+        ) if *d == v => resolve_frame_address(func, dom, sites, *src, at_def, fuel - 1),
+        (
+            AArch64Opcode::AddRI,
+            [
+                MachOperand::VReg(d),
+                MachOperand::VReg(src),
+                MachOperand::Imm(k),
+            ],
+        ) if *d == v => {
+            let (slot, off) = resolve_frame_address(func, dom, sites, *src, at_def, fuel - 1)?;
+            Some((slot, off.checked_add(*k)?))
+        }
+        (
+            AArch64Opcode::SubRI,
+            [
+                MachOperand::VReg(d),
+                MachOperand::VReg(src),
+                MachOperand::Imm(k),
+            ],
+        ) if *d == v => {
+            let (slot, off) = resolve_frame_address(func, dom, sites, *src, at_def, fuel - 1)?;
+            Some((slot, off.checked_sub(*k)?))
+        }
+        (
+            AArch64Opcode::Madd,
+            [
+                MachOperand::VReg(d),
+                MachOperand::VReg(x),
+                MachOperand::VReg(y),
+                MachOperand::VReg(src),
+            ],
+        ) if *d == v => {
+            let x = frame_offset_constant(func, dom, sites, *x, at_def)?;
+            let y = frame_offset_constant(func, dom, sites, *y, at_def)?;
+            let (slot, off) = resolve_frame_address(func, dom, sites, *src, at_def, fuel - 1)?;
+            Some((slot, off.checked_add(x.checked_mul(y)?)?))
+        }
+        // `AddRR dst, a, b` with one side a resolvable slot address and the
+        // other a constant register: the `AddRI` case after GVN/CSE has
+        // replaced the immediate by an equal constant already in a register
+        // (the field address `&vec.ptr = slot + 8` beside `MovZ 8`).
+        (
+            AArch64Opcode::AddRR,
+            [
+                MachOperand::VReg(d),
+                MachOperand::VReg(a),
+                MachOperand::VReg(b),
+            ],
+        ) if *d == v => {
+            let (base, k) = match frame_offset_constant(func, dom, sites, *b, at_def) {
+                Some(k) => (*a, k),
+                None => (*b, frame_offset_constant(func, dom, sites, *a, at_def)?),
+            };
+            let (slot, off) = resolve_frame_address(func, dom, sites, base, at_def, fuel - 1)?;
+            Some((slot, off.checked_add(k)?))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the plain load `inst` at `(block, pos)` reads only bytes inside one
+/// fixed-size stack slot, so executing it anywhere in this activation cannot
+/// fault. The access `[start, start + width)`, `start = base + off`, must
+/// satisfy `0 <= start` and `start + width <= slot.size` for the slot the base
+/// resolves to.
+fn frame_access_in_bounds(
+    func: &MachFunction,
+    dom: &DomTree,
+    sites: &FrameDefSites,
+    at: (BlockId, usize),
+    inst: &MachInst,
+) -> bool {
+    let Some(width) = plain_load_width(inst) else {
+        return false;
+    };
+    let (base, off) = match inst.operands.as_slice() {
+        [
+            MachOperand::VReg(_),
+            MachOperand::VReg(base),
+            MachOperand::Imm(off),
+        ] => (*base, *off),
+        _ => return false,
+    };
+    let Some((slot, base_off)) =
+        resolve_frame_address(func, dom, sites, base, at, FRAME_ADDRESS_FUEL)
+    else {
+        return false;
+    };
+    let Some(start) = base_off.checked_add(off) else {
+        return false;
+    };
+    fixed_frame_interval_in_bounds(func, slot, start, width)
+}
+
+/// Shared interval check for the existing frame-speculation path and the
+/// direct-slot alias tier. Distinct-slot permission also checks frame layout
+/// size/alignment domains and direct reaching address custody above.
+fn fixed_frame_interval_in_bounds(
+    func: &MachFunction,
+    slot: StackSlotId,
+    start: i64,
+    width: i64,
+) -> bool {
+    let Some(info) = usize::try_from(slot.0)
+        .ok()
+        .and_then(|i| func.stack_slots.get(i))
+    else {
+        return false;
+    };
+    if info.allocation != StackSlotAllocationKind::Fixed || info.size == 0 {
+        return false;
+    }
+    let Some(end) = start.checked_add(width) else {
+        return false;
+    };
+    start >= 0 && end <= i64::from(info.size)
 }
 
 // ===========================================================================
@@ -1793,7 +2411,7 @@ fn region_loop_runs_at_least_once(
     // Vregs with a def in a block that is neither on the chain nor in the loop
     // body: their value at the preheader is not a pure function of the chain,
     // so they are never consulted (see the doc comment).
-    let mut untrusted: HashSet<VReg> = HashSet::new();
+    let mut untrusted: HashSet<VReg> = HashSet::default();
     for &block_id in &func.block_order {
         if chain_set.contains(&block_id) || lp.body.contains(&block_id) {
             continue;
@@ -1805,7 +2423,7 @@ fn region_loop_runs_at_least_once(
         }
     }
 
-    let mut vals: HashMap<VReg, i64> = HashMap::new();
+    let mut vals: HashMap<VReg, i64> = HashMap::default();
     for &blk in &chain {
         region_interp_const_defs(func, blk, &mut vals, &untrusted);
     }
@@ -1995,7 +2613,7 @@ fn region_verify_cfg_after_surgery(
     }
 
     // (2) reachability from entry (no orphaned block).
-    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seen: HashSet<BlockId> = HashSet::default();
     let mut stack = vec![func.entry];
     while let Some(b) = stack.pop() {
         if seen.insert(b) {
@@ -2052,7 +2670,7 @@ fn verify_preheader_defs_precede_uses(
     def_counts: &HashMap<VReg, usize>,
 ) {
     let insts = &func.block(preheader).insts;
-    let mut def_pos: HashMap<VReg, usize> = HashMap::new();
+    let mut def_pos: HashMap<VReg, usize> = HashMap::default();
     for (i, &iid) in insts.iter().enumerate() {
         for_each_inst_def(func.inst(iid), |d| {
             if def_counts.get(&d).copied().unwrap_or(0) == 1 {
@@ -2222,7 +2840,7 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
         // L4: exactly one exit block, inside the outer body, and every exit
         // edge leaves from `inner.header` (stricter than the x86 original,
         // whose edge surgery silently assumed it).
-        let mut exits: HashSet<BlockId> = HashSet::new();
+        let mut exits: HashSet<BlockId> = HashSet::default();
         let mut exit_from_non_header = false;
         for &b in &inner.body {
             for &s in &func.block(b).succs {
@@ -2328,7 +2946,7 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
         }
 
         // Region defs / inner live-ins.
-        let mut inner_defs: HashSet<VReg> = HashSet::new();
+        let mut inner_defs: HashSet<VReg> = HashSet::default();
         for &b in &inner.body {
             for &iid in &func.block(b).insts {
                 for_each_inst_def(func.inst(iid), |d| {
@@ -2336,7 +2954,7 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
                 });
             }
         }
-        let mut inner_reads: HashSet<VReg> = HashSet::new();
+        let mut inner_reads: HashSet<VReg> = HashSet::default();
         for &b in &inner.body {
             for &iid in &func.block(b).insts {
                 let inst = func.inst(iid);
@@ -2368,15 +2986,15 @@ fn region_licm_hoist(func: &mut MachFunction, loops: &[NaturalLoop], dom: &DomTr
         // body OUTSIDE `ip` (a real outer-varying value, e.g. a snapshot's
         // accumulator) makes an instruction non-invariant and declines.
         let ip_insts: Vec<InstId> = func.block(ip).insts.clone();
-        let mut ip_def_idx: HashMap<VReg, usize> = HashMap::new();
+        let mut ip_def_idx: HashMap<VReg, usize> = HashMap::default();
         for (idx, &iid) in ip_insts.iter().enumerate() {
             for_each_inst_def(func.inst(iid), |d| {
                 ip_def_idx.entry(d).or_insert(idx);
             });
         }
         // Seed: `ip` defs of a vreg the inner body reads or carries (redefines).
-        let mut init_set: HashSet<usize> = HashSet::new();
-        let mut init_defs: HashSet<VReg> = HashSet::new();
+        let mut init_set: HashSet<usize> = HashSet::default();
+        let mut init_defs: HashSet<VReg> = HashSet::default();
         let mut worklist: Vec<usize> = Vec::new();
         for (idx, &iid) in ip_insts.iter().enumerate() {
             let mut seeds = false;
@@ -2721,7 +3339,7 @@ mod tests {
     fn test_licm_hoists_invariant() {
         let mut func = make_loop_with_invariant();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func));
 
         // The loop-invariant `add v0, v1` should be hoisted to bb0 (preheader).
@@ -2738,6 +3356,160 @@ mod tests {
         assert_eq!(hoisted.opcode, AArch64Opcode::AddRR);
         assert_eq!(hoisted.operands[1], vreg(0));
         assert_eq!(hoisted.operands[2], vreg(1));
+    }
+
+    /// `make_loop_with_invariant` whose preheader `bb0` ends in an invoke's
+    /// call, `bl may_throw`, before its `b bb1`. With `invoke`, the call's
+    /// exception edge leaves bb0 for the landing pad `bb3`, as instruction
+    /// selection lowers `Invoke` whose normal destination is a loop header.
+    fn make_invoke_preheader_loop(invoke: bool) -> (MachFunction, InstId, InstId) {
+        let mut func = make_loop_with_invariant();
+        let bb0 = func.entry;
+        let pad = func.create_block();
+        let pad_ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(pad, pad_ret);
+        let call = func.push_inst(MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("may_throw".into())],
+        ));
+        let tail = func.block(bb0).insts.len() - 1;
+        func.block_mut(bb0).insts.insert(tail, call);
+        if invoke {
+            crate::eh_call_custody::tests::bind_invoke(&mut func, call, bb0, pad);
+        }
+        let invariant = func.block(BlockId(1)).insts[0];
+        (func, call, invariant)
+    }
+
+    #[test]
+    fn test_licm_does_not_hoist_into_an_invoke_block() {
+        // Hoisted code goes after every preheader call, so in an invoke block
+        // it would not run on the exception edge although the block dominates
+        // the landing pad; CSE/GVN then reused such a hoisted constant in the
+        // pad (an O3 wrong value). The invoke block is refused as preheader.
+        let (mut func, _, invariant) = make_invoke_preheader_loop(true);
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(
+            !licm.run(&mut func),
+            "LICM hoisted into a preheader whose call an exception leaves through"
+        );
+        assert!(func.block(BlockId(1)).insts.contains(&invariant));
+
+        // Control: the same preheader without the exception edge hoists the
+        // invariant, after the call, so the refusal above is the invoke's.
+        let (mut func, call, invariant) = make_invoke_preheader_loop(false);
+        assert!(LoopInvariantCodeMotion::new().run(&mut func));
+        let preheader = &func.block(func.entry).insts;
+        let at = |id| preheader.iter().position(|&x| x == id);
+        assert!(at(call).unwrap() < at(invariant).expect("hoisted into the preheader"));
+    }
+
+    /// A catch-and-retry loop whose header is the landing pad `bb2`. A pad is
+    /// entered only over exception edges, so the loop's one outside
+    /// predecessor, its preheader, is the invoke block `bb0`; the latch `bb3`
+    /// re-enters the pad through a second invoke's exception edge:
+    ///
+    /// ```text
+    ///   bb0: v0 = 10; v1 = 20; bl may_throw; b bb1   (unwind -> bb2)
+    ///   bb1: ret                                     (normal destination)
+    ///   bb2: v2 = v0 + v1; b.cond bb4, bb3           (pad, loop header)
+    ///   bb3: bl may_throw; b bb1                     (unwind -> bb2)
+    ///   bb4: ret
+    /// ```
+    ///
+    /// Without `invoke` the same CFG carries no EH rows. Returns the function,
+    /// bb0's call and the invariant `v2 = v0 + v1`.
+    fn make_pad_headed_retry_loop(invoke: bool) -> (MachFunction, InstId, InstId) {
+        let mut func =
+            MachFunction::new("licm_pad_loop".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let bb4 = func.create_block();
+        let push = |func: &mut MachFunction,
+                    block: BlockId,
+                    opcode: AArch64Opcode,
+                    operands: Vec<MachOperand>| {
+            let id = func.push_inst(MachInst::new(opcode, operands));
+            func.append_inst(block, id);
+            id
+        };
+        let call = |name: &str| vec![MachOperand::Symbol(name.into())];
+
+        push(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(0), imm(10)]);
+        push(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(1), imm(20)]);
+        let entry_call = push(&mut func, bb0, AArch64Opcode::Bl, call("may_throw"));
+        push(
+            &mut func,
+            bb0,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        push(&mut func, bb1, AArch64Opcode::Ret, vec![]);
+        let invariant = push(
+            &mut func,
+            bb2,
+            AArch64Opcode::AddRR,
+            vec![vreg(2), vreg(0), vreg(1)],
+        );
+        push(
+            &mut func,
+            bb2,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb4), MachOperand::Block(bb3)],
+        );
+        let retry_call = push(&mut func, bb3, AArch64Opcode::Bl, call("may_throw"));
+        push(
+            &mut func,
+            bb3,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        push(&mut func, bb4, AArch64Opcode::Ret, vec![]);
+
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb2, bb4);
+        func.add_edge(bb2, bb3);
+        func.add_edge(bb3, bb1);
+        if invoke {
+            crate::eh_call_custody::tests::bind_invoke(&mut func, entry_call, bb0, bb2);
+            crate::eh_call_custody::tests::bind_invoke(&mut func, retry_call, bb3, bb2);
+        } else {
+            func.add_edge(bb0, bb2);
+            func.add_edge(bb3, bb2);
+        }
+        (func, entry_call, invariant)
+    }
+
+    #[test]
+    fn test_licm_does_not_hoist_into_the_invoke_block_of_a_pad_headed_loop() {
+        // The loop reads what is hoisted into bb0 directly over the exception
+        // edge, with no CSE or GVN reuse in between, so this refusal alone
+        // keeps the pad from reading a register the unwind path never wrote
+        // (e2e: `eh_pad_reads_its_own_constant_as_the_header_of_a_retry_loop`).
+        let (mut func, _, invariant) = make_pad_headed_retry_loop(true);
+        let dom = DomTree::compute(&func);
+        let loops = LoopAnalysis::compute(&func, &dom);
+        let lp = loops.get_loop(BlockId(2)).expect("the pad heads a loop");
+        assert_eq!(
+            lp.preheader,
+            Some(func.entry),
+            "its preheader is the invoke block"
+        );
+        assert!(
+            !LoopInvariantCodeMotion::new().run(&mut func),
+            "LICM hoisted into the invoke block that preheads a landing-pad loop"
+        );
+        assert!(func.block(BlockId(2)).insts.contains(&invariant));
+
+        // Control: the same CFG without the exception edges hoists the
+        // invariant after the call, so the refusal above is the invoke's.
+        let (mut func, call, invariant) = make_pad_headed_retry_loop(false);
+        assert!(LoopInvariantCodeMotion::new().run(&mut func));
+        let preheader = &func.block(func.entry).insts;
+        let at = |id| preheader.iter().position(|&x| x == id);
+        assert!(at(call).unwrap() < at(invariant).expect("hoisted into the preheader"));
     }
 
     /// REGRESSION (found by revmapfuzz): when the preheader is a ROTATED-LOOP
@@ -2814,7 +3586,7 @@ mod tests {
         func.add_edge(latch, header);
         func.add_edge(latch, exit);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func), "invariant add should hoist");
 
         // The invariant must now be in the guard block...
@@ -2881,7 +3653,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func));
 
         assert!(func.block(bb0).insts.contains(&invariant_add));
@@ -2895,7 +3667,7 @@ mod tests {
         let hoisted_inst = func.block(BlockId(1)).insts[0];
         let (mut provenance, mappings) = record_identity_provenance(&func, 100);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         let mut analyses = AnalysisCache::new();
         let changed =
             licm.run_with_analyses_and_provenance(&mut func, &mut analyses, &mut provenance);
@@ -2935,7 +3707,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
     }
 
@@ -2973,7 +3745,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
         assert_eq!(func.block(bb1).insts[0], cset);
     }
@@ -3018,7 +3790,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
         assert_eq!(func.block(bb1).insts[0], adds);
     }
@@ -3062,7 +3834,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
     }
 
@@ -3073,7 +3845,7 @@ mod tests {
         let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
         func.append_inst(func.entry, ret);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
     }
 
@@ -3124,7 +3896,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func));
 
         // Both add and mul should be hoisted.
@@ -3165,7 +3937,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
     }
 
@@ -3225,7 +3997,7 @@ mod tests {
 
         let original_loop_insts = func.block(bb1).insts.clone();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "LICM must not move fixed-register call glue"
@@ -3276,7 +4048,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "LICM must not hoist implicit fixed-register dependencies"
@@ -3324,7 +4096,7 @@ mod tests {
 
         let original_loop_insts = func.block(bb1).insts.clone();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "LICM must not hoist tied-def-use MOVK"
@@ -3438,7 +4210,7 @@ mod tests {
             func.append_inst(bb, sub);
         });
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func), "constant chain + FMOV must hoist");
 
         // Inner body keeps only the variant accumulate, counter, and branch.
@@ -3507,7 +4279,7 @@ mod tests {
         });
 
         let original = func.block(inner_body).insts.clone();
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         licm.run(&mut func);
         assert_eq!(
             func.block(inner_body).insts,
@@ -3573,7 +4345,7 @@ mod tests {
         func.add_edge(bb1, bb1);
 
         let original = func.block(bb1).insts.clone();
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         licm.run(&mut func);
         assert_eq!(
             func.block(bb1).insts,
@@ -3617,7 +4389,7 @@ mod tests {
             func.append_inst(bb, sub);
         });
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func), "integer constant chain must hoist");
 
         let body_ops: Vec<_> = func
@@ -3679,7 +4451,7 @@ mod tests {
         });
 
         let original = func.block(inner_body).insts.clone();
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         licm.run(&mut func);
         assert_eq!(
             func.block(inner_body).insts,
@@ -3727,7 +4499,7 @@ mod tests {
 
         let original_loop_insts = func.block(bb1).insts.clone();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func), "LICM must not hoist tied-def-use BFM");
         assert_eq!(func.block(bb1).insts, original_loop_insts);
     }
@@ -3787,7 +4559,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb1, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             licm.run(&mut func),
             "LICM must hoist loop-invariant relocation address materialization"
@@ -3858,7 +4630,7 @@ mod tests {
 
         let original_loop_insts = func.block(bb1).insts.clone();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "LICM must not hoist a multi-def address vreg"
@@ -3908,7 +4680,7 @@ mod tests {
 
         let original_loop_insts = func.block(bb1).insts.clone();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "LICM must not hoist trapping integer division"
@@ -3958,7 +4730,7 @@ mod tests {
 
         let original_loop_insts = func.block(bb1).insts.clone();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "LICM must not hoist non-SSA VReg definitions"
@@ -4045,7 +4817,7 @@ mod tests {
         let orig_header_preds = func.block(bb2).preds.clone();
         let orig_header_insts = func.block(bb2).insts.clone();
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "LICM must skip loops without a natural preheader"
@@ -4105,7 +4877,7 @@ mod tests {
         let stale = NaturalLoop {
             header: bb0,
             latch: bb1,
-            body: HashSet::from([bb0, bb1]),
+            body: HashSet::from_iter([bb0, bb1]),
             preheader: Some(bb1),
             depth: 1,
             parent: None,
@@ -4113,10 +4885,24 @@ mod tests {
         let dom = DomTree::compute(&func);
         // The whole-function maps are now built by the caller, once per scan.
         let def_counts = build_def_counts(&func);
-        let def_map = build_def_map(&func);
+        let def_map = crate::effects::build_reaching_def_map_by_vreg(&func);
+        let layout = LayoutPositions::new();
+        let unwind_exits = crate::eh_call_custody::UnwindExits::collect(&func);
 
         assert!(
-            !hoist_loop_invariants(&mut func, &stale, &dom, &def_counts, &def_map, &mut None),
+            !hoist_loop_invariants(
+                &mut func,
+                &stale,
+                &dom,
+                &unwind_exits,
+                &def_counts,
+                &def_map,
+                &layout,
+                &mut None,
+                &mut None,
+                false,
+                &mut Vec::new(),
+            ),
             "an in-loop preheader candidate must fail closed before the splice"
         );
         assert!(func.block(bb0).insts.contains(&invariant));
@@ -4217,7 +5003,7 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func), "store-free invariant load must hoist");
         assert!(func.block(bb0).insts.contains(&load));
         assert!(!func.block(bb1).insts.contains(&load));
@@ -4257,7 +5043,7 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         // Nothing hoistable (the load refuses, the sub is variant).
         assert!(!licm.run(&mut func));
         assert!(func.block(bb1).insts.contains(&load));
@@ -4282,7 +5068,7 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
         assert!(func.block(bb1).insts.contains(&load));
     }
@@ -4301,9 +5087,104 @@ mod tests {
         let load = append(&mut func, bb1, AArch64Opcode::Ldar, vec![vreg(1), vreg(0)]);
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func));
         assert!(func.block(bb1).insts.contains(&load));
+    }
+
+    /// Where [`store_free_loop_with_acquire`] puts the load-acquire relative
+    /// to the invariant plain load.
+    #[derive(Clone, Copy, Debug)]
+    enum AcquireAt {
+        BeforeLoad,
+        AfterLoad,
+        Preheader,
+    }
+
+    /// The tier (a) loop of `test_licm_hoists_invariant_load_store_free`
+    /// (`v1 = ldr [v0, #0]`, no writer) plus `acq v9, [v5]` at `at`. Returns
+    /// the function, the preheader, the loop block and the plain load.
+    fn store_free_loop_with_acquire(
+        acq: AArch64Opcode,
+        at: AcquireAt,
+    ) -> (MachFunction, BlockId, BlockId, InstId) {
+        let (mut func, bb0, bb1, bb2) = single_block_loop();
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(0), imm(4096)],
+        );
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(5), imm(8192)],
+        );
+        let acquire = |func: &mut MachFunction, block| {
+            append(func, block, acq, vec![vreg(9), vreg(5)]);
+        };
+        if let AcquireAt::Preheader = at {
+            acquire(&mut func, bb0);
+        }
+        finish_preheader_branch(&mut func, bb0, bb1);
+        if let AcquireAt::BeforeLoad = at {
+            acquire(&mut func, bb1);
+        }
+        let load = append(
+            &mut func,
+            bb1,
+            AArch64Opcode::LdrRI,
+            vec![vreg(1), vreg(0), imm(0)],
+        );
+        if let AcquireAt::AfterLoad = at {
+            acquire(&mut func, bb1);
+        }
+        finish_loop_tail(&mut func, bb1, bb2);
+        (func, bb0, bb1, load)
+    }
+
+    /// The load-acquire opcodes ([`is_load_acquire`]).
+    const ACQUIRE_LOADS: [AArch64Opcode; 4] = [
+        AArch64Opcode::Ldar,
+        AArch64Opcode::Ldarb,
+        AArch64Opcode::Ldarh,
+        AArch64Opcode::Ldaxr,
+    ];
+
+    #[test]
+    fn test_licm_no_hoist_plain_load_out_of_a_loop_with_an_acquire() {
+        // Tier (a) sees no writer, but after an in-loop acquire this thread
+        // may observe what another thread published: a read that follows it
+        // (iteration 1's when it comes first, later iterations' when it comes
+        // after) must not be replaced by one read in the preheader.
+        let mut hoisted = Vec::new();
+        for acq in ACQUIRE_LOADS {
+            for at in [AcquireAt::BeforeLoad, AcquireAt::AfterLoad] {
+                let (mut func, bb0, bb1, load) = store_free_loop_with_acquire(acq, at);
+                LoopInvariantCodeMotion::new().run(&mut func);
+                if func.block(bb0).insts.contains(&load) || !func.block(bb1).insts.contains(&load) {
+                    hoisted.push((acq, at));
+                }
+            }
+        }
+        assert!(
+            hoisted.is_empty(),
+            "hoisted a plain load out of a loop that contains a load-acquire: {hoisted:?}"
+        );
+    }
+
+    #[test]
+    fn test_licm_hoists_plain_load_when_the_acquire_precedes_the_loop() {
+        // POSITIVE CONTROL: an acquire in the preheader runs before the
+        // hoisted load's new position too, so tier (a) still applies.
+        for acq in ACQUIRE_LOADS {
+            let (mut func, bb0, bb1, load) =
+                store_free_loop_with_acquire(acq, AcquireAt::Preheader);
+            assert!(LoopInvariantCodeMotion::new().run(&mut func), "{acq:?}");
+            assert!(func.block(bb0).insts.contains(&load), "{acq:?}");
+            assert!(!func.block(bb1).insts.contains(&load), "{acq:?}");
+        }
     }
 
     #[test]
@@ -4357,7 +5238,7 @@ mod tests {
         func.add_edge(bb1, bb2);
         func.add_edge(bb2, bb1);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func), "non-dominating load must not hoist");
         assert!(func.block(bb2).insts.contains(&load));
     }
@@ -4406,12 +5287,566 @@ mod tests {
         func.add_edge(bb1, bb1);
         func.add_edge(bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "zero-trip guard preheader must block load"
         );
         assert!(func.block(bb1).insts.contains(&load));
+    }
+
+    // -----------------------------------------------------------------------
+    // Dereferenceable-frame speculation: a load that is NOT guaranteed to run
+    // (it sits behind the loop's exit test) hoists only when it reads inside
+    // one fixed-size stack slot.
+    // -----------------------------------------------------------------------
+
+    /// Early-exit loop with the load in the body:
+    ///
+    /// ```text
+    ///   bb0: <setup> ; b bb1
+    ///   bb1 (header): bcond bb3, bb2        (exit test)
+    ///   bb2 (body/latch): <body> ; b bb1
+    ///   bb3: ret
+    /// ```
+    ///
+    /// `setup` fills bb0 (before its branch) and `body` fills bb2 (before its
+    /// branch). Returns `(func, bb0, bb2)`.
+    fn early_exit_loop(
+        setup: impl FnOnce(&mut MachFunction, BlockId),
+        body: impl FnOnce(&mut MachFunction, BlockId),
+    ) -> (MachFunction, BlockId, BlockId) {
+        let mut func = MachFunction::new(
+            "licm_frame_spec".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        setup(&mut func, bb0);
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb3), MachOperand::Block(bb2)],
+        );
+        body(&mut func, bb2);
+        append(
+            &mut func,
+            bb2,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        append(&mut func, bb3, AArch64Opcode::Ret, vec![]);
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb2, bb1);
+        (func, bb0, bb2)
+    }
+
+    /// A 24-byte (`Vec`-sized) fixed stack slot whose address is `v0`.
+    fn vec_slot_setup(func: &mut MachFunction, bb0: BlockId) {
+        let slot = func.alloc_stack_slot(trust_cg_ir::StackSlot::new(24, 8));
+        append(
+            func,
+            bb0,
+            AArch64Opcode::AddPCRel,
+            vec![vreg(0), sp(), MachOperand::StackSlot(slot)],
+        );
+    }
+
+    fn load_at(func: &mut MachFunction, block: BlockId, dst: u32, base: u32, off: i64) -> InstId {
+        append(
+            func,
+            block,
+            AArch64Opcode::LdrRI,
+            vec![vreg(dst), vreg(base), imm(off)],
+        )
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_hoists_in_bounds_slot_loads_behind_exit_test() {
+        // The `while k < v.len() { .. v[k] .. }` shape: the Vec's pointer and
+        // length loads sit behind the exit test in a store-free loop.
+        let mut loads = Vec::new();
+        let (mut func, bb0, bb2) = early_exit_loop(vec_slot_setup, |f, b| {
+            loads.push(load_at(f, b, 1, 0, 0));
+            loads.push(load_at(f, b, 2, 0, 16));
+        });
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(licm.run(&mut func), "in-bounds slot loads must hoist");
+        for load in loads {
+            assert!(func.block(bb0).insts.contains(&load));
+            assert!(!func.block(bb2).insts.contains(&load));
+        }
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_off_keeps_the_old_rule() {
+        let mut load = None;
+        let (mut func, _, bb2) = early_exit_loop(vec_slot_setup, |f, b| {
+            load = Some(load_at(f, b, 1, 0, 16));
+        });
+        let mut licm = LoopInvariantCodeMotion::without_frame_speculation();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load.expect("load")));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_access_past_the_slot() {
+        // Bytes [20, 28) of a 24-byte slot: the last four are outside it.
+        let mut load = None;
+        let (mut func, _, bb2) = early_exit_loop(vec_slot_setup, |f, b| {
+            load = Some(load_at(f, b, 1, 0, 20));
+        });
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load.expect("load")));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_access_below_the_slot() {
+        // `v3 = v0 - 8` then `[v3, #0]`: eight bytes before the slot.
+        let mut load = None;
+        let (mut func, _, bb2) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                append(f, b, AArch64Opcode::SubRI, vec![vreg(3), vreg(0), imm(8)]);
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 3, 0));
+            },
+        );
+        let mut licm = LoopInvariantCodeMotion::new();
+        // The SubRI is already outside the loop; nothing may move.
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load.expect("load")));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_follows_offsets_inside_the_slot() {
+        // `v3 = v0 + 8` then `[v3, #8]`: bytes [16, 24), inside the slot.
+        let mut load = None;
+        let (mut func, bb0, _) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                append(f, b, AArch64Opcode::AddRI, vec![vreg(3), vreg(0), imm(8)]);
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 3, 8));
+            },
+        );
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(licm.run(&mut func));
+        assert!(func.block(bb0).insts.contains(&load.expect("load")));
+    }
+
+    /// `v9 = Madd(v3, v8, v0)` with `v3 = #index`, `v8 = #8`: the adapter's
+    /// constant-index `gep i64` into the slot, then `[v9, #0]`.
+    fn gep_slot_load(index: i64) -> (MachFunction, BlockId, BlockId, InstId) {
+        let mut load = None;
+        let (func, bb0, bb2) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                append(f, b, AArch64Opcode::Movz, vec![vreg(3), imm(index)]);
+                append(f, b, AArch64Opcode::Movz, vec![vreg(8), imm(8)]);
+                append(
+                    f,
+                    b,
+                    AArch64Opcode::Madd,
+                    vec![vreg(9), vreg(3), vreg(8), vreg(0)],
+                );
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 9, 0));
+            },
+        );
+        (func, bb0, bb2, load.expect("load"))
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_follows_constant_index_gep() {
+        // Element 2 of the three-word slot: bytes [16, 24).
+        let (mut func, bb0, _, load) = gep_slot_load(2);
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(licm.run(&mut func));
+        assert!(func.block(bb0).insts.contains(&load));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_constant_index_gep_past_the_slot() {
+        // Element 3: bytes [24, 32), past the 24-byte slot.
+        let (mut func, _, bb2, load) = gep_slot_load(3);
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load));
+    }
+
+    /// `v9 = AddRR(v0, v8)` (or `AddRR(v8, v0)` when `swapped`) with `v8 =
+    /// #k` or, when `runtime`, a loaded `k`: the field address `&vec.ptr`
+    /// after GVN reused an equal constant register, then `[v9, #0]`.
+    fn addrr_slot_load(
+        k: i64,
+        swapped: bool,
+        runtime: bool,
+    ) -> (MachFunction, BlockId, BlockId, InstId) {
+        let mut load = None;
+        let (func, bb0, bb2) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                if runtime {
+                    append(f, b, AArch64Opcode::LdrRI, vec![vreg(8), vreg(0), imm(0)]);
+                } else {
+                    append(f, b, AArch64Opcode::Movz, vec![vreg(8), imm(k)]);
+                }
+                let (a, c) = if swapped { (8, 0) } else { (0, 8) };
+                append(f, b, AArch64Opcode::AddRR, vec![vreg(9), vreg(a), vreg(c)]);
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 9, 0));
+            },
+        );
+        (func, bb0, bb2, load.expect("load"))
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_follows_constant_register_offset() {
+        // `&vec.ptr = slot + 8` in either operand order: bytes [8, 16).
+        for swapped in [false, true] {
+            let (mut func, bb0, bb2, load) = addrr_slot_load(8, swapped, false);
+            let mut licm = LoopInvariantCodeMotion::new();
+            assert!(licm.run(&mut func), "swapped={swapped}");
+            assert!(func.block(bb0).insts.contains(&load));
+            assert!(!func.block(bb2).insts.contains(&load));
+        }
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_constant_register_offset_past_the_slot() {
+        // `slot + 24`: bytes [24, 32), past the 24-byte slot.
+        let (mut func, _, bb2, load) = addrr_slot_load(24, false, false);
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_runtime_register_offset() {
+        // `slot + <loaded value>`: the offset is not a constant, so the address
+        // is not provably inside the slot.
+        let (mut func, _, bb2, load) = addrr_slot_load(0, false, true);
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_runtime_sized_slot() {
+        let mut load = None;
+        let (mut func, _, bb2) = early_exit_loop(
+            |f, b| {
+                let mut slot = trust_cg_ir::StackSlot::new(24, 8);
+                slot.allocation = StackSlotAllocationKind::RuntimeSized {
+                    size_source: trust_cg_ir::function::StackSlotSizeSource::Unknown,
+                };
+                let slot = f.alloc_stack_slot(slot);
+                append(
+                    f,
+                    b,
+                    AArch64Opcode::AddPCRel,
+                    vec![vreg(0), sp(), MachOperand::StackSlot(slot)],
+                );
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 0, 0));
+            },
+        );
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load.expect("load")));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_non_frame_pointer() {
+        // A materialized integer is not a frame address, so the old rule holds.
+        let mut load = None;
+        let (mut func, _, bb2) = early_exit_loop(
+            |f, b| {
+                append(f, b, AArch64Opcode::MovI, vec![vreg(0), imm(4096)]);
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 0, 0));
+            },
+        );
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load.expect("load")));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_when_the_loop_stores_the_slot() {
+        // Tier (b) still applies: an in-loop store to the same slot keeps the load.
+        let mut load = None;
+        let (mut func, _, bb2) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                append(f, b, AArch64Opcode::MovI, vec![vreg(6), imm(7)]);
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 0, 16));
+                append(f, b, AArch64Opcode::StrRI, vec![vreg(6), vreg(0), imm(0)]);
+            },
+        );
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load.expect("load")));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_through_self_copied_carrier() {
+        // The bridge's out-of-SSA shape: `v7` is defined once from the slot
+        // address and otherwise only re-copied to itself on the back edge, and
+        // the preheader copies it into the load's base.
+        let mut load = None;
+        let (mut func, bb0, _) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                append(f, b, AArch64Opcode::MovR, vec![vreg(7), vreg(0)]);
+                append(f, b, AArch64Opcode::MovR, vec![vreg(2), vreg(7)]);
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 2, 8));
+                append(f, b, AArch64Opcode::MovR, vec![vreg(7), vreg(7)]);
+            },
+        );
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(licm.run(&mut func));
+        assert!(func.block(bb0).insts.contains(&load.expect("load")));
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_second_value_changing_def() {
+        // `v7` has a second value-changing definition (`v7 = v7 + 16` on the
+        // back edge). The resolver does not decide which definition reaches
+        // the preheader copy, so it refuses (conservatively: here it is the
+        // first one).
+        let mut load = None;
+        let (mut func, _, bb2) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                append(f, b, AArch64Opcode::MovR, vec![vreg(7), vreg(0)]);
+                append(f, b, AArch64Opcode::MovR, vec![vreg(2), vreg(7)]);
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 2, 8));
+                append(f, b, AArch64Opcode::AddRI, vec![vreg(7), vreg(7), imm(16)]);
+            },
+        );
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load.expect("load")));
+    }
+
+    /// Position of `id` in `block`, which must hold it.
+    fn position_in(func: &MachFunction, block: BlockId, id: InstId) -> usize {
+        func.block(block)
+            .insts
+            .iter()
+            .position(|&x| x == id)
+            .expect("instruction in block")
+    }
+
+    /// The hoisted load sits in `bb0` after `writer` and right before the
+    /// preheader's closing `B`.
+    fn assert_load_after_writer(func: &MachFunction, bb0: BlockId, writer: InstId, load: InstId) {
+        let insts = &func.block(bb0).insts;
+        let load_pos = position_in(func, bb0, load);
+        assert!(
+            position_in(func, bb0, writer) < load_pos,
+            "the hoisted load must read the slot after the preheader wrote it: {insts:?}"
+        );
+        assert_eq!(load_pos + 1, insts.len() - 1, "load right before the tail");
+        let last = func.inst(*insts.last().expect("preheader branch"));
+        assert_eq!(last.opcode, AArch64Opcode::B);
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_lands_after_a_store_ending_the_preheader() {
+        // The preheader's last instruction before its branch stores the bytes
+        // the loop reads (`a[2] = v6`, then `b header`). The old placement
+        // stepped back over any non-value side effect before the tail, so the
+        // speculated load read the slot before this store.
+        let (mut store, mut load) = (None, None);
+        let (mut func, bb0, bb2) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                append(f, b, AArch64Opcode::MovI, vec![vreg(6), imm(7)]);
+                store = Some(append(
+                    f,
+                    b,
+                    AArch64Opcode::StrRI,
+                    vec![vreg(6), vreg(0), imm(16)],
+                ));
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 0, 16));
+            },
+        );
+        let (store, load) = (store.expect("store"), load.expect("load"));
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(licm.run(&mut func), "the in-bounds slot load hoists");
+        assert!(!func.block(bb2).insts.contains(&load));
+        assert_load_after_writer(&func, bb0, store, load);
+    }
+
+    /// `v5 = #1 ; TrapBoundsCheckExact v5 <u 3 ; v6 = #7 ; str v6, [v0, #16]`:
+    /// a mid-block guard carrier (flagged `IS_BRANCH | IS_TERMINATOR`, falls
+    /// through) followed by a store to the slot the loop reads.
+    fn carrier_then_store(f: &mut MachFunction, b: BlockId) -> (InstId, InstId) {
+        append(f, b, AArch64Opcode::MovI, vec![vreg(5), imm(1)]);
+        let carrier = append(
+            f,
+            b,
+            AArch64Opcode::TrapBoundsCheckExact,
+            vec![vreg(5), vreg(5), imm(3)],
+        );
+        append(f, b, AArch64Opcode::MovI, vec![vreg(6), imm(7)]);
+        let store = append(f, b, AArch64Opcode::StrRI, vec![vreg(6), vreg(0), imm(16)]);
+        (carrier, store)
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_lands_after_a_trap_carrier_and_its_store() {
+        // The old placement inserted before the first `is_branch()` instruction,
+        // which is the carrier: the speculated load then ran before the carrier
+        // and before the store behind it.
+        let (mut written, mut load) = (None, None);
+        let (mut func, bb0, _) = early_exit_loop(
+            |f, b| {
+                vec_slot_setup(f, b);
+                written = Some(carrier_then_store(f, b));
+            },
+            |f, b| {
+                load = Some(load_at(f, b, 1, 0, 16));
+            },
+        );
+        let ((carrier, store), load) = (written.expect("preheader"), load.expect("load"));
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(licm.run(&mut func), "the in-bounds slot load hoists");
+        assert!(position_in(&func, bb0, carrier) < position_in(&func, bb0, load));
+        assert_load_after_writer(&func, bb0, store, load);
+    }
+
+    #[test]
+    fn test_licm_guaranteed_load_lands_after_a_trap_carrier_and_its_store() {
+        // The same placement bug for a load that runs on every iteration (it
+        // is in the single-block loop's header, before the exit test), and
+        // so independent of the frame tier: switched off here.
+        let (mut func, bb0, bb1, bb2) = single_block_loop();
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(0), imm(4096)],
+        );
+        let (carrier, store) = carrier_then_store(&mut func, bb0);
+        finish_preheader_branch(&mut func, bb0, bb1);
+        let load = load_at(&mut func, bb1, 1, 0, 16);
+        finish_loop_tail(&mut func, bb1, bb2);
+        let mut licm = LoopInvariantCodeMotion::without_frame_speculation();
+        assert!(licm.run(&mut func), "the guaranteed store-free load hoists");
+        assert!(position_in(&func, bb0, carrier) < position_in(&func, bb0, load));
+        assert_load_after_writer(&func, bb0, store, load);
+    }
+
+    #[test]
+    fn test_licm_frame_speculation_refuses_a_base_def_that_does_not_dominate_the_load() {
+        // `v0`'s only value-changing definition (the slot address) is on one
+        // arm of a diamond before the loop; on the other arm `v0` keeps
+        // whatever it held on entry (a live-in, e.g. a reused argument
+        // register), which need not be a frame address.
+        //
+        //   bb0: bcond bb_a, bb_b
+        //   bb_a: v0 = &slot ; b bb_j        bb_b: b bb_j
+        //   bb_j (preheader): b bb1
+        //   bb1 (header): bcond bb3, bb2     bb2: [v0, #0] ; b bb1     bb3: ret
+        let mut func = MachFunction::new(
+            "licm_frame_nondom".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let (bb_a, bb_b, bb_j) = (
+            func.create_block(),
+            func.create_block(),
+            func.create_block(),
+        );
+        let (bb1, bb2, bb3) = (
+            func.create_block(),
+            func.create_block(),
+            func.create_block(),
+        );
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb_a), MachOperand::Block(bb_b)],
+        );
+        vec_slot_setup(&mut func, bb_a);
+        append(
+            &mut func,
+            bb_a,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb_j)],
+        );
+        append(
+            &mut func,
+            bb_b,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb_j)],
+        );
+        append(
+            &mut func,
+            bb_j,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb3), MachOperand::Block(bb2)],
+        );
+        let load = load_at(&mut func, bb2, 1, 0, 0);
+        append(
+            &mut func,
+            bb2,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+        append(&mut func, bb3, AArch64Opcode::Ret, vec![]);
+        for (from, to) in [
+            (bb0, bb_a),
+            (bb0, bb_b),
+            (bb_a, bb_j),
+            (bb_b, bb_j),
+            (bb_j, bb1),
+            (bb1, bb3),
+            (bb1, bb2),
+            (bb2, bb1),
+        ] {
+            func.add_edge(from, to);
+        }
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(!licm.run(&mut func));
+        assert!(func.block(bb2).insts.contains(&load));
     }
 
     /// Tier-(b) helper: single-block loop whose preheader materializes a global
@@ -4437,8 +5872,10 @@ mod tests {
     }
 
     #[test]
-    fn test_licm_tier_b_distinct_global_hoists() {
-        // Load &gA, store &gB, gA != gB: distinct link-time objects, disjoint.
+    fn test_licm_tier_b_distinct_global_authority_is_withdrawn() {
+        // Different symbol spellings do not authenticate distinct objects or
+        // the complete accessed intervals. Retain the former positive fixture
+        // as a named capability-withdrawal control.
         let (mut func, bb0, bb1, bb2) = single_block_loop();
         materialize_global(&mut func, bb0, 0, 1, "gA"); // v1 = &gA
         materialize_global(&mut func, bb0, 2, 3, "gB"); // v3 = &gB
@@ -4458,13 +5895,13 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
-            licm.run(&mut func),
-            "load from a global disjoint from the store must hoist"
+            !licm.run(&mut func),
+            "unbound distinct-symbol load/store authority must not hoist"
         );
-        assert!(func.block(bb0).insts.contains(&load));
-        assert!(!func.block(bb1).insts.contains(&load));
+        assert!(!func.block(bb0).insts.contains(&load));
+        assert!(func.block(bb1).insts.contains(&load));
     }
 
     #[test]
@@ -4488,7 +5925,7 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "same-symbol load/store must not hoist"
@@ -4500,6 +5937,14 @@ mod tests {
     fn test_licm_tier_b_distinct_stack_slot_hoists() {
         // Load ss0, store ss1: distinct frame allocations, disjoint.
         let (mut func, bb0, bb1, bb2) = single_block_loop();
+        assert_eq!(
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8)),
+            StackSlotId(0)
+        );
+        assert_eq!(
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8)),
+            StackSlotId(1)
+        );
         materialize_slot(&mut func, bb0, 0, 0); // v0 = &ss0
         materialize_slot(&mut func, bb0, 1, 1); // v1 = &ss1
         append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
@@ -4518,7 +5963,11 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(func.try_sync_vreg_counter().is_some());
+        let mut without_speculation = func.clone();
+        assert!(LoopInvariantCodeMotion::without_frame_speculation().run(&mut without_speculation));
+        assert!(without_speculation.block(bb0).insts.contains(&load));
         assert!(
             licm.run(&mut func),
             "load/store to distinct stack slots must hoist"
@@ -4531,6 +5980,10 @@ mod tests {
     fn test_licm_tier_b_same_stack_slot_refuses() {
         // Load and store both target ss0: cannot prove disjoint — refuse.
         let (mut func, bb0, bb1, bb2) = single_block_loop();
+        assert_eq!(
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8)),
+            StackSlotId(0)
+        );
         materialize_slot(&mut func, bb0, 0, 0); // v0 = &ss0
         append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
         finish_preheader_branch(&mut func, bb0, bb1);
@@ -4548,16 +6001,20 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(!licm.run(&mut func), "same-slot load/store must not hoist");
         assert!(func.block(bb1).insts.contains(&load));
     }
 
     #[test]
-    fn test_licm_tier_b_stack_vs_global_hoists() {
-        // Load a stack slot, store a global: the stack and data segment are
-        // disjoint address ranges.
+    fn test_licm_tier_b_stack_vs_global_authority_is_withdrawn() {
+        // A stack interval does not authenticate the address/extent denoted by
+        // a bare symbol spelling. Keep the original positive as lost coverage.
         let (mut func, bb0, bb1, bb2) = single_block_loop();
+        assert_eq!(
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8)),
+            StackSlotId(0)
+        );
         materialize_slot(&mut func, bb0, 0, 0); // v0 = &ss0 (load base)
         materialize_global(&mut func, bb0, 2, 3, "gB"); // v3 = &gB (store base)
         append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
@@ -4576,10 +6033,427 @@ mod tests {
         );
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
-        assert!(licm.run(&mut func), "stack-load vs global-store must hoist");
-        assert!(func.block(bb0).insts.contains(&load));
-        assert!(!func.block(bb1).insts.contains(&load));
+        let mut licm = LoopInvariantCodeMotion::new();
+        assert!(
+            !licm.run(&mut func),
+            "stack/global names are not disjointness authority"
+        );
+        assert!(!func.block(bb0).insts.contains(&load));
+        assert!(func.block(bb1).insts.contains(&load));
+    }
+
+    #[test]
+    fn test_licm_tier_b_bare_adrp_same_page_authority_is_withdrawn() {
+        // ADRP computes page(symbol), not the object's address. Distinct
+        // symbols can share that page; a page-rooted store may alias even a
+        // correctly materialized full symbol address at a static page offset.
+        for full_load_address in [false, true] {
+            let (mut func, bb0, bb1, bb2) = single_block_loop();
+            if full_load_address {
+                materialize_global(&mut func, bb0, 0, 1, "same_page_A");
+            } else {
+                append(
+                    &mut func,
+                    bb0,
+                    AArch64Opcode::Adrp,
+                    vec![vreg(1), sym("same_page_A")],
+                );
+            }
+            append(
+                &mut func,
+                bb0,
+                AArch64Opcode::Adrp,
+                vec![vreg(3), sym("same_page_B")],
+            );
+            append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
+            finish_preheader_branch(&mut func, bb0, bb1);
+            let load = load_at(&mut func, bb1, 4, 1, 0);
+            append(
+                &mut func,
+                bb1,
+                AArch64Opcode::StrRI,
+                vec![vreg(9), vreg(3), imm(0)],
+            );
+            finish_loop_tail(&mut func, bb1, bb2);
+            assert!(func.try_sync_vreg_counter().is_some());
+            let original = func.block(bb1).insts.clone();
+            assert!(
+                !LoopInvariantCodeMotion::new().run(&mut func),
+                "full_load_address={full_load_address}"
+            );
+            assert_eq!(func.block(bb1).insts, original);
+            assert!(!func.block(bb0).insts.contains(&load));
+        }
+    }
+
+    #[test]
+    fn test_licm_tier_b_integer_pointer_alias_shape_refuses() {
+        // Core PtrToInt/IntToPtr become full-width copies. A + (B - A)
+        // denotes B, not an allocation that remains disjoint merely because
+        // an additive trace encounters A. No new alias interpreter is used.
+        let (mut func, bb0, bb1, bb2) = single_block_loop();
+        materialize_global(&mut func, bb0, 0, 1, "A");
+        materialize_global(&mut func, bb0, 2, 3, "B");
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::SubRR,
+            vec![vreg(5), vreg(3), vreg(1)],
+        );
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::AddRR,
+            vec![vreg(6), vreg(1), vreg(5)],
+        );
+        append(&mut func, bb0, AArch64Opcode::MovR, vec![vreg(7), vreg(6)]);
+        append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
+        finish_preheader_branch(&mut func, bb0, bb1);
+        let load = load_at(&mut func, bb1, 4, 3, 0);
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::StrRI,
+            vec![vreg(9), vreg(7), imm(0)],
+        );
+        finish_loop_tail(&mut func, bb1, bb2);
+        assert!(func.try_sync_vreg_counter().is_some());
+        let original = func.block(bb1).insts.clone();
+        assert!(!LoopInvariantCodeMotion::new().run(&mut func));
+        assert_eq!(func.block(bb1).insts, original);
+        assert!(!func.block(bb0).insts.contains(&load));
+    }
+
+    #[test]
+    fn test_licm_tier_b_stack_access_requires_actual_fixed_bounds() {
+        for mutation in 0..7 {
+            let (mut func, bb0, bb1, bb2) = single_block_loop();
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+            func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+            match mutation {
+                0 => {
+                    func.stack_slots.pop();
+                }
+                1 => {
+                    func.stack_slots[1].size = 0;
+                }
+                2 => {
+                    func.stack_slots[1].allocation = StackSlotAllocationKind::RuntimeSized {
+                        size_source: trust_cg_ir::function::StackSlotSizeSource::Unknown,
+                    };
+                }
+                _ => {}
+            }
+            materialize_slot(&mut func, bb0, 0, 0);
+            materialize_slot(&mut func, bb0, 1, 1);
+            if mutation == 6 {
+                let source = func.block(bb0).insts[1];
+                func.inst_mut(source).operands[1] = vreg(7); // not SP custody
+            }
+            append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
+            finish_preheader_branch(&mut func, bb0, bb1);
+            let load_offset = if mutation == 5 { 9 } else { 0 };
+            let load = load_at(&mut func, bb1, 4, 0, load_offset);
+            let store_offset = match mutation {
+                3 => -1,
+                4 => 9,
+                _ => 0,
+            };
+            append(
+                &mut func,
+                bb1,
+                AArch64Opcode::StrRI,
+                vec![vreg(9), vreg(1), imm(store_offset)],
+            );
+            finish_loop_tail(&mut func, bb1, bb2);
+            assert!(func.try_sync_vreg_counter().is_some());
+            let original = func.block(bb1).insts.clone();
+            assert!(
+                !LoopInvariantCodeMotion::new().run(&mut func),
+                "stack bounds mutation={mutation}"
+            );
+            assert_eq!(func.block(bb1).insts, original);
+            assert!(!func.block(bb0).insts.contains(&load));
+        }
+    }
+
+    #[test]
+    fn test_licm_tier_b_stack_other_register_view_refuses() {
+        // Numeric virtual-register storage is shared by W/X views. A typed
+        // unique X definition is not reaching-address authority after W writes.
+        let (mut func, bb0, bb1, bb2) = single_block_loop();
+        func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+        func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+        materialize_slot(&mut func, bb0, 0, 0);
+        materialize_slot(&mut func, bb0, 1, 1);
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg_class(0, RegClass::Gpr32), imm(0)],
+        );
+        append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
+        finish_preheader_branch(&mut func, bb0, bb1);
+        let load = load_at(&mut func, bb1, 4, 0, 0);
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::StrRI,
+            vec![vreg(9), vreg(1), imm(0)],
+        );
+        finish_loop_tail(&mut func, bb1, bb2);
+        assert!(func.try_sync_vreg_counter().is_some());
+        let original = func.block(bb1).insts.clone();
+        assert!(!LoopInvariantCodeMotion::new().run(&mut func));
+        assert_eq!(func.block(bb1).insts, original);
+        assert!(!func.block(bb0).insts.contains(&load));
+    }
+
+    #[test]
+    fn test_licm_tier_b_stack_definition_must_reach_load() {
+        // One arm defines v0 as a slot address; the other preserves its live-in
+        // value. A whole-function unique definition does not dominate the use.
+        let mut func = MachFunction::new(
+            "licm_stack_nondom".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+        func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+        let bb0 = func.entry;
+        let left = func.create_block();
+        let right = func.create_block();
+        let preheader = func.create_block();
+        let header = func.create_block();
+        let exit = func.create_block();
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(left), MachOperand::Block(right)],
+        );
+        materialize_slot(&mut func, left, 0, 0);
+        append(
+            &mut func,
+            left,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(preheader)],
+        );
+        append(
+            &mut func,
+            right,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(preheader)],
+        );
+        materialize_slot(&mut func, preheader, 1, 1);
+        append(
+            &mut func,
+            preheader,
+            AArch64Opcode::MovI,
+            vec![vreg(9), imm(7)],
+        );
+        finish_preheader_branch(&mut func, preheader, header);
+        let load = load_at(&mut func, header, 4, 0, 0);
+        append(
+            &mut func,
+            header,
+            AArch64Opcode::StrRI,
+            vec![vreg(9), vreg(1), imm(0)],
+        );
+        finish_loop_tail(&mut func, header, exit);
+        for (from, to) in [
+            (bb0, left),
+            (bb0, right),
+            (left, preheader),
+            (right, preheader),
+            (preheader, header),
+            (header, header),
+            (header, exit),
+        ] {
+            func.add_edge(from, to);
+        }
+        assert!(func.try_sync_vreg_counter().is_some());
+        let original = func.block(header).insts.clone();
+        assert!(!LoopInvariantCodeMotion::new().run(&mut func));
+        assert_eq!(func.block(header).insts, original);
+        assert!(!func.block(preheader).insts.contains(&load));
+    }
+
+    #[test]
+    fn test_licm_tier_b_numeric_census_is_lazy_and_counts_all_stored_references() {
+        let (mut func, bb0, _, _) = single_block_loop();
+        func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+        materialize_slot(&mut func, bb0, 0, 0);
+        let root = func.block(bb0).insts[0];
+        let hidden = func.create_block();
+        append(
+            &mut func,
+            hidden,
+            AArch64Opcode::MovI,
+            vec![vreg_class(0, RegClass::Gpr32), imm(0)],
+        );
+        func.append_inst(hidden, root); // repeated actual definition reference
+        func.block_order.retain(|id| *id != hidden);
+        let mut sites = FrameDefSites::build(&func);
+        assert!(
+            sites.numeric_counts.is_none(),
+            "legacy typed setup performs no numeric census"
+        );
+        assert_eq!(
+            sites
+                .sites
+                .get(&VReg::new(0, RegClass::Gpr64))
+                .expect("active root")
+                .len(),
+            1
+        );
+        assert_eq!(sites.numeric_definition_count(&func, 0), 3);
+        assert!(
+            sites.numeric_counts.is_some(),
+            "new TierB demand owns one cached census"
+        );
+        assert_eq!(sites.numeric_definition_count(&func, 0), 3);
+        assert_eq!(sites.numeric_definition_count(&func, 99), 0);
+    }
+
+    #[test]
+    fn test_licm_tier_b_rejecting_writer_summary_stops_unused_census() {
+        for kind in [
+            AArch64Opcode::Bl,
+            AArch64Opcode::Dmb,
+            AArch64Opcode::Ldar,
+            AArch64Opcode::StrRI,
+        ] {
+            for canonical_first in [false, true] {
+                let (mut func, bb0, bb1, bb2) = single_block_loop();
+                func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+                materialize_slot(&mut func, bb0, 1, 0);
+                append(
+                    &mut func,
+                    bb0,
+                    AArch64Opcode::MovI,
+                    vec![vreg(5), imm(4096)],
+                );
+                append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
+                finish_preheader_branch(&mut func, bb0, bb1);
+                // Nonwriters must not end the scan: it reaches the later call,
+                // barrier, acquire or unclassified store in every case.
+                append(&mut func, bb1, AArch64Opcode::MovI, vec![vreg(12), imm(11)]);
+                load_at(&mut func, bb1, 13, 5, 0);
+                let canonical = |f: &mut MachFunction| {
+                    append(f, bb1, AArch64Opcode::StrRI, vec![vreg(9), vreg(1), imm(0)]);
+                };
+                if canonical_first {
+                    canonical(&mut func);
+                }
+                let operands = match kind {
+                    AArch64Opcode::Bl => vec![sym("opaque_call")],
+                    AArch64Opcode::Dmb => vec![imm(15)],
+                    AArch64Opcode::Ldar => vec![vreg(14), vreg(5)],
+                    AArch64Opcode::StrRI => vec![vreg(9), vreg(5), imm(0)],
+                    _ => unreachable!(),
+                };
+                append(&mut func, bb1, kind, operands);
+                if !canonical_first {
+                    canonical(&mut func);
+                }
+                finish_loop_tail(&mut func, bb1, bb2);
+                assert!(func.try_sync_vreg_counter().is_some());
+                let original = func.block(bb1).insts.clone();
+                let dom = DomTree::compute(&func);
+                let counts = build_def_counts(&func);
+                let defs = crate::effects::build_reaching_def_map_by_vreg(&func);
+                let mut sites = None;
+                let facts =
+                    compute_loop_memory_facts(&func, &dom, &[bb1], &defs, &counts, &mut sites);
+                assert!(
+                    facts.writes_memory && facts.opaque_writer,
+                    "{kind:?}/{canonical_first}"
+                );
+                assert!(
+                    facts.store_bases.is_empty(),
+                    "partial rows are not authority: {kind:?}/{canonical_first}"
+                );
+                assert_eq!(
+                    sites.is_some(),
+                    canonical_first,
+                    "census demand: {kind:?}/{canonical_first}"
+                );
+                if let Some(sites) = &sites {
+                    assert!(
+                        sites.numeric_counts.is_some(),
+                        "retain an already-demanded cache"
+                    );
+                }
+                assert_eq!(func.block(bb1).insts, original);
+            }
+        }
+    }
+
+    #[test]
+    fn test_licm_tier_b_nonwriter_prefix_still_demands_later_bounded_store() {
+        let (mut func, bb0, bb1, bb2) = single_block_loop();
+        func.alloc_stack_slot(trust_cg_ir::StackSlot::new(16, 8));
+        materialize_slot(&mut func, bb0, 1, 0);
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(5), imm(4096)],
+        );
+        append(&mut func, bb0, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
+        finish_preheader_branch(&mut func, bb0, bb1);
+        append(&mut func, bb1, AArch64Opcode::MovI, vec![vreg(12), imm(11)]);
+        load_at(&mut func, bb1, 13, 5, 0);
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::StrRI,
+            vec![vreg(9), vreg(1), imm(0)],
+        );
+        finish_loop_tail(&mut func, bb1, bb2);
+        assert!(func.try_sync_vreg_counter().is_some());
+        let dom = DomTree::compute(&func);
+        let counts = build_def_counts(&func);
+        let defs = crate::effects::build_reaching_def_map_by_vreg(&func);
+        let mut sites = None;
+        let facts = compute_loop_memory_facts(&func, &dom, &[bb1], &defs, &counts, &mut sites);
+        assert!(facts.writes_memory);
+        assert!(!facts.opaque_writer);
+        assert_eq!(facts.store_bases, vec![AddrBase::Stack(StackSlotId(0))]);
+        let sites = sites.expect("one demanded shared index");
+        assert_eq!(
+            sites.numeric_counts.expect("one demanded census").get(&1),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn test_licm_tier_b_unknown_writer_keeps_load_but_pure_hoist_continues() {
+        let (mut func, bb0, bb1, bb2) = single_block_loop();
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(0), imm(4096)],
+        );
+        finish_preheader_branch(&mut func, bb0, bb1);
+        let load = load_at(&mut func, bb1, 4, 0, 0);
+        let pure = append(&mut func, bb1, AArch64Opcode::MovI, vec![vreg(9), imm(7)]);
+        let store = append(
+            &mut func,
+            bb1,
+            AArch64Opcode::StrRI,
+            vec![vreg(9), vreg(0), imm(0)],
+        );
+        finish_loop_tail(&mut func, bb1, bb2);
+        assert!(func.try_sync_vreg_counter().is_some());
+        assert!(LoopInvariantCodeMotion::new().run(&mut func));
+        assert!(func.block(bb0).insts.contains(&pure));
+        assert!(!func.block(bb1).insts.contains(&pure));
+        assert!(func.block(bb1).insts.contains(&load));
+        assert!(func.block(bb1).insts.contains(&store));
+        assert!(!func.block(bb0).insts.contains(&load));
+        assert!(!func.block(bb0).insts.contains(&store));
     }
 
     #[test]
@@ -4598,7 +6472,7 @@ mod tests {
         append(&mut func, bb1, AArch64Opcode::Bl, vec![imm(0x1000)]);
         finish_loop_tail(&mut func, bb1, bb2);
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(
             !licm.run(&mut func),
             "load must not hoist past an opaque call"
@@ -4683,7 +6557,7 @@ mod tests {
             vec![MachOperand::Block(bb1)],
         );
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         licm.run(&mut func);
         assert!(
             func.block(bb2).insts.contains(&load),
@@ -4740,15 +6614,419 @@ mod tests {
             vec![MachOperand::Block(bb1)],
         );
 
-        let mut licm = LoopInvariantCodeMotion;
+        let mut licm = LoopInvariantCodeMotion::new();
         assert!(licm.run(&mut func), "header load must still hoist");
         assert!(func.block(bb0).insts.contains(&load));
         assert!(!func.block(bb1).insts.contains(&load));
+    }
+
+    // ---------------------------------------------------------------------
+    // Must-execute across an inner cycle the first iteration can spin in
+    // ---------------------------------------------------------------------
+
+    /// Where [`loop_with_inner_cycle`] puts an inner cycle relative to the
+    /// invariant load `v1 = ldr [v0]`.
+    #[derive(Clone, Copy, Debug)]
+    enum InnerCycle {
+        /// `bb1 -> bb2 (self-loop) -> bb3`, the load in bb3.
+        SelfLoopThenLoad,
+        /// `bb1 -> {bb2, bb3}` with `bb2 <-> bb3` (two entries, so not a
+        /// natural loop) and both `-> bb4`, the load in bb4.
+        IrreducibleThenLoad,
+        /// `bb1 -> bb2 (self-loop) -> bb3`, the load in the header bb1.
+        LoadThenSelfLoop,
+    }
+
+    /// A loop entered unconditionally from `bb0` (`v0 = 4096 ; b bb1`) whose
+    /// last block is its only latch and only exiting block. The load's block
+    /// therefore dominates every latch and exit in every shape. Returns the
+    /// function, the load and the block it starts in.
+    fn loop_with_inner_cycle(shape: InnerCycle) -> (MachFunction, InstId, BlockId) {
+        let mut func = MachFunction::new("inner".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        append(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovI,
+            vec![vreg(0), imm(4096)],
+        );
+        finish_preheader_branch(&mut func, bb0, bb1);
+        func.add_edge(bb0, bb1);
+        let load_in = |func: &mut MachFunction, block| {
+            append(
+                func,
+                block,
+                AArch64Opcode::LdrRI,
+                vec![vreg(1), vreg(0), imm(0)],
+            )
+        };
+        let branch = |func: &mut MachFunction, from, taken, other| {
+            append(
+                func,
+                from,
+                AArch64Opcode::BCond,
+                vec![MachOperand::Block(taken), MachOperand::Block(other)],
+            );
+            func.add_edge(from, taken);
+            func.add_edge(from, other);
+        };
+        let (load, load_block, latch) = match shape {
+            InnerCycle::SelfLoopThenLoad | InnerCycle::LoadThenSelfLoop => {
+                let early = matches!(shape, InnerCycle::LoadThenSelfLoop);
+                let header_load = early.then(|| load_in(&mut func, bb1));
+                append(
+                    &mut func,
+                    bb1,
+                    AArch64Opcode::B,
+                    vec![MachOperand::Block(bb2)],
+                );
+                func.add_edge(bb1, bb2);
+                append(&mut func, bb2, AArch64Opcode::CmpRI, vec![vreg(9), imm(0)]);
+                branch(&mut func, bb2, bb2, bb3);
+                match header_load {
+                    Some(load) => (load, bb1, bb3),
+                    None => (load_in(&mut func, bb3), bb3, bb3),
+                }
+            }
+            InnerCycle::IrreducibleThenLoad => {
+                let bb4 = func.create_block();
+                branch(&mut func, bb1, bb2, bb3);
+                branch(&mut func, bb2, bb3, bb4);
+                branch(&mut func, bb3, bb2, bb4);
+                (load_in(&mut func, bb4), bb4, bb4)
+            }
+        };
+        let exit = func.create_block();
+        append(
+            &mut func,
+            latch,
+            AArch64Opcode::SubRI,
+            vec![vreg(8), vreg(8), imm(1)],
+        );
+        branch(&mut func, latch, exit, bb1);
+        append(&mut func, exit, AArch64Opcode::Ret, vec![]);
+        (func, load, load_block)
+    }
+
+    /// WRONG-CODE REGRESSION: `loop { while c != 0 {} v = *q; ... }`. The load's
+    /// block dominates the only latch and exit, yet with `c != 0` the first
+    /// iteration spins forever in the inner cycle and never loads. Hoisting
+    /// `*q` into the preheader would turn that non-termination into a fault
+    /// when `q` is unmapped. Both the reducible and the irreducible inner
+    /// cycle must keep the load in place.
+    #[test]
+    fn test_licm_no_hoist_load_behind_an_inner_cycle() {
+        let mut wrong = Vec::new();
+        for shape in [
+            InnerCycle::SelfLoopThenLoad,
+            InnerCycle::IrreducibleThenLoad,
+        ] {
+            let (mut func, load, load_block) = loop_with_inner_cycle(shape);
+            let dom = DomTree::compute(&func);
+            let loops = LoopAnalysis::compute(&func, &dom);
+            let outer = loops.get_loop(BlockId(1)).expect("outer loop");
+            let pos = func
+                .block(load_block)
+                .insts
+                .iter()
+                .position(|&id| id == load)
+                .expect("the load is in its block");
+            if load_guaranteed_to_execute(&func, &dom, outer, (load_block, pos)) {
+                wrong.push(format!("{shape:?}: judged guaranteed to execute"));
+            }
+            LoopInvariantCodeMotion::new().run(&mut func);
+            if !func.block(load_block).insts.contains(&load)
+                || func.block(func.entry).insts.contains(&load)
+            {
+                wrong.push(format!("{shape:?}: hoisted into the preheader"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the first iteration can spin before the load: {wrong:?}"
+        );
+    }
+
+    /// POSITIVE CONTROL: an inner loop AFTER the load cannot stop the first
+    /// iteration from reaching it, so the header load still hoists.
+    #[test]
+    fn test_licm_hoists_load_ahead_of_an_inner_loop() {
+        let (mut func, load, load_block) = loop_with_inner_cycle(InnerCycle::LoadThenSelfLoop);
+        assert!(LoopInvariantCodeMotion::new().run(&mut func));
+        assert!(func.block(func.entry).insts.contains(&load));
+        assert!(!func.block(load_block).insts.contains(&load));
+    }
+
+    // ---------------------------------------------------------------------
+    // Must-execute inside the loop: an in-loop stop that runs before the load
+    // ---------------------------------------------------------------------
+
+    /// `TrapBoundsCheckExact v1, v1, #16`: the guard `k <u 16` on the
+    /// invariant index `v1`, as isel selects a fused `GuardBoundsCheck`. It is
+    /// flagged `IS_BRANCH | IS_TERMINATOR` but falls through to the rest of
+    /// its block and has no CFG edge, so the dominance test cannot see it.
+    fn bounds_guard(func: &mut MachFunction, block: BlockId) -> InstId {
+        append(
+            func,
+            block,
+            AArch64Opcode::TrapBoundsCheckExact,
+            vec![vreg(1), vreg(1), imm(16)],
+        )
+    }
+
+    /// The preheader `bb0`: `v0 = a` (the array pointer), `v1 = k` (the index
+    /// the guard checks), then `b bb1`. `v0` is an ordinary pointer, not a
+    /// frame slot address, so only the must-execute rule can admit a load
+    /// through it.
+    fn enter_loop(func: &mut MachFunction, bb0: BlockId, bb1: BlockId) {
+        append(func, bb0, AArch64Opcode::MovI, vec![vreg(0), imm(4096)]);
+        append(func, bb0, AArch64Opcode::MovI, vec![vreg(1), imm(1 << 44)]);
+        finish_preheader_branch(func, bb0, bb1);
+    }
+
+    /// `sub v8, v8, #1 ; bcond exit, header`: the counted exit test and back
+    /// edge of a do-while latch.
+    fn latch_tail(func: &mut MachFunction, latch: BlockId, exit: BlockId, header: BlockId) {
+        append(
+            func,
+            latch,
+            AArch64Opcode::SubRI,
+            vec![vreg(8), vreg(8), imm(1)],
+        );
+        append(
+            func,
+            latch,
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(exit), MachOperand::Block(header)],
+        );
+        append(func, exit, AArch64Opcode::Ret, vec![]);
+    }
+
+    /// Run both LICM configurations on a fresh `build()` and require each to
+    /// leave every block unchanged.
+    fn assert_licm_declines(build: impl Fn() -> MachFunction) {
+        let blocks = |func: &MachFunction| -> Vec<Vec<InstId>> {
+            func.block_order
+                .iter()
+                .map(|&b| func.block(b).insts.clone())
+                .collect()
+        };
+        for mut licm in [
+            LoopInvariantCodeMotion::new(),
+            LoopInvariantCodeMotion::without_frame_speculation(),
+        ] {
+            let mut func = build();
+            let before = blocks(&func);
+            assert!(
+                !licm.run(&mut func),
+                "{licm:?} hoisted a load above an in-loop stop that runs first"
+            );
+            assert_eq!(blocks(&func), before, "{licm:?} changed the function");
+        }
+    }
+
+    #[test]
+    fn test_licm_no_hoist_load_behind_in_block_trap_carrier() {
+        // `loop { s += a[k]; i += 1; if i >= m { break } }` with `k` out of
+        // bounds traps on the guard in the first iteration before it reads
+        // `a + 8k`. Hoisted to the preheader, that read runs first: a fault
+        // (SIGSEGV) where the program trapped (BRK).
+        //
+        //   bb0: v0 = a ; v1 = k ; b bb1
+        //   bb1 (header, latch, exiting): guard ; ldr v2, [v0] ; bcond bb2, bb1
+        //   bb2: ret
+        assert_licm_declines(|| {
+            let (mut func, bb0, bb1, bb2) = single_block_loop();
+            enter_loop(&mut func, bb0, bb1);
+            bounds_guard(&mut func, bb1);
+            load_at(&mut func, bb1, 2, 0, 0);
+            finish_loop_tail(&mut func, bb1, bb2);
+            func
+        });
+    }
+
+    #[test]
+    fn test_licm_no_hoist_load_behind_header_trap_carrier() {
+        // The rustc bridge's shape: MIR's `Assert(BoundsCheck)` ends the
+        // header, so the fused guard sits in the header and the load in its
+        // success block, which is the latch and the exiting block. That block
+        // dominates every latch and exit, yet the guard runs before it.
+        //
+        //   bb0: v0 = a ; v1 = k ; b bb1
+        //   bb1 (header): guard ; b bb2
+        //   bb2 (latch, exiting): ldr v2, [v0] ; bcond bb3, bb1
+        //   bb3: ret
+        assert_licm_declines(|| {
+            let mut func = MachFunction::new(
+                "licm_header_guard".to_string(),
+                Signature::new(vec![], vec![]),
+            );
+            let bb0 = func.entry;
+            let (bb1, bb2, bb3) = (
+                func.create_block(),
+                func.create_block(),
+                func.create_block(),
+            );
+            func.add_edge(bb0, bb1);
+            func.add_edge(bb1, bb2);
+            func.add_edge(bb2, bb3);
+            func.add_edge(bb2, bb1);
+            enter_loop(&mut func, bb0, bb1);
+            bounds_guard(&mut func, bb1);
+            append(
+                &mut func,
+                bb1,
+                AArch64Opcode::B,
+                vec![MachOperand::Block(bb2)],
+            );
+            load_at(&mut func, bb2, 2, 0, 0);
+            latch_tail(&mut func, bb2, bb3, bb1);
+            func
+        });
+    }
+
+    #[test]
+    fn test_licm_no_hoist_load_behind_trap_carrier_on_one_arm() {
+        // The guard need not dominate the load: an iteration that takes the
+        // guarded arm stops before the load as surely as one that always runs
+        // the guard.
+        //
+        //   bb0: v0 = a ; v1 = k ; b bb1
+        //   bb1 (header): bcond bb2, bb3
+        //   bb2: guard ; b bb4          bb3: b bb4
+        //   bb4 (latch, exiting): ldr v2, [v0] ; bcond bb5, bb1
+        //   bb5: ret
+        assert_licm_declines(|| {
+            let mut func =
+                MachFunction::new("licm_arm_guard".to_string(), Signature::new(vec![], vec![]));
+            let bb0 = func.entry;
+            let (bb1, bb2, bb3, bb4, bb5) = (
+                func.create_block(),
+                func.create_block(),
+                func.create_block(),
+                func.create_block(),
+                func.create_block(),
+            );
+            func.add_edge(bb0, bb1);
+            func.add_edge(bb1, bb2);
+            func.add_edge(bb1, bb3);
+            func.add_edge(bb2, bb4);
+            func.add_edge(bb3, bb4);
+            func.add_edge(bb4, bb5);
+            func.add_edge(bb4, bb1);
+            enter_loop(&mut func, bb0, bb1);
+            append(
+                &mut func,
+                bb1,
+                AArch64Opcode::BCond,
+                vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
+            );
+            bounds_guard(&mut func, bb2);
+            append(
+                &mut func,
+                bb2,
+                AArch64Opcode::B,
+                vec![MachOperand::Block(bb4)],
+            );
+            append(
+                &mut func,
+                bb3,
+                AArch64Opcode::B,
+                vec![MachOperand::Block(bb4)],
+            );
+            load_at(&mut func, bb4, 2, 0, 0);
+            latch_tail(&mut func, bb4, bb5, bb1);
+            func
+        });
+    }
+
+    #[test]
+    fn test_licm_no_hoist_load_behind_mid_block_assert_branch() {
+        // `select_assert`'s spelling of an unfused `Assert`: `cmp c, #0 ;
+        // b.eq trap` in the middle of the block, then the load. The block is
+        // the exiting block and dominates itself, but the branch leaves the
+        // loop before the load runs.
+        //
+        //   bb0: v0 = a ; v1 = k ; b bb1
+        //   bb1 (header, latch, exiting): cmp v1, #0 ; b.eq bb3 ;
+        //        ldr v2, [v0] ; bcond bb2, bb1
+        //   bb2: ret      bb3: brk
+        assert_licm_declines(|| {
+            let (mut func, bb0, bb1, bb2) = single_block_loop();
+            let bb3 = func.create_block();
+            func.add_edge(bb1, bb3);
+            enter_loop(&mut func, bb0, bb1);
+            append(&mut func, bb1, AArch64Opcode::CmpRI, vec![vreg(1), imm(0)]);
+            append(
+                &mut func,
+                bb1,
+                AArch64Opcode::BCond,
+                vec![imm(0), MachOperand::Block(bb3)],
+            );
+            load_at(&mut func, bb1, 2, 0, 0);
+            finish_loop_tail(&mut func, bb1, bb2);
+            append(&mut func, bb3, AArch64Opcode::Brk, vec![]);
+            func
+        });
+    }
+
+    /// POSITIVE CONTROL: a guard that runs only AFTER the load (later in its
+    /// block, or in a block the load's block reaches) cannot stop it, so the
+    /// load still hoists.
+    #[test]
+    fn test_licm_hoists_load_that_runs_before_the_trap_carrier() {
+        // Same block: ldr ; guard.
+        let (mut func, bb0, bb1, bb2) = single_block_loop();
+        enter_loop(&mut func, bb0, bb1);
+        let load = load_at(&mut func, bb1, 2, 0, 0);
+        let carrier = bounds_guard(&mut func, bb1);
+        finish_loop_tail(&mut func, bb1, bb2);
+        let mut licm = LoopInvariantCodeMotion::without_frame_speculation();
+        assert!(licm.run(&mut func), "a load before the guard hoists");
+        assert!(func.block(bb0).insts.contains(&load));
+        assert!(func.block(bb1).insts.contains(&carrier));
+
+        // Header load, guard in the latch.
+        let mut func = MachFunction::new(
+            "licm_latch_guard".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let (bb1, bb2, bb3) = (
+            func.create_block(),
+            func.create_block(),
+            func.create_block(),
+        );
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb2, bb3);
+        func.add_edge(bb2, bb1);
+        enter_loop(&mut func, bb0, bb1);
+        let load = load_at(&mut func, bb1, 2, 0, 0);
+        append(
+            &mut func,
+            bb1,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb2)],
+        );
+        let carrier = bounds_guard(&mut func, bb2);
+        latch_tail(&mut func, bb2, bb3, bb1);
+        let mut licm = LoopInvariantCodeMotion::without_frame_speculation();
+        assert!(
+            licm.run(&mut func),
+            "a header load before a latch guard hoists"
+        );
+        assert!(func.block(bb0).insts.contains(&load));
+        assert!(func.block(bb2).insts.contains(&carrier));
     }
 }
 
 #[cfg(test)]
 mod region_tests {
+    mod eh_call_custody_tests;
     use super::*;
     use trust_cg_ir::{
         AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, RegClass, Signature, VReg,
@@ -5133,7 +7411,8 @@ mod region_tests {
         let loops: Vec<NaturalLoop> = analysis.all_loops().cloned().collect();
         assert_eq!(loops.len(), 1, "expected exactly one natural loop");
         let def_counts = build_def_counts(func);
-        hoist_pure_call_clusters(func, &loops[0], &def_counts, &dom)
+        let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
+        hoist_pure_call_clusters(func, &loops[0], &def_counts, &dom, &protected)
     }
 
     #[test]
@@ -5329,5 +7608,183 @@ mod region_tests {
             bb,
             &[(VReg::new(0, RegClass::Gpr64), vec![ids[1], ids[0]])],
         );
+    }
+}
+
+/// L14-P6: LICM over a function with many loops costs linearly in them.
+#[cfg(test)]
+mod many_loops_tests {
+    use super::*;
+    use trust_cg_ir::{AArch64Opcode, MachFunction, MachInst, MachOperand, RegClass, Signature};
+
+    fn vreg(id: u32) -> MachOperand {
+        MachOperand::VReg(VReg::new(id, RegClass::Gpr64))
+    }
+
+    fn imm(val: i64) -> MachOperand {
+        MachOperand::Imm(val)
+    }
+
+    fn push(func: &mut MachFunction, block: BlockId, opcode: AArch64Opcode, ops: Vec<MachOperand>) {
+        let id = func.push_inst(MachInst::new(opcode, ops));
+        func.append_inst(block, id);
+    }
+
+    /// `loops` single-block loops in sequence. Each has a three-instruction
+    /// constant chain (`MOVZ` + two `MOVK`), an invariant add of values
+    /// defined before every loop, and a loop-variant multiply of the chain's
+    /// carrier; the exit of one loop is the preheader of the next.
+    fn make_loop_chain(loops: u32) -> MachFunction {
+        use AArch64Opcode::*;
+        let mut func = MachFunction::new("licm_chain".to_string(), Signature::new(vec![], vec![]));
+        let mut pre = func.entry;
+        push(&mut func, pre, MovI, vec![vreg(0), imm(10)]);
+        push(&mut func, pre, MovI, vec![vreg(1), imm(20)]);
+        for k in 0..loops {
+            let header = func.create_block();
+            let exit = func.create_block();
+            let base = 10 + 10 * k;
+            let (carrier, invariant, product, counter) = (base, base + 1, base + 2, base + 3);
+            push(&mut func, pre, MovI, vec![vreg(counter), imm(100)]);
+            push(&mut func, pre, B, vec![MachOperand::Block(header)]);
+            func.add_edge(pre, header);
+            push(
+                &mut func,
+                header,
+                Movz,
+                vec![vreg(carrier), imm(0x1234 + i64::from(k))],
+            );
+            push(
+                &mut func,
+                header,
+                Movk,
+                vec![vreg(carrier), imm(0x5678), imm(16)],
+            );
+            push(
+                &mut func,
+                header,
+                Movk,
+                vec![vreg(carrier), imm(0x9abc), imm(32)],
+            );
+            push(
+                &mut func,
+                header,
+                AddRR,
+                vec![vreg(invariant), vreg(0), vreg(1)],
+            );
+            push(
+                &mut func,
+                header,
+                MulRR,
+                vec![vreg(product), vreg(counter), vreg(carrier)],
+            );
+            push(
+                &mut func,
+                header,
+                SubRI,
+                vec![vreg(counter), vreg(counter), imm(1)],
+            );
+            push(
+                &mut func,
+                header,
+                BCond,
+                vec![MachOperand::Block(exit), MachOperand::Block(header)],
+            );
+            func.add_edge(header, exit);
+            func.add_edge(header, header);
+            pre = exit;
+        }
+        push(&mut func, pre, Ret, vec![]);
+        func
+    }
+
+    fn same_index(a: &ConstChainIndex, b: &ConstChainIndex) -> bool {
+        a.defs == b.defs && a.fmov_gpr_sources == b.fmov_gpr_sources && a.block_pos == b.block_pos
+    }
+
+    /// After every loop that hoists, the refreshed constant-chain index is
+    /// exactly what a rebuild of the changed function produces.
+    #[test]
+    fn a_refreshed_chain_index_equals_a_rebuild() {
+        for loops in [1, 3, 6] {
+            let mut func = make_loop_chain(loops);
+            let dom = DomTree::compute(&func);
+            let analysis = LoopAnalysis::compute(&func, &dom);
+            let mut ordered: Vec<NaturalLoop> = analysis.all_loops().cloned().collect();
+            ordered.sort_by_key(|lp| std::cmp::Reverse(lp.depth));
+            assert_eq!(ordered.len(), loops as usize);
+            let def_counts = build_def_counts(&func);
+            let def_map = crate::effects::build_reaching_def_map_by_vreg(&func);
+            let layout = LayoutPositions::new();
+            let mut chain_index = Some(ConstChainIndex::build(&func));
+            let unwind_exits = crate::eh_call_custody::UnwindExits::collect(&func);
+            let mut hoisted = 0;
+            for lp in &ordered {
+                let mut touched = Vec::new();
+                if hoist_loop_invariants(
+                    &mut func,
+                    lp,
+                    &dom,
+                    &unwind_exits,
+                    &def_counts,
+                    &def_map,
+                    &layout,
+                    &mut chain_index,
+                    &mut None,
+                    false,
+                    &mut touched,
+                ) {
+                    hoisted += 1;
+                    let index = chain_index.as_mut().expect("index kept");
+                    assert!(index.refresh(&func, &touched));
+                    assert!(same_index(index, &ConstChainIndex::build(&func)));
+                }
+            }
+            assert_eq!(hoisted, loops, "every loop hoists its chain");
+        }
+    }
+
+    /// The whole pass gives the same function whether the index is refreshed
+    /// or rebuilt after each hoisting loop.
+    #[test]
+    fn refreshing_the_chain_index_changes_no_hoist() {
+        for loops in [2, 5, 9] {
+            let mut refreshed = make_loop_chain(loops);
+            let mut rebuilt = refreshed.clone();
+            assert!(LoopInvariantCodeMotion::new().run(&mut refreshed));
+            FORCE_CHAIN_INDEX_REBUILD.with(|force| force.set(true));
+            let changed = LoopInvariantCodeMotion::new().run(&mut rebuilt);
+            FORCE_CHAIN_INDEX_REBUILD.with(|force| force.set(false));
+            assert!(changed);
+            assert_eq!(
+                format!("{refreshed:?}"),
+                format!("{rebuilt:?}"),
+                "{loops} loops"
+            );
+        }
+    }
+
+    /// A loop's body blocks come out in layout order, as filtering
+    /// `block_order` gives them, with a unique layout and with one that lists
+    /// a block twice.
+    #[test]
+    fn body_blocks_in_layout_match_the_layout_filter() {
+        let func = make_loop_chain(4);
+        let mut repeated = func.clone();
+        repeated.block_order.push(BlockId(1));
+        for f in [&func, &repeated] {
+            let dom = DomTree::compute(f);
+            let analysis = LoopAnalysis::compute(f, &dom);
+            let layout = LayoutPositions::new();
+            for lp in analysis.all_loops() {
+                let literal: Vec<BlockId> = f
+                    .block_order
+                    .iter()
+                    .copied()
+                    .filter(|b| lp.body.contains(b))
+                    .collect();
+                assert_eq!(layout.body_blocks_in_layout(f, &lp.body), literal);
+            }
+        }
     }
 }

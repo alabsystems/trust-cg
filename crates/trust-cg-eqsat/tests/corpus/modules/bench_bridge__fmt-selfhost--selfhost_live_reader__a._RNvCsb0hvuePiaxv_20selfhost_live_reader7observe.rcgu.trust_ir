@@ -1,0 +1,48 @@
+; TrustIr text format v1
+module "_RNvCsb0hvuePiaxv_20selfhost_live_reader7observe"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (&[ty.3 x 2]) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCsb0hvuePiaxv_20selfhost_live_reader7observe(functy.0) {
+bb0(%1: &[ty.3 x 2]):
+    %5 = load ptr, ptr %1
+    %6 = ptrtoint ptr %5 to u64
+    %7 = const u64 0
+    %8 = sub u64 %6, %7
+    %9 = icmp eq u64 %6, %7
+    %10 = bitcast u64 %8 to i64
+    %11 = const i64 1
+    %12 = add i64 %10, %11
+    %13 = const i64 0
+    %14 = select i64 %9, %12, %13
+    %4 = copy i64 %14
+    switch %4 [ 0: bb2 1: bb3 default: bb1 ]
+bb2:
+    %15 = const u64 1000
+    br bb4(%15)
+bb3:
+    %17 = const i64 8
+    %18 = ptrtoptr &[ty.3 x 2] %1 to ptr
+    %19 = ptrtoint ptr %18 to i64
+    %20 = copy i64 %17
+    %21 = add i64 %19, %20
+    %22 = inttoptr i64 %21 to ptr
+    %16 = load u64, ptr %22
+    br bb4(%16)
+bb4(%23: u64):
+    ret %23
+bb1:
+    %24 = const u64 0
+    ret %24
+}

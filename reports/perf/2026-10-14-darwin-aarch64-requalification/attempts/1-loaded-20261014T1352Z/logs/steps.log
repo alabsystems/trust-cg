@@ -1,0 +1,8 @@
+=== 01-beat-llvm-evidence-warm-cold: python3 benchmarks/beat-llvm/run.py --driver $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc --cold --retain-dir $HOME/trust-cg-w19/perf-requalification-L14-P1/reports/perf/2026-10-14-darwin-aarch64-requalification
+01-beat-llvm-evidence-warm-cold	exit=0	wall_s=367.9
+evidence results: benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T135816Z.json
+=== 02-perf-ratchet-require-current: python3 scripts/check_perf_ratchet.py --require-current benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T135816Z.json
+02-perf-ratchet-require-current	exit=3	wall_s=0.3
+=== 03-check-gates-evidence: python3 benchmarks/beat-llvm/contract/check_gates.py benchmarks/beat-llvm/results/efc47d3bc3e5-20261014T135816Z.json
+03-check-gates-evidence	exit=2	wall_s=0.1
+campaign done 2026-10-14T13:58:18Z

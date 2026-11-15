@@ -21,16 +21,24 @@
 //! All data is written in little-endian byte order (both targets are LE).
 
 pub mod constants;
-pub mod debug;
+pub mod dwarf;
 pub mod header;
+pub mod metadata;
 pub mod reloc;
 pub mod reparse;
 pub mod section;
 pub mod symbol;
 pub mod writer;
 
-pub use debug::{DwarfDebugStubs, NoteGnuStack, ProgramHeaderStub, SectionGroup};
+pub use dwarf::{ElfDwarfAnchorIndices, ElfDwarfAnchors, ElfDwarfSections};
 pub use header::ElfMachine;
-pub use reloc::{AArch64RelocType, Elf64Rela, X86_64RelocType};
+pub use metadata::{NoteGnuStack, ProgramHeaderStub, SectionGroup};
+pub use reloc::{
+    AARCH64_TLS_TCB_BYTES, AArch64RelocType, Elf64Rela, RelocationLimit, RelocationWindow,
+    WindowDischarge, X86_64RelocType,
+};
 pub use symbol::{Elf64Sym, ElfStringTable};
-pub use writer::{ElfSymbol, ElfWriter};
+pub use writer::{
+    ElfSectionError, ElfSectionGroupId, ElfSymbol, ElfSymbolError, ElfSymbolId, ElfWriter,
+    MAX_ELF_SECTION_ALIGN,
+};

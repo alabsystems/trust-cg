@@ -101,7 +101,7 @@ int main() {{
             open(cdrv, "w").write(drv)
             for O in ["O0", "O1", "O2"]:
                 obj = os.path.join(wd, "k.o")
-                r = run([MB, "--format=text", "--target", "aarch64", f"-{O}", "-c", ir, "-o", obj])
+                r = run([MB, "--format=text", "--permit-unlicensed", "--target", "aarch64", f"-{O}", "-c", ir, "-o", obj])
                 if r.returncode != 0:
                     err += 1; fails.append(f"{fty}:{name}:-{O} compile: {r.stderr.strip()[:80]}"); continue
                 exe = os.path.join(wd, "t")

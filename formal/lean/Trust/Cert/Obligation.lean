@@ -15,8 +15,12 @@ namespace Trust
 structure LoweredStep where
   exec  : MachState → MachState
   event : Event
-  /-- the chain of real x86 steps that `exec` summarizes (ties exec to x86StepPlus). -/
-  runs  : ∀ m, x86StepPlus m event (exec m)
+  /-- States in which the emitted code and its execution prerequisites are present. -/
+  entry : MachState → Prop
+  /-- The execution domain must contain a concrete state, not be `False`. -/
+  entry_nonempty : ∃ m, entry m
+  /-- Real machine execution is required on that explicitly admitted domain. -/
+  runs  : ∀ m, entry m → x86StepPlus m event (exec m)
 
 /-- The set of physical registers / slots an instruction is permitted to clobber.
     Comes from regalloc_validator (distinct live values → distinct regs) + call_clobber. -/
@@ -49,8 +53,14 @@ opaque clobberOf : LoweredStep → ClobberSet
 /-!
   ## InstrCert — the uniform obligation typeclass/structure.
 
-  Each Cert.Arith/Compare/BitManip/Niche lemma packages its result as an `InstrCert`.
-  `forward_sim`'s case for that opcode destructs the `InstrCert` and gets, in one shot:
+  Producers in this tree: `Cert.Arith.BinOpI128Site.toInstrCert`,
+  `Cert.Compare.CmpSite.toInstrCert`, `Sim.ForwardSim.pureInstrCert` (ForwardSim/Pure.lean),
+  `Sim.ForwardSim.Mem.load_instrCert` / `Sim.ForwardSim.Mem.store_instrCert`, and
+  `Sim.ForwardSim.callInstrCert` (ForwardSim/Call.lean). `Cert.BitManip` supplies standalone
+  SWAR value equations, while `Cert.Niche` is an empty placeholder; neither produces an
+  `InstrCert`
+  (docs/aarch64-completion-audit-2026-09-17.md, gap X-LEAN-P11).
+  A forward_sim case that consumes an `InstrCert` for its lowered step gets, in one shot:
     (1) `value`     — the bv_decide-discharged VALUE correctness (post-state denotes the src result),
     (2) `clobber`   — the regalloc/frame bound (Preserves),
     (3) `carrierOk` — re-establishment of WidthFaithful for the (possibly narrow) result,
@@ -61,6 +71,8 @@ structure InstrCert
     (lay : Layout) (step : LoweredStep)
     (s s' : SrcState)        -- the source transition this instruction realizes
     : Prop where
+  /-- Establish the lowered code's execution prerequisites from the incoming relation. -/
+  entryReady : ∀ m, R lay s m → step.entry m
   /-- VALUE cert (the bv_decide core): after `step.exec`, the relation's `realize`
       conjunct holds for s'. Discharged per-opcode via bv_decide on width-bounded BitVecs.
       Shapes reused: `lowerAdd_correct`, `lowerCmp_correct`. -/
@@ -89,17 +101,21 @@ theorem cert_reestablishes_R
     {lay : Layout} {step : LoweredStep} {s s' : SrcState} {m : MachState}
     (cert : InstrCert lay step s s') (hR : R lay s m) :
     x86StepPlus m step.event (step.exec m) ∧ R lay s' (step.exec m) :=
-  ⟨ step.runs m
+  ⟨ step.runs m (cert.entryReady m hR)
   , { realize  := cert.value  m hR
     , carrier  := cert.carrierOk m hR
     , memAgree := cert.memOk    m hR
     , pcSync   := cert.pcOk     m hR } ⟩
 
 /-!
-  ## CertProvider typeclass — uniform dispatch from opcode to its InstrCert.
+  ## CertProvider typeclass — the intended uniform dispatch from opcode to its InstrCert.
 
-  Cert.Arith/Compare/BitManip/Niche register instances; forward_sim's per-case code
-  resolves `CertProvider.cert` for the opcode kind, feeding `cert_reestablishes_R`. -/
+  No module in this tree registers a `CertProvider` instance, so nothing dispatches through
+  this class. The producers listed above build each `InstrCert` directly: the `Cert.Compare`
+  one is passed to `cert_reestablishes_R` directly, the ForwardSim Pure/Mem/Call ones through
+  `Sim.matchStep_exists`, and `Cert.Arith.BinOpI128Site.toInstrCert` has no consumer here.
+  `Cert.BitManip` supplies value equations but no provider; `Cert.Niche` remains an empty
+  placeholder (X-LEAN-P11). The class is kept as the intended dispatch shape. -/
 class CertProvider (OpTag : Type) where
   /-- given the static opcode tag and the source transition it implements, build the cert. -/
   cert : OpTag → (lay : Layout) → (step : LoweredStep) → (s s' : SrcState) →

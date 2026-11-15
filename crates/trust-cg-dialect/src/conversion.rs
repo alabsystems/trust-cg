@@ -16,12 +16,19 @@ use std::collections::BTreeMap;
 use trust_cg_ir::Type;
 
 use crate::id::{BlockId, DialectOpId, OpId, ValueId};
-use crate::module::{DialectFunction, DialectModule};
+use crate::module::{DialectBuildError, DialectFunction, DialectModule};
 use crate::op::{Attributes, DialectOp, SourceRange};
 
 /// Error returned by conversion logic.
 #[derive(Debug, Clone)]
 pub enum ConversionError {
+    /// Destination construction exceeded its identity domain or named an invalid block.
+    Build(DialectBuildError),
+    /// Source layout or references are malformed before conversion begins.
+    InvalidFunction(String),
+    /// An operand has no destination binding yet (unsupported forward result
+    /// use, or a pattern omitted its result binding). Never preserve its source ID.
+    UnmappedValue { value: ValueId, operation: OpId },
     /// Pattern matched but failed to produce replacement ops.
     RewriteFailed(String),
     /// No pattern is registered for this source op.
@@ -33,6 +40,12 @@ pub enum ConversionError {
 impl std::fmt::Display for ConversionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConversionError::Build(error) => write!(f, "destination construction failed: {error}"),
+            ConversionError::InvalidFunction(m) => write!(f, "invalid function: {}", m),
+            ConversionError::UnmappedValue { value, operation } => write!(
+                f,
+                "op {operation:?} has no destination mapping for operand {value:?}"
+            ),
             ConversionError::RewriteFailed(m) => write!(f, "rewrite failed: {}", m),
             ConversionError::NoPatternForOp(id) => write!(f, "no pattern for op {:?}", id),
             ConversionError::EmitFailed(m) => write!(f, "emit failed: {}", m),
@@ -41,6 +54,12 @@ impl std::fmt::Display for ConversionError {
 }
 
 impl std::error::Error for ConversionError {}
+
+impl From<DialectBuildError> for ConversionError {
+    fn from(error: DialectBuildError) -> Self {
+        Self::Build(error)
+    }
+}
 
 /// A rewriter sees a single source op and emits zero or more replacement ops
 /// into `rewriter`. Replacement ops must be in the destination dialect.
@@ -51,6 +70,9 @@ pub trait ConversionPattern {
     /// Produce replacements. The rewriter is scoped to the current block — the
     /// driver appends emitted ops in sequence into a fresh "lowered" function
     /// and records the mapping from old result values to new ones.
+    /// Operands and block-reference attributes are already in destination
+    /// space. Result IDs remain in source space for `bind_result`; do not map
+    /// the provided operands a second time.
     fn rewrite(&self, op: &DialectOp, rewriter: &mut Rewriter<'_>) -> Result<(), ConversionError>;
 }
 
@@ -69,8 +91,8 @@ pub struct Rewriter<'a> {
     /// currently being rewritten — the driver advances it as it walks blocks.
     block: BlockId,
     /// Mapping from source-function ValueIds to destination-function ValueIds.
-    /// Pattern implementations use [`Rewriter::map`] to translate operands and
-    /// [`Rewriter::bind_result`] to declare replacements for source-op results.
+    /// Patterns use [`Rewriter::bind_result`] for source-op results. `map` is
+    /// for additional source IDs, not already-translated `op.operands`.
     value_map: &'a mut BTreeMap<ValueId, ValueId>,
     /// Mapping from source-function BlockIds to destination-function BlockIds.
     /// Shared across the full walk so patterns can reference *any* destination
@@ -82,8 +104,8 @@ pub struct Rewriter<'a> {
 impl<'a> Rewriter<'a> {
     /// Translate a source-function `ValueId` into its destination-function
     /// replacement. Returns `None` if the value has not been mapped yet (e.g.
-    /// pattern was applied before the op defining that value was converted —
-    /// caller should skip / retry).
+    /// pattern omitted the binding). The driver rejects unmapped source
+    /// operands before invoking a pattern; it does not implement retry scheduling.
     pub fn map(&self, src: ValueId) -> Option<ValueId> {
         self.value_map.get(&src).copied()
     }
@@ -97,8 +119,8 @@ impl<'a> Rewriter<'a> {
     }
 
     /// Allocate a fresh destination-function `ValueId`.
-    pub fn alloc_value(&mut self) -> ValueId {
-        self.function.alloc_value()
+    pub fn alloc_value(&mut self) -> Result<ValueId, ConversionError> {
+        Ok(self.function.alloc_value()?)
     }
 
     /// The destination block currently being filled.
@@ -125,9 +147,10 @@ impl<'a> Rewriter<'a> {
         operands: Vec<ValueId>,
         attrs: Attributes,
         source: Option<SourceRange>,
-    ) -> OpId {
-        self.function
-            .append_op(self.block, op, results, operands, attrs, source)
+    ) -> Result<OpId, ConversionError> {
+        Ok(self
+            .function
+            .append_op(self.block, op, results, operands, attrs, source)?)
     }
 }
 
@@ -157,6 +180,10 @@ impl ConversionDriver {
     /// through verbatim — this lets a single driver handle mixed-dialect
     /// input/output (e.g. keeping `machir.*` ops unchanged while lowering
     /// `trust_ir.*`).
+    /// Source values must be mapped before use; forward operation-result uses
+    /// require a different scheduling strategy and currently return a diagnostic.
+    /// Block parameters are pre-mapped across all blocks. A failed rebuild does
+    /// not replace that source function; earlier functions may already be rebuilt.
     pub fn run(&self, module: &mut DialectModule) -> Result<(), ConversionError> {
         for idx in 0..module.functions.len() {
             let rebuilt = self.run_on_function(&module.functions[idx])?;
@@ -166,6 +193,8 @@ impl ConversionDriver {
     }
 
     fn run_on_function(&self, src: &DialectFunction) -> Result<DialectFunction, ConversionError> {
+        src.validate_structure()
+            .map_err(ConversionError::InvalidFunction)?;
         // --- 1. Build destination skeleton ---
         //
         // Start with a fresh function with the same signature. The entry
@@ -173,7 +202,7 @@ impl ConversionDriver {
         // function-level parameters; any *additional* source blocks are
         // re-created one-for-one with their block params re-allocated.
         let param_types: Vec<Type> = src.params.iter().map(|(_, t)| t.clone()).collect();
-        let mut dst = DialectFunction::new(src.name.clone(), param_types, src.results.clone());
+        let mut dst = DialectFunction::new(src.name.clone(), param_types, src.results.clone())?;
 
         let mut value_map: BTreeMap<ValueId, ValueId> = BTreeMap::new();
         let mut block_map: BTreeMap<BlockId, BlockId> = BTreeMap::new();
@@ -189,10 +218,6 @@ impl ConversionDriver {
         // entry block allocated by `DialectFunction::new`; any block params on
         // the entry block are allocated and appended onto the destination
         // entry block directly so the one-to-one ordering is preserved.
-        debug_assert!(
-            !src.blocks.is_empty(),
-            "source function must have at least one block"
-        );
         for (i, src_block) in src.blocks.iter().enumerate() {
             let dst_block_id = if i == 0 {
                 // Entry block: reuse the one created by `DialectFunction::new`.
@@ -202,7 +227,7 @@ impl ConversionDriver {
                 // matches the rest of the code path.
                 let entry = dst.entry_block().expect("fresh function has entry block");
                 for (src_v, ty) in &src_block.params {
-                    let v = dst.alloc_value();
+                    let v = dst.alloc_value()?;
                     dst.blocks[entry.0 as usize].params.push((v, ty.clone()));
                     value_map.insert(*src_v, v);
                 }
@@ -210,7 +235,7 @@ impl ConversionDriver {
             } else {
                 let param_tys: Vec<Type> =
                     src_block.params.iter().map(|(_, t)| t.clone()).collect();
-                let (new_block, new_param_vs) = dst.new_block_with_params(param_tys);
+                let (new_block, new_param_vs) = dst.new_block_with_params(param_tys)?;
                 for ((src_v, _), dst_v) in src_block.params.iter().zip(new_param_vs.iter()) {
                     value_map.insert(*src_v, *dst_v);
                 }
@@ -236,7 +261,7 @@ impl ConversionDriver {
                 if let Some(pattern) = self.patterns.get(&src_op.op) {
                     // Translate operands AND block-ref attrs upfront so the
                     // pattern always sees destination-space identifiers.
-                    let translated_op = self.translate_op(src_op, &value_map, &block_map);
+                    let translated_op = self.translate_op(src_op, &value_map, &block_map)?;
                     let mut rewriter = Rewriter {
                         function: &mut dst,
                         block: dst_block,
@@ -247,20 +272,16 @@ impl ConversionDriver {
                 } else {
                     // Copy-through: translate operands, reallocate result
                     // ValueIds, remap BlockId attrs, and append verbatim.
-                    let operands: Vec<ValueId> = src_op
-                        .operands
-                        .iter()
-                        .map(|v| value_map.get(v).copied().unwrap_or(*v))
-                        .collect();
+                    let operands = translate_operands(src_op, &value_map)?;
                     let results: Vec<(ValueId, Type)> = src_op
                         .results
                         .iter()
                         .map(|(v, t)| {
-                            let fresh = dst.alloc_value();
+                            let fresh = dst.alloc_value()?;
                             value_map.insert(*v, fresh);
-                            (fresh, t.clone())
+                            Ok((fresh, t.clone()))
                         })
-                        .collect();
+                        .collect::<Result<_, DialectBuildError>>()?;
                     let mut attrs = src_op.attrs.clone();
                     // Remap every block reference through the block map.
                     // Unknown blocks (should not happen) are left as-is.
@@ -274,11 +295,13 @@ impl ConversionDriver {
                         operands,
                         attrs,
                         src_op.source,
-                    );
+                    )?;
                 }
             }
         }
 
+        dst.validate_structure()
+            .map_err(ConversionError::RewriteFailed)?;
         Ok(dst)
     }
 
@@ -291,23 +314,39 @@ impl ConversionDriver {
         src_op: &DialectOp,
         value_map: &BTreeMap<ValueId, ValueId>,
         block_map: &BTreeMap<BlockId, BlockId>,
-    ) -> DialectOp {
-        let operands: Vec<ValueId> = src_op
-            .operands
-            .iter()
-            .map(|v| value_map.get(v).copied().unwrap_or(*v))
-            .collect();
+    ) -> Result<DialectOp, ConversionError> {
+        let operands = translate_operands(src_op, value_map)?;
         let mut attrs = src_op.attrs.clone();
         for (_k, attr) in attrs.iter_mut() {
             attr.remap_block_refs(&mut |b| block_map.get(&b).copied().unwrap_or(b));
         }
-        DialectOp {
+        Ok(DialectOp {
             id: src_op.id,
             op: src_op.op,
             results: src_op.results.clone(),
             operands,
             attrs,
             source: src_op.source,
-        }
+        })
     }
+}
+
+/// Source and destination IDs are separate namespaces, even when their numeric
+/// values happen to coincide. Both copy-through and rewrite paths use this gate.
+fn translate_operands(
+    op: &DialectOp,
+    values: &BTreeMap<ValueId, ValueId>,
+) -> Result<Vec<ValueId>, ConversionError> {
+    op.operands
+        .iter()
+        .map(|value| {
+            values
+                .get(value)
+                .copied()
+                .ok_or(ConversionError::UnmappedValue {
+                    value: *value,
+                    operation: op.id,
+                })
+        })
+        .collect()
 }

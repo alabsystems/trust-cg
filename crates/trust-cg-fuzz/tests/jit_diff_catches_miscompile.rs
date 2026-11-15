@@ -21,7 +21,7 @@ fn fixture_module() -> trust_ir::Module {
         allow_div: false,
         allow_shift: false,
     };
-    gen_module(42, &cfg)
+    gen_module(42, &cfg).expect("the generated module builds")
 }
 
 #[test]

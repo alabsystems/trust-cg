@@ -1,0 +1,213 @@
+{
+  "name": "abi_param_facts",
+  "functions": [
+    {
+      "id": 0,
+      "name": "c_abi_decl",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [
+          {
+            "dereferenceable": null,
+            "nonnull": false,
+            "align": null,
+            "noalias": false,
+            "readonly": false,
+            "byval": false,
+            "sret": false,
+            "ext": "None",
+            "pass": "Pair"
+          },
+          {
+            "dereferenceable": null,
+            "nonnull": false,
+            "align": null,
+            "noalias": false,
+            "readonly": false,
+            "byval": false,
+            "sret": false,
+            "ext": "None",
+            "pass": "Ignore"
+          },
+          {
+            "dereferenceable": null,
+            "nonnull": false,
+            "align": null,
+            "noalias": false,
+            "readonly": false,
+            "byval": true,
+            "sret": false,
+            "ext": "None",
+            "pass": {
+              "Indirect": {
+                "on_stack": true
+              }
+            }
+          }
+        ],
+        "naked": false,
+        "target_features": [],
+        "ret": {
+          "dereferenceable": null,
+          "nonnull": false,
+          "align": null,
+          "noalias": false,
+          "readonly": false,
+          "byval": false,
+          "sret": false,
+          "ext": "ZeroExt"
+        }
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "coerced",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [
+          {
+            "dereferenceable": null,
+            "nonnull": false,
+            "align": null,
+            "noalias": false,
+            "readonly": false,
+            "byval": false,
+            "sret": false,
+            "ext": "None",
+            "pass": {
+              "Cast": {
+                "pieces": [
+                  "U64",
+                  "U64"
+                ]
+              }
+            }
+          },
+          {
+            "dereferenceable": null,
+            "nonnull": false,
+            "align": null,
+            "noalias": false,
+            "readonly": false,
+            "byval": false,
+            "sret": false,
+            "ext": "SignExt",
+            "pass": "Direct"
+          }
+        ],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "Tuple": [
+            "U64",
+            "U64"
+          ]
+        },
+        "Unit",
+        "Ptr"
+      ],
+      "returns": [
+        "U8"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        {
+          "Tuple": [
+            "U64",
+            "U64"
+          ]
+        },
+        "I16"
+      ],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    {
+      "Tuple": [
+        "U64",
+        "U64"
+      ]
+    }
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "sysv64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [
+    {
+      "tuple_type": 0,
+      "size": 16,
+      "align": 8,
+      "field_offsets": [
+        0,
+        8
+      ]
+    }
+  ],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

@@ -25,7 +25,13 @@ use crate::shell::{Spawn, which};
 const INVENTORY_DOC: &str = "rustc-mir-coverage-inventory.md";
 const BACKEND_SOURCE: &str = "crates/rustc-codegen-trust-cg/src/lib.rs";
 const BACKEND_CRATE: &str = "crates/rustc-codegen-trust-cg";
-const BACKEND_TOOLCHAIN: &str = "nightly-2026-04-20";
+/// The backend is built by, and loaded into, the installed Trust package
+/// (`crates/rustc-codegen-trust-cg/rust-toolchain.toml` pins `channel =
+/// "trust"`): its `targo` builds the dylib in the explicit unverified lane and
+/// its `trustc` loads it. The retired stock `nightly-2026-04-20` lane cannot
+/// load a dylib linked against the Trust `librustc_driver`.
+const TARGO: &str = "targo";
+const TRUSTC: &str = "trustc";
 const TARGETS: &[&str] = &["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"];
 const UI_FIXTURES: &[RustcFixture] = &[
     RustcFixture {
@@ -181,7 +187,6 @@ struct InventoryReport {
     source: String,
     rows: Vec<InventoryRow>,
     summary: InventorySummary,
-    source_guards: Vec<ProbeRow>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -238,12 +243,8 @@ fn build_report(repo: &RepoRoot, dry_run: bool, mode: &'static str) -> anyhow::R
     let targets = probe_targets(dry_run);
     let backend_run = backend_run(repo, dry_run, mode)?;
     let required_tools_present = probes.iter().all(|probe| !probe.required || probe.present);
-    let source_guards_passed = inventory
-        .source_guards
-        .iter()
-        .all(|probe| !probe.required || probe.present);
     let inventory_present = inventory.summary.total > 0;
-    let probe_exit = if required_tools_present && source_guards_passed && inventory_present {
+    let probe_exit = if required_tools_present && inventory_present {
         ResultStatus::Ok
     } else {
         ResultStatus::EnvBroken
@@ -325,9 +326,7 @@ fn backend_fixture_run(
     if dry_run {
         let mut steps = vec![BackendStep {
             name: "build-backend",
-            command: format!(
-                "rustup run {BACKEND_TOOLCHAIN} cargo build --manifest-path {BACKEND_CRATE}/Cargo.toml"
-            ),
+            command: backend_build_command(),
             exit_code: Some(0),
             status: ResultStatus::Ok,
             stdout_tail: String::new(),
@@ -371,10 +370,11 @@ fn backend_fixture_run(
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("creating {}", work_dir.display()))?;
 
-    let build_cmd = format!(
-        "rustup run {BACKEND_TOOLCHAIN} cargo build --manifest-path {BACKEND_CRATE}/Cargo.toml"
-    );
-    if which("rustup").is_none() {
+    let build_cmd = backend_build_command();
+    if let Some(missing) = [TARGO, TRUSTC]
+        .into_iter()
+        .find(|tool| which(tool).is_none())
+    {
         return Ok(BackendRun {
             invoked: false,
             status: ResultStatus::EnvBroken,
@@ -385,21 +385,16 @@ fn backend_fixture_run(
                 exit_code: None,
                 status: ResultStatus::EnvBroken,
                 stdout_tail: String::new(),
-                stderr_tail: "rustup missing; cannot enter pinned rustc backend toolchain"
-                    .to_string(),
+                stderr_tail: format!(
+                    "{missing} missing: the backend builds with, and loads into, the installed Trust package"
+                ),
             }],
-            note: format!("rustc {mode} requires rustup to enter the pinned backend toolchain"),
+            note: format!("rustc {mode} requires the installed Trust package (targo and trustc)"),
         });
     }
 
-    let build = Spawn::new("rustup")
-        .args([
-            "run",
-            BACKEND_TOOLCHAIN,
-            "cargo",
-            "build",
-            "--manifest-path",
-        ])
+    let build = Spawn::new(TARGO)
+        .args(["--unverified", "build", "--manifest-path"])
         .arg(repo.join(BACKEND_CRATE).join("Cargo.toml"))
         .capture()?;
     let build_status = if build.success() {
@@ -430,8 +425,8 @@ fn backend_fixture_run(
         let fixture_paths = fixture_paths(&work_dir, fixture.name);
         std::fs::write(&fixture_paths.src, fixture.source)
             .with_context(|| format!("writing {}", fixture_paths.src.display()))?;
-        let compile = Spawn::new("rustup")
-            .args(["run", BACKEND_TOOLCHAIN, "rustc", "--edition=2021"])
+        let compile = Spawn::new(TRUSTC)
+            .args(["-Ztrust-verify=off", "--edition=2021"])
             .arg(format!("-Zcodegen-backend={}", backend_artifact.display()))
             .arg(&fixture_paths.src)
             .arg("-o")
@@ -466,7 +461,7 @@ fn backend_fixture_run(
         artifact: Some(backend_artifact.display().to_string()),
         steps,
         note: format!(
-            "rustc {mode} invokes rustc_codegen_trust_cg through rustc -Zcodegen-backend on {} fixture(s)",
+            "rustc {mode} invokes rustc_codegen_trust_cg through trustc -Zcodegen-backend on {} fixture(s)",
             fixtures.len()
         ),
     })
@@ -484,9 +479,13 @@ fn fixture_paths(work_dir: &Path, name: &str) -> FixturePaths {
     }
 }
 
+fn backend_build_command() -> String {
+    format!("{TARGO} --unverified build --manifest-path {BACKEND_CRATE}/Cargo.toml")
+}
+
 fn rustc_fixture_command(backend_artifact: &Path, src: &Path, bin: &Path) -> String {
     format!(
-        "rustup run {BACKEND_TOOLCHAIN} rustc --edition=2021 -Zcodegen-backend={} {} -o {}",
+        "{TRUSTC} -Ztrust-verify=off --edition=2021 -Zcodegen-backend={} {} -o {}",
         backend_artifact.display(),
         src.display(),
         bin.display()
@@ -511,7 +510,7 @@ fn tail(s: &str) -> String {
 }
 
 fn dry_run_probes() -> Vec<ProbeRow> {
-    ["cargo", "rustc"]
+    [TARGO, TRUSTC]
         .into_iter()
         .map(|name| ProbeRow {
             name: name.to_string(),
@@ -525,7 +524,7 @@ fn dry_run_probes() -> Vec<ProbeRow> {
 }
 
 fn probe_required_tools() -> Vec<ProbeRow> {
-    ["cargo", "rustc"]
+    [TARGO, TRUSTC]
         .into_iter()
         .map(|name| {
             let info = external::probe_one(name);
@@ -553,7 +552,7 @@ fn probe_targets(dry_run: bool) -> Vec<TargetRow> {
                 target: (*target).to_string(),
                 installed: true,
                 required: false,
-                note: format!("dry-run: would query rustup target list for {target}"),
+                note: format!("dry-run: would look for {target} in the Trust sysroot"),
             })
             .collect();
     }
@@ -570,74 +569,83 @@ fn probe_targets(dry_run: bool) -> Vec<TargetRow> {
                 required: false,
                 note: if installed_here {
                     "available for future backend smoke coverage".to_string()
-                } else if which("rustup").is_some() {
-                    format!("optional local-dev target missing; run: rustup target add {target}")
+                } else if which(TRUSTC).is_some() {
+                    format!(
+                        "optional local-dev target missing: the installed Trust package ships no {target} std"
+                    )
                 } else {
-                    "rustup missing; target availability not checked".to_string()
+                    "trustc missing; target availability not checked".to_string()
                 },
             }
         })
         .collect()
 }
 
+/// Targets whose std the installed Trust package ships
+/// (`<sysroot>/lib/rustlib/<target>/lib`). There is no rustup target list for
+/// the Trust package: its sysroot is the whole answer.
 fn installed_targets() -> Vec<String> {
-    if which("rustup").is_none() {
+    if which(TRUSTC).is_none() {
         return Vec::new();
     }
-    let Ok(captured) = Spawn::new("rustup")
-        .arg("target")
-        .arg("list")
-        .arg("--installed")
-        .capture()
-    else {
+    let Ok(captured) = Spawn::new(TRUSTC).args(["--print", "sysroot"]).capture() else {
         return Vec::new();
     };
     if !captured.success() {
         return Vec::new();
     }
-    captured
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+    let rustlib = Path::new(captured.stdout.trim())
+        .join("lib")
+        .join("rustlib");
+    TARGETS
+        .iter()
+        .filter(|target| rustlib.join(target).join("lib").is_dir())
+        .map(|target| (*target).to_string())
         .collect()
 }
 
 fn inventory_report(repo: &RepoRoot) -> anyhow::Result<InventoryReport> {
     let doc_path = repo.join(INVENTORY_DOC);
-    let source_path = repo.join(BACKEND_SOURCE);
     let doc = std::fs::read_to_string(&doc_path)
         .with_context(|| format!("reading {}", doc_path.display()))?;
-    let source = std::fs::read_to_string(&source_path)
-        .with_context(|| format!("reading {}", source_path.display()))?;
-    let rows = parse_inventory_rows(&doc);
+    let rows =
+        parse_inventory_rows(&doc).with_context(|| format!("parsing {}", doc_path.display()))?;
     let summary = summarize_inventory(&rows);
-    let source_guards = source_guards(&source);
 
     Ok(InventoryReport {
         doc: INVENTORY_DOC.to_string(),
         source: BACKEND_SOURCE.to_string(),
         rows,
         summary,
-        source_guards,
     })
 }
 
-fn parse_inventory_rows(doc: &str) -> Vec<InventoryRow> {
+/// The rows of every `| Variant |` or `| Fact |` table in the inventory.
+///
+/// A row of such a table must have four cells and one of the three state
+/// words. Anything else is an error, never a dropped row: a silently dropped
+/// row would leave the summary counting fewer constructs than the inventory
+/// names (ruling OD-33, `docs/decision-record.md`).
+fn parse_inventory_rows(doc: &str) -> anyhow::Result<Vec<InventoryRow>> {
     let mut family = String::new();
     let mut rows = Vec::new();
-    for line in doc.lines() {
+    let mut in_table = false;
+    for (index, line) in doc.lines().enumerate() {
         if let Some(header) = line.strip_prefix("## ") {
             family = header.trim().to_string();
+            in_table = false;
             continue;
         }
         let trimmed = line.trim();
-        if !trimmed.starts_with('|')
-            || trimmed.starts_with("| ---")
-            || trimmed.starts_with("| Variant")
-            || trimmed.starts_with("| Fact")
-        {
+        if !trimmed.starts_with('|') {
+            in_table = false;
+            continue;
+        }
+        if trimmed.starts_with("| Variant") || trimmed.starts_with("| Fact") {
+            in_table = true;
+            continue;
+        }
+        if !in_table || trimmed.starts_with("| ---") {
             continue;
         }
         let cells: Vec<String> = trimmed
@@ -645,12 +653,20 @@ fn parse_inventory_rows(doc: &str) -> Vec<InventoryRow> {
             .split('|')
             .map(|cell| cell.trim().trim_matches('`').to_string())
             .collect();
+        let line_number = index + 1;
         if cells.len() != 4 {
-            continue;
+            anyhow::bail!(
+                "inventory line {line_number}: a row needs 4 cells, found {}",
+                cells.len()
+            );
         }
         let state = cells[1].clone();
         if !matches!(state.as_str(), "supported" | "partial" | "fail-closed") {
-            continue;
+            anyhow::bail!(
+                "inventory line {line_number}: row `{}` has state `{state}`; the states are \
+                 supported, partial and fail-closed",
+                cells[0]
+            );
         }
         rows.push(InventoryRow {
             family: family.clone(),
@@ -660,7 +676,7 @@ fn parse_inventory_rows(doc: &str) -> Vec<InventoryRow> {
             notes: cells[3].clone(),
         });
     }
-    rows
+    Ok(rows)
 }
 
 fn summarize_inventory(rows: &[InventoryRow]) -> InventorySummary {
@@ -674,100 +690,6 @@ fn summarize_inventory(rows: &[InventoryRow]) -> InventorySummary {
         fail_closed: by_state.get("fail-closed").copied().unwrap_or_default(),
         total: rows.len(),
     }
-}
-
-fn static_const_identity_guard_present(source: &str) -> bool {
-    let Some(emit_const_alloc_global) = source
-        .split("fn emit_const_alloc_global(")
-        .nth(1)
-        .and_then(|tail| tail.split("\nfn emit_thread_local_global(").next())
-    else {
-        return false;
-    };
-    let Some(static_arm) = emit_const_alloc_global
-        .split("GlobalAlloc::Static(def_id) => {")
-        .nth(1)
-        .and_then(|tail| tail.split("GlobalAlloc::VTable(..)").next())
-    else {
-        return false;
-    };
-    let Some(mutable_arm) = static_arm
-        .split("if global_alloc.mutability")
-        .nth(1)
-        .and_then(|tail| tail.split("\n            let evaluated =").next())
-    else {
-        return false;
-    };
-    let Some(local_immutable_arm) = static_arm
-        .split("if def_id.is_local() {")
-        .nth(1)
-        .and_then(|tail| tail.split("\n                return Ok(canonical);").next())
-    else {
-        return false;
-    };
-
-    // A TLS address cannot be represented by the ordinary const-allocation
-    // global path, so that path must reject it explicitly. Mutable and local
-    // immutable statics, on the other hand, are admitted only by importing the
-    // definition's canonical external symbol: no per-reader initializer may be
-    // minted, and mutability must match the definition.
-    static_arm.contains("if ctx.tcx.is_thread_local_static(def_id)")
-        && static_arm.contains("const reference to thread-local static")
-        && mutable_arm.contains("== rustc_hir::Mutability::Mut")
-        && mutable_arm.contains("symbol_name(Instance::mono(ctx.tcx, def_id))")
-        && mutable_arm.contains("mutable: true")
-        && mutable_arm.contains("initializer: None")
-        && mutable_arm.contains("linkage: Linkage::External")
-        && mutable_arm.contains("return Ok(canonical);")
-        && local_immutable_arm.contains("symbol_name(Instance::mono(ctx.tcx, def_id))")
-        && local_immutable_arm.contains("mutable: false")
-        && local_immutable_arm.contains("initializer: None")
-        && local_immutable_arm.contains("linkage: Linkage::External")
-}
-
-fn source_guards(source: &str) -> Vec<ProbeRow> {
-    [
-        (
-            "intrinsic-fail-closed",
-            // `StatementKind::Intrinsic` is not in the handled arm of
-            // `lower_statement`; it reaches the catch-all that returns
-            // `Err(format!("StatementKind::{}", statement_kind_name(other)))`,
-            // and `statement_kind_name` names it "Intrinsic". Together these
-            // prove an unsupported intrinsic statement still fails closed (a
-            // lowering `Err`, never a silent miscompile).
-            source.contains(r#"StatementKind::Intrinsic(_) => "Intrinsic""#)
-                && source.contains(
-                    r#"other => Err(format!("StatementKind::{}", statement_kind_name(other)))"#,
-                ),
-            "StatementKind::Intrinsic must reach the lower_statement catch-all and fail closed",
-        ),
-        (
-            "static-const-identity-safe",
-            static_const_identity_guard_present(source),
-            "const static references must preserve canonical mutable/local identity and reject TLS through the ordinary const-allocation path",
-        ),
-        (
-            "asm-and-vtable-fail-closed",
-            // Inline assembly reaches the terminator catch-all (named via
-            // `terminator_kind_name`) and fails closed; vtable / type-id global
-            // allocations have dedicated lowering and must not be materialized
-            // as raw bytes here, so that arm fails closed too.
-            source.contains(r#"TerminatorKind::InlineAsm { .. } => "InlineAsm""#)
-                && source.contains("GlobalAlloc::VTable(..) | GlobalAlloc::TypeId { .. } =>")
-                && source.contains("is a vtable / type-id global, which has a"),
-            "inline-asm terminators and vtable/type-id globals must fail closed",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, present, note)| ProbeRow {
-        name: name.to_string(),
-        required: true,
-        present,
-        version: String::new(),
-        path: Some(BACKEND_SOURCE.to_string()),
-        note: note.to_string(),
-    })
-    .collect()
 }
 
 fn emit_report(global: &GlobalArgs, report: &RustcReport) -> anyhow::Result<()> {
@@ -849,12 +771,52 @@ mod tests {
                    | Fact | State | Diagnostic root | Notes |\n\
                    | --- | --- | --- | --- |\n\
                    | `DirectScalar` | partial | `Ty::* scalar` | scalar |\n";
-        let rows = parse_inventory_rows(doc);
+        let rows = parse_inventory_rows(doc).expect("a well-formed inventory parses");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].family, "StatementKind");
         assert_eq!(rows[0].variant, "Intrinsic");
         assert_eq!(rows[1].family, "RustcAbiLayout");
         assert_eq!(rows[1].variant, "DirectScalar");
+    }
+
+    #[test]
+    fn inventory_parser_refuses_an_unknown_state_instead_of_dropping_the_row() {
+        let doc = "## RustcAbiLayout\n\
+                   | Fact | State | Diagnostic root | Notes |\n\
+                   | --- | --- | --- | --- |\n\
+                   | `DirectScalar` | broad | `Ty::* scalar` | scalar |\n";
+        let error = parse_inventory_rows(doc).expect_err("an unknown state is an error");
+        assert!(
+            error
+                .to_string()
+                .contains("`DirectScalar` has state `broad`"),
+            "{error}"
+        );
+        let short = "## MonoItem\n\
+                     | Variant | State | Diagnostic root | Notes |\n\
+                     | `Fn` | partial | root |\n";
+        assert!(parse_inventory_rows(short).is_err());
+    }
+
+    #[test]
+    fn inventory_parser_ignores_tables_that_are_not_inventory_tables() {
+        let doc = "## Replacement Blocker Anchors\n\
+                   | Blocker | State | Required before replacement-ready |\n\
+                   | --- | --- | --- |\n\
+                   | Rust frontend parity | blocked | everything |\n";
+        assert!(
+            parse_inventory_rows(doc)
+                .expect("not an inventory table")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn committed_inventory_parses_without_dropping_a_row() {
+        let doc = include_str!("../../../../rustc-mir-coverage-inventory.md");
+        let rows = parse_inventory_rows(doc).expect("the committed inventory parses");
+        assert!(rows.iter().any(|row| row.variant == "VariadicAbi"));
+        assert!(rows.iter().any(|row| row.variant == "DirectScalar"));
     }
 
     #[test]

@@ -1,85 +1,35 @@
-// a64_ay_regalloc_differential.rs — AY-PBO optimal register allocator, 2nd-platform
-// EXECUTION-differential on AArch64 via the on-host a64 interpreter [task #11].
+// AArch64 emitted-code differential for AY-PBO register allocation.
 //
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 //
-// # What this is (and why the aarch64 EXECUTION evidence matters)
+// Compile pressured trust-ir functions with AY disabled and enabled, decode
+// each emitted AArch64 __text stream, and execute it with common/a64_interp.rs.
+// Compare both streams with the trust-ir interpreter at O0/O2/O3. Required
+// function/optimization cells must have distinct caller bytes with FORCE_KEEP;
+// this detects silent baseline fallback without attributing differences from an
+// unrelated helper function to the pressured caller. Corrupting an emitted
+// instruction is a negative control for the differential.
 //
-// trust-cg's AY-PBO (Pseudo-Boolean-Optimization) register allocator is a
-// WHOLE-VREG optimal allocator: it competes against the production LinearScan
-// baseline and is KEPT under a lexicographic (spills, copies) keep-better
-// criterion, gated by the always-on translation validator. The capability is
-// proven end-to-end on x86 by an EXECUTION differential; the code is
-// target-agnostic but native aarch64 execution is hardware-blocked on this x86
-// box.
+// The production keep policy compares recomputed loop-depth-weighted traffic,
+// then real move copies, not raw spill counts. FORCE_KEEP bypasses quality
+// selection, not legality checks or translation validation. AY can still
+// decline, so enabling it alone does not establish engagement. Per-function
+// distinctness checks supply that evidence for the required cells.
 //
-// This harness closes the aarch64 half of the both-platforms EXECUTION-evidence
-// story WITHOUT ARM silicon: it compiles high-register-pressure trust-ir
-// functions TWICE (greedy/LinearScan baseline vs the AY-PBO allocator), DECODES
-// the emitted aarch64 `__text` with the repo's real leaf disassembler, and
-// EXECUTES both streams under the faithful ARM-ARM-semantics interpreter
-// (`common/a64_interp.rs`), asserting:
+// A separate representative-case control checks natural selection keeps the
+// baseline caller bytes while FORCE_KEEP emits a distinct validated candidate.
+// That observation is not a general claim that AY cannot improve allocation,
+// nor that either allocator produces optimal code on every input.
 //
-//   * AY-on == AY-off(greedy) == the trust-ir oracle, BIT-IDENTICALLY, at
-//     O0/O2/O3 over several argument vectors (the correctness differential);
-//   * the AY stream for the PRESSURED function is DISTINCT from greedy and was
-//     KEPT (kept == AY, ENGAGED — NOT a silent greedy fallback): compiled with
-//     FORCE_KEEP, a difference in the caller's OWN `__text` byte span from greedy
-//     can ONLY arise when `allocate()` returned AY's VALIDATED allocation for that
-//     function (a decline/reject restores greedy and the span MATCHES). Comparing
-//     the caller SPAN (not the whole object) rules out distinctness being carried
-//     by an unrelated function such as the trivial inlined helper. The reliably-
-//     engaging class is the MUL-fed carriers (add/select tie the whole-vreg
-//     assignment to greedy at O2/O3; the i128 caller declines at O2/O3 as its
-//     doubled vreg count exceeds the anytime solve cap — engagement is asserted
-//     only where deterministic; correctness is asserted everywhere);
-//   * TEETH: corrupting one instruction word of the AY-on object makes the
-//     differential FAIL (fail-closed teeth on the AY path).
-//
-// # HONEST FINDING: AY does NOT strictly beat LinearScan on these shapes
-//
-// The corpus is the SPILL-ACROSS-CALL family (carriers live across a helper call
-// that clobbers the caller-saved registers). This is the shape where the
-// WHOLE-VREG AY-PBO RELIABLY ENGAGES with a DISTINCT validated stream: greedy /
-// LinearScan can SPLIT a carrier's live range (save/reload only around the call),
-// whereas the whole-vreg PBO must keep-or-spill each carrier for its WHOLE range,
-// so the two allocators structurally diverge. But that same structural fact means
-// AY here has MORE-or-EQUAL spills than greedy, so the lexicographic keep-better
-// criterion CORRECTLY keeps greedy under natural selection — FORCE_KEEP is what
-// materializes AY's distinct stream for the differential (see
-// `natural_keep_better_does_not_keep_worse_whole_vreg_ay`). Empirically, through
-// the full aarch64 backend, whole-vreg AY-PBO does NOT strictly reduce spills vs
-// LinearScan: single-block functions form INTERVAL graphs (linear scan is already
-// optimal -> a tie), and larger instances TIME OUT the anytime PBO solver (a
-// worse feasible incumbent). The strict AY spill-win is demonstrated only at the
-// allocator-unit level (small K, no ABI/splitting overhead) by
-// `trust-cg-regalloc`'s `ay_min_policy_never_worse_than_greedy_randomized`. The
-// VALUE HERE is the EXECUTION evidence: AY's DISTINCT, VALIDATED aarch64 machine
-// code executes correctly on-host across O0/O2/O3 — the same KIND of evidence x86
-// has — exercising the 0cebdda-fixed validator's aarch64 path.
-//
-// # Why the EXECUTION differential is NOT ceremony (the validator blind spot)
-//
-// LRSPLIT-2 found + VALIDATOR-1 (0cebdda) FIXED an AY-PBO validator blind spot:
-// the always-on validator PASSED a wrong whole-vreg AY allocation until 0cebdda
-// added `check_physreg_interference` + incoming-arg reservations. That proved the
-// validator is NOT a complete gate on its own -> the EXECUTION differential is the
-// true backstop that catches what per-instruction certs + the validator can miss.
-// This harness runs AY's emitted aarch64 machine code, exercising the FIXED
-// validator's aarch64 path.
-//
-// # Honest ceiling (what this does NOT prove)
-//
-// This is ON-HOST execution of the emitted BYTES under an architectural
-// interpreter, NOT execution on real ARM silicon (that needs qemu/native). The
-// interpreter models architectural ISA semantics, not a concrete CPU; it shares
-// the leaf decoder with the emitter (a common-mode decode bug would not be
-// caught). The spill delta is a STATIC proxy, not a wall-clock speedup. Per
-// DECODE-OR-REJECT, any spill/frame instruction the AY stream emits that the
-// interpreter does not model fails CLOSED (`A64Error::Unsupported`), never a
-// silent pass.
+// Scope: this harness executes emitted bytes under an architectural interpreter,
+// not a native CPU or QEMU. It can run on non-AArch64 hosts and does not establish
+// native timing, a speedup, or complete ISA/compiler correctness. The interpreter
+// shares the leaf decoder with the emitter, leaving a common-mode decode risk.
+// Unsupported instructions fail closed. Translation validation has had defects
+// historically; this differential is an additional independent check, not a
+// proof that either checker is complete.
 
 #![cfg(feature = "ay-regalloc")]
 
@@ -125,12 +75,12 @@ fn compile_raw(m: &M, opt: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     c.compile(m).expect("aarch64 compile").object_code
 }
 
-/// Compile with the AY-PBO allocator DISABLED (the production LinearScan
-/// baseline) — byte-identical to origin codegen.
+/// Compile with AY disabled to obtain the current production baseline.
 fn compile_greedy(m: &M, opt: OptLevel) -> Vec<u8> {
     env_lock::with_env_edits(|env| {
         env.remove("TCG_AY_REGALLOC");
@@ -140,23 +90,17 @@ fn compile_greedy(m: &M, opt: OptLevel) -> Vec<u8> {
     })
 }
 
-// Tractability bounds for the AY-PBO anytime solve. The DEFAULTS
-// (max_vregs=64, max_pairs=4000, ms=200) keep the shipped allocator tractable on
-// a small box; this harness RAISES them so the PBO can MODEL a deliberately
-// high-pressure function (>26 simultaneously-live vregs on the 26-GPR aarch64
-// set). The allocator ITSELF is unchanged — only its per-instance size/time
-// budget is lifted so it engages on the stress corpus; the greedy/LinearScan
-// baseline never consults these bounds, so the comparison stays fair.
+// Explicit per-instance search bounds for this stress corpus. These are test
+// settings, not documented production defaults or a performance comparison.
 fn set_ay_caps(env: &mut env_lock::EnvEditor<'_>) {
     env.set("TCG_AY_REGALLOC_MAX_VREGS", "400");
     env.set("TCG_AY_REGALLOC_MAX_PAIRS", "200000");
     env.set("TCG_AY_REGALLOC_MS", "1500");
 }
 
-/// Compile with the AY-PBO allocator ENABLED and FORCE_KEEP ON: AY's validated
-/// allocation is materialized whenever it validates (backstop), so the emitted
-/// stream is guaranteed to be AY's for the execution differential. STATS on so
-/// the `[ay-regalloc] keep: ...` line prints under `--nocapture`.
+/// Keep a validated AY candidate even without a quality win. AY can still
+/// decline; required caller-byte differences are checked separately. Statistics
+/// are visible with `--show-output` (or `--nocapture`).
 fn compile_ay_forcekeep(m: &M, opt: OptLevel) -> Vec<u8> {
     env_lock::with_env_edits(|env| {
         env.set("TCG_AY_REGALLOC", "1");
@@ -168,9 +112,8 @@ fn compile_ay_forcekeep(m: &M, opt: OptLevel) -> Vec<u8> {
 }
 
 /// Compile with AY ENABLED but FORCE_KEEP OFF: AY's stream is materialized ONLY
-/// when it strictly WINS the lexicographic keep-better criterion. A `__text`
-/// byte difference from greedy under this profile therefore PROVES AY beat greedy
-/// (kept == AY, engaged, not a silent fallback).
+/// when it wins the (recomputed traffic, real move copies) comparison. A distinct
+/// caller stream establishes selection, not a measured runtime improvement.
 fn compile_ay_natural(m: &M, opt: OptLevel) -> Vec<u8> {
     env_lock::with_env_edits(|env| {
         env.set("TCG_AY_REGALLOC", "1");
@@ -252,11 +195,14 @@ fn run_pair(obj: &[u8], sym: &str, regs: &[u64]) -> Result<(u64, u64), A64Error>
 
 /// Emit the standard `helper(x) = x*3 + 1` leaf (FuncId 0) into `m`.
 fn push_helper(m: &mut M, helper: &str) {
-    let ft1 = m.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft1 = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut h = F::new(FuncId::new(0), helper, ft1, BlockId::new(0));
     h.blocks = vec![B {
         id: BlockId::new(0),
@@ -291,7 +237,8 @@ fn push_helper(m: &mut M, helper: &str) {
             }),
         ],
     }];
-    m.add_function(h);
+    m.try_add_function(h)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// The per-carrier pre-call computation shape.
@@ -316,11 +263,14 @@ fn build_spill_across_call(helper: &str, caller: &str, n: u32, pre: PreOp) -> M 
     let mut m = M::new("spillcall");
     push_helper(&mut m, helper);
 
-    let ft2 = m.add_func_type(FuncTy {
-        params: vec![Ty::I64; 8],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft2 = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 8],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut c = F::new(FuncId::new(1), caller, ft2, BlockId::new(0));
     let mut body = Vec::new();
     let mut id = 100u32;
@@ -408,7 +358,8 @@ fn build_spill_across_call(helper: &str, caller: &str, n: u32, pre: PreOp) -> M 
         params: (0..8u32).map(|i| (ValueId::new(i), Ty::I64)).collect(),
         body,
     }];
-    m.add_function(c);
+    m.try_add_function(c)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -420,11 +371,14 @@ fn build_i128_spill_across_call(helper: &str, caller: &str, n: u32) -> M {
     let mut m = M::new("i128spillcall");
     push_helper(&mut m, helper);
 
-    let ft2 = m.add_func_type(FuncTy {
-        params: vec![Ty::I128, Ty::I64],
-        returns: vec![Ty::I128],
-        is_vararg: false,
-    });
+    let ft2 = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I128, Ty::I64],
+            returns: vec![Ty::I128],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut c = F::new(FuncId::new(1), caller, ft2, BlockId::new(0));
     let x = ValueId::new(0); // i128 in x0:x1
     let y = ValueId::new(1); // i64 in x2
@@ -507,7 +461,8 @@ fn build_i128_spill_across_call(helper: &str, caller: &str, n: u32) -> M {
         params: vec![(x, Ty::I128), (y, Ty::I64)],
         body,
     }];
-    m.add_function(c);
+    m.try_add_function(c)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -720,15 +675,9 @@ fn ay_pbo_aarch64_execution_differential() {
     d.finish();
 }
 
-/// HONEST complement: the whole-vreg AY-PBO does NOT strictly beat the LinearScan
-/// baseline on these across-call shapes — greedy can SPLIT a carrier's live range
-/// (save/reload only around the call) whereas the whole-vreg PBO must keep or
-/// spill each carrier for its WHOLE range, so AY's validated allocation here has
-/// MORE (or equal) spills. The lexicographic run-both-keep-better criterion
-/// therefore correctly KEEPS GREEDY under natural (non-FORCE_KEEP) selection: AY
-/// is materialized ONLY because FORCE_KEEP requests it. This documents that
-/// FORCE_KEEP is load-bearing for this corpus (the execution differential still
-/// proves AY's distinct validated stream runs correctly — the point of the test).
+/// Representative-case control: natural selection retains baseline caller
+/// bytes, while forced selection exercises a distinct validated AY candidate.
+/// This checks the corpus's reliance on FORCE_KEEP, not a universal quality law.
 #[test]
 fn natural_keep_better_does_not_keep_worse_whole_vreg_ay() {
     let _guard = AY_DIFFERENTIAL_TEST_LOCK
@@ -737,7 +686,7 @@ fn natural_keep_better_does_not_keep_worse_whole_vreg_ay() {
 
     // On a representative mul-fed across-call shape, the natural (keep-better) AY
     // selection returns the GREEDY caller stream (whole-vreg AY not better),
-    // proving the keep-better gate never regresses quality — while FORCE_KEEP
+    // checking selection on this case — while FORCE_KEEP
     // still materializes AY's DISTINCT validated caller stream for the
     // differential. (Comparing the caller SPAN isolates the pressured function.)
     let m = build_spill_across_call("_h_nat", "_sc_nat", 16, PreOp::Mul);
@@ -837,4 +786,13 @@ fn teeth_ay_path_detects_a_corrupted_instruction() {
         "TEETH: corrupting an ADD->SUB in the AY-emitted stream must change the result; \
          the AY-path differential fails closed on a corrupted instruction"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -1415,15 +1415,20 @@ fn emit_single_pivot_sparse_substitute_trust_ir(
     b.seal_block();
 
     let mut module = Module::new("jit_sparse_substitute_regression");
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::I64, Ty::I64, Ty::Ptr, Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::I64, Ty::I64, Ty::Ptr, Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = Function::new(FuncId(0), SPARSE_SUBSTITUTE_SYMBOL, func_ty_id, entry_block);
     func.blocks = b.blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1447,12 +1452,12 @@ fn maybe_dump_sparse_substitute_pipeline(
     );
 
     let lir_functions =
-        trust_cg_lower::translate_module(module).expect("sparse substitute module should lower");
+        permit_translate_module(module).expect("sparse substitute module should lower");
     assert_eq!(lir_functions.len(), 1, "expected a single lowered function");
 
     let pipeline_config = trust_cg_codegen::PipelineConfig {
         opt_level,
-        ..trust_cg_codegen::PipelineConfig::default()
+        ..trust_cg_codegen::PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     let (ir_func, metrics) = pipeline
@@ -1468,7 +1473,7 @@ fn sparse_substitute_compiler(opt_level: OptLevel) -> Compiler {
         parallel: false,
         ..CompilerConfig::default()
     };
-    Compiler::new(config)
+    Compiler::new(config).with_codegen_license(permit_unlicensed())
 }
 
 fn jit_compile_sparse_substitute_with_pipeline_config(
@@ -1476,7 +1481,7 @@ fn jit_compile_sparse_substitute_with_pipeline_config(
 ) -> (trust_cg_codegen::ExecutableBuffer, SparseSubstituteFn) {
     let module = emit_single_pivot_sparse_substitute_trust_ir(3, 2, 1);
     let lir_functions =
-        trust_cg_lower::translate_module(&module).expect("sparse substitute module should lower");
+        permit_translate_module(&module).expect("sparse substitute module should lower");
     assert_eq!(lir_functions.len(), 1, "expected a single lowered function");
 
     let pipeline = Pipeline::new(pipeline_config.clone());
@@ -1519,12 +1524,12 @@ fn jit_compile_sparse_substitute() -> (JitCompilationResult, SparseSubstituteFn)
 
 fn code_shape_for_module(module: &Module, opt_level: OptLevel) -> SparseCodeShape {
     let lir_functions =
-        trust_cg_lower::translate_module(module).expect("sparse substitute module should lower");
+        permit_translate_module(module).expect("sparse substitute module should lower");
     assert_eq!(lir_functions.len(), 1, "expected a single lowered function");
 
     let pipeline_config = PipelineConfig {
         opt_level,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     let (ir_func, metrics) = pipeline
@@ -1625,13 +1630,12 @@ fn prepared_kernel_function_for_module(
     module: &Module,
     opt_level: OptLevel,
 ) -> (MachFunction, SparseCodeShape, Vec<u8>) {
-    let lir_functions =
-        trust_cg_lower::translate_module(module).expect("real ay LRA module should lower");
+    let lir_functions = permit_translate_module(module).expect("real ay LRA module should lower");
     assert_eq!(lir_functions.len(), 1, "expected a single lowered function");
 
     let pipeline_config = PipelineConfig {
         opt_level,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     let (ir_func, metrics) = pipeline
@@ -1813,14 +1817,19 @@ fn emit_pivot_row_trust_ir(coefficients: &[(u32, i64)]) -> Module {
     b.seal_block_with_params(vec![(target, Ty::Ptr), (scale, Ty::I64)]);
 
     let mut module = Module::new("simplex_pivot_row");
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I64],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I64],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = Function::new(FuncId(0), PIVOT_ROW_SYMBOL, func_ty_id, entry_block);
     func.blocks = b.blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1829,7 +1838,7 @@ fn seal_overflow_check_block(
     row_idx: ValueId,
     overflow: ValueId,
     overflow_exit: BlockId,
-) -> BlockId {
+) -> ValueId {
     let continue_block = BlockId(b.blocks.len() as u32 + 5);
     b.emit_void(Inst::CondBr {
         cond: overflow,
@@ -1840,20 +1849,23 @@ fn seal_overflow_check_block(
     });
     b.seal_block_with_params(vec![(row_idx, Ty::I64)]);
     b.start_block(continue_block);
-    continue_block
+    // A continuation parameter is a new SSA definition, even though its
+    // incoming row index is unchanged. Reusing row_idx here made every
+    // second overflow check redefine a value from the preceding block.
+    b.fresh_value()
 }
 
 fn emit_batch_coeff_update_with_overflow(
     b: &mut TrustIrBuilder,
     cur_target: ValueId,
     cur_scale: ValueId,
-    row_idx: ValueId,
+    mut row_idx: ValueId,
     var_idx: u32,
     coeff: i64,
     overflow_exit: BlockId,
-) {
+) -> ValueId {
     if coeff == 0 {
-        return;
+        return row_idx;
     }
 
     let idx = b.const_u64(var_idx as i64);
@@ -1863,27 +1875,28 @@ fn emit_batch_coeff_update_with_overflow(
     let updated = match coeff {
         1 => {
             let (sum, overflow) = b.overflow(OverflowOp::AddOverflow, Ty::I64, cur, cur_scale);
-            seal_overflow_check_block(b, row_idx, overflow, overflow_exit);
+            row_idx = seal_overflow_check_block(b, row_idx, overflow, overflow_exit);
             sum
         }
         -1 => {
             let (diff, overflow) = b.overflow(OverflowOp::SubOverflow, Ty::I64, cur, cur_scale);
-            seal_overflow_check_block(b, row_idx, overflow, overflow_exit);
+            row_idx = seal_overflow_check_block(b, row_idx, overflow, overflow_exit);
             diff
         }
         _ => {
             let coeff_val = b.const_i64(coeff);
             let (product, mul_overflow) =
                 b.overflow(OverflowOp::MulOverflow, Ty::I64, cur_scale, coeff_val);
-            seal_overflow_check_block(b, row_idx, mul_overflow, overflow_exit);
+            row_idx = seal_overflow_check_block(b, row_idx, mul_overflow, overflow_exit);
 
             let (sum, add_overflow) = b.overflow(OverflowOp::AddOverflow, Ty::I64, cur, product);
-            seal_overflow_check_block(b, row_idx, add_overflow, overflow_exit);
+            row_idx = seal_overflow_check_block(b, row_idx, add_overflow, overflow_exit);
             sum
         }
     };
 
     b.store(Ty::I64, addr, updated);
+    row_idx
 }
 
 fn emit_batch_pivot_trust_ir(coefficients: &[(u32, i64)]) -> Module {
@@ -1922,7 +1935,7 @@ fn emit_batch_pivot_trust_ir(coefficients: &[(u32, i64)]) -> Module {
     });
     b.seal_block_with_params(vec![(row_idx_header, Ty::I64)]);
 
-    let row_idx_body = b.fresh_value();
+    let mut row_idx_body = b.fresh_value();
     b.start_block(loop_body);
     let target_ptr_ptr = b.index(Ty::Ptr, targets, row_idx_body);
     let cur_target = b.load(Ty::Ptr, target_ptr_ptr);
@@ -1930,7 +1943,7 @@ fn emit_batch_pivot_trust_ir(coefficients: &[(u32, i64)]) -> Module {
     let cur_scale = b.load(Ty::I64, scale_ptr);
 
     for &(var_idx, coeff) in coefficients {
-        emit_batch_coeff_update_with_overflow(
+        row_idx_body = emit_batch_coeff_update_with_overflow(
             &mut b,
             cur_target,
             cur_scale,
@@ -1956,24 +1969,32 @@ fn emit_batch_pivot_trust_ir(coefficients: &[(u32, i64)]) -> Module {
     });
     b.seal_block();
 
-    let overflow_row = b.fresh_value();
-    b.start_block(overflow_exit);
-    let one_overflow = b.const_u64(1);
-    let result = b.binop(BinOp::Add, Ty::I64, overflow_row, one_overflow);
-    b.emit_void(Inst::Return {
-        values: vec![result],
-    });
-    b.seal_block_with_params(vec![(overflow_row, Ty::I64)]);
+    // Zero coefficients emit no checked arithmetic or overflow edge.
+    if coefficients.iter().any(|(_, coeff)| *coeff != 0) {
+        let overflow_row = b.fresh_value();
+        b.start_block(overflow_exit);
+        let one_overflow = b.const_u64(1);
+        let result = b.binop(BinOp::Add, Ty::I64, overflow_row, one_overflow);
+        b.emit_void(Inst::Return {
+            values: vec![result],
+        });
+        b.seal_block_with_params(vec![(overflow_row, Ty::I64)]);
+    }
 
     let mut module = Module::new("simplex_batch_pivot");
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = Function::new(FuncId(0), BATCH_PIVOT_SYMBOL, func_ty_id, entry_block);
     func.blocks = b.blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2077,7 +2098,7 @@ fn emit_batch_pivot_status_trust_ir(coefficients: &[(u32, i64)]) -> Module {
         (capacity_required_end, Ty::I64),
     ]);
 
-    let bounds_ok_row_idx = b.fresh_value();
+    let mut bounds_ok_row_idx = b.fresh_value();
     b.start_block(bounds_ok);
     let row_len_ptr = b.index(Ty::I64, row_output_lengths, bounds_ok_row_idx);
     b.store(Ty::I64, row_len_ptr, planned_row_len);
@@ -2088,7 +2109,7 @@ fn emit_batch_pivot_status_trust_ir(coefficients: &[(u32, i64)]) -> Module {
     let cur_scale = b.load(Ty::I64, scale_ptr);
 
     for &(var_idx, coeff) in coefficients {
-        emit_batch_coeff_update_with_overflow(
+        bounds_ok_row_idx = emit_batch_coeff_update_with_overflow(
             &mut b,
             cur_target,
             cur_scale,
@@ -2120,18 +2141,20 @@ fn emit_batch_pivot_status_trust_ir(coefficients: &[(u32, i64)]) -> Module {
     b.emit_void(Inst::Return { values: vec![] });
     b.seal_block();
 
-    let overflow_row = b.fresh_value();
-    b.start_block(overflow_exit);
-    write_batch_status_record(
-        &mut b,
-        out_status,
-        AYLraStatus::Overflow,
-        AYLraDeopt::SparseSubstituteOverflow,
-        overflow_row,
-        overflow_row,
-    );
-    b.emit_void(Inst::Return { values: vec![] });
-    b.seal_block_with_params(vec![(overflow_row, Ty::I64)]);
+    if coefficients.iter().any(|(_, coeff)| *coeff != 0) {
+        let overflow_row = b.fresh_value();
+        b.start_block(overflow_exit);
+        write_batch_status_record(
+            &mut b,
+            out_status,
+            AYLraStatus::Overflow,
+            AYLraDeopt::SparseSubstituteOverflow,
+            overflow_row,
+            overflow_row,
+        );
+        b.emit_void(Inst::Return { values: vec![] });
+        b.seal_block_with_params(vec![(overflow_row, Ty::I64)]);
+    }
 
     let bounds_row = b.fresh_value();
     b.start_block(bounds_exit);
@@ -2160,20 +2183,23 @@ fn emit_batch_pivot_status_trust_ir(coefficients: &[(u32, i64)]) -> Module {
     b.seal_block();
 
     let mut module = Module::new("simplex_batch_pivot_status");
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::Ptr,
-            Ty::Ptr,
-            Ty::I64,
-            Ty::Ptr,
-            Ty::Ptr,
-            Ty::I64,
-            Ty::Ptr,
-            Ty::Ptr,
-        ],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::Ptr,
+                Ty::Ptr,
+                Ty::I64,
+                Ty::Ptr,
+                Ty::Ptr,
+                Ty::I64,
+                Ty::Ptr,
+                Ty::Ptr,
+            ],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = Function::new(
         FuncId(0),
         BATCH_PIVOT_STATUS_SYMBOL,
@@ -2181,8 +2207,51 @@ fn emit_batch_pivot_status_trust_ir(coefficients: &[(u32, i64)]) -> Module {
         entry_block,
     );
     func.blocks = b.blocks;
-    module.add_function(func);
     module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
+    module
+}
+
+#[test]
+fn batch_overflow_generators_preserve_ssa_across_all_coefficient_paths() {
+    for coefficients in [
+        vec![],
+        vec![(0, 0)],
+        vec![(0, 1), (1, 1)],
+        vec![(0, -1), (1, -1)],
+        vec![(0, 3)],
+        vec![(0, 0), (1, 3), (2, 1), (3, -1), (4, -7)],
+    ] {
+        for module in [
+            emit_batch_pivot_trust_ir(&coefficients),
+            emit_batch_pivot_status_trust_ir(&coefficients),
+        ] {
+            let errors = trust_ir_build::validate_module(&module);
+            assert!(
+                errors.is_empty(),
+                "coefficients {coefficients:?}: {errors:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_overflow_duplicate_parameter_is_still_rejected_by_admission() {
+    let mut module = emit_batch_pivot_trust_ir(&[(0, 3)]);
+    // Restore the old defect: the first continuation redeclares the loop
+    // body's row index instead of receiving a fresh SSA parameter.
+    let blocks = &mut module.functions[0].blocks;
+    let loop_row = blocks
+        .iter()
+        .find(|block| block.id == BlockId(2))
+        .unwrap()
+        .params[0]
+        .0;
+    let continuation = blocks.iter_mut().find(|block| block.id.0 >= 5).unwrap();
+    continuation.params[0].0 = loop_row;
+    let error = permit_translate_module(&module).unwrap_err().to_string();
+    assert!(error.contains("defined more than once"), "{error}");
 }
 
 fn compile_module_with_opt_level(module: &Module, opt_level: OptLevel) -> JitCompilationResult {
@@ -4107,7 +4176,7 @@ fn jit_sparse_substitute_single_match_preserves_prefix_and_updates_match_o0() {
 fn jit_sparse_substitute_single_match_preserves_prefix_and_updates_match_o2_explicit() {
     let config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let (_jit, f) = jit_compile_sparse_substitute_with_pipeline_config(config);
 
@@ -4136,7 +4205,7 @@ fn jit_sparse_substitute_single_match_preserves_prefix_and_updates_match_o2_expl
 fn jit_sparse_substitute_single_match_preserves_prefix_and_updates_match_o2_post_ra() {
     let config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let (_jit, f) = jit_compile_sparse_substitute_with_pipeline_config(config);
 
@@ -4159,4 +4228,28 @@ fn jit_sparse_substitute_single_match_preserves_prefix_and_updates_match_o2_post
     assert_eq!(raw, 2, "O2 without post-RA opt should return len 2");
     assert_eq!(out_vars[..2], [2, 3]);
     assert_eq!(out_coeffs[..2], [10, 11]);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

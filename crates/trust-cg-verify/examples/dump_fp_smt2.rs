@@ -1,7 +1,7 @@
 // Dump the exact SMT2 query the bridge sends the solver for each failing
 // FP int<->fp roundtrip obligation, so we can study AY's behavior directly.
 //
-//   cargo run -p trust-cg-verify --example dump_fp_smt2 -- <which>
+//   scripts/trust_cargo.sh run -p trust-cg-verify --example dump_fp_smt2 -- <which>
 //
 // where <which> is one of: i32 i16 i64 u32 u16 u64 (default: i32)
 

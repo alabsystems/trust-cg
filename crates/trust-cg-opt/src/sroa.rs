@@ -7,7 +7,7 @@
 //!
 //! SROA identifies stack slots whose address never escapes the function and
 //! whose uses are limited to simple load/store patterns, and rewrites those
-//! loads/stores into pure vreg-to-vreg copies. The stack slot storage is left
+//! loads/stores into register copies. The stack slot storage is left
 //! in the function (regalloc / frame lowering may prune unused slots later),
 //! but the scalar SSA replacement eliminates stack traffic for the slot.
 //!
@@ -39,6 +39,8 @@
 //!
 //! When a slot is accepted, each distinct `(slot_byte_offset, opcode)` load
 //! or store is replaced by a vreg move against a dedicated scalar vreg.
+//! Architectural GPR store values are captured at the original store, not at
+//! a later load: an intervening call may overwrite an ABI return register.
 //! Intermediate `AddPCRel` / `AddRI` / `MovR` root uses become dead and are
 //! removed in the same pass; subsequent DCE and copy-prop clean up the moves.
 //!
@@ -79,25 +81,17 @@
 //! partial-escape shadow mirrors as clones of the surviving store.
 //! Partial-escape roots, derived address defs, and stores that remain unchanged
 //! intentionally keep their existing provenance entries.
-//!
-//! Reference: `designs/2026-04-18-aggregate-lowering.md` Phase 2b.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use trust_cg_ir::function::DebugVariableStorage;
 use trust_cg_ir::{
-    AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PassId, ProofAnnotation,
-    ProvenanceMap, RegClass, StackSlotId, VReg, regs,
+    AArch64Opcode, InstFlags, InstId, MachFunction, MachInst, MachOperand, PReg, PassId,
+    ProofAnnotation, ProvenanceMap, RegClass, StackSlot, StackSlotId, VReg, regs,
 };
 
-use crate::effects::{aarch64_for_each_use_position, for_each_inst_def};
+use crate::effects::{aarch64_for_each_use_position, build_vreg_read_counts, for_each_inst_def};
 use crate::pass_manager::MachinePass;
-
-/// Kill switch for the small-constant-`memcpy`-into-slot expansion (the
-/// "memcpy fill", #salsa20): set `TCG_NO_SROA_MEMCPY_FILL` (any value) to
-/// treat such calls as full escapes again.
-fn sroa_memcpy_fill_enabled() -> bool {
-    std::env::var_os("TCG_NO_SROA_MEMCPY_FILL").is_none()
-}
 
 /// Kill switch for accepting stores to one offset from MULTIPLE (dominance-
 /// ordered) blocks: set `TCG_NO_SROA_MULTIBLOCK_STORES` (any value) to
@@ -153,6 +147,7 @@ fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> 
         return false;
     }
 
+    let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
     // 1 + 1b in ONE walk: VReg -> definer instruction (last definer in block
     //    order, as before), so we can recognise a load/store base that came
     //    from an AddPCRel or AddRI chain; and the VRegs with more than one
@@ -169,7 +164,16 @@ fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> 
     let mut use_count: Option<HashMap<VReg, u32>> = None;
 
     let mut rewrites: Vec<SlotRewrite> = Vec::new();
-    let mut next_scalar_vreg = func.next_vreg;
+    // Shadow registers are numbered from the counter while `func` is borrowed
+    // for analysis, and allocated as exactly that range before any operand
+    // names one (L10-P5; see below).
+    let first_shadow_vreg = func.next_vreg;
+    let mut next_scalar_vreg = first_shadow_vreg;
+    // Dominators, instruction positions and the vreg -> users index, computed
+    // on first use and shared by every slot's trace and plan: nothing mutates
+    // `func` before `apply_rewrites`.
+    let debug_homes = debug_variable_home_slots(func, provenance.as_deref());
+    let facts = FunctionFacts::new(func, debug_homes.clone());
 
     // 4. For each slot, try to collect all accesses. Bail out (skip the
     //    slot) the moment we see a use we don't recognise.
@@ -191,6 +195,7 @@ fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> 
             }
             if !trace_addr_uses(
                 func,
+                &facts,
                 &def_of,
                 &multidef,
                 root_vreg,
@@ -202,18 +207,28 @@ fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> 
             }
         }
 
+        // Expanding a memcpy fill would delete its call. Slot privacy does not
+        // discharge that instruction's exceptional continuation.
+        if plan
+            .memcpy_fill
+            .as_ref()
+            .is_some_and(|fill| protected.contains(fill.bl_id))
+        {
+            continue 'slot_loop;
+        }
+
         // Every root def is covered, every derived vreg is used only by
         // recognised addresses. Now confirm we touched **every** use of
         // every root/derived vreg: if `use_count` disagrees with what we
         // walked, there's an unknown reader (e.g., a backward edge we
         // didn't revisit) and we must bail.
-        let use_count = use_count.get_or_insert_with(|| collect_vreg_use_counts(func));
+        let use_count = use_count.get_or_insert_with(|| build_vreg_read_counts(func));
         if !plan.all_uses_covered(use_count) {
             continue 'slot_loop;
         }
 
         // Collect the rewrite entries.
-        if let Some(r) = plan.finalise(func, &mut next_scalar_vreg) {
+        if let Some(r) = plan.finalise(&facts, &mut next_scalar_vreg) {
             rewrites.push(r);
         }
     }
@@ -222,7 +237,19 @@ fn run_impl(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> 
         return false;
     }
 
-    apply_rewrites(func, &rewrites, provenance)
+    // L10-P5: allocate the planned shadow range before writing anything. The
+    // allocation re-derives every live identity after a pipeline boundary, so
+    // a counter left stale before this pass is refused here: the pass writes
+    // nothing and the pass manager reports the sticky refusal by name. An
+    // admitted counter is the one the numbering read (nothing changed `func`
+    // in between), so the range is the planned one; any other range declines.
+    let planned = first_shadow_vreg..next_scalar_vreg;
+    match func.try_alloc_vreg_range(planned.end - planned.start) {
+        Some(range) if range == planned => {}
+        _ => return false,
+    }
+
+    apply_rewrites(func, &rewrites, provenance, &debug_homes)
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +268,8 @@ fn def_vreg(inst: &MachInst) -> Option<VReg> {
 }
 
 /// Map every modeled VReg definition to the instruction that defined it.
-/// The multi-def set: VRegs DEFINED by more than one instruction.
+/// The multi-def set: VRegs whose numeric ID is DEFINED by more than one
+/// instruction, including a definition through another register-width view.
 /// The address-tracing model assumes SSA: each root/derived-address vreg is
 /// produced by exactly one instruction (the AddPCRel root or the MovR/AddRI
 /// alias we followed). A vreg with multiple defs breaks that assumption — most
@@ -252,42 +280,31 @@ fn def_vreg(inst: &MachInst) -> Option<VReg> {
 /// loaded runtime pointer — a miscompile (an infinite pointer-chasing loop:
 /// gcc-c-torture 20000801-2). Any derived vreg appearing here forces a bail-out.
 ///
-/// `def_of`: the last definer of each VReg in block order (`insert` overwrites,
-/// exactly as the separate def-map walk did). `multidef`: a VReg whose insert
-/// returned a previous definer was already defined — exactly the
-/// `!seen.insert(v)` of the separate multi-def walk. One traversal for both.
+/// `def_of`: the last definer of each exact VReg in block order (`insert`
+/// overwrites, as before). `multidef` includes every defined view of a numeric
+/// ID with multiple writers: a W write also defines the X view's value. The
+/// first numeric-ID writer index shares this traversal; tracing an AddRR
+/// constant never needs a per-candidate whole-function alias scan.
 fn build_def_map_and_multidef(func: &MachFunction) -> (HashMap<VReg, InstId>, HashSet<VReg>) {
-    let mut def_of = HashMap::new();
-    let mut multi = HashSet::new();
+    let mut def_of = HashMap::default();
+    let mut multi = HashSet::default();
+    let mut first_by_id = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {
             let inst = func.inst(inst_id);
             for_each_inst_def(inst, |v| {
-                if def_of.insert(v, inst_id).is_some() {
+                def_of.insert(v, inst_id);
+                if let Some(&first) = first_by_id.get(&v.id) {
+                    multi.insert(first);
                     multi.insert(v);
+                } else {
+                    first_by_id.insert(v.id, v);
                 }
             });
         }
     }
     (def_of, multi)
-}
-
-/// Count how many times each VReg appears at a modeled use position.
-fn collect_vreg_use_counts(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
-    for block_id in &func.block_order {
-        let block = func.block(*block_id);
-        for &inst_id in &block.insts {
-            let inst = func.inst(inst_id);
-            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
-                if let Some(MachOperand::VReg(v)) = inst.operands.get(pos) {
-                    *counts.entry(*v).or_insert(0) += 1;
-                }
-            });
-        }
-    }
-    counts
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +334,7 @@ fn collect_stack_slot_roots(func: &MachFunction) -> Vec<(StackSlotId, InstId)> {
 /// Group the flat list of roots by `StackSlotId`, preserving definition order.
 fn group_roots_by_slot(roots: &[(StackSlotId, InstId)]) -> Vec<(StackSlotId, Vec<InstId>)> {
     let mut order: Vec<StackSlotId> = Vec::new();
-    let mut by_slot: HashMap<StackSlotId, Vec<InstId>> = HashMap::new();
+    let mut by_slot: HashMap<StackSlotId, Vec<InstId>> = HashMap::default();
     for (slot, inst) in roots {
         if !by_slot.contains_key(slot) {
             order.push(*slot);
@@ -334,6 +351,43 @@ fn group_roots_by_slot(roots: &[(StackSlotId, InstId)]) -> Vec<(StackSlotId, Vec
 // Address-use tracing
 // ---------------------------------------------------------------------------
 
+/// A scalar access register. Physical sources are admitted only by the checked
+/// store constructor; load destinations remain virtual registers.
+#[derive(Debug, Clone, Copy)]
+enum AccessRegister {
+    Virtual(VReg),
+    Physical(PReg),
+}
+
+impl AccessRegister {
+    fn store_source(operand: &MachOperand) -> Option<Self> {
+        match operand {
+            MachOperand::VReg(value) => Some(Self::Virtual(*value)),
+            // Use the architectural bank, not the five-bit encoding: SP/WSP
+            // and XZR/WZR must not become an ordinary X/W register by aliasing.
+            // Other banks and special-register spellings remain unsupported.
+            MachOperand::PReg(value) if matches!(value.encoding(), 0..=30 | 32..=62) => {
+                Some(Self::Physical(*value))
+            }
+            _ => None,
+        }
+    }
+
+    fn class(self) -> RegClass {
+        match self {
+            Self::Virtual(value) => value.class,
+            Self::Physical(value) => trust_cg_ir::aarch64_regs::preg_class(value),
+        }
+    }
+
+    fn operand(self) -> MachOperand {
+        match self {
+            Self::Virtual(value) => MachOperand::VReg(value),
+            Self::Physical(value) => MachOperand::PReg(value),
+        }
+    }
+}
+
 /// A single access instruction (load or store) against a slot.
 #[derive(Debug, Clone)]
 struct Access {
@@ -344,9 +398,9 @@ struct Access {
     /// root-to-leaf. These are removed on full SROA and their provenance is
     /// transferred into a surviving scalar replacement.
     addr_sources: Vec<InstId>,
-    /// For loads, the destination vreg (operand[0]). For stores, the source
-    /// vreg holding the stored value (operand[0]).
-    value_vreg: VReg,
+    /// For loads, the destination vreg (operand[0]). For stores, the register
+    /// whose value is captured at this instruction (operand[0]).
+    value: AccessRegister,
     /// Opcode bucket for width-consistency checks.
     opcode: AArch64Opcode,
 }
@@ -407,7 +461,7 @@ impl SlotPlan {
             slot,
             roots: Vec::new(),
             derived_defs: Vec::new(),
-            owned_vregs: HashMap::new(),
+            owned_vregs: HashMap::default(),
             accesses: Vec::new(),
             aborted: false,
             partial_escape: false,
@@ -458,17 +512,89 @@ impl SlotPlan {
     }
 
     /// Finalise: return a rewrite, or `None` if we have nothing to do.
-    fn finalise(&mut self, func: &MachFunction, next_scalar_vreg: &mut u32) -> Option<SlotRewrite> {
+    fn finalise(
+        &mut self,
+        facts: &FunctionFacts<'_>,
+        next_scalar_vreg: &mut u32,
+    ) -> Option<SlotRewrite> {
+        let func = facts.func;
         if self.aborted {
             return None;
         }
         if self.accesses.is_empty() && self.derived_defs.is_empty() && self.roots.is_empty() {
             return None;
         }
+        if self
+            .accesses
+            .iter()
+            .any(|a| matches!(a.value, AccessRegister::Physical(_)))
+        {
+            // A slot that a source-level debug variable names as its home keeps
+            // the strict shape: no load into a physical register and no
+            // implicit use anywhere. Debug info can describe a variable only by
+            // a frame slot or a register it does not move between, so
+            // promoting such a slot would turn a variable the debugger reads
+            // from its frame slot into an optimized-out one (the frame-based
+            // locals of `aarch64_elf_dwarf` and `o3_debug_lldb_line_200loc`).
+            // Without debug variables (the corpus build) both admissions apply.
+            let debug_home = facts.debug_homes.contains(&self.slot);
+            // This extension covers fully private scalar slots, not the
+            // annotation-based partial-escape lane. Every instruction that we
+            // remove or rewrite must have exactly its ordinary effects; never
+            // erase volatile/extra effects or carry a memory proof onto a move.
+            if self.partial_escape || self.memcpy_fill.is_some()
+                || (debug_home
+                    && self
+                        .accesses
+                        .iter()
+                        .any(|a| a.is_load && matches!(a.value, AccessRegister::Physical(_))))
+                || self.roots.iter().any(|id| {
+                    !matches!(func.inst(*id).operands.as_slice(),
+                        [MachOperand::VReg(_), MachOperand::PReg(base), MachOperand::StackSlot(slot)]
+                            if *base == regs::SP && *slot == self.slot)
+                })
+                || self.accesses.iter().map(|a| a.inst_id)
+                    .chain(self.roots.iter().copied())
+                    .chain(self.derived_defs.iter().copied())
+                    .any(|id| {
+                        let inst = func.inst(id);
+                        // The one admitted non-default flag is the ABI role of
+                        // a load INTO a physical argument register: it names
+                        // what the destination write is for, not an extra
+                        // effect, and the rewrite carries it onto the `Copy`.
+                        let mut flags = inst.flags;
+                        if self.accesses.iter().any(|a| {
+                            a.inst_id == id
+                                && a.is_load
+                                && matches!(a.value, AccessRegister::Physical(_))
+                        }) {
+                            flags.remove(InstFlags::IS_CALL_ARG_SETUP);
+                        }
+                        // Implicit uses are admitted only as the formal-argument
+                        // live-in device (`append_formal_livein_uses`): reads of
+                        // incoming GPR argument registers that keep a later
+                        // parameter's register reserved. A read has no effect to
+                        // erase; a rewritten access keeps its list, and deleting
+                        // a root's reads cannot open a clobber window, because a
+                        // live-in register stays reserved from entry to its
+                        // first remaining read.
+                        flags != inst.opcode.default_flags()
+                            || !inst.implicit_defs.is_empty()
+                            || (debug_home && !inst.implicit_uses.is_empty())
+                            || !inst
+                                .implicit_uses
+                                .iter()
+                                .all(|preg| matches!(preg.encoding(), 0..=7 | 32..=39))
+                            || inst.proof.is_some()
+                    })
+            {
+                return None;
+            }
+        }
         // A scalar shadow is a plain `MovR`, so it is sound only for full-width
         // GPR accesses with one exact register class per byte offset.  In
         // particular, `LdrRI`/`StrRI` do not encode the width in the opcode:
-        // the VReg class does.  Treating a Gpr32 store and Gpr64 load as the
+        // the register class does. Treating a Gpr32 store and Gpr64 load as the
         // same shape loses the adjacent four bytes of a packed value.
         //
         // Byte/halfword forms are declined even when their opcodes match: a
@@ -476,28 +602,29 @@ impl SlotPlan {
         // reproduces.  Distinct offsets must also describe disjoint ranges;
         // otherwise independent shadow vregs would erase memory overlap.
         let slot_size = i64::from(func.stack_slots.get(self.slot.0 as usize)?.fixed_size()?);
-        let mut shape_at_offset: HashMap<i64, (RegClass, i64)> = HashMap::new();
+        let mut shape_at_offset: HashMap<i64, (RegClass, i64)> = HashMap::default();
         for a in &self.accesses {
             if !matches!(a.opcode, AArch64Opcode::LdrRI | AArch64Opcode::StrRI) {
                 return None;
             }
-            if !matches!(a.value_vreg.class, RegClass::Gpr32 | RegClass::Gpr64) {
+            let class = a.value.class();
+            if !matches!(class, RegClass::Gpr32 | RegClass::Gpr64) {
                 return None;
             }
-            let width = i64::from(a.value_vreg.class.size_bytes());
+            let width = i64::from(class.size_bytes());
             let end = a.byte_offset.checked_add(width)?;
             if a.byte_offset < 0 || end > slot_size {
                 return None;
             }
             match shape_at_offset.get(&a.byte_offset) {
                 Some((class, existing_width))
-                    if *class != a.value_vreg.class || *existing_width != width =>
+                    if *class != a.value.class() || *existing_width != width =>
                 {
                     return None;
                 }
                 Some(_) => {}
                 None => {
-                    shape_at_offset.insert(a.byte_offset, (a.value_vreg.class, width));
+                    shape_at_offset.insert(a.byte_offset, (class, width));
                 }
             }
         }
@@ -572,32 +699,37 @@ impl SlotPlan {
                         addr_sources: Vec::new(),
                         // Synthetic entry for the dataflow checks only; the
                         // value vreg is never read for stores.
-                        value_vreg: VReg::new(u32::MAX, RegClass::Gpr64),
+                        value: AccessRegister::Virtual(VReg::new(u32::MAX, RegClass::Gpr64)),
                         opcode: AArch64Opcode::StrRI,
                     });
                 }
                 flow
             }
         };
-        if !accesses_have_reaching_stores(func, &flow_accesses) {
+        if !accesses_have_reaching_stores(facts, &flow_accesses) {
             return None;
         }
-        if !stores_are_dominance_ordered_per_offset(func, &flow_accesses) {
+        if !stores_are_dominance_ordered_per_offset(facts, &flow_accesses) {
             return None;
         }
 
         // Allocate one scalar "shadow" vreg per access offset, matching the
         // destination register class of the first load at that offset (or a
         // store's source class).
-        let mut scalar_vreg: HashMap<i64, VReg> = HashMap::new();
+        // The numbering is a plan: `run_impl` allocates the whole range before
+        // any operand names one. A slot whose numbering would exhaust the
+        // counter declines without consuming any of it.
+        let mut scalar_vreg: HashMap<i64, VReg> = HashMap::default();
+        let mut next = *next_scalar_vreg;
         for a in &self.accesses {
             if scalar_vreg.contains_key(&a.byte_offset) {
                 continue;
             }
-            let cls = a.value_vreg.class;
-            scalar_vreg.insert(a.byte_offset, VReg::new(*next_scalar_vreg, cls));
-            *next_scalar_vreg += 1;
+            let cls = a.value.class();
+            scalar_vreg.insert(a.byte_offset, VReg::new(next, cls));
+            next = next.checked_add(1)?;
         }
+        *next_scalar_vreg = next;
 
         Some(SlotRewrite {
             slot: self.slot,
@@ -605,27 +737,27 @@ impl SlotPlan {
             derived_defs: std::mem::take(&mut self.derived_defs),
             accesses: std::mem::take(&mut self.accesses),
             scalar_vreg,
-            next_vreg: *next_scalar_vreg,
             partial_escape: self.partial_escape,
             memcpy_fill,
         })
     }
 }
 
-fn accesses_have_reaching_stores(func: &MachFunction, accesses: &[Access]) -> bool {
+fn accesses_have_reaching_stores(facts: &FunctionFacts<'_>, accesses: &[Access]) -> bool {
+    let func = facts.func;
     if accesses.is_empty() {
         return true;
     }
 
     let mut access_positions = Vec::with_capacity(accesses.len());
     for access in accesses {
-        let Some((block_id, index)) = containing_block_position(func, access.inst_id) else {
+        let Some((block_id, index)) = facts.position(access.inst_id) else {
             return false;
         };
         access_positions.push((access, block_id, index));
     }
 
-    let dominators = compute_dominators(func);
+    let dominators = facts.dominators();
 
     for (access, block_id, index) in &access_positions {
         if !access.is_load {
@@ -634,12 +766,7 @@ fn accesses_have_reaching_stores(func: &MachFunction, accesses: &[Access]) -> bo
         if block_has_store_before(&access_positions, *block_id, *index, access.byte_offset) {
             continue;
         }
-        if has_dominating_store(
-            &access_positions,
-            &dominators,
-            *block_id,
-            access.byte_offset,
-        ) {
+        if has_dominating_store(&access_positions, dominators, *block_id, access.byte_offset) {
             continue;
         }
 
@@ -649,7 +776,7 @@ fn accesses_have_reaching_stores(func: &MachFunction, accesses: &[Access]) -> bo
         }
 
         for pred in preds {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             if !predecessor_path_has_store(
                 func,
                 &access_positions,
@@ -665,54 +792,224 @@ fn accesses_have_reaching_stores(func: &MachFunction, accesses: &[Access]) -> bo
     true
 }
 
-fn compute_dominators(
+/// Facts about the function that every slot plan reads and none changes:
+/// computed on first use, then shared (the function is not mutated before
+/// `apply_rewrites`, so each is the value a per-plan recomputation produced).
+/// trust-cg-lower's synthetic variable namespace for fixed scalar `alloca`
+/// debug locals (`ALLOCA_DEBUG_PROVENANCE_VAR_TAG` in its adapter and in
+/// trust-cg-codegen's pipeline, which turns it into the slot's location after
+/// frame lowering): the low bits are the stack slot index.
+const ALLOCA_DEBUG_VAR_TAG: u32 = 0x8000_0000;
+const DEBUG_VAR_INDEX_MASK: u32 = 0x1fff_ffff;
+
+/// The stack slots a source-level debug variable names as its home: a local
+/// whose storage is the slot itself, a fixed scalar `alloca` local (named by
+/// its synthetic variable id, whose frame-slot range the pipeline seeds only
+/// after optimization), or a provenance variable with a live range in the
+/// slot. The adapter describes every fixed scalar `alloca` whether or not
+/// debug info is emitted, so this set, and what SROA does with it, does not
+/// depend on `-g`.
+fn debug_variable_home_slots(
     func: &MachFunction,
-) -> HashMap<trust_cg_ir::BlockId, HashSet<trust_cg_ir::BlockId>> {
-    let all_blocks: HashSet<trust_cg_ir::BlockId> = func.block_order.iter().copied().collect();
-    let entry = func.entry;
-    let mut dominators: HashMap<trust_cg_ir::BlockId, HashSet<trust_cg_ir::BlockId>> =
-        HashMap::new();
-
-    for block_id in &func.block_order {
-        if *block_id == entry {
-            dominators.insert(*block_id, HashSet::from([entry]));
-        } else {
-            dominators.insert(*block_id, all_blocks.clone());
-        }
-    }
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block_id in &func.block_order {
-            if *block_id == entry {
-                continue;
+    provenance: Option<&ProvenanceMap>,
+) -> HashSet<StackSlotId> {
+    let mut homes = HashSet::default();
+    for local in &func.debug_meta.local_variables {
+        match local.storage {
+            DebugVariableStorage::StackSlot(id) => {
+                homes.insert(StackSlotId(id));
             }
-
-            let preds = &func.block(*block_id).preds;
-            let mut next = if let Some((first, rest)) = preds.split_first() {
-                let mut intersection = dominators.get(first).cloned().unwrap_or_else(HashSet::new);
-                for pred in rest {
-                    if let Some(pred_doms) = dominators.get(pred) {
-                        intersection.retain(|candidate| pred_doms.contains(candidate));
-                    } else {
-                        intersection.clear();
+            DebugVariableStorage::ProvenanceVar(var) => {
+                if var.0 & !DEBUG_VAR_INDEX_MASK == ALLOCA_DEBUG_VAR_TAG {
+                    homes.insert(StackSlotId(var.0 & DEBUG_VAR_INDEX_MASK));
+                }
+                for range in provenance.map_or(&[][..], |p| p.var_live_ranges(var)) {
+                    if let trust_cg_ir::provenance::LocationExpr::Stack(slot) = range.value {
+                        homes.insert(slot);
                     }
                 }
-                intersection
-            } else {
-                HashSet::new()
-            };
-            next.insert(*block_id);
-
-            if dominators.get(block_id) != Some(&next) {
-                dominators.insert(*block_id, next);
-                changed = true;
             }
+            DebugVariableStorage::ConstantInt(_) => {}
+        }
+    }
+    homes
+}
+
+struct FunctionFacts<'f> {
+    func: &'f MachFunction,
+    /// Slots a source-level debug variable names as its home
+    /// ([`debug_variable_home_slots`]).
+    debug_homes: HashSet<StackSlotId>,
+    dominators: std::cell::OnceCell<Dominators>,
+    positions: std::cell::OnceCell<HashMap<InstId, (trust_cg_ir::BlockId, usize)>>,
+    users: std::cell::OnceCell<HashMap<VReg, Vec<InstId>>>,
+}
+
+impl<'f> FunctionFacts<'f> {
+    fn new(func: &'f MachFunction, debug_homes: HashSet<StackSlotId>) -> Self {
+        Self {
+            func,
+            debug_homes,
+            dominators: std::cell::OnceCell::new(),
+            positions: std::cell::OnceCell::new(),
+            users: std::cell::OnceCell::new(),
         }
     }
 
-    dominators
+    /// The instructions reading `vreg` in a use position, in walk order
+    /// (`block_order`, then each block's instruction list; an instruction
+    /// listed twice appears twice, one reading `vreg` in several positions
+    /// once).
+    ///
+    /// This is what the address tracer used to rescan the whole function for
+    /// on every traced vreg (`collect_users_of`); one walk now indexes every
+    /// vreg, in the same order.
+    fn users_of(&self, vreg: VReg) -> &[InstId] {
+        self.users
+            .get_or_init(|| {
+                let mut users: HashMap<VReg, Vec<InstId>> = HashMap::default();
+                let mut read: Vec<VReg> = Vec::new();
+                for block_id in &self.func.block_order {
+                    for &inst_id in &self.func.block(*block_id).insts {
+                        let inst = self.func.inst(inst_id);
+                        read.clear();
+                        aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+                            if let Some(MachOperand::VReg(v)) = inst.operands.get(pos)
+                                && !read.contains(v)
+                            {
+                                read.push(*v);
+                            }
+                        });
+                        for v in &read {
+                            users.entry(*v).or_default().push(inst_id);
+                        }
+                    }
+                }
+                users
+            })
+            .get(&vreg)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn dominators(&self) -> &Dominators {
+        self.dominators
+            .get_or_init(|| Dominators::compute(self.func))
+    }
+
+    /// [`containing_block_position`], from one walk of the function: the
+    /// first block in `block_order` holding the instruction and its first
+    /// index there.
+    fn position(&self, inst_id: InstId) -> Option<(trust_cg_ir::BlockId, usize)> {
+        self.positions
+            .get_or_init(|| {
+                let mut positions = HashMap::default();
+                for block_id in &self.func.block_order {
+                    for (index, id) in self.func.block(*block_id).insts.iter().enumerate() {
+                        positions.entry(*id).or_insert((*block_id, index));
+                    }
+                }
+                positions
+            })
+            .get(&inst_id)
+            .copied()
+    }
+}
+
+/// Dominator sets of the blocks of `block_order`, as bit sets over their
+/// first positions in `block_order`.
+///
+/// This is the iterative set computation the pass has always used — every
+/// non-entry block starts at the set of all `block_order` blocks, the entry at
+/// itself, and a round recomputes each non-entry block, in `block_order`, as
+/// itself plus the intersection of its predecessors' current sets (an empty
+/// set when it has no predecessor, and when a predecessor is not in
+/// `block_order`) until no set changes — with the same visiting order and the
+/// same update rule, on bit sets instead of hash sets. It was recomputed for
+/// every candidate slot (4.4% of a TY semantic-image compile); it is now
+/// computed at most once per pass run.
+struct Dominators {
+    /// `block_order` position of each block's first occurrence.
+    index: HashMap<trust_cg_ir::BlockId, usize>,
+    words: usize,
+    /// Row `i` (`words` words) is the dominator set of the block at position `i`.
+    sets: Vec<u64>,
+}
+
+impl Dominators {
+    fn compute(func: &MachFunction) -> Self {
+        let mut index: HashMap<trust_cg_ir::BlockId, usize> = HashMap::default();
+        for block_id in &func.block_order {
+            let next = index.len();
+            index.entry(*block_id).or_insert(next);
+        }
+        let n = index.len();
+        let words = n.div_ceil(64);
+        let mut all = vec![0u64; words];
+        for i in 0..n {
+            all[i / 64] |= 1u64 << (i % 64);
+        }
+        let entry = func.entry;
+        let mut sets = vec![0u64; n * words];
+        for (block_id, &i) in &index {
+            let row = &mut sets[i * words..(i + 1) * words];
+            if *block_id == entry {
+                row[i / 64] |= 1u64 << (i % 64);
+            } else {
+                row.copy_from_slice(&all);
+            }
+        }
+
+        let mut next = vec![0u64; words];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block_id in &func.block_order {
+                if *block_id == entry {
+                    continue;
+                }
+                let i = index[block_id];
+                next.fill(0);
+                let preds = &func.block(*block_id).preds;
+                if let Some((first, rest)) = preds.split_first() {
+                    if let Some(&j) = index.get(first) {
+                        next.copy_from_slice(&sets[j * words..(j + 1) * words]);
+                    }
+                    for pred in rest {
+                        match index.get(pred) {
+                            Some(&j) => {
+                                for (w, p) in next.iter_mut().zip(&sets[j * words..(j + 1) * words])
+                                {
+                                    *w &= *p;
+                                }
+                            }
+                            None => next.fill(0),
+                        }
+                    }
+                }
+                next[i / 64] |= 1u64 << (i % 64);
+                let row = &mut sets[i * words..(i + 1) * words];
+                if *row != next[..] {
+                    row.copy_from_slice(&next);
+                    changed = true;
+                }
+            }
+        }
+        Self { index, words, sets }
+    }
+
+    /// The dominator set of `block`, or `None` when it is not in `block_order`.
+    fn get(&self, block: trust_cg_ir::BlockId) -> Option<&[u64]> {
+        self.index
+            .get(&block)
+            .map(|&i| &self.sets[i * self.words..(i + 1) * self.words])
+    }
+
+    /// Whether `set` (a row of this table) contains `block`.
+    fn set_contains(&self, set: &[u64], block: trust_cg_ir::BlockId) -> bool {
+        self.index
+            .get(&block)
+            .is_some_and(|&i| set[i / 64] >> (i % 64) & 1 == 1)
+    }
 }
 
 fn containing_block_position(
@@ -746,11 +1043,11 @@ fn block_has_store_before(
 
 fn has_dominating_store(
     access_positions: &[(&Access, trust_cg_ir::BlockId, usize)],
-    dominators: &HashMap<trust_cg_ir::BlockId, HashSet<trust_cg_ir::BlockId>>,
+    dominators: &Dominators,
     load_block: trust_cg_ir::BlockId,
     byte_offset: i64,
 ) -> bool {
-    let Some(load_dominators) = dominators.get(&load_block) else {
+    let Some(load_dominators) = dominators.get(load_block) else {
         return false;
     };
 
@@ -758,7 +1055,7 @@ fn has_dominating_store(
         !access.is_load
             && access.byte_offset == byte_offset
             && *access_block != load_block
-            && load_dominators.contains(access_block)
+            && dominators.set_contains(load_dominators, *access_block)
     })
 }
 
@@ -801,13 +1098,13 @@ fn predecessor_path_has_store(
 /// — every store rewritten to a def, every load to a use, positions
 /// unchanged — needs no block constraint at all, but the dominance chain
 /// keeps the accepted shapes easy to audit).
-fn stores_are_dominance_ordered_per_offset(func: &MachFunction, accesses: &[Access]) -> bool {
-    let mut store_blocks_by_offset: HashMap<i64, Vec<trust_cg_ir::BlockId>> = HashMap::new();
+fn stores_are_dominance_ordered_per_offset(facts: &FunctionFacts<'_>, accesses: &[Access]) -> bool {
+    let mut store_blocks_by_offset: HashMap<i64, Vec<trust_cg_ir::BlockId>> = HashMap::default();
     for access in accesses {
         if access.is_load {
             continue;
         }
-        let Some((block_id, _)) = containing_block_position(func, access.inst_id) else {
+        let Some((block_id, _)) = facts.position(access.inst_id) else {
             return false;
         };
         let blocks = store_blocks_by_offset
@@ -826,12 +1123,16 @@ fn stores_are_dominance_ordered_per_offset(func: &MachFunction, accesses: &[Acce
         return false;
     }
 
-    let dominators = compute_dominators(func);
+    let dominators = facts.dominators();
     for blocks in store_blocks_by_offset.values() {
         for (i, a) in blocks.iter().enumerate() {
             for b in &blocks[i + 1..] {
-                let a_dom_b = dominators.get(b).is_some_and(|d| d.contains(a));
-                let b_dom_a = dominators.get(a).is_some_and(|d| d.contains(b));
+                let a_dom_b = dominators
+                    .get(*b)
+                    .is_some_and(|d| dominators.set_contains(d, *a));
+                let b_dom_a = dominators
+                    .get(*a)
+                    .is_some_and(|d| dominators.set_contains(d, *b));
                 if !a_dom_b && !b_dom_a {
                     return false;
                 }
@@ -844,7 +1145,6 @@ fn stores_are_dominance_ordered_per_offset(func: &MachFunction, accesses: &[Acce
 /// The rewrite description produced once we have confirmed the slot is safe.
 #[derive(Debug)]
 struct SlotRewrite {
-    #[allow(dead_code)]
     slot: StackSlotId,
     roots: Vec<InstId>,
     derived_defs: Vec<InstId>,
@@ -857,7 +1157,6 @@ struct SlotRewrite {
     /// Whole-slot memcpy initialization to expand into per-lane shadow loads
     /// (with the validated lane offsets), deleting the call (`memcpy fill`).
     memcpy_fill: Option<(MemcpyFill, Vec<i64>)>,
-    next_vreg: u32,
 }
 
 /// Walk every use of `vreg` and classify it as:
@@ -870,8 +1169,10 @@ struct SlotRewrite {
 ///
 /// Returns `false` and marks the plan aborted when it sees a use it doesn't
 /// recognise or a use it already visited (cycle).
+#[allow(clippy::too_many_arguments)]
 fn trace_addr_uses(
     func: &MachFunction,
+    facts: &FunctionFacts<'_>,
     def_of: &HashMap<VReg, InstId>,
     multidef: &HashSet<VReg>,
     vreg: VReg,
@@ -879,9 +1180,8 @@ fn trace_addr_uses(
     addr_sources: &[InstId],
     plan: &mut SlotPlan,
 ) -> bool {
-    // Find every instruction using `vreg` as a source.
-    let users = collect_users_of(func, vreg);
-    for user_id in users {
+    // Every instruction using `vreg` as a source.
+    for &user_id in facts.users_of(vreg) {
         let inst = func.inst(user_id);
         plan.note_use(vreg);
 
@@ -935,6 +1235,45 @@ fn trace_addr_uses(
                 nested_sources.push(user_id);
                 if !trace_addr_uses(
                     func,
+                    facts,
+                    def_of,
+                    multidef,
+                    dst,
+                    next_offset,
+                    &nested_sources,
+                    plan,
+                ) {
+                    return false;
+                }
+            }
+            AArch64Opcode::AddRR => {
+                // `AddRR dst, addr, k` (either operand order) where `k` is a
+                // single-def constant register: the `AddRI` field address
+                // after GVN reused an equal constant already in a register
+                // (`&vec.ptr = slot + 8` beside `MovZ 8`). Anything else
+                // (a runtime index, the address added to itself) escapes.
+                let Some((dst, imm)) = addr_user_addrr_constant(inst, vreg, def_of, multidef, func)
+                else {
+                    plan.abort();
+                    return false;
+                };
+                if multidef.contains(&dst) {
+                    plan.abort();
+                    return false;
+                }
+                if !plan.add_derived(dst, user_id) {
+                    plan.abort();
+                    return false;
+                }
+                let Some(next_offset) = base_offset.checked_add(imm) else {
+                    plan.abort();
+                    return false;
+                };
+                let mut nested_sources = addr_sources.to_vec();
+                nested_sources.push(user_id);
+                if !trace_addr_uses(
+                    func,
+                    facts,
                     def_of,
                     multidef,
                     dst,
@@ -970,6 +1309,7 @@ fn trace_addr_uses(
                         nested_sources.push(user_id);
                         if !trace_addr_uses(
                             func,
+                            facts,
                             def_of,
                             multidef,
                             dst,
@@ -988,7 +1328,7 @@ fn trace_addr_uses(
                         // (offset 0) passed as the DESTINATION of a small
                         // constant-length `memcpy` — record the fill; on full
                         // promotion the call is replaced by per-lane loads
-                        // from the source (`TCG_NO_SROA_MEMCPY_FILL`).
+                        // from the source.
                         //
                         // Otherwise: if the same block has a subsequent `Bl`
                         // tagged `ProofAnnotation::Pure`, the slot address is
@@ -997,8 +1337,7 @@ fn trace_addr_uses(
                         // the slot but must leave the root/derived defs and
                         // STRs alone (partial-escape, #456). Otherwise, this
                         // is a normal escape and we bail.
-                        if sroa_memcpy_fill_enabled()
-                            && base_offset == 0
+                        if base_offset == 0
                             && plan.memcpy_fill.is_none()
                             && let Some(fill) = match_memcpy_fill(func, def_of, multidef, user_id)
                         {
@@ -1036,9 +1375,22 @@ fn trace_addr_uses(
                         return false;
                     }
                 };
-                let dst = match def_vreg(inst) {
-                    Some(v) => v,
-                    None => {
+                // A plain `LdrRI` may load straight into a physical GPR: the
+                // call lowering reads a register-passed aggregate argument
+                // from its slot into the ABI register (`ldr x0, [slot]`), and
+                // the aggregate-return lowering does the same into the
+                // result registers. That destination is a register write
+                // like any other; the rewrite keeps it (as a `Copy` into the
+                // same register, carrying the call-argument-setup role).
+                let value = match inst.operands.first() {
+                    Some(MachOperand::VReg(v)) => AccessRegister::Virtual(*v),
+                    Some(MachOperand::PReg(p))
+                        if inst.opcode == AArch64Opcode::LdrRI
+                            && matches!(p.encoding(), 0..=30 | 32..=62) =>
+                    {
+                        AccessRegister::Physical(*p)
+                    }
+                    _ => {
                         plan.abort();
                         return false;
                     }
@@ -1052,7 +1404,7 @@ fn trace_addr_uses(
                     byte_offset,
                     is_load: true,
                     addr_sources: addr_sources.to_vec(),
-                    value_vreg: dst,
+                    value,
                     opcode: inst.opcode,
                 });
             }
@@ -1076,8 +1428,8 @@ fn trace_addr_uses(
                         return false;
                     }
                 };
-                let value = match inst.operands.first() {
-                    Some(MachOperand::VReg(v)) => *v,
+                let value = match inst.operands.first().and_then(AccessRegister::store_source) {
+                    Some(value) => value,
                     _ => {
                         plan.abort();
                         return false;
@@ -1092,7 +1444,7 @@ fn trace_addr_uses(
                     byte_offset,
                     is_load: false,
                     addr_sources: addr_sources.to_vec(),
-                    value_vreg: value,
+                    value,
                     opcode: inst.opcode,
                 });
             }
@@ -1106,7 +1458,9 @@ fn trace_addr_uses(
     true
 }
 
-/// Collect InstIds that use `vreg` as a *source* operand.
+/// Collect InstIds that use `vreg` as a *source* operand: the per-vreg scan
+/// [`FunctionFacts::users_of`] replaced, kept as its oracle.
+#[cfg(test)]
 fn collect_users_of(func: &MachFunction, vreg: VReg) -> Vec<InstId> {
     let mut out = Vec::new();
     for block_id in &func.block_order {
@@ -1125,6 +1479,39 @@ fn collect_users_of(func: &MachFunction, vreg: VReg) -> Vec<InstId> {
         }
     }
     out
+}
+
+/// `AddRR dst, a, b` where exactly one of `a`/`b` is `vreg` and the other is a
+/// single-def full-width constant (`Movz dst, #c` without a shift, or
+/// `MovI dst, #c`): returns `(dst, c)`. The constant has one value everywhere
+/// it is defined, so the sum is `vreg + c` at every execution, exactly the
+/// `AddRI dst, vreg, #c` the tracer already admits.
+fn addr_user_addrr_constant(
+    inst: &MachInst,
+    vreg: VReg,
+    def_of: &HashMap<VReg, InstId>,
+    multidef: &HashSet<VReg>,
+    func: &MachFunction,
+) -> Option<(VReg, i64)> {
+    let (dst, other) = match inst.operands.as_slice() {
+        [
+            MachOperand::VReg(dst),
+            MachOperand::VReg(a),
+            MachOperand::VReg(b),
+        ] if (*a == vreg) != (*b == vreg) => (*dst, if *a == vreg { *b } else { *a }),
+        _ => return None,
+    };
+    if dst.class != RegClass::Gpr64 || other.class != RegClass::Gpr64 || multidef.contains(&other) {
+        return None;
+    }
+    let def = func.inst(*def_of.get(&other)?);
+    match (def.opcode, def.operands.as_slice()) {
+        (
+            AArch64Opcode::Movz | AArch64Opcode::MovI,
+            [MachOperand::VReg(d), MachOperand::Imm(c)],
+        ) if *d == other => Some((dst, *c)),
+        _ => None,
+    }
 }
 
 /// Is this `AddRI dst, base, imm` with `base == vreg`?
@@ -1197,16 +1584,19 @@ fn copy_preg_reaches_pure_bl(func: &MachFunction, copy_id: InstId) -> bool {
 /// shape deviation:
 ///
 /// * `copy_id` must be the x0 (destination) argument copy;
-/// * a `Bl "memcpy"` must follow in the same block, with only other
-///   Copy-to-PReg marshalling instructions in between;
+/// * a `Bl "memcpy"` that instruction selection made for a LIR `Memcpy`
+///   (`InstFlags::LIBRARY_ROUTINE_CALL`; a source call of a function only
+///   named `memcpy` is not one) must follow in the same block, with only
+///   other Copy-to-PReg marshalling instructions in between;
 /// * the contiguous Copy-to-PReg run immediately before the `Bl` must cover
 ///   exactly x0..x2 (plain `memcpy` call) or x0..x3 (the `llvm.memcpy`
 ///   intrinsic, whose 4th argument — the volatile flag — must be constant 0),
 ///   each from a vreg, each preg exactly once, and must contain `copy_id`;
 /// * the length (x2) must be a single-def `Movz`/`MovI` constant in
 ///   `1..=SROA_MEMCPY_FILL_MAX_BYTES`;
-/// * the call's return value (x0) must be unused: the instruction after the
-///   `Bl` must not copy PReg x0 out.
+/// * no architectural GPR is read after the call on any reachable path.
+///   This conservative condition protects both outputs and deleted argument
+///   setup, including captures created by an earlier SROA invocation.
 fn match_memcpy_fill(
     func: &MachFunction,
     def_of: &HashMap<VReg, InstId>,
@@ -1240,10 +1630,29 @@ fn match_memcpy_fill(
     let bl_id = insts[bl_pos];
     if func
         .inst(bl_id)
+        .flags
+        .contains(InstFlags::EXACT_MODULE_CALL)
+    {
+        return None;
+    }
+    // The symbol alone does not make the call C's `memcpy`: a source call of
+    // a function declared otherwise but named `memcpy` is an ordinary call
+    // to it (trust-cg-lower's `classify_adapter_direct_call`). Only the call
+    // instruction selection makes for a LIR `Memcpy` carries
+    // `LIBRARY_ROUTINE_CALL`.
+    if !func
+        .inst(bl_id)
+        .flags
+        .contains(InstFlags::LIBRARY_ROUTINE_CALL)
+    {
+        return None;
+    }
+    if func
+        .inst(bl_id)
         .operands
         .first()
         .and_then(|op| op.as_symbol())
-        != Some("memcpy")
+        != Some(trust_cg_lower::RuntimeSymbol::Memcpy.name())
     {
         return None;
     }
@@ -1265,7 +1674,7 @@ fn match_memcpy_fill(
     }
 
     // Parse the run: preg index -> source vreg, each preg exactly once.
-    let mut args: HashMap<trust_cg_ir::PReg, VReg> = HashMap::new();
+    let mut args: HashMap<trust_cg_ir::PReg, VReg> = HashMap::default();
     let mut arg_copies: Vec<InstId> = Vec::new();
     for &id in &insts[run_start..bl_pos] {
         let inst = func.inst(id);
@@ -1300,14 +1709,8 @@ fn match_memcpy_fill(
         return None;
     }
 
-    // The call's return value (dst in x0) must be unused.
-    if let Some(&after_id) = insts.get(bl_pos + 1) {
-        let after = func.inst(after_id);
-        if matches!(after.opcode, AArch64Opcode::Copy | AArch64Opcode::MovR)
-            && after.operands.get(1) == Some(&MachOperand::PReg(regs::X0))
-        {
-            return None;
-        }
+    if !memcpy_fill_gpr_uses_are_dead(func, block_id, bl_pos) {
+        return None;
     }
 
     Some(MemcpyFill {
@@ -1316,6 +1719,106 @@ fn match_memcpy_fill(
         src_vreg,
         len,
     })
+}
+
+/// Conservative call-deletion gate, deliberately not a reaching-def analysis.
+/// Any later architectural GPR read keeps the fill, even after an intervening
+/// definition. This remains effective after STR-to-MovR scalarization and later
+/// optimization rounds; checking only the next X0 copy is insufficient.
+fn memcpy_fill_gpr_uses_are_dead(
+    func: &MachFunction,
+    call_block: trust_cg_ir::BlockId,
+    call_pos: usize,
+) -> bool {
+    // Exceptional and computed edges require a different control-flow proof.
+    if !func.eh_metadata.call_sites.is_empty() || !func.jump_tables.is_empty() {
+        return false;
+    }
+    let layout: HashMap<_, _> = func
+        .block_order
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(position, block)| (block, position))
+        .collect();
+    if layout.len() != func.block_order.len() {
+        return false;
+    }
+    let mut work = vec![(call_block, call_pos + 1)];
+    let mut seen = HashSet::default();
+    while let Some((block_id, start)) = work.pop() {
+        if !seen.insert((block_id, start)) {
+            continue;
+        }
+        let Some(&position) = layout.get(&block_id) else {
+            return false;
+        };
+        let Some(block) = func.blocks.get(block_id.0 as usize) else {
+            return false;
+        };
+        if start > block.insts.len() {
+            return false;
+        }
+        let mut successors = block.succs.clone();
+        for (index, inst_id) in block.insts.iter().enumerate() {
+            let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                return false;
+            };
+            // Metadata alone can omit edges in raw MachIR. Union it with all
+            // explicit targets and possible layout fallthrough, as in the
+            // vectorizer's control_successors. Invalid targets fail closed.
+            for operand in &inst.operands {
+                if let MachOperand::Block(target) = operand {
+                    successors.push(*target);
+                }
+            }
+            if index < start {
+                continue;
+            }
+            if matches!(inst.opcode, AArch64Opcode::Br | AArch64Opcode::TailCall)
+                || (inst.opcode == AArch64Opcode::B
+                    && !inst
+                        .operands
+                        .iter()
+                        .any(|op| matches!(op, MachOperand::Block(_))))
+            {
+                return false;
+            }
+            let mut reads_gpr = inst
+                .implicit_uses
+                .iter()
+                .any(|value| matches!(value.encoding(), 0..=30 | 32..=62));
+            aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |operand| {
+                reads_gpr |= matches!(
+                    inst.operands
+                        .get(operand)
+                        .and_then(AccessRegister::store_source),
+                    Some(AccessRegister::Physical(_))
+                );
+            });
+            // A memory operand reads its base even in a def position. Match
+            // the shared pipeline's physical-read model, not just bare PRegs.
+            reads_gpr |= inst.operands.iter().any(|operand| {
+                matches!(operand, MachOperand::MemOp { base, .. }
+                    if matches!(base.encoding(), 0..=30 | 32..=62))
+            });
+            if reads_gpr {
+                return false;
+            }
+        }
+        let falls_through = block.insts.last().is_none_or(|id| {
+            let inst = func.inst(*id);
+            // Stale IS_RETURN flags on another opcode cannot hide an edge.
+            !inst.opcode.is_unconditional_branch() && inst.opcode != AArch64Opcode::Ret
+        });
+        if falls_through && let Some(next) = func.block_order.get(position + 1) {
+            successors.push(*next);
+        }
+        // The initial suffix and (block, 0) are distinct visited states: a
+        // backedge must examine reads in the original call block's prefix.
+        work.extend(successors.into_iter().map(|block| (block, 0)));
+    }
+    true
 }
 
 /// `v`'s single-def constant value from a canonical `Movz`/`MovI`, if any.
@@ -1364,15 +1867,16 @@ fn apply_rewrites(
     func: &mut MachFunction,
     rewrites: &[SlotRewrite],
     mut provenance: Option<&mut ProvenanceMap>,
+    debug_homes: &HashSet<StackSlotId>,
 ) -> bool {
     let mut changed = false;
     let pass = PassId::new("sroa");
 
     // Flatten "dead" instruction ids (roots + derived) into a single set so
     // one block pass can remove them all.
-    let mut dead: HashSet<InstId> = HashSet::new();
-    // Bump the function's vreg counter once, using the max of all rewrites.
-    let mut max_next = func.next_vreg;
+    let mut dead: HashSet<InstId> = HashSet::default();
+    // Every shadow register was allocated by `run_impl` before this runs, so
+    // the counter is already past them and the pushes below do not re-derive.
 
     // For partial-escape slots (#456), each STR must be preceded by a new
     // `MovR scalar_vreg, value` that mirrors the stored bytes into the shadow
@@ -1381,13 +1885,11 @@ fn apply_rewrites(
     // only pay the block rebuild cost once.
     //
     // Keyed by `original InstId` -> newly-allocated InstIds inserted before it.
-    let mut insert_before: HashMap<InstId, Vec<InstId>> = HashMap::new();
-    let mut transferred_dead: HashSet<InstId> = HashSet::new();
+    let mut insert_before: HashMap<InstId, Vec<InstId>> = HashMap::default();
+    let mut transferred_dead: HashSet<InstId> = HashSet::default();
 
     // Rewrite loads/stores first — this modifies `func.insts` in place.
     for rw in rewrites {
-        max_next = max_next.max(rw.next_vreg);
-
         for acc in &rw.accesses {
             let target_vreg = rw.scalar_vreg[&acc.byte_offset];
             let source_loc = sroa_access_source_loc(func, acc);
@@ -1405,10 +1907,7 @@ fn apply_rewrites(
                     // its destination def, corrupting the value. Reset to MovR's
                     // canonical flags rather than mutating opcode alone.
                     inst.flags = AArch64Opcode::MovR.default_flags();
-                    inst.operands = vec![
-                        MachOperand::VReg(acc.value_vreg),
-                        MachOperand::VReg(target_vreg),
-                    ];
+                    inst.operands = vec![acc.value.operand(), MachOperand::VReg(target_vreg)];
                     inst.source_loc = source_loc;
                     if let Some(provenance) = provenance.as_deref_mut() {
                         provenance.record_in_place_transform(acc.inst_id, pass.clone());
@@ -1423,10 +1922,7 @@ fn apply_rewrites(
                     // source mapping.
                     let mut mov = MachInst::new(
                         AArch64Opcode::MovR,
-                        vec![
-                            MachOperand::VReg(target_vreg),
-                            MachOperand::VReg(acc.value_vreg),
-                        ],
+                        vec![MachOperand::VReg(target_vreg), acc.value.operand()],
                     );
                     mov.source_loc = source_loc;
                     let new_id = func.push_inst(mov);
@@ -1438,20 +1934,25 @@ fn apply_rewrites(
                 }
             } else {
                 let inst = func.inst_mut(acc.inst_id);
+                // The ABI role of a load into a physical argument register
+                // (checked to be its only non-default flag in `finalise`).
+                let arg_setup_role = inst.flags.contains(InstFlags::IS_CALL_ARG_SETUP);
                 if acc.is_load {
-                    // LdrRI dst, base, imm -> MovR dst, scalar_vreg
-                    inst.opcode = AArch64Opcode::MovR;
-                    inst.operands = vec![
-                        MachOperand::VReg(acc.value_vreg),
-                        MachOperand::VReg(target_vreg),
-                    ];
+                    // LdrRI dst, base, imm -> MovR dst, scalar_vreg; a
+                    // physical destination becomes the `Copy preg <- vreg`
+                    // shape instruction selection gives every register
+                    // argument and result.
+                    inst.opcode = match acc.value {
+                        AccessRegister::Physical(_) => AArch64Opcode::Copy,
+                        AccessRegister::Virtual(_) => AArch64Opcode::MovR,
+                    };
+                    inst.operands = vec![acc.value.operand(), MachOperand::VReg(target_vreg)];
                 } else {
-                    // StrRI value, base, imm -> MovR scalar_vreg, value
+                    // StrRI value, base, imm -> MovR scalar_vreg, value.
+                    // Capture a physical source HERE, before any later ABI
+                    // clobber; never substitute that register at the load.
                     inst.opcode = AArch64Opcode::MovR;
-                    inst.operands = vec![
-                        MachOperand::VReg(target_vreg),
-                        MachOperand::VReg(acc.value_vreg),
-                    ];
+                    inst.operands = vec![MachOperand::VReg(target_vreg), acc.value.operand()];
                 }
                 // Promoting a load/store to a register move must also clear the
                 // stale memory flags (READS_MEMORY/WRITES_MEMORY|HAS_SIDE_EFFECTS)
@@ -1460,7 +1961,10 @@ fn apply_rewrites(
                 // by the regalloc adapter, which marks *all* operands as uses and
                 // therefore never inserts a spill store for the move's
                 // destination def — yielding reads of uninitialized stack slots.
-                inst.flags = AArch64Opcode::MovR.default_flags();
+                inst.flags = inst.opcode.default_flags();
+                if acc.is_load && arg_setup_role {
+                    inst.flags.insert(InstFlags::IS_CALL_ARG_SETUP);
+                }
                 inst.source_loc = source_loc;
                 if let Some(provenance) = provenance.as_deref_mut() {
                     let mut sources = vec![acc.inst_id];
@@ -1577,8 +2081,41 @@ fn apply_rewrites(
         }
     }
 
-    if max_next > func.next_vreg {
-        func.next_vreg = max_next;
+    // A fully promoted slot that no live instruction addresses any more holds
+    // no bytes anyone can observe. Retire it to the zero-byte form (the id is
+    // kept, so no operand is renumbered): frame layout reserves nothing for
+    // it, and a function whose only slot it was needs no stack adjustment.
+    //
+    // A slot a debug variable names as its home is NOT retired: the debug
+    // pipeline describes such a local by its frame slot and has no register
+    // location for a promoted one yet, so retiring it would turn the local
+    // into an optimized-out one. Kept, the slot still reads stale (its
+    // accesses were promoted); see the 2026-09-30 emitted-size report.
+    for rw in rewrites {
+        if rw.partial_escape
+            || func.stack_protector_slot == Some(rw.slot)
+            || debug_homes.contains(&rw.slot)
+        {
+            continue;
+        }
+        let Some(slot) = func.stack_slots.get(rw.slot.0 as usize) else {
+            continue;
+        };
+        if !slot.is_fixed_size() || slot.size == 0 {
+            continue;
+        }
+        let still_addressed = func.block_order.iter().any(|block_id| {
+            func.block(*block_id).insts.iter().any(|id| {
+                func.inst(*id)
+                    .operands
+                    .iter()
+                    .any(|op| matches!(op, MachOperand::StackSlot(s) if *s == rw.slot))
+            })
+        });
+        if !still_addressed {
+            func.stack_slots[rw.slot.0 as usize] = StackSlot::new(0, 1);
+            changed = true;
+        }
     }
 
     changed
@@ -1598,7 +2135,12 @@ fn sroa_access_source_loc(func: &MachFunction, acc: &Access) -> Option<trust_cg_
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "sroa_physical_register_tests.rs"]
+mod physical_register_tests;
+
+#[cfg(test)]
 mod tests {
+    mod eh_call_custody_tests;
     use super::*;
     use trust_cg_ir::{
         AArch64Opcode, BlockId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -1639,6 +2181,17 @@ mod tests {
         let id = func.push_inst(inst);
         func.append_inst(block, id);
         id
+    }
+
+    /// The `bl memcpy` instruction selection makes for a LIR `Memcpy`
+    /// (`InstFlags::LIBRARY_ROUTINE_CALL`), the only one the fill reads.
+    fn library_memcpy_call() -> MachInst {
+        let mut call = MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("memcpy".to_string())],
+        );
+        call.flags.insert(InstFlags::LIBRARY_ROUTINE_CALL);
+        call
     }
 
     fn assert_sroa_survived(provenance: &ProvenanceMap, trust_ir: TrustIrInstId, inst_id: InstId) {
@@ -1867,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn same_id_different_class_addr_def_use_does_not_block_sroa() {
+    fn same_id_different_class_addr_writer_refuses_sroa_unchanged() {
         use trust_cg_ir::regs::SP;
 
         let mut func = new_func();
@@ -1905,11 +2458,13 @@ mod tests {
         );
         push(&mut func, entry, MachInst::new(AArch64Opcode::Ret, vec![]));
 
+        let before = format!("{func:?}");
         let mut sroa = ScalarReplacementOfAggregates;
         assert!(
-            sroa.run(&mut func),
-            "same numeric id in another class must not block scalarization"
+            !sroa.run(&mut func),
+            "a W writer changes the X root's numeric register ID"
         );
+        assert_eq!(format!("{func:?}"), before);
 
         let block = func.block(entry);
         assert!(block.insts.contains(&decoy_def));
@@ -1920,8 +2475,13 @@ mod tests {
             block
                 .insts
                 .iter()
-                .any(|id| func.inst(*id).opcode == AArch64Opcode::MovR),
-            "the real Gpr64 stack access should still scalarize"
+                .any(|id| func.inst(*id).opcode == AArch64Opcode::AddPCRel)
+        );
+        assert!(
+            block
+                .insts
+                .iter()
+                .any(|id| func.inst(*id).opcode == AArch64Opcode::LdrRI)
         );
     }
 
@@ -2789,7 +3349,7 @@ mod tests {
         let mut sroa = ScalarReplacementOfAggregates;
         assert!(sroa.run(&mut func));
 
-        let mut scalar_ids: HashSet<u32> = HashSet::new();
+        let mut scalar_ids: HashSet<u32> = HashSet::default();
         for &inst_id in &func.block(entry).insts {
             let inst = func.inst(inst_id);
             if inst.opcode == AArch64Opcode::MovR
@@ -3066,14 +3626,7 @@ mod tests {
             entry,
             MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X3), g64(3)]),
         );
-        let bl = push(
-            &mut func,
-            entry,
-            MachInst::new(
-                AArch64Opcode::Bl,
-                vec![MachOperand::Symbol("memcpy".to_string())],
-            ),
-        );
+        let bl = push(&mut func, entry, library_memcpy_call());
         // Element accesses: loads at offsets 0 and 4 (Gpr32 lanes).
         let addr4 = push(
             &mut func,
@@ -3143,6 +3696,56 @@ mod tests {
         let _ = bl;
     }
 
+    /// The same fill through a `bl memcpy` that is only named so (no
+    /// `LIBRARY_ROUTINE_CALL`: trust-cg-lower lowered a `memcpy` declared
+    /// otherwise than C's as an ordinary call of it) is not a fill: the call
+    /// stays, and the slot it is handed is not promoted.
+    #[test]
+    fn a_call_only_named_memcpy_is_not_a_fill() {
+        use trust_cg_ir::regs::{SP, X0, X1, X2, X3};
+        for library in [true, false] {
+            let mut func = new_func();
+            let entry = func.entry;
+            let slot = with_slot(&mut func, 16, 4);
+            func.next_vreg = 40;
+            let mut call = library_memcpy_call();
+            if !library {
+                call.flags.remove(InstFlags::LIBRARY_ROUTINE_CALL);
+            }
+            let body = vec![
+                MachInst::new(AArch64Opcode::Copy, vec![g64(1), MachOperand::PReg(X1)]),
+                MachInst::new(
+                    AArch64Opcode::AddPCRel,
+                    vec![g64(10), MachOperand::PReg(SP), MachOperand::StackSlot(slot)],
+                ),
+                MachInst::new(AArch64Opcode::Movz, vec![g64(2), imm(16)]),
+                MachInst::new(AArch64Opcode::Movz, vec![g64(3), imm(0)]),
+                MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X0), g64(10)]),
+                MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X1), g64(1)]),
+                MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X2), g64(2)]),
+                MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X3), g64(3)]),
+                call,
+                MachInst::new(AArch64Opcode::AddRI, vec![g64(11), g64(10), imm(4)]),
+                MachInst::new(AArch64Opcode::LdrRI, vec![g32(20), g64(10), imm(0)]),
+                MachInst::new(AArch64Opcode::LdrRI, vec![g32(21), g64(11), imm(0)]),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ];
+            let ids: Vec<InstId> = body
+                .into_iter()
+                .map(|inst| push(&mut func, entry, inst))
+                .collect();
+            let bl = ids[8];
+            let mut sroa = ScalarReplacementOfAggregates;
+            let promoted = sroa.run(&mut func);
+            let kept = func.block(entry).insts.contains(&bl);
+            assert_eq!(
+                (promoted, kept),
+                (library, !library),
+                "LIBRARY_ROUTINE_CALL: {library}"
+            );
+        }
+    }
+
     /// A memcpy whose length is NOT a lane multiple of the accessed widths
     /// (len 6 vs 4-byte accesses) must fail the whole slot closed.
     #[test]
@@ -3197,14 +3800,7 @@ mod tests {
             entry,
             MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X3), g64(3)]),
         );
-        push(
-            &mut func,
-            entry,
-            MachInst::new(
-                AArch64Opcode::Bl,
-                vec![MachOperand::Symbol("memcpy".to_string())],
-            ),
-        );
+        push(&mut func, entry, library_memcpy_call());
         push(
             &mut func,
             entry,
@@ -3451,6 +4047,209 @@ mod tests {
             !sroa.run(&mut func),
             "SROA must not erase byte truncation/extension semantics"
         );
+    }
+
+    /// How the field address `root + 8` of a 16-byte `(i64, i64)` slot is
+    /// formed in [`constant_register_field_address`].
+    #[derive(Clone, Copy)]
+    enum FieldAddress {
+        /// `AddRR v11, v10, v12` with `v12 = Movz #8`.
+        RootPlusMovz,
+        /// `AddRR v11, v12, v10` with `v12 = MovI #8`.
+        MovIPlusRoot,
+        /// `AddRR v11, v10, v12` with `v12` loaded from memory.
+        RootPlusLoaded,
+        /// `AddRR v11, v10, v12` with `v12 = Movz #8` and a second def of `v12`.
+        RootPlusTwiceDefined,
+        /// `AddRR v11, v10, v10`: the address added to itself.
+        RootPlusRoot,
+    }
+
+    /// `(i64, i64)` slot: store field 0, store field 1 through the
+    /// `FieldAddress` form, load field 1, return. Returns the function.
+    fn constant_register_field_address(form: FieldAddress) -> MachFunction {
+        use trust_cg_ir::regs::SP;
+
+        let mut func = new_func();
+        let entry = func.entry;
+        let slot = with_slot(&mut func, 16, 8);
+        func.next_vreg = 20;
+        push(
+            &mut func,
+            entry,
+            MachInst::new(
+                AArch64Opcode::AddPCRel,
+                vec![g64(10), MachOperand::PReg(SP), MachOperand::StackSlot(slot)],
+            ),
+        );
+        let (k_op, a, b) = match form {
+            FieldAddress::RootPlusMovz | FieldAddress::RootPlusTwiceDefined => {
+                (AArch64Opcode::Movz, g64(10), g64(12))
+            }
+            FieldAddress::MovIPlusRoot => (AArch64Opcode::MovI, g64(12), g64(10)),
+            FieldAddress::RootPlusLoaded => (AArch64Opcode::LdrRI, g64(10), g64(12)),
+            FieldAddress::RootPlusRoot => (AArch64Opcode::Movz, g64(10), g64(10)),
+        };
+        if k_op == AArch64Opcode::LdrRI {
+            push(
+                &mut func,
+                entry,
+                MachInst::new(AArch64Opcode::LdrRI, vec![g64(12), g64(3), imm(0)]),
+            );
+        } else {
+            push(&mut func, entry, MachInst::new(k_op, vec![g64(12), imm(8)]));
+        }
+        if matches!(form, FieldAddress::RootPlusTwiceDefined) {
+            push(
+                &mut func,
+                entry,
+                MachInst::new(AArch64Opcode::Movz, vec![g64(12), imm(0)]),
+            );
+        }
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::AddRR, vec![g64(11), a, b]),
+        );
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::StrRI, vec![g64(0), g64(10), imm(0)]),
+        );
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::StrRI, vec![g64(1), g64(11), imm(0)]),
+        );
+        push(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::LdrRI, vec![g64(2), g64(11), imm(0)]),
+        );
+        push(&mut func, entry, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func
+    }
+
+    #[test]
+    fn constant_register_field_address_is_sroa_eliminated() {
+        // The `AddRI root, #8` field address after GVN reused an equal
+        // constant register, in either operand order.
+        for form in [FieldAddress::RootPlusMovz, FieldAddress::MovIPlusRoot] {
+            let mut func = constant_register_field_address(form);
+            let entry = func.entry;
+            assert!(ScalarReplacementOfAggregates.run(&mut func));
+            let kinds: Vec<AArch64Opcode> = func
+                .block(entry)
+                .insts
+                .iter()
+                .map(|id| func.inst(*id).opcode)
+                .collect();
+            for gone in [
+                AArch64Opcode::AddPCRel,
+                AArch64Opcode::AddRR,
+                AArch64Opcode::LdrRI,
+                AArch64Opcode::StrRI,
+            ] {
+                assert!(!kinds.contains(&gone), "{gone:?} must be rewritten away");
+            }
+            // The load of field 1 reads the value stored to field 1 (`v1`).
+            assert!(func.block(entry).insts.iter().any(|id| {
+                let inst = func.inst(*id);
+                inst.opcode == AArch64Opcode::MovR && inst.operands.first() == Some(&g64(2))
+            }));
+        }
+    }
+
+    #[test]
+    fn non_constant_register_field_address_disables_sroa() {
+        // A loaded offset, a twice-defined "constant" and the address added to
+        // itself are not `root + #k`: the slot escapes.
+        for form in [
+            FieldAddress::RootPlusLoaded,
+            FieldAddress::RootPlusTwiceDefined,
+            FieldAddress::RootPlusRoot,
+        ] {
+            let mut func = constant_register_field_address(form);
+            assert!(!ScalarReplacementOfAggregates.run(&mut func));
+        }
+    }
+
+    #[test]
+    fn constant_register_field_address_refuses_w_view_writer_with_source_capture_unchanged() {
+        use trust_cg_ir::{LoweringProvenance, SourceInstDigest, SourceInstId};
+
+        // The new AddRR ingress must not treat Xv12 as a single-def #8
+        // when Wv12 also writes its numeric ID. With Wv12 = 0 the derived
+        // store aliases field0, so a later root load observes v1, not v0.
+        // An unchanged-value W write still refuses: no alias-value proof is
+        // established here. Ordinary single-writer positives remain above.
+        for swapped in [false, true] {
+            for value in [0, 8, 16] {
+                let mut func = constant_register_field_address(if swapped {
+                    FieldAddress::MovIPlusRoot
+                } else {
+                    FieldAddress::RootPlusMovz
+                });
+                let entry = func.entry;
+                let add_pos = func
+                    .block(entry)
+                    .insts
+                    .iter()
+                    .position(|&id| func.inst(id).opcode == AArch64Opcode::AddRR)
+                    .unwrap();
+                let writer = func.push_inst(MachInst::new(
+                    AArch64Opcode::Movz,
+                    vec![g32(12), imm(value)],
+                ));
+                func.block_mut(entry).insts.insert(add_pos, writer);
+                let root_load = func.push_inst(MachInst::new(
+                    AArch64Opcode::LdrRI,
+                    vec![g64(4), g64(10), imm(0)],
+                ));
+                let ret_pos = func.block(entry).insts.len() - 1;
+                func.block_mut(entry).insts.insert(ret_pos, root_load);
+                let mut provenance = ProvenanceMap::new();
+                for index in 0..func.insts.len() {
+                    let id = InstId(index as u32);
+                    let origin = TrustIrInstId(index as u32 + 100);
+                    func.set_inst_lowering_provenance(
+                        id,
+                        LoweringProvenance::SourceInst {
+                            id: SourceInstId {
+                                block: 0,
+                                index: index as u32,
+                            },
+                            digest: SourceInstDigest::compute("fixture-source", 1, 1),
+                            trust_ir_inst: Some(origin),
+                        },
+                    );
+                    func.inst_mut(id).source_loc = Some(source_loc(index as u32 + 20));
+                    provenance.record_lowering(origin, &[id], PassId::new("original-isel"));
+                }
+                let before = func.clone();
+                let original_provenance = provenance.clone();
+                let mut plain = before.clone();
+                assert!(!ScalarReplacementOfAggregates.run(&mut plain));
+                assert_eq!(format!("{plain:?}"), format!("{before:?}"));
+                assert!(
+                    !ScalarReplacementOfAggregates.run_with_provenance(&mut func, &mut provenance,)
+                );
+                assert_eq!(format!("{func:?}"), format!("{before:?}"));
+                for index in 0..before.insts.len() {
+                    let id = InstId(index as u32);
+                    let actual = provenance.get_entry(id).unwrap();
+                    let expected = original_provenance.get_entry(id).unwrap();
+                    assert_eq!(actual.trust_ir_origins, expected.trust_ir_origins);
+                    assert_eq!(actual.transforms, expected.transforms);
+                    assert_eq!(actual.status, expected.status);
+                    let origin = TrustIrInstId(index as u32 + 100);
+                    assert_eq!(
+                        provenance.get_mach_insts(origin),
+                        original_provenance.get_mach_insts(origin)
+                    );
+                }
+            }
+        }
     }
 
     /// Address arithmetic is untrusted input to this pass. Overflow must make
@@ -3868,5 +4667,206 @@ mod tests {
             assert_eq!(func.insts.len(), insts, "run {again} added instructions");
             assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
         }
+    }
+
+    /// The dominator computation the pass used before [`Dominators`], kept
+    /// verbatim as the oracle.
+    fn reference_dominators(func: &MachFunction) -> HashMap<BlockId, HashSet<BlockId>> {
+        let all_blocks: HashSet<BlockId> = func.block_order.iter().copied().collect();
+        let entry = func.entry;
+        let mut dominators: HashMap<BlockId, HashSet<BlockId>> = HashMap::default();
+        for block_id in &func.block_order {
+            if *block_id == entry {
+                dominators.insert(*block_id, HashSet::from_iter([entry]));
+            } else {
+                dominators.insert(*block_id, all_blocks.clone());
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block_id in &func.block_order {
+                if *block_id == entry {
+                    continue;
+                }
+                let preds = &func.block(*block_id).preds;
+                let mut next = if let Some((first, rest)) = preds.split_first() {
+                    let mut intersection = dominators.get(first).cloned().unwrap_or_default();
+                    for pred in rest {
+                        if let Some(pred_doms) = dominators.get(pred) {
+                            intersection.retain(|candidate| pred_doms.contains(candidate));
+                        } else {
+                            intersection.clear();
+                        }
+                    }
+                    intersection
+                } else {
+                    HashSet::default()
+                };
+                next.insert(*block_id);
+                if dominators.get(block_id) != Some(&next) {
+                    dominators.insert(*block_id, next);
+                    changed = true;
+                }
+            }
+        }
+        dominators
+    }
+
+    /// The position lookup the pass used before [`FunctionFacts::position`].
+    fn reference_position(func: &MachFunction, inst_id: InstId) -> Option<(BlockId, usize)> {
+        for block_id in &func.block_order {
+            let block = func.block(*block_id);
+            if let Some(index) = block.insts.iter().position(|id| *id == inst_id) {
+                return Some((*block_id, index));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn shared_function_facts_equal_the_per_plan_computations() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |bound: u32| -> u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(bound.max(1))) as u32
+        };
+        for _case in 0..3000 {
+            let mut func = MachFunction::new("f".to_string(), Signature::new(vec![], vec![]));
+            let n_blocks = 1 + next(70) as usize;
+            while func.blocks.len() < n_blocks {
+                func.create_block();
+            }
+            // Random edges, including self loops and blocks no path reaches.
+            for _ in 0..next(3 * n_blocks as u32 + 1) {
+                let from = BlockId(next(n_blocks as u32));
+                let to = BlockId(next(n_blocks as u32));
+                func.add_edge(from, to);
+            }
+            // A predecessor outside `block_order`, an entry that is not first
+            // or not listed, and a repeated `block_order` entry.
+            match next(5) {
+                0 => {
+                    let removed = next(n_blocks as u32);
+                    func.block_order.retain(|b| b.0 != removed);
+                }
+                1 => func.entry = BlockId(next(n_blocks as u32)),
+                2 => {
+                    let again = func.block_order[next(n_blocks as u32) as usize];
+                    func.block_order.push(again);
+                }
+                3 => func.block_order.reverse(),
+                _ => {}
+            }
+            let reference = reference_dominators(&func);
+            let dominators = Dominators::compute(&func);
+            for b in 0..n_blocks as u32 {
+                let b = BlockId(b);
+                match (reference.get(&b), dominators.get(b)) {
+                    (None, None) => {}
+                    (Some(expected), Some(row)) => {
+                        for a in 0..n_blocks as u32 + 2 {
+                            let a = BlockId(a);
+                            assert_eq!(expected.contains(&a), dominators.set_contains(row, a));
+                        }
+                    }
+                    (expected, got) => {
+                        panic!(
+                            "block {b:?}: reference {expected:?}, table {:?}",
+                            got.is_some()
+                        )
+                    }
+                }
+            }
+            // Instructions: ids placed in random blocks, some twice, some nowhere.
+            let n_insts = next(40);
+            for i in 0..n_insts {
+                if next(4) != 0 {
+                    let b = next(n_blocks as u32) as usize;
+                    func.blocks[b].insts.push(InstId(i));
+                }
+            }
+            let facts = FunctionFacts::new(&func, HashSet::default());
+            for i in 0..n_insts + 3 {
+                assert_eq!(
+                    facts.position(InstId(i)),
+                    reference_position(&func, InstId(i))
+                );
+            }
+        }
+    }
+
+    /// `FunctionFacts::users_of` lists exactly what the per-vreg scan it
+    /// replaced (`collect_users_of`) lists, in the same order: random
+    /// functions whose instructions read and write a few vregs of two classes
+    /// (same id, different class must not collide) through opcodes with
+    /// different operand-role tables, some instructions listed twice or in a
+    /// block outside `block_order`.
+    #[test]
+    fn users_index_equals_the_per_vreg_scan() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |bound: u32| -> u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(bound.max(1))) as u32
+        };
+        let opcodes = [
+            AArch64Opcode::AddRI,
+            AArch64Opcode::AddRR,
+            AArch64Opcode::MovR,
+            AArch64Opcode::Copy,
+            AArch64Opcode::StrRI,
+            AArch64Opcode::LdrRI,
+            AArch64Opcode::CmpRR,
+            AArch64Opcode::LdrPreIndex,
+            AArch64Opcode::StrPostIndex,
+            AArch64Opcode::LdpRI,
+            AArch64Opcode::StpPreIndex,
+            AArch64Opcode::Cas,
+            AArch64Opcode::Ldadd,
+            AArch64Opcode::Movk,
+            AArch64Opcode::Bl,
+        ];
+        let mut compared = 0usize;
+        for _case in 0..2000 {
+            let mut func = new_func();
+            let n_blocks = 1 + next(6) as usize;
+            while func.blocks.len() < n_blocks {
+                func.create_block();
+            }
+            let n_insts = next(30);
+            for _ in 0..n_insts {
+                let opcode = opcodes[next(opcodes.len() as u32) as usize];
+                let operands = (0..next(5))
+                    .map(|_| match next(4) {
+                        0 => imm(i64::from(next(9))),
+                        1 => g32(next(6)),
+                        _ => g64(next(6)),
+                    })
+                    .collect();
+                let block = BlockId(next(n_blocks as u32));
+                let id = push(&mut func, block, MachInst::new(opcode, operands));
+                if next(8) == 0 {
+                    let again = BlockId(next(n_blocks as u32));
+                    func.blocks[again.0 as usize].insts.push(id);
+                }
+            }
+            if next(3) == 0 && func.block_order.len() > 1 {
+                func.block_order.pop();
+            }
+            let facts = FunctionFacts::new(&func, HashSet::default());
+            for id in 0..7 {
+                for class in [RegClass::Gpr32, RegClass::Gpr64, RegClass::Fpr64] {
+                    let v = VReg::new(id, class);
+                    let expected = collect_users_of(&func, v);
+                    compared += expected.len();
+                    assert_eq!(facts.users_of(v), expected.as_slice(), "{v:?}");
+                }
+            }
+        }
+        assert!(compared > 10_000, "{compared}");
     }
 }

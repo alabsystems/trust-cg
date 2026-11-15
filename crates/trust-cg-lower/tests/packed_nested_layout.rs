@@ -56,7 +56,6 @@
 //! producer states no offsets for them), and a NON-packed container of a packed
 //! struct (the repr-blindness of `Type::bytes`/`align`/`offset_of` themselves).
 
-use trust_cg_lower::adapter::translate_function;
 use trust_cg_lower::instructions::Opcode;
 use trust_cg_lower::types::Type;
 use trust_ir::{
@@ -87,6 +86,7 @@ fn f(name: &str, ty: Ty) -> FieldDef {
 
 fn sdef(id: u32, name: &str, repr: StructRepr, fields: Vec<FieldDef>) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(id),
         name: name.to_string(),
         fields,
@@ -131,25 +131,31 @@ fn packed_structs() -> Vec<StructDef> {
 fn module_with_body(params: Vec<(ValueId, Ty)>, body: Vec<InstrNode>) -> TrustIrModule {
     let mut module = TrustIrModule::new("packed_nested");
     module.structs = packed_structs();
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: params.iter().map(|(_, t)| t.clone()).collect(),
-        returns: vec![],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: params.iter().map(|(_, t)| t.clone()).collect(),
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "k", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
         params,
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn opcodes(module: &TrustIrModule) -> Vec<Opcode> {
     let func = module.functions.first().expect("one function");
     let (lir_func, _proofs) =
-        translate_function(func, module).expect("adapter must lower the fixture");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter must lower the fixture");
     let entry = lir_func.entry_block;
     lir_func.blocks[&entry]
         .instructions
@@ -244,22 +250,19 @@ fn field_after_a_nested_packed_field_sits_at_rustcs_offset() {
 /// covers bytes 1..17 — it would destroy `t` and the two bytes past it.
 #[test]
 fn insert_of_a_nested_packed_field_copies_only_its_packed_extent() {
+    // The VALUE form (WS7.1): the base is a `Trail` value. (This fixture used
+    // to insert through an `Alloca` pointer — the store form, which is invalid
+    // trust-ir and now refused by name.)
     let module = module_with_body(
-        vec![(v(0), Ty::Ptr), (v(1), st(0))],
+        vec![(v(0), st(2)), (v(1), st(0))],
         vec![
-            InstrNode::new(Inst::Alloca {
-                ty: st(2),
-                count: None,
-                align: None,
-            })
-            .with_result(v(2)),
             InstrNode::new(Inst::InsertField {
                 ty: st(2),
-                aggregate: v(2),
+                aggregate: v(0),
                 field: 1,
                 value: v(1),
             })
-            .with_result(v(3)),
+            .with_result(v(2)),
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     );
@@ -270,9 +273,10 @@ fn insert_of_a_nested_packed_field_copies_only_its_packed_extent() {
     );
     assert_eq!(
         iconsts(&ops),
-        vec![1, 9],
-        "field offset 1 then a 9-byte copy — `P`'s packed extent. A natural-C 16 would \
-         overwrite `t`, which the layout repair moved from byte 17 to rustc's byte 10"
+        vec![11, 1, 9],
+        "the result's private copy of `Trail` (its packed extent 11), then field offset 1 \
+         then a 9-byte copy — `P`'s packed extent. A natural-C 16 would overwrite `t`, \
+         which the layout repair moved from byte 17 to rustc's byte 10"
     );
 }
 
@@ -327,7 +331,9 @@ fn the_stack_slot_for_a_nested_packed_struct_stays_at_the_natural_c_size() {
         ],
     );
     let func = module.functions.first().expect("one function");
-    let (lir_func, _proofs) = translate_function(func, &module).expect("adapter must lower");
+    let (lir_func, _proofs) =
+        trust_cg_lower::translate_function_with_license(func, &module, &permit_unlicensed())
+            .expect("adapter must lower");
     assert_eq!(
         (lir_func.stack_slots[0].size, lir_func.stack_slots[0].align),
         (24, 8),
@@ -374,11 +380,14 @@ fn array_of_packed_elements_contributes_rustcs_extent() {
         vec![f("h", Ty::U8), f("arr", Ty::Array(elem_ty_id, 2))],
     ));
     module.structs = structs;
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I64],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I64],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "k", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -394,7 +403,9 @@ fn array_of_packed_elements_contributes_rustcs_extent() {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     assert_eq!(
         iconsts(&opcodes(&module)),
@@ -430,11 +441,14 @@ fn non_packed_container_of_a_packed_struct_is_still_laid_out_natural_c() {
     ));
     let mut module = TrustIrModule::new("outer");
     module.structs = structs;
-    let fty_id: FuncTyId = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I64],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let fty_id: FuncTyId = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I64],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "k", fty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -450,7 +464,9 @@ fn non_packed_container_of_a_packed_struct_is_still_laid_out_natural_c() {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     assert_eq!(
         iconsts(&opcodes(&module)),
@@ -461,4 +477,13 @@ fn non_packed_container_of_a_packed_struct_is_still_laid_out_natural_c() {
     // And the field offset it emits is the natural-C 8, not rustc's 1.
     let lir = Type::Struct(vec![Type::I8, Type::Struct(vec![Type::I8, Type::I64])]);
     assert_eq!(lir.offset_of(1), Some(8));
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

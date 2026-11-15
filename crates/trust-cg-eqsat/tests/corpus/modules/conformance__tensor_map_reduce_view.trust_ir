@@ -1,0 +1,15 @@
+; TrustIr text format v1
+module "tensor_map_reduce_view"
+target "aarch64-apple-darwin" 8 little structpass=unclassified
+
+functy.0 = (tensor<i32, 2>, tensor<i32, 2>, usize, i32) -> (tensor<i32, 1>)
+
+fn @mrv(functy.0) {
+    ; #body-gate: ungated
+bb0(%0: tensor<i32, 2>, %1: tensor<i32, 2>, %2: usize, %3: i32):
+    %4 = const i32 0
+    %5 = tensor_map tensor<i32, 2> (%0, %1, %4) { add i32 $0, $1; neg i32 $3; icmp sgt i32 $4, $2; select i32 $5, $4, $2; trunc i32 $6 to i8; sext i8 $7 to i32 }
+    %6 = tensor_reduce add tensor<i32, 1> %5 axes [1] order row_major
+    %7 = tensor_view tensor<i32, 1> %6 params [%2] exprs [src_extent(0), param(0), add($0, $1), coord(0), sub($3, $1)] shape [$2] index [$4] fill %3
+    ret %7
+}

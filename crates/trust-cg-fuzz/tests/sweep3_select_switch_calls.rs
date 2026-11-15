@@ -86,6 +86,7 @@ fn jit_run(
 
     let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Compiler::new(cfg)
+            .with_codegen_license(permit_unlicensed())
             .compile_module_to_jit(module, &externs)
             .map_err(Box::new)
     }));
@@ -290,7 +291,7 @@ fn build_select_of_call_results() -> trust_ir::Module {
     let r = fb.select(Ty::I64, cond, ra, rb);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -403,7 +404,7 @@ fn build_switch_arms_call() -> trust_ir::Module {
     fb.switch_to_block(merge);
     fb.ret(vec![m_r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_switch_arms_call(r: &[i64; 4]) -> i64 {
@@ -577,7 +578,7 @@ fn build_switch_in_loop_call() -> trust_ir::Module {
     fb.switch_to_block(exit);
     fb.ret(vec![e_acc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -672,7 +673,7 @@ fn build_phi_of_calls_many_preds() -> trust_ir::Module {
     let fin = fb.call(finalizer, vec![m_phi, a, b, c]);
     fb.ret(vec![fin]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_leaf(j: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
@@ -791,7 +792,7 @@ fn build_condbr_tree_calls() -> trust_ir::Module {
     fb.switch_to_block(merge);
     fb.ret(vec![m_phi]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_tleaf(j: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
@@ -906,7 +907,7 @@ fn build_select_cond_and_arms_calls() -> trust_ir::Module {
     let r = fb.select(Ty::I64, cond, x, y);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_select_cond_and_arms(r: &[i64; 4]) -> i64 {
@@ -1031,7 +1032,7 @@ fn build_sparse_switch_default_call() -> trust_ir::Module {
     fb.switch_to_block(merge);
     fb.ret(vec![m_r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_sparse_switch_default_call(r: &[i64; 4]) -> i64 {
@@ -1129,7 +1130,7 @@ fn build_sparse_switch_neg_case_min() -> trust_ir::Module {
     let zero = fb.iconst(Ty::I64, 0);
     fb.ret(vec![zero]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_sparse_switch_neg_case_min(b: i64) -> i64 {
@@ -1270,7 +1271,7 @@ fn build_switch_shared_targets_call() -> trust_ir::Module {
     fb.switch_to_block(merge);
     fb.ret(vec![m_r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_switch_shared_targets_call(r: &[i64; 4]) -> i64 {
@@ -1419,7 +1420,7 @@ fn build_nested_switch_calls() -> trust_ir::Module {
     fb.switch_to_block(merge);
     fb.ret(vec![m_r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn nested_g(tag: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
@@ -1556,7 +1557,7 @@ fn build_condbr_call_predicates() -> trust_ir::Module {
     fb.switch_to_block(merge);
     fb.ret(vec![m_r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_pred(salt: i64, a: i64, b: i64, c: i64, d: i64) -> i64 {
@@ -1655,7 +1656,7 @@ fn build_select_call_args() -> trust_ir::Module {
     let out = fb.select(Ty::I64, rneg, r2call, r);
     fb.ret(vec![out]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_select_call_args(r: &[i64; 4]) -> i64 {
@@ -1821,7 +1822,7 @@ fn build_data_dependent_switch_loop() -> trust_ir::Module {
     fb.switch_to_block(exit);
     fb.ret(vec![e_acc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn ref_data_dependent_switch_loop(r: &[i64; 4]) -> i64 {
@@ -1847,4 +1848,13 @@ fn data_dependent_switch_loop() {
         &m,
         ref_data_dependent_switch_loop,
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

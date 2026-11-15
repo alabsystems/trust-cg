@@ -20,7 +20,7 @@ fn build_answer_module(module_name: &str, function_name: &str) -> trust_ir::Modu
     let answer = fb.iconst(Ty::I64, 42);
     fb.ret(vec![answer]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_linear_branchy_module(module_name: &str, function_name: &str) -> trust_ir::Module {
@@ -47,7 +47,7 @@ fn build_linear_branchy_module(module_name: &str, function_name: &str) -> trust_
     fb.ret(vec![answer]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_constant_conditional_module(module_name: &str, function_name: &str) -> trust_ir::Module {
@@ -73,7 +73,7 @@ fn build_constant_conditional_module(module_name: &str, function_name: &str) -> 
     fb.ret(vec![nine]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_late_call_module() -> trust_ir::Module {
@@ -97,7 +97,7 @@ fn build_late_call_module() -> trust_ir::Module {
     caller.ret(vec![called]);
     caller.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_late_f64_const_module() -> trust_ir::Module {
@@ -112,12 +112,13 @@ fn build_late_f64_const_module() -> trust_ir::Module {
     let value = fb.fconst(Ty::F64, 3.5);
     fb.ret(vec![value]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn assert_profile_hooks_unsupported(mode: ProfileHookMode) {
     let module = build_answer_module("x86_64_host_jit_unsupported_profile", "answer");
     let err = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(&module, &HashMap::new(), mode)
         .expect_err("x86-64 host JIT must reject unsupported profile hooks");
 
@@ -148,6 +149,7 @@ fn x86_64_raw_compile_raw_rejects_block_counts_profile_hooks() {
 fn x86_64_host_jit_accepts_block_counts_profile_hooks() {
     let module = build_linear_branchy_module("x86_64_host_jit_block_counts_profile", "linear");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(
             &module,
             &HashMap::new(),
@@ -184,6 +186,7 @@ fn x86_64_host_jit_block_counts_profile_hooks_count_conditional_targets() {
         "selective",
     );
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(
             &module,
             &HashMap::new(),
@@ -217,6 +220,7 @@ fn x86_64_host_jit_block_counts_profile_hooks_count_conditional_targets() {
 fn x86_64_host_jit_block_counts_preserve_late_call_fixup() {
     let module = build_late_call_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(
             &module,
             &HashMap::new(),
@@ -242,6 +246,7 @@ fn x86_64_host_jit_block_counts_preserve_late_call_fixup() {
 fn x86_64_host_jit_block_counts_preserve_late_rip_const_pool_fixup() {
     let module = build_late_f64_const_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(
             &module,
             &HashMap::new(),
@@ -276,6 +281,7 @@ fn x86_64_host_jit_rejects_call_counts_and_timing_profile_hooks() {
 fn x86_64_host_jit_accepts_call_counts_profile_hooks() {
     let module = build_answer_module("x86_64_host_jit_call_counts_profile", "profiled_answer");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(
             &module,
             &HashMap::new(),
@@ -294,4 +300,15 @@ fn x86_64_host_jit_accepts_call_counts_profile_hooks() {
     assert_eq!(profiled_answer(), 42);
     assert_eq!(profiled_answer(), 42);
     assert_eq!(result.buffer.entry_count("profiled_answer"), Some(2));
+}
+
+/// This file's modules are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so no test
+/// passes (or fails by name, as the profile-hook refusals assert) because it
+/// was silently refused. The file runs only on an x86-64 host, so a Darwin
+/// AArch64 landing never sees it.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

@@ -1,5 +1,11 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/darwin_native_prerequisites.rs"]
+mod darwin_native;
+#[path = "support/positive_evidence.rs"]
+mod positive_evidence;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Runtime oracle for rustc_codegen_trust_cg scalar aggregate, reference, and union
 // semantics.
@@ -10,69 +16,14 @@ mod target_dir_support;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Command, ExitStatus, Output};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 static RUNTIME_ORACLE_LOCK: Mutex<()> = Mutex::new(());
 
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let dylib_name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&dylib_name),
-        target_dir.join("debug").join(&dylib_name),
-    ];
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.clone();
-        }
-    }
-
-    let pinned_cargo_toolchain = format!("+{}", pinned_toolchain());
-    let status = Command::new("cargo")
-        .arg(pinned_cargo_toolchain)
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run reference-union test"
-    );
-
-    let built = target_dir.join("release").join(&dylib_name);
-    assert!(
-        built.exists(),
-        "expected dylib at {:?} but it was not produced",
-        built
-    );
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
@@ -112,16 +63,14 @@ fn compile_backend_source_to(
         s.push(&dylib);
         s
     };
-    let toolchain = pinned_toolchain();
-    let output = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .arg(&backend_arg)
         .args(extra_args)
         .arg("-o")
         .arg(&out_bin)
         .arg(&src_path)
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
 
     let _ = std::fs::remove_file(&src_path);
 
@@ -140,15 +89,13 @@ fn compile_pinned_source_to(
     extra_args: &[OsString],
 ) -> BackendCompile {
     let src_path = write_temp_source(stem, src);
-    let toolchain = pinned_toolchain();
-    let output = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(extra_args)
         .arg("-o")
         .arg(&out_bin)
         .arg(&src_path)
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
 
     let _ = std::fs::remove_file(&src_path);
 
@@ -160,36 +107,10 @@ fn compile_pinned_source_to(
     }
 }
 
-/// True while the aarch64 Mach-O object-relocation Certified composition
-/// has not landed (ObjectRelocationProofRegistry::aarch64_macho_production()
-/// is deliberately empty): every backend compile on this host fails
-/// promotion with TCG-PROOF-465/object-relocation-inventory. When the
-/// lanes register, this returns false and the original capability
-/// assertions below resume automatically — nothing to un-ignore.
-fn aarch64_macho_promotion_ratchet(stderr: &str) -> bool {
-    cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && stderr.contains("TCG-PROOF-465")
-        && stderr.contains("object relocation inventory")
-}
-
-/// If a backend compile failed on the promotion ratchet, assert the
-/// diagnostic still has the documented fail-closed shape and tell the
-/// caller to return early instead of asserting pre-ratchet capabilities.
-fn backend_compile_hit_promotion_ratchet(compiled: &BackendCompile) -> bool {
-    if compiled.status.success() || !aarch64_macho_promotion_ratchet(&compiled.stderr) {
-        return false;
-    }
-    assert!(
-        compiled.stderr.contains("proof promotion rejected")
-            && compiled
-                .stderr
-                .contains("no object relocation proof is registered"),
-        "promotion ratchet diagnostic lost its documented fail-closed shape. \
-         stderr: <<<{stderr}>>>",
-        stderr = compiled.stderr
-    );
-    true
-}
+// Every backend compile below runs in the default (certificates-on) lane, and a
+// refusal of any kind fails the test. On aarch64-apple-darwin a proof-promotion
+// refusal (`[TCG-PROOF-465]`) used to be an accepted early return, which passed
+// these oracles without running them (ledger L06-P10).
 
 fn assert_backend_source_compiles(stem: &str, src: &str) {
     let compiled = compile_backend_source(stem, src);
@@ -197,9 +118,6 @@ fn assert_backend_source_compiles(stem: &str, src: &str) {
     eprintln!("rustc stderr:\n{}", compiled.stderr);
     eprintln!("rustc exit: {:?}", compiled.status);
 
-    if backend_compile_hit_promotion_ratchet(&compiled) {
-        return;
-    }
     assert!(
         compiled.status.success(),
         "rustc failed to compile {stem}. stderr was: <<<{stderr}>>>",
@@ -228,40 +146,31 @@ fn assert_backend_source_compiles(stem: &str, src: &str) {
             stderr = compiled.stderr
         );
     }
+    positive_evidence::record(
+        positive_evidence::Evidence::Compiled,
+        positive_evidence::Certs::On,
+    );
 }
 
-fn run_binary_with_timeout(path: &Path, timeout: Duration) -> Output {
-    let mut child = Command::new(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn compiled reference-union binary");
-    let start = Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .expect("failed to poll compiled reference-union binary")
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .expect("failed to collect reference-union output");
-        }
-        if start.elapsed() >= timeout {
-            child
-                .kill()
-                .expect("failed to kill timed-out reference-union binary");
-            let killed = child
-                .wait_with_output()
-                .expect("failed to collect timed-out reference-union output");
-            panic!(
-                "reference-union binary did not exit before timeout; \
-                 stdout=<<<{}>>> stderr=<<<{}>>>",
-                String::from_utf8_lossy(&killed.stdout),
-                String::from_utf8_lossy(&killed.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
+/// The bound on one run of an oracle binary. Each oracle computes at once, but
+/// a freshly linked binary's first execution on an aarch64-apple-darwin host
+/// waits for the system's scan before its code runs, longer the more loaded
+/// the host is, and `posix_spawn` returns before that wait, so a bound timed
+/// from the spawn includes it. The bound separates a hang from a slow start,
+/// as `mir_families_aarch64`'s does; a run it kills fails the test.
+const RUN_LIMIT: Duration = Duration::from_secs(60);
+
+/// Run a compiled oracle binary (stdin closed, output captured) under
+/// [`RUN_LIMIT`]. A run the bound kills panics with what it printed.
+fn run_oracle_binary(path: &Path) -> Output {
+    match darwin_native::run_with_deadline(&mut Command::new(path), RUN_LIMIT) {
+        Ok(output) => output,
+        Err(killed) => panic!(
+            "reference-union binary did not exit within {RUN_LIMIT:?}; \
+             stdout=<<<{}>>> stderr=<<<{}>>>",
+            String::from_utf8_lossy(&killed.stdout),
+            String::from_utf8_lossy(&killed.stderr)
+        ),
     }
 }
 
@@ -279,9 +188,6 @@ fn assert_backend_source_exits_success(stem: &str, src: &str) {
     eprintln!("rustc stderr:\n{}", compiled.stderr);
     eprintln!("rustc exit: {:?}", compiled.status);
 
-    if backend_compile_hit_promotion_ratchet(&compiled) {
-        return;
-    }
     assert!(
         compiled.status.success(),
         "rustc failed to compile {stem} oracle. stderr was: <<<{stderr}>>>",
@@ -309,7 +215,7 @@ fn assert_backend_source_exits_success(stem: &str, src: &str) {
         );
     }
 
-    let run = run_binary_with_timeout(&compiled.out_bin, Duration::from_secs(3));
+    let run = run_oracle_binary(&compiled.out_bin);
     let run_stdout = String::from_utf8_lossy(&run.stdout);
     let run_stderr = String::from_utf8_lossy(&run.stderr);
     let _ = std::fs::remove_file(&compiled.out_bin);
@@ -323,6 +229,10 @@ fn assert_backend_source_exits_success(stem: &str, src: &str) {
     );
     assert_eq!(run_stdout, "", "{stem} oracle wrote stdout");
     assert_eq!(run_stderr, "", "{stem} oracle wrote stderr");
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::On,
+    );
 }
 
 fn assert_backend_library_links_and_runs(
@@ -353,9 +263,6 @@ fn assert_backend_library_links_and_runs(
     eprintln!("{stem} lib rustc stdout:\n{}", lib.stdout);
     eprintln!("{stem} lib rustc stderr:\n{}", lib.stderr);
     eprintln!("{stem} lib rustc exit: {:?}", lib.status);
-    if backend_compile_hit_promotion_ratchet(&lib) {
-        return;
-    }
     assert!(
         lib.status.success(),
         "{stem}: rustc failed to compile library oracle. stderr was: <<<{stderr}>>>",
@@ -407,7 +314,7 @@ fn assert_backend_library_links_and_runs(
         );
     }
 
-    let run = run_binary_with_timeout(&bin_path, Duration::from_secs(3));
+    let run = run_oracle_binary(&bin_path);
     let run_stdout = String::from_utf8_lossy(&run.stdout);
     let run_stderr = String::from_utf8_lossy(&run.stderr);
     let _ = std::fs::remove_file(&lib_path);
@@ -422,6 +329,10 @@ fn assert_backend_library_links_and_runs(
     );
     assert_eq!(run_stdout, "", "{stem} linked oracle wrote stdout");
     assert_eq!(run_stderr, "", "{stem} linked oracle wrote stderr");
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::On,
+    );
 }
 
 fn assert_backend_library_and_backend_caller_link_and_run(
@@ -452,9 +363,6 @@ fn assert_backend_library_and_backend_caller_link_and_run(
     eprintln!("{stem} lib rustc stdout:\n{}", lib.stdout);
     eprintln!("{stem} lib rustc stderr:\n{}", lib.stderr);
     eprintln!("{stem} lib rustc exit: {:?}", lib.status);
-    if backend_compile_hit_promotion_ratchet(&lib) {
-        return;
-    }
     assert!(
         lib.status.success(),
         "{stem}: rustc failed to compile backend library oracle. stderr was: <<<{stderr}>>>",
@@ -478,10 +386,6 @@ fn assert_backend_library_and_backend_caller_link_and_run(
     eprintln!("{stem} backend bin rustc stdout:\n{}", bin.stdout);
     eprintln!("{stem} backend bin rustc stderr:\n{}", bin.stderr);
     eprintln!("{stem} backend bin rustc exit: {:?}", bin.status);
-    if backend_compile_hit_promotion_ratchet(&bin) {
-        let _ = std::fs::remove_file(&lib_path);
-        return;
-    }
     assert!(
         bin.status.success(),
         "{stem}: rustc failed to compile backend caller oracle. stderr was: <<<{stderr}>>>",
@@ -512,7 +416,7 @@ fn assert_backend_library_and_backend_caller_link_and_run(
         );
     }
 
-    let run = run_binary_with_timeout(&bin_path, Duration::from_secs(3));
+    let run = run_oracle_binary(&bin_path);
     let run_stdout = String::from_utf8_lossy(&run.stdout);
     let run_stderr = String::from_utf8_lossy(&run.stderr);
     let _ = std::fs::remove_file(&lib_path);
@@ -527,6 +431,10 @@ fn assert_backend_library_and_backend_caller_link_and_run(
     );
     assert_eq!(run_stdout, "", "{stem} backend caller oracle wrote stdout");
     assert_eq!(run_stderr, "", "{stem} backend caller oracle wrote stderr");
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::On,
+    );
 }
 
 #[test]
@@ -877,22 +785,32 @@ pub extern "C" fn main(argc: i32, _argv: *const *const u8) -> i32 {
 }
 "#;
 
-    // Named unsupported-MIR gap: returning a promoted scalar reference and
-    // then passing it as an argument requires scalar borrow materialization,
-    // which the backend fails closed on today ([TCG-MIR-UNSUPPORTED]). When
-    // borrow materialization lands the refusal disappears and the original
-    // runtime oracle below resumes automatically.
+    // Returning a promoted scalar reference and then passing it as an argument
+    // needs scalar borrow materialization, which the backend refuses today by
+    // name (`[TCG-MIR-UNSUPPORTED]` "requires scalar borrow materialization",
+    // raised by target-independent MIR lowering on every host). That refusal
+    // is recorded as an EXPECTED REFUSAL, never as a run: this test used to
+    // return early on it without a word, which passed without running the
+    // oracle (ledger L06-P10). Any other refusal fails. When borrow
+    // materialization lands the refusal disappears and the runtime oracle
+    // below is the claim, a native run (the Darwin bridge runner's evidence
+    // profile for this target then moves by one, in a reviewed edit).
     let compiled = compile_backend_source("scalar_reference_return_non_escaping", src);
     if !compiled.status.success()
         && compiled
             .stderr
             .contains("requires scalar borrow materialization")
     {
+        eprintln!("rustc stderr:\n{}", compiled.stderr);
         assert!(
             compiled.stderr.contains("[TCG-MIR-UNSUPPORTED]"),
             "scalar-borrow refusal fired without the documented fail-closed \
              diagnostic. stderr: <<<{}>>>",
             compiled.stderr
+        );
+        positive_evidence::record(
+            positive_evidence::Evidence::ExpectedRefusal,
+            positive_evidence::Certs::On,
         );
         return;
     }

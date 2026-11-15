@@ -12,16 +12,36 @@
 //! Generates the standard DWARF debug sections used by debuggers (lldb, gdb)
 //! to map machine code back to source constructs:
 //!
-//! - `__DWARF,__debug_abbrev` — abbreviation table defining DIE tag/attribute schemas
-//! - `__DWARF,__debug_info` — the actual debug information entries (DIEs)
-//! - `__DWARF,__debug_str` — string table for names referenced by `.debug_info`
-//! - `__DWARF,__debug_line` — line number program (minimal: function start/end markers)
-//! - `__DWARF,__debug_loc` — optional DWARF4 location lists for ranged variables
+//! - `.debug_abbrev` — abbreviation table defining DIE tag/attribute schemas
+//! - `.debug_info` — the actual debug information entries (DIEs)
+//! - `.debug_str` — string table for names referenced by `.debug_info`
+//! - `.debug_line` — line number program
+//! - `.debug_loc` — optional DWARF4 location lists for ranged variables
+//!
+//! One byte image serves both object formats.
+//! [`DwarfDebugInfo::try_emit_section_image`] produces the sections together
+//! with every relocated field: code addresses and the cross-section
+//! `DW_FORM_strp` / `DW_FORM_sec_offset` / abbreviation / line-table offsets.
+//! Mach-O places the sections in the `__DWARF` segment through
+//! [`add_debug_info_to_writer`] and relocates only code addresses
+//! (`ARM64_RELOC_UNSIGNED`; dsymutil reads the object-local section offsets
+//! directly). AArch64 ELF places them in `.debug_*` sections through
+//! [`crate::elf::dwarf::ElfDwarfSections`], which relocates every field
+//! (`R_AARCH64_ABS64` code addresses, `R_AARCH64_ABS32` section offsets) so a
+//! static link can concatenate the sections of several objects.
+//!
+//! Before producing bytes the image checks that every line row, lexical
+//! scope and location-list range lies inside its function, that line rows are
+//! ordered and instruction-aligned, and that every relocated field holds its
+//! addend (typed [`DwarfEmitError`]s, fail-closed). These checks bind the
+//! tables to the function extents the caller supplied; they do not prove
+//! that a location describes the value a source variable holds.
 //!
 //! # DWARF version
 //!
-//! We emit DWARF 4 for macOS compatibility. DWARF 4 is the last version
-//! natively supported by all macOS toolchain components (dsymutil, lldb).
+//! Both formats use DWARF 4. It is the last version natively supported by
+//! all macOS toolchain components (dsymutil, lldb), and the GNU and LLVM
+//! Linux tools (gdb, lldb, readelf, llvm-dwarfdump) read it.
 //!
 //! # Section layout
 //!
@@ -65,9 +85,62 @@ pub enum DwarfEmitError {
     MissingLocationListOffset { cursor: usize },
     /// A single DWARF location expression exceeded DWARF4's u16 length field.
     LocationExpressionTooLarge { len: usize },
-    /// Adding a `__text` relocation for a DWARF address field failed (the
-    /// underlying Mach-O writer rejected it).
+    /// Adding the relocation for a DWARF field failed (the object writer
+    /// rejected it, or the field has no representable target).
     RelocationFailed(String),
+    /// The object writer refused a DWARF section.
+    SectionRefused(String),
+    /// A line row, lexical scope or location-list range of `function` lies
+    /// outside the function's `[low_pc, low_pc + size)` code range.
+    AddressOutOfFunction {
+        function: String,
+        what: &'static str,
+        start: u64,
+        end: u64,
+        low_pc: u64,
+        size: u32,
+    },
+    /// A location-list range of `function` is empty. DWARF4 reads an empty
+    /// range at the compile-unit base as the end-of-list marker, so one is
+    /// never emitted.
+    EmptyLocationRange { function: String, start: u64 },
+    /// The line rows of `function` are not in non-decreasing address order,
+    /// or an address is not a whole number of 4-byte instructions from the
+    /// function start (the line program advances in instruction units).
+    LineRowOrder {
+        function: String,
+        previous: u64,
+        address: u64,
+    },
+    /// A function's `decl_file` names no entry of the line-table file list
+    /// (`file_name` is file 1, `extra_files[i]` is file `i + 2`).
+    UnknownDeclFile {
+        function: String,
+        file: u8,
+        files: usize,
+    },
+    /// The line-table file list would exceed the `u8` range of
+    /// [`FunctionDebugInfo::decl_file`].
+    TooManyFiles { files: usize },
+    /// A DWARF section exceeds the DWARF32 4 GiB offset domain.
+    SectionTooLarge { section: DwarfSectionKind },
+    /// An emitted field that carries a relocation does not hold the
+    /// relocation's addend (internal emission bookkeeping error).
+    RelocatedFieldMismatch {
+        section: DwarfSectionKind,
+        offset: u32,
+        addend: u64,
+        found: u64,
+    },
+    /// A DWARF32 section offset whose `R_AARCH64_ABS32` addend is above the
+    /// psABI window `-2^31 <= S + A < 2^32`. The linked section symbol `S`
+    /// is never negative, so every link would overflow.
+    Abs32AddendOutOfWindow {
+        section: DwarfSectionKind,
+        offset: u32,
+        addend: u64,
+        max: i64,
+    },
 }
 
 impl core::fmt::Display for DwarfEmitError {
@@ -88,13 +161,258 @@ impl core::fmt::Display for DwarfEmitError {
                 write!(f, "DWARF location expression length {len} exceeds u16")
             }
             Self::RelocationFailed(msg) => {
-                write!(f, "DWARF __text relocation emission failed: {msg}")
+                write!(f, "DWARF relocation emission failed: {msg}")
             }
+            Self::SectionRefused(msg) => {
+                write!(f, "DWARF section placement failed: {msg}")
+            }
+            Self::AddressOutOfFunction {
+                function,
+                what,
+                start,
+                end,
+                low_pc,
+                size,
+            } => write!(
+                f,
+                "DWARF {what} [{start:#x}, {end:#x}) of `{function}` lies outside its code range \
+                 [{low_pc:#x}, +{size:#x}) (fail-closed)"
+            ),
+            Self::EmptyLocationRange { function, start } => write!(
+                f,
+                "DWARF location-list range of `{function}` at {start:#x} is empty (fail-closed)"
+            ),
+            Self::LineRowOrder {
+                function,
+                previous,
+                address,
+            } => write!(
+                f,
+                "DWARF line row of `{function}` at {address:#x} follows {previous:#x} out of \
+                 order or off the 4-byte instruction grid (fail-closed)"
+            ),
+            Self::UnknownDeclFile {
+                function,
+                file,
+                files,
+            } => write!(
+                f,
+                "DWARF function `{function}` names line-table file {file}, but the compile unit \
+                 lists {files} file(s) (fail-closed)"
+            ),
+            Self::TooManyFiles { files } => write!(
+                f,
+                "DWARF compile unit would list {files} source files; DW_AT_decl_file is one \
+                 byte (fail-closed)"
+            ),
+            Self::SectionTooLarge { section } => {
+                write!(f, "DWARF {section:?} section exceeds DWARF32 limits")
+            }
+            Self::RelocatedFieldMismatch {
+                section,
+                offset,
+                addend,
+                found,
+            } => write!(
+                f,
+                "DWARF {section:?} field at {offset:#x} holds {found:#x}, not its relocation \
+                 addend {addend:#x} (fail-closed)"
+            ),
+            Self::Abs32AddendOutOfWindow {
+                section,
+                offset,
+                addend,
+                max,
+            } => write!(
+                f,
+                "[TCG-RELOC-WINDOW-ABS32] DWARF {section:?} section offset at {offset:#x} has \
+                 R_AARCH64_ABS32 addend {addend:#x}; the linked value S + A is at least the \
+                 addend, above the psABI window maximum {max:#x} in every link (fail-closed)"
+            ),
         }
     }
 }
 
 impl std::error::Error for DwarfEmitError {}
+
+/// One DWARF section of a [`DwarfSectionImage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DwarfSectionKind {
+    /// `.debug_abbrev`
+    Abbrev,
+    /// `.debug_info`
+    Info,
+    /// `.debug_str`
+    Str,
+    /// `.debug_line`
+    Line,
+    /// `.debug_loc`
+    Loc,
+}
+
+impl DwarfSectionKind {
+    /// Every kind, in the order the object writers emit the sections.
+    pub const ALL: [Self; 5] = [Self::Abbrev, Self::Info, Self::Str, Self::Line, Self::Loc];
+
+    /// The ELF section name (`.debug_*`).
+    pub const fn elf_name(self) -> &'static str {
+        match self {
+            Self::Abbrev => ".debug_abbrev",
+            Self::Info => ".debug_info",
+            Self::Str => ".debug_str",
+            Self::Line => ".debug_line",
+            Self::Loc => ".debug_loc",
+        }
+    }
+}
+
+/// What a relocated DWARF field points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DwarfRelocTarget {
+    /// A code address: the object's single text section plus the addend.
+    Text,
+    /// An offset into another DWARF section of the same image.
+    Section(DwarfSectionKind),
+}
+
+/// Width of a relocated DWARF field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DwarfRelocWidth {
+    /// A DWARF32 section offset (`DW_FORM_strp`, `DW_FORM_sec_offset`, the
+    /// unit header's abbreviation offset).
+    Bits32,
+    /// A target address (`DW_FORM_addr`, `DW_LNE_set_address`).
+    Bits64,
+}
+
+impl DwarfRelocWidth {
+    /// Field width in bytes.
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::Bits32 => 4,
+            Self::Bits64 => 8,
+        }
+    }
+}
+
+/// One relocated field of a [`DwarfSectionImage`]. The emitted bytes hold
+/// `addend` at `offset`; an object writer resolves the field to
+/// `target + addend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DwarfFieldRelocation {
+    /// Section containing the field.
+    pub section: DwarfSectionKind,
+    /// Byte offset of the field within `section`.
+    pub offset: u32,
+    /// Field width.
+    pub width: DwarfRelocWidth,
+    /// What the field refers to.
+    pub target: DwarfRelocTarget,
+    /// Offset from the target's start.
+    pub addend: u64,
+}
+
+/// Format-neutral DWARF sections plus every relocated field in them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DwarfSectionImage {
+    /// `.debug_abbrev` bytes.
+    pub abbrev: Vec<u8>,
+    /// `.debug_info` bytes.
+    pub info: Vec<u8>,
+    /// `.debug_str` bytes.
+    pub str: Vec<u8>,
+    /// `.debug_line` bytes.
+    pub line: Vec<u8>,
+    /// `.debug_loc` bytes, present only when some variable uses a
+    /// location list.
+    pub loc: Option<Vec<u8>>,
+    /// Every relocated field, in section then ascending offset order.
+    pub relocations: Vec<DwarfFieldRelocation>,
+}
+
+impl DwarfSectionImage {
+    /// Bytes of `kind`, or `None` for an absent `.debug_loc`.
+    pub fn section(&self, kind: DwarfSectionKind) -> Option<&[u8]> {
+        match kind {
+            DwarfSectionKind::Abbrev => Some(&self.abbrev),
+            DwarfSectionKind::Info => Some(&self.info),
+            DwarfSectionKind::Str => Some(&self.str),
+            DwarfSectionKind::Line => Some(&self.line),
+            DwarfSectionKind::Loc => self.loc.as_deref(),
+        }
+    }
+
+    fn section_mut(&mut self, kind: DwarfSectionKind) -> Option<&mut Vec<u8>> {
+        match kind {
+            DwarfSectionKind::Abbrev => Some(&mut self.abbrev),
+            DwarfSectionKind::Info => Some(&mut self.info),
+            DwarfSectionKind::Str => Some(&mut self.str),
+            DwarfSectionKind::Line => Some(&mut self.line),
+            DwarfSectionKind::Loc => self.loc.as_mut(),
+        }
+    }
+
+    /// Clear every relocated field to zero, the GNU `SHT_RELA` convention in
+    /// which the relocation record alone carries the addend. A field whose
+    /// relocation is then lost reads as zero instead of silently keeping an
+    /// object-local offset that happens to be right for a single object.
+    pub fn clear_relocated_fields(&mut self) -> Result<(), DwarfEmitError> {
+        let relocations = self.relocations.clone();
+        for reloc in relocations {
+            let missing = DwarfEmitError::RelocatedFieldMismatch {
+                section: reloc.section,
+                offset: reloc.offset,
+                addend: reloc.addend,
+                found: 0,
+            };
+            let start = reloc.offset as usize;
+            let end = start + reloc.width.bytes();
+            let bytes = self.section_mut(reloc.section).ok_or(missing.clone())?;
+            bytes.get_mut(start..end).ok_or(missing)?.fill(0);
+        }
+        Ok(())
+    }
+
+    /// Check that every relocated field lies inside its section and holds
+    /// its addend, and that every section-offset target lies inside the
+    /// target section.
+    fn check_relocated_fields(&self) -> Result<(), DwarfEmitError> {
+        for reloc in &self.relocations {
+            let mismatch = |found: u64| DwarfEmitError::RelocatedFieldMismatch {
+                section: reloc.section,
+                offset: reloc.offset,
+                addend: reloc.addend,
+                found,
+            };
+            let bytes = self.section(reloc.section).ok_or_else(|| mismatch(0))?;
+            let start = reloc.offset as usize;
+            let field = bytes
+                .get(start..start + reloc.width.bytes())
+                .ok_or_else(|| mismatch(0))?;
+            let found = match reloc.width {
+                DwarfRelocWidth::Bits32 => u64::from(u32::from_le_bytes(
+                    field.try_into().map_err(|_| mismatch(0))?,
+                )),
+                DwarfRelocWidth::Bits64 => {
+                    u64::from_le_bytes(field.try_into().map_err(|_| mismatch(0))?)
+                }
+            };
+            if found != reloc.addend {
+                return Err(mismatch(found));
+            }
+            if let DwarfRelocTarget::Section(target) = reloc.target {
+                let target_len = self
+                    .section(target)
+                    .map(|bytes| bytes.len() as u64)
+                    .ok_or_else(|| mismatch(found))?;
+                if reloc.addend >= target_len {
+                    return Err(mismatch(found));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DWARF constants — Tags
@@ -271,7 +589,6 @@ const DW_OP_BREG0: u8 = 0x70;
 
 /// DW_OP_regx: value in register (ULEB128 register number).
 /// Used for registers > 31.
-#[allow(dead_code)]
 const DW_OP_REGX: u8 = 0x90;
 
 /// DW_OP_fbreg: value at frame_base + SLEB128 offset.
@@ -286,6 +603,9 @@ const DW_OP_STACK_VALUE: u8 = 0x9f;
 
 /// DW_LNS_advance_line: advance line by SLEB128 operand.
 const DW_LNS_ADVANCE_LINE: u8 = 3;
+
+/// DW_LNS_set_file: set the file register to a ULEB128 file-table index.
+const DW_LNS_SET_FILE: u8 = 4;
 
 /// DW_LNS_set_column: set column to ULEB128 operand.
 const DW_LNS_SET_COLUMN: u8 = 5;
@@ -543,10 +863,6 @@ impl LocationListEntry {
             expression: Vec::new(),
         })
     }
-
-    fn high_pc(&self) -> u64 {
-        self.low_pc + u64::from(self.size)
-    }
 }
 
 /// Runtime location of a variable for DWARF location expressions.
@@ -748,7 +1064,10 @@ pub struct FunctionDebugInfo {
     pub scopes: Vec<LexicalBlock>,
     /// Source line entries for the line number program.
     pub line_entries: Vec<SourceLineEntry>,
-    /// Source file index (1-based, 0 = unknown).
+    /// Source file index (1-based, 0 = unknown): the line-table file the
+    /// function is declared in and its line rows are reported in. File 1 is
+    /// [`DwarfDebugInfo::file_name`]; file `i + 2` is
+    /// [`DwarfDebugInfo::extra_files`]`[i]`.
     pub decl_file: u8,
     /// Source line number where function is declared (0 = unknown).
     pub decl_line: u16,
@@ -796,8 +1115,12 @@ pub struct FunctionDebugInfo {
 /// ```
 #[derive(Debug, Clone)]
 pub struct DwarfDebugInfo {
-    /// Source file name.
+    /// Source file name (line-table file 1, and the compile unit's name).
     pub file_name: String,
+    /// Further source files of the compile unit, in line-table order:
+    /// `extra_files[i]` is file `i + 2`. Empty for a one-file unit, whose
+    /// sections are then exactly the one-file layout.
+    pub extra_files: Vec<String>,
     /// Compilation directory.
     pub comp_dir: String,
     /// Source language.
@@ -819,6 +1142,7 @@ impl DwarfDebugInfo {
     pub fn new(file_name: &str, comp_dir: &str, language: SourceLanguage) -> Self {
         Self {
             file_name: file_name.to_string(),
+            extra_files: Vec::new(),
             comp_dir: comp_dir.to_string(),
             language,
             functions: Vec::new(),
@@ -827,6 +1151,24 @@ impl DwarfDebugInfo {
             struct_types: Vec::new(),
             enum_types: Vec::new(),
         }
+    }
+
+    /// The line-table file index of `path`, adding it to
+    /// [`extra_files`](Self::extra_files) if the unit does not list it yet.
+    pub fn file_index(&mut self, path: &str) -> Result<u8, DwarfEmitError> {
+        if path == self.file_name {
+            return Ok(1);
+        }
+        let position = match self.extra_files.iter().position(|file| file == path) {
+            Some(position) => position,
+            None => {
+                self.extra_files.push(path.to_string());
+                self.extra_files.len() - 1
+            }
+        };
+        u8::try_from(position + 2).map_err(|_| DwarfEmitError::TooManyFiles {
+            files: self.extra_files.len() + 1,
+        })
     }
 
     /// Add a function to the debug info.
@@ -1175,14 +1517,37 @@ impl DwarfDebugInfo {
     pub fn try_emit_debug_info_with_addr_relocs(
         &self,
     ) -> Result<(Vec<u8>, Vec<u32>), DwarfEmitError> {
+        let (info, relocations) = self.emit_debug_info_image()?;
+        let addr_relocs = relocations
+            .iter()
+            .filter(|reloc| reloc.target == DwarfRelocTarget::Text)
+            .map(|reloc| reloc.offset)
+            .collect();
+        Ok((info, addr_relocs))
+    }
+
+    /// `.debug_info` bytes plus every relocated field in them: each
+    /// `DW_FORM_addr` (text), `DW_FORM_strp` (`.debug_str`),
+    /// `DW_FORM_sec_offset` location list (`.debug_loc`), the unit's
+    /// abbreviation offset (`.debug_abbrev`) and `DW_AT_stmt_list`
+    /// (`.debug_line`).
+    fn emit_debug_info_image(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<DwarfFieldRelocation>), DwarfEmitError> {
         let (_, str_table) = self.build_string_table();
         let loclist_offsets = self.location_list_offsets()?;
         let mut loclist_cursor = 0usize;
-        // Offsets (final-section-relative) of DW_FORM_addr fields needing a
-        // __text relocation. `+4` throughout accounts for the unit_length field
-        // prepended below (fields are recorded relative to `body`, which starts
-        // AFTER that 4-byte length).
-        let mut addr_relocs: Vec<u32> = Vec::new();
+        // Relocated fields, recorded at their final-section offsets
+        // (`INFO_BODY_BASE` adds back the unit_length prepended below).
+        let mut relocs: Vec<DwarfFieldRelocation> = Vec::new();
+        let strp = |body: &mut Vec<u8>, relocs: &mut Vec<DwarfFieldRelocation>, text: &str| {
+            push_info_offset(
+                body,
+                relocs,
+                DwarfSectionKind::Str,
+                str_table.offset_of(text),
+            );
+        };
 
         // Build the body first (everything after the unit_length field),
         // then prepend the length.
@@ -1190,7 +1555,7 @@ impl DwarfDebugInfo {
 
         // CU header (after unit_length)
         body.extend_from_slice(&DWARF_VERSION.to_le_bytes()); // version
-        body.extend_from_slice(&0u32.to_le_bytes()); // debug_abbrev_offset
+        push_info_offset(&mut body, &mut relocs, DwarfSectionKind::Abbrev, 0); // debug_abbrev_offset
         body.push(ADDRESS_SIZE); // address_size
 
         // Compute the compilation unit's address range from functions.
@@ -1199,20 +1564,19 @@ impl DwarfDebugInfo {
         // DW_TAG_compile_unit DIE (abbreviation 1)
         encode_uleb128(ABBREV_COMPILE_UNIT as u64, &mut body);
         // DW_AT_producer (strp)
-        body.extend_from_slice(&str_table.offset_of(PRODUCER).to_le_bytes());
+        strp(&mut body, &mut relocs, PRODUCER);
         // DW_AT_language (data2)
         body.extend_from_slice(&self.language.dwarf_encoding().to_le_bytes());
         // DW_AT_name (strp)
-        body.extend_from_slice(&str_table.offset_of(&self.file_name).to_le_bytes());
+        strp(&mut body, &mut relocs, &self.file_name);
         // DW_AT_comp_dir (strp)
-        body.extend_from_slice(&str_table.offset_of(&self.comp_dir).to_le_bytes());
-        // DW_AT_low_pc (addr) — relocated against __text.
-        addr_relocs.push(4 + body.len() as u32);
-        body.extend_from_slice(&cu_low_pc.to_le_bytes());
+        strp(&mut body, &mut relocs, &self.comp_dir);
+        // DW_AT_low_pc (addr) — relocated against the text section.
+        push_info_address(&mut body, &mut relocs, cu_low_pc);
         // DW_AT_high_pc (data4) — DWARF4 length form
         body.extend_from_slice(&cu_high_pc_length.to_le_bytes());
         // DW_AT_stmt_list (sec_offset) — offset into .debug_line (always 0)
-        body.extend_from_slice(&0u32.to_le_bytes());
+        push_info_offset(&mut body, &mut relocs, DwarfSectionKind::Line, 0);
 
         // We need to track where base type DIEs start so subprogram params
         // can reference them via DW_FORM_ref4 (CU-relative offset).
@@ -1236,10 +1600,9 @@ impl DwarfDebugInfo {
 
             encode_uleb128(abbrev as u64, &mut body);
             // DW_AT_name (strp)
-            body.extend_from_slice(&str_table.offset_of(&func.name).to_le_bytes());
-            // DW_AT_low_pc (addr) — relocated against __text.
-            addr_relocs.push(4 + body.len() as u32);
-            body.extend_from_slice(&func.low_pc.to_le_bytes());
+            strp(&mut body, &mut relocs, &func.name);
+            // DW_AT_low_pc (addr) — relocated against the text section.
+            push_info_address(&mut body, &mut relocs, func.low_pc);
             // DW_AT_high_pc (data4) — length
             body.extend_from_slice(&func.size.to_le_bytes());
 
@@ -1258,7 +1621,7 @@ impl DwarfDebugInfo {
                 for param in &func.params {
                     encode_uleb128(formal_parameter_abbrev(param) as u64, &mut body);
                     // DW_AT_name (strp)
-                    body.extend_from_slice(&str_table.offset_of(&param.name).to_le_bytes());
+                    strp(&mut body, &mut relocs, &param.name);
                     // DW_AT_type (ref4) — CU-relative offset to base type DIE
                     // Placeholder, fixed up below.
                     body.extend_from_slice(&0u32.to_le_bytes());
@@ -1267,6 +1630,7 @@ impl DwarfDebugInfo {
                         &loclist_offsets,
                         &mut loclist_cursor,
                         &mut body,
+                        &mut relocs,
                     )?;
                 }
 
@@ -1274,7 +1638,7 @@ impl DwarfDebugInfo {
                 for var in &func.variables {
                     encode_uleb128(variable_abbrev(var) as u64, &mut body);
                     // DW_AT_name (strp)
-                    body.extend_from_slice(&str_table.offset_of(&var.name).to_le_bytes());
+                    strp(&mut body, &mut relocs, &var.name);
                     // DW_AT_type (ref4) — placeholder, fixed up below
                     body.extend_from_slice(&0u32.to_le_bytes());
                     emit_location_attr(
@@ -1282,15 +1646,15 @@ impl DwarfDebugInfo {
                         &loclist_offsets,
                         &mut loclist_cursor,
                         &mut body,
+                        &mut relocs,
                     )?;
                 }
 
                 // Emit lexical block scopes with their variables
                 for scope in &func.scopes {
                     encode_uleb128(ABBREV_LEXICAL_BLOCK as u64, &mut body);
-                    // DW_AT_low_pc (addr) — relocated against __text.
-                    addr_relocs.push(4 + body.len() as u32);
-                    body.extend_from_slice(&scope.low_pc.to_le_bytes());
+                    // DW_AT_low_pc (addr) — relocated against the text section.
+                    push_info_address(&mut body, &mut relocs, scope.low_pc);
                     // DW_AT_high_pc (data4) — length
                     body.extend_from_slice(&scope.size.to_le_bytes());
 
@@ -1298,7 +1662,7 @@ impl DwarfDebugInfo {
                     for var in &scope.variables {
                         encode_uleb128(variable_abbrev(var) as u64, &mut body);
                         // DW_AT_name (strp)
-                        body.extend_from_slice(&str_table.offset_of(&var.name).to_le_bytes());
+                        strp(&mut body, &mut relocs, &var.name);
                         // DW_AT_type (ref4) — placeholder, fixed up below
                         body.extend_from_slice(&0u32.to_le_bytes());
                         emit_location_attr(
@@ -1306,6 +1670,7 @@ impl DwarfDebugInfo {
                             &loclist_offsets,
                             &mut loclist_cursor,
                             &mut body,
+                            &mut relocs,
                         )?;
                     }
 
@@ -1336,7 +1701,7 @@ impl DwarfDebugInfo {
         for ty in &self.base_types {
             encode_uleb128(ABBREV_BASE_TYPE as u64, &mut body);
             // DW_AT_name (strp)
-            body.extend_from_slice(&str_table.offset_of(&ty.name).to_le_bytes());
+            strp(&mut body, &mut relocs, &ty.name);
             // DW_AT_byte_size (data1)
             body.push(ty.byte_size);
             // DW_AT_encoding (data1)
@@ -1383,7 +1748,7 @@ impl DwarfDebugInfo {
         for sty in &self.struct_types {
             encode_uleb128(ABBREV_STRUCTURE_TYPE as u64, &mut body);
             // DW_AT_name (strp)
-            body.extend_from_slice(&str_table.offset_of(&sty.name).to_le_bytes());
+            strp(&mut body, &mut relocs, &sty.name);
             // DW_AT_byte_size (data4)
             body.extend_from_slice(&sty.byte_size.to_le_bytes());
 
@@ -1391,7 +1756,7 @@ impl DwarfDebugInfo {
             for member in &sty.members {
                 encode_uleb128(ABBREV_MEMBER as u64, &mut body);
                 // DW_AT_name (strp)
-                body.extend_from_slice(&str_table.offset_of(&member.name).to_le_bytes());
+                strp(&mut body, &mut relocs, &member.name);
                 // DW_AT_type (ref4) — reference to base type
                 let type_offset = if member.type_index < base_type_offsets.len() {
                     base_type_offsets[member.type_index]
@@ -1414,7 +1779,7 @@ impl DwarfDebugInfo {
         for ety in &self.enum_types {
             encode_uleb128(ABBREV_ENUMERATION_TYPE as u64, &mut body);
             // DW_AT_name (strp)
-            body.extend_from_slice(&str_table.offset_of(&ety.name).to_le_bytes());
+            strp(&mut body, &mut relocs, &ety.name);
             // DW_AT_byte_size (data4)
             body.extend_from_slice(&ety.byte_size.to_le_bytes());
             // DW_AT_type (ref4) — reference to underlying base type
@@ -1429,7 +1794,7 @@ impl DwarfDebugInfo {
             for enumerator in &ety.enumerators {
                 encode_uleb128(ABBREV_ENUMERATOR as u64, &mut body);
                 // DW_AT_name (strp)
-                body.extend_from_slice(&str_table.offset_of(&enumerator.name).to_le_bytes());
+                strp(&mut body, &mut relocs, &enumerator.name);
                 // DW_AT_const_value (sdata)
                 encode_sleb128(enumerator.value, &mut body);
             }
@@ -1454,12 +1819,15 @@ impl DwarfDebugInfo {
         }
 
         // Prepend unit_length (4 bytes, length of everything after this field)
-        let unit_length = body.len() as u32;
+        let unit_length =
+            u32::try_from(body.len()).map_err(|_| DwarfEmitError::SectionTooLarge {
+                section: DwarfSectionKind::Info,
+            })?;
         let mut result = Vec::with_capacity(4 + body.len());
         result.extend_from_slice(&unit_length.to_le_bytes());
         result.extend(body);
 
-        Ok((result, addr_relocs))
+        Ok((result, relocs))
     }
 
     /// Fix up DW_AT_type references in formal parameter and variable DIEs.
@@ -1610,18 +1978,164 @@ impl DwarfDebugInfo {
     }
 
     /// Fallible DWARF4 `.debug_loc` section emission.
+    ///
+    /// Entry bounds are written relative to the compile unit's base address
+    /// (the lowest function `low_pc`); an empty range is refused because
+    /// DWARF4 would read one at the base as the end-of-list marker.
     pub fn try_emit_debug_loc(&self) -> Result<Vec<u8>, DwarfEmitError> {
+        let (base, _) = self.compute_cu_range();
         let mut data = Vec::new();
         let mut result: Result<(), DwarfEmitError> = Ok(());
         self.for_each_location(|location| {
             if result.is_ok()
                 && let VariableLocation::LocationList(entries) = location
             {
-                result = emit_location_list_entries(entries, &mut data);
+                result = emit_location_list_entries(entries, base, &mut data);
             }
         });
         result?;
         Ok(data)
+    }
+
+    /// Check every function's line rows, lexical scopes and location-list
+    /// ranges against its `[low_pc, low_pc + size)` code range, and that line
+    /// rows are non-decreasing and on the 4-byte instruction grid.
+    pub fn validate_address_ranges(&self) -> Result<(), DwarfEmitError> {
+        let files = 1 + self.extra_files.len();
+        for func in &self.functions {
+            if usize::from(func.decl_file) > files {
+                return Err(DwarfEmitError::UnknownDeclFile {
+                    function: func.name.clone(),
+                    file: func.decl_file,
+                    files,
+                });
+            }
+            let end = func
+                .low_pc
+                .checked_add(u64::from(func.size))
+                .ok_or_else(|| DwarfEmitError::AddressOutOfFunction {
+                    function: func.name.clone(),
+                    what: "function",
+                    start: func.low_pc,
+                    end: u64::MAX,
+                    low_pc: func.low_pc,
+                    size: func.size,
+                })?;
+            let outside =
+                |what: &'static str, start: u64, stop: u64| DwarfEmitError::AddressOutOfFunction {
+                    function: func.name.clone(),
+                    what,
+                    start,
+                    end: stop,
+                    low_pc: func.low_pc,
+                    size: func.size,
+                };
+            let check_range = |what: &'static str, start: u64, size: u32| {
+                let stop = start.saturating_add(u64::from(size));
+                if start < func.low_pc || stop > end {
+                    return Err(outside(what, start, stop));
+                }
+                Ok(())
+            };
+
+            let mut previous = func.low_pc;
+            for entry in &func.line_entries {
+                if entry.address < func.low_pc || entry.address >= end {
+                    return Err(outside("line row", entry.address, entry.address + 1));
+                }
+                if entry.address < previous
+                    || !(entry.address - func.low_pc).is_multiple_of(u64::from(MIN_INST_LEN))
+                {
+                    return Err(DwarfEmitError::LineRowOrder {
+                        function: func.name.clone(),
+                        previous,
+                        address: entry.address,
+                    });
+                }
+                previous = entry.address;
+            }
+
+            for scope in &func.scopes {
+                check_range("lexical scope", scope.low_pc, scope.size)?;
+            }
+
+            let locations = func
+                .params
+                .iter()
+                .map(|param| &param.location)
+                .chain(func.variables.iter().map(|var| &var.location))
+                .chain(
+                    func.scopes
+                        .iter()
+                        .flat_map(|scope| scope.variables.iter().map(|var| &var.location)),
+                );
+            for location in locations {
+                let VariableLocation::LocationList(entries) = location else {
+                    continue;
+                };
+                for entry in entries {
+                    if entry.size == 0 {
+                        return Err(DwarfEmitError::EmptyLocationRange {
+                            function: func.name.clone(),
+                            start: entry.low_pc,
+                        });
+                    }
+                    check_range("location-list range", entry.low_pc, entry.size)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit every DWARF section together with every relocated field.
+    ///
+    /// Runs [`validate_address_ranges`](Self::validate_address_ranges) first,
+    /// then checks that each recorded field lies inside its section, holds its
+    /// addend, and (for a section offset) points inside the target section.
+    /// Returns `Ok(None)` when there are no functions to describe.
+    pub fn try_emit_section_image(&self) -> Result<Option<DwarfSectionImage>, DwarfEmitError> {
+        if self.functions.is_empty() {
+            return Ok(None);
+        }
+        self.validate_address_ranges()?;
+
+        let abbrev = self.emit_abbrev();
+        let (info, mut relocations) = self.emit_debug_info_image()?;
+        let str = self.emit_debug_str();
+        let (line, line_addresses) = self.emit_debug_line_image();
+        let loc = if self.has_location_lists() {
+            Some(self.try_emit_debug_loc()?)
+        } else {
+            None
+        };
+        relocations.extend(line_addresses.into_iter().map(|(offset, address)| {
+            DwarfFieldRelocation {
+                section: DwarfSectionKind::Line,
+                offset,
+                width: DwarfRelocWidth::Bits64,
+                target: DwarfRelocTarget::Text,
+                addend: address,
+            }
+        }));
+
+        let image = DwarfSectionImage {
+            abbrev,
+            info,
+            str,
+            line,
+            loc,
+            relocations,
+        };
+        for kind in DwarfSectionKind::ALL {
+            if image
+                .section(kind)
+                .is_some_and(|bytes| u32::try_from(bytes.len()).is_err())
+            {
+                return Err(DwarfEmitError::SectionTooLarge { section: kind });
+            }
+        }
+        image.check_relocated_fields()?;
+        Ok(Some(image))
     }
 
     fn has_location_lists(&self) -> bool {
@@ -1704,9 +2218,20 @@ impl DwarfDebugInfo {
     /// line-number program's addresses are not tied to the code section, so
     /// dsymutil/`gimli` cannot map a runtime PC back to a source line.
     pub fn emit_debug_line_with_addr_relocs(&self) -> (Vec<u8>, Vec<u32>) {
-        // Offsets (final-section-relative) of DW_LNE_set_address operands.
-        // `+4` accounts for the unit_length field prepended at the end.
-        let mut addr_relocs: Vec<u32> = Vec::new();
+        let (line, addresses) = self.emit_debug_line_image();
+        (
+            line,
+            addresses.into_iter().map(|(offset, _)| offset).collect(),
+        )
+    }
+
+    /// `.debug_line` bytes plus `(offset, address)` for every
+    /// `DW_LNE_set_address` operand, each a text-relative code address.
+    fn emit_debug_line_image(&self) -> (Vec<u8>, Vec<(u32, u64)>) {
+        // Offsets (final-section-relative) of DW_LNE_set_address operands and
+        // the address each holds. `+4` accounts for the unit_length field
+        // prepended at the end.
+        let mut addr_relocs: Vec<(u32, u64)> = Vec::new();
         // Build header body first (everything after unit_length)
         let mut header_body = Vec::new();
 
@@ -1744,11 +2269,13 @@ impl DwarfDebugInfo {
         // File names (terminated by empty entry = 0 byte)
         // Each entry: name (null-terminated), directory index (ULEB128),
         //             modification time (ULEB128), file length (ULEB128)
-        header_body.extend_from_slice(self.file_name.as_bytes());
-        header_body.push(0); // null terminate file name
-        encode_uleb128(1, &mut header_body); // directory index = 1 (first dir)
-        encode_uleb128(0, &mut header_body); // modification time (unknown)
-        encode_uleb128(0, &mut header_body); // file length (unknown)
+        for file in std::iter::once(&self.file_name).chain(&self.extra_files) {
+            header_body.extend_from_slice(file.as_bytes());
+            header_body.push(0); // null terminate file name
+            encode_uleb128(1, &mut header_body); // directory index = 1 (first dir)
+            encode_uleb128(0, &mut header_body); // modification time (unknown)
+            encode_uleb128(0, &mut header_body); // file length (unknown)
+        }
         header_body.push(0); // end of file list
 
         // Patch header_length
@@ -1758,8 +2285,18 @@ impl DwarfDebugInfo {
 
         // Line number program opcodes
         // Set file to index 1
-        header_body.push(4); // DW_LNS_set_file
+        header_body.push(DW_LNS_SET_FILE);
         encode_uleb128(1, &mut header_body);
+        // Each function's rows are in its `decl_file`; a unit whose functions
+        // all name file 1 (or 0, unknown) never switches file.
+        let mut cur_file: u8 = 1;
+        let mut select_file = |body: &mut Vec<u8>, func: &FunctionDebugInfo| {
+            if func.decl_file != 0 && func.decl_file != cur_file {
+                body.push(DW_LNS_SET_FILE);
+                encode_uleb128(u64::from(func.decl_file), body);
+                cur_file = func.decl_file;
+            }
+        };
 
         // Collect all line entries from all functions, or fall back to
         // function-boundary markers.
@@ -1775,20 +2312,24 @@ impl DwarfDebugInfo {
             let mut cur_is_stmt = true;
 
             for func in &self.functions {
+                select_file(&mut header_body, func);
                 if func.line_entries.is_empty() {
                     // Fall back to function-boundary for this function
-                    let off = emit_set_address(&mut header_body, func.low_pc);
-                    addr_relocs.push(4 + off as u32);
+                    let address = func.low_pc;
+                    let off = emit_set_address(&mut header_body, address);
+                    addr_relocs.push((4 + off as u32, address));
                     header_body.push(1); // DW_LNS_copy
 
-                    let off = emit_set_address(&mut header_body, func.low_pc + func.size as u64);
-                    addr_relocs.push(4 + off as u32);
+                    let address = func.low_pc + func.size as u64;
+                    let off = emit_set_address(&mut header_body, address);
+                    addr_relocs.push((4 + off as u32, address));
                     continue;
                 }
 
                 // Set address to function start
-                let off = emit_set_address(&mut header_body, func.low_pc);
-                addr_relocs.push(4 + off as u32);
+                let address = func.low_pc;
+                let off = emit_set_address(&mut header_body, address);
+                addr_relocs.push((4 + off as u32, address));
                 cur_addr = func.low_pc;
 
                 for entry in &func.line_entries {
@@ -1839,19 +2380,23 @@ impl DwarfDebugInfo {
                 // Advance to function end if needed
                 let end_pc = func.low_pc + func.size as u64;
                 if cur_addr < end_pc {
-                    let off = emit_set_address(&mut header_body, end_pc);
-                    addr_relocs.push(4 + off as u32);
+                    let address = end_pc;
+                    let off = emit_set_address(&mut header_body, address);
+                    addr_relocs.push((4 + off as u32, address));
                 }
             }
         } else {
             // Minimal: for each function, set address and emit a row.
             for func in &self.functions {
-                let off = emit_set_address(&mut header_body, func.low_pc);
-                addr_relocs.push(4 + off as u32);
+                select_file(&mut header_body, func);
+                let address = func.low_pc;
+                let off = emit_set_address(&mut header_body, address);
+                addr_relocs.push((4 + off as u32, address));
                 header_body.push(1); // DW_LNS_copy
 
-                let off = emit_set_address(&mut header_body, func.low_pc + func.size as u64);
-                addr_relocs.push(4 + off as u32);
+                let address = func.low_pc + func.size as u64;
+                let off = emit_set_address(&mut header_body, address);
+                addr_relocs.push((4 + off as u32, address));
             }
         }
 
@@ -2000,11 +2545,47 @@ fn variable_abbrev(var: &VariableDebugInfo) -> u32 {
     }
 }
 
+/// Offset of `.debug_info`'s DIE body within the section: the body is built
+/// after the 4-byte DWARF32 `unit_length`, which is prepended last.
+const INFO_BODY_BASE: u32 = 4;
+
+/// Append a DWARF32 section-offset field to the `.debug_info` body and record
+/// its relocation against `target`.
+fn push_info_offset(
+    body: &mut Vec<u8>,
+    relocs: &mut Vec<DwarfFieldRelocation>,
+    target: DwarfSectionKind,
+    value: u32,
+) {
+    relocs.push(DwarfFieldRelocation {
+        section: DwarfSectionKind::Info,
+        offset: INFO_BODY_BASE + body.len() as u32,
+        width: DwarfRelocWidth::Bits32,
+        target: DwarfRelocTarget::Section(target),
+        addend: u64::from(value),
+    });
+    body.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Append a `DW_FORM_addr` code address to the `.debug_info` body and record
+/// its relocation against the text section.
+fn push_info_address(body: &mut Vec<u8>, relocs: &mut Vec<DwarfFieldRelocation>, value: u64) {
+    relocs.push(DwarfFieldRelocation {
+        section: DwarfSectionKind::Info,
+        offset: INFO_BODY_BASE + body.len() as u32,
+        width: DwarfRelocWidth::Bits64,
+        target: DwarfRelocTarget::Text,
+        addend: value,
+    });
+    body.extend_from_slice(&value.to_le_bytes());
+}
+
 fn emit_location_attr(
     location: &VariableLocation,
     loclist_offsets: &[u32],
     loclist_cursor: &mut usize,
     body: &mut Vec<u8>,
+    relocs: &mut Vec<DwarfFieldRelocation>,
 ) -> Result<(), DwarfEmitError> {
     match location {
         VariableLocation::LocationList(_) => {
@@ -2014,7 +2595,7 @@ fn emit_location_attr(
                 },
             )?;
             *loclist_cursor += 1;
-            body.extend_from_slice(&offset.to_le_bytes());
+            push_info_offset(body, relocs, DwarfSectionKind::Loc, offset);
         }
         _ => {
             let loc_expr = try_encode_location_expr(location)?;
@@ -2045,13 +2626,35 @@ fn encoded_location_list_len(entries: &[LocationListEntry]) -> Result<u32, Dwarf
     Ok(len)
 }
 
+/// Emit one DWARF4 location list. Entry bounds are offsets from the
+/// compile unit's base address (`DW_AT_low_pc`, here `base`), as DWARF4
+/// section 2.6.2 requires, so they need no relocation of their own.
 fn emit_location_list_entries(
     entries: &[LocationListEntry],
+    base: u64,
     out: &mut Vec<u8>,
 ) -> Result<(), DwarfEmitError> {
     for entry in entries {
-        out.extend_from_slice(&entry.low_pc.to_le_bytes());
-        out.extend_from_slice(&entry.high_pc().to_le_bytes());
+        let start =
+            entry
+                .low_pc
+                .checked_sub(base)
+                .ok_or_else(|| DwarfEmitError::AddressOutOfFunction {
+                    function: String::from("<compile unit>"),
+                    what: "location-list range",
+                    start: entry.low_pc,
+                    end: entry.low_pc.saturating_add(u64::from(entry.size)),
+                    low_pc: base,
+                    size: 0,
+                })?;
+        if entry.size == 0 {
+            return Err(DwarfEmitError::EmptyLocationRange {
+                function: String::from("<compile unit>"),
+                start: entry.low_pc,
+            });
+        }
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&(start + u64::from(entry.size)).to_le_bytes());
         let expr_len: u16 = entry.expression.len().try_into().map_err(|_| {
             DwarfEmitError::LocationExpressionTooLarge {
                 len: entry.expression.len(),
@@ -2161,7 +2764,9 @@ fn emit_abbrev_attr(data: &mut Vec<u8>, name: u16, form: u8) {
 /// - `__debug_loc` when location lists are present
 ///
 /// All sections use `S_ATTR_DEBUG` and 1-byte alignment (no alignment
-/// requirements for DWARF sections).
+/// requirements for DWARF sections). The bytes come from
+/// [`DwarfDebugInfo::try_emit_section_image`], so the address-range checks
+/// apply to Mach-O exactly as to ELF.
 ///
 /// # Returns
 ///
@@ -2171,35 +2776,39 @@ pub fn add_debug_info_to_writer(
     writer: &mut MachOWriter,
     debug_info: &DwarfDebugInfo,
 ) -> Result<Option<(usize, usize, usize, usize)>, DwarfEmitError> {
-    if debug_info.functions.is_empty() {
+    let Some(image) = debug_info.try_emit_section_image()? else {
         return Ok(None);
-    }
-
-    let abbrev_data = debug_info.emit_abbrev();
-    let (info_data, info_addr_relocs) = debug_info.try_emit_debug_info_with_addr_relocs()?;
-    let str_data = debug_info.emit_debug_str();
-    let (line_data, line_addr_relocs) = debug_info.emit_debug_line_with_addr_relocs();
-    let loc_data = debug_info.try_emit_debug_loc()?;
+    };
 
     let abbrev_idx = writer.add_custom_section(
         b"__debug_abbrev",
         b"__DWARF",
-        &abbrev_data,
+        &image.abbrev,
         0, // 2^0 = 1-byte alignment
         S_ATTR_DEBUG,
     );
 
     let info_idx =
-        writer.add_custom_section(b"__debug_info", b"__DWARF", &info_data, 0, S_ATTR_DEBUG);
+        writer.add_custom_section(b"__debug_info", b"__DWARF", &image.info, 0, S_ATTR_DEBUG);
 
-    let str_idx = writer.add_custom_section(b"__debug_str", b"__DWARF", &str_data, 0, S_ATTR_DEBUG);
+    let str_idx =
+        writer.add_custom_section(b"__debug_str", b"__DWARF", &image.str, 0, S_ATTR_DEBUG);
 
     let line_idx =
-        writer.add_custom_section(b"__debug_line", b"__DWARF", &line_data, 0, S_ATTR_DEBUG);
+        writer.add_custom_section(b"__debug_line", b"__DWARF", &image.line, 0, S_ATTR_DEBUG);
 
-    if debug_info.has_location_lists() {
-        writer.add_custom_section(b"__debug_loc", b"__DWARF", &loc_data, 0, S_ATTR_DEBUG);
+    if let Some(loc) = &image.loc {
+        writer.add_custom_section(b"__debug_loc", b"__DWARF", loc, 0, S_ATTR_DEBUG);
     }
+    let text_relocs = |section: DwarfSectionKind| {
+        image
+            .relocations
+            .iter()
+            .filter(move |reloc| reloc.section == section && reloc.target == DwarfRelocTarget::Text)
+            .map(|reloc| reloc.offset)
+    };
+    let info_addr_relocs = text_relocs(DwarfSectionKind::Info);
+    let line_addr_relocs = text_relocs(DwarfSectionKind::Line);
 
     // Relocate every DW_FORM_addr / DW_LNE_set_address operand against the code
     // section so the o-local addresses written into `.debug_info` / `.debug_line`
@@ -3964,5 +4573,205 @@ mod tests {
             "enum with 3 enumerators should produce larger .debug_info \
              than enum with 1 enumerator (small={small}, big={big})"
         );
+    }
+
+    // --- Section image: address-range checks and relocated fields ---
+
+    fn located_function(
+        name: &str,
+        low_pc: u64,
+        size: u32,
+        lines: &[u64],
+        loc: Option<(u64, u32)>,
+    ) -> FunctionDebugInfo {
+        FunctionDebugInfo {
+            name: name.to_string(),
+            linkage_name: None,
+            low_pc,
+            size,
+            params: loc
+                .map(|(start, len)| {
+                    vec![FunctionParam {
+                        name: format!("{name}_arg"),
+                        type_index: 0,
+                        location: VariableLocation::LocationList(vec![
+                            LocationListEntry::from_location(
+                                start,
+                                len,
+                                &VariableLocation::Register(0),
+                            ),
+                        ]),
+                    }]
+                })
+                .unwrap_or_default(),
+            variables: vec![],
+            scopes: vec![],
+            line_entries: lines
+                .iter()
+                .map(|&address| SourceLineEntry {
+                    address,
+                    line: 7,
+                    column: 1,
+                    is_stmt: true,
+                })
+                .collect(),
+            decl_file: 1,
+            decl_line: 7,
+        }
+    }
+
+    fn image_error(func: FunctionDebugInfo) -> DwarfEmitError {
+        let mut dbg = DwarfDebugInfo::new("unit.rs", "/src", SourceLanguage::Rust);
+        dbg.add_base_type(BaseType::i64());
+        dbg.add_function(func);
+        dbg.try_emit_section_image()
+            .expect_err("the image must refuse this function")
+    }
+
+    #[test]
+    fn section_image_refuses_line_rows_outside_or_out_of_order() {
+        assert!(matches!(
+            image_error(located_function("f", 0, 8, &[0, 8], None)),
+            DwarfEmitError::AddressOutOfFunction {
+                what: "line row",
+                start: 8,
+                ..
+            }
+        ));
+        assert!(matches!(
+            image_error(located_function("f", 16, 8, &[12], None)),
+            DwarfEmitError::AddressOutOfFunction { .. }
+        ));
+        assert!(matches!(
+            image_error(located_function("f", 0, 16, &[8, 4], None)),
+            DwarfEmitError::LineRowOrder {
+                previous: 8,
+                address: 4,
+                ..
+            }
+        ));
+        assert!(matches!(
+            image_error(located_function("f", 0, 16, &[6], None)),
+            DwarfEmitError::LineRowOrder { address: 6, .. }
+        ));
+    }
+
+    #[test]
+    fn section_image_refuses_empty_or_escaping_location_ranges() {
+        assert!(matches!(
+            image_error(located_function("f", 0, 16, &[], Some((4, 0)))),
+            DwarfEmitError::EmptyLocationRange { start: 4, .. }
+        ));
+        assert!(matches!(
+            image_error(located_function("f", 0, 16, &[], Some((8, 12)))),
+            DwarfEmitError::AddressOutOfFunction {
+                what: "location-list range",
+                start: 8,
+                end: 20,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn section_image_records_every_relocated_field_at_its_addend() {
+        let mut dbg = DwarfDebugInfo::new("unit.rs", "/src", SourceLanguage::Rust);
+        dbg.add_base_type(BaseType::i64());
+        dbg.add_function(located_function("first", 0, 16, &[0, 8], Some((0, 8))));
+        dbg.add_function(located_function("second", 16, 8, &[16], None));
+        let image = dbg.try_emit_section_image().unwrap().unwrap();
+
+        let of = |section, target| {
+            image
+                .relocations
+                .iter()
+                .filter(|r| r.section == section && r.target == target)
+                .collect::<Vec<_>>()
+        };
+        // Unit header abbreviation offset and DW_AT_stmt_list.
+        let abbrev = of(
+            DwarfSectionKind::Info,
+            DwarfRelocTarget::Section(DwarfSectionKind::Abbrev),
+        );
+        assert_eq!(abbrev.len(), 1);
+        assert_eq!((abbrev[0].offset, abbrev[0].addend), (6, 0));
+        assert_eq!(
+            of(
+                DwarfSectionKind::Info,
+                DwarfRelocTarget::Section(DwarfSectionKind::Line)
+            )
+            .len(),
+            1
+        );
+        // Every DW_FORM_strp names a NUL-terminated string in .debug_str.
+        let names: Vec<String> = of(
+            DwarfSectionKind::Info,
+            DwarfRelocTarget::Section(DwarfSectionKind::Str),
+        )
+        .iter()
+        .map(|r| {
+            let start = r.addend as usize;
+            let end = start + image.str[start..].iter().position(|b| *b == 0).unwrap();
+            String::from_utf8(image.str[start..end].to_vec()).unwrap()
+        })
+        .collect();
+        for expected in [
+            PRODUCER,
+            "unit.rs",
+            "/src",
+            "first",
+            "second",
+            "first_arg",
+            "i64",
+        ] {
+            assert!(names.iter().any(|n| n == expected), "{expected}: {names:?}");
+        }
+        // One location list, relocated into .debug_loc.
+        assert_eq!(
+            of(
+                DwarfSectionKind::Info,
+                DwarfRelocTarget::Section(DwarfSectionKind::Loc)
+            )
+            .len(),
+            1
+        );
+        // CU low_pc and both subprogram low_pcs are code addresses.
+        let info_code: Vec<u64> = of(DwarfSectionKind::Info, DwarfRelocTarget::Text)
+            .iter()
+            .map(|r| r.addend)
+            .collect();
+        assert_eq!(info_code, vec![0, 0, 16]);
+        // Line-program set_address operands carry each function's start and end.
+        let line_code: Vec<u64> = of(DwarfSectionKind::Line, DwarfRelocTarget::Text)
+            .iter()
+            .map(|r| r.addend)
+            .collect();
+        assert_eq!(line_code, vec![0, 16, 16, 24]);
+        assert!(
+            image
+                .relocations
+                .iter()
+                .all(|r| r.section != DwarfSectionKind::Loc)
+        );
+
+        // Clearing leaves every relocated field zero and nothing else changed.
+        let mut cleared = image.clone();
+        cleared.clear_relocated_fields().unwrap();
+        assert_ne!(cleared.info, image.info);
+        assert_eq!(cleared.abbrev, image.abbrev);
+        assert!(cleared.check_relocated_fields().is_err());
+    }
+
+    #[test]
+    fn debug_loc_entries_are_relative_to_the_unit_base() {
+        let mut dbg = DwarfDebugInfo::new("unit.rs", "/src", SourceLanguage::Rust);
+        dbg.add_base_type(BaseType::i64());
+        dbg.add_function(located_function("f", 32, 16, &[], Some((36, 8))));
+        let loc = dbg.try_emit_debug_loc().unwrap();
+        // start = 36 - 32, end = start + 8, then the expression and terminator.
+        assert_eq!(u64::from_le_bytes(loc[0..8].try_into().unwrap()), 4);
+        assert_eq!(u64::from_le_bytes(loc[8..16].try_into().unwrap()), 12);
+        let terminator = &loc[loc.len() - 16..];
+        assert!(terminator.iter().all(|b| *b == 0));
     }
 }

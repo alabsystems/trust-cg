@@ -1,0 +1,43 @@
+| row | A instr | T instr | B instr | T/A | B/A | B/T | A cycles | B cycles | result |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| ABCorrectness | 2,106 M | 2,075 M | 1,767 M | 0.985 | 0.839 | 0.852 | 707 M | 636 M | limit_reached / observed_prefix_matched |
+| ACP_NB_TLC | 12,839 M | 12,498 M | 9,561 M | 0.973 | 0.745 | 0.765 | 4,084 M | 3,207 M | limit_reached / observed_prefix_matched |
+| ACP_SB_TLC | 8,954 M | 8,748 M | 6,817 M | 0.977 | 0.761 | 0.779 | 2,956 M | 2,348 M | limit_reached / observed_prefix_matched |
+| AsyncTerminationDetection | 3,438 M | 3,373 M | 2,784 M | 0.981 | 0.810 | 0.825 | 1,142 M | 969 M | limit_reached / observed_prefix_matched |
+| AsynchInterface | 1,395 M | 1,375 M | 1,179 M | 0.986 | 0.845 | 0.857 | 492 M | 454 M | limit_reached / observed_prefix_matched |
+| Barrier | 1,415 M | 1,393 M | 1,175 M | 0.984 | 0.831 | 0.844 | 515 M | 457 M | limit_reached / observed_prefix_matched |
+| Barriers | 18,698 M | 17,911 M | 13,193 M | 0.958 | 0.706 | 0.737 | 5,710 M | 4,262 M | limit_reached / observed_prefix_matched |
+| CatEvenBoxes | 1,630 M | 1,600 M | 1,366 M | 0.981 | 0.838 | 0.854 | 572 M | 522 M | limit_reached / observed_prefix_matched |
+| CatOddBoxes | 1,631 M | 1,598 M | 1,363 M | 0.980 | 0.836 | 0.853 | 562 M | 487 M | limit_reached / observed_prefix_matched |
+| Chameneos | 3,001 M | 2,939 M | 2,345 M | 0.979 | 0.781 | 0.798 | 968 M | 827 M | limit_reached / observed_prefix_matched |
+| Channel | 1,508 M | 1,480 M | 1,196 M | 0.981 | 0.793 | 0.808 | 541 M | 464 M | limit_reached / observed_prefix_matched |
+| Consensus | 753 M | 746 M | 693 M | 0.991 | 0.920 | 0.928 | 298 M | 261 M | limit_reached / observed_prefix_matched |
+| DiningPhilosophers | 4,576 M | 4,493 M | 3,612 M | 0.982 | 0.789 | 0.804 | 1,455 M | 1,223 M | limit_reached / observed_prefix_matched |
+| HourClock | 457 M | 454 M | 400 M | 0.994 | 0.875 | 0.880 | 196 M | 179 M | limit_reached / observed_prefix_matched |
+| HourClock2 | 434 M | 428 M | 380 M | 0.985 | 0.876 | 0.889 | 189 M | 175 M | limit_reached / observed_prefix_matched |
+| LiveHourClock | 407 M | 401 M | 353 M | 0.985 | 0.867 | 0.880 | 176 M | 157 M | limit_reached / observed_prefix_matched |
+| Lock | 2,672 M | 2,632 M | 2,206 M | 0.985 | 0.826 | 0.838 | 879 M | 798 M | limit_reached / observed_prefix_matched |
+| MCConsensus | 1,050 M | 1,041 M | 950 M | 0.991 | 0.904 | 0.912 | 379 M | 362 M | limit_reached / observed_prefix_matched |
+| MCConsensus_2 | 841 M | 835 M | 776 M | 0.993 | 0.923 | 0.929 | 320 M | 298 M | limit_reached / observed_prefix_matched |
+| MCInnerFIFO | 3,391 M | 3,334 M | 2,690 M | 0.983 | 0.793 | 0.807 | 1,125 M | 946 M | limit_reached / observed_prefix_matched |
+| MCInternalMemory | 3,987 M | 3,893 M | 3,066 M | 0.977 | 0.769 | 0.787 | 1,295 M | 1,041 M | limit_reached / observed_prefix_matched |
+| MCLiveInternalMemory | 3,689 M | 3,616 M | 2,876 M | 0.980 | 0.779 | 0.795 | 1,199 M | 995 M | limit_reached / observed_prefix_matched |
+| Peterson | 5,553 M | 5,467 M | 4,597 M | 0.984 | 0.828 | 0.841 | 1,762 M | 1,505 M | limit_reached / observed_prefix_matched |
+| Prisoner | 2,980 M | 2,925 M | 2,416 M | 0.982 | 0.811 | 0.826 | 1,010 M | 847 M | limit_reached / observed_prefix_matched |
+| PrisonerLightUnknown | 2,991 M | 2,921 M | 2,417 M | 0.976 | 0.808 | 0.828 | 1,036 M | 859 M | limit_reached / observed_prefix_matched |
+| PrisonerSolo | 2,964 M | 2,907 M | 2,400 M | 0.981 | 0.809 | 0.825 | 1,029 M | 865 M | limit_reached / observed_prefix_matched |
+| PrisonerSoloLightUnknown | 2,959 M | 2,899 M | 2,395 M | 0.979 | 0.809 | 0.826 | 1,006 M | 861 M | limit_reached / observed_prefix_matched |
+| Simple | 4,296 M | 4,189 M | 3,306 M | 0.975 | 0.769 | 0.789 | 1,357 M | 1,104 M | limit_reached / observed_prefix_matched |
+| SimpleRegular | 5,831 M | 5,678 M | 4,619 M | 0.974 | 0.792 | 0.813 | 1,805 M | 1,503 M | limit_reached / observed_prefix_matched |
+| SpanTree | 1,594 M | 1,569 M | 1,278 M | 0.984 | 0.802 | 0.815 | 539 M | 459 M | limit_reached / observed_prefix_matched |
+| SyncTerminationDetection | 2,209 M | 2,177 M | 1,819 M | 0.985 | 0.823 | 0.836 | 710 M | 624 M | limit_reached / observed_prefix_matched |
+| TCommit | 2,201 M | 2,162 M | 1,821 M | 0.983 | 0.828 | 0.842 | 715 M | 629 M | limit_reached / observed_prefix_matched |
+| TwoPhase | 3,822 M | 3,761 M | 3,183 M | 0.984 | 0.833 | 0.846 | 1,246 M | 1,091 M | limit_reached / observed_prefix_matched |
+| VoucherLifeCycle | 3,550 M | 3,461 M | 2,751 M | 0.975 | 0.775 | 0.795 | 1,095 M | 894 M | limit_reached / observed_prefix_matched |
+| clean | 2,438 M | 2,400 M | 2,090 M | 0.985 | 0.857 | 0.871 | 817 M | 755 M | limit_reached / observed_prefix_matched |
+| dijkstra-mutex_LSpec-model | 9,055 M | 8,914 M | 7,430 M | 0.984 | 0.821 | 0.834 | 2,995 M | 2,580 M | limit_reached / observed_prefix_matched |
+| kvstore | 5,680 M | 5,530 M | 4,425 M | 0.974 | 0.779 | 0.800 | 1,882 M | 1,542 M | limit_reached / observed_prefix_matched |
+| nbacc_ray97 | 4,767 M | 4,683 M | 3,789 M | 0.982 | 0.795 | 0.809 | 1,472 M | 1,234 M | limit_reached / observed_prefix_matched |
+| nbacg_guer01 | 8,390 M | 8,222 M | 6,794 M | 0.980 | 0.810 | 0.826 | 2,714 M | 2,297 M | limit_reached / observed_prefix_matched |
+| stages | 3,063 M | 3,019 M | 2,592 M | 0.986 | 0.846 | 0.859 | 1,002 M | 910 M | limit_reached / observed_prefix_matched |
+| **total** | 153,216 M | 149,746 M | 120,871 M | 0.977 | 0.789 | 0.807 | 49,949 M | 41,627 M | |

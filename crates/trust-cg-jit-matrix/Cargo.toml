@@ -24,6 +24,14 @@ name = "bcp_matrix"
 path = "src/bin/bcp_matrix.rs"
 
 [[bin]]
+name = "compile_corpus"
+path = "src/bin/compile_corpus.rs"
+
+[[bin]]
+name = "tier_up_bench"
+path = "src/bin/tier_up_bench.rs"
+
+[[bin]]
 name = "jit_compile_breakdown_table"
 path = "src/bin/jit_compile_breakdown_table.rs"
 required-features = ["unsafe-unrelocated-buffer-cache-test-hooks"]
@@ -40,18 +48,26 @@ clap = { version = "4", features = ["derive"] }
 thiserror = { workspace = true }
 trust-cg-codegen = { path = "../trust-cg-codegen", default-features = false }
 trust-cg-ir = { workspace = true }
+# compile_corpus drives the adapter and reads the frame net's coverage counters.
+trust-cg-lower = { workspace = true }
+trust-cg-verify = { workspace = true, default-features = false }
 trust-cg-process-env = { workspace = true }
 trust-ir = { workspace = true }
 trust-ir-build = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+tempfile = "3"
+
+# compile_corpus reads macOS instruction/cycle counters; the executable-buffer
+# cache obtains its seal key with getentropy on both macOS and Linux.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 sha2 = "0.10"
 
 [dev-dependencies]
-tempfile = "3"
 criterion = "0.5"
 
 [[bench]]

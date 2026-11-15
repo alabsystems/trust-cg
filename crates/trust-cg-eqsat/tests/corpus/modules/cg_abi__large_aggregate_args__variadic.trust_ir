@@ -1,0 +1,78 @@
+; TrustIr text format v1
+module "large_aggregate_variadic"
+target "aarch64-unknown-linux-gnu" 8 little abi="aapcs64"
+
+struct @Quad { q0: i64 @0, q1: i64 @8, q2: i64 @16, q3: i64 @24 } size=32 align=8 repr=c id=0
+
+struct @Tri { t0: i64 @0, t1: i64 @8, t2: i64 @16 } size=24 align=8 repr=c id=1
+
+struct @K { g: [ty.0 x 128] @0 } size=1024 align=8 repr=c id=2
+
+struct @M2 { g: [ty.0 x 33] @0 } size=264 align=8 repr=c id=3
+
+functy.0 = (i64, ...) -> (i64)
+
+functy.1 = (ptr, struct.0, i64) -> (i64)
+
+functy.2 = (ptr, struct.0, struct.1, i64) -> (i64)
+
+functy.3 = (ptr, struct.2, i64) -> (i64)
+
+functy.4 = (ptr, ptr, i64) -> (i64)
+
+functy.5 = (ptr, struct.3, i64) -> (i64)
+
+type ty.0 = i64
+
+fn @c_var_mut(functy.0) {
+}
+
+fn @c_var_sum(functy.0) {
+}
+
+fn @var_mut_pass(functy.1) {
+bb0(%0: ptr, %1: struct.0, %2: i64):
+    %3 = call @func.0(%2, %1, %1)
+    store struct.0 %1, ptr %0
+    ret %3
+}
+
+fn @var_value_pass(functy.2) {
+bb0(%0: ptr, %1: struct.0, %2: struct.1, %3: i64):
+    %4 = call @func.1(%3, %1, %2, %1)
+    store struct.0 %1, ptr %0
+    %5 = const i64 32
+    %6 = gep i8, ptr %0, %5
+    store struct.1 %2, ptr %6
+    ret %4
+}
+
+fn @c_var_k(functy.0) {
+}
+
+fn @c_var_m2(functy.0) {
+}
+
+fn @var_param_k(functy.3) {
+bb0(%0: ptr, %1: struct.2, %2: i64):
+    %3 = call @func.4(%2, %1)
+    store struct.2 %1, ptr %0
+    ret %3
+}
+
+fn @var_block_k(functy.4) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %3 = load struct.2, ptr %1
+    br bb1(%3)
+bb1(%4: struct.2):
+    %5 = call @func.4(%2, %4)
+    store struct.2 %4, ptr %0
+    ret %5
+}
+
+fn @var_param_m2(functy.5) {
+bb0(%0: ptr, %1: struct.3, %2: i64):
+    %3 = call @func.5(%2, %1)
+    store struct.3 %1, ptr %0
+    ret %3
+}

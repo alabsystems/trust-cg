@@ -40,13 +40,223 @@
       "solver": {
         "concrete_ub": 0,
         "proven_safe": 0,
-        "remaining_unknown": 0,
-        "results": 0
+        "remaining_unknown": 16,
+        "results": 16
       },
-      "solver_statuses": [],
+      "solver_statuses": [
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "test",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "testL",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "testL",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "testL",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "testL",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        }
+      ],
       "source_family": "divtest",
-      "unknown": 0,
-      "unknowns": []
+      "unknown": 16,
+      "unknowns": [
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "test",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "testL",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "testL",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "testL",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "testL",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        }
+      ]
     },
     {
       "concrete_ub": 0,
@@ -153,13 +363,28 @@
       "solver": {
         "concrete_ub": 0,
         "proven_safe": 0,
-        "remaining_unknown": 0,
-        "results": 0
+        "remaining_unknown": 1,
+        "results": 1
       },
-      "solver_statuses": [],
+      "solver_statuses": [
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        }
+      ],
       "source_family": "cast tests",
-      "unknown": 0,
-      "unknowns": []
+      "unknown": 1,
+      "unknowns": [
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        }
+      ]
     },
     {
       "concrete_ub": 0,
@@ -190,13 +415,54 @@
       "solver": {
         "concrete_ub": 0,
         "proven_safe": 0,
-        "remaining_unknown": 0,
-        "results": 0
+        "remaining_unknown": 3,
+        "results": 3
       },
-      "solver_statuses": [],
+      "solver_statuses": [
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "pointer-arithmetic",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        }
+      ],
       "source_family": "cast tests",
-      "unknown": 0,
-      "unknowns": []
+      "unknown": 3,
+      "unknowns": [
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "pointer-arithmetic",
+          "reason": "the pointer has no tracked provenance, and its address is not proven one the interpreter computes (a parameter, or moved by a GEP whose no-wrap is not proven): it may lie so far past its allocation that base + offset has no address",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it; the path passes the unmodeled bb0 CondBr condition v10, so no solver escalation",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it; the path passes the unmodeled bb0 CondBr condition v10, so no solver escalation",
+          "solver_candidate": false
+        }
+      ]
     },
     {
       "concrete_ub": 0,
@@ -227,13 +493,28 @@
       "solver": {
         "concrete_ub": 0,
         "proven_safe": 0,
-        "remaining_unknown": 0,
-        "results": 0
+        "remaining_unknown": 1,
+        "results": 1
       },
-      "solver_statuses": [],
+      "solver_statuses": [
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        }
+      ],
       "source_family": "printf globals",
-      "unknown": 0,
-      "unknowns": []
+      "unknown": 1,
+      "unknowns": [
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        }
+      ]
     },
     {
       "concrete_ub": 0,
@@ -257,13 +538,67 @@
       "solver": {
         "concrete_ub": 0,
         "proven_safe": 0,
-        "remaining_unknown": 0,
-        "results": 0
+        "remaining_unknown": 4,
+        "results": 4
       },
-      "solver_statuses": [],
+      "solver_statuses": [
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "bounds",
+          "status": "unsupported"
+        },
+        {
+          "detail": "bounded local solver state count 4294967296 exceeds limit 65536",
+          "function": "main",
+          "kind": "null-deref",
+          "status": "timeout"
+        },
+        {
+          "detail": "bounded local solver state count 4294967296 exceeds limit 65536",
+          "function": "main",
+          "kind": "pointer-arithmetic",
+          "status": "timeout"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "use-after-free",
+          "status": "unsupported"
+        }
+      ],
       "source_family": "printf globals",
-      "unknown": 0,
-      "unknowns": []
+      "unknown": 4,
+      "unknowns": [
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "bounds",
+          "reason": "the pointer has no tracked provenance (a parameter, or an address computed from inputs): the object it points into is not tracked",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": true,
+          "function": "main",
+          "kind": "null-deref",
+          "reason": "no witness found in evaluator; escalate to SMT",
+          "solver_candidate": true
+        },
+        {
+          "candidate_expression": true,
+          "function": "main",
+          "kind": "pointer-arithmetic",
+          "reason": "no witness found in evaluator; escalate to SMT",
+          "solver_candidate": true
+        },
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "use-after-free",
+          "reason": "the pointer has no tracked provenance (a parameter, or an address computed from inputs): the object it points into is not tracked; the lifetime of its object is unknown",
+          "solver_candidate": false
+        }
+      ]
     },
     {
       "concrete_ub": 0,
@@ -298,13 +633,41 @@
       "solver": {
         "concrete_ub": 0,
         "proven_safe": 0,
-        "remaining_unknown": 0,
-        "results": 0
+        "remaining_unknown": 2,
+        "results": 2
       },
-      "solver_statuses": [],
+      "solver_statuses": [
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "testBitWiseNot",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        },
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "testBooleanNot",
+          "kind": "unsummarized-call",
+          "status": "unsupported"
+        }
+      ],
       "source_family": "nottest",
-      "unknown": 0,
-      "unknowns": []
+      "unknown": 2,
+      "unknowns": [
+        {
+          "candidate_expression": false,
+          "function": "testBitWiseNot",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it",
+          "solver_candidate": false
+        },
+        {
+          "candidate_expression": false,
+          "function": "testBooleanNot",
+          "kind": "unsummarized-call",
+          "reason": "external callee `printf` (External linkage) receives pointer-carrying argument #0 (Ptr); fsym has no summary of what it reads, writes or frees through it; the path passes the unmodeled bb0 CondBr condition v10, so no solver escalation",
+          "solver_candidate": false
+        }
+      ]
     },
     {
       "concrete_ub": 0,
@@ -429,13 +792,28 @@
       "solver": {
         "concrete_ub": 0,
         "proven_safe": 0,
-        "remaining_unknown": 0,
-        "results": 0
+        "remaining_unknown": 1,
+        "results": 1
       },
-      "solver_statuses": [],
+      "solver_statuses": [
+        {
+          "detail": "missing explicit candidate expression",
+          "function": "main",
+          "kind": "arithmetic",
+          "status": "unsupported"
+        }
+      ],
       "source_family": "bitreverse intrinsic",
-      "unknown": 0,
-      "unknowns": []
+      "unknown": 1,
+      "unknowns": [
+        {
+          "candidate_expression": false,
+          "function": "main",
+          "kind": "arithmetic",
+          "reason": "operand value is not modeled; cannot prove the side condition",
+          "solver_candidate": false
+        }
+      ]
     }
   ],
   "generated_with": {
@@ -445,6 +823,9 @@
   },
   "issue": 862,
   "parent_issue": 377,
+  "repin_notes": [
+    "trust-cg fsym-r3 (2026-09-23): unknown 23 -> 27 (solver results 23 -> 27, all remaining unknown), all in mutable_byte_globals `main`, which stores i8 through `gep(const ptr 0xFADE000000000000, sext(argc))` (the importer's placeholder address for a global). Before, the nonzero constant pointer passed null and had no object, so bounds were never checked and the function scanned clean. A constant address carries no provenance, and an address offset by an input is exact but untracked: the store now owes null (input-dependent address), bounds and lifetime Unknowns, and the GEP a pointer-arithmetic Unknown (its offset may overflow). Every other fixture: unchanged counts; the unsummarized-call reasons are unchanged text."
+  ],
   "totals": {
     "concrete_ub": 0,
     "false_positive_basis_points": 0,
@@ -455,9 +836,9 @@
     "solver": {
       "concrete_ub": 0,
       "proven_safe": 0,
-      "remaining_unknown": 0,
-      "results": 0
+      "remaining_unknown": 28,
+      "results": 28
     },
-    "unknown": 0
+    "unknown": 28
   }
 }

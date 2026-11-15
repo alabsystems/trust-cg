@@ -1,0 +1,561 @@
+{
+  "name": "ty_composite",
+  "functions": [
+    {
+      "id": 0,
+      "name": "composite_carrier",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Struct": 0
+              }
+            ],
+            [
+              1,
+              {
+                "Array": [
+                  0,
+                  4
+                ]
+              }
+            ],
+            [
+              2,
+              {
+                "Tuple": [
+                  "I32",
+                  "F64",
+                  "Bool"
+                ]
+              }
+            ],
+            [
+              3,
+              {
+                "Enum": 0
+              }
+            ],
+            [
+              4,
+              {
+                "Func": 0
+              }
+            ],
+            [
+              5,
+              {
+                "Sequence": 0
+              }
+            ],
+            [
+              6,
+              {
+                "Set": [
+                  0,
+                  "Bitset"
+                ]
+              }
+            ],
+            [
+              7,
+              {
+                "Set": [
+                  0,
+                  "Boxed"
+                ]
+              }
+            ],
+            [
+              8,
+              {
+                "Record": 0
+              }
+            ],
+            [
+              9,
+              {
+                "Closure": 0
+              }
+            ],
+            [
+              10,
+              {
+                "Ref": "I64"
+              }
+            ],
+            [
+              11,
+              {
+                "RefMut": "I64"
+              }
+            ],
+            [
+              12,
+              {
+                "PtrConst": "U8"
+              }
+            ],
+            [
+              13,
+              {
+                "PtrMut": "U8"
+              }
+            ],
+            [
+              14,
+              {
+                "FatPtr": "Str"
+              }
+            ],
+            [
+              15,
+              {
+                "Rc": "I32"
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Undef": {
+                  "ty": "Unit"
+                }
+              },
+              "results": [
+                100
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    100
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [
+    {
+      "id": 0,
+      "name": "Point",
+      "fields": [
+        {
+          "name": "a",
+          "ty": "I32",
+          "offset": 0
+        },
+        {
+          "name": "b",
+          "ty": "F64",
+          "offset": 8
+        }
+      ],
+      "size": 16,
+      "align": 8,
+      "repr": "Rust"
+    }
+  ],
+  "enums": [
+    {
+      "id": 0,
+      "name": "Maybe",
+      "variants": [
+        {
+          "name": "Some",
+          "fields": [
+            "I64"
+          ],
+          "field_names": []
+        },
+        {
+          "name": "None",
+          "fields": [],
+          "field_names": []
+        }
+      ],
+      "discriminants": [],
+      "repr": null,
+      "layout": null
+    },
+    {
+      "id": 1,
+      "name": "Sparse",
+      "variants": [
+        {
+          "name": "Neg",
+          "fields": [],
+          "field_names": []
+        },
+        {
+          "name": "Next",
+          "fields": [
+            "I16"
+          ],
+          "field_names": []
+        },
+        {
+          "name": "Big",
+          "fields": [],
+          "field_names": []
+        }
+      ],
+      "discriminants": [
+        -3,
+        null,
+        1000
+      ],
+      "repr": "I16",
+      "layout": null
+    }
+  ],
+  "records": [
+    {
+      "id": 0,
+      "name": "Vec2",
+      "fields": [
+        {
+          "name": "x",
+          "ty": "I64",
+          "offset": null
+        },
+        {
+          "name": "y",
+          "ty": "I64",
+          "offset": null
+        }
+      ]
+    }
+  ],
+  "closure_types": [
+    {
+      "func": 0,
+      "captures": [
+        "I64",
+        "F64"
+      ]
+    }
+  ],
+  "globals": [
+    {
+      "name": "G_POINT",
+      "ty": {
+        "Struct": 0
+      },
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 1
+          },
+          {
+            "Float": {
+              "bits": 4612811918334230528
+            }
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "G_SEQ",
+      "ty": {
+        "Sequence": 0
+      },
+      "mutable": false,
+      "initializer": {
+        "Sequence": [
+          {
+            "Int": 1
+          },
+          {
+            "Int": 2
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "G_ARRAY",
+      "ty": {
+        "Array": [
+          0,
+          2
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Array": [
+          {
+            "Int": 1
+          },
+          {
+            "Int": 2
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "G_SET",
+      "ty": {
+        "Set": [
+          0,
+          "Boxed"
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Set": [
+          {
+            "Int": 1
+          },
+          {
+            "Int": 2
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "G_REC",
+      "ty": {
+        "Record": 0
+      },
+      "mutable": false,
+      "initializer": {
+        "Record": [
+          [
+            "x",
+            {
+              "Int": 1
+            }
+          ],
+          [
+            "y",
+            {
+              "Int": 2
+            }
+          ]
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "G_CLOSURE",
+      "ty": {
+        "Closure": 0
+      },
+      "mutable": false,
+      "initializer": {
+        "Closure": {
+          "func": 0,
+          "captures": [
+            {
+              "Int": 1
+            },
+            {
+              "Float": {
+                "bits": 4612811918334230528
+              }
+            }
+          ]
+        }
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "G_FNDEF",
+      "ty": {
+        "Func": 1
+      },
+      "mutable": false,
+      "initializer": {
+        "FnDef": 0
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "G_PHANTOM",
+      "ty": "Unit",
+      "mutable": false,
+      "initializer": "PhantomData",
+      "linkage": "Internal",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        {
+          "Struct": 0
+        },
+        {
+          "Array": [
+            0,
+            4
+          ]
+        },
+        {
+          "Tuple": [
+            "I32",
+            "F64",
+            "Bool"
+          ]
+        },
+        {
+          "Enum": 0
+        },
+        {
+          "Func": 0
+        },
+        {
+          "Sequence": 0
+        },
+        {
+          "Set": [
+            0,
+            "Bitset"
+          ]
+        },
+        {
+          "Set": [
+            0,
+            "Boxed"
+          ]
+        },
+        {
+          "Record": 0
+        },
+        {
+          "Closure": 0
+        },
+        {
+          "Ref": "I64"
+        },
+        {
+          "RefMut": "I64"
+        },
+        {
+          "PtrConst": "U8"
+        },
+        {
+          "PtrMut": "U8"
+        },
+        {
+          "FatPtr": "Str"
+        },
+        {
+          "Rc": "I32"
+        }
+      ],
+      "returns": [
+        "Unit"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "I32"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

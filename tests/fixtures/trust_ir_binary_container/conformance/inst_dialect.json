@@ -1,0 +1,161 @@
+{
+  "name": "inst_dialect",
+  "functions": [
+    {
+      "id": 0,
+      "name": "dialect_roundtrip",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "DialectOp": {
+                  "dialect": "verif",
+                  "op": "bfs_step",
+                  "operands": [
+                    0
+                  ],
+                  "result_tys": [
+                    "I32"
+                  ],
+                  "attrs": [
+                    {
+                      "name": "i64_attr",
+                      "value": {
+                        "I64": -7
+                      }
+                    },
+                    {
+                      "name": "u64_attr",
+                      "value": {
+                        "U64": 42
+                      }
+                    },
+                    {
+                      "name": "f64_attr",
+                      "value": {
+                        "F64": {
+                          "bits": 4615063718147915776
+                        }
+                      }
+                    },
+                    {
+                      "name": "bool_attr",
+                      "value": {
+                        "Bool": true
+                      }
+                    },
+                    {
+                      "name": "str_attr",
+                      "value": {
+                        "Str": "hello"
+                      }
+                    },
+                    {
+                      "name": "bytes_attr",
+                      "value": {
+                        "Bytes": [
+                          222,
+                          173,
+                          190,
+                          239
+                        ]
+                      }
+                    },
+                    {
+                      "name": "ty_attr",
+                      "value": {
+                        "Ty": "I32"
+                      }
+                    }
+                  ],
+                  "version": 1
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

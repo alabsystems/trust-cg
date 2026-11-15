@@ -72,32 +72,32 @@ impl ConversionPattern for VerifBfsStepToTrustIr {
         let frontier = op.operands[0];
         let seen_set = op.operands[1];
 
-        let magic = rewriter.alloc_value();
+        let magic = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_CONST),
             vec![(magic, Type::I64)],
             vec![],
             vec![("value".to_string(), Attribute::U64(BFS_STEP_MAGIC))],
             op.source,
-        );
+        )?;
 
-        let stepped = rewriter.alloc_value();
+        let stepped = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_ADD),
             vec![(stepped, Type::I64)],
             vec![frontier, seen_set],
             vec![],
             op.source,
-        );
+        )?;
 
-        let lowered = rewriter.alloc_value();
+        let lowered = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_XOR),
             vec![(lowered, Type::I64)],
             vec![stepped, magic],
             vec![],
             op.source,
-        );
+        )?;
 
         let (src_result, _) = op.results[0];
         rewriter.bind_result(src_result, lowered);
@@ -125,32 +125,32 @@ impl ConversionPattern for VerifFingerprintBatchToTrustIr {
         let states = op.operands[0];
         let count = op.operands[1];
 
-        let magic = rewriter.alloc_value();
+        let magic = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_CONST),
             vec![(magic, Type::I64)],
             vec![],
             vec![("value".to_string(), Attribute::U64(FINGERPRINT_BATCH_MAGIC))],
             op.source,
-        );
+        )?;
 
-        let t1 = rewriter.alloc_value();
+        let t1 = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_XOR),
             vec![(t1, Type::I64)],
             vec![states, count],
             vec![],
             op.source,
-        );
+        )?;
 
-        let t2 = rewriter.alloc_value();
+        let t2 = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_XOR),
             vec![(t2, Type::I64)],
             vec![t1, magic],
             vec![],
             op.source,
-        );
+        )?;
 
         let (src_result, _) = op.results[0];
         rewriter.bind_result(src_result, t2);
@@ -179,7 +179,7 @@ impl ConversionPattern for TrustIrConstToMachir {
             ));
         }
         let (src_result, ty) = op.results[0].clone();
-        let dst = rewriter.alloc_value();
+        let dst = rewriter.alloc_value()?;
         let mut attrs = vec![];
         if let Some(v) = op.attr("value").cloned() {
             attrs.push(("value".to_string(), v));
@@ -190,7 +190,7 @@ impl ConversionPattern for TrustIrConstToMachir {
             vec![],
             attrs,
             op.source,
-        );
+        )?;
         rewriter.bind_result(src_result, dst);
         Ok(())
     }
@@ -255,7 +255,7 @@ impl ConversionPattern for TrustIrRetToMachir {
             op.operands.clone(),
             vec![],
             op.source,
-        );
+        )?;
         Ok(())
     }
 }
@@ -276,14 +276,14 @@ fn binary_to_machir(
     let a = op.operands[0];
     let b = op.operands[1];
     let (src_result, ty) = op.results[0].clone();
-    let dst = rewriter.alloc_value();
+    let dst = rewriter.alloc_value()?;
     rewriter.emit(
         DialectOpId::new(machir_id, machir_op),
         vec![(dst, ty)],
         vec![a, b],
         vec![],
         op.source,
-    );
+    )?;
     rewriter.bind_result(src_result, dst);
     Ok(())
 }
@@ -372,23 +372,23 @@ impl ConversionPattern for AYValidateAuthorityToTrustIr {
         // We lower the AY authority check to a single register bitwise operation.
         // For PoC: (record >> 24) & 0x06 != 0  (ProofChecked or KernelChecked)
 
-        let shift = rewriter.alloc_value();
+        let shift = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_CONST),
             vec![(shift, Type::I64)],
             vec![],
             vec![("value".to_string(), Attribute::U64(24))],
             op.source,
-        );
+        )?;
 
-        let shifted = rewriter.alloc_value();
+        let shifted = rewriter.alloc_value()?;
         rewriter.emit(
             DialectOpId::new(self.trust_ir_id, trust_ir::TRUST_IR_XOR), // Toy bitwise
             vec![(shifted, Type::I64)],
             vec![record, shift],
             vec![],
             op.source,
-        );
+        )?;
 
         let (src_result, _) = op.results[0];
         rewriter.bind_result(src_result, shifted);

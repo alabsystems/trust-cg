@@ -34,8 +34,10 @@
 // fixture carries them with an explicit `kind` discriminator; the bridge feeds the
 // matching encoder the SAME imm/lane/scalar. NONE are silently dropped.
 //
-// Regenerate (run ON the M4):
-//   rustc -O crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_silicon_truth.rs \
+// Regenerate (run ON the M4) with the Trust compiler in its explicit
+// unverified lane: strict Trust verification refuses the inline `asm!`
+// wrappers ("opaque MIR terminator `InlineAsm` cannot be soundly lowered").
+//   trustc -O -Ztrust-verify=off crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_silicon_truth.rs \
 //       -o /tmp/gen_neon && /tmp/gen_neon \
 //       crates/trust-cg-verify/tests/fixtures/aarch64_neon_silicon_truth.json
 
@@ -796,7 +798,7 @@ fn main() {
     s.push_str("  \"oracle\": \"m4-silicon-native\",\n");
     s.push_str("  \"oracle_note\": \"Apple M4 (native AArch64). Each (op, arrangement) has an #[inline(never)] wrapper that ldr q1/q2, runs ONE packed NEON instruction (add v0.4s, ...), and str q0 the 128-bit result. otool -tv confirms the real mnemonics. 64-bit (D-register) arrangements zero the upper 64 bits in hardware.\",\n");
     s.push_str("  \"determinism\": \"deterministic: a fixed-seed LCG drives the per-lane edge grid (0, -1, INT_MIN, INT_MAX, 1, 2 LCG randoms) + alternating patterns + 4 random vectors; shift amounts are fixed and include amount >= lane width.\",\n");
-    s.push_str("  \"regen\": \"rustc -O crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_silicon_truth.rs -o /tmp/gen_neon && /tmp/gen_neon crates/trust-cg-verify/tests/fixtures/aarch64_neon_silicon_truth.json\",\n");
+    s.push_str("  \"regen\": \"trustc -O -Ztrust-verify=off crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_silicon_truth.rs -o /tmp/gen_neon && /tmp/gen_neon crates/trust-cg-verify/tests/fixtures/aarch64_neon_silicon_truth.json\",\n");
     s.push_str("  \"operands_encoding\": \"a/b/c (mla acc)/scalar (dup,ins)/result are 0x-prefixed 32-hex-digit 128-bit values, lane 0 in the low bits. imm = shift amount (shift) | movi 8-bit imm | ins lane index. kind discriminates the encoder shape.\",\n");
     let _ = write!(s, "  \"included_fact_count\": {total},\n");
     s.push_str("  \"included_per_op\": {\n");

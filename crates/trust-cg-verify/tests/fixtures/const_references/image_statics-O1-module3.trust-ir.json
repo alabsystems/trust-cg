@@ -1,0 +1,104 @@
+{
+  "name": "IMAGE_MUT",
+  "functions": [
+    {
+      "id": 0,
+      "name": "IMAGE_MUT.static.anchor",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "Internal",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "IMAGE_MUT",
+      "ty": {
+        "Array": [
+          0,
+          8
+        ]
+      },
+      "mutable": true,
+      "initializer": {
+        "Bytes": {
+          "data": [
+            239,
+            205,
+            171,
+            137,
+            103,
+            69,
+            35,
+            1
+          ],
+          "utf8": false
+        }
+      },
+      "linkage": "External",
+      "tls": null,
+      "align": 8,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "U8"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": []
+}

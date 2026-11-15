@@ -26,7 +26,7 @@
 //! with a `CSet` (`AndRI(load, M); CmpRI(_, C); CSet(c, cc)`) rather than a
 //! branch. It lowers with an `AND.16B` (isolate `b & M`) + `CMEQ.16B` (`0xFF`
 //! where `(b&M)==C`) [+ `NOT.16B` for `!=`] + `AND.16B`-by-ones prefix feeding
-//! the same UDOT-by-ones fold. The UTF-8 code-point-start count
+//! the same byte-fold. The UTF-8 code-point-start count
 //! `(b & 0xC0) != 0x80` is exactly this shape.
 //!
 //! The count-if form is not a straight `acc = MovR(AddRR(acc, term))` latch
@@ -35,8 +35,7 @@
 //! `c+1`; the arms rejoin at a phi-merge `c = MovR(merge)` in the latch). This
 //! pass recognizes that diamond directly and lowers it with a `CMEQ.16B` (== 0
 //! -> 0xFF per byte lane) + `AND.16B` (0xFF -> 0x01) prefix feeding the same
-//! UDOT-by-ones fold. SCOPED to the `== 0` predicate; any other predicate stays
-//! scalar.
+//! byte-fold. SCOPED to the `== 0` predicate; any other predicate stays scalar.
 //!
 //! `a` is a `[u8; N]` read-only array (loaded, never stored) and `N` is a
 //! **compile-time constant** loop bound that also bounds the array index (the
@@ -73,15 +72,13 @@
 //!   `CNT.16B` computes `popcount(b)` per lane (`= popcount(b & 0xFFFFFFFF)`, the
 //!   scalar `(a[i] as u32).count_ones()` — the high bits are zero, so the mask
 //!   is a no-op), and `a[i] as u64` is `zext8(b)`. The byte contributions are
-//!   folded straight into the `.4S` accumulators by the FAITHFULLY-PROVEN
-//!   `UDOT`-by-ones accumulate (`trust-cg-verify::neon_lowering_proofs`,
-//!   `proof_neon_udotv_lanewise_4s`): per i32 lane
-//!   `acc[i] += sum_j zext32(src.byte[4i+j]) * 1` — algebraically IDENTICAL,
-//!   lane for lane, to the UADDLP(`.16B->.8H`) + UADDLP(`.8H->.4S`) + ADD.4S
-//!   chain it replaces (zext associativity: both compute the exact 4-byte group
-//!   sum `<= 1020` and add it into lane `i` mod 2^32), in ONE SIMD op per Q
-//!   instead of three — the structure LLVM itself emits for this loop
-//!   (`udot.4s acc, data, ones` x 4 accumulators).
+//!   folded into the `.4S` accumulators by one of two FAITHFULLY-PROVEN routes:
+//!   targets that admit FEAT_DotProd use `UDOT`-by-ones; baseline AArch64 uses
+//!   UADDLP(`.16B->.8H`) + UADDLP(`.8H->.4S`) + ADD.4S. Both compute, per i32
+//!   lane, the exact four-byte group sum and add it into lane `i` mod 2^32.
+//!   The baseline route keeps generic AArch64 vectorized without emitting an
+//!   optional instruction; the DotProd route fuses the three baseline SIMD
+//!   instructions into one.
 //! * **No `.4S` overflow (why the const bound is required).** The vector partial
 //!   for ONE pass over the array holds `<= 8*N` (popcount) / `<= 255*N` (sum);
 //!   we fire only when that provably fits `i32` (`8*N < 2^31`), so the `.4S`
@@ -96,19 +93,18 @@
 //!     overwritten) so the scalar tail continues from it.
 //!
 //! Every NEON op emitted (`NeonMovi`, `NeonLdpQPost`, `NeonCntV`, `NeonCmeqV`,
-//! `NeonAndV`, `NeonUdotV`, `NeonAddV`, `NeonUmovGen`) is already
+//! `NeonAndV`, `NeonUdotV`, `NeonUaddlpV`, `NeonAddV`, `NeonUmovGen`) is already
 //! coverage-credited by a discharged proof — this pass introduces **no new
-//! emittable opcode** (`NeonUdotV` is the FAITHFUL D-pair accumulate obligation
-//! the ctpop-reduction lowering already relies on; the ones vector is the same
-//! `MOVI.16B #1` the count-if mask uses). The count-if kernel's `CMEQ.16B` mask
+//! emittable opcode**. `NeonUdotV` and both `NeonUaddlpV` arrangements have
+//! faithful D-pair obligations; the ones vector is the same `MOVI.16B #1` the
+//! count-if mask uses. The count-if kernel's `CMEQ.16B` mask
 //! is co-credited by the opcode-level `cmeqv.4s` query and additionally backed
 //! by the FAITHFUL `.16B` byte-lane obligation `proof_neon_cmeqv_lanewise_16b`
 //! (`trust-cg-verify::neon_lowering_proofs`); `AND.16B` by `andv.16b`.
 //!
 //! ## Fail-closed guards (BAIL preconditions)
 //!
-//! An explicitly admitted AArch64 FEAT_DotProd target; innermost loop only; a
-//! single `Gpr64` accumulator read ONLY along its
+//! Innermost loop only; a single `Gpr64` accumulator read ONLY along its
 //! reduction path (an `AddRR` reduction, or the count-if diamond's `+1`/`+0`
 //! arms); a single `+1` `Gpr64` induction; a compile-time-constant bound `N`
 //! with `width(kind) <= N` and `8*N < 2^31` (popcount) / `< 2^31` (count-if) used by
@@ -120,23 +116,27 @@
 //! multi-valued bound, or `acc` read off the reduction path all BAIL — anything
 //! unrecognized leaves the loop entirely scalar.
 //!
-//! Included in O2/O3, but inert until the resolved target profile explicitly
-//! admits FEAT_DotProd; disable with
+//! Included in O2/O3 on baseline AArch64; a resolved FEAT_DotProd profile
+//! selects the shorter UDOT fold. Disable with
 //! `TRUST_CG_DISABLE_PASSES=neon_bytesum`. Every opcode it emits is credited by
-//! the per-compile proof gate — CNT/CMEQ/AND/UDOT/ADD/
+//! the per-compile proof gate — CNT/CMEQ/AND/UDOT/UADDLP/ADD/
 //! UMOV via their faithful lowering proofs, the paired-Q load via the shared
 //! Ldr*/Str* memory debt, and the `MOVI #0`/`MOVI #1` byte-mask via
 //! constant-materialization covered-elsewhere (`function_verifier`) — so a
 //! vectorized function promotes with `TCG_NO_PROOF_CERTS` OFF (no fail-closed
 //! regression).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::mach_util::{branch_targets, copied_const, copy_like, strip_copies};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
 };
 
 use crate::dom::DomTree;
+use crate::loop_contract::{
+    ExitPlan, GuardBound, Handoff, InductionGuards, LoopLocality, exit_of_test,
+};
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -153,6 +153,7 @@ const WIDTH_MIN: i64 = 4 * LANES_PER_Q;
 
 /// NEON arrangement operand codes (match neon_array / the encoder mapping).
 const ARR_B16: i64 = 1;
+const ARR_H8: i64 = 3;
 const ARR_S4: i64 = 5;
 /// NEON element-size code for an `S` (32-bit) `UMOV` lane extract.
 const ELEM_S: i64 = 4;
@@ -181,7 +182,7 @@ const NIB_HI_BASE: i64 = 87;
 const NIB_DELTA: i64 = NIB_HI_BASE - NIB_LO_BASE; // 39
 const NIB_THRESHOLD: i64 = 10;
 /// `48 * 2 = 96`: the constant contribution of both nibbles' `LO_BASE` per byte,
-/// folded into the vector loop as a `#96`-per-byte-lane UDOT stream.
+/// folded into the vector loop as a `#96`-per-byte-lane contribution stream.
 const HEX_CONST_PER_BYTE: i64 = NIB_LO_BASE * 2; // 96
 
 /// Largest constant loop bound admitted for the POPCOUNT kernel: one pass'
@@ -219,9 +220,8 @@ const MASK32: i64 = 0xFFFF_FFFF; // the `as u32` mask preceding the SWAR
 #[derive(Default)]
 pub struct NeonBytesumPass {
     fired: usize,
-    /// Explicit target capability. Every current lowering shape uses `UDOT`,
-    /// so false makes the pass entirely inert rather than emitting an optional
-    /// instruction for an unresolved target.
+    /// Explicit optional target capability. False selects the mandatory
+    /// baseline UADDLP+ADD fold; true selects the shorter UDOT fold.
     aarch64_dotprod: bool,
 }
 
@@ -234,8 +234,9 @@ impl NeonBytesumPass {
     }
     /// Admit FEAT_DotProd instructions for a resolved AArch64 target.
     ///
-    /// The fail-closed default is disabled; callers must explicitly thread the
-    /// backend capability into this frontend-neutral optimization pass.
+    /// Optional-instruction admission defaults to disabled; the pass remains
+    /// active and uses its mandatory-NEON UADDLP+ADD fold in that case. Callers
+    /// must explicitly thread the capability to select UDOT.
     pub fn with_aarch64_dotprod(mut self, enabled: bool) -> Self {
         self.aarch64_dotprod = enabled;
         self
@@ -252,20 +253,12 @@ impl MachinePass for NeonBytesumPass {
     }
 
     fn run(&mut self, func: &mut MachFunction) -> bool {
-        if !self.aarch64_dotprod {
-            self.fired = 0;
-            return false;
-        }
         let dom = DomTree::compute(func);
         let loops = LoopAnalysis::compute(func, &dom);
         self.run_core(func, &dom, &loops)
     }
 
     fn run_with_analyses(&mut self, func: &mut MachFunction, analyses: &mut AnalysisCache) -> bool {
-        if !self.aarch64_dotprod {
-            self.fired = 0;
-            return false;
-        }
         let loops = analyses.loop_analysis(func).clone();
         let changed = {
             let dom = analyses.domtree(func);
@@ -307,9 +300,6 @@ impl NeonBytesumPass {
                 changed = true;
             }
         }
-        if changed && std::env::var("TRUST_CG_DUMP_NEONBYTESUM").is_ok() {
-            eprintln!("[neon-bytesum] fn={} vectorized={}", func.name, self.fired);
-        }
         changed
     }
 }
@@ -319,9 +309,10 @@ impl NeonBytesumPass {
 // ---------------------------------------------------------------------------
 
 /// Which per-byte reduction term the recognized loop folds into the `u64`
-/// accumulator. All three lower to the SAME faithfully-proven `UADDLP` widen
-/// chain + `.4S` accumulate + zero-extending `u64` fold; they differ only in the
-/// per-Q-register *prefix* that produces the `.16B` byte contributions.
+/// accumulator. Every recognized term uses the same target-selected byte fold
+/// (UDOT on FEAT_DotProd; otherwise UADDLP+UADDLP+ADD) and zero-extending `u64`
+/// exit fold; they differ only in the per-Q-register *prefix* that produces the
+/// `.16B` byte contributions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TermKind {
     /// `acc += popcount(a[i])` — `CNT.16B` prefix.
@@ -352,7 +343,7 @@ enum TermKind {
     /// window via the FAITHFULLY-PROVEN `EXT.16B #1` (slide the loaded block one
     /// byte, pulling the first byte of the adjacent block), then `CMEQ.16B`
     /// against the un-shifted block, then (for `!=`) `NOT.16B`, then the existing
-    /// `AND.16B`-by-ones + `UDOT`-by-ones count fold — 1/0 per byte lane. Because
+    /// `AND.16B`-by-ones + target-selected byte fold — 1/0 per byte lane. Because
     /// the window is FORWARD (`a[iv+1]`), the vector loop reindexes `a[j] vs
     /// a[j-1]` (j in [iv, iv+width)) to `a[i] vs a[i+1]` over the block loaded at
     /// `base + iv - 1` (so `iv` MUST start at 1 — the first predecessor `a[0]` is
@@ -375,27 +366,28 @@ enum TermKind {
     /// Lowered per 16-byte block by forming `hi = USHR.16B #4`,
     /// `lo = AND.16B #15`, the two hex-letter masks
     /// `c_hi/c_lo = AND.16B(CMHS.16B(nibble, #10), #39)` (39 where `nibble>=10`,
-    /// else 0), and a constant `#96` block, then dot-summing all FIVE byte streams
+    /// else 0), and a constant `#96` block, then folding all FIVE byte streams
     /// (`hi`, `lo`, `c_hi`, `c_lo`, `#96`) into the `.4S` accumulators via the
-    /// FAITHFULLY-PROVEN `UDOT`-by-ones fold. The `#96`-per-byte stream contributes
+    /// target-selected, FAITHFULLY-PROVEN byte fold. The `#96`-per-byte stream contributes
     /// `96` for EACH byte the vector loop processes — exactly matching the scalar
     /// tail's per-byte `96` — so the split between vector prefix and scalar tail is
     /// exact regardless of where it falls. `USHR.16B` and `CMHS.16B` are faithfully
     /// proven `.16B`-lanewise (`proof_neon_ushrv_lanewise_16b(4)` /
-    /// `proof_neon_cmhsv_lanewise_16b`); `AND.16B`, `UDOT`, `ADD.4S`, `MOVI` are
-    /// already proven/credited. No `ADD.16B` is emitted (the five streams are
-    /// summed by the accumulate UDOT, not a byte-lane add).
+    /// `proof_neon_cmhsv_lanewise_16b`); `AND.16B`, `UDOT`, `UADDLP`, `ADD.4S`,
+    /// and `MOVI` are already proven/credited. No `ADD.16B` is emitted: the five
+    /// streams are accumulated only after folding to `.4S`.
     HexNibbleSum,
 }
 
 /// Independent `.4S` vector accumulators (ILP), PER TERM KIND.
 ///
-/// The UDOT accumulate chain has ~2.33 cy effective latency on Apple M4 while
-/// the 3 load pipes feed 4 Q loads in ~1.33 cy, so saturating the plain
-/// byte-sum kernel needs `ceil(latency/feed) * 4 ~= 8` accumulators — measured
-/// 2.33 -> 1.63-1.78 cy/64B going 4 -> 8 accs (12 accs show the next wall is
-/// load bandwidth; 8 is the stop). `ByteSum` therefore uses 8 accumulators /
-/// 128B per iteration.
+/// On the DotProd route, the UDOT accumulate chain has ~2.33 cy effective
+/// latency on Apple M4 while the 3 load pipes feed 4 Q loads in ~1.33 cy, so
+/// saturating the plain byte-sum kernel needs `ceil(latency/feed) * 4 ~= 8`
+/// accumulators — measured 2.33 -> 1.63-1.78 cy/64B going 4 -> 8 accs (12 accs
+/// show the next wall is load bandwidth; 8 is the stop). `ByteSum` therefore
+/// uses 8 accumulators / 128B per iteration. The baseline route preserves that
+/// grouping and substitutes a widening fold for each UDOT.
 ///
 /// `Popcount` and `PredCountEqZero` STAY at 4 (codegen bit-identical to the
 /// original): count-if is already throughput-bound at 24 SIMD ops/128B
@@ -419,10 +411,10 @@ fn unroll(kind: TermKind) -> usize {
         // SIMD-op-bound and does not want more accumulators.
         TermKind::PredStencilCmp { .. } => 3,
         // The hex-nibble sum has a HEAVY per-block prefix (USHR + AND + 2x CMHS +
-        // 2x AND = 6 compute ops, then FIVE accumulate UDOTs into the same `.4S`
-        // accumulator — a 5-deep tied-accumulate chain per block). So it is firmly
-        // SIMD-op-bound; 4 independent accumulators (64B/iter) give enough ILP to
-        // overlap the five-deep chains without the register pressure of 8.
+        // 2x AND = 6 compute ops, then FIVE byte folds into the same `.4S`
+        // accumulator). On DotProd those form a 5-deep tied-accumulate chain;
+        // baseline substitutes two widening steps plus ADD for each. Four
+        // independent accumulators (64B/iter) limit register pressure.
         TermKind::HexNibbleSum => 4,
     }
 }
@@ -456,6 +448,9 @@ struct Recognized {
     /// `u32` accumulator exactly, and the loop-invariant seed already sits in the
     /// acc (the fold ADDS, never overwrites, so the seed is folded in once).
     acc_is_u32: bool,
+    /// The loop-state contract passed for `[iv, acc]`. A plan cannot be built,
+    /// and so cannot be applied, without it.
+    _locality: LoopLocality,
 }
 
 impl Recognized {
@@ -468,23 +463,10 @@ impl Recognized {
         latch: BlockId,
         body: &HashSet<BlockId>,
     ) -> Option<Self> {
-        let dump = std::env::var("TRUST_CG_DUMP_NEONBYTESUM").is_ok();
         macro_rules! bail {
             ($($t:tt)*) => {{
-                if dump {
-                    eprintln!("[neon-bytesum] bail@{}: {}", func.name, format!($($t)*));
-                }
                 return None;
             }};
-        }
-        if dump {
-            eprintln!(
-                "[neon-bytesum] consider@{} header={:?} latch={:?} body={}",
-                func.name,
-                header,
-                latch,
-                body.len()
-            );
         }
         if header == latch || body.is_empty() {
             bail!("degenerate loop");
@@ -495,7 +477,7 @@ impl Recognized {
 
         // Whitelist every opcode in the loop body (rules out stores / calls /
         // atomics / division and any unmodeled effect).
-        let mut loop_insts = HashSet::new();
+        let mut loop_insts = HashSet::default();
         for &b in body {
             for &id in &func.block(b).insts {
                 if !allowed_loop_op(func.inst(id).opcode) {
@@ -535,14 +517,14 @@ impl Recognized {
             };
             let si = func.inst(sdef);
             if si.opcode == AArch64Opcode::AddRR && si.operands.len() == 3 {
-                let a = vreg_of(&si.operands[1])?;
-                let b = vreg_of(&si.operands[2])?;
+                let a = si.operands[1].as_vreg()?;
+                let b = si.operands[2].as_vreg()?;
                 // iv: d == a and b == const 1 (or symmetric).
-                if a == d && const_value(func, def, b) == Some(1) {
+                if a == d && copied_const(func, def, b) == Some(1) {
                     iv = Some(d);
                     continue;
                 }
-                if b == d && const_value(func, def, a) == Some(1) {
+                if b == d && copied_const(func, def, a) == Some(1) {
                     iv = Some(d);
                     continue;
                 }
@@ -554,8 +536,8 @@ impl Recognized {
                 }
             } else if si.opcode == AArch64Opcode::AddRI
                 && si.operands.len() == 3
-                && vreg_of(&si.operands[1]) == Some(d)
-                && imm_of(&si.operands[2]) == Some(1)
+                && si.operands[1].as_vreg() == Some(d)
+                && si.operands[2].as_imm() == Some(1)
             {
                 iv = Some(d);
             }
@@ -590,18 +572,17 @@ impl Recognized {
                 let inst = func.inst(id);
                 match inst.opcode {
                     AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
-                        let x = vreg_of(&inst.operands[0])?;
-                        let y = vreg_of(&inst.operands[1])?;
+                        let x = inst.operands[0].as_vreg()?;
+                        let y = inst.operands[1].as_vreg()?;
                         // The `iv <u N` loop-continue / bounds compare.
-                        if same_as_iv(func, &def, x, iv) {
-                            let Some(n) = const_value(func, def, y) else {
+                        if same_as_iv(func, def, x, iv) {
+                            let Some(n) = copied_const(func, def, y) else {
                                 bail!("cmp bound not constant");
                             };
-                            if record(n, &mut bound).is_none() {
-                                bail!("cmp bound {} disagrees", n);
-                            }
-                        } else if is_byte_load_val(func, &def, &loop_insts, x)
-                            && is_byte_load_val(func, &def, &loop_insts, y)
+                            // The cmp bound must agree with every other bound.
+                            record(n, &mut bound)?;
+                        } else if is_byte_load_val(func, def, &loop_insts, x)
+                            && is_byte_load_val(func, def, &loop_insts, y)
                         {
                             // The byte-STENCIL count-if's diamond-head compare
                             // `CmpRR(a[iv], a[iv-1])` — two byte VALUES, not a loop
@@ -630,19 +611,17 @@ impl Recognized {
                         //     leaves the loop only on `iv >= N`), so it joins no
                         //     bound agreement.
                         // Anything else BAILS.
-                        let x = vreg_of(&inst.operands[0])?;
-                        let n = imm_of(&inst.operands[1])?;
-                        if same_as_iv(func, &def, x, iv) || is_iv_minus_one(func, &def, x, iv) {
+                        let x = inst.operands[0].as_vreg()?;
+                        let n = inst.operands[1].as_imm()?;
+                        if same_as_iv(func, def, x, iv) || is_iv_minus_one(func, def, x, iv) {
                             // `iv <u N` loop guard OR the byte-STENCIL count-if's
                             // predecessor bounds check `(iv-1) <u N` — the latter's
                             // `iv-1` is induction-derived (never a data value), and
                             // its length joins the single-N agreement (it must equal
                             // the loop bound). SOUND: control leaves the loop only on
                             // an induction-vs-N condition, never on data.
-                            if record(n, &mut bound).is_none() {
-                                bail!("cmpri bound {} disagrees", n);
-                            }
-                        } else if !((n == 0 && is_cset_result(func, &def, x))
+                            record(n, &mut bound)?;
+                        } else if !((n == 0 && is_cset_result(func, def, x))
                             || cmpri_feeds_cset(func, b, id)
                             || is_internal_diamond_head(func, b, body))
                         {
@@ -661,13 +640,12 @@ impl Recognized {
                     AArch64Opcode::TrapBoundsCheckExact if inst.operands.len() == 3 => {
                         // `[base, index, Imm(len)]`: the index must be the iv, and
                         // its length joins the single-N agreement.
-                        let index = vreg_of(&inst.operands[1])?;
-                        if !same_as_iv(func, &def, index, iv) {
+                        let index = inst.operands[1].as_vreg()?;
+                        if !same_as_iv(func, def, index, iv) {
                             bail!("trap index not iv (index={:?})", index);
                         }
-                        if record(imm_of(&inst.operands[2])?, &mut bound).is_none() {
-                            bail!("trap len disagrees with loop bound");
-                        }
+                        // The trap length must agree with the loop bound.
+                        record(inst.operands[2].as_imm()?, &mut bound)?;
                     }
                     _ => {}
                 }
@@ -712,12 +690,10 @@ impl Recognized {
             // the reduction. (The count-if diamond path below is NOT a simple
             // chain and has its own exact-shape recognizer, so this gate scopes to
             // the straight reduction.) Fail-closed on any deviation.
-            if recognize_forward_chain(func, &def, header, latch, body, iv, None).is_none() {
-                bail!("not a bounds-guarded forward chain (possible data early-exit)");
-            }
+            recognize_forward_chain(func, def, header, latch, body, iv, None)?;
             // `acc` may be read ONLY by its reduction `AddRR`. (The writeback
             // copy reads the reduction's result, not `acc` itself.)
-            let Some(acc_res) = reduction_result(func, &def, latch, acc) else {
+            let Some(acc_res) = reduction_result(func, def, latch, acc) else {
                 bail!("no acc reduction result");
             };
             let acc_reduction = *def.get(&acc_res.id)?;
@@ -727,7 +703,7 @@ impl Recognized {
                 }
                 let inst = func.inst(id);
                 for opd in inst.operands.iter().skip(1) {
-                    if vreg_of(opd) == Some(acc) {
+                    if opd.as_vreg() == Some(acc) {
                         bail!("acc read by non-reduction op {:?}", inst.opcode);
                     }
                 }
@@ -735,7 +711,7 @@ impl Recognized {
             // The reduction term: byte popcount, a widened byte load, or a
             // masked-byte compare `(a[i] & MASK) ==/!= CONST` materialized by a
             // `CSet` (PredMaskCmp). Each is fail-closed; anything else BAILS.
-            if let Some((pop, base)) = recognize_bytesum_term(func, &def, &loop_insts, iv, term) {
+            if let Some((pop, base)) = recognize_bytesum_term(func, def, &loop_insts, iv, term) {
                 (
                     if pop {
                         TermKind::Popcount
@@ -747,7 +723,7 @@ impl Recognized {
                     acc_is_u32,
                 )
             } else if let Some((mask, cnst, ne, base)) =
-                recognize_maskcmp_term(func, &def, &loop_insts, iv, term)
+                recognize_maskcmp_term(func, def, &loop_insts, iv, term)
             {
                 // The masked-compare term contributes 0/1 per byte and folds
                 // (like the count-if kernel) into a `u64` acc, whose `.4S` lane
@@ -769,7 +745,7 @@ impl Recognized {
                 );
             }
         } else if let Some((acc, base, dh, arms)) =
-            recognize_predcount(func, &def, latch, body, &loop_insts, iv, dump)
+            recognize_predcount(func, def, latch, body, &loop_insts, iv)
         {
             // The conditional-increment diamond (count-if `== 0`). Always `u64`.
             // SOUNDNESS GATE: the same simple-chain requirement as the straight
@@ -777,14 +753,10 @@ impl Recognized {
             // proves the diamond is the ONLY data-dependent control flow in the
             // body (a stray data `break` would leave a block off the chain and
             // BAIL) and that every block is covered exactly once.
-            if recognize_forward_chain(func, &def, header, latch, body, iv, Some((dh, arms)))
-                .is_none()
-            {
-                bail!("count-if body not a bounds-guarded chain (possible data early-exit)");
-            }
+            recognize_forward_chain(func, def, header, latch, body, iv, Some((dh, arms)))?;
             (TermKind::PredCountEqZero, acc, base, false)
         } else if let Some((acc, base, ne, dh, arms)) =
-            recognize_stencil(func, &def, preheader, latch, body, &loop_insts, iv, dump)
+            recognize_stencil(func, def, preheader, latch, body, &loop_insts, iv)
         {
             // The byte-STENCIL count-if diamond (`a[iv] REL a[iv-1]`). Always
             // `u64`. Same simple-chain soundness gate (the stencil diamond skipped
@@ -792,25 +764,18 @@ impl Recognized {
             // 1 (so the FORWARD-window vector loop's first predecessor `a[0]` is in
             // bounds) and that the two loads are `a[iv]` / `a[iv-1]` off ONE
             // invariant base.
-            if recognize_forward_chain(func, &def, header, latch, body, iv, Some((dh, arms)))
-                .is_none()
-            {
-                bail!("stencil body not a bounds-guarded chain (possible data early-exit)");
-            }
+            recognize_forward_chain(func, def, header, latch, body, iv, Some((dh, arms)))?;
             (TermKind::PredStencilCmp { ne }, acc, base, false)
-        } else if let Some((acc, base)) = recognize_hexnibble(
-            HexNibbleLoop {
-                func,
-                def: &def,
-                header,
-                latch,
-                body,
-                loop_insts: &loop_insts,
-                iv,
-                bound,
-            },
-            dump,
-        ) {
+        } else if let Some((acc, base)) = recognize_hexnibble(HexNibbleLoop {
+            func,
+            def,
+            header,
+            latch,
+            body,
+            loop_insts: &loop_insts,
+            iv,
+            bound,
+        }) {
             // The hex-digit-code REDUCTION `s += nib(b>>4) + nib(b&15)`. Always a
             // `u64` acc. `recognize_hexnibble` has ALREADY (a) verified the exact
             // double-nibble accumulation `s = (s + nib(hi)) + nib(lo)`, the byte
@@ -868,7 +833,7 @@ impl Recognized {
         // to the invariant ROOT through SINGLE-DEF copies only (each strip step
         // is value-exact because the vreg has exactly one live def), and require
         // the root's def to sit OUTSIDE the loop and dominate the preheader.
-        let Some(base) = resolve_invariant_base(func, &def, &loop_insts, dom, preheader, base)
+        let Some(base) = resolve_invariant_base(func, def, &loop_insts, dom, preheader, base)
         else {
             bail!("base not loop-invariant");
         };
@@ -883,16 +848,54 @@ impl Recognized {
         // p7_sieve; the fixpoint never converged and hit the iteration cap).
         // A preheader that folds a NEON lane-extracted sum into `acc` is
         // exactly `apply`'s exit block, so the loop is a remainder we built.
-        if preheader_folds_vector_partial_sum(func, &def, preheader, acc) {
+        if preheader_folds_vector_partial_sum(func, def, preheader, acc) {
             bail!("remainder loop of an already-vectorized loop");
         }
 
-        if dump {
-            eprintln!(
-                "[neon-bytesum] RECOGNIZED@{} iv={:?} acc={:?} bound={} base={:?} kind={:?} u32={}",
-                func.name, iv, acc, bound, base, kind, acc_is_u32
-            );
-        }
+        // LOOP STATE (`crate::loop_contract`): the vector loop runs only
+        // iterations the header's `iv <u N` test continues, and reproduces only
+        // `iv` and `acc`. The loop's other exits must be bounds checks the
+        // contract admits by its own rule (`iv`, or the stencil's `iv - 1` with
+        // `iv >= 1`, against a bound of at least `N`): a `break` would be run
+        // past. Any other register the loop carries or leaves live at an exit
+        // (a second accumulator, a `last = i`) would keep the value it had
+        // before the skipped iterations. The p09 sieve's `sum += i` beside the
+        // count-if `count += 1` was exactly that.
+        let Some(exit) = exit_of_test(func, body.iter().copied(), header) else {
+            bail!("the header test has no single exit");
+        };
+        let stencil = matches!(kind, TermKind::PredStencilCmp { .. });
+        let at_most_iv = |v: VReg| {
+            same_as_iv(func, def, v, iv) || (stencil && is_iv_minus_one(func, def, v, iv))
+        };
+        let covers_loop_bound = |guard: GuardBound| match guard {
+            GuardBound::Imm(n) => (n as u64) >= (bound as u64),
+            GuardBound::Reg(r) => {
+                copied_const(func, def, r).is_some_and(|n| (n as u64) >= (bound as u64))
+            }
+        };
+        let exits = ExitPlan::loop_test(header, exit).and_induction_guards(
+            func,
+            body.iter().copied(),
+            header,
+            &InductionGuards {
+                iv,
+                at_most_iv: &at_most_iv,
+                covers_loop_bound: &covers_loop_bound,
+            },
+        );
+        let locality = match LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &exits,
+            Handoff::HeaderOrExit,
+            &[iv, acc],
+        ) {
+            Ok(locality) => locality,
+            Err(_escape) => bail!("loop state escapes: {:?}", _escape),
+        };
+
         Some(Recognized {
             header,
             preheader,
@@ -903,6 +906,7 @@ impl Recognized {
             base,
             kind,
             acc_is_u32,
+            _locality: locality,
         })
     }
 }
@@ -944,12 +948,13 @@ fn preheader_folds_vector_partial_sum(
             AArch64Opcode::MovR | AArch64Opcode::Copy | AArch64Opcode::Uxtw
                 if inst.operands.len() == 2 =>
             {
-                vreg_of(&inst.operands[1])
+                inst.operands[1]
+                    .as_vreg()
                     .is_some_and(|s| from_neon_lane(func, def, in_preheader, s, depth + 1))
             }
             AArch64Opcode::AddRR if inst.operands.len() == 3 => inst.operands[1..]
                 .iter()
-                .filter_map(vreg_of)
+                .filter_map(MachOperand::as_vreg)
                 .any(|s| from_neon_lane(func, def, in_preheader, s, depth + 1)),
             _ => false,
         }
@@ -958,9 +963,10 @@ fn preheader_folds_vector_partial_sum(
         let inst = func.inst(id);
         inst.opcode == AArch64Opcode::AddRR
             && inst.operands.len() == 3
-            && vreg_of(&inst.operands[0]) == Some(acc)
-            && vreg_of(&inst.operands[1]) == Some(acc)
-            && vreg_of(&inst.operands[2])
+            && inst.operands[0].as_vreg() == Some(acc)
+            && inst.operands[1].as_vreg() == Some(acc)
+            && inst.operands[2]
+                .as_vreg()
                 .is_some_and(|s| from_neon_lane(func, def, &in_preheader, s, 0))
     })
 }
@@ -1007,7 +1013,7 @@ fn recognize_forward_chain(
     countif_diamond: Option<(BlockId, [BlockId; 2])>,
 ) -> Option<i64> {
     let mut bound: Option<i64> = None;
-    let mut visited: HashSet<BlockId> = HashSet::new();
+    let mut visited: HashSet<BlockId> = HashSet::default();
     let mut cur = header;
     // Bounded by body.len(): a simple path visits each block at most once.
     for _ in 0..=body.len() {
@@ -1101,19 +1107,19 @@ fn recognize_chain_guard(
     if !body.contains(&t_lo) || body.contains(&t_b) {
         return None;
     }
-    let bcc = imm_of(&bcond.operands[0])?;
+    let bcc = bcond.operands[0].as_imm()?;
     // Decode an `iv <u N` compare with a compile-time-constant N: register form
     // `CmpRR(x, Nreg)` (N materialized by Movz/Movz+Movk) or the 12-bit
     // immediate form `CmpRI(x, #N)` (N <= 4095 folds to it).
     let const_cmp = |cmp: &MachInst| -> Option<(VReg, i64)> {
         match cmp.opcode {
             AArch64Opcode::CmpRR if cmp.operands.len() == 2 => {
-                let x = vreg_of(&cmp.operands[0])?;
-                let n_reg = vreg_of(&cmp.operands[1])?;
-                Some((x, const_value(func, def, n_reg)?))
+                let x = cmp.operands[0].as_vreg()?;
+                let n_reg = cmp.operands[1].as_vreg()?;
+                Some((x, copied_const(func, def, n_reg)?))
             }
             AArch64Opcode::CmpRI if cmp.operands.len() == 2 => {
-                Some((vreg_of(&cmp.operands[0])?, imm_of(&cmp.operands[1])?))
+                Some((cmp.operands[0].as_vreg()?, cmp.operands[1].as_imm()?))
             }
             _ => None,
         }
@@ -1131,15 +1137,15 @@ fn recognize_chain_guard(
         let cset = func.inst(insts[n - 4]);
         if cmpi.opcode == AArch64Opcode::CmpRI
             && cmpi.operands.len() == 2
-            && imm_of(&cmpi.operands[1]) == Some(0)
+            && cmpi.operands[1].as_imm() == Some(0)
             && cset.opcode == AArch64Opcode::CSet
             && cset.operands.len() == 2
-            && imm_of(&cset.operands[1]) == Some(CC_LO)
+            && cset.operands[1].as_imm() == Some(CC_LO)
             && let Some((x, nc)) = const_cmp(func.inst(insts[n - 5]))
         {
-            let c = vreg_of(&cset.operands[0])?;
+            let c = cset.operands[0].as_vreg()?;
             // The `CmpRI(c, 0)` must re-test the very boolean the CSet produced.
-            if vreg_of(&cmpi.operands[0])? != c {
+            if cmpi.operands[0].as_vreg()? != c {
                 return None;
             }
             return Some((x, nc, t_lo));
@@ -1206,7 +1212,6 @@ fn recognize_predcount(
     body: &HashSet<BlockId>,
     loop_insts: &HashSet<InstId>,
     iv: VReg,
-    dump: bool,
 ) -> Option<(VReg, VReg, BlockId, [BlockId; 2])> {
     // Candidate acc writebacks in the latch: `acc = MovR(merge)`, `acc` a
     // `Gpr64` loop-carried var distinct from the iv. Try each; take the first
@@ -1221,17 +1226,8 @@ fn recognize_predcount(
         if let Some((base, dh, arms)) =
             try_predcount_diamond(func, def, latch, body, loop_insts, iv, acc, merge)
         {
-            if dump {
-                eprintln!(
-                    "[neon-bytesum] predcount(==0) diamond OK acc={:?} merge={:?} base={:?}",
-                    acc, merge, base
-                );
-            }
             return Some((acc, base, dh, arms));
         }
-    }
-    if dump {
-        eprintln!("[neon-bytesum] predcount-bail: no count-if(==0) diamond in latch");
     }
     None
 }
@@ -1394,8 +1390,8 @@ fn classify_predcount_arm(
     let si = func.inst(sd);
     if si.opcode == AArch64Opcode::AddRI
         && si.operands.len() == 3
-        && vreg_of(&si.operands[1]) == Some(acc)
-        && imm_of(&si.operands[2]) == Some(1)
+        && si.operands[1].as_vreg() == Some(acc)
+        && si.operands[2].as_imm() == Some(1)
     {
         return Some(ArmKind::PlusOne { add_id: sd });
     }
@@ -1421,7 +1417,7 @@ fn predcount_branch_zero_arm(
             if cbr.is_some() {
                 return None;
             }
-            let w = vreg_of(inst.operands.first()?)?;
+            let w = inst.operands.first()?.as_vreg()?;
             let t = branch_targets(inst).into_iter().next()?;
             cbr = Some((is_cbz, w, t));
         }
@@ -1451,12 +1447,18 @@ fn is_iv_minus_one(func: &MachFunction, def: &DefIndex, v: VReg, iv: VReg) -> bo
     let inst = func.inst(d);
     match inst.opcode {
         AArch64Opcode::SubRI if inst.operands.len() == 3 => {
-            vreg_of(&inst.operands[1]).is_some_and(|a| same_as_iv(func, def, a, iv))
-                && imm_of(&inst.operands[2]) == Some(1)
+            inst.operands[1]
+                .as_vreg()
+                .is_some_and(|a| same_as_iv(func, def, a, iv))
+                && inst.operands[2].as_imm() == Some(1)
         }
         AArch64Opcode::SubRR if inst.operands.len() == 3 => {
-            vreg_of(&inst.operands[1]).is_some_and(|a| same_as_iv(func, def, a, iv))
-                && vreg_of(&inst.operands[2]).is_some_and(|b| const_value(func, def, b) == Some(1))
+            inst.operands[1]
+                .as_vreg()
+                .is_some_and(|a| same_as_iv(func, def, a, iv))
+                && inst.operands[2]
+                    .as_vreg()
+                    .is_some_and(|b| copied_const(func, def, b) == Some(1))
         }
         _ => false,
     }
@@ -1484,7 +1486,7 @@ fn is_byte_load_val(
         let inst = func.inst(d);
         match inst.opcode {
             AArch64Opcode::Uxtb | AArch64Opcode::Uxtw | AArch64Opcode::Uxth => {
-                match vreg_of(&inst.operands[1]) {
+                match inst.operands[1].as_vreg() {
                     Some(s) => cur = strip_copies(func, def, s),
                     None => return false,
                 }
@@ -1516,18 +1518,18 @@ fn pred_load_base(
         let inst = func.inst(d);
         match inst.opcode {
             AArch64Opcode::Uxtb | AArch64Opcode::Uxtw => {
-                cur = vreg_of(&inst.operands[1])?;
+                cur = inst.operands[1].as_vreg()?;
             }
             AArch64Opcode::LdrbRO if inst.operands.len() == 4 => {
-                let base = vreg_of(&inst.operands[1])?;
-                let index = vreg_of(&inst.operands[2])?;
+                let base = inst.operands[1].as_vreg()?;
+                let index = inst.operands[2].as_vreg()?;
                 return is_iv_minus_one(func, def, index, iv).then_some(base);
             }
             AArch64Opcode::LdrbRI if inst.operands.len() == 3 => {
-                if imm_of(&inst.operands[2]) != Some(0) {
+                if inst.operands[2].as_imm() != Some(0) {
                     return None;
                 }
-                let addr = vreg_of(&inst.operands[1])?;
+                let addr = inst.operands[1].as_vreg()?;
                 // addr == base + (iv-1): `AddRR(base, iv-1-like)` or
                 // `Madd(iv-1-like, 1, base)`.
                 let &ad = def.get(&addr.id)?;
@@ -1537,8 +1539,8 @@ fn pred_load_base(
                 let ai = func.inst(ad);
                 return match ai.opcode {
                     AArch64Opcode::AddRR if ai.operands.len() == 3 => {
-                        let a = vreg_of(&ai.operands[1])?;
-                        let b = vreg_of(&ai.operands[2])?;
+                        let a = ai.operands[1].as_vreg()?;
+                        let b = ai.operands[2].as_vreg()?;
                         if is_iv_minus_one(func, def, a, iv) {
                             Some(b)
                         } else if is_iv_minus_one(func, def, b, iv) {
@@ -1548,10 +1550,10 @@ fn pred_load_base(
                         }
                     }
                     AArch64Opcode::Madd if ai.operands.len() == 4 => {
-                        let f1 = vreg_of(&ai.operands[1])?;
-                        let f2 = vreg_of(&ai.operands[2])?;
-                        let base = vreg_of(&ai.operands[3])?;
-                        let es = |f: VReg| const_value(func, def, f) == Some(1);
+                        let f1 = ai.operands[1].as_vreg()?;
+                        let f2 = ai.operands[2].as_vreg()?;
+                        let base = ai.operands[3].as_vreg()?;
+                        let es = |f: VReg| copied_const(func, def, f) == Some(1);
                         if (is_iv_minus_one(func, def, f1, iv) && es(f2))
                             || (is_iv_minus_one(func, def, f2, iv) && es(f1))
                         {
@@ -1590,12 +1592,12 @@ fn loop_init_value(
     match inst.opcode {
         AArch64Opcode::Movz => move_wide_seed(inst, iv),
         AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            const_value(func, def, vreg_of(&inst.operands[1])?)
+            copied_const(func, def, inst.operands[1].as_vreg()?)
         }
         AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
+            if inst.operands.len() == 3 && inst.operands[2].as_imm() == Some(0) =>
         {
-            const_value(func, def, vreg_of(&inst.operands[1])?)
+            copied_const(func, def, inst.operands[1].as_vreg()?)
         }
         _ => None,
     }
@@ -1622,7 +1624,6 @@ fn recognize_stencil(
     body: &HashSet<BlockId>,
     loop_insts: &HashSet<InstId>,
     iv: VReg,
-    dump: bool,
 ) -> Option<(VReg, VReg, bool, BlockId, [BlockId; 2])> {
     // The induction MUST start at 1: the vector loop reads the predecessor block
     // starting at `base + iv_init - 1`, so `iv_init >= 1` is REQUIRED for `a[0]`
@@ -1630,9 +1631,6 @@ fn recognize_stencil(
     // (the RLE `let mut j = 1` seed; a `j = 0` start would panic the scalar loop
     // on its first `a[j-1]` and MUST NOT be silently vectorized).
     if loop_init_value(func, def, preheader, iv) != Some(1) {
-        if dump {
-            eprintln!("[neon-bytesum] stencil-bail: iv does not start at 1");
-        }
         return None;
     }
     for &wb in &func.block(latch).insts {
@@ -1645,17 +1643,8 @@ fn recognize_stencil(
         if let Some((base, ne, dh, arms)) =
             try_stencil_diamond(func, def, latch, body, loop_insts, iv, acc, merge)
         {
-            if dump {
-                eprintln!(
-                    "[neon-bytesum] stencil diamond OK acc={:?} merge={:?} base={:?} ne={}",
-                    acc, merge, base, ne
-                );
-            }
             return Some((acc, base, ne, dh, arms));
         }
-    }
-    if dump {
-        eprintln!("[neon-bytesum] stencil-bail: no byte-stencil diamond in latch");
     }
     None
 }
@@ -1817,9 +1806,9 @@ fn stencil_branch_decode(
     {
         return None;
     }
-    let x = vreg_of(&cmp.operands[0])?;
-    let y = vreg_of(&cmp.operands[1])?;
-    let cc = imm_of(&bcond.operands[0])?;
+    let x = cmp.operands[0].as_vreg()?;
+    let y = cmp.operands[1].as_vreg()?;
+    let cc = bcond.operands[0].as_imm()?;
     let t = *branch_targets(bcond).first()?;
     let f = *branch_targets(last).first()?;
     // The two edges must be exactly the two arms.
@@ -1879,11 +1868,11 @@ fn decode_nibble(
     }
     let ni = func.inst(nd);
     match ni.opcode {
-        AArch64Opcode::LsrRI if ni.operands.len() == 3 && imm_of(&ni.operands[2]) == Some(4) => {
-            Some((true, vreg_of(&ni.operands[1])?))
+        AArch64Opcode::LsrRI if ni.operands.len() == 3 && ni.operands[2].as_imm() == Some(4) => {
+            Some((true, ni.operands[1].as_vreg()?))
         }
-        AArch64Opcode::AndRI if ni.operands.len() == 3 && imm_of(&ni.operands[2]) == Some(15) => {
-            Some((false, vreg_of(&ni.operands[1])?))
+        AArch64Opcode::AndRI if ni.operands.len() == 3 && ni.operands[2].as_imm() == Some(15) => {
+            Some((false, ni.operands[1].as_vreg()?))
         }
         _ => None,
     }
@@ -1908,7 +1897,7 @@ fn decode_nib_term(
     if ti.opcode != AArch64Opcode::Uxtw || ti.operands.len() != 2 {
         return None;
     }
-    let g32 = strip_copies(func, def, vreg_of(&ti.operands[1])?);
+    let g32 = strip_copies(func, def, ti.operands[1].as_vreg()?);
     let &gd = def.get(&g32.id)?;
     if !loop_insts.contains(&gd) {
         return None;
@@ -1917,8 +1906,8 @@ fn decode_nib_term(
     if gi.opcode != AArch64Opcode::AddRR || gi.operands.len() != 3 {
         return None;
     }
-    let a = vreg_of(&gi.operands[1])?;
-    let b = vreg_of(&gi.operands[2])?;
+    let a = gi.operands[1].as_vreg()?;
+    let b = gi.operands[2].as_vreg()?;
     // Either addend order: (nibble, sel) or (sel, nibble).
     for (nibble, sel) in [(a, b), (b, a)] {
         if let Some((is_hi, byte_src)) = decode_nibble(func, def, loop_insts, nibble) {
@@ -1948,7 +1937,7 @@ fn arm_select_const(func: &MachFunction, def: &DefIndex, arm: BlockId, sel: VReg
             if d != sel {
                 return None;
             }
-            cval = Some(const_value(func, def, s)?);
+            cval = Some(copied_const(func, def, s)?);
         }
     }
     cval
@@ -1981,10 +1970,10 @@ fn decode_select_head(
     if !([a0, a1].contains(&taken) && [a0, a1].contains(&fallthru) && taken != fallthru) {
         return None;
     }
-    let bcc = imm_of(&bcond.operands[0])?;
+    let bcc = bcond.operands[0].as_imm()?;
     let const_cmp = |cmp: &MachInst| -> Option<(VReg, i64)> {
         if cmp.opcode == AArch64Opcode::CmpRI && cmp.operands.len() == 2 {
-            Some((vreg_of(&cmp.operands[0])?, imm_of(&cmp.operands[1])?))
+            Some((cmp.operands[0].as_vreg()?, cmp.operands[1].as_imm()?))
         } else {
             None
         }
@@ -2008,15 +1997,15 @@ fn decode_select_head(
         let cset = func.inst(insts[n - 4]);
         if cmpi.opcode == AArch64Opcode::CmpRI
             && cmpi.operands.len() == 2
-            && imm_of(&cmpi.operands[1]) == Some(0)
+            && cmpi.operands[1].as_imm() == Some(0)
             && cset.opcode == AArch64Opcode::CSet
             && cset.operands.len() == 2
         {
-            let c = vreg_of(&cset.operands[0])?;
-            if vreg_of(&cmpi.operands[0])? != c {
+            let c = cset.operands[0].as_vreg()?;
+            if cmpi.operands[0].as_vreg()? != c {
                 return None;
             }
-            let cset_cc = imm_of(&cset.operands[1])?;
+            let cset_cc = cset.operands[1].as_imm()?;
             if let Some((x, cst)) = const_cmp(func.inst(insts[n - 5])) {
                 let (lt_arm, ge_arm) = arms_for(cset_cc)?;
                 return Some((x, cst, lt_arm, ge_arm));
@@ -2146,7 +2135,7 @@ fn hexnibble_no_early_exit(
         bound,
         ..
     } = context;
-    let mut visited: HashSet<BlockId> = HashSet::new();
+    let mut visited: HashSet<BlockId> = HashSet::default();
     let mut cur = header;
     for _ in 0..=body.len() {
         if !body.contains(&cur) || !visited.insert(cur) {
@@ -2194,7 +2183,7 @@ fn hexnibble_no_early_exit(
 /// match; fails closed (`None`) on ANY deviation. Runs its OWN no-early-exit chain
 /// gate internally (the two select diamonds are internal merges, not the single
 /// count-if diamond `recognize_forward_chain` handles).
-fn recognize_hexnibble(context: HexNibbleLoop<'_>, dump: bool) -> Option<(VReg, VReg)> {
+fn recognize_hexnibble(context: HexNibbleLoop<'_>) -> Option<(VReg, VReg)> {
     let HexNibbleLoop {
         func, latch, iv, ..
     } = context;
@@ -2207,12 +2196,6 @@ fn recognize_hexnibble(context: HexNibbleLoop<'_>, dump: bool) -> Option<(VReg, 
             continue;
         }
         if let Some(base) = try_hexnibble_acc(context, acc, s2) {
-            if dump {
-                eprintln!(
-                    "[neon-bytesum] HEXNIBBLE@{} acc={:?} base={:?}",
-                    func.name, acc, base
-                );
-            }
             return Some((acc, base));
         }
     }
@@ -2240,8 +2223,8 @@ fn try_hexnibble_acc(context: HexNibbleLoop<'_>, acc: VReg, s2: VReg) -> Option<
     if s2i.opcode != AArch64Opcode::AddRR || s2i.operands.len() != 3 {
         return None;
     }
-    let p = vreg_of(&s2i.operands[1])?;
-    let q = vreg_of(&s2i.operands[2])?;
+    let p = s2i.operands[1].as_vreg()?;
+    let q = s2i.operands[2].as_vreg()?;
 
     // `sum1 = AddRR(acc, nibA)` — the inner add whose one operand IS the acc.
     // Returns `(nibA, sum1_inst_id)`.
@@ -2255,8 +2238,8 @@ fn try_hexnibble_acc(context: HexNibbleLoop<'_>, acc: VReg, s2: VReg) -> Option<
         if vi.opcode != AArch64Opcode::AddRR || vi.operands.len() != 3 {
             return None;
         }
-        let a = vreg_of(&vi.operands[1])?;
-        let b = vreg_of(&vi.operands[2])?;
+        let a = vi.operands[1].as_vreg()?;
+        let b = vi.operands[2].as_vreg()?;
         if same_reg(func, def, a, acc) {
             Some((b, vd))
         } else if same_reg(func, def, b, acc) {
@@ -2379,7 +2362,7 @@ fn recognize_bytesum_term(
     let inner = match func.inst(*def.get(&t.id)?).opcode {
         // popcount path: Uxtw(trunc32(SWAR64(...))) — trunc32 is a MovR to Gpr32.
         AArch64Opcode::Uxtw => {
-            let src = vreg_of(&func.inst(*def.get(&t.id)?).operands[1])?;
+            let src = func.inst(*def.get(&t.id)?).operands[1].as_vreg()?;
             strip_copies(func, def, src)
         }
         _ => t,
@@ -2431,9 +2414,10 @@ fn cmpri_feeds_cset(func: &MachFunction, blk: BlockId, id: InstId) -> bool {
 ///
 /// The UTF-8 code-point-start count `(b & 0xC0) != 0x80` lowers to exactly this
 /// (`MASK=0xC0`, `CONST=0x80`, `ne=true`). SOUND: the vector prefix reproduces
-/// `(b & MASK) OP CONST` per byte lane with `AND.16B` + `CMEQ.16B` [+ `NOT.16B`]
-/// + `AND.16B`-by-ones, all faithfully proven `.16B`-lanewise; the 0/1 per-lane
-///   contributions dot-sum into the `.4S` partials, each `<= N < 2^31` (no wrap).
+/// `(b & MASK) OP CONST` per byte lane with `AND.16B` + `CMEQ.16B` [+ `NOT.16B`],
+/// then `AND.16B`-by-ones, all faithfully proven `.16B`-lanewise; the 0/1 per-lane
+/// contributions use the target-selected byte fold into the `.4S` partials,
+/// each `<= N < 2^31` (no wrap).
 fn recognize_maskcmp_term(
     func: &MachFunction,
     def: &DefIndex,
@@ -2453,7 +2437,7 @@ fn recognize_maskcmp_term(
         let inst = func.inst(d);
         match inst.opcode {
             AArch64Opcode::Uxtw | AArch64Opcode::Uxtb | AArch64Opcode::Uxth => {
-                t = strip_copies(func, def, vreg_of(&inst.operands[1])?);
+                t = strip_copies(func, def, inst.operands[1].as_vreg()?);
             }
             AArch64Opcode::CSet if inst.operands.len() == 2 => {
                 cset_id = Some(d);
@@ -2465,7 +2449,7 @@ fn recognize_maskcmp_term(
     let cset_id = cset_id?;
     let cset = func.inst(cset_id);
     // `!=` (ne=true) or `==` (ne=false); any other condition BAILS.
-    let ne = match imm_of(&cset.operands[1])? {
+    let ne = match cset.operands[1].as_imm()? {
         CC_NE => true,
         CC_EQ => false,
         _ => return None,
@@ -2483,13 +2467,13 @@ fn recognize_maskcmp_term(
     if cmp.opcode != AArch64Opcode::CmpRI || cmp.operands.len() != 2 {
         return None;
     }
-    let cnst = imm_of(&cmp.operands[1])?;
+    let cnst = cmp.operands[1].as_imm()?;
     if !(0..=255).contains(&cnst) {
         return None;
     }
 
     // `x = [Uxtb/Uxtw ...] <- AndRI(load, MASK)`; peel an optional widening.
-    let mut a = strip_copies(func, def, vreg_of(&cmp.operands[0])?);
+    let mut a = strip_copies(func, def, cmp.operands[0].as_vreg()?);
     let mut and_id = None;
     for _ in 0..3 {
         let &d = def.get(&a.id)?;
@@ -2499,7 +2483,7 @@ fn recognize_maskcmp_term(
         let inst = func.inst(d);
         match inst.opcode {
             AArch64Opcode::Uxtb | AArch64Opcode::Uxtw | AArch64Opcode::Uxth => {
-                a = strip_copies(func, def, vreg_of(&inst.operands[1])?);
+                a = strip_copies(func, def, inst.operands[1].as_vreg()?);
             }
             AArch64Opcode::AndRI if inst.operands.len() == 3 => {
                 and_id = Some(d);
@@ -2509,13 +2493,13 @@ fn recognize_maskcmp_term(
         }
     }
     let and = func.inst(and_id?);
-    let mask = imm_of(&and.operands[2])?;
+    let mask = and.operands[2].as_imm()?;
     if !(0..=255).contains(&mask) {
         return None;
     }
 
     // The masked value is a byte load `a[iv]` at the induction index.
-    let base = byte_load_base(func, def, loop_insts, iv, vreg_of(&and.operands[1])?)?;
+    let base = byte_load_base(func, def, loop_insts, iv, and.operands[1].as_vreg()?)?;
     Some((mask, cnst, ne, base))
 }
 
@@ -2524,15 +2508,15 @@ fn recognize_maskcmp_term(
 fn strip_u32_mask(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<VReg> {
     let inst = func.inst(*def.get(&v.id)?);
     match inst.opcode {
-        AArch64Opcode::AndRI if imm_of(&inst.operands[2]) == Some(MASK32) => {
-            vreg_of(&inst.operands[1])
+        AArch64Opcode::AndRI if inst.operands[2].as_imm() == Some(MASK32) => {
+            inst.operands[1].as_vreg()
         }
         AArch64Opcode::AndRR => {
-            let a = vreg_of(&inst.operands[1])?;
-            let b = vreg_of(&inst.operands[2])?;
-            if const_value(func, def, b) == Some(MASK32) {
+            let a = inst.operands[1].as_vreg()?;
+            let b = inst.operands[2].as_vreg()?;
+            if copied_const(func, def, b) == Some(MASK32) {
                 Some(a)
-            } else if const_value(func, def, a) == Some(MASK32) {
+            } else if copied_const(func, def, a) == Some(MASK32) {
                 Some(b)
             } else {
                 None
@@ -2563,18 +2547,18 @@ fn byte_load_base(
         let inst = func.inst(d);
         match inst.opcode {
             AArch64Opcode::Uxtb | AArch64Opcode::Uxtw => {
-                cur = vreg_of(&inst.operands[1])?;
+                cur = inst.operands[1].as_vreg()?;
             }
             AArch64Opcode::LdrbRO if inst.operands.len() == 4 => {
-                let base = vreg_of(&inst.operands[1])?;
-                let index = vreg_of(&inst.operands[2])?;
+                let base = inst.operands[1].as_vreg()?;
+                let index = inst.operands[2].as_vreg()?;
                 return same_as_iv(func, def, index, iv).then_some(base);
             }
             AArch64Opcode::LdrbRI if inst.operands.len() == 3 => {
-                if imm_of(&inst.operands[2]) != Some(0) {
+                if inst.operands[2].as_imm() != Some(0) {
                     return None;
                 }
-                let addr = vreg_of(&inst.operands[1])?;
+                let addr = inst.operands[1].as_vreg()?;
                 return ldrb_addr_base(func, def, loop_insts, iv, addr);
             }
             _ => return None,
@@ -2599,8 +2583,8 @@ fn ldrb_addr_base(
     let inst = func.inst(ad);
     match inst.opcode {
         AArch64Opcode::AddRR if inst.operands.len() == 3 => {
-            let a = vreg_of(&inst.operands[1])?;
-            let b = vreg_of(&inst.operands[2])?;
+            let a = inst.operands[1].as_vreg()?;
+            let b = inst.operands[2].as_vreg()?;
             if same_as_iv(func, def, a, iv) {
                 Some(b)
             } else if same_as_iv(func, def, b, iv) {
@@ -2610,10 +2594,10 @@ fn ldrb_addr_base(
             }
         }
         AArch64Opcode::Madd if inst.operands.len() == 4 => {
-            let f1 = vreg_of(&inst.operands[1])?;
-            let f2 = vreg_of(&inst.operands[2])?;
-            let base = vreg_of(&inst.operands[3])?;
-            let es = |f: VReg| const_value(func, def, f) == Some(1);
+            let f1 = inst.operands[1].as_vreg()?;
+            let f2 = inst.operands[2].as_vreg()?;
+            let base = inst.operands[3].as_vreg()?;
+            let es = |f: VReg| copied_const(func, def, f) == Some(1);
             if (same_as_iv(func, def, f1, iv) && es(f2))
                 || (same_as_iv(func, def, f2, iv) && es(f1))
             {
@@ -2629,35 +2613,6 @@ fn ldrb_addr_base(
 /// `v` equals `iv` up through `MovR`/`Copy` chains.
 fn same_as_iv(func: &MachFunction, def: &DefIndex, v: VReg, iv: VReg) -> bool {
     strip_copies(func, def, v) == strip_copies(func, def, iv)
-}
-
-/// Follow `MovR`/`Copy` chains to the underlying value.
-fn strip_copies(func: &MachFunction, def: &DefIndex, mut v: VReg) -> VReg {
-    for _ in 0..16 {
-        // A vreg with several live defs has no single reaching definition: the
-        // def map is LAST-WINS over the emitted layout, so it names whichever
-        // def comes last rather than the one that reaches this use. Every
-        // loop-carried variable is multi-def by construction (a preheader copy
-        // and a latch copy into the same vreg), and every `if`/`match` value has
-        // one def per arm — so walking one resolves an induction variable to its
-        // LATCH source, or a merge value to whichever arm came last.
-        //
-        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
-        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
-        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
-        // in-tree precedents for doing it right.
-        if def.live_def_count(v.id) != 1 {
-            return v;
-        }
-        let Some(&d) = def.get(&v.id) else {
-            return v;
-        };
-        match copy_like(func.inst(d)) {
-            Some((dst, src)) if dst == v => v = src,
-            _ => return v,
-        }
-    }
-    v
 }
 
 /// Number of LIVE (attached-to-a-block) defs of `v` in the whole function.
@@ -2764,7 +2719,7 @@ fn swar_inst<'a>(func: &'a MachFunction, def: &DefIndex, v: VReg) -> Option<&'a 
 fn swar_and_imm(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, i64)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::AndRI && inst.operands.len() == 3 {
-        Some((vreg_of(&inst.operands[1])?, imm_of(&inst.operands[2])?))
+        Some((inst.operands[1].as_vreg()?, inst.operands[2].as_imm()?))
     } else {
         None
     }
@@ -2773,7 +2728,7 @@ fn swar_and_imm(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, i
 fn swar_add_rr(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, VReg)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::AddRR && inst.operands.len() == 3 {
-        Some((vreg_of(&inst.operands[1])?, vreg_of(&inst.operands[2])?))
+        Some((inst.operands[1].as_vreg()?, inst.operands[2].as_vreg()?))
     } else {
         None
     }
@@ -2782,7 +2737,7 @@ fn swar_add_rr(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, VR
 fn swar_sub_rr(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, VReg)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::SubRR && inst.operands.len() == 3 {
-        Some((vreg_of(&inst.operands[1])?, vreg_of(&inst.operands[2])?))
+        Some((inst.operands[1].as_vreg()?, inst.operands[2].as_vreg()?))
     } else {
         None
     }
@@ -2791,7 +2746,7 @@ fn swar_sub_rr(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, VR
 fn swar_lsr_imm(func: &MachFunction, def: &DefIndex, v: VReg) -> Option<(VReg, i64)> {
     let inst = swar_inst(func, def, v)?;
     if inst.opcode == AArch64Opcode::LsrRI && inst.operands.len() == 3 {
-        Some((vreg_of(&inst.operands[1])?, imm_of(&inst.operands[2])?))
+        Some((inst.operands[1].as_vreg()?, inst.operands[2].as_imm()?))
     } else {
         None
     }
@@ -2841,6 +2796,7 @@ fn swar_pairs(func: &MachFunction, def: &DefIndex, a: VReg, b: VReg) -> Option<V
 // ---------------------------------------------------------------------------
 
 /// The four hoisted byte-broadcast constants the hex-nibble kernel needs.
+#[derive(Clone, Copy)]
 struct HexConsts {
     /// `MOVI #0x0F` — the low-nibble isolate mask (`AND.16B` -> `b & 15`).
     v_lomask: VReg,
@@ -2849,27 +2805,113 @@ struct HexConsts {
     /// `MOVI #39` — the hex-letter contribution `87-48` (`AND.16B` with the mask
     /// gives `39` where a nibble `>= 10`, else `0`).
     v_delta: VReg,
-    /// `MOVI #96` — the per-byte ASCII base `48*2`, dot-summed as a constant stream.
+    /// `MOVI #96` — the per-byte ASCII base `48*2`, folded as a constant stream.
     v_const: VReg,
 }
 
-/// Emit the hex-nibble per-block prefix + FIVE accumulate UDOTs into `vacc`:
+/// The target-selected fold carries exactly the constant its instruction needs.
+#[derive(Clone, Copy)]
+enum ByteFold {
+    Widening,
+    DotProd { ones: VReg },
+}
+
+#[derive(Clone, Copy)]
+enum PointwiseByteKernel {
+    Popcount,
+    ByteSum,
+    PredCountEqZero {
+        zero: VReg,
+        ones: VReg,
+    },
+    PredMaskCmp {
+        mask: VReg,
+        cnst: VReg,
+        ones: VReg,
+        ne: bool,
+    },
+    HexNibbleSum(HexConsts),
+}
+
+enum PreparedByteKernel {
+    Pointwise(PointwiseByteKernel),
+    Stencil { ones: VReg, ne: bool },
+}
+
+fn emit_byte_broadcast(func: &mut MachFunction, pre: InstId, value: i64) -> VReg {
+    let register = alloc(func, RegClass::Fpr128);
+    emit_before(
+        func,
+        pre,
+        AArch64Opcode::NeonMovi,
+        vec![vreg(register), imm(value)],
+    );
+    register
+}
+
+/// Fold one `.16B` byte-contribution vector into a `.4S` accumulator.
+///
+/// FEAT_DotProd targets use the single-instruction UDOT-by-ones form. Generic
+/// AArch64 uses the mandatory-NEON widening chain. The two routes are
+/// lane-for-lane equivalent: each adds the exact sum of four zero-extended byte
+/// lanes to the corresponding i32 accumulator lane.
+fn emit_byte_fold(
+    func: &mut MachFunction,
+    block_id: BlockId,
+    vacc: VReg,
+    src: VReg,
+    fold: ByteFold,
+) {
+    if let ByteFold::DotProd { ones } = fold {
+        emit(
+            func,
+            block_id,
+            AArch64Opcode::NeonUdotV,
+            vec![vreg(vacc), vreg(src), vreg(ones), imm(ARR_B16)],
+        );
+        return;
+    }
+
+    let h = alloc(func, RegClass::Fpr128);
+    emit(
+        func,
+        block_id,
+        AArch64Opcode::NeonUaddlpV,
+        vec![vreg(h), vreg(src), imm(ARR_B16)],
+    );
+    let s4 = alloc(func, RegClass::Fpr128);
+    emit(
+        func,
+        block_id,
+        AArch64Opcode::NeonUaddlpV,
+        vec![vreg(s4), vreg(h), imm(ARR_H8)],
+    );
+    emit(
+        func,
+        block_id,
+        AArch64Opcode::NeonAddV,
+        vec![vreg(vacc), vreg(vacc), vreg(s4), imm(ARR_S4)],
+    );
+}
+
+/// Emit the hex-nibble per-block prefix + FIVE byte-folds into `vacc`:
 /// ```text
 ///   hi = USHR.16B(q, #4)              lo  = AND.16B(q, #15)
 ///   ch = AND.16B(CMHS.16B(hi,#10),#39)  cl = AND.16B(CMHS.16B(lo,#10),#39)
-///   vacc += UDOT(hi) + UDOT(lo) + UDOT(ch) + UDOT(cl) + UDOT(#96)   (by ones)
+///   vacc += FOLD(hi) + FOLD(lo) + FOLD(ch) + FOLD(cl) + FOLD(#96)
 /// ```
 /// so each `.4S` lane accumulates, per byte group,
 /// `hi + lo + 96 + 39*[hi>=10] + 39*[lo>=10]` = exactly `nib(hi)+nib(lo)` (the
 /// scalar per-byte contribution). Every emitted op is faithfully proven /
 /// credited: `USHR.16B #4` (`proof_neon_ushrv_lanewise_16b(4)`), `CMHS.16B`
-/// (`proof_neon_cmhsv_lanewise_16b`), `AND.16B`, `UDOT`, `MOVI`.
+/// (`proof_neon_cmhsv_lanewise_16b`), `AND.16B`, `UDOT` or `UADDLP+ADD`,
+/// `MOVI`.
 fn emit_hexnibble_block(
     func: &mut MachFunction,
     vb: BlockId,
     q: VReg,
     vacc: VReg,
-    vone: VReg,
+    fold: ByteFold,
     hc: &HexConsts,
 ) {
     // hi = q >> 4 (per byte lane).
@@ -2908,26 +2950,151 @@ fn emit_hexnibble_block(
     };
     let ch = letter_contrib(func, hi);
     let cl = letter_contrib(func, lo);
-    // Dot-sum all five byte streams (each byte * 1) into the .4S accumulator. The
-    // accumulate order is irrelevant (integer addition is associative); the sum is
+    // Fold all five byte streams into the .4S accumulator. The accumulate order
+    // is irrelevant (integer addition is associative); the sum is
     // `Σ (hi + lo + 39*[hi>=10] + 39*[lo>=10] + 96)` per byte = the scalar term.
     for src in [hi, lo, ch, cl, hc.v_const] {
-        emit(
-            func,
-            vb,
-            AArch64Opcode::NeonUdotV,
-            vec![vreg(vacc), vreg(src), vreg(vone), imm(ARR_B16)],
-        );
+        emit_byte_fold(func, vb, vacc, src, fold);
     }
 }
 
+fn emit_pointwise_byte_kernel(
+    func: &mut MachFunction,
+    vb: BlockId,
+    q: VReg,
+    vacc: VReg,
+    fold: ByteFold,
+    kernel: &PointwiseByteKernel,
+) {
+    let src = match *kernel {
+        PointwiseByteKernel::Popcount => {
+            let cnt = alloc(func, RegClass::Fpr128);
+            emit(
+                func,
+                vb,
+                AArch64Opcode::NeonCntV,
+                vec![vreg(cnt), vreg(q), imm(ARR_B16)],
+            );
+            cnt
+        }
+        PointwiseByteKernel::ByteSum => q,
+        PointwiseByteKernel::PredCountEqZero { zero, ones } => {
+            // 0xFF in each byte lane where `q.byte == 0`.
+            let mask = alloc(func, RegClass::Fpr128);
+            emit(
+                func,
+                vb,
+                AArch64Opcode::NeonCmeqV,
+                vec![vreg(mask), vreg(q), vreg(zero), imm(ARR_B16)],
+            );
+            // Collapse 0xFF -> 0x01 so each matching byte contributes 1.
+            let m1 = alloc(func, RegClass::Fpr128);
+            emit(
+                func,
+                vb,
+                AArch64Opcode::NeonAndV,
+                vec![vreg(m1), vreg(mask), vreg(ones)],
+            );
+            m1
+        }
+        PointwiseByteKernel::PredMaskCmp {
+            mask,
+            cnst,
+            ones,
+            ne,
+        } => {
+            // t0 = q & vmask : isolate `b & MASK` per byte lane.
+            let t0 = alloc(func, RegClass::Fpr128);
+            emit(
+                func,
+                vb,
+                AArch64Opcode::NeonAndV,
+                vec![vreg(t0), vreg(q), vreg(mask)],
+            );
+            // t1 = CMEQ.16B(t0, vcnst) : 0xFF where `(b & MASK) == CONST`.
+            let t1 = alloc(func, RegClass::Fpr128);
+            emit(
+                func,
+                vb,
+                AArch64Opcode::NeonCmeqV,
+                vec![vreg(t1), vreg(t0), vreg(cnst), imm(ARR_B16)],
+            );
+            // For `!=` (ne), invert per byte lane: 0xFF <-> 0x00. NOT.16B is
+            // faithfully proven lanewise (proof_neon_notv_lanewise_16b).
+            let matched = if ne {
+                let tn = alloc(func, RegClass::Fpr128);
+                emit(func, vb, AArch64Opcode::NeonNotV, vec![vreg(tn), vreg(t1)]);
+                tn
+            } else {
+                t1
+            };
+            // Collapse 0xFF -> 0x01 so each matching byte contributes 1.
+            let m1 = alloc(func, RegClass::Fpr128);
+            emit(
+                func,
+                vb,
+                AArch64Opcode::NeonAndV,
+                vec![vreg(m1), vreg(matched), vreg(ones)],
+            );
+            m1
+        }
+        PointwiseByteKernel::HexNibbleSum(ref constants) => {
+            emit_hexnibble_block(func, vb, q, vacc, fold, constants);
+            return;
+        }
+    };
+    emit_byte_fold(func, vb, vacc, src, fold);
+}
+
+fn emit_stencil_byte_kernel(
+    func: &mut MachFunction,
+    vb: BlockId,
+    q: VReg,
+    nb: VReg,
+    ones: VReg,
+    ne: bool,
+) -> VReg {
+    // curStream = EXT.16B(q, nb, #1) = `a[iv + 16k ..]` (slide the
+    // block one byte FORWARD, pulling `nb.byte[0]` into lane 15).
+    // FAITHFULLY PROVEN (proof_neon_extv_16b(1)). Operand order
+    // [Vd, Vn(LOW), Vm(HIGH), imm].
+    let cur = alloc(func, RegClass::Fpr128);
+    emit(
+        func,
+        vb,
+        AArch64Opcode::NeonExtV,
+        vec![vreg(cur), vreg(q), vreg(nb), imm(1)],
+    );
+    // 0xFF per lane where `a[iv+16k+m] == a[iv+16k+m-1]` (curStream vs
+    // the un-shifted predecessor block q).
+    let eqm = alloc(func, RegClass::Fpr128);
+    emit(
+        func,
+        vb,
+        AArch64Opcode::NeonCmeqV,
+        vec![vreg(eqm), vreg(cur), vreg(q), imm(ARR_B16)],
+    );
+    // For `!=` (ne=true, the RLE "count runs" relation), invert per
+    // lane. NOT.16B is faithfully proven lanewise.
+    let matched = if ne {
+        let tn = alloc(func, RegClass::Fpr128);
+        emit(func, vb, AArch64Opcode::NeonNotV, vec![vreg(tn), vreg(eqm)]);
+        tn
+    } else {
+        eqm
+    };
+    // Collapse 0xFF -> 0x01 so each matching lane contributes 1.
+    let m1 = alloc(func, RegClass::Fpr128);
+    emit(
+        func,
+        vb,
+        AArch64Opcode::NeonAndV,
+        vec![vreg(m1), vreg(matched), vreg(ones)],
+    );
+    m1
+}
+
 fn apply(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bool {
-    // All currently recognized shapes lower through `NeonUdotV`. Keep the
-    // capability check at the mutation boundary as a second fail-closed guard
-    // in addition to the pass entry checks above.
-    if !aarch64_dotprod {
-        return false;
-    }
     // Per-kind unroll: ByteSum = 8 accumulators / 128B per iteration;
     // Popcount / PredCountEqZero = 4 / 64B (see `unroll`).
     let unroll = unroll(rec.kind);
@@ -3000,72 +3167,49 @@ fn apply(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bo
         );
     }
 
-    // An all-`0x01`-byte-lane ones vector, hoisted for EVERY kind: it is the
-    // multiplier of the UDOT-by-ones fold (`acc[i] += sum_j zext(b_j) * 1`) and,
-    // for the count-if kernel, also the `0xFF -> 0x01` collapse mask. The byte-
-    // form `MOVI` the encoder emits (`MOVI Vd.16B, #imm8`) puts `0x01` in EVERY
-    // one of the 16 byte lanes (a low-lane-only 1 would undercount). The
-    // count-if kernel additionally needs a zero comparand for `CMEQ.16B`
-    // (`MOVI #0` is all-zero in every arrangement).
-    let vone = {
-        let vo = alloc(func, RegClass::Fpr128);
-        emit_before(func, pre, AArch64Opcode::NeonMovi, vec![vreg(vo), imm(1)]);
-        vo
-    };
-    let vzero = if rec.kind == TermKind::PredCountEqZero {
-        let vz = alloc(func, RegClass::Fpr128);
-        emit_before(func, pre, AArch64Opcode::NeonMovi, vec![vreg(vz), imm(0)]);
-        Some(vz)
+    // Share the ones vector between DotProd and predicate prefixes, but never
+    // allocate it for a widening fold that does not consume it.
+    let mut ones = None;
+    let mut ones_vector =
+        |func: &mut MachFunction| *ones.get_or_insert_with(|| emit_byte_broadcast(func, pre, 1));
+    let fold = if aarch64_dotprod {
+        ByteFold::DotProd {
+            ones: ones_vector(func),
+        }
     } else {
-        None
+        ByteFold::Widening
     };
-    // The masked-compare kernel hoists two byte-broadcast comparand vectors:
-    // `vmask` (the `& MASK` isolate) and `vcnst` (the `== CONST` comparand). Both
-    // are loop-invariant `MOVI Vd.16B, #imm8` (imm8 in `0..=255`), so they live
-    // in the preheader — one materialize each, not per accumulator.
-    let (vmask, vcnst) = if let TermKind::PredMaskCmp { mask, cnst, .. } = rec.kind {
-        let vm = alloc(func, RegClass::Fpr128);
-        emit_before(
-            func,
-            pre,
-            AArch64Opcode::NeonMovi,
-            vec![vreg(vm), imm(mask)],
-        );
-        let vc = alloc(func, RegClass::Fpr128);
-        emit_before(
-            func,
-            pre,
-            AArch64Opcode::NeonMovi,
-            vec![vreg(vc), imm(cnst)],
-        );
-        (Some(vm), Some(vc))
-    } else {
-        (None, None)
-    };
-    // The hex-nibble kernel hoists four byte-broadcast constants: `#15` (the low
-    // nibble mask), `#10` (the hex-letter threshold comparand), `#39` (the
-    // hex-letter contribution `87-48`, applied where a nibble `>= 10`), and `#96`
-    // (`48*2`, the per-byte ASCII-base constant). Each is a loop-invariant
-    // `MOVI Vd.16B, #imm8`.
-    let hex = if rec.kind == TermKind::HexNibbleSum {
-        let mk = |func: &mut MachFunction, byteval: i64| {
-            let v = alloc(func, RegClass::Fpr128);
-            emit_before(
-                func,
-                pre,
-                AArch64Opcode::NeonMovi,
-                vec![vreg(v), imm(byteval)],
-            );
-            v
-        };
-        Some(HexConsts {
-            v_lomask: mk(func, 0x0F),
-            v_thresh: mk(func, NIB_THRESHOLD),
-            v_delta: mk(func, NIB_DELTA),
-            v_const: mk(func, HEX_CONST_PER_BYTE),
-        })
-    } else {
-        None
+    let kernel = match rec.kind {
+        TermKind::Popcount => PreparedByteKernel::Pointwise(PointwiseByteKernel::Popcount),
+        TermKind::ByteSum => PreparedByteKernel::Pointwise(PointwiseByteKernel::ByteSum),
+        TermKind::PredCountEqZero => {
+            let ones = ones_vector(func);
+            let zero = emit_byte_broadcast(func, pre, 0);
+            PreparedByteKernel::Pointwise(PointwiseByteKernel::PredCountEqZero { zero, ones })
+        }
+        TermKind::PredMaskCmp { mask, cnst, ne } => {
+            let ones = ones_vector(func);
+            let mask = emit_byte_broadcast(func, pre, mask);
+            let cnst = emit_byte_broadcast(func, pre, cnst);
+            PreparedByteKernel::Pointwise(PointwiseByteKernel::PredMaskCmp {
+                mask,
+                cnst,
+                ones,
+                ne,
+            })
+        }
+        TermKind::PredStencilCmp { ne } => PreparedByteKernel::Stencil {
+            ones: ones_vector(func),
+            ne,
+        },
+        TermKind::HexNibbleSum => {
+            PreparedByteKernel::Pointwise(PointwiseByteKernel::HexNibbleSum(HexConsts {
+                v_lomask: emit_byte_broadcast(func, pre, 0x0F),
+                v_thresh: emit_byte_broadcast(func, pre, NIB_THRESHOLD),
+                v_delta: emit_byte_broadcast(func, pre, NIB_DELTA),
+                v_const: emit_byte_broadcast(func, pre, HEX_CONST_PER_BYTE),
+            }))
+        }
     };
 
     // --- Vector header: unsigned `iv <u main_bound` => the whole width-byte
@@ -3090,7 +3234,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bo
     //     the last load is itself useful — ZERO waste). The LDPs over-advance the
     //     pointer by `((unroll+1)/2)*32`; a single `SUB p, p, #(over - width)`
     //     realigns it to `p == base + (iv+width) - 1` for the next iteration.
-    let (qs, look): (Vec<VReg>, Option<VReg>) = if is_stencil {
+    let qs: Vec<VReg> = if is_stencil {
         let nblocks = unroll + 1; // unroll compared + 1 look-ahead (even)
         let npairs = nblocks / 2;
         let mut loaded: Vec<VReg> = Vec::with_capacity(nblocks);
@@ -3116,8 +3260,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bo
                 vec![vreg(p), vreg(p), imm(over)],
             );
         }
-        let look = loaded.pop(); // the last loaded block is the look-ahead
-        (loaded, look)
+        loaded
     } else {
         let mut qs: Vec<VReg> = Vec::with_capacity(unroll);
         for _pair in 0..unroll / 2 {
@@ -3132,153 +3275,23 @@ fn apply(func: &mut MachFunction, rec: &Recognized, aarch64_dotprod: bool) -> bo
             qs.push(q0);
             qs.push(q1);
         }
-        (qs, None)
+        qs
     };
 
-    // Per accumulator: a per-kind `.16B` prefix that produces the byte
-    // contributions, then the FIXED proven UDOT-by-ones fold. popcount =
-    // CNT.16B; plain sum = the raw byte lanes; count-if = CMEQ.16B (0xFF where
-    // byte==0) then AND.16B with the 0x01-per-lane mask.
-    //
-    // `UDOT.4S vacc, src, vone` accumulates, per i32 lane,
-    // `acc[i] += sum_{j=0..3} zext32(src.byte[4i+j]) * 1` (the FAITHFULLY-PROVEN
-    // `NeonUdotV` D-pair accumulate semantics) — lane-for-lane IDENTICAL to the
-    // UADDLP(.16B->.8H) + UADDLP(.8H->.4S) + ADD.4S chain it replaces (zext
-    // associativity: both add the exact 4-byte group sum `<= 1020` into lane `i`
-    // mod 2^32), in ONE SIMD op per Q instead of three. This is the exact
-    // structure LLVM emits for e07's byte sum (4x `udot.4s acc, data, ones`).
-    // `NeonUdotV` operand 0 is a TIED def-use (the accumulate READS Vd) — see
-    // `has_tied_def_use`.
-    for k in 0..unroll {
-        // The hex-nibble kernel emits its OWN five-stream prefix + accumulate UDOTs
-        // (no single `src`), so it is handled ahead of the single-UDOT kinds.
-        if rec.kind == TermKind::HexNibbleSum {
-            emit_hexnibble_block(func, vb, qs[k], vacc[k], vone, hex.as_ref().unwrap());
-            continue;
+    // Stencil kernels consume adjacent loaded blocks, including the final
+    // look-ahead. Pointwise kernels consume one block per accumulator.
+    match kernel {
+        PreparedByteKernel::Stencil { ones, ne } => {
+            for ((&current, &next), &accumulator) in qs.iter().zip(qs.iter().skip(1)).zip(&vacc) {
+                let src = emit_stencil_byte_kernel(func, vb, current, next, ones, ne);
+                emit_byte_fold(func, vb, accumulator, src, fold);
+            }
         }
-        let src = match rec.kind {
-            TermKind::Popcount => {
-                let cnt = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonCntV,
-                    vec![vreg(cnt), vreg(qs[k]), imm(ARR_B16)],
-                );
-                cnt
+        PreparedByteKernel::Pointwise(kernel) => {
+            for (current, &accumulator) in qs.into_iter().zip(&vacc) {
+                emit_pointwise_byte_kernel(func, vb, current, accumulator, fold, &kernel);
             }
-            TermKind::ByteSum => qs[k],
-            TermKind::PredCountEqZero => {
-                // 0xFF in each byte lane where `qs[k].byte == 0`.
-                let mask = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonCmeqV,
-                    vec![vreg(mask), vreg(qs[k]), vreg(vzero.unwrap()), imm(ARR_B16)],
-                );
-                // Collapse 0xFF -> 0x01 so each matching byte contributes 1.
-                let m1 = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonAndV,
-                    vec![vreg(m1), vreg(mask), vreg(vone)],
-                );
-                m1
-            }
-            TermKind::PredMaskCmp { ne, .. } => {
-                // t0 = qs[k] & vmask : isolate `b & MASK` per byte lane.
-                let t0 = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonAndV,
-                    vec![vreg(t0), vreg(qs[k]), vreg(vmask.unwrap())],
-                );
-                // t1 = CMEQ.16B(t0, vcnst) : 0xFF where `(b & MASK) == CONST`.
-                let t1 = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonCmeqV,
-                    vec![vreg(t1), vreg(t0), vreg(vcnst.unwrap()), imm(ARR_B16)],
-                );
-                // For `!=` (ne), invert per byte lane: 0xFF <-> 0x00. NOT.16B is
-                // faithfully proven lanewise (proof_neon_notv_lanewise_16b).
-                let matched = if ne {
-                    let tn = alloc(func, RegClass::Fpr128);
-                    emit(func, vb, AArch64Opcode::NeonNotV, vec![vreg(tn), vreg(t1)]);
-                    tn
-                } else {
-                    t1
-                };
-                // Collapse 0xFF -> 0x01 so each matching byte contributes 1.
-                let m1 = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonAndV,
-                    vec![vreg(m1), vreg(matched), vreg(vone)],
-                );
-                m1
-            }
-            TermKind::PredStencilCmp { ne } => {
-                // Block `k` = `a[iv-1 + 16k ..]`; the FORWARD neighbor block is
-                // block `k+1` (the look-ahead block for the LAST accumulator).
-                let nb = if k + 1 < qs.len() {
-                    qs[k + 1]
-                } else {
-                    look.expect("stencil look-ahead block must exist")
-                };
-                // curStream = EXT.16B(qs[k], nb, #1) = `a[iv + 16k ..]` (slide the
-                // block one byte FORWARD, pulling `nb.byte[0]` into lane 15).
-                // FAITHFULLY PROVEN (proof_neon_extv_16b(1)). Operand order
-                // [Vd, Vn(LOW), Vm(HIGH), imm].
-                let cur = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonExtV,
-                    vec![vreg(cur), vreg(qs[k]), vreg(nb), imm(1)],
-                );
-                // 0xFF per lane where `a[iv+16k+m] == a[iv+16k+m-1]` (curStream vs
-                // the un-shifted predecessor block qs[k]).
-                let eqm = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonCmeqV,
-                    vec![vreg(eqm), vreg(cur), vreg(qs[k]), imm(ARR_B16)],
-                );
-                // For `!=` (ne=true, the RLE "count runs" relation), invert per
-                // lane. NOT.16B is faithfully proven lanewise.
-                let matched = if ne {
-                    let tn = alloc(func, RegClass::Fpr128);
-                    emit(func, vb, AArch64Opcode::NeonNotV, vec![vreg(tn), vreg(eqm)]);
-                    tn
-                } else {
-                    eqm
-                };
-                // Collapse 0xFF -> 0x01 so each matching lane contributes 1.
-                let m1 = alloc(func, RegClass::Fpr128);
-                emit(
-                    func,
-                    vb,
-                    AArch64Opcode::NeonAndV,
-                    vec![vreg(m1), vreg(matched), vreg(vone)],
-                );
-                m1
-            }
-            // Handled by the early `emit_hexnibble_block` + `continue` above.
-            TermKind::HexNibbleSum => unreachable!("hex-nibble handled before the match"),
-        };
-        emit(
-            func,
-            vb,
-            AArch64Opcode::NeonUdotV,
-            vec![vreg(vacc[k]), vreg(src), vreg(vone), imm(ARR_B16)],
-        );
+        }
     }
     emit(func, vb, AArch64Opcode::B, vec![block(vl)]);
 
@@ -3405,72 +3418,6 @@ fn imm(v: i64) -> MachOperand {
 fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
 }
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
-/// `MovR(d, s)` / `Copy(d, s)` / `AddRI(d, s, 0)` copy idioms -> `(d, s)`.
-fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
-    match inst.opcode {
-        AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
-        {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        _ => None,
-    }
-}
-
-/// 16-bit `Movz` constant, or a `Movz(lo16)`+`Movk(hi16, lsl 16)` pair (e.g.
-/// `0xFFFFFFFF`), through copies. The `Movk` writes its dst IN PLACE (tied), so
-/// its low 16 bits come from a preceding `Movz` on the SAME vreg in the block.
-fn const_value(func: &MachFunction, def: &DefIndex, val: VReg) -> Option<i64> {
-    let v = strip_copies(func, def, val);
-    let id = *def.get(&v.id)?;
-    let inst = func.inst(id);
-    match inst.opcode {
-        AArch64Opcode::Movz => move_wide_seed(inst, v),
-        AArch64Opcode::Movk => {
-            // Replay same-destination move-wide writes through the final MOVK.
-            // Invalid shapes, missing seeds, or intervening definitions make
-            // the value unknown rather than fabricating a zero base.
-            let blk = block_of_inst(func, id)?;
-            let insts = &func.block(blk).insts;
-            let pos = insts.iter().position(|&i| i == id)?;
-            let mut acc: Option<i64> = None;
-            for &pid in &insts[..=pos] {
-                let pi = func.inst(pid);
-                if !crate::effects::inst_defines_vreg(pi, v) {
-                    continue;
-                }
-                match pi.opcode {
-                    AArch64Opcode::Movz => acc = move_wide_seed(pi, v),
-                    AArch64Opcode::Movk => {
-                        let (halfword, shift) = move_wide_patch(pi, v)?;
-                        let old = acc?;
-                        let mask = 0xFFFF_i64 << shift;
-                        acc = Some((old & !mask) | (halfword << shift));
-                    }
-                    _ => acc = None,
-                }
-            }
-            acc
-        }
-        _ => None,
-    }
-}
 
 fn move_wide_seed(inst: &MachInst, dst: VReg) -> Option<i64> {
     if !matches!(dst.class, RegClass::Gpr32 | RegClass::Gpr64) {
@@ -3478,34 +3425,14 @@ fn move_wide_seed(inst: &MachInst, dst: VReg) -> Option<i64> {
     }
     if inst.opcode != AArch64Opcode::Movz
         || !(2..=3).contains(&inst.operands.len())
-        || inst.operands.first().and_then(vreg_of) != Some(dst)
-        || (inst.operands.len() == 3 && imm_of(&inst.operands[2]) != Some(0))
+        || inst.operands.first().and_then(MachOperand::as_vreg) != Some(dst)
+        || (inst.operands.len() == 3 && inst.operands[2].as_imm() != Some(0))
     {
         return None;
     }
-    imm_of(&inst.operands[1]).filter(|imm| (0..=0xFFFF).contains(imm))
-}
-
-fn move_wide_patch(inst: &MachInst, dst: VReg) -> Option<(i64, u32)> {
-    if !matches!(dst.class, RegClass::Gpr32 | RegClass::Gpr64) {
-        return None;
-    }
-    if inst.opcode != AArch64Opcode::Movk
-        || !(2..=3).contains(&inst.operands.len())
-        || inst.operands.first().and_then(vreg_of) != Some(dst)
-    {
-        return None;
-    }
-    let halfword = imm_of(&inst.operands[1]).filter(|imm| (0..=0xFFFF).contains(imm))?;
-    let shift = match inst.operands.get(2) {
-        None => 0,
-        Some(operand) => imm_of(operand)?,
-    };
-    let max_shift = if dst.class == RegClass::Gpr32 { 16 } else { 48 };
-    if !matches!(shift, 0 | 16 | 32 | 48) || shift > max_shift {
-        return None;
-    }
-    Some((halfword, shift as u32))
+    inst.operands[1]
+        .as_imm()
+        .filter(|imm| (0..=0xFFFF).contains(imm))
 }
 
 /// Def map (`vreg id -> defining InstId`) over instructions still ATTACHED to a
@@ -3545,10 +3472,20 @@ impl std::ops::Deref for DefIndex {
     }
 }
 
+impl crate::mach_util::DefLookup for DefIndex {
+    fn last_def(&self, id: u32) -> Option<InstId> {
+        self.def.get(&id).copied()
+    }
+
+    fn indexed_def_count(&self, _func: &MachFunction, id: u32) -> Option<usize> {
+        Some(self.live_def_count(id))
+    }
+}
+
 impl DefIndex {
     fn build(func: &MachFunction) -> Self {
         let def = build_def_map_inner(func);
-        let mut live_defs: HashMap<u32, u32> = HashMap::new();
+        let mut live_defs: HashMap<u32, u32> = HashMap::default();
         for &b in &func.block_order {
             for &id in &func.block(b).insts {
                 let mut seen: [Option<u32>; 8] = [None; 8];
@@ -3600,16 +3537,6 @@ fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
         }
     }
     None
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|o| match o {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
 }
 
 fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
@@ -3722,7 +3649,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);

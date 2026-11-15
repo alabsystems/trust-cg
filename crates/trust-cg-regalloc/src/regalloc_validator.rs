@@ -269,6 +269,16 @@ pub enum ValidationError {
         reserved: PReg,
         point: u32,
     },
+    /// (b''') An independently recomputed physical value is live in `preg`'s
+    /// location at `point` (instruction `inst`), but the allocator's
+    /// reservation map does not reserve that location there. The shared
+    /// reservation routine under-approximated physical liveness, so any vreg it
+    /// admits into that location at `point` would clobber the physical value.
+    PhysicalLivenessUnreserved {
+        preg: PReg,
+        point: u32,
+        inst: InstId,
+    },
     /// A return's fixed ABI register has no explicit value-producing definition
     /// on at least one path. An entry live-in or an implicit call clobber is not
     /// return-value authority.
@@ -369,6 +379,11 @@ impl fmt::Display for ValidationError {
                 "phys-reg interference: {vreg} is assigned {preg} but reserved register \
                 {reserved} (aliasing {preg}) carries a live value at point {point} inside \
                  {vreg}'s range"
+            ),
+            ValidationError::PhysicalLivenessUnreserved { preg, point, inst } => write!(
+                f,
+                "physical liveness: an independent recomputation finds {preg}'s location \
+                 live at point {point} ({inst:?}) but the reservation map does not reserve it"
             ),
             ValidationError::ReturnSinkUnbound { block, inst, preg } => write!(
                 f,
@@ -564,8 +579,25 @@ pub fn validate_allocation_coalesced(
     // register — including the incoming-argument clobber the AY self-check and the
     // vreg-vreg interference check both missed (LRSPLIT-2).
     let t = crate::ra_stage_start();
-    check_physreg_interference(post, &locations, &post_liveness, &mut report);
+    let tb = crate::ra_stage_start();
+    let reserved = crate::implicit_def_reservations(post, &post_liveness.inst_numbering);
+    crate::ra_stage_end(&post.name, false, "validate::physreg::reservations", tb);
+    check_physreg_interference(post, &locations, &post_liveness, &reserved, &mut report);
     crate::ra_stage_end(&post.name, false, "validate::physreg", t);
+
+    // (b''') independent physical liveness. The reservation map consumed by
+    // (b') is built by the allocator's own shared dataflow routine, so a defect
+    // there would both mis-allocate and pass (b'). Recompute physical liveness
+    // with a separately written alias model, AAPCS64 call-kill table and solver,
+    // and require every live point to be reserved for the same location.
+    let t = crate::ra_stage_start();
+    check_physical_liveness_reservations(
+        post,
+        &post_liveness.inst_numbering,
+        &reserved,
+        &mut report,
+    );
+    crate::ra_stage_end(&post.name, false, "validate::physical-liveness", t);
 
     // (b'') return-sink identity. The fixed ABI register value after its setup
     // copy is outside VReg liveness, so independently prove that every path to
@@ -803,6 +835,11 @@ fn check_interference(
     }
 }
 
+/// One reserved register whose positions [`check_physreg_interference`] probes
+/// for an allocated register: the reserved register, its reserved positions,
+/// and whether those positions are ascending.
+type OverlappingReservation<'a> = (PReg, &'a Vec<u32>, bool);
+
 /// (b') No allocated vreg may be colored to a physical register that carries a
 /// DISTINCT live value at a point inside the vreg's range.
 ///
@@ -832,13 +869,9 @@ fn check_physreg_interference(
     post: &MachFunction,
     locations: &BTreeMap<VReg, Location>,
     liveness: &LivenessResult,
+    reserved: &BTreeMap<PReg, Vec<u32>>,
     report: &mut ValidationReport,
 ) {
-    // Sub-split timers (TRUST_CG_TIME_PASSES, `stage=validate::physreg::*`):
-    // the reservation map rebuild for the POST numbering vs. the interval loop.
-    let tb = crate::ra_stage_start();
-    let reserved = crate::implicit_def_reservations(post, &liveness.inst_numbering);
-    crate::ra_stage_end(&post.name, false, "validate::physreg::reservations", tb);
     if reserved.is_empty() {
         return;
     }
@@ -857,7 +890,13 @@ fn check_physreg_interference(
     // the predicate scan ran 136+ times per interval). `reserved` is never
     // mutated below and the sub-list keeps the map's ascending key order, so
     // the first error found per interval — and hence the report — is unchanged.
-    let mut overlapping: BTreeMap<PReg, Vec<(PReg, &Vec<u32>)>> = BTreeMap::new();
+    // Each entry also records whether its positions are ascending (they are
+    // sorted by `implicit_def_reservations`; checked here, never assumed), which
+    // lets `first_live_point` visit only the positions inside the interval's
+    // ranges. Scanning every position instead made this loop quadratic in a
+    // function's call count: one reserved position per call, probed once per
+    // interval.
+    let mut overlapping: BTreeMap<PReg, Vec<OverlappingReservation<'_>>> = BTreeMap::new();
     for interval in liveness.intervals.values() {
         let Some(&Location::Reg(preg)) = locations.get(&interval.vreg) else {
             continue;
@@ -868,25 +907,27 @@ fn check_physreg_interference(
                 .filter(|&(&reserved_preg, _)| {
                     crate::greedy::allocator_pregs_overlap(reserved_preg, preg)
                 })
-                .map(|(&reserved_preg, points)| (reserved_preg, points))
+                .map(|(&reserved_preg, points)| {
+                    let ascending = points.windows(2).all(|pair| pair[0] <= pair[1]);
+                    (reserved_preg, points, ascending)
+                })
                 .collect()
         });
-        for &(reserved_preg, points) in overlapping.iter() {
+        for &(reserved_preg, points, ascending) in overlapping.iter() {
             // A reserved position inside the vreg's range is interference UNLESS it
             // is the boundary of an identity copy relating this vreg to the
             // reserved register — where the vreg and the register hold the SAME
             // value (the coalesced-argument / return hint). That single point is
             // exempt exactly as the linear-scan allocator's `hint_exempt` exempts
             // it; a reservation at any NON-copy position is still a real clobber.
-            if let Some(&point) = points.iter().find(|&&pos| {
-                interval.is_live_at(pos)
-                    && !identity_copy_exempts_reservation(
-                        post,
-                        &pos_to_inst,
-                        pos,
-                        interval.vreg,
-                        reserved_preg,
-                    )
+            if let Some(point) = interval.first_live_point(points, ascending, |pos| {
+                !identity_copy_exempts_reservation(
+                    post,
+                    &pos_to_inst,
+                    pos,
+                    interval.vreg,
+                    reserved_preg,
+                ) && !dying_call_operand_exempts_reservation(post, &pos_to_inst, pos, interval)
             }) {
                 report.errors.push(ValidationError::PhysRegInterference {
                     vreg: interval.vreg,
@@ -899,6 +940,36 @@ fn check_physreg_interference(
         }
     }
     crate::ra_stage_end(&post.name, false, "validate::physreg::loop", tl);
+}
+
+/// (b''') Every physical-register point that an independent liveness
+/// recomputation finds live must be reserved for the same location.
+///
+/// [`check_physreg_interference`] trusts the reservation map produced by
+/// [`crate::implicit_def_reservations`], whose span component is the allocator's
+/// own shared dataflow routine. This gate recomputes physical liveness in
+/// `crate::independent_physical_liveness` from the post-allocation operand
+/// roles (explicit physical defs/uses, implicit defs/uses) and the AAPCS64 call
+/// kill table, with its own alias keys and solver, and reports the earliest
+/// unreserved live point of each location. Only under-reservation is reported:
+/// it is the direction that lets an allocated value clobber a physical one.
+fn check_physical_liveness_reservations(
+    post: &MachFunction,
+    numbering: &BTreeMap<InstId, u32>,
+    reserved: &BTreeMap<PReg, Vec<u32>>,
+    report: &mut ValidationReport,
+) {
+    for miss in
+        crate::independent_physical_liveness::unreserved_live_points(post, numbering, reserved)
+    {
+        report
+            .errors
+            .push(ValidationError::PhysicalLivenessUnreserved {
+                preg: miss.preg,
+                point: miss.point,
+                inst: miss.inst,
+            });
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -999,6 +1070,44 @@ fn reaching_return_bindings(
     preg: PReg,
     locations: Option<&BTreeMap<VReg, Location>>,
 ) -> BTreeMap<InstId, ReturnSinkBinding> {
+    // A block's transfer is decided by its LAST non-preserving instruction: a
+    // Define leaves exactly `{inst}` on a valid path and an Invalidate the
+    // empty set on an invalid one, whatever came before; with none, the block
+    // passes its entry state through. So the fixpoint needs one summary per
+    // block — computed the first time the block is reached, instead of
+    // re-evaluating every instruction's effect (a call's scans its whole
+    // clobber list) on every pass. The effect depends only on the
+    // instruction, `preg` and `locations`.
+    let summarize =
+        |block: &crate::machine_types::RegAllocBlock| -> Option<(InstId, ReturnWriteEffect)> {
+            let mut last = None;
+            for inst_id in &block.insts {
+                let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                    continue;
+                };
+                let effect = return_write_effect(inst, preg, locations);
+                if effect != ReturnWriteEffect::Preserve {
+                    last = Some((*inst_id, effect));
+                }
+            }
+            last
+        };
+    let apply =
+        |state: &mut ReturnDefState, inst_id: InstId, effect: ReturnWriteEffect| match effect {
+            ReturnWriteEffect::Preserve => {}
+            ReturnWriteEffect::Define => {
+                state.defs.clear();
+                state.defs.insert(inst_id);
+                state.invalid_path = false;
+            }
+            ReturnWriteEffect::Invalidate => {
+                state.defs.clear();
+                state.invalid_path = true;
+            }
+        };
+    type BlockSummary = Option<Option<(InstId, ReturnWriteEffect)>>;
+    let mut summaries: Vec<BlockSummary> = vec![None; func.blocks.len()];
+
     let mut in_states: Vec<Option<ReturnDefState>> = vec![None; func.blocks.len()];
     let mut out_states: Vec<Option<ReturnDefState>> = vec![None; func.blocks.len()];
 
@@ -1032,24 +1141,11 @@ fn reaching_return_bindings(
                 changed = true;
             }
             let mut state = incoming;
-            if let Some(state) = &mut state {
-                for inst_id in &block.insts {
-                    let Some(inst) = func.insts.get(inst_id.0 as usize) else {
-                        continue;
-                    };
-                    match return_write_effect(inst, preg, locations) {
-                        ReturnWriteEffect::Preserve => {}
-                        ReturnWriteEffect::Define => {
-                            state.defs.clear();
-                            state.defs.insert(*inst_id);
-                            state.invalid_path = false;
-                        }
-                        ReturnWriteEffect::Invalidate => {
-                            state.defs.clear();
-                            state.invalid_path = true;
-                        }
-                    }
-                }
+            if let Some(state) = &mut state
+                && let Some((inst_id, effect)) =
+                    *summaries[block_index].get_or_insert_with(|| summarize(block))
+            {
+                apply(state, inst_id, effect);
             }
             if out_states[block_index] != state {
                 out_states[block_index] = state;
@@ -1061,12 +1157,29 @@ fn reaching_return_bindings(
         }
     }
 
+    let is_sink = |inst: &RegAllocInst| {
+        inst.flags.is_return()
+            && inst
+                .implicit_uses
+                .iter()
+                .any(|&used| crate::greedy::allocator_pregs_overlap(used, preg))
+    };
     let mut sinks = BTreeMap::new();
     for &block_id in &func.block_order {
         let block_index = block_id.0 as usize;
         let Some(block) = func.blocks.get(block_index) else {
             continue;
         };
+        // Only a return reading `preg` records a binding: a block without one
+        // records nothing, whatever its state.
+        if !block
+            .insts
+            .iter()
+            .filter_map(|inst_id| func.insts.get(inst_id.0 as usize))
+            .any(is_sink)
+        {
+            continue;
+        }
         let Some(mut state) = in_states[block_index].clone() else {
             continue;
         };
@@ -1074,12 +1187,7 @@ fn reaching_return_bindings(
             let Some(inst) = func.insts.get(inst_id.0 as usize) else {
                 continue;
             };
-            if inst.flags.is_return()
-                && inst
-                    .implicit_uses
-                    .iter()
-                    .any(|&used| crate::greedy::allocator_pregs_overlap(used, preg))
-            {
+            if is_sink(inst) {
                 sinks.insert(
                     *inst_id,
                     ReturnSinkBinding {
@@ -1088,19 +1196,11 @@ fn reaching_return_bindings(
                     },
                 );
             }
-
-            match return_write_effect(inst, preg, locations) {
-                ReturnWriteEffect::Preserve => {}
-                ReturnWriteEffect::Define => {
-                    state.defs.clear();
-                    state.defs.insert(*inst_id);
-                    state.invalid_path = false;
-                }
-                ReturnWriteEffect::Invalidate => {
-                    state.defs.clear();
-                    state.invalid_path = true;
-                }
-            }
+            apply(
+                &mut state,
+                *inst_id,
+                return_write_effect(inst, preg, locations),
+            );
         }
     }
     sinks
@@ -1181,6 +1281,36 @@ fn check_return_sink_bindings(
             }
         }
     }
+}
+
+/// The allocator's dying-call-operand carve-out (`crate::dying_call_operand_positions`),
+/// re-derived here from `post` and the post-allocation liveness: the reserved
+/// point `pos` is a `BLR` that reads `interval`'s vreg as an explicit operand,
+/// and the interval ends right after it. `BLR Xn` reads `Xn` before the call's
+/// caller-saved clobbers take effect, so a clobber reserved at that point
+/// cannot corrupt a value whose life ends at that read; the value-flow check
+/// (a) reads the operand at the call before applying the clobbers. Every other
+/// reserved point of the interval is still checked.
+fn dying_call_operand_exempts_reservation(
+    post: &MachFunction,
+    pos_to_inst: &BTreeMap<u32, InstId>,
+    pos: u32,
+    interval: &crate::liveness::LiveInterval,
+) -> bool {
+    if interval.end() != pos + 1 {
+        return false;
+    }
+    let Some(inst) = pos_to_inst
+        .get(&pos)
+        .and_then(|inst_id| post.insts.get(inst_id.0 as usize))
+    else {
+        return false;
+    };
+    crate::is_aarch64_blr_call(inst)
+        && inst
+            .uses
+            .iter()
+            .any(|operand| operand.as_vreg() == Some(interval.vreg))
 }
 
 /// Whether the reserved position `pos` is the boundary of an IDENTITY COPY that
@@ -1775,7 +1905,14 @@ fn check_value_flow(
     // predecessor* for each incoming source is taken from `post`, because
     // `split_critical_edges` may have interposed a fresh single-pred/single-succ
     // jump block on a critical edge and placed that edge's realizing copy there.
+    //
+    // Sub-stage timers (`TRUST_CG_TIME_PASSES`, `stage=validate::vf::*`) split
+    // this driver the way `validate::*` splits its parent. Pure instrumentation:
+    // `ra_stage_start` returns `None` and `ra_stage_end` is a no-op unless the
+    // env gate is set, so the default path pays a memoized bool read per stage.
+    let t = crate::ra_stage_start();
     let phi_specs = collect_phi_specs(pre, post);
+    crate::ra_stage_end(&post.name, false, "validate::vf::phi-specs", t);
 
     // Identify which original instructions survived into `post`, so the walk can
     // distinguish ORIGINAL uses (which must validate) from inserted spill/copy
@@ -1804,7 +1941,9 @@ fn check_value_flow(
     // dropped live value — a real allocator bug) is NOT in this set and still
     // fails closed as `UnmappedVReg`. Interference (b) and per-edge phi-transfer
     // (c) remain fully fail-closed for these vregs as well.
+    let t = crate::ra_stage_start();
     let remat_reload_temps = collect_remat_reload_temps(post, locations, original_inst_count);
+    crate::ra_stage_end(&post.name, false, "validate::vf::remat-temps", t);
 
     // TRUST-BOUNDARY (greedy live-range SPLIT temporaries).
     //
@@ -1829,7 +1968,9 @@ fn check_value_flow(
     // vregs; interference (b, over `post`) and per-edge phi-transfer (c) — which
     // together cover the #52/#53/#63/#64 regalloc/splitter miscompile class —
     // remain FULLY fail-closed, including for the split temporaries.
+    let t = crate::ra_stage_start();
     let pre_vregs: BTreeSet<VReg> = collect_function_vregs(pre);
+    crate::ra_stage_end(&post.name, false, "validate::vf::pre-vregs", t);
 
     // SCOPE (documented). Property (a) follows each original SSA value to its uses
     // and requires the POST allocation to deliver, into that value's assigned home,
@@ -1917,15 +2058,35 @@ fn check_value_flow(
     // those uses (and for phi edges whose source is such a dest) is the SPEC's
     // OWN value-flow — still derived purely from `pre`, trusting nothing the
     // allocator did.
-    let removed_copy_dsts = collect_removed_original_copy_dsts(pre, post);
+    //
+    // DEAD ON THE PHI-FREE PATH. All three readers of this set are guarded by
+    // `!phi_free`: the `spec_exit` selection below, the `spec_fallback`
+    // selection in [`check_value_flow_final`], and — vacuously — the
+    // `spec_flow` selection, whose `phi_free ||` disjunct already decides it.
+    // So on x86 (every function is phi-free once ISel has lowered phis to
+    // copies) the historical eager call walked EVERY block of `post` inserting
+    // every instruction id into a `BTreeSet<u32>`, then rescanned every
+    // instruction of `pre`, and nothing ever read the answer. Computing it only
+    // where it is read is observation-equivalent by construction: `phi_free` is
+    // a whole-function constant and the empty set satisfies every `!phi_free &&
+    // ...` guard identically.
+    let t = crate::ra_stage_start();
+    let removed_copy_dsts = if phi_free {
+        BTreeSet::new()
+    } else {
+        collect_removed_original_copy_dsts(pre, post)
+    };
+    crate::ra_stage_end(&post.name, false, "validate::vf::removed-copies", t);
     // The SPEC's own value-flow at each original use: the primary obligation on
     // the phi-free x86 path, and the removed-original-copy fallback (plus the
     // per-edge phi obligation) on the phi-bearing AArch64 path.
+    let t = crate::ra_stage_start();
     let spec_flow = if phi_free || !removed_copy_dsts.is_empty() {
         Some(compute_pre_spec_flow(pre))
     } else {
         None
     };
+    crate::ra_stage_end(&post.name, false, "validate::vf::spec-flow", t);
     let empty_expected = PreExpected::new();
     let pre_expected = spec_flow
         .as_ref()
@@ -1939,15 +2100,6 @@ fn check_value_flow(
     } else {
         None
     };
-    if phi_free && std::env::var("TRUST_CG_DEBUG_VALIDATOR").is_ok() {
-        eprintln!(
-            "regalloc-validator: {}: phi-free value-flow is FAIL-CLOSED via spec \
-             value-flow (skip-top-reads={skip_top_reads}, definite-alias \
-             report-only={relax_definite_alias}); interference + per-edge \
-             phi-transfer also fail-closed",
-            pre.name
-        );
-    }
 
     // Compute each block's exit state as a FIXPOINT of the forward value-flow
     // dataflow, then validate against the converged states.
@@ -1980,18 +2132,20 @@ fn check_value_flow(
     // Resolve every `apply_inst` step ONCE per function (memoization of the
     // pass-invariant `locations` lookups and spec-name pairing), then run the
     // fixpoint passes and the recording pass over the precompiled transfers.
+    let t = crate::ra_stage_start();
     let xfers = compile_xfers(pre, post, locations);
+    crate::ra_stage_end(&post.name, false, "validate::vf::xfers", t);
+    let t = crate::ra_stage_start();
     let exit_states = compute_exit_states_fixpoint(post, locations, &phi_specs, spec_exit, &xfers);
+    crate::ra_stage_end(&post.name, false, "validate::vf::fixpoint", t);
 
-    // (R4) copy-equivalence for the spurious identity-recurrence conflict carve-out
-    // — only the phi-free path takes the value-flow relaxations, so only build it
-    // there (keeps the O(vregs) build off the phi-bearing hot path).
-    let copy_equiv = if phi_free {
-        Some(CopyEquiv::build(pre))
-    } else {
-        None
-    };
+    // (R4)/(R5) copy-equivalence for the spurious identity-recurrence conflict
+    // carve-outs — only the phi-free path takes the value-flow relaxations, so it
+    // is available only there (keeps it off the phi-bearing hot path), and it is
+    // built LAZILY: see [`LazyCopyEquiv`].
+    let copy_equiv = LazyCopyEquiv::new(phi_free.then_some(pre));
 
+    let t = crate::ra_stage_start();
     check_value_flow_final(CheckValueFlowFinalInputs {
         pre,
         post,
@@ -2007,10 +2161,48 @@ fn check_value_flow(
         phi_free,
         skip_top_reads,
         relax_definite_alias,
-        copy_equiv: copy_equiv.as_ref(),
+        copy_equiv: &copy_equiv,
         xfers: Some(&xfers),
         report,
     });
+    crate::ra_stage_end(&post.name, false, "validate::vf::record", t);
+}
+
+/// [`CopyEquiv`] built ON FIRST CONSULTATION rather than up front.
+///
+/// `CopyEquiv::build` is a whole-function analysis: it runs a root-closure DFS
+/// per vreg, allocating a fresh `BTreeSet` for the roots and another for the
+/// visited set on every one of them. It is a PURE function of `pre`, and its
+/// only consumers are the (R4) and (R5) carve-outs inside the `!matches` arm of
+/// [`check_original_use`] — i.e. it is read only when a use actually mismatches
+/// AND the mismatch survives (R2)/(R3). The overwhelmingly common function has
+/// no surviving mismatch at all, so the eager build paid the whole analysis for
+/// an answer nobody asked for, on every phi-free (i.e. every x86) function.
+///
+/// Deferring it is observation-equivalent: the value is deterministic in `pre`,
+/// `OnceCell` makes the first consultation build it and every later one reuse
+/// it, and `None` (the phi-bearing path) still means "R4/R5 do not apply" —
+/// exactly what `Option<&CopyEquiv>` meant before.
+struct LazyCopyEquiv<'a> {
+    /// `Some` only where the relaxations apply (the phi-free path).
+    pre: Option<&'a MachFunction>,
+    cell: std::cell::OnceCell<CopyEquiv>,
+}
+
+impl<'a> LazyCopyEquiv<'a> {
+    fn new(pre: Option<&'a MachFunction>) -> Self {
+        Self {
+            pre,
+            cell: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The copy-equivalence relation, building it on the first call. `None`
+    /// where the relaxations do not apply.
+    fn get(&self) -> Option<&CopyEquiv> {
+        let pre = self.pre?;
+        Some(self.cell.get_or_init(|| CopyEquiv::build(pre)))
+    }
 }
 
 /// Destinations of ORIGINAL vreg-source copy instructions that coalescing
@@ -2100,9 +2292,10 @@ struct CheckValueFlowFinalInputs<'a> {
     phi_free: bool,
     skip_top_reads: bool,
     relax_definite_alias: bool,
-    /// Copy-equivalence for the spurious identity-recurrence conflict carve-out
-    /// (R4); `Some` only on the phi-free path.
-    copy_equiv: Option<&'a CopyEquiv>,
+    /// Copy-equivalence for the spurious identity-recurrence conflict carve-outs
+    /// (R4/R5); yields `Some` only on the phi-free path, and only builds the
+    /// relation if a use actually consults it (see [`LazyCopyEquiv`]).
+    copy_equiv: &'a LazyCopyEquiv<'a>,
     /// Precompiled per-instruction transfers (indexed 1:1 with `post.insts`);
     /// `None` (the test-side dense reference) applies `apply_inst` directly.
     xfers: Option<&'a [Xfer]>,
@@ -2261,7 +2454,18 @@ fn check_value_flow_final(inputs: CheckValueFlowFinalInputs<'_>) {
                 None => apply_inst(inst, spec, locations, &mut state),
             }
             // ---- value-numbering transfer (mirrors apply_inst's defs) ----
-            update_vreg_val(inst, spec, &mut vreg_val);
+            //
+            // DEAD ON THE PHI-FREE PATH. `vreg_val` has exactly ONE reader — the
+            // `else` arm of the `if phi_free` expected-value selection above — so
+            // when `phi_free` holds (every x86 function, since ISel lowers phis to
+            // copies before regalloc) this maintained a `BTreeMap<VReg, Sym>` with
+            // an insert per def of every instruction of every block and nothing
+            // ever looked at it. `phi_free` is a whole-function constant, so
+            // skipping the transfer there is observation-equivalent by
+            // construction; the phi-bearing AArch64 path is untouched.
+            if !phi_free {
+                update_vreg_val(inst, spec, &mut vreg_val);
+            }
         }
     }
 
@@ -2358,7 +2562,7 @@ fn check_original_use(
     spec_fallback: Option<&Sym>,
     skip_top_reads: bool,
     relax_definite_alias: bool,
-    copy_equiv: Option<&CopyEquiv>,
+    copy_equiv: &LazyCopyEquiv<'_>,
     report: &mut ValidationReport,
 ) {
     // The MACHINE location read is the POST operand's (`vreg`, possibly a
@@ -2411,9 +2615,13 @@ fn check_original_use(
         // (all name one architectural value); POST is correct. A real recurrence
         // (non-copy update) has distinct roots and does NOT collapse — still fails
         // closed. See [`CopyEquiv`]. Gated to the phi-free relaxation set.
+        // The SHAPE test is applied before `copy_equiv.get()` so a mismatch that
+        // is not of this shape never forces the relation to be built; the
+        // conjunction is the same predicate either way (`get()` has no effect
+        // beyond filling its own cache).
         if relax_definite_alias
-            && let (Some(ce), Sym::Conflict(cset), Some(Sym::Defined(w))) =
-                (copy_equiv, expected, found_sym.as_ref())
+            && let (Sym::Conflict(cset), Some(Sym::Defined(w))) = (expected, found_sym.as_ref())
+            && let Some(ce) = copy_equiv.get()
             && ce.is_spurious_copy_conflict(*w, cset)
         {
             return;
@@ -2449,8 +2657,10 @@ fn check_original_use(
         // live range's value (the conflict is a flow-merge artifact of slot
         // sharing, not a live overlap). Gated to the phi-free relaxation set
         // (`copy_equiv` is `Some` there), exactly like R2/R3/R4.
-        if let Some(ce) = copy_equiv
-            && let Some(fs) = found_sym.as_ref()
+        // `found_sym` is tested first so a TOP read (which R5 cannot relax
+        // anyway) never forces `copy_equiv` to build; same predicate.
+        if let Some(fs) = found_sym.as_ref()
+            && let Some(ce) = copy_equiv.get()
             && ce.root_closure(fs) == ce.root_closure(expected)
         {
             return;
@@ -2701,13 +2911,13 @@ fn compile_xfers(
                         None => Xfer::Nop,
                     };
                 }
-            } else if opcode == PSEUDO_SPILL_STORE {
-                if let (Some(src), Some(slot)) = (first_vreg(&inst.uses), first_slot(&inst.uses)) {
-                    return Xfer::Move {
-                        src: locations.get(&src).copied(),
-                        dst: Location::Slot(slot),
-                    };
-                }
+            } else if opcode == PSEUDO_SPILL_STORE
+                && let (Some(src), Some(slot)) = (first_vreg(&inst.uses), first_slot(&inst.uses))
+            {
+                return Xfer::Move {
+                    src: locations.get(&src).copied(),
+                    dst: Location::Slot(slot),
+                };
             }
             let clobbers = inst
                 .implicit_defs
@@ -4292,7 +4502,10 @@ fn first_slot(ops: &[RegAllocOperand]) -> Option<StackSlotId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Location, Sym, ValidationError, reaching_return_bindings, validate_allocation};
+    use super::{
+        Location, ReturnDefState, ReturnSinkBinding, ReturnWriteEffect, Sym, ValidationError,
+        reaching_return_bindings, return_write_effect, validate_allocation,
+    };
     use crate::linear_scan::AllocationResult;
     use crate::machine_types::*;
     use crate::phi_elim::PSEUDO_COPY;
@@ -4476,6 +4689,244 @@ mod tests {
                 ..
             } if *preg == x0
         )));
+    }
+
+    /// The per-pass, per-instruction `reaching_return_bindings` before its
+    /// blocks were summarized, verbatim, as the oracle.
+    fn reaching_return_bindings_reference(
+        func: &MachFunction,
+        preg: PReg,
+        locations: Option<&BTreeMap<VReg, Location>>,
+    ) -> BTreeMap<InstId, ReturnSinkBinding> {
+        let mut in_states: Vec<Option<ReturnDefState>> = vec![None; func.blocks.len()];
+        let mut out_states: Vec<Option<ReturnDefState>> = vec![None; func.blocks.len()];
+
+        loop {
+            let mut changed = false;
+            for &block_id in &func.block_order {
+                let block_index = block_id.0 as usize;
+                let Some(block) = func.blocks.get(block_index) else {
+                    continue;
+                };
+
+                let mut incoming = None;
+                if block_id == func.entry_block {
+                    incoming = Some(ReturnDefState {
+                        defs: BTreeSet::new(),
+                        invalid_path: true,
+                    });
+                }
+                for pred in &block.preds {
+                    let Some(Some(pred_out)) = out_states.get(pred.0 as usize) else {
+                        continue;
+                    };
+                    match &mut incoming {
+                        Some(state) => state.merge_from(pred_out),
+                        None => incoming = Some(pred_out.clone()),
+                    }
+                }
+
+                if in_states[block_index] != incoming {
+                    in_states[block_index] = incoming.clone();
+                    changed = true;
+                }
+                let mut state = incoming;
+                if let Some(state) = &mut state {
+                    for inst_id in &block.insts {
+                        let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                            continue;
+                        };
+                        match return_write_effect(inst, preg, locations) {
+                            ReturnWriteEffect::Preserve => {}
+                            ReturnWriteEffect::Define => {
+                                state.defs.clear();
+                                state.defs.insert(*inst_id);
+                                state.invalid_path = false;
+                            }
+                            ReturnWriteEffect::Invalidate => {
+                                state.defs.clear();
+                                state.invalid_path = true;
+                            }
+                        }
+                    }
+                }
+                if out_states[block_index] != state {
+                    out_states[block_index] = state;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut sinks = BTreeMap::new();
+        for &block_id in &func.block_order {
+            let block_index = block_id.0 as usize;
+            let Some(block) = func.blocks.get(block_index) else {
+                continue;
+            };
+            let Some(mut state) = in_states[block_index].clone() else {
+                continue;
+            };
+            for inst_id in &block.insts {
+                let Some(inst) = func.insts.get(inst_id.0 as usize) else {
+                    continue;
+                };
+                if inst.flags.is_return()
+                    && inst
+                        .implicit_uses
+                        .iter()
+                        .any(|&used| crate::greedy::allocator_pregs_overlap(used, preg))
+                {
+                    sinks.insert(
+                        *inst_id,
+                        ReturnSinkBinding {
+                            block: block_id,
+                            state: state.clone(),
+                        },
+                    );
+                }
+
+                match return_write_effect(inst, preg, locations) {
+                    ReturnWriteEffect::Preserve => {}
+                    ReturnWriteEffect::Define => {
+                        state.defs.clear();
+                        state.defs.insert(*inst_id);
+                        state.invalid_path = false;
+                    }
+                    ReturnWriteEffect::Invalidate => {
+                        state.defs.clear();
+                        state.invalid_path = true;
+                    }
+                }
+            }
+        }
+        sinks
+    }
+
+    /// `reaching_return_bindings` equals the oracle on random CFGs (loops,
+    /// unreachable blocks, blocks outside `block_order`) whose instructions
+    /// define, clobber, copy into and return through X0/W0/X1, with and
+    /// without an allocation map.
+    #[test]
+    fn return_bindings_equal_the_per_instruction_walk() {
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = move |bound: u32| -> u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(bound.max(1))) as u32
+        };
+        let pregs = [PReg::new(0), PReg::new(1), PReg::new(2)];
+        let mut sinks_seen = 0usize;
+        for _case in 0..6000 {
+            let n_blocks = 1 + next(7) as usize;
+            let mut insts = Vec::new();
+            let mut blocks: Vec<MachBlock> = (0..n_blocks)
+                .map(|_| MachBlock {
+                    insts: Vec::new(),
+                    preds: Vec::new(),
+                    succs: Vec::new(),
+                    loop_depth: 0,
+                })
+                .collect();
+            for block in blocks.iter_mut() {
+                for _ in 0..next(5) {
+                    let preg = pregs[next(3) as usize];
+                    let inst = match next(6) {
+                        0 => MachInst {
+                            opcode: PSEUDO_COPY,
+                            defs: vec![MachOperand::PReg(preg)],
+                            uses: vec![MachOperand::VReg(vreg(next(4)))],
+                            implicit_defs: Vec::new(),
+                            implicit_uses: Vec::new(),
+                            flags: InstFlags::default(),
+                            tied_operands: Vec::new(),
+                        },
+                        1 => MachInst {
+                            opcode: 30,
+                            defs: Vec::new(),
+                            uses: Vec::new(),
+                            implicit_defs: vec![preg],
+                            implicit_uses: Vec::new(),
+                            flags: InstFlags::default(),
+                            tied_operands: Vec::new(),
+                        },
+                        2 => MachInst {
+                            opcode: 31,
+                            defs: Vec::new(),
+                            uses: Vec::new(),
+                            implicit_defs: Vec::new(),
+                            implicit_uses: vec![preg],
+                            flags: InstFlags::IS_RETURN.union(InstFlags::IS_TERMINATOR),
+                            tied_operands: Vec::new(),
+                        },
+                        3 => MachInst {
+                            opcode: PSEUDO_COPY,
+                            defs: vec![MachOperand::VReg(vreg(next(4)))],
+                            uses: vec![MachOperand::VReg(vreg(next(4)))],
+                            implicit_defs: Vec::new(),
+                            implicit_uses: Vec::new(),
+                            flags: InstFlags::default(),
+                            tied_operands: Vec::new(),
+                        },
+                        _ => MachInst {
+                            opcode: 32,
+                            defs: vec![MachOperand::VReg(vreg(next(4)))],
+                            uses: vec![MachOperand::Imm(1)],
+                            implicit_defs: Vec::new(),
+                            implicit_uses: Vec::new(),
+                            flags: InstFlags::default(),
+                            tied_operands: Vec::new(),
+                        },
+                    };
+                    let id = InstId(insts.len() as u32);
+                    insts.push(inst);
+                    block.insts.push(id);
+                }
+            }
+            for _ in 0..next(2 * n_blocks as u32 + 2) {
+                let from = next(n_blocks as u32) as usize;
+                let to = next(n_blocks as u32) as usize;
+                blocks[from].succs.push(BlockId(to as u32));
+                blocks[to].preds.push(BlockId(from as u32));
+            }
+            let mut block_order: Vec<BlockId> = (0..n_blocks as u32).map(BlockId).collect();
+            if next(4) == 0 && n_blocks > 1 {
+                block_order.remove(next(n_blocks as u32) as usize);
+            }
+            let func = MachFunction {
+                name: "random_return_sinks".into(),
+                insts,
+                blocks,
+                block_order,
+                entry_block: BlockId(next(n_blocks as u32)),
+                next_vreg: 4,
+                next_stack_slot: 0,
+                stack_slots: BTreeMap::new(),
+            };
+            let mut locations: BTreeMap<VReg, Location> = BTreeMap::new();
+            for id in 0..4 {
+                if next(4) != 0 {
+                    locations.insert(vreg(id), Location::Reg(pregs[next(3) as usize]));
+                }
+            }
+            for preg in pregs {
+                for locs in [None, Some(&locations)] {
+                    let fast = reaching_return_bindings(&func, preg, locs);
+                    let reference = reaching_return_bindings_reference(&func, preg, locs);
+                    sinks_seen += reference.len();
+                    assert_eq!(fast.len(), reference.len());
+                    for ((fi, fb), (ri, rb)) in fast.iter().zip(reference.iter()) {
+                        assert_eq!(fi, ri);
+                        assert_eq!(fb.block, rb.block);
+                        assert_eq!(fb.state, rb.state);
+                    }
+                }
+            }
+        }
+        assert!(sinks_seen > 5_000, "{sinks_seen}");
     }
 
     #[test]
@@ -8436,7 +8887,15 @@ mod tests {
         // (b') phys-reg interference is a single deterministic pass (not one of the
         // three sparse/dense-restricted computations), so the reference runs the
         // SAME production check at the SAME position to keep decision identity.
-        check_physreg_interference(post, &locations, &compute_live_intervals(post), &mut report);
+        let post_liveness = compute_live_intervals(post);
+        let reserved = crate::implicit_def_reservations(post, &post_liveness.inst_numbering);
+        check_physreg_interference(post, &locations, &post_liveness, &reserved, &mut report);
+        super::check_physical_liveness_reservations(
+            post,
+            &post_liveness.inst_numbering,
+            &reserved,
+            &mut report,
+        );
 
         let phi_specs = collect_phi_specs(pre, post);
         let original_inst_count = pre.insts.len() as u32;
@@ -8463,11 +8922,7 @@ mod tests {
         };
         let exit_states =
             compute_exit_states_fixpoint_reference(pre, post, &locations, &phi_specs, spec_exit);
-        let copy_equiv = if phi_free {
-            Some(CopyEquiv::build(pre))
-        } else {
-            None
-        };
+        let copy_equiv = super::LazyCopyEquiv::new(phi_free.then_some(pre));
         check_value_flow_final(CheckValueFlowFinalInputs {
             pre,
             post,
@@ -8483,7 +8938,7 @@ mod tests {
             phi_free,
             skip_top_reads,
             relax_definite_alias,
-            copy_equiv: copy_equiv.as_ref(),
+            copy_equiv: &copy_equiv,
             xfers: None,
             report: &mut report,
         });
@@ -8898,7 +9353,7 @@ mod tests {
         let func = MachFunction {
             insts,
             blocks: vec![MachBlock {
-                insts: (0..4).map(|i| InstId(i)).collect(),
+                insts: (0..4).map(InstId).collect(),
                 preds: vec![],
                 succs: vec![],
                 loop_depth: 0,
@@ -9008,7 +9463,8 @@ mod tests {
             let locations = build_location_map(&result);
             let liveness = compute_live_intervals(&post);
             let (mut fast, mut slow) = (ValidationReport::default(), ValidationReport::default());
-            check_physreg_interference(&post, &locations, &liveness, &mut fast);
+            let reserved = crate::implicit_def_reservations(&post, &liveness.inst_numbering);
+            check_physreg_interference(&post, &locations, &liveness, &reserved, &mut fast);
             reference(&post, &locations, &liveness, &mut slow);
             assert_eq!(
                 fast.errors, slow.errors,
@@ -9023,6 +9479,58 @@ mod tests {
             "corpus never produced a multi-error report (ordering untested)"
         );
         eprintln!("physreg memo: {fired}/600 cases fired, {multi} with 2+ errors, 0 divergences");
+    }
+
+    /// The physical-register interference check visits only the reserved
+    /// positions inside each interval's ranges: `n` intervals homed in one
+    /// register reserved at `n` call positions cost `O(n)`. Asking
+    /// `is_live_at` at every position per interval costs `O(n^2)` and fails
+    /// this bound (see `crate::scan_work`).
+    #[test]
+    fn physreg_interference_cost_grows_linearly() {
+        use crate::liveness::{LiveInterval, LivenessResult};
+        let x0 = PReg::new(0);
+        crate::scan_work::assert_near_linear("check_physreg_interference", 256, |n| {
+            let post = MachFunction {
+                name: "physreg_cost".into(),
+                insts: Vec::new(),
+                blocks: vec![MachBlock {
+                    insts: Vec::new(),
+                    preds: Vec::new(),
+                    succs: Vec::new(),
+                    loop_depth: 0,
+                }],
+                block_order: vec![BlockId(0)],
+                entry_block: BlockId(0),
+                next_vreg: n as u32,
+                next_stack_slot: 0,
+                stack_slots: BTreeMap::new(),
+            };
+            let mut intervals = BTreeMap::new();
+            let mut locations = BTreeMap::new();
+            for i in 0..n as u32 {
+                let vreg = VReg {
+                    id: i,
+                    class: RegClass::Gpr64,
+                };
+                let mut interval = LiveInterval::new(vreg);
+                // Live strictly between two reserved positions.
+                interval.add_range(4 * i + 1, 4 * i + 3);
+                intervals.insert(i, interval);
+                locations.insert(vreg, Location::Reg(x0));
+            }
+            let liveness = LivenessResult {
+                intervals,
+                inst_numbering: BTreeMap::new(),
+            };
+            let reserved = BTreeMap::from([(x0, (0..n as u32).map(|i| 4 * i).collect())]);
+            let mut report = ValidationReport::default();
+            let ((), units) = crate::scan_work::measure(|| {
+                check_physreg_interference(&post, &locations, &liveness, &reserved, &mut report);
+            });
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            units
+        });
     }
 
     /// The dense-by-encoding `implicit_def_reservations` must produce EXACTLY
@@ -9499,7 +10007,7 @@ mod tests {
     /// value file flowing through copy-FREE blocks, where the shared-state path
     /// wins ~20x); `BENCH_MODE=heavy` models the transfer-dominated regime (every
     /// block writes the file — no share win, no regression). Run with:
-    ///   TRUST_CG_RUN_MEASUREMENT_TESTS=1 cargo test -p trust-cg-regalloc \
+    ///   TRUST_CG_RUN_MEASUREMENT_TESTS=1 scripts/trust_cargo.sh test -p trust-cg-regalloc \
     ///     --release bench_compute_pre_expected -- --nocapture
     #[test]
     fn bench_compute_pre_expected() {

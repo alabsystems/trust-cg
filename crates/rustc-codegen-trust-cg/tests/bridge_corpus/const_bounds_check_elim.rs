@@ -1,24 +1,10 @@
-// CORPUS FIXTURE (OPT-6a) — verified elimination of a CONSTANT-index,
-// CONSTANT-length array bounds check.
-//
-// The array ELEMENTS are `black_box`d (runtime values, so the array is a real
-// memory-backed slot and the reads are genuine loads), but every index is a
-// COMPILE-TIME CONSTANT and the array length is fixed. That is the exact shape
-// the bridge routes into the verified Certified-Elimination Kernel: rustc emits
-// `Assert(BoundsCheck { len: const N, index: const k })`, the bridge discharges
-// `k <u N` through the ay solver lane and emits a `GuardBoundsCheck` probe the
-// kernel deletes (fail-closed) — see `try_lower_bounds_check_as_verified_guard`.
-//
-// This fixture is a DIFFERENTIAL correctness pin, NOT a trap pin: every access
-// is strictly in bounds, so the probe fires (or, with `TCG_REFINE_SOLVER=0` /
-// no solver, silently stays the legacy compare+branch), and the observable
-// result is identical to LLVM either way. Out-of-bounds / at-bounds traps are
-// covered structurally: the probe path is taken ONLY for a strictly-in-bounds
-// constant index, so it can never touch a trapping or dynamic-index check
-// (which stays the byte-identical legacy lowering); the surviving-carrier trap
-// is pinned by `trust-cg-codegen/tests/guard_bounds_probe_x86.rs`.
-//
-// A trapping OOB fixture is deliberately absent: these `#![no_std]` corpus
+// Constant-index bounds-check differential fixture.
+// Runtime array elements and fixed in-bounds indices must produce the same
+// result as LLVM. The bridge retains the original MIR condition as a runtime
+// assertion; no Boolean solver verdict supplies elimination authority.
+// Out-of-bounds trap behavior has dedicated native guard tests because this
+// fixture's looping panic handler cannot serve as a trap oracle.
+// All accesses are in bounds; expected exit: 7. No out-of-bounds probe: the `#![no_std]` corpus
 // programs use a `loop {}` panic handler, so an LLVM bounds-panic HANGS while
 // the trust-cg carrier TRAPS (UD2), which the differential would (correctly)
 // flag as a hang/trap divergence unrelated to OPT-6a.
@@ -47,7 +33,12 @@ pub extern "C" fn main() -> i32 {
 
     // (b) constant-index writes then read-back (the write place-projection also
     //     carries a constant-bound bounds check).
-    let mut b: [i64; 4] = [black_box(1i64), black_box(2i64), black_box(3i64), black_box(4i64)];
+    let mut b: [i64; 4] = [
+        black_box(1i64),
+        black_box(2i64),
+        black_box(3i64),
+        black_box(4i64),
+    ];
     b[1] = black_box(9i64);
     b[3] = black_box(8i64);
     let ok_b = b[0] == 1 && b[1] == 9 && b[3] == 8;
@@ -61,9 +52,5 @@ pub extern "C" fn main() -> i32 {
     // (d) constant index 0 (the boundary `0 <u N`, still strictly in bounds).
     let ok_d = b[0] == 1 && a[1] == 20;
 
-    if ok_a && ok_b && ok_c && ok_d {
-        7
-    } else {
-        13
-    }
+    if ok_a && ok_b && ok_c && ok_d { 7 } else { 13 }
 }

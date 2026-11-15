@@ -34,7 +34,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$(cd "$HERE/.." && pwd)/riscv_qemu_truth.json"
 
+# STOCK EXCEPTION (Trust's LLVM has no RISC-V target; measured `trustc
+# --target riscv64gc-unknown-none-elf` -> "could not create LLVM TargetMachine
+# for triple: riscv64", and the Trust sysroot ships no rust-lld): this oracle
+# generator runs on an explicit stock rustup toolchain. The repository pins
+# the Trust toolchain (owner directive 2026-09-28), so name the stock one.
 export PATH="$HOME/.cargo/bin:$PATH"
+export RUSTUP_TOOLCHAIN="${RISCV_ORACLE_TOOLCHAIN:-1.97.1}"
 RUSTBIN="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
 export PATH="$RUSTBIN:$PATH"   # rust-lld linker
 

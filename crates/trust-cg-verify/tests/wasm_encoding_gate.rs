@@ -35,6 +35,17 @@ use trust_ir::{BinOp, CastOp, Constant, Global, ICmpOp, Ty};
 use trust_ir_build::ModuleBuilder;
 
 use trust_cg_codegen::wasm;
+
+/// The float const and float binop corpora, re-derived from the live backend
+/// (shared with `coverage_gate_tests`, which pins the ratio those rows move).
+#[path = "support/wasm_float_live_emit.rs"]
+mod float_live;
+
+/// The guarded MemCopy / MemSet bodies, re-derived from the live backend
+/// (shared with `coverage_gate_tests`, which pins the ratio those rows move).
+#[path = "support/wasm_bulk_memory_live_emit.rs"]
+mod bulk_live;
+
 use wasm::{
     WasmFuncImportPolicy, WasmMemoryGrowthPolicy, WasmModulePolicy, WasmStaticDataPolicy,
     island_host_namespace,
@@ -44,8 +55,32 @@ use wasm::{
 // Module builders — the corpus of real modules the obligations run over
 // ---------------------------------------------------------------------------
 
+/// The lane at its default level without the trust-ir mid-end: the modules
+/// that exist to put real `call` immediates in the bytes compile through it,
+/// because the mid-end's inliner would splice their direct calls away.
+fn lane_with_policy(
+    module: &trust_ir::Module,
+    policy: &WasmModulePolicy,
+) -> Result<Vec<u8>, wasm::WasmLowerError> {
+    wasm::compile_module_with_evidence_policy_license_options(
+        module,
+        policy,
+        &permit_unlicensed(),
+        wasm::WasmOptOptions {
+            level: trust_cg_codegen::pipeline::OptLevel::O2,
+            mid_end: false,
+        },
+    )
+    .map(|(bytes, _)| bytes)
+}
+
+/// [`lane_with_policy`] for a closed module.
+fn lane(module: &trust_ir::Module) -> Result<Vec<u8>, wasm::WasmLowerError> {
+    lane_with_policy(module, &WasmModulePolicy::closed())
+}
+
 fn finish_wasm32(mb: ModuleBuilder) -> trust_ir::Module {
-    let mut m = mb.build();
+    let mut m = mb.build().expect("ModuleBuilder::build: test fixture");
     m.target_info = Some(wasm::wasm32_target_info());
     m
 }
@@ -60,7 +95,12 @@ fn const_module(ty: Ty, v: i128) -> Vec<u8> {
     let c = fb.iconst(ty, v);
     fb.ret(vec![c]);
     fb.build();
-    wasm::compile_module(&finish_wasm32(mb)).expect("const module must compile")
+    wasm::compile_module_with_policy_and_license(
+        &finish_wasm32(mb),
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("const module must compile")
 }
 
 /// The import-shift shape: two host declarations interleaved with two defined
@@ -170,9 +210,15 @@ fn table_module(with_imports: bool) -> Vec<u8> {
     }
     let m = finish_wasm32(mb);
     if with_imports {
-        wasm::compile_module_with_policy(&m, &island_policy()).expect("island table compiles")
+        wasm::compile_module_with_policy_and_license(&m, &island_policy(), &permit_unlicensed())
+            .expect("island table compiles")
     } else {
-        wasm::compile_module(&m).expect("closed table compiles")
+        wasm::compile_module_with_policy_and_license(
+            &m,
+            &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+            &permit_unlicensed(),
+        )
+        .expect("closed table compiles")
     }
 }
 
@@ -190,6 +236,10 @@ fn static_data_module() -> Vec<u8> {
         linkage: Default::default(),
         tls: None,
         align: None,
+        // trust-ir v41: an ordinary, unretained global in the consumer-chosen section.
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
     });
     let ft = mb.add_func_type(vec![Ty::I32], vec![Ty::I32]);
     let mut fb = mb.function("readw", ft);
@@ -201,7 +251,12 @@ fn static_data_module() -> Vec<u8> {
     let r = fb.binop(BinOp::Add, Ty::I32, w, i);
     fb.ret(vec![r]);
     fb.build();
-    wasm::compile_module(&finish_wasm32(mb)).expect("static-data module compiles")
+    wasm::compile_module_with_policy_and_license(
+        &finish_wasm32(mb),
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("static-data module compiles")
 }
 
 /// A memory + shadow-stack shape: an alloca round-trip pulls in the linear
@@ -226,7 +281,12 @@ fn memory_module() -> Vec<u8> {
     let out = fb.cast(CastOp::ZExt, Ty::U8, Ty::I32, b);
     fb.ret(vec![out]);
     fb.build();
-    wasm::compile_module(&finish_wasm32(mb)).expect("memory module compiles")
+    wasm::compile_module_with_policy_and_license(
+        &finish_wasm32(mb),
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("memory module compiles")
 }
 
 /// Where the host reserved this island's static-data region.
@@ -252,6 +312,10 @@ fn full_surface_island() -> Vec<u8> {
         linkage: Default::default(),
         tls: None,
         align: None,
+        // trust-ir v41: an ordinary, unretained global in the consumer-chosen section.
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
     });
     let elem = mb.add_type(Ty::U8);
     let ft = mb.add_func_type(vec![Ty::I32, Ty::I32], vec![Ty::I32]);
@@ -333,8 +397,7 @@ fn full_surface_island() -> Vec<u8> {
         memory_growth: WasmMemoryGrowthPolicy::HostGrantedShims,
         ..WasmModulePolicy::island("full")
     };
-    wasm::compile_module_with_policy(&finish_wasm32(mb), &policy)
-        .expect("the full-surface island must compile")
+    lane_with_policy(&finish_wasm32(mb), &policy).expect("the full-surface island must compile")
 }
 
 /// Every real module the family-(4)/(6) obligations run over, named.
@@ -347,12 +410,11 @@ fn module_corpus() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "closed calls",
-            wasm::compile_module(&import_shift_ir_closed()).expect("closed calls compile"),
+            lane(&import_shift_ir_closed()).expect("closed calls compile"),
         ),
         (
             "island calls (2 func imports)",
-            wasm::compile_module_with_policy(&import_shift_ir(), &island_policy())
-                .expect("island calls compile"),
+            lane_with_policy(&import_shift_ir(), &island_policy()).expect("island calls compile"),
         ),
         ("closed table", table_module(false)),
         ("island table (2 func imports)", table_module(true)),
@@ -562,12 +624,312 @@ fn live_const_immediate_mutants_are_refuted() {
     eprintln!("live_const_immediate_mutants_are_refuted: {mutants} mutants, all REFUTED");
 }
 
+// ===========================================================================
+// FAMILY (5), FLOAT — the raw IEEE-754 payloads, against the LIVE backend
+// ===========================================================================
+
+/// THE FRESHNESS CONTRACT for the float const credit: every captured payload
+/// is re-derived by compiling a real `() -> fN` module and decoding it.
+#[test]
+fn float_const_corpus_is_what_the_live_backend_emits_today() {
+    let checked = float_live::assert_float_const_corpus_is_what_the_live_backend_emits();
+    assert_eq!(checked, enc::EMITTED_FLOAT_CONST_IMMEDIATES.len());
+    eprintln!(
+        "float_const_corpus_is_what_the_live_backend_emits_today: {checked} payloads re-derived, \
+         all byte-identical"
+    );
+}
+
+/// The float const obligation over LIVE bytes: each compiled module's payload
+/// is bit-exactly the pattern its carrier denotes.
+#[test]
+fn live_float_const_immediates_denote_their_intended_pattern() {
+    let mut obs = Vec::new();
+    for &(carrier, bits, _) in enc::EMITTED_FLOAT_CONST_IMMEDIATES {
+        let module = float_live::float_const_module(bits, carrier);
+        let (op, imm) = float_live::first_float_const_immediate(&module);
+        obs.push(enc::float_const_immediate_obligation(carrier, op, &imm));
+    }
+    let r = assert_no_refutations("live float const immediates", &obs);
+    assert_eq!(r.proven, enc::EMITTED_FLOAT_CONST_IMMEDIATES.len());
+}
+
+/// ANTI-TAUTOLOGY, against LIVE bytes: every negative control built from a real
+/// emitted payload refutes, and for its stated reason; every control that
+/// applies at a width is built at least once there.
+#[test]
+fn live_float_const_controls_refute_for_their_stated_reason() {
+    use enc::FloatConstControl;
+    let mut built = std::collections::BTreeMap::<(u32, String), usize>::new();
+    let mut wrong = Vec::new();
+    for &(carrier, bits, _) in enc::EMITTED_FLOAT_CONST_IMMEDIATES {
+        let module = float_live::float_const_module(bits, carrier);
+        let (_, imm) = float_live::first_float_const_immediate(&module);
+        for control in FloatConstControl::ALL {
+            let Some((claimed, op, bytes)) = control.build(carrier, bits, &imm) else {
+                continue;
+            };
+            *built.entry((bits, format!("{control:?}"))).or_default() += 1;
+            match enc::float_const_immediate_verdict(claimed, op, &bytes) {
+                Err(why) if control.is_its_refutation(bits, &why) => {}
+                other => wrong.push(format!(
+                    "f{bits} carrier 0x{carrier:016x} {control:?}: {other:?} ({bytes:02x?})"
+                )),
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "controls that did not refute for their reason:\n  {}",
+        wrong.join("\n  ")
+    );
+    for bits in [32u32, 64] {
+        for control in FloatConstControl::ALL {
+            if control.applies_at(bits) {
+                assert!(
+                    built.contains_key(&(bits, format!("{control:?}"))),
+                    "{control:?} was never built at f{bits}: it is not evidence there"
+                );
+            }
+        }
+    }
+    eprintln!("live_float_const_controls: {built:?}");
+}
+
+/// The intended patterns are the trust-ir side, so they are checked against the
+/// ground truth they transcribe: for every entry, the pattern the reference
+/// interpreter materializes for the constant equals the stated one (the
+/// narrowing at 32 bits, NaN payloads included, on this host).
+#[test]
+fn stated_f32_narrowing_is_what_the_reference_interpreter_materializes() {
+    use trust_ir::FuncId;
+    use trust_ir::interpret::{InterpretValueKind, Interpreter};
+    let mut checked = 0usize;
+    for &(carrier, bits, _) in enc::EMITTED_FLOAT_CONST_IMMEDIATES {
+        let module = float_live::float_const_ir(bits, carrier);
+        let outcome = Interpreter::with_module(&module)
+            .execute_func(FuncId::new(0), vec![])
+            .expect("a float const function executes");
+        let InterpretValueKind::FloatBits(pattern) = outcome.returns[0].kind else {
+            panic!("f{bits} const returned {:?}", outcome.returns[0]);
+        };
+        assert_eq!(
+            Some(pattern),
+            enc::trust_ir_float_const_bits(carrier, bits),
+            "f{bits} carrier 0x{carrier:016x}: the interpreter materializes 0x{pattern:x}"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, enc::EMITTED_FLOAT_CONST_IMMEDIATES.len());
+}
+
+/// The stated narrowing agrees bit-exactly with the host binary64-to-binary32
+/// conversion (the one the reference interpreter uses) at every ROUNDING
+/// BOUNDARY, which a random sweep essentially never reaches (a tie needs all 29
+/// dropped bits to equal exactly `1 << 28`). For every binary64 exponent whose
+/// binary32 result is normal, subnormal, or rounds to zero at the half of the
+/// least subnormal, and for both signs, the dropped bits are set to the exact
+/// half quantum and to one unit either side of it, under kept bits with both
+/// parities (so ties round both down and up to even), plus all-ones kept bits
+/// (so a tie carries into the exponent, and past `f32::MAX` into infinity).
+/// Finite carriers only: the NaN payload rule is pinned by the live corpus.
+#[test]
+fn stated_f32_narrowing_matches_the_host_conversion_at_every_rounding_boundary() {
+    const MANT_MASK: u64 = (1 << 52) - 1;
+    const HIDDEN: u64 = 1 << 52;
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut checked = 0usize;
+    let mut ties = 0usize;
+    // Biased binary64 exponents: 873 puts the least-subnormal half at the
+    // hidden bit (binary32 result 0 or the least subnormal), 874..=896 give
+    // subnormal results, 897..=1150 normal ones.
+    for exp in 873u64..=1150 {
+        // Bits of the 53-bit significand below the binary32 result quantum.
+        let dropped: u32 = if exp >= 897 { 29 } else { (926 - exp) as u32 };
+        let half = 1u64 << (dropped - 1);
+        let low_mask = (1u64 << dropped) - 1;
+        for pattern in 0..34u32 {
+            let high = match pattern {
+                0 => 0,
+                1 => u64::MAX,
+                _ => {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    // Kept-bit parity alternates with the pattern index.
+                    (state & !(1 << dropped)) | (u64::from(pattern & 1) << dropped)
+                }
+            };
+            for low in [half - 1, half, half + 1] {
+                let significand = ((high & !low_mask) | low) & (HIDDEN | MANT_MASK);
+                let significand = if dropped == 53 {
+                    significand
+                } else {
+                    significand | HIDDEN
+                };
+                if significand & HIDDEN == 0 {
+                    // Not representable at this exponent (a 53-bit drop below
+                    // the half): covered by the neighbouring exponent.
+                    continue;
+                }
+                for sign in [0u64, 1 << 63] {
+                    let carrier = sign | (exp << 52) | (significand & MANT_MASK);
+                    let host = (f64::from_bits(carrier) as f32).to_bits();
+                    assert_eq!(
+                        enc::spec_narrow_binary64_to_binary32(carrier),
+                        host,
+                        "carrier 0x{carrier:016x} (exponent {exp}, dropped {dropped})"
+                    );
+                    checked += 1;
+                    ties += usize::from(low == half);
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 50_000 && ties > 15_000,
+        "{checked} checked, {ties} ties"
+    );
+}
+
+// ===========================================================================
+// f.min / f.max / copysign — the emitted BODIES, against the LIVE backend
+// ===========================================================================
+
+/// THE FRESHNESS CONTRACT for the float binop bodies.
+#[test]
+fn float_binop_bodies_are_what_the_live_backend_emits_today() {
+    let checked = float_live::assert_float_binop_bodies_are_what_the_live_backend_emits();
+    assert_eq!(checked, 6);
+}
+
+/// Over LIVE bodies: each executes and meets the relational trust-ir contract
+/// on the whole battery for every wasm NaN choice, and each of its controls
+/// refutes at its stated input class.
+#[test]
+fn live_float_binop_bodies_hold_and_their_controls_refute() {
+    use trust_cg_verify::wasm_float_binop_proofs::{
+        FloatBinopControl, TieReading, check_float_binop_body,
+    };
+    for &(kind, bits, _) in trust_cg_verify::wasm_float_binop_proofs::EMITTED_FLOAT_BINOP_BODIES {
+        let entries = float_live::code_entries(&float_live::float_binop_module(kind, bits));
+        let live = &entries[0];
+        let v = check_float_binop_body(kind, bits, live, TieReading::EitherOperand);
+        assert!(v.holds(), "{kind:?} f{bits}: {v:#?}");
+        for control in FloatBinopControl::ALL {
+            if !control.applies_to(kind) {
+                continue;
+            }
+            let (mutated, tie) = control
+                .build(kind, bits, live)
+                .unwrap_or_else(|| panic!("{control:?} cannot be built on {kind:?} f{bits}"));
+            let cv = check_float_binop_body(kind, bits, &mutated, tie);
+            assert!(
+                cv.refusal.is_none(),
+                "{control:?} {kind:?} f{bits}: {cv:#?}"
+            );
+            assert!(
+                !cv.refuted_classes.is_empty(),
+                "{control:?} SURVIVED on {kind:?} f{bits}"
+            );
+            if let Some(class) = control.stated_class() {
+                assert!(
+                    cv.refuted_classes.contains(&class),
+                    "{control:?} on {kind:?} f{bits} refuted at {:?}, not its stated {class:?}",
+                    cv.refuted_classes
+                );
+            }
+        }
+    }
+}
+
+/// Every captured guarded MemCopy / MemSet body is what the live backend emits.
+#[test]
+fn bulk_memory_bodies_are_what_the_live_backend_emits_today() {
+    let checked = bulk_live::assert_bulk_memory_bodies_are_what_the_live_backend_emits();
+    assert_eq!(checked, 3);
+}
+
+/// Over LIVE bodies: each passes the operand-provenance check, executes on
+/// the model memory and meets the relational trust-ir contract on every
+/// battery class, observes every operand bit below `OBSERVED_OPERAND_BITS`,
+/// and each of its controls refutes — at its stated input class on the
+/// battery, and an operand mask also on the provenance check. The unguarded
+/// body (the lowering before the zero-length guard) fails at exactly the
+/// zero-byte range past the memory.
+#[test]
+fn live_bulk_memory_bodies_hold_and_their_controls_refute() {
+    use trust_cg_verify::wasm_bulk_memory_proofs::{
+        BulkInputClass, BulkMemoryControl, BulkMemoryShape, CopyModel, bulk_operand_provenance,
+        check_bulk_memory_body, decode_bulk_body, unobserved_operand_bits,
+    };
+    for shape in BulkMemoryShape::ALL {
+        let live = decode_bulk_body(&bulk_live::live_bulk_memory_body(shape))
+            .unwrap_or_else(|e| panic!("{shape:?}: the live body does not decode: {e}"));
+        assert_eq!(live.count_op(shape.sub_opcode()), 1, "{shape:?}");
+        bulk_operand_provenance(shape, &live)
+            .unwrap_or_else(|e| panic!("{shape:?}: live operand provenance: {e}"));
+        let v = check_bulk_memory_body(shape, &live, CopyModel::Spec);
+        assert!(v.holds(), "{shape:?}: {v:#?}");
+        assert_eq!(
+            unobserved_operand_bits(shape, &live),
+            Ok(Vec::new()),
+            "{shape:?}: an operand bit below the model width is not observed"
+        );
+        let mut refuted_controls = 0;
+        let mut provenance_only = 0;
+        for control in BulkMemoryControl::ALL {
+            if !control.applies_to(shape) {
+                continue;
+            }
+            let (mutated, model) = control
+                .build(&live)
+                .unwrap_or_else(|| panic!("{control:?} cannot be built on {shape:?}"));
+            if matches!(control, BulkMemoryControl::OperandMasked { .. }) {
+                assert!(
+                    bulk_operand_provenance(shape, &mutated).is_err(),
+                    "{control:?} on {shape:?}: the provenance check accepts it"
+                );
+            }
+            let Some(class) = control.stated_class(shape) else {
+                provenance_only += 1;
+                continue;
+            };
+            let cv = check_bulk_memory_body(shape, &mutated, model);
+            assert!(cv.refusal.is_none(), "{control:?} {shape:?}: {cv:#?}");
+            assert!(
+                cv.refuted_classes.contains(&class),
+                "{control:?} on {shape:?} refuted at {:?}, not its stated {class:?}",
+                cv.refuted_classes
+            );
+            refuted_controls += 1;
+        }
+        assert!(
+            refuted_controls >= 7,
+            "{shape:?}: the control battery shrank ({refuted_controls})"
+        );
+        assert_eq!(
+            provenance_only, 1,
+            "{shape:?}: the count mask past the model must be a provenance-only control"
+        );
+        // The guard is exactly what separates the body from the old lowering.
+        let (bare, model) = BulkMemoryControl::Unguarded.build(&live).expect("builds");
+        let bv = check_bulk_memory_body(shape, &bare, model);
+        assert_eq!(
+            bv.refuted_classes,
+            std::collections::BTreeSet::from([BulkInputClass::ZeroLengthOutOfBounds]),
+            "{shape:?}: without its guard the body must fail at exactly the zero-length class"
+        );
+    }
+}
+
 /// EXHAUSTIVE over the full i32 range: every `v: i32` encoded by the backend's
 /// own `write_sleb128` (the function the module path calls) must decode, under
 /// the INDEPENDENT spec decoder, to exactly `v` at canonical length.
 ///
 /// `#[ignore]`d because it is 4.29e9 iterations: run it with
-/// `cargo test -p trust-cg-verify --release --test wasm_encoding_gate -- --ignored --nocapture`.
+/// `scripts/trust_cargo.sh test -p trust-cg-verify --release --test wasm_encoding_gate
+/// -- --ignored --nocapture`.
 /// The default lane runs the corpus, which is the byte-length boundaries and
 /// the sign-extension edges; this is the whole space, and the difference is
 /// named in `WASM_ENCODING_DEFERRALS`.
@@ -640,7 +1002,11 @@ fn sleb128_i64_window_and_boundaries() {
 /// row here is `∀ x ∈ S. P(x)`, and a row whose `S` is empty reports
 /// not-applicable rather than banking the module's silence (see
 /// `wasm_encoding_proofs::check_over`). Pinning `not_applicable` too is what
-/// makes "114 proven" mean 114 rows with something under them.
+/// makes "112 proven" mean 112 rows with something under them. (It was
+/// 114 / 69 before the local emission pass: the two `() -> iN { ret -1 }`
+/// modules no longer reference any local, their constant being
+/// rematerialized at the `return`, so their local-index row is not
+/// applicable.)
 #[test]
 fn every_real_module_discharges_the_indexing_family() {
     let mut total = EncodingReport::default();
@@ -658,7 +1024,7 @@ fn every_real_module_discharges_the_indexing_family() {
     assert_eq!(total.refuted, 0);
     assert_eq!(
         (total.proven, total.not_applicable),
-        (114, 69),
+        (112, 71),
         "the family-(4) split over the 9-module corpus moved: {total}. Re-derive it, and update \
          `encoding_family_tally`'s pin and the P4 line of SOUNDNESS_CHECK.md with it"
     );
@@ -667,9 +1033,8 @@ fn every_real_module_discharges_the_indexing_family() {
 /// THE P2 SHIFT, as a differential over two real compiles of the SAME trust-ir.
 #[test]
 fn the_import_shift_holds_over_real_bytes() {
-    let closed = wasm::compile_module(&import_shift_ir_closed()).expect("closed compiles");
-    let island = wasm::compile_module_with_policy(&import_shift_ir(), &island_policy())
-        .expect("island compiles");
+    let closed = lane(&import_shift_ir_closed()).expect("closed compiles");
+    let island = lane_with_policy(&import_shift_ir(), &island_policy()).expect("island compiles");
     let obs = enc::import_shift_obligations(&closed, &island, &["callee", "caller"]);
     let r = assert_no_refutations("import shift", &obs);
     eprintln!("the_import_shift_holds_over_real_bytes: {r}");
@@ -704,9 +1069,8 @@ fn the_import_shift_holds_over_real_bytes() {
 /// mutated module is byte-length identical, type-checks, and runs into the host.
 #[test]
 fn the_forgotten_import_shift_is_refuted() {
-    let closed = wasm::compile_module(&import_shift_ir_closed()).expect("closed compiles");
-    let island = wasm::compile_module_with_policy(&import_shift_ir(), &island_policy())
-        .expect("island compiles");
+    let closed = lane(&import_shift_ir_closed()).expect("closed compiles");
+    let island = lane_with_policy(&import_shift_ir(), &island_policy()).expect("island compiles");
     let k = decode_module(&island).expect("decodes").func_import_count();
     let broken = enc::mutate_unshift_calls(&island, k)
         .expect("the island has a single-byte call immediate to un-shift");
@@ -879,7 +1243,7 @@ fn structural_mutants_of_real_modules_are_refuted() {
         assert_indexing_refutes(
             &format!("{name}: element i != function i"),
             &broken,
-            "element i is function i",
+            "element vector entry i is function i",
         );
         fired += 1;
     }
@@ -1114,13 +1478,20 @@ fn the_wasm32_pin_is_enforced_by_the_compiler() {
         let r = fb.add(Ty::I32, a, one);
         fb.ret(vec![r]);
         fb.build();
-        mb.build()
+        mb.build().expect("ModuleBuilder::build: test fixture")
     };
 
     // The canonical pin compiles.
     let mut ok = build();
     ok.target_info = Some(wasm::wasm32_target_info());
-    assert!(wasm::compile_module(&ok).is_ok());
+    assert!(
+        wasm::compile_module_with_policy_and_license(
+            &ok,
+            &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+            &permit_unlicensed()
+        )
+        .is_ok()
+    );
 
     // Every mutation of the pin is REFUSED, and the refusal names the field.
     let mutations: Vec<(&str, Option<trust_ir::TargetInfo>, &str)> = vec![
@@ -1153,9 +1524,13 @@ fn the_wasm32_pin_is_enforced_by_the_compiler() {
     for (what, ti, must_name) in mutations {
         let mut m = build();
         m.target_info = ti;
-        let err = wasm::compile_module(&m)
-            .err()
-            .unwrap_or_else(|| panic!("a {what} module must NOT enter the wasm32 lane"));
+        let err = wasm::compile_module_with_policy_and_license(
+            &m,
+            &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+            &permit_unlicensed(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a {what} module must NOT enter the wasm32 lane"));
         let msg = err.to_string();
         assert!(
             msg.contains(must_name),
@@ -1175,7 +1550,7 @@ fn the_wasm32_pin_is_enforced_by_the_compiler() {
 /// adding one is a reviewable admission of debt.
 #[test]
 fn the_named_deferrals_are_pinned() {
-    assert_eq!(WASM_ENCODING_DEFERRALS.len(), 7);
+    assert_eq!(WASM_ENCODING_DEFERRALS.len(), 6);
     let mut names: Vec<&str> = WASM_ENCODING_DEFERRALS.iter().map(|d| d.name).collect();
     names.sort_unstable();
     let before = names.len();
@@ -1208,9 +1583,8 @@ fn encoding_family_tally() {
         total.absorb(i);
     }
 
-    let closed = wasm::compile_module(&import_shift_ir_closed()).expect("closed");
-    let island =
-        wasm::compile_module_with_policy(&import_shift_ir(), &island_policy()).expect("island");
+    let closed = lane(&import_shift_ir_closed()).expect("closed");
+    let island = lane_with_policy(&import_shift_ir(), &island_policy()).expect("island");
     let s = report_of(&enc::import_shift_obligations(
         &closed,
         &island,
@@ -1250,11 +1624,14 @@ fn encoding_family_tally() {
         "refutations:\n  {}",
         total.refutations.join("\n  ")
     );
-    // THE HEADLINE, pinned so it cannot drift silently: 210 proven / 0 refuted
-    // / 108 not-applicable, plus 7 named RED deferrals.
+    // THE HEADLINE, pinned so it cannot drift silently: 208 proven / 0 refuted
+    // / 110 not-applicable, plus 6 named RED deferrals. The float const
+    // obligations are pinned by their own targets below and by the coverage
+    // gate, not folded into this tally.
     //
     //   74  family (5), the captured const-immediate corpus
-    //  114  family (4) over the 9-module corpus
+    //  112  family (4) over the 9-module corpus (114 before the local
+    //       emission pass left the two const modules with no local reference)
     //    4  family (4), the two-compile import-shift differential
     //   18  family (6) over the same corpus
     //
@@ -1267,9 +1644,18 @@ fn encoding_family_tally() {
     // vacuous rows stopped counting is a more honest count, not a worse one.
     assert_eq!(
         (total.proven, total.refuted, total.not_applicable),
-        (210, 0, 108),
+        (208, 0, 110),
         "the P4 encoder/byte family headline moved: {total}. Re-derive it and update the pins in \
          this file and the P4 line of SOUNDNESS_CHECK.md; never adjust the pin to match a row \
          that cannot fail"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

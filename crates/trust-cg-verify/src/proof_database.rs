@@ -9,8 +9,6 @@
 // all_division_proofs(), all_fp_lowering_proofs(), etc.). This module
 // provides a unified ProofDatabase for inventory, reporting, and
 // verification orchestration.
-//
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! Unified proof obligation database.
 //!
@@ -639,6 +637,26 @@ fn register_comparison_branch_proofs(proofs: &mut Vec<CategorizedProof>) {
             category: ProofCategory::Comparison,
         });
     }
+    // The faithful `Select -> CMP+CSEL` family (`aarch64_select_proofs`).
+    // These are instruction lowerings, so `Comparison` is the honest category
+    // (`CmpCombine` declares `PeepholeOptimization`, which these are not).
+    //
+    // APPENDED AFTER the Icmp/CondBr families ON PURPOSE. The walk resolves a
+    // query by the FIRST case-insensitive substring match within a category,
+    // and the opcode-level `"cmp"` token must keep resolving to the same
+    // `Icmp_Eq_I32` row it always did — pinned by
+    // `select_family_registration_does_not_shadow_the_comparison_families`.
+    //
+    // These are NOT the retracted `CmpSelectCombine: diamond CFG == CSEL`
+    // entries (X==X, credited zero, kept for the ledger under `CmpCombine`).
+    // Their machine side is the DECODED CSEL word;
+    // `no_select_family_member_is_degenerate` pins that difference.
+    for p in crate::aarch64_select_proofs::all_select_cmp_csel_proofs() {
+        proofs.push(CategorizedProof {
+            obligation: p,
+            category: ProofCategory::Comparison,
+        });
+    }
     for p in crate::lowering_proof::all_branch_proofs() {
         proofs.push(CategorizedProof {
             obligation: p,
@@ -761,6 +779,12 @@ fn register_backend_proofs(proofs: &mut Vec<CategorizedProof>) {
             category: ProofCategory::FrameLayout,
         });
     }
+    // Exportable theorem, never an unbound STP/LDP opcode registration. Only
+    // the source-bound verifier can apply it to an actual complete function.
+    proofs.push(CategorizedProof {
+        obligation: crate::source_bound_frame::frame_obligation(),
+        category: ProofCategory::FrameLayout,
+    });
     for p in crate::scheduler_proofs::all_scheduler_proofs() {
         proofs.push(CategorizedProof {
             obligation: p,
@@ -854,6 +878,14 @@ fn register_emission_proofs(proofs: &mut Vec<CategorizedProof>) {
     // additionally requires the per-object ELF reparse binding (see
     // object_inventory.rs).
     for p in crate::aarch64_elf_reloc_proofs::aarch64_elf_relocation_proofs() {
+        proofs.push(CategorizedProof {
+            obligation: p,
+            category: ProofCategory::MachOEmission,
+        });
+    }
+    // The fused ADRP + LDR/STR lo12 rows (LDST8..LDST128), each with the
+    // access-size alignment precondition the emitter establishes.
+    for p in crate::aarch64_elf_reloc_proofs::aarch64_elf_ldst_lo12_proofs() {
         proofs.push(CategorizedProof {
             obligation: p,
             category: ProofCategory::MachOEmission,
@@ -1166,6 +1198,71 @@ fn register_bitfield_extract_proofs(proofs: &mut Vec<CategorizedProof>) {
     }
 }
 
+/// Decoded-word value obligations for the AArch64 register copies and scalar
+/// value forms (`aarch64_value_decode_proofs`): one per emitted form, whose
+/// machine side is the Arm ARM semantics of the independently decoded word
+/// captured from the encoder. Registered LAST in every category it touches
+/// (Arithmetic, BitwiseShift, FloatingPoint, FpConversion, AddressMode), so an
+/// older generic first-contains query ("add", "mul", ...) still resolves to
+/// the proof it resolved to before; each form's "a64 decoded ..." query is a
+/// unique substring of its own name.
+#[inline(never)]
+fn register_a64_value_decode_proofs(proofs: &mut Vec<CategorizedProof>) {
+    for (category, obligation) in crate::aarch64_value_decode_proofs::all_a64_value_decode_proofs()
+    {
+        proofs.push(CategorizedProof {
+            obligation,
+            category,
+        });
+    }
+}
+
+/// Per-instruction NZCV producer/consumer obligations (FCMP packed NZCV, FCMP
+/// -> CSET, and CSEL/CSINC/CSNEG over a reaching CMP/TST/FCMP): the machine
+/// side is the Arm ARM semantics of independently decoded captured words.
+/// Registered in `Comparison` after the Icmp/CondBr families and
+/// `aarch64_select_proofs`'s CSEL family, so the generic `"cmp"` and `icmp_*`
+/// first-contains queries resolve exactly as before; each form's
+/// `"a64 nzcv ..."` query is a unique prefix of its own name.
+#[inline(never)]
+fn register_flag_consumer_proofs(proofs: &mut Vec<CategorizedProof>) {
+    for (category, obligation) in crate::aarch64_flag_consumer_proofs::all_flag_consumer_proofs() {
+        proofs.push(CategorizedProof {
+            obligation,
+            category,
+        });
+    }
+}
+
+/// Decoded-word value obligations for the AArch64 `CSET` alias
+/// (`aarch64_value_decode_proofs`'s CSET family): one per emitted
+/// (destination width, condition) form, whose machine side is the Arm ARM
+/// effect of the INDEPENDENTLY DECODED conditional-select word the encoder
+/// emits, and whose intent side takes its predicate from the per-mnemonic
+/// `nzcv::eval_condition` table. Each is decided exhaustively over all sixteen
+/// NZCV states.
+///
+/// Registered LAST in `Comparison`, after the Icmp/CondBr families,
+/// `aarch64_select_proofs`'s CSEL family AND the NZCV producer/consumer family
+/// (`register_flag_consumer_proofs`), so the walk's first-contains query
+/// resolution for every pre-existing token is unchanged; each form's
+/// "a64 decoded cset ..." query is a unique substring of its own name.
+///
+/// A database entry alone grants no opcode credit: `function_verifier` binds
+/// these LAST, only for a `CSet` that none of the source-bound bindings
+/// claimed, so a CSET carrying a whole-sequence citation keeps it.
+#[inline(never)]
+fn register_a64_cset_value_decode_proofs(proofs: &mut Vec<CategorizedProof>) {
+    for (category, obligation) in
+        crate::aarch64_value_decode_proofs::all_a64_cset_value_decode_proofs()
+    {
+        proofs.push(CategorizedProof {
+            obligation,
+            category,
+        });
+    }
+}
+
 #[inline(never)]
 fn register_checked_overflow_proofs(proofs: &mut Vec<CategorizedProof>) {
     // #67: kept-carrier checked-overflow DETECTION idioms (AArch64).
@@ -1192,6 +1289,19 @@ fn register_checked_overflow_proofs(proofs: &mut Vec<CategorizedProof>) {
         });
     }
 
+    // The four checked-i128 carry-chain whole-chain obligations
+    // (ADDS lo; ADCS hi; CSET / SUBS lo; SBCS hi; CSET — value + final-NZCV
+    // overflow bit against the native 128-bit checked form). Registered under
+    // `Arithmetic` like their i64 siblings; the "Checked*_I128 whole-chain"
+    // names are unique substrings, so the Adcs/Sbcs bindings select them
+    // unambiguously.
+    for p in crate::checked_overflow_proofs::all_checked_i128_carry_chain_proofs() {
+        proofs.push(CategorizedProof {
+            obligation: p,
+            category: ProofCategory::Arithmetic,
+        });
+    }
+
     // #67 mul disposition: the 64-bit Smulh/Umulh FORMAL discharge is SMT-hard
     // (128-bit `bvmul` times out), so those opcodes stay fail-closed-allowlisted
     // in classify_aarch64 rather than claim a 64-bit formal proof. The HONEST
@@ -1202,6 +1312,25 @@ fn register_checked_overflow_proofs(proofs: &mut Vec<CategorizedProof>) {
     // These I8 names are distinct from the I64 names, so they never collide with
     // the Smulh/Umulh opcode bindings (which, being allowlisted, bind nothing).
     for p in crate::checked_overflow_proofs::all_checked_overflow_mul_exhaustive_i8_proofs() {
+        proofs.push(CategorizedProof {
+            obligation: p,
+            category: ProofCategory::Arithmetic,
+        });
+    }
+}
+
+/// The i128/u128 checked-multiply idiom family (`checked_mul_i128_proofs`):
+/// the `Imul I128` low-product limb chain, AArch64's guarded `__udivti3` /
+/// `__divti3` division-identity overflow flags and x86-64's division-free
+/// limb-check flags (OD-224), each flag stated against the exact 256-bit
+/// product reconstructed from 64-bit limbs. Registered under
+/// `Arithmetic` AFTER `register_checked_overflow_proofs` and the plain i128
+/// rows, so the older `imul_i128 lo`/`hi` and `checked*_i64` first-contains
+/// queries resolve exactly as before; each row's own query
+/// (`CheckedMulI128Form::query`) is a unique substring of its name.
+#[inline(never)]
+fn register_checked_mul_i128_proofs(proofs: &mut Vec<CategorizedProof>) {
+    for p in crate::checked_mul_i128_proofs::all_checked_mul_i128_proofs() {
         proofs.push(CategorizedProof {
             obligation: p,
             category: ProofCategory::Arithmetic,
@@ -1306,12 +1435,31 @@ const REGISTRARS: &[(ProofRegistrar, &[ProofCategory])] = &[
         &[ProofCategory::Arithmetic],
     ),
     (
+        register_checked_mul_i128_proofs,
+        &[ProofCategory::Arithmetic],
+    ),
+    (
         register_widening_multiply_proofs,
         &[ProofCategory::Arithmetic],
     ),
     (
         register_bitfield_extract_proofs,
         &[ProofCategory::ExtensionTruncation],
+    ),
+    (
+        register_a64_value_decode_proofs,
+        &[
+            ProofCategory::AddressMode,
+            ProofCategory::Arithmetic,
+            ProofCategory::BitwiseShift,
+            ProofCategory::FloatingPoint,
+            ProofCategory::FpConversion,
+        ],
+    ),
+    (register_flag_consumer_proofs, &[ProofCategory::Comparison]),
+    (
+        register_a64_cset_value_decode_proofs,
+        &[ProofCategory::Comparison],
     ),
 ];
 
@@ -1380,8 +1528,12 @@ impl ProofDatabase {
         register_switch_proofs(&mut proofs);
         register_checked_overflow_proofs(&mut proofs);
         register_i128_carry_chain_proofs(&mut proofs);
+        register_checked_mul_i128_proofs(&mut proofs);
         register_widening_multiply_proofs(&mut proofs);
         register_bitfield_extract_proofs(&mut proofs);
+        register_a64_value_decode_proofs(&mut proofs);
+        register_flag_consumer_proofs(&mut proofs);
+        register_a64_cset_value_decode_proofs(&mut proofs);
         ProofDatabase { proofs }
     }
 
@@ -1429,7 +1581,11 @@ impl ProofDatabase {
         register_switch_proofs(&mut proofs);
         register_checked_overflow_proofs(&mut proofs);
         register_i128_carry_chain_proofs(&mut proofs);
+        register_checked_mul_i128_proofs(&mut proofs);
         register_bitfield_extract_proofs(&mut proofs);
+        register_a64_value_decode_proofs(&mut proofs);
+        register_flag_consumer_proofs(&mut proofs);
+        register_a64_cset_value_decode_proofs(&mut proofs);
         ProofDatabase { proofs }
     }
 
@@ -1706,8 +1862,6 @@ pub const GENUINE_IDENTITY_ALLOWLIST: &[&str] = &[
     "ExtractBits{lsb=2,width=4}_I8 -> UBFM (8-bit)",
     "ExtractBits{lsb=3,width=7}_I16 -> UBFM (16-bit)",
     "ExtractBits{lsb=7,width=13}_I32 -> UBFM (32-bit)",
-    "Fabs_F32 -> FABS Sd",
-    "Fabs_F64 -> FABS Dd",
     "Fadd_F32 -> FADD Sd",
     "Fadd_F64 -> FADD Dd",
     // FCMP→NZCV+CSET model (encode_fcmp via the nzcv flag table). The cond
@@ -1715,15 +1869,13 @@ pub const GENUINE_IDENTITY_ALLOWLIST: &[&str] = &[
     // source predicate (GE/GT/LE/Ord and ALL the Unordered-* forms) are now
     // GENUINELY PROVEN (not X==X) — they were removed from this allowlist when
     // encode_fcmp moved from the degenerate FloatCC-mirroring model to the
-    // faithful from_floatcc + NZCV model. The 8 that survive here read a single
-    // flag equal to the source predicate (Eq→Z, NE→¬Z, LT→N, Uno→V), so they
-    // remain structurally identical 1:1 identities.
+    // faithful from_floatcc + NZCV model. Ordered NE now includes its NaN
+    // guard and is also non-degenerate. The six surviving Eq→Z, LT→N and
+    // Uno→V obligations remain structurally identical 1:1 identities.
     "Fcmp_Eq_F32 -> FCMP+CSET",
     "Fcmp_Eq_F64 -> FCMP+CSET",
     "Fcmp_LT_F32 -> FCMP+CSET",
     "Fcmp_LT_F64 -> FCMP+CSET",
-    "Fcmp_NE_F32 -> FCMP+CSET",
-    "Fcmp_NE_F64 -> FCMP+CSET",
     "Fcmp_Uno_F32 -> FCMP+CSET",
     "Fcmp_Uno_F32 -> x86_64 UCOMISS+SETcc",
     "Fcmp_Uno_F64 -> FCMP+CSET",
@@ -2255,6 +2407,41 @@ fn max_input_width(obligation: &ProofObligation) -> u32 {
 mod tests {
     use super::*;
 
+    /// Symbols the independent checker's lexer reserves (Clean's Carcara
+    /// `parser/lexer.rs` `Reserved`, beyond SMT-LIB's own `_ ! as let exists
+    /// forall match par`): a problem that declares one as a simple symbol
+    /// fails to PARSE, so no certificate for it can ever verify. Measured
+    /// 2026-09-28: the two `LoopUnroll` obligations declared `step` and Clean
+    /// answered "parser error on line 5, column 15" to a proof AY had checked.
+    #[test]
+    fn no_obligation_declares_an_alethe_reserved_word() {
+        with_large_stack(|| {
+            const RESERVED: &[&str] = &[
+                "_", "!", "as", "let", "exists", "forall", "match", "par", "choice", "lambda",
+                "cl", "assume", "step", "anchor",
+            ];
+            let db = ProofDatabase::new();
+            let offenders: Vec<String> = db
+                .all()
+                .iter()
+                .flat_map(|proof| {
+                    let ob = &proof.obligation;
+                    ob.inputs
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .chain(ob.fp_inputs.iter().map(|(name, ..)| name.as_str()))
+                        .filter(|name| RESERVED.contains(name))
+                        .map(|name| format!("{}: `{name}`", ob.name))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "obligations declare checker-reserved symbols: {offenders:?}"
+            );
+        });
+    }
+
     fn with_large_stack(f: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
             .name("proof-db-audit".to_string())
@@ -2476,10 +2663,64 @@ mod tests {
     #[test]
     fn test_comparison_proofs_count() {
         let db = ProofDatabase::new();
-        let count = db.count_by_category(ProofCategory::Comparison);
-        // 10 conditions x 2 widths = 20: the UGE/HS pair #62 retracted as
-        // degenerate is genuine again with the adder carry-out C flag (nzcv.rs).
-        assert_eq!(count, 20, "expected 20 comparison proofs, got {}", count);
+        let rows = db.by_category(ProofCategory::Comparison);
+        // The `Icmp_*` family: 10 conditions x 2 widths = 20. The UGE/HS pair
+        // #62 retracted as degenerate is genuine again with the adder
+        // carry-out C flag (nzcv.rs). This is the ORIGINAL pin and must not
+        // move — the category now also carries the select, NZCV
+        // producer/consumer and decoded-word CSET families, so count each
+        // family separately rather than one total that any could satisfy.
+        let icmp = rows
+            .iter()
+            .filter(|p| p.obligation.name.starts_with("Icmp_"))
+            .count();
+        assert_eq!(icmp, 20, "expected 20 Icmp lowering proofs, got {icmp}");
+        // The `Select_* -> CMP+CSEL_*` family (`aarch64_select_proofs`):
+        // 10 conditions x cmp{32,64} x sel{32,64} = 40. The comparison and
+        // select widths are INDEPENDENT, which is why this is 40 and not 20.
+        let select = rows
+            .iter()
+            .filter(|p| p.obligation.name.starts_with("Select_"))
+            .count();
+        assert_eq!(
+            select, 40,
+            "expected 40 select lowering proofs, got {select}"
+        );
+        // The 414 NZCV producer/consumer obligations of
+        // aarch64_flag_consumer_proofs: 2 FCMP packed NZCV, 28 FCMP -> CSET and
+        // 384 CSEL/CSINC/CSNEG-over-producer forms. Pinned both in the
+        // database and at the source, so a form the builder silently drops
+        // (its `if let Ok` arms) cannot pass unnoticed.
+        let nzcv = rows
+            .iter()
+            .filter(|p| p.obligation.name.starts_with("A64 NZCV "))
+            .count();
+        assert_eq!(
+            nzcv, 414,
+            "expected 414 NZCV producer/consumer proofs, got {nzcv}"
+        );
+        assert_eq!(
+            crate::aarch64_flag_consumer_proofs::all_flag_consumer_proofs().len(),
+            414
+        );
+        // The decoded-word `CSET` family (`aarch64_value_decode_proofs`):
+        // 14 condition codes x 2 destination widths = 28. AL/NV are absent
+        // because the alias cannot carry them. Counted as its OWN family for
+        // the same reason as the others — a total that any family could
+        // satisfy is not a pin.
+        let decoded_cset = rows
+            .iter()
+            .filter(|p| p.obligation.name.starts_with("A64 decoded CSET "))
+            .count();
+        assert_eq!(
+            decoded_cset, 28,
+            "expected 28 decoded-word CSET proofs, got {decoded_cset}"
+        );
+        assert_eq!(
+            rows.len(),
+            icmp + select + nzcv + decoded_cset,
+            "an unclassified proof entered ProofCategory::Comparison"
+        );
     }
 
     #[test]
@@ -2494,10 +2735,30 @@ mod tests {
     #[test]
     fn test_peephole_proofs_count() {
         let db = ProofDatabase::new();
-        let count = db.count_by_category(ProofCategory::Peephole);
-        // Was 99; the degenerate "CSEL Xd,Xn,Xn,cond ≡ MOV" X==X was retracted in
-        // #62, leaving 98.
-        assert_eq!(count, 98, "expected 98 peephole proofs, got {}", count);
+        let registered = db.by_category(ProofCategory::Peephole);
+        let expected = crate::peephole_proofs::all_peephole_proofs_all_widths();
+        // 51 x64 + 10 x32 (including I8 return demanded bits) + 39 x8,
+        // minus the retracted, degenerate same-arm CSEL theorem.
+        assert_eq!(registered.len(), 99);
+        assert_eq!(expected.len(), 99);
+        let names: std::collections::HashSet<_> = registered
+            .iter()
+            .map(|proof| proof.obligation.name.as_str())
+            .collect();
+        assert_eq!(names.len(), registered.len(), "duplicate peephole names");
+        for obligation in expected {
+            assert!(
+                registered
+                    .iter()
+                    .any(|proof| proof.obligation == obligation),
+                "missing or altered peephole obligation: {}",
+                obligation.name
+            );
+        }
+        let demanded_bits = crate::peephole_proofs::proof_i8_return_and255_demanded_bits();
+        assert!(names.contains(demanded_bits.name.as_str()));
+        let retracted = crate::peephole_proofs::proof_csel_same_arms();
+        assert!(!names.contains(retracted.name.as_str()));
     }
 
     #[test]
@@ -2596,10 +2857,12 @@ mod tests {
         //   NeonMovi and replacing its degenerate replicated-byte identity) = 281,
         // + 4 PARTIAL post-index base-register writeback obligations (the four NEON
         //   post-index memory opcodes; these prove the base advance ONLY and those
-        //   rows STAY explicitly deferred RED on the transfer itself) = 285.
+        //   rows STAY explicitly deferred RED on the transfer itself) = 285,
+        // + 1 FAITHFUL cross-lane horizontal-add obligation (AddpScalar.2D,
+        //   L04-P6, un-allowlisting NeonAddpScalar) = 286.
         assert_eq!(
-            count, 285,
-            "expected 285 NEON lowering proofs, got {}",
+            count, 286,
+            "expected 286 NEON lowering proofs, got {}",
             count
         );
     }
@@ -2897,7 +3160,13 @@ mod tests {
         // AddRRShiftLsr, the srem/sdiv magic sign-bit correction) = 74.
         // +10 for the standalone ROR-immediate obligations (5 amounts x {W,X},
         // all_ror_immediate_proofs — the rotate recognizer's unfused RorRI) = 84.
-        assert_eq!(count, 84, "expected 84 bitwise/shift proofs, got {}", count);
+        // +7 decoded-word value obligations (MOV Wd/Xd/Xd-from-SP, BFM insert
+        // W/X, RBIT W/X — aarch64_value_decode_proofs) = 91.
+        // +2 decoded-word typed post-allocation copies (MOVWrr, MOVXrr —
+        // aarch64_value_decode_proofs, L04-P11) = 93.
+        // +4 decoded-word zero-source copies (MOV Wd, WZR / Xd, XZR and the
+        // typed MOVWrr/MOVXrr from ZR, L04-P11 review) = 97.
+        assert_eq!(count, 97, "expected 97 bitwise/shift proofs, got {}", count);
     }
 
     // =======================================================================
@@ -2928,7 +3197,7 @@ mod tests {
 
     /// Regression test for #434: the `x86_64_lowering_proofs::all_x86_64_proofs`
     /// registry was an orphan and not exercised by the default
-    /// `cargo test -p trust-cg-verify` suite. Ensure it flows through
+    /// `scripts/trust_cargo.sh test -p trust-cg-verify` suite. Ensure it flows through
     /// `ProofDatabase::new()` and every obligation from the registry is
     /// represented under `ProofCategory::X8664Lowering`.
     ///

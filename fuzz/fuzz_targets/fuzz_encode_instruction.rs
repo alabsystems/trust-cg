@@ -134,7 +134,51 @@ fn derive_scalar_writeback_operands(data: &[u8], pos: &mut usize) -> Vec<MachOpe
     vec![MachOperand::PReg(rt), base, MachOperand::Imm(off)]
 }
 
+// The fuzz lane's negative controls (scripts/run_linux_fuzz_lane.py). Only a
+// build with `--features negative-control` contains them. An input starting
+// with one of these markers plants one failure the lane must report, with the
+// input retained as the failure artifact: a panic, a leaked heap allocation
+// (LeakSanitizer) and a heap-buffer-overflow read (AddressSanitizer). The
+// campaign build never enables the feature.
+#[cfg(feature = "negative-control")]
+const NEGATIVE_CONTROL_MARKER: &[u8] = b"TRUST-CG-FUZZ-LANE-NEGATIVE-CONTROL";
+#[cfg(feature = "negative-control")]
+const NEGATIVE_LEAK_MARKER: &[u8] = b"TRUST-CG-FUZZ-LANE-NEGATIVE-LEAK";
+#[cfg(feature = "negative-control")]
+const NEGATIVE_ASAN_MARKER: &[u8] = b"TRUST-CG-FUZZ-LANE-NEGATIVE-ASAN";
+
+/// Leak one heap allocation: the only pointer to it dies with this frame.
+#[cfg(feature = "negative-control")]
+#[inline(never)]
+fn planted_leak() {
+    std::mem::forget(std::hint::black_box(vec![0x5a_u8; 4096]));
+}
+
+/// Read one byte past a heap allocation.
+#[cfg(feature = "negative-control")]
+#[inline(never)]
+fn planted_heap_overflow_read() -> u8 {
+    let buffer = std::hint::black_box(vec![0x5a_u8; 16]);
+    // SAFETY: none; this deliberately reads out of bounds so AddressSanitizer
+    // reports it. The negative-control feature exists only for that report.
+    unsafe { std::ptr::read_volatile(buffer.as_ptr().add(buffer.len())) }
+}
+
 fuzz_target!(|data: &[u8]| {
+    #[cfg(feature = "negative-control")]
+    {
+        if data.starts_with(NEGATIVE_CONTROL_MARKER) {
+            panic!("planted fuzz-lane negative control");
+        }
+        if data.starts_with(NEGATIVE_LEAK_MARKER) {
+            planted_leak();
+            return;
+        }
+        if data.starts_with(NEGATIVE_ASAN_MARKER) {
+            std::hint::black_box(planted_heap_overflow_read());
+            return;
+        }
+    }
     if data.is_empty() {
         return;
     }

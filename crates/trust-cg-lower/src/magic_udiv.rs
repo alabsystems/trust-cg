@@ -59,6 +59,14 @@
 //! holds. `(x - t) >> 1` is the standard "average without overflow" that
 //! forms `floor((x + q)/2)` where `q = MULHI(x, M)`; see HD Fig. 10-1/10-4.
 //!
+//! **Pre-shift form.** For an even `K = 2^z * k` whose add-back is needed,
+//! the dividend is shifted first: `q = MULHI(x >> z, M) >> s` with `M` the
+//! no-add magic of `k` over `[0, 2^(W-z))`. That is the same lemma with the
+//! dividend bound `2^(W-z)` in place of `2^W` (Granlund and Montgomery
+//! state it for an `N`-bit dividend; see [`band_holds_bits`]), plus the
+//! integer identity `x / (2^z * k) == (x >> z) / k`, proved inline on
+//! [`MagicUPreShift`]. No other premise is added.
+//!
 //! ## How per-divisor correctness is established (NO solver)
 //!
 //! For each candidate `(K, M, s, add)` we compute (via `magicu`) and then
@@ -152,15 +160,15 @@ impl U256 {
     /// fits in 256 bits with no truncation, so this is exact.
     pub fn wrapping_mul(self, other: U256) -> U256 {
         let mut out = [0u64; 4];
-        for i in 0..4 {
-            if self.limbs[i] == 0 {
+        for (i, &left_limb) in self.limbs.iter().enumerate() {
+            if left_limb == 0 {
                 continue;
             }
             let mut carry = 0u128;
-            for j in 0..(4 - i) {
+            for (j, &right_limb) in other.limbs[..4 - i].iter().enumerate() {
                 let idx = i + j;
                 let cur = out[idx] as u128;
-                let prod = self.limbs[i] as u128 * other.limbs[j] as u128;
+                let prod = left_limb as u128 * right_limb as u128;
                 let sum = cur + (prod & 0xFFFF_FFFF_FFFF_FFFF) + (carry & 0xFFFF_FFFF_FFFF_FFFF);
                 out[idx] = sum as u64;
                 // carry = high 64 of prod + high 64 of the running carry + carry-out of `sum`.
@@ -243,6 +251,23 @@ impl MagicWidth {
 /// every value here is `< 2^(W+1) <= 2^65 < 2^128`.
 pub fn magicu(d: u64, width: MagicWidth) -> Option<MagicU> {
     let w = width.bits();
+    magicu_bits(d, w, w)
+}
+
+/// [`magicu`] for `W = w` with an explicit DIVIDEND bound: the candidate is
+/// for dividends `x` in `[0, 2^n)` (`1 <= n <= w <= 64`), multiplied as a
+/// `w`-bit MULHI. `n == w` is exactly [`magicu`]; `n < w` is the reduced
+/// range a pre-shifted dividend occupies ([`magicu_preshift`]), where `nc`
+/// (the worst-case dividend) is the largest value `<= 2^n - 1` congruent to
+/// `-1 (mod d)` and the rest of the recurrence is unchanged (LLVM's
+/// `UnsignedDivisionByConstantInfo::get` with `LeadingZeros = w - n`).
+/// Returns `None` when `d` does not leave a whole residue class in the range
+/// (`d > 2^n - 1`). A candidate only: [`band_holds`] / [`preshift_band_holds`]
+/// decide whether it is used.
+fn magicu_bits(d: u64, w: u32, n: u32) -> Option<MagicU> {
+    if !(2..=64).contains(&w) || n == 0 || n > w {
+        return None;
+    }
     if d <= 1 {
         return None;
     }
@@ -260,10 +285,15 @@ pub fn magicu(d: u64, width: MagicWidth) -> Option<MagicU> {
     let d = d as u128;
     let two_w: u128 = 1u128 << w;
     let ones: u128 = two_w - 1;
+    // The largest dividend, `2^n - 1` (`== ones` when `n == W`).
+    let ones_n: u128 = (1u128 << n) - 1;
+    if d > ones_n {
+        return None;
+    }
 
-    // nc = the largest value `<= 2^W - 1` that is `== -1 (mod d)`
-    //    = (2^W - 1) - ((2^W - 1) - d + 1) mod d       [HD Fig 10-1, unsigned]
-    let nc: u128 = ones - (ones - d + 1) % d;
+    // nc = the largest value `<= 2^n - 1` that is `== -1 (mod d)`
+    //    = (2^n - 1) - ((2^n - 1) - d + 1) mod d       [HD Fig 10-1, unsigned]
+    let nc: u128 = ones_n - (ones_n - d + 1) % d;
 
     // Two remainder-accumulator recurrences track `2^p / nc` and
     // `(2^p - 1) / d` as p grows from W-1 upward, without ever forming 2^p
@@ -341,6 +371,29 @@ pub fn magicu(d: u64, width: MagicWidth) -> Option<MagicU> {
 /// largest value formed is `M' * d < 2^65 * 2^64 = 2^129 < 2^256`.
 pub fn band_holds(d: u64, m: MagicU, width: MagicWidth) -> bool {
     let w = width.bits();
+    band_holds_bits(d, m, w, w)
+}
+
+/// [`band_holds`] for `W = w` over dividends `x` in `[0, 2^n)`
+/// (`1 <= n <= w <= 64`); `n == w` is exactly [`band_holds`].
+///
+/// The cited lemma bounds the dividend, not the register: Granlund and
+/// Montgomery state it for `0 <= x < 2^N` with the multiply-and-shift taken
+/// as a whole (`floor(x * M' / 2^(N+l))`), so a `w`-bit MULHI followed by a
+/// shift of `s` is the case `N = n`, `N + l = w + s`. The exact upper
+/// condition below is the same with `nc` taken over `[0, 2^n)`: writing
+/// `e = M'*d - 2^(w+s)` and `x = q*d + r`, the quotient is right iff
+/// `r * 2^(w+s) + x * e < d * 2^(w+s)`; if `q*d + d - 1 < 2^n` then
+/// `x * e <= nc * e`, else `nc = q*d - 1` and `x * e = nc * e + (r + 1) * e`
+/// with `(r + 1) * e <= (d - 1) * e <= nc * e` and `r <= d - 2`, so
+/// `nc * e < 2^(w+s)` suffices in both cases (and `x = nc` makes it
+/// necessary). `d <= 2^n - 1` is required, which puts `nc >= d - 1`.
+/// `tests::reduced_range_band_is_exact_iff_correct_w8` checks the iff
+/// exhaustively at `w = 8` for every `n`, divisor, magic and shift.
+fn band_holds_bits(d: u64, m: MagicU, w: u32, n: u32) -> bool {
+    if !(2..=64).contains(&w) || n == 0 || n > w {
+        return false;
+    }
     // s must keep W + s < 128 so 2^(W+s) fits our comparison magnitudes; the
     // magicu shift is always < W for valid divisors, but guard anyway.
     if m.shift >= 64 {
@@ -348,6 +401,16 @@ pub fn band_holds(d: u64, m: MagicU, width: MagicWidth) -> bool {
     }
     let w_plus_s = w + m.shift;
     if w_plus_s >= 128 {
+        return false;
+    }
+    // The dividend range must hold a whole residue class (`d <= 2^n - 1`,
+    // which every caller's divisor satisfies at `n == W`), and `M` must be a
+    // `w`-bit multiplier (`magicu` always reduces it into `[0, 2^W)`).
+    let ones_n: u128 = (1u128 << n) - 1;
+    if d <= 1 || u128::from(d) > ones_n {
+        return false;
+    }
+    if w < 64 && m.magic >= (1u64 << w) {
         return false;
     }
 
@@ -386,10 +449,81 @@ pub fn band_holds(d: u64, m: MagicU, width: MagicWidth) -> bool {
     // necessary AND sufficient — exhaustively cross-checked against brute-force
     // `eval == x/d` and against ±-perturbed magics (zero false-accepts, zero
     // false-rejects) for W = 8..16.
-    let ones: u128 = (1u128 << w) - 1;
-    let nc = (ones - (ones - d as u128 + 1) % d as u128) as u64;
+    let nc = (ones_n - (ones_n - d as u128 + 1) % d as u128) as u64;
     let nc = U256::from_u64(nc);
     prod.wrapping_mul(nc) < lo.wrapping_mul(nc).wrapping_add(lo)
+}
+
+/// A pre-shifted unsigned magic for an EVEN divisor `d = 2^z * k` (`k` odd,
+/// `k > 1`): `x / d == (x >> z) / k`, and the pre-shifted dividend is below
+/// `2^(W-z)`, so `k`'s magic over that reduced range ([`magicu_bits`] with
+/// `n = W - z`) fits in `W` bits where `d`'s full-range magic needs the
+/// add-back form. The emitted sequence is `MULHI(x >> z, M) >> s`: three
+/// instructions against the add-back form's four (`MULHI; SUB; ADD ...,
+/// LSR #1; LSR`), with a shorter dependent chain. LLVM forms the same
+/// sequence under the same condition (an even divisor whose magic needs the
+/// add-back form).
+///
+/// `x / (2^z * k) == (x >> z) / k` for every unsigned `x`: with
+/// `x = 2^z * a + b` (`0 <= b < 2^z`) and `a = q*k + c` (`0 <= c < k`),
+/// `x = q * (2^z * k) + (2^z * c + b)` and
+/// `0 <= 2^z * c + b <= 2^z * (k - 1) + 2^z - 1 = d - 1`.
+/// `tests::preshift_exhaustive_small_widths` checks the whole sequence
+/// against `x / d` for every even divisor and every dividend at small widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MagicUPreShift {
+    /// `z`: the dividend's right shift before the multiply (`trailing_zeros(d)`).
+    pub pre_shift: u32,
+    /// The no-add-back magic of the odd part `d >> z` over `[0, 2^(W-z))`.
+    pub magic: MagicU,
+}
+
+/// The pre-shifted candidate for `d` at `width`, or `None` when `d` is odd,
+/// `<= 1`, a power of two (the exact shift path), wider than `width`, or when
+/// its odd part's reduced-range magic still needs the add-back form. A
+/// candidate only: the caller uses it after [`preshift_band_holds`].
+pub fn magicu_preshift(d: u64, width: MagicWidth) -> Option<MagicUPreShift> {
+    magicu_preshift_bits(d, width.bits())
+}
+
+fn magicu_preshift_bits(d: u64, w: u32) -> Option<MagicUPreShift> {
+    if !(2..=64).contains(&w) || d <= 1 || !d.is_multiple_of(2) || d.is_power_of_two() {
+        return None;
+    }
+    if w < 64 && d >= (1u64 << w) {
+        return None;
+    }
+    let pre_shift = d.trailing_zeros();
+    let magic = magicu_bits(d >> pre_shift, w, w - pre_shift)?;
+    if magic.add {
+        return None;
+    }
+    Some(MagicUPreShift { pre_shift, magic })
+}
+
+/// **The pre-shift band check**: `true` iff `p` is the pre-shift of `d`
+/// (`p.pre_shift == trailing_zeros(d)`, an odd part `> 1`), `p.magic` is a
+/// no-add-back multiplier, and the band holds for the odd part over
+/// `[0, 2^(W - pre_shift))` ([`band_holds_bits`]). With the shift identity
+/// on [`MagicUPreShift`], a `true` here makes `MULHI(x >> z, M) >> s` equal
+/// `floor(x / d)` for every `x` in `[0, 2^W)` by the same cited lemma.
+pub fn preshift_band_holds(d: u64, p: MagicUPreShift, width: MagicWidth) -> bool {
+    preshift_band_holds_bits(d, p, width.bits())
+}
+
+fn preshift_band_holds_bits(d: u64, p: MagicUPreShift, w: u32) -> bool {
+    if !(2..=64).contains(&w) || d <= 1 || p.magic.add {
+        return false;
+    }
+    if w < 64 && d >= (1u64 << w) {
+        return false;
+    }
+    let z = d.trailing_zeros();
+    let odd = d >> z;
+    if z == 0 || odd <= 1 || p.pre_shift != z || z >= w {
+        return false;
+    }
+    band_holds_bits(odd, p.magic, w, w - z)
 }
 
 /// SIGNED magic-number division parameters (Hacker's Delight §10-3): a signed
@@ -1347,5 +1481,340 @@ mod tests {
                 assert_eq!(got, want, "mersenne rem64 MISCOMPILE x={x} c={c} q={q}");
             }
         }
+    }
+
+    // ==================================================================
+    // Pre-shifted even divisors (`magicu_preshift`) and the reduced-range
+    // band (`band_holds_bits` with `n < W`).
+    // ------------------------------------------------------------------
+
+    /// High `w` bits of the `2w`-bit product of two `w`-bit values.
+    fn mulhi_bits(a: u64, b: u64, w: u32) -> u64 {
+        ((u128::from(a) * u128::from(b)) >> w) as u64
+    }
+
+    /// The quotient the candidate `m` denotes over `w`-bit dividends:
+    /// `floor(x * M' / 2^(w+s))`, `M' = M (+ 2^w when add)`. For `s >= 1` the
+    /// add-back sequence computes exactly this (module doc).
+    fn magic_quotient_bits(x: u64, m: MagicU, w: u32) -> u64 {
+        let mult = u128::from(m.magic) + if m.add { 1u128 << w } else { 0 };
+        ((u128::from(x) * mult) >> (w + m.shift)) as u64
+    }
+
+    /// The emitted pre-shift sequence at width `w`: `MULHI(x >> z, M) >> s`.
+    fn eval_preshift_bits(x: u64, p: MagicUPreShift, w: u32) -> u64 {
+        mulhi_bits(x >> p.pre_shift, p.magic.magic, w) >> p.magic.shift
+    }
+
+    /// The reduced-range band is EXACT at `w = 8`: for every dividend bound
+    /// `n` in `1..=8`, every divisor `2 <= d <= 2^n - 1`, every multiplier in
+    /// `[0, 2^8)`, every shift in `0..8` and both forms, `band_holds_bits`
+    /// admits the candidate iff its quotient is `x / d` for every
+    /// `x < 2^n`. No false accept (soundness) and no false reject.
+    #[test]
+    fn reduced_range_band_is_exact_iff_correct_w8() {
+        let w = 8u32;
+        let mut admitted = 0usize;
+        for n in 1..=w {
+            for d in 2..(1u64 << n) {
+                for shift in 0..w {
+                    for add in [false, true] {
+                        for magic in 0..(1u64 << w) {
+                            let m = MagicU { magic, shift, add };
+                            let correct =
+                                (0..(1u64 << n)).all(|x| magic_quotient_bits(x, m, w) == x / d);
+                            let band = band_holds_bits(d, m, w, n);
+                            assert_eq!(
+                                band, correct,
+                                "reduced-range band disagrees with brute force: \
+                                 w={w} n={n} d={d} m={m:?}"
+                            );
+                            admitted += usize::from(band);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            admitted > 1000,
+            "expected many admitted candidates, got {admitted}"
+        );
+    }
+
+    /// `magicu_bits` with a reduced dividend range always yields a
+    /// band-holding candidate at `w = 8` (every `n`, every divisor), so the
+    /// pre-shift path only declines where the add-back form is still needed.
+    #[test]
+    fn reduced_range_magicu_candidates_hold_their_band_w8() {
+        let w = 8u32;
+        for n in 1..=w {
+            for d in 2..(1u64 << n) {
+                let m = magicu_bits(d, w, n)
+                    .unwrap_or_else(|| panic!("no reduced-range magic w={w} n={n} d={d}"));
+                assert!(
+                    band_holds_bits(d, m, w, n),
+                    "band w={w} n={n} d={d} m={m:?}"
+                );
+                for x in 0..(1u64 << n) {
+                    assert_eq!(
+                        magic_quotient_bits(x, m, w),
+                        x / d,
+                        "w={w} n={n} d={d} x={x}"
+                    );
+                }
+            }
+            // A divisor with no whole residue class in the range is refused.
+            assert_eq!(magicu_bits(1u64 << n, w, n), None, "w={w} n={n}");
+        }
+    }
+
+    /// Every even, non-power-of-two divisor whose full-range magic needs the
+    /// add-back form gets a pre-shift, and `MULHI(x >> z, M) >> s == x / d`
+    /// for EVERY dividend, at `w` in {4, 6, 8, 10, 12}. Divisors whose
+    /// full-range magic fits keep it (the isel never asks for a pre-shift).
+    #[test]
+    fn preshift_exhaustive_small_widths() {
+        let mut fired = 0usize;
+        for w in [4u32, 6, 8, 10, 12] {
+            for d in (2..(1u64 << w)).step_by(2) {
+                if d.is_power_of_two() {
+                    assert_eq!(magicu_preshift_bits(d, w), None, "power of two w={w} d={d}");
+                    continue;
+                }
+                let full = magicu_bits(d, w, w).unwrap();
+                assert!(band_holds_bits(d, full, w, w), "full band w={w} d={d}");
+                if !full.add {
+                    continue;
+                }
+                let p = magicu_preshift_bits(d, w).unwrap_or_else(|| {
+                    panic!("even add-back divisor without pre-shift w={w} d={d}")
+                });
+                assert_eq!(p.pre_shift, d.trailing_zeros());
+                assert!(!p.magic.add);
+                assert!(
+                    preshift_band_holds_bits(d, p, w),
+                    "pre-shift band w={w} d={d} p={p:?}"
+                );
+                for x in 0..(1u64 << w) {
+                    assert_eq!(
+                        eval_preshift_bits(x, p, w),
+                        x / d,
+                        "w={w} d={d} x={x} p={p:?}"
+                    );
+                }
+                fired += 1;
+            }
+            // Odd divisors never take the pre-shift.
+            for d in (3..(1u64 << w)).step_by(2) {
+                assert_eq!(magicu_preshift_bits(d, w), None, "odd w={w} d={d}");
+            }
+        }
+        assert!(
+            fired > 500,
+            "expected the pre-shift to fire widely, got {fired}"
+        );
+    }
+
+    /// Negative controls for `preshift_band_holds`: a wrong pre-shift, an
+    /// add-back multiplier, an odd or power-of-two divisor, and a multiplier
+    /// or shift moved by one are refused, unless the moved candidate is still
+    /// exact over every dividend (then admitting it is correct). Exhaustive
+    /// at `w = 8` and `w = 10`.
+    #[test]
+    fn preshift_band_rejects_wrong_candidates() {
+        let mut rejected = 0usize;
+        for w in [8u32, 10] {
+            for d in (2..(1u64 << w)).step_by(2) {
+                let Some(good) = magicu_preshift_bits(d, w) else {
+                    continue;
+                };
+                let exact = |p: MagicUPreShift| {
+                    (0..(1u64 << w)).all(|x| eval_preshift_bits(x, p, w) == x / d)
+                };
+                for z in [good.pre_shift - 1, good.pre_shift + 1] {
+                    let bad = MagicUPreShift {
+                        pre_shift: z,
+                        ..good
+                    };
+                    assert!(
+                        !preshift_band_holds_bits(d, bad, w),
+                        "pre_shift {z} w={w} d={d}"
+                    );
+                }
+                let added = MagicUPreShift {
+                    magic: MagicU {
+                        add: true,
+                        ..good.magic
+                    },
+                    ..good
+                };
+                assert!(!preshift_band_holds_bits(d, added, w), "add w={w} d={d}");
+                assert!(!preshift_band_holds_bits(d + 1, good, w), "odd w={w} d={d}");
+                let moved = [
+                    MagicU {
+                        magic: good.magic.magic.wrapping_add(1),
+                        ..good.magic
+                    },
+                    MagicU {
+                        magic: good.magic.magic.wrapping_sub(1),
+                        ..good.magic
+                    },
+                    MagicU {
+                        shift: good.magic.shift + 1,
+                        ..good.magic
+                    },
+                ];
+                for m in moved {
+                    let bad = MagicUPreShift { magic: m, ..good };
+                    if preshift_band_holds_bits(d, bad, w) {
+                        assert!(
+                            exact(bad),
+                            "BAND BUG: admitted a wrong pre-shift w={w} d={d} {bad:?}"
+                        );
+                    } else {
+                        assert!(
+                            !exact(bad) || m.magic >= (1u64 << w),
+                            "false reject w={w} d={d} {bad:?}"
+                        );
+                        rejected += 1;
+                    }
+                }
+            }
+            for k in 1..w {
+                let d = 1u64 << k;
+                let p = MagicUPreShift {
+                    pre_shift: k,
+                    magic: MagicU {
+                        magic: 1,
+                        shift: 0,
+                        add: false,
+                    },
+                };
+                assert!(
+                    !preshift_band_holds_bits(d, p, w),
+                    "power of two w={w} d={d}"
+                );
+            }
+        }
+        assert!(
+            rejected > 500,
+            "expected many rejected perturbations, got {rejected}"
+        );
+    }
+
+    /// The pre-shifted constants LLVM's AArch64 backend emits (clang 22 `-O3`,
+    /// `x / d` and `(x % 126) as i32`): `lsr #z; umulh` (W64) or
+    /// `lsr #z; umull; lsr #(32+s)` (W32). Divisors whose full-range W32
+    /// magic fits (100, 1000) are not pre-shifted by LLVM either.
+    #[test]
+    fn preshift_constants_match_llvm_aarch64() {
+        let cases = [
+            (
+                126u64,
+                MagicWidth::W64,
+                1u32,
+                0x8208_2082_0820_8209u64,
+                5u32,
+            ),
+            (100, MagicWidth::W64, 2, 0x28F5_C28F_5C28_F5C3, 2),
+            (14, MagicWidth::W64, 1, 0x4924_9249_2492_4925, 1),
+            (28, MagicWidth::W64, 2, 0x4924_9249_2492_4925, 1),
+            (1000, MagicWidth::W64, 3, 0x20C4_9BA5_E353_F7CF, 4),
+            (14, MagicWidth::W32, 1, 0x9249_2493, 2),
+            (126, MagicWidth::W32, 1, 0x8208_2083, 5),
+            (28, MagicWidth::W32, 2, 0x2492_4925, 0),
+        ];
+        for (d, w, z, em, es) in cases {
+            let full = magicu(d, w).unwrap();
+            assert!(
+                full.add,
+                "d={d} w={w:?}: LLVM pre-shifts only an add-back divisor"
+            );
+            let p = magicu_preshift(d, w).unwrap_or_else(|| panic!("no pre-shift d={d} w={w:?}"));
+            assert_eq!(
+                p,
+                MagicUPreShift {
+                    pre_shift: z,
+                    magic: MagicU {
+                        magic: em,
+                        shift: es,
+                        add: false
+                    }
+                },
+                "d={d} w={w:?}"
+            );
+            assert!(preshift_band_holds(d, p, w), "d={d} w={w:?}");
+        }
+        for d in [100u64, 1000] {
+            assert!(!magicu(d, MagicWidth::W32).unwrap().add, "d={d}");
+        }
+    }
+
+    /// The W64 and W32 pre-shift sequences against `x / d` and `x % d` over
+    /// the wide sample for every even add-back divisor up to 4096 and a
+    /// spread of large ones (W64), and over the i32 probe set (W32, the
+    /// `LSR; UMULL; LSR #(32+s)` sequence and its `MSUB` remainder).
+    #[test]
+    fn preshift_wide_sample_matches_hardware_division() {
+        let mut divisors: Vec<u64> = (2..=4096u64).step_by(2).collect();
+        divisors.extend([
+            126 << 20,
+            3 << 40,
+            0x7FFF_FFFF_FFFF_FFFE,
+            0xFFFF_FFFF_FFFF_FFFE,
+            6_000_000_000_000_000_000,
+            0xFFFF_FFFE,
+            1_000_000_006,
+        ]);
+        let mut fired64 = 0usize;
+        for &d in &divisors {
+            // The isel asks for a pre-shift only when the full-range magic
+            // needs the add-back form.
+            if d.is_power_of_two() || !magicu(d, MagicWidth::W64).unwrap().add {
+                continue;
+            }
+            let p = magicu_preshift(d, MagicWidth::W64)
+                .unwrap_or_else(|| panic!("even add-back divisor without pre-shift d={d}"));
+            assert!(preshift_band_holds(d, p, MagicWidth::W64), "d={d}");
+            fired64 += 1;
+            for x in wide_sample(d, MagicWidth::W64) {
+                let q = mulhi_bits(x >> p.pre_shift, p.magic.magic, 64) >> p.magic.shift;
+                assert_eq!(q, x / d, "W64 pre-shift udiv d={d} x={x} p={p:?}");
+                assert_eq!(
+                    x.wrapping_sub(q.wrapping_mul(d)),
+                    x % d,
+                    "W64 urem d={d} x={x}"
+                );
+            }
+        }
+        assert!(fired64 > 300, "W64 pre-shift fired on {fired64} divisors");
+
+        let xs: Vec<u32> = i32_probe_inputs().into_iter().map(|x| x as u32).collect();
+        let mut fired32 = 0usize;
+        let w32_divisors = divisors
+            .iter()
+            .copied()
+            .filter(|&d| d <= u64::from(u32::MAX) && !d.is_power_of_two())
+            .filter(|&d| magicu(d, MagicWidth::W32).unwrap().add);
+        for d in w32_divisors.take(48) {
+            let p = magicu_preshift(d, MagicWidth::W32)
+                .unwrap_or_else(|| panic!("even add-back divisor without pre-shift d={d}"));
+            assert!(preshift_band_holds(d, p, MagicWidth::W32), "d={d}");
+            fired32 += 1;
+            let d32 = d as u32;
+            let m = p.magic.magic as u32;
+            for &x in &xs {
+                // LSR Wt, Wx, #z; UMULL Xp, Wt, Wm; LSR Xq, Xp, #(32+s)
+                let q =
+                    ((u64::from(x >> p.pre_shift) * u64::from(m)) >> (32 + p.magic.shift)) as u32;
+                assert_eq!(q, x / d32, "W32 pre-shift udiv d={d} x={x} p={p:?}");
+                assert_eq!(
+                    x.wrapping_sub(q.wrapping_mul(d32)),
+                    x % d32,
+                    "W32 urem d={d} x={x}"
+                );
+            }
+        }
+        assert!(fired32 > 8, "W32 pre-shift fired on {fired32} divisors");
     }
 }

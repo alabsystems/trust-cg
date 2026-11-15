@@ -16,9 +16,72 @@
 
 use trust_cg_verify::VerificationStrength;
 use trust_cg_verify::proof_database::{ProofCategory, ProofDatabase};
+use trust_cg_verify::regalloc_proofs::{
+    proof_greedy_fixed_register_respect, proof_greedy_no_interference,
+    proof_greedy_stack_offset_correctness,
+};
+use trust_cg_verify::source_bound_frame::FRAME_OBLIGATION_NAME;
 use trust_cg_verify::verification_runner::{
     AYVerificationMode, VerificationRunReport, VerificationRunner, select_auto_mode,
 };
+use trust_cg_verify::verify::VerificationResult;
+
+/// The registry rows concrete evaluation cannot decide, each with the reason
+/// it must give. The set is exact: a row that leaves it (evaluation decides
+/// it) or joins it fails the lanes below.
+///
+/// * The source-bound AArch64 leaf-frame theorem quantifies over an ARBITRARY
+///   initial memory, the zero-argument uninterpreted array `entry_memory`. The
+///   evaluator samples bitvector inputs only, and declining an uninterpreted
+///   function is its pinned contract (`lowering_proof`'s
+///   `evaluator_declines_the_registry_frame_theorem_naming_its_uninterpreted_memory`):
+///   a constant-default memory would prove the theorem for one memory, not
+///   all. The row's proof belongs to the strict AY gate, whose
+///   `source_bound_leaf_frame_corpus_addition_is_exact_live_and_nondegenerate`
+///   keeps it in that corpus with no solver-capacity debt (NEW-CG-FULLDB).
+///
+/// The fifteen relational-precondition rows that were the vacuous-sample
+/// `Unknown` here (TRUSTCG-02) are not in this set: the multi-input sweep's
+/// precondition-directed trials reach them, so they are `Valid` like any
+/// other sampled row (NEW-CG-SAMPLER).
+fn expected_unknowns() -> Vec<(&'static str, &'static str)> {
+    vec![(
+        FRAME_OBLIGATION_NAME,
+        "cannot concretely evaluate uninterpreted function 'entry_memory'",
+    )]
+}
+
+/// The report's `Unknown` rows must be exactly the [`expected_unknowns`]
+/// present in the run, each with its reason. Returns how many there are.
+fn assert_unknowns_are_exactly_the_expected(report: &VerificationRunReport) -> usize {
+    let expected = expected_unknowns();
+    let mut seen = 0;
+    for r in &report.results {
+        let reason_for = expected
+            .iter()
+            .find(|(name, _)| *name == r.name)
+            .map(|(_, reason)| *reason);
+        match (&r.result, reason_for) {
+            (VerificationResult::Unknown { reason }, Some(required)) => assert!(
+                reason.contains(required),
+                "'{}' must be Unknown because {required:?}, got: {reason}",
+                r.name
+            ),
+            (VerificationResult::Unknown { reason }, None) => panic!(
+                "STRICT: '{}' was UNKNOWN (could not be decided): {reason}",
+                r.name
+            ),
+            (other, Some(_)) => panic!(
+                "'{}' is in the audited evaluation-Unknown set but returned {other:?}; if \
+                 evaluation now decides it, remove it from the set",
+                r.name
+            ),
+            (_, None) => continue,
+        }
+        seen += 1;
+    }
+    seen
+}
 
 /// Number of GENUINELY-provable (structurally non-degenerate, `trust_ir_expr !=
 /// aarch64_expr`) obligations in `cat`. Under the STRICT proven-honesty rule
@@ -78,20 +141,42 @@ fn assert_report_matches_database(report: &VerificationRunReport, db: &ProofData
         // Valid trivially but proves nothing, so it is excluded from `passed`
         // (and is NOT a failure/unknown). The honest invariant: every
         // non-degenerate obligation passes, NONE fails, NONE is unknown.
-        let expected_genuine = genuine_count_in_category(db, *cat);
+        //
+        // The audited evaluation-Unknown rows (`expected_unknowns`) are the
+        // one exception: evaluation cannot decide them, so they are neither
+        // passed nor failed but Unknown.
+        let unknown_names: Vec<&str> = expected_unknowns().iter().map(|(n, _)| *n).collect();
+        let in_cat = db.by_category(*cat);
+        let unknown_in_cat: Vec<_> = in_cat
+            .iter()
+            .filter(|p| unknown_names.contains(&p.obligation.name.as_str()))
+            .collect();
+        let genuine = genuine_count_in_category(db, *cat);
+        let expected_genuine = genuine
+            - unknown_in_cat
+                .iter()
+                .filter(|p| p.obligation.is_genuinely_proven())
+                .count();
         assert_eq!(
             bd.passed,
             expected_genuine,
-            "Category {:?}: expected all {} GENUINE (non-degenerate) proofs to pass, got {} \
-             passed (total {} incl. {} degenerate X==X that prove nothing)",
+            "Category {:?}: expected all {} GENUINE (non-degenerate) proofs outside the \
+             audited evaluation-Unknown rows to pass, got {} passed (total {} incl. {} \
+             degenerate X==X that prove nothing and {} audited Unknown)",
             cat,
             expected_genuine,
             bd.passed,
             expected,
-            expected - expected_genuine
+            expected - genuine,
+            unknown_in_cat.len()
         );
         assert_eq!(bd.failed, 0, "Category {:?} had failed proofs", cat);
-        assert_eq!(bd.unknown, 0, "Category {:?} had unknown proofs", cat);
+        assert_eq!(
+            bd.unknown,
+            unknown_in_cat.len(),
+            "Category {:?}: the only unknown proofs may be its audited evaluation-Unknown rows",
+            cat
+        );
     }
 }
 
@@ -191,6 +276,8 @@ fn run_and_assert_all_pass(db: &ProofDatabase, summary_title: &str, report_title
     //       genuinely_passed() == (total - degenerate_debt_count()), with the
     //       degenerate count accounted SEPARATELY (never as a pass).
     // This makes the drop VISIBLE (genuinely_passed < total) rather than hiding it.
+    // The single exception to (a) is the audited evaluation-Unknown set
+    // (`expected_unknowns`): exactly those rows, each for its stated reason.
     assert_eq!(
         report.failed(),
         0,
@@ -198,23 +285,18 @@ fn run_and_assert_all_pass(db: &ProofDatabase, summary_title: &str, report_title
         report.failed(),
         report
     );
-    assert_eq!(
-        report.unknown(),
-        0,
-        "STRICT: {} obligation(s) were UNKNOWN (could not be decided):\n{}",
-        report.unknown(),
-        report
-    );
+    let unknown = assert_unknowns_are_exactly_the_expected(&report);
     let degenerate = report.degenerate_debt_count();
     assert_eq!(
         report.genuinely_passed(),
-        report.total() - degenerate,
+        report.total() - degenerate - unknown,
         "STRICT: every NON-degenerate obligation must pass. genuinely_passed={} but \
-         total - degenerate_debt = {} - {} = {}:\n{}",
+         total - degenerate_debt - audited_unknown = {} - {} - {} = {}:\n{}",
         report.genuinely_passed(),
         report.total(),
         degenerate,
-        report.total() - degenerate,
+        unknown,
+        report.total() - degenerate - unknown,
         report
     );
 
@@ -246,7 +328,7 @@ fn full_proof_suite_all_pass() {
 }
 
 // Explicit slow lane for full-database verification:
-// cargo test -p trust-cg-verify --features slow-full-database \
+// scripts/trust_cargo.sh test -p trust-cg-verify --features slow-full-database \
 //   --test full_proof_suite full_proof_suite_all_pass_full_database -- --nocapture
 #[cfg(feature = "slow-full-database")]
 #[test]
@@ -446,7 +528,7 @@ fn full_proof_suite_parallel_matches_sequential() {
 }
 
 // Explicit slow lane for full-database sequential-vs-parallel parity:
-// cargo test -p trust-cg-verify --features slow-full-database \
+// scripts/trust_cargo.sh test -p trust-cg-verify --features slow-full-database \
 //   --test full_proof_suite full_proof_suite_parallel_matches_sequential_full_database
 #[cfg(feature = "slow-full-database")]
 #[test]
@@ -473,8 +555,9 @@ fn full_proof_suite_parallel_matches_sequential_full_database() {
     );
     // STRICT (task #61): the full database keeps degenerate X==X obligations
     // (documented model-consistency / debt) that prove nothing, so all_passed()
-    // is honestly false. The full-DB parity invariant: ZERO disproved/unknown in
-    // both runs, identical genuine + degenerate accounting across seq/parallel.
+    // is honestly false. The full-DB parity invariant: ZERO disproved in both
+    // runs, no unknown but the audited evaluation-Unknown rows, identical
+    // genuine + degenerate accounting across seq/parallel.
     assert_eq!(
         sequential.failed(),
         0,
@@ -488,16 +571,14 @@ fn full_proof_suite_parallel_matches_sequential_full_database() {
         parallel
     );
     assert_eq!(
-        sequential.unknown(),
-        0,
-        "Sequential full-DB had unknowns:\n{}",
-        sequential
+        assert_unknowns_are_exactly_the_expected(&sequential),
+        expected_unknowns().len(),
+        "Sequential full-DB: every audited evaluation-Unknown row must be registered and Unknown"
     );
     assert_eq!(
-        parallel.unknown(),
-        0,
-        "Parallel full-DB had unknowns:\n{}",
-        parallel
+        assert_unknowns_are_exactly_the_expected(&parallel),
+        expected_unknowns().len(),
+        "Parallel full-DB: every audited evaluation-Unknown row must be registered and Unknown"
     );
     assert_eq!(
         sequential.genuinely_passed(),
@@ -555,10 +636,62 @@ fn full_proof_suite_known_category_counts() {
     let fp = db.count_by_category(ProofCategory::FloatingPoint);
     assert!(fp >= 38, "FloatingPoint: expected >= 38, got {}", fp);
 
-    // Comparison: 10 conditions x 2 widths = 20. The UGE/HS pair #62 retracted
-    // as degenerate is genuine again now that nzcv.rs derives the C flag from the
-    // adder carry-out instead of spelling it `bvuge`.
-    assert_eq!(db.count_by_category(ProofCategory::Comparison), 20);
+    // Comparison (exact, per family): 502 = 20 + 40 + 414 + 28. Each family is
+    // pinned on its own and together they must account for every row, so one
+    // family's growth cannot mask another's loss inside a single total.
+    // * 20 `Icmp_<cc>_I{32,64} -> CMP+CSET_<cc>`: 10 conditions x 2 widths. The
+    //   UGE/HS pair #62 retracted as degenerate is genuine again now that nzcv.rs
+    //   derives the C flag from the adder carry-out instead of spelling it `bvuge`.
+    // * 40 `Select_* -> CMP+CSEL_*` (aarch64_select_proofs): 10 conditions x
+    //   cmp{32,64} x sel{32,64}; the comparison and select widths are independent.
+    // * 414 per-instruction NZCV producer/consumer obligations of
+    //   aarch64_flag_consumer_proofs (e152b164d, pinned in cea76ae56):
+    //   - 2 FCMP packed NZCV (f32, f64);
+    //   - 28 FCMP -> CSET (14 conditions x f32/f64);
+    //   - 384 CSEL/CSINC/CSNEG x W/X destination x reaching producer: CMP
+    //     w32/w64 (10 conditions each), TST w32/w64 (8), FCMP f32/f64 (14),
+    //     i.e. 3 x 2 x 64.
+    // * 28 `A64 decoded CSET` (aarch64_value_decode_proofs): 14 condition codes x
+    //   2 destination widths; AL/NV are absent because the alias cannot carry them.
+    let comparison_rows = db.by_category(ProofCategory::Comparison);
+    let comparison_family = |prefix: &str| {
+        comparison_rows
+            .iter()
+            .filter(|p| p.obligation.name.starts_with(prefix))
+            .count()
+    };
+    let icmp = comparison_family("Icmp_");
+    assert_eq!(
+        icmp, 20,
+        "Comparison: expected exactly 20 Icmp CMP+CSET, got {icmp}"
+    );
+    let select = comparison_family("Select_");
+    assert_eq!(
+        select, 40,
+        "Comparison: expected exactly 40 Select CMP+CSEL, got {select}"
+    );
+    let nzcv = comparison_family("A64 NZCV ");
+    assert_eq!(
+        nzcv, 414,
+        "Comparison: expected exactly 414 NZCV flag-consumer, got {nzcv}"
+    );
+    let decoded_cset = comparison_family("A64 decoded CSET ");
+    assert_eq!(
+        decoded_cset, 28,
+        "Comparison: expected exactly 28 decoded-word CSET, got {decoded_cset}"
+    );
+    let comparison = comparison_rows.len();
+    assert_eq!(
+        comparison,
+        icmp + select + nzcv + decoded_cset,
+        "Comparison: an unclassified proof entered the category ({comparison} rows, \
+         {icmp} Icmp + {select} Select + {nzcv} NZCV + {decoded_cset} decoded CSET)"
+    );
+    assert_eq!(
+        comparison, 502,
+        "Comparison: expected exactly 502 (20 Icmp + 40 Select + 414 NZCV + 28 decoded CSET), \
+         got {comparison}"
+    );
 
     // Branch: 10 conditions x 2 widths = 20 (same UGE/B.HS return as above).
     assert_eq!(db.count_by_category(ProofCategory::Branch), 20);
@@ -670,7 +803,10 @@ fn full_proof_suite_regalloc_proofs_comprehensive() {
         results.len()
     );
 
-    // Verify all pass.
+    // Verify all pass, the three Greedy RA proofs whose paired equalities or
+    // paired 8-alignment only the multi-input sweep's precondition-directed
+    // trials reach included (NEW-CG-SAMPLER; they were the vacuous-sample
+    // Unknown under TRUSTCG-02).
     for (name, result) in &results {
         assert!(
             matches!(result, trust_cg_verify::VerificationResult::Valid),
@@ -679,9 +815,19 @@ fn full_proof_suite_regalloc_proofs_comprehensive() {
             result
         );
     }
+    let names: Vec<&str> = results.iter().map(|(n, _)| n.as_str()).collect();
+    for relational in [
+        proof_greedy_no_interference().name,
+        proof_greedy_fixed_register_respect().name,
+        proof_greedy_stack_offset_correctness().name,
+    ] {
+        assert!(
+            names.contains(&relational.as_str()),
+            "Greedy RA proof '{relational}' must be in the RegAlloc category"
+        );
+    }
 
     // Check that specific proof names exist.
-    let names: Vec<&str> = results.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
         names.iter().any(|n| n.contains("non-interference")),
         "Missing non-interference proof"

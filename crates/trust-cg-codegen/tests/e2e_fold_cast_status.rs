@@ -90,6 +90,23 @@ use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 
 // ── shared harness ──────────────────────────────────────────────────────────
 
+/// Parse one embedded MIR-emitted module and fold its duplicate declarations.
+///
+/// The 2026-07 frontend closure emitter wrote ONE bodyless declaration of
+/// `u32::checked_mul` per call site — three functions with one link-time
+/// symbol and one signature. trust-ir refuses that (`DuplicateFunctionSymbol`:
+/// `Function.name` is the link-time symbol), and since WS7.3 every trust-cg
+/// ingestion entry refuses what the validator refuses. The module-batching
+/// merge folds declarations by symbol (every call through any copy reaches
+/// the one entry), which is exactly the module a conforming producer emits;
+/// the embedded text stays the byte-identical frontend artifact.
+fn parse_emitted(text: &str, what: &str) -> trust_ir::Module {
+    let module = trust_ir::parser::parse_module(text)
+        .unwrap_or_else(|e| panic!("MIR-emitted `{what}` trust-ir text must parse: {e:?}"));
+    trust_cg_codegen::module_merge::merge_modules(std::slice::from_ref(&module))
+        .unwrap_or_else(|e| panic!("MIR-emitted `{what}`: folding duplicate declarations: {e}"))
+}
+
 /// Parse + JIT one embedded module with bound host externs; return the buffer
 /// (keep it alive while calling fn pointers bound from it).
 fn jit_module_with(
@@ -97,10 +114,10 @@ fn jit_module_with(
     what: &str,
     externs: &HashMap<String, *const u8>,
 ) -> trust_cg_codegen::jit::ExecutableBuffer {
-    let module = trust_ir::parser::parse_module(text)
-        .unwrap_or_else(|e| panic!("MIR-emitted `{what}` trust-ir text must parse: {e:?}"));
+    let module = parse_emitted(text, what);
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, externs)
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -3409,15 +3426,15 @@ fn fold_cast_desugared_full_sweep_native_eq_jit() {
 /// the native==JIT outcome, then panics demanding promotion.
 #[test]
 fn fold_cast_halves_full_sweep_native_eq_jit() {
-    let module = trust_ir::parser::parse_module(FOLD_CAST_HALVES_IR)
-        .expect("MIR-emitted `fold_cast_entry_halves` trust-ir must parse (frontend is fine)");
+    let module = parse_emitted(FOLD_CAST_HALVES_IR, "fold_cast_entry_halves");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let halves_externs = vec![(
         EXT_CHECKED_MUL_HALVES,
         shim_checked_mul_u32 as *const () as usize,
     )];
-    let result =
-        Compiler::new(config).compile_module_to_jit(&module, &externs_map(&halves_externs));
+    let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
+        .compile_module_to_jit(&module, &externs_map(&halves_externs));
     match result {
         Err(e) => panic!(
             "REGRESSION: trust-cg can no longer lower the fold_cast i128-from-halves entry \
@@ -3534,4 +3551,13 @@ fn fold_cast_verbatim_try_full_sweep_native_eq_jit() {
         find(1, 0, Some(7)),
         "negative control must FAIL: the inverted then_some oracle should disagree with the JIT"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

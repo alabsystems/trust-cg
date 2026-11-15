@@ -1,0 +1,187 @@
+{
+  "name": "chc_batch",
+  "functions": [
+    {
+      "id": 0,
+      "name": "ay_chc_batch_eval",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Ptr"
+            ],
+            [
+              1,
+              "U64"
+            ],
+            [
+              2,
+              "Ptr"
+            ],
+            [
+              3,
+              "U64"
+            ],
+            [
+              4,
+              "Ptr"
+            ],
+            [
+              5,
+              "U64"
+            ],
+            [
+              6,
+              "Ptr"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U32",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    7
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [
+        "Deterministic",
+        "Terminates",
+        "NoPanic",
+        "NoUndef",
+        "AppendOnlyBuffer",
+        {
+          "Custom": 1001
+        },
+        {
+          "Custom": 1002
+        },
+        {
+          "Custom": 1003
+        },
+        {
+          "Custom": 1004
+        },
+        {
+          "Custom": 1005
+        }
+      ],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Ptr",
+        "U64",
+        "Ptr",
+        "U64",
+        "Ptr",
+        "U64",
+        "Ptr"
+      ],
+      "returns": [
+        "U32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "Liveness",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [terminates] on `ay_chc_batch_eval`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 1,
+      "kind": "PanicFreedom",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [no_panic] on `ay_chc_batch_eval`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 2,
+      "kind": "MemorySafety",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [no_undef] on `ay_chc_batch_eval`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    }
+  ],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

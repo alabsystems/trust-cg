@@ -1303,10 +1303,7 @@ fn add_srcs_unchanged_between(
             clobbered = true;
         }
     });
-    if clobbered {
-        return false;
-    }
-    true
+    !clobbered
 }
 
 fn collect_private_movz_const_defs(
@@ -1461,12 +1458,6 @@ fn collect_madd_const_offset_defs(
 // clean rejects the whole candidate (fail-closed). A profitability cut skips
 // the pointer-chase idiom (rewritten load feeding a `base` redefinition),
 // where the fold is sound but breaks load/pointer coalescing.
-//
-// Kill switches:
-//   * `TCG_NO_ADDR_MODE_MULTIUSE_FOLD`       — disable this whole step;
-//   * `TCG_NO_ADDR_MODE_MULTIDEF_BASE`       — restrict to single-def bases;
-//   * `TCG_NO_ADDR_MODE_INTRABLOCK_MULTIUSE` — restore the cross-block-only
-//     benefit gate.
 // ---------------------------------------------------------------------------
 
 /// One occurrence of a virtual register as an operand of some instruction.
@@ -1601,30 +1592,24 @@ impl BaseCleanliness {
     }
 }
 
+/// The def counts, `AddRI` definitions and def positions per virtual register
+/// that `fold_multiuse_base_plus_imm` reads.
+type BaseImmMaps<'a> = (
+    &'a HashMap<VReg, u32>,
+    &'a HashMap<VReg, AddDef>,
+    &'a HashMap<VReg, Vec<(BlockId, usize)>>,
+);
+
 fn fold_multiuse_base_plus_imm(
     func: &mut MachFunction,
     provenance: Option<&mut ProvenanceMap>,
-    snapshot: Option<(
-        &HashMap<VReg, u32>,
-        &HashMap<VReg, AddDef>,
-        &HashMap<VReg, Vec<(BlockId, usize)>>,
-    )>,
+    snapshot: Option<BaseImmMaps<'_>>,
 ) -> bool {
-    if std::env::var_os("TCG_NO_ADDR_MODE_MULTIUSE_FOLD").is_some() {
-        return false;
-    }
-    let multidef_base_enabled = std::env::var_os("TCG_NO_ADDR_MODE_MULTIDEF_BASE").is_none();
-    let intrablock_enabled = std::env::var_os("TCG_NO_ADDR_MODE_INTRABLOCK_MULTIUSE").is_none();
-
     // The caller's Step 1-2 maps when Steps 3-4 changed nothing (the stream is
     // the one they analysed); otherwise a fresh analysis of the post-Step-4
     // instruction stream, exactly as before.
     let (fresh_counts, fresh_add_ri, fresh_positions);
-    let (def_counts, add_ri_defs, def_positions): (
-        &HashMap<VReg, u32>,
-        &HashMap<VReg, AddDef>,
-        &HashMap<VReg, Vec<(BlockId, usize)>>,
-    ) = match snapshot {
+    let (def_counts, add_ri_defs, def_positions): BaseImmMaps<'_> = match snapshot {
         Some(maps) => maps,
         None => {
             fresh_counts = count_vreg_defs(func);
@@ -1701,9 +1686,6 @@ fn fold_multiuse_base_plus_imm(
         // cleanliness dataflow instead — every rewritten use must be provably
         // reached with `base` unchanged since the most recent AddRI execution.
         let base_multi_def = def_counts.get(&base_vreg).copied().unwrap_or(0) > 1;
-        if base_multi_def && !multidef_base_enabled {
-            continue;
-        }
         let base_def = if base_multi_def {
             None
         } else {
@@ -1825,7 +1807,7 @@ fn fold_multiuse_base_plus_imm(
         if local_rewrites.is_empty() {
             continue;
         }
-        if !(cross_block_use || intrablock_enabled && local_rewrites.len() >= 2) {
+        if !(cross_block_use || local_rewrites.len() >= 2) {
             continue;
         }
 

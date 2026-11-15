@@ -1,0 +1,427 @@
+; TrustIr text format v1
+module "hfa_zero_sized"
+target "aarch64-unknown-linux-gnu" 8 little abi="aapcs64"
+
+struct @E {  } size=0 align=1 repr=c id=0
+
+struct @N { z: struct.0 @0 } size=0 align=1 repr=c id=1
+
+struct @DE { a: f64 @0, z: struct.0 @8, b: f64 @8, c: f64 @16, d: f64 @24 } size=32 align=8 repr=c id=2
+
+struct @DU { a: f64 @0, u: () @8, b: f64 @8, c: f64 @16, d: f64 @24 } size=32 align=8 repr=c id=3
+
+struct @DEL { z: struct.0 @0, a: f64 @0, b: f64 @8, c: f64 @16, d: f64 @24 } size=32 align=8 repr=c id=4
+
+struct @DEA { a: f64 @0, z: [ty.2 x 2] @8, b: f64 @8, c: f64 @16, d: f64 @24 } size=32 align=8 repr=c id=5
+
+struct @DN { a: f64 @0, n: struct.1 @8, b: f64 @8, c: f64 @16 } size=24 align=8 repr=c id=6
+
+struct @FE { a: f32 @0, z: struct.0 @4, b: f32 @4 } size=8 align=4 repr=c id=7
+
+struct @DA { a: f64 @0, z: [ty.0 x 0] @8, b: f64 @8, c: f64 @16, d: f64 @24 } size=32 align=8 repr=c id=8
+
+struct @FA0 { a: f32 @0, z: [ty.1 x 0] @4, b: f32 @4 } size=8 align=4 repr=c id=9
+
+struct @DA2 { a: f64 @0, z: [ty.0 x 0] @8, b: f64 @8 } size=16 align=8 repr=c id=10
+
+functy.0 = (struct.2) -> (i64)
+
+functy.1 = (ptr) -> (i64)
+
+functy.2 = (struct.2, ptr) -> (i64)
+
+functy.3 = (ptr) -> (struct.2)
+
+functy.4 = () -> (struct.2)
+
+functy.5 = (struct.3) -> (i64)
+
+functy.6 = (ptr) -> (i64)
+
+functy.7 = (struct.3, ptr) -> (i64)
+
+functy.8 = (ptr) -> (struct.3)
+
+functy.9 = () -> (struct.3)
+
+functy.10 = (struct.4) -> (i64)
+
+functy.11 = (ptr) -> (i64)
+
+functy.12 = (struct.4, ptr) -> (i64)
+
+functy.13 = (ptr) -> (struct.4)
+
+functy.14 = () -> (struct.4)
+
+functy.15 = (struct.5) -> (i64)
+
+functy.16 = (ptr) -> (i64)
+
+functy.17 = (struct.5, ptr) -> (i64)
+
+functy.18 = (ptr) -> (struct.5)
+
+functy.19 = () -> (struct.5)
+
+functy.20 = (struct.6) -> (i64)
+
+functy.21 = (ptr) -> (i64)
+
+functy.22 = (struct.6, ptr) -> (i64)
+
+functy.23 = (ptr) -> (struct.6)
+
+functy.24 = () -> (struct.6)
+
+functy.25 = (struct.7) -> (i64)
+
+functy.26 = (ptr) -> (i64)
+
+functy.27 = (struct.7, ptr) -> (i64)
+
+functy.28 = (ptr) -> (struct.7)
+
+functy.29 = () -> (struct.7)
+
+functy.30 = (struct.8) -> (i64)
+
+functy.31 = (ptr) -> (i64)
+
+functy.32 = (struct.8, ptr) -> (i64)
+
+functy.33 = (ptr) -> (struct.8)
+
+functy.34 = () -> (struct.8)
+
+functy.35 = (struct.9) -> (i64)
+
+functy.36 = (ptr) -> (i64)
+
+functy.37 = (struct.9, ptr) -> (i64)
+
+functy.38 = (ptr) -> (struct.9)
+
+functy.39 = () -> (struct.9)
+
+functy.40 = (struct.10) -> (i64)
+
+functy.41 = (ptr) -> (i64)
+
+functy.42 = (struct.10, ptr) -> (i64)
+
+functy.43 = (ptr) -> (struct.10)
+
+functy.44 = () -> (struct.10)
+
+type ty.0 = f64
+
+type ty.1 = f32
+
+type ty.2 = struct.0
+
+fn @c_take_de(functy.0) {
+}
+
+fn @c_make_de(functy.4) {
+}
+
+fn @c_take_du(functy.5) {
+}
+
+fn @c_make_du(functy.9) {
+}
+
+fn @c_take_del(functy.10) {
+}
+
+fn @c_make_del(functy.14) {
+}
+
+fn @c_take_dea(functy.15) {
+}
+
+fn @c_make_dea(functy.19) {
+}
+
+fn @c_take_dn(functy.20) {
+}
+
+fn @c_make_dn(functy.24) {
+}
+
+fn @c_take_fe(functy.25) {
+}
+
+fn @c_make_fe(functy.29) {
+}
+
+fn @c_take_da(functy.30) {
+}
+
+fn @c_make_da(functy.34) {
+}
+
+fn @c_take_fa0(functy.35) {
+}
+
+fn @c_make_fa0(functy.39) {
+}
+
+fn @c_take_da2(functy.40) {
+}
+
+fn @c_make_da2(functy.44) {
+}
+
+fn @cg_pass_de(functy.1) {
+bb0(%0: ptr):
+    %1 = load struct.2, ptr %0
+    %2 = call @func.0(%1)
+    ret %2
+}
+
+fn @cg_take_de(functy.2) {
+bb0(%0: struct.2, %1: ptr):
+    store struct.2 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_de(functy.3) {
+bb0(%0: ptr):
+    %1 = load struct.2, ptr %0
+    ret %1
+}
+
+fn @cg_cret_de(functy.1) {
+bb0(%0: ptr):
+    %1 = call @func.1()
+    store struct.2 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_du(functy.6) {
+bb0(%0: ptr):
+    %1 = load struct.3, ptr %0
+    %2 = call @func.2(%1)
+    ret %2
+}
+
+fn @cg_take_du(functy.7) {
+bb0(%0: struct.3, %1: ptr):
+    store struct.3 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_du(functy.8) {
+bb0(%0: ptr):
+    %1 = load struct.3, ptr %0
+    ret %1
+}
+
+fn @cg_cret_du(functy.6) {
+bb0(%0: ptr):
+    %1 = call @func.3()
+    store struct.3 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_del(functy.11) {
+bb0(%0: ptr):
+    %1 = load struct.4, ptr %0
+    %2 = call @func.4(%1)
+    ret %2
+}
+
+fn @cg_take_del(functy.12) {
+bb0(%0: struct.4, %1: ptr):
+    store struct.4 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_del(functy.13) {
+bb0(%0: ptr):
+    %1 = load struct.4, ptr %0
+    ret %1
+}
+
+fn @cg_cret_del(functy.11) {
+bb0(%0: ptr):
+    %1 = call @func.5()
+    store struct.4 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_dea(functy.16) {
+bb0(%0: ptr):
+    %1 = load struct.5, ptr %0
+    %2 = call @func.6(%1)
+    ret %2
+}
+
+fn @cg_take_dea(functy.17) {
+bb0(%0: struct.5, %1: ptr):
+    store struct.5 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_dea(functy.18) {
+bb0(%0: ptr):
+    %1 = load struct.5, ptr %0
+    ret %1
+}
+
+fn @cg_cret_dea(functy.16) {
+bb0(%0: ptr):
+    %1 = call @func.7()
+    store struct.5 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_dn(functy.21) {
+bb0(%0: ptr):
+    %1 = load struct.6, ptr %0
+    %2 = call @func.8(%1)
+    ret %2
+}
+
+fn @cg_take_dn(functy.22) {
+bb0(%0: struct.6, %1: ptr):
+    store struct.6 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_dn(functy.23) {
+bb0(%0: ptr):
+    %1 = load struct.6, ptr %0
+    ret %1
+}
+
+fn @cg_cret_dn(functy.21) {
+bb0(%0: ptr):
+    %1 = call @func.9()
+    store struct.6 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_fe(functy.26) {
+bb0(%0: ptr):
+    %1 = load struct.7, ptr %0
+    %2 = call @func.10(%1)
+    ret %2
+}
+
+fn @cg_take_fe(functy.27) {
+bb0(%0: struct.7, %1: ptr):
+    store struct.7 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_fe(functy.28) {
+bb0(%0: ptr):
+    %1 = load struct.7, ptr %0
+    ret %1
+}
+
+fn @cg_cret_fe(functy.26) {
+bb0(%0: ptr):
+    %1 = call @func.11()
+    store struct.7 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_da(functy.31) {
+bb0(%0: ptr):
+    %1 = load struct.8, ptr %0
+    %2 = call @func.12(%1)
+    ret %2
+}
+
+fn @cg_take_da(functy.32) {
+bb0(%0: struct.8, %1: ptr):
+    store struct.8 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_da(functy.33) {
+bb0(%0: ptr):
+    %1 = load struct.8, ptr %0
+    ret %1
+}
+
+fn @cg_cret_da(functy.31) {
+bb0(%0: ptr):
+    %1 = call @func.13()
+    store struct.8 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_fa0(functy.36) {
+bb0(%0: ptr):
+    %1 = load struct.9, ptr %0
+    %2 = call @func.14(%1)
+    ret %2
+}
+
+fn @cg_take_fa0(functy.37) {
+bb0(%0: struct.9, %1: ptr):
+    store struct.9 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_fa0(functy.38) {
+bb0(%0: ptr):
+    %1 = load struct.9, ptr %0
+    ret %1
+}
+
+fn @cg_cret_fa0(functy.36) {
+bb0(%0: ptr):
+    %1 = call @func.15()
+    store struct.9 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_pass_da2(functy.41) {
+bb0(%0: ptr):
+    %1 = load struct.10, ptr %0
+    %2 = call @func.16(%1)
+    ret %2
+}
+
+fn @cg_take_da2(functy.42) {
+bb0(%0: struct.10, %1: ptr):
+    store struct.10 %0, ptr %1
+    %2 = const i64 0
+    ret %2
+}
+
+fn @cg_ret_da2(functy.43) {
+bb0(%0: ptr):
+    %1 = load struct.10, ptr %0
+    ret %1
+}
+
+fn @cg_cret_da2(functy.41) {
+bb0(%0: ptr):
+    %1 = call @func.17()
+    store struct.10 %1, ptr %0
+    %2 = const i64 0
+    ret %2
+}

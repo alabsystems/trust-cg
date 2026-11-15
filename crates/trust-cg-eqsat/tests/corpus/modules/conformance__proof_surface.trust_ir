@@ -1,0 +1,48 @@
+; TrustIr text format v1
+module "proof_surface"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+
+functy.0 = (u64, &mut u64) -> (u64)
+
+functy.1 = (u64) -> (u64)
+
+import import.0 = "proof_surface_dep" digest "sha256" [68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68, 68] producer clean
+
+fn @bump(functy.0) {
+    ; #body-gate: ungated
+    ; #summary: unproved params ["x", "p"]
+    ; #requires: formula "smtlib2" "(bvult x #x8000000000000000)" smtlib "(bvult x #x8000000000000000)" sort "Bool" bind "x" bv(64) param(0)
+    ; #ensures: formula "smtlib2" "(and (= result sum) (= p_exit p_exit) heap (not unwinding))" smtlib "(and (= result sum) (= p_exit p_exit) heap (not unwinding))" sort "Bool" bind "result" bv(64) result(0) bind "p_exit" bv(64) mut_exit(1) bind "sum" bv(64) value(%2) bind "heap" bool world bind "unwinding" bool unwind
+    ; #decreases: formula "smtlib2" "x" smtlib "x" sort "(_ BitVec 64)" bind "x" bv(64) param(0)
+bb0(%0: u64, %1: &mut u64):
+    %2 = add u64 %0, %0
+    ret %2
+}
+
+fn @reciprocal(functy.1) {
+    ; #summary: proved params ["x"]
+    ; #ensures: formula "smtlib2" "(not (= result 0))" smtlib "(not (= result 0))" sort "Bool"
+    ; #backed-by: extern 0 "reciprocal" obligation 2
+}
+
+obligation 0 termination pending "bump terminates" function 0 formula "smtlib2" "(bvule x x)" smtlib "(bvule x x)" sort "Bool" bind "x" bv(64) param(0)
+
+obligation 1 ownership pending "bump's &mut is exclusive" function 0 formula "smtlib2" "(bvule x x)" smtlib "(bvule x x)" sort "Bool" bind "x" bv(64) param(0)
+
+obligation 2 custom("trust.contract", "unlowered \"old(x)\" clause") pending "a source clause the compiler could not lower" function 0 formula "smtlib2" "(bvule x x)" smtlib "(bvule x x)" sort "Bool" bind "x" bv(64) param(0)
+
+obligation 3 postcondition trusted "an audited postcondition" function 0 formula "smtlib2" "(= 1 1)" smtlib "(= 1 1)" sort "Bool"
+
+obligation 4 postcondition trusted "an audited postcondition" function 0 formula "smtlib2" "(= 1 1)" smtlib "(= 1 1)" sort "Bool"
+
+obligation 5 postcondition trusted "an audited postcondition" function 0 formula "smtlib2" "(= 1 1)" smtlib "(= 1 1)" sort "Bool"
+
+obligation 6 postcondition trusted "an audited postcondition" function 0 formula "smtlib2" "(= 1 1)" smtlib "(= 1 1)" sort "Bool"
+
+certificate 3 "manual-audit" trusted "reviewed; coverage row 0" assurance unbounded digest "sha256" [80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80]
+
+certificate 4 "manual-audit" trusted "reviewed; coverage row 1" assurance unwind(8) digest "sha256" [81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81]
+
+certificate 5 "manual-audit" trusted "reviewed; coverage row 2" assurance model(3) digest "sha256" [82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82, 82]
+
+certificate 6 "manual-audit" trusted "reviewed; coverage row 3" assurance unrecorded digest "sha256" [83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83, 83]

@@ -7,7 +7,6 @@
 // pattern descriptors. Phase 1 of the Metal emission pipeline (MSL source;
 // Phase 2 will emit AIR bitcode directly).
 //
-// Design doc: designs/2026-04-14-metal-ir-emission.md
 // Reference: Apple. "Metal Shading Language Specification," Version 3.2.
 
 //! Metal Shading Language (MSL) kernel source code generation.
@@ -409,8 +408,6 @@ impl MtlSize {
 }
 
 /// Computed Metal dispatch parameters for a kernel launch.
-///
-/// Ref: designs/2026-04-14-metal-ir-emission.md, "Grid Size Calculation"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetalDispatchParams {
     /// Total threads in the grid (1D, 2D, or 3D).
@@ -587,8 +584,6 @@ impl MslKernel {
 ///
 /// Each emitter instance is associated with a single compute node (identified
 /// by `node_id`) and produces kernel functions named `trust_cg_<pattern>_<node_id>`.
-///
-/// Ref: designs/2026-04-14-metal-ir-emission.md
 pub struct MetalKernelEmitter {
     /// Compute node identifier (used in kernel function names).
     node_id: String,
@@ -4248,21 +4243,29 @@ mod tests {
         };
 
         let mut module = Module::new("exact_u32x4_metal");
-        let dummy_ty = module.add_func_type(FuncTy {
-            params: vec![],
-            returns: vec![],
-            is_vararg: false,
-        });
+        let dummy_ty = module
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut dummy = Function::new(FuncId::new(0), "dummy", dummy_ty, BlockId::new(0));
         dummy.blocks.push(Block::new(BlockId::new(0)));
-        module.add_function(dummy);
+        module
+            .try_add_function(dummy)
+            .expect("Module::try_add_function: test fixture");
 
         let vector_ty = Ty::Vector(Box::new(Ty::U32), 4);
-        let exact_ty = module.add_func_type(FuncTy {
-            params: vec![vector_ty.clone(), vector_ty.clone()],
-            returns: vec![vector_ty.clone()],
-            is_vararg: false,
-        });
+        let exact_ty = module
+            .add_func_type(FuncTy {
+                params: vec![vector_ty.clone(), vector_ty.clone()],
+                returns: vec![vector_ty.clone()],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut exact = Function::new(FuncId::new(1), "map2", exact_ty, BlockId::new(0));
         exact.blocks.push(Block {
             id: BlockId::new(0),
@@ -4283,7 +4286,9 @@ mod tests {
                 }),
             ],
         });
-        module.add_function(exact);
+        module
+            .try_add_function(exact)
+            .expect("Module::try_add_function: test fixture");
 
         let mut proof_ctx = TargetProofContext::default();
         proof_ctx.add_subgraph_proof(SubgraphId(0), SubgraphProof::Pure);
@@ -4304,7 +4309,9 @@ mod tests {
             ane_launch_threshold_bytes: u64::MAX,
             simd_threshold_bytes: 0,
         });
-        GraphBuilder::new(analyzer, proof_ctx).build_from_module(&module)
+        GraphBuilder::new(analyzer, proof_ctx)
+            .build_from_module(&module)
+            .expect("bounded test graph")
     }
 
     /// Cross-crate authority frontier: lower's internal `cfg(test)` structural

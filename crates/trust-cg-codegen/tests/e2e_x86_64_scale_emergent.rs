@@ -3,7 +3,11 @@
 // Faithful x86_64 check of historical aarch64-JIT scale-emergent backend
 // miscompiles: the exact pinned trust-ir that triggered the aarch64 JIT issue is
 // compiled through the SEPARATE x86_64 path (x86_64_isel.rs + Greedy regalloc) and
-// executed under Rosetta 2. Answers definitively: are these a LIVE x86 miscompile?
+// executed with the x86-64 driver `common::rosetta::x86_64_link_run` proved on this
+// host (native x86-64, opted-in Rosetta 2, or a cross driver plus
+// binfmt_misc/qemu-user). Answers definitively: are these a LIVE x86 miscompile?
+// A host without such a driver prints a `SKIP:` line for the link/run legs only;
+// every opt level is still compiled and its object's entry symbols checked.
 //
 // Author: Andrew Yates. Copyright 2026 Andrew Yates. License: Apache-2.0.
 
@@ -11,8 +15,21 @@
 
 mod common;
 
+/// The x86-64 triple the fixtures compile for on this host's object format.
+const X86_64_HOST_TRIPLE: &str = if cfg!(target_os = "macos") {
+    "x86_64-apple-darwin"
+} else {
+    "x86_64-unknown-linux-gnu"
+};
+
+#[path = "common/emitted_fixture.rs"]
+mod emitted_fixture;
+
 use std::path::Path;
 use std::process::Command;
+
+use common::rosetta::{x86_64_cc, x86_64_link_run_or_skip};
+use common::x86_64_object::assert_host_x86_64_object;
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
@@ -23,7 +40,8 @@ fn compile_x86_64_at(module: &trust_ir::Module, opt: OptLevel) -> Result<Vec<u8>
         opt_level: opt,
         target: Target::X86_64,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     match compiler.compile(module) {
         Ok(r) if !r.object_code.is_empty() => Ok(r.object_code),
         Ok(_) => Err("compiled but empty object".to_string()),
@@ -56,7 +74,7 @@ fn x86_64_scale_emergent_irs_compile() {
         ("value_matches", MIR_VALUE_MATCHES_TRUST_IR),
         ("edge_bounds", MIR_EDGE_BOUNDS_TRUST_IR),
     ] {
-        let module = trust_ir::parser::parse_module(ir)
+        let module = emitted_fixture::parse_emitted_for(ir, X86_64_HOST_TRIPLE)
             .unwrap_or_else(|e| panic!("{name} must parse: {e:?}"));
         for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
             let bytes = compile_x86_64_at(&module, opt).unwrap_or_else(|e| {
@@ -271,7 +289,9 @@ bb1:
 // ---- FAITHFUL fold_binop x86_64 differential (Rosetta) ----
 
 // Symbol names of the externs the trust-cg object calls + the entry, read off the
-// emitted object (nm). Mach-O leading-underscore convention applies.
+// emitted object (nm), spelled with the Mach-O leading underscore. On an ELF
+// host the object carries the bare name, so `host_symbol` / `host_c_symbols`
+// drop the underscore before a name reaches `nm` or a C driver's `__asm__`.
 const SYM_FOLD: &str = "_fold_binop";
 const SYM_TRY_BRANCH: &str = "__RNvXsJ_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionnENtNtNtB7_3ops9try_trait3Try6branchCs99MkpMfQ48c_23trust_fold_binop2_slice";
 const SYM_FROM_RESIDUAL: &str = "__RNvXsK_NtCs2EYQwhfuABO_4core6optionINtB5_6OptionnEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleEE13from_residualCs99MkpMfQ48c_23trust_fold_binop2_slice";
@@ -283,6 +303,26 @@ const SYM_CHECKED_MUL: &str =
     "__RNvMs2_NtCs2EYQwhfuABO_4core3numn11checked_mulCs99MkpMfQ48c_23trust_fold_binop2_slice";
 const SYM_CHECKED_SHL: &str =
     "__RNvMs2_NtCs2EYQwhfuABO_4core3numn11checked_shlCs99MkpMfQ48c_23trust_fold_binop2_slice";
+
+/// `name` as the host's object format spells it: unchanged (with its leading
+/// underscore) on Mach-O, bare on ELF.
+fn host_symbol(name: &str) -> &str {
+    if cfg!(target_os = "macos") {
+        name
+    } else {
+        name.strip_prefix('_').unwrap_or(name)
+    }
+}
+
+/// A C driver whose `__asm__("_name")` bindings were written for Mach-O,
+/// rewritten for the host: on ELF every `__asm__("_` becomes `__asm__("`.
+fn host_c_symbols(driver: String) -> String {
+    if cfg!(target_os = "macos") {
+        driver
+    } else {
+        driver.replace("__asm__(\"_", "__asm__(\"")
+    }
+}
 
 fn driver_c() -> String {
     format!(
@@ -339,8 +379,10 @@ int main(void) {{
     return 0;
 }}
 "####,
-        try = SYM_TRY_BRANCH, fromres = SYM_FROM_RESIDUAL, add = SYM_CHECKED_ADD,
-        sub = SYM_CHECKED_SUB, mul = SYM_CHECKED_MUL, shl = SYM_CHECKED_SHL, fold = SYM_FOLD,
+        try = host_symbol(SYM_TRY_BRANCH), fromres = host_symbol(SYM_FROM_RESIDUAL),
+        add = host_symbol(SYM_CHECKED_ADD), sub = host_symbol(SYM_CHECKED_SUB),
+        mul = host_symbol(SYM_CHECKED_MUL), shl = host_symbol(SYM_CHECKED_SHL),
+        fold = host_symbol(SYM_FOLD),
     )
 }
 
@@ -360,24 +402,28 @@ fn expected() -> Vec<(u128, u128)> {
     ]
 }
 
-fn run_fold_binop_at(opt: OptLevel) -> Result<Vec<(u128, u128)>, String> {
-    let module = trust_ir::parser::parse_module(MIR_FOLD_BINOP_TRUST_IR)
+/// Compile `fold_binop` at `opt` and check its object defines the entry; when
+/// `link_run`, also link and run it and return the per-case results.
+fn run_fold_binop_at(opt: OptLevel, link_run: bool) -> Result<Option<Vec<(u128, u128)>>, String> {
+    let module = emitted_fixture::parse_emitted_for(MIR_FOLD_BINOP_TRUST_IR, X86_64_HOST_TRIPLE)
         .map_err(|e| format!("parse: {e:?}"))?;
     let obj = compile_x86_64_at(&module, opt)?;
-    let dir = std::env::temp_dir().join(format!("trust_cg_scale_fold_{opt:?}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    assert_host_x86_64_object(&format!("fold_binop {opt:?}"), &obj, &["fold_binop"], &[]);
+    if !link_run {
+        return Ok(None);
+    }
+    // Removed when `scratch` drops, whatever the outcome.
+    let scratch = tempfile::Builder::new()
+        .prefix(&format!("trust_cg_scale_fold_{opt:?}-"))
+        .tempdir()
+        .unwrap();
+    let dir = scratch.path();
     let obj_path = dir.join("fold.o");
     std::fs::write(&obj_path, &obj).unwrap();
     let drv_path = dir.join("driver.c");
-    std::fs::write(&drv_path, driver_c()).unwrap();
+    std::fs::write(&drv_path, host_c_symbols(driver_c())).unwrap();
     let bin = dir.join("test_fold");
-    let out = Command::new("cc")
-        .args(if cfg!(target_os = "macos") {
-            &["-arch", "x86_64"][..]
-        } else {
-            &[][..]
-        })
+    let out = x86_64_cc()
         .args([
             "-O0",
             "-o",
@@ -415,20 +461,21 @@ fn run_fold_binop_at(opt: OptLevel) -> Result<Vec<(u128, u128)>, String> {
         let val = u128::from_str_radix(parts[2], 16).map_err(|e| format!("parse val: {e}"))?;
         results.push((disc, val));
     }
-    Ok(results)
+    Ok(Some(results))
 }
 
 #[test]
 fn x86_64_fold_binop_shl_faithful() {
-    if !common::rosetta::has_cc_x86_64_link_run() {
-        eprintln!("skip: cc -arch x86_64 link/run unavailable");
-        return;
-    }
+    let link_run = x86_64_link_run_or_skip(
+        "x86_64_fold_binop_shl_faithful",
+        "x86-64 link/run leg at O0-O3",
+    );
     let exp = expected();
     let mut any_miscompile = false;
     for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
-        match run_fold_binop_at(opt) {
-            Ok(results) => {
+        match run_fold_binop_at(opt, link_run) {
+            Ok(None) => eprintln!("[fold_binop {opt:?}] compiled; object entry checked"),
+            Ok(Some(results)) => {
                 assert_eq!(results.len(), exp.len(), "case count mismatch at {opt:?}");
                 for (i, (got, want)) in results.iter().zip(exp.iter()).enumerate() {
                     let ok = if want.0 == 0 { got.0 == 0 } else { got == want };
@@ -3439,10 +3486,10 @@ int main(void) {{
 
 #[test]
 fn x86_64_shape_matches_ty_faithful() {
-    if !common::rosetta::has_cc_x86_64_link_run() {
-        eprintln!("skip: cc -arch x86_64 link/run unavailable");
-        return;
-    }
+    let link_run = x86_64_link_run_or_skip(
+        "x86_64_shape_matches_ty_faithful",
+        "x86-64 link/run leg at O0-O3",
+    );
     // (constant, ty, label). The first two are the aarch64-JIT MISCOMPILE cases.
     let raw_cases: Vec<(VmConstant, VmTy, &str)> = vec![
         (
@@ -3479,8 +3526,8 @@ fn x86_64_shape_matches_ty_faithful() {
         })
         .collect();
 
-    let module =
-        trust_ir::parser::parse_module(MIR_VALUE_MATCHES_TRUST_IR).expect("parse value_matches");
+    let module = emitted_fixture::parse_emitted_for(MIR_VALUE_MATCHES_TRUST_IR, X86_64_HOST_TRIPLE)
+        .expect("parse value_matches");
     let mut any_miscompile = false;
     for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = match compile_x86_64_at(&module, opt) {
@@ -3490,20 +3537,28 @@ fn x86_64_shape_matches_ty_faithful() {
                 continue;
             }
         };
-        let dir = std::env::temp_dir().join(format!("trust_cg_scale_shape_{opt:?}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        assert_host_x86_64_object(
+            &format!("value_matches {opt:?}"),
+            &obj,
+            &["Constant__shape_matches_ty", "Constant__value_matches_ty"],
+            &[],
+        );
+        if !link_run {
+            eprintln!("[shape_matches {opt:?}] compiled; object entries checked");
+            continue;
+        }
+        // Removed when `scratch` drops, whatever the outcome.
+        let scratch = tempfile::Builder::new()
+            .prefix(&format!("trust_cg_scale_shape_{opt:?}-"))
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
         let obj_path = dir.join("vm.o");
         std::fs::write(&obj_path, &obj).unwrap();
         let drv_path = dir.join("driver.c");
-        std::fs::write(&drv_path, shape_driver_c(&cases)).unwrap();
+        std::fs::write(&drv_path, host_c_symbols(shape_driver_c(&cases))).unwrap();
         let bin = dir.join("test_shape");
-        let link = Command::new("cc")
-            .args(if cfg!(target_os = "macos") {
-                &["-arch", "x86_64"][..]
-            } else {
-                &[][..]
-            })
+        let link = x86_64_cc()
             .args([
                 "-O0",
                 "-o",
@@ -4091,10 +4146,10 @@ int main(void) {{
 
 #[test]
 fn x86_64_edge_bounds_faithful() {
-    if !common::rosetta::has_cc_x86_64_link_run() {
-        eprintln!("skip: cc -arch x86_64 link/run unavailable");
-        return;
-    }
+    let link_run = x86_64_link_run_or_skip(
+        "x86_64_edge_bounds_faithful",
+        "x86-64 link/run leg at O0-O3",
+    );
     // op 0..=9 crossed with a range of k (None, negative, 0, 1, small, u8-edge, wide).
     // k values are i64-representable so the C driver table can use `long long`.
     let ks: Vec<Option<i128>> = vec![
@@ -4129,8 +4184,8 @@ fn x86_64_edge_bounds_faithful() {
         cases.len()
     );
 
-    let module =
-        trust_ir::parser::parse_module(MIR_EDGE_BOUNDS_TRUST_IR).expect("edge_bounds parse");
+    let module = emitted_fixture::parse_emitted_for(MIR_EDGE_BOUNDS_TRUST_IR, X86_64_HOST_TRIPLE)
+        .expect("edge_bounds parse");
     let mut any_miscompile = false;
     for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = match compile_x86_64_at(&module, opt) {
@@ -4140,24 +4195,27 @@ fn x86_64_edge_bounds_faithful() {
                 continue;
             }
         };
-        let dir = std::env::temp_dir().join(format!("trust_cg_scale_edge_{opt:?}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        assert_host_x86_64_object(&format!("edge_bounds {opt:?}"), &obj, &["edge_bounds"], &[]);
+        if !link_run {
+            eprintln!("[edge_bounds {opt:?}] compiled; object entry checked");
+            continue;
+        }
+        // Removed when `scratch` drops, whatever the outcome.
+        let scratch = tempfile::Builder::new()
+            .prefix(&format!("trust_cg_scale_edge_{opt:?}-"))
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
         let obj_path = dir.join("eb.o");
         std::fs::write(&obj_path, &obj).unwrap();
         let drv_path = dir.join("driver.c");
         std::fs::write(
             &drv_path,
-            format!("{}\n{}", edge_bounds_driver_c(), table_c),
+            host_c_symbols(format!("{}\n{}", edge_bounds_driver_c(), table_c)),
         )
         .unwrap();
         let bin = dir.join("test_eb");
-        let link = Command::new("cc")
-            .args(if cfg!(target_os = "macos") {
-                &["-arch", "x86_64"][..]
-            } else {
-                &[][..]
-            })
+        let link = x86_64_cc()
             .args([
                 "-O0",
                 "-o",
@@ -4958,28 +5016,44 @@ fn supports_element_ops_native(tag: u32) -> i64 {
     (tag == 1) as i64
 }
 
-fn run_scalar_entry(test: &str, ir: &str, driver_c: &str) -> Result<String, String> {
-    if !common::rosetta::has_cc_x86_64_link_run() {
-        return Err("skip: cc -arch x86_64 link/run unavailable".to_string());
-    }
-    let module = trust_ir::parser::parse_module(ir).map_err(|e| format!("parse: {e:?}"))?;
-    let mut out = String::new();
+/// Compile `ir` at O0-O3, checking each object defines `entry`; then, where this
+/// host can link and run x86-64 executables, run the driver against every
+/// level and return O0's stdout (all levels must agree). Returns `Ok(None)`
+/// after printing a `SKIP:` line for the link/run leg on a host that cannot.
+fn run_scalar_entry(
+    test: &str,
+    ir: &str,
+    driver_c: &str,
+    entry: &str,
+) -> Result<Option<String>, String> {
+    let module = emitted_fixture::parse_emitted_for(ir, X86_64_HOST_TRIPLE)
+        .map_err(|e| format!("parse: {e:?}"))?;
+    let mut objects = Vec::new();
     for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = compile_x86_64_at(&module, opt)?;
-        let dir = std::env::temp_dir().join(format!("trust_cg_scale_{test}_{opt:?}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        assert_host_x86_64_object(&format!("{test} {opt:?}"), &obj, &[entry], &[]);
+        objects.push((opt, obj));
+    }
+    if !x86_64_link_run_or_skip(
+        &format!("x86_64_{test}_faithful"),
+        "x86-64 link/run leg at O0-O3",
+    ) {
+        return Ok(None);
+    }
+    let mut out = String::new();
+    for (opt, obj) in objects {
+        // Removed when `scratch` drops, whatever the outcome.
+        let scratch = tempfile::Builder::new()
+            .prefix(&format!("trust_cg_scale_{test}_{opt:?}-"))
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
         let obj_path = dir.join("f.o");
         std::fs::write(&obj_path, &obj).unwrap();
         let drv = dir.join("driver.c");
-        std::fs::write(&drv, driver_c).unwrap();
+        std::fs::write(&drv, host_c_symbols(driver_c.to_string())).unwrap();
         let bin = dir.join("bin");
-        let link = Command::new("cc")
-            .args(if cfg!(target_os = "macos") {
-                &["-arch", "x86_64"][..]
-            } else {
-                &[][..]
-            })
+        let link = x86_64_cc()
             .args([
                 "-O0",
                 "-o",
@@ -5013,15 +5087,11 @@ fn run_scalar_entry(test: &str, ir: &str, driver_c: &str) -> Result<String, Stri
             ));
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 #[test]
 fn x86_64_cast_shape_faithful() {
-    if !common::rosetta::has_cc_x86_64_link_run() {
-        eprintln!("skip: cc -arch x86_64 link/run unavailable");
-        return;
-    }
     let driver = r####"
 #include <stdio.h>
 extern unsigned cast_shape_entry(unsigned op_tag, unsigned which) __asm__("_cast_shape_entry");
@@ -5032,8 +5102,15 @@ int main(void) {
     return 0;
 }
 "####;
-    let out = run_scalar_entry("cast_shape", MIR_CAST_SHAPE_TRUST_IR, driver)
-        .unwrap_or_else(|e| panic!("cast_shape x86 run failed: {e}"));
+    let Some(out) = run_scalar_entry(
+        "cast_shape",
+        MIR_CAST_SHAPE_TRUST_IR,
+        driver,
+        "cast_shape_entry",
+    )
+    .unwrap_or_else(|e| panic!("cast_shape x86 run failed: {e}")) else {
+        return;
+    };
     let mut checked = 0;
     for line in out.lines() {
         let p: Vec<&str> = line.split_whitespace().collect();
@@ -5061,10 +5138,6 @@ int main(void) {
 
 #[test]
 fn x86_64_lane_count_faithful() {
-    if !common::rosetta::has_cc_x86_64_link_run() {
-        eprintln!("skip: cc -arch x86_64 link/run unavailable");
-        return;
-    }
     // (tag, name) menu and aux grid VERBATIM from the integrator's test.
     let tags: [u32; 11] = [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12];
     let auxes: [u64; 6] = [0, 1, 1000, u32::MAX as u64, (u32::MAX as u64) + 1, u64::MAX];
@@ -5101,8 +5174,15 @@ int main(void) {{
 }}
 "####
     );
-    let out = run_scalar_entry("lane_count", MIR_LANE_COUNT_TRUST_IR, &driver)
-        .unwrap_or_else(|e| panic!("lane_count x86 run failed: {e}"));
+    let Some(out) = run_scalar_entry(
+        "lane_count",
+        MIR_LANE_COUNT_TRUST_IR,
+        &driver,
+        "lane_count_entry",
+    )
+    .unwrap_or_else(|e| panic!("lane_count x86 run failed: {e}")) else {
+        return;
+    };
     let mut checked = 0;
     for line in out.lines() {
         let p: Vec<&str> = line.split_whitespace().collect();
@@ -5129,4 +5209,13 @@ int main(void) {{
     eprintln!(
         "[lane_count] 11 tys x 6 auxes x {{lane_count,supports_element_ops}} x O0/O1/O2/O3 all correct"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

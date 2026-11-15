@@ -314,7 +314,7 @@ fn emit_seed_values_from_initial(
     fb.br(seed_header, vec![sb_next]);
 }
 
-pub fn build_bcp_propagate_module() -> trust_ir::Module {
+pub fn build_bcp_propagate_module() -> Result<trust_ir::Module, trust_ir_build::BuildError> {
     let mut mb = ModuleBuilder::new("bcp_propagate");
 
     let entry_ty = mb.add_func_type(vec![Ty::Ptr, Ty::Ptr, Ty::I64], vec![Ty::I64]);
@@ -693,7 +693,8 @@ pub fn build_bcp_propagate_module() -> trust_ir::Module {
 ///   `BCP_RESULT_OK`; on conflict it is `BCP_RESULT_CONFLICT`. The hi32 is
 ///   the number of propagation steps performed during the propagate phase
 ///   (decode-phase assignments do NOT count toward this counter).
-pub fn build_bcp_propagate_with_decisions_module() -> trust_ir::Module {
+pub fn build_bcp_propagate_with_decisions_module()
+-> Result<trust_ir::Module, trust_ir_build::BuildError> {
     let mut mb = ModuleBuilder::new("bcp_propagate_with_decisions");
 
     let entry_ty = mb.add_func_type(vec![Ty::Ptr, Ty::Ptr, Ty::I64], vec![Ty::I64]);
@@ -1188,7 +1189,8 @@ pub fn build_bcp_propagate_with_decisions_module() -> trust_ir::Module {
 /// The lo32 of the returned `u64` is the result code; the hi32 is the
 /// number of propagation steps performed by the BCP loop (decode-phase
 /// assignments and initial unit-clause assignments are NOT counted).
-pub fn build_bcp_propagate_watched_literal_module() -> trust_ir::Module {
+pub fn build_bcp_propagate_watched_literal_module()
+-> Result<trust_ir::Module, trust_ir_build::BuildError> {
     let mut mb = ModuleBuilder::new("bcp_propagate_watched_literal");
 
     let entry_ty = mb.add_func_type(vec![Ty::Ptr, Ty::Ptr, Ty::I64], vec![Ty::I64]);
@@ -2482,7 +2484,8 @@ impl BcpWatchedArena {
 /// `watch_heads + watch_nodes` is `(2*num_vars + 2) * 4 + (2*num_clauses
 /// + 1) * 8` bytes — `O(num_vars + num_clauses)` instead of the
 /// fixed-cap layout's `O(num_vars * num_clauses)`.
-pub fn build_bcp_propagate_watched_literal_chunked_module() -> trust_ir::Module {
+pub fn build_bcp_propagate_watched_literal_chunked_module()
+-> Result<trust_ir::Module, trust_ir_build::BuildError> {
     let mut mb = ModuleBuilder::new("bcp_propagate_watched_literal_chunked");
 
     let entry_ty = mb.add_func_type(vec![Ty::Ptr, Ty::Ptr, Ty::I64], vec![Ty::I64]);

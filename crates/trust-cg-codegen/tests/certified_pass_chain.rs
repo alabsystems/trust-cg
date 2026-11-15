@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 use trust_cg_codegen::compiler::{CompileError, Compiler};
 use trust_cg_codegen::metal_emitter::{VnnBatchNormReluOptions, emit_vnn_batch_norm_relu_msl};
+use trust_cg_codegen::{CodegenLicensePolicy, UnlicensedBodyPolicy};
 use trust_cg_opt::CertifiedPassRunStatus;
 use trust_cg_verify::certified_pass_chain::CertifiedPassChain;
 use trust_cg_verify::certified_pass_checker::{
@@ -22,11 +23,14 @@ use trust_ir::{
 
 fn const_i64_module(module_name: &str, function_name: &str, value: i128) -> TrustIrModule {
     let mut module = TrustIrModule::new(module_name);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), function_name, ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -42,7 +46,9 @@ fn const_i64_module(module_name: &str, function_name: &str, value: i128) -> Trus
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -148,6 +154,7 @@ fn checked_chain_attaches_bn_relu_fusion_record_without_claiming_demo_success() 
     ])
     .expect("three-entry gamma chain should verify");
     let compiler = Compiler::default_o2()
+        .with_codegen_license(permit_unlicensed())
         .with_checked_certified_pass_entries(chain.entries().iter().cloned())
         .expect("checked chain should attach");
     let module = const_i64_module("gamma_vnncomp_demo", "bn_relu_record_carrier", 7);
@@ -212,7 +219,9 @@ fn checked_chain_attaches_bn_relu_fusion_record_without_claiming_demo_success() 
 
 #[test]
 fn production_compile_attaches_checker_backed_pass_chain_metadata() {
-    let compiler = Compiler::default_o2().with_production_certified_pass_chain();
+    let compiler = Compiler::default_o2()
+        .with_codegen_license(permit_unlicensed())
+        .with_production_certified_pass_chain();
     let module = const_i64_module("prod_cert_e2e", "prod_cert_entry", 7);
 
     let result = compiler
@@ -307,6 +316,7 @@ fn gamma_vnncomp_demo_compile_consumes_three_production_certified_passes() {
     );
 
     let compiler = Compiler::default_o2()
+        .with_codegen_license(permit_unlicensed())
         .with_production_certified_pass_chain()
         .with_additional_production_certified_pass_runs([bn_relu_run]);
     let module = const_i64_module("gamma-vnncomp-demo", "certified_demo_entry", 7);
@@ -422,6 +432,7 @@ fn gamma_vnncomp_demo_rejects_failed_bn_relu_production_run() {
     bn_relu_run.failure_count = 1;
 
     let compiler = Compiler::default_o2()
+        .with_codegen_license(permit_unlicensed())
         .with_production_certified_pass_chain()
         .with_additional_production_certified_pass_runs([bn_relu_run]);
     let module = const_i64_module("gamma-vnncomp-demo", "certified_demo_entry", 7);
@@ -455,4 +466,12 @@ fn compiler_rejects_tampered_checked_pass_report_before_attachment() {
         err,
         trust_cg_verify::CertifiedPassChainError::TamperedReportSummary { .. }
     ));
+}
+
+/// This file's carrier modules are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes (or fails by name) because it was silently refused.
+fn permit_unlicensed() -> CodegenLicensePolicy {
+    CodegenLicensePolicy::default().with_unlicensed(UnlicensedBodyPolicy::Permit)
 }

@@ -1,0 +1,1230 @@
+; TrustIr text format v1
+module "mir::closure::fp_cvt_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_fp_arith_slice.rs"
+
+functy.0 = (u32, u64, ptr) -> ()
+
+functy.1 = (u64) -> (u64)
+
+functy.2 = (u64) -> (u64)
+
+functy.3 = (u64) -> (u64)
+
+functy.4 = (u64) -> (u64)
+
+functy.5 = (u64) -> (u64)
+
+functy.6 = (u64) -> (u64)
+
+functy.7 = (u32) -> (u64)
+
+functy.8 = (u32, u64) -> (bool)
+
+functy.9 = (u32, u32, u64) -> (bool)
+
+functy.10 = (u32, u64) -> (u64)
+
+functy.11 = (u32, u32, u64) -> (bool)
+
+functy.12 = (u32, u32, u32, u32, bool, u64) -> (u64)
+
+functy.13 = (u32, u32, u64) -> (bool)
+
+functy.14 = (u32, u32, u32, bool) -> (u64)
+
+functy.15 = (u32, u32, u64) -> (bool)
+
+functy.16 = (u32, u32, u32, bool) -> (u64)
+
+functy.17 = (u32, u32, u64) -> (bool)
+
+functy.18 = (u128) -> (u32)
+
+functy.19 = (u32, u32, u64) -> (u32)
+
+functy.20 = (u32, bool, u64) -> (u128)
+
+functy.21 = (u128, u32) -> (u128)
+
+functy.22 = (u128) -> (u128)
+
+functy.23 = (bool, u32, u128) -> (u64)
+
+functy.24 = (u32, u32, u32, u32, u64) -> (u64)
+
+functy.25 = (u32, u32, u32, u32, u64) -> (u64)
+
+functy.26 = (u32, u32, u64) -> (bool)
+
+functy.27 = (u32, u64) -> (bool)
+
+functy.28 = (u32, u64) -> (bool)
+
+functy.29 = (u32) -> (u32)
+
+functy.30 = (u128) -> (u32)
+
+functy.31 = (bool, bool, bool) -> (bool)
+
+functy.32 = (u32, u32, u32, u32, u64) -> (u64)
+
+functy.33 = (bool, u32, u128) -> (u64)
+
+fn @fp_cvt_root(functy.0) {
+bb0(%0: u32, %1: u64, %2: ptr):
+    %41 = alloca i64, align 8
+    %42 = const u32 0
+    %43 = icmp eq u32 %0, %42
+    condbr %43, bb1(%1, %2), bb2(%0, %1, %2)
+bb1(%3: u64, %4: ptr):
+    %44 = call @func.1(%3)
+    br bb12(%4, %44)
+bb2(%5: u32, %6: u64, %7: ptr):
+    %45 = const u32 1
+    %46 = icmp eq u32 %5, %45
+    condbr %46, bb3(%6, %7), bb4(%5, %6, %7)
+bb3(%8: u64, %9: ptr):
+    %47 = call @func.2(%8)
+    br bb13(%9, %47)
+bb4(%10: u32, %11: u64, %12: ptr):
+    %48 = const u32 2
+    %49 = icmp eq u32 %10, %48
+    condbr %49, bb5(%11, %12), bb6(%10, %11, %12)
+bb5(%13: u64, %14: ptr):
+    %50 = call @func.3(%13)
+    br bb14(%14, %50)
+bb6(%15: u32, %16: u64, %17: ptr):
+    %51 = const u32 3
+    %52 = icmp eq u32 %15, %51
+    condbr %52, bb7(%16, %17), bb8(%15, %16, %17)
+bb7(%18: u64, %19: ptr):
+    %53 = call @func.4(%18)
+    br bb15(%19, %53)
+bb8(%20: u32, %21: u64, %22: ptr):
+    %54 = const u32 4
+    %55 = icmp eq u32 %20, %54
+    condbr %55, bb9(%21, %22), bb10(%21, %22)
+bb9(%23: u64, %24: ptr):
+    %56 = call @func.5(%23)
+    br bb16(%24, %56)
+bb10(%25: u64, %26: ptr):
+    %57 = call @func.6(%25)
+    br bb17(%26, %57)
+bb11(%27: ptr, %28: u64):
+    store u64 %28, ptr %41
+    %58 = load i64, ptr %41
+    store i64 %58, ptr %27
+    ret
+bb12(%29: ptr, %30: u64):
+    br bb11(%29, %30)
+bb13(%31: ptr, %32: u64):
+    br bb11(%31, %32)
+bb14(%33: ptr, %34: u64):
+    br bb11(%33, %34)
+bb15(%35: ptr, %36: u64):
+    br bb11(%35, %36)
+bb16(%37: ptr, %38: u64):
+    br bb11(%37, %38)
+bb17(%39: ptr, %40: u64):
+    br bb11(%39, %40)
+}
+
+fn @fcvt_widen(functy.1) {
+bb0(%0: u64):
+    %53 = const u32 32
+    %54 = call @func.7(%53)
+    br bb1(%0, %54)
+bb1(%1: u64, %2: u64):
+    %55 = and u64 %1, %2
+    %56 = const u32 32
+    %57 = call @func.8(%56, %55)
+    br bb2(%55, %57)
+bb2(%3: u64, %4: bool):
+    %58 = const u32 23
+    %59 = const u32 8
+    %60 = call @func.9(%58, %59, %3)
+    br bb3(%3, %4, %60)
+bb3(%5: u64, %6: bool, %7: bool):
+    condbr %7, bb4(%5, %6), bb9(%5, %6)
+bb4(%8: u64, %9: bool):
+    %61 = const u32 23
+    %62 = call @func.10(%61, %8)
+    br bb5(%8, %9, %62)
+bb5(%10: u64, %11: bool, %12: u64):
+    %63 = const i32 29
+    %64 = zext i32 %63 to u64
+    %65 = shl u64 %12, %64
+    %66 = const u32 23
+    %67 = const u32 8
+    %68 = call @func.11(%66, %67, %10)
+    br bb6(%11, %65, %68)
+bb6(%13: bool, %14: u64, %15: bool):
+    condbr %15, bb7(%13, %14), bb8(%13, %14)
+bb7(%16: bool, %17: u64):
+    %69 = const u64 1
+    %70 = const i32 51
+    %71 = zext i32 %70 to u64
+    %72 = shl u64 %69, %71
+    %73 = or u64 %17, %72
+    br bb8(%16, %73)
+bb8(%18: bool, %19: u64):
+    %74 = const u32 64
+    %75 = const u32 52
+    %76 = const u32 11
+    %77 = const u32 2047
+    %78 = call @func.12(%74, %75, %76, %77, %18, %19)
+    br bb23(%78)
+bb9(%20: u64, %21: bool):
+    %79 = const u32 23
+    %80 = const u32 8
+    %81 = call @func.13(%79, %80, %20)
+    br bb10(%20, %21, %81)
+bb10(%22: u64, %23: bool, %24: bool):
+    condbr %24, bb11(%23), bb12(%22, %23)
+bb11(%25: bool):
+    %82 = const u32 64
+    %83 = const u32 52
+    %84 = const u32 11
+    %85 = call @func.14(%82, %83, %84, %25)
+    br bb23(%85)
+bb12(%26: u64, %27: bool):
+    %86 = const u32 23
+    %87 = const u32 8
+    %88 = call @func.15(%86, %87, %26)
+    br bb13(%26, %27, %88)
+bb13(%28: u64, %29: bool, %30: bool):
+    condbr %30, bb14(%29), bb15(%28, %29)
+bb14(%31: bool):
+    %89 = const u32 64
+    %90 = const u32 52
+    %91 = const u32 11
+    %92 = call @func.16(%89, %90, %91, %31)
+    br bb23(%92)
+bb15(%32: u64, %33: bool):
+    %93 = const u32 23
+    %94 = const u32 8
+    %95 = call @func.17(%93, %94, %32)
+    br bb16(%32, %33, %95)
+bb16(%34: u64, %35: bool, %36: bool):
+    condbr %36, bb17(%34, %35), bb20(%34, %35)
+bb17(%37: u64, %38: bool):
+    %96 = const u32 23
+    %97 = call @func.10(%96, %37)
+    br bb18(%38, %97)
+bb18(%39: bool, %40: u64):
+    %98 = zext u64 %40 to u128
+    %99 = call @func.18(%98)
+    br bb19(%39, %40, %99)
+bb19(%41: bool, %42: u64, %43: u32):
+    %100 = const u32 874
+    %101 = add u32 %43, %100
+    %102 = const u32 52
+    %103 = sub u32 %102, %43
+    %104 = zext u32 %103 to u64
+    %105 = shl u64 %42, %104
+    %106 = zext u64 %105 to u128
+    %107 = const u128 1
+    %108 = const i32 52
+    %109 = zext i32 %108 to u128
+    %110 = shl u128 %107, %109
+    %111 = const u128 1
+    %112 = sub u128 %110, %111
+    %113 = and u128 %106, %112
+    %114 = trunc u128 %113 to u64
+    %115 = const u32 64
+    %116 = const u32 52
+    %117 = const u32 11
+    %118 = call @func.12(%115, %116, %117, %101, %41, %114)
+    br bb23(%118)
+bb20(%44: u64, %45: bool):
+    %119 = const u32 23
+    %120 = const u32 8
+    %121 = call @func.19(%119, %120, %44)
+    br bb21(%44, %45, %121)
+bb21(%46: u64, %47: bool, %48: u32):
+    %122 = const u32 23
+    %123 = call @func.10(%122, %46)
+    br bb22(%47, %48, %123)
+bb22(%49: bool, %50: u32, %51: u64):
+    %124 = const u32 896
+    %125 = add u32 %50, %124
+    %126 = const i32 29
+    %127 = zext i32 %126 to u64
+    %128 = shl u64 %51, %127
+    %129 = const u32 64
+    %130 = const u32 52
+    %131 = const u32 11
+    %132 = call @func.12(%129, %130, %131, %125, %49, %128)
+    br bb23(%132)
+bb23(%52: u64):
+    ret %52
+}
+
+fn @fcvt_narrow(functy.2) {
+bb0(%0: u64):
+    %65 = const u32 64
+    %66 = call @func.8(%65, %0)
+    br bb1(%0, %66)
+bb1(%1: u64, %2: bool):
+    %67 = const u32 52
+    %68 = const u32 11
+    %69 = call @func.9(%67, %68, %1)
+    br bb2(%1, %2, %69)
+bb2(%3: u64, %4: bool, %5: bool):
+    condbr %5, bb3(%3, %4), bb5(%3, %4)
+bb3(%6: u64, %7: bool):
+    %70 = const u32 52
+    %71 = call @func.10(%70, %6)
+    br bb4(%7, %71)
+bb4(%8: bool, %9: u64):
+    %72 = const i32 29
+    %73 = zext i32 %72 to u64
+    %74 = lshr u64 %9, %73
+    %75 = const u64 1
+    %76 = const i32 22
+    %77 = zext i32 %76 to u64
+    %78 = shl u64 %75, %77
+    %79 = or u64 %74, %78
+    %80 = const u32 32
+    %81 = const u32 23
+    %82 = const u32 8
+    %83 = const u32 255
+    %84 = call @func.12(%80, %81, %82, %83, %8, %79)
+    br bb23(%84)
+bb5(%10: u64, %11: bool):
+    %85 = const u32 52
+    %86 = const u32 11
+    %87 = call @func.13(%85, %86, %10)
+    br bb6(%10, %11, %87)
+bb6(%12: u64, %13: bool, %14: bool):
+    condbr %14, bb7(%13), bb8(%12, %13)
+bb7(%15: bool):
+    %88 = const u32 32
+    %89 = const u32 23
+    %90 = const u32 8
+    %91 = call @func.14(%88, %89, %90, %15)
+    br bb23(%91)
+bb8(%16: u64, %17: bool):
+    %92 = const u32 52
+    %93 = const u32 11
+    %94 = call @func.15(%92, %93, %16)
+    br bb9(%16, %17, %94)
+bb9(%18: u64, %19: bool, %20: bool):
+    condbr %20, bb10(%19), bb11(%18, %19)
+bb10(%21: bool):
+    %95 = const u32 32
+    %96 = const u32 23
+    %97 = const u32 8
+    %98 = call @func.16(%95, %96, %97, %21)
+    br bb23(%98)
+bb11(%22: u64, %23: bool):
+    %99 = const u32 52
+    %100 = const u32 11
+    %101 = call @func.19(%99, %100, %22)
+    br bb12(%22, %23, %101)
+bb12(%24: u64, %25: bool, %26: u32):
+    %102 = const u32 52
+    %103 = const u32 11
+    %104 = call @func.17(%102, %103, %24)
+    br bb13(%24, %25, %26, %104)
+bb13(%27: u64, %28: bool, %29: u32, %30: bool):
+    %105 = const bool false
+    %106 = icmp eq bool %30, %105
+    %107 = const u32 52
+    %108 = call @func.20(%107, %106, %27)
+    br bb14(%28, %29, %108)
+bb14(%31: bool, %32: u32, %33: u128):
+    %109 = const u32 896
+    %110 = icmp ugt u32 %32, %109
+    condbr %110, bb15(%31, %32, %33, %110), bb16(%31, %32, %33, %110)
+bb15(%34: bool, %35: u32, %36: u128, %37: bool):
+    %111 = const u32 0
+    br bb17(%34, %35, %36, %37, %111)
+bb16(%38: bool, %39: u32, %40: u128, %41: bool):
+    %112 = const u32 897
+    %113 = sub u32 %112, %39
+    br bb17(%38, %39, %40, %41, %113)
+bb17(%42: bool, %43: u32, %44: u128, %45: bool, %46: u32):
+    %114 = const u32 26
+    %115 = add u32 %114, %46
+    condbr %45, bb18(%42, %43, %44, %115), bb19(%42, %44, %115)
+bb18(%47: bool, %48: u32, %49: u128, %50: u32):
+    %116 = const u32 896
+    %117 = sub u32 %48, %116
+    br bb20(%47, %49, %50, %117)
+bb19(%51: bool, %52: u128, %53: u32):
+    %118 = const u32 1
+    br bb20(%51, %52, %53, %118)
+bb20(%54: bool, %55: u128, %56: u32, %57: u32):
+    %119 = call @func.21(%55, %56)
+    br bb21(%54, %57, %119)
+bb21(%58: bool, %59: u32, %60: u128):
+    %120 = call @func.22(%60)
+    br bb22(%58, %59, %120)
+bb22(%61: bool, %62: u32, %63: u128):
+    %121 = call @func.23(%61, %62, %63)
+    br bb23(%121)
+bb23(%64: u64):
+    ret %64
+}
+
+fn @fcvt_h_to_s(functy.3) {
+bb0(%0: u64):
+    %2 = const u32 32
+    %3 = const u32 23
+    %4 = const u32 8
+    %5 = const u32 127
+    %6 = call @func.24(%2, %3, %4, %5, %0)
+    br bb1(%6)
+bb1(%1: u64):
+    ret %1
+}
+
+fn @fcvt_h_to_d(functy.4) {
+bb0(%0: u64):
+    %2 = const u32 64
+    %3 = const u32 52
+    %4 = const u32 11
+    %5 = const u32 1023
+    %6 = call @func.24(%2, %3, %4, %5, %0)
+    br bb1(%6)
+bb1(%1: u64):
+    ret %1
+}
+
+fn @fcvt_s_to_h(functy.5) {
+bb0(%0: u64):
+    %2 = const u32 32
+    %3 = const u32 23
+    %4 = const u32 8
+    %5 = const u32 127
+    %6 = call @func.25(%2, %3, %4, %5, %0)
+    br bb1(%6)
+bb1(%1: u64):
+    ret %1
+}
+
+fn @fcvt_d_to_h(functy.6) {
+bb0(%0: u64):
+    %2 = const u32 64
+    %3 = const u32 52
+    %4 = const u32 11
+    %5 = const u32 1023
+    %6 = call @func.25(%2, %3, %4, %5, %0)
+    br bb1(%6)
+bb1(%1: u64):
+    ret %1
+}
+
+fn @word_mask(functy.7) {
+bb0(%0: u32):
+    %3 = const u32 64
+    %4 = icmp uge u32 %0, %3
+    condbr %4, bb1, bb2(%0)
+bb1:
+    %5 = const u64 18446744073709551615
+    br bb3(%5)
+bb2(%1: u32):
+    %6 = const u64 1
+    %7 = zext u32 %1 to u64
+    %8 = shl u64 %6, %7
+    %9 = const u64 1
+    %10 = sub u64 %8, %9
+    br bb3(%10)
+bb3(%2: u64):
+    ret %2
+}
+
+fn @sign(functy.8) {
+bb0(%0: u32, %1: u64):
+    %2 = const u32 1
+    %3 = sub u32 %0, %2
+    %4 = zext u32 %3 to u64
+    %5 = lshr u64 %1, %4
+    %6 = const u64 1
+    %7 = and u64 %5, %6
+    %8 = const u64 1
+    %9 = icmp eq u64 %7, %8
+    ret %9
+}
+
+fn @is_nan(functy.9) {
+bb0(%0: u32, %1: u32, %2: u64):
+    %10 = call @func.26(%0, %1, %2)
+    br bb1(%0, %2, %10)
+bb1(%3: u32, %4: u64, %5: bool):
+    condbr %5, bb2(%3, %4), bb3
+bb2(%6: u32, %7: u64):
+    %11 = call @func.27(%6, %7)
+    br bb4(%11)
+bb3:
+    %12 = const bool false
+    br bb5(%12)
+bb4(%8: bool):
+    %13 = const bool false
+    %14 = icmp eq bool %8, %13
+    br bb5(%14)
+bb5(%9: bool):
+    ret %9
+}
+
+fn @mant_field(functy.10) {
+bb0(%0: u32, %1: u64):
+    %2 = const u64 1
+    %3 = zext u32 %0 to u64
+    %4 = shl u64 %2, %3
+    %5 = const u64 1
+    %6 = sub u64 %4, %5
+    %7 = and u64 %1, %6
+    ret %7
+}
+
+fn @is_snan(functy.11) {
+bb0(%0: u32, %1: u32, %2: u64):
+    %10 = call @func.9(%0, %1, %2)
+    br bb1(%0, %2, %10)
+bb1(%3: u32, %4: u64, %5: bool):
+    condbr %5, bb2(%3, %4), bb3
+bb2(%6: u32, %7: u64):
+    %11 = call @func.28(%6, %7)
+    br bb4(%11)
+bb3:
+    %12 = const bool false
+    br bb5(%12)
+bb4(%8: bool):
+    %13 = const bool false
+    %14 = icmp eq bool %8, %13
+    br bb5(%14)
+bb5(%9: bool):
+    ret %9
+}
+
+fn @pack(functy.12) {
+bb0(%0: u32, %1: u32, %2: u32, %3: u32, %4: bool, %5: u64):
+    %8 = const u64 1
+    %9 = zext u32 %1 to u64
+    %10 = shl u64 %8, %9
+    %11 = const u64 1
+    %12 = sub u64 %10, %11
+    %13 = and u64 %5, %12
+    %14 = zext u32 %3 to u64
+    %15 = const u64 1
+    %16 = zext u32 %2 to u64
+    %17 = shl u64 %15, %16
+    %18 = const u64 1
+    %19 = sub u64 %17, %18
+    %20 = and u64 %14, %19
+    %21 = zext u32 %1 to u64
+    %22 = shl u64 %20, %21
+    %23 = const u64 1
+    %24 = const u64 0
+    %25 = select u64 %4, %23, %24
+    %26 = const u32 1
+    %27 = sub u32 %0, %26
+    %28 = zext u32 %27 to u64
+    %29 = shl u64 %25, %28
+    %30 = or u64 %13, %22
+    %31 = or u64 %30, %29
+    %32 = call @func.7(%0)
+    br bb1(%31, %32)
+bb1(%6: u64, %7: u64):
+    %33 = and u64 %6, %7
+    ret %33
+}
+
+fn @is_inf(functy.13) {
+bb0(%0: u32, %1: u32, %2: u64):
+    %9 = call @func.26(%0, %1, %2)
+    br bb1(%0, %2, %9)
+bb1(%3: u32, %4: u64, %5: bool):
+    condbr %5, bb2(%3, %4), bb3
+bb2(%6: u32, %7: u64):
+    %10 = call @func.27(%6, %7)
+    br bb4(%10)
+bb3:
+    %11 = const bool false
+    br bb4(%11)
+bb4(%8: bool):
+    ret %8
+}
+
+fn @inf_of(functy.14) {
+bb0(%0: u32, %1: u32, %2: u32, %3: bool):
+    %10 = call @func.29(%2)
+    br bb1(%0, %1, %2, %3, %10)
+bb1(%4: u32, %5: u32, %6: u32, %7: bool, %8: u32):
+    %11 = const u64 0
+    %12 = call @func.12(%4, %5, %6, %8, %7, %11)
+    br bb2(%12)
+bb2(%9: u64):
+    ret %9
+}
+
+fn @is_zero(functy.15) {
+bb0(%0: u32, %1: u32, %2: u64):
+    %9 = call @func.17(%0, %1, %2)
+    br bb1(%0, %2, %9)
+bb1(%3: u32, %4: u64, %5: bool):
+    condbr %5, bb2(%3, %4), bb3
+bb2(%6: u32, %7: u64):
+    %10 = call @func.27(%6, %7)
+    br bb4(%10)
+bb3:
+    %11 = const bool false
+    br bb4(%11)
+bb4(%8: bool):
+    ret %8
+}
+
+fn @zero_of(functy.16) {
+bb0(%0: u32, %1: u32, %2: u32, %3: bool):
+    %5 = const u32 0
+    %6 = const u64 0
+    %7 = call @func.12(%0, %1, %2, %5, %3, %6)
+    br bb1(%7)
+bb1(%4: u64):
+    ret %4
+}
+
+fn @exp_all_zero(functy.17) {
+bb0(%0: u32, %1: u32, %2: u64):
+    %4 = call @func.19(%0, %1, %2)
+    br bb1(%4)
+bb1(%3: u32):
+    %5 = const u32 0
+    %6 = icmp eq u32 %3, %5
+    ret %6
+}
+
+fn @hi_set_u128(functy.18) {
+bb0(%0: u128):
+    %4 = const u128 0
+    %5 = icmp eq u128 %0, %4
+    condbr %5, bb1, bb2(%0)
+bb1:
+    %6 = const u32 0
+    br bb4(%6)
+bb2(%1: u128):
+    %7 = call @func.30(%1)
+    br bb3(%7)
+bb3(%2: u32):
+    %8 = const u32 127
+    %9 = sub u32 %8, %2
+    br bb4(%9)
+bb4(%3: u32):
+    ret %3
+}
+
+fn @exp_field(functy.19) {
+bb0(%0: u32, %1: u32, %2: u64):
+    %3 = zext u32 %0 to u64
+    %4 = lshr u64 %2, %3
+    %5 = const u64 1
+    %6 = zext u32 %1 to u64
+    %7 = shl u64 %5, %6
+    %8 = const u64 1
+    %9 = sub u64 %7, %8
+    %10 = and u64 %4, %9
+    %11 = trunc u64 %10 to u32
+    ret %11
+}
+
+fn @sig_build(functy.20) {
+bb0(%0: u32, %1: bool, %2: u64):
+    %10 = call @func.10(%0, %2)
+    br bb1(%0, %1, %10)
+bb1(%3: u32, %4: bool, %5: u64):
+    %11 = zext u64 %5 to u128
+    condbr %4, bb2(%3, %11), bb3(%11)
+bb2(%6: u32, %7: u128):
+    %12 = const u128 1
+    %13 = zext u32 %6 to u128
+    %14 = shl u128 %12, %13
+    %15 = or u128 %7, %14
+    br bb4(%15)
+bb3(%8: u128):
+    br bb4(%8)
+bb4(%9: u128):
+    ret %9
+}
+
+fn @shr_sticky_u128(functy.21) {
+bb0(%0: u128, %1: u32):
+    %9 = const u32 0
+    %10 = icmp eq u32 %1, %9
+    condbr %10, bb1(%0), bb2(%0, %1)
+bb1(%2: u128):
+    br bb5(%2)
+bb2(%3: u128, %4: u32):
+    %11 = const u32 128
+    %12 = icmp uge u32 %4, %11
+    condbr %12, bb3(%3), bb4(%3, %4)
+bb3(%5: u128):
+    %13 = const u128 0
+    %14 = icmp ne u128 %5, %13
+    %15 = const u128 1
+    %16 = const u128 0
+    %17 = select u128 %14, %15, %16
+    br bb5(%17)
+bb4(%6: u128, %7: u32):
+    %18 = const u128 1
+    %19 = zext u32 %7 to u128
+    %20 = shl u128 %18, %19
+    %21 = const u128 1
+    %22 = sub u128 %20, %21
+    %23 = and u128 %6, %22
+    %24 = zext u32 %7 to u128
+    %25 = lshr u128 %6, %24
+    %26 = const u128 0
+    %27 = icmp ne u128 %23, %26
+    %28 = const u128 1
+    %29 = const u128 0
+    %30 = select u128 %27, %28, %29
+    %31 = or u128 %25, %30
+    br bb5(%31)
+bb5(%8: u128):
+    ret %8
+}
+
+fn @round_word(functy.22) {
+bb0(%0: u128):
+    %17 = const u32 3
+    %18 = zext u32 %17 to u128
+    %19 = lshr u128 %0, %18
+    %20 = const u128 1
+    %21 = and u128 %19, %20
+    %22 = const u128 1
+    %23 = icmp eq u128 %21, %22
+    %24 = const u32 3
+    %25 = const u32 1
+    %26 = sub u32 %24, %25
+    %27 = zext u32 %26 to u128
+    %28 = lshr u128 %0, %27
+    %29 = const u128 1
+    %30 = and u128 %28, %29
+    %31 = const u128 1
+    %32 = icmp eq u128 %30, %31
+    %33 = const u32 3
+    %34 = const u32 2
+    %35 = sub u32 %33, %34
+    %36 = zext u32 %35 to u128
+    %37 = lshr u128 %0, %36
+    %38 = const u128 1
+    %39 = and u128 %37, %38
+    %40 = const u128 1
+    %41 = icmp eq u128 %39, %40
+    %42 = const u128 1
+    %43 = and u128 %0, %42
+    %44 = const u128 1
+    %45 = icmp eq u128 %43, %44
+    condbr %41, bb1(%0, %23, %32), bb2(%0, %23, %32, %45)
+bb1(%1: u128, %2: bool, %3: bool):
+    %46 = const bool true
+    br bb3(%1, %2, %3, %46)
+bb2(%4: u128, %5: bool, %6: bool, %7: bool):
+    br bb3(%4, %5, %6, %7)
+bb3(%8: u128, %9: bool, %10: bool, %11: bool):
+    %47 = call @func.31(%9, %10, %11)
+    br bb4(%8, %47)
+bb4(%12: u128, %13: bool):
+    %48 = const u32 3
+    %49 = zext u32 %48 to u128
+    %50 = lshr u128 %12, %49
+    condbr %13, bb5(%50), bb6(%50)
+bb5(%14: u128):
+    %51 = const u128 1
+    %52 = add u128 %14, %51
+    br bb7(%52)
+bb6(%15: u128):
+    br bb7(%15)
+bb7(%16: u128):
+    ret %16
+}
+
+fn @nar_finish(functy.23) {
+bb0(%0: bool, %1: u32, %2: u128):
+    %62 = const i32 24
+    %63 = zext i32 %62 to u128
+    %64 = lshr u128 %2, %63
+    %65 = const u128 1
+    %66 = and u128 %64, %65
+    %67 = const u128 1
+    %68 = icmp eq u128 %66, %67
+    condbr %68, bb1(%0, %1, %2, %68), bb2(%0, %1, %2, %68)
+bb1(%3: bool, %4: u32, %5: u128, %6: bool):
+    %69 = const i32 1
+    %70 = zext i32 %69 to u128
+    %71 = lshr u128 %5, %70
+    br bb3(%3, %4, %6, %71)
+bb2(%7: bool, %8: u32, %9: u128, %10: bool):
+    br bb3(%7, %8, %10, %9)
+bb3(%11: bool, %12: u32, %13: bool, %14: u128):
+    condbr %13, bb4(%11, %12, %14), bb5(%11, %12, %14)
+bb4(%15: bool, %16: u32, %17: u128):
+    %72 = const u32 1
+    %73 = add u32 %16, %72
+    br bb6(%15, %17, %73)
+bb5(%18: bool, %19: u32, %20: u128):
+    br bb6(%18, %20, %19)
+bb6(%21: bool, %22: u128, %23: u32):
+    %74 = const i32 23
+    %75 = zext i32 %74 to u128
+    %76 = lshr u128 %22, %75
+    %77 = const u128 1
+    %78 = and u128 %76, %77
+    %79 = const u128 0
+    %80 = icmp eq u128 %78, %79
+    condbr %80, bb7(%21, %22, %23), bb8(%21, %22, %23)
+bb7(%24: bool, %25: u128, %26: u32):
+    %81 = const u32 1
+    %82 = icmp eq u32 %26, %81
+    br bb9(%24, %25, %26, %82)
+bb8(%27: bool, %28: u128, %29: u32):
+    %83 = const bool false
+    br bb9(%27, %28, %29, %83)
+bb9(%30: bool, %31: u128, %32: u32, %33: bool):
+    condbr %33, bb10(%30, %31), bb11(%30, %31, %32)
+bb10(%34: bool, %35: u128):
+    %84 = const u32 0
+    br bb12(%34, %35, %84)
+bb11(%36: bool, %37: u128, %38: u32):
+    br bb12(%36, %37, %38)
+bb12(%39: bool, %40: u128, %41: u32):
+    %85 = const u32 255
+    %86 = icmp uge u32 %41, %85
+    condbr %86, bb13(%39, %40, %86), bb14(%39, %40, %41, %86)
+bb13(%42: bool, %43: u128, %44: bool):
+    %87 = const u32 255
+    br bb15(%42, %43, %44, %87)
+bb14(%45: bool, %46: u128, %47: u32, %48: bool):
+    br bb15(%45, %46, %48, %47)
+bb15(%49: bool, %50: u128, %51: bool, %52: u32):
+    condbr %51, bb16(%49, %52), bb17(%49, %50, %52)
+bb16(%53: bool, %54: u32):
+    %88 = const u64 0
+    br bb18(%53, %54, %88)
+bb17(%55: bool, %56: u128, %57: u32):
+    %89 = trunc u128 %56 to u64
+    br bb18(%55, %57, %89)
+bb18(%58: bool, %59: u32, %60: u64):
+    %90 = const u32 32
+    %91 = const u32 23
+    %92 = const u32 8
+    %93 = call @func.12(%90, %91, %92, %59, %58, %60)
+    br bb19(%93)
+bb19(%61: u64):
+    ret %61
+}
+
+fn @fp16_widen(functy.24) {
+bb0(%0: u32, %1: u32, %2: u32, %3: u32, %4: u64):
+    %144 = const u32 16
+    %145 = call @func.7(%144)
+    br bb1(%0, %1, %2, %3, %4, %145)
+bb1(%5: u32, %6: u32, %7: u32, %8: u32, %9: u64, %10: u64):
+    %146 = and u64 %9, %10
+    %147 = const u32 16
+    %148 = call @func.8(%147, %146)
+    br bb2(%5, %6, %7, %8, %146, %148)
+bb2(%11: u32, %12: u32, %13: u32, %14: u32, %15: u64, %16: bool):
+    %149 = const u32 10
+    %150 = const u32 5
+    %151 = call @func.9(%149, %150, %15)
+    br bb3(%11, %12, %13, %14, %15, %16, %151)
+bb3(%17: u32, %18: u32, %19: u32, %20: u32, %21: u64, %22: bool, %23: bool):
+    condbr %23, bb4(%17, %18, %19, %21, %22), bb10(%17, %18, %19, %20, %21, %22)
+bb4(%24: u32, %25: u32, %26: u32, %27: u64, %28: bool):
+    %152 = const u32 10
+    %153 = call @func.10(%152, %27)
+    br bb5(%24, %25, %26, %27, %28, %153)
+bb5(%29: u32, %30: u32, %31: u32, %32: u64, %33: bool, %34: u64):
+    %154 = const u32 10
+    %155 = sub u32 %30, %154
+    %156 = zext u32 %155 to u64
+    %157 = shl u64 %34, %156
+    %158 = const u32 10
+    %159 = const u32 5
+    %160 = call @func.11(%158, %159, %32)
+    br bb6(%29, %30, %31, %33, %157, %160)
+bb6(%35: u32, %36: u32, %37: u32, %38: bool, %39: u64, %40: bool):
+    condbr %40, bb7(%35, %36, %37, %38, %39), bb8(%35, %36, %37, %38, %39)
+bb7(%41: u32, %42: u32, %43: u32, %44: bool, %45: u64):
+    %161 = const u32 1
+    %162 = sub u32 %42, %161
+    %163 = const u64 1
+    %164 = zext u32 %162 to u64
+    %165 = shl u64 %163, %164
+    %166 = or u64 %45, %165
+    br bb8(%41, %42, %43, %44, %166)
+bb8(%46: u32, %47: u32, %48: u32, %49: bool, %50: u64):
+    %167 = call @func.29(%48)
+    br bb9(%46, %47, %48, %49, %50, %167)
+bb9(%51: u32, %52: u32, %53: u32, %54: bool, %55: u64, %56: u32):
+    %168 = call @func.12(%51, %52, %53, %56, %54, %55)
+    br bb24(%168)
+bb10(%57: u32, %58: u32, %59: u32, %60: u32, %61: u64, %62: bool):
+    %169 = const u32 10
+    %170 = const u32 5
+    %171 = call @func.13(%169, %170, %61)
+    br bb11(%57, %58, %59, %60, %61, %62, %171)
+bb11(%63: u32, %64: u32, %65: u32, %66: u32, %67: u64, %68: bool, %69: bool):
+    condbr %69, bb12(%63, %64, %65, %68), bb13(%63, %64, %65, %66, %67, %68)
+bb12(%70: u32, %71: u32, %72: u32, %73: bool):
+    %172 = call @func.14(%70, %71, %72, %73)
+    br bb24(%172)
+bb13(%74: u32, %75: u32, %76: u32, %77: u32, %78: u64, %79: bool):
+    %173 = const u32 10
+    %174 = const u32 5
+    %175 = call @func.15(%173, %174, %78)
+    br bb14(%74, %75, %76, %77, %78, %79, %175)
+bb14(%80: u32, %81: u32, %82: u32, %83: u32, %84: u64, %85: bool, %86: bool):
+    condbr %86, bb15(%80, %81, %82, %85), bb16(%80, %81, %82, %83, %84, %85)
+bb15(%87: u32, %88: u32, %89: u32, %90: bool):
+    %176 = call @func.16(%87, %88, %89, %90)
+    br bb24(%176)
+bb16(%91: u32, %92: u32, %93: u32, %94: u32, %95: u64, %96: bool):
+    %177 = const u32 10
+    %178 = const u32 5
+    %179 = call @func.17(%177, %178, %95)
+    br bb17(%91, %92, %93, %94, %95, %96, %179)
+bb17(%97: u32, %98: u32, %99: u32, %100: u32, %101: u64, %102: bool, %103: bool):
+    condbr %103, bb18(%97, %98, %99, %100, %101, %102), bb21(%97, %98, %99, %100, %101, %102)
+bb18(%104: u32, %105: u32, %106: u32, %107: u32, %108: u64, %109: bool):
+    %180 = const u32 10
+    %181 = call @func.10(%180, %108)
+    br bb19(%104, %105, %106, %107, %109, %181)
+bb19(%110: u32, %111: u32, %112: u32, %113: u32, %114: bool, %115: u64):
+    %182 = zext u64 %115 to u128
+    %183 = call @func.18(%182)
+    br bb20(%110, %111, %112, %113, %114, %115, %183)
+bb20(%116: u32, %117: u32, %118: u32, %119: u32, %120: bool, %121: u64, %122: u32):
+    %184 = add u32 %122, %119
+    %185 = const u32 24
+    %186 = sub u32 %184, %185
+    %187 = sub u32 %117, %122
+    %188 = zext u32 %187 to u64
+    %189 = shl u64 %121, %188
+    %190 = zext u64 %189 to u128
+    %191 = const u128 1
+    %192 = zext u32 %117 to u128
+    %193 = shl u128 %191, %192
+    %194 = const u128 1
+    %195 = sub u128 %193, %194
+    %196 = and u128 %190, %195
+    %197 = trunc u128 %196 to u64
+    %198 = call @func.12(%116, %117, %118, %186, %120, %197)
+    br bb24(%198)
+bb21(%123: u32, %124: u32, %125: u32, %126: u32, %127: u64, %128: bool):
+    %199 = const u32 10
+    %200 = const u32 5
+    %201 = call @func.19(%199, %200, %127)
+    br bb22(%123, %124, %125, %126, %127, %128, %201)
+bb22(%129: u32, %130: u32, %131: u32, %132: u32, %133: u64, %134: bool, %135: u32):
+    %202 = const u32 10
+    %203 = call @func.10(%202, %133)
+    br bb23(%129, %130, %131, %132, %134, %135, %203)
+bb23(%136: u32, %137: u32, %138: u32, %139: u32, %140: bool, %141: u32, %142: u64):
+    %204 = add u32 %141, %139
+    %205 = const u32 15
+    %206 = sub u32 %204, %205
+    %207 = const u32 10
+    %208 = sub u32 %137, %207
+    %209 = zext u32 %208 to u64
+    %210 = shl u64 %142, %209
+    %211 = call @func.12(%136, %137, %138, %206, %140, %210)
+    br bb24(%211)
+bb24(%143: u64):
+    ret %143
+}
+
+fn @fp16_narrow(functy.25) {
+bb0(%0: u32, %1: u32, %2: u32, %3: u32, %4: u64):
+    %64 = call @func.7(%0)
+    br bb1(%0, %1, %2, %3, %4, %64)
+bb1(%5: u32, %6: u32, %7: u32, %8: u32, %9: u64, %10: u64):
+    %65 = and u64 %9, %10
+    %66 = call @func.8(%5, %65)
+    br bb2(%5, %6, %7, %8, %65, %66)
+bb2(%11: u32, %12: u32, %13: u32, %14: u32, %15: u64, %16: bool):
+    %67 = call @func.9(%12, %13, %15)
+    br bb3(%11, %12, %13, %14, %15, %16, %67)
+bb3(%17: u32, %18: u32, %19: u32, %20: u32, %21: u64, %22: bool, %23: bool):
+    condbr %23, bb4(%18, %21, %22), bb6(%17, %18, %19, %20, %21, %22)
+bb4(%24: u32, %25: u64, %26: bool):
+    %68 = call @func.10(%24, %25)
+    br bb5(%24, %26, %68)
+bb5(%27: u32, %28: bool, %29: u64):
+    %69 = const u32 10
+    %70 = sub u32 %27, %69
+    %71 = zext u32 %70 to u64
+    %72 = lshr u64 %29, %71
+    %73 = const u64 1
+    %74 = const i32 9
+    %75 = zext i32 %74 to u64
+    %76 = shl u64 %73, %75
+    %77 = or u64 %72, %76
+    %78 = const u32 16
+    %79 = const u32 10
+    %80 = const u32 5
+    %81 = const u32 31
+    %82 = call @func.12(%78, %79, %80, %81, %28, %77)
+    br bb13(%82)
+bb6(%30: u32, %31: u32, %32: u32, %33: u32, %34: u64, %35: bool):
+    %83 = call @func.13(%31, %32, %34)
+    br bb7(%30, %31, %32, %33, %34, %35, %83)
+bb7(%36: u32, %37: u32, %38: u32, %39: u32, %40: u64, %41: bool, %42: bool):
+    condbr %42, bb8(%41), bb9(%36, %37, %38, %39, %40, %41)
+bb8(%43: bool):
+    %84 = const u32 16
+    %85 = const u32 10
+    %86 = const u32 5
+    %87 = call @func.14(%84, %85, %86, %43)
+    br bb13(%87)
+bb9(%44: u32, %45: u32, %46: u32, %47: u32, %48: u64, %49: bool):
+    %88 = call @func.15(%45, %46, %48)
+    br bb10(%44, %45, %46, %47, %48, %49, %88)
+bb10(%50: u32, %51: u32, %52: u32, %53: u32, %54: u64, %55: bool, %56: bool):
+    condbr %56, bb11(%55), bb12(%50, %51, %52, %53, %54)
+bb11(%57: bool):
+    %89 = const u32 16
+    %90 = const u32 10
+    %91 = const u32 5
+    %92 = call @func.16(%89, %90, %91, %57)
+    br bb13(%92)
+bb12(%58: u32, %59: u32, %60: u32, %61: u32, %62: u64):
+    %93 = call @func.32(%58, %59, %60, %61, %62)
+    br bb13(%93)
+bb13(%63: u64):
+    ret %63
+}
+
+fn @exp_all_ones(functy.26) {
+bb0(%0: u32, %1: u32, %2: u64):
+    %7 = call @func.19(%0, %1, %2)
+    br bb1(%1, %7)
+bb1(%3: u32, %4: u32):
+    %8 = call @func.29(%3)
+    br bb2(%4, %8)
+bb2(%5: u32, %6: u32):
+    %9 = icmp eq u32 %5, %6
+    ret %9
+}
+
+fn @mant_zero(functy.27) {
+bb0(%0: u32, %1: u64):
+    %3 = call @func.10(%0, %1)
+    br bb1(%3)
+bb1(%2: u64):
+    %4 = const u64 0
+    %5 = icmp eq u64 %2, %4
+    ret %5
+}
+
+fn @mant_msb(functy.28) {
+bb0(%0: u32, %1: u64):
+    %2 = const u32 1
+    %3 = sub u32 %0, %2
+    %4 = zext u32 %3 to u64
+    %5 = lshr u64 %1, %4
+    %6 = const u64 1
+    %7 = and u64 %5, %6
+    %8 = const u64 1
+    %9 = icmp eq u64 %7, %8
+    ret %9
+}
+
+fn @exp_max(functy.29) {
+bb0(%0: u32):
+    %1 = const u32 1
+    %2 = shl u32 %1, %0
+    %3 = const u32 1
+    %4 = sub u32 %2, %3
+    ret %4
+}
+
+fn @u128_leading_zeros(functy.30) {
+bb0(%0: u128):
+    %13 = const u32 0
+    %14 = const u32 128
+    br bb1(%0, %13, %14)
+bb1(%1: u128, %2: u32, %3: u32):
+    %15 = const u32 0
+    %16 = icmp ugt u32 %3, %15
+    condbr %16, bb2(%1, %2, %3), bb5(%2)
+bb2(%4: u128, %5: u32, %6: u32):
+    %17 = const u32 1
+    %18 = sub u32 %6, %17
+    %19 = zext u32 %18 to u128
+    %20 = lshr u128 %4, %19
+    %21 = const u128 1
+    %22 = and u128 %20, %21
+    %23 = const u128 1
+    %24 = icmp eq u128 %22, %23
+    condbr %24, bb3(%5), bb4(%4, %5, %18)
+bb3(%7: u32):
+    br bb6(%7)
+bb4(%8: u128, %9: u32, %10: u32):
+    %25 = const u32 1
+    %26 = add u32 %9, %25
+    br bb1(%8, %26, %10)
+bb5(%11: u32):
+    br bb6(%11)
+bb6(%12: u32):
+    ret %12
+}
+
+fn @round_up(functy.31) {
+bb0(%0: bool, %1: bool, %2: bool):
+    condbr %1, bb1(%0, %2), bb2
+bb1(%3: bool, %4: bool):
+    condbr %4, bb3, bb4(%3)
+bb2:
+    %7 = const bool false
+    br bb5(%7)
+bb3:
+    %8 = const bool true
+    br bb5(%8)
+bb4(%5: bool):
+    br bb5(%5)
+bb5(%6: bool):
+    ret %6
+}
+
+fn @fp16_narrow_finite(functy.32) {
+bb0(%0: u32, %1: u32, %2: u32, %3: u32, %4: u64):
+    %82 = call @func.8(%0, %4)
+    br bb1(%1, %2, %3, %4, %82)
+bb1(%5: u32, %6: u32, %7: u32, %8: u64, %9: bool):
+    %83 = call @func.19(%5, %6, %8)
+    br bb2(%5, %6, %7, %8, %9, %83)
+bb2(%10: u32, %11: u32, %12: u32, %13: u64, %14: bool, %15: u32):
+    %84 = call @func.17(%10, %11, %13)
+    br bb3(%10, %12, %13, %14, %15, %84)
+bb3(%16: u32, %17: u32, %18: u64, %19: bool, %20: u32, %21: bool):
+    %85 = const bool false
+    %86 = icmp eq bool %21, %85
+    %87 = call @func.20(%16, %86, %18)
+    br bb4(%16, %17, %19, %20, %87)
+bb4(%22: u32, %23: u32, %24: bool, %25: u32, %26: u128):
+    %88 = const u32 15
+    %89 = sub u32 %23, %88
+    %90 = icmp ugt u32 %25, %89
+    condbr %90, bb5(%22, %23, %24, %25, %26, %90), bb6(%22, %23, %24, %25, %26, %90)
+bb5(%27: u32, %28: u32, %29: bool, %30: u32, %31: u128, %32: bool):
+    %91 = const u32 15
+    %92 = add u32 %30, %91
+    %93 = sub u32 %92, %28
+    br bb7(%27, %28, %29, %30, %31, %32, %93)
+bb6(%33: u32, %34: u32, %35: bool, %36: u32, %37: u128, %38: bool):
+    %94 = const u32 0
+    br bb7(%33, %34, %35, %36, %37, %38, %94)
+bb7(%39: u32, %40: u32, %41: bool, %42: u32, %43: u128, %44: bool, %45: u32):
+    condbr %44, bb8(%39, %41, %43, %44, %45), bb9(%39, %40, %41, %42, %43, %44, %45)
+bb8(%46: u32, %47: bool, %48: u128, %49: bool, %50: u32):
+    %95 = const u32 0
+    br bb10(%46, %47, %48, %49, %50, %95)
+bb9(%51: u32, %52: u32, %53: bool, %54: u32, %55: u128, %56: bool, %57: u32):
+    %96 = const u32 1
+    %97 = add u32 %52, %96
+    %98 = const u32 15
+    %99 = add u32 %54, %98
+    %100 = sub u32 %97, %99
+    br bb10(%51, %53, %55, %56, %57, %100)
+bb10(%58: u32, %59: bool, %60: u128, %61: bool, %62: u32, %63: u32):
+    %101 = const u32 13
+    %102 = sub u32 %58, %101
+    %103 = add u32 %102, %63
+    condbr %61, bb11(%59, %60, %62, %103), bb12(%59, %60, %103)
+bb11(%64: bool, %65: u128, %66: u32, %67: u32):
+    br bb13(%64, %65, %67, %66)
+bb12(%68: bool, %69: u128, %70: u32):
+    %104 = const u32 1
+    br bb13(%68, %69, %70, %104)
+bb13(%71: bool, %72: u128, %73: u32, %74: u32):
+    %105 = call @func.21(%72, %73)
+    br bb14(%71, %74, %105)
+bb14(%75: bool, %76: u32, %77: u128):
+    %106 = call @func.22(%77)
+    br bb15(%75, %76, %106)
+bb15(%78: bool, %79: u32, %80: u128):
+    %107 = call @func.33(%78, %79, %80)
+    br bb16(%107)
+bb16(%81: u64):
+    ret %81
+}
+
+fn @nar_finish16(functy.33) {
+bb0(%0: bool, %1: u32, %2: u128):
+    %62 = const i32 11
+    %63 = zext i32 %62 to u128
+    %64 = lshr u128 %2, %63
+    %65 = const u128 1
+    %66 = and u128 %64, %65
+    %67 = const u128 1
+    %68 = icmp eq u128 %66, %67
+    condbr %68, bb1(%0, %1, %2, %68), bb2(%0, %1, %2, %68)
+bb1(%3: bool, %4: u32, %5: u128, %6: bool):
+    %69 = const i32 1
+    %70 = zext i32 %69 to u128
+    %71 = lshr u128 %5, %70
+    br bb3(%3, %4, %6, %71)
+bb2(%7: bool, %8: u32, %9: u128, %10: bool):
+    br bb3(%7, %8, %10, %9)
+bb3(%11: bool, %12: u32, %13: bool, %14: u128):
+    condbr %13, bb4(%11, %12, %14), bb5(%11, %12, %14)
+bb4(%15: bool, %16: u32, %17: u128):
+    %72 = const u32 1
+    %73 = add u32 %16, %72
+    br bb6(%15, %17, %73)
+bb5(%18: bool, %19: u32, %20: u128):
+    br bb6(%18, %20, %19)
+bb6(%21: bool, %22: u128, %23: u32):
+    %74 = const i32 10
+    %75 = zext i32 %74 to u128
+    %76 = lshr u128 %22, %75
+    %77 = const u128 1
+    %78 = and u128 %76, %77
+    %79 = const u128 0
+    %80 = icmp eq u128 %78, %79
+    condbr %80, bb7(%21, %22, %23), bb8(%21, %22, %23)
+bb7(%24: bool, %25: u128, %26: u32):
+    %81 = const u32 1
+    %82 = icmp eq u32 %26, %81
+    br bb9(%24, %25, %26, %82)
+bb8(%27: bool, %28: u128, %29: u32):
+    %83 = const bool false
+    br bb9(%27, %28, %29, %83)
+bb9(%30: bool, %31: u128, %32: u32, %33: bool):
+    condbr %33, bb10(%30, %31), bb11(%30, %31, %32)
+bb10(%34: bool, %35: u128):
+    %84 = const u32 0
+    br bb12(%34, %35, %84)
+bb11(%36: bool, %37: u128, %38: u32):
+    br bb12(%36, %37, %38)
+bb12(%39: bool, %40: u128, %41: u32):
+    %85 = const u32 31
+    %86 = icmp uge u32 %41, %85
+    condbr %86, bb13(%39, %40, %86), bb14(%39, %40, %41, %86)
+bb13(%42: bool, %43: u128, %44: bool):
+    %87 = const u32 31
+    br bb15(%42, %43, %44, %87)
+bb14(%45: bool, %46: u128, %47: u32, %48: bool):
+    br bb15(%45, %46, %48, %47)
+bb15(%49: bool, %50: u128, %51: bool, %52: u32):
+    condbr %51, bb16(%49, %52), bb17(%49, %50, %52)
+bb16(%53: bool, %54: u32):
+    %88 = const u64 0
+    br bb18(%53, %54, %88)
+bb17(%55: bool, %56: u128, %57: u32):
+    %89 = trunc u128 %56 to u64
+    br bb18(%55, %57, %89)
+bb18(%58: bool, %59: u32, %60: u64):
+    %90 = const u32 16
+    %91 = const u32 10
+    %92 = const u32 5
+    %93 = call @func.12(%90, %91, %92, %59, %58, %60)
+    br bb19(%93)
+bb19(%61: u64):
+    ret %61
+}

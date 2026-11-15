@@ -70,14 +70,14 @@ const NUM_CLAUSES: usize = 218;
 const SEED: u64 = 42;
 
 fn fixture_clauses() -> Vec<Vec<i32>> {
-    random_3sat(NUM_VARS, NUM_CLAUSES, SEED)
+    random_3sat(NUM_VARS, NUM_CLAUSES, SEED).expect("valid 3-SAT fixture")
 }
 
 fn bench_module_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("jit_compile_breakdown");
     group.bench_function("module_construction", |b| {
         b.iter(|| {
-            let module = build_bcp_propagate_module();
+            let module = build_bcp_propagate_module().expect("the kernel module builds");
             black_box(module);
         });
     });
@@ -88,11 +88,12 @@ fn bench_compile_module_to_jit_total(c: &mut Criterion) {
     let mut group = c.benchmark_group("jit_compile_breakdown");
     group.bench_function("compile_module_to_jit_total", |b| {
         b.iter_batched(
-            build_bcp_propagate_module,
+            || build_bcp_propagate_module().expect("the kernel module builds"),
             |module| {
                 let config = CompilerConfig::for_host_jit();
                 let extern_symbols: HashMap<String, *const u8> = HashMap::new();
                 let result = Compiler::new(config)
+                    .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
                     .compile_module_to_jit(&module, &extern_symbols)
                     .expect("compile_module_to_jit");
                 black_box(result);
@@ -180,11 +181,12 @@ fn bench_sub_phases(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    let module = build_bcp_propagate_module();
+                    let module = build_bcp_propagate_module().expect("the kernel module builds");
                     let mut config = CompilerConfig::for_host_jit();
                     config.trace_level = CompilerTraceLevel::Full;
                     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
                     let result = Compiler::new(config)
+                        .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
                         .compile_module_to_jit(&module, &extern_symbols)
                         .expect("compile_module_to_jit (trace)");
                     total += extract_phase(&result, &phase_name);
@@ -241,11 +243,12 @@ fn extract_phase(
 fn _smoke_invariant_check() {
     let clauses = fixture_clauses();
     // Match what `JitBcpKernelProvider::compile` does, but with tracing on.
-    let module = build_bcp_propagate_module();
+    let module = build_bcp_propagate_module().expect("the kernel module builds");
     let mut config = CompilerConfig::for_host_jit();
     config.trace_level = CompilerTraceLevel::Full;
     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
     let result = Compiler::new(config)
+        .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
         .compile_module_to_jit(&module, &extern_symbols)
         .expect("compile_module_to_jit (smoke)");
     assert!(

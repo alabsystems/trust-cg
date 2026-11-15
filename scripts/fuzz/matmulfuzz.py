@@ -3,6 +3,13 @@
 Soundness fuzzer for the neon-map store-form matmul row-update vectorization
 (loop-invariant scalar leaf + derived-row-base noalias resolution).
 
+Scope: this script exercises `neon_map` on pointer parameters; it never
+reaches `mac-reg-block`, which models only stack-local arrays, and no runner
+invokes it. Its generator (both loop orders, the adversarial fill, edge and
+seeded random sizes) is ported to `mac-reg-block`'s shape in the committed
+native gate crates/trust-cg-codegen/tests/e2e_aarch64_mac_reg_block_differential.rs
+(ledger L10-P4); that target, not this script, is the release gate for it.
+
 Generates the classic i32 square matmul `C[i][j] += A[i][k]*B[k][j]` in BOTH
 loop orders — ikj (store-form saxpy inner, the vectorized order) and ijk
 (dot-product inner) — as size-generic trust_ir `@matmul(C,A,B,N)` with noalias
@@ -210,7 +217,7 @@ int main(int argc,char**argv){
 def compile_tcg(tcg, tir, obj, disable=None):
     env=dict(os.environ)
     if disable: env["TRUST_CG_DISABLE_PASSES"]=disable
-    return subprocess.run([tcg,"--format=text","--target","aarch64","-O2","-c",tir,"-o",obj],
+    return subprocess.run([tcg,"--format=text","--permit-unlicensed","--target","aarch64","-O2","-c",tir,"-o",obj],
                           capture_output=True,text=True,env=env)
 
 def has_st1(obj):

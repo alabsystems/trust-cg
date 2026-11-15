@@ -669,6 +669,19 @@ mod tests {
         let changed = pass.run(&mut func);
         let after = &func.blocks[&Block(0)].insts;
 
+        // `mov v1, 7; add v0, v1` => `add v0, 7` is true, so with the proof
+        // authority installed the pass must prove and commit it; only without
+        // it may the pass fail closed.
+        let authority = crate::formal_gap::proof_authority_present(
+            "test_enabled_pass_fuses_or_leaves_unchanged (proof half)",
+        );
+        assert_eq!(
+            changed,
+            authority,
+            "the fusion must be committed exactly when the proof authority is installed \
+             (stats: {:?})",
+            pass.stats()
+        );
         if changed {
             // Fused: single AddRI dst, imm; the mov is gone.
             assert_eq!(after.len(), 1, "fusion should remove the constant MOV");

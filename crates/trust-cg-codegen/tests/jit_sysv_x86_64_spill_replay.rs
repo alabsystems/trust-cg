@@ -25,7 +25,7 @@ const V128_SPILL_REPLAY_LANES: usize = 24;
 fn host_jit_o0_compiler() -> Compiler {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
-    Compiler::new(config)
+    Compiler::new(config).with_codegen_license(permit_unlicensed())
 }
 
 fn host_jit_o0_x86_pipeline() -> X86Pipeline {
@@ -39,7 +39,7 @@ fn host_jit_o0_x86_pipeline() -> X86Pipeline {
 
 fn single_lir_function(module: &trust_ir::Module) -> LirFunction {
     let mut functions =
-        trust_cg_lower::translate_module(module).expect("spill replay module should lower to LIR");
+        permit_translate_module(module).expect("spill replay module should lower to LIR");
     assert_eq!(functions.len(), 1);
     functions.remove(0).0
 }
@@ -69,7 +69,7 @@ fn build_high_gpr_pressure_spill_replay_module() -> trust_ir::Module {
     }
     fb.ret(vec![acc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn reference_high_gpr_pressure(input: &[i64]) -> i64 {
@@ -106,7 +106,7 @@ fn build_high_fpr_pressure_spill_replay_module() -> trust_ir::Module {
     }
     fb.ret(vec![acc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn reference_high_fpr_pressure(input: &[f64]) -> f64 {
@@ -136,12 +136,11 @@ fn build_high_v128_pressure_spill_replay_lir() -> LirFunction {
     func.entry_block = entry;
     func.block_order.push(entry);
 
-    let mut next_value = V128_SPILL_REPLAY_LANES as u32 + 1;
     let mut acc = Value(0);
     let mut instructions = Vec::new();
-    for lane in 1..V128_SPILL_REPLAY_LANES {
+    for (next_value, lane) in (V128_SPILL_REPLAY_LANES as u32 + 1..).zip(1..V128_SPILL_REPLAY_LANES)
+    {
         let result = Value(next_value);
-        next_value += 1;
         instructions.push(Instruction {
             opcode: Opcode::Iadd,
             args: vec![acc, Value(lane as u32)],
@@ -266,4 +265,28 @@ fn x86_64_sysv_ay_v128_pressure_evidence_has_spill_canaries() {
     assert!(evidence.machine_code.movdqu_store_count > 0, "{evidence:?}");
     assert!(evidence.instruction_count > 0, "{evidence:?}");
     assert!(evidence.code_size_bytes > 0, "{evidence:?}");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

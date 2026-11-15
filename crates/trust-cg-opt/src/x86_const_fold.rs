@@ -5,8 +5,7 @@
 
 //! Conservative constant folding for x86-64 ISel-output functions.
 //!
-//! This pass is intentionally scoped to the x86 pass-manager surface. It is not
-//! part of the default x86 codegen pipeline.
+//! Runs in the x86 optimization pipeline and through the standalone pass manager.
 
 use std::collections::HashMap;
 
@@ -14,7 +13,10 @@ use trust_cg_ir::regs::RegClass;
 use trust_cg_ir::{OpcodeCategory, VReg, X86Opcode};
 use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
-use crate::effects::{x86_inst_effect, x86_produces_value, x86_reads_flags, x86_writes_flags};
+use crate::effects::{
+    FlagOverwrite, condition_flag_overwrite, x86_inst_effect, x86_produces_value, x86_reads_flags,
+    x86_writes_flags,
+};
 use crate::x86_pass_manager::X86MachinePass;
 
 /// Constant folding for x86-64 ISel-output machine functions.
@@ -450,7 +452,7 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
         if x86_reads_flags(inst.opcode) {
             return false;
         }
-        if x86_writes_flags(inst.opcode) {
+        if condition_flag_overwrite(inst) == FlagOverwrite::Full {
             return true;
         }
         if instruction_may_export_flags(inst) {
@@ -562,6 +564,40 @@ mod tests {
 
     fn entry_opcodes(func: &X86ISelFunction) -> Vec<X86Opcode> {
         entry_insts(func).iter().map(|inst| inst.opcode).collect()
+    }
+
+    #[test]
+    fn x86_const_fold_preserves_flags_across_partial_writes() {
+        for intervening in [
+            X86ISelInst::new(X86Opcode::Inc, vec![vreg(4)]),
+            X86ISelInst::new(X86Opcode::Dec, vec![vreg(4)]),
+            X86ISelInst::new(X86Opcode::Not, vec![vreg(4)]),
+            X86ISelInst::new(
+                X86Opcode::ShlRI,
+                vec![vreg(4), vreg(5), X86ISelOperand::Imm(0)],
+            ),
+        ] {
+            let opcode = intervening.opcode;
+            let mut func = make_func(vec![
+                X86ISelInst::new(X86Opcode::MovRI, vec![vreg(0), X86ISelOperand::Imm(-1)]),
+                X86ISelInst::new(
+                    X86Opcode::AddRI,
+                    vec![vreg(1), vreg(0), X86ISelOperand::Imm(1)],
+                ),
+                intervening,
+                X86ISelInst::new(
+                    X86Opcode::Setcc,
+                    vec![vreg32(3), X86ISelOperand::CondCode(X86CondCode::B)],
+                ),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            X86ConstantFolding.run_on_function(&mut func);
+            assert_eq!(
+                entry_insts(&func)[1].opcode,
+                X86Opcode::AddRI,
+                "{opcode:?} preserves the carry consumed by SETB"
+            );
+        }
     }
 
     #[test]

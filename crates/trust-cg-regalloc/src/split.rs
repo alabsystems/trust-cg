@@ -47,6 +47,8 @@ pub struct SplitResult {
 /// Reason an attempted split point cannot be materialized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitError {
+    /// No fresh register ID can be represented for the split child.
+    VirtualRegisterExhausted,
     /// The split point is outside the interval's overall extent.
     SplitPointOutOfRange {
         split_point: u32,
@@ -221,8 +223,8 @@ pub fn find_optimal_split_point(interval: &LiveInterval) -> Option<u32> {
 /// A `PSEUDO_COPY` instruction is inserted to connect them: the new VReg
 /// is defined as a copy of the original at the split point.
 ///
-/// Returns `None` if the split point is outside the interval or would
-/// produce empty intervals.
+/// Returns `None` for an unsupported split, including register-ID exhaustion.
+/// All declined splits leave the function and its allocation counter unchanged.
 pub fn split_interval(
     interval: &LiveInterval,
     split_point: u32,
@@ -257,7 +259,11 @@ pub fn split_interval_checked(
         split_copy_plan(func, split_point, &rewrite_positions).map_err(SplitError::UnsafeCfg)?;
 
     let original_vreg = interval.vreg;
-    let new_vreg = func.alloc_vreg(original_vreg.class);
+    let mut ids = split_helper_timed(6, || func.vreg_allocation_plan());
+    ids.observe(original_vreg);
+    let new_vreg = ids
+        .allocate(original_vreg.class)
+        .ok_or(SplitError::VirtualRegisterExhausted)?;
 
     // Build the two new intervals by partitioning ranges.
     let mut original_interval = LiveInterval::new(original_vreg);
@@ -319,6 +325,8 @@ pub fn split_interval_checked(
     original_interval.spill_weight = interval.spill_weight;
     new_interval.spill_weight = interval.spill_weight;
 
+    // All refusal paths above leave both the IR and its counter untouched.
+    func.next_vreg = ids.next_vreg();
     rewrite_split_operands(func, original_vreg, new_vreg, split_point, &new_interval);
 
     copy_plan.insert_copies(func, original_vreg, new_vreg);
@@ -331,7 +339,7 @@ pub fn split_interval_checked(
     })
 }
 
-fn rewrite_split_operands(
+fn rewrite_split_operands_uncounted(
     func: &mut MachFunction,
     original_vreg: VReg,
     new_vreg: VReg,
@@ -510,6 +518,103 @@ fn push_split_copy(func: &mut MachFunction, original_vreg: VReg, new_vreg: VReg)
     let copy_id = InstId(func.insts.len() as u32);
     func.insts.push(copy_inst);
     copy_id
+}
+
+// ---------------------------------------------------------------------------
+// DIAGNOSTIC (default off, shares `TCG_RA_GREEDY_STATS`): call counts and wall
+// time for the CFG/layout helpers the split path calls.
+// ---------------------------------------------------------------------------
+//
+// WHY. Each of these walks the WHOLE function or CFG on every call, and the
+// greedy allocator's split cascade calls them ~10^5 times on one Clean-kernel
+// function (measured 2026-09-27: `build_decl_types`, 76 550 split attempts).
+// This says which one the time is in. PURELY OBSERVATIONAL: inert unless the
+// env var is set, and nothing here reads or writes the IR.
+
+/// One counter/timer pair per instrumented helper.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SplitHelperStats {
+    pub calls: u64,
+    pub nanos: u128,
+}
+
+/// The instrumented helpers, in the order [`take_split_helper_stats`] returns them.
+pub(crate) const SPLIT_HELPERS: usize = 7;
+pub(crate) const SPLIT_HELPER_NAMES: [&str; SPLIT_HELPERS] = [
+    "block_for_split_point",
+    "block_layout_span",
+    "block_participates_in_cycle",
+    "cfg_dominates_block",
+    "insert_copy_at_point",
+    "rewrite_split_operands",
+    "vreg_allocation_plan",
+];
+
+thread_local! {
+    static SPLIT_HELPER_STATS: std::cell::Cell<[SplitHelperStats; SPLIT_HELPERS]> =
+        const { std::cell::Cell::new([SplitHelperStats { calls: 0, nanos: 0 }; SPLIT_HELPERS]) };
+}
+
+fn split_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TCG_RA_GREEDY_STATS").is_some())
+}
+
+/// Time `body` and attribute it to helper `idx`. `body()` alone when off.
+fn split_helper_timed<T>(idx: usize, body: impl FnOnce() -> T) -> T {
+    if !split_stats_enabled() {
+        return body();
+    }
+    let start = std::time::Instant::now();
+    let out = body();
+    let elapsed = start.elapsed().as_nanos();
+    SPLIT_HELPER_STATS.with(|cell| {
+        let mut table = cell.get();
+        table[idx].calls += 1;
+        table[idx].nanos += elapsed;
+        cell.set(table);
+    });
+    out
+}
+
+/// Take and clear this thread's helper stats (diagnostic; see above).
+pub(crate) fn take_split_helper_stats() -> [SplitHelperStats; SPLIT_HELPERS] {
+    SPLIT_HELPER_STATS.with(|cell| cell.replace([SplitHelperStats::default(); SPLIT_HELPERS]))
+}
+
+// Counting wrappers for the helpers above (see `split_helper_timed`). Each
+// forwards verbatim; with the diagnostic off they are a plain call.
+fn block_for_split_point(func: &MachFunction, point: u32) -> Option<(BlockId, u32, u32)> {
+    split_helper_timed(0, || block_for_split_point_uncounted(func, point))
+}
+
+fn block_layout_span(func: &MachFunction, target: BlockId) -> Option<(u32, u32)> {
+    split_helper_timed(1, || block_layout_span_uncounted(func, target))
+}
+
+fn block_participates_in_cycle(func: &MachFunction, block_id: BlockId) -> bool {
+    split_helper_timed(2, || block_participates_in_cycle_uncounted(func, block_id))
+}
+
+fn cfg_dominates_block(func: &MachFunction, dominator: BlockId, block: BlockId) -> bool {
+    split_helper_timed(3, || cfg_dominates_block_uncounted(func, dominator, block))
+}
+
+fn insert_copy_at_point(func: &mut MachFunction, copy_id: InstId, point: u32) {
+    split_helper_timed(4, || insert_copy_at_point_uncounted(func, copy_id, point))
+}
+
+fn rewrite_split_operands(
+    func: &mut MachFunction,
+    original_vreg: VReg,
+    new_vreg: VReg,
+    split_point: u32,
+    new_interval: &LiveInterval,
+) {
+    split_helper_timed(5, || {
+        rewrite_split_operands_uncounted(func, original_vreg, new_vreg, split_point, new_interval)
+    })
 }
 
 fn split_copy_plan(
@@ -696,7 +801,7 @@ fn edge_is_backedge(func: &MachFunction, predecessor: BlockId, successor: BlockI
     predecessor == successor || cfg_reaches_block(func, successor, predecessor)
 }
 
-fn block_for_split_point(func: &MachFunction, point: u32) -> Option<(BlockId, u32, u32)> {
+fn block_for_split_point_uncounted(func: &MachFunction, point: u32) -> Option<(BlockId, u32, u32)> {
     let mut global_idx: u32 = 0;
     for &block_id in &func.block_order {
         let block = &func.blocks[block_id.0 as usize];
@@ -718,7 +823,7 @@ fn block_for_split_point(func: &MachFunction, point: u32) -> Option<(BlockId, u3
     None
 }
 
-fn block_layout_span(func: &MachFunction, target: BlockId) -> Option<(u32, u32)> {
+fn block_layout_span_uncounted(func: &MachFunction, target: BlockId) -> Option<(u32, u32)> {
     let mut global_idx: u32 = 0;
     for &block_id in &func.block_order {
         let block = &func.blocks[block_id.0 as usize];
@@ -760,7 +865,7 @@ fn edge_copy_position(func: &MachFunction, predecessor: BlockId) -> Option<u32> 
     None
 }
 
-fn block_participates_in_cycle(func: &MachFunction, block_id: BlockId) -> bool {
+fn block_participates_in_cycle_uncounted(func: &MachFunction, block_id: BlockId) -> bool {
     let Some(block) = func.blocks.get(block_id.0 as usize) else {
         return false;
     };
@@ -790,7 +895,7 @@ fn cfg_reaches_block(func: &MachFunction, start: BlockId, target: BlockId) -> bo
     false
 }
 
-fn cfg_dominates_block(func: &MachFunction, dominator: BlockId, block: BlockId) -> bool {
+fn cfg_dominates_block_uncounted(func: &MachFunction, dominator: BlockId, block: BlockId) -> bool {
     if dominator == block {
         return true;
     }
@@ -820,7 +925,7 @@ fn cfg_dominates_block(func: &MachFunction, dominator: BlockId, block: BlockId) 
 ///
 /// Finds the block containing instructions around `point` and inserts
 /// the copy before the instruction at that index.
-fn insert_copy_at_point(func: &mut MachFunction, copy_id: InstId, point: u32) {
+fn insert_copy_at_point_uncounted(func: &mut MachFunction, copy_id: InstId, point: u32) {
     // Walk blocks to find where to insert based on instruction numbering.
     let mut global_idx: u32 = 0;
     for &block_id in &func.block_order.clone() {
@@ -892,20 +997,13 @@ pub fn find_split_near_interference(
     interval: &LiveInterval,
     interference_start: u32,
 ) -> Option<u32> {
-    let mut positions: Vec<u32> = interval
+    let last_before = interval
         .use_positions
         .iter()
         .chain(interval.def_positions.iter())
         .copied()
         .filter(|&p| p < interference_start)
-        .collect();
-    positions.sort_unstable();
-
-    if positions.is_empty() {
-        return None;
-    }
-
-    let last_before = *positions.last().unwrap();
+        .max()?;
     let split_point = last_before + 1;
 
     if split_point <= interval.start() || split_point >= interval.end() {
@@ -1244,7 +1342,8 @@ fn count_vreg_uses_in_block(func: &MachFunction, b: usize, vreg: VReg) -> usize 
 /// preheader terminator), and rewrites the victim's uses in `rewrite_blocks` to
 /// `V_in`. Returns `Some(V_in)` when a rewrite was made (a reload copy was
 /// placed); `None` (a no-op — nothing inserted) when there is nothing to rewrite
-/// or the INVARIANCE precondition fails for a rewrite block (fail-closed).
+/// or the INVARIANCE precondition fails for a rewrite block, or fresh register
+/// IDs are exhausted (fail-closed).
 ///
 /// The returned `V_in` lets the driver's KEEP-BETTER metric distinguish the
 /// deliberately-added reload temporary from an original spill victim: a `V_in`
@@ -1275,7 +1374,7 @@ pub(crate) fn inject_loop_reload(func: &mut MachFunction, point: &LoopReloadPoin
         }
     }
 
-    let v_in = func.alloc_vreg(point.victim.class);
+    let v_in = func.try_alloc_vreg(point.victim.class)?;
     // Place the reload copy on each forward entry edge (Phase A: exactly one).
     for &pred in &point.forward_preds {
         let copy_id = push_split_copy(func, point.victim, v_in);
@@ -1489,6 +1588,28 @@ mod tests {
         // New interval should cover [10, 20).
         assert_eq!(result.new_interval.start(), 10);
         assert_eq!(result.new_interval.end(), 20);
+    }
+
+    #[test]
+    fn id_boundary_split_exhaustion_preserves_function() {
+        let mut func = make_test_func(20);
+        func.next_vreg = u32::MAX;
+        let interval = make_interval(0, &[(0, 20)], &[2, 18], &[0]);
+        let before = format!("{func:?}");
+        assert!(matches!(
+            split_interval_checked(&interval, 10, &mut func),
+            Err(SplitError::VirtualRegisterExhausted),
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn id_boundary_nonprogress_split_does_not_consume_register() {
+        let mut func = make_test_func(10);
+        let interval = make_interval(0, &[(0, 2)], &[1], &[0]);
+        let before = format!("{func:?}");
+        assert!(split_interval(&interval, 1, &mut func).is_none());
+        assert_eq!(format!("{func:?}"), before);
     }
 
     #[test]
@@ -2926,6 +3047,18 @@ mod tests {
             1,
             "two in-loop uses qualify at min_uses=2"
         );
+    }
+
+    #[test]
+    fn id_boundary_loop_reload_exhaustion_preserves_function() {
+        let mut func = make_loop_func(make_inst(4, &[], &[]), true, true);
+        let loop_info = crate::remat::compute_loop_info(&func);
+        let points = loop_invariant_reload_points(&func, vreg(0), &loop_info, 1);
+        assert_eq!(points.len(), 1, "control must reach the injector");
+        func.next_vreg = u32::MAX;
+        let before = format!("{func:?}");
+        assert_eq!(inject_loop_reload(&mut func, &points[0]), None);
+        assert_eq!(format!("{func:?}"), before);
     }
 
     #[test]

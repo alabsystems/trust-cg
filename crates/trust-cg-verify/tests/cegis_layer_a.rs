@@ -156,3 +156,32 @@ fn layer_a_cache_hit_replays_rewrites_issue_491() {
         "candidates must be at least the number of successful replays"
     );
 }
+
+/// The mutation control for Layer A: a matcher that replaced the `MulRR` by
+/// `Movz dst, #1` states `v * 0 == 1`, which is refuted, so nothing commits.
+/// Revision 2's obligation (`x * 0 == 0`) never read the replacement.
+#[test]
+fn layer_a_obligation_refutes_a_corrupted_immediate() {
+    use trust_cg_verify::CegisRunOutcome;
+    use trust_cg_verify::cegis_pass::{CegisSuperoptTestHooks, ReplacementMutation};
+
+    let (mut func, ..) = layer_a_func();
+    let before = format!("{func:?}");
+    let mut pass =
+        CegisSuperoptPass::new(make_config(None)).with_test_hooks(CegisSuperoptTestHooks {
+            corrupt_replacement: Some(ReplacementMutation::Immediate),
+            ..Default::default()
+        });
+    let outcome = pass.run_with_outcome(&mut func);
+    let stats = pass.stats();
+    assert_eq!(outcome, CegisRunOutcome::Complete { committed: false });
+    assert_eq!(
+        (stats.layer_a_candidates, stats.verified, stats.rejected),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        (stats.verifier_errors, stats.timeouts, stats.panics),
+        (0, 0, 0)
+    );
+    assert_eq!(format!("{func:?}"), before);
+}

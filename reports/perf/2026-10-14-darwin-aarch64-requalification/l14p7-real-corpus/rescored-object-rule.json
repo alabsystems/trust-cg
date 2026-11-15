@@ -1,0 +1,288 @@
+{
+ "aggregates": {
+  "bridge": {
+   "by_kind": {
+    "real-crate": {
+     "completed": 1,
+     "completion_pct": 3.7,
+     "rows": 27
+    },
+    "real-program": {
+     "completed": 0,
+     "completion_pct": 0.0,
+     "rows": 13
+    },
+    "scale-ladder": {
+     "completed": 0,
+     "completion_pct": 0.0,
+     "rows": 20
+    },
+    "trust-sysroot": {
+     "completed": 0,
+     "completion_pct": 0.0,
+     "rows": 2
+    }
+   },
+   "completed": 1,
+   "completed_with_code": 0,
+   "completion_pct": 1.6,
+   "completion_with_code_pct": 0.0,
+   "counts": {
+    "BASELINE-FAILED": 0,
+    "COMPILED": 1,
+    "ERROR": 4,
+    "INCOMPLETE": 56,
+    "INVALID-INPUT": 0,
+    "MATCH": 0,
+    "MISMATCH": 0,
+    "NONDET-FAILCLOSED": 0,
+    "TIMEOUT": 1,
+    "UNAVAILABLE": 0
+   },
+   "lane": "bridge",
+   "ratios": {
+    "compile_cpu_s": {
+     "geomean": 1.5555555555555556,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.5555555555555556
+    },
+    "compile_instructions": {
+     "geomean": 1.172258759617012,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.172258759617012
+    },
+    "compile_maxrss_bytes": {
+     "geomean": 1.2075906390202498,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.2075906390202498
+    },
+    "compile_wall_s": {
+     "geomean": 1.0513602736890273,
+     "missing": [],
+     "rows": 1,
+     "worst": 1.0513602736890273
+    }
+   },
+   "refused_rows_by_code": {
+    "[TCG-ARG-ABI]": 2,
+    "[TCG-BOX-PAYLOAD-DROP]": 1,
+    "[TCG-COLLECTION-IMAGE]": 6,
+    "[TCG-FAT-POINTEE-LANE]": 1,
+    "[TCG-FMT-DECLINED]": 2,
+    "[TCG-IR-LOWER]": 2,
+    "[TCG-ITER-UNMODELED]": 2,
+    "[TCG-MIR-UNSUPPORTED]": 56,
+    "[TCG-OWNING-ITER-METHOD]": 3,
+    "[TCG-POINTEE-LANES]": 5,
+    "[TCG-PROOF-465]": 56,
+    "[TCG-PROVENANCE-XCHECK-FAIL]": 2,
+    "[TCG-REGALLOC-063]": 4,
+    "[TCG-RET-ABI]": 2,
+    "[TCG-RET-UNBOUND]": 1,
+    "[TCG-SRET-ABI]": 2,
+    "[TCG-STEPBY-OPT-LEVEL]": 1
+   },
+   "rows": 62,
+   "unclassified": [],
+   "vacuous_completed": [
+    "crate/unicode-ident-1.0.24"
+   ]
+  },
+  "diagnostic": {
+   "by_kind": {
+    "real-crate": {
+     "completed": 8,
+     "completion_pct": 29.6,
+     "rows": 27
+    },
+    "real-program": {
+     "completed": 13,
+     "completion_pct": 100.0,
+     "rows": 13
+    },
+    "scale-ladder": {
+     "completed": 20,
+     "completion_pct": 100.0,
+     "rows": 20
+    },
+    "trust-sysroot": {
+     "completed": 1,
+     "completion_pct": 50.0,
+     "rows": 2
+    }
+   },
+   "completed": 42,
+   "completed_with_code": 41,
+   "completion_pct": 67.7,
+   "completion_with_code_pct": 66.1,
+   "counts": {
+    "BASELINE-FAILED": 0,
+    "COMPILED": 9,
+    "ERROR": 4,
+    "INCOMPLETE": 16,
+    "INVALID-INPUT": 0,
+    "MATCH": 33,
+    "MISMATCH": 0,
+    "NONDET-FAILCLOSED": 0,
+    "TIMEOUT": 0,
+    "UNAVAILABLE": 0
+   },
+   "lane": "diagnostic",
+   "ratios": {
+    "code_bytes": {
+     "geomean": 4.902280050940921,
+     "missing": [],
+     "rows": 8,
+     "worst": 75.76470588235294
+    },
+    "compile_cpu_s": {
+     "geomean": 1.9612640068221556,
+     "missing": [],
+     "rows": 42,
+     "worst": 26.387096774193548
+    },
+    "compile_instructions": {
+     "geomean": 1.4487721016859159,
+     "missing": [],
+     "rows": 42,
+     "worst": 8.847459437071562
+    },
+    "compile_maxrss_bytes": {
+     "geomean": 1.207566420559113,
+     "missing": [],
+     "rows": 42,
+     "worst": 1.2927788921462737
+    },
+    "compile_wall_s": {
+     "geomean": 1.352092236106867,
+     "missing": [],
+     "rows": 42,
+     "worst": 30.142236323250476
+    },
+    "runtime_cycles": {
+     "geomean": 1.011038827661015,
+     "missing": [],
+     "rows": 33,
+     "worst": 1.3478499122918284
+    },
+    "runtime_instructions": {
+     "geomean": 1.0081968806692825,
+     "missing": [],
+     "rows": 33,
+     "worst": 1.1774459694952162
+    },
+    "runtime_maxrss_bytes": {
+     "geomean": 1.0128178206793872,
+     "missing": [],
+     "rows": 33,
+     "worst": 1.28125
+    },
+    "runtime_wall_s": {
+     "geomean": 0.9995944682563123,
+     "missing": [],
+     "rows": 33,
+     "worst": 1.1130298273155417
+    }
+   },
+   "refused_rows_by_code": {
+    "[TCG-ARG-ABI]": 2,
+    "[TCG-BOX-PAYLOAD-DROP]": 1,
+    "[TCG-COLLECTION-IMAGE]": 6,
+    "[TCG-FAT-POINTEE-LANE]": 1,
+    "[TCG-FMT-DECLINED]": 2,
+    "[TCG-IR-LOWER]": 2,
+    "[TCG-ITER-UNMODELED]": 2,
+    "[TCG-MIR-UNSUPPORTED]": 16,
+    "[TCG-OWNING-ITER-METHOD]": 3,
+    "[TCG-POINTEE-LANES]": 5,
+    "[TCG-RET-ABI]": 2,
+    "[TCG-SRET-ABI]": 2,
+    "[TCG-STEPBY-OPT-LEVEL]": 1
+   },
+   "rows": 62,
+   "unclassified": [],
+   "vacuous_completed": [
+    "crate/unicode-ident-1.0.24"
+   ]
+  }
+ },
+ "reclassified": [
+  {
+   "from": "COMPILED",
+   "id": "crate/either-1.18.0",
+   "lane": "bridge",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  },
+  {
+   "from": "COMPILED",
+   "id": "crate/either-1.18.0",
+   "lane": "diagnostic",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  },
+  {
+   "from": "COMPILED",
+   "id": "crate/fnv-1.0.7",
+   "lane": "bridge",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  },
+  {
+   "from": "COMPILED",
+   "id": "crate/fnv-1.0.7",
+   "lane": "diagnostic",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  },
+  {
+   "from": "COMPILED",
+   "id": "crate/rustc-hash-2.1.2",
+   "lane": "bridge",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  },
+  {
+   "from": "COMPILED",
+   "id": "crate/rustc-hash-2.1.2",
+   "lane": "diagnostic",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  },
+  {
+   "from": "COMPILED",
+   "id": "crate/scopeguard-1.2.0",
+   "lane": "bridge",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  },
+  {
+   "from": "COMPILED",
+   "id": "crate/scopeguard-1.2.0",
+   "lane": "diagnostic",
+   "to": "ERROR",
+   "why": "the compile exited 0 without a readable object"
+  }
+ ],
+ "rules": "benchmarks/real-corpus/run.py object_problem (a library compile that exits 0 without a readable object is ERROR; the LLVM lane's is BASELINE-FAILED), vacuous rows (LLVM object holds 0 code bytes; no code-bytes ratio), completions with code",
+ "schema": "trust-cg-real-corpus-rescore-v1",
+ "source": {
+  "eligible": false,
+  "git_sha": "7fe6e3c255324f60d3127f5ad3dbee7bd74ec7ba",
+  "ineligible_reasons": [
+   "27 of 62 rows started or ended LOADED (1-min load above 8.0)"
+  ],
+  "path": "7fe6e3c25532-20261014T180158Z.json",
+  "sha256": "619229a751cb0d23a3a8ff489a4741e97b453065360c02358e28fe9556109f00"
+ },
+ "vacuous_rows": [
+  "crate/either-1.18.0",
+  "crate/fnv-1.0.7",
+  "crate/rustc-hash-2.1.2",
+  "crate/scopeguard-1.2.0",
+  "crate/unicode-ident-1.0.24"
+ ]
+}

@@ -30,9 +30,10 @@
 //! unproven condition keeps the check (there is no wildcard/optimistic arm):
 //!
 //! 1. **Pure-trap target.** One of the bounds-check block's two successors is a
-//!    block whose only instruction is `Ud2` (an
-//!    `emit_synthetic_trap_block`-shaped dead end). That is the trap edge; the
-//!    other successor is the fall-through (`cont`).
+//!    pure trap in the sense of `crate::x86_trap_block`: a no-successor dead
+//!    end that is exactly `[Ud2]` (`emit_synthetic_trap_block`) or
+//!    `[Call abort, Ud2]` (the bridge's panic=abort assert block). That is the
+//!    trap edge; the other successor is the fall-through (`cont`).
 //! 2. **Single dominating guard.** The bounds-check block's UNIQUE predecessor
 //!    `db` ends in a conditional branch, and `db` strictly dominates it. A
 //!    unique predecessor means every path to the check traverses the `db->check`
@@ -65,8 +66,9 @@
 //! block left with no predecessors is deleted and the block ids are renumbered
 //! back to the gap-free `0..n` range the x86 regalloc replay requires.
 //!
-//! Kill switch: `TCG_NO_X86_BCE` (any value) disables the pass. Default ON at
-//! O2/O3, mirroring `TCG_NO_VECTORIZE` / `TCG_NO_X86_SROA`.
+//! Kill switch: `-Ztrust-ir-cg-args=no-x86-bce` (or `TCG_NO_X86_BCE` when used
+//! standalone) disables the pass. Default ON at O2/O3, mirroring
+//! `TCG_NO_VECTORIZE` / `TCG_NO_X86_SROA`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -75,14 +77,135 @@ use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
 use trust_cg_lower::instructions::Block;
 use trust_cg_lower::{X86ISelBlock, X86ISelFunction, X86ISelInst, X86ISelOperand};
 
-use crate::effects::{x86_produces_value, x86_reads_flags, x86_writes_flags};
+use crate::x86_trap_block::is_pure_trap_block;
+
+use crate::effects::{
+    FlagOverwrite, MemoryEffect, condition_flag_overwrite, x86_opcode_effect, x86_produces_value,
+    x86_reads_flags,
+};
 use crate::mach_view::{CfgAnalysis, predecessor_map};
 use crate::x86_pass_manager::X86MachinePass;
 
-/// Kill switch: set `TCG_NO_X86_BCE` (any value) to disable the pass.
-/// Default ON at O2/O3 (mirrors `TCG_NO_VECTORIZE` / `TCG_NO_X86_SROA`).
-fn bce_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_BCE").is_none()
+static BCE_EARLY_COPY_DISABLED_SETTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install an opt-out for the EARLY-GUARD-COPY arm alone (case 3b), from a
+/// tracked compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-bce-earlycopy`). DEFAULT OFF (the arm is on).
+///
+/// Exists for the same reason as [`set_bce_reload_disabled`]: an arm that cannot
+/// be toggled on its own cannot be credited with anything.
+pub fn set_bce_early_copy_disabled(disabled: bool) -> bool {
+    match BCE_EARLY_COPY_DISABLED_SETTING.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => BCE_EARLY_COPY_DISABLED_SETTING.get() == Some(&requested),
+    }
+}
+
+/// True iff the early-guard-copy arm (case 3b) may fire.
+fn bce_early_copy_enabled() -> bool {
+    if let Some(disabled) = BCE_EARLY_COPY_DISABLED_SETTING.get() {
+        return !*disabled;
+    }
+    !crate::tcg_env_flag("TCG_NO_X86_BCE_EARLYCOPY")
+}
+
+static BCE_RELOAD_DISABLED_SETTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install an opt-out for the RELOADED-LENGTH arm alone (case 4), from a tracked
+/// compiler option, once (`-Ztrust-ir-cg-args=no-x86-bce-reload`). DEFAULT OFF
+/// (the arm is on).
+///
+/// This exists because `no-x86-bce` turns off the WHOLE pass, so an A/B against
+/// it cannot tell what case 4 contributed from what cases 1-3 already did. That
+/// distinction is not cosmetic: a first measurement of this arm read a 12 -> 9
+/// instruction win in a hot loop off the whole-pass A/B and attributed it to
+/// case 4, which was wrong. An arm that cannot be isolated cannot be credited.
+pub fn set_bce_reload_disabled(disabled: bool) -> bool {
+    match BCE_RELOAD_DISABLED_SETTING.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => BCE_RELOAD_DISABLED_SETTING.get() == Some(&requested),
+    }
+}
+
+/// True iff the reloaded-length arm (case 4) may fire.
+fn bce_reload_enabled() -> bool {
+    if let Some(disabled) = BCE_RELOAD_DISABLED_SETTING.get() {
+        return !*disabled;
+    }
+    !crate::tcg_env_flag("TCG_NO_X86_BCE_RELOAD")
+}
+
+static BCE_POINTER_RELOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the case-5 same-pointer reload opt-in from a TRACKED compiler option
+/// (`-Ztrust-ir-cg-args=x86-bce-ptr-reload`). DEFAULT OFF: this pass removes
+/// bounds checks, so a new admission arm ships opt-in and is measured before any
+/// question of a default arises.
+pub fn set_bce_pointer_reload_enabled(enabled: bool) -> bool {
+    match BCE_POINTER_RELOAD.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => BCE_POINTER_RELOAD.get() == Some(&requested),
+    }
+}
+
+static BCE_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the branch-form accept/decline trace from a TRACKED compiler option
+/// (`-Ztrust-ir-cg-args=trace-x86-bce`).
+///
+/// The carrier path already had a trace, but only behind the `TCG_*` environment
+/// variable `TCG_X86_BCE_CARRIER_DEBUG`, which `trustc` REFUSES before the backend
+/// loads — so it was unreachable through the bridge, and the BRANCH-form path (the
+/// one that decides `while k < v.len() { .. v[k] .. }`) had no trace at all.
+pub fn set_bce_trace_enabled(enabled: bool) -> bool {
+    match BCE_TRACE.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => BCE_TRACE.get() == Some(&requested),
+    }
+}
+
+fn bce_trace_enabled() -> bool {
+    if let Some(enabled) = BCE_TRACE.get() {
+        return *enabled;
+    }
+    crate::tcg_env_flag("TCG_X86_BCE_TRACE")
+}
+
+fn bce_pointer_reload_enabled() -> bool {
+    if let Some(enabled) = BCE_POINTER_RELOAD.get() {
+        return *enabled;
+    }
+    crate::tcg_env_flag("TCG_X86_BCE_PTR_RELOAD")
+}
+
+static BCE_DISABLED_SETTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install this pass's opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-bce`). Same contract as
+/// [`crate::x86_vectorize::set_trace_enabled`]: `true` when the installed value
+/// is `disabled` (first install, or an identical re-install), `false` when an
+/// earlier install disagrees, so the embedder refuses rather than run one
+/// compilation under two bounds-check policies.
+///
+/// `true` means the opt-out is ON, i.e. every bounds check is kept (always
+/// correct, never faster). Under `trustc` the `TCG_NO_X86_BCE` variable is
+/// refused before the backend loads, so this setter is the ONLY channel that
+/// reaches the pass there -- which is what makes an A/B of a safety-critical
+/// pass possible through the bridge instead of by rebuilding it twice.
+pub fn set_bce_disabled(disabled: bool) -> bool {
+    match BCE_DISABLED_SETTING.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => BCE_DISABLED_SETTING.get() == Some(&requested),
+    }
+}
+
+/// True iff the pass may run. The tracked option wins; the environment read is
+/// the fallback for standalone (non-`trustc`) use.
+pub fn bce_enabled() -> bool {
+    if let Some(disabled) = BCE_DISABLED_SETTING.get() {
+        return !*disabled;
+    }
+    !crate::tcg_env_flag("TCG_NO_X86_BCE")
 }
 
 /// x86-64 dominated-identical-compare bounds-check elimination pass.
@@ -93,13 +216,29 @@ pub struct X86BoundsCheckElimination {
     ///
     /// [`run`]: X86MachinePass::run
     pub last_run_eliminations: usize,
+    /// Admit case 5, the same-POINTER reload arm (see
+    /// [`same_value_by_pointer_reload`]). DEFAULT OFF.
+    ///
+    /// Threaded through the pass as well as installable globally, because a
+    /// `OnceLock` cannot be flipped twice in one process and the refutations for
+    /// this arm must run with it BOTH on and off in the same test binary.
+    pointer_reload: bool,
 }
 
 impl X86BoundsCheckElimination {
+    /// Enable case 5, the same-pointer reload admission arm, for this pass
+    /// instance (see [`same_value_by_pointer_reload`]). DEFAULT OFF; the
+    /// production lever is `-Ztrust-ir-cg-args=x86-bce-ptr-reload`.
+    pub fn with_pointer_reload(mut self, enabled: bool) -> Self {
+        self.pointer_reload = enabled;
+        self
+    }
+
     /// Create the pass.
     pub fn new() -> Self {
         Self {
             last_run_eliminations: 0,
+            pointer_reload: false,
         }
     }
 
@@ -149,7 +288,7 @@ impl X86MachinePass for X86BoundsCheckElimination {
         // All candidates are found against the ORIGINAL, unmutated function so
         // that chained checks (`s[i]` then `t[i]` at the same length) each match
         // the compare that dominates them before any of them is stripped.
-        let elims = find_eliminations(func);
+        let elims = find_eliminations(func, self.pointer_reload || bce_pointer_reload_enabled());
         if elims.is_empty() {
             return changed;
         }
@@ -182,7 +321,26 @@ impl X86MachinePass for X86BoundsCheckElimination {
 /// never-taken checks are ~free, and removing them perturbs downstream regalloc:
 /// b12 crc32 +15%, b01 +8%, b04 +7%; the sorts are neutral). Do not re-flip on a
 /// single-bench measurement — that was noise; the controlled A/B is the signal.
+static BCE_CARRIER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the CARRIER arm of x86 bounds-check elimination from a TRACKED compiler option, once. DEFAULT OFF.
+///
+/// Until 2026-09-30 the only channel was `TCG_X86_BCE_CARRIER`, and `trustc` refuses every `TCG_*`
+/// variable before the backend loads, so this opt-in had never been measured through the
+/// bridge. Three levers found the same way turned out to carry recorded numbers that no
+/// longer reproduced, and a fourth (the vectorizer's reduction unroll factor) was leaving
+/// 23% on the table, so an unmeasured opt-in here is an open question, not a settled one.
+pub fn set_bce_carrier_enabled(enabled: bool) -> bool {
+    match BCE_CARRIER.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => BCE_CARRIER.get() == Some(&requested),
+    }
+}
+
 fn bce_carrier_enabled() -> bool {
+    if let Some(enabled) = BCE_CARRIER.get() {
+        return *enabled;
+    }
     std::env::var_os("TCG_X86_BCE_CARRIER").is_some()
 }
 
@@ -662,47 +820,6 @@ fn find_carrier_eliminations(func: &X86ISelFunction) -> Vec<(Block, usize)> {
                 continue 'carrier;
             }
             trace!("{c_blk:?}[{p}] decline: no proving dominator guard (K={k})");
-            if std::env::var_os("TCG_X86_BCE_CARRIER_DUMP").is_some() {
-                eprintln!(
-                    "[bce-carrier-dump] declined carrier {c_blk:?}[{p}] idx={idx:?} root={root:?}"
-                );
-                // Full single-def MovRR chain from idx with def sites.
-                let mut v = idx;
-                for hop in 0..8 {
-                    match single_def.get(&v) {
-                        None => {
-                            eprintln!("    chain[{hop}] {v:?} MULTI-DEF/param — defs:");
-                            for &b in &func.block_order {
-                                if let Some(blk) = func.blocks.get(&b) {
-                                    for (i, m) in blk.insts.iter().enumerate() {
-                                        if inst_def_vreg(m) == Some(v) {
-                                            eprintln!(
-                                                "        {b:?}[{i}] {:?} {:?}",
-                                                m.opcode, m.operands
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        Some(&(b, i)) => {
-                            let m = &func.blocks[&b].insts[i];
-                            eprintln!(
-                                "    chain[{hop}] {v:?} def at {b:?}[{i}] {:?} {:?}",
-                                m.opcode, m.operands
-                            );
-                            if m.opcode == X86Opcode::MovRR
-                                && let Some(X86ISelOperand::VReg(s)) = m.operands.get(1)
-                            {
-                                v = *s;
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
         }
     }
     out
@@ -807,27 +924,14 @@ fn parse_cond_branch(func: &X86ISelFunction, block: Block) -> Option<CondBranch>
     })
 }
 
-/// True iff `block` is a pure trap: a dead end whose only instruction is `Ud2`
-/// (the `emit_synthetic_trap_block` shape and the panic=abort bounds-fail
-/// block). Conservative: `Nop` padding is ignored, but any other instruction or
-/// any successor edge disqualifies it.
-fn is_pure_trap_block(func: &X86ISelFunction, block: Block) -> bool {
-    let Some(b) = func.blocks.get(&block) else {
-        return false;
-    };
-    if !b.successors.is_empty() {
-        return false;
-    }
-    let mut saw_ud2 = false;
-    for inst in &b.insts {
-        match inst.opcode {
-            X86Opcode::Nop => {}
-            X86Opcode::Ud2 => saw_ud2 = true,
-            _ => return false,
-        }
-    }
-    saw_ud2
-}
+// The pure-trap predicate (condition 1 of the module doc) is the shared
+// `crate::x86_trap_block::is_pure_trap_block`: a no-successor block that is
+// exactly `[Ud2]` (ISel's `emit_synthetic_trap_block`, the fail edge of an
+// unfused MIR `Assert`) or `[Call abort, Ud2]` (the bridge's shared
+// panic=abort assert block, `emit_panic_abort_trap`, which every intercepted
+// `Vec`/slice index check under panic=abort branches to). Both diverge, so an
+// eliminated edge into either can only change how a never-failing check
+// would have died, never what a passing program computes.
 
 /// The vreg an instruction defines, if it produces a value into one.
 fn inst_def_vreg(inst: &X86ISelInst) -> Option<VReg> {
@@ -935,6 +1039,503 @@ fn copy_chain_captured_in_window(
     false
 }
 
+// ---------------------------------------------------------------------------
+// Case 4 support: two loads that RELOAD the same frame location
+// ---------------------------------------------------------------------------
+//
+// A `&[T]` passes `len` in a register, so the guard and the bounds check read
+// ONE vreg and cases 1-3 above match. A `Vec`/`String` keeps `len` in its
+// header, so `while k < v.len() { .. v[k] .. }` RELOADS it: the guard compares
+// against one load's result and the check against a second, textually distinct
+// load. Those are different vregs with different roots, so cases 1-3 all
+// decline and the redundant check survives -- which is why this pass fired on
+// slices and not on the commonest owning-container loop in Rust.
+//
+// Two loads denote the same value when they read the same bytes and nothing
+// between them may have written those bytes. Both halves are proved here
+// STATICALLY or the case is declined; there is no optimistic arm, because a
+// wrongly-removed bounds check is memory unsafety.
+
+/// Byte width of a width-known scalar frame access, or `None` for any opcode
+/// this pass will not reason about (vector, extending, SIB, `Push`/`Pop`, ...).
+///
+/// `None` is a REFUSAL, not a default: an unknown width cannot be range-checked
+/// for overlap, so every caller declines on it.
+fn frame_access_bytes(op: X86Opcode) -> Option<u32> {
+    Some(match op {
+        X86Opcode::MovRM8 | X86Opcode::MovzxRM8 | X86Opcode::MovMR8 => 1,
+        X86Opcode::MovRM16 | X86Opcode::MovzxRM16 | X86Opcode::MovMR16 => 2,
+        X86Opcode::MovRM32 | X86Opcode::MovMR32 => 4,
+        X86Opcode::MovRM | X86Opcode::MovMR => 8,
+        _ => return None,
+    })
+}
+
+/// A statically-resolved frame location: a fixed byte range inside ONE named
+/// stack slot. Two `FrameRef`s in DIFFERENT slots can never alias, because
+/// frame lowering assigns each slot a disjoint region of the frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FrameRef {
+    slot: u32,
+    off: i64,
+    bytes: u32,
+}
+
+impl FrameRef {
+    /// True iff the two byte ranges intersect. Different slots never do; within
+    /// one slot this is an exact half-open interval overlap, so a store to a
+    /// `Vec`'s `ptr` field does not block a reload of its `len` field.
+    fn overlaps(self, other: Self) -> bool {
+        self.slot == other.slot
+            && self.off < other.off.saturating_add(i64::from(other.bytes))
+            && other.off < self.off.saturating_add(i64::from(self.bytes))
+    }
+}
+
+/// Resolve a load/store address operand to the frame bytes it touches, or
+/// `None` when that is not statically provable.
+///
+/// Accepted forms -- exactly the two the x86 selector emits for a frame local,
+/// plus the `Lea` root form SROA documents:
+///
+/// * `StackSlot(s)` -> slot `s` at offset 0.
+/// * `MemAddr { base: StackSlot(s), disp }` -> slot `s` at `disp`.
+/// * `MemAddr { base: VReg(v), disp }` where `v` canonicalizes (through
+///   value-preserving `MovRR` copies) to a SINGLE-DEF `Lea r, [StackSlot(s) +
+///   d0]` -> slot `s` at `d0 + disp`.
+///
+/// Everything else is `None`: a SIB address (a runtime index could land
+/// anywhere), a register base that is not such a `Lea` (it could hold any
+/// pointer, including into the heap), a RIP-relative or symbol address, and a
+/// multi-def base. Callers treat `None` as "may alias anything".
+fn resolve_frame_ref(
+    single: &HashMap<VReg, (Block, usize)>,
+    func: &X86ISelFunction,
+    addr: &X86ISelOperand,
+    bytes: u32,
+) -> Option<FrameRef> {
+    match addr {
+        X86ISelOperand::StackSlot(s) => Some(FrameRef {
+            slot: *s,
+            off: 0,
+            bytes,
+        }),
+        X86ISelOperand::MemAddr { base, disp } => match base.as_ref() {
+            X86ISelOperand::StackSlot(s) => Some(FrameRef {
+                slot: *s,
+                off: i64::from(*disp),
+                bytes,
+            }),
+            X86ISelOperand::VReg(v) => {
+                let (slot, off) = resolve_frame_address_reg(single, func, *v)?;
+                Some(FrameRef {
+                    slot,
+                    off: off.saturating_add(i64::from(*disp)),
+                    bytes,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolve a register that holds a frame ADDRESS to the `(slot, offset)` it
+/// points at, following a CHAIN of slot-based `Lea`s to a fixed point.
+///
+/// The chain matters. `Lea a, [StackSlot(s) + 0]` followed by
+/// `Lea b, [a + 16]` is how the selector spells the address of a FIELD of a
+/// frame local -- a `Vec` header's `len` at `[vec + 16]` is exactly this. A
+/// resolver that follows only ONE `Lea` sees `b` as opaque and declines, which
+/// is precisely the case that made the reloaded-length arm miss the shape it was
+/// written for.
+///
+/// Value-preserving `MovRR` copies are followed via [`canon`]. Anything else --
+/// a `LeaSib` (its index is a runtime value, so the address is not fixed), a
+/// non-`Lea` definition, a multi-def register, or a chain longer than the bound
+/// -- returns `None`, which callers read as "may alias anything".
+fn resolve_frame_address_reg(
+    single: &HashMap<VReg, (Block, usize)>,
+    func: &X86ISelFunction,
+    v: VReg,
+) -> Option<(u32, i64)> {
+    let mut cur = v;
+    let mut off: i64 = 0;
+    for _ in 0..8 {
+        let root = canon(single, func, cur);
+        let &(b, i) = single.get(&root)?;
+        let inst = func.blocks.get(&b)?.insts.get(i)?;
+        if inst.opcode != X86Opcode::Lea {
+            return None;
+        }
+        let X86ISelOperand::MemAddr { base, disp } = inst.operands.get(1)? else {
+            return None;
+        };
+        off = off.saturating_add(i64::from(*disp));
+        match base.as_ref() {
+            X86ISelOperand::StackSlot(s) => return Some((*s, off)),
+            X86ISelOperand::VReg(next) => cur = *next,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// True iff NO instruction executed strictly between the two load sites may
+/// write `target`.
+///
+/// `window.check_block`'s unique predecessor is `window.guard_block`, so the
+/// only code between a load in the guard block and a load in the check block is
+/// the guard block's tail after the first load plus the check block's head
+/// before the second. Only two placements are admitted -- both loads in the
+/// guard block, or guard-block load then check-block load -- and any other
+/// (either load in a third block, or the check's load textually before the
+/// guard's within one block) returns `false` rather than guessing at the path.
+///
+/// An instruction passes when it is `Pure`, a `Load` (a read cannot clobber),
+/// or a `Store` whose destination resolves to a frame range DISJOINT from
+/// `target`. It fails on a `Call` -- which by `x86_opcode_effect` also covers
+/// every volatile access -- on `Push`/`Pop` (they move `rsp`), on a store whose
+/// width or address does not resolve, and on a store that overlaps.
+fn no_aliasing_write_between(
+    single: &HashMap<VReg, (Block, usize)>,
+    func: &X86ISelFunction,
+    guard_load: (Block, usize),
+    check_load: (Block, usize),
+    target: FrameRef,
+    window: CoveredWindow,
+) -> bool {
+    let (gb, gi) = guard_load;
+    let (cb, ci) = check_load;
+    // The guard's load feeds the guard compare, so it must precede it.
+    if gb != window.guard_block || gi >= window.guard_compare {
+        return false;
+    }
+    // Half-open [lo, hi) ranges of instructions that lie between the loads.
+    let ranges: Vec<(Block, usize, usize)> = if cb == window.guard_block {
+        if ci <= gi {
+            return false;
+        }
+        vec![(window.guard_block, gi + 1, ci)]
+    } else if cb == window.check_block {
+        if ci >= window.check_compare {
+            return false;
+        }
+        let Some(guard_block) = func.blocks.get(&window.guard_block) else {
+            return false;
+        };
+        vec![
+            (window.guard_block, gi + 1, guard_block.insts.len()),
+            (window.check_block, 0, ci),
+        ]
+    } else {
+        return false;
+    };
+
+    for (b, lo, hi) in ranges {
+        let Some(block) = func.blocks.get(&b) else {
+            return false;
+        };
+        for inst in block.insts.iter().take(hi.min(block.insts.len())).skip(lo) {
+            if matches!(inst.opcode, X86Opcode::Push | X86Opcode::Pop) {
+                return false;
+            }
+            match x86_opcode_effect(inst.opcode) {
+                MemoryEffect::Pure | MemoryEffect::Load => {}
+                MemoryEffect::Store => {
+                    let Some(bytes) = frame_access_bytes(inst.opcode) else {
+                        return false;
+                    };
+                    let Some(dst) = inst
+                        .operands
+                        .first()
+                        .and_then(|o| resolve_frame_ref(single, func, o, bytes))
+                    else {
+                        return false;
+                    };
+                    if dst.overlaps(target) {
+                        return false;
+                    }
+                }
+                MemoryEffect::Call => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Case 4: prove two DISTINCT load-defined vregs hold the same value because
+/// they reload the same frame bytes with no aliasing write between.
+///
+/// Returns the guard-side vreg as the shared "root". That is honest for the
+/// caller's redefinition scan: both vregs are single-def here, so neither can
+/// be redefined in the covered window and the scan is a trivially-passing
+/// no-op. Memory stability -- the condition that actually matters for a reload
+/// -- is proved by [`no_aliasing_write_between`], not by that scan.
+fn same_value_by_frame_reload(
+    single: &HashMap<VReg, (Block, usize)>,
+    func: &X86ISelFunction,
+    guard_v: VReg,
+    check_v: VReg,
+    window: CoveredWindow,
+) -> Option<VReg> {
+    let &(gb, gi) = single.get(&guard_v)?;
+    let &(cb, ci) = single.get(&check_v)?;
+    let guard_load = func.blocks.get(&gb)?.insts.get(gi)?;
+    let check_load = func.blocks.get(&cb)?.insts.get(ci)?;
+    // Identical opcode: same access width AND same load kind, so the two reads
+    // return the same bytes interpreted the same way.
+    if guard_load.opcode != check_load.opcode {
+        return None;
+    }
+    if x86_opcode_effect(guard_load.opcode) != MemoryEffect::Load {
+        return None;
+    }
+    let bytes = frame_access_bytes(guard_load.opcode)?;
+    let ga = resolve_frame_ref(single, func, guard_load.operands.get(1)?, bytes)?;
+    let ca = resolve_frame_ref(single, func, check_load.operands.get(1)?, bytes)?;
+    if ga != ca {
+        return None;
+    }
+    if !no_aliasing_write_between(single, func, (gb, gi), (cb, ci), ga, window) {
+        return None;
+    }
+    Some(guard_v)
+}
+
+/// Case 5: prove two DISTINCT load-defined vregs hold the same value because they
+/// load from the SAME POINTER at the same displacement with NO STORE between.
+///
+/// Case 4 ([`same_value_by_frame_reload`]) resolves both addresses to frame bytes
+/// via [`resolve_frame_ref`]. That misses the shape an OWNING container actually
+/// presents once its header address is materialized into a register:
+///
+/// ```text
+/// preheader:  lea  rdi, [slot_ptr + 16]     ; &v.len
+///             mov  rsi, rdi                 ; a plain copy
+/// guard:      mov  rax, [rdi + 0]           ; the while condition's length
+///             cmp  rbx, rax ; jae exit
+/// check:      mov  rax, [rsi + 0]           ; the bounds check's length
+///             cmp  rcx, rax ; jae panic
+/// ```
+///
+/// Here `resolve_frame_ref` cannot classify either load — the address is a
+/// computed pointer, not `[rbp + disp]` — so case 4 declines, although the two
+/// loads read *the same address*: `rsi` is one `MovRR` from `rdi`, which
+/// [`canon`] already follows.
+///
+/// # Why this is sound, and where it is deliberately stricter than case 4
+///
+/// * **Same address.** Both loads must carry `MemAddr { base, disp }` whose
+///   canonical bases are the SAME vreg and whose displacements are equal. Same
+///   base register plus same displacement is the same address, whatever it points
+///   to — no aliasing question arises, because it is one location, not two.
+/// * **The address cannot move.** The shared canonical base must be single-def
+///   function-wide, so nothing can redefine it anywhere, let alone between the
+///   loads. (Case 4 gets this from frame identity; here it is the register.)
+/// * **Identical opcode**, so both reads return the same bytes interpreted the
+///   same way — the same condition case 4 imposes.
+/// * **NO STORE AT ALL between the loads**, not merely no *aliasing* store. Case 4
+///   can compare a store's frame target against its own, because it resolved both
+///   to frame refs; this arm has no such target to compare against, so it refuses
+///   on ANY store, call, `Push` or `Pop` in the region. That is strictly stronger
+///   than case 4's test and it is what discharges "the memory did not change".
+///   It is exactly the premise upstream named as missing when it declined to
+///   assume a write-free loop was enough: the concern was "a store may separate
+///   the trip-bound load from the element guard's reload", and this scans the
+///   region between them for precisely that.
+/// * **The region is the one already modeled.** [`region_between_loads`] is the
+///   same two-range path [`no_aliasing_write_between`] walks: from just after the
+///   guard load to the end of the guard block, then from the top of the check
+///   block to the check load. The caller's [`CoveredWindow`] guarantees the guard
+///   block's compare dominates the check block and that this is the path taken,
+///   so there is no other route between the two loads to account for.
+///
+/// DEFAULT OFF. This is bounds-check elimination: a wrong answer is a memory
+/// safety defect, not a slow program. `-Ztrust-ir-cg-args=x86-bce-ptr-reload` is
+/// the opt-in, and `no-x86-bce-ptrreload` cannot be the lever because the arm is
+/// not on to begin with.
+fn same_value_by_pointer_reload(
+    single: &HashMap<VReg, (Block, usize)>,
+    func: &X86ISelFunction,
+    guard_v: VReg,
+    check_v: VReg,
+    window: CoveredWindow,
+) -> Option<VReg> {
+    let &(gb, gi) = single.get(&guard_v)?;
+    let &(cb, ci) = single.get(&check_v)?;
+    let guard_load = func.blocks.get(&gb)?.insts.get(gi)?;
+    let check_load = func.blocks.get(&cb)?.insts.get(ci)?;
+    if guard_load.opcode != check_load.opcode {
+        return None;
+    }
+    if x86_opcode_effect(guard_load.opcode) != MemoryEffect::Load {
+        return None;
+    }
+    let (gbase, gdisp) = plain_mem_base_disp(guard_load.operands.get(1)?)?;
+    let (cbase, cdisp) = plain_mem_base_disp(check_load.operands.get(1)?)?;
+    if gdisp != cdisp {
+        return None;
+    }
+    let root = canon(single, func, gbase);
+    if root != canon(single, func, cbase) {
+        return None;
+    }
+    // The shared address register must be unique-def function-wide, so it cannot
+    // be redefined between the two loads (or anywhere else).
+    if !single.contains_key(&root) {
+        return None;
+    }
+    if !no_store_between_loads(func, (gb, gi), (cb, ci), window) {
+        return None;
+    }
+    Some(guard_v)
+}
+
+/// A `MemAddr { base: VReg, disp }` operand's `(base, disp)`. Refuses a SIB
+/// operand: an index term makes the address depend on a second register this arm
+/// does not reason about.
+fn plain_mem_base_disp(op: &X86ISelOperand) -> Option<(VReg, i32)> {
+    match op {
+        X86ISelOperand::MemAddr { base, disp } => match base.as_ref() {
+            X86ISelOperand::VReg(b) => Some((*b, *disp)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The half-open instruction ranges strictly between two loads along the covered
+/// window's path. `None` when the two loads do not lie on that path in that
+/// order. Shared shape with [`no_aliasing_write_between`], kept separate so that
+/// function's frame-target test is not weakened.
+fn region_between_loads(
+    func: &X86ISelFunction,
+    guard_load: (Block, usize),
+    check_load: (Block, usize),
+    window: CoveredWindow,
+) -> Option<Vec<(Block, usize, usize)>> {
+    let (gb, gi) = guard_load;
+    let (cb, ci) = check_load;
+    // The guard's load feeds the guard compare, so it must precede it.
+    if gb != window.guard_block || gi >= window.guard_compare {
+        return None;
+    }
+    if cb == window.guard_block {
+        if ci <= gi {
+            return None;
+        }
+        Some(vec![(window.guard_block, gi + 1, ci)])
+    } else if cb == window.check_block {
+        if ci >= window.check_compare {
+            return None;
+        }
+        let guard_block = func.blocks.get(&window.guard_block)?;
+        Some(vec![
+            (window.guard_block, gi + 1, guard_block.insts.len()),
+            (window.check_block, 0, ci),
+        ])
+    } else {
+        None
+    }
+}
+
+/// True when NO instruction between the two loads writes memory in any way.
+///
+/// Stricter than [`no_aliasing_write_between`] on purpose — see
+/// [`same_value_by_pointer_reload`] for why this arm cannot compare a store's
+/// target against its own and so must refuse every store.
+fn no_store_between_loads(
+    func: &X86ISelFunction,
+    guard_load: (Block, usize),
+    check_load: (Block, usize),
+    window: CoveredWindow,
+) -> bool {
+    let Some(ranges) = region_between_loads(func, guard_load, check_load, window) else {
+        return false;
+    };
+    for (b, lo, hi) in ranges {
+        let Some(block) = func.blocks.get(&b) else {
+            return false;
+        };
+        for inst in block.insts.iter().take(hi.min(block.insts.len())).skip(lo) {
+            if matches!(inst.opcode, X86Opcode::Push | X86Opcode::Pop) {
+                return false;
+            }
+            match x86_opcode_effect(inst.opcode) {
+                MemoryEffect::Pure | MemoryEffect::Load => {}
+                MemoryEffect::Store | MemoryEffect::Call => return false,
+            }
+        }
+    }
+    true
+}
+
+/// What [`same_value_operand`] proved, plus where the caller's redefinition scan
+/// must START inside the guard block.
+///
+/// `guard_scan_from` is normally the guard's compare, because the covered window
+/// begins just after it. Case 3b lowers it to the definition index of the
+/// earliest guard-side copy, which is exactly what makes that copy's snapshot
+/// provably equal to the root at BOTH compares.
+#[derive(Clone, Copy)]
+struct SameValue {
+    root: VReg,
+    guard_scan_from: usize,
+}
+
+/// Case 3b: the guard side reaches the root through copies defined in the GUARD
+/// BLOCK before the guard compare.
+///
+/// Case 3 admits only "the guard uses the root directly", because a guard-side
+/// copy feeds the guard compare and so can never lie inside the covered window.
+/// Such a copy is not unprovable, though -- it is provable with a WIDER window.
+/// If the root is not redefined anywhere between that copy's definition and the
+/// check's compare, then the copy holds the root's value at the guard compare AND
+/// the root still holds it at the check compare, so the two compares read one
+/// value. This returns the earliest such definition index and the caller scans
+/// from there instead of from the compare, which is what discharges the "not
+/// redefined" side.
+///
+/// Requires every link to be a single-def `MovRR`/`MovRR32` defined in `db`
+/// strictly before `guard_compare`. A link in any OTHER block is rejected:
+/// proving "not redefined" along an arbitrary dominator path is not something
+/// this scan does, and guessing is how a bounds check gets removed wrongly.
+///
+/// This is the shape a `while k < v.len() { .. v[k] .. }` loop actually presents
+/// after the cleanup cluster -- both compares read a copy of the loop IV rather
+/// than the IV itself.
+fn guard_side_copy_scan_start(
+    single: &HashMap<VReg, (Block, usize)>,
+    func: &X86ISelFunction,
+    mut v: VReg,
+    root: VReg,
+    window: CoveredWindow,
+) -> Option<usize> {
+    let mut earliest = window.guard_compare;
+    for _ in 0..64 {
+        if v == root {
+            return Some(earliest);
+        }
+        let &(b, i) = single.get(&v)?;
+        if b != window.guard_block || i >= window.guard_compare {
+            return None;
+        }
+        let inst = func.blocks.get(&b)?.insts.get(i)?;
+        match inst.opcode {
+            X86Opcode::MovRR | X86Opcode::MovRR32 => {
+                earliest = earliest.min(i);
+                match inst.operands.get(1) {
+                    Some(X86ISelOperand::VReg(s)) => v = *s,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Prove that `guard_v` (compared at the dominating guard) and `check_v`
 /// (compared at the bounds check) denote the SAME runtime value, returning their
 /// shared canonical root vreg if so, or `None` (fail-safe) otherwise.
@@ -962,14 +1563,43 @@ fn same_value_operand(
     guard_v: VReg,
     check_v: VReg,
     window: CoveredWindow,
-) -> Option<VReg> {
+    pointer_reload: bool,
+) -> Option<SameValue> {
     let r = canon(single, func, guard_v);
     if r != canon(single, func, check_v) {
+        // Case 4: the roots genuinely differ, but both may be loads that RELOAD
+        // the SAME frame bytes with no aliasing write between them -- the
+        // owning-container (`Vec`/`String`) own-length loop. Proved statically
+        // or declined; see `same_value_by_frame_reload`.
+        if !bce_reload_enabled() {
+            return None;
+        }
+        if let Some(root) = same_value_by_frame_reload(single, func, guard_v, check_v, window) {
+            return Some(SameValue {
+                root,
+                guard_scan_from: window.guard_compare,
+            });
+        }
+        // Case 5: not the same frame bytes, but the same POINTER at the same
+        // displacement with no store between -- the owning-container shape once
+        // its header address is in a register. See
+        // [`same_value_by_pointer_reload`]. DEFAULT OFF.
+        if pointer_reload {
+            return same_value_by_pointer_reload(single, func, guard_v, check_v, window).map(
+                |root| SameValue {
+                    root,
+                    guard_scan_from: window.guard_compare,
+                },
+            );
+        }
         return None;
     }
     // Cases 1 & 2: identical vregs, or a single-def (globally-fixed) root.
     if guard_v == check_v || single.contains_key(&r) {
-        return Some(r);
+        return Some(SameValue {
+            root: r,
+            guard_scan_from: window.guard_compare,
+        });
     }
     // Case 3: multi-def root. Every copy on BOTH chains to `r` must have been
     // captured inside the covered window (so the caller's redefinition scan on
@@ -978,9 +1608,26 @@ fn same_value_operand(
     // compare) and so can never be "in window" — this admits exactly the
     // guard-uses-root-directly / check-uses-window-copy shape and rejects the
     // rest.
-    let guard_ok = copy_chain_captured_in_window(single, func, guard_v, r, window);
-    let check_ok = copy_chain_captured_in_window(single, func, check_v, r, window);
-    if guard_ok && check_ok { Some(r) } else { None }
+    if !copy_chain_captured_in_window(single, func, check_v, r, window) {
+        return None;
+    }
+    if copy_chain_captured_in_window(single, func, guard_v, r, window) {
+        return Some(SameValue {
+            root: r,
+            guard_scan_from: window.guard_compare,
+        });
+    }
+    // Case 3b: the guard side is a copy defined in the guard block BEFORE its
+    // compare. Provable with a window widened back to that copy's definition.
+    if bce_early_copy_enabled()
+        && let Some(guard_scan_from) = guard_side_copy_scan_start(single, func, guard_v, r, window)
+    {
+        return Some(SameValue {
+            root: r,
+            guard_scan_from,
+        });
+    }
+    None
 }
 
 /// Build the single-def index (vregs with EXACTLY one definition in the
@@ -1042,8 +1689,8 @@ fn operand_redefined_between(
 /// path out of `start` (the `cont` successor), so the compare may be removed.
 ///
 /// Bounded forward walk: within each block, the first flag-READER encountered
-/// (before any flag-writer) means the flags are live -> not dead (keep the
-/// compare); the first flag-WRITER clobbers them -> dead on that path (stop). A
+/// (before any full flag overwrite) means the flags are live -> not dead (keep
+/// the compare); a full overwrite makes them dead on that path (stop). A
 /// block that neither reads nor fully clobbers before its terminator lets the
 /// flags flow to its successors, which are then checked. A `visited` set bounds
 /// the walk (loops terminate because a loop guard's own compare clobbers).
@@ -1066,7 +1713,7 @@ fn compare_flags_dead_after(func: &X86ISelFunction, start: Block) -> bool {
             if x86_reads_flags(inst.opcode) {
                 return false; // flags are live: keep the compare
             }
-            if x86_writes_flags(inst.opcode) {
+            if condition_flag_overwrite(inst) == FlagOverwrite::Full {
                 clobbered = true; // clobbered before any read on this path
                 break;
             }
@@ -1082,22 +1729,42 @@ fn compare_flags_dead_after(func: &X86ISelFunction, start: Block) -> bool {
 
 /// Find every provably-dead bounds-check diamond in `func`. See the module docs
 /// for the four conditions that ALL must hold; anything unproven is skipped.
-fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
+fn find_eliminations(func: &X86ISelFunction, pointer_reload: bool) -> Vec<Elimination> {
     let single = build_single_def_index(func);
     let cfg = CfgAnalysis::compute(func);
+    let dbg = bce_trace_enabled();
+    macro_rules! decline {
+        ($bb:expr, $($t:tt)*) => {{
+            if dbg {
+                eprintln!("[bce] {}:{:?} decline: {}", func.name, $bb, format!($($t)*));
+            }
+            continue;
+        }};
+    }
 
     let mut elims: Vec<Elimination> = Vec::new();
 
     for &bb in &func.block_order {
         // (1) The bounds-check block ends in a CmpRR-driven conditional branch.
         let Some(check) = parse_cond_branch(func, bb) else {
+            if dbg {
+                let tail: Vec<_> = func
+                    .blocks
+                    .get(&bb)
+                    .map(|b| b.insts.iter().rev().take(4).map(|i| i.opcode).collect())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[bce] {}:{bb:?} decline: not a CmpRR cond branch; tail={tail:?}",
+                    func.name
+                );
+            }
             continue;
         };
         let Some(block) = func.blocks.get(&bb) else {
             continue;
         };
         if block.successors.len() != 2 {
-            continue;
+            decline!(bb, "{} successors, not 2", block.successors.len());
         }
         // The two successors: the Jcc target and "the other".
         let jcc_target = check.jcc_target;
@@ -1108,7 +1775,7 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
             .filter(|&s| s != jcc_target)
             .collect();
         let [other_target] = others.as_slice() else {
-            continue; // malformed / self-loop successor set
+            decline!(bb, "successor set is not {{jcc, one other}}");
         };
         let other_target = *other_target;
 
@@ -1120,8 +1787,30 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
             (false, true) => (other_target, jcc_target, true),
             // Neither or both a trap: not a bounds-check diamond. No wildcard
             // optimism — keep the check.
-            (false, false) => continue,
-            (true, true) => continue,
+            (false, false) => {
+                if dbg {
+                    let show = |b: Block| -> String {
+                        func.blocks
+                            .get(&b)
+                            .map(|x| {
+                                format!(
+                                    "{b:?}{:?} succs={:?}",
+                                    x.insts.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+                                    x.successors
+                                )
+                            })
+                            .unwrap_or_else(|| format!("{b:?}<missing>"))
+                    };
+                    eprintln!(
+                        "[bce] {}:{bb:?} decline: neither successor is a pure trap; jcc={} other={}",
+                        func.name,
+                        show(jcc_target),
+                        show(other_target)
+                    );
+                }
+                continue;
+            }
+            (true, true) => decline!(bb, "BOTH successors are pure traps"),
         };
 
         // The unsigned relation that must hold to reach `cont` (avoid the trap).
@@ -1135,14 +1824,14 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
         let empty: Vec<Block> = Vec::new();
         let preds = cfg.preds.get(&bb).unwrap_or(&empty);
         let [db] = preds.as_slice() else {
-            continue; // not a unique predecessor
+            decline!(bb, "check block has {} preds, not 1", preds.len());
         };
         let db = *db;
         if db == bb || !cfg.dominates(db, bb) {
-            continue;
+            decline!(bb, "pred {db:?} does not dominate (or is self)");
         }
         let Some(guard) = parse_cond_branch(func, db) else {
-            continue;
+            decline!(bb, "pred {db:?} is not a CmpRR conditional branch");
         };
 
         // The predicate the `db -> bb` edge establishes.
@@ -1162,7 +1851,7 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
         } else {
             // `bb` is not cleanly one of `db`'s two edges: cannot attribute a
             // predicate to the edge -> keep the check.
-            continue;
+            decline!(bb, "not cleanly one of {db:?}'s two edges");
         };
 
         // (3) Identical comparison: same compare opcode, same left operand
@@ -1171,7 +1860,12 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
         // predicate is the SAME unsigned relation the check needs. Guard-taken
         // then implies bounds-safe.
         if check.cmp_opcode != guard.cmp_opcode {
-            continue;
+            decline!(
+                bb,
+                "cmp opcode {:?} != guard {:?}",
+                check.cmp_opcode,
+                guard.cmp_opcode
+            );
         }
         // Left operand: guard and check must compare the SAME value. Identical
         // vregs, a single-def root, or the loop-`iv` shape (guard uses the merge
@@ -1184,17 +1878,28 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
             check_block: bb,
             check_compare: check.cmp_pos,
         };
-        let Some(b0) = same_value_operand(&single, func, guard.op0, check.op0, covered_window)
-        else {
-            continue;
+        let Some(lhs) = same_value_operand(
+            &single,
+            func,
+            guard.op0,
+            check.op0,
+            covered_window,
+            pointer_reload,
+        ) else {
+            decline!(
+                bb,
+                "lhs not same-value: guard {:?} vs check {:?}",
+                guard.op0,
+                check.op0
+            );
         };
         // Right operand: register/register (same-value) or identical immediate.
         // Register-vs-immediate and immediate mismatch never match.
-        let rhs_root = match (check.rhs, guard.rhs) {
+        let rhs = match (check.rhs, guard.rhs) {
             (CmpRhs::Reg(rc), CmpRhs::Reg(rg)) => {
-                match same_value_operand(&single, func, rg, rc, covered_window) {
+                match same_value_operand(&single, func, rg, rc, covered_window, pointer_reload) {
                     Some(r) => Some(r),
-                    None => continue,
+                    None => decline!(bb, "rhs not same-value: guard {rg:?} vs check {rc:?}"),
                 }
             }
             (CmpRhs::Imm(ic), CmpRhs::Imm(ig)) => {
@@ -1206,7 +1911,7 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
             _ => continue,
         };
         if guard_cc != safe_cc {
-            continue;
+            decline!(bb, "guard_cc {guard_cc:?} != safe_cc {safe_cc:?}");
         }
 
         // (4) Neither operand's shared root vreg redefined between the guard and
@@ -1216,16 +1921,61 @@ fn find_eliminations(func: &X86ISelFunction) -> Vec<Elimination> {
         // window-captured copy — provably stable across the two compares. Collect
         // the roots involved (the left root, and the right root when the rhs is a
         // register).
-        let mut roots: Vec<VReg> = vec![b0];
-        if let Some(r) = rhs_root {
-            roots.push(r);
+        // A SINGLE-DEF root is excluded: the scan is vacuous for it, and
+        // including it produces a FALSE positive.
+        //
+        // The scan exists to catch a MULTI-def root being redefined between the
+        // guard's read and the check's read. A vreg with exactly one definition
+        // in the whole function cannot change value between two reads — there is
+        // no second definition to change it — and its one definition must
+        // dominate the guard's read, since the guard reads it.
+        //
+        // Including such a root is not merely redundant, it is WRONG in one
+        // reachable combination: `operand_redefined_between` is positional, so it
+        // reports the root's OWN defining instruction when that instruction falls
+        // inside the scanned range. That happens exactly when case 3b has lowered
+        // `scan_from` below the definition — which is h1_vec_push_sum's shape,
+        // where the index is admitted by case 3b (`scan_from` = 0) and the length
+        // root is the guard block's own load at index 1. Cases 1/2, 4 and 5 all
+        // return single-def roots, and case 4's doc already states the intent
+        // ("both vregs are single-def here, so ... the scan is a trivially-passing
+        // no-op") — which only held while `scan_from` stayed at the guard compare.
+        let mut roots: Vec<VReg> = Vec::new();
+        if !single.contains_key(&lhs.root) {
+            roots.push(lhs.root);
         }
-        if operand_redefined_between(func, db, guard.cmp_pos, bb, check.cmp_pos, &roots) {
-            continue;
+        // The scan starts at the EARLIEST position any admitted operand needs. A
+        // lower start means a WIDER scan, which is the conservative direction:
+        // case 3b is sound precisely because the root is checked for redefinition
+        // all the way back to the guard-side copy's definition, and applying that
+        // wider scan to the other operand's root too can only reject more.
+        let scan_from = match rhs {
+            Some(r) => lhs.guard_scan_from.min(r.guard_scan_from),
+            None => lhs.guard_scan_from,
+        };
+        if let Some(r) = rhs
+            && !single.contains_key(&r.root)
+        {
+            roots.push(r.root);
+        }
+        if !roots.is_empty()
+            && operand_redefined_between(func, db, scan_from, bb, check.cmp_pos, &roots)
+        {
+            decline!(
+                bb,
+                "a root {roots:?} is redefined in the covered window (guard {db:?}@{scan_from} .. check {bb:?}@{})",
+                check.cmp_pos
+            );
         }
 
         let remove_compare = compare_flags_dead_after(func, safe_target);
 
+        if dbg {
+            eprintln!(
+                "[bce] {}:{bb:?} ACCEPT: trap {trap_block:?} unreachable, safe {safe_target:?}",
+                func.name
+            );
+        }
         elims.push(Elimination {
             block: bb,
             cmp_pos: check.cmp_pos,
@@ -1290,7 +2040,7 @@ fn cleanup_orphan_traps(func: &mut X86ISelFunction, elims: &[Elimination]) {
 /// entry) maps to `Block(0)`. Mirrors `x86_if_convert::renumber_blocks_contiguous`.
 fn renumber_blocks_contiguous(func: &mut X86ISelFunction) {
     let len = func.block_order.len();
-    let remap: HashMap<Block, Block> = func
+    let remap: crate::fast_hash::FxHashMap<Block, Block> = func
         .block_order
         .iter()
         .enumerate()
@@ -1298,7 +2048,8 @@ fn renumber_blocks_contiguous(func: &mut X86ISelFunction) {
         .collect();
 
     let order = std::mem::take(&mut func.block_order);
-    let mut new_blocks: HashMap<Block, X86ISelBlock> = HashMap::with_capacity(len);
+    let mut new_blocks: crate::fast_hash::FxHashMap<Block, X86ISelBlock> =
+        crate::fast_hash::FxHashMap::with_capacity_and_hasher(len, Default::default());
     for old_id in &order {
         let Some(mut blk) = func.blocks.remove(old_id) else {
             continue;
@@ -1390,6 +2141,13 @@ mod tests {
         X86ISelInst::new(X86Opcode::Ud2, vec![])
     }
 
+    fn call(symbol: &str) -> X86ISelInst {
+        X86ISelInst::new(
+            X86Opcode::Call,
+            vec![X86ISelOperand::Symbol(symbol.to_string())],
+        )
+    }
+
     fn count_opcode(func: &X86ISelFunction, op: X86Opcode) -> usize {
         func.blocks
             .values()
@@ -1458,6 +2216,64 @@ mod tests {
         set_succ(&mut f, b4, vec![]);
         set_succ(&mut f, b5, vec![]);
         f
+    }
+
+    #[test]
+    fn bounds_check_preserves_flags_across_partial_writes() {
+        let mut f = build_diamond(vec![], vreg(0), vreg(1));
+        f.blocks.get_mut(&Block(3)).unwrap().insts = vec![
+            X86ISelInst::new(X86Opcode::Inc, vec![X86ISelOperand::VReg(vreg(2))]),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![
+                    X86ISelOperand::VReg(VReg::new(3, RegClass::Gpr32)),
+                    X86ISelOperand::CondCode(X86CondCode::B),
+                ],
+            ),
+            ret(),
+        ];
+        assert!(!compare_flags_dead_after(&f, Block(3)));
+        X86BoundsCheckElimination::new().run_on_function(&mut f);
+        assert_eq!(count_opcode(&f, X86Opcode::CmpRR), 2);
+    }
+
+    #[test]
+    fn eliminates_diamond_into_abort_call_trap() {
+        // The bridge's shared panic=abort assert block `[Call abort, Ud2]` is
+        // a pure trap: the redundant check's edge into it is eliminated and
+        // the orphaned block removed, exactly as for a bare `Ud2`.
+        let iv = vreg(0);
+        let len = vreg(1);
+        let mut f = build_diamond(vec![], iv, len);
+        f.blocks.get_mut(&Block(5)).unwrap().insts = vec![call("abort"), ud2()];
+
+        let mut pass = X86BoundsCheckElimination::new();
+        assert!(pass.run_on_function(&mut f));
+        assert_eq!(pass.last_run_eliminations, 1);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 0, "trap block removed");
+        assert_eq!(
+            count_opcode(&f, X86Opcode::Call),
+            0,
+            "abort call removed with it"
+        );
+        assert_eq!(count_opcode(&f, X86Opcode::CmpRR), 1);
+    }
+
+    #[test]
+    fn keeps_diamond_into_other_call_trap() {
+        // `[Call exit, Ud2]` is not a pure trap (a call to any other symbol
+        // is observable work): the check is kept.
+        let iv = vreg(0);
+        let len = vreg(1);
+        let mut f = build_diamond(vec![], iv, len);
+        f.blocks.get_mut(&Block(5)).unwrap().insts = vec![call("exit"), ud2()];
+
+        let mut pass = X86BoundsCheckElimination::new();
+        assert!(!pass.run_on_function(&mut f));
+        assert_eq!(pass.last_run_eliminations, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1, "trap kept");
+        assert_eq!(count_opcode(&f, X86Opcode::Call), 1);
+        assert_eq!(count_opcode(&f, X86Opcode::CmpRR), 2);
     }
 
     #[test]
@@ -1655,5 +2471,657 @@ mod tests {
         assert_eq!(pass.last_run_eliminations, 0);
         assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1, "trap kept");
         assert_eq!(count_opcode(&f, X86Opcode::CmpRR), 2, "both compares kept");
+    }
+
+    // ---- Case 4: `len` RELOADED from the same frame slot (the Vec shape) ----
+
+    fn lea_slot(dst: VReg, slot: u32, disp: i32) -> X86ISelInst {
+        X86ISelInst::new(
+            X86Opcode::Lea,
+            vec![
+                X86ISelOperand::VReg(dst),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::StackSlot(slot)),
+                    disp,
+                },
+            ],
+        )
+    }
+
+    fn load_at(op: X86Opcode, dst: VReg, base: VReg, disp: i32) -> X86ISelInst {
+        X86ISelInst::new(
+            op,
+            vec![
+                X86ISelOperand::VReg(dst),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::VReg(base)),
+                    disp,
+                },
+            ],
+        )
+    }
+
+    fn store_at(op: X86Opcode, base: VReg, disp: i32, src: VReg) -> X86ISelInst {
+        X86ISelInst::new(
+            op,
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::VReg(base)),
+                    disp,
+                },
+                X86ISelOperand::VReg(src),
+            ],
+        )
+    }
+
+    /// `while k < v.len() { .. v[k] .. }` over an OWNING container: the guard
+    /// and the bounds check each RELOAD `len` from the container's header, so
+    /// they compare two textually distinct load results.
+    ///
+    /// The slot/displacement/opcode fields let a test make the second load read
+    /// a different location. `between` is spliced into the check block BEFORE
+    /// its load, which is exactly the region the pass must scan: the guard
+    /// block's tail after the first load plus the check block's head before the
+    /// second.
+    struct ReloadShape {
+        guard_slot: u32,
+        guard_disp: i32,
+        guard_op: X86Opcode,
+        check_slot: u32,
+        check_disp: i32,
+        check_op: X86Opcode,
+        between: Vec<X86ISelInst>,
+    }
+
+    impl Default for ReloadShape {
+        fn default() -> Self {
+            Self {
+                guard_slot: 0,
+                guard_disp: 16,
+                guard_op: X86Opcode::MovRM,
+                check_slot: 0,
+                check_disp: 16,
+                check_op: X86Opcode::MovRM,
+                between: vec![],
+            }
+        }
+    }
+
+    fn build_reload_diamond(shape: ReloadShape) -> X86ISelFunction {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut f = X86ISelFunction::new("bce_reload_test".to_string(), sig);
+        let (b0, b1, b2, b3, b4, b5) = (Block(0), Block(1), Block(2), Block(3), Block(4), Block(5));
+        for b in [b0, b1, b2, b3, b4, b5] {
+            f.ensure_block(b);
+        }
+        f.stack_slots = vec![
+            trust_cg_lower::function::StackSlotInfo::new(24, 8),
+            trust_cg_lower::function::StackSlotInfo::new(24, 8),
+        ];
+        let iv = vreg(0);
+        let acc = vreg(2);
+        let p_guard = vreg(3);
+        let p_check = vreg(4);
+        let len_g = vreg(5);
+        let len_c = vreg(6);
+        f.next_vreg = 100;
+
+        // b0: iv = 0, and one `lea` root per slot the shape names.
+        f.push_inst(b0, mov_ri(iv, 0));
+        f.push_inst(b0, lea_slot(p_guard, shape.guard_slot, 0));
+        f.push_inst(b0, lea_slot(p_check, shape.check_slot, 0));
+        f.push_inst(b0, jmp(b1));
+        // b1 guard: reload len, compare, branch.
+        f.push_inst(
+            b1,
+            load_at(shape.guard_op, len_g, p_guard, shape.guard_disp),
+        );
+        f.push_inst(b1, cmp_rr(iv, len_g));
+        f.push_inst(b1, jcc(X86CondCode::B, b2));
+        f.push_inst(b1, jmp(b4));
+        // b2 check: first whatever the test puts BETWEEN the two loads, then the
+        // second reload of len, then the redundant compare and the trap diamond.
+        for inst in shape.between {
+            f.push_inst(b2, inst);
+        }
+        f.push_inst(
+            b2,
+            load_at(shape.check_op, len_c, p_check, shape.check_disp),
+        );
+        f.push_inst(b2, cmp_rr(iv, len_c));
+        f.push_inst(b2, jcc(X86CondCode::B, b3));
+        f.push_inst(b2, jmp(b5));
+        // b3 cont / b4 exit / b5 trap
+        f.push_inst(b3, add_rr(acc, iv));
+        f.push_inst(b3, ret());
+        f.push_inst(b4, ret());
+        f.push_inst(b5, ud2());
+
+        set_succ(&mut f, b0, vec![b1]);
+        set_succ(&mut f, b1, vec![b2, b4]);
+        set_succ(&mut f, b2, vec![b3, b5]);
+        set_succ(&mut f, b3, vec![]);
+        set_succ(&mut f, b4, vec![]);
+        set_succ(&mut f, b5, vec![]);
+        f
+    }
+
+    fn run_reload(shape: ReloadShape) -> (bool, usize, X86ISelFunction) {
+        let mut f = build_reload_diamond(shape);
+        assert_eq!(
+            count_opcode(&f, X86Opcode::Ud2),
+            1,
+            "shape starts with a trap"
+        );
+        let mut pass = X86BoundsCheckElimination::new();
+        let changed = pass.run_on_function(&mut f);
+        (changed, pass.last_run_eliminations, f)
+    }
+
+    #[test]
+    fn eliminates_own_length_check_when_len_is_reloaded_from_the_same_slot() {
+        // The case cases 1-3 could not reach: two DISTINCT load-defined vregs,
+        // proved equal because they reload the same frame bytes.
+        let (changed, elims, f) = run_reload(ReloadShape::default());
+        assert!(changed);
+        assert_eq!(elims, 1, "the reloaded-len check is eliminated");
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 0, "trap block removed");
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_an_overlapping_store_intervenes() {
+        // A store to the SAME bytes between the two loads: the second load may
+        // legitimately differ, so the check must stay.
+        let shape = ReloadShape {
+            between: vec![store_at(X86Opcode::MovMR, vreg(3), 16, vreg(0))],
+            ..Default::default()
+        };
+        let (changed, elims, f) = run_reload(shape);
+        assert!(!changed, "an aliasing write must block the elimination");
+        assert_eq!(elims, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1, "trap block retained");
+    }
+
+    #[test]
+    fn eliminates_reloaded_len_check_across_a_disjoint_store_in_the_same_slot() {
+        // A store to the container's `ptr` field (offset 0, 8 bytes) cannot
+        // change its `len` field (offset 16). This is the test that proves the
+        // disambiguation is a real byte-range check and not "no stores at all".
+        let shape = ReloadShape {
+            between: vec![store_at(X86Opcode::MovMR, vreg(3), 0, vreg(0))],
+            ..Default::default()
+        };
+        let (changed, elims, _f) = run_reload(shape);
+        assert!(changed, "a disjoint field store must not block it");
+        assert_eq!(elims, 1);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_a_store_partially_overlaps() {
+        // A 8-byte store at offset 12 covers bytes 12..20 and so overlaps the
+        // 8-byte len at 16..24. Partial overlap must be treated as aliasing.
+        let shape = ReloadShape {
+            between: vec![store_at(X86Opcode::MovMR, vreg(3), 12, vreg(0))],
+            ..Default::default()
+        };
+        let (changed, elims, _f) = run_reload(shape);
+        assert!(!changed, "a partially overlapping store must block it");
+        assert_eq!(elims, 0);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_a_call_intervenes() {
+        let shape = ReloadShape {
+            between: vec![call("opaque")],
+            ..Default::default()
+        };
+        let (changed, elims, _f) = run_reload(shape);
+        assert!(!changed, "a call may write any frame slot");
+        assert_eq!(elims, 0);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_a_store_address_does_not_resolve() {
+        // Store through a vreg that is NOT a slot `lea` root: it could hold any
+        // pointer, so it may alias and the check must stay.
+        let shape = ReloadShape {
+            between: vec![store_at(X86Opcode::MovMR, vreg(77), 16, vreg(0))],
+            ..Default::default()
+        };
+        let (changed, elims, _f) = run_reload(shape);
+        assert!(!changed, "an unresolvable store address may alias");
+        assert_eq!(elims, 0);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_across_two_different_slots() {
+        // `x[i]` guarded by `y.len()` -- the cross-container analogue of
+        // `keeps_cross_length_check`, now through reloads.
+        let shape = ReloadShape {
+            check_slot: 1,
+            ..Default::default()
+        };
+        let (changed, elims, _f) = run_reload(shape);
+        assert!(!changed, "two different slots are two different lengths");
+        assert_eq!(elims, 0);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_the_two_loads_read_different_offsets() {
+        let shape = ReloadShape {
+            check_disp: 8,
+            ..Default::default()
+        };
+        let (changed, elims, _f) = run_reload(shape);
+        assert!(
+            !changed,
+            "different fields of one slot are different values"
+        );
+        assert_eq!(elims, 0);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_the_two_loads_have_different_widths() {
+        // A 4-byte reload does not prove an 8-byte guard value.
+        let shape = ReloadShape {
+            check_op: X86Opcode::MovRM32,
+            ..Default::default()
+        };
+        let (changed, elims, _f) = run_reload(shape);
+        assert!(!changed, "differing access widths must not unify");
+        assert_eq!(elims, 0);
+    }
+
+    /// The shape that motivated case 4 and that a ONE-`Lea` resolver missed: the
+    /// length is reached by a CHAIN — `lea vec, [StackSlot(0)+0]` then
+    /// `lea len_addr, [vec+16]` — which is how the selector spells the address of
+    /// a field of a frame local. Both loads go through the chained address.
+    fn build_chained_lea_reload_diamond(second_chain_disp: i32) -> X86ISelFunction {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut f = X86ISelFunction::new("bce_chain_test".to_string(), sig);
+        let (b0, b1, b2, b3, b4, b5) = (Block(0), Block(1), Block(2), Block(3), Block(4), Block(5));
+        for b in [b0, b1, b2, b3, b4, b5] {
+            f.ensure_block(b);
+        }
+        f.stack_slots = vec![trust_cg_lower::function::StackSlotInfo::new(24, 8)];
+        let iv = vreg(0);
+        let acc = vreg(2);
+        let vec_ptr = vreg(3);
+        let len_addr_g = vreg(4);
+        let len_addr_c = vreg(5);
+        let len_g = vreg(6);
+        let len_c = vreg(7);
+        f.next_vreg = 100;
+
+        // b0: the base slot `lea`, then one field `lea` per side.
+        f.push_inst(b0, mov_ri(iv, 0));
+        f.push_inst(b0, lea_slot(vec_ptr, 0, 0));
+        f.push_inst(b0, lea_reg(len_addr_g, vec_ptr, 16));
+        f.push_inst(b0, lea_reg(len_addr_c, vec_ptr, second_chain_disp));
+        f.push_inst(b0, jmp(b1));
+        // b1 guard
+        f.push_inst(b1, load_at(X86Opcode::MovRM, len_g, len_addr_g, 0));
+        f.push_inst(b1, cmp_rr(iv, len_g));
+        f.push_inst(b1, jcc(X86CondCode::B, b2));
+        f.push_inst(b1, jmp(b4));
+        // b2 check
+        f.push_inst(b2, load_at(X86Opcode::MovRM, len_c, len_addr_c, 0));
+        f.push_inst(b2, cmp_rr(iv, len_c));
+        f.push_inst(b2, jcc(X86CondCode::B, b3));
+        f.push_inst(b2, jmp(b5));
+        f.push_inst(b3, add_rr(acc, iv));
+        f.push_inst(b3, ret());
+        f.push_inst(b4, ret());
+        f.push_inst(b5, ud2());
+
+        set_succ(&mut f, b0, vec![b1]);
+        set_succ(&mut f, b1, vec![b2, b4]);
+        set_succ(&mut f, b2, vec![b3, b5]);
+        set_succ(&mut f, b3, vec![]);
+        set_succ(&mut f, b4, vec![]);
+        set_succ(&mut f, b5, vec![]);
+        f
+    }
+
+    fn lea_reg(dst: VReg, base: VReg, disp: i32) -> X86ISelInst {
+        X86ISelInst::new(
+            X86Opcode::Lea,
+            vec![
+                X86ISelOperand::VReg(dst),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::VReg(base)),
+                    disp,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn eliminates_reloaded_len_check_through_a_chained_field_lea() {
+        let mut f = build_chained_lea_reload_diamond(16);
+        let mut pass = X86BoundsCheckElimination::new();
+        assert!(pass.run_on_function(&mut f));
+        assert_eq!(
+            pass.last_run_eliminations, 1,
+            "a chained `lea` field address must resolve to its slot"
+        );
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 0);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_the_chained_leas_reach_different_fields() {
+        // Same base slot, chains ending at different offsets: different values.
+        let mut f = build_chained_lea_reload_diamond(8);
+        let mut pass = X86BoundsCheckElimination::new();
+        let changed = pass.run_on_function(&mut f);
+        assert!(!changed, "different fields are different lengths");
+        assert_eq!(pass.last_run_eliminations, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    /// h1_vec_push_sum's ACTUAL shape: a length address computed into a register
+    /// from a pointer that is NOT slot-rooted (so case 4 cannot resolve it), and
+    /// the check side reads through a plain `MovRR` COPY of that same register.
+    /// `between` is spliced into the check block BEFORE the second load.
+    fn build_pointer_reload_diamond(check_disp: i32, between: Vec<X86ISelInst>) -> X86ISelFunction {
+        let mut f = build_chained_lea_reload_diamond(16);
+        let b0 = Block(0);
+        // Root the chain in an arbitrary (non-slot) pointer, as h1's `Vec` header
+        // address is: `mov r10, [slot] ; lea rdi, [r10 + 16]`.
+        f.blocks.get_mut(&b0).unwrap().insts[1] = lea_reg(vreg(3), vreg(88), 0);
+        // The check-side address is a COPY of the guard-side address, not a second
+        // `lea`. This is what makes `canon` reach one shared base.
+        f.blocks.get_mut(&b0).unwrap().insts[3] = X86ISelInst::new(
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::VReg(vreg(5)), X86ISelOperand::VReg(vreg(4))],
+        );
+        // Re-point the check load's displacement if the test wants them to differ.
+        let b2 = Block(2);
+        if check_disp != 0 {
+            f.blocks.get_mut(&b2).unwrap().insts[0] =
+                load_at(X86Opcode::MovRM, vreg(7), vreg(5), check_disp);
+        }
+        for (k, inst) in between.into_iter().enumerate() {
+            f.blocks.get_mut(&b2).unwrap().insts.insert(k, inst);
+        }
+        f
+    }
+
+    fn run_pointer_reload(f: &mut X86ISelFunction, arm: bool) -> (bool, usize) {
+        let mut pass = X86BoundsCheckElimination::new().with_pointer_reload(arm);
+        let changed = pass.run_on_function(f);
+        (changed, pass.last_run_eliminations)
+    }
+
+    #[test]
+    fn case5_eliminates_when_the_check_address_is_a_copy_of_the_guard_address() {
+        // Same pointer, same displacement, no store between: one value, so the
+        // second compare is redundant and its trap is unreachable.
+        let mut f = build_pointer_reload_diamond(0, vec![]);
+        let (changed, n) = run_pointer_reload(&mut f, true);
+        assert!(
+            changed,
+            "a same-pointer reload with no store between must elide"
+        );
+        assert_eq!(n, 1);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 0);
+    }
+
+    #[test]
+    fn case5_with_a_case3b_guard_copy_is_not_defeated_by_the_redefinition_scan() {
+        // THE INTERACTION THAT BLOCKED h1. When the guard's INDEX is a copy
+        // defined in the guard block before its compare, case 3b lowers the
+        // redefinition scan's start to that copy's index. The widened window then
+        // CONTAINS the length root's own defining load, and a positional scan
+        // reports that definition as a "redefinition" — declining a candidate
+        // whose every real condition holds.
+        //
+        // The fix excludes SINGLE-DEF roots from the scan (a vreg with one
+        // definition cannot change value between two reads, and its definition
+        // dominates the guard's read). This pins it: the same fixture, with the
+        // guard comparing a guard-block copy of the index, must still eliminate.
+        let mut f = build_pointer_reload_diamond(0, vec![]);
+        let b1 = Block(1);
+        // Guard block becomes: MovRR ivc <- iv ; MovRM len_g ; CmpRR ivc,len_g ; ...
+        let ivc = vreg(60);
+        {
+            let blk = f.blocks.get_mut(&b1).unwrap();
+            blk.insts.insert(
+                0,
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![X86ISelOperand::VReg(ivc), X86ISelOperand::VReg(vreg(0))],
+                ),
+            );
+            // Re-point the guard compare at the copy (it is now at index 2).
+            blk.insts[2] = cmp_rr(ivc, vreg(6));
+        }
+        let (changed, n) = run_pointer_reload(&mut f, true);
+        assert!(
+            changed,
+            "a case-3b guard copy must not make the length root's own load look like a redefinition"
+        );
+        assert_eq!(n, 1);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 0);
+    }
+
+    #[test]
+    fn a_multi_def_root_is_still_scanned_for_redefinition() {
+        // The exclusion must NOT weaken the scan for what it is actually for: a
+        // MULTI-def root really redefined between the two compares. Give the
+        // index a second definition inside the covered window.
+        let mut f = build_pointer_reload_diamond(0, vec![]);
+        let b2 = Block(2);
+        f.blocks
+            .get_mut(&b2)
+            .unwrap()
+            .insts
+            .insert(0, mov_ri(vreg(0), 7));
+        let (changed, n) = run_pointer_reload(&mut f, true);
+        assert!(
+            !changed,
+            "a multi-def index redefined in the window must still decline"
+        );
+        assert_eq!(n, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    #[test]
+    fn case5_is_off_by_default() {
+        // FALSIFIABILITY, and it also preserves
+        // `keeps_reloaded_len_check_when_the_address_chain_is_not_slot_rooted`:
+        // the identical fixture with only the opt-in changed must KEEP the check.
+        let mut f = build_pointer_reload_diamond(0, vec![]);
+        let (changed, n) = run_pointer_reload(&mut f, false);
+        assert!(!changed, "case 5 must be OFF by default");
+        assert_eq!(n, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    #[test]
+    fn case5_refuses_any_store_between_the_loads() {
+        // The arm cannot compare a store's target against its own address, so it
+        // refuses on ANY store -- stricter than case 4's aliasing test. This is
+        // the premise upstream named as missing ("a store may separate the
+        // trip-bound load from the element guard's reload").
+        let store = X86ISelInst::new(
+            X86Opcode::MovMR,
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::StackSlot(0)),
+                    disp: 0,
+                },
+                X86ISelOperand::VReg(vreg(0)),
+            ],
+        );
+        let mut f = build_pointer_reload_diamond(0, vec![store]);
+        let (changed, n) = run_pointer_reload(&mut f, true);
+        assert!(!changed, "a store between the loads must decline");
+        assert_eq!(n, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    #[test]
+    fn case5_refuses_a_call_between_the_loads() {
+        let call = X86ISelInst::new(
+            X86Opcode::Call,
+            vec![X86ISelOperand::ExactModuleSymbol("opaque".into())],
+        );
+        let mut f = build_pointer_reload_diamond(0, vec![call]);
+        let (changed, n) = run_pointer_reload(&mut f, true);
+        assert!(!changed, "a call between the loads may write the location");
+        assert_eq!(n, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    #[test]
+    fn case5_refuses_different_displacements() {
+        // Same base register, DIFFERENT offset: two locations, two values.
+        let mut f = build_pointer_reload_diamond(8, vec![]);
+        let (changed, n) = run_pointer_reload(&mut f, true);
+        assert!(!changed, "different displacements are different addresses");
+        assert_eq!(n, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    #[test]
+    fn case5_refuses_a_multi_def_address_register() {
+        // The shared base must be unique-def function-wide, so nothing can move
+        // the address between the loads. Give it a second definition.
+        let mut f = build_pointer_reload_diamond(0, vec![]);
+        let b3 = Block(3);
+        f.blocks
+            .get_mut(&b3)
+            .unwrap()
+            .insts
+            .insert(0, lea_reg(vreg(4), vreg(88), 32));
+        let (changed, n) = run_pointer_reload(&mut f, true);
+        assert!(!changed, "a multi-def address register must decline");
+        assert_eq!(n, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    #[test]
+    fn keeps_reloaded_len_check_when_the_address_chain_is_not_slot_rooted() {
+        // The chain's root `lea` is over a register that is NOT a slot (an
+        // arbitrary pointer, e.g. into the heap): unresolvable, so decline.
+        let mut f = build_chained_lea_reload_diamond(16);
+        // Rewrite the root `lea` so its base is an unrelated vreg, not a slot.
+        let b0 = Block(0);
+        f.blocks.get_mut(&b0).unwrap().insts[1] = lea_reg(vreg(3), vreg(88), 0);
+        let mut pass = X86BoundsCheckElimination::new();
+        assert!(
+            !pass.run_on_function(&mut f),
+            "a chain not rooted in a stack slot may alias anything"
+        );
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
+    }
+
+    // ---- Case 3b: the GUARD side is a copy made before the guard compare ----
+
+    /// `while k < v.len() { .. v[k] .. }` after the cleanup cluster: BOTH compares
+    /// read a copy of the multi-def loop IV, the guard's made in the guard block
+    /// before its compare and the check's in the check block before its own.
+    ///
+    /// `redefine_root_in_guard_block` inserts a redefinition of the IV BETWEEN the
+    /// guard's copy and the guard compare. That makes the two copies hold
+    /// genuinely different values, and it is the case the widened redefinition
+    /// scan exists to catch — a scan starting at the compare cannot see it.
+    fn build_guard_side_copy(redefine_root_in_guard_block: bool) -> X86ISelFunction {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut f = X86ISelFunction::new("bce_guard_copy".to_string(), sig);
+        let (b0, b1, b2, b3, b4, b5) = (Block(0), Block(1), Block(2), Block(3), Block(4), Block(5));
+        for b in [b0, b1, b2, b3, b4, b5] {
+            f.ensure_block(b);
+        }
+        let iv = vreg(0);
+        let len = vreg(1);
+        let acc = vreg(2);
+        let g_copy = vreg(10);
+        let c_copy = vreg(11);
+        f.next_vreg = 100;
+
+        f.push_inst(b0, mov_ri(iv, 0));
+        f.push_inst(b0, mov_ri(len, 100));
+        f.push_inst(b0, jmp(b1));
+        // b1 guard: copy the IV, then (optionally) redefine the IV, then compare.
+        f.push_inst(b1, mov_rr(g_copy, iv));
+        if redefine_root_in_guard_block {
+            f.push_inst(b1, add_ri(iv, 1));
+        }
+        f.push_inst(b1, cmp_rr(g_copy, len));
+        f.push_inst(b1, jcc(X86CondCode::B, b2));
+        f.push_inst(b1, jmp(b4));
+        // b2 check: a copy captured inside the covered window.
+        f.push_inst(b2, mov_rr(c_copy, iv));
+        f.push_inst(b2, cmp_rr(c_copy, len));
+        f.push_inst(b2, jcc(X86CondCode::B, b3));
+        f.push_inst(b2, jmp(b5));
+        f.push_inst(b3, add_rr(acc, iv));
+        f.push_inst(b3, ret());
+        // A second IV definition makes it the multi-def merge shape.
+        f.push_inst(b4, add_ri(iv, 1));
+        f.push_inst(b4, ret());
+        f.push_inst(b5, ud2());
+
+        set_succ(&mut f, b0, vec![b1]);
+        set_succ(&mut f, b1, vec![b2, b4]);
+        set_succ(&mut f, b2, vec![b3, b5]);
+        set_succ(&mut f, b3, vec![]);
+        set_succ(&mut f, b4, vec![]);
+        set_succ(&mut f, b5, vec![]);
+        f
+    }
+
+    #[test]
+    fn eliminates_check_when_both_sides_use_copies_of_the_multidef_iv() {
+        let mut f = build_guard_side_copy(false);
+        let mut pass = X86BoundsCheckElimination::new();
+        assert!(pass.run_on_function(&mut f));
+        assert_eq!(pass.last_run_eliminations, 1);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 0, "trap block removed");
+    }
+
+    #[test]
+    fn keeps_check_when_the_root_is_redefined_between_the_guard_copy_and_its_compare() {
+        // THE test for the widened scan. The guard's copy holds the OLD iv and
+        // the check's copy the NEW one, so the guard's predicate does not imply
+        // the check's. Only a scan reaching BACK to the copy's definition sees
+        // the redefinition; one starting at the compare does not.
+        let mut f = build_guard_side_copy(true);
+        let mut pass = X86BoundsCheckElimination::new();
+        let changed = pass.run_on_function(&mut f);
+        assert!(
+            !changed,
+            "a stale guard-side capture must block the elimination"
+        );
+        assert_eq!(pass.last_run_eliminations, 0);
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1, "trap block retained");
+    }
+
+    #[test]
+    fn keeps_check_when_the_guard_copy_is_made_outside_the_guard_block() {
+        // Case 3b admits a guard-side copy only from the GUARD BLOCK, because
+        // "not redefined" along an arbitrary dominator path is not proved here.
+        let mut f = build_guard_side_copy(false);
+        // Move the guard's copy from the guard block into the entry block.
+        let copy = f.blocks.get_mut(&Block(1)).unwrap().insts.remove(0);
+        let entry = f.blocks.get_mut(&Block(0)).unwrap();
+        entry.insts.insert(2, copy);
+        let mut pass = X86BoundsCheckElimination::new();
+        assert!(
+            !pass.run_on_function(&mut f),
+            "a guard-side copy from another block is not admitted"
+        );
+        assert_eq!(count_opcode(&f, X86Opcode::Ud2), 1);
     }
 }

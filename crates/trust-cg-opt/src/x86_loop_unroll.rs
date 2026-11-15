@@ -105,10 +105,10 @@
 //!
 //! # Gating
 //!
-//! Slice 1 is OPT-IN: the pass is only registered when `TCG_X86_UNROLL=1`
-//! (see `x86_64/pipeline.rs`). `TCG_X86_UNROLL_TRACE=1` prints, per
-//! candidate loop, the applied trip/body size or the refusal reason plus
-//! a structural dump of the loop.
+//! The pass is in the default O2/O3 schedule (since fa7ee295a; it was
+//! opt-in under `TCG_X86_UNROLL` before, and that variable is read nowhere
+//! now). The tracked opt-out `-Ztrust-ir-cg-args=no-x86-loop-unroll`
+//! ([`set_loop_unroll_disabled`]) makes the pass manager's run change nothing.
 
 use std::collections::{HashMap, HashSet};
 
@@ -151,31 +151,34 @@ impl X86LoopUnroll {
     }
 }
 
+static LOOP_UNROLL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install this pass's opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-loop-unroll`). DEFAULT ON. Off is always
+/// correct: every loop keeps its shape. A diagnostic knob for the O2 proof
+/// census (slice 26's pre-build measurement); `run_on_function` ignores it.
+pub fn set_loop_unroll_disabled(disabled: bool) -> bool {
+    match LOOP_UNROLL_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LOOP_UNROLL_DISABLED.get() == Some(&requested),
+    }
+}
+
 impl X86MachinePass for X86LoopUnroll {
     fn name(&self) -> &str {
         "x86-loop-unroll"
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
+        if LOOP_UNROLL_DISABLED.get().copied().unwrap_or(false) {
+            return false;
+        }
         run_impl(func)
     }
 }
 
-fn trace_enabled() -> bool {
-    std::env::var_os("TCG_X86_UNROLL_TRACE").is_some()
-}
-
-macro_rules! utrace {
-    ($($arg:tt)*) => {
-        if trace_enabled() {
-            eprintln!("[x86-unroll] {}", format!($($arg)*));
-        }
-    };
-}
-
 fn run_impl(func: &mut X86ISelFunction) -> bool {
     if !func.eh_info.is_empty() {
-        utrace!("skip fn {}: carries EH structure", func.name);
         return false;
     }
     let mut changed = false;
@@ -188,37 +191,16 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
         let cfg = CfgAnalysis::compute(func);
         let mut applied = false;
         for lp in innermost_loops(&cfg.loops) {
-            match analyze_counted_loop(func, &cfg, lp) {
-                Ok(plan) => {
-                    let added = (plan.trip as usize - 1) * plan.body.len();
-                    if added > budget {
-                        utrace!(
-                            "refuse header={:?}: function clone budget exhausted ({} > {})",
-                            lp.header,
-                            added,
-                            budget
-                        );
-                        continue;
-                    }
-                    utrace!(
-                        "APPLY header={:?} chain={:?} exit={:?} trip={} body={} (+{} insts)",
-                        plan.header,
-                        plan.chain,
-                        plan.exit,
-                        plan.trip,
-                        plan.body.len(),
-                        added
-                    );
-                    apply_unroll(func, &plan);
-                    budget -= added;
-                    changed = true;
-                    applied = true;
-                    break;
+            if let Ok(plan) = analyze_counted_loop(func, &cfg, lp) {
+                let added = (plan.trip as usize - 1) * plan.body.len();
+                if added > budget {
+                    continue;
                 }
-                Err(reason) => {
-                    utrace!("refuse header={:?}: {}", lp.header, reason);
-                    dump_loop(func, lp);
-                }
+                apply_unroll(func, &plan);
+                budget -= added;
+                changed = true;
+                applied = true;
+                break;
             }
         }
         if !applied {
@@ -226,50 +208,6 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
         }
     }
     changed
-}
-
-/// Trace helper: one line per loop-body block (+ preheader) with opcodes
-/// and successors, so a refused shape is fully diagnosable from the log.
-fn dump_loop(func: &X86ISelFunction, lp: &GenericLoop<Block>) {
-    if !trace_enabled() {
-        return;
-    }
-    let mut blocks: Vec<Block> = lp.body.iter().copied().collect();
-    blocks.sort_by_key(|b| b.0);
-    if let Some(ph) = lp.preheader {
-        blocks.insert(0, ph);
-    }
-    for b in blocks {
-        if let Some(blk) = func.blocks.get(&b) {
-            let tag = if Some(b) == lp.preheader {
-                "pre "
-            } else if b == lp.header {
-                "hdr "
-            } else {
-                "    "
-            };
-            if Some(b) == lp.preheader || b == lp.header {
-                // Full operand detail where recognition happens.
-                eprintln!("[x86-unroll]   {}{:?} -> {:?}", tag, b, blk.successors);
-                for i in &blk.insts {
-                    eprintln!("[x86-unroll]     {:?} {:?}", i.opcode, i.operands);
-                }
-            } else {
-                let ops: Vec<String> = blk
-                    .insts
-                    .iter()
-                    .map(|i| format!("{:?}", i.opcode))
-                    .collect();
-                eprintln!(
-                    "[x86-unroll]   {}{:?} [{}] -> {:?}",
-                    tag,
-                    b,
-                    ops.join(","),
-                    blk.successors
-                );
-            }
-        }
-    }
 }
 
 /// Innermost loops: no OTHER loop's body is strictly contained in this one's.
@@ -497,6 +435,39 @@ fn analyze_counted_loop(
         }
         if has_hidden_defs(inst.opcode) {
             return Err("hidden-def instruction in body");
+        }
+        // OBSERVABLE ACCESSES ARE NEVER REPLICATED.
+        //
+        // This is the one x86 pass whose job is duplication, and until now the
+        // body admission checked branch/terminator/call flags, call-arg
+        // carriers, hidden defs and operand shapes — and nothing about EFFECTS.
+        // The header chain sixty lines above rejects `x86_inst_effect(inst) !=
+        // MemoryEffect::Pure` (the "non-pure header instruction" arm), so the
+        // effect model was applied to the chain this pass DELETES and not to
+        // the body it CLONES.
+        //
+        // Today that is latent rather than wrong: the unroll is exact-trip by
+        // construction (zero-trip refused below, `trip` obtained by exact
+        // simulation of the compare and capped at MAX_TRIP), so N volatile
+        // accesses before equal N after in the same order. It is guarded here
+        // anyway because the property that makes it safe lives in a DIFFERENT
+        // part of the pass from the code that would violate it: any future
+        // partial-unroll, runtime-trip or peeling tier duplicates observable
+        // accesses on its first day, and there would be no place for this
+        // check to go.
+        //
+        // The guard is a BARRIER test, not a purity test. A plain load or store
+        // may be replicated — exact-trip keeps its dynamic count — so demanding
+        // purity here would refuse nearly every real loop. `MemoryEffect::Call`
+        // is what the volatile opcodes map to, and it is the class that must
+        // not be cloned.
+        if x86_inst_effect(inst).is_barrier() {
+            return Err("observable (volatile/barrier) access in body");
+        }
+        // Atomics are marked by a `proof_origin`, NOT by a Volatile* opcode and
+        // not necessarily by a barrier effect, so they need their own test.
+        if inst.proof_origin.is_some() {
+            return Err("proof-origin (atomic) access in body");
         }
         for op in &inst.operands {
             if operand_refuses_in_body(op) {
@@ -1915,6 +1886,75 @@ mod tests {
             .insts
             .insert(0, inst(X86Opcode::Jcc, vec![cc(X86CondCode::E), blk(EXIT)]));
         assert!(!run(&mut f));
+    }
+
+    /// A VOLATILE access in the body is never replicated.
+    ///
+    /// This pass is the one x86 pass whose job is duplication, and its body
+    /// admission used to check nothing about effects while the header chain
+    /// sixty lines above rejected any non-pure instruction. The exact-trip
+    /// construction made that latent rather than wrong, but the property that
+    /// makes it safe lives in a different part of the pass from the code that
+    /// would violate it — so it is pinned here.
+    #[test]
+    fn refuses_volatile_access_in_body() {
+        for opcode in [
+            X86Opcode::VolatileMovRM,
+            X86Opcode::VolatileMovRM8,
+            X86Opcode::VolatileMovMR,
+            X86Opcode::VolatileMovMR8,
+        ] {
+            let mut f = counted_loop(0, 1, 4);
+            let latch = f.blocks.get_mut(&LATCH).unwrap();
+            latch.insts.insert(
+                0,
+                inst(
+                    opcode,
+                    vec![
+                        vr(7),
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(vr(8)),
+                            disp: 0,
+                        },
+                    ],
+                ),
+            );
+            assert!(
+                !run(&mut f),
+                "{opcode:?} in the body must refuse the unroll: replicating an observable \
+                 access is only safe because the trip count is exact, and nothing in the body \
+                 admission was checking for it"
+            );
+        }
+    }
+
+    /// A PLAIN load or store in the body is still unrolled.
+    ///
+    /// The guard is a BARRIER test, not a purity test. Demanding purity would
+    /// refuse nearly every real loop, so this pins that the fix did not simply
+    /// switch the pass off.
+    #[test]
+    fn still_unrolls_a_body_with_a_plain_memory_access() {
+        let mut f = counted_loop(0, 1, 4);
+        let latch = f.blocks.get_mut(&LATCH).unwrap();
+        latch.insts.insert(
+            0,
+            inst(
+                X86Opcode::MovRM,
+                vec![
+                    vr(7),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(vr(8)),
+                        disp: 0,
+                    },
+                ],
+            ),
+        );
+        assert!(
+            run(&mut f),
+            "a plain load must still unroll — the guard must exclude observable accesses, not \
+             all memory"
+        );
     }
 
     #[test]

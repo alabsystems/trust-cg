@@ -89,11 +89,14 @@ use trust_ir::{BlockId, CastOp, FuncId, ValueId};
 /// FPTrunc f64->f32: param carries the f64 source BITS (as i64), Bitcast into a
 /// double register, FCVT-narrow to f32, return f32.
 fn build_fptrunc(func_id: u32, name: &str, m: &mut TrustIrModule) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -118,17 +121,21 @@ fn build_fptrunc(func_id: u32, name: &str, m: &mut TrustIrModule) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// FPExt f32->f64: param carries the f32 source BITS (as i32), Bitcast into a single
 /// register, FCVT-widen to f64, return f64.
 fn build_fpext(func_id: u32, name: &str, m: &mut TrustIrModule) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -153,13 +160,15 @@ fn build_fpext(func_id: u32, name: &str, m: &mut TrustIrModule) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // ── JIT harness ─────────────────────────────────────────────────────────────────
 fn jit_buffer(m: &TrustIrModule) -> trust_cg_codegen::jit::ExecutableBuffer {
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(m, &HashMap::new())
         .expect(
             "hand-built f32<->f64 FCVT module must JIT-compile (backend supports FcvtSD/FcvtDS)",
@@ -887,4 +896,13 @@ fn falsification_chop_model_would_be_caught() {
          so a broken/round-toward-zero FcvtDS lowering WOULD be caught by Tests 3-6. The clean \
          bill is load-bearing, not a vacuous pass."
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

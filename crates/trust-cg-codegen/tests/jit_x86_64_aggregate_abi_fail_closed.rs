@@ -22,6 +22,7 @@ use trust_cg_codegen::compiler::CompilerConfig;
 #[cfg(not(target_os = "windows"))]
 fn v128_dev_host_compiler() -> Compiler {
     Compiler::new(CompilerConfig::for_host_jit_unchecked())
+        .with_codegen_license(permit_unlicensed())
 }
 use trust_ir::{
     Block as TrustIrBlock, BlockId, CallingConv, Constant, FieldDef, FuncId, FuncTy, FuncTyId,
@@ -199,6 +200,7 @@ extern "C" fn native_accepts_spilled_single_i64_struct(
 
 fn large_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "Large".to_string(),
         fields: vec![
@@ -226,6 +228,7 @@ fn large_struct_def() -> StructDef {
 
 fn single_i64_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "SingleI64".to_string(),
         fields: vec![FieldDef {
@@ -241,6 +244,7 @@ fn single_i64_struct_def() -> StructDef {
 
 fn single_i32_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "SingleI32".to_string(),
         fields: vec![FieldDef {
@@ -256,6 +260,7 @@ fn single_i32_struct_def() -> StructDef {
 
 fn small_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "Small".to_string(),
         fields: vec![
@@ -279,6 +284,7 @@ fn small_struct_def() -> StructDef {
 #[cfg(not(target_os = "windows"))]
 fn two_f64_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "TwoF64".to_string(),
         fields: vec![
@@ -302,6 +308,7 @@ fn two_f64_struct_def() -> StructDef {
 #[cfg(not(target_os = "windows"))]
 fn i64_f64_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "I64F64".to_string(),
         fields: vec![
@@ -325,6 +332,7 @@ fn i64_f64_struct_def() -> StructDef {
 #[cfg(not(target_os = "windows"))]
 fn f64_i64_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "F64I64".to_string(),
         fields: vec![
@@ -348,6 +356,7 @@ fn f64_i64_struct_def() -> StructDef {
 #[cfg(not(target_os = "windows"))]
 fn v128_carrier_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "V128Carrier".to_string(),
         fields: vec![FieldDef {
@@ -367,6 +376,7 @@ fn v128_carrier_struct_def() -> StructDef {
 #[cfg(not(target_os = "windows"))]
 fn unsupported_i32_pair_struct_def() -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "UnsupportedI32Pair".to_string(),
         fields: vec![
@@ -592,7 +602,7 @@ fn large_struct_param_module() -> trust_ir::Module {
     let abc = fb.add(Ty::I64, ab, c);
     fb.ret(vec![abc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -604,9 +614,16 @@ fn i32_pair_param_extract_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_i32_pair_aggregate_param_extract".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "extracts_i32_pair_param".to_owned(),
             ty: func_ty,
@@ -638,6 +655,9 @@ fn i32_pair_param_extract_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![unsupported_i32_pair_struct_def()],
         records: vec![],
@@ -646,6 +666,7 @@ fn i32_pair_param_extract_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![aggregate],
             returns: vec![Ty::I32],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -658,6 +679,9 @@ fn i32_pair_param_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -667,9 +691,16 @@ fn unsupported_i32_pair_return_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_unsupported_i32_pair_return_reject".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "returns_unsupported_i32_pair".to_owned(),
             ty: func_ty,
@@ -690,6 +721,9 @@ fn unsupported_i32_pair_return_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![unsupported_i32_pair_struct_def()],
         records: vec![],
@@ -698,6 +732,7 @@ fn unsupported_i32_pair_return_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -710,6 +745,9 @@ fn unsupported_i32_pair_return_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -725,6 +763,8 @@ fn i32_pair_byval_call_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "adds_i32_pair_by_value".to_owned(),
         ty: callee_ty,
@@ -781,9 +821,14 @@ fn i32_pair_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_i32_pair_by_value".to_owned(),
         ty: caller_ty,
@@ -815,9 +860,17 @@ fn i32_pair_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_i32_pair_byval_call".to_owned(),
         functions: vec![callee, caller],
         structs: vec![unsupported_i32_pair_struct_def()],
@@ -828,11 +881,13 @@ fn i32_pair_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -846,6 +901,9 @@ fn i32_pair_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -861,6 +919,8 @@ fn i32_pair_call_result_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "returns_i32_pair_for_call".to_owned(),
         ty: callee_ty,
@@ -881,9 +941,14 @@ fn i32_pair_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_i32_pair_result".to_owned(),
         ty: caller_ty,
@@ -926,9 +991,17 @@ fn i32_pair_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_i32_pair_call_result".to_owned(),
         functions: vec![callee, caller],
         structs: vec![unsupported_i32_pair_struct_def()],
@@ -939,11 +1012,13 @@ fn i32_pair_call_result_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![aggregate],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -957,6 +1032,9 @@ fn i32_pair_call_result_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -974,9 +1052,16 @@ fn single_i64_struct_return_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i64_aggregate_return".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "returns_single_i64_struct".to_owned(),
             ty: func_ty,
@@ -1016,6 +1101,9 @@ fn single_i64_struct_return_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![single_i64_struct_def()],
         records: vec![],
@@ -1024,6 +1112,7 @@ fn single_i64_struct_return_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -1036,6 +1125,9 @@ fn single_i64_struct_return_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1044,9 +1136,16 @@ fn single_i64_struct_param_extract_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i64_aggregate_param_extract".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "extracts_single_i64_struct_param".to_owned(),
             ty: func_ty,
@@ -1087,6 +1186,9 @@ fn single_i64_struct_param_extract_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![single_i64_struct_def()],
         records: vec![],
@@ -1095,6 +1197,7 @@ fn single_i64_struct_param_extract_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![aggregate],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -1107,6 +1210,9 @@ fn single_i64_struct_param_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1115,9 +1221,16 @@ fn single_i32_struct_return_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i32_aggregate_return".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "returns_single_i32_struct".to_owned(),
             ty: func_ty,
@@ -1138,6 +1251,9 @@ fn single_i32_struct_return_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![single_i32_struct_def()],
         records: vec![],
@@ -1146,6 +1262,7 @@ fn single_i32_struct_return_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -1158,6 +1275,9 @@ fn single_i32_struct_return_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1166,9 +1286,16 @@ fn single_i32_struct_param_extract_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i32_aggregate_param_extract".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "extracts_single_i32_struct_param".to_owned(),
             ty: func_ty,
@@ -1200,6 +1327,9 @@ fn single_i32_struct_param_extract_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![single_i32_struct_def()],
         records: vec![],
@@ -1208,6 +1338,7 @@ fn single_i32_struct_param_extract_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![aggregate],
             returns: vec![Ty::I32],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -1220,6 +1351,9 @@ fn single_i32_struct_param_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1228,9 +1362,16 @@ fn small_struct_param_extract_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_small_aggregate_param_extract".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "extracts_small_struct_param".to_owned(),
             ty: func_ty,
@@ -1262,6 +1403,9 @@ fn small_struct_param_extract_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![small_struct_def()],
         records: vec![],
@@ -1270,6 +1414,7 @@ fn small_struct_param_extract_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![aggregate],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -1282,6 +1427,9 @@ fn small_struct_param_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1291,9 +1439,16 @@ fn i64_array_param_extract_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_i64_array_formal_extract".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "extracts_i64_array_param".to_owned(),
             ty: func_ty,
@@ -1326,6 +1481,9 @@ fn i64_array_param_extract_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![],
         records: vec![],
@@ -1334,6 +1492,7 @@ fn i64_array_param_extract_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![aggregate],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![Ty::I64],
@@ -1346,6 +1505,9 @@ fn i64_array_param_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1356,6 +1518,8 @@ fn single_i64_struct_call_extract_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "returns_single_i64_struct_for_call".to_owned(),
         ty: callee_ty,
@@ -1395,10 +1559,15 @@ fn single_i64_struct_call_extract_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_single_i64_struct_and_extracts".to_owned(),
         ty: caller_ty,
@@ -1450,9 +1619,14 @@ fn single_i64_struct_call_extract_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let passthrough = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(2),
         name: "calls_single_i64_struct_and_returns".to_owned(),
         ty: callee_ty,
@@ -1492,9 +1666,17 @@ fn single_i64_struct_call_extract_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i64_aggregate_call_extract".to_owned(),
         functions: vec![callee, caller, passthrough],
         structs: vec![single_i64_struct_def()],
@@ -1505,11 +1687,13 @@ fn single_i64_struct_call_extract_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![aggregate],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -1523,6 +1707,9 @@ fn single_i64_struct_call_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1533,6 +1720,8 @@ fn single_i64_struct_byval_call_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "extracts_single_i64_struct_by_value".to_owned(),
         ty: callee_ty,
@@ -1564,10 +1753,15 @@ fn single_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_single_i64_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -1599,9 +1793,17 @@ fn single_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i64_aggregate_byval_call".to_owned(),
         functions: vec![callee, caller],
         structs: vec![single_i64_struct_def()],
@@ -1612,11 +1814,13 @@ fn single_i64_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -1630,6 +1834,9 @@ fn single_i64_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1640,6 +1847,8 @@ fn native_single_i64_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_single_i64_struct".to_owned(),
         ty: callee_ty,
@@ -1653,9 +1862,14 @@ fn native_single_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_single_i64_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -1687,9 +1901,17 @@ fn native_single_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_native_single_i64_aggregate_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![single_i64_struct_def()],
@@ -1700,11 +1922,13 @@ fn native_single_i64_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -1718,6 +1942,9 @@ fn native_single_i64_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1728,6 +1955,8 @@ fn single_i32_struct_call_extract_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "returns_single_i32_struct_for_call".to_owned(),
         ty: callee_ty,
@@ -1748,10 +1977,15 @@ fn single_i32_struct_call_extract_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     let extract_caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_single_i32_struct_and_extracts".to_owned(),
         ty: caller_ty,
@@ -1794,9 +2028,14 @@ fn single_i32_struct_call_extract_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let passthrough = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(2),
         name: "calls_single_i32_struct_and_returns".to_owned(),
         ty: callee_ty,
@@ -1827,9 +2066,17 @@ fn single_i32_struct_call_extract_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i32_aggregate_call_extract".to_owned(),
         functions: vec![callee, extract_caller, passthrough],
         structs: vec![single_i32_struct_def()],
@@ -1840,11 +2087,13 @@ fn single_i32_struct_call_extract_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![aggregate],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -1858,6 +2107,9 @@ fn single_i32_struct_call_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1868,6 +2120,8 @@ fn single_i32_struct_byval_call_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "extracts_single_i32_struct_by_value".to_owned(),
         ty: callee_ty,
@@ -1899,10 +2153,15 @@ fn single_i32_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_single_i32_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -1934,9 +2193,17 @@ fn single_i32_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_single_i32_aggregate_byval_call".to_owned(),
         functions: vec![callee, caller],
         structs: vec![single_i32_struct_def()],
@@ -1947,11 +2214,13 @@ fn single_i32_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -1965,6 +2234,9 @@ fn single_i32_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -1975,6 +2247,8 @@ fn native_single_i32_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_single_i32_struct".to_owned(),
         ty: callee_ty,
@@ -1988,9 +2262,14 @@ fn native_single_i32_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_single_i32_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -2022,9 +2301,17 @@ fn native_single_i32_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_native_single_i32_aggregate_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![single_i32_struct_def()],
@@ -2035,11 +2322,13 @@ fn native_single_i32_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I32],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2053,6 +2342,9 @@ fn native_single_i32_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2063,6 +2355,8 @@ fn small_struct_byval_call_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "extracts_small_struct_by_value".to_owned(),
         ty: callee_ty,
@@ -2094,10 +2388,15 @@ fn small_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_small_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -2129,9 +2428,17 @@ fn small_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_small_aggregate_byval_call".to_owned(),
         functions: vec![callee, caller],
         structs: vec![small_struct_def()],
@@ -2142,11 +2449,13 @@ fn small_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2160,6 +2469,9 @@ fn small_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2170,6 +2482,8 @@ fn i64_array_byval_call_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "extracts_i64_array_by_value".to_owned(),
         ty: callee_ty,
@@ -2202,10 +2516,15 @@ fn i64_array_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_i64_array_by_value".to_owned(),
         ty: caller_ty,
@@ -2237,9 +2556,17 @@ fn i64_array_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_i64_array_byval_call".to_owned(),
         functions: vec![callee, caller],
         structs: vec![],
@@ -2250,11 +2577,13 @@ fn i64_array_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2268,6 +2597,9 @@ fn i64_array_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2278,6 +2610,8 @@ fn native_small_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_small_struct".to_owned(),
         ty: callee_ty,
@@ -2291,9 +2625,14 @@ fn native_small_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_small_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -2325,9 +2664,17 @@ fn native_small_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_native_small_aggregate_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![small_struct_def()],
@@ -2338,11 +2685,13 @@ fn native_small_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2356,6 +2705,9 @@ fn native_small_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2367,6 +2719,8 @@ fn native_i64_array_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_i64_array_lanes".to_owned(),
         ty: callee_ty,
@@ -2380,9 +2734,14 @@ fn native_i64_array_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_i64_array_by_value".to_owned(),
         ty: caller_ty,
@@ -2414,9 +2773,17 @@ fn native_i64_array_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_i64_array_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![],
@@ -2427,11 +2794,13 @@ fn native_i64_array_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2445,6 +2814,9 @@ fn native_i64_array_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2471,6 +2843,8 @@ fn native_two_f64_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_two_f64_struct".to_owned(),
         ty: callee_ty,
@@ -2484,9 +2858,14 @@ fn native_two_f64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_two_f64_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -2518,9 +2897,17 @@ fn native_two_f64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_two_f64_struct_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![two_f64_struct_def()],
@@ -2531,11 +2918,13 @@ fn native_two_f64_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2549,6 +2938,9 @@ fn native_two_f64_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2560,6 +2952,8 @@ fn native_f64_array_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_f64_array_lanes".to_owned(),
         ty: callee_ty,
@@ -2573,9 +2967,14 @@ fn native_f64_array_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_f64_array_by_value".to_owned(),
         ty: caller_ty,
@@ -2607,9 +3006,17 @@ fn native_f64_array_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_f64_array_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![],
@@ -2620,11 +3027,13 @@ fn native_f64_array_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2638,6 +3047,9 @@ fn native_f64_array_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2649,6 +3061,8 @@ fn native_two_f64_struct_call_result_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_returns_two_f64_struct".to_owned(),
         ty: callee_ty,
@@ -2662,9 +3076,14 @@ fn native_two_f64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "reads_native_two_f64_struct_second_field".to_owned(),
         ty: caller_ty,
@@ -2707,9 +3126,17 @@ fn native_two_f64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_two_f64_struct_call_result".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![two_f64_struct_def()],
@@ -2720,11 +3147,13 @@ fn native_two_f64_struct_call_result_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![aggregate],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2738,6 +3167,9 @@ fn native_two_f64_struct_call_result_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2749,6 +3181,8 @@ fn native_i64_f64_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_i64_f64_struct".to_owned(),
         ty: callee_ty,
@@ -2762,9 +3196,14 @@ fn native_i64_f64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_i64_f64_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -2796,9 +3235,17 @@ fn native_i64_f64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_i64_f64_struct_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![i64_f64_struct_def()],
@@ -2809,11 +3256,13 @@ fn native_i64_f64_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2827,6 +3276,9 @@ fn native_i64_f64_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2839,6 +3291,8 @@ fn native_i64_f64_struct_call_result_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_returns_i64_f64_struct".to_owned(),
         ty: callee_ty,
@@ -2852,9 +3306,14 @@ fn native_i64_f64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let f64_caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "reads_native_i64_f64_struct_f64_field".to_owned(),
         ty: f64_caller_ty,
@@ -2897,9 +3356,14 @@ fn native_i64_f64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let i64_caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(2),
         name: "reads_native_i64_f64_struct_i64_field".to_owned(),
         ty: i64_caller_ty,
@@ -2942,9 +3406,17 @@ fn native_i64_f64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_i64_f64_struct_call_result".to_owned(),
         functions: vec![extern_decl, f64_caller, i64_caller],
         structs: vec![i64_f64_struct_def()],
@@ -2955,16 +3427,19 @@ fn native_i64_f64_struct_call_result_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![aggregate],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -2978,6 +3453,9 @@ fn native_i64_f64_struct_call_result_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -2989,6 +3467,8 @@ fn native_f64_i64_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_f64_i64_struct".to_owned(),
         ty: callee_ty,
@@ -3002,9 +3482,14 @@ fn native_f64_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_f64_i64_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -3036,9 +3521,17 @@ fn native_f64_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_f64_i64_struct_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![f64_i64_struct_def()],
@@ -3049,11 +3542,13 @@ fn native_f64_i64_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -3067,6 +3562,9 @@ fn native_f64_i64_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3079,6 +3577,8 @@ fn native_f64_i64_struct_call_result_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_returns_f64_i64_struct".to_owned(),
         ty: callee_ty,
@@ -3092,9 +3592,14 @@ fn native_f64_i64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let f64_caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "reads_native_f64_i64_struct_f64_field".to_owned(),
         ty: f64_caller_ty,
@@ -3137,9 +3642,14 @@ fn native_f64_i64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let i64_caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(2),
         name: "reads_native_f64_i64_struct_i64_field".to_owned(),
         ty: i64_caller_ty,
@@ -3182,9 +3692,17 @@ fn native_f64_i64_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_f64_i64_struct_call_result".to_owned(),
         functions: vec![extern_decl, f64_caller, i64_caller],
         structs: vec![f64_i64_struct_def()],
@@ -3195,16 +3713,19 @@ fn native_f64_i64_struct_call_result_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![aggregate],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::F64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -3218,6 +3739,9 @@ fn native_f64_i64_struct_call_result_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3228,9 +3752,16 @@ fn v128_carrier_struct_param_extract_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_v128_carrier_formal_extract".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "extracts_v128_carrier_struct_param".to_owned(),
             ty: func_ty,
@@ -3262,6 +3793,9 @@ fn v128_carrier_struct_param_extract_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![v128_carrier_struct_def()],
         records: vec![],
@@ -3270,6 +3804,7 @@ fn v128_carrier_struct_param_extract_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![aggregate],
             returns: vec![vector],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -3282,6 +3817,9 @@ fn v128_carrier_struct_param_extract_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3291,9 +3829,16 @@ fn v128_carrier_struct_return_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_v128_carrier_return".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "returns_v128_carrier_struct".to_owned(),
             ty: func_ty,
@@ -3314,6 +3859,9 @@ fn v128_carrier_struct_return_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![v128_carrier_struct_def()],
         records: vec![],
@@ -3322,6 +3870,7 @@ fn v128_carrier_struct_return_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -3334,6 +3883,9 @@ fn v128_carrier_struct_return_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3346,6 +3898,8 @@ fn native_v128_carrier_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_v128_carrier_struct".to_owned(),
         ty: callee_ty,
@@ -3359,9 +3913,14 @@ fn native_v128_carrier_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_v128_carrier_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -3393,9 +3952,17 @@ fn native_v128_carrier_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_v128_carrier_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![v128_carrier_struct_def()],
@@ -3406,11 +3973,13 @@ fn native_v128_carrier_struct_byval_call_module() -> TrustIrModule {
             FuncTy {
                 params: vec![aggregate],
                 returns: vec![vector],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![v4i32_ty()],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -3424,6 +3993,9 @@ fn native_v128_carrier_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3436,6 +4008,8 @@ fn native_v128_carrier_struct_call_result_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_returns_v128_carrier_struct".to_owned(),
         ty: callee_ty,
@@ -3449,9 +4023,14 @@ fn native_v128_carrier_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "reads_native_v128_carrier_struct_result".to_owned(),
         ty: caller_ty,
@@ -3494,9 +4073,17 @@ fn native_v128_carrier_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_sysv_native_v128_carrier_call_result".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![v128_carrier_struct_def()],
@@ -3507,11 +4094,13 @@ fn native_v128_carrier_struct_call_result_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![aggregate],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![vector],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -3525,6 +4114,9 @@ fn native_v128_carrier_struct_call_result_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3556,6 +4148,8 @@ fn native_spilled_single_i64_struct_byval_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_accepts_spilled_single_i64_struct".to_owned(),
         ty: callee_ty,
@@ -3569,9 +4163,14 @@ fn native_spilled_single_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_spilled_single_i64_struct_by_value".to_owned(),
         ty: caller_ty,
@@ -3589,9 +4188,17 @@ fn native_spilled_single_i64_struct_byval_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_native_spilled_single_i64_aggregate_byval_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![single_i64_struct_def()],
@@ -3610,11 +4217,13 @@ fn native_spilled_single_i64_struct_byval_call_module() -> TrustIrModule {
                     aggregate,
                 ],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -3628,6 +4237,9 @@ fn native_spilled_single_i64_struct_byval_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3636,9 +4248,16 @@ fn small_struct_return_module() -> TrustIrModule {
     let func_ty = FuncTyId::new(0);
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_small_aggregate_return_reject".to_owned(),
         functions: vec![TrustIrFunction {
             attrs: Default::default(),
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(0),
             name: "returns_small_struct".to_owned(),
             ty: func_ty,
@@ -3678,6 +4297,9 @@ fn small_struct_return_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }],
         structs: vec![small_struct_def()],
         records: vec![],
@@ -3686,6 +4308,7 @@ fn small_struct_return_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -3698,6 +4321,9 @@ fn small_struct_return_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3707,6 +4333,8 @@ fn small_struct_call_result_passthrough_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "returns_small_struct_for_call".to_owned(),
         ty: func_ty,
@@ -3740,10 +4368,15 @@ fn small_struct_call_result_passthrough_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_small_struct_result_and_returns".to_owned(),
         ty: func_ty,
@@ -3774,9 +4407,17 @@ fn small_struct_call_result_passthrough_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_small_aggregate_sret_cross_call".to_owned(),
         functions: vec![callee, caller],
         structs: vec![small_struct_def()],
@@ -3786,6 +4427,7 @@ fn small_struct_call_result_passthrough_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -3798,6 +4440,9 @@ fn small_struct_call_result_passthrough_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3807,6 +4452,8 @@ fn native_large_struct_call_module() -> TrustIrModule {
 
     let extern_decl = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "native_returns_large_struct".to_owned(),
         ty: func_ty,
@@ -3820,9 +4467,14 @@ fn native_large_struct_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_native_large_struct".to_owned(),
         ty: func_ty,
@@ -3862,9 +4514,17 @@ fn native_large_struct_call_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_native_aggregate_sret_call".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![large_struct_def()],
@@ -3874,6 +4534,7 @@ fn native_large_struct_call_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -3886,6 +4547,9 @@ fn native_large_struct_call_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3895,6 +4559,8 @@ fn large_struct_call_result_module() -> TrustIrModule {
 
     let callee = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(0),
         name: "returns_large_struct".to_owned(),
         ty: func_ty,
@@ -3938,9 +4604,14 @@ fn large_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
+        body_gate: None,
+        display_path: None,
         id: FuncId::new(1),
         name: "calls_large_struct_result".to_owned(),
         ty: func_ty,
@@ -3980,9 +4651,17 @@ fn large_struct_call_result_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
+        drop_glue: Vec::new(),
+        blobs: Vec::new(),
         name: "x86_64_aggregate_sret_cross_call".to_owned(),
         functions: vec![callee, caller],
         structs: vec![large_struct_def()],
@@ -3992,6 +4671,7 @@ fn large_struct_call_result_module() -> TrustIrModule {
         func_types: vec![FuncTy {
             params: vec![],
             returns: vec![aggregate],
+            abi: None,
             is_vararg: false,
         }],
         types: vec![],
@@ -4004,12 +4684,16 @@ fn large_struct_call_result_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
 #[cfg(target_os = "windows")]
 fn expect_x86_aggregate_abi_rejection(module: trust_ir::Module, position: &str, size: u32) {
     let err = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect_err("x86-64 host JIT must reject aggregate ABI before executable publication");
 
@@ -4047,6 +4731,7 @@ fn expect_x86_aggregate_abi_rejection(module: trust_ir::Module, position: &str, 
 #[test]
 fn host_jit_executes_sysv_large_struct_formal() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&large_struct_param_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile a >16-byte by-value struct formal");
 
@@ -4084,6 +4769,7 @@ fn host_jit_rejects_large_struct_formal_before_publication() {
 #[test]
 fn host_jit_extracts_sysv_i32_pair_formal_in_one_gpr() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&i32_pair_param_extract_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile {i32,i32} eightbyte formal");
 
@@ -4108,6 +4794,7 @@ fn host_jit_extracts_sysv_i32_pair_formal_in_one_gpr() {
 #[test]
 fn host_jit_executes_sysv_i32_pair_return_in_rax() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&unsupported_i32_pair_return_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile {i32,i32} eightbyte return");
 
@@ -4126,6 +4813,7 @@ fn host_jit_executes_sysv_i32_pair_return_in_rax() {
 #[test]
 fn host_jit_passes_sysv_i32_pair_by_value_to_trust_ir_callee() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&i32_pair_byval_call_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile {i32,i32} eightbyte by-value call");
 
@@ -4144,6 +4832,7 @@ fn host_jit_passes_sysv_i32_pair_by_value_to_trust_ir_callee() {
 #[test]
 fn host_jit_extracts_sysv_i32_pair_call_result() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&i32_pair_call_result_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile {i32,i32} eightbyte cross-call result");
 
@@ -4162,6 +4851,7 @@ fn host_jit_extracts_sysv_i32_pair_call_result() {
 #[test]
 fn host_jit_extracts_sysv_small_struct_formal_in_gprs() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&small_struct_param_extract_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile 16-byte aggregate formal in GPRs");
 
@@ -4185,6 +4875,7 @@ fn host_jit_extracts_sysv_small_struct_formal_in_gprs() {
 #[test]
 fn host_jit_executes_single_i64_struct_return() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i64_struct_return_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i64 aggregate return");
 
@@ -4207,6 +4898,7 @@ fn host_jit_executes_single_i64_struct_return() {
 #[test]
 fn host_jit_executes_single_i32_struct_return() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i32_struct_return_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i32 aggregate return");
 
@@ -4224,6 +4916,7 @@ fn host_jit_executes_single_i32_struct_return() {
 #[test]
 fn host_jit_extracts_single_i64_struct_formal() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i64_struct_param_extract_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i64 aggregate formal");
 
@@ -4246,6 +4939,7 @@ fn host_jit_extracts_single_i64_struct_formal() {
 #[test]
 fn host_jit_extracts_single_i32_struct_formal() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i32_struct_param_extract_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i32 aggregate formal");
 
@@ -4264,6 +4958,7 @@ fn host_jit_extracts_single_i32_struct_formal() {
 #[test]
 fn host_jit_extracts_windows_small_struct_formal_byref() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&small_struct_param_extract_module(), &HashMap::new())
         .expect("Windows x64 host JIT should compile 16-byte aggregate formal by reference");
 
@@ -4288,6 +4983,7 @@ fn host_jit_extracts_windows_small_struct_formal_byref() {
 #[test]
 fn host_jit_extracts_sysv_i64_array_formal_in_gprs() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&i64_array_param_extract_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile [i64; 2] aggregate formal in GPRs");
 
@@ -4308,6 +5004,7 @@ fn host_jit_extracts_sysv_i64_array_formal_in_gprs() {
 #[test]
 fn host_jit_extracts_single_i64_struct_call_result() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i64_struct_call_extract_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i64 aggregate cross-call");
 
@@ -4340,6 +5037,7 @@ fn host_jit_extracts_single_i64_struct_call_result() {
 #[test]
 fn host_jit_extracts_single_i32_struct_call_result() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i32_struct_call_extract_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i32 aggregate cross-call");
 
@@ -4367,6 +5065,7 @@ fn host_jit_extracts_single_i32_struct_call_result() {
 #[test]
 fn host_jit_passes_single_i64_struct_by_value_to_trust_ir_callee() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i64_struct_byval_call_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i64 aggregate by-value call");
 
@@ -4384,6 +5083,7 @@ fn host_jit_passes_single_i64_struct_by_value_to_trust_ir_callee() {
 #[test]
 fn host_jit_passes_single_i32_struct_by_value_to_trust_ir_callee() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&single_i32_struct_byval_call_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile single-i32 aggregate by-value call");
 
@@ -4402,6 +5102,7 @@ fn host_jit_passes_single_i32_struct_by_value_to_trust_ir_callee() {
 #[test]
 fn host_jit_passes_windows_small_struct_byref_to_trust_ir_callee() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&small_struct_byval_call_module(), &HashMap::new())
         .expect("Windows x64 host JIT should compile 16-byte aggregate by-value trust_ir call");
 
@@ -4420,6 +5121,7 @@ fn host_jit_passes_windows_small_struct_byref_to_trust_ir_callee() {
 #[test]
 fn host_jit_passes_sysv_small_struct_in_gprs_to_trust_ir_callee() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&small_struct_byval_call_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile 16-byte aggregate by-value trust_ir call");
 
@@ -4438,6 +5140,7 @@ fn host_jit_passes_sysv_small_struct_in_gprs_to_trust_ir_callee() {
 #[test]
 fn host_jit_passes_sysv_i64_array_in_gprs_to_trust_ir_callee() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&i64_array_byval_call_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile [i64; 2] aggregate by-value trust_ir call");
 
@@ -4456,6 +5159,7 @@ fn host_jit_passes_sysv_i64_array_in_gprs_to_trust_ir_callee() {
 #[test]
 fn host_jit_passes_windows_i64_array_byref_to_trust_ir_callee() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&i64_array_byval_call_module(), &HashMap::new())
         .expect("Windows x64 host JIT should compile [i64; 2] aggregate byref trust_ir call");
 
@@ -4482,6 +5186,7 @@ fn host_jit_passes_single_i64_struct_by_value_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_single_i64_struct_byval_call_module(), &externs)
         .expect("x86-64 host JIT should compile native single-i64 aggregate callback");
 
@@ -4506,6 +5211,7 @@ fn host_jit_passes_single_i32_struct_by_value_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_single_i32_struct_byval_call_module(), &externs)
         .expect("x86-64 host JIT should compile native single-i32 aggregate callback");
 
@@ -4531,6 +5237,7 @@ fn host_jit_passes_windows_small_struct_byref_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_small_struct_byval_call_module(), &externs)
         .expect("Windows x64 host JIT should compile native 16-byte aggregate callback");
 
@@ -4556,6 +5263,7 @@ fn host_jit_passes_sysv_small_struct_in_gprs_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_small_struct_byval_call_module(), &externs)
         .expect("SysV x86-64 host JIT should compile native 16-byte aggregate callback");
 
@@ -4580,6 +5288,7 @@ fn host_jit_passes_sysv_i64_array_in_gprs_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_i64_array_byval_call_module(), &externs)
         .expect("SysV x86-64 host JIT should compile native [i64; 2] aggregate callback");
 
@@ -4605,6 +5314,7 @@ fn host_jit_passes_sysv_two_f64_struct_in_xmms_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_two_f64_struct_byval_call_module(), &externs)
         .expect("SysV x86-64 host JIT should pass {f64,f64} in XMM registers");
 
@@ -4629,6 +5339,7 @@ fn host_jit_passes_sysv_f64_array_in_xmms_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_f64_array_byval_call_module(), &externs)
         .expect("SysV x86-64 host JIT should pass [f64; 2] in XMM registers");
 
@@ -4749,6 +5460,7 @@ fn host_jit_reads_sysv_two_f64_struct_result_from_xmm0_xmm1() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_two_f64_struct_call_result_module(), &externs)
         .expect("SysV x86-64 host JIT should read {f64,f64} from XMM return registers");
 
@@ -4774,6 +5486,7 @@ fn host_jit_passes_sysv_i64_f64_struct_in_gpr_xmm_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_i64_f64_struct_byval_call_module(), &externs)
         .expect("SysV x86-64 host JIT should pass {i64,f64} in GPR+XMM registers");
 
@@ -4799,6 +5512,7 @@ fn host_jit_passes_sysv_f64_i64_struct_in_xmm_gpr_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_f64_i64_struct_byval_call_module(), &externs)
         .expect("SysV x86-64 host JIT should pass {f64,i64} in XMM+GPR registers");
 
@@ -4823,6 +5537,7 @@ fn host_jit_reads_sysv_i64_f64_struct_result_from_rax_xmm0() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_i64_f64_struct_call_result_module(), &externs)
         .expect("SysV x86-64 host JIT should read {i64,f64} from RAX+XMM0");
 
@@ -4856,6 +5571,7 @@ fn host_jit_reads_sysv_f64_i64_struct_result_from_xmm0_rax() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_f64_i64_struct_call_result_module(), &externs)
         .expect("SysV x86-64 host JIT should read {f64,i64} from XMM0+RAX");
 
@@ -4888,6 +5604,7 @@ fn host_jit_passes_spilled_single_i64_struct_by_value_to_native_callback() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(
             &native_spilled_single_i64_struct_byval_call_module(),
             &externs,
@@ -4912,6 +5629,7 @@ fn host_jit_passes_spilled_single_i64_struct_by_value_to_native_callback() {
 #[test]
 fn host_jit_executes_sysv_small_struct_return_in_rax_rdx() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&small_struct_return_module(), &HashMap::new())
         .expect("SysV x86-64 host JIT should compile 16-byte aggregate return in RAX/RDX");
 
@@ -4930,6 +5648,7 @@ fn host_jit_executes_sysv_small_struct_return_in_rax_rdx() {
 #[test]
 fn host_jit_executes_sysv_small_struct_call_result_in_rax_rdx() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(
             &small_struct_call_result_passthrough_module(),
             &HashMap::new(),
@@ -4957,6 +5676,7 @@ fn host_jit_executes_sysv_small_struct_call_result_in_rax_rdx() {
 #[test]
 fn host_jit_executes_windows_small_struct_return_via_sret() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&small_struct_return_module(), &HashMap::new())
         .expect("Windows x64 host JIT should compile 16-byte aggregate sret return");
 
@@ -4975,6 +5695,7 @@ fn host_jit_executes_windows_small_struct_return_via_sret() {
 #[test]
 fn host_jit_executes_windows_small_struct_sret_cross_call() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(
             &small_struct_call_result_passthrough_module(),
             &HashMap::new(),
@@ -5001,6 +5722,7 @@ fn host_jit_executes_windows_small_struct_sret_cross_call() {
 #[test]
 fn host_jit_executes_large_struct_sret_cross_call() {
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&large_struct_call_result_module(), &HashMap::new())
         .expect("x86-64 host JIT should compile large aggregate sret cross-call");
 
@@ -5024,6 +5746,7 @@ fn host_jit_calls_native_large_struct_sret_function() {
     );
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&native_large_struct_call_module(), &externs)
         .expect("x86-64 host JIT should compile native aggregate sret callback");
 
@@ -5043,4 +5766,16 @@ fn host_jit_calls_native_large_struct_sret_function() {
             c: 33
         }
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+// Its callers are target-gated tests; on a host where none of them compiles
+// the helper is unused.
+#[allow(dead_code)]
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

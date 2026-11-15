@@ -3,8 +3,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: designs/2026-04-18-pgo-workflow.md (section 1, Instrumentation)
-//
 // Phase 1 MVP. Emits a `Bl` pseudo-call to a per-site symbol
 // (`__trust_cg_profile_bb_enter$<func>$<bb>`) at the top of every basic
 // block. The symbol encodes the (function, block) pair so the runtime

@@ -1,0 +1,9 @@
+; mutant-of: add_neg
+; mutation: wrong side (x + -y is x - y, not y - x)
+; subject: i8
+(rule add_neg
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add ?x (neg ?y)))
+  (rhs (sub ?y ?x))
+  (where))

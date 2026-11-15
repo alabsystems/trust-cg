@@ -17,7 +17,9 @@
 //! longer emits.
 
 use trust_cg_codegen::aarch64::encoding_neon;
-use trust_cg_verify::neon_semantics::{neon_ldp_q_post_word, neon_stp_q_post_word};
+use trust_cg_verify::neon_semantics::{
+    neon_ld1_st1_post_word, neon_ldp_q_post_word, neon_stp_q_post_word,
+};
 
 /// The Q-pair post-index offsets the backend actually emits, plus the boundary
 /// values of the signed 7-bit scaled immediate field.
@@ -50,6 +52,40 @@ fn stp_q_post_word_mirror_matches_codegen() {
             "verify's STP-Q-post word mirror drifted from the real encoder at offset \
              {offset}: mirror {mirror:#010x} vs codegen {real:#010x}"
         );
+    }
+}
+
+/// The LD1/ST1 single-register post-index mirror the word-bound memory-effect
+/// decomposition carries equals the real encoder at every arrangement and at
+/// the register-field boundaries (ledger L04-P6).
+#[test]
+fn ld1_st1_post_word_mirror_matches_codegen() {
+    use encoding_neon::VectorArrangement as A;
+    let arrangements = [
+        (A::B8, false, 0u8),
+        (A::B16, true, 0),
+        (A::H4, false, 1),
+        (A::H8, true, 1),
+        (A::S2, false, 2),
+        (A::S4, true, 2),
+        (A::D2, true, 3),
+    ];
+    for (arrangement, q, size) in arrangements {
+        for (rn, rt) in [(0u8, 0u8), (9, 2), (31, 31), (30, 17)] {
+            let ld1 = encoding_neon::encode_ld1_post_imm(arrangement, rn, rt).unwrap();
+            let st1 = encoding_neon::encode_st1_post_imm(arrangement, rn, rt).unwrap();
+            assert_eq!(
+                neon_ld1_st1_post_word(true, q, size, rn, rt),
+                ld1,
+                "LD1 {arrangement:?} rn={rn} rt={rt}"
+            );
+            assert_eq!(
+                neon_ld1_st1_post_word(false, q, size, rn, rt),
+                st1,
+                "ST1 {arrangement:?} rn={rn} rt={rt}"
+            );
+            assert_eq!(ld1 ^ st1, 1 << 22, "LD1/ST1 differ only in L");
+        }
     }
 }
 

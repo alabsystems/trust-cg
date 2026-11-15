@@ -90,11 +90,11 @@ struct DoctorReport {
 
 fn required_tools(target: TargetCmd) -> Vec<&'static str> {
     match target {
-        TargetCmd::All => vec!["cargo", "rustc", "cc", "clang", "gh"],
-        TargetCmd::Matrix => vec!["cargo"],
+        TargetCmd::All => vec!["targo", "trustc", "cc", "clang", "gh"],
+        TargetCmd::Matrix => vec!["targo"],
         TargetCmd::Suite => vec!["clang", "cc"],
         TargetCmd::Fuzz => vec!["clang", "csmith", "creduce"],
-        TargetCmd::Rustc | TargetCmd::Bootstrap | TargetCmd::Ecosystem => vec!["cargo", "rustc"],
+        TargetCmd::Rustc | TargetCmd::Bootstrap | TargetCmd::Ecosystem => vec!["targo", "trustc"],
         TargetCmd::Prove => vec!["ay"],
         TargetCmd::Pipeline => vec!["ay"],
         TargetCmd::Report => vec![],
@@ -103,7 +103,7 @@ fn required_tools(target: TargetCmd) -> Vec<&'static str> {
 
 fn all_tools() -> Vec<&'static str> {
     vec![
-        "cargo", "rustc", "cc", "clang", "csmith", "yarpgen", "creduce", "ay", "gh",
+        "targo", "trustc", "cc", "clang", "csmith", "yarpgen", "creduce", "ay", "gh",
     ]
 }
 

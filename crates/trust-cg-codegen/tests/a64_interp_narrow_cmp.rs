@@ -39,11 +39,14 @@ const SYM: &str = "__c";
 /// `fn _c(a:i32,b:i32)->i32 { ((a as N) cmp (b as N)) as i32 }`
 fn build_trunc_cmp(narrow: Ty, cmp: ICmpOp) -> M {
     let mut m = M::new("narrow_cmp");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), FN, ft, BlockId::new(0));
     f.blocks = vec![B {
         id: BlockId::new(0),
@@ -92,18 +95,22 @@ fn build_trunc_cmp(narrow: Ty, cmp: ICmpOp) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
 /// `fn _c(a:i32,b:i32)->i32 { (a as N).overflowing_add(b as N).1 as i32 }`
 fn build_add_ovf(narrow: Ty) -> M {
     let mut m = M::new("narrow_ovf");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), FN, ft, BlockId::new(0));
     f.blocks = vec![B {
         id: BlockId::new(0),
@@ -152,7 +159,8 @@ fn build_add_ovf(narrow: Ty) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -170,7 +178,8 @@ fn compile(m: &M, opt: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     c.compile(m).expect("compile").object_code
 }
 
@@ -322,4 +331,13 @@ fn teeth_harness_detects_sxt_to_uxt_miscompile() {
         oracle(&slt, 0xFFFF, 0x0000),
         "TEETH: the harness must detect the injected miscompile (got == oracle means no teeth)"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

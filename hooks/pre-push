@@ -1,30 +1,81 @@
 #!/usr/bin/env bash
 #
-# pre-push — optional local enforcement for the soundness gate.
+# pre-push — local enforcement of the per-commit soundness attestation.
 #
-# In a clone where this hook is installed, a push that updates `main` is
-# blocked unless the clean pushed commit matches the pinned release context and
-# every configured local gate is green.
+# In a clone where this hook is installed (scripts/install-hooks.sh sets
+# core.hooksPath=hooks), a push that moves `main` to commit C is allowed only
+# when C is attested, judged by the verifier committed at C's landed
+# predecessor (the ANCHOR), never by C's own verifier:
 #
-# This is deliberately NOT a .github/workflows action. It is a git hook a
-# developer installs locally (scripts/install-hooks.sh sets
-# core.hooksPath=hooks). The gate itself shells into the configured Clean checkout,
-# so a single main push verifies the entire cross-repo constellation.
+#   1. C must be the clean checked-out HEAD.
+#   2. The anchor is the remote main this push replaces, and it must be a
+#      commit this clone has and a proper ancestor of C. With no such anchor
+#      (a first push of main, a remote tip this clone never fetched, a forced
+#      or otherwise non-fast-forward push), or when the anchor carries no
+#      scripts/soundness_attestation.py (the bootstrap), the push is BLOCKED:
+#      no landed verifier exists to judge C, and C never judges itself.
+#   3. The records of C and of the anchor are fetched through native agh.
+#   4. The anchor's verifier, extracted from the anchor's tree and run with
+#      `"$SOUNDNESS_PYTHON3" -I`, decides whether C is already attested FOR LANDING
+#      (`verify --landing`: a full record, or a portable record while the
+#      anchor's DEFERRED_LANDING_CLASSES defers the x86-64-native class, which
+#      the verdict then prints as NOT ATTESTED) — the fast path.
+#      C's scripts/soundness_attestation.py runs nowhere in this hook. C's
+#      committed code does run in these places: this hook itself (it is read
+#      from C's tree); C's scripts/check_path_case_collisions.py, which lists
+#      C's tracked paths before the clean-tree check of step 1; C's
+#      scripts/soundness_check.sh --list-json, which the
+#      anchored verifier executes to read C's leg inventory (after loading the
+#      records; it refuses an inventory that drops or reclasses an anchor
+#      leg); and, after that verdict, C's trustfmt and tippy pre-flights and, on
+#      the slow path, C's gate. Records are unsigned, so a C whose own gate
+#      code writes a complete false record is not caught here; client-side
+#      enforcement is only as strong as the pushing clone, and the release
+#      boundary in publish/DECISIONS.md re-runs the anchored verification.
+#   5. trustfmt and tippy pre-flights run.
+#   6. On the slow path C's scripts/soundness_check.sh --attest writes the
+#      local records (with --scope portable when the anchor defers the
+#      x86-64-native class and this host has no x86-64 executor: neither
+#      native x86-64 nor SOUNDNESS_X86_HOST), native agh sends
+#      refs/attest/soundness/<C>/* to the remote (a nested push that is not to
+#      main), and the anchor's verifier must then find C attested for landing.
+#   7. The anchor's own records are checked too (by the anchor's verifier);
+#      if it carries no complete attestation, a loud notice reports that an
+#      earlier push bypassed this gate or predates attestation. Detection, not
+#      prevention: --no-verify cannot be disabled on a client and GitHub runs
+#      no pre-receive hook.
 #
-# Only `main` pushes are gated (feature-branch pushes are not, to stay
-# practical). Emergency override (discouraged — breaks monotonicity):
-#     git push --no-verify
+# The serialized landing train (scripts/land_main.sh) attests C before its
+# atomic push of main and the records, so its push takes the fast path.
+#
+# This is deliberately NOT a .github/workflows action. Only `main` pushes are
+# gated (feature-branch and refs/attest pushes are not).
+#
+# THE INTERIM EXCEPTION (ruling OD-LANDING-X86-DEFERRAL-20261008, which
+# replaced the owner's 2026-09-27 exception). The x86-64 premise of that
+# exception is now the anchor verifier's DEFERRED_LANDING_CLASSES constant. What
+# remains: while no commit on the anchor's history carries an attestation
+# record ref (`soundness_attestation.py
+# landing-exception`), a main push may bypass this gate with `git push
+# --no-verify`. It ENDS conservatively at the first such commit; an invalid old
+# record or stricter current verifier cannot revive it. Record presence grants
+# no landing verdict. This hook names it only where the gate blocks a push and
+# only while the anchor's verifier reports it in force.
 #
 set -u
 
+remote_name="${1:-origin}"
+remote_location="${2:-$remote_name}"
 z40="0000000000000000000000000000000000000000"
 gating=0
 main_sha=""
+remote_old=""
 # git feeds "<local ref> <local sha> <remote ref> <remote sha>" lines on stdin.
 while read -r local_ref local_sha remote_ref remote_sha; do
   if [ "$remote_ref" = "refs/heads/main" ] && [ "$local_sha" != "$z40" ]; then
     gating=1
     main_sha="$local_sha"
+    remote_old="$remote_sha"
   fi
 done
 
@@ -32,67 +83,252 @@ if [ "$gating" -eq 0 ]; then
   exit 0   # not pushing main → nothing to gate
 fi
 
+# The python3 the hook starts (the case-collision check and the anchor's
+# verifier), resolved once, by an absolute path (repair round 3 of
+# OD-XHOST-GATE-CWD-20261025): SOUNDNESS_PYTHON3 when the caller exported one,
+# else the one PATH finds now. It is not exported to the gate, which pins its
+# own interpreter and refuses a caller's SOUNDNESS_PYTHON3.
+SOUNDNESS_PYTHON3="${SOUNDNESS_PYTHON3:-$(type -P python3 || true)}"
+case "$SOUNDNESS_PYTHON3" in
+  /*) ;;
+  *)
+    echo "pre-push: no python3: no executable file by an absolute path (SOUNDNESS_PYTHON3, else PATH): '${SOUNDNESS_PYTHON3}'" >&2
+    exit 1
+    ;;
+esac
+
 repo_root="$(git rev-parse --show-toplevel)"
 gate="$repo_root/scripts/soundness_check.sh"
+# Set once the anchor's verifier has said whether the interim exception is in
+# force; empty means "not advertised" (before the anchor is known, or when the
+# anchor's verifier cannot say).
+exception_note=""
+
+blocked() {
+  echo "" >&2
+  echo "pre-push: ✗ $1 — push to main BLOCKED." >&2
+  shift
+  for line in "$@"; do echo "          $line" >&2; done
+  [ -z "$exception_note" ] || echo "$exception_note" >&2
+  exit 1
+}
 
 head_sha="$(git -C "$repo_root" rev-parse HEAD)"
 if [ "$head_sha" != "$main_sha" ]; then
-  echo "pre-push: FATAL — pushed main SHA $main_sha is not checked-out HEAD $head_sha." >&2
-  echo "          Push to main BLOCKED; check out the exact commit and retry." >&2
-  exit 1
+  blocked "pushed main SHA $main_sha is not checked-out HEAD $head_sha" \
+    "Check out the exact commit and retry."
 fi
+# Case-insensitive path collisions. Two tracked paths that differ only in case
+# (or Unicode normalization) are one file on macOS's default filesystem, so
+# every macOS checkout of that commit is dirty and the clean-tree check below
+# refuses every push from it. A case-sensitive host commits such a pair without
+# noticing (ff4c27eca did; 74a753fdd renamed it), so the pushed commit's tree is
+# checked here, where the host that introduces the pair is stopped, and before
+# the clean-tree check, so a macOS host is told the cause instead of "dirty".
+case_gate="$repo_root/scripts/check_path_case_collisions.py"
+if [ ! -f "$case_gate" ]; then
+  blocked "$case_gate is missing, so tracked-path collisions cannot be checked (fail-closed)" \
+    "Restore it from the pushed commit and retry."
+fi
+if ! "$SOUNDNESS_PYTHON3" -I -B "$case_gate" --root "$repo_root" --rev "$main_sha"; then
+  blocked "case-colliding tracked paths in $main_sha" \
+    "Rename every colliding spelling to names that differ in more than case or Unicode normalization."
+fi
+
 if [ -n "$(git -C "$repo_root" status --porcelain)" ]; then
-  echo "pre-push: FATAL — worktree is dirty; committed-source attestation is impossible." >&2
-  echo "          Push to main BLOCKED; commit or remove local changes and retry." >&2
-  exit 1
+  blocked "worktree is dirty; committed-source attestation is impossible" \
+    "Commit or remove local changes and retry."
+fi
+if [ "$remote_old" = "$main_sha" ]; then
+  exit 0   # the remote main already is C: nothing moves
 fi
 
-if [ ! -x "$gate" ]; then
-  echo "pre-push: FATAL — $gate missing/not executable; cannot verify soundness." >&2
-  echo "          Push to main BLOCKED (fail-closed). Override: git push --no-verify" >&2
-  exit 1
+# --- the anchor ----------------------------------------------------------------
+if [ -z "$remote_old" ] || [ "$remote_old" = "$z40" ]; then
+  blocked "the remote has no main to anchor ${main_sha}'s verification (a first push of main)" \
+    "No landed verifier exists to judge ${main_sha}, and a commit never judges itself." \
+    "Creating main is an owner action outside this gate."
+fi
+if ! git -C "$repo_root" cat-file -e "${remote_old}^{commit}" 2>/dev/null; then
+  blocked "the remote main ${remote_old} is unknown to this clone, so it cannot anchor ${main_sha}" \
+    "Fetch it through scripts/github_transport.py, merge or rebase onto it, and retry the landing train."
+fi
+if ! git -C "$repo_root" merge-base --is-ancestor "$remote_old" "$main_sha"; then
+  blocked "the remote main ${remote_old} is not an ancestor of ${main_sha} (a non-fast-forward push)" \
+    "The landed main anchors the verification; merge or rebase onto it and push again."
+fi
+anchor="$remote_old"
+if ! git -C "$repo_root" cat-file -e "${anchor}:scripts/soundness_attestation.py" 2>/dev/null; then
+  blocked "UNANCHORED: the remote main ${anchor} carries no scripts/soundness_attestation.py" \
+    "No landed verifier exists to judge ${main_sha} (the attestation bootstrap), and a commit never judges itself."
 fi
 
-# --- fast pre-flight: rustfmt ------------------------------------------------
+fetch_records() {
+  # Transport gives no verdict; C's attestation verifier never runs here.
+  "$SOUNDNESS_PYTHON3" -I "$repo_root/scripts/github_transport.py" --repo "$repo_root" --remote "$remote_location" \
+    records --subject "$1" >/dev/null 2>&1 || :
+}
+
+anchor_tool() {
+  # anchor_tool <subcommand> [args...]: the verifier committed at the anchor,
+  # with the result parser it ships, run directly with "$SOUNDNESS_PYTHON3" -I. Returns its
+  # status (for verify: 0 attested, 1 incomplete, 2 malformed, 3 absent).
+  local dir rc
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/pre-push-verifier.XXXXXX")" || return 2
+  mkdir "$dir/scripts"
+  git -C "$repo_root" show "${anchor}:scripts/soundness_attestation.py" >"$dir/scripts/soundness_attestation.py" || {
+    rm -rf "$dir"; return 2; }
+  git -C "$repo_root" show "${anchor}:scripts/matrix_results.py" \
+    >"$dir/scripts/matrix_results.py" 2>/dev/null || rm -f "$dir/scripts/matrix_results.py"
+  "$SOUNDNESS_PYTHON3" -I "$dir/scripts/soundness_attestation.py" "$@"
+  rc=$?
+  rm -rf "$dir"
+  return "$rc"
+}
+
+anchored_verify() {
+  # anchored_verify <commit> [--anchor]: the anchor's verifier gives its LANDING
+  # verdict on <commit>; with --anchor it also holds <commit> to the anchor's
+  # inventory, pins and landing deferral.
+  local commit="$1"
+  local -a anchored=()
+  [ "${2:-}" != --anchor ] || anchored=(--anchor "$anchor")
+  echo "anchored: the verifier committed at ${anchor} judges ${commit}"
+  anchor_tool verify "$commit" --repo "$repo_root" --landing ${anchored[@]+"${anchored[@]}"}
+}
+
+fetch_records "$main_sha"
+fetch_records "$anchor"
+# Every record on the remote, so the anchor's verifier can tell whether any
+# commit on main's history was attested for landing (the interim exception's end).
+all_records_fetched=0
+if "$SOUNDNESS_PYTHON3" -I "$repo_root/scripts/github_transport.py" --repo "$repo_root" --remote "$remote_location" records >/dev/null 2>&1; then
+  all_records_fetched=1
+fi
+exception_rc=0
+exception_remote_args=()
+# New anchors discover records themselves. Route that discovery to the actual
+# push remote. Older anchors use the complete plain-Git fetch immediately above.
+if anchor_tool landing-exception --help 2>/dev/null | grep -q -- '--remote'; then
+  exception_remote_args=(--remote "$remote_location")
+fi
+exception_status="$(anchor_tool landing-exception --repo "$repo_root" --anchor "$anchor" \
+  ${exception_remote_args[@]+"${exception_remote_args[@]}"} 2>&1)" || exception_rc=$?
+# Legacy anchors read local refs only. Even their positive answer needs the
+# complete actual-target fetch above and a current anchor. Negative/retained
+# ENDED answers remain conservative when discovery is unavailable.
+if [ "$exception_rc" -eq 0 ]; then
+  if [ "$all_records_fetched" -ne 1 ]; then
+    exception_rc=1
+    exception_status="UNDETERMINED: complete attestation discovery failed; no bypass is authorized"
+  else
+    discovered_main="$(git -C "$repo_root" ls-remote --refs "$remote_location" refs/heads/main 2>/dev/null)" || discovered_main=""
+    expected_main="${anchor}$(printf '\t')refs/heads/main"
+    if [ "$discovered_main" != "$expected_main" ]; then
+      exception_rc=1
+      exception_status="UNDETERMINED: the advertised anchor is not the actual current main; no bypass is authorized"
+    fi
+  fi
+fi
+case "$exception_rc" in
+  0) exception_note="          Interim exception (OD-LANDING-X86-DEFERRAL-20261008; it ends conservatively at the first main-history attestation record ref): git push --no-verify" ;;
+  1)
+    if printf '%s\n' "$exception_status" | grep -q '^ENDED:'; then
+      exception_note="          The interim exception has ENDED ($(printf '%s\n' "$exception_status" | tail -1 | cut -c1-160)); attest ${main_sha} for landing (scripts/land_main.sh)."
+    else
+      exception_note="          The interim exception was not established ($(printf '%s\n' "$exception_status" | tail -1 | cut -c1-160)); no bypass is authorized."
+    fi ;;
+  *) exception_note="          The anchor's verifier could not say whether the interim exception is in force (rc=${exception_rc}); see SOUNDNESS_CHECK.md, \"Landing\"." ;;
+esac
+
+anchor_note=""
+if ! predecessor="$(anchored_verify "$anchor" 2>&1)"; then
+  anchor_note=" (its anchor ${anchor} is itself unattested; see the NOTICE above)"
+  echo "pre-push: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+  echo "pre-push: NOTICE — the remote main being replaced, ${anchor}, carries no complete" >&2
+  echo "pre-push:          soundness attestation: an earlier main push bypassed this gate or" >&2
+  echo "pre-push:          predates attestation. $(printf '%s\n' "$predecessor" | tail -1)" >&2
+  echo "pre-push: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+fi
+
+# The fast-path verdict is fixed here, before any other script of C runs.
+fast_path=0
+verdict="$(anchored_verify "$main_sha" --anchor 2>&1)" && fast_path=1
+
+# --- fast pre-flight: trustfmt (`targo fmt`) ---------------------------------
 #
 # `scripts/check_fmt.sh` existed with NOTHING calling it, and went red three
 # separate times in one sweep — each break found days later by someone else,
-# never by the author who landed it. That is a coverage hole, not a strict
-# gate: the soundness meta-gate below is a proof gate and has no formatting
-# leg, so nothing in this repo ever asked.
-#
-# It runs FIRST and it is cheap: 7 s over the whole workspace, measured, no
-# build. Cheap enough that there is no case for sampling only changed files,
-# and running it before the meta-gate means a formatting slip costs seven
-# seconds instead of being discovered after several minutes of proof work.
-#
-# Deterministic by construction: rust-toolchain.toml pins 1.97.1 WITH the
-# rustfmt component and the repo commits a rustfmt.toml, so every clone gets
-# the same answer. The gate reports and never rewrites — `cargo fmt --all`
-# applies it deliberately.
+# never by the author who landed it. It is cheap (7 s over the whole workspace,
+# measured, no build), deterministic by construction (the formatter is the
+# installed Trust package's `targo fmt`; rust-toolchain.toml pins
+# `channel = "trust"` and the repo commits a rustfmt.toml), and reports without
+# rewriting.
+# A missing or non-executable gate BLOCKS the push, as for the lint gate below.
 fmt_gate="$repo_root/scripts/check_fmt.sh"
-if [ -x "$fmt_gate" ]; then
-  echo "pre-push: rustfmt pre-flight (scripts/check_fmt.sh)…"
-  if ! "$fmt_gate"; then
-    echo "" >&2
-    echo "pre-push: ✗ rustfmt gate FAILED — push to main BLOCKED." >&2
-    echo "          Apply with: cargo fmt --all" >&2
-    echo "          Emergency override (discouraged): git push --no-verify" >&2
-    exit 1
-  fi
-  echo "pre-push: ✓ rustfmt clean."
+if [ ! -x "$fmt_gate" ]; then
+  blocked "format gate missing" "Expected an executable $fmt_gate"
 fi
+echo "pre-push: trustfmt pre-flight (scripts/check_fmt.sh)…"
+if ! "$fmt_gate"; then
+  blocked "format gate FAILED" "Apply with: targo fmt --all"
+fi
+echo "pre-push: ✓ trustfmt clean."
 
-echo "pre-push: push to 'main' detected → running the soundness meta-gate."
-echo "pre-push: (this runs the FULL cross-repo constellation; it can take several minutes.)"
-"$gate" --pinned
+# --- second pre-flight: the lint gate ---------------------------------------
+#
+# The workspace denies warnings, but nothing ran a linter, and the linter aborts
+# on the first red crate, so twelve findings in `trust-cg-lower` hid fifty-one
+# more in `trust-cg-verify`. `scripts/check_tippy.sh` lints each package
+# separately with `--keep-going`; the Trust package's `targo tippy` is the
+# linter, with no stock fallback. Linting is not a proof claim; the
+# attestation is the soundness gate.
+# A missing or non-executable gate BLOCKS the push: skipping the linter
+# because its script moved would be a silent pass.
+lint_gate="$repo_root/scripts/check_tippy.sh"
+if [ ! -x "$lint_gate" ]; then
+  blocked "lint gate missing" "Expected an executable $lint_gate"
+fi
+echo "pre-push: lint pre-flight (scripts/check_tippy.sh)…"
+if ! "$lint_gate"; then
+  blocked "lint gate FAILED" "Inspect with: targo tippy --locked -p <pkg> --tests --no-deps --keep-going"
+fi
+echo "pre-push: ✓ lint clean."
+
+# --- the attestation ---------------------------------------------------------
+if [ "$fast_path" -eq 1 ]; then
+  printf '%s\n' "$verdict"
+  echo "pre-push: ✓ ${main_sha} is attested (anchored at ${anchor})${anchor_note} — allowing push to main."
+  exit 0
+fi
+if [ ! -x "$gate" ]; then
+  blocked "$gate is missing; cannot attest ${main_sha} (fail-closed)"
+fi
+printf '%s\n' "$verdict" | tail -12
+# The scope: portable only when the anchor defers the x86-64-native class for
+# landing and this host has no way to run it (not native x86-64, no executor).
+scope_args=()
+if [ -z "${SOUNDNESS_X86_HOST:-}" ] && ! anchor_tool host --require-native-x86_64 >/dev/null 2>&1 &&
+   anchor_tool deferred-classes 2>/dev/null | grep -q '"x86_64-native"'; then
+  scope_args=(--scope portable)
+fi
+echo "pre-push: ${main_sha} is not attested yet → running scripts/soundness_check.sh --attest ${scope_args[*]+"${scope_args[*]}"}."
+echo "pre-push: (the cross-repo constellation; it takes a long time."
+echo "pre-push:  The serialized landing train, scripts/land_main.sh, is the intended landing path.)"
+"$gate" --attest ${scope_args[@]+"${scope_args[@]}"}
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  echo "" >&2
-  echo "pre-push: ✗ soundness meta-gate FAILED (rc=$rc) — push to main BLOCKED." >&2
-  echo "          Fix the red gate (per-gate log paths are printed above), then re-push." >&2
-  echo "          Emergency override (discouraged, breaks monotonicity): git push --no-verify" >&2
-  exit "$rc"
+  blocked "soundness gate FAILED (rc=$rc)" \
+    "Fix the red leg (per-leg log paths are printed above), then re-push."
 fi
-echo "pre-push: ✓ soundness meta-gate GREEN — allowing push to main."
+if ! "$SOUNDNESS_PYTHON3" -I "$repo_root/scripts/github_transport.py" --repo "$repo_root" --remote "$remote_name" \
+     push-records "$main_sha"; then
+  blocked "the attestation records of $main_sha could not be pushed to $remote_name"
+fi
+if ! verdict="$(anchored_verify "$main_sha" --anchor 2>&1)"; then
+  printf '%s\n' "$verdict" >&2
+  blocked "$main_sha still does not verify against its anchor ${anchor} after a green run"
+fi
+printf '%s\n' "$verdict"
+echo "pre-push: ✓ soundness attestation GREEN for landing and shared${anchor_note} — allowing push to main."
 exit 0

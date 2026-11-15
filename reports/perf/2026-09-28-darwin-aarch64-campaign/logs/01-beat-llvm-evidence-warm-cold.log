@@ -1,0 +1,85 @@
+beat-llvm: WARNING: this host mixes core types (sysctl hw.nperflevels 2) and the lanes are not pinned; scheduler placement alone can move a ratio (reports/perf/run_scaling.sh measured ~1.4x). Use --pin-core on Linux; the affinity policy is recorded either way.
+== b1_mispredict
+   bridge fail-closed (load 1.27, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== h1_vec_push_sum
+   bridge fail-closed (load 1.25, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== h2_vec_grow
+   bridge fail-closed (load 1.23, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== h3_box_leak
+   bridge fail-closed (load 1.21, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== h4_vec_dropper
+   bridge fail-closed (load 1.19, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== m1_call_chain
+   bridge fail-closed (load 1.18, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== m2_call_heavy
+   bridge fail-closed (load 1.16, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p1_xorshift
+   bridge fail-closed (load 1.15, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p2_collatz
+   bridge fail-closed (load 1.14, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p3_gcd
+   bridge fail-closed (load 1.2, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p4_matmul
+   bridge fail-closed (load 1.19, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p5_struct_acc
+   bridge fail-closed (load 1.23, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p6_branch_match
+   bridge fail-closed (load 1.29, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p7_sieve
+   bridge fail-closed (load 1.82, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== p8_closure_nest
+   bridge fail-closed (load 1.76, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== v1_saxpy
+   bridge fail-closed (load 1.78, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== v2_memfill
+   bridge fail-closed (load 1.71, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+== v3_popcount
+   bridge fail-closed (load 1.66, threshold 8.0) — NONDET-CANDIDATE, retrying once…
+# beat-llvm results — 01fc13b13608 (2026-09-28T13:42:00+00:00, arm64, QUIET)
+
+- dylib sha256 `8fb063d31d9d4261…`  rustc `rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)`  target `aarch64-apple-darwin`
+- host: Apple M4 Max (m110-macbook-M4-Max-48GB-1TB.local, Mac16,5); -C target-cpu default; affinity none
+- load 1.29→1.66 (threshold 8.0, quiet=True)  cache: warm, 0→0 verdicts, 466→479 certificates  N: compile=3 run=5
+- TCG env: `{} (production defaults)`
+- **headline-eligible: True**
+
+**coverage 0.0% (0/18 MATCH, 18 INCOMPLETE, 0 MISMATCH; nondet: 0 NONDET-FAILCLOSED, 0 NONDET-CANDIDATE)** — runtime geomean vs LLVM -O3: **—x** [resolvable-rows-only: **—x** over 0 programs with llvm median >= 0.05s and rel_spread <= 0.25] (scalar —x, worst —x); compile warm geomean vs -O2: **—x** (vs -O3: —x)
+
+size (linked file bytes) geomean vs LLVM -O3: —x (worst —x); program peak-RSS geomean vs -O3: —x (None of 0 programs floor-bound, R1 losses unmeasured ); compiler peak-RSS geomean vs -O2: —x (vs -O3: —x, None floor-bound readings) — ru_maxrss (bytes) normalised to bytes; sampler floor 1261568 B (readings at or below 2523136 B are upper bounds); /usr/bin/time agreement True; gated by contract/gates.json v2 (S1/S2 size, R1/R2 RSS)
+
+coverage by category (intent-to-treat — INCOMPLETE rows stay in the denominator):
+
+| category | coverage % | match/total | incomplete | runtime geomean x |
+|---|---|---|---|---|
+| branch | 0.0% | 0/1 | 1 | — |
+| heap | 0.0% | 0/4 | 4 | — |
+| multifn | 0.0% | 0/2 | 2 | — |
+| scalar | 0.0% | 0/6 | 6 | — |
+| vectorizable | 0.0% | 0/5 | 5 | — |
+
+| program | cat | verdict | run llvm-O3 (s) | run bridge (s) | runtime x | compile -O2 (s) | compile -O3 (s) | bridge warm (s) | warm x(-O2) | size x | rss x |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| b1_mispredict | branch | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.297 | 0.296 | — | — | — | — |
+| h1_vec_push_sum | heap | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.301 | 0.303 | — | — | — | — |
+| h2_vec_grow | heap | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.303 | 0.304 | — | — | — | — |
+| h3_box_leak | heap | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.304 | 0.306 | — | — | — | — |
+| h4_vec_dropper | heap | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.306 | 0.306 | — | — | — | — |
+| m1_call_chain | multifn | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.296 | 0.296 | — | — | — | — |
+| m2_call_heavy | multifn | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.298 | 0.297 | — | — | — | — |
+| p1_xorshift | scalar | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.298 | 0.297 | — | — | — | — |
+| p2_collatz | scalar | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.297 | 0.298 | — | — | — | — |
+| p3_gcd | scalar | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.298 | 0.299 | — | — | — | — |
+| p4_matmul | vectorizable | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.307 | 0.308 | — | — | — | — |
+| p5_struct_acc | scalar | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.299 | 0.299 | — | — | — | — |
+| p6_branch_match | scalar | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.298 | 0.3 | — | — | — | — |
+| p7_sieve | vectorizable | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.307 | 0.328 | — | — | — | — |
+| p8_closure_nest | scalar | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.301 | 0.301 | — | — | — | — |
+| v1_saxpy | vectorizable | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.301 | 0.302 | — | — | — | — |
+| v2_memfill | vectorizable | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.298 | 0.299 | — | — | — | — |
+| v3_popcount | vectorizable | INCOMPLETE — bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465] | — | — | — | 0.302 | 0.304 | — | — | — | — |
+
+> Output equality = exit codes with a full-width checksum folded in (mod 126); a MATCH is probabilistic (collision caveat, contract section 6); a MISMATCH is definitive P0.
+
+results: $HOME/trust-cg/.claude/worktrees/agent-workflow/benchmarks/beat-llvm/results/01fc13b13608-20260928T134336Z.json
+         $HOME/trust-cg/.claude/worktrees/agent-workflow/benchmarks/beat-llvm/results/01fc13b13608-20260928T134336Z.md
+retained: $HOME/trust-cg/.claude/worktrees/agent-workflow/reports/perf/2026-09-28-darwin-aarch64-campaign/2026-09-28-01fc13b13608

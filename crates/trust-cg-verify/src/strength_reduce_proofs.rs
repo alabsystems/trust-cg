@@ -14,7 +14,6 @@
 // NOT(LHS == RHS) for UNSAT (Alive2 technique, PLDI 2021).
 //
 // Reference: crates/trust-cg-opt/src/strength_reduce.rs
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! SMT proofs for strength reduction pass correctness.
 //!

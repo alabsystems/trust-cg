@@ -21,8 +21,8 @@ use trust_cg_codegen::jit_contract::{
     TargetOperatingSystem,
 };
 use trust_cg_codegen::{
-    ArtifactKind, ArtifactPayload, CompileGeneration, CompileRequest, CompileService,
-    CompileStatus, NATIVE_INSTALL_GATE_REPLAY_SCHEMA, NATIVE_INSTALL_GATE_REPLAY_SCHEMA_VERSION,
+    ArtifactKind, ArtifactPayload, CompileGeneration, CompileRequest, CompileStatus,
+    NATIVE_INSTALL_GATE_REPLAY_SCHEMA, NATIVE_INSTALL_GATE_REPLAY_SCHEMA_VERSION,
     NATIVE_INSTALL_GATE_TELEMETRY_SCHEMA, NATIVE_INSTALL_GATE_TELEMETRY_SCHEMA_VERSION,
     NativeInstallGateActions, NativeInstallGateAuthority, NativeInstallGateDisposition,
     NativeInstallGateExpectedBindings, NativeInstallGateInput, NativeInstallGateLayoutAccess,
@@ -108,11 +108,17 @@ fn observed_bcp_payload_contract() -> (u64, String) {
             // carries no manifest or install-gate authority. The authoritative
             // compile below then independently rechecks both claims against a
             // fresh live executable before it may expose a callable symbol.
+            // It does carry the manifest's proof policy: that policy selects
+            // proof-grade publication, which keeps the FP/LR envelope through
+            // which the verifier's frame owner binds the probe's body, so the
+            // bytes calibrated here are the bytes the authoritative compile
+            // emits.
             let mut request =
                 CompileRequest::new("sat-bcp-observe-live-payload", CompileGeneration::new(0));
             request.install_intent = trust_cg_codegen::InstallIntent::CompileOnly;
+            request.proof_policy = ay_sat_watch_bcp_proof_policy();
             request.provenance.source_kind = SourceKind::TrustIrModule;
-            let response = CompileService::default().compile(request, &bcp_status_probe_module());
+            let response = permit_compile_service().compile(request, &bcp_status_probe_module());
             assert_eq!(
                 response.status,
                 CompileStatus::Compiled,
@@ -276,11 +282,14 @@ fn sat_bcp_symbol_contract(
 
 fn bcp_status_probe_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("ay_sat_watch_bcp_install_gate");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), AY_SAT_BCP_SYMBOL, ft_id, BlockId::new(0));
     func.attrs.params = vec![trust_ir::ParamAttrs {
         nonnull: true,
@@ -300,7 +309,9 @@ fn bcp_status_probe_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -338,7 +349,7 @@ fn compile_sat_bcp_response(
         input.payload_identity.trust_ir_sha256.clone(),
     );
 
-    let mut response = CompileService::default().compile(request, &bcp_status_probe_module());
+    let mut response = permit_compile_service().compile(request, &bcp_status_probe_module());
     assert_eq!(
         response.status,
         CompileStatus::Compiled,
@@ -599,7 +610,7 @@ fn sat_bcp_gate_fails_closed_for_missing_wrong_and_unrunnable_artifact_routes() 
     });
     object_request.provenance.source_kind = SourceKind::TrustIrModule;
     let object_response =
-        CompileService::default().compile(object_request, &bcp_status_probe_module());
+        permit_compile_service().compile(object_request, &bcp_status_probe_module());
     assert_eq!(object_response.status, CompileStatus::Rejected);
     assert!(object_response.payload.is_none());
     assert!(object_response.diagnostics.iter().any(|diagnostic| {
@@ -617,4 +628,16 @@ fn sat_bcp_gate_fails_closed_for_missing_wrong_and_unrunnable_artifact_routes() 
 
 fn rust_reference_empty_bcp_status() -> i32 {
     BCP_OK_STATUS
+}
+
+/// This file's fixtures carry no codegen license (`body_gate: None`), which
+/// the compile service REFUSES by default (roadmap WS7.5, decision gate
+/// DG-73). Its services state `Permit` explicitly, so no request passes
+/// because it was silently refused.
+fn permit_compile_service() -> trust_cg_codegen::CompileService {
+    trust_cg_codegen::CompileService::new(trust_cg_codegen::CompileServiceConfig {
+        codegen_license: trust_cg_codegen::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit),
+        ..trust_cg_codegen::CompileServiceConfig::default()
+    })
 }

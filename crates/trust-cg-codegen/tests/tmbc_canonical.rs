@@ -4,8 +4,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: `designs/2026-04-16-trust_ir-transport-architecture.md`, section
-// "Verification of the Format", property 2:
+// Transport-format property 2:
 //
 //     Canonical encoding: forall m: Module, encode(m) produces a unique
 //     byte sequence — no padding, no alignment-dependent output, no
@@ -25,7 +24,7 @@
 // reintroduce iteration-order dependency.
 
 use trust_cg_codegen::pipeline::{decode_tmbc, encode_tmbc};
-use trust_ir::{Global, Linkage, Module as TrustIrModule, Ty};
+use trust_ir::{DialectTy, FatPtrKind, Global, Linkage, Module as TrustIrModule, Ty};
 use trust_ir_build::ModuleBuilder;
 
 /// Build `fn return_42() -> i64 { 42 }`.
@@ -38,7 +37,7 @@ fn make_const_module(name: &str) -> TrustIrModule {
     let r = fb.iconst(Ty::I64, 42);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Build `fn add(a, b) -> i64 { a + b }` with two globals `G0`, `G1`
@@ -55,6 +54,9 @@ fn make_module_with_globals(name: &str) -> TrustIrModule {
     fb.ret(vec![sum]);
     fb.build();
     mb.add_global(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "G0".into(),
         ty: Ty::I64,
         mutable: false,
@@ -64,6 +66,9 @@ fn make_module_with_globals(name: &str) -> TrustIrModule {
         align: None,
     });
     mb.add_global(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "G1".into(),
         ty: Ty::I64,
         mutable: true,
@@ -72,7 +77,7 @@ fn make_module_with_globals(name: &str) -> TrustIrModule {
         tls: None,
         align: None,
     });
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -143,4 +148,70 @@ fn encode_decode_encode_is_fixed_point() {
         b1, b2,
         "encode . decode . encode must equal encode (canonical fixed point)"
     );
+}
+
+/// The outer tMBC envelope stays unchanged while the inner TrustIR payload
+/// selects the minimum lossless version for each nominal type surface.
+fn versioned_transport_modules() -> [(TrustIrModule, u32); 3] {
+    let plain = make_const_module("exact_v38");
+    let mut dialect = make_const_module("exact_v39");
+    dialect
+        .types
+        .push(Ty::Dialect(Box::new(DialectTy::new("example", "token", 1))));
+    let mut container = make_const_module("exact_v40");
+    container
+        .types
+        .push(Ty::FatPtr(FatPtrKind::ContainerVtable));
+    [(plain, 38), (dialect, 39), (container, 40)]
+}
+
+#[test]
+fn tmbc_preserves_versioned_nominal_types_without_changing_outer_version() {
+    for (module, inner_version) in versioned_transport_modules() {
+        let encoded = encode_tmbc(&module).expect("encode versioned module");
+        assert_eq!(&encoded[..4], b"tMBC");
+        assert_eq!(&encoded[4..8], &1u32.to_le_bytes());
+        assert_eq!(&encoded[8..16], b"TRUST_IR");
+        assert_eq!(&encoded[16..20], &inner_version.to_le_bytes());
+        let decoded = decode_tmbc(&encoded).expect("decode exact versioned module");
+        assert_eq!(decoded, module, "inner version {inner_version}");
+        assert_eq!(encode_tmbc(&decoded).unwrap(), encoded);
+    }
+}
+
+#[test]
+fn tmbc_rejects_trailers_and_concatenated_payloads_at_every_current_version() {
+    for (module, inner_version) in versioned_transport_modules() {
+        let encoded = encode_tmbc(&module).expect("encode versioned module");
+        assert_eq!(decode_tmbc(&encoded).unwrap(), module);
+        // Include both a second bare TrustIR payload and another complete tMBC
+        // envelope: neither is framing the exact-input API may silently ignore.
+        for suffix in [&[0u8][..], &[0xffu8][..], &encoded[8..], &encoded[..]] {
+            let mut extended = encoded.clone();
+            extended.extend_from_slice(suffix);
+            let error = decode_tmbc(&extended).expect_err("unconsumed input must reject");
+            let message = error.to_string();
+            assert!(
+                message.contains("failed to deserialize tMBC payload:")
+                    && message.contains("trailing bytes"),
+                "inner version {inner_version}: wrong refusal boundary: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tmbc_rejects_foreign_v39_parameter_modes_instead_of_erasing_them() {
+    let module = make_module_with_globals("foreign_param_modes");
+    let mut encoded = encode_tmbc(&module).expect("encode module");
+    encoded[16..20].copy_from_slice(&39u32.to_le_bytes());
+    assert_eq!(decode_tmbc(&encoded).unwrap(), module);
+    // The divergent v39 lineage appends row count, FuncTyId, mode count and
+    // modes (1=Lazy, 2=ByRef). Our transport must not silently drop that suffix.
+    for mode in [1, 2] {
+        let mut extended = encoded.clone();
+        extended.extend_from_slice(&[1, 0, 2, mode, mode]);
+        let error = decode_tmbc(&extended).expect_err("foreign modes must reject");
+        assert!(error.to_string().contains("trailing bytes"));
+    }
 }

@@ -3,7 +3,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: designs/2026-04-18-pgo-workflow.md
 // Issue: #396
 //
 // Phase 1 MVP. Contents:
@@ -22,7 +21,7 @@
 //! Profile-guided optimization (PGO) support.
 //!
 //! Phase 1 MVP: counter-injection pass + `.profdata` schema + writer +
-//! reader. See [`designs/2026-04-18-pgo-workflow.md`](../../../../designs/2026-04-18-pgo-workflow.md).
+//! reader.
 
 pub mod inject;
 pub mod io;

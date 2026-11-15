@@ -71,13 +71,22 @@
 //! Cross-references: issue #475 (this contract), issue #431 (sibling
 //! calling-convention ABI doc).
 
+// These proofs are checked by Trust whenever this consumer crate compiles.
+// Connecting every modeled operation to its production body remains required.
+#[path = "../../../proofs/sentinel_decide_spec.lean"]
+clean mod sentinel_proofs;
+
 pub mod aarch64_regs;
 pub mod cc;
 pub mod cost_model;
+pub mod fast_hash;
 pub mod function;
 pub mod guard;
 pub mod guard_target;
+pub mod id_admission;
 pub mod inst;
+pub mod llsc;
+pub mod native_dependency;
 pub mod operand;
 pub mod overflow_tag;
 pub mod provenance;
@@ -97,8 +106,11 @@ pub mod x86_64_regs;
 // Re-export the most commonly used types at crate root.
 pub use cc::{AArch64CC, FloatSize, OperandSize};
 pub use function::{
-    EhCallSiteEntry, EnumTagWidth, ExceptionHandlingMetadata, FunctionDebugMeta, LandingPadEntry,
-    MachBlock, MachFunction, Signature, StackProtectorMode, StackSlot, Type,
+    CallAbiFacts, CalleeSavedSet, EhCallSiteEntry, EhTypeTable, EhTypeTableEntries, EnumTagWidth,
+    ExceptionHandlingMetadata, FunctionDebugMeta, LandingPadEntry, MachBlock, MachFunction,
+    MachStackLimit, STACK_LIMIT_MAX_POINTEE_OFFSET, STACK_LIMIT_TRAP_IMM, Signature, StackArgStore,
+    StackLimitOverflow, StackLimitRequest, StackLimitSource, StackProtectorMode, StackSlot,
+    TrapExpansionRecord, Type,
 };
 pub use guard::{
     ConservationReport, ConservationViolation, DischargeStatus, DischargedEvidenceTable,
@@ -110,9 +122,11 @@ pub use guard_target::{
     AArch64GuardTarget, GuardTarget, RiscvGuardTarget, X86GuardTarget, aarch64_guard_operands,
     classify_riscv_carrier, classify_x86_carrier, riscv_guard_operands, x86_guard_operands,
 };
+pub use id_admission::{MachIdAdmissionError, MachIdDomain, MachIdRefusal, MachIdSite};
 pub use inst::{
     AArch64Opcode, InstFlags, MachInst, ProofAnnotation, ProofDivergence, ProofFact, SourceLoc,
 };
+pub use native_dependency::NativeDependencyId;
 pub use operand::MachOperand;
 pub use overflow_tag::{OverflowOp, pack_overflow_tag, unpack_overflow_tag};
 pub use provenance::{
@@ -125,8 +139,10 @@ pub use riscv_ops::RiscVOpcode;
 pub use riscv_regs::{RiscVPReg, RiscVRegClass};
 pub use target_info::{AArch64Target, OpcodeCategory, TargetInfo, X86_64Target};
 pub use target_machine::{
+    AARCH64_BASELINE_TARGET_FEATURES, AARCH64_KNOWN_TARGET_FEATURES, AArch64IsaFeature,
     AdmittedTargetFeatures, CallingConvention, OutputTargetFeatures, Target, TargetFeature,
     TargetFeatureSet, TargetFeatureSetError, TargetIdentity, TargetMachine, TargetMachineError,
+    aarch64_function_target_features,
 };
 pub use tls::TlsModel;
 pub use trace::{CompilationEvent, CompilationTrace, EventKind, Justification, RuleId, TraceLevel};

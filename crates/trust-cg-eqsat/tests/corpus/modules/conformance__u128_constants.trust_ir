@@ -1,0 +1,26 @@
+; TrustIr text format v1
+module "u128_constants"
+
+functy.0 = () -> (u128)
+
+functy.1 = () -> (i128)
+
+global @U128_GLOBAL u128 = 340282366920938463463374607431768211454
+
+fn @first_above_i128_max(functy.0) {
+bb0:
+    %0 = const u128 170141183460469231731687303715884105728
+    ret %0
+}
+
+fn @u128_max(functy.0) {
+bb0:
+    %0 = const u128 340282366920938463463374607431768211455
+    ret %0
+}
+
+fn @boundary_int(functy.1) {
+bb0:
+    %0 = const i128 170141183460469231731687303715884105727
+    ret %0
+}

@@ -1,0 +1,131 @@
+{
+  "schema": "cg-proof-corpus-audit-artifacts-v1",
+  "archive_sha256": "b05171a8dfc0f1bfe400997e2f9859ccfcf84ea4cc82eb89badfa81f1451fce3",
+  "artifacts": [
+    {
+      "path": "baseline/HANDOFF.json",
+      "bytes": 7655,
+      "sha256": "8ef07948034d78fb2017488f5e3754dfe49b8762a3fe6bc6b99820716aa47e98"
+    },
+    {
+      "path": "baseline/INPUTS.json",
+      "bytes": 4111,
+      "sha256": "37f4524077616f9b5c3926f446dd9d68b7dba2e5a62b4742792019a7a35d24ba"
+    },
+    {
+      "path": "baseline/RESULT.json",
+      "bytes": 7555,
+      "sha256": "bd53a86b26401a81979d47caaf653b88b5c510432b21b93d95788e3bf6a4bd37"
+    },
+    {
+      "path": "baseline/inventory.tsv",
+      "bytes": 269850,
+      "sha256": "f1499b90ebd359a9273e60c856a8d942fdbbfb7ecda2785069c340e82672d443"
+    },
+    {
+      "path": "baseline/PRIMARY-THREE-ADDITIONS.json",
+      "bytes": 2747,
+      "sha256": "bb345e03be5a0be4c1f58d0aceb28f076ca284efa74267c935be52ef6ac263ef"
+    },
+    {
+      "path": "current/INPUTS.json",
+      "bytes": 2156,
+      "sha256": "16ee30b6f227b99a3d2ae531937fe7edc67aed9418a485fb93c2fbeb2c006ffc"
+    },
+    {
+      "path": "current/RESULT.json",
+      "bytes": 2404,
+      "sha256": "53af057fc035b3fb0723a43b2e3569bc48d0968e23c7e2ab9d8d5569978e84e8"
+    },
+    {
+      "path": "current/inventory.tsv",
+      "bytes": 270409,
+      "sha256": "c595a2910f2b7169e4302b4f9df4604f7d14badc7a303080d5662d3d0609b83f"
+    },
+    {
+      "path": "current/build.log",
+      "bytes": 14768,
+      "sha256": "fab60427f6e8f8d70334c7e127741c81a4ed51cb05e43589c0da6e636639466e"
+    },
+    {
+      "path": "current/run.py",
+      "bytes": 1674,
+      "sha256": "30d262d15de899154952f09c20094a923a30471f28f2facf7e72a57dda394350"
+    },
+    {
+      "path": "corrected-guards/INPUTS.json",
+      "bytes": 2207,
+      "sha256": "6e98919409e3509da6c9fd71cc601f43b122581cd9a62add50989ba0de27b7b5"
+    },
+    {
+      "path": "corrected-guards/RESULT.json",
+      "bytes": 2515,
+      "sha256": "b6e5a312acd70c6e87ad5d0c6c649d5504fb6b20373c595e22800a75022da7a2"
+    },
+    {
+      "path": "corrected-guards/SOURCE.patch",
+      "bytes": 778,
+      "sha256": "bb0b6f0289c04eb51140a63e05c781d1f747e18bb1eb1fa4ef7dde033fe3ee19"
+    },
+    {
+      "path": "corrected-guards/0.log",
+      "bytes": 9442,
+      "sha256": "a64ba52406ab8eed9994ad3c0ea35e48532b4eee8cb468ba9b7da98dbc6a6d39"
+    },
+    {
+      "path": "corrected-guards/1.log",
+      "bytes": 8979,
+      "sha256": "258584e67a0d60db7982e58161312cd77bbdbe70d6525d740f4c5155c175b57d"
+    },
+    {
+      "path": "original-failure/INPUTS.json",
+      "bytes": 1994,
+      "sha256": "6e3f00d02b7627b741f604d47d7142ca7e0a05f45492286fcda219f464d59910"
+    },
+    {
+      "path": "original-failure/RESULT.json",
+      "bytes": 2127,
+      "sha256": "f5999a72e55513e610469117ad676fe507d4d93e6182aff752b79a5248e48c18"
+    },
+    {
+      "path": "original-failure/diagnosis.log",
+      "bytes": 797,
+      "sha256": "40dd63ad776f09687351c62fdbfb1917ad953d769f3b815eb1e92c5c3b223103"
+    },
+    {
+      "path": "runtime-name-audit.json",
+      "bytes": 3978,
+      "sha256": "c886dc04452773329e08445027b14462bd2ef0bcd013e5ca01d9972a20188169"
+    },
+    {
+      "path": "old-source/crates/trust-cg-verify/src/proof_database.rs",
+      "bytes": 144216,
+      "sha256": "aecf168c0f7be187bcdd4bb9a82acc921d8beb202d36d38879276d390f24eb74"
+    },
+    {
+      "path": "old-source/crates/trust-cg-verify/src/checked_mul_i128_proofs.rs",
+      "bytes": 40047,
+      "sha256": "c9e06baf0b717fe379f017ec88303dbd412ac3e1a0de7551bf7091075e34159e"
+    },
+    {
+      "path": "old-source/crates/trust-cg-verify/examples/proof_database_inventory.rs",
+      "bytes": 3657,
+      "sha256": "df03b36724f68ad833450297d676e4b73fc9e0bcba04e994845b48e4a08fe6b6"
+    },
+    {
+      "path": "current-source/crates/trust-cg-verify/src/proof_database.rs",
+      "bytes": 144281,
+      "sha256": "7e8b3b483d412b1af7b3abe7c6ce780e7457dce24d8d60791ffe2b25982b1de6"
+    },
+    {
+      "path": "current-source/crates/trust-cg-verify/src/checked_mul_i128_proofs.rs",
+      "bytes": 80077,
+      "sha256": "cba649b51ebb1d66c22093200c7f2a4d1f3aee15b55f7609aadf4b48a2231772"
+    },
+    {
+      "path": "current-source/crates/trust-cg-verify/examples/proof_database_inventory.rs",
+      "bytes": 3657,
+      "sha256": "df03b36724f68ad833450297d676e4b73fc9e0bcba04e994845b48e4a08fe6b6"
+    }
+  ]
+}

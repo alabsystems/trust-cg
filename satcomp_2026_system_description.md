@@ -9,7 +9,7 @@ This document describes that v0.1.0 submission package specifically, and the
 version labels below are deliberate: they match the `ARG TRUST_CG_REF=v0.1.0`
 pin in [`docker/sat-comp-2026/Dockerfile`](docker/sat-comp-2026/Dockerfile), so
 the commands reproduce the submitted artifact rather than the current tree. The
-current trust-cg release is 0.5.0; see [`CHANGELOG.md`](CHANGELOG.md).
+current trust-cg release is 0.6.0; see [`CHANGELOG.md`](CHANGELOG.md).
 
 - Solver: `trust-cg-sat`
 - Release: `v0.1.0`
@@ -100,6 +100,7 @@ uses standard SAT competition lines:
 - `s SATISFIABLE` plus `v` model lines, exit code 10
 - `s UNSATISFIABLE`, exit code 20
 - `s UNKNOWN`, exit code 0
+- Input/output errors produce an error comment and exit code 1, without a SAT/UNSAT result.
 
 Passing a proof path enables DRAT output. `--quiet` suppresses informational
 `c` lines; `--verbose` enables JIT diagnostics.
@@ -162,8 +163,8 @@ against glibc; it is not advertised as a portable static binary.
 From the repository root:
 
 ```sh
-cargo test --locked -p trust-cg-sat-host --test trust_cg_sat_cli
-cargo test --locked -p trust-cg-sat-host --test sat_corpus
+targo --unverified test --locked -p trust-cg-sat-host --test trust_cg_sat_cli
+targo --unverified test --locked -p trust-cg-sat-host --test sat_corpus
 ```
 
 The corpus test can take several minutes on slower hosts. Docker availability

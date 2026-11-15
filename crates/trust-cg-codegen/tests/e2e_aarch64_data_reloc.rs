@@ -34,13 +34,20 @@ use trust_ir::{
 fn macho_compiler(config: CompilerConfig) -> Compiler {
     let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
         .expect("aarch64-apple-darwin parses");
-    Compiler::new_for_target_spec(config, spec)
+    Compiler::new_for_target_spec(config, spec).with_codegen_license(permit_unlicensed())
 }
 
 const ANSWER: i128 = 16963; // 0x4243
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/fresh_dir.rs"]
+mod fresh_dir;
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF: R_AARCH64_ABS64) or macOS (Mach-O:
+/// ARM64_RELOC_UNSIGNED) can link and run the data-relocated object.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// `dg_target() -> i64` returns `ANSWER`; `dg_read() -> i64` returns the
@@ -49,11 +56,15 @@ fn build_data_reloc_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("datareloc");
 
     // A one-entry function-pointer table whose slot 0 is `&dg_target`.
+    let ptr = module.add_type(Ty::Ptr).expect("add_type: test fixture");
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "dg_table".to_string(),
-        ty: Ty::Ptr,
+        ty: Ty::Array(ptr, 1),
         mutable: false,
-        initializer: Some(Constant::Aggregate(vec![Constant::SymbolAddr {
+        initializer: Some(Constant::Array(vec![Constant::SymbolAddr {
             symbol: "dg_target".to_string(),
             addend: 0,
         }])),
@@ -62,11 +73,14 @@ fn build_data_reloc_module() -> TrustIrModule {
         align: None,
     });
 
-    let ret_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ret_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // dg_target() -> i64 { ANSWER }
     let mut target = TrustIrFunction::new(FuncId::new(0), "dg_target", ret_ft, BlockId::new(0));
@@ -84,7 +98,9 @@ fn build_data_reloc_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(target);
+    module
+        .try_add_function(target)
+        .expect("Module::try_add_function: test fixture");
 
     // dg_read() -> i64 { *(&dg_table) }  (loads the relocated fn pointer)
     let mut read = TrustIrFunction::new(FuncId::new(1), "dg_read", ret_ft, BlockId::new(0));
@@ -108,7 +124,9 @@ fn build_data_reloc_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(read);
+    module
+        .try_add_function(read)
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -142,23 +160,29 @@ fn aarch64_data_reloc_module_compiles() {
 /// `ARM64_RELOC_UNSIGNED` yields a null/garbage pointer (crash or mismatch).
 #[test]
 fn aarch64_data_reloc_links_runs_and_calls_through_pointer() {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: requires an aarch64-apple-darwin host");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: requires an AArch64 Linux GNU or macOS host");
         return;
     }
 
     let module = build_data_reloc_module();
-    let compiler = macho_compiler(CompilerConfig {
-        opt_level: OptLevel::O0,
-        ..CompilerConfig::default()
-    });
+    // The host's own object format and relocation spelling.
+    let compiler = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: OptLevel::O0,
+            ..CompilerConfig::default()
+        },
+        trust_cg_codegen::target::TargetSpec::parse(native_host::TRIPLE)
+            .expect("native triple parses"),
+    )
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module)
         .expect("aarch64 data-relocation compile should succeed");
+    native_host::assert_native_object(&result.object_code);
 
-    let dir = std::env::temp_dir().join("trust_cg_aarch64_data_reloc");
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create test dir");
+    // A fresh directory per run, removed when `dir` drops (fresh_dir.rs).
+    let dir = fresh_dir::create("trust_cg_aarch64_data_reloc-");
 
     let obj_path = dir.join("data_reloc.o");
     fs::write(&obj_path, &result.object_code).expect("write .o");
@@ -187,6 +211,7 @@ fn aarch64_data_reloc_links_runs_and_calls_through_pointer() {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc should be available");
     assert!(
@@ -208,4 +233,31 @@ fn aarch64_data_reloc_links_runs_and_calls_through_pointer() {
         "calling through the relocated function pointer must reach dg_target (a wrong \
          ARM64_RELOC_UNSIGNED silently miscompiles the vtable/table slot)"
     );
+}
+
+/// The Linux GNU native lane's object, checked at object level on every host.
+#[test]
+fn aarch64_data_reloc_linux_object_is_elf_aarch64() {
+    let object = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: OptLevel::O0,
+            ..CompilerConfig::default()
+        },
+        trust_cg_codegen::target::TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&build_data_reloc_module())
+    .expect("the Linux GNU object must compile")
+    .object_code;
+    native_host::assert_elf_aarch64_object(&object);
+    assert!(!native_host::text_words(&object).is_empty());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

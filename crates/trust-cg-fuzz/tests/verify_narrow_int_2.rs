@@ -45,6 +45,7 @@ fn jit_run(m: &trust_ir::Module, opt: OptLevel, fast: bool, row: &[i64; 4]) -> R
 
     let compiled = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         Compiler::new(cfg)
+            .with_codegen_license(permit_unlicensed())
             .compile_module_to_jit(m, &ext)
             .map_err(Box::new)
     }));
@@ -88,7 +89,7 @@ fn build_module_i8_ashr() -> trust_ir::Module {
     let wide = fb.sext(Ty::I8, Ty::I64, r);
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// i16 variant: sext_i64( trunc_i16(a) AShr trunc_i16(b) )
@@ -108,7 +109,7 @@ fn build_module_i16_ashr() -> trust_ir::Module {
     let wide = fb.sext(Ty::I16, Ty::I64, r);
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// i32 control: sext_i64( trunc_i32(a) AShr trunc_i32(b) ). Should be correct
@@ -129,7 +130,7 @@ fn build_module_i32_ashr() -> trust_ir::Module {
     let wide = fb.sext(Ty::I32, Ty::I64, r);
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn report_case(label: &str, m: &trust_ir::Module, row: &[i64; 4], expect: i64) -> bool {
@@ -205,4 +206,13 @@ fn verify_narrow_ashr_claim() {
     let all_127 = !jit_vals.is_empty() && jit_vals.iter().all(|&v| v == 127);
     let all_neg1 = !jit_vals.is_empty() && jit_vals.iter().all(|&v| v == -1);
     eprintln!("VERDICT-DATA: all_127={all_127} all_neg1={all_neg1}");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

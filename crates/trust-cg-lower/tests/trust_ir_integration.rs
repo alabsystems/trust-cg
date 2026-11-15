@@ -3,28 +3,37 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-use trust_cg_ir::function::{StackSlotAllocationKind, StackSlotSizeSource};
+use trust_cg_ir::function::{StackProtectorMode, StackSlotAllocationKind, StackSlotSizeSource};
 use trust_cg_ir::regs::RegClass;
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
 use trust_cg_lower::adapter::{
-    AdapterError, ProofContext, translate_function, translate_module, translate_type,
+    AdapterError, GuardCarrierArch, LLVM_STACK_PROTECTOR_FUNCTION_ATTR_TAG, ProofContext,
+    TlsDialect, translate_type,
 };
 use trust_cg_lower::bitfield_dialect;
 use trust_cg_lower::function::Function;
 use trust_cg_lower::instructions::{AtomicOrdering, Block, Instruction, IntCC, Opcode};
 use trust_cg_lower::isel::{
-    AArch64CC, AArch64Opcode, ISelFunction, ISelOperand, InstructionSelector,
+    AArch64CC, AArch64Opcode, ISelFunction, ISelInst, ISelOperand, InstructionSelector,
 };
 use trust_cg_lower::types::Type;
 use trust_cg_lower::x86_64_isel::{X86ISelFunction, X86ISelOperand, X86InstructionSelector};
 
 use trust_ir::dialect::vector as vector_dialect;
 use trust_ir::{
-    AtomicRMWOp, BinOp, Block as TrustIrBlock, BlockId, CastOp, ClosureTyId, Constant, FieldDef,
-    FuncId, FuncTy, FuncTyId, Function as TrustIrFunction, ICmpOp, Inst, InstrNode,
+    AtomicRMWOp, BinOp, Block as TrustIrBlock, BlockId, CastOp, ClosureTyId, Constant, FatPtrKind,
+    FieldDef, FuncId, FuncTy, FuncTyId, Function as TrustIrFunction, ICmpOp, Inst, InstrNode,
     Module as TrustIrModule, Ordering, OverflowOp, ProofAnnotation, ProofTag, RecordDef, RecordId,
     SetRepr, SwitchCase, Ty, TyId, UnOp, ValueId,
 };
+
+#[path = "common/typed_refusal.rs"]
+mod typed_refusal;
+use typed_refusal::assert_typed_const_refusal;
+
+#[path = "common/below_admission.rs"]
+mod below_admission;
+use below_admission::{body_below_admission, body_refusal_below_admission};
 
 fn v(n: u32) -> ValueId {
     ValueId::new(n)
@@ -42,6 +51,7 @@ fn func_ty(params: Vec<Ty>, returns: Vec<Ty>) -> FuncTy {
     FuncTy {
         params,
         returns,
+        abi: None,
         is_vararg: false,
     }
 }
@@ -55,13 +65,17 @@ fn single_function_module(
 ) -> TrustIrModule {
     let entry = blocks.first().expect("module must have a block").id;
     let mut module = TrustIrModule::new(func_name);
-    let func_ty_id: FuncTyId = module.add_func_type(ty);
+    let func_ty_id: FuncTyId = module
+        .add_func_type(ty)
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(f(func_id), func_name, func_ty_id, entry);
     func.blocks = blocks;
     func.proofs = proofs;
 
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -123,10 +137,12 @@ fn try_compile_trust_ir_function_with(
 ) -> Result<ISelFunction, String> {
     let func = single_function(module);
 
-    let (lir_func, _proof_ctx) = translate_function(func, module)
-        .map_err(|err| format!("adapter translation failed: {err}"))?;
+    let (lir_func, _proof_ctx) =
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .map_err(|err| format!("adapter translation failed: {err}"))?;
 
     let mut isel = InstructionSelector::new(lir_func.name.clone(), lir_func.signature.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.set_lse_enabled(lse_enabled);
 
     // Seed Value->Type hints (Call/CallIndirect result types, #381).
@@ -160,8 +176,9 @@ fn compile_trust_ir_function_x86_64(module: &TrustIrModule) -> X86ISelFunction {
 fn try_compile_trust_ir_function_x86_64(module: &TrustIrModule) -> Result<X86ISelFunction, String> {
     let func = single_function(module);
 
-    let (lir_func, _proof_ctx) = translate_function(func, module)
-        .map_err(|err| format!("adapter translation failed: {err}"))?;
+    let (lir_func, _proof_ctx) =
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .map_err(|err| format!("adapter translation failed: {err}"))?;
 
     let mut isel = X86InstructionSelector::new(lir_func.name.clone(), lir_func.signature.clone());
     isel.seed_value_types(&lir_func.value_types);
@@ -188,7 +205,11 @@ fn try_compile_trust_ir_function_x86_64(module: &TrustIrModule) -> Result<X86ISe
 }
 
 fn translate_only(module: &TrustIrModule) -> Result<(Function, ProofContext), AdapterError> {
-    translate_function(single_function(module), module)
+    trust_cg_lower::translate_function_with_license(
+        single_function(module),
+        module,
+        &permit_unlicensed(),
+    )
 }
 
 fn count_opcode(mfunc: &ISelFunction, opcode: AArch64Opcode) -> usize {
@@ -346,7 +367,7 @@ fn assert_no_v2i64_icmp_adapter_lane_scalarization(lir_func: &Function) {
     }
 }
 
-fn assert_module(assert_name: &str, constant: i128) -> TrustIrModule {
+fn assert_module(assert_name: &str, constant: bool) -> TrustIrModule {
     single_function_module(
         0,
         assert_name,
@@ -357,10 +378,14 @@ fn assert_module(assert_name: &str, constant: i128) -> TrustIrModule {
             body: vec![
                 InstrNode::new(Inst::Const {
                     ty: Ty::Bool,
-                    value: Constant::Int(constant),
+                    value: Constant::Bool(constant),
                 })
                 .with_result(v(0)),
-                InstrNode::new(Inst::Assert { cond: v(0) }),
+                InstrNode::new(Inst::Assert {
+                    cond: v(0),
+                    kind: trust_ir::AssertKind::Unspecified,
+                    site: None,
+                }),
                 InstrNode::new(Inst::Const {
                     ty: Ty::I32,
                     value: Constant::Int(7),
@@ -373,7 +398,7 @@ fn assert_module(assert_name: &str, constant: i128) -> TrustIrModule {
     )
 }
 
-fn assume_module(assume_name: &str, constant: i128) -> TrustIrModule {
+fn assume_module(assume_name: &str, constant: bool) -> TrustIrModule {
     single_function_module(
         0,
         assume_name,
@@ -384,7 +409,7 @@ fn assume_module(assume_name: &str, constant: i128) -> TrustIrModule {
             body: vec![
                 InstrNode::new(Inst::Const {
                     ty: Ty::Bool,
-                    value: Constant::Int(constant),
+                    value: Constant::Bool(constant),
                 })
                 .with_result(v(0)),
                 InstrNode::new(Inst::Assume { cond: v(0) }),
@@ -417,6 +442,30 @@ fn dealloc_module(name: &str) -> TrustIrModule {
     )
 }
 
+fn check_trap_block_aarch64(mfunc: &ISelFunction, block: Block) -> Result<(), &'static str> {
+    let trap = &mfunc.blocks[&block];
+    if !matches!(trap.insts.as_slice(), [inst]
+        if inst.opcode == AArch64Opcode::Brk && inst.operands.is_empty())
+    {
+        return Err("AArch64 trap block must contain only operand-free BRK");
+    }
+    if mfunc
+        .blocks
+        .values()
+        .flat_map(|block| &block.insts)
+        .any(|inst| {
+            inst.operands.iter().any(|operand| {
+                matches!(operand,
+                ISelOperand::Symbol(name) | ISelOperand::ExactModuleSymbol(name)
+                    if name == "abort" || name == "_abort")
+            })
+        })
+    {
+        return Err("AArch64 trap lowering must not reference an abort symbol");
+    }
+    Ok(())
+}
+
 fn assert_trap_block_aarch64(mfunc: &ISelFunction) -> Block {
     let entry = &mfunc.blocks[&Block(0)];
     let trap_block = entry
@@ -440,13 +489,8 @@ fn assert_trap_block_aarch64(mfunc: &ISelFunction) -> Block {
         entry.successors.contains(&trap_block),
         "assert false edge must be present in the AArch64 CFG"
     );
-    let trap = &mfunc.blocks[&trap_block];
-    assert!(
-        trap.insts
-            .iter()
-            .any(|inst| inst.opcode == AArch64Opcode::TrapOverflow),
-        "AArch64 assert false edge must contain an explicit trap"
-    );
+    // A preceding abort call would make even a following BRK unreachable.
+    check_trap_block_aarch64(mfunc, trap_block).expect("invalid AArch64 conditional trap");
     trap_block
 }
 
@@ -482,22 +526,22 @@ fn assert_trap_block_x86_64(mfunc: &X86ISelFunction) -> Block {
 }
 
 #[test]
-fn test_dealloc_fails_closed_until_allocator_semantics_are_wired() {
+fn test_dealloc_fails_closed_by_trust_irs_codegen_verdict() {
+    // TrustIR `Dealloc` names only the pointer: neither the allocator origin
+    // nor the layout. trust-ir refuses every one for codegen in every body
+    // (G18-1, `UnlowerableForCodegen`), and this backend conforms — the
+    // pointer is never ignored, guessed or traced back to an allocation.
     let module = dealloc_module("dealloc_fail_closed");
     let err = translate_only(&module).expect_err("Dealloc must not be ignored or lowered as free");
     match err {
         AdapterError::UnsupportedInstruction(message) => {
             assert!(
-                message.contains("allocator identity"),
-                "Dealloc diagnostic must name the missing allocator contract, got: {message}"
+                message.contains("[TCG-DEALLOC]"),
+                "Dealloc refusal must carry its named marker, got: {message}"
             );
             assert!(
-                message.contains("layout size/alignment"),
-                "Dealloc diagnostic must name the missing layout contract, got: {message}"
-            );
-            assert!(
-                message.contains("GlobalAlloc/Box"),
-                "Dealloc diagnostic must name Rust release semantics, got: {message}"
+                message.contains("UnlowerableForCodegen"),
+                "Dealloc refusal must cite trust-ir's codegen verdict, got: {message}"
             );
         }
         other => panic!("Dealloc must fail closed as UnsupportedInstruction, got {other:?}"),
@@ -505,23 +549,15 @@ fn test_dealloc_fails_closed_until_allocator_semantics_are_wired() {
 }
 
 #[test]
-fn test_assert_lowers_to_lir_runtime_guard() {
-    let module = assert_module("assert_lir_guard", 1);
-    let (lir_func, _) = translate_only(&module).expect("assert must lower to LIR");
-    let entry = &lir_func.blocks[&lir_func.entry_block];
-
-    assert!(
-        entry
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst.opcode, Opcode::Assert)),
-        "Inst::Assert must not be ignored or rejected once a trap path exists"
-    );
+fn test_assert_without_panic_kind_refuses_instead_of_a_lir_trap() {
+    let module = assert_module("assert_lir_guard", true);
+    let err = translate_only(&module).expect_err("an unspecified Rust panic is not a LIR trap");
+    assert!(err.to_string().contains("unspecified panic kind"), "{err}");
 }
 
 #[test]
 fn test_assume_lowers_to_lir_runtime_guard() {
-    let module = assume_module("assume_lir_guard", 1);
+    let module = assume_module("assume_lir_guard", true);
     let (lir_func, _) = translate_only(&module).expect("assume must lower to LIR");
     let entry = &lir_func.blocks[&lir_func.entry_block];
 
@@ -535,26 +571,87 @@ fn test_assume_lowers_to_lir_runtime_guard() {
 }
 
 #[test]
-fn test_assert_true_and_false_lower_to_aarch64_conditional_trap() {
-    for (name, constant) in [("assert_true_aarch64", 1), ("assert_false_aarch64", 0)] {
-        let module = assert_module(name, constant);
-        let mfunc = compile_trust_ir_function(&module);
-        let entry = &mfunc.blocks[&Block(0)];
+fn test_plain_trap_aarch64_is_only_brk() {
+    use trust_cg_lower::function::Signature;
 
-        assert!(
-            entry
-                .insts
-                .iter()
-                .any(|inst| inst.opcode == AArch64Opcode::CmpRI),
-            "AArch64 assert must test the condition"
+    let mut isel = InstructionSelector::new(
+        "plain_trap".to_string(),
+        Signature {
+            params: vec![],
+            returns: vec![],
+        },
+    );
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
+    isel.select_block(
+        Block(0),
+        &[Instruction {
+            opcode: Opcode::Trap,
+            args: vec![],
+            results: vec![],
+        }],
+    )
+    .expect("plain Trap must lower");
+    let mfunc = isel.finalize();
+    assert_eq!(mfunc.blocks.len(), 1);
+    check_trap_block_aarch64(&mfunc, Block(0)).expect("invalid AArch64 plain trap");
+}
+
+#[test]
+fn test_trap_aarch64_oracle_rejects_abort_sequences_and_symbols() {
+    // This oracle controls an INTERNAL checked trap, not a source Rust panic.
+    let module = assume_module("trap_oracle_controls", false);
+    let mfunc = compile_trust_ir_function(&module);
+    let trap_block = assert_trap_block_aarch64(&mfunc);
+
+    // Reject both the old mapping and an abort call preceding the new BRK.
+    for filler in [AArch64Opcode::TrapOverflow, AArch64Opcode::Brk] {
+        let mut mutant = mfunc.clone();
+        mutant.blocks.get_mut(&trap_block).unwrap().insts = vec![
+            ISelInst::new(AArch64Opcode::Bl, vec![ISelOperand::Symbol("abort".into())]),
+            ISelInst::new(filler, vec![]),
+        ];
+        assert!(check_trap_block_aarch64(&mutant, trap_block).is_err());
+    }
+
+    // The trap block remains exact: reject abort dependencies in other blocks,
+    // including symbol references that are not direct calls.
+    for symbol in [
+        ISelOperand::Symbol("abort".into()),
+        ISelOperand::Symbol("_abort".into()),
+        ISelOperand::ExactModuleSymbol("abort".into()),
+    ] {
+        let mut mutant = mfunc.clone();
+        mutant
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .insts
+            .insert(0, ISelInst::new(AArch64Opcode::Adrp, vec![symbol]));
+        assert_eq!(
+            check_trap_block_aarch64(&mutant, trap_block),
+            Err("AArch64 trap lowering must not reference an abort symbol")
         );
-        assert_trap_block_aarch64(&mfunc);
+    }
+}
+
+#[test]
+fn test_assert_true_and_false_refuse_before_aarch64_trap_selection() {
+    for (name, constant) in [
+        ("assert_true_aarch64", true),
+        ("assert_false_aarch64", false),
+    ] {
+        let module = assert_module(name, constant);
+        let err = translate_only(&module).unwrap_err();
+        assert!(err.to_string().contains("unspecified panic kind"), "{err}");
     }
 }
 
 #[test]
 fn test_assume_true_and_false_lower_to_aarch64_conditional_trap() {
-    for (name, constant) in [("assume_true_aarch64", 1), ("assume_false_aarch64", 0)] {
+    for (name, constant) in [
+        ("assume_true_aarch64", true),
+        ("assume_false_aarch64", false),
+    ] {
         let module = assume_module(name, constant);
         let mfunc = compile_trust_ir_function(&module);
         let entry = &mfunc.blocks[&Block(0)];
@@ -571,26 +668,17 @@ fn test_assume_true_and_false_lower_to_aarch64_conditional_trap() {
 }
 
 #[test]
-fn test_assert_true_and_false_lower_to_x86_64_conditional_trap() {
-    for (name, constant) in [("assert_true_x86_64", 1), ("assert_false_x86_64", 0)] {
+fn test_assert_true_and_false_refuse_before_x86_64_trap_selection() {
+    for (name, constant) in [("assert_true_x86_64", true), ("assert_false_x86_64", false)] {
         let module = assert_module(name, constant);
-        let mfunc = compile_trust_ir_function_x86_64(&module);
-        let entry = &mfunc.blocks[&Block(0)];
-
-        assert!(
-            entry
-                .insts
-                .iter()
-                .any(|inst| inst.opcode == X86Opcode::CmpRI),
-            "x86_64 assert must test the condition"
-        );
-        assert_trap_block_x86_64(&mfunc);
+        let err = translate_only(&module).unwrap_err();
+        assert!(err.to_string().contains("unspecified panic kind"), "{err}");
     }
 }
 
 #[test]
 fn test_assume_true_and_false_lower_to_x86_64_conditional_trap() {
-    for (name, constant) in [("assume_true_x86_64", 1), ("assume_false_x86_64", 0)] {
+    for (name, constant) in [("assume_true_x86_64", true), ("assume_false_x86_64", false)] {
         let module = assume_module(name, constant);
         let mfunc = compile_trust_ir_function_x86_64(&module);
         let entry = &mfunc.blocks[&Block(0)];
@@ -998,6 +1086,7 @@ fn test_sum_isel_body_instructions() {
         returns: vec![Type::I32],
     };
     let mut isel = InstructionSelector::new("sum_body".to_string(), sig.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     let entry = Block(0);
     isel.lower_formal_arguments(&sig, entry).unwrap();
 
@@ -1234,6 +1323,7 @@ fn build_cmpxchg_with_orderings(success: Ordering, failure: Ordering) -> TrustIr
                     desired: v(2),
                     success,
                     failure,
+                    weak: false,
                 })
                 .with_results(vec![v(3), v(4)]),
                 InstrNode::new(Inst::Return {
@@ -1461,7 +1551,9 @@ fn build_call_module() -> TrustIrModule {
     // onto the Call result Value, so I32 end-to-end is type-correct through
     // ISel's #307 Return check. (Historic note: this fixture was forced to
     // I64 in #380 as a workaround for the missing type propagation.)
-    let shared_sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]));
+    let shared_sig: FuncTyId = module
+        .add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut callee = TrustIrFunction::new(f(0), "callee", shared_sig, b(0));
     callee.blocks.push(TrustIrBlock {
@@ -1484,15 +1576,23 @@ fn build_call_module() -> TrustIrModule {
         ],
     });
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn build_direct_call_result_block_arg_merge() -> TrustIrModule {
     let mut module = TrustIrModule::new("direct_call_result_block_arg_merge");
-    let callee_ty = module.add_func_type(func_ty(vec![], vec![Ty::I32]));
-    let caller_ty = module.add_func_type(func_ty(vec![], vec![Ty::I32]));
+    let callee_ty = module
+        .add_func_type(func_ty(vec![], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
+    let caller_ty = module
+        .add_func_type(func_ty(vec![], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut callee = TrustIrFunction::new(f(20), "direct_block_arg_callee", callee_ty, b(0));
     callee.blocks.push(TrustIrBlock {
@@ -1533,15 +1633,19 @@ fn build_direct_call_result_block_arg_merge() -> TrustIrModule {
         },
     ];
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 #[test]
 fn test_call_adapter() {
     let module = build_call_module();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     assert_eq!(results.len(), 2);
 
     let (callee_func, _) = &results[0];
@@ -1553,7 +1657,7 @@ fn test_call_adapter() {
     let entry = &caller_func.blocks[&caller_func.entry_block];
     assert_eq!(entry.instructions.len(), 2);
     assert!(
-        matches!(&entry.instructions[0].opcode, Opcode::Call { name } if name == "callee"),
+        matches!(&entry.instructions[0].opcode, Opcode::Call { name, .. } if name == "callee"),
         "Expected Call to 'callee', got {:?}",
         entry.instructions[0].opcode
     );
@@ -1562,7 +1666,7 @@ fn test_call_adapter() {
 #[test]
 fn test_direct_call_result_can_feed_block_arg_validation() {
     let module = build_direct_call_result_block_arg_merge();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     let (caller_func, _) = results
         .iter()
         .find(|(func, _)| func.name == "direct_call_result_block_arg_merge")
@@ -1588,11 +1692,17 @@ fn test_direct_call_result_can_feed_block_arg_validation() {
 }
 
 #[test]
-fn test_empty_closure_const_materializes_function_symbol_pointer_arg() {
+fn test_fndef_const_materializes_function_symbol_pointer_arg() {
     let mut module = TrustIrModule::new("function_pointer_arg");
-    let rust_main_sig = module.add_func_type(func_ty(vec![], vec![]));
-    let accept_sig = module.add_func_type(func_ty(vec![Ty::Func(rust_main_sig)], vec![Ty::I32]));
-    let caller_sig = module.add_func_type(func_ty(vec![], vec![Ty::I32]));
+    let rust_main_sig = module
+        .add_func_type(func_ty(vec![], vec![]))
+        .expect("Module::add_func_type: test fixture");
+    let accept_sig = module
+        .add_func_type(func_ty(vec![Ty::Func(rust_main_sig)], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
+    let caller_sig = module
+        .add_func_type(func_ty(vec![], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut rust_main = TrustIrFunction::new(f(0), "_rust_main", rust_main_sig, b(0));
     rust_main.blocks.push(TrustIrBlock {
@@ -1622,10 +1732,7 @@ fn test_empty_closure_const_materializes_function_symbol_pointer_arg() {
         body: vec![
             InstrNode::new(Inst::Const {
                 ty: Ty::Func(rust_main_sig),
-                value: Constant::Closure {
-                    func: f(0),
-                    captures: vec![],
-                },
+                value: Constant::FnDef(f(0)),
             })
             .with_result(v(0)),
             InstrNode::new(Inst::Call {
@@ -1637,11 +1744,17 @@ fn test_empty_closure_const_materializes_function_symbol_pointer_arg() {
         ],
     });
 
-    module.add_function(rust_main);
-    module.add_function(accept);
-    module.add_function(caller);
+    module
+        .try_add_function(rust_main)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(accept)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
 
-    let results = translate_module(&module).expect("module should translate");
+    let results = permit_translate_module(&module).expect("module should translate");
     let (caller_lir, _) = &results[2];
     let entry = &caller_lir.blocks[&caller_lir.entry_block];
 
@@ -1651,7 +1764,7 @@ fn test_empty_closure_const_materializes_function_symbol_pointer_arg() {
     ));
     assert!(matches!(
         &entry.instructions[1].opcode,
-        Opcode::Call { name } if name == "_accept_fn_ptr"
+        Opcode::Call { name, .. } if name == "_accept_fn_ptr"
     ));
     assert_eq!(
         entry.instructions[1].args,
@@ -1659,6 +1772,7 @@ fn test_empty_closure_const_materializes_function_symbol_pointer_arg() {
     );
 
     let mut isel = InstructionSelector::new(caller_lir.name.clone(), caller_lir.signature.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.seed_value_types(&caller_lir.value_types);
     isel.lower_formal_arguments(&caller_lir.signature, caller_lir.entry_block)
         .unwrap();
@@ -1670,13 +1784,41 @@ fn test_empty_closure_const_materializes_function_symbol_pointer_arg() {
     assert!(has_opcode(&mfunc, AArch64Opcode::Adrp));
     assert!(has_opcode(&mfunc, AArch64Opcode::AddPCRel));
     assert!(has_opcode(&mfunc, AArch64Opcode::Bl));
+
+    // The capture-free closure literal is no longer a spelling of a function
+    // item at `Ty::Func`: TrustIR's typed admission refuses it by name.
+    let mut legacy = module.clone();
+    let caller = legacy
+        .functions
+        .iter_mut()
+        .find(|func| func.name == "_caller")
+        .expect("caller fixture");
+    let Inst::Const { value, .. } = &mut caller.blocks[0].body[0].inst else {
+        panic!("caller must open with the function-pointer constant")
+    };
+    *value = Constant::Closure {
+        func: f(0),
+        captures: vec![],
+    };
+    let err =
+        permit_translate_module(&legacy).expect_err("closure spelling at Ty::Func must be refused");
+    assert_typed_const_refusal(
+        &err,
+        "function '_caller' bb0",
+        "functy.0",
+        "closure<func.0>[0]",
+    );
 }
 
 #[test]
 fn test_reify_fn_pointer_from_fndef_materializes_code_pointer_on_both_targets() {
     let mut module = TrustIrModule::new("reify_fn_pointer_fndef");
-    let target_sig = module.add_func_type(func_ty(vec![], vec![]));
-    let caller_sig = module.add_func_type(func_ty(vec![], vec![Ty::Ptr]));
+    let target_sig = module
+        .add_func_type(func_ty(vec![], vec![]))
+        .expect("Module::add_func_type: test fixture");
+    let caller_sig = module
+        .add_func_type(func_ty(vec![], vec![Ty::Ptr]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut target = TrustIrFunction::new(f(0), "_reify_target", target_sig, b(0));
     target.blocks.push(TrustIrBlock {
@@ -1706,10 +1848,14 @@ fn test_reify_fn_pointer_from_fndef_materializes_code_pointer_on_both_targets() 
         ],
     });
 
-    module.add_function(target);
-    module.add_function(caller);
+    module
+        .try_add_function(target)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
 
-    let results = translate_module(&module).expect("module should translate");
+    let results = permit_translate_module(&module).expect("module should translate");
     let (caller_lir, _) = results
         .iter()
         .find(|(func, _)| func.name == "_reify_caller")
@@ -1727,6 +1873,7 @@ fn test_reify_fn_pointer_from_fndef_materializes_code_pointer_on_both_targets() 
 
     let mut aarch64 =
         InstructionSelector::new(caller_lir.name.clone(), caller_lir.signature.clone());
+    aarch64.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     aarch64.seed_value_types(&caller_lir.value_types);
     aarch64
         .lower_formal_arguments(&caller_lir.signature, caller_lir.entry_block)
@@ -1758,10 +1905,11 @@ fn test_reify_fn_pointer_from_fndef_materializes_code_pointer_on_both_targets() 
 #[test]
 fn test_call_isel() {
     let module = build_call_module();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
 
     let (caller_lir, _) = &results[1];
     let mut isel = InstructionSelector::new(caller_lir.name.clone(), caller_lir.signature.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     // Seed Value->Type hints (Call result types, #381).
     isel.seed_value_types(&caller_lir.value_types);
     isel.lower_formal_arguments(&caller_lir.signature, caller_lir.entry_block)
@@ -2077,9 +2225,12 @@ fn build_call_indirect() -> TrustIrModule {
     // #381: adapter now propagates the callee signature's return types into
     // ISel's value_types map, so I32 call results are tracked correctly and
     // no longer fall back to I64.
-    let callee_sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]));
-    let func_sig: FuncTyId =
-        module.add_func_type(func_ty(vec![Ty::Func(callee_sig), Ty::I32], vec![Ty::I32]));
+    let callee_sig: FuncTyId = module
+        .add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
+    let func_sig: FuncTyId = module
+        .add_func_type(func_ty(vec![Ty::Func(callee_sig), Ty::I32], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(f(11), "call_through_ptr", func_sig, b(0));
     func.blocks.push(TrustIrBlock {
@@ -2097,7 +2248,9 @@ fn build_call_indirect() -> TrustIrModule {
         ],
     });
 
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2628,7 +2781,7 @@ fn test_packed_fp_binary_adapter_result_flow_and_lane_semantics() {
             .filter_map(|inst| {
                 let is_lane_op = match (&op, &inst.opcode) {
                     (BinOp::FMin, Opcode::Fmin) | (BinOp::FMax, Opcode::Fmax) => true,
-                    (BinOp::FRem, Opcode::Call { name }) => {
+                    (BinOp::FRem, Opcode::Call { name, .. }) => {
                         name == if lanes == 4 { "fmodf" } else { "fmod" }
                     }
                     _ => false,
@@ -2940,7 +3093,9 @@ fn clean_expr_goal_annotation_is_compatible_but_never_treated_as_evidence() {
 /// Build a two-function module with a structurally pure callee and a caller.
 fn build_pure_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("pure_call_test");
-    let sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]));
+    let sig: FuncTyId = module
+        .add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     // Pure callee: return arg unchanged.
     let mut callee = TrustIrFunction::new(f(0), "pure_callee", sig, b(0));
@@ -2964,8 +3119,12 @@ fn build_pure_call_module() -> TrustIrModule {
         ],
     });
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2973,7 +3132,9 @@ fn build_pure_call_module() -> TrustIrModule {
 /// annotation. The annotation must not enter the pure-callee pipeline.
 fn build_forged_pure_store_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("forged_pure_store_call_test");
-    let sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::Ptr, Ty::I32], vec![Ty::I32]));
+    let sig: FuncTyId = module
+        .add_func_type(func_ty(vec![Ty::Ptr, Ty::I32], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut callee = TrustIrFunction::new(f(0), "impure_callee", sig, b(0));
     callee.blocks.push(TrustIrBlock {
@@ -3006,8 +3167,12 @@ fn build_forged_pure_store_call_module() -> TrustIrModule {
         ],
     });
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3017,7 +3182,9 @@ fn build_forged_pure_store_call_module() -> TrustIrModule {
 /// callee in the same caller.
 fn build_forged_libm_custom_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("forged_libm_custom_call_test");
-    let sig: FuncTyId = module.add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]));
+    let sig: FuncTyId = module
+        .add_func_type(func_ty(vec![Ty::I32], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut pure_callee = TrustIrFunction::new(f(0), "pure_callee", sig, b(0));
     pure_callee.blocks.push(TrustIrBlock {
@@ -3050,16 +3217,22 @@ fn build_forged_libm_custom_call_module() -> TrustIrModule {
         ],
     });
 
-    module.add_function(pure_callee);
-    module.add_function(forged_external);
-    module.add_function(caller);
+    module
+        .try_add_function(pure_callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(forged_external)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 #[test]
 fn test_pure_callee_surfaces_in_lir_function() {
     let module = build_pure_call_module();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     assert_eq!(results.len(), 2);
 
     let (caller_lir, _) = results
@@ -3077,7 +3250,7 @@ fn test_pure_callee_surfaces_in_lir_function() {
 #[test]
 fn test_forged_raw_pure_impure_callee_is_not_authorized() {
     let module = build_forged_pure_store_call_module();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
 
     let (caller_lir, _) = results
         .iter()
@@ -3094,7 +3267,7 @@ fn test_forged_raw_pure_impure_callee_is_not_authorized() {
 #[test]
 fn test_forged_libm_custom_tag_is_not_authority() {
     let module = build_forged_libm_custom_call_module();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
 
     let (caller_lir, _) = results
         .iter()
@@ -3124,7 +3297,7 @@ fn test_pure_callee_bl_carries_proof_pure() {
     use trust_cg_ir::ProofAnnotation as IrProof;
 
     let module = build_pure_call_module();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
 
     let (caller_lir, _) = results
         .iter()
@@ -3132,6 +3305,7 @@ fn test_pure_callee_bl_carries_proof_pure() {
         .expect("caller must be present");
 
     let mut isel = InstructionSelector::new(caller_lir.name.clone(), caller_lir.signature.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.seed_value_types(&caller_lir.value_types);
     isel.seed_pure_callees(&caller_lir.pure_callees);
     isel.lower_formal_arguments(&caller_lir.signature, caller_lir.entry_block)
@@ -3725,7 +3899,10 @@ fn test_switch_rejects_non_integer_selector_type() {
 }
 
 #[test]
-fn test_switch_rejects_unsupported_selector_width() {
+fn test_switch_lowers_i128_selector_through_split_halves() {
+    // L04-P10: a 128-bit selector no longer refuses by width; the adapter
+    // dispatches on both 64-bit halves (see the conformance manifest row
+    // "Inst::Switch I128/U128 selector (split halves dispatch)").
     let module = build_switch_with_selector_and_cases(
         "switch_i128_selector",
         Ty::I128,
@@ -3735,13 +3912,15 @@ fn test_switch_rejects_unsupported_selector_width() {
             args: vec![],
         }],
     );
-    let err = translate_only(&module).unwrap_err();
-    assert!(
-        matches!(err, AdapterError::UnsupportedInstruction(ref msg) if msg.contains("unsupported switch selector width")),
-        "expected unsupported selector-width rejection, got {err:?}"
-    );
+    translate_only(&module).expect("a 128-bit switch selector lowers");
 }
 
+/// The `i8` cases `-1` and `255` would collide after selector-width
+/// normalization, but `255` is not an `i8`: TrustIR's typed switch-case
+/// admission refuses it first, so this test pins that typed literal refusal.
+/// The adapter's duplicate detection after normalization is asserted, with a
+/// genuine `-1`/`-1` duplicate, by `check_switch_duplicate_normalized_case_fail_closed`
+/// in `tests/trust_ir_conformance_manifest.rs`.
 #[test]
 fn test_switch_rejects_duplicate_cases_after_selector_width_normalization() {
     let module = build_switch_with_selector_and_cases(
@@ -3760,10 +3939,16 @@ fn test_switch_rejects_duplicate_cases_after_selector_width_normalization() {
             },
         ],
     );
+    // `255` is not an `i8`: trust-ir's typed switch-case admission
+    // (`codegen_switch_case_literal_errors`, run in
+    // `validate_codegen_prerequisites`) refuses the literal by name before
+    // this adapter's normalization could alias it with `-1`. Well-typed `i8`
+    // literals cannot collide after normalization, so the adapter's own
+    // duplicate check stays as the backstop behind it.
     let err = translate_only(&module).unwrap_err();
     assert!(
-        matches!(err, AdapterError::UnsupportedInstruction(ref msg) if msg.contains("duplicate switch case value after 8-bit selector normalization")),
-        "expected duplicate normalized case rejection, got {err:?}"
+        matches!(err, AdapterError::TrustIrAdmissionRefused { ref error } if error.contains("switch case 1: const type mismatch: expected i8")),
+        "expected trust-ir's typed switch-case refusal, got {err:?}"
     );
 }
 
@@ -3778,11 +3963,58 @@ fn test_switch_rejects_non_integer_case_value() {
             args: vec![],
         }],
     );
+    // A float literal is not an `i32`: refused first by trust-ir's typed
+    // switch-case admission, ahead of this adapter's non-integer check (which
+    // `test_switch_on_bool_refuses_a_bool_case_value_in_the_adapter` reaches).
     let err = translate_only(&module).unwrap_err();
     assert!(
-        matches!(err, AdapterError::UnsupportedInstruction(ref msg) if msg.contains("non-integer switch case value")),
-        "expected non-integer case rejection, got {err:?}"
+        matches!(err, AdapterError::TrustIrAdmissionRefused { ref error } if error.contains("switch case 0: const type mismatch: expected i32")),
+        "expected trust-ir's typed switch-case refusal, got {err:?}"
     );
+}
+
+/// TrustIR's typed switch-case admission types the cases of integer and
+/// `char` selectors only, so at a `bool` selector a `Constant::Bool` case
+/// passes it and reaches this adapter. The 8/16/32/64-bit case normalization
+/// (`normalize_switch_case_value`) lowers `Constant::Int` cases only and
+/// refuses any other value by name. Pinned through
+/// `translate_module_for_arch_with_tls_and_validation`, the module entry the
+/// compiler driver calls (there with its codegen-license policy), with the
+/// `Constant::Int` spelling of the same case as the lowering control.
+#[test]
+fn test_switch_on_bool_refuses_a_bool_case_value_in_the_adapter() {
+    let switch_on_bool = |name: &str, value: Constant| {
+        build_switch_with_selector_and_cases(
+            name,
+            Ty::Bool,
+            vec![SwitchCase {
+                value,
+                target: b(2),
+                args: vec![],
+            }],
+        )
+    };
+    let lower = |module: &TrustIrModule| {
+        trust_cg_lower::translate_module_for_arch_with_tls_and_validation_with_license(
+            module,
+            GuardCarrierArch::AArch64,
+            TlsDialect::default(),
+            &permit_unlicensed(),
+        )
+        .map(drop)
+    };
+
+    // The entry runs TrustIR's codegen admission first; the refusal is the
+    // adapter's own, not `TrustIrAdmissionRefused`.
+    let err = lower(&switch_on_bool("switch_bool_case", Constant::Bool(true)))
+        .expect_err("the adapter lowers Int case values only");
+    assert!(
+        matches!(err, AdapterError::UnsupportedInstruction(ref msg) if msg == "non-integer switch case value: Bool(true)"),
+        "expected the adapter's non-integer case refusal, got {err:?}"
+    );
+
+    lower(&switch_on_bool("switch_bool_int_case", Constant::Int(1)))
+        .expect("an Int case at a bool selector lowers");
 }
 
 // ===========================================================================
@@ -3801,7 +4033,9 @@ fn test_switch_rejects_non_integer_case_value() {
 
 fn build_condbr_merge() -> TrustIrModule {
     let mut module = TrustIrModule::new("condbr_merge");
-    let ft_id = module.add_func_type(func_ty(vec![Ty::Bool, Ty::I32, Ty::I32], vec![Ty::I32]));
+    let ft_id = module
+        .add_func_type(func_ty(vec![Ty::Bool, Ty::I32, Ty::I32], vec![Ty::I32]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(f(51), "select_via_branch", ft_id, b(0));
     func.blocks = vec![
@@ -3829,7 +4063,9 @@ fn build_condbr_merge() -> TrustIrModule {
         },
     ];
 
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4046,8 +4282,12 @@ fn test_condbr_block_arg_type_mismatch_rejects_wrong_ptr_arg() {
 
 fn build_call_indirect_result_block_arg_merge() -> TrustIrModule {
     let mut module = TrustIrModule::new("call_indirect_result_block_arg_merge");
-    let callee_ty = module.add_func_type(func_ty(vec![], vec![Ty::I32, Ty::I64]));
-    let wrapper_ty = module.add_func_type(func_ty(vec![Ty::Func(callee_ty)], vec![Ty::I64]));
+    let callee_ty = module
+        .add_func_type(func_ty(vec![], vec![Ty::I32, Ty::I64]))
+        .expect("Module::add_func_type: test fixture");
+    let wrapper_ty = module
+        .add_func_type(func_ty(vec![Ty::Func(callee_ty)], vec![Ty::I64]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(
         f(156),
@@ -4081,7 +4321,9 @@ fn build_call_indirect_result_block_arg_merge() -> TrustIrModule {
         },
     ];
 
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5070,8 +5312,12 @@ fn test_i64_array_store_isel() {
 
 fn build_extern_call() -> TrustIrModule {
     let mut module = TrustIrModule::new("extern_call_test");
-    let helper_sig = module.add_func_type(func_ty(vec![Ty::Ptr, Ty::I64], vec![Ty::I64]));
-    let main_sig = module.add_func_type(func_ty(vec![Ty::Ptr, Ty::I64], vec![Ty::I64]));
+    let helper_sig = module
+        .add_func_type(func_ty(vec![Ty::Ptr, Ty::I64], vec![Ty::I64]))
+        .expect("Module::add_func_type: test fixture");
+    let main_sig = module
+        .add_func_type(func_ty(vec![Ty::Ptr, Ty::I64], vec![Ty::I64]))
+        .expect("Module::add_func_type: test fixture");
 
     // External function (minimal stub -- just returns its second argument)
     let mut helper = TrustIrFunction::new(f(0), "ty_runtime_set_card", helper_sig, b(0));
@@ -5096,15 +5342,19 @@ fn build_extern_call() -> TrustIrModule {
         ],
     });
 
-    module.add_function(helper);
-    module.add_function(main_func);
+    module
+        .try_add_function(helper)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(main_func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 #[test]
 fn test_extern_call_adapter() {
     let module = build_extern_call();
-    let results = translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
 
     // Should have 2 functions (helper declaration + caller)
     assert!(!results.is_empty(), "Should translate at least the caller");
@@ -5118,7 +5368,7 @@ fn test_extern_call_adapter() {
     let has_call = entry.instructions.iter().any(|i| {
         matches!(
             &i.opcode,
-            Opcode::Call { name } if name == "ty_runtime_set_card"
+            Opcode::Call { name, .. } if name == "ty_runtime_set_card"
         )
     });
     assert!(has_call, "Expected Call to ty_runtime_set_card");
@@ -5585,10 +5835,12 @@ fn test_multi_value_diamond_isel() {
 
 fn build_condbr_multi_value_merge() -> TrustIrModule {
     let mut module = TrustIrModule::new("condbr_multi_val");
-    let ft_id = module.add_func_type(func_ty(
-        vec![Ty::Bool, Ty::I32, Ty::I32, Ty::I32, Ty::I32],
-        vec![Ty::I32],
-    ));
+    let ft_id = module
+        .add_func_type(func_ty(
+            vec![Ty::Bool, Ty::I32, Ty::I32, Ty::I32, Ty::I32],
+            vec![Ty::I32],
+        ))
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(f(61), "select_pair", ft_id, b(0));
     func.blocks = vec![
@@ -5629,7 +5881,9 @@ fn build_condbr_multi_value_merge() -> TrustIrModule {
         },
     ];
 
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6556,7 +6810,7 @@ fn test_chain_reorder_parallel_copy() {
 // The correctness of TLA+ runtime overflow detection depends on the adapter
 // producing a real overflow flag from the hardware.
 //
-// Issue #339 and reports/2026-04-18-tla-trust_ir-coverage.md document that the
+// Issue #339 documents that the
 // current adapter hardcodes the flag to Iconst { imm: 0 } (silent miscompile).
 // The tests below are PINNING TESTS — they assert current adapter behavior
 // verbatim so that any future fix to the overflow flag requires updating the
@@ -6823,7 +7077,7 @@ fn test_tla_checked_add_overflow_flag_is_real() {
 //     alloc = Alloca { ty: I64, count: Some(n), align: None }
 // (see ~/ty/crates/tla-trust_ir/src/lower/mod.rs:920-936 and set_ops.rs).
 //
-// Issue #339 and reports/2026-04-18-tla-trust_ir-coverage.md document that the
+// Issue #339 documents that the
 // current adapter ignores `count` and always produces an 8-byte stack slot.
 // For a 10-element set literal this produces silent buffer overrun when the
 // 2nd+ elements are stored.
@@ -7145,7 +7399,9 @@ fn test_tla_bounded_dynamic_alloca_from_loaded_count_isel() {
 
 fn build_tla_bounded_dynamic_alloca_via_direct_callee() -> TrustIrModule {
     let mut module = TrustIrModule::new("tla_bounded_dynamic_alloca_via_direct_callee");
-    let callee_ty = module.add_func_type(func_ty(vec![Ty::Ptr], vec![Ty::I64]));
+    let callee_ty = module
+        .add_func_type(func_ty(vec![Ty::Ptr], vec![Ty::I64]))
+        .expect("Module::add_func_type: test fixture");
     let mut callee = TrustIrFunction::new(f(300), "tla_record_sum2", callee_ty, b(0));
     callee.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -7200,10 +7456,12 @@ fn build_tla_bounded_dynamic_alloca_via_direct_callee() -> TrustIrModule {
         ],
     }];
 
-    let caller_ty = module.add_func_type(func_ty(
-        vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
-        vec![Ty::I64],
-    ));
+    let caller_ty = module
+        .add_func_type(func_ty(
+            vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
+            vec![Ty::I64],
+        ))
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(f(301), "tla_record_build_then_sum2", caller_ty, b(0));
     caller.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -7332,15 +7590,19 @@ fn build_tla_bounded_dynamic_alloca_via_direct_callee() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 #[test]
 fn test_tla_bounded_dynamic_alloca_via_direct_callee_adapter() {
     let module = build_tla_bounded_dynamic_alloca_via_direct_callee();
-    let results = translate_module(&module)
+    let results = permit_translate_module(&module)
         .expect("direct-callee bounded-use inference should translate the loaded-count alloca");
 
     assert_eq!(results.len(), 2, "expected callee + caller translation");
@@ -7362,10 +7624,9 @@ fn test_tla_bounded_dynamic_alloca_via_direct_callee_adapter() {
 
     let entry = &caller_func.blocks[&caller_func.entry_block];
     assert!(
-        entry
-            .instructions
-            .iter()
-            .any(|inst| matches!(&inst.opcode, Opcode::Call { name } if name == "tla_record_sum2")),
+        entry.instructions.iter().any(
+            |inst| matches!(&inst.opcode, Opcode::Call { name, .. } if name == "tla_record_sum2")
+        ),
         "expected direct call to tla_record_sum2 in caller entry block"
     );
 }
@@ -7536,6 +7797,601 @@ fn test_tla_func_except_dynamic_alloca_reducer_records_runtime_metadata() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Bounded-alloca size inference: a root address that escapes into a register
+// aggregate must leave the bounded subset.
+//
+// `infer_bounded_alloca_size_from_uses` turns a dynamic-count `Alloca` into a
+// FIXED slot sized from the accesses it can see. An access made through a
+// pointer read back out of an aggregate (`ExtractField` / `ExtractElement`) is
+// not traced to the root, so a root placed in an aggregate lane must count as
+// an escape (as a stored pointer and an `ArraySplat` operand do). Otherwise
+// the slot is sized from the direct 1-byte store alone and the store at byte
+// 50 lands past it, although `f(64)` is well defined.
+// ---------------------------------------------------------------------------
+
+/// `f(n)`: `a = alloca i8, n; store 0 -> a; <escape>; q = gep i8 carrier, 50;
+/// store 0 -> q`, where `escape` puts `a` into an aggregate and reads it back
+/// into `v(30)`, the carrier.
+fn build_dynamic_alloca_escaping_through(
+    name: &str,
+    types: Vec<Ty>,
+    escape: Vec<InstrNode>,
+) -> TrustIrModule {
+    let mut body = vec![
+        InstrNode::new(Inst::Alloca {
+            ty: Ty::I8,
+            count: Some(v(0)),
+            align: None,
+        })
+        .with_result(v(10)),
+        InstrNode::new(Inst::Const {
+            ty: Ty::I8,
+            value: Constant::Int(0),
+        })
+        .with_result(v(11)),
+        InstrNode::new(Inst::Store {
+            ty: Ty::I8,
+            ptr: v(10),
+            value: v(11),
+            align: None,
+            volatile: false,
+        }),
+    ];
+    body.extend(escape);
+    body.extend([
+        InstrNode::new(Inst::Const {
+            ty: Ty::I64,
+            value: Constant::Int(50),
+        })
+        .with_result(v(12)),
+        InstrNode::new(Inst::GEP {
+            pointee_ty: Ty::I8,
+            base: v(30),
+            indices: vec![v(12)],
+            inbounds: true,
+        })
+        .with_result(v(13)),
+        InstrNode::new(Inst::Store {
+            ty: Ty::I8,
+            ptr: v(13),
+            value: v(11),
+            align: None,
+            volatile: false,
+        }),
+        InstrNode::new(Inst::Return { values: vec![] }),
+    ]);
+    let mut module = single_function_module(
+        213,
+        name,
+        func_ty(vec![Ty::I64], vec![]),
+        vec![TrustIrBlock {
+            id: b(0),
+            params: vec![(v(0), Ty::I64)],
+            body,
+        }],
+        vec![],
+    );
+    module.types = types;
+    module
+}
+
+fn assert_escaped_dynamic_alloca_is_runtime_sized(module: &TrustIrModule) {
+    let errors = trust_ir_build::validate_module(module);
+    assert!(
+        errors.is_empty(),
+        "the escaping-alloca program is valid TrustIR: {errors:?}"
+    );
+    let (lir_func, _) =
+        translate_only(module).expect("the escaping dynamic alloca should translate");
+    assert_eq!(
+        lir_func.stack_slots[0].allocation,
+        StackSlotAllocationKind::RuntimeSized {
+            size_source: StackSlotSizeSource::Value(0)
+        },
+        "an alloca whose address escapes into an aggregate must keep its runtime size; \
+         a fixed slot is sized from the direct store alone and the store at byte 50 \
+         overruns it (slots: {:?})",
+        lir_func.stack_slots
+    );
+}
+
+#[test]
+fn test_dynamic_alloca_escaping_through_make_aggregate_is_runtime_sized() {
+    let tuple = Ty::Tuple(vec![Ty::Ptr]);
+    let module = build_dynamic_alloca_escaping_through(
+        "dynamic_alloca_escaping_through_make_aggregate",
+        vec![],
+        vec![
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tuple,
+                variant: None,
+                fields: vec![v(10)],
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Ptr,
+                aggregate: v(20),
+                field: 0,
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_escaped_dynamic_alloca_is_runtime_sized(&module);
+}
+
+#[test]
+fn test_dynamic_alloca_escaping_through_insert_field_is_runtime_sized() {
+    let tuple = Ty::Tuple(vec![Ty::Ptr]);
+    let module = build_dynamic_alloca_escaping_through(
+        "dynamic_alloca_escaping_through_insert_field",
+        vec![],
+        vec![
+            InstrNode::new(Inst::NullPtr).with_result(v(19)),
+            InstrNode::new(Inst::MakeAggregate {
+                ty: tuple.clone(),
+                variant: None,
+                fields: vec![v(19)],
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::InsertField {
+                ty: tuple,
+                aggregate: v(20),
+                field: 0,
+                value: v(10),
+            })
+            .with_result(v(21)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Ptr,
+                aggregate: v(21),
+                field: 0,
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_escaped_dynamic_alloca_is_runtime_sized(&module);
+}
+
+#[test]
+fn test_dynamic_alloca_escaping_through_insert_element_is_runtime_sized() {
+    let array = Ty::Array(TyId::new(0), 2);
+    let module = build_dynamic_alloca_escaping_through(
+        "dynamic_alloca_escaping_through_insert_element",
+        vec![Ty::Ptr],
+        vec![
+            InstrNode::new(Inst::NullPtr).with_result(v(19)),
+            InstrNode::new(Inst::ArraySplat {
+                ty: array.clone(),
+                value: v(19),
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::Const {
+                ty: Ty::I64,
+                value: Constant::Int(0),
+            })
+            .with_result(v(22)),
+            InstrNode::new(Inst::InsertElement {
+                ty: array,
+                array: v(20),
+                index: v(22),
+                value: v(10),
+            })
+            .with_result(v(21)),
+            InstrNode::new(Inst::ExtractElement {
+                ty: Ty::Ptr,
+                array: v(21),
+                index: v(22),
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_escaped_dynamic_alloca_is_runtime_sized(&module);
+}
+
+#[test]
+fn test_dynamic_alloca_escaping_through_ptr_from_parts_is_runtime_sized() {
+    let fat_ptr = Ty::FatPtr(FatPtrKind::ContainerLen);
+    let module = build_dynamic_alloca_escaping_through(
+        "dynamic_alloca_escaping_through_ptr_from_parts",
+        vec![],
+        vec![
+            InstrNode::new(Inst::Const {
+                ty: Ty::U64,
+                value: Constant::Int(64),
+            })
+            .with_result(v(19)),
+            InstrNode::new(Inst::PtrFromParts {
+                ptr_ty: fat_ptr.clone(),
+                metadata_ty: Ty::U64,
+                data: v(10),
+                metadata: v(19),
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::PtrData {
+                ptr_ty: fat_ptr,
+                ptr: v(20),
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_escaped_dynamic_alloca_is_runtime_sized(&module);
+}
+
+/// The root as a trait object's vtable metadata: `PtrFromParts` stores the
+/// metadata part into the fat pointer too, and `PtrMetadata` reads it back.
+#[test]
+fn test_dynamic_alloca_escaping_through_ptr_from_parts_metadata_is_runtime_sized() {
+    let dyn_ptr = Ty::FatPtr(FatPtrKind::TraitObject { trait_id: 7 });
+    let module = build_dynamic_alloca_escaping_through(
+        "dynamic_alloca_escaping_through_ptr_from_parts_metadata",
+        vec![],
+        vec![
+            InstrNode::new(Inst::NullPtr).with_result(v(19)),
+            InstrNode::new(Inst::PtrFromParts {
+                ptr_ty: dyn_ptr.clone(),
+                metadata_ty: Ty::Ptr,
+                data: v(19),
+                metadata: v(10),
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::PtrMetadata {
+                ptr_ty: dyn_ptr,
+                metadata_ty: Ty::Ptr,
+                ptr: v(20),
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_escaped_dynamic_alloca_is_runtime_sized(&module);
+}
+
+/// The root's integer address as a slice length: `ptrtoint` into the
+/// `ContainerLen` metadata, read back with `PtrMetadata` and `inttoptr`.
+#[test]
+fn test_dynamic_alloca_escaping_through_ptr_from_parts_int_metadata_is_runtime_sized() {
+    let slice_ptr = Ty::FatPtr(FatPtrKind::ContainerLen);
+    let module = build_dynamic_alloca_escaping_through(
+        "dynamic_alloca_escaping_through_ptr_from_parts_int_metadata",
+        vec![],
+        vec![
+            InstrNode::new(Inst::NullPtr).with_result(v(19)),
+            InstrNode::new(Inst::Cast {
+                op: CastOp::PtrToInt,
+                operand: v(10),
+                src_ty: Ty::Ptr,
+                dst_ty: Ty::U64,
+            })
+            .with_result(v(18)),
+            InstrNode::new(Inst::PtrFromParts {
+                ptr_ty: slice_ptr.clone(),
+                metadata_ty: Ty::U64,
+                data: v(19),
+                metadata: v(18),
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::PtrMetadata {
+                ptr_ty: slice_ptr,
+                metadata_ty: Ty::U64,
+                ptr: v(20),
+            })
+            .with_result(v(21)),
+            InstrNode::new(Inst::Cast {
+                op: CastOp::IntToPtr,
+                operand: v(21),
+                src_ty: Ty::U64,
+                dst_ty: Ty::Ptr,
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_escaped_dynamic_alloca_is_runtime_sized(&module);
+}
+
+/// The `ArraySplat` spelling of the same escape, already refused before this
+/// family of tests: the control that the other spellings must match.
+#[test]
+fn test_dynamic_alloca_escaping_through_array_splat_is_runtime_sized() {
+    let array = Ty::Array(TyId::new(0), 2);
+    let module = build_dynamic_alloca_escaping_through(
+        "dynamic_alloca_escaping_through_array_splat",
+        vec![Ty::Ptr],
+        vec![
+            InstrNode::new(Inst::ArraySplat {
+                ty: array,
+                value: v(10),
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::Const {
+                ty: Ty::I64,
+                value: Constant::Int(0),
+            })
+            .with_result(v(22)),
+            InstrNode::new(Inst::ExtractElement {
+                ty: Ty::Ptr,
+                array: v(20),
+                index: v(22),
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_escaped_dynamic_alloca_is_runtime_sized(&module);
+}
+
+// ---------------------------------------------------------------------------
+// Imported-SSP guard decision: the same aggregate escapes must request the
+// guard.
+//
+// A function carrying the imported `ssp`/`sspstrong` tag gets a stack guard
+// only when some alloca is large or has an unsafe use. An access through a
+// pointer read back out of an aggregate is not traced to the alloca, so it is
+// never bounds checked; placing the address in the aggregate must count as the
+// unsafe use, as a stored pointer and an `ArraySplat` operand already do.
+// ---------------------------------------------------------------------------
+
+/// `g()` under the imported stack-protector tag: `a = alloca i32; store 0 -> a;
+/// <escape>; q = gep i8 carrier, 50; store 0 -> q`, where `escape` defines the
+/// carrier `v(30)`. The 4-byte scalar slot is below the imported buffer
+/// threshold, so only an unsafe use can request the guard.
+fn build_ssp_scalar_alloca_escaping_through(
+    types: Vec<Ty>,
+    escape: Vec<InstrNode>,
+) -> TrustIrModule {
+    let mut body = vec![
+        InstrNode::new(Inst::Alloca {
+            ty: Ty::I32,
+            count: None,
+            align: None,
+        })
+        .with_result(v(10)),
+        InstrNode::new(Inst::Const {
+            ty: Ty::I32,
+            value: Constant::Int(0),
+        })
+        .with_result(v(11)),
+        InstrNode::new(Inst::Store {
+            ty: Ty::I32,
+            ptr: v(10),
+            value: v(11),
+            align: None,
+            volatile: false,
+        }),
+    ];
+    body.extend(escape);
+    body.extend([
+        InstrNode::new(Inst::Const {
+            ty: Ty::I64,
+            value: Constant::Int(50),
+        })
+        .with_result(v(12)),
+        InstrNode::new(Inst::GEP {
+            pointee_ty: Ty::I8,
+            base: v(30),
+            indices: vec![v(12)],
+            inbounds: true,
+        })
+        .with_result(v(13)),
+        InstrNode::new(Inst::Store {
+            ty: Ty::I32,
+            ptr: v(13),
+            value: v(11),
+            align: None,
+            volatile: false,
+        }),
+        InstrNode::new(Inst::Return { values: vec![] }),
+    ]);
+    let mut module = single_function_module(
+        214,
+        "ssp_scalar_alloca_escaping_through_aggregate",
+        func_ty(vec![], vec![]),
+        vec![TrustIrBlock {
+            id: b(0),
+            params: vec![],
+            body,
+        }],
+        vec![ProofAnnotation::Custom(ProofTag::new(
+            LLVM_STACK_PROTECTOR_FUNCTION_ATTR_TAG,
+        ))],
+    );
+    module.types = types;
+    module
+}
+
+fn ssp_mode_for(types: Vec<Ty>, escape: Vec<InstrNode>) -> StackProtectorMode {
+    let module = build_ssp_scalar_alloca_escaping_through(types, escape);
+    let errors = trust_ir_build::validate_module(&module);
+    assert!(
+        errors.is_empty(),
+        "the SSP probe is valid TrustIR: {errors:?}"
+    );
+    let (lir_func, _) = translate_only(&module).expect("the SSP probe should translate");
+    lir_func.stack_protector
+}
+
+#[test]
+fn test_imported_ssp_alloca_escaping_into_aggregate_requests_stack_guard() {
+    let tuple = Ty::Tuple(vec![Ty::Ptr]);
+    let array = Ty::Array(TyId::new(0), 2);
+    let dyn_ptr = Ty::FatPtr(FatPtrKind::TraitObject { trait_id: 7 });
+    let slice_ptr = Ty::FatPtr(FatPtrKind::ContainerLen);
+    let null = || InstrNode::new(Inst::NullPtr).with_result(v(19));
+    let zero = || {
+        InstrNode::new(Inst::Const {
+            ty: Ty::I64,
+            value: Constant::Int(0),
+        })
+        .with_result(v(22))
+    };
+    let spellings: Vec<(&str, Vec<Ty>, Vec<InstrNode>)> = vec![
+        (
+            "array_splat (control)",
+            vec![Ty::Ptr],
+            vec![
+                InstrNode::new(Inst::ArraySplat {
+                    ty: array.clone(),
+                    value: v(10),
+                })
+                .with_result(v(20)),
+                zero(),
+                InstrNode::new(Inst::ExtractElement {
+                    ty: Ty::Ptr,
+                    array: v(20),
+                    index: v(22),
+                })
+                .with_result(v(30)),
+            ],
+        ),
+        (
+            "make_aggregate",
+            vec![],
+            vec![
+                InstrNode::new(Inst::MakeAggregate {
+                    ty: tuple.clone(),
+                    variant: None,
+                    fields: vec![v(10)],
+                })
+                .with_result(v(20)),
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::Ptr,
+                    aggregate: v(20),
+                    field: 0,
+                })
+                .with_result(v(30)),
+            ],
+        ),
+        (
+            "insert_field",
+            vec![],
+            vec![
+                null(),
+                InstrNode::new(Inst::MakeAggregate {
+                    ty: tuple.clone(),
+                    variant: None,
+                    fields: vec![v(19)],
+                })
+                .with_result(v(20)),
+                InstrNode::new(Inst::InsertField {
+                    ty: tuple.clone(),
+                    aggregate: v(20),
+                    field: 0,
+                    value: v(10),
+                })
+                .with_result(v(21)),
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::Ptr,
+                    aggregate: v(21),
+                    field: 0,
+                })
+                .with_result(v(30)),
+            ],
+        ),
+        (
+            "insert_element",
+            vec![Ty::Ptr],
+            vec![
+                null(),
+                InstrNode::new(Inst::ArraySplat {
+                    ty: array.clone(),
+                    value: v(19),
+                })
+                .with_result(v(20)),
+                zero(),
+                InstrNode::new(Inst::InsertElement {
+                    ty: array,
+                    array: v(20),
+                    index: v(22),
+                    value: v(10),
+                })
+                .with_result(v(21)),
+                InstrNode::new(Inst::ExtractElement {
+                    ty: Ty::Ptr,
+                    array: v(21),
+                    index: v(22),
+                })
+                .with_result(v(30)),
+            ],
+        ),
+        (
+            "ptr_from_parts data",
+            vec![],
+            vec![
+                InstrNode::new(Inst::Const {
+                    ty: Ty::U64,
+                    value: Constant::Int(64),
+                })
+                .with_result(v(19)),
+                InstrNode::new(Inst::PtrFromParts {
+                    ptr_ty: slice_ptr.clone(),
+                    metadata_ty: Ty::U64,
+                    data: v(10),
+                    metadata: v(19),
+                })
+                .with_result(v(20)),
+                InstrNode::new(Inst::PtrData {
+                    ptr_ty: slice_ptr,
+                    ptr: v(20),
+                })
+                .with_result(v(30)),
+            ],
+        ),
+        (
+            "ptr_from_parts metadata",
+            vec![],
+            vec![
+                null(),
+                InstrNode::new(Inst::PtrFromParts {
+                    ptr_ty: dyn_ptr.clone(),
+                    metadata_ty: Ty::Ptr,
+                    data: v(19),
+                    metadata: v(10),
+                })
+                .with_result(v(20)),
+                InstrNode::new(Inst::PtrMetadata {
+                    ptr_ty: dyn_ptr,
+                    metadata_ty: Ty::Ptr,
+                    ptr: v(20),
+                })
+                .with_result(v(30)),
+            ],
+        ),
+    ];
+    let unguarded: Vec<(&str, StackProtectorMode)> = spellings
+        .into_iter()
+        .map(|(name, types, escape)| (name, ssp_mode_for(types, escape)))
+        .filter(|(_, mode)| *mode != StackProtectorMode::StackGuard)
+        .collect();
+    assert!(
+        unguarded.is_empty(),
+        "an imported-SSP alloca whose address escapes into an aggregate must request \
+         the stack guard; the store at byte 50 through the read-back pointer is never \
+         bounds checked (unguarded spellings: {unguarded:?})"
+    );
+}
+
+/// The new arms key on the alloca's address, not on the aggregate: the same
+/// program with a null pointer in the lane has no unsafe use of the 4-byte slot.
+#[test]
+fn test_imported_ssp_aggregate_without_the_alloca_address_needs_no_guard() {
+    let mode = ssp_mode_for(
+        vec![],
+        vec![
+            InstrNode::new(Inst::NullPtr).with_result(v(19)),
+            InstrNode::new(Inst::MakeAggregate {
+                ty: Ty::Tuple(vec![Ty::Ptr]),
+                variant: None,
+                fields: vec![v(19)],
+            })
+            .with_result(v(20)),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Ptr,
+                aggregate: v(20),
+                field: 0,
+            })
+            .with_result(v(30)),
+        ],
+    );
+    assert_eq!(mode, StackProtectorMode::None);
+}
+
 // ===========================================================================
 // Category 12: tla-trust_ir coverage — Constant::Int i128 range checks
 //
@@ -7591,15 +8447,16 @@ fn test_i64_constant_above_range_is_rejected() {
     // [i64::MIN, u64::MAX] for Ty::I64 (unsigned bit-patterns like hash
     // primes are common in trust_ir frontends), but anything wider must
     // produce an explicit UnsupportedInstruction error.
+    //
+    // TrustIR's typed admission now refuses every out-of-range spelling first
+    // (an I64 constant is spelled in [i64::MIN, i64::MAX]); the adapter's own
+    // "does not fit" bound, for I64 and I32, is pinned below that admission by
+    // the adapter unit test
+    // `test_translate_int_const_refuses_signed_constants_outside_the_bit_pattern_window`.
     let module = build_i64_constant_module(u64::MAX as i128 + 1);
     let err = translate_only(&module)
         .expect_err("Constant::Int above u64::MAX must be rejected, not silently truncated");
-    let msg = format!("{:?}", err);
-    assert!(
-        msg.contains("Constant::Int") && msg.contains("does not fit"),
-        "expected UnsupportedInstruction about Constant::Int not fitting, got: {:?}",
-        err
-    );
+    assert_typed_const_refusal(&err, "function 'i64_const' bb0", "i64", "int");
 }
 
 #[test]
@@ -7607,12 +8464,7 @@ fn test_i64_constant_below_range_is_rejected() {
     // Symmetric check for the negative bound.
     let module = build_i64_constant_module(i64::MIN as i128 - 1);
     let err = translate_only(&module).expect_err("Constant::Int below i64::MIN must be rejected");
-    let msg = format!("{:?}", err);
-    assert!(
-        msg.contains("Constant::Int") && msg.contains("does not fit"),
-        "expected UnsupportedInstruction about Constant::Int not fitting, got: {:?}",
-        err
-    );
+    assert_typed_const_refusal(&err, "function 'i64_const' bb0", "i64", "int");
 }
 
 #[test]
@@ -7639,12 +8491,7 @@ fn test_i32_constant_overflow_is_rejected() {
     );
     let err =
         translate_only(&module).expect_err("Constant::Int(1<<33) in I32 context must be rejected");
-    let msg = format!("{:?}", err);
-    assert!(
-        msg.contains("does not fit"),
-        "expected range-check error message, got: {:?}",
-        err
-    );
+    assert_typed_const_refusal(&err, "function 'i32_overflow' bb0", "i32", "int");
 }
 
 // ===========================================================================
@@ -7736,9 +8583,11 @@ fn test_tla_checked_add_overflow_flag_e2e() {
 fn compile_trust_ir_function_with_stack_slots(module: &TrustIrModule) -> ISelFunction {
     let func = single_function(module);
     let (lir_func, _proof_ctx) =
-        translate_function(func, module).expect("adapter translation failed");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translation failed");
 
     let mut isel = InstructionSelector::new(lir_func.name.clone(), lir_func.signature.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.seed_value_types(&lir_func.value_types);
     isel.set_stack_slots(lir_func.stack_slots.clone());
     isel.lower_formal_arguments(&lir_func.signature, lir_func.entry_block)
@@ -7763,7 +8612,8 @@ fn compile_trust_ir_function_with_stack_slots(module: &TrustIrModule) -> ISelFun
 fn compile_trust_ir_function_x86_64_with_stack_slots(module: &TrustIrModule) -> X86ISelFunction {
     let func = single_function(module);
     let (lir_func, _proof_ctx) =
-        translate_function(func, module).expect("adapter translation failed");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translation failed");
 
     let mut isel = X86InstructionSelector::new(lir_func.name.clone(), lir_func.signature.clone());
     isel.seed_value_types(&lir_func.value_types);
@@ -8004,12 +8854,7 @@ fn test_tla_i64_constant_range_e2e() {
     let bad_module = build_i64_constant_module(too_wide);
     let err = translate_only(&bad_module)
         .expect_err("Constant::Int above u64::MAX must be rejected end-to-end");
-    let msg = format!("{:?}", err);
-    assert!(
-        msg.contains("does not fit"),
-        "expected adapter range-check error, got: {:?}",
-        err
-    );
+    assert_typed_const_refusal(&err, "function 'i64_const' bb0", "i64", "int");
 }
 
 // ===========================================================================
@@ -8070,49 +8915,66 @@ fn build_gep_stride_contract_i32_index() -> TrustIrModule {
 fn test_gep_stride_contract_i64() {
     // Contract (#475): for pointee_ty = I64 (sizeof = 8), a single-index GEP
     // must lower to `base + index * 8`, implemented as:
-    //   Iconst { ty: I64, imm: 8 }  (stride materialization)
-    //   Imul                         (scaled index)
-    //   Iadd                         (base + scaled)
+    //   Iconst { ty: I64, imm: 8 }   (stride materialization)
+    //   Imul index, stride           (scaled index, in bytes)
+    //   ArrayGep { elem_ty: I8 }     (base + scaled, a byte-stride address)
+    // The final add is a byte-stride `ArrayGep` (b79533c9c), not a numeric
+    // `Iadd`: the base may be an aggregate storage carrier, which `Iadd`
+    // cannot take as an integer. Its I8 element keeps the explicit product as
+    // the byte offset, so the stride is applied exactly once.
     let module = build_gep_stride_contract_i64();
     let (lir_func, _) = translate_only(&module).expect("adapter translation failed");
     let entry = &lir_func.blocks[&lir_func.entry_block];
+    let opcodes: Vec<_> = entry.instructions.iter().map(|i| &i.opcode).collect();
+    let base = entry.params[0].0;
+    let index = entry.params[1].0;
 
-    let has_stride_8 = entry.instructions.iter().any(|inst| {
-        matches!(
-            inst.opcode,
-            Opcode::Iconst {
-                ty: Type::I64,
-                imm: 8,
-            }
-        )
-    });
-    assert!(
-        has_stride_8,
-        "GEP stride contract (#475): expected Iconst {{ ty: I64, imm: 8 }} \
-         (sizeof(I64) stride) but got {:?}",
-        entry
-            .instructions
-            .iter()
-            .map(|i| &i.opcode)
-            .collect::<Vec<_>>()
-    );
-
-    let has_imul = entry
+    let stride = entry
         .instructions
         .iter()
-        .any(|inst| matches!(inst.opcode, Opcode::Imul));
-    assert!(
-        has_imul,
-        "GEP stride contract (#475): expected Imul for index * stride"
-    );
-
-    let has_iadd = entry
+        .find(|inst| {
+            matches!(
+                inst.opcode,
+                Opcode::Iconst {
+                    ty: Type::I64,
+                    imm: 8,
+                }
+            )
+        })
+        .and_then(|inst| inst.results.first().copied())
+        .unwrap_or_else(|| {
+            panic!(
+                "GEP stride contract (#475): expected Iconst {{ ty: I64, imm: 8 }} \
+                 (sizeof(I64) stride) but got {opcodes:?}"
+            )
+        });
+    let scaled = entry
         .instructions
         .iter()
-        .any(|inst| matches!(inst.opcode, Opcode::Iadd));
+        .find(|inst| matches!(inst.opcode, Opcode::Imul) && inst.args == [index, stride])
+        .and_then(|inst| inst.results.first().copied())
+        .unwrap_or_else(|| {
+            panic!("GEP stride contract (#475): expected Imul index, stride; got {opcodes:?}")
+        });
+    let address = entry
+        .instructions
+        .iter()
+        .find(|inst| inst.args == [base, scaled])
+        .unwrap_or_else(|| {
+            panic!("GEP stride contract (#475): expected base + scaled_index; got {opcodes:?}")
+        });
+    assert_eq!(
+        address.opcode,
+        Opcode::ArrayGep { elem_ty: Type::I8 },
+        "GEP stride contract (#475): base + scaled_index must be a byte-stride address"
+    );
+    let ret = entry
+        .instructions
+        .last()
+        .expect("the entry block is terminated");
     assert!(
-        has_iadd,
-        "GEP stride contract (#475): expected Iadd for base + scaled_index"
+        matches!(ret.opcode, Opcode::Return) && ret.args == address.results,
+        "the GEP result is the returned address; got {opcodes:?}"
     );
 }
 
@@ -8170,7 +9032,7 @@ fn test_gep_stride_contract_i32_index_extends_before_scaling() {
 // Issue #384 tracks end-to-end validation for the #339 adapter fixes. A real
 // cross-repo tla-check harness (AddTwoTest / DieHardTLA / bcastFolklore_small
 // vs tla-jit) is filed as a separate ty-side tracker so ty owns the
-// driver; see `reports/2026-04-20-384-ewd998-status.md`.
+// driver.
 //
 // The Trust Codegen-side deliverable is a pinning regression that captures the exact
 // nested Record / Sequence aggregate shape a TLA+ spec emits through
@@ -8194,7 +9056,7 @@ fn test_gep_stride_contract_i32_index_extends_before_scaling() {
 // observes between states. If the adapter or ISel ever regresses on any
 // single slot, these tests fail loudly.
 //
-// Substitute specs (per #384 body and `reports/2026-04-18-339-ewd998-plan.md`):
+// Substitute specs (per #384 body):
 //   - Record: 4-field record, like a `DieHard` state `[big |-> i, small |-> j]`
 //   - Sequence: length-header + 3 elements, like a small `Append` step
 //
@@ -8203,6 +9065,13 @@ fn test_gep_stride_contract_i32_index_extends_before_scaling() {
 // ===========================================================================
 
 fn build_record_constant_extract_right() -> TrustIrModule {
+    build_record_constant_extract_right_with(vec![
+        ("left".to_string(), Constant::Int(11)),
+        ("right".to_string(), Constant::Int(22)),
+    ])
+}
+
+fn build_record_constant_extract_right_with(fields: Vec<(String, Constant)>) -> TrustIrModule {
     let record_id = RecordId::new(0);
     let record_ty = Ty::Record(record_id);
     let func_ty = func_ty(vec![], vec![Ty::I64]);
@@ -8223,7 +9092,9 @@ fn build_record_constant_extract_right() -> TrustIrModule {
             },
         ],
     });
-    let func_ty_id = module.add_func_type(func_ty);
+    let func_ty_id = module
+        .add_func_type(func_ty)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(309), "record_constant_extract_right", func_ty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -8231,10 +9102,7 @@ fn build_record_constant_extract_right() -> TrustIrModule {
         body: vec![
             InstrNode::new(Inst::Const {
                 ty: record_ty.clone(),
-                value: Constant::Record(vec![
-                    ("right".to_string(), Constant::Int(22)),
-                    ("left".to_string(), Constant::Int(11)),
-                ]),
+                value: Constant::Record(fields),
             })
             .with_result(v(10)),
             InstrNode::new(Inst::ExtractField {
@@ -8248,20 +9116,30 @@ fn build_record_constant_extract_right() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 #[test]
 fn test_record_slice_keeps_other_trust_ir30_types_fail_closed() {
+    let err = translate_type(&Ty::Closure(ClosureTyId::new(0)))
+        .expect_err("a closure type without its table must fail closed");
+    assert!(
+        err.to_string().contains("not yet lowered"),
+        "unexpected fail-closed diagnostic for a closure: {err}"
+    );
+    // Sequences and boxed sets lower only with their element type resolved
+    // (`trust_cg_lower::sequence_layout`); the table-free helper has none.
     for ty in [
         Ty::Set(TyId::new(0), SetRepr::Boxed),
         Ty::Sequence(TyId::new(0)),
-        Ty::Closure(ClosureTyId::new(0)),
     ] {
-        let err = translate_type(&ty).expect_err("non-record trust_ir#30 type must fail closed");
+        let err = translate_type(&ty).expect_err("a collection without its element must fail");
         assert!(
-            err.to_string().contains("not yet lowered"),
+            err.to_string().contains("[TCG-SEQ]")
+                && err.to_string().contains("not in the module types table"),
             "unexpected fail-closed diagnostic for {ty:?}: {err}"
         );
     }
@@ -8274,8 +9152,18 @@ fn test_record_slice_keeps_other_trust_ir30_types_fail_closed() {
     );
 }
 
+/// A captured closure literal is a `Ty::Closure` value: at any other type
+/// there is no environment layout to materialize it into. TrustIR's typed
+/// admission refuses it on every codegen entry; below that admission the
+/// adapter's own refusal is pinned by its whole text, both for the constant
+/// itself (`translate_closure_const`) and for a closure at an aggregate field
+/// (the field walk's own arm).
 #[test]
-fn test_captured_closure_constant_stays_fail_closed() {
+fn test_captured_closure_constant_at_non_closure_type_stays_fail_closed() {
+    let captured = Constant::Closure {
+        func: f(0),
+        captures: vec![Constant::Int(1)],
+    };
     let module = single_function_module(
         308,
         "captured_closure_const_fail_closed",
@@ -8286,10 +9174,7 @@ fn test_captured_closure_constant_stays_fail_closed() {
             body: vec![
                 InstrNode::new(Inst::Const {
                     ty: Ty::I64,
-                    value: Constant::Closure {
-                        func: f(0),
-                        captures: vec![Constant::Int(1)],
-                    },
+                    value: captured.clone(),
                 })
                 .with_result(v(0)),
                 InstrNode::new(Inst::Return { values: vec![v(0)] }),
@@ -8298,9 +9183,67 @@ fn test_captured_closure_constant_stays_fail_closed() {
         vec![],
     );
     let err = translate_only(&module).expect_err("captured closure constants must fail closed");
-    assert!(
-        err.to_string().contains("aggregate/closure constant"),
-        "unexpected captured closure diagnostic: {err}"
+    assert_typed_const_refusal(
+        &err,
+        "function 'captured_closure_const_fail_closed' bb0",
+        "i64",
+        "closure<func.0>[1]",
+    );
+    assert_eq!(
+        body_refusal_below_admission(&module),
+        "not lowerable: unsupported trust_ir instruction: [TCG-CLOSURE] Constant::Closure with 1 \
+         capture(s) requires Ty::Closure, got I64; only a capture-free closure spelled at \
+         Ty::Func lowers as a bare function symbol"
+    );
+
+    let pair = Ty::Tuple(vec![Ty::I64, Ty::I64]);
+    let field = single_function_module(
+        308,
+        "captured_closure_field_fail_closed",
+        func_ty(vec![], vec![pair.clone()]),
+        vec![TrustIrBlock {
+            id: b(0),
+            params: vec![],
+            body: vec![
+                InstrNode::new(Inst::Const {
+                    ty: pair,
+                    value: Constant::Aggregate(vec![captured, Constant::Int(2)]),
+                })
+                .with_result(v(0)),
+                InstrNode::new(Inst::Return { values: vec![v(0)] }),
+            ],
+        }],
+        vec![],
+    );
+    let err = translate_only(&field).expect_err("a captured closure field must fail closed");
+    assert_typed_const_refusal(
+        &err,
+        "function 'captured_closure_field_fail_closed' bb0[0]",
+        "i64",
+        "closure<func.0>[1]",
+    );
+    assert_eq!(
+        body_refusal_below_admission(&field),
+        "not lowerable: unsupported trust_ir instruction: [TCG-CLOSURE] Constant::Closure with 1 \
+         capture(s) at aggregate field 0 requires a Ty::Closure field, got I64"
+    );
+}
+
+#[test]
+fn test_record_constant_out_of_declaration_order_is_refused() {
+    // A named record constant lists its fields in declaration order; a
+    // permuted spelling is refused by TrustIR's typed admission, not placed by
+    // name.
+    let module = build_record_constant_extract_right_with(vec![
+        ("right".to_string(), Constant::Int(22)),
+        ("left".to_string(), Constant::Int(11)),
+    ]);
+    let err = translate_only(&module).expect_err("a permuted record constant must be refused");
+    assert_typed_const_refusal(
+        &err,
+        "function 'record_constant_extract_right' bb0.left",
+        "field 'left'",
+        "field 'right' at index 0",
     );
 }
 
@@ -8920,8 +9863,12 @@ fn test_tla_sequence_len_plus_head_isel() {
 
 fn build_sequence_constant_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("sequence_constant_i64");
-    let elem_tyid = module.add_type(Ty::I64);
-    let func_ty_id = module.add_func_type(func_ty(vec![], vec![]));
+    let elem_tyid = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
+    let func_ty_id = module
+        .add_func_type(func_ty(vec![], vec![]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(f(312), "sequence_constant_i64", func_ty_id, b(0));
     func.blocks = vec![TrustIrBlock {
@@ -8940,14 +9887,20 @@ fn build_sequence_constant_module() -> TrustIrModule {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn build_sequence_extract_element_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("sequence_extract_element_i64");
-    let elem_tyid = module.add_type(Ty::I64);
-    let func_ty_id = module.add_func_type(func_ty(vec![], vec![Ty::I64]));
+    let elem_tyid = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
+    let func_ty_id = module
+        .add_func_type(func_ty(vec![], vec![Ty::I64]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(f(316), "sequence_extract_element_i64", func_ty_id, b(0));
     func.blocks = vec![TrustIrBlock {
@@ -8979,14 +9932,20 @@ fn build_sequence_extract_element_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn build_sequence_insert_element_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("sequence_insert_element_i64");
-    let elem_tyid = module.add_type(Ty::I64);
-    let func_ty_id = module.add_func_type(func_ty(vec![], vec![]));
+    let elem_tyid = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
+    let func_ty_id = module
+        .add_func_type(func_ty(vec![], vec![]))
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(f(317), "sequence_insert_element_i64", func_ty_id, b(0));
     func.blocks = vec![TrustIrBlock {
@@ -9022,8 +9981,41 @@ fn build_sequence_insert_element_module() -> TrustIrModule {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
     module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
+    module
+}
+
+#[test]
+fn test_empty_sequence_materializes_only_its_length_header() {
+    let mut module = build_sequence_constant_module();
+    let Inst::Const { value, .. } = &mut module.functions[0].blocks[0].body[0].inst else {
+        panic!("fixture must begin with a sequence constant");
+    };
+    *value = Constant::Sequence(vec![]);
+    let (function, _) = translate_only(&module).unwrap();
+    assert_eq!(function.stack_slots.len(), 1);
+    assert_eq!(function.stack_slots[0].size, 8);
+    let instructions = &function.blocks[&function.entry_block].instructions;
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|inst| matches!(inst.opcode, Opcode::Store { .. }))
+            .count(),
+        1
+    );
+    // The header is the whole image: no element address is ever formed.
+    assert!(
+        !instructions
+            .iter()
+            .any(|inst| matches!(inst.opcode, Opcode::ArrayGep { .. } | Opcode::Iadd))
+    );
+    assert!(
+        instructions
+            .iter()
+            .any(|inst| matches!(inst.opcode, Opcode::Iconst { imm: 0, .. }))
+    );
 }
 
 #[test]
@@ -9037,14 +10029,27 @@ fn test_sequence_constant_materializes_length_prefixed_stack_buffer() {
     assert_eq!(lir_func.stack_slots[0].align, 8);
 
     let entry = &lir_func.blocks[&lir_func.entry_block];
+    // `sequence_layout`: element i sits at 8 + 8 * i from the buffer base.
+    for offset in [8, 16, 24] {
+        assert!(
+            entry.instructions.iter().any(|i| matches!(
+                i.opcode,
+                Opcode::Iconst {
+                    ty: Type::I64,
+                    imm
+                } if imm == offset
+            )),
+            "expected the element offset {offset} of the length-prefixed image"
+        );
+    }
     assert_eq!(
         entry
             .instructions
             .iter()
-            .filter(|i| matches!(i.opcode, Opcode::ArrayGep { elem_ty: Type::I64 }))
+            .filter(|i| matches!(i.opcode, Opcode::Iadd))
             .count(),
-        4,
-        "expected one i64 GEP for the length header plus three i64 element GEPs"
+        3,
+        "expected one base+offset address per element"
     );
     assert_eq!(
         entry
@@ -9098,105 +10103,103 @@ fn test_sequence_constant_materializes_x86_64() {
     assert!(has_x86_opcode(&mfunc, X86Opcode::Ret));
 }
 
+/// trust-ir's codegen gate names every element op over a `Ty::Sequence`
+/// `UnlowerableForCodegen` (must-refuse row `sequence_element_op`), and the
+/// refusal does not depend on the operand's provenance: an element of a
+/// constant this backend materialized is refused like one of a parameter.
+fn assert_element_op_unlowerable(module: &TrustIrModule, inst: &str) {
+    let err = translate_only(module).expect_err("a sequence element op must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("[TCG-SEQ]")
+            && message.contains(inst)
+            && message.contains("UnlowerableForCodegen"),
+        "expected the named element-op refusal for {inst}, got {message}"
+    );
+}
+
 #[test]
 fn test_sequence_extract_element_materializes_load_path() {
-    let module = build_sequence_extract_element_module();
-    let (lir_func, _) =
-        translate_only(&module).expect("Sequence ExtractElement over materialized buffer lowers");
-    let entry = &lir_func.blocks[&lir_func.entry_block];
+    assert_element_op_unlowerable(&build_sequence_extract_element_module(), "ExtractElement");
+}
 
-    assert!(
-        entry
-            .instructions
-            .iter()
-            .filter(|i| matches!(i.opcode, Opcode::ArrayGep { elem_ty: Type::I64 }))
-            .count()
-            >= 5,
-        "expected length/element stores plus extraction element address"
-    );
-    assert!(
-        entry.instructions.iter().any(|i| matches!(
-            i.opcode,
-            Opcode::Load {
-                ty: Type::I64,
-                align: None
-            }
-        )),
-        "Sequence ExtractElement must load the selected element"
-    );
+/// The same element op over a sequence PARAMETER: the must-refuse corpus
+/// row's own shape (`refuse/sequence_element_op`).
+fn sequence_parameter_element_op_module(insert: bool) -> TrustIrModule {
+    let mut module = TrustIrModule::new("sequence_parameter_element_op");
+    let elem_tyid = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
+    let seq = Ty::Sequence(elem_tyid);
+    let func_ty_id = module
+        .add_func_type(func_ty(vec![seq.clone()], vec![Ty::I64]))
+        .expect("Module::add_func_type: test fixture");
+    let mut func = TrustIrFunction::new(f(318), "sequence_parameter_element_op", func_ty_id, b(0));
+    let mut body = vec![
+        InstrNode::new(Inst::Const {
+            ty: Ty::U64,
+            value: Constant::Int(0),
+        })
+        .with_result(v(1)),
+    ];
+    if insert {
+        body.push(
+            InstrNode::new(Inst::Const {
+                ty: Ty::I64,
+                value: Constant::Int(7),
+            })
+            .with_result(v(2)),
+        );
+        body.push(
+            InstrNode::new(Inst::InsertElement {
+                ty: seq.clone(),
+                array: v(0),
+                index: v(1),
+                value: v(2),
+            })
+            .with_result(v(3)),
+        );
+        body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
+    } else {
+        body.push(
+            InstrNode::new(Inst::ExtractElement {
+                ty: Ty::I64,
+                array: v(0),
+                index: v(1),
+            })
+            .with_result(v(2)),
+        );
+        body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
+    }
+    func.blocks = vec![TrustIrBlock {
+        id: b(0),
+        params: vec![(v(0), seq)],
+        body,
+    }];
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
+    module
 }
 
 #[test]
 fn test_sequence_extract_element_materializes_aarch64_and_x86_64() {
-    let module = build_sequence_extract_element_module();
-    let aarch64 = compile_trust_ir_function_with_stack_slots(&module);
-    assert!(
-        count_opcode(&aarch64, AArch64Opcode::LdrRI) + count_opcode(&aarch64, AArch64Opcode::LdrRO)
-            >= 1,
-        "AArch64 sequence extraction must emit a load: {:#?}",
-        aarch64.blocks
+    // No target lowers it: the refusal precedes instruction selection, and
+    // the parameter a producer passes is refused like a local constant.
+    assert_element_op_unlowerable(
+        &sequence_parameter_element_op_module(false),
+        "ExtractElement",
     );
-    assert!(has_opcode(&aarch64, AArch64Opcode::Ret));
-
-    let x86_64 = compile_trust_ir_function_x86_64_with_stack_slots(&module);
-    assert!(
-        count_x86_opcode(&x86_64, X86Opcode::MovRM) >= 1,
-        "x86_64 sequence extraction must emit a load: {:#?}",
-        x86_64.blocks
-    );
-    assert!(has_x86_opcode(&x86_64, X86Opcode::Ret));
 }
 
 #[test]
 fn test_sequence_insert_element_materializes_store_path() {
-    let module = build_sequence_insert_element_module();
-    let (lir_func, _) =
-        translate_only(&module).expect("Sequence InsertElement over materialized buffer lowers");
-    let entry = &lir_func.blocks[&lir_func.entry_block];
-
-    assert!(
-        entry
-            .instructions
-            .iter()
-            .filter(|i| matches!(
-                i.opcode,
-                Opcode::Store {
-                    ty: Type::I64,
-                    align: None
-                }
-            ))
-            .count()
-            >= 5,
-        "expected length/element stores plus replacement element store"
-    );
-    assert!(
-        entry
-            .instructions
-            .iter()
-            .any(|i| matches!(i.opcode, Opcode::Copy)),
-        "Sequence InsertElement must return the sequence pointer carrier"
-    );
+    assert_element_op_unlowerable(&build_sequence_insert_element_module(), "InsertElement");
 }
 
 #[test]
 fn test_sequence_insert_element_materializes_aarch64_and_x86_64() {
-    let module = build_sequence_insert_element_module();
-    let aarch64 = compile_trust_ir_function_with_stack_slots(&module);
-    assert!(
-        count_opcode(&aarch64, AArch64Opcode::StrRI) + count_opcode(&aarch64, AArch64Opcode::StrRO)
-            >= 5,
-        "AArch64 sequence insertion must emit stores: {:#?}",
-        aarch64.blocks
-    );
-    assert!(has_opcode(&aarch64, AArch64Opcode::Ret));
-
-    let x86_64 = compile_trust_ir_function_x86_64_with_stack_slots(&module);
-    assert!(
-        count_x86_opcode(&x86_64, X86Opcode::MovMR) >= 5,
-        "x86_64 sequence insertion must emit stores: {:#?}",
-        x86_64.blocks
-    );
-    assert!(has_x86_opcode(&x86_64, X86Opcode::Ret));
+    assert_element_op_unlowerable(&sequence_parameter_element_op_module(true), "InsertElement");
 }
 
 #[test]
@@ -9226,8 +10229,12 @@ fn test_sequence_constant_rejects_missing_or_non_scalar_element_type() {
     );
 
     let mut non_scalar = TrustIrModule::new("sequence_constant_non_scalar_type");
-    let tuple_tyid = non_scalar.add_type(Ty::Tuple(vec![Ty::I64]));
-    let func_ty_id = non_scalar.add_func_type(func_ty(vec![], vec![]));
+    let tuple_tyid = non_scalar
+        .add_type(Ty::Tuple(vec![Ty::I64]))
+        .expect("Module::add_type: test fixture");
+    let func_ty_id = non_scalar
+        .add_func_type(func_ty(vec![], vec![]))
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(
         f(314),
         "sequence_constant_non_scalar_type",
@@ -9246,11 +10253,13 @@ fn test_sequence_constant_rejects_missing_or_non_scalar_element_type() {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    non_scalar.add_function(func);
+    non_scalar
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let err = translate_only(&non_scalar).expect_err("non-scalar Sequence element type must fail");
     assert!(
-        err.to_string().contains("not a fixed scalar element type"),
+        err.to_string().contains("[TCG-SEQ]") && err.to_string().contains("is not admitted"),
         "expected non-scalar element type diagnostic, got {err:?}"
     );
 }
@@ -9276,10 +10285,22 @@ fn test_sequence_constant_rejects_non_sequence_type() {
         vec![],
     );
     let err = translate_only(&module).expect_err("Sequence constant with scalar ty must fail");
-    assert!(
-        err.to_string().contains("requires Ty::Sequence"),
-        "expected type mismatch diagnostic, got {err:?}"
+    assert_typed_const_refusal(
+        &err,
+        "function 'sequence_constant_wrong_type' bb0",
+        "i64",
+        "sequence[1]",
     );
+    // TrustIR's typed admission refuses it on every codegen entry; below that
+    // admission the collection image's own refusal names the type, and the
+    // same constant at its `Ty::Sequence` lowers.
+    assert_eq!(
+        body_refusal_below_admission(&module),
+        "not lowerable: unsupported trust_ir instruction: [TCG-SEQ] Inst::Const: I64 is not a \
+         Ty::Sequence or Ty::Set"
+    );
+    body_below_admission(&build_sequence_constant_module())
+        .expect("a sequence constant at its Ty::Sequence lowers below admission");
 }
 
 fn ty_v4i32() -> Ty {
@@ -9370,15 +10391,15 @@ fn x86_v4i32_mask_shuffle_imm(bits: u8) -> i64 {
 }
 
 fn x86_v4i32_mixed_mask_vector_const(bits: u8) -> Constant {
+    x86_v4i32_mixed_mask_vector_const_spelled(bits, -1)
+}
+
+fn x86_v4i32_mixed_mask_vector_const_spelled(bits: u8, set_lane: i128) -> Constant {
     Constant::Vector(
         (0..4)
             .map(|lane| {
                 if bits & (1_u8 << lane) != 0 {
-                    if bits & 1 == 0 {
-                        Constant::Int(i128::from(u32::MAX))
-                    } else {
-                        Constant::Int(-1)
-                    }
+                    Constant::Int(set_lane)
                 } else {
                     Constant::Int(0)
                 }
@@ -9514,63 +10535,50 @@ fn assert_vector_const_uses_pack_lanes_without_stack(
 
 #[test]
 fn test_v4i32_physical_mask_array_aggregate_and_vector_constants_keep_mask_stack_path() {
-    for (name, mask) in [
-        ("array", chc_lane_mask_array_const()),
-        ("aggregate", chc_lane_mask_aggregate_const()),
-        ("vector", chc_lane_mask_vector_const()),
+    let module = build_x86_v4i32_const_mask_select(
+        9103,
+        "x86_v4i32_vector_const_mask_select",
+        ty_v4i32(),
+        chc_lane_mask_vector_const(),
+    );
+    let err = translate_only(&module).expect_err("physical v4i32 select masks must fail closed");
+    assert!(
+        err.to_string().contains("Select over <4 x i32>")
+            && err.to_string().contains("<4 x bool>")
+            && err.to_string().contains("Vector(I32, 4)"),
+        "unexpected physical mask diagnostic for vector: {err}"
+    );
+    // `Constant::Vector` is the one spelling of a vector constant; the array
+    // and aggregate lists are refused by TrustIR's typed admission first.
+    for (name, mask, shape) in [
+        ("array", chc_lane_mask_array_const(), "array[4]"),
+        ("aggregate", chc_lane_mask_aggregate_const(), "aggregate[4]"),
     ] {
-        let module = build_x86_v4i32_const_mask_select(
-            9103,
-            &format!("x86_v4i32_{name}_const_mask_select"),
-            ty_v4i32(),
-            mask,
-        );
+        let function = format!("x86_v4i32_{name}_const_mask_select");
+        let module = build_x86_v4i32_const_mask_select(9103, &function, ty_v4i32(), mask);
         let err =
             translate_only(&module).expect_err("physical v4i32 select masks must fail closed");
-        assert!(
-            err.to_string().contains("Select over <4 x i32>")
-                && err.to_string().contains("<4 x bool>")
-                && err.to_string().contains("Vector(I32, 4)"),
-            "unexpected physical mask diagnostic for {name}: {err}"
+        assert_typed_const_refusal(
+            &err,
+            &format!("function '{function}' bb0"),
+            "<4 x i32>",
+            shape,
         );
     }
 }
 
 #[test]
 fn test_v4i32_array_aggregate_and_vector_constants_lower_to_pack_lanes_without_stack() {
-    for (name, value) in [
-        (
-            "array",
-            Constant::Array(vec![
-                Constant::Int(7),
-                Constant::Int(-20),
-                Constant::Int(0),
-                Constant::Int(5),
-            ]),
-        ),
-        (
-            "aggregate",
-            Constant::Aggregate(vec![
-                Constant::Int(i32::MIN as i128),
-                Constant::Int(1),
-                Constant::Int(i32::MAX as i128),
-                Constant::Int(42),
-            ]),
-        ),
-        (
-            "vector",
-            Constant::Vector(vec![
-                Constant::Int(-1),
-                Constant::Int(1),
-                Constant::Int(0),
-                Constant::Int(0),
-            ]),
-        ),
-    ] {
+    let lane_sets: [(&str, [i128; 4]); 3] = [
+        ("mixed", [7, -20, 0, 5]),
+        ("extremes", [i32::MIN as i128, 1, i32::MAX as i128, 42]),
+        ("signed", [-1, 1, 0, 0]),
+    ];
+    for (name, lanes) in lane_sets {
         let module = build_x86_v4i32_const_store(
             9215,
             &format!("x86_v4i32_non_mask_{name}_const_store"),
-            value,
+            Constant::Vector(lanes.iter().copied().map(Constant::Int).collect()),
         );
         let (lir_func, _) =
             translate_only(&module).expect("adapter must translate v4i32 non-mask constant");
@@ -9580,6 +10588,23 @@ fn test_v4i32_array_aggregate_and_vector_constants_lower_to_pack_lanes_without_s
             Type::I32,
             Opcode::V4I32PackLanes,
             name,
+        );
+    }
+    // `Constant::Vector` is the one spelling of a vector constant; the array
+    // and aggregate lists of the same lanes are refused by typed admission.
+    let lanes: Vec<_> = lane_sets[0].1.iter().copied().map(Constant::Int).collect();
+    for (name, value, shape) in [
+        ("array", Constant::Array(lanes.clone()), "array[4]"),
+        ("aggregate", Constant::Aggregate(lanes), "aggregate[4]"),
+    ] {
+        let function = format!("x86_v4i32_non_mask_{name}_const_store");
+        let module = build_x86_v4i32_const_store(9215, &function, value);
+        let err = translate_only(&module).expect_err("a list-spelled vector must be refused");
+        assert_typed_const_refusal(
+            &err,
+            &format!("function '{function}' bb0"),
+            "<4 x i32>",
+            shape,
         );
     }
 }
@@ -9722,6 +10747,18 @@ fn test_x86_v4i32_mixed_mask_constants_materialize_with_movd_pshufd() {
             "{bits:04b} must not emit lane-by-lane stack stores"
         );
     }
+
+    // An all-ones i32 lane is spelled -1; its unsigned bit pattern is not a
+    // second spelling and is refused at the first lane that carries it.
+    let bits = 0b0010_u8;
+    let name = format!("x86_v4i32_mixed_mask_{bits:04b}_unsigned_const_store");
+    let module = build_x86_v4i32_const_store(
+        9200,
+        &name,
+        x86_v4i32_mixed_mask_vector_const_spelled(bits, i128::from(u32::MAX)),
+    );
+    let err = translate_only(&module).expect_err("an unsigned i32 lane spelling must be refused");
+    assert_typed_const_refusal(&err, &format!("function '{name}' bb0[1]"), "i32", "int");
 }
 
 #[test]
@@ -10390,6 +11427,8 @@ fn test_x86_v_narrow_i8_i16_cmp_select_lowers_to_v128_bool_select_without_lane_m
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM8), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovMR16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM16), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM8), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquRM), 4, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquMR), 1, "{name}");
     }
@@ -10502,6 +11541,8 @@ fn test_x86_v_narrow_i8_i16_add_sub_lower_to_packed_sse2_without_scalar_lanes() 
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM8), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovMR16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM16), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM8), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquRM), 2, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquMR), 1, "{name}");
     }
@@ -10643,6 +11684,8 @@ fn test_x86_narrow_i8_i16_bitwise_lower_to_packed_sse2_without_scalar_lanes() {
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM8), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovMR16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM16), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM8), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::Pinsrd), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::Pextrd), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::Pinsrq), 0, "{name}");
@@ -11494,6 +12537,8 @@ fn test_x86_v_narrow_i8_i16_eq_ne_cmp_lower_to_pcmpeq_without_lane_memory() {
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM8), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovMR16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM16), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM8), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquRM), 2, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquMR), 1, "{name}");
     }
@@ -11750,6 +12795,8 @@ fn test_x86_v_narrow_i8_i16_signed_cmp_lower_to_pcmpgt_without_lane_memory() {
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM8), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovMR16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRM16), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM8), 0, "{name}");
+        assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovzxRM16), 0, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquRM), 2, "{name}");
         assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquMR), 1, "{name}");
     }
@@ -13504,28 +14551,38 @@ fn build_x86_v2i64_const_store(func_id: u32, name: &str, value: Constant) -> Tru
 
 #[test]
 fn test_x86_v2i64_vector_constant_forms_lower_to_pack_lanes_without_stack() {
-    for (name, value) in [
-        (
-            "array",
-            Constant::Array(vec![Constant::Int(i64::MIN as i128), Constant::Int(42)]),
-        ),
-        (
-            "aggregate",
-            Constant::Aggregate(vec![Constant::Int(17), Constant::Int(i64::MAX as i128)]),
-        ),
-        (
-            "vector",
-            Constant::Vector(vec![Constant::Int(i64::MIN as i128), Constant::Int(42)]),
-        ),
+    for (name, lanes) in [
+        ("min", [i64::MIN as i128, 42]),
+        ("max", [17, i64::MAX as i128]),
     ] {
-        let module =
-            build_x86_v2i64_const_store(9113, &format!("x86_v2i64_{name}_const_store"), value);
+        let module = build_x86_v2i64_const_store(
+            9113,
+            &format!("x86_v2i64_{name}_const_store"),
+            Constant::Vector(lanes.iter().copied().map(Constant::Int).collect()),
+        );
         let (lir_func, _) = translate_only(&module).expect("adapter must translate v2i64 constant");
         assert_vector_const_uses_pack_lanes_without_stack(
             &lir_func,
             Type::I64,
             Opcode::V2I64PackLanes,
             name,
+        );
+    }
+    // `Constant::Vector` is the one spelling of a vector constant; the array
+    // and aggregate lists are refused by TrustIR's typed admission.
+    let lanes = vec![Constant::Int(i64::MIN as i128), Constant::Int(42)];
+    for (name, value, shape) in [
+        ("array", Constant::Array(lanes.clone()), "array[2]"),
+        ("aggregate", Constant::Aggregate(lanes), "aggregate[2]"),
+    ] {
+        let function = format!("x86_v2i64_{name}_const_store");
+        let module = build_x86_v2i64_const_store(9113, &function, value);
+        let err = translate_only(&module).expect_err("a list-spelled vector must be refused");
+        assert_typed_const_refusal(
+            &err,
+            &format!("function '{function}' bb0"),
+            "<2 x i64>",
+            shape,
         );
     }
 
@@ -13889,10 +14946,13 @@ fn test_x86_v4i32_vector_constant_mask_select_lowers_to_sse2() {
 }
 
 #[test]
-fn test_x86_v4i32_array_constant_mask_select_lowers_to_sse2() {
+fn test_x86_v4i32_array_spelled_mask_constant_is_refused_by_typed_admission() {
+    // The `<4 x bool>` mask's one spelling is `Constant::Vector` (lowered to
+    // SSE2 by the test above); the array list of the same lanes is refused.
+    let function = "x86_chc_lane_packed_v4i32_array_const_mask_select";
     let module = build_x86_v4i32_const_mask_select(
         9104,
-        "x86_chc_lane_packed_v4i32_array_const_mask_select",
+        function,
         ty_v4_bool(),
         Constant::Array(vec![
             Constant::Bool(true),
@@ -13901,20 +14961,13 @@ fn test_x86_v4i32_array_constant_mask_select_lowers_to_sse2() {
             Constant::Bool(false),
         ]),
     );
-    let mfunc = compile_trust_ir_function_x86_64(&module);
-
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovMR32), 0);
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdquRM), 2);
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovRI), 1);
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::MovdToXmm), 1);
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::Pshufd), 1);
-    assert_eq!(
-        x86_opcode_imms(&mfunc, X86Opcode::Pshufd),
-        vec![x86_v4i32_mask_shuffle_imm(0b0101)]
+    let err = translate_only(&module).expect_err("a list-spelled mask must be refused");
+    assert_typed_const_refusal(
+        &err,
+        &format!("function '{function}' bb0"),
+        "<4 x bool>",
+        "array[4]",
     );
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::Pand), 1);
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::Pandn), 1);
-    assert_eq!(count_x86_opcode(&mfunc, X86Opcode::Por), 1);
 }
 
 #[test]
@@ -13953,4 +15006,28 @@ fn test_v4i32_vector_constant_in_tuple_field_translates_as_v128_store() {
         )),
         "tuple field must receive a V128 store for the vector constant"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

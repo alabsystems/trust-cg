@@ -4,7 +4,7 @@
 // records generated parent indexes and fingerprints, and calls an indirect
 // runtime callback from each enabled action.
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 #[path = "common/fixture_contract.rs"]
 mod fixture_contract;
@@ -12,6 +12,7 @@ use fixture_contract::FixtureContractLookup;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use trust_cg_codegen::compile_service::{ArtifactInstallDisposition, ArtifactManifestReference};
 use trust_cg_codegen::jit_contract::{
@@ -33,9 +34,9 @@ use trust_cg_codegen::jit_install_gate::{
 use trust_cg_codegen::pipeline::OptLevel;
 use trust_cg_codegen::ty_reducer_evidence::TyReducerEvidenceCoverageSummary;
 use trust_cg_codegen::{
-    CompileGeneration, CompileProfile, CompileRequest, CompileService, CompileStatus, Compiler,
-    CompilerConfig, DispatchVerifyMode, ExecutableBuffer, InstallIntent, InstalledArtifact,
-    JitConfig, NATIVE_INSTALL_GATE_REPLAY_SCHEMA, NATIVE_INSTALL_GATE_REPLAY_SCHEMA_VERSION,
+    CompileGeneration, CompileProfile, CompileRequest, CompileStatus, Compiler, CompilerConfig,
+    DispatchVerifyMode, ExecutableBuffer, InstallIntent, InstalledArtifact, JitConfig,
+    NATIVE_INSTALL_GATE_REPLAY_SCHEMA, NATIVE_INSTALL_GATE_REPLAY_SCHEMA_VERSION,
     NATIVE_INSTALL_GATE_TELEMETRY_SCHEMA, NATIVE_INSTALL_GATE_TELEMETRY_SCHEMA_VERSION,
     NativeInstallGateAuthority, NativeInstallGateConsumerAdmissionEvidence,
     NativeInstallGateDisposition, NativeInstallGateExpectedBindings, NativeInstallGateInput,
@@ -43,7 +44,7 @@ use trust_cg_codegen::{
     NativeInstallGateProofEvidence, NativeInstallGateRejectionCode,
     NativeInstallGateReplayIdentity, NativeInstallGateRevalidationInput, NativeInstallGateSurface,
     NativeInstallGateTelemetryInput, ProfileHookMode, ProofOptimizationCertificateCitation,
-    ProofOptimizationConsumedFactCitation, SourceKind, Target, TyReducerEvidencePacket,
+    ProofOptimizationConsumedFactCitation, SourceKind, TyReducerEvidencePacket,
     TyReducerEvidenceRow, TyReducerEvidenceStatus, native_install_gate_consumer_admission,
     native_install_gate_consumer_allowlist_key, validate_native_install_gate,
 };
@@ -113,8 +114,8 @@ fn native_fused_reducer_evidence_summary() -> TyReducerEvidenceCoverageSummary {
 
 fn native_fused_reducer_evidence_row(reducer_family: &str) -> TyReducerEvidenceRow {
     TyReducerEvidenceRow {
-        command: format!("cargo test -p trust-cg-codegen --test {reducer_family}"),
-        target_tuple: "aarch64-apple-darwin".to_owned(),
+        command: format!("scripts/trust_cargo.sh test -p trust-cg-codegen --test {reducer_family}"),
+        target_tuple: ty_contract::host_target_triple(),
         trust_cg_revision: "trust-cg-test-revision".to_owned(),
         opt_level: "O1/O3".to_owned(),
         reducer_family: reducer_family.to_owned(),
@@ -160,6 +161,13 @@ const TURN1_MASK: u64 = 0x04;
 const PC0_WAITING_MASK: u64 = 0x08;
 const PC1_WAITING_MASK: u64 = 0x10;
 
+// The JIT entry receives a bare `extern "C"` callback, so the host callback
+// records into process-wide statics. libtest runs this binary's tests
+// concurrently: every test that resets, reads, or drives these observations
+// must hold a `CallbackObservations` (which owns `CALLBACK_OBSERVATION_LOCK`)
+// for its whole body, or one test's native callbacks are counted against
+// another test's "blocked before any runtime callback" assertion.
+static CALLBACK_OBSERVATION_LOCK: Mutex<()> = Mutex::new(());
 static CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CALLBACK_LAST_PARENT: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_LAST_IDX: AtomicU64 = AtomicU64::new(0);
@@ -253,45 +261,7 @@ extern "C" fn host_mcl_runtime_callback(
     CALLBACK_LAST_STATE.store(state, Ordering::SeqCst);
 
     unsafe {
-        core::arch::asm!(
-            "mov x0, #1",
-            "mov x1, #2",
-            "mov x2, #3",
-            "mov x3, #4",
-            "mov x4, #5",
-            "mov x5, #6",
-            "mov x6, #7",
-            "mov x7, #8",
-            "mov x8, #9",
-            "mov x9, #10",
-            "mov x10, #11",
-            "mov x11, #12",
-            "mov x12, #13",
-            "mov x13, #14",
-            "mov x14, #15",
-            "mov x15, #16",
-            "mov x16, #17",
-            "mov x17, #18",
-            out("x0") _,
-            out("x1") _,
-            out("x2") _,
-            out("x3") _,
-            out("x4") _,
-            out("x5") _,
-            out("x6") _,
-            out("x7") _,
-            out("x8") _,
-            out("x9") _,
-            out("x10") _,
-            out("x11") _,
-            out("x12") _,
-            out("x13") _,
-            out("x14") _,
-            out("x15") _,
-            out("x16") _,
-            out("x17") _,
-            options(nostack)
-        );
+        ty_contract::clobber_call_volatile_gprs();
 
         if !runtime_slot.is_null() {
             *runtime_slot = runtime_value;
@@ -746,13 +716,14 @@ fn build_mcl_fused_parent_loop_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_to_jit(module: &trust_ir::Module, opt_level: OptLevel) -> ExecutableBuffer {
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     config.opt_level = opt_level;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|err| panic!("{opt_level:?} compile failed: {err}"))
         .buffer
@@ -908,17 +879,60 @@ fn reference_run(parents: &[u64], states: &[u64]) -> MclRun {
     }
 }
 
-fn reset_callback_observations() {
-    CALLBACK_CALLS.store(0, Ordering::SeqCst);
-    CALLBACK_LAST_PARENT.store(u64::MAX, Ordering::SeqCst);
-    CALLBACK_LAST_IDX.store(u64::MAX, Ordering::SeqCst);
-    CALLBACK_LAST_ACTION.store(u32::MAX, Ordering::SeqCst);
-    CALLBACK_LAST_STATE.store(u64::MAX, Ordering::SeqCst);
+/// Exclusive access to the process-wide host-callback observations.
+///
+/// While a value is alive no other test in this binary can reset them or run
+/// the host callback, so `calls()` counts every callback made in the process
+/// since the last `reset()`.
+struct CallbackObservations {
+    _serial: MutexGuard<'static, ()>,
 }
 
-fn run_at(opt_level: OptLevel, parents: &[u64], states: &[u64]) -> MclRun {
+impl CallbackObservations {
+    /// Blocks until no other test owns the observations, then resets them.
+    /// A poisoned lock (a test panicked while holding it) is taken anyway:
+    /// the reset discards whatever that test left behind, so one failure does
+    /// not cascade into every later test.
+    fn acquire() -> Self {
+        let observations = Self {
+            _serial: CALLBACK_OBSERVATION_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        };
+        observations.reset();
+        observations
+    }
+
+    fn reset(&self) {
+        CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        CALLBACK_LAST_PARENT.store(u64::MAX, Ordering::SeqCst);
+        CALLBACK_LAST_IDX.store(u64::MAX, Ordering::SeqCst);
+        CALLBACK_LAST_ACTION.store(u32::MAX, Ordering::SeqCst);
+        CALLBACK_LAST_STATE.store(u64::MAX, Ordering::SeqCst);
+    }
+
+    fn calls(&self) -> usize {
+        CALLBACK_CALLS.load(Ordering::SeqCst)
+    }
+
+    fn last_callback(&self) -> Option<CallbackObservation> {
+        (self.calls() != 0).then(|| CallbackObservation {
+            parent: CALLBACK_LAST_PARENT.load(Ordering::SeqCst),
+            idx: CALLBACK_LAST_IDX.load(Ordering::SeqCst),
+            action: CALLBACK_LAST_ACTION.load(Ordering::SeqCst),
+            state: CALLBACK_LAST_STATE.load(Ordering::SeqCst),
+        })
+    }
+}
+
+fn run_at(
+    callbacks: &CallbackObservations,
+    opt_level: OptLevel,
+    parents: &[u64],
+    states: &[u64],
+) -> MclRun {
     assert_eq!(parents.len(), states.len());
-    reset_callback_observations();
+    callbacks.reset();
 
     let module = build_mcl_fused_parent_loop_module();
     let buffer = compile_to_jit(&module, opt_level);
@@ -953,13 +967,8 @@ fn run_at(opt_level: OptLevel, parents: &[u64], states: &[u64]) -> MclRun {
     fingerprints.truncate(generated);
     runtime_values.truncate(generated);
 
-    let calls = CALLBACK_CALLS.load(Ordering::SeqCst);
-    let last_callback = (calls != 0).then(|| CallbackObservation {
-        parent: CALLBACK_LAST_PARENT.load(Ordering::SeqCst),
-        idx: CALLBACK_LAST_IDX.load(Ordering::SeqCst),
-        action: CALLBACK_LAST_ACTION.load(Ordering::SeqCst),
-        state: CALLBACK_LAST_STATE.load(Ordering::SeqCst),
-    });
+    let calls = callbacks.calls();
+    let last_callback = callbacks.last_callback();
 
     MclRun {
         summary,
@@ -1005,7 +1014,7 @@ impl BlockedActivation {
 }
 
 fn compile_service_profile(opt_level: OptLevel) -> CompileProfile {
-    let mut compiler = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut compiler = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     compiler.opt_level = opt_level;
     CompileProfile::Custom {
         compiler,
@@ -1016,6 +1025,8 @@ fn compile_service_profile(opt_level: OptLevel) -> CompileProfile {
             profile_hooks: ProfileHookMode::None,
             emit_entry_counters: false,
             cache_certificates: false,
+            external_symbol_resolution:
+                trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         },
     }
 }
@@ -1044,7 +1055,7 @@ fn observe_ty_kernel_payload(opt_level: OptLevel) -> ObservedTyKernelPayload {
     request.install_intent = InstallIntent::CompileOnly;
     request.provenance.source_kind = SourceKind::TrustIrModule;
 
-    let response = CompileService::default().compile(request, &module);
+    let response = permit_compile_service().compile(request, &module);
     assert_eq!(
         response.status,
         CompileStatus::Compiled,
@@ -1123,7 +1134,7 @@ fn compile_service_ty_manifest(
         name: "executable_text".to_owned(),
         kind: ArtifactSectionKind::Text,
         size_bytes: observed.code_size_bytes,
-        alignment_bytes: Target::Aarch64.stack_alignment(),
+        alignment_bytes: ty_contract::host_jit_target().stack_alignment(),
         checksum: None,
     });
     manifest.metadata.insert(
@@ -1208,7 +1219,7 @@ fn compile_ty_kernel_to_installed_artifact(
         live_identity.trust_ir_sha256.clone(),
     );
 
-    let response = CompileService::default().compile(request, &module);
+    let response = permit_compile_service().compile(request, &module);
     assert_eq!(
         response.status,
         CompileStatus::Compiled,
@@ -1252,6 +1263,7 @@ fn compile_ty_kernel_to_installed_artifact(
 
 #[allow(clippy::result_large_err)] // Failure carries the complete blocked-activation evidence.
 fn run_installed_activation(
+    callbacks: &CallbackObservations,
     installed: &InstalledArtifact,
     manifest: &ArtifactManifestV1,
     evidence: ProofEvidenceSummary,
@@ -1260,6 +1272,7 @@ fn run_installed_activation(
     states: &[u64],
 ) -> Result<MclRun, BlockedActivation> {
     run_installed_activation_with_admission(
+        callbacks,
         installed,
         manifest,
         evidence,
@@ -1286,7 +1299,9 @@ fn accepted_ty_activation_admission_evidence(
 }
 
 #[allow(clippy::result_large_err)] // Failure carries the complete blocked-activation evidence.
+#[allow(clippy::too_many_arguments)] // Fixture fields mirror the case table's columns.
 fn run_installed_activation_with_admission<F>(
+    callbacks: &CallbackObservations,
     installed: &InstalledArtifact,
     manifest: &ArtifactManifestV1,
     evidence: ProofEvidenceSummary,
@@ -1302,7 +1317,7 @@ where
     ) -> NativeInstallGateConsumerAdmissionEvidence,
 {
     assert_eq!(parents.len(), states.len());
-    reset_callback_observations();
+    callbacks.reset();
 
     let max_generated = parents.len().saturating_mul(2);
     let mut parent_indexes = vec![u64::MAX; max_generated];
@@ -1322,7 +1337,7 @@ where
             fingerprints,
             runtime_values,
             summary,
-            calls: CALLBACK_CALLS.load(Ordering::SeqCst),
+            calls: callbacks.calls(),
         });
     }
 
@@ -1345,7 +1360,7 @@ where
             fingerprints,
             runtime_values,
             summary,
-            calls: CALLBACK_CALLS.load(Ordering::SeqCst),
+            calls: callbacks.calls(),
         });
     }
 
@@ -1372,7 +1387,7 @@ where
             fingerprints,
             runtime_values,
             summary,
-            calls: CALLBACK_CALLS.load(Ordering::SeqCst),
+            calls: callbacks.calls(),
         });
     }
 
@@ -1411,13 +1426,8 @@ where
     fingerprints.truncate(generated);
     runtime_values.truncate(generated);
 
-    let calls = CALLBACK_CALLS.load(Ordering::SeqCst);
-    let last_callback = (calls != 0).then(|| CallbackObservation {
-        parent: CALLBACK_LAST_PARENT.load(Ordering::SeqCst),
-        idx: CALLBACK_LAST_IDX.load(Ordering::SeqCst),
-        action: CALLBACK_LAST_ACTION.load(Ordering::SeqCst),
-        state: CALLBACK_LAST_STATE.load(Ordering::SeqCst),
-    });
+    let calls = callbacks.calls();
+    let last_callback = callbacks.last_callback();
 
     Ok(MclRun {
         summary,
@@ -1592,7 +1602,7 @@ fn set_native_fused_proof_metadata(input: &mut NativeInstallGateInput, key: &str
 
 #[test]
 fn ty_mcl_fused_parent_loop_proof_required_manifest_fails_closed_without_certificates() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
 
     let module = build_mcl_fused_parent_loop_module();
     let buffer = compile_to_jit(&module, OptLevel::O3);
@@ -1625,7 +1635,7 @@ fn ty_mcl_fused_parent_loop_proof_required_manifest_fails_closed_without_certifi
         }
         other => panic!("expected missing proof evidence rejection, got {other:?}"),
     }
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 
     let rejected = ProofEvidenceSummary::rejected(
         "trust-cg-verify",
@@ -1658,12 +1668,12 @@ fn ty_mcl_fused_parent_loop_proof_required_manifest_fails_closed_without_certifi
         }
         other => panic!("expected rejected proof evidence, got {other:?}"),
     }
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_native_fused_manifest_binds_proof_consumption_contract() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
     assert_ty_native_fused_required_proof_fact_bridge();
 
     let module = build_mcl_fused_parent_loop_module();
@@ -1925,12 +1935,12 @@ fn ty_mcl_native_fused_manifest_binds_proof_consumption_contract() {
             .map(|telemetry| telemetry.useful_native_delta),
         Some(0)
     );
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_native_fused_non_promoting_product_packet_binds_proof_opt_citation() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
 
     let module = build_mcl_fused_parent_loop_module();
     let buffer = compile_to_jit(&module, OptLevel::O3);
@@ -2413,12 +2423,12 @@ fn ty_mcl_native_fused_non_promoting_product_packet_binds_proof_opt_citation() {
         NativeInstallGateProductPromotionRejectionReason::GateNotTyNativeFusedActivation
     );
 
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_native_fused_proof_refs_must_match_gate_inputs() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
 
     let module = build_mcl_fused_parent_loop_module();
     let buffer = compile_to_jit(&module, OptLevel::O3);
@@ -2487,12 +2497,12 @@ fn ty_mcl_native_fused_proof_refs_must_match_gate_inputs() {
         assert!(packet.actions.all_install_authority_blocked(), "{name}");
     }
 
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_native_fused_stale_same_kernel_certificate_identity_rejects() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
 
     let module = build_mcl_fused_parent_loop_module();
     let buffer = compile_to_jit(&module, OptLevel::O3);
@@ -2523,12 +2533,12 @@ fn ty_mcl_native_fused_stale_same_kernel_certificate_identity_rejects() {
         Some(NativeInstallGateRejectionCode::EvidenceBindingMismatch)
     );
     assert!(packet.actions.all_install_authority_blocked());
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_native_fused_stale_manifest_and_proof_same_kernel_certificate_identity_rejects() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
 
     let module = build_mcl_fused_parent_loop_module();
     let buffer = compile_to_jit(&module, OptLevel::O3);
@@ -2562,12 +2572,12 @@ fn ty_mcl_native_fused_stale_manifest_and_proof_same_kernel_certificate_identity
         Some(NativeInstallGateRejectionCode::EvidenceBindingMismatch)
     );
     assert!(packet.actions.all_install_authority_blocked());
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_native_fused_manifest_completeness_is_gate_enforced() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
 
     let module = build_mcl_fused_parent_loop_module();
     let buffer = compile_to_jit(&module, OptLevel::O3);
@@ -2682,12 +2692,12 @@ fn ty_mcl_native_fused_manifest_completeness_is_gate_enforced() {
         assert!(packet.actions.all_install_authority_blocked(), "{name}");
     }
 
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_native_fused_missing_required_facts_are_non_promoting() {
-    reset_callback_observations();
+    let callbacks = CallbackObservations::acquire();
     assert_ty_native_fused_required_proof_fact_bridge();
 
     let module = build_mcl_fused_parent_loop_module();
@@ -2846,11 +2856,12 @@ fn ty_mcl_native_fused_missing_required_facts_are_non_promoting() {
         );
     }
 
-    assert_eq!(CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    assert_eq!(callbacks.calls(), 0);
 }
 
 #[test]
 fn ty_mcl_compile_service_installed_artifact_activation_gates_native_call() {
+    let callbacks = CallbackObservations::acquire();
     let parents = vec![0x31, 0x32, 0x55];
     let states = vec![
         PC0_WAITING_MASK,
@@ -2866,6 +2877,7 @@ fn ty_mcl_compile_service_installed_artifact_activation_gates_native_call() {
     let product_evidence = ty_native_fused_verified_evidence(&product_manifest, &refs);
 
     let activated = run_installed_activation(
+        &callbacks,
         &installed,
         &compile_manifest,
         compile_evidence.clone(),
@@ -2882,6 +2894,7 @@ fn ty_mcl_compile_service_installed_artifact_activation_gates_native_call() {
     assert_eq!(activated, expected);
 
     let rollback_not_ready = run_installed_activation_with_admission(
+        &callbacks,
         &installed,
         &compile_manifest,
         compile_evidence.clone(),
@@ -2923,6 +2936,7 @@ fn ty_mcl_compile_service_installed_artifact_activation_gates_native_call() {
     );
     let other_product_evidence = ty_native_fused_verified_evidence(&other_product_manifest, &refs);
     let mismatched_payload = run_installed_activation(
+        &callbacks,
         &installed,
         &compile_manifest,
         compile_evidence.clone(),
@@ -2986,6 +3000,7 @@ fn ty_mcl_compile_service_installed_artifact_activation_gates_native_call() {
         ),
     ] {
         let blocked = run_installed_activation(
+            &callbacks,
             &installed,
             &compile_manifest,
             compile_evidence.clone(),
@@ -3001,6 +3016,7 @@ fn ty_mcl_compile_service_installed_artifact_activation_gates_native_call() {
 
 #[test]
 fn ty_mcl_fused_parent_loop_o1_o3_match_reference() {
+    let callbacks = CallbackObservations::acquire();
     let cases = [
         ("empty", vec![], vec![]),
         (
@@ -3018,8 +3034,8 @@ fn ty_mcl_fused_parent_loop_o1_o3_match_reference() {
 
     for (name, parents, states) in cases {
         let expected = reference_run(&parents, &states);
-        let o1 = run_at(OptLevel::O1, &parents, &states);
-        let o3 = run_at(OptLevel::O3, &parents, &states);
+        let o1 = run_at(&callbacks, OptLevel::O1, &parents, &states);
+        let o3 = run_at(&callbacks, OptLevel::O3, &parents, &states);
 
         assert_eq!(o1, expected, "O1 diverged for {name}");
         assert_eq!(o3, expected, "O3 diverged for {name}");
@@ -3028,4 +3044,25 @@ fn ty_mcl_fused_parent_loop_o1_o3_match_reference() {
             "O3 should match O1 for state count, generated count, parent indexes, fingerprints, callback results, and status in {name}"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// This file's fixtures carry no codegen license (`body_gate: None`), which
+/// the compile service REFUSES by default (roadmap WS7.5, decision gate
+/// DG-73). Its services state `Permit` explicitly, so no request passes
+/// because it was silently refused.
+fn permit_compile_service() -> trust_cg_codegen::CompileService {
+    trust_cg_codegen::CompileService::new(trust_cg_codegen::CompileServiceConfig {
+        codegen_license: trust_cg_codegen::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit),
+        ..trust_cg_codegen::CompileServiceConfig::default()
+    })
 }

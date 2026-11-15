@@ -43,11 +43,14 @@ const SYM: &str = "__c";
 /// `fn _c(a:f64,b:f64)->i32 { (a <op> b) as i32 }`
 fn build_fcmp(op: FCmpOp) -> M {
     let mut m = M::new("fcmp");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), FN, ft, BlockId::new(0));
     f.blocks = vec![B {
         id: BlockId::new(0),
@@ -82,7 +85,8 @@ fn build_fcmp(op: FCmpOp) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -114,7 +118,8 @@ fn compile(m: &M, opt: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     c.compile(m).expect("compile").object_code
 }
 
@@ -258,4 +263,13 @@ fn teeth_ordered_ne_on_nan_bug_and_fix() {
         key_lt,
         "the fixed lowering is still correct off NaN (1)"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

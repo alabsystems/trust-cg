@@ -36,6 +36,9 @@ pub const EV_CURRENT: u8 = 1;
 /// OS/ABI: UNIX System V.
 pub const ELFOSABI_NONE: u8 = 0;
 
+/// GNU/Linux OS ABI; required for a linker to honor `SHF_GNU_RETAIN`.
+pub const ELFOSABI_GNU: u8 = 3;
+
 /// Size of e_ident array in ELF header.
 pub const EI_NIDENT: usize = 16;
 
@@ -95,6 +98,18 @@ pub const SHT_RELA: u32 = 4;
 /// Uninitialized data (BSS).
 pub const SHT_NOBITS: u32 = 8;
 
+/// Array of pointers to initialization functions (`.init_array`), run by the
+/// dynamic loader or the static startup code before `main`, in order.
+pub const SHT_INIT_ARRAY: u32 = 14;
+
+/// Array of pointers to termination functions (`.fini_array`), run after
+/// `main` returns or `exit` is called, in reverse order.
+pub const SHT_FINI_ARRAY: u32 = 15;
+
+/// Array of pointers to pre-initialization functions (`.preinit_array`), run
+/// before every `.init_array` entry; valid only in executables.
+pub const SHT_PREINIT_ARRAY: u32 = 16;
+
 // --- Section flags ---
 
 /// Section is writable at runtime.
@@ -112,6 +127,19 @@ pub const SHF_INFO_LINK: u64 = 0x40;
 /// Section holds thread-local storage (`.tdata` / `.tbss`); each thread gets
 /// its own instance at run time.
 pub const SHF_TLS: u64 = 0x400;
+
+/// GNU extension: the section must survive linker garbage collection even
+/// when nothing references it (`#[used]` / trust-ir v41 `Global.retained`).
+/// Linkers honor it only when `e_ident[EI_OSABI]` is `ELFOSABI_GNU` (or
+/// FreeBSD), so a writer that sets it must also stamp the OSABI — exactly as
+/// LLVM's ELF writer does.
+pub const SHF_GNU_RETAIN: u64 = 0x200000;
+
+/// The section is excluded from the link output (`SHF_EXCLUDE`, in the
+/// processor-specific range but given this meaning by the GNU and LLVM
+/// toolchains on every ELF target): GCC's LTO sections and LLVM's
+/// `.llvm_addrsig` carry it. It needs no other header field.
+pub const SHF_EXCLUDE: u64 = 0x8000_0000;
 
 // --- Symbol binding (upper 4 bits of st_info) ---
 
@@ -152,6 +180,10 @@ pub const STV_DEFAULT: u8 = 0;
 
 /// Hidden visibility — not visible to other components.
 pub const STV_HIDDEN: u8 = 2;
+
+/// Protected visibility — visible to other components, but never preempted
+/// by a definition outside the defining component.
+pub const STV_PROTECTED: u8 = 3;
 
 // --- AArch64 ELF relocation types ---
 // Reference: ARM IHI 0056B, "ELF for the Arm 64-bit Architecture"
@@ -216,6 +248,18 @@ pub const R_AARCH64_TLSLE_ADD_TPREL_LO12: u32 = 0x226;
 
 /// TPREL(S + A) bits [11:0] (ADD instruction, unchecked 12-bit immediate).
 pub const R_AARCH64_TLSLE_ADD_TPREL_LO12_NC: u32 = 0x227;
+
+/// Page(G(GTLSDESC(S+A))) - Page(P) — ADRP to the TLS descriptor's GOT page.
+pub const R_AARCH64_TLSDESC_ADR_PAGE21: u32 = 0x232;
+
+/// G(GTLSDESC(S+A)) & 0xFF8 — LDR of the descriptor's resolver word.
+pub const R_AARCH64_TLSDESC_LD64_LO12: u32 = 0x233;
+
+/// G(GTLSDESC(S+A)) & 0xFFF — ADD forming the descriptor address.
+pub const R_AARCH64_TLSDESC_ADD_LO12: u32 = 0x234;
+
+/// No value: marks the `BLR` of a TLS descriptor call for linker relaxation.
+pub const R_AARCH64_TLSDESC_CALL: u32 = 0x239;
 
 // --- x86-64 ELF relocation types ---
 // Reference: System V AMD64 ABI, "Relocation Types"

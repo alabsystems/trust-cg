@@ -1,0 +1,13 @@
+driver: Trust compiler 321aaeda75478038420d97830f14724c33c8dc39 (rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)) at $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc; lane: diagnostic: explicit unverified Trust lane (-Ztrust-verify=off for direct compiles, targo --unverified for builds); no Trust-verified compilation claim
+target: aarch64-apple-darwin (driver host)
+host: Apple M4 Max (sysctl machdep.cpu.brand_string); machine Mac16,5; 64 CPU features, sha256 8109e26100af753c
+cpu policy: -C target-cpu default, -C target-feature default; lane parity True (flags differ only by ['-Zcodegen-backend=$HOME/trust-cg-w19/perf-requalification-L14-P1/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib']; the tcg lane also passes -Ztrust-ir-cg-args=no-proof-certs)
+affinity: none; heterogeneous cores True (sysctl hw.nperflevels 2)
+peak RSS: getrusage(RUSAGE_CHILDREN).ru_maxrss read by a single-child Python wrapper (benchmarks/beat-llvm/peak_rss.py) after the child is reaped, normalised to bytes; the largest single process in the measured tree, not a sum; ru_maxrss unit bytes; sampler floor 1261568 B; /usr/bin/time agreement True (relative difference 0.0002)
+compile wall = min-of-5, -O3, aarch64-apple-darwin, peak RSS = min-of-3
+
+   crate   lines      llvm   trust-cg    time   llvm RSS    tcg RSS     mem
+   small     355    0.332s     0.353s   1.06x     137.3M     167.4M   1.22x
+  medium    2805    0.444s     0.495s   1.11x     147.2M     179.8M   1.22x
+   large   11205    0.825s     0.972s   1.18x     200.2M     248.6M   1.24x
+  xlarge   33605    1.868s     2.128s   1.14x     370.9M     456.4M   1.23x

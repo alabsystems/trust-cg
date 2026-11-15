@@ -1,0 +1,16 @@
+; TrustIr text format v1
+module "debug_metadata_v33"
+file 0 "src/debug.rs"
+
+functy.0 = (i32) -> (i32)
+
+fn @named_increment(functy.0) {
+    ; #producer: trust
+    ; #names: %0="input", %2="incremented, value"
+    ; #scope: 0 root at 0 1 0
+    ; #scope: 1 parent=0 at 0 2 4
+bb0(%0: i32):
+    %1 = const i32 1  ; #loc: 0 2 8  ; #scope: 1
+    %2 = add i32 %0, %1  ; #loc: 0 2 4  ; #scope: 1
+    ret %2  ; #loc: 0 3 0  ; #scope: 0
+}

@@ -4,7 +4,7 @@
 # Copyright 2026 Andrew Yates | License: Apache-2.0
 #
 # Part of #448 (#387 follow-up) — corpus-based panic-fuzz targets for the
-# five properties already covered by the proptest harnesses:
+# six properties already covered by the proptest harnesses:
 #   - fuzz_encode_instruction.rs  (panic_fuzz_encode)
 #   - fuzz_translate_function.rs  (panic_fuzz_lower)
 #   - fuzz_compile_function.rs    (panic_fuzz_compile)
@@ -16,12 +16,20 @@
 # it as a standalone package so the libFuzzer runtime link flags do not
 # contaminate normal `cargo build` / `cargo test` invocations elsewhere.
 #
-# Run (requires `cargo install cargo-fuzz`):
+# Run (STOCK EXCEPTION: Trust ships no cargo-fuzz, AddressSanitizer runtime or
+# rust-lld; measured `trustc -Zsanitizer=address` -> "ld: library
+# 'rustc-trust_rt.asan' not found". Requires a stock toolchain with
+# `cargo install cargo-fuzz`):
 #   cargo fuzz list --fuzz-dir fuzz
 #   cargo fuzz run fuzz_encode_instruction --fuzz-dir fuzz -- -max_total_time=60
 #
-# Compile-check used by the publication gate:
-#   cargo check --manifest-path fuzz/Cargo.toml
+# Compile-check used by the publication gate (the Trust toolchain):
+#   targo --unverified check --locked --manifest-path fuzz/Cargo.toml
+#
+# Linux AArch64 campaign lane (fixed seed and budget, retained JSON, and
+# planted panic, leak and AddressSanitizer negative controls built with
+# `--features negative-control`):
+#   python3 -B scripts/run_linux_fuzz_lane.py --out <new dir outside the tree>
 
 [package]
 name = "trust-cg-cargo-fuzz"
@@ -35,6 +43,14 @@ homepage = "https://github.com/alabsystems/trust-cg"
 
 [package.metadata]
 cargo-fuzz = true
+
+[features]
+# Negative controls for scripts/run_linux_fuzz_lane.py: with this feature,
+# fuzz_encode_instruction panics, leaks a heap allocation or reads past one on
+# an input that starts with the matching planted marker, so the lane must
+# report that run as a crash, a leak or a sanitizer error. Never enabled by
+# the campaign build.
+negative-control = []
 
 [dependencies]
 libfuzzer-sys = "0.4"

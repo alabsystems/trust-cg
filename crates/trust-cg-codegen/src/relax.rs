@@ -71,11 +71,12 @@ const TBZ_MIN_RANGE: i64 = -(1 << 15); // -32,768
 
 /// Per-block offset and size information for offset computation.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 struct BlockInfo {
     /// Byte offset from the start of the function.
     offset: u32,
     /// Size of the block in bytes (number of non-pseudo instructions * 4).
+    /// Only the unit tests read it; relaxation needs only `offset`.
+    #[cfg_attr(not(test), allow(dead_code))]
     size: u32,
 }
 
@@ -551,6 +552,498 @@ fn build_final_code(func: &MachFunction) -> RelaxedCode {
         instructions,
         block_offsets,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block-structured relaxation: the production pipeline's pass
+// ---------------------------------------------------------------------------
+//
+// `relax_branches` above serves the standalone `lower` path: it rewrites a far
+// branch into an intra-block `cond_inv +2 ; B far` pair and returns a flat,
+// already-resolved instruction list. The production pipeline cannot take that
+// shape. Its final-stream authority reconstructs the CFG from the resolved
+// stream and admits exactly one intra-block immediate branch (the
+// `B.cond +2 ; BRK` guard skip); the raw JIT's block-profile splice requires
+// every resolved intra-function branch to land on a block start; and the
+// reaching-definition and frame dataflow nets walk each block linearly. So the
+// pipeline relaxes while branch targets are still symbolic, and every branch
+// it writes keeps a `Block` target. With `T` the far target, `X` the branch's
+// block and `N` the block laid out after `X`:
+//
+// 1. FALLTHROUGH. `X: … bcc T` with nothing but pseudos and `AlignNop`
+//    padding after it (it falls into `N`) becomes `X: … bcc_inv N ; B T`.
+//    That encodes as `bcc_inv +8 ; B T`, the standard relaxation, word for
+//    word. The edge set of `X` is unchanged ({N, T}).
+// 2. SWAP. `X: … bcc T ; B F` with `F` inside the conditional's range becomes
+//    `X: … bcc_inv F ; B T`. No instruction is added; the edge set is
+//    unchanged ({F, T}).
+// 3. SPLIT. Otherwise (the tail after the conditional is direct branches
+//    only, e.g. `B F` with `F` out of range too), the tail moves into a new
+//    block `Z` laid out immediately after `X`, and `X` ends
+//    `bcc_inv Z ; B T`. `Z` sits exactly where the tail was, so the tail's
+//    own fallthrough still reaches `N`. Successor/predecessor metadata is
+//    rebuilt from the branch operands with the canonical
+//    `pipeline::derive_ir_cfg_edges_from_branch_operands`.
+// 4. ISLAND. An ordinary tail ending in a non-fallthrough terminator stays
+//    in its original block. If the block end is in conditional range, insert
+//    `Z: B T` just after it and retarget the UNCHANGED conditional to Z.
+//    Neither the not-taken path nor instruction ownership changes; ADR,
+//    jump-table and EH custody stays with its original instructions/block.
+//    If later growth makes that island unreachable, refuse instead of
+//    repeatedly chaining islands or moving an authority-bearing tail.
+//
+// Termination. A rewrite only INSERTS instructions: none is deleted or
+// reordered (a split moves the tail into a block laid out where the tail
+// was). So the distance between two existing instructions never shrinks. A
+// form-1 or form-3 conditional targets the block that follows its own `B`
+// (two instructions away, plus at most the loop-head padding the alignment
+// pass may add in between); no later rewrite inserts there, because the only
+// branch between them is that unconditional `B`. A form-2 conditional targets
+// `F`, which was in range; if later growth pushes `F` out, `T` is still out
+// (distances only grow), so its second rewrite is a split, which is final.
+// Each conditional is therefore rewritten at most twice, and the fixed point
+// is reached within `2 * conditionals + 1` rounds. Exceeding that bound is
+// refused, never looped.
+// An island is final or refuses if pushed out of range; at most one is
+// installed for each conditional in this invocation, so the same bound holds.
+//
+// A function with no out-of-range branch is left untouched: not an operand,
+// not an arena slot, not a CFG list changes, so its emitted bytes are
+// identical to a build without this pass.
+
+/// What [`relax_out_of_range_branches`] did to one function.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BranchRelaxStats {
+    /// Fixed-point rounds that found at least one out-of-range branch.
+    pub rounds: u32,
+    /// Form 1: `bcc T` + fallthrough `N` became `bcc_inv N ; B T`.
+    pub fallthrough: u32,
+    /// Form 2: `bcc T ; B F` became `bcc_inv F ; B T`.
+    pub swapped: u32,
+    /// Form 3: the tail after `bcc T` moved to a new layout-next block `Z`,
+    /// and the branch became `bcc_inv Z ; B T`.
+    pub split: u32,
+    /// Form 4: an ordinary, non-fallthrough tail stayed in place and the
+    /// unchanged conditional now reaches its far target through a near B.
+    pub islands: u32,
+}
+
+impl BranchRelaxStats {
+    /// Total conditional-branch rewrites.
+    pub fn rewrites(&self) -> u32 {
+        self.fallthrough + self.swapped + self.split + self.islands
+    }
+}
+
+/// Errors from [`relax_out_of_range_branches`]. Each one is a refusal: the
+/// function is not emitted, exactly as an out-of-range branch was refused by
+/// the encoder before this pass existed.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum BranchRelaxError {
+    /// An unconditional `B`/`TailCall` to a block is beyond +/-128 MiB.
+    #[error(
+        "{opcode:?} at {block:?} position {position} targets {target:?} {displacement} bytes away, \
+         outside the +/-128 MiB unconditional range (no indirect-branch relaxation)"
+    )]
+    UnconditionalOutOfRange {
+        opcode: AArch64Opcode,
+        block: BlockId,
+        position: usize,
+        target: BlockId,
+        displacement: i64,
+    },
+    /// A conditional branch is out of range but its shape is not one of the
+    /// three rewrites.
+    #[error("cannot relax {opcode:?} at {block:?} position {position}: {detail}")]
+    UnsupportedShape {
+        opcode: AArch64Opcode,
+        block: BlockId,
+        position: usize,
+        detail: String,
+    },
+    /// The block or instruction arena would overflow its u32 ID domain.
+    #[error("the {arena} arena is full")]
+    ArenaExhausted { arena: &'static str },
+    /// The fixed point was not reached within the proven round bound.
+    #[error("no fixed point after {rounds} rounds (bound {bound})")]
+    NoFixedPoint { rounds: u32, bound: u32 },
+}
+
+/// One out-of-range branch found by [`find_out_of_range_branches`].
+#[derive(Debug, Clone, Copy)]
+struct FarBranch {
+    layout_index: usize,
+    block: BlockId,
+    position: usize,
+}
+
+/// True for the direct branches whose `Block` operand branch resolution
+/// rewrites to a PC-relative immediate (`pipeline::resolve_branches`).
+fn is_resolved_direct_branch(opcode: AArch64Opcode) -> bool {
+    matches!(
+        opcode,
+        AArch64Opcode::B
+            | AArch64Opcode::TailCall
+            | AArch64Opcode::BCond
+            | AArch64Opcode::Cbz
+            | AArch64Opcode::Cbnz
+            | AArch64Opcode::Tbz
+            | AArch64Opcode::Tbnz
+    )
+}
+
+/// Operand index of the target of a canonical conditional branch:
+/// `B.cond [cc, target]`, `CBZ/CBNZ [Rt, target]`, `TBZ/TBNZ [Rt, bit, target]`.
+fn conditional_target_index(opcode: AArch64Opcode) -> Option<usize> {
+    match opcode {
+        AArch64Opcode::BCond | AArch64Opcode::Cbz | AArch64Opcode::Cbnz => Some(1),
+        AArch64Opcode::Tbz | AArch64Opcode::Tbnz => Some(2),
+        _ => None,
+    }
+}
+
+/// The `Block` target of a resolvable direct branch, wherever branch
+/// resolution would find it.
+fn direct_branch_block_target(inst: &MachInst) -> Option<BlockId> {
+    if !is_resolved_direct_branch(inst.opcode) {
+        return None;
+    }
+    inst.operands.iter().find_map(|operand| match operand {
+        MachOperand::Block(target) => Some(*target),
+        _ => None,
+    })
+}
+
+/// True when `inst` occupies a code slot but is not control flow the relaxer
+/// has to look past: layout padding.
+fn is_padding(inst: &MachInst) -> bool {
+    inst.opcode == AArch64Opcode::AlignNop
+}
+
+/// The branch taken exactly when `inst` is not, with every other operand
+/// kept: `B.cond` flips the condition (EQ..LE only; AL and NV hold
+/// unconditionally and have no complement), `CBZ`<->`CBNZ`, `TBZ`<->`TBNZ`.
+fn complemented_conditional(inst: &MachInst) -> Result<MachInst, String> {
+    let mut complement = inst.clone();
+    match inst.opcode {
+        AArch64Opcode::BCond => match inst.operands.first() {
+            Some(MachOperand::Imm(cc)) if (0..=13).contains(cc) => {
+                complement.operands[0] = MachOperand::Imm(cc ^ 1);
+            }
+            Some(MachOperand::Imm(cc)) => {
+                return Err(format!(
+                    "condition code {cc} has no logical complement (AL/NV hold unconditionally)"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "condition operand {other:?} is not an immediate condition code"
+                ));
+            }
+        },
+        AArch64Opcode::Cbz => complement.opcode = AArch64Opcode::Cbnz,
+        AArch64Opcode::Cbnz => complement.opcode = AArch64Opcode::Cbz,
+        AArch64Opcode::Tbz => complement.opcode = AArch64Opcode::Tbnz,
+        AArch64Opcode::Tbnz => complement.opcode = AArch64Opcode::Tbz,
+        other => return Err(format!("{other:?} is not a conditional branch")),
+    }
+    Ok(complement)
+}
+
+/// Byte offset of every laid-out block (`None` for blocks not in
+/// `block_order`, which are never emitted). Every non-pseudo instruction,
+/// `AlignNop` included, is 4 bytes: the rule branch resolution and the encoder
+/// use.
+fn laid_out_block_offsets(func: &MachFunction) -> Vec<Option<i64>> {
+    let mut offsets = vec![None; func.blocks.len()];
+    let mut offset = 0i64;
+    for &block_id in &func.block_order {
+        offsets[block_id.0 as usize] = Some(offset);
+        for &inst_id in &func.block(block_id).insts {
+            if !func.inst(inst_id).is_pseudo() {
+                offset += 4;
+            }
+        }
+    }
+    offsets
+}
+
+/// Every laid-out direct branch whose `Block` target is outside its encoding
+/// range, in layout order. An unconditional one is refused here: its range is
+/// +/-128 MiB and the pass has no indirect-branch form.
+fn find_out_of_range_branches(
+    func: &MachFunction,
+    offsets: &[Option<i64>],
+) -> Result<Vec<FarBranch>, BranchRelaxError> {
+    let mut far = Vec::new();
+    for (layout_index, &block) in func.block_order.iter().enumerate() {
+        let Some(mut inst_offset) = offsets[block.0 as usize] else {
+            continue;
+        };
+        for (position, &inst_id) in func.block(block).insts.iter().enumerate() {
+            let inst = func.inst(inst_id);
+            if inst.is_pseudo() {
+                continue;
+            }
+            if let Some(target) = direct_branch_block_target(inst)
+                && let Some(Some(target_offset)) = offsets.get(target.0 as usize)
+            {
+                let displacement = target_offset - inst_offset;
+                if !in_range(inst.opcode, displacement) {
+                    if matches!(inst.opcode, AArch64Opcode::B | AArch64Opcode::TailCall) {
+                        return Err(BranchRelaxError::UnconditionalOutOfRange {
+                            opcode: inst.opcode,
+                            block,
+                            position,
+                            target,
+                            displacement,
+                        });
+                    }
+                    far.push(FarBranch {
+                        layout_index,
+                        block,
+                        position,
+                    });
+                }
+            }
+            inst_offset += 4;
+        }
+    }
+    Ok(far)
+}
+
+/// Number of laid-out conditional branches with a `Block` target: the
+/// quantity the round bound is stated in.
+fn laid_out_conditional_count(func: &MachFunction) -> u32 {
+    func.block_order
+        .iter()
+        .flat_map(|&block| func.block(block).insts.iter())
+        .filter(|&&inst_id| {
+            let inst = func.inst(inst_id);
+            conditional_target_index(inst.opcode).is_some()
+                && direct_branch_block_target(inst).is_some()
+        })
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+/// Append `B far` to the instruction arena, carrying the relaxed
+/// conditional's source location and lowering provenance: it implements the
+/// same source branch.
+fn push_far_branch(
+    func: &mut MachFunction,
+    conditional: InstId,
+    far: BlockId,
+) -> Result<InstId, BranchRelaxError> {
+    let mut branch = MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(far)]);
+    branch.source_loc = func.inst(conditional).source_loc;
+    let id = func
+        .try_push_inst(branch)
+        .ok_or(BranchRelaxError::ArenaExhausted {
+            arena: "instruction",
+        })?;
+    if let Some(provenance) = func.lowering_provenance.get(&conditional).copied() {
+        func.lowering_provenance.insert(id, provenance);
+    }
+    Ok(id)
+}
+
+/// Rewrite the out-of-range conditional at `site` into form 1, 2 or 3 (see
+/// the section comment).
+fn relax_conditional(
+    func: &mut MachFunction,
+    site: FarBranch,
+    offsets: &[Option<i64>],
+    stats: &mut BranchRelaxStats,
+    islanded: &mut std::collections::BTreeSet<InstId>,
+) -> Result<(), BranchRelaxError> {
+    let FarBranch {
+        layout_index,
+        block,
+        position,
+    } = site;
+    let conditional_id = func.block(block).insts[position];
+    let conditional = func.inst(conditional_id).clone();
+    let unsupported = |detail: String| BranchRelaxError::UnsupportedShape {
+        opcode: conditional.opcode,
+        block,
+        position,
+        detail,
+    };
+    let target_index = conditional_target_index(conditional.opcode)
+        .ok_or_else(|| unsupported("not a conditional branch".to_string()))?;
+    let far = match conditional.operands.get(target_index) {
+        Some(MachOperand::Block(far)) if conditional.operands.len() == target_index + 1 => *far,
+        _ => {
+            return Err(unsupported(format!(
+                "operands {:?} are not the canonical conditional-branch layout",
+                conditional.operands
+            )));
+        }
+    };
+    let complement = complemented_conditional(&conditional).map_err(unsupported)?;
+    let retarget = |mut inst: MachInst, target: BlockId| {
+        inst.operands[target_index] = MachOperand::Block(target);
+        inst
+    };
+
+    let tail: Vec<InstId> = func.block(block).insts[position + 1..].to_vec();
+    let real_tail: Vec<InstId> = tail
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let inst = func.inst(id);
+            !inst.is_pseudo() && !is_padding(inst)
+        })
+        .collect();
+
+    if islanded.contains(&conditional_id) {
+        return Err(unsupported(
+            "growth pushed the retained-tail branch island out of conditional range".into(),
+        ));
+    }
+
+    // Form 1: the conditional ends the block and falls into its layout
+    // successor.
+    if real_tail.is_empty() {
+        let next = *func.block_order.get(layout_index + 1).ok_or_else(|| {
+            unsupported("the last laid-out block falls off the end of the function".to_string())
+        })?;
+        *func.inst_mut(conditional_id) = retarget(complement, next);
+        let branch = push_far_branch(func, conditional_id, far)?;
+        func.block_mut(block).insts.insert(position + 1, branch);
+        stats.fallthrough += 1;
+        return Ok(());
+    }
+
+    // Form 2: `bcc T ; B F` with F reachable from the conditional.
+    if let [tail_branch] = real_tail[..] {
+        let inst = func.inst(tail_branch);
+        if inst.opcode == AArch64Opcode::B
+            && let [MachOperand::Block(near)] = inst.operands[..]
+            && let (Some(Some(block_offset)), Some(Some(near_offset))) =
+                (offsets.get(block.0 as usize), offsets.get(near.0 as usize))
+        {
+            let conditional_offset = block_offset
+                + 4 * func.block(block).insts[..position]
+                    .iter()
+                    .filter(|&&id| !func.inst(id).is_pseudo())
+                    .count() as i64;
+            if in_range(conditional.opcode, near_offset - conditional_offset) {
+                *func.inst_mut(conditional_id) = retarget(complement, near);
+                func.inst_mut(tail_branch).operands[0] = MachOperand::Block(far);
+                stats.swapped += 1;
+                return Ok(());
+            }
+        }
+    }
+
+    // Form 3: move the tail into a new block laid out right after this one.
+    // The tail may hold only direct branches to blocks: anything else (a
+    // call, an indirect or jump-table branch, ordinary code) would carry
+    // block-keyed authority — EH call sites, jump-table sources — that a
+    // move does not update, so it is refused rather than rewritten.
+    if let Some(&other) = real_tail.iter().find(|&&id| {
+        let inst = func.inst(id);
+        inst.opcode == AArch64Opcode::TailCall || direct_branch_block_target(inst).is_none()
+    }) {
+        // A nearby out-of-line B preserves the ordinary tail byte-for-byte.
+        // Require a hard end: otherwise not-taken execution would fall into
+        // the island instead of the original layout successor. An ordinary
+        // tail too large for this near target remains explicitly unsupported.
+        let tail_ends = real_tail.last().is_some_and(|&id| {
+            let last = func.inst(id);
+            last.is_unconditional_branch()
+                || last.is_return()
+                || last.opcode == AArch64Opcode::Brk
+                || (last.is_terminator() && !last.is_conditional_branch())
+        });
+        let to_island = func.block(block).insts[position..]
+            .iter()
+            .filter(|&&id| !func.inst(id).is_pseudo())
+            .count() as i64
+            * 4;
+        if tail_ends && in_range(conditional.opcode, to_island) {
+            let island = func
+                .try_create_block()
+                .ok_or(BranchRelaxError::ArenaExhausted { arena: "block" })?;
+            func.block_order.pop();
+            func.block_order.insert(layout_index + 1, island);
+            func.block_mut(island).loop_depth = func.block(block).loop_depth;
+            let branch = push_far_branch(func, conditional_id, far)?;
+            func.block_mut(island).insts.push(branch);
+            *func.inst_mut(conditional_id) = retarget(conditional, island);
+            islanded.insert(conditional_id);
+            stats.islands += 1;
+            return Ok(());
+        }
+        return Err(unsupported(format!(
+            "the instructions after it include {:?}; a retained-tail island needs a non-fallthrough end within conditional range",
+            func.inst(other).opcode
+        )));
+    }
+    let loop_depth = func.block(block).loop_depth;
+    let split = func
+        .try_create_block()
+        .ok_or(BranchRelaxError::ArenaExhausted { arena: "block" })?;
+    // `try_create_block` appends to the layout; lay it out after `block`.
+    func.block_order.pop();
+    func.block_order.insert(layout_index + 1, split);
+    func.block_mut(split).insts = tail;
+    func.block_mut(split).loop_depth = loop_depth;
+    func.block_mut(block).insts.truncate(position + 1);
+    *func.inst_mut(conditional_id) = retarget(complement, split);
+    let branch = push_far_branch(func, conditional_id, far)?;
+    func.block_mut(block).insts.push(branch);
+    stats.split += 1;
+    Ok(())
+}
+
+/// Relax every out-of-range conditional branch of a laid-out AArch64
+/// function in place, iterating to a fixed point, and leave every branch
+/// target symbolic for branch resolution (see the section comment for the
+/// three rewrites and the termination bound).
+///
+/// Precondition: the function passed the pipeline's structural validation
+/// (every laid-out block and branch target is in the arenas). A function with
+/// no out-of-range branch is returned untouched.
+pub fn relax_out_of_range_branches(
+    func: &mut MachFunction,
+) -> Result<BranchRelaxStats, BranchRelaxError> {
+    let mut stats = BranchRelaxStats::default();
+    let mut islanded = std::collections::BTreeSet::new();
+    let mut offsets = laid_out_block_offsets(func);
+    let mut far = find_out_of_range_branches(func, &offsets)?;
+    if far.is_empty() {
+        return Ok(stats);
+    }
+    let bound = laid_out_conditional_count(func)
+        .saturating_mul(2)
+        .saturating_add(1);
+    while !far.is_empty() {
+        if stats.rounds >= bound {
+            return Err(BranchRelaxError::NoFixedPoint {
+                rounds: stats.rounds,
+                bound,
+            });
+        }
+        stats.rounds += 1;
+        // Rewrite in reverse layout and position order. A rewrite changes
+        // only its own block at or after the branch, and a split inserts its
+        // block right after that one in the layout, so every site still to be
+        // visited keeps its recorded layout index and position.
+        for &site in far.iter().rev() {
+            relax_conditional(func, site, &offsets, &mut stats, &mut islanded)?;
+        }
+        offsets = laid_out_block_offsets(func);
+        far = find_out_of_range_branches(func, &offsets)?;
+    }
+    if stats.split > 0 || stats.islands > 0 {
+        let edges = crate::pipeline::derive_ir_cfg_edges_from_branch_operands(func);
+        crate::pipeline::install_ir_cfg_edges(func, edges);
+    }
+    Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,5 +2287,633 @@ mod tests {
         let total_code_bytes = result.instructions.len() as u32 * 4;
         let last_block_end = result.block_offsets[2] + 4; // bb2 has 1 inst = 4 bytes
         assert_eq!(last_block_end, total_code_bytes);
+    }
+}
+
+#[cfg(test)]
+mod block_structured_tests {
+    //! [`relax_out_of_range_branches`]: the three rewrites, the fixed point,
+    //! the refusals, and the no-op on in-range code. Every relaxed function is
+    //! also run through the pipeline's symbolic CFG authority
+    //! (`validate_aarch64_mach_function`), which requires the stored
+    //! successor/predecessor lists to equal the edges derived from the branch
+    //! operands.
+
+    use super::*;
+    use crate::pipeline::{
+        derive_ir_cfg_edges_from_branch_operands, install_ir_cfg_edges,
+        validate_aarch64_mach_function,
+    };
+    use trust_cg_ir::regs::{X0, X9, X30};
+    use trust_cg_ir::{CondCode, Signature};
+
+    /// B.cond / CBZ / CBNZ reach at most this many instructions forward.
+    const BCOND_MAX_INSTS: usize = (BCOND_MAX_RANGE / 4) as usize;
+    /// TBZ / TBNZ reach at most this many instructions forward.
+    const TBZ_MAX_INSTS: usize = (TBZ_MAX_RANGE / 4) as usize;
+
+    fn function(blocks: usize) -> (MachFunction, Vec<BlockId>) {
+        let mut func =
+            MachFunction::new("relax_fixture".to_string(), Signature::new(vec![], vec![]));
+        let mut ids = vec![func.entry];
+        for _ in 1..blocks {
+            ids.push(func.create_block());
+        }
+        (func, ids)
+    }
+
+    fn push(func: &mut MachFunction, block: BlockId, inst: MachInst) -> InstId {
+        let id = func.push_inst(inst);
+        func.append_inst(block, id);
+        id
+    }
+
+    fn filler(func: &mut MachFunction, block: BlockId, count: usize) {
+        for _ in 0..count {
+            push(
+                func,
+                block,
+                MachInst::new(
+                    AArch64Opcode::AddRI,
+                    vec![
+                        MachOperand::PReg(X9),
+                        MachOperand::PReg(X9),
+                        MachOperand::Imm(1),
+                    ],
+                ),
+            );
+        }
+    }
+
+    fn ret(func: &mut MachFunction, block: BlockId) -> InstId {
+        push(
+            func,
+            block,
+            MachInst::new(AArch64Opcode::Ret, vec![MachOperand::PReg(X30)]),
+        )
+    }
+
+    fn b(func: &mut MachFunction, block: BlockId, target: BlockId) -> InstId {
+        push(
+            func,
+            block,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(target)]),
+        )
+    }
+
+    /// A conditional branch of `opcode` to `target` in canonical operand form.
+    fn conditional(opcode: AArch64Opcode, target: BlockId) -> MachInst {
+        let operands = match opcode {
+            AArch64Opcode::BCond => vec![
+                MachOperand::Imm(CondCode::EQ.encoding() as i64),
+                MachOperand::Block(target),
+            ],
+            AArch64Opcode::Cbz | AArch64Opcode::Cbnz => {
+                vec![MachOperand::PReg(X0), MachOperand::Block(target)]
+            }
+            AArch64Opcode::Tbz | AArch64Opcode::Tbnz => vec![
+                MachOperand::PReg(X0),
+                MachOperand::Imm(3),
+                MachOperand::Block(target),
+            ],
+            other => panic!("{other:?} is not a conditional branch"),
+        };
+        MachInst::new(opcode, operands)
+    }
+
+    /// The maximum forward reach, in instructions, of `opcode`.
+    fn reach(opcode: AArch64Opcode) -> usize {
+        match opcode {
+            AArch64Opcode::Tbz | AArch64Opcode::Tbnz => TBZ_MAX_INSTS,
+            _ => BCOND_MAX_INSTS,
+        }
+    }
+
+    /// Install the CFG the branch operands define, as the pipeline's
+    /// authority expects of a function reaching branch resolution.
+    fn seal(func: &mut MachFunction) {
+        let edges = derive_ir_cfg_edges_from_branch_operands(func);
+        install_ir_cfg_edges(func, edges);
+        validate_aarch64_mach_function(func).expect("fixture must pass the CFG authority");
+    }
+
+    fn assert_in_range_and_valid(func: &MachFunction) {
+        let offsets = laid_out_block_offsets(func);
+        let far = find_out_of_range_branches(func, &offsets).expect("no unconditional overflow");
+        assert!(far.is_empty(), "branches still out of range: {far:?}");
+        validate_aarch64_mach_function(func).expect("relaxed function must pass the CFG authority");
+    }
+
+    fn succs(func: &MachFunction, block: BlockId) -> std::collections::BTreeSet<BlockId> {
+        func.block(block).succs.iter().copied().collect()
+    }
+
+    fn opcodes(func: &MachFunction, block: BlockId) -> Vec<AArch64Opcode> {
+        func.block(block)
+            .insts
+            .iter()
+            .map(|&id| func.inst(id).opcode)
+            .collect()
+    }
+
+    fn complement_of(opcode: AArch64Opcode) -> AArch64Opcode {
+        match opcode {
+            AArch64Opcode::BCond => AArch64Opcode::BCond,
+            AArch64Opcode::Cbz => AArch64Opcode::Cbnz,
+            AArch64Opcode::Cbnz => AArch64Opcode::Cbz,
+            AArch64Opcode::Tbz => AArch64Opcode::Tbnz,
+            AArch64Opcode::Tbnz => AArch64Opcode::Tbz,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const CONDITIONALS: [AArch64Opcode; 5] = [
+        AArch64Opcode::BCond,
+        AArch64Opcode::Cbz,
+        AArch64Opcode::Cbnz,
+        AArch64Opcode::Tbz,
+        AArch64Opcode::Tbnz,
+    ];
+
+    /// `b0: bcc b2` falling into `b1: <filler> ; ret`, `b2: ret`. The branch
+    /// sits at offset 0 and `b2` starts `filler + 1` instructions later.
+    fn forward_over(opcode: AArch64Opcode, fill: usize) -> (MachFunction, Vec<BlockId>) {
+        let (mut func, ids) = function(3);
+        push(&mut func, ids[0], conditional(opcode, ids[2]));
+        filler(&mut func, ids[1], fill);
+        ret(&mut func, ids[1]);
+        ret(&mut func, ids[2]);
+        seal(&mut func);
+        (func, ids)
+    }
+
+    #[test]
+    fn a_function_already_in_range_is_left_byte_for_byte_untouched() {
+        for opcode in CONDITIONALS {
+            // `b2` is exactly at the maximum reach: in range, not relaxed.
+            let (mut func, _) = forward_over(opcode, reach(opcode) - 2);
+            let before = format!("{func:?}");
+            let stats = relax_out_of_range_branches(&mut func).expect("in-range function");
+            assert_eq!(stats, BranchRelaxStats::default(), "{opcode:?}");
+            assert_eq!(format!("{func:?}"), before, "{opcode:?} function changed");
+        }
+    }
+
+    #[test]
+    fn fallthrough_form_complements_the_branch_and_jumps_over_a_far_b() {
+        for opcode in CONDITIONALS {
+            // One instruction past the maximum reach.
+            let (mut func, ids) = forward_over(opcode, reach(opcode) - 1);
+            let edges_before = succs(&func, ids[0]);
+            let stats = relax_out_of_range_branches(&mut func).expect("relaxable");
+            assert_eq!(
+                stats,
+                BranchRelaxStats {
+                    rounds: 1,
+                    fallthrough: 1,
+                    swapped: 0,
+                    split: 0,
+                    islands: 0,
+                },
+                "{opcode:?}"
+            );
+            assert_eq!(
+                opcodes(&func, ids[0]),
+                vec![complement_of(opcode), AArch64Opcode::B],
+                "{opcode:?}"
+            );
+            let inverted = func.inst(func.block(ids[0]).insts[0]);
+            assert_eq!(
+                inverted.operands.last(),
+                Some(&MachOperand::Block(ids[1])),
+                "{opcode:?}: the complemented branch skips the B into the fallthrough block"
+            );
+            if opcode == AArch64Opcode::BCond {
+                assert_eq!(
+                    inverted.operands[0],
+                    MachOperand::Imm(CondCode::NE.encoding() as i64)
+                );
+            }
+            let far = func.inst(func.block(ids[0]).insts[1]);
+            assert_eq!(far.operands, vec![MachOperand::Block(ids[2])]);
+            assert_eq!(
+                succs(&func, ids[0]),
+                edges_before,
+                "{opcode:?}: edges unchanged"
+            );
+            assert_in_range_and_valid(&func);
+        }
+    }
+
+    #[test]
+    fn a_backward_far_branch_is_relaxed_too() {
+        // b0 falls into b1 (filler), b2: cbnz x0, b1 (the far back-edge), b3: ret.
+        let (mut func, ids) = function(4);
+        filler(&mut func, ids[0], 1);
+        filler(&mut func, ids[1], BCOND_MAX_INSTS + 2);
+        push(&mut func, ids[2], conditional(AArch64Opcode::Cbnz, ids[1]));
+        ret(&mut func, ids[3]);
+        seal(&mut func);
+        let stats = relax_out_of_range_branches(&mut func).expect("relaxable");
+        assert_eq!(stats.fallthrough, 1);
+        assert_eq!(
+            opcodes(&func, ids[2]),
+            vec![AArch64Opcode::Cbz, AArch64Opcode::B]
+        );
+        assert_eq!(
+            func.inst(func.block(ids[2]).insts[0]).operands[1],
+            MachOperand::Block(ids[3])
+        );
+        assert_eq!(
+            func.inst(func.block(ids[2]).insts[1]).operands[0],
+            MachOperand::Block(ids[1])
+        );
+        assert_in_range_and_valid(&func);
+    }
+
+    #[test]
+    fn swap_form_exchanges_targets_when_the_other_one_is_near() {
+        // b0: b.eq b4 ; b b2   b1: ret   b2: ret   b3: <filler>; ret   b4: ret
+        let (mut func, ids) = function(5);
+        push(&mut func, ids[0], conditional(AArch64Opcode::BCond, ids[4]));
+        b(&mut func, ids[0], ids[2]);
+        ret(&mut func, ids[1]);
+        ret(&mut func, ids[2]);
+        filler(&mut func, ids[3], BCOND_MAX_INSTS);
+        ret(&mut func, ids[3]);
+        ret(&mut func, ids[4]);
+        seal(&mut func);
+        let insts_before = func.block(ids[0]).insts.clone();
+        let arena_before = func.insts.len();
+        let stats = relax_out_of_range_branches(&mut func).expect("relaxable");
+        assert_eq!(stats.swapped, 1);
+        assert_eq!(stats.rewrites(), 1);
+        // No instruction added: the same two instructions, retargeted.
+        assert_eq!(func.block(ids[0]).insts, insts_before);
+        assert_eq!(func.insts.len(), arena_before);
+        let cond = func.inst(insts_before[0]);
+        assert_eq!(
+            cond.operands,
+            vec![
+                MachOperand::Imm(CondCode::NE.encoding() as i64),
+                MachOperand::Block(ids[2])
+            ]
+        );
+        assert_eq!(
+            func.inst(insts_before[1]).operands,
+            vec![MachOperand::Block(ids[4])]
+        );
+        assert_in_range_and_valid(&func);
+    }
+
+    #[test]
+    fn split_form_when_both_targets_are_far() {
+        // b0: b b2   b1: ret   b2: <filler>   b3: tbz x0,#3,b1 ; b b5
+        // b4: <filler>; ret   b5: ret
+        // The TBZ target b1 is far behind and the B target b5 far ahead.
+        let (mut func, ids) = function(6);
+        b(&mut func, ids[0], ids[2]);
+        ret(&mut func, ids[1]);
+        filler(&mut func, ids[2], TBZ_MAX_INSTS + 8);
+        let tbz = push(&mut func, ids[3], conditional(AArch64Opcode::Tbz, ids[1]));
+        let tail = b(&mut func, ids[3], ids[5]);
+        filler(&mut func, ids[4], TBZ_MAX_INSTS + 8);
+        ret(&mut func, ids[4]);
+        ret(&mut func, ids[5]);
+        seal(&mut func);
+        let blocks_before = func.blocks.len();
+        let stats = relax_out_of_range_branches(&mut func).expect("relaxable");
+        assert_eq!(stats.split, 1, "{stats:?}");
+        assert_eq!(func.blocks.len(), blocks_before + 1);
+        let z = BlockId(blocks_before as u32);
+        // Laid out immediately after the split block.
+        let at = func.block_order.iter().position(|&b| b == ids[3]).unwrap();
+        assert_eq!(func.block_order[at + 1], z);
+        assert_eq!(func.block(z).insts, vec![tail]);
+        assert_eq!(func.inst(tail).operands, vec![MachOperand::Block(ids[5])]);
+        assert_eq!(func.block(ids[3]).insts[0], tbz);
+        assert_eq!(
+            opcodes(&func, ids[3]),
+            vec![AArch64Opcode::Tbnz, AArch64Opcode::B]
+        );
+        assert_eq!(
+            func.inst(tbz).operands,
+            vec![
+                MachOperand::PReg(X0),
+                MachOperand::Imm(3),
+                MachOperand::Block(z)
+            ]
+        );
+        let far = func.block(ids[3]).insts[1];
+        assert_eq!(func.inst(far).operands, vec![MachOperand::Block(ids[1])]);
+        assert_eq!(succs(&func, ids[3]), [ids[1], z].into_iter().collect());
+        assert_eq!(succs(&func, z), [ids[5]].into_iter().collect());
+        assert_in_range_and_valid(&func);
+    }
+
+    #[test]
+    fn a_relaxation_that_pushes_another_branch_out_of_range_reaches_a_fixed_point() {
+        // b0: b b2          b1: <1 MiB filler>; ret
+        // b2: tbz x0,#3,b5  (exactly at its maximum reach)
+        // b3: b.eq b1       (far backward; falls into b4)
+        // b4: <filler>      b5: ret
+        // Relaxing the b.eq inserts one instruction inside the TBZ's span,
+        // which pushes the TBZ one instruction past its reach: round two.
+        let (mut func, ids) = function(6);
+        b(&mut func, ids[0], ids[2]);
+        filler(&mut func, ids[1], BCOND_MAX_INSTS + 2);
+        ret(&mut func, ids[1]);
+        push(&mut func, ids[2], conditional(AArch64Opcode::Tbz, ids[5]));
+        push(&mut func, ids[3], conditional(AArch64Opcode::BCond, ids[1]));
+        filler(&mut func, ids[4], TBZ_MAX_INSTS - 2);
+        ret(&mut func, ids[5]);
+        seal(&mut func);
+        let offsets = laid_out_block_offsets(&func);
+        let first = find_out_of_range_branches(&func, &offsets).unwrap();
+        assert_eq!(first.len(), 1, "only the b.eq starts out of range");
+        let stats = relax_out_of_range_branches(&mut func).expect("relaxable");
+        assert_eq!(
+            stats,
+            BranchRelaxStats {
+                rounds: 2,
+                fallthrough: 2,
+                swapped: 0,
+                split: 0,
+                islands: 0,
+            }
+        );
+        assert_eq!(
+            opcodes(&func, ids[2]),
+            vec![AArch64Opcode::Tbnz, AArch64Opcode::B]
+        );
+        assert_eq!(
+            opcodes(&func, ids[3]),
+            vec![AArch64Opcode::BCond, AArch64Opcode::B]
+        );
+        assert_in_range_and_valid(&func);
+    }
+
+    #[test]
+    fn a_swapped_branch_that_grows_out_of_range_is_split_next_round() {
+        // b0: b.eq b5 ; b b2        (b5 far; b2 exactly at the b.eq's reach)
+        // b1: <filler> ; cbz x0, b4 (far; falls into b2)
+        // b2: ret   b3: <filler>   b4: ret   b5: ret
+        //
+        // Round 1 visits the cbz first (reverse layout order): fallthrough
+        // form, one instruction inserted between b0 and b2. It then swaps the
+        // b.eq onto b2, measured on the round's starting offsets. Round 2
+        // finds b2 one instruction past the swapped b.ne's reach, and b5
+        // still far: split, which is final.
+        let (mut func, ids) = function(6);
+        push(&mut func, ids[0], conditional(AArch64Opcode::BCond, ids[5]));
+        b(&mut func, ids[0], ids[2]);
+        // b0 holds 2 instructions, b1 `max - 2`: b2 starts exactly `max`
+        // instructions after the b.eq.
+        filler(&mut func, ids[1], BCOND_MAX_INSTS - 3);
+        push(&mut func, ids[1], conditional(AArch64Opcode::Cbz, ids[4]));
+        ret(&mut func, ids[2]);
+        filler(&mut func, ids[3], BCOND_MAX_INSTS + 2);
+        ret(&mut func, ids[4]);
+        ret(&mut func, ids[5]);
+        seal(&mut func);
+        let stats = relax_out_of_range_branches(&mut func).expect("relaxable");
+        assert_eq!(
+            stats,
+            BranchRelaxStats {
+                rounds: 2,
+                fallthrough: 1,
+                swapped: 1,
+                split: 1,
+                islands: 0,
+            }
+        );
+        // b0: b.eq Z ; b b2   Z: b b5 — taken still reaches b5, not taken b2.
+        let z = BlockId(6);
+        assert_eq!(func.block_order[1], z);
+        let b0 = &func.block(ids[0]).insts;
+        assert_eq!(
+            func.inst(b0[0]).operands,
+            vec![
+                MachOperand::Imm(CondCode::EQ.encoding() as i64),
+                MachOperand::Block(z)
+            ]
+        );
+        assert_eq!(func.inst(b0[1]).operands, vec![MachOperand::Block(ids[2])]);
+        let z_insts = &func.block(z).insts;
+        assert_eq!(z_insts.len(), 1);
+        assert_eq!(
+            func.inst(z_insts[0]).operands,
+            vec![MachOperand::Block(ids[5])]
+        );
+        assert_in_range_and_valid(&func);
+    }
+
+    #[test]
+    fn the_far_b_is_inserted_before_trailing_loop_head_padding() {
+        let (mut func, ids) = function(3);
+        push(&mut func, ids[0], conditional(AArch64Opcode::Cbz, ids[2]));
+        for _ in 0..2 {
+            push(
+                &mut func,
+                ids[0],
+                MachInst::new(AArch64Opcode::AlignNop, vec![]),
+            );
+        }
+        filler(&mut func, ids[1], BCOND_MAX_INSTS);
+        ret(&mut func, ids[1]);
+        ret(&mut func, ids[2]);
+        seal(&mut func);
+        let stats = relax_out_of_range_branches(&mut func).expect("relaxable");
+        assert_eq!(stats.fallthrough, 1);
+        assert_eq!(
+            opcodes(&func, ids[0]),
+            vec![
+                AArch64Opcode::Cbnz,
+                AArch64Opcode::B,
+                AArch64Opcode::AlignNop,
+                AArch64Opcode::AlignNop
+            ]
+        );
+        assert_in_range_and_valid(&func);
+    }
+
+    #[test]
+    fn the_far_b_carries_the_conditionals_source_location_and_provenance() {
+        let (mut func, ids) = forward_over(AArch64Opcode::Cbz, BCOND_MAX_INSTS);
+        let cond = func.block(ids[0]).insts[0];
+        let loc = trust_cg_ir::inst::SourceLoc {
+            file: 0,
+            line: 42,
+            col: 7,
+        };
+        func.inst_mut(cond).source_loc = Some(loc);
+        func.lowering_provenance
+            .insert(cond, trust_cg_ir::LoweringProvenance::UNATTRIBUTED);
+        relax_out_of_range_branches(&mut func).expect("relaxable");
+        let far = func.block(ids[0]).insts[1];
+        assert_eq!(func.inst(far).source_loc, Some(loc));
+        assert_eq!(
+            func.lowering_provenance.get(&far),
+            func.lowering_provenance.get(&cond)
+        );
+    }
+
+    #[test]
+    fn b_cond_complement_is_the_irs_logical_complement_and_al_nv_are_refused() {
+        const ALL: [CondCode; 16] = [
+            CondCode::EQ,
+            CondCode::NE,
+            CondCode::HS,
+            CondCode::LO,
+            CondCode::MI,
+            CondCode::PL,
+            CondCode::VS,
+            CondCode::VC,
+            CondCode::HI,
+            CondCode::LS,
+            CondCode::GE,
+            CondCode::LT,
+            CondCode::GT,
+            CondCode::LE,
+            CondCode::AL,
+            CondCode::NV,
+        ];
+        for cc in ALL {
+            let inst = MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    MachOperand::Imm(cc.encoding() as i64),
+                    MachOperand::Block(BlockId(0)),
+                ],
+            );
+            match (complemented_conditional(&inst), cc.logical_complement()) {
+                (Ok(complement), Some(expected)) => assert_eq!(
+                    complement.operands[0],
+                    MachOperand::Imm(expected.encoding() as i64),
+                    "{cc:?}"
+                ),
+                (Err(_), None) => {}
+                (got, expected) => panic!("{cc:?}: got {got:?}, expected {expected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn complemented_opcodes_keep_their_flags() {
+        for opcode in CONDITIONALS {
+            assert_eq!(
+                opcode.default_flags(),
+                complement_of(opcode).default_flags(),
+                "{opcode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_always_condition_is_refused_not_inverted() {
+        let (mut func, ids) = function(3);
+        push(
+            &mut func,
+            ids[0],
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    MachOperand::Imm(CondCode::AL.encoding() as i64),
+                    MachOperand::Block(ids[2]),
+                ],
+            ),
+        );
+        filler(&mut func, ids[1], BCOND_MAX_INSTS);
+        ret(&mut func, ids[1]);
+        ret(&mut func, ids[2]);
+        seal(&mut func);
+        let error = relax_out_of_range_branches(&mut func).unwrap_err();
+        assert!(
+            matches!(error, BranchRelaxError::UnsupportedShape { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_tail_too_far_to_reach_an_island_is_refused() {
+        // b0: b b2   b1: ret   b2: <filler>   b3: cbz x0, b1 ; add ; ret
+        let (mut func, ids) = function(4);
+        b(&mut func, ids[0], ids[2]);
+        ret(&mut func, ids[1]);
+        filler(&mut func, ids[2], BCOND_MAX_INSTS + 2);
+        push(&mut func, ids[3], conditional(AArch64Opcode::Cbz, ids[1]));
+        filler(&mut func, ids[3], BCOND_MAX_INSTS + 2);
+        ret(&mut func, ids[3]);
+        let error = relax_out_of_range_branches(&mut func).unwrap_err();
+        assert!(
+            matches!(&error, BranchRelaxError::UnsupportedShape { detail, .. } if detail.contains("AddRI")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_far_conditional_with_an_adr_tail_keeps_its_original_instruction_owners() {
+        // The conditional crosses >1MiB; its ordinary tail is short and ends
+        // in RET. Moving that tail would invalidate block-keyed custody.
+        let (mut func, ids) = function(3);
+        let cond = push(&mut func, ids[0], conditional(AArch64Opcode::Cbz, ids[2]));
+        let adr = push(
+            &mut func,
+            ids[0],
+            MachInst::new(
+                AArch64Opcode::Adr,
+                vec![MachOperand::PReg(X9), MachOperand::Imm(0)],
+            ),
+        );
+        ret(&mut func, ids[0]);
+        filler(&mut func, ids[1], BCOND_MAX_INSTS + 2);
+        ret(&mut func, ids[1]);
+        ret(&mut func, ids[2]);
+        seal(&mut func);
+        let original = func.block(ids[0]).insts.clone();
+        let adr_before = format!("{:?}", func.inst(adr));
+        let stats = relax_out_of_range_branches(&mut func)
+            .expect("a nearby branch island preserves the tail");
+        assert_eq!(stats.rewrites(), 1);
+        assert_eq!(func.block(ids[0]).insts, original);
+        assert_eq!(format!("{:?}", func.inst(adr)), adr_before);
+        assert_eq!(func.inst(cond).opcode, AArch64Opcode::Cbz);
+        assert_in_range_and_valid(&func);
+    }
+
+    #[test]
+    fn a_far_branch_in_the_last_block_that_falls_off_the_end_is_refused() {
+        // b0: b b2   b1: ret   b2: <filler> ; cbz x0, b1   (nothing after b2)
+        let (mut func, ids) = function(3);
+        b(&mut func, ids[0], ids[2]);
+        ret(&mut func, ids[1]);
+        filler(&mut func, ids[2], BCOND_MAX_INSTS + 2);
+        push(&mut func, ids[2], conditional(AArch64Opcode::Cbz, ids[1]));
+        let error = relax_out_of_range_branches(&mut func).unwrap_err();
+        assert!(
+            matches!(&error, BranchRelaxError::UnsupportedShape { detail, .. } if detail.contains("falls off")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unconditional_branch_beyond_128_mib_is_refused() {
+        let (mut func, ids) = function(2);
+        b(&mut func, ids[0], ids[1]);
+        ret(&mut func, ids[1]);
+        // Offsets as if 128 MiB of code separated the two blocks.
+        let offsets = vec![Some(0), Some(1i64 << 27)];
+        let error = find_out_of_range_branches(&func, &offsets).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BranchRelaxError::UnconditionalOutOfRange {
+                    opcode: AArch64Opcode::B,
+                    displacement,
+                    ..
+                } if displacement == 1 << 27
+            ),
+            "{error}"
+        );
     }
 }

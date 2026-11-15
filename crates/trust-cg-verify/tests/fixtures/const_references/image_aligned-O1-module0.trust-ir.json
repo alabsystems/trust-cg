@@ -1,0 +1,404 @@
+{
+  "name": "image_aligned.566ba72ff7c424fc-cgu.0",
+  "functions": [
+    {
+      "id": 0,
+      "name": "image_aligned",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": {
+                      "Array": [
+                        4,
+                        2
+                      ]
+                    }
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_aligned.const.alloc3",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": {
+                      "Array": [
+                        4,
+                        2
+                      ]
+                    }
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": {
+                      "Array": [
+                        4,
+                        2
+                      ]
+                    }
+                  },
+                  "dst_ty": {
+                    "PtrConst": {
+                      "Array": [
+                        4,
+                        2
+                      ]
+                    }
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    },
+    {
+      "id": 1,
+      "name": "image_literal",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Ref": {
+                      "Tuple": [
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8"
+                      ]
+                    }
+                  },
+                  "value": {
+                    "SymbolAddr": {
+                      "symbol": "image_literal.const.alloc4",
+                      "addend": 0
+                    }
+                  }
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": {
+                    "Ref": {
+                      "Tuple": [
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8"
+                      ]
+                    }
+                  },
+                  "operand": 3
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToPtr",
+                  "src_ty": {
+                    "Ref": {
+                      "Tuple": [
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8"
+                      ]
+                    }
+                  },
+                  "dst_ty": {
+                    "PtrConst": {
+                      "Tuple": [
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8",
+                        "U8"
+                      ]
+                    }
+                  },
+                  "operand": 2
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "image_aligned.const.alloc3",
+      "ty": {
+        "Array": [
+          4,
+          2
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": "120099658913272398869426332034741721690"
+          },
+          {
+            "Int": 90
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 16,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "image_literal.const.alloc4",
+      "ty": {
+        "Tuple": [
+          "U8",
+          "U8",
+          "U8",
+          "U8",
+          "U8",
+          "U8",
+          "U8"
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Aggregate": [
+          {
+            "Int": 108
+          },
+          {
+            "Int": 105
+          },
+          {
+            "Int": 116
+          },
+          {
+            "Int": 101
+          },
+          {
+            "Int": 114
+          },
+          {
+            "Int": 97
+          },
+          {
+            "Int": 108
+          }
+        ]
+      },
+      "linkage": "Internal",
+      "tls": null,
+      "align": 1,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": {
+            "Array": [
+              4,
+              2
+            ]
+          }
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "PtrConst": {
+            "Tuple": [
+              "U8",
+              "U8",
+              "U8",
+              "U8",
+              "U8",
+              "U8",
+              "U8"
+            ]
+          }
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "I8",
+    "I16",
+    "I32",
+    "I64",
+    "I128",
+    "U8"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-unknown-linux-gnu",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "Unclassified"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": []
+}

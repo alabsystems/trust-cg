@@ -29,23 +29,20 @@
 //     oracle's max_call_depth = 32 and fuel = 200_000 budget;
 //   * no memory, no division, no casts — see the oracle-validity note above.
 //
-// Any disagreement (oracle vs any JIT, JIT vs JIT, or a compile-error / panic on
-// an oracle-accepted module) is a DEFECT.
+// Any disagreement, unavailable oracle result, compile error, or panic is a
+// defect. Each exact module/configuration is compiled once for all input rows.
 
 #![cfg(target_arch = "aarch64")]
 
-use std::collections::HashMap;
-use std::panic;
-
-use trust_cg_codegen::Target;
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
-use trust_cg_codegen::pipeline::OptLevel;
 use trust_cg_fuzz::jit_diff::run_oracle_one;
 use trust_ir::{BinOp, FuncId, ICmpOp, Ty, ValueId};
 use trust_ir_build::ModuleBuilder;
 
 const ENTRY: &str = "fuzz_fn";
-const OPTS: [OptLevel; 4] = [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3];
+
+#[path = "common/jit_matrix.rs"]
+mod jit_matrix;
+use jit_matrix::OPTS;
 
 // Representative argument rows: zeros, units, sign extremes, and dense bit
 // patterns. The recursion-controlling argument is masked inside each builder so
@@ -63,90 +60,40 @@ const ROWS: &[[i64; 4]] = &[
     [123456789, -987654321, 0x7fff_ffff, -0x8000_0000],
 ];
 
-#[derive(Clone, Copy)]
-enum Run {
-    Value(i64),
-    CompileErr,
-    SymbolMissing,
-}
-
-fn jit_run(module: &trust_ir::Module, opt: OptLevel, jit_fast: bool, row: &[i64; 4]) -> Run {
-    let externs: HashMap<String, *const u8> = HashMap::new();
-    let mut config = if jit_fast {
-        CompilerConfig::jit_fast(Target::host())
-    } else {
-        let mut c = CompilerConfig::for_host_jit();
-        c.enable_jit_fast_regalloc = false;
-        c
-    };
-    config.opt_level = opt;
-    let compiler = Compiler::new(config);
-    let buf = match compiler.compile_module_to_jit(module, &externs) {
-        Ok(r) => r.buffer,
-        Err(_) => return Run::CompileErr,
-    };
-    type Fn4 = extern "C" fn(i64, i64, i64, i64) -> i64;
-    let fptr = match unsafe { buf.get_fn_bound::<Fn4>(ENTRY) } {
-        Some(p) => p.into_inner(),
-        None => return Run::SymbolMissing,
-    };
-    let v = fptr(row[0], row[1], row[2], row[3]);
-    drop(buf);
-    Run::Value(v)
-}
-
-/// Differential driver: compare the interpreter oracle (when defined) against
-/// all eight JIT configurations and every pair of JITs against each other.
-/// Records each disagreement / compile failure / panic into `defects`.
+/// The interpreter is required for every row. Compile each configuration once,
+/// then compare every native result with the oracle and other configurations.
+/// Missing references, compile failures, missing symbols and panics are defects.
 fn check(label: &str, module: &trust_ir::Module, rows: &[[i64; 4]], defects: &mut Vec<String>) {
-    for row in rows {
-        let oracle = run_oracle_one(module, row).ok();
-        let mut vals: Vec<(OptLevel, bool, i64)> = Vec::new();
-        for jit_fast in [true, false] {
-            for opt in OPTS {
-                let got = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                    jit_run(module, opt, jit_fast, row)
-                }));
-                match got {
-                    Ok(Run::Value(v)) => vals.push((opt, jit_fast, v)),
-                    Ok(Run::CompileErr) => {
-                        // Compile error only counts as a defect when the oracle
-                        // accepted the module (defined value). Otherwise the
-                        // module is genuinely unsupported and is skipped.
-                        if oracle.is_some() {
-                            defects.push(format!(
-                                "{label}: COMPILE_ERR row={row:?} opt={opt:?} fast={jit_fast} (oracle={oracle:?})"
-                            ));
-                        }
-                    }
-                    Ok(Run::SymbolMissing) => defects.push(format!(
-                        "{label}: SYMBOL_MISSING row={row:?} opt={opt:?} fast={jit_fast}"
-                    )),
-                    Err(_) => defects.push(format!(
-                        "{label}: JIT_PANIC row={row:?} opt={opt:?} fast={jit_fast} (oracle={oracle:?})"
-                    )),
-                }
+    let oracles: Vec<_> = rows
+        .iter()
+        .map(|row| match run_oracle_one(module, row) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                defects.push(format!(
+                    "{label}: ORACLE_UNAVAILABLE row={row:?}: {error:?}"
+                ));
+                None
             }
-        }
-        // Oracle vs every JIT (only when the oracle produced a defined value).
+        })
+        .collect();
+    let jits = jit_matrix::run_jit_matrix(module, ENTRY, rows, label, defects);
+    for (index, (row, oracle)) in rows.iter().zip(oracles).enumerate() {
         if let Some(want) = oracle {
-            for (opt, fast, got) in &vals {
-                if *got != want {
+            for (config, values) in &jits {
+                if values[index] != want {
                     defects.push(format!(
-                        "{label}: ORACLE_MISMATCH row={row:?} opt={opt:?} fast={fast}: interp={want} jit={got}"
+                        "{label}: ORACLE_MISMATCH row={row:?} {config:?}: interp={want} jit={}",
+                        values[index]
                     ));
                 }
             }
         }
-        // Every JIT against every other JIT (catches divergence even when the
-        // oracle rejected the module — though here the oracle always accepts).
-        for i in 0..vals.len() {
-            for j in (i + 1)..vals.len() {
-                let (o0, f0, v0) = vals[i];
-                let (o1, f1, v1) = vals[j];
-                if v0 != v1 {
+        for (i, (config, values)) in jits.iter().enumerate() {
+            for (other_config, other_values) in &jits[..i] {
+                if values[index] != other_values[index] {
                     defects.push(format!(
-                        "{label}: JIT_DIVERGENCE row={row:?} ({o0:?},fast={f0})={v0} vs ({o1:?},fast={f1})={v1}"
+                        "{label}: JIT_DIVERGENCE row={row:?} {config:?}={} vs {other_config:?}={}",
+                        values[index], other_values[index]
                     ));
                 }
             }
@@ -270,7 +217,7 @@ fn build_chain(name: &str, depth: u32, arity: u32, pressure: u32) -> trust_ir::M
     fb.ret(vec![out]);
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -375,7 +322,7 @@ fn build_recursive(name: &str, state: u32, depth_mask: i64) -> trust_ir::Module 
     fb.ret(vec![r]);
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +423,7 @@ fn build_tree(name: &str, state: u32, depth_mask: i64) -> trust_ir::Module {
     fb.ret(vec![r]);
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +556,7 @@ fn build_mutual(name: &str, ping_state: u32, pong_state: u32, depth_mask: i64) -
     fb.ret(vec![r]);
     fb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ===========================================================================
@@ -621,6 +568,60 @@ fn build_mutual(name: &str, ping_state: u32, pong_state: u32, depth_mask: i64) -
 /// the interpreter agreed, so this keeps the optimizer boundary independently
 /// reproducible without rerunning the 12-module campaign.
 #[test]
+fn missing_reference_and_compile_failures_are_not_agreement() {
+    let module = trust_ir::Module::new("empty_control");
+    let rows = [[0; 4]];
+    assert!(run_oracle_one(&module, &rows[0]).is_err());
+    let mut defects = Vec::new();
+    check("missing control", &module, &rows, &mut defects);
+    assert!(
+        defects
+            .iter()
+            .any(|defect| defect.contains("ORACLE_UNAVAILABLE")),
+        "requested oracle failure disappeared: {defects:?}"
+    );
+    assert!(
+        defects.len() >= 9,
+        "all eight configuration failures plus the missing reference must be recorded: {defects:?}"
+    );
+}
+
+#[test]
+fn compiler_failure_is_retained_when_the_interpreter_also_rejects() {
+    let mut builder = ModuleBuilder::new("missing_callee_control");
+    let signature = builder.add_func_type(vec![Ty::I64; 4], vec![Ty::I64]);
+    let mut function = builder.function(ENTRY, signature);
+    let entry = function.create_block();
+    for _ in 0..4 {
+        function.add_block_param(entry, Ty::I64);
+    }
+    function.switch_to_block(entry);
+    function.call(FuncId::new(9999), vec![]);
+    let value = function.iconst(Ty::I64, 0);
+    function.ret(vec![value]);
+    function.build();
+    let module = builder.build().expect("ModuleBuilder::build: test fixture");
+    let mut defects = Vec::new();
+    check("missing callee", &module, &[[0; 4]], &mut defects);
+    assert_eq!(
+        defects
+            .iter()
+            .filter(|defect| defect.contains("ORACLE_UNAVAILABLE"))
+            .count(),
+        1,
+        "{defects:?}"
+    );
+    assert_eq!(
+        defects
+            .iter()
+            .filter(|defect| defect.contains("COMPILE_ERR"))
+            .count(),
+        8,
+        "{defects:?}"
+    );
+}
+
+#[test]
 fn mutual_recursion_o3_preserves_cross_call_state_regression() {
     let module = build_mutual("mut_o3_cross_call_regression", 7, 11, 3);
     let row = [1, 2, 3, 4];
@@ -629,13 +630,8 @@ fn mutual_recursion_o3_preserves_cross_call_state_regression() {
 
     for jit_fast in [true, false] {
         for opt in OPTS {
-            let got = match jit_run(&module, opt, jit_fast, &row) {
-                Run::Value(value) => value,
-                Run::CompileErr => panic!("regression compile failed at {opt:?}, fast={jit_fast}"),
-                Run::SymbolMissing => {
-                    panic!("regression entry symbol missing at {opt:?}, fast={jit_fast}")
-                }
-            };
+            let got = jit_matrix::run_jit_config(&module, ENTRY, opt, jit_fast, &[row])
+                .unwrap_or_else(|error| panic!("regression {opt:?}, fast={jit_fast}: {error}"))[0];
             assert_eq!(
                 got, oracle,
                 "mutual-recursion cross-call state was miscompiled at {opt:?}, fast={jit_fast}"

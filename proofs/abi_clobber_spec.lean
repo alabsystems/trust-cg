@@ -31,7 +31,7 @@
 -- file directly: the 31 general-purpose registers X0..X30 as a 31-constructor inductive `Gpr`,
 -- and the 32 SIMD/FP registers V0..V31 as a 32-constructor inductive `Fpr`. (X31 is SP/XZR — not
 -- an allocatable GPR — and is deliberately outside the bank, matching the regalloc model which
--- never allocates it.) The AAPCS64 callee-saved sets are X19..X28 and V8..V15; everything else in
+-- never allocates it.) The AAPCS64 callee-saved sets are X19..X29 and V8..V15 (low 64 bits); everything else in
 -- each bank is caller-saved (volatile). `Saved` is the two-valued partition class. We define the
 -- convention as TOTAL classifier functions `gprClass`/`fprClass`, derive the caller/callee
 -- membership Flags, and prove disjointness and tiling per-register by `rfl` (one closed-form
@@ -39,10 +39,11 @@
 -- statements are UNIVERSAL Flag-equalities quantified over every register.
 --
 -- NOTE on the 128/64/32/16/8-bit aliases. The Rust `PReg` model encodes width-aliased views
--- (X/W, V/Q/D/S/H) of the SAME architectural register at distinct encodings. The CONVENTION,
--- however, is a property of the underlying architectural register, not of a width view: if Xn is
--- callee-saved then Wn is too, and if Vn is caller-saved then every Dn/Sn/Hn view is too. So we
--- model one classifier per architectural register; the Rust differential test then checks that
+-- (X/W, V/D/S/H) of the SAME architectural register at distinct encodings. The CONVENTION,
+-- however, concerns the underlying register: X/W agree on preservation, while
+-- the FPR classifier concerns only low 64-bit views; full Q values need a separate rule. We
+-- model one classifier per architectural register (only low 64-bit preservation for FPRs);
+-- full-width V8..V15 allocation must remain excluded independently. The Rust test checks that
 -- EVERY width-alias encoding of each register lands in the class this spec assigns it. This keeps
 -- the spec the faithful ground truth and the alias bookkeeping in the test where it belongs.
 
@@ -50,7 +51,7 @@
 -- Core finite types.
 
 -- The two partition classes. Caller-saved = volatile (clobbered by a call); callee-saved =
--- preserved across a call by the callee.
+-- preserved across a call by the callee (for FPRs, only the low 64 bits).
 inductive Saved where
   | caller
   | callee
@@ -62,9 +63,10 @@ inductive Flag where
   | no
 
 -- The 31 allocatable general-purpose registers, X0..X30. (X31 = SP/XZR is intentionally absent;
--- it is not part of the allocatable GPR bank.) AAPCS64: X19..X28 are callee-saved; the rest are
--- caller-saved. X16/X17 (IP0/IP1), X18 (platform), X29 (FP) and X30 (LR) are all caller-saved
--- per the convention as modeled by the regalloc clobber set.
+-- it is not part of the allocatable GPR bank.) AAPCS64: X19..X29 are callee-saved; the rest are
+-- caller-saved in this base-model partition. X18 remains platform-specific; this
+-- model treats it conservatively as volatile. X29 (FP) is preserved by the ABI,
+-- but the allocator reserves it and omits it from both allocation sets.
 inductive Gpr where
   | x0  | x1  | x2  | x3  | x4  | x5  | x6  | x7
   | x8  | x9  | x10 | x11 | x12 | x13 | x14 | x15
@@ -82,7 +84,7 @@ inductive Fpr where
 -- ===========================================================================================
 -- The convention, as TOTAL classifiers (the ground-truth mirror of AAPCS64).
 
--- GPR classification: X19..X28 are callee-saved; every other GPR is caller-saved.
+-- GPR classification: X19..X29 are callee-saved; every other GPR is caller-saved.
 def gprClass (g : Gpr) : Saved :=
   match g with
   | Gpr.x0  => Saved.caller | Gpr.x1  => Saved.caller | Gpr.x2  => Saved.caller
@@ -96,7 +98,7 @@ def gprClass (g : Gpr) : Saved :=
   | Gpr.x22 => Saved.callee | Gpr.x23 => Saved.callee | Gpr.x24 => Saved.callee
   | Gpr.x25 => Saved.callee | Gpr.x26 => Saved.callee | Gpr.x27 => Saved.callee
   | Gpr.x28 => Saved.callee
-  | Gpr.x29 => Saved.caller | Gpr.x30 => Saved.caller
+  | Gpr.x29 => Saved.callee | Gpr.x30 => Saved.caller
 
 -- FPR classification: V8..V15 are callee-saved; every other FPR is caller-saved.
 def fprClass (f : Fpr) : Saved :=
@@ -222,19 +224,20 @@ theorem fpr_caller_is_not_callee (f : Fpr) : fprIsCaller f = notFlag (fprIsCalle
 -- form rfl, so the spec independently fixes the convention at every boundary.
 
 -- GPR caller-saved boundaries: X0 (first arg/volatile), X18 (last before callee block),
--- X29 (FP) and X30 (LR) are caller-saved in this model; X15 mid-range volatile.
+-- X30 (LR) is caller-saved; X15 is mid-range volatile. X29 is preserved.
 theorem x0_caller  : gprIsCaller Gpr.x0  = Flag.yes := rfl
 theorem x15_caller : gprIsCaller Gpr.x15 = Flag.yes := rfl
 theorem x18_caller : gprIsCaller Gpr.x18 = Flag.yes := rfl
-theorem x29_caller : gprIsCaller Gpr.x29 = Flag.yes := rfl
+theorem x29_not_caller : gprIsCaller Gpr.x29 = Flag.no := rfl
 theorem x30_caller : gprIsCaller Gpr.x30 = Flag.yes := rfl
 
--- GPR callee-saved boundaries: X19 (first callee), X28 (last callee).
+-- GPR callee-saved boundaries: X19 (first), X28 and reserved X29 (last).
 theorem x19_callee : gprIsCallee Gpr.x19 = Flag.yes := rfl
 theorem x28_callee : gprIsCallee Gpr.x28 = Flag.yes := rfl
--- And X18/X29 are NOT callee-saved (the boundary on either side of the callee block).
+-- X18 and X30 are outside the preserved block.
 theorem x18_not_callee : gprIsCallee Gpr.x18 = Flag.no := rfl
-theorem x29_not_callee : gprIsCallee Gpr.x29 = Flag.no := rfl
+theorem x29_callee : gprIsCallee Gpr.x29 = Flag.yes := rfl
+theorem x30_not_callee : gprIsCallee Gpr.x30 = Flag.no := rfl
 
 -- FPR caller-saved boundaries: V0, V7 (last before callee block), V16 (first after), V31 (last).
 theorem v0_caller  : fprIsCaller Fpr.v0  = Flag.yes := rfl
@@ -248,4 +251,119 @@ theorem v15_callee : fprIsCallee Fpr.v15 = Flag.yes := rfl
 theorem v7_not_callee  : fprIsCallee Fpr.v7  = Flag.no := rfl
 theorem v16_not_callee : fprIsCallee Fpr.v16 = Flag.no := rfl
 
-def main : Nat := 0
+
+-- Native scalar classifiers consumed by the register allocator. The byte result
+-- is 1 exactly for the callee class and 0 otherwise, including out-of-bank input.
+-- Width aliases and reserved-register policy remain in the Rust consumer.
+def trust_cg_aarch64_gpr_callee (reg : UInt8) : UInt8 :=
+  if reg < 19 then 0 else if reg < 30 then 1 else 0
+
+def trust_cg_aarch64_fpr_callee (reg : UInt8) : UInt8 :=
+  if reg < 8 then 0 else if reg < 16 then 1 else 0
+
+-- Each conditional is directly emitted with parameter arms. The Rust caller
+-- composes these selectors; the equalities below bind that composition to the
+-- complete classifier without requiring a nested select to be emitted.
+def trust_cg_aarch64_gpr_before19 (reg before after : UInt8) : UInt8 :=
+  if reg < 19 then before else after
+
+def trust_cg_aarch64_gpr_before30 (reg before after : UInt8) : UInt8 :=
+  if reg < 30 then before else after
+
+def trust_cg_aarch64_fpr_before8 (reg before after : UInt8) : UInt8 :=
+  if reg < 8 then before else after
+
+def trust_cg_aarch64_fpr_before16 (reg before after : UInt8) : UInt8 :=
+  if reg < 16 then before else after
+
+theorem gpr_native_callee_composition (reg : UInt8) :
+    trust_cg_aarch64_gpr_before19 reg 0 (trust_cg_aarch64_gpr_before30 reg 1 0)
+      = trust_cg_aarch64_gpr_callee reg := by rfl
+
+theorem fpr_native_callee_composition (reg : UInt8) :
+    trust_cg_aarch64_fpr_before8 reg 0 (trust_cg_aarch64_fpr_before16 reg 1 0)
+      = trust_cg_aarch64_fpr_callee reg := by rfl
+
+def flagByte (f : Flag) : UInt8 :=
+  match f with
+  | Flag.yes => 1
+  | Flag.no => 0
+
+def gprIndex (reg : Gpr) : UInt8 :=
+  match reg with
+  | Gpr.x0 => 0
+  | Gpr.x1 => 1
+  | Gpr.x2 => 2
+  | Gpr.x3 => 3
+  | Gpr.x4 => 4
+  | Gpr.x5 => 5
+  | Gpr.x6 => 6
+  | Gpr.x7 => 7
+  | Gpr.x8 => 8
+  | Gpr.x9 => 9
+  | Gpr.x10 => 10
+  | Gpr.x11 => 11
+  | Gpr.x12 => 12
+  | Gpr.x13 => 13
+  | Gpr.x14 => 14
+  | Gpr.x15 => 15
+  | Gpr.x16 => 16
+  | Gpr.x17 => 17
+  | Gpr.x18 => 18
+  | Gpr.x19 => 19
+  | Gpr.x20 => 20
+  | Gpr.x21 => 21
+  | Gpr.x22 => 22
+  | Gpr.x23 => 23
+  | Gpr.x24 => 24
+  | Gpr.x25 => 25
+  | Gpr.x26 => 26
+  | Gpr.x27 => 27
+  | Gpr.x28 => 28
+  | Gpr.x29 => 29
+  | Gpr.x30 => 30
+
+def fprIndex (reg : Fpr) : UInt8 :=
+  match reg with
+  | Fpr.v0 => 0
+  | Fpr.v1 => 1
+  | Fpr.v2 => 2
+  | Fpr.v3 => 3
+  | Fpr.v4 => 4
+  | Fpr.v5 => 5
+  | Fpr.v6 => 6
+  | Fpr.v7 => 7
+  | Fpr.v8 => 8
+  | Fpr.v9 => 9
+  | Fpr.v10 => 10
+  | Fpr.v11 => 11
+  | Fpr.v12 => 12
+  | Fpr.v13 => 13
+  | Fpr.v14 => 14
+  | Fpr.v15 => 15
+  | Fpr.v16 => 16
+  | Fpr.v17 => 17
+  | Fpr.v18 => 18
+  | Fpr.v19 => 19
+  | Fpr.v20 => 20
+  | Fpr.v21 => 21
+  | Fpr.v22 => 22
+  | Fpr.v23 => 23
+  | Fpr.v24 => 24
+  | Fpr.v25 => 25
+  | Fpr.v26 => 26
+  | Fpr.v27 => 27
+  | Fpr.v28 => 28
+  | Fpr.v29 => 29
+  | Fpr.v30 => 30
+  | Fpr.v31 => 31
+
+-- Universal agreement with every constructor of the existing partition model.
+theorem gpr_native_callee_agrees (reg : Gpr) :
+    trust_cg_aarch64_gpr_callee (gprIndex reg) = flagByte (gprIsCallee reg) := by
+  cases reg <;> rfl
+
+-- Universal agreement with every constructor of the existing partition model.
+theorem fpr_native_callee_agrees (reg : Fpr) :
+    trust_cg_aarch64_fpr_callee (fprIndex reg) = flagByte (fprIsCallee reg) := by
+  cases reg <;> rfl

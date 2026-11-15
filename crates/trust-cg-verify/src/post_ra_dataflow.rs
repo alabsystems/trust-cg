@@ -85,6 +85,10 @@
 //!   The captured-spec Stage A check ([`crate::post_ra_captured_spec`],
 //!   WARN-only rollout) now covers the register half of this miss over the
 //!   post-fixup coalescing window.
+//! * A VReg read whose definition was dropped between the regalloc TV and
+//!   this check: the x86 replay of the allocator's stream omits dead inserted
+//!   copies under the rule stated and enforced on trust-cg-codegen's
+//!   `replay_x86_regalloc_stream_mutations`, not here.
 //! * Self-certifying ghost corruption (`operands[1] := operands[0]`):
 //!   mitigated by the convention above + the pinned contract test.
 //! * A buggy commutative swap applied to a NON-commutative opcode
@@ -121,8 +125,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use trust_cg_ir::regs::VReg;
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
 use trust_cg_ir::x86_64_regs::{
-    self, R8, R9, R10, R11, RAX, RCX, RDX, RSP, X86_CALLER_SAVED_GPRS, X86PReg, XMM0, XMM1,
-    x86_containing_gpr64, x86_preg_name, x86_regs_overlap,
+    self, R8, R9, R10, R11, RAX, RCX, RDX, RSP, X86_CALLER_SAVED_GPRS, X86_INTERNAL_RET_GPRS,
+    X86_INTERNAL_RET_XMMS, X86PReg, XMM0, XMM1, x86_containing_gpr64, x86_preg_name,
+    x86_regs_overlap,
 };
 use trust_cg_lower::instructions::Block;
 use trust_cg_lower::x86_64_isel::{
@@ -367,6 +372,7 @@ fn scalar_xmm_lane_masks(opcode: X86Opcode) -> Option<(u16, u16)> {
             | Cvttss2si
             | Ucomiss
             | MovssMR
+            | VolatileMovssMR
             | MovdFromXmm
     ) {
         Some((0x000f, 0x000f))
@@ -387,6 +393,7 @@ fn scalar_xmm_lane_masks(opcode: X86Opcode) -> Option<(u16, u16)> {
             | Cvttsd2si
             | Ucomisd
             | MovsdMR
+            | VolatileMovsdMR
             | MovqFromXmm
     ) {
         Some((0x00ff, 0x00ff))
@@ -1067,10 +1074,19 @@ pub(crate) fn classify_x86_post_ra_inst(
             for &result in regs {
                 let reg = result.reg;
                 // These are the only result registers emitted by the current
-                // x86 lowering boundary (scalar, i128, and <=2-eightbyte
-                // aggregate returns). Width aliases are rejected: metadata is
-                // expressed in canonical ABI registers, never operand widths.
-                if !matches!(reg, RAX | RDX | XMM0 | XMM1) {
+                // x86 lowering boundary: the C return file (scalar, i128, and
+                // <=2-eightbyte aggregate returns) and, under System V only,
+                // TrustCG's internal multi-result file it prefixes
+                // (RCX,RSI,RDI,R8,R9 / XMM2-XMM7 past it). Width aliases are
+                // rejected: metadata is expressed in canonical ABI registers,
+                // never operand widths.
+                let is_result_register = match call_abi {
+                    X86CallAbi::SystemV => {
+                        X86_INTERNAL_RET_GPRS.contains(&reg) || X86_INTERNAL_RET_XMMS.contains(&reg)
+                    }
+                    X86CallAbi::WindowsX64 => matches!(reg, RAX | RDX | XMM0 | XMM1),
+                };
+                if !is_result_register {
                     return Err(malformed(
                         inst,
                         "call-result metadata names a non-result ABI register",
@@ -1097,7 +1113,7 @@ pub(crate) fn classify_x86_post_ra_inst(
                         "call-result metadata must name a trackable GPR/XMM register",
                     ));
                 };
-                let width_is_valid = if reg == RAX || reg == RDX {
+                let width_is_valid = if !reg.is_xmm() {
                     matches!(result.defined_bits, 8 | 16 | 32 | 64)
                 } else {
                     matches!(result.defined_bits, 16 | 32 | 64 | 128)
@@ -1536,6 +1552,30 @@ pub(crate) fn classify_x86_post_ra_inst(
             }
         }
 
+        // --- The 128-bit atomic-load pseudo: `XOR EAX,EAX; XOR EDX,EDX;
+        // XOR EBX,EBX; XOR ECX,ECX; LOCK CMPXCHG16B [base + disp]`. It reads
+        // ONLY the address base — the comparand and replacement registers are
+        // zeroed inside the pseudo, so their incoming values are never read —
+        // and writes all four (RDX:RAX = the loaded value, RCX:RBX = 0). The
+        // XORs define CF/OF/SF/ZF/PF (AF undefined) and CMPXCHG16B then
+        // writes ZF; modeled conservatively as ZF defined and the other five
+        // UNDEFINED, so no consumer may rely on a flag carried across it.
+        // Memory form only: exactly one `[base + disp]` operand. ---
+        AtomicLoadCmpxchg16b => {
+            let [op @ X86ISelOperand::MemAddr { .. }] = inst.operands.as_slice() else {
+                return Err(malformed(
+                    inst,
+                    "AtomicLoadCmpxchg16b requires exactly one [base + disp] memory operand",
+                ));
+            };
+            add_definite_flag_effect(&mut acc, FLAG_ZF, FLAGS_ALL & !FLAG_ZF);
+            acc.read_reg_or_mem(op, alloc);
+            acc.def_preg(RAX);
+            acc.def_preg(RDX);
+            acc.def_preg(x86_64_regs::RBX);
+            acc.def_preg(RCX);
+        }
+
         // --- Atomic RMW CAS-loop pseudos: the encoder's retry loop pins the
         // RAX-root accumulator and the R10-root scratch and zero-extends the
         // old value into dst (operands[0]); the value and memory operands are
@@ -1581,10 +1621,11 @@ pub(crate) fn classify_x86_post_ra_inst(
         // --- Plain destination defs: operands[0] freshly defined,
         // operands[1..] read (memory recursed). ---
         MovRI | MovRM8 | MovRM16 | MovRM32 | MovRM | MovRMSib | MovsxdRMSib | MovRM32Sib
-        | MovRM8Sib | VolatileMovRM8 | VolatileMovRM16 | VolatileMovRM32 | VolatileMovRM
-        | VolatileMovssRM | VolatileMovsdRM | VolatileMovdquRM | VolatileMovdqaRM | Movzx
-        | MovzxW | MovsxB | MovsxW | Movsx | Lea | LeaSib | LeaRip | MovRipRel | MovRipRelTlv
-        | MovssRipRel | MovsdRipRel | MovsdRM | MovssRM | MovsdRMSib | MovssRMSib | MovdquRM
+        | MovRM8Sib | MovzxRM8 | MovzxRM16 | MovzxRM8Sib | VolatileMovzxRM8 | VolatileMovzxRM16
+        | VolatileMovRM8 | VolatileMovRM16 | VolatileMovRM32 | VolatileMovRM | VolatileMovssRM
+        | VolatileMovsdRM | VolatileMovdquRM | VolatileMovdqaRM | Movzx | MovzxW | MovsxB
+        | MovsxW | Movsx | Lea | LeaSib | LeaRip | MovRipRel | MovRipRelTlv | MovssRipRel
+        | MovsdRipRel | MovsdRM | MovssRM | MovsdRMSib | MovssRMSib | MovdquRM | MovdquRMSib
         | MovdqaRM | Sqrtsd | Sqrtss | Roundsd | Roundss | Cvtsi2sd | Cvtsd2si | Cvtsi2ss
         | Cvtss2si | Cvtsd2ss | Cvtss2sd | Cvttsd2si | Cvttss2si | MovdToXmm | MovdFromXmm
         | MovqToXmm | MovqFromXmm | Pshufd | Pmovmskb | Pextrd | Pextrq | V4I32MaskExtract
@@ -1674,9 +1715,9 @@ pub(crate) fn classify_x86_post_ra_inst(
 
         // --- Stores: value register + address registers read, no defs. ---
         MovMR8 | MovMR16 | MovMR32 | MovMR | MovMRSib | MovMR32Sib | MovMR8Sib | MovsdMR
-        | MovssMR | MovdquMR | MovdqaMR | VolatileMovMR8 | VolatileMovMR16 | VolatileMovMR32
-        | VolatileMovMR | VolatileMovssMR | VolatileMovsdMR | VolatileMovdquMR
-        | VolatileMovdqaMR => {
+        | MovssMR | MovdquMR | MovdquMRSib | MovdqaMR | VolatileMovMR8 | VolatileMovMR16
+        | VolatileMovMR32 | VolatileMovMR | VolatileMovssMR | VolatileMovsdMR
+        | VolatileMovdquMR | VolatileMovdqaMR => {
             for op in &inst.operands {
                 acc.read_reg_or_mem(op, alloc);
             }
@@ -2180,9 +2221,146 @@ fn call_taint_block_entries(
 // CFG-wide vreg-named call-severed dataflow (the #66 net)
 // ---------------------------------------------------------------------------
 
-/// Deterministically-ordered set of vregs whose caller-saved register home has
-/// been clobbered by a call since their last def-by-name.
-type SeveredSet = std::collections::BTreeSet<VReg>;
+/// Set of vregs whose caller-saved register home has been clobbered by a call
+/// since their last def-by-name, as a dense bitset over
+/// [`SeveredUniverse`]'s index space.
+///
+/// WHY A BITSET IS EXACT HERE (the representation obligation). The only site
+/// that ever ADDS a member to a severed set is [`transfer_call_severed`]'s
+/// call arm, and every value it adds is drawn from the `caller_saved_homed`
+/// vector. Block-entry states are unions of block-output states, and every
+/// state starts EMPTY. By induction over the fixpoint, every reachable severed
+/// set is therefore a SUBSET of `caller_saved_homed`'s vregs — so a bitset over
+/// exactly those vregs can represent every reachable state, and no membership
+/// can be silently dropped. `remove` of a vreg outside the universe is a no-op
+/// under both representations (it was never a member).
+///
+/// This replaced a `BTreeSet<VReg>`, whose per-element `insert` made the
+/// per-call transfer O(|caller_saved_homed| · log n); on a call-dense function
+/// that is quadratic in the function size and measured as ~65% of the whole
+/// `x86_compile_module` phase at 2400 functions. The DECISIONS are unchanged:
+/// the lattice, the meet (union), the transfer, and the fixpoint termination
+/// condition are identical element-for-element.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SeveredSet {
+    words: Vec<u64>,
+}
+
+impl SeveredSet {
+    fn empty(words: usize) -> Self {
+        Self {
+            words: vec![0; words],
+        }
+    }
+
+    /// Meet of the severed lattice: set UNION (a read is unsafe if ANY
+    /// reachable predecessor path severs it).
+    fn union_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        for (dst, src) in self.words.iter_mut().zip(other.words.iter()) {
+            *dst |= *src;
+        }
+    }
+
+    fn insert_index(&mut self, index: u32) {
+        self.words[index as usize / 64] |= 1u64 << (index % 64);
+    }
+
+    fn remove_index(&mut self, index: u32) {
+        self.words[index as usize / 64] &= !(1u64 << (index % 64));
+    }
+
+    fn contains_index(&self, index: u32) -> bool {
+        self.words[index as usize / 64] & (1u64 << (index % 64)) != 0
+    }
+
+    fn copy_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        self.words.copy_from_slice(&other.words);
+    }
+}
+
+/// The dense index space the severed bitsets live in: exactly the
+/// caller-saved-homed vregs of ONE function, in
+/// [`caller_saved_homed_vregs`]'s already-deterministic sorted order.
+///
+/// It also memoizes the post-call state for each distinct call
+/// result-location signature. That memo is what makes the per-call transfer
+/// O(universe/64) words instead of O(universe) tree insertions; see
+/// [`transfer_call_severed`] for the equivalence argument that licenses it.
+struct SeveredUniverse {
+    /// vreg -> dense index.
+    index: HashMap<VReg, u32>,
+    /// dense index -> the caller-saved home location that vreg is allocated to.
+    homes: Vec<u8>,
+    /// bitset width in 64-bit words.
+    words: usize,
+    /// Memo: sorted-deduped call result locations -> the post-call severed
+    /// state they induce (`ALL \ {v : home(v) is a result loc}`).
+    post_call: std::cell::RefCell<Vec<(Vec<u8>, SeveredSet)>>,
+}
+
+impl SeveredUniverse {
+    fn new(caller_saved_homed: &[(VReg, u8)]) -> Self {
+        let mut index = HashMap::with_capacity(caller_saved_homed.len());
+        let mut homes = Vec::with_capacity(caller_saved_homed.len());
+        for (i, &(vreg, home)) in caller_saved_homed.iter().enumerate() {
+            index.insert(vreg, i as u32);
+            homes.push(home);
+        }
+        Self {
+            index,
+            homes,
+            words: caller_saved_homed.len().div_ceil(64),
+            post_call: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn empty_set(&self) -> SeveredSet {
+        SeveredSet::empty(self.words)
+    }
+
+    fn index_of(&self, vreg: &VReg) -> Option<u32> {
+        self.index.get(vreg).copied()
+    }
+
+    fn contains(&self, set: &SeveredSet, vreg: &VReg) -> bool {
+        self.index_of(vreg).is_some_and(|i| set.contains_index(i))
+    }
+
+    /// Overwrite `dst` with the post-call severed state for a call declaring
+    /// `results`: every caller-saved-homed vreg EXCEPT those homed at a result
+    /// location. Memoized per distinct result-location SET (a function has at
+    /// most a handful; SysV scalar calls declare RAX and possibly RDX), and
+    /// written through `dst` so the hot path allocates nothing.
+    fn apply_post_call(&self, results: &[CallResultLoc], dst: &mut SeveredSet) {
+        // Key equality is SET equality, not sequence equality, so two calls
+        // that declare the same locations in a different order share one memo
+        // entry — and, more importantly, can never get different states.
+        let matches = |key: &[u8]| {
+            key.iter().all(|l| results.iter().any(|r| r.loc == *l))
+                && results.iter().all(|r| key.contains(&r.loc))
+        };
+        {
+            let memo = self.post_call.borrow();
+            if let Some((_, state)) = memo.iter().find(|(key, _)| matches(key)) {
+                dst.copy_from(state);
+                return;
+            }
+        }
+        let mut key: Vec<u8> = results.iter().map(|r| r.loc).collect();
+        key.sort_unstable();
+        key.dedup();
+        let mut state = self.empty_set();
+        for (i, home) in self.homes.iter().enumerate() {
+            if !key.contains(home) {
+                state.insert_index(i as u32);
+            }
+        }
+        dst.copy_from(&state);
+        self.post_call.borrow_mut().push((key, state));
+    }
+}
 
 /// The trackable ROOT locations a call clobbers under `call_abi` — exactly the
 /// sets [`transfer_call_taint`] havocs, so the vreg-named net and the lane
@@ -2236,21 +2414,28 @@ fn caller_saved_homed_vregs(
 /// coalesced call-result pattern (`v` allocated onto RAX with the bridge copy
 /// coalesced away) — the lane taint governs those locations, same as
 /// [`transfer_call_taint`]'s result-loc kill.
-fn transfer_call_severed(
-    severed: &mut SeveredSet,
-    acc: &InstAccess,
-    caller_saved_homed: &[(VReg, u8)],
-) {
-    for v in &acc.vreg_defs {
-        severed.remove(v);
-    }
+///
+/// EQUIVALENCE (why the call arm may overwrite the incoming state wholesale).
+/// The reference formulation is: first remove every `vreg_defs` member, then
+/// for every `(v, home)` in `caller_saved_homed` remove `v` when `home` is a
+/// declared result location and insert it otherwise. Writing `ALL` for the
+/// universe, `R` for the result-homed subset and `S1` for the state after the
+/// def-removals, the call arm computes `(S1 ∪ (ALL \ R)) \ R`. `R` and
+/// `ALL \ R` partition `ALL`, each vreg occurs at most once in
+/// `caller_saved_homed` (it is built from a `VReg -> PReg` map, so the loop
+/// order cannot matter), and `S1 ⊆ S ⊆ ALL` by the subset invariant documented
+/// on [`SeveredSet`]. Hence `S1 \ R ⊆ ALL \ R` and the whole expression
+/// collapses to exactly `ALL \ R` — INDEPENDENT of the incoming state and of
+/// the def-removals, which the call re-decides for every universe member. So
+/// assigning the memoized `ALL \ R` is the same set, not an approximation.
+fn transfer_call_severed(severed: &mut SeveredSet, acc: &InstAccess, universe: &SeveredUniverse) {
     if let Some(results) = &acc.call_result_locs {
-        for &(vreg, home_loc) in caller_saved_homed {
-            if results.iter().any(|r| r.loc == home_loc) {
-                severed.remove(&vreg);
-            } else {
-                severed.insert(vreg);
-            }
+        universe.apply_post_call(results, severed);
+        return;
+    }
+    for v in &acc.vreg_defs {
+        if let Some(i) = universe.index_of(v) {
+            severed.remove_index(i);
         }
     }
 }
@@ -2267,9 +2452,9 @@ fn call_severed_vregs_block_entries(
     alloc: &HashMap<VReg, X86PReg>,
     call_abi: X86CallAbi,
     taint_entries: &HashMap<Block, CallTaintState>,
+    universe: &SeveredUniverse,
 ) -> Result<HashMap<Block, SeveredSet>, Vec<String>> {
     let entry_block = func.block_order.first().copied();
-    let caller_saved_homed = caller_saved_homed_vregs(alloc, call_abi);
     let protected_calls = unique_x86_eh_calls(func)?;
     let exceptional_edges: HashSet<(Block, Block)> = protected_calls
         .iter()
@@ -2322,11 +2507,11 @@ fn call_severed_vregs_block_entries(
         .block_order
         .iter()
         .copied()
-        .map(|block| (block, SeveredSet::new()))
+        .map(|block| (block, universe.empty_set()))
         .collect();
     let mut eh_outputs: HashMap<(Block, Block), SeveredSet> = protected_calls
         .iter()
-        .map(|(&src, &(_, dst))| ((src, dst), SeveredSet::new()))
+        .map(|(&src, &(_, dst))| ((src, dst), universe.empty_set()))
         .collect();
     loop {
         let mut changed = false;
@@ -2334,7 +2519,7 @@ fn call_severed_vregs_block_entries(
             if !reachable.contains(&block_id) {
                 continue;
             }
-            let mut state = SeveredSet::new();
+            let mut state = universe.empty_set();
             if let Some(block_preds) = preds.get(&block_id) {
                 for &pred in block_preds {
                     if !reachable.contains(&pred) {
@@ -2344,17 +2529,17 @@ fn call_severed_vregs_block_entries(
                     if normal_edges.contains(&edge)
                         && let Some(edge_state) = outputs.get(&pred)
                     {
-                        state.extend(edge_state.iter().copied());
+                        state.union_with(edge_state);
                     }
                     if let Some(edge_state) = eh_outputs.get(&edge) {
-                        state.extend(edge_state.iter().copied());
+                        state.union_with(edge_state);
                     }
                 }
             }
             if let Some(block) = func.blocks.get(&block_id) {
                 for (inst_idx, inst) in block.insts.iter().enumerate() {
                     if let Ok(acc) = classify_x86_post_ra_inst(inst, alloc, call_abi) {
-                        transfer_call_severed(&mut state, &acc, &caller_saved_homed);
+                        transfer_call_severed(&mut state, &acc, universe);
                     }
                     if let Some(&(protected_idx, landing_pad)) = protected_calls.get(&block_id)
                         && inst_idx == protected_idx
@@ -2379,7 +2564,7 @@ fn call_severed_vregs_block_entries(
 
     let mut entries = HashMap::with_capacity(func.block_order.len());
     for &block_id in &func.block_order {
-        let mut state = SeveredSet::new();
+        let mut state = universe.empty_set();
         if let Some(block_preds) = preds.get(&block_id) {
             for &pred in block_preds {
                 if !reachable.contains(&pred) {
@@ -2389,10 +2574,10 @@ fn call_severed_vregs_block_entries(
                 if normal_edges.contains(&edge)
                     && let Some(edge_state) = outputs.get(&pred)
                 {
-                    state.extend(edge_state.iter().copied());
+                    state.union_with(edge_state);
                 }
                 if let Some(edge_state) = eh_outputs.get(&edge) {
-                    state.extend(edge_state.iter().copied());
+                    state.union_with(edge_state);
                 }
             }
         }
@@ -2557,8 +2742,13 @@ pub fn check_x86_post_ra_dataflow_with_abi(
     };
     // Same pure inputs as the taint fixpoint, so this cannot fail where that
     // succeeded; the arm exists only to stay fail-closed by construction.
+    // ONE universe per function, shared by the fixpoint and the walk below so
+    // both index the same vregs (and so `caller_saved_homed_vregs` — an
+    // `alloc`-sized sort — runs once instead of twice).
+    let caller_saved_homed = caller_saved_homed_vregs(alloc, call_abi);
+    let universe = SeveredUniverse::new(&caller_saved_homed);
     let severed_entries =
-        match call_severed_vregs_block_entries(func, alloc, call_abi, &taint_entries) {
+        match call_severed_vregs_block_entries(func, alloc, call_abi, &taint_entries, &universe) {
             Ok(entries) => entries,
             Err(errors) => {
                 violations.extend(errors.into_iter().map(|detail| PostRaDataflowViolation {
@@ -2571,7 +2761,6 @@ pub fn check_x86_post_ra_dataflow_with_abi(
                 return violations;
             }
         };
-    let caller_saved_homed = caller_saved_homed_vregs(alloc, call_abi);
 
     // The exact ABI result-register lanes every `Ret` in this function
     // delivers to its caller, from the SAME return classifier the lowering
@@ -2605,7 +2794,10 @@ pub fn check_x86_post_ra_dataflow_with_abi(
             .get(block_id)
             .copied()
             .unwrap_or([0; NUM_LOCS]);
-        let mut severed = severed_entries.get(block_id).cloned().unwrap_or_default();
+        let mut severed = severed_entries
+            .get(block_id)
+            .cloned()
+            .unwrap_or_else(|| universe.empty_set());
 
         for (inst_idx, inst) in block.insts.iter().enumerate() {
             let site = format!(
@@ -2672,7 +2864,7 @@ pub fn check_x86_post_ra_dataflow_with_abi(
             // severed set — the launder-immune net for values living across
             // calls in caller-saved homes (bug #66's class).
             for vreg in &acc.vreg_reads {
-                if severed.contains(vreg) {
+                if universe.contains(&severed, vreg) {
                     let home = alloc.get(vreg).map_or_else(
                         || "<unallocated>".to_string(),
                         |p| x86_preg_name(*p).to_string(),
@@ -2743,7 +2935,7 @@ pub fn check_x86_post_ra_dataflow_with_abi(
             // (4) Transfer.
             transfer_symbolic_state(&mut state, &acc, call_abi, inst_idx as u32);
             transfer_call_taint(&mut call_taint, &acc, call_abi);
-            transfer_call_severed(&mut severed, &acc, &caller_saved_homed);
+            transfer_call_severed(&mut severed, &acc, &universe);
         }
     }
 
@@ -3275,6 +3467,98 @@ mod tests {
             .count()
     }
 
+    /// The dense-bitset severed representation must agree ELEMENT-FOR-ELEMENT
+    /// with the reference `BTreeSet` formulation of [`transfer_call_severed`]
+    /// that it replaced. This pins the two properties the replacement rests on:
+    ///
+    ///  1. the def arm removes exactly the universe members named by
+    ///     `vreg_defs` and nothing else;
+    ///  2. the call arm's result is `ALL \ {v : home(v) is a result loc}`
+    ///     INDEPENDENT of the incoming state (the collapse argued in
+    ///     `transfer_call_severed`'s doc comment) — so memoizing it per
+    ///     result-location signature is exact, not an approximation.
+    #[test]
+    fn severed_bitset_matches_the_reference_settheoretic_transfer() {
+        // A universe with two vregs homed in RAX and RDX plus one in R11.
+        let homed: Vec<(VReg, u8)> = vec![
+            (VReg::new(0, RegClass::Gpr64), loc_of(RAX).unwrap()),
+            (VReg::new(1, RegClass::Gpr64), loc_of(RDX).unwrap()),
+            (VReg::new(2, RegClass::Gpr64), loc_of(R11).unwrap()),
+        ];
+        let universe = SeveredUniverse::new(&homed);
+
+        // Reference: the pre-bitset formulation, verbatim.
+        fn reference(
+            severed: &mut std::collections::BTreeSet<VReg>,
+            defs: &[VReg],
+            results: Option<&[CallResultLoc]>,
+            homed: &[(VReg, u8)],
+        ) {
+            for v in defs {
+                severed.remove(v);
+            }
+            if let Some(results) = results {
+                for &(vreg, home_loc) in homed {
+                    if results.iter().any(|r| r.loc == home_loc) {
+                        severed.remove(&vreg);
+                    } else {
+                        severed.insert(vreg);
+                    }
+                }
+            }
+        }
+
+        let rax_result = [CallResultLoc {
+            loc: loc_of(RAX).unwrap(),
+            defined_bits: 64,
+        }];
+        // Every incoming state in the universe's powerset, against every
+        // (defs, results) shape the classifier can produce here.
+        for bits in 0u32..(1 << 3) {
+            for defs in [
+                vec![],
+                vec![VReg::new(0, RegClass::Gpr64)],
+                vec![VReg::new(2, RegClass::Gpr64)],
+                // a vreg OUTSIDE the universe: a no-op under both models
+                vec![VReg::new(99, RegClass::Gpr64)],
+            ] {
+                for results in [None, Some(&[][..]), Some(&rax_result[..])] {
+                    let mut bitset = universe.empty_set();
+                    let mut refset = std::collections::BTreeSet::new();
+                    for i in 0..3u32 {
+                        if bits & (1 << i) != 0 {
+                            bitset.insert_index(i);
+                            refset.insert(homed[i as usize].0);
+                        }
+                    }
+                    let acc = InstAccess {
+                        vreg_defs: defs.clone(),
+                        call_result_locs: results.map(<[CallResultLoc]>::to_vec),
+                        ..InstAccess::default()
+                    };
+                    transfer_call_severed(&mut bitset, &acc, &universe);
+                    reference(&mut refset, &defs, results, &homed);
+
+                    for (i, &(vreg, _)) in homed.iter().enumerate() {
+                        assert_eq!(
+                            bitset.contains_index(i as u32),
+                            refset.contains(&vreg),
+                            "bits={bits:#05b} defs={defs:?} results={results:?}: \
+                             membership of {vreg} diverged"
+                        );
+                    }
+                    // The severed set can never gain a vreg outside the
+                    // universe — the invariant the bitset representation rests
+                    // on.
+                    assert!(
+                        refset.iter().all(|v| universe.index_of(v).is_some()),
+                        "reference transfer escaped the caller-saved-homed universe"
+                    );
+                }
+            }
+        }
+    }
+
     /// (a) A vreg homed in caller-saved RDX, defined before a call and read
     /// after it with no intervening def-by-name: enforce-tier violation.
     #[test]
@@ -3511,8 +3795,12 @@ mod tests {
         let cases = [
             missing,
             non_call,
+            // R10 is caller-saved but in NO result file (it is post-RA
+            // scratch), and XMM8 is past the internal XMM0-XMM7 file.
             inst(X86Opcode::Call, vec![X86ISelOperand::Symbol("f".into())])
-                .with_call_result_regs(vec![call_result(RCX, 64)]),
+                .with_call_result_regs(vec![call_result(R10, 64)]),
+            inst(X86Opcode::Call, vec![X86ISelOperand::Symbol("f".into())])
+                .with_call_result_regs(vec![call_result(x86_64_regs::XMM8, 64)]),
             inst(X86Opcode::Call, vec![X86ISelOperand::Symbol("f".into())])
                 .with_call_result_regs(vec![call_result(RAX, 64), call_result(RAX, 32)]),
             inst(X86Opcode::Call, vec![X86ISelOperand::Symbol("f".into())])
@@ -3530,6 +3818,59 @@ mod tests {
                 "malformed call-result metadata must fail closed: {violations:?}"
             );
         }
+    }
+
+    /// System V admits TrustCG's internal multi-result registers as call
+    /// results (RCX,RSI,RDI,R8,R9 and XMM2-XMM7 past the C file) and models
+    /// exactly those bits as defined by the call; Windows x64 defines no such
+    /// extension and still refuses them.
+    #[test]
+    fn x86_internal_multi_result_registers_are_sysv_call_results_only() {
+        use trust_cg_ir::x86_64_regs::{RDI, RSI, XMM2, XMM7};
+        let results = vec![
+            call_result(RAX, 64),
+            call_result(RDX, 64),
+            call_result(RCX, 32),
+            call_result(RSI, 8),
+            call_result(RDI, 64),
+            call_result(R8, 16),
+            call_result(R9, 64),
+            call_result(XMM0, 64),
+            call_result(XMM2, 32),
+            call_result(XMM7, 64),
+        ];
+        let reads = vec![
+            inst(X86Opcode::Call, vec![X86ISelOperand::Symbol("f".into())])
+                .with_call_result_regs(results.clone()),
+            inst(
+                X86Opcode::MovRR32,
+                vec![p(x86_64_regs::EBX), p(x86_64_regs::ECX)],
+            ),
+            inst(X86Opcode::MovRR, vec![p(x86_64_regs::R12), p(RDI)]),
+            inst(X86Opcode::MovRR, vec![p(x86_64_regs::R13), p(R9)]),
+            inst(X86Opcode::MovsdRR, vec![p(x86_64_regs::XMM8), p(XMM7)]),
+        ];
+        let func = x86_func("internal_results", reads.clone());
+        let violations =
+            check_x86_post_ra_dataflow_with_abi(&func, &HashMap::new(), X86CallAbi::SystemV);
+        assert!(violations.is_empty(), "{violations:?}");
+
+        // A read past a result's defined width is still call-clobbered.
+        let mut wide = reads.clone();
+        wide.push(inst(X86Opcode::MovRR, vec![p(x86_64_regs::R14), p(RSI)]));
+        let func = x86_func("internal_results_wide", wide);
+        assert!(
+            check_x86_post_ra_dataflow_with_abi(&func, &HashMap::new(), X86CallAbi::SystemV)
+                .iter()
+                .any(|v| v.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg)
+        );
+
+        let func = x86_func("internal_results_win64", reads);
+        assert!(
+            check_x86_post_ra_dataflow_with_abi(&func, &HashMap::new(), X86CallAbi::WindowsX64)
+                .iter()
+                .any(|v| v.kind == PostRaDataflowViolationKind::MalformedOperands)
+        );
     }
 
     #[test]
@@ -5354,6 +5695,48 @@ mod tests {
         );
         let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// A VOLATILE scalar store reads exactly the lanes its non-volatile form
+    /// reads: `movss` four bytes, `movsd` eight. A 32-bit FP call result's
+    /// upper lanes are call-clobbered garbage, so modeling the volatile form
+    /// as a full-register read failed closed on a correct program (an `f32`
+    /// call result volatile-stored after a later call). The garbage in the
+    /// SCALAR lane still fails closed.
+    #[test]
+    fn x86_volatile_scalar_fp_store_reads_only_its_scalar_lane() {
+        for (store, bits) in [
+            (X86Opcode::VolatileMovssMR, 32),
+            (X86Opcode::VolatileMovsdMR, 64),
+        ] {
+            let clean = x86_func(
+                "volatile_scalar_store",
+                vec![
+                    inst(X86Opcode::Call, vec![X86ISelOperand::Symbol("fmaf".into())])
+                        .with_call_result_regs(vec![call_result(XMM0, bits)]),
+                    inst(store, vec![base_mem(p(RBX)), p(XMM0)]),
+                    inst(X86Opcode::Ret, vec![]),
+                ],
+            );
+            let violations = check_x86_post_ra_dataflow(&clean, &HashMap::new());
+            assert!(violations.is_empty(), "{store:?}: {violations:?}");
+
+            let garbage = x86_func(
+                "volatile_scalar_store_garbage",
+                vec![
+                    // Void call: the scalar lane itself is clobbered.
+                    inst(X86Opcode::Call, vec![X86ISelOperand::Symbol("g".into())]),
+                    inst(store, vec![base_mem(p(RBX)), p(XMM0)]),
+                ],
+            );
+            let violations = check_x86_post_ra_dataflow(&garbage, &HashMap::new());
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| v.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg),
+                "{store:?}: {violations:?}"
+            );
+        }
     }
 
     /// Same routing, but the flowed garbage reaches a packed op that is NOT

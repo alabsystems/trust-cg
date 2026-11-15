@@ -1,0 +1,23 @@
+; TrustIr text format v1
+module "mir::closure::export_kind_code_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_wasm_encode_slice.rs"
+
+functy.0 = (u32) -> (u32)
+
+functy.1 = () -> (u8)
+
+fn @export_kind_code_root(functy.0) {
+bb0(%0: u32):
+    %2 = call @func.1()
+    br bb1(%2)
+bb1(%1: u8):
+    %3 = zext u8 %1 to u32
+    ret %3
+}
+
+fn @ExportKind__code(functy.1) {
+bb0:
+    %0 = const u8 0
+    ret %0
+}

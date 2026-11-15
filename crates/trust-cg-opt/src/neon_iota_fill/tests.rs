@@ -4,6 +4,7 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use super::*;
+use trust_cg_ir::MachInst;
 use trust_cg_ir::Signature;
 
 fn x(id: u32) -> MachOperand {
@@ -239,6 +240,132 @@ fn run(cfg: Cfg) -> (MachFunction, bool) {
     (func, changed)
 }
 
+fn allocation_control() -> MachFunction {
+    build_iota(Cfg {
+        bound: BoundK::Const(1024),
+        addv: Add::Invariant,
+        variant: Variant::Good,
+    })
+}
+
+#[test]
+fn candidate_boundary_success_snapshot() {
+    let mut func = allocation_control();
+    assert!(NeonIotaFillPass::new().run(&mut func));
+    println!("CANDIDATE_SNAPSHOT_IOTA: {func:?}");
+}
+
+fn assert_allocation_decline(counter: u32) {
+    let mut func = allocation_control();
+    func.next_vreg = counter;
+    let before = format!("{func:?}");
+    let mut pass = NeonIotaFillPass::new();
+    assert!(!pass.run(&mut func));
+    assert_eq!(pass.fired(), 0);
+    assert_eq!(
+        format!("{func:?}"),
+        before,
+        "decline must preserve the whole function"
+    );
+}
+
+#[test]
+fn iota_allocation_exhaustion_declines_without_edits() {
+    assert_allocation_decline(u32::MAX);
+}
+
+#[test]
+fn iota_allocation_late_exhaustion_rolls_back_emitted_setup() {
+    assert_allocation_decline(u32::MAX - 4);
+}
+
+#[test]
+fn iota_allocation_cannot_reuse_noalias_parameter_identity() {
+    let mut func = allocation_control();
+    func.noalias_params.push(u32::MAX);
+    let before = format!("{func:?}");
+    assert!(!NeonIotaFillPass::new().run(&mut func));
+    assert_eq!(format!("{func:?}"), before);
+}
+
+#[test]
+fn iota_allocation_splice_decline_rolls_back_complete_candidate() {
+    let mut func = allocation_control();
+    let dom = DomTree::compute(&func);
+    let loops = LoopAnalysis::compute(&func, &dom);
+    let defs = crate::effects::build_reaching_def_map(&func);
+    let rec = loops
+        .all_loops()
+        .find_map(|lp| Recognized::recognize(&func, &dom, &defs, lp.header, lp.latch, &lp.body))
+        .expect("control must be recognized");
+    // Inject a stale plan after recognition to arm the late refusal branch.
+    func.inst_mut(rec.preheader_term).operands.clear();
+    let before = format!("{func:?}");
+    assert!(!apply(&mut func, &rec));
+    assert_eq!(format!("{func:?}"), before);
+}
+
+#[test]
+fn iota_allocation_jumps_sparse_detached_ids_and_keeps_metadata_fresh() {
+    let mut func = allocation_control();
+    let control_max_id = func
+        .insts
+        .iter()
+        .flat_map(|inst| &inst.operands)
+        .filter_map(trust_cg_ir::MachOperand::as_vreg)
+        .map(|reg| reg.id)
+        .max()
+        .unwrap();
+    func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![x(1_000_000_000)]));
+    func.noalias_params.push(1_000_000_007);
+    let old_len = func.insts.len();
+    assert!(NeonIotaFillPass::new().run(&mut func));
+    let fresh: Vec<_> = func.insts[old_len..]
+        .iter()
+        .flat_map(|inst| &inst.operands)
+        .filter_map(trust_cg_ir::MachOperand::as_vreg)
+        .filter(|reg| reg.id > control_max_id)
+        .collect();
+    assert!(!fresh.is_empty());
+    assert!(fresh.iter().all(|reg| reg.id > 1_000_000_007));
+    assert!(func.next_vreg > 1_000_000_007);
+    assert_eq!(func.noalias_params, [1_000_000_007]);
+}
+
+#[test]
+fn iota_allocation_missing_setup_anchor_declines_without_edits() {
+    let mut func = allocation_control();
+    let dom = DomTree::compute(&func);
+    let loops = LoopAnalysis::compute(&func, &dom);
+    let defs = crate::effects::build_reaching_def_map(&func);
+    let rec = loops
+        .all_loops()
+        .find_map(|lp| Recognized::recognize(&func, &dom, &defs, lp.header, lp.latch, &lp.body))
+        .expect("control must be recognized");
+    for block in &mut func.blocks {
+        block.insts.retain(|id| *id != rec.preheader_term);
+    }
+    let before = format!("{func:?}");
+    assert!(!apply(&mut func, &rec));
+    assert_eq!(format!("{func:?}"), before);
+}
+
+#[test]
+fn iota_allocation_missing_layout_anchor_declines_without_edits() {
+    let mut func = allocation_control();
+    let dom = DomTree::compute(&func);
+    let loops = LoopAnalysis::compute(&func, &dom);
+    let defs = crate::effects::build_reaching_def_map(&func);
+    let rec = loops
+        .all_loops()
+        .find_map(|lp| Recognized::recognize(&func, &dom, &defs, lp.header, lp.latch, &lp.body))
+        .expect("control must be recognized");
+    func.block_order.retain(|block| *block != rec.header);
+    let before = format!("{func:?}");
+    assert!(!apply(&mut func, &rec));
+    assert_eq!(format!("{func:?}"), before);
+}
+
 // ---------------------------------------------------------------------------
 // Positive cases
 // ---------------------------------------------------------------------------
@@ -293,7 +420,7 @@ fn fires_on_runtime_bound_with_precheck() {
     assert!(
         func.blocks.iter().flat_map(|b| b.insts.iter()).any(|&id| {
             let inst = func.inst(id);
-            inst.opcode == AArch64Opcode::CmpRI && imm_of(&inst.operands[1]) == Some(16)
+            inst.opcode == AArch64Opcode::CmpRI && inst.operands[1].as_imm() == Some(16)
         }),
         "runtime bound needs the n<16 precheck"
     );
@@ -499,7 +626,8 @@ fn second_run_is_a_no_op() {
 /// the primary test did not exercise).
 #[test]
 fn second_run_is_a_no_op_for_every_firing_variant() {
-    let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+    type Build = Box<dyn Fn() -> MachFunction>;
+    let cases: Vec<(&str, Build)> = vec![
         (
             "const-bound",
             Box::new(|| {
@@ -555,4 +683,39 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the vector loop reproduces only
+// `iv`. `EscapingDef` above is the single-def live-out row the contract alone
+// refuses; these add a carried register and a live-out-only register (which
+// the single-def discipline also refuses).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    let iv = VReg::new(13, RegClass::Gpr64);
+    let good = || {
+        build_iota(Cfg {
+            bound: BoundK::Const(1024),
+            addv: Add::Invariant,
+            variant: Variant::Good,
+        })
+    };
+    assert!(
+        NeonIotaFillPass::new().run(&mut good()),
+        "plain fixture fires"
+    );
+    let mut carried = good();
+    crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+    assert!(
+        !NeonIotaFillPass::new().run(&mut carried),
+        "second accumulator"
+    );
+    let mut live_out = good();
+    crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+    assert!(
+        !NeonIotaFillPass::new().run(&mut live_out),
+        "live-out register"
+    );
 }

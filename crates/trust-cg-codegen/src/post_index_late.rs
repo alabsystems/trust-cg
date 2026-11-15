@@ -37,29 +37,44 @@
 //! > once per iteration.
 //!
 //! Both are proven on the POST-RA CFG (which is final) with the real
-//! [`DomTree`]/[`LoopAnalysis`]: the load's block must be dominated by the loop
-//! header and must dominate every back-edge source, and the IV's only in-loop
-//! definition must be a single `AddRI Xk, Xk, #1`. That is strictly weaker than
+//! [`DomTree`]/[`LoopAnalysis`]: the loop body must have no cycle that avoids
+//! the header, the load's block must be dominated by the loop header and must
+//! dominate every back-edge source, and the IV's only in-loop definition must
+//! be a single `AddRI Xk, Xk, #1` in such a block, after the load. The
+//! acyclicity test is what makes "dominates every back-edge source" mean
+//! "exactly once": an irreducible cycle inside the body has no dominator
+//! back-edge, so the loop still looks innermost while a block on that cycle
+//! runs twice in one iteration. That is strictly weaker than
 //! [`trust_cg_opt::ptr_iv_sr`]'s one-back-edge gate, which is why this fires on
 //! Stanford/Puzzle's two-back-edge diamond where that pass cannot.
 //!
 //! # Fail-closed constraints
 //!
-//! 1. Innermost natural loop with a preheader, on the post-RA CFG.
-//! 2. `LdrRO Wd, [Xb, Xa]` — plain 3-operand, or 4-operand with an **LSL**
-//!    extend. `SXTW`/`UXTW` are never touched: extending a loop-variant 32-bit
-//!    index does not commute with the 64-bit step (the historic
-//!    matrix-multiply miscompile).
+//! 1. Innermost natural loop with a preheader, on the post-RA CFG, whose body
+//!    has no cycle that avoids the header
+//!    ([`trust_cg_opt::loops::body_is_acyclic_dag`]).
+//! 2. `LdrRO Wd, [Xb, Xa]` — plain 3-operand, or 4-operand with the
+//!    **unshifted LSL** mode (`Imm(6)`). The size-scaled LSL (`Imm(7)`,
+//!    `[Xb, Xa, lsl #log2 size]`) is refused: it multiplies the whole index,
+//!    so the stride is not `1 << s`. `SXTW`/`UXTW` are never touched: extending
+//!    a loop-variant 32-bit index does not commute with the 64-bit step (the
+//!    historic matrix-multiply miscompile).
 //! 3. Chain is `LslRI Xt, Xk, #s` then optionally
 //!    `AddRR/AddRRShift Xa, Xt, Xi[, #m]`, all inside the load's block, before
-//!    it, and each result read ONLY by the next link (so deleting is safe).
+//!    it, and each result read ONLY by the next link (so deleting is safe) --
+//!    on every path through the whole function, loop exits included, counting
+//!    implicit reads (`ret`, call arguments).
 //! 4. `1 << s == elem`, i.e. the advance is exactly the transfer width.
-//! 5. `Xk`'s only in-loop definition is `AddRI Xk, Xk, #1`.
+//! 5. `Xk`'s only in-loop definition is `AddRI Xk, Xk, #1`, in a block that
+//!    runs exactly once per iteration (like the load's), and not before the
+//!    load.
 //! 6. `Xb`, `Xi` are never written inside the loop.
 //! 7. The pointer register is [`X16`] (IP0) and must be provably UNUSED — never
-//!    read or written — anywhere in the loop body or the preheader tail. Post-RA
-//!    there are no vregs to mint, so a register that is live would be a
-//!    miscompile; this mirrors `frame.rs`'s scratch discipline and fails closed.
+//!    read or written — anywhere in the loop body or the preheader tail,
+//!    including by a call or a `Trap*` carrier, which clobber it without naming
+//!    it (see [`touches`]). Post-RA there are no vregs to mint, so a register
+//!    that is live would be a miscompile; this mirrors `frame.rs`'s scratch
+//!    discipline and fails closed.
 //!
 //! # Measured
 //!
@@ -80,7 +95,8 @@ use std::collections::{HashMap, HashSet};
 
 use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PReg};
 use trust_cg_opt::dom::DomTree;
-use trust_cg_opt::loops::LoopAnalysis;
+use trust_cg_opt::loops::{LoopAnalysis, NaturalLoop, body_is_acyclic_dag};
+use trust_cg_opt::post_index::runs_before_in_iteration;
 
 use trust_cg_ir::regs::{X16, X17, reg_root, regs_overlap};
 
@@ -223,13 +239,47 @@ fn reg_key(reg: PReg) -> (u8, u16) {
 /// the RECURSIVE `Trial`, so the walking pointer would be destroyed by the
 /// self-call and the loop would read from a garbage address. Caught by the
 /// stdout differential against clang -O3 while building this pass.
+///
+/// ★ A `Trap*` guard carrier names no IP register either, but Phase 7.25
+/// expands it AFTER this pass into code that writes them:
+/// `expand_trap_bounds_check_exact` materialises a bound above the `CMP`
+/// immediate as `MOVZ X16` (+`MOVK`), and `expand_trap_overflow_exact` computes
+/// a 64-bit mul check in `X16`/`X17`. So every carrier counts as an IP-register
+/// clobber -- the rule the spill-reload CSE applies for the same reason.
 fn touches(inst: &MachInst, reg: PReg) -> bool {
-    if inst.is_call() && (regs_overlap(reg, X16) || regs_overlap(reg, X17)) {
+    if (inst.is_call() || inst.opcode.is_trap_pseudo())
+        && (regs_overlap(reg, X16) || regs_overlap(reg, X17))
+    {
         return true;
     }
     inst.operands
         .iter()
         .any(|op| matches!(op, MachOperand::PReg(p) if regs_overlap(*p, reg)))
+}
+
+/// Whether the loop's increment of `iv` can run before `host[lpos]` within one
+/// iteration: earlier in `host`, or in a loop block from which `host` is
+/// reachable without passing through the header (that would be the next
+/// iteration), per the opt-level twin's
+/// [`trust_cg_opt::post_index::runs_before_in_iteration`]. The seed reads `iv`
+/// at the end of the preheader, so the first load must observe that same value.
+fn iv_advances_before_load(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    host: BlockId,
+    lpos: usize,
+    iv: PReg,
+) -> bool {
+    lp.body.iter().any(|&b| {
+        func.blocks[b.0 as usize]
+            .insts
+            .iter()
+            .enumerate()
+            .any(|(pos, &id)| {
+                def_preg(func, id).is_some_and(|d| reg_key(d) == reg_key(iv))
+                    && runs_before_in_iteration(func, lp, b, pos, host, lpos)
+            })
+    })
 }
 
 /// The single physical register defined by `inst` (operand 0), when it has one.
@@ -260,7 +310,7 @@ fn def_preg(func: &MachFunction, inst_id: InstId) -> Option<PReg> {
 ///
 /// * the `x16_busy` scan sees the previous fold's `LdrPostIndex` (X16 is an
 ///   operand of it) and refuses any further fold in that loop;
-/// * `dead_after_in(X16, ..., confine = false)` walks the whole function forward
+/// * `dead_after(X16, ...)` walks the whole function forward
 ///   from the new seed point and refuses if any path reaches a READ of X16
 ///   before a redefinition -- which is exactly "the earlier fold's pointer is
 ///   still live here". It equally protects the earlier fold from this seed and
@@ -309,8 +359,22 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
         {
             continue;
         }
+        // (1) ... and no cycle in the body that avoids the header. An
+        // irreducible cycle has no dominator back-edge, so the test above
+        // cannot see it, and a block on it can run twice in one iteration.
+        if !body_is_acyclic_dag(func, lp) {
+            if dbg {
+                eprintln!(
+                    "PIL {} loop hdr={:?}: body has a cycle that avoids the header",
+                    func.name, header
+                );
+            }
+            continue;
+        }
 
-        // Back-edge sources, and the blocks that run exactly once per iteration.
+        // Back-edge sources, and the blocks that run exactly once per iteration
+        // (dominated by the header, dominating every latch, in a body checked
+        // acyclic above).
         let latches: Vec<BlockId> = lp
             .body
             .iter()
@@ -414,8 +478,12 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                 match load.operands.len() {
                     3 => {}
                     4 => match load.operands.get(3) {
-                        // 0b0110 unshifted, 0b0111 shifted-by-transfer-class
-                        Some(MachOperand::Imm(6)) | Some(MachOperand::Imm(7)) => {}
+                        // 0b0110: LSL #0, the address the 3-operand form takes.
+                        Some(MachOperand::Imm(6)) => {}
+                        // 0b0111: LSL by log2 of the transfer size, so the load
+                        // reads `base + (idx << log2 size)`. The seed and the
+                        // `#elem` step below model only the chain's own shift.
+                        Some(MachOperand::Imm(7)) => nope!("size-scaled index Imm(7)"),
                         other => nope!(format!("extend {:?}", other)),
                     },
                     n => nope!(format!("arity {}", n)),
@@ -461,19 +529,19 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                 //
                 // The question that actually licenses deleting the chain is
                 // whether OUR definition dies at the load. Walk forward through
-                // the loop CFG; on every path the first mention of `reg` must be
-                // a DEFINITION. A read reached first means the value is live and
-                // we must refuse. Falling out of the loop is fine -- the walk is
-                // confined to the loop body, and `reg` is recomputed on entry to
-                // the next iteration by the chain we are replacing.
-                let dead_after_in = |reg: PReg, b0: BlockId, at: usize, confine: bool| -> bool {
+                // the WHOLE function's CFG; on every path the first mention of
+                // `reg` must be a DEFINITION. A read reached first means the
+                // value is live and we must refuse. The walk is NOT confined to
+                // the loop: a loop EXIT can read the value too (an exit's
+                // `ldr [b, x1]` sharing the loop's scaled index), and deleting the
+                // chain would leave that reader with no definition. Implicit
+                // reads count -- a `ret` reads its result registers and a call
+                // its arguments through `implicit_uses`.
+                let dead_after = |reg: PReg, b0: BlockId, at: usize| -> bool {
                     let mut seen: HashSet<BlockId> = HashSet::new();
                     // (block, start index) worklist
                     let mut work = vec![(b0, at + 1)];
                     while let Some((b, start)) = work.pop() {
-                        if confine && !lp.body.contains(&b) {
-                            continue;
-                        }
                         if start == 0 && !seen.insert(b) {
                             continue;
                         }
@@ -483,10 +551,11 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                             let inst = &func.insts[i.0 as usize];
                             let d = def_preg(func, i);
                             let defs_reg = d.is_some_and(|d| regs_overlap(d, reg));
-                            let reads = inst.operands.iter().enumerate().any(|(k, op)| {
-                                matches!(op, MachOperand::PReg(p) if regs_overlap(*p, reg))
-                                    && !(k == 0 && defs_reg)
-                            });
+                            let reads =
+                                inst.operands.iter().enumerate().any(|(k, op)| {
+                                    matches!(op, MachOperand::PReg(p) if regs_overlap(*p, reg))
+                                        && !(k == 0 && defs_reg)
+                                }) || inst.implicit_uses.iter().any(|&u| regs_overlap(u, reg));
                             if reads {
                                 return false;
                             }
@@ -505,15 +574,28 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                     }
                     true
                 };
-                let dead_after =
-                    |reg: PReg, b0: BlockId, at: usize| dead_after_in(reg, b0, at, true);
+                // (3) A deleted value is read ONLY by the next link. `dead_after`
+                // covers everything after that link; this covers the stretch of
+                // the block between the value's definition (`lo - 1`) and the
+                // link (`hi`) -- e.g. an earlier load sharing the same `lsl`.
+                // `def_before` returned the LAST definition before the link, so
+                // nothing in the stretch defines `reg` and any mention is a read.
+                let read_between = |reg: PReg, lo: usize, hi: usize| -> bool {
+                    insts[lo..hi].iter().any(|&i| {
+                        let inst = &func.insts[i.0 as usize];
+                        inst.operands
+                            .iter()
+                            .any(|op| matches!(op, MachOperand::PReg(p) if regs_overlap(*p, reg)))
+                            || inst.implicit_uses.iter().any(|&u| regs_overlap(u, reg))
+                    })
+                };
 
                 let Some((ipos, idx_id)) = def_before(idx, lpos) else {
                     nope!("no idx def before load in this block");
                 };
                 if !dead_after(idx, host, lpos) {
                     // R4: name the blocking reader rather than guessing at the
-                    // shape. This walk mirrors `dead_after_in` exactly but
+                    // shape. This walk mirrors `dead_after` exactly but
                     // reports the first instruction that reads `idx`, so the
                     // census says *why* the index is live instead of only that
                     // it is. Debug-only -- it never influences a decision.
@@ -521,9 +603,6 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                         let mut seen: HashSet<BlockId> = HashSet::new();
                         let mut work = vec![(host, lpos + 1)];
                         while let Some((b, start)) = work.pop() {
-                            if !lp.body.contains(&b) {
-                                continue;
-                            }
                             if start == 0 && !seen.insert(b) {
                                 continue;
                             }
@@ -533,10 +612,11 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                                 let inst = &func.insts[i.0 as usize];
                                 let d = def_preg(func, i);
                                 let defs_idx = d.is_some_and(|d| regs_overlap(d, idx));
-                                let reads = inst.operands.iter().enumerate().any(|(k, op)| {
-                                    matches!(op, MachOperand::PReg(p) if regs_overlap(*p, idx))
-                                        && !(k == 0 && defs_idx)
-                                });
+                                let reads =
+                                    inst.operands.iter().enumerate().any(|(k, op)| {
+                                        matches!(op, MachOperand::PReg(p) if regs_overlap(*p, idx))
+                                            && !(k == 0 && defs_idx)
+                                    }) || inst.implicit_uses.iter().any(|&u| regs_overlap(u, idx));
                                 if reads {
                                     // Which operand slot? Slot 1 of a store is
                                     // the base, slot 2 the index -- that
@@ -567,6 +647,9 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                         "idx live after the load, next reader {}",
                         blocker()
                     ));
+                }
+                if read_between(idx, ipos + 1, lpos) {
+                    nope!("idx read between its def and the load");
                 }
                 let idx_inst = func.insts[idx_id.0 as usize].clone();
                 let (carrier, add_id, inv) = match idx_inst.opcode {
@@ -612,7 +695,9 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                 if add_id.is_some() && !dead_after(carrier, host, ipos) {
                     nope!("chain carrier live after its use");
                 }
-                let _ = lsl_pos;
+                if add_id.is_some() && read_between(carrier, lsl_pos + 1, ipos) {
+                    nope!("chain carrier read before its add");
+                }
                 let lsl_inst = func.insts[lsl_id.0 as usize].clone();
                 if lsl_inst.opcode != AArch64Opcode::LslRI || lsl_inst.operands.len() != 3 {
                     nope!(format!("chain head {:?}", lsl_inst.opcode));
@@ -637,6 +722,25 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                         iv_unit.contains(&reg_key(iv))
                     ));
                 }
+                // (5a) ... and that one increment runs on EVERY iteration: its
+                // block is one of `once`, like the load's. On a conditional arm
+                // the IV stays put on the iterations that skip the arm, while
+                // the post-indexed pointer advances on each.
+                let iv_block = lp.body.iter().copied().find(|&b| {
+                    func.blocks[b.0 as usize]
+                        .insts
+                        .iter()
+                        .any(|&i| def_preg(func, i).is_some_and(|d| reg_key(d) == reg_key(iv)))
+                });
+                if !iv_block.is_some_and(|b| once.contains(&b)) {
+                    nope!("iv steps in a block that does not run every iteration");
+                }
+                // (5b) the seed below reads the IV at the end of the
+                // preheader, so the IV's one increment must not run between
+                // the header's entry and this load.
+                if iv_advances_before_load(func, lp, host, lpos, iv) {
+                    nope!("iv advances before the load");
+                }
 
                 // SEED, computed in full: X16 = base + (iv << s) + (inv << m).
                 //
@@ -646,7 +750,8 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                 // Puzzle. Computing the term instead removes the assumption: `iv`
                 // is read at the END of the preheader, which dominates the
                 // header, so it holds exactly the value the loop's first
-                // iteration will use. X16 is its own scratch across the three
+                // iteration will use, given (5b): the increment runs after the
+                // load. X16 is its own scratch across the three
                 // instructions, and is already proven dead at this point.
                 //
                 // Phase: the pass rewrites instructions only and never touches
@@ -697,16 +802,26 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
                 // is inserted immediately BEFORE the preheader's terminator run
                 // and overwrites it. What must hold is that the value X16 holds
                 // AT THAT POINT is dead -- walk forward across the whole function
-                // (not confined to the loop) and require the first mention on
-                // every path to be a definition. The loop body itself is already
-                // known not to touch X16.
+                // and require the first mention on every path to be a
+                // definition. The loop body itself is already known not to
+                // touch X16.
                 let pre_insts = &func.blocks[pre.0 as usize].insts;
                 let mut ins_at = pre_insts.len();
                 while ins_at > 0 && func.insts[pre_insts[ins_at - 1].0 as usize].is_terminator() {
                     ins_at -= 1;
                 }
-                if ins_at == 0 || !dead_after_in(X16, pre, ins_at - 1, false) {
+                if ins_at == 0 || !dead_after(X16, pre, ins_at - 1) {
                     nope!("X16 live at the preheader insertion point");
+                }
+                // The terminator run executes AFTER the seed, so it must not
+                // touch X16 either. AArch64 stamps every `Trap*` carrier
+                // IS_TERMINATOR, so a trailing carrier sits in this run, and its
+                // later `MOVZ X16` would overwrite the seeded pointer.
+                if pre_insts[ins_at..]
+                    .iter()
+                    .any(|&i| touches(&func.insts[i.0 as usize], X16))
+                {
+                    nope!("X16 touched in the preheader's terminator run");
                 }
                 let mut kill = vec![lsl_id];
                 if let Some(a) = add_id {
@@ -765,7 +880,7 @@ fn form_one_post_index_load(func: &mut MachFunction) -> PostIndexStats {
 mod tests {
     use super::*;
     use trust_cg_ir::Signature;
-    use trust_cg_ir::regs::{W16, W22, X0, X1, X2, X3, X20, X22, X29};
+    use trust_cg_ir::regs::{W3, W16, W22, X0, X1, X2, X3, X4, X20, X21, X22, X29};
 
     fn inst(f: &mut MachFunction, op: AArch64Opcode, ops: Vec<MachOperand>) -> InstId {
         f.push_inst(MachInst::new(op, ops))
@@ -957,5 +1072,544 @@ mod tests {
         // Spot-check the direction that matters, so a vacuous helper cannot pass.
         assert!(regs_overlap(X16, W16));
         assert!(!regs_overlap(X16, X17));
+    }
+
+    /// Every block's `(opcode, operands)` in order: equal before and after a run
+    /// exactly when the pass left the function untouched.
+    fn shape(f: &MachFunction) -> Vec<Vec<(AArch64Opcode, Vec<MachOperand>)>> {
+        f.blocks
+            .iter()
+            .map(|b| {
+                b.insts
+                    .iter()
+                    .map(|&i| {
+                        let inst = &f.insts[i.0 as usize];
+                        (inst.opcode, inst.operands.clone())
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A loop whose EXIT is reachable from the load's block (`loop_fixture`'s
+    /// exit is not):
+    ///
+    /// ```text
+    ///   pre:   mov x2, #0 ; b head
+    ///   head:  <chain, ending in the LdrRO that defines x3> ; cbz x3,exit ; b latch
+    ///   latch: add x2,x2,#1 ; b head
+    ///   exit:  <exit> ; ret                  <- `ret` implicitly reads `ret_uses`
+    /// ```
+    fn exit_fixture(
+        chain: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+        exit: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+        ret_uses: &'static [PReg],
+    ) -> MachFunction {
+        let mut f = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+        let pre = f.entry;
+        let head = f.create_block();
+        let latch = f.create_block();
+        let exit_b = f.create_block();
+
+        let i = inst(
+            &mut f,
+            AArch64Opcode::MovI,
+            vec![p(X2), MachOperand::Imm(0)],
+        );
+        f.append_inst(pre, i);
+        let i = inst(&mut f, AArch64Opcode::B, vec![MachOperand::Block(head)]);
+        f.append_inst(pre, i);
+
+        for (op, ops) in chain.into_iter().chain([
+            (AArch64Opcode::Cbz, vec![p(X3), MachOperand::Block(exit_b)]),
+            (AArch64Opcode::B, vec![MachOperand::Block(latch)]),
+        ]) {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(head, i);
+        }
+        for (op, ops) in [
+            (
+                AArch64Opcode::AddRI,
+                vec![p(X2), p(X2), MachOperand::Imm(1)],
+            ),
+            (AArch64Opcode::B, vec![MachOperand::Block(head)]),
+        ] {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(latch, i);
+        }
+        for (op, ops) in exit {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(exit_b, i);
+        }
+        let i = f.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(ret_uses));
+        f.append_inst(exit_b, i);
+        install_edges(&mut f);
+        f
+    }
+
+    /// `lsl x1,x2,#2 ; ldr x3,[x22,x1]` -- the one-link chain.
+    fn one_link_chain() -> Vec<(AArch64Opcode, Vec<MachOperand>)> {
+        vec![
+            (
+                AArch64Opcode::LslRI,
+                vec![p(X1), p(X2), MachOperand::Imm(2)],
+            ),
+            (AArch64Opcode::LdrRO, vec![p(X3), p(X22), p(X1)]),
+        ]
+    }
+
+    /// `lsl x1,x2,#2 ; add x0,x1,x20 ; ldr x3,[x22,x0]` -- the two-link chain,
+    /// whose CARRIER x1 and index x0 are both deleted by the fold.
+    fn two_link_chain() -> Vec<(AArch64Opcode, Vec<MachOperand>)> {
+        vec![
+            (
+                AArch64Opcode::LslRI,
+                vec![p(X1), p(X2), MachOperand::Imm(2)],
+            ),
+            (AArch64Opcode::AddRR, vec![p(X0), p(X1), p(X20)]),
+            (AArch64Opcode::LdrRO, vec![p(X3), p(X22), p(X0)]),
+        ]
+    }
+
+    /// Asserts the pass declines `f` and leaves every instruction as it was.
+    fn assert_declines(mut f: MachFunction, why: &str) {
+        let before = shape(&f);
+        assert_eq!(form_post_index_loads(&mut f).folded, 0, "{why}");
+        assert_eq!(shape(&f), before, "a declined fold must not rewrite: {why}");
+    }
+
+    /// The seed reads the IV at the end of the preheader, which is the value
+    /// the first load sees only if the IV's increment runs AFTER the load in
+    /// each iteration. Here the head increments it first (`add x2,x2,#1 ;
+    /// lsl x1,x2,#2 ; ldr x3,[x22,x1]`), so the first load reads `x22 + 4`
+    /// and a pointer seeded from `x2 = 0` would start one element early.
+    #[test]
+    fn refuses_when_the_iv_advances_before_the_load() {
+        let mut chain = vec![(
+            AArch64Opcode::AddRI,
+            vec![p(X2), p(X2), MachOperand::Imm(1)],
+        )];
+        chain.extend(one_link_chain());
+        let mut f = exit_fixture(chain, vec![], &[]);
+        // The increment moved into the head: the latch only branches back.
+        let latch = BlockId(2);
+        assert_eq!(f.block(latch).insts.len(), 2);
+        f.block_mut(latch).insts.remove(0);
+        assert_declines(f, "the IV advances before the load");
+    }
+
+    /// Positive control for the exit tests below: the same loop, with an exit
+    /// that never reads the chain, still folds -- so each refusal is caused by
+    /// its exit reader and not by the fixture.
+    #[test]
+    fn folds_when_the_loop_exit_does_not_read_the_chain() {
+        let mut f = exit_fixture(one_link_chain(), vec![], &[]);
+        assert_eq!(form_post_index_loads(&mut f).folded, 1);
+        let mut f = exit_fixture(two_link_chain(), vec![], &[]);
+        assert_eq!(form_post_index_loads(&mut f).folded, 1);
+        // An exit that REDEFINES the index before reading it observes its own
+        // value, not the deleted chain's.
+        let mut f = exit_fixture(
+            one_link_chain(),
+            vec![
+                (AArch64Opcode::MovI, vec![p(X1), MachOperand::Imm(0)]),
+                (AArch64Opcode::LdrRO, vec![p(X0), p(X20), p(X1)]),
+            ],
+            &[X0],
+        );
+        assert_eq!(form_post_index_loads(&mut f).folded, 1);
+    }
+
+    /// ★ REGRESSION (refuter reproduction): the loop exit reads the index the
+    /// fold deletes. `lsl x1` is the only definition of x1 in the function, so
+    /// after the fold `ldr x0,[x20,x1]` in the exit reads whatever x1 held on
+    /// entry. The liveness walk was confined to the loop body and never
+    /// looked at the exit.
+    #[test]
+    fn refuses_when_the_loop_exit_reads_the_deleted_index() {
+        let f = exit_fixture(
+            one_link_chain(),
+            vec![(AArch64Opcode::LdrRO, vec![p(X0), p(X20), p(X1)])],
+            &[X0],
+        );
+        assert_declines(f, "the exit reads x1, the deleted lsl's result");
+    }
+
+    /// The same hole on the two-link chain, for each deleted value: the exit
+    /// reads the carrier x1 (the `lsl`) or the index x0 (the `add`).
+    #[test]
+    fn refuses_when_the_loop_exit_reads_a_deleted_two_link_value() {
+        for (reg, what) in [(X1, "carrier x1"), (X0, "index x0")] {
+            let f = exit_fixture(
+                two_link_chain(),
+                vec![(AArch64Opcode::LdrRO, vec![p(X4), p(X21), p(reg)])],
+                &[X4],
+            );
+            assert_declines(f, &format!("the exit reads the {what}"));
+        }
+    }
+
+    /// A RETURN reads its result registers without naming them as operands:
+    /// `ret` here returns x0, the deleted `add`'s result, so an operand-only scan
+    /// would call x0 dead on the exit path.
+    #[test]
+    fn refuses_when_the_return_reads_the_deleted_index() {
+        let f = exit_fixture(two_link_chain(), vec![], &[X0]);
+        assert_declines(f, "ret implicitly reads x0, the deleted add's result");
+    }
+
+    /// The deleted value can also be read INSIDE the load's block, before the
+    /// load: two loads share one `lsl`. The first load's index is live (the
+    /// second reads it) and is refused, but the second's liveness walk starts
+    /// after the second load and never sees the first reader. Folding it deletes
+    /// the `lsl` the first load still reads.
+    #[test]
+    fn refuses_when_an_earlier_load_in_the_block_shares_the_index() {
+        let f = exit_fixture(
+            vec![
+                (
+                    AArch64Opcode::LslRI,
+                    vec![p(X1), p(X2), MachOperand::Imm(2)],
+                ),
+                (AArch64Opcode::LdrRO, vec![p(X4), p(X21), p(X1)]),
+                (AArch64Opcode::LdrRO, vec![p(X3), p(X22), p(X1)]),
+            ],
+            vec![],
+            &[],
+        );
+        assert_declines(f, "the first load reads x1 before the folded one");
+    }
+
+    /// The same, for the two-link chain's carrier: x1 is read between the
+    /// `lsl` and the `add`, where no liveness walk looked.
+    #[test]
+    fn refuses_when_the_carrier_is_read_before_its_add() {
+        let f = exit_fixture(
+            vec![
+                (
+                    AArch64Opcode::LslRI,
+                    vec![p(X1), p(X2), MachOperand::Imm(2)],
+                ),
+                (AArch64Opcode::LdrRO, vec![p(X4), p(X21), p(X1)]),
+                (AArch64Opcode::AddRR, vec![p(X0), p(X1), p(X20)]),
+                (AArch64Opcode::LdrRO, vec![p(X3), p(X22), p(X0)]),
+            ],
+            vec![],
+            &[],
+        );
+        assert_declines(f, "a load reads the carrier x1 before the add");
+    }
+
+    /// Does any instruction of `f` write X16 (or W16) through operand 0?
+    fn writes_x16(f: &MachFunction) -> bool {
+        f.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .any(|&i| def_preg(f, i).is_some_and(|d| regs_overlap(d, X16)))
+    }
+
+    /// ★ REGRESSION (refuter reproduction): a `Trap*` carrier names no X16
+    /// operand, but Phase 7.25 expands it AFTER this pass, and the expansions
+    /// write X16 -- `MOVZ X16,#bound` for a bounds bound above the CMP
+    /// immediate, `UMULH X16` for a 64-bit unsigned-mul overflow check. A
+    /// walking pointer parked in X16 across the loop is destroyed by the next
+    /// iteration's check.
+    #[test]
+    fn refuses_when_the_loop_holds_a_trap_carrier_that_expands_into_x16() {
+        use trust_cg_ir::{OverflowOp, pack_overflow_tag};
+        for (op, ops) in [
+            (
+                AArch64Opcode::TrapBoundsCheckExact,
+                vec![p(X22), p(X2), MachOperand::Imm(5000)],
+            ),
+            (
+                AArch64Opcode::TrapOverflowExact,
+                vec![
+                    p(X4),
+                    p(X21),
+                    MachOperand::Imm(pack_overflow_tag(OverflowOp::UnsignedMul, 64)),
+                ],
+            ),
+        ] {
+            let f = loop_fixture(vec![(op, ops.clone())]);
+            // Ground the hazard in the real expanders, not in this test's word.
+            let mut expanded = f.clone();
+            assert!(!writes_x16(&expanded), "{op:?}: fixture writes no X16 yet");
+            crate::lower::expand_trap_bounds_check_exact(&mut expanded);
+            crate::lower::expand_trap_overflow_exact(&mut expanded);
+            assert!(writes_x16(&expanded), "{op:?}: its expansion writes X16");
+            assert_declines(f, &format!("{op:?} in the loop expands into X16"));
+        }
+    }
+
+    /// The seed is inserted BEFORE the preheader's terminator run, and AArch64
+    /// stamps every `Trap*` carrier `IS_TERMINATOR`: a carrier at the end of
+    /// the preheader lands AFTER the seed, so its later `MOVZ X16` overwrites
+    /// the pointer before the loop's first load.
+    #[test]
+    fn refuses_when_the_preheader_tail_holds_a_trap_carrier() {
+        let mut f = loop_fixture(vec![]);
+        let pre = f.entry;
+        let carrier = inst(
+            &mut f,
+            AArch64Opcode::TrapBoundsCheckExact,
+            vec![p(X22), p(X2), MachOperand::Imm(5000)],
+        );
+        let at = f.blocks[pre.0 as usize].insts.len() - 1; // before `b head`
+        f.blocks[pre.0 as usize].insts.insert(at, carrier);
+        assert!(f.insts[carrier.0 as usize].is_terminator());
+        assert_declines(
+            f,
+            "the preheader's trailing carrier writes X16 after the seed",
+        );
+    }
+
+    /// `chain` with its `LdrRO` given transfer register `dst` and the
+    /// 4-operand register-offset mode `mode` (`Imm(6)`: LSL #0, `Imm(7)`: LSL
+    /// by log2 of the transfer size -- see `aarch64::encode::register_offset_mode`).
+    fn with_load_mode(
+        chain: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+        dst: PReg,
+        mode: i64,
+    ) -> Vec<(AArch64Opcode, Vec<MachOperand>)> {
+        chain
+            .into_iter()
+            .map(|(op, mut ops)| {
+                if op == AArch64Opcode::LdrRO {
+                    ops[0] = p(dst);
+                    ops.push(MachOperand::Imm(mode));
+                }
+                (op, ops)
+            })
+            .collect()
+    }
+
+    /// ★ REGRESSION (refuter reproduction): `Imm(7)` is `LSL #log2(size)`, so
+    /// after `lsl x1,x2,#2` the load `ldr w3,[x22,x1,lsl #2]` reads
+    /// `x22 + 16*x2` (`x22 + 32*x2` for an X transfer). The fold admitted the
+    /// mode, then seeded `X16 = x22 + (x2 << 2)` and stepped it by 4 -- a walk
+    /// over `a[k]` instead of `a[4k]` -- because nothing after the operand
+    /// check read the mode again.
+    #[test]
+    fn refuses_the_scaled_register_offset_form() {
+        for (chain, links) in [(one_link_chain(), "one"), (two_link_chain(), "two")] {
+            for dst in [W3, X3] {
+                let f = exit_fixture(with_load_mode(chain.clone(), dst, 7), vec![], &[]);
+                assert_declines(
+                    f,
+                    &format!("{links}-link chain, {dst:?} load scales its index by the size"),
+                );
+            }
+        }
+    }
+
+    /// Positive control for the test above: the UNSHIFTED LSL mode `Imm(6)`
+    /// addresses exactly what the 3-operand form does, so it still folds.
+    #[test]
+    fn folds_the_unshifted_lsl_register_offset_form() {
+        for chain in [one_link_chain(), two_link_chain()] {
+            for dst in [W3, X3] {
+                let mut f = exit_fixture(with_load_mode(chain.clone(), dst, 6), vec![], &[]);
+                assert_eq!(form_post_index_loads(&mut f).folded, 1, "{dst:?}");
+            }
+        }
+    }
+
+    /// `add x2,x2,#1` -- the IV's unit step.
+    fn iv_step() -> (AArch64Opcode, Vec<MachOperand>) {
+        (
+            AArch64Opcode::AddRI,
+            vec![p(X2), p(X2), MachOperand::Imm(1)],
+        )
+    }
+
+    /// A loop with a conditional ARM between the load and the latch:
+    ///
+    /// ```text
+    ///   pre:   mov x2, #0 ; b head
+    ///   head:  lsl x1,x2,#2 ; add x0,x1,x20 ; ldr x3,[x22,x0] ; cbz x3,latch ; b arm
+    ///   arm:   <arm> ; b latch               <- runs on SOME iterations only
+    ///   latch: <latch> ; b.cond head ; b exit
+    ///   exit:  ret
+    /// ```
+    fn arm_fixture(
+        arm: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+        latch: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+    ) -> MachFunction {
+        let mut f = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+        let pre = f.entry;
+        let head = f.create_block();
+        let arm_b = f.create_block();
+        let latch_b = f.create_block();
+        let exit = f.create_block();
+
+        let i = inst(
+            &mut f,
+            AArch64Opcode::MovI,
+            vec![p(X2), MachOperand::Imm(0)],
+        );
+        f.append_inst(pre, i);
+        let i = inst(&mut f, AArch64Opcode::B, vec![MachOperand::Block(head)]);
+        f.append_inst(pre, i);
+
+        for (op, ops) in two_link_chain().into_iter().chain([
+            (AArch64Opcode::Cbz, vec![p(X3), MachOperand::Block(latch_b)]),
+            (AArch64Opcode::B, vec![MachOperand::Block(arm_b)]),
+        ]) {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(head, i);
+        }
+        for (op, ops) in arm
+            .into_iter()
+            .chain([(AArch64Opcode::B, vec![MachOperand::Block(latch_b)])])
+        {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(arm_b, i);
+        }
+        for (op, ops) in latch.into_iter().chain([
+            (AArch64Opcode::BCond, vec![MachOperand::Block(head)]),
+            (AArch64Opcode::B, vec![MachOperand::Block(exit)]),
+        ]) {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(latch_b, i);
+        }
+        let i = inst(&mut f, AArch64Opcode::Ret, vec![]);
+        f.append_inst(exit, i);
+        install_edges(&mut f);
+        f
+    }
+
+    /// ★ REGRESSION (refuter reproduction): the IV's one `add x2,x2,#1` sits on
+    /// a conditional arm, so `x2` advances only on iterations that take it,
+    /// while a post-indexed load would advance the pointer on EVERY iteration
+    /// -- reading `a[j]` instead of `a[k]` from the first skipped arm on. The
+    /// step count and the unit-step test were taken over the whole body, and
+    /// the increment-before-load walk from the arm never reaches the header.
+    #[test]
+    fn refuses_when_the_iv_steps_only_on_a_conditional_arm() {
+        let f = arm_fixture(vec![iv_step()], vec![]);
+        assert_declines(f, "x2 steps only on iterations that take the arm");
+    }
+
+    /// Positive control for the test above: the same loop with the increment in
+    /// the latch, which every iteration passes through, still folds.
+    #[test]
+    fn folds_when_the_iv_steps_in_the_latch_past_an_arm() {
+        let mut f = arm_fixture(vec![], vec![iv_step()]);
+        assert_eq!(form_post_index_loads(&mut f).folded, 1);
+    }
+
+    /// A loop whose body holds the two-entry cycle `{arm, inner}`:
+    ///
+    /// ```text
+    ///   pre:   mov x2, #0 ; b head
+    ///   head:  <head> ; cbz x4, inner ; b arm
+    ///   arm:   add x4,x4,#1 ; b inner
+    ///   inner: <inner> ; cbnz x4, arm ; b latch    <- `cbnz` only with `cycle`
+    ///   latch: <latch> ; b.cond head ; b exit
+    ///   exit:  ret
+    /// ```
+    ///
+    /// With `cycle`, neither `arm` nor `inner` dominates the other, so the
+    /// cycle has no dominator back-edge and the loop at `head` is the only,
+    /// innermost, loop. `inner` dominates the latch, so it passes the
+    /// once-per-iteration test, yet `head -> inner -> arm -> inner` runs it
+    /// twice. Without `cycle`, `arm` is a plain conditional arm.
+    fn two_entry_cycle_fixture(
+        head: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+        inner: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+        latch: Vec<(AArch64Opcode, Vec<MachOperand>)>,
+        cycle: bool,
+    ) -> MachFunction {
+        let mut f = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
+        let pre = f.entry;
+        let head_b = f.create_block();
+        let arm_b = f.create_block();
+        let inner_b = f.create_block();
+        let latch_b = f.create_block();
+        let exit = f.create_block();
+
+        let i = inst(
+            &mut f,
+            AArch64Opcode::MovI,
+            vec![p(X2), MachOperand::Imm(0)],
+        );
+        f.append_inst(pre, i);
+        let i = inst(&mut f, AArch64Opcode::B, vec![MachOperand::Block(head_b)]);
+        f.append_inst(pre, i);
+
+        for (op, ops) in head.into_iter().chain([
+            (AArch64Opcode::Cbz, vec![p(X4), MachOperand::Block(inner_b)]),
+            (AArch64Opcode::B, vec![MachOperand::Block(arm_b)]),
+        ]) {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(head_b, i);
+        }
+        for (op, ops) in [
+            (
+                AArch64Opcode::AddRI,
+                vec![p(X4), p(X4), MachOperand::Imm(1)],
+            ),
+            (AArch64Opcode::B, vec![MachOperand::Block(inner_b)]),
+        ] {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(arm_b, i);
+        }
+        let back_to_arm =
+            cycle.then(|| (AArch64Opcode::Cbnz, vec![p(X4), MachOperand::Block(arm_b)]));
+        for (op, ops) in inner
+            .into_iter()
+            .chain(back_to_arm)
+            .chain([(AArch64Opcode::B, vec![MachOperand::Block(latch_b)])])
+        {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(inner_b, i);
+        }
+        for (op, ops) in latch.into_iter().chain([
+            (AArch64Opcode::BCond, vec![MachOperand::Block(head_b)]),
+            (AArch64Opcode::B, vec![MachOperand::Block(exit)]),
+        ]) {
+            let i = inst(&mut f, op, ops);
+            f.append_inst(latch_b, i);
+        }
+        let i = inst(&mut f, AArch64Opcode::Ret, vec![]);
+        f.append_inst(exit, i);
+        install_edges(&mut f);
+        f
+    }
+
+    /// The head's load runs once per iteration, but `add x2,x2,#1` sits on the
+    /// irreducible cycle and runs twice on iterations that take it, so `x2`
+    /// moves two elements while a post-indexed pointer would move one.
+    #[test]
+    fn refuses_when_an_irreducible_cycle_runs_the_iv_step_twice() {
+        let f = two_entry_cycle_fixture(two_link_chain(), vec![iv_step()], vec![], true);
+        assert_declines(f, "x2 steps on a block an irreducible cycle runs twice");
+    }
+
+    /// The load sits on the irreducible cycle and reads the same `x2` twice on
+    /// iterations that take it, while `x2` steps once in the latch, so a
+    /// post-indexed pointer would move two elements per iteration.
+    #[test]
+    fn refuses_when_an_irreducible_cycle_runs_the_load_twice() {
+        let f = two_entry_cycle_fixture(vec![], two_link_chain(), vec![iv_step()], true);
+        assert_declines(
+            f,
+            "the load sits on a block an irreducible cycle runs twice",
+        );
+    }
+
+    /// Positive control for the two refusals above: the same loops without the
+    /// `inner -> arm` edge fold, so each refusal is caused by the cycle.
+    #[test]
+    fn folds_the_two_entry_shapes_once_the_cycle_is_gone() {
+        let mut f = two_entry_cycle_fixture(two_link_chain(), vec![iv_step()], vec![], false);
+        assert_eq!(
+            form_post_index_loads(&mut f).folded,
+            1,
+            "IV stepped in inner"
+        );
+        let mut f = two_entry_cycle_fixture(vec![], two_link_chain(), vec![iv_step()], false);
+        assert_eq!(form_post_index_loads(&mut f).folded, 1, "load in inner");
     }
 }

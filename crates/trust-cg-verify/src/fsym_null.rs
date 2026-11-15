@@ -5,8 +5,7 @@
 
 //! Symbolic execution: null-pointer-dereference detector (Phase 1a).
 //!
-//! This is the minimum-viable starting point for the `fsym` pass described
-//! in designs/2026-04-18-integrated-symbolic-execution.md section 3.1.
+//! This is the minimum-viable starting point for the `fsym` pass.
 //! It consumes a pointer expression and a straight-line path condition
 //! and reports whether a concrete witness shows UB via null-deref.
 
@@ -167,6 +166,18 @@ pub fn check_null_deref(op: &MemOp, ctx: &PathContext) -> FsymVerdict {
     }
 
     let empty_env = HashMap::new();
+    // A closed pointer expression (no free variable) that evaluates to a
+    // nonzero address is non-null on every path: `null + 8`, `0x1000 + 4`.
+    // `try_eval` fails on a free variable, so success means closed.
+    if matches!(
+        op.ptr.try_eval(&empty_env),
+        Ok(EvalResult::Bv(value)) if value != 0
+    ) || matches!(
+        op.ptr.try_eval(&empty_env),
+        Ok(EvalResult::Bv128(value)) if value != 0
+    ) {
+        return FsymVerdict::Safe;
+    }
     let candidates: &[HashMap<String, u64>] = if ctx.witness_candidates.is_empty() {
         std::slice::from_ref(&empty_env)
     } else {

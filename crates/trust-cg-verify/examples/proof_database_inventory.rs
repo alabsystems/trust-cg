@@ -96,7 +96,7 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo run -p trust-cg-verify --example proof_database_inventory -- --format <markdown|tsv>"
+                    "usage: scripts/trust_cargo.sh run -p trust-cg-verify --example proof_database_inventory -- --format <markdown|tsv>"
                 );
                 return;
             }

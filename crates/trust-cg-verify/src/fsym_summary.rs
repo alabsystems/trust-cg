@@ -10,7 +10,7 @@
 //! routes typed arithmetic/null obligations through the real ay bridge.
 
 use crate::ay_bridge::{AYConfig, AYResult, verify_with_ay};
-use crate::fsym_arith::ArithUbKind;
+use crate::fsym_arith::{ArithUbKind, memory_arith_ub_on_values};
 use crate::fsym_trust_ir::{
     FsymTrustIrDiagnostic, FsymTrustIrDiagnosticKind, FsymTrustIrReport, FsymTrustIrSkip,
     FsymTrustIrSolverCandidate, FsymTrustIrSolverObligation, FsymTrustIrUnknown, scan_module,
@@ -494,15 +494,29 @@ impl FsymSolverAdapter for FsymLocalSolverAdapter {
                 FsymTrustIrSolverObligation::NullDeref { .. },
             ) => solve_null_candidate(candidate, config),
             (
-                FsymTrustIrDiagnosticKind::Arithmetic,
+                FsymTrustIrDiagnosticKind::Arithmetic
+                | FsymTrustIrDiagnosticKind::PointerArithmetic
+                | FsymTrustIrDiagnosticKind::Misaligned,
                 FsymTrustIrSolverObligation::Arithmetic { .. },
             ) => solve_arithmetic_candidate(candidate, config),
             (
                 FsymTrustIrDiagnosticKind::OutOfBounds,
                 FsymTrustIrSolverObligation::OutOfBounds { .. },
             ) => solve_oob_candidate(candidate, config),
-            (FsymTrustIrDiagnosticKind::UseAfterFree, _) => FsymSolverResponse::unsupported(
-                "bounded local escalation only supports null, arithmetic, and bounds obligations",
+            (
+                FsymTrustIrDiagnosticKind::UnreachableReached,
+                FsymTrustIrSolverObligation::Reachable,
+            ) => solve_by_enumeration(candidate, config, &[], |_| Ok(true)),
+            (
+                FsymTrustIrDiagnosticKind::UseAfterFree
+                | FsymTrustIrDiagnosticKind::Overlap
+                | FsymTrustIrDiagnosticKind::UnsummarizedCall
+                | FsymTrustIrDiagnosticKind::InvalidFree
+                | FsymTrustIrDiagnosticKind::Uninitialized
+                | FsymTrustIrDiagnosticKind::ScanBound,
+                _,
+            ) => FsymSolverResponse::unsupported(
+                "bounded local escalation only supports null, arithmetic, alignment, GEP, reachability and bounds obligations",
             ),
             _ => FsymSolverResponse::solver_error(
                 "diagnostic kind does not match typed solver candidate",
@@ -531,18 +545,32 @@ impl FsymSolverAdapter for FsymAYSolverAdapter {
                 FsymTrustIrSolverObligation::NullDeref { .. },
             )
             | (
-                FsymTrustIrDiagnosticKind::Arithmetic,
+                FsymTrustIrDiagnosticKind::Arithmetic
+                | FsymTrustIrDiagnosticKind::PointerArithmetic
+                | FsymTrustIrDiagnosticKind::Misaligned,
                 FsymTrustIrSolverObligation::Arithmetic { .. },
             )
             | (
                 FsymTrustIrDiagnosticKind::OutOfBounds,
                 FsymTrustIrSolverObligation::OutOfBounds { .. },
+            )
+            | (
+                FsymTrustIrDiagnosticKind::UnreachableReached,
+                FsymTrustIrSolverObligation::Reachable,
             ) => match build_ay_fsym_obligation(obligation, candidate) {
                 Ok(proof) => fsym_response_from_ay_result((self.check)(&proof, &self.ay_config)),
                 Err(error) => error.into_response(),
             },
-            (FsymTrustIrDiagnosticKind::UseAfterFree, _) => FsymSolverResponse::unsupported(
-                "ay fsym escalation only supports null, arithmetic, and bounds obligations",
+            (
+                FsymTrustIrDiagnosticKind::UseAfterFree
+                | FsymTrustIrDiagnosticKind::Overlap
+                | FsymTrustIrDiagnosticKind::UnsummarizedCall
+                | FsymTrustIrDiagnosticKind::InvalidFree
+                | FsymTrustIrDiagnosticKind::Uninitialized
+                | FsymTrustIrDiagnosticKind::ScanBound,
+                _,
+            ) => FsymSolverResponse::unsupported(
+                "ay fsym escalation only supports null, arithmetic, alignment, GEP, reachability and bounds obligations",
             ),
             _ => FsymSolverResponse::solver_error(
                 "diagnostic kind does not match typed solver candidate",
@@ -637,7 +665,7 @@ fn ay_ub_condition(candidate: &FsymTrustIrSolverCandidate) -> Result<SmtExpr, Lo
                     "lhs expression width does not match metadata",
                 ));
             }
-            if !matches!(kind, ArithUbKind::Sneg) && rhs.is_none() {
+            if !kind.is_unary() && rhs.is_none() {
                 return Err(LocalSolverError::solver_error(
                     "binary arithmetic candidate is missing rhs",
                 ));
@@ -658,6 +686,8 @@ fn ay_ub_condition(candidate: &FsymTrustIrSolverCandidate) -> Result<SmtExpr, Lo
             access_size_bytes,
             width,
         } => oob_ub_condition(byte_offset, object_size_bytes, *access_size_bytes, *width),
+        // UB whenever the path guards hold.
+        FsymTrustIrSolverObligation::Reachable => Ok(SmtExpr::bool_const(true)),
     }
 }
 
@@ -751,6 +781,54 @@ fn arithmetic_ub_condition(
             let full = lhs.clone().sign_ext(1).bvneg();
             let wrapped = lhs.clone().bvneg().sign_ext(1);
             Ok(bv_ne(full, wrapped))
+        }
+        ArithUbKind::ShiftAmount => {
+            let rhs = rhs.ok_or_else(|| {
+                LocalSolverError::solver_error("shift candidate is missing its amount")
+            })?;
+            Ok(rhs
+                .clone()
+                .bvuge(SmtExpr::bv_const(u64::from(width), width)))
+        }
+        ArithUbKind::Misaligned { align } => {
+            if align == 0 || !align.is_power_of_two() {
+                return Err(LocalSolverError::unsupported(
+                    "alignment is not a power of two",
+                ));
+            }
+            Ok(bv_ne(
+                lhs.clone().bvand(SmtExpr::bv_const(align - 1, width)),
+                SmtExpr::bv_const(0, width),
+            ))
+        }
+        ArithUbKind::GepOffset {
+            elem_size,
+            signed_index,
+            limit,
+        } => {
+            if width != 64 {
+                return Err(LocalSolverError::solver_error(
+                    "GEP offset candidate must be 64 bits wide",
+                ));
+            }
+            let rhs = rhs.ok_or_else(|| {
+                LocalSolverError::solver_error("GEP offset candidate is missing its base")
+            })?;
+            // index * elem_size + base, exactly, in 128 bits, against the
+            // target's limit (its highest address, or u64::MAX).
+            let end = lhs
+                .clone()
+                .zero_ext(64)
+                .bvmul(SmtExpr::bv_const(elem_size, 128))
+                .bvadd(rhs.clone().zero_ext(64));
+            let overflow = end.bvugt(SmtExpr::bv_const(limit, 128));
+            Ok(if signed_index {
+                lhs.clone()
+                    .bvslt(SmtExpr::bv_const(0, 64))
+                    .or_expr(overflow)
+            } else {
+                overflow
+            })
         }
     }
 }
@@ -873,7 +951,7 @@ fn solve_arithmetic_candidate(
     if lhs.try_bv_width().ok() != Some(*width) {
         return FsymSolverResponse::solver_error("lhs expression width does not match metadata");
     }
-    if !matches!(kind, ArithUbKind::Sneg) && rhs.is_none() {
+    if !kind.is_unary() && rhs.is_none() {
         return FsymSolverResponse::solver_error("binary arithmetic candidate is missing rhs");
     }
     if let Some(rhs) = rhs
@@ -1172,6 +1250,13 @@ fn arithmetic_has_ub(
             Ok(signed_overflow(kind, lhs, Some(rhs), width))
         }
         ArithUbKind::Sneg => Ok(signed_overflow(kind, lhs, None, width)),
+        ArithUbKind::ShiftAmount
+        | ArithUbKind::Misaligned { .. }
+        | ArithUbKind::GepOffset { .. } => {
+            let rhs = rhs.map(|rhs| eval_bv_masked(rhs, width, env)).transpose()?;
+            memory_arith_ub_on_values(kind, lhs, rhs, width)
+                .ok_or_else(|| format!("{kind:?} candidate is malformed at width {width}"))
+        }
     }
 }
 
@@ -1207,7 +1292,13 @@ fn signed_overflow(kind: ArithUbKind, lhs: u64, rhs: Option<u64>, width: u32) ->
         ArithUbKind::Ssub => lhs - to_signed(rhs.expect("checked rhs"), width),
         ArithUbKind::Smul => lhs * to_signed(rhs.expect("checked rhs"), width),
         ArithUbKind::Sneg => -lhs,
-        ArithUbKind::Udiv | ArithUbKind::Sdiv | ArithUbKind::Urem | ArithUbKind::Srem => {
+        ArithUbKind::Udiv
+        | ArithUbKind::Sdiv
+        | ArithUbKind::Urem
+        | ArithUbKind::Srem
+        | ArithUbKind::ShiftAmount
+        | ArithUbKind::Misaligned { .. }
+        | ArithUbKind::GepOffset { .. } => {
             return false;
         }
     };
@@ -1718,38 +1809,41 @@ mod tests {
         assert_eq!(unsupported_after.concrete_ub, 0);
     }
 
-    // Thread-local capture of the LAST (obligation, result) the fsym AY
-    // adapter discharged — the certification-gap probe (crate::formal_gap)
-    // needs the exact obligation to confirm a diagnostic, and the adapter
-    // builds it internally. `capturing_verify_with_ay` is behavior-identical
-    // to the production `verify_with_ay` check fn.
+    // Thread-local capture of the LAST result the fsym AY adapter discharged:
+    // the report keeps only a status, and the certification-gap guard
+    // (crate::formal_gap) needs AY's own reason. `capturing_verify_with_ay` is
+    // behavior-identical to the production `verify_with_ay` check fn.
     thread_local! {
-        static LAST_FSYM_AY: std::cell::RefCell<Option<(ProofObligation, AYResult)>> =
+        static LAST_FSYM_AY: std::cell::RefCell<Option<AYResult>> =
             const { std::cell::RefCell::new(None) };
     }
 
     fn capturing_verify_with_ay(obligation: &ProofObligation, config: &AYConfig) -> AYResult {
         let result = verify_with_ay(obligation, config);
         LAST_FSYM_AY.with(|slot| {
-            *slot.borrow_mut() = Some((obligation.clone(), result.clone()));
+            *slot.borrow_mut() = Some(result.clone());
         });
         result
     }
 
     /// `Some(reason)` iff the first escalation result is `Unsupported` and
-    /// the captured live discharge is EXACTLY the confirmed certification
-    /// gap; every other shape returns `None` and the guarded test falls
-    /// through to its original assertions.
+    /// the captured live discharge is AY's disclosed proof hole; every other
+    /// shape returns `None` and the guarded test falls through to its original
+    /// assertions.
     fn fsym_certification_gap(report: &FsymSolverEscalationReport) -> Option<String> {
         if report.results.first()?.status != FsymSolverStatus::Unsupported {
             return None;
         }
-        let (obligation, result) = LAST_FSYM_AY.with(|slot| slot.borrow_mut().take())?;
-        crate::formal_gap::confirmed_certification_gap(&obligation, &ay_test_config(), &result)
+        let result = LAST_FSYM_AY.with(|slot| slot.borrow_mut().take())?;
+        crate::formal_gap::disclosed_proof_hole(&result)
     }
 
     #[test]
     fn ay_solver_proves_guarded_null_unknown_safe() {
+        // Solver-coupled (the adapter's checker is the production
+        // `verify_with_ay`): serialize on the process-global resident `ay`
+        // slot like every other live-solver test in this binary.
+        let _solver_lock = crate::ay_bridge::formal_solver_test_lock();
         if !crate::ay_bridge::z3_available() {
             crate::formal_gap::skip_test(
                 "ay_solver_proves_guarded_null_unknown_safe",
@@ -1794,6 +1888,10 @@ mod tests {
 
     #[test]
     fn ay_solver_proves_symbolic_oob_safe() {
+        // Solver-coupled (the adapter's checker is the production
+        // `verify_with_ay`): serialize on the process-global resident `ay`
+        // slot like every other live-solver test in this binary.
+        let _solver_lock = crate::ay_bridge::formal_solver_test_lock();
         if !crate::ay_bridge::z3_available() {
             crate::formal_gap::skip_test(
                 "ay_solver_proves_symbolic_oob_safe",
@@ -1832,36 +1930,27 @@ mod tests {
         assert_eq!(after.unknown, 0);
     }
 
-    #[test]
-    fn ay_solver_reports_symbolic_oob_ub_witness() {
+    /// `i == 5` reaches a four-byte read of an eight-byte object: UB.
+    fn symbolic_oob_witness_summary() -> FsymSummary {
         let offset = SmtExpr::var("i", 4);
         let guard = offset.clone().eq_expr(SmtExpr::bv_const(5, 4));
-        let summary = summary_with_unknown(
+        summary_with_unknown(
             FsymTrustIrDiagnosticKind::OutOfBounds,
             vec![guard.to_string()],
             Some("bounds side condition: offset=i, object_size=8, access_size=4".to_string()),
             Some(oob_candidate(offset, SmtExpr::bv_const(8, 4), 4, 4, guard)),
-        );
-
-        let report =
-            summary.escalate_unknown_obligations_with_ay(&enabled_config(), ay_test_config());
-        let after = summary.counters_after_solver_escalation(&report);
-
-        assert_eq!(report.results[0].status, FsymSolverStatus::ConcreteUb);
-        assert_eq!(report.results[0].witness, [("i".to_string(), 5)]);
-        assert_eq!(after.unknown, 0);
-        assert_eq!(after.concrete_ub, 1);
+        )
     }
 
-    #[test]
-    fn ay_solver_reports_arithmetic_ub_witness() {
+    /// `x == 1 && y == 1` overflows a two-bit signed add: UB.
+    fn arithmetic_witness_summary() -> FsymSummary {
         let x = SmtExpr::var("x", 2);
         let y = SmtExpr::var("y", 2);
         let guard = x
             .clone()
             .eq_expr(SmtExpr::bv_const(1, 2))
             .and_expr(y.clone().eq_expr(SmtExpr::bv_const(1, 2)));
-        let summary = summary_with_unknown(
+        summary_with_unknown(
             FsymTrustIrDiagnosticKind::Arithmetic,
             vec![guard.to_string()],
             Some("sadd side condition: x, y".to_string()),
@@ -1872,8 +1961,129 @@ mod tests {
                 2,
                 guard,
             )),
-        );
+        )
+    }
 
+    /// A FIXTURE solver for the AY adapter path, needing no AY. It decides the
+    /// obligation `build_ay_fsym_obligation` handed it by enumerating that
+    /// obligation's whole (tiny) input domain, and reports a genuine
+    /// counterexample in AY's SAT-model shape. It never reports a proof:
+    /// finding no counterexample is `Unknown`. A solver may return any model;
+    /// this one returns the LAST falsifying assignment in enumeration order, so
+    /// the witness a test pins is decided by the obligation's path guards, not
+    /// by which assignment happens to come first.
+    fn enumerating_fixture_checker(obligation: &ProofObligation, _config: &AYConfig) -> AYResult {
+        let bits: u32 = obligation.inputs.iter().map(|(_, width)| *width).sum();
+        assert!(
+            bits <= 16,
+            "the fixture enumerates tiny domains only: {bits} bits"
+        );
+        let mut last = None;
+        for point in 0u64..(1u64 << bits) {
+            let mut env = crate::smt::EvalEnv::default();
+            let mut model = Vec::with_capacity(obligation.inputs.len());
+            let mut shift = 0;
+            for (name, width) in &obligation.inputs {
+                let value = (point >> shift) & ((1u64 << width) - 1);
+                shift += width;
+                env.insert(name.clone(), value);
+                model.push((name.clone(), value));
+            }
+            let guarded = obligation.preconditions.iter().all(|guard| {
+                guard
+                    .try_eval(&env)
+                    .expect("a path guard evaluates")
+                    .as_bool()
+            });
+            let intent = obligation
+                .trust_ir_expr
+                .try_eval(&env)
+                .expect("intent evaluates");
+            let machine = obligation
+                .aarch64_expr
+                .try_eval(&env)
+                .expect("UB condition evaluates");
+            if guarded && intent != machine {
+                last = Some(model);
+            }
+        }
+        last.map_or_else(
+            || AYResult::Unknown("fixture enumeration found no counterexample".to_string()),
+            AYResult::CounterExample,
+        )
+    }
+
+    /// The AY adapter's plumbing on EVERY build, no solver needed: the
+    /// obligation it builds must put the UB condition under the path guards,
+    /// and a SAT model must come back as ConcreteUb carrying that witness and
+    /// moving the counters. The live-AY twin is `ay_solver_reports_symbolic_oob_ub_witness`.
+    #[test]
+    fn ay_adapter_reports_symbolic_oob_ub_witness_from_a_fixture_model() {
+        let summary = symbolic_oob_witness_summary();
+        let adapter =
+            FsymAYSolverAdapter::with_checker(ay_test_config(), enumerating_fixture_checker);
+        let report = summary.escalate_unknown_obligations_with(&enabled_config(), &adapter);
+        let after = summary.counters_after_solver_escalation(&report);
+
+        assert_eq!(report.results[0].status, FsymSolverStatus::ConcreteUb);
+        assert!(report.results[0].detail.contains("ay found"));
+        assert_eq!(report.results[0].witness, [("i".to_string(), 5)]);
+        assert_eq!(after.unknown, 0);
+        assert_eq!(after.concrete_ub, 1);
+    }
+
+    /// As above for signed-add overflow; the live twin is
+    /// `ay_solver_reports_arithmetic_ub_witness`.
+    #[test]
+    fn ay_adapter_reports_arithmetic_ub_witness_from_a_fixture_model() {
+        let summary = arithmetic_witness_summary();
+        let adapter =
+            FsymAYSolverAdapter::with_checker(ay_test_config(), enumerating_fixture_checker);
+        let report = summary.escalate_unknown_obligations_with(&enabled_config(), &adapter);
+
+        assert_eq!(report.results[0].status, FsymSolverStatus::ConcreteUb);
+        assert!(report.results[0].detail.contains("ay found"));
+        assert_eq!(
+            report.results[0].witness,
+            [("x".to_string(), 1), ("y".to_string(), 1)]
+        );
+    }
+
+    /// LIVE: the same scenario through an admitted AY. A stock build admits no
+    /// AY by design (b719b9248), so like its guarded siblings this skips loudly
+    /// with NO_PROOF_AUTHORITY there, and the soundness gate counts that skip as
+    /// a failure. The fixture twin above pins the plumbing on every build.
+    #[test]
+    fn ay_solver_reports_symbolic_oob_ub_witness() {
+        if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "ay_solver_reports_symbolic_oob_ub_witness",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
+            return;
+        }
+        let summary = symbolic_oob_witness_summary();
+        let report =
+            summary.escalate_unknown_obligations_with_ay(&enabled_config(), ay_test_config());
+        let after = summary.counters_after_solver_escalation(&report);
+
+        assert_eq!(report.results[0].status, FsymSolverStatus::ConcreteUb);
+        assert_eq!(report.results[0].witness, [("i".to_string(), 5)]);
+        assert_eq!(after.unknown, 0);
+        assert_eq!(after.concrete_ub, 1);
+    }
+
+    /// LIVE: see `ay_solver_reports_symbolic_oob_ub_witness`.
+    #[test]
+    fn ay_solver_reports_arithmetic_ub_witness() {
+        if !crate::ay_bridge::z3_available() {
+            crate::formal_gap::skip_test(
+                "ay_solver_reports_arithmetic_ub_witness",
+                crate::formal_gap::NO_PROOF_AUTHORITY,
+            );
+            return;
+        }
+        let summary = arithmetic_witness_summary();
         let report =
             summary.escalate_unknown_obligations_with_ay(&enabled_config(), ay_test_config());
 
@@ -1960,5 +2170,176 @@ mod tests {
         let report = summary.escalate_unknown_obligations_with(&enabled_config(), &adapter);
 
         assert_eq!(report.results[0].status, FsymSolverStatus::ProvenSafe);
+    }
+
+    #[test]
+    fn local_solver_decides_shift_amount_candidates() {
+        let value = SmtExpr::var("x", 4);
+        let amount = SmtExpr::var("n", 4);
+        let solve = |guard: SmtExpr| {
+            summary_with_unknown(
+                FsymTrustIrDiagnosticKind::Arithmetic,
+                vec![guard.to_string()],
+                Some("shl side condition: x, n".to_string()),
+                Some(arithmetic_candidate(
+                    ArithUbKind::ShiftAmount,
+                    value.clone(),
+                    Some(amount.clone()),
+                    4,
+                    guard,
+                )),
+            )
+            .escalate_unknown_obligations_locally(&enabled_config())
+        };
+        // n < 4 keeps a 4-bit shift in range.
+        let in_range = solve(amount.clone().bvult(SmtExpr::bv_const(4, 4)));
+        assert_eq!(in_range.results[0].status, FsymSolverStatus::ProvenSafe);
+        // n <= 4 admits n == 4.
+        let out_of_range = solve(amount.clone().bvule(SmtExpr::bv_const(4, 4)));
+        assert_eq!(out_of_range.results[0].status, FsymSolverStatus::ConcreteUb);
+    }
+
+    #[test]
+    fn local_solver_decides_gep_and_alignment_candidates() {
+        let gep = |index: i64, base: u64| {
+            summary_with_unknown(
+                FsymTrustIrDiagnosticKind::PointerArithmetic,
+                vec![],
+                Some("GEP side condition".to_string()),
+                Some(FsymTrustIrSolverCandidate {
+                    path_guards: vec![],
+                    obligation: FsymTrustIrSolverObligation::Arithmetic {
+                        kind: ArithUbKind::GepOffset {
+                            elem_size: 8,
+                            signed_index: true,
+                            limit: u64::MAX,
+                        },
+                        lhs: SmtExpr::bv_const(index as u64, 64),
+                        rhs: Some(SmtExpr::bv_const(base, 64)),
+                        width: 64,
+                    },
+                }),
+            )
+            .escalate_unknown_obligations_locally(&enabled_config())
+            .results[0]
+                .status
+        };
+        assert_eq!(gep(3, 16), FsymSolverStatus::ProvenSafe);
+        assert_eq!(gep(-1, 16), FsymSolverStatus::ConcreteUb);
+        assert_eq!(gep(1 << 61, 0), FsymSolverStatus::ConcreteUb);
+
+        let offset = SmtExpr::var("o", 4);
+        let aligned = |guard: SmtExpr| {
+            summary_with_unknown(
+                FsymTrustIrDiagnosticKind::Misaligned,
+                vec![guard.to_string()],
+                Some("alignment side condition".to_string()),
+                Some(arithmetic_candidate(
+                    ArithUbKind::Misaligned { align: 4 },
+                    offset.clone(),
+                    None,
+                    4,
+                    guard,
+                )),
+            )
+            .escalate_unknown_obligations_locally(&enabled_config())
+            .results[0]
+                .status
+        };
+        assert_eq!(
+            aligned(offset.clone().eq_expr(SmtExpr::bv_const(8, 4))),
+            FsymSolverStatus::ProvenSafe
+        );
+        assert_eq!(
+            aligned(offset.clone().bvule(SmtExpr::bv_const(8, 4))),
+            FsymSolverStatus::ConcreteUb
+        );
+    }
+
+    #[test]
+    fn local_solver_decides_reachability_of_unreachable() {
+        let x = SmtExpr::var("x", 2);
+        let reach = |guards: Vec<SmtExpr>| {
+            let summary = summary_with_unknown(
+                FsymTrustIrDiagnosticKind::UnreachableReached,
+                guards.iter().map(ToString::to_string).collect(),
+                Some("true".to_string()),
+                Some(FsymTrustIrSolverCandidate {
+                    path_guards: guards,
+                    obligation: FsymTrustIrSolverObligation::Reachable,
+                }),
+            );
+            summary
+                .escalate_unknown_obligations_locally(&enabled_config())
+                .results[0]
+                .status
+        };
+        let one = x.clone().eq_expr(SmtExpr::bv_const(1, 2));
+        let two = x.clone().eq_expr(SmtExpr::bv_const(2, 2));
+        assert_eq!(reach(vec![one.clone(), two]), FsymSolverStatus::ProvenSafe);
+        assert_eq!(reach(vec![one]), FsymSolverStatus::ConcreteUb);
+    }
+
+    /// The SMT conditions the ay adapter hands the solver for the new kinds
+    /// agree with their concrete definitions.
+    #[test]
+    fn ay_conditions_for_shift_gep_alignment_and_reachability_evaluate_exactly() {
+        use super::{arithmetic_ub_condition, ay_ub_condition};
+        use crate::smt::EvalResult;
+        use std::collections::HashMap;
+        let holds = |condition: SmtExpr| match condition.try_eval(&HashMap::new()) {
+            Ok(EvalResult::Bool(value)) => value,
+            other => panic!("condition did not evaluate to a boolean: {other:?}"),
+        };
+        let arithmetic = |kind: ArithUbKind, lhs: u64, rhs: Option<u64>, width: u32| {
+            holds(
+                arithmetic_ub_condition(
+                    kind,
+                    &SmtExpr::bv_const(lhs, width),
+                    rhs.map(|rhs| SmtExpr::bv_const(rhs, width)).as_ref(),
+                    width,
+                )
+                .expect("condition builds"),
+            )
+        };
+        assert!(arithmetic(ArithUbKind::ShiftAmount, 1, Some(8), 8));
+        assert!(!arithmetic(ArithUbKind::ShiftAmount, 1, Some(7), 8));
+        assert!(arithmetic(
+            ArithUbKind::Misaligned { align: 8 },
+            12,
+            None,
+            64
+        ));
+        assert!(!arithmetic(
+            ArithUbKind::Misaligned { align: 8 },
+            16,
+            None,
+            64
+        ));
+        let gep = ArithUbKind::GepOffset {
+            elem_size: 8,
+            signed_index: true,
+            limit: u64::MAX,
+        };
+        assert!(arithmetic(gep, u64::MAX, Some(0), 64));
+        assert!(arithmetic(gep, 1 << 61, Some(0), 64));
+        assert!(arithmetic(gep, 1, Some(u64::MAX - 7), 64));
+        assert!(!arithmetic(gep, 1, Some(u64::MAX - 8), 64));
+        assert!(!arithmetic(gep, 3, Some(16), 64));
+        // A 32-bit target's candidate decides ITS address space.
+        let gep32 = ArithUbKind::GepOffset {
+            elem_size: 1,
+            signed_index: false,
+            limit: u64::from(u32::MAX),
+        };
+        assert!(arithmetic(gep32, 0xFFFF_FFFF, Some(8), 64));
+        assert!(!arithmetic(gep32, 0xFFFF_FFF0, Some(8), 64));
+        assert!(holds(
+            ay_ub_condition(&FsymTrustIrSolverCandidate {
+                path_guards: vec![],
+                obligation: FsymTrustIrSolverObligation::Reachable,
+            })
+            .expect("reachability condition builds")
+        ));
     }
 }

@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -511,6 +511,7 @@ fn lean5_version_timeout_ms(policy: &Lean5CheckerPolicy) -> u64 {
     }
 }
 
+#[derive(Debug)]
 enum LeanCommandOutcome {
     Completed {
         status: ExitStatus,
@@ -522,54 +523,31 @@ enum LeanCommandOutcome {
 }
 
 fn run_command_with_timeout(program: &str, args: &[&str], timeout_ms: u64) -> LeanCommandOutcome {
-    let mut child = match Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            return LeanCommandOutcome::SpawnError(format!(
-                "failed to spawn Lean5 binary '{}': {}",
-                program, err
-            ));
-        }
-    };
-
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => match child.wait_with_output() {
-                Ok(output) => {
-                    return LeanCommandOutcome::Completed {
-                        status: output.status,
-                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    };
-                }
-                Err(err) => {
-                    return LeanCommandOutcome::SpawnError(format!(
-                        "failed to collect Lean5 output: {err}"
-                    ));
-                }
-            },
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return LeanCommandOutcome::Timeout;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return LeanCommandOutcome::SpawnError(format!(
-                    "failed while waiting for Lean5 process: {err}"
-                ));
-            }
+    let mut command = Command::new(program);
+    command.args(args);
+    match crate::subprocess::run(&mut command, Some(Duration::from_millis(timeout_ms))) {
+        Ok(output) => LeanCommandOutcome::Completed {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(crate::subprocess::RunError::Timeout(_)) => LeanCommandOutcome::Timeout,
+        Err(crate::subprocess::RunError::Io {
+            operation: "spawn",
+            source,
+            ..
+        }) => LeanCommandOutcome::SpawnError(format!(
+            "failed to spawn Lean5 binary '{program}': {source}"
+        )),
+        Err(error) => {
+            LeanCommandOutcome::SpawnError(format!("failed while running Lean5 process: {error}"))
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "lean_subprocess_tests.rs"]
+mod subprocess_tests;
 
 fn resolve_lean5_binary(policy: &Lean5CheckerPolicy) -> String {
     if let Some(binary) = &policy.lean5_binary

@@ -36,16 +36,23 @@
 //!
 //! A natural loop's header executes exactly once per iteration by definition,
 //! and a basic block has no internal control flow, so an unconditional load in
-//! the header advances `P` exactly once per iteration. The IV's in-loop def is
-//! required to be a single `AddRI V, V, #step` in the body, which likewise runs
-//! once per iteration. Both counters therefore step together and `P == base +
-//! (V << s)` is preserved — including across the FIRST iteration, which reaches
-//! the header from the preheader without executing the IV update, because `P0`
-//! is seeded from `V`'s preheader value.
+//! the header advances `P` exactly once per iteration. A body block other than
+//! the header runs exactly once per iteration when it is dominated by the
+//! header, dominates every latch, and the body has no cycle that avoids the
+//! header. The IV's in-loop def is required to be a single `AddRI V, V, #1` in
+//! a block that likewise runs exactly once per iteration, and never before the
+//! load within an iteration.
+//! Both counters therefore step together and `P == base + (V << s)` is
+//! preserved — including across the FIRST iteration: no increment runs
+//! between the header's entry and the load, so the first load observes `V`'s
+//! preheader value, which is what `P0` is seeded from.
 //!
 //! # Fail-closed constraints (all must hold)
 //!
-//! 1. Innermost natural loop with a real preheader.
+//! 1. Innermost natural loop with a real preheader, whose body has no cycle
+//!    that avoids the header ([`body_is_acyclic_dag`]). An irreducible cycle
+//!    has no dominator back-edge, so it leaves the loop looking innermost
+//!    while a block on it can run twice in one iteration.
 //! 2. Access is `LdrRO dst, base, idx` — the PLAIN 3-operand `[Xn, Xm]` form
 //!    only. The packed-extend forms carry `SXTW`/`UXTW`, where a sign/zero
 //!    extend of a loop-variant 32-bit index does not commute with the 64-bit
@@ -59,7 +66,12 @@
 //!    pointer advance is exactly the element size.
 //! 5. `V` is a `Gpr64` with EXACTLY two whole-function defs: an init whose
 //!    block dominates the preheader, and `AddRI V, V, #1` in the loop body.
-//!    A step of 1 is required so the byte advance is exactly `1 << s`.
+//!    A step of 1 is required so the byte advance is exactly `1 << s`. The
+//!    increment's block runs exactly once per iteration, like the load's
+//!    (5a), and the increment cannot run before the load within an iteration
+//!    (5b): it is neither earlier in the load's block nor in a loop block from
+//!    which the load's block is reachable without re-entering the header
+//!    ([`runs_before_in_iteration`]).
 //! 6. `base` and `inv` are whole-function single-def `Gpr64` (never SP) defined
 //!    outside the loop, with their defs dominating the preheader.
 //! 7. The loaded value must not be `V`, `base` or `inv` (no self-clobber), and
@@ -136,7 +148,7 @@
 //!
 //! `TCG_NO_POST_INDEX` (any value) — [`run`] becomes a no-op.
 
-use std::collections::HashMap;
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -144,7 +156,7 @@ use trust_cg_ir::{
 };
 
 use crate::dom::DomTree;
-use crate::loops::LoopAnalysis;
+use crate::loops::{LoopAnalysis, NaturalLoop, body_is_acyclic_dag};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// Packed extend operand value (`(option << 1) | S`) for the LSL option with no
@@ -211,8 +223,8 @@ fn transfer_bytes(v: VReg) -> Option<i64> {
 }
 
 fn collect_defs(func: &MachFunction) -> (HashMap<VReg, Vec<DefSite>>, HashMap<VReg, u32>) {
-    let mut defs: HashMap<VReg, Vec<DefSite>> = HashMap::new();
-    let mut reads: HashMap<VReg, u32> = HashMap::new();
+    let mut defs: HashMap<VReg, Vec<DefSite>> = HashMap::default();
+    let mut reads: HashMap<VReg, u32> = HashMap::default();
     for &block in &func.block_order {
         for (pos, &inst_id) in func.block(block).insts.iter().enumerate() {
             let inst = func.inst(inst_id);
@@ -264,7 +276,10 @@ fn run_post_index(func: &mut MachFunction, mut provenance: Option<&mut Provenanc
     let loops = LoopAnalysis::compute(func, &dom);
     let (defs, reads) = collect_defs(func);
 
-    let single_outside = |v: VReg, pre: BlockId, lp: &std::collections::HashSet<BlockId>| -> bool {
+    let single_outside = |v: VReg,
+                          pre: BlockId,
+                          lp: &crate::fast_hash::FxHashSet<BlockId>|
+     -> bool {
         match defs.get(&v) {
             Some(d) if d.len() == 1 => !lp.contains(&d[0].block) && dom.dominates(d[0].block, pre),
             _ => false,
@@ -292,12 +307,19 @@ fn run_post_index(func: &mut MachFunction, mut provenance: Option<&mut Provenanc
         {
             continue;
         }
+        // (1) ... and no cycle in the body that avoids the header. An
+        // irreducible cycle has no dominator back-edge, so the check above
+        // cannot see it, and a block on it can run twice in one iteration.
+        if !body_is_acyclic_dag(func, lp) {
+            bail!("loop body has a cycle that avoids the header");
+        }
 
         // Blocks that execute EXACTLY ONCE per iteration: dominated by the
-        // header and dominating every back-edge source. In a rotated loop the
-        // header is the trip-test block and the load sits in the fall-through
-        // body block, so restricting to the header alone misses the real shape
-        // (it missed Stanford/Puzzle entirely).
+        // header and dominating every back-edge source, in a body that is
+        // acyclic without its header edges (checked above). In a rotated loop
+        // the header is the trip-test block and the load sits in the
+        // fall-through body block, so restricting to the header alone misses
+        // the real shape (it missed Stanford/Puzzle entirely).
         let latches: Vec<BlockId> = lp
             .body
             .iter()
@@ -492,7 +514,7 @@ fn run_post_index(func: &mut MachFunction, mut provenance: Option<&mut Provenanc
                     bail!("iv def count");
                 }
                 let mut init_ok = false;
-                let mut step_ok = false;
+                let mut step_site = None;
                 for d in ivdefs {
                     if !lp.body.contains(&d.block) {
                         if dom.dominates(d.block, pre) {
@@ -506,22 +528,34 @@ fn run_post_index(func: &mut MachFunction, mut provenance: Option<&mut Provenanc
                             && matches!(di.operands.get(1), Some(MachOperand::VReg(x)) if *x == iv)
                             && matches!(di.operands.get(2), Some(MachOperand::Imm(1)))
                         {
-                            step_ok = true;
+                            step_site = Some(*d);
                         }
                     }
                 }
-                if !(init_ok && step_ok) {
+                let Some(step) = step_site.filter(|_| init_ok) else {
                     bail!("iv init/step");
+                };
+                // (5a) ... and that one increment runs on EVERY iteration: its
+                // block is one of `once_per_iter`, like the load's. On a
+                // conditional arm the IV stays put on the iterations that skip
+                // the arm, while the post-indexed pointer advances on each.
+                if !once_per_iter.contains(&step.block) {
+                    bail!("iv steps in a block that does not run every iteration");
+                }
+                // (5b) the seed reads V at the end of the preheader, so no
+                // increment may run between the header's entry and the load.
+                if runs_before_in_iteration(func, lp, step.block, step.pos, host, lpos) {
+                    bail!("iv advances before the load");
                 }
 
                 // (6) base / inv defined once, outside, dominating the preheader.
                 if !single_outside(base, pre, &lp.body) {
                     bail!("base not invariant");
                 }
-                if let Some((iv2, _)) = inv {
-                    if iv2.class != RegClass::Gpr64 || !single_outside(iv2, pre, &lp.body) {
-                        continue;
-                    }
+                if let Some((iv2, _)) = inv
+                    && (iv2.class != RegClass::Gpr64 || !single_outside(iv2, pre, &lp.body))
+                {
+                    continue;
                 }
                 // (7) no self-clobber.
                 if dst == base || dst == iv || inv.is_some_and(|(r, _)| dst == r) {
@@ -551,8 +585,9 @@ fn run_post_index(func: &mut MachFunction, mut provenance: Option<&mut Provenanc
     for p in plans {
         // Seed P at the END of the preheader: P = base + (inv << k) + (V << s).
         // Every leaf is single-def outside the loop with its def dominating the
-        // preheader, and `V` still holds its init value there, so this reads
-        // exactly what iteration 1's chain would have read.
+        // preheader, and `V` still holds its init value there. With (5b) no
+        // increment runs before the load, so this reads exactly what iteration
+        // 1's chain would have read.
         let Some(lp) = loops.all_loops().find(|l| {
             l.body
                 .iter()
@@ -631,6 +666,46 @@ fn run_post_index(func: &mut MachFunction, mut provenance: Option<&mut Provenanc
         changed = true;
     }
     changed
+}
+
+/// Whether position `pos` of loop block `at` can execute before position
+/// `lpos` of `host` within one iteration of `lp`: it is earlier in `host`, or
+/// `host` is reachable from `at` through the loop body without entering the
+/// header (entering it starts the next iteration).
+///
+/// Both post-index folds use this to check the premise their walking-pointer
+/// seed rests on, that the load observes the IV's preheader value on the first
+/// iteration. Precondition: `lp` contains `host` and its body has no cycle that
+/// avoids the header ([`body_is_acyclic_dag`]), so `host` runs at most once per
+/// iteration and a later position in `host` runs after `lpos`. Being innermost
+/// is not enough: an irreducible cycle through `host` has no back-edge.
+pub fn runs_before_in_iteration(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    at: BlockId,
+    pos: usize,
+    host: BlockId,
+    lpos: usize,
+) -> bool {
+    if at == host {
+        return pos < lpos;
+    }
+    let mut seen: HashSet<BlockId> = HashSet::default();
+    let mut work = vec![at];
+    while let Some(x) = work.pop() {
+        for &succ in &func.block(x).succs {
+            if succ == lp.header {
+                continue;
+            }
+            if succ == host {
+                return true;
+            }
+            if lp.body.contains(&succ) && seen.insert(succ) {
+                work.push(succ);
+            }
+        }
+    }
+    false
 }
 
 /// Append `insts` to `block` immediately before its terminator run.

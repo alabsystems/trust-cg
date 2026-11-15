@@ -55,10 +55,26 @@
 // sibling e2e_universe_integration / e2e_defeq_cache fixtures.
 #![allow(dead_code)]
 
-#[cfg(kernel_fixture_layout_unknown)]
+// A lint driver (`clippy-driver`/`tippy-driver`) links no test binary, so
+// under `kernel_fixture_layout_lint_only` this target is compiled only to BE
+// LINTED; the fixtures still cannot run, because every JIT entry point below
+// refuses at runtime under that same cfg. The ae9 Linux compiler selects its
+// own separately generated fixtures.
+#[cfg(all(
+    kernel_fixture_layout_unknown,
+    not(kernel_fixture_ae9_linux),
+    not(kernel_fixture_layout_lint_only)
+))]
 compile_error!(
     "kernel JIT fixtures require exact Rust 1.95.0, Rust 1.97.1, or the certified Trust compiler"
 );
+
+#[cfg(kernel_fixture_layout_lint_only)]
+#[path = "common/kernel_fixture_guard.rs"]
+mod kernel_fixture_guard;
+
+#[path = "common/emitted_fixture.rs"]
+mod emitted_fixture;
 
 use std::collections::HashMap;
 
@@ -704,9 +720,16 @@ type SelectI64 = extern "C" fn(bool, i64, i64) -> i64;
 /// JIT-compile `module`, resolve `name` to executable machine code, and call it
 /// with `arg`. The returned pointer is into the JIT buffer, which must outlive
 /// the call — so we keep `buffer` alive for the duration of this function.
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_call_unary(module: &trust_ir::Module, name: &str, arg: i64) -> i64 {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_call_unary");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of `{name}` failed: {e:?}"))
         .buffer;
@@ -731,9 +754,16 @@ fn interp_unary(module: &trust_ir::Module, name: &str, arg: i64) -> i64 {
 }
 
 /// JIT-compile + call a `(bool, i64, i64) -> i64` function.
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_call_select(module: &trust_ir::Module, name: &str, c: bool, a: i64, b: i64) -> i64 {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_call_select");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of `{name}` failed: {e:?}"))
         .buffer;
@@ -761,7 +791,7 @@ fn interp_select(module: &trust_ir::Module, name: &str, c: bool, a: i64, b: i64)
 
 #[test]
 fn frontend_emitted_module_parses() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M3_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M3_TRUST_IR)
         .expect("frontend M3 trust-ir text must parse");
     let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(
@@ -776,7 +806,7 @@ fn frontend_emitted_module_parses() {
 
 #[test]
 fn frontend_double_i64_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M3_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M3_TRUST_IR)
         .expect("frontend M3 trust-ir text must parse");
 
     // double(x) = x + x, computed with wrapping (trust-ir `add` is two's-complement
@@ -806,7 +836,7 @@ fn frontend_double_i64_triple_oracle() {
 
 #[test]
 fn frontend_id_i64_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M3_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M3_TRUST_IR)
         .expect("frontend M3 trust-ir text must parse");
 
     for x in [
@@ -829,7 +859,7 @@ fn frontend_id_i64_triple_oracle() {
 
 #[test]
 fn frontend_m4_callchain_parses_with_two_functions() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M4_CALLCHAIN_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M4_CALLCHAIN_TRUST_IR)
         .expect("frontend M4 call-chain trust-ir text must parse");
     let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(
@@ -849,7 +879,7 @@ fn frontend_m4_callchain_parses_with_two_functions() {
 /// straight-line arithmetic. quad(x) = double(double(x)) = 4*x (wrapping).
 #[test]
 fn frontend_quad_i64_callchain_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M4_CALLCHAIN_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M4_CALLCHAIN_TRUST_IR)
         .expect("frontend M4 call-chain trust-ir text must parse");
 
     for x in [
@@ -880,7 +910,7 @@ fn frontend_quad_i64_callchain_triple_oracle() {
 /// second call). Confirms the let-threaded SSA values survive trust-cg codegen.
 #[test]
 fn frontend_let_bindings_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5_LET_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5_LET_TRUST_IR)
         .expect("frontend M5 let trust-ir text must parse");
 
     for x in [0i64, 1, -1, 5, -3, 7, 1_000_000, i64::MAX, i64::MIN] {
@@ -918,7 +948,7 @@ fn frontend_let_bindings_triple_oracle() {
 /// output.
 #[test]
 fn frontend_scalar_match_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5_MATCH_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5_MATCH_TRUST_IR)
         .expect("frontend M5 match trust-ir text must parse");
 
     let classify_native = |x: i64| -> i64 {
@@ -1004,11 +1034,20 @@ unsafe fn count_succ_native(p: *const LevelNode) -> i64 {
 /// over the same shapes via the M5.4 differential; here we add executed machine
 /// code over a real heap graph.)
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_count_succ_recursive_adt_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5_ADT_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_count_succ_recursive_adt_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5_ADT_TRUST_IR)
         .expect("frontend M5.4 ADT-match trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of count_succ failed")
         .buffer;
@@ -1072,10 +1111,17 @@ unsafe fn is_nonzero_native(p: *const LevelNode) -> bool {
 /// real heap graphs, native == JIT machine code. This is the same leaf class
 /// LowerCx (M1/M2) hand-targeted, now end-to-end through the unified path.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_is_zero_predicate_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5_PRED_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("frontend_is_zero_predicate_roundtrip");
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5_PRED_TRUST_IR)
         .expect("frontend M5.6 predicate trust-ir text must parse");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of predicates failed")
         .buffer;
@@ -1114,7 +1160,7 @@ fn frontend_is_zero_predicate_roundtrip() {
 
 #[test]
 fn frontend_m5_if_parses_with_join_block() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5_IF_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5_IF_TRUST_IR)
         .expect("frontend M5 if/join trust-ir text must parse");
     let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(
@@ -1129,7 +1175,7 @@ fn frontend_m5_if_parses_with_join_block() {
 /// (phi-like) lowering and the bool+i64+i64 C ABI on a FRONTEND-EMITTED artifact.
 #[test]
 fn frontend_pick_select_if_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5_IF_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5_IF_TRUST_IR)
         .expect("frontend M5 if/join trust-ir text must parse");
 
     for &name in &["pick__i64", "select__i64"] {
@@ -1157,8 +1203,15 @@ fn frontend_pick_select_if_triple_oracle() {
 }
 
 /// JIT-compile + call an `(i64) -> i64` op fn.
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_call_unary_op(module: &trust_ir::Module, name: &str, x: i64) -> i64 {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_call_unary_op");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of `{name}` failed: {e:?}"))
         .buffer;
@@ -1172,8 +1225,15 @@ fn jit_call_unary_op(module: &trust_ir::Module, name: &str, x: i64) -> i64 {
 }
 
 /// JIT-compile + call an `(i64, i64) -> i64` op fn.
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_call_bin_op(module: &trust_ir::Module, name: &str, a: i64, b: i64) -> i64 {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_call_bin_op");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of `{name}` failed: {e:?}"))
         .buffer;
@@ -1200,7 +1260,7 @@ fn interp_bin(module: &trust_ir::Module, name: &str, a: i64, b: i64) -> i64 {
 
 #[test]
 fn frontend_m5g_ops_parses_with_four_functions() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5G_OPS_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5G_OPS_TRUST_IR)
         .expect("frontend M5.7c ops trust-ir text must parse");
     let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
     for want in ["negate__i64", "bitops__i64", "divrem__i64", "shifts__i64"] {
@@ -1217,7 +1277,7 @@ fn frontend_m5g_ops_parses_with_four_functions() {
 /// `neg`/`and`/`or`/`xor`/`sdiv`/`srem`/`shl`/`ashr` lowering on real machine code.
 #[test]
 fn frontend_m5g_ops_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5G_OPS_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5G_OPS_TRUST_IR)
         .expect("frontend M5.7c ops trust-ir text must parse");
 
     // negate(x) = -x (wrapping, so -i64::MIN == i64::MIN).
@@ -1303,8 +1363,15 @@ fn frontend_m5g_ops_triple_oracle() {
 }
 
 /// JIT-compile + call an `(i64, i64, i64) -> i64` op fn.
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_call_tern_op(module: &trust_ir::Module, name: &str, a: i64, b: i64, c: i64) -> i64 {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_call_tern_op");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of `{name}` failed: {e:?}"))
         .buffer;
@@ -1332,7 +1399,7 @@ fn interp_tern(module: &trust_ir::Module, name: &str, a: i64, b: i64, c: i64) ->
 
 #[test]
 fn frontend_m5h_multigen_parses_with_two_functions() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5H_MULTIGEN_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5H_MULTIGEN_TRUST_IR)
         .expect("frontend M5.7d multigen trust-ir text must parse");
     let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
     for want in ["fst__i64_i64", "combine__i64_i64"] {
@@ -1350,7 +1417,7 @@ fn frontend_m5h_multigen_parses_with_two_functions() {
 /// frontend-emitted artifact.
 #[test]
 fn frontend_m5h_multigen_triple_oracle() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5H_MULTIGEN_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5H_MULTIGEN_TRUST_IR)
         .expect("frontend M5.7d multigen trust-ir text must parse");
 
     // fst(a, _b) = a  (the second arg is bound but unused).
@@ -1471,10 +1538,19 @@ unsafe fn eval_native(p: *const ValNode) -> i64 {
 /// interpreter already cross-checks this frontend-side via the M5.7b differential;
 /// here we add executed machine code over a real heap graph.)
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_eval_inline_scalar_payload_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5I_EVAL_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_eval_inline_scalar_payload_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5I_EVAL_TRUST_IR)
         .expect("frontend M5.7b eval trust-ir text must parse");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of eval failed")
         .buffer;
@@ -1625,10 +1701,19 @@ unsafe fn is_beta_redex_native(p: *const TermNode) -> bool {
 /// interpreter already cross-checks this frontend-side via the M5.7a differential;
 /// here we add executed machine code over a real heap graph.)
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_is_beta_redex_nested_ctor_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5J_REDEX_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_is_beta_redex_nested_ctor_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5J_REDEX_TRUST_IR)
         .expect("frontend M5.7a redex trust-ir text must parse");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of is_beta_redex failed")
         .buffer;
@@ -1799,10 +1884,19 @@ unsafe fn sym_sum_native(p: *const SymNode) -> i64 {
 /// already cross-checks this frontend-side via the M5.7e differential; here we add
 /// executed machine code over a real heap graph.)
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_sym_sum_aggregate_payload_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5L_SYM_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_sym_sum_aggregate_payload_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5L_SYM_TRUST_IR)
         .expect("frontend M5.7e sym trust-ir text must parse");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of sym_sum failed")
         .buffer;
@@ -1975,13 +2069,22 @@ extern "C" fn rust_alloc_shim(size: usize, align: usize) -> *mut u8 {
 /// this frontend-side via the M5.7f differential; here we add executed machine
 /// code that constructs a real heap graph.)
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_two_depth_enum_construction_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_M5K_CONSTRUCT_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_two_depth_enum_construction_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(FRONTEND_M5K_CONSTRUCT_TRUST_IR)
         .expect("frontend M5.7f construction trust-ir text must parse");
     // Bind the allocator shim trust-cg's HeapAlloc lowering CALLs.
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert("__rust_alloc".to_string(), rust_alloc_shim as *const u8);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of two_depth (HeapAlloc+Store construction) failed")
         .buffer;
@@ -2027,8 +2130,9 @@ fn frontend_two_depth_enum_construction_roundtrip() {
 // the read, and those match rustc's real layout (size 40, tag@0 width 8, children
 // @8/@16) — confirmed by the FIX-1a LAYOUT-PIN.
 //
-// TOOLCHAIN NOTE: this test is built by STOCK cargo (the trust-cg test crate),
-// whose rustc may differ from the stage1 fork the frontend runs under. The niche
+// TOOLCHAIN NOTE: this test is built by the root workspace's pinned Trust
+// toolchain (targo/trustc; the trust-cg test crate), whose compiler may differ
+// from the stage1 fork the frontend runs under. The niche
 // layout this asserts (untagged=Param, niche {3,4,5,6}, size 40, tag@0/8B,
 // children @8/@16) is the STABLE current-rustc layout for this enum shape and is
 // the SAME one the stage1 frontend recovered (cross-checked by the probe behind
@@ -2192,17 +2296,27 @@ type NicheePredFn = extern "C" fn(*const M6Level) -> bool;
 /// the lowered predicate reads RUSTC's OWN niche bytes (incl. real `Param` word0 in
 /// {0,1,2}), not the self-consistent differential's heap-builder bytes.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_m6_niche_level_genuine_rustc_memory_crosscheck() {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_m6_niche_level_genuine_rustc_memory_crosscheck",
+    );
     // JIT each predicate as its own module (so `call @func.0` = the predicate).
-    let mz = trust_ir::parser::parse_module(FRONTEND_M6_NICHE_IS_ZERO_TRUST_IR)
+    let mz = emitted_fixture::parse_emitted(FRONTEND_M6_NICHE_IS_ZERO_TRUST_IR)
         .expect("niche is_zero IR must parse");
-    let mnz = trust_ir::parser::parse_module(FRONTEND_M6_NICHE_IS_NONZERO_TRUST_IR)
+    let mnz = emitted_fixture::parse_emitted(FRONTEND_M6_NICHE_IS_NONZERO_TRUST_IR)
         .expect("niche is_nonzero IR must parse");
     let bz = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&mz, &HashMap::new())
         .expect("trust-cg JIT compile of niche is_zero failed")
         .buffer;
     let bnz = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&mnz, &HashMap::new())
         .expect("trust-cg JIT compile of niche is_nonzero failed")
         .buffer;
@@ -2508,11 +2622,18 @@ unsafe fn sz_native(p: *const SzNode) -> i64 {
 /// `ptrtoint` align check (identity on a real pointer), `add.overflow` + its
 /// `Assert(!overflow)` (the debug `+`), and intra-module SELF-recursion (`@func.0`).
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_sz_recursive_box_adt_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_SZ_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_sz_recursive_box_adt_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_SZ_TRUST_IR)
         .expect("MIR-emitted `sz` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `sz` failed")
         .buffer;
@@ -3268,8 +3389,16 @@ type StructuralEqFn =
 /// (`@func.4`), and the four bound leaf-comparison shims (BVar/Proj `u32`, Lit, Const,
 /// Sort).
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_structural_eq_impl_micro_checker_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_STRUCTURAL_EQ_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_structural_eq_impl_micro_checker_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_STRUCTURAL_EQ_TRUST_IR)
         .expect("MIR-emitted `structural_eq_impl` trust-ir text must parse");
     // Bind the four leaf-comparison externs the body CALLs to native shims.
     let mut externs: HashMap<String, *const u8> = HashMap::new();
@@ -3279,6 +3408,7 @@ fn mir_structural_eq_impl_micro_checker_roundtrip() {
     externs.insert(EXT_LEVEL_EQ.to_string(), shim_level_eq as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `structural_eq_impl` failed")
         .buffer;
@@ -3532,7 +3662,7 @@ bb5(%7: ptr):
     br bb6(%7, %71)
 bb6(%8: ptr, %9: ptr):
     %72 = load i8, ptr %31
-    switch %72 [ 255: bb8 0: bb10(%8) 1: bb9(%9) default: bb7 ]
+    switch %72 [ -1: bb8 0: bb10(%8) 1: bb9(%9) default: bb7 ]
 bb7:
     unreachable
 bb8:
@@ -3859,8 +3989,16 @@ type SubstAtFn = extern "C" fn(*mut MicroExpr, *const MicroExpr, u32, *const Mic
 /// `Arc<MicroExpr>` children via `__rust_alloc`'d ArcInner blocks (data@+16) the native
 /// `PartialEq` derefs directly.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_subst_at_arc_new_construction_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_SUBST_AT_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_subst_at_arc_new_construction_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_SUBST_AT_TRUST_IR)
         .expect("MIR-emitted `subst_at` (Arc-WRITE) trust-ir text must parse");
     // Bind the leaf-callee shims + the Rust heap allocator the `heap_alloc` lowers to.
     let mut externs: HashMap<String, *const u8> = HashMap::new();
@@ -3871,6 +4009,7 @@ fn mir_subst_at_arc_new_construction_roundtrip() {
     externs.insert("__rust_alloc".to_string(), aw_shim_rust_alloc as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `subst_at` (Arc-WRITE) failed")
         .buffer;
@@ -4163,7 +4302,7 @@ bb11(%10: ptr):
     br bb12(%10, %169)
 bb12(%11: ptr, %12: ptr):
     %170 = load i8, ptr %80
-    switch %170 [ 255: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
+    switch %170 [ -1: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
 bb13:
     %171 = load ptr, ptr %78
     call @func.0(%0, %171)
@@ -4882,8 +5021,14 @@ type FullSubstFn = extern "C" fn(*mut MicroExpr, *const MicroExpr, u32, *const M
 /// rebuilds, Lit/Const clone). Native `subst` == JIT, structurally, over cases that
 /// hit each new arm.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_full_subst_micro_checker_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_FULL_SUBST_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_full_subst_micro_checker_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_FULL_SUBST_TRUST_IR)
         .expect("MIR-emitted full `subst` trust-ir text must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_FS_CLONE.to_string(), fs_shim_clone as *const u8);
@@ -4897,6 +5042,7 @@ fn mir_full_subst_micro_checker_roundtrip() {
     externs.insert("__rust_alloc".to_string(), fs_shim_rust_alloc as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted full `subst` failed")
         .buffer;
@@ -5333,8 +5479,14 @@ type CollectSpineFn = extern "C" fn(*const SpExpr, *mut Vec<SpExpr>);
 /// the loop bool flag as a real block param. The output `Vec` is compared element-by-
 /// element so a wrong flatten/reverse/push diverges.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_collect_spine_vec_loop_ssa_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_COLLECT_SPINE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_collect_spine_vec_loop_ssa_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_COLLECT_SPINE_TRUST_IR)
         .expect("MIR-emitted `collect_spine` trust-ir text must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_SP_AS_REF.to_string(), sp_shim_as_ref as *const u8);
@@ -5346,6 +5498,7 @@ fn mir_collect_spine_vec_loop_ssa_roundtrip() {
     externs.insert(EXT_SP_VEC_NEW.to_string(), sp_shim_vec_new as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `collect_spine` failed")
         .buffer;
@@ -6590,8 +6743,14 @@ type WhnfFn = extern "C" fn(*mut MicroExpr, *const WhnfChecker, *const MicroExpr
 /// trust-cg JIT -> machine code == native Rust, over real `Arc<MicroExpr>` heap
 /// graphs and a DELTA env. Compares the resulting `MicroExpr` trees structurally.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_whnf_core_micro_checker_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_WHNF_CORE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_whnf_core_micro_checker_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_WHNF_CORE_TRUST_IR)
         .expect("MIR-emitted `whnf` trust-ir text must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_WH_CLONE.to_string(), wh_shim_clone as *const u8);
@@ -6615,6 +6774,7 @@ fn mir_whnf_core_micro_checker_roundtrip() {
     externs.insert("__rust_alloc".to_string(), rust_alloc_shim as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `whnf` failed")
         .buffer;
@@ -9033,7 +9193,7 @@ bb11(%10: ptr):
     br bb12(%10, %169)
 bb12(%11: ptr, %12: ptr):
     %170 = load i8, ptr %80
-    switch %170 [ 255: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
+    switch %170 [ -1: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
 bb13:
     %171 = load ptr, ptr %78
     call @func.13(%0, %171)
@@ -10505,8 +10665,14 @@ type DefEqFn = extern "C" fn(*const DeChecker, *const MicroExpr, *const MicroExp
 /// END-TO-END MIR-PATH CAPSTONE #2: the JIT-EXECUTED verified def_eq composing the
 /// REAL in-module whnf + structural_eq (the SECOND verified micro-checker pillar).
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_def_eq_micro_checker_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_DEF_EQ_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_def_eq_micro_checker_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_DEF_EQ_CLOSURE_TRUST_IR)
         .expect("MIR-emitted def_eq closure trust-ir text must parse");
     // CONFIRM the call graph is genuinely IN-MODULE (not extern stubs): whnf,
     // structural_eq, instantiate, subst, lift, env_get all have non-empty bodies.
@@ -10573,6 +10739,7 @@ fn mir_def_eq_micro_checker_roundtrip() {
     externs.insert("__rust_alloc".to_string(), rust_alloc_shim as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted def_eq closure failed")
         .buffer;
@@ -20127,7 +20294,7 @@ bb11(%10: ptr):
     br bb12(%10, %169)
 bb12(%11: ptr, %12: ptr):
     %170 = load i8, ptr %80
-    switch %170 [ 255: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
+    switch %170 [ -1: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
 bb13:
     %171 = load ptr, ptr %78
     call @func.26(%0, %171)
@@ -21532,8 +21699,14 @@ const VERIFY_IMPL_TIR: &str = include_str!("verify_impl.trust.tir");
 /// threaded context `Vec`. native `verify_impl` == JIT machine code over each CIC
 /// typing rule + the failure arms.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_verify_impl_capstone_roundtrip() {
-    let module = trust_ir::parser::parse_module(VERIFY_IMPL_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_verify_impl_capstone_roundtrip");
+    let module = emitted_fixture::parse_emitted(VERIFY_IMPL_TIR)
         .expect("MIR-emitted verify_impl closure trust-ir text must parse");
 
     // CONFIRM the call graph is genuinely IN-MODULE: verify_impl composes the REAL
@@ -21663,6 +21836,7 @@ fn mir_verify_impl_capstone_roundtrip() {
 
     let externs = resolve_externs(&module, &externs);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted verify_impl closure failed")
         .buffer;
@@ -27735,7 +27909,7 @@ bb11(%10: ptr):
     br bb12(%10, %169)
 bb12(%11: ptr, %12: ptr):
     %170 = load i8, ptr %80
-    switch %170 [ 255: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
+    switch %170 [ -1: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
 bb13:
     %171 = load ptr, ptr %78
     call @func.16(%0, %171)
@@ -29191,8 +29365,14 @@ const RR_WHNF_TIR: &str = include_str!("reduce_recursor.trust.tir");
 /// END-TO-END MIR-PATH CAPSTONE: the JIT-EXECUTED verified `whnf_impl` with its IOTA
 /// recursor engine. native whnf_impl == JIT over Bool.rec / Nat.rec reductions.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_reduce_recursor_iota_roundtrip() {
-    let module = trust_ir::parser::parse_module(RR_WHNF_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_reduce_recursor_iota_roundtrip");
+    let module = emitted_fixture::parse_emitted(RR_WHNF_TIR)
         .expect("MIR-emitted whnf_impl+reduce_recursor closure trust-ir text must parse");
 
     // CONFIRM the IOTA leaf is genuinely IN-MODULE (not extern stubs): whnf_impl
@@ -29355,6 +29535,7 @@ fn mir_reduce_recursor_iota_roundtrip() {
 
     let externs = resolve_externs(&module, &externs);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted whnf_impl+reduce_recursor closure failed")
         .buffer;
@@ -30096,8 +30277,14 @@ type CheckDefEqFn =
     extern "C" fn(*mut MicroResult, *const CeChecker, *const MicroExpr, *const MicroExpr);
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_check_eq_inner_public_api_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_CE_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_check_eq_inner_public_api_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_CE_CLOSURE_TRUST_IR)
         .expect("MIR-emitted check_def_eq_result closure trust-ir text must parse");
 
     // CONFIRM the public entry composes the verified core IN-MODULE.
@@ -30277,6 +30464,7 @@ fn mir_check_eq_inner_public_api_roundtrip() {
     externs.insert("__rust_alloc".to_string(), rust_alloc_shim as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted check_def_eq_result closure failed")
         .buffer;
@@ -37991,7 +38179,7 @@ bb11(%10: ptr):
     br bb12(%10, %169)
 bb12(%11: ptr, %12: ptr):
     %170 = load i8, ptr %80
-    switch %170 [ 255: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
+    switch %170 [ -1: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
 bb13:
     %171 = load ptr, ptr %78
     call @func.37(%0, %171)
@@ -45719,7 +45907,7 @@ bb11(%10: ptr):
     br bb12(%10, %169)
 bb12(%11: ptr, %12: ptr):
     %170 = load i8, ptr %80
-    switch %170 [ 255: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
+    switch %170 [ -1: bb13 0: bb15(%11) 1: bb14(%12) default: bb1 ]
 bb13:
     %171 = load ptr, ptr %78
     call @func.16(%0, %171)
@@ -48668,8 +48856,14 @@ const NA_WHNF_TIR: &str = include_str!("native_arith.trust.tir");
 /// NATIVE-ARITHMETIC IOTA. native whnf_impl == JIT over Nat.add/mul/sub/succ/beq +
 /// Bool.beq + a stuck native op + a nested op + the recursor + plain reductions.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_native_arith_iota_roundtrip() {
-    let module = trust_ir::parser::parse_module(NA_WHNF_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_native_arith_iota_roundtrip");
+    let module = emitted_fixture::parse_emitted(NA_WHNF_TIR)
         .expect("MIR-emitted whnf_impl native-arith closure trust-ir text must parse");
 
     // CONFIRM the native-IOTA leaf is genuinely IN-MODULE (not extern stubs).
@@ -49013,6 +49207,7 @@ fn mir_native_arith_iota_roundtrip() {
 
     let externs = resolve_externs(&module, &externs);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted whnf_impl native-arith closure failed")
         .buffer;
@@ -50332,8 +50527,16 @@ impl HlExpr {
 type HlbirFn = unsafe extern "C" fn(*const HlExpr, u32, u32) -> bool;
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_has_loose_bvar_in_range_real_expr_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_HLBIR_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_has_loose_bvar_in_range_real_expr_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_HLBIR_CLOSURE_TRUST_IR)
         .expect("MIR-emitted has_loose_bvar_in_range closure trust-ir text must parse");
     // CONFIRM the call graph is genuinely IN-MODULE (real bodies, not extern shims).
     let bodied = |sym: &str| {
@@ -50374,6 +50577,7 @@ fn mir_has_loose_bvar_in_range_real_expr_roundtrip() {
     let externs: HashMap<String, *const u8> = HashMap::new();
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of has_loose_bvar_in_range closure failed")
         .buffer;
@@ -53891,8 +54095,14 @@ extern "C" fn cx_shim_hash_unreached(_a: *const u8, _b: *const u8) {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_construction_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_LIFT_AT_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_construction_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_LIFT_AT_CLOSURE_TRUST_IR)
         .expect("MIR-emitted `lift_at` (Expr CONSTRUCTION) trust-ir text must parse");
     // CONFIRM the construction call graph is genuinely IN-MODULE (real bodies).
     let bodied = |sym: &str| {
@@ -53988,6 +54198,7 @@ fn mir_real_expr_construction_roundtrip() {
     externs.insert("_RINvXsk_NtCskTzINo8ZBH9_5alloc5boxedINtB6_3BoxNtCsbAToRH58LyD_29clean_expr_construction_slice5LevelENtNtCs2EYQwhfuABO_4core4hash4Hash4hashNtBK_10KaniHasherEBK_".to_string(), cx_shim_hash_unreached as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `lift_at` (Expr CONSTRUCTION) failed")
         .buffer;
@@ -57370,8 +57581,14 @@ extern "C" fn cx_shim_hash_u32(value: *const u32, state: *mut u64) {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_instantiate_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_INSTANTIATE_AT_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_instantiate_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_INSTANTIATE_AT_CLOSURE_TRUST_IR)
         .expect("MIR-emitted `instantiate_at` (Expr BETA substitution) trust-ir text must parse");
     let bodied = |sym: &str| {
         module
@@ -57473,6 +57690,7 @@ fn mir_real_expr_instantiate_roundtrip() {
     externs.insert("_RINvXsk_NtCskTzINo8ZBH9_5alloc5boxedINtB6_3BoxNtCs7NMZVpYdFJS_28clean_expr_instantiate_slice5LevelENtNtCs2EYQwhfuABO_4core4hash4Hash4hashNtBK_10KaniHasherEBK_".to_string(), cx_shim_hash_unreached as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect(
             "trust-cg JIT compile of MIR-emitted `instantiate_at` (Expr BETA substitution) failed",
@@ -63141,8 +63359,14 @@ extern "C" fn cw_shim_hash_box_level(boxptr: *const Box<CwLevel>, state: *mut u6
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_whnf_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_WHNF_IMPL_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_whnf_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_WHNF_IMPL_CLOSURE_TRUST_IR)
         .expect("MIR-emitted `whnf_impl` (real-Expr WHNF reduction) trust-ir text must parse");
     // CONFIRM the reduction call graph is genuinely IN-MODULE (real bodies, not stubs).
     let bodied = |sym: &str| {
@@ -63300,6 +63524,7 @@ fn mir_real_expr_whnf_roundtrip() {
     externs.insert("_RINvXsk_NtCskTzINo8ZBH9_5alloc5boxedINtB6_3BoxNtCskchLIXKnH0y_21clean_expr_whnf_slice5LevelENtNtCs2EYQwhfuABO_4core4hash4Hash4hashNtBK_10KaniHasherEBK_".to_string(), cw_shim_hash_unreached as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `whnf_impl` (real-Expr WHNF) failed")
         .buffer;
@@ -69550,8 +69775,14 @@ extern "C" fn cw_shim_vec_lvl_deref(sret: *mut (*const CwLevel, usize), this: *c
 type CwDefEqFn = extern "C" fn(*const CwVerifier, *const CwExpr, *const CwExpr) -> bool;
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_def_eq_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_DEF_EQ_IMPL_CLOSURE_TRUST_IR).expect(
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_def_eq_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_DEF_EQ_IMPL_CLOSURE_TRUST_IR).expect(
         "MIR-emitted `def_eq_impl` (real-Expr definitional equality) trust-ir text must parse",
     );
     // CONFIRM the def-eq call graph is genuinely IN-MODULE (real bodies, not stubs),
@@ -69694,6 +69925,7 @@ fn mir_real_expr_def_eq_roundtrip() {
     externs.insert("_RNvXs7_NtNtCs2EYQwhfuABO_4core3cmp5implsRmNtB7_9PartialEq2eqCskchLIXKnH0y_21clean_expr_whnf_slice".to_string(), cw_shim_u32ref_eq as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `def_eq_impl` (real-Expr def-eq) failed")
         .buffer;
@@ -79079,8 +79311,14 @@ const INFER_TYPE_IMPL_TIR: &str = MIR_INFER_TYPE_IMPL_CLOSURE_TRUST_IR;
 const INFER_TYPE_IMPL_TIR: &str = include_str!("clean_expr_infer.trust.tir");
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_infer_type_roundtrip() {
-    let module = trust_ir::parser::parse_module(INFER_TYPE_IMPL_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_infer_type_roundtrip");
+    let module = emitted_fixture::parse_emitted(INFER_TYPE_IMPL_TIR)
         .expect("MIR-emitted `infer_type` (real-Expr type inference) trust-ir text must parse");
     // CONFIRM the inference call graph is genuinely IN-MODULE and COMPOSES all three
     // verified pillars: the typing rules (infer_type/infer_type_core), the WHNF pillar
@@ -79279,6 +79517,7 @@ fn mir_real_expr_infer_type_roundtrip() {
 
     let externs = resolve_externs(&module, &externs);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `infer_type` (real-Expr inference) failed")
         .buffer;
@@ -90013,8 +90252,14 @@ const DECL_CHECK_TIR: &str = MIR_DECL_CHECK_CLOSURE_TRUST_IR;
 const DECL_CHECK_TIR: &str = include_str!("clean_decl_check.trust.tir");
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_full_decl_check_roundtrip() {
-    let module = trust_ir::parser::parse_module(DECL_CHECK_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_full_decl_check_roundtrip");
+    let module = emitted_fixture::parse_emitted(DECL_CHECK_TIR)
         .expect("MIR-emitted `check_decl_readonly` (universal decl gate) trust-ir text must parse");
 
     // CONFIRM the FULL gate call graph is genuinely IN-MODULE and COMPOSES the §5/§7
@@ -90188,7 +90433,7 @@ fn mir_real_expr_full_decl_check_roundtrip() {
     externs.insert("_RNvXsq_NtCs2EYQwhfuABO_4core6resultINtB5_6ResultuNtCs2sxBbexoeSM_22clean_decl_check_slice9TypeErrorEINtNtNtB7_3ops9try_trait12FromResidualIBy_NtNtB7_7convert10InfallibleBL_EE13from_residualBN_".to_string(), dc_shim_unit_result_from_residual as *const u8);
 
     let externs = resolve_externs(&module, &externs);
-    let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+    let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64)).with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `check_decl_readonly` (universal decl gate) failed")
         .buffer;
@@ -90487,8 +90732,16 @@ fn mkh_native(name_field: u64) -> u64 {
 /// of the real `HashMap::get` lookup (the SwissTable group-scan itself does NOT lower
 /// — it bottoms out at NEON `simd_eq`, a bodiless `#[rustc_intrinsic]`; see the header).
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_env_key_make_hash_kanihasher_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_MAKE_HASH_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_env_key_make_hash_kanihasher_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_MAKE_HASH_TRUST_IR)
         .expect("MIR-emitted `make_hash_direct` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let mut externs: HashMap<String, *const u8> = HashMap::new();
@@ -90497,6 +90750,7 @@ fn mir_env_key_make_hash_kanihasher_roundtrip() {
         shim_u64_wrapping_mul as *const u8,
     );
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `make_hash_direct` failed")
         .buffer;
@@ -94730,8 +94984,14 @@ extern "C" fn cl_shim_vec_pair_pop(
 type ClIsDefEqFn = extern "C" fn(*const ClLevel, *const ClLevel) -> bool;
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_level_is_def_eq_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_LEVEL_IS_DEF_EQ_TRUST_IR).expect(
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_level_is_def_eq_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_LEVEL_IS_DEF_EQ_TRUST_IR).expect(
         "MIR-emitted `Level::is_def_eq` (real-Level universe unification) trust-ir text must parse",
     );
 
@@ -94906,6 +95166,7 @@ fn mir_real_level_is_def_eq_roundtrip() {
     );
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `Level::is_def_eq` (real-Level def-eq) failed")
         .buffer;
@@ -134238,8 +134499,14 @@ const INFER_TYPE_EXT_TIR: &str = MIR_INFER_TYPE_EXT_CLOSURE_TRUST_IR;
 const INFER_TYPE_EXT_TIR: &str = include_str!("clean_expr_infer_ext.trust.tir");
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_infer_type_extra_roundtrip() {
-    let module = trust_ir::parser::parse_module(INFER_TYPE_EXT_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_infer_type_extra_roundtrip");
+    let module = emitted_fixture::parse_emitted(INFER_TYPE_EXT_TIR)
         .expect("MIR-emitted EXTENDED `infer_type` trust-ir text must parse");
     let bodied = |sym: &str| {
         module
@@ -134444,6 +134711,7 @@ fn mir_real_expr_infer_type_extra_roundtrip() {
 
     let externs = resolve_externs(&module, &externs);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted EXTENDED `infer_type` failed")
         .buffer;
@@ -134753,8 +135021,14 @@ const PROOF_IRREL_TIR: &str = MIR_PROOF_IRREL_CLOSURE_TRUST_IR;
 const PROOF_IRREL_TIR: &str = include_str!("clean_proof_irrel.trust.tir");
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_proof_irrel_roundtrip() {
-    let module = trust_ir::parser::parse_module(PROOF_IRREL_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_proof_irrel_roundtrip");
+    let module = emitted_fixture::parse_emitted(PROOF_IRREL_TIR)
         .expect("MIR-emitted `is_def_eq_proof_irrel` trust-ir text must parse");
     let bodied = |sym: &str| {
         module
@@ -134993,6 +135267,7 @@ fn mir_real_expr_proof_irrel_roundtrip() {
     let externs = build_externs(cy_shim_result_ok as *const u8);
     let externs = resolve_externs(&module, &externs);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `is_def_eq_proof_irrel` failed")
         .buffer;
@@ -135150,6 +135425,7 @@ fn mir_real_expr_proof_irrel_roundtrip() {
     let bad_externs = build_externs(cy_shim_result_ok_corrupt as *const u8);
     let bad_externs = resolve_externs(&module, &bad_externs);
     let bad_buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &bad_externs)
         .expect("JIT compile (corrupt shim) failed")
         .buffer;
@@ -135575,11 +135851,18 @@ type IntFitsFn = extern "C" fn(i128, *const TfTy) -> bool;
 /// of TRUST's OWN compiler toolchain by executed machine code: the method that
 /// verified the clean kernel now applies to Trust itself.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_int_value_fits_ty_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_INT_FITS_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_int_value_fits_ty_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_INT_FITS_TRUST_IR)
         .expect("MIR-emitted `int_value_fits_ty` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `int_value_fits_ty` failed")
         .buffer;
@@ -135829,11 +136112,18 @@ type SwapCmpFn = extern "C" fn(*mut TfICmpOp, u8);
 /// fixed points). Exercises returning an ENUM VALUE (niche-encoded discriminant on
 /// the RESULT), a different lowering surface from the bool/int predicates.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_swap_cmp_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_SWAP_CMP_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_swap_cmp_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_SWAP_CMP_TRUST_IR)
         .expect("MIR-emitted `swap_cmp` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `swap_cmp` failed")
         .buffer;
@@ -135981,11 +136271,18 @@ type TypeMaxFn = extern "C" fn(u32) -> u128;
 /// branch, the `bits < 128` shift+subtract branch, and the boundary (bits = 0,
 /// 127, 128). Exercises real u128 shift/subtract arithmetic in the JIT.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_type_max_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_TYPE_MAX_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_type_max_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_TYPE_MAX_TRUST_IR)
         .expect("MIR-emitted `type_max` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `type_max` failed")
         .buffer;
@@ -136166,11 +136463,18 @@ type TotalBitsFn = extern "C" fn(*mut Option<u32>, *const TfPointerLayoutShape);
 /// IR comment); everything else is the verbatim emitted body. Exercises an
 /// Option<u32> result through an out-pointer + a cross-function call.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_total_bits_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_TOTAL_BITS_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_total_bits_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_TOTAL_BITS_TRUST_IR)
         .expect("MIR-emitted `total_bits` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `total_bits` failed")
         .buffer;
@@ -136422,11 +136726,18 @@ type MetadataShapeFn = extern "C" fn(*mut TfPointerMetadataShapeMs, *const TfFat
 /// trait_id for TraitObject). Exercises an enum->enum map that READS a payload off
 /// the input and WRITES it into the output -- distinct from the fieldless swap_cmp.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_metadata_shape_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_METADATA_SHAPE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_metadata_shape_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_METADATA_SHAPE_TRUST_IR)
         .expect("MIR-emitted `metadata_shape` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `metadata_shape` failed")
         .buffer;
@@ -136905,11 +137216,18 @@ fn all_ty_variants() -> Vec<(TfTy, &'static str)> {
 /// EVERY `Ty` variant (the whole discriminant space). Exercises the faithful
 /// niche-decode + switch lowering of the wide `Ty` enum to a bool predicate.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_is_reference_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_IS_REFERENCE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_is_reference_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_IS_REFERENCE_TRUST_IR)
         .expect("MIR-emitted `is_reference` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `is_reference` failed")
         .buffer;
@@ -136984,11 +137302,18 @@ fn trust_self_is_reference_roundtrip() {
 /// EVERY `Ty` variant. A DIFFERENT true-set than `is_reference`, so the JIT must
 /// decode and switch on a different subset of the discriminant space.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_is_aggregate_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_IS_AGGREGATE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_is_aggregate_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_IS_AGGREGATE_TRUST_IR)
         .expect("MIR-emitted `is_aggregate` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `is_aggregate` failed")
         .buffer;
@@ -137205,11 +137530,18 @@ type FoldAddFn = extern "C" fn(*mut Option<i128>, *const Option<i128>, *const Op
 /// payload — the width-16 path the frontend addition unblocks. The only external
 /// leaf is the documented i128 `checked_add` shim.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_fold_add_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_FOLD_ADD_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_fold_add_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_FOLD_ADD_TRUST_IR)
         .expect("MIR-emitted `fold_add` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `fold_add` failed")
         .buffer;
@@ -138329,8 +138661,14 @@ const EXT_HG_CAST_ENTRY: &str = "_RINvMNtNtCs2EYQwhfuABO_4core3ptr9const_ptrPh4c
 /// group scan that earlier blocked at NEON `simd_eq` is now JIT-verified as pure
 /// u64 arithmetic, faithful to hashbrown's algorithm.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_hashmap_get_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_ENV_GET_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_hashmap_get_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_ENV_GET_TRUST_IR)
         .expect("MIR-emitted `env_get` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
 
@@ -138383,6 +138721,7 @@ fn mir_real_hashmap_get_roundtrip() {
     );
 
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `env_get` failed")
         .buffer;
@@ -143325,8 +143664,14 @@ bb5:
 /// END-TO-END MIR-PATH MILESTONE: the JIT-EXECUTED verified `whnf_impl` with its
 /// Quot.lift iota leaf UN-CUT. native whnf_impl == JIT over quotient reductions.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_quot_lift_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_WHNF_QUOT_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_quot_lift_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_WHNF_QUOT_CLOSURE_TRUST_IR)
         .expect("MIR-emitted whnf_impl+try_quot_reduction closure trust-ir text must parse");
 
     // CONFIRM the QUOT leaf is genuinely IN-MODULE (not an extern stub), and that it
@@ -143476,6 +143821,7 @@ fn mir_real_expr_quot_lift_roundtrip() {
     );
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted whnf_impl+try_quot_reduction closure failed")
         .buffer;
@@ -144336,11 +144682,18 @@ type TyMaskFn = extern "C" fn(*const TfTy, *const TfTy) -> bool;
 /// unsigned / float / non-integer element), and every base case (non-vector
 /// operand on either side). Plus a fail-loud negative control.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_mask_select_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_MASK_SELECT_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_mask_select_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_MASK_SELECT_TRUST_IR)
         .expect("MIR-emitted `is_integer_vector_mask_for_select_ty` trust-ir text must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of MIR-emitted `mask_root` failed")
         .buffer;
@@ -144631,8 +144984,16 @@ type CombineFn = extern "C" fn(*mut Opt32, *const Opt32, u32);
 /// from the capture struct and calls `checked_mul` (the bound host leaf). This is
 /// the closure-combinator family unblocked end-to-end.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_rung9_option_and_then_closure_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_RUNG9_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_rung9_option_and_then_closure_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(FRONTEND_RUNG9_CLOSURE_TRUST_IR)
         .expect("frontend RUNG9 closure/and_then trust-ir text must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(
@@ -144640,6 +145001,7 @@ fn frontend_rung9_option_and_then_closure_roundtrip() {
         checked_mul_u32_shim as *const u8,
     );
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of combine_outer (closure + and_then) failed")
         .buffer;
@@ -145138,8 +145500,16 @@ type BitWidthFn = extern "C" fn(*mut Opt32, *const TyBw, u32);
 /// `Vector` arm walking the `Box<Ty>`, and the `bit_width` delegation — only
 /// `<u32>::checked_mul` is the bound host leaf. This verifies the actual rung target.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn frontend_rung9_trust_bit_width_with_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_RUNG9_BITWIDTH_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "frontend_rung9_trust_bit_width_with_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(FRONTEND_RUNG9_BITWIDTH_TRUST_IR)
         .expect("frontend RUNG9 bit_width_with trust-ir text must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(
@@ -145147,6 +145517,7 @@ fn frontend_rung9_trust_bit_width_with_roundtrip() {
         checked_mul_u32_shim as *const u8,
     );
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of Ty::bit_width_with (closure + and_then) failed")
         .buffer;
@@ -148340,8 +148711,14 @@ extern "C" fn vm_shim_iter(
 extern "C" fn vm_shim_precond(_a: u64, _b: u64) {}
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_value_matches_ty_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_VALUE_MATCHES_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_value_matches_ty_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_VALUE_MATCHES_TRUST_IR)
         .expect("MIR-emitted `value_matches_ty` trust-ir text must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_VM_LEN.to_string(), vm_shim_len as *const u8);
@@ -148350,6 +148727,7 @@ fn trust_self_value_matches_ty_roundtrip() {
     externs.insert(EXT_VM_PRECOND.to_string(), vm_shim_precond as *const u8);
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted `value_matches_ty` failed")
         .buffer;
@@ -150094,13 +150472,22 @@ bb3(%1: bool):
 "#;
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_is_integer_vector_mask_for_select_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_MASK_FOR_SELECT_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "trust_self_is_integer_vector_mask_for_select_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_MASK_FOR_SELECT_TRUST_IR)
         .expect("MIR-emitted `is_integer_vector_mask_for_select_ty` trust-ir must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_BOX_AS_REF.to_string(), box_as_ref_shim as *const u8);
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of `is_integer_vector_mask_for_select_ty` failed")
         .buffer;
@@ -150229,8 +150616,16 @@ fn trust_self_is_integer_vector_mask_for_select_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_validate_select_condition_ty_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_VALIDATE_SELECT_COND_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "trust_self_validate_select_condition_ty_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_VALIDATE_SELECT_COND_TRUST_IR)
         .expect("MIR-emitted `validate_select_condition_ty_code` trust-ir must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_BOX_AS_REF.to_string(), box_as_ref_shim as *const u8);
@@ -150238,6 +150633,7 @@ fn trust_self_validate_select_condition_ty_roundtrip() {
     externs.insert(EXT_TY_EQ.to_string(), ty_eq_shim as *const u8);
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of `validate_select_condition_ty_code` failed")
         .buffer;
@@ -150722,8 +151118,14 @@ fn vm_fold_binop(op: u8, lhs: Option<i128>, rhs: Option<i128>) -> Option<i128> {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_fold_binop_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_FOLD_BINOP_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_fold_binop_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_FOLD_BINOP_TRUST_IR)
         .expect("MIR-emitted `fold_binop` trust-ir must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_TRY_BRANCH.to_string(), try_branch_shim as *const u8);
@@ -150749,6 +151151,7 @@ fn trust_self_fold_binop_roundtrip() {
     );
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of `fold_binop` failed")
         .buffer;
@@ -151213,11 +151616,18 @@ type CastShapeFn = extern "C" fn(u32, u32) -> u32;
 /// drives per-category cast lowering; `is_layout_sensitive` gates which casts
 /// carry a layout-equality proof obligation — both are soundness-critical.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_cast_shape_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_CAST_SHAPE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_cast_shape_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_CAST_SHAPE_TRUST_IR)
         .expect("MIR-emitted `cast_shape_entry` trust-ir must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of `cast_shape_entry` failed")
         .buffer;
@@ -151834,13 +152244,20 @@ mod edge_bounds_oracle {
 /// previously a pinned trust-cg i128 high-half ISel limit; it is now compiled and
 /// verified.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_edge_bounds_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_EDGE_BOUNDS_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_edge_bounds_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_EDGE_BOUNDS_TRUST_IR)
         .expect("MIR-emitted `edge_bounds_entry` trust-ir must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert(EXT_SAT_SUB_U128.to_string(), sat_sub_u128_shim as *const u8);
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect(
             "REGRESSION: trust-cg must JIT-compile `edge_bounds` (previously a pinned i128 \
@@ -152438,11 +152855,18 @@ type LaneCountFn = extern "C" fn(u32, u64, u32) -> i64;
 /// non-indexable types. The slice is fully self-contained (0 externs, alloc-free
 /// menu).
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn trust_self_lane_count_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_LANE_COUNT_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("trust_self_lane_count_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_LANE_COUNT_TRUST_IR)
         .expect("MIR-emitted `lane_count_entry` trust-ir must parse");
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     let buffer = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of `lane_count_entry` failed")
         .buffer;
@@ -155397,8 +155821,14 @@ fn cp_native_root(ind_raw: u32, e: &CwExpr, sib_raw: u32, sib_count: u32) -> i32
 /// END-TO-END MIR-PATH SOUNDNESS MILESTONE: the JIT-EXECUTED strict-positivity GATE.
 /// native check_positivity == JIT over accept + REJECT inductive constructor types.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_positivity_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_POSITIVITY_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_positivity_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_POSITIVITY_CLOSURE_TRUST_IR)
         .expect("MIR-emitted check_positivity closure trust-ir text must parse");
 
     // CONFIRM the soundness engine is genuinely IN-MODULE (not stubbed), and that it
@@ -155494,6 +155924,7 @@ fn mir_real_expr_positivity_roundtrip() {
     externs.insert("_RNvXs_NtNtCs2EYQwhfuABO_4core5slice4iterRSRNtCshWpr1ZEqQNj_22clean_positivity_slice4NameNtNtNtNtB8_4iter6traits7collect12IntoIterator9into_iterBH_".to_string(), cp_shim_names_into_iter as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted check_positivity closure failed")
         .buffer;
@@ -167694,8 +168125,16 @@ type EzElimFn = extern "C" fn(*const CwExpr, *const CwExpr, u32, u32, u32) -> i3
 /// which would project the field's computational content out of a proof (a proof of
 /// False). Composes the VERIFIED whnf + def_eq + infer pillars in-module.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_elim_only_universe_zero_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_ELIM_ONLY_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_real_expr_elim_only_universe_zero_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_ELIM_ONLY_CLOSURE_TRUST_IR)
         .expect("MIR-emitted elim_only_at_universe_zero closure trust-ir text must parse");
 
     // CONFIRM the soundness engine is genuinely IN-MODULE (real bodies, not stubs).
@@ -167928,6 +168367,7 @@ fn mir_real_expr_elim_only_universe_zero_roundtrip() {
     );
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted elim_only closure failed")
         .buffer;
@@ -172270,8 +172710,14 @@ fn cr_native_root(
 /// GATE. native validate_ctor_return_type == JIT over accept + the three REJECT classes
 /// (wrong head / param mismatch / index-mentions-inductive) + a negative control.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_ctor_return_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_CTOR_RETURN_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_ctor_return_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_CTOR_RETURN_CLOSURE_TRUST_IR)
         .expect("MIR-emitted validate_ctor_root closure trust-ir text must parse");
 
     // CONFIRM the gate engine is genuinely IN-MODULE (real bodies, not stubs) and that
@@ -172424,6 +172870,7 @@ fn mir_real_expr_ctor_return_roundtrip() {
     );
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted validate_ctor_root closure failed")
         .buffer;
@@ -173190,10 +173637,17 @@ unsafe fn decl_value_ok_native(a: *const DeclExprNode, b: *const DeclExprNode) -
 /// fail-loud always-accept negative control. Builds real `Expr` heap graphs in
 /// Rust, JITs `decl_value_ok` (= `def_eq`), and asserts native == JIT.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_decl_check_roundtrip() {
-    let module = trust_ir::parser::parse_module(FRONTEND_DECL_DEFEQ_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_decl_check_roundtrip");
+    let module = emitted_fixture::parse_emitted(FRONTEND_DECL_DEFEQ_TRUST_IR)
         .expect("decl-check def_eq trust-ir text must parse");
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("trust-cg JIT compile of decl_value_ok failed")
         .buffer;
@@ -179641,8 +180095,16 @@ bb1:
 "#;
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_build_minor_premise_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_MINOR_PREMISE_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_real_expr_build_minor_premise_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_MINOR_PREMISE_CLOSURE_TRUST_IR)
         .expect("MIR-emitted build_minor_premise_type closure trust-ir text must parse");
 
     // CONFIRM the recursor minor-premise engine is genuinely IN-MODULE (real bodies),
@@ -179778,6 +180240,7 @@ fn mir_real_expr_build_minor_premise_roundtrip() {
     externs.insert("_RINvXsk_NtCskTzINo8ZBH9_5alloc5boxedINtB6_3BoxNtCs1kbsBhRuxrm_25clean_minor_premise_slice5LevelENtNtCs2EYQwhfuABO_4core4hash4Hash4hashNtBK_10KaniHasherEBK_".to_string(), cm_shim_hash_box_level as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted build_minor_premise_type closure failed")
         .buffer;
@@ -186590,8 +187053,16 @@ extern "C" fn cr_shim_hash_u64(value: *const u64, state: *mut u64) {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_build_recursor_rhs_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_REC_RHS_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_real_expr_build_recursor_rhs_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_REC_RHS_CLOSURE_TRUST_IR)
         .expect("MIR-emitted build_recursor_rule_rhs closure trust-ir text must parse");
 
     // CONFIRM the recursor iota-RHS engine is genuinely IN-MODULE (real bodies),
@@ -186733,6 +187204,7 @@ fn mir_real_expr_build_recursor_rhs_roundtrip() {
     externs.insert("_RINvXsk_NtCskTzINo8ZBH9_5alloc5boxedINtB6_3BoxNtCslejOIPyVwvp_24clean_recursor_rhs_slice5LevelENtNtCs2EYQwhfuABO_4core4hash4Hash4hashNtBK_10KaniHasherEBK_".to_string(), cm_shim_hash_box_level as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted build_recursor_rule_rhs closure failed")
         .buffer;
@@ -197687,8 +198159,16 @@ extern "C" fn ct_shim_hash_i32(value: *const i32, state: *mut u64) {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_build_recursor_type_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_REC_TYPE_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_real_expr_build_recursor_type_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(MIR_REC_TYPE_CLOSURE_TRUST_IR)
         .expect("MIR-emitted build_recursor_type closure trust-ir text must parse");
 
     // CONFIRM the full recursor-type engine is genuinely IN-MODULE (real bodies),
@@ -197864,6 +198344,7 @@ fn mir_real_expr_build_recursor_type_roundtrip() {
     );
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted build_recursor_type closure failed")
         .buffer;
@@ -210797,8 +211278,14 @@ type SetaEtaFn = extern "C" fn(u32, u32, u32, u32, u32, u32) -> i32;
 /// infer_type + whnf + reduce_proj + def_eq pillars in-module -> the remaining
 /// def_eq completeness gap closed.
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_eta_struct_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_STRUCT_ETA_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_eta_struct_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_STRUCT_ETA_CLOSURE_TRUST_IR)
         .expect("MIR-emitted struct_eta closure trust-ir text must parse");
 
     // CONFIRM the rule + pillars are genuinely IN-MODULE (real bodies, not stubs).
@@ -210996,6 +211483,7 @@ fn mir_real_expr_eta_struct_roundtrip() {
     );
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted struct_eta closure failed")
         .buffer;
@@ -217132,8 +217620,14 @@ fn cq_native_quot_type_by_kind(kind: u32) -> CwExpr {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_quot_type_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_QUOT_TYPE_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_quot_type_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_QUOT_TYPE_CLOSURE_TRUST_IR)
         .expect("MIR-emitted quot_type closure trust-ir text must parse");
 
     // The full quotient axiom-type engine must be genuinely IN-MODULE (real bodies),
@@ -217262,6 +217756,7 @@ fn mir_real_expr_quot_type_roundtrip() {
     );
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted quot_type closure failed")
         .buffer;
@@ -227705,8 +228200,14 @@ extern "C" fn cu_shim_u32ref_eq(a: *const *const u32, b: *const *const u32) -> b
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_real_expr_def_eq_universe_roundtrip() {
-    let module = trust_ir::parser::parse_module(MIR_DEF_EQ_UNIVERSE_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_real_expr_def_eq_universe_roundtrip");
+    let module = emitted_fixture::parse_emitted(MIR_DEF_EQ_UNIVERSE_CLOSURE_TRUST_IR)
         .expect("MIR-emitted universe-faithful `def_eq_impl` trust-ir text must parse");
 
     // CONFIRM the def-eq call graph composes the verified whnf+structural+congruence
@@ -227926,6 +228427,7 @@ fn mir_real_expr_def_eq_universe_roundtrip() {
     externs.insert("_RNvMs_NtCskTzINo8ZBH9_5alloc3vecINtB4_3VecTRNtCsdHZWxF3kolr_21def_eq_universe_slice5LevelBF_EE3popBI_".to_string(), cl_shim_vec_pair_pop as *const u8);
 
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of universe-faithful `def_eq_impl` failed")
         .buffer;
@@ -228151,4 +228653,13 @@ fn mir_real_expr_def_eq_universe_roundtrip() {
         "expected >=12 Max/IMax-universe TRUE cases exercised (got {universe_true_cases})"
     );
     drop(buffer);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

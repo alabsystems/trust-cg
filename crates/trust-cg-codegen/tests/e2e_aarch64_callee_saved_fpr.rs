@@ -29,10 +29,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-use std::fs;
-use std::process::Command;
-
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+#[path = "common/aarch64_native.rs"]
+mod native;
 use trust_cg_codegen::pipeline::OptLevel;
 
 use trust_ir::{
@@ -41,21 +39,20 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
 fn build_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("callee_saved_fpr");
 
     // `fn live_fp(a: f64, b: f64) -> f64 { let r = a % b; a + r }`
     // `a` is live across the `fmod` libcall the `%` lowers to, so the allocator
     // must keep it in a callee-saved D-register across that call.
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), "live_fp", ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -80,7 +77,8 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -99,11 +97,14 @@ fn build_stress_module() -> TrustIrModule {
 
     let mut params: Vec<Ty> = (0..NI).map(|_| Ty::I64).collect();
     params.extend((0..NF).map(|_| Ty::F64));
-    let ft = m.add_func_type(FuncTy {
-        params: params.clone(),
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: params.clone(),
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), "stress", ft, BlockId::new(0));
 
     let bb_params: Vec<(ValueId, Ty)> = params
@@ -182,20 +183,13 @@ fn build_stress_module() -> TrustIrModule {
         params: bb_params,
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
 fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        ..CompilerConfig::default()
-    });
-    let r = compiler
-        .compile(module)
-        .expect("callee-saved-FPR function must compile");
-    assert!(!r.object_code.is_empty());
-    r.object_code
+    native::compile(module, opt)
 }
 
 // Pin distinct sentinels into every callee-saved FP register (D8–D15) before
@@ -231,45 +225,13 @@ int main(void) {
 "#;
 
 fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
-        return None;
-    }
-    let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
-    let _ = fs::create_dir_all(&dir);
-    let obj_path = dir.join(format!("{tag}.o"));
-    let drv_path = dir.join("driver.c");
-    let bin_path = dir.join(format!("{tag}_bin"));
-    fs::write(&obj_path, obj).unwrap();
-    fs::write(&drv_path, DRIVER).unwrap();
-    let link = Command::new("cc")
-        .args([
-            drv_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
-            "-o",
-            bin_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("cc");
-    assert!(
-        link.status.success(),
-        "link:\n{}",
-        String::from_utf8_lossy(&link.stderr)
-    );
-    let code = Command::new(bin_path.to_str().unwrap())
-        .output()
-        .unwrap()
-        .status
-        .code()
-        .unwrap_or(-1);
-    let _ = fs::remove_dir_all(&dir);
-    Some(code)
+    native::link_run(tag, obj, DRIVER)
 }
 
 #[test]
 fn e2e_aarch64_callee_saved_fpr_preserved() {
     let module = build_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = compile_at(&module, opt);
         let Some(code) = link_run("callee_saved_fpr", &obj) else {
             return;
@@ -306,11 +268,13 @@ int main(void){
                      x25 asm("x25")=0x2525,x26 asm("x26")=0x2626,x27 asm("x27")=0x2727,x28 asm("x28")=0x2828;
     register double d8 asm("d8")=8.5,d9 asm("d9")=9.5,d10 asm("d10")=10.5,d11 asm("d11")=11.5,
                     d12 asm("d12")=12.5,d13 asm("d13")=13.5,d14 asm("d14")=14.5,d15 asm("d15")=15.5;
-    asm volatile("":"+r"(x19),"+r"(x20),"+r"(x21),"+r"(x22),"+r"(x23),"+r"(x24),"+r"(x25),"+r"(x26),"+r"(x27),"+r"(x28),
-                    "+w"(d8),"+w"(d9),"+w"(d10),"+w"(d11),"+w"(d12),"+w"(d13),"+w"(d14),"+w"(d15));
+    /* GCC counts each read/write operand twice toward its 30-operand limit.
+       Keep both live register banks, in adjacent barriers with no intervening C. */
+    asm volatile("":"+r"(x19),"+r"(x20),"+r"(x21),"+r"(x22),"+r"(x23),"+r"(x24),"+r"(x25),"+r"(x26),"+r"(x27),"+r"(x28));
+    asm volatile("":"+w"(d8),"+w"(d9),"+w"(d10),"+w"(d11),"+w"(d12),"+w"(d13),"+w"(d14),"+w"(d15));
     int64_t got=stress(I[0],I[1],I[2],I[3],I[4],I[5],I[6],I[7],F[0],F[1],F[2],F[3],F[4],F[5],F[6],F[7]);
-    asm volatile("":"+r"(x19),"+r"(x20),"+r"(x21),"+r"(x22),"+r"(x23),"+r"(x24),"+r"(x25),"+r"(x26),"+r"(x27),"+r"(x28),
-                    "+w"(d8),"+w"(d9),"+w"(d10),"+w"(d11),"+w"(d12),"+w"(d13),"+w"(d14),"+w"(d15));
+    asm volatile("":"+r"(x19),"+r"(x20),"+r"(x21),"+r"(x22),"+r"(x23),"+r"(x24),"+r"(x25),"+r"(x26),"+r"(x27),"+r"(x28));
+    asm volatile("":"+w"(d8),"+w"(d9),"+w"(d10),"+w"(d11),"+w"(d12),"+w"(d13),"+w"(d14),"+w"(d15));
     int64_t ref=oracle(I,F);
     if(x19!=0x1919||x20!=0x2020||x21!=0x2121||x22!=0x2222||x23!=0x2323||x24!=0x2424||x25!=0x2525||x26!=0x2626||x27!=0x2727||x28!=0x2828){printf("*** GPR clobbered ***\n");return 1;}
     if(d8!=8.5||d9!=9.5||d10!=10.5||d11!=11.5||d12!=12.5||d13!=13.5||d14!=14.5||d15!=15.5){printf("*** FPR clobbered ***\n");return 1;}
@@ -321,46 +285,13 @@ int main(void){
 "#;
 
 fn link_run_driver(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
-        return None;
-    }
-    let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
-    let _ = fs::create_dir_all(&dir);
-    let obj_path = dir.join(format!("{tag}.o"));
-    let drv_path = dir.join("driver.c");
-    let bin_path = dir.join(format!("{tag}_bin"));
-    fs::write(&obj_path, obj).unwrap();
-    fs::write(&drv_path, driver).unwrap();
-    let link = Command::new("cc")
-        .args([
-            drv_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
-            "-lm",
-            "-o",
-            bin_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("cc");
-    assert!(
-        link.status.success(),
-        "link:\n{}",
-        String::from_utf8_lossy(&link.stderr)
-    );
-    let code = Command::new(bin_path.to_str().unwrap())
-        .output()
-        .unwrap()
-        .status
-        .code()
-        .unwrap_or(-1);
-    let _ = fs::remove_dir_all(&dir);
-    Some(code)
+    native::link_run(tag, obj, driver)
 }
 
 #[test]
 fn e2e_aarch64_mixed_callee_saved_frame_preserved() {
     let module = build_stress_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = compile_at(&module, opt);
         let Some(code) = link_run_driver("stress_callee_saved", &obj, STRESS_DRIVER) else {
             return;

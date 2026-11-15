@@ -7,13 +7,9 @@
 //!
 //! # Why
 //!
-//! The x86 lane had NO straight-line block merging at all. The generic
-//! [`crate::cfg_simplify`] documents exactly this transform ("Unconditional
-//! branch folding | Merge block into sole predecessor"), but it is written
-//! against `MachFunction` (the AArch64/generic machine IR) and was never wired
-//! into the x86 pipeline. Measured on the beat-llvm suite: **123 mergeable
-//! straight-line pairs across all 18 programs**, 3-11 per program, every single
-//! program affected.
+//! This is the x86-ISel counterpart to straight-line merging in
+//! [`crate::cfg_simplify`], which operates on `MachFunction`. Its admission
+//! checks include the x86 representation's jump-table and EH side references.
 //!
 //! Two distinct payoffs:
 //!
@@ -23,13 +19,9 @@
 //!   collapse. Merging widens their window, so this can unlock optimizations
 //!   that currently decline at a block boundary.
 //!
-//! It also unblocks if-conversion. `X86IfConvert::find_one` requires each arm of
-//! a diamond to be exactly ONE block. In `b1_mispredict` the taken arm of the
-//! `if s & 6 == 2 { acc = acc.rotate_left(7) }` diamond is a two-block chain
-//! (`Block(16) -> Block(17) -> join`), so the arms appear not to reconverge and
-//! the whole diamond is rejected before arm analysis. LLVM if-converts it
-//! (`rolq $0x7,%rdi ; cmpl $0x2,%esi ; cmovneq %r8,%rdi`); we emitted a
-//! mispredicting branch.
+//! It can also expose single-block diamond arms to if-conversion. Whether a
+//! merged arm is then convertible depends on that pass's separate checks;
+//! deleting a branch does not by itself establish a runtime improvement.
 //!
 //! # Soundness
 //!
@@ -67,9 +59,7 @@ use crate::x86_pass_manager::X86MachinePass;
 /// Straight-line block merging for x86 ISel functions.
 #[derive(Debug, Default)]
 pub struct X86BlockMerge {
-    /// Merges performed by the most recent `run` (ACCEPT counter — a pass that
-    /// "obviously" fires has fired zero times often enough in this codebase
-    /// that a count is mandatory, not decoration).
+    /// Merges performed by the most recent `run`, not a performance metric.
     last_run_merges: usize,
 }
 
@@ -84,8 +74,23 @@ impl X86BlockMerge {
     }
 }
 
+static BLOCK_MERGE_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install this pass's opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-block-merge`). DEFAULT ON. `TCG_NO_X86_BLOCK_MERGE`
+/// remains the in-process channel for tests; `trustc` refuses it, so through
+/// the bridge this option is the only way to A/B the pass (for example to
+/// attribute the O2 body-theorem refusals it causes).
+pub fn set_block_merge_disabled(disabled: bool) -> bool {
+    match BLOCK_MERGE_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => BLOCK_MERGE_DISABLED.get() == Some(&requested),
+    }
+}
+
 fn enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_BLOCK_MERGE").is_none()
+    !BLOCK_MERGE_DISABLED.get().copied().unwrap_or(false)
+        && std::env::var_os("TCG_NO_X86_BLOCK_MERGE").is_none()
 }
 
 /// `Some(b)` iff `a`'s instruction list ends in exactly `Jmp b` and its
@@ -179,12 +184,6 @@ impl X86MachinePass for X86BlockMerge {
         }
         if self.last_run_merges == 0 {
             return false;
-        }
-        if std::env::var_os("TCG_X86_BLOCK_MERGE_LOG").is_some() {
-            eprintln!(
-                "[x86-block-merge] ACCEPT {} merge(s) in fn `{}`",
-                self.last_run_merges, func.name,
-            );
         }
         // The x86 regalloc replay requires CONTIGUOUS block ids.
         renumber_blocks_contiguous(func);

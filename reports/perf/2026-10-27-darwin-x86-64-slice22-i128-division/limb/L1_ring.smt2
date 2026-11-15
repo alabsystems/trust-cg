@@ -1,0 +1,8 @@
+; (ah*2^64 + al)(bh*2^64 + bl) = al*bl + (ah*bl + al*bh)*2^64 + ah*bh*2^128 (a ring identity)
+(set-logic ALL)
+(define-fun P64 () Int 18446744073709551616)
+(define-fun P128 () Int 340282366920938463463374607431768211456)
+(define-fun r64 ((x Int)) Bool (and (<= 0 x) (< x P64)))
+(declare-const ah Int) (declare-const al Int) (declare-const bh Int) (declare-const bl Int)
+(assert (not (= (* (+ (* ah P64) al) (+ (* bh P64) bl)) (+ (* al bl) (* (+ (* ah bl) (* al bh)) P64) (* (* ah bh) P128)))))
+(check-sat)

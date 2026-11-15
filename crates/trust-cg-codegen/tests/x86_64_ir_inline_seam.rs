@@ -10,6 +10,9 @@
 //     regalloc validator) so `compile` returns Ok;
 //   * at O0 the pass is skipped (0 sites), matching the gate.
 //
+// These compiles claim no proof. A compile that claims proofs runs no inliner
+// at any level (ruling OD-225; `proof_claim_lir_passes.rs`).
+//
 // NOTE ON THE RUSTC BRIDGE: rustc partitions each function into its own codegen
 // unit, so the bridge feeds `Compiler::compile` one function per module and this
 // cross-function inliner stays dormant (but safe) there. This test exercises the
@@ -50,7 +53,7 @@ fn two_function_module() -> trust_ir::Module {
         fb.ret(vec![s]);
         fb.build();
     }
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_x86(opt_level: OptLevel) -> trust_cg_codegen::CompilationResult {
@@ -61,7 +64,7 @@ fn compile_x86(opt_level: OptLevel) -> trust_cg_codegen::CompilationResult {
         parallel: false,
         ..Default::default()
     };
-    let compiler = Compiler::new(config);
+    let compiler = Compiler::new(config).with_codegen_license(permit_unlicensed());
     compiler
         .compile(&two_function_module())
         .expect("multi-function x86-64 compile should succeed")
@@ -128,4 +131,13 @@ fn seam_skips_inlining_at_o0() {
         matches!(inlined_sites(&result), None | Some(0)),
         "the O0 gate must skip inlining"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -93,19 +93,16 @@ impl DeclarativeRewritePass {
 
     /// Access the underlying engine mutably (e.g., to register more rules).
     ///
-    /// Only valid for passes constructed with an owned engine ([`new`]); a
-    /// pass built from a shared engine ([`new_shared`]) has no private engine
-    /// to mutate and will panic. The pipeline only ever shares engines that
-    /// require no further mutation.
+    /// Returns `Some` for passes constructed with an owned engine ([`new`]).
+    /// A pass built from a shared engine ([`new_shared`]) returns `None`:
+    /// shared rule sets remain read-only, even when their `Arc` is unique.
     ///
     /// [`new`]: DeclarativeRewritePass::new
     /// [`new_shared`]: DeclarativeRewritePass::new_shared
-    pub fn engine_mut(&mut self) -> &mut RewriteEngine {
+    pub fn engine_mut(&mut self) -> Option<&mut RewriteEngine> {
         match &mut self.engine {
-            EngineRef::Owned(engine) => engine,
-            EngineRef::Shared(_) => {
-                panic!("engine_mut() called on a DeclarativeRewritePass with a shared engine")
-            }
+            EngineRef::Owned(engine) => Some(engine),
+            EngineRef::Shared(_) => None,
         }
     }
 
@@ -165,6 +162,27 @@ mod tests {
         AArch64Opcode, AArch64Target, MachInst, MachOperand, ProvenanceStatus, RegClass, Signature,
         TargetInfo, TransformKind, TrustIrInstId, VReg,
     };
+
+    #[test]
+    fn owned_engine_can_register_rules() {
+        let mut pass = DeclarativeRewritePass::new("owned", RewriteEngine::new(), 16);
+        register_migrated(pass.engine_mut().expect("owned engine is mutable"));
+        assert!(pass.num_rules() > 0);
+    }
+
+    #[test]
+    fn shared_engine_refuses_mutation_without_panicking() {
+        let engine = Arc::new(RewriteEngine::new());
+        let mut pass = DeclarativeRewritePass::new_shared("shared", engine.clone(), 16);
+        assert!(pass.engine_mut().is_none());
+        assert_eq!(pass.num_rules(), 0);
+        assert_eq!(engine.num_rules(), 0);
+        drop(engine);
+        assert!(
+            pass.engine_mut().is_none(),
+            "a unique shared engine stays read-only"
+        );
+    }
 
     #[test]
     fn pass_fires_on_migrated_patterns() {

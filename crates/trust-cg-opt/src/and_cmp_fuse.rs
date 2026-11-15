@@ -59,7 +59,7 @@
 //!
 //! Author: Andrew Yates · Copyright 2026 Andrew Yates · License: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -152,7 +152,26 @@ fn and_cmp_fuse_enabled() -> bool {
 /// tuple as the default build. So the C-flag guard and the two-source
 /// redefinition guard hold across 1114 programs with the arm live. Turning it on
 /// costs correctness nothing; it simply does not pay.
+static AND_CMP_FUSE_RR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the register-register form of AND/CMP fusion from a TRACKED compiler option, once. DEFAULT OFF.
+///
+/// Until 2026-09-30 the only channel was `TCG_AND_CMP_FUSE_RR`, and `trustc` refuses every `TCG_*`
+/// variable before the backend loads, so this opt-in had never been measured through the
+/// bridge. Three levers found the same way turned out to carry recorded numbers that no
+/// longer reproduced, and a fourth (the vectorizer's reduction unroll factor) was leaving
+/// 23% on the table, so an unmeasured opt-in here is an open question, not a settled one.
+pub fn set_and_cmp_fuse_rr_enabled(enabled: bool) -> bool {
+    match AND_CMP_FUSE_RR.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => AND_CMP_FUSE_RR.get() == Some(&requested),
+    }
+}
+
 fn and_cmp_fuse_rr_enabled() -> bool {
+    if let Some(enabled) = AND_CMP_FUSE_RR.get() {
+        return *enabled;
+    }
     crate::env_lock::var_os("TCG_AND_CMP_FUSE_RR").is_some()
 }
 
@@ -186,8 +205,7 @@ fn cond_operand_index(opcode: AArch64Opcode) -> Option<usize> {
 
 /// Is this instruction a consumer of NZCV?
 fn is_flag_consumer(inst: &MachInst) -> bool {
-    crate::effects::reads_flags(inst.opcode)
-        || matches!(inst.opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc)
+    crate::effects::reads_nzcv(inst)
 }
 
 /// Blocks reachable from `block` according to the authoritative CFG.
@@ -236,7 +254,12 @@ fn flags_safe_after(func: &MachFunction, block: BlockId, cmp_pos: usize) -> bool
                 return false;
             }
         }
-        if crate::effects::writes_flags(inst.opcode) {
+        if crate::effects::nzcv_unknown(inst) {
+            // Opaque expansions and system-register accesses may observe the
+            // incoming carry. A MAY-write summary is not a definite kill.
+            return false;
+        }
+        if crate::effects::definitely_writes_flags(inst.opcode) {
             // Flags redefined here; nothing downstream can see ours.
             return true;
         }
@@ -256,7 +279,7 @@ fn flags_safe_after(func: &MachFunction, block: BlockId, cmp_pos: usize) -> bool
         return block_ends_in_return(func, block);
     }
 
-    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seen: HashSet<BlockId> = HashSet::default();
     let mut work: Vec<BlockId> = succs;
     // Bound the walk; an irreducible or very large CFG bails rather than
     // spending compile time proving a peephole.
@@ -285,7 +308,10 @@ fn flags_safe_after(func: &MachFunction, block: BlockId, cmp_pos: usize) -> bool
                     return false;
                 }
             }
-            if crate::effects::writes_flags(inst.opcode) {
+            if crate::effects::nzcv_unknown(inst) {
+                return false;
+            }
+            if crate::effects::definitely_writes_flags(inst.opcode) {
                 killed = true;
                 break;
             }
@@ -294,10 +320,8 @@ fn flags_safe_after(func: &MachFunction, block: BlockId, cmp_pos: usize) -> bool
             // Flags survive this block too — keep going. A successor-less block
             // must return, for the same reason as above.
             let next = successors_of(func, b);
-            if next.is_empty() {
-                if !block_ends_in_return(func, b) {
-                    return false;
-                }
+            if next.is_empty() && !block_ends_in_return(func, b) {
+                return false;
             }
             for s in next {
                 work.push(s);
@@ -341,7 +365,7 @@ fn run_and_cmp_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provena
 
     let mut changed = false;
     if crate::env_lock::var_os("TCG_DUMP_ANDCMP").is_some() {
-        let mut census: HashMap<String, usize> = HashMap::new();
+        let mut census: HashMap<String, usize> = HashMap::default();
         for &b in &func.block_order {
             for &i in &func.block(b).insts {
                 let inst = func.inst(i);
@@ -363,8 +387,8 @@ fn run_and_cmp_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provena
     for block_id in func.block_order.clone() {
         // AndRI defs seen so far in this block, invalidated on redefinition so a
         // hit is the true reaching definition.
-        let mut and_defs: HashMap<VReg, (InstId, usize)> = HashMap::new();
-        let mut last_def_pos: HashMap<VReg, usize> = HashMap::new();
+        let mut and_defs: HashMap<VReg, (InstId, usize)> = HashMap::default();
+        let mut last_def_pos: HashMap<VReg, usize> = HashMap::default();
 
         let insts = func.block(block_id).insts.clone();
         for (pos, &inst_id) in insts.iter().enumerate() {
@@ -381,7 +405,7 @@ fn run_and_cmp_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provena
             ) {
                 let (and_inst_id, tst) = fused;
                 // Rewrite the CMP into the TST and neutralize the AND.
-                let src_loc = func.inst(inst_id).source_loc.clone();
+                let src_loc = func.inst(inst_id).source_loc;
                 let mut new_inst = tst;
                 new_inst.source_loc = src_loc;
                 *func.inst_mut(inst_id) = new_inst;
@@ -552,7 +576,7 @@ fn reg_width(v: VReg) -> Option<u32> {
 }
 
 fn count_vreg_reads(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);

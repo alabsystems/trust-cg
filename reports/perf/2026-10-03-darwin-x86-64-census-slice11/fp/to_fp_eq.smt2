@@ -1,0 +1,6 @@
+(set-logic QF_BVFP)
+(declare-const x (_ BitVec 32))
+(declare-const y (_ BitVec 32))
+(assert (= x y))
+(assert (not (= ((_ to_fp 8 24) x) ((_ to_fp 8 24) y))))
+(check-sat)

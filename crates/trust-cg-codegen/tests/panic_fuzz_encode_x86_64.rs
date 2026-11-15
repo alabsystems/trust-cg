@@ -10,9 +10,6 @@
 //!
 //! This is the x86-64 sibling of `panic_fuzz_encode.rs`.
 //
-// Reference: `designs/2026-04-18-crash-free-codegen-plan.md` §5 (proptest
-// as primary defense) and §6 (per-crate harness).
-//
 // Contract under test: for *any* `(X86Opcode, X86InstOperands)` value,
 // `X86Encoder::encode_instruction` must either return `Ok(usize)` or
 // `Err(X86EncodeError)` — it must NEVER panic, abort, overflow (in
@@ -23,9 +20,10 @@
 // random-but-valid and random-malformed inputs.
 //
 // Run:
-//   cargo test -p trust-cg-codegen --test panic_fuzz_encode_x86_64
+//   scripts/trust_cargo.sh test -p trust-cg-codegen --test panic_fuzz_encode_x86_64
 // Increase case count via env:
-//   PROPTEST_CASES=100000 cargo test -p trust-cg-codegen --test panic_fuzz_encode_x86_64
+//   PROPTEST_CASES=100000 scripts/trust_cargo.sh test -p trust-cg-codegen \
+//     --test panic_fuzz_encode_x86_64
 //
 // ---------------------------------------------------------------------------
 // Coverage (#473 / #450)
@@ -78,6 +76,7 @@ x86_opcode_table! {
     ShlRR, ShlRI, ShrRR, ShrRI, SarRR, SarRI, RolRI, RolRCl,
     MovRR, MovRR32, MovRI, MovRM8, MovRM16, MovRM32, MovRM, MovMR8, MovMR16, MovMR32, MovMR,
     MovRM8Sib, MovMR8Sib,
+    MovzxRM8, MovzxRM16, MovzxRM8Sib, VolatileMovzxRM8, VolatileMovzxRM16,
     VolatileMovRM8, VolatileMovRM16, VolatileMovRM32, VolatileMovRM,
     VolatileMovMR8, VolatileMovMR16, VolatileMovMR32, VolatileMovMR,
     VolatileMovssRM, VolatileMovssMR, VolatileMovsdRM, VolatileMovsdMR,
@@ -87,7 +86,7 @@ x86_opcode_table! {
     CmpRR, CmpRI, CmpRI8, CmpRM, TestRR, TestRI, TestRM,
     Jmp, JmpR, Jcc, Call, CallR, CallM, Ret,
     Addsd, Subsd, Mulsd, Divsd, Sqrtsd, Andpd, MovsdRR, MovsdRM, MovsdMR, Ucomisd, MovdquRM,
-    MovdquMR, MovsdRMSib, MovssRMSib,
+    MovdquMR, MovsdRMSib, MovssRMSib, MovdquRMSib, MovdquMRSib,
     Addss, Subss, Mulss, Divss, Sqrtss, Andps, MovssRR, MovssRM, MovssMR, Ucomiss,
     MovssRipRel, MovsdRipRel,
     Addps, Subps, Mulps, Divps, Addpd, Subpd, Mulpd, Divpd,
@@ -96,7 +95,7 @@ x86_opcode_table! {
     Roundsd, Roundss,
     Minsd, Maxsd, Minss, Maxss, Cmpsd, Cmpss,
     Bsf, Bsr, Tzcnt, Lzcnt, Popcnt, BtRI, Bswap,
-    Xchg, Cmpxchg, Cmpxchg8, Cmpxchg16, AtomicRmwCasLoop, AtomicRmwCasLoop8, AtomicRmwCasLoop16, Mfence,
+    Xchg, Cmpxchg, Cmpxchg8, Cmpxchg16, AtomicLoadCmpxchg16b, AtomicRmwCasLoop, AtomicRmwCasLoop8, AtomicRmwCasLoop16, Mfence,
     MovdToXmm, MovdFromXmm, MovqToXmm, MovqFromXmm,
     Pand, Pandn, Por, Pxor, Pcmpeqb, Pcmpeqw, Pcmpgtb, Pcmpgtw, Pcmpeqd, Pshufd, Pmovmskb, MovdqaRR, Pcmpgtd, MovdqaRM, MovdqaMR,
     Paddd, Psubd, Paddq, Psubq, Pmuludq, Pmullw, Pslld, Psrld, Psrad, Psllq, Psrlq, Paddb, Paddw, Psubb, Psubw, Punpcklbw, Punpckldq, Packuswb, Punpckhbw, Punpcklqdq, Psadbw, Pinsrd, Pextrd, V4I32MaskExtract,
@@ -372,6 +371,16 @@ fn strat_width_mem_mov() -> impl Strategy<Value = OpPair> {
         (gpr32_strategy(), gpr64_strategy(), any::<i64>()).prop_map(|(reg, base, disp)| {
             (VolatileMovMR32, X86InstOperands::rm(reg, base, disp))
         }),
+        (gpr32_strategy(), gpr64_strategy(), any::<i64>())
+            .prop_map(|(reg, base, disp)| { (MovzxRM8, X86InstOperands::rm(reg, base, disp)) }),
+        (gpr32_strategy(), gpr64_strategy(), any::<i64>())
+            .prop_map(|(reg, base, disp)| { (MovzxRM16, X86InstOperands::rm(reg, base, disp)) }),
+        (gpr32_strategy(), gpr64_strategy(), any::<i64>()).prop_map(|(reg, base, disp)| {
+            (VolatileMovzxRM8, X86InstOperands::rm(reg, base, disp))
+        }),
+        (gpr32_strategy(), gpr64_strategy(), any::<i64>()).prop_map(|(reg, base, disp)| {
+            (VolatileMovzxRM16, X86InstOperands::rm(reg, base, disp))
+        }),
     ]
 }
 
@@ -400,7 +409,15 @@ fn strat_mem_rm_sib() -> impl Strategy<Value = OpPair> {
 fn strat_fp_rm_sib() -> impl Strategy<Value = OpPair> {
     use X86Opcode::*;
     (
-        prop_oneof![Just(MovsdRMSib), Just(MovssRMSib)],
+        prop_oneof![
+            Just(MovsdRMSib),
+            Just(MovssRMSib),
+            // Packed 128-bit MOVDQU: same XMM-register / SIB-operand shape.
+            // For MovdquMRSib the "reg" slot carries the SOURCE xmm (the /r
+            // store direction), which `rm_sib` puts in the same field.
+            Just(MovdquRMSib),
+            Just(MovdquMRSib)
+        ],
         xmm_strategy(),
         gpr64_strategy(),
         sib_index_strategy(),
@@ -915,6 +932,14 @@ fn strat_atomic() -> impl Strategy<Value = OpPair> {
             any::<i64>(),
         )
             .prop_map(|(op, src, base, disp)| (op, X86InstOperands::rm(src, base, disp))),
+        (gpr64_strategy(), any::<i64>()).prop_map(|(base, disp)| (
+            AtomicLoadCmpxchg16b,
+            X86InstOperands {
+                base: Some(base),
+                disp,
+                ..X86InstOperands::none()
+            }
+        )),
         (0i64..=4i64).prop_map(|kind| (
             AtomicRmwCasLoop,
             X86InstOperands {
@@ -1081,12 +1106,48 @@ fn assert_sse2_packed_no_panic(opcode: X86Sse2PackedOpcode, ops: &X86InstOperand
     }
 }
 
+/// The case count every property in this file runs: PROPTEST_CASES, else 256.
+fn panic_fuzz_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Positive control for the case count, as in `panic_fuzz_lower.rs`: a
+/// property with this file's case configuration counts the cases it actually
+/// ran and prints both figures on one line. The Linux floor requires the
+/// line with this file's default and the fuzz lane with its
+/// `--proptest-cases`, so a case count shrunk behind their back fails them.
+#[test]
+fn panic_fuzz_runs_its_configured_case_count() {
+    let configured = panic_fuzz_cases();
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: configured,
+        ..ProptestConfig::default()
+    });
+    let run = std::cell::Cell::new(0u32);
+    runner
+        .run(&any::<u64>(), |_| {
+            run.set(run.get() + 1);
+            Ok(())
+        })
+        .expect("the counting property cannot fail");
+    println!(
+        "panic-fuzz proptest cases: configured={configured} run={}",
+        run.get()
+    );
+    assert!(run.get() > 0, "no proptest case ran");
+    assert_eq!(
+        run.get(),
+        configured,
+        "proptest ran a different number of cases"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(256),
+        cases: panic_fuzz_cases(),
         max_shrink_iters: 500,
         .. ProptestConfig::default()
     })]

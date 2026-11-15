@@ -1,0 +1,303 @@
+{
+  "name": "frontend_panic_obligations",
+  "functions": [
+    {
+      "id": 0,
+      "name": "checked_index",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U64"
+            ],
+            [
+              1,
+              "U64"
+            ],
+            [
+              2,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ult",
+                  "ty": "U64",
+                  "lhs": 1,
+                  "rhs": 0
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 7,
+                "col": 13
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 4,
+                  "then_target": 1,
+                  "then_args": [],
+                  "else_target": 3,
+                  "else_args": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 7,
+                "col": 13
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 8,
+                "col": 9
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Overflow": {
+                  "op": "AddOverflow",
+                  "ty": "I32",
+                  "lhs": 2,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                6,
+                7
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 8,
+                "col": 9
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 7,
+                  "then_target": 3,
+                  "then_args": [],
+                  "else_target": 2,
+                  "else_args": [
+                    6
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 8,
+                "col": 9
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [
+            [
+              3,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 9,
+                "col": 5
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "params": [],
+          "body": [
+            {
+              "inst": "Unreachable",
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 9,
+                "col": 5
+              },
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "U64",
+        "U64",
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "BoundsCheck",
+      "status": "Pending",
+      "description": "rustc MIR Assert (bounds_check) at bb0 of `checked_index`: index is in bounds. RECORDED BY THE FRONTEND, NOT PROVED.",
+      "formula": null,
+      "function": 0,
+      "source": {
+        "source_id": "trust-ir-frontend/mir-assert@1",
+        "assertion_id": "checked_index#bb0#bounds_check",
+        "range": {
+          "file": 0,
+          "start_line": 7,
+          "start_col": 13,
+          "end_line": 7,
+          "end_col": 26
+        }
+      },
+      "site": {
+        "function": 0,
+        "block": 0,
+        "inst_index": 1
+      }
+    },
+    {
+      "id": 1,
+      "kind": "ArithmeticSafety",
+      "status": "Pending",
+      "description": "rustc MIR Assert (overflow) at bb1 of `checked_index`: arithmetic does not overflow. RECORDED BY THE FRONTEND, NOT PROVED.",
+      "formula": null,
+      "function": 0,
+      "source": {
+        "source_id": "trust-ir-frontend/mir-assert@1",
+        "assertion_id": "checked_index#bb1#overflow",
+        "range": {
+          "file": 0,
+          "start_line": 8,
+          "start_col": 9,
+          "end_line": 9,
+          "end_col": 4
+        }
+      },
+      "site": {
+        "function": 0,
+        "block": 1,
+        "inst_index": 2
+      }
+    },
+    {
+      "id": 2,
+      "kind": "PanicFreedom",
+      "status": "Pending",
+      "description": "rustc MIR Assert (resumed_after_return) at bb2 of `checked_index`: coroutine is not resumed after returning. RECORDED BY THE FRONTEND, NOT PROVED.",
+      "formula": null,
+      "function": 0,
+      "source": {
+        "source_id": "trust-ir-frontend/mir-assert@1",
+        "assertion_id": "checked_index#bb2#resumed_after_return",
+        "range": null
+      },
+      "site": null
+    }
+  ],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [
+    "examples/panic_checks.rs"
+  ],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

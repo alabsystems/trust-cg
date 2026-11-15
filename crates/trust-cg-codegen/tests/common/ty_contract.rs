@@ -149,6 +149,118 @@ pub fn assert_ty_native_fused_required_proof_fact_bridge() {
     );
 }
 
+// ── Host JIT target ──────────────────────────────────────────────────────────
+//
+// The TY reducer fixtures execute through the in-process JIT, which accepts
+// only the host architecture. Every fixture manifest, cache key and clobber
+// helper below follows the host so the same test runs on AArch64 and x86-64
+// hosts; on AArch64 every string these helpers produce is the historical one.
+
+/// The architecture the in-process JIT executes on this host, or a refusal.
+pub fn host_jit_target() -> Target {
+    Target::try_host()
+        .unwrap_or_else(|| panic!("TY reducer fixtures need a supported in-process JIT host"))
+}
+
+/// The canonical triple of this host, as the JIT's target spec spells it.
+pub fn host_target_triple() -> String {
+    trust_cg_codegen::target::TargetSpec::host_for_architecture(host_jit_target()).triple()
+}
+
+/// Target descriptor of a native-fused parent-loop artifact JIT-compiled on
+/// this host: the AArch64 fixtures keep their Darwin `apple-m` identity, the
+/// x86-64 host describes itself as a baseline SysV x86-64 machine.
+pub fn host_native_fused_target_descriptor() -> TargetDescriptor {
+    match host_jit_target() {
+        Target::Aarch64 => {
+            TargetDescriptor::for_trust_cg_target(Target::Aarch64, TargetOperatingSystem::Macos)
+                .with_cpu("apple-m")
+                .with_features(["fp", "simd"])
+        }
+        Target::X86_64 => {
+            TargetDescriptor::for_trust_cg_target(Target::X86_64, TargetOperatingSystem::host())
+                .with_cpu("x86-64")
+                .with_features(["sse2"])
+        }
+        other => panic!("no TY native-fused target descriptor for {other:?}"),
+    }
+}
+
+/// Clobber every call-volatile general-purpose register of the host C ABI
+/// (AAPCS64 x0-x17, SysV AMD64 rax/rcx/rdx/rsi/rdi/r8-r11) so a JIT caller
+/// that wrongly kept live state in one of them observes garbage on return.
+#[inline(always)]
+pub fn clobber_call_volatile_gprs() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: only caller-saved registers are written; no memory, no stack.
+    unsafe {
+        core::arch::asm!(
+            "mov x0, #1",
+            "mov x1, #2",
+            "mov x2, #3",
+            "mov x3, #4",
+            "mov x4, #5",
+            "mov x5, #6",
+            "mov x6, #7",
+            "mov x7, #8",
+            "mov x8, #9",
+            "mov x9, #10",
+            "mov x10, #11",
+            "mov x11, #12",
+            "mov x12, #13",
+            "mov x13, #14",
+            "mov x14, #15",
+            "mov x15, #16",
+            "mov x16, #17",
+            "mov x17, #18",
+            out("x0") _,
+            out("x1") _,
+            out("x2") _,
+            out("x3") _,
+            out("x4") _,
+            out("x5") _,
+            out("x6") _,
+            out("x7") _,
+            out("x8") _,
+            out("x9") _,
+            out("x10") _,
+            out("x11") _,
+            out("x12") _,
+            out("x13") _,
+            out("x14") _,
+            out("x15") _,
+            out("x16") _,
+            out("x17") _,
+            options(nostack)
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: only caller-saved registers are written; no memory, no stack.
+    unsafe {
+        core::arch::asm!(
+            "mov rax, 1",
+            "mov rcx, 2",
+            "mov rdx, 3",
+            "mov rsi, 4",
+            "mov rdi, 5",
+            "mov r8, 6",
+            "mov r9, 7",
+            "mov r10, 8",
+            "mov r11, 9",
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+            out("rsi") _,
+            out("rdi") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            options(nostack)
+        );
+    }
+}
+
 pub fn ty_reducer_manifest(
     buffer: &ExecutableBuffer,
     opt_level: OptLevel,
@@ -211,10 +323,10 @@ pub fn ty_reducer_manifest_for_symbol_with_proof_policy(
     section_size_bytes: u64,
     proof_policy: ProofPolicy,
 ) -> ArtifactManifestV1 {
-    let target =
-        TargetDescriptor::for_trust_cg_target(Target::Aarch64, TargetOperatingSystem::Unknown);
-    let mut abi = AbiDescriptor::for_trust_cg_target(Target::Aarch64);
-    abi.name = "ty-reducer-aapcs64-lp64".to_owned();
+    let jit_target = host_jit_target();
+    let target = TargetDescriptor::for_trust_cg_target(jit_target, TargetOperatingSystem::Unknown);
+    let mut abi = AbiDescriptor::for_trust_cg_target(jit_target);
+    abi.name = format!("ty-reducer-{}-lp64", jit_target.calling_convention().name);
 
     let mut layout = LayoutManifest::lp64(Endianness::Little, 16);
     layout.wrapper_identity = Some("ty::reducer::entrypoint:lp64:v1".to_owned());
@@ -234,7 +346,7 @@ pub fn ty_reducer_manifest_for_symbol_with_proof_policy(
 
     let invalidation = InvalidationKey::new(
         format!("ty:reducer:{symbol}:entrypoint-v1"),
-        format!("trust-cg:aarch64-jit:{opt_level:?}"),
+        format!("trust-cg:{}-jit:{opt_level:?}", jit_target.name()),
         target.checksum(),
         abi.checksum(),
         layout.checksum(),
@@ -323,12 +435,13 @@ pub fn ty_native_fused_parent_loop_manifest_for_symbol_with_proof_policy(
     identity: TyNativeFusedManifestIdentity,
     proof_policy: ProofPolicy,
 ) -> ArtifactManifestV1 {
-    let target =
-        TargetDescriptor::for_trust_cg_target(Target::Aarch64, TargetOperatingSystem::Macos)
-            .with_cpu("apple-m")
-            .with_features(["fp", "simd"]);
-    let mut abi = AbiDescriptor::for_trust_cg_target(Target::Aarch64);
-    abi.name = "ty-native-fused-parent-loop-aapcs64-lp64".to_owned();
+    let jit_target = host_jit_target();
+    let target = host_native_fused_target_descriptor();
+    let mut abi = AbiDescriptor::for_trust_cg_target(jit_target);
+    abi.name = format!(
+        "ty-native-fused-parent-loop-{}-lp64",
+        jit_target.calling_convention().name
+    );
 
     let mut layout = ty_native_fused_parent_loop_layout(symbol, offset_bytes, size_bytes);
     let proof_policy_checksum = proof_policy.checksum();

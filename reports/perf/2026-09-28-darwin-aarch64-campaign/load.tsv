@@ -1,0 +1,23 @@
+utc	phase	step	loadavg_1_5_15
+2026-09-28T13:41:59Z	campaign	start	1.29 1.74 2.00
+2026-09-28T13:41:59Z	before	01-beat-llvm-evidence-warm-cold	1.29 1.74 2.00
+2026-09-28T13:43:36Z	after	01-beat-llvm-evidence-warm-cold	1.66 1.71 1.96
+2026-09-28T13:43:36Z	before	02-perf-ratchet-require-current	1.66 1.71 1.96
+2026-09-28T13:43:36Z	after	02-perf-ratchet-require-current	1.66 1.71 1.96
+2026-09-28T13:43:36Z	before	03-check-gates-evidence	1.66 1.71 1.96
+2026-09-28T13:43:36Z	after	03-check-gates-evidence	1.66 1.71 1.96
+2026-09-28T13:43:36Z	before	04-beat-llvm-diagnostic-no-proof-certs	1.66 1.71 1.96
+2026-09-28T13:47:39Z	after	04-beat-llvm-diagnostic-no-proof-certs	1.80 1.69 1.87
+2026-09-28T13:47:39Z	before	05-check-gates-diagnostic	1.80 1.69 1.87
+2026-09-28T13:47:39Z	after	05-check-gates-diagnostic	1.80 1.69 1.87
+2026-09-28T13:47:39Z	before	06-scale-gate-rss	1.80 1.69 1.87
+2026-09-28T13:50:05Z	after	06-scale-gate-rss	2.09 1.68 1.83
+2026-09-28T13:50:05Z	before	07-compile-scaling	2.09 1.68 1.83
+2026-09-28T13:50:43Z	after	07-compile-scaling	1.71 1.64 1.81
+2026-09-28T13:50:43Z	before	08-compile-time-canary	1.71 1.64 1.81
+2026-09-28T13:50:44Z	after	08-compile-time-canary	1.71 1.64 1.81
+2026-09-28T13:50:45Z	before	09-determinism-sentinel	1.71 1.64 1.81
+2026-09-28T13:50:53Z	after	09-determinism-sentinel	1.60 1.62 1.80
+2026-09-28T13:50:53Z	campaign	end	1.60 1.62 1.80
+2026-09-28T13:51:12Z	before	10-scale-gate-large-xlarge-repeat	1.43 1.58 1.78
+2026-09-28T13:52:33Z	after	10-scale-gate-large-xlarge-repeat	1.15 1.45 1.71

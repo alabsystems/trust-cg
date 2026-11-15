@@ -8,7 +8,7 @@
 // MachIR (post-ISel, post-RegAlloc), so we measure the encoding + Mach-O
 // pipeline. clang compiles equivalent C source files from scratch.
 //
-// Run with: cargo bench -p trust-cg-codegen --bench compare_clang
+// Run with: scripts/trust_cargo.sh bench -p trust-cg-codegen --bench compare_clang
 //
 // Part of #65 — Benchmark suite
 
@@ -397,7 +397,7 @@ fn trust_cg_compile(func: &MachFunction) -> (Vec<u8>, usize) {
     {
         use trust_cg_codegen::frame;
         let layout = frame::compute_frame_layout(&f, 0, true);
-        frame::eliminate_frame_indices(&mut f, &layout);
+        frame::eliminate_frame_indices(&mut f, &layout).unwrap();
         frame::insert_prologue_epilogue(&mut f, &layout).unwrap();
     }
 

@@ -1,0 +1,91 @@
+{
+  "schema": "trust-cg-wasm-contract-v1",
+  "version": 2,
+  "results_schema": "trust-cg-wasm-bench-v2",
+  "target": "wasm32-unknown-unknown",
+  "opt_level": "2",
+  "baselines": {
+    "B1": "rustc + LLVM, wasm32-unknown-unknown, -C opt-level=2, the same rustc frontend, sysroot and wasm-ld as the trust-cg lane, no wasm-opt. The primary bar: every ratcheted metric and every gate is stated against B1 (lane llvm_o2).",
+    "B2": "B1's module post-processed by binaryen wasm-opt -O2 -g (names kept, as in B1's module). Context only: never ratcheted, never gated (lane llvm_o2_wasmopt). A program whose B2 module disagrees with B1 on the grid is left out of the B2 aggregates and counted."
+  },
+  "lanes": {
+    "llvm_o2": "B1",
+    "tcg_o2": "rustc + the trust-cg bridge (-Zcodegen-backend), -C opt-level=2, -Ztrust-ir-cg-args=no-proof-certs and nothing else",
+    "llvm_o2_wasmopt": "B2 (optional: absent when no wasm-opt is given)"
+  },
+  "required_bridge_cg_args": [
+    "no-proof-certs"
+  ],
+  "engine_modes": {
+    "default": [],
+    "turbofan": [
+      "--no-liftoff"
+    ],
+    "liftoff": [
+      "--liftoff-only"
+    ]
+  },
+  "n_run_min": 5,
+  "eligibility": [
+    "results schema trust-cg-wasm-bench-v2 and target wasm32-unknown-unknown",
+    "headline_eligible stamped true AND every rule below recomputed from the results by wasm_contract.evidence_problems",
+    "QUIET: the 1-minute load average at most ncpu/2 before and after the run, with no --load-threshold override, and no runaway process",
+    "clean tree: git_dirty false (untracked files are counted separately and do not disqualify)",
+    "default environment: tcg_env empty and bridge_cg_args exactly required_bridge_cg_args",
+    "complete provenance (every mandatory field present and non-empty) and a backend dylib no older than the backend sources",
+    "exactly the corpus of progs/manifest.json at the manifest digest stamped",
+    "0 MISMATCH, every INCOMPLETE program a typed refusal (incomplete_kind refused), n_run >= n_run_min, every engine mode measured, and every deterministic and timing aggregate measured (non-null)"
+  ],
+  "metrics": {
+    "file_bytes": "whole module file bytes as linked by wasm-ld (names section included in every lane)",
+    "code_bytes": "code section payload bytes",
+    "static_insns": "decoded instructions in every function body, `end` and `else` markers excluded",
+    "declared_locals": "declared locals over all function bodies (parameters excluded)",
+    "static_memops": "static loads, stores and bulk-memory operations (memory.copy/fill/init)",
+    "dyn_insns": "executed instructions (markers excluded) over one pass of the workload, counted on an instrumented copy",
+    "dyn_memops": "executed loads, stores and bulk-memory operations over one pass of the workload",
+    "dyn_calls": "executed call and call_indirect instructions over one pass of the workload",
+    "stack_hwm": "stack high-water over one pass of the workload: __stack_pointer's initial value minus the lowest stack address in use, which is the lower of the smallest value any global.set wrote to __stack_pointer and the smallest effective address any load, store or non-empty bulk-memory operation touched below that initial value (code may use memory below the stack pointer without moving it, as LLVM's leaf functions do); defined only for a stack-first layout (one memory, every active data segment at or above the initial stack pointer), otherwise no reading",
+    "time_default": "min of N samples of the in-wasm workload loop, node default tiering, after warm-up and calibration",
+    "time_turbofan": "the same with --no-liftoff (TurboFan only)",
+    "time_liftoff": "the same with --liftoff-only (baseline compiler only)"
+  },
+  "workload": "the calls of the deterministic grid on which B1 does not trap, in grid order; a program whose workload is empty, or whose B1 workload loop traps on a fresh instance, has no dynamic, stack or timing reading (status empty/oracle_traps, decided by B1 alone) and is counted outside those aggregates",
+  "verdicts": "MATCH: every grid call agrees with B1 (traps included) and the workload accumulators are equal. MISMATCH (stop-the-line, rejected by the ledger): a grid disagreement, a missing export, a differing accumulator, or a trust-cg module that fails to compile or instantiate, or does not return within max(20 s, 50x B1's time), where B1 ran. A +0/-0 difference is a disagreement unless progs/manifest.json lists the export under soft_signed_zero with a reason; NaN payloads are not observed. INCOMPLETE, with incomplete_kind: refused (a typed [TCG-*] refusal of the bridge), compile_failed, b1_failed or harness.",
+  "measurement_identity": "measurement_sha256, the SHA-256 of run.py, wasmtool.mjs and contract/wasm_contract.py, is stamped on every row and is part of the ratchet's comparison key",
+  "gates_status": "PROPOSED: GATE-WASM-SB is the wasm32 strict-superiority target of docs/wasm32_perf_roadmap.md. It is reported, never enforced; the ratchet does not read it. It is not owner-approved.",
+  "gates": {
+    "WSB1_file_bytes_vs_B1": {
+      "description": "file bytes geomean < 1.00x B1",
+      "predicate": ".aggregates.wasm_file_bytes_geomean_vs_llvm_o2 != null and .aggregates.wasm_file_bytes_geomean_vs_llvm_o2 < 1.00"
+    },
+    "WSB2_time_turbofan_vs_B1": {
+      "description": "TurboFan-only time geomean < 1.00x B1 and every program <= 1.50x",
+      "predicate": ".aggregates.wasm_time_turbofan_geomean_vs_llvm_o2 != null and .aggregates.wasm_time_turbofan_geomean_vs_llvm_o2 < 1.00 and .aggregates.wasm_time_turbofan_worst_vs_llvm_o2 <= 1.50"
+    },
+    "WSB3_time_default_vs_B1": {
+      "description": "default-tiering time geomean < 1.00x B1 and every program <= 1.50x",
+      "predicate": ".aggregates.wasm_time_default_geomean_vs_llvm_o2 != null and .aggregates.wasm_time_default_geomean_vs_llvm_o2 < 1.00 and .aggregates.wasm_time_default_worst_vs_llvm_o2 <= 1.50"
+    },
+    "WSB4_stack_hwm_vs_B1": {
+      "description": "stack high-water total <= 1.00x B1 (a total over the workload programs: a program whose exports touch no stack memory reads 0 bytes, so a per-program geomean is undefined)",
+      "predicate": ".aggregates.wasm_stack_hwm_total_vs_llvm_o2 != null and .aggregates.wasm_stack_hwm_total_vs_llvm_o2 <= 1.00"
+    },
+    "WSB5_coverage": {
+      "description": "every corpus program compiles and matches (coverage 100%, 0 MISMATCH)",
+      "predicate": ".aggregates.coverage_pct >= 100 and .aggregates.mismatch_count == 0"
+    }
+  },
+  "revisions": [
+    {
+      "version": 1,
+      "date": "2026-10-01",
+      "summary": "First wasm32 contract: B1/B2 baselines, the 144-program corpus, deterministic metrics (sizes, static and dynamic counts, stack high-water) ratcheted with zero tolerance, three engine modes ratcheted with a noise floor, and the PROPOSED GATE-WASM-SB."
+    },
+    {
+      "version": 2,
+      "date": "2026-10-01",
+      "summary": "Stack high-water counts memory touched below the stack pointer as well as stack-pointer writes; a trust-cg module that fails to compile, instantiate or return where B1 ran is a MISMATCH; signed-zero differences are disagreements unless the manifest lists the export; INCOMPLETE rows carry a kind and only typed refusals are compatible with evidence; the measuring code's digest joins the comparison key; results schema trust-cg-wasm-bench-v2."
+    }
+  ]
+}

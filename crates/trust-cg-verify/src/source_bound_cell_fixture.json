@@ -1,0 +1,156 @@
+[
+  {
+    "name": "aliased_f32_read",
+    "signature": {
+      "params": [
+        "F32",
+        "F32"
+      ],
+      "returns": [
+        "F32"
+      ]
+    },
+    "blocks": {
+      "1": {
+        "params": [],
+        "instructions": [
+          {
+            "opcode": {
+              "Load": {
+                "ty": "F32",
+                "align": null
+              }
+            },
+            "args": [
+              2
+            ],
+            "results": [
+              4
+            ]
+          },
+          {
+            "opcode": "Return",
+            "args": [
+              4
+            ],
+            "results": []
+          }
+        ],
+        "source_locs": [
+          null,
+          null
+        ]
+      },
+      "0": {
+        "params": [
+          [
+            0,
+            "F32"
+          ],
+          [
+            1,
+            "F32"
+          ]
+        ],
+        "instructions": [
+          {
+            "opcode": {
+              "StackAddr": {
+                "slot": 0
+              }
+            },
+            "args": [],
+            "results": [
+              2
+            ]
+          },
+          {
+            "opcode": {
+              "Store": {
+                "ty": "F32",
+                "align": null
+              }
+            },
+            "args": [
+              0,
+              2
+            ],
+            "results": []
+          },
+          {
+            "opcode": "Copy",
+            "args": [
+              2
+            ],
+            "results": [
+              3
+            ]
+          },
+          {
+            "opcode": {
+              "Call": {
+                "name": "c_change",
+                "binding": "Interposable"
+              }
+            },
+            "args": [
+              3,
+              1
+            ],
+            "results": []
+          },
+          {
+            "opcode": {
+              "Jump": {
+                "dest": 1
+              }
+            },
+            "args": [],
+            "results": []
+          }
+        ],
+        "source_locs": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    "block_order": [
+      0,
+      1
+    ],
+    "entry_block": 0,
+    "stack_slots": [
+      {
+        "size": 4,
+        "align": 4,
+        "allocation": "Fixed"
+      }
+    ],
+    "value_types": {
+      "2": "I64"
+    },
+    "debug_meta": {
+      "source_file": "aliased_f32_read.rs",
+      "decl_line": 0,
+      "param_names": [
+        "arg0",
+        "arg1"
+      ],
+      "local_variables": [
+        {
+          "name": "local_0",
+          "ty": "F32",
+          "storage": {
+            "ProvenanceVar": 2147483648
+          },
+          "decl_line": 0
+        }
+      ]
+    },
+    "stack_protector": "None"
+  }
+]

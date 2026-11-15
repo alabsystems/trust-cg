@@ -3,8 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Per `designs/2026-04-16-trust_ir-transport-architecture.md` Layer 3 and
-// issue #413, Trust Codegen now:
+// Per issue #413, Trust Codegen now:
 //   - accepts the human-readable `.trust_ir` text format as a debug input
 //     (enabled via `--format=text` or the `.trust_ir` extension under
 //     `--format=auto`).
@@ -42,19 +41,12 @@ fn make_test_module() -> TrustIrModule {
     let r = fb.iconst(Ty::I64, 42);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
-/// Create a fresh, empty scratch directory under the OS temp dir.
-fn scratch_dir(test_name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "trust_cg_cli_trust_ir_{}_{}",
-        test_name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+/// A new scratch directory, removed when the returned guard is dropped.
+fn scratch_dir(test_name: &str) -> scratch::ScratchDir {
+    scratch::create(&format!("trust_cg_cli_trust_ir_{test_name}_"))
 }
 
 fn trust_cg_bin() -> PathBuf {
@@ -76,6 +68,7 @@ fn cli_format_text_reaches_lowering_pass() {
     std::fs::write(&trust_ir_path, &text).expect("write .trust_ir");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--format=text")
         .arg("-c")
         .arg("-o")
@@ -114,6 +107,7 @@ fn cli_format_auto_picks_up_trust_ir_extension() {
     std::fs::write(&trust_ir_path, &text).expect("write .trust_ir");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--format=auto")
         .arg("-c")
         .arg("-o")
@@ -168,6 +162,7 @@ fn cli_emit_trust_ir_round_trips_through_parser() {
     // but request -c so we don't try to link. The .trust_ir file should
     // be written before compilation, which is what we're checking.
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--emit-trust_ir")
         .arg(&emitted_trust_ir)
         .arg("-c")
@@ -242,6 +237,7 @@ fn cli_emit_trust_ir_rejects_multiple_inputs() {
     std::fs::write(&b, &tmbc).expect("write b");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .arg("--emit-trust_ir")
         .arg(&out)
         .arg("-c")
@@ -263,3 +259,6 @@ fn cli_emit_trust_ir_rejects_multiple_inputs() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[path = "common/scratch.rs"]
+mod scratch;

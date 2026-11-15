@@ -1,0 +1,70 @@
+; TrustIr text format v1
+module "assert_panic_site"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (usize, usize, ptr) -> ()
+
+functy.1 = (ptr) -> ()
+
+functy.2 = (ptr) -> ()
+
+functy.3 = (usize, usize) -> (usize)
+
+functy.4 = (u8) -> (u8)
+
+functy.5 = (bool) -> (bool)
+
+functy.6 = (usize, usize, ptr) -> (usize)
+
+functy.7 = (usize, usize) -> (usize)
+
+global internal @loc.0 u64 = 7
+
+fn @panic_bounds_check(functy.0) {
+}
+
+fn @panic_const_add_overflow(functy.1) {
+}
+
+fn @panic_resumed(functy.2) {
+}
+
+fn @bounds(functy.3) {
+    ; #body-gate: ungated
+bb0(%0: usize, %1: usize):
+    %2 = icmp ult usize %0, %1
+    assert %2, bounds_check %0, %1, panic @func.0 at @global.0
+    ret %0
+}
+
+fn @add(functy.4) {
+    ; #body-gate: ungated
+bb0(%0: u8):
+    %1 = const u8 255
+    %2 = icmp ne u8 %0, %1
+    assert %2, overflow add, panic @func.1 at @global.0
+    ret %0
+}
+
+fn @resumed(functy.5) {
+    ; #body-gate: ungated
+bb0(%0: bool):
+    assert %0, panic @func.2 at @global.0
+    ret %0
+}
+
+fn @tracked(functy.6) {
+    ; #body-gate: ungated
+bb0(%0: usize, %1: usize, %2: ptr):
+    %3 = icmp ult usize %0, %1
+    assert %3, bounds_check %0, %1, panic @func.0 at %2
+    ret %0
+}
+
+fn @caller(functy.7) {
+    ; #body-gate: ungated
+bb0(%0: usize, %1: usize):
+    %2 = global_addr @global.0
+    %3 = call @func.6(%0, %1, %2)
+    ret %3
+}

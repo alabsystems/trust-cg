@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 """`.text` identity of two dylibs over the 18-program corpus: sha256 of
-objcopy --only-section=.text for every program, both at -O3 (harness lane)."""
+objcopy --only-section=.text for every program, both at -O3 (harness lane).
+usage: ident.py [--driver TRUSTC] DYLIB_A DYLIB_B   (driver: see _trust_driver.py)"""
 import os, subprocess, sys, tempfile, hashlib, glob, shutil
-a, b = sys.argv[1], sys.argv[2]
+from _trust_driver import resolve_from_argv
 home = os.path.expanduser("~")
-os.environ["PATH"] = f"{home}/.cargo/bin:{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
-rustc = subprocess.check_output(["rustup", "which", "--toolchain", "nightly-2026-04-20", "rustc"], text=True).strip()
-flags = ["--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3"]
+# STOCK EXCEPTION (Trust lacks rust-lld/gcc-ld; measured: no lib/rustlib/<host>/bin/{rust-lld,gcc-ld} in the Trust sysroot): the Linux linker shim comes from the stock stable toolchain's gcc-ld; the compilers come from the Trust package.
+os.environ["PATH"] = f"{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
+DRIVER = resolve_from_argv(sys.argv)
+a, b = sys.argv[1], sys.argv[2]
+rustc = DRIVER["compiler"]
+flags = [*DRIVER["compiler_flags"], "--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3"]
 progs = sorted(glob.glob(os.environ.get("TCG_PROGS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../beat-llvm/progs")) + "/*.rs"))
 if not progs:
     raise SystemExit("no corpus programs found")
-OBJCOPY = shutil.which("objcopy") or shutil.which("llvm-objcopy") or next(iter(glob.glob(f"{home}/.rustup/toolchains/*/lib/rustlib/*/bin/llvm-objcopy")), None)
+# The Trust package ships llvm-objcopy in <sysroot>/lib/rustlib/<host>/bin
+# (measured); its sysroot comes from the PATH trustc, never a rustup toolchain.
+def _trust_llvm_objcopy():
+    try:
+        sysroot = subprocess.run(["trustc", "--print", "sysroot"], capture_output=True, text=True,
+                                 env={k: v for k, v in os.environ.items()
+                                      if not k.startswith(("TRUST_CG_", "TCG_"))}).stdout.strip()
+    except OSError:
+        return None
+    return next(iter(glob.glob(f"{sysroot}/lib/rustlib/*/bin/llvm-objcopy")), None) if sysroot else None
+
+
+OBJCOPY = shutil.which("objcopy") or shutil.which("llvm-objcopy") or _trust_llvm_objcopy()
 assert OBJCOPY, "no objcopy"
 def text_sha(dylib, p, d):
     out = os.path.join(d, os.path.basename(p)[:-3])

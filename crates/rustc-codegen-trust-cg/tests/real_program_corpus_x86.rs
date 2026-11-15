@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // crates/rustc-codegen-trust-cg/tests/real_program_corpus_x86.rs
 //
@@ -40,7 +44,7 @@ mod target_dir_support;
 //
 // Run (requires target-bridge toolchain + x86_64-apple-darwin std, x86 host):
 //     cd crates/rustc-codegen-trust-cg
-//     cargo test --release --test real_program_corpus_x86 -- --nocapture
+//     targo --unverified test --release --test real_program_corpus_x86 -- --nocapture
 //
 // (Plumbing below mirrors tests/bridge_differential_x86.rs — each bridge test
 // target is its own crate, so the minimal outcome model is re-derived inline
@@ -52,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 const OPT_LEVELS: [&str; 2] = ["0", "3"];
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -63,12 +67,19 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RunOutcome {
-    Exited { code: i32 },
-    Signalled { signal: i32 },
+    Exited {
+        code: i32,
+    },
+    Signalled {
+        signal: i32,
+    },
     /// rustc (compile+link in one invocation) failed — for the trust-cg lane
     /// this is the fail-closed shape (compile rejection OR an unemitted-symbol
     /// link error; both mean the program never runs, so it cannot miscompile).
-    CompileError { stderr_tail: String, tcg_codes: Vec<String> },
+    CompileError {
+        stderr_tail: String,
+        tcg_codes: Vec<String>,
+    },
     Timeout,
 }
 
@@ -84,69 +95,12 @@ enum RowVerdict {
 // Toolchain / dylib plumbing (mirror of bridge_differential_x86.rs)
 // ---------------------------------------------------------------------------
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    let candidates = [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run the corpus gate"
-    );
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -223,13 +177,11 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> R
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join("bin");
 
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
     // Typed diagnostics for the gap table (harmless if the bridge ignores it).
-    cmd.env("TCG_DIAG_JSON", "1");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    cmd.arg(toolchain_support::backend_knobs_arg(&["diag-json"]));
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
@@ -246,17 +198,12 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> R
     .arg("-o")
     .arg(&bin)
     .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let _ = std::fs::remove_dir_all(&dir);
         return RunOutcome::CompileError {
-            stderr_tail: stderr
-                .lines()
-                .rev()
-                .take(6)
-                .collect::<Vec<_>>()
-                .join(" | "),
+            stderr_tail: stderr.lines().rev().take(6).collect::<Vec<_>>().join(" | "),
             tcg_codes: extract_tcg_codes(&stderr),
         };
     }
@@ -282,8 +229,8 @@ fn signal_of(_status: &std::process::ExitStatus) -> i32 {
 // ---------------------------------------------------------------------------
 
 fn coverage_floor_percent() -> f64 {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/real_program_corpus/COVERAGE_FLOOR.txt");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/real_program_corpus/COVERAGE_FLOOR.txt");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "COMPLETE-5 ratchet floor file missing/unreadable at {}: {e}\n\
@@ -295,7 +242,9 @@ fn coverage_floor_percent() -> f64 {
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("coverage_floor_percent") {
-            let Some((_, v)) = rest.split_once('=') else { continue };
+            let Some((_, v)) = rest.split_once('=') else {
+                continue;
+            };
             return v
                 .trim()
                 .parse::<f64>()
@@ -350,7 +299,10 @@ fn real_program_corpus_acceptance_gate() {
                 // succeeds, the row is labeled NONDET (still INCOMPLETE, never
                 // upgraded to MATCH), because the first verdict flapped.
                 let first_reason = match &test {
-                    RunOutcome::CompileError { stderr_tail, tcg_codes } => {
+                    RunOutcome::CompileError {
+                        stderr_tail,
+                        tcg_codes,
+                    } => {
                         if tcg_codes.is_empty() {
                             stderr_tail.clone()
                         } else {
@@ -384,15 +336,19 @@ fn real_program_corpus_acceptance_gate() {
                 }
             } else {
                 match (&reference, &test) {
-                    (_, RunOutcome::CompileError { stderr_tail, tcg_codes }) => {
-                        RowVerdict::Incomplete {
-                            reason: if tcg_codes.is_empty() {
-                                format!("fail-closed: {stderr_tail}")
-                            } else {
-                                tcg_codes.join(",")
-                            },
-                        }
-                    }
+                    (
+                        _,
+                        RunOutcome::CompileError {
+                            stderr_tail,
+                            tcg_codes,
+                        },
+                    ) => RowVerdict::Incomplete {
+                        reason: if tcg_codes.is_empty() {
+                            format!("fail-closed: {stderr_tail}")
+                        } else {
+                            tcg_codes.join(",")
+                        },
+                    },
                     (RunOutcome::Exited { code: rc }, RunOutcome::Exited { code: tc }) => {
                         if rc == tc {
                             RowVerdict::Match { exit_code: *rc }
@@ -471,9 +427,7 @@ fn real_program_corpus_acceptance_gate() {
         incomplete_rows.len() as u32 - nondet_count,
         mismatches.len()
     );
-    eprintln!(
-        "compile-and-match coverage: {coverage:.1}% (ratchet floor: {floor:.1}%)"
-    );
+    eprintln!("compile-and-match coverage: {coverage:.1}% (ratchet floor: {floor:.1}%)");
     if !gap_table.is_empty() {
         eprintln!("ranked gap table (diagnostic -> row count):");
         let mut ranked: Vec<(&String, &u32)> = gap_table.iter().collect();

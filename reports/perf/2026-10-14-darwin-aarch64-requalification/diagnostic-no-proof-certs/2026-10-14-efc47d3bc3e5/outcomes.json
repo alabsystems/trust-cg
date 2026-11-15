@@ -1,0 +1,146 @@
+{
+ "b1_mispredict": {
+  "category": "branch",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "h1_vec_push_sum": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "h2_vec_grow": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "h3_box_leak": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "h4_vec_dropper": {
+  "category": "heap",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "m1_call_chain": {
+  "category": "multifn",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "m2_call_heavy": {
+  "category": "multifn",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p1_xorshift": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p2_collatz": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p3_gcd": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p4_matmul": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p5_struct_acc": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p6_branch_match": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p7_sieve": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "p8_closure_nest": {
+  "category": "scalar",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "v1_saxpy": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "v2_memfill": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ },
+ "v3_popcount": {
+  "category": "vectorizable",
+  "expected_bridge": "MATCH",
+  "label": null,
+  "nondet": null,
+  "reason": "",
+  "verdict": "MATCH"
+ }
+}

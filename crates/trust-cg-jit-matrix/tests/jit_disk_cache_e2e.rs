@@ -51,6 +51,14 @@ impl DiskCacheTestEnv {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let tmp = TempDir::new().expect("tempdir for disk cache test");
+        // The disk cache is used only below a directory no other user can
+        // write; `TempDir::new` makes it `0777 & !umask`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make the test cache root private");
+        }
         // Capture whatever override was set before this test, so we
         // can restore it on drop. In practice this is None on the
         // first test, then None again because the previous Drop

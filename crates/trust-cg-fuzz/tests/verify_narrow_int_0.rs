@@ -44,6 +44,7 @@ fn jit_run(m: &trust_ir::Module, opt: OptLevel, fast: bool, row: &[i64; 4]) -> R
 
     let compiled = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         Compiler::new(cfg)
+            .with_codegen_license(permit_unlicensed())
             .compile_module_to_jit(m, &ext)
             .map_err(Box::new)
     }));
@@ -98,7 +99,7 @@ fn build_module(nty: Ty, op: BinOp) -> trust_ir::Module {
     let wide = fb.sext(nty.clone(), Ty::I64, r);
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -173,4 +174,13 @@ fn verify_narrow_int_0() {
     // This test is a VERIFICATION probe: we EXPECT the claimed defect to
     // reproduce, so findings should be non-empty if the claim is real.
     // We do not fail the test either way; the eprintln output is the evidence.
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

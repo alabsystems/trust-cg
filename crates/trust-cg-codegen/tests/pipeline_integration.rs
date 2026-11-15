@@ -155,7 +155,7 @@ fn test_pipeline_add_function_to_macho() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -191,7 +191,7 @@ fn test_pipeline_add_function_write_and_verify() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -336,7 +336,7 @@ fn test_pipeline_nop_function() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -394,7 +394,7 @@ fn test_compact_unwind_section_emitted() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -491,7 +491,7 @@ fn test_runtime_stack_addr_compiles_with_dwarf_fallback() {
         opt_level: OptLevel::O0,
         emit_debug: false,
         verify_dispatch: trust_cg_codegen::pipeline::DispatchVerifyMode::Off,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -553,6 +553,7 @@ fn test_overaligned_runtime_stack_addr_with_stack_arg_call_compiles() {
     instructions.push(Instruction {
         opcode: Opcode::Call {
             name: "stack_arg_callee".to_string(),
+            binding: Default::default(),
         },
         args: (0..9).map(|idx| Value(2 + idx)).collect(),
         results: vec![],
@@ -575,7 +576,7 @@ fn test_overaligned_runtime_stack_addr_with_stack_arg_call_compiles() {
         opt_level: OptLevel::O0,
         emit_debug: false,
         verify_dispatch: trust_cg_codegen::pipeline::DispatchVerifyMode::Off,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -607,7 +608,7 @@ fn test_compact_unwind_nop_function() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -635,7 +636,7 @@ fn test_compact_unwind_otool_verification() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let obj_bytes = pipeline
@@ -744,7 +745,7 @@ fn test_full_pipeline_produces_valid_object() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     match pipeline.compile_ir_function(&mut func) {
@@ -816,7 +817,7 @@ fn test_prepare_ir_function_eliminates_vregs_before_encode() {
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     pipeline

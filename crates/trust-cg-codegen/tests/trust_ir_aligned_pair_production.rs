@@ -40,7 +40,7 @@ fn aligned_pair_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn aligned_pair_citations(
@@ -78,7 +78,8 @@ fn compile_with_opt(module: &trust_ir::Module, opt_level: OptLevel) -> Compilati
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-unknown-linux-gnu").expect("test target spec parses"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .expect("production compiler pipeline should accept trust_ir aligned-pair fixture")
@@ -103,7 +104,7 @@ fn explicit_aligned_store_pair_module(name: &'static str, align: u64) -> trust_i
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn explicit_aligned_load_pair_module(name: &'static str, align: u64) -> trust_ir::Module {
@@ -124,13 +125,13 @@ fn explicit_aligned_load_pair_module(name: &'static str, align: u64) -> trust_ir
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
 fn compiler_pipeline_does_not_consume_aligned_claim_without_replay_authority() {
     let module = aligned_pair_module();
-    let lowered = trust_cg_lower::adapter::translate_module(&module).expect("trust_ir lowers");
+    let lowered = permit_translate_module(&module).expect("trust_ir lowers");
     assert_eq!(lowered.len(), 1);
     assert_eq!(
         lowered[0]
@@ -147,7 +148,8 @@ fn compiler_pipeline_does_not_consume_aligned_claim_without_replay_authority() {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-unknown-linux-gnu").expect("test target spec parses"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module)
         .expect("production compiler pipeline should accept aligned-pair trust_ir");
@@ -173,7 +175,7 @@ fn compiler_pipeline_does_not_consume_aligned_claim_without_replay_authority() {
 fn compiler_pipeline_keeps_explicit_aligned_store_pair_without_replay_authority() {
     const NAME: &str = "trust_ir_explicit_aligned_store_pair";
     let module = explicit_aligned_store_pair_module(NAME, 16);
-    let lowered = trust_cg_lower::adapter::translate_module(&module).expect("trust_ir lowers");
+    let lowered = permit_translate_module(&module).expect("trust_ir lowers");
     assert_eq!(
         lowered[0]
             .1
@@ -198,7 +200,7 @@ fn compiler_pipeline_keeps_explicit_aligned_store_pair_without_replay_authority(
 fn compiler_pipeline_keeps_explicit_aligned_load_pair_without_replay_authority() {
     const NAME: &str = "trust_ir_explicit_aligned_load_pair";
     let module = explicit_aligned_load_pair_module(NAME, 16);
-    let lowered = trust_cg_lower::adapter::translate_module(&module).expect("trust_ir lowers");
+    let lowered = permit_translate_module(&module).expect("trust_ir lowers");
     assert_eq!(
         lowered[0]
             .1
@@ -251,4 +253,28 @@ fn compiler_pipeline_does_not_combine_weak_explicit_aligned_load_pair_at_o2_o3()
             result.proof_optimization_certificates
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

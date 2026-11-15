@@ -10,8 +10,6 @@
 //
 // A CertificateChain collects all proof certificates for a compilation unit
 // (e.g., a function) and can be serialized to/from JSON for persistence.
-//
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! Proof certificate chain for verification persistence.
 //!
@@ -448,7 +446,64 @@ pub struct ChainSummary {
 // Lowering certificates
 // ---------------------------------------------------------------------------
 
-/// Function-level certificate for a trust_ir-to-machine-code lowering.
+/// The span of the translation a certificate's rules cover (WS7.2, F-111).
+///
+/// Every rule trust-cg certifies today relates a LIR instruction to the
+/// machine code selected for it. The trust-ir -> LIR step (the
+/// `trust-cg-lower` adapter) sits OUTSIDE that boundary: an adapter
+/// miscompile (F-111: an `InsertField` whose result aliased its base) still
+/// earned three `[VERIFIED]` rules and a certified sidecar. This label makes
+/// the boundary explicit in every certificate and sidecar instead of leaving a
+/// reader to assume a trust-ir -> machine claim.
+///
+/// It has exactly one value until an end-to-end trust-ir -> machine obligation
+/// exists (WS7.16). Deserializing any other spelling is refused, so a sidecar
+/// cannot be edited into a wider claim; a certificate written before this
+/// field existed deserializes as [`CoveredSpan::LirToMachine`], which is what
+/// it covered. A second variant must enter [`LoweringCertificate::stable_hash`]
+/// and the JIT certificate seal: both match on this type exhaustively for that
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CoveredSpan {
+    /// LIR instruction -> machine code. The trust-ir -> LIR adapter is NOT
+    /// covered.
+    #[default]
+    #[serde(rename = "lir->machine")]
+    LirToMachine,
+}
+
+impl CoveredSpan {
+    /// The stable JSON spelling (`"lir->machine"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LirToMachine => "lir->machine",
+        }
+    }
+
+    /// Whether the trust-ir -> LIR adapter step is inside the covered span.
+    /// `false` for every certificate trust-cg can produce today.
+    pub const fn covers_trust_ir_to_lir(self) -> bool {
+        match self {
+            Self::LirToMachine => false,
+        }
+    }
+}
+
+impl std::fmt::Display for CoveredSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The one-line disclosure printed beside every function's certificates while
+/// the adapter is outside the proven boundary.
+pub const TRUST_IR_TO_LIR_NOT_COVERED: &str =
+    "trust-ir->lir: NOT COVERED (adapter outside the proven boundary)";
+
+/// Function-level certificate for one function's compile. Its rule checks
+/// cover LIR -> machine only (`covered_span`); the trust-ir -> LIR adapter is
+/// outside them, and the `trust-proof-cert` sidecar's `CodegenLowering` chain
+/// step is `Trusted`, never checked (WS7.2).
 ///
 /// This composes the existing per-obligation [`ProofCertificate`] entries into
 /// the function-level shape tRust can consume via `trust-proof-cert` JSON. It is
@@ -472,10 +527,21 @@ pub struct LoweringCertificate {
     pub rule_proofs: Vec<LoweringRuleProof>,
     /// Weakest proof strength among all included rules.
     pub overall_strength: LoweringProofStrength,
+    /// The translation span the rules cover: always
+    /// [`CoveredSpan::LirToMachine`] today (WS7.2). The trust-ir -> LIR
+    /// adapter is outside it, whatever `result` says.
+    #[serde(default)]
+    pub covered_span: CoveredSpan,
     /// Certificate-level result. Current lowering certificates are fail-closed.
     pub result: LoweringCertificateStatus,
     /// Aggregate solver information across all included obligations.
     pub solver: LoweringSolverSummary,
+    /// For a FORMAL certificate: the AY admitted by `crate::ay_identity` that
+    /// every obligation was bound to (route, path, SHA-256, recorded build),
+    /// plus any rule answered by a portable certificate instead of a run.
+    /// Absent on certificates no AY produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ay: Option<String>,
     /// Sum of per-obligation verification time.
     pub total_time_ms: u64,
     /// Unix epoch seconds when this certificate was created.
@@ -508,12 +574,55 @@ impl LoweringCertificate {
         )
     }
 
+    /// Build a lowering certificate from precomputed canonical SHA-256
+    /// digests. This is equivalent to [`Self::from_verified_chain`] but lets a
+    /// streaming compiler avoid materializing a whole-function canonical byte
+    /// buffer solely to hash it.
+    pub fn from_verified_chain_digests(
+        function: &str,
+        target: &str,
+        trust_ir_digest: [u8; 32],
+        machine_code_digest: [u8; 32],
+        compiler_config_digest: [u8; 32],
+        chain: &CertificateChain,
+    ) -> Result<Self, CertificateError> {
+        Self::from_verified_chain_with_hashes_and_state_counts(
+            function,
+            target,
+            hex_bytes(&trust_ir_digest),
+            hex_bytes(&machine_code_digest),
+            hex_bytes(&compiler_config_digest),
+            chain,
+            &HashMap::new(),
+        )
+    }
+
     fn from_verified_chain_with_state_counts(
         function: &str,
         target: &str,
         trust_ir_bytes: &[u8],
         machine_code_bytes: &[u8],
         compiler_config_bytes: &[u8],
+        chain: &CertificateChain,
+        exhaustive_state_counts: &HashMap<String, u64>,
+    ) -> Result<Self, CertificateError> {
+        Self::from_verified_chain_with_hashes_and_state_counts(
+            function,
+            target,
+            sha256_hex(trust_ir_bytes),
+            sha256_hex(machine_code_bytes),
+            sha256_hex(compiler_config_bytes),
+            chain,
+            exhaustive_state_counts,
+        )
+    }
+
+    fn from_verified_chain_with_hashes_and_state_counts(
+        function: &str,
+        target: &str,
+        trust_ir_hash: String,
+        machine_code_hash: String,
+        compiler_config_hash: String,
         chain: &CertificateChain,
         exhaustive_state_counts: &HashMap<String, u64>,
     ) -> Result<Self, CertificateError> {
@@ -568,17 +677,19 @@ impl LoweringCertificate {
             schema: "trust-cg.lowering_certificate.v1".to_string(),
             function: function.to_string(),
             target: target.to_string(),
-            trust_ir_hash: sha256_hex(trust_ir_bytes),
-            machine_code_hash: sha256_hex(machine_code_bytes),
-            compiler_config_hash: sha256_hex(compiler_config_bytes),
+            trust_ir_hash,
+            machine_code_hash,
+            compiler_config_hash,
             rule_proofs,
             overall_strength,
+            covered_span: CoveredSpan::LirToMachine,
             result: LoweringCertificateStatus::Verified,
             solver: LoweringSolverSummary {
                 name: solver_name,
                 version: format!("trust-cg-verify {}", env!("CARGO_PKG_VERSION")),
                 total_time_ms,
             },
+            ay: None,
             total_time_ms,
             created_epoch_secs: chain.created_epoch_secs,
         })
@@ -677,12 +788,18 @@ impl LoweringCertificate {
             "version": 2,
             "signature": null,
             "trust_cg_lowering_certificate_hash": proof_bundle_hash,
+            "covered_span": self.covered_span.as_str(),
         }))
     }
 
     /// Stable SHA-256 hash of the lowering certificate content that affects the
     /// proof claim. Timing and timestamp metadata are intentionally excluded.
     pub fn stable_hash(&self) -> Result<String, CertificateError> {
+        // `covered_span` has one value, so it carries no information the hash
+        // could lose; a second value must be hashed (exhaustive on purpose).
+        match self.covered_span {
+            CoveredSpan::LirToMachine => {}
+        }
         let stable = LoweringStableHashView {
             schema: &self.schema,
             function: &self.function,
@@ -776,6 +893,89 @@ pub fn generate_lowering_certificate(
         machine_code_bytes,
         obligations,
     )
+}
+
+/// Generate a lowering sidecar by independently replaying every raw obligation.
+/// This supports arbitrary-memory theorems that concrete evaluation cannot
+/// discharge. A bare UNSAT, incomplete proof, timeout, or absent checker refuses
+/// the entire chain. As with other lowering sidecars, input hashes identify the
+/// subject; source-to-machine correspondence remains the compiler's obligation.
+pub fn generate_formal_lowering_certificate(
+    function: &str,
+    target: &str,
+    trust_ir_bytes: &[u8],
+    machine_code_bytes: &[u8],
+    compiler_config_bytes: &[u8],
+    obligations: &[ProofObligation],
+) -> Result<LoweringCertificate, CertificateError> {
+    use crate::ay_bridge::{AYConfig, AYResult, AyVerdictSource, verify_with_cli_raw_attributed};
+
+    let defaults = AYConfig::default();
+    // Bind every obligation of the certificate to ONE admitted AY, and record
+    // exactly that AY in the certificate.
+    let mut admitted: Option<crate::ay_identity::PinnedAy> = None;
+    let mut portable_rules = Vec::new();
+    let mut chain = CertificateChain::new(function.into());
+    for obligation in obligations {
+        let start = Instant::now();
+        let solver = match &admitted {
+            Some(solver) => solver.clone(),
+            None => match crate::ay_identity::resolve_for_process() {
+                Ok(solver) => admitted.insert(solver).clone(),
+                Err(refusal) => {
+                    return Err(CertificateError::UnverifiedObligation {
+                        obligation_name: obligation.name.clone(),
+                        result: AYResult::Error(refusal.to_string()).to_string(),
+                    });
+                }
+            },
+        };
+        let config = AYConfig {
+            solver: Some(solver),
+            timeout_ms: defaults.timeout_ms,
+            produce_models: defaults.produce_models,
+        };
+        let verdict = verify_with_cli_raw_attributed(obligation, &config);
+        if verdict.result != AYResult::Verified {
+            return Err(CertificateError::UnverifiedObligation {
+                obligation_name: obligation.name.clone(),
+                result: verdict.result.to_string(),
+            });
+        }
+        if let AyVerdictSource::PortableCertificate { producer_ay_sha256 } = &verdict.source {
+            portable_rules.push(format!(
+                "{} (producer-ay-sha256={producer_ay_sha256})",
+                obligation.name
+            ));
+        }
+        chain.add(ProofCertificate {
+            obligation_name: obligation.name.clone(),
+            result: CertificateResult::Verified,
+            solver: SolverUsed::AYCli,
+            strength: VerificationStrength::Formal,
+            check_kind: obligation.category,
+            formula_hash: compute_formula_hash(obligation),
+            timestamp_epoch_secs: chain.created_epoch_secs,
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
+    }
+    let mut certificate = LoweringCertificate::from_verified_chain(
+        function,
+        target,
+        trust_ir_bytes,
+        machine_code_bytes,
+        compiler_config_bytes,
+        &chain,
+    )?;
+    certificate.ay = admitted.map(|solver| {
+        let mut record = solver.describe();
+        if !portable_rules.is_empty() {
+            record.push_str("; answered by portable DRAT certificates (AY not run): ");
+            record.push_str(&portable_rules.join(", "));
+        }
+        record
+    });
+    Ok(certificate)
 }
 
 /// One verified lowering rule inside a [`LoweringCertificate`].
@@ -1167,7 +1367,7 @@ fn sha256_digest(data: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let base = i * 4;
@@ -1266,7 +1466,10 @@ fn strength_to_solver(strength: &VerificationStrength) -> SolverUsed {
         VerificationStrength::Statistical { sample_count } => SolverUsed::MockStatistical {
             samples: *sample_count,
         },
-        VerificationStrength::Formal => SolverUsed::AYNative,
+        // The current formal discharge route invokes AY as a child process and
+        // independently checks its Alethe proof; do not report the unimplemented
+        // in-process AYNative backend.
+        VerificationStrength::Formal => SolverUsed::AYCli,
     }
 }
 
@@ -1570,6 +1773,247 @@ mod tests {
     use super::*;
     use crate::smt::SmtExpr;
 
+    #[cfg(unix)]
+    #[test]
+    fn formal_lowering_sidecar_refuses_verdicts_without_checked_proofs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::ay_identity::test_fixtures::{warm, warm_guard};
+
+        let directory = tempfile::tempdir().unwrap();
+        // Each stub is admitted through the identity rule as this scope's
+        // declared fixture AY, so the verdict transcript really reaches the
+        // sidecar gate; an undeclared stub would be refused before any run.
+        // It is started once first (`warm`), so the one-second deadline is not
+        // spent on the host's first-exec assessment of a new file, which would
+        // refuse the certificate for a timeout instead of for its verdict.
+        for verdict in ["unsat", "sat", "unknown"] {
+            let solver = directory.path().join(verdict);
+            std::fs::write(
+                &solver,
+                format!("#!/bin/sh\n{}\nprintf '{verdict}\\n'\n", warm_guard()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&solver, std::fs::Permissions::from_mode(0o755)).unwrap();
+            warm(&solver);
+            let declaration = crate::ay_identity::test_fixtures::declare(&[&solver]);
+            crate::env_lock::with_env_overrides(
+                &[
+                    ("AY_SOLVER_PATH", solver.to_str().unwrap()),
+                    (
+                        crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV,
+                        declaration.as_str(),
+                    ),
+                    ("TCG_NO_SOLVER_SERVER", "1"),
+                    ("TCG_NO_PROOF_CACHE", "1"),
+                    ("TCG_NO_CERT_STORE", "1"),
+                    ("TRUST_CG_AY_TIMEOUT_MS", "1000"),
+                ],
+                || {
+                    let result = generate_formal_lowering_certificate(
+                        "unproved_frame",
+                        "aarch64-unknown-linux-gnu",
+                        b"source",
+                        b"machine",
+                        b"config",
+                        &[crate::source_bound_frame::frame_obligation()],
+                    );
+                    assert!(
+                        matches!(result, Err(CertificateError::UnverifiedObligation { .. })),
+                        "a {verdict} transcript cannot mint a formal sidecar: {result:?}"
+                    );
+                },
+            );
+        }
+    }
+
+    /// A formal sidecar names the exact AY its obligations were bound to. The
+    /// solver and checker are transport fixtures (the solver is this scope's
+    /// declared fixture AY; the checker transcript is synthetic): this pins the
+    /// recorded provenance, not proof validity.
+    #[cfg(unix)]
+    #[test]
+    fn formal_lowering_sidecar_records_the_admitted_ay_that_produced_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::ay_identity::test_fixtures::{warm, warm_guard};
+
+        let directory = tempfile::tempdir().unwrap();
+        let solver = directory.path().join("ay");
+        std::fs::write(
+            &solver,
+            format!(
+                "#!/bin/sh\n{}\ntest \"$4\" = --proof || exit 91\nprintf 'transport-only fixture proof\\n' > \"$5\"\nprintf 'unsat\\n'\n",
+                warm_guard()
+            ),
+        )
+        .unwrap();
+        let checker = directory.path().join("clean");
+        std::fs::write(
+            &checker,
+            format!(
+                "#!/bin/sh\n{}\nprintf 'External certificate verification: PASSED\\nType: Alethe SMT proof\\nProof status: fully verified\\n'\n",
+                warm_guard()
+            ),
+        )
+        .unwrap();
+        // Both are new files, started once before the five-second deadlines
+        // (`warm`): the solver's admitted private copy and the checker's path.
+        for path in [&solver, &checker] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            warm(path);
+        }
+        let declaration = crate::ay_identity::test_fixtures::declare(&[&solver]);
+        // An ordinary build's record: an overlay build's would pin its own
+        // Clean and refuse the fixture checker.
+        let result = crate::ay_identity::test_fixtures::with_ordinary_record(|| {
+            crate::env_lock::with_env_overrides(
+                &[
+                    ("AY_SOLVER_PATH", solver.to_str().unwrap()),
+                    (
+                        crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV,
+                        declaration.as_str(),
+                    ),
+                    ("TCG_EXTERNAL_CLEAN_CHECKER", checker.to_str().unwrap()),
+                    ("TCG_NO_SOLVER_SERVER", "1"),
+                    ("TCG_NO_PROOF_CACHE", "1"),
+                    ("TCG_NO_CERT_STORE", "1"),
+                    ("TCG_CANARY_NO_CACHE", "1"),
+                    ("TRUST_CG_AY_TIMEOUT_MS", "5000"),
+                ],
+                || {
+                    generate_formal_lowering_certificate(
+                        "admitted_frame",
+                        "aarch64-unknown-linux-gnu",
+                        b"source",
+                        b"machine",
+                        b"config",
+                        &[crate::source_bound_frame::frame_obligation()],
+                    )
+                },
+            )
+        });
+        let certificate = result.expect("a checked fixture transcript mints the sidecar");
+        let ay = certificate
+            .ay
+            .as_deref()
+            .expect("a formal certificate names the AY that produced it");
+        assert!(
+            ay.contains(&declaration)
+                && ay.contains(&solver.display().to_string())
+                && ay.contains("route=override-pinned-ay"),
+            "{ay}"
+        );
+        let json = certificate.to_json().unwrap();
+        assert_eq!(LoweringCertificate::from_json(&json).unwrap(), certificate);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["ay"], serde_json::Value::String(ay.to_owned()));
+
+        // A certificate no AY produced carries no AY record.
+        let chain = generate_certificate_chain("mock_only", &[make_simple_obligation("mock")]);
+        let mock = LoweringCertificate::from_verified_chain(
+            "mock_only",
+            "aarch64-unknown-linux-gnu",
+            b"source",
+            b"machine",
+            b"config",
+            &chain,
+        )
+        .expect("an exhaustively verified 8-bit obligation composes");
+        assert_eq!(mock.ay, None);
+        assert!(!mock.to_json().unwrap().contains("\"ay\""));
+    }
+
+    /// Ruling OD-223 on the export's consumer re-check (`--emit-proofs`): a
+    /// formal sidecar re-checks each obligation through the same funnel, so
+    /// the Clean check of AY's proof runs under the checker's own deadline.
+    /// A proof whose check (1.2 s) outlasts the whole 500 ms solve budget is
+    /// published; one the checker refuses, however slowly, is not. On main
+    /// the check was killed at 500 ms and the sidecar refused with `TIMEOUT`.
+    /// The solver and checker are transport fixtures (no proof content).
+    #[cfg(unix)]
+    #[test]
+    fn a_formal_sidecar_whose_check_outlasts_the_solve_budget_is_published() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::ay_identity::test_fixtures::{warm, warm_guard};
+
+        let directory = tempfile::tempdir().unwrap();
+        let solver = directory.path().join("ay");
+        std::fs::write(
+            &solver,
+            format!(
+                "#!/bin/sh\n{}\ntest \"$4\" = --proof || exit 91\nprintf 'transport-only fixture proof\\n' > \"$5\"\nprintf 'unsat\\n'\n",
+                warm_guard()
+            ),
+        )
+        .unwrap();
+        // The capability probe passes at once; the check of the fixture
+        // proof takes 1.2 s, then accepts (or, with `<checker>.reject`,
+        // refuses).
+        let checker = directory.path().join("clean");
+        let reject = directory.path().join("clean.reject");
+        std::fs::write(
+            &checker,
+            format!(
+                "#!/bin/sh\n{}\nif grep -q 'transport-only fixture proof' \"$3\"; then\n  sleep 1.2\n  if test -f '{}'; then printf 'External certificate verification: FAILED\\n'; exit 1; fi\nfi\nprintf 'External certificate verification: PASSED\\nType: Alethe SMT proof\\nProof status: fully verified\\n'\n",
+                warm_guard(),
+                reject.display(),
+            ),
+        )
+        .unwrap();
+        for path in [&solver, &checker] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            warm(path);
+        }
+        let declaration = crate::ay_identity::test_fixtures::declare(&[&solver]);
+        let sidecar = || {
+            crate::ay_identity::test_fixtures::with_ordinary_record(|| {
+                crate::env_lock::with_env_overrides(
+                    &[
+                        ("AY_SOLVER_PATH", solver.to_str().unwrap()),
+                        (
+                            crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV,
+                            declaration.as_str(),
+                        ),
+                        ("TCG_EXTERNAL_CLEAN_CHECKER", checker.to_str().unwrap()),
+                        ("TCG_NO_SOLVER_SERVER", "1"),
+                        ("TCG_NO_PROOF_CACHE", "1"),
+                        ("TCG_NO_CERT_STORE", "1"),
+                        ("TCG_CANARY_NO_CACHE", "1"),
+                        ("TRUST_CG_AY_TIMEOUT_MS", "500"),
+                    ],
+                    || {
+                        crate::env_lock::with_env_overrides_removed(
+                            &[crate::obligation_cert_store::PROOF_CHECK_TIMEOUT_ENV],
+                            || {
+                                generate_formal_lowering_certificate(
+                                    "slow_check_frame",
+                                    "aarch64-unknown-linux-gnu",
+                                    b"source",
+                                    b"machine",
+                                    b"config",
+                                    &[crate::source_bound_frame::frame_obligation()],
+                                )
+                            },
+                        )
+                    },
+                )
+            })
+        };
+        let published = sidecar().expect("a proof Clean accepts after the solve budget publishes");
+        assert!(published.ay.is_some());
+        std::fs::write(&reject, "").unwrap();
+        match sidecar() {
+            Err(CertificateError::UnverifiedObligation { result, .. }) => assert!(
+                result.contains("rejected or could not fully verify THIS Alethe proof")
+                    && !result.contains("TIMEOUT"),
+                "{result}"
+            ),
+            other => panic!("a refused proof must not publish: {other:?}"),
+        }
+    }
+
     /// Helper: create a trivially valid proof obligation (bvadd(a,b) == bvadd(a,b)).
     fn make_simple_obligation(name: &str) -> ProofObligation {
         let a = SmtExpr::var("a", 8);
@@ -1680,6 +2124,77 @@ mod tests {
             LoweringProofStrength::ExhaustiveFinite {
                 state_count: Some(65_536)
             }
+        );
+    }
+
+    #[test]
+    fn lowering_certificate_digest_constructor_matches_byte_constructor() {
+        let chain =
+            generate_certificate_chain("digest_fn", &[make_simple_obligation("digest_rule")]);
+        let from_bytes = LoweringCertificate::from_verified_chain(
+            "digest_fn",
+            "aarch64",
+            b"trust-ir",
+            b"machine",
+            b"config",
+            &chain,
+        )
+        .unwrap();
+        let from_digests = LoweringCertificate::from_verified_chain_digests(
+            "digest_fn",
+            "aarch64",
+            sha256_digest(b"trust-ir"),
+            sha256_digest(b"machine"),
+            sha256_digest(b"config"),
+            &chain,
+        )
+        .unwrap();
+        assert_eq!(from_bytes, from_digests);
+    }
+
+    /// WS7.2 (F-111): the lowering certificate and its trust-proof-cert export
+    /// both say which span they cover — LIR -> machine, never trust-ir ->
+    /// machine. A certificate written before the field existed reads as the
+    /// span it covered, and a sidecar edited to claim a wider span is refused
+    /// at deserialization. The label is outside the stable hash (it has one
+    /// value), so existing hashes are unchanged.
+    #[test]
+    fn lowering_certificate_discloses_its_covered_span() {
+        let chain = generate_certificate_chain("span_fn", &[make_simple_obligation("span_rule")]);
+        let cert = LoweringCertificate::from_verified_chain(
+            "span_fn",
+            "aarch64",
+            b"trust-ir",
+            b"machine",
+            b"config",
+            &chain,
+        )
+        .unwrap();
+        assert_eq!(cert.covered_span, CoveredSpan::LirToMachine);
+        assert!(!cert.covered_span.covers_trust_ir_to_lir());
+
+        let json = cert.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["covered_span"], "lir->machine", "{json}");
+        let trust = cert.to_trust_proof_cert_value().unwrap();
+        assert_eq!(trust["covered_span"], "lir->machine", "{trust}");
+
+        let mut legacy = value.clone();
+        legacy.as_object_mut().unwrap().remove("covered_span");
+        let legacy = LoweringCertificate::from_json(&legacy.to_string()).unwrap();
+        assert_eq!(
+            legacy, cert,
+            "a pre-WS7.2 certificate covered LIR -> machine"
+        );
+        assert_eq!(legacy.stable_hash().unwrap(), cert.stable_hash().unwrap());
+
+        let mut widened = value;
+        widened["covered_span"] = serde_json::json!("trust-ir->machine");
+        let err = LoweringCertificate::from_json(&widened.to_string())
+            .expect_err("a sidecar cannot be edited into a trust-ir -> machine claim");
+        assert!(
+            matches!(err, CertificateError::JsonParseError(_)),
+            "{err:?}"
         );
     }
 

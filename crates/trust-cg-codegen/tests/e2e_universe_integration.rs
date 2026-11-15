@@ -14,8 +14,8 @@
 //! `level_eq` — exactly the real kernel wiring (cert/expr_eq.rs:34) — and with the FULL
 //! smart-constructor `imax` in infer_type's Pi rule and infer_sort. The differential
 //! exercises: the imax(_,0)=0 edge, the imax(_,Succ..)=Max collapse, a REAL IMax node
-//! produced by inference (IMax(succ u, u)), Max commutativity + Succ-offset distribution
-//! + flatten/sort/dedup-same-base normalization inside §7's def_eq, and the §4
+//! produced by inference (IMax(succ u, u)), Max commutativity, Succ-offset distribution
+//! and flatten/sort/dedup-same-base normalization inside §7's def_eq, and the §4
 //! level-param closure walk through Max/IMax level trees.
 //!
 //! The embedded module below is the byte-verbatim `--mir-emit-closure check_decl_readonly`
@@ -46,17 +46,30 @@
 //!       REJECTED by deep_eq (proves the bit-identity check actually reads meta).
 //!
 //! COVERAGE NOTE: gated to aarch64 (the JIT target). Run per-test:
-//!   cargo test -p trust-cg-codegen --test e2e_universe_integration -- \
+//!   scripts/trust_cargo.sh test -p trust-cg-codegen --test e2e_universe_integration -- \
 //!     --exact mir_decl_gate_full_universe_roundtrip --test-threads=1
 
 #![cfg(target_arch = "aarch64")]
 #![allow(dead_code)]
 #![allow(clippy::all)]
 
-#[cfg(kernel_fixture_layout_unknown)]
+// A lint driver (`clippy-driver`/`tippy-driver`) links no test binary, so
+// under `kernel_fixture_layout_lint_only` this target is compiled only to BE
+// LINTED; the fixtures still cannot run, because every JIT entry point below
+// refuses at runtime under that same cfg. The ae9 Linux compiler selects its
+// own separately generated fixtures.
+#[cfg(all(
+    kernel_fixture_layout_unknown,
+    not(kernel_fixture_ae9_linux),
+    not(kernel_fixture_layout_lint_only)
+))]
 compile_error!(
     "kernel JIT fixtures require exact Rust 1.95.0, Rust 1.97.1, or the certified Trust compiler"
 );
+
+#[cfg(kernel_fixture_layout_lint_only)]
+#[path = "common/kernel_fixture_guard.rs"]
+mod kernel_fixture_guard;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14686,8 +14699,10 @@ bb17(%19: bool):
 // Both certified fixture lanes run the test; nothing is ignored.
 #[cfg(kernel_fixture_layout_matches)]
 const TIR: &str = MIR_DECL_UNIVERSE_TRUST_IR;
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const TIR: &str = include_str!("clean_decl_universe.trust.tir");
+#[cfg(kernel_fixture_ae9_linux)]
+const TIR: &str = include_str!("fixtures/ae9-linux/clean_decl_universe.tir");
 
 // ════════════════════════════════════════════════════════════════════════════
 // NATIVE ORACLE — byte-equivalent mirror of clean_decl_universe_slice.rs (the
@@ -17203,7 +17218,13 @@ fn resolve_externs(
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_decl_gate_full_universe_roundtrip() {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("mir_decl_gate_full_universe_roundtrip");
     let module = trust_ir::parser::parse_module(TIR).expect(
         "MIR-emitted `check_decl_readonly` (full-universe decl gate) trust-ir text must parse",
     );
@@ -17342,6 +17363,7 @@ fn mir_decl_gate_full_universe_roundtrip() {
     let externs = build_externs();
     let resolved = resolve_externs(&module, &externs);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &resolved)
         .expect("trust-cg JIT compile of MIR-emitted full-universe `check_decl_readonly` failed")
         .buffer;
@@ -17678,4 +17700,13 @@ fn mir_decl_gate_full_universe_roundtrip() {
     );
 
     drop(buffer);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

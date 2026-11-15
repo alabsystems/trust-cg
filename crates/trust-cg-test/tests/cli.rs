@@ -5,7 +5,7 @@
 //
 // The snapshots under `tests/snapshots/` are the stable contract with
 // operators + CI — CI fails on any un-committed drift. Regenerate via:
-//   INSTA_UPDATE=always cargo test -p trust-cg-test --test cli
+//   INSTA_UPDATE=always scripts/trust_cargo.sh test -p trust-cg-test --test cli
 
 use assert_cmd::Command;
 
@@ -121,24 +121,6 @@ fn ratchet_help() {
 #[test]
 fn ratchet_tests_help() {
     insta::assert_snapshot!("ratchet_tests_help", help_of(&["ratchet", "tests"]));
-}
-
-#[test]
-fn ratchet_warnings_help() {
-    insta::assert_snapshot!("ratchet_warnings_help", help_of(&["ratchet", "warnings"]));
-}
-
-#[test]
-fn ratchet_unwrap_help() {
-    insta::assert_snapshot!("ratchet_unwrap_help", help_of(&["ratchet", "unwrap"]));
-}
-
-#[test]
-fn ratchet_panic_clippy_help() {
-    insta::assert_snapshot!(
-        "ratchet_panic_clippy_help",
-        help_of(&["ratchet", "panic-clippy"])
-    );
 }
 
 #[test]

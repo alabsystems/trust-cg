@@ -17,7 +17,7 @@ alternating +/-, high-bit random) x n edges.  BAIL kernels additionally assert
 NO vector op was emitted.
 usage: i64widefuzz.py <trust-cg-binary>
 """
-import sys, os, subprocess, tempfile
+import atexit, shutil, sys, os, subprocess, tempfile
 
 HDR = """; TrustIr text format v1
 module "k"
@@ -189,6 +189,12 @@ def run(cmd, **kw):
 def main():
     tcg = sys.argv[1]
     wd = tempfile.mkdtemp(prefix="i64widefuzz_")
+    # The work directory is removed when the run ends, unless
+    # TRUST_CG_KEEP_TEST_OBJECTS asks to keep it for inspection.
+    if os.environ.get("TRUST_CG_KEEP_TEST_OBJECTS"):
+        print(f"work directory kept: {wd}")
+    else:
+        atexit.register(shutil.rmtree, wd, ignore_errors=True)
     total = ok = mism = 0
     fails = []
     for name, (tir_text, cbody, expect_fire, opsub, is_map) in KERNELS.items():
@@ -216,7 +222,7 @@ def main():
         env = dict(os.environ)
         env["TRUST_CG_DUMP_NEONPREDSUM"] = "1"; env["TRUST_CG_DUMP_NEONMINMAX"] = "1"
         env["TRUST_CG_DUMP_NEONMAP"] = "1"; env["TRUST_CG_DUMP_NEONARRAY"] = "1"
-        r = run([tcg, "--format=text", "--target", "aarch64", "-O2", "-c", t, "-o", on_o], env=env)
+        r = run([tcg, "--format=text", "--permit-unlicensed", "--target", "aarch64", "-O2", "-c", t, "-o", on_o], env=env)
         if r.returncode != 0:
             print(f"{name}: COMPILE_ON failed\n{r.stderr}"); sys.exit(2)
         fired = any(x in r.stderr for x in ("neon-predsum", "neon-minmax", "neon-map", "neon-array"))
@@ -233,7 +239,7 @@ def main():
                 sys.exit(2)
         envoff = dict(os.environ)
         envoff["TRUST_CG_DISABLE_PASSES"] = "neon_predsum,neon_minmax,neon_map,neon_array"
-        assert run([tcg, "--format=text", "--target", "aarch64", "-O2", "-c", t, "-o", off_o], env=envoff).returncode == 0
+        assert run([tcg, "--format=text", "--permit-unlicensed", "--target", "aarch64", "-O2", "-c", t, "-o", off_o], env=envoff).returncode == 0
         assert run(["cc", "-O2", "-c", c, "-o", cl_o]).returncode == 0
         on_b, off_b, cl_b = [os.path.join(wd, name + x) for x in ("_on", "_off", "_cl")]
         for (obj, binp) in ((on_o, on_b), (off_o, off_b), (cl_o, cl_b)):

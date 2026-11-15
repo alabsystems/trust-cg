@@ -3,8 +3,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: designs/2026-04-18-pgo-workflow.md
-//
 // v1 serializes as a little-endian binary container. v0 JSON is no longer
 // accepted by the writer; the reader returns an explicit migration diagnostic
 // instead of silently falling back to module-hash-only freshness.

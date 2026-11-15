@@ -1,15 +1,26 @@
 -- Sentinel Certified-Elimination Kernel — decide() contract, formalized for Clean.
 --
+-- Production boundary (2026-11-10): elimination certificates now retain the exact
+-- minted operand list and recheck compares it with the observed list. Thus the
+-- production operand-drift check does not require fingerprint collision freedom.
+-- Section IV below remains the older lossy fingerprint MODEL; its conditional
+-- collision-resistance theorem is not a proof of this new exact production gate.
+-- Porting that gate and its list comparison into Trust remains required.
+--
 -- Author: Andrew Yates
 -- Copyright 2026 Andrew Yates | License: Apache-2.0
 --
 -- This file formalizes the soundness contract of the Rust kernel
 -- `trust_cg_ir::guard::decide` (crates/trust-cg-ir/src/guard.rs). It is authored in
--- Clean's native Lean4 subset (Init only; term-mode; finite inductives — no Bool/Nat/Option
+-- Clean's native Lean4 subset (Init arithmetic; checked tactic proofs; finite inductives — no Bool/Nat/Option
 -- matching, which Clean's elaborator routes through an unavailable Decidable instance) and is
 -- checked by:
 --
---     cargo run --locked -p clean --bin clean -- check proofs/sentinel_decide_spec.lean
+--     python3 scripts/tests/sentinel_clean_unit_test.py -v
+--
+-- This compiles this entire file as a Trust Clean module and checks same-route
+-- true/false theorem controls. The Rust lane is explicitly unverified: these
+-- declaration checks do not establish the model-to-production correspondence.
 --
 -- The Rust kernel returns Eliminate iff ALL FIVE gates hold:
 --   (1) the guard kind is proof-eliminable;
@@ -793,4 +804,1286 @@ theorem driftaware_rejects_drifted_even_when_discharged :
       = Recheck.reject :=
   rfl
 
-def main : Nat := 0
+
+-- Checked FNV limb definitions for the pending production computation port.
+-- Rust still uses its existing wide arithmetic; native limb callability and the
+-- Rust representation/serialization connection remain required. The finite Fp
+-- model above is an abstraction; these definitions do not prove collision resistance.
+-- The exact FNV-1a-128 byte step, represented by two UInt64 limbs.
+-- The prime is 2^88 + 315. Multiplication carries are computed in base 2^32.
+-- This is executable arithmetic, not a collision-resistance assumption.
+def trust_cg_fnv128_step_lo (lo byte : UInt64) : UInt64 :=
+  (lo ^^^ byte) * (315 : UInt64)
+
+def trust_cg_fnv128_step_hi (hi lo byte : UInt64) : UInt64 :=
+  let mixed : UInt64 := lo ^^^ byte
+  let lowProduct : UInt64 := (mixed &&& 4294967295) * (315 : UInt64)
+  let highProduct : UInt64 := (mixed >>> 32) * (315 : UInt64) + (lowProduct >>> 32)
+  hi * (315 : UInt64) + (mixed <<< 24) + (highProduct >>> 32)
+
+
+-- The low base-2^32 multiplication partial fits the UInt64 carrier.
+-- This is one arithmetic ingredient, not the full carry/multiply theorem
+-- or proof of the emitted FNV consumer. The helper uses explicit induction
+-- instead of the refused scaled-goal omega reconstruction.
+namespace TrustCg.Fnv128Carry
+
+theorem scale_pos (a b k : Nat) (h : a < b) : a * Nat.succ k < b * Nat.succ k := by
+  induction k with
+  | zero => simpa only [Nat.mul_one] using h
+  | succ k ih =>
+    exact @Nat.add_lt_add (a * Nat.succ k) (b * Nat.succ k) a b ih h
+
+theorem scale315 (a b : Nat) (h : a < b) : a * 315 < b * 315 := by
+  exact scale_pos a b 314 h
+
+theorem low_partial_fits (x : Nat) :
+    (x % 4294967296) * 315 < 18446744073709551616 := by
+  have remainder_bound : x % 4294967296 < 4294967296 := by omega
+  have scaled : (x % 4294967296) * 315 < 4294967296 * 315 := by
+    exact scale315 (x % 4294967296) 4294967296 remainder_bound
+  exact @Nat.lt_trans ((x % 4294967296) * 315) (4294967296 * 315)
+    18446744073709551616 scaled (by decide)
+
+end TrustCg.Fnv128Carry
+
+
+-- Bounds for the high base-2^32 partial; the full carry/multiply identity
+-- and the emitted caller connection remain separate obligations.
+
+namespace TrustCg.Fnv128Carry
+
+theorem le_add (n k : Nat) : n ≤ n + k := by
+  induction k with
+  | zero => exact Nat.le_refl n
+  | succ k ih => exact Nat.le.step ih
+
+theorem order_split (a b : Nat) : a ≤ b ∨ b < a := by
+  induction a generalizing b with
+  | zero => exact Or.inl (Nat.zero_le b)
+  | succ a ih =>
+    cases b with
+    | zero => exact Or.inr (Nat.zero_lt_succ a)
+    | succ b =>
+      cases ih b with
+      | inl hab => exact Or.inl (@Nat.succ_le_succ a b hab)
+      | inr hba => exact Or.inr (@Nat.succ_lt_succ b a hba)
+
+theorem division_identity (x a : Nat) : (x / a) * a + x % a = x := by
+  simpa only [Nat.mul_comm] using (Nat.div_add_mod x a)
+
+theorem div_lt_product (x a b : Nat) (bounded : x < b * a) : x / a < b := by
+  have orderCases : b ≤ x / a ∨ x / a < b := order_split b (x / a)
+  cases orderCases with
+  | inl hle =>
+    have product_le : b * a ≤ (x / a) * a :=
+      @Nat.mul_le_mul b a (x / a) a hle (Nat.le_refl a)
+    have floor_le : (x / a) * a ≤ x :=
+      Eq.mp (congrArg (fun t : Nat => (x / a) * a ≤ t) (division_identity x a))
+        (le_add ((x / a) * a) (x % a))
+    have total : b * a ≤ x :=
+      @Nat.le_trans (b * a) ((x / a) * a) x product_le floor_le
+    have impossible : x < x := @Nat.lt_of_lt_of_le x (b * a) x bounded total
+    exact False.elim ((Nat.lt_irrefl x) impossible)
+  | inr hlt => exact hlt
+
+theorem high_partial_fits (x : Nat) (bounded : x < 18446744073709551616) :
+    (x / 4294967296) * 315 + ((x % 4294967296) * 315) / 4294967296
+      < 18446744073709551616 := by
+  have quotient : x / 4294967296 < 4294967296 :=
+    div_lt_product x 4294967296 4294967296 bounded
+  have remainder_bound : x % 4294967296 < 4294967296 := by omega
+  have scaled : (x / 4294967296) * 315 < 4294967296 * 315 :=
+    scale315 (x / 4294967296) 4294967296 quotient
+  have carry : ((x % 4294967296) * 315) / 4294967296 < 315 :=
+    div_lt_product ((x % 4294967296) * 315) 4294967296 315
+      (scale315 (x % 4294967296) 4294967296 remainder_bound)
+  have combined :
+      (x / 4294967296) * 315 + ((x % 4294967296) * 315) / 4294967296
+        < 4294967296 * 315 + 315 :=
+    @Nat.add_lt_add ((x / 4294967296) * 315) (4294967296 * 315)
+      (((x % 4294967296) * 315) / 4294967296) 315 scaled carry
+  exact @Nat.lt_trans
+    ((x / 4294967296) * 315 + ((x % 4294967296) * 315) / 4294967296)
+    (4294967296 * 315 + 315) 18446744073709551616 combined (by decide)
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem add_left_strict (a b k : Nat) (h : a < b) : k + a < k + b := by
+  induction k with
+  | zero => simpa only [Nat.zero_add] using h
+  | succ k ih => simpa only [Nat.succ_add] using (@Nat.succ_lt_succ (k + a) (k + b) ih)
+
+theorem successor_product (q a : Nat) : Nat.succ q * a = q * a + a := by
+  simpa only [Nat.add_comm] using (Nat.succ_mul q a)
+
+theorem small_remainder_lt_succ_product (q r a : Nat) (hr : r < a) :
+    q * a + r < Nat.succ q * a := by
+  exact Eq.mp
+    (congrArg (fun v : Nat => q * a + r < v) (Eq.symm (successor_product q a)))
+    (add_left_strict r a (q * a) hr)
+
+theorem quotient_compare (q r d s a : Nat)
+    (h : q * a + r = d * a + s) (hs : s < a) : q ≤ d := by
+  cases order_split q d with
+  | inl hqd => exact hqd
+  | inr hdq =>
+    have step : Nat.succ d ≤ q := hdq
+    have scaled : Nat.succ d * a ≤ q * a :=
+      @Nat.mul_le_mul (Nat.succ d) a q a step (Nat.le_refl a)
+    have below : d * a + s < Nat.succ d * a :=
+      small_remainder_lt_succ_product d s a hs
+    have floor : q * a ≤ q * a + r := le_add (q * a) r
+    have upper : Nat.succ d * a ≤ q * a + r :=
+      @Nat.le_trans (Nat.succ d * a) (q * a) (q * a + r) scaled floor
+    have strict : d * a + s < q * a + r :=
+      @Nat.lt_of_lt_of_le (d * a + s) (Nat.succ d * a) (q * a + r) below upper
+    have impossible : d * a + s < d * a + s :=
+      Eq.mp (congrArg (fun v : Nat => d * a + s < v) h) strict
+    exact False.elim ((Nat.lt_irrefl (d * a + s)) impossible)
+
+theorem quotient_unique (q r d s a : Nat)
+    (h : q * a + r = d * a + s) (hr : r < a) (hs : s < a) : q = d := by
+  exact @Nat.le_antisymm q d
+    (quotient_compare q r d s a h hs)
+    (quotient_compare d s q r a (Eq.symm h) hr)
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem add_exchange (a b c d : Nat) : (a + b) + (c + d) = (a + c) + (b + d) := by
+  calc
+    (a + b) + (c + d) = a + (b + (c + d)) := Nat.add_assoc a b (c + d)
+    _ = a + ((b + c) + d) := congrArg (fun v : Nat => a + v) (Eq.symm (Nat.add_assoc b c d))
+    _ = a + ((c + b) + d) := congrArg (fun v : Nat => a + (v + d)) (Nat.add_comm b c)
+    _ = a + (c + (b + d)) := congrArg (fun v : Nat => a + v) (Nat.add_assoc c b d)
+    _ = (a + c) + (b + d) := Eq.symm (Nat.add_assoc a c (b + d))
+
+theorem add_mul_canonical (a b c : Nat) : (a + b) * c = a * c + b * c := by
+  induction c with
+  | zero => rfl
+  | succ c ih =>
+    change (a + b) * c + (a + b) = (a * c + a) + (b * c + b)
+    exact Eq.trans (congrArg (fun v : Nat => v + (a + b)) ih)
+      (add_exchange (a * c) (b * c) a b)
+
+theorem swap_mul_right (a b c : Nat) : a * b * c = a * c * b := by
+  exact Eq.trans (Nat.mul_assoc a b c)
+    (Eq.trans (congrArg (fun v : Nat => a * v) (Nat.mul_comm b c))
+      (Eq.symm (Nat.mul_assoc a c b)))
+
+theorem carry_equation (x q r c s d t b p : Nat)
+    (hx : q * b + r = x) (hr : c * b + s = r * p)
+    (hh : d * b + t = q * p + c) :
+    x * p = d * (b * b) + (t * b + s) := by
+  calc
+    x * p = (q * b + r) * p := congrArg (fun v : Nat => v * p) (Eq.symm hx)
+    _ = (q * b) * p + r * p := add_mul_canonical (q * b) r p
+    _ = (q * p) * b + r * p := congrArg (fun v : Nat => v + r * p) (swap_mul_right q b p)
+    _ = (q * p) * b + (c * b + s) := congrArg (fun v : Nat => (q * p) * b + v) (Eq.symm hr)
+    _ = ((q * p) * b + c * b) + s := Eq.symm (Nat.add_assoc ((q * p) * b) (c * b) s)
+    _ = (q * p + c) * b + s := congrArg (fun v : Nat => v + s) (Eq.symm (add_mul_canonical (q * p) c b))
+    _ = (d * b + t) * b + s := congrArg (fun v : Nat => v * b + s) (Eq.symm hh)
+    _ = ((d * b) * b + t * b) + s := congrArg (fun v : Nat => v + s) (add_mul_canonical (d * b) t b)
+    _ = (d * b) * b + (t * b + s) := Nat.add_assoc ((d * b) * b) (t * b) s
+    _ = d * (b * b) + (t * b + s) := congrArg (fun v : Nat => v + (t * b + s)) (Nat.mul_assoc d b b)
+
+theorem combined_remainder_bound (t s b : Nat) (ht : t < b) (hs : s < b) :
+    t * b + s < b * b := by
+  have upper : Nat.succ t * b ≤ b * b :=
+    @Nat.mul_le_mul (Nat.succ t) b b b ht (Nat.le_refl b)
+  exact @Nat.lt_of_lt_of_le (t * b + s) (Nat.succ t * b) (b * b)
+    (small_remainder_lt_succ_product t s b hs) upper
+
+theorem carry_exact (x : Nat) :
+    ((x / 4294967296) * 315 + ((x % 4294967296) * 315) / 4294967296) / 4294967296
+      = (x * 315) / 18446744073709551616 := by
+  let q := x / 4294967296
+  let r := x % 4294967296
+  let c := (r * 315) / 4294967296
+  let s := (r * 315) % 4294967296
+  let d := (q * 315 + c) / 4294967296
+  let t := (q * 315 + c) % 4294967296
+  have hx : q * 4294967296 + r = x := division_identity x 4294967296
+  have hr : c * 4294967296 + s = r * 315 := division_identity (r * 315) 4294967296
+  have hh : d * 4294967296 + t = q * 315 + c := division_identity (q * 315 + c) 4294967296
+  have hs : s < 4294967296 := @Nat.mod_lt (r * 315) 4294967296 (by decide)
+  have ht : t < 4294967296 := @Nat.mod_lt (q * 315 + c) 4294967296 (by decide)
+  have shape : x * 315 = d * 18446744073709551616 + (t * 4294967296 + s) :=
+    carry_equation x q r c s d t 4294967296 315 hx hr hh
+  have bounded : t * 4294967296 + s < 18446744073709551616 :=
+    combined_remainder_bound t s 4294967296 ht hs
+  have original := division_identity (x * 315) 18446744073709551616
+  exact quotient_unique d (t * 4294967296 + s)
+    ((x * 315) / 18446744073709551616) ((x * 315) % 18446744073709551616)
+    18446744073709551616 (Eq.trans (Eq.symm shape) (Eq.symm original))
+    bounded (@Nat.mod_lt (x * 315) 18446744073709551616 (by decide))
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem mul_add_canonical (a b c : Nat) : a * (b + c) = a * b + a * c := by
+  calc
+    a * (b + c) = (b + c) * a := Nat.mul_comm a (b + c)
+    _ = b * a + c * a := add_mul_canonical b c a
+    _ = a * b + c * a := congrArg (fun v : Nat => v + c * a) (Nat.mul_comm b a)
+    _ = a * b + a * c := congrArg (fun v : Nat => a * b + v) (Nat.mul_comm c a)
+
+theorem mul_cross (a b c d : Nat) : (a * b) * (c * d) = (a * d) * (b * c) := by
+  calc
+    (a * b) * (c * d) = a * (b * (c * d)) := Nat.mul_assoc a b (c * d)
+    _ = a * ((b * c) * d) := congrArg (fun v : Nat => a * v) (Eq.symm (Nat.mul_assoc b c d))
+    _ = a * (d * (b * c)) := congrArg (fun v : Nat => a * v) (Nat.mul_comm (b * c) d)
+    _ = (a * d) * (b * c) := Eq.symm (Nat.mul_assoc a d (b * c))
+
+theorem collect_three (a b c m r : Nat) :
+    a * m + (b * m + (c * m + r)) = (a + b + c) * m + r := by
+  calc
+    a * m + (b * m + (c * m + r)) = a * m + ((b * m + c * m) + r) :=
+      congrArg (fun v : Nat => a * m + v) (Eq.symm (Nat.add_assoc (b * m) (c * m) r))
+    _ = (a * m + (b * m + c * m)) + r := Eq.symm (Nat.add_assoc (a * m) (b * m + c * m) r)
+    _ = ((a * m + b * m) + c * m) + r :=
+      congrArg (fun v : Nat => v + r) (Eq.symm (Nat.add_assoc (a * m) (b * m) (c * m)))
+    _ = ((a + b) * m + c * m) + r :=
+      congrArg (fun v : Nat => (v + c * m) + r) (Eq.symm (add_mul_canonical a b m))
+    _ = (a + b + c) * m + r :=
+      congrArg (fun v : Nat => v + r) (Eq.symm (add_mul_canonical (a + b) c m))
+
+theorem product_equation (hi lo m k p q r h t : Nat)
+    (low : q * m + r = lo * p) (high : h * m + t = hi * p + lo * k + q) :
+    (hi * m + lo) * (m * k + p) = (hi * k + h) * (m * m) + (t * m + r) := by
+  calc
+    (hi * m + lo) * (m * k + p) = (hi * m) * (m * k + p) + lo * (m * k + p) :=
+      add_mul_canonical (hi * m) lo (m * k + p)
+    _ = ((hi * m) * (m * k) + (hi * m) * p) + lo * (m * k + p) :=
+      congrArg (fun v : Nat => v + lo * (m * k + p)) (mul_add_canonical (hi * m) (m * k) p)
+    _ = ((hi * m) * (m * k) + (hi * m) * p) + (lo * (m * k) + lo * p) :=
+      congrArg (fun v : Nat => ((hi * m) * (m * k) + (hi * m) * p) + v) (mul_add_canonical lo (m * k) p)
+    _ = ((hi * k) * (m * m) + (hi * m) * p) + (lo * (m * k) + lo * p) :=
+      congrArg (fun v : Nat => (v + (hi * m) * p) + (lo * (m * k) + lo * p)) (mul_cross hi m m k)
+    _ = ((hi * k) * (m * m) + (hi * p) * m) + (lo * (m * k) + lo * p) :=
+      congrArg (fun v : Nat => ((hi * k) * (m * m) + v) + (lo * (m * k) + lo * p)) (swap_mul_right hi m p)
+    _ = ((hi * k) * (m * m) + (hi * p) * m) + ((lo * k) * m + lo * p) :=
+      congrArg (fun v : Nat => ((hi * k) * (m * m) + (hi * p) * m) + (v + lo * p))
+        (Eq.trans (Eq.symm (Nat.mul_assoc lo m k)) (swap_mul_right lo m k))
+    _ = ((hi * k) * (m * m) + (hi * p) * m) + ((lo * k) * m + (q * m + r)) :=
+      congrArg (fun v : Nat => ((hi * k) * (m * m) + (hi * p) * m) + ((lo * k) * m + v)) (Eq.symm low)
+    _ = (hi * k) * (m * m) + ((hi * p) * m + ((lo * k) * m + (q * m + r))) :=
+      Nat.add_assoc ((hi * k) * (m * m)) ((hi * p) * m) ((lo * k) * m + (q * m + r))
+    _ = (hi * k) * (m * m) + ((hi * p + lo * k + q) * m + r) :=
+      congrArg (fun v : Nat => (hi * k) * (m * m) + v) (collect_three (hi * p) (lo * k) q m r)
+    _ = (hi * k) * (m * m) + ((h * m + t) * m + r) :=
+      congrArg (fun v : Nat => (hi * k) * (m * m) + (v * m + r)) (Eq.symm high)
+    _ = (hi * k) * (m * m) + (((h * m) * m + t * m) + r) :=
+      congrArg (fun v : Nat => (hi * k) * (m * m) + (v + r)) (add_mul_canonical (h * m) t m)
+    _ = (hi * k) * (m * m) + ((h * m) * m + (t * m + r)) :=
+      congrArg (fun v : Nat => (hi * k) * (m * m) + v) (Nat.add_assoc ((h * m) * m) (t * m) r)
+    _ = (hi * k) * (m * m) + (h * (m * m) + (t * m + r)) :=
+      congrArg (fun v : Nat => (hi * k) * (m * m) + (v + (t * m + r))) (Nat.mul_assoc h m m)
+    _ = ((hi * k) * (m * m) + h * (m * m)) + (t * m + r) :=
+      Eq.symm (Nat.add_assoc ((hi * k) * (m * m)) (h * (m * m)) (t * m + r))
+    _ = (hi * k + h) * (m * m) + (t * m + r) :=
+      congrArg (fun v : Nat => v + (t * m + r)) (Eq.symm (add_mul_canonical (hi * k) h (m * m)))
+
+theorem remainder_unique (q r d s a : Nat)
+    (h : q * a + r = d * a + s) (hr : r < a) (hs : s < a) : r = s := by
+  have same : q = d := quotient_unique q r d s a h hr hs
+  have fixed : d * a + r = d * a + s :=
+    Eq.mp (congrArg (fun v : Nat => v * a + r = d * a + s) same) h
+  exact @Nat.add_left_cancel (d * a) r s fixed
+
+theorem multiply_split (hi lo : Nat) :
+    ((hi * 18446744073709551616 + lo) * 309485009821345068724781371)
+        % 340282366920938463463374607431768211456
+      = (lo * 315) % 18446744073709551616
+        + 18446744073709551616 * ((hi * 315 + lo * 16777216
+            + (lo * 315) / 18446744073709551616) % 18446744073709551616) := by
+  let q := (lo * 315) / 18446744073709551616
+  let r := (lo * 315) % 18446744073709551616
+  let h := (hi * 315 + lo * 16777216 + q) / 18446744073709551616
+  let t := (hi * 315 + lo * 16777216 + q) % 18446744073709551616
+  let n := (hi * 18446744073709551616 + lo) * 309485009821345068724781371
+  have low : q * 18446744073709551616 + r = lo * 315 :=
+    division_identity (lo * 315) 18446744073709551616
+  have high : h * 18446744073709551616 + t = hi * 315 + lo * 16777216 + q :=
+    division_identity (hi * 315 + lo * 16777216 + q) 18446744073709551616
+  have hr : r < 18446744073709551616 :=
+    @Nat.mod_lt (lo * 315) 18446744073709551616 (by decide)
+  have ht : t < 18446744073709551616 :=
+    @Nat.mod_lt (hi * 315 + lo * 16777216 + q) 18446744073709551616 (by decide)
+  have shape : n = (hi * 16777216 + h) * 340282366920938463463374607431768211456
+      + (t * 18446744073709551616 + r) :=
+    product_equation hi lo 18446744073709551616 16777216 315 q r h t low high
+  have bounded : t * 18446744073709551616 + r < 340282366920938463463374607431768211456 :=
+    combined_remainder_bound t r 18446744073709551616 ht hr
+  have original := division_identity n 340282366920938463463374607431768211456
+  have same : n % 340282366920938463463374607431768211456 = t * 18446744073709551616 + r :=
+    remainder_unique (n / 340282366920938463463374607431768211456)
+      (n % 340282366920938463463374607431768211456) (hi * 16777216 + h)
+      (t * 18446744073709551616 + r) 340282366920938463463374607431768211456
+      (Eq.trans original shape)
+      (@Nat.mod_lt n 340282366920938463463374607431768211456 (by decide)) bounded
+  exact Eq.trans same
+    (Eq.trans (Nat.add_comm (t * 18446744073709551616) r)
+      (congrArg (fun v : Nat => r + v) (Nat.mul_comm t 18446744073709551616)))
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem low_source_value (lo byte : UInt64) :
+    (trust_cg_fnv128_step_lo lo byte).toNat
+      = (((lo ^^^ byte).toNat * 315) % 18446744073709551616) := by
+  rfl
+
+end TrustCg.Fnv128Carry
+
+-- Constructive descent prerequisites for the remaining bitwise mask refinement.
+namespace TrustCg.Fnv128Carry
+
+theorem nat_strong_induction (P : Nat → Prop)
+    (step : ∀ n, (∀ m, m < n → P m) → P n) (n : Nat) : P n := by
+  have bound : ∀ k, ∀ m, m < k → P m := by
+    intro k
+    induction k with
+    | zero =>
+      intro m hm
+      exact False.elim ((Nat.lt_irrefl m) (@Nat.lt_of_lt_of_le m 0 m hm (Nat.zero_le m)))
+    | succ k ih =>
+      intro m hm
+      cases order_split k m with
+      | inl above =>
+        have same_succ : Nat.succ m = Nat.succ k :=
+          @Nat.le_antisymm (Nat.succ m) (Nat.succ k) hm (@Nat.succ_le_succ k m above)
+        have same : m = k := congrArg Nat.pred same_succ
+        exact Eq.mp (congrArg P (Eq.symm same)) (step k ih)
+      | inr below => exact ih m below
+  exact bound (Nat.succ n) n (Nat.lt_succ_self n)
+
+theorem mod_add_period (x a : Nat) (positive : 0 < a) :
+    (x + a) % a = x % a := by
+  have shifted : (Nat.succ (x / a)) * a + x % a = x + a := by
+    calc
+      (Nat.succ (x / a)) * a + x % a = ((x / a) * a + a) + x % a :=
+        congrArg (fun v : Nat => v + x % a) (successor_product (x / a) a)
+      _ = (x / a) * a + (a + x % a) := Nat.add_assoc ((x / a) * a) a (x % a)
+      _ = (x / a) * a + (x % a + a) :=
+        congrArg (fun v : Nat => (x / a) * a + v) (Nat.add_comm a (x % a))
+      _ = ((x / a) * a + x % a) + a := Eq.symm (Nat.add_assoc ((x / a) * a) (x % a) a)
+      _ = x + a := congrArg (fun v : Nat => v + a) (division_identity x a)
+  have same : (Nat.succ (x / a)) * a + x % a = ((x + a) / a) * a + (x + a) % a :=
+    Eq.trans shifted (Eq.symm (division_identity (x + a) a))
+  exact Eq.symm (remainder_unique (Nat.succ (x / a)) (x % a)
+    ((x + a) / a) ((x + a) % a) a same (@Nat.mod_lt x a positive) (@Nat.mod_lt (x + a) a positive))
+
+-- Keep the varying lower bound in the induction motive explicitly.
+theorem le_add_witness_bounded (k : Nat) :
+    ∀ start, start ≤ k → ∃ y, y + start = k := by
+  induction k with
+  | zero =>
+    intro start hs
+    have same : start = 0 := @Nat.le_antisymm start 0 hs (Nat.zero_le start)
+    exact Exists.intro 0 (Eq.trans (Nat.zero_add start) same)
+  | succ k ih =>
+    intro start hs
+    cases order_split start k with
+    | inl below =>
+      cases ih start below with
+      | intro y same =>
+        exact Exists.intro (Nat.succ y)
+          (Eq.trans (Nat.succ_add y start) (congrArg Nat.succ same))
+    | inr above =>
+      have same : start = Nat.succ k := @Nat.le_antisymm start (Nat.succ k) hs above
+      exact Exists.intro 0 (Eq.trans (Nat.zero_add start) same)
+
+theorem le_add_witness (a x : Nat) (h : a ≤ x) : ∃ y, y + a = x := by
+  exact le_add_witness_bounded x a h
+
+theorem mod_descent (x a : Nat) (positive : 0 < a) :
+    x < a ∨ ∃ y, y < x ∧ y + a = x ∧ x % a = y % a := by
+  cases order_split a x with
+  | inl enough =>
+    cases le_add_witness a x enough with
+    | intro y joined =>
+      have smaller : y < y + a := add_left_strict 0 a y positive
+      have decreases : y < x := Eq.mp (congrArg (fun v : Nat => y < v) joined) smaller
+      have same : x % a = y % a :=
+        Eq.mp (congrArg (fun v : Nat => v % a = y % a) joined) (mod_add_period y a positive)
+      exact Or.inr (Exists.intro y (And.intro decreases (And.intro joined same)))
+  | inr below => exact Or.inl below
+
+theorem div_product (x a b : Nat) (apos : 0 < a) (bpos : 0 < b) :
+    x / (b * a) = (x / a) / b := by
+  let q := (x / a) / b
+  let r := (x / a) % b
+  let s := x % a
+  have rs : s < a := @Nat.mod_lt x a apos
+  have rb : r < b := @Nat.mod_lt (x / a) b bpos
+  have small : r * a + s < Nat.succ r * a := small_remainder_lt_succ_product r s a rs
+  have scaled : Nat.succ r * a ≤ b * a :=
+    @Nat.mul_le_mul (Nat.succ r) a b a rb (Nat.le_refl a)
+  have bound : r * a + s < b * a :=
+    @Nat.lt_of_lt_of_le (r * a + s) (Nat.succ r * a) (b * a) small scaled
+  have product_positive : 0 < b * a := by
+    cases order_split (b * a) 0 with
+    | inl zero =>
+      have bad : r * a + s < r * a + s :=
+        @Nat.lt_of_lt_of_le (r * a + s) (b * a) (r * a + s) bound
+          (@Nat.le_trans (b * a) 0 (r * a + s) zero (Nat.zero_le (r * a + s)))
+      exact False.elim ((Nat.lt_irrefl (r * a + s)) bad)
+    | inr positive => exact positive
+  have expansion : q * (b * a) + (r * a + s) = x := by
+    calc
+      q * (b * a) + (r * a + s) = (q * b) * a + (r * a + s) :=
+        congrArg (fun v : Nat => v + (r * a + s)) (Eq.symm (Nat.mul_assoc q b a))
+      _ = ((q * b) * a + r * a) + s := Eq.symm (Nat.add_assoc ((q * b) * a) (r * a) s)
+      _ = (q * b + r) * a + s :=
+        congrArg (fun v : Nat => v + s) (Eq.symm (add_mul_canonical (q * b) r a))
+      _ = (x / a) * a + s :=
+        congrArg (fun v : Nat => v * a + s) (division_identity (x / a) b)
+      _ = x := division_identity x a
+  have same : q * (b * a) + (r * a + s) = (x / (b * a)) * (b * a) + x % (b * a) :=
+    Eq.trans expansion (Eq.symm (division_identity x (b * a)))
+  exact Eq.symm (quotient_unique q (r * a + s) (x / (b * a)) (x % (b * a))
+    (b * a) same bound (@Nat.mod_lt x (b * a) product_positive))
+
+theorem bit_quotient (x i : Nat) :
+    Nat.testBit x i = decide ((x / 2^i) % 2 = 1) := by
+  first
+  | exact Nat.testBit_eq_decide_div_mod_eq
+  | have twice : forall (t : Nat), t * 2 = t + t := by
+      intro t
+      first
+      | exact Nat.mul_two t
+      | rfl
+      | change (0 + t) + t = t + t
+        exact congrArg (fun v : Nat => v + t) (Nat.zero_add t)
+    have part_bound : forall (t : Nat), Nat.div2Par t < 2 := by
+      intro t
+      cases Nat.div2Par_zero_or_one t with
+      | inl zero => exact Eq.mp (congrArg (fun v : Nat => v < 2) (Eq.symm zero)) (by decide)
+      | inr one => exact Eq.mp (congrArg (fun v : Nat => v < 2) (Eq.symm one)) (by decide)
+    have joined : forall (t : Nat), Nat.div2 t * 2 + Nat.div2Par t = t := fun (t : Nat) =>
+      Eq.trans (congrArg (fun v : Nat => v + Nat.div2Par t) (twice (Nat.div2 t)))
+        (Eq.symm (Nat.div2_rejoin t))
+    have same : forall (t : Nat), Nat.div2 t * 2 + Nat.div2Par t = (t / 2) * 2 + t % 2 := fun (t : Nat) =>
+      Eq.trans (joined t) (Eq.symm (division_identity t 2))
+    have half : forall (t : Nat), Nat.div2 t = t / 2 := fun (t : Nat) =>
+      quotient_unique (Nat.div2 t) (Nat.div2Par t) (t / 2) (t % 2) 2
+        (same t) (part_bound t) (@Nat.mod_lt t 2 (by decide))
+    have parity : forall (t : Nat), Nat.div2Par t = t % 2 := fun (t : Nat) =>
+      remainder_unique (Nat.div2 t) (Nat.div2Par t) (t / 2) (t % 2) 2
+        (same t) (part_bound t) (@Nat.mod_lt t 2 (by decide))
+    have bit_zero : forall (t : Nat), Nat.testBit t 0 = decide (t % 2 = 1) := by
+      intro t
+      change Nat.toBoolPar (Nat.div2Par t) = decide (t % 2 = 1)
+      cases Nat.div2Par_zero_or_one t with
+      | inl zero =>
+        have rem : t % 2 = 0 := Eq.trans (Eq.symm (parity t)) zero
+        rw [zero, rem]
+      | inr one =>
+        have rem : t % 2 = 1 := Eq.trans (Eq.symm (parity t)) one
+        rw [one, rem]
+    have pow_positive : ∀ n, 0 < 2^n := by
+      intro n
+      induction n with
+      | zero => decide
+      | succ n ih =>
+        have positive : 0 < 2^n + 2^n :=
+          @Nat.lt_of_lt_of_le 0 (2^n) (2^n + 2^n) ih (le_add (2^n) (2^n))
+        change 0 < (2^n) * 2
+        exact Eq.mp (congrArg (fun v : Nat => 0 < v) (Eq.symm (twice (2^n)))) positive
+    have divide_one : forall (t : Nat), t / 1 = t := by
+      intro t
+      have eq : t * 1 + 0 = (t / 1) * 1 + t % 1 :=
+        Eq.trans (Nat.mul_one t) (Eq.symm (division_identity t 1))
+      exact Eq.symm (quotient_unique t 0 (t / 1) (t % 1) 1 eq (by decide) (@Nat.mod_lt t 1 (by decide)))
+    induction i generalizing x with
+    | zero =>
+      exact Eq.trans (bit_zero x)
+        (Eq.symm (congrArg (fun v : Nat => decide (v % 2 = 1)) (divide_one x)))
+    | succ i ih =>
+      change Nat.testBit (Nat.div2 x) i = decide ((x / 2^(Nat.succ i)) % 2 = 1)
+      have quot : Nat.div2 x / 2^i = x / 2^(Nat.succ i) :=
+        Eq.trans (congrArg (fun v : Nat => v / 2^i) (half x))
+          (Eq.symm (div_product x 2 (2^i) (by decide) (pow_positive i)))
+      exact Eq.trans (ih (Nat.div2 x)) (congrArg (fun v : Nat => decide (v % 2 = 1)) quot)
+
+theorem mod_product (x a b : Nat) (apos : 0 < a) (bpos : 0 < b) :
+    x % (b * a) = ((x / a) % b) * a + x % a := by
+  let q := (x / a) / b
+  let r := (x / a) % b
+  let s := x % a
+  have rs : s < a := @Nat.mod_lt x a apos
+  have rb : r < b := @Nat.mod_lt (x / a) b bpos
+  have small : r * a + s < Nat.succ r * a := small_remainder_lt_succ_product r s a rs
+  have scaled : Nat.succ r * a ≤ b * a :=
+    @Nat.mul_le_mul (Nat.succ r) a b a rb (Nat.le_refl a)
+  have bound : r * a + s < b * a :=
+    @Nat.lt_of_lt_of_le (r * a + s) (Nat.succ r * a) (b * a) small scaled
+  have product_positive : 0 < b * a := by
+    cases order_split (b * a) 0 with
+    | inl zero =>
+      have bad : r * a + s < r * a + s :=
+        @Nat.lt_of_lt_of_le (r * a + s) (b * a) (r * a + s) bound
+          (@Nat.le_trans (b * a) 0 (r * a + s) zero (Nat.zero_le (r * a + s)))
+      exact False.elim ((Nat.lt_irrefl (r * a + s)) bad)
+    | inr positive => exact positive
+  have expansion : q * (b * a) + (r * a + s) = x := by
+    calc
+      q * (b * a) + (r * a + s) = (q * b) * a + (r * a + s) :=
+        congrArg (fun v : Nat => v + (r * a + s)) (Eq.symm (Nat.mul_assoc q b a))
+      _ = ((q * b) * a + r * a) + s := Eq.symm (Nat.add_assoc ((q * b) * a) (r * a) s)
+      _ = (q * b + r) * a + s :=
+        congrArg (fun v : Nat => v + s) (Eq.symm (add_mul_canonical (q * b) r a))
+      _ = (x / a) * a + s :=
+        congrArg (fun v : Nat => v * a + s) (division_identity (x / a) b)
+      _ = x := division_identity x a
+  have same : q * (b * a) + (r * a + s) = (x / (b * a)) * (b * a) + x % (b * a) :=
+    Eq.trans expansion (Eq.symm (division_identity x (b * a)))
+  exact Eq.symm (remainder_unique q (r * a + s) (x / (b * a)) (x % (b * a))
+    (b * a) same bound (@Nat.mod_lt x (b * a) product_positive))
+
+theorem mod_product_parts (x a b : Nat) (apos : 0 < a) (bpos : 0 < b) :
+    (x % (b * a)) / a = (x / a) % b ∧ (x % (b * a)) % a = x % a := by
+  have same : ((x / a) % b) * a + x % a =
+      ((x % (b * a)) / a) * a + (x % (b * a)) % a :=
+    Eq.trans (Eq.symm (mod_product x a b apos bpos))
+      (Eq.symm (division_identity (x % (b * a)) a))
+  have low : x % a < a := @Nat.mod_lt x a apos
+  have other : (x % (b * a)) % a < a := @Nat.mod_lt (x % (b * a)) a apos
+  exact And.intro
+    (Eq.symm (quotient_unique ((x / a) % b) (x % a) ((x % (b * a)) / a)
+      ((x % (b * a)) % a) a same low other))
+    (Eq.symm (remainder_unique ((x / a) % b) (x % a) ((x % (b * a)) / a)
+      ((x % (b * a)) % a) a same low other))
+
+theorem two_power_positive (n : Nat) : 0 < 2^n := by
+  have twice : forall (t : Nat), t * 2 = t + t := by
+    intro t
+    first
+    | exact Nat.mul_two t
+    | rfl
+    | change (0 + t) + t = t + t
+      exact congrArg (fun v : Nat => v + t) (Nat.zero_add t)
+  induction n with
+  | zero => decide
+  | succ n ih =>
+    have positive : 0 < 2^n + 2^n :=
+      @Nat.lt_of_lt_of_le 0 (2^n) (2^n + 2^n) ih (le_add (2^n) (2^n))
+    change 0 < (2^n) * 2
+    exact Eq.mp (congrArg (fun v : Nat => 0 < v) (Eq.symm (twice (2^n)))) positive
+
+theorem divide_one (t : Nat) : t / 1 = t := by
+  have same : t * 1 + 0 = (t / 1) * 1 + t % 1 :=
+    Eq.trans (Nat.mul_one t) (Eq.symm (division_identity t 1))
+  exact Eq.symm (quotient_unique t 0 (t / 1) (t % 1) 1 same
+    (by decide) (@Nat.mod_lt t 1 (by decide)))
+
+theorem bit_zero_quotient (x : Nat) : Nat.testBit x 0 = decide (x % 2 = 1) :=
+  Eq.trans (bit_quotient x 0)
+    (congrArg (fun v : Nat => decide (v % 2 = 1)) (divide_one x))
+
+theorem bit_succ_quotient (x i : Nat) :
+    Nat.testBit x (Nat.succ i) = Nat.testBit (x / 2) i := by
+  have quot : x / 2^(Nat.succ i) = (x / 2) / 2^i :=
+    div_product x 2 (2^i) (by decide) (two_power_positive i)
+  have parity : decide ((x / 2^(Nat.succ i)) % 2 = 1) =
+      decide (((x / 2) / 2^i) % 2 = 1) :=
+    congrArg (fun v : Nat => decide (v % 2 = 1)) quot
+  exact Eq.trans (bit_quotient x (Nat.succ i))
+    (Eq.trans parity (Eq.symm (bit_quotient (x / 2) i)))
+
+theorem bit_mod_pow (x j i : Nat) :
+    Nat.testBit (x % 2^j) i = (decide (i < j) && Nat.testBit x i) := by
+  induction j generalizing x i with
+  | zero =>
+    have bound : x % 1 < 1 := @Nat.mod_lt x 1 (by decide)
+    have rem : x % 1 = 0 :=
+      @Nat.le_antisymm (x % 1) 0
+        (@Nat.le_of_succ_le_succ (x % 1) 0 bound) (Nat.zero_le (x % 1))
+    have never : ¬ i < 0 := fun h =>
+      (Nat.lt_irrefl i) (@Nat.lt_of_lt_of_le i 0 i h (Nat.zero_le i))
+    have mask : decide (i < 0) = false := by
+      cases h : decide (i < 0) with
+      | false => rfl
+      | true => exact False.elim (never (of_decide_eq_true h))
+    rw [mask]
+    exact Eq.trans (congrArg (fun v : Nat => Nat.testBit v i) rem) (by
+      first
+      | exact Nat.testBit_zero_eq_false i
+      | exact Nat.zero_testBit i)
+  | succ j ih =>
+    have parts := mod_product_parts x 2 (2^j) (by decide) (two_power_positive j)
+    cases i with
+    | zero =>
+      have mask : decide (0 < Nat.succ j) = true := by
+        cases h : decide (0 < Nat.succ j) with
+        | false => exact False.elim ((of_decide_eq_false h) (Nat.zero_lt_succ j))
+        | true => rfl
+      rw [mask]
+      exact Eq.trans (bit_zero_quotient (x % 2^(Nat.succ j)))
+        (Eq.trans (congrArg (fun v : Nat => decide (v = 1)) parts.right)
+          (Eq.symm (bit_zero_quotient x)))
+    | succ i =>
+      have comparison : decide (Nat.succ i < Nat.succ j) = decide (i < j) := by
+        cases lhs : decide (Nat.succ i < Nat.succ j) with
+        | false =>
+          cases rhs : decide (i < j) with
+          | false => rfl
+          | true => exact False.elim ((of_decide_eq_false lhs)
+              (@Nat.succ_lt_succ i j (of_decide_eq_true rhs)))
+        | true =>
+          cases rhs : decide (i < j) with
+          | false => exact False.elim ((of_decide_eq_false rhs)
+              (@Nat.le_of_succ_le_succ (Nat.succ i) j (of_decide_eq_true lhs)))
+          | true => rfl
+      rw [comparison]
+      calc
+        Nat.testBit (x % 2^(Nat.succ j)) (Nat.succ i) =
+            Nat.testBit ((x % 2^(Nat.succ j)) / 2) i :=
+          bit_succ_quotient (x % 2^(Nat.succ j)) i
+        _ = Nat.testBit ((x / 2) % 2^j) i :=
+          congrArg (fun v : Nat => Nat.testBit v i) parts.left
+        _ = (decide (i < j) && Nat.testBit (x / 2) i) := ih (x / 2) i
+        _ = (decide (i < j) && Nat.testBit x (Nat.succ i)) :=
+          congrArg (fun v : Bool => decide (i < j) && v) (Eq.symm (bit_succ_quotient x i))
+
+-- Constructive quotient and parity of an odd natural; no bitwise assumption.
+theorem odd_parts (t : Nat) : (t * 2 + 1) / 2 = t ∧ (t * 2 + 1) % 2 = 1 := by
+  have same : t * 2 + 1 = ((t * 2 + 1) / 2) * 2 + (t * 2 + 1) % 2 :=
+    Eq.symm (division_identity (t * 2 + 1) 2)
+  have low : 1 < 2 := by decide
+  have other : (t * 2 + 1) % 2 < 2 := @Nat.mod_lt (t * 2 + 1) 2 (by decide)
+  exact And.intro
+    (Eq.symm (quotient_unique t 1 ((t * 2 + 1) / 2) ((t * 2 + 1) % 2) 2 same low other))
+    (Eq.symm (remainder_unique t 1 ((t * 2 + 1) / 2) ((t * 2 + 1) % 2) 2 same low other))
+
+-- Expose the actual predecessor rather than assuming a subtraction law.
+theorem two_power_predecessor (n : Nat) :
+    ∃ m, m + 1 = 2^n ∧ 2^n - 1 = m := by
+  cases le_add_witness 1 (2^n) (two_power_positive n) with
+  | intro m joined =>
+    have predecessor : 2^n - 1 = m :=
+      Eq.trans (congrArg (fun v : Nat => v - 1) (Eq.symm joined)) (by rfl)
+    exact Exists.intro m (And.intro joined predecessor)
+
+-- The all-ones mask gains a final one bit when the width increases.
+theorem two_power_predecessor_step (n : Nat) :
+    2^(Nat.succ n) - 1 = (2^n - 1) * 2 + 1 := by
+  cases two_power_predecessor n with
+  | intro m parts =>
+    have doubled : 2^(Nat.succ n) = Nat.succ (m * 2 + 1) := by
+      calc
+        2^(Nat.succ n) = (m + 1) * 2 :=
+          congrArg (fun v : Nat => v * 2) (Eq.symm parts.left)
+        _ = m * 2 + 1 * 2 := add_mul_canonical m 1 2
+        _ = Nat.succ (m * 2 + 1) := by rfl
+    have predecessor : 2^(Nat.succ n) - 1 = m * 2 + 1 :=
+      Eq.trans (congrArg (fun v : Nat => v - 1) doubled) (by rfl)
+    exact Eq.trans predecessor
+      (congrArg (fun v : Nat => v * 2 + 1) (Eq.symm parts.right))
+
+
+theorem bit_power_predecessor (n i : Nat) :
+    Nat.testBit (2^n - 1) i = decide (i < n) := by
+  have never : forall (k : Nat), decide (k < 0) = false := by
+    intro k
+    have impossible : ¬ k < 0 := fun h =>
+      (Nat.lt_irrefl k) (@Nat.lt_of_lt_of_le k 0 k h (Nat.zero_le k))
+    cases h : decide (k < 0) with
+    | false => rfl
+    | true => exact False.elim (impossible (of_decide_eq_true h))
+  have positive : forall (k : Nat), decide (0 < Nat.succ k) = true := by
+    intro k
+    cases h : decide (0 < Nat.succ k) with
+    | false => exact False.elim ((of_decide_eq_false h) (Nat.zero_lt_succ k))
+    | true => rfl
+  have successor : forall (a c : Nat), decide (Nat.succ a < Nat.succ c) = decide (a < c) := by
+    intro a c
+    cases lhs : decide (Nat.succ a < Nat.succ c) with
+    | false =>
+      cases rhs : decide (a < c) with
+      | false => rfl
+      | true => exact False.elim ((of_decide_eq_false lhs)
+          (@Nat.succ_lt_succ a c (of_decide_eq_true rhs)))
+    | true =>
+      cases rhs : decide (a < c) with
+      | false => exact False.elim ((of_decide_eq_false rhs)
+          (@Nat.le_of_succ_le_succ (Nat.succ a) c (of_decide_eq_true lhs)))
+      | true => rfl
+  induction n generalizing i with
+  | zero =>
+    have bits : Nat.testBit 0 i = false := by
+      first
+      | exact Nat.testBit_zero_eq_false i
+      | exact Nat.zero_testBit i
+    exact Eq.trans bits (Eq.symm (never i))
+  | succ n ih =>
+    have step : 2^(Nat.succ n) - 1 = (2^n - 1) * 2 + 1 :=
+      two_power_predecessor_step n
+    have odd := odd_parts (2^n - 1)
+    cases i with
+    | zero =>
+      have parity : (2^(Nat.succ n) - 1) % 2 = 1 :=
+        Eq.trans (congrArg (fun v : Nat => v % 2) step) odd.right
+      have bits : Nat.testBit (2^(Nat.succ n) - 1) 0 = true :=
+        Eq.trans (bit_zero_quotient (2^(Nat.succ n) - 1))
+          (congrArg (fun v : Nat => decide (v = 1)) parity)
+      exact Eq.trans bits (Eq.symm (positive n))
+    | succ i =>
+      calc
+        Nat.testBit (2^(Nat.succ n) - 1) (Nat.succ i) =
+            Nat.testBit ((2^(Nat.succ n) - 1) / 2) i :=
+          bit_succ_quotient (2^(Nat.succ n) - 1) i
+        _ = Nat.testBit (((2^n - 1) * 2 + 1) / 2) i :=
+          congrArg (fun v : Nat => Nat.testBit (v / 2) i) step
+        _ = Nat.testBit (2^n - 1) i :=
+          congrArg (fun v : Nat => Nat.testBit v i) odd.left
+        _ = decide (i < n) := ih i
+        _ = decide (Nat.succ i < Nat.succ n) := Eq.symm (successor i n)
+
+-- Equality of the actual checked bitwise operation and arithmetic remainder.
+theorem and_power_mask (x n : Nat) : Nat.land x (2^n - 1) = x % 2^n := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  have comm : forall (a b : Bool), (a && b) = (b && a) := by
+    intro a b
+    cases a <;> cases b <;> rfl
+  have emitted : Nat.testBit (Nat.land x (2^n - 1)) i =
+      (Nat.testBit x i && Nat.testBit (2^n - 1) i) :=
+    Nat.testBit_and x (2^n - 1) i
+  have masked : (Nat.testBit x i && Nat.testBit (2^n - 1) i) =
+      (Nat.testBit x i && decide (i < n)) :=
+    congrArg (fun v : Bool => Nat.testBit x i && v) (bit_power_predecessor n i)
+  exact Eq.trans emitted (Eq.trans masked
+    (Eq.trans (comm (Nat.testBit x i) (decide (i < n)))
+      (Eq.symm (bit_mod_pow x n i))))
+
+
+-- The actual UInt64 low-half mask used by the FNV source definition.
+theorem uint64_mask32_value (x : UInt64) :
+    (x &&& (4294967295 : UInt64)).toNat = x.toNat % 4294967296 := by
+  first
+  | exact Eq.trans (UInt64.toNat_and x (4294967295 : UInt64))
+      (and_power_mask x.toNat 32)
+  | change (Nat.land x.toNat 4294967295) % 18446744073709551616 =
+      x.toNat % 4294967296
+    have masked : Nat.land x.toNat 4294967295 = x.toNat % 4294967296 :=
+      and_power_mask x.toNat 32
+    have bound : x.toNat % 4294967296 < 18446744073709551616 :=
+      @Nat.lt_trans (x.toNat % 4294967296) 4294967296 18446744073709551616
+        (@Nat.mod_lt x.toNat 4294967296 (by decide)) (by decide)
+    exact Eq.trans (congrArg (fun v : Nat => v % 18446744073709551616) masked)
+      (@Nat.mod_eq_of_lt (x.toNat % 4294967296) 18446744073709551616 bound)
+
+-- The actual UInt64 high-half shift used by the FNV source definition.
+theorem uint64_shift32_value (x : UInt64) :
+    (x >>> (32 : UInt64)).toNat = x.toNat / 4294967296 := by
+  first
+  | exact Eq.trans (UInt64.toNat_shiftRight x (32 : UInt64))
+      (Nat.shiftRight_eq_div_pow x.toNat 32)
+  | change (x.toNat / 4294967296) % 18446744073709551616 =
+      x.toNat / 4294967296
+    have bound : x.toNat / 4294967296 < 18446744073709551616 :=
+      @Nat.lt_of_le_of_lt (x.toNat / 4294967296) x.toNat 18446744073709551616
+        (Nat.div_le_self x.toNat 4294967296) (UInt64.toNat_lt x)
+    exact @Nat.mod_eq_of_lt (x.toNat / 4294967296) 18446744073709551616 bound
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem shift_left_power (x n : Nat) : Nat.shiftLeft x n = x * 2^n := by
+  first
+  | exact Nat.shiftLeft_eq x n
+  | induction n with
+    | zero => exact Eq.symm (Nat.mul_one x)
+    | succ n ih =>
+      change Nat.shiftLeft x n * 2 = x * ((2^n) * 2)
+      exact Eq.trans (congrArg (fun v : Nat => v * 2) ih) (Nat.mul_assoc x (2^n) 2)
+
+theorem uint64_shift24_value (x : UInt64) :
+    (x <<< (24 : UInt64)).toNat = (x.toNat * 16777216) % 18446744073709551616 := by
+  first
+  | exact Eq.trans (UInt64.toNat_shiftLeft x (24 : UInt64))
+      (congrArg (fun v : Nat => v % 18446744073709551616) (shift_left_power x.toNat 24))
+  | have shifted : Nat.shiftLeft x.toNat 24 = x.toNat * 16777216 :=
+      shift_left_power x.toNat 24
+    change (Nat.shiftLeft x.toNat 24) % 18446744073709551616 =
+      (x.toNat * 16777216) % 18446744073709551616
+    rw [shifted]
+
+theorem uint64_add_value (a b : UInt64) :
+    (a + b).toNat = (a.toNat + b.toNat) % 18446744073709551616 := by
+  first
+  | rfl
+  | exact UInt64.toNat_add a b
+
+theorem uint64_mul_value (a b : UInt64) :
+    (a * b).toNat = (a.toNat * b.toNat) % 18446744073709551616 := by
+  first
+  | rfl
+  | exact UInt64.toNat_mul a b
+
+theorem mod_add_multiple (x a k : Nat) (positive : 0 < a) :
+    (x + k * a) % a = x % a := by
+  induction k with
+  | zero => simpa only [Nat.zero_mul, Nat.add_zero]
+  | succ k ih =>
+    have expanded : x + Nat.succ k * a = (x + k * a) + a :=
+      Eq.trans (congrArg (fun v : Nat => x + v) (successor_product k a))
+        (Eq.symm (Nat.add_assoc x (k * a) a))
+    exact Eq.trans (congrArg (fun v : Nat => v % a) expanded)
+      (Eq.trans (mod_add_period (x + k * a) a positive) ih)
+
+theorem mod_remove_left (x y m : Nat) (positive : 0 < m) :
+    (x + y) % m = (x % m + y) % m := by
+  have expanded : x + y = (x % m + y) + (x / m) * m := by
+    calc
+      x + y = ((x / m) * m + x % m) + y :=
+        congrArg (fun v : Nat => v + y) (Eq.symm (division_identity x m))
+      _ = (x / m) * m + (x % m + y) := Nat.add_assoc ((x / m) * m) (x % m) y
+      _ = (x % m + y) + (x / m) * m := Nat.add_comm ((x / m) * m) (x % m + y)
+  exact Eq.trans (congrArg (fun v : Nat => v % m) expanded)
+    (mod_add_multiple (x % m + y) m (x / m) positive)
+
+theorem mod_remove_right (x y m : Nat) (positive : 0 < m) :
+    (x + y) % m = (x + y % m) % m :=
+  Eq.trans (congrArg (fun v : Nat => v % m) (Nat.add_comm x y))
+    (Eq.trans (mod_remove_left y x m positive)
+      (congrArg (fun v : Nat => v % m) (Nat.add_comm (y % m) x)))
+
+theorem mod_add_values (x y m : Nat) (positive : 0 < m) :
+    (x + y) % m = (x % m + y % m) % m :=
+  Eq.trans (mod_remove_left x y m positive) (mod_remove_right (x % m) y m positive)
+
+theorem mod_add_three (a b c m : Nat) (positive : 0 < m) :
+    (((a % m + b % m) % m) + c) % m = (a + b + c) % m := by
+  have pair : (a % m + b % m) % m = (a + b) % m :=
+    Eq.symm (mod_add_values a b m positive)
+  exact Eq.trans (congrArg (fun v : Nat => (v + c) % m) pair)
+    (Eq.symm (mod_remove_left (a + b) c m positive))
+
+theorem high_source_value (hi lo byte : UInt64) :
+    (trust_cg_fnv128_step_hi hi lo byte).toNat =
+      (hi.toNat * 315 + (lo ^^^ byte).toNat * 16777216 +
+        ((lo ^^^ byte).toNat * 315) / 18446744073709551616) % 18446744073709551616 := by
+  let mixed : UInt64 := lo ^^^ byte
+  let lowProduct : UInt64 := (mixed &&& (4294967295 : UInt64)) * (315 : UInt64)
+  let upperProduct : UInt64 := (mixed >>> (32 : UInt64)) * (315 : UInt64)
+  let highProduct : UInt64 := upperProduct + (lowProduct >>> (32 : UInt64))
+  let hiProduct : UInt64 := hi * (315 : UInt64)
+  let shifted : UInt64 := mixed <<< (24 : UInt64)
+  let firstSum : UInt64 := hiProduct + shifted
+  have mixedBound : mixed.toNat < 18446744073709551616 := by
+    first
+    | exact UInt64.toNat_lt mixed
+    | exact UInt64.toNat_lt_size mixed
+  have lowMask : (mixed &&& (4294967295 : UInt64)).toNat = mixed.toNat % 4294967296 :=
+    uint64_mask32_value mixed
+  have upperShift : (mixed >>> (32 : UInt64)).toNat = mixed.toNat / 4294967296 :=
+    uint64_shift32_value mixed
+  have lowRaw : lowProduct.toNat = ((mixed.toNat % 4294967296) * 315) % 18446744073709551616 := by
+    have word : lowProduct.toNat =
+        ((mixed &&& (4294967295 : UInt64)).toNat * 315) % 18446744073709551616 :=
+      uint64_mul_value (mixed &&& (4294967295 : UInt64)) (315 : UInt64)
+    exact Eq.trans word
+      (congrArg (fun v : Nat => (v * 315) % 18446744073709551616) lowMask)
+  have lowValue : lowProduct.toNat = (mixed.toNat % 4294967296) * 315 :=
+    Eq.trans lowRaw (@Nat.mod_eq_of_lt ((mixed.toNat % 4294967296) * 315)
+      18446744073709551616 (low_partial_fits mixed.toNat))
+  have lowCarry : (lowProduct >>> (32 : UInt64)).toNat =
+      ((mixed.toNat % 4294967296) * 315) / 4294967296 :=
+    Eq.trans (uint64_shift32_value lowProduct)
+      (congrArg (fun v : Nat => v / 4294967296) lowValue)
+  have upperRaw : upperProduct.toNat =
+      ((mixed.toNat / 4294967296) * 315) % 18446744073709551616 := by
+    have word : upperProduct.toNat =
+        ((mixed >>> (32 : UInt64)).toNat * 315) % 18446744073709551616 :=
+      uint64_mul_value (mixed >>> (32 : UInt64)) (315 : UInt64)
+    exact Eq.trans word
+      (congrArg (fun v : Nat => (v * 315) % 18446744073709551616) upperShift)
+  have highBound : (mixed.toNat / 4294967296) * 315 +
+      ((mixed.toNat % 4294967296) * 315) / 4294967296 < 18446744073709551616 :=
+    high_partial_fits mixed.toNat mixedBound
+  have upperBound : (mixed.toNat / 4294967296) * 315 < 18446744073709551616 :=
+    @Nat.lt_of_le_of_lt ((mixed.toNat / 4294967296) * 315)
+      ((mixed.toNat / 4294967296) * 315 + ((mixed.toNat % 4294967296) * 315) / 4294967296)
+      18446744073709551616
+      (le_add ((mixed.toNat / 4294967296) * 315) (((mixed.toNat % 4294967296) * 315) / 4294967296)) highBound
+  have upperValue : upperProduct.toNat = (mixed.toNat / 4294967296) * 315 :=
+    Eq.trans upperRaw (@Nat.mod_eq_of_lt ((mixed.toNat / 4294967296) * 315)
+      18446744073709551616 upperBound)
+  have highRaw : highProduct.toNat =
+      ((mixed.toNat / 4294967296) * 315 + ((mixed.toNat % 4294967296) * 315) / 4294967296) % 18446744073709551616 := by
+    have word : highProduct.toNat =
+        (upperProduct.toNat + (lowProduct >>> (32 : UInt64)).toNat) % 18446744073709551616 :=
+      uint64_add_value upperProduct (lowProduct >>> (32 : UInt64))
+    exact Eq.trans word (Eq.trans
+      (congrArg (fun v : Nat => (v + (lowProduct >>> (32 : UInt64)).toNat) % 18446744073709551616) upperValue)
+      (congrArg (fun v : Nat => ((mixed.toNat / 4294967296) * 315 + v) % 18446744073709551616) lowCarry))
+  have highValue : highProduct.toNat =
+      (mixed.toNat / 4294967296) * 315 + ((mixed.toNat % 4294967296) * 315) / 4294967296 :=
+    Eq.trans highRaw (@Nat.mod_eq_of_lt
+      ((mixed.toNat / 4294967296) * 315 + ((mixed.toNat % 4294967296) * 315) / 4294967296)
+      18446744073709551616 highBound)
+  have finalCarry : (highProduct >>> (32 : UInt64)).toNat =
+      (mixed.toNat * 315) / 18446744073709551616 :=
+    Eq.trans (uint64_shift32_value highProduct)
+      (Eq.trans (congrArg (fun v : Nat => v / 4294967296) highValue) (carry_exact mixed.toNat))
+  have hiValue : hiProduct.toNat = (hi.toNat * 315) % 18446744073709551616 :=
+    uint64_mul_value hi (315 : UInt64)
+  have shiftedValue : shifted.toNat = (mixed.toNat * 16777216) % 18446744073709551616 :=
+    uint64_shift24_value mixed
+  have pairValue : firstSum.toNat =
+      ((hi.toNat * 315) % 18446744073709551616 +
+        (mixed.toNat * 16777216) % 18446744073709551616) % 18446744073709551616 := by
+    have word : firstSum.toNat = (hiProduct.toNat + shifted.toNat) % 18446744073709551616 :=
+      uint64_add_value hiProduct shifted
+    exact Eq.trans word (Eq.trans
+      (congrArg (fun v : Nat => (v + shifted.toNat) % 18446744073709551616) hiValue)
+      (congrArg (fun v : Nat => ((hi.toNat * 315) % 18446744073709551616 + v) % 18446744073709551616) shiftedValue))
+  have output : (firstSum + (highProduct >>> (32 : UInt64))).toNat =
+      (((hi.toNat * 315) % 18446744073709551616 +
+        (mixed.toNat * 16777216) % 18446744073709551616) % 18446744073709551616 +
+        (mixed.toNat * 315) / 18446744073709551616) % 18446744073709551616 := by
+    have word : (firstSum + (highProduct >>> (32 : UInt64))).toNat =
+        (firstSum.toNat + (highProduct >>> (32 : UInt64)).toNat) % 18446744073709551616 :=
+      uint64_add_value firstSum (highProduct >>> (32 : UInt64))
+    exact Eq.trans word (Eq.trans
+      (congrArg (fun v : Nat => (v + (highProduct >>> (32 : UInt64)).toNat) % 18446744073709551616) pairValue)
+      (congrArg (fun v : Nat => (((hi.toNat * 315) % 18446744073709551616 +
+        (mixed.toNat * 16777216) % 18446744073709551616) % 18446744073709551616 + v) % 18446744073709551616) finalCarry))
+  change (firstSum + (highProduct >>> (32 : UInt64))).toNat =
+    (hi.toNat * 315 + mixed.toNat * 16777216 + (mixed.toNat * 315) / 18446744073709551616) % 18446744073709551616
+  exact Eq.trans output (mod_add_three (hi.toNat * 315) (mixed.toNat * 16777216)
+    ((mixed.toNat * 315) / 18446744073709551616) 18446744073709551616 (by decide))
+
+theorem limbs_source_value (hi lo byte : UInt64) :
+    (trust_cg_fnv128_step_lo lo byte).toNat +
+      18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat =
+    ((hi.toNat * 18446744073709551616 + (lo ^^^ byte).toNat) *
+      309485009821345068724781371) % 340282366920938463463374607431768211456 := by
+  have low : (trust_cg_fnv128_step_lo lo byte).toNat =
+      ((lo ^^^ byte).toNat * 315) % 18446744073709551616 := low_source_value lo byte
+  have high : (trust_cg_fnv128_step_hi hi lo byte).toNat =
+      (hi.toNat * 315 + (lo ^^^ byte).toNat * 16777216 +
+        ((lo ^^^ byte).toNat * 315) / 18446744073709551616) % 18446744073709551616 :=
+    high_source_value hi lo byte
+  calc
+    (trust_cg_fnv128_step_lo lo byte).toNat +
+        18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat =
+      ((lo ^^^ byte).toNat * 315) % 18446744073709551616 +
+        18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat :=
+      congrArg (fun v : Nat => v + 18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat) low
+    _ = ((lo ^^^ byte).toNat * 315) % 18446744073709551616 +
+        18446744073709551616 * ((hi.toNat * 315 + (lo ^^^ byte).toNat * 16777216 +
+          ((lo ^^^ byte).toNat * 315) / 18446744073709551616) % 18446744073709551616) :=
+      congrArg (fun v : Nat => ((lo ^^^ byte).toNat * 315) % 18446744073709551616 + 18446744073709551616 * v) high
+    _ = ((hi.toNat * 18446744073709551616 + (lo ^^^ byte).toNat) *
+        309485009821345068724781371) % 340282366920938463463374607431768211456 :=
+      Eq.symm (multiply_split hi.toNat (lo ^^^ byte).toNat)
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem add_multiple_parts (k x a : Nat) (positive : 0 < a) :
+    (k * a + x) / a = k + x / a ∧ (k * a + x) % a = x % a := by
+  have representation : (k + x / a) * a + x % a = k * a + x := by
+    calc
+      (k + x / a) * a + x % a = (k * a + (x / a) * a) + x % a :=
+        congrArg (fun v : Nat => v + x % a) (add_mul_canonical k (x / a) a)
+      _ = k * a + ((x / a) * a + x % a) := Nat.add_assoc (k * a) ((x / a) * a) (x % a)
+      _ = k * a + x := congrArg (fun v : Nat => k * a + v) (division_identity x a)
+  have equation : (k + x / a) * a + x % a =
+      ((k * a + x) / a) * a + (k * a + x) % a :=
+    Eq.trans representation (Eq.symm (division_identity (k * a + x) a))
+  have small : x % a < a := @Nat.mod_lt x a positive
+  have actualSmall : (k * a + x) % a < a := @Nat.mod_lt (k * a + x) a positive
+  exact And.intro
+    (Eq.symm (quotient_unique (k + x / a) (x % a) ((k * a + x) / a)
+      ((k * a + x) % a) a equation small actualSmall))
+    (Eq.symm (remainder_unique (k + x / a) (x % a) ((k * a + x) / a)
+      ((k * a + x) % a) a equation small actualSmall))
+
+theorem bit_add_partition (a b n i : Nat) (bounded : b < 2^n) :
+    Nat.testBit (2^n * a + b) i =
+      (Nat.testBit (2^n * a) i || Nat.testBit b i) := by
+  induction n generalizing a b i with
+  | zero =>
+    have bz : b = 0 := @Nat.le_antisymm b 0
+      (@Nat.le_of_succ_le_succ b 0 bounded) (Nat.zero_le b)
+    have zeroBit : Nat.testBit 0 i = false := by
+      first
+      | exact Nat.testBit_zero_eq_false i
+      | exact Nat.zero_testBit i
+    rw [bz]
+    simp only [Nat.pow_zero, Nat.one_mul, Nat.add_zero, zeroBit]
+    cases h : Nat.testBit a i with
+    | false => rfl
+    | true => rfl
+  | succ n ih =>
+    have power : 2^(Nat.succ n) = 2^n * 2 := by rfl
+    have even : 2^(Nat.succ n) * a = (2^n * a) * 2 :=
+      Eq.trans (congrArg (fun v : Nat => v * a) power)
+        (swap_mul_right (2^n) 2 a)
+    have parts := add_multiple_parts (2^n * a) b 2 (by decide)
+    have evenParts := add_multiple_parts (2^n * a) 0 2 (by decide)
+    have evenDiv : ((2^n * a) * 2) / 2 = 2^n * a := by
+      simpa only [Nat.add_zero, Nat.zero_div] using evenParts.left
+    have evenMod : ((2^n * a) * 2) % 2 = 0 := by
+      simpa only [Nat.add_zero, Nat.zero_mod] using evenParts.right
+    have lowBound : b / 2 < 2^n :=
+      div_lt_product b 2 (2^n) (Eq.mp (congrArg (fun v : Nat => b < v) power) bounded)
+    rw [even]
+    cases i with
+    | zero =>
+      have sumBit : Nat.testBit (((2^n * a) * 2) + b) 0 = decide (b % 2 = 1) :=
+        Eq.trans (bit_zero_quotient (((2^n * a) * 2) + b))
+          (congrArg (fun v : Nat => decide (v = 1)) parts.right)
+      have highBit : Nat.testBit ((2^n * a) * 2) 0 = false :=
+        Eq.trans (bit_zero_quotient ((2^n * a) * 2))
+          (congrArg (fun v : Nat => decide (v = 1)) evenMod)
+      exact Eq.trans sumBit (Eq.symm (Eq.trans
+        (congrArg (fun v : Bool => v || Nat.testBit b 0) highBit)
+        (bit_zero_quotient b)))
+    | succ i =>
+      rw [bit_succ_quotient (((2^n * a) * 2) + b) i, parts.left,
+        bit_succ_quotient ((2^n * a) * 2) i, evenDiv, bit_succ_quotient b i]
+      exact ih a (b / 2) i lowBound
+
+theorem or_disjoint_limbs (a b n : Nat) (bounded : b < 2^n) :
+    Nat.lor (2^n * a) b = 2^n * a + b := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  exact Eq.trans (Nat.testBit_or (2^n * a) b i)
+    (Eq.symm (bit_add_partition a b n i bounded))
+
+theorem limbs_or_source_value (hi lo byte : UInt64) :
+    Nat.lor (18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat)
+      (trust_cg_fnv128_step_lo lo byte).toNat =
+    ((hi.toNat * 18446744073709551616 + (lo ^^^ byte).toNat) *
+      309485009821345068724781371) % 340282366920938463463374607431768211456 := by
+  have lowBound : (trust_cg_fnv128_step_lo lo byte).toNat < 18446744073709551616 := by
+    first
+    | exact UInt64.toNat_lt (trust_cg_fnv128_step_lo lo byte)
+    | exact UInt64.toNat_lt_size (trust_cg_fnv128_step_lo lo byte)
+  have disjoint : Nat.lor
+      (18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat)
+      (trust_cg_fnv128_step_lo lo byte).toNat =
+      18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat +
+        (trust_cg_fnv128_step_lo lo byte).toNat :=
+    or_disjoint_limbs (trust_cg_fnv128_step_hi hi lo byte).toNat
+      (trust_cg_fnv128_step_lo lo byte).toNat 64 lowBound
+  exact Eq.trans disjoint (Eq.trans
+    (Nat.add_comm (18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat)
+      (trust_cg_fnv128_step_lo lo byte).toNat)
+    (limbs_source_value hi lo byte))
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem uint64_from_nat_value (x : Nat) :
+    (UInt64.ofNat x).toNat = x % 18446744073709551616 := by
+  first
+  | rfl
+  | exact UInt64.toNat_ofNat x
+
+theorem split_state_or_value (x : Nat)
+    (bounded : x < 340282366920938463463374607431768211456) :
+    Nat.lor (18446744073709551616 *
+      (UInt64.ofNat (x / 18446744073709551616)).toNat)
+      (UInt64.ofNat x).toNat = x := by
+  have highBound : x / 18446744073709551616 < 18446744073709551616 :=
+    div_lt_product x 18446744073709551616 18446744073709551616 bounded
+  have highValue : (UInt64.ofNat (x / 18446744073709551616)).toNat =
+      x / 18446744073709551616 :=
+    Eq.trans (uint64_from_nat_value (x / 18446744073709551616))
+      (@Nat.mod_eq_of_lt (x / 18446744073709551616) 18446744073709551616 highBound)
+  have lowValue : (UInt64.ofNat x).toNat = x % 18446744073709551616 :=
+    uint64_from_nat_value x
+  have lowBound : (UInt64.ofNat x).toNat < 18446744073709551616 := by
+    first
+    | exact UInt64.toNat_lt (UInt64.ofNat x)
+    | exact UInt64.toNat_lt_size (UInt64.ofNat x)
+  have disjoint : Nat.lor (18446744073709551616 *
+      (UInt64.ofNat (x / 18446744073709551616)).toNat)
+      (UInt64.ofNat x).toNat =
+      18446744073709551616 * (UInt64.ofNat (x / 18446744073709551616)).toNat +
+        (UInt64.ofNat x).toNat :=
+    or_disjoint_limbs (UInt64.ofNat (x / 18446744073709551616)).toNat
+      (UInt64.ofNat x).toNat 64 lowBound
+  exact Eq.trans disjoint (Eq.trans
+    (congrArg (fun v : Nat => 18446744073709551616 * v + (UInt64.ofNat x).toNat) highValue)
+    (Eq.trans (congrArg (fun v : Nat => 18446744073709551616 *
+      (x / 18446744073709551616) + v) lowValue)
+      (Eq.trans (congrArg (fun v : Nat => v + x % 18446744073709551616)
+        (Nat.mul_comm 18446744073709551616 (x / 18446744073709551616)))
+        (division_identity x 18446744073709551616))))
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem xor_below_power (x y n : Nat) (xb : x < 2^n) (yb : y < 2^n) :
+    Nat.xor x y < 2^n := by
+  have unchanged : (Nat.xor x y) % 2^n = Nat.xor x y := by
+    apply Nat.eq_of_testBit_eq
+    intro i
+    have modX : x % 2^n = x := @Nat.mod_eq_of_lt x (2^n) xb
+    have modY : y % 2^n = y := @Nat.mod_eq_of_lt y (2^n) yb
+    have bitsX : Nat.testBit (x % 2^n) i = Nat.testBit x i :=
+      congrArg (fun v : Nat => Nat.testBit v i) modX
+    have bitsY : Nat.testBit (y % 2^n) i = Nat.testBit y i :=
+      congrArg (fun v : Nat => Nat.testBit v i) modY
+    have bitX : Nat.testBit x i = (decide (i < n) && Nat.testBit x i) :=
+      Eq.trans (Eq.symm bitsX) (bit_mod_pow x n i)
+    have bitY : Nat.testBit y i = (decide (i < n) && Nat.testBit y i) :=
+      Eq.trans (Eq.symm bitsY) (bit_mod_pow y n i)
+    have xored : Nat.testBit (Nat.xor x y) i =
+        (Bool.xor (Nat.testBit x i) (Nat.testBit y i)) := Nat.testBit_xor x y i
+    rw [bit_mod_pow, xored]
+    cases h : decide (i < n) with
+    | false =>
+      have lowX : Nat.testBit x i = false :=
+        Eq.trans bitX (congrArg (fun v : Bool => v && Nat.testBit x i) h)
+      have lowY : Nat.testBit y i = false :=
+        Eq.trans bitY (congrArg (fun v : Bool => v && Nat.testBit y i) h)
+      have bothBits : Bool.xor (Nat.testBit x i) (Nat.testBit y i) = false :=
+        Eq.trans (congrArg (fun v : Bool => Bool.xor v (Nat.testBit y i)) lowX)
+          (congrArg (fun v : Bool => Bool.xor false v) lowY)
+      exact Eq.trans (congrArg (fun v : Bool => false && v) bothBits) (Eq.symm bothBits)
+    | true => rfl
+  exact Eq.mp (congrArg (fun v : Nat => v < 2^n) unchanged)
+    (@Nat.mod_lt (Nat.xor x y) (2^n) (two_power_positive n))
+
+theorem uint64_xor_value (x y : UInt64) :
+    (x ^^^ y).toNat = Nat.xor x.toNat y.toNat := by
+  first
+  | exact UInt64.toNat_xor x y
+  | have raw : (x ^^^ y).toNat =
+        (Nat.xor x.toNat y.toNat) % 18446744073709551616 := by rfl
+    have xb : x.toNat < 18446744073709551616 := by
+      first
+      | exact UInt64.toNat_lt x
+      | exact UInt64.toNat_lt_size x
+    have yb : y.toNat < 18446744073709551616 := by
+      first
+      | exact UInt64.toNat_lt y
+      | exact UInt64.toNat_lt_size y
+    have bound : Nat.xor x.toNat y.toNat < 18446744073709551616 :=
+      xor_below_power x.toNat y.toNat 64 xb yb
+    exact Eq.trans raw (@Nat.mod_eq_of_lt (Nat.xor x.toNat y.toNat)
+      18446744073709551616 bound)
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem xor_state_partition (a b c n : Nat) (bb : b < 2^n) (cb : c < 2^n) :
+    Nat.xor (2^n * a + b) c = 2^n * a + Nat.xor b c := by
+  have xorBound : Nat.xor b c < 2^n := xor_below_power b c n bb cb
+  have parts := add_multiple_parts a 0 (2^n) (two_power_positive n)
+  have highRaw : (a * 2^n) % 2^n = 0 := by
+    simpa only [Nat.add_zero, Nat.zero_mod] using parts.right
+  have highComm : (2^n * a) % 2^n = (a * 2^n) % 2^n :=
+    @congrArg Nat Nat (2^n * a) (a * 2^n) (fun v : Nat => v % 2^n)
+      (Nat.mul_comm (2^n) a)
+  have highMod : (2^n * a) % 2^n = 0 := Eq.trans highComm highRaw
+  have modC : c % 2^n = c := @Nat.mod_eq_of_lt c (2^n) cb
+  have xorFalse : forall (v : Bool), Bool.xor v false = v := by
+    intro v
+    cases v <;> rfl
+  apply Nat.eq_of_testBit_eq
+  intro i
+  have zeroBit : Nat.testBit 0 i = false := by
+    first
+    | exact Nat.testBit_zero_eq_false i
+    | exact Nat.zero_testBit i
+  have highModBits : Nat.testBit ((2^n * a) % 2^n) i = Nat.testBit 0 i :=
+    congrArg (fun v : Nat => Nat.testBit v i) highMod
+  have highBits : (decide (i < n) && Nat.testBit (2^n * a) i) = false :=
+    Eq.trans (Eq.symm (bit_mod_pow (2^n * a) n i)) (Eq.trans highModBits zeroBit)
+  have bitsC : Nat.testBit (c % 2^n) i = Nat.testBit c i :=
+    congrArg (fun v : Nat => Nat.testBit v i) modC
+  have byteBits : Nat.testBit c i = (decide (i < n) && Nat.testBit c i) :=
+    Eq.trans (Eq.symm bitsC) (bit_mod_pow c n i)
+  have leftXor : Nat.testBit (Nat.xor (2^n * a + b) c) i =
+      Bool.xor (Nat.testBit (2^n * a + b) i) (Nat.testBit c i) :=
+    Nat.testBit_xor (2^n * a + b) c i
+  have lowXor : Nat.testBit (Nat.xor b c) i =
+      Bool.xor (Nat.testBit b i) (Nat.testBit c i) := Nat.testBit_xor b c i
+  have leftEquation : Nat.testBit (Nat.xor (2^n * a + b) c) i =
+      Bool.xor (Nat.testBit (2^n * a) i || Nat.testBit b i) (Nat.testBit c i) :=
+    Eq.trans leftXor (congrArg (fun v : Bool => Bool.xor v (Nat.testBit c i))
+      (bit_add_partition a b n i bb))
+  have rightEquation : Nat.testBit (2^n * a + Nat.xor b c) i =
+      (Nat.testBit (2^n * a) i || Bool.xor (Nat.testBit b i) (Nat.testBit c i)) :=
+    Eq.trans (bit_add_partition a (Nat.xor b c) n i xorBound)
+      (congrArg (fun v : Bool => Nat.testBit (2^n * a) i || v) lowXor)
+  have separate : Bool.xor (Nat.testBit (2^n * a) i || Nat.testBit b i) (Nat.testBit c i) =
+      (Nat.testBit (2^n * a) i || Bool.xor (Nat.testBit b i) (Nat.testBit c i)) := by
+    cases h : decide (i < n) with
+    | true =>
+      have highZero : Nat.testBit (2^n * a) i = false :=
+        Eq.trans (congrArg (fun v : Bool => v && Nat.testBit (2^n * a) i) (Eq.symm h)) highBits
+      exact Eq.trans
+        (congrArg (fun v : Bool => Bool.xor (v || Nat.testBit b i) (Nat.testBit c i)) highZero)
+        (Eq.symm (congrArg (fun v : Bool => v || Bool.xor (Nat.testBit b i) (Nat.testBit c i)) highZero))
+    | false =>
+      have byteZero : Nat.testBit c i = false :=
+        Eq.trans byteBits (congrArg (fun v : Bool => v && Nat.testBit c i) h)
+      exact Eq.trans
+        (congrArg (fun v : Bool => Bool.xor (Nat.testBit (2^n * a) i || Nat.testBit b i) v) byteZero)
+        (Eq.trans (xorFalse (Nat.testBit (2^n * a) i || Nat.testBit b i))
+          (Eq.trans (congrArg (fun v : Bool => Nat.testBit (2^n * a) i || v)
+            (Eq.symm (xorFalse (Nat.testBit b i))))
+            (congrArg (fun v : Bool => Nat.testBit (2^n * a) i || Bool.xor (Nat.testBit b i) v)
+              (Eq.symm byteZero))))
+  exact Eq.trans leftEquation (Eq.trans separate (Eq.symm rightEquation))
+
+end TrustCg.Fnv128Carry
+
+namespace TrustCg.Fnv128Carry
+
+theorem full_step_source_value (hi lo byte : UInt64) :
+    Nat.lor (18446744073709551616 * (trust_cg_fnv128_step_hi hi lo byte).toNat)
+      (trust_cg_fnv128_step_lo lo byte).toNat =
+    (Nat.xor (18446744073709551616 * hi.toNat + lo.toNat) byte.toNat *
+      309485009821345068724781371) % 340282366920938463463374607431768211456 := by
+  have lowBound : lo.toNat < 18446744073709551616 := by
+    first
+    | exact UInt64.toNat_lt lo
+    | exact UInt64.toNat_lt_size lo
+  have byteBound : byte.toNat < 18446744073709551616 := by
+    first
+    | exact UInt64.toNat_lt byte
+    | exact UInt64.toNat_lt_size byte
+  have stateXor : Nat.xor (18446744073709551616 * hi.toNat + lo.toNat) byte.toNat =
+      18446744073709551616 * hi.toNat + Nat.xor lo.toNat byte.toNat :=
+    xor_state_partition hi.toNat lo.toNat byte.toNat 64 lowBound byteBound
+  have mixed : (lo ^^^ byte).toNat = Nat.xor lo.toNat byte.toNat :=
+    uint64_xor_value lo byte
+  have inputValue : hi.toNat * 18446744073709551616 + (lo ^^^ byte).toNat =
+      Nat.xor (18446744073709551616 * hi.toNat + lo.toNat) byte.toNat := by
+    calc
+      hi.toNat * 18446744073709551616 + (lo ^^^ byte).toNat =
+          hi.toNat * 18446744073709551616 + Nat.xor lo.toNat byte.toNat :=
+        congrArg (fun v : Nat => hi.toNat * 18446744073709551616 + v) mixed
+      _ = 18446744073709551616 * hi.toNat + Nat.xor lo.toNat byte.toNat :=
+        congrArg (fun v : Nat => v + Nat.xor lo.toNat byte.toNat)
+          (Nat.mul_comm hi.toNat 18446744073709551616)
+      _ = Nat.xor (18446744073709551616 * hi.toNat + lo.toNat) byte.toNat :=
+        Eq.symm stateXor
+  exact Eq.trans (limbs_or_source_value hi lo byte)
+    (congrArg (fun v : Nat => (v * 309485009821345068724781371) %
+      340282366920938463463374607431768211456) inputValue)
+
+end TrustCg.Fnv128Carry

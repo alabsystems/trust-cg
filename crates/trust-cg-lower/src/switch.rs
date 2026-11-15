@@ -332,19 +332,43 @@ pub fn check_cascade_preserved(cases: &[(i64, Block)], default: Block) -> Result
 // Block and VReg allocation helpers
 // ---------------------------------------------------------------------------
 
-/// Allocate a fresh `Block` ID, inserting it into the function.
-fn alloc_block(func: &mut ISelFunction, next_block_id: &mut u32) -> Block {
-    let block = Block(*next_block_id);
-    *next_block_id += 1;
-    func.ensure_block(block);
-    block
+/// A fully allocated BST shape, built before changing the function.
+struct BinarySearchPlan {
+    block: Block,
+    children: Option<Box<(BinarySearchPlan, BinarySearchPlan)>>,
+}
+
+impl BinarySearchPlan {
+    fn build(
+        case_count: usize,
+        block: Block,
+        next: &mut u32,
+        reserved: &mut std::collections::HashSet<Block>,
+    ) -> Result<Self, ISelError> {
+        let children = if case_count <= LINEAR_SCAN_MAX {
+            None
+        } else {
+            let left = crate::isel::allocate_synthetic_block_id(next, |id| reserved.contains(&id))?;
+            reserved.insert(left);
+            let right =
+                crate::isel::allocate_synthetic_block_id(next, |id| reserved.contains(&id))?;
+            reserved.insert(right);
+            let mid = case_count / 2;
+            Some(Box::new((
+                Self::build(mid, left, next, reserved)?,
+                Self::build(case_count - mid - 1, right, next, reserved)?,
+            )))
+        };
+        Ok(Self { block, children })
+    }
 }
 
 /// Allocate a fresh `VReg` for constant materialization.
 fn alloc_vreg(func: &mut ISelFunction, class: RegClass) -> VReg {
-    let id = func.next_vreg;
-    func.next_vreg += 1;
-    VReg { id, class }
+    VReg {
+        id: func.alloc_vreg_id(),
+        class,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,15 +386,43 @@ fn emit_cmp(
     case_val: i64,
     is_32: bool,
 ) {
+    let case_reg = materialize_case_operand(func, block, case_val, is_32);
+    emit_cmp_against(func, block, selector, case_val, case_reg);
+}
+
+/// The CMP of `selector` against `case_val`, whose register (when it is not
+/// a 12-bit immediate) `materialize_case_operand` already defined.
+fn emit_cmp_against(
+    func: &mut ISelFunction,
+    block: Block,
+    selector: &ISelOperand,
+    case_val: i64,
+    case_reg: Option<VReg>,
+) {
+    let cmp = match case_reg {
+        None => ISelInst::new(
+            AArch64Opcode::CmpRI,
+            vec![selector.clone(), ISelOperand::Imm(case_val)],
+        ),
+        Some(tmp) => ISelInst::new(
+            AArch64Opcode::CmpRR,
+            vec![selector.clone(), ISelOperand::VReg(tmp)],
+        ),
+    };
+    func.push_inst(block, cmp);
+}
+
+/// Materialize `case_val` into a fresh register when `CmpRI`'s 12-bit
+/// unsigned immediate cannot hold it; `None` when it can.
+fn materialize_case_operand(
+    func: &mut ISelFunction,
+    block: Block,
+    case_val: i64,
+    is_32: bool,
+) -> Option<VReg> {
     let fits_imm12 = (0..=0xFFF).contains(&case_val);
     if fits_imm12 {
-        func.push_inst(
-            block,
-            ISelInst::new(
-                AArch64Opcode::CmpRI,
-                vec![selector.clone(), ISelOperand::Imm(case_val)],
-            ),
-        );
+        None
     } else {
         // Materialize into register, then CmpRR. A bare MOVZ only encodes a
         // 16-bit unsigned immediate, so it cannot represent a NEGATIVE case
@@ -394,13 +446,7 @@ fn emit_cmp(
             case_val as u64
         };
         emit_movz_movk_chain(func, block, tmp, bits);
-        func.push_inst(
-            block,
-            ISelInst::new(
-                AArch64Opcode::CmpRR,
-                vec![selector.clone(), ISelOperand::VReg(tmp)],
-            ),
-        );
+        Some(tmp)
     }
 }
 
@@ -478,8 +524,16 @@ fn emit_linear_scan_into(
     default: Block,
     mapping: &mut NormalizedMapping,
 ) {
-    for &(case_val, target) in cases {
-        emit_cmp(func, block, selector, case_val, is_32);
+    // Every case register is materialized before the first `B.EQ`: an
+    // instruction after a mid-block exit runs only on the paths that did not
+    // take it, yet GVN and CSE treat a value defined in this block as available
+    // in every block it dominates (see `select_switch_cascade` in isel.rs).
+    let case_regs: Vec<Option<VReg>> = cases
+        .iter()
+        .map(|&(case_val, _)| materialize_case_operand(func, block, case_val, is_32))
+        .collect();
+    for (&(case_val, target), case_reg) in cases.iter().zip(case_regs) {
+        emit_cmp_against(func, block, selector, case_val, case_reg);
 
         // B.EQ target
         func.push_inst(
@@ -543,17 +597,46 @@ pub fn emit_binary_search(
     let mut sorted_cases: Vec<(i64, Block)> = cases.to_vec();
     sorted_cases.sort_by_key(|(v, _)| *v);
 
+    // Reserve both materialized blocks and references to future blocks. The
+    // public emitter also accepts caller-provided cursors outside the selector's
+    // disjoint high range, so source targets must not become subtree blocks.
+    let mut reserved: std::collections::HashSet<Block> = func.blocks.keys().copied().collect();
+    reserved.extend(func.block_order.iter().copied());
+    reserved.extend(cases.iter().map(|(_, target)| *target));
+    reserved.extend([default, entry_block]);
+    for block in func.blocks.values() {
+        reserved.extend(block.successors.iter().copied());
+        for inst in &block.insts {
+            for operand in &inst.operands {
+                match operand {
+                    ISelOperand::Block(target) => {
+                        reserved.insert(*target);
+                    }
+                    ISelOperand::JumpTable { targets, .. } => {
+                        reserved.extend(targets.iter().copied())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for table in &func.jump_tables {
+        reserved.extend(table.targets.iter().copied());
+    }
+    let mut planned_next = *next_block_id;
+    let plan = BinarySearchPlan::build(cases.len(), entry_block, &mut planned_next, &mut reserved)?;
+    *next_block_id = planned_next;
+
     // Accumulate the value->target mapping the BST actually wires (pivot B.EQs
     // and leaf linear-scan B.EQs), plus the default every leaf falls through to.
     let mut mapping = NormalizedMapping::default();
     emit_bst_node(
         func,
-        next_block_id,
+        &plan,
         selector,
         is_32,
         &sorted_cases,
         default,
-        entry_block,
         &mut mapping,
     );
 
@@ -573,19 +656,19 @@ pub fn emit_binary_search(
 #[allow(clippy::too_many_arguments)]
 fn emit_bst_node(
     func: &mut ISelFunction,
-    next_block_id: &mut u32,
+    plan: &BinarySearchPlan,
     selector: &ISelOperand,
     is_32: bool,
     cases: &[(i64, Block)],
     default: Block,
-    block: Block,
     mapping: &mut NormalizedMapping,
 ) {
-    // Base case: small enough for linear scan.
-    if cases.len() <= LINEAR_SCAN_MAX {
+    let block = plan.block;
+    // The plan is derived from this exact sorted case count before emission.
+    let Some((left_plan, right_plan)) = plan.children.as_deref() else {
         emit_linear_scan_into(func, block, selector, is_32, cases, default, mapping);
         return;
-    }
+    };
 
     // Pick the median as pivot.
     let mid = cases.len() / 2;
@@ -597,9 +680,10 @@ fn emit_bst_node(
     let left_cases = &cases[..mid];
     let right_cases = &cases[mid + 1..];
 
-    // Allocate blocks for left and right subtrees.
-    let left_block = alloc_block(func, next_block_id);
-    let right_block = alloc_block(func, next_block_id);
+    let left_block = left_plan.block;
+    let right_block = right_plan.block;
+    func.ensure_block(left_block);
+    func.ensure_block(right_block);
 
     // Emit CMP selector, pivot_val
     emit_cmp(func, block, selector, pivot_val, is_32);
@@ -664,14 +748,7 @@ fn emit_bst_node(
         }
     } else {
         emit_bst_node(
-            func,
-            next_block_id,
-            selector,
-            is_32,
-            left_cases,
-            default,
-            left_block,
-            mapping,
+            func, left_plan, selector, is_32, left_cases, default, mapping,
         );
     }
 
@@ -689,12 +766,11 @@ fn emit_bst_node(
     } else {
         emit_bst_node(
             func,
-            next_block_id,
+            right_plan,
             selector,
             is_32,
             right_cases,
             default,
-            right_block,
             mapping,
         );
     }
@@ -732,16 +808,33 @@ pub fn emit_jump_table(
     default: Block,
     entry_block: Block,
 ) -> Result<(), ISelError> {
-    assert!(!cases.is_empty(), "Jump table requires at least one case");
-
-    let min_val = cases.iter().map(|(v, _)| *v).min().unwrap();
-    let max_val = cases.iter().map(|(v, _)| *v).max().unwrap();
-    let range = max_val - min_val;
+    let invalid = |reason: &str| ISelError::SwitchNormalizationMismatch {
+        strategy: "JumpTable",
+        reason: reason.into(),
+    };
+    let Some(((first, _), rest)) = cases.split_first() else {
+        return Err(invalid("jump table requires at least one case"));
+    };
+    let (min_val, max_val) = rest
+        .iter()
+        .fold((*first, *first), |(min, max), (value, _)| {
+            (min.min(*value), max.max(*value))
+        });
+    let range = max_val
+        .checked_sub(min_val)
+        .ok_or_else(|| invalid("jump-table span exceeds signed 64-bit indexing"))?;
+    let target_count = usize::try_from(range)
+        .ok()
+        .and_then(|range| range.checked_add(1))
+        .ok_or_else(|| invalid("jump-table extent exceeds the host address space"))?;
 
     // Build the dense targets vector: for each index 0..=range,
     // map to the case target if one exists, otherwise to the default block.
     let case_map: HashMap<i64, Block> = cases.iter().cloned().collect();
-    let mut targets = Vec::with_capacity((range + 1) as usize);
+    let mut targets = Vec::new();
+    targets
+        .try_reserve_exact(target_count)
+        .map_err(|_| invalid("jump-table target storage cannot be allocated"))?;
     for i in 0..=range {
         let val = min_val + i;
         targets.push(*case_map.get(&val).unwrap_or(&default));
@@ -935,6 +1028,64 @@ mod tests {
     use super::*;
     use crate::function::Signature;
 
+    #[test]
+    fn binary_search_exhaustion_rejects_before_allocating_or_emitting() {
+        let (mut func, _) = make_test_func();
+        let mut next = u32::MAX - 1;
+        let selector = ISelOperand::VReg(VReg::new(0, RegClass::Gpr64));
+        let cases = [
+            (1, Block(1)),
+            (20, Block(2)),
+            (50, Block(3)),
+            (100, Block(4)),
+        ];
+        assert!(matches!(
+            emit_binary_search(
+                &mut func,
+                &mut next,
+                &selector,
+                false,
+                &cases,
+                Block(5),
+                Block(0)
+            ),
+            Err(ISelError::SyntheticBlockIdExhausted)
+        ));
+        assert_eq!(next, u32::MAX - 1);
+        assert!(func.blocks.is_empty());
+        assert!(func.block_order.is_empty());
+        assert_eq!(func.next_vreg, 0);
+    }
+
+    #[test]
+    fn binary_search_never_allocates_over_future_source_targets() {
+        let (mut func, _) = make_test_func();
+        let mut next = 0;
+        let selector = ISelOperand::VReg(VReg::new(0, RegClass::Gpr64));
+        let cases = [
+            (1, Block(1)),
+            (20, Block(2)),
+            (50, Block(3)),
+            (100, Block(4)),
+        ];
+        emit_binary_search(
+            &mut func,
+            &mut next,
+            &selector,
+            false,
+            &cases,
+            Block(5),
+            Block(0),
+        )
+        .unwrap();
+        assert_eq!(next, 8);
+        assert!(func.blocks.contains_key(&Block(6)));
+        assert!(func.blocks.contains_key(&Block(7)));
+        for target in 1..=5 {
+            assert!(!func.blocks.contains_key(&Block(target)));
+        }
+    }
+
     fn make_test_func() -> (ISelFunction, u32) {
         let sig = Signature {
             params: vec![],
@@ -943,6 +1094,38 @@ mod tests {
         let func = ISelFunction::new("test_switch".to_string(), sig);
         // Reserve block IDs 0-20 for test targets; BST intermediate blocks start at 100.
         (func, 100)
+    }
+
+    #[test]
+    fn jump_table_rejects_empty_overflowing_and_unallocatable_extents_before_mutation() {
+        for cases in [
+            vec![],
+            vec![(i64::MIN, Block(1)), (i64::MAX, Block(2))],
+            vec![(0, Block(1)), (i64::MAX, Block(2))],
+        ] {
+            let (mut function, mut next_block) = make_test_func();
+            let selector = ISelOperand::VReg(VReg::new(0, RegClass::Gpr64));
+            let result = emit_jump_table(
+                &mut function,
+                &mut next_block,
+                &selector,
+                false,
+                &cases,
+                Block(3),
+                Block(0),
+            );
+            assert!(matches!(
+                result,
+                Err(ISelError::SwitchNormalizationMismatch {
+                    strategy: "JumpTable",
+                    ..
+                })
+            ));
+            assert!(function.blocks.is_empty());
+            assert!(function.jump_tables.is_empty());
+            assert_eq!(function.next_vreg, 0);
+            assert_eq!(next_block, 100);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1049,6 +1232,60 @@ mod tests {
         let last = insts.last().unwrap();
         assert_eq!(last.opcode, AArch64Opcode::B);
         assert_eq!(last.operands[0], ISelOperand::Block(Block(3)));
+    }
+
+    #[test]
+    fn linear_scan_defines_every_case_register_before_its_first_exit() {
+        // GVN and CSE treat a value defined in a block as available in every
+        // block it dominates, which a value defined after a mid-block `B.EQ`
+        // is not (see `select_switch_cascade` in isel.rs).
+        let (mut func, _) = make_test_func();
+        let entry = Block(0);
+        for block in 0..=5 {
+            func.ensure_block(Block(block));
+        }
+        let selector = ISelOperand::VReg(VReg::new(0, RegClass::Gpr64));
+        emit_linear_scan(
+            &mut func,
+            entry,
+            &selector,
+            false,
+            &[
+                (7, Block(1)),
+                (65535, Block(2)),
+                (0x1_0000, Block(3)),
+                (-3, Block(4)),
+            ],
+            Block(5),
+        )
+        .unwrap();
+        let insts = &func.blocks[&entry].insts;
+        let first_exit = insts
+            .iter()
+            .position(|i| i.opcode == AArch64Opcode::BCond)
+            .expect("the scan branches");
+        assert!(
+            insts
+                .iter()
+                .take(first_exit)
+                .any(|i| i.opcode == AArch64Opcode::Movz),
+            "the out-of-range cases need registers"
+        );
+        for (pos, inst) in insts.iter().enumerate().skip(first_exit) {
+            assert!(
+                !matches!(inst.opcode, AArch64Opcode::Movz | AArch64Opcode::Movk),
+                "{:?} at {pos} defines a case register after the first B.EQ (at {first_exit})",
+                inst.opcode
+            );
+        }
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|i| i.opcode == AArch64Opcode::CmpRR)
+                .count(),
+            3,
+            "65535, 0x1_0000 and -3 are compared against registers"
+        );
     }
 
     // Regression (#366-class): a NEGATIVE case value must be materialized via a

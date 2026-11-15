@@ -49,6 +49,7 @@ fn jit_run(m: &trust_ir::Module, opt: OptLevel, fast: bool, row: &[i64; 4]) -> R
 
     let compiled = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         Compiler::new(cfg)
+            .with_codegen_license(permit_unlicensed())
             .compile_module_to_jit(m, &ext)
             .map_err(Box::new)
     }));
@@ -140,7 +141,7 @@ fn build_arith(nty: Ty, op: BinOp, widen_signed: bool) -> trust_ir::Module {
     };
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 2: trunc -> store to alloca of narrow type -> reload -> normalizing
@@ -173,7 +174,7 @@ fn build_alloca_roundtrip(nty: Ty, widen_signed: bool) -> trust_ir::Module {
     };
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 3: pure trunc/zext/sext round-trip with NO normalizing binop after
@@ -200,7 +201,7 @@ fn build_pure_roundtrip(nty: Ty, widen_signed: bool) -> trust_ir::Module {
     };
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 4: multi-step narrow ladder: i64 -> trunc to nty -> narrow ops ->
@@ -237,7 +238,7 @@ fn build_ladder(wide_ty: Ty, narrow_ty: Ty, mix_signed: bool) -> trust_ir::Modul
     };
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Shape 5: zext-narrow then signed compare via icmp, materializing a bool to
@@ -279,7 +280,7 @@ fn build_cmp(nty: Ty, signed_cmp: bool) -> trust_ir::Module {
     let wide = fb.sext(nty.clone(), Ty::I64, sel);
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +422,7 @@ fn build_min_signed_op(nty: Ty, op: BinOp) -> trust_ir::Module {
     let wide = fb.sext(nty.clone(), Ty::I64, r);
     fb.ret(vec![wide]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// CONFIRMED MISCOMPILE (narrow signed SDiv / SRem / AShr on i8 & i16).
@@ -636,4 +637,13 @@ fn diff_narrow_int_sweep() {
         "narrow_int found {} defects",
         sweep.defects.len()
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

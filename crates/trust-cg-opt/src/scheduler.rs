@@ -64,8 +64,8 @@ use trust_cg_ir::{
 };
 
 use crate::effects::{
-    aarch64_for_each_def_position, aarch64_for_each_use_position, opcode_effect, reads_flags,
-    writes_flags,
+    aarch64_for_each_def_position, aarch64_for_each_use_position, may_clobber_nzcv, opcode_effect,
+    reads_nzcv,
 };
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -121,7 +121,7 @@ pub fn opcode_latency(opcode: AArch64Opcode) -> (u32, ExecutionPort) {
         AddTprelHi12 | AddTprelLo12 => (1, ExecutionPort::IntAlu),
         AddsRR | AddsRI | SubsRR | SubsRI => (1, ExecutionPort::IntAlu),
         // i128 multi-register: ADC/SBC are 1-cycle ALU, UMULH/MADD are 3-cycle multiply
-        Adc | Sbc => (1, ExecutionPort::IntAlu),
+        Adc | Sbc | Adcs | Sbcs => (1, ExecutionPort::IntAlu),
         Umulh | Smulh | Madd => (3, ExecutionPort::IntMul),
 
         // Integer multiply: 3 cycles
@@ -130,10 +130,15 @@ pub fn opcode_latency(opcode: AArch64Opcode) -> (u32, ExecutionPort) {
         // Integer divide: 10 cycles
         SDiv | UDiv => (10, ExecutionPort::IntDiv),
 
+        // FEAT_CRC32: 3 cycles on a complex-integer pipe.
+        Crc32B | Crc32H | Crc32W | Crc32X | Crc32Cb | Crc32Ch | Crc32Cw | Crc32Cx => {
+            (3, ExecutionPort::IntMul)
+        }
+
         // Loads: 4 cycles (L1 hit)
         LdrRI | LdrPreIndex | LdrPostIndex | LdrbRI | LdrhRI | LdrsbRI | LdrshRI | LdrRO
         | LdrbRO | LdrhRO | LdrswRO | LdrLiteral | LdpRI | LdpPostIndex | LdrGot | LdrTlvp
-        | LdrGottprel => (4, ExecutionPort::LoadStore),
+        | LdrGottprel | LdrTlsdesc => (4, ExecutionPort::LoadStore),
         // Volatile loads/stores: same port/latency as plain (the barrier effect
         // that keeps them from being reordered lives in the effects model).
         VolatileLdrRI | VolatileLdrbRI | VolatileLdrhRI => (4, ExecutionPort::LoadStore),
@@ -157,7 +162,7 @@ pub fn opcode_latency(opcode: AArch64Opcode) -> (u32, ExecutionPort) {
         // FMADD fused multiply-add: 4-cycle FP mul/FMA unit.
         FmaddRR => (4, ExecutionPort::FpAlu),
         FminnmRR | FmaxnmRR => (3, ExecutionPort::FpAlu),
-        FrintmRR | FrintpRR | FrintzRR => (3, ExecutionPort::FpAlu),
+        FrintnRR | FrintmRR | FrintpRR | FrintzRR => (3, ExecutionPort::FpAlu),
         FsqrtRR => (12, ExecutionPort::FpAlu),
         FcvtzsRR | FcvtzuRR | ScvtfRR | UcvtfRR => (3, ExecutionPort::FpAlu),
         FcvtSD | FcvtDS | FcvtHS | FcvtHD | FcvtSH | FcvtDH => (3, ExecutionPort::FpAlu),
@@ -240,6 +245,21 @@ pub fn opcode_latency(opcode: AArch64Opcode) -> (u32, ExecutionPort) {
         // Atomic stores: 2 cycles (like regular store + ordering)
         Stlr | Stlrb | Stlrh | Stlxr => (2, ExecutionPort::LoadStore),
 
+        // Baseline exclusives (post-RA expansion output only) and CLREX.
+        Ldxr | Ldxrb | Ldxrh | Ldaxrb | Ldaxrh | Ldxp | Ldaxp => (4, ExecutionPort::LoadStore),
+        Stxr | Stxrb | Stxrh | Stlxrb | Stlxrh | Stxp | Stlxp => (2, ExecutionPort::LoadStore),
+        Clrex => (1, ExecutionPort::LoadStore),
+
+        // Opaque LL/SC pseudos: an uncontended load-exclusive, ALU step,
+        // store-exclusive and retry branch. Full barriers in the effect model.
+        LlscRmw8 | LlscRmw16 | LlscRmw32 | LlscRmw64 => (10, ExecutionPort::LoadStore),
+        LlscCmpSwap8 | LlscCmpSwap16 | LlscCmpSwap32 | LlscCmpSwap64 => {
+            (12, ExecutionPort::LoadStore)
+        }
+        LlscLoad128 | LlscStore128 => (10, ExecutionPort::LoadStore),
+        LlscRmw128 => (12, ExecutionPort::LoadStore),
+        LlscCmpSwap128 => (14, ExecutionPort::LoadStore),
+
         // Atomic RMW (LSE): 6 cycles
         Ldadd | Ldadda | Ldaddal | Ldaddl | Ldclr | Ldclra | Ldclral | Ldclrl | Ldeor | Ldeora
         | Ldeoral | Ldeorl | Ldset | Ldseta | Ldsetal | Ldsetl | Ldsmax | Ldsmaxa | Ldsmaxal
@@ -268,6 +288,11 @@ pub fn opcode_latency(opcode: AArch64Opcode) -> (u32, ExecutionPort) {
         // Emission-time alignment padding (never present when the scheduler
         // runs; entry exists for totality).
         AlignNop => (1, ExecutionPort::IntAlu),
+
+        // TLSDESC: the unexpanded call sequence is a call; the expanded
+        // descriptor add and resolver call exist only after scheduling.
+        TlsDescCall | BlrTlsdesc => (1, ExecutionPort::Branch),
+        AddTlsdescLo12 => (1, ExecutionPort::IntAlu),
     }
 }
 
@@ -549,11 +574,127 @@ fn memory_accesses_must_stay_ordered(prior: &MachInst, current: &MachInst) -> bo
     true
 }
 
-fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG {
-    let n = inst_ids.len();
+/// Collects the DAG's edges, each once.
+trait EdgeCollector {
+    fn with_nodes(n: usize) -> Self;
+    /// Record `from -> to` unless it is a self edge or already recorded.
+    fn add(&mut self, from: usize, to: usize);
+    /// The recorded edges, in the order the DAG's dependency lists take them.
+    fn into_edges(self) -> Vec<(usize, usize)>;
+}
 
-    // Create nodes.
-    let mut nodes: Vec<ScheduleNode> = Vec::with_capacity(n);
+/// The production collector: a bit per node pair (a hash set above
+/// [`DenseEdges::MAX_DENSE_NODES`]), and the edges in first-insertion order.
+///
+/// It records exactly the edge set the previous `HashSet<(usize, usize)>`
+/// did; only the order of each node's `deps` / `rev_deps` differs (insertion
+/// order instead of hash-table order), and no consumer of a `ScheduleDAG`
+/// depends on that order: priorities are longest paths over a topological
+/// order, the list schedulers update each successor independently and pick
+/// from a ready set totally ordered by (priority, pressure, index), and the
+/// forced-order check, hazard counts and dual-issue hints treat the lists as
+/// sets. A call or barrier is ordered against every instruction of its
+/// region, so a call-dense region has quadratically many edges, and the
+/// hash set's inserts and rehashes were 80% of building its DAG.
+///
+/// The scheduling passes build [`build_scheduling_dag_for_insts`]'s segmented
+/// DAG, with one collector per barrier-free segment whose edge count is linear
+/// in the segment's size. Each matrix is dropped before the next segment's is
+/// allocated, so the matrices add at most 8 MiB to peak memory.
+struct DenseEdges {
+    n: usize,
+    bits: Vec<u64>,
+    sparse: Option<HashSet<(usize, usize)>>,
+    order: Vec<(usize, usize)>,
+}
+
+impl DenseEdges {
+    /// 8,192 nodes: an 8 MiB bit matrix.
+    const MAX_DENSE_NODES: usize = 8192;
+}
+
+impl EdgeCollector for DenseEdges {
+    fn with_nodes(n: usize) -> Self {
+        let dense = n <= Self::MAX_DENSE_NODES;
+        Self {
+            n,
+            bits: if dense {
+                vec![0u64; (n * n).div_ceil(64)]
+            } else {
+                Vec::new()
+            },
+            sparse: (!dense).then(HashSet::default),
+            order: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        let fresh = match &mut self.sparse {
+            Some(set) => set.insert((from, to)),
+            None => {
+                let bit = from * self.n + to;
+                let word = &mut self.bits[bit / 64];
+                let mask = 1u64 << (bit % 64);
+                let fresh = *word & mask == 0;
+                *word |= mask;
+                fresh
+            }
+        };
+        if fresh {
+            self.order.push((from, to));
+        }
+    }
+
+    fn into_edges(self) -> Vec<(usize, usize)> {
+        self.order
+    }
+}
+
+/// The collector the DAG builder used before [`DenseEdges`], kept as the
+/// tests' oracle: a hash set, whose iteration order the lists took.
+#[cfg(test)]
+struct HashSetEdges(HashSet<(usize, usize)>);
+
+#[cfg(test)]
+impl EdgeCollector for HashSetEdges {
+    fn with_nodes(_n: usize) -> Self {
+        Self(HashSet::default())
+    }
+
+    fn add(&mut self, from: usize, to: usize) {
+        if from != to {
+            self.0.insert((from, to));
+        }
+    }
+
+    fn into_edges(self) -> Vec<(usize, usize)> {
+        self.0.into_iter().collect()
+    }
+}
+
+fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG {
+    build_dag_for_insts_with::<DenseEdges>(func, inst_ids)
+}
+
+fn build_dag_for_insts_with<E: EdgeCollector>(
+    func: &MachFunction,
+    inst_ids: &[InstId],
+) -> ScheduleDAG {
+    let edges = dependency_edges::<E>(func, inst_ids, MemoryOrderEdges::AllPairs);
+    assemble_dag(func, inst_ids, edges)
+}
+
+/// Create one node per instruction, attach `edges` as `deps`/`rev_deps` in
+/// the order given, and compute critical-path priorities.
+fn assemble_dag(
+    func: &MachFunction,
+    inst_ids: &[InstId],
+    edges: impl IntoIterator<Item = (usize, usize)>,
+) -> ScheduleDAG {
+    let mut nodes: Vec<ScheduleNode> = Vec::with_capacity(inst_ids.len());
     for &inst_id in inst_ids {
         let inst = func.inst(inst_id);
         let (latency, port) = opcode_latency(inst.opcode);
@@ -569,13 +710,155 @@ fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG 
         });
     }
 
-    // Helper: add edge from `from` to `to` (from must execute before to).
-    let mut edges: HashSet<(usize, usize)> = HashSet::default();
-    let add_edge = |from: usize, to: usize, edges: &mut HashSet<(usize, usize)>| {
-        if from != to && edges.insert((from, to)) {
-            // edges set prevents duplicates; actual deps/rev_deps updated below
+    for (from, to) in edges {
+        nodes[to].deps.push(from);
+        nodes[from].rev_deps.push(to);
+    }
+
+    let mut dag = ScheduleDAG { nodes };
+    dag.compute_priorities();
+    dag
+}
+
+/// Whether `inst` is ordered after EVERY earlier instruction of its region and
+/// before EVERY later one: a call, an opcode-modeled barrier (steps 3a of
+/// [`dependency_edges`]) or a terminator (step 4).
+fn is_full_scheduling_barrier(inst: &MachInst) -> bool {
+    inst.flags.contains(InstFlags::IS_CALL)
+        || opcode_effect(inst.opcode).is_barrier()
+        || inst.flags.contains(InstFlags::IS_TERMINATOR)
+}
+
+/// The scheduling DAG for one region, with `O(n)` barrier and memory-order
+/// edges instead of `O(n^2)`.
+///
+/// # Why this exists
+///
+/// [`build_dag_for_insts`] materializes two rules pair by pair. Step 3a gives
+/// every call or barrier an edge from EVERY earlier instruction and to EVERY
+/// later one, so a region with `c` calls and `n` instructions stores
+/// `O(c * n)` edges, and the pairwise steps (physical registers, fixed-PReg
+/// anti-dependencies, memory order) compare instructions across every call.
+/// Step 2 orders every memory access after every earlier one it may alias, so
+/// a region of `m` stores stores `m * (m - 1) / 2` edges. Measured on the
+/// `scale_gate.py` `xlarge` crate (2,400 functions, whose `main` is one
+/// block of 2,400 calls), the pressure-aware scheduler on that single block
+/// took most of a 26 s compile and 9 GB of peak RSS (L14-P6).
+///
+/// # What it builds instead
+///
+/// Full barriers (calls, opcode barriers, terminators) split the region into
+/// segments. Each segment's edges come from [`dependency_edges`] run on that
+/// segment alone, with step 2 in its [`MemoryOrderEdges::Reduced`] form. Each
+/// barrier gets edges from the nodes of the segment just before it and from
+/// the previous barrier, and edges to the nodes of the segment just after it.
+///
+/// # Why every schedule is unchanged
+///
+/// 1. **Same in-segment rules.** Every rule of [`dependency_edges`] except
+///    step 2 either relates a pair by the two instructions alone (physical
+///    registers, fixed-PReg anti-dependencies, the use-before-def pairs of
+///    the WAR rule) or chains consecutive accesses (latest reaching def,
+///    consecutive defs, NZCV and side-effect chains). Both give the same
+///    pairs on a contiguous segment as on the whole region. The second WAR
+///    rule only adds use-before-def pairs, which the first WAR rule already
+///    contains. Step 2 keeps a subset of its all-pairs edges (see (2)).
+/// 2. **Same partial order.** Every kept edge is an edge of the full DAG, and
+///    every dropped edge `u -> w` is implied by a kept path `u -> v -> .. -> w`:
+///    through the barrier chain for an edge that crosses a barrier, through
+///    the chain of total memory accesses for a reduced memory edge.
+/// 3. **Same priorities.** A dropped successor `w` of `u` is reached from `u`
+///    through a kept successor `v`, and every latency is at least 1, so
+///    `priority(v) > priority(w)`. The longest-path maximum is unchanged.
+/// 4. **Same readiness and start cycles.** A dropped predecessor `u` of `w`
+///    reaches `w` through a kept predecessor `v`, which is scheduled after `u`
+///    and finishes no earlier than `u` does. So `w` becomes ready on the same
+///    step, when its last predecessor is scheduled, with the same
+///    `earliest_start`.
+/// 5. **Same selection.** The ready-set keys are `(priority, index)` and
+///    `(net pressure, priority, index)`. Net pressure and the live-set
+///    tracker read instructions, never edges.
+///
+/// `schedule_forced_original_order` admits a region only when its unique
+/// topological order is the original order, which (2) makes a property of
+/// the partial order. Both DAGs then emit the original order with the same
+/// pressure replay. `scheduling_dag_matches_full_dag_schedules` in the unit
+/// tests checks the equality differentially.
+fn build_scheduling_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG {
+    let n = inst_ids.len();
+    let barriers: Vec<usize> = inst_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &inst_id)| is_full_scheduling_barrier(func.inst(inst_id)).then_some(idx))
+        .collect();
+
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let mut segment_start = 0usize;
+    let mut previous_barrier: Option<usize> = None;
+    for boundary in barriers.iter().copied().chain(std::iter::once(n)) {
+        // The segment `segment_start..boundary` holds no barrier.
+        if boundary > segment_start + 1 {
+            edges.extend(
+                dependency_edges::<DenseEdges>(
+                    func,
+                    &inst_ids[segment_start..boundary],
+                    MemoryOrderEdges::Reduced,
+                )
+                .into_iter()
+                .map(|(from, to)| (from + segment_start, to + segment_start)),
+            );
         }
-    };
+        if let Some(barrier) = previous_barrier {
+            edges.extend((segment_start..boundary).map(|later| (barrier, later)));
+        }
+        if boundary < n {
+            edges.extend((segment_start..boundary).map(|earlier| (earlier, boundary)));
+            if let Some(barrier) = previous_barrier {
+                edges.push((barrier, boundary));
+            }
+            previous_barrier = Some(boundary);
+        }
+        segment_start = boundary + 1;
+    }
+    assemble_dag(func, inst_ids, edges)
+}
+
+/// How [`dependency_edges`] spells step 2, the memory-order edges.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemoryOrderEdges {
+    /// One edge per ordered pair of memory accesses: the full DAG
+    /// [`build_dag`] exposes.
+    AllPairs,
+    /// The same partial order through `O(accesses)` edges (see the
+    /// `Reduced` arm). A block of `m` stores holds `m * (m - 1) / 2`
+    /// all-pairs edges.
+    Reduced,
+}
+
+/// Whether step 2 orders `inst` as a memory access.
+fn is_memory_access(inst: &MachInst) -> bool {
+    let effect = opcode_effect(inst.opcode);
+    effect.reads_memory()
+        || inst.flags.contains(InstFlags::READS_MEMORY)
+        || effect.writes_memory()
+        || inst.flags.contains(InstFlags::WRITES_MEMORY)
+        || effect.is_barrier()
+        || inst.flags.contains(InstFlags::IS_CALL)
+}
+
+/// Every dependency edge `(from, to)` of one scheduling region, indexed by
+/// position in `inst_ids`, each once, in the order `E` hands them over;
+/// `from < to` for every edge.
+fn dependency_edges<E: EdgeCollector>(
+    func: &MachFunction,
+    inst_ids: &[InstId],
+    memory_order: MemoryOrderEdges,
+) -> Vec<(usize, usize)> {
+    let n = inst_ids.len();
+
+    // Helper: add edge from `from` to `to` (from must execute before to).
+    let mut edges = E::with_nodes(n);
+    let add_edge = |from: usize, to: usize, edges: &mut E| edges.add(from, to);
 
     // Build VReg def list: vreg -> sorted list of node indices where the
     // vreg is defined. Most value-producing instructions define operand 0;
@@ -924,28 +1207,58 @@ fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG 
     // StrRI -> LdrRI when the byte ranges are statically disjoint. Keep
     // overlapping ranges, unknown ranges, stores, calls, barriers, atomics,
     // writeback forms, and unproven memory operations ordered as before.
-    let mut memory_accesses: Vec<usize> = Vec::new();
-
-    for (idx, &inst_id) in inst_ids.iter().enumerate() {
-        let inst = func.inst(inst_id);
-        let flags = inst.flags;
-        let effect = opcode_effect(inst.opcode);
-
-        let is_load = effect.reads_memory() || flags.contains(InstFlags::READS_MEMORY);
-        let is_store = effect.writes_memory() || flags.contains(InstFlags::WRITES_MEMORY);
-        let is_barrier = effect.is_barrier() || flags.contains(InstFlags::IS_CALL);
-
-        if !(is_load || is_store || is_barrier) {
-            continue;
-        }
-
-        for &prior_idx in &memory_accesses {
-            let prior = func.inst(inst_ids[prior_idx]);
-            if memory_accesses_must_stay_ordered(prior, inst) {
-                add_edge(prior_idx, idx, &mut edges);
+    match memory_order {
+        MemoryOrderEdges::AllPairs => {
+            let mut memory_accesses: Vec<usize> = Vec::new();
+            for (idx, &inst_id) in inst_ids.iter().enumerate() {
+                let inst = func.inst(inst_id);
+                if !is_memory_access(inst) {
+                    continue;
+                }
+                for &prior_idx in &memory_accesses {
+                    let prior = func.inst(inst_ids[prior_idx]);
+                    if memory_accesses_must_stay_ordered(prior, inst) {
+                        add_edge(prior_idx, idx, &mut edges);
+                    }
+                }
+                memory_accesses.push(idx);
             }
         }
-        memory_accesses.push(idx);
+        MemoryOrderEdges::Reduced => {
+            // Every access except a proof-reorderable ordinary load (PRL) is
+            // a TOTAL access: `memory_accesses_must_stay_ordered(p, x)` holds
+            // for every earlier access `p`, because both exceptions need the
+            // later access to be a PRL (a proven `LdrRI` is one). The total
+            // accesses therefore form a chain, and an edge from an earlier
+            // access to a later total access is implied by the chain. A PRL
+            // is never ordered after another PRL, so its predecessors are
+            // total accesses, and the latest one it must stay ordered after
+            // implies every earlier one.
+            let mut total_accesses: Vec<usize> = Vec::new();
+            let mut loads_since_total: Vec<usize> = Vec::new();
+            for (idx, &inst_id) in inst_ids.iter().enumerate() {
+                let inst = func.inst(inst_id);
+                if !is_memory_access(inst) {
+                    continue;
+                }
+                if is_proof_reorderable_ordinary_load(inst.opcode, inst.flags) {
+                    if let Some(&prior_idx) = total_accesses.iter().rev().find(|&&prior_idx| {
+                        memory_accesses_must_stay_ordered(func.inst(inst_ids[prior_idx]), inst)
+                    }) {
+                        add_edge(prior_idx, idx, &mut edges);
+                    }
+                    loads_since_total.push(idx);
+                } else {
+                    if let Some(&prior_idx) = total_accesses.last() {
+                        add_edge(prior_idx, idx, &mut edges);
+                    }
+                    for prior_idx in loads_since_total.drain(..) {
+                        add_edge(prior_idx, idx, &mut edges);
+                    }
+                    total_accesses.push(idx);
+                }
+            }
+        }
     }
 
     // 2b. NZCV flag dependencies: flag-writing instructions (CMP, TST, ADDS,
@@ -956,14 +1269,16 @@ fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG 
     //     These dependencies are not captured by explicit operands. A later
     //     flag writer must not move between an earlier writer and its reader,
     //     so serialize all NZCV accesses in program order while allowing
-    //     unrelated non-flag instructions to schedule around them.
+    //     unrelated non-flag instructions to schedule around them. A writer
+    //     here is anything that MAY change NZCV (`may_clobber_nzcv`), not
+    //     only an architectural flag writer: a dynamic `StackAlloc` expands
+    //     after scheduling into a probe loop that compares, and an exact trap
+    //     carrier into its own `CMP; B.cc; BRK`.
     {
         let mut last_flag_access: Option<usize> = None;
         for (idx, &inst_id) in inst_ids.iter().enumerate() {
             let inst = func.inst(inst_id);
-            let touches_flags = writes_flags(inst.opcode)
-                || reads_flags(inst.opcode)
-                || matches!(inst.opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc);
+            let touches_flags = may_clobber_nzcv(inst) || reads_nzcv(inst);
             if touches_flags {
                 if let Some(prev) = last_flag_access {
                     add_edge(prev, idx, &mut edges);
@@ -1026,15 +1341,7 @@ fn build_dag_for_insts(func: &MachFunction, inst_ids: &[InstId]) -> ScheduleDAG 
         }
     }
 
-    // Populate deps/rev_deps from the edge set.
-    for &(from, to) in &edges {
-        nodes[to].deps.push(from);
-        nodes[from].rev_deps.push(to);
-    }
-
-    let mut dag = ScheduleDAG { nodes };
-    dag.compute_priorities();
-    dag
+    edges.into_edges()
 }
 
 #[derive(Debug, Default)]
@@ -1281,6 +1588,134 @@ fn compute_pressure_info(func: &MachFunction, dag: &ScheduleDAG) -> Vec<NodePres
     }
 
     infos
+}
+
+/// Return true only when the dependency graph proves that node order
+/// `0, 1, .., n - 1` is its unique topological order.
+///
+/// A topological order is unique exactly when every consecutive pair in that
+/// order is connected by an edge.  DAG construction indexes nodes in original
+/// instruction order, so direct edges `i -> i + 1` force the scheduler to emit
+/// the region unchanged, independent of latency, priority, or pressure.
+///
+/// This is also an integrity gate, not just a shape check.  The scheduler keeps
+/// every edge twice (`deps` and `rev_deps`); accepting a fast path from only one
+/// view could hide a malformed graph from the general scheduler.  Require the
+/// two views to be exact, duplicate-free mirrors and require every edge to
+/// point forward.  Ambiguity, cycles, out-of-range indices, duplicate edges,
+/// and mismatched mirrors all fail closed to the general scheduler.
+fn has_forced_original_order(dag: &ScheduleDAG) -> bool {
+    let n = dag.nodes.len();
+
+    // Integrity validation below is deliberately exact, but its edge set is
+    // extra work on top of the general scheduler's own O(E) successor walk.
+    // Dense memory-order DAGs can contain every forward edge; benchmarking
+    // showed that attempting the fast path there loses increasingly badly as
+    // E grows.  A uniquely ordered graph already needs n-1 adjacent edges, so
+    // admit only near-chain graphs (at most one edge per node).  This keeps the
+    // proof and replay O(n), while dense graphs pay only this O(n) count before
+    // returning directly to the general scheduler.
+    let Some(edge_count) = dag
+        .nodes
+        .iter()
+        .try_fold(0usize, |total, node| total.checked_add(node.deps.len()))
+    else {
+        return false;
+    };
+    if edge_count > n {
+        return false;
+    }
+
+    // Most reorderable regions fail this cheap preflight immediately, without
+    // allocating the edge-integrity set used by the full admission check.
+    for idx in 0..n.saturating_sub(1) {
+        if !dag.nodes[idx].rev_deps.contains(&(idx + 1)) || !dag.nodes[idx + 1].deps.contains(&idx)
+        {
+            return false;
+        }
+    }
+
+    let mut unmatched_edges: HashSet<(usize, usize)> = HashSet::default();
+    unmatched_edges.reserve(edge_count);
+
+    for (to, node) in dag.nodes.iter().enumerate() {
+        for &from in &node.deps {
+            if from >= n || from >= to || !unmatched_edges.insert((from, to)) {
+                return false;
+            }
+        }
+    }
+
+    for (from, node) in dag.nodes.iter().enumerate() {
+        for &to in &node.rev_deps {
+            if to >= n || to <= from || !unmatched_edges.remove(&(from, to)) {
+                return false;
+            }
+        }
+    }
+
+    unmatched_edges.is_empty()
+}
+
+/// Replay the uniquely forced original schedule without constructing ready
+/// sets.  Returns `None` before mutating `dag` if cycle arithmetic overflows.
+fn schedule_forced_original_order(
+    func: &MachFunction,
+    dag: &mut ScheduleDAG,
+) -> Option<(Vec<InstId>, PressureTracker)> {
+    if !has_forced_original_order(dag) {
+        return None;
+    }
+
+    // Compute all starts into scratch storage first.  Besides preserving the
+    // general scheduler's latency accounting exactly, this ensures the rare
+    // malformed-overflow case falls back without leaving a half-mutated DAG.
+    let mut starts: Vec<u32> = dag.nodes.iter().map(|node| node.earliest_start).collect();
+    let mut cycle = 0u32;
+    for idx in 0..dag.nodes.len() {
+        let start = cycle.max(starts[idx]);
+        starts[idx] = start;
+        let finish = start.checked_add(dag.nodes[idx].latency)?;
+        for &succ in &dag.nodes[idx].rev_deps {
+            starts[succ] = starts[succ].max(finish);
+        }
+        cycle = start.checked_add(1)?;
+    }
+
+    // Use the same metadata and update order as the general scheduler: count
+    // all uses first, then for each instruction process uses/kills before defs.
+    // This preserves live-set and peak GPR/FPR reporting, not merely emission.
+    let pressure_info = compute_pressure_info(func, dag);
+    let mut vreg_remaining_uses: HashMap<VReg, u32> = HashMap::default();
+    for info in &pressure_info {
+        for &vreg in &info.uses {
+            *vreg_remaining_uses.entry(vreg).or_insert(0) += 1;
+        }
+    }
+
+    let mut tracker = PressureTracker::new();
+    for info in &pressure_info {
+        for &vreg in &info.uses {
+            if let Some(count) = vreg_remaining_uses.get_mut(&vreg) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    tracker.kill_vreg(vreg);
+                }
+            }
+        }
+        for &vreg in &info.defs {
+            tracker.define_vreg(vreg);
+        }
+    }
+
+    let mut order = Vec::with_capacity(dag.nodes.len());
+    for (node, start) in dag.nodes.iter_mut().zip(starts) {
+        node.scheduled = true;
+        node.earliest_start = start;
+        order.push(node.inst_id);
+    }
+
+    Some((order, tracker))
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,6 +2009,24 @@ pub fn schedule_list_pressure_aware(
     func: &MachFunction,
     dag: &mut ScheduleDAG,
 ) -> (Vec<InstId>, PressureTracker) {
+    if dag.nodes.is_empty() {
+        return (Vec::new(), PressureTracker::new());
+    }
+
+    if let Some(schedule) = schedule_forced_original_order(func, dag) {
+        return schedule;
+    }
+
+    schedule_list_pressure_aware_general(func, dag)
+}
+
+/// General pressure-aware list scheduler used whenever more than one
+/// topological choice may exist.  Kept as a separate implementation so the
+/// forced-order fast path can be differentially tested against it.
+fn schedule_list_pressure_aware_general(
+    func: &MachFunction,
+    dag: &mut ScheduleDAG,
+) -> (Vec<InstId>, PressureTracker) {
     let n = dag.nodes.len();
     if n == 0 {
         return (Vec::new(), PressureTracker::new());
@@ -1805,7 +2258,7 @@ fn schedule_block_with_redefined_vregs(
     if regions.len() <= 1 {
         // Single region: schedule the whole block as before.
         let original_order: Vec<InstId> = block.insts.clone();
-        let mut dag = build_dag(func, block_id);
+        let mut dag = build_scheduling_dag_for_insts(func, &original_order);
         let new_order = schedule_list(&mut dag);
 
         if new_order == original_order {
@@ -1828,7 +2281,7 @@ fn schedule_block_with_redefined_vregs(
             continue;
         }
 
-        let mut dag = build_dag_for_insts(func, &region_insts);
+        let mut dag = build_scheduling_dag_for_insts(func, &region_insts);
         let scheduled = schedule_list(&mut dag);
 
         new_full_order.extend(scheduled);
@@ -1876,7 +2329,7 @@ fn schedule_block_pressure_aware_with_redefined_vregs(
     if regions.len() <= 1 {
         // Single region: schedule the whole block as before.
         let original_order: Vec<InstId> = block.insts.clone();
-        let mut dag = build_dag(func, block_id);
+        let mut dag = build_scheduling_dag_for_insts(func, &original_order);
         let (new_order, tracker) = schedule_list_pressure_aware(func, &mut dag);
 
         if new_order == original_order {
@@ -1900,7 +2353,7 @@ fn schedule_block_pressure_aware_with_redefined_vregs(
             continue;
         }
 
-        let mut dag = build_dag_for_insts(func, &region_insts);
+        let mut dag = build_scheduling_dag_for_insts(func, &region_insts);
         let (scheduled, tracker) = schedule_list_pressure_aware(func, &mut dag);
 
         // Accumulate pressure from the last region (approximation).
@@ -2691,6 +3144,10 @@ pub fn schedule_block_with_metrics(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "scheduler_nzcv_tests.rs"]
+mod nzcv_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::pass_manager::{AnalysisCache, MachinePass};
@@ -2796,6 +3253,92 @@ mod tests {
             earliest_start: 0,
             priority: 0,
             scheduled: false,
+        }
+    }
+
+    fn schedule_dag_with_edges(func: &MachFunction, edges: &[(usize, usize)]) -> ScheduleDAG {
+        let insts = &func.block(func.entry).insts;
+        let mut nodes: Vec<ScheduleNode> = insts
+            .iter()
+            .enumerate()
+            .map(|(idx, &inst_id)| ScheduleNode {
+                inst_id,
+                // Exercise latency gaps and pre-existing earliest-start bounds
+                // while keeping all arithmetic far from overflow.
+                latency: 1 + ((idx * 7) % 10) as u32,
+                port: ExecutionPort::IntAlu,
+                deps: Vec::new(),
+                rev_deps: Vec::new(),
+                earliest_start: ((idx * 3) % 5) as u32,
+                priority: 0,
+                scheduled: false,
+            })
+            .collect();
+
+        for &(from, to) in edges {
+            nodes[to].deps.push(from);
+            nodes[from].rev_deps.push(to);
+        }
+
+        let mut dag = ScheduleDAG { nodes };
+        dag.compute_priorities();
+        dag
+    }
+
+    fn assert_pressure_trackers_equal(actual: &PressureTracker, expected: &PressureTracker) {
+        assert_eq!(actual.live_gprs, expected.live_gprs);
+        assert_eq!(actual.live_fprs, expected.live_fprs);
+        assert_eq!(actual.peak_gpr, expected.peak_gpr);
+        assert_eq!(actual.peak_fpr, expected.peak_fpr);
+        assert_eq!(actual.gpr_threshold, expected.gpr_threshold);
+        assert_eq!(actual.fpr_threshold, expected.fpr_threshold);
+    }
+
+    fn assert_pressure_schedule_matches_general(func: &MachFunction, dag: &ScheduleDAG) {
+        let original_order: Vec<InstId> = dag.nodes.iter().map(|node| node.inst_id).collect();
+        let mut fast_dag = dag.clone();
+        let mut general_dag = dag.clone();
+
+        let (fast_order, fast_tracker) = schedule_list_pressure_aware(func, &mut fast_dag);
+        let (general_order, general_tracker) =
+            schedule_list_pressure_aware_general(func, &mut general_dag);
+
+        assert_eq!(fast_order, general_order, "emitted order differs");
+        assert_eq!(
+            fast_order != original_order,
+            general_order != original_order,
+            "changed result differs"
+        );
+        assert_pressure_trackers_equal(&fast_tracker, &general_tracker);
+
+        for (idx, (fast, general)) in fast_dag.nodes.iter().zip(&general_dag.nodes).enumerate() {
+            assert_eq!(
+                fast.scheduled, general.scheduled,
+                "scheduled bit differs at node {idx}"
+            );
+            assert_eq!(
+                fast.earliest_start, general.earliest_start,
+                "earliest start differs at node {idx}"
+            );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SchedulerTestRng(u64);
+
+    impl SchedulerTestRng {
+        fn next(&mut self) -> u64 {
+            // Fixed-seed SplitMix64: deterministic across platforms and Rust
+            // versions, with no test-only dependency on `rand`.
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, limit: usize) -> usize {
+            (self.next() as usize) % limit
         }
     }
 
@@ -4363,6 +4906,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_flag_reader_stays_before_an_nzcv_clobbering_pseudo_or_trap_carrier() {
+        // A dynamic StackAlloc's probe loop and an exact trap carrier both
+        // expand, after scheduling, into their own compare. A CSET reading
+        // the earlier CMP must not be scheduled after either.
+        for clobber in [
+            MachInst::with_flags(
+                AArch64Opcode::StackAlloc,
+                vec![vreg(4), vreg(5), imm(8), imm(8)],
+                InstFlags::EMPTY,
+            ),
+            MachInst::new(AArch64Opcode::TrapBoundsCheckExact, vec![vreg(6), vreg(7)]),
+        ] {
+            let opcode = clobber.opcode;
+            let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(1), vreg(2)]);
+            let cset = MachInst::new(AArch64Opcode::CSet, vec![vreg(3), imm(0)]);
+            let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
+            let func = make_func_with_insts(vec![cmp, cset, clobber, ret]);
+
+            let dag = build_dag(&func, func.entry);
+
+            assert!(
+                dag.nodes[2].deps.contains(&1),
+                "{opcode:?} must stay after the CSET that reads the CMP's flags"
+            );
+        }
+    }
+
     // ---- Priority computation test ----
 
     #[test]
@@ -5122,6 +5693,303 @@ mod tests {
     }
 
     #[test]
+    fn test_pressure_forced_original_fast_path_matches_general_scheduler() {
+        // The cross-class data chain forces this exact order while ensuring
+        // both peak-pressure counters are exercised.  It is intentionally
+        // sparse enough to exercise the admitted production fast path.
+        let insts = vec![
+            MachInst::new(AArch64Opcode::MovI, vec![vreg(1), imm(7)]),
+            MachInst::new(AArch64Opcode::ScvtfRR, vec![fpreg(2), vreg(1)]),
+            MachInst::new(AArch64Opcode::FaddRR, vec![fpreg(3), fpreg(2), fpreg(90)]),
+            MachInst::new(AArch64Opcode::FcvtzsRR, vec![vreg(4), fpreg(3)]),
+            MachInst::new(AArch64Opcode::AddRI, vec![vreg(5), vreg(4), imm(1)]),
+        ];
+        let func = make_func_with_insts(insts);
+        let dag = build_dag(&func, func.entry);
+
+        assert!(has_forced_original_order(&dag));
+        assert_pressure_schedule_matches_general(&func, &dag);
+
+        let mut scheduled = func.clone();
+        let (changed, peak_gpr, peak_fpr) = schedule_function_pressure_aware(&mut scheduled);
+        assert!(!changed, "the forced original order must report unchanged");
+        assert_eq!(
+            scheduled.block(scheduled.entry).insts,
+            func.block(func.entry).insts
+        );
+
+        let mut reference_dag = dag;
+        let (_, reference_tracker) =
+            schedule_list_pressure_aware_general(&func, &mut reference_dag);
+        assert_eq!(peak_gpr, reference_tracker.peak_gpr);
+        assert_eq!(peak_fpr, reference_tracker.peak_fpr);
+        assert!(peak_gpr > 0, "GPR peak accounting was not exercised");
+        assert!(peak_fpr > 0, "FPR peak accounting was not exercised");
+    }
+
+    #[test]
+    fn test_pressure_forced_original_gate_rejects_non_proofs() {
+        let func = make_func_with_insts(vec![
+            MachInst::new(AArch64Opcode::MovI, vec![vreg(1), imm(1)]),
+            MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(2)]),
+            MachInst::new(AArch64Opcode::MovI, vec![vreg(3), imm(3)]),
+        ]);
+        let chain = schedule_dag_with_edges(&func, &[(0, 1), (1, 2)]);
+        assert!(has_forced_original_order(&chain));
+
+        let ambiguous = schedule_dag_with_edges(&func, &[(0, 2), (1, 2)]);
+        assert!(!has_forced_original_order(&ambiguous));
+        assert_pressure_schedule_matches_general(&func, &ambiguous);
+
+        let cycle = schedule_dag_with_edges(&func, &[(0, 1), (1, 2), (2, 0)]);
+        assert!(!has_forced_original_order(&cycle));
+        assert_pressure_schedule_matches_general(&func, &cycle);
+
+        let mut missing_reverse = chain.clone();
+        missing_reverse.nodes[0].rev_deps.clear();
+        assert!(!has_forced_original_order(&missing_reverse));
+        assert_pressure_schedule_matches_general(&func, &missing_reverse);
+
+        let mut duplicate = chain.clone();
+        duplicate.nodes[1].deps.push(0);
+        duplicate.nodes[0].rev_deps.push(1);
+        assert!(!has_forced_original_order(&duplicate));
+        assert_pressure_schedule_matches_general(&func, &duplicate);
+
+        let mut out_of_range = chain;
+        out_of_range.nodes[2].rev_deps.push(usize::MAX);
+        assert!(!has_forced_original_order(&out_of_range));
+
+        // A dense DAG can also force original order, but the integrity scan is
+        // not profitable there.  It must take the general path unchanged.
+        let dense_func = make_func_with_insts(
+            (0..8)
+                .map(|idx| MachInst::new(AArch64Opcode::MovI, vec![vreg(idx), imm(idx as i64)]))
+                .collect(),
+        );
+        let mut dense_edges = Vec::new();
+        for from in 0..8 {
+            for to in (from + 1)..8 {
+                dense_edges.push((from, to));
+            }
+        }
+        let dense = schedule_dag_with_edges(&dense_func, &dense_edges);
+        assert!(!has_forced_original_order(&dense));
+        assert_pressure_schedule_matches_general(&dense_func, &dense);
+    }
+
+    #[test]
+    fn test_pressure_forced_original_randomized_equivalence() {
+        let mut rng = SchedulerTestRng(0x5c4e_d017_91a2_b3f8);
+        let mut forced_cases = 0usize;
+        let mut ambiguous_cases = 0usize;
+
+        for case in 0..256usize {
+            let n = 2 + rng.below(47);
+            let mut insts = Vec::with_capacity(n);
+            for idx in 0..n {
+                let dst = 1000 + idx as u32;
+                let src1 = rng.below(32) as u32;
+                let src2 = rng.below(32) as u32;
+                let inst = match rng.below(4) {
+                    0 => MachInst::new(AArch64Opcode::MovI, vec![vreg(dst), imm(idx as i64)]),
+                    1 => MachInst::new(
+                        AArch64Opcode::AddRR,
+                        vec![vreg(dst), vreg(src1), vreg(src2)],
+                    ),
+                    2 => MachInst::new(
+                        AArch64Opcode::FaddRR,
+                        vec![fpreg(dst), fpreg(src1), fpreg(src2)],
+                    ),
+                    _ => MachInst::new(
+                        AArch64Opcode::MulRR,
+                        vec![vreg(dst), vreg(src1), vreg(src2)],
+                    ),
+                };
+                insts.push(inst);
+            }
+            let func = make_func_with_insts(insts);
+
+            let force_original = case % 2 == 0;
+            let mut edges = Vec::new();
+            if force_original {
+                // A full adjacent chain, plus at most one random shortcut,
+                // exercises every admitted edge density (n-1 and n).
+                edges.extend((0..n - 1).map(|idx| (idx, idx + 1)));
+                if n > 2 && rng.below(2) == 0 {
+                    let from = rng.below(n - 2);
+                    let to = from + 2 + rng.below(n - from - 2);
+                    edges.push((from, to));
+                }
+            } else {
+                for from in 0..n {
+                    for to in (from + 1)..n {
+                        // Deliberately omit 0 -> 1, leaving nodes zero and one
+                        // simultaneously ready regardless of other edges.
+                        if !(from == 0 && to == 1) && rng.below(7) == 0 {
+                            edges.push((from, to));
+                        }
+                    }
+                }
+            }
+
+            let dag = schedule_dag_with_edges(&func, &edges);
+            assert_eq!(
+                has_forced_original_order(&dag),
+                force_original,
+                "wrong fast-path admission for randomized case {case}"
+            );
+            if force_original {
+                forced_cases += 1;
+            } else {
+                ambiguous_cases += 1;
+            }
+            assert_pressure_schedule_matches_general(&func, &dag);
+        }
+
+        assert_eq!(forced_cases, 128);
+        assert_eq!(ambiguous_cases, 128);
+    }
+
+    #[test]
+    #[ignore = "diagnostic microbenchmark; run explicitly with --release --ignored"]
+    fn test_pressure_forced_original_microbenchmark() {
+        use std::hint::black_box;
+
+        const ROUNDS: usize = 7;
+        for (nodes, iterations) in [
+            (16usize, 2048usize),
+            (32, 1024),
+            (64, 512),
+            (128, 256),
+            (256, 128),
+            (512, 64),
+            (1024, 32),
+            (4096, 16),
+        ] {
+            let mut insts = Vec::with_capacity(nodes);
+            insts.push(MachInst::new(AArch64Opcode::MovI, vec![vreg(1000), imm(1)]));
+            for idx in 1..nodes {
+                insts.push(MachInst::new(
+                    AArch64Opcode::AddRI,
+                    vec![vreg(1000 + idx as u32), vreg(999 + idx as u32), imm(1)],
+                ));
+            }
+            let func = make_func_with_insts(insts);
+            let edges: Vec<(usize, usize)> = (0..nodes - 1).map(|idx| (idx, idx + 1)).collect();
+            let dag = schedule_dag_with_edges(&func, &edges);
+            assert!(has_forced_original_order(&dag));
+
+            let mut fast_samples = Vec::with_capacity(ROUNDS);
+            let mut general_samples = Vec::with_capacity(ROUNDS);
+            for round in 0..ROUNDS {
+                let measure_fast = || {
+                    let mut trials = vec![dag.clone(); iterations];
+                    let start = Instant::now();
+                    for trial in &mut trials {
+                        black_box(schedule_list_pressure_aware(&func, trial));
+                    }
+                    start.elapsed()
+                };
+                let measure_general = || {
+                    let mut trials = vec![dag.clone(); iterations];
+                    let start = Instant::now();
+                    for trial in &mut trials {
+                        black_box(schedule_list_pressure_aware_general(&func, trial));
+                    }
+                    start.elapsed()
+                };
+
+                if round % 2 == 0 {
+                    fast_samples.push(measure_fast());
+                    general_samples.push(measure_general());
+                } else {
+                    general_samples.push(measure_general());
+                    fast_samples.push(measure_fast());
+                }
+            }
+
+            fast_samples.sort_unstable();
+            general_samples.sort_unstable();
+            let fast = fast_samples[ROUNDS / 2];
+            let general = general_samples[ROUNDS / 2];
+            eprintln!(
+                "pressure chain forced-order nodes={nodes} iterations={iterations}: fast={fast:?} general={general:?} ratio={:.3}",
+                fast.as_secs_f64() / general.as_secs_f64()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic dense-DAG microbenchmark; run explicitly with --release --ignored"]
+    fn test_pressure_forced_original_dense_microbenchmark() {
+        use std::hint::black_box;
+
+        const ROUNDS: usize = 7;
+        for (nodes, iterations) in [(64usize, 128usize), (128, 64), (256, 24), (512, 8)] {
+            let insts: Vec<MachInst> = (0..nodes)
+                .map(|idx| {
+                    MachInst::new(
+                        AArch64Opcode::MovI,
+                        vec![vreg(1000 + idx as u32), imm(idx as i64)],
+                    )
+                })
+                .collect();
+            let func = make_func_with_insts(insts);
+            let mut edges = Vec::with_capacity(nodes * (nodes - 1) / 2);
+            for from in 0..nodes {
+                for to in (from + 1)..nodes {
+                    edges.push((from, to));
+                }
+            }
+            let dag = schedule_dag_with_edges(&func, &edges);
+            assert!(
+                !has_forced_original_order(&dag),
+                "dense DAG must bypass the sparse fast path"
+            );
+
+            let mut fast_samples = Vec::with_capacity(ROUNDS);
+            let mut general_samples = Vec::with_capacity(ROUNDS);
+            for round in 0..ROUNDS {
+                let measure_fast = || {
+                    let mut trials = vec![dag.clone(); iterations];
+                    let start = Instant::now();
+                    for trial in &mut trials {
+                        black_box(schedule_list_pressure_aware(&func, trial));
+                    }
+                    start.elapsed()
+                };
+                let measure_general = || {
+                    let mut trials = vec![dag.clone(); iterations];
+                    let start = Instant::now();
+                    for trial in &mut trials {
+                        black_box(schedule_list_pressure_aware_general(&func, trial));
+                    }
+                    start.elapsed()
+                };
+
+                if round % 2 == 0 {
+                    fast_samples.push(measure_fast());
+                    general_samples.push(measure_general());
+                } else {
+                    general_samples.push(measure_general());
+                    fast_samples.push(measure_fast());
+                }
+            }
+
+            fast_samples.sort_unstable();
+            general_samples.sort_unstable();
+            let fast = fast_samples[ROUNDS / 2];
+            let general = general_samples[ROUNDS / 2];
+            eprintln!(
+                "pressure dense forced-order nodes={nodes} edges={} iterations={iterations}: fast={fast:?} general={general:?} ratio={:.3}",
+                edges.len(),
+                fast.as_secs_f64() / general.as_secs_f64()
+            );
+        }
+    }
+
+    #[test]
     fn test_pressure_aware_scheduler_low_pressure() {
         // With low pressure, the pressure-aware scheduler should behave like
         // the basic scheduler (critical-path priority).
@@ -5434,5 +6302,446 @@ mod tests {
             tracker.peak_gpr, 0,
             "FPR-only code should have no GPR pressure"
         );
+    }
+
+    /// Reachability sets of a DAG (`reach[i]` holds every node `i` precedes),
+    /// for regions of at most 128 nodes.
+    fn dag_reachability(dag: &ScheduleDAG) -> Vec<u128> {
+        let n = dag.nodes.len();
+        assert!(n <= 128, "reachability bitsets hold at most 128 nodes");
+        let mut reach = vec![0u128; n];
+        // Every edge points forward, so a reverse index sweep is topological.
+        for idx in (0..n).rev() {
+            let mut set = 0u128;
+            for &succ in &dag.nodes[idx].rev_deps {
+                set |= (1u128 << succ) | reach[succ];
+            }
+            reach[idx] = set;
+        }
+        reach
+    }
+
+    fn dag_edge_count(dag: &ScheduleDAG) -> usize {
+        dag.nodes.iter().map(|node| node.deps.len()).sum()
+    }
+
+    /// One random instruction for the barrier-segmentation differential:
+    /// vreg arithmetic with reuse (so pressure can exceed the thresholds),
+    /// vreg redefinitions, loads and stores, NZCV writers and readers, ABI
+    /// argument and return copies through X0/X1, direct and indirect calls,
+    /// and memory barriers.
+    fn random_segmentation_inst(rng: &mut SchedulerTestRng, idx: usize) -> MachInst {
+        static CALL_USES: &[PReg] = &[X0, X1, X16];
+        let fresh = 2000 + idx as u32;
+        let old = rng.below(40) as u32;
+        let other = rng.below(40) as u32;
+        if rng.below(4) == 0 {
+            return random_memory_inst(rng, idx);
+        }
+        match rng.below(16) {
+            0 | 1 => MachInst::new(AArch64Opcode::MovI, vec![vreg(fresh), imm(idx as i64)]),
+            2 => MachInst::new(AArch64Opcode::MovI, vec![vreg(old), imm(idx as i64)]),
+            3 => MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![vreg(fresh), vreg(old), vreg(other)],
+            ),
+            4 => MachInst::new(
+                AArch64Opcode::MulRR,
+                vec![vreg(old), vreg(other), vreg(old)],
+            ),
+            5 => MachInst::new(AArch64Opcode::LdrRI, vec![vreg(fresh), vreg(old), imm(8)]),
+            6 => MachInst::new(AArch64Opcode::StrRI, vec![vreg(other), vreg(old), imm(16)]),
+            7 => MachInst::new(AArch64Opcode::CmpRR, vec![vreg(old), vreg(other)]),
+            8 => MachInst::new(
+                AArch64Opcode::Csel,
+                vec![vreg(fresh), vreg(old), vreg(other), imm(0)],
+            ),
+            9 => MachInst::new(AArch64Opcode::Copy, vec![MachOperand::PReg(X0), vreg(old)]),
+            10 => MachInst::new(
+                AArch64Opcode::Copy,
+                vec![MachOperand::PReg(X1), vreg(other)],
+            ),
+            11 => MachInst::new(
+                AArch64Opcode::Copy,
+                vec![vreg(fresh), MachOperand::PReg(X0)],
+            ),
+            12 => MachInst::new(
+                AArch64Opcode::Bl,
+                vec![MachOperand::Symbol("callee".into())],
+            )
+            .with_implicit_uses(CALL_USES),
+            13 => MachInst::new(AArch64Opcode::Blr, vec![MachOperand::PReg(X16)])
+                .with_implicit_uses(CALL_USES),
+            14 => MachInst::new(AArch64Opcode::Dmb, vec![imm(0xb)]),
+            _ => MachInst::new(
+                AArch64Opcode::FaddRR,
+                vec![fpreg(fresh), fpreg(old), fpreg(other)],
+            ),
+        }
+    }
+
+    /// One random memory access for the memory-order reduction: proof-
+    /// reorderable ordinary loads (`LdrRI` and `LdrbRI`), proven `StrRI`
+    /// stores and plain loads and stores, over two bases and offsets that
+    /// make some `StrRI -> LdrRI` pairs statically disjoint and some overlap.
+    fn random_memory_inst(rng: &mut SchedulerTestRng, idx: usize) -> MachInst {
+        let fresh = 2000 + idx as u32;
+        let value = rng.below(40) as u32;
+        let base = 5 + rng.below(2) as u32;
+        let offset = [0, 4, 8, 16, 24][rng.below(5)];
+        match rng.below(6) {
+            0 | 1 => proof_reorderable_load(fresh, base, offset),
+            2 | 3 => proof_reorderable_store(value, base, offset),
+            4 => proof_reorderable_inst(
+                AArch64Opcode::LdrbRI,
+                vec![typed_vreg(fresh, RegClass::Gpr32), vreg(base), imm(offset)],
+            ),
+            _ => {
+                if rng.below(2) == 0 {
+                    MachInst::new(
+                        AArch64Opcode::LdrRI,
+                        vec![vreg(fresh), vreg(base), imm(offset)],
+                    )
+                } else {
+                    MachInst::new(
+                        AArch64Opcode::StrRI,
+                        vec![vreg(value), vreg(base), imm(offset)],
+                    )
+                }
+            }
+        }
+    }
+
+    /// The barrier-segmented DAG the schedulers use must order every region
+    /// exactly as the full DAG does: the same partial order, the same
+    /// priorities, and the same emitted order and pressure replay from both
+    /// list schedulers. This is the differential behind the "Why every
+    /// schedule is unchanged" argument on `build_scheduling_dag_for_insts`.
+    #[test]
+    fn scheduling_dag_matches_full_dag_schedules() {
+        let mut rng = SchedulerTestRng(0x6c14_9e06_d0a4_31f7);
+        let mut segmented_cases = 0usize;
+        let mut reordered_cases = 0usize;
+        let mut high_pressure_cases = 0usize;
+        let mut fewer_edges_cases = 0usize;
+
+        let mut memory_only_reduced_cases = 0usize;
+        for case in 0..900usize {
+            let n = 2 + rng.below(110);
+            // Every third case is a barrier-free block of memory accesses, the
+            // shape the memory-order reduction alone serves.
+            let memory_only = case % 3 == 1;
+            let mut insts: Vec<MachInst> = (0..n)
+                .map(|idx| {
+                    if memory_only {
+                        random_memory_inst(&mut rng, idx)
+                    } else {
+                        random_segmentation_inst(&mut rng, idx)
+                    }
+                })
+                .collect();
+            if case % 3 == 0 {
+                insts.push(MachInst::new(AArch64Opcode::Ret, vec![]));
+            }
+            // Some cases hold many live values across the calls, so the
+            // pressure-aware selection order is exercised as well.
+            if case % 4 == 0 {
+                for extra in 0..24u32 {
+                    insts.insert(
+                        0,
+                        MachInst::new(AArch64Opcode::MovI, vec![vreg(900 + extra), imm(1)]),
+                    );
+                    let use_at = insts.len() - usize::from(case % 3 == 0);
+                    insts.insert(
+                        use_at,
+                        MachInst::new(
+                            AArch64Opcode::AddRR,
+                            vec![vreg(950 + extra), vreg(900 + extra), vreg(900 + extra)],
+                        ),
+                    );
+                }
+            }
+            if insts.len() > 128 {
+                insts.truncate(127);
+                if case % 3 == 0 {
+                    insts.push(MachInst::new(AArch64Opcode::Ret, vec![]));
+                }
+            }
+            let func = make_func_with_insts(insts);
+            let ids = func.block(func.entry).insts.clone();
+
+            let full = build_dag_for_insts(&func, &ids);
+            let segmented = build_scheduling_dag_for_insts(&func, &ids);
+            let barrier_count = ids
+                .iter()
+                .filter(|&&id| is_full_scheduling_barrier(func.inst(id)))
+                .count();
+            if barrier_count > 1 {
+                segmented_cases += 1;
+            }
+            if dag_edge_count(&segmented) < dag_edge_count(&full) {
+                fewer_edges_cases += 1;
+                if memory_only {
+                    memory_only_reduced_cases += 1;
+                }
+            }
+
+            assert_eq!(
+                dag_reachability(&full),
+                dag_reachability(&segmented),
+                "partial order differs in case {case}"
+            );
+            for (idx, (a, b)) in full.nodes.iter().zip(&segmented.nodes).enumerate() {
+                assert_eq!(a.inst_id, b.inst_id, "node {idx} differs in case {case}");
+                assert_eq!(
+                    a.priority, b.priority,
+                    "priority differs at node {idx} in case {case}"
+                );
+            }
+
+            let mut full_basic = full.clone();
+            let mut segmented_basic = segmented.clone();
+            let full_order = schedule_list(&mut full_basic);
+            assert_eq!(
+                full_order,
+                schedule_list(&mut segmented_basic),
+                "list schedule differs in case {case}"
+            );
+            if full_order != ids {
+                reordered_cases += 1;
+            }
+
+            let mut full_pressure = full.clone();
+            let mut segmented_pressure = segmented.clone();
+            let (full_order, full_tracker) =
+                schedule_list_pressure_aware(&func, &mut full_pressure);
+            let (segmented_order, segmented_tracker) =
+                schedule_list_pressure_aware(&func, &mut segmented_pressure);
+            assert_eq!(
+                full_order, segmented_order,
+                "pressure-aware schedule differs in case {case}"
+            );
+            assert_pressure_trackers_equal(&segmented_tracker, &full_tracker);
+            if full_tracker.peak_gpr > full_tracker.gpr_threshold {
+                high_pressure_cases += 1;
+            }
+        }
+
+        // The differential must reach the shapes it is about.
+        assert!(
+            memory_only_reduced_cases > 200,
+            "memory-only reduced cases: {memory_only_reduced_cases}"
+        );
+        assert!(segmented_cases > 300, "segmented cases: {segmented_cases}");
+        assert!(
+            fewer_edges_cases > 300,
+            "fewer-edge cases: {fewer_edges_cases}"
+        );
+        assert!(reordered_cases > 100, "reordered cases: {reordered_cases}");
+        assert!(
+            high_pressure_cases > 50,
+            "high-pressure cases: {high_pressure_cases}"
+        );
+    }
+
+    /// A block of `m` stores and `m` proof-reorderable loads keeps `O(m)`
+    /// memory-order edges, where the full DAG holds one per ordered pair.
+    #[test]
+    fn scheduling_dag_of_a_store_block_is_linear() {
+        let stores = 300u32;
+        let mut insts = Vec::new();
+        for i in 0..stores {
+            insts.push(MachInst::new(
+                AArch64Opcode::MovI,
+                vec![vreg(i), imm(i64::from(i))],
+            ));
+            insts.push(proof_reorderable_store(i, 5000, 8 * i64::from(i)));
+        }
+        for i in 0..stores {
+            insts.push(proof_reorderable_load(1000 + i, 5000, 8 * i64::from(i)));
+        }
+        let n = insts.len();
+        let func = make_func_with_insts(insts);
+        let ids = func.block(func.entry).insts.clone();
+
+        let segmented = build_scheduling_dag_for_insts(&func, &ids);
+        assert!(
+            dag_edge_count(&segmented) <= 4 * n,
+            "segmented DAG holds {} edges for {n} instructions",
+            dag_edge_count(&segmented)
+        );
+        let full = build_dag_for_insts(&func, &ids);
+        let pairs = (stores * (stores - 1) / 2) as usize;
+        assert!(
+            dag_edge_count(&full) >= pairs,
+            "the full DAG is expected to order every store pair ({} edges)",
+            dag_edge_count(&full)
+        );
+        assert_eq!(
+            dag_reachability_large(&full),
+            dag_reachability_large(&segmented)
+        );
+        let full_order = schedule_list_pressure_aware(&func, &mut full.clone()).0;
+        let segmented_order = schedule_list_pressure_aware(&func, &mut segmented.clone()).0;
+        assert_eq!(full_order, segmented_order);
+    }
+
+    /// Reachability sets of a DAG of any size, as sorted successor lists.
+    fn dag_reachability_large(dag: &ScheduleDAG) -> Vec<Vec<usize>> {
+        let n = dag.nodes.len();
+        let mut reach: Vec<std::collections::BTreeSet<usize>> =
+            vec![std::collections::BTreeSet::new(); n];
+        for idx in (0..n).rev() {
+            let mut set = std::collections::BTreeSet::new();
+            for &succ in &dag.nodes[idx].rev_deps {
+                set.insert(succ);
+                set.extend(reach[succ].iter().copied());
+            }
+            reach[idx] = set;
+        }
+        reach
+            .into_iter()
+            .map(|set| set.into_iter().collect())
+            .collect()
+    }
+
+    /// A block of `c` calls keeps `O(c)` scheduling edges, where the full DAG
+    /// holds one edge per (call, other instruction) pair.
+    #[test]
+    fn scheduling_dag_of_a_call_chain_is_linear() {
+        static CALL_USES: &[PReg] = &[X0, X1];
+        let calls = 400usize;
+        let mut insts = Vec::new();
+        for call in 0..calls {
+            let base = 10 * call as u32;
+            insts.push(MachInst::new(
+                AArch64Opcode::MovI,
+                vec![vreg(base), imm(call as i64)],
+            ));
+            insts.push(MachInst::new(
+                AArch64Opcode::Copy,
+                vec![MachOperand::PReg(X0), vreg(base)],
+            ));
+            insts.push(MachInst::new(
+                AArch64Opcode::Copy,
+                vec![MachOperand::PReg(X1), vreg(base)],
+            ));
+            insts.push(
+                MachInst::new(AArch64Opcode::Bl, vec![MachOperand::Symbol("f".into())])
+                    .with_implicit_uses(CALL_USES),
+            );
+            insts.push(MachInst::new(
+                AArch64Opcode::Copy,
+                vec![vreg(base + 1), MachOperand::PReg(X0)],
+            ));
+            insts.push(MachInst::new(
+                AArch64Opcode::EorRR,
+                vec![vreg(base + 2), vreg(base + 1), vreg(base + 1)],
+            ));
+        }
+        insts.push(MachInst::new(AArch64Opcode::Ret, vec![]));
+        let n = insts.len();
+        let func = make_func_with_insts(insts);
+        let ids = func.block(func.entry).insts.clone();
+
+        let segmented = build_scheduling_dag_for_insts(&func, &ids);
+        assert!(
+            dag_edge_count(&segmented) <= 4 * n,
+            "segmented DAG holds {} edges for {n} instructions",
+            dag_edge_count(&segmented)
+        );
+        let full = build_dag_for_insts(&func, &ids);
+        assert!(
+            dag_edge_count(&full) >= calls * n / 2,
+            "the full DAG is expected to hold a quadratic edge set ({} edges)",
+            dag_edge_count(&full)
+        );
+        let full_order = schedule_list_pressure_aware(&func, &mut full.clone()).0;
+        let segmented_order = schedule_list_pressure_aware(&func, &mut segmented.clone()).0;
+        assert_eq!(full_order, segmented_order);
+    }
+
+    /// A random region: ALU work on a small vreg pool (with redefinitions),
+    /// fixed-register copies in and out, loads and stores (some proof-
+    /// reorderable), flag writers and readers, calls, and a final terminator.
+    fn random_region(seed: &mut u64, len: usize) -> MachFunction {
+        let mut next = |bound: u64| -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed % bound
+        };
+        let mut insts = Vec::with_capacity(len + 1);
+        for _ in 0..len {
+            let a = next(12) as u32;
+            let b = next(12) as u32;
+            let c = next(12) as u32;
+            let inst = match next(11) {
+                0 | 1 => MachInst::new(AArch64Opcode::AddRR, vec![vreg(a), vreg(b), vreg(c)]),
+                2 => MachInst::new(AArch64Opcode::MulRR, vec![vreg(a), vreg(b), vreg(c)]),
+                3 => MachInst::new(AArch64Opcode::MovR, vec![vreg(a), MachOperand::PReg(X0)]),
+                4 => MachInst::new(AArch64Opcode::MovR, vec![MachOperand::PReg(X1), vreg(a)]),
+                5 => MachInst::new(
+                    AArch64Opcode::LdrRI,
+                    vec![vreg(a), vreg(b), imm(8 * next(4) as i64)],
+                ),
+                6 => proof_reorderable_load(a, b, 8 * next(4) as i64),
+                7 => MachInst::new(
+                    AArch64Opcode::StrRI,
+                    vec![vreg(a), vreg(b), imm(8 * next(4) as i64)],
+                ),
+                8 => MachInst::new(AArch64Opcode::CmpRR, vec![vreg(a), vreg(b)]),
+                9 => MachInst::new(AArch64Opcode::CSet, vec![vreg(a), imm(0)]),
+                _ => MachInst::new(
+                    AArch64Opcode::Bl,
+                    vec![MachOperand::Symbol("callee".into())],
+                ),
+            };
+            insts.push(inst);
+        }
+        insts.push(MachInst::new(AArch64Opcode::Ret, vec![]));
+        make_func_with_insts(insts)
+    }
+
+    #[test]
+    fn dense_edge_collector_builds_the_hash_set_dag_up_to_list_order() {
+        let mut seed = 0x6a09_e667_f3bc_c909u64;
+        let mut edges_seen = 0usize;
+        for case in 0..600 {
+            let len = [2usize, 5, 17, 40, 90][case % 5];
+            let func = random_region(&mut seed, len);
+            let insts = func.block(func.entry).insts.clone();
+            let mut reference = build_dag_for_insts_with::<HashSetEdges>(&func, &insts);
+            let mut dense = build_dag_for_insts_with::<DenseEdges>(&func, &insts);
+            assert_eq!(reference.nodes.len(), dense.nodes.len());
+            for (r, d) in reference.nodes.iter().zip(&dense.nodes) {
+                let sorted = |v: &[usize]| {
+                    let mut v = v.to_vec();
+                    v.sort_unstable();
+                    v
+                };
+                assert_eq!(r.inst_id, d.inst_id);
+                assert_eq!(sorted(&r.deps), sorted(&d.deps), "case {case}");
+                assert_eq!(sorted(&r.rev_deps), sorted(&d.rev_deps), "case {case}");
+                assert_eq!(r.priority, d.priority, "case {case}");
+                assert_eq!(r.latency, d.latency);
+                edges_seen += r.deps.len();
+            }
+            let (mut r2, mut d2) = (reference.clone(), dense.clone());
+            assert_eq!(
+                schedule_list(&mut r2),
+                schedule_list(&mut d2),
+                "case {case}"
+            );
+            let (r_order, r_tracker) = schedule_list_pressure_aware(&func, &mut reference);
+            let (d_order, d_tracker) = schedule_list_pressure_aware(&func, &mut dense);
+            assert_eq!(r_order, d_order, "case {case}");
+            assert_eq!(
+                format!("{r_tracker:?}"),
+                format!("{d_tracker:?}"),
+                "case {case}"
+            );
+        }
+        assert!(edges_seen > 50_000, "{edges_seen}");
     }
 }

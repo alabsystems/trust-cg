@@ -11,11 +11,13 @@ members = [
     "crates/trust-cg-dialect",
     "crates/trust-cg-lower",
     "crates/trust-cg-opt",
+    "crates/trust-cg-irmid",
+    "crates/trust-cg-eqsat",
+    "crates/trust-cg-eqsat-check",
     "crates/trust-cg-verify",
     "crates/trust-cg-codegen",
     "crates/trust-cg-lift",
     "crates/trust-cg-regalloc",
-    "crates/trust-cg-gpu",
     "crates/trust-cg-cli",
     "crates/trust-cg-fuzz",
     "crates/trust-cg-llvm-import",
@@ -29,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -51,24 +53,52 @@ anyhow = "1.0"
 # Input IR (trust-ir). Cargo auto-derives the Rust
 # identifier `trust_ir` from the kebab package name, so `use trust_ir::...`
 # in source code keeps compiling.
-# trust-ir is consumed as a git dependency so trust-cg builds standalone from
-# any location. Development checkouts may use configured Git credentials;
-# publication maps the exact pin to anonymous public HTTPS.
-# When built inside the `alabsystems/trust` superproject, that superproject's
-# `.cargo/config.toml` redirects this git dep to its `first-party/trust-ir`.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "cf5a6eaecea7d7a36f0d89c63e36882b787b770d", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
-trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "cf5a6eaecea7d7a36f0d89c63e36882b787b770d" }
+# trust-ir is consumed as an exact rev-pinned git dependency so trust-cg builds
+# standalone from any location. Development checkouts may use configured Git
+# credentials; publication maps the exact pin to anonymous public HTTPS.
+#
+# Two sanctioned ways to build against a local trust-ir instead of the pin — and
+# NEITHER is this repo's `.cargo/config.toml`, which sets only `[build]`/`[env]`/
+# `[net]` and contains no `[patch]`:
+#
+#   * Sibling-checkout iteration, in this repo: `scripts/use-local-siblings <cmd>`
+#     runs cargo with `--config .cargo/local-siblings.toml`, whose `[patch]` maps
+#     this git URL onto `../../trust-ir/crates/*`. It is opt-in per invocation and
+#     the active copy is gitignored, so a mutable worktree can never silently
+#     replace the committed pin above.
+#
+#   * The `alabsystems/trust` superproject, which vendors this repo as the
+#     `first-party/trust-cg` submodule and depends on its crates by path. The
+#     redirect to `first-party/trust-ir` lives in that superproject's WORKSPACE
+#     MANIFESTS (`[patch."https://github.com/alabsystems/trust-ir.git"]` and the
+#     ssh spellings, in both its root `Cargo.toml` and `crates/Cargo.toml`) — not
+#     in its `.cargo/config.toml`. A manifest `[patch]` applies to that workspace's
+#     dependency graph only, and `first-party/trust-cg` is `exclude`d from it, so
+#     a plain `cargo build` run from inside the submodule directory resolves in
+#     THIS workspace and gets the pinned rev, not the patch.
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", features = ["binary"] }
+# The must-refuse corpus runner (KIND 4, trust-ir 3aacfcd5 / a31c6ff1): dev-only,
+# `default-features = false` + `must-refuse` forwards exactly `trust-ir/binary`.
+# Same rev as the two lines above BY CONSTRUCTION: scripts/bump_trust_ir_pin.py
+# rewrites all three and `cargo update -p trust-ir --precise` moves the whole
+# git source; crates/trust-cg-test/tests/dependency_authority.rs asserts it.
+# It is consumed ONLY by the must-refuse consumer tests (trust-cg-codegen
+# `tests/must_refuse_corpus.rs`, trust-cg-cli `tests/must_refuse_corpus.rs`);
+# the production graph MUST NOT gain it.
+trust-ir-conformance = { git = "https://github.com/alabsystems/trust-ir.git", rev = "a98dfbbe7f0b7ee8c60f2ee7c2cfd641ba850b87", default-features = false, features = ["must-refuse"] }
 
 # Internal crates
 trust-cg-ir = { path = "crates/trust-cg-ir" }
 trust-cg-dialect = { path = "crates/trust-cg-dialect" }
 trust-cg-lower = { path = "crates/trust-cg-lower" }
 trust-cg-opt = { path = "crates/trust-cg-opt" }
-trust-cg-verify = { path = "crates/trust-cg-verify", default-features = false }
+trust-cg-irmid = { path = "crates/trust-cg-irmid" }
+trust-cg-eqsat-check = { path = "crates/trust-cg-eqsat-check" }
+trust-cg-verify = { path = "crates/trust-cg-verify", default-features = false, features = ["original-i128-cic"] }
 trust-cg-codegen = { path = "crates/trust-cg-codegen" }
 trust-cg-lift = { path = "crates/trust-cg-lift" }
 trust-cg-regalloc = { path = "crates/trust-cg-regalloc" }
-trust-cg-gpu = { path = "crates/trust-cg-gpu" }
 trust-cg-llvm-import = { path = "crates/trust-cg-llvm-import" }
 trust-cg-onnx-import = { path = "crates/trust-cg-onnx-import" }
 trust-cg-jit-matrix = { path = "crates/trust-cg-jit-matrix" }
@@ -79,10 +109,9 @@ trust-types = { path = "crates/trust-types-compat" }
 
 # Workspace-wide lint configuration.
 #
-# deny(warnings) is the zero-warnings ratchet checked by
-# `cargo run -p trust-cg-test --quiet -- ratchet warnings` (it is not run by
-# any automatic gate today; invoke it by hand). Production and test code must
-# compile without warnings. If a new warning is unavoidable (e.g., an
+# deny(warnings) makes every warning a build error, so production and test
+# code must compile without warnings; the pre-push `scripts/check_tippy.sh`
+# lane exercises it. If a new warning is unavoidable (e.g., an
 # inherited dependency quirk), prefer a narrowly-scoped `#[allow(...)]`
 # with a comment explaining why, rather than loosening this lint.
 #
@@ -93,33 +122,50 @@ trust-types = { path = "crates/trust-types-compat" }
 [workspace.lints.rust]
 warnings = "deny"
 
-[workspace.metadata.trust_cg.panic_clippy]
-# Baseline-aware panic-family lint gate. The command-line check uses these
-# exact lints as deny-level clippy diagnostics, then compares findings against
-# the generated panic audit baseline so accepted ledger entries keep compiling
-# while newly introduced production sites fail.
-command = "scripts/check_panic_clippy.sh"
-scope = "crates/*/src/** production code; tests and trust-cg-verify are excluded"
-lints = [
-    "clippy::unwrap_used",
-    "clippy::expect_used",
-    "clippy::panic",
-    "clippy::unreachable",
-    "clippy::todo",
-]
-
 [workspace.metadata.trust_cg.fmt]
 # rustfmt conformance gate. rustfmt.toml pins edition/style_edition 2024 and the
-# root rust-toolchain.toml pins the toolchain *with the rustfmt component*, so
-# the formatting is reproducible for every checkout rather than a function of
-# whichever rustfmt happens to be on PATH. The gate reports and exits; it never
-# rewrites, so a landing diff cannot pick up unreviewed reformatting.
+# root rust-toolchain.toml pins the Trust toolchain, whose `targo fmt`
+# (trustfmt) the gate runs, so the formatting is reproducible for every
+# checkout rather than a function of whichever rustfmt happens to be on PATH.
+# The gate reports and exits; it never rewrites, so a landing diff cannot pick
+# up unreviewed reformatting.
 command = "scripts/check_fmt.sh"
-scope = "every workspace member, via `cargo fmt --all -- --check`"
-fix = "cargo fmt --all"
+scope = "every workspace member, via `targo fmt --all -- --check`"
+fix = "targo fmt --all"
+
+# The AY identity rule (crates/trust-cg-verify/src/ay_identity.rs) digests the
+# toolchain AY (~90 MB) once per process before starting it. sha2's aarch64
+# backend is intrinsics that are not inlined at opt-level 0: measured
+# 2026-09-17 on this machine, 0.64-1.52 s per process with sha2 unoptimized
+# versus 35-50 ms with this package optimized (and 41-50 ms in release).
+# Retain optimized proof dependencies without local LTO during engineering builds.
+# Test inherits dev; release/bench retain their own settings.
+[profile.dev]
+lto = "off"
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+# Every rooted replay infers and reduces terms in this kernel. Optimize that
+# dependency for dev/test while inheriting their debug and overflow settings.
+# The bounded whole-case measurement is recorded in the development reports.
+[profile.dev.package.clean-kernel]
+opt-level = 2
+
+# The retained original-CIC route freshly drives the complete constant cone.
+[profile.dev.package.clean-olean]
+opt-level = 2
 
 [workspace.metadata.atpkg]
 # The one user-facing command for `trust-cg`. The rest of the workspace bins are internal
 # tooling (drivers, benches, matrices, JIT probes, the competition solver trust_cg_sat which,
 # if shipped, belongs as its own atpkg package).
 expose = ["trust-cg"]
+
+# Trust: policy for `targo trust` over this workspace.
+[trust]
+# No budget key: Trust retired `function_budget_ms` (its DECISION_QUEUE
+# BUDGET-1a; a targo that carries the retirement refuses the key here), so a
+# `targo trust` run of this workspace uses the toolchain's builtin clocks. The
+# verified lane is not part of the release gate; publish/DECISIONS.md
+# ("Anonymous clone gate") records why.

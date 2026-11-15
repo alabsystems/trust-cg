@@ -25,12 +25,52 @@ use std::process::Command;
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::{AArch64IsaProfile, TargetSpec};
 
 use trust_ir::{ICmpOp, Ty, UnOp};
 use trust_ir_build::ModuleBuilder;
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O) can link and run the objects.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
+}
+
+/// UDOT (vector, by element size S): `0 Q 1 01110 10 0 Rm 100101 Rn Rd`.
+fn is_udot_4s(word: u32) -> bool {
+    word & 0xbfe0_fc00 == 0x2e80_9400
+}
+
+/// Darwin's AOT target contract admits FEAT_DotProd, so the production
+/// `Compiler` lane runs there. Generic Linux AOT does not admit it and keeps
+/// the non-UDOT lowering (pinned below), so every native host also runs the
+/// explicit-DotProd pipeline lane, the only UDOT lane on Linux GNU. A host CPU
+/// without DotProd is a failure, never a skip.
+fn lanes() -> Vec<&'static str> {
+    let mut lanes = Vec::new();
+    if !native_host::LINUX_GNU {
+        lanes.push("darwin-aot");
+    }
+    if native_host::NATIVE {
+        assert!(
+            AArch64IsaProfile::DOTPROD.is_supported_by_host(),
+            "the explicit DotProd native lane requires host DotProd"
+        );
+        lanes.push("explicit-dotprod");
+    }
+    lanes
+}
+
+fn compile_lane(lane: &str, module: &trust_ir::Module, opt: OptLevel) -> Result<Vec<u8>, String> {
+    match lane {
+        "darwin-aot" => compile_at(module, opt),
+        "explicit-dotprod" => {
+            native_host::compile_with_isa_profile(module, opt, AArch64IsaProfile::DOTPROD)
+        }
+        _ => unreachable!("unknown lane {lane}"),
+    }
 }
 
 /// `kernel(ptr a, i32 n) -> i32`: `s = 0; for i in 0..n: s += ctpop(a[i])` —
@@ -78,14 +118,15 @@ fn build_module() -> trust_ir::Module {
         fb.ret(vec![result]);
         fb.build();
     }
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_at(module: &trust_ir::Module, opt: OptLevel) -> Result<Vec<u8>, String> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|r| r.object_code)
@@ -141,8 +182,8 @@ int main(void) {
 
 /// Link `obj` against the driver, run it, and return (exit_code, disassembly).
 fn link_run_disasm(tag: &str, obj: &[u8]) -> Option<(i32, String)> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -159,6 +200,7 @@ fn link_run_disasm(tag: &str, obj: &[u8]) -> Option<(i32, String)> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -186,36 +228,98 @@ fn link_run_disasm(tag: &str, obj: &[u8]) -> Option<(i32, String)> {
 #[test]
 fn e2e_aarch64_udot_popcount_accumulator_preserved() {
     let module = build_module();
-
-    // -O0: scalar SWAR baseline must already match the reference.
-    let obj0 = compile_at(&module, OptLevel::O0).expect("O0 must compile");
-    if let Some((code, _)) = link_run_disasm("udot_pc_o0", &obj0) {
-        assert_eq!(code, 0, "O0 scalar popcount reduction mismatch");
-    } else {
+    let lanes = lanes();
+    if lanes.is_empty() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return;
     }
+    for lane in lanes {
+        // -O0: scalar SWAR baseline must already match the reference.
+        let obj0 = compile_lane(lane, &module, OptLevel::O0)
+            .unwrap_or_else(|error| panic!("{lane} O0 must compile: {error}"));
+        if let Some((code, _)) = link_run_disasm(&format!("udot_pc_o0_{lane}"), &obj0) {
+            assert_eq!(code, 0, "{lane} O0 scalar popcount reduction mismatch");
+        } else {
+            return;
+        }
 
-    // -O2: the NEON popcount fold with the accumulating UDOT.
-    let obj2 = compile_at(&module, OptLevel::O2).expect("O2 must compile");
-    let Some((code, disasm)) = link_run_disasm("udot_pc_o2", &obj2) else {
-        return;
-    };
-
-    // The differential is only meaningful if the UDOT path actually fired.
-    if !disasm.is_empty() {
+        // -O2: the NEON popcount fold with the accumulating UDOT.
+        let obj2 = compile_lane(lane, &module, OptLevel::O2)
+            .unwrap_or_else(|error| panic!("{lane} O2 must compile: {error}"));
+        // Independent of any disassembler: the object's code carries UDOT.
         assert!(
-            disasm.contains("udot"),
-            "expected the accumulating UDOT in the -O2 kernel body; disasm:\n{disasm}"
+            native_host::text_words(&obj2).into_iter().any(is_udot_4s),
+            "{lane}: expected the accumulating UDOT in the -O2 kernel words"
         );
-        assert!(
-            !disasm.contains("uaddlp"),
-            "term-root ctpop must take the UDOT fast path, not the UADDLP chain"
+        let Some((code, disasm)) = link_run_disasm(&format!("udot_pc_o2_{lane}"), &obj2) else {
+            return;
+        };
+
+        // The differential is only meaningful if the UDOT path actually fired.
+        if !disasm.is_empty() {
+            assert!(
+                disasm.contains("udot"),
+                "{lane}: expected the accumulating UDOT in the -O2 kernel body; disasm:\n{disasm}"
+            );
+            assert!(
+                !disasm.contains("uaddlp"),
+                "{lane}: term-root ctpop must take the UDOT fast path, not the UADDLP chain"
+            );
+        }
+
+        // Bit-exact vs __builtin_popcount across edge patterns (incl. the
+        // SDOT-sensitive 0x80-heavy bytes) and vector/tail boundaries. A regalloc /
+        // DCE / scheduling violation of the UDOT's tied accumulator (operand 0
+        // def-use) corrupts the running sum and fails here.
+        assert_eq!(
+            code, 0,
+            "{lane} O2 UDOT popcount reduction mismatch vs reference"
         );
     }
+}
 
-    // Bit-exact vs __builtin_popcount across edge patterns (incl. the
-    // SDOT-sensitive 0x80-heavy bytes) and vector/tail boundaries. A regalloc /
-    // DCE / scheduling violation of the UDOT's tied accumulator (operand 0
-    // def-use) corrupts the running sum and fails here.
-    assert_eq!(code, 0, "O2 UDOT popcount reduction mismatch vs reference");
+/// Generic Linux AOT does not admit FEAT_DotProd: it must compile the same
+/// kernel without any UDOT word. Object-level, so it runs on every host.
+#[test]
+fn generic_linux_aot_never_emits_udot() {
+    let object = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: OptLevel::O2,
+            ..CompilerConfig::default()
+        },
+        TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&build_module())
+    .expect("generic Linux AOT keeps the non-UDOT popcount lowering")
+    .object_code;
+    native_host::assert_elf_aarch64_object(&object);
+    assert!(
+        !native_host::text_words(&object).into_iter().any(is_udot_4s),
+        "generic Linux AOT emitted UDOT without FEAT_DotProd admission"
+    );
+}
+
+/// The Linux GNU explicit-DotProd lane's object, checked at object level on
+/// every host: it compiles for the generic Linux triple and carries UDOT.
+#[test]
+fn explicit_dotprod_linux_object_carries_udot() {
+    let object = native_host::compile_with_isa_profile_for(
+        "aarch64-unknown-linux-gnu",
+        &build_module(),
+        OptLevel::O2,
+        AArch64IsaProfile::DOTPROD,
+    )
+    .expect("explicit DotProd Linux object");
+    native_host::assert_elf_aarch64_object(&object);
+    assert!(native_host::text_words(&object).into_iter().any(is_udot_4s));
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

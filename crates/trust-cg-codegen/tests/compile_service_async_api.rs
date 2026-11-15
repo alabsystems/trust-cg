@@ -342,7 +342,10 @@ fn cache_lookup_outcome_codes_are_stable_lower_snake_case() {
 
 #[test]
 fn submit_poll_start_and_finish_installable() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-installable-artifact", 1);
     let request = request("async-installable", 1).with_artifact_manifest(manifest.clone());
     let request_id = request.request_id.clone();
@@ -390,7 +393,10 @@ fn submit_poll_start_and_finish_installable() {
 
 #[test]
 fn explicit_compile_plan_survives_async_worker_boundary() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let mut compile_request = request("async-explicit-plan", 29);
     compile_request.install_intent = InstallIntent::CompileOnly;
     let request_id = compile_request.request_id.clone();
@@ -446,7 +452,10 @@ fn explicit_compile_plan_survives_async_worker_boundary() {
 
 #[test]
 fn finish_plan_rejects_response_from_a_different_target() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let mut compile_request = request("async-plan-target-mismatch", 31);
     compile_request.install_intent = InstallIntent::CompileOnly;
     let expected_target = TargetSpec::parse("x86_64-pc-windows-msvc").unwrap();
@@ -478,7 +487,10 @@ fn finish_plan_rejects_response_from_a_different_target() {
 
 #[test]
 fn installable_response_without_async_gate_metadata_fails_closed() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-missing-gate-artifact", 30);
     let request = request("async-missing-gate", 30).with_artifact_manifest(manifest.clone());
     let request_id = request.request_id.clone();
@@ -558,7 +570,10 @@ fn installable_response_rejected_or_mismatched_async_gate_metadata_fails_closed(
             ),
         ]
     } {
-        let mut async_service = AsyncCompileService::default();
+        let mut async_service = AsyncCompileService::new(
+            permit_compile_service(),
+            trust_cg_codegen::AsyncCompileServiceConfig::default(),
+        );
         let request =
             request(&format!("async-{label}-gate"), 31).with_artifact_manifest(manifest.clone());
         let request_id = request.request_id.clone();
@@ -592,7 +607,10 @@ fn installable_response_rejected_or_mismatched_async_gate_metadata_fails_closed(
 
 #[test]
 fn async_finish_extracts_response_native_install_gate_packet() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-response-derived-gate", 32);
     let response_gate = gate_packet(
         &manifest,
@@ -638,7 +656,10 @@ fn async_finish_extracts_response_native_install_gate_packet() {
 
 #[test]
 fn async_finish_response_gate_overrides_seeded_accepted_packet() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-response-rejected-gate", 33);
     let seeded_gate = gate_packet(
         &manifest,
@@ -700,7 +721,10 @@ fn async_finish_response_gate_overrides_seeded_accepted_packet() {
 
 #[test]
 fn profile_only_response_polls_non_installable() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-profile-only-artifact", 2);
     let mut request = request("async-profile-only", 2).with_artifact_manifest(manifest.clone());
     request.install_intent = InstallIntent::CompileOnly;
@@ -761,10 +785,13 @@ fn profile_only_response_polls_non_installable() {
 
 #[test]
 fn immediate_submit_rejections_use_stable_codes() {
-    let mut queue_full = AsyncCompileService::with_default_service(AsyncCompileServiceConfig {
-        max_queued: 0,
-        ..AsyncCompileServiceConfig::default()
-    });
+    let mut queue_full = AsyncCompileService::new(
+        permit_compile_service(),
+        AsyncCompileServiceConfig {
+            max_queued: 0,
+            ..AsyncCompileServiceConfig::default()
+        },
+    );
     let reject = queue_full
         .submit(request("queue-full", 1))
         .expect_err("queue full");
@@ -783,18 +810,23 @@ fn immediate_submit_rejections_use_stable_codes() {
     assert_eq!(queue_full.telemetry_summary().reject, 1);
     assert_metadata_only_telemetry(&queue_full);
 
-    let mut budget_exceeded =
-        AsyncCompileService::with_default_service(AsyncCompileServiceConfig {
+    let mut budget_exceeded = AsyncCompileService::new(
+        permit_compile_service(),
+        AsyncCompileServiceConfig {
             max_total_submitted: Some(0),
             ..AsyncCompileServiceConfig::default()
-        });
+        },
+    );
     let reject = budget_exceeded
         .submit(request("budget-exceeded", 1))
         .expect_err("budget exceeded");
     assert_eq!(reject.code, AsyncSubmitRejectCode::BudgetExceeded);
     assert_eq!(reject.code.as_str(), "budget_exceeded");
 
-    let mut stale = AsyncCompileService::default();
+    let mut stale = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let mut stale_request = request("stale-submit", 1);
     stale_request.stale_before = Some(CompileGeneration::new(2));
     let reject = stale.submit(stale_request).expect_err("stale");
@@ -802,7 +834,10 @@ fn immediate_submit_rejections_use_stable_codes() {
     assert_eq!(reject.code.as_str(), "stale_generation");
     assert_eq!(reject.state, AsyncCompileState::StaleGeneration);
 
-    let mut cancelled = AsyncCompileService::default();
+    let mut cancelled = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let mut cancelled_request = request("cancelled-submit", 1);
     cancelled_request.cancellation = CancellationToken::cancelled();
     let reject = cancelled.submit(cancelled_request).expect_err("cancelled");
@@ -814,7 +849,10 @@ fn immediate_submit_rejections_use_stable_codes() {
 
 #[test]
 fn cancelled_queued_work_never_starts_backend_compilation() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let request = request("cancel-queued", 3);
     let request_id = request.request_id.clone();
     async_service.submit(request).expect("submit accepted");
@@ -841,7 +879,10 @@ fn cancelled_queued_work_never_starts_backend_compilation() {
 #[test]
 fn cancelled_before_start_telemetry_includes_terminal_join_fields() {
     let cancellation = CancellationToken::new();
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let mut request = request("cancel-before-start", 13);
     request.cancellation = cancellation.clone();
     let request_id = request.request_id.clone();
@@ -878,7 +919,10 @@ fn cancelled_before_start_telemetry_includes_terminal_join_fields() {
 
 #[test]
 fn cancelled_running_work_cannot_publish_installable_response() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let request = request("cancel-running", 4);
     let request_id = request.request_id.clone();
     async_service.submit(request).expect("submit accepted");
@@ -906,7 +950,10 @@ fn cancelled_running_work_cannot_publish_installable_response() {
 #[test]
 fn stale_before_start_telemetry_includes_terminal_join_fields() {
     let fence = CompileGenerationFence::new();
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let mut request = request("stale-before-start", 14);
     request.generation_fence = Some(fence.clone());
     let request_id = request.request_id.clone();
@@ -944,7 +991,10 @@ fn stale_before_start_telemetry_includes_terminal_join_fields() {
 #[test]
 fn stale_generation_running_work_cannot_publish_installable_response() {
     let fence = CompileGenerationFence::new();
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let mut request = request("stale-running", 10);
     request.generation_fence = Some(fence.clone());
     let request_id = request.request_id.clone();
@@ -979,7 +1029,10 @@ fn stale_generation_running_work_cannot_publish_installable_response() {
 
 #[test]
 fn duplicate_and_unknown_poll_are_typed_non_installable_states() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let request = request("duplicate", 1);
     async_service
         .submit(request.clone())
@@ -996,7 +1049,10 @@ fn duplicate_and_unknown_poll_are_typed_non_installable_states() {
 
 #[test]
 fn duplicate_submit_does_not_overwrite_retained_terminal_success() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-duplicate-terminal", 1);
     let request = request("duplicate-terminal", 1).with_artifact_manifest(manifest.clone());
     let request_id = request.request_id.clone();
@@ -1032,7 +1088,10 @@ fn duplicate_submit_does_not_overwrite_retained_terminal_success() {
 
 #[test]
 fn compiled_rejected_response_has_async_explain_reject() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let request = request("compiled-rejected", 7);
     let request_id = request.request_id.clone();
     async_service.submit(request).expect("submit accepted");
@@ -1057,7 +1116,10 @@ fn compiled_rejected_response_has_async_explain_reject() {
 
 #[test]
 fn failed_response_emits_failed_metadata_only_telemetry() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     async_service
         .submit(request("failed-telemetry", 8))
         .expect("submit accepted");
@@ -1084,7 +1146,10 @@ fn failed_response_emits_failed_metadata_only_telemetry() {
 
 #[test]
 fn telemetry_json_is_deterministic_and_carries_join_keys() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-manifest-telemetry", 9);
     let expected_manifest_ref = format!(
         "{}:{}:{}:{}",
@@ -1208,7 +1273,10 @@ fn telemetry_json_is_deterministic_and_carries_join_keys() {
 
 #[test]
 fn async_submit_and_poll_record_manifest_cache_hit_outcome() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-cache-hit", 16);
     let cache_key = manifest_cache_key(&manifest);
     record_accepted_cache_insert(&mut async_service, &manifest);
@@ -1283,7 +1351,10 @@ fn async_manifest_cache_non_authorizing_outcomes_do_not_publish_installable_poll
             AsyncCacheLookupOutcome::UnsupportedRequiredFeature,
         ),
     ] {
-        let mut async_service = AsyncCompileService::default();
+        let mut async_service = AsyncCompileService::new(
+            permit_compile_service(),
+            trust_cg_codegen::AsyncCompileServiceConfig::default(),
+        );
         let manifest = deterministic_manifest(artifact_id, 17);
         let cache_key = manifest_cache_key(&manifest);
         async_service.record_manifest_cache_entry(&manifest, outcome);
@@ -1309,7 +1380,10 @@ fn async_manifest_cache_non_authorizing_outcomes_do_not_publish_installable_poll
 
 #[test]
 fn async_manifest_cache_installable_hit_without_gate_metadata_fails_closed() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-cache-missing-gate", 26);
     async_service.record_manifest_cache_entry(&manifest, AsyncCacheLookupOutcome::HitInstallable);
 
@@ -1379,7 +1453,10 @@ fn async_manifest_cache_insert_revalidates_gate_metadata() {
             None,
         ),
     ] {
-        let mut async_service = AsyncCompileService::default();
+        let mut async_service = AsyncCompileService::new(
+            permit_compile_service(),
+            trust_cg_codegen::AsyncCompileServiceConfig::default(),
+        );
         if let Some(insert_gate) = insert_gate {
             async_service.record_manifest_cache_insert_gate_entry(
                 &manifest,
@@ -1469,7 +1546,10 @@ fn async_manifest_cache_hit_revalidates_gate_surface_and_identity() {
             "sha256:other-telemetry",
         ),
     ] {
-        let mut async_service = AsyncCompileService::default();
+        let mut async_service = AsyncCompileService::new(
+            permit_compile_service(),
+            trust_cg_codegen::AsyncCompileServiceConfig::default(),
+        );
         record_accepted_cache_insert(&mut async_service, &manifest);
         async_service.record_manifest_cache_gate_entry_with_identity(
             &manifest,
@@ -1514,7 +1594,10 @@ fn async_manifest_cache_hit_revalidates_current_generation() {
     stale_gate.freshness.current_generation += 1;
     persist_native_install_gate_packet_bindings(&mut stale_gate);
 
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     record_accepted_cache_insert(&mut async_service, &manifest);
     async_service.record_manifest_cache_gate_entry_with_identity(
         &manifest,
@@ -1577,7 +1660,10 @@ fn async_manifest_cache_rejects_stale_or_mismatched_gate_metadata() {
             None,
         ),
     ] {
-        let mut async_service = AsyncCompileService::default();
+        let mut async_service = AsyncCompileService::new(
+            permit_compile_service(),
+            trust_cg_codegen::AsyncCompileServiceConfig::default(),
+        );
         record_accepted_cache_insert(&mut async_service, &manifest);
         async_service.record_manifest_cache_gate_entry(
             &manifest,
@@ -1611,7 +1697,10 @@ fn async_manifest_cache_rejects_stale_or_mismatched_gate_metadata() {
 
 #[test]
 fn async_manifest_cache_miss_is_recorded_for_uncached_manifest() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-cache-miss", 18);
     let cache_key = manifest_cache_key(&manifest);
     let request = request("cache-miss-request", 18).with_artifact_manifest(manifest);
@@ -1634,7 +1723,10 @@ fn async_manifest_cache_miss_is_recorded_for_uncached_manifest() {
 
 #[test]
 fn duplicate_in_flight_async_submit_dedupes_by_manifest_cache_key() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-cache-dedupe", 19);
     let cache_key = manifest_cache_key(&manifest);
     let first = request("cache-dedupe-first", 19).with_artifact_manifest(manifest.clone());
@@ -1694,7 +1786,10 @@ fn duplicate_in_flight_async_submit_dedupes_by_manifest_cache_key() {
 
 #[test]
 fn duplicate_request_id_reject_does_not_release_manifest_cache_owner() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-cache-owner", 21);
     let cache_key = manifest_cache_key(&manifest);
     let original = request("cache-owner-original", 21).with_artifact_manifest(manifest.clone());
@@ -1782,7 +1877,10 @@ fn duplicate_request_id_reject_does_not_release_manifest_cache_owner() {
 
 #[test]
 fn telemetry_records_async_lifecycle_events() {
-    let mut async_service = AsyncCompileService::default();
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        trust_cg_codegen::AsyncCompileServiceConfig::default(),
+    );
     let manifest = deterministic_manifest("async-lifecycle-telemetry", 11);
     let request = request("lifecycle-telemetry", 11).with_artifact_manifest(manifest.clone());
     let request_id = request.request_id.clone();
@@ -1832,10 +1930,13 @@ fn telemetry_records_async_lifecycle_events() {
 
 #[test]
 fn terminal_poll_reports_evicted_when_retention_is_exceeded() {
-    let mut async_service = AsyncCompileService::with_default_service(AsyncCompileServiceConfig {
-        max_terminal_retained: 1,
-        ..AsyncCompileServiceConfig::default()
-    });
+    let mut async_service = AsyncCompileService::new(
+        permit_compile_service(),
+        AsyncCompileServiceConfig {
+            max_terminal_retained: 1,
+            ..AsyncCompileServiceConfig::default()
+        },
+    );
     let first = request("evicted-first", 1);
     let first_id = first.request_id.clone();
     async_service.submit(first).expect("first submit");
@@ -1860,4 +1961,16 @@ fn terminal_poll_reports_evicted_when_retention_is_exceeded() {
         async_service.poll(&first_id).state,
         AsyncCompileState::Evicted
     );
+}
+
+/// This file's fixtures carry no codegen license (`body_gate: None`), which
+/// the compile service REFUSES by default (roadmap WS7.5, decision gate
+/// DG-73). Its services state `Permit` explicitly, so no request passes
+/// because it was silently refused.
+fn permit_compile_service() -> trust_cg_codegen::CompileService {
+    trust_cg_codegen::CompileService::new(trust_cg_codegen::CompileServiceConfig {
+        codegen_license: trust_cg_codegen::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit),
+        ..trust_cg_codegen::CompileServiceConfig::default()
+    })
 }

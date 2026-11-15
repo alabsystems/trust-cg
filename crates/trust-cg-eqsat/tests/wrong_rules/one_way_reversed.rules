@@ -1,0 +1,9 @@
+; mutant-of: double_to_mul
+; mutation: a one-way (refines) rule used right to left (sides swapped)
+; subject: i64
+(rule double_to_mul
+  (direction refines)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x (const 2)))
+  (rhs (add ?x ?x))
+  (where))

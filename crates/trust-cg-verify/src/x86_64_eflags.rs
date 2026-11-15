@@ -7,7 +7,6 @@
 // verification. This is the x86-64 analogue of `nzcv.rs`.
 //
 // Reference: Intel 64 and IA-32 Architectures Software Developer's Manual
-// Reference: designs/2026-04-13-verification-architecture.md, "Flag Correctness"
 
 //! x86-64 EFLAGS model and condition code evaluation.
 //!
@@ -120,6 +119,66 @@ pub fn encode_cmp_eflags(src1: SmtExpr, src2: SmtExpr, width: u32) -> EflagsFlag
         sf,
         of_,
         pf,
+    }
+}
+
+/// Encode x86-64 `ADD` semantics as EFLAGS expressions.
+///
+/// `ADD src1, src2` computes `result = src1 + src2` (wrapping at `width`) and
+/// sets every status flag according to it (Intel SDM Vol 2A, ADD: "The OF,
+/// SF, ZF, AF, CF, and PF flags are set according to the result"):
+///
+/// - `CF` = the carry out of the most significant bit: bit `width` of the
+///   `width + 1`-bit sum of the zero-extended operands
+/// - `ZF = (result == 0)`
+/// - `SF = result[MSB]`
+/// - `OF = (sign(src1) == sign(src2)) AND (sign(result) != sign(src1))`
+/// - `PF = even_parity(result[7:0])`
+pub fn encode_add_eflags(src1: SmtExpr, src2: SmtExpr, width: u32) -> EflagsFlags {
+    let result = src1.clone().bvadd(src2.clone());
+    let msb = |value: SmtExpr| value.extract(width - 1, width - 1);
+    let cf = src1
+        .clone()
+        .zero_ext(1)
+        .bvadd(src2.clone().zero_ext(1))
+        .extract(width, width)
+        .eq_expr(SmtExpr::bv_const(1, 1));
+    let zf = result.clone().eq_expr(SmtExpr::bv_const(0, width));
+    let sf = msb(result.clone()).eq_expr(SmtExpr::bv_const(1, 1));
+    let pf = encode_parity_low8(&result);
+    let of_ = msb(src1.clone())
+        .eq_expr(msb(src2))
+        .and_expr(msb(src1).eq_expr(msb(result)).not_expr());
+    EflagsFlags {
+        cf,
+        zf,
+        sf,
+        of_,
+        pf,
+    }
+}
+
+/// Encode x86-64 `TEST` semantics as EFLAGS expressions.
+///
+/// `TEST src1, src2` computes `src1 AND src2`, discards it, and updates the
+/// flags from it (Intel SDM Vol 2B, TEST: "The OF and CF flags are set to 0.
+/// The SF, ZF, and PF flags are set according to the result."):
+///
+/// - `CF = 0`, `OF = 0`
+/// - `ZF = (result == 0)`
+/// - `SF = result[MSB]`
+/// - `PF = even_parity(result[7:0])`
+pub fn encode_test_eflags(src1: SmtExpr, src2: SmtExpr, width: u32) -> EflagsFlags {
+    let result = src1.bvand(src2);
+    EflagsFlags {
+        cf: SmtExpr::bool_const(false),
+        zf: result.clone().eq_expr(SmtExpr::bv_const(0, width)),
+        sf: result
+            .clone()
+            .extract(width - 1, width - 1)
+            .eq_expr(SmtExpr::bv_const(1, 1)),
+        of_: SmtExpr::bool_const(false),
+        pf: encode_parity_low8(&result),
     }
 }
 

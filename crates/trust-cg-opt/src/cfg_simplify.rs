@@ -36,7 +36,8 @@
 //!
 //! Reference: LLVM `SimplifyCFG`, `BranchFolding`
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -45,6 +46,8 @@ use trust_cg_ir::{
 
 use crate::effects::{for_each_inst_def, inst_defines_vreg};
 use crate::pass_manager::{AnalysisCache, MachinePass};
+
+mod eh_identity;
 
 /// CFG simplification pass.
 pub struct CfgSimplify;
@@ -223,7 +226,7 @@ fn cfg_simplify_pass_id() -> PassId {
 /// a semantic change, not a cleanup). Empty for non-EH functions, so all
 /// guards keyed on this set are no-ops on the common path.
 fn eh_referenced_blocks(func: &MachFunction) -> HashSet<BlockId> {
-    let mut set = HashSet::new();
+    let mut set = HashSet::default();
     for pad in &func.eh_metadata.landing_pads {
         set.insert(pad.block);
     }
@@ -363,8 +366,9 @@ fn remove_unreachable_blocks(
         );
     }
 
-    func.block_order.retain(|bid| reachable.contains(bid));
+    // Authenticate pruning against the old layout, before hiding dead owners.
     prune_eh_metadata_for_removed_blocks(func, &reachable);
+    func.block_order.retain(|bid| reachable.contains(bid));
     true
 }
 
@@ -387,6 +391,11 @@ fn remove_unreachable_blocks(
 /// cleared too: an LSDA-less function must not drag a personality symbol into
 /// the object.
 fn prune_eh_metadata_for_removed_blocks(func: &mut MachFunction, reachable: &HashSet<BlockId>) {
+    // Only an authentic one-to-one dead handler may lose its exact binding.
+    // Keep malformed/orphan records so pruning cannot repair them silently.
+    let Some(pruned_bindings) = eh_identity::prunable_bindings(func, reachable) else {
+        return;
+    };
     let eh = &mut func.eh_metadata;
     if eh.landing_pads.is_empty() && eh.call_sites.is_empty() {
         return;
@@ -397,16 +406,23 @@ fn prune_eh_metadata_for_removed_blocks(func: &mut MachFunction, reachable: &Has
     eh.call_sites
         .retain(|cs| reachable.contains(&cs.call_block));
     eh.landing_pads.retain(|lp| reachable.contains(&lp.block));
+    if let trust_cg_ir::function::EhCallSiteBindings::ExactInstructions(bindings) =
+        &mut eh.call_site_bindings
+    {
+        bindings.retain(|binding| !pruned_bindings.contains(binding));
+    }
 
     let pruned = eh.landing_pads.len() != before_pads || eh.call_sites.len() != before_sites;
-    if pruned && eh.landing_pads.is_empty() && eh.call_sites.is_empty() {
+    let has_exact_bindings = matches!(&eh.call_site_bindings,
+        trust_cg_ir::function::EhCallSiteBindings::ExactInstructions(bindings) if !bindings.is_empty());
+    if pruned && eh.landing_pads.is_empty() && eh.call_sites.is_empty() && !has_exact_bindings {
         eh.personality = None;
     }
 }
 
 /// BFS from entry to find all reachable block IDs.
 fn compute_reachable(func: &MachFunction) -> HashSet<BlockId> {
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     let mut queue = VecDeque::new();
 
     visited.insert(func.entry);
@@ -594,7 +610,7 @@ fn simplify_branch_targets(
 }
 
 fn single_jump_block_map(func: &MachFunction) -> HashMap<BlockId, BlockId> {
-    let mut jump_map = HashMap::new();
+    let mut jump_map = HashMap::default();
     // A landing pad is entered by the UNWINDER (via the LSDA), not by a
     // branch: even when its body has collapsed to a bare `B`, it must keep
     // its own layout position, so it can never be an eliminate/thread-through
@@ -625,7 +641,7 @@ fn single_jump_block_map(func: &MachFunction) -> HashMap<BlockId, BlockId> {
 /// Resolve chains in the jump map: if A→B and B→C, produce A→C.
 /// Limit chain length to prevent infinite loops on cycles.
 fn resolve_chains(jump_map: &HashMap<BlockId, BlockId>) -> HashMap<BlockId, BlockId> {
-    let mut resolved = HashMap::new();
+    let mut resolved = HashMap::default();
     for &src in jump_map.keys() {
         if let Some(target) = resolve_chain_target(jump_map, src) {
             resolved.insert(src, target);
@@ -636,7 +652,7 @@ fn resolve_chains(jump_map: &HashMap<BlockId, BlockId>) -> HashMap<BlockId, Bloc
 
 fn resolve_chain_target(jump_map: &HashMap<BlockId, BlockId>, src: BlockId) -> Option<BlockId> {
     let mut target = *jump_map.get(&src)?;
-    let mut seen = HashSet::from([src]);
+    let mut seen = HashSet::from_iter([src]);
     let mut depth = 0;
 
     loop {
@@ -671,7 +687,7 @@ fn fold_unconditional_branches(
     // We may need multiple passes since merging can create new opportunities.
     // But the outer loop in run() handles this; do one pass here.
     let order = func.block_order.clone();
-    let mut merged_away: HashSet<BlockId> = HashSet::new();
+    let mut merged_away: HashSet<BlockId> = HashSet::default();
     // EH boundary: never merge INTO an invoke call-site block (the merged
     // instructions would land inside the protected PC range and any call
     // among them would wrongly dispatch to this site's landing pad), and
@@ -925,8 +941,8 @@ struct ZeroTestDefs {
 }
 
 fn build_zero_test_defs(func: &MachFunction) -> ZeroTestDefs {
-    let mut def_count: HashMap<VReg, u32> = HashMap::new();
-    let mut single_def: HashMap<VReg, (BlockId, usize)> = HashMap::new();
+    let mut def_count: HashMap<VReg, u32> = HashMap::default();
+    let mut single_def: HashMap<VReg, (BlockId, usize)> = HashMap::default();
     for &bid in &func.block_order {
         for (pos, &iid) in func.block(bid).insts.iter().enumerate() {
             let inst = func.inst(iid);
@@ -944,34 +960,42 @@ fn build_zero_test_defs(func: &MachFunction) -> ZeroTestDefs {
 
 /// Follow `v` through SINGLE-DEF, SAME-CLASS `MovR`/`Copy` links (bounded) to
 /// the first vreg that is multi-def, undefined, or produced by a non-copy —
-/// the canonical root. A single-def link's value can never change, so testing
-/// any vreg in the chain tests the root's value AT THE LINK'S DEF SITE; the
-/// caller must separately prove the root itself is not redefined between the
-/// two test sites.
-fn zero_test_chain_root(func: &MachFunction, defs: &ZeroTestDefs, mut v: VReg) -> VReg {
+/// the canonical root. Returns the root and the `(block, position)` def site
+/// of every link walked, outermost (`v`'s own def) first; empty when `v` is
+/// the root. A single-def link's value can never change, so testing `v` tests
+/// the root's value AT THE INNERMOST LINK'S DEF SITE, which may precede a
+/// redefinition of a multi-def root: the caller must place every link site
+/// where the root already holds the value the edge fact describes.
+fn zero_test_chain_root(
+    func: &MachFunction,
+    defs: &ZeroTestDefs,
+    mut v: VReg,
+) -> (VReg, Vec<(BlockId, usize)>) {
+    let mut sites = Vec::new();
     for _ in 0..4 {
         if defs.def_count.get(&v).copied() != Some(1) {
-            return v;
+            return (v, sites);
         }
         let Some(&(b, pos)) = defs.single_def.get(&v) else {
-            return v;
+            return (v, sites);
         };
         let Some(&iid) = func.block(b).insts.get(pos) else {
-            return v;
+            return (v, sites);
         };
         let inst = func.inst(iid);
         if !matches!(inst.opcode, AArch64Opcode::MovR | AArch64Opcode::Copy) {
-            return v;
+            return (v, sites);
         }
         let Some(src) = inst.operands.get(1).and_then(MachOperand::as_vreg) else {
-            return v;
+            return (v, sites);
         };
         if src.class != v.class {
-            return v;
+            return (v, sites);
         }
+        sites.push((b, pos));
         v = src;
     }
-    v
+    (v, sites)
 }
 
 /// The `(register, fact)` established on the edge `d -> p`, if `d`'s
@@ -1036,9 +1060,11 @@ fn edge_zero_fact(func: &MachFunction, d: BlockId, p: BlockId) -> Option<(VReg, 
 ///
 /// Soundness: the block has exactly one predecessor and the fact holds on
 /// that edge, so it holds on every entry; the register must have no def in
-/// the block before the resolved branch (same conservative same-block
-/// discipline as `same_block_constant_def_before` — no cross-block reaching
-/// analysis is attempted).
+/// the block before the resolved branch, and both tested registers must read
+/// the shared root inside the window from its last def in the predecessor to
+/// the resolved branch (same conservative same-block discipline as
+/// `same_block_constant_def_before` — no cross-block reaching analysis is
+/// attempted).
 fn resolve_dominated_zero_tests(
     func: &mut MachFunction,
     provenance: Option<&mut ProvenanceMap>,
@@ -1083,41 +1109,64 @@ fn resolve_dominated_zero_tests(
         // single-def copy links (the importer emits a fresh carrier copy per
         // test: `MovR t1, b; cbz t1` at the header, `MovR t2, b; cbnz t2` at
         // the guard).
-        let root = zero_test_chain_root(func, &defs, r);
-        if zero_test_chain_root(func, &defs, fact_reg) != root {
+        let (root, r_sites) = zero_test_chain_root(func, &defs, r);
+        let (fact_root, fact_sites) = zero_test_chain_root(func, &defs, fact_reg);
+        if fact_root != root {
             continue;
         }
         // The root's value must be provably the same at both test sites.
-        // Conservative discipline, no cross-block reaching analysis:
-        //  * pred side: the fact-carrying vreg is either the root itself, or
-        //    its single def sits in `pred` with no later def of the root in
-        //    that block;
-        //  * this side: no def of the root (or of the tested vreg) before the
-        //    conditional in this block.
+        // Conservative discipline, no cross-block reaching analysis: the
+        // window runs from just after the root's LAST def in `pred` (or the
+        // start of `pred`) through `pred`'s conditional and on to this
+        // block's conditional, and must contain no def of the root, so the
+        // root holds one value throughout it. A tested vreg that is the root
+        // reads that value at its test; one reached through copy links reads
+        // the root at its innermost link's def, so every link must lie in the
+        // window, each executing after the link it reads (a link outside it
+        // can capture the root before a redefinition: `old = b; b = b - 1;
+        // f = b; cbz f` says nothing about `old`).
         let root_def_positions = |b: BlockId, from: usize, to: usize| -> bool {
             func.block(b).insts[from..to]
                 .iter()
                 .any(|&id| inst_defines_vreg(func.inst(id), root))
         };
-        if fact_reg != root {
-            let Some(&(fb, fpos)) = defs.single_def.get(&fact_reg) else {
-                continue;
-            };
-            if fb != pred {
-                continue;
-            }
-            if root_def_positions(pred, fpos + 1, func.block(pred).insts.len()) {
-                continue;
-            }
-        }
         let cond_pos = block.insts.iter().position(|&id| id == cond_id).unwrap();
         if root_def_positions(bid, 0, cond_pos) {
             continue;
         }
-        // (No separate check on `r` itself: if `r` is multi-def it IS the
-        // root and the root region check above covers it; if single-def, its
-        // one def is the value-preserving chain link, whose source value the
-        // root checks pin.)
+        let pred_insts = &func.block(pred).insts;
+        let window_start = pred_insts
+            .iter()
+            .rposition(|&id| inst_defines_vreg(func.inst(id), root))
+            .map_or(0, |p| p + 1);
+        // Execution order along `pred -> bid`; `None` outside the window.
+        let window_order = |(b, pos): (BlockId, usize)| -> Option<usize> {
+            if b == pred && pos >= window_start {
+                Some(pos)
+            } else if b == bid && pos < cond_pos {
+                Some(pred_insts.len() + pos)
+            } else {
+                None
+            }
+        };
+        // Outermost link first: each site must execute before `before` (the
+        // test, then the outer link that reads this one).
+        let chain_in_window = |sites: &[(BlockId, usize)], mut before: usize| -> bool {
+            sites.iter().all(|&site| match window_order(site) {
+                Some(order) if order < before => {
+                    before = order;
+                    true
+                }
+                _ => false,
+            })
+        };
+        // `pred`'s conditional ends the block (no def follows it), so its
+        // chain must sit in `pred`; this block's chain must precede `cond`.
+        if !chain_in_window(&fact_sites, pred_insts.len())
+            || !chain_in_window(&r_sites, pred_insts.len() + cond_pos)
+        {
+            continue;
+        }
         let taken = (matches!(fact, ZeroFact::Zero) && cond.opcode.is_cbz())
             || (matches!(fact, ZeroFact::NonZero) && cond.opcode.is_cbnz());
         if taken {
@@ -2345,7 +2394,7 @@ mod tests {
 
     #[test]
     fn test_resolve_chains_rejects_cycles() {
-        let jump_map = HashMap::from([(BlockId(1), BlockId(2)), (BlockId(2), BlockId(1))]);
+        let jump_map = HashMap::from_iter([(BlockId(1), BlockId(2)), (BlockId(2), BlockId(1))]);
         let resolved = resolve_chains(&jump_map);
         assert!(resolved.is_empty());
     }
@@ -2834,5 +2883,177 @@ mod tests {
         let branch = func.inst(cbnz);
         assert_eq!(branch.opcode, AArch64Opcode::B);
         assert_eq!(branch.operands, vec![block(fallthrough.0)]);
+    }
+
+    // ---- Dominated zero-test resolution ----
+    //
+    // Vregs (all Gpr32): p = 0 (incoming value, no def), b = 1 (the
+    // multi-def scalar SROA makes of a stack slot stored twice), old = 2,
+    // b_minus_1 = 3, f = 4, g = 5, the returned value = 9.
+
+    fn w(id: u32) -> MachOperand {
+        vreg_class(id, RegClass::Gpr32)
+    }
+
+    fn emit(
+        func: &mut MachFunction,
+        b: BlockId,
+        opcode: AArch64Opcode,
+        operands: Vec<MachOperand>,
+    ) -> InstId {
+        let id = func.push_inst(MachInst::new(opcode, operands));
+        func.append_inst(b, id);
+        id
+    }
+
+    /// `MovI w9, #value; Ret`; returns the `MovI` so a test can check the arm
+    /// is still laid out.
+    fn emit_return_arm(func: &mut MachFunction, b: BlockId, value: i64) -> InstId {
+        let movi = emit(func, b, AArch64Opcode::MovI, vec![w(9), imm(value)]);
+        emit(func, b, AArch64Opcode::Ret, vec![]);
+        movi
+    }
+
+    fn inst_is_laid_out(func: &MachFunction, id: InstId) -> bool {
+        func.block_order
+            .iter()
+            .any(|&b| func.block(b).insts.contains(&id))
+    }
+
+    /// The dominated re-test diamond (`bb2`'s only predecessor is `bb0`):
+    ///   bb0: <entry>;  Cbz  <fact>,   bb1; B bb2
+    ///   bb1: return 1
+    ///   bb2: <retest>; Cbnz <tested>, bb3; B bb4
+    ///   bb3: return 2
+    ///   bb4: return 3
+    /// Returns the function, `bb2`'s `Cbnz`, and `bb4`'s `MovI #3`.
+    fn dominated_retest_diamond(
+        entry: &[(AArch64Opcode, Vec<MachOperand>)],
+        fact: MachOperand,
+        retest: &[(AArch64Opcode, Vec<MachOperand>)],
+        tested: MachOperand,
+    ) -> (MachFunction, InstId, InstId) {
+        let mut func = empty_func();
+        let bb0 = BlockId(0);
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let bb4 = func.create_block();
+        for (opcode, operands) in entry {
+            emit(&mut func, bb0, *opcode, operands.clone());
+        }
+        emit(&mut func, bb0, AArch64Opcode::Cbz, vec![fact, block(bb1.0)]);
+        emit(&mut func, bb0, AArch64Opcode::B, vec![block(bb2.0)]);
+        emit_return_arm(&mut func, bb1, 1);
+        for (opcode, operands) in retest {
+            emit(&mut func, bb2, *opcode, operands.clone());
+        }
+        let cbnz = emit(
+            &mut func,
+            bb2,
+            AArch64Opcode::Cbnz,
+            vec![tested, block(bb3.0)],
+        );
+        emit(&mut func, bb2, AArch64Opcode::B, vec![block(bb4.0)]);
+        emit_return_arm(&mut func, bb3, 2);
+        let return_three = emit_return_arm(&mut func, bb4, 3);
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb0, bb2);
+        func.add_edge(bb2, bb3);
+        func.add_edge(bb2, bb4);
+        (func, cbnz, return_three)
+    }
+
+    /// The re-test must survive: the sub-pass declines and leaves the `Cbnz`
+    /// unchanged, and the whole pass keeps `bb4`'s `return 3` arm.
+    fn assert_dominated_retest_kept(
+        entry: &[(AArch64Opcode, Vec<MachOperand>)],
+        fact: MachOperand,
+        retest: &[(AArch64Opcode, Vec<MachOperand>)],
+        tested: MachOperand,
+    ) {
+        let (mut func, cbnz, _) =
+            dominated_retest_diamond(entry, fact.clone(), retest, tested.clone());
+        assert!(
+            !resolve_dominated_zero_tests(&mut func, None),
+            "the re-test reads a different value of the root than the edge fact"
+        );
+        let branch = func.inst(cbnz);
+        assert_eq!(branch.opcode, AArch64Opcode::Cbnz);
+        assert_eq!(branch.operands, vec![tested.clone(), block(3)]);
+
+        let (mut func, _, return_three) = dominated_retest_diamond(entry, fact, retest, tested);
+        let mut pass = CfgSimplify;
+        pass.run(&mut func);
+        assert!(
+            inst_is_laid_out(&func, return_three),
+            "the `return 3` arm must stay reachable"
+        );
+    }
+
+    /// The prologue `b = p; old = b; b = b - 1;` — `old` copies `b` BEFORE
+    /// the redefinition, so it holds the incoming value, not the new one.
+    fn copy_then_redefine_root() -> Vec<(AArch64Opcode, Vec<MachOperand>)> {
+        vec![
+            (AArch64Opcode::MovR, vec![w(1), w(0)]),
+            (AArch64Opcode::MovR, vec![w(2), w(1)]),
+            (AArch64Opcode::SubRI, vec![w(3), w(1), imm(1)]),
+            (AArch64Opcode::MovR, vec![w(1), w(3)]),
+        ]
+    }
+
+    #[test]
+    fn test_dominated_zero_keeps_retest_of_copy_taken_before_root_redefinition() {
+        // int f(int b) { int old = b; b = b - 1;
+        //                if (b == 0) return 1; if (old != 0) return 2; return 3; }
+        // after SROA + CmpBranchFusion: the fact tests `f = b` (the NEW b),
+        // the re-test tests `old` (the OLD b). Both chain to root `b`, but
+        // f(0) must return 3 (old == 0, b == -1).
+        let mut entry = copy_then_redefine_root();
+        entry.push((AArch64Opcode::MovR, vec![w(4), w(1)]));
+        assert_dominated_retest_kept(&entry, w(4), &[], w(2));
+    }
+
+    #[test]
+    fn test_dominated_zero_keeps_retest_when_fact_tests_redefined_root_directly() {
+        // Same program with the fact on the root itself (`Cbz b`): no
+        // fact-side copy exists, so only the re-test's copy site can tell
+        // the two values apart.
+        assert_dominated_retest_kept(&copy_then_redefine_root(), w(1), &[], w(2));
+    }
+
+    #[test]
+    fn test_dominated_zero_keeps_retest_when_fact_chain_captured_stale_root() {
+        // The fact tests `f = old` (the OLD b, through a two-link chain whose
+        // last link is defined after the redefinition); the re-test copies
+        // the NEW b in `bb2`. The fact says nothing about the new b.
+        let mut entry = copy_then_redefine_root();
+        entry.push((AArch64Opcode::MovR, vec![w(4), w(2)]));
+        let retest = [(AArch64Opcode::MovR, vec![w(5), w(1)])];
+        assert_dominated_retest_kept(&entry, w(4), &retest, w(5));
+    }
+
+    #[test]
+    fn test_dominated_zero_resolves_retest_of_same_root_value() {
+        // The shape the sub-pass exists for: both carrier copies read b after
+        // its last redefinition (`f = b` before `Cbz f`; `g = b` before
+        // `Cbnz g`), so the edge fact `b != 0` decides the re-test.
+        let entry = [
+            (AArch64Opcode::MovR, vec![w(1), w(0)]),
+            (AArch64Opcode::SubRI, vec![w(3), w(1), imm(1)]),
+            (AArch64Opcode::MovR, vec![w(1), w(3)]),
+            (AArch64Opcode::MovR, vec![w(4), w(1)]),
+        ];
+        let retest = [(AArch64Opcode::MovR, vec![w(5), w(1)])];
+        let (mut func, cbnz, _) = dominated_retest_diamond(&entry, w(4), &retest, w(5));
+        assert!(resolve_dominated_zero_tests(&mut func, None));
+        let branch = func.inst(cbnz);
+        assert_eq!(branch.opcode, AArch64Opcode::B);
+        assert_eq!(branch.operands, vec![block(3)]);
+        assert_eq!(
+            func.block(BlockId(2)).insts.len(),
+            2,
+            "the trailing `B bb4` is unlinked"
+        );
     }
 }

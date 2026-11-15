@@ -1,0 +1,64 @@
+; TrustIr text format v1
+module "large_aggregate_invoke_variadic"
+target "aarch64-unknown-linux-gnu" 8 little abi="aapcs64"
+
+struct @Quad { q0: i64 @0, q1: i64 @8, q2: i64 @16, q3: i64 @24 } size=32 align=8 repr=c id=0
+
+struct @K { g: [ty.0 x 128] @0 } size=1024 align=8 repr=c id=1
+
+functy.0 = (i64, ...) -> (i64)
+
+functy.1 = (ptr) -> (ptr)
+
+functy.2 = () -> ()
+
+functy.3 = (ptr, struct.0, i64) -> (i64)
+
+functy.4 = (ptr, ptr, i64) -> (i64)
+
+type ty.0 = i64
+
+fn @c_var_throw_quad(functy.0) {
+}
+
+fn @c_var_throw_k(functy.0) {
+}
+
+fn @__cxa_begin_catch(functy.1) {
+}
+
+fn @__cxa_end_catch(functy.2) {
+}
+
+fn @inv_var_param(functy.3) {
+bb0(%0: ptr, %1: struct.0, %2: i64):
+    %3 = invoke @func.0(%2, %1) to bb1() unwind bb2
+bb1:
+    store struct.0 %1, ptr %0
+    ret %3
+bb2:
+    %4, %5 = landingpad catch 0
+    %6 = call @func.2(%4)
+    call @func.3()
+    store struct.0 %1, ptr %0
+    %7 = const i64 -1
+    ret %7
+}
+
+fn @inv_var_block_k(functy.4) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %3 = load struct.1, ptr %1
+    br bb1(%3)
+bb1(%4: struct.1):
+    %5 = invoke @func.1(%2, %4) to bb2() unwind bb3
+bb2:
+    store struct.1 %4, ptr %0
+    ret %5
+bb3:
+    %6, %7 = landingpad catch 0
+    %8 = call @func.2(%6)
+    call @func.3()
+    store struct.1 %4, ptr %0
+    %9 = const i64 -1
+    ret %9
+}

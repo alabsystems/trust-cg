@@ -20,6 +20,14 @@
 // cannot prove; `Verified` here means "agreed on every sampled input", the
 // same evidentiary tier as the crate's Statistical strength, and is labeled
 // as such in the verdict docs.
+//
+// STATUS: compiled only under #[cfg(test)]. No verify mode, CLI, JIT or bridge
+// path consumes a verdict, so it is not a product check; its unit tests are a
+// host-independent miscompile check of the trust-cg-lower adapter's WS3.20
+// bit-intrinsic expansions (RotL/RotR/CtLz/CtTz/BSwap/BitReverse) against
+// trust-ir's interpreter, with mutation controls. It is not wired into a
+// statistical-strength verify mode: sampled equivalence is never proof credit
+// (OD-41 in docs/decision-record.md).
 
 //! Whole-function equivalence checking: a lowered [`trust_cg_lower::Function`]
 //! against its source [`trust_ir::Function`] executed by trust-ir's
@@ -54,7 +62,7 @@ pub enum EquivalenceOutcome {
     /// Normal return: raw two's-complement bit patterns of each return value,
     /// masked to the value's declared width.
     Returns(Vec<u128>),
-    /// A runtime trap (source `Assert` failure / lowered trap carrier).
+    /// An internal lowered trap. Source Rust panics are not trap outcomes.
     Trap,
 }
 
@@ -154,6 +162,29 @@ pub fn verify_function_equivalence(
         ));
     }
 
+    // The value each return slot carries is its source-declared width. The
+    // lowered function may widen a narrow return in its register (the Apple
+    // arm64 callee extends i8/i16/u8/u16 results to 32 bits), which is an ABI
+    // convention outside this value-level slice, so both sides are compared at
+    // the declared width.
+    let Some(signature) = module.func_type(source.ty) else {
+        return inconclusive(format!(
+            "source function `{}` has no signature",
+            source.name
+        ));
+    };
+    let mut return_bits = Vec::with_capacity(signature.returns.len());
+    for ty in &signature.returns {
+        match param_shape(ty) {
+            Some(shape) => return_bits.push(shape.bits),
+            None => {
+                return inconclusive(format!(
+                    "unsupported return type {ty} (supported: bool + integers up to 64 bits)"
+                ));
+            }
+        }
+    }
+
     let interpreter = Interpreter::with_module(module);
     let mut inputs_checked = 0usize;
     let mut inputs_skipped_source_ub = 0usize;
@@ -168,6 +199,22 @@ pub fn verify_function_equivalence(
             OracleResult::Inconclusive(reason) => return inconclusive(reason),
         };
         let lowered_outcome = match run_lowered(lowered, &param_shapes, &input) {
+            Ok(EquivalenceOutcome::Returns(raws)) if raws.len() == return_bits.len() => {
+                EquivalenceOutcome::Returns(
+                    raws.into_iter()
+                        .zip(&return_bits)
+                        .map(|(raw, bits)| raw & width_mask(*bits))
+                        .collect(),
+                )
+            }
+            Ok(EquivalenceOutcome::Returns(raws)) => {
+                return inconclusive(format!(
+                    "lowered `{}` returned {} value(s) for {} declared return(s)",
+                    lowered.name,
+                    raws.len(),
+                    return_bits.len()
+                ));
+            }
             Ok(outcome) => outcome,
             Err(reason) => return inconclusive(reason),
         };
@@ -208,7 +255,7 @@ fn scan_source_function(func: &TirFunction) -> Result<(), String> {
         return Err(format!("source function `{}` has no body", func.name));
     }
     for block in &func.blocks {
-        for node in &block.body {
+        for (inst_index, node) in block.body.iter().enumerate() {
             match &node.inst {
                 Inst::BinOp { ty, .. }
                 | Inst::UnOp { ty, .. }
@@ -234,8 +281,20 @@ fn scan_source_function(func: &TirFunction) -> Result<(), String> {
                 Inst::Br { .. }
                 | Inst::CondBr { .. }
                 | Inst::Switch { .. }
-                | Inst::Return { .. }
-                | Inst::Assert { .. } => {}
+                | Inst::Return { .. } => {}
+                // A sited check (v54) is declined like every source panic.
+                Inst::Assert {
+                    cond: _,
+                    kind,
+                    site: _,
+                } => {
+                    return Err(format!(
+                        "source Assert panic {kind:?} in `{}` bb{} instruction {inst_index} \
+                         cannot be compared to a generic trap; faithful panic outcomes unsupported",
+                        func.name,
+                        block.id.index()
+                    ));
+                }
                 // Everything else — calls (side effects), memory, atomics,
                 // aggregates, pointers, floats, proof pseudo-ops — is outside
                 // the slice. Decline loudly rather than guess.
@@ -548,7 +607,11 @@ fn run_oracle(
             OracleResult::Outcome(EquivalenceOutcome::Returns(raws))
         }
         Err(error) => match error.code {
-            InterpretErrorCode::Panic => OracleResult::Outcome(EquivalenceOutcome::Trap),
+            InterpretErrorCode::Panic => OracleResult::Inconclusive(format!(
+                "oracle panic {:?}: {}; a Rust panic is not a generic trap",
+                error.panic(),
+                error.message
+            )),
             InterpretErrorCode::UndefinedBehavior => OracleResult::SourceUb,
             // Everything else (unsupported constructs the scan missed, fuel,
             // type errors) is an incapacity, not a verdict.
@@ -898,8 +961,96 @@ fn icmp(cond: IntCC, lhs: u128, rhs: u128, bits: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trust_cg_lower::adapter::translate_module;
+
+    /// This file's fixtures are hand-built and carry no codegen license
+    /// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+    /// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+    /// them passes because it was silently refused.
+    fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+        trust_cg_lower::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+    }
+
+    /// `translate_module` under [`permit_unlicensed`].
+    fn permit_translate_module(
+        module: &trust_ir::Module,
+    ) -> Result<
+        Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+        trust_cg_lower::AdapterError,
+    > {
+        trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+            module,
+            trust_cg_lower::GuardCarrierArch::default(),
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
+        )
+    }
+
     use trust_ir::{BinOp, Block, BlockId, Constant, FuncTy, ICmpOp, InstrNode, Module, ValueId};
+
+    #[test]
+    fn differential_sampling_does_not_turn_any_source_panic_into_a_trap() {
+        use trust_ir::{AssertKind, AssertOverflowOp, Function};
+        let v = ValueId::new;
+        let mut module = Module::new("assert_equivalence_refusal");
+        let signature = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::Bool, Ty::Usize, Ty::Usize],
+                returns: vec![],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let mut function = Function::new(FuncId::new(0), "checked", signature, BlockId::new(7));
+        let mut block = Block::new(BlockId::new(7));
+        block.params = vec![(v(0), Ty::Bool), (v(1), Ty::Usize), (v(2), Ty::Usize)];
+        block.body = vec![InstrNode::new(Inst::Return { values: vec![] })];
+        function.blocks.push(block);
+        module.functions.push(function);
+        let (lowered, _) = trust_cg_lower::translate_function_with_license(
+            &module.functions[0],
+            &module,
+            &crate::license_test_support::permit_unlicensed(),
+        )
+        .unwrap();
+        let mut kinds = vec![AssertKind::Unspecified];
+        kinds.extend(AssertOverflowOp::ALL.map(AssertKind::Overflow));
+        kinds.extend([
+            AssertKind::DivByZero,
+            AssertKind::RemByZero,
+            AssertKind::NullPtr,
+            AssertKind::BoundsCheck {
+                index: v(1),
+                len: v(2),
+            },
+            AssertKind::MisalignedPtr {
+                required: v(1),
+                found: v(2),
+            },
+        ]);
+        for kind in kinds {
+            let mut changed = module.clone();
+            changed.functions[0].blocks[0].body.insert(
+                0,
+                InstrNode::new(Inst::Assert {
+                    cond: v(0),
+                    kind,
+                    site: None,
+                }),
+            );
+            assert!(trust_ir_build::validate_module(&changed).is_empty());
+            let verdict = verify_function_equivalence(&changed, FuncId::new(0), &lowered);
+            let EquivalenceVerdict::Inconclusive { reason } = verdict else {
+                panic!("panic cannot be verified/refuted as a trap: {verdict:?}");
+            };
+            assert!(reason.contains(&format!("{kind:?}")), "{reason}");
+            assert!(reason.contains("bb7 instruction 0"), "{reason}");
+            assert!(
+                reason.contains("cannot be compared to a generic trap"),
+                "{reason}"
+            );
+        }
+    }
 
     /// `fn branchy(a: i64, b: i64) -> i64`:
     /// ```text
@@ -912,11 +1063,14 @@ mod tests {
     /// ```
     fn branchy_module() -> Module {
         let mut module = Module::new("action_equiv_test");
-        let ft = module.add_func_type(FuncTy {
-            params: vec![Ty::I64, Ty::I64],
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
+        let ft = module
+            .add_func_type(FuncTy {
+                params: vec![Ty::I64, Ty::I64],
+                returns: vec![Ty::I64],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut func = trust_ir::Function::new(FuncId::new(0), "branchy", ft, BlockId::new(0));
 
         let a = ValueId::new(0);
@@ -988,12 +1142,14 @@ mod tests {
         }));
         func.blocks.push(else_block);
 
-        module.add_function(func);
+        module
+            .try_add_function(func)
+            .expect("Module::try_add_function: test fixture");
         module
     }
 
     fn lower_first(module: &Module) -> LirFunction {
-        let lowered = translate_module(module).expect("test module lowers");
+        let lowered = permit_translate_module(module).expect("test module lowers");
         assert_eq!(lowered.len(), 1);
         lowered.into_iter().next().unwrap().0
     }
@@ -1055,11 +1211,14 @@ mod tests {
         // `fn effectful() -> i64 { call helper(); ... }` — a call is outside
         // the slice (side effects), so the check must DECLINE, not verify.
         let mut module = Module::new("action_equiv_unsupported");
-        let ft = module.add_func_type(FuncTy {
-            params: vec![],
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
+        let ft = module
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::I64],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut caller = trust_ir::Function::new(FuncId::new(0), "effectful", ft, BlockId::new(0));
         let r = ValueId::new(0);
         let mut entry = Block::new(BlockId::new(0));
@@ -1074,7 +1233,9 @@ mod tests {
             .body
             .push(InstrNode::new(Inst::Return { values: vec![r] }));
         caller.blocks.push(entry);
-        module.add_function(caller);
+        module
+            .try_add_function(caller)
+            .expect("Module::try_add_function: test fixture");
 
         let mut helper = trust_ir::Function::new(FuncId::new(1), "helper", ft, BlockId::new(1));
         let hv = ValueId::new(1);
@@ -1090,9 +1251,11 @@ mod tests {
             .body
             .push(InstrNode::new(Inst::Return { values: vec![hv] }));
         helper.blocks.push(hentry);
-        module.add_function(helper);
+        module
+            .try_add_function(helper)
+            .expect("Module::try_add_function: test fixture");
 
-        let lowered = translate_module(&module).expect("call module lowers");
+        let lowered = permit_translate_module(&module).expect("call module lowers");
         let (caller_lowered, _) = lowered
             .into_iter()
             .find(|(f, _)| f.name == "effectful")
@@ -1107,6 +1270,200 @@ mod tests {
             }
             other => panic!("a call must be Inconclusive (never Verified), got {other:?}"),
         }
+    }
+
+    /// `fn ws320(x: ty[, n: ty]) -> ty { op x, n }`, the amount either the
+    /// second parameter or the constant `constant_amount`.
+    fn ws320_rotate_module(op: BinOp, ty: &Ty, constant_amount: Option<i128>) -> Module {
+        let mut module = Module::new("ws320_rotate_equiv");
+        let params = match constant_amount {
+            Some(_) => vec![ty.clone()],
+            None => vec![ty.clone(), ty.clone()],
+        };
+        let ft = module
+            .add_func_type(FuncTy {
+                params,
+                returns: vec![ty.clone()],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let mut func = trust_ir::Function::new(FuncId::new(0), "ws320", ft, BlockId::new(0));
+        let x = ValueId::new(0);
+        let n = ValueId::new(1);
+        let r = ValueId::new(2);
+        let mut entry = Block::new(BlockId::new(0)).with_param(x, ty.clone());
+        match constant_amount {
+            Some(amount) => entry.body.push(
+                InstrNode::new(Inst::Const {
+                    ty: ty.clone(),
+                    value: Constant::Int(amount),
+                })
+                .with_result(n),
+            ),
+            None => entry = entry.with_param(n, ty.clone()),
+        }
+        entry.body.push(
+            InstrNode::new(Inst::BinOp {
+                op,
+                ty: ty.clone(),
+                lhs: x,
+                rhs: n,
+            })
+            .with_result(r),
+        );
+        entry
+            .body
+            .push(InstrNode::new(Inst::Return { values: vec![r] }));
+        func.blocks.push(entry);
+        module
+            .try_add_function(func)
+            .expect("Module::try_add_function: test fixture");
+        module
+    }
+
+    /// `fn ws320(x: ty) -> ty { op x }`.
+    fn ws320_unop_module(op: trust_ir::UnOp, ty: &Ty) -> Module {
+        let mut module = Module::new("ws320_unop_equiv");
+        let ft = module
+            .add_func_type(FuncTy {
+                params: vec![ty.clone()],
+                returns: vec![ty.clone()],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let mut func = trust_ir::Function::new(FuncId::new(0), "ws320", ft, BlockId::new(0));
+        let x = ValueId::new(0);
+        let r = ValueId::new(1);
+        let mut entry = Block::new(BlockId::new(0)).with_param(x, ty.clone());
+        entry.body.push(
+            InstrNode::new(Inst::UnOp {
+                op,
+                ty: ty.clone(),
+                operand: x,
+            })
+            .with_result(r),
+        );
+        entry
+            .body
+            .push(InstrNode::new(Inst::Return { values: vec![r] }));
+        func.blocks.push(entry);
+        module
+            .try_add_function(func)
+            .expect("Module::try_add_function: test fixture");
+        module
+    }
+
+    fn assert_ws320_verifies(module: &Module, what: &str) {
+        let lowered = lower_first(module);
+        match verify_function_equivalence(module, FuncId::new(0), &lowered) {
+            EquivalenceVerdict::Verified {
+                inputs_checked,
+                inputs_skipped_source_ub,
+            } => {
+                assert!(inputs_checked >= 64, "{what}: only {inputs_checked} inputs");
+                assert_eq!(
+                    inputs_skipped_source_ub, 0,
+                    "{what}: the WS3.20 ops are total"
+                );
+            }
+            other => panic!("{what}: the adapter's expansion must agree, got {other:?}"),
+        }
+    }
+
+    const WS320_WIDTHS: [(Ty, i128); 8] = [
+        (Ty::I8, 8),
+        (Ty::U8, 8),
+        (Ty::I16, 16),
+        (Ty::U16, 16),
+        (Ty::I32, 32),
+        (Ty::U32, 32),
+        (Ty::I64, 64),
+        (Ty::U64, 64),
+    ];
+
+    /// trust-ir WS3.20: the adapter expands rotates and the bit intrinsics
+    /// into covered LIR opcodes; each expansion agrees with trust-ir's own
+    /// interpreter (boundary values plus the fixed-seed sample) at every
+    /// width, signed and unsigned, for dynamic amounts and for constant
+    /// amounts at, beyond and (signed) below the width.
+    #[test]
+    fn ws320_bit_intrinsic_expansions_agree_with_the_trust_ir_interpreter() {
+        for (ty, width) in WS320_WIDTHS {
+            for op in [BinOp::RotL, BinOp::RotR] {
+                assert_ws320_verifies(&ws320_rotate_module(op, &ty, None), &format!("{op:?} {ty}"));
+                let mut amounts = vec![0, 1, width - 1, width, width + 3];
+                if ty.is_signed() {
+                    amounts.push(-1);
+                }
+                for amount in amounts {
+                    assert_ws320_verifies(
+                        &ws320_rotate_module(op, &ty, Some(amount)),
+                        &format!("{op:?} {ty} by {amount}"),
+                    );
+                }
+            }
+            for op in [
+                trust_ir::UnOp::CtLz,
+                trust_ir::UnOp::CtTz,
+                trust_ir::UnOp::BSwap,
+                trust_ir::UnOp::BitReverse,
+            ] {
+                assert_ws320_verifies(&ws320_unop_module(op, &ty), &format!("{op:?} {ty}"));
+            }
+        }
+    }
+
+    /// Mutation control: the equivalence check has teeth for these
+    /// expansions. A rotate whose low half shifts arithmetically, and a bit
+    /// reversal with one wrong swap mask, are both refuted with a witness.
+    #[test]
+    fn ws320_corrupted_expansions_are_refuted() {
+        let module = ws320_rotate_module(BinOp::RotL, &Ty::U32, None);
+        let mut lowered = lower_first(&module);
+        let mut corrupted = false;
+        for block in lowered.blocks.values_mut() {
+            for inst in &mut block.instructions {
+                if matches!(inst.opcode, Opcode::Ushr) {
+                    inst.opcode = Opcode::Sshr;
+                    corrupted = true;
+                }
+            }
+        }
+        assert!(corrupted, "test premise: the rotate expansion shifts right");
+        assert!(
+            matches!(
+                verify_function_equivalence(&module, FuncId::new(0), &lowered),
+                EquivalenceVerdict::Refuted { .. }
+            ),
+            "an arithmetic low half must be refuted"
+        );
+
+        let module = ws320_unop_module(trust_ir::UnOp::BitReverse, &Ty::U16);
+        let mut lowered = lower_first(&module);
+        let mut corrupted = false;
+        for block in lowered.blocks.values_mut() {
+            for inst in &mut block.instructions {
+                if let Opcode::Iconst { imm, .. } = &mut inst.opcode
+                    && *imm == 0x5555
+                {
+                    *imm = 0x5554;
+                    corrupted = true;
+                }
+            }
+        }
+        assert!(
+            corrupted,
+            "test premise: the bit reversal swaps odd/even bits"
+        );
+        assert!(
+            matches!(
+                verify_function_equivalence(&module, FuncId::new(0), &lowered),
+                EquivalenceVerdict::Refuted { .. }
+            ),
+            "a wrong swap mask must be refuted"
+        );
     }
 
     #[test]

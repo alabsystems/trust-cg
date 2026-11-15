@@ -1,0 +1,523 @@
+{
+  "name": "tensor_weight_blob",
+  "functions": [
+    {
+      "id": 0,
+      "name": "dot",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              {
+                "Tensor": [
+                  "I32",
+                  1
+                ]
+              }
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Tensor": [
+                      "I32",
+                      1
+                    ]
+                  },
+                  "value": {
+                    "TensorBlob": {
+                      "digest": [
+                        10,
+                        28,
+                        230,
+                        52,
+                        135,
+                        159,
+                        106,
+                        72,
+                        117,
+                        39,
+                        201,
+                        161,
+                        133,
+                        177,
+                        164,
+                        163,
+                        222,
+                        127,
+                        65,
+                        35,
+                        138,
+                        212,
+                        19,
+                        158,
+                        60,
+                        109,
+                        158,
+                        13,
+                        167,
+                        35,
+                        98,
+                        140
+                      ],
+                      "dims": [
+                        3
+                      ]
+                    }
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "TensorContract": {
+                  "ty": {
+                    "Tensor": [
+                      "I32",
+                      0
+                    ]
+                  },
+                  "lhs": 0,
+                  "rhs": 1,
+                  "batch": [],
+                  "contract": [
+                    [
+                      0,
+                      0
+                    ]
+                  ]
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "raw",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Tensor": [
+                      "U8",
+                      1
+                    ]
+                  },
+                  "value": {
+                    "TensorBlob": {
+                      "digest": [
+                        10,
+                        28,
+                        230,
+                        52,
+                        135,
+                        159,
+                        106,
+                        72,
+                        117,
+                        39,
+                        201,
+                        161,
+                        133,
+                        177,
+                        164,
+                        163,
+                        222,
+                        127,
+                        65,
+                        35,
+                        138,
+                        212,
+                        19,
+                        158,
+                        60,
+                        109,
+                        158,
+                        13,
+                        167,
+                        35,
+                        98,
+                        140
+                      ],
+                      "dims": [
+                        12
+                      ]
+                    }
+                  }
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 2,
+      "name": "none",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Tensor": [
+                      "I64",
+                      1
+                    ]
+                  },
+                  "value": {
+                    "TensorBlob": {
+                      "digest": [
+                        227,
+                        176,
+                        196,
+                        66,
+                        152,
+                        252,
+                        28,
+                        20,
+                        154,
+                        251,
+                        244,
+                        200,
+                        153,
+                        111,
+                        185,
+                        36,
+                        39,
+                        174,
+                        65,
+                        228,
+                        100,
+                        155,
+                        147,
+                        76,
+                        164,
+                        149,
+                        153,
+                        27,
+                        120,
+                        82,
+                        184,
+                        85
+                      ],
+                      "dims": [
+                        0
+                      ]
+                    }
+                  }
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        {
+          "Tensor": [
+            "I32",
+            1
+          ]
+        }
+      ],
+      "returns": [
+        {
+          "Tensor": [
+            "I32",
+            0
+          ]
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "Tensor": [
+            "U8",
+            1
+          ]
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [],
+      "returns": [
+        {
+          "Tensor": [
+            "I64",
+            1
+          ]
+        }
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "Unclassified"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": [],
+  "blobs": [
+    {
+      "digest": [
+        10,
+        28,
+        230,
+        52,
+        135,
+        159,
+        106,
+        72,
+        117,
+        39,
+        201,
+        161,
+        133,
+        177,
+        164,
+        163,
+        222,
+        127,
+        65,
+        35,
+        138,
+        212,
+        19,
+        158,
+        60,
+        109,
+        158,
+        13,
+        167,
+        35,
+        98,
+        140
+      ],
+      "data": [
+        1,
+        0,
+        0,
+        0,
+        2,
+        0,
+        0,
+        0,
+        255,
+        255,
+        255,
+        255
+      ]
+    },
+    {
+      "digest": [
+        227,
+        176,
+        196,
+        66,
+        152,
+        252,
+        28,
+        20,
+        154,
+        251,
+        244,
+        200,
+        153,
+        111,
+        185,
+        36,
+        39,
+        174,
+        65,
+        228,
+        100,
+        155,
+        147,
+        76,
+        164,
+        149,
+        153,
+        27,
+        120,
+        82,
+        184,
+        85
+      ],
+      "data": []
+    }
+  ]
+}

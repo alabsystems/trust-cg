@@ -46,6 +46,16 @@
 //     obligation directly, over inputs CONSTRUCTED to satisfy the invariant (not
 //     constrained by a precondition random sampling would satisfy ~never).
 //
+// WHAT IS NEVER SELECTED: the `i64` sub-word loads (0x30..=0x35) and stores
+// (0x3c..=0x3e) and the `i64` sign-extensions (0xc2..=0xc4). No trust-ir type
+// reaches a narrow `i64` carrier, so the lowerer emits none of them; their
+// obligations stay built and discharging, and the coverage gate excludes them
+// as never selected ([`WASM_VALUE_DOMAIN_UNSELECTED`]) rather than crediting
+// evidence for code no module contains. That premise is checked, not assumed:
+// [`never_selected_opcodes_in`] scans a module for every excluded byte (and
+// the `0xfd` prefix of the v128 forms `GateArch::Wasm` excludes), and the gates
+// that pin the exclusions run it over a corpus compiled by the live backend.
+//
 // WHAT IS DEFERRED, BY NAME: `br_table`, `memory.size`/`memory.grow`, and data
 // segments. Each has an entry in [`WASM_VALUE_DOMAIN_DEFERRALS`] naming the
 // family that must answer for it and why the per-instruction SMT layer cannot.
@@ -54,10 +64,23 @@
 //
 // WHAT THESE OBLIGATIONS DO NOT COVER, said plainly rather than left implicit:
 //
-//   * The `memarg` STATIC OFFSET. Every obligation here models offset 0, which
-//     is what the current lowering emits. A non-zero offset would need the
-//     decoded immediate in the reconstruction; until then an offset bug is
-//     outside this evidence.
+//   * Which `memarg` STATIC OFFSET the lowering CHOSE, in general. The scalar
+//     `Load` / `Store` arms emit offset 0, while struct fields, enum tags and
+//     lanes, the high half of a 128-bit value, sret slots and parameter /
+//     return lanes use a NONZERO offset. The OFFSET obligations below
+//     ([`mem_load_offset_obligation`], [`mem_store_offset_obligation`]) state
+//     what an offset MEANS — the access at `(base, offset)` reads / writes the
+//     bytes trust-ir addresses at `base + offset`, with the spec's no-wrap
+//     effective address — over a SYMBOLIC offset, and a skew between the
+//     emitted and the intended offset refutes. In this per-byte set the skew
+//     is 0: it reads no emitted module. The CREDIT of a selected load / store
+//     byte ([`value_domain_discharges_valid`]) additionally requires
+//     `wasm_memarg_offset_proofs`, which instantiates the same obligation from
+//     a captured module's DECODED memarg offsets against the trust-ir layout
+//     offsets of struct field reads and writes. Other nonzero-offset sites
+//     (enum tags, niches, nested lanes, i128 halves, sret and parameter lanes)
+//     are outside that corpus; the lane differentials (`wasm_g1_lane_semantics`,
+//     `wasm_g3_lane_frames`) are their only evidence.
 //   * The BOUNDS CHECK. wasm loads and stores TRAP when the effective address
 //     leaves the memory, and the model memory is an unbounded array, so nothing
 //     here says the backend emits (or the host performs) a bounds check. These
@@ -104,7 +127,10 @@ pub const WASM_STORE_BYTES: &[u8] = &[
 pub const WASM_SIGN_EXTEND_BYTES: &[u8] = &[0xc0, 0xc1, 0xc2, 0xc3, 0xc4];
 
 /// The complete P3 value-domain opcode surface, in spec order: the 14 loads, the
-/// 9 stores, and the 5 sign-extension operators. Deferred forms
+/// 9 stores, and the 5 sign-extension operators. Every byte keeps its
+/// obligation set, but the 12 in [`WASM_VALUE_DOMAIN_UNSELECTED`] are never
+/// selected by the lowerer and are excluded from the credited denominator
+/// (see [`value_domain_unselected`]). Deferred forms
 /// (`br_table`, `memory.size`, `memory.grow`, data segments) are NOT here — they
 /// are enumerated by [`WASM_VALUE_DOMAIN_DEFERRALS`] instead, so a row can never
 /// be both "has an obligation" and "deferred".
@@ -113,6 +139,83 @@ pub fn all_wasm_value_domain_bytes() -> Vec<u8> {
     v.extend_from_slice(WASM_STORE_BYTES);
     v.extend_from_slice(WASM_SIGN_EXTEND_BYTES);
     v
+}
+
+/// The P3 bytes the current wasm lowerer NEVER selects: the `i64` sub-word
+/// loads (0x30..=0x35) and stores (0x3c..=0x3e), and the `i64` sign-extension
+/// operators (0xc2..=0xc4).
+///
+/// Their obligations are built and required to discharge exactly like the
+/// selected bytes' (`tests/wasm_value_domain_gate.rs`), so each row re-enters
+/// the credited denominator unchanged the moment the lowering selects it. They
+/// are not credited today because a credit for an opcode no emitted module
+/// contains covers no emitted code.
+pub const WASM_VALUE_DOMAIN_UNSELECTED: &[u8] = &[
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, // i64.load8_s..load32_u
+    0x3c, 0x3d, 0x3e, // i64.store8/store16/store32
+    0xc2, 0xc3, 0xc4, // i64.extend8_s/extend16_s/extend32_s
+];
+
+/// Why a P3 byte is excluded as never selected, or `None` for a byte the
+/// lowerer emits (or one outside the surface).
+pub fn value_domain_unselected(byte: u8) -> Option<&'static str> {
+    if !WASM_VALUE_DOMAIN_UNSELECTED.contains(&byte) {
+        return None;
+    }
+    Some(if w::decode_sign_extend(byte).is_some() {
+        "i64 sign-extension operator, never selected by the current wasm lowerer: a narrow \
+         integer rides in an i32 carrier, so re-canonicalization emits only i32.extend8_s / \
+         i32.extend16_s (emit_canonicalize refuses a narrow non-i32 carrier) and the lowerer has \
+         no i64.extendN_s emitter; not in the emitted set. Its obligations stay built and \
+         discharging, so the row re-enters the denominator unchanged when selection lands"
+    } else {
+        "i64 sub-word memory access, never selected by the current wasm lowerer: int_repr_of \
+         gives an i64 carrier only to the 64-bit integers, so mem_ops never reaches the (i64, \
+         8|16|32) arms of mem_ops_for (pinned by the lane's \
+         no_scalar_type_selects_an_i64_sub_word_access); not in the emitted set. Its obligations \
+         stay built and discharging, so the row re-enters the denominator unchanged when \
+         selection lands"
+    })
+}
+
+/// The `0xfd` prefix of every v128 / SIMD instruction. The coverage gate's
+/// never-selected wasm rows (`v128.load` / `store` / `const` and the lane-wise
+/// ops) all sit under it.
+pub const SIMD_PREFIX: u8 = 0xfd;
+
+/// Every never-selected instruction an emitted module contains, as `(defined
+/// function ordinal, byte offset in its body, description)`: each instruction
+/// whose opcode byte is in [`WASM_VALUE_DOMAIN_UNSELECTED`], and each
+/// `0xfd`-prefixed (v128 / SIMD) instruction.
+///
+/// This is the check that keeps the never-selected EXCLUSIONS honest: an
+/// excluded row is outside the credited denominator only while no emitted
+/// module contains it, so the gates that pin those exclusions run it over
+/// modules compiled by the live backend. `Err` when the module, or a body,
+/// stops decoding at any other opcode — absence cannot be claimed over bytes
+/// the walk did not read. A `0xfd` instruction ends the walk of its body (its
+/// immediates are not modelled) after it is reported.
+pub fn never_selected_opcodes_in(wasm: &[u8]) -> Result<Vec<(usize, usize, String)>, String> {
+    use crate::wasm_abi_proofs::{AbiDecodeError, decode_insts_until_unknown, decode_module};
+    let module = decode_module(wasm).map_err(|e| format!("the module does not decode: {e:?}"))?;
+    let mut hits = Vec::new();
+    for (f, body) in module.bodies.iter().enumerate() {
+        let (insts, stop) = decode_insts_until_unknown(&body.code);
+        for i in &insts {
+            if WASM_VALUE_DOMAIN_UNSELECTED.contains(&i.op) {
+                let what = value_domain_mnemonic(i.op).unwrap_or("<unnamed>");
+                hits.push((f, i.at, format!("{what} (0x{:02x})", i.op)));
+            }
+        }
+        match stop {
+            None => {}
+            Some(AbiDecodeError::UnknownOpcode { at, opcode }) if opcode == SIMD_PREFIX => {
+                hits.push((f, at, "a 0xfd-prefixed v128 / SIMD instruction".to_string()));
+            }
+            Some(e) => return Err(format!("function {f} does not decode: {e:?}")),
+        }
+    }
+    Ok(hits)
 }
 
 /// The spec mnemonic for a P3 value-domain opcode byte, for report rows.
@@ -463,6 +566,147 @@ pub fn mem_store_width_obligation(intended_byte: u8, emitted_byte: u8) -> Option
 }
 
 // ===========================================================================
+// The memarg static offset
+// ===========================================================================
+
+/// The no-trap precondition and the trust-ir address of an access at
+/// `(recon_p, recon_off)`: `recon_p + recon_off` as trust-ir computes a byte
+/// GEP on wasm32. Under the precondition the sum does not wrap, which is also
+/// the only case trust-ir defines (a GEP past `2^32 - 1`, or an access past the
+/// address space, is UB there), so the obligation covers every defined access.
+fn offset_access(n_bytes: u32) -> (SmtExpr, SmtExpr, SmtExpr, SmtExpr) {
+    let p = SmtExpr::var("recon_p", ADDR_BITS);
+    let off = SmtExpr::var("recon_off", ADDR_BITS);
+    let pre = w::encode_access_does_not_trap(p.clone(), off.clone(), n_bytes);
+    let q = p.clone().bvadd(off.clone());
+    (p, off, pre, q)
+}
+
+/// The emitted offset: the intended symbolic offset plus `skew` (mod 2^32).
+/// `skew == 0` is the honest lowering; a nonzero skew is a negative control.
+fn skewed(off: &SmtExpr, skew: u32) -> SmtExpr {
+    if skew == 0 {
+        off.clone()
+    } else {
+        off.clone()
+            .bvadd(SmtExpr::bv_const(u64::from(skew), ADDR_BITS))
+    }
+}
+
+/// LOAD OFFSET obligation — the access at `(base, offset)` reads the value
+/// trust-ir stored at `base + offset`.
+///
+/// Memory holds a symbolic `v` at the trust-ir address `q = p + off` (full
+/// value width, little-endian); the machine side DECODES `emitted_byte` and
+/// loads with the memarg offset `off + skew` through the spec's no-wrap
+/// effective address; the source side is the intended narrow value extended
+/// independently, exactly as in [`mem_load_value_obligation`]. The offset is
+/// SYMBOLIC, so the statement covers every offset the lowering can emit, under
+/// the precondition that the access does not trap. A shifted offset (`skew !=
+/// 0`) reads other bytes and REFUTES.
+pub fn mem_load_offset_obligation(
+    intended_byte: u8,
+    emitted_byte: u8,
+    skew: u32,
+) -> Option<ProofObligation> {
+    let intended = w::decode_mem_op(intended_byte)?;
+    let emitted = w::decode_mem_op(emitted_byte)?;
+    if !intended.is_load() || !emitted.is_load() || emitted.value_bits != intended.value_bits {
+        return None;
+    }
+    let value_bits = intended.value_bits;
+    let (p, off, pre, q) = offset_access(value_bits / 8);
+    let v = SmtExpr::var("recon_v", value_bits);
+    let mem = w::encode_store_n(w::zero_memory(), q, v.clone(), value_bits / 8);
+    let machine_expr = w::encode_mem_load_at(mem, p, skewed(&off, skew), emitted)?;
+
+    let narrow = low_bits(&v, intended.access_bits);
+    let extra = value_bits - intended.access_bits;
+    let trust_ir_expr = match intended.extend()? {
+        w::WasmLoadExtend::None => narrow,
+        w::WasmLoadExtend::Zero => narrow.zero_ext(extra),
+        w::WasmLoadExtend::Sign => narrow.sign_ext(extra),
+    };
+    let mut ob = reconstructed_obligation(
+        format!(
+            "RECONSTRUCTED wasm {} (0x{:02x}) at memarg offset off{} -> reads the value at \
+             trust-ir address base + off",
+            intended.mnemonic,
+            emitted.byte,
+            if skew == 0 {
+                String::new()
+            } else {
+                format!(" + {skew}")
+            }
+        ),
+        trust_ir_expr,
+        machine_expr,
+        vec![
+            ("recon_p".to_string(), ADDR_BITS),
+            ("recon_off".to_string(), ADDR_BITS),
+            ("recon_v".to_string(), value_bits),
+        ],
+        format!("{} (0x{:02x})", emitted.mnemonic, emitted.byte),
+        1,
+    );
+    ob.preconditions = vec![pre];
+    Some(ob)
+}
+
+/// STORE OFFSET obligation — the access at `(base, offset)` writes the bytes
+/// trust-ir addresses at `base + offset`.
+///
+/// The machine side stores a symbolic `v` through the DECODED `emitted_byte`
+/// with memarg offset `off + skew` (spec no-wrap effective address) into zeroed
+/// memory; the source side reads the INTENDED access width back at the trust-ir
+/// address `p + off` and demands the truncated operand. A shifted offset
+/// leaves those bytes zero and REFUTES.
+pub fn mem_store_offset_obligation(
+    intended_byte: u8,
+    emitted_byte: u8,
+    skew: u32,
+) -> Option<ProofObligation> {
+    let intended = w::decode_mem_op(intended_byte)?;
+    let emitted = w::decode_mem_op(emitted_byte)?;
+    if intended.is_load() || emitted.is_load() || emitted.value_bits != intended.value_bits {
+        return None;
+    }
+    let value_bits = intended.value_bits;
+    if emitted.access_bits > value_bits {
+        return None;
+    }
+    let (p, off, pre, q) = offset_access(intended.access_bytes());
+    let v = SmtExpr::var("recon_v", value_bits);
+    let mem = w::encode_mem_store_at(w::zero_memory(), p, skewed(&off, skew), v.clone(), emitted)?;
+    let machine_expr = w::encode_load_n(mem, q, intended.access_bytes());
+    let trust_ir_expr = low_bits(&v, intended.access_bits);
+    let mut ob = reconstructed_obligation(
+        format!(
+            "RECONSTRUCTED wasm {} (0x{:02x}) at memarg offset off{} -> writes the bytes at \
+             trust-ir address base + off",
+            intended.mnemonic,
+            emitted.byte,
+            if skew == 0 {
+                String::new()
+            } else {
+                format!(" + {skew}")
+            }
+        ),
+        trust_ir_expr,
+        machine_expr,
+        vec![
+            ("recon_p".to_string(), ADDR_BITS),
+            ("recon_off".to_string(), ADDR_BITS),
+            ("recon_v".to_string(), value_bits),
+        ],
+        format!("{} (0x{:02x})", emitted.mnemonic, emitted.byte),
+        2,
+    );
+    ob.preconditions = vec![pre];
+    Some(ob)
+}
+
+// ===========================================================================
 // Sign-extension operator obligations (0xc0..=0xc4)
 // ===========================================================================
 
@@ -595,9 +839,11 @@ pub fn obligations_for_byte(byte: u8) -> Vec<ProofObligation> {
         if op.is_load() {
             out.extend(mem_load_value_obligation(byte, byte));
             out.extend(mem_load_invariant_obligation(byte, byte));
+            out.extend(mem_load_offset_obligation(byte, byte, 0));
         } else {
             out.extend(mem_store_value_obligation(byte, byte));
             out.extend(mem_store_width_obligation(byte, byte));
+            out.extend(mem_store_offset_obligation(byte, byte, 0));
         }
     } else if w::decode_sign_extend(byte).is_some() {
         out.extend(sign_extend_value_obligation(byte, byte));
@@ -616,26 +862,64 @@ pub fn all_value_domain_obligations() -> Vec<ProofObligation> {
 }
 
 /// The coverage-gate credit hook: does the FULL obligation set for `byte`
-/// discharge `Valid`?
+/// discharge `Valid` — and, for a load or store byte the lowerer selects, is
+/// its emitted memarg offset bound to the trust-ir layout offset?
 ///
 /// Fails closed — `false` for a byte with no obligations, for any obligation
 /// that is not tagged [`MachineSideProvenance::Reconstructed`], and for any that
 /// does not discharge `Valid`. Mirrors
 /// `wasm_function_verifier::reconstruction_discharges_valid` exactly, except that
 /// a P3 byte must clear EVERY one of its obligations, not just one: the store
-/// pair only pins the access width when both halves hold.
+/// pair only pins the access width when both halves hold. A selected load or
+/// store byte must also pass
+/// [`crate::wasm_memarg_offset_proofs::memarg_offset_discharges_valid`]: the
+/// offset obligation instantiated from DECODED emitted offsets of captured
+/// field accesses, with its shifted- and dropped-offset controls refuting. A
+/// never-selected byte has no emitted access to bind, so its set alone is
+/// checked (it is excluded from the credited denominator either way).
+///
+/// This is [`value_domain_discharges_valid_over`] over the captured corpus
+/// [`crate::wasm_memarg_offset_proofs::MEMARG_FIELDS_TIR`] /
+/// [`crate::wasm_memarg_offset_proofs::MEMARG_FIELDS_WASM`].
 pub fn value_domain_discharges_valid(byte: u8, config: &VerificationConfig) -> bool {
+    value_domain_discharges_valid_over(
+        byte,
+        config,
+        crate::wasm_memarg_offset_proofs::MEMARG_FIELDS_TIR,
+        crate::wasm_memarg_offset_proofs::MEMARG_FIELDS_WASM,
+    )
+}
+
+/// [`value_domain_discharges_valid`] with the memarg-offset binding of a
+/// selected load or store byte taken over the corpus `(tir, wasm)` through
+/// [`crate::wasm_memarg_offset_proofs::memarg_offset_credit_failures`], so a
+/// corpus whose emitted offsets do not match the trust-ir layout withdraws the
+/// credit of every byte it touches.
+pub fn value_domain_discharges_valid_over(
+    byte: u8,
+    config: &VerificationConfig,
+    tir: &str,
+    wasm: &[u8],
+) -> bool {
     let obligations = obligations_for_byte(byte);
     if obligations.is_empty() {
         return false;
     }
-    obligations.iter().all(|ob| {
+    let set_holds = obligations.iter().all(|ob| {
         ob.is_reconstructed()
             && matches!(
                 verify_by_evaluation_with_config(ob, config),
                 VerificationResult::Valid
             )
-    })
+    });
+    let selected_access =
+        w::decode_mem_op(byte).is_some() && value_domain_unselected(byte).is_none();
+    set_holds
+        && (!selected_access
+            || crate::wasm_memarg_offset_proofs::memarg_offset_credit_failures(
+                byte, tir, wasm, config,
+            )
+            .is_empty())
 }
 
 // ===========================================================================
@@ -972,25 +1256,91 @@ mod tests {
 
     /// Sub-word loads/stores carry BOTH of their obligations; full-width loads
     /// carry only the value one (there is no narrow carrier to constrain).
+    /// Every load and store also carries its memarg-offset obligation.
     #[test]
     fn obligation_counts_are_width_aware() {
-        // Full-width loads: value only.
+        // Full-width loads: value + offset.
         for byte in [0x28u8, 0x29, 0x2a, 0x2b] {
-            assert_eq!(obligations_for_byte(byte).len(), 1, "0x{byte:02x}");
-        }
-        // Sub-word loads: value + invariant.
-        for byte in [0x2cu8, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35] {
             assert_eq!(obligations_for_byte(byte).len(), 2, "0x{byte:02x}");
         }
-        // All stores: value + width.
+        // Sub-word loads: value + invariant + offset.
+        for byte in [0x2cu8, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35] {
+            assert_eq!(obligations_for_byte(byte).len(), 3, "0x{byte:02x}");
+        }
+        // All stores: value + width + offset.
         for byte in WASM_STORE_BYTES {
-            assert_eq!(obligations_for_byte(*byte).len(), 2, "0x{byte:02x}");
+            assert_eq!(obligations_for_byte(*byte).len(), 3, "0x{byte:02x}");
         }
         // Sign-extension operators: value + shift-pair + invariant.
         for byte in WASM_SIGN_EXTEND_BYTES {
             assert_eq!(obligations_for_byte(*byte).len(), 3, "0x{byte:02x}");
         }
-        assert_eq!(all_value_domain_obligations().len(), 57);
+        assert_eq!(all_value_domain_obligations().len(), 57 + 23);
+    }
+
+    /// The memarg-offset obligations hold at the honest offset, carry the
+    /// no-trap precondition, and REFUTE for a shifted offset in either
+    /// direction, for every load and store byte.
+    #[test]
+    fn a_shifted_memarg_offset_refutes_for_every_access() {
+        let cfg = cfg();
+        let refutes = |ob: &ProofObligation| {
+            matches!(
+                verify_by_evaluation_with_config(ob, &cfg),
+                VerificationResult::Invalid { .. }
+            )
+        };
+        for &byte in WASM_LOAD_BYTES.iter().chain(WASM_STORE_BYTES) {
+            let (honest, skews): (ProofObligation, Vec<ProofObligation>) =
+                if w::decode_mem_op(byte).expect("mem op").is_load() {
+                    (
+                        mem_load_offset_obligation(byte, byte, 0).expect("builds"),
+                        [4u32, 1, u32::MAX - 3]
+                            .iter()
+                            .map(|&k| mem_load_offset_obligation(byte, byte, k).expect("builds"))
+                            .collect(),
+                    )
+                } else {
+                    (
+                        mem_store_offset_obligation(byte, byte, 0).expect("builds"),
+                        [4u32, 1, u32::MAX - 3]
+                            .iter()
+                            .map(|&k| mem_store_offset_obligation(byte, byte, k).expect("builds"))
+                            .collect(),
+                    )
+                };
+            assert_eq!(honest.preconditions.len(), 1, "0x{byte:02x} states no-trap");
+            assert!(
+                matches!(
+                    verify_by_evaluation_with_config(&honest, &cfg),
+                    VerificationResult::Valid
+                ),
+                "0x{byte:02x}: the honest offset must hold"
+            );
+            for ob in &skews {
+                assert!(refutes(ob), "{} must REFUTE", ob.name);
+            }
+        }
+    }
+
+    /// The effective address does not wrap: `ea + N <= 2^32` is the no-trap
+    /// condition, so an access at `(0xffff_fffc, 4)` of 4 bytes traps while
+    /// `(0xffff_fff8, 4)` does not, and a wrapping 32-bit sum would name
+    /// address 0 for the first.
+    #[test]
+    fn the_effective_address_is_unbounded_and_traps_past_the_address_space() {
+        use crate::smt::SmtExpr as E;
+        let at = |base: u64, off: u64, n: u32| {
+            w::encode_access_does_not_trap(E::bv_const(base, 32), E::bv_const(off, 32), n)
+        };
+        let eval = |e: SmtExpr| match e.try_eval(&crate::smt::EvalEnv::default()) {
+            Ok(crate::smt::EvalResult::Bool(b)) => b,
+            other => panic!("closed Bool expression, got {other:?}"),
+        };
+        assert!(eval(at(0xffff_fff8, 4, 4)));
+        assert!(!eval(at(0xffff_fffc, 4, 4)));
+        assert!(!eval(at(0xffff_ffff, 0xffff_ffff, 1)));
+        assert!(eval(at(0, 0xffff_fffc, 4)));
     }
 
     /// Every P3 byte's FULL obligation set discharges `Valid` under the native
@@ -1187,8 +1537,7 @@ mod tests {
             let verdict = crate::wasm_formal::discharge(&ob);
             if verdict == crate::wasm_formal::Formal::Proven {
                 proven += 1;
-            } else if let Some(reason) = crate::wasm_formal::certification_gap_reason(&ob, &verdict)
-            {
+            } else if let Some(reason) = crate::wasm_formal::certification_gap_reason(&verdict) {
                 crate::formal_gap::print_gap_skip(
                     &format!("p3_formal_discharge_summary `{}`", ob.name),
                     &reason,

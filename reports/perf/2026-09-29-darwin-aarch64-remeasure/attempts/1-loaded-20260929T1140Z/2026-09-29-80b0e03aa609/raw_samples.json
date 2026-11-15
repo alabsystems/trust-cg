@@ -1,0 +1,596 @@
+{
+ "b1_mispredict": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.309,
+    0.309,
+    0.308
+   ],
+   "llvm_o2": [
+    0.321,
+    0.32,
+    0.326
+   ],
+   "llvm_o3": [
+    0.322,
+    0.321,
+    0.325
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h1_vec_push_sum": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.313,
+    0.314,
+    0.317
+   ],
+   "llvm_o2": [
+    0.329,
+    0.328,
+    0.329
+   ],
+   "llvm_o3": [
+    0.328,
+    0.329,
+    0.328
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h2_vec_grow": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.311,
+    0.312,
+    0.311
+   ],
+   "llvm_o2": [
+    0.327,
+    0.324,
+    0.327
+   ],
+   "llvm_o3": [
+    0.328,
+    0.331,
+    0.328
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h3_box_leak": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.308,
+    0.308,
+    0.307
+   ],
+   "llvm_o2": [
+    0.33,
+    0.333,
+    0.33
+   ],
+   "llvm_o3": [
+    0.328,
+    0.344,
+    0.366
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "h4_vec_dropper": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.336,
+    0.34,
+    0.328
+   ],
+   "llvm_o2": [
+    0.348,
+    0.338,
+    0.376
+   ],
+   "llvm_o3": [
+    0.336,
+    0.344,
+    0.335
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "m1_call_chain": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.325,
+    0.333,
+    0.332
+   ],
+   "llvm_o2": [
+    0.339,
+    0.331,
+    0.327
+   ],
+   "llvm_o3": [
+    0.324,
+    0.323,
+    0.323
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "m2_call_heavy": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.309,
+    0.312,
+    0.312
+   ],
+   "llvm_o2": [
+    0.322,
+    0.319,
+    0.319
+   ],
+   "llvm_o3": [
+    0.322,
+    0.321,
+    0.321
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p1_xorshift": {
+  "cold_cache_entries_after": [
+   13
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.315,
+    0.308,
+    0.308
+   ],
+   "llvm_o2": [
+    0.318,
+    0.318,
+    0.317
+   ],
+   "llvm_o3": [
+    0.318,
+    0.318,
+    0.322
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p2_collatz": {
+  "cold_cache_entries_after": [
+   13
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.321,
+    0.315,
+    0.314
+   ],
+   "llvm_o2": [
+    0.321,
+    0.324,
+    0.325
+   ],
+   "llvm_o3": [
+    0.33,
+    0.327,
+    0.33
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p3_gcd": {
+  "cold_cache_entries_after": [
+   14
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.321,
+    0.317,
+    0.32
+   ],
+   "llvm_o2": [
+    0.331,
+    0.328,
+    0.33
+   ],
+   "llvm_o3": [
+    0.333,
+    0.328,
+    0.331
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p4_matmul": {
+  "cold_cache_entries_after": [
+   15
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.324,
+    0.316,
+    0.327
+   ],
+   "llvm_o2": [
+    0.348,
+    0.339,
+    0.337
+   ],
+   "llvm_o3": [
+    0.382,
+    0.336,
+    0.332
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p5_struct_acc": {
+  "cold_cache_entries_after": [
+   13
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.311,
+    0.31,
+    0.314
+   ],
+   "llvm_o2": [
+    0.321,
+    0.328,
+    0.324
+   ],
+   "llvm_o3": [
+    0.323,
+    0.323,
+    0.325
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p6_branch_match": {
+  "cold_cache_entries_after": [
+   17
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.321,
+    0.311,
+    0.311
+   ],
+   "llvm_o2": [
+    0.321,
+    0.322,
+    0.321
+   ],
+   "llvm_o3": [
+    0.32,
+    0.335,
+    0.323
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p7_sieve": {
+  "cold_cache_entries_after": [
+   14
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.308,
+    0.308,
+    0.309
+   ],
+   "llvm_o2": [
+    0.324,
+    0.331,
+    0.324
+   ],
+   "llvm_o3": [
+    0.348,
+    0.351,
+    0.349
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "p8_closure_nest": {
+  "cold_cache_entries_after": [
+   14
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.312,
+    0.316,
+    0.316
+   ],
+   "llvm_o2": [
+    0.328,
+    0.325,
+    0.323
+   ],
+   "llvm_o3": [
+    0.33,
+    0.329,
+    0.334
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "v1_saxpy": {
+  "cold_cache_entries_after": [
+   16
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.379,
+    0.389,
+    0.415
+   ],
+   "llvm_o2": [
+    0.409,
+    0.428,
+    0.446
+   ],
+   "llvm_o3": [
+    0.492,
+    0.585,
+    0.604
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "v2_memfill": {
+  "cold_cache_entries_after": [
+   17
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.529,
+    0.587,
+    0.542
+   ],
+   "llvm_o2": [
+    0.485,
+    0.448,
+    0.57
+   ],
+   "llvm_o3": [
+    0.563,
+    0.568,
+    0.513
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ },
+ "v3_popcount": {
+  "cold_cache_entries_after": [
+   18
+  ],
+  "compile": {
+   "bridge_cold": [],
+   "bridge_warm": [],
+   "llvm_o0": [
+    0.515,
+    0.427,
+    0.452
+   ],
+   "llvm_o2": [
+    0.562,
+    0.522,
+    0.533
+   ],
+   "llvm_o3": [
+    0.45,
+    0.509,
+    0.51
+   ]
+  },
+  "compile_peak_rss_bytes": {},
+  "peak_rss_bytes": {},
+  "ratios": {},
+  "rss_samples": {
+   "compiler": {},
+   "program": {}
+  },
+  "run": {},
+  "size_bytes": {}
+ }
+}

@@ -1,7 +1,7 @@
 // Dump the RAW (un-simplified) SMT2 query for any ProofDatabase obligation whose
 // name contains a given substring.
 //
-//   cargo run -p trust-cg-verify --example dump_proof_smt2_raw -- "Imul_I32"
+//   scripts/trust_cargo.sh run -p trust-cg-verify --example dump_proof_smt2_raw -- "Imul_I32"
 //
 // The default `dump_proof_smt2` uses `generate_smt2_query`, which runs the
 // solver-oriented bitvector simplifier. For commutative-reconstructed ALU

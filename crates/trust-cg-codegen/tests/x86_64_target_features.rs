@@ -2374,7 +2374,7 @@ fn build_v2i64_bool_mask_extract_lir(name: &str, op: ICmpOp) -> LirFunction {
     );
 
     let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test module must translate");
+        permit_translate_module(&module).expect("feature-test module must translate");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -2441,7 +2441,7 @@ fn build_v4i32_ne_mask_extract_lir(name: &str) -> LirFunction {
     );
 
     let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test module must translate");
+        permit_translate_module(&module).expect("feature-test module must translate");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -2494,8 +2494,7 @@ fn build_narrow_vector_icmp_store_lir(name: &str, vector_ty: TrustIrTy, op: ICmp
         }],
     );
 
-    let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test narrow ICmp module");
+    let mut translated = permit_translate_module(&module).expect("feature-test narrow ICmp module");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -2553,7 +2552,7 @@ fn build_narrow_vector_bitwise_store_lir(
     );
 
     let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test narrow bitwise module");
+        permit_translate_module(&module).expect("feature-test narrow bitwise module");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -2607,7 +2606,7 @@ fn build_narrow_vector_cmp_mask_to_bits_lir(
     );
 
     let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test narrow mask_to_bits module");
+        permit_translate_module(&module).expect("feature-test narrow mask_to_bits module");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -2645,7 +2644,7 @@ fn build_bool_const_mask_to_bits_lir(
     );
 
     let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test bool mask_to_bits module");
+        permit_translate_module(&module).expect("feature-test bool mask_to_bits module");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -2726,7 +2725,7 @@ fn build_narrow_vector_cmp_select_store_lir(
     );
 
     let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test narrow select module");
+        permit_translate_module(&module).expect("feature-test narrow select module");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -2790,8 +2789,8 @@ fn build_narrow_bool_const_select_store_lir(
         }],
     );
 
-    let mut translated = trust_cg_lower::translate_module(&module)
-        .expect("feature-test bool-constant select module");
+    let mut translated =
+        permit_translate_module(&module).expect("feature-test bool-constant select module");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -3045,8 +3044,8 @@ fn build_v2i64_const_store_lir(name: &str, lanes: [i128; 2]) -> LirFunction {
         }],
     );
 
-    let mut translated = trust_cg_lower::translate_module(&module)
-        .expect("feature-test const module must translate");
+    let mut translated =
+        permit_translate_module(&module).expect("feature-test const module must translate");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -3095,7 +3094,7 @@ fn build_v4i32_pack_store_lir(name: &str) -> LirFunction {
     );
 
     let mut translated =
-        trust_cg_lower::translate_module(&module).expect("feature-test pack module must translate");
+        permit_translate_module(&module).expect("feature-test pack module must translate");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
 }
@@ -3141,7 +3140,7 @@ fn build_v4i32_zero_insert_store_lir(name: &str, lane: i128) -> LirFunction {
         }],
     );
 
-    let mut translated = trust_cg_lower::translate_module(&module)
+    let mut translated = permit_translate_module(&module)
         .expect("feature-test zero v4i32 insert module must translate");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
@@ -3188,7 +3187,7 @@ fn build_v2i64_zero_insert_store_lir(name: &str) -> LirFunction {
         }],
     );
 
-    let mut translated = trust_cg_lower::translate_module(&module)
+    let mut translated = permit_translate_module(&module)
         .expect("feature-test zero v2i64 insert module must translate");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
@@ -3399,7 +3398,7 @@ fn build_v4i32_uniform_const_shift_lir(name: &str, op: BinOp, count: i128) -> Li
         }],
     );
 
-    let mut translated = trust_cg_lower::translate_module(&module)
+    let mut translated = permit_translate_module(&module)
         .expect("feature-test uniform v4i32 shift module must translate");
     assert_eq!(translated.len(), 1);
     translated.pop().expect("translated function").0
@@ -3910,6 +3909,7 @@ fn func_ty(params: Vec<TrustIrTy>, returns: Vec<TrustIrTy>) -> FuncTy {
     FuncTy {
         params,
         returns,
+        abi: None,
         is_vararg: false,
     }
 }
@@ -3922,10 +3922,14 @@ fn add_trust_ir_function(
     blocks: Vec<TrustIrBlock>,
 ) {
     let entry = blocks.first().expect("test function must have a block").id;
-    let func_ty_id: FuncTyId = module.add_func_type(ty);
+    let func_ty_id: FuncTyId = module
+        .add_func_type(ty)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(func_id), name, func_ty_id, entry);
     func.blocks = blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn v2i64_ty() -> TrustIrTy {
@@ -3972,6 +3976,14 @@ fn bool_mask_const_from_bits(lanes: usize, true_bits: u32) -> Constant {
     )
 }
 
+/// Two helpers whose lowering needs the SSE4 profile: a `<2 x i64>` signed
+/// compare (PCMPGTQ, SSE4.2) feeding a pointer select, and a `<4 x i32>`
+/// multiply (PMULLD, SSE4.1) feeding a mask extract. The pointer select takes
+/// the first pointer when ANY compare lane is true: trust-ir requires a scalar
+/// `bool` condition for a scalar select (`Ty::select_condition_ty`;
+/// `validate_module` reports `SelectConditionTypeMismatch` for a `<2 x bool>`
+/// condition), so the compare mask is folded to its lane bits with
+/// `bitfield.v2i64_bool_mask_extract` and compared against zero.
 #[cfg(target_arch = "x86_64")]
 fn build_chc_sse4_public_jit_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("x86_feature_chc_sse4_public_jit".to_string());
@@ -4007,15 +4019,34 @@ fn build_chc_sse4_public_jit_module() -> TrustIrModule {
                     rhs: v(11),
                 })
                 .with_result(v(12)),
+                InstrNode::new(Inst::DialectOp(Box::new(
+                    trust_cg_lower::bitfield_dialect::v2i64_bool_mask_extract(
+                        v(12),
+                        TrustIrTy::I32,
+                    ),
+                )))
+                .with_result(v(13)),
+                InstrNode::new(Inst::Const {
+                    ty: TrustIrTy::I32,
+                    value: Constant::Int(0),
+                })
+                .with_result(v(14)),
+                InstrNode::new(Inst::ICmp {
+                    op: ICmpOp::Ne,
+                    ty: TrustIrTy::I32,
+                    lhs: v(13),
+                    rhs: v(14),
+                })
+                .with_result(v(15)),
                 InstrNode::new(Inst::Select {
                     ty: TrustIrTy::Ptr,
-                    cond: v(12),
+                    cond: v(15),
                     then_val: v(0),
                     else_val: v(1),
                 })
-                .with_result(v(13)),
+                .with_result(v(16)),
                 InstrNode::new(Inst::Return {
-                    values: vec![v(13)],
+                    values: vec![v(16)],
                 }),
             ],
         }],
@@ -4125,6 +4156,7 @@ fn public_x86_jit_rejects_unsupported_vector_shapes_fail_closed() {
     config.parallel = false;
 
     let err = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(
             &build_unsupported_vector_shape_public_jit_module(),
             &HashMap::new(),
@@ -4134,10 +4166,14 @@ fn public_x86_jit_rejects_unsupported_vector_shapes_fail_closed() {
     let CompileError::Adapter(trust_cg_lower::AdapterError::UnsupportedType(message)) = err else {
         panic!("expected public x86 adapter rejection for unsupported vector shape, got {err:?}");
     };
+    // The refused shape and the closed carrier contract are both named: the
+    // contract is the adapter's "only contracted 64-bit and 128-bit fixed
+    // vector carriers are lowered" (widened from 128-bit only when the 64-bit
+    // carriers landed), and `<4 x i64>` is the 256-bit shape outside it.
     assert!(
-        message.contains("unsupported vector shape")
-            || message.contains("only 128-bit fixed vectors are lowered today"),
-        "unsupported vector diagnostic should name the closed contract, got: {message}"
+        message.contains("fixed vector carriers are lowered") && message.contains("Vector(I64, 4)"),
+        "unsupported vector diagnostic should name the closed carrier contract and the refused \
+         shape, got: {message}"
     );
 }
 
@@ -4150,6 +4186,7 @@ fn default_host_jit_uses_detected_features_for_chc_sse4_helpers() {
 
     let host = X86TargetFeatures::host();
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&build_chc_sse4_public_jit_module(), &HashMap::new());
 
     if !host.contains(X86TargetFeature::Sse41) || !host.contains(X86TargetFeature::Sse42) {
@@ -4222,10 +4259,35 @@ fn public_x86_aot_compiler_uses_current_sse4_feature_profile() {
     };
 
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile(&build_chc_sse4_public_jit_module())
         .expect("public x86 AOT compiler should use the current SSE4-capable profile");
 
     assert_eq!(result.metrics.function_count, 2);
     assert!(result.metrics.code_size_bytes > 0);
     assert!(!result.object_code.is_empty());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

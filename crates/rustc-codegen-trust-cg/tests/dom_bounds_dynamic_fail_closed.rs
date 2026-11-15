@@ -1,69 +1,29 @@
-//! Dynamic dominating-bounds identity is deliberately fail-closed.
+//! Every MIR bounds assertion survives a dynamic-guard shape — silent-OOB canaries.
 //!
-//! The retired lane compared source-place spellings but did not prove the
-//! exact statement interval in the guard/assert endpoint blocks and did not
-//! carry provenance for a raw/mutable alias created before that interval. Each
+//! Main's `9c523812f` ("preserve canonical runtime bounds assertions") retired
+//! the backend's dominated bounds-check-elimination probe (OPT-6b) and its
+//! dynamic lane; the backend now keeps every MIR bounds assertion. The probe's
+//! trace assertions this file used to make (`TCG-BCE-DOM fact: ..`,
+//! `TCG-BCE-DYN refused: ..`) could no longer pass and are gone with its
+//! `bce-trace` knob. What remains is what they were protecting: each
 //! adversarial below shrinks a `Vec` after a dynamic guard but before indexing
-//! at the old last element. Keeping the legacy check aborts; deleting it reads
-//! still-allocated capacity and exits cleanly, a crisp silent-OOB canary.
+//! at the old last element. Keeping the check aborts; deleting it reads
+//! still-allocated capacity and exits cleanly — a crisp silent-OOB canary. The
+//! two in-bounds controls must still run to their exact exit code.
 //!
-//! The constant-array control reaches the same OPT-6b recognizer without the
-//! dynamic refusal. Its actual elimination remains licensed only by the AY +
-//! independent-checker solver lane; solver absence therefore keeps the check
-//! and is still a valid control outcome.
+//! Compiled on the census default lane (`no-proof-certs`): with certificates
+//! on, E0.2 refuses these bodies outright and the canary would never run.
 
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let name = dylib_name();
-    for candidate in [
-        target_dir.join("release").join(&name),
-        target_dir.join("debug").join(&name),
-    ] {
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke cargo build");
-    assert!(status.success(), "cargo build failed; cannot run dynamic BCE pins");
-    let built = target_dir.join("release").join(&name);
-    assert!(built.exists(), "expected backend dylib at {built:?}");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -85,9 +45,8 @@ fn compile_run_traced(stem: &str, source: &str, dylib: &Path) -> (Outcome, Strin
     let binary = dir.join("prog");
     let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
     backend_arg.push(dylib);
-    let output = Command::new("rustup")
-        .env("TCG_BCE_TRACE", "1")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
+        .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]))
         .args([
             "--crate-type",
             "bin",
@@ -103,9 +62,14 @@ fn compile_run_traced(stem: &str, source: &str, dylib: &Path) -> (Outcome, Strin
         .output()
         .expect("spawn rustc for dynamic BCE canary");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(output.status.success(), "{stem}: backend compile failed: {stderr}");
+    assert!(
+        output.status.success(),
+        "{stem}: backend compile failed: {stderr}"
+    );
 
-    let run = Command::new(&binary).output().expect("run dynamic BCE canary");
+    let run = Command::new(&binary)
+        .output()
+        .expect("run dynamic BCE canary");
     let outcome = match run.status.code() {
         Some(code) => Outcome::Exited(code),
         None => Outcome::Signalled,
@@ -191,70 +155,42 @@ fn main() {
 "#;
 
 #[test]
-fn dynamic_identity_refuses_endpoint_and_alias_hazards() {
+fn retained_bounds_checks_abort_on_dynamic_guard_hazards() {
+    // The bridge compiles below pass a backend knob on `-Ztrust-ir-cg-args`;
+    // the knob's former `TCG_*` environment spelling is refused outright, so on
+    // a compiler without that option the test cannot run at all. Skip honestly.
+    if toolchain_support::skip_without_backend_knobs("dom_bounds_dynamic_fail_closed") {
+        return;
+    }
     if !matches!(std::env::consts::ARCH, "aarch64" | "x86_64") {
         eprintln!("skipping: trust-cg host backend is not available for this architecture");
         return;
     }
     let dylib = ensure_dylib_built();
 
-    let (outcome, stderr) = compile_run_traced("constant_control", CONSTANT_CONTROL, &dylib);
+    let (outcome, _stderr) = compile_run_traced("constant_control", CONSTANT_CONTROL, &dylib);
     assert!(matches!(outcome, Outcome::Exited(64)));
-    assert!(
-        stderr.contains("TCG-BCE-DOM fact: Const"),
-        "constant control did not reach OPT-6b: {stderr}"
-    );
-    assert!(!stderr.contains("TCG-BCE-DYN refused"));
 
-    let (outcome, stderr) =
-        compile_run_traced("dynamic_recognized_control", DYNAMIC_RECOGNIZED_CONTROL, &dylib);
+    let (outcome, _stderr) = compile_run_traced(
+        "dynamic_recognized_control",
+        DYNAMIC_RECOGNIZED_CONTROL,
+        &dylib,
+    );
     assert!(matches!(outcome, Outcome::Exited(36)));
-    assert!(
-        stderr.contains("TCG-BCE-DOM fact: DynLocal"),
-        "dynamic control did not reach OPT-6b: {stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "TCG-BCE-DYN refused: statement-position interval and alias provenance are not certified"
-        ),
-        "recognized dynamic control did not exercise the authority refusal: {stderr}"
-    );
-    assert!(!stderr.contains("TCG-BCE-DOM fired"));
 
     for (stem, source) in [
         ("guard_endpoint_write", GUARD_ENDPOINT_WRITE),
         ("assert_endpoint_write", ASSERT_ENDPOINT_WRITE),
     ] {
-        let (outcome, stderr) = compile_run_traced(stem, source, &dylib);
-        // These high-level hazards may conservatively decline before producing
-        // a fact because rustc can place the write/call in a non-endpoint MIR
-        // block. Either trace is safe; the recognized control above pins the
-        // actual dynamic authority boundary independently.
-        assert!(
-            stderr.contains("TCG-BCE-DYN refused")
-                || stderr.contains("TCG-BCE-DOM bail: no dominating fact"),
-            "{stem}: dynamic path neither refused nor conservatively declined: {stderr}"
-        );
-        assert!(!stderr.contains("TCG-BCE-DOM fired"), "{stem}: {stderr}");
+        let (outcome, _stderr) = compile_run_traced(stem, source, &dylib);
         assert!(
             matches!(outcome, Outcome::Signalled),
             "{stem}: retained bounds check must abort after the Vec shrinks"
         );
     }
 
-    let (outcome, stderr) =
+    let (outcome, _stderr) =
         compile_run_traced("preexisting_mut_alias", PREEXISTING_MUT_ALIAS, &dylib);
-    assert!(
-        stderr.contains("TCG-BCE-DOM fact: DynLocal"),
-        "preexisting alias did not reach the dynamic authority boundary: {stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "TCG-BCE-DYN refused: statement-position interval and alias provenance are not certified"
-        ),
-        "preexisting alias was not rejected by the exact authority refusal: {stderr}"
-    );
-    assert!(!stderr.contains("TCG-BCE-DOM fired"), "{stderr}");
     assert!(
         matches!(outcome, Outcome::Signalled),
         "preexisting alias: retained bounds check must abort after the Vec shrinks"

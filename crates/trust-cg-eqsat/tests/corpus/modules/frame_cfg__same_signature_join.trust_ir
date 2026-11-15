@@ -1,0 +1,24 @@
+; TrustIr text format v1
+module "same_signature_join"
+
+functy.0 = (bool) -> (i64)
+
+fn @main(functy.0) {
+bb0(%0: bool):
+    %1 = open_frame #0 "narrow" {x: i64}
+    %2 = const i64 7
+    %3 = bind_slot %1, 0, %2
+    %4 = open_frame #1 "wide" {x: i64}
+    %5 = const i64 8
+    %6 = bind_slot %4, 0, %5
+    condbr %0, bb1(%3), bb2(%6)
+bb1(%7: ptr):
+    br bb3(%7)
+bb2(%8: ptr):
+    br bb3(%8)
+bb3(%9: ptr):
+    %10 = load_slot i64 %9, 0
+    close_frame %4
+    close_frame %1
+    ret %10
+}

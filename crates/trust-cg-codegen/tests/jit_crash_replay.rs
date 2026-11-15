@@ -26,7 +26,7 @@ static CRASH_BUFFER_PTR: AtomicPtr<ExecutableBuffer> = AtomicPtr::new(std::ptr::
 unsafe extern "C" {
     fn sigaction(signum: c_int, act: *const DarwinSigAction, oldact: *mut DarwinSigAction)
     -> c_int;
-    fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn _exit(status: c_int) -> !;
 }
 
@@ -122,7 +122,7 @@ extern "C" fn write_crash_json_and_exit(signal: c_int, _info: *mut c_void, conte
             .with_message("BRK #1 trap replay")
             .to_pretty_json();
         unsafe {
-            let _ = write(1, report.as_ptr(), report.len());
+            let _ = write(1, report.as_ptr().cast(), report.len());
         }
     }
     unsafe { _exit(0) }

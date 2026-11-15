@@ -1,11 +1,15 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: x86 drop-glue Slice 3 (needs-drop ELEMENTS) — a `Box<T>` /
 // `Vec<T>` whose element `T` has its own `Drop`. The drop glue runs `T`'s
 // `drop_in_place` on each initialized element (in ascending order for a `Vec`),
 // then frees the heap buffer. This is the per-element drop loop the drop-glue plan
-// (docs/x86-dropglue-plan.md STEP 5) describes, composed with the Slice-1 user-Drop
+// (docs/archive/x86-dropglue-plan.md STEP 5) describes, composed with the Slice-1 user-Drop
 // glue for the element `T`.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -34,65 +38,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -123,9 +76,8 @@ fn try_compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -353,11 +305,16 @@ fn try_compile_unwind(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
+        // An execution differential, not a certification test: certified
+        // compiles refuse objects with exception tables ([TCG-EH-UNPROVED]),
+        // and every x86-64 object compiled under panic=unwind carries them
+        // (walk-through filler tables included), so compile without proof
+        // certificates.
+        cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
     }
     cmd.args(["--target", TARGET, "-Cpanic=unwind"])
         .arg(format!("-Copt-level={opt}"))
@@ -648,8 +605,13 @@ fn double_panic_abort_reason_wording_matches_llvm() {
          fn main() {{ go(); std::process::exit(0); }}\n"
     );
     for opt in ["0", "2", "3"] {
-        let (tout, tbin) =
-            try_compile_unwind(&dir, &format!("f9w_o{opt}_t"), &two_panics, Some(&dylib), opt);
+        let (tout, tbin) = try_compile_unwind(
+            &dir,
+            &format!("f9w_o{opt}_t"),
+            &two_panics,
+            Some(&dylib),
+            opt,
+        );
         assert!(
             tout.status.success(),
             "trust-cg failed to compile the double-panic shape (opt={opt}): {}",

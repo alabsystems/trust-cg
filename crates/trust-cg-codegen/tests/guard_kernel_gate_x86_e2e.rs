@@ -43,13 +43,18 @@ const ARRAY_LEN: u64 = 8;
 /// module obligation of the given `status`.
 fn build_module(status: ProofStatus, with_proof_ref: bool) -> (Module, TrustIrFunction) {
     let mut module = Module::new("guard_kernel_gate_x86_e2e");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "proven_extract_x86", ft, BlockId::new(0));
     let mut node = InstrNode::new(Inst::ExtractElement {
         ty: Ty::I64,
@@ -81,7 +86,9 @@ fn build_module(status: ProofStatus, with_proof_ref: bool) -> (Module, TrustIrFu
         ));
     }
 
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (module, func)
 }
 
@@ -91,7 +98,8 @@ fn build_module(status: ProofStatus, with_proof_ref: bool) -> (Module, TrustIrFu
 /// policy requires the report to remain empty for public annotations.
 fn lower_to_x86_isel(func: &TrustIrFunction, module: &Module) -> (X86ISelFunction, Vec<u64>) {
     let (lir_func, proof_ctx): (LirFunction, LirProofContext) =
-        trust_cg_lower::translate_function(func, module).expect("adapter translate");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translate");
 
     let sig = trust_cg_lower::function::Signature {
         params: lir_func.signature.params.clone(),
@@ -340,7 +348,8 @@ fn compile_x86_object(module: &Module) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         spec,
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     let result = compiler.compile(module).expect("x86 compile");
     result.object_code
 }
@@ -419,4 +428,13 @@ fn x86_carrier_fingerprint_binding_is_non_authoritative_without_replay() {
         evidence.is_empty(),
         "traceable identity is not replay authority"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

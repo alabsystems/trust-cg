@@ -1,0 +1,22 @@
+{
+  "source": "actual complete direct-THIR Result captures; no reconstructed or hand-edited body",
+  "producer_component_sha256": "fcaba8717187b57f77cbb77c67d4c9bb4ac9db1132d88e6c495dc04fca019986",
+  "subject_source_sha256": "c27b3d4b8d6ae5af0fe68e75b5998bb298bf20f1d90e7ca1b69a703c033c1428",
+  "scope": "unverified engineering IR-to-native codegen; unrecorded legacy carrier ABI, not a Rust FnAbi/source-proof assertion",
+  "rows": [
+    {
+      "name": "result_enum",
+      "actual_capture": "$HOME/trust-result-transport-20261105-nfu/fixture-2/captures/body-000011.json",
+      "capture_sha256": "4e3edd58c0a9fddd860816475c253bb194067566ef0dae0847a8e269b64ae877",
+      "module_sha256": "07d4cec6c2825cc5bcf0b27f7ba813df770897ac1701a25cde39ba6cdaf0f829",
+      "full_module_retained": true
+    },
+    {
+      "name": "result_struct",
+      "actual_capture": "$HOME/trust-result-transport-20261105-nfu/fixture-2/captures/body-000012.json",
+      "capture_sha256": "0116293bd0942f23789a5451ca556fb3000c41361193b2f580bc33b635d01ab8",
+      "module_sha256": "3ddaee8d069b498afb7c85c5d1426db6900795d7b9bfbc606bbb05bee9862df2",
+      "full_module_retained": true
+    }
+  ]
+}

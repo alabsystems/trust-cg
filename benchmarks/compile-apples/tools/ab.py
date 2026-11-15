@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Paired, interleaved compile-wall A/B: LLVM vs dylib A vs dylib B.
 
-Mirrors benchmarks/beat-llvm/run.py's compile lane (same rustc, same flags,
+Mirrors benchmarks/beat-llvm/run.py's compile lane (same trustc, same flags,
 time.monotonic wall, median of N) but interleaves L,A,B per iteration so drift
 hits all three equally. Reports per-program medians, ratios, and the geomean.
 
-usage: ab.py --a DYLIB [--b DYLIB] [--n 9] [--opt 2] PROG.rs ...
+usage: ab.py [--driver TRUSTC] --a DYLIB [--b DYLIB] [--n 9] [--opt 2] PROG.rs ...
+(driver: see _trust_driver.py)
 """
 import argparse, os, statistics, subprocess, sys, time, math, tempfile, shutil, resource
+from _trust_driver import resolve
 
 ap = argparse.ArgumentParser()
+ap.add_argument("--driver", default=None, help="explicit Trust package trustc (default: PATH trustc/targo)")
 ap.add_argument("--a", required=True)
 ap.add_argument("--b")
 ap.add_argument("--n", type=int, default=9)
@@ -23,9 +26,11 @@ if args.n < 1:
     ap.error("--n must be at least 1")
 
 home = os.path.expanduser("~")
-os.environ["PATH"] = f"{home}/.cargo/bin:{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
-rustc = subprocess.check_output(["rustup", "which", "--toolchain", "nightly-2026-04-20", "rustc"], text=True).strip()
-flags = ["--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort"]
+# STOCK EXCEPTION (Trust lacks rust-lld/gcc-ld; measured: no lib/rustlib/<host>/bin/{rust-lld,gcc-ld} in the Trust sysroot): the Linux linker shim comes from the stock stable toolchain's gcc-ld; the compilers come from the Trust package.
+os.environ["PATH"] = f"{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
+DRIVER = resolve(args.driver)
+rustc = DRIVER["compiler"]
+flags = [*DRIVER["compiler_flags"], "--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort"]
 llvm_opt = args.llvm_opt or args.opt
 extra = dict(kv.split("=", 1) for kv in args.env)
 bextra = dict(kv.split("=", 1) for kv in args.benv)

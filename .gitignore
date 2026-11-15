@@ -10,6 +10,12 @@ venv/
 
 # Rust
 target/
+# A `target` symlink and its Spotlight-excluded `target.noindex/` build
+# directory (this Mac's layout). Both must be ignored, or the Darwin floor's
+# source fingerprint hashes the build output and reports a source change
+# during the run.
+/target
+/target.noindex/
 # Cargo.lock is committed: trust-cg's dependency revs (notably trust-ir) are
 # pinned for cross-repo reproducibility with ty/trust-mc (shared-core alignment).
 **/*.rs.bk
@@ -40,6 +46,45 @@ benchmarks/**/results/
 /reports/perf/results/
 benchmarks/**/logs/
 benchmarks/**/data/
+
+# Evidence payloads stay out of tree: a committed development record is its
+# README narrative with identities and hashes, plus its reproducer sources
+# (docs/linux-aarch64-completion.md, "Durable evidence policy"). Logs,
+# captures, JSON and inventories of a dated record are not added. The
+# prerequisites record keeps its payload (scripts/gate_env.sh reads it). The
+# step-0 oracles record keeps its report's LaTeX source, which is the
+# narrative itself, not a payload. Test fixtures live under
+# scripts/tests/fixtures/.
+/reports/20*/**
+/reports/perf/20*/**
+!/reports/20*/**/
+!/reports/perf/20*/**/
+!/reports/**/*.md
+!/reports/**/*.rs
+!/reports/**/*.c
+!/reports/**/*.cc
+!/reports/**/*.cpp
+!/reports/**/*.h
+!/reports/**/*.py
+!/reports/**/*.sh
+!/reports/**/*.s
+!/reports/**/*.S
+!/reports/**/*.ll
+!/reports/**/*.lean
+!/reports/**/*.smt2
+!/reports/**/*.patch
+!/reports/**/*.toml
+!/reports/**/*.trust_ir
+!/reports/**/*.trust-ir
+!/reports/2026-09-10-soundness-prerequisites/**
+!/reports/2026-09-29-step0-oracles/latex/*.tex
+reports/**/records/
+reports/**/*.tar.gz
+docs/archive/session-reports/**/*.gz
+# The acceptance record archives its payloads in tree (acceptance template rule 2).
+!reports/acceptance/**/records/
+!reports/acceptance/**/*.tar.gz
+!reports/acceptance/**/*.o
 
 # Emacs
 *~
@@ -99,8 +144,8 @@ publish/.out/
 # Fuzzer repro programs are source-controlled regression fixtures (fuzz/repros/).
 /scratchpad/
 
-# Raw eval RUN OUTPUT (scripts/run_llvm_test_suite.sh,
-# scripts/run_panic_fuzz_evidence.sh, the per-test logs). Nothing under here has
+# Raw eval RUN OUTPUT (scripts/run_panic_fuzz_evidence.sh, the per-test
+# logs). Nothing under here has
 # ever been tracked, and the ratchet's own instruction is to COPY a result out
 # to a reviewed baseline (`cp evals/results/tests/<date>.json <baseline>`) —
 # which is what gets committed. The raw tree is scratch.
@@ -113,3 +158,7 @@ publish/.out/
 
 # Verification build output (channel=trust default lane)
 target-verify/
+# A `RUSTC=<trust stage2>/bin/trustc` build of the root workspace, used to run
+# `regen_verdict_db` with an ADMITTED AY (the stock-built tree records no
+# toolchain AY identity, so it cannot).
+target-trustregen/

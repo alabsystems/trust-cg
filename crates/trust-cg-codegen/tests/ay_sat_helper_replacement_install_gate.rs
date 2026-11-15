@@ -37,8 +37,8 @@ use trust_cg_codegen::jit_contract::{
     TargetDescriptor, TargetOperatingSystem,
 };
 use trust_cg_codegen::{
-    ArtifactKind, ArtifactPayload, CompileGeneration, CompileRequest, CompileService,
-    CompileStatus, NATIVE_INSTALL_GATE_REPLAY_SCHEMA, NATIVE_INSTALL_GATE_REPLAY_SCHEMA_VERSION,
+    ArtifactKind, ArtifactPayload, CompileGeneration, CompileRequest, CompileStatus,
+    NATIVE_INSTALL_GATE_REPLAY_SCHEMA, NATIVE_INSTALL_GATE_REPLAY_SCHEMA_VERSION,
     NATIVE_INSTALL_GATE_TELEMETRY_SCHEMA, NATIVE_INSTALL_GATE_TELEMETRY_SCHEMA_VERSION,
     NativeInstallGateActions, NativeInstallGateAuthority, NativeInstallGateDisposition,
     NativeInstallGateExpectedBindings, NativeInstallGateInput, NativeInstallGateLayoutAccess,
@@ -203,7 +203,7 @@ fn observe_payload_contract(request_id: &'static str, module: TrustIrModule) -> 
     let mut request = CompileRequest::new(request_id, CompileGeneration::new(0));
     request.install_intent = trust_cg_codegen::InstallIntent::CompileOnly;
     request.provenance.source_kind = SourceKind::TrustIrModule;
-    let response = CompileService::default().compile(request, &module);
+    let response = permit_compile_service().compile(request, &module);
     assert_eq!(
         response.status,
         CompileStatus::Compiled,
@@ -789,11 +789,14 @@ fn contains4_lane_mask(
 
 fn contains4_masked_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("ay_sat_helper_replacement_install_gate");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut body = Vec::new();
     let zero = v(6);
     const_i32(&mut body, zero, 0);
@@ -832,25 +835,30 @@ fn contains4_masked_module() -> TrustIrModule {
         ],
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn minimize_keep_drop_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("ay_sat_minimize_helper_replacement_install_gate");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-        ],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+            ],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut body = Vec::new();
 
     let zero = v(7);
@@ -962,25 +970,30 @@ fn minimize_keep_drop_module() -> TrustIrModule {
         ],
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn theory_dispatch_assignment_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("ay_sat_theory_dispatch_helper_replacement_install_gate");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-            Ty::I32,
-        ],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+            ],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut body = Vec::new();
 
     let zero = v(7);
@@ -1178,7 +1191,9 @@ fn theory_dispatch_assignment_module() -> TrustIrModule {
         ],
         body,
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1216,7 +1231,7 @@ fn compile_sat_helper_response(
         input.payload_identity.trust_ir_sha256.clone(),
     );
 
-    let mut response = CompileService::default().compile(request, &contains4_masked_module());
+    let mut response = permit_compile_service().compile(request, &contains4_masked_module());
     assert_eq!(
         response.status,
         CompileStatus::Compiled,
@@ -1273,7 +1288,7 @@ fn compile_minimize_helper_response(
         input.payload_identity.trust_ir_sha256.clone(),
     );
 
-    let mut response = CompileService::default().compile(request, &minimize_keep_drop_module());
+    let mut response = permit_compile_service().compile(request, &minimize_keep_drop_module());
     assert_eq!(
         response.status,
         CompileStatus::Compiled,
@@ -1332,7 +1347,7 @@ fn compile_theory_dispatch_response(
     );
 
     let mut response =
-        CompileService::default().compile(request, &theory_dispatch_assignment_module());
+        permit_compile_service().compile(request, &theory_dispatch_assignment_module());
     assert_eq!(
         response.status,
         CompileStatus::Compiled,
@@ -1749,7 +1764,7 @@ fn sat_helper_gate_fails_closed_for_missing_wrong_and_unrunnable_artifact_routes
     });
     object_request.provenance.source_kind = SourceKind::TrustIrModule;
     let object_response =
-        CompileService::default().compile(object_request, &contains4_masked_module());
+        permit_compile_service().compile(object_request, &contains4_masked_module());
     assert_eq!(object_response.status, CompileStatus::Rejected);
     assert!(object_response.payload.is_none());
     assert!(object_response.diagnostics.iter().any(|diagnostic| {
@@ -2267,4 +2282,16 @@ fn sat_theory_dispatch_helper_gate_fails_closed_for_incomplete_policy_and_wrong_
             .is_err(),
         "installed SAT theory-dispatch helper lookup must fail when the expected symbol is absent"
     );
+}
+
+/// This file's fixtures carry no codegen license (`body_gate: None`), which
+/// the compile service REFUSES by default (roadmap WS7.5, decision gate
+/// DG-73). Its services state `Permit` explicitly, so no request passes
+/// because it was silently refused.
+fn permit_compile_service() -> trust_cg_codegen::CompileService {
+    trust_cg_codegen::CompileService::new(trust_cg_codegen::CompileServiceConfig {
+        codegen_license: trust_cg_codegen::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit),
+        ..trust_cg_codegen::CompileServiceConfig::default()
+    })
 }

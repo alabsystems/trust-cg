@@ -29,6 +29,8 @@
 
 use thiserror::Error;
 
+use crate::apple_deployment::MachOBuildVersion;
+
 use super::constants::*;
 use super::header::MachHeader;
 use super::reloc::{MachORelocationError, Relocation, encode_relocation_validated};
@@ -46,6 +48,14 @@ pub const N_WEAK_REF: u16 = 0x0040;
 ///
 /// Reference: `<mach-o/nlist.h>`.
 pub const N_WEAK_DEF: u16 = 0x0080;
+
+/// `n_desc` flag: the symbol must not be dead-stripped by the linker (the
+/// `.no_dead_strip` directive; what a `#[used]` / trust-ir v41
+/// `Global.retained` definition carries). Per-symbol, so it retains exactly
+/// the flagged definition and nothing else in its section.
+///
+/// Reference: `<mach-o/nlist.h>`.
+pub const N_NO_DEAD_STRIP: u16 = 0x0020;
 
 /// Target CPU for the Mach-O object file.
 ///
@@ -76,21 +86,41 @@ pub struct Symbol {
     /// overridable definition); for an undefined symbol it emits `N_WEAK_REF`
     /// (the reference may stay unresolved). Defaults to `false`.
     pub is_weak: bool,
+    /// Whether the symbol is PRIVATE EXTERNAL (`N_PEXT` — hidden visibility).
+    ///
+    /// A defined private extern keeps `N_EXT` in this relocatable object (it
+    /// resolves across objects at static link exactly like an external), and
+    /// the final link demotes it to a local so it never enters the linked
+    /// image's export surface. Only meaningful with `is_global == true` on a
+    /// DEFINED symbol; `add_symbol_impl` enforces that shape. Defaults to
+    /// `false`.
+    pub is_private_extern: bool,
+    /// Whether the linker must keep this DEFINITION even when nothing
+    /// references it (`N_NO_DEAD_STRIP` in `n_desc`; trust-ir v41
+    /// `Global.retained`). Only meaningful on a defined symbol. Defaults to
+    /// `false`.
+    pub no_dead_strip: bool,
 }
 
 impl Symbol {
-    /// Compute the `n_desc` value for this symbol, encoding the weak flags.
+    /// Compute the `n_desc` value for this symbol, encoding the weak and
+    /// no-dead-strip flags.
     fn n_desc(&self) -> u16 {
-        if !self.is_weak {
-            return 0;
-        }
-        if self.section == 0 {
+        let weak = if !self.is_weak {
+            0
+        } else if self.section == 0 {
             // Undefined weak reference.
             N_WEAK_REF
         } else {
             // Defined weak ("weak external") definition.
             N_WEAK_DEF
-        }
+        };
+        let retain = if self.no_dead_strip && self.section != 0 {
+            N_NO_DEAD_STRIP
+        } else {
+            0
+        };
+        weak | retain
     }
 }
 
@@ -356,6 +386,9 @@ pub struct MachOWriter {
     /// reused, replacing the previous O(n)-per-lookup / O(n^2)-per-object scan.
     /// `None` until the first `final_symbol_index` call freezes the table.
     final_symbol_indices: Option<Vec<u32>>,
+    /// Platform and minimum OS recorded in `LC_BUILD_VERSION`. Defaults to
+    /// macOS 14.0; object emitters set it from the target triple.
+    build_version: MachOBuildVersion,
 }
 
 impl MachOWriter {
@@ -367,6 +400,7 @@ impl MachOWriter {
             symbols: Vec::new(),
             symbols_frozen: false,
             final_symbol_indices: None,
+            build_version: MachOBuildVersion::DEFAULT,
         }
     }
 
@@ -378,12 +412,25 @@ impl MachOWriter {
             symbols: Vec::new(),
             symbols_frozen: false,
             final_symbol_indices: None,
+            build_version: MachOBuildVersion::DEFAULT,
         }
     }
 
     /// Returns the target CPU for this writer.
     pub fn target(&self) -> MachOTarget {
         self.target
+    }
+
+    /// Record `build_version` (platform, minimum OS and SDK) in the object's
+    /// `LC_BUILD_VERSION`. Emitters derive it from the target triple with
+    /// [`MachOBuildVersion::for_target_triple`].
+    pub fn set_build_version(&mut self, build_version: MachOBuildVersion) {
+        self.build_version = build_version;
+    }
+
+    /// The build version this writer records.
+    pub fn build_version(&self) -> MachOBuildVersion {
+        self.build_version
     }
 
     /// Add a text section (__text in __TEXT) with the given machine code bytes.
@@ -477,7 +524,79 @@ impl MachOWriter {
         offset: u64,
         is_global: bool,
     ) -> Result<SymbolId, MachOWriteError> {
-        self.add_symbol_impl(name, section, offset, is_global, false)
+        self.add_symbol_impl(name, section, offset, is_global, false, false, false)
+    }
+
+    /// Add a DEFINED data/text symbol carrying the full trust-ir v41 symbol
+    /// residue: weak definition, visibility, and `#[used]` retention.
+    ///
+    /// - `Visibility::Hidden` on a GLOBAL definition emits `N_PEXT` (private
+    ///   extern), exactly like [`Self::add_private_extern_symbol`]; on a
+    ///   LOCAL definition it is vacuous (a local is already invisible outside
+    ///   this object) and adds nothing.
+    /// - `Visibility::Protected` has no Mach-O spelling. As in LLVM's Mach-O
+    ///   lowering it is DEFAULT here: two-level namespaces already make every
+    ///   symbol non-preemptible, which is what protected asks for.
+    /// - `no_dead_strip` emits `N_NO_DEAD_STRIP` in `n_desc`.
+    ///
+    /// An UNDEFINED symbol (`section == 0`) is refused: neither `N_PEXT` nor
+    /// `N_NO_DEAD_STRIP` has a meaning on a reference, and the pipelines emit
+    /// references through [`Self::add_symbol`] by name.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_defined_symbol_with_attrs(
+        &mut self,
+        name: &str,
+        section: usize,
+        offset: u64,
+        is_global: bool,
+        is_weak: bool,
+        visibility: trust_ir::Visibility,
+        no_dead_strip: bool,
+    ) -> Result<SymbolId, MachOWriteError> {
+        if section == 0 {
+            return Err(MachOWriteError::SymbolSectionOutOfRange {
+                symbol: name.to_string(),
+                section,
+                section_count: self.sections.len(),
+                max_supported_ordinal: u8::MAX,
+            });
+        }
+        let is_private_extern = is_global && visibility == trust_ir::Visibility::Hidden;
+        self.add_symbol_impl(
+            name,
+            section,
+            offset,
+            is_global,
+            is_weak,
+            is_private_extern,
+            no_dead_strip,
+        )
+    }
+
+    /// Add a PRIVATE EXTERNAL (hidden visibility) defined symbol.
+    ///
+    /// Emitted `N_SECT | N_EXT | N_PEXT`: the symbol resolves across objects at
+    /// static link like any external definition, and the final link demotes it
+    /// to a local so it never reaches the linked image's export surface. This
+    /// is the Mach-O spelling of rustc's `External` linkage + `Hidden`
+    /// visibility. A hidden symbol is necessarily DEFINED (`section != 0`) and
+    /// global; an undefined private extern has no meaning in an MH_OBJECT and
+    /// is refused.
+    pub fn add_private_extern_symbol(
+        &mut self,
+        name: &str,
+        section: usize,
+        offset: u64,
+    ) -> Result<SymbolId, MachOWriteError> {
+        if section == 0 {
+            return Err(MachOWriteError::SymbolSectionOutOfRange {
+                symbol: name.to_string(),
+                section,
+                section_count: self.sections.len(),
+                max_supported_ordinal: u8::MAX,
+            });
+        }
+        self.add_symbol_impl(name, section, offset, true, false, true, false)
     }
 
     /// Add a weak symbol to the object file.
@@ -495,9 +614,10 @@ impl MachOWriter {
         offset: u64,
         is_global: bool,
     ) -> Result<SymbolId, MachOWriteError> {
-        self.add_symbol_impl(name, section, offset, is_global, true)
+        self.add_symbol_impl(name, section, offset, is_global, true, false, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_symbol_impl(
         &mut self,
         name: &str,
@@ -505,6 +625,8 @@ impl MachOWriter {
         offset: u64,
         is_global: bool,
         is_weak: bool,
+        is_private_extern: bool,
+        no_dead_strip: bool,
     ) -> Result<SymbolId, MachOWriteError> {
         if self.symbols_frozen {
             return Err(MachOWriteError::SymbolTableFrozen);
@@ -555,6 +677,8 @@ impl MachOWriter {
             value: offset,
             is_global,
             is_weak,
+            is_private_extern,
+            no_dead_strip,
         });
         Ok(id)
     }
@@ -1370,6 +1494,8 @@ impl MachOWriter {
                 value: s.value,
                 is_global: s.is_global,
                 is_weak: s.is_weak,
+                is_private_extern: s.is_private_extern,
+                no_dead_strip: s.no_dead_strip,
             });
         }
 
@@ -1394,22 +1520,23 @@ impl MachOWriter {
             .map_err(|error| MachOWriteError::ReparseGate(error.to_string()))
     }
 
-    /// Write the LC_BUILD_VERSION load command.
-    ///
-    /// Specifies macOS 14.0 as the minimum deployment target with no tool entries.
+    /// Write the LC_BUILD_VERSION load command: the configured platform,
+    /// minimum OS and SDK (see [`Self::set_build_version`]), no tool entries.
     fn write_build_version(&self, buf: &mut Vec<u8>) {
+        debug_assert_eq!(self.build_version.platform(), PLATFORM_MACOS);
         buf.extend_from_slice(&LC_BUILD_VERSION.to_le_bytes());
-        // cmd
         buf.extend_from_slice(&BUILD_VERSION_COMMAND_SIZE.to_le_bytes());
-        // cmdsize
-        buf.extend_from_slice(&PLATFORM_MACOS.to_le_bytes());
-        // platform
-        // minos: 14.0.0 encoded as 0x000E0000
-        buf.extend_from_slice(&0x000E_0000u32.to_le_bytes());
-        // sdk: 14.0.0
-        buf.extend_from_slice(&0x000E_0000u32.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&self.build_version.platform().to_le_bytes());
+        buf.extend_from_slice(
+            &self
+                .build_version
+                .minimum_os()
+                .macho_encoding()
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(&self.build_version.sdk().macho_encoding().to_le_bytes());
         // ntools = 0
+        buf.extend_from_slice(&0u32.to_le_bytes());
     }
 
     /// Write the LC_SYMTAB load command.
@@ -1479,7 +1606,13 @@ impl MachOWriter {
                 N_UNDF
             }
         } else if sym.is_global {
-            N_SECT | N_EXT
+            if sym.is_private_extern {
+                // Hidden visibility: still external in this object (N_EXT), but
+                // marked N_PEXT so the final link demotes it to a local.
+                N_SECT | N_EXT | N_PEXT
+            } else {
+                N_SECT | N_EXT
+            }
         } else {
             N_SECT
         };
@@ -2134,9 +2267,38 @@ mod tests {
         let minos = read_u32(&bytes, bv_offset + 12);
         assert_eq!(minos, 0x000E_0000, "minimum OS should be macOS 14.0");
 
+        assert_eq!(read_u32(&bytes, bv_offset + 16), 0, "no SDK was used");
+
         // ntools = 0
         let ntools = read_u32(&bytes, bv_offset + 20);
         assert_eq!(ntools, 0, "no tool entries");
+    }
+
+    #[test]
+    fn build_version_command_records_the_configured_deployment_target() {
+        use crate::apple_deployment::{AppleDeploymentTargetSource, AppleOsVersion};
+
+        let bv_offset = (MACH_HEADER_64_SIZE + SEGMENT_COMMAND_64_SIZE) as usize;
+        for (version, sdk) in [
+            (AppleOsVersion::new(12, 0, 0), 0),
+            (AppleOsVersion::new(13, 3, 1), 0),
+            (AppleOsVersion::new(15, 2, 0), 0),
+        ] {
+            let mut writer = MachOWriter::new();
+            writer.set_build_version(
+                MachOBuildVersion::macos(
+                    "arm64",
+                    version,
+                    AppleDeploymentTargetSource::TargetTriple,
+                )
+                .unwrap(),
+            );
+            let bytes = writer.write().unwrap();
+            assert_eq!(read_u32(&bytes, bv_offset), LC_BUILD_VERSION);
+            assert_eq!(read_u32(&bytes, bv_offset + 8), PLATFORM_MACOS);
+            assert_eq!(read_u32(&bytes, bv_offset + 12), version.macho_encoding());
+            assert_eq!(read_u32(&bytes, bv_offset + 16), sdk, "{version}");
+        }
     }
 
     #[test]
@@ -2486,5 +2648,67 @@ mod tests {
         // Spot-check the published flag values.
         assert_eq!(N_WEAK_REF, 0x0040);
         assert_eq!(N_WEAK_DEF, 0x0080);
+    }
+
+    /// A PRIVATE EXTERN (hidden visibility) symbol encodes
+    /// `N_SECT | N_EXT | N_PEXT` and stays in the external-defined nlist
+    /// partition (the final link, not this object, demotes it to a local); an
+    /// ordinary global has no `N_PEXT`, and a local has neither flag. An
+    /// undefined private extern is refused — it has no meaning in an
+    /// MH_OBJECT.
+    #[test]
+    fn test_private_extern_symbol_nlist_encoding() {
+        let mut writer = MachOWriter::for_target(MachOTarget::AArch64);
+        writer.add_text_section(&[0xC0, 0x03, 0x5F, 0xD6]); // ret
+
+        let hidden = writer.add_private_extern_symbol("_hidden", 1, 0).unwrap();
+        let global = writer.add_symbol("_global", 1, 0, true).unwrap();
+        let local = writer.add_symbol("_local", 1, 0, false).unwrap();
+        assert!(
+            writer
+                .add_private_extern_symbol("_undef_hidden", 0, 0)
+                .is_err(),
+            "an undefined private extern must be refused"
+        );
+        let bytes = writer.write().unwrap();
+
+        let ncmds = read_u32(&bytes, 16);
+        let mut cmd_off = MACH_HEADER_64_SIZE as usize;
+        let mut symoff = 0usize;
+        let mut dysym: Option<usize> = None;
+        for _ in 0..ncmds {
+            let cmd = read_u32(&bytes, cmd_off);
+            let cmdsize = read_u32(&bytes, cmd_off + 4) as usize;
+            if cmd == LC_SYMTAB {
+                symoff = read_u32(&bytes, cmd_off + 8) as usize;
+            }
+            if cmd == LC_DYSYMTAB {
+                dysym = Some(cmd_off);
+            }
+            cmd_off += cmdsize;
+        }
+
+        let mut read_type = |sym_id: SymbolId| -> u8 {
+            let idx = writer.final_symbol_index(sym_id).unwrap().unwrap() as usize;
+            bytes[symoff + idx * NLIST_64_SIZE as usize + 4]
+        };
+        assert_eq!(
+            read_type(hidden),
+            N_SECT | N_EXT | N_PEXT,
+            "hidden = defined external + private extern"
+        );
+        assert_eq!(read_type(global), N_SECT | N_EXT);
+        assert_eq!(read_type(local), N_SECT);
+
+        // Partition: the hidden symbol counts as an EXTERNAL DEFINED symbol
+        // (nextdefsym includes it; nlocalsym does not). LC_DYSYMTAB layout:
+        // ilocalsym/nlocalsym at +8/+12, iextdefsym/nextdefsym at +16/+20.
+        let dysym = dysym.expect("LC_DYSYMTAB present");
+        assert_eq!(read_u32(&bytes, dysym + 12), 1, "one local (_local)");
+        assert_eq!(
+            read_u32(&bytes, dysym + 20),
+            2,
+            "hidden + global are both external defined"
+        );
     }
 }

@@ -2042,10 +2042,10 @@ pub(crate) mod cfg_corpus {
         let mut out: Vec<VReg> = Vec::new();
         for inst in &func.insts {
             for op in &inst.operands {
-                if let MachOperand::VReg(v) = op {
-                    if !out.contains(v) {
-                        out.push(*v);
-                    }
+                if let MachOperand::VReg(v) = op
+                    && !out.contains(v)
+                {
+                    out.push(*v);
                 }
             }
         }
@@ -2405,8 +2405,8 @@ mod differential_runner {
     use super::super::{DefSite, ReachingCtx, reaching_defs_at, unique_reaching_const};
     use super::cfg_corpus::{self, Case};
     use super::{OracleSite, oracle_reaching};
+    use crate::fast_hash::FxHashSet as HashSet;
     use std::collections::BTreeSet;
-    use std::collections::HashSet;
 
     fn to_oracle(s: &HashSet<DefSite>) -> BTreeSet<OracleSite> {
         s.iter()

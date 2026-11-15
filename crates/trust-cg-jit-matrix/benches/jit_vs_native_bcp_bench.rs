@@ -90,7 +90,8 @@ fn bench_jit_vs_native(c: &mut Criterion) {
     let mut group = c.benchmark_group("bcp_propagate_throughput");
 
     for case in CASES {
-        let clauses = random_3sat(case.num_vars, case.num_clauses, case.seed);
+        let clauses =
+            random_3sat(case.num_vars, case.num_clauses, case.seed).expect("valid 3-SAT fixture");
 
         // One-off semantic prologue (not timed). Catches JIT-vs-native
         // divergence before we hand criterion any wall-clock numbers.
@@ -172,7 +173,8 @@ fn bench_jit_vs_native_with_decisions(c: &mut Criterion) {
     let mut group = c.benchmark_group("bcp_propagate_with_decisions_throughput");
 
     for case in CASES {
-        let clauses = random_3sat(case.num_vars, case.num_clauses, case.seed);
+        let clauses =
+            random_3sat(case.num_vars, case.num_clauses, case.seed).expect("valid 3-SAT fixture");
         let decisions = random_decisions(case.num_vars, DECISION_COUNT, case.seed ^ 0xDEC1510D);
 
         let native_label = format!("{}_native_dec{}", case.label, DECISION_COUNT);
@@ -221,7 +223,8 @@ fn bench_jit_watched_literal_vs_native(c: &mut Criterion) {
     let mut group = c.benchmark_group("bcp_watched_literal_throughput");
 
     for case in CASES {
-        let clauses = random_3sat(case.num_vars, case.num_clauses, case.seed);
+        let clauses =
+            random_3sat(case.num_vars, case.num_clauses, case.seed).expect("valid 3-SAT fixture");
 
         // Empty-input variant.
         let native_label = format!("{}_native_empty", case.label);
@@ -316,7 +319,8 @@ fn bench_jit_watched_literal_chunked_vs_native(c: &mut Criterion) {
     let mut group = c.benchmark_group("bcp_watched_literal_chunked_throughput");
 
     for case in CASES {
-        let clauses = random_3sat(case.num_vars, case.num_clauses, case.seed);
+        let clauses =
+            random_3sat(case.num_vars, case.num_clauses, case.seed).expect("valid 3-SAT fixture");
 
         // Memory delta print: this is the headline number for the
         // chunked variant. Done once per case before the timed loops so

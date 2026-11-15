@@ -45,9 +45,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use trust_cg_codegen::interpreter::{InterpreterConfig, InterpreterValue, interpret_with_config};
 use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig};
-use trust_cg_fuzz::runlog::{Repro, RunLog};
+use trust_cg_fuzz::runlog::{Repro, RunLog, campaign_deadline};
 use trust_cg_fuzz::trust_ir_gen::{FUZZ_FN_NAME, GenConfig, gen_module, sample_inputs};
-use trust_cg_lower::adapter::translate_module;
+use trust_cg_lower::{
+    GuardCarrierArch, TlsDialect, translate_module_for_arch_with_tls_with_license,
+};
 
 const MAX_REPROS_RECORDED: usize = 32;
 
@@ -137,7 +139,14 @@ fn run_oracle_one(module: &trust_ir::Module, args: &[i64]) -> Result<Vec<i64>, S
 /// all succeeded; `Err(_)` carries the stringified error.
 fn compile_one(module: &trust_ir::Module, opt: OptLevel) -> Result<usize, String> {
     // Translate trust_ir -> trust-cg-lower::Function.
-    let lower = match translate_module(module) {
+    // `translate_module` under the harness's license (the named `FuzzHarness`
+    // exception): the default refuses a generated, claim-less body.
+    let lower = match translate_module_for_arch_with_tls_with_license(
+        module,
+        GuardCarrierArch::default(),
+        TlsDialect::default(),
+        &trust_cg_fuzz::fuzz_license(),
+    ) {
         Ok(v) => v,
         Err(e) => return Err(format!("translate_err: {:?}", e)),
     };
@@ -154,9 +163,11 @@ fn compile_one(module: &trust_ir::Module, opt: OptLevel) -> Result<usize, String
         enable_fsym_trust_ir_preflight: false,
         target_triple: "aarch64-unknown-unknown".to_string(),
         enable_jit_fast_regalloc: false,
+        aarch64_force_frame_pointers: false,
         skip_cse_gvn: false,
         disabled_passes_override: None,
         contains4_scanner_batch_rewrite_override: None,
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
     });
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         pipeline.compile_function(func).map_err(Box::new)
@@ -199,10 +210,15 @@ fn main() -> Result<(), String> {
     let seed_start: u64 = parse_arg(&args, "--seed-start", 1)?;
 
     let out_path = PathBuf::from(&out_dir);
-    fs::create_dir_all(&out_path).expect("create out_dir");
+    let deadline = campaign_deadline(duration_secs)?;
+    fs::create_dir_all(&out_path).map_err(|error| {
+        format!(
+            "cannot create output directory '{}': {error}",
+            out_path.display()
+        )
+    })?;
 
     let started_at = iso_now();
-    let deadline = Instant::now() + Duration::from_secs(duration_secs);
 
     let mut log = RunLog {
         driver: "trust-ir-gen".to_string(),
@@ -216,6 +232,19 @@ fn main() -> Result<(), String> {
         repros: Vec::new(),
         started_at: started_at.clone(),
         finished_at: String::new(),
+        seed_start: Some(seed_start),
+        requested_runs: None,
+        planted_miscompile_seed: None,
+        rows_checked: None,
+        rows_executed: None,
+        rows_refused: None,
+        refusal_samples: Vec::new(),
+        rows_oracle_compared: None,
+        rows_cross_level_only: None,
+        oracle_error_samples: Vec::new(),
+        scalar_rows_per_seed: None,
+        seeds_incomplete: None,
+        incomplete_seed_samples: Vec::new(),
     };
 
     let mut seed = seed_start;
@@ -228,14 +257,17 @@ fn main() -> Result<(), String> {
 
         // Step 1: generate.
         let module = match panic::catch_unwind(panic::AssertUnwindSafe(|| gen_module(seed, &cfg))) {
-            Ok(m) => m,
-            Err(_) => {
+            Ok(Ok(m)) => m,
+            failed => {
                 log.crashes += 1;
                 if log.repros.len() < MAX_REPROS_RECORDED {
                     log.repros.push(Repro {
                         seed,
                         minimized_input_path: None,
-                        summary: "gen_module panicked".to_string(),
+                        summary: match failed {
+                            Ok(Err(refusal)) => format!("gen_module's builder refused: {refusal}"),
+                            _ => "gen_module panicked".to_string(),
+                        },
                     });
                 }
                 continue;
@@ -348,8 +380,8 @@ fn main() -> Result<(), String> {
 
     // Write the JSON result.
     let json_path = out_path.join("trust-ir-gen.json");
-    let json = serde_json::to_string_pretty(&log).expect("serialize RunLog");
-    fs::write(&json_path, json).expect("write trust-ir-gen.json");
+    log.write_to(&json_path)
+        .map_err(|error| error.to_string())?;
     eprintln!(
         "[trust-ir-gen] wrote {} runs={} miscompiles={} crashes={}",
         json_path.display(),

@@ -3,7 +3,6 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: designs/2026-04-18-pgo-workflow.md
 // Issue: #396
 
 //! Profile-use pass plumbing.
@@ -31,19 +30,15 @@ use super::schema::{FunctionProfile, ProfData};
 /// Pass name used in pass-manager diagnostics and `TRUST_CG_DISABLE_PASSES`.
 pub const PROFILE_USE_PASS_NAME: &str = "profile-use";
 
-/// Kill switch for the profile-guided block layout: set `TCG_PGO_NO_LAYOUT`
-/// (any value) to skip the hot-chain reordering while keeping the hotness
-/// handout to downstream consumers (for PGO effect attribution A/B runs).
-/// Inert without a profile.
-fn pgo_layout_enabled() -> bool {
-    std::env::var_os("TCG_PGO_NO_LAYOUT").is_none()
-}
-
 /// Opt-in decision log (`TCG_PGO_LAYOUT_LOG=1`): one stderr line per layout
 /// chain pick, with the candidate hit counts, so profile-layout decisions can
 /// be attributed program-by-program. Mirrors `TCG_LATCH_SPLIT_LOG`.
+/// Cached: a PURE log gate (it selects only whether the pick trace prints),
+/// read once per placed block inside the layout walk.
 fn pgo_layout_log_enabled() -> bool {
-    std::env::var_os("TCG_PGO_LAYOUT_LOG").is_some()
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TCG_PGO_LAYOUT_LOG").is_some())
 }
 
 /// Kill switch for the zero-hit-span chain gate: set `TCG_PGO_LAYOUT_UNGATED`
@@ -134,9 +129,6 @@ impl ProfileUsePass {
         func: &mut MachFunction,
         provenance: Option<&mut ProvenanceMap>,
     ) -> bool {
-        if !pgo_layout_enabled() {
-            return false;
-        }
         if self.hotness.function(&func.name).is_none() || func.block_order.len() <= 1 {
             return false;
         }

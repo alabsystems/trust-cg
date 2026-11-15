@@ -145,8 +145,8 @@ INCLUDED = {
 
 # Ops present in the chip files but DEFERRED (no Rust bit-model port yet). Logged.
 # (Now EMPTY for AArch64 scalar binary32/binary64: FDIV/FSQRT are ported above.
-# f32-carrier residual is tracked in the soundness manifest, not here, since the
-# bit-model itself supports F32 — only the smt.rs eval carrier is f64-lossy.)
+# The f32-carrier residual belongs to smt.rs's f64 eval carrier, whose doc
+# comments state it; the bit-model itself supports F32.)
 DEFERRED_REASONS = {}
 
 # Chip files to scan.

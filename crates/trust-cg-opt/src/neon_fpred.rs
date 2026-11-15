@@ -17,8 +17,8 @@
 //! `fmadd / fmsub` (`llvm.fmuladd`) over the leaves `(double)i` (from
 //! `UCVTF/SCVTF` of the integer induction) and **loop-invariant** `f64` scalars
 //! (hoisted coefficients, parameters), and the reduction combines EITHER with a
-//! PLAIN `FADD` (`acc = acc + f(i)` or `f(i) + acc`) — the *canonical* flops-5
-//! tan-integral shape, >99 % of its runtime — OR as a FUSED accumulate
+//! PLAIN `FADD` (`acc = acc + f(i)` or `f(i) + acc`) — the flops-5
+//! tan-integral shape — OR as a FUSED accumulate
 //! `acc = fmadd(n, m, acc)` (the accumulator in the ADDEND position;
 //! `-ffp-contract=on` fuses `acc += n*m`), the *canonical* `flops-6/8` shape.
 //! Both fold in WITHOUT reassociation (below).
@@ -34,8 +34,7 @@
 //! `mov d, v.d[0]; fadd acc, acc, d; mov d, v.d[1]; fadd acc, acc, d; …` (the
 //! [`AArch64Opcode::NeonDupScalarD`] lane extract + scalar `FADD`). The fadds
 //! into `acc` therefore happen in exactly the scalar sequence
-//! `acc += f(i); acc += f(i+1); …`, so NO reassociation occurs. This is clang
-//! -O3's own emission for these kernels.
+//! `acc += f(i); acc += f(i+1); …`, so NO reassociation occurs.
 //!
 //! For a FUSED accumulate `acc = fmadd(n, m, acc)` the vector body computes ONLY
 //! the `n` and `m` multiplicand lanes (each a per-lane-exact op); the drain then
@@ -86,7 +85,9 @@
 //! neither the induction nor a loop-invariant `f64`, a fused accumulate whose
 //! accumulator is a MULTIPLICAND rather than the addend
 //! (`acc = fmadd(acc, _, _)`, a rounding-sensitive
-//! multiply-recurrence), an extra live-out, an accumulator that does not
+//! multiply-recurrence), register state the vector loop does not reproduce
+//! (the crate's one loop-state contract, [`crate::loop_contract`]), an
+//! accumulator that does not
 //! provably ENTER the loop holding `+0.0` (the drain OVERWRITES `acc` with the
 //! vector partial sum, so a non-zero init would be silently discarded — see
 //! (R5b)) — the loop is left ENTIRELY to the scalar path (`scalar_unroll`'s
@@ -96,8 +97,18 @@
 //! Runs at O2/O3 immediately BEFORE `reduction_split`/`scalar_unroll` (so it gets
 //! first shot at the FP-reduction loop). Disable with
 //! `TRUST_CG_DISABLE_PASSES=neonfpred`.
+//!
+//! Recognized rewrites are built on a private function clone and committed only
+//! on success. Register-ID exhaustion or a lowering/splice refusal leaves the
+//! input unchanged. Counter synchronization scans existing identities once;
+//! each subsequent allocation checks capacity without rescanning the function.
+//! This is not a general malformed-IR or allocation-failure boundary: the shared
+//! arena/block APIs and legacy infallible register allocator still need auditing.
 
-use std::collections::{HashMap, HashSet};
+use crate::candidate::{alloc, commit, emit, emit_before, insert_new_blocks_before, splice_edge};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{ExitPlan, Handoff, LoopLocality};
+use crate::mach_util::{branch_targets, const_value};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstFlags, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -110,7 +121,7 @@ use crate::pass_manager::{AnalysisCache, MachinePass};
 /// Lanes per NEON `.2D` (f64) unit.
 const VF: i64 = 2;
 /// Independent 2-lane pairs unrolled per vector iteration (`width = VF*UNROLL`
-/// = 8 elements, matching clang -O3's flops emission).
+/// = 8 elements).
 const UNROLL: i64 = 4;
 /// FP-op arrangement code for `.2D` (NeonFaddV/…/NeonFmlaV/NeonUcvtfV: 2=2D).
 const FARR_D2: i64 = 2;
@@ -217,9 +228,6 @@ impl NeonFPRedPass {
                 changed = true;
             }
         }
-        if changed && std::env::var("TRUST_CG_DUMP_NEONFPRED").is_ok() {
-            eprintln!("[neon-fpred] fn={} vectorized={}", func.name, self.fired);
-        }
         changed
     }
 }
@@ -261,6 +269,9 @@ struct Recognized {
     def: HashMap<u32, InstId>,
     /// Instruction ids that live inside the loop body.
     loop_insts: HashSet<InstId>,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv, acc, acc_src]`. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 /// Opcodes permitted anywhere in the loop body. Anything else ⇒ BAIL (rules out
@@ -280,20 +291,6 @@ fn allowed_loop_op(op: AArch64Opcode) -> bool {
     )
 }
 
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
 /// `MovR/Copy/FmovFprFpr(d, s)` or `AddRI(d, s, 0)` copy idioms ⇒ `(d, s)`.
 /// Handles the FP accumulator writeback (`FmovFprFpr`) as well as the GPR
 /// induction writeback (`MovR`).
@@ -302,28 +299,15 @@ fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
         AArch64Opcode::MovR | AArch64Opcode::Copy | AArch64Opcode::FmovFprFpr
             if inst.operands.len() == 2 =>
         {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
+            Some((inst.operands[0].as_vreg()?, inst.operands[1].as_vreg()?))
         }
         AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
+            if inst.operands.len() == 3 && inst.operands[2].as_imm() == Some(0) =>
         {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
+            Some((inst.operands[0].as_vreg()?, inst.operands[1].as_vreg()?))
         }
         _ => None,
     }
-}
-
-/// Constant value of `val` if defined by a `Movz`(+`Movk`) chain reaching a use.
-/// Used to prove the `+1` step's addend register is exactly 1.
-fn movz_const(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
-    let inst = func.inst(*def.get(&val.id)?);
-    if inst.opcode == AArch64Opcode::Movz
-        && let Some(v) = inst.operands.get(1).and_then(imm_of)
-        && inst.operands.len() == 2
-    {
-        return Some(v);
-    }
-    None
 }
 
 fn is_increment_by_one(
@@ -338,13 +322,13 @@ fn is_increment_by_one(
     let inst = func.inst(id);
     match inst.opcode {
         AArch64Opcode::AddRI => {
-            vreg_of(&inst.operands[1]) == Some(iv) && imm_of(&inst.operands[2]) == Some(1)
+            inst.operands[1].as_vreg() == Some(iv) && inst.operands[2].as_imm() == Some(1)
         }
         AArch64Opcode::AddRR => {
-            let a = vreg_of(&inst.operands[1]);
-            let b = vreg_of(&inst.operands[2]);
-            (a == Some(iv) && b.and_then(|r| movz_const(func, def, r)) == Some(1))
-                || (b == Some(iv) && a.and_then(|r| movz_const(func, def, r)) == Some(1))
+            let a = inst.operands[1].as_vreg();
+            let b = inst.operands[2].as_vreg();
+            (a == Some(iv) && b.and_then(|r| const_value(func, def, r)) == Some(1))
+                || (b == Some(iv) && a.and_then(|r| const_value(func, def, r)) == Some(1))
         }
         _ => false,
     }
@@ -371,7 +355,7 @@ fn recognize_rotated_header_exit(
         return None;
     }
     let bcond = func.inst(insts[p]);
-    let cc = imm_of(&bcond.operands[0])?;
+    let cc = bcond.operands[0].as_imm()?;
     if cc != CC_EQ && cc != CC_GE {
         return None;
     }
@@ -381,10 +365,10 @@ fn recognize_rotated_header_exit(
     if cmp.opcode != AArch64Opcode::CmpRR {
         return None;
     }
-    if vreg_of(&cmp.operands[0])? != iv_src {
+    if cmp.operands[0].as_vreg()? != iv_src {
         return None; // must compare the STEP value (iv+1)
     }
-    Some((vreg_of(&cmp.operands[1])?, exit, cmp_id))
+    Some((cmp.operands[1].as_vreg()?, exit, cmp_id))
 }
 
 /// FPR-to-FPR copy levels followed while proving the accumulator's entry value.
@@ -422,10 +406,10 @@ fn acc_enters_as_pos_zero(func: &MachFunction, preheader_term: InstId, acc: VReg
         if inst.operands.len() != 2 {
             return false;
         }
-        let Some(dst) = vreg_of(&inst.operands[0]).filter(|d| d.id == id) else {
+        let Some(dst) = inst.operands[0].as_vreg().filter(|d| d.id == id) else {
             return false;
         };
-        let Some(src) = vreg_of(&inst.operands[1]) else {
+        let Some(src) = inst.operands[1].as_vreg() else {
             return false; // a PReg source (e.g. an incoming argument) is opaque
         };
         match inst.opcode {
@@ -462,7 +446,7 @@ impl Recognized {
         }
 
         // (R2) whitelist every opcode in the loop body — no memory/call/etc.
-        let mut loop_insts = HashSet::new();
+        let mut loop_insts = HashSet::default();
         for &b in [header, latch].iter() {
             for &id in &func.block(b).insts {
                 if !allowed_loop_op(func.inst(id).opcode) {
@@ -472,7 +456,7 @@ impl Recognized {
             }
         }
 
-        let def = build_def_map(func);
+        let def = crate::effects::build_reaching_def_map(func);
 
         // (R3) header preds = {latch, guard}; re-root onto the guard (rotated).
         let hpreds = &func.block(header).preds;
@@ -563,8 +547,8 @@ impl Recognized {
         let acc_def = func.inst(*def.get(&acc_src.id)?);
         let reduction = match acc_def.opcode {
             AArch64Opcode::FaddRR => {
-                let x = vreg_of(&acc_def.operands[1])?;
-                let y = vreg_of(&acc_def.operands[2])?;
+                let x = acc_def.operands[1].as_vreg()?;
+                let y = acc_def.operands[2].as_vreg()?;
                 let term = if x == acc {
                     y
                 } else if y == acc {
@@ -583,9 +567,9 @@ impl Recognized {
                 // multiplicand (operands 1/2) — `acc + n*m` is a pure add-into-acc
                 // reduction, whereas `acc` as a factor is a scaling recurrence we
                 // cannot fold without changing the result.
-                let n = vreg_of(&acc_def.operands[1])?;
-                let m = vreg_of(&acc_def.operands[2])?;
-                let a = vreg_of(&acc_def.operands[3])?;
+                let n = acc_def.operands[1].as_vreg()?;
+                let m = acc_def.operands[2].as_vreg()?;
+                let a = acc_def.operands[3].as_vreg()?;
                 if a != acc || n == acc || m == acc {
                     return None;
                 }
@@ -605,13 +589,32 @@ impl Recognized {
                 continue;
             }
             for op in func.inst(id).operands.iter().skip(1) {
-                if vreg_of(op) == Some(acc) {
+                if op.as_vreg() == Some(acc) {
                     return None;
                 }
             }
         }
 
+        // LOOP STATE (`crate::loop_contract`): the vector loop runs only
+        // iterations the header's rotated `iv + 1 == bound` test continues, and
+        // the loop may leave by no other exit. It reproduces `iv`, `acc`, and
+        // `acc_src` (the drain seeds it for the rotated exit, which leaves from
+        // the header). The drain branches straight to the true exit when
+        // nothing remains, so every exit is checked. This replaced the pass's
+        // own live-out scan, which also admitted `iv_src` (`iv + 1`): the vector
+        // code never writes it, so an exit reading it saw a stale register at
+        // an empty remainder.
+        let locality = LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &ExitPlan::loop_test(header, exit),
+            Handoff::HeaderOrExit,
+            &[iv, acc, acc_src],
+        )
+        .ok()?;
         let mut rec = Recognized {
+            _locality: locality,
             preheader_term,
             vec_guard: header,
             preheader: guard,
@@ -631,7 +634,7 @@ impl Recognized {
         // accumulate, BOTH multiplicand DAGs `n` and `m` are validated (shared
         // subexpressions like `n == m` for `v*v` are tolerated by the `seen`
         // memo). Also fixes `unsigned_cvt`.
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut saw_signed = false;
         let mut saw_unsigned = false;
         let roots_ok = match rec.reduction {
@@ -650,29 +653,6 @@ impl Recognized {
             return None; // mixed cvt kinds on the same induction — bail
         }
         rec.unsigned_cvt = !saw_signed;
-
-        // (R10) no other live-outs than {iv, iv_src, acc, acc_src}: every other
-        // body-defined vreg must be body-local (else a term intermediate could be
-        // read stale when the vector consumes all n and the tail runs 0 times).
-        let allowed_liveout: HashSet<u32> =
-            [iv.id, iv_src.id, acc.id, acc_src.id].into_iter().collect();
-        let body_defs = collect_body_defs(func, &rec.loop_insts);
-        for (bidx, block) in func.blocks.iter().enumerate() {
-            let bid = BlockId(bidx as u32);
-            if body.contains(&bid) {
-                continue;
-            }
-            for &id in &block.insts {
-                for op in &func.inst(id).operands {
-                    if let Some(v) = vreg_of(op)
-                        && body_defs.contains(&v.id)
-                        && !allowed_liveout.contains(&v.id)
-                    {
-                        return None;
-                    }
-                }
-            }
-        }
 
         Some(rec)
     }
@@ -708,7 +688,7 @@ impl Recognized {
         match inst.opcode {
             UcvtfRR | ScvtfRR => {
                 // The single induction leaf: convert of the loop-carried iv.
-                if vreg_of(&inst.operands[1]) != Some(self.iv) {
+                if inst.operands[1].as_vreg() != Some(self.iv) {
                     return false;
                 }
                 if inst.opcode == UcvtfRR {
@@ -719,11 +699,11 @@ impl Recognized {
                 true
             }
             FmulRR | FaddRR | FsubRR | FdivRR => {
-                let a = match vreg_of(&inst.operands[1]) {
+                let a = match inst.operands[1].as_vreg() {
                     Some(v) => v,
                     None => return false,
                 };
-                let b = match vreg_of(&inst.operands[2]) {
+                let b = match inst.operands[2].as_vreg() {
                     Some(v) => v,
                     None => return false,
                 };
@@ -732,9 +712,9 @@ impl Recognized {
             }
             FmaddRR if inst.operands.len() == 4 => {
                 // d = a + n*m — the fused contraction (per-lane preserved).
-                let n = vreg_of(&inst.operands[1]);
-                let m = vreg_of(&inst.operands[2]);
-                let a = vreg_of(&inst.operands[3]);
+                let n = inst.operands[1].as_vreg();
+                let m = inst.operands[2].as_vreg();
+                let a = inst.operands[3].as_vreg();
                 match (n, m, a) {
                     (Some(n), Some(m), Some(a)) => {
                         self.node_ok(func, n, seen, saw_signed, saw_unsigned)
@@ -755,17 +735,6 @@ impl Recognized {
             _ => false,
         }
     }
-}
-
-fn collect_body_defs(func: &MachFunction, loop_insts: &HashSet<InstId>) -> HashSet<u32> {
-    let mut defs = HashSet::new();
-    for &id in loop_insts {
-        let inst = func.inst(id);
-        crate::effects::for_each_inst_def(inst, |v| {
-            defs.insert(v.id);
-        });
-    }
-    defs
 }
 
 // ---------------------------------------------------------------------------
@@ -807,12 +776,18 @@ enum LoweredPair {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool {
+    commit(func, |candidate| {
+        apply_candidate(candidate, rec, pressure_tune)
+    })
+}
+
+fn apply_candidate(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> Option<()> {
     let width = VF * UNROLL; // lanes per vector iteration (8)
-    let vh = func.create_block();
-    let vb = func.create_block();
-    let vl = func.create_block();
-    let vx = func.create_block();
-    insert_new_blocks_before(func, rec.vec_guard, &[vh, vb, vl, vx]);
+    let vh = func.try_create_block()?;
+    let vb = func.try_create_block()?;
+    let vl = func.try_create_block()?;
+    let vx = func.try_create_block()?;
+    insert_new_blocks_before(func, rec.vec_guard, &[vh, vb, vl, vx])?;
     func.add_edge(vh, vb);
     func.add_edge(vh, vx);
     func.add_edge(vb, vl);
@@ -822,23 +797,23 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
 
     // --- Preheader: materialize the constant bound + `main_bound = bound -
     // (width-1)` (i64, exact) and seed a FRESH scalar accumulator `svec = 0.0`.
-    let bound = materialize_const(func, pre, rec.bound_const, RegClass::Gpr64);
-    let main_bound = alloc(func, RegClass::Gpr64);
+    let bound = materialize_const(func, pre, rec.bound_const, RegClass::Gpr64)?;
+    let main_bound = alloc(func, RegClass::Gpr64)?;
     emit_before(
         func,
         pre,
         AArch64Opcode::SubRI,
         vec![vreg(main_bound), vreg(bound), imm(width - 1)],
-    );
-    let wz = alloc(func, RegClass::Gpr64);
-    emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(wz), imm(0)]);
-    let svec = alloc(func, RegClass::Fpr64);
+    )?;
+    let wz = alloc(func, RegClass::Gpr64)?;
+    emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(wz), imm(0)])?;
+    let svec = alloc(func, RegClass::Fpr64)?;
     emit_before(
         func,
         pre,
         AArch64Opcode::FmovGprFpr,
         vec![vreg(svec), vreg(wz)],
-    );
+    )?;
 
     // --- Preheader: the i64 index-vector scheme.
     //
@@ -853,56 +828,55 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
     // `[VF, VF]` constant (`vi_k = vi_{k-1} + [2, 2]`). The lane values are
     // IDENTICAL (exact i64: `dup(iv) + [0,1] = [iv, iv+1]`; the chained adds
     // reach the same `iv+2k`, `iv+2k+1`), but only TWO invariant `.2D`
-    // constants stay live across the loop — no advance step, no carried vector
-    // register to spill/writeback (measured: the carried Q + its step were
-    // spill-reloaded every iteration on the flops polynomial kernels).
+    // constants stay live across the loop — no advance step or loop-carried
+    // vector register. Actual spill behavior depends on allocation and the input.
     let mut carried: Option<(VReg, VReg)> = None; // (vidx0, vstep) — untuned
     let mut c01: Option<VReg> = None; // [0, 1] — tuned body recompute
     let voff: Vec<VReg> = if pressure_tune {
-        let d = alloc(func, RegClass::Fpr128);
-        emit_before(func, pre, AArch64Opcode::NeonMovi, vec![vreg(d), imm(0)]);
-        let one = alloc(func, RegClass::Gpr64);
-        emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(one), imm(1)]);
+        let d = alloc(func, RegClass::Fpr128)?;
+        emit_before(func, pre, AArch64Opcode::NeonMovi, vec![vreg(d), imm(0)])?;
+        let one = alloc(func, RegClass::Gpr64)?;
+        emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(one), imm(1)])?;
         emit_before(
             func,
             pre,
             AArch64Opcode::NeonInsGen,
             vec![vreg(d), vreg(one), imm(1), imm(ELEM_D)],
-        );
+        )?;
         c01 = Some(d);
-        vec![dup_const_i64_pre(func, pre, VF)]
+        vec![dup_const_i64_pre(func, pre, VF)?]
     } else {
-        let vidx0 = alloc(func, RegClass::Fpr128);
+        let vidx0 = alloc(func, RegClass::Fpr128)?;
         emit_before(
             func,
             pre,
             AArch64Opcode::NeonDupGen,
             vec![vreg(vidx0), vreg(rec.iv), imm(ELEM_D)],
-        );
-        let iv_p1 = alloc(func, RegClass::Gpr64);
+        )?;
+        let iv_p1 = alloc(func, RegClass::Gpr64)?;
         emit_before(
             func,
             pre,
             AArch64Opcode::AddRI,
             vec![vreg(iv_p1), vreg(rec.iv), imm(1)],
-        );
+        )?;
         emit_before(
             func,
             pre,
             AArch64Opcode::NeonInsGen,
             vec![vreg(vidx0), vreg(iv_p1), imm(1), imm(ELEM_D)],
-        );
-        let vstep = dup_const_i64_pre(func, pre, width);
+        )?;
+        let vstep = dup_const_i64_pre(func, pre, width)?;
         carried = Some((vidx0, vstep));
         (0..UNROLL)
             .map(|k| {
                 if k == 0 {
-                    vidx0 // placeholder (pair 0 uses vidx0 directly)
+                    Some(vidx0) // placeholder (pair 0 uses vidx0 directly)
                 } else {
                     dup_const_i64_pre(func, pre, VF * k)
                 }
             })
-            .collect()
+            .collect::<Option<Vec<_>>>()?
     };
 
     // --- Vector header: guard `iv < main_bound` (i64 signed; iv,bound positive).
@@ -911,9 +885,9 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
         vh,
         AArch64Opcode::CmpRR,
         vec![vreg(rec.iv), vreg(main_bound)],
-    );
-    emit(func, vh, AArch64Opcode::BCond, vec![imm(CC_LT), block(vb)]);
-    emit(func, vh, AArch64Opcode::B, vec![block(vx)]);
+    )?;
+    emit(func, vh, AArch64Opcode::BCond, vec![imm(CC_LT), block(vb)])?;
+    emit(func, vh, AArch64Opcode::B, vec![block(vx)])?;
 
     // --- Vector body: for each pair, convert its index lanes and lower the term;
     // then drain all lane results into `svec` in ITERATION ORDER.
@@ -921,14 +895,14 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
     // PRESSURE tune: the body first recomputes `vi_0 = [iv, iv+1]` from the
     // live scalar induction (`DUP Vd.2D, Xiv` + `[0, 1]`) — no loop-carried Q.
     let vi_base = if pressure_tune {
-        let dupv = alloc(func, RegClass::Fpr128);
+        let dupv = alloc(func, RegClass::Fpr128)?;
         emit(
             func,
             vb,
             AArch64Opcode::NeonDupGen,
             vec![vreg(dupv), vreg(rec.iv), imm(ELEM_D)],
-        );
-        let vi0 = alloc(func, RegClass::Fpr128);
+        )?;
+        let vi0 = alloc(func, RegClass::Fpr128)?;
         emit(
             func,
             vb,
@@ -937,12 +911,12 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
                 vreg(vi0),
                 vreg(dupv),
                 // `c01` is assigned in the `if pressure_tune` preheader branch
-                // above, on the same `pressure_tune` this arm tests — an `apply`
+                // above, on the same `pressure_tune` this arm tests — a candidate
                 // parameter, never reassigned in the body.
                 vreg(c01.expect("tuned scheme materializes [0,1]")),
                 imm(ARR_D2),
             ],
-        );
+        )?;
         vi0
     } else {
         // Mirror of the above: `carried` is assigned in the `else` branch of
@@ -956,8 +930,8 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
         preheader_term: pre,
         def: rec.def.clone(),
         loop_insts: rec.loop_insts.clone(),
-        memo: HashMap::new(),
-        broadcast_cache: HashMap::new(),
+        memo: HashMap::default(),
+        broadcast_cache: HashMap::default(),
         lane_fmla: pressure_tune,
     };
     let cvt_op = if rec.unsigned_cvt {
@@ -995,7 +969,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
         let vi_k = if k == 0 {
             vi_base
         } else {
-            let d = alloc(func, RegClass::Fpr128);
+            let d = alloc(func, RegClass::Fpr128)?;
             let (base, off) = if pressure_tune {
                 (prev_vi, voff[0])
             } else {
@@ -1006,13 +980,13 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
                 vb,
                 AArch64Opcode::NeonAddV,
                 vec![vreg(d), vreg(base), vreg(off), imm(ARR_D2)],
-            );
+            )?;
             d
         };
         prev_vi = vi_k;
         // vfi_k = cvt(vi_k) = [(double)(iv+2k), (double)(iv+2k+1)].
-        let vfi = alloc(func, RegClass::Fpr128);
-        emit(func, vb, cvt_op, vec![vreg(vfi), vreg(vi_k), imm(FARR_D2)]);
+        let vfi = alloc(func, RegClass::Fpr128)?;
+        emit(func, vb, cvt_op, vec![vreg(vfi), vreg(vi_k), imm(FARR_D2)])?;
         ctx.vfi = vfi;
         ctx.memo.clear();
         // Lower the per-iteration term root(s) per lane. For a fused accumulate,
@@ -1022,18 +996,12 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
         // for `v*v`) is lowered once.
         let pair = match rec.reduction {
             Reduction::Fadd { term } => {
-                let Some(vterm) = lower(func, &mut ctx, term) else {
-                    return false;
-                };
+                let vterm = lower(func, &mut ctx, term)?;
                 LoweredPair::Fadd(vterm)
             }
             Reduction::Fmadd { n, m, .. } => {
-                let Some(vn) = lower(func, &mut ctx, n) else {
-                    return false;
-                };
-                let Some(vm) = lower(func, &mut ctx, m) else {
-                    return false;
-                };
+                let vn = lower(func, &mut ctx, n)?;
+                let vm = lower(func, &mut ctx, m)?;
                 LoweredPair::Fmadd(vn, vm)
             }
         };
@@ -1044,7 +1012,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
             // the FP result is bit-identical; only instruction PLACEMENT moves,
             // ending each pair's `n`/`m` vector live ranges early instead of
             // keeping all `2*UNROLL` lowered vectors live until a final drain.
-            drain_pair(func, vb, svec, &pair, &rec.reduction, unfuse_drain);
+            drain_pair(func, vb, svec, &pair, &rec.reduction, unfuse_drain)?;
         } else {
             terms.push(pair);
         }
@@ -1057,7 +1025,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
             vb,
             AArch64Opcode::NeonAddV,
             vec![vreg(vidx0), vreg(vidx0), vreg(vstep), imm(ARR_D2)],
-        );
+        )?;
     }
     // ORDERED SCALAR DRAIN — the bit-exactness linchpin. For every pair, in
     // order, extract lane 0 then lane 1 and fold into `svec` with the SAME scalar
@@ -1071,9 +1039,9 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
     // (PRESSURE tune: `terms` is empty — every pair was already drained in-place
     // by the SAME per-pair fold, in the SAME pair-then-lane order.)
     for pair in &terms {
-        drain_pair(func, vb, svec, pair, &rec.reduction, unfuse_drain);
+        drain_pair(func, vb, svec, pair, &rec.reduction, unfuse_drain)?;
     }
-    emit(func, vb, AArch64Opcode::B, vec![block(vl)]);
+    emit(func, vb, AArch64Opcode::B, vec![block(vl)])?;
 
     // --- Vector latch: advance the scalar induction by `width`.
     emit(
@@ -1081,8 +1049,8 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
         vl,
         AArch64Opcode::AddRI,
         vec![vreg(rec.iv), vreg(rec.iv), imm(width)],
-    );
-    emit(func, vl, AArch64Opcode::B, vec![block(vh)]);
+    )?;
+    emit(func, vl, AArch64Opcode::B, vec![block(vh)])?;
 
     // --- Vector exit / drain: seed the scalar accumulator (a plain COPY of the
     // partial sum — NO arithmetic, bit-exact) for BOTH the scalar tail (acc) and
@@ -1094,35 +1062,31 @@ fn apply(func: &mut MachFunction, rec: &Recognized, pressure_tune: bool) -> bool
         vx,
         AArch64Opcode::FmovFprFpr,
         vec![vreg(rec.acc), vreg(svec)],
-    );
+    )?;
     emit(
         func,
         vx,
         AArch64Opcode::FmovFprFpr,
         vec![vreg(rec.acc_src), vreg(svec)],
-    );
+    )?;
     emit(
         func,
         vx,
         AArch64Opcode::CmpRR,
         vec![vreg(rec.iv), vreg(bound)],
-    );
+    )?;
     emit(
         func,
         vx,
         AArch64Opcode::BCond,
         vec![imm(CC_GE), block(rec.exit)],
-    );
+    )?;
 
     // --- COMMIT: splice the vector loop in front of the scalar loop.
-    if !rewrite_block_target(func.inst_mut(rec.preheader_term), rec.vec_guard, vh) {
-        return false;
-    }
-    remove_cfg_edge(func, rec.preheader, rec.vec_guard);
-    func.add_edge(rec.preheader, vh);
+    splice_edge(func, rec.preheader, rec.preheader_term, rec.vec_guard, vh)?;
     func.add_edge(vx, rec.vec_guard);
     func.add_edge(vx, rec.exit);
-    true
+    Some(())
 }
 
 /// Drain ONE lowered pair into the scalar accumulator, LANE 0 THEN LANE 1 —
@@ -1148,73 +1112,73 @@ fn drain_pair(
     pair: &LoweredPair,
     reduction: &Reduction,
     unfuse_drain: bool,
-) {
+) -> Option<()> {
     if let LoweredPair::Fmadd(vn, vm) = *pair
         && unfuse_drain
     {
-        let vt = alloc(func, RegClass::Fpr128);
+        let vt = alloc(func, RegClass::Fpr128)?;
         emit(
             func,
             vb,
             AArch64Opcode::NeonFmulV,
             vec![vreg(vt), vreg(vn), vreg(vm), imm(FARR_D2)],
-        );
+        )?;
         for lane in 0..VF {
-            let d = alloc(func, RegClass::Fpr64);
+            let d = alloc(func, RegClass::Fpr64)?;
             emit(
                 func,
                 vb,
                 AArch64Opcode::NeonDupScalarD,
                 vec![vreg(d), vreg(vt), imm(lane)],
-            );
+            )?;
             emit(
                 func,
                 vb,
                 AArch64Opcode::FaddRR,
                 vec![vreg(svec), vreg(svec), vreg(d)],
-            );
+            )?;
         }
-        return;
+        return Some(());
     }
     for lane in 0..VF {
         match *pair {
             LoweredPair::Fadd(vterm) => {
-                let d = alloc(func, RegClass::Fpr64);
+                let d = alloc(func, RegClass::Fpr64)?;
                 emit(
                     func,
                     vb,
                     AArch64Opcode::NeonDupScalarD,
                     vec![vreg(d), vreg(vterm), imm(lane)],
-                );
+                )?;
                 emit(
                     func,
                     vb,
                     AArch64Opcode::FaddRR,
                     vec![vreg(svec), vreg(svec), vreg(d)],
-                );
+                )?;
             }
             LoweredPair::Fmadd(vn, vm) => {
-                let dn = alloc(func, RegClass::Fpr64);
+                let dn = alloc(func, RegClass::Fpr64)?;
                 emit(
                     func,
                     vb,
                     AArch64Opcode::NeonDupScalarD,
                     vec![vreg(dn), vreg(vn), imm(lane)],
-                );
-                let dm = alloc(func, RegClass::Fpr64);
+                )?;
+                let dm = alloc(func, RegClass::Fpr64)?;
                 emit(
                     func,
                     vb,
                     AArch64Opcode::NeonDupScalarD,
                     vec![vreg(dm), vreg(vm), imm(lane)],
-                );
+                )?;
                 // svec = svec + dn*dm  (scalar FMADD: d = a + n*m, a = svec).
                 let fmadd = emit(
                     func,
                     vb,
                     AArch64Opcode::FmaddRR,
                     vec![vreg(svec), vreg(dn), vreg(dm), vreg(svec)],
-                );
+                )?;
                 if matches!(
                     reduction,
                     Reduction::Fmadd {
@@ -1229,6 +1193,7 @@ fn drain_pair(
             }
         }
     }
+    Some(())
 }
 
 /// `val` is a loop-invariant leaf: defined OUTSIDE the loop body (recognition
@@ -1240,8 +1205,8 @@ fn is_loop_invariant(ctx: &LowerCtx, val: VReg) -> bool {
     }
 }
 
-/// Lower `val` to a `.2D` (f64) NEON value in the vector body. `None` only on an
-/// unexpected shape (recognition already proved lowerability).
+/// Lower `val` to a `.2D` (f64) NEON value in the vector body. `None` on an
+/// unexpected shape or register-ID exhaustion; the caller discards the candidate.
 fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg> {
     if let Some(&v) = ctx.memo.get(&val.id) {
         return Some(v);
@@ -1249,8 +1214,7 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
     let &def_id = ctx.def.get(&val.id)?;
     if !ctx.loop_insts.contains(&def_id) {
         // loop-invariant f64 leaf ⇒ broadcast to both lanes (once).
-        let v = broadcast(func, ctx, val);
-        return Some(v);
+        return broadcast(func, ctx, val);
     }
     let inst = func.inst(def_id);
     let opcode = inst.opcode;
@@ -1258,33 +1222,33 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
     use AArch64Opcode::*;
     let result = match opcode {
         UcvtfRR | ScvtfRR => {
-            if vreg_of(&ops[1])? != ctx.iv {
+            if ops[1].as_vreg()? != ctx.iv {
                 return None;
             }
             ctx.vfi
         }
         FmulRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            fbin(func, ctx, NeonFmulV, a, b)
+            fbin(func, ctx, NeonFmulV, a, b)?
         }
         FaddRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            fbin(func, ctx, NeonFaddV, a, b)
+            fbin(func, ctx, NeonFaddV, a, b)?
         }
         FsubRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            fbin(func, ctx, NeonFsubV, a, b)
+            fbin(func, ctx, NeonFsubV, a, b)?
         }
         FdivRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            fbin(func, ctx, NeonFdivV, a, b)
+            fbin(func, ctx, NeonFdivV, a, b)?
         }
         FmaddRR => {
             // d = a + n*m (fused). Copy the addend into a fresh Vd, then
             // FMLA Vd, Vn, Vm — the SAME single rounding per lane.
-            let n_raw = vreg_of(&ops[1])?;
-            let m_raw = vreg_of(&ops[2])?;
-            let a_raw = vreg_of(&ops[3])?;
+            let n_raw = ops[1].as_vreg()?;
+            let m_raw = ops[2].as_vreg()?;
+            let a_raw = ops[3].as_vreg()?;
             // PRESSURE tune: when exactly ONE multiplicand is a loop-invariant
             // scalar (e.g. the leading polynomial coefficient in `A6*w + A5`),
             // read it straight from lane 0 of its OWN FPR via the by-element
@@ -1306,14 +1270,14 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
             if let Some((inv, stream_raw)) = lane_form {
                 let stream = lower(func, ctx, stream_raw)?;
                 let a = lower(func, ctx, a_raw)?;
-                let vd = alloc(func, RegClass::Fpr128);
-                emit(func, ctx.vbody, NeonOrrV, vec![vreg(vd), vreg(a), vreg(a)]);
+                let vd = alloc(func, RegClass::Fpr128)?;
+                emit(func, ctx.vbody, NeonOrrV, vec![vreg(vd), vreg(a), vreg(a)])?;
                 emit(
                     func,
                     ctx.vbody,
                     NeonFmlaLaneV,
                     vec![vreg(vd), vreg(stream), vreg(inv), imm(0), imm(FARR_D2)],
-                );
+                )?;
                 vd
             } else {
                 // Untuned/fallback: the ORIGINAL n, m, a lowering order (kept
@@ -1322,14 +1286,14 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
                 let n = lower(func, ctx, n_raw)?;
                 let m = lower(func, ctx, m_raw)?;
                 let a = lower(func, ctx, a_raw)?;
-                let vd = alloc(func, RegClass::Fpr128);
-                emit(func, ctx.vbody, NeonOrrV, vec![vreg(vd), vreg(a), vreg(a)]);
+                let vd = alloc(func, RegClass::Fpr128)?;
+                emit(func, ctx.vbody, NeonOrrV, vec![vreg(vd), vreg(a), vreg(a)])?;
                 emit(
                     func,
                     ctx.vbody,
                     NeonFmlaV,
                     vec![vreg(vd), vreg(n), vreg(m), imm(FARR_D2)],
-                );
+                )?;
                 vd
             }
         }
@@ -1359,70 +1323,81 @@ fn lower_two(
     ctx: &mut LowerCtx,
     ops: &[MachOperand],
 ) -> Option<(VReg, VReg)> {
-    let a = lower(func, ctx, vreg_of(ops.get(1)?)?)?;
-    let b = lower(func, ctx, vreg_of(ops.get(2)?)?)?;
+    let a = lower(func, ctx, ops.get(1)?.as_vreg()?)?;
+    let b = lower(func, ctx, ops.get(2)?.as_vreg()?)?;
     Some((a, b))
 }
 
 /// Emit `d = op(a, b)` (`.2D` FP three-same) in the vector body.
-fn fbin(func: &mut MachFunction, ctx: &LowerCtx, op: AArch64Opcode, a: VReg, b: VReg) -> VReg {
-    let d = alloc(func, RegClass::Fpr128);
+fn fbin(
+    func: &mut MachFunction,
+    ctx: &LowerCtx,
+    op: AArch64Opcode,
+    a: VReg,
+    b: VReg,
+) -> Option<VReg> {
+    let d = alloc(func, RegClass::Fpr128)?;
     emit(
         func,
         ctx.vbody,
         op,
         vec![vreg(d), vreg(a), vreg(b), imm(FARR_D2)],
-    );
-    d
+    )?;
+    Some(d)
 }
 
 /// Broadcast a loop-invariant `f64` scalar to both `.2D` lanes (`DUP Vd.2D,
 /// Vr.D[0]`), materialized once per invariant in the preheader.
-fn broadcast(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> VReg {
+fn broadcast(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg> {
     if let Some(&v) = ctx.broadcast_cache.get(&val.id) {
-        return v;
+        return Some(v);
     }
-    let d = alloc(func, RegClass::Fpr128);
+    let d = alloc(func, RegClass::Fpr128)?;
     emit_before(
         func,
         ctx.preheader_term,
         AArch64Opcode::NeonDupElem,
         vec![vreg(d), vreg(val), imm(0), imm(ELEM_D)],
-    );
+    )?;
     ctx.broadcast_cache.insert(val.id, d);
-    d
+    Some(d)
 }
 
 /// Materialize a broadcast `.2D` i64 constant in the preheader (`DUP Vd.2D, Xn`).
-fn dup_const_i64_pre(func: &mut MachFunction, pre: InstId, value: i64) -> VReg {
-    let x = alloc(func, RegClass::Gpr64);
-    let v = alloc(func, RegClass::Fpr128);
-    emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(x), imm(value)]);
+fn dup_const_i64_pre(func: &mut MachFunction, pre: InstId, value: i64) -> Option<VReg> {
+    let x = alloc(func, RegClass::Gpr64)?;
+    let v = alloc(func, RegClass::Fpr128)?;
+    emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(x), imm(value)])?;
     emit_before(
         func,
         pre,
         AArch64Opcode::NeonDupGen,
         vec![vreg(v), vreg(x), imm(ELEM_D)],
-    );
-    v
+    )?;
+    Some(v)
 }
 
 /// Materialize a compile-time constant into a fresh reg before `pre` via the
 /// isel `Movz`(+`Movk #hi, lsl #16`) convention (bound is validated `[1, 2^31)`).
-fn materialize_const(func: &mut MachFunction, pre: InstId, k: i64, class: RegClass) -> VReg {
-    let b = alloc(func, class);
+fn materialize_const(
+    func: &mut MachFunction,
+    pre: InstId,
+    k: i64,
+    class: RegClass,
+) -> Option<VReg> {
+    let b = alloc(func, class)?;
     let lo = k & 0xFFFF;
     let hi = (k >> 16) & 0xFFFF;
-    emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(b), imm(lo)]);
+    emit_before(func, pre, AArch64Opcode::Movz, vec![vreg(b), imm(lo)])?;
     if hi != 0 {
         emit_before(
             func,
             pre,
             AArch64Opcode::Movk,
             vec![vreg(b), imm(hi), imm(16)],
-        );
+        )?;
     }
-    b
+    Some(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -1437,99 +1412,6 @@ fn imm(v: i64) -> MachOperand {
 }
 fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
-}
-
-fn emit(
-    func: &mut MachFunction,
-    b: BlockId,
-    op: AArch64Opcode,
-    operands: Vec<MachOperand>,
-) -> InstId {
-    let id = func.push_inst(MachInst::new(op, operands));
-    func.append_inst(b, id);
-    id
-}
-
-fn emit_before(
-    func: &mut MachFunction,
-    before: InstId,
-    op: AArch64Opcode,
-    operands: Vec<MachOperand>,
-) -> InstId {
-    let id = func.push_inst(MachInst::new(op, operands));
-    insert_before_inst(func, before, &[id]);
-    id
-}
-
-fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
-    let max_existing = func
-        .insts
-        .iter()
-        .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
-        .map(|v| v.id)
-        .max()
-        .unwrap_or(0);
-    let mut id = func.alloc_vreg();
-    while id <= max_existing {
-        id = func.alloc_vreg();
-    }
-    VReg::new(id, class)
-}
-
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    crate::effects::build_reaching_def_map(func)
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|op| match op {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
-}
-
-fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
-    let mut changed = false;
-    for op in &mut inst.operands {
-        if matches!(op, MachOperand::Block(b) if *b == old) {
-            *op = MachOperand::Block(new);
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn remove_cfg_edge(func: &mut MachFunction, from: BlockId, to: BlockId) {
-    func.block_mut(from).succs.retain(|&s| s != to);
-    func.block_mut(to).preds.retain(|&p| p != from);
-}
-
-fn insert_new_blocks_before(func: &mut MachFunction, before: BlockId, new_blocks: &[BlockId]) {
-    let mut reordered = Vec::with_capacity(func.block_order.len() + new_blocks.len());
-    for &b in &func.block_order {
-        if b == before {
-            reordered.extend(new_blocks.iter().copied());
-        }
-        if !new_blocks.contains(&b) {
-            reordered.push(b);
-        }
-    }
-    func.block_order = reordered;
-}
-
-fn insert_before_inst(func: &mut MachFunction, before: InstId, new_insts: &[InstId]) -> bool {
-    for block in &mut func.blocks {
-        if let Some(pos) = block.insts.iter().position(|&id| id == before) {
-            for (off, &id) in new_insts.iter().enumerate() {
-                block.insts.insert(pos + off, id);
-            }
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]

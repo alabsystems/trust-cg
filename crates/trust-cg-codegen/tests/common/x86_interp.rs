@@ -547,6 +547,58 @@ fn read_u32_le(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// Extract the function's machine code (entry at offset 0) from an emitted
+/// x86-64 object of the HOST's format: `__TEXT,__text` from a Mach-O object,
+/// `.text` from an ELF one. The interpreter is format-agnostic; only the
+/// container differs between macOS and GNU/Linux.
+pub fn extract_text(obj: &[u8]) -> Vec<u8> {
+    if obj.len() >= 4 && obj[0..4] == [0x7F, b'E', b'L', b'F'] {
+        extract_elf_text(obj)
+    } else {
+        extract_macho_text(obj)
+    }
+}
+
+/// Extract the `.text` section bytes from an emitted x86-64 ELF relocatable
+/// object: walk the section header table, resolve each name through
+/// `e_shstrndx`, and slice `[sh_offset, sh_offset + sh_size)` of `.text`.
+pub fn extract_elf_text(obj: &[u8]) -> Vec<u8> {
+    fn u16_at(b: &[u8], off: usize) -> usize {
+        u16::from_le_bytes([b[off], b[off + 1]]) as usize
+    }
+    fn u64_at(b: &[u8], off: usize) -> usize {
+        u64::from_le_bytes(b[off..off + 8].try_into().unwrap()) as usize
+    }
+    assert!(obj.len() >= 64, "object too small for an ELF64 header");
+    assert_eq!(&obj[0..4], &[0x7F, b'E', b'L', b'F'], "not an ELF object");
+    assert_eq!(obj[4], 2, "not a 64-bit ELF object");
+    assert_eq!(obj[5], 1, "not a little-endian ELF object");
+    let shoff = u64_at(obj, 0x28);
+    let shentsize = u16_at(obj, 0x3A);
+    let shnum = u16_at(obj, 0x3C);
+    let shstrndx = u16_at(obj, 0x3E);
+    assert!(
+        shentsize >= 64 && shnum > shstrndx,
+        "malformed ELF section header table"
+    );
+    let shstr_offset = u64_at(obj, shoff + shstrndx * shentsize + 24);
+    for index in 0..shnum {
+        let shdr = shoff + index * shentsize;
+        let name_offset = shstr_offset + read_u32_le(obj, shdr) as usize;
+        let name_end = obj[name_offset..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|len| name_offset + len)
+            .expect("unterminated section name");
+        if &obj[name_offset..name_end] == b".text" {
+            let offset = u64_at(obj, shdr + 24);
+            let size = u64_at(obj, shdr + 32);
+            return obj[offset..offset + size].to_vec();
+        }
+    }
+    panic!("no .text section in the ELF object");
+}
+
 /// Extract the `__TEXT,__text` section bytes (the function's machine code, entry
 /// at offset 0) from an emitted x86-64 Mach-O object. Parses the LC_SEGMENT_64
 /// load commands, finds the `__text` section, and slices `[offset, offset+size)`.
@@ -613,22 +665,20 @@ pub fn has_objdump() -> bool {
 /// stream of the `__text` section. Used to cross-check the in-house decoder.
 /// Returns `None` if objdump is unavailable or fails.
 pub fn objdump_mnemonics(obj: &[u8]) -> Option<Vec<(u64, String)>> {
-    let dir = std::env::temp_dir().join(format!(
-        "trust_cg_x86interp_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join("g.o");
+    // An exclusively created directory per call: a pid+clock name repeats
+    // across parallel tests (see `common/fresh_dir.rs`), and a shared
+    // directory would let one decode read another test's object.
+    let dir = tempfile::Builder::new()
+        .prefix("trust_cg_x86interp_")
+        .tempdir()
+        .ok()?;
+    let path = dir.path().join("g.o");
     std::fs::write(&path, obj).ok()?;
     let output = Command::new("objdump")
         .args(["-d", "--no-show-raw-insn", path.to_str()?])
         .output()
         .ok();
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir);
     let output = output?;
     if !output.status.success() {
         return None;
@@ -650,11 +700,14 @@ pub fn objdump_mnemonics(obj: &[u8]) -> Option<Vec<(u64, String)>> {
         if body.is_empty() {
             continue;
         }
+        // LLVM objdump (macOS) separates the mnemonic from its operands with a
+        // tab (`pushq\t%rbp`); GNU objdump (Linux binutils) pads with spaces
+        // (`push   %rbp`). The first whitespace-delimited token is the
+        // mnemonic under both layouts.
         let mnem = body
-            .split('\t')
+            .split_whitespace()
             .next()
             .unwrap_or("")
-            .trim()
             .to_ascii_lowercase();
         if mnem.is_empty() {
             continue;

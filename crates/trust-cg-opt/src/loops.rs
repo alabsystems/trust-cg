@@ -20,7 +20,8 @@
 //!
 //! Reference: LLVM `llvm/include/llvm/Analysis/LoopInfo.h`
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::{BTreeMap, VecDeque};
 
 use trust_cg_ir::{AArch64Opcode, BlockId, MachFunction, MachInst, MachOperand};
 
@@ -67,14 +68,38 @@ pub struct LoopAnalysis {
     /// `LoopAnalysis::compute` by a wide margin -- it rebuilds this analysis
     /// once per single-loop rewrite. Building the map eagerly there was a sort
     /// plus one hash insert per block of every loop body, thrown away every
-    /// time. The six real consumers (`ext_addr`, `if_convert`, `layout`) pay
-    /// for it on first `containing_loop` / `is_in_loop`.
+    /// time. The seven production call sites in `ext_addr`, `if_convert`, and
+    /// `layout` pay for it on first `containing_loop` / `is_in_loop`.
     block_to_loop: std::cell::OnceCell<HashMap<BlockId, BlockId>>,
 }
 
 impl LoopAnalysis {
     /// Compute loop analysis for a machine function.
     pub fn compute(func: &MachFunction, dom: &DomTree) -> Self {
+        let mut analysis = Self::compute_structure(func, dom);
+
+        // Step 3: Compute nesting depth and parent relationships.
+        compute_nesting(&mut analysis.loops);
+        analysis
+    }
+
+    /// Compute only the loop structure needed by a rewrite driver.
+    ///
+    /// This is intentionally crate-private: its `NaturalLoop`s have the same
+    /// header, latch, body and preheader as [`Self::compute`], but leave the
+    /// unused nesting metadata at `depth = 1` / `parent = None`. The
+    /// loop-latch-layout driver rebuilds loop information after every single
+    /// rewrite and reads none of that metadata, so paying the O(L^2) nesting
+    /// scan on every reoffer was pure compile-time work. Keeping this as a
+    /// separate entry point also prevents callers that need parent/depth from
+    /// silently receiving incomplete analysis.
+    pub(crate) fn compute_for_rewrite_driver(func: &MachFunction, dom: &DomTree) -> Self {
+        Self::compute_structure(func, dom)
+    }
+
+    /// Shared structural core. Keeping both public entry points on this exact
+    /// path makes their rewrite-visible fields identical by construction.
+    fn compute_structure(func: &MachFunction, dom: &DomTree) -> Self {
         // Step 1: Find all back-edges.
         let back_edges = find_back_edges(func, dom);
 
@@ -121,9 +146,6 @@ impl LoopAnalysis {
             natural_loop.preheader = find_preheader(func, natural_loop.header, &natural_loop.body);
         }
 
-        // Step 3: Compute nesting depth and parent relationships.
-        compute_nesting(&mut loops);
-
         Self {
             loops,
             block_to_loop: std::cell::OnceCell::new(),
@@ -137,7 +159,7 @@ impl LoopAnalysis {
     /// last writer for each block.
     fn block_to_loop(&self) -> &HashMap<BlockId, BlockId> {
         self.block_to_loop.get_or_init(|| {
-            let mut map: HashMap<BlockId, BlockId> = HashMap::new();
+            let mut map: HashMap<BlockId, BlockId> = HashMap::default();
             let mut sorted_loops: Vec<_> = self.loops.values().collect();
             sorted_loops.sort_by_key(|l| std::cmp::Reverse(l.body.len()));
             for lp in sorted_loops {
@@ -205,7 +227,7 @@ fn find_back_edges(func: &MachFunction, dom: &DomTree) -> Vec<(BlockId, BlockId)
 /// without going through the header. Computed via reverse BFS from
 /// the latch, stopping at the header.
 fn compute_loop_body(func: &MachFunction, header: BlockId, latch: BlockId) -> HashSet<BlockId> {
-    let mut body: HashSet<BlockId> = HashSet::new();
+    let mut body: HashSet<BlockId> = HashSet::default();
     body.insert(header);
     body.insert(latch);
 
@@ -400,6 +422,88 @@ pub fn create_preheader(
     preheader
 }
 
+/// Whether every block of `lp`'s body runs AT MOST ONCE per iteration: the
+/// body, with every edge into the header removed, is acyclic, and a DFS from
+/// the header reaches every body block.
+///
+/// Being innermost does not imply this. [`LoopAnalysis`] finds loops by
+/// dominator back-edges, so an IRREDUCIBLE cycle inside the body (a two-entry
+/// cycle whose blocks do not dominate one another) has no back-edge and is
+/// never reported as a loop. The enclosing loop then looks innermost while the
+/// blocks of that cycle can run more than once in one iteration. The DFS here
+/// does not use dominance: it reports any edge to a block still on its stack,
+/// which catches that cycle as well as a reducible one.
+///
+/// A block that is dominated by the header and dominates every latch runs at
+/// least once on each iteration that reaches a latch. When this predicate also
+/// holds, it runs exactly once.
+pub fn body_is_acyclic_dag(func: &MachFunction, lp: &NaturalLoop) -> bool {
+    walk_one_iteration(func, lp, None)
+        .is_some_and(|reached| lp.body.iter().all(|b| reached.contains(b)))
+}
+
+/// The blocks one iteration of `lp` can run before it first enters `target`,
+/// or `None` when those blocks contain a cycle.
+///
+/// They are the blocks the header reaches along body edges that neither
+/// re-enter the header nor enter `target`; the header is one of them unless it
+/// is `target` (then there are none). A cycle among them is an inner loop,
+/// reducible or not ([`body_is_acyclic_dag`] explains why the irreducible kind
+/// is not a [`LoopAnalysis`] loop), that the iteration can enter before
+/// `target` and need never leave. When the result is `Some`, no path from the
+/// header through these blocks is longer than their count, so every such path
+/// ends by entering `target`, leaving the body, or re-entering the header.
+pub fn blocks_before_first_reaching(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    target: BlockId,
+) -> Option<HashSet<BlockId>> {
+    walk_one_iteration(func, lp, Some(target))
+}
+
+/// Depth-first walk of `lp`'s body from the header that stays inside one
+/// iteration and stops at `target`: it skips every edge into the header, out
+/// of the body, or into `target`. Returns the blocks it reached, or `None` as
+/// soon as it follows an edge to a block still on its stack (a cycle among the
+/// reached blocks). The DFS does not use dominance, so it reports irreducible
+/// cycles as well as reducible ones.
+fn walk_one_iteration(
+    func: &MachFunction,
+    lp: &NaturalLoop,
+    target: Option<BlockId>,
+) -> Option<HashSet<BlockId>> {
+    let header = lp.header;
+    if target == Some(header) {
+        return Some(HashSet::default());
+    }
+    let mut on_stack: HashSet<BlockId> = HashSet::default();
+    let mut reached: HashSet<BlockId> = HashSet::default();
+    let mut stack: Vec<(BlockId, usize)> = vec![(header, 0)];
+    on_stack.insert(header);
+    reached.insert(header);
+    while let Some(&(b, idx)) = stack.last() {
+        let succs = &func.block(b).succs;
+        if idx < succs.len() {
+            stack.last_mut().expect("nonempty").1 += 1;
+            let s = succs[idx];
+            if s == header || !lp.body.contains(&s) || Some(s) == target {
+                continue;
+            }
+            if on_stack.contains(&s) {
+                return None;
+            }
+            if reached.insert(s) {
+                on_stack.insert(s);
+                stack.push((s, 0));
+            }
+        } else {
+            on_stack.remove(&b);
+            stack.pop();
+        }
+    }
+    Some(reached)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +623,78 @@ mod tests {
         func
     }
 
+    /// Build one loop with two distinct backedge/latch blocks.
+    fn make_multi_latch_loop() -> MachFunction {
+        //   bb0 (entry)
+        //    |
+        //   bb1 (header) <---+---+
+        //   / \               |   |
+        // bb2  bb3            |   |
+        //  |    |             |   |
+        //  +----+-> bb4 -----+   |
+        //        \                |
+        //         bb5 -----------+
+        let mut func = MachFunction::new("multi_latch".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let bb4 = func.create_block();
+        let bb5 = func.create_block();
+        let bb6 = func.create_block();
+
+        let br0 = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb0, br0);
+
+        let br1 = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
+        ));
+        func.append_inst(bb1, br1);
+
+        let br2 = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb4)],
+        ));
+        func.append_inst(bb2, br2);
+
+        let br3 = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb4), MachOperand::Block(bb5)],
+        ));
+        func.append_inst(bb3, br3);
+
+        let br4 = func.push_inst(MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(bb1), MachOperand::Block(bb6)],
+        ));
+        func.append_inst(bb4, br4);
+
+        let br5 = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        ));
+        func.append_inst(bb5, br5);
+
+        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.append_inst(bb6, ret);
+
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb2, bb4);
+        func.add_edge(bb3, bb4);
+        func.add_edge(bb3, bb5);
+        func.add_edge(bb4, bb1);
+        func.add_edge(bb4, bb6);
+        func.add_edge(bb5, bb1);
+
+        func
+    }
+
     #[test]
     fn test_simple_loop_detection() {
         let func = make_simple_loop();
@@ -569,6 +745,35 @@ mod tests {
         assert_eq!(inner.parent, Some(BlockId(1)));
         assert_eq!(inner.depth, 2);
         assert_eq!(outer.depth, 1);
+    }
+
+    #[test]
+    fn rewrite_driver_analysis_matches_full_structural_fields_and_order() {
+        // The optimized loop-rotation path deliberately skips only nesting
+        // metadata. Exercise a single loop, a nested pair, and merged latches
+        // so this catches a future structural step accidentally moving out of
+        // the shared core, as well as a change to header iteration order.
+        for func in [
+            make_simple_loop(),
+            make_nested_loops(),
+            make_multi_latch_loop(),
+        ] {
+            let dom = DomTree::compute(&func);
+            let full = LoopAnalysis::compute(&func, &dom);
+            let rewrite = LoopAnalysis::compute_for_rewrite_driver(&func, &dom);
+            let full_loops: Vec<_> = full.all_loops().collect();
+            let rewrite_loops: Vec<_> = rewrite.all_loops().collect();
+
+            assert_eq!(rewrite_loops.len(), full_loops.len());
+            for (got, expected) in rewrite_loops.iter().zip(&full_loops) {
+                assert_eq!(got.header, expected.header);
+                assert_eq!(got.latch, expected.latch);
+                assert_eq!(got.body, expected.body);
+                assert_eq!(got.preheader, expected.preheader);
+                assert_eq!(got.depth, 1, "rewrite analysis leaves depth unused");
+                assert_eq!(got.parent, None, "rewrite analysis leaves parent unused");
+            }
+        }
     }
 
     #[test]
@@ -720,7 +925,7 @@ mod tests {
         let la = LoopAnalysis::compute(&func, &dom);
         let lp = la.get_loop(bb0).expect("merged loop at entry header");
 
-        assert_eq!(lp.body, HashSet::from([bb0, bb1]));
+        assert_eq!(lp.body, HashSet::from_iter([bb0, bb1]));
         assert_eq!(
             lp.preheader, None,
             "a block in the final merged loop body cannot remain its preheader"
@@ -944,76 +1149,7 @@ mod tests {
 
     #[test]
     fn test_loop_with_multiple_latches() {
-        // Loop with 2 back-edges (2 latch blocks):
-        //
-        //   bb0 (entry)
-        //    |
-        //   bb1 (header) <---+---+
-        //   / \               |   |
-        // bb2  bb3            |   |
-        //  |    |             |   |
-        //  +----+-> bb4 -----+   |
-        //        \                |
-        //         bb5 -----------+
-        //
-        // Both bb4 -> bb1 and bb5 -> bb1 are back-edges.
-        let mut func = MachFunction::new("multi_latch".to_string(), Signature::new(vec![], vec![]));
-        let bb0 = func.entry;
-        let bb1 = func.create_block();
-        let bb2 = func.create_block();
-        let bb3 = func.create_block();
-        let bb4 = func.create_block();
-        let bb5 = func.create_block();
-        let bb6 = func.create_block(); // exit
-
-        let br0 = func.push_inst(MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(bb1)],
-        ));
-        func.append_inst(bb0, br0);
-
-        let br1 = func.push_inst(MachInst::new(
-            AArch64Opcode::BCond,
-            vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
-        ));
-        func.append_inst(bb1, br1);
-
-        let br2 = func.push_inst(MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(bb4)],
-        ));
-        func.append_inst(bb2, br2);
-
-        let br3 = func.push_inst(MachInst::new(
-            AArch64Opcode::BCond,
-            vec![MachOperand::Block(bb4), MachOperand::Block(bb5)],
-        ));
-        func.append_inst(bb3, br3);
-
-        let br4 = func.push_inst(MachInst::new(
-            AArch64Opcode::BCond,
-            vec![MachOperand::Block(bb1), MachOperand::Block(bb6)],
-        ));
-        func.append_inst(bb4, br4);
-
-        let br5 = func.push_inst(MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(bb1)],
-        ));
-        func.append_inst(bb5, br5);
-
-        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
-        func.append_inst(bb6, ret);
-
-        func.add_edge(bb0, bb1);
-        func.add_edge(bb1, bb2);
-        func.add_edge(bb1, bb3);
-        func.add_edge(bb2, bb4);
-        func.add_edge(bb3, bb4);
-        func.add_edge(bb3, bb5);
-        func.add_edge(bb4, bb1);
-        func.add_edge(bb4, bb6);
-        func.add_edge(bb5, bb1);
+        let func = make_multi_latch_loop();
 
         let dom = DomTree::compute(&func);
         let la = LoopAnalysis::compute(&func, &dom);
@@ -1213,5 +1349,117 @@ mod tests {
 
         assert!(la.is_empty());
         assert!(!la.is_in_loop(BlockId(0)));
+    }
+
+    /// ```text
+    ///   bb0 (preheader) -> bb1 (header)
+    ///   bb1 -> bb2, bb3          two entries into the cycle {bb2, bb3}
+    ///   bb2 -> bb3
+    ///   bb3 -> bb2 (if `cycle`), bb4
+    ///   bb4 (latch) -> bb1, bb5 (exit)
+    /// ```
+    fn make_two_entry_cycle_loop(cycle: bool) -> MachFunction {
+        let mut func = MachFunction::new("cycle".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let bbs: Vec<BlockId> = (0..5).map(|_| func.create_block()).collect();
+        let (bb1, bb2, bb3, bb4, bb5) = (bbs[0], bbs[1], bbs[2], bbs[3], bbs[4]);
+        let mut edges = vec![
+            (bb0, bb1),
+            (bb1, bb2),
+            (bb1, bb3),
+            (bb2, bb3),
+            (bb3, bb4),
+            (bb4, bb1),
+            (bb4, bb5),
+        ];
+        if cycle {
+            edges.push((bb3, bb2));
+        }
+        for (from, to) in edges {
+            func.add_edge(from, to);
+        }
+        func
+    }
+
+    /// The two-entry cycle has no dominator back-edge, so the header's loop is
+    /// the only one reported and looks innermost, yet bb3 can run twice per
+    /// iteration. The acyclicity predicate is what sees it.
+    #[test]
+    fn an_irreducible_cycle_in_an_innermost_body_is_not_a_dag() {
+        let func = make_two_entry_cycle_loop(true);
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        assert_eq!(la.num_loops(), 1, "the irreducible cycle is not a loop");
+        let lp = la.get_loop(BlockId(1)).unwrap();
+        assert_eq!(lp.body.len(), 4);
+        assert!(!body_is_acyclic_dag(&func, lp));
+
+        let func = make_two_entry_cycle_loop(false);
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let lp = la.get_loop(BlockId(1)).unwrap();
+        assert!(body_is_acyclic_dag(&func, lp));
+    }
+
+    /// What one iteration of the two-entry-cycle loop runs before its latch
+    /// bb4: the irreducible cycle {bb2, bb3} when it is there, else the header,
+    /// bb2 and bb3, each at most once.
+    #[test]
+    fn the_blocks_before_a_target_include_an_irreducible_cycle_on_the_way() {
+        let (bb1, bb2, bb3, bb4) = (BlockId(1), BlockId(2), BlockId(3), BlockId(4));
+        let func = make_two_entry_cycle_loop(true);
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let lp = la.get_loop(bb1).unwrap();
+        assert_eq!(blocks_before_first_reaching(&func, lp, bb4), None);
+        // Stopping inside the cycle cuts it: bb3 -> bb2 is never followed, and
+        // the latch bb4 is reached through bb3 alone.
+        let before_bb2 = blocks_before_first_reaching(&func, lp, bb2).unwrap();
+        assert_eq!(before_bb2, HashSet::from_iter([bb1, bb3, bb4]));
+        assert_eq!(
+            blocks_before_first_reaching(&func, lp, bb1),
+            Some(HashSet::default()),
+            "nothing runs before the header"
+        );
+
+        let func = make_two_entry_cycle_loop(false);
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let lp = la.get_loop(bb1).unwrap();
+        let before_bb4 = blocks_before_first_reaching(&func, lp, bb4).unwrap();
+        assert_eq!(before_bb4, HashSet::from_iter([bb1, bb2, bb3]));
+    }
+
+    /// An inner self-loop on the way to a block is a cycle before it; one
+    /// after it is not.
+    #[test]
+    fn an_inner_loop_counts_only_before_the_target() {
+        // bb0 -> bb1 (outer header) -> bb2 (self-loop) -> bb3 (outer latch)
+        // bb3 -> bb1, bb4 (exit)
+        let func = {
+            let mut func = MachFunction::new("inner".to_string(), Signature::new(vec![], vec![]));
+            let bbs: Vec<BlockId> = (0..4).map(|_| func.create_block()).collect();
+            let entry = func.entry;
+            for (from, to) in [
+                (entry, bbs[0]),
+                (bbs[0], bbs[1]),
+                (bbs[1], bbs[1]),
+                (bbs[1], bbs[2]),
+                (bbs[2], bbs[0]),
+                (bbs[2], bbs[3]),
+            ] {
+                func.add_edge(from, to);
+            }
+            func
+        };
+        let dom = DomTree::compute(&func);
+        let la = LoopAnalysis::compute(&func, &dom);
+        let outer = la.get_loop(BlockId(1)).unwrap();
+        assert_eq!(blocks_before_first_reaching(&func, outer, BlockId(3)), None);
+        assert_eq!(
+            blocks_before_first_reaching(&func, outer, BlockId(2)),
+            Some(HashSet::from_iter([BlockId(1)]))
+        );
+        assert!(!body_is_acyclic_dag(&func, outer));
     }
 }

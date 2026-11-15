@@ -1,0 +1,334 @@
+
+Available unstable options:
+
+    -Z                                allow-features=val -- only allow the listed language features to be enabled in code (comma separated)
+    -Z                     allow-partial-mitigations=val -- Allow mitigations not enabled for all dependency crates (comma separated list)
+    -Z                             always-encode-mir=val -- encode MIR of all functions into the crate metadata (default: no)
+    -Z                                annotate-moves=val -- emit debug info for compiler-generated move and copy operations to make them visible in profilers. Can be a boolean or a size limit in bytes (default: disabled)
+    -Z                             assert-incr-state=val -- assert that the incremental cache is in given state: either `loaded` or `not-loaded`.
+    -Z                     assume-incomplete-release=val -- make cfg(version) treat the current version as incomplete (default: no)
+    -Z                        assumptions-on-binders=val -- allow deducing higher-ranked outlives assumptions from all binders (`for<'a>`)
+    -Z                                      autodiff=val -- a list of autodiff flags to enable
+        Mandatory setting:
+        `=Enable`
+        Optional extra settings:
+        `=PrintTA`
+        `=PrintAA`
+        `=PrintPerf`
+        `=PrintSteps`
+        `=PrintModBefore`
+        `=PrintModAfter`
+        `=PrintModFinal`
+        `=PrintPasses`,
+        `=NoPostopt`
+        `=LooseTypes`
+        `=Inline`
+        Multiple options can be combined with commas.
+    -Z                          autodiff-post-passes=val -- set llvm passes to run after enzyme (no passes run when it is empty)
+    -Z                            binary-dep-depinfo=val -- include artifacts (sysroot, crate dependencies) used during compilation in dep-info (default: no)
+    -Z                                   box-noalias=val -- emit noalias metadata for box (default: yes)
+    -Z                             branch-protection=val -- set options for branch target identification and pointer authentication on AArch64
+    -Z                        build-sdylib-interface=val -- whether the stable interface is being built
+    -Z                             cache-proc-macros=val -- cache the results of derive proc macro invocations (potentially unsound!) (default: no
+    -Z                                 cf-protection=val -- instrument control-flow architecture protection
+    -Z                        check-cfg-all-expected=val -- show all expected values in check-cfg diagnostics (default: no)
+    -Z                       checksum-hash-algorithm=val -- hash algorithm of source files used to check freshness in cargo (`blake3` or `sha256`)
+    -Z                               codegen-backend=val -- the backend to use
+    -Z                            codegen-emit-retag=val -- emit retag function calls in generated code
+    -Z                          codegen-source-order=val -- emit mono items in the order of spans in source files (default: no)
+    -Z                               contract-checks=val -- emit runtime checks for contract pre- and post-conditions (default: no)
+    -Z                              coverage-options=val -- control details of coverage instrumentation
+    -Z                                    crate-attr=val -- inject the given attribute in the crate
+    -Z                  cross-crate-inline-threshold=val -- threshold to allow cross crate inlining of functions
+    -Z                  debug-info-type-line-numbers=val -- emit type and line information for additional data types (default: no)
+    -Z                         debuginfo-compression=val -- compress debug info sections (none, zlib, zstd, default: none)
+    -Z                       debuginfo-for-profiling=val -- emit discriminators and other data necessary for AutoFDO
+    -Z                       deduplicate-diagnostics=val -- deduplicate identical diagnostics (default: yes)
+    -Z                            default-visibility=val -- overrides the `default_visibility` setting of the target
+    -Z                      deny-partial-mitigations=val -- Deny mitigations not enabled for all dependency crates (comma separated list)
+    -Z                        dep-info-omit-d-target=val -- in dep-info output, omit targets for tracking dependencies of the dep-info files themselves (default: no)
+    -Z                   direct-access-external-data=val -- Direct or use GOT indirect to reference external data symbols
+    -Z                            disable-fast-paths=val -- disable various performance optimizations in trait solving
+    -Z             disable-incr-comp-backend-caching=val -- disable caching of compiled objects by the codegen backend during incremental compilation
+    -Z                              dual-proc-macros=val -- load proc macros for both target and host, but only link to the target (default: no)
+    -Z                                dump-dep-graph=val -- dump the dependency graph to $RUST_DEP_GRAPH (default: /tmp/dep_graph.gv) (default: no)
+    -Z                                      dump-mir=val -- dump MIR state to file.
+        `val` is used to select which passes and functions to dump. For example:
+        `all` matches all passes and functions,
+        `foo` matches all passes for functions whose name contains 'foo',
+        `foo & ConstProp` only the 'ConstProp' pass for function names containing 'foo',
+        `foo | bar` all passes for function names containing 'foo' or 'bar'.
+    -Z                             dump-mir-dataflow=val -- in addition to `.mir` files, create graphviz `.dot` files with dataflow results (default: no)
+    -Z                                  dump-mir-dir=val -- the directory the MIR is dumped into (default: `mir_dump`)
+    -Z                  dump-mir-exclude-alloc-bytes=val -- exclude the raw bytes of allocations when dumping MIR (used in tests) (default: no)
+    -Z                  dump-mir-exclude-pass-number=val -- exclude the pass number when dumping MIR (used in tests) (default: no)
+    -Z                             dump-mir-graphviz=val -- in addition to `.mir` files, create graphviz `.dot` files (default: no)
+    -Z                               dump-mono-stats=val -- output statistics about monomorphization collection
+    -Z                        dump-mono-stats-format=val -- the format to use for -Z dump-mono-stats (`markdown` (default) or `json`)
+    -Z                                 dwarf-version=val -- version of DWARF debug information to emit (default: 2 or 4, depending on platform)
+    -Z                                     dylib-lto=val -- enables LTO for dylib crate type
+    -Z                     eagerly-emit-delayed-bugs=val -- emit delayed bugs eagerly as errors instead of stashing them and emitting them only if an error has not been emitted
+    -Z                                  ehcont-guard=val -- generate Windows EHCont Guard tables
+    -Z                                embed-metadata=val -- embed metadata in rlibs and dylibs (default: yes)
+    -Z                                  embed-source=val -- embed source text in DWARF debug sections (default: no)
+    -Z                              emit-stack-sizes=val -- emit a section containing stack size metadata (default: no)
+    -Z                     enforce-type-length-limit=val -- enforce the type length limit when monomorphizing instances in codegen
+    -Z                   experimental-default-bounds=val -- enable default bounds for experimental group of auto traits
+    -Z                     export-executable-symbols=val -- export symbols from executables, as if they were dynamic libraries
+    -Z                              external-clangrt=val -- rely on user specified linker commands to find clangrt
+    -Z                         extra-const-ub-checks=val -- turns on more checks to detect const UB, which can be slow (default: no)
+    -Z                                   fewer-names=val -- reduce memory use by retaining fewer names within compilation artifacts (LLVM-IR) (default: no)
+    -Z                                     fixed-x18=val -- make the x18 register reserved on AArch64 (default: no)
+    -Z                           flatten-format-args=val -- flatten nested format_args!() and literals into a simplified format_args!() call (default: yes)
+    -Z                                     fmt-debug=val -- how detailed `#[derive(Debug)]` should be. `full` prints types recursively, `shallow` prints only type names, `none` prints nothing and disables `{:?}`. (default: `full`)
+    -Z                      force-intrinsic-fallback=val -- always use the fallback body of an intrinsic, if it has one, instead of lowering the intrinsic in the codegen backend (default: no).
+    -Z                    force-unstable-if-unmarked=val -- force all crates to be `rustc_private` unstable (default: no)
+    -Z                               function-return=val -- replace returns with jumps to `__x86_return_thunk` (default: `keep`)
+    -Z                             function-sections=val -- whether each function should go in its own section
+    -Z                          future-incompat-test=val -- forces all lints to be future incompatible, used for internal testing (default: no)
+    -Z                            graphviz-dark-mode=val -- use dark-themed colors in graphviz output (default: no)
+    -Z                                 graphviz-font=val -- use the given `fontname` in graphviz output; can be overridden by setting environment variable `RUSTC_GRAPHVIZ_FONT` (default: `Courier, monospace`)
+    -Z                              has-thread-local=val -- explicitly enable the `cfg(target_thread_local)` directive
+    -Z                                          help=val -- Print unstable compiler options
+    -Z                     higher-ranked-assumptions=val -- allow deducing higher-ranked outlives assumptions from coroutines when proving auto traits
+    -Z                            hint-mostly-unused=val -- hint that most of this crate will go unused, to minimize work for uncalled functions
+    -Z                                     hint-msrv=val -- control the minimum rust version for lints
+    -Z                      human-readable-cgu-names=val -- generate human-readable, predictable names for codegen units (default: no)
+    -Z                              identify-regions=val -- display unnamed regions as `'<id>`, using a non-ident unique id (default: no)
+    -Z ignore-directory-in-diagnostics-source-blocks=val -- do not display the source code block in diagnostics for files in the directory
+    -Z                      incremental-ignore-spans=val -- ignore spans during ICH computation -- used for testing (default: no)
+    -Z                              incremental-info=val -- print high-level information about incremental reuse (or the lack thereof) (default: no)
+    -Z                        incremental-verify-ich=val -- verify extended properties for incr. comp. (default: no):
+        - hashes of green query instances
+        - hash collisions of query keys
+        - hash collisions when creating dep-nodes
+    -Z                     indirect-branch-cs-prefix=val -- add `cs` prefix to `call` and `jmp` to indirect thunks (default: no)
+    -Z                                   inline-llvm=val -- enable LLVM inlining (default: yes)
+    -Z                                    inline-mir=val -- enable MIR inlining (default: no)
+    -Z                inline-mir-forwarder-threshold=val -- inlining threshold when the caller is a simple forwarding function (default: 30)
+    -Z                     inline-mir-hint-threshold=val -- inlining threshold for functions with inline hint (default: 100)
+    -Z                     inline-mir-preserve-debug=val -- when MIR inlining, whether to preserve debug info for callee variables (default: preserve for debuginfo != None, otherwise remove)
+    -Z                          inline-mir-threshold=val -- a default MIR inlining threshold (default: 50)
+    -Z                                   input-stats=val -- print some statistics about AST and HIR (default: no)
+    -Z                             instrument-mcount=val -- insert function instrument code for mcount-based tracing (default: no)
+    -Z                               instrument-xray=val -- insert function instrument code for XRay-based tracing (default: no)
+         Optional extra settings:
+         `=always`
+         `=never`
+         `=ignore-loops`
+         `=instruction-threshold=N`
+         `=skip-entry`
+         `=skip-exit`
+         Multiple options can be combined with commas.
+    -Z                     internal-testing-features=val -- allow certain internal language features to be enabled that help exercise & test the compiler
+    -Z                          large-data-threshold=val -- set the threshold for objects to be stored in a "large data" section (only effective with -Ccode-model=medium, default: 65536)
+    -Z                                   layout-seed=val -- seed layout randomization
+    -Z                               link-directives=val -- honor #[link] directives in the compiled crate (default: yes)
+    -Z                         link-native-libraries=val -- link native libraries in the linker invocation (default: yes)
+    -Z                                     link-only=val -- link the `.rlink` file generated by `-Z no-link` (default: no)
+    -Z                                  lint-llvm-ir=val -- lint LLVM IR (default: no)
+    -Z                                      lint-mir=val -- lint MIR before and after each transformation
+    -Z                              llvm-module-flag=val -- a list of module flags to pass to LLVM (space separated)
+    -Z                                  llvm-plugins=val -- a list LLVM plugins to enable (space separated)
+    -Z                               llvm-time-trace=val -- generate JSON tracing data file from LLVM data (default: no)
+    -Z                                 llvm-writable=val -- emit the LLVM writable attribute for mutable reference arguments (default: no)
+    -Z                               location-detail=val -- what location details should be tracked when using caller_location, either `none`, or a comma separated list of location details, for which valid options are `file`, `line`, and `column` (default: `file,line,column`)
+    -Z                                            ls=val -- decode and print various parts of the crate metadata for a library crate (space separated)
+    -Z                               macro-backtrace=val -- show macro backtraces (default: no)
+    -Z                                   macro-stats=val -- print some statistics about macro expansions (default: no)
+    -Z                   maximal-hir-to-mir-coverage=val -- save as much information as possible about the correspondence between MIR and HIR as source scopes (default: no)
+    -Z                               merge-functions=val -- control the operation of the MergeFunctions LLVM pass, taking the same values as the target option of the same name
+    -Z                                    meta-stats=val -- gather metadata statistics (default: no)
+    -Z                                   metrics-dir=val -- the directory metrics emitted by rustc are dumped into (implicitly enables default set of metrics)
+    -Z                        min-function-alignment=val -- align all functions to at least this many bytes. Must be a power of 2
+    -Z                           min-recursion-limit=val -- set a minimum recursion limit (final limit = max(this, recursion_limit_from_crate))
+    -Z                             mir-enable-passes=val -- use like `-Zmir-enable-passes=+DestinationPropagation,-InstSimplify`. Forces the specified passes to be enabled, overriding all other checks. In particular, this will enable unsound (known-buggy and hence usually disabled) passes without further warning! Passes that are not specified are enabled or disabled by other flags as usual.
+    -Z                             mir-include-spans=val -- include extra comments in mir pretty printing, like line numbers and statement indices, details about types, etc. (boolean for all passes, 'nll' to enable in NLL MIR only, default: 'nll')
+    -Z                          mir-opt-bisect-limit=val -- limit the number of MIR optimization pass executions (global across all bodies). Pass executions after this limit are skipped and reported. (default: no limit)
+    -Z                                 mir-opt-level=val -- MIR optimization level (0-4; default: 1 in non optimized builds and 2 in optimized builds)
+    -Z                               mir-preserve-ub=val -- keep place mention statements and reads in trivial SwitchInt terminators, which are interpreted e.g., by miri; implies -Zmir-opt-level=0 (default: no)
+    -Z                           mir-strip-debuginfo=val -- Whether to remove some of the MIR debug info from methods.  Default: None
+    -Z                               move-size-limit=val -- the size at which the `large_assignments` lint starts to be emitted
+    -Z                               mutable-noalias=val -- emit noalias metadata for mutable references (default: yes)
+    -Z                             namespaced-crates=val -- allow crates to be namespaced by other crates (default: no)
+    -Z                                   next-solver=val -- enable and configure the next generation trait solver used by rustc
+    -Z                                     nll-facts=val -- dump facts from NLL analysis into side files (default: no)
+    -Z                                 nll-facts-dir=val -- the directory the NLL facts are dumped into (default: `nll-facts`)
+    -Z                                   no-analysis=val -- parse and expand the source, but run no analysis
+    -Z                                    no-codegen=val -- run all passes except codegen; no output
+    -Z                    no-generate-arange-section=val -- omit DWARF address ranges that give faster lookups
+    -Z                      no-implied-bounds-compat=val -- disable the compatibility version of the `implied_bounds_ty` query
+    -Z                                 no-leak-check=val -- disable the 'leak check' for subtyping; unsound, but useful for tests
+    -Z                                       no-link=val -- compile without linking
+    -Z                           no-parallel-backend=val -- run LLVM in non-parallel mode (while keeping codegen-units and ThinLTO)
+    -Z                           no-profiler-runtime=val -- prevent automatic injection of the profiler_builtins crate
+    -Z                                 no-steal-thir=val -- don't steal the THIR when we're done with it; useful for rustc drivers (default: no)
+    -Z                                 no-trait-vptr=val -- disable generation of trait vptr in vtable for upcasting
+    -Z                       no-unique-section-names=val -- do not use unique names for text and data sections when -Z function-sections is used
+    -Z                                normalize-docs=val -- normalize associated items in rustdoc when generating documentation
+    -Z                                       offload=val -- a list of offload flags to enable
+        Mandatory setting:
+        `=Enable`
+        Currently the only option available
+    -Z                                on-broken-pipe=val -- behavior of std::io::ErrorKind::BrokenPipe (SIGPIPE)
+    -Z                        osx-rpath-install-name=val -- pass `-install_name @rpath/...` to the macOS linker (default: no)
+    -Z                           packed-bundled-libs=val -- change rlib format to store native libraries as archives
+    -Z                                  packed-stack=val -- use packed stack frames (s390x only) (default: no)
+    -Z                             panic-abort-tests=val -- support compiling tests with panic=abort (default: no)
+    -Z                                 panic-in-drop=val -- panic strategy for panics in drops
+    -Z                         parse-crate-root-only=val -- parse the crate root file only; do not parse other files, compile, assemble, or link (default: no)
+    -Z                      patchable-function-entry=val -- nop padding at function entry
+    -Z                                           plt=val -- whether to use the PLT when calling into shared libraries;
+        only has effect for PIC code on systems with ELF binaries
+        (default: PLT is disabled if full relro is enabled on x86_64)
+    -Z                                      polonius=val -- enable polonius-based borrow-checker (default: no)
+    -Z                                  pre-link-arg=val -- a single extra argument to prepend the linker invocation (can be used several times)
+    -Z                                 pre-link-args=val -- extra arguments to prepend to the linker invocation (space separated)
+    -Z                 precise-enum-drop-elaboration=val -- use a more precise version of drop elaboration for matches on enums (default: yes). This results in better codegen, but has caused miscompilations on some tier 2 platforms. See #77382 and #74551.
+    -Z                           print-codegen-stats=val -- print codegen statistics (default: no)
+    -Z                      print-codegen-stats-json=val -- print codegen statistics in JSON to a file (default: no)
+    -Z                             print-llvm-passes=val -- print the LLVM optimization passes being run (default: no)
+    -Z                              print-mono-items=val -- print the result of the monomorphization collection pass (default: no)
+    -Z                              print-type-sizes=val -- print layout information for each type encountered (default: no)
+    -Z                          proc-macro-backtrace=val -- show backtraces for panics during proc-macro execution (default: no)
+    -Z                 proc-macro-execution-strategy=val -- how to run proc-macro code (default: same-thread)
+    -Z                              profile-closures=val -- profile size of closures
+    -Z                            profile-sample-use=val -- use the given `.prof` file for sampled profile-guided optimization (also known as AutoFDO)
+    -Z                              profiler-runtime=val -- name of the profiler runtime crate to automatically inject (default: `profiler_builtins`)
+    -Z                               ptrauth-elf-got=val -- enable signing of ELF GOT entries
+    -Z                               query-dep-graph=val -- enable queries of the dependency graph for regression testing (default: no)
+    -Z                              randomize-layout=val -- randomize the layout of types (default: no)
+    -Z                             reg-struct-return=val -- On x86-32 targets, it overrides the default ABI to return small structs in registers.
+        It is UNSOUND to link together crates that use different values for this flag!
+    -Z                                       regparm=val -- On x86-32 targets, setting this to N causes the compiler to pass N arguments in registers EAX, EDX, and ECX instead of on the stack for"C", "cdecl", and "stdcall" fn.It is UNSOUND to link together crates that use different values for this flag!
+    -Z                         relax-elf-relocations=val -- whether ELF relocations can be relaxed
+    -Z                              remap-cwd-prefix=val -- remap paths under the current working directory to this path prefix
+    -Z                                    remark-dir=val -- directory into which to write optimization remarks (if not specified, they will be written to standard error output)
+    -Z                     renormalize-rigid-aliases=val -- do not skip rigid aliases in normalization for internal debugging
+    -Z                                     retpoline=val -- enables retpoline-indirect-branches and retpoline-indirect-calls target features (default: no)
+    -Z                      retpoline-external-thunk=val -- enables retpoline-external-thunk, retpoline-indirect-branches and retpoline-indirect-calls target features (default: no)
+    -Z                                     sanitizer=val -- use a sanitizer
+    -Z           sanitizer-cfi-canonical-jump-tables=val -- enable canonical jump tables (default: yes)
+    -Z             sanitizer-cfi-generalize-pointers=val -- enable generalizing pointer types (default: no)
+    -Z              sanitizer-cfi-normalize-integers=val -- enable normalizing integer types (default: no)
+    -Z                    sanitizer-dataflow-abilist=val -- additional ABI list files that control how shadow parameters are passed (comma separated)
+    -Z                          sanitizer-kcfi-arity=val -- enable KCFI arity indicator (default: no)
+    -Z                sanitizer-memory-track-origins=val -- enable origins tracking in MemorySanitizer
+    -Z                             sanitizer-recover=val -- enable recovery for selected sanitizers
+    -Z                        saturating-float-casts=val -- make float->int casts UB-free: numbers outside the integer type's range are clipped to the max/min integer respectively, and NaN is mapped to 0 (default: yes)
+    -Z                                  self-profile=val -- run the self profiler and output the raw event data
+    -Z                          self-profile-counter=val -- counter used by the self profiler (default: `wall-time`), one of:
+        `wall-time` (monotonic clock, i.e. `std::time::Instant`)
+        `instructions:u` (retired instructions, userspace-only)
+        `instructions-minus-irqs:u` (subtracting hardware interrupt counts for extra accuracy)
+    -Z                           self-profile-events=val -- specify the events recorded by the self profiler;
+        for example: `-Z self-profile-events=default,query-keys`
+        all options: none, all, default, generic-activity, query-provider, query-cache-hit
+                     query-blocked, incr-cache-load, incr-result-hashing, query-keys, function-args, args, llvm, artifact-sizes
+    -Z                                share-generics=val -- make the current crate share its generic instantiations
+    -Z                                shell-argfiles=val -- allow argument files to be specified with POSIX "shell-style" argument quoting
+    -Z               simulate-remapped-rust-src-base=val -- simulate the effect of remap-debuginfo = true at bootstrapping by remapping path to rust's source base directory. only meant for testing purposes
+    -Z                          small-data-threshold=val -- Set the threshold for objects to be stored in a "small data" section
+    -Z                                    span-debug=val -- forward proc_macro::Span's `Debug` impl to `Span`
+    -Z                             span-free-formats=val -- exclude spans when debug-printing compiler state (default: no)
+    -Z                          split-dwarf-inlining=val -- provide minimal debug info in the object/executable to facilitate online symbolication/stack traces in the absence of .dwo/.dwp files when using Split DWARF
+    -Z                              split-dwarf-kind=val -- split dwarf variant (only if -Csplit-debuginfo is enabled and on relevant platform)
+        (default: `split`)
+
+        `split`: sections which do not require relocation are written into a DWARF object (`.dwo`)
+                 file which is ignored by the linker
+        `single`: sections which do not require relocation are written into object file but ignored
+                  by the linker
+    -Z                           split-dwarf-out-dir=val -- location for writing split DWARF objects (`.dwo`) if enabled
+    -Z                                split-lto-unit=val -- enable LTO unit splitting (default: no)
+    -Z                            src-hash-algorithm=val -- hash algorithm of source files in debug info (`md5`, `sha1`, or `sha256`)
+    -Z                             stack-frame-limit=val -- the size at which the `large_stack_frame` lint starts to be emitted
+    -Z                               stack-protector=val -- control stack smash protection strategy (`rustc --print stack-protector-strategies` for details)
+    -Z                   staticlib-allow-rdylib-deps=val -- allow staticlibs to have rust dylib dependencies
+    -Z               staticlib-hide-internal-symbols=val -- hide non-exported Rust symbols when building staticlibs by setting STV_HIDDEN
+    -Z             staticlib-rename-internal-symbols=val -- rename non-exported Rust symbols when building staticlibs to avoid conflicts
+    -Z                      staticlib-prefer-dynamic=val -- prefer dynamic linking to static linking for staticlibs (default: no)
+    -Z                            strict-init-checks=val -- control if mem::uninitialized and mem::zeroed panic on more UB
+    -Z                                         teach=val -- show extended diagnostic help (default: no)
+    -Z                                     temps-dir=val -- the directory the intermediate files are written to
+    -Z                                 terminal-urls=val -- use the OSC 8 hyperlink terminal specification to print hyperlinks in the compiler output
+    -Z                                       thinlto=val -- enable ThinLTO when possible
+    -Z                                       threads=val -- use a thread pool with N threads
+    -Z                              time-llvm-passes=val -- measure time of each LLVM pass (default: no)
+    -Z                                   time-passes=val -- measure time of each rustc pass (default: no)
+    -Z                            time-passes-format=val -- the format to use for -Z time-passes (`text` (default) or `json`)
+    -Z                         tiny-const-eval-limit=val -- sets a tiny, non-configurable limit for const eval; useful for compiler tests
+    -Z                                     tls-model=val -- choose the TLS model to use (`rustc --print tls-models` for details)
+    -Z                                  trace-macros=val -- for every macro invocation, print its name and arguments (default: no)
+    -Z                             track-diagnostics=val -- tracks where in rustc a diagnostic was emitted
+    -Z         translate-remapped-path-to-local-path=val -- translate remapped paths into local paths when possible (default: yes)
+    -Z                              trap-unreachable=val -- generate trap instructions for unreachable intrinsics (default: use target setting, usually yes)
+    -Z                              treat-err-as-bug=val -- treat the `val`th error that occurs as bug (default if not specified: 0 - don't treat errors as bugs. default if specified without a value: 1 - treat the first error as bug)
+    -Z                         trim-diagnostic-paths=val -- in diagnostics, use heuristics to shorten paths referring to items
+    -Z                    trust-bundle-foreign-crate=val -- declare, as one comma-separated list, the crates whose foreign bodies may be bundled into a caller's lowered verification bundle and re-derived there, on the same footing as `std`/`core`/`alloc`. This carries no foreign verdict: every obligation over an admitted body is minted and discharged by this compilation. Only fully non-generic callees are admitted
+    -Z                             trust-cg-frontend=val -- which producer supplies the trust-cg backend's per-function input: `mir` (the default and the shipped path — rustc MIR -> VerifiableFunction -> LIR) or `trust-ir` (the source-first F1 path — THIR -> `trust_ir_of` -> trust_ir::Module -> LIR). `trust-ir` requires -Ztrust-ir-lower and fails the build on any item the producer or the converter declines -- it never falls back to the MIR path, so one unsupported item refuses the whole crate. It IS verified by the proven-output gate (the spec is derived from the trust-ir module rather than from MIR) and needs no gate relaxation: it emits under the default `strict`
+    -Z                         trust-ir-upstream-mir=val -- with -Ztrust-cg-frontend=trust-ir, additionally admit UPSTREAM-CRATE instances by bridging their monomorphized MIR into trust-ir (MIR -> VerifiableFunction -> trust_ir::Module) and feeding the SAME converter and proven-output gate as the source-first artifacts. Off by default: the default trust-ir lane refuses every upstream body by name. This is not a fallback for local items — a local body still comes only from `trust_ir_of`, and a refused item still refuses the crate; only the IR's recorded provenance differs (MIR-derived rather than source-first) for bodies that HAVE no source-first artifact
+    -Z                          trust-cg-output-gate=val -- set the trust-cg output-preservation gate: `strict` (the default) rejects an unknown output-preservation outcome, `allow-unknown` records it, `off` disables the gate; batteries-on strict verification pins this to `strict` and rejects `off`
+    -Z                              trust-ir-cg-args=val -- a space-separated list of `key` / `key=value` knobs for the trust-ir → trust-cg codegen backend (`-Zcodegen-backend=trust-ir-cg`); the backend parses them, rustc does not. This is the tracked replacement for that backend's former `TCG_*` environment variables, which trustc refuses as untracked codegen controls
+    -Z                 trust-certified-test-monitors=val -- reserved internal Targo phase-A fingerprint for a non-`--test` monitor subject; it has no independent authority and requires the paired -Ztrust-targo-test-monitor session-consistency selector
+    -Z                             trust-body-census=val -- write a diagnostic HIR body-owner census to a NEW JSONL file, independently of direct lowering; requires -Zchecksum-hash-algorithm=sha256; missing completion footer is incomplete evidence, and HIR owners are not the reachable-instance/runtime census
+    -Z                         trust-instance-census=val -- write a diagnostic concrete mono-item/root/usage/CGU census to a NEW JSONL file; requires -Zchecksum-hash-algorithm=sha256; observes normal collection without forcing codegen, and explicitly leaves non-collected runtime/linker items unmeasured
+    -Z                             trust-lean-census=val -- write a diagnostic census of actual HIR-admitted Lean island checks to a NEW JSONL file; requires -Zchecksum-hash-algorithm=sha256; preserves sequential and header-first checking semantics, and does not claim a complete runtime-body denominator
+    -Z                      trust-ctfe-trivial-probe=val -- MEASUREMENT ONLY: replay the CTFE flip seam's decision procedure over every trivial const in the crate (a body `mir_built` fast-paths, so the seam is never demanded for it) and log what it WOULD decide, discarding the derived body; installs nothing and changes no emitted code (default: no)
+    -Z                                    trust-dump=val -- publish one Trust verification artifact to a non-empty directory: `mir:<dir>` writes each extracted MIR verification input, `mir-only:<dir>` writes them and skips solver/certifier dispatch (requires the nonfatal `-Ztrust-policy=advisory`), `native-bundle:<dir>` writes each finalized native TrustIr verification bundle, `ir:<dir>` writes the assembled crate-level TrustIr lowering artifacts under a pre-input publication lease (the user-facing spelling for that last artifact is `--emit=trust-ir`), `spec-clean:<dir>` writes one JSONL row per kernel-graded spec goal exactly as the discharge lane graded it (the `targo trust spec --emit clean` session artifact); repeat the option for more than one sink
+    -Z                           trust-instance-flip=val -- allow the Trust-IR flip to install derived MIR PER INSTANCE at the codegen seam, for generic bodies the DefId seam cannot flip, after a per-instance differential proof (default: yes; requires -Ztrust-ir-lower and -Ztrust-ir-flip)
+    -Z                    trust-instance-flip-mutate=val -- wall-A mutation control: corrupt one input of the per-instance flip's evidence chain and require the differential to catch it. `abi-anchor` derives at IDENTITY args instead of the instance's; `abi-swap` swaps the first two re-derived ABI anchors (and REFUSES, loudly, where a signature has no two distinct ones to swap); `abi-ret` derives at a wrong return anchor (which bites every signature whose Module HAS a return value); `abi-arg0` derives at a wrong FIRST-ARGUMENT anchor, which bites every signature that takes one; `incumbent-args` instantiates the incumbent at the wrong args; `lineage` corrupts the recorded lineage digest. Only those six spellings are matched: any other value is not rejected and runs the ordinary, un-mutated flip
+    -Z                                 trust-ir-flip=val -- allow the direct Trust-IR frontend to derive compatibility/codegen MIR after an exact differential proof (default: yes)
+    -Z                     trust-instance-flip-probe=val -- wall-A measurement probe: for generic `agreed` bodies matching the given def-path substring (`*` = all), measure per-instance differential agreement and ABI rederivation at concrete GenericArgs; prints TRUST-WALLA-PROBE lines to stderr; requires -Ztrust-verify=off -Ztrust-ir-lower and no -Ztrust-dump sink
+    -Z                             trust-sat-perturb=val -- burn-in SAT control: deliberately perturb one shim lowering class          (enum-reshape|enum-case-value|enum-ctor|enum-disc-index|switch-map|enum-payload|marker-order|marker-drop|agg-field-order|marker-arm|payload-tramp|dr-tramp|dr-retire|mc-plan|cf-lit-order|chain-ret-order|cf-field-drop|cf-unit-late|cf-pair-order|cf-ret-late|cf-post-late|sw-tramp|swr-tramp|g25-hoist|seq-unit-late|g21-ret-order|uc-unit-late) so the          flip comparator must reject it; requires -Ztrust-verify=off -Ztrust-ir-lower
+    -Z                                trust-ir-lower=val -- how far to run the direct source (THIR) to Trust-IR frontend: off|on|strict (default: unset, meaning follow verification; batteries-on verification always runs it, so an explicit value only takes effect in the -Ztrust-verify=off compatibility lane, where the default is off). `strict` additionally makes a body the producer cannot fully lower a compile error instead of a coverage-only skip
+    -Z                                   trust-no-r1=val -- disable kernel-certified whole-program R1 caller-propagation strengthening
+    -Z                                  trust-policy=val -- set how an active verification run enforces its verdicts: `strict` (the default) fails the build on a refutation and on any unproved obligation that has NO runtime fallback, while reporting — not failing on — a completeness gap whose operation rustc still checks at runtime (bit-for-bit vanilla semantics; see the completeness-gap ruling), `certify` demands FULL static discharge and fails on every unproved obligation including those (the release gate, `targo trust certify`), `advisory` verifies and reports every obligation non-fatally (selected by `targo trust --allow-l0-gaps`), `memory-safe` records reachable Rust panic refutations and supported capability gaps as explicit assumptions in functions with no source or inlined `unsafe` while UB, hardened, contract, functional, and unmarked failures stay strict
+    -Z                     trust-proof-artifact-root=val -- write externalized proof materializations beneath this explicit private root; without it proof bytes remain inline and rustc never writes an ambient working-directory store
+    -Z             trust-clean-origin-mutate-emitter=val -- TEST-ONLY (#65/C3): perturb the Clean-origin emitted body post-plan so the faithfulness gate's fatal refusal is exercisable end-to-end from a ui fixture; mutates side A (the emission) only, never the recognizer/admitters/extractor, and can only make a build FAIL that would have passed — never the reverse
+    -Z                      trust-targo-test-monitor=val -- reserved internal Targo per-unit session-consistency selector (direct use is rejected): install kernel-certified test monitors; requires a matching -Ztrust-verify-session, does not authenticate a direct rustc caller, and never enables static verification
+    -Z                                  trust-verify=val -- run the batteries-on Trust typed verification pipeline (`on`, the default) or compile as vanilla Rust (`off`); this is the sole verification activation control, used by the vanilla-comparison and bootstrap compiler lanes
+    -Z                          trust-verify-ay-path=val -- use the executable at this non-empty path as the AY verification solver; exact solver contents, not this location, are dependency-tracked
+    -Z                       trust-verify-crate-role=val -- reserved Targo reporting metadata: record this compiler unit's role (`unscoped`, `primary`, `dependency`, or `build-script`); every non-`unscoped` role requires both `-Ztrust-verify-package-name` and `-Ztrust-verify-session`; this value never changes verifier scope (use the explicit `-Ztrust-verify=off` switch)
+    -Z               trust-verify-function-budget-ms=val -- set the cooperative per-function verification wall-clock budget in milliseconds; no new proof work starts and late proof results are rejected after expiry (0 disables the budget)
+    -Z            trust-verify-function-budget-steps=val -- set the DEADLINE-INDEPENDENT per-function preprocessing step budget: every instrumented pre-dispatch loop iteration decrements it, and reaching zero fails the function closed (never Proved). Unlike the wall-clock budget this is a provable monotone-decreasing bound that guarantees termination even with the clock disabled (0 disables the step budget)
+    -Z             trust-verify-include-dependencies=val -- include authenticated dependency-crate MIR in the Trust verification scope
+    -Z                            trust-verify-level=val -- set the Trust verification proof level (0 = safety, 1 = functional, 2 = domain)
+    -Z                           trust-verify-output=val -- set Trust verification output mode (`human`, `json`, or `both`)
+    -Z                     trust-verify-package-name=val -- reserved Targo metadata: set the non-empty Cargo package identity recorded in structured verifier transport; requires `-Ztrust-verify-session` and is required by every non-`unscoped` role
+    -Z                          trust-verify-profile=val -- set the Trust verification profile that selects proof obligations; the registered hardened profiles (`hardened`, `unix_hardened`, `coreutils_hardened`) additionally emit fail-closed hardened boundary verification conditions
+    -Z                          trust-verify-session=val -- set a non-empty proof-build freshness identity that invalidates incremental reuse without changing the downstream crate hash; Targo pairs it with package metadata for non-`unscoped` roles, while a raw `unscoped` compile may use a session-only nonce
+    -Z               trust-verify-target-spec-sha256=val -- bind a session-scoped custom JSON target to the exact SHA-256 bytes parsed by rustc; reserved for Targo
+    -Z                       trust-verify-timeout-ms=val -- set the positive per-obligation verifier timeout in milliseconds
+    -Z                   trust-verify-worker-threads=val -- cap verifier worker threads (1 = serial dispatch; 0, the default, = no cap: engine batches run in parallel; maximum 256)
+    -Z                                 trust-witness=val -- select the typeck-witness lane: `auto` (the default) mints and replays through `<out-dir>/trust-witness`, router-gated to bodies where replay beats fresh typeck and inert without an `--out-dir`; `off` disables it; `mint:<dir>` mints every eligible root into an explicit store without replaying; `replay:<dir>` replays every stored root from an explicit store without minting
+    -Z                         trust-witness-precise=val -- EXPERIMENTAL: shadow-mint parity measurement of the precise edit-loop witness key (never trusted)
+    -Z                                      tune-cpu=val -- select processor to schedule for (`rustc --print target-cpus` for details)
+    -Z        typing-mode-post-typeck-until-borrowck=val -- enable `TypingMode::PostTypeckUntilBorrowck`, changing the way opaque types are handled during MIR borrowck
+    -Z                                     ub-checks=val -- emit runtime checks for Undefined Behavior (default: -Cdebug-assertions)
+    -Z                                    ui-testing=val -- emit compiler diagnostics in a form suitable for UI testing (default: no)
+    -Z                  uninit-const-chunk-threshold=val -- allow generating const initializers with mixed init/uninit chunks, and set the maximum number of chunks for which this is allowed (default: 16)
+    -Z                unleash-the-miri-inside-of-you=val -- take the brakes off const evaluation. NOTE: this is unsound (default: no)
+    -Z                                      unpretty=val -- present the input source, unstable (and less-pretty) variants;
+        `normal`,
+        `expanded`, `expanded,identified`,
+        `expanded,hygiene` (with internal representations),
+        `ast-tree` (raw AST before expansion),
+        `ast-tree,expanded` (raw AST after expansion),
+        `hir` (the HIR), `hir,identified`,
+        `hir,typed` (HIR with types for each node),
+        `hir-tree` (dump the raw HIR),
+        `thir-tree`, `thir-flat`,
+        `mir` (the MIR), or `mir-cfg` (graphviz formatted MIR)
+    -Z                              unsound-mir-opts=val -- enable unsound and buggy MIR optimizations (default: no)
+    -Z                              unstable-options=val -- adds unstable command line options to rustc interface (default: no)
+    -Z                             use-ctors-section=val -- use legacy .ctors section for initializers rather than .init_array
+    -Z                               use-sync-unwind=val -- Generate sync unwind tables instead of async unwind tables (default: no)
+    -Z                                  validate-mir=val -- validate MIR after each transformation
+    -Z                                   verbose-asm=val -- add descriptive comments from LLVM to the assembly (may change behavior) (default: no)
+    -Z                             verbose-internals=val -- in general, enable more debug printouts (default: no)
+    -Z                                verify-llvm-ir=val -- verify LLVM IR (default: no)
+    -Z                  virtual-function-elimination=val -- enables dead virtual function elimination optimization. Requires `-Clto[=[fat,yes]]`
+    -Z                               wasi-exec-model=val -- whether to build a wasi command or reactor
+    -Z                                    wasm-c-abi=val -- use spec-compliant C ABI for `wasm32-unknown-unknown` (deprecated, always enabled)
+    -Z                      write-long-types-to-disk=val -- whether long type names should be written to files instead of being printed in errors

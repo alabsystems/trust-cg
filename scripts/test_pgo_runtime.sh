@@ -25,11 +25,11 @@ require_command() {
 
 cc=${CC:-cc}
 require_command "${cc}"
-require_command cargo
 require_command python3
-require_command rustc
 
-actual_host=$(rustc -vV | sed -n 's/^host: //p')
+# The installed Trust package (scripts/trust_toolchain.py); no stock fallback.
+actual_host=$(python3 -B "${SCRIPT_DIR}/trust_toolchain.py" --print host) ||
+    fail "no installed Trust package resolves (scripts/trust_toolchain.py)"
 if [ "${actual_host}" != "aarch64-apple-darwin" ]; then
     fail "real PGO execution requires an aarch64-apple-darwin host, got ${actual_host:-unknown}"
 fi
@@ -239,7 +239,7 @@ assert_no_temporary concurrent.raw
 # multi-function LLVM fixture, link this runtime, execute the canary, and feed
 # its emitted profile into a second importer compile.
 build_messages="${tmp_dir}/cargo-build.json"
-cargo build --locked -p trust-cg-llvm-import \
+"${SCRIPT_DIR}/trust_cargo.sh" build --locked -p trust-cg-llvm-import \
     --bin trust-cg-ws2-import --features driver \
     --message-format=json-render-diagnostics > "${build_messages}"
 importer=$(
@@ -260,7 +260,7 @@ for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
     ):
         result = message["executable"]
 if result is None:
-    raise SystemExit("test_pgo_runtime: cargo did not report the importer executable")
+    raise SystemExit("test_pgo_runtime: targo did not report the importer executable")
 print(result)
 PY
 )

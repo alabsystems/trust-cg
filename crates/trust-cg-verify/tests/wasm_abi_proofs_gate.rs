@@ -15,11 +15,20 @@
 //!     requires BYTE EQUALITY, so a backend change that moves an emission fails
 //!     here instead of quietly leaving the family proving things about a module
 //!     nobody emits any more;
+//!
+//!     The family checks the LOWERING (frame layout, call and table ABI), so
+//!     every compile here is at O0: the lowering's own bytes, which are the
+//!     input of the lane's local emission pass. At O1 and above that pass
+//!     rewrites each function and emits the rewrite only when
+//!     `wasm_local_tv` validates it against exactly these bytes (equal call,
+//!     load, store and `global` effects with equal operands, end stacks and
+//!     live-out locals per segment); `the_optimized_fixtures_are_validated_
+//!     rewrites_of_these_bytes` requires that of every fixture function;
 //!  2. runs every anti-tautology guard against the FRESHLY COMPILED bytes, not
 //!     only the frozen ones, so a guard cannot be disarmed by fixture drift;
 //!  3. runs the whole family over LIVE modules that are NOT in the frozen
 //!     corpus — a loop with a frame, a call inside a branch, a frameless island
-//!     — so the evidence is not over-fitted to four fixtures;
+//!     — so the evidence is not over-fitted to the frozen fixtures;
 //!  4. prints the REAL numbers: proven / refuted / inconclusive obligations,
 //!     passing and failing structural checks, guard outcomes including the
 //!     declared blind spot, and the named deferrals that stay RED.
@@ -29,13 +38,14 @@
 //! trust-cg-codegen depends on trust-cg-verify, so the cycle is legal only
 //! through `[dev-dependencies]`.
 
+use trust_cg_codegen::pipeline::OptLevel;
 use trust_cg_codegen::wasm;
 use trust_cg_verify::coverage_gate::{CoverageFinding, CoverageGate, GateArch};
 use trust_cg_verify::lowering_proof::VerificationConfig;
 use trust_cg_verify::wasm_abi_proofs::{
     AbiGuard, GuardExpectation, WASM_ABI_DEFERRALS, WASM_ABI_FIXTURES, WASM_ABI_GUARDS,
-    all_wasm_abi_guards, decode_module, discharge_by_evaluation, intended_module, run_guard,
-    wasm_abi_evidence, wasm_abi_family_report,
+    all_wasm_abi_guards, decode_insts, decode_module, discharge_by_evaluation, intended_module,
+    run_guard, wasm_abi_evidence, wasm_abi_family_report,
 };
 use trust_ir::{ICmpOp, Ty};
 use trust_ir_build::ModuleBuilder;
@@ -58,8 +68,21 @@ fn policy_for(tag: &str) -> WasmModulePolicy {
     }
 }
 
+/// The lowering's own bytes for `module` under `policy`: the O0 compile, the
+/// input of the local emission pass (see the file docs).
+fn lowered(module: &trust_ir::Module, policy: &WasmModulePolicy) -> Vec<u8> {
+    wasm::compile_module_with_evidence_policy_license_optimized(
+        module,
+        policy,
+        &permit_unlicensed(),
+        OptLevel::O0,
+    )
+    .map(|(bytes, _)| bytes)
+    .unwrap_or_else(|e| panic!("`{}`: O0 compile failed: {e}", module.name))
+}
+
 fn finish_wasm32(mb: ModuleBuilder) -> trust_ir::Module {
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.target_info = Some(wasm::target::wasm32_target_info());
     module
 }
@@ -69,7 +92,8 @@ fn finish_wasm32(mb: ModuleBuilder) -> trust_ir::Module {
 // ---------------------------------------------------------------------------
 
 /// THE FRESHNESS GATE. Every frozen fixture must still be EXACTLY what the live
-/// backend emits for its trust-ir text under its policy.
+/// backend's lowering emits for its trust-ir text under its policy (at O0, see
+/// the file docs).
 ///
 /// This is the load-bearing test of the whole family: without it, the frozen
 /// bytes could drift away from the shipping backend and every obligation below
@@ -80,8 +104,7 @@ fn frozen_fixtures_are_what_the_backend_emits_today() {
         let module = trust_ir::parser::parse_module(f.tir).unwrap_or_else(|e| {
             panic!("fixture `{}`: trust-ir text does not parse: {e:?}", f.name)
         });
-        let fresh = wasm::compile_module_with_policy(&module, &policy_for(f.policy))
-            .unwrap_or_else(|e| panic!("fixture `{}`: live compile failed: {e}", f.name));
+        let fresh = lowered(&module, &policy_for(f.policy));
         assert_eq!(
             fresh.len(),
             f.wasm.len(),
@@ -96,6 +119,52 @@ fn frozen_fixtures_are_what_the_backend_emits_today() {
             "fixture `{}` DRIFTED: the live backend emits different bytes",
             f.name
         );
+    }
+}
+
+/// At O1 and above every fixture function is emitted through the local
+/// emission pass and its validator, against the bytes the family checks: no
+/// function keeps a body the validator did not relate to the lowering's, and
+/// at O0 the pass does not run at all.
+#[test]
+fn the_optimized_fixtures_are_validated_rewrites_of_these_bytes() {
+    for f in WASM_ABI_FIXTURES {
+        let module = trust_ir::parser::parse_module(f.tir).unwrap_or_else(|e| {
+            panic!("fixture `{}`: trust-ir text does not parse: {e:?}", f.name)
+        });
+        let policy = policy_for(f.policy);
+        let (_, o0) = wasm::compile_module_with_evidence_policy_license_optimized(
+            &module,
+            &policy,
+            &permit_unlicensed(),
+            OptLevel::O0,
+        )
+        .unwrap_or_else(|e| panic!("fixture `{}`: O0 compile failed: {e}", f.name));
+        assert!(!o0.local_emission.enabled, "{}", f.name);
+        assert_eq!(o0.local_emission.functions, 0, "{}", f.name);
+        let defined = decode_module(f.wasm)
+            .unwrap_or_else(|e| panic!("fixture `{}` decodes: {e:?}", f.name))
+            .bodies
+            .len();
+        for level in [OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+            let (_, evidence) = wasm::compile_module_with_evidence_policy_license_optimized(
+                &module,
+                &policy,
+                &permit_unlicensed(),
+                level,
+            )
+            .unwrap_or_else(|e| panic!("fixture `{}`: {level:?}: {e}", f.name));
+            let e = &evidence.local_emission;
+            assert!(e.enabled, "{} {level:?}", f.name);
+            assert_eq!(e.functions, defined, "{} {level:?}: {e:?}", f.name);
+            assert_eq!(e.fallback_count(), 0, "{} {level:?}: {e:?}", f.name);
+            assert_eq!(
+                e.optimized + e.unchanged,
+                e.functions,
+                "{} {level:?}: {e:?}",
+                f.name
+            );
+        }
     }
 }
 
@@ -116,7 +185,10 @@ fn fixture_text_matches_a_live_builder_shape() {
     let b = fb.alloca(Ty::I64);
     let c = fb.alloca(Ty::Array(elem, 3));
     fb.store(Ty::I32, a, x);
-    fb.store(Ty::I64, b, x);
+    // An i32 store into the 8-byte slot: the slot's size and alignment are
+    // what the fixture exercises, and the stored value must have the store's
+    // type (an `i64.store` of an `i32` operand is not a valid wasm module).
+    fb.store(Ty::I32, b, x);
     fb.store(Ty::I32, c, y);
     let ra = fb.load(Ty::I32, a);
     let rc = fb.load(Ty::I32, c);
@@ -231,8 +303,7 @@ fn guards_bite_the_live_backend_output() {
             .find(|f| f.name == g.fixture)
             .unwrap_or_else(|| panic!("guard `{}` names unknown fixture `{}`", g.name, g.fixture));
         let module = trust_ir::parser::parse_module(f.tir).expect("fixture parses");
-        let live = wasm::compile_module_with_policy(&module, &policy_for(f.policy))
-            .unwrap_or_else(|e| panic!("fixture `{}`: live compile failed: {e}", f.name));
+        let live = lowered(&module, &policy_for(f.policy));
         let outcome = run_guard(g, &live, &module, &cfg())
             .unwrap_or_else(|e| panic!("guard `{}` could not run on live bytes: {e}", g.name));
         match g.expectation {
@@ -289,7 +360,7 @@ fn guards_agree_between_frozen_and_live_bytes() {
 /// A framed function with a LOOP and two returns, compiled live. The family
 /// must recognize its prologue, both allocas and its restore window, and every
 /// obligation must discharge — evidence that the recognition is not over-fitted
-/// to the four straight-line fixtures.
+/// to the straight-line fixtures.
 #[test]
 fn a_live_loop_with_a_frame_is_covered() {
     let mut mb = ModuleBuilder::new("abi_live_loop");
@@ -331,7 +402,7 @@ fn a_live_loop_with_a_frame_is_covered() {
     fb.build();
 
     let module = finish_wasm32(mb);
-    let bytes = wasm::compile_module(&module).expect("live compile");
+    let bytes = lowered(&module, &WasmModulePolicy::closed());
     let ev = wasm_abi_evidence(&bytes, &module).expect("evidence");
     assert!(
         ev.refusals.is_empty(),
@@ -404,7 +475,7 @@ fn live_calls_inside_a_branch_are_covered() {
         func_imports: WasmFuncImportPolicy::FromModule(island_host_namespace("live")),
         ..WasmModulePolicy::closed()
     };
-    let bytes = wasm::compile_module_with_policy(&module, &policy).expect("live compile");
+    let bytes = lowered(&module, &policy);
 
     // The decode must independently agree that the import space is 2 wide and
     // that `pick` is function 2.
@@ -445,6 +516,229 @@ fn live_calls_inside_a_branch_are_covered() {
     );
 }
 
+/// A function-pointer constant is credited only where it is BOUND to its use:
+///
+///  * a constant that reaches anything other than a `call_indirect` callee
+///    (here: reified and turned into an integer) is REFUSED — the family cannot
+///    say which table element that integer must name, so it credits nothing;
+///  * a constant that is a `call_indirect` callee is resolved on the decoded
+///    body and looked up in the decoded element segment. On the
+///    `abi_table_collide` fixture an unrelated `const i32 2` equals the
+///    pointer's table index; the three MustRefute guards — the pointer moved
+///    to 1, the pointer moved to the null slot, and the call reading the
+///    scalar's local before its only write (still the implicit 0 there) — are
+///    registered, and all three refute through the binding check.
+#[test]
+fn an_escaping_function_pointer_is_refused_and_a_bound_one_is_checked() {
+    let text = "; TrustIr text format v1\nmodule \"abi_live_leak\"\ntarget \
+                \"wasm32-unknown-unknown\" 4 little\n\nfuncty.0 = (i32) -> (i32)\n\nfuncty.1 = () \
+                -> (i32)\n\nfn @id(functy.0) {\nbb0(%0: i32):\n    ret %0\n}\n\nfn \
+                @leak(functy.1) {\nbb0:\n    %0 = const functy.0 fndef<func.0>\n    %1 = \
+                reify_fn_pointer functy.0 %0 to ptr\n    %2 = ptrtoint ptr %1 to i32\n    ret \
+                %2\n}\n";
+    let module = trust_ir::parser::parse_module(text).expect("parses");
+    let bytes = lowered(&module, &WasmModulePolicy::closed());
+    let ev = wasm_abi_evidence(&bytes, &module).expect("evidence");
+    assert!(
+        ev.refusals
+            .iter()
+            .any(|r| r.contains("`leak`") && r.contains("NO CREDIT")),
+        "an escaping function-pointer constant must be refused: {:#?}",
+        ev.refusals
+    );
+    let intended = intended_module(&module).expect("model");
+    assert_eq!(
+        intended.defined[1].escaping_func_ptrs,
+        vec!["id".to_string()]
+    );
+    assert!(intended.defined[1].const_callees.is_empty());
+
+    // The bound case, on the frozen collision fixture.
+    let f = WASM_ABI_FIXTURES
+        .iter()
+        .find(|f| f.name == "abi_table_collide")
+        .expect("collision fixture");
+    let module = trust_ir::parser::parse_module(f.tir).expect("fixture parses");
+    let intended = intended_module(&module).expect("model");
+    assert_eq!(
+        intended.defined[2].const_callees,
+        vec![1],
+        "viaptr calls add7"
+    );
+    let ev = wasm_abi_evidence(f.wasm, &module).expect("evidence");
+    let bound = ev
+        .structural
+        .iter()
+        .find(|c| c.name.contains("`viaptr`") && c.name.contains("element segment"))
+        .expect("the binding check runs on viaptr");
+    assert!(bound.ok, "{}", bound.detail);
+    let collide: Vec<&AbiGuard> = WASM_ABI_GUARDS
+        .iter()
+        .filter(|g| g.fixture == "abi_table_collide")
+        .collect();
+    assert_eq!(collide.len(), 3);
+    for g in collide {
+        assert_eq!(g.expectation, GuardExpectation::MustRefute);
+        let outcome = run_guard(g, f.wasm, &module, &cfg()).expect("guard runs");
+        assert!(outcome.refuted, "`{}`: {}", g.name, outcome.detail);
+        assert!(
+            outcome.detail.contains("element segment"),
+            "`{}` must be caught by the binding check: {}",
+            g.name,
+            outcome.detail
+        );
+    }
+}
+
+/// C6 binds each constant `call_indirect` site to ITS OWN pointer constant
+/// when every site sits in one trust-ir block and the body emits exactly as many
+/// sites: on `abi_table_two` (`inc(neg(x))`
+/// through two same-signature pointers) the check is per-site and holds, and
+/// the MustRefute guard that swaps the two table indices — same multiset of
+/// callees, same signatures, `neg(inc(x))` — is caught by name. With the sites
+/// in two trust-ir blocks the statement falls back to the multiset and says
+/// so, leaving the order to the call-site correspondence deferral.
+#[test]
+fn constant_call_indirect_sites_are_bound_one_by_one() {
+    let f = WASM_ABI_FIXTURES
+        .iter()
+        .find(|f| f.name == "abi_table_two")
+        .expect("two-pointer fixture");
+    let module = trust_ir::parser::parse_module(f.tir).expect("fixture parses");
+    let intended = intended_module(&module).expect("model");
+    let two = &intended.defined[2];
+    assert_eq!(two.const_callees, vec![0, 1], "two calls neg, then inc");
+    assert_eq!(
+        two.indirects
+            .iter()
+            .map(|i| (i.block, i.const_callee))
+            .collect::<Vec<_>>(),
+        vec![(0, Some(0)), (0, Some(1))]
+    );
+    let ev = wasm_abi_evidence(f.wasm, &module).expect("evidence");
+    let bound = ev
+        .structural
+        .iter()
+        .find(|c| c.name.contains("`two`") && c.name.contains("its own pointer constant"))
+        .expect("the per-site binding check runs on two");
+    assert!(bound.ok, "{}", bound.detail);
+    assert!(
+        bound.detail.contains("site 0 -> function 0")
+            && bound.detail.contains("site 1 -> function 1"),
+        "{}",
+        bound.detail
+    );
+    let swap: Vec<&AbiGuard> = WASM_ABI_GUARDS
+        .iter()
+        .filter(|g| g.fixture == "abi_table_two")
+        .collect();
+    assert_eq!(swap.len(), 1);
+    for g in swap {
+        assert_eq!(g.expectation, GuardExpectation::MustRefute);
+        let outcome = run_guard(g, f.wasm, &module, &cfg()).expect("guard runs");
+        assert!(outcome.refuted, "`{}`: {}", g.name, outcome.detail);
+        assert!(
+            outcome.detail.contains("its own pointer constant"),
+            "`{}` must be caught by the per-site binding: {}",
+            g.name,
+            outcome.detail
+        );
+    }
+
+    // The same two calls in two trust-ir blocks: the multiset statement.
+    let split = f.tir.replace(
+        "    %4 = const functy.0 fndef<func.1>",
+        "    br bb1\nbb1:\n    %4 = const functy.0 fndef<func.1>",
+    );
+    let module = trust_ir::parser::parse_module(&split).expect("split parses");
+    let bytes = lowered(&module, &WasmModulePolicy::closed());
+    let ev = wasm_abi_evidence(&bytes, &module).expect("evidence");
+    let multiset = ev
+        .structural
+        .iter()
+        .find(|c| c.name.contains("`two`") && c.name.contains("multiset"))
+        .expect("the multiset check runs on a two-block two");
+    assert!(multiset.ok, "{}", multiset.detail);
+    assert!(
+        multiset.detail.contains("across 2 trust-ir block(s)"),
+        "{}",
+        multiset.detail
+    );
+}
+
+/// The binding check must not fail a CORRECT module whose pointer constant is
+/// written in a structured construct that closes before the call: `twoexit`
+/// binds the pointer in a loop header whose two exits meet in one block, so
+/// the lowering writes the local inside `loop { block { .. } }` and calls
+/// through it after that inner block has closed. Every way out of the block
+/// passes the write, so the local is definitely assigned at both calls and
+/// C6 resolves them; `arm` calls through one constant from both `if` arms.
+#[test]
+fn a_pointer_bound_in_a_closed_block_resolves_after_it() {
+    let text = "; TrustIr text format v1\nmodule \"abi_live_loop_ptr\"\ntarget \
+                \"wasm32-unknown-unknown\" 4 little\n\nfuncty.0 = (i32) -> (i32)\n\nfn \
+                @add7(functy.0) {\nbb0(%0: i32):\n    %1 = const i32 7\n    %2 = add i32 %0, \
+                %1\n    ret %2\n}\n\nfn @twoexit(functy.0) {\nbb0(%0: i32):\n    br \
+                bb1(%0)\nbb1(%1: i32):\n    %2 = const functy.0 fndef<func.0>\n    %3 = const \
+                i32 100\n    %4 = icmp sgt i32 %1, %3\n    condbr %4, bb3(%1), bb2\nbb2:\n    \
+                %5 = const i32 1\n    %6 = sub i32 %1, %5\n    %7 = const i32 0\n    %8 = icmp \
+                sgt i32 %6, %7\n    condbr %8, bb1(%6), bb3(%6)\nbb3(%9: i32):\n    %10 = \
+                call_indirect %2(functy.0)(%9)\n    %11 = call_indirect \
+                %2(functy.0)(%10)\n    ret %11\n}\n\nfn @arm(functy.0) {\nbb0(%0: i32):\n    \
+                %1 = const functy.0 fndef<func.0>\n    %2 = const i32 0\n    %3 = icmp sgt i32 \
+                %0, %2\n    condbr %3, bb1, bb2\nbb1:\n    %4 = call_indirect \
+                %1(functy.0)(%0)\n    ret %4\nbb2:\n    %5 = call_indirect %1(functy.0)(%2)\n    \
+                ret %5\n}\n";
+    let module = trust_ir::parser::parse_module(text).expect("parses");
+    let bytes = lowered(&module, &WasmModulePolicy::closed());
+    let ev = wasm_abi_evidence(&bytes, &module).expect("evidence");
+    assert!(ev.refusals.is_empty(), "{:#?}", ev.refusals);
+    // `twoexit` calls twice from its one exit block, so each site is bound
+    // on its own; `arm` calls from two blocks, so the statement is over the
+    // multiset.
+    for (name, want) in [
+        ("`twoexit`", "site 0 -> function 0, site 1 -> function 0"),
+        ("`arm`", "resolved element functions [0, 0]"),
+    ] {
+        let bound = ev
+            .structural
+            .iter()
+            .find(|c| c.name.contains(name) && c.name.contains("element segment"))
+            .unwrap_or_else(|| panic!("the binding check runs on {name}"));
+        assert!(bound.ok, "{name}: {}", bound.detail);
+        assert!(bound.detail.contains(want), "{name}: {}", bound.detail);
+    }
+    // `twoexit` really does write the pointer inside a block and call after
+    // that block's `end`: the case a positional "the write's block still
+    // encloses the read" rule would reject.
+    let d = decode_module(&bytes).expect("decodes");
+    let insts = decode_insts(&d.bodies[1].code).expect("twoexit decodes");
+    let open = insts.iter().position(|i| i.op == 0x02).expect("a block");
+    let block_end = {
+        let mut depth = 0usize;
+        insts[open..]
+            .iter()
+            .position(|i| {
+                match i.op {
+                    0x02..=0x04 => depth += 1,
+                    0x0b => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            })
+            .map(|k| k + open)
+            .expect("the block closes")
+    };
+    let first_call = insts.iter().position(|i| i.op == 0x11).expect("a call");
+    assert!(block_end < first_call, "the calls follow the block");
+    assert!(
+        insts[open..block_end]
+            .windows(2)
+            .any(|w| w[0].op == 0x41 && w[1].op == 0x21),
+        "the pointer constant is written inside the block"
+    );
+}
+
 /// A frameless island under an IMPORTED memory: no prologue, no stack global,
 /// and the family must say so positively rather than silently crediting the
 /// absence of evidence.
@@ -462,8 +756,7 @@ fn a_frameless_island_is_positively_covered() {
     fb.ret(vec![v]);
     fb.build();
     let module = finish_wasm32(mb);
-    let bytes = wasm::compile_module_with_policy(&module, &WasmModulePolicy::island("pure"))
-        .expect("compile");
+    let bytes = lowered(&module, &WasmModulePolicy::island("pure"));
 
     let ev = wasm_abi_evidence(&bytes, &module).expect("evidence");
     assert!(ev.refusals.is_empty(), "{:#?}", ev.refusals);
@@ -549,11 +842,11 @@ fn on_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .expect("gate thread panicked")
 }
 
-/// PINS the family's rows in `GateArch::WasmAbi`: 128 rows, ALL of them in the
-/// denominator, 118 covered and 10 RED.
+/// PINS the family's rows in `GateArch::WasmAbi`: 176 rows, ALL of them in the
+/// denominator, 166 covered and 10 RED.
 ///
-/// The breakdown is 22 reconstructed frame obligations + 80 decidable structural
-/// checks + 16 refuting anti-tautology guards = 118 covered; 1 declared blind
+/// The breakdown is 22 reconstructed frame obligations + 122 decidable
+/// structural checks + 22 refuting anti-tautology guards = 166 covered; 1 declared blind
 /// guard + the 9 named deferrals = 10 RED. NOTHING is allowlisted out: five of
 /// the nine deferrals are the HOST's under the ownership map, and being someone
 /// else's obligation is a reason to name an owner, not a reason to drop the row.
@@ -568,14 +861,14 @@ fn the_family_is_counted_in_the_coverage_gate() {
 
     assert_eq!(
         report.total(),
-        128,
-        "wasm-abi gate row count changed — 22 frame obligations + 80 structural checks + 17 \
+        176,
+        "wasm-abi gate row count changed — 22 frame obligations + 122 structural checks + 23 \
          guards + 9 deferrals.\n{}",
         report.audit_log()
     );
     assert_eq!(
         report.emittable_count(),
-        128,
+        176,
         "every wasm-abi row stays IN the denominator; nothing here may be allowlisted out"
     );
     assert_eq!(
@@ -585,7 +878,7 @@ fn the_family_is_counted_in_the_coverage_gate() {
     );
     assert_eq!(
         report.covered_count(),
-        118,
+        166,
         "wasm-abi covered count changed — do NOT inflate by crediting a deferral, a blind guard, \
          or a refusal.\n{}",
         report.audit_log()
@@ -679,4 +972,13 @@ fn gate_credit_never_rests_on_a_self_equality() {
         "the 22 frame obligations are the family's reconstruction-credited rows; if that count \
          moves, the frame family gained or lost an obligation and the pin above moved with it"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

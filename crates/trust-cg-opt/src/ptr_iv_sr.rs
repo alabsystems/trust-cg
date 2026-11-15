@@ -108,7 +108,7 @@
 //!
 //! [`run`]: MachinePass::run
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -337,7 +337,7 @@ fn find_conventional_ivs(
     def_sites: &HashMap<VReg, Vec<DefSite>>,
     dom: &DomTree,
 ) -> HashMap<VReg, IvInfo> {
-    let mut ivs: HashMap<VReg, IvInfo> = HashMap::new();
+    let mut ivs: HashMap<VReg, IvInfo> = HashMap::default();
     let latch_insts = &func.block(shape.latch).insts;
     for (movr_pos, &inst_id) in latch_insts.iter().enumerate() {
         let inst = func.inst(inst_id);
@@ -743,7 +743,7 @@ fn filter_profitable_plans(func: &MachFunction, mut plans: Vec<AccessPlan>) -> V
         let chain_set: HashSet<InstId> =
             plans.iter().flat_map(|p| p.chain.iter().copied()).collect();
         // All uses of each vreg: (using inst, operand position).
-        let mut uses: HashMap<VReg, Vec<(InstId, usize)>> = HashMap::new();
+        let mut uses: HashMap<VReg, Vec<(InstId, usize)>> = HashMap::default();
         for &block_id in &func.block_order {
             for &inst_id in &func.block(block_id).insts {
                 let inst = func.inst(inst_id);
@@ -760,7 +760,7 @@ fn filter_profitable_plans(func: &MachFunction, mut plans: Vec<AccessPlan>) -> V
         // either an address operand (position >= 1) of a rewritten access —
         // those operands are REPLACED by the walking pointer — or another
         // deadable chain inst.
-        let mut deadable: HashSet<InstId> = HashSet::new();
+        let mut deadable: HashSet<InstId> = HashSet::default();
         loop {
             let mut changed = false;
             for &c in &chain_set {
@@ -811,7 +811,7 @@ fn apply_plans(
 ) {
     // Clone each distinct index chain ONCE per loop (accesses often share the
     // index; per-access carriers still get their own pointer).
-    let mut clone_cache: HashMap<VReg, VReg> = HashMap::new();
+    let mut clone_cache: HashMap<VReg, VReg> = HashMap::default();
     // Latch insertions accumulate at the IV's carrier MovR; group per IV so
     // positions are computed once against the ORIGINAL latch layout.
     let mut latch_inserts: Vec<(usize, Vec<InstId>)> = Vec::new();
@@ -970,7 +970,7 @@ fn clone_chain_into_preheader(
         // exactly what iteration 1 reads.
         return index;
     }
-    let mut mapping: HashMap<VReg, VReg> = HashMap::new();
+    let mut mapping: HashMap<VReg, VReg> = HashMap::default();
     let mut clones: Vec<MachInst> = Vec::new();
     for &inst_id in chain {
         let inst = func.inst(inst_id);
@@ -1056,7 +1056,7 @@ fn single_def(def_sites: &HashMap<VReg, Vec<DefSite>>, v: VReg) -> Option<DefSit
 // ---------------------------------------------------------------------------
 
 fn collect_def_sites(func: &MachFunction) -> HashMap<VReg, Vec<DefSite>> {
-    let mut sites: HashMap<VReg, Vec<DefSite>> = HashMap::new();
+    let mut sites: HashMap<VReg, Vec<DefSite>> = HashMap::default();
     for &block_id in &func.block_order {
         for (position, &inst_id) in func.block(block_id).insts.iter().enumerate() {
             let inst = func.inst(inst_id);
@@ -1077,7 +1077,7 @@ fn collect_def_sites(func: &MachFunction) -> HashMap<VReg, Vec<DefSite>> {
 }
 
 fn count_vreg_uses(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);

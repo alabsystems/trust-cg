@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: the dynamic-growth bulk-append memcpy path —
 // `String::push_str`, `Vec::extend_from_slice`, and the `-O3`-inlined
@@ -54,52 +58,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 use std::sync::OnceLock;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m100 test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,13 +168,7 @@ fn probe_x86_64_target_runner() -> Result<TargetRunnerCapability, String> {
         std::fs::write(&src, "fn main() {}\n")
             .map_err(|err| format!("write target runner probe source: {err}"))?;
         let bin = dir.join("trivial_x86_64");
-        let output = Command::new("rustup")
-            .args([
-                "run",
-                pinned_toolchain().as_str(),
-                "rustc",
-                "--edition=2021",
-            ])
+        let output = toolchain_support::rustc_command()
             .args(["--crate-type", "bin", "--target", TARGET, "-Cpanic=abort"])
             .arg("-o")
             .arg(&bin)
@@ -233,7 +189,6 @@ fn probe_x86_64_target_runner() -> Result<TargetRunnerCapability, String> {
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
-
 
 fn runner_probe_result() -> &'static Result<TargetRunnerCapability, String> {
     static RUNNER_PROBE: OnceLock<Result<TargetRunnerCapability, String>> = OnceLock::new();
@@ -280,15 +235,17 @@ fn run_llvm(dir: &Path, src: &str) -> i32 {
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join("llvm_out");
-    let status = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let status = toolchain_support::rustc_command()
         .args(["--crate-type", "bin", "-Cpanic=abort", "-O"])
         .arg("-o")
         .arg(&bin)
         .arg(&src_path)
         .status()
         .expect("spawn rustc (LLVM)");
-    assert!(status.success(), "LLVM reference failed to compile: <<<{src}>>>");
+    assert!(
+        status.success(),
+        "LLVM reference failed to compile: <<<{src}>>>"
+    );
     Command::new(&bin)
         .status()
         .expect("run LLVM binary")
@@ -303,13 +260,7 @@ fn compile_bridge(dir: &Path, dylib: &Path, src: &str, opt_level: &str) -> Optio
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(format!("bridge_out_{opt_level}"));
-    let output = Command::new("rustup")
-        .args([
-            "run",
-            pinned_toolchain().as_str(),
-            "rustc",
-            "--edition=2021",
-        ])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "bin"])
         .arg(backend_arg(dylib))
         .args(["--target", TARGET, "-Cpanic=abort"])
@@ -564,7 +515,10 @@ fn push_str_and_extend_len_match_llvm_at_o0_and_o3() {
         let llvm = run_llvm(&dir, src);
         match run_bridge(&dir, &dylib, src, "0") {
             Some(code) => {
-                assert_eq!(code, llvm, "O0 MISMATCH `{label}`: bridge={code} llvm={llvm}");
+                assert_eq!(
+                    code, llvm,
+                    "O0 MISMATCH `{label}`: bridge={code} llvm={llvm}"
+                );
                 ok_o0 += 1;
             }
             None => panic!("`{label}` unexpectedly FAILED CLOSED at O0"),
@@ -581,8 +535,16 @@ fn push_str_and_extend_len_match_llvm_at_o0_and_o3() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(ok_o0, cases.len(), "every push_str/extend case intercepted at O0");
-    assert_eq!(ok_o3, cases.len(), "every push_str/extend case intercepted at O3");
+    assert_eq!(
+        ok_o0,
+        cases.len(),
+        "every push_str/extend case intercepted at O0"
+    );
+    assert_eq!(
+        ok_o3,
+        cases.len(),
+        "every push_str/extend case intercepted at O3"
+    );
 }
 
 /// CONTENT check for `Vec::extend_from_slice` (not just length): build the Vec via
@@ -723,7 +685,10 @@ fn write_matches_at_o0_and_fails_closed_at_o3() {
     for (src, label) in cases {
         let llvm = run_llvm(&dir, src);
         match run_bridge(&dir, &dylib, src, "0") {
-            Some(code) => assert_eq!(code, llvm, "O0 write! MISMATCH `{label}`: bridge={code} llvm={llvm}"),
+            Some(code) => assert_eq!(
+                code, llvm,
+                "O0 write! MISMATCH `{label}`: bridge={code} llvm={llvm}"
+            ),
             None => panic!("`{label}` unexpectedly FAILED CLOSED at O0 (write! should intercept)"),
         }
         // O3 must EITHER match OR fail closed — never a wrong answer.
@@ -1667,7 +1632,9 @@ fn nested_const_aggregate_field_decode_matches_llvm() {
         let llvm = run_llvm(&dir, src);
         for opt in ["0", "2", "3"] {
             match run_bridge(&dir, &dylib, src, opt) {
-                None => panic!("`{label}` at -O{opt} fail-closed — nested const aggregate must lower"),
+                None => {
+                    panic!("`{label}` at -O{opt} fail-closed — nested const aggregate must lower")
+                }
                 Some(code) => assert_eq!(
                     code, llvm,
                     "`{label}` at -O{opt} WRONG (nested const decode miscompile): bridge={code} llvm={llvm}"
@@ -1991,7 +1958,10 @@ fn capturing_fold_terminal_matches_llvm() {
             }
         }
         if *must_lower {
-            assert!(lowered, "capturing fold fail-closed at every level: src=<<<{src}>>>");
+            assert!(
+                lowered,
+                "capturing fold fail-closed at every level: src=<<<{src}>>>"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -2035,7 +2005,10 @@ fn dyn_fn_arg_spread_matches_llvm() {
                 );
             }
         }
-        assert!(lowered, "dyn-Fn spread fail-closed at every level: src=<<<{src}>>>");
+        assert!(
+            lowered,
+            "dyn-Fn spread fail-closed at every level: src=<<<{src}>>>"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

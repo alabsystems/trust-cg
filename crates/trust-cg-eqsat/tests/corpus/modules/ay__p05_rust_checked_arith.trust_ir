@@ -1,0 +1,83 @@
+; TrustIr text format v1
+module "p05_rust_checked_arith"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "p05_rust_checked_arith.rs"
+
+functy.0 = (u32, u32) -> (u32)
+
+functy.1 = (u64, u64) -> (u64)
+
+functy.2 = () -> (u64)
+
+rustcc fn @scale(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="a", %1="b"
+bb0(%0: u32, %1: u32):
+    %2, %3 = mul.overflow u32 %0, %1  ; #loc: 0 8 4
+    %4 = const bool false  ; #loc: 0 8 4
+    %5 = const bool true  ; #loc: 0 8 4
+    %6 = select bool %3, %4, %5  ; #loc: 0 8 4
+    assert %6  ; #proof: no_overflow  ; #loc: 0 8 4
+    %7, %8 = add.overflow u32 %2, %0  ; #loc: 0 8 4
+    %9 = const bool false  ; #loc: 0 8 4
+    %10 = const bool true  ; #loc: 0 8 4
+    %11 = select bool %8, %9, %10  ; #loc: 0 8 4
+    assert %11  ; #proof: no_overflow  ; #loc: 0 8 4
+    ret %7  ; #loc: 0 9 1
+}
+
+rustcc fn @ratio(functy.1) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="a", %1="b"
+bb0(%0: u64, %1: u64):
+    %3 = const u64 0  ; #loc: 0 12 12
+    %4 = icmp eq u64 %1, %3  ; #loc: 0 12 7
+    condbr %4, bb1, bb2  ; #loc: 0 12 4
+bb1:
+    %5 = const u64 0  ; #loc: 0 12 16
+    br bb3(%5)  ; #loc: 0 12 4
+bb2:
+    %6 = const u64 0  ; #loc: 0 12 27
+    %7 = icmp ne u64 %1, %6  ; #loc: 0 12 27
+    assert %7  ; #proof: div_nonzero  ; #loc: 0 12 27
+    %8 = udiv u64 %0, %1  ; #loc: 0 12 27
+    br bb3(%8)  ; #loc: 0 12 4
+bb3(%2: u64):
+    ret %2  ; #loc: 0 13 1
+}
+
+rustcc fn @program(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+bb0:
+    %0 = const u32 6  ; #loc: 0 15 10
+    %1 = const u32 7  ; #loc: 0 15 13
+    %2 = call @func.0(%0, %1)  ; #loc: 0 15 4
+    %3 = zext u32 %2 to u64  ; #loc: 0 15 4
+    %4 = const u64 100  ; #loc: 0 15 31
+    %5 = const u64 7  ; #loc: 0 15 36
+    %6 = call @func.1(%4, %5)  ; #loc: 0 15 25
+    %7, %8 = add.overflow u64 %3, %6  ; #loc: 0 15 4
+    %9 = const bool false  ; #loc: 0 15 4
+    %10 = const bool true  ; #loc: 0 15 4
+    %11 = select bool %8, %9, %10  ; #loc: 0 15 4
+    assert %11  ; #proof: no_overflow  ; #loc: 0 15 4
+    ret %7  ; #loc: 0 16 1
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L8C4 of `p05_rust_checked_arith::scale`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "p05_rust_checked_arith::scale#L8C4#overflow#o0" range 0 8 4 8 9 site f0/bb0#4
+
+obligation 1 arithmetic_safety pending "direct THIR Assert (overflow) at L8C4 of `p05_rust_checked_arith::scale`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "p05_rust_checked_arith::scale#L8C4#overflow#o1" range 0 8 4 8 13 site f0/bb0#9
+
+obligation 2 arithmetic_safety pending "direct THIR Assert (div_by_zero) at L12C27 of `p05_rust_checked_arith::ratio`: divisor is nonzero. RECORDED BY THE LOWERING, NOT PROVED." function 1 source "trust-thir-lower/direct-assert@1" assertion "p05_rust_checked_arith::ratio#L12C27#div_by_zero#o0" range 0 12 27 12 32 site f1/bb2#2
+
+obligation 3 arithmetic_safety pending "direct THIR Assert (overflow) at L15C4 of `p05_rust_checked_arith::program`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 2 source "trust-thir-lower/direct-assert@1" assertion "p05_rust_checked_arith::program#L15C4#overflow#o0" range 0 15 4 15 38 site f2/bb0#11
+
+spec_module "@trust-internal::contract-disclosure-v1" {
+  origin embedded
+  enforcement design-only
+  invariant "fn:0:requires:0" : "{\"schema\":\"trust.contract-disclosure.v1\",\"func_id\":0,\"def_path\":\"scale\",\"kind\":\"requires\",\"non_claim\":\"DesignOnly disclosure: these are the AUTHORED clauses, carried unproven; nothing here is a verdict\",\"predicate\":{\"typed\":{\"text\":\"__trust_lowered_compiler_contract__:a <= 1000\",\"proposition\":{\"le\":[{\"var\":{\"name\":\"a\",\"domain\":\"MachineInt { width: 32, signed: false }\"}},{\"int\":\"1000\"}]}}}}"
+  invariant "fn:0:requires:1" : "{\"schema\":\"trust.contract-disclosure.v1\",\"func_id\":0,\"def_path\":\"scale\",\"kind\":\"requires\",\"non_claim\":\"DesignOnly disclosure: these are the AUTHORED clauses, carried unproven; nothing here is a verdict\",\"predicate\":{\"typed\":{\"text\":\"__trust_lowered_compiler_contract__:b <= 1000\",\"proposition\":{\"le\":[{\"var\":{\"name\":\"b\",\"domain\":\"MachineInt { width: 32, signed: false }\"}},{\"int\":\"1000\"}]}}}}"
+}

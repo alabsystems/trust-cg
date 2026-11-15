@@ -13,10 +13,12 @@ The crate keeps evidence strength explicit:
 | --- | --- | --- |
 | Exhaustive evaluator | Small bounded obligations, normally widths up to 8 bits subject to the input-count limit. | Every point in the represented bounded domain was checked. |
 | Statistical evaluator | Wider obligations, normally 32 and 64 bits. | Edge cases and deterministic pseudorandom samples matched. This is regression evidence, not a proof over all inputs. |
-| External SMT solver | Supported obligations serialized through `ay_bridge` to an AY binary. | `Verified` means AY reported the negated represented obligation unsatisfiable. Timeout, unknown, error, and counterexample are not proofs. |
+| External SMT solver | Supported obligations serialized through `ay_bridge` to AY. | A live `Verified` requires AY's exact UNSAT proof to be independently accepted by Clean. Bare solver UNSAT, timeout, unknown, error, and counterexample are not proofs. |
 
-The encoding, solver, and bridge are part of the trusted computing base for an
-SMT verdict. Independent replay exists only on named certificate paths.
+The encoding and bridge still determine which obligation was represented.
+Independent checking does not prove that the source semantics were modeled
+correctly. Portable committed canaries have a separate, exact-query-bound
+DRAT replay path; they do not require a locally installed AY.
 
 trust-cg intentionally exposes no native-AY Cargo feature. Solver-backed checks
 use the canonical external AY binary so Trust-CG keeps a one-way tool boundary
@@ -27,17 +29,19 @@ instead of introducing an AY <-> Trust-CG Cargo cycle.
 Run the default evaluator-focused package tests:
 
 ```sh
-cargo test --locked -p trust-cg-verify
+targo --unverified test --locked -p trust-cg-verify
 ```
 
 Run the opt-in slow evaluator sweep of the full proof database:
 
 ```sh
-cargo test --locked -p trust-cg-verify \
+targo --unverified test --locked -p trust-cg-verify \
   --features slow-full-database --test full_proof_suite
 ```
 
-With `ay` on `PATH`, run the short fail-closed SMT smoke:
+With the build toolchain's AY — admitted by the SHA-256 of its bytes recorded at
+build time (see `src/ay_identity.rs`) — and
+aterm's capable Clean package, run the short fail-closed SMT smoke:
 
 ```sh
 scripts/check_proof_gate.sh \
@@ -53,49 +57,57 @@ scripts/check_proof_gate.sh \
 
 The full-database floor requires zero counterexamples/errors and forbids a
 statistical fallback. Solver timeouts and `unknown` results remain explicit
-pending obligations; the test prints the verified and pending counts and does
-not relabel pending work as proved.
+pending obligations. Only the five explicitly audited capacity-pending names
+in `tests/proof_gate_strict.rs` are allowed; any new pending name fails the
+floor. Its verified/pending split never relabels pending work as proved.
 
-Set `TRUST_CG_AY_TIMEOUT_MS=<milliseconds>` to raise the external solver budget;
-`0` means no timeout. Solver availability never causes the strict gate to
-downgrade silently to statistical evaluation.
+Set `TRUST_CG_AY_TIMEOUT_MS=<milliseconds>` to change the default AY/Clean
+per-subprocess budget (30 seconds unless overridden); `0` means unlimited.
+`AYConfig::with_timeout` sets the authority caller's policy explicitly. Cache
+replay, solving, proof checking and optional minting have separate budgets;
+staging and executable hashing are outside the timer. This is not a whole-query
+deadline. Solver availability never permits a statistical downgrade.
 
 ## The independent Alethe checker (required to promote UNSAT)
 
 An AY `unsat` is a solver verdict, not a proof. Before it becomes `Verified`,
 the Alethe proof AY emits is re-checked by an **independent** checker — Carcara,
 invoked as `clean cert verify-external <cert.json> --verbose`. Without a usable
-checker, UNSAT stays `Unknown` and the whole solver lane reports itself
-unavailable rather than pretending to authority it does not have.
+checker, UNSAT stays `Unknown`; a timed-out probe or replay yields `Timeout`.
+AY identification is separate from checker availability: a broken Clean
+package is not reported as a missing AY executable.
 
-Resolution order: `$TCG_EXTERNAL_CLEAN_CHECKER` (canonical), else
-`$TCG_CLEAN_CHECKER` (legacy alias, consulted only when the canonical name is
-unset), else `~/Clean/target/release/clean`.
+AY is the sole SMT solver. The Trust toolchain ships AY and Clean as one
+sealed pair, and both come from the toolchain that owns the code (the compiler
+hosting the process, otherwise the one that built this crate): AY exclusively
+(`src/ay_identity.rs`), Clean first, because a checker must read the proofs of
+the AY it is paired with. aterm's managed Clean package is the fallback when
+that toolchain ships no capable checker. Normal use requires neither sibling
+source checkouts nor a separate checker installation. Clean must ship with
+`carcara-verify` enabled. Inspect the package with `aterm pkg doctor` and
+`aterm pkg which clean`.
+[LIMITATIONS.md](../../LIMITATIONS.md) records what happens when no candidate
+checker is usable.
 
-**The checker must be built with the `carcara-verify` cargo feature:**
+For toolchain development only, `$TCG_EXTERNAL_CLEAN_CHECKER` explicitly
+selects a checker. `$TCG_CLEAN_CHECKER` is a legacy alias, used only when the
+canonical variable is unset. Overrides are authoritative and never fall back.
+Without one, discovery tries the owning toolchain's `bin/clean`, then aterm's
+managed package paths, never arbitrary PATH commands or sibling builds. A
+default candidate that fails the probe is skipped with a one-line notice when
+the other one is capable; the DEGRADED banner means no checker is usable. No
+alternate SMT solver is a fallback.
 
-```sh
-cargo build --locked --release -p clean --features carcara-verify
-```
+A known-good propositional refutation checks capability before proof admission.
+Stable capability defects receive a package-repair diagnostic; transient probe
+timeouts and I/O failures remain retryable. `clean_checker_path` is only a
+cached scheduling hint. `clean_checker_path_and_identity` binds current checker
+bytes, and replay checks that identity before and after complete output capture.
 
-That feature is **not** in Clean's default set, and the reason is licensing, not
-build cost: it pulls `carcara -> rug -> gmp-mpfr-sys`, which statically links
-LGPL-3.0-or-later GMP and requires a C toolchain. A plain `cargo build --release`
-therefore produces a `clean` that answers **every** Alethe request with
-`carcara-verify feature required for tier 1 verification` — a refusal that does
-not depend on the proof at all.
-
-Because such a binary rejects valid and invalid proofs identically, trust-cg
-does not take its word for anything. On first use it **probes** the resolved
-checker with a known-good control refutation (a propositional contradiction and
-its one-step Alethe resolution proof). A checker that cannot verify the control
-is treated as ABSENT and announced once on stderr with the build line above,
-instead of being consulted and silently disbelieved. See
-`obligation_cert_store::clean_checker_path`.
-
-This is worth stating plainly because the silent version of this failure was
-expensive: a checker built without the feature cost 22 of 54 compile-gate
-outcomes on one box with no diagnostic of any kind.
+The machine-local Alethe store rechecks exact query, producer, certificate and
+checker bindings before granting a replay hit. Its two writers use owned
+same-directory staging and no-clobber publication. Minting is synchronous,
+optional and checked before publication; it is not an unchecked verdict cache.
 
 ## Coverage boundaries
 

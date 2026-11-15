@@ -1,0 +1,218 @@
+; TrustIr text format v1
+module "aggregate_reborrow_corpus.d3bc56e74bac3ff0-cgu.0"
+target "aarch64-unknown-linux-gnu" 8 little
+
+struct @indexed_record.const.alloc3.allocation { part0: ptr @0, part1: [ty.5 x 16] @8 } size=24 align=1 repr=packed(1) id=0
+
+struct @indexed_record_mut.const.alloc4.allocation { part0: ptr @0, part1: [ty.5 x 16] @8 } size=24 align=1 repr=packed(1) id=1
+
+struct @shared_from_mut_record.const.alloc5.allocation { part0: ptr @0, part1: [ty.5 x 16] @8 } size=24 align=1 repr=packed(1) id=2
+
+functy.0 = (&[ty.2 x 6]) -> (&(u32, u32, u32))
+
+functy.1 = (&[ty.3 x 6], u64) -> (&(u32, u32, u32))
+
+functy.2 = (ptr, i64, ptr) -> ()
+
+functy.3 = (&mut [ty.3 x 6], u64) -> (&mut (u32, u32, u32))
+
+functy.4 = (ptr, i64, ptr) -> ()
+
+functy.5 = (&[ty.2 x 6]) -> (&(u32, u32, u32))
+
+functy.6 = (&mut [ty.2 x 6]) -> (&mut (u32, u32, u32))
+
+functy.7 = (&[ty.2 x 6]) -> (&(u32, u32, u32))
+
+functy.8 = (&mut [ty.2 x 6]) -> (&(u32, u32, u32))
+
+functy.9 = (&mut [ty.3 x 6], u64) -> (&(u32, u32, u32))
+
+functy.10 = (ptr, i64, ptr) -> ()
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+type ty.5 = u8
+
+global internal align(1) @indexed_record.const.alloc1 [ty.5 x 19] = bytes<696e646578206f7574206f6620626f756e6473>
+
+global internal align(8) @indexed_record.const.alloc3 struct.0 = { symaddr<indexed_record.const.alloc2>, bytes<56000000000000000f0000003c000000> }
+
+global internal align(1) @indexed_record.const.alloc2 [ty.5 x 87] = bytes<2f686f6d652f6179617465732f74727573742d63672f7461726765742f7374642d636f6d706c6574696f6e2d696e7665737469676174696f6e2f6167677265676174652d7265626f72726f772d636f727075732e727300>
+
+global internal align(1) @indexed_record_mut.const.alloc1 [ty.5 x 19] = bytes<696e646578206f7574206f6620626f756e6473>
+
+global internal align(8) @indexed_record_mut.const.alloc4 struct.1 = { symaddr<indexed_record_mut.const.alloc2>, bytes<5600000000000000110000004c000000> }
+
+global internal align(1) @indexed_record_mut.const.alloc2 [ty.5 x 87] = bytes<2f686f6d652f6179617465732f74727573742d63672f7461726765742f7374642d636f6d706c6574696f6e2d696e7665737469676174696f6e2f6167677265676174652d7265626f72726f772d636f727075732e727300>
+
+global internal align(1) @shared_from_mut_record.const.alloc1 [ty.5 x 19] = bytes<696e646578206f7574206f6620626f756e6473>
+
+global internal align(8) @shared_from_mut_record.const.alloc5 struct.2 = { symaddr<shared_from_mut_record.const.alloc2>, bytes<56000000000000001f00000015000000> }
+
+global internal align(1) @shared_from_mut_record.const.alloc2 [ty.5 x 87] = bytes<2f686f6d652f6179617465732f74727573742d63672f7461726765742f7374642d636f6d706c6574696f6e2d696e7665737469676174696f6e2f6167677265676174652d7265626f72726f772d636f727075732e727300>
+
+fn @first_array_field(functy.0) {
+bb0(%1: &[ty.2 x 6]):
+    %2 = ptrtoptr &[ty.2 x 6] %1 to &(u32, u32, u32)
+    %3 = ptrtoptr &(u32, u32, u32) %2 to ptr
+    %4 = ptrtoptr ptr %3 to &(u32, u32, u32)
+    ret %4
+}
+
+fn @indexed_record(functy.1) {
+bb0(%1: &[ty.3 x 6], %2: u64):
+    %5 = const u64 3
+    %4 = icmp ult u64 %2, %5
+    condbr %4, bb1, bb3
+bb3:
+    %6 = global_addr @global.0
+    %7 = const i64 19
+    %8 = global_addr @global.1
+    call @func.2(%6, %7, %8)
+    unreachable
+bb1:
+    %9 = const i64 8
+    %10 = ptrtoptr &[ty.3 x 6] %1 to ptr
+    %11 = ptrtoint ptr %10 to i64
+    %12 = copy i64 %9
+    %13 = add i64 %11, %12
+    %14 = inttoptr i64 %13 to ptr
+    %15 = copy ptr %14
+    %16 = ptrtoint ptr %15 to i64
+    %17 = bitcast u64 %2 to i64
+    %18 = const i64 12
+    %19 = mul i64 %17, %18
+    %20 = add i64 %16, %19
+    %21 = inttoptr i64 %20 to ptr
+    %22 = copy ptr %21
+    %23 = ptrtoptr ptr %22 to &(u32, u32, u32)
+    ret %23
+}
+
+fn @_RNvNtCsfsP382UbnKb_4core9panicking5panic(functy.2) {
+}
+
+fn @indexed_record_mut(functy.3) {
+bb0(%1: &mut [ty.3 x 6], %2: u64):
+    %5 = const u64 3
+    %4 = icmp ult u64 %2, %5
+    condbr %4, bb1, bb3
+bb3:
+    %6 = global_addr @global.3
+    %7 = const i64 19
+    %8 = global_addr @global.4
+    call @func.2(%6, %7, %8)
+    unreachable
+bb1:
+    %9 = const i64 8
+    %10 = ptrtoptr &mut [ty.3 x 6] %1 to ptr
+    %11 = ptrtoint ptr %10 to i64
+    %12 = copy i64 %9
+    %13 = add i64 %11, %12
+    %14 = inttoptr i64 %13 to ptr
+    %15 = copy ptr %14
+    %16 = ptrtoint ptr %15 to i64
+    %17 = bitcast u64 %2 to i64
+    %18 = const i64 12
+    %19 = mul i64 %17, %18
+    %20 = add i64 %16, %19
+    %21 = inttoptr i64 %20 to ptr
+    %22 = copy ptr %21
+    %23 = ptrtoptr ptr %22 to &mut (u32, u32, u32)
+    ret %23
+}
+
+fn @last_array_field(functy.5) {
+bb0(%1: &[ty.2 x 6]):
+    %2 = const i64 12
+    %3 = ptrtoptr &[ty.2 x 6] %1 to ptr
+    %4 = ptrtoint ptr %3 to i64
+    %5 = copy i64 %2
+    %6 = add i64 %4, %5
+    %7 = inttoptr i64 %6 to ptr
+    %8 = copy ptr %7
+    %9 = ptrtoptr ptr %8 to &(u32, u32, u32)
+    ret %9
+}
+
+fn @last_array_field_mut(functy.6) {
+bb0(%1: &mut [ty.2 x 6]):
+    %2 = const i64 12
+    %3 = ptrtoptr &mut [ty.2 x 6] %1 to ptr
+    %4 = ptrtoint ptr %3 to i64
+    %5 = copy i64 %2
+    %6 = add i64 %4, %5
+    %7 = inttoptr i64 %6 to ptr
+    %8 = copy ptr %7
+    %9 = ptrtoptr ptr %8 to &mut (u32, u32, u32)
+    ret %9
+}
+
+fn @reborrow_array_field(functy.7) {
+bb0(%1: &[ty.2 x 6]):
+    %4 = const i64 12
+    %5 = ptrtoptr &[ty.2 x 6] %1 to ptr
+    %6 = ptrtoint ptr %5 to i64
+    %7 = copy i64 %4
+    %8 = add i64 %6, %7
+    %9 = inttoptr i64 %8 to ptr
+    %10 = copy ptr %9
+    %11 = ptrtoptr ptr %10 to &(u32, u32, u32)
+    %12 = ptrtoptr &(u32, u32, u32) %11 to *const (u32, u32, u32)
+    %13 = ptrtoptr *const (u32, u32, u32) %12 to &(u32, u32, u32)
+    ret %13
+}
+
+fn @shared_from_mut_array(functy.8) {
+bb0(%1: &mut [ty.2 x 6]):
+    %3 = const i64 12
+    %4 = ptrtoptr &mut [ty.2 x 6] %1 to ptr
+    %5 = ptrtoint ptr %4 to i64
+    %6 = copy i64 %3
+    %7 = add i64 %5, %6
+    %8 = inttoptr i64 %7 to ptr
+    %9 = copy ptr %8
+    %10 = ptrtoptr ptr %9 to &mut (u32, u32, u32)
+    %11 = ptrtoptr &mut (u32, u32, u32) %10 to &(u32, u32, u32)
+    ret %11
+}
+
+fn @shared_from_mut_record(functy.9) {
+bb0(%1: &mut [ty.3 x 6], %2: u64):
+    %6 = const u64 3
+    %5 = icmp ult u64 %2, %6
+    condbr %5, bb1, bb3
+bb3:
+    %7 = global_addr @global.6
+    %8 = const i64 19
+    %9 = global_addr @global.7
+    call @func.2(%7, %8, %9)
+    unreachable
+bb1:
+    %10 = const i64 8
+    %11 = ptrtoptr &mut [ty.3 x 6] %1 to ptr
+    %12 = ptrtoint ptr %11 to i64
+    %13 = copy i64 %10
+    %14 = add i64 %12, %13
+    %15 = inttoptr i64 %14 to ptr
+    %16 = copy ptr %15
+    %17 = ptrtoint ptr %16 to i64
+    %18 = bitcast u64 %2 to i64
+    %19 = const i64 12
+    %20 = mul i64 %18, %19
+    %21 = add i64 %17, %20
+    %22 = inttoptr i64 %21 to ptr
+    %23 = copy ptr %22
+    %24 = ptrtoptr ptr %23 to &mut (u32, u32, u32)
+    %25 = ptrtoptr &mut (u32, u32, u32) %24 to &(u32, u32, u32)
+    ret %25
+}

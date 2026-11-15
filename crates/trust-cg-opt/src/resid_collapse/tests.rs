@@ -347,3 +347,34 @@ fn mismatched_entry_constants_fail_closed() {
     add_second_entry(&mut func, hdr, 3);
     assert!(!run(&mut func));
 }
+
+/// NZCV is live on entry to a block whose first flag access is a `B.cond`
+/// (cmp-branch-fusion's cross-block compare elimination makes such blocks),
+/// or a pseudo with an unknown expansion (`StackAlloc`'s probe loop compares),
+/// so the predecessor's compare is not dead there.
+#[test]
+fn flags_are_live_into_a_block_that_branches_on_them() {
+    for first in [
+        (
+            AArch64Opcode::BCond,
+            vec![
+                MachOperand::Imm(trust_cg_ir::CondCode::EQ.encoding() as i64),
+                blk(BlockId(2)),
+            ],
+        ),
+        (AArch64Opcode::StackAlloc, vec![g64(1), g64(2), i(8), i(8)]),
+    ] {
+        let opcode = first.0;
+        let mut func = MachFunction::new("live_flags".to_string(), Signature::new(vec![], vec![]));
+        let exit = func.entry;
+        let taken = func.create_block();
+        let fall = func.create_block();
+        push(&mut func, exit, first.0, first.1);
+        push(&mut func, exit, AArch64Opcode::B, vec![blk(fall)]);
+        push(&mut func, taken, AArch64Opcode::Ret, vec![]);
+        push(&mut func, fall, AArch64Opcode::Ret, vec![]);
+        func.add_edge(exit, taken);
+        func.add_edge(exit, fall);
+        assert!(!flags_dead_from(&func, exit), "{opcode:?}");
+    }
+}

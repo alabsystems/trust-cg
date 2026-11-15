@@ -20,8 +20,9 @@
 // INTEGER-ONLY, BIT-LEVEL IEEE-754 model. Every function here operates on raw
 // bit patterns held in `u32` / `u64` / `u128` and uses ONLY integer & bitwise
 // operations (`+ - * << >> & | ^ == <` on integers). There is ZERO `f32`/`f64`
-// arithmetic anywhere in this file (enforced by a grep gate in the bridge test
-// and the soundness manifest). The only things trusted are the host INTEGER ALU
+// arithmetic anywhere in this file (enforced by the grep gate
+// `bitmodel_source_is_integer_only` in tests/fp_bitmodel_bridge.rs, a
+// `scripts/soundness_check.sh` gate). The only things trusted are the host INTEGER ALU
 // and THIS algorithm — and the algorithm is itself validated, bit-for-bit,
 // against REAL Apple M4 silicon by tests/fp_bitmodel_bridge.rs (the chip
 // `:= rfl` theorems of the sibling Clean tree's proofs/aarch64_fp*_chip.lean).

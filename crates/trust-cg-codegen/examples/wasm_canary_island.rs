@@ -29,7 +29,7 @@
 //! catch — a divergence is a miscompile or a spec-copy bug, and both are
 //! failures.
 //!
-//!     cargo run --example wasm_canary_island -- <outdir>
+//!     scripts/trust_cargo.sh run --example wasm_canary_island -- <outdir>
 //!
 //! writes `<outdir>/canary_island.wasm` (trust-cg bytes, NO wasm-opt — island
 //! policy is that shipped bytes are exactly the emitted bytes),
@@ -328,12 +328,14 @@ fn main() {
     let opts = InterpretOptions {
         fuel: 50_000_000,
         max_call_depth: 16,
-        mem_budget: 16 * 1024 * 1024,
+        panic_strategy: trust_ir::interpret::PanicStrategy::Abort,
     };
 
     let mut mb = ModuleBuilder::new("canary_island");
     let fid = build_canary(&mut mb, ICmpOp::Ult);
-    let mut module = mb.build();
+    let mut module = mb
+        .build()
+        .expect("ModuleBuilder::build: the example module");
     let interp = Interpreter::with_module(&module).with_options(opts);
 
     // The MUTANT: the same spec with the straddle round's compare flipped to
@@ -341,7 +343,9 @@ fn main() {
     // loop below can prove that the corpus would actually catch that drift.
     let mut mut_mb = ModuleBuilder::new("canary_island_slt_mutant");
     let mut_fid = build_canary(&mut mut_mb, ICmpOp::Slt);
-    let mut_module = mut_mb.build();
+    let mut_module = mut_mb
+        .build()
+        .expect("ModuleBuilder::build: the example module");
     let mut_interp = Interpreter::with_module(&mut_module).with_options(opts);
 
     let mut inputs: Vec<(u32, u32)> = EDGES.to_vec();
@@ -420,7 +424,12 @@ fn main() {
     // fail-closes the other way (reference execution wants the canonical
     // 64-bit layout), so the wasm32 pin is stamped after interpretation.
     module.target_info = Some(wasm::wasm32_target_info());
-    let bytes = wasm::compile_module(&module).expect("compile_module");
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("compile_module");
     std::fs::File::create(format!("{out}/canary_island.wasm"))
         .unwrap()
         .write_all(&bytes)
@@ -439,4 +448,13 @@ fn main() {
         bytes.len(),
         inputs.len()
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

@@ -2,21 +2,31 @@
 
 // trust-cg-llvm-import / tests / printf_globals.rs
 //
-// Regression coverage for WS2 imported printf string globals.
+// Regression coverage for WS2 imported printf string globals. The Mach-O and
+// ELF section/symbol/relocation checks compile for explicit triples and run on
+// every host; the linked program compiles for this host's triple and runs
+// natively.
+
+mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
 
+use common::{
+    APPLE, LINUX, compile_for, compile_for_host, describe_status, elf_section_bytes,
+    elf_section_index, elf_symbol_index, elf_text_relocation_kinds, link_with_cc,
+    native_host_or_skip, unique_temp_dir,
+};
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
+use trust_cg_codegen::elf::constants::{
+    R_AARCH64_ADD_ABS_LO12_NC, R_AARCH64_ADR_PREL_PG_HI21, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
+    SHT_NOBITS, SHT_PROGBITS, STB_LOCAL, STT_OBJECT,
+};
+use trust_cg_codegen::elf::reparse::read_object_records;
 use trust_cg_codegen::macho::linker::MachOParser;
 use trust_cg_codegen::pipeline::OptLevel;
 use trust_cg_codegen::target::Target;
-use trust_cg_llvm_import::import_text;
-
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use trust_cg_llvm_import::{import_text, import_text_for_target};
 
 /// These fixtures parse Mach-O structure (MachOParser sections/relocations),
 /// so pin the aarch64-apple-darwin spec explicitly: `Compiler::new` derives
@@ -25,7 +35,7 @@ use std::os::unix::process::ExitStatusExt;
 fn macho_compiler(config: CompilerConfig) -> Compiler {
     let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
         .expect("aarch64-apple-darwin parses");
-    Compiler::new_for_target_spec(config, spec)
+    Compiler::new_for_target_spec(config, spec).with_codegen_license(permit_unlicensed())
 }
 
 const LL_PRINTF_STRING_GLOBAL: &str = r#"
@@ -179,7 +189,9 @@ fn compile_to_aarch64_object(src: &str, module_name: &str) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution: Default::default(),
         panic_unwind: false,
+        ..CompilerConfig::default()
     });
     compiler
         .compile(&module)
@@ -187,49 +199,13 @@ fn compile_to_aarch64_object(src: &str, module_name: &str) -> Vec<u8> {
         .object_code
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "trust-cg-import-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-fn link_with_cc(obj_path: &Path, bin_path: &Path) {
-    let output = Command::new("cc")
-        .arg(obj_path)
-        .arg("-o")
-        .arg(bin_path)
-        .output()
-        .expect("run cc");
-    assert!(
-        output.status.success(),
-        "cc failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn describe_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit {code}");
-    }
-    #[cfg(unix)]
-    if let Some(signal) = status.signal() {
-        return format!("signal {signal}");
-    }
-    "unknown status".to_string()
-}
-
 #[test]
 fn imported_printf_string_global_emits_const_data_and_relocation() {
-    let module = import_text(LL_PRINTF_STRING_GLOBAL, "printf_string").expect("import");
+    // Imported for the Mach-O target it is compiled for: the `printf`
+    // declaration is an FFI boundary, so the module must state its target
+    // (`TargetInfoRequired`).
+    let module =
+        import_text_for_target(LL_PRINTF_STRING_GLOBAL, "printf_string", APPLE).expect("import");
     assert_eq!(module.globals[0].align, Some(1));
     let compiler = macho_compiler(CompilerConfig {
         opt_level: OptLevel::O0,
@@ -242,7 +218,9 @@ fn imported_printf_string_global_emits_const_data_and_relocation() {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution: Default::default(),
         panic_unwind: false,
+        ..CompilerConfig::default()
     });
     let result = compiler.compile(&module).expect("compile");
     assert!(
@@ -353,18 +331,132 @@ fn imported_mutable_byte_globals_emit_writable_data_and_relocation() {
     );
 }
 
+/// ELF twin of the Mach-O string-global check: the format string is the
+/// read-only `.rodata` section, the local `.str` object symbol sits at its
+/// start, and `.text` addresses it with the GlobalRef ADRP/ADD pair.
+#[test]
+fn imported_printf_string_global_emits_rodata_and_relocation_elf() {
+    let object = compile_for(
+        LL_PRINTF_STRING_GLOBAL,
+        "printf_string",
+        LINUX,
+        OptLevel::O0,
+    );
+    let records = read_object_records(&object).expect("read ELF object records");
+
+    let rodata_idx = elf_section_index(&records, ".rodata");
+    let rodata = &records.sections[rodata_idx];
+    assert_eq!(rodata.sh_type, SHT_PROGBITS);
+    assert_eq!(
+        rodata.sh_flags & (SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
+        SHF_ALLOC,
+        "the format string must be allocated, read-only and non-executable: {rodata:?}"
+    );
+    assert_eq!(elf_section_bytes(&object, rodata_idx), b"%d\n\0");
+
+    let string_symbol_idx = elf_symbol_index(&records, ".str");
+    let string_symbol = &records.symbols[string_symbol_idx];
+    assert_eq!(
+        (
+            string_symbol.section_index as usize,
+            string_symbol.value,
+            string_symbol.size,
+            string_symbol.binding,
+            string_symbol.symbol_type
+        ),
+        (rodata_idx, 0, 4, STB_LOCAL, STT_OBJECT),
+        "private string global: {string_symbol:?}"
+    );
+
+    let kinds = elf_text_relocation_kinds(&records, string_symbol_idx);
+    assert!(
+        kinds.contains(&R_AARCH64_ADR_PREL_PG_HI21) && kinds.contains(&R_AARCH64_ADD_ABS_LO12_NC),
+        "text should relocate the GlobalRef ADRP/ADD pair against .str; kinds={kinds:?}, relocs={:?}",
+        records.relocations
+    );
+    assert!(
+        kinds
+            .iter()
+            .all(|kind| [R_AARCH64_ADR_PREL_PG_HI21, R_AARCH64_ADD_ABS_LO12_NC].contains(kind)),
+        "only the ADRP/ADD pair relocates against .str: {kinds:?}"
+    );
+}
+
+/// ELF twin of the Mach-O mutable-byte-global check. ELF keeps the
+/// initialized `main.bytes` in writable `.data` and the zero-initialized
+/// `main.flags` in writable `.bss`; neither lands in a read-only section, and
+/// `.text` addresses `main.flags` with the GlobalRef ADRP/ADD pair.
+#[test]
+fn imported_mutable_byte_globals_emit_writable_data_and_relocation_elf() {
+    let object = compile_for(
+        LL_MUTABLE_BYTE_GLOBALS,
+        "mutable_byte_globals",
+        LINUX,
+        OptLevel::O0,
+    );
+    let records = read_object_records(&object).expect("read ELF object records");
+
+    let data_idx = elf_section_index(&records, ".data");
+    let data = &records.sections[data_idx];
+    assert_eq!(data.sh_type, SHT_PROGBITS);
+    assert_eq!(
+        data.sh_flags & (SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
+        SHF_ALLOC | SHF_WRITE
+    );
+    assert_eq!(elf_section_bytes(&object, data_idx), &[1, 2, 3, 4]);
+
+    let bss_idx = elf_section_index(&records, ".bss");
+    let bss = &records.sections[bss_idx];
+    assert_eq!(bss.sh_type, SHT_NOBITS);
+    assert_eq!(
+        bss.sh_flags & (SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR),
+        SHF_ALLOC | SHF_WRITE
+    );
+    assert_eq!(bss.size, 4);
+    assert!(
+        records
+            .sections
+            .iter()
+            .all(|section| !section.name.starts_with(".rodata")),
+        "mutable byte globals must not be emitted read-only: {:?}",
+        records.sections
+    );
+
+    let flags_symbol_idx = elf_symbol_index(&records, "main.flags");
+    let bytes_symbol_idx = elf_symbol_index(&records, "main.bytes");
+    for (index, section, name) in [
+        (flags_symbol_idx, bss_idx, "main.flags"),
+        (bytes_symbol_idx, data_idx, "main.bytes"),
+    ] {
+        let symbol = &records.symbols[index];
+        assert_eq!(
+            (
+                symbol.section_index as usize,
+                symbol.value,
+                symbol.size,
+                symbol.binding,
+                symbol.symbol_type
+            ),
+            (section, 0, 4, STB_LOCAL, STT_OBJECT),
+            "internal byte global {name}: {symbol:?}"
+        );
+    }
+
+    let kinds = elf_text_relocation_kinds(&records, flags_symbol_idx);
+    assert!(
+        kinds.contains(&R_AARCH64_ADR_PREL_PG_HI21) && kinds.contains(&R_AARCH64_ADD_ABS_LO12_NC),
+        "text should relocate the GlobalRef ADRP/ADD pair against main.flags; kinds={kinds:?}, relocs={:?}",
+        records.relocations
+    );
+}
+
 #[test]
 fn imported_nottest_linked_binary_matches_clang_stdout() {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        eprintln!(
-            "skipping: test requires aarch64-apple-darwin (host is {} / {})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
+    if !native_host_or_skip("imported_nottest_linked_binary_matches_clang_stdout") {
         return;
     }
 
-    let object = compile_to_aarch64_object(LL_NOTTEST, "ws2_nottest");
+    let object = compile_for_host(LL_NOTTEST, "ws2_nottest", OptLevel::O0);
     let dir = unique_temp_dir("nottest");
     let obj_path = dir.join("nottest.o");
     let bin_path = dir.join("nottest");
@@ -383,4 +475,13 @@ fn imported_nottest_linked_binary_matches_clang_stdout() {
         String::from_utf8_lossy(&output.stdout),
         "Bitwise Not: -2 -3 2 -6\nBoolean Not: 0 1 0 1 0 1\n"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

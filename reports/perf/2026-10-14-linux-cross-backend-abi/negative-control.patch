@@ -1,0 +1,14 @@
+diff --git a/crates/trust-cg-lower/src/abi.rs b/crates/trust-cg-lower/src/abi.rs
+index 2676ff94c..23c8175c0 100644
+--- a/crates/trust-cg-lower/src/abi.rs
++++ b/crates/trust-cg-lower/src/abi.rs
+@@ -519,7 +519,8 @@ impl AArch64AbiVariant {
+             || triple.contains("-illumos")
+             || triple.contains("-solaris");
+         if elf_os {
+-            Ok(Self::Aapcs64)
++            // NEGATIVE CONTROL (never committed): DarwinPCS on an ELF target.
++            Ok(Self::Darwin)
+         } else if triple.contains("-apple-") || triple.ends_with("-darwin") {
+             Ok(Self::Darwin)
+         } else {

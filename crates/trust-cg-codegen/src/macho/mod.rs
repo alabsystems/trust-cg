@@ -15,13 +15,19 @@
 //! - Symbol table (nlist_64) with proper local/global partitioning
 //! - String table
 //! - Deferred fixup layer for late-bound address resolution
+//! - An independent verifier for embedded ad-hoc code signatures
+//!   ([`codesign`]), used on standalone-linked and ld64-linked images
+//! - A linked-image evidence record ([`linked_image`]) that replays the
+//!   objects' relocations against a linked executable or dylib
 //!
 //! All data is written in little-endian byte order (native for both ARM64
 //! and x86-64 on macOS).
 
+pub mod codesign;
 pub mod constants;
 pub mod fixup;
 pub mod header;
+pub mod linked_image;
 pub mod linker;
 pub mod reloc;
 pub mod reparse;
@@ -30,6 +36,7 @@ pub mod symbol;
 pub mod writer;
 pub mod x86_64_reloc;
 
+pub use codesign::{AdHocSignature, CodeSignatureError, verify_ad_hoc_signature};
 pub use fixup::{Fixup, FixupError, FixupList, FixupTarget};
 pub use reloc::{AArch64RelocKind, MachORelocationError, Relocation, encode_relocation};
 pub use symbol::{DysymtabParams, NList64, SymbolTable};

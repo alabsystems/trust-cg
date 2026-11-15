@@ -134,7 +134,11 @@
 //! Disable with `TRUST_CG_DISABLE_PASSES=neon_find`. Widths: i32 (`.4S`,
 //! 16-element blocks) and i8/u8 (`.16B`, 64-byte blocks).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{
+    ExitPlan, GuardBound, Handoff, InductionGuards, LoopExit, LoopLocality, exit_of_test,
+};
+use crate::mach_util::{branch_targets, const_value, copy_like, strip_copies};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstFlags, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -234,15 +238,9 @@ impl NeonFindPass {
         // preheader terminator; it never renumbers or edits the scalar loop), so
         // recognized data for other loops stays valid.
         //
-        // Escape hatch (differential testing): disable ONLY the forward-chain
-        // recognizer, leaving the proven strict 3-block path intact, so the
-        // scalar output can be compared against the vectorized one.
-        let allow_chain = std::env::var_os("TCG_NO_CHAIN_FIND").is_none();
         let mut plans = Vec::new();
         for lp in loops.all_loops() {
-            if let Some(rec) =
-                FindRecognized::recognize(func, dom, lp.header, lp.latch, &lp.body, allow_chain)
-            {
+            if let Some(rec) = FindRecognized::recognize(func, dom, lp.header, lp.latch, &lp.body) {
                 plans.push(rec);
             }
         }
@@ -253,9 +251,6 @@ impl NeonFindPass {
                 self.fired += 1;
                 changed = true;
             }
-        }
-        if changed && std::env::var("TRUST_CG_DUMP_NEONFIND").is_ok() {
-            eprintln!("[neon-find] fn={} vectorized={}", func.name, self.fired);
         }
         changed
     }
@@ -298,6 +293,9 @@ struct FindRecognized {
     /// forward-chain shape). The guard/pointer then skip the `Sxtw` the `Gpr32`
     /// strict path performs and the loop-continue is UNSIGNED (`LO`).
     iv_is_i64: bool,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv]`. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 /// Opcodes permitted anywhere in the search loop body. Anything else — in
@@ -329,61 +327,18 @@ fn allowed_loop_op(op: AArch64Opcode) -> bool {
     )
 }
 
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
-/// `(dst, src)` if `inst` is a register copy (`MovR`/`Copy`, or `AddRI +0`).
-fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
-    match inst.opcode {
-        AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
-        {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        _ => None,
-    }
-}
-
-/// Constant value of a `Movz #imm` def (16-bit immediate).
-fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
-    let inst = func.inst(*def.get(&val.id)?);
-    if inst.opcode == AArch64Opcode::Movz
-        && inst.operands.len() == 2
-        && let Some(v) = imm_of(&inst.operands[1])
-        && (0..=0xFFFF).contains(&v)
-    {
-        return Some(v);
-    }
-    None
-}
-
-/// Whether `val` is `iv` or a chain of register copies rooted at `iv`.
+/// Whether `val` is `iv` or a chain of register copies rooted at `iv`, each
+/// the copied register's ONLY def ([`crate::mach_util::sole_copy_source`]): a
+/// copy into a register written elsewhere too holds `iv` on some paths only.
 fn resolves_to_iv(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg, iv: VReg) -> bool {
     let mut cur = val;
     for _ in 0..8 {
         if cur == iv {
             return true;
         }
-        let Some(&id) = def.get(&cur.id) else {
-            return false;
-        };
-        match copy_like(func.inst(id)) {
-            Some((d, s)) if d == cur => cur = s,
-            _ => return false,
+        match crate::mach_util::sole_copy_source(func, def, cur) {
+            Some(src) => cur = src,
+            None => return false,
         }
     }
     false
@@ -426,18 +381,18 @@ fn load_base(
     let load = func.inst(load_id);
     if load.opcode != AArch64Opcode::LdrRI
         || load.operands.len() != 3
-        || imm_of(&load.operands[2]) != Some(0)
+        || load.operands[2].as_imm() != Some(0)
     {
         return None;
     }
-    let addr = vreg_of(&load.operands[1])?;
+    let addr = load.operands[1].as_vreg()?;
     let madd = func.inst(*def.get(&addr.id)?);
     if madd.opcode != AArch64Opcode::Madd || madd.operands.len() != 4 {
         return None;
     }
-    let f1 = vreg_of(&madd.operands[1])?;
-    let f2 = vreg_of(&madd.operands[2])?;
-    let base = vreg_of(&madd.operands[3])?;
+    let f1 = madd.operands[1].as_vreg()?;
+    let f2 = madd.operands[2].as_vreg()?;
+    let base = madd.operands[3].as_vreg()?;
     // One factor is `Sxtw(iv-through-copies)`, the other is the element size 4.
     let is_sext_iv = |factor: VReg| -> bool {
         let Some(&id) = def.get(&factor.id) else {
@@ -449,7 +404,9 @@ fn load_base(
         let inst = func.inst(id);
         inst.opcode == AArch64Opcode::Sxtw
             && inst.operands.len() == 2
-            && vreg_of(&inst.operands[1]).is_some_and(|s| resolves_to_iv(func, def, s, iv))
+            && inst.operands[1]
+                .as_vreg()
+                .is_some_and(|s| resolves_to_iv(func, def, s, iv))
     };
     let es_ok = |factor: VReg| const_value(func, def, factor) == Some(ELEM_BYTES);
     if !((is_sext_iv(f1) && es_ok(f2)) || (is_sext_iv(f2) && es_ok(f1))) {
@@ -493,7 +450,7 @@ fn byte_load_base(
     if !matches!(ext.opcode, AArch64Opcode::Uxtb | AArch64Opcode::Sxtb) || ext.operands.len() != 2 {
         return None;
     }
-    let loaded = vreg_of(&ext.operands[1])?;
+    let loaded = ext.operands[1].as_vreg()?;
     if loaded.class != RegClass::Gpr32 {
         return None;
     }
@@ -504,11 +461,11 @@ fn byte_load_base(
     let load = func.inst(load_id);
     if load.opcode != AArch64Opcode::LdrbRI
         || load.operands.len() != 3
-        || imm_of(&load.operands[2]) != Some(0)
+        || load.operands[2].as_imm() != Some(0)
     {
         return None;
     }
-    let addr = vreg_of(&load.operands[1])?;
+    let addr = load.operands[1].as_vreg()?;
     let addr_id = *def.get(&addr.id)?;
     if !loop_insts.contains(&addr_id) {
         return None;
@@ -524,13 +481,15 @@ fn byte_load_base(
         let inst = func.inst(id);
         inst.opcode == AArch64Opcode::Sxtw
             && inst.operands.len() == 2
-            && vreg_of(&inst.operands[1]).is_some_and(|s| resolves_to_iv(func, def, s, iv))
+            && inst.operands[1]
+                .as_vreg()
+                .is_some_and(|s| resolves_to_iv(func, def, s, iv))
     };
     let base = match addr_inst.opcode {
         // The `*1` gep folds to a plain add: `AddRR(base, sxtw(iv))`.
         AArch64Opcode::AddRR if addr_inst.operands.len() == 3 => {
-            let a = vreg_of(&addr_inst.operands[1])?;
-            let b = vreg_of(&addr_inst.operands[2])?;
+            let a = addr_inst.operands[1].as_vreg()?;
+            let b = addr_inst.operands[2].as_vreg()?;
             if is_sext_iv(a) {
                 b
             } else if is_sext_iv(b) {
@@ -541,9 +500,9 @@ fn byte_load_base(
         }
         // `Madd(idx, 1, base)` (factor order free).
         AArch64Opcode::Madd if addr_inst.operands.len() == 4 => {
-            let f1 = vreg_of(&addr_inst.operands[1])?;
-            let f2 = vreg_of(&addr_inst.operands[2])?;
-            let base = vreg_of(&addr_inst.operands[3])?;
+            let f1 = addr_inst.operands[1].as_vreg()?;
+            let f2 = addr_inst.operands[2].as_vreg()?;
+            let base = addr_inst.operands[3].as_vreg()?;
             let es_ok = |f: VReg| const_value(func, def, f) == Some(ELEM_BYTES_B);
             if (is_sext_iv(f1) && es_ok(f2)) || (is_sext_iv(f2) && es_ok(f1)) {
                 base
@@ -574,13 +533,9 @@ impl FindRecognized {
         header: BlockId,
         latch: BlockId,
         body: &HashSet<BlockId>,
-        allow_chain: bool,
     ) -> Option<Self> {
         if let Some(rec) = Self::recognize_strict(func, dom, header, latch, body) {
             return Some(rec);
-        }
-        if !allow_chain {
-            return None;
         }
         Self::recognize_forward_chain(func, dom, header, latch, body)
     }
@@ -606,7 +561,7 @@ impl FindRecognized {
         // `CmpRR`). Stores, atomics (`Ldar*`/LSE), and calls are all outside the
         // whitelist AND carry `WRITES_MEMORY`/`IS_CALL`; volatile loads use
         // distinct `VolatileLdr*` opcodes outside the whitelist.
-        let mut loop_insts = HashSet::new();
+        let mut loop_insts = HashSet::default();
         for &b in &[header, body_blk, latch] {
             for &id in &func.block(b).insts {
                 let inst = func.inst(id);
@@ -619,7 +574,7 @@ impl FindRecognized {
                 loop_insts.insert(id);
             }
         }
-        let def = build_def_map(func);
+        let def = crate::effects::build_reaching_def_map(func);
 
         // (R3) header: `CmpRR(iv, bound); BCond LT -> body_blk; B -> no-match`.
         // The LT-true edge stays in the loop; the fall-through leaves it.
@@ -628,7 +583,7 @@ impl FindRecognized {
             .iter()
             .find(|&&id| func.inst(id).opcode == AArch64Opcode::BCond)?;
         let h_bcond = func.inst(h_bcond_id);
-        if imm_of(&h_bcond.operands[0]) != Some(CC_LT) {
+        if h_bcond.operands[0].as_imm() != Some(CC_LT) {
             return None;
         }
         if *branch_targets(h_bcond).first()? != body_blk {
@@ -639,8 +594,8 @@ impl FindRecognized {
         if h_cmp.opcode != AArch64Opcode::CmpRR {
             return None;
         }
-        let iv = vreg_of(&h_cmp.operands[0])?;
-        let bound = vreg_of(&h_cmp.operands[1])?;
+        let iv = h_cmp.operands[0].as_vreg()?;
+        let bound = h_cmp.operands[1].as_vreg()?;
         if iv.class != RegClass::Gpr32 || bound.class != RegClass::Gpr32 {
             return None;
         }
@@ -665,28 +620,6 @@ impl FindRecognized {
         if !is_increment_by_one(func, &def, iv_src?, iv) {
             return None;
         }
-        // (R4b) SOUNDNESS: `iv` must be the ONLY loop-carried value. This path
-        // vectorizes into a block-SKIPPING filter whose latch advances ONLY
-        // `iv` (see the apply); it maintains no other running state. So a loop
-        // that also carries a reduction/accumulator (e.g. `sum += a[iv]`, whose
-        // result is live-out) would be miscompiled — the vector filter skips
-        // whole blocks without updating the accumulator, then the scalar loop
-        // resumes with every skipped element missing. In this un-coalesced
-        // conventional-SSA form (which R4 already requires, via the
-        // `iv = MovR(iv+1)` latch copy), every loop-carried value's back-edge
-        // copy lands in the latch as a `copy_like` writeback. Reject any latch
-        // writeback to a register other than `iv` — mirrors the chain path's
-        // identical guard ("no reduction accumulator in a pure first-match
-        // scan"). Address arithmetic is recomputed per iteration (dead at
-        // iteration end, no latch copy) and is correctly unaffected.
-        for &id in &l_insts {
-            if let Some((d, _)) = copy_like(func.inst(id))
-                && d != iv
-            {
-                return None;
-            }
-        }
-
         // (R5) body: `CmpRR(a[iv], key); BCond EQ -> match exit (LEAVES loop);
         // B -> latch`. The load and key operands may appear in either order.
         let b_insts = func.block(body_blk).insts.clone();
@@ -694,7 +627,7 @@ impl FindRecognized {
             .iter()
             .find(|&&id| func.inst(id).opcode == AArch64Opcode::BCond)?;
         let b_bcond = func.inst(b_bcond_id);
-        if imm_of(&b_bcond.operands[0]) != Some(CC_EQ) {
+        if b_bcond.operands[0].as_imm() != Some(CC_EQ) {
             return None;
         }
         let eq_target = *branch_targets(b_bcond).first()?;
@@ -714,8 +647,34 @@ impl FindRecognized {
         if b_cmp.opcode != AArch64Opcode::CmpRR {
             return None;
         }
-        let c0 = vreg_of(&b_cmp.operands[0])?;
-        let c1 = vreg_of(&b_cmp.operands[1])?;
+        let c0 = b_cmp.operands[0].as_vreg()?;
+        let c1 = b_cmp.operands[1].as_vreg()?;
+
+        // (R4b) SOUNDNESS, the crate's one loop-state contract
+        // (`crate::loop_contract`): this path vectorizes into a block-SKIPPING
+        // filter whose latch advances ONLY `iv` and maintains no other running
+        // state. It runs only iterations the header's `iv < n` test continues,
+        // and it reproduces the match exit: a block holding a match hands
+        // control back to the scalar loop before that block. The loop may leave
+        // by no other exit. A loop that also carries a reduction (`sum += a[iv]`)
+        // or leaves another register live at an exit would be miscompiled: the
+        // filter skips whole blocks without updating it. This used to check
+        // only the carried half (no latch writeback other than `iv`); the
+        // contract also refuses a register that is only live out.
+        let no_match = exit_of_test(func, body.iter().copied(), header)?;
+        let exits = ExitPlan::loop_test(header, no_match).and_reproduces(LoopExit::Edge {
+            from: body_blk,
+            to: eq_target,
+        });
+        let locality = LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &exits,
+            Handoff::HeaderOrExit,
+            &[iv],
+        )
+        .ok()?;
 
         // preheader = header's non-latch predecessor (single-pred through the
         // guard chain); its terminator branches to `header`.
@@ -758,6 +717,7 @@ impl FindRecognized {
                 continue;
             }
             return Some(FindRecognized {
+                _locality: locality,
                 header,
                 preheader,
                 preheader_term,
@@ -796,7 +756,7 @@ impl FindRecognized {
         // WRITE / CALL flag (same defense-in-depth as `recognize_strict`). Stores,
         // atomics, calls, and distinct `VolatileLdr*` loads are outside the
         // whitelist; stores/calls are additionally flag-tagged here.
-        let mut loop_insts = HashSet::new();
+        let mut loop_insts = HashSet::default();
         for &b in body {
             for &id in &func.block(b).insts {
                 let inst = func.inst(id);
@@ -864,14 +824,10 @@ impl FindRecognized {
         if iv.class != RegClass::Gpr64 {
             return None;
         }
-        if writebacks.iter().any(|(d, _)| *d != iv) {
-            return None; // no reduction accumulator in a pure first-match scan
-        }
-
         // Walk header -> ... -> latch, classifying each block as the loop-continue
         // / bounds guard, the (single) equality match block, or a pass-through,
         // proving SINGLE-N agreement, full coverage, and EXACTLY ONE match block.
-        let (bound, mtch) = walk_find_chain(
+        let (bound, mtch, (match_block, match_target)) = walk_find_chain(
             func,
             dom,
             &def,
@@ -921,7 +877,49 @@ impl FindRecognized {
         }
         let (base, key, is_byte) = mtch;
 
+        // The loop-state contract (`crate::loop_contract`): the filter runs only
+        // iterations the header's `iv <u N` guard continues, and reproduces the
+        // match exit (a block holding a match hands control back to the scalar
+        // loop before that block). The chain's surviving bounds guards (on
+        // `iv`, against the same `N`) are exits the contract admits by its own
+        // rule. A pure first-match scan carries no reduction and leaves nothing
+        // but `iv` live, because the vector filter reproduces only `iv`.
+        let is_iv = |v: VReg| resolves_to_iv(func, &def, v, iv);
+        let is_bound = |guard: GuardBound| {
+            let guard = match guard {
+                GuardBound::Imm(n) => ChainBound::Const(n),
+                GuardBound::Reg(r) => ChainBound::Reg(r),
+            };
+            chain_bound_agrees(func, &def, bound, guard)
+        };
+        let exits =
+            ExitPlan::unsigned_loop_test(func, body.iter().copied(), header, &is_iv, &is_bound)?
+                .and_reproduces(LoopExit::Edge {
+                    from: match_block,
+                    to: match_target,
+                })
+                .and_induction_guards(
+                    func,
+                    body.iter().copied(),
+                    header,
+                    &InductionGuards {
+                        iv,
+                        at_most_iv: &is_iv,
+                        covers_loop_bound: &is_bound,
+                    },
+                );
+        let locality = LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &exits,
+            Handoff::HeaderOrExit,
+            &[iv],
+        )
+        .ok()?;
+
         Some(FindRecognized {
+            _locality: locality,
             header,
             preheader,
             preheader_term,
@@ -945,36 +943,6 @@ enum ChainBound {
     Reg(VReg),
 }
 
-/// Follow value-preserving copy chains to the underlying value (bounded). Used
-/// only on single-def bound registers, never on the multi-def induction.
-fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
-    for _ in 0..16 {
-        // A vreg with several live defs has no single reaching definition: the
-        // def map is LAST-WINS over the emitted layout, so it names whichever
-        // def comes last rather than the one that reaches this use. Every
-        // loop-carried variable is multi-def by construction (a preheader copy
-        // and a latch copy into the same vreg), and every `if`/`match` value has
-        // one def per arm — so walking one resolves an induction variable to its
-        // LATCH source, or a merge value to whichever arm came last.
-        //
-        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
-        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
-        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
-        // in-tree precedents for doing it right.
-        if crate::effects::live_def_count(func, v.id) != 1 {
-            return v;
-        }
-        let Some(&d) = def.get(&v.id) else {
-            return v;
-        };
-        match copy_like(func.inst(d)) {
-            Some((dst, src)) if dst == v => v = src,
-            _ => return v,
-        }
-    }
-    v
-}
-
 /// Recognize the terminating guard diamond `cmp x, N; b.lo t_lo; b t_b` (last
 /// three instructions) with the unsigned-`LO` taken edge `t_lo` IN the loop and
 /// the fall-through `t_b` OUT of it. `N` is a constant immediate (`CmpRI`) or a
@@ -995,18 +963,18 @@ fn recognize_chain_guard(
     let br = func.inst(insts[n - 1]);
     if bcond.opcode != AArch64Opcode::BCond
         || br.opcode != AArch64Opcode::B
-        || imm_of(&bcond.operands[0])? != CC_LO
+        || bcond.operands[0].as_imm()? != CC_LO
     {
         return None;
     }
     let (x, bound) = match cmp.opcode {
         AArch64Opcode::CmpRR => (
-            vreg_of(&cmp.operands[0])?,
-            ChainBound::Reg(vreg_of(&cmp.operands[1])?),
+            cmp.operands[0].as_vreg()?,
+            ChainBound::Reg(cmp.operands[1].as_vreg()?),
         ),
         AArch64Opcode::CmpRI => (
-            vreg_of(&cmp.operands[0])?,
-            ChainBound::Const(imm_of(&cmp.operands[1])?),
+            cmp.operands[0].as_vreg()?,
+            ChainBound::Const(cmp.operands[1].as_imm()?),
         ),
         _ => return None,
     };
@@ -1064,11 +1032,11 @@ fn chain_load_base(
     let load = func.inst(load_id);
     if load.opcode != AArch64Opcode::LdrRI
         || load.operands.len() != 3
-        || imm_of(&load.operands[2]) != Some(0)
+        || load.operands[2].as_imm() != Some(0)
     {
         return None;
     }
-    let addr = vreg_of(&load.operands[1])?;
+    let addr = load.operands[1].as_vreg()?;
     let madd_id = *def.get(&addr.id)?;
     if !loop_insts.contains(&madd_id) {
         return None;
@@ -1077,9 +1045,9 @@ fn chain_load_base(
     if madd.opcode != AArch64Opcode::Madd || madd.operands.len() != 4 {
         return None;
     }
-    let f1 = vreg_of(&madd.operands[1])?;
-    let f2 = vreg_of(&madd.operands[2])?;
-    let base = vreg_of(&madd.operands[3])?;
+    let f1 = madd.operands[1].as_vreg()?;
+    let f2 = madd.operands[2].as_vreg()?;
+    let base = madd.operands[3].as_vreg()?;
     let is_sext_iv = |factor: VReg| chain_is_sext_iv(func, def, loop_insts, factor, iv);
     let idx_ok = |factor: VReg| resolves_to_iv(func, def, factor, iv) || is_sext_iv(factor);
     let es_ok = |factor: VReg| const_value(func, def, factor) == Some(ELEM_BYTES);
@@ -1112,7 +1080,9 @@ fn chain_is_sext_iv(
     let inst = func.inst(id);
     inst.opcode == AArch64Opcode::Sxtw
         && inst.operands.len() == 2
-        && vreg_of(&inst.operands[1]).is_some_and(|s| resolves_to_iv(func, def, s, iv))
+        && inst.operands[1]
+            .as_vreg()
+            .is_some_and(|s| resolves_to_iv(func, def, s, iv))
 }
 
 /// Chain variant of [`byte_load_base`]: the byte (`memchr`, `.16B`) widening
@@ -1139,7 +1109,7 @@ fn chain_byte_load_base(
     if !matches!(ext.opcode, AArch64Opcode::Uxtb | AArch64Opcode::Sxtb) || ext.operands.len() != 2 {
         return None;
     }
-    let loaded = vreg_of(&ext.operands[1])?;
+    let loaded = ext.operands[1].as_vreg()?;
     if loaded.class != RegClass::Gpr32 {
         return None;
     }
@@ -1150,11 +1120,11 @@ fn chain_byte_load_base(
     let load = func.inst(load_id);
     if load.opcode != AArch64Opcode::LdrbRI
         || load.operands.len() != 3
-        || imm_of(&load.operands[2]) != Some(0)
+        || load.operands[2].as_imm() != Some(0)
     {
         return None;
     }
-    let addr = vreg_of(&load.operands[1])?;
+    let addr = load.operands[1].as_vreg()?;
     let addr_id = *def.get(&addr.id)?;
     if !loop_insts.contains(&addr_id) {
         return None;
@@ -1164,8 +1134,8 @@ fn chain_byte_load_base(
     let idx_ok = |factor: VReg| resolves_to_iv(func, def, factor, iv) || is_sext_iv(factor);
     let base = match addr_inst.opcode {
         AArch64Opcode::AddRR if addr_inst.operands.len() == 3 => {
-            let a = vreg_of(&addr_inst.operands[1])?;
-            let b = vreg_of(&addr_inst.operands[2])?;
+            let a = addr_inst.operands[1].as_vreg()?;
+            let b = addr_inst.operands[2].as_vreg()?;
             if idx_ok(a) {
                 b
             } else if idx_ok(b) {
@@ -1175,9 +1145,9 @@ fn chain_byte_load_base(
             }
         }
         AArch64Opcode::Madd if addr_inst.operands.len() == 4 => {
-            let f1 = vreg_of(&addr_inst.operands[1])?;
-            let f2 = vreg_of(&addr_inst.operands[2])?;
-            let base = vreg_of(&addr_inst.operands[3])?;
+            let f1 = addr_inst.operands[1].as_vreg()?;
+            let f2 = addr_inst.operands[2].as_vreg()?;
+            let base = addr_inst.operands[3].as_vreg()?;
             let es_ok = |f: VReg| const_value(func, def, f) == Some(ELEM_BYTES_B);
             if (idx_ok(f1) && es_ok(f2)) || (idx_ok(f2) && es_ok(f1)) {
                 base
@@ -1224,7 +1194,7 @@ fn recognize_search_match(
         .iter()
         .find(|&&id| func.inst(id).opcode == AArch64Opcode::BCond)?;
     let bcond = func.inst(bcond_id);
-    let cc = imm_of(&bcond.operands[0])?;
+    let cc = bcond.operands[0].as_imm()?;
     let br = insts
         .iter()
         .rev()
@@ -1253,8 +1223,8 @@ fn recognize_search_match(
     if cmp.opcode != AArch64Opcode::CmpRR {
         return None;
     }
-    let c0 = vreg_of(&cmp.operands[0])?;
-    let c1 = vreg_of(&cmp.operands[1])?;
+    let c0 = cmp.operands[0].as_vreg()?;
+    let c1 = cmp.operands[1].as_vreg()?;
     // One operand is the `a[iv]` load, the other the invariant key (either order;
     // i32 direct load, else the byte width's widening load — mutually exclusive
     // on the opcode).
@@ -1281,12 +1251,16 @@ fn recognize_search_match(
     None
 }
 
+/// What [`walk_find_chain`] proves of a forward chain: the agreed bound, the
+/// match `(base, key, is_byte)`, and the match exit `(block, target)`.
+type FindChain = (ChainBound, (VReg, VReg, bool), (BlockId, BlockId));
+
 /// Walk the chain header -> ... -> latch, classifying every block and proving
 /// SINGLE-N agreement, full coverage, and EXACTLY ONE equality match block.
-/// Returns `(bound, (base, key, is_byte))`. Fail-closed on any block off the
-/// header->latch structure, a limit disagreement, a missing/duplicate match, or
-/// an unclassifiable shape (e.g. an outer loop whose body contains a 2-in
-/// sub-block).
+/// Returns `(bound, (base, key, is_byte), (match block, match target))`.
+/// Fail-closed on any block off the header->latch structure, a limit
+/// disagreement, a missing/duplicate match, or an unclassifiable shape (e.g. an
+/// outer loop whose body contains a 2-in sub-block).
 #[allow(clippy::too_many_arguments)]
 fn walk_find_chain(
     func: &MachFunction,
@@ -1298,10 +1272,11 @@ fn walk_find_chain(
     latch: BlockId,
     iv: VReg,
     preheader: BlockId,
-) -> Option<(ChainBound, (VReg, VReg, bool))> {
-    let mut visited: HashSet<BlockId> = HashSet::new();
+) -> Option<FindChain> {
+    let mut visited: HashSet<BlockId> = HashSet::default();
     let mut bound: Option<ChainBound> = None;
     let mut mtch: Option<(VReg, VReg, bool)> = None;
+    let mut match_exit: Option<(BlockId, BlockId)> = None;
     let mut cur = header;
     for _ in 0..(body.len() + 1) {
         if !body.contains(&cur) || visited.contains(&cur) {
@@ -1337,6 +1312,7 @@ fn walk_find_chain(
                     return None; // EXACTLY ONE match block
                 }
                 mtch = Some((base, key, is_byte));
+                match_exit = Some((cur, *succs.iter().find(|s| !body.contains(s))?));
                 visited.insert(cur);
                 cur = cont;
             } else {
@@ -1353,7 +1329,7 @@ fn walk_find_chain(
     if visited.len() != body.len() {
         return None;
     }
-    Some((bound?, mtch?))
+    Some((bound?, mtch?, match_exit?))
 }
 
 /// Build a def map (`vreg id -> defining InstId`) considering ONLY instructions
@@ -1427,11 +1403,11 @@ fn is_increment_by_one(
     let inst = func.inst(id);
     match inst.opcode {
         AArch64Opcode::AddRI => {
-            vreg_of(&inst.operands[1]) == Some(iv) && imm_of(&inst.operands[2]) == Some(1)
+            inst.operands[1].as_vreg() == Some(iv) && inst.operands[2].as_imm() == Some(1)
         }
         AArch64Opcode::AddRR => {
-            let a = vreg_of(&inst.operands[1]);
-            let b = vreg_of(&inst.operands[2]);
+            let a = inst.operands[1].as_vreg();
+            let b = inst.operands[2].as_vreg();
             (a == Some(iv) && b.is_some_and(|b| const_value(func, def, b) == Some(1)))
                 || (b == Some(iv) && a.is_some_and(|a| const_value(func, def, a) == Some(1)))
         }
@@ -1715,7 +1691,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);
@@ -1726,10 +1702,6 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
     VReg::new(id, class)
 }
 
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    crate::effects::build_reaching_def_map(func)
-}
-
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
     for (idx, block) in func.blocks.iter().enumerate() {
         if block.insts.contains(&target) {
@@ -1737,16 +1709,6 @@ fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
         }
     }
     None
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|op| match op {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
 }
 
 fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {

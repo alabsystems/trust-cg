@@ -1,0 +1,10 @@
+{
+  "schema": "trust-cg.bridge-trust-ir-dump.v1",
+  "cgu": "trustcg_split_copy_k_xsh_8",
+  "kind": "Regular",
+  "target": "X86_64",
+  "opt_level": "O3",
+  "emit_proofs": false,
+  "panic_unwind": false,
+  "parallel": false
+}

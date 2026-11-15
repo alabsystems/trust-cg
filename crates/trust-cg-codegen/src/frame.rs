@@ -42,7 +42,18 @@
 //!   unwind compatibility.
 //! - Red zone (128 bytes below SP) is disabled by default.
 
-use trust_cg_ir::function::{MachFunction, StackSlot};
+mod eh_identity;
+mod instruction_view;
+mod zero_storage;
+
+use instruction_view::FrameInstructions;
+
+use std::collections::BTreeMap;
+use std::ops::Index;
+
+use trust_cg_ir::function::{
+    EhCallSiteBindings, EhCallSiteEntry, MachBlock, MachFunction, StackSlot,
+};
 use trust_cg_ir::inst::{AArch64Opcode, MachInst};
 use trust_cg_ir::operand::MachOperand;
 use trust_cg_ir::regs::{
@@ -99,10 +110,166 @@ const AARCH64_ADD_SUB_IMM12_MAX: u32 = 4095;
 pub(crate) const AARCH64_SP_ADJUST_CHUNK: u32 =
     (AARCH64_ADD_SUB_IMM12_MAX / STACK_ALIGNMENT) * STACK_ALIGNMENT;
 
-/// C-level Darwin arm64 symbol for the process stack guard.
-const DARWIN_STACK_CHK_GUARD: &str = "__stack_chk_guard";
-/// C-level Darwin arm64 symbol for the stack-check failure routine.
-const DARWIN_STACK_CHK_FAIL: &str = "__stack_chk_fail";
+/// C-level symbol for the process stack guard word. The Mach-O writer adds
+/// the leading underscore (`___stack_chk_guard`); ELF uses the name as is.
+/// Either way it is read through a GOT slot (see
+/// [`crate::pipeline::StackProtectorTargetAbi`]).
+pub const STACK_CHK_GUARD_SYMBOL: &str = trust_cg_lower::RuntimeSymbol::StackChkGuard.name();
+/// C-level symbol for the stack-check failure routine, called on mismatch.
+pub const STACK_CHK_FAIL_SYMBOL: &str = trust_cg_lower::RuntimeSymbol::StackChkFail.name();
+
+// ---------------------------------------------------------------------------
+// Stack probing (stack-clash protection)
+// ---------------------------------------------------------------------------
+//
+// Moving SP past the guard region below a thread stack without touching it
+// lets a later access land in whatever mapping lies below the guard, which
+// silently corrupts it instead of faulting. AArch64 frame lowering therefore
+// follows LLVM's `probe-stack=inline-asm` scheme, rustc's default on every
+// aarch64 target:
+//
+// * every nonzero frame begins with the callee-saved pre-index store
+//   (`stp ..., [sp, #-csa]!`), which touches the new SP;
+// * a static SP adjustment is allocated in `STACK_PROBE_INTERVAL` steps, each
+//   followed by `str xzr, [sp]` before the next decrement. Up to
+//   `STACK_PROBE_MAX_UNROLL` steps are emitted inline; more use a counted loop
+//   in its own block, after the frame pointer is established so the FP-based
+//   CFA stays valid in every iteration;
+// * the residual below one interval is probed when it exceeds
+//   `STACK_PROBE_MAX_UNPROBED`, or when a runtime-sized allocation may follow;
+// * a runtime-sized allocation walks SP down one interval at a time, probing
+//   each step, then sets SP to the target and probes it.
+//
+// Resulting invariant: consecutive stack touches made by one frame are at most
+// `STACK_PROBE_INTERVAL` bytes apart, and at most `STACK_PROBE_MAX_UNPROBED`
+// bytes above SP are untouched at any call, so a guard region of at least
+// `STACK_PROBE_INTERVAL` bytes cannot be stepped over. It relies on callers
+// keeping the same bound (trust-cg and LLVM inline-probing callers do); it
+// is tested, not proved. Deallocation needs no probes.
+
+/// Largest SP decrement between two stack touches. This is LLVM's AArch64
+/// `stack-probe-size` default; 4 KiB is the smallest guard region the scheme
+/// defends (4 KiB Linux pages), so 16 KiB Darwin and Linux pages are covered.
+pub const STACK_PROBE_INTERVAL: u32 = 4096;
+
+/// Most bytes a static allocation may leave untouched above SP
+/// (LLVM `AArch64::StackProbeMaxUnprobedStack`).
+pub const STACK_PROBE_MAX_UNPROBED: u32 = 1024;
+
+/// Most interval steps emitted inline before a probe loop is used
+/// (LLVM `AArch64::StackProbeMaxLoopUnroll`).
+pub const STACK_PROBE_MAX_UNROLL: u32 = 4;
+
+/// Loop counter for the static probe loop. IP0 is never allocated and never
+/// carries an argument, so it is free at function entry.
+const STACK_PROBE_COUNTER: PReg = X16;
+
+/// AArch64 condition codes used by the probe loops.
+const COND_NE: i64 = 0b0001;
+const COND_LS: i64 = 0b1001;
+
+/// How one static SP adjustment is allocated and probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticStackProbePlan {
+    /// Whole `STACK_PROBE_INTERVAL` steps, each followed by a probe.
+    pub steps: u32,
+    /// Whether the steps run as a loop (more than `STACK_PROBE_MAX_UNROLL`).
+    pub looped: bool,
+    /// Bytes allocated after the steps; always below one interval.
+    pub residual: u32,
+    /// Whether a probe follows the residual allocation.
+    pub residual_probe: bool,
+}
+
+impl StaticStackProbePlan {
+    /// Plan an SP adjustment of `adjustment` bytes. `runtime_allocation_follows`
+    /// forces a final probe so a later runtime-sized allocation starts at a
+    /// touched SP.
+    pub fn for_adjustment(adjustment: u32, runtime_allocation_follows: bool) -> Self {
+        let steps = adjustment / STACK_PROBE_INTERVAL;
+        let residual = adjustment % STACK_PROBE_INTERVAL;
+        Self {
+            steps,
+            looped: steps > STACK_PROBE_MAX_UNROLL,
+            residual,
+            residual_probe: residual > STACK_PROBE_MAX_UNPROBED
+                || (runtime_allocation_follows && residual > 0),
+        }
+    }
+
+    /// Plan the local-area adjustment emitted by [`emit_prologue`].
+    pub fn for_layout(layout: &FrameLayout) -> Self {
+        if prologue_is_red_zone_minimal(layout) {
+            return Self::for_adjustment(0, false);
+        }
+        Self::for_adjustment(layout.sp_adjustment(), layout.has_dynamic_alloc)
+    }
+
+    /// Number of `str xzr, [sp]` probes executed by the allocation.
+    pub fn probe_count(&self) -> u32 {
+        self.steps + u32::from(self.residual_probe)
+    }
+}
+
+/// One straight-line element of a static SP allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpAllocationStep {
+    /// `sub sp, sp, #bytes` (one encodable immediate chunk).
+    Sub(u32),
+    /// `str xzr, [sp]`.
+    Probe,
+}
+
+/// Fully unrolled static allocation of [`emit_prologue`]'s local area, one
+/// entry per emitted instruction. DWARF CFI for SP-based frames mirrors it.
+pub(crate) fn straight_line_sp_allocation(layout: &FrameLayout) -> Vec<SpAllocationStep> {
+    let plan = StaticStackProbePlan::for_layout(layout);
+    let mut steps = Vec::new();
+    for _ in 0..plan.steps {
+        push_sp_allocation_chunks(&mut steps, STACK_PROBE_INTERVAL);
+        steps.push(SpAllocationStep::Probe);
+    }
+    push_sp_allocation_chunks(&mut steps, plan.residual);
+    if plan.residual_probe {
+        steps.push(SpAllocationStep::Probe);
+    }
+    steps
+}
+
+fn push_sp_allocation_chunks(steps: &mut Vec<SpAllocationStep>, mut bytes: u32) {
+    while bytes > 0 {
+        let chunk = bytes.min(AARCH64_SP_ADJUST_CHUNK);
+        steps.push(SpAllocationStep::Sub(chunk));
+        bytes -= chunk;
+    }
+}
+
+fn prologue_is_red_zone_minimal(layout: &FrameLayout) -> bool {
+    layout.uses_red_zone && layout.sp_adjustment() == 0 && layout.callee_saved_pairs.len() <= 1
+}
+
+/// `STR XZR, [SP]`: touch the page SP now points into.
+fn make_stack_probe() -> MachInst {
+    MachInst::new(
+        AArch64Opcode::StrRI,
+        vec![
+            MachOperand::PReg(XZR),
+            MachOperand::Special(SpecialReg::SP),
+            MachOperand::Imm(0),
+        ],
+    )
+}
+
+/// Whether `inst` is the stack probe emitted by frame lowering.
+pub fn is_stack_probe(inst: &MachInst) -> bool {
+    inst.opcode == AArch64Opcode::StrRI
+        && inst.operands
+            == [
+                MachOperand::PReg(XZR),
+                MachOperand::Special(SpecialReg::SP),
+                MachOperand::Imm(0),
+            ]
+}
 
 // ---------------------------------------------------------------------------
 // CalleeSavedPair — a pair of registers saved/restored together
@@ -121,11 +288,11 @@ pub struct CalleeSavedPair {
     /// Legacy FP-relative ordering metadata for the saved pair.
     ///
     /// The prologue/epilogue do not consume this as the actual STP/LDP
-    /// displacement: after the initial pre-index save, FP is established at
-    /// the base of the callee-saved area and later pairs are addressed at
-    /// positive offsets from SP/FP in save-order. This field is kept for
-    /// layout tests and unwind metadata construction that reason about pair
-    /// order.
+    /// displacement. The Apple-canonical emitter puts FP/LR at the TOP of
+    /// the callee-saved area and establishes FP there; extra pairs are below
+    /// FP, with reversed register storage order. This field retains historical
+    /// pair-order values, not actual byte addresses. Use the emitted operands
+    /// and their checked word bindings for save-slot/frame proofs.
     pub fp_offset: i32,
     /// Whether this is an FPR pair (D-registers) vs GPR pair (X-registers).
     pub is_fpr: bool,
@@ -138,7 +305,7 @@ pub struct CalleeSavedPair {
 /// Complete description of a function's stack frame layout.
 ///
 /// Computed after register allocation, before prologue/epilogue insertion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameLayout {
     /// Callee-saved register pairs to save/restore (in save order).
     /// The first pair is always X29/X30 (FP/LR) when `uses_frame_pointer` is true.
@@ -147,10 +314,14 @@ pub struct FrameLayout {
     /// Total size of the callee-saved register area (bytes).
     pub callee_saved_area_size: u32,
 
-    /// Size of the spill slot area (from regalloc), in bytes.
+    /// Reserved area for ALL stack slots, including spills and addressable
+    /// locals, with downward-placement alignment padding. This does not imply
+    /// that the bytes are private or inaccessible to a callee.
     pub spill_area_size: u32,
 
-    /// Size of local variable area (alloca, aggregates), in bytes.
+    /// Separate local-area contribution. Current computation combines locals
+    /// into `spill_area_size` and sets this to zero; zero is not evidence that
+    /// the source has no local allocations or address-taken stack slots.
     pub local_area_size: u32,
 
     /// Size of outgoing argument area (max across all calls), in bytes.
@@ -174,8 +345,9 @@ pub struct FrameLayout {
 
     /// Offset from FP to the start of the spill/local area.
     /// On AArch64: FP points at the saved FP/LR pair after the callee-saved
-    /// area has already been allocated, so spill/local slots start
-    /// immediately below FP.
+    /// area has already been allocated. Extra saved pairs lie below FP, and
+    /// spill/local placement starts below the whole saved area, at
+    /// `FP - (callee_saved_area_size - 16)`.
     pub fp_to_spill_offset: i32,
 
     /// Whether this function uses runtime-sized stack allocation.
@@ -258,12 +430,17 @@ fn mark_callee_saved_reg(preg: PReg, gpr_used: &mut u16, fpr_used: &mut u8) {
 }
 
 #[inline]
+#[cfg(test)]
 fn scan_function(func: &MachFunction) -> ScanResult {
+    scan_instructions(&FrameInstructions::all(func))
+}
+
+fn scan_instructions(instructions: &FrameInstructions<'_>) -> ScanResult {
     let mut gpr_used = 0u16;
     let mut fpr_used = 0u8;
     let mut has_calls = false;
 
-    for inst in &func.insts {
+    for inst in instructions.iter() {
         // Check for call instructions.
         // A direct tail call consumes call arguments and clobbers caller-saved
         // registers, but it never returns and does not write LR. It therefore
@@ -322,9 +499,9 @@ fn scan_function(func: &MachFunction) -> ScanResult {
 /// base DOWN to that slot's own alignment, every slot beneath the canary keeps
 /// the alignment it would have had without it, with no separate padding logic.
 ///
-/// Fail-closed: an out-of-range `stack_protector_slot` index is ignored, which
-/// degrades to plain allocation order in BOTH walkers rather than panicking or
-/// desynchronizing them.
+/// Out-of-range metadata uses plain order in both read-only layout walkers.
+/// That alone is not fail-closed guard admission: preparation and prologue
+/// insertion reject malformed required guard storage before changing code.
 fn stack_slot_layout_order(func: &MachFunction) -> impl Iterator<Item = usize> + '_ {
     let slot_count = func.stack_slots.len();
     let protector = func
@@ -355,28 +532,64 @@ fn stack_slot_layout_order(func: &MachFunction) -> impl Iterator<Item = usize> +
 /// align<=16 slots; over-aligned slots get a conservative slack (the real anchor
 /// is only guaranteed 16-aligned).
 #[inline]
-fn compute_stack_slot_area(func: &MachFunction) -> u32 {
-    let mut offset: i32 = 0;
+fn compute_stack_slot_area(func: &MachFunction) -> Result<u32, crate::lower::LowerError> {
+    let (extent, max_align) = checked_stack_slot_extent(func, 0)?;
+    // Preserve the existing slack for an anchor guaranteed only 16-byte alignment.
+    extent
+        .checked_add(max_align - STACK_ALIGNMENT)
+        .ok_or_else(|| frame_layout_overflow("over-aligned stack-slot area"))
+}
+
+fn frame_layout_overflow(detail: &str) -> crate::lower::LowerError {
+    crate::lower::LowerError::FrameLowering(format!("frame layout overflow: {detail}"))
+}
+
+fn checked_frame_align(value: u32) -> Result<u32, crate::lower::LowerError> {
+    value
+        .checked_add(STACK_ALIGNMENT - 1)
+        .map(|value| value & !(STACK_ALIGNMENT - 1))
+        .ok_or_else(|| frame_layout_overflow("16-byte alignment"))
+}
+
+/// Validate the exact downward placement used by stack_slot_frame_offsets.
+/// Its public offset domain is i32, including the real CSA-dependent anchor.
+/// Validate the operands of its existing i32 casts as well as the result:
+/// size/align=2^31 is not interchangeable with a positive signed operand.
+fn checked_stack_slot_extent(
+    func: &MachFunction,
+    anchor: i32,
+) -> Result<(u32, u32), crate::lower::LowerError> {
+    let mut offset = i64::from(anchor);
     let mut max_align: u32 = STACK_ALIGNMENT;
     for idx in stack_slot_layout_order(func) {
         let slot = &func.stack_slots[idx];
+        if !slot.align.is_power_of_two() {
+            return Err(crate::lower::LowerError::FrameLowering(format!(
+                "frame layout invalid alignment {} for stack slot {idx}",
+                slot.align
+            )));
+        }
         if slot.is_runtime_sized() {
             continue;
         }
-        // Grow downward: subtract size, then round the base DOWN to alignment —
-        // identical to `stack_slot_frame_offsets`.
-        offset -= slot.size as i32;
-        let align = slot.align as i32;
-        if align > 0 {
-            offset &= !(align - 1);
+        if i32::try_from(slot.size).is_err() || i32::try_from(slot.align).is_err() {
+            return Err(frame_layout_overflow(
+                "fixed stack-slot size/alignment exceeds signed FP domain",
+            ));
         }
+        offset = offset
+            .checked_sub(i64::from(slot.size))
+            .ok_or_else(|| frame_layout_overflow("downward stack-slot subtraction"))?;
+        offset &= !(i64::from(slot.align) - 1);
+        i32::try_from(offset)
+            .map_err(|_| frame_layout_overflow("CSA-anchored stack-slot offset exceeds i32"))?;
         max_align = max_align.max(slot.align);
     }
-    let extent = (-offset) as u32;
-    // Over-aligned slots (> 16B) may need more padding than the anchored-at-0
-    // computation shows, because the real anchor is only 16-aligned; reserve the
-    // difference so the lowest slot can never fall below SP.
-    extent + (max_align - STACK_ALIGNMENT)
+    let extent = i64::from(anchor)
+        .checked_sub(offset)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| frame_layout_overflow("stack-slot extent"))?;
+    Ok((extent, max_align))
 }
 
 /// Returns true when any stack slot requires runtime sizing.
@@ -397,8 +610,8 @@ pub fn function_has_dynamic_stack_alloc_pseudos(func: &MachFunction) -> bool {
 }
 
 #[inline]
-fn function_has_frame_pointer_dependencies(func: &MachFunction) -> bool {
-    func.insts.iter().any(|inst| {
+fn instructions_have_frame_pointer_dependencies(instructions: &FrameInstructions<'_>) -> bool {
+    instructions.iter().any(|inst| {
         inst.implicit_defs.contains(&X29)
             || inst.implicit_uses.contains(&X29)
             || inst.operands.iter().any(|operand| match operand {
@@ -425,14 +638,49 @@ fn function_has_frame_pointer_dependencies(func: &MachFunction) -> bool {
 /// slack term also stays 0, since 16 == `STACK_ALIGNMENT`.
 ///
 /// Note this only changes the slot's LAYOUT position; the slot ID is still
-/// handed out in allocation order by `alloc_stack_slot`.
-pub fn ensure_stack_protector_slot(func: &mut MachFunction) {
-    if !func.stack_protector.is_enabled() || func.stack_protector_slot.is_some() {
-        return;
+/// handed out in allocation order by `try_alloc_stack_slot`.
+pub fn ensure_stack_protector_slot(
+    func: &mut MachFunction,
+) -> Result<(), crate::lower::LowerError> {
+    if !func.stack_protector.is_enabled() {
+        return Ok(());
     }
-
-    let slot = func.alloc_stack_slot(StackSlot::new(8, STACK_ALIGNMENT));
+    if func.stack_protector_slot.is_some() {
+        checked_stack_protector_slot(func)?;
+        return Ok(());
+    }
+    let slot = func
+        .try_alloc_stack_slot(StackSlot::new(8, STACK_ALIGNMENT))
+        .ok_or_else(|| {
+            crate::lower::LowerError::FrameLowering(
+                "stack guard slot ID domain exhausted".to_string(),
+            )
+        })?;
     func.stack_protector_slot = Some(slot);
+    Ok(())
+}
+
+/// The protector owns a fixed eight-byte value in one aligned stack granule.
+/// An arbitrary existing local or dynamic allocation is not equivalent guard
+/// storage. Public IR metadata must satisfy the same shape as preparation.
+fn checked_stack_protector_slot(func: &MachFunction) -> Result<usize, crate::lower::LowerError> {
+    let error = |detail: &str| {
+        crate::lower::LowerError::FrameLowering(format!(
+            "invalid stack guard reservation: {detail}"
+        ))
+    };
+    let id = func
+        .stack_protector_slot
+        .ok_or_else(|| error("missing slot"))?;
+    let index = id.0 as usize;
+    let slot = func
+        .stack_slots
+        .get(index)
+        .ok_or_else(|| error("slot ID is outside the arena"))?;
+    if slot.is_runtime_sized() || slot.size != 8 || slot.align != STACK_ALIGNMENT {
+        return Err(error("expected a fixed 8-byte, 16-aligned slot"));
+    }
+    Ok(index)
 }
 
 /// Compute the maximum outgoing stack-argument area needed by any call site.
@@ -440,7 +688,10 @@ pub fn ensure_stack_protector_slot(func: &mut MachFunction) {
 /// ISel emits outgoing stack arguments as `STR{,B,H}` / `STP` with a base of
 /// `PReg(SP)` (or `Special(SP)`) and a non-negative immediate offset. This
 /// helper scans every instruction and returns the high-water mark of
-/// `offset + access_size` across all such stores.
+/// `offset + access_size` across valid such stores, including volatile scalar
+/// aliases and the full S/D/Q transfer width. Writeback pairs are not outgoing
+/// argument stores. Malformed or unrepresentable intents get no area credit;
+/// their eventual encoder admission is still required.
 ///
 /// This runs BEFORE [`eliminate_frame_indices`], so spill stores are still
 /// encoded as `FrameIndex`/`StackSlot` operands and do not use `PReg(SP)`
@@ -451,25 +702,40 @@ pub fn ensure_stack_protector_slot(func: &mut MachFunction) {
 /// so the caller can safely subtract it from SP on entry without misaligning
 /// the stack.
 pub fn compute_max_outgoing_arg_size(func: &MachFunction) -> u32 {
+    instructions_max_outgoing_arg_size(&FrameInstructions::all(func))
+}
+
+fn instructions_max_outgoing_arg_size(instructions: &FrameInstructions<'_>) -> u32 {
     use AArch64Opcode::*;
 
-    let mut max_end: i64 = 0;
-    for inst in &func.insts {
-        // Access size in bytes keyed off opcode. StrRI covers both 32- and
-        // 64-bit variants depending on source register class; we conservatively
-        // assume 8 bytes (worst case). StpRI pair is 16 bytes.
-        let (base_idx, offset_idx, access_size) = match inst.opcode {
-            StrRI => (1, 2, 8),
-            StrbRI => (1, 2, 1),
-            StrhRI => (1, 2, 2),
-            // StpRI layout: [Rt, Rt2, base, Imm(offset)] — 16 bytes total.
-            StpRI => (2, 3, 16),
+    let mut max_end = 0u32;
+    for inst in instructions.iter() {
+        let (base_idx, offset, access_size) = match inst.opcode {
+            StpRI => {
+                let Ok(pair) = crate::aarch64::encode::pair_memory_descriptor(inst) else {
+                    continue;
+                };
+                (2, pair.offset, 2 * i64::from(pair.element_bytes))
+            }
+            StrRI | StrbRI | StrhRI | VolatileStrRI | VolatileStrbRI | VolatileStrhRI => {
+                // Resolved scalar producers admit an omitted zero offset or
+                // one actual immediate. SP is checked below; unresolved spill
+                // slots and MemOp operands are not outgoing-argument shapes.
+                if !matches!(inst.operands.len(), 2 | 3) {
+                    continue;
+                }
+                let offset = match inst.operands.get(2) {
+                    None => 0,
+                    Some(MachOperand::Imm(offset)) => *offset,
+                    _ => continue,
+                };
+                let Some(size) = crate::aarch64::encode::scalar_ri_mem_scale(inst) else {
+                    continue;
+                };
+                (1, offset, size)
+            }
             _ => continue,
         };
-
-        if inst.operands.len() <= offset_idx {
-            continue;
-        }
 
         // Base must be SP (either PReg(SP) or Special(SP)).
         let base_is_sp = match &inst.operands[base_idx] {
@@ -481,20 +747,26 @@ pub fn compute_max_outgoing_arg_size(func: &MachFunction) -> u32 {
             continue;
         }
 
-        // Offset must be a non-negative literal immediate (not an IncomingArg
-        // marker or FrameIndex; those never reach this point on SP bases).
-        if let MachOperand::Imm(off) = &inst.operands[offset_idx]
-            && *off >= 0
-        {
-            let end = *off + access_size as i64;
-            if end > max_end {
-                max_end = end;
-            }
+        if offset < 0 {
+            continue;
+        }
+        // A pair descriptor has bounded imm7; scalar producers may await
+        // large-offset legalization. Neither may overflow or narrow-wrap the
+        // u32 frame-size domain, including its final 16-byte rounding.
+        let Some(rounded_end) = offset
+            .checked_add(access_size)
+            .and_then(|end| end.checked_add(15))
+            .and_then(|end| u32::try_from(end).ok())
+            .map(|end| end & !15)
+        else {
+            continue;
+        };
+        if rounded_end > max_end {
+            max_end = rounded_end;
         }
     }
 
-    // Round up to 16-byte alignment for AArch64 SP requirements.
-    align_up(max_end as u32, 16)
+    max_end
 }
 
 /// Compute the complete frame layout for a function.
@@ -506,12 +778,18 @@ pub fn compute_max_outgoing_arg_size(func: &MachFunction) -> u32 {
 /// * `func` — The machine function (post-regalloc).
 /// * `outgoing_arg_size` — Maximum outgoing argument area across all call sites.
 /// * `enable_red_zone` — Whether to consider red zone optimization for leaf functions.
+///
+/// # Panics
+/// Compatibility entrypoint for representable, well-aligned layouts. Panics
+/// on invalid alignment or frame/FP-offset overflow; compiler Result paths
+/// must use [`try_compute_frame_layout`] instead.
 pub fn compute_frame_layout(
     func: &MachFunction,
     outgoing_arg_size: u32,
     enable_red_zone: bool,
 ) -> FrameLayout {
-    compute_frame_layout_inner(func, outgoing_arg_size, enable_red_zone, false)
+    try_compute_frame_layout(func, outgoing_arg_size, enable_red_zone)
+        .expect("compute_frame_layout requires a representable frame")
 }
 
 /// Compute the complete frame layout for a function with runtime-sized stack allocation.
@@ -519,45 +797,146 @@ pub fn compute_frame_layout(
 /// Like [`compute_frame_layout`] but explicitly marks the frame as having
 /// runtime-sized stack allocation. Trust Codegen currently routes these layouts
 /// through DWARF CFI fallback for unwind encoding.
+///
+/// # Panics
+/// Same compatibility precondition as [`compute_frame_layout`]. Fallible
+/// consumers must use [`try_compute_frame_layout_dynamic`].
 pub fn compute_frame_layout_dynamic(
     func: &MachFunction,
     outgoing_arg_size: u32,
     enable_red_zone: bool,
 ) -> FrameLayout {
-    compute_frame_layout_inner(func, outgoing_arg_size, enable_red_zone, true)
+    try_compute_frame_layout_dynamic(func, outgoing_arg_size, enable_red_zone)
+        .expect("compute_frame_layout_dynamic requires a representable frame")
 }
 
-fn compute_frame_layout_inner(
+/// Compute a layout without wrapping or panicking on frame arithmetic.
+pub fn try_compute_frame_layout(
     func: &MachFunction,
     outgoing_arg_size: u32,
     enable_red_zone: bool,
+) -> Result<FrameLayout, crate::lower::LowerError> {
+    try_compute_frame_layout_inner(
+        FrameInstructions::all(func),
+        outgoing_arg_size,
+        enable_red_zone,
+        false,
+        LeafFramePolicy::Keep,
+    )
+}
+
+/// Checked layout with runtime-sized stack allocation explicitly enabled.
+pub fn try_compute_frame_layout_dynamic(
+    func: &MachFunction,
+    outgoing_arg_size: u32,
+    enable_red_zone: bool,
+) -> Result<FrameLayout, crate::lower::LowerError> {
+    try_compute_frame_layout_inner(
+        FrameInstructions::all(func),
+        outgoing_arg_size,
+        enable_red_zone,
+        true,
+        LeafFramePolicy::Keep,
+    )
+}
+
+/// Frame-record policy, independent of whether the target has a red zone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafFramePolicy {
+    /// Preserve the existing target/red-zone layout behavior.
+    Keep,
+    /// Also omit the frame for audited leaves requiring no stack storage.
+    /// ADD/SUB/immediate-LSL bodies and constant/copy returns keep the
+    /// sixteen-byte FP/LR envelope through which the verifier's source-bound
+    /// frame owner binds their complete body.
+    OmitZeroStorage,
+    /// Apply the ordinary zero-storage audit without keeping an envelope for
+    /// the frame-bound proof owner. The caller's source is either outside that
+    /// owner's domain or has independently checked frameless return/control
+    /// binding. This selects layout only and grants no instruction proof.
+    OmitZeroStorageWithoutFrameOwner,
+}
+
+/// Checked layout with an explicit leaf-frame policy. Runtime allocations are
+/// detected from both stack-slot declarations and machine instructions.
+pub fn try_compute_frame_layout_with_leaf_policy(
+    func: &MachFunction,
+    outgoing_arg_size: u32,
+    enable_red_zone: bool,
+    leaf_policy: LeafFramePolicy,
+) -> Result<FrameLayout, crate::lower::LowerError> {
+    try_compute_frame_layout_inner(
+        FrameInstructions::all(func),
+        outgoing_arg_size,
+        enable_red_zone,
+        false,
+        leaf_policy,
+    )
+}
+
+/// Production frame effects come from exactly the validated emitted layout.
+/// Public compatibility queries retain their whole-arena input contract.
+pub(crate) fn try_compute_emitted_frame_layout(
+    func: &MachFunction,
+    enable_red_zone: bool,
+    leaf_policy: LeafFramePolicy,
+) -> Result<FrameLayout, crate::lower::LowerError> {
+    let instructions = FrameInstructions::emitted(func)?;
+    let outgoing_arg_size = instructions_max_outgoing_arg_size(&instructions);
+    try_compute_frame_layout_inner(
+        instructions,
+        outgoing_arg_size,
+        enable_red_zone,
+        false,
+        leaf_policy,
+    )
+}
+
+fn try_compute_frame_layout_inner(
+    instructions: FrameInstructions<'_>,
+    outgoing_arg_size: u32,
+    enable_red_zone: bool,
     has_dynamic_alloc: bool,
-) -> FrameLayout {
+    leaf_policy: LeafFramePolicy,
+) -> Result<FrameLayout, crate::lower::LowerError> {
+    let func = instructions.function();
     let has_dynamic_alloc = has_dynamic_alloc
         || function_has_runtime_stack_slots(func)
-        || function_has_dynamic_stack_alloc_pseudos(func);
+        || instructions.iter().any(is_dynamic_stack_alloc_pseudo);
 
     // Single-pass scan replaces three separate iterations.
-    let scan = scan_function(func);
+    let scan = scan_instructions(&instructions);
     let is_leaf = !scan.has_calls;
 
     // Callee-saved register usage from merged scan.
     let gpr_used = scan.gpr_used;
     let fpr_used = scan.fpr_used;
 
-    let has_frame_pointer_dependencies = function_has_frame_pointer_dependencies(func);
+    let has_frame_pointer_dependencies =
+        instructions_have_frame_pointer_dependencies(&instructions);
     let has_stack_protector_frame_dependency =
         func.stack_protector.is_enabled() || func.stack_protector_slot.is_some();
-    let raw_stack_slot_area = compute_stack_slot_area(func);
+    let raw_stack_slot_area = compute_stack_slot_area(func)?;
 
     // Outgoing argument area (only non-leaf functions need this).
     let outgoing_arg_area_size = if is_leaf {
         0
     } else {
-        align_up(outgoing_arg_size, STACK_ALIGNMENT)
+        checked_frame_align(outgoing_arg_size)?
     };
 
-    let can_use_zero_frame = enable_red_zone
+    let omit_zero_storage = match leaf_policy {
+        LeafFramePolicy::Keep => false,
+        LeafFramePolicy::OmitZeroStorage => {
+            outgoing_arg_size == 0
+                && zero_storage::eligible(&instructions, zero_storage::OwnerEnvelopes::Keep)
+        }
+        LeafFramePolicy::OmitZeroStorageWithoutFrameOwner => {
+            outgoing_arg_size == 0
+                && zero_storage::eligible(&instructions, zero_storage::OwnerEnvelopes::Independent)
+        }
+    };
+    let can_use_zero_frame = (enable_red_zone || omit_zero_storage)
         && is_leaf
         && !has_dynamic_alloc
         && outgoing_arg_area_size == 0
@@ -633,8 +1012,11 @@ fn compute_frame_layout_inner(
     let callee_saved_area_size = (pairs.len() as u32) * 16;
 
     // Total frame = callee-saved + stack slots + outgoing args, aligned to 16.
-    let raw_total = callee_saved_area_size + stack_slot_area + outgoing_arg_area_size;
-    let total_frame_size = align_up(raw_total, STACK_ALIGNMENT);
+    let raw_total = callee_saved_area_size
+        .checked_add(stack_slot_area)
+        .and_then(|total| total.checked_add(outgoing_arg_area_size))
+        .ok_or_else(|| frame_layout_overflow("saved registers + slots + outgoing arguments"))?;
+    let total_frame_size = checked_frame_align(raw_total)?;
 
     // Red zone: leaf function with no stack slots and total frame <= 128 bytes.
     let uses_red_zone = enable_red_zone
@@ -650,8 +1032,11 @@ fn compute_frame_layout_inner(
     // The spill area therefore starts at `FP - (csa - 16)`. (For FP/LR-only
     // frames, csa == 16 and this is 0 — unchanged from the historical model.)
     let fp_to_spill_offset = -((callee_saved_area_size as i32) - 16);
+    // A zero-based extent alone does not prove that every actual FP-relative
+    // slot survives the additional saved-register displacement in i32.
+    checked_stack_slot_extent(func, fp_to_spill_offset)?;
 
-    FrameLayout {
+    Ok(FrameLayout {
         callee_saved_pairs: pairs,
         callee_saved_area_size,
         spill_area_size: stack_slot_area,
@@ -663,7 +1048,7 @@ fn compute_frame_layout_inner(
         uses_red_zone,
         fp_to_spill_offset,
         has_dynamic_alloc,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -686,35 +1071,106 @@ fn compute_frame_layout_inner(
 /// stp  d8,  d9,  [sp, #N]
 /// ...
 ///
-/// ; Allocate local + spill + outgoing arg space
+/// ; Allocate local + spill + outgoing arg space, probing every
+/// ; STACK_PROBE_INTERVAL bytes (see "Stack probing" above)
 /// sub  sp, sp, #(total_frame - callee_saved_area)
 /// ```
 ///
-/// Returns the generated instructions in order.
+/// Returns the straight-line instructions in order. A frame whose plan needs
+/// a probe loop is returned here with every probe step unrolled; frame
+/// insertion emits the equivalent counted loop in its own block instead.
 pub fn emit_prologue(layout: &FrameLayout) -> Vec<MachInst> {
-    // Pre-allocate: worst case is 1 (STP pre-index) + 1 (MOV FP) + N-1 (STP pairs) + 1 (SUB SP)
-    let capacity = layout.callee_saved_pairs.len() + 2;
-    let mut insts = Vec::with_capacity(capacity);
+    let parts = emit_prologue_parts(layout, true);
+    debug_assert!(parts.probe_loop.is_none());
+    let mut insts = parts.head;
+    insts.extend(parts.tail);
+    insts
+}
 
-    if layout.uses_red_zone && layout.sp_adjustment() == 0 && layout.callee_saved_pairs.len() <= 1 {
+/// Prologue instructions around an optional static probe loop.
+struct PrologueParts {
+    /// Callee-saved stores, frame-pointer setup, unrolled probe steps and,
+    /// for a looped plan, the loop-counter setup.
+    head: Vec<MachInst>,
+    /// How many leading `head` instructions are the callee-saved stores and
+    /// the frame-pointer setup: the point where a U10 stack-limit check goes,
+    /// before any probe, counter or SP adjustment.
+    csa_len: usize,
+    /// One loop iteration: allocate one interval, probe it and decrement the
+    /// counter. Frame insertion appends the backward `B.NE` to its block.
+    probe_loop: Option<Vec<MachInst>>,
+    /// Residual allocation and its probe.
+    tail: Vec<MachInst>,
+}
+
+fn emit_prologue_parts(layout: &FrameLayout, unroll_all: bool) -> PrologueParts {
+    // Worst case without probes: CSA stores + FP setup + one SUB SP.
+    let capacity = layout.callee_saved_pairs.len() + 2;
+    let mut head = Vec::with_capacity(capacity);
+
+    if prologue_is_red_zone_minimal(layout) {
         // Red zone: minimal prologue for trivial leaf functions.
         // Still save FP/LR if frame pointer is used (Apple requires it).
         if layout.uses_frame_pointer && !layout.callee_saved_pairs.is_empty() {
             // STP X29, X30, [SP, #-16]!
-            insts.push(make_stp_pre_index(X29, X30, -16_i64));
+            head.push(make_stp_pre_index(X29, X30, -16_i64));
             // MOV X29, SP
-            insts.push(make_mov_sp_to_fp());
+            head.push(make_mov_sp_to_fp());
         }
-        return insts;
+        return PrologueParts {
+            csa_len: head.len(),
+            head,
+            probe_loop: None,
+            tail: Vec::new(),
+        };
     }
 
-    if layout.callee_saved_pairs.is_empty() {
-        // No callee-saves — just allocate the frame.
-        let adj = layout.sp_adjustment();
-        push_sub_sp_imm(&mut insts, adj);
-        return insts;
+    if !layout.callee_saved_pairs.is_empty() {
+        emit_callee_saved_prologue(layout, &mut head);
     }
+    let csa_len = head.len();
 
+    // Allocate locals + spills + outgoing args.
+    let plan = StaticStackProbePlan::for_layout(layout);
+    let probe_step = |insts: &mut Vec<MachInst>| {
+        push_sub_sp_imm(insts, STACK_PROBE_INTERVAL);
+        insts.push(make_stack_probe());
+    };
+    let probe_loop = if plan.looped && !unroll_all {
+        emit_materialize_u64(STACK_PROBE_COUNTER, u64::from(plan.steps), &mut head);
+        let mut body = Vec::with_capacity(4);
+        probe_step(&mut body);
+        body.push(MachInst::new(
+            AArch64Opcode::SubsRI,
+            vec![
+                MachOperand::PReg(STACK_PROBE_COUNTER),
+                MachOperand::PReg(STACK_PROBE_COUNTER),
+                MachOperand::Imm(1),
+            ],
+        ));
+        Some(body)
+    } else {
+        for _ in 0..plan.steps {
+            probe_step(&mut head);
+        }
+        None
+    };
+    let mut tail = Vec::with_capacity(2);
+    push_sub_sp_imm(&mut tail, plan.residual);
+    if plan.residual_probe {
+        tail.push(make_stack_probe());
+    }
+    PrologueParts {
+        head,
+        csa_len,
+        probe_loop,
+        tail,
+    }
+}
+
+/// Emit the callee-saved stores and frame-pointer setup of a frame with at
+/// least one saved pair.
+fn emit_callee_saved_prologue(layout: &FrameLayout, insts: &mut Vec<MachInst>) {
     // Apple-canonical `UNWIND_ARM64_MODE_FRAME` layout. The compact unwinder
     // (libunwind `stepWithCompactEncodingFrame`) and the C++ personality assume
     // FP/LR sit at the TOP of the callee-saved area (`[FP]`/`[FP+8]`) with the
@@ -767,14 +1223,6 @@ pub fn emit_prologue(layout: &FrameLayout) -> Vec<MachInst> {
     if layout.uses_frame_pointer {
         insts.push(make_add_fp_sp_imm(csa - 16));
     }
-
-    // Allocate locals + spills + outgoing args.
-    let sp_adj = layout.sp_adjustment();
-    if sp_adj > 0 {
-        push_sub_sp_imm(&mut insts, sp_adj);
-    }
-
-    insts
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +1260,16 @@ pub fn emit_epilogue(layout: &FrameLayout) -> Vec<MachInst> {
         if layout.uses_frame_pointer && !layout.callee_saved_pairs.is_empty() {
             // LDP X29, X30, [SP], #16
             insts.push(make_ldp_post_index(X29, X30, 16));
+        }
+        insts.push(make_ret());
+        return insts;
+    }
+
+    // A frameless leaf has no FP/LR pair to restore. This also mirrors the
+    // prologue for fixed SP-only layouts, without relying on red-zone support.
+    if layout.callee_saved_pairs.is_empty() {
+        if layout.sp_adjustment() > 0 {
+            push_add_sp_imm(&mut insts, layout.sp_adjustment());
         }
         insts.push(make_ret());
         return insts;
@@ -891,19 +1349,29 @@ fn emit_epilogue_before_tail_branch(layout: &FrameLayout) -> Vec<MachInst> {
     insts
 }
 
-fn stack_protector_frame_offset(func: &MachFunction, layout: &FrameLayout) -> Option<i32> {
+fn stack_protector_frame_offset(
+    func: &MachFunction,
+    layout: &FrameLayout,
+) -> Result<Option<i32>, crate::lower::LowerError> {
     if !func.stack_protector.is_enabled() {
-        return None;
+        return Ok(None);
     }
-    let slot = func.stack_protector_slot?;
-    assert!(
-        layout.uses_frame_pointer,
-        "stack protector guard slot requires a frame pointer"
-    );
-    stack_slot_frame_offsets(func, layout)
-        .get(slot.0 as usize)
+    let slot = checked_stack_protector_slot(func)?;
+    if !layout.uses_frame_pointer {
+        return Err(crate::lower::LowerError::FrameLowering(
+            "stack protector guard slot requires a frame pointer".to_string(),
+        ));
+    }
+    let offset = stack_slot_frame_offsets(func, layout)
+        .get(slot)
         .copied()
         .flatten()
+        .ok_or_else(|| {
+            crate::lower::LowerError::FrameLowering(
+                "stack guard has no fixed frame offset".to_string(),
+            )
+        })?;
+    Ok(Some(offset))
 }
 
 fn stack_chk_guard_address_sequence(dst: PReg) -> [MachInst; 2] {
@@ -912,7 +1380,7 @@ fn stack_chk_guard_address_sequence(dst: PReg) -> [MachInst; 2] {
             AArch64Opcode::Adrp,
             vec![
                 MachOperand::PReg(dst),
-                MachOperand::Symbol(DARWIN_STACK_CHK_GUARD.to_string()),
+                MachOperand::Symbol(STACK_CHK_GUARD_SYMBOL.to_string()),
             ],
         ),
         MachInst::new(
@@ -920,7 +1388,7 @@ fn stack_chk_guard_address_sequence(dst: PReg) -> [MachInst; 2] {
             vec![
                 MachOperand::PReg(dst),
                 MachOperand::PReg(dst),
-                MachOperand::Symbol(DARWIN_STACK_CHK_GUARD.to_string()),
+                MachOperand::Symbol(STACK_CHK_GUARD_SYMBOL.to_string()),
             ],
         ),
     ]
@@ -982,16 +1450,508 @@ fn emit_stack_protector_check(slot_offset: i32, fail_block: BlockId) -> Vec<Mach
     insts
 }
 
-fn append_stack_chk_fail_block(func: &mut MachFunction) -> BlockId {
-    let fail_block = func.create_block();
-    let call = func.push_inst(MachInst::new(
-        AArch64Opcode::Bl,
-        vec![MachOperand::Symbol(DARWIN_STACK_CHK_FAIL.to_string())],
+// ---------------------------------------------------------------------------
+// U10 prologue stack-limit check (docs/u10-prologue-stack-limit.md §3-§4)
+// ---------------------------------------------------------------------------
+
+/// AArch64 condition `LO` (unsigned lower, `CC`).
+const COND_LO: i64 = 0b0011;
+
+/// A stack-limit check frame insertion will emit.
+struct StackLimitFramePlan {
+    limit: trust_cg_ir::MachStackLimit,
+    /// `F`: the SP adjustment after the callee-saved area.
+    sp_adj: u32,
+}
+
+/// Admit `func`'s stack-limit request against its layout, before any edit.
+///
+/// `None` when nothing is requested, or when the frame is zero (`total ==
+/// 0`): such a function writes no stack, so the check is elided and the
+/// verifier certifies the elision. A frame needs the callee-saved prologue
+/// the check follows (every nonzero frame has its FP record); a runtime-sized
+/// allocation is refused in v1, because its SP decrements happen after the
+/// check with sizes the check cannot cover.
+fn stack_limit_frame_plan(
+    func: &MachFunction,
+    layout: &FrameLayout,
+) -> Result<Option<StackLimitFramePlan>, crate::lower::LowerError> {
+    let Some(limit) = &func.stack_limit else {
+        return Ok(None);
+    };
+    if layout.total_frame_size == 0 {
+        return Ok(None);
+    }
+    if layout.has_dynamic_alloc {
+        return Err(frame_insertion_error(
+            "[TCG-A64-STACK-LIMIT] a runtime-sized stack allocation cannot be covered by the \
+             prologue stack-limit check in v1",
+        ));
+    }
+    if !layout.uses_frame_pointer || layout.callee_saved_pairs.is_empty() {
+        return Err(frame_insertion_error(
+            "[TCG-A64-STACK-LIMIT] a nonzero frame without a frame record has no place for the \
+             prologue stack-limit check",
+        ));
+    }
+    Ok(Some(StackLimitFramePlan {
+        limit: limit.clone(),
+        sp_adj: layout.sp_adjustment(),
+    }))
+}
+
+/// The check that follows the callee-saved prologue. With `P` = SP there
+/// (`S − csa`) and `F = sp_adj`, it branches to `overflow` exactly when
+/// `P − F <ℤ L` (`(P <u L) ∨ (P − L <u F)`):
+///
+/// ```text
+///   ldr  x17, [x<k>, #off]   // Pointee; Value reads x<k> directly
+///   subs x16, sp, x17        // extended register: P − L, C clear iff P <u L
+///   b.lo overflow
+///   cmp  x16, #F             // F > 4095: movz/movk x17, #F; cmp x16, x17
+///   b.lo overflow
+/// ```
+///
+/// With `F == 0` it is `subs xzr, sp, x17` (`cmp sp, x17`) and one `b.lo`.
+/// X16 and X17 are IP0/IP1: never allocated, never an argument, dead at
+/// entry (the protector and the probes use them the same way).
+fn emit_stack_limit_check(
+    limit: &trust_cg_ir::MachStackLimit,
+    sp_adj: u32,
+    overflow: BlockId,
+) -> Vec<MachInst> {
+    use trust_cg_ir::StackLimitSource;
+    let mut insts = Vec::with_capacity(7);
+    let source = match limit.request.source {
+        StackLimitSource::Value => limit.limit_reg,
+        StackLimitSource::Pointee { offset } => {
+            insts.push(MachInst::new(
+                AArch64Opcode::LdrRI,
+                vec![
+                    MachOperand::PReg(X17),
+                    MachOperand::PReg(limit.limit_reg),
+                    MachOperand::Imm(i64::from(offset)),
+                ],
+            ));
+            X17
+        }
+    };
+    let branch = || {
+        MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Imm(COND_LO), MachOperand::Block(overflow)],
+        )
+    };
+    let difference = if sp_adj == 0 {
+        MachOperand::Special(SpecialReg::XZR)
+    } else {
+        MachOperand::PReg(X16)
+    };
+    insts.push(MachInst::new(
+        AArch64Opcode::SubsRR,
+        vec![
+            difference,
+            MachOperand::Special(SpecialReg::SP),
+            MachOperand::PReg(source),
+        ],
     ));
-    let trap = func.push_inst(MachInst::new(AArch64Opcode::Brk, vec![]));
-    func.blocks[fail_block.0 as usize].insts.push(call);
-    func.blocks[fail_block.0 as usize].insts.push(trap);
-    fail_block
+    insts.push(branch());
+    if sp_adj != 0 {
+        if sp_adj <= AARCH64_ADD_SUB_IMM12_MAX {
+            insts.push(MachInst::new(
+                AArch64Opcode::CmpRI,
+                vec![MachOperand::PReg(X16), MachOperand::Imm(i64::from(sp_adj))],
+            ));
+        } else {
+            emit_materialize_u64(X17, u64::from(sp_adj), &mut insts);
+            insts.push(MachInst::new(
+                AArch64Opcode::CmpRR,
+                vec![MachOperand::PReg(X16), MachOperand::PReg(X17)],
+            ));
+        }
+        insts.push(branch());
+    }
+    insts
+}
+
+/// The overflow block's code. `Trap`: `brk #0x534c` with the frame intact.
+/// `Handler`: the callee-saved restore of a frame whose SP adjustment was
+/// never made (the epilogue without its `add sp`), then a tail call of the
+/// handler that keeps the requester's argument registers as implicit uses.
+fn emit_stack_limit_overflow(
+    limit: &trust_cg_ir::MachStackLimit,
+    layout: &FrameLayout,
+) -> Vec<MachInst> {
+    use trust_cg_ir::StackLimitOverflow;
+    match &limit.request.overflow {
+        StackLimitOverflow::Trap => vec![MachInst::new(
+            AArch64Opcode::Brk,
+            vec![MachOperand::Imm(i64::from(
+                trust_cg_ir::STACK_LIMIT_TRAP_IMM,
+            ))],
+        )],
+        StackLimitOverflow::Handler { symbol } => {
+            let csa_only = FrameLayout {
+                total_frame_size: layout.callee_saved_area_size,
+                spill_area_size: 0,
+                local_area_size: 0,
+                outgoing_arg_area_size: 0,
+                has_dynamic_alloc: false,
+                ..layout.clone()
+            };
+            let mut insts = emit_epilogue_before_tail_branch(&csa_only);
+            let mut tail = MachInst::new(
+                AArch64Opcode::TailCall,
+                vec![MachOperand::Symbol(symbol.clone())],
+            );
+            tail.implicit_uses = trust_cg_ir::inst::intern_pregs(&limit.arg_regs);
+            insts.push(tail);
+            insts
+        }
+    }
+}
+
+fn append_stack_chk_fail_block(
+    plan: &mut FrameInsertionPlan,
+) -> Result<BlockId, crate::lower::LowerError> {
+    let fail_block = plan.create_block()?;
+    let call = plan.push_inst(MachInst::new(
+        AArch64Opcode::Bl,
+        vec![MachOperand::Symbol(STACK_CHK_FAIL_SYMBOL.to_string())],
+    ))?;
+    let trap = plan.push_inst(MachInst::new(AArch64Opcode::Brk, vec![]))?;
+    plan.blocks[fail_block.0 as usize].insts.push(call);
+    plan.blocks[fail_block.0 as usize].insts.push(trap);
+    Ok(fail_block)
+}
+
+/// Stage frame insertion without cloning the instruction arena or mutating its
+/// owner. Existing IDs are retained; only edited instructions and new code are
+/// owned by the plan. All recoverable errors occur before `commit` publishes it.
+struct FrameInsertionPlan {
+    original_inst_count: usize,
+    added_insts: Vec<MachInst>,
+    edited_insts: BTreeMap<usize, MachInst>,
+    blocks: Vec<MachBlock>,
+    block_order: Vec<BlockId>,
+    entry: BlockId,
+    /// EH call sites, retargeted when a probe loop splits a protected block.
+    eh_call_sites: Vec<EhCallSiteEntry>,
+    eh_call_site_bindings: EhCallSiteBindings,
+    /// The U10 overflow block, when a stack-limit check was emitted.
+    stack_limit_overflow_block: Option<BlockId>,
+}
+
+fn frame_insertion_error(detail: impl Into<String>) -> crate::lower::LowerError {
+    crate::lower::LowerError::FrameLowering(detail.into())
+}
+
+fn checked_frame_insertion_id(
+    base: usize,
+    added: usize,
+    arena: &'static str,
+) -> Result<u32, crate::lower::LowerError> {
+    base.checked_add(added)
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or_else(|| {
+            frame_insertion_error(format!("frame insertion {arena} ID domain exhausted"))
+        })
+}
+
+impl FrameInsertionPlan {
+    fn new(func: &MachFunction) -> Result<Self, crate::lower::LowerError> {
+        // Public frame entrypoints must also be safe without the outer compiler
+        // validator. Validate references before any helper indexes the arenas.
+        let block_count = func.blocks.len();
+        if func.entry.0 as usize >= block_count
+            || func
+                .block_order
+                .iter()
+                .any(|id| id.0 as usize >= block_count)
+            || func.blocks.iter().any(|block| {
+                block
+                    .insts
+                    .iter()
+                    .any(|id| id.0 as usize >= func.insts.len())
+                    || block
+                        .preds
+                        .iter()
+                        .chain(&block.succs)
+                        .any(|id| id.0 as usize >= block_count)
+            })
+        {
+            return Err(frame_insertion_error(
+                "frame insertion received an invalid arena reference",
+            ));
+        }
+        crate::pipeline::validate_exact_aarch64_eh_call_identity(func)
+            .map_err(|error| frame_insertion_error(error.to_string()))?;
+        Ok(Self {
+            original_inst_count: func.insts.len(),
+            added_insts: Vec::new(),
+            edited_insts: BTreeMap::new(),
+            blocks: func.blocks.clone(),
+            block_order: func.block_order.clone(),
+            entry: func.entry,
+            eh_call_sites: func.eh_metadata.call_sites.clone(),
+            eh_call_site_bindings: func.eh_metadata.call_site_bindings.clone(),
+            stack_limit_overflow_block: None,
+        })
+    }
+
+    fn push_inst(&mut self, inst: MachInst) -> Result<InstId, crate::lower::LowerError> {
+        let id = checked_frame_insertion_id(
+            self.original_inst_count,
+            self.added_insts.len(),
+            "instruction",
+        )?;
+        self.added_insts.push(inst);
+        Ok(InstId(id))
+    }
+
+    fn create_block(&mut self) -> Result<BlockId, crate::lower::LowerError> {
+        let id = BlockId(checked_frame_insertion_id(self.blocks.len(), 0, "block")?);
+        self.blocks.push(MachBlock::new());
+        self.block_order.push(id);
+        Ok(id)
+    }
+
+    /// Create an empty block laid out directly after `anchor`, at `anchor`'s
+    /// loop depth plus `extra_depth`. A block created after an anchor that is
+    /// absent from the layout (unreachable, never encoded) stays out of it too.
+    fn create_block_after(
+        &mut self,
+        anchor: BlockId,
+        extra_depth: u32,
+    ) -> Result<BlockId, crate::lower::LowerError> {
+        let id = BlockId(checked_frame_insertion_id(self.blocks.len(), 0, "block")?);
+        let mut block = MachBlock::new();
+        block.loop_depth = self.blocks[anchor.0 as usize]
+            .loop_depth
+            .saturating_add(extra_depth);
+        self.blocks.push(block);
+        if let Some(position) = self.block_order.iter().position(|&block| block == anchor) {
+            self.block_order.insert(position + 1, id);
+        }
+        Ok(id)
+    }
+
+    /// Move `block`'s instructions from index `at` onward into a new block laid
+    /// out directly after `block`, and divide its successor edges between the
+    /// halves. A successor that an instruction staying in `block` names (a
+    /// mid-block conditional branch, such as a run-time witness branching to a
+    /// trap block, or a jump table) keeps its edge from `block`. Every other
+    /// successor moves to the new block, and so does a head-named one that the
+    /// moved instructions also name, that is `block`'s layout successor while
+    /// the moved instructions do not end in a hard terminator (the fall-through
+    /// the tail inherits), that is an entry of a jump table the head's `ADR`
+    /// names (its `BR` may follow the split point), or that is a landing pad
+    /// of one of `block`'s call sites. The new block starts without predecessors; the
+    /// caller wires the path into it. An EH call site naming `block` moves
+    /// with its protected call; a split that would separate the call from its
+    /// landing-pad edge fails.
+    fn split_block_tail(
+        &mut self,
+        func: &MachFunction,
+        block: BlockId,
+        at: usize,
+    ) -> Result<BlockId, crate::lower::LowerError> {
+        let layout_next = self
+            .block_order
+            .iter()
+            .position(|&candidate| candidate == block)
+            .and_then(|position| self.block_order.get(position + 1))
+            .copied();
+        let tail = self.create_block_after(block, 0)?;
+        let index = block.0 as usize;
+        let moved = self.blocks[index].insts.split_off(at);
+        let succs = std::mem::take(&mut self.blocks[index].succs);
+        let (head_targets, tail_targets, tail_falls_through) = {
+            let view = self.view(func);
+            let last = moved
+                .iter()
+                .map(|id| &view.insts[id.0 as usize])
+                .rfind(|inst| !inst.is_pseudo());
+            let hard_terminator = last.is_some_and(|inst| {
+                inst.is_unconditional_branch()
+                    || inst.is_return()
+                    || inst.opcode == AArch64Opcode::Brk
+                    || (inst.is_terminator() && !inst.is_conditional_branch())
+            });
+            (
+                named_block_targets(func, &view.insts, &self.blocks[index].insts),
+                named_block_targets(func, &view.insts, &moved),
+                !hard_terminator,
+            )
+        };
+        let eh_partition = {
+            let view = self.view(func);
+            eh_identity::partition(
+                &view.insts,
+                &self.eh_call_sites,
+                &self.eh_call_site_bindings,
+                block,
+                &self.blocks[index].insts,
+                &moved,
+            )?
+        };
+        let mut head_succs = Vec::new();
+        let mut tail_succs = Vec::with_capacity(succs.len());
+        for &succ in &succs {
+            let head_named = head_targets.0.contains(&succ) || head_targets.1.contains(&succ);
+            let to_head = head_named || eh_partition.head_pads.contains(&succ);
+            let to_tail = (!head_named && !eh_partition.head_pads.contains(&succ))
+                || tail_targets.0.contains(&succ)
+                || tail_targets.1.contains(&succ)
+                || head_targets.1.contains(&succ)
+                || (tail_falls_through && layout_next == Some(succ))
+                || eh_partition.tail_pads.contains(&succ);
+            if to_head && !head_succs.contains(&succ) {
+                head_succs.push(succ);
+            }
+            if to_tail && !tail_succs.contains(&succ) {
+                tail_succs.push(succ);
+            }
+        }
+        for &succ in &succs {
+            let preds = &mut self.blocks[succ.0 as usize].preds;
+            let in_head = head_succs.contains(&succ);
+            let in_tail = tail_succs.contains(&succ);
+            if in_head && in_tail {
+                if !preds.contains(&tail) {
+                    preds.push(tail);
+                }
+            } else if in_tail {
+                for pred in preds.iter_mut() {
+                    if *pred == block {
+                        *pred = tail;
+                    }
+                }
+            }
+        }
+        self.blocks[index].succs = head_succs;
+        eh_partition.retarget(
+            &mut self.eh_call_sites,
+            &mut self.eh_call_site_bindings,
+            tail,
+        );
+        self.blocks[tail.0 as usize].insts = moved;
+        self.blocks[tail.0 as usize].succs = tail_succs;
+        Ok(tail)
+    }
+
+    fn add_edge(&mut self, from: BlockId, to: BlockId) {
+        self.blocks[from.0 as usize].succs.push(to);
+        self.blocks[to.0 as usize].preds.push(from);
+    }
+
+    fn view<'a>(&'a self, source: &'a MachFunction) -> FrameFunctionView<'a> {
+        FrameFunctionView {
+            source,
+            blocks: &self.blocks,
+            insts: FrameInstructionView {
+                source: &source.insts,
+                plan: Some(self),
+            },
+        }
+    }
+
+    fn commit(self, func: &mut MachFunction) -> Result<(), crate::lower::LowerError> {
+        // The caller exclusively owns the function throughout planning. Reserve
+        // the only growing destination before publishing any edits or CFG state.
+        func.insts
+            .try_reserve(self.added_insts.len())
+            .map_err(|error| {
+                frame_insertion_error(format!(
+                    "frame insertion instruction allocation failed: {error}"
+                ))
+            })?;
+        func.insts.extend(self.added_insts);
+        for (index, inst) in self.edited_insts {
+            func.insts[index] = inst;
+        }
+        func.blocks = self.blocks;
+        func.block_order = self.block_order;
+        func.entry = self.entry;
+        func.eh_metadata.call_sites = self.eh_call_sites;
+        func.eh_metadata.call_site_bindings = self.eh_call_site_bindings;
+        func.stack_limit_overflow_block = self.stack_limit_overflow_block;
+        Ok(())
+    }
+}
+
+/// The shrink-wrap and return-copy analyses see staged edits in their original
+/// order, without a full-function clone or speculative mutation of the input.
+struct FrameFunctionView<'a> {
+    source: &'a MachFunction,
+    blocks: &'a [MachBlock],
+    insts: FrameInstructionView<'a>,
+}
+
+impl<'a> FrameFunctionView<'a> {
+    #[cfg(test)]
+    fn original(source: &'a MachFunction) -> Self {
+        Self {
+            source,
+            blocks: &source.blocks,
+            insts: FrameInstructionView {
+                source: &source.insts,
+                plan: None,
+            },
+        }
+    }
+}
+
+struct FrameInstructionView<'a> {
+    source: &'a [MachInst],
+    plan: Option<&'a FrameInsertionPlan>,
+}
+
+impl Index<usize> for FrameInstructionView<'_> {
+    type Output = MachInst;
+    fn index(&self, index: usize) -> &Self::Output {
+        if let Some(plan) = self.plan {
+            if index >= self.source.len() {
+                return &plan.added_insts[index - self.source.len()];
+            }
+            if let Some(inst) = plan.edited_insts.get(&index) {
+                return inst;
+            }
+        }
+        &self.source[index]
+    }
+}
+
+/// Blocks the instructions `ids` name: `(Block operands, entries of every
+/// referenced jump table)`.
+fn named_block_targets(
+    func: &MachFunction,
+    insts: &FrameInstructionView<'_>,
+    ids: &[InstId],
+) -> (Vec<BlockId>, Vec<BlockId>) {
+    let mut branches = Vec::new();
+    let mut tables = Vec::new();
+    for &id in ids {
+        for operand in &insts[id.0 as usize].operands {
+            match operand {
+                MachOperand::Block(target) => branches.push(*target),
+                MachOperand::JumpTableIndex(table) => {
+                    if let Some(table) = func.jump_tables.get(*table as usize) {
+                        tables.extend(table.targets.iter().copied());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (branches, tables)
+}
+
+impl FrameInstructionView<'_> {
+    fn iter(&self) -> impl Iterator<Item = &MachInst> {
+        let count = self.source.len() + self.plan.map_or(0, |plan| plan.added_insts.len());
+        (0..count).map(|index| &self[index])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1972,10 @@ fn append_stack_chk_fail_block(func: &mut MachFunction) -> BlockId {
 ///
 /// Frame index encoding: `FrameIdx(i)` where `i` is the stack slot index.
 /// The concrete offset is computed from the frame layout.
-pub fn eliminate_frame_indices(func: &mut MachFunction, layout: &FrameLayout) {
+pub fn eliminate_frame_indices(
+    func: &mut MachFunction,
+    layout: &FrameLayout,
+) -> Result<(), FrameIndexEliminationError> {
     // IncomingArg offsets resolve to `[FP, #16 + offset]`.
     //
     // With the Apple-canonical FRAME layout the callee's FP points at the saved
@@ -1030,14 +1993,19 @@ pub fn eliminate_frame_indices(func: &mut MachFunction, layout: &FrameLayout) {
     for inst in &mut func.insts {
         for operand in &mut inst.operands {
             if let MachOperand::IncomingArg(arg_offset) = operand {
-                let fp_offset = FP_TO_CFA + *arg_offset;
+                let fp_offset = FP_TO_CFA.checked_add(*arg_offset).ok_or(
+                    FrameIndexEliminationError::IncomingArgumentOffsetOverflow {
+                        offset: *arg_offset,
+                    },
+                )?;
                 *operand = MachOperand::Imm(fp_offset);
             }
         }
     }
 
     let eliminator = FrameIndexEliminator::new(layout, func);
-    let _stats = eliminator.run(func);
+    eliminator.run(func)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,14 +2017,47 @@ use trust_cg_opt::effects::{OperandRole, aarch64_operand_roles};
 /// Locate the single addressing operand of a scalar register+immediate
 /// load/store and return `(operand_index, base, byte_offset, is_split_form)`.
 ///
-/// Two shapes reach the encoder for these opcodes:
+/// Canonical RI opcodes accept only these complete resolved shapes:
 ///   * resolved MemOp form:  `[Rt, MemOp { base, offset }]`  (post frame lowering)
 ///   * split base+imm form:  `[Rt, base(PReg|SP), Imm(offset)]`  (non-frame ISel)
+///   * zero-offset form:    `[Rt, base(PReg|SP)]`
 ///
-/// `base` is normalized to a `PReg` (`SP` becomes `PReg(31)`), matching what the
-/// encoder's `extract_base_offset` decodes. Returns `None` when neither shape is
-/// present (e.g. an unresolved frame operand), leaving the access untouched.
+/// Their base must be X0..X30 or SP. Malformed and unresolved forms remain
+/// untouched, so legalization cannot erase extra operands before encoding.
+/// Legacy typed-store aliases retain their existing addressing accessor below.
 fn scalar_mem_addressing(inst: &MachInst) -> Option<(usize, PReg, i64, bool)> {
+    if matches!(
+        inst.opcode,
+        AArch64Opcode::LdrRI
+            | AArch64Opcode::StrRI
+            | AArch64Opcode::LdrbRI
+            | AArch64Opcode::LdrhRI
+            | AArch64Opcode::LdrsbRI
+            | AArch64Opcode::LdrshRI
+            | AArch64Opcode::StrbRI
+            | AArch64Opcode::StrhRI
+            | AArch64Opcode::VolatileLdrRI
+            | AArch64Opcode::VolatileStrRI
+            | AArch64Opcode::VolatileLdrbRI
+            | AArch64Opcode::VolatileLdrhRI
+            | AArch64Opcode::VolatileStrbRI
+            | AArch64Opcode::VolatileStrhRI
+    ) {
+        let (base_operand, offset) = match inst.operands.as_slice() {
+            [_, MachOperand::MemOp { base, offset }] if base.encoding() <= 31 => {
+                return Some((1, *base, *offset, false));
+            }
+            [_, base] => (base, 0),
+            [_, base, MachOperand::Imm(offset)] => (base, *offset),
+            _ => return None,
+        };
+        let base = match base_operand {
+            MachOperand::PReg(base) if base.encoding() <= 31 => *base,
+            MachOperand::Special(SpecialReg::SP) => SP,
+            _ => return None,
+        };
+        return Some((1, base, offset, true));
+    }
     // Prefer an explicit MemOp anywhere in the operand list.
     for (idx, op) in inst.operands.iter().enumerate() {
         if let MachOperand::MemOp { base, offset } = op {
@@ -1153,6 +2154,7 @@ fn scratch_live_after(
     live_out_of_block: bool,
 ) -> bool {
     for &inst_id in remaining {
+        charge_scratch_scan(1);
         let Some(inst) = func.insts.get(inst_id.0 as usize) else {
             continue;
         };
@@ -1168,6 +2170,102 @@ fn scratch_live_after(
         }
     }
     live_out_of_block
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCRATCH_SCAN_UNITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `units` instructions examined by an IP-scratch liveness scan on this
+/// thread. Unit tests bound how that count grows with block size (ledger row
+/// L14-P6); outside `cfg(test)` this compiles to nothing.
+#[inline(always)]
+fn charge_scratch_scan(units: usize) {
+    #[cfg(test)]
+    SCRATCH_SCAN_UNITS.with(|total| total.set(total.get().saturating_add(units as u64)));
+    #[cfg(not(test))]
+    let _ = units;
+}
+
+/// [`scratch_live_after`] for every position of one block, computed once per
+/// scratch register and then answered in constant time.
+///
+/// Frame-index elimination asks, for each access whose frame offset needs an
+/// IP scratch, whether that scratch is live after the access. Answered by the
+/// forward scan alone, a block of `n` such accesses (a frame larger than the
+/// immediate range, e.g. a large stack array) costs `O(n^2)`: each scan runs
+/// to the next read, write or call of the scratch, which is usually the block
+/// end. This table is the same scan run backward once: `answers[k]` is
+/// `scratch_live_after(func, &block_insts[k..], reg, live_out)`.
+///
+/// It is built on the first query in the block, from the instructions as they
+/// are then. That equals the lazy scan at every later query because the
+/// elimination loop rewrites only the instruction at the current position
+/// (and appends new arena instructions): the instructions after a queried
+/// position are still untouched when it is queried. A block that lists one
+/// instruction id twice would break that, so such a block keeps the scan.
+struct ScratchLiveness<'a> {
+    block_insts: &'a [InstId],
+    live_out: (bool, bool),
+    unique_ids: Option<bool>,
+    x16: Option<Vec<bool>>,
+    x17: Option<Vec<bool>>,
+}
+
+impl<'a> ScratchLiveness<'a> {
+    fn new(block_insts: &'a [InstId], live_out: (bool, bool)) -> Self {
+        Self {
+            block_insts,
+            live_out,
+            unique_ids: None,
+            x16: None,
+            x17: None,
+        }
+    }
+
+    /// `scratch_live_after(func, &block_insts[pos + 1..], reg, live_out)`,
+    /// where `live_out` is the block's live-out flag of `reg`.
+    fn live_after(&mut self, func: &MachFunction, pos: usize, reg: PReg) -> bool {
+        let remaining = self.block_insts.get(pos + 1..).unwrap_or(&[]);
+        let (table, live_out) = if reg == X16 {
+            (&mut self.x16, self.live_out.0)
+        } else if reg == X17 {
+            (&mut self.x17, self.live_out.1)
+        } else {
+            return scratch_live_after(func, remaining, reg, self.live_out.1);
+        };
+        let block_insts = self.block_insts;
+        let unique_ids = *self.unique_ids.get_or_insert_with(|| {
+            let mut seen = std::collections::HashSet::with_capacity(block_insts.len());
+            block_insts.iter().all(|id| seen.insert(*id))
+        });
+        if !unique_ids {
+            return scratch_live_after(func, remaining, reg, live_out);
+        }
+        let answers = table.get_or_insert_with(|| {
+            charge_scratch_scan(block_insts.len());
+            let mut answers = vec![live_out; block_insts.len() + 1];
+            for (k, id) in block_insts.iter().enumerate().rev() {
+                let after = answers[k + 1];
+                answers[k] = match func.insts.get(id.0 as usize) {
+                    None => after,
+                    Some(inst) => {
+                        let (read, written) = scratch_read_written(inst, reg);
+                        if read {
+                            true
+                        } else if written || inst.flags.is_call() {
+                            false
+                        } else {
+                            after
+                        }
+                    }
+                };
+            }
+            answers
+        });
+        answers.get(pos + 1).copied().unwrap_or(live_out)
+    }
 }
 
 /// Whole-function backward liveness of the IP scratch registers `(X16, X17)`,
@@ -1294,10 +2392,10 @@ fn ip_scratch_block_live_out(func: &MachFunction) -> Vec<(bool, bool)> {
 }
 
 /// The GPR destination of a single-register RI *load* (operand 0, a pure Def),
-/// as its 64-bit view — or `None` for stores and FP-destination loads (whose
-/// destination cannot host address arithmetic). Reusing this register as the
-/// address scratch is always sound: the load overwrites it anyway, so its prior
-/// value is dead and no *other* register is disturbed.
+/// as its 64-bit view — or `None` when it cannot host address arithmetic.
+/// Only a writable GPR can hold the address: ZR discards it, and SP must not be
+/// repurposed. Reusing a writable destination distinct from the address base is
+/// sound because the load overwrites it anyway, so its prior value is dead.
 fn load_dest_gpr(inst: &MachInst) -> Option<PReg> {
     let is_load = matches!(
         inst.opcode,
@@ -1306,18 +2404,22 @@ fn load_dest_gpr(inst: &MachInst) -> Option<PReg> {
             | AArch64Opcode::LdrhRI
             | AArch64Opcode::LdrsbRI
             | AArch64Opcode::LdrshRI
+            | AArch64Opcode::VolatileLdrRI
+            | AArch64Opcode::VolatileLdrbRI
+            | AArch64Opcode::VolatileLdrhRI
     );
     if !is_load {
         return None;
     }
-    match inst.operands.first() {
+    let dest = match inst.operands.first() {
         Some(MachOperand::PReg(p)) => match preg_class(*p) {
             RegClass::Gpr64 => Some(*p),
             RegClass::Gpr32 => gpr32_to_gpr64(*p),
             _ => None,
         },
         _ => None,
-    }
+    }?;
+    (dest != SP && dest != XZR).then_some(dest)
 }
 
 /// Choose a scratch register to hold the materialized effective address, or
@@ -1762,6 +2864,24 @@ pub struct FrameIndexEliminator<'a> {
     sp_rebase_delta: Option<i64>,
 }
 
+/// Fail-closed frame-index legalization errors. Failed transforms must not be
+/// encoded: the caller retains its function for diagnostics, not publication.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FrameIndexEliminationError {
+    #[error("runtime-sized stack slot {slot} requires dynamic SP lowering")]
+    RuntimeSizedSlot { slot: usize },
+    #[error("frame slot {slot} is outside the {slots}-slot frame layout")]
+    InvalidSlot { slot: usize, slots: usize },
+    #[error("incoming argument offset {offset} exceeds the signed frame-offset domain")]
+    IncomingArgumentOffsetOverflow { offset: i64 },
+    #[error("invalid frame instruction {instruction}: {reason}")]
+    InvalidInstruction { instruction: u32, reason: String },
+    #[error(
+        "large frame-offset materialization for instruction {instruction} would clobber IP scratch {scratch:?}"
+    )]
+    LiveScratch { instruction: u32, scratch: PReg },
+}
+
 /// Kill switch for the SP-relative far-slot re-base (`TCG_NO_SP_FAR_SLOT=1`
 /// restores byte-identical FP-relative addressing plus scratch materialization).
 fn sp_far_slot_disabled() -> bool {
@@ -1826,16 +2946,17 @@ impl<'a> FrameIndexEliminator<'a> {
     ///
     /// Spill/local slots use FP-relative addressing when the frame pointer
     /// is available (always on Apple AArch64). The returned offset is signed.
-    pub fn resolve_slot_operand(&self, slot_idx: usize) -> (PReg, i64) {
+    pub fn resolve_slot_operand(
+        &self,
+        slot_idx: usize,
+    ) -> Result<(PReg, i64), FrameIndexEliminationError> {
         if self
             .runtime_sized_slots
             .get(slot_idx)
             .copied()
             .unwrap_or(false)
         {
-            panic!(
-                "runtime-sized stack slot {slot_idx} requires dynamic SP lowering; fixed frame index elimination cannot resolve it"
-            );
+            return Err(FrameIndexEliminationError::RuntimeSizedSlot { slot: slot_idx });
         }
         if slot_idx < self.slot_offsets.len() {
             let fp_offset = self.slot_offsets[slot_idx] as i64;
@@ -1855,19 +2976,22 @@ impl<'a> FrameIndexEliminator<'a> {
                 if !self.layout.has_dynamic_alloc && is_large_offset(fp_offset) {
                     let sp_offset = fp_offset + self.layout.total_frame_size as i64 - 16;
                     if !is_large_offset(sp_offset) {
-                        return (SP, sp_offset);
+                        return Ok((SP, sp_offset));
                     }
                 }
-                (X29, fp_offset)
+                Ok((X29, fp_offset))
             } else {
                 // SP-relative: FP offset + callee_saved_area + sp_adjustment
                 let sp_offset = fp_offset + self.layout.sp_adjustment() as i64;
-                (SP, sp_offset)
+                Ok((SP, sp_offset))
             }
         } else {
-            // Out-of-range slot index — treat as outgoing arg area (SP-relative).
-            // This shouldn't happen in well-formed IR but we handle it defensively.
-            (SP, 0)
+            // An unknown slot does not name the outgoing-argument area. Mapping
+            // it to SP+0 would silently redirect the caller's memory access.
+            Err(FrameIndexEliminationError::InvalidSlot {
+                slot: slot_idx,
+                slots: self.slot_offsets.len(),
+            })
         }
     }
 
@@ -1899,25 +3023,29 @@ impl<'a> FrameIndexEliminator<'a> {
     /// path — `is_large_offset`'s conservative `4095` ceiling would otherwise
     /// send a perfectly encodable scaled offset (e.g. `ldr x0, [sp, #6496]`)
     /// off to a three-instruction address computation.
-    fn resolve_slot_operand_for_inst(&self, slot_idx: usize, inst: &MachInst) -> (PReg, i64, bool) {
-        let (base, offset) = self.resolve_slot_operand(slot_idx);
+    fn resolve_slot_operand_for_inst(
+        &self,
+        slot_idx: usize,
+        inst: &MachInst,
+    ) -> Result<(PReg, i64, bool), FrameIndexEliminationError> {
+        let (base, offset) = self.resolve_slot_operand(slot_idx)?;
         if base != X29 {
-            return (base, offset, false);
+            return Ok((base, offset, false));
         }
         let Some(delta) = self.sp_rebase_delta else {
-            return (base, offset, false);
+            return Ok((base, offset, false));
         };
         let Some(scale) = crate::aarch64::encode::scalar_ri_mem_scale(inst) else {
-            return (base, offset, false);
+            return Ok((base, offset, false));
         };
         if crate::aarch64::encode::scalar_ri_offset_encodable(offset, scale) {
-            return (base, offset, false);
+            return Ok((base, offset, false));
         }
         let sp_offset = offset + delta;
         if sp_offset >= 0 && crate::aarch64::encode::scalar_ri_offset_encodable(sp_offset, scale) {
-            (SP, sp_offset, true)
+            Ok((SP, sp_offset, true))
         } else {
-            (base, offset, false)
+            Ok((base, offset, false))
         }
     }
 
@@ -1925,9 +3053,13 @@ impl<'a> FrameIndexEliminator<'a> {
     ///
     /// Unchanged (`is_large_offset`) for every access that keeps its
     /// FP-relative base; never for a re-based one.
-    fn slot_access_needs_scratch(&self, slot_idx: usize, inst: &MachInst) -> bool {
-        let (_, offset, rebased) = self.resolve_slot_operand_for_inst(slot_idx, inst);
-        !rebased && is_large_offset(offset)
+    fn slot_access_needs_scratch(
+        &self,
+        slot_idx: usize,
+        inst: &MachInst,
+    ) -> Result<bool, FrameIndexEliminationError> {
+        let (_, offset, rebased) = self.resolve_slot_operand_for_inst(slot_idx, inst)?;
+        Ok(!rebased && is_large_offset(offset))
     }
 
     /// Run the frame index elimination pass over the function.
@@ -1937,15 +3069,42 @@ impl<'a> FrameIndexEliminator<'a> {
     /// materialization instructions.
     ///
     /// Returns statistics about the elimination.
-    pub fn run(&self, func: &mut MachFunction) -> EliminationStats {
+    pub fn run(
+        &self,
+        func: &mut MachFunction,
+    ) -> Result<EliminationStats, FrameIndexEliminationError> {
         let mut stats = EliminationStats::default();
 
         // Early exit: if no stack slots, no frame indices can exist.
         if func.stack_slots.is_empty() && !self.has_frame_operands(func) {
-            return stats;
+            return Ok(stats);
         }
 
         let mut attached = vec![false; func.insts.len()];
+
+        // Liveness follows block/instruction references before rewriting. Admit
+        // those indices here for direct users of the public frame pass too.
+        if let Some(block) = func
+            .block_order
+            .iter()
+            .find(|block| block.0 as usize >= func.blocks.len())
+        {
+            return Err(FrameIndexEliminationError::InvalidInstruction {
+                instruction: block.0,
+                reason: "block order references a block outside the arena".into(),
+            });
+        }
+        if let Some(instruction) = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find(|instruction| instruction.0 as usize >= func.insts.len())
+        {
+            return Err(FrameIndexEliminationError::InvalidInstruction {
+                instruction: instruction.0,
+                reason: "block references an instruction outside the arena".into(),
+            });
+        }
 
         // Whole-function live-out of the IP scratch pair, so the fail-closed
         // borrow guard below sees live ranges that leave a block (post-RA
@@ -1956,12 +3115,20 @@ impl<'a> FrameIndexEliminator<'a> {
         // large offsets require inserting materialization instructions.
         let num_blocks = func.blocks.len();
         for block_idx in 0..num_blocks {
-            let block_insts = std::mem::take(&mut func.blocks[block_idx].insts);
+            // Retain the original block list on rejection. Inserted arena
+            // instructions remain diagnostic-only until this block commits.
+            let block_insts = func.blocks[block_idx].insts.clone();
             let mut new_insts = Vec::with_capacity(block_insts.len());
             let mut block_modified = false;
+            let mut scratch_liveness = ScratchLiveness::new(
+                &block_insts,
+                block_live_out
+                    .get(block_idx)
+                    .copied()
+                    .unwrap_or((true, true)),
+            );
 
-            for pos in 0..block_insts.len() {
-                let inst_id = block_insts[pos];
+            for (pos, &inst_id) in block_insts.iter().enumerate() {
                 if let Some(slot) = attached.get_mut(inst_id.0 as usize) {
                     *slot = true;
                 }
@@ -1970,18 +3137,23 @@ impl<'a> FrameIndexEliminator<'a> {
                 let mut has_frame_op = false;
                 let mut needs_large_offset = false;
 
-                let scan_inst = &func.insts[inst_id.0 as usize];
+                let scan_inst = func.insts.get(inst_id.0 as usize).ok_or_else(|| {
+                    FrameIndexEliminationError::InvalidInstruction {
+                        instruction: inst_id.0,
+                        reason: "block references an instruction outside the arena".into(),
+                    }
+                })?;
                 for operand in &scan_inst.operands {
                     match operand {
                         MachOperand::FrameIndex(fi) => {
                             has_frame_op = true;
-                            if self.slot_access_needs_scratch(fi.0 as usize, scan_inst) {
+                            if self.slot_access_needs_scratch(fi.0 as usize, scan_inst)? {
                                 needs_large_offset = true;
                             }
                         }
                         MachOperand::StackSlot(ss) => {
                             has_frame_op = true;
-                            if self.slot_access_needs_scratch(ss.0 as usize, scan_inst) {
+                            if self.slot_access_needs_scratch(ss.0 as usize, scan_inst)? {
                                 needs_large_offset = true;
                             }
                         }
@@ -1995,7 +3167,7 @@ impl<'a> FrameIndexEliminator<'a> {
                 }
 
                 if self.is_stack_addr_inst(func, inst_id) {
-                    let addr_insts = self.rewrite_stack_addr(func, inst_id, &mut stats);
+                    let addr_insts = self.rewrite_stack_addr(func, inst_id, &mut stats)?;
                     block_modified |= addr_insts.len() != 1 || addr_insts[0] != inst_id;
                     for addr_id in addr_insts {
                         new_insts.push(addr_id);
@@ -2008,20 +3180,17 @@ impl<'a> FrameIndexEliminator<'a> {
                     let mat_insts = self.materialize_and_rewrite(
                         func,
                         inst_id,
-                        &block_insts[pos + 1..],
-                        block_live_out
-                            .get(block_idx)
-                            .copied()
-                            .unwrap_or((true, true)),
+                        pos,
+                        &mut scratch_liveness,
                         &mut stats,
-                    );
+                    )?;
                     for mat_id in mat_insts {
                         new_insts.push(mat_id);
                     }
                     block_modified = true;
                 } else {
                     // Small offset — just rewrite operands in place.
-                    self.rewrite_operands_small(func, inst_id, &mut stats);
+                    self.rewrite_operands_small(func, inst_id, &mut stats)?;
                     new_insts.push(inst_id);
                 }
             }
@@ -2043,11 +3212,11 @@ impl<'a> FrameIndexEliminator<'a> {
             }
             let inst_id = trust_cg_ir::types::InstId(inst_idx as u32);
             if self.inst_has_frame_operands(func, inst_id) {
-                self.rewrite_operands_small(func, inst_id, &mut stats);
+                self.rewrite_operands_small(func, inst_id, &mut stats)?;
             }
         }
 
-        stats
+        Ok(stats)
     }
 
     /// Check if any instruction has FrameIndex or StackSlot operands.
@@ -2182,17 +3351,25 @@ impl<'a> FrameIndexEliminator<'a> {
         func: &mut MachFunction,
         inst_id: trust_cg_ir::types::InstId,
         stats: &mut EliminationStats,
-    ) -> Vec<trust_cg_ir::types::InstId> {
+    ) -> Result<Vec<trust_cg_ir::types::InstId>, FrameIndexEliminationError> {
         let (dst, base_reg, offset) = {
             let inst = &func.insts[inst_id.0 as usize];
             let dst = match inst.operands.first() {
                 Some(MachOperand::PReg(dst)) => *dst,
-                other => panic!("StackAddr AddPCRel expected PReg dst, got {:?}", other),
+                other => {
+                    return Err(FrameIndexEliminationError::InvalidInstruction {
+                        instruction: inst_id.0,
+                        reason: format!("StackAddr AddPCRel expected PReg dst, got {other:?}"),
+                    });
+                }
             };
             let Some(slot_idx) = inst.operands.get(2).and_then(Self::frame_operand_slot) else {
-                panic!("StackAddr AddPCRel missing frame operand at index 2");
+                return Err(FrameIndexEliminationError::InvalidInstruction {
+                    instruction: inst_id.0,
+                    reason: "StackAddr AddPCRel missing frame operand at index 2".into(),
+                });
             };
-            let (base_reg, offset) = self.resolve_slot_operand(slot_idx);
+            let (base_reg, offset) = self.resolve_slot_operand(slot_idx)?;
             (dst, base_reg, offset)
         };
 
@@ -2214,7 +3391,7 @@ impl<'a> FrameIndexEliminator<'a> {
                     MachOperand::Imm(abs_offset as i64),
                 ],
             );
-            return vec![inst_id];
+            return Ok(vec![inst_id]);
         }
 
         let mut result = self.materialize_abs_offset(func, dst, abs_offset);
@@ -2229,7 +3406,7 @@ impl<'a> FrameIndexEliminator<'a> {
         );
         stats.large_offset_count += 1;
         result.push(inst_id);
-        result
+        Ok(result)
     }
 
     /// Rewrite small-offset frame operands in place (no new instructions needed).
@@ -2238,7 +3415,7 @@ impl<'a> FrameIndexEliminator<'a> {
         func: &mut MachFunction,
         inst_id: trust_cg_ir::types::InstId,
         stats: &mut EliminationStats,
-    ) {
+    ) -> Result<(), FrameIndexEliminationError> {
         // Resolve against a snapshot: `resolve_slot_operand_for_inst` needs the
         // (still unmodified) operand list to derive the encoder's access scale,
         // and the borrow checker will not hand us both at once.
@@ -2248,49 +3425,37 @@ impl<'a> FrameIndexEliminator<'a> {
             match operand {
                 MachOperand::FrameIndex(fi) => {
                     let slot_idx = fi.0 as usize;
-                    let (base, offset, _) = self.resolve_slot_operand_for_inst(slot_idx, &snapshot);
+                    let (base, offset, _) =
+                        self.resolve_slot_operand_for_inst(slot_idx, &snapshot)?;
                     *operand = MachOperand::MemOp { base, offset };
                     stats.eliminated_count += 1;
                 }
                 MachOperand::StackSlot(ss) => {
                     let slot_idx = ss.0 as usize;
-                    let (base, offset, _) = self.resolve_slot_operand_for_inst(slot_idx, &snapshot);
+                    let (base, offset, _) =
+                        self.resolve_slot_operand_for_inst(slot_idx, &snapshot)?;
                     *operand = MachOperand::MemOp { base, offset };
                     stats.eliminated_count += 1;
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
-    /// MEASURED OPPORTUNITY (not implemented here). Every access this method
-    /// touches costs THREE instructions — `MOVZ xS,#off; SUB xS,x29,xS; ldr
-    /// Rt,[xS]` — because the FP-relative offset of a big frame is negative and
-    /// far outside `ldur`'s +/-256 window. The same slot is a SMALL POSITIVE
-    /// offset from SP, which the scaled 12-bit unsigned form encodes in ONE
-    /// instruction: huffbench's `compdecomp` reloads at `[x29, #-12888]` while
-    /// SP sits 12944 bytes below FP, i.e. `ldr x16, [sp, #56]`. Byte-patching
-    /// all 27 such triples in that function to `nop; nop; ldr [sp,#imm]` keeps
-    /// the output bit-exact and moves it 1.1724 -> 1.1614 (min) / 1.1722 ->
-    /// 1.1673 (trimmed median) vs clang 21 -O3 — and that patch still executes
-    /// the two NOPs, so the real transform is strictly better. Doing it for
-    /// real needs: SP provably constant through the body (no dynamic alloca),
-    /// per-access encodability (the scaled immediate must match the access
-    /// SIZE), and a shrink-wrap interaction review, since SP-relative
-    /// addressing is only valid after the prologue that the sunk-prologue plan
-    /// may place in a later block.
-    ///
-    /// Handle a large-offset frame index: materialize the address in a scratch
-    /// register, then rewrite the operand. Returns the list of InstIds that
-    /// replace the original instruction.
+    /// Materialize an address that still needs scratch after the direct FP and
+    /// proven-static SP encodings have been considered. Borrow an IP register
+    /// only after operand-overlap and whole-function liveness checks. Return
+    /// the replacement instruction IDs, or a typed refusal if no safe
+    /// address materialization exists.
     fn materialize_and_rewrite(
         &self,
         func: &mut MachFunction,
         inst_id: trust_cg_ir::types::InstId,
-        remaining: &[InstId],
-        block_live_out: (bool, bool),
+        pos: usize,
+        scratch_liveness: &mut ScratchLiveness<'_>,
         stats: &mut EliminationStats,
-    ) -> Vec<trust_cg_ir::types::InstId> {
+    ) -> Result<Vec<trust_cg_ir::types::InstId>, FrameIndexEliminationError> {
         let mut result = Vec::with_capacity(4);
 
         // Large memory offsets are only supported for single-address
@@ -2300,14 +3465,16 @@ impl<'a> FrameIndexEliminator<'a> {
             let inst = &func.insts[inst_id.0 as usize];
             let frame_operands = self.frame_operand_indices(inst);
             if frame_operands.len() != 1 {
-                panic!(
-                    "large frame-offset materialization requires exactly one frame operand, got {} in {:?}",
-                    frame_operands.len(),
-                    inst
-                );
+                return Err(FrameIndexEliminationError::InvalidInstruction {
+                    instruction: inst_id.0,
+                    reason: format!(
+                        "large frame-offset materialization requires exactly one frame operand, got {}",
+                        frame_operands.len()
+                    ),
+                });
             }
             let (operand_idx, slot_idx) = frame_operands[0];
-            let (base_reg, offset, _) = self.resolve_slot_operand_for_inst(slot_idx, inst);
+            let (base_reg, offset, _) = self.resolve_slot_operand_for_inst(slot_idx, inst)?;
             (operand_idx, base_reg, offset)
         };
         // `is_ip_scratch` distinguishes the two safe-scratch sources: the load's
@@ -2325,10 +3492,11 @@ impl<'a> FrameIndexEliminator<'a> {
             } else if !self.inst_overlaps_scratch(inst, X17) {
                 (X17, true)
             } else {
-                panic!(
-                    "cannot safely materialize large frame offset for {:?}: both X16 and X17 are live operands",
-                    inst
-                );
+                return Err(FrameIndexEliminationError::InvalidInstruction {
+                    instruction: inst_id.0,
+                    reason: "both X16 and X17 are live operands; no safe address scratch register"
+                        .into(),
+                });
             }
         };
 
@@ -2342,17 +3510,11 @@ impl<'a> FrameIndexEliminator<'a> {
         // error — rather than emit the miscompile. This never fires on
         // well-formed spill code, where X16/X17 never carry a value across the
         // spill store/load being rewritten.
-        let live_out_of_block = if scratch_reg == X16 {
-            block_live_out.0
-        } else {
-            block_live_out.1
-        };
-        if is_ip_scratch && scratch_live_after(func, remaining, scratch_reg, live_out_of_block) {
-            panic!(
-                "large frame-offset materialization for {:?} would clobber IP scratch {scratch_reg:?}, \
-                 which still holds a value read later in the block (spill-materialization / frame-offset invariant violation)",
-                func.insts[inst_id.0 as usize]
-            );
+        if is_ip_scratch && scratch_liveness.live_after(func, pos, scratch_reg) {
+            return Err(FrameIndexEliminationError::LiveScratch {
+                instruction: inst_id.0,
+                scratch: scratch_reg,
+            });
         }
 
         // Compute `base_reg + offset` into the chosen scratch. The shared helper
@@ -2365,15 +3527,10 @@ impl<'a> FrameIndexEliminator<'a> {
         if let Err(err) =
             emit_effective_address_into_scratch(func, scratch_reg, base_reg, offset, &mut result)
         {
-            // The eliminator has no fail-closed return channel, so the only
-            // Err cases — an SP base with |offset| > 4095, or |offset| beyond
-            // the 32-bit MOVZ/MOVK window — panic rather than let the encoder
-            // emit an address that does not equal base + offset. Neither is
-            // reachable for Apple AArch64 frame slots (FP-relative, bounded).
-            panic!(
-                "large frame-offset materialization for {:?}: {err}",
-                func.insts[inst_id.0 as usize]
-            );
+            return Err(FrameIndexEliminationError::InvalidInstruction {
+                instruction: inst_id.0,
+                reason: err,
+            });
         }
 
         // Rewrite the single frame memory operand to [scratch, #0]. The effective
@@ -2388,7 +3545,7 @@ impl<'a> FrameIndexEliminator<'a> {
         stats.large_offset_count += 1;
         result.push(inst_id);
 
-        result
+        Ok(result)
     }
 }
 
@@ -2710,6 +3867,7 @@ fn make_ret() -> MachInst {
 ///
 /// `align` must be a power of two.
 #[inline]
+#[cfg(test)]
 fn align_up(value: u32, align: u32) -> u32 {
     debug_assert!(align.is_power_of_two());
     (value + align - 1) & !(align - 1)
@@ -2806,31 +3964,12 @@ fn make_mov_reg_to_sp(src: PReg) -> MachInst {
     )
 }
 
-fn emit_sub_sp_reg(func: &mut MachFunction, size_reg: PReg, out: &mut Vec<InstId>) {
-    let scratch = stack_alloc_scratch(size_reg, None)
-        .expect("runtime stack allocation SP adjustment needs an IP scratch register");
-
-    // AArch64 ADD/SUB shifted-register encodings treat register 31 as XZR,
-    // not SP. Adjust SP via a real GPR and move it back with ADD-immediate,
-    // where register 31 is the architectural stack pointer.
-    out.push(func.push_inst(make_mov_sp_to_reg(scratch)));
-    out.push(func.push_inst(MachInst::new(
-        AArch64Opcode::SubRR,
-        vec![
-            MachOperand::PReg(scratch),
-            MachOperand::PReg(scratch),
-            MachOperand::PReg(size_reg),
-        ],
-    )));
-    out.push(func.push_inst(make_mov_reg_to_sp(scratch)));
-}
-
-fn emit_materialize_u64(func: &mut MachFunction, dst: PReg, value: u64, out: &mut Vec<InstId>) {
-    out.push(func.push_inst(make_movz_imm(dst, (value & 0xFFFF) as i64)));
+fn emit_materialize_u64(dst: PReg, value: u64, out: &mut Vec<MachInst>) {
+    out.push(make_movz_imm(dst, (value & 0xFFFF) as i64));
     for shift in [16_u32, 32, 48] {
         let part = ((value >> shift) & 0xFFFF) as i64;
         if part != 0 {
-            out.push(func.push_inst(make_movk_imm(dst, part, shift as i64)));
+            out.push(make_movk_imm(dst, part, shift as i64));
         }
     }
 }
@@ -2846,18 +3985,18 @@ fn stack_alloc_scratch(dst: PReg, src: Option<PReg>) -> Option<PReg> {
 }
 
 fn emit_stack_alloc_size(
-    func: &mut MachFunction,
     dst: PReg,
     size_operand: &MachOperand,
     unit_size: u32,
-    out: &mut Vec<InstId>,
+    out: &mut Vec<MachInst>,
 ) -> Result<(), crate::lower::LowerError> {
     match size_operand {
         MachOperand::Imm(count) => {
-            assert!(
-                *count >= 0,
-                "runtime stack allocation count must be non-negative, got {count}"
-            );
+            if *count < 0 {
+                return Err(frame_insertion_error(format!(
+                    "runtime stack allocation count must be non-negative, got {count}"
+                )));
+            }
             // FINDING #10a: a well-typed but huge constant-count alloca (e.g.
             // [i64; ~2^61]) makes count*unit_size overflow u64. Previously this
             // tripped `.expect()` and ABORTED the compiler; now it returns a
@@ -2867,11 +4006,11 @@ fn emit_stack_alloc_size(
                     "runtime stack allocation immediate size overflow: count {count} * unit {unit_size} exceeds u64"
                 ))
             })?;
-            emit_materialize_u64(func, dst, bytes, out);
+            emit_materialize_u64(dst, bytes, out);
         }
         MachOperand::PReg(src) => {
             let src64 = if preg_class(*src) == RegClass::Gpr32 {
-                out.push(func.push_inst(make_uxtw(dst, *src)));
+                out.push(make_uxtw(dst, *src));
                 dst
             } else {
                 *src
@@ -2879,20 +4018,16 @@ fn emit_stack_alloc_size(
 
             if unit_size == 1 {
                 if src64 != dst {
-                    out.push(func.push_inst(make_mov_reg(dst, src64)));
+                    out.push(make_mov_reg(dst, src64));
                 }
             } else if unit_size.is_power_of_two() {
-                out.push(func.push_inst(make_lsl_imm(
-                    dst,
-                    src64,
-                    unit_size.trailing_zeros() as i64,
-                )));
+                out.push(make_lsl_imm(dst, src64, unit_size.trailing_zeros() as i64));
             } else if let Some(scratch) = stack_alloc_scratch(dst, Some(src64)) {
-                emit_materialize_u64(func, scratch, unit_size as u64, out);
-                out.push(func.push_inst(make_mul_reg(dst, src64, scratch)));
+                emit_materialize_u64(scratch, unit_size as u64, out);
+                out.push(make_mul_reg(dst, src64, scratch));
             } else if !regs_overlap(dst, src64) {
-                emit_materialize_u64(func, dst, unit_size as u64, out);
-                out.push(func.push_inst(make_mul_reg(dst, src64, dst)));
+                emit_materialize_u64(dst, unit_size as u64, out);
+                out.push(make_mul_reg(dst, src64, dst));
             } else {
                 // FINDING #10a class: a register-allocation shape this expansion
                 // cannot lower, not an impossible state. Surface it up the
@@ -2912,34 +4047,29 @@ fn emit_stack_alloc_size(
     Ok(())
 }
 
-fn emit_round_up_power_of_two(
-    func: &mut MachFunction,
-    reg: PReg,
-    align: u32,
-    out: &mut Vec<InstId>,
-) {
+fn emit_round_up_power_of_two(reg: PReg, align: u32, out: &mut Vec<MachInst>) {
     debug_assert!(align.is_power_of_two());
-    out.push(func.push_inst(MachInst::new(
+    out.push(MachInst::new(
         AArch64Opcode::AddRI,
         vec![
             MachOperand::PReg(reg),
             MachOperand::PReg(reg),
             MachOperand::Imm((align - 1) as i64),
         ],
-    )));
-    out.push(func.push_inst(make_lsr_imm(reg, reg, align.trailing_zeros() as i64)));
-    out.push(func.push_inst(make_lsl_imm(reg, reg, align.trailing_zeros() as i64)));
+    ));
+    out.push(make_lsr_imm(reg, reg, align.trailing_zeros() as i64));
+    out.push(make_lsl_imm(reg, reg, align.trailing_zeros() as i64));
 }
 
-fn emit_clamp_stack_alloc_minimum(func: &mut MachFunction, reg: PReg, out: &mut Vec<InstId>) {
+fn emit_clamp_stack_alloc_minimum(reg: PReg, out: &mut Vec<MachInst>) {
     let scratch = stack_alloc_scratch(reg, None)
         .expect("runtime stack allocation minimum clamp needs an IP scratch register");
-    emit_materialize_u64(func, scratch, STACK_ALIGNMENT as u64, out);
-    out.push(func.push_inst(MachInst::new(
+    emit_materialize_u64(scratch, STACK_ALIGNMENT as u64, out);
+    out.push(MachInst::new(
         AArch64Opcode::CmpRR,
         vec![MachOperand::PReg(reg), MachOperand::PReg(scratch)],
-    )));
-    out.push(func.push_inst(MachInst::new(
+    ));
+    out.push(MachInst::new(
         AArch64Opcode::Csel,
         vec![
             MachOperand::PReg(reg),
@@ -2947,188 +4077,319 @@ fn emit_clamp_stack_alloc_minimum(func: &mut MachFunction, reg: PReg, out: &mut 
             MachOperand::PReg(reg),
             MachOperand::Imm(3), // LO: unsigned reg < STACK_ALIGNMENT
         ],
-    )));
+    ));
 }
 
-fn emit_add_reg_imm(
-    func: &mut MachFunction,
-    dst: PReg,
-    src: MachOperand,
-    imm: u32,
-    out: &mut Vec<InstId>,
-) {
+fn emit_add_reg_imm(dst: PReg, mut src: MachOperand, mut imm: u32, out: &mut Vec<MachInst>) {
     if imm == 0 {
         match src {
-            MachOperand::PReg(src) if src != dst => {
-                out.push(func.push_inst(make_mov_reg(dst, src)))
-            }
-            MachOperand::Special(SpecialReg::SP) => {
-                out.push(func.push_inst(make_mov_sp_to_reg(dst)))
-            }
+            MachOperand::PReg(src) if src != dst => out.push(make_mov_reg(dst, src)),
+            MachOperand::Special(SpecialReg::SP) => out.push(make_mov_sp_to_reg(dst)),
             _ => {}
         }
         return;
     }
-    assert!(
-        imm <= 4095,
-        "runtime stack allocation immediate adjustment {imm} exceeds ADD immediate range"
-    );
-    out.push(func.push_inst(MachInst::new(
-        AArch64Opcode::AddRI,
-        vec![MachOperand::PReg(dst), src, MachOperand::Imm(imm as i64)],
-    )));
+    // ADD-immediate admits SP as its source in both the ordinary and LSL #12
+    // forms. Consume the high 12-bit chunks first, then the low remainder;
+    // subsequent additions use dst, so no extra scratch or source clobber is
+    // needed. This handles the complete u32 outgoing-area domain.
+    while imm != 0 {
+        let (opcode, encoded, consumed) = if imm >= 4096 {
+            let high = (imm >> 12).min(4095);
+            (AArch64Opcode::AddRIShift12, high, high << 12)
+        } else {
+            (AArch64Opcode::AddRI, imm, imm)
+        };
+        out.push(MachInst::new(
+            opcode,
+            vec![
+                MachOperand::PReg(dst),
+                src,
+                MachOperand::Imm(i64::from(encoded)),
+            ],
+        ));
+        imm -= consumed;
+        src = MachOperand::PReg(dst);
+    }
+}
+
+/// A runtime stack allocation expanded around its probe loop.
+///
+/// ```text
+/// setup: <dst = aligned byte count, plus the outgoing area>
+///        add  s, sp, #0          ; s = target SP = SP - dst
+///        sub  s, s, dst
+///        add  dst, sp, #0        ; dst = cursor
+/// test:  sub  dst, dst, #4096    ; next probe address (two SUB chunks)
+///        cmp  dst, s
+///        b.ls exit               ; within one interval of the target
+/// step:  add  sp, dst, #0
+///        str  xzr, [sp]
+///        b    test
+/// exit:  add  sp, s, #0
+///        str  xzr, [sp]
+///        <dst = SP + outgoing area, over-aligned if requested>
+/// ```
+///
+/// The walk starts from a touched SP: every nonzero frame's callee-saved
+/// store touches it, the static allocation of a frame with runtime
+/// allocations ends with a probe, and each runtime allocation probes its final
+/// SP. The frame insertion splits the containing block to lay out the loop.
+struct DynamicStackAllocExpansion {
+    setup: Vec<MachInst>,
+    test: Vec<MachInst>,
+    step: Vec<MachInst>,
+    exit: Vec<MachInst>,
 }
 
 fn expand_dynamic_stack_alloc_inst(
-    func: &mut MachFunction,
-    inst_id: InstId,
+    inst: &MachInst,
     outgoing_arg_area_size: u32,
-) -> Result<Option<Vec<InstId>>, crate::lower::LowerError> {
-    let inst = &func.insts[inst_id.0 as usize];
+) -> Result<Option<DynamicStackAllocExpansion>, crate::lower::LowerError> {
     if inst.opcode != AArch64Opcode::StackAlloc {
         return Ok(None);
     }
 
     if inst.operands.len() < 2 {
-        func.insts[inst_id.0 as usize] = make_nop();
-        return Ok(Some(vec![inst_id]));
+        return Err(frame_insertion_error(
+            "StackAlloc requires destination and count operands",
+        ));
     }
 
     let dst = match inst.operands.first() {
-        Some(MachOperand::PReg(dst)) => *dst,
+        Some(MachOperand::PReg(dst))
+            if preg_class(*dst) == RegClass::Gpr64 && hw_encoding(*dst) < 31 =>
+        {
+            *dst
+        }
         other => {
             return Err(crate::lower::LowerError::FrameLowering(format!(
-                "StackAlloc expected a PReg destination operand, got {other:?}"
+                "StackAlloc expected a 64-bit GPR destination (excluding register 31), got {other:?}"
             )));
         }
     };
     let size_operand = inst.operands[1].clone();
-    let unit_size = inst
-        .operands
-        .get(2)
-        .and_then(MachOperand::as_imm)
-        .unwrap_or(1);
-    assert!(
-        unit_size > 0 && unit_size <= u32::MAX as i64,
-        "StackAlloc unit size must fit u32 and be positive, got {unit_size}"
-    );
-    let requested_align = inst
-        .operands
-        .get(3)
-        .and_then(MachOperand::as_imm)
-        .unwrap_or(STACK_ALIGNMENT as i64);
-    assert!(
-        requested_align > 0
-            && requested_align <= 4096
-            && (requested_align as u64).is_power_of_two(),
-        "runtime stack allocation alignment {requested_align} must be a power of two <= 4096"
-    );
+    let immediate = |index, default| match inst.operands.get(index) {
+        None => Ok(default),
+        Some(MachOperand::Imm(value)) => Ok(*value),
+        Some(other) => Err(frame_insertion_error(format!(
+            "StackAlloc operand {index} must be an immediate, got {other:?}"
+        ))),
+    };
+    let unit_size = immediate(2, 1)?;
+    if unit_size <= 0 || unit_size > i64::from(u32::MAX) {
+        return Err(frame_insertion_error(format!(
+            "StackAlloc unit size must fit u32 and be positive, got {unit_size}"
+        )));
+    }
+    let requested_align = immediate(3, i64::from(STACK_ALIGNMENT))?;
+    if requested_align <= 0 || requested_align > 4096 || !(requested_align as u64).is_power_of_two()
+    {
+        return Err(frame_insertion_error(format!(
+            "runtime stack allocation alignment {requested_align} must be a power of two <= 4096"
+        )));
+    }
+    if let MachOperand::PReg(src) = size_operand
+        && (!matches!(preg_class(src), RegClass::Gpr32 | RegClass::Gpr64) || hw_encoding(src) >= 31)
+    {
+        return Err(frame_insertion_error(format!(
+            "StackAlloc count must be a GPR, got {src:?}"
+        )));
+    }
     let requested_align = requested_align as u32;
 
     let mut replacement = Vec::with_capacity(16);
-    emit_stack_alloc_size(func, dst, &size_operand, unit_size as u32, &mut replacement)?;
+    emit_stack_alloc_size(dst, &size_operand, unit_size as u32, &mut replacement)?;
 
     // Reserve enough bytes for the object, alignment slack, and the stable
     // outgoing call area below the returned pointer. SP itself remains
     // 16-byte aligned; over-alignment is applied to the returned address.
     if requested_align <= STACK_ALIGNMENT {
-        emit_round_up_power_of_two(func, dst, STACK_ALIGNMENT, &mut replacement);
+        emit_round_up_power_of_two(dst, STACK_ALIGNMENT, &mut replacement);
     } else {
         emit_add_reg_imm(
-            func,
             dst,
             MachOperand::PReg(dst),
             requested_align - 1,
             &mut replacement,
         );
-        emit_round_up_power_of_two(func, dst, STACK_ALIGNMENT, &mut replacement);
+        emit_round_up_power_of_two(dst, STACK_ALIGNMENT, &mut replacement);
     }
-    emit_clamp_stack_alloc_minimum(func, dst, &mut replacement);
+    emit_clamp_stack_alloc_minimum(dst, &mut replacement);
 
     if outgoing_arg_area_size > 0 {
         emit_add_reg_imm(
-            func,
             dst,
             MachOperand::PReg(dst),
             outgoing_arg_area_size,
             &mut replacement,
         );
     }
-    emit_sub_sp_reg(func, dst, &mut replacement);
 
-    if requested_align <= STACK_ALIGNMENT {
-        emit_add_reg_imm(
-            func,
-            dst,
-            MachOperand::Special(SpecialReg::SP),
-            outgoing_arg_area_size,
-            &mut replacement,
-        );
-    } else {
-        emit_add_reg_imm(
-            func,
-            dst,
-            MachOperand::Special(SpecialReg::SP),
-            outgoing_arg_area_size,
-            &mut replacement,
-        );
-        emit_round_up_power_of_two(func, dst, requested_align, &mut replacement);
+    // AArch64 ADD/SUB shifted-register encodings treat register 31 as XZR,
+    // not SP, so SP is only ever read or written through ADD-immediate, where
+    // register 31 is the architectural stack pointer.
+    let target = stack_alloc_scratch(dst, None).ok_or_else(|| {
+        frame_insertion_error(format!(
+            "runtime stack allocation needs an IP scratch register distinct from {dst:?}"
+        ))
+    })?;
+    replacement.push(make_mov_sp_to_reg(target));
+    replacement.push(MachInst::new(
+        AArch64Opcode::SubRR,
+        vec![
+            MachOperand::PReg(target),
+            MachOperand::PReg(target),
+            MachOperand::PReg(dst),
+        ],
+    ));
+    replacement.push(make_mov_sp_to_reg(dst));
+
+    let mut test = Vec::with_capacity(3);
+    push_sub_reg_imm_chunks(dst, STACK_PROBE_INTERVAL, &mut test);
+    test.push(MachInst::new(
+        AArch64Opcode::CmpRR,
+        vec![MachOperand::PReg(dst), MachOperand::PReg(target)],
+    ));
+
+    let step = vec![make_mov_reg_to_sp(dst), make_stack_probe()];
+
+    let mut exit = vec![make_mov_reg_to_sp(target), make_stack_probe()];
+    emit_add_reg_imm(
+        dst,
+        MachOperand::Special(SpecialReg::SP),
+        outgoing_arg_area_size,
+        &mut exit,
+    );
+    if requested_align > STACK_ALIGNMENT {
+        emit_round_up_power_of_two(dst, requested_align, &mut exit);
     }
 
-    func.insts[inst_id.0 as usize] = make_nop();
-    Ok(Some(replacement))
+    Ok(Some(DynamicStackAllocExpansion {
+        setup: replacement,
+        test,
+        step,
+        exit,
+    }))
+}
+
+/// `SUB reg, reg, #bytes` in encodable immediate chunks.
+fn push_sub_reg_imm_chunks(reg: PReg, mut bytes: u32, out: &mut Vec<MachInst>) {
+    while bytes > 0 {
+        let chunk = bytes.min(AARCH64_SP_ADJUST_CHUNK);
+        out.push(MachInst::new(
+            AArch64Opcode::SubRI,
+            vec![
+                MachOperand::PReg(reg),
+                MachOperand::PReg(reg),
+                MachOperand::Imm(i64::from(chunk)),
+            ],
+        ));
+        bytes -= chunk;
+    }
 }
 
 /// Expand runtime stack allocation pseudos after register allocation.
 ///
-/// `StackAlloc dst, count, unit, align` computes an aligned byte count,
-/// subtracts it from SP, and returns the newly allocated address in `dst`.
-/// For non-leaf callers, each runtime allocation also leaves the fixed
-/// outgoing stack-argument area below `dst` so later `[SP + offset]` call
-/// stores cannot overlap the allocation's returned object.
+/// `StackAlloc dst, count, unit, align` computes an aligned byte count, moves
+/// SP down by it through the probed walk of [`DynamicStackAllocExpansion`],
+/// and returns the newly allocated address in `dst`. For non-leaf callers,
+/// each runtime allocation also leaves the fixed outgoing stack-argument area
+/// below `dst` so later `[SP + offset]` call stores cannot overlap the
+/// allocation's returned object. The containing block is split after the
+/// pseudo; the loop blocks sit between its two halves.
 fn expand_dynamic_stack_allocs(
-    func: &mut MachFunction,
+    func: &MachFunction,
+    plan: &mut FrameInsertionPlan,
     outgoing_arg_area_size: u32,
 ) -> Result<(), crate::lower::LowerError> {
-    for block_idx in 0..func.blocks.len() {
-        let old_insts = std::mem::take(&mut func.blocks[block_idx].insts);
-        let mut new_insts = Vec::with_capacity(old_insts.len());
+    // Blocks created below are appended, so a continuation holding further
+    // allocations from the same original block is visited later.
+    let mut block_idx = 0;
+    while block_idx < plan.blocks.len() {
+        let block = BlockId(checked_frame_insertion_id(block_idx, 0, "block")?);
+        // Match the opcode alone so a malformed pseudo reaches the operand
+        // checks below instead of surviving to encoding.
+        let view = plan.view(func);
+        let found = plan.blocks[block_idx]
+            .insts
+            .iter()
+            .enumerate()
+            .map(|(position, &inst_id)| (position, inst_id, &view.insts[inst_id.0 as usize]))
+            .find(|(_, _, inst)| inst.opcode == AArch64Opcode::StackAlloc)
+            .map(|(position, inst_id, inst)| (position, inst_id, inst.clone()));
+        let Some((position, inst_id, inst)) = found else {
+            block_idx += 1;
+            continue;
+        };
+        let expansion = expand_dynamic_stack_alloc_inst(&inst, outgoing_arg_area_size)?
+            .ok_or_else(|| frame_insertion_error("StackAlloc expansion produced no code"))?;
 
-        for inst_id in old_insts {
-            if let Some(replacement) =
-                expand_dynamic_stack_alloc_inst(func, inst_id, outgoing_arg_area_size)?
-            {
-                new_insts.extend(replacement);
-            } else {
-                new_insts.push(inst_id);
-            }
+        let exit = plan.split_block_tail(func, block, position + 1)?;
+        plan.blocks[block_idx].insts.pop();
+        plan.edited_insts.insert(inst_id.0 as usize, make_nop());
+        let test = plan.create_block_after(block, 1)?;
+        let step = plan.create_block_after(test, 0)?;
+
+        for inst in expansion.setup {
+            let id = plan.push_inst(inst)?;
+            plan.blocks[block_idx].insts.push(id);
         }
+        for inst in expansion.test.into_iter().chain([MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Imm(COND_LS), MachOperand::Block(exit)],
+        )]) {
+            let id = plan.push_inst(inst)?;
+            plan.blocks[test.0 as usize].insts.push(id);
+        }
+        for inst in expansion.step.into_iter().chain([MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(test)],
+        )]) {
+            let id = plan.push_inst(inst)?;
+            plan.blocks[step.0 as usize].insts.push(id);
+        }
+        let mut exit_insts = Vec::with_capacity(expansion.exit.len());
+        for inst in expansion.exit {
+            exit_insts.push(plan.push_inst(inst)?);
+        }
+        exit_insts.append(&mut plan.blocks[exit.0 as usize].insts);
+        plan.blocks[exit.0 as usize].insts = exit_insts;
 
-        func.blocks[block_idx].insts = new_insts;
+        plan.add_edge(block, test);
+        plan.add_edge(test, exit);
+        plan.add_edge(test, step);
+        plan.add_edge(step, test);
+        block_idx += 1;
     }
     Ok(())
 }
 
-fn retarget_rbit_return_copies(func: &mut MachFunction) -> u32 {
+fn retarget_rbit_return_copies(func: &MachFunction, plan: &mut FrameInsertionPlan) -> u32 {
     let mut removed = 0;
 
     for block_idx in 0..func.blocks.len() {
-        let old_insts = std::mem::take(&mut func.blocks[block_idx].insts);
+        let old_insts = std::mem::take(&mut plan.blocks[block_idx].insts);
         let mut new_insts = Vec::with_capacity(old_insts.len());
         let mut idx = 0;
 
         while idx < old_insts.len() {
             if idx + 2 < old_insts.len()
-                && (try_remove_copy_before_rbit_return(func, &old_insts, idx)
-                    || try_remove_uxtw_before_rbit_return(func, &old_insts, idx))
+                && (try_remove_copy_before_rbit_return(&plan.view(func), &old_insts, idx)
+                    || try_remove_uxtw_before_rbit_return(&plan.view(func), &old_insts, idx))
             {
                 idx += 1;
                 removed += 1;
                 continue;
             }
 
-            if idx + 2 < old_insts.len() && try_retarget_rbit_return_copy(func, &old_insts, idx + 1)
+            if idx + 2 < old_insts.len()
+                && let Some((rbit_id, dst)) =
+                    try_retarget_rbit_return_copy(&plan.view(func), &old_insts, idx + 1)
             {
+                let mut rbit = plan.view(func).insts[rbit_id.0 as usize].clone();
+                rbit.operands[0] = MachOperand::PReg(dst);
+                plan.edited_insts.insert(rbit_id.0 as usize, rbit);
                 new_insts.push(old_insts[idx]);
                 idx += 2;
                 removed += 1;
@@ -3139,14 +4400,14 @@ fn retarget_rbit_return_copies(func: &mut MachFunction) -> u32 {
             idx += 1;
         }
 
-        func.blocks[block_idx].insts = new_insts;
+        plan.blocks[block_idx].insts = new_insts;
     }
 
     removed
 }
 
 fn try_remove_copy_before_rbit_return(
-    func: &MachFunction,
+    func: &FrameFunctionView<'_>,
     block_insts: &[InstId],
     copy_idx: usize,
 ) -> bool {
@@ -3186,7 +4447,7 @@ fn try_remove_copy_before_rbit_return(
 }
 
 fn try_remove_uxtw_before_rbit_return(
-    func: &MachFunction,
+    func: &FrameFunctionView<'_>,
     block_insts: &[InstId],
     uxtw_idx: usize,
 ) -> bool {
@@ -3228,12 +4489,12 @@ fn try_remove_uxtw_before_rbit_return(
 }
 
 fn try_retarget_rbit_return_copy(
-    func: &mut MachFunction,
+    func: &FrameFunctionView<'_>,
     block_insts: &[InstId],
     copy_idx: usize,
-) -> bool {
+) -> Option<(InstId, PReg)> {
     if copy_idx == 0 || copy_idx + 1 >= block_insts.len() {
-        return false;
+        return None;
     }
 
     let rbit_id = block_insts[copy_idx - 1];
@@ -3241,42 +4502,42 @@ fn try_retarget_rbit_return_copy(
     let ret_id = block_insts[copy_idx + 1];
 
     if !func.insts[ret_id.0 as usize].is_return() {
-        return false;
+        return None;
     }
 
     let copy = &func.insts[copy_id.0 as usize];
     let copy_opcode = copy.opcode;
     if !is_rbit_return_copy_opcode(copy_opcode) || copy.operands.len() < 2 {
-        return false;
+        return None;
     }
 
     let (Some(copy_dst), Some(copy_src)) = (
         copy.operands.first().and_then(MachOperand::as_preg),
         copy.operands.get(1).and_then(MachOperand::as_preg),
     ) else {
-        return false;
+        return None;
     };
 
     let retarget_dst = if copy_opcode == AArch64Opcode::Uxtw {
         if matches!(copy_dst, W0 | X0) {
             W0
         } else {
-            return false;
+            return None;
         }
     } else {
         if preg_class(copy_dst) != preg_class(copy_src) {
-            return false;
+            return None;
         }
         copy_dst
     };
 
     if !matches!(retarget_dst, W0 | X0) || preg_class(retarget_dst) != preg_class(copy_src) {
-        return false;
+        return None;
     }
 
     let rbit = &func.insts[rbit_id.0 as usize];
     if rbit.opcode != AArch64Opcode::Rbit || rbit.operands.len() < 2 {
-        return false;
+        return None;
     }
 
     if rbit.operands.first().and_then(MachOperand::as_preg) != Some(copy_src)
@@ -3284,11 +4545,10 @@ fn try_retarget_rbit_return_copy(
         || !rbit.implicit_defs.is_empty()
         || !rbit.implicit_uses.is_empty()
     {
-        return false;
+        return None;
     }
 
-    func.insts[rbit_id.0 as usize].operands[0] = MachOperand::PReg(retarget_dst);
-    true
+    Some((rbit_id, retarget_dst))
 }
 
 fn is_rbit_return_copy_opcode(opcode: AArch64Opcode) -> bool {
@@ -3378,12 +4638,12 @@ impl BlockDom {
 /// Compute block dominators over `func`'s CFG. Returns `None` for the bail-out
 /// cases (empty / oversized / out-of-range entry) so callers treat the function
 /// as ineligible for shrink-wrapping.
-fn compute_block_dominators(func: &MachFunction) -> Option<BlockDom> {
+fn compute_block_dominators(func: &FrameFunctionView<'_>) -> Option<BlockDom> {
     let n = func.blocks.len();
     if n == 0 || n > 4096 {
         return None;
     }
-    let entry = func.entry.0 as usize;
+    let entry = func.source.entry.0 as usize;
     if entry >= n {
         return None;
     }
@@ -3402,8 +4662,12 @@ fn compute_block_dominators(func: &MachFunction) -> Option<BlockDom> {
     }
     dom[entry * words + entry / 64] = 1u64 << (entry % 64);
 
-    let order: Vec<usize> = if func.block_order.len() == n {
-        func.block_order.iter().map(|b| b.0 as usize).collect()
+    let order: Vec<usize> = if func.source.block_order.len() == n {
+        func.source
+            .block_order
+            .iter()
+            .map(|b| b.0 as usize)
+            .collect()
     } else {
         (0..n).collect()
     };
@@ -3451,7 +4715,10 @@ fn compute_block_dominators(func: &MachFunction) -> Option<BlockDom> {
 }
 
 /// Blocks reachable from `entry` over successor edges.
-fn compute_reachable(func: &MachFunction, entry: usize) -> std::collections::BTreeSet<usize> {
+fn compute_reachable(
+    func: &FrameFunctionView<'_>,
+    entry: usize,
+) -> std::collections::BTreeSet<usize> {
     let n = func.blocks.len();
     let mut seen = std::collections::BTreeSet::new();
     if entry >= n {
@@ -3473,7 +4740,10 @@ fn compute_reachable(func: &MachFunction, entry: usize) -> std::collections::BTr
 /// The set of blocks that lie inside some natural loop (i.e. are reachable from a
 /// latch back to its dominating header). A block placed in this set can execute
 /// more than once, so `S` must NOT be one of them (the prologue must run once).
-fn blocks_in_any_loop(func: &MachFunction, dom: &BlockDom) -> std::collections::BTreeSet<usize> {
+fn blocks_in_any_loop(
+    func: &FrameFunctionView<'_>,
+    dom: &BlockDom,
+) -> std::collections::BTreeSet<usize> {
     let n = func.blocks.len();
     let mut looped = std::collections::BTreeSet::new();
     for u in 0..n {
@@ -3576,7 +4846,7 @@ fn inst_needs_frame(inst: &MachInst) -> bool {
 }
 
 /// Does any instruction in block `b` force a frame?
-fn block_needs_frame(func: &MachFunction, b: usize) -> bool {
+fn block_needs_frame(func: &FrameFunctionView<'_>, b: usize) -> bool {
     func.blocks[b]
         .insts
         .iter()
@@ -3584,11 +4854,151 @@ fn block_needs_frame(func: &MachFunction, b: usize) -> bool {
 }
 
 /// Does block `b` contain a return instruction?
-fn block_is_return(func: &MachFunction, b: usize) -> bool {
+fn block_is_return(func: &FrameFunctionView<'_>, b: usize) -> bool {
     func.blocks[b]
         .insts
         .iter()
         .any(|&id| func.insts[id.0 as usize].is_return())
+}
+
+/// Whether block `b` can host an EDGE epilogue: its only control transfer is a
+/// trailing unconditional `B` (or a plain fallthrough), so the restore that
+/// `emit_shrink_wrapped` places before that `B` (or at the block end) runs on
+/// every exit from the block. A conditional branch, a jump-table / register
+/// branch or a return anywhere in the block would leave through an exit the
+/// restore does not precede.
+fn block_can_host_edge_epilogue(func: &FrameFunctionView<'_>, b: usize) -> bool {
+    let insts = &func.blocks[b].insts;
+    insts.iter().enumerate().all(|(position, &id)| {
+        let inst = &func.insts[id.0 as usize];
+        if inst.is_return() || inst.opcode == AArch64Opcode::TailCall {
+            return false;
+        }
+        // A trap pseudo carries `IS_BRANCH` only because it flows control by
+        // TRAPPING (`AArch64Opcode::is_trap_pseudo`); it never leaves to a
+        // block, so the restore need not precede it.
+        let is_transfer = !inst.opcode.is_trap_pseudo()
+            && (inst.is_branch() || inst.is_conditional_branch() || inst.is_unconditional_branch());
+        !is_transfer || (position + 1 == insts.len() && inst.opcode == AArch64Opcode::B)
+    })
+}
+
+/// The frame-state regions of a shrink-wrap candidate with save block `S`.
+struct ShrinkWrapRegions {
+    /// Blocks entered with the frame established: reachable from `S` without
+    /// leaving through an edge-epilogue block.
+    frame: std::collections::BTreeSet<usize>,
+    /// Blocks entered WITHOUT a frame: reachable from the entry without passing
+    /// `S`, or from the successor of an edge-epilogue block (whose restore has
+    /// already run). Disjoint from `frame` in every admitted plan.
+    leaf: std::collections::BTreeSet<usize>,
+    /// Frame-only, single-successor blocks whose end carries the restore
+    /// (epilogue minus `ret`) because their successor is also a leaf block.
+    edge_epilogue: std::collections::BTreeSet<usize>,
+}
+
+/// Separate the frame region of save block `s` from the leaf region, or `None`.
+///
+/// A block reached both with and without the frame (a JOIN of a frame path and
+/// a leaf path) cannot run correctly: code after it either restores registers
+/// that were never saved or returns without restoring them. Each such mixed
+/// block is resolved by cutting every FRAME-ONLY predecessor edge into it with
+/// an edge epilogue, which is sound only when that predecessor's one exit is
+/// the edge into the mixed block (`block_can_host_edge_epilogue`, a single
+/// successor). The cut turns the mixed block leaf-only; the regions are then
+/// recomputed, because the cut changes what the frame path reaches. A mixed
+/// block whose frame-side predecessors cannot all be cut — or a cut that would
+/// itself be reached in leaf state — declines the candidate. Each round adds
+/// at least one cut or stops, so the loop is bounded by the block count.
+fn shrink_wrap_regions(
+    func: &FrameFunctionView<'_>,
+    reachable: &std::collections::BTreeSet<usize>,
+    entry: usize,
+    s: usize,
+) -> Option<ShrinkWrapRegions> {
+    use std::collections::BTreeSet;
+    let n = func.blocks.len();
+    if s >= n || entry >= n || s == entry {
+        return None;
+    }
+    let succs = |b: usize| {
+        func.blocks[b]
+            .succs
+            .iter()
+            .map(|succ| succ.0 as usize)
+            .filter(move |&t| t < n)
+    };
+    let mut edge_epilogue: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        // The frame region: forward from `S`, stopping at every cut.
+        let mut frame = BTreeSet::from([s]);
+        let mut stack = vec![s];
+        while let Some(b) = stack.pop() {
+            if edge_epilogue.contains(&b) {
+                continue;
+            }
+            for t in succs(b) {
+                if frame.insert(t) {
+                    stack.push(t);
+                }
+            }
+        }
+        // The leaf region: forward from the entry and from past every cut,
+        // never entering `S` (its prologue is what makes a block frame-state).
+        let mut leaf = BTreeSet::new();
+        let mut stack = Vec::new();
+        let seeds = std::iter::once(entry).chain(edge_epilogue.iter().flat_map(|&e| succs(e)));
+        for b in seeds {
+            if b != s && leaf.insert(b) {
+                stack.push(b);
+            }
+        }
+        while let Some(b) = stack.pop() {
+            for t in succs(b) {
+                if t != s && leaf.insert(t) {
+                    stack.push(t);
+                }
+            }
+        }
+        // A cut reached in leaf state would restore registers never saved.
+        if edge_epilogue.iter().any(|e| leaf.contains(e)) {
+            return None;
+        }
+        let mixed: Vec<usize> = frame.intersection(&leaf).copied().collect();
+        if mixed.is_empty() {
+            return Some(ShrinkWrapRegions {
+                frame,
+                leaf,
+                edge_epilogue,
+            });
+        }
+        let cuts_before = edge_epilogue.len();
+        for &q in &mixed {
+            for pred in &func.blocks[q].preds {
+                let p = pred.0 as usize;
+                if p >= n
+                    || !reachable.contains(&p)
+                    || !frame.contains(&p)
+                    || leaf.contains(&p)
+                    || edge_epilogue.contains(&p)
+                {
+                    // Leaf-only and already-cut predecessors need nothing; a
+                    // MIXED predecessor is itself in `mixed` and is resolved
+                    // upstream in this same round.
+                    continue;
+                }
+                let single_successor_into_q =
+                    func.blocks[p].succs.len() == 1 && func.blocks[p].succs[0].0 as usize == q;
+                if !single_successor_into_q || !block_can_host_edge_epilogue(func, p) {
+                    return None;
+                }
+                edge_epilogue.insert(p);
+            }
+        }
+        if edge_epilogue.len() == cuts_before {
+            return None;
+        }
+    }
 }
 
 /// A validated shrink-wrap placement: where to sink the prologue and how each
@@ -3596,12 +5006,14 @@ fn block_is_return(func: &MachFunction, b: usize) -> bool {
 struct ShrinkWrapPlan {
     /// The save block `S`: prologue is emitted at its start.
     save_block: BlockId,
-    /// Returns dominated by `S`: emit the full epilogue (incl. `ret`) before the
-    /// original `ret`.
+    /// Returns entered with the frame established (`shrink_wrap_regions`'
+    /// frame region): emit the full epilogue (incl. `ret`) before the original
+    /// `ret`.
     frame_return_blocks: Vec<BlockId>,
-    /// Frame-side predecessors of a leaf-shared join return: append the epilogue
-    /// (minus `ret`) at the block end so the restore runs on the frame edge while
-    /// the leaf edge into the shared return stays bare.
+    /// Frame-only, single-successor blocks whose successor a leaf path also
+    /// reaches (a leaf-shared join — a return, or a block on the way to one):
+    /// append the epilogue (minus `ret`) at the block end so the restore runs on
+    /// the frame edge while the leaf edge into the join stays bare.
     edge_epilogue_blocks: Vec<BlockId>,
     /// Return blocks left as a bare `ret` (leaf / leaf-shared join). Informational
     /// (used by the fail-closed invariant check).
@@ -3611,7 +5023,10 @@ struct ShrinkWrapPlan {
 /// Compute a shrink-wrap plan for `func`, or `None` if the function is not an
 /// admissible leaf-guard shape (fail-closed — the caller then emits the ordinary
 /// whole-function prologue). See the module comment above for the admission set.
-fn compute_shrink_wrap_plan(func: &MachFunction, layout: &FrameLayout) -> Option<ShrinkWrapPlan> {
+fn compute_shrink_wrap_plan(
+    func: &FrameFunctionView<'_>,
+    layout: &FrameLayout,
+) -> Option<ShrinkWrapPlan> {
     let dbg =
         shrink_wrap_env_enabled() && std::env::var_os("TCG_AARCH64_SHRINKWRAP_STATS").is_some();
     // --- Target / layout preconditions (Darwin FRAME mode, nothing exotic). ---
@@ -3621,10 +5036,14 @@ fn compute_shrink_wrap_plan(func: &MachFunction, layout: &FrameLayout) -> Option
     if layout.callee_saved_pairs.is_empty() {
         return None;
     }
-    if func.eh_metadata.has_eh_info() {
+    // A probe loop needs its own block; the sunk prologue is straight-line.
+    if StaticStackProbePlan::for_layout(layout).looped {
         return None;
     }
-    if func.stack_protector.is_enabled() || func.stack_protector_slot.is_some() {
+    if func.source.eh_metadata.has_eh_info() {
+        return None;
+    }
+    if func.source.stack_protector.is_enabled() || func.source.stack_protector_slot.is_some() {
         return None;
     }
     // Must encode as compact-unwind FRAME mode (never DWARF fallback): the shrunk
@@ -3637,7 +5056,7 @@ fn compute_shrink_wrap_plan(func: &MachFunction, layout: &FrameLayout) -> Option
     if !(2..=4096).contains(&n) {
         return None;
     }
-    let entry = func.entry.0 as usize;
+    let entry = func.source.entry.0 as usize;
     if entry >= n {
         return None;
     }
@@ -3711,67 +5130,62 @@ fn compute_shrink_wrap_plan(func: &MachFunction, layout: &FrameLayout) -> Option
             continue;
         }
 
-        // Classify returns.
+        // Classify returns by the FRAME STATE they are reached in, not by
+        // dominance. Dominance answers "does every path pass `S`", which is
+        // the wrong question for a return (or any block) that a frame path
+        // can reach through a block `S` does NOT dominate: a JOIN of a leaf
+        // path and a frame path, which the dominance classification took for
+        // a leaf block and left without a restore. Measured (2026-09-28):
+        // `core::char::methods::encode_utf8_raw_unchecked` at -O0 has the
+        // frame-dominated block 13 fall into block 22 — also the leaf path's
+        // successor — and 22 into the shared return 32; the frame edge 30 into
+        // 32 got its restore, the frame path through 22 did not, and the final
+        // stream's spill-slot net refused with `callee-saved-not-restored` at
+        // block 32 (`[TCG-A64-SPILL-SLOT]`). `shrink_wrap_regions` cuts every
+        // frame path with an edge epilogue on the last frame-only block before
+        // a block a leaf path also reaches — or declines.
+        let Some(regions) = shrink_wrap_regions(func, &reachable, entry, s) else {
+            if dbg {
+                eprintln!(
+                    "[shrinkwrap-B] fn={} decline S={s}: no edge-epilogue cut separates the \
+                     frame region from the leaf region",
+                    func.source.name
+                );
+            }
+            continue;
+        };
+        // Every frame-forcing block runs with the frame established and is
+        // never reached in leaf state.
+        if !frame_blocks
+            .iter()
+            .all(|b| regions.frame.contains(b) && !regions.leaf.contains(b))
+        {
+            continue;
+        }
         let mut frame_return_blocks = Vec::new();
-        let mut edge_epilogue_blocks = Vec::new();
         let mut leaf_return_blocks = Vec::new();
-        let mut has_leaf_return = false;
         let mut ok = true;
         for b in 0..n {
             if !reachable.contains(&b) || !block_is_return(func, b) {
                 continue;
             }
-            if dom.dominates(s, b) {
-                frame_return_blocks.push(BlockId(b as u32));
-                continue;
-            }
-            // A return NOT dominated by `S`: a leaf or leaf-shared join return.
-            has_leaf_return = true;
-            let mut frame_preds = Vec::new();
-            let mut has_leaf_pred = false;
-            for &p in &func.blocks[b].preds {
-                let pu = p.0 as usize;
-                if pu >= n || !reachable.contains(&pu) {
-                    continue;
-                }
-                if dom.dominates(s, pu) {
-                    frame_preds.push(pu);
-                } else {
-                    has_leaf_pred = true;
-                }
-            }
-            if frame_preds.is_empty() {
-                // Pure leaf return: bare `ret`.
-                leaf_return_blocks.push(BlockId(b as u32));
-                continue;
-            }
-            // Join return reached by both a frame edge and a leaf edge. Each
-            // frame-side predecessor must be a single-successor block so the
-            // epilogue can be appended there (on the frame edge only).
-            if !has_leaf_pred {
-                ok = false;
-                break;
-            }
-            for &fp in &frame_preds {
-                if func.blocks[fp].succs.len() != 1
-                    || func.blocks[fp].succs[0].0 as usize != b
-                    || block_is_return(func, fp)
-                {
+            match (regions.frame.contains(&b), regions.leaf.contains(&b)) {
+                (true, false) => frame_return_blocks.push(BlockId(b as u32)),
+                (false, true) => leaf_return_blocks.push(BlockId(b as u32)),
+                _ => {
                     ok = false;
                     break;
                 }
-                edge_epilogue_blocks.push(BlockId(fp as u32));
             }
-            if !ok {
-                break;
-            }
-            leaf_return_blocks.push(BlockId(b as u32)); // stays bare
         }
-        if !ok || !has_leaf_return {
+        if !ok || leaf_return_blocks.is_empty() {
             continue;
         }
-        edge_epilogue_blocks.sort_unstable_by_key(|b| b.0);
-        edge_epilogue_blocks.dedup();
+        let edge_epilogue_blocks: Vec<BlockId> = regions
+            .edge_epilogue
+            .iter()
+            .map(|&b| BlockId(b as u32))
+            .collect();
 
         let plan = ShrinkWrapPlan {
             save_block: s_cand,
@@ -3784,7 +5198,7 @@ fn compute_shrink_wrap_plan(func: &MachFunction, layout: &FrameLayout) -> Option
             if dbg {
                 eprintln!(
                     "[shrinkwrap-B] fn={} ADMIT: save_block={} frame_rets={} edge_epi={} leaf_rets={}",
-                    func.name,
+                    func.source.name,
                     plan.save_block.0,
                     plan.frame_return_blocks.len(),
                     plan.edge_epilogue_blocks.len(),
@@ -3798,11 +5212,12 @@ fn compute_shrink_wrap_plan(func: &MachFunction, layout: &FrameLayout) -> Option
 }
 
 /// Fail-closed frame invariant (design-mandated): re-check, INDEPENDENTLY of the
-/// construction above, that `S` dominates every frame-forcing block and that
-/// every path to a `ret` restores exactly when it saved. Returns false (decline)
-/// on any violation.
+/// construction above, that `S` dominates every frame-forcing block and — by a
+/// forward frame-state dataflow over every path, not by dominance at a return's
+/// predecessors — that every path to a `ret` restores exactly when it saved.
+/// Returns false (decline) on any violation.
 fn verify_shrink_wrap_plan(
-    func: &MachFunction,
+    func: &FrameFunctionView<'_>,
     dom: &BlockDom,
     reachable: &std::collections::BTreeSet<usize>,
     plan: &ShrinkWrapPlan,
@@ -3823,56 +5238,101 @@ fn verify_shrink_wrap_plan(
         }
     }
     // (2) Every reachable return is accounted for exactly once and consistently.
-    let frame_set: std::collections::BTreeSet<u32> =
-        plan.frame_return_blocks.iter().map(|b| b.0).collect();
-    let leaf_set: std::collections::BTreeSet<u32> =
-        plan.leaf_return_blocks.iter().map(|b| b.0).collect();
-    let edge_set: std::collections::BTreeSet<u32> =
-        plan.edge_epilogue_blocks.iter().map(|b| b.0).collect();
+    let frame_set: std::collections::BTreeSet<usize> = plan
+        .frame_return_blocks
+        .iter()
+        .map(|b| b.0 as usize)
+        .collect();
+    let leaf_set: std::collections::BTreeSet<usize> = plan
+        .leaf_return_blocks
+        .iter()
+        .map(|b| b.0 as usize)
+        .collect();
+    let edge_set: std::collections::BTreeSet<usize> = plan
+        .edge_epilogue_blocks
+        .iter()
+        .map(|b| b.0 as usize)
+        .collect();
     // Frame returns and leaf returns are disjoint; edge blocks are neither.
-    if frame_set.intersection(&leaf_set).next().is_some() {
+    if frame_set.intersection(&leaf_set).next().is_some()
+        || edge_set
+            .iter()
+            .any(|e| frame_set.contains(e) || leaf_set.contains(e))
+    {
         return false;
     }
-    for b in 0..n {
-        if !reachable.contains(&b) || !block_is_return(func, b) {
-            continue;
-        }
-        let bid = b as u32;
-        if dom.dominates(s, b) {
-            if !frame_set.contains(&bid) {
-                return false;
-            }
-        } else {
-            if !leaf_set.contains(&bid) {
-                return false;
-            }
-            // Each frame-side predecessor of a bare (leaf) return must carry an
-            // edge epilogue and be single-successor into this return (restore
-            // post-dominates the frame edge).
-            for &p in &func.blocks[b].preds {
-                let pu = p.0 as usize;
-                if pu >= n || !reachable.contains(&pu) {
-                    continue;
-                }
-                if dom.dominates(s, pu)
-                    && (!edge_set.contains(&(pu as u32))
-                        || func.blocks[pu].succs.len() != 1
-                        || func.blocks[pu].succs[0].0 as usize != b)
-                {
-                    return false;
-                }
-            }
-        }
-    }
-    // (3) Edge-epilogue blocks are frame-dominated single-successor non-returns.
-    for &eb in &plan.edge_epilogue_blocks {
-        let e = eb.0 as usize;
+    // (3) Edge-epilogue blocks are single-successor non-returns whose only
+    //     exit follows the appended restore.
+    for &e in &edge_set {
         if e >= n
-            || !dom.dominates(s, e)
             || func.blocks[e].succs.len() != 1
             || block_is_return(func, e)
+            || !block_can_host_edge_epilogue(func, e)
         {
             return false;
+        }
+    }
+    // (3b) THE FRAME STATE, as a forward dataflow over every path from the
+    //      entry. This is the invariant itself, not a proxy for it: a block is
+    //      entered with the frame either established or not, never both; `S`
+    //      is entered only without it (so the prologue runs once) and leaves
+    //      with it; an edge-epilogue block is entered only with it and leaves
+    //      without it; every frame-forcing block runs with it; and a return
+    //      runs in exactly the state its classification restores for. The old
+    //      check read dominance at a return's IMMEDIATE predecessors, which
+    //      misses a frame path that reaches a leaf-shared return through a
+    //      join block `S` does not dominate — the `encode_utf8_raw_unchecked`
+    //      hole (see `shrink_wrap_regions`).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FrameState {
+        Leaf,
+        Frame,
+    }
+    let entry = func.source.entry.0 as usize;
+    if entry >= n {
+        return false;
+    }
+    let mut entered: Vec<Option<FrameState>> = vec![None; n];
+    let mut work = vec![(entry, FrameState::Leaf)];
+    while let Some((b, state)) = work.pop() {
+        if b >= n {
+            return false;
+        }
+        match entered[b] {
+            Some(seen) if seen == state => continue,
+            Some(_) => return false,
+            None => entered[b] = Some(state),
+        }
+        let mut state = state;
+        if b == s {
+            if state != FrameState::Leaf {
+                return false;
+            }
+            state = FrameState::Frame;
+        }
+        if block_needs_frame(func, b) && state != FrameState::Frame {
+            return false;
+        }
+        if block_is_return(func, b) {
+            let restores_for = if frame_set.contains(&b) {
+                FrameState::Frame
+            } else if leaf_set.contains(&b) {
+                FrameState::Leaf
+            } else {
+                return false;
+            };
+            if state != restores_for {
+                return false;
+            }
+        }
+        if edge_set.contains(&b) {
+            if state != FrameState::Frame {
+                return false;
+            }
+            state = FrameState::Leaf;
+        }
+        for succ in &func.blocks[b].succs {
+            work.push((succ.0 as usize, state));
         }
     }
     // (4) There is a genuine leaf return (a shrink actually happens).
@@ -3882,30 +5342,35 @@ fn verify_shrink_wrap_plan(
 /// Emit a shrink-wrapped frame from a validated plan: prologue at `S`, epilogue
 /// before frame-dominated returns, epilogue (minus `ret`) on the frame edge into
 /// a leaf-shared join return, and bare `ret` on the leaf returns.
-fn emit_shrink_wrapped(func: &mut MachFunction, layout: &FrameLayout, plan: &ShrinkWrapPlan) {
+fn emit_shrink_wrapped(
+    func: &MachFunction,
+    insertion: &mut FrameInsertionPlan,
+    layout: &FrameLayout,
+    plan: &ShrinkWrapPlan,
+) -> Result<(), crate::lower::LowerError> {
     // Prologue at the start of the save block.
     let prologue = emit_prologue(layout);
     let s = plan.save_block.0 as usize;
-    let old = std::mem::take(&mut func.blocks[s].insts);
+    let old = std::mem::take(&mut insertion.blocks[s].insts);
     let mut new_insts = Vec::with_capacity(prologue.len() + old.len());
     for pi in prologue {
-        let id = func.push_inst(pi);
+        let id = insertion.push_inst(pi)?;
         new_insts.push(id);
     }
     new_insts.extend(old);
-    func.blocks[s].insts = new_insts;
+    insertion.blocks[s].insts = new_insts;
 
     // Frame-dominated returns: insert cleanup before the original return. The
     // return carries signature-authenticated implicit ABI sink metadata, so it
     // must retain both its instruction identity and all of its fields.
     for &rb in &plan.frame_return_blocks {
         let b = rb.0 as usize;
-        let old = std::mem::take(&mut func.blocks[b].insts);
+        let old = std::mem::take(&mut insertion.blocks[b].insts);
         let mut new_insts = Vec::with_capacity(old.len() + layout.callee_saved_pairs.len() + 2);
         for &inst_id in &old {
-            if func.insts[inst_id.0 as usize].is_return() {
+            if insertion.view(func).insts[inst_id.0 as usize].is_return() {
                 for ei in emit_epilogue_before_tail_branch(layout) {
-                    let id = func.push_inst(ei);
+                    let id = insertion.push_inst(ei)?;
                     new_insts.push(id);
                 }
                 new_insts.push(inst_id);
@@ -3913,7 +5378,7 @@ fn emit_shrink_wrapped(func: &mut MachFunction, layout: &FrameLayout, plan: &Shr
                 new_insts.push(inst_id);
             }
         }
-        func.blocks[b].insts = new_insts;
+        insertion.blocks[b].insts = new_insts;
     }
 
     // Frame edges into a leaf-shared return: epilogue minus ret, inserted before
@@ -3921,29 +5386,31 @@ fn emit_shrink_wrapped(func: &mut MachFunction, layout: &FrameLayout, plan: &Shr
     for &eb in &plan.edge_epilogue_blocks {
         let b = eb.0 as usize;
         let epi = emit_epilogue_before_tail_branch(layout);
-        let old = std::mem::take(&mut func.blocks[b].insts);
-        let ends_in_uncond_branch = old
+        let old = std::mem::take(&mut insertion.blocks[b].insts);
+        let final_branch = old
             .last()
-            .is_some_and(|&id| func.insts[id.0 as usize].opcode == AArch64Opcode::B);
+            .copied()
+            .filter(|id| insertion.view(func).insts[id.0 as usize].opcode == AArch64Opcode::B);
         let mut new_insts = Vec::with_capacity(old.len() + epi.len());
-        if ends_in_uncond_branch {
+        if let Some(branch) = final_branch {
             new_insts.extend_from_slice(&old[..old.len() - 1]);
             for ei in epi {
-                let id = func.push_inst(ei);
+                let id = insertion.push_inst(ei)?;
                 new_insts.push(id);
             }
-            new_insts.push(*old.last().unwrap());
+            new_insts.push(branch);
         } else {
             new_insts.extend_from_slice(&old);
             for ei in epi {
-                let id = func.push_inst(ei);
+                let id = insertion.push_inst(ei)?;
                 new_insts.push(id);
             }
         }
-        func.blocks[b].insts = new_insts;
+        insertion.blocks[b].insts = new_insts;
     }
 
     // Leaf returns keep their bare `ret` (nothing to do).
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3961,7 +5428,8 @@ fn emit_shrink_wrapped(func: &mut MachFunction, layout: &FrameLayout, plan: &Shr
 ///
 /// # Performance notes
 ///
-/// - Entry block insts are moved (via `mem::take`) rather than cloned.
+/// - Block lists and edited instructions are staged; the full instruction arena
+///   is borrowed, not cloned. Returned errors leave the function unchanged.
 /// - Epilogue instructions are generated fresh per return site rather than
 ///   cloning a template, avoiding heap allocation for operand Vecs.
 /// - Block inst lists are only rebuilt for blocks that contain returns,
@@ -3991,8 +5459,33 @@ fn insert_prologue_epilogue_impl(
     layout: &FrameLayout,
     eligibility: ShrinkWrapEligibility,
 ) -> Result<(), crate::lower::LowerError> {
-    expand_dynamic_stack_allocs(func, layout.outgoing_arg_area_size)?;
-    retarget_rbit_return_copies(func);
+    // L10-P5: the plan numbers its prologue/epilogue instructions and blocks
+    // from the arena lengths, not through the allocators, so it runs the
+    // function's allocation-time admission first (a no-op unless a boundary
+    // is pending). A refusal is sticky on `func`, where the pipeline reports
+    // it by name.
+    if let Err(error) = func.admit_ids_before_allocation() {
+        return Err(frame_insertion_error(format!(
+            "frame insertion refused by the machine-IR identity admission: {error}"
+        )));
+    }
+    plan_frame_insertion(func, layout, eligibility)?.commit(func)
+}
+
+fn plan_frame_insertion(
+    func: &MachFunction,
+    layout: &FrameLayout,
+    eligibility: ShrinkWrapEligibility,
+) -> Result<FrameInsertionPlan, crate::lower::LowerError> {
+    // Guard admission precedes every code edit, including dynamic-allocation
+    // expansion and return-copy rewriting. Missing metadata cannot disable a
+    // requested protector or turn it into shrink-wrap eligibility.
+    let stack_protector_offset = stack_protector_frame_offset(func, layout)?;
+    // A U10 stack-limit request is admitted (or refused) before any edit too.
+    let stack_limit = stack_limit_frame_plan(func, layout)?;
+    let mut insertion = FrameInsertionPlan::new(func)?;
+    expand_dynamic_stack_allocs(func, &mut insertion, layout.outgoing_arg_area_size)?;
+    retarget_rbit_return_copies(func, &mut insertion);
 
     // Shrink-wrapping attempt (Darwin FRAME mode, env-gated). On admission the
     // prologue is sunk to the save block and the leaf return is left bare; on any
@@ -4001,46 +5494,138 @@ fn insert_prologue_epilogue_impl(
     // moved, so a declined shape is byte-identical to the whole-function path.
     if eligibility == ShrinkWrapEligibility::DarwinFrame
         && shrink_wrap_env_enabled()
-        && stack_protector_frame_offset(func, layout).is_none()
-        && let Some(plan) = compute_shrink_wrap_plan(func, layout)
+        && stack_protector_offset.is_none()
+        && func.stack_limit.is_none()
+        && let Some(plan) = compute_shrink_wrap_plan(&insertion.view(func), layout)
     {
-        emit_shrink_wrapped(func, layout, &plan);
-        return Ok(());
+        emit_shrink_wrapped(func, &mut insertion, layout, &plan)?;
+        return Ok(insertion);
     }
 
-    let stack_protector_offset = stack_protector_frame_offset(func, layout);
-    let stack_chk_fail_block = stack_protector_offset.map(|_| append_stack_chk_fail_block(func));
-    let prologue = emit_prologue(layout);
+    let stack_chk_fail_block = stack_protector_offset
+        .map(|_| append_stack_chk_fail_block(&mut insertion))
+        .transpose()?;
+    let mut prologue = emit_prologue_parts(layout, false);
+    // The U10 overflow block is created empty here, so the check can name
+    // it, and filled only after the exit loop below: that loop puts the
+    // protector check and the `add sp` teardown in front of every TailCall,
+    // and neither belongs on the overflow path (no canary was stored and no
+    // SP adjustment was made when the check fails).
+    let stack_limit_overflow = match &stack_limit {
+        Some(_) => Some(insertion.create_block()?),
+        None => None,
+    };
+    // Positions, in the entry block, of the check's `B.LO`s: the entry is
+    // split after each, so every check branch ends its block.
+    let mut stack_limit_branches = Vec::new();
+    if let (Some(plan), Some(overflow)) = (&stack_limit, stack_limit_overflow) {
+        let check = emit_stack_limit_check(&plan.limit, plan.sp_adj, overflow);
+        stack_limit_branches = check
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| inst.opcode == AArch64Opcode::BCond)
+            .map(|(index, _)| prologue.csa_len + index)
+            .collect();
+        let rest = prologue.head.split_off(prologue.csa_len);
+        prologue.head.extend(check);
+        prologue.head.extend(rest);
+    }
 
-    // Insert prologue at the start of the entry block.
-    // Use mem::take to move the old insts without cloning.
-    let entry = func.entry;
-    let old_entry_insts = std::mem::take(&mut func.blocks[entry.0 as usize].insts);
+    // A branch, jump table, or landing pad may target the original entry as a
+    // body label. Put the one-time frame setup in a new entry block so those
+    // existing targets continue without saving the frame again.
+    let original_entry = func.entry;
+    let entry_is_target = !func.blocks[original_entry.0 as usize].preds.is_empty()
+        || func.blocks.iter().any(|block| block.succs.contains(&original_entry))
+        || func.block_order.iter().any(|&block_id| {
+            func.blocks[block_id.0 as usize].insts.iter().any(|&inst_id| {
+                func.insts[inst_id.0 as usize]
+                    .operands
+                    .iter()
+                    .any(|operand| matches!(operand, MachOperand::Block(id) if *id == original_entry))
+            })
+        })
+        || func.jump_tables.iter().any(|table| table.targets.contains(&original_entry))
+        || func.eh_metadata.landing_pads.iter().any(|pad| pad.block == original_entry)
+        || func.eh_metadata.call_sites.iter().any(|site| site.landing_pad_block == Some(original_entry));
+    let has_frame_setup = !prologue.head.is_empty()
+        || !prologue.tail.is_empty()
+        || prologue.probe_loop.is_some()
+        || stack_protector_offset.is_some()
+        || stack_limit.is_some();
+    let entry = if entry_is_target && has_frame_setup {
+        if insertion.block_order.first().copied() != Some(original_entry) {
+            return Err(frame_insertion_error(
+                "cannot isolate a targeted entry absent from the start of block layout",
+            ));
+        }
+        let one_time_entry = insertion.create_block()?;
+        insertion.block_order.pop();
+        insertion.block_order.insert(0, one_time_entry);
+        insertion.entry = one_time_entry;
+        insertion.add_edge(one_time_entry, original_entry);
+        one_time_entry
+    } else {
+        original_entry
+    };
+
+    // Insert the prologue at the start of the one-time entry. A looped static
+    // probe splits that block: its head stays at entry, its loop and residual
+    // setup precede the original body.
+    let body_block = match prologue.probe_loop {
+        Some(iteration) => insert_static_probe_loop(func, &mut insertion, layout, iteration)?,
+        None => entry,
+    };
 
     let stack_protector_prologue = stack_protector_offset
         .map(emit_stack_protector_prologue)
         .unwrap_or_default();
-    let mut new_entry_insts =
-        Vec::with_capacity(prologue.len() + stack_protector_prologue.len() + old_entry_insts.len());
-    for prologue_inst in prologue {
-        let id = func.push_inst(prologue_inst);
-        new_entry_insts.push(id);
+    let old_body_insts = std::mem::take(&mut insertion.blocks[body_block.0 as usize].insts);
+    let mut new_body_insts = Vec::with_capacity(
+        prologue.tail.len() + stack_protector_prologue.len() + old_body_insts.len(),
+    );
+    for inst in prologue.tail.into_iter().chain(stack_protector_prologue) {
+        let id = insertion.push_inst(inst)?;
+        new_body_insts.push(id);
     }
-    for guard_inst in stack_protector_prologue {
-        let id = func.push_inst(guard_inst);
+    new_body_insts.extend(old_body_insts);
+    insertion.blocks[body_block.0 as usize].insts = new_body_insts;
+
+    // Use mem::take to move the old insts without cloning.
+    let old_entry_insts = std::mem::take(&mut insertion.blocks[entry.0 as usize].insts);
+    let mut new_entry_insts = Vec::with_capacity(prologue.head.len() + old_entry_insts.len());
+    for prologue_inst in prologue.head {
+        let id = insertion.push_inst(prologue_inst)?;
         new_entry_insts.push(id);
     }
     new_entry_insts.extend(old_entry_insts);
-    func.blocks[entry.0 as usize].insts = new_entry_insts;
+    insertion.blocks[entry.0 as usize].insts = new_entry_insts;
+    // Split the entry after each check `B.LO`, so each branch terminates its
+    // block and falls through to the next: every analysis then sees the
+    // overflow edge leave with the state at the branch (CSA saved, SP not
+    // yet adjusted). Done only now: a probe-loop split above moves every
+    // unnamed entry successor to its tail, and so does each split here.
+    if let Some(overflow) = stack_limit_overflow {
+        let mut block = entry;
+        let mut consumed = 0usize;
+        for &position in &stack_limit_branches {
+            let tail = insertion.split_block_tail(func, block, position + 1 - consumed)?;
+            insertion.add_edge(block, overflow);
+            insertion.add_edge(block, tail);
+            consumed = position + 1;
+            block = tail;
+        }
+    }
 
     // For each block, find return instructions and structural tail calls, then
     // insert exit cleanup before them.
     // First pass: identify which blocks contain returns to avoid unnecessary work.
-    let num_blocks = func.blocks.len();
+    let num_blocks = insertion.blocks.len();
     for block_idx in 0..num_blocks {
         // Check if this block has any function-exit instructions.
-        let has_function_exit = func.blocks[block_idx].insts.iter().any(|&inst_id| {
-            let inst = &func.insts[inst_id.0 as usize];
+        let has_function_exit = insertion.blocks[block_idx].insts.iter().any(|&inst_id| {
+            let view = insertion.view(func);
+            let inst = &view.insts[inst_id.0 as usize];
             inst.is_return() || is_tail_call(inst)
         });
 
@@ -4049,12 +5634,12 @@ fn insert_prologue_epilogue_impl(
         }
 
         // Move the old insts out to avoid borrow conflict.
-        let block_insts = std::mem::take(&mut func.blocks[block_idx].insts);
+        let block_insts = std::mem::take(&mut insertion.blocks[block_idx].insts);
         let mut new_insts = Vec::with_capacity(block_insts.len() + 8);
 
         for &inst_id in &block_insts {
-            let is_return = func.insts[inst_id.0 as usize].is_return();
-            let is_tail_branch = is_tail_call(&func.insts[inst_id.0 as usize]);
+            let is_return = insertion.view(func).insts[inst_id.0 as usize].is_return();
+            let is_tail_branch = is_tail_call(&insertion.view(func).insts[inst_id.0 as usize]);
 
             if is_return || is_tail_branch {
                 if let (Some(slot_offset), Some(fail_block)) =
@@ -4062,18 +5647,20 @@ fn insert_prologue_epilogue_impl(
                 {
                     let check = emit_stack_protector_check(slot_offset, fail_block);
                     for check_inst in check {
-                        let id = func.push_inst(check_inst);
+                        let id = insertion.push_inst(check_inst)?;
                         new_insts.push(id);
                     }
-                    let this_block = BlockId(block_idx as u32);
-                    if !func.blocks[block_idx].succs.contains(&fail_block) {
-                        func.blocks[block_idx].succs.push(fail_block);
+                    let this_block = BlockId(checked_frame_insertion_id(block_idx, 0, "block")?);
+                    if !insertion.blocks[block_idx].succs.contains(&fail_block) {
+                        insertion.blocks[block_idx].succs.push(fail_block);
                     }
-                    if !func.blocks[fail_block.0 as usize]
+                    if !insertion.blocks[fail_block.0 as usize]
                         .preds
                         .contains(&this_block)
                     {
-                        func.blocks[fail_block.0 as usize].preds.push(this_block);
+                        insertion.blocks[fail_block.0 as usize]
+                            .preds
+                            .push(this_block);
                     }
                 }
                 // Generate cleanup instructions fresh, then retain the original
@@ -4082,7 +5669,7 @@ fn insert_prologue_epilogue_impl(
                 // allocation and must survive frame insertion unchanged.
                 let epilogue = emit_epilogue_before_tail_branch(layout);
                 for epi_inst in epilogue {
-                    let id = func.push_inst(epi_inst);
+                    let id = insertion.push_inst(epi_inst)?;
                     new_insts.push(id);
                 }
                 new_insts.push(inst_id);
@@ -4090,13 +5677,59 @@ fn insert_prologue_epilogue_impl(
                 new_insts.push(inst_id);
             }
         }
-        func.blocks[block_idx].insts = new_insts;
+        insertion.blocks[block_idx].insts = new_insts;
     }
-    Ok(())
+    if let (Some(plan), Some(overflow)) = (&stack_limit, stack_limit_overflow) {
+        for inst in emit_stack_limit_overflow(&plan.limit, layout) {
+            let id = insertion.push_inst(inst)?;
+            insertion.blocks[overflow.0 as usize].insts.push(id);
+        }
+        insertion.stack_limit_overflow_block = Some(overflow);
+    }
+    Ok(insertion)
 }
 
 fn is_tail_call(inst: &MachInst) -> bool {
     inst.opcode == AArch64Opcode::TailCall
+}
+
+/// Split the entry block around a static probe loop and return the block that
+/// continues after it (holding the original entry instructions).
+///
+/// ```text
+/// entry: <callee-saved stores, add x29>  movz x16, #steps
+/// loop:  sub sp, sp, #4096 (two chunks); str xzr, [sp]; subs x16, x16, #1; b.ne loop
+/// body:  <residual allocation and probe> <original entry instructions>
+/// ```
+///
+/// The loop runs after the frame pointer is established, so the FP-based CFA
+/// describes every iteration. An SP-based CFA cannot, so such frames fail.
+fn insert_static_probe_loop(
+    func: &MachFunction,
+    insertion: &mut FrameInsertionPlan,
+    layout: &FrameLayout,
+    iteration: Vec<MachInst>,
+) -> Result<BlockId, crate::lower::LowerError> {
+    if !layout.uses_frame_pointer || layout.callee_saved_pairs.is_empty() {
+        return Err(frame_insertion_error(format!(
+            "stack probe loop for a {}-byte SP adjustment requires a frame pointer: an SP-based CFA cannot describe the loop",
+            layout.sp_adjustment()
+        )));
+    }
+    let entry = insertion.entry;
+    let body = insertion.split_block_tail(func, entry, 0)?;
+    let probe_loop = insertion.create_block_after(entry, 1)?;
+    for inst in iteration.into_iter().chain([MachInst::new(
+        AArch64Opcode::BCond,
+        vec![MachOperand::Imm(COND_NE), MachOperand::Block(probe_loop)],
+    )]) {
+        let id = insertion.push_inst(inst)?;
+        insertion.blocks[probe_loop.0 as usize].insts.push(id);
+    }
+    insertion.add_edge(entry, probe_loop);
+    insertion.add_edge(probe_loop, probe_loop);
+    insertion.add_edge(probe_loop, body);
+    Ok(body)
 }
 
 // ===========================================================================
@@ -4126,6 +5759,733 @@ mod tests {
             func.append_inst(BlockId(0), id);
         }
         func
+    }
+
+    /// The per-block scratch-liveness table answers exactly what the forward
+    /// scan answers at every position, for both IP scratches and both
+    /// live-out seeds, including reads, writes, calls, other registers and a
+    /// block that lists an instruction twice (which keeps the scan).
+    #[test]
+    fn scratch_liveness_table_matches_forward_scan() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |limit: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % limit
+        };
+        let mut live_answers = 0usize;
+        for case in 0..400 {
+            let len = 1 + next(60) as usize;
+            let insts: Vec<MachInst> = (0..len)
+                .map(|_| {
+                    let reg = [X16, X17, W16, X0, X1][next(5) as usize];
+                    match next(7) {
+                        // Reads the register.
+                        0 => MachInst::new(
+                            AArch64Opcode::AddRI,
+                            vec![
+                                MachOperand::PReg(X0),
+                                MachOperand::PReg(reg),
+                                MachOperand::Imm(1),
+                            ],
+                        ),
+                        // Writes the register.
+                        1 => MachInst::new(
+                            AArch64Opcode::MovI,
+                            vec![MachOperand::PReg(reg), MachOperand::Imm(7)],
+                        ),
+                        // A memory base is always read.
+                        2 => MachInst::new(
+                            AArch64Opcode::LdrRI,
+                            vec![
+                                MachOperand::PReg(X1),
+                                MachOperand::MemOp {
+                                    base: reg,
+                                    offset: 8,
+                                },
+                            ],
+                        ),
+                        3 => MachInst::new(
+                            AArch64Opcode::Bl,
+                            vec![MachOperand::Symbol("callee".into())],
+                        ),
+                        _ => MachInst::new(
+                            AArch64Opcode::MovI,
+                            vec![MachOperand::PReg(X0), MachOperand::Imm(3)],
+                        ),
+                    }
+                })
+                .collect();
+            let func = make_func("scratch_liveness", insts);
+            let mut block_insts = func.blocks[0].insts.clone();
+            if case % 9 == 0 && block_insts.len() > 2 {
+                let repeated = block_insts[0];
+                block_insts.push(repeated);
+            }
+            for live_out in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut table = ScratchLiveness::new(&block_insts, live_out);
+                for pos in 0..block_insts.len() {
+                    for (reg, seed) in [(X16, live_out.0), (X17, live_out.1)] {
+                        let expected =
+                            scratch_live_after(&func, &block_insts[pos + 1..], reg, seed);
+                        assert_eq!(
+                            table.live_after(&func, pos, reg),
+                            expected,
+                            "case {case}, live-out {live_out:?}, position {pos}, {reg:?}"
+                        );
+                        live_answers += usize::from(expected);
+                    }
+                }
+            }
+        }
+        assert!(live_answers > 1000, "live answers: {live_answers}");
+    }
+
+    /// Frame-index elimination of one block of `n` far-slot stores, each of
+    /// which borrows an IP scratch to materialize its offset, examines `O(n)`
+    /// instructions to prove the scratch dead: the per-block table scans the
+    /// block once. Asking the forward scan at every access (each runs to the
+    /// block end, since no later instruction touches the scratch yet)
+    /// examines `O(n^2)`, and this bound fails at the 4x steps below.
+    #[test]
+    fn scratch_liveness_cost_grows_linearly() {
+        let units_for = |stores: usize| {
+            let mut insts: Vec<MachInst> = (0..stores)
+                .map(|_| {
+                    MachInst::new(
+                        AArch64Opcode::StrRI,
+                        vec![
+                            MachOperand::PReg(PReg::new(0)),
+                            MachOperand::FrameIndex(FrameIdx(0)),
+                        ],
+                    )
+                })
+                .collect();
+            insts.push(MachInst::new(AArch64Opcode::Ret, vec![]));
+            let mut func = make_func("scratch_liveness_cost", insts);
+            func.alloc_stack_slot(StackSlot::new(8192, 16));
+            let layout = layout_without_sp_rebase(&func, 0, false);
+            let before = SCRATCH_SCAN_UNITS.with(std::cell::Cell::get);
+            let stats = FrameIndexEliminator::new(&layout, &func)
+                .run(&mut func)
+                .unwrap();
+            let units = SCRATCH_SCAN_UNITS.with(std::cell::Cell::get) - before;
+            assert_eq!(
+                stats.large_offset_count as usize, stores,
+                "every store materializes its offset in a scratch"
+            );
+            units
+        };
+        let sizes = [64usize, 256, 1024];
+        let units: Vec<u64> = sizes.iter().map(|&stores| units_for(stores)).collect();
+        for step in 0..2 {
+            assert!(units[step] > 0, "no scan work at {} stores", sizes[step]);
+            let ratio = units[step + 1] as f64 / units[step] as f64;
+            assert!(
+                ratio <= 5.0,
+                "scratch-liveness scans grew x{ratio:.2} from {} to {} stores ({} -> {} \
+                 instructions examined)",
+                sizes[step],
+                sizes[step + 1],
+                units[step],
+                units[step + 1]
+            );
+        }
+    }
+
+    /// Every instruction in layout order (probe loops split blocks).
+    fn laid_out_insts(func: &MachFunction) -> Vec<&MachInst> {
+        func.block_order
+            .iter()
+            .flat_map(|block| &func.blocks[block.0 as usize].insts)
+            .map(|id| &func.insts[id.0 as usize])
+            .collect()
+    }
+
+    #[test]
+    fn pair_memory_outgoing_pair_width_and_implicit_zero() {
+        let mut failures = Vec::new();
+        let mut count = 0;
+        for (bank, element_bytes) in [(32, 4u32), (0, 8), (128, 4), (96, 8), (64, 16)] {
+            for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+                for offset in [None, Some(0), Some(16), Some(32)] {
+                    let mut operands = vec![
+                        MachOperand::PReg(PReg::new(bank)),
+                        MachOperand::PReg(PReg::new(bank + 1)),
+                        base.clone(),
+                    ];
+                    if let Some(offset) = offset {
+                        operands.push(MachOperand::Imm(offset));
+                    }
+                    let inst = MachInst::new(AArch64Opcode::StpRI, operands);
+                    let func = make_func(
+                        "pair_outgoing_width",
+                        vec![
+                            inst.clone(),
+                            MachInst::new(
+                                AArch64Opcode::Bl,
+                                vec![MachOperand::Symbol("callee".into())],
+                            ),
+                        ],
+                    );
+                    let expected = (offset.unwrap_or(0) as u32 + 2 * element_bytes + 15) & !15;
+                    let actual = compute_max_outgoing_arg_size(&func);
+                    count += 1;
+                    if actual != expected {
+                        failures.push(format!("{inst:?}: {actual} != {expected}"));
+                    }
+                    // The caller-provided high-water mark is actually reserved by frame layout.
+                    assert_eq!(
+                        compute_frame_layout(&func, expected, false).outgoing_arg_area_size,
+                        expected
+                    );
+                }
+            }
+        }
+        assert_eq!(count, 40);
+        assert!(
+            failures.is_empty(),
+            "{}/40 pair outgoing widths wrong:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn pair_memory_outgoing_scalar_q_and_volatile_widths() {
+        let mut failures = Vec::new();
+        let mut count = 0;
+        // The same scanner must reserve a whole Q scalar store, not only the
+        // historical eight-byte estimate. These are real supported store opcodes.
+        let mut rows = Vec::new();
+        for opcode in [AArch64Opcode::StrRI, AArch64Opcode::VolatileStrRI] {
+            for (bank, bytes) in [(32, 4u32), (0, 8), (165, 2), (128, 4), (96, 8), (64, 16)] {
+                rows.push((opcode, bank, bytes));
+            }
+        }
+        for (opcode, bytes) in [
+            (AArch64Opcode::StrbRI, 1),
+            (AArch64Opcode::StrhRI, 2),
+            (AArch64Opcode::VolatileStrbRI, 1),
+            (AArch64Opcode::VolatileStrhRI, 2),
+        ] {
+            rows.push((opcode, 32, bytes));
+        }
+        for (opcode, bank, bytes) in rows {
+            for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+                for offset in [0, 8, 16] {
+                    let inst = MachInst::new(
+                        opcode,
+                        vec![
+                            MachOperand::PReg(PReg::new(bank)),
+                            base.clone(),
+                            MachOperand::Imm(offset),
+                        ],
+                    );
+                    let expected = (offset as u32 + bytes + 15) & !15;
+                    let actual = compute_max_outgoing_arg_size(&make_func(
+                        "scalar_outgoing_width",
+                        vec![inst.clone()],
+                    ));
+                    count += 1;
+                    if actual != expected {
+                        failures.push(format!("{inst:?}: {actual} != {expected}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 96);
+        assert!(
+            failures.is_empty(),
+            "{}/96 scalar outgoing widths wrong; first32:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(32)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn pair_memory_outgoing_scalar_implicit_zero() {
+        let mut rows = Vec::new();
+        for opcode in [AArch64Opcode::StrRI, AArch64Opcode::VolatileStrRI] {
+            for (register, bytes) in [
+                (W0, 4u32),
+                (X0, 8),
+                (trust_cg_ir::regs::H0, 2),
+                (trust_cg_ir::regs::S0, 4),
+                (trust_cg_ir::regs::D0, 8),
+                (trust_cg_ir::regs::V0, 16),
+            ] {
+                rows.push((opcode, register, bytes));
+            }
+        }
+        for (opcode, bytes) in [
+            (AArch64Opcode::StrbRI, 1),
+            (AArch64Opcode::StrhRI, 2),
+            (AArch64Opcode::VolatileStrbRI, 1),
+            (AArch64Opcode::VolatileStrhRI, 2),
+        ] {
+            rows.push((opcode, W0, bytes));
+        }
+        assert_eq!(rows.len(), 16);
+        let mut failures = Vec::new();
+        let mut count = 0;
+        for (opcode, register, bytes) in rows {
+            for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+                let inst = MachInst::new(opcode, vec![MachOperand::PReg(register), base]);
+                let mut explicit = inst.clone();
+                explicit.operands.push(MachOperand::Imm(0));
+                let encoded = crate::aarch64::encode::encode_instruction(&inst);
+                let zero_encoded = crate::aarch64::encode::encode_instruction(&explicit);
+                let expected = (bytes + 15) & !15;
+                let actual = compute_max_outgoing_arg_size(&make_func(
+                    "scalar_implicit_zero",
+                    vec![inst.clone()],
+                ));
+                count += 1;
+                if encoded.is_err()
+                    || encoded.as_ref().ok() != zero_encoded.as_ref().ok()
+                    || actual != expected
+                {
+                    failures.push(format!("{inst:?}: outgoing {actual} != {expected}; omitted encoding={encoded:?}, explicit-zero encoding={zero_encoded:?}"));
+                }
+            }
+        }
+        assert_eq!(count, 32);
+        assert!(
+            failures.is_empty(),
+            "{}/32 scalar implicit-zero contracts failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn pair_memory_outgoing_scanner_does_not_credit_malformed_or_other_bases() {
+        let good = vec![
+            MachOperand::PReg(X0),
+            MachOperand::PReg(X1),
+            MachOperand::PReg(SP),
+            MachOperand::Imm(0),
+        ];
+        let mut bad = Vec::new();
+        let mut extra = good.clone();
+        extra.push(MachOperand::Imm(0));
+        bad.push(extra);
+        bad.push(good[..2].to_vec());
+        for offset in [
+            MachOperand::PReg(X0),
+            MachOperand::Imm(1),
+            MachOperand::Imm(512),
+            MachOperand::Imm(i64::MAX),
+            MachOperand::Imm(i64::MIN),
+            MachOperand::Imm(-8),
+        ] {
+            let mut operands = good.clone();
+            operands[3] = offset;
+            bad.push(operands);
+        }
+        for base in [X19, W0, trust_cg_ir::regs::WSP, trust_cg_ir::regs::XZR] {
+            let mut operands = good.clone();
+            operands[2] = MachOperand::PReg(base);
+            bad.push(operands);
+        }
+        for data in [
+            SP,
+            trust_cg_ir::regs::WSP,
+            PReg::new(162),
+            PReg::new(4095),
+            PReg::new(96),
+        ] {
+            let mut operands = good.clone();
+            operands[0] = MachOperand::PReg(data);
+            bad.push(operands);
+        }
+        let mut failures = Vec::new();
+        assert_eq!(bad.len(), 17);
+        for operands in bad {
+            let inst = MachInst::new(AArch64Opcode::StpRI, operands);
+            let func = make_func("pair_non_outgoing", vec![inst.clone()]);
+            let actual = std::panic::catch_unwind(|| compute_max_outgoing_arg_size(&func));
+            if !matches!(actual, Ok(0)) {
+                failures.push(format!("{inst:?}: {actual:?}"));
+            }
+        }
+        for opcode in [
+            AArch64Opcode::LdpRI,
+            AArch64Opcode::LdpPostIndex,
+            AArch64Opcode::StpPreIndex,
+            AArch64Opcode::NeonStpQPost,
+            AArch64Opcode::NeonLdpQPost,
+        ] {
+            let func = make_func(
+                "not_outgoing_store",
+                vec![MachInst::new(opcode, good.clone())],
+            );
+            assert_eq!(compute_max_outgoing_arg_size(&func), 0, "{opcode:?}");
+        }
+        assert!(
+            failures.is_empty(),
+            "{}/17 malformed/non-outgoing pair controls failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    fn outgoing_frame_sum_fixture(
+        opcode: AArch64Opcode,
+        base: MachOperand,
+        offset: Option<i64>,
+        local_bytes: u32,
+    ) -> MachFunction {
+        let mut operands = vec![MachOperand::PReg(X0), base];
+        if let Some(offset) = offset {
+            operands.push(MachOperand::Imm(offset));
+        }
+        let mut func = make_func(
+            "outgoing_frame_sum",
+            vec![
+                MachInst::new(opcode, operands),
+                MachInst::new(
+                    AArch64Opcode::Bl,
+                    vec![MachOperand::Symbol("external_frame_sum_probe".into())],
+                ),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ],
+        );
+        if local_bytes != 0 {
+            func.alloc_stack_slot(StackSlot::new(local_bytes, 16));
+        }
+        func
+    }
+
+    #[test]
+    fn outgoing_frame_sum_overflow_is_structured_refusal_not_panic() {
+        use crate::pipeline::{OptLevel, Pipeline, PipelineConfig, PipelineError};
+        let pipeline = Pipeline::new(PipelineConfig {
+            opt_level: OptLevel::O0,
+            target_triple: "aarch64-unknown-linux-gnu".into(),
+            ..PipelineConfig::default()
+        });
+        let mut attempts = 0;
+        let mut failures = Vec::new();
+        for opcode in [AArch64Opcode::StrRI, AArch64Opcode::VolatileStrRI] {
+            for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+                for (offset, local_bytes, outgoing) in [
+                    (4_294_967_264i64, 0, 4_294_967_280u32),
+                    (4_294_967_248i64, 32, 4_294_967_264u32),
+                ] {
+                    let mut func =
+                        outgoing_frame_sum_fixture(opcode, base.clone(), Some(offset), local_bytes);
+                    // The individually representable outgoing area is the
+                    // prerequisite, not a substitute for complete-frame bounds.
+                    assert_eq!(compute_max_outgoing_arg_size(&func), outgoing);
+                    assert!(scan_function(&func).has_calls);
+                    assert!(
+                        u64::from(outgoing) + u64::from(local_bytes) + 16 > u64::from(u32::MAX)
+                    );
+                    let before = format!("{func:?}");
+                    attempts += 1;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pipeline.encode_and_emit(&mut func)
+                    }));
+                    let refused = matches!(
+                        &outcome,
+                        Ok(Err(PipelineError::FrameLowering(crate::lower::LowerError::FrameLowering(detail))))
+                            if detail.contains("frame") && detail.contains("overflow")
+                    );
+                    if !refused || format!("{func:?}") != before {
+                        let detail = match outcome {
+                            Err(_) => "PANIC".into(),
+                            Ok(Err(error)) => format!("wrong refusal: {error:?}"),
+                            Ok(Ok(bytes)) => format!("unexpected object: {} bytes", bytes.len()),
+                        };
+                        failures.push(format!(
+                            "{opcode:?}/{base:?} offset={offset} local={local_bytes}: {detail}"
+                        ));
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "OUTGOING_FRAME_SUM negative_attempts={attempts} failures={}",
+            failures.len()
+        );
+        assert_eq!(attempts, 8);
+        assert!(
+            failures.is_empty(),
+            "{} / 8 complete-frame refusals failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn outgoing_frame_sum_valid_boundaries_reach_real_elf_emission() {
+        use crate::pipeline::{OptLevel, Pipeline, PipelineConfig};
+        let pipeline = Pipeline::new(PipelineConfig {
+            opt_level: OptLevel::O0,
+            target_triple: "aarch64-unknown-linux-gnu".into(),
+            ..PipelineConfig::default()
+        });
+        let mut attempts = 0;
+        let mut failures = Vec::new();
+        for opcode in [AArch64Opcode::StrRI, AArch64Opcode::VolatileStrRI] {
+            for base in [MachOperand::PReg(SP), MachOperand::Special(SpecialReg::SP)] {
+                for offset in [None, Some(0), Some(4088), Some(32760)] {
+                    for local_bytes in [0, 32] {
+                        let mut func =
+                            outgoing_frame_sum_fixture(opcode, base.clone(), offset, local_bytes);
+                        let expected_outgoing = ((offset.unwrap_or(0) + 8 + 15) & !15) as u32;
+                        let outgoing = compute_max_outgoing_arg_size(&func);
+                        assert_eq!(outgoing, expected_outgoing);
+                        let layout = compute_frame_layout(&func, outgoing, false);
+                        assert!(!layout.is_leaf && layout.uses_frame_pointer);
+                        assert_eq!(layout.outgoing_arg_area_size, expected_outgoing);
+                        assert_eq!(
+                            layout.total_frame_size,
+                            16 + local_bytes + expected_outgoing
+                        );
+                        attempts += 1;
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                pipeline.encode_and_emit(&mut func)
+                            }));
+                        if !matches!(&outcome, Ok(Ok(bytes)) if bytes.len() > 64 && bytes.starts_with(b"\x7fELF"))
+                        {
+                            let detail = match outcome {
+                                Err(_) => "PANIC".into(),
+                                Ok(Err(error)) => format!("{error:?}"),
+                                Ok(Ok(bytes)) => {
+                                    format!("non-ELF/truncated object: {} bytes", bytes.len())
+                                }
+                            };
+                            failures.push(format!("{opcode:?}/{base:?} offset={offset:?} local={local_bytes}: {detail}"));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "OUTGOING_FRAME_SUM positive_attempts={attempts} failures={}",
+            failures.len()
+        );
+        assert_eq!(attempts, 32);
+        assert!(
+            failures.is_empty(),
+            "{} / 32 valid frame emissions failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    fn checked_layout_for_test(
+        func: &MachFunction,
+        outgoing: u32,
+        dynamic: bool,
+    ) -> Result<FrameLayout, crate::lower::LowerError> {
+        if dynamic {
+            try_compute_frame_layout_dynamic(func, outgoing, false)
+        } else {
+            try_compute_frame_layout(func, outgoing, false)
+        }
+    }
+
+    #[test]
+    fn outgoing_frame_checked_total_and_alignment_boundaries() {
+        let mut count = 0;
+        for dynamic in [false, true] {
+            let func =
+                outgoing_frame_sum_fixture(AArch64Opcode::StrRI, MachOperand::PReg(SP), Some(0), 0);
+            for outgoing in [0u32, 1, 15, 16, 4095, u32::MAX - 31] {
+                let layout = checked_layout_for_test(&func, outgoing, dynamic).unwrap();
+                let rounded = (u64::from(outgoing) + 15) & !15;
+                assert_eq!(u64::from(layout.total_frame_size), rounded + 16);
+                assert_eq!(u64::from(layout.outgoing_arg_area_size), rounded);
+                count += 1;
+            }
+            for outgoing in [u32::MAX - 30, u32::MAX - 15, u32::MAX] {
+                assert!(
+                    matches!(checked_layout_for_test(&func, outgoing, dynamic), Err(crate::lower::LowerError::FrameLowering(detail)) if detail.contains("overflow"))
+                );
+                count += 1;
+            }
+            // The raw sum fits u32 but its final rounding does not.
+            let mut rounded_overflow = func.clone();
+            rounded_overflow.alloc_stack_slot(StackSlot::new(1, 1));
+            assert!(
+                matches!(checked_layout_for_test(&rounded_overflow, u32::MAX - 31, dynamic), Err(crate::lower::LowerError::FrameLowering(detail)) if detail.contains("alignment"))
+            );
+            count += 1;
+        }
+        assert_eq!(count, 20);
+    }
+
+    #[test]
+    fn outgoing_frame_checked_signed_offsets_include_csa_anchor() {
+        let mut count = 0;
+        for dynamic in [false, true] {
+            let mut func =
+                outgoing_frame_sum_fixture(AArch64Opcode::StrRI, MachOperand::PReg(SP), Some(0), 0);
+            // Each signed size is valid; their cumulative offset is exactly
+            // i32::MIN and must remain accepted with the zero FP/LR anchor.
+            func.alloc_stack_slot(StackSlot::new(1 << 30, 1));
+            func.alloc_stack_slot(StackSlot::new(1 << 30, 1));
+            let layout = checked_layout_for_test(&func, 0, dynamic).unwrap();
+            assert_eq!(layout.fp_to_spill_offset, 0);
+            assert_eq!(
+                stack_slot_frame_offsets(&func, &layout),
+                vec![Some(-(1 << 30)), Some(i32::MIN)]
+            );
+            count += 1;
+            // One additional saved GPR pair moves that actual anchor by -16.
+            let mut shifted = func.clone();
+            let id = shifted.push_inst(MachInst::new(
+                AArch64Opcode::MovR,
+                vec![MachOperand::PReg(X19), MachOperand::PReg(X0)],
+            ));
+            shifted.blocks[0].insts.insert(0, id);
+            assert!(
+                matches!(checked_layout_for_test(&shifted, 0, dynamic), Err(crate::lower::LowerError::FrameLowering(detail)) if detail.contains("CSA-anchored"))
+            );
+            count += 1;
+
+            let mut maximum_csa =
+                outgoing_frame_sum_fixture(AArch64Opcode::StrRI, MachOperand::PReg(SP), Some(0), 0);
+            for raw in 19..=28 {
+                let id = maximum_csa.push_inst(MachInst::new(
+                    AArch64Opcode::MovR,
+                    vec![MachOperand::PReg(PReg::new(raw)), MachOperand::PReg(X0)],
+                ));
+                maximum_csa.blocks[0].insts.insert(0, id);
+            }
+            for raw in 104..=111 {
+                let id = maximum_csa.push_inst(MachInst::new(
+                    AArch64Opcode::FmovFprFpr,
+                    vec![
+                        MachOperand::PReg(PReg::new(raw)),
+                        MachOperand::PReg(PReg::new(96)),
+                    ],
+                ));
+                maximum_csa.blocks[0].insts.insert(0, id);
+            }
+            maximum_csa.alloc_stack_slot(StackSlot::new((1u32 << 31) - 144, 16));
+            let layout = checked_layout_for_test(&maximum_csa, 0, dynamic).unwrap();
+            assert_eq!(
+                (layout.callee_saved_area_size, layout.fp_to_spill_offset),
+                (160, -144)
+            );
+            assert_eq!(
+                stack_slot_frame_offsets(&maximum_csa, &layout),
+                vec![Some(i32::MIN)]
+            );
+            count += 1;
+            maximum_csa.stack_slots[0].size += 1;
+            assert!(
+                matches!(checked_layout_for_test(&maximum_csa, 0, dynamic), Err(crate::lower::LowerError::FrameLowering(detail)) if detail.contains("CSA-anchored"))
+            );
+            count += 1;
+        }
+        assert_eq!(count, 8);
+    }
+
+    #[test]
+    fn outgoing_frame_checked_raw_slot_metadata_and_packing() {
+        let mut count = 0;
+        for dynamic in [false, true] {
+            let empty =
+                outgoing_frame_sum_fixture(AArch64Opcode::StrRI, MachOperand::PReg(SP), Some(0), 0);
+            let mut malformed = Vec::new();
+            for size in [1u32 << 31, u32::MAX] {
+                malformed.push(StackSlot::new(size, 16));
+            }
+            malformed.push(StackSlot::new(0, 1 << 31));
+            for runtime in [false, true] {
+                for align in [0, 3] {
+                    let mut slot = if runtime {
+                        StackSlot::new_dynamic(StackSlotSizeSource::Unknown, 16)
+                    } else {
+                        StackSlot::new(8, 16)
+                    };
+                    // Public/deserialized metadata bypasses constructor guards.
+                    slot.align = align;
+                    malformed.push(slot);
+                }
+            }
+            assert_eq!(malformed.len(), 7);
+            for slot in malformed {
+                let mut func = empty.clone();
+                func.stack_slots.push(slot);
+                assert!(matches!(
+                    checked_layout_for_test(&func, 0, dynamic),
+                    Err(crate::lower::LowerError::FrameLowering(_))
+                ));
+                count += 1;
+            }
+            let mut packed = empty.clone();
+            for (size, align) in [(1, 16), (17, 32), (3, 8)] {
+                packed.alloc_stack_slot(StackSlot::new(size, align));
+            }
+            let layout = checked_layout_for_test(&packed, 0, dynamic).unwrap();
+            assert_eq!(layout.spill_area_size, 88); // 72 downward extent + 16 slack.
+            assert_eq!(layout.total_frame_size, 112);
+            assert_eq!(
+                stack_slot_frame_offsets(&packed, &layout),
+                vec![Some(-16), Some(-64), Some(-72)]
+            );
+            count += 1;
+        }
+        assert_eq!(count, 16);
+    }
+
+    #[test]
+    fn outgoing_frame_checked_minimum_fp_offset_stackaddr_encodes() {
+        let mut func = make_func(
+            "minimum_fp_offset",
+            vec![
+                MachInst::new(
+                    AArch64Opcode::AddPCRel,
+                    vec![
+                        MachOperand::PReg(X0),
+                        MachOperand::PReg(SP),
+                        MachOperand::StackSlot(StackSlotId(1)),
+                    ],
+                ),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ],
+        );
+        func.alloc_stack_slot(StackSlot::new(1 << 30, 1));
+        func.alloc_stack_slot(StackSlot::new(1 << 30, 1));
+        // Force the actual FP path; do not emit or execute a huge prologue.
+        let layout = try_compute_frame_layout_dynamic(&func, 0, false).unwrap();
+        assert_eq!(stack_slot_frame_offsets(&func, &layout)[1], Some(i32::MIN));
+        eliminate_frame_indices(&mut func, &layout).unwrap();
+        let words = func.blocks[0]
+            .insts
+            .iter()
+            .map(|&id| crate::aarch64::encode::encode_instruction(func.inst(id)).unwrap())
+            .collect::<Vec<_>>();
+        // Independent MOVZ X0,#0; MOVK X0,#0x8000,LSL#16;
+        // SUB X0,X29,X0; RET. The magnitude is unsigned 2^31, not truncated.
+        assert_eq!(words, [0xd280_0000, 0xf2b0_0000, 0xcb00_03a0, 0xd65f_03c0]);
+    }
+
+    fn compute_shrink_wrap_plan(
+        func: &MachFunction,
+        layout: &FrameLayout,
+    ) -> Option<ShrinkWrapPlan> {
+        super::compute_shrink_wrap_plan(&FrameFunctionView::original(func), layout)
+    }
+
+    fn emit_shrink_wrapped(func: &mut MachFunction, layout: &FrameLayout, plan: &ShrinkWrapPlan) {
+        let mut insertion = FrameInsertionPlan::new(func).unwrap();
+        super::emit_shrink_wrapped(func, &mut insertion, layout, plan).unwrap();
+        insertion.commit(func).unwrap();
     }
 
     /// Helper: a frame layout whose SP is NOT a stable base, so out-of-range
@@ -4254,7 +6614,7 @@ mod tests {
 
         let layout = leaf_guard_layout(&func);
         assert!(layout.uses_frame_pointer && !layout.has_dynamic_alloc);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         // The fixture must still exercise the SP form (deep slot, in-reach
         // positive SP offset) or this test stops guarding the interaction.
@@ -4274,6 +6634,132 @@ mod tests {
             compute_shrink_wrap_plan(&func, &layout).is_none(),
             "plan with a frame access outside the saved region must be declined"
         );
+    }
+
+    #[test]
+    fn shrinkwrap_declines_looped_stack_probes_and_sinks_unrolled_ones() {
+        let mut looped = make_leaf_guard_func();
+        looped.alloc_stack_slot(StackSlot::new(1 << 20, 16));
+        let layout = leaf_guard_layout(&looped);
+        assert!(StaticStackProbePlan::for_layout(&layout).looped);
+        assert!(compute_shrink_wrap_plan(&looped, &layout).is_none());
+
+        let mut unrolled = make_leaf_guard_func();
+        unrolled.alloc_stack_slot(StackSlot::new(
+            STACK_PROBE_MAX_UNROLL * STACK_PROBE_INTERVAL,
+            16,
+        ));
+        let layout = leaf_guard_layout(&unrolled);
+        let plan = StaticStackProbePlan::for_layout(&layout);
+        assert_eq!((plan.steps, plan.looped), (STACK_PROBE_MAX_UNROLL, false));
+        let shrink = compute_shrink_wrap_plan(&unrolled, &layout).expect("unrolled probes sink");
+        emit_shrink_wrapped(&mut unrolled, &layout, &shrink);
+        let save = &unrolled.blocks[shrink.save_block.0 as usize];
+        let probes = save
+            .insts
+            .iter()
+            .filter(|id| is_stack_probe(unrolled.inst(**id)))
+            .count();
+        assert_eq!(probes, STACK_PROBE_MAX_UNROLL as usize);
+    }
+
+    #[test]
+    fn looped_static_probe_splits_the_entry_into_a_valid_loop() {
+        let mut func = make_func("looped_probe", vec![make_ret()]);
+        func.alloc_stack_slot(StackSlot::new(1 << 20, 16));
+        let ret = func.blocks[0].insts[0];
+        let layout = compute_frame_layout(&func, 0, false);
+        insert_prologue_epilogue(&mut func, &layout).unwrap();
+        crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+        assert_eq!(func.block_order.len(), 3);
+        let [entry, probe_loop, body] = [0, 1, 2].map(|i| func.block_order[i]);
+        assert_eq!(entry, func.entry);
+        let insts = |block: BlockId| {
+            func.blocks[block.0 as usize]
+                .insts
+                .iter()
+                .map(|id| func.inst(*id).clone())
+                .collect::<Vec<_>>()
+        };
+        let head = insts(entry);
+        assert!(head.iter().all(|inst| !is_stack_probe(inst)));
+        assert_eq!(head.last().unwrap().opcode, AArch64Opcode::Movz);
+        let iteration = insts(probe_loop);
+        assert_eq!(
+            iteration.iter().map(|inst| inst.opcode).collect::<Vec<_>>(),
+            [
+                AArch64Opcode::SubRI,
+                AArch64Opcode::SubRI,
+                AArch64Opcode::StrRI,
+                AArch64Opcode::SubsRI,
+                AArch64Opcode::BCond,
+            ]
+        );
+        assert!(is_stack_probe(&iteration[2]));
+        assert_eq!(func.blocks[probe_loop.0 as usize].loop_depth, 1);
+        assert_eq!(func.blocks[probe_loop.0 as usize].succs, [probe_loop, body]);
+        assert!(func.blocks[body.0 as usize].insts.contains(&ret));
+    }
+
+    #[test]
+    fn framed_entry_backedge_bypasses_one_time_prologue() {
+        for probed in [false, true] {
+            let mut func = make_func("entry_backedge", vec![]);
+            let body_entry = func.entry;
+            let loop_block = push_block(
+                &mut func,
+                vec![MachInst::new(
+                    AArch64Opcode::B,
+                    vec![MachOperand::Block(body_entry)],
+                )],
+            );
+            let exit = push_block(&mut func, vec![make_ret()]);
+            let guard = func.push_inst(MachInst::new(
+                AArch64Opcode::Cbz,
+                vec![MachOperand::PReg(W0), MachOperand::Block(exit)],
+            ));
+            func.append_inst(body_entry, guard);
+            let to_loop = func.push_inst(MachInst::new(
+                AArch64Opcode::B,
+                vec![MachOperand::Block(loop_block)],
+            ));
+            func.append_inst(body_entry, to_loop);
+            func.add_edge(body_entry, exit);
+            func.add_edge(body_entry, loop_block);
+            func.add_edge(loop_block, body_entry);
+            let original_body = func.blocks[body_entry.0 as usize].insts.clone();
+            if probed {
+                func.alloc_stack_slot(StackSlot::new(1 << 20, 16));
+            }
+
+            let layout = compute_frame_layout(&func, 0, false);
+            assert!(layout.uses_frame_pointer);
+            assert_eq!(StaticStackProbePlan::for_layout(&layout).looped, probed);
+            insert_prologue_epilogue(&mut func, &layout).unwrap();
+
+            assert_ne!(func.entry, body_entry);
+            assert_eq!(func.block_order[0], func.entry);
+            let body_pos = func
+                .block_order
+                .iter()
+                .position(|&id| id == body_entry)
+                .unwrap();
+            assert_eq!(body_pos, if probed { 3 } else { 1 });
+            assert_eq!(func.blocks[body_entry.0 as usize].insts, original_body);
+            let before_body = func.block_order[body_pos - 1];
+            assert!(
+                func.blocks[before_body.0 as usize]
+                    .succs
+                    .contains(&body_entry)
+            );
+            assert_eq!(func.blocks[loop_block.0 as usize].succs, [body_entry]);
+            assert_eq!(
+                func.inst(func.blocks[func.entry.0 as usize].insts[0])
+                    .opcode,
+                AArch64Opcode::StpPreIndex
+            );
+            crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+        }
     }
 
     #[test]
@@ -4429,8 +6915,8 @@ mod tests {
         // Hand-build a plan whose save block does NOT dominate a frame-forcing
         // block (point S at the shared return, which does not dominate `save`).
         let func = make_leaf_guard_func();
-        let dom = compute_block_dominators(&func).unwrap();
-        let reachable = compute_reachable(&func, 0);
+        let dom = compute_block_dominators(&FrameFunctionView::original(&func)).unwrap();
+        let reachable = compute_reachable(&FrameFunctionView::original(&func), 0);
         let bad_plan = ShrinkWrapPlan {
             save_block: BlockId(2), // the return block — does NOT dominate save(1)
             frame_return_blocks: vec![],
@@ -4438,10 +6924,232 @@ mod tests {
             leaf_return_blocks: vec![BlockId(2)],
         };
         assert!(
-            !verify_shrink_wrap_plan(&func, &dom, &reachable, &bad_plan),
+            !verify_shrink_wrap_plan(
+                &FrameFunctionView::original(&func),
+                &dom,
+                &reachable,
+                &bad_plan
+            ),
             "the fail-closed invariant must reject a save block that does not \
              dominate all frame-forcing blocks"
         );
+    }
+
+    /// Walk every path of an EMITTED function and require that the callee-saved
+    /// area is allocated exactly once before any return that restores it, and
+    /// released exactly when it was allocated: a block is entered at one frame
+    /// depth only, `StpPreIndex` (the CSA-allocating save) takes depth 0 -> 1,
+    /// `LdpPostIndex` (the CSA-releasing restore) takes 1 -> 0, and every `ret`
+    /// runs at depth 0. This is the property the final-stream spill-slot net
+    /// checks as `callee-saved-not-restored`.
+    fn assert_frame_balanced_on_every_path(func: &MachFunction) {
+        let n = func.blocks.len();
+        let mut entered: Vec<Option<u8>> = vec![None; n];
+        let mut work = vec![(func.entry.0 as usize, 0u8)];
+        while let Some((b, depth)) = work.pop() {
+            match entered[b] {
+                Some(seen) if seen == depth => continue,
+                Some(seen) => panic!("block {b} is entered at frame depth {seen} AND {depth}"),
+                None => entered[b] = Some(depth),
+            }
+            let mut depth = depth;
+            for &id in &func.blocks[b].insts {
+                let inst = &func.insts[id.0 as usize];
+                match inst.opcode {
+                    AArch64Opcode::StpPreIndex => {
+                        assert_eq!(depth, 0, "block {b}: second callee-saved allocation");
+                        depth = 1;
+                    }
+                    AArch64Opcode::LdpPostIndex => {
+                        assert_eq!(depth, 1, "block {b}: restore of an unsaved frame");
+                        depth = 0;
+                    }
+                    _ if inst.is_return() => {
+                        assert_eq!(
+                            depth, 0,
+                            "block {b}: `ret` with callee-saved registers not restored"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for succ in &func.blocks[b].succs {
+                work.push((succ.0 as usize, depth));
+            }
+        }
+    }
+
+    /// The `encode_utf8_raw_unchecked` shape (2026-09-28): a frame path reaches
+    /// the shared bare return THROUGH a join block the save block does not
+    /// dominate.
+    ///
+    /// ```text
+    ///   0 entry: cbz w0, 1 ; b 2          (frame-clean guard)
+    ///   1 leaf:  b 4
+    ///   2 save:  bl f ; mov x19,x19 ; cbz w1, 3 ; b 5
+    ///   3 mid:   b 4                        (frame-only, falls into the join)
+    ///   4 join:  b 6                        (preds [leaf, mid]: NOT dominated by 2)
+    ///   5 edge:  b 6                        (frame-only)
+    ///   6 ret:   ret                        (preds [join, edge])
+    /// ```
+    ///
+    /// Dominance at the return's immediate predecessors classified `join` as a
+    /// leaf predecessor and put the only restore on `edge`, so the path
+    /// `2 -> 3 -> 4 -> 6` returned with x19/x29/x30 still the frame's. Returns
+    /// the function and its (join, mid, edge, ret) block ids.
+    fn make_frame_path_through_leaf_join_func() -> (MachFunction, [BlockId; 4]) {
+        let sig = Signature::new(vec![], vec![]);
+        let mut func = MachFunction::new("frame_through_join".to_string(), sig);
+        let entry = BlockId(0);
+        let leaf = push_block(&mut func, vec![]);
+        let save = push_block(
+            &mut func,
+            vec![
+                MachInst::new(AArch64Opcode::Bl, vec![MachOperand::Symbol("f".into())]),
+                MachInst::new(
+                    AArch64Opcode::MovR,
+                    vec![MachOperand::PReg(X19), MachOperand::PReg(X19)],
+                ),
+            ],
+        );
+        let mid = push_block(&mut func, vec![]);
+        let join = push_block(&mut func, vec![]);
+        let edge = push_block(&mut func, vec![]);
+        let ret = push_block(&mut func, vec![MachInst::new(AArch64Opcode::Ret, vec![])]);
+        let branch = |func: &mut MachFunction, from: BlockId, inst: MachInst| {
+            let id = func.push_inst(inst);
+            func.append_inst(from, id);
+        };
+        branch(
+            &mut func,
+            entry,
+            MachInst::new(
+                AArch64Opcode::Cbz,
+                vec![MachOperand::PReg(W0), MachOperand::Block(leaf)],
+            ),
+        );
+        branch(
+            &mut func,
+            entry,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(save)]),
+        );
+        branch(
+            &mut func,
+            leaf,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(join)]),
+        );
+        branch(
+            &mut func,
+            save,
+            MachInst::new(
+                AArch64Opcode::Cbz,
+                vec![MachOperand::PReg(W1), MachOperand::Block(mid)],
+            ),
+        );
+        branch(
+            &mut func,
+            save,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(edge)]),
+        );
+        branch(
+            &mut func,
+            mid,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(join)]),
+        );
+        branch(
+            &mut func,
+            join,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(ret)]),
+        );
+        branch(
+            &mut func,
+            edge,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(ret)]),
+        );
+        func.add_edge(entry, leaf);
+        func.add_edge(entry, save);
+        func.add_edge(leaf, join);
+        func.add_edge(save, mid);
+        func.add_edge(save, edge);
+        func.add_edge(mid, join);
+        func.add_edge(join, ret);
+        func.add_edge(edge, ret);
+        (func, [join, mid, edge, ret])
+    }
+
+    #[test]
+    fn test_shrinkwrap_restores_on_a_frame_path_through_a_non_dominated_join() {
+        let (mut func, [join, mid, edge, ret]) = make_frame_path_through_leaf_join_func();
+        let layout = leaf_guard_layout(&func);
+        let plan = compute_shrink_wrap_plan(&func, &layout)
+            .expect("the shape is admissible once the frame path into the join is cut");
+        assert_eq!(plan.save_block, BlockId(2));
+        // BOTH frame edges into leaf-reached blocks carry the restore: `mid`
+        // (into the join) as well as `edge` (into the return).
+        assert_eq!(plan.edge_epilogue_blocks, vec![mid, edge]);
+        assert_eq!(plan.leaf_return_blocks, vec![ret]);
+        assert!(plan.frame_return_blocks.is_empty());
+        emit_shrink_wrapped(&mut func, &layout, &plan);
+        assert_frame_balanced_on_every_path(&func);
+        // The join stays bare: it is leaf-state on both of its edges now.
+        assert!(
+            func.blocks[join.0 as usize]
+                .insts
+                .iter()
+                .all(|&id| func.insts[id.0 as usize].opcode == AArch64Opcode::B)
+        );
+    }
+
+    #[test]
+    fn test_shrinkwrap_verifier_rejects_the_dominance_only_plan() {
+        // The plan the dominance classification produced for this shape: the
+        // restore on `edge` only. The independent frame-state check must refuse
+        // it, whatever the planner says.
+        let (func, [_join, _mid, edge, ret]) = make_frame_path_through_leaf_join_func();
+        let view = FrameFunctionView::original(&func);
+        let dom = compute_block_dominators(&view).unwrap();
+        let reachable = compute_reachable(&view, 0);
+        let dominance_only_plan = ShrinkWrapPlan {
+            save_block: BlockId(2),
+            frame_return_blocks: vec![],
+            edge_epilogue_blocks: vec![edge],
+            leaf_return_blocks: vec![ret],
+        };
+        assert!(
+            !verify_shrink_wrap_plan(&view, &dom, &reachable, &dominance_only_plan),
+            "a frame path reaching a bare `ret` through a non-dominated join must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_shrinkwrap_declines_a_join_whose_frame_predecessor_cannot_be_cut() {
+        // `mid` now has a SECOND exit (a frame return), so the restore cannot be
+        // placed on its edge into the join alone: the candidate must decline
+        // (whole-function prologue) rather than return from `ret` unrestored.
+        let (mut func, [join, mid, _edge, _ret]) = make_frame_path_through_leaf_join_func();
+        let frame_ret = push_block(&mut func, vec![MachInst::new(AArch64Opcode::Ret, vec![])]);
+        let mid_insts = std::mem::take(&mut func.blocks[mid.0 as usize].insts);
+        let cond = func.push_inst(MachInst::new(
+            AArch64Opcode::Cbz,
+            vec![MachOperand::PReg(W1), MachOperand::Block(frame_ret)],
+        ));
+        func.blocks[mid.0 as usize].insts = std::iter::once(cond).chain(mid_insts).collect();
+        func.add_edge(mid, frame_ret);
+        assert_eq!(func.blocks[mid.0 as usize].succs, vec![join, frame_ret]);
+        let layout = leaf_guard_layout(&func);
+        assert!(compute_shrink_wrap_plan(&func, &layout).is_none());
+        insert_prologue_epilogue_impl(&mut func, &layout, ShrinkWrapEligibility::DarwinFrame)
+            .unwrap();
+        assert_frame_balanced_on_every_path(&func);
+    }
+
+    #[test]
+    fn test_shrinkwrap_leaf_guard_diamond_is_frame_balanced() {
+        let mut func = make_leaf_guard_func();
+        let layout = leaf_guard_layout(&func);
+        let plan = compute_shrink_wrap_plan(&func, &layout).unwrap();
+        emit_shrink_wrapped(&mut func, &layout, &plan);
+        assert_frame_balanced_on_every_path(&func);
     }
 
     #[test]
@@ -4738,10 +7446,94 @@ mod tests {
     }
 
     #[test]
+    fn stack_guard_admission_requires_a_reserved_fixed_guard_slot() {
+        for slot in [
+            None,
+            Some(StackSlot::new(4, 4)),
+            Some(StackSlot::new_dynamic(StackSlotSizeSource::Unknown, 16)),
+        ] {
+            let mut func = make_func(
+                "bad_guard_slot",
+                vec![MachInst::new(AArch64Opcode::Ret, vec![])],
+            );
+            func.stack_protector = StackProtectorMode::StackGuard;
+            // Missing, undersized, or runtime-sized guard storage must not
+            // silently turn a protected function into an unprotected one.
+            func.stack_protector_slot = Some(trust_cg_ir::StackSlotId(0));
+            if let Some(slot) = slot {
+                func.stack_slots.push(slot);
+            }
+            let layout = compute_frame_layout(&func, 0, true);
+            let before = format!("{func:?}");
+            assert!(insert_prologue_epilogue(&mut func, &layout).is_err());
+            assert_eq!(format!("{func:?}"), before);
+        }
+    }
+
+    #[test]
+    fn stack_guard_admission_rejects_missing_reservation_before_frame_edits() {
+        let mut func = make_func(
+            "missing_guard_slot",
+            vec![MachInst::new(AArch64Opcode::Ret, vec![])],
+        );
+        func.stack_protector = StackProtectorMode::StackGuard;
+        let layout = compute_frame_layout(&func, 0, true);
+        let before = format!("{func:?}");
+        assert!(insert_prologue_epilogue(&mut func, &layout).is_err());
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn stack_guard_admission_reservation_is_checked_and_idempotent() {
+        let mut func = make_func(
+            "guard_reservation",
+            vec![MachInst::new(AArch64Opcode::Ret, vec![])],
+        );
+        ensure_stack_protector_slot(&mut func).unwrap();
+        assert!(func.stack_slots.is_empty());
+        func.stack_protector = StackProtectorMode::StackGuard;
+        ensure_stack_protector_slot(&mut func).unwrap();
+        assert_eq!(func.stack_slots, [StackSlot::new(8, 16)]);
+        let before = format!("{func:?}");
+        ensure_stack_protector_slot(&mut func).unwrap();
+        assert_eq!(format!("{func:?}"), before);
+        for slot in [
+            StackSlot::new(8, 8),
+            StackSlot::new(16, 16),
+            StackSlot::new_dynamic(StackSlotSizeSource::Unknown, 16),
+        ] {
+            func.stack_slots[0] = slot;
+            let invalid = format!("{func:?}");
+            assert!(ensure_stack_protector_slot(&mut func).is_err());
+            assert_eq!(format!("{func:?}"), invalid);
+        }
+    }
+
+    #[test]
+    fn stack_guard_admission_shrinkwrap_cannot_hide_a_missing_guard() {
+        let mut func = make_func(
+            "guard_shrinkwrap",
+            vec![MachInst::new(AArch64Opcode::Ret, vec![])],
+        );
+        func.stack_protector = StackProtectorMode::StackGuard;
+        let layout = compute_frame_layout(&func, 0, true);
+        let before = format!("{func:?}");
+        assert!(
+            insert_prologue_epilogue_shrinkwrap(
+                &mut func,
+                &layout,
+                ShrinkWrapEligibility::DarwinFrame
+            )
+            .is_err()
+        );
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
     fn test_stack_protector_trivial_leaf_uses_frame_before_guard_save() {
         let mut func = make_func("ssp_leaf", vec![MachInst::new(AArch64Opcode::Ret, vec![])]);
         func.stack_protector = StackProtectorMode::StackGuard;
-        ensure_stack_protector_slot(&mut func);
+        ensure_stack_protector_slot(&mut func).unwrap();
 
         let layout = compute_frame_layout(&func, 0, true);
 
@@ -4822,7 +7614,7 @@ mod tests {
             func.alloc_stack_slot(*slot);
         }
         func.stack_protector = StackProtectorMode::StackGuard;
-        ensure_stack_protector_slot(&mut func);
+        ensure_stack_protector_slot(&mut func).unwrap();
         func
     }
 
@@ -4949,15 +7741,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stack protector guard slot requires a frame pointer")]
     fn test_stack_protector_guard_offset_requires_frame_pointer() {
         let mut func = make_func("ssp_no_fp", vec![MachInst::new(AArch64Opcode::Ret, vec![])]);
         func.stack_protector = StackProtectorMode::StackGuard;
-        ensure_stack_protector_slot(&mut func);
+        ensure_stack_protector_slot(&mut func).unwrap();
         let mut layout = compute_frame_layout(&func, 0, true);
         layout.uses_frame_pointer = false;
 
-        let _ = stack_protector_frame_offset(&func, &layout);
+        let before = format!("{func:?}");
+        let error = insert_prologue_epilogue(&mut func, &layout).unwrap_err();
+        assert!(error.to_string().contains("requires a frame pointer"));
+        assert_eq!(format!("{func:?}"), before);
     }
 
     #[test]
@@ -5381,7 +8175,7 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(8, 8));
 
         let layout = compute_frame_layout(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         // The FrameIndex should be replaced with a MemOp.
         let inst = &func.insts[0];
@@ -5430,11 +8224,11 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(1, 1)); // Slot 2
 
         let layout = compute_frame_layout(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         // All FrameIndex operands should be replaced.
-        for i in 0..3 {
-            match &func.insts[i].operands[1] {
+        for (i, inst) in func.insts[..3].iter().enumerate() {
+            match &inst.operands[1] {
                 MachOperand::MemOp { base, .. } => {
                     assert_eq!(*base, X29);
                 }
@@ -5972,6 +8766,154 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_runtime_allocation_expands_outside_the_layout() {
+        let mut func = make_func("dead_alloc", vec![make_ret()]);
+        let dead = BlockId(func.blocks.len() as u32);
+        func.blocks.push(trust_cg_ir::function::MachBlock::new());
+        for inst in [frame_insert_alloc(3, 8, 16), make_ret()] {
+            let id = func.push_inst(inst);
+            func.append_inst(dead, id);
+        }
+        let layout = compute_frame_layout_dynamic(&func, 0, false);
+        insert_prologue_epilogue(&mut func, &layout).unwrap();
+        assert_eq!(func.block_order, vec![func.entry]);
+        assert_eq!(
+            func.blocks.len(),
+            5,
+            "test, step and exit blocks stay unlaid"
+        );
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .all(|id| func.inst(*id).opcode != AArch64Opcode::StackAlloc)
+        );
+        crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+    }
+
+    /// A branch that stays in the block a runtime allocation splits keeps its
+    /// recorded edge (the L05-P8 length witness branches to a trap block
+    /// mid-block); the tail keeps the edges its own terminator names.
+    #[test]
+    fn allocation_split_keeps_edges_named_by_the_head() {
+        let mut func = make_func(
+            "witness_then_alloc",
+            vec![
+                MachInst::new(
+                    AArch64Opcode::CmpRI,
+                    vec![MachOperand::PReg(X1), MachOperand::Imm(0)],
+                ),
+                MachInst::new(
+                    AArch64Opcode::BCond,
+                    vec![MachOperand::Imm(0b0000), MachOperand::Block(BlockId(1))],
+                ),
+                frame_insert_alloc(3, 8, 16),
+                MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(BlockId(2))]),
+            ],
+        );
+        let trap = BlockId(1);
+        let exit = BlockId(2);
+        for (block, inst) in [
+            (
+                trap,
+                MachInst::new(AArch64Opcode::Brk, vec![MachOperand::Imm(1)]),
+            ),
+            (exit, make_ret()),
+        ] {
+            assert_eq!(func.create_block(), block);
+            let id = func.push_inst(inst);
+            func.append_inst(block, id);
+        }
+        func.add_edge(BlockId(0), exit);
+        func.add_edge(BlockId(0), trap);
+        let layout = compute_frame_layout_dynamic(&func, 0, false);
+        insert_prologue_epilogue(&mut func, &layout).unwrap();
+
+        let holder = |opcode: AArch64Opcode| {
+            func.block_order
+                .iter()
+                .copied()
+                .find(|block| {
+                    func.blocks[block.0 as usize]
+                        .insts
+                        .iter()
+                        .any(|id| func.inst(*id).opcode == opcode)
+                })
+                .expect("instruction laid out")
+        };
+        let head = holder(AArch64Opcode::BCond);
+        let tail = func
+            .block_order
+            .iter()
+            .copied()
+            .find(|block| {
+                func.blocks[block.0 as usize].insts.iter().any(|id| {
+                    func.inst(*id).opcode == AArch64Opcode::B
+                        && func.inst(*id).operands == vec![MachOperand::Block(exit)]
+                })
+            })
+            .expect("tail laid out");
+        assert_ne!(head, tail, "the allocation splits the block");
+        assert!(func.blocks[head.0 as usize].succs.contains(&trap));
+        assert!(!func.blocks[head.0 as usize].succs.contains(&exit));
+        assert_eq!(func.blocks[tail.0 as usize].succs, vec![exit]);
+        assert!(func.blocks[trap.0 as usize].preds.contains(&head));
+        assert!(!func.blocks[trap.0 as usize].preds.contains(&tail));
+        assert_eq!(func.blocks[exit.0 as usize].preds, vec![tail]);
+        crate::pipeline::validate_aarch64_mach_function(&func).unwrap();
+    }
+
+    /// A jump table the head's `ADR` names keeps its entries on both halves:
+    /// the table's `BR` may follow the split point.
+    #[test]
+    fn allocation_split_keeps_head_named_jump_table_entries_on_both_halves() {
+        let mut func = make_func(
+            "table_then_alloc",
+            vec![
+                MachInst::new(
+                    AArch64Opcode::Adr,
+                    vec![MachOperand::PReg(X16), MachOperand::JumpTableIndex(0)],
+                ),
+                frame_insert_alloc(3, 8, 16),
+                MachInst::new(AArch64Opcode::Br, vec![MachOperand::PReg(X16)]),
+            ],
+        );
+        let arms = [BlockId(1), BlockId(2)];
+        for arm in arms {
+            assert_eq!(func.create_block(), arm);
+            let id = func.push_inst(make_ret());
+            func.append_inst(arm, id);
+            func.add_edge(BlockId(0), arm);
+        }
+        func.jump_tables.push(trust_cg_ir::function::JumpTableData {
+            min_val: 0,
+            targets: arms.to_vec(),
+        });
+        let layout = compute_frame_layout_dynamic(&func, 0, false);
+        insert_prologue_epilogue(&mut func, &layout).unwrap();
+        let holder = |opcode: AArch64Opcode| {
+            func.block_order
+                .iter()
+                .copied()
+                .find(|block| {
+                    func.blocks[block.0 as usize]
+                        .insts
+                        .iter()
+                        .any(|id| func.inst(*id).opcode == opcode)
+                })
+                .expect("instruction laid out")
+        };
+        let (head, tail) = (holder(AArch64Opcode::Adr), holder(AArch64Opcode::Br));
+        assert_ne!(head, tail, "the allocation splits the block");
+        for arm in arms {
+            assert!(func.blocks[head.0 as usize].succs.contains(&arm));
+            assert!(func.blocks[tail.0 as usize].succs.contains(&arm));
+            assert!(func.blocks[arm.0 as usize].preds.contains(&head));
+            assert!(func.blocks[arm.0 as usize].preds.contains(&tail));
+        }
+    }
+
+    #[test]
     fn test_insert_prologue_expands_stack_alloc_pseudo() {
         let mut func = make_func(
             "dynamic_stack_alloc",
@@ -5992,11 +8934,7 @@ mod tests {
 
         insert_prologue_epilogue(&mut func, &layout).unwrap();
 
-        let entry_insts: Vec<_> = func.blocks[func.entry.0 as usize]
-            .insts
-            .iter()
-            .map(|id| &func.insts[id.0 as usize])
-            .collect();
+        let entry_insts = laid_out_insts(&func);
         assert!(
             entry_insts
                 .iter()
@@ -6022,12 +8960,25 @@ mod tests {
                     && window[2].opcode == AArch64Opcode::AddRI
                     && window[2].operands
                         == vec![
+                            MachOperand::PReg(X0),
+                            MachOperand::Special(SpecialReg::SP),
+                            MachOperand::Imm(0),
+                        ]
+            }),
+            "expanded dynamic allocation must compute the target SP through a real GPR"
+        );
+        assert!(
+            entry_insts.windows(2).any(|window| {
+                window[0].opcode == AArch64Opcode::AddRI
+                    && window[0].operands
+                        == vec![
                             MachOperand::Special(SpecialReg::SP),
                             MachOperand::PReg(X16),
                             MachOperand::Imm(0),
                         ]
+                    && is_stack_probe(window[1])
             }),
-            "expanded dynamic allocation must subtract the aligned runtime size through a real GPR"
+            "the final SP of a runtime allocation must be probed"
         );
         assert!(
             entry_insts.iter().all(|inst| {
@@ -6049,11 +9000,330 @@ mod tests {
     }
 
     #[test]
+    fn frame_insert_negative_count_is_transactional_error() {
+        assert_frame_insert_operand_error(-1, 1, 16);
+    }
+
+    #[test]
+    fn frame_insert_invalid_unit_is_transactional_error() {
+        for unit in [0, -1, i64::from(u32::MAX) + 1] {
+            assert_frame_insert_operand_error(1, unit, 16);
+        }
+    }
+
+    #[test]
+    fn frame_insert_invalid_alignment_is_transactional_error() {
+        for align in [0, -1, 3, 8192] {
+            assert_frame_insert_operand_error(1, 1, align);
+        }
+    }
+
+    fn frame_insert_alloc(count: i64, unit: i64, align: i64) -> MachInst {
+        MachInst::new(
+            AArch64Opcode::StackAlloc,
+            vec![
+                MachOperand::PReg(X0),
+                MachOperand::Imm(count),
+                MachOperand::Imm(unit),
+                MachOperand::Imm(align),
+            ],
+        )
+    }
+
+    fn assert_frame_insert_operand_error(count: i64, unit: i64, align: i64) {
+        // A valid allocation before the invalid one detects partial expansion,
+        // not merely failure before the first append.
+        let mut func = make_func(
+            "frame_insert_invalid",
+            vec![
+                frame_insert_alloc(1, 1, 16),
+                frame_insert_alloc(count, unit, align),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ],
+        );
+        let layout = compute_frame_layout_dynamic(&func, 0, false);
+        let before = format!("{func:?}");
+        assert!(matches!(
+            insert_prologue_epilogue(&mut func, &layout),
+            Err(crate::lower::LowerError::FrameLowering(_))
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn frame_insert_outgoing_area_4096_lowers() {
+        assert_frame_insert_large_outgoing_area(4096);
+    }
+
+    #[test]
+    fn frame_insert_outgoing_area_8192_lowers() {
+        assert_frame_insert_large_outgoing_area(8192);
+    }
+
+    #[test]
+    fn frame_insert_large_additions_encode_exact_unsigned_arithmetic() {
+        // Replay the actual encoded ADD words, independently of the builder's
+        // opcode/operand representation. No native execution is needed.
+        for amount in [
+            1,
+            4095,
+            4096,
+            4097,
+            8192,
+            0x00ff_f000,
+            0x0100_0001,
+            u32::MAX,
+        ] {
+            for source in [
+                MachOperand::Special(SpecialReg::SP),
+                MachOperand::PReg(X1),
+                MachOperand::PReg(X0),
+            ] {
+                let mut insts = Vec::new();
+                emit_add_reg_imm(X0, source.clone(), amount, &mut insts);
+                let initial = 0x1234_5678_0000_0000u64;
+                let mut regs = [initial; 32];
+                for (index, inst) in insts.iter().enumerate() {
+                    let word = crate::aarch64::encode::encode_instruction(inst).unwrap();
+                    assert_eq!(
+                        word & 0xff80_0000,
+                        0x9100_0000,
+                        "64-bit, non-flag-setting ADD immediate"
+                    );
+                    let rd = (word & 31) as usize;
+                    let rn = ((word >> 5) & 31) as usize;
+                    assert_eq!(rd, 0, "only the destination may be clobbered");
+                    if index == 0 {
+                        assert_eq!(
+                            rn,
+                            match source {
+                                MachOperand::Special(SpecialReg::SP) => 31,
+                                MachOperand::PReg(reg) => usize::from(hw_encoding(reg)),
+                                _ => unreachable!(),
+                            }
+                        );
+                    } else {
+                        assert_eq!(rn, rd, "continuation must read the partial sum");
+                    }
+                    let imm = u64::from((word >> 10) & 4095)
+                        << (if word & (1 << 22) != 0 { 12 } else { 0 });
+                    regs[rd] = regs[rn].wrapping_add(imm);
+                }
+                assert_eq!(regs[0], initial + u64::from(amount));
+                assert_eq!(regs[1], initial);
+                assert_eq!(regs[31], initial, "forming an address must not change SP");
+            }
+        }
+    }
+
+    #[test]
+    fn frame_insert_id_domain_checks_final_valid_id_and_overflow() {
+        for arena in ["instruction", "block"] {
+            assert_eq!(
+                checked_frame_insertion_id(u32::MAX as usize, 0, arena).unwrap(),
+                u32::MAX
+            );
+            assert!(checked_frame_insertion_id(u32::MAX as usize, 1, arena).is_err());
+            assert!(checked_frame_insertion_id(usize::MAX, 1, arena).is_err());
+        }
+        let func = make_func("checked_frame_ids", vec![make_ret()]);
+        let before = format!("{func:?}");
+        let mut plan = FrameInsertionPlan::new(&func).unwrap();
+        // Exercise the production append check with a synthetic logical base;
+        // no multi-billion-instruction allocation is needed and no fake plan
+        // is committed to the real function.
+        plan.original_inst_count = u32::MAX as usize;
+        assert_eq!(plan.push_inst(make_nop()).unwrap(), InstId(u32::MAX));
+        assert!(plan.push_inst(make_nop()).is_err());
+        assert_eq!(plan.added_insts.len(), 1);
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn frame_insert_staged_append_refusal_preserves_input() {
+        let func = make_func(
+            "frame_id_refusal",
+            vec![frame_insert_alloc(1, 1, 16), make_ret()],
+        );
+        let before = format!("{func:?}");
+        let mut plan = FrameInsertionPlan::new(&func).unwrap();
+        plan.original_inst_count = u32::MAX as usize;
+        assert!(expand_dynamic_stack_allocs(&func, &mut plan, 0).is_err());
+        assert_eq!(format!("{func:?}"), before);
+        assert_eq!(plan.added_insts.len(), 1);
+    }
+
+    #[test]
+    fn frame_insert_rejects_malformed_optional_operands_and_registers() {
+        let mut malformed = Vec::new();
+        for (index, value) in [
+            (0, MachOperand::PReg(D8)),
+            (0, MachOperand::PReg(W0)),
+            (1, MachOperand::PReg(D8)),
+            (2, MachOperand::PReg(X1)),
+            (3, MachOperand::PReg(X1)),
+        ] {
+            let mut inst = frame_insert_alloc(1, 1, 16);
+            inst.operands[index] = value;
+            malformed.push(inst);
+        }
+        malformed.push(MachInst::new(AArch64Opcode::StackAlloc, vec![]));
+        for inst in malformed {
+            let mut func = make_func(
+                "malformed_frame_alloc",
+                vec![frame_insert_alloc(1, 1, 16), inst, make_ret()],
+            );
+            let layout = compute_frame_layout_dynamic(&func, 0, false);
+            let before = format!("{func:?}");
+            assert!(insert_prologue_epilogue(&mut func, &layout).is_err());
+            assert_eq!(format!("{func:?}"), before);
+        }
+    }
+
+    #[test]
+    fn frame_insert_plan_commits_exact_counts_and_preserves_return_metadata() {
+        for protected in [false, true] {
+            let mut func = make_func(
+                "frame_insert_metadata",
+                vec![
+                    frame_insert_alloc(3, 8, 16),
+                    MachInst::new(AArch64Opcode::Ret, vec![]).with_implicit_uses(&[X0]),
+                ],
+            );
+            func.signature.returns = vec![trust_cg_ir::function::Type::I64];
+            let ret = func.blocks[0].insts[1];
+            func.set_inst_lowering_provenance(
+                ret,
+                trust_cg_ir::provenance::LoweringProvenance::Synthetic {
+                    reason: trust_cg_ir::provenance::SyntheticReason::PrologueEpilogue,
+                },
+            );
+            if protected {
+                func.stack_protector = StackProtectorMode::StackGuard;
+                ensure_stack_protector_slot(&mut func).unwrap();
+            }
+            let layout = compute_frame_layout_dynamic(&func, 4096, false);
+            let before = format!("{func:?}");
+            let old_ret = format!("{:?}", func.inst(ret));
+            let old_provenance = func.lowering_provenance.clone();
+            let old_inst_count = func.insts.len();
+            let old_block_count = func.blocks.len();
+            let plan =
+                plan_frame_insertion(&func, &layout, ShrinkWrapEligibility::Disabled).unwrap();
+            assert_eq!(
+                format!("{func:?}"),
+                before,
+                "planning must not mutate the owner"
+            );
+            let additions = plan.added_insts.len();
+            // One runtime allocation adds its probe-loop test, step and exit
+            // blocks; the protector adds its failure block.
+            assert_eq!(
+                plan.blocks.len(),
+                old_block_count + 3 + usize::from(protected)
+            );
+            plan.commit(&mut func).unwrap();
+            assert_eq!(func.insts.len(), old_inst_count + additions);
+            assert_eq!(format!("{:?}", func.inst(ret)), old_ret);
+            assert_eq!(func.lowering_provenance, old_provenance);
+            assert_eq!(
+                func.blocks
+                    .iter()
+                    .flat_map(|block| &block.insts)
+                    .filter(|&&id| id == ret)
+                    .count(),
+                1
+            );
+            assert!(
+                func.blocks
+                    .iter()
+                    .flat_map(|block| &block.insts)
+                    .all(|id| (id.0 as usize) < func.insts.len())
+            );
+        }
+    }
+
+    fn assert_frame_insert_large_outgoing_area(outgoing: u32) {
+        let mut func = make_func(
+            "frame_insert_large_outgoing",
+            vec![
+                frame_insert_alloc(3, 8, 16),
+                MachInst::new(
+                    AArch64Opcode::StrRI,
+                    vec![
+                        MachOperand::PReg(X1),
+                        MachOperand::Special(SpecialReg::SP),
+                        MachOperand::Imm(i64::from(outgoing - 8)),
+                    ],
+                ),
+                MachInst::new(
+                    AArch64Opcode::Bl,
+                    vec![MachOperand::Symbol("callee".into())],
+                ),
+                MachInst::new(AArch64Opcode::Ret, vec![]),
+            ],
+        );
+        assert_eq!(compute_max_outgoing_arg_size(&func), outgoing);
+        let layout = compute_frame_layout_dynamic(&func, outgoing, false);
+        let return_id = func.blocks[0].insts[3];
+        let original_return = format!("{:?}", func.inst(return_id));
+        insert_prologue_epilogue(&mut func, &layout).unwrap();
+        // The probe loop splits the block: the return continues after it.
+        let return_block = func
+            .blocks
+            .iter()
+            .position(|block| block.insts.contains(&return_id))
+            .unwrap();
+        assert_ne!(return_block, 0);
+        assert_eq!(format!("{:?}", func.inst(return_id)), original_return);
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .all(|id| func.inst(*id).opcode != AArch64Opcode::StackAlloc)
+        );
+        let dynamic = expand_dynamic_stack_alloc_inst(&frame_insert_alloc(3, 8, 16), outgoing)
+            .unwrap()
+            .unwrap();
+        assert!(
+            dynamic
+                .setup
+                .iter()
+                .chain(&dynamic.test)
+                .chain(&dynamic.step)
+                .chain(&dynamic.exit)
+                .all(|inst| crate::aarch64::encode::encode_instruction(inst).is_ok())
+        );
+        let address = dynamic
+            .exit
+            .iter()
+            .rev()
+            .take_while(|inst| {
+                matches!(
+                    inst.opcode,
+                    AArch64Opcode::AddRI | AArch64Opcode::AddRIShift12
+                )
+            })
+            .collect::<Vec<_>>();
+        // The last sequence constructs dst = new_SP + outgoing, after SP was
+        // moved. Read the encoded immediates, including their actual shift bit.
+        let mut total = 0u64;
+        for inst in address {
+            if inst.operands.first() != Some(&MachOperand::PReg(X0)) {
+                break;
+            }
+            let word = crate::aarch64::encode::encode_instruction(inst).unwrap();
+            total += u64::from((word >> 10) & 4095) << (if word & (1 << 22) != 0 { 12 } else { 0 });
+        }
+        assert_eq!(total, u64::from(outgoing));
+    }
+
+    #[test]
     fn test_stack_alloc_constant_count_size_overflow_returns_err() {
         // FINDING #10a: a well-typed but enormous constant-count alloca
         // (count * unit_size overflows u64) previously aborted the compiler
         // via `.expect()`. It must now return a typed FrameLowering error.
-        // count = i64::MAX is >= 0 (passes the non-negative assert) and
+        // count = i64::MAX is non-negative and
         // unit_size = 8 is in (0, u32::MAX]; their u64 product overflows.
         let mut func = make_func(
             "overflow_stack_alloc",
@@ -6247,11 +9517,7 @@ mod tests {
 
         insert_prologue_epilogue(&mut func, &layout).unwrap();
 
-        let entry_insts: Vec<_> = func.blocks[func.entry.0 as usize]
-            .insts
-            .iter()
-            .map(|id| &func.insts[id.0 as usize])
-            .collect();
+        let entry_insts = laid_out_insts(&func);
         assert!(
             entry_insts.iter().any(|inst| {
                 inst.opcode == AArch64Opcode::AddRI
@@ -6287,11 +9553,7 @@ mod tests {
 
         insert_prologue_epilogue(&mut func, &layout).unwrap();
 
-        let entry_insts: Vec<_> = func.blocks[func.entry.0 as usize]
-            .insts
-            .iter()
-            .map(|id| &func.insts[id.0 as usize])
-            .collect();
+        let entry_insts = laid_out_insts(&func);
         assert!(
             entry_insts.iter().any(|inst| {
                 inst.opcode == AArch64Opcode::AddRI
@@ -6570,7 +9832,7 @@ mod tests {
 
         let layout = compute_frame_layout(&func, 0, false);
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let stats = fie.run(&mut func);
+        let stats = fie.run(&mut func).unwrap();
 
         // Both FrameIndex operands should be eliminated.
         assert_eq!(stats.eliminated_count, 2);
@@ -6639,7 +9901,9 @@ mod tests {
             "test setup: FP offset {fp_offset} must be out of immediate range"
         );
 
-        let stats = FrameIndexEliminator::new(&layout, &func).run(&mut func);
+        let stats = FrameIndexEliminator::new(&layout, &func)
+            .run(&mut func)
+            .unwrap();
         assert_eq!(stats.large_offset_count, 0, "no scratch should be needed");
         // The load is untouched apart from its operand: still exactly two insts.
         assert_eq!(func.blocks[0].insts.len(), 2);
@@ -6664,7 +9928,9 @@ mod tests {
         let mut func = far_slot_load_func("far_slot_dyn", 4096);
         let layout = layout_without_sp_rebase(&func, 0, false);
         assert!(sp_rebase_delta_for(&layout, &func).is_none());
-        let stats = FrameIndexEliminator::new(&layout, &func).run(&mut func);
+        let stats = FrameIndexEliminator::new(&layout, &func)
+            .run(&mut func)
+            .unwrap();
         assert_eq!(stats.large_offset_count, 1);
         assert!(func.blocks[0].insts.len() > 2, "expected materialization");
     }
@@ -6678,7 +9944,9 @@ mod tests {
         let layout = compute_frame_layout(&func, 0, false);
         let fp_offset = FrameIndexEliminator::new(&layout, &func).slot_offsets[0] as i64;
         assert!(!is_large_offset(fp_offset));
-        FrameIndexEliminator::new(&layout, &func).run(&mut func);
+        FrameIndexEliminator::new(&layout, &func)
+            .run(&mut func)
+            .unwrap();
         let MachOperand::MemOp { base, offset } = func.inst(func.blocks[0].insts[0]).operands[1]
         else {
             panic!("expected a resolved MemOp");
@@ -6709,7 +9977,9 @@ mod tests {
             );
             func.alloc_stack_slot(StackSlot::new(4096, 16));
             let layout = compute_frame_layout(&func, 0, false);
-            FrameIndexEliminator::new(&layout, &func).run(&mut func);
+            FrameIndexEliminator::new(&layout, &func)
+                .run(&mut func)
+                .unwrap();
             let inst = func.inst(func.blocks[0].insts[0]);
             if let MachOperand::MemOp { offset, .. } = inst.operands[1] {
                 assert!(
@@ -6789,7 +10059,7 @@ mod tests {
             "fixture must be outside the FP window, got {fp_offset}"
         );
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let stats = fie.run(&mut func);
+        let stats = fie.run(&mut func).unwrap();
 
         assert_eq!(stats.eliminated_count, 1);
         assert_eq!(stats.large_offset_count, 0, "SP form needs no scratch");
@@ -6836,7 +10106,7 @@ mod tests {
         );
         let fp_offset = stack_slot_frame_offsets(&func, &layout)[0].unwrap() as i64;
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let (base, offset) = fie.resolve_slot_operand(0);
+        let (base, offset) = fie.resolve_slot_operand(0).unwrap();
         assert_eq!(base, SP);
         assert_eq!(offset, fp_offset + layout.total_frame_size as i64 - 16);
         assert_ne!(
@@ -6868,7 +10138,7 @@ mod tests {
         let mut layout = compute_frame_layout(&func, 0, false);
         layout.has_dynamic_alloc = true;
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let (base, offset) = fie.resolve_slot_operand(0);
+        let (base, offset) = fie.resolve_slot_operand(0).unwrap();
         assert_eq!(base, X29, "dynamic alloc must keep the FP base");
         assert!(offset < 0);
     }
@@ -6895,7 +10165,7 @@ mod tests {
 
         let layout = layout_without_sp_rebase(&func, 0, false);
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let stats = fie.run(&mut func);
+        let stats = fie.run(&mut func).unwrap();
 
         assert_eq!(stats.eliminated_count, 1);
         assert_eq!(stats.large_offset_count, 1);
@@ -6950,7 +10220,7 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(8192, 16));
 
         let layout = layout_without_sp_rebase(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         let block_insts = &func.blocks[0].insts;
         assert!(
@@ -6977,14 +10247,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "would clobber IP scratch")]
     fn eliminate_frame_indices_fails_closed_on_live_ip_scratch_clobber() {
         // Reconstructs the pr28982b spill-materialization hazard: two far-offset
         // spill stores where the FIRST stores X16 (forcing the eliminator to
         // borrow X17 as the address scratch) while X17 still holds a live value
         // that the SECOND store reads. Overwriting X17 there is the loop-carried
-        // pointer miscompile; the eliminator must FAIL CLOSED (panic) rather than
-        // silently emit it.
+        // pointer miscompile; the eliminator must reject with a typed error.
         let mut func = make_func(
             "live_ip_scratch_clobber",
             vec![
@@ -7012,7 +10280,12 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(8, 8)); // slot 2
 
         let layout = layout_without_sp_rebase(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        let before = func.clone();
+        assert!(matches!(
+            eliminate_frame_indices(&mut func, &layout),
+            Err(FrameIndexEliminationError::LiveScratch { scratch: X17, .. })
+        ));
+        assert_eq!(format!("{func:?}"), format!("{before:?}"));
     }
 
     #[test]
@@ -7037,7 +10310,7 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(8, 8)); // slot 1
 
         let layout = compute_frame_layout(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         // The store survives with its frame operand rewritten to [scratch, #0].
         let has_store = func.blocks[0]
@@ -7077,7 +10350,7 @@ mod tests {
             "FP/LR plus the X19/X20 callee-saved pair should be in the saved area"
         );
 
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         // Apple-canonical layout: FP points at the saved FP/LR pair, so the
         // caller's SP (CFA) is at FP+16 and incoming stack args sit just above
@@ -7111,7 +10384,7 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(512, 16));
 
         let layout = layout_without_sp_rebase(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         let block_insts = &func.blocks[0].insts;
         assert!(
@@ -7158,7 +10431,7 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(512, 16));
 
         let layout = layout_without_sp_rebase(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         let store_inst_id = func.blocks[0]
             .insts
@@ -7201,7 +10474,7 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new(512, 16));
 
         let layout = layout_without_sp_rebase(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         let load_inst_id = func.blocks[0]
             .insts
@@ -7243,7 +10516,7 @@ mod tests {
 
         func.alloc_stack_slot(StackSlot::new(8192, 16)); // padding below: keep the accessed slot outside the SP positive window too
         let layout = compute_frame_layout(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         let addr = func.inst(func.blocks[0].insts[0]);
         assert_eq!(addr.opcode, AArch64Opcode::SubRI);
@@ -7260,7 +10533,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "runtime-sized stack slot 0 requires dynamic SP lowering")]
     fn eliminate_frame_indices_rejects_runtime_stack_slot_fixed_resolution() {
         let mut func = make_func(
             "runtime_stack_addr",
@@ -7276,7 +10548,12 @@ mod tests {
         func.alloc_stack_slot(StackSlot::new_dynamic(StackSlotSizeSource::Unknown, 16));
 
         let layout = compute_frame_layout(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        let before = func.clone();
+        assert_eq!(
+            eliminate_frame_indices(&mut func, &layout),
+            Err(FrameIndexEliminationError::RuntimeSizedSlot { slot: 0 })
+        );
+        assert_eq!(format!("{func:?}"), format!("{before:?}"));
     }
 
     #[test]
@@ -7295,7 +10572,7 @@ mod tests {
         ));
 
         let layout = compute_frame_layout(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         match &func.inst(detached).operands[1] {
             MachOperand::MemOp { base, offset } => {
@@ -7345,7 +10622,7 @@ mod tests {
 
         let layout = compute_frame_layout(&func, 0, false);
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let stats = fie.run(&mut func);
+        let stats = fie.run(&mut func).unwrap();
 
         assert_eq!(stats.eliminated_count, 3);
 
@@ -7399,7 +10676,7 @@ mod tests {
         assert_eq!(layout.outgoing_arg_area_size, 32);
 
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let stats = fie.run(&mut func);
+        let stats = fie.run(&mut func).unwrap();
 
         assert_eq!(stats.eliminated_count, 1);
         // Spill slot should use FP-relative addressing.
@@ -7434,7 +10711,7 @@ mod tests {
         assert!(layout.uses_frame_pointer);
 
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let (base, _offset) = fie.resolve_slot_operand(0);
+        let (base, _offset) = fie.resolve_slot_operand(0).unwrap();
         assert_eq!(base, X29, "With FP, should use FP-relative");
 
         // Test SP-relative by creating a layout with uses_frame_pointer=false.
@@ -7443,7 +10720,7 @@ mod tests {
             ..layout.clone()
         };
         let fie_sp = FrameIndexEliminator::new(&sp_layout, &func);
-        let (base_sp, _offset_sp) = fie_sp.resolve_slot_operand(0);
+        let (base_sp, _offset_sp) = fie_sp.resolve_slot_operand(0).unwrap();
         assert_eq!(base_sp, SP, "Without FP, should use SP-relative");
     }
 
@@ -7482,7 +10759,7 @@ mod tests {
 
         let layout = compute_frame_layout(&func, 0, false);
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let stats = fie.run(&mut func);
+        let stats = fie.run(&mut func).unwrap();
 
         assert_eq!(
             stats.eliminated_count, 3,
@@ -7511,7 +10788,7 @@ mod tests {
 
         let layout = compute_frame_layout(&func, 0, false);
         let fie = FrameIndexEliminator::new(&layout, &func);
-        let stats = fie.run(&mut func);
+        let stats = fie.run(&mut func).unwrap();
 
         assert_eq!(stats.eliminated_count, 0);
         assert_eq!(stats.large_offset_count, 0);
@@ -7547,8 +10824,8 @@ mod tests {
         let layout = compute_frame_layout(&func, 0, false);
         let fie = FrameIndexEliminator::new(&layout, &func);
 
-        let (base0, off0) = fie.resolve_slot_operand(0);
-        let (base1, off1) = fie.resolve_slot_operand(1);
+        let (base0, off0) = fie.resolve_slot_operand(0).unwrap();
+        let (base1, off1) = fie.resolve_slot_operand(1).unwrap();
 
         assert_eq!(base0, X29);
         assert_eq!(base1, X29);
@@ -7572,10 +10849,80 @@ mod tests {
         let layout = compute_frame_layout(&func, 0, false);
         let fie = FrameIndexEliminator::new(&layout, &func);
 
-        // No slots allocated, so index 0 is out of range.
-        let (base, offset) = fie.resolve_slot_operand(0);
-        assert_eq!(base, SP, "Out-of-range slot should default to SP");
-        assert_eq!(offset, 0, "Out-of-range slot should default to offset 0");
+        // An unknown slot must not silently redirect an access to SP+0.
+        assert_eq!(
+            fie.resolve_slot_operand(0),
+            Err(FrameIndexEliminationError::InvalidSlot { slot: 0, slots: 0 })
+        );
+    }
+
+    #[test]
+    fn frame_elimination_rejects_unknown_slot_without_redirecting_memory() {
+        let mut func = make_func(
+            "unknown_slot",
+            vec![MachInst::new(
+                AArch64Opcode::LdrRI,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::StackSlot(StackSlotId(1)),
+                ],
+            )],
+        );
+        func.alloc_stack_slot(StackSlot::new(8, 8));
+        let layout = compute_frame_layout(&func, 0, false);
+        let before = format!("{func:?}");
+        assert_eq!(
+            eliminate_frame_indices(&mut func, &layout),
+            Err(FrameIndexEliminationError::InvalidSlot { slot: 1, slots: 1 })
+        );
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn frame_elimination_rejects_malformed_stack_address_destination() {
+        let mut func = make_func(
+            "invalid_stack_address",
+            vec![MachInst::new(
+                AArch64Opcode::AddPCRel,
+                vec![
+                    MachOperand::Imm(0),
+                    MachOperand::PReg(SP),
+                    MachOperand::StackSlot(StackSlotId(0)),
+                ],
+            )],
+        );
+        func.alloc_stack_slot(StackSlot::new(8, 8));
+        let layout = compute_frame_layout(&func, 0, false);
+        let before = format!("{func:?}");
+        let error = eliminate_frame_indices(&mut func, &layout).unwrap_err();
+        assert!(matches!(
+            error,
+            FrameIndexEliminationError::InvalidInstruction { .. }
+        ));
+        assert!(error.to_string().contains("PReg dst"));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn frame_elimination_rejects_incoming_offset_overflow() {
+        let mut func = make_func(
+            "invalid_incoming_offset",
+            vec![MachInst::new(
+                AArch64Opcode::AddRI,
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X29),
+                    MachOperand::IncomingArg(i64::MAX),
+                ],
+            )],
+        );
+        let layout = compute_frame_layout(&func, 0, false);
+        let before = format!("{func:?}");
+        assert_eq!(
+            eliminate_frame_indices(&mut func, &layout),
+            Err(FrameIndexEliminationError::IncomingArgumentOffsetOverflow { offset: i64::MAX })
+        );
+        assert_eq!(format!("{func:?}"), before);
     }
 
     #[test]
@@ -7595,6 +10942,359 @@ mod tests {
             .iter()
             .map(|&id| func.inst(id).opcode)
             .collect()
+    }
+
+    fn gpr_ri_opcodes() -> [AArch64Opcode; 14] {
+        use AArch64Opcode as Op;
+        [
+            Op::LdrRI,
+            Op::StrRI,
+            Op::LdrbRI,
+            Op::LdrhRI,
+            Op::LdrsbRI,
+            Op::LdrshRI,
+            Op::StrbRI,
+            Op::StrhRI,
+            Op::VolatileLdrRI,
+            Op::VolatileStrRI,
+            Op::VolatileLdrbRI,
+            Op::VolatileLdrhRI,
+            Op::VolatileStrbRI,
+            Op::VolatileStrhRI,
+        ]
+    }
+
+    #[test]
+    fn gpr_ri_legalizer_does_not_launder_malformed_resolved_shapes() {
+        let mut rewritten = Vec::new();
+        let mut attempted = 0;
+        for opcode in gpr_ri_opcodes() {
+            for operands in [
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(32768),
+                    MachOperand::Imm(8),
+                ],
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::MemOp {
+                        base: X1,
+                        offset: 32768,
+                    },
+                    MachOperand::Imm(8),
+                ],
+                vec![
+                    MachOperand::PReg(X0),
+                    MachOperand::PReg(X1),
+                    MachOperand::MemOp {
+                        base: X1,
+                        offset: 32768,
+                    },
+                ],
+            ] {
+                attempted += 1;
+                let mut func = make_func("bad_ri_shape", vec![MachInst::new(opcode, operands)]);
+                let before = format!("{func:?}");
+                if legalize_large_mem_offsets(&mut func).is_ok() && format!("{func:?}") != before {
+                    rewritten.push(format!(
+                        "{opcode:?}: malformed operands were rewritten: {func:?}"
+                    ));
+                }
+            }
+        }
+        assert_eq!(attempted, 42);
+        assert!(
+            rewritten.is_empty(),
+            "{} of {attempted} malformed shapes rewritten:\n{}",
+            rewritten.len(),
+            rewritten.join("\n")
+        );
+    }
+
+    /// Source-level address-sequence check, not native execution. Arithmetic
+    /// must use a real X register, preserve the requested delta, and leave one
+    /// unchanged-kind memory access with the original transfer and flags.
+    fn check_gpr_ri_legalization(
+        inst: MachInst,
+        requested: i64,
+        zero_transfer: bool,
+    ) -> Result<(), String> {
+        let transfer = inst.operands[0].clone();
+        let flags = inst.flags;
+        let opcode = inst.opcode;
+        let mut func = make_func("valid_far_ri", vec![inst]);
+        legalize_large_mem_offsets(&mut func)?;
+        let access = func.inst(InstId(0));
+        let [actual_transfer, MachOperand::MemOp { base, offset: 0 }] = access.operands.as_slice()
+        else {
+            return Err(format!(
+                "{opcode:?}: missing legalized address: {:?}",
+                access.operands
+            ));
+        };
+        if *actual_transfer != transfer || access.opcode != opcode || access.flags != flags {
+            return Err(format!("{opcode:?}: transfer/opcode/flags changed"));
+        }
+        if base.encoding() > 30 || (zero_transfer && *base != X16 && *base != X17) {
+            return Err(format!(
+                "{opcode:?}: invalid effective-address scratch {base:?}"
+            ));
+        }
+        let ids = &func.blocks[0].insts;
+        if ids.len() < 2 || ids.last() != Some(&InstId(0)) {
+            return Err(format!("{opcode:?}: missing ordered materialization"));
+        }
+        assert_eq!(
+            eval_scratch_delta(&func, &ids[..ids.len() - 1], *base, X1),
+            requested
+        );
+        for id in ids {
+            crate::aarch64::encode::encode_instruction(func.inst(*id))
+                .map_err(|error| format!("{opcode:?}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gpr_ri_legalizer_never_uses_zero_register_as_address_scratch() {
+        use AArch64Opcode as Op;
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for opcode in [
+            Op::LdrRI,
+            Op::LdrbRI,
+            Op::LdrhRI,
+            Op::LdrsbRI,
+            Op::LdrshRI,
+            Op::VolatileLdrRI,
+            Op::VolatileLdrbRI,
+            Op::VolatileLdrhRI,
+        ] {
+            for transfer in [
+                MachOperand::PReg(PReg::new(160)),
+                MachOperand::PReg(PReg::new(161)),
+                MachOperand::Special(SpecialReg::XZR),
+                MachOperand::Special(SpecialReg::WZR),
+            ] {
+                for offset in [-300, 32768] {
+                    attempted += 1;
+                    let inst = MachInst::new(
+                        opcode,
+                        vec![
+                            transfer.clone(),
+                            MachOperand::PReg(X1),
+                            MachOperand::Imm(offset),
+                        ],
+                    );
+                    if let Err(error) = check_gpr_ri_legalization(inst, offset, true) {
+                        failures.push(format!("{opcode:?}/{transfer:?}/{offset}: {error}"));
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 64);
+        assert!(
+            failures.is_empty(),
+            "{} of {attempted} zero-transfer cases failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn gpr_ri_legalizer_preserves_all_fourteen_large_offset_forms() {
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for opcode in gpr_ri_opcodes() {
+            for transfer in [W0, X0] {
+                for split in [false, true] {
+                    for offset in [-300, 32768] {
+                        attempted += 1;
+                        let operands = if split {
+                            vec![
+                                MachOperand::PReg(transfer),
+                                MachOperand::PReg(X1),
+                                MachOperand::Imm(offset),
+                            ]
+                        } else {
+                            vec![
+                                MachOperand::PReg(transfer),
+                                MachOperand::MemOp { base: X1, offset },
+                            ]
+                        };
+                        if let Err(error) = check_gpr_ri_legalization(
+                            MachInst::new(opcode, operands),
+                            offset,
+                            false,
+                        ) {
+                            failures.push(format!(
+                                "{opcode:?}/{transfer:?}/split={split}/{offset}: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 112);
+        assert!(
+            failures.is_empty(),
+            "{} of {attempted} legal forms failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn gpr_ri_legalizer_preserves_unresolved_frames_and_legacy_typed_aliases() {
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for opcode in gpr_ri_opcodes() {
+            for frame in [
+                MachOperand::FrameIndex(FrameIdx(0)),
+                MachOperand::StackSlot(StackSlotId(0)),
+            ] {
+                attempted += 1;
+                let inst = MachInst::new(opcode, vec![MachOperand::PReg(X0), frame]);
+                if crate::aarch64::encode::scalar_ri_mem_scale(&inst).is_none() {
+                    failures.push(format!(
+                        "{opcode:?}: transfer scale unavailable before frame resolution"
+                    ));
+                }
+                let mut func = make_func("unresolved_ri", vec![inst]);
+                let before = format!("{func:?}");
+                legalize_large_mem_offsets(&mut func)
+                    .expect("early legalizer defers unresolved frame operands");
+                assert_eq!(format!("{func:?}"), before);
+            }
+        }
+        assert_eq!(attempted, 28);
+        // Existing typed aliases are not part of the tightened 14-op contract.
+        // Their valid address materialization remains available and unchanged.
+        for (opcode, transfer) in [
+            (AArch64Opcode::STRWui, W0),
+            (AArch64Opcode::STRXui, X0),
+            (AArch64Opcode::STRSui, PReg::new(128)),
+            (AArch64Opcode::STRDui, PReg::new(96)),
+        ] {
+            let inst = MachInst::new(
+                opcode,
+                vec![
+                    MachOperand::PReg(transfer),
+                    MachOperand::PReg(X1),
+                    MachOperand::Imm(32768),
+                ],
+            );
+            if let Err(error) = check_gpr_ri_legalization(inst, 32768, false) {
+                failures.push(format!("legacy {opcode:?}: {error}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unresolved/legacy controls failed:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn gpr_ri_legalizer_post_repair_volatile_fp_far_offsets() {
+        use trust_cg_ir::regs::{D0, H0, S0, V0};
+
+        // Eight opcode/width forms, each in both address layouts at two
+        // offsets beyond every H/S/D/Q immediate range. This is source-level
+        // materialization and encoding coverage, not native execution.
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for opcode in [AArch64Opcode::VolatileLdrRI, AArch64Opcode::VolatileStrRI] {
+            for transfer in [H0, S0, D0, V0] {
+                for split in [false, true] {
+                    for offset in [-300, 65536] {
+                        attempted += 1;
+                        let operands = if split {
+                            vec![
+                                MachOperand::PReg(transfer),
+                                MachOperand::PReg(X1),
+                                MachOperand::Imm(offset),
+                            ]
+                        } else {
+                            vec![
+                                MachOperand::PReg(transfer),
+                                MachOperand::MemOp { base: X1, offset },
+                            ]
+                        };
+                        if let Err(error) = check_gpr_ri_legalization(
+                            MachInst::new(opcode, operands),
+                            offset,
+                            false,
+                        ) {
+                            failures.push(format!(
+                                "{opcode:?}/{transfer:?}/split={split}/{offset}: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 32);
+        assert!(
+            failures.is_empty(),
+            "{} of {attempted} volatile FP forms failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn gpr_ri_legalizer_post_repair_preserves_malformed_address_banks() {
+        use trust_cg_ir::regs::{D0, H0, NZCV, S0, V0, WZR};
+
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for opcode in gpr_ri_opcodes() {
+            // W0/WSP, all FP widths, both ZR widths, system and unknown PRegs.
+            let mut addresses = Vec::new();
+            for base in [
+                W0,
+                PReg::new(63),
+                H0,
+                S0,
+                D0,
+                V0,
+                XZR,
+                WZR,
+                NZCV,
+                PReg::new(u16::MAX),
+            ] {
+                addresses.push(vec![MachOperand::MemOp {
+                    base,
+                    offset: 65536,
+                }]);
+                addresses.push(vec![MachOperand::PReg(base), MachOperand::Imm(65536)]);
+            }
+            for base in [SpecialReg::XZR, SpecialReg::WZR] {
+                addresses.push(vec![MachOperand::Special(base), MachOperand::Imm(65536)]);
+            }
+            for address in addresses {
+                attempted += 1;
+                let mut operands = vec![MachOperand::PReg(X0)];
+                operands.extend(address);
+                let mut func = make_func("bad_ri_base", vec![MachInst::new(opcode, operands)]);
+                let before = format!("{func:?}");
+                let result = legalize_large_mem_offsets(&mut func);
+                if result.is_err() || format!("{func:?}") != before {
+                    failures.push(format!("{opcode:?}: malformed base was not deferred unchanged: {result:?}: {func:?}"));
+                }
+                if crate::aarch64::encode::encode_instruction(func.inst(InstId(0))).is_ok() {
+                    failures.push(format!("{opcode:?}: malformed base encoded: {func:?}"));
+                }
+            }
+        }
+        assert_eq!(attempted, 308);
+        assert!(
+            failures.is_empty(),
+            "malformed address controls failed:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
@@ -8009,7 +11709,7 @@ mod tests {
             );
             func.alloc_stack_slot(StackSlot::new(0x144, 4));
             let layout = layout_without_sp_rebase(&func, 0, false);
-            eliminate_frame_indices(&mut func, &layout);
+            eliminate_frame_indices(&mut func, &layout).unwrap();
 
             let block = &func.blocks[0].insts;
             // Exactly SUB #imm12 ; <access> ; RET — no MOVZ/MOVK anywhere.
@@ -8065,7 +11765,7 @@ mod tests {
         );
         func.alloc_stack_slot(StackSlot::new(5000, 8)); // |offset| = 5000 > 4095
         let layout = layout_without_sp_rebase(&func, 0, false);
-        eliminate_frame_indices(&mut func, &layout);
+        eliminate_frame_indices(&mut func, &layout).unwrap();
 
         let block = &func.blocks[0].insts;
         assert_eq!(func.inst(block[0]).opcode, AArch64Opcode::Movz);

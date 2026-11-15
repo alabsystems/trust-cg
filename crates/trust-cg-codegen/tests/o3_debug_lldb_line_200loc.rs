@@ -7,12 +7,9 @@ mod common;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 use trust_cg_codegen::pipeline::{DispatchVerifyMode, OptLevel, Pipeline, PipelineConfig};
 use trust_cg_ir::function::{DebugBaseType, DebugLocalVariable, DebugVariableStorage};
@@ -95,16 +92,22 @@ fn const_i64(value_id: u32, value: i64, line: u32) -> InstrNode {
 
 fn build_200loc_fixture() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new(FIXTURE_STEM);
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let barrier_ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let barrier_ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), FIXTURE_STEM, ft_id, BlockId::new(0));
     let mut barrier = TrustIrFunction::new(
         FuncId::new(1),
@@ -349,8 +352,12 @@ fn build_200loc_fixture() -> (TrustIrFunction, TrustIrModule) {
         params: vec![(ValueId::new(0), Ty::I64)],
         body,
     }];
-    module.add_function(func.clone());
-    module.add_function(barrier);
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(barrier)
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -361,10 +368,11 @@ fn compile_fixture_object() -> Vec<u8> {
         .iter()
         .map(|func| (func.id, func.name.clone()))
         .collect();
-    let (mut lir_func, _) = trust_cg_lower::adapter::translate_function_with_names(
+    let (mut lir_func, _) = trust_cg_lower::translate_function_with_names_and_license(
         &trust_ir_func,
         &module,
         &func_names,
+        &permit_unlicensed(),
     )
     .expect("adapter should translate #376 O3 debug-line fixture");
     lir_func.debug_meta.param_names = vec!["x".to_string()];
@@ -412,7 +420,7 @@ fn compile_fixture_object() -> Vec<u8> {
         opt_level: OptLevel::O3,
         emit_debug: true,
         verify_dispatch: DispatchVerifyMode::Off,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     pipeline
@@ -488,82 +496,16 @@ impl BoundedCommandOutput {
 }
 
 fn command_output_with_timeout(mut command: Command, timeout: Duration) -> BoundedCommandOutput {
-    let out_path = std::env::temp_dir().join(format!(
-        "trust_cg_376_cmd_{}_{}_stdout",
-        std::process::id(),
-        thread_id_suffix()
-    ));
-    let err_path = std::env::temp_dir().join(format!(
-        "trust_cg_376_cmd_{}_{}_stderr",
-        std::process::id(),
-        thread_id_suffix()
-    ));
-    let stdout_file = fs::File::create(&out_path).expect("create bounded command stdout file");
-    let stderr_file = fs::File::create(&err_path).expect("create bounded command stderr file");
     let command_desc = format!("{command:?}");
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command.spawn().expect("spawn bounded command");
-    let child_pid = child.id();
     let start = Instant::now();
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll bounded command") {
-            let stdout = fs::read(&out_path).unwrap_or_default();
-            let stderr = fs::read(&err_path).unwrap_or_default();
-            let _ = fs::remove_file(&out_path);
-            let _ = fs::remove_file(&err_path);
-            return BoundedCommandOutput {
-                output: Output {
-                    status,
-                    stdout,
-                    stderr,
-                },
-                timed_out: false,
-                command: command_desc,
-                timeout,
-                elapsed: start.elapsed(),
-            };
-        }
-        if Instant::now() >= deadline {
-            // Direct syscall, never `kill -KILL -<pid>` through util-linux `kill`:
-            // that binary parses a leading-`-` argument as a SIGNAL spec and falls
-            // through to a target of -1 = every process the user owns. See
-            // `common::rosetta::kill_process_group` for the strace evidence.
-            #[cfg(unix)]
-            common::rosetta::kill_process_group(child_pid);
-            let _ = child.kill();
-            let status = child.wait().expect("wait for timed-out command");
-            let stdout = fs::read(&out_path).unwrap_or_default();
-            let mut stderr = fs::read(&err_path).unwrap_or_default();
-            stderr.extend_from_slice(
-                format!(
-                    "\n[trust-cg-timeout] command timed out after {:.3}s (timeout={}s), killed process group for pid {child_pid}: {command_desc}\n",
-                    start.elapsed().as_secs_f64(),
-                    timeout.as_secs().max(1),
-                )
-                .as_bytes(),
-            );
-            let _ = fs::remove_file(&out_path);
-            let _ = fs::remove_file(&err_path);
-            return BoundedCommandOutput {
-                output: Output {
-                    status,
-                    stdout,
-                    stderr,
-                },
-                timed_out: true,
-                command: command_desc,
-                timeout,
-                elapsed: start.elapsed(),
-            };
-        }
-        thread::sleep(Duration::from_millis(50));
+    let result = common::rosetta::command_output_with_timeout(&mut command, timeout)
+        .expect("run supervised debugger command");
+    BoundedCommandOutput {
+        output: result.output,
+        timed_out: result.timed_out,
+        command: command_desc,
+        timeout,
+        elapsed: start.elapsed(),
     }
 }
 
@@ -594,6 +536,32 @@ fn run_dwarfdump(path: &Path, args: &[&str]) -> String {
         String::from_utf8(output.output.stdout).expect("dwarfdump stdout should be UTF-8");
     combined.push_str(&String::from_utf8_lossy(&output.output.stderr));
     combined
+}
+
+#[cfg(unix)]
+#[test]
+fn debugger_supervisor_preserves_command_status_and_timeout_observations() {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf 'out\\n'; printf 'err\\n' >&2; exit 7"]);
+    let result = command_output_with_timeout(command, Duration::from_secs(5));
+    assert!(!result.timed_out);
+    assert_eq!(result.output.status.code(), Some(7));
+    assert_eq!(result.stdout_text(), "out\n");
+    assert_eq!(result.stderr_text(), "err\n");
+    assert!(result.command.contains("exit 7"));
+    assert_eq!(result.timeout, Duration::from_secs(5));
+
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf 'started\\n'; exec sleep 60"]);
+    let result = command_output_with_timeout(command, Duration::from_secs(1));
+    assert!(result.timed_out);
+    assert!(!result.output.status.success());
+    assert!(result.elapsed < Duration::from_secs(4));
+    assert_eq!(result.stdout_text(), "started\n");
+    assert!(result.stderr_text().contains("termination requested"));
+    let diagnostic = result.diagnostic();
+    assert!(diagnostic.contains("sleep 60"));
+    assert!(diagnostic.contains("timed_out: true"));
 }
 
 fn line_dump_mentions_source_line(dump: &str, line: u32) -> bool {
@@ -1231,4 +1199,13 @@ fn o3_debug_line_200loc_survives_dwarfdump_and_lldb() {
     run_lldb_line_probe(&dir, &exe_path);
 
     let _ = fs::remove_dir_all(dir);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its lowerings state `Permit` explicitly, so none of
+/// them passes (or is refused) because the license silently refused it.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

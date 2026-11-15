@@ -24,7 +24,8 @@ pub enum Attribute {
     U64(u64),
     Bool(bool),
     Str(String),
-    /// Reference to a basic block inside the owning [`DialectFunction`].
+    /// Reference to a basic block inside the owning
+    /// [`DialectFunction`](crate::module::DialectFunction).
     /// Conversion infrastructure (`ConversionDriver`) automatically remaps
     /// these through the source→destination block map.
     Block(BlockId),
@@ -116,7 +117,7 @@ pub type Attributes = Vec<(String, Attribute)>;
 /// A single dialect-level SSA op.
 #[derive(Debug, Clone)]
 pub struct DialectOp {
-    /// Arena index inside the owning [`DialectFunction`].
+    /// Arena index inside the owning [`DialectFunction`](crate::module::DialectFunction).
     pub id: OpId,
     /// Dialect-qualified opcode.
     pub op: DialectOpId,

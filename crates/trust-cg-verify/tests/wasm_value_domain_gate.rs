@@ -23,8 +23,15 @@ use trust_cg_verify::coverage_gate::{
 use trust_cg_verify::lowering_proof::{VerificationConfig, verify_by_evaluation_with_config};
 use trust_cg_verify::proof_database::{ProofCategory, ProofDatabase};
 use trust_cg_verify::verify::VerificationResult;
+use trust_cg_verify::wasm_memarg_offset_proofs as mo;
 use trust_cg_verify::wasm_semantics as w;
 use trust_cg_verify::wasm_value_domain as vd;
+
+#[path = "support/wasm_memarg_live_emit.rs"]
+mod wasm_memarg_live;
+
+#[path = "support/wasm_never_selected_live_scan.rs"]
+mod wasm_never_selected_live;
 
 /// Run `f` on a 64 MiB stack so `ProofDatabase::new()` does not overflow the
 /// default 8 MiB test-thread stack (proof_database.rs #205).
@@ -42,16 +49,32 @@ fn on_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 // 1. The inventory: the denominator grew with the opcode set
 // ===========================================================================
 
-/// PINS the P3 value-domain inventory: 32 rows = 28 credited opcode bytes +
-/// 4 named deferrals, with 28 covered and 4 RED.
+/// PINS the P3 value-domain inventory: 32 rows = 28 opcode bytes + 4 named
+/// deferrals. 20 rows are in the denominator, 16 covered and 4 RED; the other
+/// 12 bytes are excluded because the lowerer never selects them.
 ///
-/// The 28 credited bytes are the 14 loads (0x28..=0x35), the 9 stores
-/// (0x36..=0x3e) and the 5 sign-extension operators (0xc0..=0xc4). The 4 RED
-/// rows are `br_table`, `memory.size`, `memory.grow` and data segments — each an
-/// explicit `DeferredUnfaithfulModel` carrying its own reason, never an
-/// allowlist exclusion and never a fake green.
+/// The 16 credited bytes are the ones the lowerer emits: the 8 i32/i64/f32/f64
+/// full-width and i32 sub-word loads (0x28..=0x2f), the 6 matching stores
+/// (0x36..=0x3b) and `i32.extend8_s` / `i32.extend16_s` (0xc0, 0xc1). The 12
+/// excluded bytes are the i64 sub-word loads (0x30..=0x35) and stores
+/// (0x3c..=0x3e) and the i64 sign-extensions (0xc2..=0xc4): no trust-ir type
+/// reaches a narrow i64 carrier, and a live corpus reaching every width
+/// conversion and scalar access type is scanned to show none is emitted. Their
+/// obligations still discharge (pinned below), so they re-enter the
+/// denominator unchanged when selection lands.
+/// The 4 RED rows are `br_table`, `memory.size`, `memory.grow` and data
+/// segments — each an explicit `DeferredUnfaithfulModel` carrying its own
+/// reason, never an allowlist exclusion and never a fake green.
 #[test]
 fn wasm_value_domain_inventory_pins_accepted_and_deferred_rows() {
+    // The load / store credits bind the emitted memarg offsets of a captured
+    // corpus; re-derive it from the live backend so this pin cannot stay
+    // green over frozen bytes.
+    wasm_memarg_live::assert_memarg_corpus_is_what_the_live_backend_emits();
+    // The 12 exclusions are a fact about emission: no module of the live
+    // corpus contains one, and the scan reports one that does.
+    assert!(wasm_never_selected_live::assert_no_never_selected_opcode_is_emitted() > 0);
+    wasm_never_selected_live::assert_the_scan_reports_an_emitted_excluded_opcode();
     let report = on_large_stack(|| CoverageGate::new().audit(GateArch::WasmValueDomain));
     // Always print the audit so the deferrals stay visible in CI output.
     eprintln!("{}", report.audit_log());
@@ -59,33 +82,230 @@ fn wasm_value_domain_inventory_pins_accepted_and_deferred_rows() {
     assert_eq!(
         report.total(),
         32,
-        "P3 inventory row count changed — 28 credited opcode bytes + 4 named deferrals.\n{}",
+        "P3 inventory row count changed — 28 opcode bytes + 4 named deferrals.\n{}",
         report.audit_log()
     );
     assert_eq!(
         report.emittable_count(),
-        32,
-        "every P3 row is EmittableNeedsProof: the credited bytes carry reconstructions and the \
-         deferrals keep their debt IN the denominator. Nothing here may be allowlisted out.\n{}",
+        20,
+        "the P3 denominator is the 16 emitted bytes and the 4 deferrals; only never-selected \
+         bytes may be excluded.\n{}",
         report.audit_log()
     );
     assert_eq!(
         report.covered_count(),
-        28,
-        "P3 covered count changed — must be 28 (14 loads + 9 stores + 5 sign-extensions), ALL \
-         credited via byte-decoded reconstruction. Do NOT inflate by crediting a deferral.\n{}",
+        16,
+        "P3 covered count changed — must be 16 (8 loads + 6 stores + 2 sign-extensions the \
+         lowerer emits), ALL credited via byte-decoded reconstruction. Do NOT inflate by \
+         crediting a deferral or a never-selected byte.\n{}",
         report.audit_log()
     );
     assert_eq!(
         report.allowlisted_count(),
-        0,
-        "no P3 row may be excluded from the denominator"
+        12,
+        "exactly the 12 never-selected i64 sub-word / sign-extension bytes are excluded"
     );
+    for row in &report.rows {
+        if let OpcodeClass::FailClosedAllowlisted { reason } = row.class {
+            assert!(
+                reason.contains("never selected"),
+                "{} is excluded without a never-selected reason: {reason}",
+                row.opcode_display
+            );
+        }
+    }
     assert_eq!(
         report.failures().len(),
         4,
         "exactly the four named deferrals are RED:\n{}",
         report.failure_summary()
+    );
+}
+
+/// The 12 never-selected bytes keep their full obligation set, and it still
+/// discharges: the exclusion is about what the lowerer emits, not about the
+/// evidence, which is ready the moment selection lands.
+#[test]
+fn never_selected_bytes_keep_discharging_obligations() {
+    assert_eq!(vd::WASM_VALUE_DOMAIN_UNSELECTED.len(), 12);
+    let cfg = VerificationConfig::default();
+    for &byte in vd::WASM_VALUE_DOMAIN_UNSELECTED {
+        assert!(
+            vd::all_wasm_value_domain_bytes().contains(&byte),
+            "0x{byte:02x}"
+        );
+        assert!(vd::value_domain_unselected(byte).is_some(), "0x{byte:02x}");
+        assert!(
+            vd::value_domain_discharges_valid(byte, &cfg),
+            "0x{byte:02x} ({:?}) no longer discharges",
+            vd::value_domain_mnemonic(byte)
+        );
+    }
+    for byte in [0x28u8, 0x2f, 0x36, 0x3b, 0xc0, 0xc1] {
+        assert!(vd::value_domain_unselected(byte).is_none(), "0x{byte:02x}");
+    }
+}
+
+/// The memarg-offset obligations (what a nonzero offset MEANS: the access at
+/// `(base, offset)` is the trust-ir access at `base + offset`, with the spec's
+/// no-wrap effective address) are part of every load and store byte's set,
+/// carry the no-trap precondition, hold at a zero skew, and REFUTE at a
+/// nonzero skew between the emitted and the intended offset. Built here with
+/// a chosen skew, they read no emitted module; the next test is where the skew
+/// comes from decoded emitted offsets.
+#[test]
+fn a_shifted_memarg_offset_refutes_for_every_load_and_store() {
+    let cfg = VerificationConfig::default();
+    for &byte in vd::WASM_LOAD_BYTES.iter().chain(vd::WASM_STORE_BYTES) {
+        let load = w::decode_mem_op(byte).expect("mem op").is_load();
+        let build = |skew: u32| {
+            if load {
+                vd::mem_load_offset_obligation(byte, byte, skew)
+            } else {
+                vd::mem_store_offset_obligation(byte, byte, skew)
+            }
+            .expect("builds")
+        };
+        let honest = build(0);
+        assert!(
+            vd::obligations_for_byte(byte)
+                .iter()
+                .any(|o| o.name == honest.name),
+            "0x{byte:02x}: the offset obligation is part of the credited set"
+        );
+        assert_eq!(
+            honest.preconditions.len(),
+            1,
+            "0x{byte:02x}: no-trap precondition"
+        );
+        assert!(
+            matches!(
+                verify_by_evaluation_with_config(&honest, &cfg),
+                VerificationResult::Valid
+            ),
+            "0x{byte:02x}: the honest offset must hold"
+        );
+        for skew in [4u32, 1, u32::MAX - 3] {
+            let shifted = build(skew);
+            assert!(
+                matches!(
+                    verify_by_evaluation_with_config(&shifted, &cfg),
+                    VerificationResult::Invalid { .. }
+                ),
+                "{} must REFUTE",
+                shifted.name
+            );
+        }
+    }
+}
+
+/// The load / store credits bind EMITTED memarg offsets: over the captured
+/// corpus of struct field reads and writes (fresh against the live backend),
+/// every selected load and store byte has an access at a nonzero trust-ir
+/// layout offset whose decoded offset equals it and whose offset obligation,
+/// instantiated at the decoded skew, discharges. The same corpus with the
+/// lowering bug of emitting every offset of 8 or more as `offset + 4` fails
+/// the credit of exactly the bytes that have such an access, every nonzero
+/// offset shifted fails every byte, and a slipped opcode (`i32.load8_s` for a
+/// `u8` field) fails its byte — each both in the binding and through the P3
+/// coverage-gate hook (`value_domain_discharges_valid_over`), so the P3 credit
+/// cannot drop the binding unnoticed.
+#[test]
+fn emitted_memarg_offsets_are_bound_to_the_layout_and_a_shifted_offset_refutes() {
+    wasm_memarg_live::assert_memarg_corpus_is_what_the_live_backend_emits();
+    let cfg = VerificationConfig::default();
+    let selected: Vec<u8> = vd::WASM_LOAD_BYTES
+        .iter()
+        .chain(vd::WASM_STORE_BYTES)
+        .copied()
+        .filter(|&b| vd::value_domain_unselected(b).is_none())
+        .collect();
+    assert_eq!(selected.len(), 14, "8 loads and 6 stores are selected");
+    let accesses =
+        mo::bind_memarg_accesses(mo::MEMARG_FIELDS_TIR, mo::MEMARG_FIELDS_WASM).expect("binds");
+    for &byte in &selected {
+        assert!(
+            mo::memarg_offset_discharges_valid(byte, &cfg),
+            "0x{byte:02x}: {:?}",
+            mo::memarg_offset_credit_failures(
+                byte,
+                mo::MEMARG_FIELDS_TIR,
+                mo::MEMARG_FIELDS_WASM,
+                &cfg
+            )
+        );
+        assert!(
+            vd::value_domain_discharges_valid(byte, &cfg),
+            "0x{byte:02x}"
+        );
+        assert!(
+            vd::value_domain_discharges_valid_over(
+                byte,
+                &cfg,
+                mo::MEMARG_FIELDS_TIR,
+                mo::MEMARG_FIELDS_WASM
+            ),
+            "0x{byte:02x}: the P3 hook over the captured corpus"
+        );
+    }
+
+    // The lowering bug: every offset of 8 or more emitted 4 bytes further. It
+    // fails the binding, and through it the P3 credit hook, of exactly the
+    // bytes that have such an access: 10 of the 14.
+    let m4 = wasm_memarg_live::shift_memarg_offsets(mo::MEMARG_FIELDS_WASM, |o| o >= 8, 4);
+    let mut p3_refused = 0;
+    for &byte in &selected {
+        let hit = accesses
+            .iter()
+            .any(|a| a.intended_byte == byte && a.intended_offset >= 8);
+        let failures = mo::memarg_offset_credit_failures(byte, mo::MEMARG_FIELDS_TIR, &m4, &cfg);
+        assert_eq!(
+            !failures.is_empty(),
+            hit,
+            "0x{byte:02x} under the offset + 4 bug: {failures:?}"
+        );
+        let credited =
+            vd::value_domain_discharges_valid_over(byte, &cfg, mo::MEMARG_FIELDS_TIR, &m4);
+        assert_eq!(
+            credited, !hit,
+            "0x{byte:02x}: the P3 credit hook must follow the emitted-offset binding under the \
+             offset + 4 bug"
+        );
+        p3_refused += usize::from(!credited);
+    }
+    assert_eq!(
+        p3_refused, 10,
+        "the offset + 4 corpus withdraws the P3 credit of the 10 bytes with a field at offset 8 or \
+         more"
+    );
+    // Every nonzero offset shifted: no byte keeps its credit, in the binding or
+    // in the P3 hook.
+    let all = wasm_memarg_live::shift_memarg_offsets(mo::MEMARG_FIELDS_WASM, |o| o != 0, 4);
+    for &byte in &selected {
+        assert!(
+            !mo::memarg_offset_credit_failures(byte, mo::MEMARG_FIELDS_TIR, &all, &cfg).is_empty(),
+            "0x{byte:02x} keeps its credit with every field offset shifted"
+        );
+        assert!(
+            !vd::value_domain_discharges_valid_over(byte, &cfg, mo::MEMARG_FIELDS_TIR, &all),
+            "0x{byte:02x} keeps its P3 credit with every field offset shifted"
+        );
+    }
+    // A slipped opcode: `i32.load8_s` where the u8 field needs `i32.load8_u`.
+    let needle = [0x2d, 0x00, 0x01];
+    let at = mo::MEMARG_FIELDS_WASM
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("the u8 field read occurs");
+    let mut slipped = mo::MEMARG_FIELDS_WASM.to_vec();
+    slipped[at] = 0x2c;
+    assert!(
+        !mo::memarg_offset_credit_failures(0x2d, mo::MEMARG_FIELDS_TIR, &slipped, &cfg).is_empty(),
+        "an i32.load8_s for a u8 field must fail the 0x2d credit"
+    );
+    assert!(
+        !vd::value_domain_discharges_valid_over(0x2d, &cfg, mo::MEMARG_FIELDS_TIR, &slipped),
+        "an i32.load8_s for a u8 field must withdraw the 0x2d P3 credit"
     );
 }
 
@@ -155,11 +375,19 @@ fn wasm_value_domain_credit_is_always_reconstruction() {
 #[test]
 fn wasm_value_domain_surface_and_classifier_agree() {
     for byte in vd::all_wasm_value_domain_bytes() {
-        assert_eq!(
-            classify_wasm_value_domain(byte),
-            Some(OpcodeClass::EmittableNeedsProof),
-            "0x{byte:02x} is enumerated but not classified"
-        );
+        let class = classify_wasm_value_domain(byte);
+        if vd::value_domain_unselected(byte).is_some() {
+            assert!(
+                matches!(class, Some(OpcodeClass::FailClosedAllowlisted { .. })),
+                "never-selected 0x{byte:02x} must be excluded, got {class:?}"
+            );
+        } else {
+            assert_eq!(
+                class,
+                Some(OpcodeClass::EmittableNeedsProof),
+                "0x{byte:02x} is enumerated but not classified"
+            );
+        }
     }
     for deferral in vd::WASM_VALUE_DOMAIN_DEFERRALS {
         if let Some(byte) = deferral.opcode_byte {

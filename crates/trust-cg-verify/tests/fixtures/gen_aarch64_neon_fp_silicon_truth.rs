@@ -38,8 +38,10 @@
 //     NUMBER; sNaN or both-NaN -> NaN). -0 < +0 for all four.
 //   * FCMEQ/FCMGT/FCMGE produce per-lane all-ones / all-zero masks (ordered; NaN -> 0).
 //
-// Regenerate (run ON the M4):
-//   rustc -O crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_fp_silicon_truth.rs \
+// Regenerate (run ON the M4) with the Trust compiler in its explicit
+// unverified lane: strict Trust verification refuses the inline `asm!`
+// wrappers ("opaque MIR terminator `InlineAsm` cannot be soundly lowered").
+//   trustc -O -Ztrust-verify=off crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_fp_silicon_truth.rs \
 //       -o /tmp/gen_neon_fp && /tmp/gen_neon_fp \
 //       crates/trust-cg-verify/tests/fixtures/aarch64_neon_fp_silicon_truth.json
 
@@ -365,7 +367,7 @@ fn main() {
     s.push_str("  \"oracle_note\": \"Apple M4 (native AArch64). Each (op, arrangement) has an #[inline(never)] wrapper that ldr q1/q2, runs ONE packed FP NEON instruction (fadd v0.4s, ...; fmul v0.2d; fminnm; fcmgt; fsqrt), and str q0 the 128-bit result. otool -tv confirms the real mnemonics. 64-bit (.2S, D-register) arrangements zero the upper 64 bits in hardware.\",\n");
     s.push_str("  \"arm_fp_semantics\": \"FMIN/FMAX = NaN-PROPAGATING (any NaN -> NaN, the FPProcessNaN-selected/quieted input); FMINNM/FMAXNM = IEEE-2008 minNum/maxNum (lone qNaN -> the NUMBER; sNaN or both-NaN -> NaN); -0 < +0 for all four. FCMEQ/FCMGT/FCMGE -> per-lane all-ones/all-zero ordered masks (NaN -> 0). Modeled AS ARM by the in-house encoders, NOT RISC-V minimumNumber, NOT x86 MINSS-second-operand.\",\n");
     s.push_str("  \"determinism\": \"deterministic: a fixed-seed LCG drives the 2 random finite values in each per-lane FP edge alphabet (+-0/+-Inf/qNaN/sNaN/subnormals/min-max-normal/+-1/+2/tie); the grid is every-lane-uniform + alternating edge pairs (incl NaN-vs-number, ordered-unequal, zero-ordering).\",\n");
-    s.push_str("  \"regen\": \"rustc -O crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_fp_silicon_truth.rs -o /tmp/gen_neon_fp && /tmp/gen_neon_fp crates/trust-cg-verify/tests/fixtures/aarch64_neon_fp_silicon_truth.json\",\n");
+    s.push_str("  \"regen\": \"trustc -O -Ztrust-verify=off crates/trust-cg-verify/tests/fixtures/gen_aarch64_neon_fp_silicon_truth.rs -o /tmp/gen_neon_fp && /tmp/gen_neon_fp crates/trust-cg-verify/tests/fixtures/aarch64_neon_fp_silicon_truth.json\",\n");
     s.push_str("  \"operands_encoding\": \"a/b/result are 0x-prefixed 32-hex-digit 128-bit values, lane 0 in the low bits; f32 lanes for .2S/.4S, f64 lanes for .2D. kind discriminates binary/unary/compare.\",\n");
     let _ = write!(s, "  \"included_fact_count\": {total},\n");
     s.push_str("  \"included_per_op\": {\n");

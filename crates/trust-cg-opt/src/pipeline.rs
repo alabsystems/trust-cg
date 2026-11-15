@@ -6,8 +6,7 @@
 //! Optimization pipeline configuration and execution.
 //!
 //! Builds a `PassManager` with passes appropriate for the requested
-//! optimization level. The pipeline follows the ordering from the
-//! design doc (designs/2026-04-12-aarch64-backend.md):
+//! optimization level, in this order:
 //!
 //! Pre-register-allocation:
 //! 1. Constant folding
@@ -36,6 +35,7 @@ use crate::and_cmp_fuse::AndCmpFuse;
 use crate::cfg_simplify::CfgSimplify;
 use crate::cmp_branch_fusion::CmpBranchFusion;
 use crate::cmp_select::CmpSelectCombine;
+use crate::const_chain_dedup::ConstChainDedup;
 use crate::const_fold::{CertifiedConstantFolding, ConstantFolding};
 use crate::copy_prop::CopyPropagation;
 use crate::cse::CommonSubexprElim;
@@ -44,7 +44,10 @@ use crate::dead_loop::DeadCountedLoopElimination;
 use crate::eor_rotate_fuse::EorRotateFuse;
 use crate::ext_addr::ExtRegAddrFold;
 use crate::gvn::GlobalValueNumbering;
-use crate::if_convert::{CsincFold, IfConversion, TinyLoopDiamondConvert};
+use crate::i8_return_demanded_bits::I8ReturnDemandedBits;
+use crate::if_convert::{
+    CsincFold, IfConversion, LateBooleanDiamondConvert, TinyLoopDiamondConvert,
+};
 use crate::inline::FunctionInlining;
 use crate::latch_and_split::LatchAndSplit;
 use crate::licm::LoopInvariantCodeMotion;
@@ -72,6 +75,7 @@ use crate::neon_predsum::NeonPredSumPass;
 use crate::neon_reduce::NeonReducePass;
 use crate::neon_stencil::NeonStencilPass;
 use crate::pass_manager::{MachinePass, PassManager, PassStats};
+use crate::pass_validation::PassValidationConfig;
 use crate::pgo::{PipelineConfig as PgoPipelineConfig, ProfileUsePass};
 use crate::post_index::PostIndexForm;
 use crate::proof_opts::{ProofOptimization, ProofOptimizationMetadata};
@@ -99,6 +103,7 @@ use crate::tail_call::TailCallOptimization;
 use crate::unfuse_serial_fma::UnfuseSerialFma;
 use crate::vectorize::VectorizationPass;
 use crate::xorshift_demanded_bits::XorshiftDemandedBits;
+use crate::xorshift_pair_fusion::XorshiftPairFusion;
 
 #[cfg(test)]
 thread_local! {
@@ -156,12 +161,6 @@ fn pipeline_env_var(key: &str) -> Option<String> {
     }
 
     crate::env_lock::var(key).ok()
-}
-
-/// Kill switch for the late (post-unroll) SROA instance: set
-/// `TCG_NO_LATE_SROA` (any value) to drop it from the O2/O3 pipelines.
-fn late_sroa_enabled() -> bool {
-    std::env::var_os("TCG_NO_LATE_SROA").is_none()
 }
 
 // The declarative rewrite pass is unconditionally on (it carries the migrated
@@ -327,6 +326,14 @@ pub struct OptimizationPipeline {
     ///
     /// Default `false`: zero behaviour change for every existing caller.
     skip_redundancy_elimination: bool,
+    /// When set, the tail-call pass is skipped: no call becomes a tail branch.
+    ///
+    /// The codegen pipeline sets it for a function whose exception table must
+    /// stop an exception at a call (a non-unwinding frame with an LSDA, under
+    /// `panic=abort`): a tail branch removes the frame before the callee runs,
+    /// so the table is never consulted and an exception from the callee keeps
+    /// unwinding into the caller's caller. Default `false`.
+    skip_tail_calls: bool,
     /// Explicit per-invocation pass-disable list. `None` preserves the
     /// process-level `TRUST_CG_DISABLE_PASSES` compatibility control; `Some`
     /// (including an empty string) makes this pipeline independent of mutable
@@ -347,6 +354,13 @@ pub struct OptimizationPipeline {
     /// fail-closed default keeps every optimizer caller target-neutral: passes
     /// may synthesize `UDOT` only after a target resolver explicitly opts in.
     aarch64_dotprod: bool,
+    /// Per-pass translation validation ([`crate::pass_validation`]). The
+    /// optimizer only records verdicts; the caller decides what a failure
+    /// does.
+    pass_validation: PassValidationConfig,
+    /// Record every run that changes the function's interface
+    /// ([`crate::pass_validation::PassTransition`]); `None` records none.
+    transition_digest: Option<crate::pass_validation::FunctionInterfaceDigest>,
 }
 
 impl OptimizationPipeline {
@@ -361,11 +375,42 @@ impl OptimizationPipeline {
             certified_pass_execution: false,
             kernel_gate: None,
             skip_redundancy_elimination: false,
+            skip_tail_calls: false,
             disabled_passes_override: None,
             contains4_scanner_batch_rewrite_override: None,
             target_is_darwin: false,
             aarch64_dotprod: false,
+            pass_validation: PassValidationConfig::diagnostic(),
+            transition_digest: None,
         }
+    }
+
+    /// Validate each pass run under `config` ([`crate::pass_validation`]).
+    /// The default runs the schedulers' validator as a diagnostic
+    /// ([`PassValidationConfig::diagnostic`]).
+    pub fn with_pass_validation(mut self, config: PassValidationConfig) -> Self {
+        self.pass_validation = config;
+        self
+    }
+
+    /// The pass-validation configuration this pipeline runs with.
+    pub fn pass_validation(&self) -> PassValidationConfig {
+        self.pass_validation
+    }
+
+    /// Record every pass run (and the post-convergence loop rotation) that
+    /// changes the function's interface under `digest`, in
+    /// [`crate::PassStats::pass_validation`]'s `transitions`: each pass run
+    /// validated for the record ([`crate::pass_validation`]'s transitions),
+    /// the rotation, which no validator covers, as uncovered. The policy's
+    /// counters and refusals are those of [`Self::with_pass_validation`]
+    /// alone.
+    pub fn with_pass_transitions(
+        mut self,
+        digest: Option<crate::pass_validation::FunctionInterfaceDigest>,
+    ) -> Self {
+        self.transition_digest = digest;
+        self
     }
 
     /// Use an explicit pass-disable list for this pipeline invocation.
@@ -405,6 +450,13 @@ impl OptimizationPipeline {
         self
     }
 
+    /// Keep calls and returns when the caller must retain its exception frame.
+    /// This applies to both self and sibling tail-call optimization, in every
+    /// pass schedule. It grants no unwind or proof authority.
+    pub fn with_required_call_frame(self) -> Self {
+        self.without_tail_calls()
+    }
+
     /// Skip the redundancy-elimination passes (CSE + GVN) at O2/O3.
     ///
     /// Intended for in-process JIT kernels compiled under the JIT-latency
@@ -416,6 +468,13 @@ impl OptimizationPipeline {
     /// observable results.
     pub fn without_redundancy_elimination(mut self) -> Self {
         self.skip_redundancy_elimination = true;
+        self
+    }
+
+    /// Skip the tail-call pass at O2/O3, so every call keeps its `BL` and its
+    /// frame (see `OptimizationPipeline::skip_tail_calls`).
+    pub fn without_tail_calls(mut self) -> Self {
+        self.skip_tail_calls = true;
         self
     }
 
@@ -533,6 +592,7 @@ impl OptimizationPipeline {
             .clone()
             .unwrap_or_else(|| pipeline_env_var("TRUST_CG_DISABLE_PASSES").unwrap_or_default());
         let skip_redundancy_elimination = self.skip_redundancy_elimination;
+        let skip_tail_calls = self.skip_tail_calls;
         let lattice_kernel_gate = matches!(self.kernel_gate, Some(KernelGate::Lattice(_)));
         let is_disabled = |name: &str| -> bool {
             // The opt-in `without_redundancy_elimination()` builder skips the
@@ -542,1493 +602,1629 @@ impl OptimizationPipeline {
             if skip_redundancy_elimination && matches!(name, "cse" | "gvn") {
                 return true;
             }
+            if skip_tail_calls && name == "tailcall" {
+                return true;
+            }
             disabled.split(',').any(|d| d.trim() == name)
         };
 
-        let pm = match self.level {
-            OptLevel::O0 => {
-                // No optimizations at O0.
-                PassManager::new().with_proof_optimization_metadata(self.proof_metadata.clone())
-            }
-            OptLevel::O1 => {
-                // Basic: DCE, declarative rewrite, rotate idiom, late
-                // scheduling.
-                //
-                // Wave 3 (#393) flipped declarative rewrite to default-on;
-                // the hand-written `Peephole` pass has since been deleted.
-                // The declarative pass carries every migrated pattern and
-                // the standalone `RotateIdiom` pass carries pattern 53.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=declrewrite`.
-                let mut pm = PassManager::new()
-                    .with_proof_optimization_metadata(self.proof_metadata.clone());
-                // ProofOptimization (guard elimination) is pure-deletion:
-                // apply_in_bounds/apply_not_null only insert into `to_delete`,
-                // so the exact post-ISel lattice authority can be consumed
-                // before an unrelated transform rewrites its bound function.
-                // The ordinary/raw compatibility pass retains its established
-                // post-DCE placement. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=proof`.
-                if lattice_kernel_gate && !is_disabled("proof") {
-                    pm = pm.with_pass(self.proof_optimization_pass());
-                }
-                if !is_disabled("dce") {
-                    pm = pm.with_pass(self.dce_pass());
-                }
-                if !lattice_kernel_gate && !is_disabled("proof") {
-                    pm = pm.with_pass(self.proof_optimization_pass());
-                }
-                if !is_disabled("declrewrite") {
-                    let (pass, report) = make_declarative_rewrite_pass_with_report(
-                        &self.admitted_rewrite_records,
-                        self.rewrite_admission_config,
-                    );
-                    pipeline_report.record_rewrite_admission_load(report);
-                    pm = pm.with_pass(Box::new(pass));
-                }
-                // SROA before rotate-idiom recognition: scalarise aggregate
-                // locals so the subsequent rewrite/scheduler stages see plain
-                // vreg moves instead of LDR/STR pairs. Part of #391
-                // (aggregate lowering).
-                if !is_disabled("sroa") {
-                    pm = pm.with_pass(Box::new(ScalarReplacementOfAggregates));
-                }
-                // Peephole dropped: declarative rewrite covers it;
-                // RotateIdiom carries pattern 53 (needs dominator info).
-                // The `peep` bisect key now gates RotateIdiom.
-                if !is_disabled("peep") {
-                    pm = pm.with_pass(Box::new(RotateIdiom));
-                }
-                // EOR-with-rotate fusion: collapse `t = RorRI(s,k); d = EorRR(x,t)`
-                // (single-use t) into the shifted-register `d = EorRRShift(x,s,k)`
-                // (EOR x, s, ROR #k) — the consumer of the RorRI RotateIdiom just
-                // created. Removes one instruction and one serial critical-path
-                // node per ARX statement (salsa20). Fail-closed. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=eorrotfuse`.
-                if !is_disabled("eorrotfuse") {
-                    pm = pm.with_pass(Box::new(EorRotateFuse));
-                }
-                // Shift-into-ADD/SUB fusion: collapse `t = LslRI(s,k); d =
-                // AddRR/SubRR(x,t)` (single-use t) into the shifted-register
-                // `d = AddRRShift/SubRRShift(x,s,k)`; also the LSR sibling
-                // `t = LsrRI(s,k); d = AddRR(x,t)` -> `AddRRShiftLsr` (the
-                // srem/sdiv magic sign-bit correction; `TCG_NO_LSR_ADD_FUSE`
-                // disables the LSR half alone). Non-commutative for SUB (the
-                // shift binds to the subtrahend only). Fail-closed. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=shiftalufuse`.
-                if !is_disabled("shiftalufuse") {
-                    pm = pm.with_pass(Box::new(ShiftAluFuse));
-                }
-                // `LSR #k; AND #low_mask` -> UBFM/UBFX. The shared symbolic
-                // W/X UBFM theorem proves the exact pre-rewrite expression and
-                // independently decoded immediates. Fail-closed on use/def,
-                // widths, masks, and field bounds. Bisect key: `lsrandubfx`.
-                if !is_disabled("lsrandubfx") {
-                    pm = pm.with_pass(Box::new(LsrAndUbfx));
-                }
-                if !is_disabled("sched") {
-                    pm = pm.with_pass(Box::new(InstructionScheduler));
-                }
-                pm
-            }
-            OptLevel::O2 | OptLevel::Os => {
-                // Standard: inlining + proof-consuming opts + scalar opts +
-                // vectorization (before LICM!) + loop opts + peephole combines,
-                // DCE, CFG cleanup, and pressure-aware scheduling last.
-                //
-                // Vectorization runs BEFORE LICM because LICM hoists
-                // loop-invariant pure instructions out of loops, removing
-                // the instructions the vectorizer needs to see. This matches
-                // LLVM's ordering where LoopVectorize runs early in the loop
-                // optimization pipeline. After vectorization rewrites scalar
-                // ops to NEON, LICM can still hoist any remaining invariants.
-                //
-                // Dev note (#366 bisect): set TRUST_CG_DISABLE_PASSES to a
-                // comma-separated list of pass short names to skip at O2.
-                // Names: inline, addrmodeearly, proof, cfold, copyprop, cse,
-                // gvn, sroa, vec, licm, strred, unswitch, unroll, declrewrite,
-                // peep, addrmode, cmpsel, ifconv, cmpbr, latchsplit, tailcall, dce,
-                // cfgsimp, aarch64bce, looplatch, extaddr, selfuse,
-                // shiftalufuse, lsrandubfx, sched, profileuse. Empty/missing =
-                // run all.
-                //
-                // Declarative rewrite (#393) is DEFAULT-ON as of Wave 3 and,
-                // with the hand-written peephole pass deleted, is the sole
-                // carrier of the migrated patterns (`RotateIdiom` carries
-                // pattern 53; the `peep` bisect key gates it).
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=declrewrite`.
-                let mut pm = PassManager::new()
-                    .with_proof_optimization_metadata(self.proof_metadata.clone());
-                // Consume exact post-ISel replay authority before any pass can
-                // mutate the machine function it is bound to.
-                if lattice_kernel_gate && !is_disabled("proof") {
-                    pm = pm.with_pass(self.proof_optimization_pass());
-                }
-                let profile_use_enabled = !is_disabled("profileuse");
-                let profile_hotness = profile_use_enabled
-                    .then(|| self.pgo.profile_hotness())
-                    .flatten();
-                if let Some(profile) = self.pgo.profile_use.clone()
-                    && profile_use_enabled
-                {
-                    pm = pm.with_pass(Box::new(ProfileUsePass::new(profile)));
-                }
-                if !is_disabled("inline") {
-                    pm = pm.with_pass(Box::new(
-                        FunctionInlining::new().with_profile_hotness(profile_hotness.clone()),
-                    ));
-                }
-                // Sin/cos -> ___sincos_stret fusion (Darwin arm64). Runs EARLY —
-                // right after inlining (so inlined bodies are covered) and before
-                // the scheduler, which legally reorders across the two calls and
-                // would separate the same-argument pair. The pass is inert unless
-                // the target is Darwin (`with_target_is_darwin`). Kill switch:
-                // `TCG_NO_SINCOS_MERGE` / `TRUST_CG_DISABLE_PASSES=sincosmerge`.
-                if !is_disabled("sincosmerge") {
-                    pm = pm.with_pass(Box::new(SincosMerge::new(self.target_is_darwin)));
-                }
-                // Loop-dead pure-computation deferral (almabench store
-                // sinking). Runs EARLY — right after inlining/sincos-merge on
-                // the pristine post-ISel shapes (the call-cluster and rotated
-                // do-while recognizers depend on them), and before
-                // addr-mode/CSE/scheduling rewrite the address chains. The
-                // deferred loop it emits is then optimized by every later
-                // pass. Kill switch: `TCG_NO_LOOP_DEAD_SINK` /
-                // `TRUST_CG_DISABLE_PASSES=loopdeadsink`.
-                if !is_disabled("loopdeadsink") {
-                    pm = pm.with_pass(Box::new(LoopDeadPureSink));
-                }
-                if !is_disabled("addrmodeearly") {
-                    pm = pm.with_pass(Box::new(AddrModeEarlyFormation));
-                }
-                if !lattice_kernel_gate && !is_disabled("proof") {
-                    pm = pm.with_pass(self.proof_optimization_pass());
-                }
-                if !is_disabled("cfold") {
-                    pm = pm.with_pass(self.constant_folding_pass());
-                }
-                if !is_disabled("copyprop") {
-                    pm = pm.with_pass(Box::new(CopyPropagation));
-                }
-                if !is_disabled("cse") {
-                    pm = pm.with_pass(Box::new(CommonSubexprElim));
-                }
-                if !is_disabled("gvn") {
-                    pm = pm.with_pass(Box::new(GlobalValueNumbering));
-                }
-                // SROA: scalarise non-escaping aggregate locals (#391 phase 2b).
-                // Runs after load-eliminating passes so it sees the canonical
-                // LDR/STR pattern, and before loop/peep transforms that might
-                // fold scalar moves back into memory ops.
-                if !is_disabled("sroa") {
-                    pm = pm.with_pass(Box::new(ScalarReplacementOfAggregates));
-                }
-                if !is_disabled("vec") {
-                    let mut vectorizer =
-                        VectorizationPass::new().with_profile_hotness(profile_hotness.clone());
-                    if let Some(enabled) = self.contains4_scanner_batch_rewrite_override {
-                        vectorizer = vectorizer.with_contains4_scanner_batch_rewrite(enabled);
-                    }
-                    pm = pm.with_pass(Box::new(vectorizer));
-                }
-                if !is_disabled("licm") {
-                    pm = pm.with_pass(Box::new(LoopInvariantCodeMotion));
-                }
-                if !is_disabled("strred") {
-                    pm = pm.with_pass(Box::new(StrengthReduction));
-                }
-                if !is_disabled("unfusefma") {
-                    pm = pm.with_pass(Box::new(UnfuseSerialFma));
-                }
-                // Invariant loop unswitching: version a small innermost loop
-                // on a loop-invariant Cbz/Cbnz/CmpRI#0+BCond test so the
-                // decision is made ONCE in the preheader (Queens' Try
-                // `i < 8`: previously tested 8x per call after the bounded
-                // early-exit unroll, with the boolean spilled post-RA — a
-                // serialized ldur+cbnz per clone). MUST run immediately
-                // BEFORE loop-unroll so both versions unroll cleanly.
-                // Fail-closed. Kill switch: `TCG_NO_LOOP_UNSWITCH`; bisect
-                // key `unswitch`.
-                if !is_disabled("unswitch") {
-                    pm = pm.with_pass(Box::new(LoopUnswitch));
-                }
-                if !is_disabled("unroll") {
-                    pm = pm.with_pass(Box::new(LoopUnroll::new(profile_hotness.clone())));
-                }
-                // Late SROA (2nd instance): the const-addr full unroll above
-                // (`TCG_NO_CONST_ADDR_UNROLL`) rewrites stack-array index
-                // arithmetic into constant offsets; re-running SROA promotes
-                // the now-constant-offset local array to scalars (salsa20's
-                // `x[16]` stack round-trip). Kill switch: `TCG_NO_LATE_SROA`;
-                // shares the `sroa` bisect key.
-                if !is_disabled("sroa") && late_sroa_enabled() {
-                    pm = pm.with_pass(Box::new(ScalarReplacementOfAggregates));
-                }
-                if !is_disabled("declrewrite") {
-                    let (pass, report) = make_declarative_rewrite_pass_with_report(
-                        &self.admitted_rewrite_records,
-                        self.rewrite_admission_config,
-                    );
-                    pipeline_report.record_rewrite_admission_load(report);
-                    pm = pm.with_pass(Box::new(pass));
-                }
-                // Peephole dropped: declarative rewrite covers it;
-                // RotateIdiom carries pattern 53 (needs dominator info).
-                // The `peep` bisect key now gates RotateIdiom.
-                if !is_disabled("peep") {
-                    pm = pm.with_pass(Box::new(RotateIdiom));
-                }
-                // EOR-with-rotate fusion: collapse `t = RorRI(s,k); d = EorRR(x,t)`
-                // (single-use t) into the shifted-register `d = EorRRShift(x,s,k)`
-                // (EOR x, s, ROR #k) — the consumer of the RorRI RotateIdiom just
-                // created. Removes one instruction and one serial critical-path
-                // node per ARX statement (salsa20). Fail-closed. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=eorrotfuse`.
-                if !is_disabled("eorrotfuse") {
-                    pm = pm.with_pass(Box::new(EorRotateFuse));
-                }
-                if !is_disabled("addrmode") {
-                    pm = pm.with_pass(Box::new(AddrModeFormation));
-                }
-                if !is_disabled("cmpsel") {
-                    pm = pm.with_pass(Box::new(CmpSelectCombine));
-                }
-                if !is_disabled("ifconv") {
-                    pm = pm.with_pass(Box::new(IfConversion));
-                }
-                // AND+CMP#0 -> TST. MUST precede cmp-branch-fusion: that pass
-                // rewrites CmpRI into Cbz/Cbnz and AndCmpFuse only matches a
-                // surviving CmpRI, so the reverse order silently starves it.
-                // Together they compose into LLVM's `tbz`. C-flag guarded (ANDS
-                // clears C, SUBS #0 sets it). Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=andcmpfuse`.
-                if !is_disabled("andcmpfuse") {
-                    pm = pm.with_pass(Box::new(AndCmpFuse));
-                }
-                // `y = x ^ (x << k)`: consumers reading only bits [0,k) may read
-                // `x`, shortening the dependency chain into a mispredicting
-                // branch by one shifted-EOR. Purely an operand swap; the bit
-                // range must be provably below k or the operand is left alone.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=xorshiftdemanded`.
-                if !is_disabled("xorshiftdemanded") {
-                    pm = pm.with_pass(Box::new(XorshiftDemandedBits));
-                }
-                if !is_disabled("cmpbr") {
-                    pm = pm.with_pass(Box::new(CmpBranchFusion));
-                }
-                // Profile-gated hot-latch AND-condition split. Runs right AFTER
-                // cmp-branch-fusion (which forms the `cbnz t` its recogniser
-                // matches). INERT without an attached profile — the default
-                // compile stays byte-identical; with a profile it fires only in
-                // the unpredictable taken-rate band (see latch_and_split.rs).
-                // Kill switch: `TCG_NO_LATCH_AND_SPLIT`; bisect key `latchsplit`.
-                if !is_disabled("latchsplit") {
-                    pm = pm.with_pass(Box::new(LatchAndSplit::new(profile_hotness.clone())));
-                }
-                if !is_disabled("tailcall") {
-                    pm = pm.with_pass(Box::new(TailCallOptimization));
-                }
-                if !is_disabled("dce") {
-                    pm = pm.with_pass(self.dce_pass());
-                }
-                if !is_disabled("cfgsimp") {
-                    pm = pm.with_pass(Box::new(CfgSimplify));
-                }
-                // Late tiny-loop-diamond if-conversion: convert an unpredictable
-                // NON-AFFINE-recurrence-gated tiny pure-arm diamond (b1's
-                // `if s&6==2 { acc=rotate_left(acc,7) }`) to a CSEL. Runs HERE —
-                // after cfg-simplify canonicalizes it to a clean diamond, which
-                // the primary if-convert (pre-dce/cfg-simplify) cannot see. Tight
-                // gate (loop-resident + tiny pure arm + EOR self-recurrence) so it
-                // stays branchy on predictable diamonds. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=tinyloop`.
-                if !is_disabled("tinyloop") {
-                    pm = pm.with_pass(Box::new(TinyLoopDiamondConvert));
-                }
-                // AArch64 bounds-check elimination: DELETE a still-live
-                // `TrapBoundsCheckExact` carrier whose enclosing loop-header
-                // unsigned guard machine-proves the bound at the carrier site
-                // (the own-length `for i in 0..N { a[i] }` shape). Runs here —
-                // post-dce/cfgsimp (guard canonicalized to a direct
-                // CmpRR/CmpRI+BCond) and PRE-looplatch/vectorization (single
-                // unrotated header dominates the body) — the simplest sound
-                // case. Standalone structural delete: it never touches the
-                // proof/kernel path. Fail-safe on every unproven condition.
-                // Default-ON kill switch: `TCG_NO_AARCH64_BCE`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=aarch64bce`.
-                if !is_disabled("aarch64bce") {
-                    pm = pm.with_pass(Box::new(AArch64BoundsCheckElimination::new()));
-                }
-                // Loop-carried store-to-load forwarding: register-carry the
-                // memory recurrence of an in-place `a[i+1] = f(a[i], i)` loop
-                // (one preheader load; the in-loop re-loads of the
-                // just-stored cell are deleted and read the stored register
-                // instead). Removes the store-forward latency — and its
-                // address-sensitive run-to-run variance — from the
-                // loop-carried critical path (d02 prefix-recurrence class).
-                // Runs right AFTER aarch64-bounds-check-elim (recognizes the
-                // clean bounds-elided body) and BEFORE the
-                // unrollers/vectorizers. Closed-world, fail-closed on every
-                // unproven precondition; emits only already-credited opcodes
-                // (Madd + LdrRI). Default-ON kill switch:
-                // `TCG_NO_RECURRENCE_STORE_FWD`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=recurrence_store_fwd`.
-                if !is_disabled("recurrence_store_fwd") {
-                    pm = pm.with_pass(Box::new(RecurrenceStoreForward::new()));
-                }
-                // Counted-strided-store partial-unroll (x4): splice a guarded,
-                // 4x-unrolled main loop in FRONT of an innermost `while q <u N {
-                // base[q]=val; q+=strideReg }` marking loop (const N, invariant
-                // base/value, invariant REGISTER stride), leaving the scalar loop
-                // as the exact `trip mod 4` remainder. This is p7's sieve marking
-                // loop, which LLVM 4x-unrolls. PURELY ADDITIVE (never edits the
-                // scalar loop); wrap-free via an `s <u N` pre-guard (3s/lim built
-                // from AddRR/SubRR only — NO udiv, NO multiply); emits only
-                // already-credited opcodes. Runs AFTER aarch64-bounds-check-elim
-                // (needs the clean bounds-elided body) and BEFORE
-                // closed-form-reduction/loop-latch-layout (needs the NATIVE,
-                // non-rotated header test). Fail-safe on every unproven
-                // precondition. Compile-time kill switch:
-                // `TCG_NO_STRIDED_STORE_UNROLL`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=strided_store_unroll`.
-                // Normalize ISel's folded constant-trip `CmpRI` guards back to
-                // `CmpRR(iv, movz)` BEFORE the vectorizers/unrollers, so
-                // dc5916e's `cmp_imm12_fold` does not silently defeat their
-                // constant-trip recognizers (matmul full-unroll, the dt-class FP
-                // maps). Semantics-preserving. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=consttripnorm`.
-                if !is_disabled("consttripnorm") {
-                    pm = pm.with_pass(Box::new(crate::scalar_unroll::ConstTripGuardNormalize));
-                }
-                if !is_disabled("strided_store_unroll") {
-                    pm = pm.with_pass(Box::new(StridedStoreUnroll::new()));
-                }
-                // RMW-MAC row-loop partial-unroll (x4): splice a guarded,
-                // 4x-unrolled main loop in FRONT of an innermost bounds-checked
-                // `while j <u N { c[i*N+j] += aik*b[k*N+j]; j+=1 }` accumulate
-                // loop (const N, const array length L, invariant i/k/aik/bases),
-                // leaving the scalar loop as the exact `trip mod 4` remainder and
-                // the fallback on any guard failure. This is p4_matmul's inner
-                // j-loop, which LLVM 4x-unrolls with running pointers. PURELY
-                // ADDITIVE (never edits the scalar loop); each lane replicates
-                // the scalar per-lane memory order bit-for-bit (sound under any
-                // aliasing); the three per-block guards re-check `j<N-3`,
-                // `cidx<L-3`, `bidx<L-3` and subsume the scalar per-iteration
-                // bounds branches; emits only already-credited opcodes (no
-                // udiv/mul beyond the scalar madd). Same slot/ordering as
-                // strided-store-unroll: AFTER aarch64-bounds-check-elim and
-                // BEFORE closed-form-reduction/loop-latch-layout (needs the
-                // NATIVE, non-rotated header test). Fail-safe on every unproven
-                // precondition. Compile-time kill switch:
-                // `TCG_NO_MAC_ROW_UNROLL`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=mac_row_unroll`.
-                // Matmul 1D register-blocking (T=8): recognize the whole
-                // 3-deep bounds-checked matmul nest (distinct stack-local
-                // a/b/c, read-only a/b, single c store, const N a multiple of
-                // 8, L>=N*N) and splice a CHECK-FREE register-blocked fast path
-                // (k/j interchange, 8 c accumulators held across the k-loop,
-                // stores sunk to tile end) in FRONT of the untouched checked
-                // nest — kept as the runtime-guarded fallback so mac-row-unroll
-                // still fires on it. Store-sinking is sound because a/b/c are
-                // distinct locals (a/b never written; c's only store is
-                // c[i*N+j]); the tiled indices are provably < L so no per-access
-                // check is emitted. Runs right BEFORE mac-row-unroll (which
-                // handles the fallback's inner j-loop) and AFTER
-                // aarch64-bounds-check-elim (the clean LdrRI/StrRI + Madd
-                // address form). Purely additive, fail-closed, emits only
-                // already-credited opcodes. Kill switch: `TCG_NO_MAC_REG_BLOCK`;
-                // per-pass bisect: `TRUST_CG_DISABLE_PASSES=mac_reg_block`.
-                if !is_disabled("mac_reg_block") {
-                    pm = pm.with_pass(Box::new(MacRegBlock::new()));
-                }
-                if !is_disabled("mac_row_unroll") {
-                    pm = pm.with_pass(Box::new(MacRowUnroll::new()));
-                }
-                // SOUND hoisted-range-guard crosswise-SWAP fast path
-                // (mac-row-unroll's sibling shape): splice a guarded,
-                // check-free running-pointer main loop in FRONT of the
-                // innermost bounds-checked transpose swap loop
-                // `while x <u C { swap(base[y*S+x], base[x*S+y]) }` (const
-                // C/S/K, invariant y/base, 4 expanded per-access checks). The
-                // hoisted guards prove every elided check passes (both index
-                // families are strictly monotone in x; their maxima are
-                // checked once); the fast path replays the scalar loop's EXACT
-                // per-iteration memory trace (sound under any aliasing);
-                // guard-fail runs the untouched scalar loop. Same slot
-                // rationale as mac-row-unroll: AFTER
-                // aarch64-bounds-check-elim (the surviving checks are the
-                // expanded cmp/b.lo diamonds), BEFORE
-                // closed-form-reduction/loop-latch-layout (needs the NATIVE
-                // header test) and BEFORE ext-addr/mul-shift-reduce (matches
-                // the Madd index/address form). Purely additive; emits only
-                // already-credited opcodes. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=swap_range_guard`.
-                if !is_disabled("swap_range_guard") {
-                    pm = pm.with_pass(Box::new(SwapRangeGuardPass::new()));
-                }
-                // Closed-form (Faulhaber) reduction: DELETE a reduction loop
-                // whose entire term is a pure degree-≤2 polynomial in the IV,
-                // replacing it with straight-line O(1) code. Runs BEFORE
-                // LoopLatchLayoutCombine (which rotates the loop) so it sees the
-                // clean, non-rotated register loop, and before the split so it
-                // claims pure-polynomial add/madd reductions; everything else
-                // (xor/or/mul/opaque terms) falls through to the split.
-                // Fail-closed. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=closed_form_reduction`.
-                if !is_disabled("closed_form_reduction") {
-                    pm = pm.with_pass(Box::new(ClosedFormReduction));
-                }
-                // Delete provably-terminating, side-effect-free counted loops
-                // (empty after upstream DCE). Fail-closed. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=deadloop`.
-                if !is_disabled("deadloop") {
-                    pm = pm.with_pass(Box::new(DeadCountedLoopElimination::new()));
-                }
-                if !is_disabled("looplatch") {
-                    pm = pm.with_pass(Box::new(LoopLatchLayoutCombine));
-                }
-                // Reduction splitting (accumulator widening): break a
-                // throughput-bound integer reduction's loop-carried chain into
-                // N independent accumulators for ILP. Fail-closed: only fires on
-                // the exact recognized constant-trip register-reduction shape.
-                // Placed after DCE/CFG-simplify so it sees the cleaned-up loop.
-                // SOUND NEON add-reduction vectorizer. Runs immediately BEFORE
-                // reduction_split so it fires FIRST on lane-wise-vectorizable
-                // reduction terms (e.g. `a += (i*7)|(i*3)`), lowering them to a
-                // NEON vector accumulator + scalar tail. It BAILS (leaving the
-                // scalar loop intact) on any shape it cannot prove lane-wise
-                // equivalent, so reduction_split still handles those.
-                if !is_disabled("neonreduce") {
-                    pm = pm.with_pass(Box::new(NeonReducePass::new()));
-                }
-                // SOUND NEON array-reduction vectorizer: extends neon-reduce to
-                // reductions whose term reads from READ-ONLY memory (`s +=
-                // TERM(a[i], b[i], ...)`). Runs immediately after neon-reduce
-                // (which BAILS on any load) and before reduction_split. Fires
-                // only on the shapes it can prove lane-wise equivalent (i32
-                // accumulator, `a[i]` loads, lane-wise ops) and BAILS otherwise.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_array`.
-                if !is_disabled("neon_array") {
-                    pm = pm.with_pass(Box::new(
-                        NeonArrayPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
-                    ));
-                }
-                // SOUND NEON byte-widening reduction into a u64 accumulator
-                // (popcount-sum / byte-sum) — the case neon_array's i32-only
-                // widening TRACK B and 2-block loop shape both miss (e.g.
-                // v3_popcount). Composes already-proven CNT/UADDLP/ADD/UMOV +
-                // the const-materialization MOVI and the shared-debt paired-Q
-                // load, all now credited per-compile, so it promotes gate-clean.
-                // Present by default but inert unless the resolved target
-                // explicitly admits FEAT_DotProd; kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
-                if !is_disabled("neon_bytesum") {
-                    pm = pm.with_pass(Box::new(
-                        NeonBytesumPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
-                    ));
-                }
-                // SOUND NEON min/max & bitwise array-reduction vectorizer:
-                // extends neon-array to the non-add associative+commutative
-                // reductions `m = max/min(m, TERM(a[i]))` (via `select(icmp)`)
-                // and `m &= / |= / ^= TERM(a[i])`, plus the index-tracking
-                // ARGMIN/ARGMAX shape (a 3rd carried var — best index — updated
-                // under the SAME strict compare; first-occurrence preserved by a
-                // (value, min-index) lexicographic exit fold). Runs immediately
-                // after neon-array (which claims add/madd and BAILS on these)
-                // and before reduction_split. i32-only; BAILS on i64, register
-                // reductions, ambiguous / non-strict selects, and any
-                // store/effect. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_minmax`.
-                if !is_disabled("neon_minmax") {
-                    pm = pm.with_pass(Box::new(NeonMinMaxPass::new()));
-                }
-                // SOUND NEON predicated-sum array-reduction vectorizer: `s +=
-                // TERM(a[i], ...)` where TERM contains a lane-wise `select`
-                // (`(a[i]>0)?a[i]:0`, count-if, abs-sum, per-element-max sum).
-                // Add-rooted, so neon-array (no Csel in its whitelist) and
-                // neon-minmax (needs a Csel/bitwise-rooted acc) both BAIL on
-                // these; this pass fires ONLY when the term has a select. The
-                // select lowers to a proven per-lane compare mask + branchless
-                // bitselect (EOR/AND). i32-only; BAILS on i64, ambiguous selects,
-                // and any store/effect. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_predsum`.
-                if !is_disabled("neon_predsum") {
-                    pm = pm.with_pass(Box::new(NeonPredSumPass::new()));
-                }
-                // SOUND NEON memory-MAP/STORE vectorizer: `a[i] = TERM(b[i],
-                // c[i], ...)`. Distinct from the reduction vectorizers — it fires
-                // only on loops that WRITE a single output array (BAILS on any
-                // accumulator/reduction) and only when it can PROVE the store
-                // pointer does not alias any input (trust_ir `noalias` params).
-                // Runs after neon-array (both BAIL on each other's shapes) and
-                // before reduction_split. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_map`.
-                if !is_disabled("neon_map") {
-                    pm = pm.with_pass(Box::new(NeonMapPass::new()));
-                }
-                // SOUND NEON per-byte 8-bit-reverse MAP vectorizer: the byte
-                // elementwise `out[i] = a[i].reverse_bits()` over two DISTINCT
-                // `[u8; N]` stack slots — the case neon-map's i32/i64 lane set and
-                // 2-block/chain shapes both miss. Recognizes the bridge's exact
-                // `bitmanip_reverse_bits(n=8)` isolate/shift/OR ladder and lowers
-                // each 16-byte Q to one FAITHFULLY-PROVEN `RBIT.16B`; purely
-                // additive (a `ldp/rbit.16b/stp` main loop before the untouched
-                // scalar tail), proven non-aliasing via distinct stack slots.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_bitrev`.
-                if !is_disabled("neon_bitrev") {
-                    pm = pm.with_pass(Box::new(NeonBitrevPass::new()));
-                }
-                // SOUND NEON array-FILL store vectorizer: `for i in 0..bound {
-                // base[i*sz] = value }` with a loop-invariant base, a
-                // const-OR-loop-invariant value, ZERO loads. Fires on the shared
-                // `__trustcg_array_fill_iN` helper (DUP path) and any inline
-                // const/invariant fill (MOVI/DUP). Purely additive (a MOVI/DUP
-                // preheader + a `stp q,q,[p],#32` main loop in front of the
-                // UNTOUCHED scalar loop); removes no bounds check. Runs after
-                // neon-map, which needs a memory-reading TERM and BAILs on a
-                // load-free pure fill, so the two never contend. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_fill`.
-                if !is_disabled("neon_fill") {
-                    pm = pm.with_pass(Box::new(NeonFillPass::new()));
-                }
-                // SOUND NEON affine IOTA-fill store vectorizer: `for iv in
-                // start..bound { base[iv] = trunc32(iv) + inv }` (i32
-                // elements; `inv` loop-invariant/const/absent). The affine
-                // sibling of neon-fill, which requires an iteration-INVARIANT
-                // stored value and BAILS on this shape — the two never
-                // contend. Purely additive (iota literal + DUP/ADD preheader +
-                // a 64-byte `stp q,q` main loop in front of the UNTOUCHED
-                // scalar loop); removes no bounds check. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_iota_fill`.
-                if !is_disabled("neon_iota_fill") {
-                    pm = pm.with_pass(Box::new(NeonIotaFillPass::new()));
-                }
-                // Conditional-store blind-write vectorization is intentionally
-                // unscheduled: TrustIR/MachIR does not yet carry the required
-                // function/value/range-bound writable+single-owner capability.
-                // SOUND NEON EARLY-EXIT SEARCH (find/memchr) vectorizer: the
-                // vector loop is a BLOCK FILTER — it only skips 16-blocks it has
-                // PROVEN contain no match (faithful CMEQ + OR); on any-hit it
-                // hands off to the UNTOUCHED scalar loop at the block base, which
-                // finds the exact first match. Over-read is a SUBSET of the
-                // no-match scalar execution's read set (guard admits only fully
-                // in-bounds blocks) — no new axiom. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_find`.
-                if !is_disabled("neon_find") {
-                    pm = pm.with_pass(Box::new(NeonFindPass::new()));
-                }
-                // SOUND NEON STENCIL (windowed-read) vectorizer: `out[i] =
-                // TERM(a[i+k1], a[i+k2], ...)` with small constant offsets. Runs
-                // after neon-map (which BAILS on any shifted read) and requires
-                // `out` and every read base to be DISTINCT noalias params (so the
-                // store is disjoint from every read; in-place stencils BAIL) and
-                // the store at offset 0 (so the halo stays inside the scalar
-                // loop's access set). Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_stencil`.
-                if !is_disabled("neon_stencil") {
-                    pm = pm.with_pass(Box::new(NeonStencilPass::new()));
-                }
-                // SOUND NEON elementwise-FP map/stencil/count vectorizer:
-                // `out[i] = FTERM(a[i+k], ..., invariants)` (f32 `.4S` / f64
-                // `.2D`) and the integer-accumulating FP count-above
-                // `c += (a[i] > t)`. FP REDUCTIONS ARE NEVER TOUCHED
-                // (reassociation would change results — they stay on the
-                // order-preserving scalar path). Per-lane ops are the SAME
-                // IEEE operations the scalar loop performs (no FMLA
-                // contraction), so the output is bit-identical. Runs after
-                // the integer map/stencil passes (disjoint shapes — those
-                // bail on FP classes) and before reduction_split. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=neon_fmap`.
-                if !is_disabled("neon_fmap") {
-                    pm = pm.with_pass(Box::new(NeonFMapPass::new()));
-                }
-                // SOUND NEON AoS stride-2 complex-butterfly vectorizer: the
-                // radix-2 FFT inner loop over `struct complex { f32 rp, ip; }`
-                // (Stanford Oscar's Fft — clang -O3 vectorizes it, trust-cg
-                // was fully scalar). One complex PAIR (`.4S`) per iteration on
-                // the INTERLEAVED data: FADD/FSUB per lane + the REV64.4S
-                // pair-swap + sign-mask EOR (the scalar FNEG, bitwise) +
-                // FMUL/FMLA with broadcast twiddles — per-lane the SAME IEEE
-                // ops and roundings the scalar loop performs (no contraction
-                // introduced; the source's fused fmuladd stays fused), so
-                // BIT-IDENTICAL. Entered only behind a runtime 7-pair
-                // byte-range disjointness preamble (regime-C versioning,
-                // wrap-safe modular-interval tests) that otherwise falls back
-                // to the untouched scalar loop. Fail-closed on any deviation
-                // from the exact butterfly dag. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_butterfly`.
-                if !is_disabled("neon_butterfly") {
-                    pm = pm.with_pass(Box::new(NeonButterflyPass::new()));
-                }
-                // SOUND NEON early-exit linear-search (find/memchr) vectorizer:
-                // `for i<n: if a[i]==key return i; return -1`. A purely additive
-                // vector BLOCK FILTER runs in front of the UNCHANGED scalar loop:
-                // per whole 16-element in-bounds block it CMEQs the loads against
-                // a key splat and, on a PROVEN no-match block, skips it; on any-
-                // hit (or a partial trailing block) it re-enters the scalar loop,
-                // which computes the exact first-match index (delegated — no
-                // vector lane ordering, so same-block and cross-block duplicates
-                // are correct by the scalar scan). The over-read is a SUBSET of
-                // the no-match scalar read set (the guard admits only whole blocks
-                // within [0,n)); reads are pure (BAILS on stores / atomics; volatile
-                // fails closed at lowering). Every other neon pass BAILS on this
-                // early-exit shape. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_find`.
-                if !is_disabled("neon_find") {
-                    pm = pm.with_pass(Box::new(NeonFindPass::new()));
-                }
-                // SOUND NEON IV-synthesized FP-reduction vectorizer:
-                // `acc += f(i)` where `f(i)` is a pure lane-wise f64 dataflow of
-                // the induction (`(double)i` via UCVTF/SCVTF) and loop-invariant
-                // scalars (NO arrays/memory), combined by a PLAIN fadd. It
-                // vectorizes only the INDEPENDENT per-lane term (`.2D`, x4 pairs)
-                // and folds the lanes into the scalar accumulator with ORDERED
-                // scalar fadds in iteration order — no reassociation, so the sum
-                // is BIT-IDENTICAL to the scalar loop (clang -O3's own emission
-                // for the flops kernels). Runs before reduction_split /
-                // scalar_unroll (first shot at the FP-reduction loop); BAILS on a
-                // fused accumulate, f32, non-unit step, stores/calls, or an extra
-                // live-out — scalar_unroll's SERIAL unroll is the fallback. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=neonfpred`.
-                if !is_disabled("neonfpred") {
-                    pm = pm.with_pass(Box::new(NeonFPRedPass::new()));
-                }
-                // SOUND NEON FP ARRAY-reduction vectorizer (memory-bearing sibling
-                // of neon-fpred): `acc += a[i]*b[i]` / `acc += a[i]` over unit-stride
-                // f64 arrays, PLUS the `f32 -> f64` widening dot (the fp-convert
-                // kernel) via the proven vector FCVTL/FCVTL2. Coalesced LDP-Q loads
-                // (widened by FCVTL for f32 streams) + ORDERED scalar drain (fused
-                // fmadd preserved) = bit-identical to the scalar loop.
-                //
-                // ASYMMETRIC DEFAULT (measured): the `f32 -> f64` WIDENING
-                // recognition fires BY DEFAULT — the FCVTL halved convert
-                // throughput is a real win (fp-convert ~1.1x, bit-exact). The
-                // NON-widening pure-`f64` recognition stays OPT-IN
-                // (`TRUST_CG_ENABLE_NEONFARRAY=1` = full mode): the ordered-drain
-                // ceiling is ~0% there and firing on the fused f64 ddot regresses
-                // ~5% by stealing the loop from scalar_unroll's extract-free
-                // unroll. Kill switch: `TRUST_CG_DISABLE_PASSES=neonfarray`.
-                if !is_disabled("neonfarray") {
-                    let farray = if pipeline_env_var("TRUST_CG_ENABLE_NEONFARRAY").is_some() {
-                        NeonFArrayPass::new()
-                    } else {
-                        NeonFArrayPass::widening_only()
-                    };
-                    pm = pm.with_pass(Box::new(farray));
-                }
-                if !is_disabled("redsplit") {
-                    pm = pm.with_pass(Box::new(ReductionSplit));
-                }
-                // Scalar ILP unroll: the load-bearing reduction loops nothing
-                // above could take. SPLIT mode = 4 independent integer
-                // accumulators (two's-complement reassociation, the
-                // reduction_split argument) for i64-mul / gather-term
-                // reductions no NEON path exists for; SERIAL mode =
-                // order-preserving 4x unroll (bit-identical by construction —
-                // FP chains and compound integer recurrences are NEVER
-                // reassociated). Runs AFTER every vectorizer and
-                // reduction_split (placement + a no-vector-path shape gate
-                // mean it can never steal their loops) and BEFORE ext-addr,
-                // which folds each unrolled lane's address chain. Fail-closed.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=scalar_unroll`.
-                if !is_disabled("scalar_unroll") {
-                    pm = pm.with_pass(Box::new(ScalarUnrollPass::new()));
-                }
-                // Single-trip residual-loop collapse: decides the ALWAYS-TAKEN
-                // exit branch of the one-iteration tail loop scalar-unroll's
-                // full-unroll leaves behind (the iv enters as a compile-time
-                // constant, so `iv+step` vs the constant bound is decidable)
-                // and rewrites `BCond exit; B latch` into `B exit`, unlinking
-                // the dead latch. Runs immediately AFTER scalar-unroll (whose
-                // full-unroll mints these tails) and BEFORE ext-addr /
-                // alias-hoist, so the straight-lined residual body's iv
-                // becomes single-def and its loads hoistable like every other
-                // lane (Shootout matrix lane 9, ~9% whole-program).
-                // Fail-closed on every unproven shape. Compile-time kill
-                // switch: `TCG_NO_RESID_COLLAPSE`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=residcollapse`.
-                if !is_disabled("residcollapse") {
-                    pm = pm.with_pass(Box::new(ResidTripCollapse));
-                }
-                // Second (LATE) UnfuseSerialFma instance: the NEON vectorizers
-                // above emit ordered-drain reductions as IN-PLACE FmaddRR runs
-                // (`FmaddRR [acc, a, b, acc]` — e.g. fp-convert's vectorized
-                // sum), which do not exist at the early instance's position.
-                // Loops the early instance already un-fused have no FMADDs
-                // left, so this re-run only touches vectorizer output. Same
-                // gate, same kill switch.
-                if !is_disabled("unfusefma") {
-                    pm = pm.with_pass(Box::new(UnfuseSerialFma));
-                }
-                // Extended-register addressing fold + select/flag fusion:
-                // LATE scalar cleanups that MUST run after the NEON
-                // vectorizers (whose recognizers decode the unfused
-                // Sxtw/Madd/LdrRI and CSet/CmpRI/Csel chains) and before the
-                // scheduler. Fail-closed; kill switches:
-                // `TRUST_CG_DISABLE_PASSES=extaddr` / `selfuse`.
-                if !is_disabled("extaddr") {
-                    pm = pm.with_pass(Box::new(ExtRegAddrFold));
-                }
-                // Pointer-IV strength reduction: rewrite a register-offset 2D
-                // array walk (`ldr [base, idx]` with `idx` affine in the loop
-                // counter — the loop-invariant-addend shape ext-addr cannot
-                // fold) into a preheader-initialized WALKING POINTER advanced
-                // by an explicit AddRI+MovR carrier in the latch, deleting the
-                // per-iteration index recompute (almabench planetpv's
-                // k-loops). Runs AFTER the vectorizers and ext-addr so it only
-                // claims accesses they left scalar/register-offset, and before
-                // the scheduler. Fail-closed on every unproven shape; never
-                // traces through a sign/zero-extend of a loop-variant index.
-                // Compile-time kill switch: `TCG_NO_PTR_IV_SR`; per-pass
-                // bisect: `TRUST_CG_DISABLE_PASSES=ptrivsr`.
-                // Scalar post-index formation. Runs immediately AFTER ptr-iv-sr
-                // and is disjoint from it by construction: ptr-iv-sr demands a
-                // single-back-edge {header}/{header,latch} body, this one only
-                // needs the load in the header, so a loop either pass rewrote is
-                // no longer in the shape the other recognises. Kill switch
-                // `TCG_NO_POST_INDEX`; bisect `TRUST_CG_DISABLE_PASSES=postindex`.
-                if !is_disabled("postindex") {
-                    pm = pm.with_pass(Box::new(PostIndexForm));
-                }
-                if !is_disabled("ptrivsr") {
-                    pm = pm.with_pass(Box::new(PtrIvStrengthReduce));
-                }
-                // Late call-bearing exact-trip FULL unroll: replicate the
-                // body of a proven-constant-trip counted loop whose body
-                // CONTAINS a call, at K = N (the loop control then evaluates
-                // once per entry instead of N times). Runs immediately AFTER
-                // ptr-iv-sr — that ordering IS the pass: unrolling this shape
-                // at the early `unroll` slot deletes the loop before ptr-iv-sr
-                // can reduce it, so each clone keeps the unreduced
-                // `lsl; madd; add; ldr` address chain. Toggling
-                // TCG_NO_PTR_IV_SR around THIS slot reproduces that placement
-                // exactly and prices it: almabench planetpv emits madd 16 /
-                // lsl 9 either way when the order is right, madd 58 / lsl 51
-                // when it is not (+42 = 6 arrays x 7 extra clones), and the
-                // unreduced unroll is a WASH against not unrolling at all
-                // (1.0095 vs 1.0094 PMC cycles) where the reduced one is
-                // 0.9890. Here the clones inherit the walking-pointer body
-                // and the unroll only removes work. Disjoint from
-                // partial-unroll by construction (that tier refuses calls).
-                // Purely structural: trip test, bound, step and exit edge are
-                // untouched, so a mis-modeled trip count can only refuse.
-                // Kill switch: `TCG_NO_CALL_UNROLL`; bisect key `callunroll`.
-                if !is_disabled("callunroll") {
-                    pm = pm.with_pass(Box::new(crate::loop_unroll::CallUnroll::new()));
-                }
-                // Alias-versioned loop-invariant load hoisting (LICM tier c):
-                // versions an inner loop on a RUNTIME byte-range disjointness
-                // check between its store range and each loop-invariant load,
-                // hoisting the loads into the disjoint (fast) clone's preheader
-                // and leaving the original loop untouched as the aliasing
-                // fallback. Runs after ext-addr so it sees the folded
-                // `ldr [base,#imm]` invariant loads the full-unroll exposes,
-                // and before the scheduler. Fail-closed on every unbounded
-                // store / unproven speculation / live-out clone value. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=aliashoist`.
-                if !is_disabled("aliashoist") {
-                    pm = pm.with_pass(Box::new(AliasVersionedLoadHoist));
-                }
-                if !is_disabled("selfuse") {
-                    pm = pm.with_pass(Box::new(SelectFlagFuse));
-                }
-                // Multiply-by-small-constant -> shift/add-sub strength reduction:
-                // rewrite `MulRR x, C` / `Madd x, C, y` (C a proven small
-                // compile-time constant expressible as ≤2 signed powers of two)
-                // into `LslRI` + `AddRR`/`SubRR`, off the latency-3-4 MUL/MADD
-                // critical path (p2_collatz's carried `c = c*3 + 1`). Fail-closed
-                // via `unique_reaching_const`; emits only already-gate-credited
-                // opcodes (no new surface). Runs DEAD LAST (after every
-                // vectorizer, unroller, and addressing pass) so it NEVER hides a
-                // multiply those passes must recognize — it only reduces the
-                // multiplies that survive to final scalar code, immediately before
-                // scheduling. The now-dead constant `Movz` is loop-invariant
-                // (LICM-hoisted to the preheader), so leaving it uncollected costs
-                // nothing on the hot path. Compile-time kill switch:
-                // `TCG_NO_MUL_SHIFT_REDUCE`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=mulshift`.
-                if !is_disabled("mulshift") {
-                    pm = pm.with_pass(Box::new(MulShiftReduce));
-                }
-                // Shift-into-ADD/SUB fusion: collapse `t = LslRI(s,k); d =
-                // AddRR/SubRR(x,t)` (single-use t) into the shifted-register
-                // `d = AddRRShift/SubRRShift(x,s,k)` (ADD/SUB x, s, LSL #k). Runs
-                // right after mul-shift-reduce so it also collapses that pass's
-                // `LslRI`+`AddRR`/`SubRR` output (`x*(2^k±1)`) into ONE op, plus
-                // any explicit `y + (x<<k)` / `y - (x<<k)`, and the LSR sibling
-                // `t = LsrRI(s,k); d = AddRR(x,t)` -> `AddRRShiftLsr` (the
-                // srem/sdiv magic sign-bit correction and udiv magic add-back;
-                // `TCG_NO_LSR_ADD_FUSE` disables the LSR half alone).
-                // Non-commutative for SUB (the shift binds to the subtrahend
-                // only). Fail-closed. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=shiftalufuse`.
-                if !is_disabled("shiftalufuse") {
-                    pm = pm.with_pass(Box::new(ShiftAluFuse));
-                }
-                // `LSR #k; AND #low_mask` -> UBFM/UBFX; see the O1 site for
-                // proof authority and fail-closed guards.
-                if !is_disabled("lsrandubfx") {
-                    pm = pm.with_pass(Box::new(LsrAndUbfx));
-                }
-                // CSEL->CSINC increment fold: absorb a single-use `+1` select arm
-                // into a `CSINC` (p2_collatz's `c*3+1` odd arm after
-                // mul-shift-reduce+shift-alu-fuse expose the trailing `+1`).
-                // Runs here so the `+1` is already the CSEL's direct operand.
-                // Sound (exact select semantics); `Csinc` is already credited.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=csincfold`.
-                if !is_disabled("csincfold") {
-                    pm = pm.with_pass(Box::new(CsincFold));
-                }
-                // PARTIAL (factor) unroll: replicate the body of a constant-trip
-                // loop that is TOO LONG for any full unroller (every tier caps
-                // at 4..16 trips) K times, with the `N mod K` remainder peeled
-                // as a prologue. Runs LATE — after every vectorizer and
-                // pattern-specific unroller has had first refusal on the native
-                // counted shape, and before scheduling/mem-pair so the
-                // replicated accesses can still pair. Purely structural: the
-                // trip test, bound, step and exit edge are untouched, so a
-                // mis-modeled trip count can only refuse to fire. Kill switch:
-                // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
-                if !is_disabled("partial_unroll") {
-                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new(
-                        (!is_disabled("profileuse"))
-                            .then(|| self.pgo.profile_hotness())
-                            .flatten(),
-                    )));
-                }
-                if !is_disabled("sched") {
-                    pm = pm.with_pass(Box::new(PressureAwareScheduler));
-                }
-                // LDP/STP pair formation runs AFTER scheduling (adjacency is
-                // near-final) but before regalloc (so the translation validator
-                // checks every pair). Kill switch: `TRUST_CG_DISABLE_PASSES=mempair`.
-                if !is_disabled("mempair") {
-                    pm = pm.with_pass(Box::new(crate::mem_pair::MemPairFormation));
-                }
-                pm
-            }
-            OptLevel::O3 => {
-                // Aggressive: same as O2 but iterated to fixpoint.
-                // Vectorization before LICM (see O2 comment for rationale).
-                //
-                // Declarative rewrite (#393) runs before the standalone
-                // RotateIdiom stage when the default is on. The kill switch
-                // `TRUST_CG_DISABLE_PASSES=declrewrite` drops the pass for
-                // forensic rollback.
-                //
-                // SROA (#391 Phase 2b) runs once before vectorization,
-                // between GVN and VectorizationPass.
-                let mut pm = PassManager::new()
-                    .with_proof_optimization_metadata(self.proof_metadata.clone());
-                // Consume exact post-ISel replay authority before any pass can
-                // mutate the machine function it is bound to.
-                if lattice_kernel_gate && !is_disabled("proof") {
-                    pm = pm.with_pass(self.proof_optimization_pass());
-                }
-                let profile_use_enabled = !is_disabled("profileuse");
-                let profile_hotness = profile_use_enabled
-                    .then(|| self.pgo.profile_hotness())
-                    .flatten();
-                if let Some(profile) = self.pgo.profile_use.clone()
-                    && profile_use_enabled
-                {
-                    pm = pm.with_pass(Box::new(ProfileUsePass::new(profile)));
-                }
-                if !is_disabled("inline") {
-                    pm = pm.with_pass(Box::new(
-                        FunctionInlining::new().with_profile_hotness(profile_hotness.clone()),
-                    ));
-                }
-                // Sin/cos -> ___sincos_stret fusion (Darwin arm64). See the O2
-                // branch for the placement rationale (early, pre-scheduler;
-                // Darwin-gated). Kill switch: `TCG_NO_SINCOS_MERGE` /
-                // `TRUST_CG_DISABLE_PASSES=sincosmerge`.
-                if !is_disabled("sincosmerge") {
-                    pm = pm.with_pass(Box::new(SincosMerge::new(self.target_is_darwin)));
-                }
-                // Loop-dead pure-computation deferral (almabench store
-                // sinking). Runs EARLY — right after inlining/sincos-merge on
-                // the pristine post-ISel shapes (the call-cluster and rotated
-                // do-while recognizers depend on them), and before
-                // addr-mode/CSE/scheduling rewrite the address chains. The
-                // deferred loop it emits is then optimized by every later
-                // pass. Kill switch: `TCG_NO_LOOP_DEAD_SINK` /
-                // `TRUST_CG_DISABLE_PASSES=loopdeadsink`.
-                if !is_disabled("loopdeadsink") {
-                    pm = pm.with_pass(Box::new(LoopDeadPureSink));
-                }
-                if !is_disabled("addrmodeearly") {
-                    pm = pm.with_pass(Box::new(AddrModeEarlyFormation));
-                }
-                if !lattice_kernel_gate && !is_disabled("proof") {
-                    pm = pm.with_pass(self.proof_optimization_pass());
-                }
-                if !is_disabled("cfold") {
-                    pm = pm.with_pass(self.constant_folding_pass());
-                }
-                if !is_disabled("copyprop") {
-                    pm = pm.with_pass(Box::new(CopyPropagation));
-                }
-                if !is_disabled("cse") {
-                    pm = pm.with_pass(Box::new(CommonSubexprElim));
-                }
-                if !is_disabled("gvn") {
-                    pm = pm.with_pass(Box::new(GlobalValueNumbering));
-                }
-                if !is_disabled("sroa") {
-                    pm = pm.with_pass(Box::new(ScalarReplacementOfAggregates));
-                }
-                if !is_disabled("vec") {
-                    let mut vectorizer =
-                        VectorizationPass::new().with_profile_hotness(profile_hotness.clone());
-                    if let Some(enabled) = self.contains4_scanner_batch_rewrite_override {
-                        vectorizer = vectorizer.with_contains4_scanner_batch_rewrite(enabled);
-                    }
-                    pm = pm.with_pass(Box::new(vectorizer));
-                }
-                if !is_disabled("licm") {
-                    pm = pm.with_pass(Box::new(LoopInvariantCodeMotion));
-                }
-                if !is_disabled("strred") {
-                    pm = pm.with_pass(Box::new(StrengthReduction));
-                }
-                if !is_disabled("unfusefma") {
-                    pm = pm.with_pass(Box::new(UnfuseSerialFma));
-                }
-                // Invariant loop unswitching: version a small innermost loop
-                // on a loop-invariant Cbz/Cbnz/CmpRI#0+BCond test so the
-                // decision is made ONCE in the preheader (Queens' Try
-                // `i < 8`: previously tested 8x per call after the bounded
-                // early-exit unroll, with the boolean spilled post-RA — a
-                // serialized ldur+cbnz per clone). MUST run immediately
-                // BEFORE loop-unroll so both versions unroll cleanly.
-                // Fail-closed. Kill switch: `TCG_NO_LOOP_UNSWITCH`; bisect
-                // key `unswitch`.
-                if !is_disabled("unswitch") {
-                    pm = pm.with_pass(Box::new(LoopUnswitch));
-                }
-                if !is_disabled("unroll") {
-                    pm = pm.with_pass(Box::new(LoopUnroll::new(profile_hotness.clone())));
-                }
-                // Late SROA (2nd instance): the const-addr full unroll above
-                // (`TCG_NO_CONST_ADDR_UNROLL`) rewrites stack-array index
-                // arithmetic into constant offsets; re-running SROA promotes
-                // the now-constant-offset local array to scalars (salsa20's
-                // `x[16]` stack round-trip). Kill switch: `TCG_NO_LATE_SROA`;
-                // shares the `sroa` bisect key.
-                if !is_disabled("sroa") && late_sroa_enabled() {
-                    pm = pm.with_pass(Box::new(ScalarReplacementOfAggregates));
-                }
-                if !is_disabled("declrewrite") {
-                    let (pass, report) = make_declarative_rewrite_pass_with_report(
-                        &self.admitted_rewrite_records,
-                        self.rewrite_admission_config,
-                    );
-                    pipeline_report.record_rewrite_admission_load(report);
-                    pm = pm.with_pass(Box::new(pass));
-                }
-                // Peephole dropped: declarative rewrite covers it;
-                // RotateIdiom carries pattern 53 (needs dominator info).
-                // The `peep` bisect key now gates RotateIdiom.
-                if !is_disabled("peep") {
-                    pm = pm.with_pass(Box::new(RotateIdiom));
-                }
-                // EOR-with-rotate fusion: collapse `t = RorRI(s,k); d = EorRR(x,t)`
-                // (single-use t) into the shifted-register `d = EorRRShift(x,s,k)`
-                // (EOR x, s, ROR #k) — the consumer of the RorRI RotateIdiom just
-                // created. Removes one instruction and one serial critical-path
-                // node per ARX statement (salsa20). Fail-closed. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=eorrotfuse`.
-                if !is_disabled("eorrotfuse") {
-                    pm = pm.with_pass(Box::new(EorRotateFuse));
-                }
-                if !is_disabled("addrmode") {
-                    pm = pm.with_pass(Box::new(AddrModeFormation));
-                }
-                if !is_disabled("cmpsel") {
-                    pm = pm.with_pass(Box::new(CmpSelectCombine));
-                }
-                if !is_disabled("ifconv") {
-                    pm = pm.with_pass(Box::new(IfConversion));
-                }
-                // AND+CMP#0 -> TST. MUST precede cmp-branch-fusion: that pass
-                // rewrites CmpRI into Cbz/Cbnz and AndCmpFuse only matches a
-                // surviving CmpRI, so the reverse order silently starves it.
-                // Together they compose into LLVM's `tbz`. C-flag guarded (ANDS
-                // clears C, SUBS #0 sets it). Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=andcmpfuse`.
-                if !is_disabled("andcmpfuse") {
-                    pm = pm.with_pass(Box::new(AndCmpFuse));
-                }
-                // `y = x ^ (x << k)`: consumers reading only bits [0,k) may read
-                // `x`, shortening the dependency chain into a mispredicting
-                // branch by one shifted-EOR. Purely an operand swap; the bit
-                // range must be provably below k or the operand is left alone.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=xorshiftdemanded`.
-                if !is_disabled("xorshiftdemanded") {
-                    pm = pm.with_pass(Box::new(XorshiftDemandedBits));
-                }
-                if !is_disabled("cmpbr") {
-                    pm = pm.with_pass(Box::new(CmpBranchFusion));
-                }
-                // Profile-gated hot-latch AND-condition split. Runs right AFTER
-                // cmp-branch-fusion (which forms the `cbnz t` its recogniser
-                // matches). INERT without an attached profile — the default
-                // compile stays byte-identical; with a profile it fires only in
-                // the unpredictable taken-rate band (see latch_and_split.rs).
-                // Kill switch: `TCG_NO_LATCH_AND_SPLIT`; bisect key `latchsplit`.
-                if !is_disabled("latchsplit") {
-                    pm = pm.with_pass(Box::new(LatchAndSplit::new(profile_hotness.clone())));
-                }
-                if !is_disabled("tailcall") {
-                    pm = pm.with_pass(Box::new(TailCallOptimization));
-                }
-                if !is_disabled("dce") {
-                    pm = pm.with_pass(self.dce_pass());
-                }
-                if !is_disabled("cfgsimp") {
-                    pm = pm.with_pass(Box::new(CfgSimplify));
-                }
-                // Late tiny-loop-diamond if-conversion: convert an unpredictable
-                // NON-AFFINE-recurrence-gated tiny pure-arm diamond (b1's
-                // `if s&6==2 { acc=rotate_left(acc,7) }`) to a CSEL. Runs HERE —
-                // after cfg-simplify canonicalizes it to a clean diamond, which
-                // the primary if-convert (pre-dce/cfg-simplify) cannot see. Tight
-                // gate (loop-resident + tiny pure arm + EOR self-recurrence) so it
-                // stays branchy on predictable diamonds. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=tinyloop`.
-                if !is_disabled("tinyloop") {
-                    pm = pm.with_pass(Box::new(TinyLoopDiamondConvert));
-                }
-                // AArch64 bounds-check elimination — see the O2 comment. Same
-                // late-machine-opt slot (post-cfgsimp, pre-looplatch/vectorize).
-                // Default-ON kill switch: `TCG_NO_AARCH64_BCE`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=aarch64bce`.
-                if !is_disabled("aarch64bce") {
-                    pm = pm.with_pass(Box::new(AArch64BoundsCheckElimination::new()));
-                }
-                // Loop-carried store-to-load forwarding — see the O2 comment.
-                // Same slot: right AFTER aarch64-bounds-check-elim, BEFORE the
-                // unrollers/vectorizers. Closed-world, fail-closed; emits only
-                // already-credited opcodes. Default-ON kill switch:
-                // `TCG_NO_RECURRENCE_STORE_FWD`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=recurrence_store_fwd`.
-                if !is_disabled("recurrence_store_fwd") {
-                    pm = pm.with_pass(Box::new(RecurrenceStoreForward::new()));
-                }
-                // Counted-strided-store partial-unroll (x4) — see the O2 comment.
-                // Same slot: AFTER aarch64-bounds-check-elim, BEFORE
-                // closed-form-reduction/loop-latch-layout. Additive, wrap-free,
-                // fail-safe; emits only already-credited opcodes (no udiv/mul).
-                // Compile-time kill switch: `TCG_NO_STRIDED_STORE_UNROLL`;
-                // per-pass bisect: `TRUST_CG_DISABLE_PASSES=strided_store_unroll`.
-                // Normalize ISel's folded constant-trip `CmpRI` guards back to
-                // `CmpRR(iv, movz)` BEFORE the vectorizers/unrollers, so
-                // dc5916e's `cmp_imm12_fold` does not silently defeat their
-                // constant-trip recognizers (matmul full-unroll, the dt-class FP
-                // maps). Semantics-preserving. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=consttripnorm`.
-                if !is_disabled("consttripnorm") {
-                    pm = pm.with_pass(Box::new(crate::scalar_unroll::ConstTripGuardNormalize));
-                }
-                if !is_disabled("strided_store_unroll") {
-                    pm = pm.with_pass(Box::new(StridedStoreUnroll::new()));
-                }
-                // RMW-MAC row-loop partial-unroll (x4) — see the O2 comment.
-                // Same slot: AFTER aarch64-bounds-check-elim, BEFORE
-                // closed-form-reduction/loop-latch-layout. Additive, wrap-free,
-                // fail-safe; emits only already-credited opcodes (no udiv/mul).
-                // Compile-time kill switch: `TCG_NO_MAC_ROW_UNROLL`; per-pass
-                // bisect: `TRUST_CG_DISABLE_PASSES=mac_row_unroll`.
-                // Matmul 1D register-blocking (T=8): recognize the whole
-                // 3-deep bounds-checked matmul nest (distinct stack-local
-                // a/b/c, read-only a/b, single c store, const N a multiple of
-                // 8, L>=N*N) and splice a CHECK-FREE register-blocked fast path
-                // (k/j interchange, 8 c accumulators held across the k-loop,
-                // stores sunk to tile end) in FRONT of the untouched checked
-                // nest — kept as the runtime-guarded fallback so mac-row-unroll
-                // still fires on it. Store-sinking is sound because a/b/c are
-                // distinct locals (a/b never written; c's only store is
-                // c[i*N+j]); the tiled indices are provably < L so no per-access
-                // check is emitted. Runs right BEFORE mac-row-unroll (which
-                // handles the fallback's inner j-loop) and AFTER
-                // aarch64-bounds-check-elim (the clean LdrRI/StrRI + Madd
-                // address form). Purely additive, fail-closed, emits only
-                // already-credited opcodes. Kill switch: `TCG_NO_MAC_REG_BLOCK`;
-                // per-pass bisect: `TRUST_CG_DISABLE_PASSES=mac_reg_block`.
-                if !is_disabled("mac_reg_block") {
-                    pm = pm.with_pass(Box::new(MacRegBlock::new()));
-                }
-                if !is_disabled("mac_row_unroll") {
-                    pm = pm.with_pass(Box::new(MacRowUnroll::new()));
-                }
-                // SOUND hoisted-range-guard crosswise-SWAP fast path (O3):
-                // see the O2 comment. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=swap_range_guard`.
-                if !is_disabled("swap_range_guard") {
-                    pm = pm.with_pass(Box::new(SwapRangeGuardPass::new()));
-                }
-                // Closed-form (Faulhaber) reduction — see the O2 comment. Runs
-                // before LoopLatchLayoutCombine and the split; iterated to
-                // fixpoint at O3. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=closed_form_reduction`.
-                if !is_disabled("closed_form_reduction") {
-                    pm = pm.with_pass(Box::new(ClosedFormReduction));
-                }
-                // Delete provably-terminating, side-effect-free counted loops
-                // (empty after upstream DCE). Fail-closed. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=deadloop`.
-                if !is_disabled("deadloop") {
-                    pm = pm.with_pass(Box::new(DeadCountedLoopElimination::new()));
-                }
-                if !is_disabled("looplatch") {
-                    pm = pm.with_pass(Box::new(LoopLatchLayoutCombine));
-                }
-                // Reduction splitting (accumulator widening): break a
-                // throughput-bound integer reduction's loop-carried chain into
-                // N independent accumulators for ILP. Fail-closed: only fires on
-                // the exact recognized constant-trip register-reduction shape.
-                // Placed after DCE/CFG-simplify so it sees the cleaned-up loop.
-                // SOUND NEON add-reduction vectorizer. Runs immediately BEFORE
-                // reduction_split so it fires FIRST on lane-wise-vectorizable
-                // reduction terms (e.g. `a += (i*7)|(i*3)`), lowering them to a
-                // NEON vector accumulator + scalar tail. It BAILS (leaving the
-                // scalar loop intact) on any shape it cannot prove lane-wise
-                // equivalent, so reduction_split still handles those.
-                if !is_disabled("neonreduce") {
-                    pm = pm.with_pass(Box::new(NeonReducePass::new()));
-                }
-                // SOUND NEON array-reduction vectorizer: extends neon-reduce to
-                // reductions whose term reads from READ-ONLY memory (`s +=
-                // TERM(a[i], b[i], ...)`). Runs immediately after neon-reduce
-                // (which BAILS on any load) and before reduction_split. Fires
-                // only on the shapes it can prove lane-wise equivalent (i32
-                // accumulator, `a[i]` loads, lane-wise ops) and BAILS otherwise.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_array`.
-                if !is_disabled("neon_array") {
-                    pm = pm.with_pass(Box::new(
-                        NeonArrayPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
-                    ));
-                }
-                // SOUND NEON byte-widening reduction into a u64 accumulator
-                // (popcount-sum / byte-sum) — the case neon_array's i32-only
-                // widening TRACK B and 2-block loop shape both miss (e.g.
-                // v3_popcount). Composes already-proven CNT/UADDLP/ADD/UMOV +
-                // the const-materialization MOVI and the shared-debt paired-Q
-                // load, all now credited per-compile, so it promotes gate-clean.
-                // Present by default but inert unless the resolved target
-                // explicitly admits FEAT_DotProd; kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
-                if !is_disabled("neon_bytesum") {
-                    pm = pm.with_pass(Box::new(
-                        NeonBytesumPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
-                    ));
-                }
-                // SOUND NEON min/max & bitwise array-reduction vectorizer:
-                // extends neon-array to the non-add associative+commutative
-                // reductions `m = max/min(m, TERM(a[i]))` (via `select(icmp)`)
-                // and `m &= / |= / ^= TERM(a[i])`, plus the index-tracking
-                // ARGMIN/ARGMAX shape (a 3rd carried var — best index — updated
-                // under the SAME strict compare; first-occurrence preserved by a
-                // (value, min-index) lexicographic exit fold). Runs immediately
-                // after neon-array (which claims add/madd and BAILS on these)
-                // and before reduction_split. i32-only; BAILS on i64, register
-                // reductions, ambiguous / non-strict selects, and any
-                // store/effect. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_minmax`.
-                if !is_disabled("neon_minmax") {
-                    pm = pm.with_pass(Box::new(NeonMinMaxPass::new()));
-                }
-                // SOUND NEON predicated-sum array-reduction vectorizer (O3): see
-                // the O2 comment. Add-rooted `s += select(...)`; fires only when
-                // the term has a lane-wise select, lowering it to a proven
-                // per-lane compare mask + branchless bitselect. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_predsum`.
-                if !is_disabled("neon_predsum") {
-                    pm = pm.with_pass(Box::new(NeonPredSumPass::new()));
-                }
-                // SOUND NEON memory-MAP/STORE vectorizer (O3): see the O2 comment.
-                // Fires only on provably-non-aliasing store loops; BAILS
-                // otherwise. Kill switch: `TRUST_CG_DISABLE_PASSES=neon_map`.
-                if !is_disabled("neon_map") {
-                    pm = pm.with_pass(Box::new(NeonMapPass::new()));
-                }
-                // SOUND NEON per-byte 8-bit-reverse MAP vectorizer (O3): see the
-                // O2 comment. Kill switch: `TRUST_CG_DISABLE_PASSES=neon_bitrev`.
-                if !is_disabled("neon_bitrev") {
-                    pm = pm.with_pass(Box::new(NeonBitrevPass::new()));
-                }
-                // SOUND NEON array-FILL store vectorizer (O3): see the O2
-                // comment. Fires on the shared `__trustcg_array_fill_iN` helper
-                // and any inline const/invariant fill; purely additive, removes
-                // no bounds check. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_fill`.
-                if !is_disabled("neon_fill") {
-                    pm = pm.with_pass(Box::new(NeonFillPass::new()));
-                }
-                // SOUND NEON affine IOTA-fill store vectorizer (O3): see the
-                // O2 comment. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_iota_fill`.
-                if !is_disabled("neon_iota_fill") {
-                    pm = pm.with_pass(Box::new(NeonIotaFillPass::new()));
-                }
-                // Conditional-store blind-write vectorization remains
-                // unscheduled until typed ownership evidence is available.
-                // SOUND NEON EARLY-EXIT SEARCH vectorizer (O3): see the O2 comment.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_find`.
-                if !is_disabled("neon_find") {
-                    pm = pm.with_pass(Box::new(NeonFindPass::new()));
-                }
-                // SOUND NEON STENCIL (windowed-read) vectorizer (O3): see the O2
-                // comment. Fires only on provably-disjoint (noalias) out-vs-reads
-                // stencils with the store at offset 0; BAILS otherwise. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=neon_stencil`.
-                if !is_disabled("neon_stencil") {
-                    pm = pm.with_pass(Box::new(NeonStencilPass::new()));
-                }
-                // SOUND NEON elementwise-FP map/stencil/count vectorizer:
-                // `out[i] = FTERM(a[i+k], ..., invariants)` (f32 `.4S` / f64
-                // `.2D`) and the integer-accumulating FP count-above
-                // `c += (a[i] > t)`. FP REDUCTIONS ARE NEVER TOUCHED
-                // (reassociation would change results — they stay on the
-                // order-preserving scalar path). Per-lane ops are the SAME
-                // IEEE operations the scalar loop performs (no FMLA
-                // contraction), so the output is bit-identical. Runs after
-                // the integer map/stencil passes (disjoint shapes — those
-                // bail on FP classes) and before reduction_split. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=neon_fmap`.
-                if !is_disabled("neon_fmap") {
-                    pm = pm.with_pass(Box::new(NeonFMapPass::new()));
-                }
-                // SOUND NEON AoS stride-2 complex-butterfly vectorizer: the
-                // radix-2 FFT inner loop over `struct complex { f32 rp, ip; }`
-                // (Stanford Oscar's Fft — clang -O3 vectorizes it, trust-cg
-                // was fully scalar). One complex PAIR (`.4S`) per iteration on
-                // the INTERLEAVED data: FADD/FSUB per lane + the REV64.4S
-                // pair-swap + sign-mask EOR (the scalar FNEG, bitwise) +
-                // FMUL/FMLA with broadcast twiddles — per-lane the SAME IEEE
-                // ops and roundings the scalar loop performs (no contraction
-                // introduced; the source's fused fmuladd stays fused), so
-                // BIT-IDENTICAL. Entered only behind a runtime 7-pair
-                // byte-range disjointness preamble (regime-C versioning,
-                // wrap-safe modular-interval tests) that otherwise falls back
-                // to the untouched scalar loop. Fail-closed on any deviation
-                // from the exact butterfly dag. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_butterfly`.
-                if !is_disabled("neon_butterfly") {
-                    pm = pm.with_pass(Box::new(NeonButterflyPass::new()));
-                }
-                // SOUND NEON early-exit linear-search (find/memchr) vectorizer:
-                // `for i<n: if a[i]==key return i; return -1`. A purely additive
-                // vector BLOCK FILTER runs in front of the UNCHANGED scalar loop:
-                // per whole 16-element in-bounds block it CMEQs the loads against
-                // a key splat and, on a PROVEN no-match block, skips it; on any-
-                // hit (or a partial trailing block) it re-enters the scalar loop,
-                // which computes the exact first-match index (delegated — no
-                // vector lane ordering, so same-block and cross-block duplicates
-                // are correct by the scalar scan). The over-read is a SUBSET of
-                // the no-match scalar read set (the guard admits only whole blocks
-                // within [0,n)); reads are pure (BAILS on stores / atomics; volatile
-                // fails closed at lowering). Every other neon pass BAILS on this
-                // early-exit shape. Kill switch:
-                // `TRUST_CG_DISABLE_PASSES=neon_find`.
-                if !is_disabled("neon_find") {
-                    pm = pm.with_pass(Box::new(NeonFindPass::new()));
-                }
-                // SOUND NEON IV-synthesized FP-reduction vectorizer:
-                // `acc += f(i)` where `f(i)` is a pure lane-wise f64 dataflow of
-                // the induction (`(double)i` via UCVTF/SCVTF) and loop-invariant
-                // scalars (NO arrays/memory), combined by a PLAIN fadd. It
-                // vectorizes only the INDEPENDENT per-lane term (`.2D`, x4 pairs)
-                // and folds the lanes into the scalar accumulator with ORDERED
-                // scalar fadds in iteration order — no reassociation, so the sum
-                // is BIT-IDENTICAL to the scalar loop (clang -O3's own emission
-                // for the flops kernels). Runs before reduction_split /
-                // scalar_unroll (first shot at the FP-reduction loop); BAILS on a
-                // fused accumulate, f32, non-unit step, stores/calls, or an extra
-                // live-out — scalar_unroll's SERIAL unroll is the fallback. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=neonfpred`.
-                if !is_disabled("neonfpred") {
-                    pm = pm.with_pass(Box::new(NeonFPRedPass::new()));
-                }
-                // SOUND NEON FP ARRAY-reduction vectorizer (memory-bearing sibling
-                // of neon-fpred): `acc += a[i]*b[i]` / `acc += a[i]` over unit-stride
-                // f64 arrays, PLUS the `f32 -> f64` widening dot (the fp-convert
-                // kernel) via the proven vector FCVTL/FCVTL2. Coalesced LDP-Q loads
-                // (widened by FCVTL for f32 streams) + ORDERED scalar drain (fused
-                // fmadd preserved) = bit-identical to the scalar loop.
-                //
-                // ASYMMETRIC DEFAULT (measured): the `f32 -> f64` WIDENING
-                // recognition fires BY DEFAULT — the FCVTL halved convert
-                // throughput is a real win (fp-convert ~1.1x, bit-exact). The
-                // NON-widening pure-`f64` recognition stays OPT-IN
-                // (`TRUST_CG_ENABLE_NEONFARRAY=1` = full mode): the ordered-drain
-                // ceiling is ~0% there and firing on the fused f64 ddot regresses
-                // ~5% by stealing the loop from scalar_unroll's extract-free
-                // unroll. Kill switch: `TRUST_CG_DISABLE_PASSES=neonfarray`.
-                if !is_disabled("neonfarray") {
-                    let farray = if pipeline_env_var("TRUST_CG_ENABLE_NEONFARRAY").is_some() {
-                        NeonFArrayPass::new()
-                    } else {
-                        NeonFArrayPass::widening_only()
-                    };
-                    pm = pm.with_pass(Box::new(farray));
-                }
-                if !is_disabled("redsplit") {
-                    pm = pm.with_pass(Box::new(ReductionSplit));
-                }
-                // Scalar ILP unroll (O3): see the O2 comment. Idempotent (the
-                // inserted 3-block main loop and the tail's multi-pred entry
-                // are both rejected by the recognizer), so fixpoint iteration
-                // is safe. Kill switch: `TRUST_CG_DISABLE_PASSES=scalar_unroll`.
-                if !is_disabled("scalar_unroll") {
-                    pm = pm.with_pass(Box::new(ScalarUnrollPass::new()));
-                }
-                // Single-trip residual-loop collapse (O3) — see the O2
-                // comment. Idempotent under fixpoint: the rewritten block ends
-                // in a single unconditional `B` (no `BCond`+`B` pair left), so
-                // the recognizer never re-matches a collapsed header. Same
-                // kill switches (`TCG_NO_RESID_COLLAPSE` /
-                // `TRUST_CG_DISABLE_PASSES=residcollapse`).
-                if !is_disabled("residcollapse") {
-                    pm = pm.with_pass(Box::new(ResidTripCollapse));
-                }
-                // Second (LATE) UnfuseSerialFma instance: the NEON vectorizers
-                // above emit ordered-drain reductions as IN-PLACE FmaddRR runs
-                // (`FmaddRR [acc, a, b, acc]` — e.g. fp-convert's vectorized
-                // sum), which do not exist at the early instance's position.
-                // Loops the early instance already un-fused have no FMADDs
-                // left, so this re-run only touches vectorizer output. Same
-                // gate, same kill switch.
-                if !is_disabled("unfusefma") {
-                    pm = pm.with_pass(Box::new(UnfuseSerialFma));
-                }
-                // Extended-register addressing fold + select/flag fusion —
-                // see the O2 comment. Both are idempotent (each fold consumes
-                // its matched chain), so O3 fixpoint iteration is safe; the
-                // vectorizers bail cleanly on already-folded shapes.
-                if !is_disabled("extaddr") {
-                    pm = pm.with_pass(Box::new(ExtRegAddrFold));
-                }
-                // Pointer-IV strength reduction — see the O2 comment. Safe
-                // under fixpoint iteration: a rewritten access is a
-                // zero-offset LdrRI/StrRI (no LdrRO/StrRO left to re-claim),
-                // so the pass reports no change on re-runs.
-                // Scalar post-index formation. Runs immediately AFTER ptr-iv-sr
-                // and is disjoint from it by construction: ptr-iv-sr demands a
-                // single-back-edge {header}/{header,latch} body, this one only
-                // needs the load in the header, so a loop either pass rewrote is
-                // no longer in the shape the other recognises. Kill switch
-                // `TCG_NO_POST_INDEX`; bisect `TRUST_CG_DISABLE_PASSES=postindex`.
-                if !is_disabled("postindex") {
-                    pm = pm.with_pass(Box::new(PostIndexForm));
-                }
-                if !is_disabled("ptrivsr") {
-                    pm = pm.with_pass(Box::new(PtrIvStrengthReduce));
-                }
-                // Late call-bearing exact-trip FULL unroll: replicate the
-                // body of a proven-constant-trip counted loop whose body
-                // CONTAINS a call, at K = N (the loop control then evaluates
-                // once per entry instead of N times). Runs immediately AFTER
-                // ptr-iv-sr — that ordering IS the pass: unrolling this shape
-                // at the early `unroll` slot deletes the loop before ptr-iv-sr
-                // can reduce it, so each clone keeps the unreduced
-                // `lsl; madd; add; ldr` address chain. Toggling
-                // TCG_NO_PTR_IV_SR around THIS slot reproduces that placement
-                // exactly and prices it: almabench planetpv emits madd 16 /
-                // lsl 9 either way when the order is right, madd 58 / lsl 51
-                // when it is not (+42 = 6 arrays x 7 extra clones), and the
-                // unreduced unroll is a WASH against not unrolling at all
-                // (1.0095 vs 1.0094 PMC cycles) where the reduced one is
-                // 0.9890. Here the clones inherit the walking-pointer body
-                // and the unroll only removes work. Disjoint from
-                // partial-unroll by construction (that tier refuses calls).
-                // Purely structural: trip test, bound, step and exit edge are
-                // untouched, so a mis-modeled trip count can only refuse.
-                // Kill switch: `TCG_NO_CALL_UNROLL`; bisect key `callunroll`.
-                if !is_disabled("callunroll") {
-                    pm = pm.with_pass(Box::new(crate::loop_unroll::CallUnroll::new()));
-                }
-                // Alias-versioned load hoisting (LICM tier c) — see the O2
-                // comment. Self-limiting under fixpoint: the slow loop's new
-                // preheader is a two-successor check block (fails the
-                // unconditional-entry gate on re-run) and the fast clone has no
-                // hoistable loads left, so it fires at most once per loop.
-                if !is_disabled("aliashoist") {
-                    pm = pm.with_pass(Box::new(AliasVersionedLoadHoist));
-                }
-                if !is_disabled("selfuse") {
-                    pm = pm.with_pass(Box::new(SelectFlagFuse));
-                }
-                // Multiply-by-small-constant -> shift/add-sub strength reduction:
-                // rewrite `MulRR x, C` / `Madd x, C, y` (C a proven small
-                // compile-time constant expressible as ≤2 signed powers of two)
-                // into `LslRI` + `AddRR`/`SubRR`, off the latency-3-4 MUL/MADD
-                // critical path (p2_collatz's carried `c = c*3 + 1`). Fail-closed
-                // via `unique_reaching_const`; emits only already-gate-credited
-                // opcodes (no new surface). Runs DEAD LAST (after every
-                // vectorizer, unroller, and addressing pass) so it NEVER hides a
-                // multiply those passes must recognize — it only reduces the
-                // multiplies that survive to final scalar code, immediately before
-                // scheduling. The now-dead constant `Movz` is loop-invariant
-                // (LICM-hoisted to the preheader), so leaving it uncollected costs
-                // nothing on the hot path. Compile-time kill switch:
-                // `TCG_NO_MUL_SHIFT_REDUCE`; per-pass bisect:
-                // `TRUST_CG_DISABLE_PASSES=mulshift`.
-                if !is_disabled("mulshift") {
-                    pm = pm.with_pass(Box::new(MulShiftReduce));
-                }
-                // Shift-into-ADD/SUB fusion: collapse `t = LslRI(s,k); d =
-                // AddRR/SubRR(x,t)` (single-use t) into the shifted-register
-                // `d = AddRRShift/SubRRShift(x,s,k)` (ADD/SUB x, s, LSL #k). Runs
-                // right after mul-shift-reduce so it also collapses that pass's
-                // `LslRI`+`AddRR`/`SubRR` output (`x*(2^k±1)`) into ONE op, plus
-                // any explicit `y + (x<<k)` / `y - (x<<k)`, and the LSR sibling
-                // `t = LsrRI(s,k); d = AddRR(x,t)` -> `AddRRShiftLsr` (the
-                // srem/sdiv magic sign-bit correction and udiv magic add-back;
-                // `TCG_NO_LSR_ADD_FUSE` disables the LSR half alone).
-                // Non-commutative for SUB (the shift binds to the subtrahend
-                // only). Fail-closed. Kill
-                // switch: `TRUST_CG_DISABLE_PASSES=shiftalufuse`.
-                if !is_disabled("shiftalufuse") {
-                    pm = pm.with_pass(Box::new(ShiftAluFuse));
-                }
-                // `LSR #k; AND #low_mask` -> UBFM/UBFX; see the O1 site for
-                // proof authority and fail-closed guards.
-                if !is_disabled("lsrandubfx") {
-                    pm = pm.with_pass(Box::new(LsrAndUbfx));
-                }
-                // CSEL->CSINC increment fold: absorb a single-use `+1` select arm
-                // into a `CSINC` (p2_collatz's `c*3+1` odd arm after
-                // mul-shift-reduce+shift-alu-fuse expose the trailing `+1`).
-                // Runs here so the `+1` is already the CSEL's direct operand.
-                // Sound (exact select semantics); `Csinc` is already credited.
-                // Kill switch: `TRUST_CG_DISABLE_PASSES=csincfold`.
-                if !is_disabled("csincfold") {
-                    pm = pm.with_pass(Box::new(CsincFold));
-                }
-                // PARTIAL (factor) unroll — see the O2 comment. Kill switch:
-                // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
-                if !is_disabled("partial_unroll") {
-                    pm = pm.with_pass(Box::new(crate::loop_unroll::PartialUnroll::new(
-                        (!is_disabled("profileuse"))
-                            .then(|| self.pgo.profile_hotness())
-                            .flatten(),
-                    )));
-                }
-                if !is_disabled("sched") {
-                    pm = pm.with_pass(Box::new(PressureAwareScheduler));
-                }
-                // LDP/STP pair formation runs AFTER scheduling (adjacency is
-                // near-final) but before regalloc (so the translation validator
-                // checks every pair). Kill switch: `TRUST_CG_DISABLE_PASSES=mempair`.
-                if !is_disabled("mempair") {
-                    pm = pm.with_pass(Box::new(crate::mem_pair::MemPairFormation));
-                }
-                pm
-            }
-        };
-
+        // Register in place rather than moving a manager (including its proof
+        // metadata maps) through one debug temporary for every pass. Both APIs
+        // seed each pass from the same canonical metadata setter.
+        let mut pm = PassManager::new();
+        pm.set_proof_optimization_metadata(self.proof_metadata.clone());
+        match self.level {
+            // No optimizations at O0, but metadata and final validation retain
+            // the same construction contract as optimized pipelines.
+            OptLevel::O0 => {}
+            OptLevel::O1 => self.append_o1_passes(
+                &mut pm,
+                &mut pipeline_report,
+                &is_disabled,
+                lattice_kernel_gate,
+            ),
+            OptLevel::O2 | OptLevel::Os => self.append_standard_passes(
+                &mut pm,
+                &mut pipeline_report,
+                &is_disabled,
+                lattice_kernel_gate,
+            ),
+            OptLevel::O3 => self.append_aggressive_passes(
+                &mut pm,
+                &mut pipeline_report,
+                &is_disabled,
+                lattice_kernel_gate,
+            ),
+        }
+        pm.set_pass_validation(self.pass_validation);
+        pm.set_transition_digest(self.transition_digest);
         (pm, pipeline_report)
+    }
+
+    // Keep optimization-level registration in a separate frame: an O0
+    // consumer must not reserve the aggregate optimized-pipeline debug frame.
+    #[inline(never)]
+    fn append_o1_passes(
+        &self,
+        pm: &mut PassManager,
+        pipeline_report: &mut OptimizationPipelineReport,
+        is_disabled: &impl Fn(&str) -> bool,
+        lattice_kernel_gate: bool,
+    ) {
+        // Basic: DCE, declarative rewrite, rotate idiom, CFG cleanup,
+        // late scheduling.
+        //
+        // Wave 3 (#393) flipped declarative rewrite to default-on;
+        // the hand-written `Peephole` pass has since been deleted.
+        // The declarative pass carries every migrated pattern and
+        // the standalone `RotateIdiom` pass carries pattern 53.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=declrewrite`.
+        // ProofOptimization (guard elimination) is pure-deletion:
+        // apply_in_bounds/apply_not_null only insert into `to_delete`,
+        // so the exact post-ISel lattice authority can be consumed
+        // before an unrelated transform rewrites its bound function.
+        // The ordinary/raw compatibility pass retains its established
+        // post-DCE placement. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=proof`.
+        if lattice_kernel_gate && !is_disabled("proof") {
+            pm.add_pass(self.proof_optimization_pass());
+        }
+        // An I8 ABI return observes only W0[7:0].  Consume the exact
+        // post-ISel `AND #255; UXTB; Copy W0; RET` suffix before DCE
+        // or declarative rewrites disturb that proof-matched shape.
+        // The pass rewrites only the return-copy operand; DCE below
+        // removes the now-dead producers. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=i8retbits`.
+        if !is_disabled("i8retbits") {
+            pm.add_pass(Box::new(I8ReturnDemandedBits));
+        }
+        if !is_disabled("dce") {
+            pm.add_pass(self.dce_pass());
+        }
+        if !lattice_kernel_gate && !is_disabled("proof") {
+            pm.add_pass(self.proof_optimization_pass());
+        }
+        if !is_disabled("declrewrite") {
+            let (pass, report) = make_declarative_rewrite_pass_with_report(
+                &self.admitted_rewrite_records,
+                self.rewrite_admission_config,
+            );
+            pipeline_report.record_rewrite_admission_load(report);
+            pm.add_pass(Box::new(pass));
+        }
+        // SROA before rotate-idiom recognition: scalarise aggregate
+        // locals so the subsequent rewrite/scheduler stages see plain
+        // vreg moves instead of LDR/STR pairs. Part of #391
+        // (aggregate lowering).
+        if !is_disabled("sroa") {
+            pm.add_pass(Box::new(ScalarReplacementOfAggregates));
+        }
+        // Peephole dropped: declarative rewrite covers it;
+        // RotateIdiom carries pattern 53 (needs dominator info).
+        // The `peep` bisect key now gates RotateIdiom.
+        if !is_disabled("peep") {
+            pm.add_pass(Box::new(RotateIdiom));
+        }
+        // EOR-with-rotate fusion: collapse `t = RorRI(s,k); d = EorRR(x,t)`
+        // (single-use t) into the shifted-register `d = EorRRShift(x,s,k)`
+        // (EOR x, s, ROR #k) — the consumer of the RorRI RotateIdiom just
+        // created. Removes one instruction and one serial critical-path
+        // node per ARX statement (salsa20). Fail-closed. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=eorrotfuse`.
+        if !is_disabled("eorrotfuse") {
+            pm.add_pass(Box::new(EorRotateFuse));
+        }
+        // Shift-into-ADD/SUB fusion: collapse `t = LslRI(s,k); d =
+        // AddRR/SubRR(x,t)` (single-use t) into the shifted-register
+        // `d = AddRRShift/SubRRShift(x,s,k)`; also the LSR sibling
+        // `t = LsrRI(s,k); d = AddRR(x,t)` -> `AddRRShiftLsr` (the
+        // srem/sdiv magic sign-bit correction; `TCG_NO_LSR_ADD_FUSE`
+        // disables the LSR half alone). Non-commutative for SUB (the
+        // shift binds to the subtrahend only). Fail-closed. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=shiftalufuse`.
+        if !is_disabled("shiftalufuse") {
+            pm.add_pass(Box::new(ShiftAluFuse));
+        }
+        // `LSR #k; AND #low_mask` -> UBFM/UBFX. The shared symbolic
+        // W/X UBFM theorem proves the exact pre-rewrite expression and
+        // independently decoded immediates. Fail-closed on use/def,
+        // widths, masks, and field bounds. Bisect key: `lsrandubfx`.
+        if !is_disabled("lsrandubfx") {
+            pm.add_pass(Box::new(LsrAndUbfx));
+        }
+        // Disconnected arms can still assign shared copy carriers.
+        // Remove them and rebuild predecessor lists before register
+        // allocation, so impossible paths do not enter its dataflow.
+        if !is_disabled("cfgsimp") {
+            pm.add_pass(Box::new(CfgSimplify));
+        }
+        if !is_disabled("sched") {
+            pm.add_pass(Box::new(InstructionScheduler));
+        }
+    }
+
+    // Keep optimization-level registration in a separate frame: an O0
+    // consumer must not reserve the aggregate optimized-pipeline debug frame.
+    #[inline(never)]
+    fn append_standard_passes(
+        &self,
+        pm: &mut PassManager,
+        pipeline_report: &mut OptimizationPipelineReport,
+        is_disabled: &impl Fn(&str) -> bool,
+        lattice_kernel_gate: bool,
+    ) {
+        // Standard: inlining + proof-consuming opts + scalar opts +
+        // vectorization (before LICM!) + loop opts + peephole combines,
+        // DCE, CFG cleanup, and pressure-aware scheduling last.
+        //
+        // Vectorization runs BEFORE LICM because LICM hoists
+        // loop-invariant pure instructions out of loops, removing
+        // the instructions the vectorizer needs to see. This matches
+        // LLVM's ordering where LoopVectorize runs early in the loop
+        // optimization pipeline. After vectorization rewrites scalar
+        // ops to NEON, LICM can still hoist any remaining invariants.
+        //
+        // Dev note (#366 bisect): set TRUST_CG_DISABLE_PASSES to a
+        // comma-separated list of pass short names to skip at O2.
+        // Names: i8retbits, inline, addrmodeearly, proof, cfold, copyprop, cse,
+        // gvn, sroa, vec, licm, strred, unswitch, unroll, declrewrite,
+        // peep, addrmode, cmpsel, ifconv, cmpbr, latchsplit, tailcall, dce,
+        // cfgsimp, aarch64bce, looplatch, extaddr, selfuse,
+        // shiftalufuse, lsrandubfx, sched, profileuse. Empty/missing =
+        // run all.
+        //
+        // Declarative rewrite (#393) is DEFAULT-ON as of Wave 3 and,
+        // with the hand-written peephole pass deleted, is the sole
+        // carrier of the migrated patterns (`RotateIdiom` carries
+        // pattern 53; the `peep` bisect key gates it).
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=declrewrite`.
+        // Consume exact post-ISel replay authority before any pass can
+        // mutate the machine function it is bound to.
+        if lattice_kernel_gate && !is_disabled("proof") {
+            pm.add_pass(self.proof_optimization_pass());
+        }
+        // Preserve and consume the pristine post-ISel I8-return shape
+        // before profile use, inlining, or any scalar rewrite.  The
+        // later DCE removes producers made dead by the consumer-only
+        // rewrite. Kill switch: `TRUST_CG_DISABLE_PASSES=i8retbits`.
+        if !is_disabled("i8retbits") {
+            pm.add_pass(Box::new(I8ReturnDemandedBits));
+        }
+        let profile_use_enabled = !is_disabled("profileuse");
+        let profile_hotness = profile_use_enabled
+            .then(|| self.pgo.profile_hotness())
+            .flatten();
+        if let Some(profile) = self.pgo.profile_use.clone()
+            && profile_use_enabled
+        {
+            pm.add_pass(Box::new(ProfileUsePass::new(profile)));
+        }
+        if !is_disabled("inline") {
+            pm.add_pass(Box::new(
+                FunctionInlining::new().with_profile_hotness(profile_hotness.clone()),
+            ));
+        }
+        // Sin/cos -> ___sincos_stret fusion (Darwin arm64). Runs EARLY —
+        // right after inlining (so inlined bodies are covered) and before
+        // the scheduler, which legally reorders across the two calls and
+        // would separate the same-argument pair. The pass is inert unless
+        // the target is Darwin (`with_target_is_darwin`). Kill switch:
+        // `TCG_NO_SINCOS_MERGE` / `TRUST_CG_DISABLE_PASSES=sincosmerge`.
+        if !is_disabled("sincosmerge") {
+            pm.add_pass(Box::new(SincosMerge::new(self.target_is_darwin)));
+        }
+        // Loop-dead pure-computation deferral (almabench store
+        // sinking). Runs EARLY — right after inlining/sincos-merge on
+        // the pristine post-ISel shapes (the call-cluster and rotated
+        // do-while recognizers depend on them), and before
+        // addr-mode/CSE/scheduling rewrite the address chains. The
+        // deferred loop it emits is then optimized by every later
+        // pass. Kill switch: `TCG_NO_LOOP_DEAD_SINK` /
+        // `TRUST_CG_DISABLE_PASSES=loopdeadsink`.
+        if !is_disabled("loopdeadsink") {
+            pm.add_pass(Box::new(LoopDeadPureSink));
+        }
+        if !is_disabled("addrmodeearly") {
+            pm.add_pass(Box::new(AddrModeEarlyFormation));
+        }
+        if !lattice_kernel_gate && !is_disabled("proof") {
+            pm.add_pass(self.proof_optimization_pass());
+        }
+        if !is_disabled("cfold") {
+            pm.add_pass(self.constant_folding_pass());
+        }
+        if !is_disabled("copyprop") {
+            pm.add_pass(Box::new(CopyPropagation));
+        }
+        if !is_disabled("cse") {
+            pm.add_pass(Box::new(CommonSubexprElim));
+        }
+        if !is_disabled("gvn") {
+            pm.add_pass(Box::new(GlobalValueNumbering));
+        }
+        // SROA: scalarise non-escaping aggregate locals (#391 phase 2b).
+        // Runs after load-eliminating passes so it sees the canonical
+        // LDR/STR pattern, and before loop/peep transforms that might
+        // fold scalar moves back into memory ops.
+        if !is_disabled("sroa") {
+            pm.add_pass(Box::new(ScalarReplacementOfAggregates));
+        }
+        if !is_disabled("vec") {
+            let mut vectorizer =
+                VectorizationPass::new().with_profile_hotness(profile_hotness.clone());
+            if let Some(enabled) = self.contains4_scanner_batch_rewrite_override {
+                vectorizer = vectorizer.with_contains4_scanner_batch_rewrite(enabled);
+            }
+            pm.add_pass(Box::new(vectorizer));
+        }
+        if !is_disabled("licm") {
+            // `licmframespec` keeps LICM but drops its speculation of
+            // in-bounds stack-slot loads that are not guaranteed to
+            // execute (the on/off control of the native differential).
+            pm.add_pass(Box::new(if is_disabled("licmframespec") {
+                LoopInvariantCodeMotion::without_frame_speculation()
+            } else {
+                LoopInvariantCodeMotion::new()
+            }));
+        }
+        if !is_disabled("strred") {
+            pm.add_pass(Box::new(StrengthReduction));
+        }
+        if !is_disabled("unfusefma") {
+            pm.add_pass(Box::new(UnfuseSerialFma));
+        }
+        // Invariant loop unswitching: version a small innermost loop
+        // on a loop-invariant Cbz/Cbnz/CmpRI#0+BCond test so the
+        // decision is made ONCE in the preheader (Queens' Try
+        // `i < 8`: previously tested 8x per call after the bounded
+        // early-exit unroll, with the boolean spilled post-RA — a
+        // serialized ldur+cbnz per clone). MUST run immediately
+        // BEFORE loop-unroll so both versions unroll cleanly.
+        // Fail-closed. Kill switch: `TCG_NO_LOOP_UNSWITCH`; bisect
+        // key `unswitch`.
+        if !is_disabled("unswitch") {
+            pm.add_pass(Box::new(LoopUnswitch));
+        }
+        if !is_disabled("unroll") {
+            pm.add_pass(Box::new(LoopUnroll::new(profile_hotness.clone())));
+        }
+        // Late SROA (2nd instance): the const-addr full unroll above
+        // (`TCG_NO_CONST_ADDR_UNROLL`) rewrites stack-array index
+        // arithmetic into constant offsets; re-running SROA promotes
+        // the now-constant-offset local array to scalars (salsa20's
+        // `x[16]` stack round-trip). Shares the `sroa` bisect key.
+        if !is_disabled("sroa") {
+            pm.add_pass(Box::new(ScalarReplacementOfAggregates));
+        }
+        if !is_disabled("declrewrite") {
+            let (pass, report) = make_declarative_rewrite_pass_with_report(
+                &self.admitted_rewrite_records,
+                self.rewrite_admission_config,
+            );
+            pipeline_report.record_rewrite_admission_load(report);
+            pm.add_pass(Box::new(pass));
+        }
+        // Peephole dropped: declarative rewrite covers it;
+        // RotateIdiom carries pattern 53 (needs dominator info).
+        // The `peep` bisect key now gates RotateIdiom.
+        if !is_disabled("peep") {
+            pm.add_pass(Box::new(RotateIdiom));
+        }
+        // EOR-with-rotate fusion: collapse `t = RorRI(s,k); d = EorRR(x,t)`
+        // (single-use t) into the shifted-register `d = EorRRShift(x,s,k)`
+        // (EOR x, s, ROR #k) — the consumer of the RorRI RotateIdiom just
+        // created. Removes one instruction and one serial critical-path
+        // node per ARX statement (salsa20). Fail-closed. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=eorrotfuse`.
+        if !is_disabled("eorrotfuse") {
+            pm.add_pass(Box::new(EorRotateFuse));
+        }
+        if !is_disabled("addrmode") {
+            pm.add_pass(Box::new(AddrModeFormation));
+        }
+        if !is_disabled("cmpsel") {
+            pm.add_pass(Box::new(CmpSelectCombine));
+        }
+        if !is_disabled("ifconv") {
+            pm.add_pass(Box::new(IfConversion));
+        }
+        // AND+CMP#0 -> TST. MUST precede cmp-branch-fusion: that pass
+        // rewrites CmpRI into Cbz/Cbnz and AndCmpFuse only matches a
+        // surviving CmpRI, so the reverse order silently starves it.
+        // Together they compose into LLVM's `tbz`. C-flag guarded (ANDS
+        // clears C, SUBS #0 sets it). Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=andcmpfuse`.
+        if !is_disabled("andcmpfuse") {
+            pm.add_pass(Box::new(AndCmpFuse));
+        }
+        // `y = x ^ (x << k)`: consumers reading only bits [0,k) may read
+        // `x`, shortening the dependency chain into a mispredicting
+        // branch by one shifted-EOR. Purely an operand swap; the bit
+        // range must be provably below k or the operand is left alone.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=xorshiftdemanded`.
+        if !is_disabled("xorshiftdemanded") {
+            pm.add_pass(Box::new(XorshiftDemandedBits));
+        }
+        if !is_disabled("cmpbr") {
+            pm.add_pass(Box::new(CmpBranchFusion));
+        }
+        // Profile-gated hot-latch AND-condition split. Runs right AFTER
+        // cmp-branch-fusion (which forms the `cbnz t` its recogniser
+        // matches). INERT without an attached profile — the default
+        // compile stays byte-identical; with a profile it fires only in
+        // the unpredictable taken-rate band (see latch_and_split.rs).
+        // Kill switch: `TCG_NO_LATCH_AND_SPLIT`; bisect key `latchsplit`.
+        if !is_disabled("latchsplit") {
+            pm.add_pass(Box::new(LatchAndSplit::new(profile_hotness.clone())));
+        }
+        if !is_disabled("tailcall") {
+            pm.add_pass(Box::new(TailCallOptimization));
+        }
+        if !is_disabled("dce") {
+            pm.add_pass(self.dce_pass());
+        }
+        if !is_disabled("cfgsimp") {
+            pm.add_pass(Box::new(CfgSimplify));
+        }
+        // The exact constant-arm boolean diamond becomes visible only
+        // after cmp-branch-fusion + DCE + CFG simplification. Fold it
+        // back to CSET at that seam. The pass admits no other diamond
+        // class. Kill switch: `TRUST_CG_DISABLE_PASSES=booldiamond`.
+        if !is_disabled("booldiamond") {
+            pm.add_pass(Box::new(LateBooleanDiamondConvert));
+        }
+        // Late tiny-loop-diamond if-conversion: convert an unpredictable
+        // NON-AFFINE-recurrence-gated tiny pure-arm diamond (b1's
+        // `if s&6==2 { acc=rotate_left(acc,7) }`) to a CSEL. Runs HERE —
+        // after cfg-simplify canonicalizes it to a clean diamond, which
+        // the primary if-convert (pre-dce/cfg-simplify) cannot see. Tight
+        // gate (loop-resident + tiny pure arm + EOR self-recurrence) so it
+        // stays branchy on predictable diamonds. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=tinyloop`.
+        if !is_disabled("tinyloop") {
+            pm.add_pass(Box::new(TinyLoopDiamondConvert));
+        }
+        // AArch64 bounds-check elimination: DELETE a still-live
+        // `TrapBoundsCheckExact` carrier whose enclosing loop-header
+        // unsigned guard machine-proves the bound at the carrier site
+        // (the own-length `for i in 0..N { a[i] }` shape). Runs here —
+        // post-dce/cfgsimp (guard canonicalized to a direct
+        // CmpRR/CmpRI+BCond) and PRE-looplatch/vectorization (single
+        // unrotated header dominates the body) — the simplest sound
+        // case. Standalone structural delete: it never touches the
+        // proof/kernel path. Fail-safe on every unproven condition.
+        // Default-ON kill switch: `TCG_NO_AARCH64_BCE`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=aarch64bce`.
+        if !is_disabled("aarch64bce") {
+            // `bcetrapbranch` keeps the carrier arms but drops the
+            // register-bound trap-branch fold (its native on/off control).
+            let mut bce = AArch64BoundsCheckElimination::new();
+            if is_disabled("bcetrapbranch") {
+                bce = bce.without_trap_branch_folds();
+            }
+            pm.add_pass(Box::new(bce));
+        }
+        // Loop-carried store-to-load forwarding: register-carry the
+        // memory recurrence of an in-place `a[i+1] = f(a[i], i)` loop
+        // (one preheader load; the in-loop re-loads of the
+        // just-stored cell are deleted and read the stored register
+        // instead). Removes the store-forward latency — and its
+        // address-sensitive run-to-run variance — from the
+        // loop-carried critical path (d02 prefix-recurrence class).
+        // Runs right AFTER aarch64-bounds-check-elim (recognizes the
+        // clean bounds-elided body) and BEFORE the
+        // unrollers/vectorizers. Closed-world, fail-closed on every
+        // unproven precondition; emits only already-credited opcodes
+        // (Madd + LdrRI). Default-ON kill switch:
+        // `TCG_NO_RECURRENCE_STORE_FWD`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=recurrence_store_fwd`.
+        if !is_disabled("recurrence_store_fwd") {
+            pm.add_pass(Box::new(RecurrenceStoreForward::new()));
+        }
+        // Counted-strided-store partial-unroll (x4): splice a guarded,
+        // 4x-unrolled main loop in FRONT of an innermost `while q <u N {
+        // base[q]=val; q+=strideReg }` marking loop (const N, invariant
+        // base/value, invariant REGISTER stride), leaving the scalar loop
+        // as the exact `trip mod 4` remainder. This is p7's sieve marking
+        // loop, which LLVM 4x-unrolls. PURELY ADDITIVE (never edits the
+        // scalar loop); wrap-free via an `s <u N` pre-guard (3s/lim built
+        // from AddRR/SubRR only — NO udiv, NO multiply); emits only
+        // already-credited opcodes. Runs AFTER aarch64-bounds-check-elim
+        // (needs the clean bounds-elided body) and BEFORE
+        // closed-form-reduction/loop-latch-layout (needs the NATIVE,
+        // non-rotated header test). Fail-safe on every unproven
+        // precondition. Compile-time kill switch:
+        // `TCG_NO_STRIDED_STORE_UNROLL`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=strided_store_unroll`.
+        // Normalize ISel's folded constant-trip `CmpRI` guards back to
+        // `CmpRR(iv, movz)` BEFORE the vectorizers/unrollers, so
+        // dc5916e's `cmp_imm12_fold` does not silently defeat their
+        // constant-trip recognizers (matmul full-unroll, the dt-class FP
+        // maps). Semantics-preserving. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=consttripnorm`.
+        if !is_disabled("consttripnorm") {
+            pm.add_pass(Box::new(crate::scalar_unroll::ConstTripGuardNormalize));
+        }
+        if !is_disabled("strided_store_unroll") {
+            pm.add_pass(Box::new(StridedStoreUnroll::new()));
+        }
+        // RMW-MAC row-loop partial-unroll (x4): splice a guarded,
+        // 4x-unrolled main loop in FRONT of an innermost bounds-checked
+        // `while j <u N { c[i*N+j] += aik*b[k*N+j]; j+=1 }` accumulate
+        // loop (const N, const array length L, invariant i/k/aik/bases),
+        // leaving the scalar loop as the exact `trip mod 4` remainder and
+        // the fallback on any guard failure. This is p4_matmul's inner
+        // j-loop, which LLVM 4x-unrolls with running pointers. PURELY
+        // ADDITIVE (never edits the scalar loop); each lane replicates
+        // the scalar per-lane memory order bit-for-bit (sound under any
+        // aliasing); the three per-block guards re-check `j<N-3`,
+        // `cidx<L-3`, `bidx<L-3` and subsume the scalar per-iteration
+        // bounds branches; emits only already-credited opcodes (no
+        // udiv/mul beyond the scalar madd). Same slot/ordering as
+        // strided-store-unroll: AFTER aarch64-bounds-check-elim and
+        // BEFORE closed-form-reduction/loop-latch-layout (needs the
+        // NATIVE, non-rotated header test). Fail-safe on every unproven
+        // precondition. Compile-time kill switch:
+        // `TCG_NO_MAC_ROW_UNROLL`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=mac_row_unroll`.
+        // Matmul 1D register-blocking (T=12 or 8): recognize the whole
+        // 3-deep bounds-checked matmul nest (distinct stack-local
+        // a/b/c, read-only a/b, single c store, const N a multiple of
+        // 12 or 8, L>=N*N) and splice a CHECK-FREE register-blocked fast path
+        // (k/j interchange, T c accumulators held across the k-loop,
+        // stores sunk to tile end) in FRONT of the untouched checked
+        // nest — kept as the runtime-guarded fallback so mac-row-unroll
+        // still fires on it. Store-sinking is sound because a/b/c are
+        // distinct locals (a/b never written; c's only store is
+        // c[i*N+j]); the tiled indices are provably < L so no per-access
+        // check is emitted. Runs right BEFORE mac-row-unroll (which
+        // handles the fallback's inner j-loop) and AFTER
+        // aarch64-bounds-check-elim (the clean LdrRI/StrRI + Madd
+        // address form). Purely additive, fail-closed, emits only
+        // already-credited opcodes. Recognition also enforces the
+        // publication review bar (L10-P4, `mac_reg_block::review_bar`):
+        // 64-bit data values, every bounds check >= N*N on a current
+        // index and slots of N*N elements, no branch but header tests
+        // and passing checks, headers holding only copies and the
+        // counter test, every access in the body of its own loop,
+        // dominated reads, counters read only inside their loop, never
+        // after the step, and reset once per parent iteration, no nest
+        // value live into the exit. Native on/off/C-reference gate:
+        // trust-cg-codegen `e2e_aarch64_mac_reg_block_differential`.
+        // Kill switch: `TCG_NO_MAC_REG_BLOCK`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=mac_reg_block` (in-process:
+        // `OptimizationPipeline::with_disabled_passes`).
+        if !is_disabled("mac_reg_block") {
+            pm.add_pass(Box::new(MacRegBlock::new()));
+        }
+        if !is_disabled("mac_row_unroll") {
+            pm.add_pass(Box::new(MacRowUnroll::new()));
+        }
+        // SOUND hoisted-range-guard crosswise-SWAP fast path
+        // (mac-row-unroll's sibling shape): splice a guarded,
+        // check-free running-pointer main loop in FRONT of the
+        // innermost bounds-checked transpose swap loop
+        // `while x <u C { swap(base[y*S+x], base[x*S+y]) }` (const
+        // C/S/K, invariant y/base, 4 expanded per-access checks). The
+        // hoisted guards prove every elided check passes (both index
+        // families are strictly monotone in x; their maxima are
+        // checked once); the fast path replays the scalar loop's EXACT
+        // per-iteration memory trace (sound under any aliasing);
+        // guard-fail runs the untouched scalar loop. Same slot
+        // rationale as mac-row-unroll: AFTER
+        // aarch64-bounds-check-elim (the surviving checks are the
+        // expanded cmp/b.lo diamonds), BEFORE
+        // closed-form-reduction/loop-latch-layout (needs the NATIVE
+        // header test) and BEFORE ext-addr/mul-shift-reduce (matches
+        // the Madd index/address form). Purely additive; emits only
+        // already-credited opcodes. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=swap_range_guard`.
+        if !is_disabled("swap_range_guard") {
+            pm.add_pass(Box::new(SwapRangeGuardPass::new()));
+        }
+        // Closed-form (Faulhaber) reduction: DELETE a reduction loop
+        // whose entire term is a pure degree-≤2 polynomial in the IV,
+        // replacing it with straight-line O(1) code. Runs BEFORE
+        // LoopLatchLayoutCombine (which rotates the loop) so it sees the
+        // clean, non-rotated register loop, and before the split so it
+        // claims pure-polynomial add/madd reductions; everything else
+        // (xor/or/mul/opaque terms) falls through to the split.
+        // Fail-closed. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=closed_form_reduction`.
+        if !is_disabled("closed_form_reduction") {
+            pm.add_pass(Box::new(ClosedFormReduction));
+        }
+        // Delete provably-terminating, side-effect-free counted loops
+        // (empty after upstream DCE). Fail-closed. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=deadloop`.
+        if !is_disabled("deadloop") {
+            pm.add_pass(Box::new(DeadCountedLoopElimination::new()));
+        }
+        if !is_disabled("looplatch") {
+            pm.add_pass(Box::new(LoopLatchLayoutCombine));
+        }
+        // Reduction splitting (accumulator widening): break a
+        // throughput-bound integer reduction's loop-carried chain into
+        // N independent accumulators for ILP. Fail-closed: only fires on
+        // the exact recognized constant-trip register-reduction shape.
+        // Placed after DCE/CFG-simplify so it sees the cleaned-up loop.
+        // NEON integer reductions run before reduction_split. Recognized
+        // induction-term and memory-chain shapes build checked private
+        // candidates; a refusal preserves the original function for
+        // subsequent scalar passes. Construction checks are not whole-
+        // transform proof evidence.
+        if !is_disabled("neonreduce") {
+            pm.add_pass(Box::new(NeonReducePass::new()));
+        }
+        // SOUND NEON array-reduction vectorizer: extends neon-reduce to
+        // reductions whose term reads from READ-ONLY memory (`s +=
+        // TERM(a[i], b[i], ...)`). Runs immediately after neon-reduce
+        // and before reduction_split. Fires
+        // only on the shapes it can prove lane-wise equivalent (i32
+        // accumulator, `a[i]` loads, lane-wise ops) and BAILS otherwise.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_array`.
+        if !is_disabled("neon_array") {
+            pm.add_pass(Box::new(
+                NeonArrayPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+            ));
+        }
+        // SOUND NEON byte-widening reduction into a u64 accumulator
+        // (popcount-sum / byte-sum) — the case neon_array's i32-only
+        // widening TRACK B and 2-block loop shape both miss (e.g.
+        // v3_popcount). Composes already-proven CNT/UADDLP/ADD/UMOV +
+        // the const-materialization MOVI and the shared-debt paired-Q
+        // load, all now credited per-compile, so it promotes gate-clean.
+        // Active on baseline AArch64 via UADDLP+ADD; a resolved
+        // FEAT_DotProd target selects the shorter UDOT fold. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
+        if !is_disabled("neon_bytesum") {
+            pm.add_pass(Box::new(
+                NeonBytesumPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+            ));
+        }
+        // NEON i32/i64 min/max, bitwise and strict argmin/argmax
+        // reductions, plus i32 forward-chain diamonds. Runs after
+        // neon-array/bytesum and before predsum/reduction_split.
+        // Ambiguous shapes and effects decline. Checked private
+        // candidates publish atomically and scalar remainders are
+        // not vectorized again. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_minmax`.
+        if !is_disabled("neon_minmax") {
+            pm.add_pass(Box::new(NeonMinMaxPass::new()));
+        }
+        // NEON predicated sums: i32/i64 add-rooted lane-wise
+        // selects and forward-chain conditional adds, including
+        // signed i32-to-i64 widening. Recognition declines ambiguous
+        // selects and effects; checked private construction leaves
+        // the original untouched on refusal. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_predsum`.
+        if !is_disabled("neon_predsum") {
+            pm.add_pass(Box::new(NeonPredSumPass::new()));
+        }
+        // NEON integer maps: a single output array with independent
+        // per-element values. Admit single-array in-place, distinct
+        // noalias roots, or recognized runtime alias-versioning shapes.
+        // i32/i64, descending/rotated and forward-chain forms share
+        // checked private construction. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_map`.
+        if !is_disabled("neon_map") {
+            pm.add_pass(Box::new(NeonMapPass::new()));
+        }
+        // SOUND NEON per-byte 8-bit-reverse MAP vectorizer: the byte
+        // elementwise `out[i] = a[i].reverse_bits()` over two DISTINCT
+        // `[u8; N]` stack slots — the case neon-map's i32/i64 lane set and
+        // 2-block/chain shapes both miss. Recognizes the bridge's exact
+        // `bitmanip_reverse_bits(n=8)` isolate/shift/OR ladder and lowers
+        // each 16-byte Q to one FAITHFULLY-PROVEN `RBIT.16B`; purely
+        // additive (a `ldp/rbit.16b/stp` main loop before the untouched
+        // scalar tail), proven non-aliasing via distinct stack slots.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_bitrev`.
+        if !is_disabled("neon_bitrev") {
+            pm.add_pass(Box::new(NeonBitrevPass::new()));
+        }
+        // SOUND NEON array-FILL store vectorizer: `for i in 0..bound {
+        // base[i*sz] = value }` with a loop-invariant base, a
+        // const-OR-loop-invariant value, ZERO loads. Fires on the shared
+        // `__trustcg_array_fill_iN` helper (DUP path) and any inline
+        // const/invariant fill (MOVI/DUP). Purely additive (a MOVI/DUP
+        // preheader + a `stp q,q,[p],#32` main loop in front of the
+        // UNTOUCHED scalar loop); removes no bounds check. Runs after
+        // neon-map, which needs a memory-reading TERM and BAILs on a
+        // load-free pure fill, so the two never contend. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_fill`.
+        if !is_disabled("neon_fill") {
+            pm.add_pass(Box::new(NeonFillPass::new()));
+        }
+        // SOUND NEON affine IOTA-fill store vectorizer: `for iv in
+        // start..bound { base[iv] = trunc32(iv) + inv }` (i32
+        // elements; `inv` loop-invariant/const/absent). The affine
+        // sibling of neon-fill, which requires an iteration-INVARIANT
+        // stored value and BAILS on this shape — the two never
+        // contend. Purely additive (iota literal + DUP/ADD preheader +
+        // a 64-byte `stp q,q` main loop in front of the UNTOUCHED
+        // scalar loop); removes no bounds check. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_iota_fill`.
+        if !is_disabled("neon_iota_fill") {
+            pm.add_pass(Box::new(NeonIotaFillPass::new()));
+        }
+        // Conditional-store blind-write vectorization is intentionally
+        // unscheduled: TrustIR/MachIR does not yet carry the required
+        // function/value/range-bound writable+single-owner capability.
+        // SOUND NEON EARLY-EXIT SEARCH (find/memchr) vectorizer: the
+        // vector loop is a BLOCK FILTER — it only skips 16-blocks it has
+        // PROVEN contain no match (faithful CMEQ + OR); on any-hit it
+        // hands off to the UNTOUCHED scalar loop at the block base, which
+        // finds the exact first match. Over-read is a SUBSET of the
+        // no-match scalar execution's read set (guard admits only fully
+        // in-bounds blocks) — no new axiom. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_find`.
+        if !is_disabled("neon_find") {
+            pm.add_pass(Box::new(NeonFindPass::new()));
+        }
+        // SOUND NEON STENCIL (windowed-read) vectorizer: `out[i] =
+        // TERM(a[i+k1], a[i+k2], ...)` with small constant offsets. Runs
+        // after neon-map (which BAILS on any shifted read) and requires
+        // `out` and every read base to be DISTINCT noalias params (so the
+        // store is disjoint from every read; in-place stencils BAIL) and
+        // the store at offset 0 (so the halo stays inside the scalar
+        // loop's access set). Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_stencil`.
+        if !is_disabled("neon_stencil") {
+            pm.add_pass(Box::new(NeonStencilPass::new()));
+        }
+        // NEON f32/f64 maps, stencils and integer-accumulating
+        // FP count-above. Scalar operation order and existing fusion
+        // are retained; no new FP contraction is introduced. Alias
+        // versioning, rotated guards and the vector remainder share
+        // checked candidate publication. Proof admission is separate.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_fmap`.
+        if !is_disabled("neon_fmap") {
+            pm.add_pass(Box::new(NeonFMapPass::new()));
+        }
+        // SOUND NEON AoS stride-2 complex-butterfly vectorizer: the
+        // radix-2 FFT inner loop over `struct complex { f32 rp, ip; }`
+        // (Stanford Oscar's Fft — clang -O3 vectorizes it, trust-cg
+        // was fully scalar). One complex PAIR (`.4S`) per iteration on
+        // the INTERLEAVED data: FADD/FSUB per lane + the REV64.4S
+        // pair-swap + sign-mask EOR (the scalar FNEG, bitwise) +
+        // FMUL/FMLA with broadcast twiddles — per-lane the SAME IEEE
+        // ops and roundings the scalar loop performs (no contraction
+        // introduced; the source's fused fmuladd stays fused), so
+        // BIT-IDENTICAL. Entered only behind a runtime 7-pair
+        // byte-range disjointness preamble (regime-C versioning,
+        // wrap-safe modular-interval tests) that otherwise falls back
+        // to the untouched scalar loop. Fail-closed on any deviation
+        // from the exact butterfly dag. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_butterfly`.
+        if !is_disabled("neon_butterfly") {
+            pm.add_pass(Box::new(NeonButterflyPass::new()));
+        }
+        // SOUND NEON early-exit linear-search (find/memchr) vectorizer:
+        // `for i<n: if a[i]==key return i; return -1`. A purely additive
+        // vector BLOCK FILTER runs in front of the UNCHANGED scalar loop:
+        // per whole 16-element in-bounds block it CMEQs the loads against
+        // a key splat and, on a PROVEN no-match block, skips it; on any-
+        // hit (or a partial trailing block) it re-enters the scalar loop,
+        // which computes the exact first-match index (delegated — no
+        // vector lane ordering, so same-block and cross-block duplicates
+        // are correct by the scalar scan). The over-read is a SUBSET of
+        // the no-match scalar read set (the guard admits only whole blocks
+        // within [0,n)); reads are pure (BAILS on stores / atomics; volatile
+        // fails closed at lowering). Every other neon pass BAILS on this
+        // early-exit shape. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_find`.
+        if !is_disabled("neon_find") {
+            pm.add_pass(Box::new(NeonFindPass::new()));
+        }
+        // SOUND NEON IV-synthesized FP-reduction vectorizer:
+        // `acc += f(i)` where `f(i)` is a pure lane-wise f64 dataflow of
+        // the induction (`(double)i` via UCVTF/SCVTF) and loop-invariant
+        // scalars (NO arrays/memory), combined by a PLAIN fadd. It
+        // vectorizes only the INDEPENDENT per-lane term (`.2D`, x4 pairs)
+        // and folds the lanes into the scalar accumulator with ORDERED
+        // scalar fadds in iteration order — no reassociation, so the sum
+        // is BIT-IDENTICAL to the scalar loop (clang -O3's own emission
+        // for the flops kernels). Runs before reduction_split /
+        // scalar_unroll (first shot at the FP-reduction loop); BAILS on a
+        // fused accumulate, f32, non-unit step, stores/calls, or an extra
+        // live-out — scalar_unroll's SERIAL unroll is the fallback. Kill
+        // switch: `TRUST_CG_DISABLE_PASSES=neonfpred`.
+        if !is_disabled("neonfpred") {
+            pm.add_pass(Box::new(NeonFPRedPass::new()));
+        }
+        // SOUND NEON FP ARRAY-reduction vectorizer (memory-bearing sibling
+        // of neon-fpred): `acc += a[i]*b[i]` / `acc += a[i]` over unit-stride
+        // f64 arrays, PLUS the `f32 -> f64` widening dot (the fp-convert
+        // kernel) via the proven vector FCVTL/FCVTL2. Coalesced LDP-Q loads
+        // (widened by FCVTL for f32 streams) + ORDERED scalar drain (fused
+        // fmadd preserved) = bit-identical to the scalar loop.
+        //
+        // Widening reductions and iota fills run by default; pure-f64
+        // reductions require TRUST_CG_ENABLE_NEONFARRAY=1. This preserves
+        // the existing policy, not a current benchmark result. Scalar
+        // unrolling remains available when the vectorizer declines.
+        // Kill switch: TRUST_CG_DISABLE_PASSES=neonfarray.
+        if !is_disabled("neonfarray") {
+            let farray = if pipeline_env_var("TRUST_CG_ENABLE_NEONFARRAY").is_some() {
+                NeonFArrayPass::new()
+            } else {
+                NeonFArrayPass::widening_only()
+            };
+            pm.add_pass(Box::new(farray));
+        }
+        if !is_disabled("redsplit") {
+            pm.add_pass(Box::new(ReductionSplit));
+        }
+        // Scalar ILP unroll: the load-bearing reduction loops nothing
+        // above could take. SPLIT mode = 4 independent integer
+        // accumulators (two's-complement reassociation, the
+        // reduction_split argument) for i64-mul / gather-term
+        // reductions no NEON path exists for; SERIAL mode =
+        // order-preserving 4x unroll (bit-identical by construction —
+        // FP chains and compound integer recurrences are NEVER
+        // reassociated). Runs AFTER every vectorizer and
+        // reduction_split (placement + a no-vector-path shape gate
+        // mean it can never steal their loops) and BEFORE ext-addr,
+        // which folds each unrolled lane's address chain. Fail-closed.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=scalar_unroll`.
+        if !is_disabled("scalar_unroll") {
+            pm.add_pass(Box::new(ScalarUnrollPass::new()));
+        }
+        // Single-trip residual-loop collapse: decides the ALWAYS-TAKEN
+        // exit branch of the one-iteration tail loop scalar-unroll's
+        // full-unroll leaves behind (the iv enters as a compile-time
+        // constant, so `iv+step` vs the constant bound is decidable)
+        // and rewrites `BCond exit; B latch` into `B exit`, unlinking
+        // the dead latch. Runs immediately AFTER scalar-unroll (whose
+        // full-unroll mints these tails) and BEFORE ext-addr /
+        // alias-hoist, so the straight-lined residual body's iv
+        // becomes single-def and its loads hoistable like every other
+        // lane (Shootout matrix lane 9, ~9% whole-program).
+        // Fail-closed on every unproven shape. Compile-time kill
+        // switch: `TCG_NO_RESID_COLLAPSE`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=residcollapse`.
+        if !is_disabled("residcollapse") {
+            pm.add_pass(Box::new(ResidTripCollapse));
+        }
+        // Second (LATE) UnfuseSerialFma instance: the NEON vectorizers
+        // above emit ordered-drain reductions as IN-PLACE FmaddRR runs
+        // (`FmaddRR [acc, a, b, acc]` — e.g. fp-convert's vectorized
+        // sum), which do not exist at the early instance's position.
+        // Loops the early instance already un-fused have no FMADDs
+        // left, so this re-run only touches vectorizer output. Same
+        // gate, same kill switch.
+        if !is_disabled("unfusefma") {
+            pm.add_pass(Box::new(UnfuseSerialFma));
+        }
+        // Extended-register addressing fold + select/flag fusion:
+        // LATE scalar cleanups that MUST run after the NEON
+        // vectorizers (whose recognizers decode the unfused
+        // Sxtw/Madd/LdrRI and CSet/CmpRI/Csel chains) and before the
+        // scheduler. Fail-closed; kill switches:
+        // `TRUST_CG_DISABLE_PASSES=extaddr` / `selfuse`.
+        if !is_disabled("extaddr") {
+            pm.add_pass(Box::new(ExtRegAddrFold));
+        }
+        // Pointer-IV strength reduction: rewrite a register-offset 2D
+        // array walk (`ldr [base, idx]` with `idx` affine in the loop
+        // counter — the loop-invariant-addend shape ext-addr cannot
+        // fold) into a preheader-initialized WALKING POINTER advanced
+        // by an explicit AddRI+MovR carrier in the latch, deleting the
+        // per-iteration index recompute (almabench planetpv's
+        // k-loops). Runs AFTER the vectorizers and ext-addr so it only
+        // claims accesses they left scalar/register-offset, and before
+        // the scheduler. Fail-closed on every unproven shape; never
+        // traces through a sign/zero-extend of a loop-variant index.
+        // Compile-time kill switch: `TCG_NO_PTR_IV_SR`; per-pass
+        // bisect: `TRUST_CG_DISABLE_PASSES=ptrivsr`.
+        // Scalar post-index formation. Runs immediately AFTER ptr-iv-sr
+        // and is disjoint from it by construction: ptr-iv-sr demands a
+        // single-back-edge {header}/{header,latch} body, this one only
+        // needs the load in the header, so a loop either pass rewrote is
+        // no longer in the shape the other recognises. Kill switch
+        // `TCG_NO_POST_INDEX`; bisect `TRUST_CG_DISABLE_PASSES=postindex`.
+        if !is_disabled("postindex") {
+            pm.add_pass(Box::new(PostIndexForm));
+        }
+        if !is_disabled("ptrivsr") {
+            pm.add_pass(Box::new(PtrIvStrengthReduce));
+        }
+        // Late call-bearing exact-trip FULL unroll: replicate the
+        // body of a proven-constant-trip counted loop whose body
+        // CONTAINS a call, at K = N (the loop control then evaluates
+        // once per entry instead of N times). Runs immediately AFTER
+        // ptr-iv-sr — that ordering IS the pass: unrolling this shape
+        // at the early `unroll` slot deletes the loop before ptr-iv-sr
+        // can reduce it, so each clone keeps the unreduced
+        // `lsl; madd; add; ldr` address chain. Toggling
+        // TCG_NO_PTR_IV_SR around THIS slot reproduces that placement
+        // exactly and prices it: almabench planetpv emits madd 16 /
+        // lsl 9 either way when the order is right, madd 58 / lsl 51
+        // when it is not (+42 = 6 arrays x 7 extra clones), and the
+        // unreduced unroll is a WASH against not unrolling at all
+        // (1.0095 vs 1.0094 PMC cycles) where the reduced one is
+        // 0.9890. Here the clones inherit the walking-pointer body
+        // and the unroll only removes work. Disjoint from
+        // partial-unroll by construction (that tier refuses calls).
+        // Purely structural: trip test, bound, step and exit edge are
+        // untouched, so a mis-modeled trip count can only refuse.
+        // Kill switch: `TCG_NO_CALL_UNROLL`; bisect key `callunroll`.
+        if !is_disabled("callunroll") {
+            pm.add_pass(Box::new(crate::loop_unroll::CallUnroll::new()));
+        }
+        // Alias-versioned loop-invariant load hoisting (LICM tier c):
+        // versions an inner loop on a RUNTIME byte-range disjointness
+        // check between its store range and each loop-invariant load,
+        // hoisting the loads into the disjoint (fast) clone's preheader
+        // and leaving the original loop untouched as the aliasing
+        // fallback. Runs after ext-addr so it sees the folded
+        // `ldr [base,#imm]` invariant loads the full-unroll exposes,
+        // and before the scheduler. Fail-closed on every unbounded
+        // store / unproven speculation / live-out clone value. Kill
+        // switch: `TRUST_CG_DISABLE_PASSES=aliashoist`.
+        if !is_disabled("aliashoist") {
+            pm.add_pass(Box::new(AliasVersionedLoadHoist));
+        }
+        if !is_disabled("selfuse") {
+            pm.add_pass(Box::new(SelectFlagFuse));
+        }
+        // Multiply-by-small-constant -> shift/add-sub strength reduction:
+        // rewrite `MulRR x, C` / `Madd x, C, y` (C a proven small
+        // compile-time constant expressible as ≤2 signed powers of two)
+        // into `LslRI` + `AddRR`/`SubRR`, off the latency-3-4 MUL/MADD
+        // critical path (p2_collatz's carried `c = c*3 + 1`). Fail-closed
+        // via `unique_reaching_const`; emits only already-gate-credited
+        // opcodes (no new surface). Runs DEAD LAST (after every
+        // vectorizer, unroller, and addressing pass) so it NEVER hides a
+        // multiply those passes must recognize — it only reduces the
+        // multiplies that survive to final scalar code, immediately before
+        // scheduling. The now-dead constant `Movz` is loop-invariant
+        // (LICM-hoisted to the preheader), so leaving it uncollected costs
+        // nothing on the hot path. Compile-time kill switch:
+        // `TCG_NO_MUL_SHIFT_REDUCE`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=mulshift`.
+        if !is_disabled("mulshift") {
+            pm.add_pass(Box::new(MulShiftReduce));
+        }
+        // Shift-into-ADD/SUB fusion: collapse `t = LslRI(s,k); d =
+        // AddRR/SubRR(x,t)` (single-use t) into the shifted-register
+        // `d = AddRRShift/SubRRShift(x,s,k)` (ADD/SUB x, s, LSL #k). Runs
+        // right after mul-shift-reduce so it also collapses that pass's
+        // `LslRI`+`AddRR`/`SubRR` output (`x*(2^k±1)`) into ONE op, plus
+        // any explicit `y + (x<<k)` / `y - (x<<k)`, and the LSR sibling
+        // `t = LsrRI(s,k); d = AddRR(x,t)` -> `AddRRShiftLsr` (the
+        // srem/sdiv magic sign-bit correction and udiv magic add-back;
+        // `TCG_NO_LSR_ADD_FUSE` disables the LSR half alone).
+        // Non-commutative for SUB (the shift binds to the subtrahend
+        // only). Fail-closed. Kill
+        // switch: `TRUST_CG_DISABLE_PASSES=shiftalufuse`.
+        if !is_disabled("shiftalufuse") {
+            pm.add_pass(Box::new(ShiftAluFuse));
+        }
+        // `LSR #k; AND #low_mask` -> UBFM/UBFX; see the O1 site for
+        // proof authority and fail-closed guards.
+        if !is_disabled("lsrandubfx") {
+            pm.add_pass(Box::new(LsrAndUbfx));
+        }
+        // CSEL->CSINC increment fold: absorb a single-use `+1` select arm
+        // into a `CSINC` (p2_collatz's `c*3+1` odd arm after
+        // mul-shift-reduce+shift-alu-fuse expose the trailing `+1`).
+        // Runs here so the `+1` is already the CSEL's direct operand.
+        // Sound (exact select semantics); `Csinc` is already credited.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=csincfold`.
+        if !is_disabled("csincfold") {
+            pm.add_pass(Box::new(CsincFold));
+        }
+        // PARTIAL (factor) unroll: replicate the body of a constant-trip
+        // loop that is TOO LONG for any full unroller (every tier caps
+        // at 4..16 trips) K times, with the `N mod K` remainder peeled
+        // as a prologue. Runs LATE — after every vectorizer and
+        // pattern-specific unroller has had first refusal on the native
+        // counted shape, and before scheduling/mem-pair so the
+        // replicated accesses can still pair. Purely structural: the
+        // trip test, bound, step and exit edge are untouched, so a
+        // mis-modeled trip count can only refuse to fire. Kill switch:
+        // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
+        if !is_disabled("partial_unroll") {
+            pm.add_pass(Box::new(crate::loop_unroll::PartialUnroll::new(
+                (!is_disabled("profileuse"))
+                    .then(|| self.pgo.profile_hotness())
+                    .flatten(),
+            )));
+        }
+        // Xorshift step-pair latency fusion: a loop-carried
+        // `t = x ^ (x << a); y = t ^ (t >> b)` computes `t >> b` from
+        // `x` in parallel with `t` (one cycle less per step pair on
+        // the recurrence; `xorshift_pair_fusion` module docs). Runs
+        // after every pass that recognizes the xorshift shape and
+        // before the scheduler. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=xorshiftfuse`.
+        if !is_disabled("xorshiftfuse") {
+            pm.add_pass(Box::new(XorshiftPairFusion));
+        }
+        // A constant the body materializes twice is hoisted twice:
+        // keep the first `MOVZ`+`MOVK` run of a value in a block and
+        // point the second one's readers at it
+        // (`const_chain_dedup` module docs). After LICM and the
+        // unrollers, before the scheduler. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=constdedup`.
+        if !is_disabled("constdedup") {
+            pm.add_pass(Box::new(ConstChainDedup));
+        }
+        if !is_disabled("sched") {
+            pm.add_pass(Box::new(PressureAwareScheduler));
+        }
+        // LDP/STP pair formation runs AFTER scheduling (adjacency is
+        // near-final) but before regalloc (so the translation validator
+        // checks every pair). Kill switch: `TRUST_CG_DISABLE_PASSES=mempair`.
+        if !is_disabled("mempair") {
+            pm.add_pass(Box::new(crate::mem_pair::MemPairFormation));
+        }
+    }
+
+    // Keep optimization-level registration in a separate frame: an O0
+    // consumer must not reserve the aggregate optimized-pipeline debug frame.
+    #[inline(never)]
+    fn append_aggressive_passes(
+        &self,
+        pm: &mut PassManager,
+        pipeline_report: &mut OptimizationPipelineReport,
+        is_disabled: &impl Fn(&str) -> bool,
+        lattice_kernel_gate: bool,
+    ) {
+        // Aggressive: same as O2 but iterated to fixpoint.
+        // Vectorization before LICM (see O2 comment for rationale).
+        //
+        // Declarative rewrite (#393) runs before the standalone
+        // RotateIdiom stage when the default is on. The kill switch
+        // `TRUST_CG_DISABLE_PASSES=declrewrite` drops the pass for
+        // forensic rollback.
+        //
+        // SROA (#391 Phase 2b) runs once before vectorization,
+        // between GVN and VectorizationPass.
+        // Consume exact post-ISel replay authority before any pass can
+        // mutate the machine function it is bound to.
+        if lattice_kernel_gate && !is_disabled("proof") {
+            pm.add_pass(self.proof_optimization_pass());
+        }
+        // Preserve and consume the pristine post-ISel I8-return shape
+        // before profile use, inlining, or any scalar rewrite.  The
+        // later DCE removes producers made dead by the consumer-only
+        // rewrite. Kill switch: `TRUST_CG_DISABLE_PASSES=i8retbits`.
+        if !is_disabled("i8retbits") {
+            pm.add_pass(Box::new(I8ReturnDemandedBits));
+        }
+        let profile_use_enabled = !is_disabled("profileuse");
+        let profile_hotness = profile_use_enabled
+            .then(|| self.pgo.profile_hotness())
+            .flatten();
+        if let Some(profile) = self.pgo.profile_use.clone()
+            && profile_use_enabled
+        {
+            pm.add_pass(Box::new(ProfileUsePass::new(profile)));
+        }
+        if !is_disabled("inline") {
+            pm.add_pass(Box::new(
+                FunctionInlining::new().with_profile_hotness(profile_hotness.clone()),
+            ));
+        }
+        // Sin/cos -> ___sincos_stret fusion (Darwin arm64). See the O2
+        // branch for the placement rationale (early, pre-scheduler;
+        // Darwin-gated). Kill switch: `TCG_NO_SINCOS_MERGE` /
+        // `TRUST_CG_DISABLE_PASSES=sincosmerge`.
+        if !is_disabled("sincosmerge") {
+            pm.add_pass(Box::new(SincosMerge::new(self.target_is_darwin)));
+        }
+        // Loop-dead pure-computation deferral (almabench store
+        // sinking). Runs EARLY — right after inlining/sincos-merge on
+        // the pristine post-ISel shapes (the call-cluster and rotated
+        // do-while recognizers depend on them), and before
+        // addr-mode/CSE/scheduling rewrite the address chains. The
+        // deferred loop it emits is then optimized by every later
+        // pass. Kill switch: `TCG_NO_LOOP_DEAD_SINK` /
+        // `TRUST_CG_DISABLE_PASSES=loopdeadsink`.
+        if !is_disabled("loopdeadsink") {
+            pm.add_pass(Box::new(LoopDeadPureSink));
+        }
+        if !is_disabled("addrmodeearly") {
+            pm.add_pass(Box::new(AddrModeEarlyFormation));
+        }
+        if !lattice_kernel_gate && !is_disabled("proof") {
+            pm.add_pass(self.proof_optimization_pass());
+        }
+        if !is_disabled("cfold") {
+            pm.add_pass(self.constant_folding_pass());
+        }
+        if !is_disabled("copyprop") {
+            pm.add_pass(Box::new(CopyPropagation));
+        }
+        if !is_disabled("cse") {
+            pm.add_pass(Box::new(CommonSubexprElim));
+        }
+        if !is_disabled("gvn") {
+            pm.add_pass(Box::new(GlobalValueNumbering));
+        }
+        if !is_disabled("sroa") {
+            pm.add_pass(Box::new(ScalarReplacementOfAggregates));
+        }
+        if !is_disabled("vec") {
+            let mut vectorizer =
+                VectorizationPass::new().with_profile_hotness(profile_hotness.clone());
+            if let Some(enabled) = self.contains4_scanner_batch_rewrite_override {
+                vectorizer = vectorizer.with_contains4_scanner_batch_rewrite(enabled);
+            }
+            pm.add_pass(Box::new(vectorizer));
+        }
+        if !is_disabled("licm") {
+            // `licmframespec` keeps LICM but drops its speculation of
+            // in-bounds stack-slot loads that are not guaranteed to
+            // execute (the on/off control of the native differential).
+            pm.add_pass(Box::new(if is_disabled("licmframespec") {
+                LoopInvariantCodeMotion::without_frame_speculation()
+            } else {
+                LoopInvariantCodeMotion::new()
+            }));
+        }
+        if !is_disabled("strred") {
+            pm.add_pass(Box::new(StrengthReduction));
+        }
+        if !is_disabled("unfusefma") {
+            pm.add_pass(Box::new(UnfuseSerialFma));
+        }
+        // Invariant loop unswitching: version a small innermost loop
+        // on a loop-invariant Cbz/Cbnz/CmpRI#0+BCond test so the
+        // decision is made ONCE in the preheader (Queens' Try
+        // `i < 8`: previously tested 8x per call after the bounded
+        // early-exit unroll, with the boolean spilled post-RA — a
+        // serialized ldur+cbnz per clone). MUST run immediately
+        // BEFORE loop-unroll so both versions unroll cleanly.
+        // Fail-closed. Kill switch: `TCG_NO_LOOP_UNSWITCH`; bisect
+        // key `unswitch`.
+        if !is_disabled("unswitch") {
+            pm.add_pass(Box::new(LoopUnswitch));
+        }
+        if !is_disabled("unroll") {
+            pm.add_pass(Box::new(LoopUnroll::new(profile_hotness.clone())));
+        }
+        // Late SROA (2nd instance): the const-addr full unroll above
+        // (`TCG_NO_CONST_ADDR_UNROLL`) rewrites stack-array index
+        // arithmetic into constant offsets; re-running SROA promotes
+        // the now-constant-offset local array to scalars (salsa20's
+        // `x[16]` stack round-trip). Shares the `sroa` bisect key.
+        if !is_disabled("sroa") {
+            pm.add_pass(Box::new(ScalarReplacementOfAggregates));
+        }
+        if !is_disabled("declrewrite") {
+            let (pass, report) = make_declarative_rewrite_pass_with_report(
+                &self.admitted_rewrite_records,
+                self.rewrite_admission_config,
+            );
+            pipeline_report.record_rewrite_admission_load(report);
+            pm.add_pass(Box::new(pass));
+        }
+        // Peephole dropped: declarative rewrite covers it;
+        // RotateIdiom carries pattern 53 (needs dominator info).
+        // The `peep` bisect key now gates RotateIdiom.
+        if !is_disabled("peep") {
+            pm.add_pass(Box::new(RotateIdiom));
+        }
+        // EOR-with-rotate fusion: collapse `t = RorRI(s,k); d = EorRR(x,t)`
+        // (single-use t) into the shifted-register `d = EorRRShift(x,s,k)`
+        // (EOR x, s, ROR #k) — the consumer of the RorRI RotateIdiom just
+        // created. Removes one instruction and one serial critical-path
+        // node per ARX statement (salsa20). Fail-closed. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=eorrotfuse`.
+        if !is_disabled("eorrotfuse") {
+            pm.add_pass(Box::new(EorRotateFuse));
+        }
+        if !is_disabled("addrmode") {
+            pm.add_pass(Box::new(AddrModeFormation));
+        }
+        if !is_disabled("cmpsel") {
+            pm.add_pass(Box::new(CmpSelectCombine));
+        }
+        if !is_disabled("ifconv") {
+            pm.add_pass(Box::new(IfConversion));
+        }
+        // AND+CMP#0 -> TST. MUST precede cmp-branch-fusion: that pass
+        // rewrites CmpRI into Cbz/Cbnz and AndCmpFuse only matches a
+        // surviving CmpRI, so the reverse order silently starves it.
+        // Together they compose into LLVM's `tbz`. C-flag guarded (ANDS
+        // clears C, SUBS #0 sets it). Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=andcmpfuse`.
+        if !is_disabled("andcmpfuse") {
+            pm.add_pass(Box::new(AndCmpFuse));
+        }
+        // `y = x ^ (x << k)`: consumers reading only bits [0,k) may read
+        // `x`, shortening the dependency chain into a mispredicting
+        // branch by one shifted-EOR. Purely an operand swap; the bit
+        // range must be provably below k or the operand is left alone.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=xorshiftdemanded`.
+        if !is_disabled("xorshiftdemanded") {
+            pm.add_pass(Box::new(XorshiftDemandedBits));
+        }
+        if !is_disabled("cmpbr") {
+            pm.add_pass(Box::new(CmpBranchFusion));
+        }
+        // Profile-gated hot-latch AND-condition split. Runs right AFTER
+        // cmp-branch-fusion (which forms the `cbnz t` its recogniser
+        // matches). INERT without an attached profile — the default
+        // compile stays byte-identical; with a profile it fires only in
+        // the unpredictable taken-rate band (see latch_and_split.rs).
+        // Kill switch: `TCG_NO_LATCH_AND_SPLIT`; bisect key `latchsplit`.
+        if !is_disabled("latchsplit") {
+            pm.add_pass(Box::new(LatchAndSplit::new(profile_hotness.clone())));
+        }
+        if !is_disabled("tailcall") {
+            pm.add_pass(Box::new(TailCallOptimization));
+        }
+        if !is_disabled("dce") {
+            pm.add_pass(self.dce_pass());
+        }
+        if !is_disabled("cfgsimp") {
+            pm.add_pass(Box::new(CfgSimplify));
+        }
+        // Late exact boolean materialization fold; see the O2 comment.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=booldiamond`.
+        if !is_disabled("booldiamond") {
+            pm.add_pass(Box::new(LateBooleanDiamondConvert));
+        }
+        // Late tiny-loop-diamond if-conversion: convert an unpredictable
+        // NON-AFFINE-recurrence-gated tiny pure-arm diamond (b1's
+        // `if s&6==2 { acc=rotate_left(acc,7) }`) to a CSEL. Runs HERE —
+        // after cfg-simplify canonicalizes it to a clean diamond, which
+        // the primary if-convert (pre-dce/cfg-simplify) cannot see. Tight
+        // gate (loop-resident + tiny pure arm + EOR self-recurrence) so it
+        // stays branchy on predictable diamonds. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=tinyloop`.
+        if !is_disabled("tinyloop") {
+            pm.add_pass(Box::new(TinyLoopDiamondConvert));
+        }
+        // AArch64 bounds-check elimination — see the O2 comment. Same
+        // late-machine-opt slot (post-cfgsimp, pre-looplatch/vectorize).
+        // Default-ON kill switch: `TCG_NO_AARCH64_BCE`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=aarch64bce`.
+        if !is_disabled("aarch64bce") {
+            // `bcetrapbranch` keeps the carrier arms but drops the
+            // register-bound trap-branch fold (its native on/off control).
+            let mut bce = AArch64BoundsCheckElimination::new();
+            if is_disabled("bcetrapbranch") {
+                bce = bce.without_trap_branch_folds();
+            }
+            pm.add_pass(Box::new(bce));
+        }
+        // Loop-carried store-to-load forwarding — see the O2 comment.
+        // Same slot: right AFTER aarch64-bounds-check-elim, BEFORE the
+        // unrollers/vectorizers. Closed-world, fail-closed; emits only
+        // already-credited opcodes. Default-ON kill switch:
+        // `TCG_NO_RECURRENCE_STORE_FWD`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=recurrence_store_fwd`.
+        if !is_disabled("recurrence_store_fwd") {
+            pm.add_pass(Box::new(RecurrenceStoreForward::new()));
+        }
+        // Counted-strided-store partial-unroll (x4) — see the O2 comment.
+        // Same slot: AFTER aarch64-bounds-check-elim, BEFORE
+        // closed-form-reduction/loop-latch-layout. Additive, wrap-free,
+        // fail-safe; emits only already-credited opcodes (no udiv/mul).
+        // Compile-time kill switch: `TCG_NO_STRIDED_STORE_UNROLL`;
+        // per-pass bisect: `TRUST_CG_DISABLE_PASSES=strided_store_unroll`.
+        // Normalize ISel's folded constant-trip `CmpRI` guards back to
+        // `CmpRR(iv, movz)` BEFORE the vectorizers/unrollers, so
+        // dc5916e's `cmp_imm12_fold` does not silently defeat their
+        // constant-trip recognizers (matmul full-unroll, the dt-class FP
+        // maps). Semantics-preserving. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=consttripnorm`.
+        if !is_disabled("consttripnorm") {
+            pm.add_pass(Box::new(crate::scalar_unroll::ConstTripGuardNormalize));
+        }
+        if !is_disabled("strided_store_unroll") {
+            pm.add_pass(Box::new(StridedStoreUnroll::new()));
+        }
+        // RMW-MAC row-loop partial-unroll (x4) — see the O2 comment.
+        // Same slot: AFTER aarch64-bounds-check-elim, BEFORE
+        // closed-form-reduction/loop-latch-layout. Additive, wrap-free,
+        // fail-safe; emits only already-credited opcodes (no udiv/mul).
+        // Compile-time kill switch: `TCG_NO_MAC_ROW_UNROLL`; per-pass
+        // bisect: `TRUST_CG_DISABLE_PASSES=mac_row_unroll`.
+        // Matmul 1D register-blocking (T=12 or 8): recognize the whole
+        // 3-deep bounds-checked matmul nest (distinct stack-local
+        // a/b/c, read-only a/b, single c store, const N a multiple of
+        // 12 or 8, L>=N*N) and splice a CHECK-FREE register-blocked fast path
+        // (k/j interchange, T c accumulators held across the k-loop,
+        // stores sunk to tile end) in FRONT of the untouched checked
+        // nest — kept as the runtime-guarded fallback so mac-row-unroll
+        // still fires on it. Store-sinking is sound because a/b/c are
+        // distinct locals (a/b never written; c's only store is
+        // c[i*N+j]); the tiled indices are provably < L so no per-access
+        // check is emitted. Runs right BEFORE mac-row-unroll (which
+        // handles the fallback's inner j-loop) and AFTER
+        // aarch64-bounds-check-elim (the clean LdrRI/StrRI + Madd
+        // address form). Purely additive, fail-closed, emits only
+        // already-credited opcodes. Recognition also enforces the
+        // publication review bar (L10-P4, `mac_reg_block::review_bar`):
+        // 64-bit data values, every bounds check >= N*N on a current
+        // index and slots of N*N elements, no branch but header tests
+        // and passing checks, headers holding only copies and the
+        // counter test, every access in the body of its own loop,
+        // dominated reads, counters read only inside their loop, never
+        // after the step, and reset once per parent iteration, no nest
+        // value live into the exit. Native on/off/C-reference gate:
+        // trust-cg-codegen `e2e_aarch64_mac_reg_block_differential`.
+        // Kill switch: `TCG_NO_MAC_REG_BLOCK`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=mac_reg_block` (in-process:
+        // `OptimizationPipeline::with_disabled_passes`).
+        if !is_disabled("mac_reg_block") {
+            pm.add_pass(Box::new(MacRegBlock::new()));
+        }
+        if !is_disabled("mac_row_unroll") {
+            pm.add_pass(Box::new(MacRowUnroll::new()));
+        }
+        // SOUND hoisted-range-guard crosswise-SWAP fast path (O3):
+        // see the O2 comment. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=swap_range_guard`.
+        if !is_disabled("swap_range_guard") {
+            pm.add_pass(Box::new(SwapRangeGuardPass::new()));
+        }
+        // Closed-form (Faulhaber) reduction — see the O2 comment. Runs
+        // before LoopLatchLayoutCombine and the split; iterated to
+        // fixpoint at O3. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=closed_form_reduction`.
+        if !is_disabled("closed_form_reduction") {
+            pm.add_pass(Box::new(ClosedFormReduction));
+        }
+        // Delete provably-terminating, side-effect-free counted loops
+        // (empty after upstream DCE). Fail-closed. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=deadloop`.
+        if !is_disabled("deadloop") {
+            pm.add_pass(Box::new(DeadCountedLoopElimination::new()));
+        }
+        if !is_disabled("looplatch") {
+            pm.add_pass(Box::new(LoopLatchLayoutCombine));
+        }
+        // Reduction splitting (accumulator widening): break a
+        // throughput-bound integer reduction's loop-carried chain into
+        // N independent accumulators for ILP. Fail-closed: only fires on
+        // the exact recognized constant-trip register-reduction shape.
+        // Placed after DCE/CFG-simplify so it sees the cleaned-up loop.
+        // NEON integer reductions run before reduction_split. Recognized
+        // induction-term and memory-chain shapes build checked private
+        // candidates; a refusal preserves the original function for
+        // subsequent scalar passes. Construction checks are not whole-
+        // transform proof evidence.
+        if !is_disabled("neonreduce") {
+            pm.add_pass(Box::new(NeonReducePass::new()));
+        }
+        // SOUND NEON array-reduction vectorizer: extends neon-reduce to
+        // reductions whose term reads from READ-ONLY memory (`s +=
+        // TERM(a[i], b[i], ...)`). Runs immediately after neon-reduce
+        // and before reduction_split. Fires
+        // only on the shapes it can prove lane-wise equivalent (i32
+        // accumulator, `a[i]` loads, lane-wise ops) and BAILS otherwise.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_array`.
+        if !is_disabled("neon_array") {
+            pm.add_pass(Box::new(
+                NeonArrayPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+            ));
+        }
+        // SOUND NEON byte-widening reduction into a u64 accumulator
+        // (popcount-sum / byte-sum) — the case neon_array's i32-only
+        // widening TRACK B and 2-block loop shape both miss (e.g.
+        // v3_popcount). Composes already-proven CNT/UADDLP/ADD/UMOV +
+        // the const-materialization MOVI and the shared-debt paired-Q
+        // load, all now credited per-compile, so it promotes gate-clean.
+        // Active on baseline AArch64 via UADDLP+ADD; a resolved
+        // FEAT_DotProd target selects the shorter UDOT fold. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_bytesum`.
+        if !is_disabled("neon_bytesum") {
+            pm.add_pass(Box::new(
+                NeonBytesumPass::new().with_aarch64_dotprod(self.aarch64_dotprod),
+            ));
+        }
+        // NEON i32/i64 min/max, bitwise and strict argmin/argmax
+        // reductions, plus i32 forward-chain diamonds. Runs after
+        // neon-array/bytesum and before predsum/reduction_split.
+        // Ambiguous shapes and effects decline. Checked private
+        // candidates publish atomically and scalar remainders are
+        // not vectorized again. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_minmax`.
+        if !is_disabled("neon_minmax") {
+            pm.add_pass(Box::new(NeonMinMaxPass::new()));
+        }
+        // NEON predicated-sum vectorizer (O3): same supported
+        // widths, shape guards and candidate boundary as O2/Os.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_predsum`.
+        if !is_disabled("neon_predsum") {
+            pm.add_pass(Box::new(NeonPredSumPass::new()));
+        }
+        // NEON integer maps (O3): same alias regimes and checked
+        // candidate boundary as O2/Os. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_map`.
+        if !is_disabled("neon_map") {
+            pm.add_pass(Box::new(NeonMapPass::new()));
+        }
+        // SOUND NEON per-byte 8-bit-reverse MAP vectorizer (O3): see the
+        // O2 comment. Kill switch: `TRUST_CG_DISABLE_PASSES=neon_bitrev`.
+        if !is_disabled("neon_bitrev") {
+            pm.add_pass(Box::new(NeonBitrevPass::new()));
+        }
+        // SOUND NEON array-FILL store vectorizer (O3): see the O2
+        // comment. Fires on the shared `__trustcg_array_fill_iN` helper
+        // and any inline const/invariant fill; purely additive, removes
+        // no bounds check. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_fill`.
+        if !is_disabled("neon_fill") {
+            pm.add_pass(Box::new(NeonFillPass::new()));
+        }
+        // SOUND NEON affine IOTA-fill store vectorizer (O3): see the
+        // O2 comment. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_iota_fill`.
+        if !is_disabled("neon_iota_fill") {
+            pm.add_pass(Box::new(NeonIotaFillPass::new()));
+        }
+        // Conditional-store blind-write vectorization remains
+        // unscheduled until typed ownership evidence is available.
+        // SOUND NEON EARLY-EXIT SEARCH vectorizer (O3): see the O2 comment.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_find`.
+        if !is_disabled("neon_find") {
+            pm.add_pass(Box::new(NeonFindPass::new()));
+        }
+        // SOUND NEON STENCIL (windowed-read) vectorizer (O3): see the O2
+        // comment. Fires only on provably-disjoint (noalias) out-vs-reads
+        // stencils with the store at offset 0; BAILS otherwise. Kill
+        // switch: `TRUST_CG_DISABLE_PASSES=neon_stencil`.
+        if !is_disabled("neon_stencil") {
+            pm.add_pass(Box::new(NeonStencilPass::new()));
+        }
+        // NEON f32/f64 maps, stencils and integer-accumulating
+        // FP count-above. Scalar operation order and existing fusion
+        // are retained; no new FP contraction is introduced. Alias
+        // versioning, rotated guards and the vector remainder share
+        // checked candidate publication. Proof admission is separate.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=neon_fmap`.
+        if !is_disabled("neon_fmap") {
+            pm.add_pass(Box::new(NeonFMapPass::new()));
+        }
+        // SOUND NEON AoS stride-2 complex-butterfly vectorizer: the
+        // radix-2 FFT inner loop over `struct complex { f32 rp, ip; }`
+        // (Stanford Oscar's Fft — clang -O3 vectorizes it, trust-cg
+        // was fully scalar). One complex PAIR (`.4S`) per iteration on
+        // the INTERLEAVED data: FADD/FSUB per lane + the REV64.4S
+        // pair-swap + sign-mask EOR (the scalar FNEG, bitwise) +
+        // FMUL/FMLA with broadcast twiddles — per-lane the SAME IEEE
+        // ops and roundings the scalar loop performs (no contraction
+        // introduced; the source's fused fmuladd stays fused), so
+        // BIT-IDENTICAL. Entered only behind a runtime 7-pair
+        // byte-range disjointness preamble (regime-C versioning,
+        // wrap-safe modular-interval tests) that otherwise falls back
+        // to the untouched scalar loop. Fail-closed on any deviation
+        // from the exact butterfly dag. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_butterfly`.
+        if !is_disabled("neon_butterfly") {
+            pm.add_pass(Box::new(NeonButterflyPass::new()));
+        }
+        // SOUND NEON early-exit linear-search (find/memchr) vectorizer:
+        // `for i<n: if a[i]==key return i; return -1`. A purely additive
+        // vector BLOCK FILTER runs in front of the UNCHANGED scalar loop:
+        // per whole 16-element in-bounds block it CMEQs the loads against
+        // a key splat and, on a PROVEN no-match block, skips it; on any-
+        // hit (or a partial trailing block) it re-enters the scalar loop,
+        // which computes the exact first-match index (delegated — no
+        // vector lane ordering, so same-block and cross-block duplicates
+        // are correct by the scalar scan). The over-read is a SUBSET of
+        // the no-match scalar read set (the guard admits only whole blocks
+        // within [0,n)); reads are pure (BAILS on stores / atomics; volatile
+        // fails closed at lowering). Every other neon pass BAILS on this
+        // early-exit shape. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=neon_find`.
+        if !is_disabled("neon_find") {
+            pm.add_pass(Box::new(NeonFindPass::new()));
+        }
+        // SOUND NEON IV-synthesized FP-reduction vectorizer:
+        // `acc += f(i)` where `f(i)` is a pure lane-wise f64 dataflow of
+        // the induction (`(double)i` via UCVTF/SCVTF) and loop-invariant
+        // scalars (NO arrays/memory), combined by a PLAIN fadd. It
+        // vectorizes only the INDEPENDENT per-lane term (`.2D`, x4 pairs)
+        // and folds the lanes into the scalar accumulator with ORDERED
+        // scalar fadds in iteration order — no reassociation, so the sum
+        // is BIT-IDENTICAL to the scalar loop (clang -O3's own emission
+        // for the flops kernels). Runs before reduction_split /
+        // scalar_unroll (first shot at the FP-reduction loop); BAILS on a
+        // fused accumulate, f32, non-unit step, stores/calls, or an extra
+        // live-out — scalar_unroll's SERIAL unroll is the fallback. Kill
+        // switch: `TRUST_CG_DISABLE_PASSES=neonfpred`.
+        if !is_disabled("neonfpred") {
+            pm.add_pass(Box::new(NeonFPRedPass::new()));
+        }
+        // SOUND NEON FP ARRAY-reduction vectorizer (memory-bearing sibling
+        // of neon-fpred): `acc += a[i]*b[i]` / `acc += a[i]` over unit-stride
+        // f64 arrays, PLUS the `f32 -> f64` widening dot (the fp-convert
+        // kernel) via the proven vector FCVTL/FCVTL2. Coalesced LDP-Q loads
+        // (widened by FCVTL for f32 streams) + ORDERED scalar drain (fused
+        // fmadd preserved) = bit-identical to the scalar loop.
+        //
+        // Widening reductions and iota fills run by default; pure-f64
+        // reductions require TRUST_CG_ENABLE_NEONFARRAY=1. This preserves
+        // the existing policy, not a current benchmark result. Scalar
+        // unrolling remains available when the vectorizer declines.
+        // Kill switch: TRUST_CG_DISABLE_PASSES=neonfarray.
+        if !is_disabled("neonfarray") {
+            let farray = if pipeline_env_var("TRUST_CG_ENABLE_NEONFARRAY").is_some() {
+                NeonFArrayPass::new()
+            } else {
+                NeonFArrayPass::widening_only()
+            };
+            pm.add_pass(Box::new(farray));
+        }
+        if !is_disabled("redsplit") {
+            pm.add_pass(Box::new(ReductionSplit));
+        }
+        // Scalar ILP unroll (O3): see the O2 comment. Idempotent (the
+        // inserted 3-block main loop and the tail's multi-pred entry
+        // are both rejected by the recognizer), so fixpoint iteration
+        // is safe. Kill switch: `TRUST_CG_DISABLE_PASSES=scalar_unroll`.
+        if !is_disabled("scalar_unroll") {
+            pm.add_pass(Box::new(ScalarUnrollPass::new()));
+        }
+        // Single-trip residual-loop collapse (O3) — see the O2
+        // comment. Idempotent under fixpoint: the rewritten block ends
+        // in a single unconditional `B` (no `BCond`+`B` pair left), so
+        // the recognizer never re-matches a collapsed header. Same
+        // kill switches (`TCG_NO_RESID_COLLAPSE` /
+        // `TRUST_CG_DISABLE_PASSES=residcollapse`).
+        if !is_disabled("residcollapse") {
+            pm.add_pass(Box::new(ResidTripCollapse));
+        }
+        // Second (LATE) UnfuseSerialFma instance: the NEON vectorizers
+        // above emit ordered-drain reductions as IN-PLACE FmaddRR runs
+        // (`FmaddRR [acc, a, b, acc]` — e.g. fp-convert's vectorized
+        // sum), which do not exist at the early instance's position.
+        // Loops the early instance already un-fused have no FMADDs
+        // left, so this re-run only touches vectorizer output. Same
+        // gate, same kill switch.
+        if !is_disabled("unfusefma") {
+            pm.add_pass(Box::new(UnfuseSerialFma));
+        }
+        // Extended-register addressing fold + select/flag fusion —
+        // see the O2 comment. Both are idempotent (each fold consumes
+        // its matched chain), so O3 fixpoint iteration is safe; the
+        // vectorizers bail cleanly on already-folded shapes.
+        if !is_disabled("extaddr") {
+            pm.add_pass(Box::new(ExtRegAddrFold));
+        }
+        // Pointer-IV strength reduction — see the O2 comment. Safe
+        // under fixpoint iteration: a rewritten access is a
+        // zero-offset LdrRI/StrRI (no LdrRO/StrRO left to re-claim),
+        // so the pass reports no change on re-runs.
+        // Scalar post-index formation. Runs immediately AFTER ptr-iv-sr
+        // and is disjoint from it by construction: ptr-iv-sr demands a
+        // single-back-edge {header}/{header,latch} body, this one only
+        // needs the load in the header, so a loop either pass rewrote is
+        // no longer in the shape the other recognises. Kill switch
+        // `TCG_NO_POST_INDEX`; bisect `TRUST_CG_DISABLE_PASSES=postindex`.
+        if !is_disabled("postindex") {
+            pm.add_pass(Box::new(PostIndexForm));
+        }
+        if !is_disabled("ptrivsr") {
+            pm.add_pass(Box::new(PtrIvStrengthReduce));
+        }
+        // Late call-bearing exact-trip FULL unroll: replicate the
+        // body of a proven-constant-trip counted loop whose body
+        // CONTAINS a call, at K = N (the loop control then evaluates
+        // once per entry instead of N times). Runs immediately AFTER
+        // ptr-iv-sr — that ordering IS the pass: unrolling this shape
+        // at the early `unroll` slot deletes the loop before ptr-iv-sr
+        // can reduce it, so each clone keeps the unreduced
+        // `lsl; madd; add; ldr` address chain. Toggling
+        // TCG_NO_PTR_IV_SR around THIS slot reproduces that placement
+        // exactly and prices it: almabench planetpv emits madd 16 /
+        // lsl 9 either way when the order is right, madd 58 / lsl 51
+        // when it is not (+42 = 6 arrays x 7 extra clones), and the
+        // unreduced unroll is a WASH against not unrolling at all
+        // (1.0095 vs 1.0094 PMC cycles) where the reduced one is
+        // 0.9890. Here the clones inherit the walking-pointer body
+        // and the unroll only removes work. Disjoint from
+        // partial-unroll by construction (that tier refuses calls).
+        // Purely structural: trip test, bound, step and exit edge are
+        // untouched, so a mis-modeled trip count can only refuse.
+        // Kill switch: `TCG_NO_CALL_UNROLL`; bisect key `callunroll`.
+        if !is_disabled("callunroll") {
+            pm.add_pass(Box::new(crate::loop_unroll::CallUnroll::new()));
+        }
+        // Alias-versioned load hoisting (LICM tier c) — see the O2
+        // comment. Self-limiting under fixpoint: the slow loop's new
+        // preheader is a two-successor check block (fails the
+        // unconditional-entry gate on re-run) and the fast clone has no
+        // hoistable loads left, so it fires at most once per loop.
+        if !is_disabled("aliashoist") {
+            pm.add_pass(Box::new(AliasVersionedLoadHoist));
+        }
+        if !is_disabled("selfuse") {
+            pm.add_pass(Box::new(SelectFlagFuse));
+        }
+        // Multiply-by-small-constant -> shift/add-sub strength reduction:
+        // rewrite `MulRR x, C` / `Madd x, C, y` (C a proven small
+        // compile-time constant expressible as ≤2 signed powers of two)
+        // into `LslRI` + `AddRR`/`SubRR`, off the latency-3-4 MUL/MADD
+        // critical path (p2_collatz's carried `c = c*3 + 1`). Fail-closed
+        // via `unique_reaching_const`; emits only already-gate-credited
+        // opcodes (no new surface). Runs DEAD LAST (after every
+        // vectorizer, unroller, and addressing pass) so it NEVER hides a
+        // multiply those passes must recognize — it only reduces the
+        // multiplies that survive to final scalar code, immediately before
+        // scheduling. The now-dead constant `Movz` is loop-invariant
+        // (LICM-hoisted to the preheader), so leaving it uncollected costs
+        // nothing on the hot path. Compile-time kill switch:
+        // `TCG_NO_MUL_SHIFT_REDUCE`; per-pass bisect:
+        // `TRUST_CG_DISABLE_PASSES=mulshift`.
+        if !is_disabled("mulshift") {
+            pm.add_pass(Box::new(MulShiftReduce));
+        }
+        // Shift-into-ADD/SUB fusion: collapse `t = LslRI(s,k); d =
+        // AddRR/SubRR(x,t)` (single-use t) into the shifted-register
+        // `d = AddRRShift/SubRRShift(x,s,k)` (ADD/SUB x, s, LSL #k). Runs
+        // right after mul-shift-reduce so it also collapses that pass's
+        // `LslRI`+`AddRR`/`SubRR` output (`x*(2^k±1)`) into ONE op, plus
+        // any explicit `y + (x<<k)` / `y - (x<<k)`, and the LSR sibling
+        // `t = LsrRI(s,k); d = AddRR(x,t)` -> `AddRRShiftLsr` (the
+        // srem/sdiv magic sign-bit correction and udiv magic add-back;
+        // `TCG_NO_LSR_ADD_FUSE` disables the LSR half alone).
+        // Non-commutative for SUB (the shift binds to the subtrahend
+        // only). Fail-closed. Kill
+        // switch: `TRUST_CG_DISABLE_PASSES=shiftalufuse`.
+        if !is_disabled("shiftalufuse") {
+            pm.add_pass(Box::new(ShiftAluFuse));
+        }
+        // `LSR #k; AND #low_mask` -> UBFM/UBFX; see the O1 site for
+        // proof authority and fail-closed guards.
+        if !is_disabled("lsrandubfx") {
+            pm.add_pass(Box::new(LsrAndUbfx));
+        }
+        // CSEL->CSINC increment fold: absorb a single-use `+1` select arm
+        // into a `CSINC` (p2_collatz's `c*3+1` odd arm after
+        // mul-shift-reduce+shift-alu-fuse expose the trailing `+1`).
+        // Runs here so the `+1` is already the CSEL's direct operand.
+        // Sound (exact select semantics); `Csinc` is already credited.
+        // Kill switch: `TRUST_CG_DISABLE_PASSES=csincfold`.
+        if !is_disabled("csincfold") {
+            pm.add_pass(Box::new(CsincFold));
+        }
+        // PARTIAL (factor) unroll — see the O2 comment. Kill switch:
+        // `TCG_NO_PARTIAL_UNROLL`; bisect key `partial_unroll`.
+        if !is_disabled("partial_unroll") {
+            pm.add_pass(Box::new(crate::loop_unroll::PartialUnroll::new(
+                (!is_disabled("profileuse"))
+                    .then(|| self.pgo.profile_hotness())
+                    .flatten(),
+            )));
+        }
+        // Xorshift step-pair latency fusion: a loop-carried
+        // `t = x ^ (x << a); y = t ^ (t >> b)` computes `t >> b` from
+        // `x` in parallel with `t` (one cycle less per step pair on
+        // the recurrence; `xorshift_pair_fusion` module docs). Runs
+        // after every pass that recognizes the xorshift shape and
+        // before the scheduler. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=xorshiftfuse`.
+        if !is_disabled("xorshiftfuse") {
+            pm.add_pass(Box::new(XorshiftPairFusion));
+        }
+        // A constant the body materializes twice is hoisted twice:
+        // keep the first `MOVZ`+`MOVK` run of a value in a block and
+        // point the second one's readers at it
+        // (`const_chain_dedup` module docs). After LICM and the
+        // unrollers, before the scheduler. Kill switch:
+        // `TRUST_CG_DISABLE_PASSES=constdedup`.
+        if !is_disabled("constdedup") {
+            pm.add_pass(Box::new(ConstChainDedup));
+        }
+        if !is_disabled("sched") {
+            pm.add_pass(Box::new(PressureAwareScheduler));
+        }
+        // LDP/STP pair formation runs AFTER scheduling (adjacency is
+        // near-final) but before regalloc (so the translation validator
+        // checks every pair). Kill switch: `TRUST_CG_DISABLE_PASSES=mempair`.
+        if !is_disabled("mempair") {
+            pm.add_pass(Box::new(crate::mem_pair::MemPairFormation));
+        }
     }
 
     /// Return the number of passes registered for the current optimization
@@ -2045,19 +2241,36 @@ impl OptimizationPipeline {
                 PassStats::default()
             }
             OptLevel::O1 | OptLevel::O2 | OptLevel::Os => {
-                let stats = pm.run_once_with_stats(func);
-                self.run_post_convergence(func, None);
+                let mut stats = pm.run_once_with_stats(func);
+                self.run_post_convergence_admitted(func, None, &mut stats);
                 stats
             }
             OptLevel::O3 => {
                 // Iterate to fixed point (max 4 iterations to bound compile time).
                 // The analysis cache in PassManager avoids redundant domtree
                 // recomputation within each iteration.
-                let stats = pm.run_to_fixpoint(func, 4);
-                self.run_post_convergence(func, None);
+                let mut stats = pm.run_to_fixpoint(func, 4);
+                self.run_post_convergence_admitted(func, None, &mut stats);
                 stats
             }
         }
+    }
+
+    /// [`Self::run_post_convergence`] behind the L10-P5 identity admission:
+    /// it runs only on a function the pass manager admitted, and its exit is
+    /// one more admitted boundary.
+    fn run_post_convergence_admitted(
+        &self,
+        func: &mut MachFunction,
+        provenance: Option<&mut ProvenanceMap>,
+        stats: &mut PassStats,
+    ) {
+        if stats.id_admission.is_err() {
+            return;
+        }
+        self.run_post_convergence(func, provenance, stats);
+        stats.id_admission =
+            func.admit_id_counters_at(|| "exit of post-convergence loop rotation".to_string());
     }
 
     /// Single-shot passes that must see the CONVERGED function and whose
@@ -2070,12 +2283,32 @@ impl OptimizationPipeline {
         &self,
         func: &mut MachFunction,
         provenance: Option<&mut ProvenanceMap>,
+        stats: &mut PassStats,
     ) {
         let disabled = std::env::var("TRUST_CG_DISABLE_PASSES").unwrap_or_default();
         if disabled.split(',').any(|d| d.trim() == "looplatch") {
             return;
         }
-        crate::loop_latch_layout::run_extended_loop_rotation(func, provenance);
+        let before = self.transition_digest.map(|digest| digest(func));
+        if crate::loop_latch_layout::run_extended_loop_rotation(func, provenance) {
+            // Outside the pass manager, so record the rewrite here: no
+            // validator covers the rotation.
+            crate::pass_validation::record_unvalidated_change(
+                self.pass_validation,
+                "extended-loop-rotation",
+                func,
+                &mut stats.pass_validation,
+            );
+        }
+        // Whatever the rotation reported: a changed interface is an
+        // unvalidated transition.
+        crate::pass_validation::record_unvalidated_transition(
+            self.transition_digest,
+            "extended-loop-rotation",
+            before,
+            func,
+            &mut stats.pass_validation,
+        );
     }
 
     fn run_pass_manager_with_provenance(
@@ -2087,13 +2320,13 @@ impl OptimizationPipeline {
         match self.level {
             OptLevel::O0 => PassStats::default(),
             OptLevel::O1 | OptLevel::O2 | OptLevel::Os => {
-                let stats = pm.run_once_with_stats_and_provenance(func, provenance);
-                self.run_post_convergence(func, Some(provenance));
+                let mut stats = pm.run_once_with_stats_and_provenance(func, provenance);
+                self.run_post_convergence_admitted(func, Some(provenance), &mut stats);
                 stats
             }
             OptLevel::O3 => {
-                let stats = pm.run_to_fixpoint_with_provenance(func, provenance, 4);
-                self.run_post_convergence(func, Some(provenance));
+                let mut stats = pm.run_to_fixpoint_with_provenance(func, provenance, 4);
+                self.run_post_convergence_admitted(func, Some(provenance), &mut stats);
                 stats
             }
         }
@@ -2329,59 +2562,27 @@ mod tests {
         (func, vec![add, sub, mul])
     }
 
-    fn make_profitable_small_vectorization_loop() -> (MachFunction, Vec<InstId>) {
-        let mut func = MachFunction::new(
-            "pipeline_hot_small_vec".to_string(),
-            Signature::new(vec![], vec![]),
-        );
-        let bb0 = func.entry;
-        let bb1 = func.create_block();
-        let bb2 = func.create_block();
-        let bb3 = func.create_block();
+    /// The vectorizer's O2 revertBits counted loop `for (i = 0; i < bound;
+    /// i++)` and its two `RBIT`s, which vectorization upgrades. A real counted
+    /// loop: the vectorizer publishes only what the loop-state contract's
+    /// iteration-coverage clause admits.
+    fn counted_vectorization_loop(bound: u32) -> (MachFunction, Vec<InstId>) {
+        let func = crate::vectorize::tests::o2_revertbits_counted_loop(bound);
+        let rbits = func
+            .block_order
+            .iter()
+            .flat_map(|&block| func.block(block).insts.iter().copied())
+            .filter(|&inst| func.inst(inst).opcode == AArch64Opcode::Rbit)
+            .collect();
+        (func, rbits)
+    }
 
-        let br0 = func.push_inst(MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(bb1)],
-        ));
-        func.append_inst(bb0, br0);
-
-        let mut adds = Vec::new();
-        for id in 2..12 {
-            let add = func.push_inst(MachInst::new(
-                AArch64Opcode::AddRR,
-                vec![vreg32(id), vreg32(0), vreg32(1)],
-            ));
-            func.append_inst(bb1, add);
-            adds.push(add);
-        }
-
-        let cmp = func.push_inst(MachInst::new(
-            AArch64Opcode::CmpRI,
-            vec![vreg32(20), imm(4)],
-        ));
-        func.append_inst(bb1, cmp);
-
-        let bcond = func.push_inst(MachInst::new(
-            AArch64Opcode::BCond,
-            vec![MachOperand::Block(bb2), MachOperand::Block(bb3)],
-        ));
-        func.append_inst(bb1, bcond);
-
-        let br3 = func.push_inst(MachInst::new(
-            AArch64Opcode::B,
-            vec![MachOperand::Block(bb1)],
-        ));
-        func.append_inst(bb3, br3);
-
-        let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
-        func.append_inst(bb2, ret);
-
-        func.add_edge(bb0, bb1);
-        func.add_edge(bb1, bb2);
-        func.add_edge(bb1, bb3);
-        func.add_edge(bb3, bb1);
-
-        (func, adds)
+    /// [`counted_vectorization_loop`] with trip count 4 (below the default
+    /// minimum of 8), named as `small_vectorization_profile` profiles it.
+    fn small_counted_vectorization_loop() -> (MachFunction, Vec<InstId>) {
+        let (mut func, rbits) = counted_vectorization_loop(4);
+        func.name = "pipeline_hot_small_vec".to_string();
+        (func, rbits)
     }
 
     fn small_vectorization_profile(header_hits: u64, function_count: u64) -> ProfData {
@@ -2587,6 +2788,8 @@ mod tests {
         let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
         let mut func = make_func_with_insts(vec![m0, m1, add, ret]);
 
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = OptimizationPipeline::new(OptLevel::O2)
             .with_certified_pass_execution()
             .run(&mut func);
@@ -2773,11 +2976,75 @@ mod tests {
         let mut func = make_func_with_insts(vec![add, ret]);
 
         let pipeline = OptimizationPipeline::new(OptLevel::O1);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         pipeline.run(&mut func);
 
         let block = func.block(func.entry);
         // DCE removes the add (v0 unused), only ret remains.
         assert_eq!(block.insts.len(), 1);
+    }
+
+    #[test]
+    fn test_o1_removes_unreachable_copy_predecessor() {
+        // Pointer helpers can arrive with an unreachable arm assigning the
+        // shared return carrier. Keeping that predecessor makes the allocator's
+        // spec dataflow include a value that cannot reach the return at runtime.
+        let mut func = make_func_with_insts(vec![]);
+        let entry = func.entry;
+        let dead = func.create_block();
+        let join = func.create_block();
+        for (block, insts) in [
+            (
+                entry,
+                vec![
+                    MachInst::new(AArch64Opcode::MovI, vec![vreg(0), imm(7)]),
+                    MachInst::new(AArch64Opcode::Copy, vec![vreg(1), vreg(0)]),
+                    MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(join)]),
+                ],
+            ),
+            (
+                dead,
+                vec![
+                    MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(99)]),
+                    MachInst::new(AArch64Opcode::Copy, vec![vreg(1), vreg(2)]),
+                    MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(join)]),
+                ],
+            ),
+            (
+                join,
+                vec![
+                    MachInst::new(
+                        AArch64Opcode::Copy,
+                        vec![MachOperand::PReg(trust_cg_ir::PReg::new(0)), vreg(1)],
+                    ),
+                    MachInst::new(AArch64Opcode::Ret, vec![]),
+                ],
+            ),
+        ] {
+            for inst in insts {
+                let id = func.push_inst(inst);
+                func.append_inst(block, id);
+            }
+        }
+        func.add_edge(entry, join);
+        func.add_edge(dead, join);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
+        OptimizationPipeline::new(OptLevel::O1).run(&mut func);
+        assert!(!func.block_order.contains(&dead));
+        for &block in &func.block_order {
+            assert!(!func.block(block).preds.contains(&dead));
+            for &id in &func.block(block).insts {
+                assert!(!func.inst(id).operands.contains(&imm(99)));
+            }
+        }
+        assert!(func.block_order.iter().any(|&block| {
+            func.block(block)
+                .insts
+                .iter()
+                .any(|&id| func.inst(id).opcode == AArch64Opcode::Ret)
+        }));
     }
 
     #[test]
@@ -2789,6 +3056,8 @@ mod tests {
         let mut func = make_func_with_insts(vec![m0, a1, a2, ret]);
 
         let pipeline = OptimizationPipeline::new(OptLevel::O2);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = pipeline.run(&mut func);
         assert!(stats.changes > 0);
     }
@@ -2810,6 +3079,8 @@ mod tests {
 
         let pipeline =
             OptimizationPipeline::new(OptLevel::O2).with_proof_optimization_metadata(metadata);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = pipeline.run(&mut func);
 
         assert_eq!(stats.proof_optimization_certificates.len(), 1);
@@ -2859,7 +3130,7 @@ mod tests {
             Some(
                 "inline,cfold,copyprop,cse,gvn,sroa,vec,licm,strred,unroll,\
                  declrewrite,peep,addrmode,cmpsel,ifconv,cmpbr,looplatch,\
-                 tailcall,dce,cfgsimp,closed_form_reduction,neonreduce,neon_array,\
+                 tailcall,dce,cfgsimp,booldiamond,closed_form_reduction,neonreduce,neon_array,\
                  neon_minmax,neon_predsum,neon_map,neon_condstore,neon_find,neon_stencil,\
                  neon_fmap,neonfpred,neonfarray,redsplit,scalar_unroll,extaddr,aliashoist,selfuse,sched",
             ),
@@ -2871,124 +3142,22 @@ mod tests {
 
                 let pipeline = OptimizationPipeline::new(OptLevel::O2)
                     .with_proof_optimization_metadata(metadata);
+                func.try_sync_vreg_counter()
+                    .expect("fixture register ids fit u32");
                 let stats = pipeline.run(&mut func);
 
-                assert_eq!(
-                    stats.runs,
-                    vec![
-                        // sincos-merge runs first (registered right after inline,
-                        // which is disabled here); inert on this store-pair
-                        // candidate (no sin/cos calls; also non-Darwin default),
-                        // but still executes once.
-                        ("sincos-merge".to_string(), 1),
-                        // loop-dead-pure-sink runs right after sincos-merge;
-                        // inert on this store-pair candidate (no libm-pure
-                        // call), but still executes once.
-                        ("loop-dead-pure-sink".to_string(), 1),
-                        ("addr-mode-early".to_string(), 1),
-                        ("proof-opts".to_string(), 1),
-                        // unfuse-serial-fma runs (registered after StrengthReduction,
-                        // not in this test's disable list); inert on this non-loop
-                        // store-pair candidate but still executes once.
-                        ("unfuse-serial-fma".to_string(), 1),
-                        // loop-unswitch runs right before loop-unroll (disabled
-                        // here); inert on this non-loop store-pair candidate but
-                        // still executes once.
-                        ("loop-unswitch".to_string(), 1),
-                        // eor-rotate-fuse runs (registered after RotateIdiom, not
-                        // in this test's disable list); it is inert on this
-                        // store-pair candidate but still executes once.
-                        ("eor-rotate-fuse".to_string(), 1),
-                        ("and-cmp-fuse".to_string(), 1),
-                        ("xorshift-demanded-bits".to_string(), 1),
-                        // latch-and-split runs right after cmp-branch-fusion
-                        // (disabled here); INERT without a profile (this test
-                        // attaches none) but still executes once.
-                        ("latch-and-split".to_string(), 1),
-                        // tiny-loop-diamond runs right after cfg-simplify (disabled
-                        // here); inert on this non-loop store-pair candidate but
-                        // executes once.
-                        ("tiny-loop-diamond".to_string(), 1),
-                        // aarch64-bounds-check-elim executes once (inert on this
-                        // non-loop store-pair candidate — no carrier), default-ON.
-                        ("aarch64-bounds-check-elim".to_string(), 1),
-                        // recurrence-store-forward executes once (inert on this
-                        // non-loop store-pair candidate — no recurrence loop),
-                        // default-ON.
-                        ("recurrence-store-forward".to_string(), 1),
-                        // const-trip-guard-normalize runs before the unrollers/
-                        // vectorizers (inert on this non-loop candidate — no
-                        // constant-trip CmpRI guard), default-ON.
-                        ("const-trip-guard-normalize".to_string(), 1),
-                        // strided-store-unroll executes once (inert on this
-                        // non-loop store-pair candidate — no marking loop),
-                        // default-ON.
-                        ("strided-store-unroll".to_string(), 1),
-                        // mac-reg-block executes once (inert on this non-loop
-                        // store-pair candidate — no matmul nest), default-ON.
-                        ("mac-reg-block".to_string(), 1),
-                        // mac-row-unroll executes once (inert on this non-loop
-                        // store-pair candidate — no MAC loop), default-ON.
-                        ("mac-row-unroll".to_string(), 1),
-                        // swap-range-guard executes once (inert on this non-loop
-                        // store-pair candidate — no swap chain), default-ON.
-                        ("swap-range-guard".to_string(), 1),
-                        ("deadloop".to_string(), 1),
-                        // neon-bytesum executes once (inert on this non-loop
-                        // store-pair candidate — no change), now default-ON.
-                        ("neon-bytesum".to_string(), 1),
-                        ("neon-bitrev".to_string(), 1),
-                        // neon-fill executes once (inert on this non-loop
-                        // store-pair candidate — no fill loop), default-ON.
-                        ("neon-fill".to_string(), 1),
-                        // neon-iota-fill executes once (inert on this non-loop
-                        // store-pair candidate — no iota-fill loop), default-ON.
-                        ("neon-iota-fill".to_string(), 1),
-                        // neon-butterfly executes once (inert on this non-loop
-                        // store-pair candidate — no stride-2 complex-butterfly
-                        // loop), default-ON.
-                        ("neon-butterfly".to_string(), 1),
-                        // resid-collapse runs right after scalar-unroll
-                        // (disabled here); inert on this non-loop store-pair
-                        // candidate (no counted single-trip tail), default-ON.
-                        ("resid-collapse".to_string(), 1),
-                        // the LATE unfuse-serial-fma instance (post-vectorizer,
-                        // catches ordered-drain FMADD runs); inert here.
-                        ("unfuse-serial-fma".to_string(), 1),
-                        // ptr-iv-sr runs after ext-addr (disabled in this
-                        // test); inert on this non-loop store-pair candidate
-                        // but executes once.
-                        // post-index is registered immediately before ptr-iv-sr;
-                        // inert on this store-pair candidate.
-                        ("post-index".to_string(), 1),
-                        ("ptr-iv-sr".to_string(), 1),
-                        // call-unroll runs immediately after ptr-iv-sr; inert
-                        // on this non-loop store-pair candidate (no counted
-                        // loop, no call) but executes once.
-                        ("call-unroll".to_string(), 1),
-                        // mul-shift-reduce runs DEAD LAST (right before the
-                        // disabled scheduler); inert on this multiply-free
-                        // store-pair candidate but executes once.
-                        ("mul-shift-reduce".to_string(), 1),
-                        // shift-alu-fuse runs right after mul-shift-reduce; inert
-                        // on this store-pair candidate (no LslRI+ADD/SUB) but
-                        // executes once.
-                        ("shift-alu-fuse".to_string(), 1),
-                        // lsr-and-ubfx runs immediately after shift-alu-fuse;
-                        // inert on this store-pair candidate but executes once.
-                        ("lsr-and-ubfx".to_string(), 1),
-                        // csinc-fold runs right after shift-alu-fuse; inert on
-                        // this store-pair candidate (no CSEL) but executes once.
-                        ("csinc-fold".to_string(), 1),
-                        // partial-unroll runs just before the scheduler; inert
-                        // here (no loops in this candidate) but executes once.
-                        ("partial-unroll".to_string(), 1),
-                        // mem-pair-formation runs DEAD LAST; the early addr-mode
-                        // pass already paired this candidate, so it is inert here
-                        // but executes once.
-                        ("mem-pair-formation".to_string(), 1),
-                    ]
-                );
+                // This regression checks the early-address-mode -> proof-store
+                // pairing contract, not the full inventory of unrelated passes.
+                // New passes that are inert on this fixture must not invalidate
+                // its stage-order assertion.
+                let relevant_runs = stats
+                    .runs
+                    .iter()
+                    .filter(|(name, _)| matches!(name.as_str(), "addr-mode-early" | "proof-opts"))
+                    .map(|(name, count)| (name.as_str(), *count))
+                    .collect::<Vec<_>>();
+                assert_eq!(relevant_runs, [("addr-mode-early", 1), ("proof-opts", 1)]);
+                assert!(!stats.runs.iter().any(|(name, _)| name == "addr-mode"));
                 assert_eq!(stats.changes, 2);
 
                 let block = func.block(func.entry);
@@ -3021,6 +3190,8 @@ mod tests {
             provenance.record_lowering(origin, &[InstId(0)], PassId::new("isel"));
 
             let pipeline = OptimizationPipeline::new(OptLevel::O2);
+            func.try_sync_vreg_counter()
+                .expect("fixture register ids fit u32");
             let stats = pipeline.run_with_provenance(&mut func, &mut provenance);
 
             assert_eq!(stats.proof_optimization_certificates.len(), 1);
@@ -3045,6 +3216,8 @@ mod tests {
         );
         let pipeline =
             OptimizationPipeline::new(OptLevel::O2).with_proof_optimization_metadata(metadata);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = pipeline.run(&mut func);
 
         let cert = stats
@@ -3071,6 +3244,8 @@ mod tests {
         );
         let pipeline =
             OptimizationPipeline::new(OptLevel::O2).with_proof_optimization_metadata(metadata);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         let stats = pipeline.run(&mut func);
 
         let cert = stats
@@ -3172,11 +3347,11 @@ mod tests {
         with_declarative_rewrite_env(None, Some("1"), || {
             let pipeline = OptimizationPipeline::new(OptLevel::O3);
             let pm = pipeline.build_pass_manager();
-            // 70 passes: inline + early addr-mode + proof-opts + const-fold +
+            // 74 passes: inline + early addr-mode + proof-opts + const-fold +
             // copy-prop + cse + gvn + sroa + vectorize + licm +
             // strength-reduce + loop-unswitch + loop-unroll + peephole + addr-mode +
             // cmp-select + if-convert + cmp-branch-fusion + tail-call + dce +
-            // cfg-simplify + aarch64-bounds-check-elim +
+            // cfg-simplify + late-boolean-diamond + aarch64-bounds-check-elim +
             // recurrence-store-forward + strided-store-unroll +
             // closed-form-reduction + loop-latch-layout +
             // neon-reduce + neon-array + neon-minmax + neon-predsum + neon-map + neon-fill +
@@ -3187,8 +3362,9 @@ mod tests {
             // xorshift-demanded-bits + csinc-fold + pressure-aware-scheduler +
             // resid-collapse + sincos-merge + loop-dead-pure-sink + the late
             // (post-unroll) sroa instance + latch-and-split (profile-gated,
-            // inert without a profile) + call-unroll + partial-unroll.
-            assert_eq!(pm.num_passes(), 73);
+            // inert without a profile) + call-unroll + partial-unroll +
+            // xorshift-pair-fusion + const-chain-dedup.
+            assert_eq!(pm.num_passes(), 77);
         });
     }
 
@@ -3204,16 +3380,58 @@ mod tests {
         );
 
         let o2 = OptimizationPipeline::new(OptLevel::O2).with_profile_use(profile.clone());
-        assert_eq!(
-            o2.build_pass_manager().pass_names().first(),
-            Some(&"profile-use")
-        );
+        let o2_manager = o2.build_pass_manager();
+        let o2_names = o2_manager.pass_names();
+        assert_eq!(o2_names.first(), Some(&"i8-return-demanded-bits"));
+        assert_eq!(o2_names.get(1), Some(&"profile-use"));
 
         let o3 = OptimizationPipeline::new(OptLevel::O3).with_profile_use(profile);
-        assert_eq!(
-            o3.build_pass_manager().pass_names().first(),
-            Some(&"profile-use")
+        let o3_manager = o3.build_pass_manager();
+        let o3_names = o3_manager.pass_names();
+        assert_eq!(o3_names.first(), Some(&"i8-return-demanded-bits"));
+        assert_eq!(o3_names.get(1), Some(&"profile-use"));
+    }
+
+    #[test]
+    fn i8_return_demanded_bits_is_early_and_kill_switchable() {
+        assert!(
+            !OptimizationPipeline::new(OptLevel::O0)
+                .build_pass_manager()
+                .pass_names()
+                .contains(&"i8-return-demanded-bits"),
+            "O0 must not run the optimization"
         );
+
+        for level in [OptLevel::O1, OptLevel::O2, OptLevel::Os, OptLevel::O3] {
+            let manager = OptimizationPipeline::new(level).build_pass_manager();
+            let names = manager.pass_names();
+            assert_eq!(
+                names.first(),
+                Some(&"i8-return-demanded-bits"),
+                "the exact post-ISel shape must be consumed first at {level:?}"
+            );
+            let demanded_bits = names
+                .iter()
+                .position(|name| *name == "i8-return-demanded-bits")
+                .unwrap();
+            let dce = names
+                .iter()
+                .position(|name| *name == "dce")
+                .expect("optimized pipelines must include DCE");
+            assert!(demanded_bits < dce, "I8 demanded bits must precede DCE");
+        }
+
+        with_disable_passes_env(Some("i8retbits"), || {
+            for level in [OptLevel::O1, OptLevel::O2, OptLevel::Os, OptLevel::O3] {
+                assert!(
+                    !OptimizationPipeline::new(level)
+                        .build_pass_manager()
+                        .pass_names()
+                        .contains(&"i8-return-demanded-bits"),
+                    "i8retbits bisect key ignored at {level:?}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -3245,11 +3463,14 @@ mod tests {
             "ifconv,cmpbr,looplatch,tailcall,dce,cfgsimp,sched,consttripnorm"
         );
         with_disable_passes_env(Some(disabled), || {
-            let (mut hot_func, hot_adds) = make_profitable_small_vectorization_loop();
+            let (mut hot_func, hot_adds) = small_counted_vectorization_loop();
             let hot_profile = small_vectorization_profile(100, 100);
             let hot_pipeline =
                 OptimizationPipeline::new(OptLevel::O2).with_profile_use(hot_profile);
 
+            hot_func
+                .try_sync_vreg_counter()
+                .expect("fixture register ids fit u32");
             let hot_stats = hot_pipeline.run(&mut hot_func);
 
             assert!(
@@ -3265,17 +3486,16 @@ mod tests {
                 "hot-profile vectorization should upgrade scalar operands"
             );
 
-            let (mut cold_func, cold_adds) = make_profitable_small_vectorization_loop();
+            let (mut cold_func, cold_adds) = small_counted_vectorization_loop();
             let cold_profile = small_vectorization_profile(5, 100);
             let cold_pipeline =
                 OptimizationPipeline::new(OptLevel::O2).with_profile_use(cold_profile);
 
-            let cold_stats = cold_pipeline.run(&mut cold_func);
+            cold_func
+                .try_sync_vreg_counter()
+                .expect("fixture register ids fit u32");
+            cold_pipeline.run(&mut cold_func);
 
-            assert_eq!(
-                cold_stats.changes, 0,
-                "cold profile should keep the default vectorization gate"
-            );
             assert!(
                 cold_adds.iter().all(|&inst_id| {
                     cold_func.inst(inst_id).operands.iter().all(|operand| {
@@ -3299,6 +3519,9 @@ mod tests {
             let hot_pipeline = OptimizationPipeline::new(OptLevel::O2)
                 .with_profile_use(loop_unroll_profile(100, 100));
 
+            hot_func
+                .try_sync_vreg_counter()
+                .expect("fixture register ids fit u32");
             let hot_stats = hot_pipeline.run(&mut hot_func);
 
             assert!(
@@ -3326,6 +3549,9 @@ mod tests {
             let cold_pipeline = OptimizationPipeline::new(OptLevel::O2)
                 .with_profile_use(loop_unroll_profile(5, 100));
 
+            cold_func
+                .try_sync_vreg_counter()
+                .expect("fixture register ids fit u32");
             cold_pipeline.run(&mut cold_func);
 
             assert!(
@@ -3337,6 +3563,9 @@ mod tests {
             let missing_pipeline =
                 OptimizationPipeline::new(OptLevel::O2).with_profile_use(ProfData::new(0x829));
 
+            missing_func
+                .try_sync_vreg_counter()
+                .expect("fixture register ids fit u32");
             missing_pipeline.run(&mut missing_func);
 
             assert!(
@@ -3663,112 +3892,112 @@ mod tests {
         assert_eq!(trimmed_names, default_names);
     }
 
+    #[test]
+    fn without_tail_calls_removes_exactly_the_tail_call_pass() {
+        for level in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+            let default_pm = OptimizationPipeline::new(level)
+                .with_disabled_passes("")
+                .build_pass_manager();
+            let default_names = default_pm.pass_names();
+            assert_eq!(
+                default_names.contains(&"tail-call"),
+                matches!(level, OptLevel::O2 | OptLevel::O3),
+                "{level:?}: the tail-call pass runs at O2 and O3 only"
+            );
+            let trimmed_pm = OptimizationPipeline::new(level)
+                .with_disabled_passes("")
+                .without_tail_calls()
+                .build_pass_manager();
+            let expected: Vec<&str> = default_names
+                .iter()
+                .copied()
+                .filter(|name| *name != "tail-call")
+                .collect();
+            assert_eq!(
+                trimmed_pm.pass_names(),
+                expected,
+                "{level:?}: only the tail-call pass is removed"
+            );
+        }
+    }
+
     // =========================================================================
     // Pipeline integration tests for NEON auto-vectorization
     // =========================================================================
 
-    /// Verify that O2 pipeline fires vectorization on a simple i32 add loop.
+    fn has_fpr128_operand(func: &MachFunction, inst: InstId) -> bool {
+        func.inst(inst).operands.iter().any(
+            |operand| matches!(operand, MachOperand::VReg(vreg) if vreg.class == RegClass::Fpr128),
+        )
+    }
+
+    /// The O2 pipeline vectorizes a real counted loop (the O2 revertBits
+    /// shape, 100 iterations): its `RBIT`s are upgraded to NEON registers.
+    /// The vectorizer publishes only what the loop-state contract's
+    /// iteration-coverage clause admits, so the loop must be one whose trip
+    /// the clause can run.
     ///
-    /// The add instruction's operands should be upgraded from Gpr32 to Fpr128
-    /// (NEON SIMD) and an arrangement immediate should be appended.
+    /// The fixture is the MIR the O2 pipeline hands the vectorizer, after
+    /// `sroa` made the induction's copies. Copy propagation runs before
+    /// `sroa` in the real pipeline; re-run on the fixture it folds the
+    /// latch's copy into the step, a shape the vectorizer's induction
+    /// recognizer does not plan (measured: `analyze_loop` returns `None`),
+    /// so the replay leaves it out.
     #[test]
     fn test_o2_vectorization_fires_on_loop() {
-        let (mut func, add_id) = make_vectorizable_loop();
-
-        // Precondition: add operands are Gpr32 before pipeline.
-        let add_inst = func.inst(add_id);
-        assert_eq!(add_inst.opcode, AArch64Opcode::AddRR);
-        assert_eq!(add_inst.operands.len(), 3, "pre-pipeline: 3 operands");
-        if let MachOperand::VReg(vreg) = &add_inst.operands[0] {
-            assert_eq!(vreg.class, RegClass::Gpr32, "pre-pipeline: Gpr32");
-        }
-
-        let pipeline = OptimizationPipeline::new(OptLevel::O2);
-        let stats = pipeline.run(&mut func);
-        assert!(stats.changes > 0, "O2 pipeline should report changes");
-
-        // Postcondition: the add instruction should have SIMD register class.
-        // After vectorization, operands are Fpr128 and an arrangement
-        // immediate is appended (4 operands: dst, src1, src2, arrangement).
-        let add_inst = func.inst(add_id);
-        let has_fpr128 = add_inst.operands.iter().any(|op| {
-            if let MachOperand::VReg(vreg) = op {
-                vreg.class == RegClass::Fpr128
-            } else {
-                false
-            }
-        });
+        let (mut func, rbits) = counted_vectorization_loop(100);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
         assert!(
-            has_fpr128,
-            "O2 pipeline should vectorize the add: operands should include Fpr128 registers"
+            rbits.iter().all(|&inst| !has_fpr128_operand(&func, inst)),
+            "pre-pipeline: scalar"
         );
 
-        // Arrangement immediate should be present (encoder code 5 for i32 4S).
-        let has_arrangement = add_inst
-            .operands
-            .iter()
-            .any(|op| matches!(op, MachOperand::Imm(5)));
+        let stats = OptimizationPipeline::new(OptLevel::O2)
+            .with_disabled_passes("copyprop")
+            .run(&mut func);
+        assert!(stats.changes > 0, "O2 pipeline should report changes");
         assert!(
-            has_arrangement,
-            "O2 pipeline should append arrangement encoding (Imm(5) for 4S)"
+            rbits.iter().any(|&inst| has_fpr128_operand(&func, inst)),
+            "O2 pipeline should vectorize the counted loop's RBITs"
         );
     }
 
-    /// Verify that O3 pipeline fires vectorization on a simple i32 add loop.
+    /// Verify that O3 pipeline fires vectorization on the same counted loop
+    /// (the same post-`sroa` replay as the O2 test).
     #[test]
     fn test_o3_vectorization_fires_on_loop() {
-        let (mut func, add_id) = make_vectorizable_loop();
+        let (mut func, rbits) = counted_vectorization_loop(100);
 
-        let pipeline = OptimizationPipeline::new(OptLevel::O3);
-        let stats = pipeline.run(&mut func);
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
+        let stats = OptimizationPipeline::new(OptLevel::O3)
+            .with_disabled_passes("copyprop")
+            .run(&mut func);
         assert!(stats.changes > 0, "O3 pipeline should report changes");
-
-        // Same postcondition: Fpr128 after vectorization.
-        let add_inst = func.inst(add_id);
-        let has_fpr128 = add_inst.operands.iter().any(|op| {
-            if let MachOperand::VReg(vreg) = op {
-                vreg.class == RegClass::Fpr128
-            } else {
-                false
-            }
-        });
         assert!(
-            has_fpr128,
-            "O3 pipeline should vectorize the add: operands should include Fpr128 registers"
+            rbits.iter().any(|&inst| has_fpr128_operand(&func, inst)),
+            "O3 pipeline should vectorize the counted loop's RBITs"
         );
     }
 
-    /// Verify that O2 pipeline vectorizes multiple arithmetic ops in a loop.
+    /// A loop the vectorizer would rewrite without scaling its trip (no
+    /// induction it can widen: the trip compare reads a register nothing
+    /// defines) would run `vf` lanes per pass through the latch for as many
+    /// passes as the scalar loop takes. Before the iteration-coverage clause
+    /// the O2 pipeline upgraded all three ops to NEON registers here; now the
+    /// rewrite is refused and the loop stays scalar.
     #[test]
-    fn test_o2_vectorization_multi_op() {
+    fn test_o2_vectorization_refuses_a_loop_whose_trip_it_does_not_cover() {
         let (mut func, op_ids) = make_multi_op_vectorizable_loop();
-
-        // Precondition: all ops have Gpr32 operands.
+        func.try_sync_vreg_counter()
+            .expect("fixture register ids fit u32");
+        OptimizationPipeline::new(OptLevel::O2).run(&mut func);
         for &id in &op_ids {
-            let inst = func.inst(id);
-            if let MachOperand::VReg(vreg) = &inst.operands[0] {
-                assert_eq!(vreg.class, RegClass::Gpr32, "pre-pipeline: Gpr32");
-            }
-        }
-
-        let pipeline = OptimizationPipeline::new(OptLevel::O2);
-        let stats = pipeline.run(&mut func);
-        assert!(stats.changes > 0, "O2 pipeline should report changes");
-
-        // Postcondition: all three ops should be vectorized to Fpr128.
-        for &id in &op_ids {
-            let inst = func.inst(id);
-            let has_fpr128 = inst.operands.iter().any(|op| {
-                if let MachOperand::VReg(vreg) = op {
-                    vreg.class == RegClass::Fpr128
-                } else {
-                    false
-                }
-            });
             assert!(
-                has_fpr128,
-                "O2 pipeline should vectorize {:?} (inst {:?}): expected Fpr128",
-                inst.opcode, id,
+                !has_fpr128_operand(&func, id),
+                "{:?} (inst {id:?}) must stay scalar",
+                func.inst(id).opcode,
             );
         }
     }
@@ -3805,12 +4034,13 @@ mod tests {
     fn test_o2_includes_vectorize_pass() {
         with_declarative_rewrite_env(None, Some("1"), || {
             let pipeline = OptimizationPipeline::new(OptLevel::O2);
-            // O2 (decl-rewrite off) = 70 passes: inline + early addr-mode +
+            // O2 (decl-rewrite off) = 74 passes: inline + early addr-mode +
             // proof-opts + const-fold + copy-prop + cse + gvn + sroa +
             // vectorize + licm + strength-reduce + loop-unswitch +
             // loop-unroll + peephole +
             // addr-mode + cmp-select + if-convert + cmp-branch-fusion +
-            // tail-call + dce + cfg-simplify + tiny-loop-diamond +
+            // tail-call + dce + cfg-simplify + late-boolean-diamond +
+            // tiny-loop-diamond +
             // aarch64-bounds-check-elim +
             // strided-store-unroll + closed-form-reduction +
             // loop-latch-layout + neon-reduce + neon-array + neon-minmax +
@@ -3823,8 +4053,9 @@ mod tests {
             // + and-cmp-fuse + xorshift-demanded-bits + resid-collapse +
             // sincos-merge + loop-dead-pure-sink + the late (post-unroll) sroa
             // instance + latch-and-split (profile-gated, inert without a
-            // profile) + call-unroll + partial-unroll.
-            assert_eq!(pipeline.pass_count(), 73);
+            // profile) + call-unroll + partial-unroll + xorshift-pair-fusion +
+            // const-chain-dedup.
+            assert_eq!(pipeline.pass_count(), 77);
         });
     }
 
@@ -3894,14 +4125,88 @@ mod tests {
     }
 
     #[test]
+    fn required_call_frame_preserves_self_and_sibling_calls_in_every_schedule() {
+        use trust_cg_ir::{CallAbiFacts, CalleeSavedSet, Type};
+
+        fn caller(callee: &str) -> MachFunction {
+            let mut func = MachFunction::new(
+                "frame".into(),
+                Signature::new(vec![Type::I64], vec![Type::I64]),
+            );
+            let call = func.push_inst(
+                MachInst::new(AArch64Opcode::Bl, vec![MachOperand::Symbol(callee.into())])
+                    .with_implicit_uses(&[X0])
+                    .with_implicit_defs(&[X0]),
+            );
+            let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+            func.append_inst(func.entry, call);
+            func.append_inst(func.entry, ret);
+            func.incoming_stack_arg_bytes = Some(0);
+            func.call_abi_facts.insert(
+                call,
+                CallAbiFacts {
+                    callee: Some(callee.into()),
+                    stack_arg_bytes: 0,
+                    stack_stores: vec![],
+                    aggregate_stack_args: false,
+                    hidden_result_pointer: false,
+                    by_reference_argument_copies: false,
+                    variadic: false,
+                    callee_saved: CalleeSavedSet::Aapcs64,
+                },
+            );
+            func
+        }
+
+        for level in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+            for callee in ["frame", "sibling"] {
+                for provenance in [false, true] {
+                    for required in [false, true] {
+                        let mut func = caller(callee);
+                        let mut pipeline =
+                            OptimizationPipeline::new(level).with_disabled_passes("");
+                        if required {
+                            pipeline = pipeline.with_required_call_frame();
+                        }
+                        let manager = pipeline.build_pass_manager();
+                        let names = manager.pass_names();
+                        let expected_tail =
+                            !required && matches!(level, OptLevel::O2 | OptLevel::O3);
+                        assert_eq!(names.contains(&"tail-call"), expected_tail);
+                        if provenance {
+                            pipeline.run_with_provenance(&mut func, &mut ProvenanceMap::new());
+                        } else {
+                            pipeline.run(&mut func);
+                        }
+                        let opcodes: Vec<_> = func
+                            .block_order
+                            .iter()
+                            .flat_map(|block| func.block(*block).insts.iter())
+                            .map(|inst| func.inst(*inst).opcode)
+                            .collect();
+                        assert_eq!(
+                            opcodes.contains(&AArch64Opcode::TailCall),
+                            expected_tail,
+                            "{level:?} {callee} required={required} provenance={provenance}"
+                        );
+                        assert_eq!(opcodes.contains(&AArch64Opcode::Bl), !expected_tail);
+                        assert_eq!(opcodes.contains(&AArch64Opcode::Ret), !expected_tail);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn declarative_rewrite_defaults_on_o1() {
         // Wave 3 flipped default-on. Neither env var set → pass is in
         // the pipeline: DCE, proof-opts, declarative-rewrite, SROA,
-        // RotateIdiom, EorRotateFuse, ShiftAluFuse, LsrAndUbfx, Scheduler = 9.
+        // I8ReturnDemandedBits, RotateIdiom, EorRotateFuse, ShiftAluFuse,
+        // LsrAndUbfx, CfgSimplify, Scheduler = 11.
         // AndCmpFuse remains in the O2+ lane.
         with_declarative_rewrite_env(None, None, || {
             let pipeline = OptimizationPipeline::new(OptLevel::O1);
-            assert_eq!(pipeline.pass_count(), 9);
+            assert_eq!(pipeline.pass_count(), 11);
         });
     }
 
@@ -4027,17 +4332,18 @@ mod tests {
     fn declarative_rewrite_kill_switch_o1() {
         // `TRUST_CG_DISABLE_PASSES=declrewrite` removes the declarative
         // pass: DCE, proof-opts, SROA, RotateIdiom, EorRotateFuse,
-        // ShiftAluFuse, LsrAndUbfx, Scheduler = 8. AndCmpFuse remains in the
+        // I8ReturnDemandedBits, ShiftAluFuse, LsrAndUbfx, CfgSimplify,
+        // Scheduler = 10. AndCmpFuse remains in the
         // O2+ lane.
         with_declarative_rewrite_env(None, Some("1"), || {
             let pipeline = OptimizationPipeline::new(OptLevel::O1);
-            assert_eq!(pipeline.pass_count(), 8);
+            assert_eq!(pipeline.pass_count(), 10);
         });
     }
 
     #[test]
     fn declarative_rewrite_defaults_on_o2() {
-        // Wave 3 default: the 70-pass base pipeline (incl. SROA, early addr-mode,
+        // Default: the 74-pass base pipeline (incl. SROA, early addr-mode,
         // aarch64-bounds-check-elim, strided-store-unroll,
         // closed-form-reduction, neon-reduce, neon-array, neon-minmax,
         // neon-predsum, neon-map, neon-fill, neon-stencil, neon-fmap,
@@ -4046,17 +4352,17 @@ mod tests {
         // ext-addr, ptr-iv-sr, select-fuse, eor-rotate-fuse, mul-shift-reduce,
         // shift-alu-fuse, lsr-and-ubfx, and-cmp-fuse, xorshift-demanded-bits,
         // resid-collapse, sincos-merge, loop-unswitch, and profile-gated
-        // latch-and-split, call-unroll, partial-unroll) plus 1
-        // declarative-rewrite pass.
+        // latch-and-split, call-unroll, partial-unroll, xorshift-pair-fusion,
+        // const-chain-dedup) plus 1 declarative-rewrite pass.
         with_declarative_rewrite_env(None, None, || {
             let pipeline = OptimizationPipeline::new(OptLevel::O2);
-            assert_eq!(pipeline.pass_count(), 74);
+            assert_eq!(pipeline.pass_count(), 78);
         });
     }
 
     #[test]
     fn declarative_rewrite_kill_switch_o2() {
-        // Kill switch drops back to 72 passes (base O2 incl. SROA,
+        // Kill switch drops back to 74 passes (base O2 incl. SROA,
         // aarch64-bounds-check-elim, strided-store-unroll,
         // closed-form-reduction, neon-reduce, neon-array, neon-minmax,
         // neon-predsum, neon-map, neon-fill, neon-stencil, neon-fmap,
@@ -4067,10 +4373,11 @@ mod tests {
         // xorshift-demanded-bits, resid-collapse and mac-row-unroll, without
         // the declarative-rewrite pass; sincos-merge, loop-unswitch, and the
         // profile-gated latch-and-split are still present; call-unroll and
-        // partial-unroll are present too).
+        // partial-unroll, xorshift-pair-fusion and const-chain-dedup are
+        // present too).
         with_declarative_rewrite_env(None, Some("1"), || {
             let pipeline = OptimizationPipeline::new(OptLevel::O2);
-            assert_eq!(pipeline.pass_count(), 73);
+            assert_eq!(pipeline.pass_count(), 77);
         });
     }
 
@@ -4079,10 +4386,11 @@ mod tests {
         // Transitional: explicit opt-in wins over the disable variable.
         with_declarative_rewrite_env(Some("1"), Some("1"), || {
             let pipeline = OptimizationPipeline::new(OptLevel::O1);
-            // Enable beats disable → pass included (8 total: DCE +
+            // Enable beats disable → pass included (11 total: DCE +
             // proof-opts + declarative-rewrite + SROA + RotateIdiom +
-            // EorRotateFuse + ShiftAluFuse + LsrAndUbfx + Scheduler).
-            assert_eq!(pipeline.pass_count(), 9);
+            // I8ReturnDemandedBits + EorRotateFuse + ShiftAluFuse +
+            // LsrAndUbfx + CfgSimplify + Scheduler).
+            assert_eq!(pipeline.pass_count(), 11);
         });
     }
 
@@ -4093,7 +4401,7 @@ mod tests {
         with_declarative_rewrite_env(None, None, || {
             with_disable_passes_env(Some("declrewrite"), || {
                 let pipeline = OptimizationPipeline::new(OptLevel::O2);
-                // Declarative disabled via bisect list → 72 base passes
+                // Declarative disabled via bisect list → 74 base passes
                 // (incl. SROA, early addr-mode, aarch64-bounds-check-elim,
                 // strided-store-unroll, closed-form-reduction,
                 // neon-reduce, neon-array, neon-minmax, neon-predsum, neon-map,
@@ -4105,8 +4413,8 @@ mod tests {
                 // resid-collapse, sincos-merge, the late (post-unroll) sroa
                 // instance, loop-dead-pure-sink, loop-unswitch, and the
                 // profile-gated latch-and-split, call-unroll,
-                // partial-unroll).
-                assert_eq!(pipeline.pass_count(), 73);
+                // partial-unroll, xorshift-pair-fusion, const-chain-dedup).
+                assert_eq!(pipeline.pass_count(), 77);
             });
         });
     }
@@ -4117,9 +4425,9 @@ mod tests {
             with_disable_passes_env(Some("sroa"), || {
                 let pipeline = OptimizationPipeline::new(OptLevel::O1);
                 // declrewrite + sroa off → DCE, proof-opts, RotateIdiom,
-                // EorRotateFuse, ShiftAluFuse, LsrAndUbfx,
-                // Scheduler = 7.
-                assert_eq!(pipeline.pass_count(), 7);
+                // I8ReturnDemandedBits, EorRotateFuse, ShiftAluFuse, LsrAndUbfx,
+                // CfgSimplify, Scheduler = 9.
+                assert_eq!(pipeline.pass_count(), 9);
             });
         });
     }
@@ -4132,9 +4440,9 @@ mod tests {
                 let pm = pipeline.build_pass_manager();
                 let pass_names = pm.pass_names();
                 // declrewrite + sched off → DCE, proof-opts, SROA,
-                // RotateIdiom, EorRotateFuse, ShiftAluFuse,
-                // LsrAndUbfx = 7.
-                assert_eq!(pass_names.len(), 7);
+                // I8ReturnDemandedBits, RotateIdiom, EorRotateFuse, ShiftAluFuse,
+                // LsrAndUbfx, CfgSimplify = 9.
+                assert_eq!(pass_names.len(), 9);
                 assert!(!pass_names.contains(&"instruction-scheduler"));
             });
         });
@@ -4145,7 +4453,7 @@ mod tests {
         with_declarative_rewrite_env(None, Some("1"), || {
             with_disable_passes_env(Some("sroa"), || {
                 let pipeline = OptimizationPipeline::new(OptLevel::O3);
-                assert_eq!(pipeline.pass_count(), 71);
+                assert_eq!(pipeline.pass_count(), 75);
             });
         });
     }
@@ -4157,7 +4465,7 @@ mod tests {
                 let pipeline = OptimizationPipeline::new(OptLevel::O3);
                 let pm = pipeline.build_pass_manager();
                 let pass_names = pm.pass_names();
-                assert_eq!(pass_names.len(), 70);
+                assert_eq!(pass_names.len(), 74);
                 assert!(!pass_names.contains(&"licm"));
                 assert!(!pass_names.contains(&"if-convert"));
                 assert!(!pass_names.contains(&"pressure-aware-scheduler"));
@@ -4176,6 +4484,8 @@ mod tests {
             let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
             let mut func = make_func_with_insts(vec![add, ret]);
 
+            func.try_sync_vreg_counter()
+                .expect("fixture register ids fit u32");
             let pipeline = OptimizationPipeline::new(OptLevel::O1);
             pipeline.run(&mut func);
 

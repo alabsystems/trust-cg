@@ -91,6 +91,14 @@ pub mod gpr {
         V29,
         V30,
         V31,
+        W0,
+        W1,
+        W2,
+        W3,
+        W4,
+        W5,
+        W6,
+        W7,
         X0,
         X1,
         X2,
@@ -130,7 +138,12 @@ pub mod gpr {
 /// Where a single argument or return value is placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgLocation {
-    /// In a general-purpose register (X0-X7 for args, X0-X7 for returns).
+    /// A logical empty aggregate with no physical argument bytes or slot.
+    /// Later arguments retain their register/stack positions; this value
+    /// remains present in the original signature.
+    Ignore,
+    /// In a register. Integer parameters use X0-X7; I8/I16/I32 returns use
+    /// the width-precise W0-W7 aliases.
     Reg(PReg),
     /// On the stack at `[SP + offset]`, occupying `size` bytes.
     Stack { offset: i64, size: u32 },
@@ -194,6 +207,12 @@ pub enum ClassifyResult {
         count: usize,
         first_reg: PReg,
     },
+    /// Homogeneous short-vector aggregate: 1-4 equal-width V64/V128 members.
+    Hva {
+        base_ty: HvaBaseType,
+        count: usize,
+        first_reg: PReg,
+    },
 }
 
 /// The base floating-point element type of an HFA (Homogeneous Floating-point
@@ -206,6 +225,40 @@ pub enum HfaBaseType {
     F32,
     /// 64-bit float (double / f64)
     F64,
+}
+
+/// AAPCS64 short-vector homogeneity depends on total vector width, not lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvaBaseType {
+    V64,
+    V128,
+}
+
+/// Shared marshalling descriptor without changing the public float-only HFA API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomogeneousAggregateBase {
+    Float(HfaBaseType),
+    Vector(HvaBaseType),
+}
+
+impl HomogeneousAggregateBase {
+    pub fn element_bytes(self) -> u32 {
+        match self {
+            Self::Float(HfaBaseType::F16) => 2,
+            Self::Float(HfaBaseType::F32) => 4,
+            Self::Float(HfaBaseType::F64) | Self::Vector(HvaBaseType::V64) => 8,
+            Self::Vector(HvaBaseType::V128) => 16,
+        }
+    }
+
+    pub fn argument_registers(self) -> &'static [PReg] {
+        match self {
+            Self::Float(HfaBaseType::F16) => &H_ARG_REGS,
+            Self::Float(HfaBaseType::F32) => &S_ARG_REGS,
+            Self::Float(HfaBaseType::F64) | Self::Vector(HvaBaseType::V64) => &D_ARG_REGS,
+            Self::Vector(HvaBaseType::V128) => &FPR_ARG_REGS,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +275,23 @@ const GPR_ARG_REGS: [PReg; 8] = [
     gpr::X5,
     gpr::X6,
     gpr::X7,
+];
+
+/// Width-precise GPR return aliases for scalar values no wider than 32 bits.
+///
+/// The declared scalar width is the ABI obligation for I8/I16/I32. Keeping
+/// this distinct from [`GPR_ARG_REGS`] avoids widening a narrow return to X
+/// solely to describe its location. B1 deliberately remains on the X-register
+/// path because ISel carries it in GPR64.
+const GPR32_RETURN_REGS: [PReg; 8] = [
+    gpr::W0,
+    gpr::W1,
+    gpr::W2,
+    gpr::W3,
+    gpr::W4,
+    gpr::W5,
+    gpr::W6,
+    gpr::W7,
 ];
 
 /// FPR argument registers: V0-V7 (128-bit view, used for all FP/SIMD args)
@@ -387,11 +457,16 @@ const CALL_CLOBBER_FPRS: [PReg; 24] = [
 /// the callee reads them from another. It does not show up in a program
 /// compiled entirely by trust-cg, because both sides are then wrong the same
 /// way -- only against LLVM-compiled code, libc, or any mixed build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// There is deliberately no `Default`: every production entry selects the
+/// variant with [`Self::from_target_triple`], which refuses an empty or
+/// unrecognized triple, and a directly constructed
+/// [`crate::isel::InstructionSelector`] refuses ABI-dependent selection until
+/// a variant is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AArch64AbiVariant {
     /// Apple arm64 DarwinPCS: macOS/iOS on Apple silicon. Narrow fixed stack
     /// arguments are packed at natural size/alignment.
-    #[default]
     Darwin,
     /// Base AAPCS64: every AArch64 ELF target, including the
     /// `aarch64-unknown-linux-gnu` target trust-cg is developed against.
@@ -399,20 +474,60 @@ pub enum AArch64AbiVariant {
     Aapcs64,
 }
 
+/// Why [`AArch64AbiVariant::from_target_triple`] selected no calling
+/// convention. Both refusals carry the `[TCG-TARGET-ABI]` tag.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AArch64AbiTargetError {
+    /// No triple was supplied. The object format (Mach-O/ELF) and calling
+    /// convention (DarwinPCS/AAPCS64) are target facts, so an empty triple is
+    /// refused rather than defaulting to Apple arm64.
+    #[error(
+        "[TCG-TARGET-ABI] no target triple was supplied: the AArch64 calling convention (DarwinPCS or AAPCS64) and object format (Mach-O or ELF) are target-specific, so an empty triple is refused rather than defaulting to Apple arm64; name the target explicitly (e.g. aarch64-apple-darwin or aarch64-unknown-linux-gnu)"
+    )]
+    Empty,
+    /// The triple is not an AArch64 triple whose OS family has a modeled
+    /// calling convention.
+    #[error(
+        "[TCG-TARGET-ABI] target triple `{0}` selects no modeled AArch64 calling convention: only Apple triples (DarwinPCS, Mach-O) and Linux/Android/BSD/illumos/Solaris triples (AAPCS64, ELF) are lowered"
+    )]
+    Unrecognized(String),
+}
+
 impl AArch64AbiVariant {
     /// Select the ABI from the compilation target, never from the host.
     ///
-    /// Apple triples get DarwinPCS; everything else gets standard AAPCS64.
-    /// An empty triple keeps the historical Darwin default for direct/test
-    /// construction sites -- matching
-    /// `reject_unsupported_aarch64_object_format`'s empty-triple behaviour --
-    /// so this does not silently reclassify existing callers; the production
-    /// pipeline always supplies its target.
-    pub fn from_target_triple(triple: &str) -> Self {
-        if triple.is_empty() || triple.contains("-apple-") || triple.ends_with("-darwin") {
-            Self::Darwin
+    /// AArch64 triples of the ELF OS families the object writer supports get
+    /// base AAPCS64; other Apple triples (`-apple-`, `-darwin`) get DarwinPCS.
+    /// The OS markers and their precedence match the pipeline's object-format
+    /// selection, so the ABI and the object format come from the same facts. An empty
+    /// triple, a non-AArch64 architecture, an architecture-only alias and any
+    /// other OS (for example Windows, whose variadic convention differs) are
+    /// refused with a typed [`AArch64AbiTargetError`].
+    pub fn from_target_triple(triple: &str) -> Result<Self, AArch64AbiTargetError> {
+        if triple.is_empty() {
+            return Err(AArch64AbiTargetError::Empty);
+        }
+        let unrecognized = || AArch64AbiTargetError::Unrecognized(triple.to_owned());
+        let architecture = triple.split('-').next().unwrap_or_default();
+        if !matches!(architecture, "aarch64" | "arm64") {
+            return Err(unrecognized());
+        }
+        // ELF OS markers win over an Apple vendor, exactly as the pipeline's
+        // object-format choice does (`aarch64-apple-linux-gnu` is an ELF,
+        // no-red-zone target).
+        let elf_os = triple.contains("-linux-")
+            || triple.ends_with("-linux")
+            || triple.contains("-freebsd")
+            || triple.contains("-netbsd")
+            || triple.contains("-openbsd")
+            || triple.contains("-illumos")
+            || triple.contains("-solaris");
+        if elf_os {
+            Ok(Self::Aapcs64)
+        } else if triple.contains("-apple-") || triple.ends_with("-darwin") {
+            Ok(Self::Darwin)
         } else {
-            Self::Aapcs64
+            Err(unrecognized())
         }
     }
 }
@@ -479,6 +594,55 @@ fn place_scalar_stack_arg(
     loc
 }
 
+/// Align a by-value composite before assigning its stack slot. Register
+/// exhaustion does not reset NSAA: an earlier scalar may have left it at 8
+/// modulo 16 (or at any byte offset with Darwin's packed named arguments).
+/// Large indirect arguments must use the scalar POINTER path instead, not the
+/// aggregate's alignment.
+///
+/// * AAPCS64 C.4/C.5/C.14: the copy's natural alignment, at least eight, and
+///   the NSAA advances by the size rounded up to a multiple of 8 (an HFA/HVA
+///   included).
+/// * DarwinPCS HFA/HVA: clang passes the member array, and LLVM allocates each
+///   member at its own size, the first at the members' natural alignment
+///   (`CC_AArch64_Custom_Block`, no 8-byte minimum on Darwin), so a `float`
+///   HFA after a packed `float` starts at `[sp, #4]` and the next argument
+///   follows its last member with no rounding.
+/// * Every other DarwinPCS by-value composite is at most 16 bytes here, and
+///   clang coerces it to `i64`, `[2 x i64]` or `i128`: an 8-aligned (16 for a
+///   16-aligned composite) slot of whole 8-byte units, whatever the natural
+///   alignment of its members (`struct { uint8_t; uint16_t; }` after a packed
+///   `uint8_t` starts at `[sp, #8]`, not `[sp, #2]`).
+///
+/// `e2e_aarch64_aggregate_stack_darwin` checks the Darwin rules against Apple
+/// clang in both directions.
+fn place_composite_stack_arg(
+    variant: AArch64AbiVariant,
+    stack_offset: &mut i64,
+    ty: &Type,
+) -> ArgLocation {
+    let natural = i64::from(ty.align());
+    let packed_members = variant == AArch64AbiVariant::Darwin
+        && AppleAArch64ABI::classify_homogeneous_aggregate(ty).is_some();
+    let alignment = if packed_members {
+        natural
+    } else {
+        natural.max(8)
+    };
+    *stack_offset = align_up(*stack_offset, alignment);
+    let size = ty.bytes();
+    let location = ArgLocation::Stack {
+        offset: *stack_offset,
+        size,
+    };
+    *stack_offset += if packed_members {
+        i64::from(size)
+    } else {
+        align_up(i64::from(size), 8)
+    };
+    location
+}
+
 /// Apple AArch64 (DarwinPCS) calling convention implementation.
 ///
 /// Follows the ARM AAPCS64 base with Apple-specific modifications:
@@ -500,76 +664,76 @@ impl AppleAArch64ABI {
     /// Reference: AAPCS64 sec. 6.4.2 "Homogeneous Aggregates"
     /// Reference: Apple ARM64 ABI documentation
     fn detect_hfa(ty: &Type) -> Option<(Type, usize)> {
-        match ty {
-            Type::Struct(fields) => {
-                if fields.is_empty() || fields.len() > 4 {
-                    return None;
-                }
-                // All fields must be the same FP type (F32 or F64).
-                // Nested structs/arrays: recursively flatten to check.
-                let mut flat_fields = Vec::new();
-                for field in fields {
-                    Self::flatten_hfa_fields(field, &mut flat_fields);
-                }
-                if flat_fields.is_empty() || flat_fields.len() > 4 {
-                    return None;
-                }
-                let base = &flat_fields[0];
-                if !matches!(base, Type::F16 | Type::F32 | Type::F64) {
-                    return None;
-                }
-                if flat_fields.iter().all(|f| f == base) {
-                    Some((base.clone(), flat_fields.len()))
-                } else {
-                    None
-                }
-            }
-            Type::Array(elem, count) => {
-                let count = *count as usize;
-                if count == 0 || count > 4 {
-                    return None;
-                }
-                // Element must be F32 or F64 (or itself an HFA that flattens to same type).
-                match elem.as_ref() {
-                    Type::F16 => Some((Type::F16, count)),
-                    Type::F32 => Some((Type::F32, count)),
-                    Type::F64 => Some((Type::F64, count)),
-                    _ => {
-                        // Check if element is itself an HFA (e.g., array of float-structs)
-                        if let Some((base, inner_count)) = Self::detect_hfa(elem) {
-                            let total = count * inner_count;
-                            if total <= 4 {
-                                Some((base, total))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                }
-            }
-            _ => None,
-        }
+        Self::detect_homogeneous(ty)
+            .filter(|(base, _)| matches!(base, Type::F16 | Type::F32 | Type::F64))
     }
 
-    /// Recursively flatten struct/array fields to their leaf FP types for HFA detection.
-    fn flatten_hfa_fields(ty: &Type, out: &mut Vec<Type>) {
+    /// HFA and HVA share the same member rule after layout. V64 and V128 are
+    /// distinct fundamental types, including through nested arrays.
+    ///
+    /// Members are counted after flattening, never as declared fields, and a
+    /// zero-sized member contributes none: `struct { double a; struct {} z;
+    /// double b, c, d; }` is an HFA of four doubles, which GCC 13 on Linux
+    /// AArch64 passes in d0-d3 (probed with `gcc -O2`; clang's
+    /// `isHomogeneousAggregate` skips empty records the same way, and rustc
+    /// ignores `()`, empty structs and `PhantomData`). A zero-LENGTH array
+    /// member (`double z[0]`, or `struct {} z[0]`) is different: GCC and clang
+    /// both make the aggregate non-homogeneous, so it is passed by its size
+    /// class instead. rustc treats a Rust `[T; 0]` field as ignorable; this
+    /// classifier follows the C ABI (`StructPassingPolicy::NativeC`).
+    fn detect_homogeneous(ty: &Type) -> Option<(Type, usize)> {
+        if !matches!(ty, Type::Struct(_) | Type::Array(_, _)) {
+            return None;
+        }
+        let mut members = Vec::new();
+        if !Self::homogeneous_members(ty, &mut members) {
+            return None;
+        }
+        let base = members.first()?;
+        members
+            .iter()
+            .all(|member| member == base)
+            .then(|| (base.clone(), members.len()))
+    }
+
+    /// Append the homogeneous-aggregate members of `ty` to `out`: one per
+    /// floating-point or short-vector leaf, none for a zero-sized empty
+    /// struct (or a non-empty array of them). Returns `false` when `ty` cannot
+    /// be part of a homogeneous aggregate: another leaf type, a zero-length
+    /// array, or more than four members in all.
+    fn homogeneous_members(ty: &Type, out: &mut Vec<Type>) -> bool {
         match ty {
-            Type::F16 | Type::F32 | Type::F64 => out.push(ty.clone()),
-            Type::Struct(fields) => {
-                for field in fields {
-                    Self::flatten_hfa_fields(field, out);
-                }
+            Type::F16 | Type::F32 | Type::F64 | Type::V64 | Type::V128 => {
+                out.push(ty.clone());
+                out.len() <= 4
             }
+            Type::Struct(fields) => fields
+                .iter()
+                .all(|field| Self::homogeneous_members(field, out)),
             Type::Array(elem, count) => {
-                for _ in 0..*count {
-                    Self::flatten_hfa_fields(elem, out);
+                if *count == 0 {
+                    return false;
                 }
+                let mut one = Vec::new();
+                if !Self::homogeneous_members(elem, &mut one) {
+                    return false;
+                }
+                if one.is_empty() {
+                    return true;
+                }
+                let total = usize::try_from(*count)
+                    .ok()
+                    .and_then(|count| one.len().checked_mul(count))
+                    .and_then(|members| members.checked_add(out.len()));
+                if total.is_none_or(|total| total > 4) {
+                    return false;
+                }
+                for _ in 0..*count {
+                    out.extend(one.iter().cloned());
+                }
+                true
             }
-            Type::Enum { .. } => out.push(ty.clone()),
-            // Any non-FP leaf type makes this not an HFA
-            _ => out.push(ty.clone()),
+            _ => false,
         }
     }
 
@@ -584,6 +748,11 @@ impl AppleAArch64ABI {
     /// - Scalar overflow uses variant-specific stack slots: natural packing on
     ///   Darwin, at least 8 bytes/alignment under AAPCS64
     /// - Aggregates > 16 bytes: indirect via pointer in next GPR
+    ///
+    /// This is the DarwinPCS classification. Code lowering for a target
+    /// classifies with [`Self::classify_params_with`] and the variant that
+    /// [`AArch64AbiVariant::from_target_triple`] resolved; in this workspace
+    /// only tests and the rustc bridge's placement comparison call this form.
     pub fn classify_params(params: &[Type]) -> Vec<ArgLocation> {
         Self::classify_params_with(AArch64AbiVariant::Darwin, params)
     }
@@ -601,6 +770,10 @@ impl AppleAArch64ABI {
 
         for ty in params {
             match ty {
+                // Empty structures have size zero, alignment one and no
+                // fields. Their logical parameter consumes no argument bank
+                // or outgoing stack space on either supported PCS variant.
+                Type::Struct(fields) if fields.is_empty() => result.push(ArgLocation::Ignore),
                 // Integer and boolean types -> GPR
                 Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
                     if gpr_idx < GPR_ARG_REGS.len() {
@@ -720,15 +893,10 @@ impl AppleAArch64ABI {
                     //
                     // Reference: AAPCS64 sec. 6.4.2, Apple ARM64 ABI
                     // Reference: LLVM AArch64CallingConvention.td line 390+
-                    if let Some((base_ty, count)) = Self::detect_hfa(ty) {
+                    if let Some((base_ty, count)) = Self::classify_homogeneous_aggregate(ty) {
                         if fpr_idx + count <= FPR_ARG_REGS.len() {
                             // Select the typed register array based on HFA element type.
-                            let typed_regs: &[PReg] = match base_ty {
-                                Type::F16 => &H_ARG_REGS,
-                                Type::F32 => &S_ARG_REGS,
-                                Type::F64 => &D_ARG_REGS,
-                                _ => &FPR_ARG_REGS, // fallback (shouldn't happen)
-                            };
+                            let typed_regs = base_ty.argument_registers();
                             // Build explicit register sequence for code generation.
                             let regs: Vec<PReg> =
                                 (fpr_idx..fpr_idx + count).map(|i| typed_regs[i]).collect();
@@ -736,12 +904,7 @@ impl AppleAArch64ABI {
                             fpr_idx += count;
                         } else {
                             // Not enough FPR slots: entire HFA goes on stack.
-                            let size = ty.bytes();
-                            result.push(ArgLocation::Stack {
-                                offset: stack_offset,
-                                size,
-                            });
-                            stack_offset += align_up(size as i64, 8);
+                            result.push(place_composite_stack_arg(variant, &mut stack_offset, ty));
                             // AAPCS64 C.5: once an HFA/HVA is passed on the stack,
                             // the NSRN is set to 8 — no later SIMD/FP argument may
                             // BACKFILL an FPR the HFA skipped. Without this clamp a
@@ -781,14 +944,14 @@ impl AppleAArch64ABI {
                                 // (X7 here). Without this clamp caller and callee
                                 // disagree (clang leaves X7 unused and puts the next
                                 // scalar on the stack).
-                                result.push(ArgLocation::Stack {
-                                    offset: stack_offset,
-                                    size,
-                                });
-                                stack_offset += align_up(size as i64, 8);
+                                result.push(place_composite_stack_arg(
+                                    variant,
+                                    &mut stack_offset,
+                                    ty,
+                                ));
                                 gpr_idx = GPR_ARG_REGS.len();
                             }
-                        } else if size > 16 {
+                        } else if Self::passes_composite_by_reference(ty) {
                             // Large aggregates: pass indirect via pointer
                             if gpr_idx < GPR_ARG_REGS.len() {
                                 result.push(ArgLocation::Indirect {
@@ -796,11 +959,12 @@ impl AppleAArch64ABI {
                                 });
                                 gpr_idx += 1;
                             } else {
-                                result.push(ArgLocation::Stack {
-                                    offset: stack_offset,
-                                    size: 8, // pointer size
-                                });
-                                stack_offset += 8;
+                                result.push(place_scalar_stack_arg(
+                                    variant,
+                                    &mut stack_offset,
+                                    8,
+                                    8,
+                                ));
                                 // NGRN already exhausted here; clamp defensively so
                                 // the no-backfill invariant holds regardless.
                                 gpr_idx = GPR_ARG_REGS.len();
@@ -808,11 +972,7 @@ impl AppleAArch64ABI {
                         } else {
                             // size <= 16 with the GPRs already exhausted: spill
                             // whole to the stack and keep NGRN pinned at 8.
-                            result.push(ArgLocation::Stack {
-                                offset: stack_offset,
-                                size,
-                            });
-                            stack_offset += align_up(size as i64, 8);
+                            result.push(place_composite_stack_arg(variant, &mut stack_offset, ty));
                             gpr_idx = GPR_ARG_REGS.len();
                         }
                     }
@@ -826,12 +986,19 @@ impl AppleAArch64ABI {
     /// Classify return values.
     ///
     /// Rules:
-    /// - Integer: X0 (single), X0+X1 (pair)
+    /// - Integer: W0 for I8/I16/I32, X0 for B1/I64, X0+X1 for I128
     /// - Float: V0 (single), V0+V1 (pair)
     /// - HFA aggregate: V0-V3 (1-4 FP registers)
     /// - Small aggregate (<= 16 bytes, non-HFA): X0 (<=8 bytes), X0+X1 (<=16 bytes)
     /// - Large aggregate (> 16 bytes): indirect via X8 pointer (sret)
-    /// - Up to 4 return values in registers per AAPCS64
+    ///
+    /// Multiple independent IR results use TrustCG's internal multi-result
+    /// convention: scalar integer results consume X0-X7 (or their W-register
+    /// counterparts), and scalar FP results consume their separate register
+    /// sequence. This is not a C ABI rule for returning an aggregate of that
+    /// total size. A C aggregate return is one aggregate type, classified by
+    /// the size/HFA/sret rules above; four registers is the HFA lane limit,
+    /// not a blanket limit on internal scalar result slots.
     pub fn classify_returns(returns: &[Type]) -> Vec<ArgLocation> {
         let mut result = Vec::with_capacity(returns.len());
         let mut gpr_idx: usize = 0;
@@ -839,7 +1006,17 @@ impl AppleAArch64ABI {
 
         for ty in returns {
             match ty {
-                Type::B1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
+                Type::I8 | Type::I16 | Type::I32 => {
+                    if gpr_idx < GPR32_RETURN_REGS.len() {
+                        result.push(ArgLocation::Reg(GPR32_RETURN_REGS[gpr_idx]));
+                        gpr_idx += 1;
+                    } else {
+                        // Too many return values for registers -> indirect
+                        result.push(ArgLocation::Indirect { ptr_reg: gpr::X8 });
+                    }
+                }
+
+                Type::B1 | Type::I64 => {
                     if gpr_idx < GPR_ARG_REGS.len() {
                         result.push(ArgLocation::Reg(GPR_ARG_REGS[gpr_idx]));
                         gpr_idx += 1;
@@ -908,15 +1085,10 @@ impl AppleAArch64ABI {
                 Type::Struct(_) | Type::Array(_, _) | Type::Enum { .. } => {
                     // Check for HFA: return in consecutive typed FPR registers.
                     // F32 HFA -> S0-S3, F64 HFA -> D0-D3.
-                    if let Some((base_ty, count)) = Self::detect_hfa(ty) {
+                    if let Some((base_ty, count)) = Self::classify_homogeneous_aggregate(ty) {
                         if fpr_idx + count <= 4 {
                             // HFA return in typed FPR registers (max 4).
-                            let typed_regs: &[PReg] = match base_ty {
-                                Type::F16 => &H_ARG_REGS,
-                                Type::F32 => &S_ARG_REGS,
-                                Type::F64 => &D_ARG_REGS,
-                                _ => &FPR_ARG_REGS,
-                            };
+                            let typed_regs = base_ty.argument_registers();
                             let regs: Vec<PReg> =
                                 (fpr_idx..fpr_idx + count).map(|i| typed_regs[i]).collect();
                             result.push(ArgLocation::RegSequence(regs));
@@ -967,7 +1139,7 @@ impl AppleAArch64ABI {
                     required.push(hi);
                 }
                 ArgLocation::RegSequence(regs) => required.extend(regs),
-                ArgLocation::Indirect { .. } | ArgLocation::Stack { .. } => {}
+                ArgLocation::Ignore | ArgLocation::Indirect { .. } | ArgLocation::Stack { .. } => {}
             }
         }
         required.sort_unstable();
@@ -1062,7 +1234,8 @@ impl AppleAArch64ABI {
         Some((ArgLocation::Reg(FPR_ARG_REGS[fpr_idx]), fpr_idx + 1))
     }
 
-    /// Total stack space consumed by overflow arguments.
+    /// Total stack space consumed by overflow arguments under DarwinPCS
+    /// (see [`Self::classify_params`]).
     pub fn stack_args_size(params: &[Type]) -> i64 {
         let locs = Self::classify_params(params);
         locs.iter()
@@ -1083,12 +1256,34 @@ impl AppleAArch64ABI {
     /// - Fixed params (`params[0..fixed_count]`) follow normal ABI classification
     ///   (GPR X0-X7, FPR V0-V7, then stack overflow).
     /// - Variadic params (`params[fixed_count..]`) are ALL placed on the stack,
-    ///   each 8-byte aligned, regardless of type. This differs from standard
-    ///   AAPCS64 which allows variadic args in registers.
+    ///   regardless of type, in slots of at least 8 bytes. This differs from
+    ///   standard AAPCS64 which allows variadic args in registers.
+    /// - A 16-byte-aligned anonymous argument (`I128`, `V128`, or an aggregate
+    ///   whose natural alignment is 16) starts at the next 16-aligned offset;
+    ///   every other anonymous argument is 8-aligned. See
+    ///   [`darwin_anonymous_vararg_align`].
     ///
     /// Reference: Apple ARM64 Function Calling Conventions, "Variadic Functions"
     /// Reference: LLVM AArch64ISelLowering.cpp CC_AArch64_DarwinPCS_VarArg
     pub fn classify_params_variadic(fixed_count: usize, params: &[Type]) -> Vec<ArgLocation> {
+        Self::classify_params_variadic_with(AArch64AbiVariant::Darwin, fixed_count, params)
+    }
+
+    /// Classify a variadic call using the compilation target's ABI.
+    ///
+    /// Base AAPCS64 marshals named and anonymous arguments with the same rules:
+    /// both register banks remain available until exhausted, including HFA,
+    /// aligned integer pairs, and indirect composite arguments. Darwin instead
+    /// puts the anonymous tail on the stack. Language-level default argument
+    /// promotions must already have been performed by the producer.
+    pub fn classify_params_variadic_with(
+        variant: AArch64AbiVariant,
+        fixed_count: usize,
+        params: &[Type],
+    ) -> Vec<ArgLocation> {
+        if variant == AArch64AbiVariant::Aapcs64 {
+            return Self::classify_params_with(variant, params);
+        }
         let fixed_params = if fixed_count <= params.len() {
             &params[..fixed_count]
         } else {
@@ -1098,12 +1293,17 @@ impl AppleAArch64ABI {
         // Classify fixed params normally.
         let mut result = Self::classify_params(fixed_params);
 
-        // Determine the stack offset after fixed parameter overflow.
+        // Determine the stack offset after fixed parameter overflow: the end of
+        // the last fixed stack BYTE. DarwinPCS packs narrow fixed stack
+        // arguments at natural size (`int32_t` at `[sp]` and `[sp, #4]`), so
+        // rounding each to its own 8-byte slot here would start the anonymous
+        // tail one slot late; every anonymous argument below is itself aligned
+        // to at least 8 (clang: `[sp, #8]` after two packed `int32_t`).
         let mut stack_offset: i64 = result
             .iter()
             .filter_map(|loc| {
                 if let ArgLocation::Stack { offset, size } = loc {
-                    Some(offset + align_up(*size as i64, 8))
+                    Some(offset + *size as i64)
                 } else {
                     None
                 }
@@ -1111,9 +1311,11 @@ impl AppleAArch64ABI {
             .max()
             .unwrap_or(0);
 
-        // All variadic arguments go on the stack, 8-byte aligned.
+        // All variadic arguments go on the stack: 8-aligned slots, except that
+        // a 16-byte-aligned argument is placed at the next 16-aligned offset.
         for ty in params.iter().skip(fixed_count) {
             let size = if ty.bytes() < 8 { 8 } else { ty.bytes() };
+            stack_offset = align_up(stack_offset, darwin_anonymous_vararg_align(ty));
             result.push(ArgLocation::Stack {
                 offset: stack_offset,
                 size,
@@ -1168,6 +1370,14 @@ impl AppleAArch64ABI {
             };
         }
 
+        if let Some((base_ty, count)) = Self::classify_hva(ty) {
+            return ClassifyResult::Hva {
+                base_ty,
+                count,
+                first_reg: gpr::V0,
+            };
+        }
+
         // Non-HFA aggregate: size-based classification.
         match ty.bytes() {
             0..=8 => ClassifyResult::InRegs {
@@ -1183,16 +1393,19 @@ impl AppleAArch64ABI {
     /// Classify a single variadic argument (Apple AArch64 ABI).
     ///
     /// On Apple arm64, ALL variadic arguments are passed on the stack,
-    /// regardless of type. Each argument occupies at least 8 bytes and is
-    /// 8-byte aligned. This differs from standard AAPCS64 which allows
-    /// variadic args in registers.
+    /// regardless of type. Each argument occupies at least 8 bytes. It is
+    /// 8-byte aligned unless its natural alignment is 16 (`I128`, `V128`, a
+    /// 16-aligned aggregate), in which case it is 16-byte aligned, matching
+    /// clang's caller and its `va_arg` cursor rounding. This differs from
+    /// standard AAPCS64 which allows variadic args in registers.
     ///
     /// Returns `(classification, next_stack_offset)` so callers can chain
     /// multiple variadic argument classifications.
     ///
     /// Reference: Apple ARM64 Function Calling Conventions, "Variadic Functions"
     pub fn classify_variadic(ty: &Type, stack_offset: i64) -> (ClassifyResult, i64) {
-        let offset = align_up(stack_offset, 8);
+        let align = darwin_anonymous_vararg_align(ty);
+        let offset = align_up(stack_offset, align);
         let size = ty.bytes().max(8);
         let next_offset = offset + align_up(size as i64, 8);
 
@@ -1200,7 +1413,7 @@ impl AppleAArch64ABI {
             ClassifyResult::OnStack {
                 offset,
                 size,
-                align: 8,
+                align: align as u32,
             },
             next_offset,
         )
@@ -1219,6 +1432,100 @@ impl AppleAArch64ABI {
             Type::F64 => Some((HfaBaseType::F64, count)),
             _ => None,
         })
+    }
+
+    pub fn classify_hva(ty: &Type) -> Option<(HvaBaseType, usize)> {
+        Self::detect_homogeneous(ty).and_then(|(base, count)| match base {
+            Type::V64 => Some((HvaBaseType::V64, count)),
+            Type::V128 => Some((HvaBaseType::V128, count)),
+            _ => None,
+        })
+    }
+
+    /// Whether an argument of type `ty` is a composite passed by reference:
+    /// larger than 16 bytes and not an HFA/HVA (AAPCS64 §6.8.2 B.4, kept by
+    /// DarwinPCS). The caller passes a pointer to a copy it allocates, in the
+    /// next GPR or, once X0-X7 are used, in an 8-byte stack slot, exactly as
+    /// it would pass a pointer. `classify_params_with`, instruction selection
+    /// and the trust-ir adapter all decide by-reference passing here.
+    pub fn passes_composite_by_reference(ty: &Type) -> bool {
+        ty.is_aggregate() && ty.bytes() > 16 && Self::classify_homogeneous_aggregate(ty).is_none()
+    }
+
+    pub fn classify_homogeneous_aggregate(ty: &Type) -> Option<(HomogeneousAggregateBase, usize)> {
+        Self::detect_homogeneous(ty).and_then(|(base, count)| {
+            let base = match base {
+                Type::F16 => HomogeneousAggregateBase::Float(HfaBaseType::F16),
+                Type::F32 => HomogeneousAggregateBase::Float(HfaBaseType::F32),
+                Type::F64 => HomogeneousAggregateBase::Float(HfaBaseType::F64),
+                Type::V64 => HomogeneousAggregateBase::Vector(HvaBaseType::V64),
+                Type::V128 => HomogeneousAggregateBase::Vector(HvaBaseType::V128),
+                _ => return None,
+            };
+            Some((base, count))
+        })
+    }
+}
+
+/// Stack alignment of one DarwinPCS anonymous (variadic) argument.
+///
+/// LLVM's `CC_AArch64_DarwinPCS_VarArg` assigns a split `i128` with
+/// `CCAssignToStack<8, 16>` and 128-bit vectors with `CCAssignToStack<16, 16>`.
+/// clang coerces a non-homogeneous aggregate of at most 16 bytes whose natural
+/// alignment is 16 to `i128`, so it too starts 16-aligned. A homogeneous
+/// floating-point aggregate is instead passed as a consecutive block
+/// (`CC_AArch64_Custom_Stack_Block`) at 8-byte alignment; everything else is
+/// `CCAssignToStack<8, 8>`. clang's Darwin `va_arg` rounds its `char *` cursor
+/// the same way. Observed from clang's own arm64-apple-darwin callers after
+/// one 8-byte vararg: `__int128`, `int32x4_t` and `struct { __int128 }` land at
+/// `[sp, #16]`; `struct { int64_t a, b; }` and `struct { double a, b, c; }`
+/// land at `[sp, #8]`. The native clang oracle is
+/// `tests/e2e_aarch64_darwin_variadic_wide.rs` in trust-cg-codegen.
+///
+/// [`darwin_anonymous_vararg_refusal`] names the aggregate shapes the
+/// selector refuses instead of placing (by-reference aggregates and
+/// short-vector HVAs); their value here is not used for lowering.
+pub(crate) fn darwin_anonymous_vararg_align(ty: &Type) -> i64 {
+    match ty {
+        Type::I128 | Type::V128 => 16,
+        Type::Struct(_) | Type::Array(_, _) | Type::Enum { .. } => {
+            let homogeneous = AppleAArch64ABI::classify_homogeneous_aggregate(ty).is_some();
+            if !homogeneous && ty.bytes() <= 16 && ty.align() >= 16 {
+                16
+            } else {
+                8
+            }
+        }
+        _ => 8,
+    }
+}
+
+/// Why the DarwinPCS anonymous tail cannot place this argument, if it cannot.
+///
+/// * A non-homogeneous aggregate larger than 16 bytes is passed by reference:
+///   clang stores a pointer to a caller-owned copy in the 8-byte slot, and the
+///   anonymous tail models only inline slots.
+/// * A homogeneous short-vector aggregate (HVA) has no reference placement:
+///   clang's own arm64-apple-darwin caller stores `struct { int32x4_t a, b; }`
+///   as an 8-aligned block while its `va_arg` reads it 16-aligned, so a clang
+///   caller and a clang callee disagree (observed at -O0 and -O2).
+///
+/// Homogeneous floating-point aggregates and every scalar are placeable.
+pub(crate) fn darwin_anonymous_vararg_refusal(ty: &Type) -> Option<&'static str> {
+    if !matches!(ty, Type::Struct(_) | Type::Array(_, _) | Type::Enum { .. }) {
+        return None;
+    }
+    match AppleAArch64ABI::classify_homogeneous_aggregate(ty) {
+        Some((HomogeneousAggregateBase::Vector(_), _)) => Some(
+            "a homogeneous short-vector aggregate has no consistent DarwinPCS anonymous \
+             placement (clang's caller and va_arg disagree)",
+        ),
+        Some((HomogeneousAggregateBase::Float(_), _)) => None,
+        None if ty.bytes() > 16 => Some(
+            "DarwinPCS passes a non-homogeneous anonymous aggregate larger than 16 bytes by \
+             reference to a caller copy, which is not lowered",
+        ),
+        None => None,
     }
 }
 
@@ -2120,6 +2427,26 @@ mod tests {
     fn required_return_pregs_flattens_register_results_and_excludes_sret_pointer() {
         assert_eq!(AppleAArch64ABI::required_return_pregs(&[]), Vec::new());
         assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::B1]),
+            vec![gpr::X0]
+        );
+        assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::I8]),
+            vec![gpr::W0]
+        );
+        assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::I16]),
+            vec![gpr::W0]
+        );
+        assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::I32]),
+            vec![gpr::W0]
+        );
+        assert_eq!(
+            AppleAArch64ABI::required_return_pregs(&[Type::I64]),
+            vec![gpr::X0]
+        );
+        assert_eq!(
             AppleAArch64ABI::required_return_pregs(&[Type::I128]),
             vec![gpr::X0, gpr::X1]
         );
@@ -2244,19 +2571,26 @@ mod tests {
     fn classify_return_i8() {
         let locs = AppleAArch64ABI::classify_returns(&[Type::I8]);
         assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0], ArgLocation::Reg(gpr::X0));
+        assert_eq!(locs[0], ArgLocation::Reg(gpr::W0));
     }
 
     #[test]
     fn classify_return_i16() {
         let locs = AppleAArch64ABI::classify_returns(&[Type::I16]);
         assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0], ArgLocation::Reg(gpr::X0));
+        assert_eq!(locs[0], ArgLocation::Reg(gpr::W0));
     }
 
     #[test]
     fn classify_return_i32() {
         let locs = AppleAArch64ABI::classify_returns(&[Type::I32]);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0], ArgLocation::Reg(gpr::W0));
+    }
+
+    #[test]
+    fn classify_return_i64_keeps_full_x_register() {
+        let locs = AppleAArch64ABI::classify_returns(&[Type::I64]);
         assert_eq!(locs.len(), 1);
         assert_eq!(locs[0], ArgLocation::Reg(gpr::X0));
     }
@@ -2523,6 +2857,124 @@ mod tests {
         let ty = Type::Array(Box::new(Type::F32), 0);
         let hfa = AppleAArch64ABI::detect_hfa(&ty);
         assert_eq!(hfa, None);
+    }
+
+    // ===================================================================
+    // Zero-sized members, against `gcc -O2` on Linux AArch64 (GCC 13):
+    // an empty struct member is skipped, a zero-length array member makes
+    // the aggregate non-homogeneous.
+    // ===================================================================
+
+    fn empty() -> Type {
+        Type::Struct(Vec::new())
+    }
+
+    #[test]
+    fn empty_struct_members_do_not_count_toward_the_hfa_limit() {
+        let f64x = |n| vec![Type::F64; n];
+        // struct { double a; struct {} z; double b, c, d; }: d0-d3.
+        let middle = Type::Struct([vec![Type::F64, empty()], f64x(3)].concat());
+        // struct { struct {} z; double a, b, c, d; } and the empty member last.
+        let first = Type::Struct([vec![empty()], f64x(4)].concat());
+        let last = Type::Struct([f64x(4), vec![empty()]].concat());
+        // struct { double a; struct {} z[2]; double b, c, d; }.
+        let array_of_empty =
+            Type::Struct([vec![Type::F64, Type::Array(Box::new(empty()), 2)], f64x(3)].concat());
+        // struct { double a; struct { struct {} z; } n; double b, c; }.
+        let nested = Type::Struct(vec![
+            Type::F64,
+            Type::Struct(vec![empty()]),
+            Type::F64,
+            Type::F64,
+        ]);
+        for (ty, count) in [
+            (&middle, 4),
+            (&first, 4),
+            (&last, 4),
+            (&array_of_empty, 4),
+            (&nested, 3),
+        ] {
+            assert_eq!(
+                AppleAArch64ABI::detect_hfa(ty),
+                Some((Type::F64, count)),
+                "{ty:?}"
+            );
+            for variant in [AArch64AbiVariant::Aapcs64, AArch64AbiVariant::Darwin] {
+                let locs = AppleAArch64ABI::classify_params_with(variant, std::slice::from_ref(ty));
+                let want: Vec<PReg> = D_ARG_REGS[..count].to_vec();
+                assert_eq!(
+                    locs,
+                    vec![ArgLocation::RegSequence(want)],
+                    "{variant:?} {ty:?}"
+                );
+            }
+            let returns = AppleAArch64ABI::classify_returns(std::slice::from_ref(ty));
+            assert!(
+                matches!(&returns[..], [ArgLocation::RegSequence(regs)] if regs.len() == count),
+                "{ty:?} returns {returns:?}"
+            );
+        }
+        // struct { float a; struct {} z; float b; }: s0, s1.
+        let floats = Type::Struct(vec![Type::F32, empty(), Type::F32]);
+        assert_eq!(AppleAArch64ABI::detect_hfa(&floats), Some((Type::F32, 2)));
+        // Five doubles and an empty member stay over the limit.
+        let five = Type::Struct([vec![Type::F64, empty()], f64x(4)].concat());
+        assert_eq!(AppleAArch64ABI::detect_hfa(&five), None);
+        assert!(five.bytes() > 16);
+        // Only zero-sized members: no members, not homogeneous.
+        assert_eq!(
+            AppleAArch64ABI::detect_hfa(&Type::Struct(vec![empty(), empty()])),
+            None
+        );
+    }
+
+    #[test]
+    fn zero_length_array_members_make_an_aggregate_non_homogeneous() {
+        let zero = |elem: Type| Type::Array(Box::new(elem), 0);
+        // struct { double a; double z[0]; double b, c, d; }: by reference.
+        let four = Type::Struct(vec![
+            Type::F64,
+            zero(Type::F64),
+            Type::F64,
+            Type::F64,
+            Type::F64,
+        ]);
+        // struct { double a; struct {} z[0]; double b, c, d; }: by reference.
+        let empty_elems = Type::Struct(vec![
+            Type::F64,
+            zero(empty()),
+            Type::F64,
+            Type::F64,
+            Type::F64,
+        ]);
+        for ty in [&four, &empty_elems] {
+            assert_eq!(AppleAArch64ABI::detect_hfa(ty), None, "{ty:?}");
+            let locs = AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Aapcs64,
+                std::slice::from_ref(ty),
+            );
+            assert_eq!(locs, vec![ArgLocation::Indirect { ptr_reg: gpr::X0 }]);
+        }
+        // struct { float a; float z[0]; float b; } (8 bytes): x0.
+        let small = Type::Struct(vec![Type::F32, zero(Type::F32), Type::F32]);
+        assert_eq!(AppleAArch64ABI::detect_hfa(&small), None);
+        assert_eq!(
+            AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Aapcs64,
+                std::slice::from_ref(&small)
+            ),
+            vec![ArgLocation::Reg(gpr::X0)]
+        );
+        // struct { double a; double z[0]; double b; } (16 bytes): x0, x1.
+        let pair = Type::Struct(vec![Type::F64, zero(Type::F64), Type::F64]);
+        assert_eq!(AppleAArch64ABI::detect_hfa(&pair), None);
+        assert_eq!(
+            AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Aapcs64,
+                std::slice::from_ref(&pair)
+            ),
+            vec![ArgLocation::RegPair(gpr::X0, gpr::X1)]
+        );
     }
 
     // ===================================================================
@@ -3562,12 +4014,16 @@ mod tests {
 
     #[test]
     fn classify_variadic_v128_goes_on_stack() {
-        assert_variadic_stack(
-            AppleAArch64ABI::classify_variadic(&Type::V128, 0),
-            0,
-            16,
-            16,
+        let (classify, next) = AppleAArch64ABI::classify_variadic(&Type::V128, 0);
+        assert_eq!(
+            classify,
+            ClassifyResult::OnStack {
+                offset: 0,
+                size: 16,
+                align: 16,
+            }
         );
+        assert_eq!(next, 16);
     }
 
     #[test]
@@ -3606,16 +4062,189 @@ mod tests {
                 align: 8,
             }
         );
+        // A 16-byte vector after one 8-byte slot starts at the next 16-aligned
+        // offset (clang: `str x0, [sp]` / `str q0, [sp, #16]`).
         let (second, final_next) = AppleAArch64ABI::classify_variadic(&Type::V128, next);
         assert_eq!(
             second,
             ClassifyResult::OnStack {
-                offset: 8,
+                offset: 16,
                 size: 16,
+                align: 16,
+            }
+        );
+        assert_eq!(final_next, 32);
+    }
+
+    #[test]
+    fn classify_variadic_i128_after_one_slot_is_sixteen_aligned() {
+        let (first, next) = AppleAArch64ABI::classify_variadic(&Type::I64, 0);
+        assert_eq!(
+            first,
+            ClassifyResult::OnStack {
+                offset: 0,
+                size: 8,
                 align: 8,
             }
         );
-        assert_eq!(final_next, 24);
+        let (second, final_next) = AppleAArch64ABI::classify_variadic(&Type::I128, next);
+        assert_eq!(
+            second,
+            ClassifyResult::OnStack {
+                offset: 16,
+                size: 16,
+                align: 16,
+            }
+        );
+        assert_eq!(final_next, 32);
+        // An 8-aligned 16-byte aggregate keeps 8-byte alignment (clang passes
+        // it as `[2 x i64]`, each half `CCAssignToStack<8, 8>`).
+        let pair = Type::Struct(vec![Type::I64, Type::I64]);
+        assert_variadic_stack(AppleAArch64ABI::classify_variadic(&pair, 8), 8, 16, 24);
+        let aligned = Type::Struct(vec![Type::I128]);
+        let (third, _) = AppleAArch64ABI::classify_variadic(&aligned, 8);
+        assert_eq!(
+            third,
+            ClassifyResult::OnStack {
+                offset: 16,
+                size: 16,
+                align: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn darwin_variadic_sixteen_aligned_tail_matches_clang_placement() {
+        // Placements observed from clang's own caller on arm64-apple-darwin:
+        //   take(int n, int64_t a, __int128 w, int64_t c)  a=[sp] w=[sp,#16] c=[sp,#32]
+        //   take(int n, int64_t a, int64_t b, __int128 w)  a=[sp] b=[sp,#8] w=[sp,#16]
+        //   take(int n, int64_t a, v4i32 v, int64_t c)     a=[sp] v=[sp,#16] c=[sp,#32]
+        for wide in [Type::I128, Type::V128] {
+            let one = [Type::I32, Type::I64, wide.clone(), Type::I64];
+            let locs = AppleAArch64ABI::classify_params_variadic(1, &one);
+            assert_eq!(locs[0], ArgLocation::Reg(gpr::X0));
+            assert_eq!(locs[1], ArgLocation::Stack { offset: 0, size: 8 });
+            assert_eq!(
+                locs[2],
+                ArgLocation::Stack {
+                    offset: 16,
+                    size: 16
+                },
+                "{wide:?} after one 8-byte vararg"
+            );
+            assert_eq!(
+                locs[3],
+                ArgLocation::Stack {
+                    offset: 32,
+                    size: 8
+                }
+            );
+            assert_eq!(AppleAArch64ABI::stack_args_size_variadic(1, &one), 40);
+
+            let two = [Type::I32, Type::I64, Type::I64, wide.clone(), Type::I64];
+            let locs = AppleAArch64ABI::classify_params_variadic(1, &two);
+            assert_eq!(locs[1], ArgLocation::Stack { offset: 0, size: 8 });
+            assert_eq!(locs[2], ArgLocation::Stack { offset: 8, size: 8 });
+            assert_eq!(
+                locs[3],
+                ArgLocation::Stack {
+                    offset: 16,
+                    size: 16
+                },
+                "{wide:?} after two 8-byte varargs"
+            );
+            assert_eq!(
+                locs[4],
+                ArgLocation::Stack {
+                    offset: 32,
+                    size: 8
+                }
+            );
+        }
+        // Aggregates, as clang places them after one 8-byte vararg: a
+        // non-homogeneous 16-aligned aggregate is coerced to i128 (16), while
+        // an 8-aligned pair and a floating-point HFA (even one larger than 16
+        // bytes) are 8-aligned inline blocks.
+        let s16 = Type::Struct(vec![Type::I128]);
+        let p16 = Type::Struct(vec![Type::I64, Type::I64]);
+        let d3 = Type::Struct(vec![Type::F64, Type::F64, Type::F64]);
+        for (aggregate, offset, next) in [(s16, 16, 32), (p16, 8, 24), (d3, 8, 32)] {
+            let locs = AppleAArch64ABI::classify_params_variadic(
+                1,
+                &[Type::I32, Type::I64, aggregate.clone(), Type::I64],
+            );
+            let size = aggregate.bytes();
+            assert_eq!(
+                locs[2],
+                ArgLocation::Stack { offset, size },
+                "{aggregate:?}"
+            );
+            assert_eq!(
+                locs[3],
+                ArgLocation::Stack {
+                    offset: next,
+                    size: 8
+                },
+                "{aggregate:?}"
+            );
+            assert_eq!(darwin_anonymous_vararg_refusal(&aggregate), None);
+        }
+        // Shapes the anonymous tail must not place: a >16-byte non-homogeneous
+        // aggregate (clang passes a pointer to a copy) and any short-vector
+        // HVA (clang's own caller and va_arg disagree). The selector refuses
+        // both (see `select_variadic_call`).
+        for refused in [
+            Type::Struct(vec![Type::I64, Type::I64, Type::I64]),
+            Type::Struct(vec![Type::V128]),
+            Type::Struct(vec![Type::V128, Type::V128]),
+        ] {
+            assert!(
+                darwin_anonymous_vararg_refusal(&refused).is_some(),
+                "{refused:?}"
+            );
+        }
+        for scalar in [Type::I128, Type::V128, Type::F64, Type::I32] {
+            assert_eq!(darwin_anonymous_vararg_refusal(&scalar), None);
+        }
+
+        // The tail starts after the last packed FIXED stack byte. clang's
+        // caller for take(8 x int64_t, int32_t s0, int32_t s1, int64_t a,
+        // __int128 w, int64_t c): s0=[sp] s1=[sp,#4] a=[sp,#8] w=[sp,#16]
+        // c=[sp,#32]. Rounding each fixed stack argument to an 8-byte slot
+        // would start the tail at [sp,#16] (native oracle:
+        // e2e_aarch64_darwin_variadic_wide.rs).
+        let mut narrow_fixed = vec![Type::I64; 8];
+        narrow_fixed.extend([Type::I32, Type::I32, Type::I64, Type::I128, Type::I64]);
+        let locs = AppleAArch64ABI::classify_params_variadic(10, &narrow_fixed);
+        assert_eq!(
+            locs[8..],
+            [
+                ArgLocation::Stack { offset: 0, size: 4 },
+                ArgLocation::Stack { offset: 4, size: 4 },
+                ArgLocation::Stack { offset: 8, size: 8 },
+                ArgLocation::Stack {
+                    offset: 16,
+                    size: 16
+                },
+                ArgLocation::Stack {
+                    offset: 32,
+                    size: 8
+                },
+            ]
+        );
+        assert_eq!(
+            AppleAArch64ABI::stack_args_size_variadic(10, &narrow_fixed),
+            40
+        );
+
+        // Base AAPCS64 is unaffected: anonymous arguments use the ordinary
+        // register rules there (the i128 pair starts at an even register).
+        let linux = AppleAArch64ABI::classify_params_variadic_with(
+            AArch64AbiVariant::Aapcs64,
+            1,
+            &[Type::I32, Type::I64, Type::I128],
+        );
+        assert_eq!(linux[2], ArgLocation::RegPair(gpr::X2, gpr::X3));
     }
 
     // --- classify_hfa tests ---
@@ -4178,7 +4807,7 @@ mod tests {
         ] {
             assert_eq!(
                 AArch64AbiVariant::from_target_triple(triple),
-                AArch64AbiVariant::Darwin,
+                Ok(AArch64AbiVariant::Darwin),
                 "{triple}"
             );
         }
@@ -4187,18 +4816,89 @@ mod tests {
             "aarch64-unknown-linux-musl",
             "aarch64-unknown-freebsd",
             "aarch64-linux-android",
+            // An ELF OS wins over an Apple vendor, as in object-format choice.
+            "aarch64-apple-linux-gnu",
         ] {
             assert_eq!(
                 AArch64AbiVariant::from_target_triple(triple),
-                AArch64AbiVariant::Aapcs64,
+                Ok(AArch64AbiVariant::Aapcs64),
                 "{triple}"
             );
         }
-        // The empty triple keeps the historical Darwin default so this change
-        // does not silently reclassify existing construction sites.
+        // No silent DarwinPCS: an empty triple is a typed refusal.
+        let empty = AArch64AbiVariant::from_target_triple("").unwrap_err();
+        assert_eq!(empty, AArch64AbiTargetError::Empty);
+        assert!(empty.to_string().contains("[TCG-TARGET-ABI]"));
+        // Unparseable, architecture-only, non-AArch64 and unmodeled-OS
+        // triples are refused rather than classified as AAPCS64.
+        for triple in [
+            "garbage",
+            "aarch64",
+            "aarch64-unknown-unknown",
+            "aarch64-pc-windows-msvc",
+            "aarch64_be-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            " aarch64-apple-darwin",
+        ] {
+            assert_eq!(
+                AArch64AbiVariant::from_target_triple(triple),
+                Err(AArch64AbiTargetError::Unrecognized(triple.to_owned())),
+                "{triple:?}"
+            );
+        }
+    }
+
+    /// DarwinPCS composites behind packed narrow stack arguments: clang coerces
+    /// a non-homogeneous composite of at most 16 bytes to `i64`/`[2 x i64]`, so
+    /// it starts 8-aligned whatever its members' alignment, while an HFA is
+    /// passed as its member array, packed at the members' alignment with no
+    /// size rounding. AAPCS64 gives both an 8-aligned slot rounded to 8. The
+    /// native oracle is `e2e_aarch64_aggregate_stack_darwin` (Apple clang,
+    /// both directions, O0-O3).
+    #[test]
+    fn darwin_composite_stack_slots_follow_clang_coercion() {
+        let small = Type::Struct(vec![Type::I8, Type::I16]);
+        assert_eq!((small.bytes(), small.align()), (4, 2));
+        let mut params = vec![Type::I64; 8];
+        params.extend([Type::I8, small, Type::I8]);
+        for variant in [AArch64AbiVariant::Darwin, AArch64AbiVariant::Aapcs64] {
+            assert_eq!(
+                stack_offsets(&AppleAArch64ABI::classify_params_with(variant, &params)),
+                vec![0, 8, 16],
+                "{variant:?}: the small composite takes an 8-aligned slot"
+            );
+        }
+        let pair = Type::Struct(vec![Type::I32, Type::I32, Type::I32]);
+        let mut params = vec![Type::I64; 8];
+        params.extend([Type::I32, pair, Type::I8]);
         assert_eq!(
-            AArch64AbiVariant::from_target_triple(""),
-            AArch64AbiVariant::Darwin
+            stack_offsets(&AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Darwin,
+                &params
+            )),
+            vec![0, 8, 24],
+            "a 12-byte composite is [2 x i64]: 8-aligned, 16 bytes"
+        );
+
+        let hfa = Type::Struct(vec![Type::F32; 3]);
+        let mut params = vec![Type::F64; 8];
+        params.extend([Type::F32, hfa, Type::F32]);
+        assert_eq!(
+            stack_offsets(&AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Darwin,
+                &params
+            )),
+            vec![0, 4, 16],
+            "DarwinPCS packs the HFA behind the float and the next float behind it"
+        );
+        assert_eq!(
+            stack_offsets(&AppleAArch64ABI::classify_params_with(
+                AArch64AbiVariant::Aapcs64,
+                &params
+            )),
+            vec![0, 8, 24],
+            "AAPCS64 C.4/C.5 round the HFA's start and size to 8"
         );
     }
 

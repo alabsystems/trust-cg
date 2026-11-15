@@ -1,0 +1,57 @@
+; TrustIr text format v1
+module "_RNvCslVlYzCJvBmO_21s19_iota_merge_addend4fill"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (*mut u32, u64, u32) -> ()
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCslVlYzCJvBmO_21s19_iota_merge_addend4fill(functy.0) {
+bb0(%1: *mut u32, %2: u64, %3: u32):
+    switch %3 [ 0: bb3 1: bb2 default: bb1 ]
+bb3:
+    %14 = const u32 3
+    br bb4(%14)
+bb2:
+    %15 = const u32 5
+    br bb4(%15)
+bb1:
+    %16 = const u32 7
+    br bb4(%16)
+bb4(%17: u32):
+    %18 = const u64 0
+    br bb5(%17, %18)
+bb5(%19: u32, %20: u64):
+    %21 = copy u64 %20
+    %22 = icmp ult u64 %21, %2
+    condbr %22, bb6, bb7
+bb7:
+    ret
+bb6:
+    %23 = copy u64 %20
+    %24 = trunc u64 %23 to u32
+    %25 = copy u32 %19
+    %26 = add u32 %24, %25
+    %27 = copy u64 %20
+    %29 = ptrtoptr *mut u32 %1 to ptr
+    %30 = ptrtoint ptr %29 to i64
+    %31 = bitcast u64 %27 to i64
+    %32 = const i64 4
+    %33 = mul i64 %31, %32
+    %34 = add i64 %30, %33
+    %35 = inttoptr i64 %34 to ptr
+    %28 = ptrtoptr ptr %35 to *mut u32
+    %36 = copy u32 %26
+    store u32 %36, ptr %28
+    %38 = const u64 1
+    %37 = add u64 %20, %38
+    br bb5(%19, %37)
+}

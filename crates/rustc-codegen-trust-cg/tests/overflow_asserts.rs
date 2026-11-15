@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/positive_evidence.rs"]
+mod positive_evidence;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Runtime regressions for rustc_codegen_trust_cg debug arithmetic assertions.
 //
@@ -12,63 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
-fn dylib_name() -> String {
-    format!(
-        "{}rustc_codegen_trust_cg{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    )
-}
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let dylib_name = dylib_name();
-    let pinned_cargo_toolchain = format!("+{}", pinned_toolchain());
-    let status = Command::new("cargo")
-        .arg(pinned_cargo_toolchain)
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run overflow-asserts test"
-    );
-
-    let candidates = [
-        target_dir.join("release").join(&dylib_name),
-        target_dir.join("debug").join(&dylib_name),
-    ];
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.clone();
-        }
-    }
-
-    let built = target_dir.join("release").join(&dylib_name);
-    assert!(
-        built.exists(),
-        "expected dylib at {:?} but it was not produced",
-        built
-    );
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
@@ -95,16 +44,14 @@ fn compile_backend_source(stem: &str, src: &str) -> BackendCompile {
         s.push(&dylib);
         s
     };
-    let toolchain = pinned_toolchain();
-    let output = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .arg(&backend_arg)
         .args(["-C", "overflow-checks=yes"])
         .arg("-o")
         .arg(&out_bin)
         .arg(&src_path)
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
 
     let _ = std::fs::remove_file(&src_path);
 
@@ -148,30 +95,6 @@ fn run_binary_with_timeout(path: &Path, timeout: Duration) -> Option<Output> {
     }
 }
 
-/// True while the aarch64 Mach-O object-relocation Certified composition
-/// has not landed (ObjectRelocationProofRegistry::aarch64_macho_production()
-/// is deliberately empty): every backend compile on this host fails
-/// promotion with TCG-PROOF-465/object-relocation-inventory. When the
-/// lanes register, this returns false and the original capability
-/// assertions below resume automatically — nothing to un-ignore.
-fn aarch64_macho_promotion_ratchet(stderr: &str) -> bool {
-    cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && stderr.contains("TCG-PROOF-465")
-        && stderr.contains("object relocation inventory")
-}
-
-/// True while the AArch64 opcode-inventory ratchet still lacks a proof
-/// mapping for an emitted opcode (today: `Movk` — its absence is deliberate
-/// and even locked by `opcode_to_proof_query(Movk).is_none()` in
-/// trust-cg-verify's function_verifier tests). Same fail-closed contract as
-/// the relocation ratchet: when the Movk proof query is authored, this
-/// returns false and the original runtime assertions resume automatically.
-fn aarch64_opcode_proof_ratchet(stderr: &str) -> bool {
-    cfg!(all(target_arch = "aarch64", target_os = "macos"))
-        && stderr.contains("TCG-PROOF-465")
-        && stderr.contains("no proof mapping for opcode")
-}
-
 fn assert_no_backend_load_failure(stderr: &str) {
     let load_failure_markers = [
         "failed to load",
@@ -190,37 +113,16 @@ fn assert_no_backend_load_failure(stderr: &str) {
     }
 }
 
-/// Returns `None` when the compile died on the aarch64 Mach-O promotion
-/// ratchet (after asserting the diagnostic is the documented fail-closed
-/// shape); callers skip their runtime assertions for that case only.
-fn assert_backend_source_compiles(stem: &str, src: &str) -> Option<BackendCompile> {
+/// Compile the oracle in the default (certificates-on) lane. A refusal of any
+/// kind fails here: on aarch64-apple-darwin the object-relocation and
+/// opcode-inventory proof-promotion refusals (`[TCG-PROOF-465]`) used to return
+/// `None`, and every runtime oracle in this file then passed without running
+/// (ledger L06-P10).
+fn assert_backend_source_compiles(stem: &str, src: &str) -> BackendCompile {
     let compiled = compile_backend_source(stem, src);
     eprintln!("{stem} rustc stdout:\n{}", compiled.stdout);
     eprintln!("{stem} rustc stderr:\n{}", compiled.stderr);
     eprintln!("{stem} rustc exit: {:?}", compiled.status);
-
-    if !compiled.status.success() && aarch64_macho_promotion_ratchet(&compiled.stderr) {
-        assert!(
-            compiled.stderr.contains("proof promotion rejected")
-                && compiled
-                    .stderr
-                    .contains("no object relocation proof is registered"),
-            "{stem}: promotion ratchet fired but the diagnostic is not the \
-             documented fail-closed shape. stderr was: <<<{stderr}>>>",
-            stderr = compiled.stderr
-        );
-        return None;
-    }
-    if !compiled.status.success() && aarch64_opcode_proof_ratchet(&compiled.stderr) {
-        assert!(
-            compiled.stderr.contains("proof promotion rejected")
-                && compiled.stderr.contains("opcode inventory found"),
-            "{stem}: opcode-proof ratchet fired but the diagnostic is not the \
-             documented fail-closed shape. stderr was: <<<{stderr}>>>",
-            stderr = compiled.stderr
-        );
-        return None;
-    }
 
     assert!(
         compiled.status.success(),
@@ -233,13 +135,11 @@ fn assert_backend_source_compiles(stem: &str, src: &str) -> Option<BackendCompil
         compiled.out_bin
     );
     assert_no_backend_load_failure(&compiled.stderr);
-    Some(compiled)
+    compiled
 }
 
 fn assert_backend_source_exits_success(stem: &str, src: &str) {
-    let Some(compiled) = assert_backend_source_compiles(stem, src) else {
-        return;
-    };
+    let compiled = assert_backend_source_compiles(stem, src);
     // 10s (not 1s): the oracle binary computes instantly, but a freshly-written
     // Mach-O's first exec pays dynamic-linker/Gatekeeper cold-start overhead that
     // can exceed 1s when the test machine is under build/run contention, causing a
@@ -265,35 +165,45 @@ fn assert_backend_source_exits_success(stem: &str, src: &str) {
         Some(0),
         "{stem}: arithmetic oracle exited with a nonzero success-code convention"
     );
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::On,
+    );
 }
 
 fn assert_backend_source_traps(stem: &str, src: &str, forbidden_success_code: i32) {
-    let Some(compiled) = assert_backend_source_compiles(stem, src) else {
-        return;
-    };
+    let compiled = assert_backend_source_compiles(stem, src);
     // 10s (not 1s): a trapping binary aborts essentially instantly, but the bound
     // must tolerate cold-start exec overhead under contention so a slow first exec
-    // is not mistaken for the binary still running. A timeout here is treated as
-    // "did not reach the success path" (the trap fired), so the bound is safe.
+    // is not mistaken for the binary still running.
     let run = run_binary_with_timeout(&compiled.out_bin, Duration::from_secs(10));
     let _ = std::fs::remove_file(&compiled.out_bin);
 
-    if let Some(run) = run {
-        let run_stdout = String::from_utf8_lossy(&run.stdout);
-        let run_stderr = String::from_utf8_lossy(&run.stderr);
-        assert!(
-            !run.status.success(),
-            "{stem}: arithmetic oracle reached the post-assert success path; \
-             stdout=<<<{}>>> stderr=<<<{}>>>",
-            run_stdout,
-            run_stderr
-        );
-        assert_ne!(
-            run.status.code(),
-            Some(forbidden_success_code),
-            "{stem}: arithmetic oracle followed the unchecked arithmetic path"
-        );
-    }
+    // Killed at the bound, the binary produced no exit status: no trap was
+    // observed, and a miscompile that hangs is not a trap. That fails, as it
+    // does in `assert_backend_source_exits_success`, and is never recorded as
+    // a native run.
+    let Some(run) = run else {
+        panic!("{stem}: arithmetic oracle timed out after 10s; no trap was observed");
+    };
+    let run_stdout = String::from_utf8_lossy(&run.stdout);
+    let run_stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success(),
+        "{stem}: arithmetic oracle reached the post-assert success path; \
+         stdout=<<<{}>>> stderr=<<<{}>>>",
+        run_stdout,
+        run_stderr
+    );
+    assert_ne!(
+        run.status.code(),
+        Some(forbidden_success_code),
+        "{stem}: arithmetic oracle followed the unchecked arithmetic path"
+    );
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::On,
+    );
 }
 
 #[test]

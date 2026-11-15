@@ -1,0 +1,270 @@
+; TrustIr text format v1
+module "fieldless"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "fieldless.rs"
+
+enum @ContainmentMode repr(u8) { Containment = 0, Safety = 1, User = 2 } layout(direct tag@0 size=1 align=1 offsets=[[], [], []]) id=0
+
+enum @Ordering3 repr(i8) { Less = -1, Equal = 0, Greater = 1 } layout(direct tag@0 size=1 align=1 offsets=[[], [], []]) id=1
+
+enum @Implicit { A = 0, B = 1, C = 2 } layout(direct tag@0 size=1 align=1 offsets=[[], [], []]) id=2
+
+enum @Sparse { A = 5, B = 9 } layout(direct tag@0 size=1 align=1 offsets=[[], []]) id=3
+
+enum @FpCategory { Nan = 0, Infinite = 1, Zero = 2, Subnormal = 3, Normal = 4 } layout(direct tag@0 size=1 align=1 offsets=[[], [], [], [], []]) id=4
+
+enum @AtomicOrdering { Relaxed = 0, Release = 1, Acquire = 2, AcqRel = 3, SeqCst = 4 } layout(direct tag@0 size=1 align=1 offsets=[[], [], [], [], []]) id=5
+
+functy.0 = () -> (u8)
+
+functy.1 = (enum.0) -> (u8)
+
+functy.2 = () -> (i8)
+
+functy.3 = (enum.1) -> (i32)
+
+functy.4 = (enum.1) -> (u8)
+
+functy.5 = (enum.2) -> (u32)
+
+functy.6 = () -> (enum.0)
+
+functy.7 = () -> (isize)
+
+functy.8 = (enum.3) -> (u8)
+
+functy.9 = (enum.4) -> (bool)
+
+functy.10 = (enum.5) -> (u32)
+
+internal rustcc fn @__trust_init_cd1593a723de5791e03dc5ce18b786c0(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "ContainmentMode::Containment::{constant#0}::{const-init}"
+bb0:
+    %0 = const u8 0  ; #loc: 0 6 18
+    ret %0  ; #loc: 0 6 19
+}
+
+internal rustcc fn @__trust_init_cd1593a723de57911040c726bb7113d1(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "ContainmentMode::Safety::{constant#0}::{const-init}"
+bb0:
+    %0 = const u8 1  ; #loc: 0 7 13
+    ret %0  ; #loc: 0 7 14
+}
+
+internal rustcc fn @__trust_init_cd1593a723de5791bc78ff0caeb94e60(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "ContainmentMode::User::{constant#0}::{const-init}"
+bb0:
+    %0 = const u8 2  ; #loc: 0 8 11
+    ret %0  ; #loc: 0 8 12
+}
+
+rustcc fn @_RNvMCshBEQyixXSSH_9fieldlessNtB2_15ContainmentMode5level(functy.1) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "ContainmentMode::level"
+    ; #names: %0="self"
+bb0(%0: enum.0):
+    %1 = extractfield u8 %0, 0  ; #loc: 0 12 8
+    %2 = bitcast u8 %1 to u8  ; #loc: 0 12 8
+    ret %2  ; #loc: 0 13 5
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless8headroom(functy.1) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "headroom"
+    ; #names: %0="m"
+bb0(%0: enum.0):
+    %1 = const u8 100  ; #loc: 0 17 4
+    %2 = extractfield u8 %0, 0  ; #loc: 0 17 11
+    %3 = bitcast u8 %2 to u8  ; #loc: 0 17 11
+    %4 = const u8 1  ; #loc: 0 17 21
+    %5, %6 = add.overflow u8 %3, %4  ; #loc: 0 17 10
+    %7 = const bool false  ; #loc: 0 17 10
+    %8 = const bool true  ; #loc: 0 17 10
+    %9 = select bool %6, %7, %8  ; #loc: 0 17 10
+    assert %9, overflow add  ; #proof: no_overflow  ; #loc: 0 17 10
+    %10 = const u8 0  ; #loc: 0 17 4
+    %11 = icmp ne u8 %5, %10  ; #loc: 0 17 4
+    assert %11, div_by_zero  ; #proof: div_nonzero  ; #loc: 0 17 4
+    %12 = udiv u8 %1, %5  ; #loc: 0 17 4
+    ret %12  ; #loc: 0 18 1
+}
+
+internal rustcc fn @__trust_init_cd1593a723de5791962b0071f4910045(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "Ordering3::Less::{constant#0}::{const-init}"
+bb0:
+    %0 = const i8 -1  ; #loc: 0 21 11
+    ret %0  ; #loc: 0 21 13
+}
+
+internal rustcc fn @__trust_init_cd1593a723de5791fdf9b66218820460(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "Ordering3::Equal::{constant#0}::{const-init}"
+bb0:
+    %0 = const i8 0  ; #loc: 0 22 12
+    ret %0  ; #loc: 0 22 13
+}
+
+internal rustcc fn @__trust_init_cd1593a723de57913071f0c33aa38b5c(functy.2) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "Ordering3::Greater::{constant#0}::{const-init}"
+bb0:
+    %0 = const i8 1  ; #loc: 0 23 14
+    ret %0  ; #loc: 0 23 15
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless4sign(functy.3) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "sign"
+    ; #names: %0="o"
+bb0(%0: enum.1):
+    %1 = extractfield i8 %0, 0  ; #loc: 0 26 4
+    %2 = sext i8 %1 to i32  ; #loc: 0 26 4
+    ret %2  ; #loc: 0 27 1
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless10flip_index(functy.4) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "flip_index"
+    ; #names: %0="o"
+bb0(%0: enum.1):
+    %1 = extractfield i8 %0, 0  ; #loc: 0 29 4
+    switch %1 [ -1: bb1 0: bb2 default: bb3 ]  ; #loc: 0 29 4
+bb1:
+    %2 = const u8 2  ; #loc: 0 30 27
+    br bb4(%2)  ; #loc: 0 29 4
+bb2:
+    %3 = const u8 1  ; #loc: 0 31 28
+    br bb4(%3)  ; #loc: 0 29 4
+bb3:
+    %4 = const u8 0  ; #loc: 0 32 30
+    br bb4(%4)  ; #loc: 0 29 4
+bb4(%5: u8):
+    ret %5  ; #loc: 0 34 1
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless4pick(functy.5) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "pick"
+    ; #names: %0="e"
+bb0(%0: enum.2):
+    %1 = extractfield u8 %0, 0  ; #loc: 0 41 4
+    switch %1 [ 0: bb1 1: bb2 default: bb3 ]  ; #loc: 0 41 4
+bb1:
+    %2 = const u32 1  ; #loc: 0 42 23
+    br bb4(%2)  ; #loc: 0 41 4
+bb2:
+    %3 = const u32 2  ; #loc: 0 43 23
+    br bb4(%3)  ; #loc: 0 41 4
+bb3:
+    %4 = const u32 3  ; #loc: 0 44 23
+    br bb4(%4)  ; #loc: 0 41 4
+bb4(%5: u32):
+    ret %5  ; #loc: 0 46 1
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless2mk(functy.6) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "mk"
+bb0:
+    %0 = const enum.0 { 2 }  ; #loc: 0 48 4
+    ret %0  ; #loc: 0 49 1
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless8mk_level(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "mk_level"
+bb0:
+    %0 = call @func.11()  ; #loc: 0 51 4
+    %1 = call @func.3(%0)  ; #loc: 0 51 9
+    ret %1  ; #loc: 0 52 1
+}
+
+internal rustcc fn @__trust_init_cd1593a723de5791db7f983031d9b750(functy.7) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "Sparse::A::{constant#0}::{const-init}"
+bb0:
+    %0 = const isize 5  ; #loc: 0 55 8
+    ret %0  ; #loc: 0 55 9
+}
+
+internal rustcc fn @__trust_init_cd1593a723de5791ce6453fab436161b(functy.7) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "Sparse::B::{constant#0}::{const-init}"
+bb0:
+    %0 = const isize 9  ; #loc: 0 56 8
+    ret %0  ; #loc: 0 56 9
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless10sparse_tag(functy.8) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "sparse_tag"
+    ; #names: %0="s"
+bb0(%0: enum.3):
+    %1 = extractfield u8 %0, 0  ; #loc: 0 59 4
+    %2 = bitcast u8 %1 to u8  ; #loc: 0 59 4
+    ret %2  ; #loc: 0 60 1
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless15is_finite_class(functy.9) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "is_finite_class"
+    ; #names: %0="c"
+bb0(%0: enum.4):
+    %1 = extractfield u8 %0, 0  ; #loc: 0 71 4
+    switch %1 [ 0: bb1 1: bb2 default: bb3 ]  ; #loc: 0 71 4
+bb1:
+    %2 = const bool false  ; #loc: 0 72 50
+    br bb4(%2)  ; #loc: 0 71 4
+bb2:
+    %3 = const bool false  ; #loc: 0 72 50
+    br bb4(%3)  ; #loc: 0 71 4
+bb3:
+    %4 = const bool true  ; #loc: 0 73 13
+    br bb4(%4)  ; #loc: 0 71 4
+bb4(%5: bool):
+    ret %5  ; #loc: 0 75 1
+}
+
+rustcc fn @_RNvCshBEQyixXSSH_9fieldless8strength(functy.10) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "strength"
+    ; #names: %0="o"
+bb0(%0: enum.5):
+    %1 = extractfield u8 %0, 0  ; #loc: 0 84 4
+    %2 = zext u8 %1 to u32  ; #loc: 0 84 4
+    %3 = const u32 10  ; #loc: 0 84 15
+    %4, %5 = mul.overflow u32 %2, %3  ; #loc: 0 84 4
+    %6 = const bool false  ; #loc: 0 84 4
+    %7 = const bool true  ; #loc: 0 84 4
+    %8 = select bool %5, %6, %7  ; #loc: 0 84 4
+    assert %8, overflow mul  ; #proof: no_overflow  ; #loc: 0 84 4
+    ret %4  ; #loc: 0 85 1
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L17C10 of `fieldless::headroom`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 4 source "trust-thir-lower/direct-assert@1" assertion "fieldless::headroom#L17C10#overflow#o0" range 0 17 10 17 23 site f4/bb0#8
+
+obligation 1 arithmetic_safety pending "direct THIR Assert (div_by_zero) at L17C4 of `fieldless::headroom`: divisor is nonzero. RECORDED BY THE LOWERING, NOT PROVED." function 4 source "trust-thir-lower/direct-assert@1" assertion "fieldless::headroom#L17C4#div_by_zero#o0" range 0 17 4 17 23 site f4/bb0#11
+
+obligation 2 arithmetic_safety pending "direct THIR Assert (overflow) at L84C4 of `fieldless::strength`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 17 source "trust-thir-lower/direct-assert@1" assertion "fieldless::strength#L84C4#overflow#o0" range 0 84 4 84 17 site f17/bb0#7

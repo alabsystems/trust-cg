@@ -14,17 +14,32 @@
 # loop-carried value, mixed element types).
 #
 # Each program here is one SHAPE, is deterministic, and encodes its whole
-# result in its exit status. rustc's LLVM backend is the oracle. Every binary
+# result in its exit status. trustc's LLVM backend is the oracle. Every binary
 # is run TWICE: an out-of-bounds read shows up as run-to-run variation, which
 # is exactly how two of those seven bugs announced themselves.
 #
-# Usage:  ./run.sh [path-to-backend.so]
+# Both sides use the Trust compiler the bridge pin (channel = "trust") names,
+# resolved by scripts/trust_toolchain.py from the PATH trustc/targo package or
+# the package trustc named by --driver. The retired stock nightly, any
+# unidentified compiler and a bare `rustc` fallback are refused (exit 2). Both
+# sides compile in Trust's explicit unverified frontend lane (-Ztrust-verify=off),
+# a diagnostic lane with no Trust-verified compilation claim.
+#
+# Usage:  ./run.sh [--driver TRUSTC] [path-to-backend.so]
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
+DRIVER_ARGS=()
+if [ "${1:-}" = "--driver" ]; then
+  [ "$#" -ge 2 ] || { echo "shape-coverage: --driver needs a trustc path" >&2; exit 2; }
+  DRIVER_ARGS=(--driver "$2"); shift 2
+fi
 DYLIB="${1:-$HERE/../../crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.so}"
-RUSTC="$(rustup which --toolchain nightly-2026-04-20 rustc 2>/dev/null || echo rustc)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-BASE="--edition=2021 --crate-type bin -Cpanic=abort -Coverflow-checks=off -Ccodegen-units=1"
+BASE="-Ztrust-verify=off --edition=2021 --crate-type bin -Cpanic=abort -Coverflow-checks=off -Ccodegen-units=1"
+# trust-cg halves switch proof certificates and the refinement solver off
+# through the backend's TRACKED knob option; trustc refuses the former
+# TCG_NO_PROOF_CERTS / TCG_REFINE_SOLVER environment variables as untracked
+# codegen controls, which made every trust-cg compile fail (2026-09-22).
 
 # Exact fail-closed coverage floor at the final s72 corpus. A new decline is a
 # lost differential regression and fails. If one of these known gaps starts
@@ -58,18 +73,23 @@ if [[ "${1:-}" == "--selftest" ]]; then
   exit 0
 fi
 
+RUSTC="$(python3 "$HERE/../../scripts/trust_toolchain.py" ${DRIVER_ARGS[@]+"${DRIVER_ARGS[@]}"} --print compiler)" || {
+  echo "shape-coverage: cannot resolve the pinned Trust compiler" >&2; exit 2; }
+echo "shape-coverage: driver $(python3 "$HERE/../../scripts/trust_toolchain.py" --driver "$RUSTC" --print summary)"
+
 pass=0; fail=0; unsup=0; expected_unsup=0
 for src in "$HERE"/progs/*.rs; do
   n="$(basename "$src" .rs)"
   for opt in 0 1 2 3; do
-    if ! $RUSTC $BASE -Copt-level=$opt -o "$TMP/l" "$src" 2>"$TMP/llvm.err"; then
+    # shellcheck disable=SC2086 # BASE is a deliberate word list
+    if ! "$RUSTC" $BASE -Copt-level=$opt -o "$TMP/l" "$src" 2>"$TMP/llvm.err"; then
       echo "FAIL  $n O$opt: LLVM oracle failed to build"
       tail -5 "$TMP/llvm.err"
       fail=$((fail+1))
       continue
     fi
     "$TMP/l" >/dev/null 2>&1; want=$?
-    if ! env TCG_NO_PROOF_CERTS=1 TCG_REFINE_SOLVER=0 $RUSTC $BASE -Copt-level=$opt \
+    if ! "$RUSTC" $BASE -Ztrust-ir-cg-args=no-proof-certs -Ztrust-ir-cg-args=refine-solver=0 -Copt-level=$opt \
          -Zcodegen-backend="$DYLIB" -o "$TMP/t" "$src" 2>"$TMP/err"; then
       # A clean FAIL-CLOSED refusal is correct behaviour, not a miscompile:
       # the backend declines MIR it cannot lower rather than guessing. Count

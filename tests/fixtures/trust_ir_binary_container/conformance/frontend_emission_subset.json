@@ -1,0 +1,344 @@
+{
+  "name": "frontend_emission_subset",
+  "functions": [
+    {
+      "id": 0,
+      "name": "checked_add",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ],
+            [
+              1,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Overflow": {
+                  "op": "AddOverflow",
+                  "ty": "I32",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                3,
+                4
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 3,
+                "col": 5
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "CondBr": {
+                  "cond": 4,
+                  "then_target": 2,
+                  "then_args": [],
+                  "else_target": 1,
+                  "else_args": [
+                    3
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 3,
+                "col": 9
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [
+            [
+              2,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 4,
+                "col": 5
+              },
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "params": [],
+          "body": [
+            {
+              "inst": "Unreachable",
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 5,
+                "col": 5
+              },
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [
+        "Terminates",
+        "Deterministic"
+      ],
+      "calling_conv": "Rust",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": true,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "sum3",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 9,
+                "col": 24
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 2
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 9,
+                "col": 27
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    0,
+                    1
+                  ]
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 9,
+                "col": 17
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    3,
+                    2
+                  ]
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 9,
+                "col": 5
+              },
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 10,
+                "col": 1
+              },
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [
+        "Terminates"
+      ],
+      "calling_conv": "Rust",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32",
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "Liveness",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [terminates] on `checked_add`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 1,
+      "kind": "Liveness",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [terminates] on `sum3`",
+      "formula": null,
+      "function": 1,
+      "source": null,
+      "site": null
+    }
+  ],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [
+    "examples/mini_frontend.rs"
+  ],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

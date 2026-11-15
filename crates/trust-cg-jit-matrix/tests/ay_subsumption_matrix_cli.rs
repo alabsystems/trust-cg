@@ -67,15 +67,24 @@ fn run_plan_only_matrix(name: &str) -> PlanOnlyRun {
     let out_dir = temp_dir.path().join(name);
     let cases = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/ay_subsumption_cases.json");
-    let status = Command::new(env!("CARGO_BIN_EXE_ay_subsumption_matrix"))
+    // Capture the CLI's output and re-print it through libtest's captured
+    // streams: an inherited stdout/stderr would split this test's result line
+    // in a run that keeps output captured (`--show-output`).
+    let output = Command::new(env!("CARGO_BIN_EXE_ay_subsumption_matrix"))
         .arg("--cases")
         .arg(cases)
         .arg("--out-dir")
         .arg(&out_dir)
         .arg("--plan-only")
-        .status()
+        .output()
         .expect("ay_subsumption_matrix should run");
-    assert!(status.success());
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "ay_subsumption_matrix exited {}",
+        output.status
+    );
 
     let counters: Value = serde_json::from_slice(
         &std::fs::read(out_dir.join("phase8_native_promotion_counters.json"))

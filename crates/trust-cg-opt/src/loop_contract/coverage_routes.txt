@@ -1,0 +1,43 @@
+# The boundary of the loop-state contract's ITERATION-COVERAGE clause
+# (`crate::loop_contract::coverage`): every source file of this crate that
+# admits a rewrite with `LoopLocality::check(` or its shared-index twin
+# `LoopLocality::check_in(` -- which run the control and register clauses
+# only -- and how many times. A rewrite routed through the
+# coverage clause uses `LoopLocality::check_covered` and publishes through
+# `publish_covered` instead, and its line here shrinks or goes.
+#
+# `coverage_routes_list_every_uncovered_rewrite` (loop_contract/coverage/
+# tests.rs) recounts the sources and requires this list to match exactly: a
+# new uncovered rewrite must be added here by hand, in review, and a routed
+# one must be taken off. Format: `<path relative to src/> <count>`, sorted.
+#
+# x86_vectorize.rs: one of its checks is not a route of its own. It is the
+# second check `zero_trip_remainder_exit` makes, on the exit block alone,
+# before the byte-sum route (counted once already) hands its packed loop
+# straight to the loop exit. That handoff rests on an iteration-count premise
+# (the scalar remainder runs zero iterations) proved outside the coverage
+# clause, so it is listed, not routed.
+dead_loop.rs 1
+mac_reg_block/review_bar.rs 1
+mac_row_unroll.rs 1
+neon_array.rs 1
+neon_bitrev.rs 1
+neon_butterfly.rs 1
+neon_bytesum.rs 1
+neon_condstore.rs 1
+neon_farray.rs 2
+neon_find.rs 2
+neon_fmap.rs 2
+neon_fpred.rs 1
+neon_iota_fill.rs 1
+neon_map.rs 2
+neon_minmax.rs 3
+neon_predsum.rs 2
+neon_reduce.rs 2
+neon_stencil.rs 1
+reduction_split.rs 2
+scalar_unroll.rs 1
+strided_store_unroll.rs 1
+swap_range_guard.rs 1
+vectorize.rs 2
+x86_vectorize.rs 16

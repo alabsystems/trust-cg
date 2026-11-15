@@ -38,8 +38,8 @@ use std::{error::Error, fmt};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    compiler::{CompilerConfig, CompilerTraceLevel, JitValidationMode},
-    jit::{JitConfig, ProfileHookMode},
+    compiler::{CompilerConfig, CompilerTraceLevel, JitValidationMode, RelocationModel},
+    jit::{JitConfig, JitExternalSymbolResolutionPolicy, ProfileHookMode},
     pipeline::{DispatchVerifyMode, OptLevel},
     target::{Target, TargetEnvironment, TargetOperatingSystem, TargetSpec, TargetVendor},
 };
@@ -60,7 +60,10 @@ pub const MAX_COMPILE_POLICY_ENCODING_BYTES: usize = 4096;
 const ENCODING_MAGIC: &[u8; 8] = b"TCGCPOL\0";
 const ENCODING_HEADER_BYTES: usize = ENCODING_MAGIC.len() + 2 + 1 + 1;
 const TLV_HEADER_BYTES: usize = 2 + 2;
-const MAX_POLICY_FIELD_BYTES: usize = 9;
+/// The largest inline field: a SHA-256 digest (`TAG_COMPILER_NEVER_INLINE`,
+/// `TAG_COMPILER_EH_NOUNWIND_CALLEES`, `TAG_COMPILER_LINK_UNIT_DEFINITIONS`).
+/// Every other field fits in 9 bytes.
+const MAX_POLICY_FIELD_BYTES: usize = 32;
 
 // Target identity.  Tags are global across all partitions so the full-policy
 // encoding can merge and sort every field without introducing a second map.
@@ -68,6 +71,11 @@ const TAG_TARGET_ARCHITECTURE: u16 = 0x0001;
 const TAG_TARGET_VENDOR: u16 = 0x0002;
 const TAG_TARGET_OPERATING_SYSTEM: u16 = 0x0003;
 const TAG_TARGET_ENVIRONMENT: u16 = 0x0004;
+// Present only when the target carries a macOS deployment target (triple OS
+// version or a driver-captured MACOSX_DEPLOYMENT_TARGET): absence is the
+// canonical default, so every pre-existing digest is unchanged. It sets the
+// Mach-O LC_BUILD_VERSION minimum OS, so it is Artifact-affecting.
+const TAG_TARGET_APPLE_DEPLOYMENT_TARGET: u16 = 0x0005;
 
 // CompilerConfig fields.  Keep these in struct declaration order.  The target
 // field is validated against, then represented by, the normalized TargetSpec.
@@ -86,6 +94,33 @@ const TAG_COMPILER_JIT_VALIDATION_OVERRIDE: u16 = 0x100b;
 // the ordinary parallel field in Invocation and add this derived Artifact
 // binding only when such a pass is armed.
 const TAG_COMPILER_CEGIS_PARALLEL_SCHEDULE: u16 = 0x100c;
+const TAG_COMPILER_JIT_EXTERNAL_SYMBOL_RESOLUTION: u16 = 0x100d;
+const TAG_COMPILER_RELOCATION_MODEL: u16 = 0x100e;
+// Present only when the function-sections object policy is ON: absence is the
+// canonical default, so every pre-existing default-policy digest is unchanged.
+const TAG_COMPILER_FUNCTION_SECTIONS: u16 = 0x100f;
+/// Explicit AArch64 optional-ISA profile (`CompilerConfig::aarch64_isa_profile`),
+/// encoded only when configured so every default-policy digest is unchanged.
+const TAG_COMPILER_AARCH64_ISA_PROFILE: u16 = 0x1010;
+/// The never-inline set (`CompilerConfig::never_inline`) as the SHA-256 of
+/// its canonical encoding ([`never_inline_digest`]), encoded only when
+/// non-empty so every default-policy digest is unchanged.
+const TAG_COMPILER_NEVER_INLINE: u16 = 0x1011;
+/// Non-unwinding exception frames (`CompilerConfig::eh_frames_cannot_unwind`),
+/// encoded only when ON so every default-policy digest is unchanged.
+const TAG_COMPILER_EH_FRAMES_CANNOT_UNWIND: u16 = 0x1012;
+/// SHA-256 of the canonical nounwind callee set
+/// (`CompilerConfig::eh_nounwind_callees`), encoded exactly when
+/// `TAG_COMPILER_EH_FRAMES_CANNOT_UNWIND` is: the set is read only then.
+const TAG_COMPILER_EH_NOUNWIND_CALLEES: u16 = 0x1013;
+/// SHA-256 of the canonical link-unit definition set
+/// (`CompilerConfig::link_unit_definitions`, ruling OD-216), encoded only when
+/// non-empty so every default-policy digest is unchanged. It withholds
+/// body-theorem credit and changes no emitted byte: Evidence.
+const TAG_COMPILER_LINK_UNIT_DEFINITIONS: u16 = 0x1014;
+/// Forced AArch64 object frame records, present only when enabled so existing
+/// default-policy artifact identities remain unchanged.
+const TAG_COMPILER_AARCH64_FORCE_FRAME_POINTERS: u16 = 0x1015;
 
 // JitConfig fields.  Profile hooks and emit_entry_counters intentionally share
 // one effective field: the latter is an ergonomic alias, not a second policy.
@@ -94,6 +129,7 @@ const TAG_JIT_VERIFY: u16 = 0x2002;
 const TAG_JIT_DISPATCH_VERIFY: u16 = 0x2003;
 const TAG_JIT_EFFECTIVE_PROFILE_HOOKS: u16 = 0x2004;
 const TAG_JIT_CACHE_CERTIFICATES: u16 = 0x2005;
+const TAG_JIT_EXTERNAL_SYMBOL_RESOLUTION: u16 = 0x2006;
 
 /// A canonical compile-policy identity partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -267,6 +303,17 @@ pub enum CompilePolicyError {
         /// Architecture selected by `CompilerConfig`.
         compiler_target: Target,
     },
+    /// An explicit AArch64 ISA profile was configured for another
+    /// architecture; the policy refuses to encode a control no route honors.
+    Aarch64IsaProfileOnNonAarch64Target {
+        /// Architecture selected by `CompilerConfig`.
+        compiler_target: Target,
+    },
+    /// Forced AArch64 frame records cannot apply to another architecture.
+    Aarch64FramePointersOnNonAarch64Target {
+        /// Architecture selected by `CompilerConfig`.
+        compiler_target: Target,
+    },
     /// A canonical encoding exceeded the public fixed-size bound.
     EncodingTooLarge {
         /// Partition whose encoding exceeded the bound.
@@ -287,6 +334,16 @@ impl fmt::Display for CompilePolicyError {
             } => write!(
                 f,
                 "compile policy target {policy_target:?} does not match CompilerConfig target {compiler_target:?}"
+            ),
+            Self::Aarch64IsaProfileOnNonAarch64Target { compiler_target } => write!(
+                f,
+                "an explicit AArch64 ISA profile cannot apply to CompilerConfig target \
+                 {compiler_target:?}"
+            ),
+            Self::Aarch64FramePointersOnNonAarch64Target { compiler_target } => write!(
+                f,
+                "forced AArch64 frame pointers cannot apply to CompilerConfig target \
+                 {compiler_target:?}"
             ),
             Self::EncodingTooLarge {
                 partition,
@@ -473,21 +530,32 @@ impl PolicyInputs<'_> {
 
     const fn field_capacity(self) -> usize {
         match self {
-            Self::Compiler(_) => 16,
-            Self::Jit(_) => 9,
-            Self::Combined { .. } => 21,
+            Self::Compiler(_) => 18,
+            Self::Jit(_) => 10,
+            Self::Combined { .. } => 24,
         }
     }
 }
 
 fn normalize_target_spec(target_spec: TargetSpec) -> TargetSpec {
     let resolved = target_spec.with_default_os_abi();
-    TargetSpec::new(
+    let explicit = TargetSpec::new(
         resolved.architecture,
         resolved.vendor,
         resolved.operating_system,
         resolved.environment,
-    )
+    );
+    match resolved.apple_deployment_target() {
+        // `resolved` already carried this version, so re-attaching it to the
+        // same explicit Apple components cannot be refused.
+        Some(version) => explicit
+            .with_apple_deployment_target(
+                version,
+                crate::apple_deployment::AppleDeploymentTargetSource::TargetTriple,
+            )
+            .unwrap_or(resolved),
+        None => explicit,
+    }
 }
 
 fn push_target_fields(fields: &mut Vec<PolicyField>, target_spec: TargetSpec) {
@@ -515,6 +583,14 @@ fn push_target_fields(fields: &mut Vec<PolicyField>, target_spec: TargetSpec) {
         TAG_TARGET_ENVIRONMENT,
         &[target_environment_tag(target_spec.environment)],
     );
+    if let Some(version) = target_spec.apple_deployment_target() {
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_TARGET_APPLE_DEPLOYMENT_TARGET,
+            &version.macho_encoding().to_be_bytes(),
+        );
+    }
 }
 
 fn push_compiler_fields(
@@ -535,7 +611,16 @@ fn push_compiler_fields(
         enable_fsym_trust_ir_preflight,
         enable_jit_fast_regalloc,
         jit_validation_mode_override,
+        jit_external_symbol_resolution,
         panic_unwind,
+        relocation_model,
+        function_sections,
+        aarch64_isa_profile,
+        aarch64_force_frame_pointers,
+        never_inline,
+        eh_frames_cannot_unwind,
+        eh_nounwind_callees,
+        link_unit_definitions,
     } = compiler;
     if target_spec.architecture != *target {
         return Err(CompilePolicyError::TargetArchitectureMismatch {
@@ -622,7 +707,132 @@ fn push_compiler_fields(
         TAG_COMPILER_JIT_VALIDATION_OVERRIDE,
         &option_jit_validation_mode_bytes(*jit_validation_mode_override),
     );
+    push_field(
+        fields,
+        CompilePolicyPartition::Artifact,
+        TAG_COMPILER_JIT_EXTERNAL_SYMBOL_RESOLUTION,
+        &[jit_external_symbol_resolution_policy_tag(
+            *jit_external_symbol_resolution,
+        )],
+    );
+    // The relocation model selects GOT-indirect versus PC-relative symbol
+    // access and the TLS access models, so it changes the emitted bytes.
+    push_field(
+        fields,
+        CompilePolicyPartition::Artifact,
+        TAG_COMPILER_RELOCATION_MODEL,
+        &[relocation_model_tag(*relocation_model)],
+    );
+    // Function sections change the emitted object's section layout, so the
+    // control is Artifact-affecting.
+    if *function_sections {
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_COMPILER_FUNCTION_SECTIONS,
+            &[bool_tag(true)],
+        );
+    }
+    // An explicit AArch64 ISA profile widens or narrows which instructions
+    // the selector may emit, so it is Artifact-affecting. Encoded as the
+    // profile's stable feature bits; absent for the target contract.
+    if let Some(profile) = aarch64_isa_profile {
+        if *target != Target::Aarch64 {
+            return Err(CompilePolicyError::Aarch64IsaProfileOnNonAarch64Target {
+                compiler_target: *target,
+            });
+        }
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_COMPILER_AARCH64_ISA_PROFILE,
+            &profile.feature_bits().to_be_bytes(),
+        );
+    }
+    if *aarch64_force_frame_pointers {
+        if *target != Target::Aarch64 {
+            return Err(CompilePolicyError::Aarch64FramePointersOnNonAarch64Target {
+                compiler_target: *target,
+            });
+        }
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_COMPILER_AARCH64_FORCE_FRAME_POINTERS,
+            &[bool_tag(true)],
+        );
+    }
+    // A never-inline name keeps a call that OPT-4 would otherwise splice, so
+    // the set is Artifact-affecting. Absent when empty.
+    if !never_inline.is_empty() {
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_COMPILER_NEVER_INLINE,
+            &never_inline_digest(never_inline),
+        );
+    }
+    // Non-unwinding frames keep a propagation entry only for a region that
+    // holds a call which may unwind, decided against the nounwind callee set,
+    // so both change the emitted exception tables and are Artifact-affecting.
+    // The set is read only under the policy, so it is encoded only with it.
+    if *eh_frames_cannot_unwind {
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_COMPILER_EH_FRAMES_CANNOT_UNWIND,
+            &[bool_tag(true)],
+        );
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_COMPILER_EH_NOUNWIND_CALLEES,
+            &nounwind_callees_sha256(eh_nounwind_callees),
+        );
+    }
+    // OD-216: the routines the link unit's other compile units define decide
+    // which body theorems are refused, never an emitted byte, so the set is
+    // Evidence-affecting. Absent when empty.
+    if !link_unit_definitions.is_empty() {
+        push_field(
+            fields,
+            CompilePolicyPartition::Evidence,
+            TAG_COMPILER_LINK_UNIT_DEFINITIONS,
+            &link_unit_definitions_sha256(link_unit_definitions),
+        );
+    }
     Ok(())
+}
+
+/// The SHA-256 of a link-unit definition set's canonical encoding
+/// ([`name_set_sha256`] under its own domain tag).
+fn link_unit_definitions_sha256(definitions: &std::collections::BTreeSet<String>) -> [u8; 32] {
+    name_set_sha256(b"trust-cg.compiler.link-unit-definitions.v1\0", definitions)
+}
+
+/// The SHA-256 of a never-inline set's canonical encoding ([`name_set_sha256`]
+/// under its own domain tag).
+pub(crate) fn never_inline_digest(never_inline: &std::collections::BTreeSet<String>) -> [u8; 32] {
+    name_set_sha256(b"trust-cg.compiler.never-inline.v1\0", never_inline)
+}
+
+/// The SHA-256 of a nounwind callee set's canonical encoding ([`name_set_sha256`]
+/// under its own domain tag).
+fn nounwind_callees_sha256(callees: &std::collections::BTreeSet<String>) -> [u8; 32] {
+    name_set_sha256(b"trust-cg.compiler.eh-nounwind-callees.v1\0", callees)
+}
+
+/// SHA-256 of a name set: a domain tag, then each name in sorted (`BTreeSet`)
+/// order as a big-endian `u64` byte length followed by its UTF-8 bytes, so
+/// distinct sets (or one set under two domains) never share an encoding.
+fn name_set_sha256(domain: &[u8], names: &std::collections::BTreeSet<String>) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for name in names {
+        hasher.update((name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 fn push_jit_fields(fields: &mut Vec<PolicyField>, jit: &JitConfig) {
@@ -634,6 +844,7 @@ fn push_jit_fields(fields: &mut Vec<PolicyField>, jit: &JitConfig) {
         profile_hooks: _,
         emit_entry_counters: _,
         cache_certificates,
+        external_symbol_resolution,
     } = jit;
 
     push_field(
@@ -667,6 +878,14 @@ fn push_jit_fields(fields: &mut Vec<PolicyField>, jit: &JitConfig) {
         CompilePolicyPartition::Evidence,
         TAG_JIT_CACHE_CERTIFICATES,
         &[bool_tag(*cache_certificates)],
+    );
+    push_field(
+        fields,
+        CompilePolicyPartition::Artifact,
+        TAG_JIT_EXTERNAL_SYMBOL_RESOLUTION,
+        &[jit_external_symbol_resolution_policy_tag(
+            *external_symbol_resolution,
+        )],
     );
 }
 
@@ -795,6 +1014,14 @@ const fn target_environment_tag(environment: TargetEnvironment) -> u8 {
     }
 }
 
+const fn relocation_model_tag(model: RelocationModel) -> u8 {
+    match model {
+        RelocationModel::Static => 0,
+        RelocationModel::Pie => 1,
+        RelocationModel::Pic => 2,
+    }
+}
+
 const fn opt_level_tag(opt_level: OptLevel) -> u8 {
     match opt_level {
         OptLevel::O0 => 0,
@@ -844,8 +1071,64 @@ const fn profile_hook_mode_tag(mode: ProfileHookMode) -> u8 {
     }
 }
 
+const fn jit_external_symbol_resolution_policy_tag(
+    policy: JitExternalSymbolResolutionPolicy,
+) -> u8 {
+    match policy {
+        JitExternalSymbolResolutionPolicy::ExplicitThenProcess => 0,
+        JitExternalSymbolResolutionPolicy::ExplicitOnly => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn apple_deployment_target_is_bound_in_the_artifact_projection() {
+        use crate::apple_deployment::{AppleDeploymentTargetSource, AppleOsVersion};
+
+        let config = CompilerConfig::default();
+        let policy = |spec: TargetSpec| CompilePolicy::from_compiler(spec, &config).unwrap();
+        let darwin = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let twelve = TargetSpec::parse("aarch64-apple-macos12.0").unwrap();
+        let thirteen = TargetSpec::parse("aarch64-apple-macos13.0").unwrap();
+
+        let unversioned = policy(darwin);
+        let at_twelve = policy(twelve);
+        // Exactly one extra TLV (4-byte header, 4-byte encoded version): an
+        // unversioned target keeps its pre-existing encoding.
+        assert_eq!(
+            at_twelve
+                .canonical_bytes(CompilePolicyPartition::Artifact)
+                .len(),
+            unversioned
+                .canonical_bytes(CompilePolicyPartition::Artifact)
+                .len()
+                + TLV_HEADER_BYTES
+                + 4
+        );
+        assert_ne!(
+            unversioned.digest(CompilePolicyPartition::Artifact),
+            at_twelve.digest(CompilePolicyPartition::Artifact)
+        );
+        assert_ne!(
+            at_twelve.digest(CompilePolicyPartition::Artifact),
+            policy(thirteen).digest(CompilePolicyPartition::Artifact)
+        );
+        // The version affects object bytes only, so it is not evidence.
+        assert_eq!(
+            unversioned.digest(CompilePolicyPartition::Evidence),
+            at_twelve.digest(CompilePolicyPartition::Evidence)
+        );
+        // A driver-captured version is the same identity as the triple's.
+        let captured = darwin
+            .with_apple_deployment_target(
+                AppleOsVersion::new(12, 0, 0),
+                AppleDeploymentTargetSource::Environment,
+            )
+            .unwrap();
+        assert_eq!(policy(captured).digests(), at_twelve.digests());
+        assert_eq!(policy(captured).target_spec(), twelve);
+    }
     use std::num::NonZeroU32;
 
     use super::*;
@@ -871,7 +1154,16 @@ mod tests {
             enable_fsym_trust_ir_preflight: false,
             enable_jit_fast_regalloc: false,
             jit_validation_mode_override: Some(JitValidationMode::CachedVerified),
+            jit_external_symbol_resolution: JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
             panic_unwind: false,
+            relocation_model: RelocationModel::Static,
+            function_sections: false,
+            aarch64_isa_profile: None,
+            aarch64_force_frame_pointers: false,
+            never_inline: Default::default(),
+            eh_frames_cannot_unwind: false,
+            eh_nounwind_callees: std::collections::BTreeSet::new(),
+            link_unit_definitions: std::collections::BTreeSet::new(),
         };
         let jit = JitConfig {
             opt_level: OptLevel::O2,
@@ -880,6 +1172,7 @@ mod tests {
             profile_hooks: ProfileHookMode::None,
             emit_entry_counters: false,
             cache_certificates: true,
+            external_symbol_resolution: JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         };
         (linux_x86_64(), compiler, jit)
     }
@@ -952,9 +1245,9 @@ mod tests {
         let combined_tags = encoded_tags(&combined, CompilePolicyPartition::Full);
         let compiler_tags = encoded_tags(&compiler_only, CompilePolicyPartition::Full);
         let jit_tags = encoded_tags(&jit_only, CompilePolicyPartition::Full);
-        assert_eq!(combined_tags.len(), 20);
-        assert_eq!(compiler_tags.len(), 15);
-        assert_eq!(jit_tags.len(), 9);
+        assert_eq!(combined_tags.len(), 23);
+        assert_eq!(compiler_tags.len(), 17);
+        assert_eq!(jit_tags.len(), 10);
         assert_eq!(
             compiler_tags,
             combined_tags
@@ -1071,13 +1364,288 @@ mod tests {
             CompilePolicyPartition::Evidence,
         );
 
-        let mut changed = compiler;
+        let mut changed = compiler.clone();
+        changed.jit_external_symbol_resolution = JitExternalSymbolResolutionPolicy::ExplicitOnly;
+        assert_only_partition_changed(
+            &base,
+            &policy(target, &changed, &jit),
+            CompilePolicyPartition::Artifact,
+        );
+
+        let mut changed = compiler.clone();
         changed.panic_unwind = true;
         assert_only_partition_changed(
             &base,
             &policy(target, &changed, &jit),
             CompilePolicyPartition::Artifact,
         );
+
+        // Each relocation model is a distinct artifact identity.
+        let mut seen = std::collections::HashSet::new();
+        for model in RelocationModel::ALL {
+            let mut changed = compiler.clone();
+            changed.relocation_model = model;
+            let changed_policy = policy(target, &changed, &jit);
+            if model != compiler.relocation_model {
+                assert_only_partition_changed(
+                    &base,
+                    &changed_policy,
+                    CompilePolicyPartition::Artifact,
+                );
+            }
+            assert!(seen.insert(changed_policy.digest(CompilePolicyPartition::Artifact)));
+        }
+
+        let mut changed = compiler.clone();
+        changed.function_sections = true;
+        assert_only_partition_changed(
+            &base,
+            &policy(target, &changed, &jit),
+            CompilePolicyPartition::Artifact,
+        );
+
+        let mut changed = compiler.clone();
+        changed.eh_frames_cannot_unwind = true;
+        assert_only_partition_changed(
+            &base,
+            &policy(target, &changed, &jit),
+            CompilePolicyPartition::Artifact,
+        );
+
+        // The nounwind callee set changes the enabled policy's Artifact
+        // partition only, and is not encoded at all while the policy is off.
+        let enabled = policy(target, &changed, &jit);
+        let mut callee = changed;
+        callee
+            .eh_nounwind_callees
+            .insert("nounwind_drop".to_owned());
+        assert_only_partition_changed(
+            &enabled,
+            &policy(target, &callee, &jit),
+            CompilePolicyPartition::Artifact,
+        );
+        let mut unused = compiler;
+        unused
+            .eh_nounwind_callees
+            .insert("nounwind_drop".to_owned());
+        assert_eq!(
+            base.digests().full,
+            policy(target, &unused, &jit).digests().full
+        );
+    }
+
+    /// The non-unwinding exception-frame fields are encoded only when ON, so
+    /// the default policy's canonical bytes (and every golden digest) are
+    /// unchanged and the enabled policy carries exactly one Artifact TLV for
+    /// the control and one for its nounwind callee set.
+    #[test]
+    fn eh_frames_cannot_unwind_is_present_only_when_enabled() {
+        let (target, compiler, _) = baseline();
+        for tag in [
+            TAG_COMPILER_EH_FRAMES_CANNOT_UNWIND,
+            TAG_COMPILER_EH_NOUNWIND_CALLEES,
+        ] {
+            assert_eh_frame_tag_present_only_when_enabled(target, &compiler, tag);
+        }
+    }
+
+    fn assert_eh_frame_tag_present_only_when_enabled(
+        target: TargetSpec,
+        compiler: &CompilerConfig,
+        tag: u16,
+    ) {
+        let tag = tag.to_be_bytes();
+        let count_tag = |policy: &CompilePolicy, partition| {
+            let bytes = policy.canonical_bytes(partition);
+            let mut cursor = ENCODING_HEADER_BYTES;
+            let mut found = 0usize;
+            while cursor < bytes.len() {
+                let len = usize::from(u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+                found += usize::from(bytes[cursor..cursor + 2] == tag);
+                cursor += TLV_HEADER_BYTES + len;
+            }
+            found
+        };
+        let off = CompilePolicy::from_compiler(target, compiler).unwrap();
+        let mut enabled = compiler.clone();
+        enabled.eh_frames_cannot_unwind = true;
+        let on = CompilePolicy::from_compiler(target, &enabled).unwrap();
+        assert_eq!(count_tag(&off, CompilePolicyPartition::Full), 0);
+        assert_eq!(count_tag(&on, CompilePolicyPartition::Artifact), 1);
+        assert_eq!(count_tag(&on, CompilePolicyPartition::Full), 1);
+        assert_eq!(count_tag(&on, CompilePolicyPartition::Evidence), 0);
+        assert_eq!(count_tag(&on, CompilePolicyPartition::Invocation), 0);
+    }
+
+    /// The function-sections field is encoded only when ON: the default
+    /// policy's canonical bytes carry no such tag (so every pre-existing
+    /// digest, including the goldens below, is unchanged) and the enabled
+    /// policy carries exactly one Artifact TLV for it.
+    #[test]
+    fn function_sections_is_present_only_when_enabled() {
+        let (target, compiler, _) = baseline();
+        let tag = TAG_COMPILER_FUNCTION_SECTIONS.to_be_bytes();
+        let has_tag = |policy: &CompilePolicy, partition| {
+            let bytes = policy.canonical_bytes(partition);
+            let mut cursor = ENCODING_HEADER_BYTES;
+            let mut found = false;
+            while cursor < bytes.len() {
+                let len = usize::from(u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+                found |= bytes[cursor..cursor + 2] == tag;
+                cursor += TLV_HEADER_BYTES + len;
+            }
+            found
+        };
+        let off = CompilePolicy::from_compiler(target, &compiler).unwrap();
+        let mut enabled = compiler.clone();
+        enabled.function_sections = true;
+        let on = CompilePolicy::from_compiler(target, &enabled).unwrap();
+        assert!(!has_tag(&off, CompilePolicyPartition::Full));
+        assert!(has_tag(&on, CompilePolicyPartition::Artifact));
+        assert!(has_tag(&on, CompilePolicyPartition::Full));
+        assert!(!has_tag(&on, CompilePolicyPartition::Evidence));
+        assert!(!has_tag(&on, CompilePolicyPartition::Invocation));
+    }
+
+    /// The never-inline set is encoded only when non-empty, only in the
+    /// Artifact partition, and distinct sets (including a name split
+    /// differently across entries) are distinct identities.
+    #[test]
+    fn never_inline_is_an_artifact_field_only_when_non_empty() {
+        let (target, compiler, jit) = baseline();
+        let tag = TAG_COMPILER_NEVER_INLINE.to_be_bytes();
+        let has_tag = |policy: &CompilePolicy, partition| {
+            let bytes = policy.canonical_bytes(partition);
+            let mut cursor = ENCODING_HEADER_BYTES;
+            let mut found = false;
+            while cursor < bytes.len() {
+                let len = usize::from(u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+                found |= bytes[cursor..cursor + 2] == tag;
+                cursor += TLV_HEADER_BYTES + len;
+            }
+            found
+        };
+        let base = policy(target, &compiler, &jit);
+        assert!(!has_tag(&base, CompilePolicyPartition::Full));
+        let with = |names: &[&str]| {
+            let mut changed = compiler.clone();
+            changed.never_inline = names.iter().map(|name| (*name).to_owned()).collect();
+            policy(target, &changed, &jit)
+        };
+        let one = with(&["helper"]);
+        assert!(has_tag(&one, CompilePolicyPartition::Artifact));
+        assert!(has_tag(&one, CompilePolicyPartition::Full));
+        assert!(!has_tag(&one, CompilePolicyPartition::Evidence));
+        assert!(!has_tag(&one, CompilePolicyPartition::Invocation));
+        assert_only_partition_changed(&base, &one, CompilePolicyPartition::Artifact);
+        let mut seen = std::collections::HashSet::new();
+        for names in [
+            &["helper"][..],
+            &["helper", "other"],
+            &["ab", "c"],
+            &["a", "bc"],
+            &["abc"],
+        ] {
+            assert!(
+                seen.insert(with(names).digest(CompilePolicyPartition::Artifact)),
+                "{names:?}"
+            );
+        }
+        assert_eq!(
+            with(&["b", "a"]).digest(CompilePolicyPartition::Artifact),
+            with(&["a", "b"]).digest(CompilePolicyPartition::Artifact)
+        );
+    }
+
+    /// OD-216: the link-unit definition set is encoded only when non-empty,
+    /// only in the Evidence partition (it withholds body-theorem credit and
+    /// changes no emitted byte), and distinct sets are distinct identities.
+    #[test]
+    fn link_unit_definitions_is_an_evidence_field_only_when_non_empty() {
+        let (target, compiler, jit) = baseline();
+        let tag = TAG_COMPILER_LINK_UNIT_DEFINITIONS.to_be_bytes();
+        let has_tag = |policy: &CompilePolicy, partition| {
+            let bytes = policy.canonical_bytes(partition);
+            let mut cursor = ENCODING_HEADER_BYTES;
+            let mut found = false;
+            while cursor < bytes.len() {
+                let len = usize::from(u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+                found |= bytes[cursor..cursor + 2] == tag;
+                cursor += TLV_HEADER_BYTES + len;
+            }
+            found
+        };
+        let base = policy(target, &compiler, &jit);
+        assert!(!has_tag(&base, CompilePolicyPartition::Full));
+        let with = |names: &[&str]| {
+            let mut changed = compiler.clone();
+            changed.link_unit_definitions = names.iter().map(|name| (*name).to_owned()).collect();
+            policy(target, &changed, &jit)
+        };
+        let one = with(&["__udivti3"]);
+        assert!(has_tag(&one, CompilePolicyPartition::Evidence));
+        assert!(has_tag(&one, CompilePolicyPartition::Full));
+        assert!(!has_tag(&one, CompilePolicyPartition::Artifact));
+        assert!(!has_tag(&one, CompilePolicyPartition::Invocation));
+        assert_only_partition_changed(&base, &one, CompilePolicyPartition::Evidence);
+        let mut seen = std::collections::HashSet::new();
+        for names in [
+            &["__udivti3"][..],
+            &["__udivti3", "memcpy"],
+            &["memcpy"],
+            &["mem", "cpy"],
+        ] {
+            assert!(
+                seen.insert(with(names).digest(CompilePolicyPartition::Evidence)),
+                "{names:?}"
+            );
+        }
+    }
+
+    /// An explicit AArch64 ISA profile is encoded only when configured, only
+    /// in the Artifact partition, and each profile is a distinct identity.
+    #[test]
+    fn explicit_aarch64_isa_profile_is_an_artifact_field_only_when_configured() {
+        use crate::target::AArch64IsaProfile;
+        let (x86_target, x86_compiler, jit) = baseline();
+        let mut x86_explicit = x86_compiler.clone();
+        x86_explicit.aarch64_isa_profile = Some(AArch64IsaProfile::FP16);
+        assert!(matches!(
+            CompilePolicy::new(x86_target, &x86_explicit, &jit),
+            Err(CompilePolicyError::Aarch64IsaProfileOnNonAarch64Target { .. })
+        ));
+        let target = TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap();
+        let mut compiler = x86_compiler;
+        compiler.target = Target::Aarch64;
+        let tag = TAG_COMPILER_AARCH64_ISA_PROFILE.to_be_bytes();
+        let has_tag = |policy: &CompilePolicy, partition| {
+            let bytes = policy.canonical_bytes(partition);
+            let mut cursor = ENCODING_HEADER_BYTES;
+            let mut found = false;
+            while cursor < bytes.len() {
+                let len = usize::from(u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+                found |= bytes[cursor..cursor + 2] == tag;
+                cursor += TLV_HEADER_BYTES + len;
+            }
+            found
+        };
+        let base = policy(target, &compiler, &jit);
+        assert!(!has_tag(&base, CompilePolicyPartition::Full));
+        let mut seen = std::collections::HashSet::new();
+        for profile in [
+            AArch64IsaProfile::BASELINE,
+            AArch64IsaProfile::FP16,
+            AArch64IsaProfile::LSE,
+            AArch64IsaProfile::APPLE_ARM64,
+        ] {
+            let mut changed = compiler.clone();
+            changed.aarch64_isa_profile = Some(profile);
+            let changed_policy = policy(target, &changed, &jit);
+            assert_only_partition_changed(&base, &changed_policy, CompilePolicyPartition::Artifact);
+            assert!(has_tag(&changed_policy, CompilePolicyPartition::Artifact));
+            assert!(!has_tag(&changed_policy, CompilePolicyPartition::Evidence));
+            assert!(seen.insert(changed_policy.digest(CompilePolicyPartition::Artifact)));
+        }
     }
 
     #[test]
@@ -1094,6 +1662,22 @@ mod tests {
         assert_eq!(parallel.digests().evidence, serial.digests().evidence);
         assert_ne!(parallel.digests().invocation, serial.digests().invocation);
         assert_ne!(parallel.digests().full, serial.digests().full);
+    }
+
+    #[test]
+    fn forced_aarch64_frame_pointers_partition_objects_and_refuse_other_targets() {
+        let (x86_target, mut compiler, jit) = baseline();
+        compiler.aarch64_force_frame_pointers = true;
+        assert!(matches!(
+            CompilePolicy::new(x86_target, &compiler, &jit),
+            Err(CompilePolicyError::Aarch64FramePointersOnNonAarch64Target { .. })
+        ));
+        let target = TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap();
+        compiler.target = Target::Aarch64;
+        let forced = policy(target, &compiler, &jit);
+        compiler.aarch64_force_frame_pointers = false;
+        let default = policy(target, &compiler, &jit);
+        assert_only_partition_changed(&default, &forced, CompilePolicyPartition::Artifact);
     }
 
     #[test]
@@ -1137,6 +1721,14 @@ mod tests {
 
         let mut changed = jit.clone();
         changed.emit_entry_counters = true;
+        assert_only_partition_changed(
+            &base,
+            &policy(target, &compiler, &changed),
+            CompilePolicyPartition::Artifact,
+        );
+
+        let mut changed = jit.clone();
+        changed.external_symbol_resolution = JitExternalSymbolResolutionPolicy::ExplicitOnly;
         assert_only_partition_changed(
             &base,
             &policy(target, &compiler, &changed),
@@ -1312,7 +1904,7 @@ mod tests {
                 .digests()
                 .full
                 .to_prefixed_hex(),
-            "sha256:53956bf6d5e76519b5c2a0b28646b76093b5c5d807141b38fff0f75b8317655b"
+            "sha256:2b7d23166f275ce82e22015a6b74f1a1465a8eec2a5309d91a08410b74d354bf"
         );
         assert_eq!(
             CompilePolicy::from_jit(target, &jit)
@@ -1320,14 +1912,14 @@ mod tests {
                 .digests()
                 .full
                 .to_prefixed_hex(),
-            "sha256:ae3336391405ee0eb8d7a2b06c245dac3fbc1df2b86ef5df5ca35f47ac8d8ddc"
+            "sha256:a962352e68035483b92ffbac605f17af714e173905a3007f6319448fa983d0d0"
         );
         assert_eq!(
             policy(target, &compiler, &jit)
                 .digests()
                 .full
                 .to_prefixed_hex(),
-            "sha256:9cb00e5cf72f5838d09d95ecc365556c2f3ae232ba5c4fdaf6d5c01599215dab"
+            "sha256:af7e84536c887fa25188b86ec80e2fa15bc2dc09c1e88dc85dfae2a918264643"
         );
     }
 }

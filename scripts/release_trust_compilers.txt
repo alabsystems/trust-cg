@@ -1,0 +1,21 @@
+# The exact Trust compilers the public release gate runs on, per AArch64 host.
+#
+# One compiler per line: the host target triple, one TAB, and that compiler's
+# exact `trustc --version` line. scripts/run_public_release_checks.sh and
+# scripts/run_public_release_codegen_tests.sh both read this file and refuse
+# any other compiler before a lane runs: the kernel-JIT fixtures compare JIT
+# code with host Rust values whose repr(Rust) layout is compiler-specific.
+#
+# The list is the Trust half of what crates/trust-cg-codegen/fixture_toolchain.rs
+# certifies, each compiler on the host its qualification ran on. Add a compiler
+# here in the same change that qualifies it there, never before:
+# scripts/tests/test_release_harness_syntax_gate.py holds the two equal, and
+# holds each host's soundness pin (`expected_trustc` in
+# run_public_release_checks.sh, which scripts/soundness_attestation.py reads)
+# to one of the compilers listed here for that host.
+aarch64-apple-darwin	rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)
+aarch64-apple-darwin	rustc 1.99.0-dev (450403669 2026-09-24) (trustc 0.10.0+g450403669)
+aarch64-apple-darwin	rustc 1.101.0-dev (c6d3ebc20 2026-10-27) (trustc 0.11.0+gc6d3ebc20)
+aarch64-apple-darwin	rustc 1.101.0-dev (d460ce139 2026-10-28) (trustc 0.12.0+gd460ce139)
+aarch64-apple-darwin	rustc 1.101.0-dev (29ebb403d 2026-10-28) (trustc 0.12.0+g29ebb403d)
+aarch64-unknown-linux-gnu	rustc 1.99.0-dev (ae9c2c1da 2026-09-21) (trustc 0.1.0)

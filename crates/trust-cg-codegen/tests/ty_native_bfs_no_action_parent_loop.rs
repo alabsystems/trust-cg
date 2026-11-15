@@ -3,13 +3,13 @@
 // The loop still has live parent-loop state carried as block arguments and
 // records the status fields that downstream O1/O3 gates compare.
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use std::collections::HashMap;
 
 use trust_cg_codegen::pipeline::{OptLevel, ProofOptimizationCertificateCitation};
-use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer, Target};
-use trust_ir::{BinOp, FieldDef, ICmpOp, ProofAnnotation, StructDef, Ty, ValueId};
+use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer};
+use trust_ir::{BinOp, ICmpOp, ProofAnnotation, Ty, ValueId};
 use trust_ir_build::{FunctionBuilder, ModuleBuilder};
 
 #[path = "common/ty_contract.rs"]
@@ -52,25 +52,6 @@ fn store_summary_slot(fb: &mut FunctionBuilder<'_>, out: ValueId, slot: u64, val
 
 fn build_no_action_parent_loop_module() -> trust_ir::Module {
     let mut mb = ModuleBuilder::new("ty_native_bfs_no_action_parent_loop");
-    let summary_pair = mb.add_struct(StructDef {
-        id: trust_ir::StructId::new(0),
-        name: "TyBfsSummaryPair".to_owned(),
-        fields: vec![
-            FieldDef {
-                name: "state_count".to_owned(),
-                ty: Ty::U64,
-                offset: None,
-            },
-            FieldDef {
-                name: "generated".to_owned(),
-                ty: Ty::U64,
-                offset: None,
-            },
-        ],
-        size: None,
-        align: Some(16),
-        repr: Default::default(),
-    });
     let entry_ty = mb.add_func_type(vec![Ty::Ptr, Ty::U64, Ty::Ptr], vec![Ty::U64]);
 
     {
@@ -141,7 +122,11 @@ fn build_no_action_parent_loop_module() -> trust_ir::Module {
             done_state_count,
             vec![ProofAnnotation::Aligned(16)],
         );
-        let _ = fb.insert_field(Ty::Struct(summary_pair), out, 1, done_generated);
+        // Field 1 (`generated`) of the summary written through `out`: a
+        // memory write, so it is spelled `GEP` + `Store`. (It used to be the
+        // "store form" of `insertfield` over the `out` pointer, which trust-ir
+        // does not define and trust-cg now refuses by name — WS7.1 (b).)
+        store_summary_slot(&mut fb, out, 1, done_generated);
         store_summary_slot(&mut fb, out, 2, done_last_parent);
         store_summary_slot(&mut fb, out, 3, done_fingerprint);
         store_summary_slot(&mut fb, out, 4, done_status);
@@ -150,13 +135,14 @@ fn build_no_action_parent_loop_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_to_jit(module: &trust_ir::Module, opt_level: OptLevel) -> ExecutableBuffer {
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     config.opt_level = opt_level;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|err| panic!("{opt_level:?} compile failed: {err}"))
         .buffer
@@ -248,4 +234,13 @@ fn native_bfs_no_action_parent_loop_o1_o3_status_summaries_match() {
         );
         assert_no_alignment_claim_authority(&o3_certs);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

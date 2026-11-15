@@ -1,0 +1,341 @@
+; TrustIr text format v1
+module "__ty_frontend_neutral_trust_ir_module"
+target "aarch64-apple-darwin" 8 little abi="darwinpcs"
+
+functy.0 = (ptr, ptr, ptr, i32) -> ()
+
+type ty.0 = i64
+
+fn @__ty_trust_ir_func_0(functy.0) {
+    ; #proof: deterministic, terminates
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: i32):
+    %4 = alloca i64
+    %17 = alloca i64
+    %19 = const i32 1
+    %20 = gep i64, ptr %1, %19
+    %21 = load i64, ptr %20
+    %22 = const i32 0
+    %23 = gep i64, ptr %1, %22
+    %24 = load i64, ptr %23
+    %27 = icmp eq i64 %21, %24
+    %28 = zext bool %27 to i64
+    store i64 %28, ptr %4
+    %30 = load i64, ptr %4
+    %31 = const i64 0
+    %32 = icmp ne i64 %30, %31
+    condbr %32, bb1, bb4
+bb1:
+    %33 = const i64 8
+    %34 = const i64 1
+    %36 = const i32 2
+    %37 = gep i64, ptr %2, %36
+    store i64 %33, ptr %37
+    store i64 %34, ptr %4
+    %40 = load i64, ptr %4
+    %41 = const i64 0
+    %42 = icmp ne i64 %40, %41
+    condbr %42, bb2, bb4
+bb2:
+    %43 = const i64 1
+    store i64 %43, ptr %17
+    %44 = const i64 1
+    %45 = const i32 1
+    %46 = gep i64, ptr %1, %45
+    %47 = load i64, ptr %46
+    %50, %51 = sub.overflow i64 %44, %47
+    condbr %51, bb5, bb6
+bb3:
+    %65 = const i32 0
+    %66 = gep i64, ptr %1, %65
+    %67 = load i64, ptr %66
+    %68 = const i32 0
+    %69 = gep i64, ptr %2, %68
+    %70 = load i64, ptr %69
+    %71 = icmp eq i64 %67, %70
+    %72 = zext bool %71 to i64
+    store i64 %72, ptr %4
+    br bb4
+bb4:
+    %74 = load i64, ptr %4
+    %75 = const i64 0
+    %76 = icmp ne i64 %74, %75
+    %77 = zext bool %76 to i64
+    %78 = const i64 0
+    %79 = gep i8, ptr %0, %78
+    %80 = const i8 0
+    store i8 %80, ptr %79
+    %81 = const i64 8
+    %82 = gep i8, ptr %0, %81
+    store i64 %77, ptr %82
+    ret
+bb5:
+    %52 = const i64 0
+    %53 = gep i8, ptr %0, %52
+    %54 = const i8 1
+    store i8 %54, ptr %53
+    %55 = const i64 16
+    %56 = gep i8, ptr %0, %55
+    %57 = const i8 4
+    store i8 %57, ptr %56
+    ret
+bb6:
+    %59 = const i32 1
+    %60 = gep i64, ptr %2, %59
+    store i64 %50, ptr %60
+    %61 = load i64, ptr %17
+    store i64 %61, ptr %4
+    %62 = load i64, ptr %4
+    %63 = const i64 0
+    %64 = icmp ne i64 %62, %63
+    condbr %64, bb3, bb4
+}
+
+fn @__ty_trust_ir_func_1(functy.0) {
+    ; #proof: deterministic, terminates
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: i32):
+    %4 = alloca i64
+    %12 = alloca i64
+    %14 = const i32 1
+    %15 = gep i64, ptr %1, %14
+    %16 = load i64, ptr %15
+    %17 = const i32 0
+    %18 = gep i64, ptr %1, %17
+    %19 = load i64, ptr %18
+    %22 = icmp ne i64 %16, %19
+    %23 = zext bool %22 to i64
+    store i64 %23, ptr %4
+    %25 = load i64, ptr %4
+    %26 = const i64 0
+    %27 = icmp ne i64 %25, %26
+    condbr %27, bb1, bb3
+bb1:
+    %28 = const i64 1
+    store i64 %28, ptr %12
+    %29 = const i64 1
+    %30 = const i32 0
+    %31 = gep i64, ptr %1, %30
+    %32 = load i64, ptr %31
+    %35, %36 = sub.overflow i64 %29, %32
+    condbr %36, bb4, bb5
+bb2:
+    %50 = const i32 2
+    %51 = gep i64, ptr %1, %50
+    %52 = load i64, ptr %51
+    %53 = const i32 2
+    %54 = gep i64, ptr %2, %53
+    %55 = load i64, ptr %54
+    %56 = icmp eq i64 %52, %55
+    %57 = zext bool %56 to i64
+    %58 = const i32 1
+    %59 = gep i64, ptr %1, %58
+    %60 = load i64, ptr %59
+    %61 = const i32 1
+    %62 = gep i64, ptr %2, %61
+    %63 = load i64, ptr %62
+    %64 = icmp eq i64 %60, %63
+    %65 = zext bool %64 to i64
+    %66 = and i64 %57, %65
+    store i64 %66, ptr %4
+    br bb3
+bb3:
+    %68 = load i64, ptr %4
+    %69 = const i64 0
+    %70 = icmp ne i64 %68, %69
+    %71 = zext bool %70 to i64
+    %72 = const i64 0
+    %73 = gep i8, ptr %0, %72
+    %74 = const i8 0
+    store i8 %74, ptr %73
+    %75 = const i64 8
+    %76 = gep i8, ptr %0, %75
+    store i64 %71, ptr %76
+    ret
+bb4:
+    %37 = const i64 0
+    %38 = gep i8, ptr %0, %37
+    %39 = const i8 1
+    store i8 %39, ptr %38
+    %40 = const i64 16
+    %41 = gep i8, ptr %0, %40
+    %42 = const i8 4
+    store i8 %42, ptr %41
+    ret
+bb5:
+    %44 = const i32 0
+    %45 = gep i64, ptr %2, %44
+    store i64 %35, ptr %45
+    %46 = load i64, ptr %12
+    store i64 %46, ptr %4
+    %47 = load i64, ptr %4
+    %48 = const i64 0
+    %49 = icmp ne i64 %47, %48
+    condbr %49, bb2, bb3
+}
+
+fn @__ty_trust_ir_func_2(functy.0) {
+    ; #proof: deterministic, terminates
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: i32):
+    %4 = alloca i64
+    %17 = alloca i64
+    %19 = const i32 1
+    %20 = gep i64, ptr %1, %19
+    %21 = load i64, ptr %20
+    %22 = const i32 0
+    %23 = gep i64, ptr %1, %22
+    %24 = load i64, ptr %23
+    %27 = icmp eq i64 %21, %24
+    %28 = zext bool %27 to i64
+    store i64 %28, ptr %4
+    %30 = load i64, ptr %4
+    %31 = const i64 0
+    %32 = icmp ne i64 %30, %31
+    condbr %32, bb1, bb4
+bb1:
+    %33 = const i64 9
+    %34 = const i64 1
+    %36 = const i32 2
+    %37 = gep i64, ptr %2, %36
+    store i64 %33, ptr %37
+    store i64 %34, ptr %4
+    %40 = load i64, ptr %4
+    %41 = const i64 0
+    %42 = icmp ne i64 %40, %41
+    condbr %42, bb2, bb4
+bb2:
+    %43 = const i64 1
+    store i64 %43, ptr %17
+    %44 = const i64 1
+    %45 = const i32 1
+    %46 = gep i64, ptr %1, %45
+    %47 = load i64, ptr %46
+    %50, %51 = sub.overflow i64 %44, %47
+    condbr %51, bb5, bb6
+bb3:
+    %65 = const i32 0
+    %66 = gep i64, ptr %1, %65
+    %67 = load i64, ptr %66
+    %68 = const i32 0
+    %69 = gep i64, ptr %2, %68
+    %70 = load i64, ptr %69
+    %71 = icmp eq i64 %67, %70
+    %72 = zext bool %71 to i64
+    store i64 %72, ptr %4
+    br bb4
+bb4:
+    %74 = load i64, ptr %4
+    %75 = const i64 0
+    %76 = icmp ne i64 %74, %75
+    %77 = zext bool %76 to i64
+    %78 = const i64 0
+    %79 = gep i8, ptr %0, %78
+    %80 = const i8 0
+    store i8 %80, ptr %79
+    %81 = const i64 8
+    %82 = gep i8, ptr %0, %81
+    store i64 %77, ptr %82
+    ret
+bb5:
+    %52 = const i64 0
+    %53 = gep i8, ptr %0, %52
+    %54 = const i8 1
+    store i8 %54, ptr %53
+    %55 = const i64 16
+    %56 = gep i8, ptr %0, %55
+    %57 = const i8 4
+    store i8 %57, ptr %56
+    ret
+bb6:
+    %59 = const i32 1
+    %60 = gep i64, ptr %2, %59
+    store i64 %50, ptr %60
+    %61 = load i64, ptr %17
+    store i64 %61, ptr %4
+    %62 = load i64, ptr %4
+    %63 = const i64 0
+    %64 = icmp ne i64 %62, %63
+    condbr %64, bb3, bb4
+}
+
+fn @__ty_trust_ir_func_3(functy.0) {
+    ; #proof: deterministic, terminates
+bb0(%0: ptr, %1: ptr, %2: ptr, %3: i32):
+    %4 = alloca i64
+    %17 = alloca i64
+    %19 = const i32 1
+    %20 = gep i64, ptr %1, %19
+    %21 = load i64, ptr %20
+    %22 = const i32 0
+    %23 = gep i64, ptr %1, %22
+    %24 = load i64, ptr %23
+    %27 = icmp eq i64 %21, %24
+    %28 = zext bool %27 to i64
+    store i64 %28, ptr %4
+    %30 = load i64, ptr %4
+    %31 = const i64 0
+    %32 = icmp ne i64 %30, %31
+    condbr %32, bb1, bb4
+bb1:
+    %33 = const i64 10
+    %34 = const i64 1
+    %36 = const i32 2
+    %37 = gep i64, ptr %2, %36
+    store i64 %33, ptr %37
+    store i64 %34, ptr %4
+    %40 = load i64, ptr %4
+    %41 = const i64 0
+    %42 = icmp ne i64 %40, %41
+    condbr %42, bb2, bb4
+bb2:
+    %43 = const i64 1
+    store i64 %43, ptr %17
+    %44 = const i64 1
+    %45 = const i32 1
+    %46 = gep i64, ptr %1, %45
+    %47 = load i64, ptr %46
+    %50, %51 = sub.overflow i64 %44, %47
+    condbr %51, bb5, bb6
+bb3:
+    %65 = const i32 0
+    %66 = gep i64, ptr %1, %65
+    %67 = load i64, ptr %66
+    %68 = const i32 0
+    %69 = gep i64, ptr %2, %68
+    %70 = load i64, ptr %69
+    %71 = icmp eq i64 %67, %70
+    %72 = zext bool %71 to i64
+    store i64 %72, ptr %4
+    br bb4
+bb4:
+    %74 = load i64, ptr %4
+    %75 = const i64 0
+    %76 = icmp ne i64 %74, %75
+    %77 = zext bool %76 to i64
+    %78 = const i64 0
+    %79 = gep i8, ptr %0, %78
+    %80 = const i8 0
+    store i8 %80, ptr %79
+    %81 = const i64 8
+    %82 = gep i8, ptr %0, %81
+    store i64 %77, ptr %82
+    ret
+bb5:
+    %52 = const i64 0
+    %53 = gep i8, ptr %0, %52
+    %54 = const i8 1
+    store i8 %54, ptr %53
+    %55 = const i64 16
+    %56 = gep i8, ptr %0, %55
+    %57 = const i8 4
+    store i8 %57, ptr %56
+    ret
+bb6:
+    %59 = const i32 1
+    %60 = gep i64, ptr %2, %59
+    store i64 %50, ptr %60
+    %61 = load i64, ptr %17
+    store i64 %61, ptr %4
+    %62 = load i64, ptr %4
+    %63 = const i64 0
+    %64 = icmp ne i64 %62, %63
+    condbr %64, bb3, bb4
+}

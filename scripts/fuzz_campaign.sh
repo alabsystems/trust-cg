@@ -69,11 +69,11 @@ esac
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 BIN="$REPO_ROOT/target/release/$DRIVER"
 
-# Build the driver if missing. We trust cargo's own up-to-date check on
+# Build the driver if missing. We trust targo's own up-to-date check on
 # subsequent runs — this is idempotent but not forced.
 if [[ ! -x "$BIN" ]]; then
     echo "[fuzz_campaign] building $DRIVER (release) ..."
-    (cd "$REPO_ROOT" && cargo build --release -p trust-cg-fuzz --bin "$DRIVER")
+    (cd "$REPO_ROOT" && "$REPO_ROOT/scripts/trust_cargo.sh" build --release -p trust-cg-fuzz --bin "$DRIVER")
 fi
 
 mkdir -p "$OUT"

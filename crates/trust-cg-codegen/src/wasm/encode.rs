@@ -77,6 +77,49 @@ pub fn write_sleb128(buf: &mut Vec<u8>, mut value: i64) {
     }
 }
 
+/// The defined functions reachable from `start` by a path of at least one
+/// edge of `graph` (adjacency by ordinal), as a membership vector.
+fn reachable_from(graph: &[Vec<usize>], start: usize) -> Vec<bool> {
+    let mut seen = vec![false; graph.len()];
+    let mut stack: Vec<usize> = graph[start].clone();
+    while let Some(n) = stack.pop() {
+        if !std::mem::replace(&mut seen[n], true) {
+            stack.extend(&graph[n]);
+        }
+    }
+    seen
+}
+
+/// Append a 5-byte PADDED unsigned LEB128 encoding of `value` — the fixed
+/// width a relocatable immediate needs, so the linker can rewrite it in place
+/// (WebAssembly tool-conventions, `Linking.md`: every relocated LEB field is
+/// padded to its maximum width).
+pub fn write_padded_uleb128(buf: &mut Vec<u8>, value: u32) {
+    let mut v = value;
+    for i in 0..5 {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if i < 4 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+    }
+}
+
+/// Append a 5-byte PADDED signed LEB128 encoding of `value` (see
+/// [`write_padded_uleb128`]).
+pub fn write_padded_sleb128(buf: &mut Vec<u8>, value: i32) {
+    let mut v = i64::from(value);
+    for i in 0..5 {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if i < 4 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+    }
+}
+
 /// WebAssembly value types (the numeric types Slice 0 needs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValType {
@@ -114,6 +157,70 @@ pub struct FuncBody {
     pub locals: Vec<(u32, ValType)>,
     /// Encoded instruction bytes (no trailing `end`).
     pub code: Vec<u8>,
+    /// Relocations against `code` (offsets relative to its first byte). Only
+    /// a relocatable object ([`WasmModule::new_object`]) carries any; a closed
+    /// module resolves every index before encoding.
+    pub relocs: Vec<Reloc>,
+}
+
+/// A relocation kind from the WebAssembly object-file conventions
+/// (tool-conventions `Linking.md`, the `R_WASM_*` table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocKind {
+    /// A function index as a padded ULEB128 (`call`).
+    FunctionIndexLeb = 0,
+    /// A table index as a padded SLEB128 (`i32.const` of a function pointer).
+    TableIndexSleb = 1,
+    /// A table index as a little-endian `u32` (a function pointer in data).
+    TableIndexI32 = 2,
+    /// A linear-memory address as a padded ULEB128 (a load/store offset).
+    MemoryAddrLeb = 3,
+    /// A linear-memory address as a padded SLEB128 (`i32.const`).
+    MemoryAddrSleb = 4,
+    /// A linear-memory address as a little-endian `u32` (a pointer in data).
+    MemoryAddrI32 = 5,
+    /// A type index as a padded ULEB128 (`call_indirect`).
+    TypeIndexLeb = 6,
+    /// A global index as a padded ULEB128 (`global.get` / `global.set`).
+    GlobalIndexLeb = 7,
+    /// A table number as a padded ULEB128 (`call_indirect`'s table).
+    TableNumberLeb = 20,
+}
+
+impl RelocKind {
+    /// Whether this relocation carries an addend field.
+    pub fn has_addend(self) -> bool {
+        matches!(
+            self,
+            RelocKind::MemoryAddrLeb | RelocKind::MemoryAddrSleb | RelocKind::MemoryAddrI32
+        )
+    }
+}
+
+/// What a relocation refers to. Resolved to a symbol-table index when the
+/// object is encoded, so a lowering never has to know symbol numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RelocTarget {
+    /// A function, by its wasm function index (import or definition).
+    Func(u32),
+    /// A data item, by its index in declaration order ([`WasmModule::add_data_item`]).
+    Data(u32),
+    /// A global, by its wasm global index (import or definition).
+    Global(u32),
+    /// The imported `__indirect_function_table`.
+    Table,
+    /// A type-section index (no symbol).
+    Type(u32),
+}
+
+/// One relocation: rewrite the field at `offset` to refer to `target` (plus
+/// `addend` for memory addresses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reloc {
+    pub kind: RelocKind,
+    pub offset: u32,
+    pub target: RelocTarget,
+    pub addend: i32,
 }
 
 /// Export descriptor kind.
@@ -273,12 +380,14 @@ impl fmt::Display for WasmEncodeError {
 
 impl std::error::Error for WasmEncodeError {}
 
-/// An imported function: its two-level name and its type index.
+/// An imported function: its two-level name, its type index, and (in a
+/// relocatable object) the visibility of its undefined symbol.
 #[derive(Debug, Clone)]
 struct FuncImport {
     module: String,
     name: String,
     type_idx: u32,
+    hidden: bool,
 }
 
 /// An imported global: its two-level name, value type, and mutability.
@@ -314,6 +423,135 @@ struct DataSegment {
     bytes: Vec<u8>,
 }
 
+/// The import module every symbol of a relocatable object is imported from
+/// (the linker's namespace; `wasm-ld` resolves `env.<symbol>` by name).
+pub const OBJECT_IMPORT_MODULE: &str = "env";
+/// The linear memory a relocatable object imports; `wasm-ld` defines it.
+pub const OBJECT_MEMORY_IMPORT: &str = "__linear_memory";
+/// The stack-pointer global a relocatable object imports.
+pub const OBJECT_STACK_POINTER_IMPORT: &str = "__stack_pointer";
+/// The function table a relocatable object imports.
+pub const OBJECT_TABLE_IMPORT: &str = "__indirect_function_table";
+
+/// The first `funcref` table element a CLOSED module fills. Element 0 stays
+/// the null funcref, so the integer 0 — the null pointer — is never the
+/// address of a function (trust-ir's `NullPtr` is distinct from every
+/// `FnDef`, and a Rust `Option<fn()>` niche relies on it), and a
+/// `call_indirect` through null traps instead of calling a function. This is
+/// the same convention `wasm-ld` applies to a linked object (its default
+/// `--table-base` is 1).
+pub const CLOSED_TABLE_BASE: u32 = 1;
+
+/// The table index — the function-pointer value — of function `funcidx` in a
+/// CLOSED module ([`CLOSED_TABLE_BASE`]).
+pub fn closed_table_index(funcidx: u32) -> u32 {
+    funcidx + CLOSED_TABLE_BASE
+}
+
+/// `WASM_SYM_UNDEFINED`.
+const SYM_UNDEFINED: u32 = 0x10;
+/// `WASM_SYM_VISIBILITY_HIDDEN`.
+const SYM_VISIBILITY_HIDDEN: u32 = 0x4;
+/// `WASM_SYM_NO_STRIP`.
+const SYM_NO_STRIP: u32 = 0x80;
+
+/// The flags of an UNDEFINED function or data symbol. An undefined symbol is
+/// always a STRONG reference: `WASM_SYM_BINDING_WEAK` on an undefined symbol
+/// makes it extern_weak, which `wasm-ld` resolves to null (address 0, table
+/// index 0) when nothing defines it — a reference the object lane refuses
+/// rather than emits. It is never local and has no bytes to retain, so its
+/// only attribute is its visibility.
+fn undefined_symbol_bits(hidden: bool) -> u32 {
+    SYM_UNDEFINED | if hidden { SYM_VISIBILITY_HIDDEN } else { 0 }
+}
+
+/// Symbol attributes of a DEFINED function or data item in a relocatable
+/// object (tool-conventions `Linking.md`, `WASM_SYM_*`). Only `hidden` is
+/// carried onto an UNDEFINED symbol ([`undefined_symbol_bits`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SymbolFlags {
+    /// `WASM_SYM_BINDING_LOCAL`: visible only inside this object.
+    pub local: bool,
+    /// `WASM_SYM_BINDING_WEAK`: another definition may replace this one.
+    pub weak: bool,
+    /// `WASM_SYM_VISIBILITY_HIDDEN`: not exported from a linked module.
+    pub hidden: bool,
+    /// `WASM_SYM_NO_STRIP`: kept by `--gc-sections` (`#[used]`).
+    pub no_strip: bool,
+}
+
+impl SymbolFlags {
+    fn bits(self) -> u32 {
+        let mut bits = 0;
+        if self.weak {
+            bits |= 0x1;
+        }
+        if self.local {
+            bits |= 0x2;
+        }
+        if self.hidden {
+            bits |= SYM_VISIBILITY_HIDDEN;
+        }
+        if self.no_strip {
+            bits |= SYM_NO_STRIP;
+        }
+        bits
+    }
+}
+
+/// The bytes of a defined data item: its own data segment in a relocatable
+/// object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataDef {
+    pub bytes: Vec<u8>,
+    /// Alignment in bytes (a power of two).
+    pub align: u32,
+    /// Relocations against `bytes` (offsets relative to the item's first
+    /// byte; `TableIndexI32` / `MemoryAddrI32` only), in any order: the
+    /// encoder emits every relocation section sorted by offset.
+    pub relocs: Vec<Reloc>,
+    /// Read-only data (`.rodata.*`) rather than writable (`.data.*`).
+    pub readonly: bool,
+}
+
+/// A named data item of a relocatable object: a defined segment, or a name the
+/// linker resolves elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataItem {
+    pub name: String,
+    pub flags: SymbolFlags,
+    /// `None` for an UNDEFINED data symbol.
+    pub def: Option<DataDef>,
+    /// The item's address in the object's own data layout (what an
+    /// unrelocated reference to it encodes). Assigned by
+    /// [`WasmModule::add_data_item`].
+    pub virtual_addr: u32,
+}
+
+/// Everything only a relocatable object has.
+#[derive(Debug, Clone, Default)]
+struct ObjectState {
+    /// Symbol name and flags of each DEFINED function, by definition ordinal.
+    func_symbols: Vec<(String, SymbolFlags)>,
+    /// Data items in declaration order (`RelocTarget::Data` indexes this).
+    data_items: Vec<DataItem>,
+    /// The object imports `__indirect_function_table` even if no relocation
+    /// names the table ([`WasmModule::object_needs_table`] adds it whenever
+    /// one does).
+    table_import: bool,
+    /// Next free address in the object's own data layout.
+    data_cursor: u32,
+    /// Target features the code relies on (`target_features` section).
+    features: std::collections::BTreeSet<&'static str>,
+    /// Debug names of DEFINED functions, by definition ordinal: the `name`
+    /// section [`WasmModule::finish`] writes, from which `wasm-ld` names the
+    /// function in the linked module's `name` section instead of from its
+    /// symbol. Debug information only: no symbol, relocation, import or
+    /// export reads it, and a function without an entry keeps its symbol's
+    /// name in the linked module.
+    debug_names: std::collections::BTreeMap<u32, String>,
+}
+
 /// A WebAssembly module under construction.
 #[derive(Debug, Clone, Default)]
 pub struct WasmModule {
@@ -334,9 +572,10 @@ pub struct WasmModule {
     memory_min_pages: Option<u32>,
     globals: Vec<GlobalDef>,
     /// If set, a `funcref` table is emitted holding every function (imported
-    /// and defined) at element index `i = funcidx i` (for `call_indirect` /
-    /// function pointers). The size is derived from [`WasmModule::func_count`]
-    /// at emission, never from caller arithmetic that could forget the import
+    /// and defined) at element index [`closed_table_index`]`(funcidx)` (for
+    /// `call_indirect` / function pointers); element 0 stays the null
+    /// funcref. The size is derived from [`WasmModule::func_count`] at
+    /// emission, never from caller arithmetic that could forget the import
     /// shift.
     func_table: bool,
     /// ACTIVE data segments, emitted as section 11 in declaration order.
@@ -345,6 +584,14 @@ pub struct WasmModule {
     /// data segments into the memory it IMPORTS. Without it,
     /// [`WasmModule::add_data_segment`] fails closed under an imported memory.
     imported_memory_data_granted: bool,
+    /// `Some` for a RELOCATABLE OBJECT ([`WasmModule::new_object`]): the module
+    /// is linker input, not a runnable module.
+    object: Option<ObjectState>,
+    /// Emission-pass candidates awaiting translation validation. Each defined
+    /// function's body above is its unoptimized baseline until
+    /// [`super::opt::validate_pending`] swaps in a validated candidate; a
+    /// module finished without that step encodes the baselines.
+    local_opt_pending: Vec<super::opt::PendingLocalOpt>,
 }
 
 impl WasmModule {
@@ -359,6 +606,388 @@ impl WasmModule {
         Self {
             memory_policy: policy,
             ..Self::default()
+        }
+    }
+
+    /// A RELOCATABLE OBJECT for `wasm-ld` (WebAssembly tool-conventions
+    /// `Linking.md`): its linear memory is imported as
+    /// `env.__linear_memory`, every body-less function is an undefined symbol
+    /// imported from `env`, indices and addresses in code and data are
+    /// relocations, and [`WasmModule::finish`] appends the `linking`,
+    /// `reloc.CODE`, `reloc.DATA` and `target_features` custom sections.
+    pub fn new_object() -> Self {
+        Self {
+            memory_policy: WasmMemoryPolicy::Imported {
+                module: OBJECT_IMPORT_MODULE.to_string(),
+                name: OBJECT_MEMORY_IMPORT.to_string(),
+            },
+            imported_memory_data_granted: true,
+            object: Some(ObjectState::default()),
+            ..Self::default()
+        }
+    }
+
+    /// True for a relocatable object.
+    pub fn is_object(&self) -> bool {
+        self.object.is_some()
+    }
+
+    /// Record the symbol name and attributes of the DEFINED function
+    /// `func_idx` (an index [`WasmModule::add_function`] returned). Only an
+    /// object carries symbols; a closed module ignores this.
+    pub fn set_function_symbol(&mut self, func_idx: u32, name: &str, flags: SymbolFlags) {
+        let import_count = self.func_import_count();
+        if let Some(obj) = &mut self.object {
+            let ordinal = (func_idx - import_count) as usize;
+            if obj.func_symbols.len() <= ordinal {
+                obj.func_symbols
+                    .resize(ordinal + 1, (String::new(), SymbolFlags::default()));
+            }
+            obj.func_symbols[ordinal] = (name.to_string(), flags);
+        }
+    }
+
+    /// Give the DEFINED function `func_idx` the debug name `name` in the
+    /// object's `name` section (see `ObjectState::debug_names`). A closed
+    /// module, or an index that is not a defined function, ignores it.
+    pub(crate) fn set_function_debug_name(&mut self, func_idx: u32, name: &str) {
+        let import_count = self.func_import_count();
+        let defined = self.bodies.len() as u32;
+        if let Some(obj) = &mut self.object
+            && let Some(ordinal) = func_idx.checked_sub(import_count)
+            && ordinal < defined
+        {
+            obj.debug_names.insert(ordinal, name.to_string());
+        }
+    }
+
+    /// The identical-body folds of a relocatable object's FINAL bodies (plan
+    /// them after every body is emitted and every emission-pass candidate is
+    /// validated, then [`WasmModule::apply_body_folds`]). Defined functions
+    /// `eligible` admits, of at least `min_code` code bytes, whose type, local
+    /// declarations, code bytes and relocations (kind, offset, target and
+    /// addend) are all equal form a group. One member whose symbol is not
+    /// weak is kept (a weak symbol is never kept, since another object's
+    /// definition could replace its body at link), and a member `m` is folded
+    /// onto the kept `k` only when `m` is not reachable from `k` in this
+    /// object's call graph ([`WasmModule::fold_call_graph`]), so no cycle of
+    /// calls among this object's functions passes through a forwarder (an
+    /// indirect call included, whichever object took the address it calls)
+    /// and such a recursion pays no forwarder frame per level. The kept member is the one that admits the
+    /// most folds, the lowest-indexed on a tie. Returns `(folded, kept)`
+    /// function index pairs in folded order; a closed module has none.
+    pub(crate) fn plan_body_folds(
+        &self,
+        eligible: &dyn Fn(u32) -> bool,
+        min_code: usize,
+    ) -> Vec<(u32, u32)> {
+        let Some(obj) = &self.object else {
+            return Vec::new();
+        };
+        let import_count = self.func_import_count();
+        let weak = |ordinal: usize| obj.func_symbols.get(ordinal).is_none_or(|(_, f)| f.weak);
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (ordinal, body) in self.bodies.iter().enumerate() {
+            if body.code.len() < min_code || !eligible(import_count + ordinal as u32) {
+                continue;
+            }
+            let same = |k: usize| {
+                self.func_types[k] == self.func_types[ordinal]
+                    && self.bodies[k].locals == body.locals
+                    && self.bodies[k].code == body.code
+                    && self.bodies[k].relocs == body.relocs
+            };
+            match groups.iter_mut().find(|g| same(g[0])) {
+                Some(g) => g.push(ordinal),
+                None => groups.push(vec![ordinal]),
+            }
+        }
+        groups.retain(|g| g.len() > 1);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let graph = self.fold_call_graph();
+        let mut folds = Vec::new();
+        for group in &groups {
+            let mut best: Option<(usize, Vec<usize>)> = None;
+            for &k in group.iter().filter(|&&k| !weak(k)) {
+                let reach = reachable_from(&graph, k);
+                let foldable: Vec<usize> = group
+                    .iter()
+                    .copied()
+                    .filter(|&m| m != k && !reach[m])
+                    .collect();
+                if best.as_ref().is_none_or(|(_, b)| foldable.len() > b.len()) {
+                    best = Some((k, foldable));
+                }
+            }
+            if let Some((k, foldable)) = best {
+                for m in foldable {
+                    folds.push((import_count + m as u32, import_count + k as u32));
+                }
+            }
+        }
+        folds.sort_unstable();
+        folds
+    }
+
+    /// The call graph [`WasmModule::plan_body_folds`] keeps forwarders out
+    /// of, over defined-function ordinals: body `b` has an edge to every
+    /// defined function a relocation of `b` names (a call, or an address it
+    /// takes), and a body that makes an indirect call (a type-index or
+    /// table-number relocation) has an edge to every defined function whose
+    /// address it could be handed: every one whose address this object takes
+    /// anywhere (a table-index relocation in a body or a data item), and
+    /// every one whose symbol is not `WASM_SYM_BINDING_LOCAL` (or that has no
+    /// symbol), since another object or the host can name such a function
+    /// and take its address. It over-approximates every call path WITHIN the
+    /// object, an indirect call included wherever its target's address was
+    /// taken; a path that runs through another object's function or the host
+    /// is outside it.
+    fn fold_call_graph(&self) -> Vec<Vec<usize>> {
+        let import_count = self.func_import_count();
+        let defined = |r: &Reloc| match r.target {
+            RelocTarget::Func(f) => f
+                .checked_sub(import_count)
+                .map(|o| o as usize)
+                .filter(|&o| o < self.bodies.len()),
+            _ => None,
+        };
+        let data_relocs = self
+            .object
+            .iter()
+            .flat_map(|o| &o.data_items)
+            .filter_map(|i| i.def.as_ref())
+            .flat_map(|d| &d.relocs);
+        let address_taken: Vec<usize> = {
+            let mut v: Vec<usize> = self
+                .bodies
+                .iter()
+                .flat_map(|b| &b.relocs)
+                .filter(|r| r.kind != RelocKind::FunctionIndexLeb)
+                .chain(data_relocs)
+                .filter_map(defined)
+                .chain((0..self.bodies.len()).filter(|&o| {
+                    self.object
+                        .as_ref()
+                        .and_then(|obj| obj.func_symbols.get(o))
+                        .is_none_or(|(name, f)| name.is_empty() || !f.local)
+                }))
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        self.bodies
+            .iter()
+            .map(|b| {
+                let mut edges: Vec<usize> = b.relocs.iter().filter_map(defined).collect();
+                if b.relocs
+                    .iter()
+                    .any(|r| matches!(r.kind, RelocKind::TypeIndexLeb | RelocKind::TableNumberLeb))
+                {
+                    edges.extend(&address_taken);
+                }
+                edges.sort_unstable();
+                edges.dedup();
+                edges
+            })
+            .collect()
+    }
+
+    /// Replace the body of each `folded` function of `folds` (pairs from
+    /// [`WasmModule::plan_body_folds`]) by a FORWARDER to `kept`: no locals,
+    /// `local.get` of each parameter in order, then a `call` of `kept` (a
+    /// padded function-index relocation) whose results it returns. A pair
+    /// whose forwarder would not be shorter than the body is skipped. Returns
+    /// the pairs applied.
+    ///
+    /// Every function keeps its own index, symbol, exports and table
+    /// entries, so no function address changes and none becomes equal to
+    /// another; a call of a folded function runs the kept function's body,
+    /// which was its own body byte for byte, on the same arguments.
+    pub(crate) fn apply_body_folds(&mut self, folds: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let import_count = self.func_import_count();
+        let mut applied = Vec::with_capacity(folds.len());
+        for &(folded, kept) in folds {
+            let Some(ordinal) = folded
+                .checked_sub(import_count)
+                .map(|o| o as usize)
+                .filter(|&o| o < self.bodies.len())
+            else {
+                continue;
+            };
+            let params = self.types[self.func_types[ordinal] as usize].params.len() as u32;
+            let mut code = Vec::new();
+            for p in 0..params {
+                emit_local_get(&mut code, p);
+            }
+            code.push(op::CALL);
+            let relocs = vec![Reloc {
+                kind: RelocKind::FunctionIndexLeb,
+                offset: code.len() as u32,
+                target: RelocTarget::Func(kept),
+                addend: 0,
+            }];
+            write_padded_uleb128(&mut code, kept);
+            if code.len() >= self.bodies[ordinal].code.len() {
+                continue;
+            }
+            self.bodies[ordinal] = FuncBody {
+                locals: Vec::new(),
+                code,
+                relocs,
+            };
+            applied.push((folded, kept));
+        }
+        applied
+    }
+
+    /// Declare a data item of a relocatable object, returning its index (the
+    /// [`RelocTarget::Data`] of every reference to it) and its address in the
+    /// object's own data layout.
+    pub fn add_data_item(
+        &mut self,
+        name: &str,
+        flags: SymbolFlags,
+        def: Option<DataDef>,
+    ) -> Result<(u32, u32), WasmEncodeError> {
+        let obj = self.object.as_mut().ok_or_else(|| {
+            WasmEncodeError::NoMemory("data items belong to a relocatable object".to_string())
+        })?;
+        let mut virtual_addr = 0;
+        if let Some(d) = &def {
+            let align = d.align.max(1);
+            virtual_addr = obj
+                .data_cursor
+                .checked_next_multiple_of(align)
+                .ok_or_else(|| {
+                    WasmEncodeError::DataOutOfRange(format!("data item `{name}` overflows"))
+                })?;
+            obj.data_cursor = virtual_addr
+                .checked_add(d.bytes.len() as u32)
+                .ok_or_else(|| {
+                    WasmEncodeError::DataOutOfRange(format!("data item `{name}` overflows"))
+                })?;
+        }
+        let index = obj.data_items.len() as u32;
+        obj.data_items.push(DataItem {
+            name: name.to_string(),
+            flags,
+            def,
+            virtual_addr,
+        });
+        Ok((index, virtual_addr))
+    }
+
+    /// Replace the bytes (and data relocations) of DEFINED data item `item`.
+    /// The size must not change: the item's address was assigned from it.
+    pub fn set_data_item_image(
+        &mut self,
+        item: u32,
+        bytes: Vec<u8>,
+        relocs: Vec<Reloc>,
+    ) -> Result<(), WasmEncodeError> {
+        let obj = self.object.as_mut().ok_or_else(|| {
+            WasmEncodeError::NoMemory("data items belong to a relocatable object".to_string())
+        })?;
+        let def = obj
+            .data_items
+            .get_mut(item as usize)
+            .and_then(|i| i.def.as_mut())
+            .ok_or_else(|| {
+                WasmEncodeError::DataOutOfRange(format!("data item {item} is not defined"))
+            })?;
+        if def.bytes.len() != bytes.len() {
+            return Err(WasmEncodeError::DataOutOfRange(format!(
+                "data item {item} image is {} bytes, laid out as {}",
+                bytes.len(),
+                def.bytes.len()
+            )));
+        }
+        def.bytes = bytes;
+        def.relocs = relocs;
+        Ok(())
+    }
+
+    /// Import the linker's function table (`env.__indirect_function_table`).
+    pub fn require_table_import(&mut self) {
+        if let Some(obj) = &mut self.object {
+            obj.table_import = true;
+        }
+    }
+
+    /// Whether this relocatable object imports `__indirect_function_table`:
+    /// when asked to, and whenever any code or data relocation is a table
+    /// index or table number. A `TABLE_INDEX` relocation puts its function in
+    /// the linker's element segment, and `wasm-ld` creates that table only if
+    /// some input carries the table symbol (LLVM's object writer always emits
+    /// it next to a table-index relocation), so the requirement is derived
+    /// here from the relocations themselves, not left to each lowering path.
+    /// False for a closed module.
+    pub fn object_needs_table(&self) -> bool {
+        let Some(obj) = &self.object else {
+            return false;
+        };
+        let is_table_reloc = |r: &Reloc| {
+            matches!(
+                r.kind,
+                RelocKind::TableIndexSleb | RelocKind::TableIndexI32 | RelocKind::TableNumberLeb
+            )
+        };
+        obj.table_import
+            || self
+                .bodies
+                .iter()
+                .flat_map(|b| &b.relocs)
+                .any(is_table_reloc)
+            || obj
+                .data_items
+                .iter()
+                .filter_map(|i| i.def.as_ref())
+                .flat_map(|d| &d.relocs)
+                .any(is_table_reloc)
+    }
+
+    /// The first name two NON-LOCAL symbols of this object share, if any:
+    /// every function import (its import name), every defined function and
+    /// data item not bound local, every imported global, and the table the
+    /// object imports. LLVM's wasm object reader — `wasm-ld`, `llvm-nm` —
+    /// rejects an object with such a pair as malformed ("duplicate symbol
+    /// name"), so a caller refuses it rather than hand it on. `None` for a
+    /// closed module, which carries no symbols.
+    pub fn object_duplicate_symbol(&self) -> Option<String> {
+        let obj = self.object.as_ref()?;
+        let mut names: Vec<&str> = Vec::new();
+        names.extend(self.func_imports.iter().map(|f| f.name.as_str()));
+        names.extend(
+            obj.func_symbols
+                .iter()
+                .filter(|(_, flags)| !flags.local)
+                .map(|(name, _)| name.as_str()),
+        );
+        names.extend(
+            obj.data_items
+                .iter()
+                .filter(|item| !item.flags.local)
+                .map(|item| item.name.as_str()),
+        );
+        names.extend(self.global_imports.iter().map(|g| g.name.as_str()));
+        if self.object_needs_table() {
+            names.push(OBJECT_TABLE_IMPORT);
+        }
+        let mut seen = std::collections::HashSet::new();
+        names
+            .into_iter()
+            .find(|name| !seen.insert(*name))
+            .map(str::to_string)
+    }
+
+    /// Record that emitted code relies on a WebAssembly feature (named as in
+    /// the `target_features` section: `bulk-memory`, `multivalue`, ...).
+    pub fn require_feature(&mut self, feature: &'static str) {
+        if let Some(obj) = &mut self.object {
+            obj.features.insert(feature);
         }
     }
 
@@ -401,8 +1030,20 @@ impl WasmModule {
             module: module.to_string(),
             name: name.to_string(),
             type_idx,
+            hidden: false,
         });
         Ok(idx)
+    }
+
+    /// Give the undefined symbol of imported function `func_idx` hidden
+    /// visibility (a relocatable object's declaration of a hidden function).
+    /// Only an object carries symbols; a closed module ignores this.
+    pub fn set_func_import_hidden(&mut self, func_idx: u32, hidden: bool) {
+        if self.object.is_some()
+            && let Some(import) = self.func_imports.get_mut(func_idx as usize)
+        {
+            import.hidden = hidden;
+        }
     }
 
     /// Import a global from `module`.`name`, returning its **global index**.
@@ -456,6 +1097,64 @@ impl WasmModule {
         self.func_types.push(type_idx);
         self.bodies.push(body);
         idx
+    }
+
+    /// The type of function `func` (an import or a definition).
+    pub(crate) fn func_type_of(&self, func: u32) -> Option<&FuncType> {
+        let imports = self.func_imports.len();
+        let i = func as usize;
+        let ty = if i < imports {
+            self.func_imports[i].type_idx
+        } else {
+            *self.func_types.get(i - imports)?
+        };
+        self.types.get(ty as usize)
+    }
+
+    /// The value type of global `global` (an import or a definition).
+    pub(crate) fn global_type(&self, global: u32) -> Option<ValType> {
+        let imports = self.global_imports.len();
+        let i = global as usize;
+        if i < imports {
+            Some(self.global_imports[i].ty)
+        } else {
+            self.globals.get(i - imports).map(|g| g.ty)
+        }
+    }
+
+    /// The type at type-section index `idx`.
+    pub(crate) fn type_at(&self, idx: u32) -> Option<&FuncType> {
+        self.types.get(idx as usize)
+    }
+
+    /// The body of defined function `func`.
+    pub(crate) fn body_of(&self, func: u32) -> Option<&FuncBody> {
+        let i = (func as usize).checked_sub(self.func_imports.len())?;
+        self.bodies.get(i)
+    }
+
+    /// Replace the body of defined function `func`; false if there is none.
+    pub(crate) fn replace_body(&mut self, func: u32, body: FuncBody) -> bool {
+        let Some(i) = (func as usize).checked_sub(self.func_imports.len()) else {
+            return false;
+        };
+        match self.bodies.get_mut(i) {
+            Some(slot) => {
+                *slot = body;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Queue an emission-pass candidate for validation.
+    pub(crate) fn push_local_opt(&mut self, pending: super::opt::PendingLocalOpt) {
+        self.local_opt_pending.push(pending);
+    }
+
+    /// Take every queued emission-pass candidate.
+    pub(crate) fn take_local_opt(&mut self) -> Vec<super::opt::PendingLocalOpt> {
+        std::mem::take(&mut self.local_opt_pending)
     }
 
     /// True once the module has a linear memory (defined or imported).
@@ -607,8 +1306,9 @@ impl WasmModule {
     }
 
     /// Emit a `funcref` table holding EVERY function — imported and defined —
-    /// at element index equal to its function index, so a function pointer is
-    /// its funcidx. The size and contents are derived from
+    /// at element index [`closed_table_index`]`(funcidx)`, so a function
+    /// pointer is its funcidx plus [`CLOSED_TABLE_BASE`] and element 0 stays
+    /// the null funcref. The size and contents are derived from
     /// [`WasmModule::func_count`] when the module is serialized, so the import
     /// shift cannot be forgotten at a call site.
     pub fn enable_func_table(&mut self) {
@@ -645,8 +1345,10 @@ impl WasmModule {
     }
 
     /// The host contract this module binds: every import it requires, as
-    /// `"<kind> <module>.<name>"` lines in emission order. Empty for a closed
-    /// module — which is exactly the claim "the boundary is the module".
+    /// `"<kind> <module>.<name>"` lines in emission order (for a relocatable
+    /// object, its undefined data symbols follow as `data env.<name>`). Empty
+    /// for a closed module — which is exactly the claim "the boundary is the
+    /// module".
     pub fn host_contract(&self) -> Vec<String> {
         let mut out = Vec::new();
         for f in &self.func_imports {
@@ -658,11 +1360,21 @@ impl WasmModule {
         for g in &self.global_imports {
             out.push(format!("global {}.{}", g.module, g.name));
         }
+        // An object's undefined DATA symbols are link terms too: the linker
+        // must resolve each against another object's definition.
+        if let Some(obj) = &self.object {
+            for item in obj.data_items.iter().filter(|i| i.def.is_none()) {
+                out.push(format!("data {OBJECT_IMPORT_MODULE}.{}", item.name));
+            }
+        }
         out
     }
 
     /// Serialize the module to its binary `.wasm` representation.
     pub fn finish(&self) -> Vec<u8> {
+        if let Some(obj) = &self.object {
+            return self.finish_object(obj);
+        }
         let mut out = Vec::new();
         // Magic "\0asm" + version 1.
         out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d]);
@@ -727,14 +1439,18 @@ impl WasmModule {
             push_section(&mut out, 3, &body);
         }
 
-        // Table section (id 4): one funcref table sized to hold all functions
-        // (imported ones included — they share the function index space).
+        // Table section (id 4): one funcref table sized to hold the null slot
+        // plus all functions (imported ones included — they share the function
+        // index space).
         if self.func_table {
             let mut body = Vec::new();
             write_uleb128(&mut body, 1); // one table
             body.push(0x70); // funcref element type
             body.push(0x00); // limits flag: min only
-            write_uleb128(&mut body, u64::from(self.func_count()));
+            write_uleb128(
+                &mut body,
+                u64::from(CLOSED_TABLE_BASE) + u64::from(self.func_count()),
+            );
             push_section(&mut out, 4, &body);
         }
 
@@ -787,16 +1503,17 @@ impl WasmModule {
             push_section(&mut out, 7, &body);
         }
 
-        // Element section (id 9): an active segment filling table 0 at offset 0
-        // with every function index, so funcidx == table element index.
+        // Element section (id 9): an active segment filling table 0 from
+        // CLOSED_TABLE_BASE with every function index, so table element
+        // `closed_table_index(funcidx)` holds funcidx and element 0 stays null.
         if self.func_table {
             let count = self.func_count();
             let mut body = Vec::new();
             write_uleb128(&mut body, 1); // one element segment
             write_uleb128(&mut body, 0); // segment flags: active, table 0
-            // offset init expr: i32.const 0; end
+            // offset init expr: i32.const CLOSED_TABLE_BASE; end
             body.push(op::I32_CONST);
-            write_sleb128(&mut body, 0);
+            write_sleb128(&mut body, i64::from(CLOSED_TABLE_BASE));
             body.push(op::END);
             write_uleb128(&mut body, u64::from(count)); // number of func indices
             for i in 0..count {
@@ -846,6 +1563,337 @@ impl WasmModule {
             push_section(&mut out, 11, &body);
         }
 
+        out
+    }
+}
+
+impl WasmModule {
+    /// Serialize a relocatable object (see [`WasmModule::new_object`]).
+    fn finish_object(&self, obj: &ObjectState) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d]);
+        out.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        // Section ordinal of every emitted section: relocation sections name
+        // their target by it.
+        let mut section_count: u32 = 0;
+        let mut emit = |out: &mut Vec<u8>, id: u8, body: &[u8]| -> u32 {
+            push_section(out, id, body);
+            section_count += 1;
+            section_count - 1
+        };
+
+        if !self.types.is_empty() {
+            let mut body = Vec::new();
+            write_uleb128(&mut body, self.types.len() as u64);
+            for ty in &self.types {
+                body.push(0x60);
+                write_uleb128(&mut body, ty.params.len() as u64);
+                body.extend(ty.params.iter().map(|p| p.code()));
+                write_uleb128(&mut body, ty.results.len() as u64);
+                body.extend(ty.results.iter().map(|r| r.code()));
+            }
+            emit(&mut out, 1, &body);
+        }
+
+        // Imports: memory, functions, table, globals. Within a kind the order
+        // is the index order.
+        let table_import = self.object_needs_table();
+        let import_count = usize::from(self.memory_import.is_some())
+            + self.func_imports.len()
+            + usize::from(table_import)
+            + self.global_imports.len();
+        if import_count > 0 {
+            let mut body = Vec::new();
+            write_uleb128(&mut body, import_count as u64);
+            if let Some(m) = &self.memory_import {
+                push_name(&mut body, &m.module);
+                push_name(&mut body, &m.name);
+                body.push(0x02);
+                body.push(0x00);
+                let pages = obj
+                    .data_cursor
+                    .div_ceil(WASM_PAGE_BYTES)
+                    .max(u32::from(obj.data_cursor > 0));
+                write_uleb128(&mut body, u64::from(pages));
+            }
+            for f in &self.func_imports {
+                push_name(&mut body, &f.module);
+                push_name(&mut body, &f.name);
+                body.push(0x00);
+                write_uleb128(&mut body, u64::from(f.type_idx));
+            }
+            if table_import {
+                push_name(&mut body, OBJECT_IMPORT_MODULE);
+                push_name(&mut body, OBJECT_TABLE_IMPORT);
+                body.push(0x01); // importdesc: table
+                body.push(0x70); // funcref
+                body.push(0x00); // limits: min only
+                write_uleb128(&mut body, 0);
+            }
+            for g in &self.global_imports {
+                push_name(&mut body, &g.module);
+                push_name(&mut body, &g.name);
+                body.push(0x03);
+                body.push(g.ty.code());
+                body.push(if g.mutable { 0x01 } else { 0x00 });
+            }
+            emit(&mut out, 2, &body);
+        }
+
+        if !self.func_types.is_empty() {
+            let mut body = Vec::new();
+            write_uleb128(&mut body, self.func_types.len() as u64);
+            for type_idx in &self.func_types {
+                write_uleb128(&mut body, u64::from(*type_idx));
+            }
+            emit(&mut out, 3, &body);
+        }
+
+        // Symbol table. Functions (imports, then definitions), data items,
+        // imported globals, the table.
+        let func_imports = self.func_imports.len() as u32;
+        let mut symtab = Vec::new();
+        let mut sym_count: u32 = 0;
+        let mut func_sym = std::collections::HashMap::new();
+        for (i, import) in (0..func_imports).zip(&self.func_imports) {
+            symtab.push(0u8); // SYMTAB_FUNCTION
+            write_uleb128(&mut symtab, u64::from(undefined_symbol_bits(import.hidden)));
+            write_uleb128(&mut symtab, u64::from(i));
+            func_sym.insert(i, sym_count);
+            sym_count += 1;
+        }
+        for (ordinal, _) in self.func_types.iter().enumerate() {
+            let (name, flags) = obj.func_symbols.get(ordinal).cloned().unwrap_or_else(|| {
+                (
+                    format!("__tcg_fn{ordinal}"),
+                    SymbolFlags {
+                        local: true,
+                        ..SymbolFlags::default()
+                    },
+                )
+            });
+            symtab.push(0u8);
+            write_uleb128(&mut symtab, u64::from(flags.bits()));
+            write_uleb128(&mut symtab, u64::from(func_imports + ordinal as u32));
+            push_name(&mut symtab, &name);
+            func_sym.insert(func_imports + ordinal as u32, sym_count);
+            sym_count += 1;
+        }
+        let mut data_sym = Vec::with_capacity(obj.data_items.len());
+        let mut segment_of_item = Vec::with_capacity(obj.data_items.len());
+        let mut segments = 0u32;
+        for item in &obj.data_items {
+            symtab.push(1u8); // SYMTAB_DATA
+            match &item.def {
+                Some(d) => {
+                    write_uleb128(&mut symtab, u64::from(item.flags.bits()));
+                    push_name(&mut symtab, &item.name);
+                    write_uleb128(&mut symtab, u64::from(segments)); // segment
+                    write_uleb128(&mut symtab, 0); // offset within segment
+                    write_uleb128(&mut symtab, d.bytes.len() as u64); // size
+                    segment_of_item.push(Some(segments));
+                    segments += 1;
+                }
+                None => {
+                    write_uleb128(
+                        &mut symtab,
+                        u64::from(undefined_symbol_bits(item.flags.hidden)),
+                    );
+                    push_name(&mut symtab, &item.name);
+                    segment_of_item.push(None);
+                }
+            }
+            data_sym.push(sym_count);
+            sym_count += 1;
+        }
+        let mut global_sym = std::collections::HashMap::new();
+        for i in 0..self.global_imports.len() as u32 {
+            symtab.push(2u8); // SYMTAB_GLOBAL
+            write_uleb128(&mut symtab, u64::from(SYM_UNDEFINED));
+            write_uleb128(&mut symtab, u64::from(i));
+            global_sym.insert(i, sym_count);
+            sym_count += 1;
+        }
+        let table_sym = if table_import {
+            symtab.push(5u8); // SYMTAB_TABLE
+            // NO_STRIP, as LLVM's object writer does: a TABLE_INDEX relocation
+            // does not reference the table symbol, so under `--gc-sections`
+            // (wasm-ld's default) the table would otherwise be live only
+            // through a live `call_indirect`, and a function address with no
+            // live indirect call would leave the linker without a table.
+            write_uleb128(&mut symtab, u64::from(SYM_UNDEFINED | SYM_NO_STRIP));
+            write_uleb128(&mut symtab, 0);
+            sym_count += 1;
+            Some(sym_count - 1)
+        } else {
+            None
+        };
+        let resolve = |t: RelocTarget| -> u32 {
+            match t {
+                RelocTarget::Func(i) => *func_sym.get(&i).expect("relocated function has a symbol"),
+                RelocTarget::Data(d) => data_sym[d as usize],
+                RelocTarget::Global(g) => {
+                    *global_sym.get(&g).expect("relocated global is an import")
+                }
+                RelocTarget::Table => table_sym.expect("table relocation without a table import"),
+                RelocTarget::Type(t) => t,
+            }
+        };
+
+        // Code section, recording each reloc's offset in the section payload.
+        let mut code_relocs: Vec<Reloc> = Vec::new();
+        let code_section = if self.bodies.is_empty() {
+            None
+        } else {
+            let mut body = Vec::new();
+            write_uleb128(&mut body, self.bodies.len() as u64);
+            for func in &self.bodies {
+                let mut head = Vec::new();
+                write_uleb128(&mut head, func.locals.len() as u64);
+                for (count, ty) in &func.locals {
+                    write_uleb128(&mut head, u64::from(*count));
+                    head.push(ty.code());
+                }
+                let len = head.len() + func.code.len() + 1;
+                write_uleb128(&mut body, len as u64);
+                body.extend_from_slice(&head);
+                let code_start = body.len() as u32;
+                body.extend_from_slice(&func.code);
+                body.push(op::END);
+                for r in &func.relocs {
+                    code_relocs.push(Reloc {
+                        offset: code_start + r.offset,
+                        ..*r
+                    });
+                }
+            }
+            Some(emit(&mut out, 10, &body))
+        };
+        // A relocation section lists its entries in increasing offset order
+        // (the object reader in `wasm-ld` rejects anything else). Code
+        // relocations are appended as the bytes are, but the order is imposed
+        // here rather than assumed of every producer.
+        code_relocs.sort_by_key(|r| r.offset);
+
+        // Data section: one segment per defined item, at its virtual address.
+        let mut data_relocs: Vec<Reloc> = Vec::new();
+        let mut segment_info = Vec::new();
+        let data_section = if segments == 0 {
+            None
+        } else {
+            let mut body = Vec::new();
+            write_uleb128(&mut body, u64::from(segments));
+            for item in &obj.data_items {
+                let Some(d) = &item.def else { continue };
+                write_uleb128(&mut body, 0);
+                body.push(op::I32_CONST);
+                write_sleb128(&mut body, i64::from(item.virtual_addr as i32));
+                body.push(op::END);
+                write_uleb128(&mut body, d.bytes.len() as u64);
+                let start = body.len() as u32;
+                body.extend_from_slice(&d.bytes);
+                for r in &d.relocs {
+                    data_relocs.push(Reloc {
+                        offset: start + r.offset,
+                        ..*r
+                    });
+                }
+                let prefix = if d.readonly { ".rodata." } else { ".data." };
+                push_name(&mut segment_info, &format!("{prefix}{}", item.name));
+                write_uleb128(
+                    &mut segment_info,
+                    u64::from(d.align.max(1).trailing_zeros()),
+                );
+                write_uleb128(&mut segment_info, 0); // flags
+            }
+            Some(emit(&mut out, 11, &body))
+        };
+        // A data image lists its pointers in field-DECLARATION order, which
+        // need not be offset order (trust-ir fixes byte ranges, not field
+        // order). Segment starts only increase, so one stable sort orders the
+        // whole section.
+        data_relocs.sort_by_key(|r| r.offset);
+
+        // `linking` (version 2): segment info, then the symbol table.
+        let mut linking = Vec::new();
+        push_name(&mut linking, "linking");
+        write_uleb128(&mut linking, 2);
+        if segments > 0 {
+            let mut sub = Vec::new();
+            write_uleb128(&mut sub, u64::from(segments));
+            sub.extend_from_slice(&segment_info);
+            linking.push(5); // WASM_SEGMENT_INFO
+            write_uleb128(&mut linking, sub.len() as u64);
+            linking.extend_from_slice(&sub);
+        }
+        {
+            let mut sub = Vec::new();
+            write_uleb128(&mut sub, u64::from(sym_count));
+            sub.extend_from_slice(&symtab);
+            linking.push(8); // WASM_SYMBOL_TABLE
+            write_uleb128(&mut linking, sub.len() as u64);
+            linking.extend_from_slice(&sub);
+        }
+        emit(&mut out, 0, &linking);
+
+        let reloc_section = |name: &str, target: u32, relocs: &[Reloc]| -> Vec<u8> {
+            let mut body = Vec::new();
+            push_name(&mut body, name);
+            write_uleb128(&mut body, u64::from(target));
+            write_uleb128(&mut body, relocs.len() as u64);
+            for r in relocs {
+                body.push(r.kind as u8);
+                write_uleb128(&mut body, u64::from(r.offset));
+                write_uleb128(&mut body, u64::from(resolve(r.target)));
+                if r.kind.has_addend() {
+                    write_sleb128(&mut body, i64::from(r.addend));
+                }
+            }
+            body
+        };
+        if let Some(code) = code_section
+            && !code_relocs.is_empty()
+        {
+            let body = reloc_section("reloc.CODE", code, &code_relocs);
+            emit(&mut out, 0, &body);
+        }
+        if let Some(data) = data_section
+            && !data_relocs.is_empty()
+        {
+            let body = reloc_section("reloc.DATA", data, &data_relocs);
+            emit(&mut out, 0, &body);
+        }
+
+        // `name` (function names only), after the relocation sections and
+        // before `target_features`: LLVM's object reader enforces that order
+        // among the custom sections it knows. Entries are in increasing
+        // function index order, as a name map requires.
+        if !obj.debug_names.is_empty() {
+            let mut sub = Vec::new();
+            write_uleb128(&mut sub, obj.debug_names.len() as u64);
+            for (ordinal, name) in &obj.debug_names {
+                write_uleb128(&mut sub, u64::from(func_imports + ordinal));
+                push_name(&mut sub, name);
+            }
+            let mut body = Vec::new();
+            push_name(&mut body, "name");
+            body.push(1); // function names
+            write_uleb128(&mut body, sub.len() as u64);
+            body.extend_from_slice(&sub);
+            emit(&mut out, 0, &body);
+        }
+
+        if !obj.features.is_empty() {
+            let mut body = Vec::new();
+            push_name(&mut body, "target_features");
+            write_uleb128(&mut body, obj.features.len() as u64);
+            for f in &obj.features {
+                body.push(b'+');
+                push_name(&mut body, f);
+            }
+            emit(&mut out, 0, &body);
+        }
+        let _ = segment_of_item;
         out
     }
 }
@@ -1041,6 +2089,33 @@ pub mod op {
     // invariant).
     pub const I32_EXTEND8_S: u8 = 0xc0;
     pub const I32_EXTEND16_S: u8 = 0xc1;
+    pub const I64_EXTEND8_S: u8 = 0xc2;
+    pub const I64_EXTEND16_S: u8 = 0xc3;
+    pub const I64_EXTEND32_S: u8 = 0xc4;
+
+    // Parametric and the remaining integer/float operators the value-domain
+    // extension (Rust-shaped trust-ir) lowers to.
+    pub const NOP: u8 = 0x01;
+    pub const SELECT: u8 = 0x1b;
+    pub const I32_EQZ: u8 = 0x45;
+    pub const I64_EQZ: u8 = 0x50;
+    pub const I32_CLZ: u8 = 0x67;
+    pub const I32_CTZ: u8 = 0x68;
+    pub const I64_CLZ: u8 = 0x79;
+    pub const I64_CTZ: u8 = 0x7a;
+    pub const I32_ROTL: u8 = 0x77;
+    pub const I32_ROTR: u8 = 0x78;
+    pub const I64_ROTL: u8 = 0x89;
+    pub const I64_ROTR: u8 = 0x8a;
+    pub const F32_MIN: u8 = 0x96;
+    pub const F32_MAX: u8 = 0x97;
+    pub const F32_COPYSIGN: u8 = 0x98;
+    pub const F64_MIN: u8 = 0xa4;
+    pub const F64_MAX: u8 = 0xa5;
+    pub const F64_COPYSIGN: u8 = 0xa6;
+    // Bulk memory (0xfc prefix + index): `memory.copy 0 0` / `memory.fill 0`.
+    pub const MEMORY_COPY: u32 = 10;
+    pub const MEMORY_FILL: u32 = 11;
 
     // Conversions. Integer width:
     pub const I32_WRAP_I64: u8 = 0xa7;
@@ -1170,6 +2245,7 @@ mod tests {
             FuncBody {
                 locals: vec![],
                 code,
+                relocs: vec![],
             },
         );
         module.export_func("add", func);
@@ -1321,7 +2397,8 @@ mod tests {
     }
 
     /// The funcref table covers the WHOLE function index space (imports
-    /// included), so element index == funcidx still holds with imports.
+    /// included) after the null slot, so element `closed_table_index(funcidx)`
+    /// holds funcidx with imports too.
     #[test]
     fn the_element_segment_covers_imports_and_definitions() {
         let mut m = WasmModule::new();
@@ -1332,17 +2409,19 @@ mod tests {
         m.enable_func_table();
         let bytes = m.finish();
 
-        // Table section: 1 table, funcref, min-only limits, min == 3.
-        assert_eq!(section(&bytes, 4).unwrap(), vec![0x01, 0x70, 0x00, 0x03]);
-        // Element section: 1 active segment @ table 0, offset i32.const 0,
-        // then funcidx 0,1,2 — the imports are elements too.
+        // Table section: 1 table, funcref, min-only limits, min == 4 (the
+        // null slot plus three functions).
+        assert_eq!(section(&bytes, 4).unwrap(), vec![0x01, 0x70, 0x00, 0x04]);
+        // Element section: 1 active segment @ table 0, offset i32.const 1
+        // (element 0 is the null funcref), then funcidx 0,1,2 — the imports
+        // are elements too.
         assert_eq!(
             section(&bytes, 9).unwrap(),
             vec![
                 0x01,
                 0x00,
                 op::I32_CONST,
-                0x00,
+                0x01,
                 op::END,
                 0x03,
                 0x00,

@@ -2,20 +2,18 @@
 
 // trust-cg-llvm-import / tests / cast_e2e.rs
 //
-// Regression coverage for WS2 imported integer cast chains.
+// Regression coverage for WS2 imported integer cast chains, compiled for this
+// host's explicit triple, linked with `cc` and run natively.
+
+mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
 
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
+use common::{
+    compile_for_host, describe_status, link_with_cc, native_host_or_skip, unique_temp_dir,
+};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::Target;
-use trust_cg_llvm_import::import_text;
-
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 
 const LL_CASTTEST_TRUNC_I8: &str = r#"
 target triple = "arm64-apple-macosx26.0.0"
@@ -42,79 +40,13 @@ define i32 @main() {
 declare i32 @printf(ptr noundef, ...)
 "#;
 
-fn compile_to_aarch64_object(src: &str, module_name: &str) -> Vec<u8> {
-    let module = import_text(src, module_name).expect("import");
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level: OptLevel::O0,
-        target: Target::Aarch64,
-        emit_proofs: false,
-        trace_level: CompilerTraceLevel::None,
-        emit_debug: false,
-        parallel: false,
-        cegis_superopt_budget_sec: None,
-        enable_fsym_trust_ir_preflight: false,
-        enable_jit_fast_regalloc: false,
-        jit_validation_mode_override: None,
-        panic_unwind: false,
-    });
-    compiler
-        .compile(&module)
-        .unwrap_or_else(|e| panic!("compile `{module_name}` failed: {e}"))
-        .object_code
-}
-
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "trust-cg-import-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-fn link_with_cc(obj_path: &Path, bin_path: &Path) {
-    let output = Command::new("cc")
-        .arg(obj_path)
-        .arg("-o")
-        .arg(bin_path)
-        .output()
-        .expect("run cc");
-    assert!(
-        output.status.success(),
-        "cc failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn describe_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit {code}");
-    }
-    #[cfg(unix)]
-    if let Some(signal) = status.signal() {
-        return format!("signal {signal}");
-    }
-    "unknown status".to_string()
-}
-
 #[test]
 fn ws2_casttest_trunc_i8_linked_binary_prints_64() {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        eprintln!(
-            "skipping: test requires aarch64-apple-darwin (host is {} / {})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
+    if !native_host_or_skip("ws2_casttest_trunc_i8_linked_binary_prints_64") {
         return;
     }
 
-    let object = compile_to_aarch64_object(LL_CASTTEST_TRUNC_I8, "ws2_casttest_trunc_i8");
+    let object = compile_for_host(LL_CASTTEST_TRUNC_I8, "ws2_casttest_trunc_i8", OptLevel::O0);
     let dir = unique_temp_dir("casttest-trunc-i8");
     let obj_path = dir.join("casttest.o");
     let bin_path = dir.join("casttest");

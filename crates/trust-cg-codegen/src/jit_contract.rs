@@ -24,10 +24,18 @@ use crate::target::{AArch64IsaProfile, Target, TargetSpec};
 use crate::x86_64::{X86TargetFeature, X86TargetFeatures};
 
 /// Stable schema name for [`DeterministicArtifactManifest`].
-pub const JIT_ARTIFACT_MANIFEST_SCHEMA: &str = "trust-cg.artifact/v1";
+///
+/// v2 added [`DeterministicArtifactManifest::executable_memory`], the
+/// page-protection and allocation contract of executable artifacts. v3 added
+/// its [`PageProtectionWitness`]: the witness source and the
+/// recorded/observed permission pair an executable must publish with. A v2
+/// manifest is refused by [`DeterministicArtifactManifest::verify_schema`];
+/// it is not migrated, because it does not say which witness its publisher
+/// promised.
+pub const JIT_ARTIFACT_MANIFEST_SCHEMA: &str = "trust-cg.artifact/v3";
 
 /// Current schema version for [`DeterministicArtifactManifest`].
-pub const JIT_ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const JIT_ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 /// Stable schema name for [`ProofEvidenceSummary`].
 pub const JIT_PROOF_EVIDENCE_SUMMARY_SCHEMA: &str = "trust-cg.proof_evidence_summary/v1";
@@ -754,6 +762,11 @@ pub enum ExecutableMemoryOwner {
 }
 
 /// Executable artifact teardown policy.
+///
+/// Trust Codegen-owned executable buffers enforce `RefCounted` (the mapping is
+/// unmapped only after every execution lease is released) and
+/// `ProcessLifetime` (never unmapped); the other variants are refused as
+/// runtime policies because Trust Codegen cannot enforce them.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TeardownPolicy {
     /// The artifact is process-lifetime.
@@ -764,6 +777,251 @@ pub enum TeardownPolicy {
     Downstream(String),
     /// Teardown is intentionally unspecified.
     Unspecified,
+}
+
+/// How the published protection of an executable allocation is witnessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PageProtectionWitnessSource {
+    /// Linux: the kernel's view of every page of the published allocation,
+    /// read through `/proc/self/maps` (`PROCMAP_QUERY`, or the retrying text
+    /// reader) right after the read-execute seal and again on the three
+    /// checked installed routes.
+    KernelProcSelfMaps,
+    /// No kernel re-read on this target (macOS, Windows): only the
+    /// publisher's recorded protection is bound.
+    RecordedOnly,
+}
+
+impl PageProtectionWitnessSource {
+    /// Stable lower-snake-case name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelProcSelfMaps => "kernel_proc_self_maps",
+            Self::RecordedOnly => "recorded_only",
+        }
+    }
+
+    /// Witness source Trust Codegen's in-process JIT publishes with on
+    /// `operating_system`.
+    pub fn for_operating_system(operating_system: &TargetOperatingSystem) -> Self {
+        match operating_system {
+            TargetOperatingSystem::Linux => Self::KernelProcSelfMaps,
+            _ => Self::RecordedOnly,
+        }
+    }
+}
+
+/// Observed-versus-recorded page-protection pair of a published executable
+/// allocation, in `/proc/self/maps` permission notation (`r`, `w`, `x`, then
+/// `p` for a private or `s` for a shared mapping).
+///
+/// The recorded half follows from the record's own allocator, allocation
+/// flags and raw published protection ([`recorded_page_permissions`]). The
+/// observed half is what the kernel reported for the whole allocation at
+/// publication, or `None` for a [`PageProtectionWitnessSource::RecordedOnly`]
+/// source; a mixed observation lists each run's permissions in address order,
+/// separated by `|`. A binding is sealed only when the publication
+/// observation equals the recorded half, so in a sealed binding the two are
+/// equal; the differences live in the named refusals. The process observes
+/// its own mapping, and no observation shows the whole process at one
+/// instant (see [`crate::jit_page_witness`]): this is execution evidence of
+/// the kernel's state during the reads at publication and at each checked
+/// lookup, not proof that the protection held in between, and it binds no
+/// thread or execution-lease context.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PageProtectionWitness {
+    /// How the protection was witnessed.
+    pub source: PageProtectionWitnessSource,
+    /// Permission string implied by the recorded published protection.
+    pub recorded_permissions: String,
+    /// Permission string the kernel reported at publication.
+    pub observed_permissions: Option<String>,
+}
+
+impl PageProtectionWitness {
+    /// Whether any observed run is both writable and executable.
+    pub fn observed_writable_and_executable(&self) -> bool {
+        self.observed_permissions
+            .as_deref()
+            .is_some_and(page_permissions_writable_and_executable)
+    }
+}
+
+/// Whether a `/proc/self/maps` permission string, or a `|`-separated list of
+/// them, grants write and execute on the same run.
+pub fn page_permissions_writable_and_executable(permissions: &str) -> bool {
+    permissions.split('|').any(|run| {
+        let bytes = run.as_bytes();
+        bytes.get(1) == Some(&b'w') && bytes.get(2) == Some(&b'x')
+    })
+}
+
+/// `/proc/self/maps` permission string implied by a recorded allocation.
+///
+/// For `mmap`, read/write/execute come from the raw `PROT_*` protection and
+/// the private or shared letter from the allocation flags. For
+/// `virtual_alloc`, the `PAGE_*` constant maps to the same notation (committed
+/// pages are private). An unknown allocator or constant yields `????`, which
+/// no kernel observation matches.
+pub fn recorded_page_permissions(
+    allocator: &str,
+    allocation_flags: u64,
+    protection: u64,
+) -> String {
+    const PROT_READ: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+    const MAP_SHARED: u64 = 0x1;
+    let letter = |set: bool, yes: char, no: char| if set { yes } else { no };
+    match allocator {
+        "mmap" => [
+            letter(protection & PROT_READ != 0, 'r', '-'),
+            letter(protection & PROT_WRITE != 0, 'w', '-'),
+            letter(protection & PROT_EXEC != 0, 'x', '-'),
+            letter(allocation_flags & MAP_SHARED != 0, 's', 'p'),
+        ]
+        .iter()
+        .collect(),
+        "virtual_alloc" => match protection {
+            0x01 => "---p",
+            0x02 => "r--p",
+            0x04 | 0x08 => "rw-p",
+            0x10 => "--xp",
+            0x20 => "r-xp",
+            0x40 | 0x80 => "rwxp",
+            _ => "????",
+        }
+        .to_owned(),
+        _ => "????".to_owned(),
+    }
+}
+
+/// Page-protection and allocation state under which executable JIT memory is
+/// published.
+///
+/// Carried by executable [`DeterministicArtifactManifest`]s as the declared
+/// contract and by the compile service's installed payload binding as the
+/// state observed on the live mapping; an artifact republished under any
+/// other protection state no longer matches either record. Raw values are the
+/// host allocator's own constants (`MAP_*` / `PROT_*` for `mmap`, `MEM_*` /
+/// `PAGE_*` for `VirtualAlloc`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecutableMemoryProtection {
+    /// Allocation primitive: `mmap` or `virtual_alloc`.
+    pub allocator: String,
+    /// Raw allocation flags (`MAP_PRIVATE | MAP_ANONYMOUS [| MAP_JIT]` or
+    /// `MEM_RESERVE | MEM_COMMIT`).
+    pub allocation_flags: u64,
+    /// Allocation rounding granule in bytes used by the publisher.
+    pub allocation_granule_bytes: u64,
+    /// Raw protection of the write phase (read+write, never executable).
+    pub write_phase_protection: u64,
+    /// Raw protection of the published mapping (read+execute, never writable).
+    pub published_protection: u64,
+    /// The mapping was allocated with Apple `MAP_JIT`.
+    pub map_jit: bool,
+    /// The host supports per-thread `MAP_JIT` write-protect toggling.
+    pub write_protect_supported: bool,
+    /// The mapping reached the published read-execute state.
+    pub published_rx: bool,
+    /// The publication-time protection change to read-execute succeeded.
+    pub mprotect_rx_ok: bool,
+    /// Witness source and observed-versus-recorded permission pair of the
+    /// published allocation (manifest v3, installed binding v6).
+    pub page_protection_witness: PageProtectionWitness,
+}
+
+impl ExecutableMemoryProtection {
+    /// The publication contract Trust Codegen's in-process JIT uses on
+    /// `target`, or `None` when that target has no in-process publication.
+    pub fn for_trust_cg_target(target: &TargetDescriptor) -> Option<Self> {
+        const PROT_RW: u64 = 0x1 | 0x2;
+        const PROT_RX: u64 = 0x1 | 0x4;
+        const MAP_PRIVATE: u64 = 0x0002;
+        const DARWIN_MAP_ANON: u64 = 0x1000;
+        const DARWIN_MAP_JIT: u64 = 0x0800;
+        const LINUX_MAP_ANONYMOUS: u64 = 0x0020;
+        // A kernel-witnessed target promises that the kernel reports exactly
+        // the recorded permissions; a recorded-only target promises no
+        // observation at all.
+        let source = PageProtectionWitnessSource::for_operating_system(&target.operating_system);
+        let witness = |allocator: &str, flags: u64, published: u64| {
+            let recorded_permissions = recorded_page_permissions(allocator, flags, published);
+            PageProtectionWitness {
+                source,
+                observed_permissions: (source == PageProtectionWitnessSource::KernelProcSelfMaps)
+                    .then(|| recorded_permissions.clone()),
+                recorded_permissions,
+            }
+        };
+        let mmap = |flags: u64, granule: u64, map_jit: bool| Self {
+            allocator: "mmap".to_owned(),
+            allocation_flags: flags,
+            allocation_granule_bytes: granule,
+            write_phase_protection: PROT_RW,
+            published_protection: PROT_RX,
+            map_jit,
+            write_protect_supported: map_jit,
+            published_rx: true,
+            mprotect_rx_ok: true,
+            page_protection_witness: witness("mmap", flags, PROT_RX),
+        };
+        match (&target.architecture, &target.operating_system) {
+            (TargetArchitecture::Aarch64, TargetOperatingSystem::Macos) => Some(mmap(
+                MAP_PRIVATE | DARWIN_MAP_ANON | DARWIN_MAP_JIT,
+                16 * 1024,
+                true,
+            )),
+            (TargetArchitecture::X86_64, TargetOperatingSystem::Macos) => {
+                Some(mmap(MAP_PRIVATE | DARWIN_MAP_ANON, 4096, false))
+            }
+            (
+                TargetArchitecture::Aarch64 | TargetArchitecture::X86_64,
+                TargetOperatingSystem::Linux,
+            ) => Some(mmap(MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 4096, false)),
+            (TargetArchitecture::X86_64, TargetOperatingSystem::Windows) => Some(Self {
+                allocator: "virtual_alloc".to_owned(),
+                // MEM_COMMIT | MEM_RESERVE
+                allocation_flags: 0x1000 | 0x2000,
+                allocation_granule_bytes: 4096,
+                // PAGE_READWRITE / PAGE_EXECUTE_READ
+                write_phase_protection: 0x04,
+                published_protection: 0x20,
+                map_jit: false,
+                write_protect_supported: false,
+                published_rx: true,
+                mprotect_rx_ok: true,
+                page_protection_witness: witness("virtual_alloc", 0x1000 | 0x2000, 0x20),
+            }),
+            _ => None,
+        }
+    }
+
+    /// `/proc/self/maps` permission string implied by this record's own
+    /// allocator, allocation flags and raw published protection.
+    pub fn recorded_page_permissions(&self) -> String {
+        recorded_page_permissions(
+            &self.allocator,
+            self.allocation_flags,
+            self.published_protection,
+        )
+    }
+
+    /// Deterministic checksum for this record.
+    pub fn checksum(&self) -> ArtifactChecksum {
+        checksum_of(self)
+    }
+
+    /// Canonical bytes for cryptographic bindings.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_bytes_of(self)
+    }
+
+    /// `sha256:<hex>` digest of [`Self::canonical_bytes`], the form carried by
+    /// replay metadata.
+    pub fn canonical_sha256(&self) -> String {
+        format!("sha256:{}", sha256_hex(&self.canonical_bytes()))
+    }
 }
 
 /// Varargs behavior for an ABI descriptor.
@@ -827,7 +1085,8 @@ impl AbiDescriptor {
                 strings(["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]),
                 strings(["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"]),
                 strings([
-                    "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+                    "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29",
+                    "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15",
                 ]),
             ),
             Target::X86_64 => (
@@ -870,9 +1129,26 @@ impl AbiDescriptor {
 
     /// Create an ABI descriptor from Trust Codegen's target enum and target OS.
     ///
-    /// `Target::X86_64` is OS-sensitive: Unix hosts use System V AMD64,
-    /// while 64-bit Windows uses the Microsoft x64 ABI.
+    /// AArch64 is OS-sensitive because Darwin provides a 128-byte red zone
+    /// while Linux AAPCS64 does not. `Target::X86_64` is OS-sensitive because
+    /// Unix hosts use System V AMD64 while 64-bit Windows uses Microsoft x64.
     pub fn for_trust_cg_target_os(target: Target, operating_system: TargetOperatingSystem) -> Self {
+        if target == Target::Aarch64 {
+            let mut descriptor = Self::for_trust_cg_target(target);
+            match operating_system {
+                TargetOperatingSystem::Linux => {
+                    descriptor.name = "trust-cg-aarch64-linux".to_owned();
+                    descriptor.red_zone_bytes = 0;
+                    return descriptor;
+                }
+                TargetOperatingSystem::Macos => {
+                    descriptor.name = "trust-cg-aarch64-darwin".to_owned();
+                    descriptor.calling_convention = "darwinpcs".to_owned();
+                    return descriptor;
+                }
+                _ => {}
+            }
+        }
         if target != Target::X86_64 || operating_system != TargetOperatingSystem::Windows {
             return Self::for_trust_cg_target(target);
         }
@@ -1258,6 +1534,10 @@ pub enum EvidenceStrength {
         /// Stable name of the solver that discharged the obligation.
         solver: String,
     },
+    /// Complete proof objects independently replayed by the named checker.
+    /// This does not assert that an SMT solver produced every proof.
+    #[cfg(feature = "source-defined-call")]
+    IndependentReplay { checker: String },
 }
 
 impl EvidenceStrength {
@@ -1269,6 +1549,8 @@ impl EvidenceStrength {
             Self::Exhaustive => "exhaustive",
             Self::Statistical { .. } => "statistical",
             Self::Formal { .. } => "formal",
+            #[cfg(feature = "source-defined-call")]
+            Self::IndependentReplay { .. } => "independent_replay",
         }
     }
 
@@ -1277,15 +1559,22 @@ impl EvidenceStrength {
     /// Statistical discharge is deliberately *not* complete, and neither
     /// `NotRun` nor `NotReported` are.
     pub const fn is_complete(&self) -> bool {
-        matches!(self, Self::Exhaustive | Self::Formal { .. })
+        match self {
+            Self::Exhaustive | Self::Formal { .. } => true,
+            #[cfg(feature = "source-defined-call")]
+            Self::IndependentReplay { .. } => true,
+            _ => false,
+        }
     }
 
     /// Whether anything at all ran to produce this strength.
     pub const fn ran(&self) -> bool {
-        matches!(
-            self,
-            Self::Exhaustive | Self::Statistical { .. } | Self::Formal { .. }
-        )
+        match self {
+            Self::Exhaustive | Self::Statistical { .. } | Self::Formal { .. } => true,
+            #[cfg(feature = "source-defined-call")]
+            Self::IndependentReplay { .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -1301,8 +1590,8 @@ pub enum RequiredEvidenceStrength {
     /// preserves the historical behaviour of every existing caller.
     #[default]
     Any,
-    /// The obligation must be covered completely: exhaustive enumeration or a
-    /// solver proof. Statistical sampling is refused.
+    /// The obligation must be covered completely: exhaustive enumeration,
+    /// a solver proof, or independent replay of complete proof objects. Statistical sampling is refused.
     Complete,
     /// The obligation must be discharged by an SMT solver. Exhaustive
     /// enumeration over a small input space is refused as well, because the
@@ -1364,8 +1653,9 @@ impl AcceptedAssumption {
 /// sampling because no SMT solver binary was reachable on this host.
 pub const ASSUMPTION_NO_SOLVER_AVAILABLE: &str = "trust-cg.assumption.no_solver_available";
 
-/// Obligations were discharged statistically: edge cases plus N random trials
-/// generalize to the full input space.
+/// Some obligations were checked only statistically (edge cases plus N random
+/// trials). Sampling is disclosed, never credited: an instruction whose only
+/// evidence is sampling is refused proof promotion.
 pub const ASSUMPTION_STATISTICAL_DISCHARGE: &str = "trust-cg.assumption.statistical_discharge";
 
 /// The TV-3 dataflow-integrity validator ran in warn mode rather than enforce
@@ -1934,12 +2224,6 @@ pub enum TypedApplyStatus<T> {
     Failed(ApplyFailure),
 }
 
-/// Product-facing alias for native apply results.
-pub type NativeApplyStatus<T> = TypedApplyStatus<T>;
-
-/// Product-facing alias for native deopt reasons.
-pub type NativeDeoptReason = DeoptReason;
-
 /// Artifact payload category.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JitArtifactKind {
@@ -2362,6 +2646,12 @@ pub struct DeterministicArtifactManifest {
     pub target: TargetDescriptor,
     /// ABI descriptor.
     pub abi: AbiDescriptor,
+    /// Page-protection and allocation contract of executable memory: the
+    /// Trust Codegen publication contract for `target` when `kind` is
+    /// [`JitArtifactKind::ExecutableMemory`], otherwise `None`. Installed
+    /// lookup requires it to equal the protection observed on the live
+    /// mapping.
+    pub executable_memory: Option<ExecutableMemoryProtection>,
     /// Layout manifest.
     pub layout: LayoutManifest,
     /// Invalidation key.
@@ -2387,6 +2677,9 @@ impl DeterministicArtifactManifest {
         invalidation: InvalidationKey,
         proof_policy: ProofPolicy,
     ) -> Self {
+        let executable_memory = (kind == JitArtifactKind::ExecutableMemory)
+            .then(|| ExecutableMemoryProtection::for_trust_cg_target(&target))
+            .flatten();
         let mut manifest = Self {
             schema: JIT_ARTIFACT_MANIFEST_SCHEMA.to_owned(),
             schema_version: JIT_ARTIFACT_MANIFEST_SCHEMA_VERSION,
@@ -2394,6 +2687,7 @@ impl DeterministicArtifactManifest {
             kind,
             target,
             abi,
+            executable_memory,
             layout,
             invalidation,
             proof_policy,
@@ -3067,21 +3361,6 @@ fn detected_x86_64_host_features() -> Vec<String> {
 /// Versioned artifact manifest name used by product integrations.
 pub type ArtifactManifestV1 = DeterministicArtifactManifest;
 
-/// Product-facing ABI descriptor alias.
-pub type ArtifactAbiDescriptor = AbiDescriptor;
-
-/// Product-facing target descriptor alias.
-pub type ArtifactTargetDescriptor = TargetDescriptor;
-
-/// Product-facing layout manifest alias.
-pub type ArtifactLayoutManifest = LayoutManifest;
-
-/// Product-facing invalidation key alias.
-pub type ArtifactInvalidationKey = InvalidationKey;
-
-/// Product-facing proof policy alias.
-pub type ArtifactProofPolicy = ProofPolicy;
-
 /// Typed mismatch errors returned by artifact contract validation.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ArtifactContractError {
@@ -3176,6 +3455,78 @@ pub enum ArtifactContractError {
         /// Exact fail-closed mismatch detail.
         detail: String,
     },
+    /// The page-protection witness of an installed executable allocation
+    /// refused callable exposure: the kernel reported a protection other
+    /// than the recorded one, a writable and executable page, or no mapping,
+    /// or the sealed witness itself was not the target's contract.
+    #[error(
+        "{} artifact contract page-protection witness refused at {}: {detail}",
+        refusal.code(),
+        stage.as_str()
+    )]
+    PageProtectionWitnessRefused {
+        /// Named refusal.
+        refusal: PageProtectionWitnessRefusal,
+        /// Where the witness was checked.
+        stage: PageProtectionWitnessStage,
+        /// Exact fail-closed detail, including observed and recorded values.
+        detail: String,
+    },
+}
+
+/// Named refusals of the executable page-protection witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PageProtectionWitnessRefusal {
+    /// The kernel reported a page that is both writable and executable, or
+    /// the sealed observation names one.
+    WritableExecutable,
+    /// The kernel-observed permissions differ from the recorded permissions.
+    ObservedRecordedMismatch,
+    /// `/proc/self/maps` does not cover every byte of the published range.
+    RangeNotCovered,
+    /// `/proc/self/maps` could not be read or parsed, or a kernel-witnessed
+    /// record carries no observation.
+    Unobservable,
+    /// The record names a witness source other than the one the target
+    /// publishes with (for example a recorded-only record on Linux).
+    SourceMismatch,
+    /// The recorded permission string does not follow from the record's raw
+    /// allocation flags and published protection.
+    RecordedProtectionForged,
+}
+
+impl PageProtectionWitnessRefusal {
+    /// Stable bracketed diagnostic code.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::WritableExecutable => "[TCG-JIT-PAGE-WITNESS-WX]",
+            Self::ObservedRecordedMismatch => "[TCG-JIT-PAGE-WITNESS-MISMATCH]",
+            Self::RangeNotCovered => "[TCG-JIT-PAGE-WITNESS-UNCOVERED]",
+            Self::Unobservable => "[TCG-JIT-PAGE-WITNESS-UNREADABLE]",
+            Self::SourceMismatch => "[TCG-JIT-PAGE-WITNESS-SOURCE]",
+            Self::RecordedProtectionForged => "[TCG-JIT-PAGE-WITNESS-RECORDED]",
+        }
+    }
+}
+
+/// Where a page-protection witness was checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PageProtectionWitnessStage {
+    /// While building the installed binding, from the observation taken
+    /// right after the read-execute seal.
+    Publication,
+    /// While validating the sealed binding before callable exposure.
+    Lookup,
+}
+
+impl PageProtectionWitnessStage {
+    /// Stable lower-case name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publication => "publication",
+            Self::Lookup => "lookup",
+        }
+    }
 }
 
 trait CanonicalEncode {
@@ -3351,6 +3702,37 @@ impl CanonicalEncode for ExecutableMemoryOwner {
                 put_str(out, value);
             }
             Self::Unspecified => put_str(out, "unspecified"),
+        }
+    }
+}
+
+impl CanonicalEncode for ExecutableMemoryProtection {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_label(out, "ExecutableMemoryProtection.v2");
+        put_str(out, &self.allocator);
+        put_u64(out, self.allocation_flags);
+        put_u64(out, self.allocation_granule_bytes);
+        put_u64(out, self.write_phase_protection);
+        put_u64(out, self.published_protection);
+        put_bool(out, self.map_jit);
+        put_bool(out, self.write_protect_supported);
+        put_bool(out, self.published_rx);
+        put_bool(out, self.mprotect_rx_ok);
+        self.page_protection_witness.encode(out);
+    }
+}
+
+impl CanonicalEncode for PageProtectionWitness {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_label(out, "PageProtectionWitness.v1");
+        put_str(out, self.source.as_str());
+        put_str(out, &self.recorded_permissions);
+        match &self.observed_permissions {
+            Some(observed) => {
+                put_bool(out, true);
+                put_str(out, observed);
+            }
+            None => put_bool(out, false),
         }
     }
 }
@@ -3664,6 +4046,8 @@ impl CanonicalEncode for EvidenceStrength {
         match self {
             Self::Statistical { sample_count } => put_u64(out, *sample_count),
             Self::Formal { solver } => put_str(out, solver),
+            #[cfg(feature = "source-defined-call")]
+            Self::IndependentReplay { checker } => put_str(out, checker),
             Self::NotReported | Self::NotRun | Self::Exhaustive => {}
         }
     }
@@ -3853,13 +4237,20 @@ impl CanonicalEncode for KernelArtifactContract {
 
 impl CanonicalEncode for DeterministicArtifactManifest {
     fn encode(&self, out: &mut Vec<u8>) {
-        put_label(out, "DeterministicArtifactManifest.v1");
+        put_label(out, "DeterministicArtifactManifest.v2");
         put_str(out, &self.schema);
         put_u32(out, self.schema_version);
         put_str(out, &self.artifact_id);
         self.kind.encode(out);
         self.target.encode(out);
         self.abi.encode(out);
+        match &self.executable_memory {
+            Some(protection) => {
+                put_bool(out, true);
+                protection.encode(out);
+            }
+            None => put_bool(out, false),
+        }
         self.layout.encode(out);
         self.invalidation.encode(out);
         self.proof_policy.encode(out);
@@ -3950,9 +4341,7 @@ mod tests {
     #[test]
     fn selected_codegen_profile_canonical_payload_and_digest_are_stable() {
         let profile = selected_codegen_profile_fixture();
-        let expected_payload = concat!(
-            r#"{"authority_scope":"engine_self_observation","detected_host_feature_domain":["sse2","sse3","ssse3","sse4.1","sse4.2","popcnt","aes","pclmulqdq","avx","avx2","fma","bmi1","bmi2"],"detected_host_features":["sse2","sse4.1","popcnt","aes","avx2","bmi2"],"evidence_basis":"uniform_per_function_x86_machine_code_target_features","schema":"trust-cg.host_jit.selected_codegen_profile.v1","schema_version":1,"selected_codegen_feature_domain":["popcnt","sse4.1","sse4.2","avx","avx2"],"selected_codegen_features":["popcnt","sse4.1","avx2"],"selection_policy":"runtime_detected_all_supported_in_domain_v1","target_architecture":"x86_64","target_pointer_width_bits":64,"target_triple":"x86_64-test-host"}"#,
-        );
+        let expected_payload = r#"{"authority_scope":"engine_self_observation","detected_host_feature_domain":["sse2","sse3","ssse3","sse4.1","sse4.2","popcnt","aes","pclmulqdq","avx","avx2","fma","bmi1","bmi2"],"detected_host_features":["sse2","sse4.1","popcnt","aes","avx2","bmi2"],"evidence_basis":"uniform_per_function_x86_machine_code_target_features","schema":"trust-cg.host_jit.selected_codegen_profile.v1","schema_version":1,"selected_codegen_feature_domain":["popcnt","sse4.1","sse4.2","avx","avx2"],"selected_codegen_features":["popcnt","sse4.1","avx2"],"selection_policy":"runtime_detected_all_supported_in_domain_v1","target_architecture":"x86_64","target_pointer_width_bits":64,"target_triple":"x86_64-test-host"}"#;
 
         assert_eq!(profile.canonical_payload_json(), expected_payload);
         assert_eq!(
@@ -4045,6 +4434,35 @@ mod tests {
             AbiDescriptor::for_trust_cg_target_os(Target::X86_64, TargetOperatingSystem::Windows);
 
         assert_microsoft_x64_abi(&abi);
+    }
+
+    #[test]
+    fn aarch64_abi_descriptor_distinguishes_linux_from_darwin_red_zone() {
+        let linux =
+            AbiDescriptor::for_trust_cg_target_os(Target::Aarch64, TargetOperatingSystem::Linux);
+        let darwin =
+            AbiDescriptor::for_trust_cg_target_os(Target::Aarch64, TargetOperatingSystem::Macos);
+
+        assert_eq!(linux.name, "trust-cg-aarch64-linux");
+        assert_eq!(linux.calling_convention, "aapcs64");
+        assert_eq!(linux.red_zone_bytes, 0);
+        assert_eq!(darwin.name, "trust-cg-aarch64-darwin");
+        assert_eq!(darwin.calling_convention, "darwinpcs");
+        assert_eq!(darwin.red_zone_bytes, 128);
+        for register in ["x29", "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15"] {
+            assert!(
+                linux
+                    .callee_saved_registers
+                    .iter()
+                    .any(|saved| saved == register)
+            );
+            assert!(
+                darwin
+                    .callee_saved_registers
+                    .iter()
+                    .any(|saved| saved == register)
+            );
+        }
     }
 
     #[test]

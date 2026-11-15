@@ -1,0 +1,117 @@
+; TrustIr text format v1
+; Compile-cost shapes for by-reference composite arguments: 72,000- and
+; 288,000-byte arguments that must be copied (the loaded value is stored again
+; after the call), and 64 calls in one block each passing a copy of one 1 KiB
+; value. A by-reference copy is a Memcpy, which selection lowers to a memcpy
+; call above 32 bytes, so the emitted code does not grow with the aggregate.
+; Compiled only (the native rows are in corpus.trust_ir and invoke.trust_ir).
+; Shared by e2e_aarch64_large_aggregate_args_linux.
+module "large_aggregate_scaling"
+target "aarch64-unknown-linux-gnu" 8 little abi="aapcs64"
+
+struct @Big72 { g: [ty.0 x 9000] @0 } size=72000 align=8 repr=c id=0
+struct @Big288 { g: [ty.0 x 36000] @0 } size=288000 align=8 repr=c id=1
+struct @K { g: [ty.0 x 128] @0 } size=1024 align=8 repr=c id=2
+
+type ty.0 = i64
+
+functy.0 = (struct.0, i64) -> (i64)
+functy.1 = (struct.1, i64) -> (i64)
+functy.2 = (struct.2, i64) -> (i64)
+functy.3 = (ptr, ptr, i64) -> (i64)
+
+fn @c_big72(functy.0) {
+}
+
+fn @c_big288(functy.1) {
+}
+
+fn @c_k(functy.2) {
+}
+
+fn @pass72k(functy.3) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %3 = load struct.0, ptr %1
+    %4 = call @func.0(%3, %2)
+    store struct.0 %3, ptr %0
+    ret %4
+}
+
+fn @pass288k(functy.3) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %3 = load struct.1, ptr %1
+    %4 = call @func.1(%3, %2)
+    store struct.1 %3, ptr %0
+    ret %4
+}
+
+fn @many64(functy.3) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %3 = load struct.2, ptr %1
+    %4 = call @func.2(%3, %2)
+    %5 = call @func.2(%3, %4)
+    %6 = call @func.2(%3, %5)
+    %7 = call @func.2(%3, %6)
+    %8 = call @func.2(%3, %7)
+    %9 = call @func.2(%3, %8)
+    %10 = call @func.2(%3, %9)
+    %11 = call @func.2(%3, %10)
+    %12 = call @func.2(%3, %11)
+    %13 = call @func.2(%3, %12)
+    %14 = call @func.2(%3, %13)
+    %15 = call @func.2(%3, %14)
+    %16 = call @func.2(%3, %15)
+    %17 = call @func.2(%3, %16)
+    %18 = call @func.2(%3, %17)
+    %19 = call @func.2(%3, %18)
+    %20 = call @func.2(%3, %19)
+    %21 = call @func.2(%3, %20)
+    %22 = call @func.2(%3, %21)
+    %23 = call @func.2(%3, %22)
+    %24 = call @func.2(%3, %23)
+    %25 = call @func.2(%3, %24)
+    %26 = call @func.2(%3, %25)
+    %27 = call @func.2(%3, %26)
+    %28 = call @func.2(%3, %27)
+    %29 = call @func.2(%3, %28)
+    %30 = call @func.2(%3, %29)
+    %31 = call @func.2(%3, %30)
+    %32 = call @func.2(%3, %31)
+    %33 = call @func.2(%3, %32)
+    %34 = call @func.2(%3, %33)
+    %35 = call @func.2(%3, %34)
+    %36 = call @func.2(%3, %35)
+    %37 = call @func.2(%3, %36)
+    %38 = call @func.2(%3, %37)
+    %39 = call @func.2(%3, %38)
+    %40 = call @func.2(%3, %39)
+    %41 = call @func.2(%3, %40)
+    %42 = call @func.2(%3, %41)
+    %43 = call @func.2(%3, %42)
+    %44 = call @func.2(%3, %43)
+    %45 = call @func.2(%3, %44)
+    %46 = call @func.2(%3, %45)
+    %47 = call @func.2(%3, %46)
+    %48 = call @func.2(%3, %47)
+    %49 = call @func.2(%3, %48)
+    %50 = call @func.2(%3, %49)
+    %51 = call @func.2(%3, %50)
+    %52 = call @func.2(%3, %51)
+    %53 = call @func.2(%3, %52)
+    %54 = call @func.2(%3, %53)
+    %55 = call @func.2(%3, %54)
+    %56 = call @func.2(%3, %55)
+    %57 = call @func.2(%3, %56)
+    %58 = call @func.2(%3, %57)
+    %59 = call @func.2(%3, %58)
+    %60 = call @func.2(%3, %59)
+    %61 = call @func.2(%3, %60)
+    %62 = call @func.2(%3, %61)
+    %63 = call @func.2(%3, %62)
+    %64 = call @func.2(%3, %63)
+    %65 = call @func.2(%3, %64)
+    %66 = call @func.2(%3, %65)
+    %67 = call @func.2(%3, %66)
+    store struct.2 %3, ptr %0
+    ret %67
+}

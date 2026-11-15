@@ -69,14 +69,6 @@ pub struct Totals {
     pub errored: u64,
 }
 
-impl Totals {
-    /// Total unit count.
-    #[must_use]
-    pub fn total(&self) -> u64 {
-        self.passed + self.failed + self.skipped + self.errored
-    }
-}
-
 /// Host metadata captured at run start — useful for reproducibility.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct HostInfo {
@@ -92,6 +84,7 @@ pub struct HostInfo {
     pub hostname: Option<String>,
 }
 
+#[cfg(test)]
 impl HostInfo {
     /// Collect host info for the running process.
     #[must_use]

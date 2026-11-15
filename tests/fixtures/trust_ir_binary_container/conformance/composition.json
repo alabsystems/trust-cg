@@ -1,0 +1,208 @@
+{
+  "name": "composition",
+  "functions": [
+    {
+      "id": 0,
+      "name": "reciprocal",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [
+          {
+            "schema": "trust-types.Formula@1",
+            "payload": "{\"Ne\":[{\"Var\":[\"x\",\"Int\"]},{\"Int\":0}]}",
+            "smtlib": "(not (= x 0))",
+            "sort": "Bool"
+          }
+        ],
+        "ensures": [
+          {
+            "schema": "smtlib2",
+            "payload": "(not (= result 0))",
+            "smtlib": "(not (= result 0))",
+            "sort": "Bool"
+          }
+        ],
+        "params": [
+          "x"
+        ],
+        "proved": true,
+        "decreases": [],
+        "backed_by": {
+          "module": 0,
+          "symbol": "reciprocal",
+          "obligation": 3
+        }
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "passthrough",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": {
+        "requires": [],
+        "ensures": [
+          {
+            "schema": "smtlib2",
+            "payload": "(= result x)",
+            "smtlib": "(= result x)",
+            "sort": "Bool"
+          }
+        ],
+        "params": [
+          "x"
+        ],
+        "proved": false,
+        "decreases": [],
+        "backed_by": null
+      },
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "aapcs64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [
+    {
+      "name": "trusted_prelude",
+      "digest": {
+        "algorithm": "Sha256",
+        "bytes": [
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17,
+          17
+        ]
+      },
+      "producer": "Clean"
+    }
+  ],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

@@ -34,6 +34,11 @@ fn zero_extending_movri_alias(dst: X86PReg, imm: i64) -> Option<X86PReg> {
         .flatten()
 }
 
+// Trust compiles this definition and checks the emitted body against it.
+// There is deliberately no handwritten Rust implementation of the computation.
+#[path = "../../../../formal/lean/Trust/Model/RegisterBits.lean"]
+clean mod register_bits;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -143,8 +148,8 @@ impl ModRM {
     pub fn reg_reg(reg: u8, rm: u8) -> Self {
         Self {
             mode: 0b11,
-            reg: reg & 0x7,
-            rm: rm & 0x7,
+            reg: trust_cg_x86_low3(reg),
+            rm: trust_cg_x86_low3(rm),
         }
     }
 
@@ -152,8 +157,8 @@ impl ModRM {
     pub fn ext_reg(ext: u8, rm: u8) -> Self {
         Self {
             mode: 0b11,
-            reg: ext & 0x7,
-            rm: rm & 0x7,
+            reg: trust_cg_x86_low3(ext),
+            rm: trust_cg_x86_low3(rm),
         }
     }
 
@@ -161,8 +166,8 @@ impl ModRM {
     pub fn indirect(reg: u8, base: u8) -> Self {
         Self {
             mode: 0b00,
-            reg: reg & 0x7,
-            rm: base & 0x7,
+            reg: trust_cg_x86_low3(reg),
+            rm: trust_cg_x86_low3(base),
         }
     }
 
@@ -170,8 +175,8 @@ impl ModRM {
     pub fn indirect_disp8(reg: u8, base: u8) -> Self {
         Self {
             mode: 0b01,
-            reg: reg & 0x7,
-            rm: base & 0x7,
+            reg: trust_cg_x86_low3(reg),
+            rm: trust_cg_x86_low3(base),
         }
     }
 
@@ -179,8 +184,8 @@ impl ModRM {
     pub fn indirect_disp32(reg: u8, base: u8) -> Self {
         Self {
             mode: 0b10,
-            reg: reg & 0x7,
-            rm: base & 0x7,
+            reg: trust_cg_x86_low3(reg),
+            rm: trust_cg_x86_low3(base),
         }
     }
 
@@ -1029,51 +1034,6 @@ impl X86Encoder {
         self.emit_sib_mem_operand(dst.hw_enc(), base, index, scale, disp)
     }
 
-    /// Emit a 3-byte VEX (`0xC4`) prefix + opcode + reg-reg ModRM for a 256-bit
-    /// (`L=1`) AVX2 packed instruction: `VEX.256.pp.map.W opcode /r`, in the
-    /// non-destructive 3-operand form `dst = src1 <op> src2`
-    /// (dst = ModRM.reg, src1 = VEX.vvvv, src2 = ModRM.rm).
-    ///
-    /// `map`: opcode map (1 = `0F`, 2 = `0F38`, 3 = `0F3A`). `pp`: mandatory SIMD
-    /// prefix (0 = none, 1 = `66`, 2 = `F3`, 3 = `F2`). `w`: the `VEX.W` bit (0 for
-    /// the WIG ops used here). `*_hw` are the 4-bit hardware register numbers
-    /// (0..=15); their high bit goes into the inverted `R`/`B` / `vvvv` fields.
-    ///
-    /// FOUNDATION for the AVX2-256 vectorizer widening (memory:
-    /// avx2-perf-lever-measured-2026-07-15) — the x86 vectorizer is SSE-128 only
-    /// while LLVM uses AVX2-256, a ~2x width gap. This is the (unit-tested,
-    /// byte-exact) VEX-prefix encoder that the 256-bit lowerings will use; it is
-    /// deliberately NOT yet wired into any opcode dispatch, so it cannot affect any
-    /// compiled program (zero miscompile risk) until the ymm register class +
-    /// per-op proof coverage land in a dedicated follow-up.
-    #[allow(dead_code)]
-    fn emit_vex3_ymm_rr(
-        &mut self,
-        map: u8,
-        pp: u8,
-        w: u8,
-        opcode: u8,
-        dst_hw: u8,
-        src1_hw: u8,
-        src2_hw: u8,
-    ) {
-        // Byte 1: [R X B mmmmm] — R/B are the INVERTED high bits of dst/rm; there is
-        // no index register in the reg-reg form, so X is the inverted 0 = 1.
-        let r = 1 - ((dst_hw >> 3) & 1);
-        let x = 1u8;
-        let b = 1 - ((src2_hw >> 3) & 1);
-        let byte1 = (r << 7) | (x << 6) | (b << 5) | (map & 0x1F);
-        // Byte 2: [W vvvv L pp] — vvvv is the INVERTED src1 register (4 bits);
-        // L = 1 (256-bit).
-        let vvvv = (!src1_hw) & 0x0F;
-        let byte2 = ((w & 1) << 7) | (vvvv << 3) | (1 << 2) | (pp & 0x03);
-        self.emit_byte(0xC4);
-        self.emit_byte(byte1);
-        self.emit_byte(byte2);
-        self.emit_byte(opcode);
-        self.emit_modrm(ModRM::reg_reg(dst_hw & 7, src2_hw & 7));
-    }
-
     /// Encode an SSE2 packed integer instruction with an `xmm, xmm/m128` source.
     fn encode_sse2_packed_xmm_rm_or_rr(
         &mut self,
@@ -1845,6 +1805,41 @@ impl X86Encoder {
                 })?;
                 self.encode_mov_rm_width(dst, base, ops.disp, 0x8B, false, true, false)?;
             }
+            // MOVZX r32, m8 / MOVZX r32, m16: [REX] 0F B6 /r / [REX] 0F B7 /r.
+            // A zero-extending load: the 32-bit destination write zero-extends
+            // to 64 bits, so the whole register is defined (no merge into the
+            // old bits, unlike 8A / 66 8B). No REX.W (the 32-bit form, LLVM's
+            // movzbl/movzwl), no operand-size prefix (66 0F B6 would be
+            // `movzx r16, m8`, a MERGE into bits 16..63), and no forced REX:
+            // the destination is a 32-bit register, which has no AH..BH
+            // spelling.
+            X86Opcode::MovzxRM8
+            | X86Opcode::VolatileMovzxRM8
+            | X86Opcode::MovzxRM16
+            | X86Opcode::VolatileMovzxRM16 => {
+                let dst = self.require_dst(ops, opcode)?;
+                if !dst.is_gpr() {
+                    return Err(X86EncodeError::InvalidOperands(format!(
+                        "{:?}: destination must be a GPR",
+                        opcode
+                    )));
+                }
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                let second = if matches!(
+                    opcode,
+                    X86Opcode::MovzxRM8 | X86Opcode::VolatileMovzxRM8
+                ) {
+                    0xB6
+                } else {
+                    0xB7
+                };
+                self.emit_mem_reg_rex(dst, base, false, false);
+                self.emit_byte(0x0F);
+                self.emit_byte(second);
+                self.emit_mem_operand(dst.hw_enc(), base, ops.disp)?;
+            }
             // MOV r32, [base+disp]: 8B /r
             X86Opcode::MovRM32 | X86Opcode::VolatileMovRM32 => {
                 let dst = self.require_dst(ops, opcode)?;
@@ -2165,6 +2160,68 @@ impl X86Encoder {
                 }
                 self.emit_mem_operand(src_narrow.hw_enc(), base, ops.disp)?;
             }
+            // The 128-bit atomic-load pseudo. Expansion, in this order:
+            //   XOR EAX,EAX ; XOR EDX,EDX ; XOR EBX,EBX ; XOR ECX,ECX
+            //       (31 /r, each 2 bytes; a 32-bit XOR zero-extends into the
+            //        full 64-bit register, SDM Vol. 1 3.4.1.1)
+            //   LOCK CMPXCHG16B m128
+            //       (F0 + REX.W(+B) + 0F C7 /1; SDM Vol. 2A CMPXCHG8B/CMPXCHG16B,
+            //        REX.W selects the 16-byte form)
+            // With RDX:RAX = RCX:RBX = 0 the compare-exchange returns the 16
+            // bytes in RDX:RAX and leaves memory unchanged in both branches. The
+            // zeroing is emitted HERE, as part of one pseudo, so the load's
+            // precondition cannot be separated from the CMPXCHG16B by any pass.
+            // Memory form only (`/1` with mod=11 is #UD); the operands carry
+            // `[base + disp]` and nothing else. A base in RAX/RBX/RCX/RDX would
+            // be zeroed before the CMPXCHG16B reads it: refused, mirroring the
+            // CAS-loop scratch checks above.
+            X86Opcode::AtomicLoadCmpxchg16b => {
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!(
+                        "{:?}: CMPXCHG16B requires a memory operand",
+                        opcode
+                    ))
+                })?;
+                if ops.dst.is_some() || ops.src.is_some() || ops.index.is_some() {
+                    return Err(X86EncodeError::InvalidOperands(format!(
+                        "{:?}: CMPXCHG16B takes only a [base+disp] memory operand",
+                        opcode
+                    )));
+                }
+                if !base.is_gpr64() {
+                    return Err(X86EncodeError::InvalidOperands(format!(
+                        "{:?}: CMPXCHG16B requires a 64-bit base register",
+                        opcode
+                    )));
+                }
+                if [
+                    x86_64_regs::RAX,
+                    x86_64_regs::RBX,
+                    x86_64_regs::RCX,
+                    x86_64_regs::RDX,
+                ]
+                .into_iter()
+                .any(|fixed| x86_64_regs::x86_regs_overlap(base, fixed))
+                {
+                    return Err(X86EncodeError::InvalidOperands(format!(
+                        "{:?}: base conflicts with the zeroed RDX:RAX / RCX:RBX registers",
+                        opcode
+                    )));
+                }
+                for zeroed in [
+                    x86_64_regs::EAX,
+                    x86_64_regs::EDX,
+                    x86_64_regs::EBX,
+                    x86_64_regs::ECX,
+                ] {
+                    self.encode_alu_rr(0x31, zeroed, zeroed); // XOR r/m32, r32
+                }
+                self.emit_byte(0xF0); // LOCK prefix
+                self.emit_rex(Self::rex_m64(base));
+                self.emit_byte(0x0F);
+                self.emit_byte(0xC7);
+                self.emit_mem_operand(1, base, ops.disp)?;
+            }
 
             // =================================================================
             // Scaled-index (SIB) memory addressing
@@ -2278,6 +2335,37 @@ impl X86Encoder {
                 };
                 self.emit_rex_forced(rex, Self::low_byte_reg_needs_rex(dst));
                 self.emit_byte(0x8A);
+                self.emit_sib_mem_operand(dst.hw_enc(), base, index, ops.scale, ops.disp)?;
+            }
+            // MOVZX r32, [base+index*scale+disp] (m8): [REX] 0F B6 /r + SIB.
+            // The scaled-index sibling of MovzxRM8: a zero-extending byte load
+            // whose 32-bit destination write defines the whole register. No
+            // forced REX (a 32-bit destination has no AH..BH spelling) and no
+            // REX.W.
+            X86Opcode::MovzxRM8Sib => {
+                let dst = self.require_dst(ops, opcode)?;
+                if !dst.is_gpr() {
+                    return Err(X86EncodeError::InvalidOperands(format!(
+                        "{:?}: destination must be a GPR",
+                        opcode
+                    )));
+                }
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                let index = ops.index.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing index register", opcode))
+                })?;
+                Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
+                let rex = RexPrefix {
+                    w: false,
+                    r: dst.hw_enc() >= 8,
+                    x: index.hw_enc() >= 8,
+                    b: base.hw_enc() >= 8,
+                };
+                self.emit_rex(rex);
+                self.emit_byte(0x0F);
+                self.emit_byte(0xB6);
                 self.emit_sib_mem_operand(dst.hw_enc(), base, index, ops.scale, ops.disp)?;
             }
             // MOV [base+index*scale+disp], r8: 88 /r + SIB. Same forced-REX rule
@@ -2559,6 +2647,37 @@ impl X86Encoder {
                     X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
                 })?;
                 self.encode_sse_mr(0xF3, 0x7F, src, base, ops.disp)?;
+            }
+            // MOVDQU xmm, [base+index*scale+disp]: F3 0F 6F /r + SIB
+            X86Opcode::MovdquRMSib => {
+                let dst = self.require_dst(ops, opcode)?;
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                let index = ops.index.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing index register", opcode))
+                })?;
+                Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
+                self.encode_sse_rm_sib(0xF3, 0x6F, dst, base, index, ops.scale, ops.disp)?;
+            }
+            // MOVDQU [base+index*scale+disp], xmm: F3 0F 7F /r + SIB.
+            //
+            // `encode_sse_rm_sib` puts its `dst` argument in the ModRM REG field,
+            // which for the /r STORE direction is the SOURCE xmm — exactly the
+            // same relationship `encode_sse_mr` has to `encode_sse_rm`. The byte
+            // layout (prefix, REX with the index high bit in X, 0F, opcode, SIB
+            // memory operand) is identical, so the store reuses it rather than
+            // duplicating the helper.
+            X86Opcode::MovdquMRSib => {
+                let src = self.require_dst(ops, opcode)?; // dst field holds src for stores
+                let base = ops.base.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing base register", opcode))
+                })?;
+                let index = ops.index.ok_or_else(|| {
+                    X86EncodeError::InvalidOperands(format!("{:?}: missing index register", opcode))
+                })?;
+                Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
+                self.encode_sse_rm_sib(0xF3, 0x7F, src, base, index, ops.scale, ops.disp)?;
             }
 
             // =================================================================
@@ -3898,8 +4017,9 @@ mod tests {
     use super::*;
     use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode, X86Sse2PackedOpcode};
     use trust_cg_ir::x86_64_regs::{
-        AL, AX, CL, CX, EAX, ECX, EDX, R8, R8B, R8D, R9, R9D, R10, R10B, R11, R12, R13, R14, R14D,
-        R14W, R15, R15D, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, SIL, XMM0, XMM1, XMM8, XMM15,
+        AL, AX, CL, CX, EAX, ECX, EDI, EDX, ESI, R8, R8B, R8D, R9, R9D, R10, R10B, R11, R12, R12D,
+        R13, R14, R14D, R14W, R15, R15D, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, SIL, XMM0, XMM1,
+        XMM8, XMM15,
     };
 
     // Helper to encode an instruction and return the bytes.
@@ -3913,63 +4033,6 @@ mod tests {
         let mut enc = X86Encoder::new();
         enc.encode_sse2_packed_instruction(opcode, ops).unwrap();
         enc.finish()
-    }
-
-    // AVX2-256 foundation: byte-exact VEX 3-byte (C4) prefix encoding for the ymm
-    // ops the future vectorizer widening will emit. Verified against the
-    // Intel SDM VEX layout `VEX.256.pp.map.W opcode /r`. (The helper is not yet
-    // wired into opcode dispatch, so these tests are its only consumer today.)
-    #[test]
-    fn vex3_ymm_encoding_is_byte_exact() {
-        // VPADDQ ymm0, ymm0, ymm0  = VEX.256.66.0F.WIG D4 /r = C4 E1 7D D4 C0
-        let mut e = X86Encoder::new();
-        e.emit_vex3_ymm_rr(1, 1, 0, 0xD4, 0, 0, 0);
-        assert_eq!(
-            e.finish(),
-            vec![0xC4, 0xE1, 0x7D, 0xD4, 0xC0],
-            "VPADDQ ymm0,ymm0,ymm0"
-        );
-        // VPMULUDQ ymm0, ymm0, ymm0 = VEX.256.66.0F.WIG F4 /r = C4 E1 7D F4 C0
-        let mut e = X86Encoder::new();
-        e.emit_vex3_ymm_rr(1, 1, 0, 0xF4, 0, 0, 0);
-        assert_eq!(
-            e.finish(),
-            vec![0xC4, 0xE1, 0x7D, 0xF4, 0xC0],
-            "VPMULUDQ ymm0,ymm0,ymm0"
-        );
-        // VMULPD ymm0, ymm0, ymm0   = VEX.256.66.0F.WIG 59 /r = C4 E1 7D 59 C0
-        let mut e = X86Encoder::new();
-        e.emit_vex3_ymm_rr(1, 1, 0, 0x59, 0, 0, 0);
-        assert_eq!(
-            e.finish(),
-            vec![0xC4, 0xE1, 0x7D, 0x59, 0xC0],
-            "VMULPD ymm0,ymm0,ymm0"
-        );
-        // VADDPD ymm0, ymm0, ymm0   = VEX.256.66.0F.WIG 58 /r = C4 E1 7D 58 C0
-        let mut e = X86Encoder::new();
-        e.emit_vex3_ymm_rr(1, 1, 0, 0x58, 0, 0, 0);
-        assert_eq!(
-            e.finish(),
-            vec![0xC4, 0xE1, 0x7D, 0x58, 0xC0],
-            "VADDPD ymm0,ymm0,ymm0"
-        );
-        // HIGH registers: VPADDQ ymm8, ymm1, ymm9 exercises the inverted R (dst>=8),
-        // B (rm>=8), and vvvv (src1) fields. byte1=0x41, byte2=0x75, ModRM=0xC1.
-        let mut e = X86Encoder::new();
-        e.emit_vex3_ymm_rr(1, 1, 0, 0xD4, 8, 1, 9);
-        assert_eq!(
-            e.finish(),
-            vec![0xC4, 0x41, 0x75, 0xD4, 0xC1],
-            "VPADDQ ymm8,ymm1,ymm9"
-        );
-        // W=1 sets byte2 bit 7 (a W1-form op).
-        let mut e = X86Encoder::new();
-        e.emit_vex3_ymm_rr(1, 1, 1, 0xD4, 0, 0, 0);
-        assert_eq!(
-            e.finish(),
-            vec![0xC4, 0xE1, 0xFD, 0xD4, 0xC0],
-            "VEX.W=1 sets byte2 bit7"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -4682,6 +4745,94 @@ mod tests {
         assert_eq!(
             encode(X86Opcode::MovRM, &X86InstOperands::rm(RAX, RBX, 0)),
             vec![0x48, 0x8B, 0x03]
+        );
+    }
+
+    /// The zero-extending loads, against the host assembler's bytes
+    /// (`movzbl`/`movzwl`, read back with objdump): the 32-bit `0F B6`/`0F B7`
+    /// form, no REX.W, no operand-size prefix, and no forced REX for an
+    /// ESI/EDI/ESP/EBP destination (the AH..BH trap is a byte-register one).
+    /// The volatile twins are byte-identical.
+    #[test]
+    fn test_movzx_loads_from_mem_are_the_32_bit_zero_extending_forms() {
+        let cases: &[(X86Opcode, X86PReg, X86PReg, i64, &[u8])] = &[
+            // movzbl (%rbx), %eax
+            (X86Opcode::MovzxRM8, EAX, RBX, 0, &[0x0F, 0xB6, 0x03]),
+            // movzbl (%rbx), %esi: no REX, unlike `mov sil, [rbx]` (40 8A 33)
+            (X86Opcode::MovzxRM8, ESI, RBX, 0, &[0x0F, 0xB6, 0x33]),
+            // movzbl -8(%r13), %r12d
+            (
+                X86Opcode::MovzxRM8,
+                R12D,
+                R13,
+                -8,
+                &[0x45, 0x0F, 0xB6, 0x65, 0xF8],
+            ),
+            // movzbl (%rsp), %edi: an RSP base needs the SIB byte 24
+            (X86Opcode::MovzxRM8, EDI, RSP, 0, &[0x0F, 0xB6, 0x3C, 0x24]),
+            // movzbl 0(%rbp), %ecx: an RBP base cannot use mod=00
+            (X86Opcode::MovzxRM8, ECX, RBP, 0, &[0x0F, 0xB6, 0x4D, 0x00]),
+            // movzwl 16(%rbx), %esi
+            (
+                X86Opcode::MovzxRM16,
+                ESI,
+                RBX,
+                16,
+                &[0x0F, 0xB7, 0x73, 0x10],
+            ),
+            // movzwl 4096(%rsp), %edx
+            (
+                X86Opcode::MovzxRM16,
+                EDX,
+                RSP,
+                4096,
+                &[0x0F, 0xB7, 0x94, 0x24, 0x00, 0x10, 0x00, 0x00],
+            ),
+            (
+                X86Opcode::VolatileMovzxRM8,
+                EAX,
+                RBX,
+                0,
+                &[0x0F, 0xB6, 0x03],
+            ),
+            (
+                X86Opcode::VolatileMovzxRM16,
+                ESI,
+                RBX,
+                16,
+                &[0x0F, 0xB7, 0x73, 0x10],
+            ),
+            // A 64-bit spelling of the destination encodes the same 32-bit
+            // form: the write zero-extends either way.
+            (X86Opcode::MovzxRM8, RAX, RBX, 0, &[0x0F, 0xB6, 0x03]),
+        ];
+        for &(opcode, dst, base, disp, expected) in cases {
+            assert_eq!(
+                encode(opcode, &X86InstOperands::rm(dst, base, disp)),
+                expected,
+                "{opcode:?} {dst:?}, [{base:?}{disp:+}]"
+            );
+        }
+        // movzbl 16(%rbx,%rcx,8), %eax and movzbl -8(%r13,%r14,4), %r12d
+        assert_eq!(
+            encode(
+                X86Opcode::MovzxRM8Sib,
+                &X86InstOperands::rm_sib(EAX, RBX, RCX, 8, 16)
+            ),
+            vec![0x0F, 0xB6, 0x44, 0xCB, 0x10]
+        );
+        assert_eq!(
+            encode(
+                X86Opcode::MovzxRM8Sib,
+                &X86InstOperands::rm_sib(R12D, R13, R14, 4, -8)
+            ),
+            vec![0x47, 0x0F, 0xB6, 0x64, 0xB5, 0xF8]
+        );
+        // An XMM destination is refused rather than encoded as a GPR number.
+        let mut e = X86Encoder::new();
+        assert!(
+            e.encode_instruction(X86Opcode::MovzxRM8, &X86InstOperands::rm(XMM0, RBX, 0))
+                .is_err()
         );
     }
 
@@ -5642,6 +5793,87 @@ mod tests {
             vec![0xF2, 0x47, 0x0F, 0x10, 0x84, 0x97, 0x80, 0x00, 0x00, 0x00]
         );
         assert_eq!(bytes.len(), 10);
+    }
+
+    // Packed 128-bit scaled-index MOVDQU. Same ground-truth rule as the scalar-FP
+    // SIB loads above: every expected byte string comes from `llvm-mc
+    // -show-encoding`, never from re-deriving this encoder's own arithmetic.
+    #[test]
+    fn test_movdqu_rm_sib_basic() {
+        // llvm-mc: movdqu 16(%rbx,%rcx,8), %xmm0 => [f3,0f,6f,44,cb,10]
+        let bytes = encode(
+            X86Opcode::MovdquRMSib,
+            &X86InstOperands::rm_sib(XMM0, RBX, RCX, 8, 16),
+        );
+        assert_eq!(bytes, vec![0xF3, 0x0F, 0x6F, 0x44, 0xCB, 0x10]);
+    }
+
+    #[test]
+    fn test_movdqu_mr_sib_basic() {
+        // llvm-mc: movdqu %xmm0, 16(%rbx,%rcx,8) => [f3,0f,7f,44,cb,10]
+        // Identical to the load except the opcode byte (7F store vs 6F load):
+        // the ModRM/SIB bytes are the same because the /r reg field holds the
+        // XMM in BOTH directions.
+        let bytes = encode(
+            X86Opcode::MovdquMRSib,
+            &X86InstOperands::rm_sib(XMM0, RBX, RCX, 8, 16),
+        );
+        assert_eq!(bytes, vec![0xF3, 0x0F, 0x7F, 0x44, 0xCB, 0x10]);
+    }
+
+    #[test]
+    fn test_movdqu_mr_sib_r12_base_scale1() {
+        // THE `v2_memfill` SHAPE: llvm-mc: movdqu %xmm0, (%r12,%rcx)
+        //   => [f3,41,0f,7f,04,0c]
+        // R12's low three bits are 100, which is the SIB escape in a plain ModRM
+        // r/m field — so this form is only encodable through the SIB path at all,
+        // and REX.B (0x41) carries r12's high bit.
+        let bytes = encode(
+            X86Opcode::MovdquMRSib,
+            &X86InstOperands::rm_sib(XMM0, R12, RCX, 1, 0),
+        );
+        assert_eq!(bytes, vec![0xF3, 0x41, 0x0F, 0x7F, 0x04, 0x0C]);
+    }
+
+    #[test]
+    fn test_movdqu_rm_sib_high_base_rex_b() {
+        // llvm-mc: movdqu (%r8,%rdx,8), %xmm1 => [f3,41,0f,6f,0c,d0]
+        // Pins that the mandatory SIMD prefix precedes REX (0xF3 then 0x41).
+        let bytes = encode(
+            X86Opcode::MovdquRMSib,
+            &X86InstOperands::rm_sib(XMM1, R8, RDX, 8, 0),
+        );
+        assert_eq!(bytes, vec![0xF3, 0x41, 0x0F, 0x6F, 0x0C, 0xD0]);
+    }
+
+    #[test]
+    fn test_movdqu_sib_all_high_regs_disp32_is_10_bytes() {
+        // llvm-mc: movdqu 128(%r15,%r10,4), %xmm8
+        //       => [f3,47,0f,6f,84,97,80,00,00,00]
+        //          movdqu %xmm8, 128(%r15,%r10,4)
+        //       => [f3,47,0f,7f,84,97,80,00,00,00]
+        // REX 0x47 = R|X|B: the X bit carries the INDEX register's high bit,
+        // which has no slot in a plain ModRM memory operand. This is also the
+        // 10-byte worst case `estimate_inst_size` must not under-report, since
+        // branch displacements are laid out against it.
+        let load = encode(
+            X86Opcode::MovdquRMSib,
+            &X86InstOperands::rm_sib(XMM8, R15, R10, 4, 128),
+        );
+        assert_eq!(
+            load,
+            vec![0xF3, 0x47, 0x0F, 0x6F, 0x84, 0x97, 0x80, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(load.len(), 10);
+        let store = encode(
+            X86Opcode::MovdquMRSib,
+            &X86InstOperands::rm_sib(XMM8, R15, R10, 4, 128),
+        );
+        assert_eq!(
+            store,
+            vec![0xF3, 0x47, 0x0F, 0x7F, 0x84, 0x97, 0x80, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(store.len(), 10);
     }
 
     #[test]
@@ -8498,6 +8730,94 @@ mod tests {
         // LOCK CMPXCHG [R13+0], R8: F0 + REX.WRB + 0F B1 + ModRM + disp8(0)
         let bytes = encode(X86Opcode::Cmpxchg, &X86InstOperands::rm(R8, R13, 0));
         assert_eq!(bytes, &[0xF0, 0x4D, 0x0F, 0xB1, 0x45, 0x00]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The 128-bit atomic-load pseudo: `XOR EAX,EAX; XOR EDX,EDX; XOR EBX,EBX;
+    // XOR ECX,ECX; LOCK CMPXCHG16B m128` (Intel SDM: 31 /r; F0 + REX.W + 0F C7
+    // /1). Every expected byte string was produced by the host assembler
+    // (`clang -c` on the same instruction sequence, read back with objdump).
+    // -----------------------------------------------------------------------
+
+    fn cmpxchg16b_ops(base: X86PReg, disp: i64) -> X86InstOperands {
+        X86InstOperands {
+            base: Some(base),
+            disp,
+            ..X86InstOperands::none()
+        }
+    }
+
+    /// `xor eax,eax; xor edx,edx; xor ebx,ebx; xor ecx,ecx`, assembled.
+    const CMPXCHG16B_ZEROING: [u8; 8] = [0x31, 0xC0, 0x31, 0xD2, 0x31, 0xDB, 0x31, 0xC9];
+
+    #[test]
+    fn test_atomic_load_cmpxchg16b_zeroes_all_four_registers_first() {
+        // The assembler's own bytes for the whole expansion at `(%rdi)`:
+        // 31 c0 / 31 d2 / 31 db / 31 c9 / f0 48 0f c7 0f.
+        let bytes = encode(X86Opcode::AtomicLoadCmpxchg16b, &cmpxchg16b_ops(RDI, 0));
+        assert_eq!(
+            bytes,
+            &[
+                0x31, 0xC0, 0x31, 0xD2, 0x31, 0xDB, 0x31, 0xC9, 0xF0, 0x48, 0x0F, 0xC7, 0x0F
+            ],
+            "the pseudo must emit the four zeroing XORs immediately before the CMPXCHG16B"
+        );
+    }
+
+    #[test]
+    fn test_cmpxchg16b_matches_the_assembler() {
+        let cases: [(X86PReg, i64, &[u8]); 10] = [
+            (RDI, 0, &[0xF0, 0x48, 0x0F, 0xC7, 0x0F]),
+            (RSI, 0, &[0xF0, 0x48, 0x0F, 0xC7, 0x0E]),
+            (R8, 0, &[0xF0, 0x49, 0x0F, 0xC7, 0x08]),
+            (RSP, 0, &[0xF0, 0x48, 0x0F, 0xC7, 0x0C, 0x24]),
+            (RBP, 0, &[0xF0, 0x48, 0x0F, 0xC7, 0x4D, 0x00]),
+            (R12, 0, &[0xF0, 0x49, 0x0F, 0xC7, 0x0C, 0x24]),
+            (R13, 0, &[0xF0, 0x49, 0x0F, 0xC7, 0x4D, 0x00]),
+            (RSI, 16, &[0xF0, 0x48, 0x0F, 0xC7, 0x4E, 0x10]),
+            (R9, -24, &[0xF0, 0x49, 0x0F, 0xC7, 0x49, 0xE8]),
+            (
+                R15,
+                4096,
+                &[0xF0, 0x49, 0x0F, 0xC7, 0x8F, 0x00, 0x10, 0x00, 0x00],
+            ),
+        ];
+        for (base, disp, expected) in cases {
+            let bytes = encode(X86Opcode::AtomicLoadCmpxchg16b, &cmpxchg16b_ops(base, disp));
+            assert_eq!(
+                &bytes[..CMPXCHG16B_ZEROING.len()],
+                &CMPXCHG16B_ZEROING,
+                "the zeroing prefix of [{base:?}{disp:+}]"
+            );
+            assert_eq!(
+                &bytes[CMPXCHG16B_ZEROING.len()..],
+                expected,
+                "lock cmpxchg16b [{base:?}{disp:+}]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cmpxchg16b_refuses_a_fixed_register_base_and_stray_operands() {
+        let reject = |ops: &X86InstOperands| {
+            X86Encoder::new()
+                .encode_instruction(X86Opcode::AtomicLoadCmpxchg16b, ops)
+                .expect_err("malformed CMPXCHG16B operands must be refused")
+        };
+        // A base in any of the four implicit data registers.
+        for base in [RAX, RBX, RCX, RDX] {
+            reject(&cmpxchg16b_ops(base, 0));
+        }
+        // No memory operand (the register form is #UD).
+        reject(&X86InstOperands::none());
+        // A 32-bit base.
+        reject(&cmpxchg16b_ops(R9D, 0));
+        // An explicit register operand or an index.
+        reject(&X86InstOperands::rm(RSI, RDI, 0));
+        reject(&X86InstOperands {
+            index: Some(RSI),
+            ..cmpxchg16b_ops(RDI, 0)
+        });
     }
 
     #[test]

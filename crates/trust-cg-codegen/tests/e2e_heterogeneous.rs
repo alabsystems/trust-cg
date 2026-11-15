@@ -541,7 +541,7 @@ fn e2e_dispatch_verification_passes_all_plan_types() {
         ];
         let pipeline = Pipeline::new(PipelineConfig {
             verify_dispatch: DispatchVerifyMode::ErrorOnFailure,
-            ..Default::default()
+            ..PipelineConfig::for_target("aarch64-apple-darwin")
         });
         let result = pipeline.generate_and_verify_dispatch(&graph, &recs);
         assert!(
@@ -728,7 +728,7 @@ fn e2e_pipeline_verify_dispatch_integration() {
     // ErrorOnFailure mode: should pass for a well-formed graph.
     let pipeline = Pipeline::new(PipelineConfig {
         verify_dispatch: DispatchVerifyMode::ErrorOnFailure,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
     let verified_plan = pipeline
         .generate_and_verify_dispatch(&graph, &recs)
@@ -740,7 +740,7 @@ fn e2e_pipeline_verify_dispatch_integration() {
     // FallbackOnFailure mode: should also pass (same valid plan).
     let pipeline_fallback = Pipeline::new(PipelineConfig {
         verify_dispatch: DispatchVerifyMode::FallbackOnFailure,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
     let fallback_plan = pipeline_fallback
         .generate_and_verify_dispatch(&graph, &recs)
@@ -761,7 +761,7 @@ fn e2e_fallback_mode_recovers_from_bad_graph() {
 
     let pipeline = Pipeline::new(PipelineConfig {
         verify_dispatch: DispatchVerifyMode::FallbackOnFailure,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
 
     let plan = pipeline

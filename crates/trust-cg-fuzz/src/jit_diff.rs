@@ -86,17 +86,19 @@ pub fn run_oracle_one(module: &trust_ir::Module, args: &[i64]) -> Result<i64, St
     }
 }
 
-/// Project the interpreter's widthless raw representation of
-/// `sext Bool -> i64` into the native one-bit sign-extension result.
+/// The interpreter's `sext Bool -> i64` result, if it is in the domain of a
+/// one-bit sign extension: `0` for false, all ones (`-1`) for true.
 ///
-/// The interpreter deliberately models integer casts without source widths,
-/// so a true Bool reaches this boundary as `1`. Native Trust IR semantics
-/// sign-extend that one-bit value to `-1`. Reject values outside the Bool
-/// domain so a future interpreter change cannot be silently normalized.
-pub fn project_widthless_bool_sext_i64(raw: i64) -> Option<i64> {
+/// This is trust-ir's meaning (its reference interpreter widens
+/// `as_signed()` of the 1-bit value, `interpret.rs` `eval_cast`) and LLVM's
+/// `sext i1`. Since `1d65e8e64` the interpreter computes it directly;
+/// before, it returned the raw Bool `1`, which a harness projected to `-1`.
+/// Every other value, the retired `1` included, is refused, so neither a
+/// return of that model nor any other change to the interpreter can be
+/// silently normalized into agreement.
+pub fn bool_sext_i64_oracle_result(raw: i64) -> Option<i64> {
     match raw {
-        0 => Some(0),
-        1 => Some(-1),
+        0 | -1 => Some(raw),
         _ => None,
     }
 }
@@ -108,7 +110,7 @@ pub fn compile_and_run(module: &trust_ir::Module, opt: OptLevel, args: &[i64; 4]
     let externs: HashMap<String, *const u8> = HashMap::new();
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = opt;
-    let compiler = Compiler::new(config);
+    let compiler = Compiler::new(config).with_codegen_license(crate::fuzz_license());
     let buf_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         compiler.compile_module_to_jit(module, &externs)
     }));
@@ -166,7 +168,7 @@ pub fn compile_and_run_consumer_shape(
     let externs: HashMap<String, *const u8> = HashMap::new();
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = opt;
-    let compiler = Compiler::new(config);
+    let compiler = Compiler::new(config).with_codegen_license(crate::fuzz_license());
     let buf_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         compiler.compile_module_to_jit(module, &externs)
     }));
@@ -481,23 +483,105 @@ fn classify_consumer_one(
     }
 }
 
+/// What one row check actually executed, beside its verdict. A JIT level
+/// that was refused (`Unsupported`: a compile error, a missing symbol or an
+/// unavailable sandbox) compared nothing, so a campaign must count it rather
+/// than let the row pass silently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowExecution {
+    /// JIT levels (of O0, O2, O3) whose call ran to a value or a hardware trap.
+    pub executed_levels: u8,
+    /// JIT levels that were refused.
+    pub refused_levels: u8,
+    /// The first refusal's reason.
+    pub refusal: Option<String>,
+    /// Whether the reference model (the trust-ir interpreter, or the
+    /// consumer shape's closed-form oracle) produced a value the JIT levels
+    /// were compared against. Without one (an interpreter error such as a
+    /// division by zero) the row only compares the levels with each other.
+    pub oracle_compared: bool,
+    /// The reference model's error when it produced no value.
+    pub oracle_error: Option<String>,
+}
+
+impl RowExecution {
+    fn record(&mut self, refusal: Option<&str>, executed: bool) {
+        if executed {
+            self.executed_levels += 1;
+        }
+        if let Some(reason) = refusal {
+            self.refused_levels += 1;
+            self.refusal.get_or_insert_with(|| reason.to_string());
+        }
+    }
+
+    fn of_scalar(outcomes: [&JitOutcome; 3]) -> Self {
+        let mut execution = Self::default();
+        for outcome in outcomes {
+            let refusal = match outcome {
+                JitOutcome::Unsupported(reason) => Some(reason.as_str()),
+                _ => None,
+            };
+            let executed = matches!(outcome, JitOutcome::Value(_) | JitOutcome::Trapped(_));
+            execution.record(refusal, executed);
+        }
+        execution
+    }
+
+    fn of_consumer(outcomes: [&ConsumerJitOutcome; 3]) -> Self {
+        let mut execution = Self::default();
+        for outcome in outcomes {
+            let refusal = match outcome {
+                ConsumerJitOutcome::Unsupported(reason) => Some(reason.as_str()),
+                _ => None,
+            };
+            let executed = matches!(
+                outcome,
+                ConsumerJitOutcome::Value(_) | ConsumerJitOutcome::Trapped(_)
+            );
+            execution.record(refusal, executed);
+        }
+        execution
+    }
+}
+
 /// One full differential check for a consumer-shaped pointer-buffer module.
 pub fn diff_consumer_shape_row(
     module: &trust_ir::Module,
     row: &[i64; 4],
 ) -> Option<(&'static str, String)> {
+    diff_consumer_shape_row_executed(module, row).0
+}
+
+/// [`diff_consumer_shape_row`] with what the row executed.
+pub fn diff_consumer_shape_row_executed(
+    module: &trust_ir::Module,
+    row: &[i64; 4],
+) -> (Option<(&'static str, String)>, RowExecution) {
     let oracle = run_consumer_shape_oracle(row);
     let o0 = compile_and_run_consumer_shape(module, OptLevel::O0, row);
     let o2 = compile_and_run_consumer_shape(module, OptLevel::O2, row);
     let o3 = compile_and_run_consumer_shape(module, OptLevel::O3, row);
+    let mut execution = RowExecution::of_consumer([&o0, &o2, &o3]);
+    // The consumer oracle is closed-form and always defines a snapshot.
+    execution.oracle_compared = true;
+    (consumer_verdict(row, &oracle, &o0, &o2, &o3), execution)
+}
 
-    for (name, outcome) in [("O0", &o0), ("O2", &o2), ("O3", &o3)] {
-        if let Some(defect) = classify_consumer_one(name, &oracle, outcome, row) {
+fn consumer_verdict(
+    row: &[i64; 4],
+    oracle: &ConsumerSnapshot,
+    o0: &ConsumerJitOutcome,
+    o2: &ConsumerJitOutcome,
+    o3: &ConsumerJitOutcome,
+) -> Option<(&'static str, String)> {
+    for (name, outcome) in [("O0", o0), ("O2", o2), ("O3", o3)] {
+        if let Some(defect) = classify_consumer_one(name, oracle, outcome, row) {
             return Some(defect);
         }
     }
 
-    let values = [("O0", &o0), ("O2", &o2), ("O3", &o3)];
+    let values = [("O0", o0), ("O2", o2), ("O3", o3)];
     for i in 0..values.len() {
         for j in (i + 1)..values.len() {
             if let (ConsumerJitOutcome::Value(a), ConsumerJitOutcome::Value(b)) =
@@ -519,29 +603,113 @@ pub fn diff_consumer_shape_row(
 
 /// One full differential check for a single `(module, args)` row.
 pub fn diff_one_row(module: &trust_ir::Module, row: &[i64]) -> Option<(&'static str, String)> {
-    let oracle = run_oracle_one(module, row);
+    diff_one_row_executed(module, row, false).0
+}
 
+/// The negative control of a campaign lane: [`diff_one_row`] with the O2 JIT
+/// value perturbed by one after it executes, so the classifier must report a
+/// miscompile whenever O2 returns a value. A row where O2 returns no value
+/// (a trap, a refusal) plants nothing and is checked as usual.
+pub fn diff_one_row_planted_miscompile(
+    module: &trust_ir::Module,
+    row: &[i64],
+) -> Option<(&'static str, String)> {
+    diff_one_row_executed(module, row, true).0
+}
+
+/// [`diff_one_row`] (or, with `plant`, [`diff_one_row_planted_miscompile`])
+/// with what the row executed.
+pub fn diff_one_row_executed(
+    module: &trust_ir::Module,
+    row: &[i64],
+    plant: bool,
+) -> (Option<(&'static str, String)>, RowExecution) {
+    diff_row_against(module, row, plant, run_oracle_one(module, row))
+}
+
+/// Run trust-ir's reference interpreter (`trust_ir::interpret`) on
+/// [`FUZZ_FN_NAME`]. Unlike [`run_oracle_one`], whose integer casts are
+/// width-free, it models every integer at its width, so it is the oracle for
+/// programs with narrow integers ([`crate::control_gen`]).
+pub fn run_reference_oracle_one(module: &trust_ir::Module, args: &[i64]) -> Result<i64, String> {
+    use trust_ir::interpret::{InterpretOptions, InterpretValue, InterpretValueKind, Interpreter};
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == FUZZ_FN_NAME)
+        .ok_or_else(|| "reference_interp: no fuzz function".to_string())?;
+    let values = args
+        .iter()
+        .map(|&x| InterpretValue::int(trust_ir::Ty::I64, i128::from(x)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("reference_interp_args: {error}"))?;
+    let outcome = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        Interpreter::with_module(module)
+            .with_options(InterpretOptions {
+                fuel: 200_000,
+                max_call_depth: 32,
+                panic_strategy: trust_ir::interpret::PanicStrategy::Abort,
+            })
+            .execute_function(function, values)
+    }))
+    .map_err(|_| "reference_interp_panic".to_string())?
+    .map_err(|error| format!("reference_interp_err: {error}"))?;
+    match outcome.returns.first().map(|value| &value.kind) {
+        Some(InterpretValueKind::Int(int)) => Ok(int.as_signed() as i64),
+        Some(InterpretValueKind::Bool(b)) => Ok(i64::from(*b)),
+        _ => Err("reference_interp_unsupported_ret".to_string()),
+    }
+}
+
+/// [`diff_one_row_executed`] for a [`crate::control_gen`] module, judged by
+/// [`run_reference_oracle_one`].
+pub fn diff_control_row_executed(
+    module: &trust_ir::Module,
+    row: &[i64],
+) -> (Option<(&'static str, String)>, RowExecution) {
+    diff_row_against(module, row, false, run_reference_oracle_one(module, row))
+}
+
+fn diff_row_against(
+    module: &trust_ir::Module,
+    row: &[i64],
+    plant: bool,
+    oracle: Result<i64, String>,
+) -> (Option<(&'static str, String)>, RowExecution) {
     let mut padded = [0i64; 4];
     for (i, v) in row.iter().take(4).enumerate() {
         padded[i] = *v;
     }
 
     let o0 = compile_and_run(module, OptLevel::O0, &padded);
-    let o2 = compile_and_run(module, OptLevel::O2, &padded);
+    let o2 = match compile_and_run(module, OptLevel::O2, &padded) {
+        JitOutcome::Value(value) if plant => JitOutcome::Value(value.wrapping_add(1)),
+        other => other,
+    };
     let o3 = compile_and_run(module, OptLevel::O3, &padded);
+    let mut execution = RowExecution::of_scalar([&o0, &o2, &o3]);
+    match &oracle {
+        Ok(_) => execution.oracle_compared = true,
+        Err(error) => execution.oracle_error = Some(error.clone()),
+    }
 
-    classify_outputs_o0_o2_o3(Some(oracle), &o0, &o2, &o3, &padded)
+    (
+        classify_outputs_o0_o2_o3(Some(oracle), &o0, &o2, &o3, &padded),
+        execution,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::project_widthless_bool_sext_i64;
+    use super::bool_sext_i64_oracle_result;
 
     #[test]
-    fn widthless_bool_sext_projection_is_domain_checked() {
-        assert_eq!(project_widthless_bool_sext_i64(0), Some(0));
-        assert_eq!(project_widthless_bool_sext_i64(1), Some(-1));
-        assert_eq!(project_widthless_bool_sext_i64(-1), None);
-        assert_eq!(project_widthless_bool_sext_i64(2), None);
+    fn bool_sext_oracle_result_is_domain_checked() {
+        assert_eq!(bool_sext_i64_oracle_result(0), Some(0));
+        assert_eq!(bool_sext_i64_oracle_result(-1), Some(-1));
+        // The retired widthless model's `true`.
+        assert_eq!(bool_sext_i64_oracle_result(1), None);
+        assert_eq!(bool_sext_i64_oracle_result(2), None);
+        assert_eq!(bool_sext_i64_oracle_result(i64::MIN), None);
     }
 }

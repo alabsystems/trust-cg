@@ -53,7 +53,7 @@
 //! the block's instructions), we still apply the idiom but materialise the
 //! V-flag into a vreg via CSET so the result stays usable as a boolean.
 
-use std::collections::{HashMap, HashSet};
+use trust_cg_ir::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::instructions::{Instruction, IntCC, Opcode, Value};
 use crate::types::Type;
@@ -141,7 +141,7 @@ pub fn detect_overflow_idioms(
     // Build a fast lookup: for each LIR Value, where is its producing op?
     // We only index ops that carry a single result (all idiom ops do). Phi
     // nodes and multi-result ops are skipped in the map.
-    let mut def_site: HashMap<Value, usize> = HashMap::new();
+    let mut def_site: HashMap<Value, usize> = HashMap::default();
     for (i, inst) in instructions.iter().enumerate() {
         if inst.results.len() == 1 {
             def_site.insert(inst.results[0], i);
@@ -162,7 +162,7 @@ pub fn detect_overflow_idioms(
     let use_count: &HashMap<Value, usize> = match cross_block_use_counts {
         Some(total) => total,
         None => {
-            let mut local: HashMap<Value, usize> = HashMap::new();
+            let mut local: HashMap<Value, usize> = HashMap::default();
             for inst in instructions {
                 for a in &inst.args {
                     *local.entry(*a).or_insert(0) += 1;
@@ -452,13 +452,24 @@ fn push_idiom(
         }
     }
 
+    let skip_indices_local: Vec<usize> = {
+        let mut v = vec![sext_a_idx, sext_b_idx, wide_idx, sext_sum_idx, icmp_idx];
+        v.sort_unstable();
+        v
+    };
+
     // Decide whether the V flag can be consumed directly by a terminator
     // Brif (no CSET needed), or whether we must materialise it.
     //
     // Fast path requirements:
     //   * overflow has exactly one use, AND
     //   * that use is the block's terminator, AND
-    //   * the terminator is a Brif whose condition operand is `overflow`.
+    //   * the terminator is a Brif whose condition operand is `overflow`, AND
+    //   * every instruction between the narrow op and the terminator is one of
+    //     this idiom's skipped intermediates. The `ADDS`/`SUBS` V flag stays
+    //     live from the narrow op to the branch, and any other instruction
+    //     there may select to an NZCV writer (a compare, a `Select`, a bool
+    //     load's `TST`), which the deferred `B.VS` would then read instead.
     //
     // Otherwise, fall back to CSET after ADDS.
     let overflow_uses = use_count.get(&overflow).copied().unwrap_or(0);
@@ -469,13 +480,10 @@ fn push_idiom(
             _ => false,
         })
         .unwrap_or(false);
-    let needs_cset_fallback = !(overflow_uses == 1 && terminator_is_brif_on_overflow);
-
-    let skip_indices_local: Vec<usize> = {
-        let mut v = vec![sext_a_idx, sext_b_idx, wide_idx, sext_sum_idx, icmp_idx];
-        v.sort_unstable();
-        v
-    };
+    let flag_interval_is_idiom_only = (narrow_idx + 1..terminator_idx)
+        .all(|index| skip_indices_local.binary_search(&index).is_ok());
+    let needs_cset_fallback =
+        !(overflow_uses == 1 && terminator_is_brif_on_overflow && flag_interval_is_idiom_only);
 
     let idiom = OverflowIdiom {
         kind,
@@ -720,5 +728,75 @@ mod tests {
         ];
         let a = detect_overflow_idioms(&insts, None);
         assert!(a.overflow_idiom(&Value(7)).is_none());
+    }
+
+    /// The add idiom over `v0 + v1` (overflow `v7`), with `between` placed
+    /// after the compare and a `Brif` on the overflow bool ending the block.
+    fn add_idiom_then_brif(between: Vec<Instruction>) -> Vec<Instruction> {
+        let mut insts = vec![
+            mk(Opcode::Iadd, vec![Value(0), Value(1)], vec![Value(2)]),
+            sext_i64_to_i128(Value(0), Value(3)),
+            sext_i64_to_i128(Value(1), Value(4)),
+            mk(Opcode::Iadd, vec![Value(3), Value(4)], vec![Value(5)]),
+            sext_i64_to_i128(Value(2), Value(6)),
+            mk(
+                Opcode::Icmp {
+                    cond: IntCC::NotEqual,
+                },
+                vec![Value(6), Value(5)],
+                vec![Value(7)],
+            ),
+        ];
+        insts.extend(between);
+        insts.push(mk(
+            Opcode::Brif {
+                cond: Value(7),
+                then_dest: crate::instructions::Block(1),
+                else_dest: crate::instructions::Block(2),
+            },
+            vec![Value(7)],
+            vec![],
+        ));
+        insts
+    }
+
+    /// A single-use overflow bool that only the block's `Brif` reads, with
+    /// nothing but the idiom between the narrow op and the branch, defers
+    /// the V flag to a `B.VS`.
+    #[test]
+    fn brif_on_the_overflow_bool_defers_the_v_flag() {
+        let a = detect_overflow_idioms(&add_idiom_then_brif(vec![]), None);
+        let idiom = a.overflow_idiom(&Value(7)).expect("idiom detected");
+        assert!(!idiom.needs_cset_fallback);
+    }
+
+    /// Any other instruction between the narrow `ADDS` and the branch may
+    /// select to an NZCV writer (a compare's `CMP`, a bool load's `TST`), so
+    /// the V flag is materialized with `CSET VS` right after the `ADDS`
+    /// instead of being read by a `B.VS` after that writer.
+    #[test]
+    fn an_instruction_between_the_adds_and_the_branch_forces_the_cset() {
+        for between in [
+            mk(
+                Opcode::Icmp {
+                    cond: IntCC::SignedLessThan,
+                },
+                vec![Value(0), Value(1)],
+                vec![Value(8)],
+            ),
+            mk(
+                Opcode::Load {
+                    ty: Type::B1,
+                    align: None,
+                },
+                vec![Value(0)],
+                vec![Value(8)],
+            ),
+        ] {
+            let insts = add_idiom_then_brif(vec![between.clone()]);
+            let a = detect_overflow_idioms(&insts, None);
+            let idiom = a.overflow_idiom(&Value(7)).expect("idiom detected");
+            assert!(idiom.needs_cset_fallback, "{:?}", between.opcode);
+        }
     }
 }

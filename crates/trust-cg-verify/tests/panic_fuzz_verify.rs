@@ -6,9 +6,6 @@
 //
 // Part of #448 (#387 follow-up) / Part of #372 (Crash-free codegen).
 //
-// Reference: `designs/2026-04-18-crash-free-codegen-plan.md` §5 (proptest
-// as primary defense) and §6 (per-crate harness).
-//
 // Contract under test: `FunctionVerifier::verify` / `verify_function` must
 // either return a `FunctionVerificationReport` or raise a typed error — it
 // must NEVER panic, abort, or overflow on any `MachFunction` shape. The
@@ -21,9 +18,9 @@
 // `panic_fuzz_encode` so the generators share structure across crates.
 //
 // Run:
-//   cargo test -p trust-cg-verify --test panic_fuzz_verify
+//   scripts/trust_cargo.sh test -p trust-cg-verify --test panic_fuzz_verify
 // Increase case count via env:
-//   PROPTEST_CASES=100000 cargo test -p trust-cg-verify --test panic_fuzz_verify
+//   PROPTEST_CASES=100000 scripts/trust_cargo.sh test -p trust-cg-verify --test panic_fuzz_verify
 
 use proptest::prelude::*;
 use trust_cg_ir::function::{MachBlock, MachFunction, Signature, Type};
@@ -298,15 +295,51 @@ fn assert_no_panic(func: MachFunction) {
 // Properties
 // ---------------------------------------------------------------------------
 
+/// The case count every property in this file runs: PROPTEST_CASES, else 64.
+fn panic_fuzz_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64)
+}
+
+/// Positive control for the case count, as in `panic_fuzz_lower.rs`: a
+/// property with this file's case configuration counts the cases it actually
+/// ran and prints both figures on one line. The Linux floor requires the
+/// line with this file's default and the fuzz lane with its
+/// `--proptest-cases`, so a case count shrunk behind their back fails them.
+#[test]
+fn panic_fuzz_runs_its_configured_case_count() {
+    let configured = panic_fuzz_cases();
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: configured,
+        ..ProptestConfig::default()
+    });
+    let run = std::cell::Cell::new(0u32);
+    runner
+        .run(&any::<u64>(), |_| {
+            run.set(run.get() + 1);
+            Ok(())
+        })
+        .expect("the counting property cannot fail");
+    println!(
+        "panic-fuzz proptest cases: configured={configured} run={}",
+        run.get()
+    );
+    assert!(run.get() > 0, "no proptest case ran");
+    assert_eq!(
+        run.get(),
+        configured,
+        "proptest ran a different number of cases"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         // Verification walks the proof database on every instruction
         // with a proof mapping. 128 cases at ~10 insts × 4 blocks is
         // <30s locally; reduce via PROPTEST_CASES=32 while iterating.
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64),
+        cases: panic_fuzz_cases(),
         max_shrink_iters: 200,
         .. ProptestConfig::default()
     })]

@@ -34,6 +34,7 @@ fn func_ty(params: Vec<TrustIrTy>, returns: Vec<TrustIrTy>) -> FuncTy {
     FuncTy {
         params,
         returns,
+        abi: None,
         is_vararg: false,
     }
 }
@@ -54,8 +55,9 @@ fn add_v4i32_uniform_const_shift_function(
     count: i128,
 ) {
     let v4i32 = v4i32_ty();
-    let func_ty_id: FuncTyId =
-        module.add_func_type(func_ty(vec![TrustIrTy::Ptr, TrustIrTy::Ptr], vec![]));
+    let func_ty_id: FuncTyId = module
+        .add_func_type(func_ty(vec![TrustIrTy::Ptr, TrustIrTy::Ptr], vec![]))
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(func_id), name, func_ty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -94,7 +96,9 @@ fn add_v4i32_uniform_const_shift_function(
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_v4i32_uniform_const_shift_module() -> TrustIrModule {
@@ -104,7 +108,7 @@ fn build_v4i32_uniform_const_shift_module() -> TrustIrModule {
     for (suffix, op, _) in shift_cases() {
         for count in SHIFT_COUNTS {
             let name = format!("v4i32_{suffix}_imm_{count}");
-            add_v4i32_uniform_const_shift_function(&mut module, func_id, &name, op.clone(), count);
+            add_v4i32_uniform_const_shift_function(&mut module, func_id, &name, op, count);
             func_id += 1;
         }
     }
@@ -119,7 +123,7 @@ fn host_jit_o0_compiler() -> Compiler {
     // Unchecked mode explicitly.
     let mut config = CompilerConfig::for_host_jit_unchecked();
     config.opt_level = OptLevel::O0;
-    Compiler::new(config)
+    Compiler::new(config).with_codegen_license(permit_unlicensed())
 }
 
 fn metrics_for<'a>(result: &'a JitCompilationResult, name: &str) -> &'a FunctionQualityMetrics {
@@ -335,4 +339,13 @@ fn x86_v4i32_immediate_dword_shifts_use_sse2_host_jit() {
             );
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

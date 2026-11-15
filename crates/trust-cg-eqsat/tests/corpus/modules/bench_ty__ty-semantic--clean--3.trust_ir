@@ -1,0 +1,29 @@
+; TrustIr text format v1
+module "__ty_frontend_neutral_trust_ir_module"
+target "aarch64-apple-darwin" 8 little abi="darwinpcs"
+
+functy.0 = (ptr, ptr, i32) -> ()
+
+type ty.0 = i64
+
+fn @__ty_trust_ir_func_0(functy.0) {
+    ; #proof: deterministic, terminates, no_panic
+bb0(%0: ptr, %1: ptr, %2: i32):
+    %6 = const i32 2
+    %7 = gep i64, ptr %1, %6
+    %8 = load i64, ptr %7
+    %9 = const i64 0
+    %12 = icmp sge i64 %8, %9
+    %13 = zext bool %12 to i64
+    %16 = const i64 0
+    %17 = icmp ne i64 %13, %16
+    %18 = zext bool %17 to i64
+    %19 = const i64 0
+    %20 = gep i8, ptr %0, %19
+    %21 = const i8 0
+    store i8 %21, ptr %20
+    %22 = const i64 8
+    %23 = gep i8, ptr %0, %22
+    store i64 %18, ptr %23
+    ret
+}

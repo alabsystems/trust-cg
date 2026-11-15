@@ -1,0 +1,3364 @@
+; TrustIr text format v1
+module "__ty_frontend_neutral_trust_ir_module"
+target "aarch64-apple-darwin" 8 little abi="darwinpcs"
+
+functy.0 = (ptr, ptr, i32) -> ()
+
+functy.1 = (ptr, ptr, i32, ptr) -> (i64)
+
+functy.2 = (ptr, ptr, i32, ptr) -> (i64)
+
+functy.3 = (ptr, ptr, i32, ptr) -> (i64)
+
+functy.4 = (ptr, ptr, i32, ptr, i64) -> (i64)
+
+functy.5 = (ptr, ptr, i32, ptr, i64) -> (i64)
+
+functy.6 = (ptr, ptr, i32, ptr, i64) -> (i64)
+
+type ty.0 = i64
+
+fn @__ty_trust_ir_func_0(functy.0) {
+    ; #proof: deterministic, terminates
+bb0(%0: ptr, %1: ptr, %2: i32):
+    %3 = alloca i64
+    %4 = alloca i64
+    %5 = alloca i64
+    %6 = alloca i64
+    %7 = alloca i64
+    %8 = alloca i64
+    %9 = alloca i64
+    %10 = alloca i64
+    %11 = alloca i64
+    %12 = alloca i64
+    %13 = alloca i64
+    %14 = alloca i64
+    %15 = alloca i64
+    %16 = alloca i64
+    %17 = alloca i64
+    %18 = alloca i64
+    %19 = alloca i64
+    %20 = alloca i64
+    %21 = alloca i64
+    %22 = alloca i64
+    %23 = alloca i64
+    %24 = alloca i64
+    %25 = alloca i64
+    %26 = alloca i64
+    %27 = alloca i64
+    %28 = alloca i64
+    %29 = alloca i64
+    %30 = alloca i64
+    %31 = alloca i64
+    %32 = alloca i64
+    %33 = alloca i64
+    %34 = alloca i64
+    %35 = alloca i64
+    %36 = alloca i64
+    %37 = alloca i64
+    %38 = alloca i64
+    %39 = alloca i64
+    %40 = alloca i64
+    %41 = alloca i64
+    %42 = alloca i64
+    %43 = alloca i64
+    %44 = alloca i64
+    %45 = alloca i64
+    %46 = alloca i64
+    %47 = alloca i64
+    %48 = alloca i64
+    %49 = alloca i64
+    %50 = alloca i64
+    %51 = alloca i64
+    %52 = alloca i64
+    %53 = alloca i64
+    %54 = alloca i64
+    %55 = alloca i64
+    %56 = alloca i64
+    %57 = alloca i64
+    %58 = alloca i64
+    %59 = alloca i64
+    %60 = alloca i64
+    %61 = alloca i64
+    %62 = alloca i64
+    %63 = alloca i64
+    %64 = alloca i64
+    %65 = alloca i64
+    %66 = alloca i64
+    %67 = alloca i64
+    %68 = alloca i64
+    %69 = alloca i64
+    %70 = alloca i64
+    %71 = alloca i64
+    %72 = alloca i64
+    %73 = alloca i64
+    %74 = alloca i64
+    %75 = alloca i64
+    %76 = alloca i64
+    %77 = alloca i64
+    %78 = alloca i64
+    %79 = alloca i64
+    %80 = alloca i64
+    %81 = alloca i64
+    %82 = alloca i64
+    %83 = alloca i64
+    %84 = alloca i64
+    %85 = alloca i64
+    %86 = alloca i64
+    %87 = alloca i64
+    %88 = alloca i64
+    %89 = alloca i64
+    %90 = alloca i64
+    %91 = alloca i64
+    %92 = alloca i64
+    %93 = alloca i64
+    %94 = alloca i64
+    %95 = alloca i64
+    %96 = alloca i64
+    %97 = alloca i64
+    %98 = alloca i64
+    %99 = alloca i64
+    %100 = alloca i64
+    %101 = alloca i64
+    %102 = alloca i64
+    %103 = alloca i64
+    %104 = alloca i64
+    %105 = alloca i64
+    %106 = alloca i64
+    %107 = alloca i64
+    %108 = alloca i64
+    %109 = alloca i64
+    %110 = alloca i64
+    %111 = alloca i64
+    %112 = alloca i64
+    %113 = alloca i64
+    %114 = alloca i64
+    %115 = alloca i64
+    %116 = alloca i64
+    %117 = alloca i64
+    %118 = alloca i64
+    %119 = alloca i64
+    %120 = alloca i64
+    %121 = alloca i64
+    %122 = alloca i64
+    %123 = alloca i64
+    %124 = alloca i64
+    %125 = alloca i64
+    %126 = alloca i64
+    %127 = alloca i64
+    %128 = alloca i64
+    %129 = alloca i64
+    %130 = alloca i64
+    %131 = alloca i64
+    %132 = alloca i64
+    %133 = alloca i64
+    %134 = alloca i64
+    %135 = alloca i64
+    %136 = alloca i64
+    %137 = alloca i64
+    %138 = alloca i64
+    %139 = alloca i64
+    %140 = alloca i64
+    %141 = alloca i64
+    %142 = alloca i64
+    %143 = alloca i64
+    %144 = alloca i64
+    %145 = alloca i64
+    %146 = alloca i64
+    %147 = alloca i64
+    %148 = alloca i64
+    %149 = alloca i64
+    %150 = alloca i64
+    %151 = alloca i64
+    %152 = alloca i64
+    %153 = alloca i64
+    %154 = alloca i64
+    %155 = alloca i64
+    %156 = alloca i64
+    %157 = alloca i64
+    %158 = alloca i64
+    %159 = alloca i64
+    %160 = alloca i64
+    %161 = alloca i64
+    %162 = alloca i64
+    %163 = alloca i64
+    %164 = alloca i64
+    %165 = alloca i64
+    %166 = const i32 0
+    %167 = gep i64, ptr %1, %166
+    %168 = load i64, ptr %167
+    store i64 %168, ptr %3
+    %169 = const i64 0
+    store i64 %169, ptr %4
+    %170 = const i64 6
+    store i64 %170, ptr %5
+    %171 = load i64, ptr %4
+    %172 = load i64, ptr %5
+    %173 = icmp slt i64 %172, %171
+    condbr %173, bb77, bb78
+bb1:
+    %217 = const i32 1
+    %218 = gep i64, ptr %1, %217
+    %219 = load i64, ptr %218
+    store i64 %219, ptr %9
+    %220 = const i64 0
+    store i64 %220, ptr %10
+    %221 = const i64 6
+    store i64 %221, ptr %11
+    %222 = load i64, ptr %10
+    %223 = load i64, ptr %11
+    %224 = icmp slt i64 %223, %222
+    condbr %224, bb86, bb87
+bb2:
+    %265 = load i64, ptr %8
+    store i64 %265, ptr %14
+    %266 = load i64, ptr %14
+    %267 = const i64 0
+    %268 = icmp ne i64 %266, %267
+    condbr %268, bb3, bb4
+bb3:
+    %269 = const i32 9
+    %270 = gep i64, ptr %1, %269
+    %271 = load i64, ptr %270
+    store i64 %271, ptr %15
+    %272 = const i32 7
+    %273 = alloca i64, %272
+    %274 = const i64 0
+    %275 = gep i8, ptr %0, %274
+    %276 = const i8 0
+    store i8 %276, ptr %275
+    %277 = call @func.1(%0, %1, %2, %273)
+    %278 = load i8, ptr %275
+    %279 = icmp eq i8 %278, %276
+    store i64 %277, ptr %17
+    condbr %279, bb95, bb96
+bb4:
+    %291 = load i64, ptr %14
+    store i64 %291, ptr %20
+    %292 = load i64, ptr %20
+    %293 = const i64 0
+    %294 = icmp ne i64 %292, %293
+    condbr %294, bb5, bb10
+bb5:
+    %295 = const i32 0
+    %296 = gep i64, ptr %1, %295
+    %297 = load i64, ptr %296
+    store i64 %297, ptr %21
+    %298 = const i64 0
+    store i64 %298, ptr %22
+    %299 = load i64, ptr %21
+    %300 = load i64, ptr %22
+    %301 = icmp sgt i64 %299, %300
+    %302 = zext bool %301 to i64
+    store i64 %302, ptr %23
+    %303 = const i64 1
+    store i64 %303, ptr %24
+    %304 = load i64, ptr %23
+    %305 = const i64 0
+    %306 = icmp ne i64 %304, %305
+    condbr %306, bb6, bb9
+bb6:
+    %307 = const i32 7
+    %308 = alloca i64, %307
+    %309 = const i64 6
+    %310 = const i32 0
+    %311 = gep i64, ptr %308, %310
+    store i64 %309, ptr %311
+    %312 = const i64 1
+    %313 = const i32 1
+    %314 = gep i64, ptr %308, %313
+    store i64 %312, ptr %314
+    %315 = const i64 2
+    %316 = const i32 2
+    %317 = gep i64, ptr %308, %316
+    store i64 %315, ptr %317
+    %318 = const i64 3
+    %319 = const i32 3
+    %320 = gep i64, ptr %308, %319
+    store i64 %318, ptr %320
+    %321 = const i64 4
+    %322 = const i32 4
+    %323 = gep i64, ptr %308, %322
+    store i64 %321, ptr %323
+    %324 = const i64 5
+    %325 = const i32 5
+    %326 = gep i64, ptr %308, %325
+    store i64 %324, ptr %326
+    %327 = const i64 6
+    %328 = const i32 6
+    %329 = gep i64, ptr %308, %328
+    store i64 %327, ptr %329
+    %330 = ptrtoint ptr %308 to i64
+    store i64 %330, ptr %25
+    %331 = const i64 0
+    store i64 %331, ptr %26
+    %332 = load i64, ptr %25
+    %333 = inttoptr i64 %332 to ptr
+    %334 = const i32 0
+    %335 = gep i64, ptr %333, %334
+    %336 = load i64, ptr %335
+    %337 = alloca i64
+    %338 = const i64 0
+    store i64 %338, ptr %337
+    br bb97
+bb7:
+    %347 = const i32 3
+    %348 = gep i64, ptr %1, %347
+    %349 = load i64, ptr %348
+    store i64 %349, ptr %28
+    %350 = load i64, ptr %27
+    %351 = const i64 1
+    %352 = const i64 6
+    %353 = icmp sge i64 %350, %351
+    condbr %353, bb99, bb101
+bb8:
+    %396 = load i64, ptr %26
+    store i64 %396, ptr %24
+    br bb9
+bb9:
+    %397 = load i64, ptr %24
+    store i64 %397, ptr %20
+    br bb10
+bb10:
+    %398 = load i64, ptr %20
+    store i64 %398, ptr %32
+    %399 = load i64, ptr %32
+    %400 = const i64 0
+    %401 = icmp ne i64 %399, %400
+    condbr %401, bb11, bb16
+bb11:
+    %402 = const i32 1
+    %403 = gep i64, ptr %1, %402
+    %404 = load i64, ptr %403
+    store i64 %404, ptr %33
+    %405 = const i64 0
+    store i64 %405, ptr %34
+    %406 = load i64, ptr %33
+    %407 = load i64, ptr %34
+    %408 = icmp sgt i64 %406, %407
+    %409 = zext bool %408 to i64
+    store i64 %409, ptr %35
+    %410 = const i64 1
+    store i64 %410, ptr %36
+    %411 = load i64, ptr %35
+    %412 = const i64 0
+    %413 = icmp ne i64 %411, %412
+    condbr %413, bb12, bb15
+bb12:
+    %414 = const i32 7
+    %415 = alloca i64, %414
+    %416 = const i64 6
+    %417 = const i32 0
+    %418 = gep i64, ptr %415, %417
+    store i64 %416, ptr %418
+    %419 = const i64 1
+    %420 = const i32 1
+    %421 = gep i64, ptr %415, %420
+    store i64 %419, ptr %421
+    %422 = const i64 2
+    %423 = const i32 2
+    %424 = gep i64, ptr %415, %423
+    store i64 %422, ptr %424
+    %425 = const i64 3
+    %426 = const i32 3
+    %427 = gep i64, ptr %415, %426
+    store i64 %425, ptr %427
+    %428 = const i64 4
+    %429 = const i32 4
+    %430 = gep i64, ptr %415, %429
+    store i64 %428, ptr %430
+    %431 = const i64 5
+    %432 = const i32 5
+    %433 = gep i64, ptr %415, %432
+    store i64 %431, ptr %433
+    %434 = const i64 6
+    %435 = const i32 6
+    %436 = gep i64, ptr %415, %435
+    store i64 %434, ptr %436
+    %437 = ptrtoint ptr %415 to i64
+    store i64 %437, ptr %37
+    %438 = const i64 0
+    store i64 %438, ptr %38
+    %439 = load i64, ptr %37
+    %440 = inttoptr i64 %439 to ptr
+    %441 = const i32 0
+    %442 = gep i64, ptr %440, %441
+    %443 = load i64, ptr %442
+    %444 = alloca i64
+    %445 = const i64 0
+    store i64 %445, ptr %444
+    br bb105
+bb13:
+    %454 = const i32 3
+    %455 = gep i64, ptr %1, %454
+    %456 = load i64, ptr %455
+    store i64 %456, ptr %40
+    %457 = load i64, ptr %39
+    %458 = const i64 1
+    %459 = const i64 6
+    %460 = icmp sge i64 %457, %458
+    condbr %460, bb107, bb109
+bb14:
+    %503 = load i64, ptr %38
+    store i64 %503, ptr %36
+    br bb15
+bb15:
+    %504 = load i64, ptr %36
+    store i64 %504, ptr %32
+    br bb16
+bb16:
+    %505 = load i64, ptr %32
+    store i64 %505, ptr %44
+    %506 = load i64, ptr %44
+    %507 = const i64 0
+    %508 = icmp ne i64 %506, %507
+    condbr %508, bb17, bb20
+bb17:
+    %509 = const i32 0
+    %510 = gep i64, ptr %1, %509
+    %511 = load i64, ptr %510
+    store i64 %511, ptr %45
+    %512 = const i64 0
+    store i64 %512, ptr %46
+    %513 = load i64, ptr %45
+    %514 = load i64, ptr %46
+    %515 = icmp eq i64 %513, %514
+    %516 = zext bool %515 to i64
+    store i64 %516, ptr %47
+    %517 = load i64, ptr %47
+    store i64 %517, ptr %48
+    %518 = load i64, ptr %48
+    %519 = const i64 0
+    %520 = icmp ne i64 %518, %519
+    condbr %520, bb19, bb18
+bb18:
+    %521 = const i32 1
+    %522 = gep i64, ptr %1, %521
+    %523 = load i64, ptr %522
+    store i64 %523, ptr %49
+    %524 = const i64 0
+    store i64 %524, ptr %50
+    %525 = load i64, ptr %49
+    %526 = load i64, ptr %50
+    %527 = icmp eq i64 %525, %526
+    %528 = zext bool %527 to i64
+    store i64 %528, ptr %51
+    %529 = load i64, ptr %51
+    store i64 %529, ptr %48
+    br bb19
+bb19:
+    %530 = load i64, ptr %48
+    store i64 %530, ptr %44
+    br bb20
+bb20:
+    %531 = load i64, ptr %44
+    store i64 %531, ptr %52
+    %532 = load i64, ptr %52
+    %533 = const i64 0
+    %534 = icmp ne i64 %532, %533
+    condbr %534, bb21, bb28
+bb21:
+    %535 = const i32 7
+    %536 = alloca i64, %535
+    %537 = const i64 6
+    %538 = const i32 0
+    %539 = gep i64, ptr %536, %538
+    store i64 %537, ptr %539
+    %540 = const i64 1
+    %541 = const i32 1
+    %542 = gep i64, ptr %536, %541
+    store i64 %540, ptr %542
+    %543 = const i64 2
+    %544 = const i32 2
+    %545 = gep i64, ptr %536, %544
+    store i64 %543, ptr %545
+    %546 = const i64 3
+    %547 = const i32 3
+    %548 = gep i64, ptr %536, %547
+    store i64 %546, ptr %548
+    %549 = const i64 4
+    %550 = const i32 4
+    %551 = gep i64, ptr %536, %550
+    store i64 %549, ptr %551
+    %552 = const i64 5
+    %553 = const i32 5
+    %554 = gep i64, ptr %536, %553
+    store i64 %552, ptr %554
+    %555 = const i64 6
+    %556 = const i32 6
+    %557 = gep i64, ptr %536, %556
+    store i64 %555, ptr %557
+    %558 = ptrtoint ptr %536 to i64
+    store i64 %558, ptr %53
+    %559 = const i64 0
+    store i64 %559, ptr %54
+    %560 = load i64, ptr %53
+    %561 = inttoptr i64 %560 to ptr
+    %562 = const i32 0
+    %563 = gep i64, ptr %561, %562
+    %564 = load i64, ptr %563
+    %565 = alloca i64
+    %566 = const i64 0
+    store i64 %566, ptr %565
+    br bb113
+bb22:
+    %575 = const i32 3
+    %576 = gep i64, ptr %1, %575
+    %577 = load i64, ptr %576
+    store i64 %577, ptr %56
+    %578 = load i64, ptr %55
+    %579 = const i64 1
+    %580 = const i64 6
+    %581 = icmp sge i64 %578, %579
+    condbr %581, bb115, bb117
+bb23:
+    %645 = const i64 1
+    store i64 %645, ptr %60
+    %646 = load i64, ptr %54
+    %647 = const i64 0
+    %648 = icmp ne i64 %646, %647
+    condbr %648, bb24, bb27
+bb24:
+    %649 = const i32 7
+    %650 = alloca i64, %649
+    %651 = const i64 6
+    %652 = const i32 0
+    %653 = gep i64, ptr %650, %652
+    store i64 %651, ptr %653
+    %654 = const i64 1
+    %655 = const i32 1
+    %656 = gep i64, ptr %650, %655
+    store i64 %654, ptr %656
+    %657 = const i64 2
+    %658 = const i32 2
+    %659 = gep i64, ptr %650, %658
+    store i64 %657, ptr %659
+    %660 = const i64 3
+    %661 = const i32 3
+    %662 = gep i64, ptr %650, %661
+    store i64 %660, ptr %662
+    %663 = const i64 4
+    %664 = const i32 4
+    %665 = gep i64, ptr %650, %664
+    store i64 %663, ptr %665
+    %666 = const i64 5
+    %667 = const i32 5
+    %668 = gep i64, ptr %650, %667
+    store i64 %666, ptr %668
+    %669 = const i64 6
+    %670 = const i32 6
+    %671 = gep i64, ptr %650, %670
+    store i64 %669, ptr %671
+    %672 = ptrtoint ptr %650 to i64
+    store i64 %672, ptr %61
+    %673 = const i64 0
+    store i64 %673, ptr %62
+    %674 = load i64, ptr %61
+    %675 = inttoptr i64 %674 to ptr
+    %676 = const i32 0
+    %677 = gep i64, ptr %675, %676
+    %678 = load i64, ptr %677
+    %679 = alloca i64
+    %680 = const i64 0
+    store i64 %680, ptr %679
+    br bb121
+bb25:
+    %689 = const i32 3
+    %690 = gep i64, ptr %1, %689
+    %691 = load i64, ptr %690
+    store i64 %691, ptr %64
+    %692 = load i64, ptr %63
+    %693 = const i64 1
+    %694 = const i64 6
+    %695 = icmp sge i64 %692, %693
+    condbr %695, bb123, bb125
+bb26:
+    %752 = load i64, ptr %62
+    %753 = const i64 0
+    %754 = icmp eq i64 %752, %753
+    %755 = zext bool %754 to i64
+    store i64 %755, ptr %68
+    %756 = load i64, ptr %68
+    store i64 %756, ptr %60
+    br bb27
+bb27:
+    %757 = load i64, ptr %60
+    store i64 %757, ptr %52
+    br bb28
+bb28:
+    %758 = load i64, ptr %52
+    store i64 %758, ptr %69
+    %759 = load i64, ptr %69
+    %760 = const i64 0
+    %761 = icmp ne i64 %759, %760
+    condbr %761, bb29, bb36
+bb29:
+    %762 = const i32 7
+    %763 = alloca i64, %762
+    %764 = const i64 6
+    %765 = const i32 0
+    %766 = gep i64, ptr %763, %765
+    store i64 %764, ptr %766
+    %767 = const i64 1
+    %768 = const i32 1
+    %769 = gep i64, ptr %763, %768
+    store i64 %767, ptr %769
+    %770 = const i64 2
+    %771 = const i32 2
+    %772 = gep i64, ptr %763, %771
+    store i64 %770, ptr %772
+    %773 = const i64 3
+    %774 = const i32 3
+    %775 = gep i64, ptr %763, %774
+    store i64 %773, ptr %775
+    %776 = const i64 4
+    %777 = const i32 4
+    %778 = gep i64, ptr %763, %777
+    store i64 %776, ptr %778
+    %779 = const i64 5
+    %780 = const i32 5
+    %781 = gep i64, ptr %763, %780
+    store i64 %779, ptr %781
+    %782 = const i64 6
+    %783 = const i32 6
+    %784 = gep i64, ptr %763, %783
+    store i64 %782, ptr %784
+    %785 = ptrtoint ptr %763 to i64
+    store i64 %785, ptr %70
+    %786 = const i64 0
+    store i64 %786, ptr %71
+    %787 = load i64, ptr %70
+    %788 = inttoptr i64 %787 to ptr
+    %789 = const i32 0
+    %790 = gep i64, ptr %788, %789
+    %791 = load i64, ptr %790
+    %792 = alloca i64
+    %793 = const i64 0
+    store i64 %793, ptr %792
+    br bb129
+bb30:
+    %802 = const i32 3
+    %803 = gep i64, ptr %1, %802
+    %804 = load i64, ptr %803
+    store i64 %804, ptr %73
+    %805 = load i64, ptr %72
+    %806 = const i64 1
+    %807 = const i64 6
+    %808 = icmp sge i64 %805, %806
+    condbr %808, bb131, bb133
+bb31:
+    %865 = const i64 1
+    store i64 %865, ptr %77
+    %866 = load i64, ptr %71
+    %867 = const i64 0
+    %868 = icmp ne i64 %866, %867
+    condbr %868, bb32, bb35
+bb32:
+    %869 = const i32 7
+    %870 = alloca i64, %869
+    %871 = const i64 6
+    %872 = const i32 0
+    %873 = gep i64, ptr %870, %872
+    store i64 %871, ptr %873
+    %874 = const i64 1
+    %875 = const i32 1
+    %876 = gep i64, ptr %870, %875
+    store i64 %874, ptr %876
+    %877 = const i64 2
+    %878 = const i32 2
+    %879 = gep i64, ptr %870, %878
+    store i64 %877, ptr %879
+    %880 = const i64 3
+    %881 = const i32 3
+    %882 = gep i64, ptr %870, %881
+    store i64 %880, ptr %882
+    %883 = const i64 4
+    %884 = const i32 4
+    %885 = gep i64, ptr %870, %884
+    store i64 %883, ptr %885
+    %886 = const i64 5
+    %887 = const i32 5
+    %888 = gep i64, ptr %870, %887
+    store i64 %886, ptr %888
+    %889 = const i64 6
+    %890 = const i32 6
+    %891 = gep i64, ptr %870, %890
+    store i64 %889, ptr %891
+    %892 = ptrtoint ptr %870 to i64
+    store i64 %892, ptr %78
+    %893 = const i64 0
+    store i64 %893, ptr %79
+    %894 = load i64, ptr %78
+    %895 = inttoptr i64 %894 to ptr
+    %896 = const i32 0
+    %897 = gep i64, ptr %895, %896
+    %898 = load i64, ptr %897
+    %899 = alloca i64
+    %900 = const i64 0
+    store i64 %900, ptr %899
+    br bb137
+bb33:
+    %909 = const i32 3
+    %910 = gep i64, ptr %1, %909
+    %911 = load i64, ptr %910
+    store i64 %911, ptr %81
+    %912 = load i64, ptr %80
+    %913 = const i64 1
+    %914 = const i64 6
+    %915 = icmp sge i64 %912, %913
+    condbr %915, bb139, bb141
+bb34:
+    %979 = load i64, ptr %79
+    %980 = const i64 0
+    %981 = icmp eq i64 %979, %980
+    %982 = zext bool %981 to i64
+    store i64 %982, ptr %85
+    %983 = load i64, ptr %85
+    store i64 %983, ptr %77
+    br bb35
+bb35:
+    %984 = load i64, ptr %77
+    store i64 %984, ptr %69
+    br bb36
+bb36:
+    %985 = load i64, ptr %69
+    store i64 %985, ptr %86
+    %986 = load i64, ptr %86
+    %987 = const i64 0
+    %988 = icmp ne i64 %986, %987
+    condbr %988, bb37, bb38
+bb37:
+    %989 = const i32 0
+    %990 = gep i64, ptr %1, %989
+    %991 = load i64, ptr %990
+    store i64 %991, ptr %87
+    %992 = const i32 7
+    %993 = alloca i64, %992
+    %994 = const i64 0
+    %995 = gep i8, ptr %0, %994
+    %996 = const i8 0
+    store i8 %996, ptr %995
+    %997 = call @func.2(%0, %1, %2, %993)
+    %998 = load i8, ptr %995
+    %999 = icmp eq i8 %998, %996
+    store i64 %997, ptr %89
+    condbr %999, bb145, bb146
+bb38:
+    %1011 = load i64, ptr %86
+    store i64 %1011, ptr %92
+    %1012 = load i64, ptr %92
+    %1013 = const i64 0
+    %1014 = icmp ne i64 %1012, %1013
+    condbr %1014, bb39, bb44
+bb39:
+    %1015 = const i32 7
+    %1016 = alloca i64, %1015
+    %1017 = const i64 6
+    %1018 = const i32 0
+    %1019 = gep i64, ptr %1016, %1018
+    store i64 %1017, ptr %1019
+    %1020 = const i64 1
+    %1021 = const i32 1
+    %1022 = gep i64, ptr %1016, %1021
+    store i64 %1020, ptr %1022
+    %1023 = const i64 2
+    %1024 = const i32 2
+    %1025 = gep i64, ptr %1016, %1024
+    store i64 %1023, ptr %1025
+    %1026 = const i64 3
+    %1027 = const i32 3
+    %1028 = gep i64, ptr %1016, %1027
+    store i64 %1026, ptr %1028
+    %1029 = const i64 4
+    %1030 = const i32 4
+    %1031 = gep i64, ptr %1016, %1030
+    store i64 %1029, ptr %1031
+    %1032 = const i64 5
+    %1033 = const i32 5
+    %1034 = gep i64, ptr %1016, %1033
+    store i64 %1032, ptr %1034
+    %1035 = const i64 6
+    %1036 = const i32 6
+    %1037 = gep i64, ptr %1016, %1036
+    store i64 %1035, ptr %1037
+    %1038 = ptrtoint ptr %1016 to i64
+    store i64 %1038, ptr %93
+    %1039 = const i64 0
+    store i64 %1039, ptr %94
+    %1040 = load i64, ptr %93
+    %1041 = inttoptr i64 %1040 to ptr
+    %1042 = const i32 0
+    %1043 = gep i64, ptr %1041, %1042
+    %1044 = load i64, ptr %1043
+    %1045 = alloca i64
+    %1046 = const i64 0
+    store i64 %1046, ptr %1045
+    br bb147
+bb40:
+    %1055 = const i32 3
+    %1056 = gep i64, ptr %1, %1055
+    %1057 = load i64, ptr %1056
+    store i64 %1057, ptr %96
+    %1058 = load i64, ptr %95
+    %1059 = const i64 1
+    %1060 = const i64 6
+    %1061 = icmp sge i64 %1058, %1059
+    condbr %1061, bb149, bb151
+bb41:
+    %1125 = const i64 1
+    store i64 %1125, ptr %100
+    %1126 = load i64, ptr %94
+    %1127 = const i64 0
+    %1128 = icmp ne i64 %1126, %1127
+    condbr %1128, bb42, bb43
+bb42:
+    %1129 = const i32 0
+    %1130 = gep i64, ptr %1, %1129
+    %1131 = load i64, ptr %1130
+    store i64 %1131, ptr %101
+    %1132 = const i64 0
+    store i64 %1132, ptr %102
+    %1133 = load i64, ptr %101
+    %1134 = load i64, ptr %102
+    %1135 = icmp eq i64 %1133, %1134
+    %1136 = zext bool %1135 to i64
+    store i64 %1136, ptr %103
+    %1137 = load i64, ptr %103
+    store i64 %1137, ptr %100
+    br bb43
+bb43:
+    %1138 = load i64, ptr %100
+    store i64 %1138, ptr %92
+    br bb44
+bb44:
+    %1139 = load i64, ptr %92
+    store i64 %1139, ptr %104
+    %1140 = load i64, ptr %104
+    %1141 = const i64 0
+    %1142 = icmp ne i64 %1140, %1141
+    condbr %1142, bb45, bb56
+bb45:
+    %1143 = const i32 7
+    %1144 = alloca i64, %1143
+    %1145 = const i64 6
+    %1146 = const i32 0
+    %1147 = gep i64, ptr %1144, %1146
+    store i64 %1145, ptr %1147
+    %1148 = const i64 1
+    %1149 = const i32 1
+    %1150 = gep i64, ptr %1144, %1149
+    store i64 %1148, ptr %1150
+    %1151 = const i64 2
+    %1152 = const i32 2
+    %1153 = gep i64, ptr %1144, %1152
+    store i64 %1151, ptr %1153
+    %1154 = const i64 3
+    %1155 = const i32 3
+    %1156 = gep i64, ptr %1144, %1155
+    store i64 %1154, ptr %1156
+    %1157 = const i64 4
+    %1158 = const i32 4
+    %1159 = gep i64, ptr %1144, %1158
+    store i64 %1157, ptr %1159
+    %1160 = const i64 5
+    %1161 = const i32 5
+    %1162 = gep i64, ptr %1144, %1161
+    store i64 %1160, ptr %1162
+    %1163 = const i64 6
+    %1164 = const i32 6
+    %1165 = gep i64, ptr %1144, %1164
+    store i64 %1163, ptr %1165
+    %1166 = ptrtoint ptr %1144 to i64
+    store i64 %1166, ptr %105
+    %1167 = const i64 1
+    store i64 %1167, ptr %106
+    %1168 = load i64, ptr %105
+    %1169 = inttoptr i64 %1168 to ptr
+    %1170 = const i32 0
+    %1171 = gep i64, ptr %1169, %1170
+    %1172 = load i64, ptr %1171
+    %1173 = alloca i64
+    %1174 = const i64 0
+    store i64 %1174, ptr %1173
+    br bb155
+bb46:
+    %1183 = const i32 3
+    %1184 = gep i64, ptr %1, %1183
+    %1185 = load i64, ptr %1184
+    store i64 %1185, ptr %108
+    %1186 = load i64, ptr %107
+    %1187 = const i64 1
+    %1188 = const i64 6
+    %1189 = icmp sge i64 %1186, %1187
+    condbr %1189, bb157, bb159
+bb47:
+    %1212 = const i32 9
+    %1213 = gep i64, ptr %1, %1212
+    %1214 = load i64, ptr %1213
+    store i64 %1214, ptr %113
+    %1215 = const i64 6
+    store i64 %1215, ptr %114
+    %1216 = load i64, ptr %113
+    %1217 = load i64, ptr %114
+    %1218 = icmp eq i64 %1216, %1217
+    %1219 = zext bool %1218 to i64
+    store i64 %1219, ptr %115
+    %1220 = load i64, ptr %115
+    store i64 %1220, ptr %116
+    %1221 = load i64, ptr %116
+    %1222 = const i64 0
+    %1223 = icmp ne i64 %1221, %1222
+    condbr %1223, bb48, bb53
+bb48:
+    %1224 = const i32 7
+    %1225 = alloca i64, %1224
+    %1226 = const i64 6
+    %1227 = const i32 0
+    %1228 = gep i64, ptr %1225, %1227
+    store i64 %1226, ptr %1228
+    %1229 = const i64 1
+    %1230 = const i32 1
+    %1231 = gep i64, ptr %1225, %1230
+    store i64 %1229, ptr %1231
+    %1232 = const i64 2
+    %1233 = const i32 2
+    %1234 = gep i64, ptr %1225, %1233
+    store i64 %1232, ptr %1234
+    %1235 = const i64 3
+    %1236 = const i32 3
+    %1237 = gep i64, ptr %1225, %1236
+    store i64 %1235, ptr %1237
+    %1238 = const i64 4
+    %1239 = const i32 4
+    %1240 = gep i64, ptr %1225, %1239
+    store i64 %1238, ptr %1240
+    %1241 = const i64 5
+    %1242 = const i32 5
+    %1243 = gep i64, ptr %1225, %1242
+    store i64 %1241, ptr %1243
+    %1244 = const i64 6
+    %1245 = const i32 6
+    %1246 = gep i64, ptr %1225, %1245
+    store i64 %1244, ptr %1246
+    %1247 = ptrtoint ptr %1225 to i64
+    store i64 %1247, ptr %117
+    %1248 = const i64 1
+    store i64 %1248, ptr %118
+    %1249 = load i64, ptr %117
+    %1250 = inttoptr i64 %1249 to ptr
+    %1251 = const i32 0
+    %1252 = gep i64, ptr %1250, %1251
+    %1253 = load i64, ptr %1252
+    %1254 = alloca i64
+    %1255 = const i64 0
+    store i64 %1255, ptr %1254
+    br bb161
+bb49:
+    %1264 = load i64, ptr %107
+    %1265 = load i64, ptr %119
+    %1266 = icmp ne i64 %1264, %1265
+    %1267 = zext bool %1266 to i64
+    store i64 %1267, ptr %120
+    %1268 = const i64 1
+    store i64 %1268, ptr %121
+    %1269 = load i64, ptr %120
+    %1270 = const i64 0
+    %1271 = icmp ne i64 %1269, %1270
+    condbr %1271, bb50, bb51
+bb50:
+    %1272 = const i32 3
+    %1273 = gep i64, ptr %1, %1272
+    %1274 = load i64, ptr %1273
+    store i64 %1274, ptr %122
+    %1275 = load i64, ptr %119
+    %1276 = const i64 1
+    %1277 = const i64 6
+    %1278 = icmp sge i64 %1275, %1276
+    condbr %1278, bb163, bb165
+bb51:
+    %1298 = load i64, ptr %121
+    %1299 = const i64 0
+    %1300 = icmp eq i64 %1298, %1299
+    condbr %1300, bb167, bb168
+bb52:
+    %1305 = load i64, ptr %118
+    store i64 %1305, ptr %116
+    br bb53
+bb53:
+    %1306 = load i64, ptr %116
+    store i64 %1306, ptr %112
+    br bb54
+bb54:
+    %1307 = load i64, ptr %112
+    %1308 = const i64 0
+    %1309 = icmp eq i64 %1307, %1308
+    condbr %1309, bb169, bb170
+bb55:
+    %1314 = load i64, ptr %106
+    store i64 %1314, ptr %104
+    br bb56
+bb56:
+    %1315 = load i64, ptr %104
+    store i64 %1315, ptr %126
+    %1316 = load i64, ptr %126
+    %1317 = const i64 0
+    %1318 = icmp ne i64 %1316, %1317
+    condbr %1318, bb57, bb58
+bb57:
+    %1319 = const i32 1
+    %1320 = gep i64, ptr %1, %1319
+    %1321 = load i64, ptr %1320
+    store i64 %1321, ptr %127
+    %1322 = const i32 7
+    %1323 = alloca i64, %1322
+    %1324 = const i64 0
+    %1325 = gep i8, ptr %0, %1324
+    %1326 = const i8 0
+    store i8 %1326, ptr %1325
+    %1327 = call @func.3(%0, %1, %2, %1323)
+    %1328 = load i8, ptr %1325
+    %1329 = icmp eq i8 %1328, %1326
+    store i64 %1327, ptr %129
+    condbr %1329, bb171, bb172
+bb58:
+    %1341 = load i64, ptr %126
+    store i64 %1341, ptr %132
+    %1342 = load i64, ptr %132
+    %1343 = const i64 0
+    %1344 = icmp ne i64 %1342, %1343
+    condbr %1344, bb59, bb64
+bb59:
+    %1345 = const i32 7
+    %1346 = alloca i64, %1345
+    %1347 = const i64 6
+    %1348 = const i32 0
+    %1349 = gep i64, ptr %1346, %1348
+    store i64 %1347, ptr %1349
+    %1350 = const i64 1
+    %1351 = const i32 1
+    %1352 = gep i64, ptr %1346, %1351
+    store i64 %1350, ptr %1352
+    %1353 = const i64 2
+    %1354 = const i32 2
+    %1355 = gep i64, ptr %1346, %1354
+    store i64 %1353, ptr %1355
+    %1356 = const i64 3
+    %1357 = const i32 3
+    %1358 = gep i64, ptr %1346, %1357
+    store i64 %1356, ptr %1358
+    %1359 = const i64 4
+    %1360 = const i32 4
+    %1361 = gep i64, ptr %1346, %1360
+    store i64 %1359, ptr %1361
+    %1362 = const i64 5
+    %1363 = const i32 5
+    %1364 = gep i64, ptr %1346, %1363
+    store i64 %1362, ptr %1364
+    %1365 = const i64 6
+    %1366 = const i32 6
+    %1367 = gep i64, ptr %1346, %1366
+    store i64 %1365, ptr %1367
+    %1368 = ptrtoint ptr %1346 to i64
+    store i64 %1368, ptr %133
+    %1369 = const i64 0
+    store i64 %1369, ptr %134
+    %1370 = load i64, ptr %133
+    %1371 = inttoptr i64 %1370 to ptr
+    %1372 = const i32 0
+    %1373 = gep i64, ptr %1371, %1372
+    %1374 = load i64, ptr %1373
+    %1375 = alloca i64
+    %1376 = const i64 0
+    store i64 %1376, ptr %1375
+    br bb173
+bb60:
+    %1385 = const i32 3
+    %1386 = gep i64, ptr %1, %1385
+    %1387 = load i64, ptr %1386
+    store i64 %1387, ptr %136
+    %1388 = load i64, ptr %135
+    %1389 = const i64 1
+    %1390 = const i64 6
+    %1391 = icmp sge i64 %1388, %1389
+    condbr %1391, bb175, bb177
+bb61:
+    %1448 = const i64 1
+    store i64 %1448, ptr %140
+    %1449 = load i64, ptr %134
+    %1450 = const i64 0
+    %1451 = icmp ne i64 %1449, %1450
+    condbr %1451, bb62, bb63
+bb62:
+    %1452 = const i32 1
+    %1453 = gep i64, ptr %1, %1452
+    %1454 = load i64, ptr %1453
+    store i64 %1454, ptr %141
+    %1455 = const i64 0
+    store i64 %1455, ptr %142
+    %1456 = load i64, ptr %141
+    %1457 = load i64, ptr %142
+    %1458 = icmp eq i64 %1456, %1457
+    %1459 = zext bool %1458 to i64
+    store i64 %1459, ptr %143
+    %1460 = load i64, ptr %143
+    store i64 %1460, ptr %140
+    br bb63
+bb63:
+    %1461 = load i64, ptr %140
+    store i64 %1461, ptr %132
+    br bb64
+bb64:
+    %1462 = load i64, ptr %132
+    store i64 %1462, ptr %144
+    %1463 = load i64, ptr %144
+    %1464 = const i64 0
+    %1465 = icmp ne i64 %1463, %1464
+    condbr %1465, bb65, bb76
+bb65:
+    %1466 = const i32 7
+    %1467 = alloca i64, %1466
+    %1468 = const i64 6
+    %1469 = const i32 0
+    %1470 = gep i64, ptr %1467, %1469
+    store i64 %1468, ptr %1470
+    %1471 = const i64 1
+    %1472 = const i32 1
+    %1473 = gep i64, ptr %1467, %1472
+    store i64 %1471, ptr %1473
+    %1474 = const i64 2
+    %1475 = const i32 2
+    %1476 = gep i64, ptr %1467, %1475
+    store i64 %1474, ptr %1476
+    %1477 = const i64 3
+    %1478 = const i32 3
+    %1479 = gep i64, ptr %1467, %1478
+    store i64 %1477, ptr %1479
+    %1480 = const i64 4
+    %1481 = const i32 4
+    %1482 = gep i64, ptr %1467, %1481
+    store i64 %1480, ptr %1482
+    %1483 = const i64 5
+    %1484 = const i32 5
+    %1485 = gep i64, ptr %1467, %1484
+    store i64 %1483, ptr %1485
+    %1486 = const i64 6
+    %1487 = const i32 6
+    %1488 = gep i64, ptr %1467, %1487
+    store i64 %1486, ptr %1488
+    %1489 = ptrtoint ptr %1467 to i64
+    store i64 %1489, ptr %145
+    %1490 = const i64 1
+    store i64 %1490, ptr %146
+    %1491 = load i64, ptr %145
+    %1492 = inttoptr i64 %1491 to ptr
+    %1493 = const i32 0
+    %1494 = gep i64, ptr %1492, %1493
+    %1495 = load i64, ptr %1494
+    %1496 = alloca i64
+    %1497 = const i64 0
+    store i64 %1497, ptr %1496
+    br bb181
+bb66:
+    %1506 = const i32 3
+    %1507 = gep i64, ptr %1, %1506
+    %1508 = load i64, ptr %1507
+    store i64 %1508, ptr %148
+    %1509 = load i64, ptr %147
+    %1510 = const i64 1
+    %1511 = const i64 6
+    %1512 = icmp sge i64 %1509, %1510
+    condbr %1512, bb183, bb185
+bb67:
+    %1535 = const i32 9
+    %1536 = gep i64, ptr %1, %1535
+    %1537 = load i64, ptr %1536
+    store i64 %1537, ptr %153
+    %1538 = const i64 0
+    store i64 %1538, ptr %154
+    %1539 = load i64, ptr %153
+    %1540 = load i64, ptr %154
+    %1541 = icmp eq i64 %1539, %1540
+    %1542 = zext bool %1541 to i64
+    store i64 %1542, ptr %155
+    %1543 = load i64, ptr %155
+    store i64 %1543, ptr %156
+    %1544 = load i64, ptr %156
+    %1545 = const i64 0
+    %1546 = icmp ne i64 %1544, %1545
+    condbr %1546, bb68, bb73
+bb68:
+    %1547 = const i32 7
+    %1548 = alloca i64, %1547
+    %1549 = const i64 6
+    %1550 = const i32 0
+    %1551 = gep i64, ptr %1548, %1550
+    store i64 %1549, ptr %1551
+    %1552 = const i64 1
+    %1553 = const i32 1
+    %1554 = gep i64, ptr %1548, %1553
+    store i64 %1552, ptr %1554
+    %1555 = const i64 2
+    %1556 = const i32 2
+    %1557 = gep i64, ptr %1548, %1556
+    store i64 %1555, ptr %1557
+    %1558 = const i64 3
+    %1559 = const i32 3
+    %1560 = gep i64, ptr %1548, %1559
+    store i64 %1558, ptr %1560
+    %1561 = const i64 4
+    %1562 = const i32 4
+    %1563 = gep i64, ptr %1548, %1562
+    store i64 %1561, ptr %1563
+    %1564 = const i64 5
+    %1565 = const i32 5
+    %1566 = gep i64, ptr %1548, %1565
+    store i64 %1564, ptr %1566
+    %1567 = const i64 6
+    %1568 = const i32 6
+    %1569 = gep i64, ptr %1548, %1568
+    store i64 %1567, ptr %1569
+    %1570 = ptrtoint ptr %1548 to i64
+    store i64 %1570, ptr %157
+    %1571 = const i64 1
+    store i64 %1571, ptr %158
+    %1572 = load i64, ptr %157
+    %1573 = inttoptr i64 %1572 to ptr
+    %1574 = const i32 0
+    %1575 = gep i64, ptr %1573, %1574
+    %1576 = load i64, ptr %1575
+    %1577 = alloca i64
+    %1578 = const i64 0
+    store i64 %1578, ptr %1577
+    br bb187
+bb69:
+    %1587 = load i64, ptr %147
+    %1588 = load i64, ptr %159
+    %1589 = icmp ne i64 %1587, %1588
+    %1590 = zext bool %1589 to i64
+    store i64 %1590, ptr %160
+    %1591 = const i64 1
+    store i64 %1591, ptr %161
+    %1592 = load i64, ptr %160
+    %1593 = const i64 0
+    %1594 = icmp ne i64 %1592, %1593
+    condbr %1594, bb70, bb71
+bb70:
+    %1595 = const i32 3
+    %1596 = gep i64, ptr %1, %1595
+    %1597 = load i64, ptr %1596
+    store i64 %1597, ptr %162
+    %1598 = load i64, ptr %159
+    %1599 = const i64 1
+    %1600 = const i64 6
+    %1601 = icmp sge i64 %1598, %1599
+    condbr %1601, bb189, bb191
+bb71:
+    %1621 = load i64, ptr %161
+    %1622 = const i64 0
+    %1623 = icmp eq i64 %1621, %1622
+    condbr %1623, bb193, bb194
+bb72:
+    %1628 = load i64, ptr %158
+    store i64 %1628, ptr %156
+    br bb73
+bb73:
+    %1629 = load i64, ptr %156
+    store i64 %1629, ptr %152
+    br bb74
+bb74:
+    %1630 = load i64, ptr %152
+    %1631 = const i64 0
+    %1632 = icmp eq i64 %1630, %1631
+    condbr %1632, bb195, bb196
+bb75:
+    %1637 = load i64, ptr %146
+    store i64 %1637, ptr %144
+    br bb76
+bb76:
+    %1638 = load i64, ptr %144
+    store i64 %1638, ptr %3
+    %1639 = load i64, ptr %3
+    %1640 = const i64 0
+    %1641 = icmp ne i64 %1639, %1640
+    %1642 = zext bool %1641 to i64
+    %1643 = const i64 0
+    %1644 = gep i8, ptr %0, %1643
+    %1645 = const i8 0
+    store i8 %1645, ptr %1644
+    %1646 = const i64 8
+    %1647 = gep i8, ptr %0, %1646
+    store i64 %1642, ptr %1647
+    ret
+bb77:
+    %174 = const i64 0
+    %175 = const i32 1
+    %176 = alloca i64, %175
+    %177 = const i32 0
+    %178 = gep i64, ptr %176, %177
+    store i64 %174, ptr %178
+    %179 = ptrtoint ptr %176 to i64
+    store i64 %179, ptr %6
+    br bb79
+bb78:
+    %180, %181 = sub.overflow i64 %172, %171
+    condbr %181, bb80, bb81
+bb79:
+    %205 = load i64, ptr %3
+    %206 = const i64 0
+    %207 = const i64 6
+    %208 = icmp sge i64 %205, %206
+    %209 = icmp sle i64 %205, %207
+    %210 = zext bool %208 to i64
+    %211 = zext bool %209 to i64
+    %212 = and i64 %210, %211
+    store i64 %212, ptr %7
+    %213 = load i64, ptr %7
+    store i64 %213, ptr %8
+    %214 = load i64, ptr %8
+    %215 = const i64 0
+    %216 = icmp ne i64 %214, %215
+    condbr %216, bb1, bb2
+bb80:
+    %184 = const i64 0
+    %185 = gep i8, ptr %0, %184
+    %186 = const i8 2
+    store i8 %186, ptr %185
+    ret
+bb81:
+    %182 = const i64 2147483645
+    %183 = icmp sle i64 %180, %182
+    condbr %183, bb82, bb80
+bb82:
+    %187 = const i64 1
+    %188 = add i64 %180, %187
+    %189 = add i64 %188, %187
+    %190 = const i32 8
+    %191 = alloca i64, %190
+    %192 = const i32 0
+    %193 = gep i64, ptr %191, %192
+    store i64 %188, ptr %193
+    %194 = const i64 0
+    %195 = alloca i64
+    store i64 %194, ptr %195
+    br bb83
+bb83:
+    %196 = load i64, ptr %195
+    %197 = icmp slt i64 %196, %188
+    condbr %197, bb84, bb85
+bb84:
+    %198 = load i64, ptr %195
+    %199 = add i64 %171, %198
+    %200 = add i64 %198, %187
+    %201 = trunc i64 %200 to i32
+    %202 = gep i64, ptr %191, %201
+    store i64 %199, ptr %202
+    %203 = add i64 %198, %187
+    store i64 %203, ptr %195
+    br bb83
+bb85:
+    %204 = ptrtoint ptr %191 to i64
+    store i64 %204, ptr %6
+    br bb79
+bb86:
+    %225 = const i64 0
+    %226 = const i32 1
+    %227 = alloca i64, %226
+    %228 = const i32 0
+    %229 = gep i64, ptr %227, %228
+    store i64 %225, ptr %229
+    %230 = ptrtoint ptr %227 to i64
+    store i64 %230, ptr %12
+    br bb88
+bb87:
+    %231, %232 = sub.overflow i64 %223, %222
+    condbr %232, bb89, bb90
+bb88:
+    %256 = load i64, ptr %9
+    %257 = const i64 0
+    %258 = const i64 6
+    %259 = icmp sge i64 %256, %257
+    %260 = icmp sle i64 %256, %258
+    %261 = zext bool %259 to i64
+    %262 = zext bool %260 to i64
+    %263 = and i64 %261, %262
+    store i64 %263, ptr %13
+    %264 = load i64, ptr %13
+    store i64 %264, ptr %8
+    br bb2
+bb89:
+    %235 = const i64 0
+    %236 = gep i8, ptr %0, %235
+    %237 = const i8 2
+    store i8 %237, ptr %236
+    ret
+bb90:
+    %233 = const i64 2147483645
+    %234 = icmp sle i64 %231, %233
+    condbr %234, bb91, bb89
+bb91:
+    %238 = const i64 1
+    %239 = add i64 %231, %238
+    %240 = add i64 %239, %238
+    %241 = const i32 8
+    %242 = alloca i64, %241
+    %243 = const i32 0
+    %244 = gep i64, ptr %242, %243
+    store i64 %239, ptr %244
+    %245 = const i64 0
+    %246 = alloca i64
+    store i64 %245, ptr %246
+    br bb92
+bb92:
+    %247 = load i64, ptr %246
+    %248 = icmp slt i64 %247, %239
+    condbr %248, bb93, bb94
+bb93:
+    %249 = load i64, ptr %246
+    %250 = add i64 %222, %249
+    %251 = add i64 %249, %238
+    %252 = trunc i64 %251 to i32
+    %253 = gep i64, ptr %242, %252
+    store i64 %250, ptr %253
+    %254 = add i64 %249, %238
+    store i64 %254, ptr %246
+    br bb92
+bb94:
+    %255 = ptrtoint ptr %242 to i64
+    store i64 %255, ptr %12
+    br bb88
+bb95:
+    %280 = load i64, ptr %17
+    store i64 %280, ptr %16
+    %281 = load i64, ptr %16
+    %282 = inttoptr i64 %281 to ptr
+    %283 = const i32 0
+    %284 = gep i64, ptr %282, %283
+    %285 = load i64, ptr %284
+    store i64 %285, ptr %18
+    %286 = load i64, ptr %15
+    %287 = load i64, ptr %18
+    %288 = icmp eq i64 %286, %287
+    %289 = zext bool %288 to i64
+    store i64 %289, ptr %19
+    %290 = load i64, ptr %19
+    store i64 %290, ptr %14
+    br bb4
+bb96:
+    ret
+bb97:
+    %339 = load i64, ptr %337
+    %340 = icmp slt i64 %339, %336
+    condbr %340, bb98, bb8  ; #proof: bounded_loop(6)
+bb98:
+    %341 = load i64, ptr %337
+    %342 = const i64 1
+    %343 = add i64 %341, %342
+    %344 = trunc i64 %343 to i32
+    %345 = gep i64, ptr %333, %344
+    %346 = load i64, ptr %345
+    store i64 %346, ptr %27
+    br bb7
+bb99:
+    %354 = icmp sle i64 %350, %352
+    condbr %354, bb100, bb101
+bb100:
+    %355 = sub i64 %350, %351
+    %356 = const i64 3
+    %357 = add i64 %356, %355
+    %358 = trunc i64 %357 to i32
+    %359 = gep i64, ptr %1, %358
+    %360 = load i64, ptr %359
+    store i64 %360, ptr %29
+    br bb102
+bb101:
+    %361 = const i64 0
+    %362 = gep i8, ptr %0, %361
+    %363 = const i8 1
+    store i8 %363, ptr %362
+    %364 = const i64 16
+    %365 = gep i8, ptr %0, %364
+    %366 = const i8 3
+    store i8 %366, ptr %365
+    ret
+bb102:
+    %367 = const i32 3
+    %368 = alloca i64, %367
+    %369 = const i64 2
+    %370 = const i32 0
+    %371 = gep i64, ptr %368, %370
+    store i64 %369, ptr %371
+    %372 = const i64 61
+    %373 = const i32 1
+    %374 = gep i64, ptr %368, %373
+    store i64 %372, ptr %374
+    %375 = const i64 60
+    %376 = const i32 2
+    %377 = gep i64, ptr %368, %376
+    store i64 %375, ptr %377
+    %378 = ptrtoint ptr %368 to i64
+    store i64 %378, ptr %30
+    %379 = load i64, ptr %29
+    %380 = const i64 0
+    %381 = const i64 61
+    %382 = icmp eq i64 %379, %381
+    %383 = zext bool %382 to i64
+    %384 = or i64 %380, %383
+    %385 = const i64 60
+    %386 = icmp eq i64 %379, %385
+    %387 = zext bool %386 to i64
+    %388 = or i64 %384, %387
+    store i64 %388, ptr %31
+    %389 = load i64, ptr %31
+    %390 = const i64 0
+    %391 = icmp ne i64 %389, %390
+    condbr %391, bb103, bb104
+bb103:
+    %392 = const i64 1
+    store i64 %392, ptr %26
+    br bb8
+bb104:
+    %393 = load i64, ptr %337
+    %394 = const i64 1
+    %395 = add i64 %393, %394
+    store i64 %395, ptr %337
+    br bb97
+bb105:
+    %446 = load i64, ptr %444
+    %447 = icmp slt i64 %446, %443
+    condbr %447, bb106, bb14  ; #proof: bounded_loop(6)
+bb106:
+    %448 = load i64, ptr %444
+    %449 = const i64 1
+    %450 = add i64 %448, %449
+    %451 = trunc i64 %450 to i32
+    %452 = gep i64, ptr %440, %451
+    %453 = load i64, ptr %452
+    store i64 %453, ptr %39
+    br bb13
+bb107:
+    %461 = icmp sle i64 %457, %459
+    condbr %461, bb108, bb109
+bb108:
+    %462 = sub i64 %457, %458
+    %463 = const i64 3
+    %464 = add i64 %463, %462
+    %465 = trunc i64 %464 to i32
+    %466 = gep i64, ptr %1, %465
+    %467 = load i64, ptr %466
+    store i64 %467, ptr %41
+    br bb110
+bb109:
+    %468 = const i64 0
+    %469 = gep i8, ptr %0, %468
+    %470 = const i8 1
+    store i8 %470, ptr %469
+    %471 = const i64 16
+    %472 = gep i8, ptr %0, %471
+    %473 = const i8 3
+    store i8 %473, ptr %472
+    ret
+bb110:
+    %474 = const i32 3
+    %475 = alloca i64, %474
+    %476 = const i64 2
+    %477 = const i32 0
+    %478 = gep i64, ptr %475, %477
+    store i64 %476, ptr %478
+    %479 = const i64 64
+    %480 = const i32 1
+    %481 = gep i64, ptr %475, %480
+    store i64 %479, ptr %481
+    %482 = const i64 63
+    %483 = const i32 2
+    %484 = gep i64, ptr %475, %483
+    store i64 %482, ptr %484
+    %485 = ptrtoint ptr %475 to i64
+    store i64 %485, ptr %42
+    %486 = load i64, ptr %41
+    %487 = const i64 0
+    %488 = const i64 64
+    %489 = icmp eq i64 %486, %488
+    %490 = zext bool %489 to i64
+    %491 = or i64 %487, %490
+    %492 = const i64 63
+    %493 = icmp eq i64 %486, %492
+    %494 = zext bool %493 to i64
+    %495 = or i64 %491, %494
+    store i64 %495, ptr %43
+    %496 = load i64, ptr %43
+    %497 = const i64 0
+    %498 = icmp ne i64 %496, %497
+    condbr %498, bb111, bb112
+bb111:
+    %499 = const i64 1
+    store i64 %499, ptr %38
+    br bb14
+bb112:
+    %500 = load i64, ptr %444
+    %501 = const i64 1
+    %502 = add i64 %500, %501
+    store i64 %502, ptr %444
+    br bb105
+bb113:
+    %567 = load i64, ptr %565
+    %568 = icmp slt i64 %567, %564
+    condbr %568, bb114, bb23  ; #proof: bounded_loop(6)
+bb114:
+    %569 = load i64, ptr %565
+    %570 = const i64 1
+    %571 = add i64 %569, %570
+    %572 = trunc i64 %571 to i32
+    %573 = gep i64, ptr %561, %572
+    %574 = load i64, ptr %573
+    store i64 %574, ptr %55
+    br bb22
+bb115:
+    %582 = icmp sle i64 %578, %580
+    condbr %582, bb116, bb117
+bb116:
+    %583 = sub i64 %578, %579
+    %584 = const i64 3
+    %585 = add i64 %584, %583
+    %586 = trunc i64 %585 to i32
+    %587 = gep i64, ptr %1, %586
+    %588 = load i64, ptr %587
+    store i64 %588, ptr %57
+    br bb118
+bb117:
+    %589 = const i64 0
+    %590 = gep i8, ptr %0, %589
+    %591 = const i8 1
+    store i8 %591, ptr %590
+    %592 = const i64 16
+    %593 = gep i8, ptr %0, %592
+    %594 = const i8 3
+    store i8 %594, ptr %593
+    ret
+bb118:
+    %595 = const i32 6
+    %596 = alloca i64, %595
+    %597 = const i64 5
+    %598 = const i32 0
+    %599 = gep i64, ptr %596, %598
+    store i64 %597, ptr %599
+    %600 = const i64 57
+    %601 = const i32 1
+    %602 = gep i64, ptr %596, %601
+    store i64 %600, ptr %602
+    %603 = const i64 68
+    %604 = const i32 2
+    %605 = gep i64, ptr %596, %604
+    store i64 %603, ptr %605
+    %606 = const i64 56
+    %607 = const i32 3
+    %608 = gep i64, ptr %596, %607
+    store i64 %606, ptr %608
+    %609 = const i64 66
+    %610 = const i32 4
+    %611 = gep i64, ptr %596, %610
+    store i64 %609, ptr %611
+    %612 = const i64 65
+    %613 = const i32 5
+    %614 = gep i64, ptr %596, %613
+    store i64 %612, ptr %614
+    %615 = ptrtoint ptr %596 to i64
+    store i64 %615, ptr %58
+    %616 = load i64, ptr %57
+    %617 = const i64 0
+    %618 = const i64 57
+    %619 = icmp eq i64 %616, %618
+    %620 = zext bool %619 to i64
+    %621 = or i64 %617, %620
+    %622 = const i64 68
+    %623 = icmp eq i64 %616, %622
+    %624 = zext bool %623 to i64
+    %625 = or i64 %621, %624
+    %626 = const i64 56
+    %627 = icmp eq i64 %616, %626
+    %628 = zext bool %627 to i64
+    %629 = or i64 %625, %628
+    %630 = const i64 66
+    %631 = icmp eq i64 %616, %630
+    %632 = zext bool %631 to i64
+    %633 = or i64 %629, %632
+    %634 = const i64 65
+    %635 = icmp eq i64 %616, %634
+    %636 = zext bool %635 to i64
+    %637 = or i64 %633, %636
+    store i64 %637, ptr %59
+    %638 = load i64, ptr %59
+    %639 = const i64 0
+    %640 = icmp ne i64 %638, %639
+    condbr %640, bb119, bb120
+bb119:
+    %641 = const i64 1
+    store i64 %641, ptr %54
+    br bb23
+bb120:
+    %642 = load i64, ptr %565
+    %643 = const i64 1
+    %644 = add i64 %642, %643
+    store i64 %644, ptr %565
+    br bb113
+bb121:
+    %681 = load i64, ptr %679
+    %682 = icmp slt i64 %681, %678
+    condbr %682, bb122, bb26  ; #proof: bounded_loop(6)
+bb122:
+    %683 = load i64, ptr %679
+    %684 = const i64 1
+    %685 = add i64 %683, %684
+    %686 = trunc i64 %685 to i32
+    %687 = gep i64, ptr %675, %686
+    %688 = load i64, ptr %687
+    store i64 %688, ptr %63
+    br bb25
+bb123:
+    %696 = icmp sle i64 %692, %694
+    condbr %696, bb124, bb125
+bb124:
+    %697 = sub i64 %692, %693
+    %698 = const i64 3
+    %699 = add i64 %698, %697
+    %700 = trunc i64 %699 to i32
+    %701 = gep i64, ptr %1, %700
+    %702 = load i64, ptr %701
+    store i64 %702, ptr %65
+    br bb126
+bb125:
+    %703 = const i64 0
+    %704 = gep i8, ptr %0, %703
+    %705 = const i8 1
+    store i8 %705, ptr %704
+    %706 = const i64 16
+    %707 = gep i8, ptr %0, %706
+    %708 = const i8 3
+    store i8 %708, ptr %707
+    ret
+bb126:
+    %709 = const i32 5
+    %710 = alloca i64, %709
+    %711 = const i64 4
+    %712 = const i32 0
+    %713 = gep i64, ptr %710, %712
+    store i64 %711, ptr %713
+    %714 = const i64 62
+    %715 = const i32 1
+    %716 = gep i64, ptr %710, %715
+    store i64 %714, ptr %716
+    %717 = const i64 58
+    %718 = const i32 2
+    %719 = gep i64, ptr %710, %718
+    store i64 %717, ptr %719
+    %720 = const i64 67
+    %721 = const i32 3
+    %722 = gep i64, ptr %710, %721
+    store i64 %720, ptr %722
+    %723 = const i64 59
+    %724 = const i32 4
+    %725 = gep i64, ptr %710, %724
+    store i64 %723, ptr %725
+    %726 = ptrtoint ptr %710 to i64
+    store i64 %726, ptr %66
+    %727 = load i64, ptr %65
+    %728 = const i64 0
+    %729 = const i64 62
+    %730 = icmp eq i64 %727, %729
+    %731 = zext bool %730 to i64
+    %732 = or i64 %728, %731
+    %733 = const i64 58
+    %734 = icmp eq i64 %727, %733
+    %735 = zext bool %734 to i64
+    %736 = or i64 %732, %735
+    %737 = const i64 67
+    %738 = icmp eq i64 %727, %737
+    %739 = zext bool %738 to i64
+    %740 = or i64 %736, %739
+    %741 = const i64 59
+    %742 = icmp eq i64 %727, %741
+    %743 = zext bool %742 to i64
+    %744 = or i64 %740, %743
+    store i64 %744, ptr %67
+    %745 = load i64, ptr %67
+    %746 = const i64 0
+    %747 = icmp ne i64 %745, %746
+    condbr %747, bb127, bb128
+bb127:
+    %748 = const i64 1
+    store i64 %748, ptr %62
+    br bb26
+bb128:
+    %749 = load i64, ptr %679
+    %750 = const i64 1
+    %751 = add i64 %749, %750
+    store i64 %751, ptr %679
+    br bb121
+bb129:
+    %794 = load i64, ptr %792
+    %795 = icmp slt i64 %794, %791
+    condbr %795, bb130, bb31  ; #proof: bounded_loop(6)
+bb130:
+    %796 = load i64, ptr %792
+    %797 = const i64 1
+    %798 = add i64 %796, %797
+    %799 = trunc i64 %798 to i32
+    %800 = gep i64, ptr %788, %799
+    %801 = load i64, ptr %800
+    store i64 %801, ptr %72
+    br bb30
+bb131:
+    %809 = icmp sle i64 %805, %807
+    condbr %809, bb132, bb133
+bb132:
+    %810 = sub i64 %805, %806
+    %811 = const i64 3
+    %812 = add i64 %811, %810
+    %813 = trunc i64 %812 to i32
+    %814 = gep i64, ptr %1, %813
+    %815 = load i64, ptr %814
+    store i64 %815, ptr %74
+    br bb134
+bb133:
+    %816 = const i64 0
+    %817 = gep i8, ptr %0, %816
+    %818 = const i8 1
+    store i8 %818, ptr %817
+    %819 = const i64 16
+    %820 = gep i8, ptr %0, %819
+    %821 = const i8 3
+    store i8 %821, ptr %820
+    ret
+bb134:
+    %822 = const i32 5
+    %823 = alloca i64, %822
+    %824 = const i64 4
+    %825 = const i32 0
+    %826 = gep i64, ptr %823, %825
+    store i64 %824, ptr %826
+    %827 = const i64 62
+    %828 = const i32 1
+    %829 = gep i64, ptr %823, %828
+    store i64 %827, ptr %829
+    %830 = const i64 58
+    %831 = const i32 2
+    %832 = gep i64, ptr %823, %831
+    store i64 %830, ptr %832
+    %833 = const i64 67
+    %834 = const i32 3
+    %835 = gep i64, ptr %823, %834
+    store i64 %833, ptr %835
+    %836 = const i64 59
+    %837 = const i32 4
+    %838 = gep i64, ptr %823, %837
+    store i64 %836, ptr %838
+    %839 = ptrtoint ptr %823 to i64
+    store i64 %839, ptr %75
+    %840 = load i64, ptr %74
+    %841 = const i64 0
+    %842 = const i64 62
+    %843 = icmp eq i64 %840, %842
+    %844 = zext bool %843 to i64
+    %845 = or i64 %841, %844
+    %846 = const i64 58
+    %847 = icmp eq i64 %840, %846
+    %848 = zext bool %847 to i64
+    %849 = or i64 %845, %848
+    %850 = const i64 67
+    %851 = icmp eq i64 %840, %850
+    %852 = zext bool %851 to i64
+    %853 = or i64 %849, %852
+    %854 = const i64 59
+    %855 = icmp eq i64 %840, %854
+    %856 = zext bool %855 to i64
+    %857 = or i64 %853, %856
+    store i64 %857, ptr %76
+    %858 = load i64, ptr %76
+    %859 = const i64 0
+    %860 = icmp ne i64 %858, %859
+    condbr %860, bb135, bb136
+bb135:
+    %861 = const i64 1
+    store i64 %861, ptr %71
+    br bb31
+bb136:
+    %862 = load i64, ptr %792
+    %863 = const i64 1
+    %864 = add i64 %862, %863
+    store i64 %864, ptr %792
+    br bb129
+bb137:
+    %901 = load i64, ptr %899
+    %902 = icmp slt i64 %901, %898
+    condbr %902, bb138, bb34  ; #proof: bounded_loop(6)
+bb138:
+    %903 = load i64, ptr %899
+    %904 = const i64 1
+    %905 = add i64 %903, %904
+    %906 = trunc i64 %905 to i32
+    %907 = gep i64, ptr %895, %906
+    %908 = load i64, ptr %907
+    store i64 %908, ptr %80
+    br bb33
+bb139:
+    %916 = icmp sle i64 %912, %914
+    condbr %916, bb140, bb141
+bb140:
+    %917 = sub i64 %912, %913
+    %918 = const i64 3
+    %919 = add i64 %918, %917
+    %920 = trunc i64 %919 to i32
+    %921 = gep i64, ptr %1, %920
+    %922 = load i64, ptr %921
+    store i64 %922, ptr %82
+    br bb142
+bb141:
+    %923 = const i64 0
+    %924 = gep i8, ptr %0, %923
+    %925 = const i8 1
+    store i8 %925, ptr %924
+    %926 = const i64 16
+    %927 = gep i8, ptr %0, %926
+    %928 = const i8 3
+    store i8 %928, ptr %927
+    ret
+bb142:
+    %929 = const i32 6
+    %930 = alloca i64, %929
+    %931 = const i64 5
+    %932 = const i32 0
+    %933 = gep i64, ptr %930, %932
+    store i64 %931, ptr %933
+    %934 = const i64 57
+    %935 = const i32 1
+    %936 = gep i64, ptr %930, %935
+    store i64 %934, ptr %936
+    %937 = const i64 68
+    %938 = const i32 2
+    %939 = gep i64, ptr %930, %938
+    store i64 %937, ptr %939
+    %940 = const i64 56
+    %941 = const i32 3
+    %942 = gep i64, ptr %930, %941
+    store i64 %940, ptr %942
+    %943 = const i64 66
+    %944 = const i32 4
+    %945 = gep i64, ptr %930, %944
+    store i64 %943, ptr %945
+    %946 = const i64 65
+    %947 = const i32 5
+    %948 = gep i64, ptr %930, %947
+    store i64 %946, ptr %948
+    %949 = ptrtoint ptr %930 to i64
+    store i64 %949, ptr %83
+    %950 = load i64, ptr %82
+    %951 = const i64 0
+    %952 = const i64 57
+    %953 = icmp eq i64 %950, %952
+    %954 = zext bool %953 to i64
+    %955 = or i64 %951, %954
+    %956 = const i64 68
+    %957 = icmp eq i64 %950, %956
+    %958 = zext bool %957 to i64
+    %959 = or i64 %955, %958
+    %960 = const i64 56
+    %961 = icmp eq i64 %950, %960
+    %962 = zext bool %961 to i64
+    %963 = or i64 %959, %962
+    %964 = const i64 66
+    %965 = icmp eq i64 %950, %964
+    %966 = zext bool %965 to i64
+    %967 = or i64 %963, %966
+    %968 = const i64 65
+    %969 = icmp eq i64 %950, %968
+    %970 = zext bool %969 to i64
+    %971 = or i64 %967, %970
+    store i64 %971, ptr %84
+    %972 = load i64, ptr %84
+    %973 = const i64 0
+    %974 = icmp ne i64 %972, %973
+    condbr %974, bb143, bb144
+bb143:
+    %975 = const i64 1
+    store i64 %975, ptr %79
+    br bb34
+bb144:
+    %976 = load i64, ptr %899
+    %977 = const i64 1
+    %978 = add i64 %976, %977
+    store i64 %978, ptr %899
+    br bb137
+bb145:
+    %1000 = load i64, ptr %89
+    store i64 %1000, ptr %88
+    %1001 = load i64, ptr %88
+    %1002 = inttoptr i64 %1001 to ptr
+    %1003 = const i32 0
+    %1004 = gep i64, ptr %1002, %1003
+    %1005 = load i64, ptr %1004
+    store i64 %1005, ptr %90
+    %1006 = load i64, ptr %87
+    %1007 = load i64, ptr %90
+    %1008 = icmp sle i64 %1006, %1007
+    %1009 = zext bool %1008 to i64
+    store i64 %1009, ptr %91
+    %1010 = load i64, ptr %91
+    store i64 %1010, ptr %86
+    br bb38
+bb146:
+    ret
+bb147:
+    %1047 = load i64, ptr %1045
+    %1048 = icmp slt i64 %1047, %1044
+    condbr %1048, bb148, bb41  ; #proof: bounded_loop(6)
+bb148:
+    %1049 = load i64, ptr %1045
+    %1050 = const i64 1
+    %1051 = add i64 %1049, %1050
+    %1052 = trunc i64 %1051 to i32
+    %1053 = gep i64, ptr %1041, %1052
+    %1054 = load i64, ptr %1053
+    store i64 %1054, ptr %95
+    br bb40
+bb149:
+    %1062 = icmp sle i64 %1058, %1060
+    condbr %1062, bb150, bb151
+bb150:
+    %1063 = sub i64 %1058, %1059
+    %1064 = const i64 3
+    %1065 = add i64 %1064, %1063
+    %1066 = trunc i64 %1065 to i32
+    %1067 = gep i64, ptr %1, %1066
+    %1068 = load i64, ptr %1067
+    store i64 %1068, ptr %97
+    br bb152
+bb151:
+    %1069 = const i64 0
+    %1070 = gep i8, ptr %0, %1069
+    %1071 = const i8 1
+    store i8 %1071, ptr %1070
+    %1072 = const i64 16
+    %1073 = gep i8, ptr %0, %1072
+    %1074 = const i8 3
+    store i8 %1074, ptr %1073
+    ret
+bb152:
+    %1075 = const i32 6
+    %1076 = alloca i64, %1075
+    %1077 = const i64 5
+    %1078 = const i32 0
+    %1079 = gep i64, ptr %1076, %1078
+    store i64 %1077, ptr %1079
+    %1080 = const i64 57
+    %1081 = const i32 1
+    %1082 = gep i64, ptr %1076, %1081
+    store i64 %1080, ptr %1082
+    %1083 = const i64 68
+    %1084 = const i32 2
+    %1085 = gep i64, ptr %1076, %1084
+    store i64 %1083, ptr %1085
+    %1086 = const i64 56
+    %1087 = const i32 3
+    %1088 = gep i64, ptr %1076, %1087
+    store i64 %1086, ptr %1088
+    %1089 = const i64 66
+    %1090 = const i32 4
+    %1091 = gep i64, ptr %1076, %1090
+    store i64 %1089, ptr %1091
+    %1092 = const i64 65
+    %1093 = const i32 5
+    %1094 = gep i64, ptr %1076, %1093
+    store i64 %1092, ptr %1094
+    %1095 = ptrtoint ptr %1076 to i64
+    store i64 %1095, ptr %98
+    %1096 = load i64, ptr %97
+    %1097 = const i64 0
+    %1098 = const i64 57
+    %1099 = icmp eq i64 %1096, %1098
+    %1100 = zext bool %1099 to i64
+    %1101 = or i64 %1097, %1100
+    %1102 = const i64 68
+    %1103 = icmp eq i64 %1096, %1102
+    %1104 = zext bool %1103 to i64
+    %1105 = or i64 %1101, %1104
+    %1106 = const i64 56
+    %1107 = icmp eq i64 %1096, %1106
+    %1108 = zext bool %1107 to i64
+    %1109 = or i64 %1105, %1108
+    %1110 = const i64 66
+    %1111 = icmp eq i64 %1096, %1110
+    %1112 = zext bool %1111 to i64
+    %1113 = or i64 %1109, %1112
+    %1114 = const i64 65
+    %1115 = icmp eq i64 %1096, %1114
+    %1116 = zext bool %1115 to i64
+    %1117 = or i64 %1113, %1116
+    store i64 %1117, ptr %99
+    %1118 = load i64, ptr %99
+    %1119 = const i64 0
+    %1120 = icmp ne i64 %1118, %1119
+    condbr %1120, bb153, bb154
+bb153:
+    %1121 = const i64 1
+    store i64 %1121, ptr %94
+    br bb41
+bb154:
+    %1122 = load i64, ptr %1045
+    %1123 = const i64 1
+    %1124 = add i64 %1122, %1123
+    store i64 %1124, ptr %1045
+    br bb147
+bb155:
+    %1175 = load i64, ptr %1173
+    %1176 = icmp slt i64 %1175, %1172
+    condbr %1176, bb156, bb55  ; #proof: bounded_loop(6)
+bb156:
+    %1177 = load i64, ptr %1173
+    %1178 = const i64 1
+    %1179 = add i64 %1177, %1178
+    %1180 = trunc i64 %1179 to i32
+    %1181 = gep i64, ptr %1169, %1180
+    %1182 = load i64, ptr %1181
+    store i64 %1182, ptr %107
+    br bb46
+bb157:
+    %1190 = icmp sle i64 %1186, %1188
+    condbr %1190, bb158, bb159
+bb158:
+    %1191 = sub i64 %1186, %1187
+    %1192 = const i64 3
+    %1193 = add i64 %1192, %1191
+    %1194 = trunc i64 %1193 to i32
+    %1195 = gep i64, ptr %1, %1194
+    %1196 = load i64, ptr %1195
+    store i64 %1196, ptr %109
+    br bb160
+bb159:
+    %1197 = const i64 0
+    %1198 = gep i8, ptr %0, %1197
+    %1199 = const i8 1
+    store i8 %1199, ptr %1198
+    %1200 = const i64 16
+    %1201 = gep i8, ptr %0, %1200
+    %1202 = const i8 3
+    store i8 %1202, ptr %1201
+    ret
+bb160:
+    %1203 = const i64 65
+    store i64 %1203, ptr %110
+    %1204 = load i64, ptr %109
+    %1205 = load i64, ptr %110
+    %1206 = icmp eq i64 %1204, %1205
+    %1207 = zext bool %1206 to i64
+    store i64 %1207, ptr %111
+    %1208 = const i64 1
+    store i64 %1208, ptr %112
+    %1209 = load i64, ptr %111
+    %1210 = const i64 0
+    %1211 = icmp ne i64 %1209, %1210
+    condbr %1211, bb47, bb54
+bb161:
+    %1256 = load i64, ptr %1254
+    %1257 = icmp slt i64 %1256, %1253
+    condbr %1257, bb162, bb52  ; #proof: bounded_loop(6)
+bb162:
+    %1258 = load i64, ptr %1254
+    %1259 = const i64 1
+    %1260 = add i64 %1258, %1259
+    %1261 = trunc i64 %1260 to i32
+    %1262 = gep i64, ptr %1250, %1261
+    %1263 = load i64, ptr %1262
+    store i64 %1263, ptr %119
+    br bb49
+bb163:
+    %1279 = icmp sle i64 %1275, %1277
+    condbr %1279, bb164, bb165
+bb164:
+    %1280 = sub i64 %1275, %1276
+    %1281 = const i64 3
+    %1282 = add i64 %1281, %1280
+    %1283 = trunc i64 %1282 to i32
+    %1284 = gep i64, ptr %1, %1283
+    %1285 = load i64, ptr %1284
+    store i64 %1285, ptr %123
+    br bb166
+bb165:
+    %1286 = const i64 0
+    %1287 = gep i8, ptr %0, %1286
+    %1288 = const i8 1
+    store i8 %1288, ptr %1287
+    %1289 = const i64 16
+    %1290 = gep i8, ptr %0, %1289
+    %1291 = const i8 3
+    store i8 %1291, ptr %1290
+    ret
+bb166:
+    %1292 = const i64 60
+    store i64 %1292, ptr %124
+    %1293 = load i64, ptr %123
+    %1294 = load i64, ptr %124
+    %1295 = icmp eq i64 %1293, %1294
+    %1296 = zext bool %1295 to i64
+    store i64 %1296, ptr %125
+    %1297 = load i64, ptr %125
+    store i64 %1297, ptr %121
+    br bb51
+bb167:
+    %1301 = const i64 0
+    store i64 %1301, ptr %118
+    br bb52
+bb168:
+    %1302 = load i64, ptr %1254
+    %1303 = const i64 1
+    %1304 = add i64 %1302, %1303
+    store i64 %1304, ptr %1254
+    br bb161
+bb169:
+    %1310 = const i64 0
+    store i64 %1310, ptr %106
+    br bb55
+bb170:
+    %1311 = load i64, ptr %1173
+    %1312 = const i64 1
+    %1313 = add i64 %1311, %1312
+    store i64 %1313, ptr %1173
+    br bb155
+bb171:
+    %1330 = load i64, ptr %129
+    store i64 %1330, ptr %128
+    %1331 = load i64, ptr %128
+    %1332 = inttoptr i64 %1331 to ptr
+    %1333 = const i32 0
+    %1334 = gep i64, ptr %1332, %1333
+    %1335 = load i64, ptr %1334
+    store i64 %1335, ptr %130
+    %1336 = load i64, ptr %127
+    %1337 = load i64, ptr %130
+    %1338 = icmp sle i64 %1336, %1337
+    %1339 = zext bool %1338 to i64
+    store i64 %1339, ptr %131
+    %1340 = load i64, ptr %131
+    store i64 %1340, ptr %126
+    br bb58
+bb172:
+    ret
+bb173:
+    %1377 = load i64, ptr %1375
+    %1378 = icmp slt i64 %1377, %1374
+    condbr %1378, bb174, bb61  ; #proof: bounded_loop(6)
+bb174:
+    %1379 = load i64, ptr %1375
+    %1380 = const i64 1
+    %1381 = add i64 %1379, %1380
+    %1382 = trunc i64 %1381 to i32
+    %1383 = gep i64, ptr %1371, %1382
+    %1384 = load i64, ptr %1383
+    store i64 %1384, ptr %135
+    br bb60
+bb175:
+    %1392 = icmp sle i64 %1388, %1390
+    condbr %1392, bb176, bb177
+bb176:
+    %1393 = sub i64 %1388, %1389
+    %1394 = const i64 3
+    %1395 = add i64 %1394, %1393
+    %1396 = trunc i64 %1395 to i32
+    %1397 = gep i64, ptr %1, %1396
+    %1398 = load i64, ptr %1397
+    store i64 %1398, ptr %137
+    br bb178
+bb177:
+    %1399 = const i64 0
+    %1400 = gep i8, ptr %0, %1399
+    %1401 = const i8 1
+    store i8 %1401, ptr %1400
+    %1402 = const i64 16
+    %1403 = gep i8, ptr %0, %1402
+    %1404 = const i8 3
+    store i8 %1404, ptr %1403
+    ret
+bb178:
+    %1405 = const i32 5
+    %1406 = alloca i64, %1405
+    %1407 = const i64 4
+    %1408 = const i32 0
+    %1409 = gep i64, ptr %1406, %1408
+    store i64 %1407, ptr %1409
+    %1410 = const i64 62
+    %1411 = const i32 1
+    %1412 = gep i64, ptr %1406, %1411
+    store i64 %1410, ptr %1412
+    %1413 = const i64 58
+    %1414 = const i32 2
+    %1415 = gep i64, ptr %1406, %1414
+    store i64 %1413, ptr %1415
+    %1416 = const i64 67
+    %1417 = const i32 3
+    %1418 = gep i64, ptr %1406, %1417
+    store i64 %1416, ptr %1418
+    %1419 = const i64 59
+    %1420 = const i32 4
+    %1421 = gep i64, ptr %1406, %1420
+    store i64 %1419, ptr %1421
+    %1422 = ptrtoint ptr %1406 to i64
+    store i64 %1422, ptr %138
+    %1423 = load i64, ptr %137
+    %1424 = const i64 0
+    %1425 = const i64 62
+    %1426 = icmp eq i64 %1423, %1425
+    %1427 = zext bool %1426 to i64
+    %1428 = or i64 %1424, %1427
+    %1429 = const i64 58
+    %1430 = icmp eq i64 %1423, %1429
+    %1431 = zext bool %1430 to i64
+    %1432 = or i64 %1428, %1431
+    %1433 = const i64 67
+    %1434 = icmp eq i64 %1423, %1433
+    %1435 = zext bool %1434 to i64
+    %1436 = or i64 %1432, %1435
+    %1437 = const i64 59
+    %1438 = icmp eq i64 %1423, %1437
+    %1439 = zext bool %1438 to i64
+    %1440 = or i64 %1436, %1439
+    store i64 %1440, ptr %139
+    %1441 = load i64, ptr %139
+    %1442 = const i64 0
+    %1443 = icmp ne i64 %1441, %1442
+    condbr %1443, bb179, bb180
+bb179:
+    %1444 = const i64 1
+    store i64 %1444, ptr %134
+    br bb61
+bb180:
+    %1445 = load i64, ptr %1375
+    %1446 = const i64 1
+    %1447 = add i64 %1445, %1446
+    store i64 %1447, ptr %1375
+    br bb173
+bb181:
+    %1498 = load i64, ptr %1496
+    %1499 = icmp slt i64 %1498, %1495
+    condbr %1499, bb182, bb75  ; #proof: bounded_loop(6)
+bb182:
+    %1500 = load i64, ptr %1496
+    %1501 = const i64 1
+    %1502 = add i64 %1500, %1501
+    %1503 = trunc i64 %1502 to i32
+    %1504 = gep i64, ptr %1492, %1503
+    %1505 = load i64, ptr %1504
+    store i64 %1505, ptr %147
+    br bb66
+bb183:
+    %1513 = icmp sle i64 %1509, %1511
+    condbr %1513, bb184, bb185
+bb184:
+    %1514 = sub i64 %1509, %1510
+    %1515 = const i64 3
+    %1516 = add i64 %1515, %1514
+    %1517 = trunc i64 %1516 to i32
+    %1518 = gep i64, ptr %1, %1517
+    %1519 = load i64, ptr %1518
+    store i64 %1519, ptr %149
+    br bb186
+bb185:
+    %1520 = const i64 0
+    %1521 = gep i8, ptr %0, %1520
+    %1522 = const i8 1
+    store i8 %1522, ptr %1521
+    %1523 = const i64 16
+    %1524 = gep i8, ptr %0, %1523
+    %1525 = const i8 3
+    store i8 %1525, ptr %1524
+    ret
+bb186:
+    %1526 = const i64 62
+    store i64 %1526, ptr %150
+    %1527 = load i64, ptr %149
+    %1528 = load i64, ptr %150
+    %1529 = icmp eq i64 %1527, %1528
+    %1530 = zext bool %1529 to i64
+    store i64 %1530, ptr %151
+    %1531 = const i64 1
+    store i64 %1531, ptr %152
+    %1532 = load i64, ptr %151
+    %1533 = const i64 0
+    %1534 = icmp ne i64 %1532, %1533
+    condbr %1534, bb67, bb74
+bb187:
+    %1579 = load i64, ptr %1577
+    %1580 = icmp slt i64 %1579, %1576
+    condbr %1580, bb188, bb72  ; #proof: bounded_loop(6)
+bb188:
+    %1581 = load i64, ptr %1577
+    %1582 = const i64 1
+    %1583 = add i64 %1581, %1582
+    %1584 = trunc i64 %1583 to i32
+    %1585 = gep i64, ptr %1573, %1584
+    %1586 = load i64, ptr %1585
+    store i64 %1586, ptr %159
+    br bb69
+bb189:
+    %1602 = icmp sle i64 %1598, %1600
+    condbr %1602, bb190, bb191
+bb190:
+    %1603 = sub i64 %1598, %1599
+    %1604 = const i64 3
+    %1605 = add i64 %1604, %1603
+    %1606 = trunc i64 %1605 to i32
+    %1607 = gep i64, ptr %1, %1606
+    %1608 = load i64, ptr %1607
+    store i64 %1608, ptr %163
+    br bb192
+bb191:
+    %1609 = const i64 0
+    %1610 = gep i8, ptr %0, %1609
+    %1611 = const i8 1
+    store i8 %1611, ptr %1610
+    %1612 = const i64 16
+    %1613 = gep i8, ptr %0, %1612
+    %1614 = const i8 3
+    store i8 %1614, ptr %1613
+    ret
+bb192:
+    %1615 = const i64 63
+    store i64 %1615, ptr %164
+    %1616 = load i64, ptr %163
+    %1617 = load i64, ptr %164
+    %1618 = icmp eq i64 %1616, %1617
+    %1619 = zext bool %1618 to i64
+    store i64 %1619, ptr %165
+    %1620 = load i64, ptr %165
+    store i64 %1620, ptr %161
+    br bb71
+bb193:
+    %1624 = const i64 0
+    store i64 %1624, ptr %158
+    br bb72
+bb194:
+    %1625 = load i64, ptr %1577
+    %1626 = const i64 1
+    %1627 = add i64 %1625, %1626
+    store i64 %1627, ptr %1577
+    br bb187
+bb195:
+    %1633 = const i64 0
+    store i64 %1633, ptr %146
+    br bb75
+bb196:
+    %1634 = load i64, ptr %1496
+    %1635 = const i64 1
+    %1636 = add i64 %1634, %1635
+    store i64 %1636, ptr %1496
+    br bb181
+}
+
+internal fn @__ty_trust_ir_func_1(functy.1) {
+bb197(%1648: ptr, %1649: ptr, %1650: i32, %1651: ptr):
+    %1652 = alloca i64
+    %1653 = alloca i64
+    %1654 = alloca i64
+    %1655 = alloca i64
+    %1656 = alloca i64
+    %1657 = const i32 7
+    %1658 = alloca i64, %1657
+    %1659 = const i64 6
+    %1660 = const i32 0
+    %1661 = gep i64, ptr %1658, %1660
+    store i64 %1659, ptr %1661
+    %1662 = const i64 1
+    %1663 = const i32 1
+    %1664 = gep i64, ptr %1658, %1663
+    store i64 %1662, ptr %1664
+    %1665 = const i64 2
+    %1666 = const i32 2
+    %1667 = gep i64, ptr %1658, %1666
+    store i64 %1665, ptr %1667
+    %1668 = const i64 3
+    %1669 = const i32 3
+    %1670 = gep i64, ptr %1658, %1669
+    store i64 %1668, ptr %1670
+    %1671 = const i64 4
+    %1672 = const i32 4
+    %1673 = gep i64, ptr %1658, %1672
+    store i64 %1671, ptr %1673
+    %1674 = const i64 5
+    %1675 = const i32 5
+    %1676 = gep i64, ptr %1658, %1675
+    store i64 %1674, ptr %1676
+    %1677 = const i64 6
+    %1678 = const i32 6
+    %1679 = gep i64, ptr %1658, %1678
+    store i64 %1677, ptr %1679
+    %1680 = ptrtoint ptr %1658 to i64
+    store i64 %1680, ptr %1652
+    %1681 = load i64, ptr %1652
+    %1682 = inttoptr i64 %1681 to ptr
+    %1683 = const i32 0
+    %1684 = gep i64, ptr %1682, %1683
+    %1685 = load i64, ptr %1684
+    %1686 = const i64 0
+    %1687 = const i64 1
+    %1688 = const i64 0
+    %1689 = icmp sge i64 %1685, %1688
+    condbr %1689, bb200, bb201
+bb198:
+    %1722 = load i64, ptr %1654
+    store i64 %1722, ptr %1655
+    %1723 = load i64, ptr %1655
+    %1724 = null ptr
+    %1725 = const i64 0
+    %1726 = gep i8, ptr %1648, %1725
+    %1727 = const i8 0
+    store i8 %1727, ptr %1726
+    %1728 = call @func.4(%1648, %1649, %1650, %1724, %1723)
+    %1729 = load i8, ptr %1726
+    %1730 = icmp eq i8 %1729, %1727
+    store i64 %1728, ptr %1656
+    condbr %1730, bb208, bb209
+bb199:
+    %1751 = load i64, ptr %1653
+    store i64 %1751, ptr %1652
+    %1752 = load i64, ptr %1652
+    %1753 = inttoptr i64 %1752 to ptr
+    %1754 = const i32 0
+    %1755 = gep i64, ptr %1753, %1754
+    %1756 = load i64, ptr %1755
+    %1757 = const i64 0
+    %1758 = icmp sge i64 %1756, %1757
+    condbr %1758, bb212, bb214
+bb200:
+    %1694, %1695 = add.overflow i64 %1685, %1687
+    condbr %1695, bb202, bb203
+bb201:
+    %1690 = const i64 0
+    %1691 = gep i8, ptr %1648, %1690
+    %1692 = const i8 2
+    store i8 %1692, ptr %1691
+    %1693 = const i64 0
+    ret %1693
+bb202:
+    %1696 = const i64 0
+    %1697 = gep i8, ptr %1648, %1696
+    %1698 = const i8 2
+    store i8 %1698, ptr %1697
+    %1699 = const i64 0
+    ret %1699
+bb203:
+    %1700 = const i64 1
+    %1701 = const i64 2147483647
+    %1702 = icmp sge i64 %1694, %1700
+    %1703 = icmp sle i64 %1694, %1701
+    %1704 = and bool %1702, %1703
+    condbr %1704, bb204, bb205
+bb204:
+    %1709 = const i32 7
+    %1710 = alloca i64, %1709
+    %1711 = const i32 0
+    %1712 = gep i64, ptr %1710, %1711
+    store i64 %1686, ptr %1712
+    %1713 = ptrtoint ptr %1710 to i64
+    store i64 %1713, ptr %1653
+    %1714 = alloca i64
+    store i64 %1686, ptr %1714
+    br bb206
+bb205:
+    %1705 = const i64 0
+    %1706 = gep i8, ptr %1648, %1705
+    %1707 = const i8 2
+    store i8 %1707, ptr %1706
+    %1708 = const i64 0
+    ret %1708
+bb206:
+    %1715 = load i64, ptr %1714
+    %1716 = icmp slt i64 %1715, %1685
+    condbr %1716, bb207, bb199  ; #proof: bounded_loop(6)
+bb207:
+    %1717 = load i64, ptr %1714
+    %1718 = add i64 %1717, %1687
+    %1719 = trunc i64 %1718 to i32
+    %1720 = gep i64, ptr %1682, %1719
+    %1721 = load i64, ptr %1720
+    store i64 %1721, ptr %1654
+    br bb198
+bb208:
+    %1732 = load i64, ptr %1656
+    %1733 = const i64 0
+    %1734 = icmp ne i64 %1732, %1733
+    condbr %1734, bb210, bb211
+bb209:
+    %1731 = const i64 0
+    ret %1731
+bb210:
+    %1735 = load i64, ptr %1653
+    %1736 = inttoptr i64 %1735 to ptr
+    %1737 = const i32 0
+    %1738 = gep i64, ptr %1736, %1737
+    %1739 = load i64, ptr %1738
+    %1740 = const i64 1
+    %1741 = add i64 %1739, %1740
+    %1742 = load i64, ptr %1654
+    %1743 = trunc i64 %1741 to i32
+    %1744 = gep i64, ptr %1736, %1743
+    store i64 %1742, ptr %1744
+    %1745 = add i64 %1739, %1740
+    %1746 = const i32 0
+    %1747 = gep i64, ptr %1736, %1746
+    store i64 %1745, ptr %1747
+    br bb211
+bb211:
+    %1748 = load i64, ptr %1714
+    %1749 = const i64 1
+    %1750 = add i64 %1748, %1749
+    store i64 %1750, ptr %1714
+    br bb206
+bb212:
+    %1759 = const i64 6
+    %1760 = icmp sle i64 %1756, %1759
+    condbr %1760, bb213, bb214
+bb213:
+    %1768 = const i32 0
+    %1769 = gep i64, ptr %1651, %1768
+    store i64 %1756, ptr %1769
+    %1770 = const i64 1
+    %1771 = alloca i64
+    store i64 %1770, ptr %1771
+    br bb215
+bb214:
+    %1761 = const i64 0
+    %1762 = gep i8, ptr %1648, %1761
+    %1763 = const i8 1
+    store i8 %1763, ptr %1762
+    %1764 = const i64 16
+    %1765 = gep i8, ptr %1648, %1764
+    %1766 = const i8 3
+    store i8 %1766, ptr %1765
+    %1767 = const i64 0
+    ret %1767
+bb215:
+    %1772 = load i64, ptr %1771
+    %1773 = icmp sle i64 %1772, %1756
+    condbr %1773, bb216, bb217
+bb216:
+    %1774 = load i64, ptr %1771
+    %1775 = trunc i64 %1774 to i32
+    %1776 = gep i64, ptr %1753, %1775
+    %1777 = load i64, ptr %1776
+    %1778 = trunc i64 %1774 to i32
+    %1779 = gep i64, ptr %1651, %1778
+    store i64 %1777, ptr %1779
+    %1780 = add i64 %1774, %1770
+    store i64 %1780, ptr %1771
+    br bb215
+bb217:
+    %1781 = add i64 %1756, %1770
+    store i64 %1781, ptr %1771
+    br bb218
+bb218:
+    %1782 = load i64, ptr %1771
+    %1783 = const i64 6
+    %1784 = icmp sle i64 %1782, %1783
+    condbr %1784, bb219, bb220
+bb219:
+    %1785 = load i64, ptr %1771
+    %1786 = trunc i64 %1785 to i32
+    %1787 = gep i64, ptr %1651, %1786
+    store i64 %1757, ptr %1787
+    %1788 = add i64 %1785, %1770
+    store i64 %1788, ptr %1771
+    br bb218
+bb220:
+    %1789 = ptrtoint ptr %1651 to i64
+    ret %1789
+}
+
+internal fn @__ty_trust_ir_func_2(functy.2) {
+bb221(%1790: ptr, %1791: ptr, %1792: i32, %1793: ptr):
+    %1794 = alloca i64
+    %1795 = alloca i64
+    %1796 = alloca i64
+    %1797 = alloca i64
+    %1798 = alloca i64
+    %1799 = const i32 7
+    %1800 = alloca i64, %1799
+    %1801 = const i64 6
+    %1802 = const i32 0
+    %1803 = gep i64, ptr %1800, %1802
+    store i64 %1801, ptr %1803
+    %1804 = const i64 1
+    %1805 = const i32 1
+    %1806 = gep i64, ptr %1800, %1805
+    store i64 %1804, ptr %1806
+    %1807 = const i64 2
+    %1808 = const i32 2
+    %1809 = gep i64, ptr %1800, %1808
+    store i64 %1807, ptr %1809
+    %1810 = const i64 3
+    %1811 = const i32 3
+    %1812 = gep i64, ptr %1800, %1811
+    store i64 %1810, ptr %1812
+    %1813 = const i64 4
+    %1814 = const i32 4
+    %1815 = gep i64, ptr %1800, %1814
+    store i64 %1813, ptr %1815
+    %1816 = const i64 5
+    %1817 = const i32 5
+    %1818 = gep i64, ptr %1800, %1817
+    store i64 %1816, ptr %1818
+    %1819 = const i64 6
+    %1820 = const i32 6
+    %1821 = gep i64, ptr %1800, %1820
+    store i64 %1819, ptr %1821
+    %1822 = ptrtoint ptr %1800 to i64
+    store i64 %1822, ptr %1794
+    %1823 = load i64, ptr %1794
+    %1824 = inttoptr i64 %1823 to ptr
+    %1825 = const i32 0
+    %1826 = gep i64, ptr %1824, %1825
+    %1827 = load i64, ptr %1826
+    %1828 = const i64 0
+    %1829 = const i64 1
+    %1830 = const i64 0
+    %1831 = icmp sge i64 %1827, %1830
+    condbr %1831, bb224, bb225
+bb222:
+    %1864 = load i64, ptr %1796
+    store i64 %1864, ptr %1797
+    %1865 = load i64, ptr %1797
+    %1866 = null ptr
+    %1867 = const i64 0
+    %1868 = gep i8, ptr %1790, %1867
+    %1869 = const i8 0
+    store i8 %1869, ptr %1868
+    %1870 = call @func.5(%1790, %1791, %1792, %1866, %1865)
+    %1871 = load i8, ptr %1868
+    %1872 = icmp eq i8 %1871, %1869
+    store i64 %1870, ptr %1798
+    condbr %1872, bb232, bb233
+bb223:
+    %1893 = load i64, ptr %1795
+    store i64 %1893, ptr %1794
+    %1894 = load i64, ptr %1794
+    %1895 = inttoptr i64 %1894 to ptr
+    %1896 = const i32 0
+    %1897 = gep i64, ptr %1895, %1896
+    %1898 = load i64, ptr %1897
+    %1899 = const i64 0
+    %1900 = icmp sge i64 %1898, %1899
+    condbr %1900, bb236, bb238
+bb224:
+    %1836, %1837 = add.overflow i64 %1827, %1829
+    condbr %1837, bb226, bb227
+bb225:
+    %1832 = const i64 0
+    %1833 = gep i8, ptr %1790, %1832
+    %1834 = const i8 2
+    store i8 %1834, ptr %1833
+    %1835 = const i64 0
+    ret %1835
+bb226:
+    %1838 = const i64 0
+    %1839 = gep i8, ptr %1790, %1838
+    %1840 = const i8 2
+    store i8 %1840, ptr %1839
+    %1841 = const i64 0
+    ret %1841
+bb227:
+    %1842 = const i64 1
+    %1843 = const i64 2147483647
+    %1844 = icmp sge i64 %1836, %1842
+    %1845 = icmp sle i64 %1836, %1843
+    %1846 = and bool %1844, %1845
+    condbr %1846, bb228, bb229
+bb228:
+    %1851 = const i32 7
+    %1852 = alloca i64, %1851
+    %1853 = const i32 0
+    %1854 = gep i64, ptr %1852, %1853
+    store i64 %1828, ptr %1854
+    %1855 = ptrtoint ptr %1852 to i64
+    store i64 %1855, ptr %1795
+    %1856 = alloca i64
+    store i64 %1828, ptr %1856
+    br bb230
+bb229:
+    %1847 = const i64 0
+    %1848 = gep i8, ptr %1790, %1847
+    %1849 = const i8 2
+    store i8 %1849, ptr %1848
+    %1850 = const i64 0
+    ret %1850
+bb230:
+    %1857 = load i64, ptr %1856
+    %1858 = icmp slt i64 %1857, %1827
+    condbr %1858, bb231, bb223  ; #proof: bounded_loop(6)
+bb231:
+    %1859 = load i64, ptr %1856
+    %1860 = add i64 %1859, %1829
+    %1861 = trunc i64 %1860 to i32
+    %1862 = gep i64, ptr %1824, %1861
+    %1863 = load i64, ptr %1862
+    store i64 %1863, ptr %1796
+    br bb222
+bb232:
+    %1874 = load i64, ptr %1798
+    %1875 = const i64 0
+    %1876 = icmp ne i64 %1874, %1875
+    condbr %1876, bb234, bb235
+bb233:
+    %1873 = const i64 0
+    ret %1873
+bb234:
+    %1877 = load i64, ptr %1795
+    %1878 = inttoptr i64 %1877 to ptr
+    %1879 = const i32 0
+    %1880 = gep i64, ptr %1878, %1879
+    %1881 = load i64, ptr %1880
+    %1882 = const i64 1
+    %1883 = add i64 %1881, %1882
+    %1884 = load i64, ptr %1796
+    %1885 = trunc i64 %1883 to i32
+    %1886 = gep i64, ptr %1878, %1885
+    store i64 %1884, ptr %1886
+    %1887 = add i64 %1881, %1882
+    %1888 = const i32 0
+    %1889 = gep i64, ptr %1878, %1888
+    store i64 %1887, ptr %1889
+    br bb235
+bb235:
+    %1890 = load i64, ptr %1856
+    %1891 = const i64 1
+    %1892 = add i64 %1890, %1891
+    store i64 %1892, ptr %1856
+    br bb230
+bb236:
+    %1901 = const i64 6
+    %1902 = icmp sle i64 %1898, %1901
+    condbr %1902, bb237, bb238
+bb237:
+    %1910 = const i32 0
+    %1911 = gep i64, ptr %1793, %1910
+    store i64 %1898, ptr %1911
+    %1912 = const i64 1
+    %1913 = alloca i64
+    store i64 %1912, ptr %1913
+    br bb239
+bb238:
+    %1903 = const i64 0
+    %1904 = gep i8, ptr %1790, %1903
+    %1905 = const i8 1
+    store i8 %1905, ptr %1904
+    %1906 = const i64 16
+    %1907 = gep i8, ptr %1790, %1906
+    %1908 = const i8 3
+    store i8 %1908, ptr %1907
+    %1909 = const i64 0
+    ret %1909
+bb239:
+    %1914 = load i64, ptr %1913
+    %1915 = icmp sle i64 %1914, %1898
+    condbr %1915, bb240, bb241
+bb240:
+    %1916 = load i64, ptr %1913
+    %1917 = trunc i64 %1916 to i32
+    %1918 = gep i64, ptr %1895, %1917
+    %1919 = load i64, ptr %1918
+    %1920 = trunc i64 %1916 to i32
+    %1921 = gep i64, ptr %1793, %1920
+    store i64 %1919, ptr %1921
+    %1922 = add i64 %1916, %1912
+    store i64 %1922, ptr %1913
+    br bb239
+bb241:
+    %1923 = add i64 %1898, %1912
+    store i64 %1923, ptr %1913
+    br bb242
+bb242:
+    %1924 = load i64, ptr %1913
+    %1925 = const i64 6
+    %1926 = icmp sle i64 %1924, %1925
+    condbr %1926, bb243, bb244
+bb243:
+    %1927 = load i64, ptr %1913
+    %1928 = trunc i64 %1927 to i32
+    %1929 = gep i64, ptr %1793, %1928
+    store i64 %1899, ptr %1929
+    %1930 = add i64 %1927, %1912
+    store i64 %1930, ptr %1913
+    br bb242
+bb244:
+    %1931 = ptrtoint ptr %1793 to i64
+    ret %1931
+}
+
+internal fn @__ty_trust_ir_func_3(functy.3) {
+bb245(%1932: ptr, %1933: ptr, %1934: i32, %1935: ptr):
+    %1936 = alloca i64
+    %1937 = alloca i64
+    %1938 = alloca i64
+    %1939 = alloca i64
+    %1940 = alloca i64
+    %1941 = const i32 7
+    %1942 = alloca i64, %1941
+    %1943 = const i64 6
+    %1944 = const i32 0
+    %1945 = gep i64, ptr %1942, %1944
+    store i64 %1943, ptr %1945
+    %1946 = const i64 1
+    %1947 = const i32 1
+    %1948 = gep i64, ptr %1942, %1947
+    store i64 %1946, ptr %1948
+    %1949 = const i64 2
+    %1950 = const i32 2
+    %1951 = gep i64, ptr %1942, %1950
+    store i64 %1949, ptr %1951
+    %1952 = const i64 3
+    %1953 = const i32 3
+    %1954 = gep i64, ptr %1942, %1953
+    store i64 %1952, ptr %1954
+    %1955 = const i64 4
+    %1956 = const i32 4
+    %1957 = gep i64, ptr %1942, %1956
+    store i64 %1955, ptr %1957
+    %1958 = const i64 5
+    %1959 = const i32 5
+    %1960 = gep i64, ptr %1942, %1959
+    store i64 %1958, ptr %1960
+    %1961 = const i64 6
+    %1962 = const i32 6
+    %1963 = gep i64, ptr %1942, %1962
+    store i64 %1961, ptr %1963
+    %1964 = ptrtoint ptr %1942 to i64
+    store i64 %1964, ptr %1936
+    %1965 = load i64, ptr %1936
+    %1966 = inttoptr i64 %1965 to ptr
+    %1967 = const i32 0
+    %1968 = gep i64, ptr %1966, %1967
+    %1969 = load i64, ptr %1968
+    %1970 = const i64 0
+    %1971 = const i64 1
+    %1972 = const i64 0
+    %1973 = icmp sge i64 %1969, %1972
+    condbr %1973, bb248, bb249
+bb246:
+    %2006 = load i64, ptr %1938
+    store i64 %2006, ptr %1939
+    %2007 = load i64, ptr %1939
+    %2008 = null ptr
+    %2009 = const i64 0
+    %2010 = gep i8, ptr %1932, %2009
+    %2011 = const i8 0
+    store i8 %2011, ptr %2010
+    %2012 = call @func.6(%1932, %1933, %1934, %2008, %2007)
+    %2013 = load i8, ptr %2010
+    %2014 = icmp eq i8 %2013, %2011
+    store i64 %2012, ptr %1940
+    condbr %2014, bb256, bb257
+bb247:
+    %2035 = load i64, ptr %1937
+    store i64 %2035, ptr %1936
+    %2036 = load i64, ptr %1936
+    %2037 = inttoptr i64 %2036 to ptr
+    %2038 = const i32 0
+    %2039 = gep i64, ptr %2037, %2038
+    %2040 = load i64, ptr %2039
+    %2041 = const i64 0
+    %2042 = icmp sge i64 %2040, %2041
+    condbr %2042, bb260, bb262
+bb248:
+    %1978, %1979 = add.overflow i64 %1969, %1971
+    condbr %1979, bb250, bb251
+bb249:
+    %1974 = const i64 0
+    %1975 = gep i8, ptr %1932, %1974
+    %1976 = const i8 2
+    store i8 %1976, ptr %1975
+    %1977 = const i64 0
+    ret %1977
+bb250:
+    %1980 = const i64 0
+    %1981 = gep i8, ptr %1932, %1980
+    %1982 = const i8 2
+    store i8 %1982, ptr %1981
+    %1983 = const i64 0
+    ret %1983
+bb251:
+    %1984 = const i64 1
+    %1985 = const i64 2147483647
+    %1986 = icmp sge i64 %1978, %1984
+    %1987 = icmp sle i64 %1978, %1985
+    %1988 = and bool %1986, %1987
+    condbr %1988, bb252, bb253
+bb252:
+    %1993 = const i32 7
+    %1994 = alloca i64, %1993
+    %1995 = const i32 0
+    %1996 = gep i64, ptr %1994, %1995
+    store i64 %1970, ptr %1996
+    %1997 = ptrtoint ptr %1994 to i64
+    store i64 %1997, ptr %1937
+    %1998 = alloca i64
+    store i64 %1970, ptr %1998
+    br bb254
+bb253:
+    %1989 = const i64 0
+    %1990 = gep i8, ptr %1932, %1989
+    %1991 = const i8 2
+    store i8 %1991, ptr %1990
+    %1992 = const i64 0
+    ret %1992
+bb254:
+    %1999 = load i64, ptr %1998
+    %2000 = icmp slt i64 %1999, %1969
+    condbr %2000, bb255, bb247  ; #proof: bounded_loop(6)
+bb255:
+    %2001 = load i64, ptr %1998
+    %2002 = add i64 %2001, %1971
+    %2003 = trunc i64 %2002 to i32
+    %2004 = gep i64, ptr %1966, %2003
+    %2005 = load i64, ptr %2004
+    store i64 %2005, ptr %1938
+    br bb246
+bb256:
+    %2016 = load i64, ptr %1940
+    %2017 = const i64 0
+    %2018 = icmp ne i64 %2016, %2017
+    condbr %2018, bb258, bb259
+bb257:
+    %2015 = const i64 0
+    ret %2015
+bb258:
+    %2019 = load i64, ptr %1937
+    %2020 = inttoptr i64 %2019 to ptr
+    %2021 = const i32 0
+    %2022 = gep i64, ptr %2020, %2021
+    %2023 = load i64, ptr %2022
+    %2024 = const i64 1
+    %2025 = add i64 %2023, %2024
+    %2026 = load i64, ptr %1938
+    %2027 = trunc i64 %2025 to i32
+    %2028 = gep i64, ptr %2020, %2027
+    store i64 %2026, ptr %2028
+    %2029 = add i64 %2023, %2024
+    %2030 = const i32 0
+    %2031 = gep i64, ptr %2020, %2030
+    store i64 %2029, ptr %2031
+    br bb259
+bb259:
+    %2032 = load i64, ptr %1998
+    %2033 = const i64 1
+    %2034 = add i64 %2032, %2033
+    store i64 %2034, ptr %1998
+    br bb254
+bb260:
+    %2043 = const i64 6
+    %2044 = icmp sle i64 %2040, %2043
+    condbr %2044, bb261, bb262
+bb261:
+    %2052 = const i32 0
+    %2053 = gep i64, ptr %1935, %2052
+    store i64 %2040, ptr %2053
+    %2054 = const i64 1
+    %2055 = alloca i64
+    store i64 %2054, ptr %2055
+    br bb263
+bb262:
+    %2045 = const i64 0
+    %2046 = gep i8, ptr %1932, %2045
+    %2047 = const i8 1
+    store i8 %2047, ptr %2046
+    %2048 = const i64 16
+    %2049 = gep i8, ptr %1932, %2048
+    %2050 = const i8 3
+    store i8 %2050, ptr %2049
+    %2051 = const i64 0
+    ret %2051
+bb263:
+    %2056 = load i64, ptr %2055
+    %2057 = icmp sle i64 %2056, %2040
+    condbr %2057, bb264, bb265
+bb264:
+    %2058 = load i64, ptr %2055
+    %2059 = trunc i64 %2058 to i32
+    %2060 = gep i64, ptr %2037, %2059
+    %2061 = load i64, ptr %2060
+    %2062 = trunc i64 %2058 to i32
+    %2063 = gep i64, ptr %1935, %2062
+    store i64 %2061, ptr %2063
+    %2064 = add i64 %2058, %2054
+    store i64 %2064, ptr %2055
+    br bb263
+bb265:
+    %2065 = add i64 %2040, %2054
+    store i64 %2065, ptr %2055
+    br bb266
+bb266:
+    %2066 = load i64, ptr %2055
+    %2067 = const i64 6
+    %2068 = icmp sle i64 %2066, %2067
+    condbr %2068, bb267, bb268
+bb267:
+    %2069 = load i64, ptr %2055
+    %2070 = trunc i64 %2069 to i32
+    %2071 = gep i64, ptr %1935, %2070
+    store i64 %2041, ptr %2071
+    %2072 = add i64 %2069, %2054
+    store i64 %2072, ptr %2055
+    br bb266
+bb268:
+    %2073 = ptrtoint ptr %1935 to i64
+    ret %2073
+}
+
+internal fn @__ty_trust_ir_func_4(functy.4) {
+bb269(%2074: ptr, %2075: ptr, %2076: i32, %2077: ptr, %2078: i64):
+    %2079 = alloca i64
+    %2081 = alloca i64
+    store i64 %2078, ptr %2079
+    %2084 = const i32 3
+    %2085 = gep i64, ptr %2075, %2084
+    %2086 = load i64, ptr %2085
+    %2087 = load i64, ptr %2079
+    %2088 = const i64 1
+    %2089 = const i64 6
+    %2090 = icmp sge i64 %2087, %2088
+    condbr %2090, bb270, bb272
+bb270:
+    %2091 = icmp sle i64 %2087, %2089
+    condbr %2091, bb271, bb272
+bb271:
+    %2092 = sub i64 %2087, %2088
+    %2093 = const i64 3
+    %2094 = add i64 %2093, %2092
+    %2095 = trunc i64 %2094 to i32
+    %2096 = gep i64, ptr %2075, %2095
+    %2097 = load i64, ptr %2096
+    store i64 %2097, ptr %2081
+    br bb273
+bb272:
+    %2098 = const i64 0
+    %2099 = gep i8, ptr %2074, %2098
+    %2100 = const i8 1
+    store i8 %2100, ptr %2099
+    %2101 = const i64 16
+    %2102 = gep i8, ptr %2074, %2101
+    %2103 = const i8 3
+    store i8 %2103, ptr %2102
+    %2104 = const i64 0
+    ret %2104
+bb273:
+    %2105 = const i32 7
+    %2107 = const i64 6
+    %2108 = const i32 0
+    %2110 = const i64 66
+    %2111 = const i32 1
+    %2113 = const i64 65
+    %2114 = const i32 2
+    %2116 = const i64 61
+    %2117 = const i32 3
+    %2119 = const i64 60
+    %2120 = const i32 4
+    %2122 = const i64 58
+    %2123 = const i32 5
+    %2125 = const i64 67
+    %2126 = const i32 6
+    %2129 = load i64, ptr %2081
+    %2130 = const i64 0
+    %2131 = const i64 66
+    %2132 = icmp eq i64 %2129, %2131
+    %2133 = zext bool %2132 to i64
+    %2134 = or i64 %2130, %2133
+    %2135 = const i64 65
+    %2136 = icmp eq i64 %2129, %2135
+    %2137 = zext bool %2136 to i64
+    %2138 = or i64 %2134, %2137
+    %2139 = const i64 61
+    %2140 = icmp eq i64 %2129, %2139
+    %2141 = zext bool %2140 to i64
+    %2142 = or i64 %2138, %2141
+    %2143 = const i64 60
+    %2144 = icmp eq i64 %2129, %2143
+    %2145 = zext bool %2144 to i64
+    %2146 = or i64 %2142, %2145
+    %2147 = const i64 58
+    %2148 = icmp eq i64 %2129, %2147
+    %2149 = zext bool %2148 to i64
+    %2150 = or i64 %2146, %2149
+    %2151 = const i64 67
+    %2152 = icmp eq i64 %2129, %2151
+    %2153 = zext bool %2152 to i64
+    %2154 = or i64 %2150, %2153
+    store i64 %2154, ptr %2079
+    %2156 = load i64, ptr %2079
+    ret %2156
+}
+
+internal fn @__ty_trust_ir_func_5(functy.5) {
+bb274(%2157: ptr, %2158: ptr, %2159: i32, %2160: ptr, %2161: i64):
+    %2162 = alloca i64
+    %2164 = alloca i64
+    store i64 %2161, ptr %2162
+    %2167 = const i32 3
+    %2168 = gep i64, ptr %2158, %2167
+    %2169 = load i64, ptr %2168
+    %2170 = load i64, ptr %2162
+    %2171 = const i64 1
+    %2172 = const i64 6
+    %2173 = icmp sge i64 %2170, %2171
+    condbr %2173, bb275, bb277
+bb275:
+    %2174 = icmp sle i64 %2170, %2172
+    condbr %2174, bb276, bb277
+bb276:
+    %2175 = sub i64 %2170, %2171
+    %2176 = const i64 3
+    %2177 = add i64 %2176, %2175
+    %2178 = trunc i64 %2177 to i32
+    %2179 = gep i64, ptr %2158, %2178
+    %2180 = load i64, ptr %2179
+    store i64 %2180, ptr %2164
+    br bb278
+bb277:
+    %2181 = const i64 0
+    %2182 = gep i8, ptr %2157, %2181
+    %2183 = const i8 1
+    store i8 %2183, ptr %2182
+    %2184 = const i64 16
+    %2185 = gep i8, ptr %2157, %2184
+    %2186 = const i8 3
+    store i8 %2186, ptr %2185
+    %2187 = const i64 0
+    ret %2187
+bb278:
+    %2188 = const i32 8
+    %2190 = const i64 7
+    %2191 = const i32 0
+    %2193 = const i64 57
+    %2194 = const i32 1
+    %2196 = const i64 68
+    %2197 = const i32 2
+    %2199 = const i64 56
+    %2200 = const i32 3
+    %2202 = const i64 66
+    %2203 = const i32 4
+    %2205 = const i64 65
+    %2206 = const i32 5
+    %2208 = const i64 61
+    %2209 = const i32 6
+    %2211 = const i64 60
+    %2212 = const i32 7
+    %2215 = load i64, ptr %2164
+    %2216 = const i64 0
+    %2217 = const i64 57
+    %2218 = icmp eq i64 %2215, %2217
+    %2219 = zext bool %2218 to i64
+    %2220 = or i64 %2216, %2219
+    %2221 = const i64 68
+    %2222 = icmp eq i64 %2215, %2221
+    %2223 = zext bool %2222 to i64
+    %2224 = or i64 %2220, %2223
+    %2225 = const i64 56
+    %2226 = icmp eq i64 %2215, %2225
+    %2227 = zext bool %2226 to i64
+    %2228 = or i64 %2224, %2227
+    %2229 = const i64 66
+    %2230 = icmp eq i64 %2215, %2229
+    %2231 = zext bool %2230 to i64
+    %2232 = or i64 %2228, %2231
+    %2233 = const i64 65
+    %2234 = icmp eq i64 %2215, %2233
+    %2235 = zext bool %2234 to i64
+    %2236 = or i64 %2232, %2235
+    %2237 = const i64 61
+    %2238 = icmp eq i64 %2215, %2237
+    %2239 = zext bool %2238 to i64
+    %2240 = or i64 %2236, %2239
+    %2241 = const i64 60
+    %2242 = icmp eq i64 %2215, %2241
+    %2243 = zext bool %2242 to i64
+    %2244 = or i64 %2240, %2243
+    store i64 %2244, ptr %2162
+    %2246 = load i64, ptr %2162
+    ret %2246
+}
+
+internal fn @__ty_trust_ir_func_6(functy.6) {
+bb279(%2247: ptr, %2248: ptr, %2249: i32, %2250: ptr, %2251: i64):
+    %2252 = alloca i64
+    %2254 = alloca i64
+    store i64 %2251, ptr %2252
+    %2257 = const i32 3
+    %2258 = gep i64, ptr %2248, %2257
+    %2259 = load i64, ptr %2258
+    %2260 = load i64, ptr %2252
+    %2261 = const i64 1
+    %2262 = const i64 6
+    %2263 = icmp sge i64 %2260, %2261
+    condbr %2263, bb280, bb282
+bb280:
+    %2264 = icmp sle i64 %2260, %2262
+    condbr %2264, bb281, bb282
+bb281:
+    %2265 = sub i64 %2260, %2261
+    %2266 = const i64 3
+    %2267 = add i64 %2266, %2265
+    %2268 = trunc i64 %2267 to i32
+    %2269 = gep i64, ptr %2248, %2268
+    %2270 = load i64, ptr %2269
+    store i64 %2270, ptr %2254
+    br bb283
+bb282:
+    %2271 = const i64 0
+    %2272 = gep i8, ptr %2247, %2271
+    %2273 = const i8 1
+    store i8 %2273, ptr %2272
+    %2274 = const i64 16
+    %2275 = gep i8, ptr %2247, %2274
+    %2276 = const i8 3
+    store i8 %2276, ptr %2275
+    %2277 = const i64 0
+    ret %2277
+bb283:
+    %2278 = const i32 7
+    %2280 = const i64 6
+    %2281 = const i32 0
+    %2283 = const i64 62
+    %2284 = const i32 1
+    %2286 = const i64 64
+    %2287 = const i32 2
+    %2289 = const i64 63
+    %2290 = const i32 3
+    %2292 = const i64 58
+    %2293 = const i32 4
+    %2295 = const i64 67
+    %2296 = const i32 5
+    %2298 = const i64 59
+    %2299 = const i32 6
+    %2302 = load i64, ptr %2254
+    %2303 = const i64 0
+    %2304 = const i64 62
+    %2305 = icmp eq i64 %2302, %2304
+    %2306 = zext bool %2305 to i64
+    %2307 = or i64 %2303, %2306
+    %2308 = const i64 64
+    %2309 = icmp eq i64 %2302, %2308
+    %2310 = zext bool %2309 to i64
+    %2311 = or i64 %2307, %2310
+    %2312 = const i64 63
+    %2313 = icmp eq i64 %2302, %2312
+    %2314 = zext bool %2313 to i64
+    %2315 = or i64 %2311, %2314
+    %2316 = const i64 58
+    %2317 = icmp eq i64 %2302, %2316
+    %2318 = zext bool %2317 to i64
+    %2319 = or i64 %2315, %2318
+    %2320 = const i64 67
+    %2321 = icmp eq i64 %2302, %2320
+    %2322 = zext bool %2321 to i64
+    %2323 = or i64 %2319, %2322
+    %2324 = const i64 59
+    %2325 = icmp eq i64 %2302, %2324
+    %2326 = zext bool %2325 to i64
+    %2327 = or i64 %2323, %2326
+    store i64 %2327, ptr %2252
+    %2329 = load i64, ptr %2252
+    ret %2329
+}

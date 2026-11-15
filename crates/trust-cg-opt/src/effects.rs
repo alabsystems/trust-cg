@@ -9,8 +9,6 @@
 //! Pure, Load, Store, or Call, which determines whether the instruction
 //! can be reordered, eliminated, or hoisted.
 //!
-//! Reference: designs/2026-04-12-aarch64-backend.md, "Memory-Effects Model"
-//!
 //! | Effect | Meaning |
 //! |--------|---------|
 //! | Pure   | No memory access, no side effects. Safe to reorder, CSE, DCE. |
@@ -18,7 +16,7 @@
 //! | Store  | Writes memory. Barrier for loads and other stores. |
 //! | Call   | Clobbers everything (conservative default). |
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::AArch64Opcode;
 use trust_cg_ir::OpcodeCategory;
@@ -81,7 +79,7 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
         // -- Loads: read memory --
         LdrRI | LdrPreIndex | LdrPostIndex | LdrbRI | LdrhRI | LdrsbRI | LdrshRI | LdrLiteral
         | LdpRI | LdpPostIndex | LdrRO | LdrbRO | LdrhRO | LdrswRO | LdrGot | LdrTlvp
-        | LdrGottprel | NeonLd1Post | NeonLdpQPost => MemoryEffect::Load,
+        | LdrGottprel | LdrTlsdesc | NeonLd1Post | NeonLdpQPost => MemoryEffect::Load,
 
         // -- Stores: write memory --
         StrRI | StrPreIndex | StrPostIndex | StrbRI | StrhRI | StpRI | StpPreIndex | StrRO
@@ -101,7 +99,8 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
         | VolatileStrhRI => MemoryEffect::Call,
 
         // -- Calls: full barrier --
-        Bl | Blr | BL | BLR | TailCall => MemoryEffect::Call,
+        // (The TLSDESC resolver call, before and after expansion, is a call.)
+        Bl | Blr | BL | BLR | TailCall | TlsDescCall | BlrTlsdesc => MemoryEffect::Call,
 
         // -- Stack allocation: side effect (modifies SP) --
         StackAlloc => MemoryEffect::Store,
@@ -110,6 +109,11 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
         // Arithmetic
         AddRR | AddRI | AddRIShift12 | SubRR | SubRI | MulRR | Msub | Smull | Umull | SDiv
         | UDiv | Neg => MemoryEffect::Pure,
+
+        // FEAT_CRC32 checksum steps: register-only data processing.
+        Crc32B | Crc32H | Crc32W | Crc32X | Crc32Cb | Crc32Ch | Crc32Cw | Crc32Cx => {
+            MemoryEffect::Pure
+        }
 
         // Logical
         AndRR | AndRI | OrrRR | OrrRI | EorRR | EorRI | BicRR => MemoryEffect::Pure,
@@ -151,7 +155,7 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
 
         // Floating-point arithmetic
         FaddRR | FsubRR | FmulRR | FdivRR | FmaddRR | FminnmRR | FmaxnmRR | FnegRR | FabsRR
-        | FsqrtRR | FrintmRR | FrintpRR | FrintzRR => MemoryEffect::Pure,
+        | FsqrtRR | FrintnRR | FrintmRR | FrintpRR | FrintzRR => MemoryEffect::Pure,
 
         // NEON SIMD: pure computation (no memory access except LD1/ST1 above)
         NeonAddV | NeonSubV | NeonMulV | NeonFaddV | NeonFsubV | NeonFmulV | NeonFdivV
@@ -179,12 +183,15 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
         // ELF local-exec TLS TPREL adds: pure ALU address arithmetic
         // (TPIDR_EL0 was read by the preceding Mrs, not here).
         AddTprelHi12 | AddTprelLo12 => MemoryEffect::Pure,
+        // TLSDESC descriptor-address add: pure address arithmetic.
+        AddTlsdescLo12 => MemoryEffect::Pure,
 
         // Checked arithmetic: set flags but no memory access
         AddsRR | AddsRI | SubsRR | SubsRI => MemoryEffect::Pure,
 
-        // i128 multi-register arithmetic: pure computation (ADC/SBC read flags, no memory)
-        Adc | Sbc | Umulh | Smulh | Madd => MemoryEffect::Pure,
+        // i128 multi-register arithmetic: pure computation (ADC/SBC read flags,
+        // ADCS/SBCS read and write them; none touch memory)
+        Adc | Sbc | Adcs | Sbcs | Umulh | Smulh | Madd => MemoryEffect::Pure,
 
         // Trap pseudo-instructions: control flow, not memory ops
         Brk | TrapOverflow | TrapBoundsCheck | TrapBoundsCheckExact | TrapNull | TrapNullIfZero
@@ -199,6 +206,18 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
 
         // Atomic stores (store-release): memory write with ordering
         Stlr | Stlrb | Stlrh | Stlxr => MemoryEffect::Store,
+
+        // Baseline exclusive-monitor instructions and the opaque LL/SC atomic
+        // pseudos: full barriers. A pseudo is one indivisible atomic
+        // read-modify-write whose acquire/release strength is an immediate
+        // operand, and the exclusive forms exist only inside the post-RA
+        // expanded retry loop, where nothing may be moved into or out of the
+        // exclusive window. `Call` is the strongest effect every effect-gated
+        // pass already honours.
+        Ldxr | Ldxrb | Ldxrh | Ldaxrb | Ldaxrh | Stxr | Stxrb | Stxrh | Stlxrb | Stlxrh | Ldxp
+        | Ldaxp | Stxp | Stlxp | Clrex | LlscRmw8 | LlscRmw16 | LlscRmw32 | LlscRmw64
+        | LlscCmpSwap8 | LlscCmpSwap16 | LlscCmpSwap32 | LlscCmpSwap64 | LlscLoad128
+        | LlscStore128 | LlscRmw128 | LlscCmpSwap128 => MemoryEffect::Call,
 
         // Atomic RMW (LSE): both read and write — classify as Store (conservative)
         Ldadd | Ldadda | Ldaddal | Ldaddl | Ldclr | Ldclra | Ldclral | Ldclrl | Ldeor | Ldeora
@@ -231,6 +250,32 @@ pub fn opcode_effect(opcode: AArch64Opcode) -> MemoryEffect {
         // HAS_SIDE_EFFECTS InstFlags additionally pins it in place.)
         AlignNop => MemoryEffect::Pure,
     }
+}
+
+/// Whether `opcode` is a load-acquire: `Ldar`, `Ldarb`, `Ldarh` or `Ldaxr`.
+///
+/// [`opcode_effect`] classifies these as [`MemoryEffect::Load`] because they
+/// write nothing, so `writes_memory()` and `is_barrier()` are false for them.
+/// But acquire semantics order every LATER access of this thread after the
+/// acquire, and once it reads a value a release wrote, this thread may observe
+/// every write another thread made before that release. So:
+/// - no later plain load may move above one (`mem_pair`), and
+/// - no loop that contains one may treat a plain load's value as stable
+///   across iterations, even when the loop itself writes nothing there
+///   (`licm`, `alias_hoist`): a load hoisted out of the loop reads before the
+///   acquire.
+///
+/// Instruction selection lowers every atomic load narrower than 128 bits to
+/// one of these whatever its ordering, so a `Relaxed` load is one too.
+///
+/// These are the only `Load`-class opcodes with ordering semantics. Release
+/// stores, exclusives, LSE atomics, barriers and volatile accesses are
+/// `Store`/`Call`, which those three passes already treat as writers.
+pub fn is_load_acquire(opcode: AArch64Opcode) -> bool {
+    matches!(
+        opcode,
+        AArch64Opcode::Ldar | AArch64Opcode::Ldarb | AArch64Opcode::Ldarh | AArch64Opcode::Ldaxr
+    )
 }
 
 /// Legacy classifier for opcodes with a primary result in operand 0.
@@ -312,6 +357,19 @@ pub(crate) fn inst_defines_vreg(inst: &MachInst, v: VReg) -> bool {
     found
 }
 
+/// Whether an explicit modeled definition clobbers this numeric register ID.
+/// W/X views share an ID even when their operand classes differ. Use this
+/// storage-identity query for redefinition barriers, not the exact typed
+/// carrier query above. The shared operand-role model remains authoritative.
+#[inline]
+pub(crate) fn inst_clobbers_vreg_id(inst: &MachInst, id: u32) -> bool {
+    let mut found = false;
+    for_each_inst_def(inst, |defined| {
+        found |= defined.id == id;
+    });
+    found
+}
+
 /// The vreg in the sole modeled def position, or `None` for zero/multiple defs
 /// or a malformed non-vreg destination.
 ///
@@ -365,20 +423,19 @@ fn operand_zero_is_def(opcode: AArch64Opcode, operand_count: usize) -> bool {
 /// resolve copy chains and constants back to a defining instruction
 /// (`strip_copies`, `same_as_iv`, `const_value` and friends).
 ///
-/// **This is the one implementation.** It replaced 24 hand-rolled copies that
-/// had drifted apart on two independent axes, each copy looking locally
-/// reasonable. The drift *is* the defect, so a new pass must call this rather
-/// than open-code the loop again.
+/// Passes share this implementation so definition discovery does not drift
+/// between consumers. New passes should call it instead of duplicating a scan.
 ///
-/// Two ways the naive loop
+/// This naive loop illustrates two failure modes (pseudocode, not a runnable
+/// example):
 ///
-/// ```ignore
+/// ```text
 /// for (idx, inst) in func.insts.iter().enumerate() {
 ///     if let Some(MachOperand::VReg(v)) = inst.operands.first() { .. }
 /// }
 /// ```
 ///
-/// names a "definition" that never defines the value the consumer reads. Note
+/// It can name a "definition" that never defines the value the consumer reads. Note
 /// it is last-wins by ARENA INDEX, which is not program order, so a bad entry
 /// silently outranks the real def:
 ///
@@ -458,13 +515,18 @@ fn operand_zero_is_def(opcode: AArch64Opcode, operand_count: usize) -> bool {
 ///
 /// Consumers that resolve an admitting operand through this non-unique map
 /// must enforce uniqueness at their own boundary with [`live_def_count`] or
-/// [`build_unique_reaching_def_map`]. The audited vectorization recognizers do
-/// that for non-loop-carried values and copy chains; the induction variable
+/// [`build_unique_reaching_def_map`]. The shared resolvers in
+/// `crate::mach_util` do it for them: `const_value` and `materialized_value`
+/// return a constant only when EVERY def of the id writes it, and
+/// `sole_copy_source` (under `strip_copies` and `copies_reg`) walks a copy
+/// only when it is the id's only def; they use this map's def as a cheap first
+/// filter and nothing more. A consumer with a use point reads the value that
+/// reaches it with `crate::reaching_const` instead. The induction variable
 /// itself deliberately retains its two expected definitions. Any new consumer
 /// inherits the same obligation and must fail closed rather than crediting
 /// `[TCG-SSA-071]` as proof authority.
 pub fn build_reaching_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for &b in &func.block_order {
         for &id in &func.block(b).insts {
             let inst = func.inst(id);
@@ -483,7 +545,7 @@ pub fn build_reaching_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
 /// which is precisely the confusion that once had a `*mut f32` fill loop emit
 /// `dup v0.2d, x28`. Same sweep, same complete role model, stricter key.
 pub fn build_reaching_def_map_by_vreg(func: &MachFunction) -> HashMap<VReg, InstId> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for &b in &func.block_order {
         for &id in &func.block(b).insts {
             let inst = func.inst(id);
@@ -502,7 +564,7 @@ pub fn build_reaching_def_map_by_vreg(func: &MachFunction) -> HashMap<VReg, Inst
 /// not collapsing multi-def ids, so a caller can SEE that a register has more
 /// than one definition instead of silently resolving to whichever came last.
 pub fn build_all_defs_map(func: &MachFunction) -> HashMap<VReg, Vec<InstId>> {
-    let mut map: HashMap<VReg, Vec<InstId>> = HashMap::new();
+    let mut map: HashMap<VReg, Vec<InstId>> = HashMap::default();
     for &b in &func.block_order {
         for &id in &func.block(b).insts {
             let inst = func.inst(id);
@@ -512,6 +574,24 @@ pub fn build_all_defs_map(func: &MachFunction) -> HashMap<VReg, Vec<InstId>> {
         }
     }
     map
+}
+
+/// How many modeled use OPERANDS read each vreg in the emitted layout: one per
+/// operand occurrence ([`for_each_inst_use`]), so `Csel d, v, v` counts `v`
+/// twice. A count of 1 means a single operand of a single instruction reads the
+/// vreg, which is what a rewrite that replaces that one operand and deletes the
+/// vreg's producer needs. Counting reading INSTRUCTIONS instead would report 1
+/// for that `Csel` and strand its other operand.
+pub(crate) fn build_vreg_read_counts(func: &MachFunction) -> HashMap<VReg, u32> {
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
+    for &b in &func.block_order {
+        for &id in &func.block(b).insts {
+            for_each_inst_use(func.inst(id), |v| {
+                *counts.entry(v).or_insert(0) += 1;
+            });
+        }
+    }
+    counts
 }
 
 /// Number of instructions in the EMITTED layout that write vreg `id`, counting
@@ -551,7 +631,7 @@ pub fn live_def_count(func: &MachFunction, id: u32) -> usize {
 /// Reach for this where resolving through a def that may not reach the use
 /// would be UNSOUND rather than merely imprecise.
 pub fn build_unique_reaching_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    let mut counts: HashMap<u32, usize> = HashMap::new();
+    let mut counts: HashMap<u32, usize> = HashMap::default();
     for &b in &func.block_order {
         for &i in &func.block(b).insts {
             let inst = func.inst(i);
@@ -642,6 +722,27 @@ pub fn is_lse_cas(opcode: AArch64Opcode) -> bool {
         opcode,
         AArch64Opcode::Cas | AArch64Opcode::Casa | AArch64Opcode::Casal | AArch64Opcode::Casl
     )
+}
+
+/// Returns true for the opaque AArch64 LL/SC atomic pseudos
+/// (`LlscRmw*` / `LlscCmpSwap*`), whose leading operands are all definitions
+/// (see [`trust_cg_ir::llsc::LlscPseudo::def_count`]).
+pub fn is_llsc_pseudo(opcode: AArch64Opcode) -> bool {
+    trust_cg_ir::llsc::LlscPseudo::of(opcode).is_some()
+}
+
+/// Opcodes whose def/use partition must come from the explicit role table
+/// even though they write memory: LSE RMW/CAS atomics, store-exclusive forms
+/// (operand 0 is the W status DEF) and the LL/SC pseudos (several leading
+/// defs). Every def/use consumer that otherwise treats a memory write as
+/// "all operands are uses" (register allocation, spill materialization,
+/// post-RA reaching-definition and debug-provenance walks) must consult this
+/// single predicate first.
+pub fn has_explicit_atomic_operand_roles(opcode: AArch64Opcode) -> bool {
+    is_lse_rmw(opcode)
+        || is_lse_cas(opcode)
+        || trust_cg_ir::llsc::is_exclusive_store(opcode)
+        || is_llsc_pseudo(opcode)
 }
 
 /// Returns true when operand 0 is explicitly both a def and a use.
@@ -768,6 +869,21 @@ fn fill_operand_roles(opcode: AArch64Opcode, roles: &mut [OperandRole]) {
         return;
     }
 
+    if let Some(pseudo) = trust_cg_ir::llsc::LlscPseudo::of(opcode) {
+        for role in roles.iter_mut().take(pseudo.def_count()) {
+            *role = OperandRole::Def;
+        }
+        return;
+    }
+
+    // LDXP/LDAXP Xt1, Xt2, [Xn] define both data registers.
+    if matches!(opcode, AArch64Opcode::Ldxp | AArch64Opcode::Ldaxp) {
+        for role in roles.iter_mut().take(2) {
+            *role = OperandRole::Def;
+        }
+        return;
+    }
+
     if opcode == AArch64Opcode::LdpRI {
         for role in roles.iter_mut().take(2) {
             *role = OperandRole::Def;
@@ -784,9 +900,114 @@ fn fill_operand_roles(opcode: AArch64Opcode, roles: &mut [OperandRole]) {
     }
 }
 
+/// One opcode's roles for its leading operands; every later operand is a use.
+///
+/// Every classification [`fill_operand_roles`] makes has that shape — these
+/// leading operands have these roles, written only where the operand exists —
+/// so an opcode's roles for any operand count up to [`ROLE_INLINE_CAP`] are its
+/// roles for `ROLE_INLINE_CAP` operands, truncated. [`role_prefix`] memoizes
+/// that pattern per opcode, but only after re-deriving the roles for EVERY
+/// count up to the cap and finding each one equal to the truncation; an opcode
+/// that fails the check is marked to take the direct path forever. The memo
+/// therefore never answers anything `fill_operand_roles` would not: it only
+/// stops re-running the opcode classification (a chain of large `matches!`)
+/// for every operand-role query of every pass.
+///
+/// Packed: two bits per position (0 use, 1 def, 2 def-use) in bits 0..16, the
+/// pattern length in bits 16..20.
+#[derive(Clone, Copy)]
+struct RolePrefix(u32);
+
+impl RolePrefix {
+    #[inline]
+    fn len(self) -> usize {
+        ((self.0 >> 16) & 0xF) as usize
+    }
+
+    #[inline]
+    fn role(self, pos: usize) -> OperandRole {
+        if pos >= self.len() {
+            return OperandRole::Use;
+        }
+        match (self.0 >> (2 * pos)) & 3 {
+            1 => OperandRole::Def,
+            2 => OperandRole::DefUse,
+            _ => OperandRole::Use,
+        }
+    }
+
+    /// The pattern `fill_operand_roles` gives `opcode`, if it is one.
+    fn derive(opcode: AArch64Opcode) -> Option<Self> {
+        let mut full = [OperandRole::Use; ROLE_INLINE_CAP];
+        fill_operand_roles(opcode, &mut full);
+        let len = full
+            .iter()
+            .rposition(|role| *role != OperandRole::Use)
+            .map_or(0, |last| last + 1);
+        let mut bits = (len as u32) << 16;
+        for (pos, role) in full[..len].iter().enumerate() {
+            let code = match role {
+                OperandRole::Use => 0,
+                OperandRole::Def => 1,
+                OperandRole::DefUse => 2,
+            };
+            bits |= code << (2 * pos);
+        }
+        let prefix = Self(bits);
+        for count in 0..=ROLE_INLINE_CAP {
+            let mut roles = [OperandRole::Use; ROLE_INLINE_CAP];
+            let roles = &mut roles[..count];
+            fill_operand_roles(opcode, roles);
+            if roles
+                .iter()
+                .enumerate()
+                .any(|(pos, role)| *role != prefix.role(pos))
+            {
+                return None;
+            }
+        }
+        Some(prefix)
+    }
+}
+
+/// Memo slot values: not derived yet, derived but not a truncated pattern,
+/// or (with this bit set) the packed [`RolePrefix`].
+const ROLE_MEMO_EMPTY: u32 = 0;
+const ROLE_MEMO_DIRECT: u32 = 1;
+const ROLE_MEMO_PATTERN: u32 = 1 << 31;
+/// Opcode discriminants at or beyond this take the direct path.
+const ROLE_MEMO_SLOTS: usize = 1024;
+
+static ROLE_MEMO: [std::sync::atomic::AtomicU32; ROLE_MEMO_SLOTS] =
+    [const { std::sync::atomic::AtomicU32::new(ROLE_MEMO_EMPTY) }; ROLE_MEMO_SLOTS];
+
+/// The memoized [`RolePrefix`] of `opcode`, or `None` when its roles must be
+/// classified directly. Relaxed ordering is enough: a slot only ever goes
+/// from empty to the one value `RolePrefix::derive` computes for that opcode,
+/// so racing threads store the same value.
+#[inline]
+fn role_prefix(opcode: AArch64Opcode) -> Option<RolePrefix> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let slot = ROLE_MEMO.get(opcode as usize)?;
+    let memo = slot.load(Relaxed);
+    if memo & ROLE_MEMO_PATTERN != 0 {
+        return Some(RolePrefix(memo & !ROLE_MEMO_PATTERN));
+    }
+    if memo == ROLE_MEMO_DIRECT {
+        return None;
+    }
+    let derived = RolePrefix::derive(opcode);
+    slot.store(
+        derived.map_or(ROLE_MEMO_DIRECT, |prefix| prefix.0 | ROLE_MEMO_PATTERN),
+        Relaxed,
+    );
+    derived
+}
+
 /// Invoke `f` with every explicit-operand role, without heap allocation for the
-/// common case. Delegates to [`fill_operand_roles`], so the roles are identical
-/// to [`aarch64_operand_roles`]; only the storage differs (inline stack array up
+/// common case. The roles are [`fill_operand_roles`]'s, through the per-opcode
+/// [`role_prefix`] memo where it applies, so they are identical to
+/// [`aarch64_operand_roles`]; only the storage differs (inline stack array up
 /// to [`ROLE_INLINE_CAP`], heap fallback beyond). Positions are visited in
 /// ascending order, matching the `Vec`/`into_iter` callers.
 #[inline]
@@ -796,6 +1017,12 @@ fn for_each_operand_role(
     mut f: impl FnMut(usize, OperandRole),
 ) {
     if operand_count <= ROLE_INLINE_CAP {
+        if let Some(prefix) = role_prefix(opcode) {
+            for pos in 0..operand_count {
+                f(pos, prefix.role(pos));
+            }
+            return;
+        }
         let mut roles = [OperandRole::Use; ROLE_INLINE_CAP];
         let roles = &mut roles[..operand_count];
         fill_operand_roles(opcode, roles);
@@ -820,6 +1047,18 @@ pub fn aarch64_for_each_def_position(
     operand_count: usize,
     mut f: impl FnMut(usize),
 ) {
+    // Past the memoized pattern every operand is a use: visit only the
+    // pattern's positions.
+    if operand_count <= ROLE_INLINE_CAP
+        && let Some(prefix) = role_prefix(opcode)
+    {
+        for pos in 0..operand_count.min(prefix.len()) {
+            if prefix.role(pos).is_def() {
+                f(pos);
+            }
+        }
+        return;
+    }
     for_each_operand_role(opcode, operand_count, |pos, role| {
         if role.is_def() {
             f(pos);
@@ -899,6 +1138,8 @@ pub fn is_removable(opcode: AArch64Opcode) -> bool {
             | AddsRI
             | SubsRR
             | SubsRI
+            | Adcs
+            | Sbcs
             | Brk
             | TrapOverflow
             | TrapBoundsCheck
@@ -913,9 +1154,10 @@ pub fn is_removable(opcode: AArch64Opcode) -> bool {
     )
 }
 
-/// Returns true if the opcode writes implicit NZCV condition flags.
+/// Returns true if the opcode MAY write implicit NZCV condition flags.
 ///
-/// These instructions set the processor flags (N, Z, C, V) as a side effect.
+/// Architectural writers set the processor flags (N, Z, C, V) as a side effect.
+/// Opaque LL/SC expansions may do so depending on their operation operands.
 /// Any subsequent flag-reading instruction (CSet, Csel, BCond, etc.) depends
 /// on the most recent flag-writing instruction, but this dependency is NOT
 /// captured in the explicit operand list.
@@ -924,6 +1166,15 @@ pub fn is_removable(opcode: AArch64Opcode) -> bool {
 /// Without explicit edges, the scheduler may freely reorder a CSet before
 /// the CMP that sets the flags it consumes.
 pub fn writes_flags(opcode: AArch64Opcode) -> bool {
+    definitely_writes_flags(opcode) || is_llsc_pseudo(opcode)
+}
+
+/// Architectural instructions that definitely write NZCV when executed.
+///
+/// This is not a liveness kill: ADCS/SBCS read the old flags first. Use
+/// [`kills_nzcv`] when an instruction must make incoming flags unobservable.
+/// Opaque expansion carriers belong only in the MAY-write scheduling summary.
+pub fn definitely_writes_flags(opcode: AArch64Opcode) -> bool {
     use AArch64Opcode::*;
     matches!(
         opcode,
@@ -939,7 +1190,258 @@ pub fn writes_flags(opcode: AArch64Opcode) -> bool {
             | AddsRI
             | SubsRR
             | SubsRI
+            | Adcs
+            | Sbcs
     )
+}
+
+/// May this instruction change NZCV, so that flags set before it are not the
+/// flags any reader after it sees? Shared by the passes that keep NZCV live
+/// from a CSET to a later consumer (`cmp_branch_fusion`, `select_fuse`).
+///
+/// Deliberately conservative: returns `true` (clobbers) unless the
+/// instruction is provably NZCV-transparent. Beyond the architectural flag
+/// writers ([`writes_flags`]), the following all count as clobbers:
+///
+/// - **Calls** (`BL`/`BLR`): NZCV is caller-saved.
+/// - **Branches/terminators**: control leaves the straight-line region.
+/// - **Trap carriers** (`TrapBoundsCheckExact`, `TrapShiftRangeIfOOB`, ...):
+///   these expand at codegen time into `CMP; B.LO; BRK` / `CBNZ; BRK`
+///   sequences (see `trust-cg-codegen/src/lower.rs`), so they clobber NZCV
+///   at runtime even though the carrier opcode itself is not a flag writer.
+/// - **Pseudos** other than `Copy`/`Nop`: unknown expansion. `Copy` lowers
+///   to a plain register move and `Nop` to nothing — both NZCV-transparent.
+/// - **Generic system-register reads** (`Mrs`): the operand-selected register
+///   can observe NZCV, so the shared opaque-effect boundary applies here too.
+pub fn may_clobber_nzcv(inst: &MachInst) -> bool {
+    use AArch64Opcode::*;
+    if writes_flags(inst.opcode) || nzcv_unknown(inst) {
+        return true;
+    }
+    if matches!(
+        inst.opcode,
+        Brk | TrapOverflow
+            | TrapBoundsCheck
+            | TrapBoundsCheckExact
+            | TrapNull
+            | TrapNullIfZero
+            | TrapDivZero
+            | TrapDivZeroIfZero
+            | TrapShiftRange
+            | TrapShiftRangeIfOOB
+            | TrapOverflowExact
+    ) {
+        return true;
+    }
+    // Consult both the instruction's own flags and the opcode defaults —
+    // passes occasionally construct MachInsts with hand-set flags.
+    let combined = inst.flags.union(inst.opcode.default_flags());
+    if combined.contains(trust_cg_ir::InstFlags::IS_CALL)
+        || combined.contains(trust_cg_ir::InstFlags::IS_BRANCH)
+        || combined.contains(trust_cg_ir::InstFlags::IS_TERMINATOR)
+    {
+        return true;
+    }
+    if combined.contains(trust_cg_ir::InstFlags::IS_PSEUDO) {
+        // Copy lowers to a plain MOV and Nop to nothing; every other pseudo
+        // has an unknown expansion — fail closed.
+        return !matches!(inst.opcode, Copy | Nop);
+    }
+    false
+}
+
+/// Blocks the [`nzcv_dead_after_branch`] successor walk will visit before it
+/// fails closed. Matches `and_cmp_fuse::flags_safe_after`'s budget.
+const NZCV_WALK_BUDGET: usize = 64;
+
+/// Does `inst` READ NZCV?
+///
+/// The complete set of AArch64 NZCV readers modelled by this backend: the
+/// conditional-select/set family and `ADC`/`SBC`
+/// ([`reads_flags`]) plus the conditional branches, which
+/// `reads_flags` tracks structurally rather than by opcode. Explicit implicit
+/// NZCV operands participate in the same contract as architectural readers.
+pub fn reads_nzcv(inst: &MachInst) -> bool {
+    reads_flags(inst.opcode)
+        || matches!(inst.opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc)
+        || inst.implicit_uses.contains(&trust_cg_ir::regs::NZCV)
+}
+
+/// Does `inst` definitely REDEFINE NZCV, so that nothing after it can observe
+/// the flags that were live before it?
+///
+/// Only a definite kill may end the walk early, so this is the STRICT
+/// subset of the MAY-clobber summary: non-reading architectural flag writers,
+/// and ordinary calls (NZCV is caller-saved). Unknown expansions or explicit
+/// NZCV reads/definitions must never terminate a liveness walk as a kill.
+pub fn kills_nzcv(inst: &MachInst) -> bool {
+    if reads_nzcv(inst) || nzcv_unknown(inst) {
+        return false;
+    }
+    if definitely_writes_flags(inst.opcode) {
+        return true;
+    }
+    inst.flags
+        .union(inst.opcode.default_flags())
+        .contains(trust_cg_ir::InstFlags::IS_CALL)
+}
+
+/// An instruction whose NZCV behaviour this walk cannot account for: a pseudo
+/// with an unknown expansion or an unmodeled implicit NZCV definition.
+/// LL/SC carriers intentionally lack IS_PSEUDO but still have opaque expansions.
+/// Generic `Mrs` operands can select NZCV itself or another system register;
+/// an opcode-only summary must not assume the TLS-specific TPIDR_EL0 form.
+/// Keep every form opaque rather than inventing a system-register effect model.
+/// `Copy` lowers to a plain `MOV` and `Nop` to
+/// nothing; the trap carriers are `IS_BRANCH`/`IS_TERMINATOR`, not pseudos, and
+/// expand to sequences that produce their own flags before reading any
+/// (`BRK`, `CMP; B.LO; BRK`, `CBNZ; BRK` — see `trust-cg-codegen/src/lower.rs`).
+pub fn nzcv_unknown(inst: &MachInst) -> bool {
+    is_llsc_pseudo(inst.opcode)
+        || inst.opcode == AArch64Opcode::Mrs
+        || inst.implicit_defs.contains(&trust_cg_ir::regs::NZCV)
+        || (inst
+            .flags
+            .union(inst.opcode.default_flags())
+            .contains(trust_cg_ir::InstFlags::IS_PSEUDO)
+            && !matches!(inst.opcode, AArch64Opcode::Copy | AArch64Opcode::Nop))
+}
+
+/// A block with no successors is only safe to leave with NZCV live if control
+/// genuinely leaves the function there: a `RET` (NZCV is not part of the return
+/// value and does not survive the call boundary) or an abort (`BRK` / a trap
+/// carrier). Anything else is a shape this walk does not model.
+pub fn block_terminates_flag_liveness(func: &MachFunction, block: trust_cg_ir::BlockId) -> bool {
+    func.block(block).insts.last().is_some_and(|&id| {
+        matches!(
+            func.inst(id).opcode,
+            AArch64Opcode::Ret
+                | AArch64Opcode::Brk
+                | AArch64Opcode::TrapOverflow
+                | AArch64Opcode::TrapOverflowExact
+                | AArch64Opcode::TrapBoundsCheck
+                | AArch64Opcode::TrapBoundsCheckExact
+                | AArch64Opcode::TrapNull
+                | AArch64Opcode::TrapNullIfZero
+                | AArch64Opcode::TrapDivZero
+                | AArch64Opcode::TrapDivZeroIfZero
+                | AArch64Opcode::TrapShiftRange
+                | AArch64Opcode::TrapShiftRangeIfOOB
+        )
+    })
+}
+
+/// Prove NZCV is DEAD everywhere reachable after the branch at
+/// `block.insts[branch_pos]`.
+///
+/// cmp-branch-fusion's `try_fuse_cbz`/`try_fuse_tbz` DELETE the flag-setting
+/// compare and replace the `B.cc` with `CBZ`/`CBNZ`/`TBZ`/`TBNZ`, which do not
+/// write NZCV, and select-fuse deletes a `CMP b, #0` re-test; every downstream
+/// reader of those flags loses its producer. cmp-branch-fusion's cross-block
+/// compare elimination deliberately CREATES blocks whose conditional branch or
+/// select reads the live-out NZCV of their single predecessor — exactly the
+/// readers such a deletion would strand. This walk fails closed on anything it
+/// cannot account for.
+///
+/// Instructions already marked for deletion this sweep are skipped: they will
+/// not exist after the sweep's `retain`. That is the conservative direction for
+/// a KILLER (the walk keeps going and can only find more readers). No READER is
+/// ever deleted by this pass without a flag writer surviving ahead of it in the
+/// same block, so skipping cannot hide one.
+pub fn nzcv_dead_after_branch(
+    func: &MachFunction,
+    block: trust_cg_ir::BlockId,
+    branch_pos: usize,
+    to_delete: &crate::fast_hash::FxHashSet<InstId>,
+) -> bool {
+    // Scan the rest of the defining block, after the branch being rewritten.
+    for &id in func.block(block).insts.iter().skip(branch_pos + 1) {
+        if to_delete.contains(&id) {
+            continue;
+        }
+        let inst = func.inst(id);
+        if reads_nzcv(inst) || nzcv_unknown(inst) {
+            return false;
+        }
+        if kills_nzcv(inst) {
+            return true;
+        }
+    }
+
+    let succs = func.block(block).succs.clone();
+    if succs.is_empty() {
+        return block_terminates_flag_liveness(func, block);
+    }
+
+    // Only the origin's tail has been scanned. A backedge enters its head,
+    // where a reader may precede the first surviving flag writer, so the
+    // origin is NOT pre-marked as seen.
+    nzcv_dead_on_paths_from(
+        func,
+        succs,
+        crate::fast_hash::FxHashSet::default(),
+        to_delete,
+    )
+}
+
+/// Prove NZCV is DEAD on entry to `block`: no path from its first instruction
+/// reads the flags before a definite kill ([`kills_nzcv`]), and every path that
+/// leaves the walk without one leaves the function
+/// ([`block_terminates_flag_liveness`]). The same fail-closed walk and budget
+/// as [`nzcv_dead_after_branch`], for a pass that wants to enter `block` from
+/// an edge whose source never set the flags `block` would otherwise see.
+pub fn nzcv_dead_at_block_entry(func: &MachFunction, block: trust_cg_ir::BlockId) -> bool {
+    nzcv_dead_on_paths_from(
+        func,
+        vec![block],
+        crate::fast_hash::FxHashSet::default(),
+        &crate::fast_hash::FxHashSet::default(),
+    )
+}
+
+/// The successor walk shared by [`nzcv_dead_after_branch`] and
+/// [`nzcv_dead_at_block_entry`]: every block in `work` is scanned from its
+/// first instruction.
+fn nzcv_dead_on_paths_from(
+    func: &MachFunction,
+    mut work: Vec<trust_cg_ir::BlockId>,
+    mut seen: crate::fast_hash::FxHashSet<trust_cg_ir::BlockId>,
+    to_delete: &crate::fast_hash::FxHashSet<InstId>,
+) -> bool {
+    let mut budget = NZCV_WALK_BUDGET;
+
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+
+        let mut killed = false;
+        for &id in &func.block(b).insts {
+            if to_delete.contains(&id) {
+                continue;
+            }
+            let inst = func.inst(id);
+            if reads_nzcv(inst) || nzcv_unknown(inst) {
+                return false;
+            }
+            if kills_nzcv(inst) {
+                killed = true;
+                break;
+            }
+        }
+        if !killed {
+            let next = func.block(b).succs.clone();
+            if next.is_empty() && !block_terminates_flag_liveness(func, b) {
+                return false;
+            }
+            work.extend(next);
+        }
+    }
+    true
 }
 
 /// Returns true if the opcode has a tied def-use operand (`operand[0]` is
@@ -1054,7 +1556,7 @@ pub fn reads_flags(opcode: AArch64Opcode) -> bool {
     // CSEL family — the scheduler MUST keep it after its flag-setting CMP.
     matches!(
         opcode,
-        CSet | Csel | Csinc | Csinv | Csneg | FcselRR | Adc | Sbc
+        CSet | Csel | Csinc | Csinv | Csneg | FcselRR | Adc | Sbc | Adcs | Sbcs
     )
 }
 
@@ -1070,14 +1572,18 @@ pub fn x86_opcode_effect(opcode: X86Opcode) -> MemoryEffect {
     match opcode {
         // -- Loads: read memory --
         MovRM8 | MovRM16 | MovRM32 | MovRM | MovsdRM | MovssRM | MovdquRM | MovdqaRM | MovRMSib
-        | MovsxdRMSib | MovRM32Sib | MovRM8Sib | MovsdRMSib | MovssRMSib | AddRM | SubRM | CmpRM
+        | MovsxdRMSib | MovRM32Sib | MovRM8Sib | MovsdRMSib | MovssRMSib | MovdquRMSib | AddRM
+        | SubRM | CmpRM
         | ImulRM
         | ImulRMSib | TestRM | Ptest
         | MovRipRel | MovssRipRel | MovsdRipRel | MovRipRelTlv | Pop => MemoryEffect::Load,
+        // The zero-extending loads read memory exactly like the narrow MOV
+        // loads; only what they write into the destination differs.
+        MovzxRM8 | MovzxRM16 | MovzxRM8Sib => MemoryEffect::Load,
 
         // -- Stores: write memory --
         MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR | MovMRSib
-        | MovMR32Sib | MovMR8Sib | Push => MemoryEffect::Store,
+        | MovMR32Sib | MovMR8Sib | MovdquMRSib | Push => MemoryEffect::Store,
 
         // -- Volatile memory: full barrier (see the AArch64 counterpart) --
         // A volatile access must never be elided/CSE'd/forwarded/hoisted/
@@ -1085,7 +1591,9 @@ pub fn x86_opcode_effect(opcode: X86Opcode) -> MemoryEffect {
         VolatileMovRM8 | VolatileMovRM16 | VolatileMovRM32 | VolatileMovRM | VolatileMovMR8
         | VolatileMovMR16 | VolatileMovMR32 | VolatileMovMR | VolatileMovssRM | VolatileMovssMR
         | VolatileMovsdRM | VolatileMovsdMR | VolatileMovdquRM | VolatileMovdquMR
-        | VolatileMovdqaRM | VolatileMovdqaMR => MemoryEffect::Call,
+        | VolatileMovdqaRM | VolatileMovdqaMR | VolatileMovzxRM8 | VolatileMovzxRM16 => {
+            MemoryEffect::Call
+        }
 
         // -- Calls / barriers: full memory ordering barrier --
         Call | CallR | CallM | Mfence => MemoryEffect::Call,
@@ -1152,7 +1660,7 @@ pub fn x86_opcode_effect(opcode: X86Opcode) -> MemoryEffect {
 
         // Atomic: conservative (read + write memory)
         Xchg => MemoryEffect::Store,
-        Cmpxchg | Cmpxchg8 | Cmpxchg16 => MemoryEffect::Store,
+        Cmpxchg | Cmpxchg8 | Cmpxchg16 | AtomicLoadCmpxchg16b => MemoryEffect::Store,
         AtomicRmwCasLoop | AtomicRmwCasLoop8 | AtomicRmwCasLoop16 => MemoryEffect::Store,
 
         // Memory-destination RMW ALU (XOR/ADD [mem], r64): reads AND writes
@@ -1225,34 +1733,128 @@ fn x86_isel_operand_is_register(operand: &X86ISelOperand) -> bool {
     matches!(operand, X86ISelOperand::VReg(_) | X86ISelOperand::PReg(_))
 }
 
+/// Explicit virtual registers that may be written. Exchange/CAS carriers
+/// conservatively include every direct register operand, including secondary
+/// results. IDs are deduplicated: width views are aliases, not extra writes.
+/// Proof-only guards carry uses, never definitions. Allocation-free, including
+/// the short prefix scan used to deduplicate each instruction's operands.
+pub(crate) fn x86_may_defined_vregs(
+    inst: &X86ISelInst,
+) -> impl Iterator<Item = trust_cg_ir::VReg> + '_ {
+    let exchange = matches!(
+        inst.opcode,
+        X86Opcode::Xchg
+            | X86Opcode::Cmpxchg
+            | X86Opcode::Cmpxchg8
+            | X86Opcode::Cmpxchg16
+            | X86Opcode::AtomicRmwCasLoop
+            | X86Opcode::AtomicRmwCasLoop8
+            | X86Opcode::AtomicRmwCasLoop16
+    );
+    let limit = if trust_cg_ir::guard_target::classify_x86_carrier(inst.opcode).is_some() {
+        0
+    } else if exchange {
+        inst.operands.len()
+    } else {
+        usize::from(x86_produces_value(inst.opcode))
+    };
+    inst.operands
+        .iter()
+        .take(limit)
+        .enumerate()
+        .filter_map(move |(index, op)| {
+            let X86ISelOperand::VReg(v) = op else {
+                return None;
+            };
+            (!inst.operands[..index]
+                .iter()
+                .any(|prior| matches!(prior, X86ISelOperand::VReg(d) if d.id == v.id)))
+            .then_some(*v)
+        })
+}
+
 /// Returns true if this x86-64 opcode produces a value (`operand[0]` is a def).
+///
+/// EXHAUSTIVE on purpose: there is no `_` arm, so a new `X86Opcode` variant
+/// does not compile until someone decides whether its operand 0 is written.
+/// This used to be a `!matches!` blacklist, and every opcode appended after it
+/// was written silently answered `true` — including three families whose
+/// operand 0 is a READ:
+///
+/// * `JmpR [target]` — the indirect jump-table dispatch reads its target;
+/// * the `Volatile*MR` stores — operand 0 is the destination `MemAddr`, whose
+///   base register is read (a def reading skipped it, so DCE deleted the
+///   `Lea` that formed a volatile store's address);
+/// * `Cmpxchg8` / `Cmpxchg16` — operand 0 is the desired value, exactly as
+///   for `Cmpxchg` (the result arrives in the implicit accumulator).
+///
+/// A `false` answer means no explicit register is defined, so operand 0 is
+/// read (or is a label, immediate or implicit-register form). Opcodes whose
+/// writes go to implicit fixed registers (`Cdq`/`Cqo`/`Idiv`/`Div`/`Mul`, the
+/// `Cmpxchg` family) or to memory (stores, memory-destination RMW, `Push`)
+/// define no explicit vreg.
+///
+/// `StackAlloc [dst, count, unit, align]` used to answer `false` although it
+/// writes `dst`, so every def map built on this function (x86 LICM's loop
+/// defs and def counts, `mach_view`, single-def counts) missed the write.
+///
+/// This is also the register allocator's def model: the trust-cg-codegen x86
+/// pipeline's `opcode_has_def` delegates here.
+///
+/// `true` does not say operand 0 is ONLY written: the tied two-address forms
+/// also read it. Ask [`x86_operand0_may_be_read`] for that.
 pub fn x86_produces_value(opcode: X86Opcode) -> bool {
     use X86Opcode::*;
-    !matches!(
-        opcode,
+    match opcode {
         // Compare/test: only set flags
-        CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM
-        | Ucomisd | Ucomiss | BtRI | Ptest
-        // Stores
-        | MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR
-        | MovMRSib | MovMR32Sib | MovMR8Sib
+        CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM | Ucomisd | Ucomiss | BtRI
+        | Ptest => false,
+
+        // Stores: operand 0 is the destination memory operand.
+        MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR | MovMRSib
+        | MovMR32Sib | MovMR8Sib | MovdquMRSib => false,
+
+        // Volatile stores: the same `[MemAddr, src]` schema as the plain stores.
+        VolatileMovMR8 | VolatileMovMR16 | VolatileMovMR32 | VolatileMovMR | VolatileMovssMR
+        | VolatileMovsdMR | VolatileMovdquMR | VolatileMovdqaMR => false,
+
         // Memory-destination RMW ALU: the destination is the memory slot;
         // no register is defined.
-        | XorMR | AddMR | XorMRSib | AddMRSib
-        // Branches and control flow
-        | Jmp | Jcc | Call | CallR | CallM | Ret
+        XorMR | AddMR | XorMRSib | AddMRSib => false,
+
+        // Branches and control flow. `JmpR [target]` READS its target.
+        Jmp | JmpR | Jcc | Call | CallR | CallM | Ret => false,
+
         // Stack store
-        | Push
-        // Pseudo with no value
-        | Nop | NopMulti | StackAlloc
+        Push => false,
+
+        // Pseudo with no value.
+        Nop | NopMulti => false,
+
+        // Runtime stack allocation: `StackAlloc [dst, count, unit, align]`
+        // writes the allocated address to `dst` (the codegen expansion
+        // writes it with `mov dst, rsp`) and reads only `count`. The round-8 JIT
+        // transcription of this function (`e2e_trust_fns_round8.rs`) is
+        // re-pinned to this answer.
+        StackAlloc => true,
+
         // Memory fence
-        | Mfence
-        // Atomic exchange (complex implicit operands)
-        | Cmpxchg
+        Mfence => false,
+
+        // Compare-exchange at every width: `[desired, MemAddr]`, both read;
+        // the old value lands in the implicit accumulator.
+        Cmpxchg | Cmpxchg8 | Cmpxchg16 => false,
+
+        // The 128-bit atomic-load pseudo: `[MemAddr]` only; the loaded value
+        // lands in the implicit RDX:RAX, so no explicit register is defined.
+        AtomicLoadCmpxchg16b => false,
+
         // Fixed-register implicit writes
-        | Cdq | Cqo | Idiv | Div | Mul
+        Cdq | Cqo | Idiv | Div | Mul => false,
+
         // Trap terminator
-        | Ud2
+        Ud2 => false,
+
         // Proof-only trap carriers: every operand is a READ of the guarded
         // value (the expansion emits TEST/CMP on them); nothing is defined.
         // P0 (2026-07-18, b14/b18 runtime ud2): treating operand[0] as a def
@@ -1260,9 +1862,174 @@ pub fn x86_produces_value(opcode: X86Opcode) -> bool {
         // magic-sdiv replaced the Div — liveness/DCE then dropped the
         // divisor's MovRI while the carrier expanded into a real test of a
         // never-written spill slot.
-        | TrapBoundsCheckExact | TrapNullIfZeroExact | TrapDivZeroExact
-        | TrapShiftRangeExact
-    )
+        TrapBoundsCheckExact | TrapNullIfZeroExact | TrapDivZeroExact | TrapShiftRangeExact => {
+            false
+        }
+
+        // Integer ALU, shifts and rotates.
+        AddRR | AddRI | AddRM | SubRR | SubRI | SubRM | ImulRR | ImulRRI | ImulRM | ImulRMSib
+        | AdcRR | SbbRR | Neg | Inc | Dec | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI | Not
+        | ShlRR | ShlRI | ShrRR | ShrRI | SarRR | SarRI | RolRI | RolRCl => true,
+
+        // Register, immediate and address moves; loads.
+        MovRR | MovRR32 | MovRI | Movzx | MovzxW | MovsxB | MovsxW | Movsx | Lea | LeaSib
+        | LeaRip | MovRM8 | MovRM16 | MovRM32 | MovRM | MovRMSib | MovRM32Sib | MovRM8Sib
+        | MovsxdRMSib | MovRipRel | MovssRipRel | MovsdRipRel | MovRipRelTlv => true,
+
+        // Volatile loads define their destination like the plain loads.
+        VolatileMovRM8 | VolatileMovRM16 | VolatileMovRM32 | VolatileMovRM | VolatileMovssRM
+        | VolatileMovsdRM | VolatileMovdquRM | VolatileMovdqaRM => true,
+
+        // Zero-extending loads, plain and volatile.
+        MovzxRM8 | MovzxRM16 | MovzxRM8Sib | VolatileMovzxRM8 | VolatileMovzxRM16 => true,
+
+        // Conditional move/set.
+        Cmovcc | Cmovcc32 | Setcc => true,
+
+        // Scalar SSE arithmetic, moves and loads.
+        Addsd | Subsd | Mulsd | Divsd | Sqrtsd | Andpd | Addss | Subss | Mulss | Divss | Sqrtss
+        | Andps | Roundsd | Roundss | Minsd | Maxsd | Minss | Maxss | Cmpsd | Cmpss | MovsdRR
+        | MovssRR | MovsdRM | MovssRM | MovsdRMSib | MovssRMSib | MovdquRM | MovdquRMSib
+        | MovdqaRR | MovdqaRM => true,
+
+        // Conversions and GPR <-> XMM transfers.
+        Cvtsi2sd | Cvtsd2si | Cvttsd2si | Cvtsi2ss | Cvtss2si | Cvttss2si | Cvtsd2ss | Cvtss2sd
+        | MovdToXmm | MovdFromXmm | MovqToXmm | MovqFromXmm => true,
+
+        // Bit manipulation.
+        Bsf | Bsr | Tzcnt | Lzcnt | Popcnt | Bswap => true,
+
+        // Exchange and the CAS-loop RMW pseudos: operand 0 receives the old
+        // value.
+        Xchg | AtomicRmwCasLoop | AtomicRmwCasLoop8 | AtomicRmwCasLoop16 => true,
+
+        // Stack pop and SSA phi.
+        Pop | Phi => true,
+
+        // Packed SSE/SSE2/SSE4 integer and floating-point operations, and the
+        // vector pseudos that lower to them.
+        Pand | Pandn | Por | Pxor | Pcmpeqb | Pcmpeqw | Pcmpeqd | Pcmpeqq | Pcmpgtb | Pcmpgtw
+        | Pcmpgtd | Pcmpgtq | Paddb | Paddw | Paddd | Paddq | Psubb | Psubw | Psubd | Psubq
+        | Pmullw | Pmulld | Pmuludq | Psadbw | Punpcklbw | Punpckhbw | Punpckldq | Punpcklqdq
+        | Packuswb | Pshufd | Pmovmskb | Pinsrd | Pinsrq | Pextrd | Pextrq | Pblendvb | Pslld
+        | Psrld | Psrad | Psllq | Psrlq | Addps | Subps | Mulps | Divps | Addpd | Subpd | Mulpd
+        | Divpd | V4I32MaskExtract | V16I8MaskExtract | V8I16MaskExtract | V2I64MaskExtract
+        | V128BoolSelect => true,
+    }
+}
+
+/// Whether `inst` may READ the register its operand 0 names — the use half of
+/// the operand-0 role, decided per instruction FORM.
+///
+/// * An opcode that defines no register ([`x86_produces_value`] is `false`)
+///   always reads operand 0: a store's destination address, a compare's first
+///   source, `JmpR`'s target, a compare-exchange's desired value, a trap
+///   carrier's guarded value.
+/// * A value-producing opcode reads operand 0 when the form is tied — the
+///   destination is also the first source (`AddRR [d, s]` is `d := d + s`) —
+///   or the write is read-modify-write or conditional (`Inc`, `Cmovcc`).
+///
+/// This is a MAY-read over-approximation, meant for liveness, use counting
+/// and for refusing to treat a form as a function of its sources alone (x86
+/// CSE and LICM). It answers `true` whenever either model the backend carries
+/// says operand 0 is read: the opcode-level tied list the x86 DCE, CSE, LICM
+/// and copy-propagation passes used to carry privately
+/// (`first_operand_is_def_and_use`, which ignored the form), or the register
+/// allocator's per-form two-address tie (`first_operand_is_def_and_use` in the
+/// trust-cg-codegen x86 pipeline). An extra read only keeps a definition
+/// alive. It does NOT make operand 0 a pure use: a tied operand 0 is written
+/// as well, so a pass that rewrites uses must never rename it on the strength
+/// of this answer (x86 copy propagation renamed the tied `Not [v]`).
+///
+/// Exhaustive on purpose (no `_` arm): a new opcode must decide its tie here,
+/// as it must decide its def in [`x86_produces_value`].
+pub fn x86_operand0_may_be_read(inst: &X86ISelInst) -> bool {
+    use X86Opcode::*;
+    // The two-address (tied) form of a binary op names the destination as its
+    // first source, so it carries one operand fewer than the three-address
+    // form: `[d, s]` versus `[d, a, b]`.
+    let tied_binary = inst.operands.len() < 3;
+    // The same, for the forms that also carry an immediate: `[d, s, imm]`
+    // versus `[d, a, b, imm]`.
+    let tied_binary_with_imm = inst.operands.len() < 4;
+    match inst.opcode {
+        // -- No register defined: every operand is a read. --
+        CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM | Ucomisd | Ucomiss | BtRI
+        | Ptest | MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR
+        | MovMRSib | MovMR32Sib | MovMR8Sib | MovdquMRSib | VolatileMovMR8 | VolatileMovMR16
+        | VolatileMovMR32 | VolatileMovMR | VolatileMovssMR | VolatileMovsdMR
+        | VolatileMovdquMR | VolatileMovdqaMR | XorMR | AddMR | XorMRSib | AddMRSib | Jmp
+        | JmpR | Jcc | Call | CallR | CallM | Ret | Push | Nop | NopMulti | Mfence | Cmpxchg
+        | Cmpxchg8 | Cmpxchg16 | Cdq | Cqo | Idiv | Div | Mul | Ud2 | TrapBoundsCheckExact
+        | TrapNullIfZeroExact | TrapDivZeroExact | TrapShiftRangeExact => true,
+
+        // The 128-bit atomic-load pseudo defines no register: operand 0 is the
+        // memory operand, whose base is read.
+        AtomicLoadCmpxchg16b => true,
+
+        // -- Read-modify-write or conditional in every form. --
+        // Unary in-place ALU.
+        Neg | Not | Inc | Dec => true,
+        // Register-immediate ALU and shifts. The three-operand `[d, s, imm]`
+        // forms do not read `d`, but the passes' tied list has always counted
+        // them; keep the over-approximation.
+        AddRI | SubRI | AndRI | OrRI | XorRI | ShlRI | ShrRI | SarRI => true,
+        // Register-count shifts and rotate (count implicit in CL).
+        ShlRR | ShrRR | SarRR | RolRCl => true,
+        // `[d, mem]`: `d := d OP mem`.
+        AddRM | SubRM | ImulRM | ImulRMSib => true,
+        // A conditional move keeps the old destination on the not-taken path.
+        Cmovcc | Cmovcc32 => true,
+        // In-place byte swap, register exchange, and the blend into its
+        // destination.
+        Bswap | Xchg | Pblendvb => true,
+
+        // -- Read only by the tied two-address form. --
+        AddRR | SubRR | AdcRR | SbbRR | AndRR | OrRR | XorRR | ImulRR => tied_binary,
+        Addsd | Subsd | Mulsd | Divsd | Andpd | Addss | Subss | Mulss | Divss | Andps | Minsd
+        | Maxsd | Minss | Maxss => tied_binary,
+        Pand | Pandn | Por | Pxor | Pcmpeqb | Pcmpeqw | Pcmpeqd | Pcmpeqq | Pcmpgtb | Pcmpgtw
+        | Pcmpgtd | Pcmpgtq | Paddb | Paddw | Paddd | Paddq | Psubb | Psubw | Psubd | Psubq
+        | Pmullw | Pmulld | Pmuludq | Psadbw | Punpcklbw | Punpckhbw | Punpckldq | Punpcklqdq
+        | Packuswb => tied_binary,
+        Addps | Subps | Mulps | Divps | Addpd | Subpd | Mulpd | Divpd => tied_binary,
+        // Immediate-count shifts and rotate: `[d, imm]` is tied, `[d, s, imm]`
+        // is not.
+        RolRI | Pslld | Psrld | Psrad | Psllq | Psrlq => tied_binary,
+        // Compare-to-mask and lane insert carry an immediate on top.
+        Cmpsd | Cmpss | Pinsrd | Pinsrq => tied_binary_with_imm,
+
+        // -- Operand 0 is only written. --
+        // Three-operand IMUL is a genuine hardware three-operand form.
+        ImulRRI => false,
+        MovRR | MovRR32 | MovRI | Movzx | MovzxW | MovsxB | MovsxW | Movsx | Lea | LeaSib
+        | LeaRip => false,
+        MovRM8 | MovRM16 | MovRM32 | MovRM | MovRMSib | MovRM32Sib | MovRM8Sib | MovsxdRMSib
+        | MovRipRel | MovssRipRel | MovsdRipRel | MovRipRelTlv | VolatileMovRM8
+        | VolatileMovRM16 | VolatileMovRM32 | VolatileMovRM | VolatileMovssRM | VolatileMovsdRM
+        | VolatileMovdquRM | VolatileMovdqaRM => false,
+        // A zero-extending load writes the whole register and reads only
+        // memory: operand 0 is never read.
+        MovzxRM8 | MovzxRM16 | MovzxRM8Sib | VolatileMovzxRM8 | VolatileMovzxRM16 => false,
+        MovsdRR | MovssRR | MovdqaRR | MovsdRM | MovssRM | MovsdRMSib | MovssRMSib | MovdquRM
+        | MovdquRMSib | MovdqaRM => false,
+        // `Setcc` writes only the low byte. It does not read operand 0 as long
+        // as its result is consumed through ISel's following `Movzx d, d`,
+        // which reads only that byte; neither model ties it. No pass may drop
+        // that Movzx and rely on bits 31:8 surviving the `Setcc` (the retired
+        // x86 peephole setcc-flag-hoist did, and the allocator saw the
+        // xor-zeroed value as dead).
+        Setcc => false,
+        Sqrtsd | Sqrtss | Roundsd | Roundss | Cvtsi2sd | Cvtsd2si | Cvttsd2si | Cvtsi2ss
+        | Cvtss2si | Cvttss2si | Cvtsd2ss | Cvtss2sd | MovdToXmm | MovdFromXmm | MovqToXmm
+        | MovqFromXmm => false,
+        Bsf | Bsr | Tzcnt | Lzcnt | Popcnt => false,
+        Pshufd | Pmovmskb | Pextrd | Pextrq | V4I32MaskExtract | V16I8MaskExtract
+        | V8I16MaskExtract | V2I64MaskExtract | V128BoolSelect => false,
+        AtomicRmwCasLoop | AtomicRmwCasLoop8 | AtomicRmwCasLoop16 => false,
+        // `StackAlloc [dst, count, unit, align]` reads only `count`.
+        Pop | Phi | StackAlloc => false,
+    }
 }
 
 /// Returns true if this x86-64 opcode can be safely eliminated if
@@ -1350,6 +2117,8 @@ pub fn x86_is_removable(opcode: X86Opcode) -> bool {
 /// modify condition flags. This is a fundamental difference from AArch64
 /// where only explicit flag-setting instructions (CMP, TST, ADDS, SUBS)
 /// modify NZCV.
+/// This is a may-write query; use the internal `condition_flag_overwrite` or
+/// [`x86_defines_all_cc_flags`] when proving an earlier flag value dead.
 pub fn x86_writes_flags(opcode: X86Opcode) -> bool {
     use X86Opcode::*;
     matches!(
@@ -1362,7 +2131,7 @@ pub fn x86_writes_flags(opcode: X86Opcode) -> bool {
         // Memory-destination RMW ALU (same flag behavior as the RR forms)
         | XorMR | AddMR | XorMRSib | AddMRSib
         // Logical
-        | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI | Not
+        | AndRR | AndRI | OrRR | OrRI | XorRR | XorRI
         // Shifts
         // Variable-count rotate: writes CF/OF when the CL count is nonzero
         // (NOT the full shift mask — SF/ZF/AF/PF are untouched; the exact
@@ -1381,6 +2150,11 @@ pub fn x86_writes_flags(opcode: X86Opcode) -> bool {
         | Cmpxchg
         | Cmpxchg8
         | Cmpxchg16
+        // The 128-bit atomic-load pseudo: its zeroing XORs write every flag
+        // (AF undefined) and its CMPXCHG16B then writes ZF. Kept OUT of
+        // `x86_defines_all_cc_flags` (a partial writer is the conservative
+        // reading; nothing consumes these flags).
+        | AtomicLoadCmpxchg16b
         | AtomicRmwCasLoop
         | AtomicRmwCasLoop8
         | AtomicRmwCasLoop16
@@ -1421,6 +2195,46 @@ pub fn x86_defines_all_cc_flags(opcode: X86Opcode) -> bool {
         // Compare/test (same flag behavior as SUB/AND).
         | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM
     )
+}
+
+/// How an instruction overwrites the condition flags consumed by this IR.
+/// Partial writers cannot establish that an earlier flag value is dead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlagOverwrite {
+    None,
+    Partial,
+    Full,
+}
+
+/// Shared instruction-level flag coverage for x86 optimization legality.
+///
+/// A may-write opcode is not necessarily a full overwrite: INC/DEC preserve
+/// CF, rotates preserve ZF/SF/PF, and shifts with zero counts preserve all
+/// flags. Undefined flags also do not qualify as a full definition.
+pub(crate) fn condition_flag_overwrite(inst: &X86ISelInst) -> FlagOverwrite {
+    use X86Opcode::*;
+
+    if matches!(inst.opcode, ShlRI | ShrRI | SarRI)
+        && matches!(
+            inst.operands.as_slice(),
+            [X86ISelOperand::VReg(_), X86ISelOperand::Imm(0)]
+                | [
+                    X86ISelOperand::VReg(_),
+                    X86ISelOperand::VReg(_),
+                    X86ISelOperand::Imm(0),
+                ]
+        )
+    {
+        FlagOverwrite::None
+    } else if x86_defines_all_cc_flags(inst.opcode)
+        || matches!(inst.opcode, Ucomisd | Ucomiss | Popcnt)
+    {
+        FlagOverwrite::Full
+    } else if x86_writes_flags(inst.opcode) {
+        FlagOverwrite::Partial
+    } else {
+        FlagOverwrite::None
+    }
 }
 
 /// Returns true if this x86-64 opcode reads RFLAGS.
@@ -1514,6 +2328,10 @@ pub fn category_reads_flags(cat: OpcodeCategory) -> bool {
 pub fn category_writes_flags(cat: OpcodeCategory) -> bool {
     matches!(cat, OpcodeCategory::CmpRR | OpcodeCategory::CmpRI)
 }
+
+#[cfg(test)]
+#[path = "effects_nzcv_tests.rs"]
+mod nzcv_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2077,6 +2895,277 @@ mod tests {
 }
 
 // ===========================================================================
+// x86-64 operand-0 def/use roles
+// ===========================================================================
+
+#[cfg(test)]
+mod tests_x86_operand_roles {
+    use super::*;
+
+    /// Declares the full `X86Opcode` universe once and derives both the list
+    /// the sweeps below iterate and an exhaustive `match` over the same
+    /// names, so a variant missing from the list is a compile error here.
+    macro_rules! x86_opcode_universe {
+        ($($op:ident),+ $(,)?) => {
+            const ALL_X86_OPCODES: &[X86Opcode] = &[$(X86Opcode::$op),+];
+
+            #[allow(dead_code)]
+            fn universe_is_exhaustive(opcode: X86Opcode) {
+                match opcode {
+                    $(X86Opcode::$op)|+ => {}
+                }
+            }
+        };
+    }
+
+    x86_opcode_universe! {
+        AddRR, AddRI, AddRM, SubRR, SubRI, SubRM, ImulRR, ImulRRI, ImulRM, Idiv, Div,
+        Neg, Inc, Dec, Cdq, Cqo, AndRR, AndRI, OrRR, OrRI, XorRR, XorRI, Not, ShlRR,
+        ShlRI, ShrRR, ShrRI, SarRR, SarRI, MovRR, MovRI, MovRM8, MovRM16, MovRM32,
+        MovRM, MovMR8, MovMR16, MovMR32, MovMR, Movzx, MovzxW, MovsxB, MovsxW, Movsx,
+        Lea, LeaSib, MovRMSib, MovMRSib, LeaRip, CmpRR, CmpRI, CmpRI8, CmpRM, TestRR,
+        TestRI, TestRM, Jmp, Jcc, Call, CallR, CallM, Ret, Addsd, Subsd, Mulsd, Divsd,
+        Sqrtsd, Andpd, MovsdRR, MovsdRM, MovsdMR, Ucomisd, MovdquRM, MovdquMR, Addss,
+        Subss, Mulss, Divss, Sqrtss, Andps, MovssRR, MovssRM, MovssMR, Ucomiss, Roundsd,
+        Roundss, Minsd, Maxsd, Minss, Maxss, Cmpsd, Cmpss, MovssRipRel, MovsdRipRel,
+        Cmovcc, Setcc, Cvtsi2sd, Cvtsd2si, Cvtsi2ss, Cvtss2si, Cvtsd2ss, Cvtss2sd, Bsf,
+        Bsr, Tzcnt, Lzcnt, Popcnt, BtRI, Bswap, Xchg, Cmpxchg, Mfence, MovdToXmm,
+        MovdFromXmm, MovqToXmm, MovqFromXmm, Push, Pop, Phi, StackAlloc, Nop, NopMulti,
+        MovRR32, MovRipRel, Cmovcc32, Mul, Ud2, Cvttsd2si, Cvttss2si, AtomicRmwCasLoop,
+        AtomicRmwCasLoop8, AtomicRmwCasLoop16, Pand, Pandn, Por, Pxor, Pcmpeqd, Pshufd,
+        Pmovmskb, MovdqaRR, Pcmpgtd, MovdqaRM, MovdqaMR, Paddd, Psubd, Punpckldq,
+        Punpcklqdq, Paddq, Psubq, Paddb, Paddw, Psubb, Psubw, Pinsrd, Pextrd,
+        V4I32MaskExtract, Pmulld, Pcmpeqq, Pcmpgtq, Ptest, Pinsrq, Pextrq,
+        V2I64MaskExtract, Pblendvb, V128BoolSelect, Pmuludq, Pmullw, Pcmpeqb, Pcmpeqw,
+        Pcmpgtb, Pcmpgtw, V16I8MaskExtract, V8I16MaskExtract, Pslld, Psrld, Psrad,
+        AdcRR, SbbRR, Addps, Subps, Mulps, Divps, Addpd, Subpd, Mulpd, Divpd, Punpcklbw,
+        Punpckhbw, Packuswb, TrapBoundsCheckExact, TrapNullIfZeroExact,
+        TrapDivZeroExact, TrapShiftRangeExact, Psllq, Psrlq, JmpR, MovsxdRMSib,
+        MovRipRelTlv, Cmpxchg8, Cmpxchg16, Psadbw, ImulRMSib, MovRM32Sib, MovMR32Sib,
+        VolatileMovRM8, VolatileMovRM16, VolatileMovRM32, VolatileMovRM, VolatileMovMR8,
+        VolatileMovMR16, VolatileMovMR32, VolatileMovMR, VolatileMovssRM,
+        VolatileMovssMR, VolatileMovsdRM, VolatileMovsdMR, VolatileMovdquRM,
+        VolatileMovdquMR, VolatileMovdqaRM, VolatileMovdqaMR, MovsdRMSib, MovssRMSib,
+        RolRI, MovRM8Sib, MovMR8Sib, XorMR, AddMR, XorMRSib, AddMRSib, RolRCl,
+        MovdquRMSib, MovdquMRSib, AtomicLoadCmpxchg16b, MovzxRM8, MovzxRM16, MovzxRM8Sib,
+        VolatileMovzxRM8, VolatileMovzxRM16
+    }
+
+    #[test]
+    fn universe_lists_each_opcode_once() {
+        let mut seen = std::collections::HashSet::new();
+        for &opcode in ALL_X86_OPCODES {
+            assert!(seen.insert(opcode), "{opcode:?} listed twice");
+        }
+        // 232 -> 233: `AtomicLoadCmpxchg16b`, the 128-bit atomic-load pseudo.
+        // 233 -> 238: the zero-extending loads `MovzxRM8`, `MovzxRM16`,
+        // `MovzxRM8Sib`, `VolatileMovzxRM8`, `VolatileMovzxRM16`.
+        assert_eq!(seen.len(), 238);
+    }
+
+    /// A control transfer writes no explicit register: its operands are a
+    /// label, a callee, or (for `JmpR`/`CallR`) the target register it READS.
+    /// Reading `JmpR [target]` as a def left the jump-table target with no
+    /// read in every def-use consumer.
+    #[test]
+    fn control_transfers_define_no_register() {
+        for &opcode in ALL_X86_OPCODES {
+            let flags = opcode.default_flags();
+            if flags.is_branch() || flags.is_call() || flags.is_return() || flags.is_terminator() {
+                assert!(
+                    !x86_produces_value(opcode),
+                    "{opcode:?} is a control transfer; operand 0 must not be a def"
+                );
+            }
+        }
+    }
+
+    /// A pure store (writes memory, reads none) has the `[MemAddr, src]`
+    /// schema: operand 0 is the destination address, whose base and index
+    /// registers are READ. The volatile stores used to answer `true`, so DCE
+    /// skipped their address operand and deleted the `Lea` that formed it.
+    #[test]
+    fn pure_stores_define_no_register() {
+        let mut stores = 0usize;
+        for &opcode in ALL_X86_OPCODES {
+            let flags = opcode.default_flags();
+            if flags.writes_memory() && !flags.reads_memory() {
+                stores += 1;
+                assert!(
+                    !x86_produces_value(opcode),
+                    "{opcode:?} is a store; operand 0 is its destination address"
+                );
+            }
+        }
+        // 12 plain stores, 8 volatile stores and `Push`.
+        assert_eq!(stores, 21);
+    }
+
+    /// `StackAlloc [dst, count, unit, align]` writes the runtime stack
+    /// address into `dst` (the codegen expansion writes it with
+    /// `mov dst, rsp`) and reads only `count`. A def map built on a `false`
+    /// answer missed that write.
+    #[test]
+    fn stack_alloc_defines_its_destination() {
+        assert!(x86_produces_value(X86Opcode::StackAlloc));
+        for operand_count in 1..=4 {
+            assert!(
+                !x86_operand0_may_be_read(&inst_with(X86Opcode::StackAlloc, operand_count)),
+                "StackAlloc with {operand_count} operands only writes operand 0"
+            );
+        }
+    }
+
+    /// Every compare-exchange width has the `[desired, MemAddr]` schema and
+    /// returns the old value in the implicit accumulator, so none defines
+    /// operand 0. The narrow widths used to disagree with `Cmpxchg`.
+    #[test]
+    fn compare_exchange_widths_agree() {
+        for opcode in [
+            X86Opcode::Cmpxchg,
+            X86Opcode::Cmpxchg8,
+            X86Opcode::Cmpxchg16,
+        ] {
+            assert!(
+                !x86_produces_value(opcode),
+                "{opcode:?}: operand 0 is the desired value, a read"
+            );
+        }
+    }
+
+    fn vr(id: u32) -> X86ISelOperand {
+        X86ISelOperand::VReg(VReg::new(id, trust_cg_ir::RegClass::Gpr64))
+    }
+
+    fn inst_with(opcode: X86Opcode, operand_count: usize) -> X86ISelInst {
+        let operands = (0..operand_count).map(|i| vr(i as u32)).collect();
+        X86ISelInst::new(opcode, operands)
+    }
+
+    /// Where no register is defined, operand 0 is a read in every form.
+    #[test]
+    fn operand0_of_a_non_defining_opcode_is_always_read() {
+        for &opcode in ALL_X86_OPCODES {
+            if x86_produces_value(opcode) {
+                continue;
+            }
+            for operand_count in 0..=4 {
+                assert!(
+                    x86_operand0_may_be_read(&inst_with(opcode, operand_count)),
+                    "{opcode:?} with {operand_count} operands"
+                );
+            }
+        }
+    }
+
+    /// Every opcode the register allocator ties in its two-operand form
+    /// (`is_x86_two_address_rr` in the trust-cg-codegen x86 pipeline) reads
+    /// operand 0 in that form and not in the three-operand form. `AddRR` is
+    /// the one the jump-table dispatch emits as `AddRR [off, base]`.
+    #[test]
+    fn two_operand_tied_forms_read_operand0() {
+        use X86Opcode::*;
+        for opcode in [
+            AddRR, SubRR, AdcRR, SbbRR, AndRR, OrRR, XorRR, ImulRR, Addsd, Subsd, Mulsd, Divsd,
+            Andpd, Addss, Subss, Mulss, Divss, Andps, Pand, Pandn, Por, Pxor, Pcmpeqb, Pcmpeqw,
+            Pcmpgtb, Pcmpgtw, Pcmpeqd, Pcmpgtd, Paddb, Paddw, Paddd, Psubb, Psubw, Psubd, Paddq,
+            Psubq, Pmullw, Pmuludq, Punpcklbw, Punpckldq, Packuswb, Punpckhbw, Punpcklqdq, Pmulld,
+            Psadbw, Pcmpeqq, Pcmpgtq, Addps, Subps, Mulps, Divps, Addpd, Subpd, Mulpd, Divpd,
+            Minsd, Maxsd, Minss, Maxss,
+        ] {
+            assert!(x86_produces_value(opcode), "{opcode:?}");
+            assert!(
+                x86_operand0_may_be_read(&inst_with(opcode, 2)),
+                "{opcode:?} [d, s]"
+            );
+            assert!(
+                !x86_operand0_may_be_read(&inst_with(opcode, 3)),
+                "{opcode:?} [d, a, b]"
+            );
+        }
+        // The immediate-carrying forms are tied one operand later.
+        for opcode in [Cmpsd, Cmpss, Pinsrd, Pinsrq] {
+            assert!(
+                x86_operand0_may_be_read(&inst_with(opcode, 3)),
+                "{opcode:?} [d, s, imm]"
+            );
+            assert!(
+                !x86_operand0_may_be_read(&inst_with(opcode, 4)),
+                "{opcode:?} [d, a, b, imm]"
+            );
+        }
+    }
+
+    /// Read-modify-write and conditional writes read operand 0 in every form;
+    /// plain moves, loads and three-operand IMUL only write it. `Setcc` only
+    /// writes it because no pass separates it from ISel's `Movzx d, d` (the
+    /// peephole test `x86_peephole_keeps_setcc_movzx_pair` pins that).
+    #[test]
+    fn operand0_reads_of_value_producing_forms() {
+        use X86Opcode::*;
+        for opcode in [
+            Neg, Not, Inc, Dec, AddRI, SubRI, AndRI, OrRI, XorRI, ShlRI, ShrRI, SarRI, ShlRR,
+            ShrRR, SarRR, RolRCl, AddRM, SubRM, ImulRM, ImulRMSib, Cmovcc, Cmovcc32, Bswap, Xchg,
+            Pblendvb,
+        ] {
+            for operand_count in 1..=4 {
+                assert!(
+                    x86_operand0_may_be_read(&inst_with(opcode, operand_count)),
+                    "{opcode:?} with {operand_count} operands"
+                );
+            }
+        }
+        for opcode in [
+            MovRR,
+            MovRR32,
+            MovRI,
+            Lea,
+            LeaSib,
+            LeaRip,
+            MovRM,
+            MovRMSib,
+            VolatileMovRM,
+            ImulRRI,
+            Setcc,
+            Movzx,
+            Popcnt,
+            Pshufd,
+            Phi,
+            Pop,
+            AtomicRmwCasLoop,
+        ] {
+            assert!(x86_produces_value(opcode), "{opcode:?}");
+            for operand_count in 1..=4 {
+                assert!(
+                    !x86_operand0_may_be_read(&inst_with(opcode, operand_count)),
+                    "{opcode:?} with {operand_count} operands"
+                );
+            }
+        }
+    }
+
+    /// The loads, including the volatile ones, still define operand 0.
+    #[test]
+    fn loads_define_their_destination() {
+        for &opcode in ALL_X86_OPCODES {
+            let flags = opcode.default_flags();
+            if flags.reads_memory() && !flags.writes_memory() && !flags.is_call() {
+                // CMP/TEST/PTEST with a memory source only set flags.
+                let flag_only = matches!(
+                    opcode,
+                    X86Opcode::CmpRM | X86Opcode::TestRM | X86Opcode::Ptest
+                );
+                assert_eq!(
+                    x86_produces_value(opcode),
+                    !flag_only,
+                    "{opcode:?}: a load defines its destination unless it only sets flags"
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Reaching-def map
 // ===========================================================================
 
@@ -2355,6 +3444,42 @@ mod tests_x86 {
     use trust_cg_lower::{X86ISelInst, X86ISelOperand};
 
     #[test]
+    fn may_def_ids_cover_secondary_writes_without_counting_aliases_or_guards() {
+        use trust_cg_ir::{RegClass, VReg};
+        let wide = VReg::new(7, RegClass::Gpr64);
+        let alias = VReg::new(7, RegClass::Gpr32);
+        let other = VReg::new(8, RegClass::Gpr64);
+        for (opcode, expected) in [
+            (X86Opcode::Xchg, vec![7, 8]),
+            (X86Opcode::Cmpxchg, vec![7, 8]),
+            (X86Opcode::Cmpxchg8, vec![7, 8]),
+            (X86Opcode::Cmpxchg16, vec![7, 8]),
+            (X86Opcode::AtomicRmwCasLoop, vec![7, 8]),
+            (X86Opcode::AtomicRmwCasLoop8, vec![7, 8]),
+            (X86Opcode::AtomicRmwCasLoop16, vec![7, 8]),
+            (X86Opcode::MovRR, vec![7]),
+            (X86Opcode::CmpRR, vec![]),
+            (X86Opcode::TrapBoundsCheckExact, vec![]),
+        ] {
+            let inst = X86ISelInst::new(
+                opcode,
+                vec![
+                    X86ISelOperand::VReg(wide),
+                    X86ISelOperand::VReg(alias),
+                    X86ISelOperand::VReg(other),
+                ],
+            );
+            assert_eq!(
+                x86_may_defined_vregs(&inst)
+                    .map(|v| v.id)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{opcode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_x86_arithmetic_is_pure() {
         assert_eq!(x86_opcode_effect(X86Opcode::AddRR), MemoryEffect::Pure);
         assert_eq!(x86_opcode_effect(X86Opcode::SubRI), MemoryEffect::Pure);
@@ -2377,6 +3502,20 @@ mod tests_x86 {
         assert_eq!(x86_opcode_effect(X86Opcode::Ptest), MemoryEffect::Load);
         assert_eq!(x86_opcode_effect(X86Opcode::Pop), MemoryEffect::Load);
         assert_eq!(x86_opcode_effect(X86Opcode::MovRMSib), MemoryEffect::Load);
+        for op in [
+            X86Opcode::MovzxRM8,
+            X86Opcode::MovzxRM16,
+            X86Opcode::MovzxRM8Sib,
+        ] {
+            assert_eq!(x86_opcode_effect(op), MemoryEffect::Load, "{op:?}");
+            assert!(x86_produces_value(op), "{op:?}");
+            assert!(!x86_is_removable(op), "{op:?}");
+        }
+        // The volatile twins are full barriers, like every volatile access.
+        for op in [X86Opcode::VolatileMovzxRM8, X86Opcode::VolatileMovzxRM16] {
+            assert_eq!(x86_opcode_effect(op), MemoryEffect::Call, "{op:?}");
+            assert!(x86_produces_value(op), "{op:?}");
+        }
     }
 
     #[test]
@@ -2617,6 +3756,7 @@ mod tests_x86 {
         assert!(!x86_writes_flags(X86Opcode::MovRR));
         assert!(!x86_writes_flags(X86Opcode::MovRR32));
         assert!(!x86_writes_flags(X86Opcode::MovRI));
+        assert!(!x86_writes_flags(X86Opcode::Not));
         assert!(!x86_writes_flags(X86Opcode::Lea));
         assert!(!x86_writes_flags(X86Opcode::Cmovcc));
         assert!(!x86_writes_flags(X86Opcode::Cmovcc32));
@@ -2871,6 +4011,46 @@ mod tests_defmap_authority {
     use super::*;
     use trust_cg_ir::{AArch64Opcode, MachInst, MachOperand, RegClass, VReg};
 
+    #[test]
+    fn numeric_clobber_query_counts_w_x_aliases_and_secondary_defs_not_reads() {
+        let operand = |id, class| MachOperand::VReg(VReg::new(id, class));
+        for (written, queried) in [
+            (RegClass::Gpr32, RegClass::Gpr64),
+            (RegClass::Gpr64, RegClass::Gpr32),
+        ] {
+            let inst = MachInst::new(
+                AArch64Opcode::MovR,
+                vec![operand(10, written), operand(11, written)],
+            );
+            assert!(inst_clobbers_vreg_id(&inst, 10));
+            assert!(!inst_clobbers_vreg_id(&inst, 11));
+            assert!(!inst_defines_vreg(&inst, VReg::new(10, queried)));
+            assert!(inst_defines_vreg(&inst, VReg::new(10, written)));
+        }
+        let load_pair = MachInst::new(
+            AArch64Opcode::LdpRI,
+            vec![
+                operand(1, RegClass::Gpr32),
+                operand(2, RegClass::Gpr32),
+                operand(3, RegClass::Gpr64),
+                MachOperand::Imm(0),
+            ],
+        );
+        assert!(inst_clobbers_vreg_id(&load_pair, 1));
+        assert!(inst_clobbers_vreg_id(&load_pair, 2));
+        assert!(!inst_clobbers_vreg_id(&load_pair, 3));
+        let store = MachInst::new(
+            AArch64Opcode::StrRI,
+            vec![
+                operand(1, RegClass::Gpr32),
+                operand(3, RegClass::Gpr64),
+                MachOperand::Imm(0),
+            ],
+        );
+        assert!(!inst_clobbers_vreg_id(&store, 1));
+        assert!(!inst_clobbers_vreg_id(&store, 3));
+    }
+
     /// The current `AArch64Opcode` inventory, used to exercise the def visitor
     /// over every supported operand arity. A hand-written SUBSET would silently
     /// stop covering opcodes as the ISA table grows, which is exactly how the
@@ -2979,6 +4159,15 @@ mod tests_defmap_authority {
         AArch64Opcode::FnegRR,
         AArch64Opcode::FabsRR,
         AArch64Opcode::FsqrtRR,
+        AArch64Opcode::FrintnRR,
+        AArch64Opcode::Crc32B,
+        AArch64Opcode::Crc32H,
+        AArch64Opcode::Crc32W,
+        AArch64Opcode::Crc32X,
+        AArch64Opcode::Crc32Cb,
+        AArch64Opcode::Crc32Ch,
+        AArch64Opcode::Crc32Cw,
+        AArch64Opcode::Crc32Cx,
         AArch64Opcode::FrintmRR,
         AArch64Opcode::FrintpRR,
         AArch64Opcode::FrintzRR,
@@ -3119,6 +4308,8 @@ mod tests_defmap_authority {
         AArch64Opcode::SubsRI,
         AArch64Opcode::Adc,
         AArch64Opcode::Sbc,
+        AArch64Opcode::Adcs,
+        AArch64Opcode::Sbcs,
         AArch64Opcode::Umulh,
         AArch64Opcode::Smulh,
         AArch64Opcode::Madd,
@@ -3168,6 +4359,10 @@ mod tests_defmap_authority {
         AArch64Opcode::VolatileStrbRI,
         AArch64Opcode::VolatileStrhRI,
         AArch64Opcode::AlignNop,
+        AArch64Opcode::TlsDescCall,
+        AArch64Opcode::LdrTlsdesc,
+        AArch64Opcode::AddTlsdescLo12,
+        AArch64Opcode::BlrTlsdesc,
     ];
 
     /// The operand-0 predicate and the role model must answer "is operand 0
@@ -3252,6 +4447,26 @@ mod tests_defmap_authority {
             }
         }
     }
+
+    /// [`is_load_acquire`] names every `Load`-class acquire opcode (`Lda*`)
+    /// in the inventory and nothing else. A new `Load`-class acquire form
+    /// (for example an RCpc `LDAPR`) fails here until the predicate covers
+    /// it, instead of being hoisted as a plain load.
+    #[test]
+    fn load_acquire_predicate_covers_every_load_class_acquire() {
+        let mut bad = Vec::new();
+        for &op in ALL {
+            let load_class_acquire =
+                opcode_effect(op) == MemoryEffect::Load && format!("{op:?}").starts_with("Lda");
+            if is_load_acquire(op) != load_class_acquire {
+                bad.push(format!(
+                    "{op:?}: is_load_acquire {} but Load-class `Lda*` {load_class_acquire}",
+                    is_load_acquire(op)
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join(", "));
+    }
 }
 
 #[cfg(test)]
@@ -3294,13 +4509,42 @@ mod position_enumeration_tests {
             AArch64Opcode::MOVXrr,
             AArch64Opcode::Nop,
             AArch64Opcode::Tst,
+            // Atomics, exclusives and tied def-uses.
+            AArch64Opcode::Ldadd,
+            AArch64Opcode::Swpal,
+            AArch64Opcode::Casal,
+            AArch64Opcode::Stxr,
+            AArch64Opcode::Stlxrb,
+            AArch64Opcode::Ldxp,
+            AArch64Opcode::Ldaxp,
+            AArch64Opcode::LlscRmw8,
+            AArch64Opcode::LlscRmw64,
+            AArch64Opcode::LlscCmpSwap32,
+            AArch64Opcode::LlscLoad128,
+            AArch64Opcode::LlscStore128,
+            AArch64Opcode::LlscRmw128,
+            AArch64Opcode::LlscCmpSwap128,
+            AArch64Opcode::Movk,
+            AArch64Opcode::Bfm,
+            AArch64Opcode::NeonInsGen,
+            AArch64Opcode::NeonUdotV,
         ];
         for opcode in opcodes.iter().copied() {
+            // Every table entry is a truncated leading pattern, so the memo
+            // serves them all (the direct path is only a guard).
+            assert!(role_prefix(opcode).is_some(), "{opcode:?} not memoized");
             for count in 0..=(ROLE_INLINE_CAP + 2) {
                 let mut defs = Vec::new();
                 aarch64_for_each_def_position(opcode, count, |p| defs.push(p));
                 let mut uses = Vec::new();
                 aarch64_for_each_use_position(opcode, count, |p| uses.push(p));
+                // The memoized visitors against the direct classification.
+                let mut direct = vec![OperandRole::Use; count];
+                fill_operand_roles(opcode, &mut direct);
+                let direct_defs: Vec<usize> = (0..count).filter(|&p| direct[p].is_def()).collect();
+                let direct_uses: Vec<usize> = (0..count).filter(|&p| direct[p].is_use()).collect();
+                assert_eq!(defs, direct_defs, "{opcode:?}/{count}: memoized defs");
+                assert_eq!(uses, direct_uses, "{opcode:?}/{count}: memoized uses");
                 assert_eq!(
                     aarch64_def_operand_positions(opcode, count),
                     defs,

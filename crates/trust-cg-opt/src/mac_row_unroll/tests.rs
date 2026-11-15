@@ -28,7 +28,7 @@ fn count_bcond_cc(func: &MachFunction, cc: i64) -> usize {
         .flat_map(|blk| blk.insts.iter().copied())
         .filter(|&id| {
             let inst = func.inst(id);
-            inst.opcode == AArch64Opcode::BCond && imm_of(&inst.operands[0]) == Some(cc)
+            inst.opcode == AArch64Opcode::BCond && inst.operands[0].as_imm() == Some(cc)
         })
         .count()
 }
@@ -38,7 +38,7 @@ fn has_movz_imm(func: &MachFunction, v: i64) -> bool {
         .flat_map(|b| b.insts.iter().copied())
         .any(|id| {
             let inst = func.inst(id);
-            inst.opcode == AArch64Opcode::Movz && imm_of(&inst.operands[1]) == Some(v)
+            inst.opcode == AArch64Opcode::Movz && inst.operands[1].as_imm() == Some(v)
         })
 }
 /// The (unique) block that contains exactly four `StrRI` — the unrolled main
@@ -63,7 +63,7 @@ fn count_addri_imm_in(func: &MachFunction, blk: BlockId, v: i64) -> usize {
         .iter()
         .filter(|&&id| {
             let inst = func.inst(id);
-            inst.opcode == AArch64Opcode::AddRI && imm_of(&inst.operands[2]) == Some(v)
+            inst.opcode == AArch64Opcode::AddRI && inst.operands[2].as_imm() == Some(v)
         })
         .count()
 }
@@ -401,17 +401,17 @@ fn check_unrolled_addresses(func: &MachFunction, mb: BlockId) {
 
     // Each store is `StrRI [val, base, #off]`: the base register is identical
     // (the running caddr0) and the immediate offsets are exactly {0,8,16,24}.
-    let base0 = vreg_of(&func.inst(stores[0]).operands[1]).unwrap().id;
+    let base0 = func.inst(stores[0]).operands[1].as_vreg().unwrap().id;
     let mut offs: Vec<i64> = stores
         .iter()
         .map(|&id| {
             let inst = func.inst(id);
             assert_eq!(
-                vreg_of(&inst.operands[1]).unwrap().id,
+                inst.operands[1].as_vreg().unwrap().id,
                 base0,
                 "all lanes share the running pointer pc"
             );
-            imm_of(&inst.operands[2]).unwrap()
+            inst.operands[2].as_imm().unwrap()
         })
         .collect();
     offs.sort_unstable();
@@ -660,4 +660,27 @@ fn bails_on_early_exit_in_body() {
         },
         "body carries an unmodeled loop-exiting block (break)",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the main loop reproduces the MAC
+// lanes' memory effects and `iv` only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    let iv = VReg::new(100, RegClass::Gpr64);
+    assert!(run(&mut build_mac(Cfg::default())).0, "plain fixture fires");
+    let mut wrong = Vec::new();
+    let mut carried = build_mac(Cfg::default());
+    crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+    if run(&mut carried).0 {
+        wrong.push("fired with a second accumulator");
+    }
+    let mut live_out = build_mac(Cfg::default());
+    crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+    if run(&mut live_out).0 {
+        wrong.push("fired with a live-out-only register");
+    }
+    assert!(wrong.is_empty(), "skipped register state: {wrong:?}");
 }

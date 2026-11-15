@@ -6,7 +6,7 @@
 // Benchmark framework for Trust Codegen compilation pipeline.
 // Measures throughput (instructions/second) and per-phase timing.
 //
-// Run with: cargo bench -p trust-cg-codegen --bench compile_bench
+// Run with: scripts/trust_cargo.sh bench -p trust-cg-codegen --bench compile_bench
 //
 // Part of #65 — Benchmark suite
 
@@ -630,7 +630,7 @@ fn time_frame_lowering(func: &MachFunction, iters: u32) -> PhaseResult {
     for _ in 0..iters {
         let mut f = func.clone();
         let layout = frame::compute_frame_layout(&f, 0, true);
-        frame::eliminate_frame_indices(&mut f, &layout);
+        frame::eliminate_frame_indices(&mut f, &layout).unwrap();
         frame::insert_prologue_epilogue(&mut f, &layout).unwrap();
     }
     PhaseResult {
@@ -646,7 +646,7 @@ fn bench_complexity(complexity: Complexity, opt_level: OptLevel) -> BenchResult 
     let config = PipelineConfig {
         opt_level,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
 
     // Warmup
@@ -696,7 +696,7 @@ fn bench_complexity(complexity: Complexity, opt_level: OptLevel) -> BenchResult 
         {
             use trust_cg_codegen::frame;
             let layout = frame::compute_frame_layout(&f, 0, true);
-            frame::eliminate_frame_indices(&mut f, &layout);
+            frame::eliminate_frame_indices(&mut f, &layout).unwrap();
             frame::insert_prologue_epilogue(&mut f, &layout).unwrap();
         }
         // Encoding

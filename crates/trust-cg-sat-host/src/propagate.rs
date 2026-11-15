@@ -6,27 +6,24 @@
 // implementation to `microsat_native_propagate`, freeing the
 // `propagate` name for the trampoline to claim.
 //
-// ## Phases
+// ## Dispatch and state ownership
 //
-// **Phase 1 (historical):** `trust_cg_propagate` was a thin Rust
-// delegate that forwarded to `microsat_native_propagate`. The shadow
-// path also called the native function, giving a trivial
-// "trampoline-is-wired" baseline with divergence impossible by
-// construction.
+// With both modes off, dispatch delegates directly to native MicroSAT.
+// SHADOW_MODE compares native with a JIT BCP kernel over the original input
+// formula; the native verdict remains authoritative. A provider is cached per
+// solve on a thread-local. Scan-only providers are evaluated once per solve;
+// the other providers reset their arenas between evaluations.
 //
-// **Phase 2 (current):** the shadow path is a real call into the
-// trust-cg JIT'd verified BCP kernel. When `SHADOW_MODE` is true, the
-// very first invocation of `trust_cg_propagate` snapshots the formula
-// out of MicroSAT's `DB` (clauses only, by walking the pristine input
-// region `DB[1 .. mem_fixed]`), compiles a JIT BCP provider, and
-// caches it on a thread-local. Subsequent calls reuse the cached
-// provider and run a differential check against MicroSAT's native
-// propagate on the *original formula*.
+// PRIMARY_JIT_MODE first attempts replacement on a nonempty unprocessed trail
+// if the root-authority predicate or JIT_ANALYZE_DRIVER_FORCE admits it. The
+// force flag defaults to true; it also admits decision-level conflict analysis.
+// Accepted replacements apply implications to MicroSAT's state. A non-root
+// conflict goes through native analyze/assign AND native propagation of the
+// learned lemma; that continuation can itself return UNSAT.
 //
-// **Phase 3 (current):** `PRIMARY_JIT_MODE` engages the JIT'd BCP
-// kernel as the primary verdict producer. On the first eligible call
-// the kernel is compiled and its result is used as the primary return
-// value surfaced to MicroSAT's `solve()`.
+// Declined replacements fall through to native propagation. An eligible JIT
+// comparison may then run against the saved pre-native assignment. This path
+// always returns native's value so the verdict agrees with the mutated state.
 //
 // **Kernel choice:** both
 // `SHADOW_MODE` and `PRIMARY_JIT_MODE` build whatever JIT kernel is
@@ -36,52 +33,18 @@
 // older scan or with-decisions kernels for differential coverage set
 // the choice explicitly via `JIT_KERNEL_CHOICE.store(...)`.
 //
-// ### Why we still call native under PRIMARY_JIT_MODE
-//
-// MicroSAT's `propagate` is heavily side-effecting: it mutates
-// `S->processed`, `S->assigned`, `S->falseStack`, `S->reason`,
-// `S->model`, `S->forced`, the watch lists in `S->first[]`, and
-// invokes `analyze()` -> `addClause()` to learn lemmas on non-root
-// conflicts. The JIT'd BCP kernel runs on a private arena (`values`
-// + `trail`) that is independent of MicroSAT's data structures, so it
-// cannot drive those side effects. Replacing the native call outright
-// would leave MicroSAT's solver state stale (unit-implied literals
-// would not be pushed onto `falseStack`, learned clauses would never
-// appear, conflict analysis would be skipped) and the next iteration
-// of `solve()` would either loop or return an incorrect answer.
-//
-// We therefore keep the native call in the hot path *for its side
-// effects*. PRIMARY_JIT_MODE adds the JIT call alongside it and
-// surfaces the JIT's mapped return code as the primary value when
-// the JIT is considered authoritative for that call site.
-//
-// ### Where the JIT is authoritative
-//
-// Even with native always running for state mutation, the JIT
-// answers propagate against the *original* formula given the
-// current assignment. Phase 2's scratch-arena design (A1's
-// strategic insight) puts the reason values for JIT-implied
-// literals in `S->DB`'s high tail rather than referencing learned
-// clauses, so the JIT-compiled kernel for the original formula
-// remains valid for the entire solve regardless of how many lemmas
-// MicroSAT learns. There is no epoch boundary: the kernel never
-// sees the learned clauses, only the original ones.
-//
-// The "JIT-conflict-implies-UNSAT" mapping still only holds in the
-// root-forced regime (`pre_authoritative` true). At
-// decision-level >= 1 the conflict is driven through MicroSAT's
-// native `analyze` via the analyze-driver path (Phase 2). In
-// either regime the JIT contributes the implication stream and
-// MicroSAT's downstream `analyze` / `implied` walks consume the
-// scratch reasons transparently.
+// The JIT evaluates the original formula, not newly learned clauses. Synthetic
+// implication reasons live in the reserved high tail of MicroSAT's DB so its
+// native reason walks can consume the replacement's implication stream.
 //
 // ### Hard-fail policy
 //
-// Under PRIMARY_JIT_MODE, once the JIT has agreed with native on
-// `JIT_HARDFAIL_WARMUP` consecutive calls (default 5), any future
-// divergence panics rather than just incrementing the warning
-// counter. SHADOW_MODE stays soft-warning forever (it is a research
-// probe). The two flags are independent; both may be set at once.
+// PRIMARY_JIT_MODE escalates a comparison divergence to panic after
+// JIT_HARDFAIL_WARMUP cumulative successful events (default 5). These include
+// accepted replacements as well as matching native/JIT comparisons; they are
+// neither consecutive agreements nor independent proof checks. Saturation
+// keeps this policy monotone even when the counter exhausts u64. SHADOW_MODE
+// stays soft-warning (a research probe). The two flags are independent.
 
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -96,23 +59,34 @@ use trust_cg_jit_matrix::solver_kernel_abi::SolverKernelHandle;
 use crate::scratch_arena::ScratchArena;
 use crate::sys;
 
+/// Advance a process-global event count without wrapping, returning its prior
+/// value for rate-limited warnings. At u64::MAX, counts and deltas are capped
+/// lower bounds, not exact event totals. Relaxed ordering does not publish any
+/// solver state; only the atomic counter's own modification order matters.
+fn increment_counter(counter: &AtomicU64) -> u64 {
+    let mut previous = counter.load(Ordering::Relaxed);
+    loop {
+        let next = previous.saturating_add(1);
+        match counter.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return previous,
+            Err(current) => previous = current,
+        }
+    }
+}
+
 /// When `true`, `trust_cg_propagate` runs the dispatch in differential
 /// "shadow" mode: the primary native call is paired with a JIT-side
 /// re-evaluation of the original formula and the two outcomes are
 /// compared.
 ///
-/// In Phase 1 both paths were `microsat_native_propagate`, so this was
-/// a trivial self-consistency check. In Phase 2 the shadow path
-/// became the JIT'd verified BCP kernel, making this a real
-/// divergence detector for the first-restart epoch.
+/// The comparison is a diagnostic over the original formula, not proof of the
+/// entire solve. Native remains authoritative on this path.
 pub static SHADOW_MODE: AtomicBool = AtomicBool::new(false);
 
 /// When `true`, `trust_cg_propagate` engages the JIT'd BCP kernel as
-/// the *primary* return path. Native still runs (its side effects are
-/// load-bearing for MicroSAT's solver state), but the JIT's mapped
-/// result code is the value surfaced to MicroSAT when the JIT is
-/// authoritative for this call (see module docs for the epoch-0
-/// authority rules).
+/// replacement path where admitted. Successful replacements update MicroSAT's
+/// state; non-root conflict analysis still uses its native continuation.
+/// Declines use native propagation and may perform a JIT comparison afterwards.
 ///
 /// Independent of `SHADOW_MODE`; both may be set simultaneously.
 pub static PRIMARY_JIT_MODE: AtomicBool = AtomicBool::new(false);
@@ -149,7 +123,8 @@ pub static JIT_KERNEL_CHOICE: AtomicU8 = AtomicU8::new(JIT_KERNEL_WATCHED_LITERA
 /// our Rust replacement rather than the original C implementation.
 ///
 /// Note: this counter is global and intentionally not reset between
-/// solves. Tests should snapshot it before/after the call.
+/// solves. Tests should snapshot it before/after the call. All event counters
+/// in this module saturate at u64::MAX; saturated totals/deltas are lower bounds.
 pub static PROPAGATE_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Counts how many times the shadow / primary-JIT path has compiled
@@ -166,10 +141,10 @@ pub static JIT_INIT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// snapshot deltas.
 pub static JIT_DIVERGENCE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Counts how many PRIMARY_JIT_MODE calls saw the JIT and native
-/// agree on the propagate outcome (i.e. zero-divergence calls). Used
-/// to gate the hard-fail divergence policy: until at least
-/// `JIT_HARDFAIL_WARMUP` zero-divergence calls have been observed, a
+/// Counts accepted JIT replacements and matching primary/native comparisons.
+/// Replacement events do not independently compare the two implementations.
+/// Used to gate the hard-fail divergence policy: until at least
+/// `JIT_HARDFAIL_WARMUP` such events have accumulated, a
 /// divergence emits a warning and bumps `JIT_DIVERGENCE_COUNT`; after
 /// the warmup threshold, a divergence panics so a real correctness
 /// regression in the JIT cannot be missed by the benchmark harness.
@@ -178,16 +153,15 @@ pub static JIT_DIVERGENCE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// hard-fail policy is monotone across the full test run.
 pub static JIT_SUCCESSFUL_RUNS: AtomicU64 = AtomicU64::new(0);
 
-/// Number of zero-divergence primary-JIT calls that must accumulate
-/// before a divergence is escalated from "warning" to "panic". Chosen
-/// to require several agreeing calls before hard-fail enforcement begins.
+/// Number of `JIT_SUCCESSFUL_RUNS` events that must accumulate before a
+/// comparison divergence is escalated from "warning" to "panic".
 pub const JIT_HARDFAIL_WARMUP: u64 = 5;
 
-/// Counts how many propagate calls were resolved by returning the
-/// JIT's mapped result code as the primary value (i.e. the JIT was
-/// authoritative for that call). When PRIMARY_JIT_MODE is off this
-/// counter never advances; tests use it to confirm the primary path
-/// fired at least once.
+/// Legacy name: counts replacement kernel invocations (before result
+/// validation) plus mapped post-native primary comparisons. A declined
+/// replacement followed by a comparison can count twice in one propagate call.
+/// This is primary-path activity, NOT authoritative JIT returns or native calls
+/// avoided. When PRIMARY_JIT_MODE is off this counter never advances.
 pub static JIT_PRIMARY_RETURNS: AtomicU64 = AtomicU64::new(0);
 
 /// Counts how many JIT-replacement calls saw a conflict at a non-root
@@ -199,24 +173,14 @@ pub static JIT_PRIMARY_RETURNS: AtomicU64 = AtomicU64::new(0);
 /// `analyze` path for non-trivial decision-level conflicts.
 pub static JIT_ANALYZE_DRIVEN: AtomicU64 = AtomicU64::new(0);
 
-/// Counts how many ADF-conflict calls saw the JIT-reported conflict
-/// clause AGREE with native's first-conflict watch-list pick (F1-v2
-/// Candidate 1 telemetry). When this counter equals
-/// `JIT_ANALYZE_DRIVEN`, every conflict native would have picked is
-/// the same one the JIT already produced, so the host-side
-/// `native_find_first_conflict_clause` walk is pure overhead and the
-/// short-circuit is dropping it. A delta below `JIT_ANALYZE_DRIVEN`
-/// means the JIT and native sometimes disagree (structured-hard
-/// fixtures e.g. pigeon-hole).
+/// Legacy name: counts admissions by `jit_conflict_clause_is_native_first`.
+/// This predicate can bypass the full native conflict-clause walk; the counter
+/// does not represent independent comparison with the skipped walk's result.
 pub static JIT_ANALYZE_DRIVER_CLAUSE_AGREEMENTS: AtomicU64 = AtomicU64::new(0);
 
-/// Counts how many ADF-conflict calls skipped the post-analyze
-/// `microsat_native_propagate` continuation because `analyze` learned
-/// a multi-literal lemma (F1-v2 Candidate 2 telemetry). Multi-literal
-/// lemmas cause MicroSAT's outer solve loop to backjump to a lower DL
-/// on the NEXT iteration, so re-running BCP inline is wasted work; we
-/// skip it. Unit lemmas (`lemma[1] == 0`) still call native to
-/// propagate the new unit immediately (correctness-required).
+/// Reserved legacy telemetry; dispatch never increments it. The analyze-driver
+/// always performs native propagation after analyze/assign, including for
+/// multi-literal lemmas. A zero here is not evidence of an enabled optimization.
 pub static JIT_ANALYZE_DRIVER_NATIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// Counts how many JIT-replacement calls fell back to native because
@@ -1017,7 +981,7 @@ unsafe fn install_scratch_reasons_for_jit(
         // SAFETY: arena was bound to `s`; reading `S->mem_used` is a
         // plain int field load.
         if unsafe { arena.is_near_overflow(s) } {
-            JIT_SCRATCH_OVERFLOW_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            increment_counter(&JIT_SCRATCH_OVERFLOW_FALLBACKS);
             if TRUST_CG_PROPAGATE_VERBOSE.load(Ordering::Relaxed) {
                 eprintln!(
                     "trust_cg_propagate: scratch arena near overflow at \
@@ -1034,7 +998,7 @@ unsafe fn install_scratch_reasons_for_jit(
         match arena.allocate_synthetic_clause(lit, &ants) {
             Ok(scratch_reason) => scratch_reasons.push(scratch_reason),
             Err(_overflow) => {
-                JIT_SCRATCH_OVERFLOW_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                increment_counter(&JIT_SCRATCH_OVERFLOW_FALLBACKS);
                 if TRUST_CG_PROPAGATE_VERBOSE.load(Ordering::Relaxed) {
                     eprintln!(
                         "trust_cg_propagate: scratch arena overflow at \
@@ -1523,7 +1487,7 @@ unsafe fn try_jit_replace_native(
                     }
                 };
                 if provider.is_some() {
-                    JIT_INIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    increment_counter(&JIT_INIT_COUNT);
                 }
                 let buf_size = (num_vars * 2).max(8);
                 // Phase 2: bind a per-solve scratch arena to the
@@ -1649,7 +1613,7 @@ unsafe fn try_jit_replace_native(
                 }
             };
 
-            JIT_PRIMARY_RETURNS.fetch_add(1, Ordering::Relaxed);
+            increment_counter(&JIT_PRIMARY_RETURNS);
 
             // Compute the `forced` flag exactly as MicroSAT's
             // propagate would (top-of-loop, microsat.c:133). The flag
@@ -1781,7 +1745,7 @@ unsafe fn try_jit_replace_native(
                     //
                     // SAFETY: same as the success-branch precondition.
                     unsafe { apply_jit_implications(s, lits, reasons, forced) };
-                    JIT_SUCCESSFUL_RUNS.fetch_add(1, Ordering::Relaxed);
+                    increment_counter(&JIT_SUCCESSFUL_RUNS);
                     // SAFETY: `s` is live; we record the
                     // post-implication processed offset so the next
                     // call can detect a restart-induced rewind.
@@ -1896,7 +1860,7 @@ unsafe fn try_jit_replace_native(
                         // SAFETY: same precondition as the success branch.
                         unsafe { apply_jit_implications(s, lits, reasons, forced) };
                         let _ = conflict_idx;
-                        JIT_SUCCESSFUL_RUNS.fetch_add(1, Ordering::Relaxed);
+                        increment_counter(&JIT_SUCCESSFUL_RUNS);
                         // SAFETY: `s` is live; refresh restart
                         // detector even though solve() is about to
                         // terminate (defensive: a follow-up call in
@@ -2082,7 +2046,7 @@ unsafe fn try_jit_replace_native(
                         let short_circuit_ok =
                             unsafe { jit_conflict_clause_is_native_first(s, jit_conflict_db_off) };
                         if short_circuit_ok {
-                            JIT_ANALYZE_DRIVER_CLAUSE_AGREEMENTS.fetch_add(1, Ordering::Relaxed);
+                            increment_counter(&JIT_ANALYZE_DRIVER_CLAUSE_AGREEMENTS);
                             jit_conflict_db_off
                         } else {
                             // Fall back to the full native watch walk.
@@ -2154,8 +2118,8 @@ unsafe fn try_jit_replace_native(
                     // inside `S->DB`.
                     unsafe { assign(s, lemma_ptr, post_forced) };
 
-                    JIT_ANALYZE_DRIVEN.fetch_add(1, Ordering::Relaxed);
-                    JIT_SUCCESSFUL_RUNS.fetch_add(1, Ordering::Relaxed);
+                    increment_counter(&JIT_ANALYZE_DRIVEN);
+                    increment_counter(&JIT_SUCCESSFUL_RUNS);
                     // Continue propagation by handing off to native:
                     // native's `propagate` body runs analyze + assign
                     // INSIDE its outer `while (S->processed <
@@ -2223,7 +2187,7 @@ unsafe fn try_jit_replace_native(
 /// root-level conflict, matching the upstream contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn trust_cg_propagate(s: *mut sys::solver) -> c_int {
-    PROPAGATE_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    increment_counter(&PROPAGATE_CALL_COUNT);
 
     let shadow_on = SHADOW_MODE.load(Ordering::Relaxed);
     let primary_on = PRIMARY_JIT_MODE.load(Ordering::Relaxed);
@@ -2281,39 +2245,11 @@ pub unsafe extern "C" fn trust_cg_propagate(s: *mut sys::solver) -> c_int {
         Vec::new()
     };
 
-    // Phase 3.5 / extension #5 (JIT replaces native, with analyze-driver):
-    // if PRIMARY_JIT_MODE is on, the unprocessed trail is non-empty, and
-    // the cache is healthy, run the JIT FIRST and skip native entirely
-    // on success.
-    //
-    // The historical `jit_is_authoritative_at_root` gate (extensions
-    // #1-4) only let the JIT replace native at the root-forced regime;
-    // mid-search conflicts surrendered the primary path to native.
-    // Extension #5 (this commit) relaxes the gate to cover decision-
-    // level >= 1 conflicts: the JIT-replacement path now drives the
-    // conflict clause into MicroSAT's `analyze` and `assign` (the
-    // analyze-driver) so `solve()` sees the same lemma it would have
-    // seen had native propagate run end-to-end.
-    //
-    // We still keep the `pre_authoritative` value plumbed through the
-    // outcome handling because the *return value* (SAT vs UNSAT)
-    // depends on it: only root-forced conflicts terminate as UNSAT;
-    // every other outcome (clean BCP, or analyze-driven mid-search
-    // conflict) returns SAT to `solve()` so the outer search loop
-    // continues. The JIT mutates MicroSAT's state via
-    // `apply_jit_implications` (and, on the analyze branch,
-    // `analyze` + `assign` itself) so subsequent solver iterations
-    // see the same trail / reason / model fields they would have
-    // seen had native run.
-    //
-    // Note: `pre_authoritative` is still required as the gate for the
-    // JIT-as-primary replacement path. Extension #5's analyze-driver
-    // is implemented inside `try_jit_replace_native` for the conflict
-    // sub-path, but the BCP-OK sub-path is not yet trusted to drive
-    // MicroSAT's full mid-search state, so we keep the existing
-    // root-authoritative gate for the production replacement entry.
-    // Dedicated tests below exercise the analyze-driver via the
-    // `JIT_ANALYZE_DRIVER_FORCE` override flag.
+    // Try replacement before native. Root-authority or the default-on
+    // analyze-driver flag admits the nonempty trail. Successful BCP applies
+    // implications directly; a non-root conflict drives native analyze/assign
+    // and its propagation continuation. That continuation may return UNSAT,
+    // so an analyze-driven attempt does not necessarily surface SAT.
     let analyze_driver_forced = JIT_ANALYZE_DRIVER_FORCE.load(Ordering::Relaxed);
     let replacement_outcome: Option<JitReplacementOutcome> =
         if primary_on && pre_nonempty && (pre_authoritative || analyze_driver_forced) {
@@ -2392,7 +2328,7 @@ pub unsafe extern "C" fn trust_cg_propagate(s: *mut sys::solver) -> c_int {
                 };
 
                 if provider.is_some() {
-                    JIT_INIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    increment_counter(&JIT_INIT_COUNT);
                 }
                 // Buffer sizing: `2 * num_vars` is a safe upper bound.
                 // Each propagation sweep assigns at most `num_vars`
@@ -2493,34 +2429,33 @@ pub unsafe extern "C" fn trust_cg_propagate(s: *mut sys::solver) -> c_int {
             // `prior` is a multiple of `JIT_DIVERGENCE_WARN_INTERVAL`
             // (i.e. at occurrences 1, 1001, 2001, ...). This rate limit
             // keeps a regression from spamming stderr while still leaving
-            // an audit trail. The full divergence count is
-            // surfaced in `JIT_DIVERGENCE_COUNT` regardless.
-            let prior = JIT_DIVERGENCE_COUNT.fetch_add(1, Ordering::Relaxed);
+            // an audit trail. The divergence count is surfaced in
+            // `JIT_DIVERGENCE_COUNT`, capped at u64::MAX.
+            let prior = increment_counter(&JIT_DIVERGENCE_COUNT);
             if prior == 0 || prior.is_multiple_of(JIT_DIVERGENCE_WARN_INTERVAL) {
                 eprintln!(
                     "trust_cg_propagate: shadow divergence on initial formula \
                      (occurrence #{}): native={native_return} \
                      (conflict={native_conflict}) jit_result={jit_result} \
                      (conflict={jit_conflict})",
-                    prior + 1
+                    prior.saturating_add(1)
                 );
             }
         }
     }
 
-    // Surface the primary-JIT mapped result if it was produced AND
-    // the kernel returned a well-defined OK/conflict code. A decode
-    // error (result == 2) falls through to native silently.
+    // Compare the primary-JIT mapped result if the kernel produced a
+    // well-defined OK/conflict code. Both this path and an unmapped result
+    // return native's verdict, consistent with its already-mutated state.
     if let Some(jit_result) = primary_result_opt
         && let Some(mapped) = jit_result_to_microsat(jit_result)
     {
         let agree = mapped == native_return;
         if agree {
-            let prior = JIT_SUCCESSFUL_RUNS.fetch_add(1, Ordering::Relaxed);
-            let _ = prior;
+            increment_counter(&JIT_SUCCESSFUL_RUNS);
         } else {
             let successful_so_far = JIT_SUCCESSFUL_RUNS.load(Ordering::Relaxed);
-            let prior = JIT_DIVERGENCE_COUNT.fetch_add(1, Ordering::Relaxed);
+            let prior = increment_counter(&JIT_DIVERGENCE_COUNT);
             if successful_so_far >= JIT_HARDFAIL_WARMUP {
                 panic!(
                     "trust_cg_propagate: PRIMARY_JIT_MODE divergence past \
@@ -2537,7 +2472,7 @@ pub unsafe extern "C" fn trust_cg_propagate(s: *mut sys::solver) -> c_int {
                     "trust_cg_propagate: PRIMARY_JIT_MODE divergence within \
                          warmup window (occurrence #{}, successful_so_far={}/{}) - \
                          jit_mapped={} native={} jit_result_code={}",
-                    prior + 1,
+                    prior.saturating_add(1),
                     successful_so_far,
                     JIT_HARDFAIL_WARMUP,
                     mapped,
@@ -2546,7 +2481,7 @@ pub unsafe extern "C" fn trust_cg_propagate(s: *mut sys::solver) -> c_int {
                 );
             }
         }
-        JIT_PRIMARY_RETURNS.fetch_add(1, Ordering::Relaxed);
+        increment_counter(&JIT_PRIMARY_RETURNS);
         // Whether agree or not, the primary path *would* surface
         // the JIT's mapped value. To keep the solver state
         // self-consistent we still need to return what MicroSAT
@@ -2876,6 +2811,70 @@ pub(crate) mod test_support {
     /// default and the atomics' temporary swaps in one test would
     /// otherwise race with another test's load.
     pub static SOLVER_LOCK: Mutex<()> = Mutex::new(());
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    #[test]
+    fn increment_reports_previous_count() {
+        let counter = AtomicU64::new(0);
+        for expected in 0..10 {
+            assert_eq!(increment_counter(&counter), expected);
+            assert_eq!(counter.load(Ordering::Relaxed), expected + 1);
+        }
+    }
+
+    #[test]
+    fn saturated_counter_never_wraps() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(increment_counter(&counter), u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        for _ in 0..3 {
+            assert_eq!(increment_counter(&counter), u64::MAX);
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
+    }
+
+    #[test]
+    fn increments_cannot_reopen_hardfail_warmup() {
+        // Local state uses the production increment and threshold without
+        // mutating the process-global solver policy or invoking JIT code.
+        for initial in [JIT_HARDFAIL_WARMUP - 1, u64::MAX - 1, u64::MAX] {
+            let counter = AtomicU64::new(initial);
+            for _ in 0..10 {
+                increment_counter(&counter);
+                assert!(counter.load(Ordering::Relaxed) >= JIT_HARDFAIL_WARMUP);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_increments_saturate_without_losing_prior_counts() {
+        let counter = AtomicU64::new(u64::MAX - 8);
+        let mut priors = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..4)
+                            .map(|_| increment_counter(&counter))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        priors.sort_unstable();
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        let expected: Vec<_> = (u64::MAX - 8..u64::MAX)
+            .chain(std::iter::repeat_n(u64::MAX, 8))
+            .collect();
+        assert_eq!(priors, expected);
+    }
 }
 
 #[cfg(test)]

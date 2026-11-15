@@ -84,7 +84,8 @@ fn compile(m: &M, opt: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     c.compile(m).expect("aarch64 compile").object_code
 }
 
@@ -259,18 +260,26 @@ impl Sweep {
             );
         }
 
-        // TV-6 (a64 post-RA spill-SLOT reaching-store net) soundness gate. The
-        // net runs at WARN on every a64 compile in this sweep; on this KNOWN-
-        // CORRECT corpus it must NEVER report a violation. A non-zero hit count is
-        // a FALSE-WARN regression in the SP-relative spill-slot model (e.g. a new
-        // frameless spill shape the tracker mis-classifies) — catch it here before
-        // the WARN->Enforce ratchet. Most functions DECLINE (their spills are
-        // FP-relative); the analyzed set is the frameless / red-zone-leaf lane.
+        // TV-6 frame dataflow net (`post_ra_spill_slots`) soundness gate. The
+        // net runs on every a64 compile in this sweep; on this KNOWN-CORRECT
+        // corpus it must NEVER report a violation. A non-zero hit count is a
+        // false report in the frame model (spill pairing, call clobbers,
+        // callee-saved/return-lane exits). Framed functions are modeled; the
+        // decline reasons are printed so coverage loss is visible.
         {
             use trust_cg_verify::post_ra_spill_slots as pss;
             let (analyzed, declined) = pss::coverage_counts();
+            let coverage = pss::frame_coverage();
             eprintln!(
-                "[TV-6] spill-slot net over this sweep: {analyzed} analyzed, {declined} declined, {} hits",
+                "[TV-6] spill-slot net over this sweep: {analyzed} analyzed ({} framed, {} spill reloads, {} exits checked), {declined} declined {:?}, {} hits",
+                coverage.framed_analyzed,
+                coverage.spill_reloads_checked,
+                coverage.exits_checked,
+                pss::decline_counts()
+                    .into_iter()
+                    .filter(|(_, count)| *count > 0)
+                    .map(|(reason, count)| format!("{}={count}", reason.tag()))
+                    .collect::<Vec<_>>(),
                 pss::spill_slot_hit_count()
             );
             assert_eq!(
@@ -289,11 +298,14 @@ impl Sweep {
 /// `fn _f(a: TY, b: TY) -> TY { a <op> b }` — a straight-line binary op.
 fn build_bin(name: &str, ty: Ty, op: BinOp) -> M {
     let mut m = M::new("bin");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![ty.clone(), ty.clone()],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![ty.clone(), ty.clone()],
+            returns: vec![ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), name, ft, BlockId::new(0));
     f.blocks = vec![B {
         id: BlockId::new(0),
@@ -311,7 +323,8 @@ fn build_bin(name: &str, ty: Ty, op: BinOp) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -319,11 +332,14 @@ fn build_bin(name: &str, ty: Ty, op: BinOp) -> M {
 /// final widening is SExt for a signed narrow type and ZExt for an unsigned one.
 fn build_narrow_bin(name: &str, narrow: Ty, op: BinOp, signed: bool) -> M {
     let mut m = M::new("nbin");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), name, ft, BlockId::new(0));
     f.blocks = vec![B {
         id: BlockId::new(0),
@@ -362,18 +378,22 @@ fn build_narrow_bin(name: &str, narrow: Ty, op: BinOp, signed: bool) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
 /// `fn _f(a: TY) -> TY { a <op> IMM }` — an immediate shift (UBFM/SBFM path).
 fn build_shift_imm(name: &str, ty: Ty, op: BinOp, amount: i128) -> M {
     let mut m = M::new("shimm");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![ty.clone()],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![ty.clone()],
+            returns: vec![ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), name, ft, BlockId::new(0));
     f.blocks = vec![B {
         id: BlockId::new(0),
@@ -396,7 +416,8 @@ fn build_shift_imm(name: &str, ty: Ty, op: BinOp, amount: i128) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -404,11 +425,14 @@ fn build_shift_imm(name: &str, ty: Ty, op: BinOp, amount: i128) -> M {
 /// overflow FLAG, zero-extended to i32.
 fn build_overflow(name: &str, ty: Ty, op: OverflowOp) -> M {
     let mut m = M::new("ovf");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![ty.clone(), ty.clone()],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![ty.clone(), ty.clone()],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), name, ft, BlockId::new(0));
     f.blocks = vec![B {
         id: BlockId::new(0),
@@ -433,18 +457,22 @@ fn build_overflow(name: &str, ty: Ty, op: OverflowOp) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
 /// `fn _clamp(x, lo, hi) { max(lo, min(x, hi)) }` — nested selects (CSEL chain).
 fn build_clamp(name: &str) -> M {
     let mut m = M::new("clamp");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), name, ft, BlockId::new(0));
     let x = ValueId::new(0);
     let lo = ValueId::new(1);
@@ -488,7 +516,8 @@ fn build_clamp(name: &str) -> M {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -497,11 +526,14 @@ fn build_clamp(name: &str) -> M {
 /// table baked into `__text`.
 fn build_switch(name: &str, ncases: u32) -> M {
     let mut m = M::new("sw");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = F::new(FuncId::new(0), name, ft, BlockId::new(0));
     let mut cases = vec![];
     let mut arms = vec![];
@@ -554,7 +586,8 @@ fn build_switch(name: &str, ncases: u32) -> M {
     }];
     blocks.extend(arms);
     f.blocks = blocks;
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -565,11 +598,14 @@ fn build_switch(name: &str, ncases: u32) -> M {
 fn build_stack_args(caller: &str, callee: &str) -> M {
     let mut m = M::new("stackargs");
     // callee: fn(i64 x10) -> i64
-    let ft10 = m.add_func_type(FuncTy {
-        params: vec![Ty::I64; 10],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft10 = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 10],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut sum = F::new(FuncId::new(0), callee, ft10, BlockId::new(0));
     let mut body = vec![];
     // acc = a0; acc += a1; ... acc += a9
@@ -603,11 +639,14 @@ fn build_stack_args(caller: &str, callee: &str) -> M {
     }];
 
     // caller: fn(i64 n) -> i64 { _sum10(n, n+1, ..., n+9) }
-    let ft1 = m.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft1 = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut call = F::new(FuncId::new(1), caller, ft1, BlockId::new(0));
     let mut cbody = vec![];
     let mut call_args = vec![ValueId::new(0)];
@@ -645,8 +684,10 @@ fn build_stack_args(caller: &str, callee: &str) -> M {
         params: vec![(ValueId::new(0), Ty::I64)],
         body: cbody,
     }];
-    m.add_function(sum);
-    m.add_function(call);
+    m.try_add_function(sum)
+        .expect("Module::try_add_function: test fixture");
+    m.try_add_function(call)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -654,11 +695,14 @@ fn build_stack_args(caller: &str, callee: &str) -> M {
 /// middle, and sums them all — the five must survive a caller-clobbering call.
 fn build_spill_across_call(helper: &str, spill: &str) -> M {
     let mut m = M::new("spill");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut h = F::new(FuncId::new(0), helper, ft, BlockId::new(0));
     h.blocks = vec![B {
         id: BlockId::new(0),
@@ -677,11 +721,14 @@ fn build_spill_across_call(helper: &str, spill: &str) -> M {
         ],
     }];
 
-    let ft2 = m.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft2 = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut s = F::new(FuncId::new(1), spill, ft2, BlockId::new(0));
     let mut body = vec![];
     // v_k = x + k, for k in 1..=5
@@ -765,8 +812,10 @@ fn build_spill_across_call(helper: &str, spill: &str) -> M {
         params: vec![(ValueId::new(0), Ty::I64)],
         body,
     }];
-    m.add_function(h);
-    m.add_function(s);
+    m.try_add_function(h)
+        .expect("Module::try_add_function: test fixture");
+    m.try_add_function(s)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -1414,4 +1463,13 @@ fn teeth_detects_jump_table_entry_miscompile() {
         corrupt as u32 as i32 as i128, want,
         "TEETH: perturbing jump-table entry[3] must change case 3; harness has teeth on the switch jump-table path"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -49,9 +49,10 @@
 //! same-class copies propagate, any other def (or a hidden-def
 //! `Xchg`/`Cmpxchg*`-class instruction) invalidates.
 //!
-//! Registered in the pipeline ONLY under the `TCG_X86_UNROLL` opt-in and
-//! respecting the `TCG_NO_X86_BCE` kill switch (it IS a bounds-check
-//! elimination); a default-ON flip owes its own differential evidence.
+//! Registered in the default O2/O3 schedule, right after the full unroller
+//! and const-fold (since fa7ee295a, which flipped both on with the unroller's
+//! differential soak as evidence), and respecting the BCE opt-out
+//! (`no-x86-bce`; it IS a bounds-check elimination).
 
 use std::collections::HashMap;
 
@@ -61,14 +62,6 @@ use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
 use crate::effects::x86_produces_value;
 use crate::x86_pass_manager::X86MachinePass;
-
-/// Kill switch for the masked-range tier alone: set
-/// `TCG_NO_X86_MASKED_GUARD_ELIM` (any value) to fall back to the
-/// exact-constant tiers, for a one-dylib A/B of the tier's effect.
-/// (`TCG_NO_X86_BCE` still disables the whole pass.)
-fn masked_tier_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_MASKED_GUARD_ELIM").is_none()
-}
 
 /// Const-index guard elimination for x86-64 ISel-output functions.
 pub struct X86ConstGuardElim;
@@ -113,8 +106,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                             .get(idx)
                             .or_else(|| unique_consts.get(idx))
                             .is_some_and(|c| (*c as u64) < (*bound as u64));
-                        let mask_ok = masked_tier_enabled()
-                            && bounds.get(idx).is_some_and(|ub| *ub < (*bound as u64));
+                        let mask_ok = bounds.get(idx).is_some_and(|ub| *ub < (*bound as u64));
                         if const_ok || mask_ok {
                             retain = false;
                         }

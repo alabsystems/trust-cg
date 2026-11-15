@@ -34,7 +34,7 @@
 //! * `Tbz`/`Tbnz Rt, #b`      — demands bit `b`;            requires `b < k`
 //! * `Ubfm Rd, Rn, #lsb,#imms`— demands `[lsb, imms]`;      requires `imms < k`
 //! * `AndRI Rd, Rn, #m`       — demands the set bits of `m`; requires
-//!                              `m < 2^k` (all set bits below `k`)
+//!   `m < 2^k` (all set bits below `k`)
 //!
 //! Anything else — including any consumer this pass does not recognize — is left
 //! alone. Reading a bit at or above `k` from `x` instead of `y` is a WRONG VALUE,
@@ -43,7 +43,7 @@
 //!
 //! Author: Andrew Yates · Copyright 2026 Andrew Yates · License: Apache-2.0
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{AArch64Opcode, MachFunction, MachOperand, ProvenanceMap, VReg};
 
@@ -118,7 +118,7 @@ fn run_pass(func: &mut MachFunction, _provenance: Option<&mut ProvenanceMap>) ->
     }
 
     // Producers: dst -> (source x, shift k). Only `x ^ (x << k)`.
-    let mut producers: HashMap<VReg, (VReg, u32)> = HashMap::new();
+    let mut producers: HashMap<VReg, (VReg, u32)> = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);

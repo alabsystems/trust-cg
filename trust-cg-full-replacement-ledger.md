@@ -1,6 +1,15 @@
 # trust-cg replacement-readiness ledger
 
-Scope: the 0.x research-preview series. Publication audit of 2026-07-22.
+Scope: the 0.x research-preview series. This is a maintained admission and
+claim boundary; individual historical audit runs are not current validation.
+
+The October 14 audit records the
+local/upstream reconciliation, current gap census, concrete source blockers
+and the checks actually executed. Its selected validation does not close a
+replacement gate.
+
+The replacement and MIR-inventory anchors are maintained by hand; no test
+checks this text.
 
 ## Decision
 
@@ -27,14 +36,15 @@ coverage.
 | Object and linker boundary | Partial | Faithful relocation/linker/runtime models and independently checked authority for every published artifact path. |
 | JIT publication | Experimental | Complete memory-protection, relocation, code-install, cache/provenance, target, and concurrency guarantees. |
 | Proof chain | Partial | Production binding from source semantics through every transformation and emitted byte, plus independent replay for every claimed certificate. |
-| Lean development | Conditional and incomplete | Remove classified `sorry`/axiom dependencies, close call/control/concurrency gaps, and connect the model to the Rust emitter. |
+| Lean development | No `sorry` or axiom; vacuous capstone | Give the source semantics a program, the machine observable instructions and residency-guarded step existence; close call/control/backward/concurrency gaps; and connect the model to the Rust emitter and to hardware. |
 | Validation matrix | Local, host-dependent gates | Reproducible multi-host and multi-target validation with pinned toolchains and non-vacuous runtime/object checks. |
 
 ## Rust bridge boundary
 
-The nightly `rustc_codegen_trust_cg` bridge is an evaluation surface, not a
-drop-in Rust backend. It admits selected scalar functions and bounded MIR/ABI
-shapes and rejects many unsupported variants with named diagnostics. The
+The Trust-pinned `rustc_codegen_trust_cg` bridge is an evaluation surface, not a
+drop-in Rust backend. It implements substantial MIR lowering, layout/ABI
+marshalling, static data and bounded runtime/ownership paths, and rejects many
+unsupported variants with named diagnostics. The
 detailed conservative inventory is
 [`rustc-mir-coverage-inventory.md`](rustc-mir-coverage-inventory.md).
 

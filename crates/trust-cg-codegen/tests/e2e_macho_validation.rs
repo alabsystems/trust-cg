@@ -344,13 +344,17 @@ fn compile_trust_ir_function(
     module: &TrustIrModule,
     opt_level: OptLevel,
 ) -> Result<Vec<u8>, String> {
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
-        .map_err(|e| format!("adapter error: {}", e))?;
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+        trust_ir_func,
+        module,
+        &permit_unlicensed(),
+    )
+    .map_err(|e| format!("adapter error: {}", e))?;
 
     let config = PipelineConfig {
         opt_level,
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
     let pipeline = Pipeline::new(config);
     let obj_bytes = pipeline
@@ -369,11 +373,14 @@ fn compile_trust_ir_function(
 /// Simplest possible trust_ir function: one block, const + return.
 fn build_return_const_trust_ir() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "return_const", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -389,18 +396,23 @@ fn build_return_const_trust_ir() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
 /// Build trust_ir for: fn simple_add(a: i64, b: i64) -> i64 { a + b }
 fn build_simple_add_trust_ir() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "simple_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -418,7 +430,9 @@ fn build_simple_add_trust_ir() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -430,11 +444,14 @@ fn build_simple_add_trust_ir() -> (TrustIrFunction, TrustIrModule) {
 ///   bb2: return b
 fn build_max_val_trust_ir() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "max_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): compare and branch
@@ -478,18 +495,23 @@ fn build_max_val_trust_ir() -> (TrustIrFunction, TrustIrModule) {
             })],
         },
     ];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
 /// Build trust_ir for: fn simple_sub(a: i64, b: i64) -> i64 { a - b }
 fn build_simple_sub_trust_ir() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "simple_sub", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -507,7 +529,9 @@ fn build_simple_sub_trust_ir() -> (TrustIrFunction, TrustIrModule) {
             }),
         ],
     }];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -522,11 +546,14 @@ fn build_simple_sub_trust_ir() -> (TrustIrFunction, TrustIrModule) {
 ///     goto loop
 fn build_count_down_trust_ir() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "count_down", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): init sum=0, jump to loop
@@ -617,7 +644,9 @@ fn build_count_down_trust_ir() -> (TrustIrFunction, TrustIrModule) {
             ],
         },
     ];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
@@ -1551,4 +1580,13 @@ fn test_macho_object_sizes_reasonable() {
             max_size
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

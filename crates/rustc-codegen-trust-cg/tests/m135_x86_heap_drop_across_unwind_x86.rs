@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // E2E (x86_64-apple-darwin): HEAP `Drop` across an EH cleanup/unwind path.
 // A `Box` held live across a may-unwind (panicking) call is FREED by the cleanup
@@ -51,51 +55,10 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    for cand in [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ] {
-        if cand.exists() {
-            return cand;
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run heap-drop test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn host_is_x86_64_macos() -> bool {
@@ -103,16 +66,7 @@ fn host_is_x86_64_macos() -> bool {
 }
 
 fn x86_64_std_available() -> bool {
-    Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == TARGET)
-        })
-        .unwrap_or(false)
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -163,8 +117,7 @@ fn build_panicker_rlib(dir: &Path) -> PathBuf {
     let panicker_src = dir.join("panicker.rs");
     std::fs::write(&panicker_src, PANICKER_CRATE).expect("write panicker");
     let panicker_rlib = dir.join("libpanicker.rlib");
-    let pk = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let pk = toolchain_support::rustc_command()
         .args(["--crate-name", "panicker", "--crate-type", "rlib"])
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .arg("--emit=link")
@@ -222,13 +175,13 @@ fn compile_staticlib(
 ) -> (bool, String) {
     let src = dir.join(src_name);
     std::fs::write(&src, src_body).expect("write source");
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "staticlib"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "staticlib"]);
     if let Some(dylib) = dylib {
         let mut s = std::ffi::OsString::from("-Zcodegen-backend=");
         s.push(dylib);
-        cmd.arg(&s).env("TCG_NO_PROOF_CERTS", "1");
+        cmd.arg(&s)
+            .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
     }
     cmd.args(["--target", TARGET])
         .arg(format!("-Cpanic={panic}"))
@@ -339,8 +292,7 @@ fn link_driver(
     let bin = dir.join(bin_name);
     let mut l = std::ffi::OsString::from("-L");
     l.push(dir);
-    let link = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let link = toolchain_support::rustc_command()
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .arg(&l)
         .args(["-l", &format!("static={staticlib_name}")])
@@ -426,8 +378,7 @@ fn bridge_heap_box_drop_across_unwind_freed_once_and_matches_llvm_x86_64() {
     let src = dir.join("box_unwind.rs");
     std::fs::write(&src, UNWIND_CRATE).expect("write source");
     let mir_out = dir.join("box_unwind.mir");
-    let mir_status = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let mir_status = toolchain_support::rustc_command()
         .args(["--crate-type", "lib"])
         .args(["--target", TARGET, "-Cpanic=unwind", "-Zmir-opt-level=0"])
         .arg("--extern")
@@ -484,7 +435,10 @@ fn bridge_heap_box_drop_across_unwind_freed_once_and_matches_llvm_x86_64() {
             &format!("driver_{label}"),
         );
         let (exit, out, err, hung) = run_with_timeout(&bin, std::time::Duration::from_secs(20));
-        assert!(!hung, "[{label}] heap-drop binary HUNG. stdout:{out}\nstderr:{err}");
+        assert!(
+            !hung,
+            "[{label}] heap-drop binary HUNG. stdout:{out}\nstderr:{err}"
+        );
         assert_eq!(
             exit,
             Some(0),
@@ -507,7 +461,9 @@ fn bridge_heap_box_drop_across_unwind_freed_once_and_matches_llvm_x86_64() {
         "bridge heap-drop-across-unwind output must MATCH the all-LLVM binary \
          (tcg: {tcg_out}; llvm: {llvm_out})"
     );
-    eprintln!("HEAP Drop-across-unwind VERIFIED (x86-64): {tcg_out} (freed EXACTLY once mid-unwind, matches all-LLVM)");
+    eprintln!(
+        "HEAP Drop-across-unwind VERIFIED (x86-64): {tcg_out} (freed EXACTLY once mid-unwind, matches all-LLVM)"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -543,7 +499,10 @@ fn bridge_heap_box_normal_return_drop_freed_once_matches_llvm_x86_64() {
                 "abort",
                 None,
             );
-            assert!(ok, "[{label} O{opt}] floor frame must compile. stderr:\n{stderr}");
+            assert!(
+                ok,
+                "[{label} O{opt}] floor frame must compile. stderr:\n{stderr}"
+            );
             let frame_obj = object_defining(&dir, &stem, "floor_box");
             let staticlib_name = format!("floor{label}{opt}");
             let staticlib = ar_staticlib(&dir, &staticlib_name, &[frame_obj]);
@@ -556,7 +515,10 @@ fn bridge_heap_box_normal_return_drop_freed_once_matches_llvm_x86_64() {
                 &format!("floorbin_{label}_{opt}"),
             );
             let (exit, out, err, hung) = run_with_timeout(&bin, std::time::Duration::from_secs(20));
-            assert!(!hung, "[{label} O{opt}] floor binary HUNG. stdout:{out}\nstderr:{err}");
+            assert!(
+                !hung,
+                "[{label} O{opt}] floor binary HUNG. stdout:{out}\nstderr:{err}"
+            );
             assert_eq!(
                 exit,
                 Some(0),
@@ -674,7 +636,9 @@ fn bridge_heap_aggregate_and_projected_drops_fail_closed_x86_64() {
                 && stderr.contains("failing closed rather than miscompiling"),
             "[{name}] expected the clean [TCG-MIR-UNSUPPORTED] fail-closed gate; got:\n{stderr}"
         );
-        eprintln!("[{name}] fail-closed at compile time (no wrong dealloc, no runtime crash) — GOOD");
+        eprintln!(
+            "[{name}] fail-closed at compile time (no wrong dealloc, no runtime crash) — GOOD"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

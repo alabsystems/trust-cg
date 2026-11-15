@@ -23,7 +23,7 @@
 //! source (a function-argument register or a load) or a sufficiently large
 //! constant. Unknown and small-constant bounds stay fused.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, InstFlags, InstId, MachFunction, MachInst, MachOperand, ProvenanceMap, RegClass,
@@ -146,7 +146,7 @@ fn run_on_loops(func: &mut MachFunction, loops: &LoopAnalysis) -> bool {
 /// Whole-function def-site map for the opcodes we trace.
 fn fn_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
     use AArch64Opcode::*;
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
@@ -231,7 +231,7 @@ fn classify_loop_bound(
     min_const: i64,
 ) -> BoundClass {
     let loop_defs: HashSet<VReg> = {
-        let mut s = HashSet::new();
+        let mut s = HashSet::default();
         for &b in &func.block_order {
             if !lp.body.contains(&b) {
                 continue;
@@ -331,7 +331,7 @@ fn const_lower_bound(
 
 fn body_def_map(func: &MachFunction, lp: &NaturalLoop) -> HashMap<VReg, InstId> {
     use AArch64Opcode::*;
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for &block_id in &func.block_order {
         if !lp.body.contains(&block_id) {
             continue;
@@ -381,7 +381,7 @@ fn unfuse_loop(func: &mut MachFunction, lp: &NaturalLoop, max_chains: usize) -> 
     // drain to preserve FP order — e.g. fp-convert's vectorized sum loop) and
     // it is exactly as latency-bound as the copy-based form. Group by
     // accumulator vreg; each distinct accumulator is one chain.
-    let mut inplace: HashMap<VReg, Vec<InstId>> = HashMap::new();
+    let mut inplace: HashMap<VReg, Vec<InstId>> = HashMap::default();
     for &block_id in &func.block_order {
         if !lp.body.contains(&block_id) {
             continue;
@@ -409,15 +409,6 @@ fn unfuse_loop(func: &mut MachFunction, lp: &NaturalLoop, max_chains: usize) -> 
     let to_unfuse: HashSet<InstId> = chains.iter().flatten().copied().collect();
     if to_unfuse.is_empty() {
         return false;
-    }
-    if std::env::var("TCG_UNFUSE_FMA_TRACE").is_ok() {
-        eprintln!(
-            "[unfuse-fma] {} header={:?}: {} chain(s), {} FMADD(s)",
-            func.name,
-            lp.header,
-            chains.len(),
-            to_unfuse.len()
-        );
     }
     for &fmadd_id in &to_unfuse {
         split_fmadd(func, lp, fmadd_id);

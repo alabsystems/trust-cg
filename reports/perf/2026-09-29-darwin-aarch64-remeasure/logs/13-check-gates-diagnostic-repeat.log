@@ -1,0 +1,13 @@
+INELIGIBLE run (load_status=QUIET, dirty=True, mismatches=0, headline_eligible=False; harness reasons: source tree has tracked edits; non-default backend knobs ['no-proof-certs'] (diagnostic lane)) — verdicts below are informational only:
+  PASS        G1a_scalar_runtime_M2  — scalar-integer corpus runtime geomean <= 1.30x LLVM -O3 (scalar category only, per manifest.json — the corpus now spans categories, BENCH-3)
+  PASS        G1b_vectorizable_M5  — each vectorizable kernel <= 2.0x LLVM -O3 (worst over the vectorizable category)
+  PASS        G1c_GATE_SB_M6  — strictly better: full intent-to-treat geomean < 1.00x AND no benchmark > 1.50x, coverage >= 80%
+  fail        G2_M1_compile_warm_vs_O2  — warm certs-on compile geomean <= 1.00x LLVM -O2 (warm cache mode stamped)
+  fail        G2_M1_compile_cold_vs_O2  — cold compile geomean <= 2.00x LLVM -O2 (true cold, not cold_proxy)
+  fail        G2_endstate_compile_warm_vs_O3  — end-state: warm certs-on compile geomean < 1.00x LLVM -O3
+  PASS        G5_coverage_M6  — intent-to-treat coverage >= 80% compile-and-match
+  PASS        S1_size_linked_parity_vs_O3  — linked executable file bytes (st_size, shared std included; not emitted-code size) geomean <= 1.10x LLVM -O3 (the roadmap BENCH-1 GATE-P2 threshold, applied to linked bytes)
+  fail        S2_size_linked_SB_vs_O3  — linked executable file bytes geomean <= 1.00x LLVM -O3 (the roadmap BENCH-1 GATE-SB size threshold, applied to linked bytes)
+  unmeasured  R1_program_rss_no_resolved_loss  — no MATCH program's bridge peak-RSS reading exceeds max(its LLVM -O3 reading, the sampler floor) by more than 5% (a conclusive loss); passes only when every program's comparison is resolved (both readings above 2x the sampler floor), otherwise unmeasured; one-sided: cannot certify a win or RSS <= 1.0x
+  fail        R2_compile_rss_parity_vs_O2  — compiler peak RSS (largest single process of the rustc invocation) geomean <= 1.00x LLVM -O2, with no compiler reading at or below 2x the sampler floor (mirrors G2-M1)
+exit=2

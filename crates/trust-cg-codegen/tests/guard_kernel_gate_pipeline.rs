@@ -31,13 +31,18 @@ const ARRAY_LEN: u64 = 8;
 /// single module obligation of the given status.
 fn build(status: ProofStatus) -> (Module, TrustIrFunction) {
     let mut module = Module::new("guard_kernel_gate_pipeline");
-    let elem_ty = module.add_type(Ty::I64);
+    let elem_ty = module
+        .add_type(Ty::I64)
+        .expect("Module::add_type: test fixture");
     let array_ty = Ty::Array(elem_ty, ARRAY_LEN);
-    let ft = module.add_func_type(FuncTy {
-        params: vec![array_ty.clone(), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![array_ty.clone(), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "guarded_extract", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -62,7 +67,9 @@ fn build(status: ProofStatus) -> (Module, TrustIrFunction) {
         status,
         "array index is in bounds",
     ));
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (module, func)
 }
 
@@ -80,11 +87,12 @@ fn try_prepare(
     func: &TrustIrFunction,
 ) -> Result<MachFunction, trust_cg_codegen::pipeline::PipelineError> {
     let (lir_func, proof_ctx) =
-        trust_cg_lower::translate_function(func, module).expect("adapter translate");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter translate");
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O2,
         verify: false,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     });
     pipeline
         .prepare_function_with_metrics_and_trust_ir_module(
@@ -135,4 +143,13 @@ fn public_status_and_env_spellings_never_authorize_guard_elimination() {
             "public Discharged status must not authorize runtime-guard deletion"
         );
     });
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

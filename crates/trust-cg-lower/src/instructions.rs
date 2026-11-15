@@ -7,7 +7,7 @@
 
 use crate::types::Type;
 use serde::{Deserialize, Serialize};
-use trust_cg_ir::TlsModel;
+use trust_cg_ir::{NativeDependencyId, TlsModel};
 
 /// A value reference in the IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -21,6 +21,50 @@ pub struct Value(pub u32);
 /// the loop-body sets in `x86_vectorize.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Block(pub u32);
+
+/// Resolution contract for a named direct call.
+///
+/// Ordinary source calls remain interposable: object linkers and JIT clients
+/// may bind their symbol name according to the platform ABI. An exact module
+/// call is different. Its frontend-neutral numeric identity was authenticated
+/// against the current module, so every later stage must select that module
+/// definition or fail closed; an extern map or same-name definition must not
+/// redirect it. Keeping this distinction in LIR prevents optimizers and
+/// backends from silently erasing function identity back into a raw string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DirectCallBinding {
+    /// Resolve by the platform's ordinary named-symbol/interposition rules.
+    #[default]
+    Interposable,
+    /// Resolve only to this validated module-local function identity.
+    ExactModuleFunction { function: u32 },
+    /// Strict lowering retained the exact bodyless External `FuncId`, but no
+    /// native-runtime catalog has been joined yet.
+    ///
+    /// This is a pending identity carrier, not resolution authority. Core JIT
+    /// planning must replace it with [`Self::NativeDependency`] from the sealed
+    /// `FuncId -> NativeDependencyId` map or fail closed. Compatibility paths
+    /// intentionally never emit this variant.
+    DeclaredExternalFunction { function: u32 },
+    /// Resolve only through this catalog-local native dependency identity.
+    ///
+    /// `function` preserves the authenticated TrustIR identity so a verifier
+    /// can replay the exact sealed map. `dependency` is meaningful only with
+    /// the catalog and binding-receipt digests carried by the opaque Core plan.
+    /// This public data carrier grants no address, symbol, or execution
+    /// authority on its own.
+    NativeDependency {
+        function: u32,
+        dependency: NativeDependencyId,
+    },
+}
+
+impl DirectCallBinding {
+    /// Whether this edge requires the exact authenticated module definition.
+    pub const fn is_exact_module(self) -> bool {
+        matches!(self, Self::ExactModuleFunction { .. })
+    }
+}
 
 /// LIR opcodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,7 +249,9 @@ pub enum Opcode {
     ///
     /// `args[0]` is the assertion condition. Execution continues when the
     /// condition is non-zero and traps when it is zero. This is not proof-only:
-    /// dropping it would silently ignore a source `trust_ir::Inst::Assert`.
+    /// dropping it would silently ignore an internal checked guard. A source
+    /// `trust_ir::Inst::Assert` is a Rust panic, not this generic trap, and is
+    /// refused until its exact kind, payload and runtime behavior are lowered.
     Assert,
     Ineg, // Integer negate: result = -operand
 
@@ -220,6 +266,11 @@ pub enum Opcode {
     Ffloor, // Float round-to-integral toward -inf: result = floor(operand)
     Fceil,  // Float round-to-integral toward +inf: result = ceil(operand)
     Ftrunc, // Float round-to-integral toward zero: result = trunc(operand)
+    // Instruction-preserving AArch64 asm. Keep distinct from portable FP ops:
+    // folding/reassociation must not replace the hardware NaN/FPCR behavior.
+    Aarch64FmaddAsm,
+    Aarch64FsqrtAsm,
+    Aarch64FrintnAsm,
 
     // Shift operations
     Ishl, // Logical shift left
@@ -619,6 +670,19 @@ pub enum Opcode {
     /// profitability pass. This is deliberately distinct from strict [`Self::Fma`].
     /// Args: [a, b, c]; result: [dst].
     Fmuladd,
+    /// One CRC-32 step over `bytes` (1, 2, 4 or 8) bytes of data, bit-reflected
+    /// (least-significant bit first): the `llvm.aarch64.crc32{b,h,w,x}` (IEEE
+    /// 802.3 polynomial 0x04C11DB7) and, with `castagnoli`,
+    /// `llvm.aarch64.crc32c{b,h,w,x}` (0x1EDC6F41) intrinsics.
+    ///
+    /// Args: [crc (I32), data (I32; I64 when `bytes == 8`)]; result: [I32].
+    /// Only the low `bytes` bytes of the data are read. AArch64 selects one
+    /// `CRC32*` instruction when the function admits FEAT_CRC32 and otherwise
+    /// the same function from baseline shifts, masks and XORs.
+    Crc32 {
+        bytes: u8,
+        castagnoli: bool,
+    },
     // Floating-point NaN-propagating-away minimum/maximum (Rust f{32,64}::
     // min/max). NOT IEEE fp.min/fp.max: if exactly one operand is NaN the
     // result is the OTHER operand; both NaN -> NaN; numerically lesser/greater
@@ -687,6 +751,9 @@ pub enum Opcode {
     Return,
     Call {
         name: String,
+        /// Typed resolution class retained after the source IR is lowered.
+        #[serde(default)]
+        binding: DirectCallBinding,
     }, // Direct function call by symbol name
     /// Indirect function call via a register-held function pointer.
     ///
@@ -721,6 +788,9 @@ pub enum Opcode {
     /// Reference: LLVM IR `invoke` instruction
     Invoke {
         name: String,
+        /// The same typed resolution contract as Call; EH never erases identity.
+        #[serde(default)]
+        binding: DirectCallBinding,
         normal_dest: Block,
         unwind_dest: Block,
     },
@@ -741,6 +811,8 @@ pub enum Opcode {
     ///
     /// `catch_type_indices`: 1-based indices into the type table for catch
     /// clauses. Index 0 means catch-all. Empty for cleanup-only pads.
+    /// [`crate::function::RUST_EH_EMPTY_FILTER`] is the restricted Rust
+    /// empty-filter clause, preserved exactly through EH metadata.
     ///
     /// Reference: LLVM IR `landingpad` instruction
     LandingPad {
@@ -791,20 +863,21 @@ pub enum Opcode {
     },
 
     // Atomic memory operations
-    /// Atomic load with acquire semantics: result = atomic_load(ptr).
-    /// args[0] = ptr. Lowered to LDAR on AArch64.
+    /// Atomic load: result = atomic_load(ptr).
+    /// args[0] = ptr. AArch64 selects the load by width and ordering.
     AtomicLoad {
         ty: Type,
         ordering: AtomicOrdering,
     },
-    /// Atomic store with release semantics: atomic_store(ptr, value).
-    /// args[0] = value, args[1] = ptr. Lowered to STLR on AArch64.
+    /// Atomic store: atomic_store(ptr, value).
+    /// args[0] = value, args[1] = ptr. AArch64 selects by width and ordering.
     AtomicStore {
         ty: Type,
         ordering: AtomicOrdering,
     },
     /// Atomic read-modify-write: result (old value) = atomic_rmw(op, ptr, val).
-    /// args[0] = val, args[1] = ptr. Lowered to target atomic RMW instructions or CAS loops.
+    /// args[0] = val, args[1] = ptr. AArch64 currently requires LSE;
+    /// a complete baseline LL/SC lowering is not yet admitted.
     AtomicRmw {
         op: AtomicRmwOp,
         ty: Type,
@@ -812,7 +885,8 @@ pub enum Opcode {
     },
     /// Compare-and-swap: result (old value) = cmpxchg(ptr, expected, desired).
     /// args[0] = expected, args[1] = desired, args[2] = ptr.
-    /// Lowered to CAS (LSE) or LDAXR/STLXR loop (non-LSE).
+    /// AArch64 currently requires CAS (LSE). Existing LDAXR/STLXR machine
+    /// primitives do not establish an admitted non-LSE compare/exchange loop.
     CmpXchg {
         ty: Type,
         success: AtomicOrdering,
@@ -832,11 +906,13 @@ pub enum Opcode {
     },
     /// Compute address of an array element: base + index * sizeof(elem_ty).
     ///
-    /// args[0] = base pointer (I64 address of the array),
+    /// args[0] = base address (I64, or a pointer-represented aggregate value),
     /// args[1] = index (I64). Result is a pointer to the element (I64).
     ///
     /// ISel lowers this to `LSL + ADD` when `elem_ty.bytes()` is a power of
     /// two, otherwise `MOVZ + MUL + ADD` (materialise size, multiply, add).
+    /// With I8 elements this expresses a producer-authorized byte offset;
+    /// it does not reinterpret the aggregate's data as a numeric operand.
     ArrayGep {
         elem_ty: Type,
     },
@@ -864,6 +940,17 @@ pub enum Opcode {
     ///
     /// LLVM intrinsic names: `memset`, `llvm.memset.*`
     Memset,
+
+    /// Address of one exact bodied Internal/Private module function.
+    ///
+    /// Unlike `GlobalRef`, this must never be interposed by an external symbol
+    /// or resolved through a spelling alias. The source-owned translation
+    /// report authenticates the numeric identity before instruction selection.
+    /// Appended to preserve existing serialized enum discriminants.
+    FunctionAddr {
+        name: String,
+        function: u32,
+    },
 }
 
 /// Floating-point comparison conditions.
@@ -913,6 +1000,32 @@ pub enum IntCC {
     UnsignedLessThanOrEqual,
 }
 
+/// The LIR condition a trust-ir integer compare predicate lowers to: THE one
+/// `ICmpOp -> IntCC` map. The adapter's `ICmp` arm and every verifier that
+/// builds a lowering obligation keyed on a trust-ir predicate (the x86-64
+/// vector-compare cells, the read-only source core, mid-level translation
+/// validation) call it instead of restating the match, so a swapped arm is one
+/// edit that every reader sees: the x86-64 `Ult` obligation would then state
+/// trust-ir's `ult` against an `ugt` composition and fail evaluation and its
+/// certified digest. Exhaustive over `ICmpOp`, so a predicate trust-ir adds
+/// fails to compile here first.
+#[must_use]
+pub const fn intcc_of_icmp(op: trust_ir::ICmpOp) -> IntCC {
+    use trust_ir::ICmpOp;
+    match op {
+        ICmpOp::Eq => IntCC::Equal,
+        ICmpOp::Ne => IntCC::NotEqual,
+        ICmpOp::Ult => IntCC::UnsignedLessThan,
+        ICmpOp::Ule => IntCC::UnsignedLessThanOrEqual,
+        ICmpOp::Ugt => IntCC::UnsignedGreaterThan,
+        ICmpOp::Uge => IntCC::UnsignedGreaterThanOrEqual,
+        ICmpOp::Slt => IntCC::SignedLessThan,
+        ICmpOp::Sle => IntCC::SignedLessThanOrEqual,
+        ICmpOp::Sgt => IntCC::SignedGreaterThan,
+        ICmpOp::Sge => IntCC::SignedGreaterThanOrEqual,
+    }
+}
+
 /// Memory ordering for atomic operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AtomicOrdering {
@@ -929,6 +1042,37 @@ pub enum AtomicOrdering {
 }
 
 impl AtomicOrdering {
+    /// The trust-ir ordering this LIR ordering carries. The two enums name the
+    /// same five orderings one-to-one (the adapter's `translate_ordering` is
+    /// the inverse), so a legality table stated over trust-ir's `Ordering`
+    /// decides an LIR ordering exactly.
+    #[must_use]
+    pub const fn to_trust_ir(self) -> trust_ir::Ordering {
+        match self {
+            AtomicOrdering::Relaxed => trust_ir::Ordering::Relaxed,
+            AtomicOrdering::Acquire => trust_ir::Ordering::Acquire,
+            AtomicOrdering::Release => trust_ir::Ordering::Release,
+            AtomicOrdering::AcqRel => trust_ir::Ordering::AcqRel,
+            AtomicOrdering::SeqCst => trust_ir::Ordering::SeqCst,
+        }
+    }
+
+    /// Whether an atomic LOAD may carry this ordering (`Relaxed`, `Acquire`,
+    /// `SeqCst`): trust-ir's proved table `Ordering::is_legal_for_load`
+    /// (every cell a gate-13 law), the one trust-ir's validator refuses
+    /// `IllegalAtomicOrdering` by.
+    #[must_use]
+    pub const fn is_legal_for_load(self) -> bool {
+        self.to_trust_ir().is_legal_for_load()
+    }
+
+    /// Whether an atomic STORE may carry this ordering (`Relaxed`, `Release`,
+    /// `SeqCst`): trust-ir's proved table `Ordering::is_legal_for_store`.
+    #[must_use]
+    pub const fn is_legal_for_store(self) -> bool {
+        self.to_trust_ir().is_legal_for_store()
+    }
+
     /// THE compare-exchange failure-ordering validity rule (Rust/LLVM,
     /// C++17-and-later): the failure (load-only) ordering must not be
     /// `Release` or `AcqRel` — a failed compare-exchange performs no store,
@@ -937,13 +1081,17 @@ impl AtomicOrdering {
     /// STRONGER than the success ordering (`compare_exchange(.., AcqRel,
     /// SeqCst)` in std's mutex/rwlock is legal).
     ///
+    /// That is exactly a legal LOAD ordering ([`Self::is_legal_for_load`],
+    /// trust-ir's proved table), which trust-ir's validator applies to
+    /// `CmpXchg`'s failure ordering as well.
+    ///
     /// Every cmpxchg admission gate (the trust_ir adapter, the AArch64 ISel,
     /// the x86-64 ISel) must use exactly this predicate — one rule, all
     /// places. A backend whose opcode choice assumes `failure <= success`
     /// lifts the success side via [`Self::lift_for_cmpxchg_failure`] instead
     /// of rejecting.
     pub fn is_valid_cmpxchg_failure(self) -> bool {
-        !matches!(self, AtomicOrdering::Release | AtomicOrdering::AcqRel)
+        self.is_legal_for_load()
     }
 
     /// Lift `self` (a cmpxchg SUCCESS ordering) minimally so it covers a
@@ -977,7 +1125,7 @@ impl AtomicOrdering {
     }
 
     pub fn allows_cmpxchg_failure(self, failure: AtomicOrdering) -> bool {
-        if matches!(failure, AtomicOrdering::Release | AtomicOrdering::AcqRel) {
+        if !failure.is_valid_cmpxchg_failure() {
             return false;
         }
 
@@ -1047,8 +1195,8 @@ impl Instruction {
     /// plus the argument/result arities (operand shape). See the
     /// LoweringProvenance schema comment in `trust_cg_ir::provenance`.
     pub fn lowering_digest(&self) -> trust_cg_ir::provenance::SourceInstDigest {
-        trust_cg_ir::provenance::SourceInstDigest::compute(
-            &format!("{:?}", self.opcode),
+        trust_cg_ir::provenance::SourceInstDigest::compute_debug(
+            &self.opcode,
             self.args.len(),
             self.results.len(),
         )
@@ -1115,5 +1263,64 @@ mod tests {
         assert_eq!(Acquire.lift_for_cmpxchg_failure(SeqCst), SeqCst);
         assert_eq!(Release.lift_for_cmpxchg_failure(SeqCst), SeqCst);
         assert_eq!(AcqRel.lift_for_cmpxchg_failure(SeqCst), SeqCst);
+    }
+
+    /// `intcc_of_icmp` is a bijection from trust-ir's ten integer predicates
+    /// onto the ten `IntCC`s, and the adapter's `ICmp` arm calls it rather than
+    /// restating the match. Scope (test rung): this catches a dropped or
+    /// duplicated arm and a restated copy, not a swap of two arms; a swap is
+    /// caught by the x86-64 vector-compare cells, whose obligations state
+    /// trust-ir's predicate against the composition this map selects
+    /// (trust-cg-verify `tests/x86_icmp_manifest_cells.rs`: evaluation and the
+    /// certified digests).
+    #[test]
+    fn intcc_of_icmp_is_one_bijective_map_the_adapter_calls() {
+        use super::{IntCC, intcc_of_icmp};
+        use trust_ir::ICmpOp;
+
+        const OPS: [ICmpOp; 10] = [
+            ICmpOp::Eq,
+            ICmpOp::Ne,
+            ICmpOp::Ult,
+            ICmpOp::Ule,
+            ICmpOp::Ugt,
+            ICmpOp::Uge,
+            ICmpOp::Slt,
+            ICmpOp::Sle,
+            ICmpOp::Sgt,
+            ICmpOp::Sge,
+        ];
+        const CCS: [IntCC; 10] = [
+            IntCC::Equal,
+            IntCC::NotEqual,
+            IntCC::SignedLessThan,
+            IntCC::SignedGreaterThanOrEqual,
+            IntCC::SignedGreaterThan,
+            IntCC::SignedLessThanOrEqual,
+            IntCC::UnsignedLessThan,
+            IntCC::UnsignedGreaterThanOrEqual,
+            IntCC::UnsignedGreaterThan,
+            IntCC::UnsignedLessThanOrEqual,
+        ];
+        let image: Vec<IntCC> = OPS.into_iter().map(intcc_of_icmp).collect();
+        for cc in CCS {
+            assert_eq!(
+                image.iter().filter(|got| **got == cc).count(),
+                1,
+                "{cc:?} must be the image of exactly one ICmpOp (image {image:?})"
+            );
+        }
+
+        let adapter = include_str!("adapter.rs");
+        assert!(
+            adapter.contains("intcc_of_icmp(*op)"),
+            "the adapter's ICmp arm must lower its predicate through intcc_of_icmp"
+        );
+        for restated in ["ICmpOp::Ult => IntCC::", "ICmpOp::Sge => IntCC::"] {
+            assert!(
+                !adapter.contains(restated),
+                "the adapter restates the ICmpOp -> IntCC map (`{restated}`); call intcc_of_icmp"
+            );
+        }
     }
 }

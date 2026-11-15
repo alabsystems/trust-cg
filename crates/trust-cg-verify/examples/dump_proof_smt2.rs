@@ -1,7 +1,7 @@
 // Dump the SMT2 query for any ProofDatabase obligation whose name contains a
 // given substring, so we can study AY's behavior on it directly.
 //
-//   cargo run -p trust-cg-verify --example dump_proof_smt2 -- "Umul_I32"
+//   scripts/trust_cargo.sh run -p trust-cg-verify --example dump_proof_smt2 -- "Umul_I32"
 //
 // Prints, for each match: a header line `;; <name>` then the SMT2 query.
 

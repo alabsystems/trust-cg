@@ -29,7 +29,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use trust_cg_codegen::macho::MachOWriter;
 use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig, encode_function};
 use trust_cg_ir::function::MachFunction;
 use trust_cg_ir::inst::AArch64Opcode;
@@ -39,8 +38,12 @@ use trust_ir::{
     Module as TrustIrModule, OverflowOp, ProofAnnotation, Ty, ValueId,
 };
 
-fn is_aarch64_macos() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O) can link and run the object.
+fn is_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn has_cc() -> bool {
@@ -56,11 +59,14 @@ fn has_cc() -> bool {
 /// result[1], is DEAD). When `with_proof` is set, the node carries `ProofAnnotation::NoOverflow`.
 fn build_overflow_add_module(name: &str, with_proof: bool) -> TrustIrModule {
     let mut module = TrustIrModule::new(name);
-    let func_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let func_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = BlockId::new(0);
     let mut func = TrustIrFunction::new(FuncId::new(0), name, func_ty, entry);
@@ -90,20 +96,22 @@ fn build_overflow_add_module(name: &str, with_proof: bool) -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// Lower + prepare the module through the REAL pipeline (O2, kernel gate default-ON, AArch64 carrier
 /// arch). Returns the prepared MachFunction.
 fn prepare(module: &TrustIrModule) -> MachFunction {
-    let lowered = trust_cg_lower::translate_module(module).expect("Inst::Overflow module lowers");
+    let lowered = permit_translate_module(module).expect("Inst::Overflow module lowers");
     assert_eq!(lowered.len(), 1, "expected one lowered function");
 
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O2,
         verify: false,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_target(native_host::TRIPLE)
     });
     pipeline
         .prepare_function_with_proofs(&lowered[0].0, Some(&lowered[0].1))
@@ -143,12 +151,7 @@ fn make_dir(name: &str) -> PathBuf {
 
 fn emit_object(func: &MachFunction) -> Vec<u8> {
     let code = encode_function(func).expect("encode prepared overflow function");
-    let mut writer = MachOWriter::new();
-    writer.add_text_section(&code);
-    writer
-        .add_symbol(&format!("_{}", func.name), 1, 0, true)
-        .unwrap();
-    writer.write().unwrap()
+    native_host::naked_function_object(&func.name, &code)
 }
 
 /// Link the object with a C driver that calls `checked_add(a, b)` and exits 0 iff the result equals
@@ -175,15 +178,22 @@ int main(void) {{
     std::fs::write(&driver_path, driver).expect("write driver");
 
     let bin = dir.join("checked_add_bin");
-    let status = Command::new("cc")
+    // Capture the linker's output: an inherited stderr would interleave
+    // linker warnings with libtest's per-test result lines.
+    let link = Command::new("cc")
         .arg("-o")
         .arg(&bin)
         .arg(&driver_path)
         .arg(&obj_path)
-        .arg("-Wl,-no_pie")
-        .status()
+        .arg(native_host::no_pie_link_flag())
+        .args(native_host::c_math_library_args())
+        .output()
         .expect("run cc");
-    assert!(status.success(), "linking checked_add failed");
+    assert!(
+        link.status.success(),
+        "linking checked_add failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
     bin
 }
 
@@ -222,8 +232,8 @@ fn overflow_inst_proven_dead_flag_eliminates_carrier_and_computes_sum() {
         "the eliminated carrier must leave no TrapOverflowExact in the prepared stream"
     );
 
-    if !is_aarch64_macos() || !has_cc() {
-        eprintln!("SKIP runtime half: not AArch64 macOS or cc unavailable");
+    if !is_aarch64_native() || !has_cc() {
+        eprintln!("SKIP runtime half: not an AArch64 Linux GNU or macOS host, or cc unavailable");
         return;
     }
 
@@ -249,8 +259,8 @@ fn overflow_inst_unproven_keeps_legacy_path_and_computes_sum() {
          carrier"
     );
 
-    if !is_aarch64_macos() || !has_cc() {
-        eprintln!("SKIP runtime half: not AArch64 macOS or cc unavailable");
+    if !is_aarch64_native() || !has_cc() {
+        eprintln!("SKIP runtime half: not an AArch64 Linux GNU or macOS host, or cc unavailable");
         return;
     }
 
@@ -260,4 +270,28 @@ fn overflow_inst_unproven_keeps_legacy_path_and_computes_sum() {
     let bin = link(&dir, "checked_add_unproven", &obj, 100, 23, 123);
     run(&bin).expect("legacy-path add must return the correct value with NO trap");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

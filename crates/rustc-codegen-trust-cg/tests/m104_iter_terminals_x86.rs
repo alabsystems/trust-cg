@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: REDUCING / SHORT-CIRCUITING ITERATOR TERMINALS —
 // `.find(p)` / `.position(p)` / `.any(p)` / `.all(p)` / `.min()` / `.max()` /
@@ -41,65 +45,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run iter-terminal test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -135,9 +88,8 @@ fn try_compile_at(
     let src_path = dir.join(format!("{name}.rs"));
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -158,17 +110,15 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>) -> PathBuf
     compile_at(dir, name, src, backend, 0)
 }
 
-fn compile_at(
-    dir: &Path,
-    name: &str,
-    src: &str,
-    backend: Option<&Path>,
-    opt_level: u8,
-) -> PathBuf {
+fn compile_at(dir: &Path, name: &str, src: &str, backend: Option<&Path>, opt_level: u8) -> PathBuf {
     try_compile_at(dir, name, src, backend, opt_level).unwrap_or_else(|| {
         panic!(
             "compile of `{name}` failed ({} backend)",
-            if backend.is_some() { "trust-cg" } else { "llvm" }
+            if backend.is_some() {
+                "trust-cg"
+            } else {
+                "llvm"
+            }
         )
     })
 }
@@ -242,9 +192,7 @@ fn ord_minmax_and_custom_comparators_preserve_semantics_at_o3() {
         // Depending on optimized MIR shape, the comparator-driven reducer may
         // lower this exactly or fail closed. A successful build must preserve the
         // custom comparator rather than flattening it to ordinary min/max.
-        if let Some(tcg) =
-            try_compile_at(&dir, &format!("{name}_tcg"), &src, Some(&dylib), 3)
-        {
+        if let Some(tcg) = try_compile_at(&dir, &format!("{name}_tcg"), &src, Some(&dylib), 3) {
             assert_eq!(
                 run_exit_code(&tcg),
                 *native_expected,
@@ -269,7 +217,11 @@ fn ord_minmax_and_custom_comparators_preserve_semantics_at_o3() {
     let llvm = compile(&dir, "evil_min_by_llvm", &spoof, None);
     let tcg = compile(&dir, "evil_min_by_tcg", &spoof, Some(&dylib));
     assert_eq!(run_exit_code(&llvm), 77, "LLVM name-spoof sanity");
-    assert_eq!(run_exit_code(&tcg), 77, "trust-cg must retain user method body");
+    assert_eq!(
+        run_exit_code(&tcg),
+        77,
+        "trust-cg must retain user method body"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -19,7 +19,7 @@ driven with fully-overlapping pointers.
 
 usage: fpmapfuzz.py <trust-cg-binary> [--quick]
 """
-import sys, os, subprocess, tempfile
+import atexit, shutil, sys, os, subprocess, tempfile
 
 TCG = sys.argv[1]
 QUICK = "--quick" in sys.argv
@@ -322,7 +322,7 @@ def compile_tcg(tir, obj, disable=None):
     env = dict(os.environ)
     if disable:
         env["TRUST_CG_DISABLE_PASSES"] = disable
-    r = run([TCG, "--format=text", "--target", "aarch64", "-O2", "-c", tir, "-o", obj], env=env)
+    r = run([TCG, "--format=text", "--permit-unlicensed", "--target", "aarch64", "-O2", "-c", tir, "-o", obj], env=env)
     if r.returncode != 0:
         print(r.stderr)
         raise SystemExit(f"tcg compile failed: {tir}")
@@ -333,6 +333,12 @@ def has_vec(obj):
 
 def main():
     wd = tempfile.mkdtemp(prefix="fpmapfuzz")
+    # The work directory is removed when the run ends, unless
+    # TRUST_CG_KEEP_TEST_OBJECTS asks to keep it for inspection.
+    if os.environ.get("TRUST_CG_KEEP_TEST_OBJECTS"):
+        print(f"work directory kept: {wd}")
+    else:
+        atexit.register(shutil.rmtree, wd, ignore_errors=True)
     total = fails = 0
     vec_fired = 0
     for fty in FTYS:

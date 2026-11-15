@@ -445,6 +445,66 @@ pub fn encode_trust_ir_ctlz(operand: SmtExpr) -> SmtExpr {
     result
 }
 
+/// `x` rotated left by the CONSTANT `k` (`0 < k < width`), written as the bit
+/// permutation it is: the low `width - k` bits move to the top and the high `k`
+/// bits wrap to the bottom.
+fn rotate_left_by_const(x: &SmtExpr, width: u32, k: u32) -> SmtExpr {
+    let moved_up = x.clone().extract(width - 1 - k, 0);
+    let wrapped = x.clone().extract(width - 1, width - k);
+    moved_up.concat(wrapped)
+}
+
+/// Rotate `value` left (`left`) or right by `amount`, following the trust-ir
+/// reference interpreter's `rotate_at_width`: the amount is reduced with
+/// `amount % width` (unsigned), a reduced amount of `0` returns the value, and
+/// every other reduced amount selects the matching fixed bit permutation.
+fn encode_trust_ir_rotate(value: SmtExpr, amount: SmtExpr, left: bool) -> SmtExpr {
+    let width = value.bv_width();
+    let n = amount.bvurem(SmtExpr::bv_const(u64::from(width), width));
+    let mut result = value.clone();
+    for k in 1..width {
+        // A right rotate by `k` is the left rotate by `width - k`.
+        let left_amount = if left { k } else { width - k };
+        let rotated = rotate_left_by_const(&value, width, left_amount);
+        let hit = n.clone().eq_expr(SmtExpr::bv_const(u64::from(k), width));
+        result = SmtExpr::ite(hit, rotated, result);
+    }
+    result
+}
+
+/// Encode trust-ir `BinOp::RotL`: `value` rotated left by `amount % width`. Total
+/// at every amount; see `encode_trust_ir_rotate`.
+pub fn encode_trust_ir_rotl(value: SmtExpr, amount: SmtExpr) -> SmtExpr {
+    encode_trust_ir_rotate(value, amount, true)
+}
+
+/// Encode trust-ir `BinOp::RotR`: `value` rotated right by `amount % width`.
+/// Total at every amount; see `encode_trust_ir_rotate`.
+pub fn encode_trust_ir_rotr(value: SmtExpr, amount: SmtExpr) -> SmtExpr {
+    encode_trust_ir_rotate(value, amount, false)
+}
+
+/// Encode trust-ir `BinOp::FCopySign` at `F32`/`F64` over the operands' IEEE-754
+/// BIT PATTERNS: the magnitude bits of `lhs` merged with the sign bit of `rhs`.
+/// The reference interpreter executes it as `lhs.copysign(rhs)`, which the
+/// `BinOp::FCopySign` contract states as IEEE 754 `copySign` — exact, quiet,
+/// never rounding, and keeping a NaN magnitude's payload — and whose `F16` arm
+/// is written as this same mask-and-merge. The width is the operands' width.
+pub fn encode_trust_ir_fcopysign(lhs: SmtExpr, rhs: SmtExpr) -> SmtExpr {
+    let width = lhs.bv_width();
+    let sign = 1u64 << (width - 1);
+    let magnitude_mask = SmtExpr::bv_const(!sign & (u64::MAX >> (64 - width)), width);
+    lhs.bvand(magnitude_mask)
+        .bvor(rhs.bvand(SmtExpr::bv_const(sign, width)))
+}
+
+/// Encode trust-ir `Inst::Select` over a scalar: the `Bool` condition is the
+/// 1-bit value `encode_trust_ir_icmp` produces, and the result is `then_val`
+/// exactly when that bit is `1`.
+pub fn encode_trust_ir_select(cond: SmtExpr, then_val: SmtExpr, else_val: SmtExpr) -> SmtExpr {
+    SmtExpr::ite(cond.eq_expr(SmtExpr::bv_const(1, 1)), then_val, else_val)
+}
+
 /// Encode the x86 BSR (bit-scan-reverse) reference for NONZERO inputs: the index
 /// of the highest set bit, `(width - 1) - Ctlz(src)`. The caller carries a
 /// `src != 0` precondition (BSR(0) is architecturally undefined). The machine side
@@ -546,7 +606,10 @@ pub fn encode_trust_ir_fcmp(
 
     let bool_result = match cond {
         FloatCC::Equal => lhs.fp_eq(rhs),
-        FloatCC::NotEqual => lhs.fp_eq(rhs).not_expr(),
+        // FloatCC::NotEqual is ordered-not-equal (ONe), not Rust's `!=`
+        // or unordered-not-equal: fp.eq is false on NaN, so negating it
+        // alone would incorrectly accept unordered operands.
+        FloatCC::NotEqual => either_nan.not_expr().and_expr(lhs.fp_eq(rhs).not_expr()),
         FloatCC::LessThan => lhs.fp_lt(rhs),
         FloatCC::LessThanOrEqual => lhs.fp_le(rhs),
         FloatCC::GreaterThan => lhs.fp_gt(rhs),
@@ -612,6 +675,64 @@ pub fn encode_trust_ir_icmp(cond: &IntCC, _ty: Type, lhs: SmtExpr, rhs: SmtExpr)
 }
 
 // ---------------------------------------------------------------------------
+// trust_ir CmpXchg (compare-and-swap) source semantics
+// ---------------------------------------------------------------------------
+
+/// The three observable results of a trust_ir `CmpXchg` at one width, as pure
+/// bitvector/boolean functions of `(current, expected, desired)`.
+///
+/// Every field is a function of the three w-bit VALUE leaves ONLY. There is no
+/// register, no flag, no address and no x86 anywhere in this struct — that is
+/// what makes it the INDEPENDENT source side of the narrow-CMPXCHG obligation
+/// rather than a restatement of the machine model.
+#[derive(Debug, Clone)]
+pub struct TrustIrCmpXchg {
+    /// First result: the value that was in the cell BEFORE the operation.
+    pub loaded: SmtExpr,
+    /// The cell's contents AFTER the operation: `desired` on success, the
+    /// unchanged `current` on failure.
+    pub stored: SmtExpr,
+    /// Second result: the success predicate `current == expected` (Bool sort).
+    pub success: SmtExpr,
+}
+
+/// Encode trust_ir `CmpXchg { ty, ptr, expected, desired, .. }` at the value
+/// width of `ty`, as a pure function of the three w-bit values.
+///
+/// TRANSCRIBED from the pinned trust-ir reference interpreter
+/// (`crates/trust-ir/src/interpret.rs`, `Inst::CmpXchg` arm @ `d41fa3f`):
+///
+/// ```text
+///     let current = eval_load(ty, ptr);
+///     let success = current == expected;
+///     if success { eval_store(ty, ptr, desired); }
+///     results = (current, bool(success))
+/// ```
+///
+/// so `loaded = current`, `success = (current == expected)` and the cell after
+/// the operation is `desired` when `success` and `current` otherwise — which is
+/// what [`TrustIrCmpXchg::stored`] states as a total function (the interpreter's
+/// `if` is a partial update of the same cell).
+///
+/// WHAT THIS DOES NOT SAY. It says nothing about atomicity, about LOCK
+/// serialization or about the memory ORDERING pair carried on the instruction:
+/// the reference interpreter is single-threaded and so is this encoding. It
+/// also says nothing about registers or flags — trust-ir has no notion of an
+/// accumulator, of carrier high bits, or of ZF.
+pub fn encode_trust_ir_cmpxchg(
+    current: SmtExpr,
+    expected: SmtExpr,
+    desired: SmtExpr,
+) -> TrustIrCmpXchg {
+    let success = current.clone().eq_expr(expected);
+    TrustIrCmpXchg {
+        loaded: current.clone(),
+        stored: SmtExpr::ite(success.clone(), desired, current),
+        success,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LANE-WISE (packed/SIMD) trust_ir source semantics
 // ---------------------------------------------------------------------------
 //
@@ -651,6 +772,12 @@ pub fn encode_trust_ir_lanewise_binop(
 /// `encode_packed_eq`/`encode_packed_signed_gt`). The SOURCE side of a packed
 /// compare-mask reconstruction.
 ///
+/// It is trust-ir's statement, not a restatement: `bv_meaning::vector_icmp`
+/// with each lane carried as `physical_mask_lane`, printed by
+/// [`crate::trust_ir_bv::SmtAlgebra`] (the tree is the one this function built
+/// by hand before: per lane `ite(pred(extract(lhs), extract(rhs)), 2^w-1, 0)`,
+/// lane 0 least significant).
+///
 /// Panics if `cond` is not Equal or SignedGreaterThan (the only conditions whose
 /// whole packed lowering is the single PCMPEQ*/PCMPGT* instruction).
 pub fn encode_trust_ir_lanewise_cmp_mask(
@@ -659,17 +786,18 @@ pub fn encode_trust_ir_lanewise_cmp_mask(
     lhs: SmtExpr,
     rhs: SmtExpr,
 ) -> SmtExpr {
-    let lane_bits = arrangement.lane_bits();
-    let all_ones = SmtExpr::bv_const(crate::smt::mask(u64::MAX, lane_bits), lane_bits);
-    let zero = SmtExpr::bv_const(0, lane_bits);
-    crate::smt::map_lanes_binary(&lhs, &rhs, arrangement, |a, b| {
-        let cmp_bool = match cond {
-            IntCC::Equal => a.eq_expr(b),
-            IntCC::SignedGreaterThan => a.bvsgt(b),
-            other => panic!("encode_trust_ir_lanewise_cmp_mask: unsupported lane cond {other:?}"),
-        };
-        SmtExpr::ite(cmp_bool, all_ones.clone(), zero.clone())
-    })
+    let op = match cond {
+        IntCC::Equal => trust_ir::ICmpOp::Eq,
+        IntCC::SignedGreaterThan => trust_ir::ICmpOp::Sgt,
+        other => panic!("encode_trust_ir_lanewise_cmp_mask: unsupported lane cond {other:?}"),
+    };
+    crate::trust_ir_bv::vector_icmp_physical_mask(
+        op,
+        arrangement.lane_bits(),
+        arrangement.lane_count(),
+        &lhs,
+        &rhs,
+    )
 }
 
 /// Encode a trust_ir lane-wise FULL-WIDTH BITWISE op (`Band`/`Bor`/`Bxor`/
@@ -755,7 +883,12 @@ pub fn encode_trust_ir_bitwise_binop(
 /// This matches the AArch64 MVN instruction semantics.
 pub fn encode_trust_ir_bnot(ty: Type, operand: SmtExpr) -> SmtExpr {
     let width = ty.bits();
-    let all_ones = SmtExpr::bv_const(crate::smt::mask(u64::MAX, width), width);
+    let all_ones = if width == 128 {
+        // SMT literals carry u64 payloads; a wide NOT must flip both limbs.
+        SmtExpr::bv_const(u64::MAX, 64).concat(SmtExpr::bv_const(u64::MAX, 64))
+    } else {
+        SmtExpr::bv_const(crate::smt::mask(u64::MAX, width), width)
+    };
     operand.bvxor(all_ones)
 }
 
@@ -1286,6 +1419,226 @@ mod tests {
     // -----------------------------------------------------------------------
     // FP comparison (FCMP) semantic encoder tests
     // -----------------------------------------------------------------------
+
+    const FCMP_IEEE_BITS: [[u64; 16]; 2] = [
+        [
+            0, 0x80000000, 1, 0x80000001, 0x007fffff, 0x00800000, 0x3f800000, 0xbf800000,
+            0x7f800000, 0xff800000, 0x7f7fffff, 0xff7fffff, 0x7fc12345, 0xffc54321, 0x7f800001,
+            0xff800123,
+        ],
+        [
+            0,
+            0x8000000000000000,
+            1,
+            0x8000000000000001,
+            0x000fffffffffffff,
+            0x0010000000000000,
+            0x3ff0000000000000,
+            0xbff0000000000000,
+            0x7ff0000000000000,
+            0xfff0000000000000,
+            0x7fefffffffffffff,
+            0xffefffffffffffff,
+            0x7ff8123456789abc,
+            0xfff8abcdef123456,
+            0x7ff0000000000001,
+            0xfff0000012345678,
+        ],
+    ];
+
+    // Independent integer-only IEEE classification/order, not a call to either
+    // encoder, from_floatcc, NZCV, or a floating-point comparison oracle.
+    fn fcmp_ieee_relation(a: u64, b: u64, width: u32) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        let (mask, sign, exponent, fraction) = match width {
+            32 => (0xffff_ffff, 0x8000_0000, 0x7f80_0000, 0x007f_ffff),
+            64 => (
+                u64::MAX,
+                1 << 63,
+                0x7ff0_0000_0000_0000,
+                0x000f_ffff_ffff_ffff,
+            ),
+            _ => panic!("unsupported IEEE width"),
+        };
+        let (a, b) = (a & mask, b & mask);
+        let nan = |bits| bits & exponent == exponent && bits & fraction != 0;
+        if nan(a) || nan(b) {
+            None
+        } else if a == b || (a & !sign == 0 && b & !sign == 0) {
+            Some(Ordering::Equal)
+        } else if (a ^ b) & sign != 0 {
+            Some(if a & sign != 0 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            })
+        } else if a & sign != 0 {
+            Some(b.cmp(&a))
+        } else {
+            Some(a.cmp(&b))
+        }
+    }
+
+    fn fcmp_ieee_expected(
+        cond: trust_cg_lower::instructions::FloatCC,
+        relation: Option<std::cmp::Ordering>,
+    ) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        use trust_cg_lower::instructions::FloatCC;
+        match cond {
+            FloatCC::Equal => relation == Some(Equal),
+            FloatCC::NotEqual => matches!(relation, Some(Less | Greater)),
+            FloatCC::LessThan => relation == Some(Less),
+            FloatCC::LessThanOrEqual => matches!(relation, Some(Less | Equal)),
+            FloatCC::GreaterThan => relation == Some(Greater),
+            FloatCC::GreaterThanOrEqual => matches!(relation, Some(Greater | Equal)),
+            FloatCC::Ordered => relation.is_some(),
+            FloatCC::Unordered => relation.is_none(),
+            FloatCC::UnorderedEqual => matches!(relation, None | Some(Equal)),
+            FloatCC::UnorderedNotEqual => relation != Some(Equal),
+            FloatCC::UnorderedLessThan => matches!(relation, None | Some(Less)),
+            FloatCC::UnorderedLessThanOrEqual => relation != Some(Greater),
+            FloatCC::UnorderedGreaterThan => matches!(relation, None | Some(Greater)),
+            FloatCC::UnorderedGreaterThanOrEqual => relation != Some(Less),
+        }
+    }
+
+    fn fcmp_ieee_constant(bits: u64, width: u32) -> SmtExpr {
+        if width == 32 {
+            SmtExpr::fp32_const(f32::from_bits(bits as u32))
+        } else {
+            SmtExpr::fp64_const(f64::from_bits(bits))
+        }
+    }
+
+    fn check_fcmp_ieee_matrix(machine: bool) {
+        use crate::aarch64_semantics::{FPSize, encode_fcmp};
+        use trust_cg_lower::instructions::FloatCC;
+        let conditions = [
+            FloatCC::Equal,
+            FloatCC::NotEqual,
+            FloatCC::LessThan,
+            FloatCC::LessThanOrEqual,
+            FloatCC::GreaterThan,
+            FloatCC::GreaterThanOrEqual,
+            FloatCC::Ordered,
+            FloatCC::Unordered,
+            FloatCC::UnorderedEqual,
+            FloatCC::UnorderedNotEqual,
+            FloatCC::UnorderedLessThan,
+            FloatCC::UnorderedLessThanOrEqual,
+            FloatCC::UnorderedGreaterThan,
+            FloatCC::UnorderedGreaterThanOrEqual,
+        ];
+        let empty = HashMap::new();
+        let (mut checked, mut wrong, mut unordered_pairs) = (0, 0, 0);
+        let mut first_wrong = None;
+        for (width, values) in [32, 64].into_iter().zip(FCMP_IEEE_BITS) {
+            for cond in conditions {
+                let mut truth_values = [0usize; 2];
+                for a in values {
+                    for b in values {
+                        let relation = fcmp_ieee_relation(a, b, width);
+                        unordered_pairs += usize::from(relation.is_none());
+                        let expected = fcmp_ieee_expected(cond, relation);
+                        truth_values[usize::from(expected)] += 1;
+                        let (a_expr, b_expr) =
+                            (fcmp_ieee_constant(a, width), fcmp_ieee_constant(b, width));
+                        let result = if machine {
+                            encode_fcmp(
+                                if width == 32 {
+                                    FPSize::Single
+                                } else {
+                                    FPSize::Double
+                                },
+                                a_expr,
+                                b_expr,
+                                &cond,
+                            )
+                        } else {
+                            encode_trust_ir_fcmp(
+                                &cond,
+                                if width == 32 { Type::F32 } else { Type::F64 },
+                                a_expr,
+                                b_expr,
+                            )
+                        };
+                        assert_eq!(result.sort(), crate::smt::SmtSort::BitVec(1));
+                        let got = result.eval(&empty);
+                        if got != EvalResult::Bv(u64::from(expected)) {
+                            wrong += 1;
+                            first_wrong.get_or_insert_with(|| format!("machine={machine} width={width} {cond:?} a={a:016x} b={b:016x} got={got:?} expected={expected}"));
+                        }
+                        checked += 1;
+                    }
+                }
+                assert!(truth_values.into_iter().all(|n| n > 0));
+            }
+        }
+        assert_eq!(checked, 7168);
+        assert_eq!(unordered_pairs, 3136);
+        assert_eq!(
+            wrong, 0,
+            "{wrong}/{checked} wrong IEEE predicates; first={first_wrong:?}"
+        );
+    }
+
+    #[test]
+    fn fcmp_semantic_source_matches_independent_ieee_predicates() {
+        check_fcmp_ieee_matrix(false);
+    }
+
+    #[test]
+    fn fcmp_semantic_machine_matches_independent_ieee_predicates() {
+        check_fcmp_ieee_matrix(true);
+    }
+
+    #[test]
+    fn fcmp_semantic_one_is_distinct_from_hardware_ne_and_une() {
+        use crate::aarch64_semantics::{FPSize, encode_fcmp, encode_fcmp_cset};
+        use trust_cg_lower::{instructions::FloatCC, isel::AArch64CC};
+        let empty = HashMap::new();
+        let (mut checked, mut wrong) = (0, 0);
+        for (width, values) in [32, 64].into_iter().zip(FCMP_IEEE_BITS) {
+            let size = if width == 32 {
+                FPSize::Single
+            } else {
+                FPSize::Double
+            };
+            let ty = if width == 32 { Type::F32 } else { Type::F64 };
+            for a in values {
+                for b in values {
+                    if fcmp_ieee_relation(a, b, width).is_some() {
+                        continue;
+                    }
+                    let (a, b) = (fcmp_ieee_constant(a, width), fcmp_ieee_constant(b, width));
+                    // Keep both actual old wrong terms as explicit mutants:
+                    // !fp.eq and hardware CSET NE are true on unordered inputs.
+                    assert_eq!(
+                        a.clone().fp_eq(b.clone()).not_expr().eval(&empty),
+                        EvalResult::Bool(true)
+                    );
+                    assert_eq!(
+                        encode_fcmp_cset(size, a.clone(), b.clone(), AArch64CC::NE).eval(&empty),
+                        EvalResult::Bv(1)
+                    );
+                    for cond in [FloatCC::NotEqual, FloatCC::UnorderedNotEqual] {
+                        let expected =
+                            EvalResult::Bv(u64::from(cond == FloatCC::UnorderedNotEqual));
+                        for result in [
+                            encode_trust_ir_fcmp(&cond, ty.clone(), a.clone(), b.clone()),
+                            encode_fcmp(size, a.clone(), b.clone(), &cond),
+                        ] {
+                            wrong += usize::from(result.eval(&empty) != expected);
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 224);
+        assert_eq!(wrong, 0, "ONE incorrectly inherited unordered NE semantics");
+    }
 
     #[test]
     fn test_encode_trust_ir_fcmp_eq_true() {

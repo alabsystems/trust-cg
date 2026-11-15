@@ -116,10 +116,16 @@ pub enum VaArgAccess {
 ///
 /// Rules (Apple AArch64 DarwinPCS):
 /// - All variadic args are on the stack, 8-byte minimum alignment
-/// - Scalars (I8-I128, F32, F64, B1): direct load, 8-byte advance
-/// - V128: direct load, 16-byte aligned, 16-byte advance
-/// - Small aggregates (<= 16 bytes): direct load, 8-byte aligned
+/// - Scalars (I8-I64, F32, F64, B1): direct load, 8-byte advance
+/// - I128 and V128: direct load, 16-byte aligned, 16-byte advance
+/// - Small aggregates (<= 16 bytes): direct load, aligned to 16 when the
+///   aggregate's natural alignment is 16, otherwise to 8
 /// - Large aggregates (> 16 bytes): indirect (pointer), 8-byte advance
+///
+/// The slot alignment mirrors the caller placement in
+/// `AppleAArch64ABI::classify_params_variadic_with` (see
+/// `abi::darwin_anonymous_vararg_align`), which is checked against clang by
+/// trust-cg-codegen's `tests/e2e_aarch64_darwin_variadic_wide.rs`.
 ///
 /// Reference: Apple ARM64 Function Calling Conventions
 /// Reference: LLVM AArch64ISelLowering.cpp::LowerVAARG()
@@ -134,12 +140,14 @@ pub fn lower_va_arg(ty: &Type) -> VaArgLowering {
             advance_bytes: 8,
         },
 
-        // I128: 16 bytes, 8-byte aligned on Apple (Apple does NOT require
-        // 16-byte alignment for I128 varargs, unlike Linux AAPCS).
+        // I128: 16 bytes, 16-byte aligned. LLVM assigns the split i128 with
+        // `CCAssignToStack<8, 16>` and clang's Darwin `va_arg` rounds the
+        // cursor up to 16, so after an odd number of 8-byte slots the value
+        // starts at the next 16-aligned address.
         Type::I128 => VaArgLowering {
             access: VaArgAccess::Direct,
             load_size: 16,
-            slot_align: 8,
+            slot_align: 16,
             advance_bytes: 16,
         },
 
@@ -189,7 +197,7 @@ pub fn lower_va_arg(ty: &Type) -> VaArgLowering {
                 VaArgLowering {
                     access: VaArgAccess::Direct,
                     load_size: size,
-                    slot_align: 8,
+                    slot_align: crate::abi::darwin_anonymous_vararg_align(ty) as u32,
                     advance_bytes: padded,
                 }
             } else {
@@ -328,8 +336,17 @@ mod tests {
         let l = lower_va_arg(&Type::I128);
         assert_eq!(l.access, VaArgAccess::Direct);
         assert_eq!(l.load_size, 16);
-        assert_eq!(l.slot_align, 8);
+        assert_eq!(l.slot_align, 16);
         assert_eq!(l.advance_bytes, 16);
+    }
+
+    #[test]
+    fn va_arg_small_aggregate_alignment_follows_natural_alignment() {
+        let pair = lower_va_arg(&Type::Struct(vec![Type::I64, Type::I64]));
+        assert_eq!(pair.slot_align, 8);
+        let wide = lower_va_arg(&Type::Struct(vec![Type::I128]));
+        assert_eq!(wide.slot_align, 16);
+        assert_eq!(wide.advance_bytes, 16);
     }
 
     #[test]

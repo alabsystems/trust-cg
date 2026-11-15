@@ -5,11 +5,12 @@
 //
 // Wraps the `CegisLoop` primitive as a `MachinePass` so callers can request
 // CEGIS-based superoptimization from the optimization pipeline with a
-// per-function wall-clock budget. Results (whether the candidate rewrite was
-// proven equivalent or rejected) are keyed into the shared compilation cache
-// under a per-function hash derived from (instructions + target triple + cpu
-// + features). Repeat compilations reuse cached outcomes so that expensive
-// CEGIS searches are paid for only once per input tuple.
+// per-function wall-clock budget for solver-backed verification. Results
+// (whether the candidate rewrite was proven equivalent or rejected) are keyed
+// into the shared compilation cache under a per-function hash derived from
+// (instructions + target triple + cpu + features). Repeat compilations reuse
+// cached outcomes so that expensive CEGIS searches are paid for only once per
+// input tuple.
 //
 // ty supremacy blocker #8 (part of epic #390, issue #395).
 
@@ -25,11 +26,14 @@
 //! 1. Compute a deterministic 128-bit hash of the function body + target
 //!    triple + CPU + features via [`crate::CegisLoop`]-independent key.
 //! 2. Lookup the cache. On a hit: deserialize [`CegisCacheEntry`] and apply
-//!    the stored rewrites (skip all solver work).
-//! 3. On a miss: walk instructions, identify candidate rewrite sites, and
-//!    call [`crate::CegisLoop::verify`] with a per-query timeout derived
-//!    from `per_query_ms`. The total wall clock spent in this pass is
-//!    capped by `budget_sec`.
+//!    the stored rewrites (skip all solver work), each only where the
+//!    search's matcher rebuilds exactly the recorded body; any other entry is
+//!    stale and the function is searched again.
+//! 3. On a miss: walk every instruction, identify candidate rewrite sites,
+//!    and call [`crate::CegisLoop::verify`] with a per-query timeout derived
+//!    from `per_query_ms`. `budget_sec` bounds the solver work: its clock
+//!    starts with the first solver-backed verification, and no further
+//!    verification starts once it has elapsed (see `SolverBudget`).
 //! 4. On successful equivalence proofs, record rewrites in
 //!    [`CegisCacheEntry`], serialize via [`crate::cegis_cache_codec`], and
 //!    store under the function hash.
@@ -38,7 +42,7 @@
 //! rewrite: `MulRR x, (Movz #0)` within a block can become `Movz #0` when the
 //! replacement is strictly cheaper and CEGIS proves equivalence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,98 +52,135 @@ use trust_cg_ir::cost_model::{AppleSiliconCostModel, CostModel, CostModelGen};
 use trust_cg_ir::provenance::PassId as TracePassId;
 use trust_cg_ir::trace::{CompilationTrace, EventKind, Justification, RuleId};
 use trust_cg_ir::{
-    AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PReg, RegClass, SpecialReg, VReg,
+    AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, SpecialReg, VReg,
 };
+use trust_cg_opt::effects::{aarch64_for_each_def_position, aarch64_for_each_use_position};
 use trust_cg_opt::{CacheBackend, CacheKey, MachinePass, StableHasher};
 
 use crate::cegis::{CegisLoop, CegisResult};
 use crate::cegis_cache_codec::CacheCodecError;
+use crate::cegis_pass::obligation::{RewriteObligation, window_obligation};
 use crate::failed_proof_reducer::FailedProofCounterexampleCorpus;
 use crate::rewrite_admission::{SourceRegionIdentity, TargetAbiLayoutIdentity};
 use crate::smt::SmtExpr;
 use crate::synthesis::ProvenRuleDb;
 
+#[path = "cegis_pass_obligation.rs"]
+mod obligation;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Count how many instructions in `func` read `target` as a VReg operand.
+/// Visit each vreg `inst` reads: the vreg operands at the use positions of
+/// the shared AArch64 operand-role model
+/// ([`aarch64_for_each_use_position`]).
 ///
-/// "Uses" are any operand after the first that match the VReg id. The
-/// leading operand is treated as the definition (conventional for our
-/// `MachInst` layout where `operands[0]` is the destination). This matches
-/// the assumption used by the Layer A / Layer B matchers.
-fn count_vreg_uses(func: &MachFunction, target: VReg) -> u32 {
-    let mut uses: u32 = 0;
-    for inst in &func.insts {
-        // Skip the destination slot (operand 0) — that is a def, not a use.
-        for operand in inst.operands.iter().skip(1) {
-            if let Some(v) = operand.as_vreg()
-                && v.id == target.id
-            {
-                uses = uses.saturating_add(1);
-            }
+/// Operand 0 is a read for compares, stores, conditional branches and the
+/// other opcodes without a register result, and both a def and a read for the
+/// tied forms such as `Movk`; a paired or atomic load's defined operands after
+/// operand 0 are not reads. `cegis_pass_operand_uses_tests` checks this
+/// against the register allocator's partition over every opcode.
+fn for_each_vreg_read(inst: &MachInst, mut f: impl FnMut(VReg)) {
+    aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
+        if let Some(MachOperand::VReg(vreg)) = inst.operands.get(pos) {
+            f(*vreg);
         }
-    }
-    uses
+    });
 }
 
-/// Low-`width` bitmask for constant immediates fed into the SMT evaluator.
+/// Visit each vreg `inst` writes, at the def positions of the shared operand
+/// role model ([`aarch64_for_each_def_position`]): operand 0 of a value
+/// producer, and the later defined operands of paired loads, writeback
+/// addressing and atomics.
+fn for_each_vreg_def(inst: &MachInst, mut f: impl FnMut(VReg)) {
+    aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| {
+        if let Some(MachOperand::VReg(vreg)) = inst.operands.get(pos) {
+            f(*vreg);
+        }
+    });
+}
+
+/// Reads of vreg `id`, under any register class, by `inst`.
+fn vreg_reads_in(inst: &MachInst, id: u32) -> u32 {
+    let mut reads = 0u32;
+    for_each_vreg_read(inst, |vreg| {
+        if vreg.id == id {
+            reads = reads.saturating_add(1);
+        }
+    });
+    reads
+}
+
+/// Whether `inst` writes vreg `id` under any register class.
+fn defines_vreg_id(inst: &MachInst, id: u32) -> bool {
+    let mut defines = false;
+    for_each_vreg_def(inst, |vreg| defines |= vreg.id == id);
+    defines
+}
+
+/// Count the reads of `target`'s id in the instruction arena, including
+/// instructions no block schedules any more.
+///
+/// A rewrite that deletes the instruction defining `target` is sound only if
+/// the reads it removes with it are all the reads there are, so this must
+/// count every read position, operand 0 included, and nothing else.
+fn count_vreg_uses(func: &MachFunction, target: VReg) -> u32 {
+    func.insts.iter().fold(0u32, |uses, inst| {
+        uses.saturating_add(vreg_reads_in(inst, target.id))
+    })
+}
+
+/// Record the vregs `inst` defines in a block-local reaching-definition map.
+///
+/// Every def position counts: a later write to a constant's register at
+/// operand 1 (a paired load, say) must hide the materializer from the
+/// matchers, and a read at operand 0 must not.
+fn record_defs(def_map: &mut HashMap<u32, InstId>, inst_id: InstId, inst: &MachInst) {
+    for_each_vreg_def(inst, |vreg| {
+        def_map.insert(vreg.id, inst_id);
+    });
+}
+
+/// The reaching-definition map of `block_id` just before `target_id`.
+fn block_prefix_defs(
+    func: &MachFunction,
+    block_id: BlockId,
+    target_id: InstId,
+) -> HashMap<u32, InstId> {
+    let mut def_map = HashMap::new();
+    for &inst_id in &func.block(block_id).insts {
+        if inst_id == target_id {
+            break;
+        }
+        record_defs(&mut def_map, inst_id, func.inst(inst_id));
+    }
+    def_map
+}
+
+/// Whether the block schedule of `func` lists some instruction id more than
+/// once, within one block or across the blocks of `block_order` (a block
+/// listed twice repeats all of its ids).
+///
+/// Every layer rewrites an instruction in place, in the shared arena, so a
+/// rewrite of a repeated id would also change its other occurrences, whose
+/// windows the matcher never checked. A well-formed layout schedules each id
+/// once; the pass skips any other function rather than reason about it.
+fn schedule_repeats_an_instruction(func: &MachFunction) -> bool {
+    let mut scheduled = HashSet::with_capacity(func.insts.len());
+    func.block_order
+        .iter()
+        .flat_map(|&block_id| func.block(block_id).insts.iter())
+        .any(|&inst_id| !scheduled.insert(inst_id))
+}
+
+/// Low-`width` bitmask of a register.
 fn mask_u64(width: u32) -> u64 {
     if width >= 64 {
         u64::MAX
     } else {
         (1u64 << width) - 1
     }
-}
-
-fn rotate_right_within(value: u64, rotation: u32, width: u32) -> u64 {
-    let rotation = rotation % width;
-    let mask = mask_u64(width);
-    if rotation == 0 {
-        value & mask
-    } else {
-        ((value >> rotation) | (value << (width - rotation))) & mask
-    }
-}
-
-fn replicate_logical_element(pattern: u64, element_width: u32, register_width: u32) -> u64 {
-    let mut out = 0;
-    let mut shift = 0;
-    while shift < register_width {
-        out |= pattern << shift;
-        shift += element_width;
-    }
-    out & mask_u64(register_width)
-}
-
-fn is_aarch64_logical_immediate(raw: u64, register_width: u32) -> bool {
-    let register_mask = mask_u64(register_width);
-    let raw = raw & register_mask;
-    if raw == 0 || raw == register_mask {
-        return false;
-    }
-
-    let element_widths: &[u32] = if register_width == 64 {
-        &[2, 4, 8, 16, 32, 64]
-    } else {
-        &[2, 4, 8, 16, 32]
-    };
-
-    for &element_width in element_widths {
-        for ones_len in 1..element_width {
-            let ones = mask_u64(ones_len);
-            for rotation in 0..element_width {
-                let element = rotate_right_within(ones, rotation, element_width);
-                let candidate = replicate_logical_element(element, element_width, register_width);
-                if candidate == raw {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
 }
 
 fn target_matches_config(target: &TargetAbiLayoutIdentity, config: &CegisSuperoptConfig) -> bool {
@@ -166,7 +207,26 @@ fn sorted_feature_strings(features: &[String]) -> Vec<&str> {
 /// matcher, enumeration order, solver contract, or schedule policy can change
 /// which proven rewrites a bounded search discovers without changing the
 /// serialized entry layout. Such a change must bump this revision.
-pub const CEGIS_SEARCH_SEMANTICS_REVISION: u32 = 1;
+///
+/// Revision 2: the per-function budget gates only the start of solver-backed
+/// verifications (see `SolverBudget`) instead of every instruction.
+///
+/// Revision 3: the matchers and cache replay read and write registers by the
+/// shared operand-role model. Revision 2 skipped operand 0 of every
+/// instruction when counting reads, so a `Movz` whose register a compare,
+/// store or `Movk` also read (at operand 0) was spliced out, leaving that
+/// read undefined, and it ignored definitions after operand 0. Its entries
+/// can therefore record wrong-code rewrites and must never replay; the
+/// candidate set also changed (`AddRI` immediates beyond `imm12` are no longer
+/// candidates), and every obligation, and so every proof hash, is now built
+/// from the instruction windows instead of the matcher's constant.
+///
+/// Two later changes kept revision 3: replay now applies a recorded body only
+/// if the matcher rebuilds it exactly, and the pass skips a schedule that
+/// repeats an instruction id. The search records the same entries, every
+/// honest revision 3 entry still replays, and a skipped function never reads
+/// its entry.
+pub const CEGIS_SEARCH_SEMANTICS_REVISION: u32 = 3;
 
 /// Version of the outer-executor schedule identity bound into CEGIS keys.
 ///
@@ -233,7 +293,13 @@ impl Default for CegisSearchScheduleIdentity {
 /// non-zero value.
 #[derive(Clone)]
 pub struct CegisSuperoptConfig {
-    /// Total per-function wall-clock budget in seconds. `0` disables the pass.
+    /// Per-function wall-clock budget, in seconds, for solver-backed
+    /// verification. Its clock starts with the function's first solver-backed
+    /// verification; no further verification starts once it has elapsed, and
+    /// the search then fails closed as
+    /// [`CegisSearchCompletion::DeadlineExceeded`]. The structural walk that
+    /// finds candidates is linear in the function and always completes.
+    /// `0` disables the pass.
     pub budget_sec: u64,
     /// Per solver query timeout (milliseconds).
     pub per_query_ms: u64,
@@ -324,12 +390,12 @@ pub enum RewriteLayer {
     C,
 }
 
+/// A matched Layer C window: the materializer chain in schedule order and the
+/// `AndRI` that replaces the `AndRR` it feeds.
 #[derive(Debug, Clone)]
 struct LayerCAndImmCandidate {
-    width: u32,
     materializer_ids: Vec<InstId>,
     replacement: MachInst,
-    mask: u64,
 }
 
 /// Serializable register-class projection for [`MachInstBlob`] operands.
@@ -418,6 +484,7 @@ pub enum MachOperandBlob {
     Symbol(String),
     JumpTableIndex(u32),
     IncomingArg(i64),
+    ExactModuleSymbol(String),
 }
 
 impl MachOperandBlob {
@@ -441,15 +508,19 @@ impl MachOperandBlob {
             },
             MachOperand::Special(reg) => Self::Special((*reg).into()),
             MachOperand::Symbol(symbol) => Self::Symbol(symbol.clone()),
+            MachOperand::ExactModuleSymbol(symbol) => Self::ExactModuleSymbol(symbol.clone()),
             MachOperand::JumpTableIndex(index) => Self::JumpTableIndex(*index),
             MachOperand::IncomingArg(offset) => Self::IncomingArg(*offset),
         }
     }
 
+    /// The inverse of [`Self::from_operand`], which the tests use to show the
+    /// projection loses nothing that replay's equality check relies on.
+    #[cfg(test)]
     fn to_operand(&self) -> MachOperand {
         match self {
             Self::VReg { id, class } => MachOperand::VReg(VReg::new(*id, (*class).into())),
-            Self::PReg { encoding } => MachOperand::PReg(PReg::new(*encoding)),
+            Self::PReg { encoding } => MachOperand::PReg(trust_cg_ir::PReg::new(*encoding)),
             Self::Imm(imm) => MachOperand::Imm(*imm),
             Self::FImmBits(bits) => MachOperand::FImm(f64::from_bits(*bits)),
             Self::Block(block) => MachOperand::Block(trust_cg_ir::BlockId(*block)),
@@ -459,11 +530,12 @@ impl MachOperandBlob {
                 base_encoding,
                 offset,
             } => MachOperand::MemOp {
-                base: PReg::new(*base_encoding),
+                base: trust_cg_ir::PReg::new(*base_encoding),
                 offset: *offset,
             },
             Self::Special(reg) => MachOperand::Special((*reg).into()),
             Self::Symbol(symbol) => MachOperand::Symbol(symbol.clone()),
+            Self::ExactModuleSymbol(symbol) => MachOperand::ExactModuleSymbol(symbol.clone()),
             Self::JumpTableIndex(index) => MachOperand::JumpTableIndex(*index),
             Self::IncomingArg(offset) => MachOperand::IncomingArg(*offset),
         }
@@ -472,9 +544,13 @@ impl MachOperandBlob {
 
 /// Cache-format projection of a replacement [`MachInst`].
 ///
-/// The cache format stores opcode + operands only. On replay the first rebuilt
-/// replacement instruction inherits `proof` and `source_loc` from the first
-/// source instruction, matching the design's replay contract.
+/// The cache format stores opcode + operands only. Replay never decodes a
+/// blob into an instruction: it rebuilds the replacement with the matcher and
+/// applies it only if its projection equals the recorded blob, so the
+/// projection must be injective on opcodes and operands
+/// (`exact_module_symbol_projection_preserves_binding` round-trips it). The
+/// rebuilt instruction carries the `proof` and `source_loc` of the
+/// instruction it replaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachInstBlob {
     pub opcode: String,
@@ -492,34 +568,15 @@ impl MachInstBlob {
                 .collect(),
         }
     }
-
-    fn to_inst(&self) -> Option<MachInst> {
-        let opcode = Self::opcode_from_name(&self.opcode)?;
-        let operands = self
-            .operands
-            .iter()
-            .map(MachOperandBlob::to_operand)
-            .collect();
-        Some(MachInst::new(opcode, operands))
-    }
-
-    fn opcode_from_name(name: &str) -> Option<AArch64Opcode> {
-        // Keep this list aligned with the opcodes emitted by CEGIS replacements.
-        match name {
-            "AddRI" => Some(AArch64Opcode::AddRI),
-            "AndRI" => Some(AArch64Opcode::AndRI),
-            "Movz" => Some(AArch64Opcode::Movz),
-            _ => None,
-        }
-    }
 }
 
 /// A single CEGIS rewrite proof recorded in the cache.
 ///
 /// `inst_index` is the flat [`MachFunction::insts`] index that was verified
 /// equivalent to `replacement`. `window_len` records the source window consumed
-/// by the rewrite. Cache hits replay the serialized replacement body directly,
-/// so repeat compilations avoid both CEGIS and matcher reconstruction.
+/// by the rewrite. A cache hit skips CEGIS: it re-runs the layer's matcher at
+/// `inst_index` and applies the rewrite only if the matcher admits a window of
+/// `window_len` and rebuilds exactly `replacement`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvenRewrite {
     /// Instruction index in `MachFunction::insts`.
@@ -530,7 +587,8 @@ pub struct ProvenRewrite {
     pub iterations: u32,
     /// Number of source instructions consumed by this rewrite.
     pub window_len: u32,
-    /// Serialized replacement body applied on cache hits.
+    /// Serialized replacement body. A cache hit applies it only if the
+    /// matcher, run on the current body, rebuilds exactly this body.
     pub replacement: Vec<MachInstBlob>,
     /// Which payload layer produced this rewrite (used for stats and splices).
     pub layer: RewriteLayer,
@@ -550,7 +608,8 @@ pub enum CegisSearchCompletion {
     /// Every candidate was considered and every query reached a definitive
     /// result.
     Complete,
-    /// The per-function wall-clock deadline stopped enumeration.
+    /// The per-function wall-clock budget had elapsed when a further
+    /// candidate needed a solver-backed verification.
     DeadlineExceeded,
     /// A solver query timed out or exhausted its iteration budget.
     QueryIncomplete,
@@ -756,13 +815,25 @@ pub struct CegisPassStats {
     pub cache_misses: u64,
     /// Number of cache puts after a successful verification pass.
     pub cache_puts: u64,
+    /// Number of decoded cache entries refused on replay because a recorded
+    /// rewrite is not one the matchers admit and rebuild exactly on the
+    /// current body. Each is also a miss: the function is searched again and
+    /// a complete search rewrites the entry.
+    #[serde(default)]
+    pub cache_stale: u64,
+    /// Number of functions skipped, with no cache lookup and no search,
+    /// because their block schedule lists an instruction id more than once
+    /// (`schedule_repeats_an_instruction`).
+    #[serde(default)]
+    pub repeated_schedule_skips: u64,
     /// Number of candidate rewrite sites considered (all layers).
     pub candidates: u64,
     /// Number of candidate sites proven equivalent (all layers).
     pub verified: u64,
     /// Number of candidate sites rejected (not equivalent / timeout / error).
     pub rejected: u64,
-    /// Number of times the wall-clock budget was exhausted mid-function.
+    /// Number of searches stopped because the wall-clock budget had elapsed
+    /// before a further solver-backed verification could start.
     pub budget_exhausted: u64,
     /// Number of solver calls made (across all CegisLoop instances).
     pub solver_calls: u64,
@@ -806,18 +877,89 @@ pub struct CegisPassStats {
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 pub struct CegisSuperoptTestHooks {
+    /// The budget reads as elapsed before the first solver-backed
+    /// verification.
     pub force_expired_deadline: bool,
+    /// The budget reads as elapsed once this many solver-backed verifications
+    /// have been admitted, as if the last of them had run past it.
+    pub force_deadline_after_verifications: Option<u32>,
     pub force_layer_a_equal_cost: bool,
     pub force_layer_b_equal_cost: bool,
     pub verifier_result: Option<CegisResult>,
+    /// Corrupt every matched replacement before its obligation is built, as
+    /// a matcher bug would. The mutation control for the obligations: each
+    /// corrupted rewrite must be refuted, never committed.
+    pub corrupt_replacement: Option<ReplacementMutation>,
+}
+
+/// A deliberate matcher bug, applied by
+/// [`CegisSuperoptTestHooks::corrupt_replacement`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementMutation {
+    /// The wrong immediate: an `AddRI` or `Movz` immediate with its low bit
+    /// flipped, or an `AndRI` mask rotated right by one bit (still a logical
+    /// immediate).
+    Immediate,
+    /// The wrong register: the replacement reads the constant register the
+    /// rewrite removes (or, for Layer A, keeps) instead of its source.
+    SourceRegister,
+    /// The wrong operation: `AddRI` and `AndRI` swapped.
+    Operation,
+}
+
+impl ReplacementMutation {
+    fn apply(self, replacement: &mut MachInst, constant_register: Option<&MachOperand>) {
+        let width = replacement
+            .operands
+            .first()
+            .and_then(MachOperand::as_vreg)
+            .and_then(|vreg| gpr_width(vreg.class))
+            .unwrap_or(64);
+        let opcode = replacement.opcode;
+        match (self, opcode, replacement.operands.as_mut_slice()) {
+            (Self::Immediate, AArch64Opcode::AndRI, [_, _, MachOperand::Imm(imm)]) => {
+                let mask = (*imm as u64) & mask_u64(width);
+                *imm = (((mask >> 1) | (mask << (width - 1))) & mask_u64(width)) as i64;
+            }
+            (Self::Immediate, AArch64Opcode::AddRI, [_, _, MachOperand::Imm(imm)])
+            | (Self::Immediate, AArch64Opcode::Movz, [_, MachOperand::Imm(imm), ..]) => {
+                *imm ^= 1;
+            }
+            (Self::SourceRegister, AArch64Opcode::AddRI | AArch64Opcode::AndRI, [_, source, _]) => {
+                if let Some(constant) = constant_register {
+                    *source = constant.clone();
+                }
+            }
+            (Self::Operation, AArch64Opcode::AddRI, _) => {
+                replacement.opcode = AArch64Opcode::AndRI;
+            }
+            (Self::Operation, AArch64Opcode::AndRI, _) => {
+                replacement.opcode = AArch64Opcode::AddRI;
+            }
+            // Layer A's `Movz dst, #0` has no source register or operation
+            // to get wrong.
+            _ => {}
+        }
+    }
 }
 
 impl CegisSuperoptTestHooks {
     fn affects_execution(&self) -> bool {
         self.force_expired_deadline
+            || self.force_deadline_after_verifications.is_some()
             || self.force_layer_a_equal_cost
             || self.force_layer_b_equal_cost
             || self.verifier_result.is_some()
+            || self.corrupt_replacement.is_some()
+    }
+
+    /// Apply [`Self::corrupt_replacement`], if set, to a matched
+    /// `replacement` whose window materializes `constant_register`.
+    fn corrupt(&self, replacement: &mut MachInst, constant_register: Option<&MachOperand>) {
+        if let Some(mutation) = self.corrupt_replacement {
+            mutation.apply(replacement, constant_register);
+        }
     }
 
     fn write_cache_identity(&self, h: &mut StableHasher) {
@@ -828,6 +970,13 @@ impl CegisSuperoptTestHooks {
 
         h.write_u8(1);
         h.write_u8(u8::from(self.force_expired_deadline));
+        match self.force_deadline_after_verifications {
+            None => h.write_u8(0),
+            Some(started) => {
+                h.write_u8(1);
+                h.write_u32(started);
+            }
+        }
         h.write_u8(u8::from(self.force_layer_a_equal_cost));
         h.write_u8(u8::from(self.force_layer_b_equal_cost));
         match self.verifier_result.as_ref() {
@@ -847,7 +996,7 @@ impl CegisSuperoptTestHooks {
                 h.write_u8(2);
                 h.write_u8(u8::from(*found_by_concrete));
                 let mut values = counterexample.values.iter().collect::<Vec<_>>();
-                values.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                values.sort_unstable_by_key(|(left, _)| *left);
                 h.write_u64(u64::try_from(values.len()).unwrap_or(u64::MAX));
                 for (name, value) in values {
                     h.write_str(name);
@@ -864,6 +1013,419 @@ impl CegisSuperoptTestHooks {
                 h.write_str(message);
             }
         }
+        match self.corrupt_replacement {
+            None => h.write_u8(0),
+            Some(mutation) => {
+                h.write_u8(1);
+                h.write_u8(mutation as u8);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Solver budget
+// ---------------------------------------------------------------------------
+
+/// Per-function budget for solver-backed verifications.
+///
+/// The budget bounds solver work, the only part of a search whose cost is not
+/// linear in the function: the structural walk that matches candidates keeps
+/// its facts in [`IndexedWalkFacts`] and always runs to the end. The clock
+/// starts when the search admits its first solver-backed verification, and a
+/// further verification is admitted only while `budget` has not elapsed since
+/// then. A query already running is bounded by `per_query_ms`, not by this
+/// budget.
+///
+/// Consequently a search whose every candidate received a definitive verdict
+/// is complete however long its final query ran. A function with at most one
+/// solver-backed candidate therefore reaches the same outcome at any machine
+/// load as long as that query finishes within `per_query_ms`. That limit is
+/// wall-clock time too: it covers the whole verification exchange, including
+/// waiting for the solver and the Clean replay, and a query that exceeds it
+/// ends the search as [`CegisSearchCompletion::QueryIncomplete`]. Once a
+/// function has two or more such candidates, whether a later one may start
+/// also depends on measured query time. Only deterministic fuel would remove
+/// either dependence, which is why the outer schedule stays in the cache key.
+struct SolverBudget {
+    budget: Duration,
+    clock_started: Option<Instant>,
+    admitted: u32,
+    /// Test control: the budget reads as elapsed once this many
+    /// verifications have been admitted.
+    elapsed_after: Option<u32>,
+}
+
+impl SolverBudget {
+    fn new(budget_sec: u64, hooks: &CegisSuperoptTestHooks) -> Self {
+        let elapsed_after = if hooks.force_expired_deadline {
+            Some(0)
+        } else {
+            hooks.force_deadline_after_verifications
+        };
+        Self {
+            budget: Duration::from_secs(budget_sec),
+            clock_started: None,
+            admitted: 0,
+            elapsed_after,
+        }
+    }
+
+    /// Admit one more solver-backed verification, or report that the budget
+    /// has elapsed. The first admission starts the clock.
+    fn admit_verification(&mut self) -> bool {
+        if self
+            .elapsed_after
+            .is_some_and(|limit| self.admitted >= limit)
+        {
+            return false;
+        }
+        let now = Instant::now();
+        let clock_started = *self.clock_started.get_or_insert(now);
+        if now.saturating_duration_since(clock_started) >= self.budget {
+            return false;
+        }
+        self.admitted = self.admitted.saturating_add(1);
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structural walk facts
+// ---------------------------------------------------------------------------
+
+/// A constant a block prefix materializes into a vreg, and the move-wide
+/// instructions that built it.
+type MaterializedConst = (u64, Vec<InstId>);
+
+/// The structural questions the layer matchers ask while a search walks a
+/// function, and the events that keep the answers current.
+///
+/// [`DirectWalkFacts`] answers by scanning the function, so each answer costs
+/// time proportional to the function and a walk that asks once per
+/// instruction is quadratic. [`IndexedWalkFacts`] answers in amortized
+/// constant time from indexes the walk keeps current, which makes the walk
+/// linear. The two must agree on every question: the `indexed_walk_facts_*`
+/// tests run whole searches under each and require the same candidates,
+/// verdict order, cache entry and final function.
+trait WalkFacts {
+    /// Reads of `vreg` in the instruction arena, as [`count_vreg_uses`]
+    /// counts them.
+    fn vreg_uses(&self, func: &MachFunction, vreg: VReg) -> u64;
+
+    /// [`CegisSuperoptPass::materialized_wide_const_before`] for the block
+    /// the walk has entered.
+    fn materialized_wide_const_before(
+        &mut self,
+        func: &MachFunction,
+        block_id: BlockId,
+        target_id: InstId,
+        target: VReg,
+        width: u32,
+    ) -> Option<MaterializedConst>;
+
+    /// The walk replaced the arena body `old` of `inst_id` with `new`.
+    fn replaced(&mut self, inst_id: InstId, old: &MachInst, new: &MachInst);
+
+    /// A walk that asks [`Self::materialized_wide_const_before`] enters
+    /// `block_id`, whose schedule is `schedule`. It must then report each
+    /// scheduled instruction to [`Self::passed`] in order, and must not change
+    /// the schedule until it leaves the block.
+    fn enter_block(&mut self, block_id: BlockId, schedule: &[InstId]);
+
+    /// The walk is done with the next scheduled instruction, whose current
+    /// body is `inst`.
+    fn passed(&mut self, inst_id: InstId, inst: &MachInst);
+}
+
+/// Walk facts answered by scanning the function for each question.
+///
+/// Cache replay validates one recorded rewrite at a time, where a single scan
+/// is cheaper than building an index; the tests also use this as the
+/// reference for [`IndexedWalkFacts`].
+struct DirectWalkFacts;
+
+impl WalkFacts for DirectWalkFacts {
+    fn vreg_uses(&self, func: &MachFunction, vreg: VReg) -> u64 {
+        u64::from(count_vreg_uses(func, vreg))
+    }
+
+    fn materialized_wide_const_before(
+        &mut self,
+        func: &MachFunction,
+        block_id: BlockId,
+        target_id: InstId,
+        target: VReg,
+        width: u32,
+    ) -> Option<MaterializedConst> {
+        CegisSuperoptPass::materialized_wide_const_before(func, block_id, target_id, target, width)
+    }
+
+    fn replaced(&mut self, _inst_id: InstId, _old: &MachInst, _new: &MachInst) {}
+
+    fn enter_block(&mut self, _block_id: BlockId, _schedule: &[InstId]) {}
+
+    fn passed(&mut self, _inst_id: InstId, _inst: &MachInst) {}
+}
+
+/// Register width the Layer B and C matchers accept for a class.
+fn gpr_width(class: RegClass) -> Option<u32> {
+    match class {
+        RegClass::Gpr32 => Some(32),
+        RegClass::Gpr64 => Some(64),
+        _ => None,
+    }
+}
+
+/// The part of an instruction that [`CegisSuperoptPass::materialized_wide_const_before`]
+/// reads: the vreg ids it defines, and its opcode and operands if it is a
+/// move-wide.
+type MaterializerView<'a> = (Vec<u32>, Option<(AArch64Opcode, &'a [MachOperand])>);
+
+fn materializer_view(inst: &MachInst) -> MaterializerView<'_> {
+    let move_wide = matches!(
+        inst.opcode,
+        AArch64Opcode::Movz | AArch64Opcode::Movn | AArch64Opcode::Movk
+    )
+    .then_some((inst.opcode, inst.operands.as_slice()));
+    (defined_ids(inst), move_wide)
+}
+
+/// The distinct vreg ids `inst` defines, in ascending order.
+fn defined_ids(inst: &MachInst) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for_each_vreg_def(inst, |vreg| ids.push(vreg.id));
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Where the materializer scan stands for one vreg of the current block.
+/// A vreg without an entry holds no known constant.
+#[derive(Debug, Clone)]
+enum MaterializerChain {
+    /// A `Movz` or `Movn` and the `Movk`s after it built `value`, already
+    /// masked to the register width.
+    Built { value: u64, ids: Vec<InstId> },
+    /// The scan met a move-wide it cannot model and answers `None` for this
+    /// vreg for the rest of the block.
+    Refused,
+}
+
+/// Walk facts kept current in amortized constant time per instruction.
+///
+/// Use counts cover the whole arena and follow each body a walk replaces.
+/// Materializer chains cover the block being walked: for each GPR vreg, the
+/// state [`CegisSuperoptPass::materialized_wide_const_before`] reaches after
+/// scanning the instructions passed so far. A walk rewrites only the
+/// instruction it is at, before passing it, so a passed body changes only
+/// where a schedule repeats an instruction id. The direct scan stops at an
+/// id's first occurrence, so a later occurrence reuses the answer recorded
+/// there. If a walk changes a passed body in a way the scan would see, the
+/// rest of the block falls back to [`DirectWalkFacts`]; Layer C's only rewrite
+/// (`AndRR` to `AndRI`, same operand 0) never does. The pass itself never
+/// searches a schedule that repeats an id (`schedule_repeats_an_instruction`);
+/// the facts still handle one, so the walk tests can hold them to the direct
+/// scans on any layout.
+struct IndexedWalkFacts {
+    uses: HashMap<u32, u64>,
+    block: Option<BlockId>,
+    chains: HashMap<VReg, MaterializerChain>,
+    /// Instruction ids the current block schedules more than once.
+    repeated: HashSet<InstId>,
+    passed_repeated: HashSet<InstId>,
+    first_occurrence_answers: HashMap<(InstId, VReg), Option<MaterializedConst>>,
+    /// A passed body changed in a way the scan would see.
+    stale: bool,
+    /// Queries answered by a direct scan; the tests require none outside the
+    /// fallback cases above.
+    #[cfg(test)]
+    direct_fallbacks: usize,
+}
+
+impl IndexedWalkFacts {
+    fn for_search(func: &MachFunction) -> Self {
+        let mut facts = Self {
+            uses: HashMap::new(),
+            block: None,
+            chains: HashMap::new(),
+            repeated: HashSet::new(),
+            passed_repeated: HashSet::new(),
+            first_occurrence_answers: HashMap::new(),
+            stale: false,
+            #[cfg(test)]
+            direct_fallbacks: 0,
+        };
+        for inst in &func.insts {
+            facts.count_reads(inst);
+        }
+        facts
+    }
+
+    fn count_reads(&mut self, inst: &MachInst) {
+        for_each_vreg_read(inst, |vreg| *self.uses.entry(vreg.id).or_insert(0) += 1);
+    }
+
+    fn uncount_reads(&mut self, inst: &MachInst) {
+        for_each_vreg_read(inst, |vreg| {
+            let count = self.uses.entry(vreg.id).or_insert(0);
+            debug_assert!(*count > 0, "replaced body was not counted");
+            *count = count.saturating_sub(1);
+        });
+    }
+
+    fn direct_scan(
+        &mut self,
+        func: &MachFunction,
+        block_id: BlockId,
+        target_id: InstId,
+        target: VReg,
+        width: u32,
+    ) -> Option<MaterializedConst> {
+        #[cfg(test)]
+        {
+            self.direct_fallbacks += 1;
+        }
+        DirectWalkFacts.materialized_wide_const_before(func, block_id, target_id, target, width)
+    }
+
+    /// Apply one scan step of [`CegisSuperoptPass::materialized_wide_const_before`]
+    /// for every GPR vreg the instruction defines.
+    fn step_chain(&mut self, inst_id: InstId, inst: &MachInst) {
+        let exact = inst.operands.first().and_then(MachOperand::as_vreg);
+        for id in defined_ids(inst) {
+            // The matchers ask only about Gpr32/Gpr64 targets, and a target's
+            // class fixes the width its scan uses. A write to the id under
+            // any class is a definition of each of them.
+            for class in [RegClass::Gpr32, RegClass::Gpr64] {
+                let target = VReg::new(id, class);
+                if matches!(self.chains.get(&target), Some(MaterializerChain::Refused)) {
+                    continue;
+                }
+                let next = if exact == Some(target) {
+                    self.move_wide_step(inst_id, inst, target)
+                } else {
+                    None
+                };
+                match next {
+                    Some(chain) => {
+                        self.chains.insert(target, chain);
+                    }
+                    None => {
+                        self.chains.remove(&target);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The chain state after `inst`, a definition of `target` at operand 0,
+    /// or `None` when `inst` is not a move-wide and forgets the constant.
+    fn move_wide_step(
+        &mut self,
+        inst_id: InstId,
+        inst: &MachInst,
+        target: VReg,
+    ) -> Option<MaterializerChain> {
+        let width = gpr_width(target.class)?;
+        let register_mask = mask_u64(width);
+        let imm = CegisSuperoptPass::move_wide_imm16(inst);
+        let shift = CegisSuperoptPass::move_wide_shift(inst, width);
+        Some(match inst.opcode {
+            AArch64Opcode::Movz | AArch64Opcode::Movn => match (imm, shift) {
+                (Some(imm), Some(shift)) => {
+                    let field = imm << shift;
+                    let value = if inst.opcode == AArch64Opcode::Movz {
+                        field
+                    } else {
+                        !field
+                    };
+                    MaterializerChain::Built {
+                        value: value & register_mask,
+                        ids: vec![inst_id],
+                    }
+                }
+                _ => MaterializerChain::Refused,
+            },
+            AArch64Opcode::Movk => match (imm, shift, self.chains.remove(&target)) {
+                (Some(imm), Some(shift), Some(MaterializerChain::Built { value, mut ids })) => {
+                    let field_mask = 0xFFFFu64 << shift;
+                    ids.push(inst_id);
+                    MaterializerChain::Built {
+                        value: ((value & !field_mask) | (imm << shift)) & register_mask,
+                        ids,
+                    }
+                }
+                _ => MaterializerChain::Refused,
+            },
+            _ => return None,
+        })
+    }
+}
+
+impl WalkFacts for IndexedWalkFacts {
+    fn vreg_uses(&self, _func: &MachFunction, vreg: VReg) -> u64 {
+        self.uses.get(&vreg.id).copied().unwrap_or(0)
+    }
+
+    fn materialized_wide_const_before(
+        &mut self,
+        func: &MachFunction,
+        block_id: BlockId,
+        target_id: InstId,
+        target: VReg,
+        width: u32,
+    ) -> Option<MaterializedConst> {
+        if self.stale || self.block != Some(block_id) || gpr_width(target.class) != Some(width) {
+            return self.direct_scan(func, block_id, target_id, target, width);
+        }
+        if self.passed_repeated.contains(&target_id) {
+            return match self.first_occurrence_answers.get(&(target_id, target)) {
+                Some(answer) => answer.clone(),
+                None => self.direct_scan(func, block_id, target_id, target, width),
+            };
+        }
+        let answer = match self.chains.get(&target) {
+            Some(MaterializerChain::Built { value, ids }) => Some((*value, ids.clone())),
+            Some(MaterializerChain::Refused) | None => None,
+        };
+        if self.repeated.contains(&target_id) {
+            self.first_occurrence_answers
+                .insert((target_id, target), answer.clone());
+        }
+        answer
+    }
+
+    fn replaced(&mut self, inst_id: InstId, old: &MachInst, new: &MachInst) {
+        self.uncount_reads(old);
+        self.count_reads(new);
+        if self.passed_repeated.contains(&inst_id)
+            && materializer_view(old) != materializer_view(new)
+        {
+            self.stale = true;
+        }
+    }
+
+    fn enter_block(&mut self, block_id: BlockId, schedule: &[InstId]) {
+        self.block = Some(block_id);
+        self.stale = false;
+        self.chains.clear();
+        self.repeated.clear();
+        self.passed_repeated.clear();
+        self.first_occurrence_answers.clear();
+        let mut scheduled = HashSet::with_capacity(schedule.len());
+        for &id in schedule {
+            if !scheduled.insert(id) {
+                self.repeated.insert(id);
+            }
+        }
+    }
+
+    fn passed(&mut self, inst_id: InstId, inst: &MachInst) {
+        if self.repeated.contains(&inst_id) {
+            self.passed_repeated.insert(inst_id);
+        }
+        self.step_chain(inst_id, inst);
     }
 }
 
@@ -874,10 +1436,11 @@ impl CegisSuperoptTestHooks {
 /// CEGIS-driven superoptimization pass.
 ///
 /// This is a thin wrapper around [`crate::CegisLoop`] that threads a
-/// per-function time budget and a shared compilation cache. On a cache hit it
-/// skips all solver work. On a miss it walks the function instructions and
+/// per-function solver budget and a shared compilation cache. On a cache hit
+/// it skips all solver work. On a miss it walks the function instructions and
 /// invokes `CegisLoop::verify` for each candidate rewrite site (if any),
-/// aborting early when the budget is exhausted.
+/// failing closed when a candidate needs a verification after the budget has
+/// elapsed (see `SolverBudget`).
 ///
 /// The first payload layer rewrites `MulRR x, (Movz #0)` to `Movz #0` when the
 /// verifier proves equivalence and the replacement is strictly cheaper.
@@ -890,6 +1453,17 @@ pub struct CegisSuperoptPass {
     // Deterministic adversarial control used only by transaction tests. It is
     // private and separately keyed so it cannot carry production authority.
     test_incomplete_after_first_commit: bool,
+    /// Per-candidate verdicts and an event log for the walk-equivalence tests.
+    #[cfg(test)]
+    test_walk_script: Option<WalkScript>,
+}
+
+/// Deterministic per-candidate verdicts for unit tests, with a log of every
+/// matched candidate and verdict in walk order.
+#[cfg(test)]
+struct WalkScript {
+    verdict: Box<dyn FnMut(RewriteLayer, InstId) -> CegisResult + Send>,
+    events: Vec<String>,
 }
 
 impl CegisSuperoptPass {
@@ -902,6 +1476,8 @@ impl CegisSuperoptPass {
             failed_proof_counterexamples: FailedProofCounterexampleCorpus::empty(),
             failed_proof_counterexample_scope: None,
             test_incomplete_after_first_commit: false,
+            #[cfg(test)]
+            test_walk_script: None,
         }
     }
 
@@ -1029,11 +1605,16 @@ impl CegisSuperoptPass {
         )
     }
 
+    /// Match a Layer A candidate: `MulRR dst, src1, src2` whose `src2` is
+    /// defined, according to `def_map`, by a shift-zero `Movz src2, #0`.
+    ///
+    /// Returns the register width, the `Movz`'s id (the rewrite keeps it) and
+    /// the `Movz dst, #0` that replaces the `MulRR`.
     fn match_layer_a_candidate(
         func: &MachFunction,
         inst: &MachInst,
         def_map: &HashMap<u32, trust_cg_ir::InstId>,
-    ) -> Option<(u32, MachInst)> {
+    ) -> Option<(u32, InstId, MachInst)> {
         if inst.opcode != AArch64Opcode::MulRR || inst.operands.len() < 3 {
             return None;
         }
@@ -1068,13 +1649,14 @@ impl CegisSuperoptPass {
         replacement.proof = inst.proof;
         replacement.source_loc = inst.source_loc;
 
-        Some((width, replacement))
+        Some((width, *def_id, replacement))
     }
 
     fn enumerate_and_verify_layer_a(
         &mut self,
         func: &mut MachFunction,
-        deadline: Instant,
+        facts: &mut impl WalkFacts,
+        budget: &mut SolverBudget,
         failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
     ) -> (bool, CegisCacheEntry, CegisSearchCompletion, bool) {
         let mut entry = CegisCacheEntry::search_in_progress();
@@ -1094,18 +1676,13 @@ impl CegisSuperoptPass {
             let mut def_map = HashMap::new();
 
             for inst_id in inst_ids {
-                if Instant::now() >= deadline {
-                    // A deadline is also control flow: unlike a query failure,
-                    // it stops this layer and must remain visible even if an
-                    // earlier query was already incomplete.
-                    completion = CegisSearchCompletion::DeadlineExceeded;
-                    break 'blocks;
-                }
-
                 let inst = func.inst(inst_id).clone();
-                if let Some((width, replacement)) =
+                if let Some((_width, zero_id, mut replacement)) =
                     Self::match_layer_a_candidate(func, &inst, &def_map)
                 {
+                    self.test_hooks
+                        .corrupt(&mut replacement, func.inst(zero_id).operands.first());
+                    self.note_candidate(RewriteLayer::A, inst_id, &[], &replacement);
                     self.stats.candidates += 1;
                     self.stats.layer_a_candidates += 1;
                     entry.attempted += 1;
@@ -1116,45 +1693,30 @@ impl CegisSuperoptPass {
                     } else {
                         cost_model.latency(AArch64Opcode::Movz) as i32
                     };
-                    if tgt_cost >= src_cost {
+                    // The kept `Movz` runs before the `MulRR` it feeds and
+                    // before the `Movz dst, #0` that replaces it.
+                    let zero = func.inst(zero_id);
+                    let obligation =
+                        Self::layer_obligation(&[zero, &inst], &[zero, &replacement], &inst);
+                    if tgt_cost >= src_cost || obligation.is_none() {
+                        // Not cheaper, or no obligation to discharge: rejected
+                        // without a verification.
                         self.stats.rejected += 1;
                         entry.rejected += 1;
-                    } else {
-                        let vars = vec![("x".to_string(), width)];
-                        let src = SmtExpr::var("x", width).bvmul(SmtExpr::bv_const(0, width));
-                        let tgt = SmtExpr::bv_const(0, width);
-                        // Clear counterexamples from prior candidates so a
-                        // CX proving a different obligation cannot trigger a
-                        // spurious `NotEquivalent` fast-path rejection here
-                        // (#493). Stats accumulate across candidates via
-                        // `clear_counterexamples` (not `reset`).
-                        cegis.clear_counterexamples();
-                        cegis.add_edge_case_seeds(&vars);
-                        if self.add_failed_proof_counterexample_seeds(
+                    } else if !budget.admit_verification() {
+                        // Any earlier incompleteness already ended the walk, so
+                        // the budget is why this candidate stays unverified.
+                        completion = CegisSearchCompletion::DeadlineExceeded;
+                        break 'blocks;
+                    } else if let Some(obligation) = obligation {
+                        let result = self.verify_obligation(
                             &mut cegis,
+                            RewriteLayer::A,
+                            inst_id,
+                            &obligation,
                             failed_proof_scope,
-                            &vars,
-                        ) > 0
-                        {
-                            used_failed_proof_seed = true;
-                        }
-
-                        // Wall-clock the solver call so we can populate
-                        // `stats.solver_ms`. CegisLoop::verify does concrete
-                        // eval + potentially several ay queries; we attribute
-                        // the entire elapsed duration to "solver" since that
-                        // is what the #486 acceptance criterion wants
-                        // (anything that is not pure enumeration/mutation).
-                        let solver_start = Instant::now();
-                        let result = if let Some(result) = self.test_hooks.verifier_result.clone() {
-                            Ok(result)
-                        } else {
-                            catch_unwind(AssertUnwindSafe(|| cegis.verify(&src, &tgt, &vars)))
-                        };
-                        self.stats.solver_ms = self
-                            .stats
-                            .solver_ms
-                            .saturating_add(solver_start.elapsed().as_millis() as u64);
+                            &mut used_failed_proof_seed,
+                        );
 
                         match result {
                             Ok(CegisResult::Equivalent {
@@ -1162,6 +1724,7 @@ impl CegisSuperoptPass {
                                 iterations,
                             }) => {
                                 let replacement_blob = MachInstBlob::from_inst(&replacement);
+                                facts.replaced(inst_id, &inst, &replacement);
                                 *func.inst_mut(inst_id) = replacement;
                                 entry.verified += 1;
                                 self.stats.verified += 1;
@@ -1191,7 +1754,7 @@ impl CegisSuperoptPass {
                             }
                             Ok(CegisResult::Error(message)) => {
                                 completion.record(CegisSearchCompletion::VerifierError);
-                                if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
+                                if crate::diag::solve_trace_enabled() {
                                     eprintln!(
                                         "TCG_SOLVE_TRACE cegis_error layer=A message={message}"
                                     );
@@ -1214,12 +1777,7 @@ impl CegisSuperoptPass {
                     break 'blocks;
                 }
 
-                let current_inst = func.inst(inst_id);
-                if current_inst.produces_value()
-                    && let Some(dst) = current_inst.operands.first().and_then(MachOperand::as_vreg)
-                {
-                    def_map.insert(dst.id, inst_id);
-                }
+                record_defs(&mut def_map, inst_id, func.inst(inst_id));
             }
         }
 
@@ -1252,23 +1810,27 @@ impl CegisSuperoptPass {
     ///
     /// 1. The `AddRR` keeps its original `dst` VReg — consumers of `dst`
     ///    elsewhere in the function are unaffected.
-    /// 2. The `Movz`'s `dst` VReg becomes dead after the splice. We verified
-    ///    above that it has exactly one use (the current `AddRR`), so no
-    ///    other consumer is left dangling.
+    /// 2. The `Movz`'s `dst` VReg becomes dead after the splice. The
+    ///    matcher requires exactly one read of it (the current `AddRR`), so
+    ///    no other consumer is left dangling.
     /// 3. The `AddRR`'s `src` operand is kept verbatim.
     ///
     /// Constraints enforced:
     /// - `Movz` must be a proof-covered shift-zero form (implicit or explicit)
-    ///   and its immediate must be non-negative and fit in `u32::MAX`
-    ///   (downstream encoders further restrict to ADD's 12-bit imm field,
-    ///   but that is a concern for codegen, not for the semantic proof).
-    /// - The Movz result VReg must be used exactly once in the function.
+    ///   and the latest definition of `v` before the `AddRR`, by every def
+    ///   position of the shared operand-role model.
+    /// - Its immediate must fit `ADD`'s unshifted 12-bit field, the only
+    ///   `AddRI` form the encoder emits.
+    /// - The Movz result VReg must be read exactly once in the function, at
+    ///   every use position of the shared operand-role model (operand 0 of a
+    ///   compare or store is a read).
     /// - The register class of AddRR's `dst`, `src`, and `v` must agree
     ///   (Gpr32 or Gpr64).
     fn match_layer_b_candidate(
         func: &MachFunction,
         add_inst: &MachInst,
         def_map: &HashMap<u32, trust_cg_ir::InstId>,
+        facts: &impl WalkFacts,
     ) -> Option<(u32, trust_cg_ir::InstId, MachInst)> {
         if add_inst.opcode != AArch64Opcode::AddRR || add_inst.operands.len() < 3 {
             return None;
@@ -1302,13 +1864,13 @@ impl CegisSuperoptPass {
             return None;
         }
         let imm = i64::try_from(Self::move_wide_imm16(movz_inst)?).ok()?;
-        if imm < 0 || imm > u32::MAX as i64 {
-            return None;
-        }
+        // `AddRI` is emitted as `ADD #imm12` with no shift.
+        obligation::encode_add_imm(imm)?;
 
-        // Single-use check: if any other instruction in the function reads
-        // the Movz destination, we cannot splice it out.
-        if count_vreg_uses(func, movz_vreg) != 1 {
+        // Single-use check: the `AddRR`'s operand 2 must be the only read of
+        // the Movz destination anywhere, operand 0 of a compare or store
+        // included, or splicing the Movz out leaves a read of nothing.
+        if facts.vreg_uses(func, movz_vreg) != 1 {
             return None;
         }
 
@@ -1333,7 +1895,8 @@ impl CegisSuperoptPass {
     fn enumerate_and_verify_layer_b(
         &mut self,
         func: &mut MachFunction,
-        deadline: Instant,
+        facts: &mut impl WalkFacts,
+        budget: &mut SolverBudget,
         entry: &mut CegisCacheEntry,
         failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
     ) -> (bool, CegisSearchCompletion, bool) {
@@ -1354,15 +1917,13 @@ impl CegisSuperoptPass {
             let mut to_remove: Vec<trust_cg_ir::InstId> = Vec::new();
 
             for inst_id in inst_ids {
-                if Instant::now() >= deadline {
-                    completion = CegisSearchCompletion::DeadlineExceeded;
-                    break 'blocks;
-                }
-
                 let inst = func.inst(inst_id).clone();
-                if let Some((width, movz_id, replacement)) =
-                    Self::match_layer_b_candidate(func, &inst, &def_map)
+                if let Some((_width, movz_id, mut replacement)) =
+                    Self::match_layer_b_candidate(func, &inst, &def_map, facts)
                 {
+                    self.test_hooks
+                        .corrupt(&mut replacement, func.inst(movz_id).operands.first());
+                    self.note_candidate(RewriteLayer::B, inst_id, &[movz_id], &replacement);
                     self.stats.candidates += 1;
                     self.stats.layer_b_candidates += 1;
                     entry.attempted += 1;
@@ -1376,51 +1937,28 @@ impl CegisSuperoptPass {
                     } else {
                         cost_model.latency(AArch64Opcode::AddRI) as i32
                     };
-                    if tgt_cost >= src_cost {
+                    let obligation = Self::layer_obligation(
+                        &[func.inst(movz_id), &inst],
+                        &[&replacement],
+                        &inst,
+                    );
+                    if tgt_cost >= src_cost || obligation.is_none() {
+                        // Not cheaper, or no obligation to discharge: rejected
+                        // without a verification.
                         self.stats.rejected += 1;
                         entry.rejected += 1;
-                    } else {
-                        let imm_val = func
-                            .inst(movz_id)
-                            .operands
-                            .get(1)
-                            .and_then(MachOperand::as_imm)
-                            .unwrap_or(0);
-                        let imm_u = (imm_val as u64) & mask_u64(width);
-
-                        let vars = vec![("y".to_string(), width)];
-                        let src_expr =
-                            SmtExpr::var("y", width).bvadd(SmtExpr::bv_const(imm_u, width));
-                        let tgt_expr =
-                            SmtExpr::var("y", width).bvadd(SmtExpr::bv_const(imm_u, width));
-                        // Scope CX state to this candidate (#493). Different
-                        // `imm` values per candidate mean each `src_expr`
-                        // uses a distinct constant; leaving prior CXs in
-                        // place would let them reject this obligation on
-                        // the concrete fast path.
-                        cegis.clear_counterexamples();
-                        cegis.add_edge_case_seeds(&vars);
-                        if self.add_failed_proof_counterexample_seeds(
+                    } else if !budget.admit_verification() {
+                        completion = CegisSearchCompletion::DeadlineExceeded;
+                        break 'blocks;
+                    } else if let Some(obligation) = obligation {
+                        let result = self.verify_obligation(
                             &mut cegis,
+                            RewriteLayer::B,
+                            inst_id,
+                            &obligation,
                             failed_proof_scope,
-                            &vars,
-                        ) > 0
-                        {
-                            used_failed_proof_seed = true;
-                        }
-
-                        let solver_start = Instant::now();
-                        let result = if let Some(result) = self.test_hooks.verifier_result.clone() {
-                            Ok(result)
-                        } else {
-                            catch_unwind(AssertUnwindSafe(|| {
-                                cegis.verify(&src_expr, &tgt_expr, &vars)
-                            }))
-                        };
-                        self.stats.solver_ms = self
-                            .stats
-                            .solver_ms
-                            .saturating_add(solver_start.elapsed().as_millis() as u64);
+                            &mut used_failed_proof_seed,
+                        );
 
                         match result {
                             Ok(CegisResult::Equivalent {
@@ -1428,6 +1966,7 @@ impl CegisSuperoptPass {
                                 iterations,
                             }) => {
                                 let replacement_blob = MachInstBlob::from_inst(&replacement);
+                                facts.replaced(inst_id, &inst, &replacement);
                                 *func.inst_mut(inst_id) = replacement;
                                 to_remove.push(movz_id);
                                 entry.verified += 1;
@@ -1458,7 +1997,7 @@ impl CegisSuperoptPass {
                             }
                             Ok(CegisResult::Error(message)) => {
                                 completion.record(CegisSearchCompletion::VerifierError);
-                                if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
+                                if crate::diag::solve_trace_enabled() {
                                     eprintln!(
                                         "TCG_SOLVE_TRACE cegis_error layer=B message={message}"
                                     );
@@ -1482,13 +2021,8 @@ impl CegisSuperoptPass {
                 }
 
                 // Update def_map with the CURRENT body (possibly just
-                // rewritten from AddRR to AddRI — both produce `dst`).
-                let current_inst = func.inst(inst_id);
-                if current_inst.produces_value()
-                    && let Some(dst) = current_inst.operands.first().and_then(MachOperand::as_vreg)
-                {
-                    def_map.insert(dst.id, inst_id);
-                }
+                // rewritten from AddRR to AddRI — both define `dst`).
+                record_defs(&mut def_map, inst_id, func.inst(inst_id));
             }
 
             // Apply pending splices: drop spliced-out insts from the block
@@ -1544,6 +2078,16 @@ impl CegisSuperoptPass {
         Some(imm as u64)
     }
 
+    /// The constant `target` holds just before `target_id` in `block_id`, and
+    /// the move-wide instructions that built it, if a `Movz` or `Movn` of
+    /// `target` followed by `Movk`s of `target` is its latest definition.
+    ///
+    /// The scan follows definitions by the shared operand-role model: any
+    /// other write to `target`'s id, at any operand position and under any
+    /// register class, forgets the constant; a read of `target` does not.
+    /// A move-wide of `target` the scan cannot model, or a `Movk` with no
+    /// known constant under it, makes the answer `None` for the rest of the
+    /// block.
     fn materialized_wide_const_before(
         func: &MachFunction,
         block_id: trust_cg_ir::BlockId,
@@ -1561,29 +2105,28 @@ impl CegisSuperoptPass {
             }
 
             let inst = func.inst(inst_id);
-            let Some(dst) = inst.operands.first().and_then(MachOperand::as_vreg) else {
-                continue;
-            };
-            if dst != target {
+            if !defines_vreg_id(inst, target.id) {
                 continue;
             }
+            let exact_move_wide =
+                inst.operands.first().and_then(MachOperand::as_vreg) == Some(target);
 
             match inst.opcode {
-                AArch64Opcode::Movz => {
+                AArch64Opcode::Movz if exact_move_wide => {
                     let imm = Self::move_wide_imm16(inst)?;
                     let shift = Self::move_wide_shift(inst, width)?;
                     value = Some((imm << shift) & register_mask);
                     materializer_ids.clear();
                     materializer_ids.push(inst_id);
                 }
-                AArch64Opcode::Movn => {
+                AArch64Opcode::Movn if exact_move_wide => {
                     let imm = Self::move_wide_imm16(inst)?;
                     let shift = Self::move_wide_shift(inst, width)?;
                     value = Some((!(imm << shift)) & register_mask);
                     materializer_ids.clear();
                     materializer_ids.push(inst_id);
                 }
-                AArch64Opcode::Movk => {
+                AArch64Opcode::Movk if exact_move_wide => {
                     let imm = Self::move_wide_imm16(inst)?;
                     let shift = Self::move_wide_shift(inst, width)?;
                     let current = value?;
@@ -1621,12 +2164,14 @@ impl CegisSuperoptPass {
     /// bit-swap stage materializes masks such as `0x55555555`,
     /// `0x33333333`, and `0x0f0f0f0f` before an `AndRR`. The replacement is
     /// admitted only when the materialized mask is a real AArch64 logical
-    /// immediate and the mask vreg has exactly one read, so the materializer
-    /// chain can be removed from the block schedule.
+    /// immediate and the `AndRR` is the only reader of the mask vreg outside
+    /// the chain, so the materializer chain can be removed from the block
+    /// schedule.
     fn match_layer_c_and_imm_candidate(
         func: &MachFunction,
         block_id: trust_cg_ir::BlockId,
         and_id: InstId,
+        facts: &mut impl WalkFacts,
     ) -> Option<LayerCAndImmCandidate> {
         let and_inst = func.inst(and_id);
         if and_inst.opcode != AArch64Opcode::AndRR || and_inst.operands.len() < 3 {
@@ -1646,13 +2191,18 @@ impl CegisSuperoptPass {
             _ => return None,
         };
 
-        if count_vreg_uses(func, mask_vreg) != 1 {
-            return None;
-        }
-
         let (mask, materializer_ids) =
-            Self::materialized_wide_const_before(func, block_id, and_id, mask_vreg, width)?;
-        if !is_aarch64_logical_immediate(mask, width) {
+            facts.materialized_wide_const_before(func, block_id, and_id, mask_vreg, width)?;
+        obligation::encode_logical_imm(mask as i64, width)?;
+
+        // The chain leaves the schedule with the rewrite, taking its own reads
+        // of the mask (each `Movk` reads the halfwords it keeps) with it. The
+        // `AndRR`'s mask operand must then be the only read left.
+        let chain_reads: u64 = materializer_ids
+            .iter()
+            .map(|id| u64::from(vreg_reads_in(func.inst(*id), mask_vreg.id)))
+            .sum();
+        if facts.vreg_uses(func, mask_vreg) != chain_reads + 1 {
             return None;
         }
 
@@ -1668,17 +2218,16 @@ impl CegisSuperoptPass {
         replacement.source_loc = and_inst.source_loc;
 
         Some(LayerCAndImmCandidate {
-            width,
             materializer_ids,
             replacement,
-            mask,
         })
     }
 
     fn enumerate_and_verify_layer_c(
         &mut self,
         func: &mut MachFunction,
-        deadline: Instant,
+        facts: &mut impl WalkFacts,
+        budget: &mut SolverBudget,
         entry: &mut CegisCacheEntry,
         failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
     ) -> (bool, CegisSearchCompletion, bool) {
@@ -1696,115 +2245,128 @@ impl CegisSuperoptPass {
         'blocks: for block_id in func.block_order.clone() {
             let inst_ids = func.block(block_id).insts.clone();
             let mut to_remove: Vec<InstId> = Vec::new();
+            // The matcher asks for the constant a mask vreg holds before each
+            // `AndRR`; the facts follow the walk so that answer is not a scan
+            // of the block prefix. Spliced materializers leave the schedule
+            // only after the block, as the facts require.
+            facts.enter_block(block_id, &inst_ids);
 
             for inst_id in inst_ids {
-                if Instant::now() >= deadline {
-                    completion = CegisSearchCompletion::DeadlineExceeded;
-                    break 'blocks;
-                }
+                'candidate: {
+                    let Some(mut candidate) =
+                        Self::match_layer_c_and_imm_candidate(func, block_id, inst_id, facts)
+                    else {
+                        break 'candidate;
+                    };
+                    let mask_register = func.inst(inst_id).operands.get(2);
+                    self.test_hooks
+                        .corrupt(&mut candidate.replacement, mask_register);
 
-                let Some(candidate) =
-                    Self::match_layer_c_and_imm_candidate(func, block_id, inst_id)
-                else {
-                    continue;
-                };
+                    self.note_candidate(
+                        RewriteLayer::C,
+                        inst_id,
+                        &candidate.materializer_ids,
+                        &candidate.replacement,
+                    );
+                    self.stats.candidates += 1;
+                    entry.attempted += 1;
 
-                self.stats.candidates += 1;
-                entry.attempted += 1;
+                    let source_materializer_cost: i32 = candidate
+                        .materializer_ids
+                        .iter()
+                        .map(|id| cost_model.latency(func.inst(*id).opcode) as i32)
+                        .sum();
+                    let src_cost =
+                        source_materializer_cost + cost_model.latency(AArch64Opcode::AndRR) as i32;
+                    let tgt_cost = cost_model.latency(AArch64Opcode::AndRI) as i32;
+                    // The chain in schedule order, then the `AndRR` it feeds.
+                    let and_inst = func.inst(inst_id);
+                    let mut original: Vec<&MachInst> = candidate
+                        .materializer_ids
+                        .iter()
+                        .map(|id| func.inst(*id))
+                        .collect();
+                    original.push(and_inst);
+                    let obligation =
+                        Self::layer_obligation(&original, &[&candidate.replacement], and_inst);
+                    let Some(obligation) = obligation.filter(|_| tgt_cost < src_cost) else {
+                        // Not cheaper, or no obligation to discharge: rejected
+                        // without a verification.
+                        self.stats.rejected += 1;
+                        entry.rejected += 1;
+                        break 'candidate;
+                    };
+                    if !budget.admit_verification() {
+                        completion = CegisSearchCompletion::DeadlineExceeded;
+                        break 'blocks;
+                    }
 
-                let source_materializer_cost: i32 = candidate
-                    .materializer_ids
-                    .iter()
-                    .map(|id| cost_model.latency(func.inst(*id).opcode) as i32)
-                    .sum();
-                let src_cost =
-                    source_materializer_cost + cost_model.latency(AArch64Opcode::AndRR) as i32;
-                let tgt_cost = cost_model.latency(AArch64Opcode::AndRI) as i32;
-                if tgt_cost >= src_cost {
-                    self.stats.rejected += 1;
-                    entry.rejected += 1;
-                    continue;
-                }
+                    let result = self.verify_obligation(
+                        &mut cegis,
+                        RewriteLayer::C,
+                        inst_id,
+                        &obligation,
+                        failed_proof_scope,
+                        &mut used_failed_proof_seed,
+                    );
 
-                let vars = vec![("x".to_string(), candidate.width)];
-                let src_expr = SmtExpr::var("x", candidate.width)
-                    .bvand(SmtExpr::bv_const(candidate.mask, candidate.width));
-                let tgt_expr = SmtExpr::var("x", candidate.width)
-                    .bvand(SmtExpr::bv_const(candidate.mask, candidate.width));
-                cegis.clear_counterexamples();
-                cegis.add_edge_case_seeds(&vars);
-                if self.add_failed_proof_counterexample_seeds(&mut cegis, failed_proof_scope, &vars)
-                    > 0
-                {
-                    used_failed_proof_seed = true;
-                }
-
-                let solver_start = Instant::now();
-                let result = if let Some(result) = self.test_hooks.verifier_result.clone() {
-                    Ok(result)
-                } else {
-                    catch_unwind(AssertUnwindSafe(|| {
-                        cegis.verify(&src_expr, &tgt_expr, &vars)
-                    }))
-                };
-                self.stats.solver_ms = self
-                    .stats
-                    .solver_ms
-                    .saturating_add(solver_start.elapsed().as_millis() as u64);
-
-                match result {
-                    Ok(CegisResult::Equivalent {
-                        proof_hash,
-                        iterations,
-                    }) => {
-                        let replacement_blob = MachInstBlob::from_inst(&candidate.replacement);
-                        *func.inst_mut(inst_id) = candidate.replacement;
-                        to_remove.extend(candidate.materializer_ids.iter().copied());
-                        entry.verified += 1;
-                        self.stats.verified += 1;
-                        entry.proven_rewrites.push(ProvenRewrite {
-                            inst_index: inst_id.0,
+                    match result {
+                        Ok(CegisResult::Equivalent {
                             proof_hash,
-                            iterations: iterations as u32,
-                            window_len: 1 + candidate.materializer_ids.len() as u32,
-                            replacement: vec![replacement_blob],
-                            layer: RewriteLayer::C,
-                        });
-                        committed = true;
-                        if self.test_incomplete_after_first_commit {
+                            iterations,
+                        }) => {
+                            let replacement_blob = MachInstBlob::from_inst(&candidate.replacement);
+                            let source =
+                                std::mem::replace(func.inst_mut(inst_id), candidate.replacement);
+                            facts.replaced(inst_id, &source, func.inst(inst_id));
+                            to_remove.extend(candidate.materializer_ids.iter().copied());
+                            entry.verified += 1;
+                            self.stats.verified += 1;
+                            entry.proven_rewrites.push(ProvenRewrite {
+                                inst_index: inst_id.0,
+                                proof_hash,
+                                iterations: iterations as u32,
+                                window_len: 1 + candidate.materializer_ids.len() as u32,
+                                replacement: vec![replacement_blob],
+                                layer: RewriteLayer::C,
+                            });
+                            committed = true;
+                            if self.test_incomplete_after_first_commit {
+                                completion.record(CegisSearchCompletion::QueryIncomplete);
+                            }
+                        }
+                        Ok(CegisResult::NotEquivalent { .. }) => {
+                            self.stats.rejected += 1;
+                            entry.rejected += 1;
+                        }
+                        Ok(CegisResult::Timeout | CegisResult::MaxIterationsReached { .. }) => {
                             completion.record(CegisSearchCompletion::QueryIncomplete);
+                            self.stats.timeouts += 1;
+                            self.stats.rejected += 1;
+                            entry.rejected += 1;
                         }
-                    }
-                    Ok(CegisResult::NotEquivalent { .. }) => {
-                        self.stats.rejected += 1;
-                        entry.rejected += 1;
-                    }
-                    Ok(CegisResult::Timeout | CegisResult::MaxIterationsReached { .. }) => {
-                        completion.record(CegisSearchCompletion::QueryIncomplete);
-                        self.stats.timeouts += 1;
-                        self.stats.rejected += 1;
-                        entry.rejected += 1;
-                    }
-                    Ok(CegisResult::Error(message)) => {
-                        completion.record(CegisSearchCompletion::VerifierError);
-                        if std::env::var_os("TCG_SOLVE_TRACE").is_some() {
-                            eprintln!("TCG_SOLVE_TRACE cegis_error layer=C message={message}");
+                        Ok(CegisResult::Error(message)) => {
+                            completion.record(CegisSearchCompletion::VerifierError);
+                            if crate::diag::solve_trace_enabled() {
+                                eprintln!("TCG_SOLVE_TRACE cegis_error layer=C message={message}");
+                            }
+                            self.stats.verifier_errors += 1;
+                            self.stats.rejected += 1;
+                            entry.rejected += 1;
                         }
-                        self.stats.verifier_errors += 1;
-                        self.stats.rejected += 1;
-                        entry.rejected += 1;
-                    }
-                    Err(_) => {
-                        completion.record(CegisSearchCompletion::VerifierPanicked);
-                        self.stats.panics += 1;
-                        self.stats.rejected += 1;
-                        entry.rejected += 1;
+                        Err(_) => {
+                            completion.record(CegisSearchCompletion::VerifierPanicked);
+                            self.stats.panics += 1;
+                            self.stats.rejected += 1;
+                            entry.rejected += 1;
+                        }
                     }
                 }
 
                 if !completion.is_complete() {
                     break 'blocks;
                 }
+                facts.passed(inst_id, func.inst(inst_id));
             }
 
             if !to_remove.is_empty() {
@@ -1826,17 +2388,35 @@ impl CegisSuperoptPass {
     /// Apply a single cached rewrite to `func` from the serialized replacement
     /// body recorded in [`ProvenRewrite`].
     ///
-    /// Returns `true` if the rewrite was applied. Bad indices or undecodable
-    /// blobs are treated as unapplied rewrites rather than hard pass failures.
+    /// The cache has no MAC: anyone who can write its root can change a
+    /// recorded body, and the codec checks only the format. Replay therefore
+    /// re-runs the search's own matcher on the current body and applies the
+    /// rewrite only where that matcher still admits the window, with the
+    /// window length it implies, and rebuilds exactly the recorded body: the
+    /// same opcode and the same operands, every register id and class and
+    /// every immediate. Anything else leaves `func` untouched, and the caller
+    /// treats the entry as stale and searches again. Replay thus splices out
+    /// exactly the materializers the matcher would, under the same
+    /// reaching-definition and single-read rules, and writes only a body the
+    /// matcher builds. Cache blobs can also outlive matcher hardening; an
+    /// older entry must not, for example, normalize away a now-non-emittable
+    /// shifted `Movz`.
+    ///
+    /// What replay does not repeat is the equivalence proof: a replayed body
+    /// is the matcher's own candidate, which the search admits only after the
+    /// solver proves it.
+    ///
+    /// Returns `true` if the rewrite was applied. Bad indices, recorded bodies
+    /// other than the matcher's, and windows the matcher no longer admits are
+    /// treated as unapplied rewrites rather than hard pass failures.
     fn apply_cached_rewrite(func: &mut MachFunction, rewrite: &ProvenRewrite) -> bool {
         let target_id = trust_cg_ir::InstId(rewrite.inst_index);
         if (target_id.0 as usize) >= func.insts.len() {
             return false;
         }
-        if rewrite.window_len == 0 || rewrite.replacement.is_empty() {
+        let [recorded] = rewrite.replacement.as_slice() else {
             return false;
-        }
-
+        };
         let Some(block_id) = func
             .block_order
             .iter()
@@ -1846,74 +2426,47 @@ impl CegisSuperoptPass {
             return false;
         };
 
-        let source_inst = func.inst(target_id).clone();
-        let mut rebuilt = Vec::with_capacity(rewrite.replacement.len());
-        for blob in &rewrite.replacement {
-            let Some(inst) = blob.to_inst() else {
-                return false;
-            };
-            rebuilt.push(inst);
-        }
-        if let Some(first) = rebuilt.first_mut() {
-            first.proof = source_inst.proof;
-            first.source_loc = source_inst.source_loc;
-        }
-
-        let mut remove_ids = Vec::new();
-        match rewrite.layer {
+        let target = func.inst(target_id);
+        let matched = match rewrite.layer {
             RewriteLayer::A => {
-                if !Self::cached_layer_a_source_is_valid(func, block_id, target_id) {
-                    return false;
-                }
+                let def_map = block_prefix_defs(func, block_id, target_id);
+                Self::match_layer_a_candidate(func, target, &def_map)
+                    .map(|(_, _, replacement)| (Vec::new(), replacement))
             }
             RewriteLayer::B => {
-                if let Some(movz_id) = Self::cached_layer_b_movz_id(func, block_id, target_id) {
-                    remove_ids.push(movz_id);
-                } else {
-                    return false;
-                }
+                let def_map = block_prefix_defs(func, block_id, target_id);
+                Self::match_layer_b_candidate(func, target, &def_map, &DirectWalkFacts)
+                    .map(|(_, movz_id, replacement)| (vec![movz_id], replacement))
             }
-            RewriteLayer::C => {
-                let Some(mut materializers) =
-                    Self::cached_layer_c_materializer_ids(func, block_id, target_id)
-                else {
-                    return false;
-                };
-                remove_ids.append(&mut materializers);
-            }
+            RewriteLayer::C => Self::match_layer_c_and_imm_candidate(
+                func,
+                block_id,
+                target_id,
+                &mut DirectWalkFacts,
+            )
+            .map(|candidate| (candidate.materializer_ids, candidate.replacement)),
+        };
+        let Some((remove_ids, rebuilt)) = matched else {
+            return false;
+        };
+        if rewrite.window_len as usize != 1 + remove_ids.len() {
+            return false;
         }
-
-        let first = rebuilt.remove(0);
-        *func.inst_mut(target_id) = first;
-
-        let mut inserted_ids = Vec::with_capacity(rebuilt.len());
-        for inst in rebuilt {
-            inserted_ids.push(func.push_inst(inst));
-        }
-
-        let block = func.block_mut(block_id);
-        if let Some(pos) = block.insts.iter().position(|id| *id == target_id) {
-            if rewrite.layer == RewriteLayer::A {
-                let extra = rewrite.window_len.saturating_sub(1) as usize;
-                if extra > 0 {
-                    let end = (pos + 1 + extra).min(block.insts.len());
-                    block.insts.drain(pos + 1..end);
-                }
-            }
-            for (offset, new_id) in inserted_ids.into_iter().enumerate() {
-                block.insts.insert(pos + 1 + offset, new_id);
-            }
-        } else {
+        // Fail closed before any splice: the recorded body must be exactly
+        // the one the matcher builds on the current body.
+        if MachInstBlob::from_inst(&rebuilt) != *recorded {
             return false;
         }
 
+        // The matchers copy `proof` and `source_loc` from the rewritten
+        // instruction, which the recorded blob does not carry.
+        *func.inst_mut(target_id) = rebuilt;
         if !remove_ids.is_empty() {
-            let remove_set: std::collections::HashSet<_> = remove_ids.into_iter().collect();
+            let remove_set: HashSet<_> = remove_ids.into_iter().collect();
             func.block_mut(block_id)
                 .insts
                 .retain(|id| !remove_set.contains(id));
         }
-
         true
     }
 
@@ -1954,89 +2507,6 @@ impl CegisSuperoptPass {
             return None;
         }
         Some((source_region, target))
-    }
-
-    /// Find the producer Movz that Layer B's cold path spliced out.
-    ///
-    /// The replacement body itself comes from the cache blob; this helper only
-    /// recovers the source instruction to remove from the block schedule.
-    fn cached_layer_b_movz_id(
-        func: &MachFunction,
-        block_id: trust_cg_ir::BlockId,
-        target_id: trust_cg_ir::InstId,
-    ) -> Option<trust_cg_ir::InstId> {
-        let inst = func.inst(target_id);
-        if inst.opcode != AArch64Opcode::AddRR || inst.operands.len() < 3 {
-            return None;
-        }
-        let movz_vreg = inst.operands.get(2)?.as_vreg()?;
-
-        let mut def_map = HashMap::new();
-        for &inst_id in &func.block(block_id).insts {
-            if inst_id == target_id {
-                break;
-            }
-            let inst = func.inst(inst_id);
-            if inst.produces_value()
-                && let Some(dst) = inst.operands.first().and_then(MachOperand::as_vreg)
-            {
-                def_map.insert(dst.id, inst_id);
-            }
-        }
-        let movz_id = *def_map.get(&movz_vreg.id)?;
-        let movz_inst = func.inst(movz_id);
-        if movz_inst.opcode != AArch64Opcode::Movz {
-            return None;
-        }
-        if movz_inst.operands.first()?.as_vreg()? != movz_vreg {
-            return None;
-        }
-        let width = match movz_vreg.class {
-            RegClass::Gpr32 => 32,
-            RegClass::Gpr64 => 64,
-            _ => return None,
-        };
-        Self::move_wide_imm16(movz_inst)?;
-        if Self::move_wide_shift(movz_inst, width)? != 0 {
-            return None;
-        }
-        if count_vreg_uses(func, movz_vreg) != 1 {
-            return None;
-        }
-        Some(movz_id)
-    }
-
-    /// Revalidate Layer A's source window before replaying a cache entry.
-    ///
-    /// Cache blobs can outlive matcher hardening.  In particular, an older
-    /// entry must not normalize away a now-non-emittable shifted `Movz`.
-    fn cached_layer_a_source_is_valid(
-        func: &MachFunction,
-        block_id: trust_cg_ir::BlockId,
-        target_id: trust_cg_ir::InstId,
-    ) -> bool {
-        let mut def_map = HashMap::new();
-        for &inst_id in &func.block(block_id).insts {
-            if inst_id == target_id {
-                break;
-            }
-            let inst = func.inst(inst_id);
-            if inst.produces_value()
-                && let Some(dst) = inst.operands.first().and_then(MachOperand::as_vreg)
-            {
-                def_map.insert(dst.id, inst_id);
-            }
-        }
-        Self::match_layer_a_candidate(func, func.inst(target_id), &def_map).is_some()
-    }
-
-    fn cached_layer_c_materializer_ids(
-        func: &MachFunction,
-        block_id: trust_cg_ir::BlockId,
-        target_id: InstId,
-    ) -> Option<Vec<InstId>> {
-        Self::match_layer_c_and_imm_candidate(func, block_id, target_id)
-            .map(|candidate| candidate.materializer_ids)
     }
 
     /// Replay all cached rewrites in order. Returns
@@ -2094,6 +2564,178 @@ impl CegisSuperoptPass {
         (committed, applied_a, applied_b, applied_other)
     }
 
+    /// Walk Layers A, B and C over `search_func`, the transaction's private
+    /// copy, under one [`SolverBudget`].
+    ///
+    /// Returns whether any layer rewrote `search_func`, the cache entry, the
+    /// search completion and whether failed-proof seeds were used. `facts`
+    /// must describe `search_func` as it is on entry.
+    fn search_layers(
+        &mut self,
+        search_func: &mut MachFunction,
+        facts: &mut impl WalkFacts,
+        failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
+    ) -> (bool, CegisCacheEntry, CegisSearchCompletion, bool) {
+        let mut budget = SolverBudget::new(self.config.budget_sec, &self.test_hooks);
+        let (committed_a, mut entry, completion_a, used_seed_a) =
+            self.enumerate_and_verify_layer_a(search_func, facts, &mut budget, failed_proof_scope);
+        let mut completion = completion_a;
+        let mut used_failed_proof_seed = used_seed_a;
+        // Layer B runs after Layer A so that any Layer-A-rewrites are
+        // visible to the window enumerator (e.g. a MulRR->Movz collapse
+        // could unblock a subsequent two-inst fusion).
+        let (committed_b, completion_b, used_seed_b) = if !completion_a.is_complete() {
+            (false, completion_a, false)
+        } else {
+            self.enumerate_and_verify_layer_b(
+                search_func,
+                facts,
+                &mut budget,
+                &mut entry,
+                failed_proof_scope,
+            )
+        };
+        completion.record(completion_b);
+        used_failed_proof_seed |= used_seed_b;
+        let (committed_c, completion_c, used_seed_c) = if !completion.is_complete() {
+            (false, completion, false)
+        } else {
+            self.enumerate_and_verify_layer_c(
+                search_func,
+                facts,
+                &mut budget,
+                &mut entry,
+                failed_proof_scope,
+            )
+        };
+        completion.record(completion_c);
+        used_failed_proof_seed |= used_seed_c;
+        entry.completion = completion;
+        (
+            committed_a || committed_b || committed_c,
+            entry,
+            completion,
+            used_failed_proof_seed,
+        )
+    }
+
+    /// The obligation for a rewrite of `consumer`: its destination must hold
+    /// the same value after `original` as after `replacement`.
+    fn layer_obligation(
+        original: &[&MachInst],
+        replacement: &[&MachInst],
+        consumer: &MachInst,
+    ) -> Option<RewriteObligation> {
+        let observed = consumer.operands.first()?.as_vreg()?;
+        window_obligation(original, replacement, observed)
+    }
+
+    /// Discharge one admitted obligation with fresh counterexample state.
+    ///
+    /// Counterexamples from prior candidates are cleared so a counterexample
+    /// to a different obligation cannot trigger a spurious `NotEquivalent`
+    /// fast-path rejection here (#493); statistics accumulate across
+    /// candidates (`clear_counterexamples`, not `reset`).
+    fn verify_obligation(
+        &mut self,
+        cegis: &mut CegisLoop,
+        layer: RewriteLayer,
+        inst_id: InstId,
+        obligation: &RewriteObligation,
+        failed_proof_scope: Option<(&SourceRegionIdentity, &TargetAbiLayoutIdentity)>,
+        used_failed_proof_seed: &mut bool,
+    ) -> std::thread::Result<CegisResult> {
+        cegis.clear_counterexamples();
+        cegis.add_edge_case_seeds(&obligation.vars);
+        if self.add_failed_proof_counterexample_seeds(cegis, failed_proof_scope, &obligation.vars)
+            > 0
+        {
+            *used_failed_proof_seed = true;
+        }
+        self.run_verification(
+            cegis,
+            layer,
+            inst_id,
+            &obligation.source,
+            &obligation.target,
+            &obligation.vars,
+        )
+    }
+
+    /// Run one admitted solver-backed verification of `src` against `tgt`.
+    ///
+    /// The elapsed time goes to `stats.solver_ms`: `CegisLoop::verify` does
+    /// concrete evaluation and possibly several solver queries, and #486
+    /// attributes everything that is not enumeration or mutation to the
+    /// solver.
+    fn run_verification(
+        &mut self,
+        cegis: &mut CegisLoop,
+        layer: RewriteLayer,
+        inst_id: InstId,
+        src: &SmtExpr,
+        tgt: &SmtExpr,
+        vars: &[(String, u32)],
+    ) -> std::thread::Result<CegisResult> {
+        let solver_start = Instant::now();
+        let result = if let Some(result) = self.scripted_verdict(layer, inst_id) {
+            Ok(result)
+        } else if let Some(result) = self.test_hooks.verifier_result.clone() {
+            Ok(result)
+        } else {
+            catch_unwind(AssertUnwindSafe(|| cegis.verify(src, tgt, vars)))
+        };
+        self.stats.solver_ms = self
+            .stats
+            .solver_ms
+            .saturating_add(solver_start.elapsed().as_millis() as u64);
+        result
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn scripted_verdict(&mut self, _layer: RewriteLayer, _inst_id: InstId) -> Option<CegisResult> {
+        None
+    }
+
+    #[cfg(test)]
+    fn scripted_verdict(&mut self, layer: RewriteLayer, inst_id: InstId) -> Option<CegisResult> {
+        let script = self.test_walk_script.as_mut()?;
+        let result = (script.verdict)(layer, inst_id);
+        script
+            .events
+            .push(format!("verdict {layer:?} {inst_id:?} {result:?}"));
+        Some(result)
+    }
+
+    /// Record a matched candidate in the test walk script, if any.
+    #[cfg(not(test))]
+    #[inline]
+    fn note_candidate(
+        &mut self,
+        _layer: RewriteLayer,
+        _inst_id: InstId,
+        _window: &[InstId],
+        _replacement: &MachInst,
+    ) {
+    }
+
+    #[cfg(test)]
+    fn note_candidate(
+        &mut self,
+        layer: RewriteLayer,
+        inst_id: InstId,
+        window: &[InstId],
+        replacement: &MachInst,
+    ) {
+        if let Some(script) = self.test_walk_script.as_mut() {
+            script.events.push(format!(
+                "candidate {layer:?} {inst_id:?} window={window:?} replacement={:?}",
+                MachInstBlob::from_inst(replacement)
+            ));
+        }
+    }
+
     /// Run one transactional CEGIS search and return its typed terminal state.
     ///
     /// Cache misses execute against a private clone. A deadline, query
@@ -2144,9 +2786,18 @@ impl CegisSuperoptPass {
         let mut invocation_completion = CegisSearchCompletion::Complete;
         let mut used_failed_proof_seed = false;
 
+        // A schedule that lists an instruction id twice is left alone: no
+        // cache lookup, no search and no put. An in-place rewrite of that id
+        // would also change its other occurrence.
+        let repeated_schedule = schedule_repeats_an_instruction(func);
+        if repeated_schedule {
+            self.stats.repeated_schedule_skips += 1;
+        }
+
         // Cache hit path --------------------------------------------------
         let mut used_cache = false;
-        if !cache_disabled_by_failed_proof_fuel
+        if !repeated_schedule
+            && !cache_disabled_by_failed_proof_fuel
             && let Some(backend) = self.config.cache.as_ref()
             && let Some(bytes) = backend.get(&key)
             && let Some(entry) = CegisCacheEntry::decode(&bytes)
@@ -2175,13 +2826,17 @@ impl CegisSuperoptPass {
                 // find the site. We therefore do NOT re-credit `entry.rejected`
                 // on a hit; the observability is about work done this run.
             } else {
-                // Treat stale cache plans as misses. Restore any partial replay
-                // before re-running enumeration on the current function body.
+                // A stale or tampered plan: some recorded rewrite is not one
+                // the matchers admit and rebuild exactly on this body. Treat
+                // it as a miss. Restore any partial replay before re-running
+                // enumeration on the current function body; a complete search
+                // then overwrites the entry.
+                self.stats.cache_stale += 1;
                 *func = before_replay;
             }
         }
 
-        if !used_cache {
+        if !used_cache && !repeated_schedule {
             // Cache miss path ---------------------------------------------
             self.stats.cache_misses += 1;
 
@@ -2190,46 +2845,11 @@ impl CegisSuperoptPass {
             // cache miss is small beside solver work and removes wall-clock
             // scheduling from the emitted artifact.
             let mut search_func = func.clone();
-
-            let deadline = if self.test_hooks.force_expired_deadline {
-                Instant::now()
-            } else {
-                Instant::now() + Duration::from_secs(self.config.budget_sec)
-            };
-            let (committed_a, mut entry, completion_a, used_seed_a) =
-                self.enumerate_and_verify_layer_a(&mut search_func, deadline, failed_proof_scope);
-            let mut completion = completion_a;
-            used_failed_proof_seed |= used_seed_a;
-            // Layer B runs after Layer A so that any Layer-A-rewrites are
-            // visible to the window enumerator (e.g. a MulRR->Movz collapse
-            // could unblock a subsequent two-inst fusion).
-            let (committed_b, completion_b, used_seed_b) = if !completion_a.is_complete() {
-                (false, completion_a, false)
-            } else {
-                self.enumerate_and_verify_layer_b(
-                    &mut search_func,
-                    deadline,
-                    &mut entry,
-                    failed_proof_scope,
-                )
-            };
-            completion.record(completion_b);
-            used_failed_proof_seed |= used_seed_b;
-            let (committed_c, completion_c, used_seed_c) = if !completion.is_complete() {
-                (false, completion, false)
-            } else {
-                self.enumerate_and_verify_layer_c(
-                    &mut search_func,
-                    deadline,
-                    &mut entry,
-                    failed_proof_scope,
-                )
-            };
-            completion.record(completion_c);
-            used_failed_proof_seed |= used_seed_c;
+            let mut facts = IndexedWalkFacts::for_search(&search_func);
+            let (speculative_committed, entry, completion, used_seed) =
+                self.search_layers(&mut search_func, &mut facts, failed_proof_scope);
+            used_failed_proof_seed |= used_seed;
             invocation_completion = completion;
-            let speculative_committed = committed_a || committed_b || committed_c;
-            entry.completion = completion;
 
             if completion.is_complete() {
                 *func = search_func;
@@ -2273,7 +2893,7 @@ impl CegisSuperoptPass {
         // stats payload encoded as `key=value` pairs so it round-trips
         // through `CompilationTrace::to_json` without needing new enum
         // variants. Downstream tooling can parse the payload with a trivial
-        // regex; the goal is discoverability under `cargo run -- --trace`
+        // regex; the goal is discoverability under `targo --unverified run -- --trace`
         // more than typed access.
         if let Some(trace) = self.config.trace.as_ref() {
             // Per-invocation deltas (since we only ever accumulate).
@@ -2329,7 +2949,9 @@ impl CegisSuperoptPass {
                 (
                     EventKind::Rejected {
                         rule: RuleId(486),
-                        reason: if from_cache {
+                        reason: if repeated_schedule {
+                            "skipped: the schedule repeats an instruction id".to_string()
+                        } else if from_cache {
                             "cache-hit: no rewrites replayed".to_string()
                         } else if !invocation_completion.is_complete() {
                             format!("incomplete CEGIS transaction: {invocation_completion:?}")
@@ -2384,6 +3006,17 @@ mod tests {
     use crate::rewrite_admission::CounterexampleValue;
     use std::sync::Arc;
     use trust_cg_opt::{CacheBackend, CacheKey, InMemoryCache};
+
+    #[test]
+    fn exact_module_symbol_projection_preserves_binding() {
+        let exact = MachOperand::ExactModuleSymbol("same_name".into());
+        let ordinary = MachOperand::Symbol("same_name".into());
+        let exact_blob = MachOperandBlob::from_operand(&exact);
+        let ordinary_blob = MachOperandBlob::from_operand(&ordinary);
+        assert_ne!(exact_blob, ordinary_blob);
+        assert_eq!(exact_blob.to_operand(), exact);
+        assert_eq!(ordinary_blob.to_operand(), ordinary);
+    }
 
     // Build a minimally-valid MachFunction for tests via the public
     // constructor. We only need the name + insts + blocks + block_order
@@ -2468,7 +3101,8 @@ mod tests {
         let add = MachInst::new(AArch64Opcode::AddRR, vec![v32(2), v32(0), v32(1)]);
         let def_map = HashMap::from([(1, movz)]);
         assert!(
-            CegisSuperoptPass::match_layer_b_candidate(&func, &add, &def_map).is_none(),
+            CegisSuperoptPass::match_layer_b_candidate(&func, &add, &def_map, &DirectWalkFacts)
+                .is_none(),
             "an optimizer rewrite must not hide an encoder-invalid shifted Movz"
         );
     }
@@ -2673,6 +3307,121 @@ mod tests {
     }
 
     #[test]
+    fn budget_test_controls_have_disjoint_cache_namespaces() {
+        let func = empty_func("budget-control-cache-namespace");
+        let config = make_config(None, 10);
+        let key = |hooks: CegisSuperoptTestHooks| {
+            CegisSuperoptPass::new(config.clone())
+                .with_test_hooks(hooks)
+                .compute_function_key(&func)
+        };
+        let keys = [
+            CegisSuperoptPass::new(config.clone()).compute_function_key(&func),
+            key(CegisSuperoptTestHooks {
+                force_expired_deadline: true,
+                ..Default::default()
+            }),
+            key(CegisSuperoptTestHooks {
+                force_deadline_after_verifications: Some(0),
+                ..Default::default()
+            }),
+            key(CegisSuperoptTestHooks {
+                force_deadline_after_verifications: Some(1),
+                ..Default::default()
+            }),
+        ];
+        for (i, left) in keys.iter().enumerate() {
+            for right in &keys[i + 1..] {
+                assert_ne!(left, right, "budget controls must not share a key");
+            }
+        }
+    }
+
+    /// A corrupted-replacement control is never committed, but its cache
+    /// entry must still never be served to production or to another control.
+    #[test]
+    fn replacement_mutation_controls_have_disjoint_cache_namespaces() {
+        let func = empty_func("mutation-control-cache-namespace");
+        let config = make_config(None, 10);
+        let mut keys = vec![CegisSuperoptPass::new(config.clone()).compute_function_key(&func)];
+        for mutation in [
+            ReplacementMutation::Immediate,
+            ReplacementMutation::SourceRegister,
+            ReplacementMutation::Operation,
+        ] {
+            keys.push(
+                CegisSuperoptPass::new(config.clone())
+                    .with_test_hooks(CegisSuperoptTestHooks {
+                        corrupt_replacement: Some(mutation),
+                        ..Default::default()
+                    })
+                    .compute_function_key(&func),
+            );
+        }
+        for (i, left) in keys.iter().enumerate() {
+            for right in &keys[i + 1..] {
+                assert_ne!(left, right, "mutation controls must not share a key");
+            }
+        }
+    }
+
+    #[test]
+    fn solver_budget_clock_starts_at_the_first_verification() {
+        let mut budget = SolverBudget::new(60, &CegisSuperoptTestHooks::default());
+        assert!(
+            budget.clock_started.is_none(),
+            "matching candidates must not start the budget clock"
+        );
+        assert!(
+            budget.admit_verification(),
+            "the first verification always starts"
+        );
+        let started = budget
+            .clock_started
+            .expect("the first admission starts the clock");
+        assert!(
+            budget.admit_verification(),
+            "a verification inside the budget starts"
+        );
+
+        // Move the clock start back by the whole budget instead of sleeping.
+        budget.clock_started = Some(
+            started
+                .checked_sub(Duration::from_secs(60))
+                .expect("the monotonic clock has a minute of history"),
+        );
+        assert!(
+            !budget.admit_verification(),
+            "no verification starts once the budget has elapsed"
+        );
+        assert_eq!(budget.admitted, 2);
+    }
+
+    #[test]
+    fn solver_budget_test_controls_elapse_after_the_requested_admissions() {
+        let mut expired = SolverBudget::new(
+            10,
+            &CegisSuperoptTestHooks {
+                force_expired_deadline: true,
+                ..Default::default()
+            },
+        );
+        assert!(!expired.admit_verification());
+        assert_eq!(expired.admitted, 0);
+
+        let mut after_one = SolverBudget::new(
+            10,
+            &CegisSuperoptTestHooks {
+                force_deadline_after_verifications: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(after_one.admit_verification());
+        assert!(!after_one.admit_verification());
+        assert_eq!(after_one.admitted, 1);
+    }
+
+    #[test]
     fn test_cache_entry_roundtrip() {
         let entry = CegisCacheEntry {
             version: CegisCacheEntry::VERSION,
@@ -2773,3 +3522,15 @@ mod tests {
         assert_eq!(decoded, entry);
     }
 }
+
+#[cfg(test)]
+#[path = "cegis_pass_walk_tests.rs"]
+mod walk_tests;
+
+#[cfg(test)]
+#[path = "cegis_pass_operand_uses_tests.rs"]
+mod operand_uses_tests;
+
+#[cfg(test)]
+#[path = "cegis_pass_replay_tests.rs"]
+mod replay_tests;

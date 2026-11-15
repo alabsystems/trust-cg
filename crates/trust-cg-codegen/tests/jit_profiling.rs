@@ -90,7 +90,7 @@ fn build_two_function_metrics_module() -> trust_ir::Module {
         fb.ret(vec![adjusted]);
         fb.build();
     }
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn build_single_function_metrics_module() -> trust_ir::Module {
@@ -109,7 +109,7 @@ fn build_single_function_metrics_module() -> trust_ir::Module {
     let adjusted = fb.sub(Ty::I64, prod, a);
     fb.ret(vec![adjusted]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Compile the function with profiling mode `mode`, call it `n` times, and
@@ -499,7 +499,7 @@ fn call_counts_can_dump_binary_profdata_across_reset_windows() {
 #[test]
 fn test_per_function_metrics_populated() {
     let module = build_two_function_metrics_module();
-    let compiler = Compiler::for_host();
+    let compiler = Compiler::for_host().with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("compile_module_to_jit should succeed");
@@ -561,7 +561,7 @@ fn test_per_function_metrics_populated() {
 #[test]
 fn test_phase_timings_total_is_monotonic() {
     let module = build_single_function_metrics_module();
-    let compiler = Compiler::for_host();
+    let compiler = Compiler::for_host().with_codegen_license(permit_unlicensed());
     let start = Instant::now();
     let result = compiler
         .compile_module_to_jit(&module, &HashMap::new())
@@ -575,4 +575,13 @@ fn test_phase_timings_total_is_monotonic() {
         total <= elapsed,
         "sum of per-phase timings ({total:?}) should not exceed external elapsed time ({elapsed:?})"
     );
+}
+
+/// This file's metrics modules are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes (or fails by name) because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

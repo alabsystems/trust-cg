@@ -4,12 +4,12 @@
 //! `STP` (two registers moved per instruction); trust-cg's existing
 //! `addr_mode` pairing is GPR64-only AND requires an address-computation chain,
 //! so plain double/float loads-stores (the FP cluster — matmul_f64, the flops
-//! family) stay scalar. This pass is a conservative, STRICTLY-ADJACENT peephole:
-//! it only fuses two instructions at positions `p, p+1` (nothing between them),
-//! so the fusion is trivially semantics-preserving — `LDP Rt1,Rt2,[base,#off]`
-//! loads `[base,#off]`/`[base,#off+size]` into two registers exactly as the two
-//! separate `LDR`s did, and likewise for `STP`. No reordering, no aliasing
-//! reasoning (the two accesses are to distinct, non-overlapping slots).
+//! family) stay scalar. This pass pairs adjacent consecutive accesses and
+//! also uses bounded windows for load hoisting and store sinking. Windowed
+//! motion checks numeric register dependencies, ordinary effects/metadata and
+//! memory barriers. GPR stores may cross another plain store only when the
+//! same dynamic base and checked immediate byte ranges establish disjointness;
+//! distinct symbol strings and unqualified origin claims confer no permission.
 //!
 //! Runs AFTER the instruction scheduler (so adjacency reflects the near-final
 //! order) but BEFORE register allocation, so the always-on regalloc translation
@@ -27,15 +27,18 @@
 //! fail-closed (`scratch_live_after` liveness guard), so a regression is a
 //! named panic, not a silent miscompile.
 //!
-//! Kill switch: `TCG_NO_MEM_PAIR` (compile-time) / per-pass bisect
-//! `TRUST_CG_DISABLE_PASSES=mempair`.
+//! Per-pass bisect: `TRUST_CG_DISABLE_PASSES=mempair`.
 
 use crate::effects::{
-    aarch64_for_each_def_position, inst_defines_vreg, is_removable, opcode_effect,
+    aarch64_for_each_def_position, inst_clobbers_vreg_id, is_load_acquire, is_removable,
+    opcode_effect,
 };
+use crate::fast_hash::FxHashMap as HashMap;
 use crate::pass_manager::MachinePass;
-use std::collections::HashMap;
-use trust_cg_ir::{AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg};
+use trust_cg_ir::{
+    AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap, RegClass,
+    VReg,
+};
 
 /// How far ahead the windowed load pairing looks for a partner load. Loads the
 /// scheduler spread apart (matmul's row loads, interleaved with the FMADDs that
@@ -52,11 +55,116 @@ impl MachinePass for MemPairFormation {
     }
 
     fn run(&mut self, func: &mut MachFunction) -> bool {
-        if std::env::var_os("TCG_NO_MEM_PAIR").is_some() {
-            return false;
-        }
-        run_mem_pair(func)
+        run_mem_pair(func, None)
     }
+
+    fn run_with_provenance(
+        &mut self,
+        func: &mut MachFunction,
+        provenance: &mut ProvenanceMap,
+    ) -> bool {
+        run_mem_pair(func, Some(provenance))
+    }
+
+    fn run_with_analyses_and_provenance(
+        &mut self,
+        func: &mut MachFunction,
+        _analyses: &mut crate::pass_manager::AnalysisCache,
+        provenance: &mut ProvenanceMap,
+    ) -> bool {
+        run_mem_pair(func, Some(provenance))
+    }
+}
+
+fn ordinary_metadata(inst: &MachInst) -> bool {
+    inst.flags == inst.opcode.default_flags()
+        && inst.implicit_defs.is_empty()
+        && inst.implicit_uses.is_empty()
+        && inst.proof.is_none()
+}
+
+/// Only ordinary, encodable virtual scalar accesses may lose arena state.
+/// Source locations and immutable lowering sidecars remain history; custom
+/// effects or proof metadata cannot be erased by replacing the access.
+fn pairable_scalar(inst: &MachInst, next_vreg: u32) -> bool {
+    if pair_opcode(inst.opcode).is_none() || !ordinary_metadata(inst) {
+        return false;
+    }
+    let [
+        MachOperand::VReg(data),
+        MachOperand::VReg(base),
+        MachOperand::Imm(offset),
+    ] = inst.operands.as_slice()
+    else {
+        return false;
+    };
+    let Some(size) = access_size(data.class) else {
+        return false;
+    };
+    data.id < next_vreg
+        && base.id < next_vreg
+        && base.class == RegClass::Gpr64
+        && ((-256..=255).contains(offset) || is_encodable_single_offset(*offset, size))
+}
+
+/// The existing ordinary AddRI shape usable as a register-materialized base.
+/// Ownership collection and fold recognition must use the same eligibility.
+fn ordinary_addri_base(inst: &MachInst, next_vreg: u32) -> Option<(VReg, VReg, i64)> {
+    if inst.opcode != AArch64Opcode::AddRI || !ordinary_metadata(inst) {
+        return None;
+    }
+    let [
+        MachOperand::VReg(dst),
+        MachOperand::VReg(root),
+        MachOperand::Imm(k),
+    ] = inst.operands.as_slice()
+    else {
+        return None;
+    };
+    (root != dst
+        && root.class == RegClass::Gpr64
+        && dst.class == RegClass::Gpr64
+        && root.id < next_vreg
+        && dst.id < next_vreg
+        && (0..=4095).contains(k))
+    .then_some((*dst, *root, *k))
+}
+
+/// Only potentially rewritten layout IDs need ownership storage. References
+/// in EVERY block still count, including blocks omitted from layout. Counts
+/// saturate at two: one means unique, two means an unsupported shared input.
+fn candidate_ownership(func: &MachFunction) -> HashMap<InstId, u8> {
+    let mut candidates = HashMap::default();
+    for block_id in &func.block_order {
+        for &id in &func.block(*block_id).insts {
+            let inst = func.inst(id);
+            if pairable_scalar(inst, func.next_vreg)
+                || ordinary_addri_base(inst, func.next_vreg).is_some()
+            {
+                candidates.entry(id).or_insert(0u8);
+            }
+        }
+    }
+    for block in &func.blocks {
+        for &id in &block.insts {
+            if let Some(references) = candidates.get_mut(&id) {
+                *references = references.saturating_add(1).min(2);
+            }
+        }
+    }
+    candidates
+}
+
+fn pair_at(
+    func: &MachFunction,
+    first: InstId,
+    second: InstId,
+    ownership: &HashMap<InstId, u8>,
+) -> Option<MachInst> {
+    if ownership.get(&first) != Some(&1) || ownership.get(&second) != Some(&1) {
+        return None;
+    }
+    try_form_pair(func.inst(first), func.inst(second), func.next_vreg)
 }
 
 /// Access size in bytes for the register class of a scalar load/store's data
@@ -109,8 +217,8 @@ fn is_encodable_single_offset(offset: i64, size: i64) -> bool {
 /// register class, build the fused `LdpRI`/`StpRI`. The lower-offset access is
 /// placed first (matching `LDP/STP Rt1,Rt2,[base,#lo]`). Fail-closed on any
 /// deviation.
-fn try_form_pair(a: &MachInst, b: &MachInst) -> Option<MachInst> {
-    if a.opcode != b.opcode {
+fn try_form_pair(a: &MachInst, b: &MachInst, next_vreg: u32) -> Option<MachInst> {
+    if a.opcode != b.opcode || !pairable_scalar(a, next_vreg) || !pairable_scalar(b, next_vreg) {
         return None;
     }
     let pair_op = pair_opcode(a.opcode)?;
@@ -150,7 +258,10 @@ fn try_form_pair(a: &MachInst, b: &MachInst) -> Option<MachInst> {
     // `LDP` into two registers requires them DISTINCT (same-reg is CONSTRAINED
     // UNPREDICTABLE) and neither equal to the base (the address register). Stores
     // read their sources, so no such constraint.
-    if pair_op == AArch64Opcode::LdpRI && (lo_data == hi_data || lo_data == base || hi_data == base)
+    // Numeric virtual IDs name global slots; a conflicting W/X class view
+    // cannot turn a destination/base identity into a distinct register.
+    if pair_op == AArch64Opcode::LdpRI
+        && (lo_data.id == hi_data.id || lo_data.id == base.id || hi_data.id == base.id)
     {
         return None;
     }
@@ -244,8 +355,7 @@ fn collect_store_ranges(func: &MachFunction, insts: &[InstId]) -> Vec<StoreRange
 /// narrower load). Only same-base, definitely-aliasing stores veto; unknown-base
 /// stores never do (fewer pairs = always correct, a pure conservative narrowing).
 ///
-/// Kill switch: `TCG_NO_MEM_PAIR_HAZARD_GUARD` (re-enables aggressive pairing);
-/// `TCG_NO_MEM_PAIR_BASE_RESOLVE` forces `base_is_block_local=false` (old guard).
+/// Kill switch: `TCG_NO_MEM_PAIR_HAZARD_GUARD` (re-enables aggressive pairing).
 fn load_pair_store_hazard(
     pair: &MachInst,
     store_ranges: &[StoreRange],
@@ -283,17 +393,58 @@ fn load_pair_store_hazard(
     })
 }
 
-/// True if any operand of `inst` names vreg `v`.
+/// True if any operand names the same storage ID as `v`. W/X views differ
+/// in class, not identity; moving a load across either view changes its use.
 fn operand_refs(inst: &MachInst, v: VReg) -> bool {
-    inst.operands.iter().any(|o| o.as_vreg() == Some(v))
+    inst.operands
+        .iter()
+        .any(|o| o.as_vreg().is_some_and(|r| r.id == v.id))
+}
+
+/// True if no later plain load may be hoisted above `inst`. A memory write,
+/// call, barrier (`Dmb`/`Dsb`/`Isb`) or volatile access (`writes_memory()`:
+/// effect `Store`/`Call`) may change the loaded slot or order the load. A
+/// load-acquire ([`is_load_acquire`]) writes nothing — its effect class is
+/// only `Load` — but acquire semantics order every LATER access after it:
+/// hoisting a plain load above one (`ldr; ldar; ldr` -> `ldp; ldar`) lets the
+/// load return a value older than the one the acquire synchronizes with.
+/// Every other `Load`-class opcode is a plain (non-ordering) load.
+fn blocks_load_hoist(inst: &MachInst) -> bool {
+    !ordinary_metadata(inst)
+        || opcode_effect(inst.opcode).writes_memory()
+        || is_load_acquire(inst.opcode)
+}
+
+/// Whether a later load may be hoisted above `inst` with respect to control
+/// and ordering: `inst` neither ends or diverts execution (a call, branch,
+/// trap carrier, `BRK` or other terminator: the load would run where the
+/// input never ran it, ahead of the very bounds or null check guarding it)
+/// nor carries an ordering side effect (a barrier). `HAS_SIDE_EFFECTS` on a
+/// memory-pure flag setter only marks its NZCV write, which a load does not
+/// touch.
+fn load_may_cross(inst: &MachInst) -> bool {
+    use trust_cg_ir::InstFlags;
+    let flags = inst.flags.union(inst.opcode.default_flags());
+    if flags.contains(InstFlags::IS_CALL)
+        || flags.contains(InstFlags::IS_BRANCH)
+        || flags.contains(InstFlags::IS_TERMINATOR)
+        || inst.opcode == AArch64Opcode::Brk
+    {
+        return false;
+    }
+    let effect = opcode_effect(inst.opcode);
+    !flags.contains(InstFlags::HAS_SIDE_EFFECTS)
+        || (effect.is_pure() && crate::effects::writes_flags(inst.opcode))
 }
 
 /// Every instruction strictly between positions `i` and `j` (in `old`) must be
-/// safe to hoist the load at `j` above: it must NOT write memory / call (which
-/// could change the loaded slot), NOT redefine the `base` address register, and
-/// NOT reference `moved_dst` (the moved load's destination — a read would see a
-/// changed value, a write would be clobbered by the moved def). Reads/writes of
-/// the OTHER (stationary, position-`i`) destination are fine.
+/// safe to hoist the load at `j` above: it must NOT write memory / call /
+/// carry acquire ordering ([`blocks_load_hoist`]), NOT end or divert execution
+/// or order memory ([`load_may_cross`]: a trap carrier between the loads is
+/// the second load's bounds check), NOT redefine the `base` address register,
+/// and NOT reference `moved_dst` (the moved load's destination — a read would
+/// see a changed value, a write would be clobbered by the moved def).
+/// Reads/writes of the OTHER (stationary, position-`i`) destination are fine.
 fn gap_is_hoist_safe(
     func: &MachFunction,
     old: &[InstId],
@@ -304,10 +455,10 @@ fn gap_is_hoist_safe(
 ) -> bool {
     for &id in &old[i + 1..j] {
         let inst = func.inst(id);
-        if opcode_effect(inst.opcode).writes_memory() {
+        if blocks_load_hoist(inst) || !load_may_cross(inst) {
             return false;
         }
-        if inst_defines_vreg(inst, base) {
+        if inst_clobbers_vreg_id(inst, base.id) {
             return false;
         }
         if operand_refs(inst, moved_dst) {
@@ -319,16 +470,17 @@ fn gap_is_hoist_safe(
 
 /// Find a partner `LdrRI` at `j > i` (within the window, not already consumed)
 /// that pairs with the load at `old[i]` AND whose whole gap is hoist-safe. A
-/// memory write / call / base redefinition between halts the scan (nothing past
-/// it is reachable).
+/// memory write / call / load-acquire / trap or branch / base redefinition
+/// between halts the scan (nothing past it is reachable).
 fn find_windowed_load_partner(
     func: &MachFunction,
     old: &[InstId],
     i: usize,
     consumed: &std::collections::HashSet<usize>,
+    ownership: &HashMap<InstId, u8>,
 ) -> Option<(usize, MachInst)> {
     let a = func.inst(old[i]);
-    if a.opcode != AArch64Opcode::LdrRI {
+    if a.opcode != AArch64Opcode::LdrRI || ownership.get(&old[i]) != Some(&1) {
         return None; // stores are handled by the strictly-adjacent path only
     }
     let base = a.operands.get(1)?.as_vreg()?;
@@ -338,15 +490,19 @@ fn find_windowed_load_partner(
         if !consumed.contains(&j)
             && let (Some(moved_dst), Some(pair)) = (
                 inst_j.operands.first().and_then(|o| o.as_vreg()),
-                try_form_pair(a, inst_j),
+                pair_at(func, old[i], inst_id, ownership),
             )
             && gap_is_hoist_safe(func, old, i, j, base, moved_dst)
         {
             return Some((j, pair));
         }
-        // A barrier (store/call) or a base redefinition at `j` means no later
-        // instruction can be hoisted over it to `i`; stop scanning.
-        if opcode_effect(inst_j.opcode).writes_memory() || inst_defines_vreg(inst_j, base) {
+        // A barrier (store/call/load-acquire/trap/ordering access) or a base
+        // redefinition at `j` means no later instruction can be hoisted over
+        // it to `i`; stop scanning.
+        if blocks_load_hoist(inst_j)
+            || !load_may_cross(inst_j)
+            || inst_clobbers_vreg_id(inst_j, base.id)
+        {
             break;
         }
     }
@@ -392,7 +548,7 @@ impl BlockDefs {
 
 /// Analyze one block's vreg definitions and single-def `AddRI` bases.
 fn analyze_block_defs(func: &MachFunction, old: &[InstId]) -> BlockDefs {
-    let mut def_pos: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut def_pos: HashMap<u32, Vec<usize>> = HashMap::default();
     for (p, &id) in old.iter().enumerate() {
         let inst = func.inst(id);
         aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| {
@@ -401,26 +557,18 @@ fn analyze_block_defs(func: &MachFunction, old: &[InstId]) -> BlockDefs {
             }
         });
     }
-    let mut addri: HashMap<u32, AddRiBase> = HashMap::new();
+    let mut addri: HashMap<u32, AddRiBase> = HashMap::default();
     for (p, &id) in old.iter().enumerate() {
         let inst = func.inst(id);
-        if inst.opcode != AArch64Opcode::AddRI || inst.operands.len() != 3 {
-            continue;
-        }
-        let (Some(dst), Some(root), Some(k)) = (
-            inst.operands[0].as_vreg(),
-            inst.operands[1].as_vreg(),
-            inst.operands[2].as_imm(),
-        ) else {
+        let Some((dst, root, k)) = ordinary_addri_base(inst, func.next_vreg) else {
             continue;
         };
         // `root == dst` would be a self-referential fold; and only accept when
         // this AddRI is the SOLE def of `dst` in the block (so `dst` provably
         // equals `root + k` at every in-block use).
-        if root != dst
-            && def_pos
-                .get(&dst.id)
-                .is_some_and(|v| v.len() == 1 && v[0] == p)
+        if def_pos
+            .get(&dst.id)
+            .is_some_and(|v| v.len() == 1 && v[0] == p)
         {
             addri.insert(dst.id, AddRiBase { root, k, pos: p });
         }
@@ -439,13 +587,16 @@ fn analyze_block_defs(func: &MachFunction, old: &[InstId]) -> BlockDefs {
 /// `LDP`/`STP`. Any `AddRI` left dead by the fold is removed by post-RA
 /// dead-def elimination. Fail-closed on a non-dominating/redefined root or an
 /// offset that would not stay encodable.
-fn resolve_ri_bases(func: &mut MachFunction, old: &[InstId], defs: &BlockDefs) -> bool {
+fn resolve_ri_bases(
+    func: &mut MachFunction,
+    old: &[InstId],
+    defs: &BlockDefs,
+    ownership: &HashMap<InstId, u8>,
+) -> bool {
     let mut changed = false;
     for (p, &id) in old.iter().enumerate() {
         let inst = func.inst(id);
-        if !matches!(inst.opcode, AArch64Opcode::LdrRI | AArch64Opcode::StrRI)
-            || inst.operands.len() != 3
-        {
+        if ownership.get(&id) != Some(&1) || !pairable_scalar(inst, func.next_vreg) {
             continue;
         }
         let (Some(data), Some(base), Some(off)) = (
@@ -466,7 +617,10 @@ fn resolve_ri_bases(func: &mut MachFunction, old: &[InstId], defs: &BlockDefs) -
         };
         // The AddRI must dominate this access (its unique def precedes it) and
         // `root` must be unchanged from the AddRI through the access.
-        if ab.pos >= p || defs.redefined_between(ab.root, ab.pos, p) {
+        if ab.pos >= p
+            || ownership.get(&old[ab.pos]) != Some(&1)
+            || defs.redefined_between(ab.root, ab.pos, p)
+        {
             continue;
         }
         let Some(new_off) = off.checked_add(ab.k) else {
@@ -484,9 +638,9 @@ fn resolve_ri_bases(func: &mut MachFunction, old: &[InstId], defs: &BlockDefs) -
 }
 
 /// How far the store-sink scan looks ahead for a consecutive partner store to
-/// fuse a `STR` into an `STP`. As with the load window, the scan halts at the
-/// first non-pure op (a store can be sunk only across memory-pure compute), so
-/// this is a linear bound, not the true reach.
+/// fuse a `STR` into an `STP`. The scan stops at the first motion barrier;
+/// GPR stores also cross same-base disjoint immediate stores. This bound keeps
+/// the scan linear regardless of the number of pure operations in a block.
 const STORE_SINK_WINDOW: usize = 24;
 
 /// Cross-store integer sink kill switch: `TCG_NO_MEM_PAIR_XSTORE=1` disables
@@ -496,176 +650,46 @@ fn xstore_sink_enabled() -> bool {
     std::env::var_os("TCG_NO_MEM_PAIR_XSTORE").is_none()
 }
 
-/// Function-wide single-def provenance maps for the GPR cross-store sink:
-/// vreg id -> defining instruction, and vreg id -> def count.
-type ProvMaps = (HashMap<u32, InstId>, HashMap<u32, usize>);
-
-/// Function-wide vreg definition maps (def instruction + def count), built
-/// with the full operand-role table so secondary defs count. Same shape as
-/// LICM's address-provenance prerequisite: a vreg is only traceable when it
-/// has EXACTLY ONE def in the whole function (its value is then that def's
-/// result at every use).
-fn function_def_maps(func: &MachFunction) -> ProvMaps {
-    let mut def_map: HashMap<u32, InstId> = HashMap::new();
-    let mut def_counts: HashMap<u32, usize> = HashMap::new();
-    for block in &func.blocks {
-        for &inst_id in &block.insts {
-            let inst = func.inst(inst_id);
-            aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| {
-                if let Some(v) = inst.operands[pos].as_vreg() {
-                    *def_counts.entry(v.id).or_insert(0) += 1;
-                    def_map.insert(v.id, inst_id);
-                }
-            });
-        }
-    }
-    (def_map, def_counts)
-}
-
-/// The GLOBAL SYMBOL a (64-bit) address register is derived from, traced
-/// through a bounded chain of single-def additive ops to a direct
-/// `AddPCRel dst, page, sym` root — or `None` when any hop is untraceable.
+/// True when a plain immediate gap store cannot overlap the sunk store's
+/// access. Both use the SAME full-width base value: the scan refuses every
+/// numeric-ID redefinition before reaching this operation. Checked static
+/// byte intervals are then disjoint without an object-origin assumption.
 ///
-/// This is the mem-pair instance of the object-provenance license LICM's
-/// [`addr_bases_disjoint`] already stakes ("distinct global symbols name
-/// distinct, non-overlapping link-time objects"): an access whose address is
-/// `sym_root (+ indices/immediates)` stays within `sym_root`'s object — the
-/// imported IR derives such addresses from `getelementptr inbounds` on that
-/// global (the importer preserves the flag; out-of-object indexing is UB in
-/// the source semantics), and trust-cg's own address formation never crosses
-/// objects. Two accesses rooted at DIFFERENT symbols therefore cannot
-/// overlap. Deliberately NARROWER than LICM's classifier in one respect: a
-/// bare `Adrp` (page-granular, no low add) is NOT accepted as a root — a
-/// page can host several objects, so page provenance proves nothing about
-/// object disjointness. Additive hops (`AddRR`/`AddRRShift`/`AddRI`) follow
-/// whichever operand classifies; if BOTH sides of an `AddRR` classify
-/// (pointer+pointer — nonsense as an object address) the trace refuses.
-/// Every traced vreg must be `Gpr64` (a narrowed copy of a pointer is not an
-/// address) and single-def function-wide. Depth-bounded, fail-closed.
-fn addpcrel_root_symbol(
-    func: &MachFunction,
-    def_map: &HashMap<u32, InstId>,
-    def_counts: &HashMap<u32, usize>,
-    v: VReg,
-    depth: u32,
-) -> Option<String> {
-    if depth == 0 || v.class != RegClass::Gpr64 {
-        return None;
+/// Different symbol spellings, additive roots and source `inbounds`/`noalias`
+/// claims do not authenticate distinct allocations at this stage. Register-
+/// offset, ordered, pair and write-back stores therefore fail this rule closed.
+fn provably_disjoint_gap_store(s: &MachInst, a_base: VReg, a_off: i64, a_size: i64) -> bool {
+    if !matches!(
+        s.opcode,
+        AArch64Opcode::StrRI | AArch64Opcode::StrbRI | AArch64Opcode::StrhRI
+    ) {
+        return false;
     }
-    if def_counts.get(&v.id).copied() != Some(1) {
-        return None;
-    }
-    let inst = func.inst(*def_map.get(&v.id)?);
-    // The def must define `v` at operand 0 (the additive/address ops below
-    // all do); a secondary-def producer (load pair, write-back...) is not a
-    // traceable address computation.
-    if inst.operands.first().and_then(|o| o.as_vreg()) != Some(v) {
-        return None;
-    }
-    match inst.opcode {
-        // `AddPCRel dst, page, sym` — the full symbol address root.
-        AArch64Opcode::AddPCRel => match inst.operands.get(2) {
-            Some(MachOperand::Symbol(s)) => Some(s.clone()),
-            _ => None,
-        },
-        AArch64Opcode::AddRI => {
-            let src = inst.operands.get(1)?.as_vreg()?;
-            addpcrel_root_symbol(func, def_map, def_counts, src, depth - 1)
-        }
-        AArch64Opcode::AddRR | AArch64Opcode::AddRRShift => {
-            let lhs = inst.operands.get(1)?.as_vreg()?;
-            let rhs = inst.operands.get(2)?.as_vreg()?;
-            let l = addpcrel_root_symbol(func, def_map, def_counts, lhs, depth - 1);
-            let r = addpcrel_root_symbol(func, def_map, def_counts, rhs, depth - 1);
-            match (l, r) {
-                (Some(s), None) | (None, Some(s)) => Some(s),
-                // Both classify (pointer+pointer) or neither: refuse.
-                _ => None,
-            }
-        }
-        AArch64Opcode::MovR => {
-            let src = inst.operands.get(1)?.as_vreg()?;
-            addpcrel_root_symbol(func, def_map, def_counts, src, depth - 1)
-        }
-        _ => None,
-    }
-}
-
-/// True when the gap store `s` provably CANNOT overlap the sunk store's
-/// access `[a_base + a_off, a_base + a_off + a_size)`, so delaying that write
-/// past `s` leaves the final memory state and every later read unchanged.
-/// Two rock-solid rules; anything else is `false` (the scan then halts):
-///
-/// 1. SAME base vreg, base+immediate store, byte ranges disjoint. The gap
-///    scan halts on any redefinition of the base, so both accesses read the
-///    same dynamic base value; distinct static ranges cannot overlap.
-/// 2. DISTINCT `AddPCRel` symbol roots ([`addpcrel_root_symbol`]): distinct
-///    link-time objects cannot overlap, whatever the indices.
-///
-/// Only plain scalar stores (`StrRI`/`StrbRI`/`StrhRI`/`StrRO`) are eligible
-/// as `s`: volatile/atomic/pair/write-back stores have distinct opcodes and
-/// order semantics beyond aliasing, so they never match and always halt.
-fn provably_disjoint_gap_store(
-    func: &MachFunction,
-    s: &MachInst,
-    a_base: VReg,
-    a_off: i64,
-    a_size: i64,
-    def_map: &HashMap<u32, InstId>,
-    def_counts: &HashMap<u32, usize>,
-) -> bool {
-    let s_base = match s.opcode {
-        AArch64Opcode::StrRI | AArch64Opcode::StrbRI | AArch64Opcode::StrhRI => {
-            let Some(base) = s.operands.get(1).and_then(|o| o.as_vreg()) else {
-                return false;
-            };
-            // Rule 1: same base vreg, disjoint immediate ranges.
-            if base == a_base {
-                let (Some(s_off), Some(s_size)) = (
-                    s.operands.get(2).and_then(|o| o.as_imm()),
-                    store_access_size(s),
-                ) else {
-                    return false;
-                };
-                let (Some(a_end), Some(s_end)) =
-                    (a_off.checked_add(a_size), s_off.checked_add(s_size))
-                else {
-                    return false;
-                };
-                return s_end <= a_off || a_end <= s_off;
-            }
-            base
-        }
-        // Register-offset store: [base + extended index] — provenance is the
-        // base's object (rule 2 only).
-        AArch64Opcode::StrRO => {
-            let Some(base) = s.operands.get(1).and_then(|o| o.as_vreg()) else {
-                return false;
-            };
-            base
-        }
-        _ => return false,
-    };
-    // Rule 2: distinct global-symbol roots.
-    let (Some(sym_s), Some(sym_a)) = (
-        addpcrel_root_symbol(func, def_map, def_counts, s_base, 4),
-        addpcrel_root_symbol(func, def_map, def_counts, a_base, 4),
-    ) else {
+    let [
+        MachOperand::VReg(_),
+        MachOperand::VReg(base),
+        MachOperand::Imm(s_off),
+    ] = s.operands.as_slice()
+    else {
         return false;
     };
-    sym_s != sym_a
+    if *base != a_base {
+        return false;
+    }
+    let Some(s_size) = store_access_size(s) else {
+        return false;
+    };
+    let (Some(a_end), Some(s_end)) = (a_off.checked_add(a_size), s_off.checked_add(s_size)) else {
+        return false;
+    };
+    s_end <= a_off || a_end <= *s_off
 }
 
-/// True if `inst` writes `v` through ANY def-role operand (operand-0 defs plus
-/// the secondary defs the role table knows about).
+/// A write through ANY modeled definition clobbers the numeric storage ID,
+/// including W/X views and secondary defs. Keep the shared role visitor
+/// authoritative instead of comparing exact typed carriers locally.
 fn inst_defs_vreg(inst: &MachInst, v: VReg) -> bool {
-    let mut hit = false;
-    aarch64_for_each_def_position(inst.opcode, inst.operands.len(), |pos| {
-        if inst.operands[pos].as_vreg() == Some(v) {
-            hit = true;
-        }
-    });
-    hit
+    inst_clobbers_vreg_id(inst, v.id)
 }
 
 /// Find a later `StrRI` at `j > i` (within the window, not consumed) that pairs
@@ -683,23 +707,19 @@ fn find_sink_store_partner(
     old: &[InstId],
     i: usize,
     consumed: &std::collections::HashSet<usize>,
-    prov: Option<&ProvMaps>,
+    gpr_sink_enabled: bool,
+    ownership: &HashMap<InstId, u8>,
 ) -> Option<(usize, MachInst)> {
     let a = func.inst(old[i]);
-    if a.opcode != AArch64Opcode::StrRI {
+    if a.opcode != AArch64Opcode::StrRI || ownership.get(&old[i]) != Some(&1) {
         return None; // loads use the windowed-hoist path; only StrRI sinks
     }
     let data = a.operands.first()?.as_vreg()?;
-    // FP: the complex-array write-back pattern (pure-compute gaps only).
-    // GPR: admitted only with the cross-store provenance maps (`prov`), whose
-    // disjointness proofs let the sink cross an intervening store — the
-    // adjacent-field struct write split by an unrelated store (Stanford/Towers
-    // `Move`'s push tail: `cellspace[el].next=;  stack[s]=;  cellspace[el]
-    // .discsize=` — the two field stores fuse to one STP so the next call's
-    // field LOADS forward from a single store-queue entry; split stores were
-    // the dominant measured defect in its 1.26x residual).
+    // FP keeps its pure-computation-gap behavior. GPR admission is a policy
+    // bit, not optional provenance: safe pure gaps and checked same-base
+    // disjoint ranges require no function-wide name-root maps.
     let is_fp = is_fp_class(data.class);
-    if !is_fp && prov.is_none() {
+    if !is_fp && !gpr_sink_enabled {
         return None;
     }
     let base = a.operands.get(1)?.as_vreg()?;
@@ -712,7 +732,7 @@ fn find_sink_store_partner(
         // is itself non-pure): the whole gap `(i, j)` already passed the
         // pure + no-clobber test in the earlier iterations.
         if !consumed.contains(&j)
-            && let Some(stp) = try_form_pair(a, inst_j)
+            && let Some(stp) = pair_at(func, old[i], inst_id, ownership)
         {
             return Some((j, stp));
         }
@@ -722,14 +742,16 @@ fn find_sink_store_partner(
         // and, crucially, NO trap: a trap that fires would abort before the sunk
         // store ran, so the delayed write must never cross one. The GPR path
         // additionally admits a PROVABLY-DISJOINT plain store in the gap
-        // (`provably_disjoint_gap_store` — same-base disjoint ranges or
-        // distinct `AddPCRel` symbol roots): delaying the sunk write past a
+        // (`provably_disjoint_gap_store` — SAME-base disjoint ranges only):
+        // delaying the sunk write past a
         // write it cannot overlap leaves every later read and the final
         // memory state unchanged.
-        let gap_ok = if is_removable(inst_j.opcode) {
+        let gap_ok = if !ordinary_metadata(inst_j) {
+            false
+        } else if is_removable(inst_j.opcode) {
             true
-        } else if let Some((def_map, def_counts)) = prov.filter(|_| !is_fp) {
-            provably_disjoint_gap_store(func, inst_j, base, a_off, a_size, def_map, def_counts)
+        } else if !is_fp {
+            provably_disjoint_gap_store(inst_j, base, a_off, a_size)
         } else {
             false
         };
@@ -740,24 +762,36 @@ fn find_sink_store_partner(
     None
 }
 
-fn run_mem_pair(func: &mut MachFunction) -> bool {
+fn run_mem_pair(func: &mut MachFunction, provenance: Option<&mut ProvenanceMap>) -> bool {
+    // Exact no-work prefilter: fold-back also requires one of these ordinary
+    // scalar accesses. Pure/no-admitted-access functions need no ownership or
+    // address-provenance census.
+    if !func
+        .block_order
+        .iter()
+        .flat_map(|id| func.block(*id).insts.iter())
+        .any(|&id| pairable_scalar(func.inst(id), func.next_vreg))
+    {
+        return false;
+    }
+    let ownership = candidate_ownership(func);
     let hazard_guard = crate::env_lock::var_os("TCG_NO_MEM_PAIR_HAZARD_GUARD").is_none();
     // `AddRI` base fold-back (folds `vB = add root,#k` bases onto `root`) plus
     // the loop-variant-base hazard exception it needs to let the resulting load
-    // pairs form. Disabling reverts this pass to byte-identical prior behavior.
-    let base_resolve = std::env::var_os("TCG_NO_MEM_PAIR_BASE_RESOLVE").is_none();
-    // Function-wide single-def provenance maps for the GPR cross-store sink
-    // (`TCG_NO_MEM_PAIR_XSTORE=1` reverts to the FP-only sink, byte-identical).
-    let prov_maps = xstore_sink_enabled().then(|| function_def_maps(func));
+    // pairs form.
+    // Capture GPR sink policy once. The admitted pure-gap and same-base range
+    // cases need no global definition maps or unqualified symbol-root facts.
+    // `TCG_NO_MEM_PAIR_XSTORE=1` retains the existing FP-only sink behavior.
+    let gpr_sink_enabled = xstore_sink_enabled();
     let mut changed = false;
+    let mut retired = Vec::new();
+    let mut merges = Vec::new();
     for block_id in func.block_order.clone() {
         let old = func.blocks[block_id.0 as usize].insts.clone();
         // Fold register-materialized bases back onto their root FIRST, so the
         // store-range collection and pairing scan below observe canonical bases.
-        let defs = base_resolve.then(|| analyze_block_defs(func, &old));
-        if let Some(defs) = &defs
-            && resolve_ri_bases(func, &old, defs)
-        {
+        let defs = analyze_block_defs(func, &old);
+        if resolve_ri_bases(func, &old, &defs, &ownership) {
             changed = true;
         }
         // Same-base store byte-ranges in this block; used to veto LOAD-pair
@@ -778,22 +812,27 @@ fn run_mem_pair(func: &mut MachFunction) -> bool {
                 .and_then(|o| o.as_vreg())
                 .is_some_and(|d| is_fp_class(d.class));
             is_fp
-                && defs
-                    .as_ref()
-                    .zip(pair.operands.get(2).and_then(|o| o.as_vreg()))
-                    .is_some_and(|(d, base)| d.is_block_local(base))
+                && pair
+                    .operands
+                    .get(2)
+                    .and_then(|o| o.as_vreg())
+                    .is_some_and(|base| defs.is_block_local(base))
         };
         let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // Store-sink landings: `pending_stp[j]` is the `STP` that replaces the
         // partner store at position `j`, absorbing an earlier store sunk down to
         // it. Emitted when the scan reaches `j` (checked before `consumed`).
-        let mut pending_stp: std::collections::HashMap<usize, MachInst> =
+        let mut pending_stp: std::collections::HashMap<usize, (MachInst, [InstId; 2])> =
             std::collections::HashMap::new();
         let mut new_insts = Vec::with_capacity(old.len());
         for i in 0..old.len() {
-            if let Some(stp) = pending_stp.remove(&i) {
+            if let Some((stp, sources)) = pending_stp.remove(&i) {
                 let id = func.push_inst(stp);
                 new_insts.push(id);
+                retired.extend(sources);
+                if provenance.is_some() {
+                    merges.push((sources, id));
+                }
                 changed = true;
                 continue; // a sunk store pair lands here
             }
@@ -802,26 +841,35 @@ fn run_mem_pair(func: &mut MachFunction) -> bool {
             }
             // 1) Strictly-adjacent fusion (loads OR stores): zero instructions
             // between, so trivially safe.
-            if i + 1 < old.len() && !consumed.contains(&(i + 1)) {
-                let a = func.inst(old[i]).clone();
-                let b = func.inst(old[i + 1]).clone();
-                if let Some(pair) = try_form_pair(&a, &b)
-                    && !load_pair_store_hazard(&pair, &store_ranges, i, base_is_block_local(&pair))
-                {
-                    let id = func.push_inst(pair);
-                    new_insts.push(id);
-                    consumed.insert(i + 1);
-                    changed = true;
-                    continue;
-                }
-            }
-            // 2) Windowed LOAD fusion: hoist a later same-base consecutive load
-            // up to `i` when the whole gap is hoist-safe.
-            if let Some((j, pair)) = find_windowed_load_partner(func, &old, i, &consumed)
+            if i + 1 < old.len()
+                && !consumed.contains(&(i + 1))
+                && let Some(pair) = pair_at(func, old[i], old[i + 1], &ownership)
                 && !load_pair_store_hazard(&pair, &store_ranges, i, base_is_block_local(&pair))
             {
                 let id = func.push_inst(pair);
                 new_insts.push(id);
+                let sources = [old[i], old[i + 1]];
+                retired.extend(sources);
+                if provenance.is_some() {
+                    merges.push((sources, id));
+                }
+                consumed.insert(i + 1);
+                changed = true;
+                continue;
+            }
+            // 2) Windowed LOAD fusion: hoist a later same-base consecutive load
+            // up to `i` when the whole gap is hoist-safe.
+            if let Some((j, pair)) =
+                find_windowed_load_partner(func, &old, i, &consumed, &ownership)
+                && !load_pair_store_hazard(&pair, &store_ranges, i, base_is_block_local(&pair))
+            {
+                let id = func.push_inst(pair);
+                new_insts.push(id);
+                let sources = [old[i], old[j]];
+                retired.extend(sources);
+                if provenance.is_some() {
+                    merges.push((sources, id));
+                }
                 consumed.insert(j);
                 changed = true;
                 continue;
@@ -831,11 +879,10 @@ fn run_mem_pair(func: &mut MachFunction) -> bool {
             // at the partner's position (`pending_stp`), so drop `old[i]` here.
             // Gated with the base fold-back it complements (butterfly write-back
             // pairing). Load hazard guard is irrelevant to store pairs.
-            if base_resolve
-                && let Some((j, stp)) =
-                    find_sink_store_partner(func, &old, i, &consumed, prov_maps.as_ref())
+            if let Some((j, stp)) =
+                find_sink_store_partner(func, &old, i, &consumed, gpr_sink_enabled, &ownership)
             {
-                pending_stp.insert(j, stp);
+                pending_stp.insert(j, (stp, [old[i], old[j]]));
                 consumed.insert(j);
                 changed = true;
                 continue;
@@ -844,8 +891,36 @@ fn run_mem_pair(func: &mut MachFunction) -> bool {
         }
         func.blocks[block_id.0 as usize].insts = new_insts;
     }
+    // Only IDs actually replaced by this run are candidates. The shared
+    // helper checks EVERY remaining block reference before making a stable
+    // arena slot inert; unrelated or still-linked instructions stay intact.
+    crate::retirement::retire_unlinked_before(func, &retired, |unlinked| {
+        if let Some(provenance) = provenance {
+            let pass = PassId::new("mem-pair-formation");
+            for (sources, merged) in merges {
+                let (consumed, live): (&[InstId], &[InstId]) = match (
+                    unlinked.contains(&sources[0]),
+                    unlinked.contains(&sources[1]),
+                ) {
+                    (true, true) => (&sources, &[]),
+                    (true, false) => (&sources[..1], &sources[1..]),
+                    (false, true) => (&sources[1..], &sources[..1]),
+                    (false, false) => (&[], &sources),
+                };
+                if live.is_empty() {
+                    provenance.record_merge(consumed, merged, pass.clone());
+                } else {
+                    provenance.record_merge_with_live_sources(consumed, live, merged, pass.clone());
+                }
+            }
+        }
+    });
     changed
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "mem_pair_retirement_tests.rs"]
+mod retirement_tests;

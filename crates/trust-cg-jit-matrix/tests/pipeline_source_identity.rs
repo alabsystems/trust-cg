@@ -103,14 +103,26 @@ fn closure_names_every_machine_code_pipeline_crate() {
     );
     assert_eq!(CLEAN_PIPELINE_CRATES, ["clean-kernel"]);
 
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("Cargo's current source package");
     let workspace_root = manifest_dir
-        .parent()
-        .and_then(std::path::Path::parent)
-        .unwrap();
+        .ancestors()
+        .take(5)
+        .find(|root| {
+            root.join("crates/trust-cg-jit-matrix/src/pipeline_source_identity.rs")
+                .is_file()
+        })
+        .expect("the original CG source workspace");
     let production = compute_pipeline_source_identity(workspace_root)
         .expect("the production closure must be complete and readable");
     assert_eq!(production.hex.len(), 64);
+    assert!(
+        production
+            .hashed_relative_paths
+            .iter()
+            .any(|path| { path == "crates/trust-cg-jit-matrix/src/pipeline_watch_plan.rs" })
+    );
     assert!(
         production
             .hashed_relative_paths
@@ -170,4 +182,116 @@ fn missing_required_root_fails_closed() {
     )
     .expect_err("missing source root must abort identity construction");
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn recursive_watch_roots_cover_sources_without_repeated_descendants() {
+    let root = fixture();
+    let identity = compute_source_identity(
+        root.path(),
+        &[PathBuf::from("crate/src"), PathBuf::from("assets")],
+        &[
+            PathBuf::from("crate/Cargo.toml"),
+            PathBuf::from("Cargo.lock"),
+        ],
+    )
+    .unwrap();
+    let mut expected = ["crate/src", "assets", "crate/Cargo.toml", "Cargo.lock"]
+        .map(|path| root.path().join(path))
+        .to_vec();
+    expected.sort();
+    assert_eq!(identity.watched_paths, expected);
+    assert_eq!(
+        identity.hashed_relative_paths,
+        [
+            "Cargo.lock",
+            "assets/verdict.vdb",
+            "crate/Cargo.toml",
+            "crate/src/lib.rs",
+            "crate/src/nested/lower.rs",
+        ]
+    );
+}
+
+#[test]
+fn similar_names_and_parent_components_keep_their_own_declarations() {
+    let root = fixture();
+    fs::create_dir(root.path().join("crate-other")).unwrap();
+    fs::write(root.path().join("crate-other/data"), "separate\n").unwrap();
+    let identity = compute_source_identity(
+        root.path(),
+        &[PathBuf::from("crate")],
+        &[
+            PathBuf::from("crate/src/../Cargo.toml"),
+            PathBuf::from("crate-other/data"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(identity.watched_paths.len(), 3);
+    for path in ["crate", "crate/src/../Cargo.toml", "crate-other/data"] {
+        assert!(identity.watched_paths.contains(&root.path().join(path)));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_roots_keep_explicit_descendants_and_nested_links_still_refuse() {
+    let root = fixture();
+    let link = root.path().join("linked-src");
+    std::os::unix::fs::symlink("crate/src", &link).unwrap();
+    let identity =
+        compute_source_identity(root.path(), &[PathBuf::from("linked-src")], &[]).unwrap();
+    assert!(identity.watched_paths.contains(&link));
+    assert!(identity.watched_paths.contains(&link.join("lib.rs")));
+    assert!(identity.watched_paths.contains(&link.join("nested")));
+    // The plain nested directory covers only its own descendant.
+    assert!(
+        !identity
+            .watched_paths
+            .contains(&link.join("nested/lower.rs"))
+    );
+    std::os::unix::fs::symlink("lib.rs", root.path().join("crate/src/alias.rs")).unwrap();
+    assert_eq!(
+        compute_source_identity(root.path(), &[PathBuf::from("linked-src")], &[])
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData,
+    );
+}
+
+#[test]
+fn crate_root_watch_observes_a_new_optional_build_script() {
+    let world = tempfile::tempdir().unwrap();
+    let root = world.path().join("cg");
+    for name in PIPELINE_CRATES {
+        let crate_root = root.join("crates").join(name);
+        fs::create_dir_all(crate_root.join("src")).unwrap();
+        fs::write(crate_root.join("src/lib.rs"), "// fixture source\n").unwrap();
+        fs::write(crate_root.join("Cargo.toml"), "// fixture manifest\n").unwrap();
+    }
+    for path in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "third_party/vendor/drat-trim/drat-trim.c",
+        "crates/trust-cg-verify/verdict_db/fixture.vdb",
+        "crates/trust-cg-verify/lrat_fixtures/fixture.lrat",
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "fixture\n").unwrap();
+    }
+    let before = compute_pipeline_source_identity(&root).unwrap();
+    let build = root.join("crates/trust-cg-opt/build.rs");
+    fs::write(&build, "fn main() {}\n").unwrap();
+    let after = compute_pipeline_source_identity(&root).unwrap();
+    assert_ne!(before.hex, after.hex);
+    assert_eq!(before.watched_paths, after.watched_paths);
+    assert!(
+        after
+            .watched_paths
+            .contains(&root.join("crates/trust-cg-opt"))
+    );
+    assert!(!after.watched_paths.contains(&build));
+    fs::remove_file(build).unwrap();
+    assert_eq!(before, compute_pipeline_source_identity(&root).unwrap());
 }

@@ -46,8 +46,8 @@
 //       off-by-one; the model's `field_downcast_same_key` documents it.
 
 use crate::{
-    resolve_place_kernel, BindingFlags, DerefTarget, DerefTargetKind, FieldTag, ProjShape,
-    RejectReason, Resolution,
+    BindingFlags, DerefTarget, DerefTargetKind, FieldTag, ProjShape, RejectReason, Resolution,
+    resolve_place_kernel,
 };
 
 // -----------------------------------------------------------------------------

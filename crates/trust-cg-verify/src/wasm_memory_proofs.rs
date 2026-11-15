@@ -42,11 +42,19 @@
 //!
 //! NOT yet covered (documented next slice): refinement against a trust-ir memory
 //! SMT encoder (none exists in `trust_ir_semantics` yet), aliasing against a
-//! symbolic prior memory (needs a free array-sort input), the shadow-stack
-//! frame offset arithmetic, and the non-zero `memarg` static offset (every
-//! obligation here and in `wasm_value_domain` models offset 0, matching the
-//! current lowering). `memory.size`/`memory.grow` and data segments are NAMED
-//! deferrals — see `wasm_value_domain::WASM_VALUE_DOMAIN_DEFERRALS`.
+//! symbolic prior memory (needs a free array-sort input), and the shadow-stack
+//! frame offset arithmetic. The obligations HERE model a zero `memarg` static
+//! offset; the lowering also emits nonzero offsets (struct fields, enum tags
+//! and lanes, the high half of a 128-bit value, sret slots, parameter / return
+//! lanes), whose meaning — the access at `(base, offset)` is the trust-ir
+//! access at `base + offset`, with the spec's no-wrap effective address — is
+//! stated over a symbolic offset by `wasm_value_domain`'s offset obligations.
+//! Whether an emitted offset is the trust-ir layout offset of its field is
+//! checked for struct field reads and writes by `wasm_memarg_offset_proofs`
+//! (decoded offsets of a captured module against the declared layout); every
+//! other nonzero-offset site rests on the lane differentials.
+//! `memory.size`/`memory.grow` and data segments are NAMED deferrals — see
+//! `wasm_value_domain::WASM_VALUE_DOMAIN_DEFERRALS`.
 
 use crate::lowering_proof::ProofObligation;
 use crate::smt::SmtExpr;

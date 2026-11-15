@@ -132,7 +132,8 @@
 //! the sequential tail is proven in
 //! `trust-cg-verify/src/reduction_split_proofs.rs`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{ExitPlan, Handoff, LoopLocality};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -212,37 +213,11 @@ impl ReductionSplit {
             .cloned()
             .collect();
 
-        let dump = std::env::var("TRUST_CG_DUMP_REDSPLIT").is_ok();
-
         let mut changed = false;
         for lp in &innermost {
-            match recognize(func, lp) {
-                Some(plan) => {
-                    if dump {
-                        let mode = match plan.mode {
-                            SplitMode::Constant => "constant".to_string(),
-                            SplitMode::Runtime { limit, cc } => {
-                                format!("runtime(limit={limit:?},cc={cc})")
-                            }
-                        };
-                        eprintln!(
-                            "[redsplit] FIRE fn={} header={:?} op={:?} mode={} acc={:?} iv={:?}",
-                            func.name, lp.header, plan.combine_op, mode, plan.acc, plan.iv
-                        );
-                    }
-                    apply(func, &plan, provenance.as_deref_mut());
-                    if dump {
-                        eprintln!("[redsplit] POST-TRANSFORM fn={}", func.name);
-                        dump_all(func);
-                    }
-                    changed = true;
-                }
-                None => {
-                    if dump {
-                        eprintln!("[redsplit] BAIL fn={} header={:?}", func.name, lp.header);
-                        dump_loop(func, lp);
-                    }
-                }
+            if let Some(plan) = recognize(func, lp) {
+                apply(func, &plan, provenance.as_deref_mut());
+                changed = true;
             }
         }
         changed
@@ -319,7 +294,6 @@ impl ClosedFormReduction {
             .filter(|lp| !all_loops.iter().any(|o| o.parent == Some(lp.header)))
             .cloned()
             .collect();
-        let dump = std::env::var("TRUST_CG_DUMP_CLOSEDFORM").is_ok();
 
         let mut changed = false;
         // Only the FIRST recognized loop per function is closed-form-rewritten
@@ -329,33 +303,10 @@ impl ClosedFormReduction {
         // common single-loop kernels; a second independent loop is picked up on
         // the next iteration (O3) or by ReductionSplit (O2).
         for lp in &innermost {
-            match recognize_closed_form(func, lp) {
-                Some(cf) => {
-                    if dump {
-                        eprintln!(
-                            "[closedform] FIRE fn={} header={:?} poly=(a2={},a1={},a0={}) start={} cc={}",
-                            func.name,
-                            lp.header,
-                            cf.poly.a2,
-                            cf.poly.a1,
-                            cf.poly.a0,
-                            cf.start,
-                            cf.cc
-                        );
-                    }
-                    apply_closed_form(func, &cf, provenance.as_deref_mut());
-                    if dump {
-                        eprintln!("[closedform] POST-TRANSFORM fn={}", func.name);
-                        dump_all(func);
-                    }
-                    changed = true;
-                    break;
-                }
-                None => {
-                    if dump {
-                        eprintln!("[closedform] BAIL fn={} header={:?}", func.name, lp.header);
-                    }
-                }
+            if let Some(cf) = recognize_closed_form(func, lp) {
+                apply_closed_form(func, &cf, provenance.as_deref_mut());
+                changed = true;
+                break;
             }
         }
         changed
@@ -462,6 +413,9 @@ struct SplitPlan {
     /// (clone-with-`iv→i+k`) exactly as the original transform did. See
     /// `analyze_poly_term`.
     poly: Option<PolyTermPlan>,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv, acc]`. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +505,7 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
         let def = latch_unique_def(func, latch, src)?;
         let def_inst = func.inst(def);
         // IV: src = AddRR(dst, c=1) or AddRI(dst, #1).
-        if let Some(step) = increment_step(func, lp, def_inst, dst) {
+        if let Some(step) = increment_step(func, def_inst, dst) {
             if step != 1 {
                 return None; // only +1 IV supported (idempotence + f(i+k) indexing)
             }
@@ -623,8 +577,8 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
     // start = 0); this keeps parity with the constant path and is a harmless
     // conservative gate for the runtime path (correctness does not depend on the
     // concrete start value — see the RUNTIME section of the module docs).
-    let start = resolve_const(func, lp, iv_init_source(func, preheader, iv)?)?;
-    let (limit_kind, cc) = validate_header(func, header, iv, latch, exit, lp)?;
+    let start = resolve_const(func, iv_init_source(func, preheader, iv)?)?;
+    let (limit_kind, cc) = validate_header(func, header, iv, latch, exit)?;
 
     // -- `acc` read nowhere in the body except the reduction. --
     for &bid in &[header, latch] {
@@ -665,7 +619,7 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
     // Closed-world check: each term inst is a value producer reading only
     // {iv, loop-invariants, earlier term defs}.
     let body_defs = collect_body_defs(func, lp);
-    let mut term_defs: HashSet<VReg> = HashSet::new();
+    let mut term_defs: HashSet<VReg> = HashSet::default();
     for &iid in &term_insts {
         let inst = func.inst(iid);
         let def = simple_term_def(inst)?;
@@ -730,12 +684,28 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
     // multiplies. `None` ⇒ no reducible multiply; emit the term verbatim.
     let poly = match red_kind {
         RedKind::Assoc(_) => {
-            analyze_poly_term(func, lp, &term_insts, &red_inputs, iv, &body_defs, start)
+            analyze_poly_term(func, &term_insts, &red_inputs, iv, &body_defs, start)
         }
         RedKind::Madd => None,
     };
 
+    // LOOP STATE (`crate::loop_contract`): the split loop runs only
+    // iterations the header's test continues, and the loop may leave by no
+    // other exit. The split loop, its combine and its tail reproduce `iv` and
+    // `acc` (the exit's reads of `acc` are rewired to the combined value). No
+    // other register the loop writes may be live into the header or the exit.
+    let locality = LoopLocality::check(
+        func,
+        lp.body.iter().copied(),
+        header,
+        &ExitPlan::loop_test(header, exit),
+        Handoff::HeaderOrExit,
+        &[iv, acc],
+    )
+    .ok()?;
+
     Some(SplitPlan {
+        _locality: locality,
         header,
         latch,
         preheader,
@@ -761,12 +731,7 @@ fn recognize(func: &MachFunction, lp: &NaturalLoop) -> Option<SplitPlan> {
 
 /// If `def_inst` computes `dst + const` (via `AddRR(dst, c)` with `c` a
 /// loop-invariant constant, or `AddRI(dst, #imm)`), return the step.
-fn increment_step(
-    func: &MachFunction,
-    lp: &NaturalLoop,
-    def_inst: &MachInst,
-    dst: VReg,
-) -> Option<i64> {
+fn increment_step(func: &MachFunction, def_inst: &MachInst, dst: VReg) -> Option<i64> {
     match def_inst.opcode {
         AArch64Opcode::AddRI => {
             if def_inst.operands.len() >= 3
@@ -784,12 +749,12 @@ fn increment_step(
                 if a == Some(dst)
                     && let Some(r) = b
                 {
-                    return resolve_const(func, lp, r);
+                    return resolve_const(func, r);
                 }
                 if b == Some(dst)
                     && let Some(r) = a
                 {
-                    return resolve_const(func, lp, r);
+                    return resolve_const(func, r);
                 }
             }
             None
@@ -827,7 +792,6 @@ fn validate_header(
     iv: VReg,
     latch: BlockId,
     exit: BlockId,
-    lp: &NaturalLoop,
 ) -> Option<(LimitKind, i64)> {
     let insts = &func.block(header).insts;
     if insts.len() != 3 {
@@ -851,7 +815,7 @@ fn validate_header(
                 return None;
             }
             let r = cmp.operands.get(1)?.as_vreg()?;
-            match resolve_const(func, lp, r) {
+            match resolve_const(func, r) {
                 Some(c) => LimitKind::Const(c),
                 None => LimitKind::Runtime(r),
             }
@@ -924,50 +888,36 @@ fn rewrite_vreg_uses(inst: &mut MachInst, old: VReg, new: VReg) {
     });
 }
 
-/// Resolve a vreg to a constant by folding the `Movz` / `Movk` / `MovI`
-/// sequence that defines it in blocks OUTSIDE the loop body.
-fn resolve_const(func: &MachFunction, lp: &NaturalLoop, v: VReg) -> Option<i64> {
-    let mut val: Option<u64> = None;
-    let mut saw_def = false;
-    for &bid in &func.block_order {
-        if lp.body.contains(&bid) {
-            continue;
-        }
-        for &iid in &func.block(bid).insts {
-            let inst = func.inst(iid);
-            if !inst_defines_vreg(inst, v) {
-                continue;
+/// Resolve a vreg to the constant it holds on EVERY path: every instruction in
+/// the emitted layout that writes its id (any register class, in the loop or
+/// not) materializes that same constant, either as `MovI` or as a `Movz` run
+/// patched by the `Movk`s right after it
+/// ([`crate::mach_util::materialized_runs_value`]).
+///
+/// The machine IR is not SSA: a start, limit or term operand written on
+/// several paths (a phi of constants, the per-exit-edge writes of an unrolled
+/// search) holds a different constant on each, and folding its defs in layout
+/// order would bake the layout-last one into the rewrite.
+fn resolve_const(func: &MachFunction, v: VReg) -> Option<i64> {
+    let sites = crate::mach_util::live_def_sites(func, v.id);
+    if sites
+        .iter()
+        .all(|site| func.inst(site.inst).opcode == AArch64Opcode::MovI)
+    {
+        let mut agreed: Option<i64> = None;
+        for site in &sites {
+            let inst = func.inst(site.inst);
+            if inst.operands.len() != 2 || inst.operands[0].as_vreg() != Some(v) {
+                return None;
             }
-            match inst.opcode {
-                AArch64Opcode::MovI if inst.operands.len() == 2 => {
-                    val = Some(inst.operands.get(1)?.as_imm()? as u64);
-                    saw_def = true;
-                }
-                AArch64Opcode::Movz => {
-                    let (dst, value) = crate::reaching_const::movz_value(inst)?;
-                    if dst != v {
-                        return None;
-                    }
-                    val = Some(value);
-                    saw_def = true;
-                }
-                AArch64Opcode::Movk => {
-                    let (dst, imm, shift) = crate::reaching_const::parse_move_wide_inst(inst)?;
-                    if dst != v {
-                        return None;
-                    }
-                    let cur = val?;
-                    val = Some((cur & !(0xFFFFu64 << shift)) | (imm << shift));
-                    saw_def = true;
-                }
-                _ => {
-                    // Some other definition of `v` — cannot resolve to a constant.
-                    return None;
-                }
+            let k = inst.operands[1].as_imm()?;
+            if agreed.replace(k).is_some_and(|seen| seen != k) {
+                return None;
             }
         }
+        return agreed;
     }
-    if saw_def { Some(val? as i64) } else { None }
+    crate::mach_util::materialized_runs_value(func, v, &sites).map(|value| value as i64)
 }
 
 /// The unique value-producing instruction in `block` that defines `v`, if
@@ -999,7 +949,7 @@ fn count_defs_in_block(func: &MachFunction, block: BlockId, v: VReg) -> usize {
 
 /// The set of vregs defined at any modeled def position in `block`.
 fn block_value_defs(func: &MachFunction, block: BlockId) -> HashSet<VReg> {
-    let mut defs = HashSet::new();
+    let mut defs = HashSet::default();
     for &iid in &func.block(block).insts {
         let inst = func.inst(iid);
         for_each_inst_def(inst, |v| {
@@ -1011,7 +961,7 @@ fn block_value_defs(func: &MachFunction, block: BlockId) -> HashSet<VReg> {
 
 /// All vregs defined inside the loop body.
 fn collect_body_defs(func: &MachFunction, lp: &NaturalLoop) -> HashSet<VReg> {
-    let mut defs = HashSet::new();
+    let mut defs = HashSet::default();
     for &bid in &func.block_order {
         if !lp.body.contains(&bid) {
             continue;
@@ -1209,7 +1159,6 @@ fn mask_to_width(v: i128, w: u32) -> u64 {
 /// caller, which needs the full degree-2 result (`i*i`).
 fn inst_poly_core(
     func: &MachFunction,
-    lp: &NaturalLoop,
     inst: &MachInst,
     iv: VReg,
     coeffs: &HashMap<VReg, Poly>,
@@ -1225,7 +1174,7 @@ fn inst_poly_core(
         }
         // A loop-invariant that resolves to a constant is a degree-0 polynomial.
         if !body_defs.contains(&v)
-            && let Some(c) = resolve_const(func, lp, v)
+            && let Some(c) = resolve_const(func, v)
         {
             return Some(Poly::constant(c as i128));
         }
@@ -1247,13 +1196,12 @@ fn inst_poly_core(
 /// which deliberately leaves `i*i` as a real multiply (see below).
 fn inst_poly(
     func: &MachFunction,
-    lp: &NaturalLoop,
     inst: &MachInst,
     iv: VReg,
     coeffs: &HashMap<VReg, Poly>,
     body_defs: &HashSet<VReg>,
 ) -> Option<Poly> {
-    let result = inst_poly_core(func, lp, inst, iv, coeffs, body_defs)?;
+    let result = inst_poly_core(func, inst, iv, coeffs, body_defs)?;
     // DEGREE CAP: only affine (degree ≤ 1) polynomials are strength-reduced.
     // A quadratic like `i*i` is left OPAQUE — emitted as a real multiply of the
     // per-lane index `i+k`, exactly as clang does (clang keeps the `i*i`
@@ -1271,21 +1219,20 @@ fn inst_poly(
 /// `Some` only when at least one `MulRR` becomes a recurrence.
 fn analyze_poly_term(
     func: &MachFunction,
-    lp: &NaturalLoop,
     term_insts: &[InstId],
     red_inputs: &[VReg],
     iv: VReg,
     body_defs: &HashSet<VReg>,
     _start: i64,
 ) -> Option<PolyTermPlan> {
-    let mut coeffs: HashMap<VReg, Poly> = HashMap::new();
+    let mut coeffs: HashMap<VReg, Poly> = HashMap::default();
     coeffs.insert(iv, Poly::iv());
 
     let mut muls_eliminated = 0usize;
     for &tid in term_insts {
         let inst = func.inst(tid);
         let def = inst.operands.first().and_then(|o| o.as_vreg())?;
-        if let Some(p) = inst_poly(func, lp, inst, iv, &coeffs, body_defs) {
+        if let Some(p) = inst_poly(func, inst, iv, &coeffs, body_defs) {
             coeffs.insert(def, p);
             if inst.opcode == AArch64Opcode::MulRR {
                 muls_eliminated += 1;
@@ -1299,7 +1246,7 @@ fn analyze_poly_term(
     // Boundaries: polynomial values consumed by an opaque term-inst, or used as
     // a reduction input.
     let mut boundaries: Vec<VReg> = Vec::new();
-    let mut seen: HashSet<VReg> = HashSet::new();
+    let mut seen: HashSet<VReg> = HashSet::default();
     for &tid in term_insts {
         let inst = func.inst(tid);
         let def = inst.operands.first().and_then(|o| o.as_vreg())?;
@@ -1395,7 +1342,7 @@ fn emit_sr_lane_term(
     let mut body: Vec<InstId> = Vec::new();
     // term-def -> this lane's value vreg (opaque defs get fresh vregs; boundary
     // polynomials map to their per-lane recurrence value).
-    let mut map: HashMap<VReg, VReg> = HashMap::new();
+    let mut map: HashMap<VReg, VReg> = HashMap::default();
 
     for &tid in &plan.term_insts {
         let (opcode, operands, def) = {
@@ -1551,10 +1498,10 @@ fn build_sr_main_latch(
     let start = plan.start as i128;
     let preheader = plan.preheader;
     // Loop-invariant constant cache (only used for offsets/steps > 4095).
-    let mut cache: HashMap<(u64, RegClass), VReg> = HashMap::new();
+    let mut cache: HashMap<(u64, RegClass), VReg> = HashMap::default();
 
     // --- Phase A: seed each (non-IV) affine boundary's base value `v = L(start)`.
-    let mut engines: HashMap<VReg, BoundaryEngine> = HashMap::new();
+    let mut engines: HashMap<VReg, BoundaryEngine> = HashMap::default();
     for &b in &pp.boundaries {
         if b == iv {
             continue; // the IV is handled as `i+k`, not a recurrence.
@@ -1597,7 +1544,7 @@ fn build_sr_main_latch(
 
     // Per-boundary per-lane value vregs. For the IV boundary: `i+k` (lane 0 = the
     // IV itself). For an affine engine: `v + a1·k`.
-    let mut lane_values: HashMap<VReg, Vec<VReg>> = HashMap::new();
+    let mut lane_values: HashMap<VReg, Vec<VReg>> = HashMap::default();
     for &b in &pp.boundaries {
         let mut vals: Vec<VReg> = Vec::with_capacity(n);
         if b == iv {
@@ -1649,7 +1596,7 @@ fn build_sr_main_latch(
 
     // Lane bodies: opaque term + reduction, reading the per-lane values.
     for k in 0..n {
-        let mut lane_map: HashMap<VReg, VReg> = HashMap::new();
+        let mut lane_map: HashMap<VReg, VReg> = HashMap::default();
         for &b in &pp.boundaries {
             lane_map.insert(b, lane_values[&b][k]);
         }
@@ -1806,7 +1753,7 @@ fn apply_constant(
         synthesized.push(inc);
 
         // Clone the term computation with rename {iv -> i_pk, def -> fresh}.
-        let mut rename: HashMap<VReg, VReg> = HashMap::new();
+        let mut rename: HashMap<VReg, VReg> = HashMap::default();
         rename.insert(plan.iv, i_pk);
         for &tid in &plan.term_insts {
             let (opcode, operands, def) = {
@@ -1992,7 +1939,7 @@ fn apply_runtime(
             new_latch_insts.push(inc);
             synthesized.push(inc);
 
-            let mut rename: HashMap<VReg, VReg> = HashMap::new();
+            let mut rename: HashMap<VReg, VReg> = HashMap::default();
             rename.insert(plan.iv, i_pk);
             let cloned = clone_term(func, &plan.term_insts, &mut rename, src_loc);
             for &cid in &cloned {
@@ -2100,7 +2047,7 @@ fn apply_runtime(
         synthesized.push(bbody);
 
         // body: <term(iv)> ; acc_final = op(acc_final, term) ; iv += 1 ; B next
-        let mut rename: HashMap<VReg, VReg> = HashMap::new(); // iv maps to itself
+        let mut rename: HashMap<VReg, VReg> = HashMap::default(); // iv maps to itself
         let cloned = clone_term(func, &plan.term_insts, &mut rename, src_loc);
         for &cid in &cloned {
             func.append_inst(body, cid);
@@ -2242,7 +2189,7 @@ fn apply_runtime(
     //     combine (reads acc0..N-1), and the tail blocks (use acc_final by
     //     construction) are excluded; every other read of acc0 is a liveout and
     //     becomes acc_final, which after the tail holds the fully-reduced value.
-    let mut exclude: HashSet<BlockId> = HashSet::new();
+    let mut exclude: HashSet<BlockId> = HashSet::default();
     exclude.insert(plan.preheader);
     exclude.insert(plan.header);
     exclude.insert(plan.latch);
@@ -2523,47 +2470,6 @@ fn insert_before_terminator(func: &mut MachFunction, block: BlockId, inst_id: In
 }
 
 // ---------------------------------------------------------------------------
-// Debug dump
-// ---------------------------------------------------------------------------
-
-fn dump_all(func: &MachFunction) {
-    for &bid in &func.block_order {
-        eprintln!(
-            "  block {:?} preds={:?} succs={:?}",
-            bid,
-            func.block(bid).preds,
-            func.block(bid).succs
-        );
-        for &iid in &func.block(bid).insts {
-            eprintln!("    {:?}", func.inst(iid));
-        }
-    }
-}
-
-fn dump_loop(func: &MachFunction, lp: &NaturalLoop) {
-    eprintln!(
-        "  loop header={:?} latch={:?} preheader={:?} body={:?}",
-        lp.header, lp.latch, lp.preheader, lp.body
-    );
-    let mut blocks: Vec<BlockId> = lp.body.iter().copied().collect();
-    if let Some(ph) = lp.preheader {
-        blocks.push(ph);
-    }
-    blocks.sort_by_key(|b| b.0);
-    for bid in blocks {
-        eprintln!(
-            "  block {:?} preds={:?} succs={:?}",
-            bid,
-            func.block(bid).preds,
-            func.block(bid).succs
-        );
-        for &iid in &func.block(bid).insts {
-            eprintln!("    {:?}", func.inst(iid));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Closed-form (Faulhaber) recognizer + rewrite
 // ---------------------------------------------------------------------------
 
@@ -2601,6 +2507,9 @@ struct ClosedForm {
     reduction_inst: InstId,
     /// Source location carried onto the synthesized closed-form code.
     src_loc: Option<SourceLoc>,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[acc]`, handing off only at the exit. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 /// Recognize a loop the closed-form rewrite can DELETE. This is a SELF-CONTAINED
@@ -2739,7 +2648,7 @@ fn recognize_closed_form(func: &MachFunction, lp: &NaturalLoop) -> Option<Closed
 
     // IV: its writeback source is `iv + 1`.
     let iv_inc_inst = latch_unique_def(func, latch, iv_next)?;
-    if increment_step(func, lp, func.inst(iv_inc_inst), iv) != Some(1) {
+    if increment_step(func, func.inst(iv_inc_inst), iv) != Some(1) {
         return None;
     }
 
@@ -2798,7 +2707,7 @@ fn recognize_closed_form(func: &MachFunction, lp: &NaturalLoop) -> Option<Closed
     }
 
     // -- Constant, non-negative start. --
-    let start = resolve_const(func, lp, iv_init_source(func, preheader, iv)?)?;
+    let start = resolve_const(func, iv_init_source(func, preheader, iv)?)?;
     if start < 0 {
         return None;
     }
@@ -2811,7 +2720,7 @@ fn recognize_closed_form(func: &MachFunction, lp: &NaturalLoop) -> Option<Closed
     }
     // RUNTIME limit only; a constant trip count stays with ReductionSplit / the
     // scalar loop (fail-closed — the closed form here targets runtime `n`).
-    if resolve_const(func, lp, limit).is_some() {
+    if resolve_const(func, limit).is_some() {
         return None;
     }
 
@@ -2836,7 +2745,7 @@ fn recognize_closed_form(func: &MachFunction, lp: &NaturalLoop) -> Option<Closed
         term_insts.push(iid);
     }
     // Closed-world check: each term inst reads only {iv, invariants, earlier defs}.
-    let mut term_defs: HashSet<VReg> = HashSet::new();
+    let mut term_defs: HashSet<VReg> = HashSet::default();
     for &iid in &term_insts {
         let inst = func.inst(iid);
         let def = simple_term_def(inst)?;
@@ -2855,18 +2764,29 @@ fn recognize_closed_form(func: &MachFunction, lp: &NaturalLoop) -> Option<Closed
     }
 
     // -- The term must be a pure degree-≤2 polynomial in the IV. --
-    let poly = closed_form_term_poly(
+    let poly = closed_form_term_poly(func, &term_insts, &red_kind, &red_inputs, iv, &body_defs)?;
+
+    // LOOP STATE (`crate::loop_contract`): the closed form DELETES the loop
+    // and hands off only at its exit, reproducing `acc` alone (its reads there
+    // are rewired to the closed-form result). The induction and every term
+    // register keep their pre-loop values, so none may be live into the exit:
+    // `s + i` after `while i < n { s += i * i; i += 1 }` read `i`'s initial
+    // value instead of `n`.
+    // The loop may leave by no exit but its header test.
+    let exit_only = [exit];
+    let locality = LoopLocality::check(
         func,
-        lp,
-        &term_insts,
-        &red_kind,
-        &red_inputs,
-        iv,
-        &body_defs,
-    )?;
+        lp.body.iter().copied(),
+        header,
+        &ExitPlan::loop_test(header, exit),
+        Handoff::Only(&exit_only),
+        &[acc],
+    )
+    .ok()?;
 
     let src_loc = func.inst(reduction_inst).source_loc;
     Some(ClosedForm {
+        _locality: locality,
         header,
         latch,
         preheader,
@@ -2952,7 +2872,6 @@ fn validate_header_closed_form(
 /// path depends on).
 fn cf_operand_poly(
     func: &MachFunction,
-    lp: &NaturalLoop,
     inst: &MachInst,
     idx: usize,
     iv: VReg,
@@ -2967,7 +2886,7 @@ fn cf_operand_poly(
         return Some(Poly::iv());
     }
     if !body_defs.contains(&v) {
-        return Some(Poly::constant(resolve_const(func, lp, v)? as i128));
+        return Some(Poly::constant(resolve_const(func, v)? as i128));
     }
     None
 }
@@ -2978,19 +2897,18 @@ fn cf_operand_poly(
 /// from `inst_poly_core` so the affine strength-reduction path is untouched.
 fn cf_inst_poly(
     func: &MachFunction,
-    lp: &NaturalLoop,
     inst: &MachInst,
     iv: VReg,
     coeffs: &HashMap<VReg, Poly>,
     body_defs: &HashSet<VReg>,
 ) -> Option<Poly> {
     if inst.opcode == AArch64Opcode::Madd {
-        let a = cf_operand_poly(func, lp, inst, 1, iv, coeffs, body_defs)?;
-        let b = cf_operand_poly(func, lp, inst, 2, iv, coeffs, body_defs)?;
-        let c = cf_operand_poly(func, lp, inst, 3, iv, coeffs, body_defs)?;
+        let a = cf_operand_poly(func, inst, 1, iv, coeffs, body_defs)?;
+        let b = cf_operand_poly(func, inst, 2, iv, coeffs, body_defs)?;
+        let c = cf_operand_poly(func, inst, 3, iv, coeffs, body_defs)?;
         return a.mul(b)?.add(c);
     }
-    inst_poly_core(func, lp, inst, iv, coeffs, body_defs)
+    inst_poly_core(func, inst, iv, coeffs, body_defs)
 }
 
 /// Compute the reduction's term as a degree-≤2 polynomial in the IV, or `None`
@@ -3002,19 +2920,18 @@ fn cf_inst_poly(
 /// resolvable term guarantees a pure polynomial in `i`.
 fn closed_form_term_poly(
     func: &MachFunction,
-    lp: &NaturalLoop,
     term_insts: &[InstId],
     red_kind: &RedKind,
     red_inputs: &[VReg],
     iv: VReg,
     body_defs: &HashSet<VReg>,
 ) -> Option<Poly> {
-    let mut coeffs: HashMap<VReg, Poly> = HashMap::new();
+    let mut coeffs: HashMap<VReg, Poly> = HashMap::default();
     coeffs.insert(iv, Poly::iv());
     for &tid in term_insts {
         let inst = func.inst(tid);
         let def = inst.operands.first().and_then(|o| o.as_vreg())?;
-        if let Some(p) = cf_inst_poly(func, lp, inst, iv, &coeffs, body_defs) {
+        if let Some(p) = cf_inst_poly(func, inst, iv, &coeffs, body_defs) {
             coeffs.insert(def, p);
         }
     }
@@ -3024,7 +2941,7 @@ fn closed_form_term_poly(
         } else if let Some(p) = coeffs.get(&v) {
             Some(*p)
         } else if !body_defs.contains(&v) {
-            Some(Poly::constant(resolve_const(func, lp, v)? as i128))
+            Some(Poly::constant(resolve_const(func, v)? as i128))
         } else {
             None
         }
@@ -3371,7 +3288,7 @@ fn apply_closed_form(
 /// at encode. Emptying the removed blocks makes them inert dead code. Runs with
 /// no cleanup pass after the closed-form rewrite in the O2 pipeline.
 fn prune_to_reachable(func: &mut MachFunction) {
-    let mut reachable: HashSet<BlockId> = HashSet::new();
+    let mut reachable: HashSet<BlockId> = HashSet::default();
     let mut stack = vec![func.entry];
     while let Some(b) = stack.pop() {
         if !reachable.insert(b) {
@@ -4146,5 +4063,62 @@ mod tests {
             assert_eq!(func.insts.len(), insts, "run {again} added instructions");
             assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
         }
+    }
+
+    /// Insert `MovR v21, <reg>` at the top of the exit block (`bb2`): a read of
+    /// a loop register after the loop.
+    fn read_after_loop(func: &mut MachFunction, reg: u32) {
+        let read = func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![vreg(21), vreg(reg)],
+        ));
+        func.block_mut(BlockId(2)).insts.insert(0, read);
+    }
+
+    /// Loop-state contract (`crate::loop_contract`): the closed form deletes the
+    /// loop and reproduces `acc` alone, so an induction read after the loop
+    /// (`s + i` after `while i < n { s += i * i; i += 1 }`) must keep the loop.
+    /// The split reproduces `iv` (its main loop and tail advance it to the
+    /// limit), so it still fires on the same loop.
+    #[test]
+    fn closed_form_refuses_an_induction_read_after_the_loop() {
+        let mut plain = make_runtime_reduction_loop(sumsq_body);
+        assert!(ClosedFormReduction.run(&mut plain), "plain fixture closes");
+        let mut func = make_runtime_reduction_loop(sumsq_body);
+        read_after_loop(&mut func, 3);
+        assert!(
+            !ClosedFormReduction.run(&mut func),
+            "the closed form leaves `iv` at its initial value; the exit reads it"
+        );
+        assert!(ReductionSplit.run(&mut func), "the split reproduces `iv`");
+    }
+
+    /// Both rewrites refuse a second carried register and a live-out-only
+    /// register (a term the split would rename per lane and leave stale).
+    #[test]
+    fn refuses_skipped_register_state() {
+        let iv = VReg::new(3, RegClass::Gpr64);
+        let mut carried = make_runtime_reduction_loop(sumsq_body);
+        let mut live_out = make_runtime_reduction_loop(sumsq_body);
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        let mut wrong = Vec::new();
+        if ReductionSplit.run(&mut carried.clone()) {
+            wrong.push("split: fired with a second accumulator");
+        }
+        if ReductionSplit.run(&mut live_out.clone()) {
+            wrong.push("split: fired with a live-out-only register");
+        }
+        if ClosedFormReduction.run(&mut carried) {
+            wrong.push("closed form: fired with a second accumulator");
+        }
+        if ClosedFormReduction.run(&mut live_out) {
+            wrong.push("closed form: fired with a live-out-only register");
+        }
+        assert!(
+            wrong.is_empty(),
+            "skipped register state:\n  {}",
+            wrong.join("\n  ")
+        );
     }
 }

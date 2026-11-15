@@ -1,9 +1,9 @@
 // Minimal TY BFS parent-loop O1/O3 summary reducer.
 //
-// Builds a small parent loop directly in trust_ir, runs it through the AArch64 JIT
+// Builds a small parent loop directly in trust_ir, runs it through the host JIT
 // at O1 and O3, and compares the status summary against a Rust reference.
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use std::collections::HashMap;
 use std::{env, fs};
@@ -181,7 +181,7 @@ fn build_minimal_parent_loop_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_to_jit(module: &trust_ir::Module, opt_level: OptLevel) -> ExecutableBuffer {
@@ -193,9 +193,10 @@ fn compile_to_jit_with_profile_hooks(
     opt_level: OptLevel,
     profile_hooks: ProfileHookMode,
 ) -> ExecutableBuffer {
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     config.opt_level = opt_level;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(module, &HashMap::new(), profile_hooks)
         .unwrap_or_else(|err| {
             panic!("{opt_level:?} compile with {profile_hooks:?} hooks failed: {err}")
@@ -208,9 +209,10 @@ fn compile_to_jit_with_profile_use(
     opt_level: OptLevel,
     profile: ProfData,
 ) -> ExecutableBuffer {
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     config.opt_level = opt_level;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .with_profile_use(profile)
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|err| panic!("{opt_level:?} profile-use compile failed: {err}"))
@@ -341,12 +343,21 @@ fn parent_loop_profile_key(opt_level: OptLevel) -> CacheKey {
     module_identity.extend_from_slice(b"trust-cg.ty.parent_loop.pgo_canary.v1\0");
     module_identity.extend_from_slice(ENTRY_NAME.as_bytes());
 
+    // The profile is written and re-read by this test, so the key only has
+    // to name the host consistently: the historical AArch64 tuple there, a
+    // baseline SysV tuple on x86-64.
+    let target = ty_contract::host_jit_target();
+    let (cpu, features) = match target {
+        Target::Aarch64 => ("generic-aarch64", vec!["+neon".to_owned()]),
+        Target::X86_64 => ("generic-x86-64", vec!["+sse2".to_owned()]),
+        other => panic!("no PGO canary cache key for {other:?}"),
+    };
     CacheKey::new(
         stable_hash(&module_identity),
         opt_level_num(opt_level),
-        format!("{}-unknown-unknown", Target::Aarch64.name()),
-        "generic-aarch64".to_owned(),
-        vec!["+neon".to_owned()],
+        format!("{}-unknown-unknown", target.name()),
+        cpu.to_owned(),
+        features,
     )
 }
 
@@ -414,4 +425,13 @@ fn ty_bfs_minimal_parent_loop_pgo_canary_profile_round_trip() {
     );
 
     let _ = fs::remove_file(path);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

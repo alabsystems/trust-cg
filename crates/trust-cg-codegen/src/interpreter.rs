@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use trust_ir::{
     BinOp, Block as TrustIrBlock, BlockId, Constant, FuncId, Function as TrustIrFunction, ICmpOp,
-    Inst, Module as TrustIrModule, Ty, UnOp, ValueId,
+    Inst, InterpretPanic, Module as TrustIrModule, Ty, UnOp, ValueId,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +114,23 @@ fn normalize_unsigned(bits: u128, ty: &Ty, width: u32) -> i128 {
 
 fn normalize_int(value: i128, ty: &Ty, width: u32) -> i128 {
     normalize_unsigned(value as u128, ty, width)
+}
+
+/// Width of an integer operand of a trust-ir WS3.20 bit intrinsic. These
+/// are width-defined (a rotate or byte swap of a 64-bit value is not one of a
+/// 128-bit value), so a pointer-width integer takes the 64-bit pointer width of
+/// every target this backend lowers for instead of the 128-bit fallback the
+/// arithmetic arms use.
+fn bit_intrinsic_width(ty: &Ty) -> Result<u32, InterpreterError> {
+    match ty {
+        Ty::Isize | Ty::Usize => Ok(64),
+        _ if ty.is_integer() => ty.bit_width().ok_or_else(|| {
+            InterpreterError::TypeMismatch(format!("integer type {ty:?} has no bit width"))
+        }),
+        _ => Err(InterpreterError::TypeMismatch(format!(
+            "the bit intrinsics are defined on integers only, got {ty:?}"
+        ))),
+    }
 }
 
 fn shift_amount(value: i128, width: u32) -> u32 {
@@ -249,8 +266,11 @@ pub enum InterpreterError {
     FuelExhausted(u64),
     /// Unsupported instruction.
     Unsupported(String),
-    /// Assertion failed.
+    /// Legacy assertion error; v52 execution retains `AssertPanic` instead.
     AssertionFailed,
+    /// A stated v52 assertion failed, with its original kind and resolved
+    /// failure-only operands. This is diagnostic execution, not native proof.
+    AssertPanic(InterpretPanic),
     /// Argument count mismatch.
     ArityMismatch { expected: usize, got: usize },
     /// Call stack depth exceeded.
@@ -268,6 +288,7 @@ impl std::fmt::Display for InterpreterError {
             Self::FuelExhausted(limit) => write!(f, "fuel exhausted after {} steps", limit),
             Self::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             Self::AssertionFailed => write!(f, "assertion failed"),
+            Self::AssertPanic(panic) => f.write_str(&panic.message()),
             Self::ArityMismatch { expected, got } => {
                 write!(f, "arity mismatch: expected {} args, got {}", expected, got)
             }
@@ -392,6 +413,20 @@ impl<'m> Interpreter<'m> {
                 match &node.inst {
                     // --- Constants ---
                     Inst::Const { ty: _, value } => {
+                        if value
+                            .try_visit_constants(|c| {
+                                if matches!(c, Constant::TensorBlob { .. }) {
+                                    std::ops::ControlFlow::Break(())
+                                } else {
+                                    std::ops::ControlFlow::Continue(())
+                                }
+                            })
+                            .is_break()
+                        {
+                            return Err(InterpreterError::Unsupported(
+                                "Constant::TensorBlob has no tensor weight model".into(),
+                            ));
+                        }
                         let result_vid = node.results[0];
                         let val = self.eval_constant(value);
                         regs.insert(result_vid, val);
@@ -514,9 +549,47 @@ impl<'m> Interpreter<'m> {
 
                     // --- Assume/Assert ---
                     Inst::Assume { .. } => {}
-                    Inst::Assert { cond } => {
+                    // v54 (amendment P): a sited check's failure realization
+                    // names a panic entry and a location this diagnostic
+                    // interpreter does not resolve; refused by name rather
+                    // than reported as an unsited panic.
+                    Inst::Assert { site: Some(_), .. } => {
+                        return Err(InterpreterError::Unsupported(
+                            "Assert with a v54 panic site (the diagnostic interpreter does not \
+                             resolve panic sites)"
+                                .to_string(),
+                        ));
+                    }
+                    Inst::Assert {
+                        cond,
+                        kind,
+                        site: None,
+                    } => {
                         if !self.get_reg(regs, *cond)?.as_bool()? {
-                            return Err(InterpreterError::AssertionFailed);
+                            let operands = if let Some(ids) = kind.operands() {
+                                let mut values = [0; 2];
+                                for (slot, id) in values.iter_mut().zip(ids) {
+                                    // Validated payloads are usize. Preserve the
+                                    // module's actual pointer-width carrier,
+                                    // including wasm32 diagnostic inputs.
+                                    let InterpreterValue::Int(value) = self.get_reg(regs, id)?
+                                    else {
+                                        return Err(InterpreterError::TypeMismatch(format!(
+                                            "assert {} panic payload %{id:?} is not an integer",
+                                            kind.keyword()
+                                        )));
+                                    };
+                                    *slot = unsigned_bits(value, self.module.pointer_bits());
+                                }
+                                Some(values)
+                            } else {
+                                None
+                            };
+                            return Err(InterpreterError::AssertPanic(InterpretPanic {
+                                kind: *kind,
+                                operands,
+                                site: None,
+                            }));
                         }
                     }
 
@@ -684,11 +757,16 @@ impl<'m> Interpreter<'m> {
 
     fn eval_constant(&self, c: &Constant) -> InterpreterValue {
         match c {
+            Constant::Ext(e) => e.unreachable(),
             Constant::Int(v) => InterpreterValue::Int(*v),
             Constant::Float(v) => InterpreterValue::Float(*v),
             Constant::Bool(b) => InterpreterValue::Bool(*b),
-            Constant::Aggregate(_) | Constant::Array(_) | Constant::Vector(_) => {
-                // Simplified aggregate/vector interpreter model.
+            Constant::Aggregate(_)
+            | Constant::Array(_)
+            | Constant::Splat { .. }
+            | Constant::Vector(_) => {
+                // Simplified aggregate/vector interpreter model (its `Inst`
+                // walk refuses `ArraySplat` with every other aggregate op).
                 InterpreterValue::Undef
             }
             // trust_ir#30 aggregate/closure constants — this simplified
@@ -709,6 +787,9 @@ impl<'m> Interpreter<'m> {
             // is exercised by link+run differential testing instead).
             | Constant::SymbolAddr { .. }
             | Constant::PhantomData => InterpreterValue::Undef,
+            // v49: an unwritten lane is no value; every use of `Undef` here
+            // is a type mismatch, so nothing reads it as one.
+            Constant::TensorBlob { .. } | Constant::Uninit => InterpreterValue::Undef,
         }
     }
 
@@ -899,6 +980,30 @@ impl<'m> Interpreter<'m> {
                 let b = shift_amount(rhs.as_int()?, int_width);
                 Ok(InterpreterValue::Int(normalize_int(a >> b, ty, int_width)))
             }
+            // trust-ir WS3.20 rotates: TOTAL, the amount reduced modulo the
+            // width (`rotate_at_width` in trust-ir's reference interpreter).
+            BinOp::RotL | BinOp::RotR => {
+                let width = bit_intrinsic_width(ty)?;
+                let value = unsigned_bits(lhs.as_int()?, width);
+                let amount = (unsigned_bits(rhs.as_int()?, width) % u128::from(width)) as u32;
+                let rotated = if amount == 0 {
+                    value
+                } else if op == BinOp::RotL {
+                    (value << amount) | (value >> (width - amount))
+                } else {
+                    (value >> amount) | (value << (width - amount))
+                };
+                Ok(InterpreterValue::Int(normalize_unsigned(
+                    rotated, ty, width,
+                )))
+            }
+            // IEEE copySign: the magnitude of `lhs` with the sign of `rhs`,
+            // exact on the f64 carrier every float width is held in here.
+            BinOp::FCopySign => {
+                let a = lhs.as_float()?;
+                let b = rhs.as_float()?;
+                Ok(InterpreterValue::Float(a.copysign(b)))
+            }
         }
     }
 
@@ -945,6 +1050,26 @@ impl<'m> Interpreter<'m> {
                 let width = ty.bit_width().unwrap_or(128);
                 let v = unsigned_bits(src.as_int()?, width);
                 Ok(InterpreterValue::Int(v.count_ones() as i128))
+            }
+            // trust-ir WS3.20 bit intrinsics, TOTAL (`ctlz 0 = cttz 0 = width`),
+            // computed on the value's low `width` bits exactly as trust-ir's
+            // reference interpreter does.
+            UnOp::CtLz | UnOp::CtTz | UnOp::BSwap | UnOp::BitReverse => {
+                let width = bit_intrinsic_width(ty)?;
+                let v = unsigned_bits(src.as_int()?, width);
+                let high_padding = 128 - width;
+                let bits = match op {
+                    UnOp::CtLz => u128::from(v.leading_zeros() - high_padding),
+                    UnOp::CtTz => u128::from(v.trailing_zeros().min(width)),
+                    UnOp::BSwap => v.swap_bytes() >> high_padding,
+                    UnOp::BitReverse => v.reverse_bits() >> high_padding,
+                    other => {
+                        return Err(InterpreterError::Unsupported(format!(
+                            "UnOp::{other:?} is not a bit intrinsic"
+                        )));
+                    }
+                };
+                Ok(InterpreterValue::Int(normalize_unsigned(bits, ty, width)))
             }
         }
     }
@@ -994,6 +1119,12 @@ impl<'m> Interpreter<'m> {
     ) -> Result<InterpreterValue, InterpreterError> {
         use trust_ir::CastOp;
         match op {
+            // A bool's sign extension makes `true` all ones (trust-ir widens
+            // `as_signed()` of the 1-bit value); its zero extension, below,
+            // is 1. Width-blind like every integer here: -1 at any width.
+            CastOp::SExt if matches!(src, InterpreterValue::Bool(_)) => {
+                Ok(InterpreterValue::Int(-src.as_int()?))
+            }
             CastOp::ZExt | CastOp::SExt | CastOp::Trunc => {
                 // For the interpreter, all ints are i128, so extension/truncation
                 // is a no-op at this level. Real semantics depend on bit-width,
@@ -1057,6 +1188,12 @@ pub fn interpret_with_config(
     args: &[InterpreterValue],
     config: InterpreterConfig,
 ) -> Result<Vec<InterpreterValue>, InterpreterError> {
+    if !module.blobs.is_empty() {
+        return Err(InterpreterError::Unsupported(
+            "Module::blobs has no tensor weight model".into(),
+        ));
+    }
+
     let func = module
         .functions
         .iter()
@@ -1156,7 +1293,7 @@ mod tests {
         fb.ret(vec![sum]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let result = interpret(
             &module,
             "add",
@@ -1217,7 +1354,7 @@ mod tests {
         fb.ret(vec![loop_a]);
 
         fb.build();
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         let result =
             interpret(&module, "fib", &[InterpreterValue::Int(10)]).expect("interpret fib");
@@ -1280,7 +1417,7 @@ mod tests {
         fb.ret(vec![loop_a]);
 
         fb.build();
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         let result = interpret(
             &module,
@@ -1356,7 +1493,7 @@ mod tests {
         fb.ret(vec![loop_sum]);
 
         fb.build();
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         let result =
             interpret(&module, "sum_to", &[InterpreterValue::Int(100)]).expect("interpret sum_to");
@@ -1411,7 +1548,7 @@ mod tests {
         fb.ret(vec![product]);
 
         fb.build();
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         let result = interpret(&module, "factorial", &[InterpreterValue::Int(10)])
             .expect("interpret factorial");
@@ -1460,7 +1597,7 @@ mod tests {
         fb.ret(vec![b]);
 
         fb.build();
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         let r1 = interpret(
             &module,
@@ -1518,7 +1655,7 @@ mod tests {
         fb.ret(vec![result]);
 
         fb.build();
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         // cond=1 -> select a=10
         let r1 = interpret(
@@ -1592,7 +1729,7 @@ mod tests {
             fb.build();
         }
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         // AND: 0xFF & 0x0F == 0x0F
         let r_and = interpret(
@@ -1644,7 +1781,7 @@ mod tests {
         fb.ret(vec![result]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let result =
             interpret(&module, "ctpop8", &[InterpreterValue::Int(-1)]).expect("interpret ctpop8");
         assert_eq!(result_int(&result), 8);
@@ -1664,7 +1801,7 @@ mod tests {
         fb.ret(vec![result]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         let r_boundary = interpret(
             &module,
@@ -1701,7 +1838,7 @@ mod tests {
         fb.ret(vec![shifted]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let result = interpret(
             &module,
             "fuzz_fn",
@@ -1725,15 +1862,22 @@ mod tests {
 
         let entry = fb.create_block();
         fb.switch_to_block(entry);
-        let false_value = fb.iconst(Ty::Bool, 0);
+        let false_value = fb.bool_const(false);
         fb.assert(false_value);
         let zero = fb.iconst(Ty::I64, 0);
         fb.ret(vec![zero]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let result = interpret(&module, "assert_false", &[]);
-        assert!(matches!(result, Err(InterpreterError::AssertionFailed)));
+        assert!(matches!(
+            result,
+            Err(InterpreterError::AssertPanic(InterpretPanic {
+                kind: trust_ir::AssertKind::Unspecified,
+                operands: None,
+                site: None,
+            }))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1757,7 +1901,7 @@ mod tests {
         fb.br(bb_loop, vec![]);
 
         fb.build();
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         let config = InterpreterConfig {
             fuel: 100,
@@ -1778,7 +1922,7 @@ mod tests {
     #[test]
     fn test_interpreter_function_not_found() {
         let mb = ModuleBuilder::new("empty");
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let result = interpret(&module, "nonexistent", &[]);
         assert!(matches!(result, Err(InterpreterError::FunctionNotFound(_))));
     }
@@ -1799,7 +1943,7 @@ mod tests {
         fb.ret(vec![a]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
         let result = interpret(&module, "needs_two", &[InterpreterValue::Int(1)]);
         assert!(matches!(
             result,
@@ -1999,7 +2143,7 @@ mod tests {
         fb.ret(vec![overflow]);
         fb.build();
 
-        let module = mb.build();
+        let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
         // 127 + 1 overflows i8.
         let overflowed = interpret(

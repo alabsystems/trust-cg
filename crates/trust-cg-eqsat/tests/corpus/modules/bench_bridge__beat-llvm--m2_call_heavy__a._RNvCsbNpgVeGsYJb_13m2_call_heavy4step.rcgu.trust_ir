@@ -1,0 +1,36 @@
+; TrustIr text format v1
+module "_RNvCsbNpgVeGsYJb_13m2_call_heavy4step"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (u64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCsbNpgVeGsYJb_13m2_call_heavy4step(functy.0) {
+bb0(%1: u64):
+    %8 = copy u64 %1
+    %10 = const i32 13
+    %11 = const u64 13
+    %9 = shl u64 %8, %11
+    %12 = xor u64 %1, %9
+    %13 = copy u64 %12
+    %15 = const i32 7
+    %16 = const u64 7
+    %14 = lshr u64 %13, %16
+    %17 = xor u64 %12, %14
+    %18 = copy u64 %17
+    %20 = const i32 17
+    %21 = const u64 17
+    %19 = shl u64 %18, %21
+    %22 = xor u64 %17, %19
+    %23 = copy u64 %22
+    ret %23
+}

@@ -81,8 +81,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -348,11 +359,14 @@ fn triple_oracle_int(
 /// `f64 _f64_chain(a, b, c, d) -> ((a + b) * c) - (d / b)`
 fn build_f64_chain_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64; 4],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64; 4],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_f64_chain", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -400,18 +414,23 @@ fn build_f64_chain_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `f32 _f32_chain(a, b, c, d) -> ((a + b) * c) - (d / b)`
 fn build_f32_chain_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F32; 4],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F32; 4],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_f32_chain", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -455,18 +474,23 @@ fn build_f32_chain_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `i64 _fcmp(a: f64, b: f64) -> (a PRED b) ? 1 : 0` for a given predicate.
 fn build_fcmp_module(name: &str, pred: FCmpOp) -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -502,18 +526,23 @@ fn build_fcmp_module(name: &str, pred: FCmpOp) -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `i64 _fptosi(x: f64) -> (i64) x`  (truncation toward zero)
 fn build_fptosi_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fptosi", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -531,18 +560,23 @@ fn build_fptosi_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `f64 _sitofp(x: i64) -> (f64) x`
 fn build_sitofp_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sitofp", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -560,18 +594,23 @@ fn build_sitofp_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `i64 _round_trip(x: f32) -> (i64)((f64)x)`  (FPExt f32->f64 then FPToSI)
 fn build_fpext_fptosi_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fpext_fptosi", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -596,18 +635,23 @@ fn build_fpext_fptosi_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `f32 _fptrunc(x: f64) -> (f32) x`  (FPTrunc, returned as f32)
 fn build_fptrunc_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fptrunc", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -625,7 +669,9 @@ fn build_fptrunc_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1072,4 +1118,13 @@ int main(void) {
     ];
     let r = triple_oracle_int("fpext_fptosi", &module, "_fpext_fptosi", c_source, &cases);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -2,72 +2,30 @@
 
 // trust-cg-llvm-import / tests / ary3_init_o2_e2e.rs
 //
-// Deterministic imported-O0 ary3 initialization coverage for #922.
+// Deterministic imported-O0 ary3 initialization coverage for #922 and
+// TRUSTCG-18. Both fixtures are `for (i = start; i < end; i++) a[i] = i + 1`
+// loops that trust-cg-opt's i32 induction-store rewrite turns into a NEON ST1
+// main loop in front of the scalar loop. The linked programs check every
+// written element and every untouched sentinel. The second fixture's loops
+// start at nonzero, negative and i32::MAX-adjacent indices, which the rewrite
+// used to store at a[0] and guard with a wrapping i32 `index + 3`. Each
+// fixture compiles for this host's explicit triple (ELF on AArch64 Linux GNU,
+// Mach-O on AArch64 macOS); `/usr/bin/objdump` (binutils on Linux, LLVM on
+// macOS) reads it back and the linked program runs natively.
+
+mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
+use common::{compile_for_host, describe_status, native_host_or_skip, unique_temp_dir};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::TargetSpec;
-use trust_cg_llvm_import::import_text;
-
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 
 const ARY3_INIT_LL: &str = include_str!("fixtures/ary3_init_clang_o0.ll");
-
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "trust-cg-import-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-fn describe_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit {code}");
-    }
-    #[cfg(unix)]
-    if let Some(signal) = status.signal() {
-        return format!("signal {signal}");
-    }
-    "unknown status".to_string()
-}
-
-fn compile_to_aarch64_object(src: &str, module_name: &str) -> Vec<u8> {
-    let module = import_text(src, module_name).expect("import ary3 init fixture");
-    let target_spec = TargetSpec::parse("aarch64-apple-darwin").expect("target spec");
-    let compiler = Compiler::new_for_target_spec(
-        CompilerConfig {
-            opt_level: OptLevel::O2,
-            target: target_spec.architecture,
-            emit_proofs: false,
-            trace_level: CompilerTraceLevel::None,
-            emit_debug: false,
-            parallel: false,
-            cegis_superopt_budget_sec: None,
-            enable_fsym_trust_ir_preflight: false,
-            enable_jit_fast_regalloc: false,
-            jit_validation_mode_override: None,
-            panic_unwind: false,
-        },
-        target_spec,
-    );
-    compiler
-        .compile(&module)
-        .expect("compile ary3 init fixture")
-        .object_code
-}
+const ARY3_INIT_OFFSET_LL: &str = include_str!("fixtures/ary3_init_offset_clang_o0.ll");
 
 fn run_command_output(mut command: Command, timeout: Duration) -> std::process::Output {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -113,7 +71,7 @@ fn disassemble_object(obj_path: &Path) -> String {
 }
 
 fn link_with_cc(obj_path: &Path, bin_path: &Path) {
-    let mut command = Command::new("cc");
+    let mut command = common::native_c_command();
     command.arg(obj_path).arg("-o").arg(bin_path);
     let output = run_command_output(command, Duration::from_secs(10));
     assert!(
@@ -125,31 +83,35 @@ fn link_with_cc(obj_path: &Path, bin_path: &Path) {
     );
 }
 
-#[test]
-fn ary3_init_imported_o0_o2_vectorizes_and_preserves_tails() {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        eprintln!(
-            "skipping: test requires aarch64-apple-darwin (host is {} / {})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
+/// Compile `src` at O2 for this host's triple, require the NEON ST1 main loop
+/// and the scalar tail's STR, then link and run it; the fixture's `main` exits
+/// 0 only when every element and sentinel is what the scalar loop writes.
+fn assert_vectorized_fixture_runs(test: &str, src: &str, module_name: &str, tag: &str) {
+    if !native_host_or_skip(test) {
         return;
     }
     if !Path::new("/usr/bin/objdump").exists() {
-        eprintln!("skipping: /usr/bin/objdump is not available");
+        eprintln!("SKIP {test}: /usr/bin/objdump is not available to read the object");
         return;
     }
 
-    let dir = unique_temp_dir("ary3-init-o2");
-    let obj_path = dir.join("ary3_init.trust-cg.o");
-    let bin_path = dir.join("ary3_init.trust-cg");
-    let object = compile_to_aarch64_object(ARY3_INIT_LL, "ary3_init_clang_o0");
-    fs::write(&obj_path, object).expect("write ary3 init object");
+    let dir = unique_temp_dir(tag);
+    let obj_path = dir.join(format!("{module_name}.trust-cg.o"));
+    let bin_path = dir.join(format!("{module_name}.trust-cg"));
+    let object = compile_for_host(src, module_name, OptLevel::O2);
+    fs::write(&obj_path, object).expect("write fixture object");
 
     let disassembly = disassemble_object(&obj_path);
+    let lowercase_disassembly = disassembly.to_ascii_lowercase();
+    // Both objdumps print a tab before the mnemonic (`\tst1\t{ v0.4s }, ...`),
+    // so the object's path in the header cannot satisfy this check.
     assert!(
-        disassembly.to_ascii_lowercase().contains("st1"),
-        "ary3 init loop should contain a NEON ST1 vector store:\n{disassembly}"
+        lowercase_disassembly.contains("\tst1"),
+        "the i32 induction-store loop should contain a NEON ST1 vector store:\n{disassembly}"
+    );
+    assert!(
+        lowercase_disassembly.contains("\tstr\t"),
+        "the scalar loop must remain as the tail:\n{disassembly}"
     );
 
     link_with_cc(&obj_path, &bin_path);
@@ -157,7 +119,7 @@ fn ary3_init_imported_o0_o2_vectorizes_and_preserves_tails() {
     let output = run_command_output(command, Duration::from_secs(10));
     assert!(
         output.status.success(),
-        "linked ary3 init fixture failed with {}\nstdout:\n{}\nstderr:\n{}\ndisassembly:\n{}",
+        "linked {module_name} fixture failed with {}\nstdout:\n{}\nstderr:\n{}\ndisassembly:\n{}",
         describe_status(output.status),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -167,5 +129,25 @@ fn ary3_init_imported_o0_o2_vectorizes_and_preserves_tails() {
         output.stdout.is_empty(),
         "fixture should be silent on success, got stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn ary3_init_imported_o0_o2_vectorizes_and_preserves_tails() {
+    assert_vectorized_fixture_runs(
+        "ary3_init_imported_o0_o2_vectorizes_and_preserves_tails",
+        ARY3_INIT_LL,
+        "ary3_init_clang_o0",
+        "ary3-init-o2",
+    );
+}
+
+#[test]
+fn ary3_init_offset_imported_o0_o2_vectorizes_from_nonzero_and_edge_entries() {
+    assert_vectorized_fixture_runs(
+        "ary3_init_offset_imported_o0_o2_vectorizes_from_nonzero_and_edge_entries",
+        ARY3_INIT_OFFSET_LL,
+        "ary3_init_offset_clang_o0",
+        "ary3-init-offset-o2",
     );
 }

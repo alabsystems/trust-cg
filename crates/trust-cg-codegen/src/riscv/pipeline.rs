@@ -169,6 +169,9 @@ pub enum RiscVPipelineError {
     Encoding(RiscVEncodeError),
     /// Prologue/epilogue generation failed.
     FrameLowering(String),
+    /// The ELF writer refused the object (a section, symbol or relocation it
+    /// cannot serialize faithfully, or a reparse-gate mismatch).
+    ObjectEmission(String),
 }
 
 impl core::fmt::Display for RiscVPipelineError {
@@ -178,6 +181,7 @@ impl core::fmt::Display for RiscVPipelineError {
             Self::RegAlloc(msg) => write!(f, "RISC-V regalloc failed: {}", msg),
             Self::Encoding(e) => write!(f, "RISC-V encoding failed: {}", e),
             Self::FrameLowering(msg) => write!(f, "RISC-V frame lowering failed: {}", msg),
+            Self::ObjectEmission(msg) => write!(f, "RISC-V object emission failed: {}", msg),
         }
     }
 }
@@ -186,6 +190,31 @@ impl From<RiscVEncodeError> for RiscVPipelineError {
     fn from(e: RiscVEncodeError) -> Self {
         Self::Encoding(e)
     }
+}
+
+/// Validate a symbol name at a RISC-V ELF object boundary.
+///
+/// The ELF string table cannot represent either shape faithfully: the empty
+/// name is the table's null sentinel (an unnamed symbol), and a name with an
+/// embedded NUL is truncated there into a DIFFERENT identity that a linker
+/// would resolve against some other definition. Raw machine-code compilation
+/// may carry symbolic placeholders, so the object paths check every
+/// definition and relocation target before mutating the writer.
+pub(crate) fn validate_riscv_elf_symbol_name(
+    name: &str,
+    origin: &str,
+) -> Result<(), RiscVPipelineError> {
+    if name.is_empty() {
+        return Err(RiscVPipelineError::FrameLowering(format!(
+            "RISC-V ELF {origin} symbol name must not be empty (fail-closed)"
+        )));
+    }
+    if name.as_bytes().contains(&0) {
+        return Err(RiscVPipelineError::FrameLowering(format!(
+            "RISC-V ELF {origin} symbol name {name:?} contains an embedded NUL (fail-closed)"
+        )));
+    }
+    Ok(())
 }
 
 /// A deferred cross-function direct call recorded during per-function encoding.
@@ -2306,13 +2335,13 @@ fn resolve_riscv_branches(func: &mut RiscVISelFunction) -> Result<(), RiscVPipel
                     // shared Block value (not raw adjacency) so a future
                     // zero-sized insertion between them cannot mis-pair.
                     let mut paired = None;
-                    for j in (idx + 1)..n {
-                        if mblock.insts[j].opcode == RiscVOpcode::Jalr
-                            && mblock.insts[j].operands.iter().any(
+                    for (offset, candidate) in mblock.insts[idx + 1..n].iter().enumerate() {
+                        if candidate.opcode == RiscVOpcode::Jalr
+                            && candidate.operands.iter().any(
                                 |op| matches!(op, RiscVISelOperand::Block(b) if *b == target_block),
                             )
                         {
-                            paired = Some(j);
+                            paired = Some(idx + 1 + offset);
                             break;
                         }
                     }
@@ -3038,7 +3067,7 @@ impl RiscVPipeline {
         // module path consumes the raw bytes + fixups directly.
         if self.config.emit_elf {
             if fixups.is_empty() {
-                return Ok((self.emit_elf(&func.name, &code), fixups));
+                return Ok((self.emit_elf(&func.name, &code)?, fixups));
             }
             // A cross-function call cannot be resolved by the single-function ELF
             // wrapper (it emits one symbol at offset 0 for the whole code with no
@@ -3084,7 +3113,9 @@ impl RiscVPipeline {
         let prologue = generate_prologue(&assignment.used_callee_saved, frame_size);
         let epilogue = generate_epilogue(&assignment.used_callee_saved, frame_size);
 
-        // Insert prologue at the start of the entry block.
+        // Insert prologue at the start of the first block, the machine entry.
+        // It runs once per call: `select_function` never lays out first a
+        // block that a branch targets.
         if let Some(entry_block) = func.block_order.first().copied()
             && let Some(mblock) = func.blocks.get_mut(&entry_block)
         {
@@ -3239,12 +3270,21 @@ impl RiscVPipeline {
     }
 
     /// Emit an ELF .o file wrapping the encoded machine code.
-    fn emit_elf(&self, func_name: &str, code: &[u8]) -> Vec<u8> {
+    fn emit_elf(&self, func_name: &str, code: &[u8]) -> Result<Vec<u8>, RiscVPipelineError> {
+        validate_riscv_elf_symbol_name(func_name, "defined function")?;
         let mut writer = ElfWriter::new(ElfMachine::Riscv64);
         writer.set_e_flags(EF_RISCV_FLOAT_ABI_DOUBLE);
         writer.add_text_section(code);
         writer.add_symbol(func_name, 1, 0, code.len() as u64, true, 2); // STT_FUNC
-        writer.write()
+        // Non-executable stack marker, added last so earlier section indices
+        // are unchanged: without it GNU ld assumes this object needs an
+        // executable stack.
+        writer.add_note_gnu_stack();
+        // The checked funnel every ELF emitter serializes through: section,
+        // symbol and relocation checks, then the reparse gate.
+        writer
+            .write_checked()
+            .map_err(|error| RiscVPipelineError::ObjectEmission(error.to_string()))
     }
 }
 
@@ -3447,6 +3487,43 @@ mod tests {
         let entry = Block(0);
         func.ensure_block(entry);
         func
+    }
+
+    /// The single-function RISC-V ELF object carries `.note.GNU-stack`, so
+    /// GNU ld does not assume it needs an executable stack.
+    #[test]
+    fn riscv_production_elf_marks_stack_non_executable() {
+        let object = riscv_compile_to_elf(&build_riscv_const_test_function())
+            .expect("representative RISC-V ELF should emit");
+        let records = crate::elf::reparse::read_object_records(&object).expect("reparse ELF");
+        let note = records
+            .sections
+            .iter()
+            .find(|section| section.name == ".note.GNU-stack")
+            .expect("production ELF must carry the GNU non-executable-stack marker");
+        assert_eq!(
+            (note.sh_type, note.sh_flags, note.size),
+            (crate::elf::constants::SHT_PROGBITS, 0, 0)
+        );
+    }
+
+    /// An empty name (the `.strtab` null sentinel) or one with an embedded
+    /// NUL (truncated by `.strtab` into a different identity) cannot name a
+    /// RISC-V ELF definition: refuse it instead of emitting a wrong symbol.
+    #[test]
+    fn riscv_single_elf_rejects_unrepresentable_function_names() {
+        for invalid in ["", "bad\0name"] {
+            let mut func = build_riscv_const_test_function();
+            func.name = invalid.to_string();
+            let error = riscv_compile_to_elf(&func)
+                .expect_err("single-function ELF must reject invalid definition names");
+            let message = error.to_string();
+            assert!(message.contains("defined function"), "{message}");
+            assert!(
+                message.contains("must not be empty") || message.contains("embedded NUL"),
+                "{message}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4385,8 +4462,10 @@ mod tests {
         assert_eq!(bytes.len() % 4, 0);
         // EBREAK (0x00100073) must be present as a 4-byte LE word.
         let has_ebreak = bytes
-            .chunks_exact(4)
-            .any(|w| w == 0x0010_0073u32.to_le_bytes());
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|w| *w == 0x0010_0073u32.to_le_bytes());
         assert!(has_ebreak, "kept carrier must expand to an EBREAK trap");
     }
 
@@ -4406,8 +4485,10 @@ mod tests {
 
         let bytes = riscv_compile_to_bytes(&func).expect("compile eliminated carrier");
         let has_ebreak = bytes
-            .chunks_exact(4)
-            .any(|w| w == 0x0010_0073u32.to_le_bytes());
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|w| *w == 0x0010_0073u32.to_le_bytes());
         assert!(
             !has_ebreak,
             "eliminated carrier must NOT emit an EBREAK trap"
@@ -7121,9 +7202,11 @@ mod tests {
     /// A minimal byte-level RV64 interpreter that DECODES the emitted `.text`
     /// stream (not the ISel stream) and executes it, so a cross-function call's
     /// resolved AUIPC+JALR pcrel pair is verified to land EXACTLY on the callee's
-    /// entry. Implements only the opcodes the phase-4 module test needs: ADDI,
-    /// ADD, SD, LD, AUIPC, JALR, JAL. Panics on anything else (keeping test
-    /// functions in the supported subset).
+    /// entry. Implements the integer subset the RISC-V selector emits: OP-IMM
+    /// (ADDI, SLTI, SLTIU, XORI, ORI, ANDI, SLLI, SRLI, SRAI), OP (ADD, SUB,
+    /// SLL, SLT, SLTU, XOR, SRL, SRA, OR, AND, MUL), the six conditional
+    /// branches, SD, LD, LUI, AUIPC, JALR and JAL. Panics on anything else
+    /// (keeping test functions in the supported subset).
     struct RiscVByteInterp {
         regs: [u64; 32],
         mem: Vec<u8>,
@@ -7143,6 +7226,13 @@ mod tests {
         }
 
         fn run(&mut self, entry_pc: u64, sentinel_ra: u64, step_limit: usize) -> u64 {
+            self.try_run(entry_pc, sentinel_ra, step_limit)
+                .expect("byte interp: step limit reached (corrupted ra/sp -> nonterminating)")
+        }
+
+        /// [`Self::run`], or `None` when the code has not returned to
+        /// `sentinel_ra` within `step_limit` instructions.
+        fn try_run(&mut self, entry_pc: u64, sentinel_ra: u64, step_limit: usize) -> Option<u64> {
             self.regs[1] = sentinel_ra; // ra
             let mut pc = entry_pc;
             for _ in 0..step_limit {
@@ -7158,23 +7248,77 @@ mod tests {
                 let funct3 = (word >> 12) & 0x7;
                 let rs1 = ((word >> 15) & 0x1F) as usize;
                 let rs2 = ((word >> 20) & 0x1F) as usize;
+                let funct7 = word >> 25;
                 let mut next_pc = pc + 4;
                 match opcode {
                     0x13 => {
-                        // OP-IMM: only ADDI (funct3=0) is used.
-                        assert_eq!(funct3, 0, "only ADDI supported");
-                        let imm = (word as i32) >> 20; // I-type sign-extended imm12
-                        let v = (self.regs[rs1] as i64).wrapping_add(imm as i64) as u64;
+                        // OP-IMM. RV64 shifts take a 6-bit shamt; bit 30
+                        // selects SRAI over SRLI.
+                        let imm = ((word as i32) >> 20) as i64; // I-type sign-extended imm12
+                        let x = self.regs[rs1];
+                        let shamt = (word >> 20) & 0x3F;
+                        let v = match funct3 {
+                            0 => (x as i64).wrapping_add(imm) as u64,
+                            1 => x << shamt,
+                            2 => ((x as i64) < imm) as u64,
+                            3 => (x < imm as u64) as u64,
+                            4 => x ^ imm as u64,
+                            5 if word & (1 << 30) != 0 => ((x as i64) >> shamt) as u64,
+                            5 => x >> shamt,
+                            6 => x | imm as u64,
+                            _ => x & imm as u64,
+                        };
                         if rd != 0 {
                             self.regs[rd] = v;
                         }
                     }
                     0x33 => {
-                        // OP: only ADD (funct3=0, funct7=0) is used.
-                        assert_eq!(funct3, 0, "only ADD supported");
-                        let v = self.regs[rs1].wrapping_add(self.regs[rs2]);
+                        // OP, and MUL from the M extension (funct7 = 1).
+                        let (x, y) = (self.regs[rs1], self.regs[rs2]);
+                        let v = match (funct7, funct3) {
+                            (0, 0) => x.wrapping_add(y),
+                            (0x20, 0) => x.wrapping_sub(y),
+                            (0, 1) => x << (y & 0x3F),
+                            (0, 2) => ((x as i64) < (y as i64)) as u64,
+                            (0, 3) => (x < y) as u64,
+                            (0, 4) => x ^ y,
+                            (0, 5) => x >> (y & 0x3F),
+                            (0x20, 5) => ((x as i64) >> (y & 0x3F)) as u64,
+                            (0, 6) => x | y,
+                            (0, 7) => x & y,
+                            (1, 0) => x.wrapping_mul(y),
+                            other => panic!("byte interp: unsupported OP {other:?} at pc {pc}"),
+                        };
                         if rd != 0 {
                             self.regs[rd] = v;
+                        }
+                    }
+                    0x63 => {
+                        // BRANCH: B-type 13-bit signed even offset.
+                        let (x, y) = (self.regs[rs1], self.regs[rs2]);
+                        let taken = match funct3 {
+                            0 => x == y,
+                            1 => x != y,
+                            4 => (x as i64) < (y as i64),
+                            5 => (x as i64) >= (y as i64),
+                            6 => x < y,
+                            7 => x >= y,
+                            other => panic!("byte interp: unsupported branch {other} at pc {pc}"),
+                        };
+                        let b12 = ((word >> 31) & 1) as i32;
+                        let b10_5 = ((word >> 25) & 0x3F) as i32;
+                        let b4_1 = ((word >> 8) & 0xF) as i32;
+                        let b11 = ((word >> 7) & 1) as i32;
+                        let imm =
+                            ((b12 << 12) | (b11 << 11) | (b10_5 << 5) | (b4_1 << 1)) << 19 >> 19;
+                        if taken {
+                            next_pc = (pc as i64 + imm as i64) as u64;
+                        }
+                    }
+                    0x37 => {
+                        // LUI: rd = sign-extended imm20 << 12.
+                        if rd != 0 {
+                            self.regs[rd] = (word & 0xFFFF_F000) as i32 as i64 as u64;
                         }
                     }
                     0x23 => {
@@ -7213,7 +7357,7 @@ mod tests {
                             self.regs[rd] = link;
                         }
                         if target == sentinel_ra {
-                            return self.regs[A0.hw_enc() as usize];
+                            return Some(self.regs[A0.hw_enc() as usize]);
                         }
                         next_pc = target;
                     }
@@ -7235,7 +7379,7 @@ mod tests {
                 }
                 pc = next_pc;
             }
-            panic!("byte interp: step limit reached (corrupted ra/sp -> nonterminating)");
+            None
         }
     }
 
@@ -7548,5 +7692,174 @@ mod tests {
             fixups[0].jalr_offset > fixups[0].auipc_offset,
             "JALR pcrel-lo must follow the AUIPC pcrel-hi anchor"
         );
+    }
+
+    // =======================================================================
+    // An entry block that a back edge re-enters.
+    // =======================================================================
+
+    const ENTRY_LOOP: &str = "entry_loop";
+
+    /// `f(a, b, n)`: while `n != 0`, `(a, b, n) = (3a + c, a, n - 1)` through a
+    /// back edge into the ENTRY block; then `a ^ b`. `c` is `b`, or with
+    /// `self_call` the recursive `f(b, a, 0)` (which is `a ^ b`): a call that
+    /// enters the function at its machine entry and clobbers every
+    /// caller-saved register while `a` and `n` are live.
+    fn build_entry_loop(self_call: bool) -> trust_ir::Module {
+        use trust_ir::{BinOp, ICmpOp, Ty};
+
+        let mut mb = trust_ir_build::ModuleBuilder::new("riscv_entry_loop");
+        let ty = mb.add_func_type(vec![Ty::U64; 3], vec![Ty::U64]);
+        let id = mb.declare_function(ENTRY_LOOP, ty);
+        let mut fb = mb.define_function(id).expect("declared function");
+        let entry = fb.create_block();
+        let body = fb.create_block();
+        let exit = fb.create_block();
+        let a = fb.add_block_param(entry, Ty::U64);
+        let b = fb.add_block_param(entry, Ty::U64);
+        let n = fb.add_block_param(entry, Ty::U64);
+        fb.switch_to_block(entry);
+        let zero = fb.iconst(Ty::U64, 0);
+        let more = fb.icmp(ICmpOp::Ne, Ty::U64, n, zero);
+        fb.condbr(more, body, vec![], exit, vec![]);
+        fb.switch_to_block(body);
+        let three = fb.iconst(Ty::U64, 3);
+        let scaled = fb.binop(BinOp::Mul, Ty::U64, a, three);
+        let addend = if self_call {
+            let zero = fb.iconst(Ty::U64, 0);
+            fb.call(id, vec![b, a, zero])
+        } else {
+            b
+        };
+        let next = fb.binop(BinOp::Add, Ty::U64, scaled, addend);
+        let one = fb.iconst(Ty::U64, 1);
+        let n1 = fb.binop(BinOp::Sub, Ty::U64, n, one);
+        fb.br(entry, vec![next, a, n1]);
+        fb.switch_to_block(exit);
+        let x = fb.binop(BinOp::Xor, Ty::U64, a, b);
+        fb.ret(vec![x]);
+        fb.build();
+        mb.build().expect("ModuleBuilder::build: test fixture")
+    }
+
+    fn entry_loop_reference(mut a: u64, mut b: u64, n: u64, self_call: bool) -> u64 {
+        for _ in 0..n {
+            let addend = if self_call { a ^ b } else { b };
+            (a, b) = (a.wrapping_mul(3).wrapping_add(addend), a);
+        }
+        a ^ b
+    }
+
+    /// The `.text` bytes of RISC-V relocatable object `object` and the offset
+    /// of `symbol` in them.
+    fn riscv_text_and_symbol(object: &[u8], symbol: &str) -> (Vec<u8>, u64) {
+        let u16_at = |at: usize| u16::from_le_bytes([object[at], object[at + 1]]) as usize;
+        let u32_at = |at: usize| u32::from_le_bytes(object[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(object[at..at + 8].try_into().unwrap());
+        let shoff = u64_at(0x28) as usize;
+        let shentsize = u16_at(0x3A);
+        let header = |index: usize| shoff + index * shentsize;
+        let names = u64_at(header(u16_at(0x3E)) + 0x18) as usize;
+        let text = (0..u16_at(0x3C))
+            .map(header)
+            .find(|&h| {
+                let name = names + u32_at(h) as usize;
+                object[name..].starts_with(b".text\0")
+            })
+            .expect(".text section");
+        let (offset, size) = (u64_at(text + 0x18) as usize, u64_at(text + 0x20) as usize);
+        let records = crate::elf::reparse::read_object_records(object).expect("reparse ELF");
+        let value = records
+            .symbols
+            .iter()
+            .find(|s| s.name == symbol)
+            .expect("function symbol")
+            .value;
+        (object[offset..offset + size].to_vec(), value)
+    }
+
+    /// trust-ir admits a branch to the entry block, so the entry block can
+    /// head a loop. The formal-argument copies out of a0..a7 and the frame
+    /// prologue run once per call; a back edge into the entry block must
+    /// reach neither, and must write the registers the entry block reads as
+    /// its parameters. Each function is compiled by `Compiler::compile` at
+    /// O0-O3 and its `.text` decoded and run against a Rust model, with
+    /// sp and every callee-saved register checked on return. A call that
+    /// does not return within the step limit is a failure.
+    #[test]
+    fn entry_block_that_heads_a_loop_runs_formals_and_prologue_once() {
+        use crate::pipeline::OptLevel;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        const SENTINEL: u64 = 0xFFFF_FFFF_FFFF_FF00;
+        // s0, s1, s2-s11.
+        const CALLEE_SAVED: [usize; 12] = [8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+        let seeds = [5u64, 0x1111_2222_3333_4444, u64::MAX - 6];
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for self_call in [false, true] {
+            let module = build_entry_loop(self_call);
+            for opt_level in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+                let label = format!("self_call={self_call} {opt_level:?}");
+                let config = crate::compiler::CompilerConfig {
+                    target: crate::target::Target::Riscv64,
+                    opt_level,
+                    parallel: false,
+                    ..crate::compiler::CompilerConfig::default()
+                };
+                let object = match crate::compiler::Compiler::new(config)
+                    .with_codegen_license(crate::license_test_support::permit_unlicensed())
+                    .compile(&module)
+                {
+                    Ok(result) => result.object_code,
+                    Err(error) => {
+                        failures.push(format!("{label}: refused: {error}"));
+                        continue;
+                    }
+                };
+                let (text, entry) = riscv_text_and_symbol(&object, ENTRY_LOOP);
+                for n in 0..4u64 {
+                    for (i, &a) in seeds.iter().enumerate() {
+                        let b = seeds[(i + 1) % seeds.len()] ^ 7;
+                        let expected = entry_loop_reference(a, b, n, self_call);
+                        let call = format!("{label}: f({a:#x}, {b:#x}, {n})");
+                        let mut interp = RiscVByteInterp::new(text.clone());
+                        interp.regs[A0.hw_enc() as usize] = a;
+                        interp.regs[A1.hw_enc() as usize] = b;
+                        interp.regs[A2.hw_enc() as usize] = n;
+                        for r in CALLEE_SAVED {
+                            interp.regs[r] = 0x5A5A_0000 + r as u64;
+                        }
+                        let sp = interp.regs[2];
+                        checked += 1;
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            interp.try_run(entry, SENTINEL, 10_000)
+                        })) {
+                            Ok(Some(got)) if got != expected => {
+                                failures.push(format!("{call} = {got:#x}, expected {expected:#x}"))
+                            }
+                            Ok(Some(_)) if interp.regs[2] != sp => failures.push(format!(
+                                "{call} returned with sp moved by {} bytes",
+                                interp.regs[2].wrapping_sub(sp) as i64
+                            )),
+                            Ok(Some(_)) => {
+                                for r in CALLEE_SAVED {
+                                    if interp.regs[r] != 0x5A5A_0000 + r as u64 {
+                                        failures.push(format!("{call} clobbered x{r}"));
+                                    }
+                                }
+                            }
+                            Ok(None) => failures.push(format!(
+                                "{call} did not return within 10000 instructions \
+                                 (expected {expected:#x})"
+                            )),
+                            Err(_) => failures.push(format!("{call} ran off the code")),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(checked, 2 * 4 * 4 * 3);
     }
 }

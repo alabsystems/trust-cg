@@ -1,0 +1,231 @@
+{
+  "name": "declared_tuple_v42",
+  "functions": [
+    {
+      "id": 0,
+      "name": "read_declared_image",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Alloca": {
+                  "ty": {
+                    "Tuple": [
+                      "U8",
+                      "U64",
+                      "U8"
+                    ]
+                  },
+                  "count": null,
+                  "align": null
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Tuple": [
+                      "U8",
+                      "U64",
+                      "U8"
+                    ]
+                  },
+                  "value": {
+                    "Aggregate": [
+                      {
+                        "Int": 17
+                      },
+                      {
+                        "Int": 1234605616436508552
+                      },
+                      {
+                        "Int": 34
+                      }
+                    ]
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Store": {
+                  "ty": {
+                    "Tuple": [
+                      "U8",
+                      "U64",
+                      "U8"
+                    ]
+                  },
+                  "ptr": 0,
+                  "value": 1,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I64",
+                  "value": {
+                    "Int": 0
+                  }
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "GEP": {
+                  "pointee_ty": "U8",
+                  "base": 0,
+                  "indices": [
+                    2
+                  ],
+                  "inbounds": true
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Load": {
+                  "ty": "U64",
+                  "ptr": 3,
+                  "volatile": false,
+                  "align": null
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [
+        "U64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    {
+      "Tuple": [
+        "U8",
+        "U64",
+        "U8"
+      ]
+    }
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "Unclassified"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [
+    {
+      "tuple_type": 0,
+      "size": 16,
+      "align": 8,
+      "field_offsets": [
+        8,
+        0,
+        9
+      ]
+    }
+  ],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

@@ -1,6 +1,6 @@
 // trust-cg-codegen/tests/e2e_aarch64_i128_overflow.rs
 //
-// End-to-end (compile -> link -> RUN on this aarch64-apple-darwin host) coverage
+// End-to-end (compile -> link -> RUN on an AArch64 macOS or Linux GNU host) coverage
 // for i128/u128 checked-overflow add/sub (`Inst::Overflow`).
 //
 // Before this, `Inst::Overflow` fail-closed for every 128-bit type ("need
@@ -29,8 +29,13 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId, ValueId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// `fn name(a, b) -> i32 { if op(a, b) overflows { 1 } else { 0 } }`
@@ -42,11 +47,14 @@ fn build_overflow_flag_func(
     ty: Ty,
     op: OverflowOp,
 ) {
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![ty.clone(), ty.clone()],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![ty.clone(), ty.clone()],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(func_id), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -84,7 +92,9 @@ fn build_overflow_flag_func(
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// `fn name(a, b) -> i128 { a (op) b   // the WRAPPED value (result[0]) }`
@@ -95,11 +105,14 @@ fn build_overflow_value_func(
     ty: Ty,
     op: OverflowOp,
 ) {
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![ty.clone(), ty.clone()],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![ty.clone(), ty.clone()],
+            returns: vec![ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(func_id), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -117,7 +130,9 @@ fn build_overflow_value_func(
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -162,11 +177,14 @@ fn build_module() -> TrustIrModule {
 
 /// `fn name(a) -> i128 { (op) a }` — single i128 unary op (Neg or Not).
 fn build_unop_func(func_id: u32, name: &str, module: &mut TrustIrModule, op: UnOp) {
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I128],
-        returns: vec![Ty::I128],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I128],
+            returns: vec![Ty::I128],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(func_id), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -183,7 +201,9 @@ fn build_unop_func(func_id: u32, name: &str, module: &mut TrustIrModule, op: UnO
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_unop_module() -> TrustIrModule {
@@ -197,11 +217,14 @@ fn build_unop_module() -> TrustIrModule {
 /// `fn name(a, b) -> i128 { if cmp(a, b) { a } else { b } }` — i128 compare
 /// feeding an i128 register-pair Select (a branchless min).
 fn build_i128_cmp_select(func_id: u32, name: &str, module: &mut TrustIrModule, cmp: ICmpOp) {
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I128, Ty::I128],
-        returns: vec![Ty::I128],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I128, Ty::I128],
+            returns: vec![Ty::I128],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(func_id), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -226,7 +249,9 @@ fn build_i128_cmp_select(func_id: u32, name: &str, module: &mut TrustIrModule, c
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_select_module() -> TrustIrModule {
@@ -240,11 +265,14 @@ fn build_loadstore_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("i128_loadstore");
 
     // _i128_load(p: *const i128) -> i128 { *p }
-    let load_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I128],
-        is_vararg: false,
-    });
+    let load_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I128],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut load_fn = TrustIrFunction::new(FuncId::new(0), "_i128_load", load_ft, BlockId::new(0));
     load_fn.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -262,14 +290,19 @@ fn build_loadstore_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(load_fn);
+    module
+        .try_add_function(load_fn)
+        .expect("Module::try_add_function: test fixture");
 
     // _i128_store(p: *mut i128, v: i128) { *p = v }
-    let store_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I128],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let store_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I128],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut store_fn =
         TrustIrFunction::new(FuncId::new(1), "_i128_store", store_ft, BlockId::new(0));
     store_fn.blocks = vec![TrustIrBlock {
@@ -286,7 +319,9 @@ fn build_loadstore_module() -> TrustIrModule {
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(store_fn);
+    module
+        .try_add_function(store_fn)
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -300,11 +335,14 @@ fn build_loadstore_module() -> TrustIrModule {
 /// drops the high half on the back-edge.
 fn build_i128_loop_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("i128_loop");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I128],
-        returns: vec![Ty::I128],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I128],
+            returns: vec![Ty::I128],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), "_i128_loopsum", ft, BlockId::new(0));
     f.blocks = vec![
         // bb0(n): s0 = 1<<100; i0 = 1; -> bb1(s0, i0)
@@ -388,7 +426,9 @@ fn build_i128_loop_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -396,7 +436,8 @@ fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("i128/u128 lowering must compile (proof/coverage gate included)");
@@ -449,8 +490,8 @@ int main(void) {
 /// Compile `obj`, link against `driver`, run, and return the process exit code
 /// (or `None` when this host can't link+run aarch64 Mach-O).
 fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: link-and-run requires an aarch64-apple-darwin host");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: link-and-run requires an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -468,6 +509,7 @@ fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc available");
     assert!(
@@ -677,4 +719,13 @@ fn e2e_aarch64_i128_neg_not() {
             "i128 neg/not/popcount runtime mismatch at {opt:?} (failing-case code {code})",
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

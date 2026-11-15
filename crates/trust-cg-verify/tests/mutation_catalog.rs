@@ -55,6 +55,11 @@ use trust_cg_verify::{ProofObligation, verify_by_evaluation};
 use trust_cg_lower::instructions::Opcode;
 use trust_cg_lower::types::Type;
 
+/// The wasm gate excludes the v128 forms as never selected; fault 6 exempts
+/// exactly those rows, so it checks the exclusion against live emission.
+#[path = "support/wasm_never_selected_live_scan.rs"]
+mod wasm_never_selected_live;
+
 fn on_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .name("mutation-catalog".to_string())
@@ -402,6 +407,10 @@ fn fault5a_dropped_divisor_precond_killed_by_native_trap_model() {
 //        reconstructable. If a value op were moved into the allowlist, it would
 //        STILL reconstruct-discharge Valid, so this invariant would flag it as a
 //        value op hiding in the exemption list.
+// One exemption, itself checked: a wasm v128 row excluded as NEVER SELECTED
+// keeps its reconstruction built for the day selection lands, so it
+// discharges; the test runs the live never-selected scan first, so an
+// emitted value op cannot hide behind that reason.
 #[test]
 fn fault6_value_op_in_allowlist_killed_by_credit_vs_exemption_invariant() {
     use trust_cg_verify::function_verifier::reconstruction_discharges_valid as aarch64_recon;
@@ -419,18 +428,39 @@ fn fault6_value_op_in_allowlist_killed_by_credit_vs_exemption_invariant() {
         universe: &[O],
         classify: impl Fn(O) -> OpcodeClass,
         recon: impl Fn(O, &VerificationConfig) -> bool,
+        exempt: impl Fn(O, &str) -> bool,
         cfg: &VerificationConfig,
     ) -> Vec<String> {
         let mut hiding = Vec::new();
         for &op in universe {
-            if matches!(classify(op), OpcodeClass::FailClosedAllowlisted { .. }) && recon(op, cfg) {
+            if let OpcodeClass::FailClosedAllowlisted { reason } = classify(op)
+                && !exempt(op, reason)
+                && recon(op, cfg)
+            {
                 hiding.push(format!("{arch}::{op:?}"));
             }
         }
         hiding
     }
+    fn strict<O>(_: O, _: &str) -> bool {
+        false
+    }
+    // One exemption: a wasm v128 row excluded as NEVER SELECTED. Its
+    // lane-wise reconstruction is kept built so the row re-enters the
+    // credited denominator unchanged when selection lands (coverage_gate,
+    // 33083326d); crediting it now would count evidence for code no module
+    // contains. That premise is a fact about the lowering, checked inside the
+    // run below against the live backend (the scan the coverage gate pins,
+    // whose corpus holds one module per v128 form: refused at the vector
+    // carrier, or compiled and scanned), so the exemption cannot hide an
+    // emitted value op.
+    fn wasm_never_selected(op: WasmOpcode, reason: &str) -> bool {
+        reason.contains("never selected")
+            && op.opcode_byte() == trust_cg_verify::wasm_value_domain::SIMD_PREFIX
+    }
 
     let hiding = on_large_stack(move || {
+        wasm_never_selected_live::assert_no_never_selected_opcode_is_emitted();
         let cfg = VerificationConfig::default();
         let mut h = Vec::new();
         h.extend(check(
@@ -438,6 +468,7 @@ fn fault6_value_op_in_allowlist_killed_by_credit_vs_exemption_invariant() {
             ALL_AARCH64_OPCODES,
             classify_aarch64,
             aarch64_recon,
+            strict,
             &cfg,
         ));
         h.extend(check(
@@ -445,6 +476,7 @@ fn fault6_value_op_in_allowlist_killed_by_credit_vs_exemption_invariant() {
             ALL_X86_OPCODES,
             classify_x86,
             x86_recon,
+            strict,
             &cfg,
         ));
         h.extend(check(
@@ -452,6 +484,7 @@ fn fault6_value_op_in_allowlist_killed_by_credit_vs_exemption_invariant() {
             ALL_RISCV_OPCODES,
             classify_riscv,
             riscv_recon,
+            strict,
             &cfg,
         ));
         h.extend(check(
@@ -459,6 +492,7 @@ fn fault6_value_op_in_allowlist_killed_by_credit_vs_exemption_invariant() {
             ALL_WASM_OPCODES,
             classify_wasm,
             wasm_recon,
+            wasm_never_selected,
             &cfg,
         ));
         h

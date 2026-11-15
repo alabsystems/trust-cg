@@ -3,56 +3,27 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-//! **The exact, obligation-bound replay capability the guard seam has been waiting for.**
+//! Predicate implication diagnostics and the exact bounds-guard binding machinery.
 //!
-//! [`crate::guard_evidence`] says, and still says, that a trust-ir [`ProofStatus`] or a
-//! `CleanCic` lineage record is *producer-owned metadata*: constructible through trust-ir's
-//! public data model, therefore never elimination authority. That judgement is unchanged and
-//! this module does not relax it by one bit.
+//! `PredTable::implies` can decide that a predicate entails `Interval(0, bound - 1)`.
+//! It does not establish that an external parameter or a loaded value satisfies that
+//! predicate. Declarations and producer-owned proof status or lineage labels therefore
+//! cannot authorize elision, even when `lattice-guard-elision` is enabled (OD-27).
 //!
-//! What changed is that trust-ir v30 added something that is **not** producer-owned metadata:
-//! a *decidable predicate lattice* ([`trust_ir::pred`]). `PredTable::implies` is a total,
-//! allocation-free, solver-free decision procedure that returns `true` ONLY when the
-//! implication genuinely holds. That is exactly the shape the seam demanded:
+//! Production source capabilities require `Module::refinement_has_replayed_authority`.
+//! trust-cg has no RefinementType rechecker and supplies TrustIR's rejecting capability;
+//! no source capability is minted and the public replay authority stays unavailable.
+//! A future implementation must replay the exact value/predicate premise before using
+//! an implication to remove its guard. Predicate replay alone is insufficient.
 //!
-//! | seam requirement | how the lattice meets it |
-//! |---|---|
-//! | *independent* | the decision is trust-ir's, re-derived here from the module's own tables; trust-cg asserts nothing |
-//! | *exact* | interval containment / finite-set subset / universe+space equality — no heuristic, no widening, no "probably" |
-//! | *obligation-bound* | the production id is a pure function of the DISCHARGING PREDICATE'S CONTENT, the EXACT interval, and the originating function/base/index; changing any component changes the obligation |
-//! | *replayable* | [`LatticeBoundsCapability::replay`] re-runs the whole decision from scratch against the tables and re-derives both ids; nothing is taken on trust |
+//! The public [`certify_bounds_guard`] result is an unbound diagnostic witness. Its
+//! [`LatticeBoundsCapability::replay`] rechecks the implication and its content-derived
+//! identity, not a runtime value. Source associations, full capability equality,
+//! function identity, exact carrier operands and the elimination kernel remain
+//! independent binding checks. Unit tests exercise that structural machinery with
+//! synthetic source associations without claiming a replayed refinement premise.
 //!
-//! # What a capability means, precisely
-//!
-//! A diagnostic [`LatticeBoundsCapability`] for `(pred, bound)` asserts one thing:
-//!
-//! > the refinement predicate `pred` carried by the guard's INDEX value entails
-//! > `Interval(0, bound - 1)`, which is exactly the condition the bounds guard tests.
-//!
-//! `TrapBoundsCheckExact base, index, bound` traps iff `!(index <u bound)`. So a certified
-//! `index ∈ [0, bound-1]` means the trap is unreachable. Production additionally binds that
-//! decision to the exact source function/base/index and requires ISel to reproduce the association
-//! before the carrier is dead code.
-//!
-//! # Fail-closed, in five independent ways
-//!
-//! 1. **No source-bound capability, no elision.** Fields are private and there is no `Default` or
-//!    `serde`. The public lattice witness is deliberately unbound and cannot become authority.
-//! 2. **`implies` answers `false` when unsure.** A one-directional sound decision procedure
-//!    means an almost-sufficient predicate (off by one, wrong space, wrong universe) mints
-//!    nothing and the guard survives as a runtime check.
-//! 3. **Exact per-use association.** ISel issues an opaque carrier binding only when function,
-//!    LIR base, and LIR index match the private source association; a caller map or same-bound
-//!    substitute carrier is inert.
-//! 4. **The authority is feature-gated.** Without `lattice-guard-elision` the capability can
-//!    still be minted and inspected (so its tests are meaningful on the default build) but
-//!    [`lattice_guard_replay_authority_available`] is `false`, and every consumer refuses to
-//!    turn it into behavior.
-//! 5. **The kernel still decides.** A capability only fills a
-//!    [`trust_cg_ir::DischargedEvidenceTable`] entry; deletion still requires
-//!    [`trust_cg_ir::decide`] plus the independent operand-fingerprint re-check.
-//!
-//! [`ProofStatus`]: trust_ir::proof::ProofStatus
+//! Absent production authority, every bounds carrier remains a runtime check.
 
 use std::collections::HashMap;
 
@@ -67,19 +38,14 @@ use trust_ir::value::PredId;
 
 use crate::instructions::Value;
 
-/// Whether production holds a *decidable-lattice* guard-replay authority.
+/// Whether production can replay the value's refinement premise before eliding a guard.
 ///
-/// This is a SECOND, independent seam beside
-/// [`crate::guard_evidence::validator_guard_replay_authority_available`], which stays `false`.
-/// The two are deliberately not merged: that one is about producer-owned proof *labels* and
-/// must remain unwired; this one is about a decision procedure trust-cg re-runs itself.
-///
-/// Gated on the `lattice-guard-elision` Cargo feature — a compile-time switch, not an
-/// environment variable, so no runtime input can turn it on and a default build is bit-identical
-/// to the pre-lattice compiler.
+/// OD-27 requires a replayed `RefinementType` authority. Predicate implication establishes
+/// only the consequence *if* the value satisfies its declared predicate. trust-cg has no
+/// RefinementType rechecker, so even the `lattice-guard-elision` feature grants no authority.
 #[inline]
 pub fn lattice_guard_replay_authority_available() -> bool {
-    cfg!(feature = "lattice-guard-elision")
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +116,24 @@ pub struct RefinementEnv {
     universes: Vec<Universe>,
 }
 
+/// Borrowed, complete projection used by the retained-LIR authority seal.
+pub(crate) struct RefinementEnvIdentityView<'a> {
+    pub predicates: &'a [Pred],
+    pub universes: &'a [Universe],
+}
+
 impl RefinementEnv {
+    pub(crate) fn retained_identity_view(&self) -> RefinementEnvIdentityView<'_> {
+        let Self {
+            predicates,
+            universes,
+        } = self;
+        RefinementEnvIdentityView {
+            predicates,
+            universes,
+        }
+    }
+
     /// Snapshot the module's lattice tables.
     pub fn from_module(module: &Module) -> Self {
         Self {
@@ -235,7 +218,58 @@ pub struct LatticeBoundsCapability {
     source_carrier: Option<LatticeSourceCarrier>,
 }
 
+/// Borrowed, complete projection used by the retained-LIR authority seal.
+pub(crate) struct LatticeBoundsCapabilityIdentityView<'a> {
+    pub obligation_id: u64,
+    pub lineage_digest: u128,
+    pub discharging_pred: PredId,
+    pub discharging_pred_text: &'a str,
+    pub required_hi: i128,
+    pub bound: u64,
+    pub source_carrier: Option<LatticeSourceCarrierIdentityView<'a>>,
+}
+
+/// Borrowed source-carrier projection used by the retained-LIR authority seal.
+pub(crate) struct LatticeSourceCarrierIdentityView<'a> {
+    pub function: &'a str,
+    pub base: Value,
+    pub index: Value,
+}
+
 impl LatticeBoundsCapability {
+    pub(crate) fn retained_identity_view(&self) -> LatticeBoundsCapabilityIdentityView<'_> {
+        let Self {
+            obligation_id,
+            lineage_digest,
+            discharging_pred,
+            discharging_pred_text,
+            required_hi,
+            bound,
+            source_carrier,
+        } = self;
+        let source_carrier = source_carrier.as_ref().map(|carrier| {
+            let LatticeSourceCarrier {
+                function,
+                base,
+                index,
+            } = carrier;
+            LatticeSourceCarrierIdentityView {
+                function,
+                base: *base,
+                index: *index,
+            }
+        });
+        LatticeBoundsCapabilityIdentityView {
+            obligation_id: *obligation_id,
+            lineage_digest: *lineage_digest,
+            discharging_pred: *discharging_pred,
+            discharging_pred_text,
+            required_hi: *required_hi,
+            bound: *bound,
+            source_carrier,
+        }
+    }
+
     /// The obligation id to thread onto the guard carrier.
     pub fn obligation_id(&self) -> u64 {
         self.obligation_id
@@ -304,9 +338,8 @@ impl LatticeBoundsCapability {
 /// Decide whether refinement predicate `actual` entails the condition an exact bounds guard with
 /// element count `bound` tests, and on success mint an **unbound diagnostic witness**.
 ///
-/// This public result can be inspected and replayed, but cannot authorize elimination: production
-/// uses [`certify_bounds_guard_for_source_carrier`] to add a private exact source association, and
-/// ISel requires that association before issuing an opaque machine-carrier binding.
+/// This public result can be inspected and replayed, but cannot authorize elimination. It proves
+/// a predicate implication, not that any runtime value satisfies the predicate.
 ///
 /// Returns `None` — and therefore keeps the guard — whenever:
 ///
@@ -325,12 +358,43 @@ pub fn certify_bounds_guard(
     certify_bounds_guard_impl(env, actual, bound, None)
 }
 
-/// Production minter: bind a decidable lattice implication to one exact source carrier.
+/// Production minter: require a replayed refinement premise before binding an implication.
 ///
-/// This is crate-private so a public caller cannot turn a true predicate about one value into
-/// authority for an unrelated same-bound LIR carrier. ISel independently matches this sealed
-/// association before minting the machine-carrier binding.
+/// The shared TrustIR gate rejects declarations and producer-owned status labels. Until an
+/// actual RefinementType rechecker exists, use its rejecting capability: no source capability
+/// is minted, including with the Cargo feature enabled. A future rechecker must establish the
+/// exact value/predicate premise; a predicate implication or a feature is not a substitute.
 pub(crate) fn certify_bounds_guard_for_source_carrier(
+    module: &Module,
+    actual: PredId,
+    bound: u64,
+    function: &str,
+    base: Value,
+    index: Value,
+) -> Option<LatticeBoundsCapability> {
+    if !module.refinement_has_replayed_authority(
+        actual,
+        &trust_ir::proof::RejectingProofAuthorityRechecker,
+    ) {
+        return None;
+    }
+    let env = RefinementEnv::from_module(module);
+    certify_bounds_guard_impl(
+        &env,
+        actual,
+        bound,
+        Some(LatticeSourceCarrier {
+            function: function.to_string(),
+            base,
+            index,
+        }),
+    )
+}
+
+/// Synthetic source association for binding and retained-identity unit tests only.
+/// It does not replay a value premise and cannot reach the public production authority.
+#[cfg(test)]
+pub(crate) fn certify_bounds_guard_for_test_source_carrier(
     env: &RefinementEnv,
     actual: PredId,
     bound: u64,
@@ -488,6 +552,18 @@ impl LatticeGuardReplayAuthority {
             return Self::default();
         }
 
+        Self::replay_implications_and_bind_aarch64(func, carrier_bindings, env, capabilities)
+    }
+
+    // The structural binding engine. Unit tests exercise exact positive and negative bindings
+    // using synthetic implications; those tests supply no evidence about a runtime value.
+    // Production must pass the independent refinement-premise authority gate above first.
+    fn replay_implications_and_bind_aarch64(
+        func: &MachFunction,
+        carrier_bindings: &[LatticeGuardCarrierBinding],
+        env: &RefinementEnv,
+        capabilities: &[LatticeBoundsCapability],
+    ) -> Self {
         let mut authority = Self {
             enabled: true,
             function_identity: lattice_authority_function_identity(func),
@@ -936,13 +1012,92 @@ mod tests {
     }
 
     #[test]
-    fn default_build_holds_no_lattice_authority() {
-        // The capability is mintable and inspectable on every build; only the AUTHORITY to turn
-        // it into behavior is feature-gated.
-        assert_eq!(
-            lattice_guard_replay_authority_available(),
-            cfg!(feature = "lattice-guard-elision")
+    fn cargo_feature_alone_holds_no_lattice_authority() {
+        assert!(!lattice_guard_replay_authority_available());
+    }
+
+    #[test]
+    fn declared_and_producer_labelled_refinements_mint_no_source_capability() {
+        use trust_ir::proof::{ObligationKind, ProofFormula, ProofObligation, ProofStatus};
+        use trust_ir::value::ProofId;
+
+        let mut module = Module::new("declared_refinement");
+        let pred = module
+            .intern_pred(Pred::interval(0, 7).unwrap())
+            .expect("Module::intern_pred: test fixture")
+            .unwrap();
+        let env = RefinementEnv::from_module(&module);
+        assert!(certify_bounds_guard(&env, pred, 8).unwrap().replay(&env));
+        assert!(
+            certify_bounds_guard_for_source_carrier(
+                &module,
+                pred,
+                8,
+                "external",
+                Value(0),
+                Value(1),
+            )
+            .is_none()
         );
+
+        for status in [
+            ProofStatus::Pending,
+            ProofStatus::Discharged,
+            ProofStatus::Certified,
+        ] {
+            module.proof_obligations = vec![
+                ProofObligation::new(
+                    ProofId::new(0),
+                    ObligationKind::RefinementType,
+                    status,
+                    "producer claim",
+                )
+                .with_formula(ProofFormula::new(
+                    trust_ir::pred::PRED_FORMULA_SCHEMA,
+                    format!("pred.{}", pred.index()),
+                )),
+            ];
+            assert_eq!(module.refinement_obligations_for(pred).len(), 1);
+            assert!(
+                certify_bounds_guard_for_source_carrier(
+                    &module,
+                    pred,
+                    8,
+                    "external",
+                    Value(0),
+                    Value(1),
+                )
+                .is_none(),
+                "producer status {status:?} is not replay authority"
+            );
+        }
+    }
+
+    #[cfg(feature = "lattice-guard-elision")]
+    #[test]
+    fn public_replay_refuses_even_an_exact_source_associated_diagnostic() {
+        let env = env_with(vec![Pred::interval(0, 7).unwrap()], vec![]);
+        let capability = source_bound_capability(&env);
+        let (func, guard_id, fingerprint) = bounds_carrier_with_index(8, 1);
+        let bindings = [LatticeGuardCarrierBinding::new(&capability, fingerprint)];
+        // The binding model has a positive control, but its synthetic premise cannot
+        // make the public production constructor authorize anything.
+        let model = LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
+            &func,
+            &bindings,
+            &env,
+            std::slice::from_ref(&capability),
+        );
+        assert!(model.authorize(&func, guard_id).is_some());
+        let production = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+            &func,
+            &bindings,
+            &env,
+            std::slice::from_ref(&capability),
+        );
+        assert!(!production.is_enabled());
+        assert!(production.bound_inst_ids().next().is_none());
+        assert!(production.authorize(&func, guard_id).is_none());
     }
 
     #[test]
@@ -982,7 +1137,7 @@ mod tests {
 
     #[cfg(feature = "lattice-guard-elision")]
     fn source_bound_capability(env: &RefinementEnv) -> LatticeBoundsCapability {
-        certify_bounds_guard_for_source_carrier(
+        certify_bounds_guard_for_test_source_carrier(
             env,
             PredId::new(0),
             8,
@@ -995,13 +1150,13 @@ mod tests {
 
     #[cfg(feature = "lattice-guard-elision")]
     #[test]
-    fn replay_authority_binds_exact_carrier_and_rejects_later_operand_drift() {
+    fn binding_model_binds_exact_carrier_and_rejects_later_operand_drift() {
         let env = env_with(vec![Pred::interval(0, 7).unwrap()], vec![]);
         let capability = source_bound_capability(&env);
         let (mut func, guard_id, fingerprint) = bounds_carrier_with_index(8, 1);
         let carrier_bindings = [LatticeGuardCarrierBinding::new(&capability, fingerprint)];
 
-        let authority = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+        let authority = LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
             &func,
             &carrier_bindings,
             &env,
@@ -1029,7 +1184,7 @@ mod tests {
 
     #[cfg(feature = "lattice-guard-elision")]
     #[test]
-    fn replay_authority_rejects_capability_misassociated_with_another_bound() {
+    fn binding_model_rejects_capability_misassociated_with_another_bound() {
         let env = env_with(vec![Pred::interval(0, 7).unwrap()], vec![]);
         let capability = source_bound_capability(&env);
         let (func, guard_id, wrong_fingerprint) = bounds_carrier_with_index(9, 1);
@@ -1039,7 +1194,7 @@ mod tests {
             &capability,
             wrong_fingerprint,
         )];
-        let authority = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+        let authority = LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
             &func,
             &carrier_bindings,
             &env,
@@ -1051,7 +1206,7 @@ mod tests {
 
     #[cfg(feature = "lattice-guard-elision")]
     #[test]
-    fn replay_authority_rejects_same_bound_carrier_substitution() {
+    fn binding_model_rejects_same_bound_carrier_substitution() {
         let env = env_with(vec![Pred::interval(0, 7).unwrap()], vec![]);
         let capability = source_bound_capability(&env);
         let (_, _, certified_fingerprint) = bounds_carrier_with_index(8, 1);
@@ -1065,7 +1220,7 @@ mod tests {
         // cannot be rewritten, so replay must keep the substituted guard.
         let (substituted, guard_id, substituted_fingerprint) = bounds_carrier_with_index(8, 2);
         assert_ne!(certified_fingerprint, substituted_fingerprint);
-        let authority = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+        let authority = LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
             &substituted,
             &carrier_bindings,
             &env,
@@ -1082,7 +1237,7 @@ mod tests {
         let unbound = certify_bounds_guard(&env, PredId::new(0), 8).unwrap();
         let (func, guard_id, fingerprint) = bounds_carrier_with_index(8, 1);
         let carrier_bindings = [LatticeGuardCarrierBinding::new(&unbound, fingerprint)];
-        let authority = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+        let authority = LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
             &func,
             &carrier_bindings,
             &env,
@@ -1094,7 +1249,7 @@ mod tests {
 
     #[cfg(feature = "lattice-guard-elision")]
     #[test]
-    fn replay_authority_rejects_cross_function_identical_carrier_substitution() {
+    fn binding_model_rejects_cross_function_identical_carrier_substitution() {
         let env = env_with(vec![Pred::interval(0, 7).unwrap()], vec![]);
         let capability = source_bound_capability(&env);
         let (original, original_guard, fingerprint) = bounds_carrier_with_index(8, 1);
@@ -1107,12 +1262,13 @@ mod tests {
         assert_eq!(original_guard, substituted_guard);
         assert_eq!(fingerprint, substituted_fingerprint);
 
-        let substituted_authority = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
-            &substituted,
-            &carrier_bindings,
-            &env,
-            std::slice::from_ref(&capability),
-        );
+        let substituted_authority =
+            LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
+                &substituted,
+                &carrier_bindings,
+                &env,
+                std::slice::from_ref(&capability),
+            );
         assert!(substituted_authority.bound_inst_ids().next().is_none());
         assert!(
             substituted_authority
@@ -1121,7 +1277,7 @@ mod tests {
         );
 
         // Also reject transporting an already-built authority after replay.
-        let original_authority = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+        let original_authority = LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
             &original,
             &carrier_bindings,
             &env,
@@ -1136,12 +1292,12 @@ mod tests {
 
     #[cfg(feature = "lattice-guard-elision")]
     #[test]
-    fn replay_authority_rejects_same_name_different_definition_or_cfg() {
+    fn binding_model_rejects_same_name_different_definition_or_cfg() {
         let env = env_with(vec![Pred::interval(0, 7).unwrap()], vec![]);
         let capability = source_bound_capability(&env);
         let (original, guard_id, fingerprint) = bounds_carrier_with_index(8, 1);
         let carrier_bindings = [LatticeGuardCarrierBinding::new(&capability, fingerprint)];
-        let authority = LatticeGuardReplayAuthority::replay_and_bind_aarch64(
+        let authority = LatticeGuardReplayAuthority::replay_implications_and_bind_aarch64(
             &original,
             &carrier_bindings,
             &env,
@@ -1198,7 +1354,7 @@ mod tests {
             ],
             vec![],
         );
-        let original = certify_bounds_guard_for_source_carrier(
+        let original = certify_bounds_guard_for_test_source_carrier(
             &env,
             PredId::new(0),
             8,
@@ -1207,7 +1363,7 @@ mod tests {
             Value(1),
         )
         .unwrap();
-        let mut colliding_substitute = certify_bounds_guard_for_source_carrier(
+        let mut colliding_substitute = certify_bounds_guard_for_test_source_carrier(
             &env,
             PredId::new(1),
             8,

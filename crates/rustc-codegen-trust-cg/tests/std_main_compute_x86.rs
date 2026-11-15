@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: STANDARD-Rust `fn main` (std) compiled for x86_64 via the
 // rustc_codegen_trust_cg bridge.
@@ -38,7 +42,7 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 const STD_SUM_PROGRAM: &str = "fn main() {\n\
     \x20   let mut s = 0i32;\n\
@@ -47,63 +51,12 @@ const STD_SUM_PROGRAM: &str = "fn main() {\n\
     \x20   std::process::exit(s);\n\
     }\n";
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run std-main test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -122,8 +75,8 @@ fn backend_arg(dylib: &Path) -> std::ffi::OsString {
 /// `llvm-nm` from the pinned toolchain's rustlib bin (the system `nm` cannot
 /// parse the bridge/libstd Mach-O objects produced by this LLVM version).
 fn llvm_nm() -> PathBuf {
-    let sysroot = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--print", "sysroot"])
+    let sysroot = toolchain_support::rustc_driver_command()
+        .args(["--print", "sysroot"])
         .output()
         .expect("rustc --print sysroot");
     let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_owned();
@@ -152,8 +105,7 @@ fn std_main_runs_via_lang_start_closure_vtable() {
     std::fs::write(&src, STD_SUM_PROGRAM).expect("write source");
 
     let bin = dir.join("out");
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "bin"])
         .arg(backend_arg(&dylib))
         .args(["--target", TARGET, "-Cpanic=abort"])
@@ -179,7 +131,9 @@ fn std_main_runs_via_lang_start_closure_vtable() {
          allocator). stderr: <<<{stderr}>>>"
     );
 
-    let run = Command::new(&bin).output().expect("run trust-cg std binary");
+    let run = Command::new(&bin)
+        .output()
+        .expect("run trust-cg std binary");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         run.status.code(),
@@ -221,8 +175,7 @@ fn closure_by_value_capture_call_compiles_cleanly() {
     )
     .expect("write source");
 
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "bin"])
         .arg(backend_arg(&dylib))
         .args(["--target", TARGET, "-Cpanic=abort", "-Copt-level=0"])
@@ -273,15 +226,16 @@ fn entry_wrapper_and_allocator_shim_objects_are_abi_correct() {
     let src = dir.join("prog.rs");
     std::fs::write(&src, STD_SUM_PROGRAM).expect("write source");
 
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "bin"])
         .arg(backend_arg(&dylib))
         .args(["--target", TARGET, "-Cpanic=abort"])
         .arg("--emit=obj")
         .arg("-o")
         .arg(dir.join("out"))
-        .env("TRUST_CG_TEST_SKIP_LANG_START", "1")
+        .arg(toolchain_support::backend_knobs_arg(&[
+            "test-skip-lang-start",
+        ]))
         .arg(&src)
         .output()
         .expect("spawn rustc");
@@ -348,7 +302,9 @@ fn entry_wrapper_and_allocator_shim_objects_are_abi_correct() {
     // --- Entry wrapper ---
     let entry_syms = symbols(&entry_obj);
     assert!(
-        entry_syms.lines().any(|l| l.contains(" T ") && l.contains("_main")),
+        entry_syms
+            .lines()
+            .any(|l| l.contains(" T ") && l.contains("_main")),
         "entry wrapper must export the C `main`. symbols:\n{entry_syms}"
     );
     assert!(

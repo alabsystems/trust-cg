@@ -14,11 +14,14 @@ use trust_ir::{BlockId, Constant, FuncId, ValueId};
 /// Build the same `sum_to_n` loop that hangs at O2.
 fn build_loop_function() -> (TrustIrFunction, TrustIrModule) {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "sum_to_n", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -98,14 +101,20 @@ fn build_loop_function() -> (TrustIrFunction, TrustIrModule) {
             })],
         },
     ];
-    module.add_function(func.clone());
+    module
+        .try_add_function(func.clone())
+        .expect("Module::try_add_function: test fixture");
     (func, module)
 }
 
 fn get_ir_func_via_isel() -> trust_cg_ir::MachFunction {
     let (trust_ir_func, module) = build_loop_function();
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(&trust_ir_func, &module)
-        .expect("adapter should succeed");
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+        &trust_ir_func,
+        &module,
+        &permit_unlicensed(),
+    )
+    .expect("adapter should succeed");
 
     use trust_cg_lower::function::Signature;
     use trust_cg_lower::isel::InstructionSelector;
@@ -116,6 +125,7 @@ fn get_ir_func_via_isel() -> trust_cg_ir::MachFunction {
     };
 
     let mut isel = InstructionSelector::new(lir_func.name.clone(), sig.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.set_stack_slots(lir_func.stack_slots.clone());
     isel.seed_value_types(&lir_func.value_types);
     isel.seed_pure_callees(&lir_func.pure_callees);
@@ -248,4 +258,13 @@ fn test_pressure_scheduler_on_raw_loop() {
     let mut sched = PressureAwareScheduler;
     sched.run(&mut func);
     eprintln!("  PressureAwareScheduler completed on raw loop.");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

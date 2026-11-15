@@ -12,10 +12,6 @@
 //! materialisation, and bulk memory copies: `AddRI` + `LdrRI`/`StrRI`
 //! for struct fields, `LslRI` + `AddRR` + `LdrRI`/`StrRI` for array element
 //! addressing, and `StrbRI` tag plus `StrRI` payload writes for enums.
-//!
-//! See
-//! `designs/2026-04-18-aggregate-lowering.md` for context and the
-//! per-pass audit table.
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachBlock, MachFunction, MachInst, MachOperand, RegClass,

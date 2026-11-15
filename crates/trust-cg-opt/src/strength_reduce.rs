@@ -48,7 +48,7 @@
 //!
 //! Reference: LLVM `LoopStrengthReduce.cpp`, Muchnick ch. 14.1
 
-use std::collections::HashSet;
+use crate::fast_hash::FxHashSet as HashSet;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, PassId, ProvenanceMap,
@@ -130,8 +130,8 @@ impl StrengthReduction {
 struct InductionVar {
     /// The vreg of the IV (as defined by the Phi or the increment).
     vreg: VReg,
-    /// The constant step added each iteration.
-    step: i64,
+    /// Each actual backedge and its constant induction step.
+    steps: Vec<(BlockId, i64)>,
 }
 
 /// Attempt strength reduction on multiply instructions in a loop.
@@ -215,11 +215,12 @@ fn reduce_strength_in_loop(
     }
 
     // Step 4: Apply each reduction.
+    let mut changed = false;
     for reduction in &reductions {
-        apply_reduction(func, lp, preheader, reduction, provenance.as_deref_mut());
+        changed |= apply_reduction(func, lp, preheader, reduction, provenance.as_deref_mut());
     }
 
-    true
+    changed
 }
 
 /// A multiply instruction that can be strength-reduced.
@@ -241,8 +242,8 @@ struct MulReduction {
 ///
 /// An induction variable is defined by a Phi in the header where:
 /// - One incoming value is from outside the loop (init value).
-/// - The other incoming value is defined by `AddRI` or `SubRI` of the
-///   Phi's own value and a constant step.
+/// - Every incoming backedge value is defined by `AddRI` or `SubRI` of
+///   the Phi's own value and an edge-specific constant step.
 fn find_induction_variables(func: &MachFunction, lp: &NaturalLoop) -> Vec<InductionVar> {
     let mut ivs = Vec::new();
     let header_block = func.block(lp.header);
@@ -259,27 +260,34 @@ fn find_induction_variables(func: &MachFunction, lp: &NaturalLoop) -> Vec<Induct
             None => continue,
         };
 
-        // Find the incoming value from inside the loop (the latch or body).
-        let mut loop_val: Option<VReg> = None;
-        let mut i = 1;
-        while i + 1 < inst.operands.len() {
-            if let MachOperand::Block(bid) = &inst.operands[i + 1]
-                && lp.body.contains(bid)
-                && let Some(v) = inst.operands[i].as_vreg()
-            {
-                loop_val = Some(v);
+        // A merged natural loop can have several backedges, each with its
+        // own update. Derive the recurrence from every original phi input;
+        // the representative `lp.latch` is not the complete edge inventory.
+        let mut seen = HashSet::default();
+        let mut steps = Vec::new();
+        let mut admitted = inst.operands.len() == 1 + 2 * header_block.preds.len();
+        for pair in inst.operands[1..].as_chunks::<2>().0.iter() {
+            let (Some(value), MachOperand::Block(pred)) = (pair[0].as_vreg(), &pair[1]) else {
+                admitted = false;
+                break;
+            };
+            if !header_block.preds.contains(pred) || !seen.insert(*pred) {
+                admitted = false;
+                break;
             }
-            i += 2;
+            if lp.body.contains(pred) {
+                let Some(step) = find_iv_step(func, lp, def, value) else {
+                    admitted = false;
+                    break;
+                };
+                steps.push((*pred, step));
+            } else if Some(*pred) != lp.preheader {
+                admitted = false;
+                break;
+            }
         }
-
-        let loop_val = match loop_val {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Check if loop_val is defined by AddRI or SubRI of the Phi's def.
-        if let Some(step) = find_iv_step(func, lp, def, loop_val) {
-            ivs.push(InductionVar { vreg: def, step });
+        if admitted && !steps.is_empty() {
+            ivs.push(InductionVar { vreg: def, steps });
         }
     }
 
@@ -326,7 +334,7 @@ fn find_iv_step(
                         && dst == result_vreg
                         && src == phi_vreg
                     {
-                        return Some(-step);
+                        return Some(step.wrapping_neg());
                     }
                 }
                 _ => {}
@@ -345,7 +353,7 @@ fn find_iv_step(
 /// "loop-invariant" test. Strictly more conservative than the historical
 /// operand-0 scan (it can only add defs, i.e. only REJECT more reductions).
 fn collect_loop_defined_vregs(func: &MachFunction, lp: &NaturalLoop) -> HashSet<VReg> {
-    let mut defs = HashSet::new();
+    let mut defs = HashSet::default();
     for &block_id in &func.block_order {
         if !lp.body.contains(&block_id) {
             continue;
@@ -372,27 +380,28 @@ fn collect_loop_defined_vregs(func: &MachFunction, lp: &NaturalLoop) -> HashSet<
 /// 1. In preheader: compute initial value `v_init = MulRR iv_init, stride`.
 /// 2. Add a Phi in header for the running product.
 /// 3. Replace MulRR in loop body with `Copy v_cur`.
-/// 4. Advance the running product on the latch edge by `stride_step`.
+/// 4. Advance the running product on every backedge by its `stride_step`.
+///    Distributivity holds modulo the register width even when steps differ.
 fn apply_reduction(
     func: &mut MachFunction,
     lp: &NaturalLoop,
     preheader: BlockId,
     reduction: &MulReduction,
     provenance: Option<&mut ProvenanceMap>,
-) {
+) -> bool {
     if reduction.block_id != lp.latch {
-        return;
+        return false;
     }
 
     let iv = &reduction.iv;
     let iv_init = match find_iv_init_vreg(func, lp, iv.vreg) {
         Some(v) => v,
-        None => return,
+        None => return false,
     };
 
     let rc = reduction.dst.class;
     if iv.vreg.class != rc || iv_init.class != rc || reduction.invariant_vreg.class != rc {
-        return;
+        return false;
     }
     let source_loc = func.inst(reduction.inst_id).source_loc;
     let with_reduction_source_loc = |mut inst: MachInst| {
@@ -412,7 +421,7 @@ fn apply_reduction(
     insert_before_terminator(func, preheader, mul_init);
     let mut created_insts = vec![mul_init];
 
-    if iv.step == 0 {
+    if iv.steps.iter().all(|(_, step)| *step == 0) {
         let inst = func.inst_mut(reduction.inst_id);
         inst.opcode = AArch64Opcode::Copy;
         inst.operands = vec![
@@ -426,12 +435,11 @@ fn apply_reduction(
             provenance.record_in_place_transform(reduction.inst_id, pass.clone());
             provenance.record_clone(reduction.inst_id, mul_init, pass);
         }
-        return;
+        return true;
     }
 
     // Allocate new vregs for the running derived-IV recurrence.
     let running_vreg = func.alloc_vreg(); // running product (Phi in header)
-    let next_vreg = func.alloc_vreg(); // running product for the next iteration
 
     // The current iteration must see the current derived value, not the
     // incremented one. Advance to the next value on the latch edge instead.
@@ -442,70 +450,83 @@ fn apply_reduction(
         MachOperand::VReg(VReg::new(running_vreg, rc)),
     ];
 
-    let advance_inst = if iv.step == 1 {
-        with_reduction_source_loc(MachInst::new(
-            AArch64Opcode::AddRR,
-            vec![
-                MachOperand::VReg(VReg::new(next_vreg, rc)),
+    let mut phi_operands = vec![
+        MachOperand::VReg(VReg::new(running_vreg, rc)),
+        MachOperand::VReg(VReg::new(init_vreg_id, rc)),
+        MachOperand::Block(preheader),
+    ];
+    for &(latch, step) in &iv.steps {
+        if step == 0 {
+            phi_operands.extend([
                 MachOperand::VReg(VReg::new(running_vreg, rc)),
-                MachOperand::VReg(reduction.invariant_vreg),
-            ],
-        ))
-    } else if iv.step == -1 {
-        with_reduction_source_loc(MachInst::new(
-            AArch64Opcode::SubRR,
-            vec![
-                MachOperand::VReg(VReg::new(next_vreg, rc)),
-                MachOperand::VReg(VReg::new(running_vreg, rc)),
-                MachOperand::VReg(reduction.invariant_vreg),
-            ],
-        ))
-    } else {
-        let step_vreg_id = func.alloc_vreg();
-        let stride_step_vreg = func.alloc_vreg();
-        let step_mov = func.push_inst(with_reduction_source_loc(MachInst::new(
-            AArch64Opcode::MovI,
-            vec![
-                MachOperand::VReg(VReg::new(step_vreg_id, rc)),
-                MachOperand::Imm(iv.step),
-            ],
-        )));
-        insert_before_terminator(func, preheader, step_mov);
-        created_insts.push(step_mov);
+                MachOperand::Block(latch),
+            ]);
+            continue;
+        }
+        let next_vreg = func.alloc_vreg();
+        let advance_inst = if step == 1 {
+            with_reduction_source_loc(MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![
+                    MachOperand::VReg(VReg::new(next_vreg, rc)),
+                    MachOperand::VReg(VReg::new(running_vreg, rc)),
+                    MachOperand::VReg(reduction.invariant_vreg),
+                ],
+            ))
+        } else if step == -1 {
+            with_reduction_source_loc(MachInst::new(
+                AArch64Opcode::SubRR,
+                vec![
+                    MachOperand::VReg(VReg::new(next_vreg, rc)),
+                    MachOperand::VReg(VReg::new(running_vreg, rc)),
+                    MachOperand::VReg(reduction.invariant_vreg),
+                ],
+            ))
+        } else {
+            let step_vreg_id = func.alloc_vreg();
+            let stride_step_vreg = func.alloc_vreg();
+            let step_mov = func.push_inst(with_reduction_source_loc(MachInst::new(
+                AArch64Opcode::MovI,
+                vec![
+                    MachOperand::VReg(VReg::new(step_vreg_id, rc)),
+                    MachOperand::Imm(step),
+                ],
+            )));
+            insert_before_terminator(func, preheader, step_mov);
+            created_insts.push(step_mov);
 
-        let stride_step_inst = func.push_inst(with_reduction_source_loc(MachInst::new(
-            AArch64Opcode::MulRR,
-            vec![
-                MachOperand::VReg(VReg::new(stride_step_vreg, rc)),
-                MachOperand::VReg(reduction.invariant_vreg),
-                MachOperand::VReg(VReg::new(step_vreg_id, rc)),
-            ],
-        )));
-        insert_before_terminator(func, preheader, stride_step_inst);
-        created_insts.push(stride_step_inst);
+            let stride_step_inst = func.push_inst(with_reduction_source_loc(MachInst::new(
+                AArch64Opcode::MulRR,
+                vec![
+                    MachOperand::VReg(VReg::new(stride_step_vreg, rc)),
+                    MachOperand::VReg(reduction.invariant_vreg),
+                    MachOperand::VReg(VReg::new(step_vreg_id, rc)),
+                ],
+            )));
+            insert_before_terminator(func, preheader, stride_step_inst);
+            created_insts.push(stride_step_inst);
 
-        with_reduction_source_loc(MachInst::new(
-            AArch64Opcode::AddRR,
-            vec![
-                MachOperand::VReg(VReg::new(next_vreg, rc)),
-                MachOperand::VReg(VReg::new(running_vreg, rc)),
-                MachOperand::VReg(VReg::new(stride_step_vreg, rc)),
-            ],
-        ))
-    };
-    let advance_inst_id = func.push_inst(advance_inst);
-    insert_before_terminator(func, lp.latch, advance_inst_id);
-    created_insts.push(advance_inst_id);
+            with_reduction_source_loc(MachInst::new(
+                AArch64Opcode::AddRR,
+                vec![
+                    MachOperand::VReg(VReg::new(next_vreg, rc)),
+                    MachOperand::VReg(VReg::new(running_vreg, rc)),
+                    MachOperand::VReg(VReg::new(stride_step_vreg, rc)),
+                ],
+            ))
+        };
+        let advance_inst_id = func.push_inst(advance_inst);
+        insert_before_terminator(func, latch, advance_inst_id);
+        created_insts.push(advance_inst_id);
 
+        phi_operands.extend([
+            MachOperand::VReg(VReg::new(next_vreg, rc)),
+            MachOperand::Block(latch),
+        ]);
+    }
     let phi = func.push_inst(with_reduction_source_loc(MachInst::new(
         AArch64Opcode::Phi,
-        vec![
-            MachOperand::VReg(VReg::new(running_vreg, rc)),
-            MachOperand::VReg(VReg::new(init_vreg_id, rc)),
-            MachOperand::Block(preheader),
-            MachOperand::VReg(VReg::new(next_vreg, rc)),
-            MachOperand::Block(lp.latch),
-        ],
+        phi_operands,
     )));
     let header_insts = &mut func.block_mut(lp.header).insts;
     header_insts.insert(0, phi);
@@ -518,6 +539,7 @@ fn apply_reduction(
             provenance.record_clone(reduction.inst_id, inst_id, pass.clone());
         }
     }
+    true
 }
 
 /// Find the vreg of the IV's initial value from the preheader.
@@ -1469,5 +1491,228 @@ mod tests {
             assert_eq!(func.insts.len(), insts, "run {again} added instructions");
             assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
         }
+    }
+
+    fn make_two_latch_loop() -> MachFunction {
+        let mut func = make_mul_in_loop();
+        let other = func.create_block();
+        let first = BlockId(3);
+        let header = BlockId(1);
+        let term = *func.block(first).insts.last().unwrap();
+        *func.inst_mut(term) = MachInst::new(
+            AArch64Opcode::BCond,
+            vec![MachOperand::Block(header), MachOperand::Block(other)],
+        );
+        func.add_edge(first, other);
+        let step = func.push_inst(MachInst::new(
+            AArch64Opcode::AddRI,
+            vec![vreg(5), vreg(1), imm(2)],
+        ));
+        func.append_inst(other, step);
+        let branch = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(header)],
+        ));
+        func.append_inst(other, branch);
+        func.add_edge(other, header);
+        let phi = func.block(header).insts[0];
+        func.inst_mut(phi)
+            .operands
+            .extend([vreg(5), MachOperand::Block(other)]);
+        func
+    }
+
+    #[test]
+    fn strength_reduce_preserves_every_backedge_phi_input() {
+        let mut func = make_two_latch_loop();
+        assert!(StrengthReduction.run(&mut func));
+        let header = BlockId(1);
+        let mut phis = 0;
+        for &id in &func.block(header).insts {
+            let inst = func.inst(id);
+            if inst.opcode != AArch64Opcode::Phi {
+                continue;
+            }
+            phis += 1;
+            let mut incoming: Vec<_> = inst.operands[1..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| match pair[1] {
+                    MachOperand::Block(b) => b,
+                    _ => panic!("phi edge"),
+                })
+                .collect();
+            incoming.sort();
+            let mut expected = func.block(header).preds.clone();
+            expected.sort();
+            assert_eq!(
+                incoming, expected,
+                "derived recurrence must cover every real predecessor"
+            );
+        }
+        assert_eq!(
+            phis, 2,
+            "retain the optimization with a complete derived recurrence"
+        );
+    }
+
+    // Evaluate the arithmetic and parallel phi assignments on a chosen CFG
+    // trace. This oracle does not inspect induction-variable analysis or the
+    // optimizer's recurrence representation.
+    fn execute_trace_block(
+        func: &MachFunction,
+        block: BlockId,
+        predecessor: BlockId,
+        values: &mut [u64],
+        mask: u64,
+    ) {
+        let read = |op: &MachOperand, values: &[u64]| match op {
+            MachOperand::VReg(v) => values[v.id as usize],
+            MachOperand::Imm(n) => *n as u64,
+            _ => panic!("non-value operand"),
+        };
+        let mut phis = Vec::new();
+        for &id in &func.block(block).insts {
+            let inst = func.inst(id);
+            if inst.opcode == AArch64Opcode::Phi {
+                let input = inst.operands[1..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .find(|pair| pair[1] == MachOperand::Block(predecessor))
+                    .expect("phi must define the selected incoming edge");
+                phis.push((
+                    inst.operands[0].as_vreg().unwrap().id,
+                    read(&input[0], values),
+                ));
+            }
+        }
+        for (dst, value) in phis {
+            values[dst as usize] = value & mask;
+        }
+        for &id in &func.block(block).insts {
+            let inst = func.inst(id);
+            let value =
+                match inst.opcode {
+                    AArch64Opcode::MovI | AArch64Opcode::Copy => read(&inst.operands[1], values),
+                    AArch64Opcode::AddRI | AArch64Opcode::AddRR => read(&inst.operands[1], values)
+                        .wrapping_add(read(&inst.operands[2], values)),
+                    AArch64Opcode::SubRI | AArch64Opcode::SubRR => read(&inst.operands[1], values)
+                        .wrapping_sub(read(&inst.operands[2], values)),
+                    AArch64Opcode::MulRR => read(&inst.operands[1], values)
+                        .wrapping_mul(read(&inst.operands[2], values)),
+                    AArch64Opcode::Phi
+                    | AArch64Opcode::CmpRI
+                    | AArch64Opcode::B
+                    | AArch64Opcode::BCond
+                    | AArch64Opcode::Ret => continue,
+                    other => panic!("unmodeled trace instruction {other:?}"),
+                };
+            values[inst.operands[0].as_vreg().unwrap().id as usize] = value & mask;
+        }
+    }
+
+    #[test]
+    fn strength_reduce_two_latches_preserve_wrapping_values_on_mixed_paths() {
+        for class in [RegClass::Gpr32, RegClass::Gpr64] {
+            let mask = if class == RegClass::Gpr32 {
+                u32::MAX as u64
+            } else {
+                u64::MAX
+            };
+            for init in [0u64, 17, u64::MAX - 2] {
+                for stride in [0u64, 8, u64::MAX] {
+                    for step in [0i64, 2, -1, -7] {
+                        let mut original = make_two_latch_loop();
+                        for inst in &mut original.insts {
+                            for operand in &mut inst.operands {
+                                if let MachOperand::VReg(v) = operand {
+                                    v.class = class;
+                                }
+                            }
+                        }
+                        let init_id = original.block(original.entry).insts[0];
+                        original.inst_mut(init_id).operands[1] = imm(init as i64);
+                        let stride_id = original.block(original.entry).insts[1];
+                        original.inst_mut(stride_id).operands[1] = imm(stride as i64);
+                        let other = BlockId(4);
+                        let step_id = original.block(other).insts[0];
+                        original.inst_mut(step_id).opcode = if step < 0 {
+                            AArch64Opcode::SubRI
+                        } else {
+                            AArch64Opcode::AddRI
+                        };
+                        original.inst_mut(step_id).operands[2] = imm(step.abs());
+                        let mut optimized = original.clone();
+                        assert!(StrengthReduction.run(&mut optimized));
+                        let mut before = vec![0; original.next_vreg as usize];
+                        let mut after = vec![0; optimized.next_vreg as usize];
+                        execute_trace_block(
+                            &original,
+                            original.entry,
+                            original.entry,
+                            &mut before,
+                            mask,
+                        );
+                        execute_trace_block(
+                            &optimized,
+                            optimized.entry,
+                            optimized.entry,
+                            &mut after,
+                            mask,
+                        );
+                        let mut previous = original.entry;
+                        let mut expected_iv = init & mask;
+                        for iteration in 0..64 {
+                            for (func, values) in
+                                [(&original, &mut before), (&optimized, &mut after)]
+                            {
+                                execute_trace_block(func, BlockId(1), previous, values, mask);
+                                execute_trace_block(func, BlockId(3), BlockId(1), values, mask);
+                            }
+                            let expected = expected_iv.wrapping_mul(stride) & mask;
+                            assert_eq!(before[2], expected, "source oracle");
+                            assert_eq!(
+                                after[2], expected,
+                                "{class:?} init={init} stride={stride} step={step} iteration={iteration}"
+                            );
+                            if iteration % 3 != 0 {
+                                execute_trace_block(
+                                    &original,
+                                    other,
+                                    BlockId(3),
+                                    &mut before,
+                                    mask,
+                                );
+                                execute_trace_block(
+                                    &optimized,
+                                    other,
+                                    BlockId(3),
+                                    &mut after,
+                                    mask,
+                                );
+                                previous = other;
+                                expected_iv = expected_iv.wrapping_add(step as u64) & mask;
+                            } else {
+                                previous = BlockId(3);
+                                expected_iv = expected_iv.wrapping_add(1) & mask;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strength_reduce_keeps_original_loop_if_any_backedge_has_no_affine_step() {
+        let mut func = make_two_latch_loop();
+        let update = func.block(BlockId(4)).insts[0];
+        *func.inst_mut(update) =
+            MachInst::new(AArch64Opcode::MulRR, vec![vreg(5), vreg(1), vreg(1)]);
+        let before = format!("{func:?}");
+        assert!(!StrengthReduction.run(&mut func));
+        assert_eq!(format!("{func:?}"), before);
     }
 }

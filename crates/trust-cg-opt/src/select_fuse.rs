@@ -39,30 +39,39 @@
 //!
 //! - A fused `CMP xb, #0` must be immediately followed by the CSELs that
 //!   consume it (condition NE or EQ; EQ fuses to the inverted condition).
-//! - Any OTHER flag-writing instruction ends the scan (`commit`): flags
-//!   are re-established, everything downstream is unaffected.
 //! - Any flag-READING instruction encountered after a planned deletion
 //!   ABORTS the whole plan (it would observe changed flags) — fail-closed.
 //!   Flag readers seen before any deletion are unaffected and benign.
+//! - A definite NZCV kill (any OTHER flag writer, or a call: NZCV is
+//!   caller-saved) ends the scan (`commit`): nothing downstream observes the
+//!   deletions.
+//! - A pseudo with an unknown expansion commits only an empty plan.
+//! - A trap carrier (expanded later into its own compare and branch) or a
+//!   branch stops further matching: no re-test past it is fused to the
+//!   CSET's flags. Readers after it are still checked.
 //! - A redefinition of the boolean register stops further matching (later
 //!   re-tests test the NEW value).
-//! - Flags are never live across block boundaries in this backend (the
-//!   same-block discipline every fusion pass relies on: isel emits the
-//!   flag setter immediately before each consumer; cmp-branch-fusion and
-//!   cmp-select both assume it), so reaching the end of the block commits.
+//! - NZCV can be live out of a block: cmp-branch-fusion's cross-block
+//!   compare elimination lets a single-predecessor successor read its
+//!   predecessor's flags. At the end of the block a plan commits only when
+//!   no successor can observe them (`effects::nzcv_dead_after_branch`).
 //!
 //! This pass runs LATE — after the NEON vectorizers, whose recognizers
 //! decode the materialized CSET shape (they also accept the direct
 //! `CmpRR; Csel(cc)` shape, but running late means their input is
 //! byte-for-byte what they were built against).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
-    AArch64Opcode, CondCode, InstId, MachFunction, MachOperand, PassId, ProvenanceMap, VReg,
+    AArch64Opcode, BlockId, CondCode, InstId, MachFunction, MachOperand, PassId, ProvenanceMap,
+    VReg,
 };
 
-use crate::effects::{aarch64_def_operand_positions, aarch64_use_operand_positions, writes_flags};
+use crate::effects::{
+    aarch64_def_operand_positions, aarch64_use_operand_positions, kills_nzcv, may_clobber_nzcv,
+    nzcv_dead_after_branch, nzcv_unknown, reads_nzcv,
+};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// AArch64 select/flag fusion pass.
@@ -127,7 +136,7 @@ fn run_select_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provenan
             let Some(cset_cond) = inst.operands[1].as_imm().and_then(decode_cond) else {
                 continue;
             };
-            if let Some(groups) = scan_from_cset(func, &insts, position, bool_vreg, cset_cond)
+            if let Some(groups) = scan_from_cset(func, block_id, position, bool_vreg, cset_cond)
                 && !groups.is_empty()
             {
                 plans.push(CsetPlan {
@@ -143,7 +152,7 @@ fn run_select_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provenan
         return false;
     }
 
-    let mut to_delete: HashSet<InstId> = HashSet::new();
+    let mut to_delete: HashSet<InstId> = HashSet::default();
     let mut changed = false;
 
     for plan in &plans {
@@ -200,11 +209,12 @@ fn run_select_fuse(func: &mut MachFunction, mut provenance: Option<&mut Provenan
 /// (possibly empty) list of committed fuse groups.
 fn scan_from_cset(
     func: &MachFunction,
-    insts: &[InstId],
+    block: BlockId,
     cset_pos: usize,
     bool_vreg: VReg,
     cset_cond: CondCode,
 ) -> Option<Vec<FuseGroup>> {
+    let insts = &func.block(block).insts;
     let mut groups: Vec<FuseGroup> = Vec::new();
     let mut matching = true;
     let mut j = cset_pos + 1;
@@ -258,17 +268,32 @@ fn scan_from_cset(
             // real flag writer.
         }
 
-        // Any real flag writer re-establishes NZCV: everything downstream
-        // is unaffected by our deletions. Commit.
-        if writes_flags(inst.opcode) {
+        // Flag readers after a planned deletion would observe changed
+        // flags — abort the whole plan (fail-closed). Readers before any
+        // deletion are unaffected. Checked before the kill test below, so
+        // an instruction that reads NZCV and then writes it (`ADCS`, `SBCS`)
+        // cannot commit a plan whose deletion it observes.
+        if reads_nzcv(inst) && !groups.is_empty() {
+            return None;
+        }
+
+        // A definite kill (a flag writer, or a call: NZCV is caller-saved)
+        // ends the scan: nothing downstream observes our deletions. Commit.
+        if kills_nzcv(inst) {
             return Some(groups);
         }
 
-        // Flag readers after a planned deletion would observe changed
-        // flags — abort the whole plan (fail-closed). Readers before any
-        // deletion are unaffected.
-        if reads_nzcv(inst.opcode) && !groups.is_empty() {
-            return None;
+        // A pseudo with an unknown expansion may read NZCV: only an empty
+        // plan is safe to commit past it.
+        if nzcv_unknown(inst) {
+            return groups.is_empty().then_some(groups);
+        }
+
+        // A trap carrier may change NZCV and a branch may leave the block
+        // without killing it: no re-test past either is fused to the CSET's
+        // flags, but later readers still observe our deletions.
+        if may_clobber_nzcv(inst) {
+            matching = false;
         }
 
         // A redefinition of the boolean stops further re-test matching
@@ -280,9 +305,12 @@ fn scan_from_cset(
         j += 1;
     }
 
-    // End of block: flags are not live across block boundaries in this
-    // backend (same-block flag discipline). Commit.
-    Some(groups)
+    // End of block. NZCV can be live out (cmp-branch-fusion's cross-block
+    // compare elimination makes a successor read it), so a plan commits only
+    // when no successor can observe the deleted re-tests.
+    let empty = HashSet::default();
+    (groups.is_empty() || nzcv_dead_after_branch(func, block, insts.len() - 1, &empty))
+        .then_some(groups)
 }
 
 fn is_cmp_zero_of(inst: &trust_cg_ir::MachInst, bool_vreg: VReg) -> bool {
@@ -290,12 +318,6 @@ fn is_cmp_zero_of(inst: &trust_cg_ir::MachInst, bool_vreg: VReg) -> bool {
         && inst.operands.len() == 2
         && inst.operands[0].as_vreg() == Some(bool_vreg)
         && inst.operands[1].as_imm() == Some(0)
-}
-
-/// True if the opcode reads the NZCV flags (conditional ops, carry ops,
-/// and conditional branches).
-fn reads_nzcv(opcode: AArch64Opcode) -> bool {
-    crate::effects::reads_flags(opcode) || opcode == AArch64Opcode::BCond
 }
 
 fn defines_vreg(func: &MachFunction, inst_id: InstId, vreg: VReg) -> bool {
@@ -306,7 +328,7 @@ fn defines_vreg(func: &MachFunction, inst_id: InstId, vreg: VReg) -> bool {
 }
 
 fn count_vreg_uses(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for block_id in &func.block_order {
         let block = func.block(*block_id);
         for &inst_id in &block.insts {

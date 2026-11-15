@@ -36,6 +36,7 @@ fn func_ty(params: Vec<TrustIrTy>, returns: Vec<TrustIrTy>) -> FuncTy {
     FuncTy {
         params,
         returns,
+        abi: None,
         is_vararg: false,
     }
 }
@@ -57,7 +58,9 @@ fn add_unsigned_cmp_mask_extract_function(
 ) {
     let v4i32 = v4i32_ty();
     let ty = func_ty(vec![TrustIrTy::Ptr, TrustIrTy::Ptr], vec![TrustIrTy::I32]);
-    let func_ty_id: FuncTyId = module.add_func_type(ty);
+    let func_ty_id: FuncTyId = module
+        .add_func_type(ty)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(f(func_id), name, func_ty_id, b(0));
     func.blocks = vec![TrustIrBlock {
         id: b(0),
@@ -110,7 +113,9 @@ fn add_unsigned_cmp_mask_extract_function(
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn unsigned_cmp_cases() -> [(&'static str, ICmpOp); 4] {
@@ -144,7 +149,7 @@ fn build_single_unsigned_cmp_module(name: &str, op: ICmpOp) -> TrustIrModule {
 fn host_jit_o0_compiler() -> Compiler {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
-    Compiler::new(config)
+    Compiler::new(config).with_codegen_license(permit_unlicensed())
 }
 
 fn metrics_for<'a>(result: &'a JitCompilationResult, name: &str) -> &'a FunctionQualityMetrics {
@@ -157,7 +162,7 @@ fn metrics_for<'a>(result: &'a JitCompilationResult, name: &str) -> &'a Function
 
 fn single_translated_lir_function(module: &TrustIrModule) -> LirFunction {
     let mut translated =
-        trust_cg_lower::translate_module(module).expect("test module must translate to LIR");
+        permit_translate_module(module).expect("test module must translate to LIR");
     assert_eq!(
         translated.len(),
         1,
@@ -399,4 +404,28 @@ fn x86_v4i32_unsigned_compare_avx_feature_bits_are_inert() {
         assert_legacy_unsigned_compare_code_shape(&generic_code, op, &name);
         assert_legacy_unsigned_compare_code_shape(&avx_code, op, &name);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

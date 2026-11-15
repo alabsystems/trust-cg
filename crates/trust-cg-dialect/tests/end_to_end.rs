@@ -20,6 +20,23 @@ use trust_cg_dialect::module::{DialectFunction, DialectModule};
 use trust_cg_dialect::pass::{Legality, validate_legality};
 use trust_cg_dialect::registry::DialectRegistry;
 
+fn reconstructed_magic(insts: &[trust_cg_ir::MachInst]) -> u64 {
+    let mut value = 0_u64;
+    for inst in insts {
+        let halfword = inst.operands[1].as_imm().unwrap();
+        assert!((0..=0xffff).contains(&halfword));
+        let shift = match inst.opcode {
+            AArch64Opcode::Movz => 0,
+            AArch64Opcode::Movk => inst.operands[2].as_imm().unwrap(),
+            opcode => panic!("unexpected constant instruction {opcode:?}"),
+        };
+        assert!([0, 16, 32, 48].contains(&shift));
+        let mask = 0xffff_u64 << shift;
+        value = (value & !mask) | ((halfword as u64) << shift);
+    }
+    value
+}
+
 fn build_verif_module() -> (
     DialectModule,
     trust_cg_dialect::id::DialectId,
@@ -37,7 +54,8 @@ fn build_verif_module() -> (
         "fingerprint_of",
         vec![Type::I64, Type::I64],
         vec![Type::I64],
-    );
+    )
+    .expect("bounded test function");
     let entry = func.entry_block().unwrap();
     let states = func.params[0].0;
     let count = func.params[1].0;
@@ -48,8 +66,9 @@ fn build_verif_module() -> (
         vec![states],
         vec![],
         None,
-    );
-    let result = func.alloc_value();
+    )
+    .expect("bounded test function");
+    let result = func.alloc_value().expect("bounded test function");
     func.append_op(
         entry,
         DialectOpId::new(verif_id, verif::FINGERPRINT_BATCH),
@@ -57,7 +76,8 @@ fn build_verif_module() -> (
         vec![states, count],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
     // Mirror trust_ir.ret so after verif->trust_ir lowering the module returns.
     func.append_op(
         entry,
@@ -66,7 +86,8 @@ fn build_verif_module() -> (
         vec![result],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     let mut module = DialectModule::new("fingerprint", registry);
     module.push_function(func);
@@ -85,11 +106,12 @@ fn build_bfs_step_module() -> (
     // fn bfs_step_of(frontier: i64, seen_set: i64) -> i64 {
     //     return verif.bfs_step(frontier, seen_set)
     // }
-    let mut func = DialectFunction::new("bfs_step_of", vec![Type::I64, Type::I64], vec![Type::I64]);
+    let mut func = DialectFunction::new("bfs_step_of", vec![Type::I64, Type::I64], vec![Type::I64])
+        .expect("bounded test function");
     let entry = func.entry_block().unwrap();
     let frontier = func.params[0].0;
     let seen_set = func.params[1].0;
-    let result = func.alloc_value();
+    let result = func.alloc_value().expect("bounded test function");
     func.append_op(
         entry,
         DialectOpId::new(verif_id, verif::BFS_STEP),
@@ -97,7 +119,8 @@ fn build_bfs_step_module() -> (
         vec![frontier, seen_set],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
     func.append_op(
         entry,
         DialectOpId::new(trust_ir_id, trust_ir::TRUST_IR_RET),
@@ -105,7 +128,8 @@ fn build_bfs_step_module() -> (
         vec![result],
         vec![],
         None,
-    );
+    )
+    .expect("bounded test function");
 
     let mut module = DialectModule::new("bfs_step", registry);
     module.push_function(func);
@@ -147,31 +171,29 @@ fn progressive_lowering_verif_to_machine() {
     assert_eq!(mf.signature.params, vec![Type::I64, Type::I64]);
     assert_eq!(mf.signature.returns, vec![Type::I64]);
 
-    // We expect the following ops in order (ignoring flags, exact registers):
-    //   Movz  (the magic constant)
-    //   EorRR (ptr XOR len)
-    //   EorRR (XOR magic)
-    //   Ret
+    // ABI entry copies, the four-halfword magic, two XORs, then the X0 result
+    // transfer and RET. Exact temporary registers are assigned downstream.
     let opcodes: Vec<AArch64Opcode> = mf.insts.iter().map(|i| i.opcode).collect();
     assert_eq!(
         opcodes,
         vec![
+            AArch64Opcode::MovR,
+            AArch64Opcode::MovR,
             AArch64Opcode::Movz,
+            AArch64Opcode::Movk,
+            AArch64Opcode::Movk,
+            AArch64Opcode::Movk,
             AArch64Opcode::EorRR,
             AArch64Opcode::EorRR,
+            AArch64Opcode::MovR,
             AArch64Opcode::Ret,
         ],
         "unexpected MachInst sequence: {:?}",
         opcodes
     );
 
-    // The Movz instruction should carry the fingerprint magic value.
-    let movz = &mf.insts[0];
-    let imm = movz
-        .operands
-        .iter()
-        .find_map(|o| o.as_imm())
-        .expect("Movz has immediate operand");
+    // The combined MOVZ/MOVK sequence must carry the entire magic value.
+    let imm = reconstructed_magic(&mf.insts[2..6]);
     assert_eq!(imm as u64, FINGERPRINT_BATCH_MAGIC);
 
     // Every instruction should be in the entry block.
@@ -209,21 +231,22 @@ fn progressive_lowering_bfs_step_to_machine() {
     assert_eq!(
         opcodes,
         vec![
+            AArch64Opcode::MovR,
+            AArch64Opcode::MovR,
             AArch64Opcode::Movz,
+            AArch64Opcode::Movk,
+            AArch64Opcode::Movk,
+            AArch64Opcode::Movk,
             AArch64Opcode::AddRR,
             AArch64Opcode::EorRR,
+            AArch64Opcode::MovR,
             AArch64Opcode::Ret,
         ],
         "unexpected MachInst sequence: {:?}",
         opcodes
     );
 
-    let movz = &mf.insts[0];
-    let imm = movz
-        .operands
-        .iter()
-        .find_map(|o| o.as_imm())
-        .expect("Movz has immediate operand");
+    let imm = reconstructed_magic(&mf.insts[2..6]);
     assert_eq!(imm as u64, BFS_STEP_MAGIC);
 }
 

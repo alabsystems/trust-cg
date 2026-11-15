@@ -37,11 +37,21 @@ use trust_ir::{BlockId, FuncId, ValueId};
 fn macho_compiler(config: CompilerConfig) -> Compiler {
     let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
         .expect("aarch64-apple-darwin parses");
-    Compiler::new_for_target_spec(config, spec)
+    Compiler::new_for_target_spec(config, spec).with_codegen_license(permit_unlicensed())
+}
+
+/// The directory this test process writes its objects, drivers and binaries
+/// into: one per process, removed when the process exits (see
+/// `fresh_dir::process_scoped`).
+fn e2e_scratch_dir() -> std::path::PathBuf {
+    static DIRECTORY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| fresh_dir::process_scoped("trust_cg_e2e_tests-"))
+        .clone()
 }
 
 fn write_temp_file(name: &str, suffix: &str, contents: &[u8]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("trust_cg_e2e_tests");
+    let dir = e2e_scratch_dir();
     fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join(format!("{}{}", name, suffix));
     let mut f = fs::File::create(&path).expect("create temp file");
@@ -120,11 +130,14 @@ fn run_macho_nm(path: &std::path::Path) -> Option<String> {
 /// Build a minimal trust_ir module: `fn add(a: i32, b: i32) -> i32 { a + b }`
 fn build_trust_ir_add_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_add_two", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -145,18 +158,23 @@ fn build_trust_ir_add_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// Build a trust_ir module: `fn const_42() -> i32 { 42 }`
 fn build_trust_ir_const_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_const_42", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -172,18 +190,23 @@ fn build_trust_ir_const_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// Build a trust_ir module: `fn sub_vals(a: i64, b: i64) -> i64 { a - b }`
 fn build_trust_ir_sub_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sub_vals", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -201,7 +224,9 @@ fn build_trust_ir_sub_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -337,7 +362,7 @@ fn e2e_aarch64_link_and_run() {
         .compile(&module)
         .expect("compilation should succeed");
 
-    let test_dir = std::env::temp_dir().join("trust_cg_e2e_tests");
+    let test_dir = e2e_scratch_dir();
     fs::create_dir_all(&test_dir).expect("create temp dir");
 
     let obj_path = test_dir.join("add_two.o");
@@ -481,7 +506,7 @@ fn e2e_aarch64_ir_link_and_run() {
         .compile_ir_function(&mut ir_func)
         .expect("compile_ir_function should succeed");
 
-    let test_dir = std::env::temp_dir().join("trust_cg_e2e_tests");
+    let test_dir = e2e_scratch_dir();
     fs::create_dir_all(&test_dir).expect("create temp dir");
 
     let obj_path = test_dir.join("ir_add.o");
@@ -785,11 +810,14 @@ fn link_and_run(
 fn build_trust_ir_max_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_max_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): compare and branch
@@ -833,7 +861,9 @@ fn build_trust_ir_max_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -852,11 +882,14 @@ fn build_trust_ir_max_module() -> TrustIrModule {
 fn build_trust_ir_abs_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_abs_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): compare x < 0
@@ -911,7 +944,9 @@ fn build_trust_ir_abs_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -936,11 +971,14 @@ fn build_trust_ir_abs_module() -> TrustIrModule {
 fn build_trust_ir_fibonacci_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fibonacci", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): check n <= 1
@@ -1060,7 +1098,9 @@ fn build_trust_ir_fibonacci_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1082,11 +1122,14 @@ fn build_trust_ir_fibonacci_module() -> TrustIrModule {
 fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum_1_to_n", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): init sum=0, i=1, jump to loop
@@ -1173,7 +1216,9 @@ fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1561,11 +1606,14 @@ fn build_trust_ir_cross_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
     // fn _callee(x: i32) -> i32 { x + 10 }
-    let ft_id_1 = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id_1 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut callee = TrustIrFunction::new(FuncId::new(0), "_callee", ft_id_1, BlockId::new(0));
     callee.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1590,11 +1638,14 @@ fn build_trust_ir_cross_call_module() -> TrustIrModule {
     }];
 
     // fn _caller(x: i32) -> i32 { _callee(x) }
-    let ft_id_2 = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id_2 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(FuncId::new(1), "_caller", ft_id_2, BlockId::new(0));
     caller.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1611,8 +1662,12 @@ fn build_trust_ir_cross_call_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1762,11 +1817,14 @@ int main(void) {
 fn build_trust_ir_tla_record_cross_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let sum_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let sum_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut callee =
         TrustIrFunction::new(FuncId::new(0), "_tla_record_sum2", sum_ft, BlockId::new(0));
     callee.blocks = vec![TrustIrBlock {
@@ -1824,11 +1882,14 @@ fn build_trust_ir_tla_record_cross_call_module() -> TrustIrModule {
         ],
     }];
 
-    let build_ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let build_ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(
         FuncId::new(1),
         "_tla_record_build_then_sum2",
@@ -1962,8 +2023,12 @@ fn build_trust_ir_tla_record_cross_call_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2094,11 +2159,14 @@ int main(void) {
 fn build_trust_ir_classify_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_classify", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): check x < 0
@@ -2190,7 +2258,9 @@ fn build_trust_ir_classify_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2213,11 +2283,14 @@ fn build_trust_ir_classify_module() -> TrustIrModule {
 fn build_trust_ir_sum_to_n_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum_to_n", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): acc=0, i=1, jump to loop
@@ -2307,7 +2380,9 @@ fn build_trust_ir_sum_to_n_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2330,11 +2405,14 @@ fn build_trust_ir_sum_to_n_module() -> TrustIrModule {
 fn build_trust_ir_clamp_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_clamp", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): cmp x < lo
@@ -2408,7 +2486,9 @@ fn build_trust_ir_clamp_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2434,11 +2514,14 @@ fn build_trust_ir_clamp_module() -> TrustIrModule {
 fn build_trust_ir_factorial_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_factorial", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0 (entry): check n <= 1
@@ -2562,7 +2645,9 @@ fn build_trust_ir_factorial_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2962,16 +3047,17 @@ fn build_trust_ir_thread_local_module() -> TrustIrModule {
 
     // `_Thread_local int X = 0xABCD;` — the 4-byte little-endian template
     // `CD AB 00 00` lives in `__thread_data`; the descriptor in `__thread_vars`.
+    // An `i32` global's initializer is the integer itself: trust-ir refuses a
+    // byte aggregate at `i32` (`ConstTypeMismatch`), and every ingestion entry
+    // refuses what the validator refuses (WS7.3).
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "X".to_string(),
         ty: Ty::I32,
         mutable: true,
-        initializer: Some(Constant::Aggregate(vec![
-            Constant::Int(0xCD),
-            Constant::Int(0xAB),
-            Constant::Int(0x00),
-            Constant::Int(0x00),
-        ])),
+        initializer: Some(Constant::Int(0xABCD)),
         linkage: Linkage::External,
         // Any dynamic model selects the Darwin TLV path on Mach-O; the backend
         // lowers it to `TlsModel::Tlv` during ISel.
@@ -2980,11 +3066,14 @@ fn build_trust_ir_thread_local_module() -> TrustIrModule {
     });
 
     // int read_x(void) { return X; }
-    let ft_read = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_read = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut read = TrustIrFunction::new(FuncId::new(0), "read_x", ft_read, BlockId::new(0));
     read.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -3006,14 +3095,19 @@ fn build_trust_ir_thread_local_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(read);
+    module
+        .try_add_function(read)
+        .expect("Module::try_add_function: test fixture");
 
     // int bump_x(int delta) { X = X + delta; return X; }
-    let ft_bump = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_bump = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut bump = TrustIrFunction::new(FuncId::new(1), "bump_x", ft_bump, BlockId::new(0));
     bump.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -3054,7 +3148,9 @@ fn build_trust_ir_thread_local_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(bump);
+    module
+        .try_add_function(bump)
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -3075,7 +3171,7 @@ fn e2e_aarch64_thread_local_read_is_correct_and_per_thread() {
         .compile(&module)
         .expect("thread-local module compilation should succeed");
 
-    let test_dir = std::env::temp_dir().join("trust_cg_e2e_tests");
+    let test_dir = e2e_scratch_dir();
     fs::create_dir_all(&test_dir).expect("create temp dir");
 
     let obj_path = test_dir.join("tls_x.o");
@@ -3146,11 +3242,13 @@ int main(void) {
     }
 
     // Run under a watchdog: a botched TLV descriptor / BLR would hang or crash.
-    let run_output = Command::new("timeout")
-        .args(["10", binary_path.to_str().unwrap()])
-        .output()
-        .or_else(|_| Command::new(binary_path.to_str().unwrap()).output())
-        .expect("run the TLV binary");
+    let run = process::run_executable_with_timeout(
+        &binary_path,
+        process::exec_timeout(std::time::Duration::from_secs(10)),
+    )
+    .expect("run the TLV binary");
+    assert!(!run.timed_out, "TLV binary hung: {:?}", run.output);
+    let run_output = run.output;
 
     let run_stdout = String::from_utf8_lossy(&run_output.stdout);
     eprintln!("TLV binary stdout: {}", run_stdout.trim());
@@ -3168,3 +3266,17 @@ int main(void) {
         "thread-local read must be 0xABCD and per-thread isolated"
     );
 }
+
+#[path = "common/fresh_dir.rs"]
+mod fresh_dir;
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+#[path = "common/rosetta.rs"]
+mod process;

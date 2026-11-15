@@ -22,12 +22,13 @@
 // interpreter oracle is DOWNSTREAM of the adapter — both sides share the adapter
 // output, so an adapter miscompile is in BOTH the oracle and the test side and
 // cancels out. To catch a bridge bug you need an oracle that does NOT go through
-// trust-cg at all: stock rustc/LLVM.
+// trust-cg at all: the compiler's own LLVM backend (trustc without
+// `-Zcodegen-backend`).
 //
 // This module is the toolchain-independent CORE of that harness: the outcome
 // model, the comparison (diff) engine, the seed corpus, and the test-case
 // reducer. All of it is PURE and unit-testable inside the workspace. The two
-// actual compiler invocations (stock rustc/LLVM -> reference exe; trust-cg
+// actual compiler invocations (trustc/LLVM -> reference exe; trust-cg
 // backend -> test exe) live behind the `BridgeCompiler` trait, whose real
 // implementation (`real_compiler` / the bridge integration test) needs the
 // nightly `target-bridge` toolchain and is therefore exercised out of workspace.
@@ -98,7 +99,7 @@ impl RunOutcome {
 /// One backend's identity, used only for human-readable finding messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Backend {
-    /// Stock rustc with the default LLVM codegen backend — the ORACLE.
+    /// The compiler (trustc) with its default LLVM codegen backend — the ORACLE.
     LlvmReference,
     /// rustc with `-Zcodegen-backend=<librustc_codegen_trust_cg>` — UNDER TEST.
     TrustCg,
@@ -190,19 +191,16 @@ pub enum DivergenceKind {
 ///   * LLVM `CompileError`      => `ReferenceCompileError` (bad fixture)
 ///   * trap-vs-value / hang-vs-exit / wrong-value => `Divergence`
 pub fn diff_outcomes(reference: &RunOutcome, test: &RunOutcome) -> DiffVerdict {
-    // A reference (LLVM) compile error means the fixture is malformed; we cannot
-    // form an oracle, so this is never a trust-cg finding.
-    if let RunOutcome::CompileError { stderr_tail } = reference {
-        return DiffVerdict::ReferenceCompileError(stderr_tail.clone());
-    }
-    // trust-cg failing closed (refusing to lower) is the SAFE outcome. The
-    // bridge emitted no wrong code. Surface it distinctly so a corpus entry that
-    // expects compilation can flag a regression, but it is NOT a miscompile.
-    if let RunOutcome::CompileError { stderr_tail } = test {
-        return DiffVerdict::TrustCgFailedClosed(stderr_tail.clone());
-    }
-
     match (reference, test) {
+        // These arms precede all execution outcomes: a failed reference has no
+        // oracle, including when trust-cg also refuses. A trust-cg refusal is
+        // reported separately from a wrong-code finding.
+        (RunOutcome::CompileError { stderr_tail }, _) => {
+            DiffVerdict::ReferenceCompileError(stderr_tail.clone())
+        }
+        (_, RunOutcome::CompileError { stderr_tail }) => {
+            DiffVerdict::TrustCgFailedClosed(stderr_tail.clone())
+        }
         // Both ran to a clean exit: compare exit code AND captured stdout.
         (
             RunOutcome::Exited {
@@ -317,12 +315,6 @@ pub fn diff_outcomes(reference: &RunOutcome, test: &RunOutcome) -> DiffVerdict {
             kind: DivergenceKind::HangMismatch,
             detail: format!("llvm={} trust_cg=TIMEOUT", describe(reference)),
         },
-
-        // CompileError pairs are handled by the early returns above; this arm is
-        // unreachable for them, but the match must be exhaustive.
-        (RunOutcome::CompileError { .. }, _) | (_, RunOutcome::CompileError { .. }) => {
-            unreachable!("compile-error outcomes handled before the value match")
-        }
     }
 }
 
@@ -660,9 +652,9 @@ fn join(lines: &[String]) -> String {
 
 /// The two-compiler boundary. The PURE logic above (diff + reduce + corpus)
 /// never touches a compiler; it only ever sees `RunOutcome`s. A real campaign
-/// implements this by shelling out to `rustup run <nightly> rustc ...` (see the
-/// bridge integration test `bridge_differential_x86.rs`), which requires the
-/// `target-bridge` toolchain. Unit tests implement it with canned outcomes.
+/// implements this by shelling out to the Trust package's `trustc
+/// -Ztrust-verify=off ...` (see the bridge integration test
+/// `bridge_differential_x86.rs`), the compiler the bridge is built for. Unit tests implement it with canned outcomes.
 pub trait BridgeCompiler {
     /// Compile `source` with the given backend at `opt`, run the resulting
     /// binary, and return its outcome. Must never panic on a compile failure —

@@ -1,0 +1,23 @@
+; TrustIr text format v1
+module "call_unwind_boundary"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+
+functy.0 = (u64) -> (u64)
+
+functy.1 = (functy.0, u64) -> (u64)
+
+fn @identity(functy.0) {
+    ; #body-gate: ungated
+bb2(%0: u64):
+    ret %0
+}
+
+fn @all_call_shapes(functy.1) {
+    ; #body-gate: ungated
+bb11(%0: functy.0, %1: u64):
+    %2 = call @func.0(%1)
+    %3 = call_cannot_unwind @func.0(%2)
+    %4 = call_indirect %0(functy.0)(%3)
+    %5 = call_indirect_cannot_unwind %0(functy.0)(%4) cc=fastcc
+    ret %5
+}

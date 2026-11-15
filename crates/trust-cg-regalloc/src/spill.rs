@@ -10,17 +10,19 @@
 //! - Stores after each definition of a spilled VReg.
 //! - Loads before each use of a spilled VReg.
 //!
-//! Each spilled VReg gets a dedicated stack slot. Future work will add
-//! spill-slot reuse (share slots for non-overlapping spilled intervals)
-//! and rematerialization (recompute cheap values instead of loading).
+//! Each distinct spilled VReg initially gets a dedicated stack slot. The
+//! surrounding pipeline can subsequently rematerialize loads and reuse slots
+//! for non-overlapping live intervals. Slot IDs and metadata are planned before
+//! any spill instructions are emitted; exhaustion returns an error.
 //!
 //! Reference: LLVM's `InlineSpiller` and `SpillPlacement`.
 
-use crate::linear_scan::SpillInfo;
 use crate::machine_types::{
-    InstFlags, InstId, MachFunction, MachInst, MachOperand, PReg, RegClass, StackSlotId, VReg,
+    InstFlags, InstId, MachFunction, MachInst, MachOperand, PReg, StackSlotAllocationPlan,
+    StackSlotId, VReg,
 };
-use std::collections::BTreeMap;
+use crate::{AllocError, SpillInfo};
+use std::collections::{BTreeMap, BTreeSet};
 
 type SpillInsertionPlan = Vec<(InstId, Vec<MachInst>, Vec<MachInst>)>;
 
@@ -38,25 +40,20 @@ pub const PSEUDO_SPILL_LOAD: u16 = 0xFFF1;
 /// 2. After each def of the spilled VReg, insert a store to the stack slot.
 /// 3. Before each use of the spilled VReg, insert a load from the stack slot.
 ///
-/// The spilled VReg operands are rewritten to use a fresh temporary VReg
-/// that is immediately loaded/stored, so it has a very short live range
-/// (just one instruction). This temporary can be trivially allocated in
-/// a second allocation pass or assigned a dedicated spill register.
+/// Pseudos retain the original VReg identities; this helper does not create
+/// new temporary VRegs or assign physical spill registers. Repeated requests
+/// for one VReg share one slot/record, in first-occurrence order. ID exhaustion
+/// leaves the function unchanged, including slot metadata.
 pub fn insert_spill_code(
     func: &mut MachFunction,
     spilled_vregs: &[VReg],
     _allocation: &BTreeMap<VReg, PReg>,
-) -> Vec<SpillInfo> {
-    let mut spill_infos = Vec::new();
-    let mut vreg_to_slot: BTreeMap<VReg, StackSlotId> = BTreeMap::new();
-
-    // Allocate stack slots for each spilled VReg.
-    for &vreg in spilled_vregs {
-        let size = reg_class_size(vreg.class);
-        let slot = func.alloc_stack_slot(size, size); // align = size
-        vreg_to_slot.insert(vreg, slot);
-        spill_infos.push(SpillInfo { vreg, slot });
-    }
+) -> Result<Vec<SpillInfo>, AllocError> {
+    let (slots, spill_infos) = plan_spill_slots(func, spilled_vregs)?;
+    let vreg_to_slot: BTreeMap<_, _> = spill_infos
+        .iter()
+        .map(|spill| (spill.vreg, spill.slot))
+        .collect();
 
     // Phase 1: Scan all blocks and collect the spill insertions needed.
     // We must read func.insts immutably first, then mutate afterward.
@@ -96,7 +93,8 @@ pub fn insert_spill_code(
         block_plans.push(plan);
     }
 
-    // Phase 2: Apply the plans — add new instructions and rebuild block inst lists.
+    // Phase 2: Commit slots and instructions after every allocation succeeded.
+    slots.commit(func);
     for (block_idx, plan) in block_plans.into_iter().enumerate() {
         let mut new_insts = Vec::new();
 
@@ -122,20 +120,37 @@ pub fn insert_spill_code(
         func.blocks[block_idx].insts = new_insts;
     }
 
-    spill_infos
+    Ok(spill_infos)
 }
 
-/// Returns the size in bytes for a register class.
-fn reg_class_size(class: RegClass) -> u32 {
-    match class {
-        RegClass::Gpr32 | RegClass::Fpr32 => 4,
-        RegClass::Gpr64 | RegClass::Fpr64 => 8,
-        RegClass::Fpr128 => 16,
-        // Smaller FPR classes: use their natural size
-        RegClass::Fpr16 => 2,
-        RegClass::Fpr8 => 1,
-        RegClass::System => 4,
+fn plan_spill_slots(
+    func: &MachFunction,
+    spilled: &[VReg],
+) -> Result<(StackSlotAllocationPlan, Vec<SpillInfo>), AllocError> {
+    let mut slots = func.stack_slot_allocation_plan();
+    let mut seen = BTreeSet::new();
+    let mut infos = Vec::new();
+    for &vreg in spilled {
+        if seen.insert(vreg) {
+            let size = vreg.class.size_bytes();
+            let slot = slots
+                .allocate(size, size)
+                .ok_or(AllocError::StackSlotExhausted)?;
+            infos.push(SpillInfo { vreg, slot });
+        }
     }
+    Ok((slots, infos))
+}
+
+/// Allocate metadata for the target-owned spill-code lane using the same slot
+/// policy as generic pseudo insertion. Refusal does not commit a partial set.
+pub(crate) fn allocate_spill_slots(
+    func: &mut MachFunction,
+    spilled: &[VReg],
+) -> Result<Vec<SpillInfo>, AllocError> {
+    let (slots, infos) = plan_spill_slots(func, spilled)?;
+    slots.commit(func);
+    Ok(infos)
 }
 
 /// Create a pseudo spill-load instruction: load VReg from stack slot.
@@ -167,17 +182,18 @@ fn make_spill_store(vreg: VReg, slot: StackSlotId) -> MachInst {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine_types::RegClass;
 
     #[test]
     fn test_reg_class_sizes() {
-        assert_eq!(reg_class_size(RegClass::Gpr32), 4);
-        assert_eq!(reg_class_size(RegClass::Gpr64), 8);
-        assert_eq!(reg_class_size(RegClass::Fpr32), 4);
-        assert_eq!(reg_class_size(RegClass::Fpr64), 8);
-        assert_eq!(reg_class_size(RegClass::Fpr128), 16);
-        assert_eq!(reg_class_size(RegClass::Fpr16), 2);
-        assert_eq!(reg_class_size(RegClass::Fpr8), 1);
-        assert_eq!(reg_class_size(RegClass::System), 4);
+        assert_eq!(RegClass::Gpr32.size_bytes(), 4);
+        assert_eq!(RegClass::Gpr64.size_bytes(), 8);
+        assert_eq!(RegClass::Fpr32.size_bytes(), 4);
+        assert_eq!(RegClass::Fpr64.size_bytes(), 8);
+        assert_eq!(RegClass::Fpr128.size_bytes(), 16);
+        assert_eq!(RegClass::Fpr16.size_bytes(), 2);
+        assert_eq!(RegClass::Fpr8.size_bytes(), 1);
+        assert_eq!(RegClass::System.size_bytes(), 4);
     }
 
     /// Helper: build a simple single-block function where v0 is defined and used.
@@ -236,6 +252,149 @@ mod tests {
     }
 
     #[test]
+    fn slot_boundary_spill_exhaustion_preserves_function() {
+        let (mut func, allocation) = make_simple_def_use();
+        func.next_stack_slot = u32::MAX - 1;
+        let before = format!("{func:?}");
+        let spilled = [
+            VReg::new(0, RegClass::Gpr64),
+            VReg::new(1, RegClass::Fpr128),
+        ];
+        assert!(matches!(
+            insert_spill_code(&mut func, &spilled, &allocation),
+            Err(AllocError::StackSlotExhausted)
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn slot_boundary_spill_does_not_overwrite_existing_slot() {
+        let (mut func, allocation) = make_simple_def_use();
+        func.stack_slots.insert(
+            StackSlotId(0),
+            crate::machine_types::RegAllocStackSlot::new(32, 32),
+        );
+        let original_slot = format!("{:?}", func.stack_slots[&StackSlotId(0)]);
+        insert_spill_code(&mut func, &[VReg::new(0, RegClass::Gpr64)], &allocation).unwrap();
+        assert_eq!(
+            format!("{:?}", func.stack_slots[&StackSlotId(0)]),
+            original_slot
+        );
+        assert_eq!(func.stack_slots.len(), 2);
+    }
+
+    #[test]
+    fn slot_boundary_repeated_spill_uses_one_slot_and_one_record() {
+        let (mut func, allocation) = make_simple_def_use();
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        let infos = insert_spill_code(&mut func, &[v0, v0], &allocation).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(func.stack_slots.len(), 1);
+        assert_eq!(func.next_stack_slot, 1);
+    }
+
+    #[test]
+    fn slot_boundary_spill_last_slot_emits_matching_store_and_load() {
+        let (mut func, allocation) = make_simple_def_use();
+        func.next_stack_slot = u32::MAX - 1;
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        let infos = insert_spill_code(&mut func, &[v0, v0], &allocation).unwrap();
+        let slot = StackSlotId(u32::MAX - 1);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].slot, slot);
+        assert_eq!(func.next_stack_slot, u32::MAX);
+        let insts: Vec<_> = func.blocks[0]
+            .insts
+            .iter()
+            .map(|id| &func.insts[id.0 as usize])
+            .collect();
+        assert_eq!(
+            insts.iter().map(|inst| inst.opcode).collect::<Vec<_>>(),
+            [1, PSEUDO_SPILL_STORE, PSEUDO_SPILL_LOAD, 2]
+        );
+        assert_eq!(
+            insts[1].uses,
+            [MachOperand::VReg(v0), MachOperand::StackSlot(slot)]
+        );
+        assert_eq!(insts[2].defs, [MachOperand::VReg(v0)]);
+        assert_eq!(insts[2].uses, [MachOperand::StackSlot(slot)]);
+    }
+
+    #[test]
+    fn slot_boundary_metadata_only_exhaustion_preserves_function() {
+        let (mut func, _) = make_simple_def_use();
+        func.next_stack_slot = u32::MAX - 1;
+        let before = format!("{func:?}");
+        let spilled = [
+            VReg::new(0, RegClass::Gpr64),
+            VReg::new(1, RegClass::Fpr128),
+        ];
+        assert!(matches!(
+            allocate_spill_slots(&mut func, &spilled),
+            Err(AllocError::StackSlotExhausted)
+        ));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn slot_boundary_metadata_only_matches_pseudo_policy_for_all_classes() {
+        let (mut metadata, allocation) = make_simple_def_use();
+        metadata.stack_slots.insert(
+            StackSlotId(4),
+            crate::machine_types::RegAllocStackSlot::new(32, 32),
+        );
+        let mut pseudos = metadata.clone();
+        let classes_and_sizes = [
+            (RegClass::Gpr32, 4),
+            (RegClass::Gpr64, 8),
+            (RegClass::Fpr8, 1),
+            (RegClass::Fpr16, 2),
+            (RegClass::Fpr32, 4),
+            (RegClass::Fpr64, 8),
+            (RegClass::Fpr128, 16),
+            (RegClass::System, 4),
+        ];
+        // Same numeric ID but distinct register classes remain distinct VRegs.
+        let mut spilled: Vec<_> = classes_and_sizes
+            .iter()
+            .map(|&(class, _)| VReg::new(0, class))
+            .collect();
+        spilled.push(spilled[0]);
+        let before_insts = format!("{:?}", metadata.insts);
+        let before_blocks = format!("{:?}", metadata.blocks);
+        let infos = allocate_spill_slots(&mut metadata, &spilled).unwrap();
+        let pseudo_infos = insert_spill_code(&mut pseudos, &spilled, &allocation).unwrap();
+        assert_eq!(infos.len(), 8);
+        for (i, (info, &(class, size))) in infos.iter().zip(&classes_and_sizes).enumerate() {
+            assert_eq!(info.vreg, VReg::new(0, class));
+            assert_eq!(info.slot, StackSlotId(5 + i as u32));
+            assert_eq!(info.slot, pseudo_infos[i].slot);
+            assert_eq!(metadata.stack_slots[&info.slot].size, size);
+            assert_eq!(metadata.stack_slots[&info.slot].align, size);
+        }
+        assert_eq!(
+            format!("{:?}", metadata.stack_slots),
+            format!("{:?}", pseudos.stack_slots)
+        );
+        assert_eq!(format!("{:?}", metadata.insts), before_insts);
+        assert_eq!(format!("{:?}", metadata.blocks), before_blocks);
+    }
+
+    #[test]
+    fn slot_boundary_empty_spill_requests_succeed_at_capacity() {
+        let (mut func, allocation) = make_simple_def_use();
+        func.next_stack_slot = u32::MAX;
+        let before = format!("{func:?}");
+        assert!(allocate_spill_slots(&mut func, &[]).unwrap().is_empty());
+        assert!(
+            insert_spill_code(&mut func, &[], &allocation)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
     fn test_insert_spill_code_allocates_stack_slot() {
         let (mut func, allocation) = make_simple_def_use();
         let v0 = VReg {
@@ -243,7 +402,7 @@ mod tests {
             class: RegClass::Gpr64,
         };
 
-        let spill_infos = insert_spill_code(&mut func, &[v0], &allocation);
+        let spill_infos = insert_spill_code(&mut func, &[v0], &allocation).unwrap();
 
         assert_eq!(spill_infos.len(), 1);
         assert_eq!(spill_infos[0].vreg, v0);
@@ -262,7 +421,7 @@ mod tests {
             class: RegClass::Gpr64,
         };
 
-        insert_spill_code(&mut func, &[v0], &allocation);
+        insert_spill_code(&mut func, &[v0], &allocation).unwrap();
 
         // After spill insertion, the block should have more instructions:
         // - Before use of v0: a PSEUDO_SPILL_LOAD
@@ -295,7 +454,7 @@ mod tests {
             class: RegClass::Gpr64,
         };
 
-        insert_spill_code(&mut func, &[v0], &allocation);
+        insert_spill_code(&mut func, &[v0], &allocation).unwrap();
 
         let block = &func.blocks[0];
         // Find positions of load and the original use instruction.
@@ -323,7 +482,7 @@ mod tests {
             class: RegClass::Gpr64,
         };
 
-        insert_spill_code(&mut func, &[v0], &allocation);
+        insert_spill_code(&mut func, &[v0], &allocation).unwrap();
 
         let block = &func.blocks[0];
         // Find positions of the original def and the store.
@@ -420,7 +579,7 @@ mod tests {
             class: RegClass::Fpr64,
         };
 
-        let spill_infos = insert_spill_code(&mut func, &[v0, v1], &BTreeMap::new());
+        let spill_infos = insert_spill_code(&mut func, &[v0, v1], &BTreeMap::new()).unwrap();
 
         assert_eq!(spill_infos.len(), 2);
         // Different register classes should get slots of different sizes.
@@ -496,7 +655,7 @@ mod tests {
             stack_slots: std::collections::BTreeMap::new(),
         };
 
-        let spill_infos = insert_spill_code(&mut func, &[gpr_v0], &BTreeMap::new());
+        let spill_infos = insert_spill_code(&mut func, &[gpr_v0], &BTreeMap::new()).unwrap();
 
         assert_eq!(spill_infos.len(), 1);
         assert_eq!(spill_infos[0].vreg, gpr_v0);
@@ -537,7 +696,7 @@ mod tests {
     fn test_insert_spill_code_no_spills() {
         let (mut func, allocation) = make_simple_def_use();
         // No spilled vregs — nothing should happen.
-        let spill_infos = insert_spill_code(&mut func, &[], &allocation);
+        let spill_infos = insert_spill_code(&mut func, &[], &allocation).unwrap();
         assert!(spill_infos.is_empty());
         // Block should be unchanged.
         assert_eq!(func.blocks[0].insts.len(), 2);
@@ -650,7 +809,7 @@ mod tests {
             id: 0,
             class: RegClass::Gpr64,
         };
-        let spill_infos = insert_spill_code(&mut func, &[v0], &BTreeMap::new());
+        let spill_infos = insert_spill_code(&mut func, &[v0], &BTreeMap::new()).unwrap();
 
         assert_eq!(spill_infos.len(), 1);
 
@@ -682,14 +841,14 @@ mod tests {
     #[test]
     fn test_reg_class_size_all_classes() {
         // Exhaustive: every RegClass variant must have a sensible size.
-        assert_eq!(reg_class_size(RegClass::Gpr32), 4);
-        assert_eq!(reg_class_size(RegClass::Gpr64), 8);
-        assert_eq!(reg_class_size(RegClass::Fpr8), 1);
-        assert_eq!(reg_class_size(RegClass::Fpr16), 2);
-        assert_eq!(reg_class_size(RegClass::Fpr32), 4);
-        assert_eq!(reg_class_size(RegClass::Fpr64), 8);
-        assert_eq!(reg_class_size(RegClass::Fpr128), 16);
-        assert_eq!(reg_class_size(RegClass::System), 4);
+        assert_eq!(RegClass::Gpr32.size_bytes(), 4);
+        assert_eq!(RegClass::Gpr64.size_bytes(), 8);
+        assert_eq!(RegClass::Fpr8.size_bytes(), 1);
+        assert_eq!(RegClass::Fpr16.size_bytes(), 2);
+        assert_eq!(RegClass::Fpr32.size_bytes(), 4);
+        assert_eq!(RegClass::Fpr64.size_bytes(), 8);
+        assert_eq!(RegClass::Fpr128.size_bytes(), 16);
+        assert_eq!(RegClass::System.size_bytes(), 4);
     }
 
     #[test]
@@ -703,7 +862,7 @@ mod tests {
             class: RegClass::Gpr64,
         };
 
-        insert_spill_code(&mut func, &[v0], &allocation);
+        insert_spill_code(&mut func, &[v0], &allocation).unwrap();
 
         let block = &func.blocks[0];
         let opcodes: Vec<u16> = block
@@ -781,7 +940,7 @@ mod tests {
             id: 0,
             class: RegClass::Gpr64,
         };
-        insert_spill_code(&mut func, &[v0], &BTreeMap::new());
+        insert_spill_code(&mut func, &[v0], &BTreeMap::new()).unwrap();
 
         let block = &func.blocks[0];
         let has_load = block
@@ -857,7 +1016,7 @@ mod tests {
             id: 0,
             class: RegClass::Gpr64,
         };
-        insert_spill_code(&mut func, &[v0], &BTreeMap::new());
+        insert_spill_code(&mut func, &[v0], &BTreeMap::new()).unwrap();
 
         // Should have at least one load before the double-use instruction.
         let load_count = func.blocks[0]
@@ -925,7 +1084,7 @@ mod tests {
             id: 0,
             class: RegClass::Fpr128,
         };
-        let spill_infos = insert_spill_code(&mut func, &[v0], &BTreeMap::new());
+        let spill_infos = insert_spill_code(&mut func, &[v0], &BTreeMap::new()).unwrap();
 
         assert_eq!(spill_infos.len(), 1);
         let slot = &func.stack_slots[&spill_infos[0].slot];
@@ -1001,7 +1160,7 @@ mod tests {
             id: 0,
             class: RegClass::Gpr64,
         };
-        insert_spill_code(&mut func, &[v0], &BTreeMap::new());
+        insert_spill_code(&mut func, &[v0], &BTreeMap::new()).unwrap();
 
         // The non-spilled instruction (opcode 99) should still be in the block.
         let has_non_spilled = func.blocks[0]
@@ -1074,7 +1233,7 @@ mod tests {
                 class: RegClass::Gpr64,
             })
             .collect();
-        let spill_infos = insert_spill_code(&mut func, &vregs, &BTreeMap::new());
+        let spill_infos = insert_spill_code(&mut func, &vregs, &BTreeMap::new()).unwrap();
 
         assert_eq!(spill_infos.len(), 3);
         let slots: std::collections::BTreeSet<StackSlotId> =
@@ -1168,7 +1327,7 @@ mod tests {
             id: 1,
             class: RegClass::Fpr8,
         };
-        let spill_infos = insert_spill_code(&mut func, &[v0, v1], &BTreeMap::new());
+        let spill_infos = insert_spill_code(&mut func, &[v0, v1], &BTreeMap::new()).unwrap();
 
         assert_eq!(spill_infos.len(), 2);
         let slot0 = &func.stack_slots[&spill_infos[0].slot];
@@ -1282,7 +1441,7 @@ mod tests {
             id: 0,
             class: RegClass::Gpr64,
         };
-        insert_spill_code(&mut func, &[v0], &BTreeMap::new());
+        insert_spill_code(&mut func, &[v0], &BTreeMap::new()).unwrap();
 
         // Block 0 should have a store after the def.
         let block0_has_store = func.blocks[0]
@@ -1366,7 +1525,7 @@ mod tests {
             id: 0,
             class: RegClass::System,
         };
-        let spill_infos = insert_spill_code(&mut func, &[v0], &BTreeMap::new());
+        let spill_infos = insert_spill_code(&mut func, &[v0], &BTreeMap::new()).unwrap();
 
         assert_eq!(spill_infos.len(), 1);
         let slot = &func.stack_slots[&spill_infos[0].slot];

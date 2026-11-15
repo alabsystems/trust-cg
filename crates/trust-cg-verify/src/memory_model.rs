@@ -16,7 +16,6 @@
 // contents.
 //
 // Reference: ARM Architecture Reference Manual (DDI 0487), Section C6.
-// Reference: designs/2026-04-13-verification-architecture.md, Phase 4.
 
 //! Memory model and load/store lowering proofs.
 //!

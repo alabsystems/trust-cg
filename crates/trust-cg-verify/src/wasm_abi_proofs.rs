@@ -43,7 +43,7 @@
 //     authority exists) by `ay`.
 //   * [`AbiStructuralCheck`]s — the INDEX-SPACE and ABI discipline. "This
 //     `call`'s target index resolves to a function of the declared signature",
-//     "the arg window pushes exactly these types", "element i is function i"
+//     "the arg window pushes exactly these types", "element i + 1 is function i"
 //     are DECIDABLE equalities over the decoded module. Handing them to a
 //     solver would be theatre, so they are not dressed as SMT obligations:
 //     they are decoded, compared, and reported with their own counts. Their
@@ -64,6 +64,15 @@
 // stack reserve bound, base alignment, argument-window validity, restoration
 // after a trap — stays RED in the denominator with the OWNERSHIP.md clause that
 // owns it. None of them is given a weak obligation.
+//
+// THE INTERNAL ABI: the object lane's multi-value internal ABI (P6) is
+// checked by the sibling module `wasm_internal_abi.rs` — the symbol-table
+// boundary gate, the forwarding (return) binding of every internal entry's
+// C-form entry, its source binding against the trust-ir signature, and the
+// link binding across a crate's objects — over relocatable objects, which
+// this file's closed-module decoder does not read. Its live gate is the
+// separate target `tests/wasm_internal_abi_gate.rs`; it adds nothing to
+// this family's denominators.
 //
 // THIS FAMILY PROMOTES NOTHING TO "VERIFIED". It covers the frame arithmetic
 // and the call/table index discipline of the modules it is run over. It says
@@ -124,9 +133,11 @@ pub const WASM_ABI_DEFERRALS: &[WasmAbiDeferral] = &[
         citation: "crates/trust-cg-codegen/src/wasm/OWNERSHIP.md §1.3, §1.5, §5",
         reason: "under Policy I the island's rights are exactly the stack reserve S and the \
                  argument windows A, a division of the memory that no wasm mechanism expresses \
-                 and no engine checks. The emitted code carries NO region check — a Load lowers \
-                 to a bare local.get + i32.load with a zero memarg offset — so no property of \
-                 the bytes can refute an access outside S union A. The frame family below proves \
+                 and no engine checks. The emitted code carries NO region check — a scalar Load \
+                 lowers to a bare local.get + load with a zero memarg offset, and a field, lane \
+                 or sret access to a load/store whose memarg offset is the field's constant \
+                 offset, with no base, limit or comparison either way — so no property of the \
+                 bytes can refute an access outside S union A. The frame family below proves \
                  the island's OWN frame arithmetic; whether the region that arithmetic lands in \
                  belongs to the island is a fact about the host's allocator that the module does \
                  not name and this evidence must not appear to cover",
@@ -135,8 +146,9 @@ pub const WASM_ABI_DEFERRALS: &[WasmAbiDeferral] = &[
         name: "stack-reserve sufficiency (sum of frame sizes <= R)",
         owner: "HOST",
         citation: "OWNERSHIP.md §1.4 (\"the bounds that do not hold\"), §2 item 5, §7 item 4",
-        reason: "the prologue contains no comparison against any limit: there is no stack-limit \
-                 global, no guard, and no trap. This family proves the shape of ONE frame and \
+        reason: "an island's prologue contains no comparison against any limit: there is no \
+                 stack-limit global, no guard, and no trap (a closed module's floor check \
+                 guards its own static data, not a host reserve). This family proves the shape of ONE frame and \
                  hence the chain bound [B - sum(F), B); it cannot bound sum(F), which is \
                  unbounded for any island with a cycle in its call graph and, because \
                  set_func_table publishes every function, has the whole module as its worst-case \
@@ -182,12 +194,17 @@ pub const WASM_ABI_DEFERRALS: &[WasmAbiDeferral] = &[
         citation: "this file, `GuardExpectation::KnownBlind`",
         reason: "the lowering emits blocks in dominator-tree order, so for a multi-block function \
                  the emitted sequence of calls is a PERMUTATION of the trust-ir order chosen by \
-                 the relooper. This family pins the MULTISET of call targets in a function and \
-                 the signature each target resolves to; which trust-ir call site produced which \
-                 emitted call is a CFG fact it cannot see. A permutation of two call sites whose \
-                 targets have the SAME signature is therefore NOT refuted here — the guard that \
-                 performs exactly that mutation is registered as KnownBlind and reported as not \
-                 refuted rather than omitted",
+                 the relooper. This family pins the MULTISET of direct-call targets in a \
+                 function and the signature each target resolves to, and binds constant \
+                 call_indirect sites one by one only when they all sit in one trust-ir block \
+                 AND the body emits exactly as many call_indirect sites as the trust-ir has \
+                 (otherwise it too pins their multiset); which trust-ir call site produced which \
+                 emitted call is otherwise a CFG fact it cannot see. A permutation of two direct \
+                 call sites whose targets have the SAME signature, or of two constant \
+                 call_indirect sites in different blocks or in a body whose call_indirect count \
+                 differs, is therefore NOT refuted here — the \
+                 guard that performs the direct-call mutation is registered as KnownBlind and \
+                 reported as not refuted rather than omitted",
     },
     WasmAbiDeferral {
         name: "whole-body operand-stack typing across control flow",
@@ -209,7 +226,7 @@ pub const WASM_ABI_DEFERRALS: &[WasmAbiDeferral] = &[
                  the declared type index. That check is the engine's and appears nowhere in the \
                  module's bytes. This family proves the STATIC half — the declared type index \
                  denotes the call site's own signature, the table immediate is 0, and the element \
-                 segment fills table 0 so element i is function i — which is what makes the \
+                 segment fills table 0 so element i + 1 is function i — which is what makes the \
                  engine's check pass rather than a substitute for it",
     },
     WasmAbiDeferral {
@@ -865,7 +882,23 @@ pub struct DecodedInst {
 /// immediate length, so continuing would mis-decode every byte after it and
 /// could silently turn a real instruction into a matched "window".
 pub fn decode_insts(code: &[u8]) -> Result<Vec<DecodedInst>, AbiDecodeError> {
+    match decode_insts_until_unknown(code) {
+        (insts, None) => Ok(insts),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// [`decode_insts`], also returning the instructions decoded before the first
+/// error, and that error (`None` when the whole body decodes).
+pub fn decode_insts_until_unknown(code: &[u8]) -> (Vec<DecodedInst>, Option<AbiDecodeError>) {
     let mut out = Vec::new();
+    match decode_insts_into(code, &mut out) {
+        Ok(()) => (out, None),
+        Err(e) => (out, Some(e)),
+    }
+}
+
+fn decode_insts_into(code: &[u8], out: &mut Vec<DecodedInst>) -> Result<(), AbiDecodeError> {
     let mut c = Cur::new(code);
     while !c.done() {
         let at = c.p;
@@ -903,12 +936,30 @@ pub fn decode_insts(code: &[u8]) -> Result<Vec<DecodedInst>, AbiDecodeError> {
             0x44 => Imm::FpBits(c.take(8, "f64.const")?.to_vec()),
             // Numeric / comparison / conversion: no immediate.
             0x45..=0xc4 => Imm::None,
-            0xfc => Imm::Fc(c.uleb32("0xfc sub-opcode")?),
+            0xfc => {
+                let sub = c.uleb32("0xfc sub-opcode")?;
+                match sub {
+                    // The saturating truncations carry no further immediate.
+                    0..=7 => {}
+                    // memory.copy: destination and source memory index bytes.
+                    10 => {
+                        c.byte("memory.copy destination memory")?;
+                        c.byte("memory.copy source memory")?;
+                    }
+                    // memory.fill: the memory index byte.
+                    11 => {
+                        c.byte("memory.fill memory")?;
+                    }
+                    // Anything else has an immediate this walker does not model.
+                    _ => return Err(AbiDecodeError::UnknownOpcode { at, opcode: 0xfc }),
+                }
+                Imm::Fc(sub)
+            }
             other => return Err(AbiDecodeError::UnknownOpcode { at, opcode: other }),
         };
         out.push(DecodedInst { at, op, imm });
     }
-    Ok(out)
+    Ok(())
 }
 
 /// The index immediate of an instruction, or `None` when it carries another
@@ -937,16 +988,18 @@ const VT_F32: u8 = 0x7d;
 const VT_F64: u8 = 0x7c;
 
 /// Table-mutating and table-reading instructions. None of them may appear if
-/// "element `i` is function `i`" is to hold for the instance's lifetime.
+/// "element `i + 1` is function `i`" is to hold for the instance's lifetime.
 ///
 /// `table.set` is the single byte 0x26; `table.init` / `elem.drop` /
 /// `table.copy` / `table.grow` / `table.size` / `table.fill` are the
 /// `0xfc`-prefixed sub-opcodes 12..=17 (`table.size` is not itself mutating —
 /// including it is deliberately conservative).
 ///
-/// Both arms are DEFENSIVE rather than load-bearing today: 0x25 / 0x26 are
-/// outside [`decode_insts`]'s modeled surface, so a body containing one fails
-/// the instruction walk outright and the whole function is REFUSED. Failing
+/// Both arms are DEFENSIVE rather than load-bearing today: 0x25 / 0x26 and the
+/// `0xfc` sub-opcodes 12..=17 are outside [`decode_insts`]'s modeled surface
+/// (it decodes only the saturating truncations 0..=7 and `memory.copy` /
+/// `memory.fill`, whose memory-index bytes it consumes), so a body containing
+/// one fails the instruction walk outright and the whole function is REFUSED. Failing
 /// closed is strictly stronger than flagging, and this predicate stays so the
 /// property is stated where the check lives if the walker ever learns them.
 fn is_table_mutating(i: &DecodedInst) -> bool {
@@ -1069,15 +1122,31 @@ pub struct IntendedCall {
     pub sig: DecodedFuncType,
 }
 
-/// One intended indirect call: the signature the call site declares.
+/// One intended indirect call: the signature the call site declares, the
+/// trust-ir block it sits in, and the function its callee names when the
+/// callee is a function-pointer constant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntendedIndirect {
     /// The declared signature, as wasm valtype bytes.
     pub sig: DecodedFuncType,
+    /// The ordinal of the trust-ir block holding the call.
+    pub block: usize,
+    /// The import-shifted wasm function index the callee's pointer constant
+    /// names (followed through `Copy` and `reify_fn_pointer`); `None` for a
+    /// dynamic callee.
+    pub const_callee: Option<u32>,
 }
 
-/// One intended function-pointer constant: the wasm function index it must
-/// materialize.
+/// The first table element a closed module's element segment fills. Element 0
+/// stays the null funcref, so the null pointer (0) is never the address of a
+/// function and a `call_indirect` through it traps: a function pointer is
+/// `funcidx + CLOSED_TABLE_BASE`. This is the convention `wasm-ld` applies to a
+/// linked module (its default `--table-base` is 1), restated here rather than
+/// imported from the backend this family checks.
+pub const CLOSED_TABLE_BASE: u32 = 1;
+
+/// One intended function-pointer constant: the wasm function index it names
+/// (its table index is that plus [`CLOSED_TABLE_BASE`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntendedFuncPtr {
     /// Name of the pointee, for diagnostics.
@@ -1103,6 +1172,15 @@ pub struct IntendedFunction {
     pub indirects: Vec<IntendedIndirect>,
     /// Its function-pointer constants, in trust-ir order.
     pub func_ptrs: Vec<IntendedFuncPtr>,
+    /// The import-shifted wasm function index of every `call_indirect` whose
+    /// callee is a function-pointer constant (followed through `Copy` and
+    /// `reify_fn_pointer`), in trust-ir order.
+    pub const_callees: Vec<u32>,
+    /// Function-pointer constants that reach anything OTHER than the callee
+    /// operand of a `call_indirect` (an argument, a store, a block argument, a
+    /// return, a select): this family cannot bind such a constant to the table
+    /// element it names, so the function is refused rather than credited.
+    pub escaping_func_ptrs: Vec<String>,
     /// Whether the function returns normally somewhere (so an epilogue is due).
     pub has_return: bool,
 }
@@ -1193,6 +1271,55 @@ fn sig_of_id(module: &Module, id: FuncTyId) -> Result<DecodedFuncType, AbiModelE
     func_type_bytes(ft)
 }
 
+fn call_unwind_boundary_refusal(construct: &str, function: &str) -> AbiModelError {
+    AbiModelError::Unsupported(format!(
+        "{construct} in `{function}`: a non-propagating call boundary (trust-ir v53) \
+         requires host-unwind semantics; this ABI model does not model it"
+    ))
+}
+
+/// The public model entry does not run compiler admission. Inspect every
+/// stored node before extracting frames, call sites or function-pointer uses:
+/// omitting a void or unreachable boundary call would erase its contract.
+fn reject_call_unwind_boundaries(module: &Module) -> Result<(), AbiModelError> {
+    for function in &module.functions {
+        for node in function.blocks.iter().flat_map(|block| &block.body) {
+            match &node.inst {
+                Inst::CallCannotUnwind { .. } => {
+                    return Err(call_unwind_boundary_refusal(
+                        "Inst::CallCannotUnwind",
+                        &function.name,
+                    ));
+                }
+                Inst::CallIndirectCannotUnwind { .. } => {
+                    return Err(call_unwind_boundary_refusal(
+                        "Inst::CallIndirectCannotUnwind",
+                        &function.name,
+                    ));
+                }
+                // trust-ir v55 / v56 (amendment D): the unwinding twins of a
+                // drop (a call of its type's glue) and of an indirect call.
+                // Each is a call site with an unwind edge this model does not
+                // model; extracting none for it would erase the call.
+                Inst::DropInvoke { .. } | Inst::InvokeIndirect { .. } => {
+                    let construct = if matches!(node.inst, Inst::DropInvoke { .. }) {
+                        "Inst::DropInvoke"
+                    } else {
+                        "Inst::InvokeIndirect"
+                    };
+                    return Err(AbiModelError::Unsupported(format!(
+                        "{construct} in `{}`: an unwinding call (trust-ir v55/v56) requires \
+                         host-unwind semantics; this ABI model does not model it",
+                        function.name
+                    )));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build the intended model of a whole trust-ir module.
 ///
 /// The index assignment is the P2 rule stated in OWNERSHIP.md §4.1 / §7 item 2
@@ -1201,6 +1328,7 @@ fn sig_of_id(module: &Module, id: FuncTyId) -> Result<DecodedFuncType, AbiModelE
 /// functions follow at `N + ordinal`. Every `call` target, function-pointer
 /// constant, table element and export shifts with them.
 pub fn intended_module(module: &Module) -> Result<IntendedModule, AbiModelError> {
+    reject_call_unwind_boundaries(module)?;
     let mut out = IntendedModule::default();
     let mut index_of: BTreeMap<u32, u32> = BTreeMap::new();
 
@@ -1236,10 +1364,24 @@ pub fn intended_module(module: &Module) -> Result<IntendedModule, AbiModelError>
         let mut calls = Vec::new();
         let mut indirects = Vec::new();
         let mut func_ptrs = Vec::new();
+        let (site_callees, escaping_func_ptrs) = function_pointer_uses(module, func, &index_of)?;
+        let const_callees: Vec<u32> = site_callees.iter().flatten().copied().collect();
         let mut has_return = false;
-        for block in &func.blocks {
+        for (block_ordinal, block) in func.blocks.iter().enumerate() {
             for node in &block.body {
                 match &node.inst {
+                    Inst::CallCannotUnwind { .. } => {
+                        return Err(call_unwind_boundary_refusal(
+                            "Inst::CallCannotUnwind",
+                            &func.name,
+                        ));
+                    }
+                    Inst::CallIndirectCannotUnwind { .. } => {
+                        return Err(call_unwind_boundary_refusal(
+                            "Inst::CallIndirectCannotUnwind",
+                            &func.name,
+                        ));
+                    }
                     Inst::Call { callee, .. } => {
                         let (callee_name, csig) = sig_of_func(module, *callee)?;
                         let target = *index_of.get(&callee.index()).ok_or_else(|| {
@@ -1252,8 +1394,18 @@ pub fn intended_module(module: &Module) -> Result<IntendedModule, AbiModelError>
                         });
                     }
                     Inst::CallIndirect { sig, .. } => {
+                        // `function_pointer_uses` visits the call sites in
+                        // this same order.
+                        let const_callee = *site_callees.get(indirects.len()).ok_or_else(|| {
+                            AbiModelError::Unsupported(
+                                "call_indirect sites and their callees disagree in number"
+                                    .to_string(),
+                            )
+                        })?;
                         indirects.push(IntendedIndirect {
                             sig: sig_of_id(module, *sig)?,
+                            block: block_ordinal,
+                            const_callee,
                         });
                     }
                     Inst::Const {
@@ -1286,10 +1438,121 @@ pub fn intended_module(module: &Module) -> Result<IntendedModule, AbiModelError>
             calls,
             indirects,
             func_ptrs,
+            const_callees,
+            escaping_func_ptrs,
             has_return,
         });
     }
     Ok(out)
+}
+
+/// Where each function-pointer constant of `func` goes.
+///
+/// Returns, for every `call_indirect` in trust-ir order, the import-shifted
+/// target its callee names when that callee is such a constant — followed
+/// through `Copy` and `reify_fn_pointer`, the two value-preserving forms a
+/// frontend puts between them — or `None` for a dynamic callee; and the names
+/// of the constants that reach any other use.
+fn function_pointer_uses(
+    module: &Module,
+    func: &Function,
+    index_of: &BTreeMap<u32, u32>,
+) -> Result<(Vec<Option<u32>>, Vec<String>), AbiModelError> {
+    use trust_ir::{CastOp, ValueId};
+
+    let nodes: Vec<&trust_ir::InstrNode> = func.blocks.iter().flat_map(|b| &b.body).collect();
+    // The function-pointer constant each value carries, when it is one.
+    let mut carries: BTreeMap<ValueId, FuncId> = BTreeMap::new();
+    for node in &nodes {
+        if let (
+            Inst::Const {
+                value: Constant::FnDef(id),
+                ..
+            },
+            [r],
+        ) = (&node.inst, node.results.as_slice())
+        {
+            carries.insert(*r, *id);
+        }
+    }
+    // Propagate through the value-preserving forms (SSA: one pass per chain
+    // link; the chain is at most as long as the body).
+    loop {
+        let before = carries.len();
+        for node in &nodes {
+            let src = match &node.inst {
+                Inst::Copy { operand, .. } => Some(*operand),
+                Inst::Cast {
+                    op: CastOp::ReifyFnPointer,
+                    operand,
+                    ..
+                } => Some(*operand),
+                _ => None,
+            };
+            if let (Some(src), [r]) = (src, node.results.as_slice())
+                && let Some(&id) = carries.get(&src)
+            {
+                carries.insert(*r, id);
+            }
+        }
+        if carries.len() == before {
+            break;
+        }
+    }
+    let mut callees = Vec::new();
+    let mut escaping = BTreeSet::new();
+    for node in &nodes {
+        let passes_through = matches!(
+            node.inst,
+            Inst::Copy { .. }
+                | Inst::Cast {
+                    op: CastOp::ReifyFnPointer,
+                    ..
+                }
+        );
+        match &node.inst {
+            Inst::CallCannotUnwind { .. } => {
+                return Err(call_unwind_boundary_refusal(
+                    "Inst::CallCannotUnwind",
+                    &func.name,
+                ));
+            }
+            Inst::CallIndirectCannotUnwind { .. } => {
+                return Err(call_unwind_boundary_refusal(
+                    "Inst::CallIndirectCannotUnwind",
+                    &func.name,
+                ));
+            }
+            Inst::CallIndirect { callee, args, .. } => {
+                let mut target = None;
+                if let Some(&id) = carries.get(callee) {
+                    let (pointee, _) = sig_of_func(module, id)?;
+                    target = Some(*index_of.get(&id.index()).ok_or_else(|| {
+                        AbiModelError::Unresolved(format!("function pointer `{pointee}`"))
+                    })?);
+                }
+                callees.push(target);
+                for a in args {
+                    if let Some(&id) = carries.get(a) {
+                        escaping.insert(sig_of_func(module, id)?.0);
+                    }
+                }
+            }
+            _ if passes_through => {}
+            inst => {
+                let mut hit = Vec::new();
+                inst.visit_value_operands(|v| {
+                    if let Some(&id) = carries.get(&v) {
+                        hit.push(id);
+                    }
+                });
+                for id in hit {
+                    escaping.insert(sig_of_func(module, id)?.0);
+                }
+            }
+        }
+    }
+    Ok((callees, escaping.into_iter().collect()))
 }
 
 // ===========================================================================
@@ -1918,26 +2181,28 @@ pub fn module_structural_checks(
         ));
     }
 
-    // S5 — the funcref table covers the WHOLE function index space, and the
-    // element segment makes element `i` be function `i`. This is what lets a
-    // function-pointer constant be a plain funcidx.
+    // S5 — the funcref table covers the null slot plus the WHOLE function index
+    // space, and the element segment makes element `i + 1` be function `i`.
+    // This is what lets a function-pointer constant be its funcidx plus
+    // `CLOSED_TABLE_BASE`, and keeps the null pointer off every function.
     if intended.needs_table {
         let count = dec.func_count();
-        let table_ok = dec.table_min == Some(count);
+        let table_ok = dec.table_min == Some(count + CLOSED_TABLE_BASE);
         out.push(check(
-            "funcref table covers the whole function index space".to_string(),
+            "funcref table covers the null slot and the whole function index space".to_string(),
             table_ok,
             format!(
-                "table min {:?}, function index space {count}",
-                dec.table_min
+                "table min {:?}, null slot + function index space {}",
+                dec.table_min,
+                count + CLOSED_TABLE_BASE
             ),
         ));
         let elems_ok = dec.elements.len() == 1
-            && dec.elements[0].offset == 0
+            && dec.elements[0].offset == CLOSED_TABLE_BASE as i32
             && dec.elements[0].table == 0
             && dec.elements[0].funcs == (0..count).collect::<Vec<_>>();
         out.push(check(
-            "element segment fills table 0 so element i is function i".to_string(),
+            "element segment fills table 0 from index 1 so element i + 1 is function i".to_string(),
             elems_ok,
             format!(
                 "{} segment(s); first {:?}",
@@ -1959,7 +2224,7 @@ pub fn module_structural_checks(
 
     // S6 — the element binding is FIXED for the instance's lifetime: the table
     // is not exported and no body contains a table-mutating instruction. Without
-    // this, "element i is function i" holds only until someone overwrites it.
+    // this, "element i + 1 is function i" holds only until someone overwrites it.
     let table_exported = dec.exports.iter().any(|e| e.kind == 0x01);
     let mutates = dec
         .bodies
@@ -2266,43 +2531,302 @@ pub fn call_structural_checks(
         ));
     }
 
-    // C6 — a function-pointer constant materializes the IMPORT-SHIFTED funcidx.
-    // With the table filled so element i is function i (S5), the funcidx IS the
-    // table index, which is what makes C5's typecheck meaningful.
-    let mut got_ptrs: Vec<i32> = insts
-        .iter()
-        .enumerate()
-        .filter(|(k, i)| {
-            i.op == OP_I32_CONST
-                && insts
-                    .get(k + 1)
-                    .is_some_and(|n| n.op == OP_LOCAL_SET || n.op == OP_LOCAL_TEE)
-        })
-        .filter_map(|(_, i)| match i.imm {
-            Imm::I32(v) => Some(v),
-            _ => None,
-        })
-        .collect();
-    let mut want_ptrs: Vec<i32> = intended.func_ptrs.iter().map(|p| p.target as i32).collect();
-    if !want_ptrs.is_empty() {
-        got_ptrs.sort_unstable();
-        want_ptrs.sort_unstable();
-        let ok = want_ptrs.iter().all(|w| got_ptrs.contains(w));
-        out.push(check(
-            format!(
-                "`{}`: every function-pointer constant is its import-shifted funcidx",
-                intended.name
-            ),
-            ok,
-            format!(
-                "intended {want_ptrs:?}, i32 constants bound to a local {got_ptrs:?} (import base \
-                 {})",
-                dec.func_import_count()
-            ),
-        ));
+    // C6 — every call_indirect whose trust-ir callee is a function-pointer
+    // constant calls, through the element segment, the function that constant
+    // names. The table operand is resolved on the DECODED body: an `i32.const
+    // X` pushed directly, or a local whose every write in the body is (a copy
+    // of) the same `i32.const X` and which is definitely assigned at the read
+    // (a local starts at 0, the null slot, so a read some path reaches before
+    // any write is ambiguous and leaves the site unresolved). `X` is then
+    // looked up in the decoded element segment — never by assuming the table
+    // layout — and the element must have the call site's declared type.
+    // Binding the constant to its use site is what keeps an unrelated scalar
+    // that happens to equal the table index from standing in for the pointer;
+    // a pointer constant with any other use is refused in `wasm_abi_evidence`.
+    //
+    // WHICH SITE IS WHICH. When every trust-ir `call_indirect` of the function
+    // sits in ONE trust-ir block and the body holds exactly as many
+    // `call_indirect`s, the lowering emits them in that block's order, so the
+    // i-th emitted site is bound to the i-th trust-ir site: its element must be
+    // the function ITS OWN pointer constant names, and a dynamic trust-ir
+    // callee must not resolve to a constant. Two same-signature pointers
+    // swapped between their sites refute. Otherwise (sites in several blocks,
+    // whose emitted order is the relooper's, or an emitted count that differs)
+    // the statement is over the
+    // MULTISET of resolved elements, and which site produced which call is the
+    // "call-site correspondence" deferral's. A body whose emitted
+    // `call_indirect` count differs from the trust-ir count has no one-to-one
+    // correspondence to bind either, so it too is stated over the multiset (and
+    // then fails whenever the resolved elements differ from the intended ones).
+    if !intended.const_callees.is_empty() || !indirect.is_empty() {
+        let blocks: BTreeSet<usize> = intended.indirects.iter().map(|i| i.block).collect();
+        let per_site = blocks.len() <= 1 && indirect.len() == intended.indirects.len();
+        let mut problems: Vec<String> = Vec::new();
+        // The element function a constant site resolves to, after the
+        // null-slot and signature checks (which push their own problem).
+        let resolve_site = |k: usize, type_idx: u32, problems: &mut Vec<String>| {
+            let x = k
+                .checked_sub(1)
+                .and_then(|j| resolve_i32_constant(&insts, j, params.len()))?;
+            match element_function(dec, x) {
+                None => {
+                    problems.push(format!(
+                        "call_indirect at instruction {k}: table index {x} names no element (the \
+                         null slot or past the segment)"
+                    ));
+                    Some(None)
+                }
+                Some(f) => {
+                    let declared = dec.types.get(type_idx as usize);
+                    if declared.is_none() || dec.type_of_func(f) != declared {
+                        problems.push(format!(
+                            "call_indirect at instruction {k}: element {x} is function {f} of \
+                             type {:?}, the site declares {declared:?}",
+                            dec.type_of_func(f)
+                        ));
+                    }
+                    Some(Some(f))
+                }
+            }
+        };
+        if per_site {
+            let mut bound: Vec<String> = Vec::new();
+            for (ordinal, ((k, type_idx, _), site)) in
+                indirect.iter().zip(&intended.indirects).enumerate()
+            {
+                let got = resolve_site(*k, *type_idx, &mut problems);
+                match (site.const_callee, got) {
+                    (Some(want), Some(Some(f))) if f == want => {
+                        bound.push(format!("site {ordinal} -> function {f}"));
+                    }
+                    (Some(want), Some(Some(f))) => problems.push(format!(
+                        "call_indirect at instruction {k} (trust-ir indirect call {ordinal}) \
+                         calls element function {f}, but its pointer constant names function \
+                         {want}"
+                    )),
+                    (Some(_), Some(None)) => {}
+                    (Some(want), None) => problems.push(format!(
+                        "call_indirect at instruction {k} (trust-ir indirect call {ordinal}) \
+                         does not resolve to a constant table index, but its pointer constant \
+                         names function {want}"
+                    )),
+                    (None, Some(_)) => problems.push(format!(
+                        "call_indirect at instruction {k} (trust-ir indirect call {ordinal}) \
+                         resolves to a constant table index, but its trust-ir callee is not a \
+                         function-pointer constant"
+                    )),
+                    (None, None) => {}
+                }
+            }
+            out.push(check(
+                format!(
+                    "`{}`: each constant call_indirect site calls, through the element segment, \
+                     the function its own pointer constant names",
+                    intended.name
+                ),
+                problems.is_empty(),
+                format!(
+                    "per-site binding in emission order within one trust-ir block: [{}]{}",
+                    bound.join(", "),
+                    if problems.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", problems.join("; "))
+                    }
+                ),
+            ));
+        } else {
+            let mut want: Vec<u32> = intended.const_callees.clone();
+            want.sort_unstable();
+            let mut got: Vec<u32> = Vec::new();
+            for (k, type_idx, _) in &indirect {
+                if let Some(Some(f)) = resolve_site(*k, *type_idx, &mut problems) {
+                    got.push(f);
+                }
+            }
+            got.sort_unstable();
+            out.push(check(
+                format!(
+                    "`{}`: the constant call_indirect callees resolve, through the element \
+                     segment, to the multiset of functions their pointer constants name",
+                    intended.name
+                ),
+                got == want && problems.is_empty(),
+                format!(
+                    "multiset only ({} call_indirect site(s) across {} trust-ir block(s), {} \
+                     emitted; which site produced which call is the call-site correspondence \
+                     deferral's): resolved element functions {got:?}, intended constant \
+                     callees {want:?}{}",
+                    intended.indirects.len(),
+                    blocks.len(),
+                    indirect.len(),
+                    if problems.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", problems.join("; "))
+                    }
+                ),
+            ));
+        }
     }
 
     out
+}
+
+/// The single `i32` constant the value pushed by `insts[at]` must hold, when
+/// the decoded body alone determines it: an `i32.const`, or a `local.get` of a
+/// non-parameter local every write of which stores the same resolvable
+/// constant AND that is definitely assigned at the read. A declared local
+/// starts at zero, so a read that some path reaches before any write (an
+/// earlier position, a write in an `if` arm or a block a branch can leave
+/// first, a loop reading before its own write) may observe that implicit 0:
+/// without definite assignment the value is ambiguous and the site is
+/// unresolved. `None` otherwise, and on a body whose control structure does
+/// not decode.
+fn resolve_i32_constant(insts: &[DecodedInst], at: usize, param_count: usize) -> Option<i32> {
+    fn go(
+        insts: &[DecodedInst],
+        at: usize,
+        param_count: usize,
+        seen: &mut BTreeSet<u32>,
+    ) -> Option<i32> {
+        let i = insts.get(at)?;
+        match (i.op, &i.imm) {
+            (OP_I32_CONST, Imm::I32(v)) => Some(*v),
+            (OP_LOCAL_GET, Imm::Idx(l)) => {
+                let l = *l;
+                if (l as usize) < param_count || !seen.insert(l) {
+                    return None;
+                }
+                let mut value = None;
+                for (j, w) in insts.iter().enumerate() {
+                    if (w.op == OP_LOCAL_SET || w.op == OP_LOCAL_TEE) && idx_of(w) == Some(l) {
+                        let v = go(insts, j.checked_sub(1)?, param_count, seen)?;
+                        if value.is_some_and(|x| x != v) {
+                            return None;
+                        }
+                        value = Some(v);
+                    }
+                }
+                if definitely_assigned(insts, l, at)? {
+                    value
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    go(insts, at, param_count, &mut BTreeSet::new())
+}
+
+/// Is local `local` written on EVERY path from the function entry to
+/// instruction `read`? A forward must-analysis over the structured body:
+/// `assigned` only turns true along a path, so a loop header's state is its
+/// entry state (a back edge arrives no less assigned than it left), a
+/// `block` / `if` end joins its fall-through with every branch to its label
+/// (an `if` without `else` also with its entry state), and code after an
+/// unconditional branch, `return` or `unreachable` is unreachable (vacuously
+/// assigned). `None` when the body's control structure does not decode
+/// anywhere in the body (a branch label past the open constructs, an `else`
+/// outside an `if`, an unbalanced `end`, an instruction after the body's
+/// final `end`) or `read` is not one of its instructions.
+fn definitely_assigned(insts: &[DecodedInst], local: u32, read: usize) -> Option<bool> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Block,
+        Loop,
+        If { else_seen: bool },
+    }
+    struct Frame {
+        kind: Kind,
+        entry: bool,
+        branched: bool,
+    }
+    fn record(stack: &mut [Frame], label: u32, a: bool) -> Option<()> {
+        let at = stack.len().checked_sub(1 + label as usize)?;
+        let f = &mut stack[at];
+        if f.kind != Kind::Loop {
+            f.branched &= a;
+        }
+        Some(())
+    }
+    // The function body is an implicit block; a branch to it returns.
+    let mut stack = vec![Frame {
+        kind: Kind::Block,
+        entry: false,
+        branched: true,
+    }];
+    let mut a = false;
+    let mut at_read = None;
+    for (k, i) in insts.iter().enumerate() {
+        if stack.is_empty() {
+            return None;
+        }
+        if k == read {
+            at_read = Some(a);
+        }
+        match (i.op, &i.imm) {
+            (0x02, _) => stack.push(Frame {
+                kind: Kind::Block,
+                entry: a,
+                branched: true,
+            }),
+            (0x03, _) => stack.push(Frame {
+                kind: Kind::Loop,
+                entry: a,
+                branched: true,
+            }),
+            (0x04, _) => stack.push(Frame {
+                kind: Kind::If { else_seen: false },
+                entry: a,
+                branched: true,
+            }),
+            (0x05, _) => {
+                let f = stack.last_mut()?;
+                let Kind::If { else_seen: false } = f.kind else {
+                    return None;
+                };
+                f.branched &= a;
+                f.kind = Kind::If { else_seen: true };
+                a = f.entry;
+            }
+            (0x0b, _) => {
+                let f = stack.pop()?;
+                a = match f.kind {
+                    Kind::Block | Kind::If { else_seen: true } => f.branched && a,
+                    Kind::If { else_seen: false } => f.branched && a && f.entry,
+                    Kind::Loop => a,
+                };
+            }
+            (0x0c, Imm::Idx(l)) => {
+                record(&mut stack, *l, a)?;
+                a = true;
+            }
+            (0x0d, Imm::Idx(l)) => record(&mut stack, *l, a)?,
+            (0x0e, Imm::BrTable { targets, default }) => {
+                for l in targets.iter().chain(std::iter::once(default)) {
+                    record(&mut stack, *l, a)?;
+                }
+                a = true;
+            }
+            (0x00 | 0x0f, _) => a = true,
+            (OP_LOCAL_SET | OP_LOCAL_TEE, Imm::Idx(l)) if *l == local => a = true,
+            _ => {}
+        }
+    }
+    if stack.is_empty() { at_read } else { None }
+}
+
+/// The function the decoded element segment of table 0 puts at table index
+/// `x`, or `None` for an index no element fills (the null slot among them).
+fn element_function(dec: &DecodedModule, x: i32) -> Option<u32> {
+    dec.elements.iter().filter(|e| e.table == 0).find_map(|e| {
+        let k = i64::from(x) - i64::from(e.offset);
+        usize::try_from(k)
+            .ok()
+            .and_then(|k| e.funcs.get(k).copied())
+    })
 }
 
 /// Is `i` the start of the narrow-carrier re-canonicalization the lowering
@@ -2466,9 +2990,10 @@ impl WasmAbiEvidence {
 /// Build the family's whole evidence for one emitted module.
 ///
 /// `bytes` are the REAL emitted module; `module` is the trust-ir it was
-/// compiled from. Fails only when the bytes cannot be decoded at all — a
-/// per-function recognition failure becomes a recorded REFUSAL (no credit),
-/// never a silent skip.
+/// compiled from. Fails when the bytes cannot be decoded or the source model
+/// refuses a construct, including a trust-ir v53 non-propagating call
+/// boundary. A per-function byte recognition failure becomes a recorded
+/// REFUSAL (no credit), never a silent skip.
 pub fn wasm_abi_evidence(bytes: &[u8], module: &Module) -> Result<WasmAbiEvidence, String> {
     let dec = decode_module(bytes).map_err(|e| format!("decode: {e}"))?;
     let intended = intended_module(module).map_err(|e| format!("intended model: {e}"))?;
@@ -2487,6 +3012,14 @@ pub fn wasm_abi_evidence(bytes: &[u8], module: &Module) -> Result<WasmAbiEvidenc
         ev.structural.extend(frame_structural_checks(body, want));
         ev.structural
             .extend(call_structural_checks(&dec, body, want));
+        if !want.escaping_func_ptrs.is_empty() {
+            ev.refusals.push(format!(
+                "`{}`: function-pointer constant(s) {:?} reach a use other than a call_indirect \
+                 callee (an argument, a store, a block argument, a return); this family cannot \
+                 bind such a constant to the table element it names — NO CREDIT",
+                want.name, want.escaping_func_ptrs
+            ));
+        }
         match frame_obligations(body, want) {
             Ok(obs) => ev.obligations.extend(obs),
             Err(why) => ev.refusals.push(why),
@@ -2692,11 +3225,56 @@ pub const WASM_ABI_GUARDS: &[AbiGuard] = &[
         expectation: GuardExpectation::MustRefute,
     },
     AbiGuard {
-        name: "a function-pointer constant FORGETS the import shift (2 -> 0)",
+        name: "a function-pointer constant FORGETS the import shift (3 -> 1)",
         fixture: "abi_table",
-        // i32.const 2; local.set 2
-        needle: &[0x41, 0x02, 0x21, 0x02],
-        patch: &[0x41, 0x00, 0x21, 0x02],
+        // i32.const 3 (funcidx 2 + the null slot); local.set 2
+        needle: &[0x41, 0x03, 0x21, 0x02],
+        patch: &[0x41, 0x01, 0x21, 0x02],
+        expectation: GuardExpectation::MustRefute,
+    },
+    AbiGuard {
+        name: "a function-pointer constant FORGETS the null slot (3 -> 2)",
+        fixture: "abi_table",
+        // i32.const 3; local.set 2  ->  the bare funcidx 2
+        needle: &[0x41, 0x03, 0x21, 0x02],
+        patch: &[0x41, 0x02, 0x21, 0x02],
+        expectation: GuardExpectation::MustRefute,
+    },
+    AbiGuard {
+        name: "a function-pointer constant is OFF BY ONE while an unrelated scalar equals its \
+               table index (2 -> 1)",
+        fixture: "abi_table_collide",
+        // `viaptr`: i32.const 2 (add7 = funcidx 1 + the null slot); local.set 1.
+        // The scalar `const i32 2` is `i32.const 2; local.set 3`, untouched.
+        needle: &[0x41, 0x02, 0x21, 0x01],
+        patch: &[0x41, 0x01, 0x21, 0x01],
+        expectation: GuardExpectation::MustRefute,
+    },
+    AbiGuard {
+        name: "a function-pointer constant names the NULL slot while an unrelated scalar equals \
+               its table index (2 -> 0)",
+        fixture: "abi_table_collide",
+        needle: &[0x41, 0x02, 0x21, 0x01],
+        patch: &[0x41, 0x00, 0x21, 0x01],
+        expectation: GuardExpectation::MustRefute,
+    },
+    AbiGuard {
+        name: "the call_indirect reads the unrelated scalar's local BEFORE its only write \
+               (local 1 -> local 3: still zero, the null slot, at the call)",
+        fixture: "abi_table_collide",
+        // `viaptr`: local.get 0; local.get 1; call_indirect. Local 3 is written
+        // only by the later `i32.const 2; local.set 3`, which equals the table
+        // index but is not assigned on the path to the call.
+        needle: &[0x20, 0x00, 0x20, 0x01, 0x11],
+        patch: &[0x20, 0x00, 0x20, 0x03, 0x11],
+        expectation: GuardExpectation::MustRefute,
+    },
+    AbiGuard {
+        name: "the element segment fills table index 0, the null pointer (offset 1 -> 0)",
+        fixture: "abi_table",
+        // offset i32.const 1; end; 4 entries; function 0
+        needle: &[0x41, 0x01, 0x0b, 0x04, 0x00],
+        patch: &[0x41, 0x00, 0x0b, 0x04, 0x00],
         expectation: GuardExpectation::MustRefute,
     },
     AbiGuard {
@@ -2729,6 +3307,24 @@ pub const WASM_ABI_GUARDS: &[AbiGuard] = &[
         // ...global import: i32 (0x7f), immutable (0x00); then section 3
         needle: &[0x03, 0x7f, 0x00, 0x03, 0x02, 0x01, 0x00],
         patch: &[0x03, 0x7f, 0x01, 0x03, 0x02, 0x01, 0x00],
+        expectation: GuardExpectation::MustRefute,
+    },
+    AbiGuard {
+        name: "two same-signature function-pointer constants are SWAPPED between their \
+               call_indirect sites in one block",
+        fixture: "abi_table_two",
+        // `two`: i32.const 1 (neg); local.set 1; local.get 0; local.get 1;
+        // call_indirect; local.set 2; i32.const 2 (inc). Exchanging the two
+        // table indices keeps the multiset of callees and every signature, and
+        // computes neg(inc(x)) for inc(neg(x)).
+        needle: &[
+            0x41, 0x01, 0x21, 0x01, 0x20, 0x00, 0x20, 0x01, 0x11, 0x00, 0x00, 0x21, 0x02, 0x41,
+            0x02,
+        ],
+        patch: &[
+            0x41, 0x02, 0x21, 0x01, 0x20, 0x00, 0x20, 0x01, 0x11, 0x00, 0x00, 0x21, 0x02, 0x41,
+            0x01,
+        ],
         expectation: GuardExpectation::MustRefute,
     },
     // ---- the declared blind spot ----
@@ -2820,8 +3416,10 @@ pub fn run_guard(
 // ===========================================================================
 
 /// One corpus fixture: a trust-ir module in the TrustIr text format, the wasm
-/// policy it is compiled under, and the module bytes the backend really emitted
-/// for it.
+/// policy it is compiled under, and the module bytes the backend's LOWERING
+/// really emitted for it (the O0 compile: the input of the lane's local
+/// emission pass, which at O1 and above emits a rewrite of a function only
+/// when `wasm_local_tv` validates it against these bytes).
 ///
 /// The bytes are frozen so this module needs no dependency on the backend (the
 /// dependency direction is codegen -> verify, so it cannot have one). They are
@@ -2841,7 +3439,7 @@ pub struct AbiFixture {
     pub wasm: &'static [u8],
 }
 
-/// The four corpus fixtures.
+/// The six corpus fixtures.
 pub const WASM_ABI_FIXTURES: &[AbiFixture] = &[
     AbiFixture {
         name: "abi_frame",
@@ -2867,6 +3465,18 @@ pub const WASM_ABI_FIXTURES: &[AbiFixture] = &[
         tir: ISLAND_TIR,
         wasm: ISLAND_WASM,
     },
+    AbiFixture {
+        name: "abi_table_collide",
+        policy: "closed",
+        tir: TABLE_COLLIDE_TIR,
+        wasm: TABLE_COLLIDE_WASM,
+    },
+    AbiFixture {
+        name: "abi_table_two",
+        policy: "closed",
+        tir: TABLE_TWO_TIR,
+        wasm: TABLE_TWO_WASM,
+    },
 ];
 
 /// Look up a fixture by name.
@@ -2876,7 +3486,7 @@ pub fn fixture(name: &str) -> Option<&'static AbiFixture> {
 
 const FRAME_TIR: &str = r#"; TrustIr text format v1
 module "abi_frame"
-target "wasm32-unknown-unknown" 4 little structpass=unclassified
+target "wasm32-unknown-unknown" 4 little
 
 functy.0 = (i32, i32) -> (i32)
 
@@ -2888,7 +3498,7 @@ bb0(%0: i32, %1: i32):
     %3 = alloca i64
     %4 = alloca [ty.0 x 3]
     store i32 %0, ptr %2
-    store i64 %0, ptr %3
+    store i32 %0, ptr %3
     store i32 %1, ptr %4
     %5 = load i32, ptr %2
     %6 = load i32, ptr %4
@@ -2904,14 +3514,14 @@ const FRAME_WASM: &[u8] = &[
     0x0a, 0x5a, 0x01, 0x58, 0x01, 0x08, 0x7f, 0x23, 0x00, 0x21, 0x08, 0x20, 0x08, 0x41, 0x20, 0x6b,
     0x22, 0x09, 0x24, 0x00, 0x20, 0x09, 0x41, 0x00, 0x6a, 0x21, 0x02, 0x20, 0x09, 0x41, 0x08, 0x6a,
     0x21, 0x03, 0x20, 0x09, 0x41, 0x10, 0x6a, 0x21, 0x04, 0x20, 0x02, 0x20, 0x00, 0x36, 0x02, 0x00,
-    0x20, 0x03, 0x20, 0x00, 0x37, 0x03, 0x00, 0x20, 0x04, 0x20, 0x01, 0x36, 0x02, 0x00, 0x20, 0x02,
+    0x20, 0x03, 0x20, 0x00, 0x36, 0x02, 0x00, 0x20, 0x04, 0x20, 0x01, 0x36, 0x02, 0x00, 0x20, 0x02,
     0x28, 0x02, 0x00, 0x21, 0x05, 0x20, 0x04, 0x28, 0x02, 0x00, 0x21, 0x06, 0x20, 0x05, 0x20, 0x06,
     0x6a, 0x21, 0x07, 0x20, 0x08, 0x24, 0x00, 0x20, 0x07, 0x0f, 0x00, 0x0b,
 ];
 
 const CALLS_TIR: &str = r#"; TrustIr text format v1
 module "abi_calls"
-target "wasm32-unknown-unknown" 4 little structpass=unclassified
+target "wasm32-unknown-unknown" 4 little
 
 functy.0 = (i32, i32) -> (i32)
 
@@ -2955,7 +3565,7 @@ const CALLS_WASM: &[u8] = &[
 
 const TABLE_TIR: &str = r#"; TrustIr text format v1
 module "abi_table"
-target "wasm32-unknown-unknown" 4 little structpass=unclassified
+target "wasm32-unknown-unknown" 4 little
 
 functy.0 = (i32, i32) -> (i32)
 
@@ -2985,17 +3595,17 @@ const TABLE_WASM: &[u8] = &[
     0x64, 0x2f, 0x63, 0x61, 0x6c, 0x6c, 0x73, 0x40, 0x31, 0x06, 0x68, 0x6f, 0x73, 0x74, 0x5f, 0x61,
     0x00, 0x00, 0x14, 0x74, 0x72, 0x75, 0x73, 0x74, 0x3a, 0x69, 0x73, 0x6c, 0x61, 0x6e, 0x64, 0x2f,
     0x63, 0x61, 0x6c, 0x6c, 0x73, 0x40, 0x31, 0x06, 0x68, 0x6f, 0x73, 0x74, 0x5f, 0x62, 0x00, 0x00,
-    0x03, 0x03, 0x02, 0x00, 0x00, 0x04, 0x04, 0x01, 0x70, 0x00, 0x04, 0x07, 0x13, 0x02, 0x04, 0x69,
+    0x03, 0x03, 0x02, 0x00, 0x00, 0x04, 0x04, 0x01, 0x70, 0x00, 0x05, 0x07, 0x13, 0x02, 0x04, 0x69,
     0x6d, 0x75, 0x6c, 0x00, 0x02, 0x08, 0x64, 0x69, 0x73, 0x70, 0x61, 0x74, 0x63, 0x68, 0x00, 0x03,
-    0x09, 0x0a, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x04, 0x00, 0x01, 0x02, 0x03, 0x0a, 0x29, 0x02, 0x0f,
+    0x09, 0x0a, 0x01, 0x00, 0x41, 0x01, 0x0b, 0x04, 0x00, 0x01, 0x02, 0x03, 0x0a, 0x29, 0x02, 0x0f,
     0x01, 0x01, 0x7f, 0x20, 0x00, 0x20, 0x01, 0x6c, 0x21, 0x02, 0x20, 0x02, 0x0f, 0x00, 0x0b, 0x17,
-    0x01, 0x02, 0x7f, 0x41, 0x02, 0x21, 0x02, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x11, 0x00, 0x00,
+    0x01, 0x02, 0x7f, 0x41, 0x03, 0x21, 0x02, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x11, 0x00, 0x00,
     0x21, 0x03, 0x20, 0x03, 0x0f, 0x00, 0x0b,
 ];
 
 const ISLAND_TIR: &str = r#"; TrustIr text format v1
 module "abi_island"
-target "wasm32-unknown-unknown" 4 little structpass=unclassified
+target "wasm32-unknown-unknown" 4 little
 
 functy.0 = (i32, i32) -> (i32)
 
@@ -3031,6 +3641,97 @@ const ISLAND_WASM: &[u8] = &[
     0x00, 0x20, 0x03, 0x20, 0x01, 0x36, 0x02, 0x00, 0x20, 0x02, 0x28, 0x02, 0x00, 0x21, 0x04, 0x20,
     0x03, 0x28, 0x02, 0x00, 0x21, 0x05, 0x20, 0x04, 0x20, 0x05, 0x10, 0x00, 0x21, 0x06, 0x20, 0x07,
     0x24, 0x01, 0x20, 0x06, 0x0f, 0x00, 0x0b,
+];
+
+/// A pointer constant whose table index (2, for `add7`) EQUALS an unrelated
+/// scalar constant bound to a local in the same body (`const i32 2`), so a
+/// check that looks for the index among the body's constants cannot tell a
+/// wrong pointer from a right one; binding the pointer to its call_indirect
+/// can.
+const TABLE_COLLIDE_TIR: &str = r#"; TrustIr text format v1
+module "abi_table_collide"
+target "wasm32-unknown-unknown" 4 little
+
+functy.0 = (i32) -> (i32)
+
+fn @mul3(functy.0) {
+bb0(%1: i32):
+    %2 = const i32 3
+    %3 = mul i32 %1, %2
+    ret %3
+}
+
+fn @add7(functy.0) {
+bb0(%1: i32):
+    %2 = const i32 7
+    %3 = add i32 %1, %2
+    ret %3
+}
+
+fn @viaptr(functy.0) {
+bb0(%1: i32):
+    %2 = const functy.0 fndef<func.1>
+    %3 = call_indirect %2(functy.0)(%1)
+    %4 = const i32 2
+    %5 = mul i32 %3, %4
+    ret %5
+}
+"#;
+
+const TABLE_COLLIDE_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x04, 0x03, 0x00, 0x00, 0x00, 0x04, 0x04, 0x01, 0x70, 0x00, 0x04, 0x07, 0x18, 0x03, 0x04,
+    0x6d, 0x75, 0x6c, 0x33, 0x00, 0x00, 0x04, 0x61, 0x64, 0x64, 0x37, 0x00, 0x01, 0x06, 0x76, 0x69,
+    0x61, 0x70, 0x74, 0x72, 0x00, 0x02, 0x09, 0x09, 0x01, 0x00, 0x41, 0x01, 0x0b, 0x03, 0x00, 0x01,
+    0x02, 0x0a, 0x4a, 0x03, 0x13, 0x01, 0x02, 0x7f, 0x41, 0x03, 0x21, 0x01, 0x20, 0x00, 0x20, 0x01,
+    0x6c, 0x21, 0x02, 0x20, 0x02, 0x0f, 0x00, 0x0b, 0x13, 0x01, 0x02, 0x7f, 0x41, 0x07, 0x21, 0x01,
+    0x20, 0x00, 0x20, 0x01, 0x6a, 0x21, 0x02, 0x20, 0x02, 0x0f, 0x00, 0x0b, 0x20, 0x01, 0x04, 0x7f,
+    0x41, 0x02, 0x21, 0x01, 0x20, 0x00, 0x20, 0x01, 0x11, 0x00, 0x00, 0x21, 0x02, 0x41, 0x02, 0x21,
+    0x03, 0x20, 0x02, 0x20, 0x03, 0x6c, 0x21, 0x04, 0x20, 0x04, 0x0f, 0x00, 0x0b,
+];
+
+/// Two same-signature function pointers called in ONE block: the per-site
+/// binding of C6 is what tells `inc(neg(x))` from `neg(inc(x))`.
+const TABLE_TWO_TIR: &str = r#"; TrustIr text format v1
+module "abi_table_two"
+target "wasm32-unknown-unknown" 4 little
+
+functy.0 = (i32) -> (i32)
+
+fn @neg(functy.0) {
+bb0(%1: i32):
+    %2 = const i32 0
+    %3 = sub i32 %2, %1
+    ret %3
+}
+
+fn @inc(functy.0) {
+bb0(%1: i32):
+    %2 = const i32 1
+    %3 = add i32 %1, %2
+    ret %3
+}
+
+fn @two(functy.0) {
+bb0(%1: i32):
+    %2 = const functy.0 fndef<func.0>
+    %3 = call_indirect %2(functy.0)(%1)
+    %4 = const functy.0 fndef<func.1>
+    %5 = call_indirect %4(functy.0)(%3)
+    ret %5
+}
+"#;
+
+const TABLE_TWO_WASM: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x04, 0x03, 0x00, 0x00, 0x00, 0x04, 0x04, 0x01, 0x70, 0x00, 0x04, 0x07, 0x13, 0x03, 0x03,
+    0x6e, 0x65, 0x67, 0x00, 0x00, 0x03, 0x69, 0x6e, 0x63, 0x00, 0x01, 0x03, 0x74, 0x77, 0x6f, 0x00,
+    0x02, 0x09, 0x09, 0x01, 0x00, 0x41, 0x01, 0x0b, 0x03, 0x00, 0x01, 0x02, 0x0a, 0x4c, 0x03, 0x13,
+    0x01, 0x02, 0x7f, 0x41, 0x00, 0x21, 0x01, 0x20, 0x01, 0x20, 0x00, 0x6b, 0x21, 0x02, 0x20, 0x02,
+    0x0f, 0x00, 0x0b, 0x13, 0x01, 0x02, 0x7f, 0x41, 0x01, 0x21, 0x01, 0x20, 0x00, 0x20, 0x01, 0x6a,
+    0x21, 0x02, 0x20, 0x02, 0x0f, 0x00, 0x0b, 0x22, 0x01, 0x04, 0x7f, 0x41, 0x01, 0x21, 0x01, 0x20,
+    0x00, 0x20, 0x01, 0x11, 0x00, 0x00, 0x21, 0x02, 0x41, 0x02, 0x21, 0x03, 0x20, 0x02, 0x20, 0x03,
+    0x11, 0x00, 0x00, 0x21, 0x04, 0x20, 0x04, 0x0f, 0x00, 0x0b,
 ];
 
 // ===========================================================================
@@ -3202,6 +3903,103 @@ mod tests {
             e,
             AbiDecodeError::UnknownOpcode { opcode: 0xd0, .. }
         ));
+    }
+
+    /// A local operand resolves to a constant only where it is definitely
+    /// assigned at the read; a local still holding its implicit 0 on some
+    /// path is ambiguous. The read is the last `local.get 1` (params: 1, so
+    /// local 1 is a declared local).
+    #[test]
+    fn a_local_resolves_only_where_it_is_definitely_assigned() {
+        let resolve = |code: &[u8]| {
+            let insts = decode_insts(code).expect("decodes");
+            let read = insts
+                .iter()
+                .rposition(|i| i.op == OP_LOCAL_GET)
+                .expect("a read");
+            resolve_i32_constant(&insts, read, 1)
+        };
+        // A straight-line write before the read.
+        assert_eq!(
+            resolve(&[0x41, 0x02, 0x21, 0x01, 0x20, 0x01, 0x1a, 0x0b]),
+            Some(2)
+        );
+        // A write before the read, the read nested in a later block.
+        assert_eq!(
+            resolve(&[
+                0x41, 0x02, 0x21, 0x01, 0x02, 0x40, 0x20, 0x01, 0x1a, 0x0b, 0x0b
+            ]),
+            Some(2)
+        );
+        // Both arms of an `if` write it.
+        assert_eq!(
+            resolve(&[
+                0x20, 0x00, 0x04, 0x40, 0x41, 0x02, 0x21, 0x01, 0x05, 0x41, 0x02, 0x21, 0x01, 0x0b,
+                0x20, 0x01, 0x1a, 0x0b
+            ]),
+            Some(2)
+        );
+        // Written in a loop's inner block and read after the loop: the block
+        // is left only past the write (`br_if 0`) or back to the loop header
+        // (`br_if 1`), so every exit is assigned — the shape the lowering
+        // gives a loop with two exits into one block.
+        assert_eq!(
+            resolve(&[
+                0x03, 0x40, 0x02, 0x40, 0x41, 0x02, 0x21, 0x01, 0x20, 0x00, 0x0d, 0x00, 0x20, 0x00,
+                0x0d, 0x01, 0x0b, 0x0b, 0x20, 0x01, 0x1a, 0x0b
+            ]),
+            Some(2)
+        );
+        // The only write comes AFTER the read: the read sees 0.
+        assert_eq!(
+            resolve(&[
+                0x02, 0x40, 0x20, 0x01, 0x1a, 0x0b, 0x41, 0x02, 0x21, 0x01, 0x0b
+            ]),
+            None
+        );
+        // The only write is inside an `if` arm the read is not in.
+        assert_eq!(
+            resolve(&[
+                0x20, 0x00, 0x04, 0x40, 0x41, 0x02, 0x21, 0x01, 0x0b, 0x20, 0x01, 0x1a, 0x0b
+            ]),
+            None
+        );
+        // The only write is in the `then` arm, the read in the `else` arm.
+        assert_eq!(
+            resolve(&[
+                0x20, 0x00, 0x04, 0x40, 0x41, 0x02, 0x21, 0x01, 0x05, 0x20, 0x01, 0x1a, 0x0b, 0x0b
+            ]),
+            None
+        );
+        // The only write is inside a block a `br_if` can leave before it.
+        assert_eq!(
+            resolve(&[
+                0x02, 0x40, 0x20, 0x00, 0x0d, 0x00, 0x41, 0x02, 0x21, 0x01, 0x0b, 0x20, 0x01, 0x1a,
+                0x0b
+            ]),
+            None
+        );
+        // A `br_table` leaves the block before its only write.
+        assert_eq!(
+            resolve(&[
+                0x02, 0x40, 0x20, 0x00, 0x0e, 0x01, 0x00, 0x00, 0x41, 0x02, 0x21, 0x01, 0x0b, 0x20,
+                0x01, 0x1a, 0x0b
+            ]),
+            None
+        );
+        // A loop reading before its own later write: the first iteration
+        // sees 0.
+        assert_eq!(
+            resolve(&[
+                0x03, 0x40, 0x20, 0x01, 0x1a, 0x41, 0x02, 0x21, 0x01, 0x0b, 0x0b
+            ]),
+            None
+        );
+        // An unbalanced body is not resolved, even past the read.
+        assert_eq!(
+            resolve(&[0x41, 0x02, 0x21, 0x01, 0x20, 0x01, 0x1a, 0x0b, 0x0b]),
+            None
+        );
     }
 
     /// The whole corpus produces evidence, every SMT obligation is
@@ -3398,8 +4196,7 @@ mod tests {
             let verdict = crate::wasm_formal::discharge(&ob);
             if verdict == crate::wasm_formal::Formal::Proven {
                 proven += 1;
-            } else if let Some(reason) = crate::wasm_formal::certification_gap_reason(&ob, &verdict)
-            {
+            } else if let Some(reason) = crate::wasm_formal::certification_gap_reason(&verdict) {
                 crate::formal_gap::print_gap_skip(
                     &format!("wasm_abi_proofs `{}`", ob.name),
                     &reason,

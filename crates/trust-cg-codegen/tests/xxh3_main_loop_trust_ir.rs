@@ -165,8 +165,12 @@ fn compile_trust_ir(
     module: &trust_ir::Module,
     opt_level: OptLevel,
 ) -> Result<Vec<u8>, String> {
-    let (lir_func, _proof) = trust_cg_lower::translate_function(trust_ir_func, module)
-        .map_err(|e| format!("adapter: {e}"))?;
+    let (lir_func, _proof) = trust_cg_lower::translate_function_with_license(
+        trust_ir_func,
+        module,
+        &permit_unlicensed(),
+    )
+    .map_err(|e| format!("adapter: {e}"))?;
     let config = PipelineConfig {
         target_triple: host_aarch64_triple().to_string(),
         opt_level,
@@ -184,8 +188,12 @@ fn prepare_trust_ir(
     module: &trust_ir::Module,
     opt_level: OptLevel,
 ) -> Result<MachFunction, String> {
-    let (lir_func, _proof) = trust_cg_lower::translate_function(trust_ir_func, module)
-        .map_err(|e| format!("adapter: {e}"))?;
+    let (lir_func, _proof) = trust_cg_lower::translate_function_with_license(
+        trust_ir_func,
+        module,
+        &permit_unlicensed(),
+    )
+    .map_err(|e| format!("adapter: {e}"))?;
     let config = PipelineConfig {
         target_triple: host_aarch64_triple().to_string(),
         opt_level,
@@ -364,7 +372,7 @@ fn build_xxh3_main_loop() -> (trust_ir::Function, trust_ir::Module) {
     let byte_offset = fb.mul(Ty::I64, loop_i, eight);
     let block_ptr = fb.gep(Ty::I8, data, vec![byte_offset]);
     let block_val = fb.load(Ty::I64, block_ptr);
-    let prime1 = fb.iconst(Ty::I64, XXH3_PRIME1 as i128);
+    let prime1 = fb.iconst(Ty::I64, i128::from(XXH3_PRIME1 as i64));
     let mixed = fb.mul(Ty::I64, block_val, prime1);
     let tmp = fb.binop(BinOp::Xor, Ty::I64, loop_acc, mixed);
     let shl_amt = fb.iconst(Ty::I64, 31);
@@ -372,7 +380,7 @@ fn build_xxh3_main_loop() -> (trust_ir::Function, trust_ir::Module) {
     let tmp_shl = fb.binop(BinOp::Shl, Ty::I64, tmp, shl_amt);
     let tmp_lshr = fb.binop(BinOp::LShr, Ty::I64, tmp, shr_amt);
     let rotated = fb.binop(BinOp::Or, Ty::I64, tmp_shl, tmp_lshr);
-    let prime2 = fb.iconst(Ty::I64, XXH3_PRIME2 as i128);
+    let prime2 = fb.iconst(Ty::I64, i128::from(XXH3_PRIME2 as i64));
     let next_acc = fb.mul(Ty::I64, rotated, prime2);
     let one = fb.iconst(Ty::I64, 1);
     let next_i = fb.add(Ty::I64, loop_i, one);
@@ -382,7 +390,7 @@ fn build_xxh3_main_loop() -> (trust_ir::Function, trust_ir::Module) {
     fb.ret(vec![exit_acc]);
 
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let func = module
         .functions
         .iter()
@@ -699,4 +707,13 @@ fn test_xxh3_main_loop_e2e_zero_blocks() {
         return;
     }
     run_xxh3_main_loop_case("zero_blocks", 0x082E_FA98_EC4E_6C89, &[]);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

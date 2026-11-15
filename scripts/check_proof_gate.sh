@@ -7,7 +7,7 @@
 # Runs the strict, fail-closed formal-proof gate. Unlike the default
 # verification lane (which silently downgrades to statistical mock when no solver
 # is present), this gate FAILS if:
-#   (i)   no external AY solver is available,
+#   (i)   AY or its independent Clean proof checker is unavailable,
 #   (ii)  any obligation is disproved or errors, or
 #   (iii) any obligation falls back to statistical evaluation.
 #
@@ -21,22 +21,22 @@
 # The DEFAULT lane runs `full_database_is_formally_verified`: every obligation in
 # the ProofDatabase is discharged FORMALLY through AY. THE ENFORCED GUARANTEE
 # is ZERO soundness failures — a counterexample (the solver DISPROVED an
-# obligation) or an error hard-fails the gate; that is the only thing that can
-# indicate a miscompile. Solver-capacity PENDING (timeouts/unknown) are REPORTED,
+# obligation) or an error hard-fails the gate. Passing covers only the represented
+# obligations, not every possible compiler defect. Timeouts/unknown are REPORTED,
 # never a pass. Only five audited wide x86 bit-vector obligations may remain
 # pending (Sdiv I32/I64, Srem I32/I64, and V2I64 widening Umul); an entry may
 # graduate to Verified, but any new pending name hard-fails the floor. The
-# registry contains exactly 1,907 unique obligations, so the five-row capacity
-# ceiling requires at least 1,902 formally Verified rows and 0 soundness
-# failures. (These two numbers are PROSE — this script asserts neither. The
-# authority is EXPECTED_STATIC_PROOF_OBLIGATION_COUNT in
-# crates/trust-cg-verify/tests/proof_gate_strict.rs, which does assert it.
-# They read 1,877/1,872 until 2026-08-26, one corpus growth out of date.) Several minutes; quick smoke via
+# registry cardinality and derived verified floor are asserted by
+# EXPECTED_STATIC_PROOF_OBLIGATION_COUNT in
+# crates/trust-cg-verify/tests/proof_gate_strict.rs; do not duplicate that moving
+# count here. Several minutes; quick smoke via
 # `--test representative_arithmetic_is_formally_verified`.
 #
-# trust-cg intentionally exposes only the external solver lane. It uses an `ay`
-# binary on PATH (`z3_available()` retains its legacy compatibility name);
-# there is no native-AY Cargo feature in this release.
+# trust-cg uses the identity-checked AY shipped in the sysroot of the Trust
+# compiler that built it (crates/trust-cg-verify/src/ay_identity.rs) and
+# independent Clean checking from aterm's managed package store. No sibling
+# source checkout or Z3 fallback is required.
+# There is no native-AY Cargo feature in this release.
 #
 # This script is meant to be added to scripts/run_full_test_matrix.sh as a
 # dedicated external probe (see the integration_edits in the P0 manifest), in
@@ -46,7 +46,7 @@
 #   0 — the selected gate completed with zero soundness failures and no
 #       statistical fallback. Solver-capacity PENDING is reported, not proved.
 #   1 — gate failure (no solver, a soundness failure, or an un-allowlisted PENDING).
-#   2 — tooling error (cargo missing, build failure).
+#   2 — tooling error (targo missing, build failure).
 #
 # Usage:
 #   scripts/check_proof_gate.sh                 # DEFAULT = full ProofDatabase floor (CLI solver)
@@ -93,8 +93,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "check_proof_gate: cargo not found on PATH" >&2
+# The installed Trust package's targo, through the wrapper that keeps the
+# TRUST_CG_* controls below out of trustc's environment (it refuses to run
+# under one) and hands them to the test. A Trust build of trust-cg-verify is
+# also what records the toolchain AY its solver lanes admit.
+TRUST_CARGO="${SCRIPT_DIR}/trust_cargo.sh"
+if [ ! -x "${TRUST_CARGO}" ]; then
+    echo "check_proof_gate: missing executable ${TRUST_CARGO}" >&2
     exit 2
 fi
 
@@ -114,10 +119,10 @@ echo "[proof-gate] TRUST_CG_AY_TIMEOUT_MS=${TRUST_CG_AY_TIMEOUT_MS:-<default 300
 #
 # Capture the libtest output (while still streaming it) so we can assert below
 # that the filter actually matched and RAN at least one test — see the
-# zero-tests-ran guard. `tee` would mask cargo's exit, so use PIPESTATUS.
+# zero-tests-ran guard. `tee` would mask targo's exit, so use PIPESTATUS.
 gate_out_log="$(mktemp -t trust_cg_proof_gate.XXXXXX)"
 set +e
-cargo test --locked \
+"${TRUST_CARGO}" test --locked \
     -p "${PACKAGE}" \
     --test "${TEST_TARGET}" \
     "${TEST_FILTER}" \
@@ -133,7 +138,7 @@ if [ "${status}" -ne 0 ]; then
     exit 1
 fi
 
-# ZERO-TESTS-RAN GUARD (an empty gate is worse than none). `cargo test <filter>`
+# ZERO-TESTS-RAN GUARD (an empty gate is worse than none). `targo test <filter>`
 # exits 0 even when the filter matches NOTHING ("0 passed; N filtered out") — if
 # the gate test is renamed, typo'd, or cfg-gated out, the gate would otherwise
 # print "proof gate OK" while discharging ZERO obligations. Require that libtest
@@ -144,7 +149,7 @@ gate_passed_total="$(
 if ! grep -q 'test result:' "${gate_out_log}" || [ "${gate_passed_total:-0}" -eq 0 ]; then
     echo "proof gate FAILED: filter '${TEST_FILTER}' (target '${TEST_TARGET}') matched 0 tests that RAN" >&2
     echo "  (libtest reported ${gate_passed_total:-0} passed). The gate verified NOTHING — a renamed/" >&2
-    echo "  typo'd/cfg-gated test name passes 'cargo test' with exit 0. Refusing to report OK." >&2
+    echo "  typo'd/cfg-gated test name passes 'targo test' with exit 0. Refusing to report OK." >&2
     rm -f "${gate_out_log}"
     exit 2
 fi

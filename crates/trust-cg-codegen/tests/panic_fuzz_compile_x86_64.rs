@@ -10,9 +10,10 @@
 // or FP constant-pool shapes.
 //
 // Run:
-//   cargo test -p trust-cg-codegen --test panic_fuzz_compile_x86_64
+//   scripts/trust_cargo.sh test -p trust-cg-codegen --test panic_fuzz_compile_x86_64
 // Increase case count via env:
-//   PROPTEST_CASES=100000 cargo test -p trust-cg-codegen --test panic_fuzz_compile_x86_64
+//   PROPTEST_CASES=100000 scripts/trust_cargo.sh test -p trust-cg-codegen \
+//     --test panic_fuzz_compile_x86_64
 
 use std::panic;
 
@@ -373,12 +374,48 @@ fn x86_generic_sse4_feature_gate_returns_typed_error_without_panic() {
     }
 }
 
+/// The case count every property in this file runs: PROPTEST_CASES, else 64.
+fn panic_fuzz_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64)
+}
+
+/// Positive control for the case count, as in `panic_fuzz_lower.rs`: a
+/// property with this file's case configuration counts the cases it actually
+/// ran and prints both figures on one line. The Linux floor requires the
+/// line with this file's default and the fuzz lane with its
+/// `--proptest-cases`, so a case count shrunk behind their back fails them.
+#[test]
+fn panic_fuzz_runs_its_configured_case_count() {
+    let configured = panic_fuzz_cases();
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig {
+        cases: configured,
+        ..ProptestConfig::default()
+    });
+    let run = std::cell::Cell::new(0u32);
+    runner
+        .run(&any::<u64>(), |_| {
+            run.set(run.get() + 1);
+            Ok(())
+        })
+        .expect("the counting property cannot fail");
+    println!(
+        "panic-fuzz proptest cases: configured={configured} run={}",
+        run.get()
+    );
+    assert!(run.get() > 0, "no proptest case ran");
+    assert_eq!(
+        run.get(),
+        configured,
+        "proptest ran a different number of cases"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64),
+        cases: panic_fuzz_cases(),
         max_shrink_iters: 200,
         .. ProptestConfig::default()
     })]
@@ -397,7 +434,14 @@ fn assert_host_jit_no_panic(module: trust_ir::Module, label: &'static str) {
     let result = panic::catch_unwind(panic::AssertUnwindSafe(move || {
         let mut config = CompilerConfig::for_host_jit();
         config.opt_level = CompilerOptLevel::O0;
-        let _ = Compiler::new(config).compile_module_to_jit(&module, &HashMap::new());
+        // Generated bodies carry no `body_gate`, refused by default (WS7.5,
+        // DG-73); `Permit` keeps every case reaching the JIT it fuzzes.
+        let _ = Compiler::new(config)
+            .with_codegen_license(
+                trust_cg_lower::CodegenLicensePolicy::default()
+                    .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit),
+            )
+            .compile_module_to_jit(&module, &HashMap::new());
     }));
     if let Err(payload) = result {
         panic!(
@@ -427,7 +471,10 @@ fn x86_host_jit_spill_pressure_shape_never_panics() {
     fb.ret(vec![acc]);
     fb.build();
 
-    assert_host_jit_no_panic(mb.build(), "spill-pressure");
+    assert_host_jit_no_panic(
+        mb.build().expect("ModuleBuilder::build: test fixture"),
+        "spill-pressure",
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -447,5 +494,8 @@ fn x86_host_jit_fp_constant_pool_shape_never_panics() {
     fb.ret(vec![acc]);
     fb.build();
 
-    assert_host_jit_no_panic(mb.build(), "fp-constant-pool");
+    assert_host_jit_no_panic(
+        mb.build().expect("ModuleBuilder::build: test fixture"),
+        "fp-constant-pool",
+    );
 }

@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test for the rustc_codegen_trust_cg x86_64 target path.
 //
@@ -32,17 +36,17 @@ mod target_dir_support;
 //
 // Running this test:
 //
-//     cd crates/rustc_codegen_trust_cg
-//     cargo test --release -- --nocapture
+//     cd crates/rustc-codegen-trust-cg
+//     targo --unverified test --release -- --nocapture
 //
-// Prerequisites: the `rust-toolchain.toml` pinned toolchain with
-// `rustc-dev`, `rust-src`, and `llvm-tools` components, plus the
-// `x86_64-apple-darwin` rust-std component.
+// Prerequisites: the installed Trust package this crate pins
+// (`rust-toolchain.toml` `channel = "trust"`; it ships the rustc_private crates
+// and llvm-tools), with an `x86_64-apple-darwin` std in its sysroot.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn pinned_toolchain() -> String {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -60,46 +64,10 @@ fn pinned_toolchain() -> String {
     panic!("rust-toolchain.toml did not contain a channel");
 }
 
-/// Return the path to the freshly-built `librustc_codegen_trust_cg.dylib`,
-/// building it via `cargo build --release` from the crate root if it is not
-/// already present. Mirrors the helper in `hello_loop.rs`.
+/// The backend sibling of this Cargo test executable, not another profile or
+/// whichever cached library happens to have the newest modification time.
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-
-    let pinned_cargo_toolchain = format!("+{}", pinned_toolchain());
-    let status = Command::new("cargo")
-        .arg(pinned_cargo_toolchain)
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run x86_64 test");
-
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(
-        built.exists(),
-        "expected dylib at {:?} but it was not produced",
-        built
-    );
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
@@ -110,29 +78,19 @@ fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
 }
 
 /// Whether the `x86_64-apple-darwin` rust-std component is installed for the
-/// pinned toolchain. Without it, `rustc --target x86_64-apple-darwin` cannot
+/// pinned toolchain. Without it, `trustc --target x86_64-apple-darwin` cannot
 /// find `std` and the test cannot run; we skip rather than fail so the suite
 /// stays green on hosts that have not added the target.
 fn x86_64_std_available() -> bool {
-    let toolchain = pinned_toolchain();
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(&toolchain)
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 #[test]
 fn m1_hello_loop_compiles_for_x86_64() {
     if !x86_64_std_available() {
         eprintln!(
-            "skipping: rust-std for {TARGET} is not installed for the pinned toolchain; \
-             run `rustup target add {TARGET} --toolchain {}`",
+            "skipping: rust-std for {TARGET} is not in the {} toolchain's sysroot \
+             (the installed Trust package ships no {TARGET} std today)",
             pinned_toolchain()
         );
         return;
@@ -156,16 +114,14 @@ fn m1_hello_loop_compiles_for_x86_64() {
         s.push(&dylib);
         s
     };
-    let toolchain = pinned_toolchain();
-    let output = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .arg(&backend_arg)
         .args(["--target", TARGET, "-Cpanic=abort"])
         .arg("-o")
         .arg(&out_bin)
         .arg(&src_path)
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -221,23 +177,25 @@ fn m1_hello_loop_compiles_for_x86_64() {
     // honoured `--target x86_64`, routing through trust-cg's x86_64 backend,
     // not the AArch64 pipeline). We assert object format via the toolchain's
     // `llvm-objdump`.
-    let obj_dir = std::env::temp_dir().join(format!("rcl2_hello_loop_x86_obj_{}", std::process::id()));
+    let obj_dir =
+        std::env::temp_dir().join(format!("rcl2_hello_loop_x86_obj_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&obj_dir);
     std::fs::create_dir_all(&obj_dir).expect("create obj dir");
     let obj_src = obj_dir.join("prog.rs");
     std::fs::write(&obj_src, src).expect("write source");
     let obj_out = obj_dir.join("out");
-    let obj_output = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
+    let obj_output = toolchain_support::rustc_command()
         .arg(&backend_arg)
         .args(["--target", TARGET, "-Cpanic=abort"])
         .arg("--emit=obj")
         .arg("-o")
         .arg(&obj_out)
-        .env("TRUST_CG_TEST_SKIP_LANG_START", "1")
+        .arg(toolchain_support::backend_knobs_arg(&[
+            "test-skip-lang-start",
+        ]))
         .arg(&obj_src)
         .output()
-        .expect("failed to spawn rustc via rustup (obj emit)");
+        .expect("failed to spawn trustc (obj emit)");
     assert!(
         obj_output.status.success(),
         "with lang_start skipped, the x86_64 bridge must still emit objects. stderr: <<<{}>>>",
@@ -245,8 +203,8 @@ fn m1_hello_loop_compiles_for_x86_64() {
     );
 
     // Find the entry wrapper object and confirm it is x86_64 Mach-O.
-    let sysroot = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--print", "sysroot"])
+    let sysroot = toolchain_support::rustc_driver_command()
+        .args(["--print", "sysroot"])
         .output()
         .expect("rustc --print sysroot");
     let sysroot = String::from_utf8_lossy(&sysroot.stdout).trim().to_owned();

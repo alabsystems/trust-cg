@@ -33,6 +33,9 @@
 
 mod common;
 
+#[path = "common/field_typed.rs"]
+mod field_typed;
+
 use std::sync::Mutex;
 
 use common::x86_64_corpus::{x86_64_differential_test, x86_64_oracle_enabled};
@@ -68,6 +71,7 @@ fn run_differential(
 
 fn struct_def(name: &str, fields: &[Ty]) -> StructDef {
     StructDef {
+        origin: None,
         id: StructId::new(0),
         name: name.to_string(),
         fields: fields
@@ -147,6 +151,8 @@ fn ret(value: u32) -> InstrNode {
 
 fn func(name: &str, ty: FuncTyId, blocks: Vec<TrustIrBlock>) -> TrustIrFunction {
     TrustIrFunction {
+        body_gate: None,
+        display_path: None,
         attrs: Default::default(),
         id: FuncId::new(0),
         name: name.to_string(),
@@ -161,6 +167,9 @@ fn func(name: &str, ty: FuncTyId, blocks: Vec<TrustIrBlock>) -> TrustIrFunction 
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     }
 }
 
@@ -171,11 +180,18 @@ fn module(
     functions: Vec<TrustIrFunction>,
 ) -> TrustIrModule {
     TrustIrModule {
+        completeness: None,
+        drop_glue: Vec::new(),
+        global_asm: vec![],
+        tuple_layouts: Vec::new(),
+        imports: vec![],
         name: name.to_string(),
         functions,
         structs,
         records: vec![],
         closure_types: vec![],
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
         globals: vec![],
         func_types,
         types: vec![],
@@ -242,6 +258,7 @@ fn int_struct_sum_module(name: &str, agg_name: &str, field_tys: &[Ty]) -> TrustI
         vec![FuncTy {
             params: vec![aggregate],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(name, ft, blocks)],
@@ -397,6 +414,7 @@ fn i64_f64_mix_module(name: &str, agg_name: &str, int_first: bool) -> TrustIrMod
         vec![FuncTy {
             params: vec![aggregate.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -494,6 +512,7 @@ fn x86_64_aggregate_arg_f64_pair_vs_clang() {
         vec![FuncTy {
             params: vec![aggregate.clone()],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -546,6 +565,7 @@ fn x86_64_aggregate_i128_field_passthrough_vs_clang() {
         vec![FuncTy {
             params: vec![aggregate.clone()],
             returns: vec![aggregate.clone()],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -688,6 +708,7 @@ fn int_struct_return_module(name: &str, agg_name: &str, field_tys: &[Ty]) -> Tru
         vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![aggregate.clone()],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -879,6 +900,7 @@ fn x86_64_aggregate_return_i64_f64_mix_vs_clang() {
         vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![aggregate.clone()],
+            abi: None,
             is_vararg: false,
         }],
         vec![func(
@@ -976,4 +998,180 @@ int main(void) {
 }
 "#;
     run_differential("x86_64_aggregate_return_large_sret", &m, c, driver).unwrap();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARTIAL-EIGHTBYTE aggregates: 3/5/6/7 valid bytes.
+//
+// `sysv_eightbyte_lane_type` admits POWER-OF-TWO lane widths only, and the
+// reason it gives is correct: a 3-byte lane has no single GPR access that
+// covers exactly three bytes, and a 4-byte access would read or write one byte
+// PAST the object. So these shapes fail closed today.
+//
+// They are the second-largest refusal class in the Linux x86-64 `core` census
+// (37 roots: `Array(I8, 3|5|6)`, `Array(I16, 3)`). Closing them needs the lane
+// COPY to be decomposed into width-exact accesses — a 3-byte lane as I16@+0
+// then I8@+2 — on both sides: the caller may only READ the object's bytes, and
+// the callee may only WRITE its own allocation. SysV leaves the bytes beyond
+// the object UNSPECIFIED, so neither side may touch them.
+//
+// These tests are the acceptance gate for that work. Until it lands they are
+// `#[ignore]`d with the reason, rather than deleted or weakened: an ignored
+// test that states the contract is worth more than no test, and it fails the
+// moment the lowering starts producing WRONG bytes rather than refusing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn x86_64_aggregate_arg_i8x3_vs_clang() {
+    if !x86_64_oracle_enabled("x86_64_aggregate_arg_i8x3_vs_clang") {
+        return;
+    }
+    // 3 bytes: ONE INTEGER eightbyte with 3 valid bytes. The smallest shape
+    // the power-of-two restriction refuses.
+    let m = int_struct_sum_module("_sum_i8x3", "I8x3", &[Ty::I8, Ty::I8, Ty::I8]);
+    let c = r#"
+#include <stdint.h>
+struct I8x3 { int8_t f0; int8_t f1; int8_t f2; };
+long _sum_i8x3(struct I8x3 s) { return (long)s.f0 + (long)s.f1 + (long)s.f2; }
+"#;
+    let driver = r#"
+#include <stdint.h>
+#include <stdio.h>
+struct I8x3 { int8_t f0; int8_t f1; int8_t f2; };
+extern long _sum_i8x3(struct I8x3 s);
+int main(void) {
+    struct I8x3 s = { -5, 100, -128 };
+    printf("%ld\n", _sum_i8x3(s));
+    return 0;
+}
+"#;
+    run_differential("x86_64_aggregate_arg_i8x3", &m, c, driver).unwrap();
+}
+
+#[test]
+fn x86_64_aggregate_arg_i8x5_vs_clang() {
+    if !x86_64_oracle_enabled("x86_64_aggregate_arg_i8x5_vs_clang") {
+        return;
+    }
+    // 5 bytes: one INTEGER eightbyte, 5 valid. Decomposes as I32@+0 + I8@+4.
+    let m = int_struct_sum_module(
+        "_sum_i8x5",
+        "I8x5",
+        &[Ty::I8, Ty::I8, Ty::I8, Ty::I8, Ty::I8],
+    );
+    let c = r#"
+#include <stdint.h>
+struct I8x5 { int8_t f0, f1, f2, f3, f4; };
+long _sum_i8x5(struct I8x5 s) {
+    return (long)s.f0 + (long)s.f1 + (long)s.f2 + (long)s.f3 + (long)s.f4;
+}
+"#;
+    let driver = r#"
+#include <stdint.h>
+#include <stdio.h>
+struct I8x5 { int8_t f0, f1, f2, f3, f4; };
+extern long _sum_i8x5(struct I8x5 s);
+int main(void) {
+    struct I8x5 s = { -5, 100, -128, 127, 1 };
+    printf("%ld\n", _sum_i8x5(s));
+    return 0;
+}
+"#;
+    run_differential("x86_64_aggregate_arg_i8x5", &m, c, driver).unwrap();
+}
+
+#[test]
+fn x86_64_aggregate_arg_i16x3_vs_clang() {
+    if !x86_64_oracle_enabled("x86_64_aggregate_arg_i16x3_vs_clang") {
+        return;
+    }
+    // 6 bytes: one INTEGER eightbyte, 6 valid. Decomposes as I32@+0 + I16@+4.
+    let m = int_struct_sum_module("_sum_i16x3", "I16x3", &[Ty::I16, Ty::I16, Ty::I16]);
+    let c = r#"
+#include <stdint.h>
+struct I16x3 { int16_t f0, f1, f2; };
+long _sum_i16x3(struct I16x3 s) { return (long)s.f0 + (long)s.f1 + (long)s.f2; }
+"#;
+    let driver = r#"
+#include <stdint.h>
+#include <stdio.h>
+struct I16x3 { int16_t f0, f1, f2; };
+extern long _sum_i16x3(struct I16x3 s);
+int main(void) {
+    struct I16x3 s = { -30000, 20000, 12345 };
+    printf("%ld\n", _sum_i16x3(s));
+    return 0;
+}
+"#;
+    run_differential("x86_64_aggregate_arg_i16x3", &m, c, driver).unwrap();
+}
+
+/// The partial-eightbyte shapes now COMPILE, including the 7-byte case that
+/// has no differential of its own.
+///
+/// This replaces the fail-closed gate that stood here while the lane copy was
+/// undecomposed. That gate required all four shapes to REFUSE, and it was the
+/// right assertion then: a refusal is a correct compiler, an over-reading
+/// 4-byte access for a 3-byte object is not. It has now served its purpose —
+/// the shapes are lowered by width-exact access sequences, and the clang
+/// differentials above hold their RESULTS to the platform ABI.
+///
+/// What this adds beyond those differentials is the 7-byte shape, whose
+/// decomposition is the deepest (I32@+0, I16@+4, I8@+6) and which therefore
+/// exercises three accesses and two shifts on each side.
+#[test]
+fn x86_64_partial_eightbyte_aggregates_are_lowered_not_refused() {
+    use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+    use trust_cg_codegen::pipeline::OptLevel;
+    use trust_cg_codegen::target::TargetSpec;
+
+    let shapes: &[(&str, &str, Vec<Ty>)] = &[
+        (
+            "3 bytes (I16@+0, I8@+2)",
+            "I8x3",
+            vec![Ty::I8, Ty::I8, Ty::I8],
+        ),
+        (
+            "5 bytes (I32@+0, I8@+4)",
+            "I8x5",
+            vec![Ty::I8, Ty::I8, Ty::I8, Ty::I8, Ty::I8],
+        ),
+        (
+            "6 bytes (I32@+0, I16@+4)",
+            "I16x3",
+            vec![Ty::I16, Ty::I16, Ty::I16],
+        ),
+        (
+            "7 bytes (I32@+0, I16@+4, I8@+6)",
+            "I8x7",
+            vec![Ty::I8, Ty::I8, Ty::I8, Ty::I8, Ty::I8, Ty::I8, Ty::I8],
+        ),
+    ];
+    for (label, name, fields) in shapes {
+        let m = int_struct_sum_module("_probe", name, fields);
+        let result = Compiler::new_for_target_spec(
+            CompilerConfig {
+                opt_level: OptLevel::O0,
+                ..CompilerConfig::default()
+            },
+            TargetSpec::parse("x86_64-unknown-linux-gnu")
+                .expect("x86_64-unknown-linux-gnu is a known triple"),
+        )
+        .with_codegen_license(permit_unlicensed())
+        .compile(&field_typed::normalized(&m));
+        assert!(
+            result.is_ok(),
+            "{label}: a partial-eightbyte by-value aggregate must now LOWER, not refuse: {:?}",
+            result.err()
+        );
+    }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

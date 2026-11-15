@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: FLOAT ITERATOR REDUCTIONS / ADAPTERS / COLLECT — `.sum()`,
 // `.product()`, `.fold()`, `.map()`, `.filter()`, `.collect::<Vec<_>>()` over
@@ -61,65 +65,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run float-iter test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -154,13 +107,12 @@ fn try_compile(
     let src_path = dir.join(format!("{name}.rs"));
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
         if !certs {
-            cmd.env("TCG_NO_PROOF_CERTS", "1");
+            cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
         }
     }
     cmd.args(["--target", TARGET, "-Cpanic=abort"])
@@ -179,7 +131,11 @@ fn try_compile(
 /// Run `bin`; return `Some(exit_code)` for a normal exit, `None` if the process
 /// died by SIGNAL (a loud trap — e.g. the proof-cert trapping stub's SIGILL).
 fn run_outcome(bin: &Path) -> Option<i32> {
-    Command::new(bin).output().expect("run binary").status.code()
+    Command::new(bin)
+        .output()
+        .expect("run binary")
+        .status
+        .code()
 }
 
 const BB: &str = "#[inline(never)] fn bb<T>(x: T) -> T { std::hint::black_box(x) }";
@@ -203,7 +159,14 @@ fn assert_float_match_or_safe(dir: &Path, shapes: &[(&str, &str, i32)], certs: b
                 llvm_exit, *expected,
                 "LLVM exit for `{name}` @O{opt} is {llvm_exit}, expected {expected}"
             );
-            match try_compile(dir, &format!("{name}_tcg_{opt}_{tag}"), &src, Some(&dylib), opt, certs) {
+            match try_compile(
+                dir,
+                &format!("{name}_tcg_{opt}_{tag}"),
+                &src,
+                Some(&dylib),
+                opt,
+                certs,
+            ) {
                 Some(tcg_bin) => match run_outcome(&tcg_bin) {
                     Some(tcg_exit) => assert_eq!(
                         tcg_exit, llvm_exit,
@@ -221,7 +184,9 @@ fn assert_float_match_or_safe(dir: &Path, shapes: &[(&str, &str, i32)], certs: b
                         eprintln!("note: `{name}` @O{opt} ({tag}) trapped loudly (safe, #465)");
                     }
                 },
-                None => eprintln!("note: `{name}` @O{opt} ({tag}) failed closed under trust-cg (safe)"),
+                None => {
+                    eprintln!("note: `{name}` @O{opt} ({tag}) failed closed under trust-cg (safe)")
+                }
             }
         }
     }

@@ -12,6 +12,16 @@
 
 use libfuzzer_sys::fuzz_target;
 
+/// The license this target lowers under. Its generated bodies carry no
+/// `body_gate`, which trust-cg refuses by default (roadmap WS7.5, decision
+/// gate DG-73); refusing every input at the license would leave the lowering
+/// this target fuzzes unreached. The named, counted `FuzzHarness` exception
+/// keeps it reached.
+fn license() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed_permit_exception(trust_cg_lower::UnlicensedPermitException::FuzzHarness)
+}
+
 use trust_cg_codegen::pipeline::{OptLevel, Pipeline, PipelineConfig};
 use trust_cg_lower::trust_ir_compat::{
     BinOp, Block as TmirBlock, BlockId, Constant, FuncId, FuncTy, Function as TmirFunction, Inst,
@@ -63,11 +73,14 @@ fn signed_lane(byte: u8) -> i128 {
 
 fn build_vector_function(data: &[u8], ty: Ty, ops: &[BinOp]) -> (TmirFunction, TmirModule) {
     let mut module = TmirModule::new("_fuzz_compile_vector");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![ty.clone()],
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("a fresh fuzz module has room for its signature");
 
     let mut func = TmirFunction::new(FuncId::new(0), "_fuzz_vector_fn", ft_id, BlockId::new(0));
     let mut next_vid: u32 = 1000;
@@ -142,14 +155,15 @@ fuzz_target!(|data: &[u8]| {
     match data[1] % 4 {
         1 => {
             let (func, module) = build_vector_function(data, v2i64_ty(), &[BinOp::Add, BinOp::Sub]);
-            let lir = match trust_cg_lower::translate_function(&func, &module) {
-                Ok((l, _)) => l,
-                Err(_) => return,
-            };
+            let lir =
+                match trust_cg_lower::translate_function_with_license(&func, &module, &license()) {
+                    Ok((l, _)) => l,
+                    Err(_) => return,
+                };
             let config = PipelineConfig {
                 opt_level: pick_opt_level(data[0]),
                 emit_debug: false,
-                ..Default::default()
+                ..PipelineConfig::for_target("aarch64-apple-darwin")
             };
             let pipeline = Pipeline::new(config);
             let _ = pipeline.compile_function(&lir);
@@ -158,14 +172,15 @@ fuzz_target!(|data: &[u8]| {
         2 => {
             let (func, module) =
                 build_vector_function(data, v4i32_ty(), &[BinOp::Shl, BinOp::LShr, BinOp::AShr]);
-            let lir = match trust_cg_lower::translate_function(&func, &module) {
-                Ok((l, _)) => l,
-                Err(_) => return,
-            };
+            let lir =
+                match trust_cg_lower::translate_function_with_license(&func, &module, &license()) {
+                    Ok((l, _)) => l,
+                    Err(_) => return,
+                };
             let config = PipelineConfig {
                 opt_level: pick_opt_level(data[0]),
                 emit_debug: false,
-                ..Default::default()
+                ..PipelineConfig::for_target("aarch64-apple-darwin")
             };
             let pipeline = Pipeline::new(config);
             let _ = pipeline.compile_function(&lir);
@@ -175,11 +190,14 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let mut module = TmirModule::new("_fuzz_compile");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            is_vararg: false,
+            abi: None,
+        })
+        .expect("a fresh fuzz module has room for its signature");
     let mut func = TmirFunction::new(FuncId::new(0), "_fuzz_fn", ft_id, BlockId::new(0));
     let mut next_vid: u32 = 1000;
     let mut alloc_vid = || {
@@ -240,14 +258,14 @@ fuzz_target!(|data: &[u8]| {
         body,
     });
 
-    let lir = match trust_cg_lower::translate_function(&func, &module) {
+    let lir = match trust_cg_lower::translate_function_with_license(&func, &module, &license()) {
         Ok((l, _)) => l,
         Err(_) => return,
     };
     let config = PipelineConfig {
         opt_level: pick_opt_level(data[0]),
         emit_debug: false,
-        ..Default::default()
+        ..PipelineConfig::for_target("aarch64-apple-darwin")
     };
     let pipeline = Pipeline::new(config);
     let _ = pipeline.compile_function(&lir);

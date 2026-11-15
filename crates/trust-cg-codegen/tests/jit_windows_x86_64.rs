@@ -301,8 +301,9 @@ fn x86_64_jit_calls_host_abi_entrypoints() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("x86-64 host JIT should compile");
 
@@ -346,10 +347,11 @@ fn x86_64_windows_jit_accepts_requested_windows_target_spec() {
     let answer = fb.iconst(Ty::I64, 42);
     fb.ret(vec![answer]);
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let target_spec = TargetSpec::parse("x86_64-pc-windows-msvc").unwrap();
-    let compiler = Compiler::new_for_target_spec(CompilerConfig::for_host_jit(), target_spec);
+    let compiler = Compiler::new_for_target_spec(CompilerConfig::for_host_jit(), target_spec)
+        .with_codegen_license(permit_unlicensed());
     assert_eq!(compiler.target_spec(), target_spec);
 
     let result = compiler
@@ -391,7 +393,7 @@ fn windows_dirty_narrow_icmp_args_module() -> TrustIrModule {
     add_dirty_arg_icmp_fn(&mut mb, "dirty_i16_ult", Ty::I16, ICmpOp::Ult);
     add_dirty_arg_icmp_fn(&mut mb, "dirty_i16_slt", Ty::I16, ICmpOp::Slt);
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -399,6 +401,7 @@ fn windows_dirty_narrow_icmp_args_module() -> TrustIrModule {
 fn x86_64_windows_jit_canonicalizes_dirty_narrow_icmp_args() {
     let module = windows_dirty_narrow_icmp_args_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile dirty narrow comparison probes");
 
@@ -447,6 +450,9 @@ fn windows_dirty_narrow_extern_return_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }
     }
 
@@ -498,10 +504,16 @@ fn windows_dirty_narrow_extern_return_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }
     }
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
         name: "x86_64_windows_dirty_narrow_extern_return".to_owned(),
         functions: vec![
             extern_decl(0, "trust_cg_win64_dirty_i8_return", i8_extern_ty),
@@ -529,21 +541,25 @@ fn windows_dirty_narrow_extern_return_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I8],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I16],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -557,6 +573,9 @@ fn windows_dirty_narrow_extern_return_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -574,6 +593,7 @@ fn x86_64_windows_jit_canonicalizes_dirty_narrow_extern_returns() {
         ),
     ]);
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(
             &windows_dirty_narrow_extern_return_module(),
             &extern_symbols,
@@ -612,9 +632,10 @@ fn x86_64_windows_jit_executes_atomic_xchg_i64() {
     let old = fb.atomic_rmw(AtomicRMWOp::Xchg, Ty::I64, ptr, desired, Ordering::SeqCst);
     fb.ret(vec![old]);
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile i64 atomic exchange");
     let atomic_swap_i64: extern "C" fn(*mut i64, i64) -> i64 = unsafe {
@@ -711,7 +732,7 @@ fn windows_atomic_load_store_fence_module() -> TrustIrModule {
     add_atomic_fence_load_fn(&mut mb, "atomic_fence_release_load_i64", Ordering::Release);
     add_atomic_fence_load_fn(&mut mb, "atomic_fence_acqrel_load_i64", Ordering::AcqRel);
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -721,6 +742,7 @@ fn x86_64_windows_jit_executes_atomic_load_store_fence_widths() {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile atomic load/store/fence widths");
 
@@ -825,9 +847,10 @@ fn x86_64_windows_jit_executes_non_exchange_atomic_rmw_i64() {
     add_atomic_rmw_fn!("atomic_and_i64", AtomicRMWOp::And);
     add_atomic_rmw_fn!("atomic_or_i64", AtomicRMWOp::Or);
     add_atomic_rmw_fn!("atomic_xor_i64", AtomicRMWOp::Xor);
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile i64 non-exchange atomic RMWs");
     let atomic_add_i64: extern "C" fn(*mut i64, i64) -> i64 = unsafe {
@@ -924,8 +947,9 @@ fn x86_64_windows_jit_executes_non_exchange_atomic_rmw_i8_i16() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile i8/i16 non-exchange atomic RMWs");
     let atomic_add_i8: extern "C" fn(*mut u8, i64) -> i64 = unsafe {
@@ -973,9 +997,10 @@ fn x86_64_windows_jit_executes_cmpxchg_i64_success_and_failure() {
     );
     fb.ret(vec![old]);
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile i64 compare-exchange");
     let atomic_cas_i64: extern "C" fn(*mut i64, i64, i64) -> i64 = unsafe {
@@ -1027,9 +1052,10 @@ fn x86_64_windows_jit_executes_branch_diamond_with_block_args() {
     let result = fb.add(Ty::I64, joined, bias);
     fb.ret(vec![result]);
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile a branch diamond with block args");
     let branch_diamond_block_arg: extern "C" fn(i64, i64, i64) -> i64 = unsafe {
@@ -1080,8 +1106,9 @@ fn x86_64_windows_jit_executes_scalar_fp_select() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile scalar FP selects");
     let select_f64_from_i64_cmp: extern "C" fn(i64, f64, f64) -> f64 = unsafe {
@@ -1140,8 +1167,9 @@ fn x86_64_windows_jit_executes_fcmp_nan_predicates() {
     add_fcmp_i64_result(&mut mb, "fcmp_f32_ugt", Ty::F32, FCmpOp::UGt);
     add_fcmp_i64_result(&mut mb, "fcmp_f32_uge", Ty::F32, FCmpOp::UGe);
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile FCmp NaN predicates");
     type F64Cmp = extern "C" fn(f64, f64) -> i64;
@@ -1366,7 +1394,7 @@ fn windows_scalar_fp_select_proof_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(all(target_os = "windows", feature = "verify"))]
@@ -1423,7 +1451,7 @@ fn windows_fcmp_remainder_proof_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(all(target_os = "windows", feature = "verify"))]
@@ -1470,7 +1498,7 @@ fn windows_atomic_rmw_proof_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(all(target_os = "windows", feature = "verify"))]
@@ -1518,7 +1546,7 @@ fn windows_call_branch_proof_gap_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(all(target_os = "windows", feature = "verify"))]
@@ -1691,7 +1719,7 @@ fn x86_64_windows_jit_emit_proofs_records_call_branch_verifier_gaps() {
             config.opt_level = OptLevel::O0;
             config.parallel = false;
 
-            let result = Compiler::new(config)
+            let result = Compiler::new(config).with_codegen_license(permit_unlicensed())
                 .compile_module_to_jit(&module, &HashMap::new())
                 .expect("Windows x86-64 JIT should compile call/branch proof-gap module");
 
@@ -1796,6 +1824,7 @@ fn x86_64_windows_jit_emit_proofs_tracks_scalar_fp_select_transfer_proofs() {
             config.parallel = false;
 
             let result = Compiler::new(config)
+                .with_codegen_license(permit_unlicensed())
                 .compile_module_to_jit(&module, &HashMap::new())
                 .expect("Windows x86-64 JIT should compile with emit_proofs=true");
 
@@ -1850,6 +1879,7 @@ fn x86_64_windows_jit_emit_proofs_binds_fcmp_and_remainder_sequences_to_exact_pr
             config.parallel = false;
 
             let result = Compiler::new(config)
+                .with_codegen_license(permit_unlicensed())
                 .compile_module_to_jit(&module, &HashMap::new())
                 .expect("Windows x86-64 JIT should compile fcmp/rem with emit_proofs=true");
 
@@ -1960,6 +1990,7 @@ fn x86_64_windows_jit_emit_proofs_tracks_atomic_rmw_cas_loop_proofs() {
             config.parallel = false;
 
             let result = Compiler::new(config)
+                .with_codegen_license(permit_unlicensed())
                 .compile_module_to_jit(&module, &HashMap::new())
                 .expect("Windows x86-64 JIT should compile atomic RMWs with emit_proofs=true");
 
@@ -2042,7 +2073,7 @@ fn x86_64_windows_jit_emit_proofs_tracks_atomic_load_store_fence_proofs() {
             config.opt_level = OptLevel::O0;
             config.parallel = false;
 
-            let result = Compiler::new(config)
+            let result = Compiler::new(config).with_codegen_license(permit_unlicensed())
                 .compile_module_to_jit(&module, &HashMap::new())
                 .expect("Windows x86-64 JIT should compile atomic load/store/fence with emit_proofs=true");
 
@@ -2281,7 +2312,7 @@ fn windows_typed_trust_ir_bitfield_i64_module() -> TrustIrModule {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(all(target_os = "windows", feature = "verify"))]
@@ -2327,6 +2358,7 @@ fn x86_64_windows_jit_emit_proofs_tracks_scalar_bitfield_lowering_components() {
             config.parallel = false;
 
             let result = Compiler::new(config)
+                .with_codegen_license(permit_unlicensed())
                 .compile_module_to_jit(&module, &HashMap::new())
                 .expect("Windows x86-64 JIT should compile bitfield ops with emit_proofs=true");
             let proofs = result
@@ -2351,6 +2383,7 @@ fn x86_64_windows_jit_emit_proofs_tracks_scalar_bitfield_lowering_components() {
 fn x86_64_windows_jit_executes_typed_trust_ir_bitfield_i64_ops() {
     let module = windows_typed_trust_ir_bitfield_i64_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 typed trust_ir JIT should compile i64 bitfield ops");
     let extract: extern "C" fn(i64) -> i64 = unsafe {
@@ -2407,8 +2440,9 @@ fn x86_64_windows_jit_rejects_typed_trust_ir_bitfield_bad_range() {
     fb.ret(vec![result]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let err = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect_err("bad bitfield range should fail before JIT publication");
     assert!(
@@ -2421,11 +2455,14 @@ fn x86_64_windows_jit_rejects_typed_trust_ir_bitfield_bad_range() {
 #[cfg(target_os = "windows")]
 fn windows_i64_switch_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("x86_64_windows_i64_switch");
-    let ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "switch_i64_cases", ty, BlockId::new(0));
     let mut blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2478,7 +2515,9 @@ fn windows_i64_switch_module() -> TrustIrModule {
     }
 
     func.blocks = blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2487,6 +2526,7 @@ fn windows_i64_switch_module() -> TrustIrModule {
 fn x86_64_windows_jit_executes_i64_switch_cases() {
     let module = windows_i64_switch_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile i64 switch cases");
 
@@ -2517,16 +2557,22 @@ fn x86_64_windows_jit_executes_i64_switch_cases() {
 #[cfg(target_os = "windows")]
 fn windows_global_ref_indirect_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("x86_64_windows_global_ref_indirect_call");
-    let callee_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let callee_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut target = TrustIrFunction::new(
         FuncId::new(0),
@@ -2579,8 +2625,12 @@ fn windows_global_ref_indirect_call_module() -> TrustIrModule {
         ],
     });
 
-    module.add_function(target);
-    module.add_function(entry);
+    module
+        .try_add_function(target)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2589,6 +2639,7 @@ fn windows_global_ref_indirect_call_module() -> TrustIrModule {
 fn x86_64_windows_jit_materializes_in_module_global_ref_for_indirect_call() {
     let module = windows_global_ref_indirect_call_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should patch in-module GlobalRef LEA fixups");
 
@@ -2610,33 +2661,44 @@ extern "C" fn host_extern_ref_add7(value: i64) -> i64 {
 #[cfg(target_os = "windows")]
 fn windows_extern_ref_indirect_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("x86_64_windows_extern_ref_indirect_call");
-    let callback_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let callback_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
-    module.add_function(TrustIrFunction {
-        attrs: Default::default(),
-        id: FuncId::new(0),
-        name: "host_extern_ref_add7".to_string(),
-        ty: callback_ty,
-        entry: BlockId::new(0),
-        blocks: vec![],
-        proofs: vec![],
-        calling_conv: CallingConv::default(),
-        linkage: Linkage::External,
-        summary: None,
-        producer: None,
-        value_names: None,
-        scopes: None,
-        source_provenance: None,
-    });
+    module
+        .try_add_function(TrustIrFunction {
+            attrs: Default::default(),
+            id: FuncId::new(0),
+            name: "host_extern_ref_add7".to_string(),
+            ty: callback_ty,
+            entry: BlockId::new(0),
+            blocks: vec![],
+            proofs: vec![],
+            calling_conv: CallingConv::default(),
+            linkage: Linkage::External,
+            summary: None,
+            producer: None,
+            value_names: None,
+            scopes: None,
+            source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
+        })
+        .expect("Module::try_add_function: test fixture");
 
     let mut entry = TrustIrFunction::new(
         FuncId::new(1),
@@ -2670,7 +2732,9 @@ fn windows_extern_ref_indirect_call_module() -> TrustIrModule {
         ],
     });
 
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2683,6 +2747,7 @@ fn x86_64_windows_jit_materializes_extern_ref_for_indirect_call() {
         host_extern_ref_add7 as *const () as *const u8,
     )]);
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &extern_symbols)
         .expect("Windows x86-64 JIT should patch ExternRef pointer slots");
 
@@ -2724,7 +2789,7 @@ fn windows_indirect_six_i64_call_module() -> trust_ir::Module {
     let result = fb.call_indirect(callee, callback_ty, args);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -2732,6 +2797,7 @@ fn windows_indirect_six_i64_call_module() -> trust_ir::Module {
 fn x86_64_windows_jit_executes_indirect_call_with_overflow_integer_args() {
     let module = windows_indirect_six_i64_call_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile indirect six-i64 call");
 
@@ -2751,12 +2817,15 @@ fn x86_64_windows_jit_executes_indirect_call_with_overflow_integer_args() {
 #[cfg(target_os = "windows")]
 #[test]
 fn x86_64_windows_jit_rejects_requested_foreign_target_specs() {
-    let module = ModuleBuilder::new("x86_64_windows_foreign_jit_target_spec").build();
+    let module = ModuleBuilder::new("x86_64_windows_foreign_jit_target_spec")
+        .build()
+        .expect("ModuleBuilder::build: test fixture");
     let host_spec = TargetSpec::parse("x86_64-pc-windows-msvc").unwrap();
 
     for triple in ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"] {
         let requested = TargetSpec::parse(triple).unwrap();
-        let compiler = Compiler::new_for_target_spec(CompilerConfig::for_host_jit(), requested);
+        let compiler = Compiler::new_for_target_spec(CompilerConfig::for_host_jit(), requested)
+            .with_codegen_license(permit_unlicensed());
         let err = compiler
             .compile_module_to_jit(&module, &HashMap::new())
             .unwrap_err();
@@ -2785,8 +2854,9 @@ fn x86_64_jit_call_counts_profile_hook_counts_entries() {
     fb.ret(vec![answer]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit_with_profile_hooks(
             &module,
             &HashMap::new(),
@@ -2861,8 +2931,9 @@ fn x86_64_jit_mixed_int_float_host_abi_direct_and_internal_call() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("x86-64 host JIT should compile mixed integer/float ABI module");
 
@@ -2963,10 +3034,11 @@ fn x86_64_windows_jit_mixed_int_float_stack_args_direct_and_internal_call() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile mixed integer/FP stack-arg ABI module");
 
@@ -3066,8 +3138,9 @@ fn x86_64_windows_jit_unsigned_float_conversion_edges() {
         fb.build();
     }
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile unsigned FP conversion edges");
 
@@ -3184,8 +3257,9 @@ fn x86_64_jit_store_then_reload_through_host_pointer() {
     fb.ret(vec![result]);
     fb.build();
 
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("x86-64 host JIT should compile pointer load/store module");
 
@@ -3227,9 +3301,14 @@ extern "C" fn jit_windows_host_memset(dst: *mut u8, byte: i32, len: i64) {
 
 #[cfg(target_os = "windows")]
 fn windows_memory_intrinsic_module() -> TrustIrModule {
+    // The wrappers' own `(…) -> ()` types; the library routines are declared
+    // with C's prototypes (`-> void *`), the only declarations whose calls
+    // the adapter lowers as the memory intrinsics.
     let memcpy_ty = FuncTyId::new(0);
     let memmove_ty = FuncTyId::new(1);
     let memset_ty = FuncTyId::new(2);
+    let c_copy_ty = FuncTyId::new(3);
+    let c_memset_ty = FuncTyId::new(4);
     let pointer_copy_params = vec![Ty::Ptr, Ty::Ptr, Ty::I64];
     let memset_params = vec![Ty::Ptr, Ty::I32, Ty::I64];
 
@@ -3249,6 +3328,9 @@ fn windows_memory_intrinsic_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }
     }
 
@@ -3260,6 +3342,7 @@ fn windows_memory_intrinsic_module() -> TrustIrModule {
         params: Vec<Ty>,
     ) -> TrustIrFunction {
         let args: Vec<_> = (0..params.len() as u32).map(ValueId::new).collect();
+        let destination = ValueId::new(params.len() as u32);
         TrustIrFunction {
             attrs: Default::default(),
             id: FuncId::new(id),
@@ -3275,7 +3358,7 @@ fn windows_memory_intrinsic_module() -> TrustIrModule {
                             callee,
                             args: args.clone(),
                         },
-                        results: vec![],
+                        results: vec![destination],
                         proofs: vec![],
                         span: None,
                         proof_context: None,
@@ -3299,15 +3382,21 @@ fn windows_memory_intrinsic_module() -> TrustIrModule {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }
     }
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
         name: "x86_64_windows_memory_intrinsics".to_owned(),
         functions: vec![
-            extern_decl(0, "memcpy", memcpy_ty),
-            extern_decl(1, "memmove", memmove_ty),
-            extern_decl(2, "memset", memset_ty),
+            extern_decl(0, "memcpy", c_copy_ty),
+            extern_decl(1, "memmove", c_copy_ty),
+            extern_decl(2, "memset", c_memset_ty),
             wrapper(
                 3,
                 "call_intrinsic_memcpy",
@@ -3338,16 +3427,31 @@ fn windows_memory_intrinsic_module() -> TrustIrModule {
             FuncTy {
                 params: vec![Ty::Ptr, Ty::Ptr, Ty::I64],
                 returns: vec![],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![Ty::Ptr, Ty::Ptr, Ty::I64],
                 returns: vec![],
+                abi: None,
+                is_vararg: false,
+            },
+            FuncTy {
+                params: memset_params.clone(),
+                returns: vec![],
+                abi: None,
+                is_vararg: false,
+            },
+            FuncTy {
+                params: vec![Ty::Ptr, Ty::Ptr, Ty::I64],
+                returns: vec![Ty::Ptr],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: memset_params,
-                returns: vec![],
+                returns: vec![Ty::Ptr],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -3361,6 +3465,9 @@ fn windows_memory_intrinsic_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -3382,6 +3489,7 @@ fn x86_64_windows_jit_executes_memory_intrinsics() {
         ),
     ]);
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&windows_memory_intrinsic_module(), &extern_symbols)
         .expect("Windows x86-64 JIT should compile memory intrinsics");
 
@@ -3512,7 +3620,7 @@ fn build_high_gpr_pressure_spill_replay_module() -> trust_ir::Module {
     }
     fb.ret(vec![acc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -3532,6 +3640,7 @@ fn x86_64_windows_jit_high_gpr_pressure_spill_replay_executes() {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile high-pressure GPR spill replay");
 
@@ -3578,7 +3687,7 @@ fn build_fixed_reg_div_shift_module() -> trust_ir::Module {
     let result = fb.add(Ty::I64, shifted_mix, tail_mix);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -3599,6 +3708,7 @@ fn x86_64_windows_jit_executes_idiv_cqo_and_shift_cl_fixed_regs() {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile IDIV/CQO and shift-CL fixed-register path");
 
@@ -3652,7 +3762,7 @@ fn build_unsigned_fixed_reg_div_shift_module() -> trust_ir::Module {
     let result = fb.add(Ty::U64, shifted_mix, shift);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -3680,6 +3790,7 @@ fn x86_64_windows_jit_executes_udiv_urem_lshr_u64_fixed_regs() {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect(
             "Windows x86-64 JIT should compile unsigned DIV and logical shift fixed-register path",
@@ -3754,7 +3865,7 @@ fn build_unsigned_u32_fixed_reg_div_shift_module() -> trust_ir::Module {
     let result = fb.add(Ty::U32, shifted_mix, shift);
     fb.ret(vec![result]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -3781,7 +3892,7 @@ fn x86_64_windows_jit_executes_u32_udiv_urem_lshr_fixed_regs() {
     let module = build_unsigned_u32_fixed_reg_div_shift_module();
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
-    let result = Compiler::new(config)
+    let result = Compiler::new(config).with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect(
             "Windows x86-64 JIT should compile U32 unsigned DIV and CL logical shift fixed-register path",
@@ -3812,11 +3923,14 @@ fn x86_64_windows_jit_executes_u32_udiv_urem_lshr_fixed_regs() {
 #[cfg(target_os = "windows")]
 fn windows_guarded_sdiv_trap_route_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("x86_64_windows_guarded_sdiv_trap_route");
-    let ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "guarded_sdiv_nonzero", ty, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -3841,7 +3955,9 @@ fn windows_guarded_sdiv_trap_route_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3852,6 +3968,7 @@ fn x86_64_windows_jit_guarded_div_nonzero_contains_ud2_trap_route() {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile guarded division with a trap route");
 
@@ -3904,41 +4021,52 @@ fn x86_64_windows_jit_guarded_div_nonzero_contains_ud2_trap_route() {
 #[cfg(target_os = "windows")]
 fn windows_stack_alignment_probe_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("x86_64_windows_stack_alignment_probe");
-    let probe_ty = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::Ptr,
-        ],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let probe_ty = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::Ptr,
+            ],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
-    module.add_function(TrustIrFunction {
-        attrs: Default::default(),
-        id: FuncId::new(0),
-        name: "trust_cg_win64_stack_probe_helper".to_owned(),
-        ty: probe_ty,
-        entry: BlockId::new(0),
-        blocks: vec![],
-        proofs: vec![],
-        calling_conv: CallingConv::default(),
-        linkage: Linkage::External,
-        summary: None,
-        producer: None,
-        value_names: None,
-        scopes: None,
-        source_provenance: None,
-    });
+    module
+        .try_add_function(TrustIrFunction {
+            attrs: Default::default(),
+            id: FuncId::new(0),
+            name: "trust_cg_win64_stack_probe_helper".to_owned(),
+            ty: probe_ty,
+            entry: BlockId::new(0),
+            blocks: vec![],
+            proofs: vec![],
+            calling_conv: CallingConv::default(),
+            linkage: Linkage::External,
+            summary: None,
+            producer: None,
+            value_names: None,
+            scopes: None,
+            source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
+        })
+        .expect("Module::try_add_function: test fixture");
 
     let mut body = Vec::new();
     for (idx, value) in [
@@ -3990,7 +4118,9 @@ fn windows_stack_alignment_probe_module() -> TrustIrModule {
         params: vec![(ValueId::new(0), Ty::Ptr)],
         body,
     });
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4003,6 +4133,7 @@ fn x86_64_windows_jit_validates_shadow_space_and_stack_alignment_with_overflow_a
         trust_cg_win64_stack_probe_helper as *const () as *const u8,
     )]);
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &extern_symbols)
         .expect("Windows x86-64 JIT should compile stack-alignment probe");
 
@@ -4079,21 +4210,30 @@ fn windows_stack_local_survives_stack_arg_call_module() -> TrustIrModule {
     }
 
     let mut module = TrustIrModule::new("x86_64_windows_stack_local_survives_call");
-    let sum_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64; 8],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let fixed_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let runtime_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let sum_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 8],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let fixed_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let runtime_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut sum8 = TrustIrFunction::new(
         FuncId::new(0),
@@ -4117,7 +4257,9 @@ fn windows_stack_local_survives_stack_arg_call_module() -> TrustIrModule {
             sum_body
         },
     });
-    module.add_function(sum8);
+    module
+        .try_add_function(sum8)
+        .expect("Module::try_add_function: test fixture");
 
     let mut fixed_body = vec![
         InstrNode::new(Inst::Alloca {
@@ -4167,7 +4309,9 @@ fn windows_stack_local_survives_stack_arg_call_module() -> TrustIrModule {
         params: vec![],
         body: fixed_body,
     });
-    module.add_function(fixed);
+    module
+        .try_add_function(fixed)
+        .expect("Module::try_add_function: test fixture");
 
     let mut runtime_body = vec![
         InstrNode::new(Inst::Alloca {
@@ -4224,7 +4368,9 @@ fn windows_stack_local_survives_stack_arg_call_module() -> TrustIrModule {
         params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
         body: runtime_body,
     });
-    module.add_function(runtime);
+    module
+        .try_add_function(runtime)
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -4238,6 +4384,7 @@ fn x86_64_windows_jit_preserves_stack_locals_across_stack_arg_calls() {
 
     let module = windows_stack_local_survives_stack_arg_call_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile stack-local call overlap probes");
     let fixed_stack_local_survives_stack_arg_call: extern "C" fn() -> i64 = unsafe {
@@ -4308,6 +4455,9 @@ fn windows_get_current_process_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
@@ -4350,9 +4500,15 @@ fn windows_get_current_process_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
         name: "x86_64_windows_process_symbol_fallback".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![],
@@ -4363,11 +4519,13 @@ fn windows_get_current_process_module() -> TrustIrModule {
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::Ptr],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params: vec![],
                 returns: vec![Ty::Ptr],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -4381,6 +4539,9 @@ fn windows_get_current_process_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -4389,6 +4550,7 @@ fn windows_get_current_process_module() -> TrustIrModule {
 fn x86_64_windows_jit_resolves_kernel32_helper_without_extern_symbols() {
     let module = windows_get_current_process_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should resolve GetCurrentProcess from loaded modules");
 
@@ -4434,7 +4596,7 @@ fn windows_jit_non_leaf_unwind_lookup_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_os = "windows")]
@@ -4442,6 +4604,7 @@ fn windows_jit_non_leaf_unwind_lookup_module() -> trust_ir::Module {
 fn x86_64_windows_jit_rtl_lookup_function_entry_finds_non_leaf_function() {
     let module = windows_jit_non_leaf_unwind_lookup_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile non-leaf unwind lookup module");
 
@@ -4524,6 +4687,9 @@ fn windows_explicit_extern_weighted_sum_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
     let caller = TrustIrFunction {
         attrs: Default::default(),
@@ -4566,9 +4732,15 @@ fn windows_explicit_extern_weighted_sum_module() -> TrustIrModule {
         value_names: None,
         scopes: None,
         source_provenance: None,
+        section: None,
+        visibility: Default::default(),
+        retained: false,
     };
 
     TrustIrModule {
+        closure_layouts: Vec::new(),
+        blobs: Vec::new(),
+        completeness: None,
         name: "x86_64_windows_explicit_extern_binding".to_owned(),
         functions: vec![extern_decl, caller],
         structs: vec![],
@@ -4579,11 +4751,13 @@ fn windows_explicit_extern_weighted_sum_module() -> TrustIrModule {
             FuncTy {
                 params: params.clone(),
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
             FuncTy {
                 params,
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             },
         ],
@@ -4597,6 +4771,9 @@ fn windows_explicit_extern_weighted_sum_module() -> TrustIrModule {
         spec_modules: vec![],
         universes: vec![],
         predicates: vec![],
+        global_asm: vec![],
+        imports: vec![],
+        tuple_layouts: vec![],
     }
 }
 
@@ -4605,6 +4782,7 @@ fn windows_explicit_extern_weighted_sum_module() -> TrustIrModule {
 fn x86_64_windows_jit_uses_explicit_extern_symbol_veneer() {
     let module = windows_explicit_extern_weighted_sum_module();
     Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect_err("unique host helper should require an explicit extern binding");
 
@@ -4614,6 +4792,7 @@ fn x86_64_windows_jit_uses_explicit_extern_symbol_veneer() {
         jit_windows_explicit_host_weighted_sum as *const () as *const u8,
     );
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &extern_symbols)
         .expect("Windows x86-64 JIT should bind explicit extern through a veneer");
 
@@ -4645,105 +4824,126 @@ extern "C" fn jit_windows_shared_explicit_host_affine(a: i64, b: i64) -> i64 {
 #[cfg(target_os = "windows")]
 fn windows_shared_explicit_extern_veneer_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("x86_64_windows_shared_explicit_extern_veneer");
-    let extern_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let caller_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let extern_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let caller_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
-    module.add_function(TrustIrFunction {
-        attrs: Default::default(),
-        id: FuncId::new(0),
-        name: "jit_windows_shared_explicit_host_affine".to_owned(),
-        ty: extern_ty,
-        entry: BlockId::new(0),
-        blocks: vec![],
-        proofs: vec![],
-        calling_conv: CallingConv::default(),
-        linkage: Linkage::External,
-        summary: None,
-        producer: None,
-        value_names: None,
-        scopes: None,
-        source_provenance: None,
-    });
+    module
+        .try_add_function(TrustIrFunction {
+            attrs: Default::default(),
+            id: FuncId::new(0),
+            name: "jit_windows_shared_explicit_host_affine".to_owned(),
+            ty: extern_ty,
+            entry: BlockId::new(0),
+            blocks: vec![],
+            proofs: vec![],
+            calling_conv: CallingConv::default(),
+            linkage: Linkage::External,
+            summary: None,
+            producer: None,
+            value_names: None,
+            scopes: None,
+            source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
+        })
+        .expect("Module::try_add_function: test fixture");
 
-    module.add_function(TrustIrFunction {
-        attrs: Default::default(),
-        id: FuncId::new(1),
-        name: "call_shared_explicit_a".to_owned(),
-        ty: caller_ty,
-        entry: BlockId::new(0),
-        blocks: vec![TrustIrBlock {
-            id: BlockId::new(0),
-            params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
-            body: vec![
-                InstrNode::new(Inst::Call {
-                    callee: FuncId::new(0),
-                    args: vec![ValueId::new(0), ValueId::new(1)],
-                })
-                .with_result(ValueId::new(2)),
-                InstrNode::new(Inst::Return {
-                    values: vec![ValueId::new(2)],
-                }),
-            ],
-        }],
-        proofs: vec![],
-        calling_conv: CallingConv::default(),
-        linkage: Linkage::default(),
-        summary: None,
-        producer: None,
-        value_names: None,
-        scopes: None,
-        source_provenance: None,
-    });
+    module
+        .try_add_function(TrustIrFunction {
+            attrs: Default::default(),
+            id: FuncId::new(1),
+            name: "call_shared_explicit_a".to_owned(),
+            ty: caller_ty,
+            entry: BlockId::new(0),
+            blocks: vec![TrustIrBlock {
+                id: BlockId::new(0),
+                params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
+                body: vec![
+                    InstrNode::new(Inst::Call {
+                        callee: FuncId::new(0),
+                        args: vec![ValueId::new(0), ValueId::new(1)],
+                    })
+                    .with_result(ValueId::new(2)),
+                    InstrNode::new(Inst::Return {
+                        values: vec![ValueId::new(2)],
+                    }),
+                ],
+            }],
+            proofs: vec![],
+            calling_conv: CallingConv::default(),
+            linkage: Linkage::default(),
+            summary: None,
+            producer: None,
+            value_names: None,
+            scopes: None,
+            source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
+        })
+        .expect("Module::try_add_function: test fixture");
 
-    module.add_function(TrustIrFunction {
-        attrs: Default::default(),
-        id: FuncId::new(2),
-        name: "call_shared_explicit_b".to_owned(),
-        ty: caller_ty,
-        entry: BlockId::new(0),
-        blocks: vec![TrustIrBlock {
-            id: BlockId::new(0),
-            params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
-            body: vec![
-                InstrNode::new(Inst::Call {
-                    callee: FuncId::new(0),
-                    args: vec![ValueId::new(1), ValueId::new(0)],
-                })
-                .with_result(ValueId::new(2)),
-                InstrNode::new(Inst::Const {
-                    ty: Ty::I64,
-                    value: Constant::Int(7),
-                })
-                .with_result(ValueId::new(3)),
-                InstrNode::new(Inst::BinOp {
-                    op: BinOp::Add,
-                    ty: Ty::I64,
-                    lhs: ValueId::new(2),
-                    rhs: ValueId::new(3),
-                })
-                .with_result(ValueId::new(4)),
-                InstrNode::new(Inst::Return {
-                    values: vec![ValueId::new(4)],
-                }),
-            ],
-        }],
-        proofs: vec![],
-        calling_conv: CallingConv::default(),
-        linkage: Linkage::default(),
-        summary: None,
-        producer: None,
-        value_names: None,
-        scopes: None,
-        source_provenance: None,
-    });
+    module
+        .try_add_function(TrustIrFunction {
+            attrs: Default::default(),
+            id: FuncId::new(2),
+            name: "call_shared_explicit_b".to_owned(),
+            ty: caller_ty,
+            entry: BlockId::new(0),
+            blocks: vec![TrustIrBlock {
+                id: BlockId::new(0),
+                params: vec![(ValueId::new(0), Ty::I64), (ValueId::new(1), Ty::I64)],
+                body: vec![
+                    InstrNode::new(Inst::Call {
+                        callee: FuncId::new(0),
+                        args: vec![ValueId::new(1), ValueId::new(0)],
+                    })
+                    .with_result(ValueId::new(2)),
+                    InstrNode::new(Inst::Const {
+                        ty: Ty::I64,
+                        value: Constant::Int(7),
+                    })
+                    .with_result(ValueId::new(3)),
+                    InstrNode::new(Inst::BinOp {
+                        op: BinOp::Add,
+                        ty: Ty::I64,
+                        lhs: ValueId::new(2),
+                        rhs: ValueId::new(3),
+                    })
+                    .with_result(ValueId::new(4)),
+                    InstrNode::new(Inst::Return {
+                        values: vec![ValueId::new(4)],
+                    }),
+                ],
+            }],
+            proofs: vec![],
+            calling_conv: CallingConv::default(),
+            linkage: Linkage::default(),
+            summary: None,
+            producer: None,
+            value_names: None,
+            scopes: None,
+            source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
+        })
+        .expect("Module::try_add_function: test fixture");
 
     module
 }
@@ -4753,6 +4953,7 @@ fn windows_shared_explicit_extern_veneer_module() -> TrustIrModule {
 fn x86_64_windows_jit_reuses_shared_explicit_extern_veneer_across_call_sites() {
     let module = windows_shared_explicit_extern_veneer_module();
     Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect_err("shared host helper should require an explicit extern binding");
 
@@ -4761,6 +4962,7 @@ fn x86_64_windows_jit_reuses_shared_explicit_extern_veneer_across_call_sites() {
         jit_windows_shared_explicit_host_affine as *const () as *const u8,
     )]);
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &extern_symbols)
         .expect("Windows x86-64 JIT should bind shared explicit extern through one veneer");
 
@@ -4840,13 +5042,14 @@ fn build_fp_constant_pool_boundary_module() -> trust_ir::Module {
 
     fb.ret(vec![acc]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
 fn x86_64_jit_fp_constant_pool_duplicate_boundary_compiles() {
     let module = build_fp_constant_pool_boundary_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("x86-64 JIT should compile FP constant-pool boundary module");
 
@@ -4957,6 +5160,7 @@ fn has_nonvolatile_gpr_save(bytes: &[u8]) -> bool {
 fn x86_64_windows_jit_preserves_nonvolatile_xmm6() {
     let module = build_fp_constant_pool_boundary_module();
     let result = Compiler::for_host()
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile FP pressure module");
 
@@ -4985,6 +5189,7 @@ fn x86_64_windows_jit_preserves_nonvolatile_gprs_under_pressure() {
     let mut config = CompilerConfig::for_host_jit();
     config.opt_level = OptLevel::O0;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .expect("Windows x86-64 JIT should compile high-pressure GPR module");
 
@@ -5020,4 +5225,16 @@ fn x86_64_windows_jit_preserves_nonvolatile_gprs_under_pressure() {
         has_nonvolatile_gpr_save(&bytes),
         "high-pressure function should force at least one non-RBP nonvolatile GPR save; bytes: {bytes:02x?}"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+// Its callers are target-gated tests; on a host where none of them compiles
+// the helper is unused.
+#[allow(dead_code)]
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

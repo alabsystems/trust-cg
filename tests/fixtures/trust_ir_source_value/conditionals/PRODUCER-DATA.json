@@ -1,0 +1,229 @@
+{
+  "scope": "DATA ONLY: actual ordinary Lean source, actual normal compiler whole module, original checked Definition and CIC original-source equation proof. Consumer must choose/authenticate original source independently and derive its own goal.",
+  "producer_commit": "550ad0858df6a00c61a7cdabc7f37fa0bc975258",
+  "kernel_tree": "d1a068842f53591e6835c0d4215a6ec8542f0f00",
+  "widths": [
+    8,
+    16,
+    32,
+    64
+  ],
+  "fixture_files": {
+    "boundConditional8/equation-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "014ddd74cbf54d6fb014045869af3a127e0603770e377c9fe6e8a6c36f57f5b4"
+    },
+    "boundConditional8/theorem.type.bin": {
+      "bytes": 890,
+      "sha256": "3da39efd8c70084c75a34484bf1f54b81c582b11c66aeac74d07fd1148feea8a"
+    },
+    "boundConditional8/theorem.value.bin": {
+      "bytes": 12648,
+      "sha256": "8c53ea8620abb942f1be3138577cbd3e174a02158c21f175e3838285997950d3"
+    },
+    "boundConditional8/definition-0.name.bin": {
+      "bytes": 45,
+      "sha256": "252dd02fbd2bda3a916f7fa77d0066169dd80ad5689e0c4a2cc90cd47e939ffa"
+    },
+    "boundConditional8/source-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "4cc786ef953c23acb74f41dd2f6bd35545d92fa471407d5e1409c3fe6280e183"
+    },
+    "boundConditional8/definition-0.type.bin": {
+      "bytes": 123,
+      "sha256": "b2f0827ee403caaf0755e69dcf9a045b69928077314cfe83cfb085c558606aee"
+    },
+    "boundConditional8/definition-0.value.bin": {
+      "bytes": 720,
+      "sha256": "8c29c0a3d6986d716757c71e1ab664ff14872a56bedd9e5869da9c08df48580d"
+    },
+    "boundConditional8/module.bin": {
+      "bytes": 5959,
+      "sha256": "e18f293a60550f97c75fb1915c7eda9eee17d12b6f864a14fbe2ab15fbbf35ab"
+    },
+    "boundConditional8/DATA.txt": {
+      "bytes": 183,
+      "sha256": "a7c9a8f80ed6c8252a1da7f5831e2b90f5a40f1a18bdfcf97aaa5ee41d374c5e"
+    },
+    "boundConditional8/theorem.name.bin": {
+      "bytes": 65,
+      "sha256": "d3c89b72bf7415110dcd9694cf26e1dc2eaaef2bb2637b502f1864515f422a11"
+    },
+    "boundConditional16/equation-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "7db6e6730e905e2d4db9bc24be0e6738d329162fdc46373c2ef6231372a426f9"
+    },
+    "boundConditional16/theorem.type.bin": {
+      "bytes": 898,
+      "sha256": "da6f7cc2b50f56c5d828a9316d284b6d42504b64358a6c5b1ab65b64f278a90d"
+    },
+    "boundConditional16/theorem.value.bin": {
+      "bytes": 12744,
+      "sha256": "2cf2c19d533c3f436561771c77e7e950fabee6d05b57858a37a6c85c3f849426"
+    },
+    "boundConditional16/definition-0.name.bin": {
+      "bytes": 46,
+      "sha256": "161c441d80258a0ce378db90bb4495c0011aeab0c35b3601c1f500694413a099"
+    },
+    "boundConditional16/source-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "55dea4e9b0622cdd49e6b7d436b022d05858f8495dbdc03eb99b766203e4037b"
+    },
+    "boundConditional16/definition-0.type.bin": {
+      "bytes": 126,
+      "sha256": "3f209d980a1a0a15583f4116674113e4c8b34bc3a6262f931b05bfd541b356b2"
+    },
+    "boundConditional16/definition-0.value.bin": {
+      "bytes": 731,
+      "sha256": "25b8284ea8e5dbfce798a20a57ceb60050b01b8a28d443f24b6d5c6092cb6b0f"
+    },
+    "boundConditional16/module.bin": {
+      "bytes": 5969,
+      "sha256": "553e3303fdb963c1c2dfbf4e5c2d6b2fc7e074ee1343c4354cc5c6d2a1a3b40a"
+    },
+    "boundConditional16/DATA.txt": {
+      "bytes": 185,
+      "sha256": "49cc760f7929954f16bdaf81cd623e8dc8fcd2ef8afd6771a50b40077c434183"
+    },
+    "boundConditional16/theorem.name.bin": {
+      "bytes": 66,
+      "sha256": "58d3cba64e021a0299e07eb538704a7c78421336a5872708eabb40f5e3e95aac"
+    },
+    "boundConditional32/equation-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "57b5492546d5a04c8d858bc0a8dbecb3b58a6f7cce462cc1b6d2e9c7c0635ef4"
+    },
+    "boundConditional32/theorem.type.bin": {
+      "bytes": 898,
+      "sha256": "63f6e616de57c2552e565ad2b4e6031eb40fe5e2515517f5f9c84963e7b81d9d"
+    },
+    "boundConditional32/theorem.value.bin": {
+      "bytes": 12744,
+      "sha256": "9eaeb585233dd90dee76fd6d7ca88d198258aa0d3ca94963d56793de9f66152a"
+    },
+    "boundConditional32/definition-0.name.bin": {
+      "bytes": 46,
+      "sha256": "cfdcd2ad94f2bea2ed828404d441e8a3b0aa4ffb477581708d16b9f8afec0d02"
+    },
+    "boundConditional32/source-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "20ba12fb57ac9ed2a18d633e6c3dfd0f5c055694e52202f6cd764c884e10eca1"
+    },
+    "boundConditional32/definition-0.type.bin": {
+      "bytes": 126,
+      "sha256": "bb88e4de868f4e3efc494e5c406cb2abd0dbc770e8978b1660033b395443dc74"
+    },
+    "boundConditional32/definition-0.value.bin": {
+      "bytes": 731,
+      "sha256": "8842bb7c1dbdb734a8d3b159fac4e55c04c6d9479176346b182766445b6effa9"
+    },
+    "boundConditional32/module.bin": {
+      "bytes": 5936,
+      "sha256": "678c0d3921a9b8f401575d815a89ab1aff4e40739466c2d11f1ea1fcaecaf90b"
+    },
+    "boundConditional32/DATA.txt": {
+      "bytes": 185,
+      "sha256": "d306bf1863c1351c95d6b5c2c3df057fcab5f81d4ed205454044416d9f447493"
+    },
+    "boundConditional32/theorem.name.bin": {
+      "bytes": 66,
+      "sha256": "f7b2f1c3c0c31654f1ee6c41a14c2d63f9aae590830d9f60d5f8d7478db0e2c4"
+    },
+    "boundConditional64/equation-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "2bfcbb21300bdb0ed8ea58e844bb59ea297ef979b1c7d8f93089f18ca98876d5"
+    },
+    "boundConditional64/theorem.type.bin": {
+      "bytes": 914,
+      "sha256": "e7971f35401974119d643c2c6069bc8aa632909754fa42ff96de44bd7cd2374a"
+    },
+    "boundConditional64/theorem.value.bin": {
+      "bytes": 12888,
+      "sha256": "cdd503098402b1cc088970cb6a31d92f94aedc5171e6419331d786bf3358b5e5"
+    },
+    "boundConditional64/definition-0.name.bin": {
+      "bytes": 46,
+      "sha256": "c970c721e69b8814831c6ccac5e7bf5432e10c0b9ce6d943fe7cf3ae7fe72e30"
+    },
+    "boundConditional64/source-closure-digest.bin": {
+      "bytes": 32,
+      "sha256": "3a113c7eb937a29da6aa9b2f31a812adb6c62c6e84f15c9540186eec9c8946dc"
+    },
+    "boundConditional64/definition-0.type.bin": {
+      "bytes": 126,
+      "sha256": "d70250fe68bef57d0f693d8db1d56ebbcb46415557631e0fe908ab04724582a5"
+    },
+    "boundConditional64/definition-0.value.bin": {
+      "bytes": 731,
+      "sha256": "2727cadd6d9b81a33fc420ce0a6ae434d66c33653a52e8122f1ad70962e15b11"
+    },
+    "boundConditional64/module.bin": {
+      "bytes": 5968,
+      "sha256": "3525854d09c0fc0e73e9fe97ae3236b6ae6cd9e426b0089fc9ebead3eb4b3dac"
+    },
+    "boundConditional64/DATA.txt": {
+      "bytes": 185,
+      "sha256": "7015e6cd3a5211b165866941b702d5b023cb13c8023fc4f0fa7b5e6af81c652b"
+    },
+    "boundConditional64/theorem.name.bin": {
+      "bytes": 66,
+      "sha256": "3fdb71d8455868c2867b11b902b795b94386724a7603d5f18f16f92d9fb2c8c0"
+    }
+  },
+  "actual_pipeline_log": "$HOME/trust-clean-full-compiler-20261107-root-xi1dz9b4/source-conditional-shape2/command-1.log",
+  "actual_pipeline_log_sha256": "f563664dec1c085c3cda52bd478df854aa9c52a7086815a7c9f261ceaa1338ff",
+  "previous_producer_commit": "4f4e43204a1285c3b16958c61bbcc2a762305c87",
+  "qualification_result": "$HOME/.cache/trust-cg-bitvec-cohort-20261110/producer-qualification.json",
+  "qualification_result_sha256": "da4408eba88b462661c7c342e611ab7e3e19df139886b3cd1d86f7ce5c3fdc6e",
+  "consumer_qualification": "Seven separate read-only IR producer-data tests passed with Clean 5b8de1228; no body/runtime/ABI/NoUB/machine-code license or completeness claim",
+  "consumer_log_sha256": "36d38d708301dddd66c93809f1d1d8d96bccbf7ad5b6fcc0990e79113be3a766",
+  "producer_ir": "81a6f0cf41ab153e3260c95a0db53592cc34e9a4",
+  "producer_graph_scope": "Intermediate IR-only producer graph; kernel/compiler/reflection source at producer_commit, manifests/locks retargeted to producer_ir; no final cohort qualification.",
+  "producer_test": "emit_trust_ir_tv::tests::ws6_7::source_pipeline::ws6_7_actual_source_equation_proves_checked_conditional_all_uint_widths",
+  "producer_tool_inputs": {
+    "clean_source": "550ad0858df6a00c61a7cdabc7f37fa0bc975258",
+    "kernel_tree": "d1a068842f53591e6835c0d4215a6ec8542f0f00",
+    "IR": "81a6f0cf41ab153e3260c95a0db53592cc34e9a4",
+    "old_dev_CG": "095f3eb1583672bf593c72918f88e7259994b5aa",
+    "scope": "intermediate IR-only source producer, NOT final pin cohort; unverified Rust build, genuine kernel-checked DATA",
+    "tools": {
+      "$HOME/trust-native-uint-decision-tree/build/aarch64-apple-darwin/stage1/bin/targo": "ec055a7c7038d03736e47e5096893492d2c13f987c1e8c62bc8ff6310f1de986",
+      "$HOME/trust-native-uint-decision-tree/build/aarch64-apple-darwin/stage1/bin/trustc": "04133dcd2d79b600f629aba0f10f138d1ebe962964c35ff10c60d3bd9c463429"
+    },
+    "command": [
+      "build-slot",
+      "--cpus",
+      "6",
+      "--",
+      "$HOME/trust-native-uint-decision-tree/build/aarch64-apple-darwin/stage1/bin/targo",
+      "--unverified",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "clean-compiler",
+      "--features",
+      "trust-ir-backend",
+      "--lib",
+      "ws6_7_actual_source_equation_proves_checked_conditional_all_uint_widths",
+      "--",
+      "--test-threads=1",
+      "--nocapture"
+    ],
+    "environment": {
+      "CARGO_HOME": "$HOME/.cargo",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "CARGO_INCREMENTAL": "0",
+      "CLEAN_SOURCE_EQUATION_EXPORT_DIR": "$HOME/.ubd/clean550-ir81-conditional-producer/export",
+      "CARGO_TARGET_DIR": "$HOME/.ubd/clean550-ir81-conditional-producer/target.noindex",
+      "compiler_bin_first": "$HOME/trust-native-uint-decision-tree/build/aarch64-apple-darwin/stage1/bin"
+    },
+    "actual_inputs_sha256": {
+      "crates/clean-compiler/src/emit_trust_ir_tv_ws6_7_source_pipeline_tests.rs": "712d372c53eb152fad27e80ab44777d2611ebe56cfbe13634bf4522a5afa0ebb",
+      "crates/clean-reflect/src/source_equation.rs": "45c306d1b06d5a7a545480c4f40a3f73d8fbbda652b3635104fb961186e0ecec",
+      "Cargo.toml": "51f638e9b254dfc87e22bf9a75f67aeb179e9277ad6a85724c40f40402b9e7a6",
+      "Cargo.lock": "81ad015be16176fea1b7176a69a4e8a2244e745c97433f85c6c2e198ee7435ae"
+    },
+    "producer_test_filter": "ws6_7_actual_source_equation_proves_checked_conditional_all_uint_widths"
+  }
+}

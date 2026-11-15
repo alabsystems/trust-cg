@@ -7,12 +7,12 @@
 //   G2  scalar float `Select` (f32/f64)
 //   G3  switch dense jump-table, sub-64-bit selector + negative/high min_val
 //   G4  `UIToFP` from a narrow u16 with dirty upper bits
-//   G5  GEP over a `#[repr(packed)]` struct (CORRECT packed-offset address)
+//   G5  field projection from a `#[repr(packed)]` struct at its packed offset
 //   G6  CallIndirect narrow-int (i8) register-arg extension
 //
 // Each link-and-run test compiles a trust-ir module with trust-cg at O0 AND O2,
 // links it against a clang C driver that embodies the correct (C == clang)
-// semantics, and asserts bit-exact agreement on an aarch64-apple-darwin host.
+// semantics, and asserts bit-exact agreement on an AArch64 macOS or Linux GNU host.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -29,15 +29,21 @@ use trust_ir::{
     StructRepr, Ty, ValueId,
 };
 
-fn aarch64_host() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn compile_obj(module: &TirModule, opt: OptLevel) -> Result<Vec<u8>, String> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|r| r.object_code)
@@ -45,10 +51,10 @@ fn compile_obj(module: &TirModule, opt: OptLevel) -> Result<Vec<u8>, String> {
 }
 
 /// Link `obj` against C `driver`, run, return the process exit code.
-/// `None` => not an aarch64-apple-darwin host (skip).
+/// `None` => not an AArch64 macOS or Linux GNU host (skip).
 fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !aarch64_host() {
-        eprintln!("SKIP {tag}: link-and-run requires aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP {tag}: link-and-run requires an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_p0"));
@@ -71,6 +77,7 @@ fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc available");
     assert!(
@@ -102,11 +109,14 @@ fn run_both_opts(tag: &str, module: &TirModule, driver: &str) {
 
 /// `fn(c:i32, a:F, b:F) -> F { if c != 0 { a } else { b } }`
 fn build_fsel(module: &mut TirModule, id: u32, name: &str, fty: Ty) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, fty.clone(), fty.clone()],
-        returns: vec![fty.clone()],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, fty.clone(), fty.clone()],
+            returns: vec![fty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -140,7 +150,9 @@ fn build_fsel(module: &mut TirModule, id: u32, name: &str, fty: Ty) {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 const G2_DRIVER: &str = r#"
@@ -179,11 +191,14 @@ fn g2_float_select_matches_clang() {
 /// The 16-bit add wraps and leaves dirty bits in [16:31]; UCVTF must read only
 /// the low 16 bits.
 fn build_u16_to_f32(module: &mut TirModule) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::U16, Ty::U16],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::U16, Ty::U16],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g4_u16_to_f32", ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -208,7 +223,9 @@ fn build_u16_to_f32(module: &mut TirModule) {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 const G4_DRIVER: &str = r#"
@@ -259,11 +276,14 @@ fn ret_const_block(id: u32, next_val: ValueId, ret_val: ValueId, val: i64) -> Ti
 /// `fn(x: SEL) -> i32 { match x { case_vals[i] => outs[i], _ => 999 } }`
 /// as a dense contiguous jump table.
 fn build_switch(module: &mut TirModule, id: u32, name: &str, sel_ty: Ty, cases: &[(i64, i64)]) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![sel_ty.clone()],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![sel_ty.clone()],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
 
     // Block ids: 0 = entry (switch); 1.. = case blocks; last = default.
@@ -300,7 +320,9 @@ fn build_switch(module: &mut TirModule, id: u32, name: &str, sel_ty: Ty, cases: 
     blocks.push(ret_const_block(cases.len() as u32 + 1, dv, dv, 999));
 
     f.blocks = blocks;
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 const G3_DRIVER: &str = r#"
@@ -374,16 +396,22 @@ fn g3_switch_negative_and_high_min_matches_clang() {
 /// `a as i8` (Trunc) leaves a non-canonical i8; the indirect call must
 /// sign-extend it to canonical w0 for the clang callee.
 fn build_g6_caller(module: &mut TirModule) {
-    let callee_sig = module.add_func_type(FuncTy {
-        params: vec![Ty::I8],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let callee_sig = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I8],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g6_caller", ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -408,7 +436,9 @@ fn build_g6_caller(module: &mut TirModule) {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 const G6_DRIVER: &str = r#"
@@ -445,6 +475,7 @@ fn g6_indirect_narrow_arg_matches_clang() {
 fn build_g1_caller(module: &mut TirModule) {
     let sid = StructId::new(0);
     module.add_struct(StructDef {
+        origin: None,
         id: sid,
         name: "S3".to_string(),
         fields: vec![
@@ -469,16 +500,22 @@ fn build_g1_caller(module: &mut TirModule) {
         repr: StructRepr::C,
     });
     let struct_ty = Ty::Struct(sid);
-    let callee_sig = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![struct_ty.clone()],
-        is_vararg: false,
-    });
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let callee_sig = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![struct_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(0), "g1_caller", ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
@@ -493,19 +530,19 @@ fn build_g1_caller(module: &mut TirModule) {
             })
             .with_result(ValueId::new(1)),
             InstrNode::new(Inst::ExtractField {
-                ty: struct_ty.clone(),
+                ty: Ty::I64,
                 aggregate: ValueId::new(1),
                 field: 0,
             })
             .with_result(ValueId::new(2)),
             InstrNode::new(Inst::ExtractField {
-                ty: struct_ty.clone(),
+                ty: Ty::I64,
                 aggregate: ValueId::new(1),
                 field: 1,
             })
             .with_result(ValueId::new(3)),
             InstrNode::new(Inst::ExtractField {
-                ty: struct_ty,
+                ty: Ty::I64,
                 aggregate: ValueId::new(1),
                 field: 2,
             })
@@ -553,7 +590,9 @@ fn build_g1_caller(module: &mut TirModule) {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 const G1_DRIVER: &str = r#"
@@ -579,17 +618,16 @@ fn g1_sret_caller_matches_clang() {
 }
 
 // ---------------------------------------------------------------------------
-// G5 — GEP over a #[repr(packed)] struct computes the CORRECT packed address
+// G5 — field projection from a #[repr(packed)] struct uses its packed offset
 // ---------------------------------------------------------------------------
 
-/// Build `fn(p: ptr) -> ptr { &((*P)p)[0].b }` — a multi-index GEP
-/// `getelementptr P, p, 0, 1` selecting the second field of struct P (given
-/// `repr`). For `#[repr(packed)] struct P { a: u8, b: u32 }` field `b` sits at
-/// PACKED offset 1; for `#[repr(C)]` it sits at natural offset 4.
+/// Load `((*P)p).b` with TrustIR's aggregate field projection. GEP does not
+/// select fields: its indices all stride the complete pointee type.
 fn build_g5_field_b(m: &mut TirModule, sid: StructId, fid: u32, name: &str, repr: StructRepr) {
     m.add_struct(StructDef {
         id: sid,
         name: format!("P{}", sid.index()),
+        origin: None,
         fields: vec![
             FieldDef {
                 name: "a".into(),
@@ -607,63 +645,62 @@ fn build_g5_field_b(m: &mut TirModule, sid: StructId, fid: u32, name: &str, repr
         repr,
     });
     let struct_ty = Ty::Struct(sid);
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::Ptr],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::U32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TirFunction::new(FuncId::new(fid), name, ft, BlockId::new(0));
     f.blocks = vec![TirBlock {
         id: BlockId::new(0),
         params: vec![(ValueId::new(0), Ty::Ptr)],
         body: vec![
-            InstrNode::new(Inst::Const {
-                ty: Ty::I64,
-                value: Constant::Int(0),
+            InstrNode::new(Inst::Load {
+                ty: struct_ty,
+                ptr: ValueId::new(0),
+                volatile: false,
+                align: None,
             })
             .with_result(ValueId::new(1)),
-            InstrNode::new(Inst::Const {
-                ty: Ty::I64,
-                value: Constant::Int(1),
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::U32,
+                aggregate: ValueId::new(1),
+                field: 1,
             })
             .with_result(ValueId::new(2)),
-            InstrNode::new(Inst::GEP {
-                pointee_ty: struct_ty,
-                base: ValueId::new(0),
-                indices: vec![ValueId::new(1), ValueId::new(2)],
-                inbounds: false,
-            })
-            .with_result(ValueId::new(3)),
             InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(3)],
+                values: vec![ValueId::new(2)],
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 const G5_DRIVER: &str = r#"
+#include <stdint.h>
 #include <stdio.h>
-extern void* g5_field_b_packed(void* p);
-extern void* g5_field_b_c(void* p);
+extern uint32_t g5_field_b_packed(void* p);
+extern uint32_t g5_field_b_c(void* p);
+struct __attribute__((packed)) Packed { uint8_t a; uint32_t b; };
+struct Natural { uint8_t a; uint32_t b; };
 int main(void){
-    char buf[16];
-    long packed_off = (char*)g5_field_b_packed(buf) - buf;
-    long c_off      = (char*)g5_field_b_c(buf) - buf;
-    /* #[repr(packed)] {u8,u32}: offsetof(b) == 1; #[repr(C)]: 4. */
-    if(packed_off != 1){ printf("g5 FAIL: packed offset %ld want 1\n", packed_off); return 1; }
-    if(c_off != 4){ printf("g5 FAIL: C offset %ld want 4\n", c_off); return 2; }
-    printf("g5 packed GEP OK\n");
+    struct Packed packed = { 0xa5, 0x12345678 };
+    struct Natural natural = { 0x5a, 0x89abcdef };
+    if(g5_field_b_packed(&packed) != packed.b) return 1;
+    if(g5_field_b_c(&natural) != natural.b) return 2;
+    printf("g5 packed field projection OK\n");
     return 0;
 }
 "#;
 
 #[test]
-fn g5_packed_struct_gep_matches_clang() {
-    // A #[repr(packed)] struct GEP must compute the PACKED field address
-    // (offset 1), NOT the natural-C aligned offset (4). The identical #[repr(C)]
-    // shape must still compute the natural offset (4), proving the packed path
-    // is specific to the packed repr.
+fn g5_packed_struct_field_projection_matches_clang() {
+    // The same field projection must respect each struct's declared repr:
+    // offset 1 in the packed image and offset 4 in the natural image.
     let mut m = TirModule::new("g5");
     build_g5_field_b(
         &mut m,
@@ -674,4 +711,13 @@ fn g5_packed_struct_gep_matches_clang() {
     );
     build_g5_field_b(&mut m, StructId::new(1), 1, "g5_field_b_c", StructRepr::C);
     run_both_opts("g5", &m, G5_DRIVER);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

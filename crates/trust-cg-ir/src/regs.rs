@@ -328,7 +328,7 @@ impl RegClass {
             Type::V128 => RegClass::Fpr128,
             Type::F16 => RegClass::Fpr16,
             Type::F32 => RegClass::Fpr32,
-            Type::F64 => RegClass::Fpr64,
+            Type::F64 | Type::V64 => RegClass::Fpr64,
             // Aggregates are handled via pointers at the machine level.
             Type::Struct(_) | Type::Array(_, _) | Type::Enum { .. } => RegClass::Gpr64,
         }

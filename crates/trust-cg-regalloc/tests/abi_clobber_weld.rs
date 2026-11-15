@@ -22,8 +22,8 @@
 //!     preserved register as clobbered.
 //!
 //! GROUND-TRUTH ORACLE (mirror of abi_clobber_spec.lean):
-//!   GPR callee-saved = X19..X28 ; everything else in X0..X30 is caller-saved.
-//!   FPR callee-saved = V8..V15  ; everything else in V0..V31 is caller-saved.
+//!   GPR callee-saved = X19..X29 ; everything else in X0..X30 is caller-saved.
+//!   FPR low-64 callee-saved = V8..V15  ; everything else in V0..V31 is caller-saved.
 //! These two lines are the SAME convention the Clean `gprClass` / `fprClass`
 //! classifiers encode; the spec proves disjointness + tiling of this partition,
 //! and this test welds the real accessors to it.
@@ -38,7 +38,7 @@
 //!
 //! RESERVED EXCEPTION. X29 (FP, frame pointer) and its W29 alias are reserved
 //! and non-allocatable, so the real accessors omit them from BOTH sets. The
-//! spec models X29 as caller-saved (it is volatile per AAPCS64), but regalloc
+//! spec models X29 as callee-saved (as required by AAPCS64), but regalloc
 //! never hands it out; we document and assert this single carve-out explicitly
 //! so completeness is checked HONESTLY rather than by quietly skipping it.
 
@@ -82,15 +82,15 @@ fn decode(enc: u16) -> Option<(Bank, u16)> {
 /// Clean `gprClass` / `fprClass` proven in abi_clobber_spec.lean.
 fn spec_class(bank: Bank, idx: u16) -> SavedClass {
     match bank {
-        // GPR callee-saved = X19..X28; everything else (X0..X18, X29, X30) caller-saved.
+        // X19..X29 are preserved architecturally; X29 is reserved by regalloc.
         Bank::Gpr => {
-            if (19..=28).contains(&idx) {
+            if (19..=29).contains(&idx) {
                 SavedClass::Callee
             } else {
                 SavedClass::Caller
             }
         }
-        // FPR callee-saved = V8..V15; everything else caller-saved.
+        // FPR low-64 callee-saved = V8..V15; everything else caller-saved.
         Bank::Fpr => {
             if (8..=15).contains(&idx) {
                 SavedClass::Callee

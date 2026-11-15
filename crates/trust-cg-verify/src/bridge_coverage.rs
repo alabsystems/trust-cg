@@ -263,6 +263,8 @@ impl TerminatorShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionKind {
     Deref,
+    /// Borrow-checker-only projection: never an admitted machine-code operation.
+    PhantomDeref,
     Field,
     Index,
     ConstantIndex,
@@ -277,6 +279,7 @@ impl ProjectionKind {
     pub fn name(self) -> &'static str {
         match self {
             ProjectionKind::Deref => "Deref",
+            ProjectionKind::PhantomDeref => "PhantomDeref",
             ProjectionKind::Field => "Field",
             ProjectionKind::Index => "Index",
             ProjectionKind::ConstantIndex => "ConstantIndex",
@@ -317,9 +320,10 @@ pub enum MemRefineKind {
     /// `for c in v.chunks(n)` (and `windows`/`chunks_exact`/`rchunks`/
     /// `rchunks_exact`) — the intercepted slice STRIDE-ITERATOR constructor
     /// lowering. A VALUE-level refinement (not a memory-op sequence): the
-    /// reconstructed trap predicate + the three `{ ptr, end, n }` cursor fields are
-    /// checked against `mir_semantics::stride_iter_ctor_spec` (trap iff `n == 0`;
-    /// `ptr == data`; `end == data + len*elem_size`; `n == n`). Like `SplitAt` it
+    /// reconstructed trap predicate + std's state fields (`v`, the size and, for
+    /// the `*_exact` kinds, `rem`) are checked against
+    /// `mir_semantics::stride_iter_ctor_spec` (trap iff `n == 0`; `v`/`rem` the
+    /// split std's `new` makes; size `n`). Like `SplitAt` it
     /// has no place projection, so it surfaces only in the dedicated
     /// `[memory refinements]` manifest section.
     StrideIterCtor,
@@ -423,8 +427,24 @@ pub enum MemRefineKind {
     /// `new_state == ITE(cond, (reset<<32)|reset, state)`;
     /// `tag == ITE(cond, some, none)`; `payload == y`). Like `SplitAt` it has
     /// no place projection, so it surfaces only in the dedicated
-    /// `[memory refinements]` manifest section.
+    /// `[memory refinements]` manifest section. No bridge lowering emits the
+    /// packed state any more, so no compile notes this kind; an unsigned
+    /// `Range` source is [`MemRefineKind::StepByNextCountdown`].
     StepByNextPacked,
+    /// `<StepBy<Range<u64|usize>> as Iterator>::next(&mut self)` ->
+    /// `Option<u64|usize>` on a 64-bit target: core's COUNTDOWN `spec_next`
+    /// (`lower_step_by_countdown_next`; `end` holds the items left, as
+    /// `SpecRangeSetup` wrote it). A STATE-TRANSITION VALUE-level check over
+    /// the FOUR cells the lowering writes (the `range.start` and `range.end`
+    /// write-backs and the `Option` tag and payload), reconstructed from the
+    /// emitted pre-state `Load`s / `Add`/`Sub` / `ICmp Ne` / `Select`s /
+    /// `Store`s and checked against
+    /// `mir_semantics::step_by_countdown_next_spec`
+    /// (`cond = end != 0`; `new_start == ITE(cond, start + (sm + 1), start)`;
+    /// `new_end == ITE(cond, end - 1, end)`; `tag == ITE(cond, some, none)`;
+    /// `payload == start`). Like `SplitAt` it has no place projection, so it
+    /// surfaces only in the dedicated `[memory refinements]` manifest section.
+    StepByNextCountdown,
     /// `<StepBy<slice::Iter<T>> as Iterator>::next(&mut self)` -> `Option<&T>`
     /// — the intercepted branchless StepBy step (`lower_step_by_next`, the
     /// STD-LAYOUT SLICE-source path: a `{ptr, end}` cursor + the std
@@ -484,6 +504,7 @@ impl MemRefineKind {
             MemRefineKind::SliceIterNext => "slice-iter-NEXT",
             MemRefineKind::StepByNext => "stepby-NEXT",
             MemRefineKind::StepByNextPacked => "stepby-next-PACKED",
+            MemRefineKind::StepByNextCountdown => "stepby-next-COUNTDOWN",
             MemRefineKind::StepByNextSlice => "stepby-next-SLICE",
             MemRefineKind::SliceToVecHeader => "to-vec-HEADER",
         }
@@ -627,6 +648,7 @@ pub fn classify_terminator(kind: TerminatorShape) -> ShapeClass {
 pub fn classify_projection(kind: ProjectionKind) -> ShapeClass {
     use ShapeClass::*;
     match kind {
+        ProjectionKind::PhantomDeref => Unmodeled,
         ProjectionKind::Deref => TrustedAllowlisted {
             reason: "deref projection (*p) — load/store address",
             phase: Phase::P1MemoryAndPlaces,
@@ -735,6 +757,23 @@ pub struct CoverageRecorder {
     mem_refined: BTreeMap<(&'static str, MemRefineKind), usize>,
 }
 
+/// Embedder-installed `(manifest, strict)` pair for [`CoverageRecorder::from_env`].
+///
+/// `None` until an embedding installs one; see that method for why.
+static RECORDER_DEFAULTS: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+
+/// Install the coverage-recorder settings for this process.
+///
+/// Returns true for a first or identical installation and false for a conflict.
+/// Conflicts never replace the installed pair; embedders must check the result
+/// before lowering under a supposedly installed strict/manifest policy.
+pub fn set_recorder_defaults(manifest: bool, strict: bool) -> bool {
+    match RECORDER_DEFAULTS.set((manifest, strict)) {
+        Ok(()) => true,
+        Err(requested) => RECORDER_DEFAULTS.get() == Some(&requested),
+    }
+}
+
 impl CoverageRecorder {
     /// Construct a recorder with explicit flags (used by unit tests).
     pub fn new(manifest: bool, strict: bool) -> Self {
@@ -747,13 +786,29 @@ impl CoverageRecorder {
         }
     }
 
-    /// Construct a recorder from the environment:
-    /// `TCG_BRIDGE_COVERAGE` enables the per-function manifest; STRICT mode is
-    /// `TCG_BRIDGE_COVERAGE_STRICT` (fail-closed on any `Unmodeled` shape).
+    /// Construct a recorder from the ambient settings:
+    /// the manifest flag enables the per-function manifest; STRICT mode fails
+    /// the compile closed on any `Unmodeled` shape.
+    ///
+    /// An embedder-installed pair (see [`set_recorder_defaults`]) is
+    /// authoritative: it is the one that arrived through a tracked channel. The
+    /// rustc bridge installs it during `CodegenBackend::init` from
+    /// `-Ztrust-ir-cg-args=bridge-coverage[-strict]`, because
+    /// `TCG_BRIDGE_COVERAGE*` are untracked codegen controls that trustc
+    /// refuses outright. The environment read remains ONLY as the fallback for a
+    /// standalone, non-rustc use of this crate.
+    ///
+    /// Note the direction of the fallback: with no setting installed and no
+    /// variable set, both flags are `false` — and `false` STRICT is the
+    /// permissive value here, exactly as before. This is a reporting recorder;
+    /// the gates that refuse unmodeled shapes live elsewhere.
     pub fn from_env() -> Self {
+        if let Some((manifest, strict)) = RECORDER_DEFAULTS.get() {
+            return Self::new(*manifest, *strict);
+        }
         Self::new(
-            std::env::var_os("TCG_BRIDGE_COVERAGE").is_some(),
-            std::env::var_os("TCG_BRIDGE_COVERAGE_STRICT").is_some(),
+            crate::env_lock::var_os("TCG_BRIDGE_COVERAGE").is_some(),
+            crate::env_lock::var_os("TCG_BRIDGE_COVERAGE_STRICT").is_some(),
         )
     }
 
@@ -1527,6 +1582,34 @@ mod tests {
         assert_eq!(
             MemRefineKind::StepByNextPacked.label(),
             "stepby-next-PACKED"
+        );
+    }
+
+    #[test]
+    fn step_by_next_countdown_surfaces_in_memory_refinements_only_after_a_discharge() {
+        // Like `split_at`, the countdown StepBy::next state transition has no
+        // place row: it must NOT appear until a real discharge notes it.
+        let rec = CoverageRecorder::new(true, false);
+        let m = rec.manifest("test::no_step_by_next_countdown");
+        assert!(
+            !m.contains("stepby-next-COUNTDOWN"),
+            "without a discharge no stepby-next-COUNTDOWN may appear: {m}"
+        );
+        let mut rec = CoverageRecorder::new(true, false);
+        rec.note_memory_refined(
+            "<stepby::next_countdown>",
+            MemRefineKind::StepByNextCountdown,
+        );
+        let m = rec.manifest("test::step_by_next_countdown_refined");
+        assert!(
+            m.contains("[memory refinements]")
+                && m.contains("stepby-next-COUNTDOWN")
+                && m.contains("stepby::next_countdown"),
+            "a discharged countdown StepBy::next must surface as stepby-next-COUNTDOWN @ the anchor: {m}"
+        );
+        assert_eq!(
+            MemRefineKind::StepByNextCountdown.label(),
+            "stepby-next-COUNTDOWN"
         );
     }
 

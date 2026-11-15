@@ -10,8 +10,6 @@
 // candidate rewrite (pattern -> replacement), encode both sides as
 // bitvector SMT expressions and check whether they compute the same
 // result for all inputs. If equivalent, the rule is proven correct.
-//
-// Reference: designs/2026-04-13-superoptimization.md
 
 //! Offline peephole synthesis framework.
 //!
@@ -956,6 +954,44 @@ impl SynthesisEngine {
 mod tests {
     use super::*;
 
+    /// A known-good candidate's CEGIS verdict. With the proof authority
+    /// installed it must be proven; when it is not, the exact obligation is
+    /// re-run through a fresh `CegisLoop` seeded the same way, and the test
+    /// skips loudly only when that answer is AY's disclosed proof hole
+    /// (`crate::formal_gap`) — a rejected proof, any other `unknown`, a timeout
+    /// and a solver error fail. Without the authority the test skips by name
+    /// and nothing may be proven.
+    fn expect_cegis_proven(
+        test: &str,
+        engine: &SynthesisEngine,
+        candidate: &RuleCandidate,
+        rule: Option<ProvenRule>,
+    ) -> Option<ProvenRule> {
+        if !crate::formal_gap::proof_authority_present(test) {
+            assert!(
+                rule.is_none(),
+                "{test}: a rule was proven without proof authority"
+            );
+            return None;
+        }
+        if rule.is_some() {
+            return rule;
+        }
+        let (pattern, replacement, _) = engine.build_obligation(candidate);
+        let vars = vec![("x".to_string(), engine.width)];
+        let mut probe = CegisLoop::new(10, 5000);
+        probe.add_edge_case_seeds(&vars);
+        let verdict = probe.verify(&pattern, &replacement, &vars);
+        let Some(reason) = crate::formal_gap::cegis_gap_reason(&verdict) else {
+            panic!(
+                "{test}: proof authority was available but the known-good candidate was not \
+                 proven; the same obligation returns {verdict:?}"
+            )
+        };
+        crate::formal_gap::print_gap_skip(test, reason);
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Encoding tests
     // -----------------------------------------------------------------------
@@ -1630,12 +1666,13 @@ mod tests {
 
         let mut engine = SynthesisEngine::with_mode(8, VerifyMode::Cegis);
         let rule = engine.verify_candidate_cegis(&candidate);
-        // If solver is available, this should be proven.
-        // If solver is not available, CEGIS may return Error => None.
-        // Either way, the function should not panic.
-        if rule.is_some() {
-            assert_eq!(engine.candidates_proven, 1);
-        }
+        let proven = expect_cegis_proven(
+            "test_verify_candidate_cegis_add_zero",
+            &engine,
+            &candidate,
+            rule,
+        );
+        assert_eq!(engine.candidates_proven, usize::from(proven.is_some()));
     }
 
     /// verify_candidate_cegis rejects non-equivalent candidates via
@@ -1773,9 +1810,14 @@ mod tests {
 
         let mut engine = SynthesisEngine::with_mode(8, VerifyMode::EvaluationThenCegis);
         let rule = engine.verify_candidate_with_mode(&candidate);
-        // If solver available: Some (CEGIS confirms). If not: may be None.
-        // Either way, should not panic.
-        if let Some(rule) = rule {
+        // With the proof authority installed CEGIS confirms the evaluator's
+        // verdict; without it CEGIS returns Error and nothing is proven.
+        if let Some(rule) = expect_cegis_proven(
+            "test_verify_with_mode_eval_then_cegis_passes",
+            &engine,
+            &candidate,
+            rule,
+        ) {
             assert!(rule.cost_delta > 0);
         }
     }
@@ -1811,14 +1853,35 @@ mod tests {
         let mut engine = SynthesisEngine::with_mode(config.width, VerifyMode::Cegis);
         let db = engine.run(&config);
 
-        // Even in CEGIS mode, we should discover rules (if solver available)
-        // or at least not panic (if solver unavailable).
-        // The CEGIS concrete evaluation alone catches obvious non-equivalences.
         eprintln!(
             "CEGIS run stats: {} checked, {} proven, {} disproven",
             engine.candidates_checked, engine.candidates_proven, engine.candidates_disproven
         );
         eprintln!("CEGIS proven rules: {}", db.len());
+        assert!(
+            engine.candidates_checked > 0,
+            "CEGIS mode checked no candidate"
+        );
+        // The CEGIS concrete evaluation alone catches obvious
+        // non-equivalences.
+        assert!(
+            engine.candidates_disproven > 0,
+            "CEGIS mode disproved no candidate"
+        );
+        // Only a certified CEGIS `Equivalent` proves a rule, so with the proof
+        // authority installed the search must prove some, and without it none.
+        if crate::formal_gap::proof_authority_present("test_run_with_cegis_mode (proof half)") {
+            assert!(
+                engine.candidates_proven > 0 && !db.is_empty(),
+                "proof authority was available but CEGIS mode proved no rule"
+            );
+        } else {
+            assert_eq!(
+                engine.candidates_proven, 0,
+                "a rule was proven without proof authority"
+            );
+            assert!(db.is_empty(), "a rule was stored without proof authority");
+        }
     }
 
     #[test]

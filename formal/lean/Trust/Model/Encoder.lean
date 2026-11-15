@@ -1,5 +1,5 @@
 /-
-  Model.Encoder — the byte-level x86-64 encoder/decoder and the `step_emitted` keystone.
+  Model.Encoder — the byte-level x86-64 instruction model: encoder, decoder, transfer function.
 
   Author: Andrew Yates
   Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -9,50 +9,41 @@
   instructions the backend is *allowed* to emit; every one of them must carry a per-instruction
   SMT cert or compilation FAILS CLOSED.  The Cert.* modules discharge the VALUE leg of those
   certs by `bv_decide`.  But a value cert about `execInstr` only matters end-to-end if the BYTES
-  the backend actually writes DECODE to that very `execInstr`.  This module supplies that missing
-  link:
+  the backend actually writes DECODE to that very `execInstr`.  This module supplies the model
+  side of that link:
 
       Instr               — the reified `EmittableNeedsProof` opcode set (mirrors `X86Opcode`).
       encode  : Instr → List UInt8     — REX / opcode / ModRM / disp / imm byte emission.
       decode  : List UInt8 → Option (Instr × List UInt8)  — the inverse byte parser.
-      decode_encode        — left-inverse: every emitted opcode byte-round-trips.
+      decode_encode_*      — left-inverse: every decodable emitted opcode byte-round-trips.
       execInstr            — the architectural effect of one decoded `Instr` on `MachState`.
-      step_emitted         — THE KEYSTONE: fetch∘decode∘execute at `m.rip` over `encode i`
-                             equals `x86Step m (eventOf i) (execInstr i m)`.  This is what
-                             discharges every `_exec` obligation in `LoweredStep.runs`: a
-                             Cert.* author may reason about `execInstr` and KNOW the real
-                             fetch/decode/execute machine agrees, because the bytes round-trip.
+      BytesAt              — the bytes resident at an address.
 
-  HOW IT PLUGS INTO THE CONTRACT.  `Trust.Model` declares `x86Step` *opaque* (the real
-  decode∘execute relation).  Here we (1) give the concrete `execInstr` transfer function, (2)
-  AXIOMATIZE the link between the opaque `x86Step` and `fetch/decode/execInstr` via the single
-  named bridge `x86Step_decode` (classified `stubbed-semantics`: it is the *definition* of the
-  opaque relation, supplied by Model.Machine; we do not have its body here), and (3) PROVE
-  `step_emitted` and the `LoweredStep` builders FROM that bridge + `decode_encode` with NO further
-  `sorry`.  So the only thing trusted about the machine is "x86Step IS decode∘execute", and the
-  byte-faithfulness (`decode_encode`) is a kernel-checked fact — exactly the property that turns
-  the fail-closed cert gate into an end-to-end guarantee.
+  HOW IT PLUGS INTO THE CONTRACT.  This module imports only `Model.Core`.  `Trust.Model` (the
+  link step) DEFINES `x86Step` as fetch∘decode∘execInstr over these definitions, and
+  `Model.EncoderStep` proves the keystone `x86Step_decode` (formerly an axiom) and the
+  `LoweredStep` builders from that definition.  The byte round trips here are kernel-checked;
+  what stays trusted, outside Lean, is that `decode`/`execInstr` are what an x86-64 processor
+  does with the same bytes.  The golden matrix (`Model.EncoderGolden`) binds enumerated `encode`
+  rows to the Rust emitter; `Model.MovabsGolden` extends that binding to full-width
+  immediate loads. Nothing binds `execInstr` to hardware.
 
-  WHAT IS TRUSTED (the SINGLE assumption).  Exactly ONE: the opaque-machine bridge `x86Step_decode`
-  (an `axiom`, NOT a `sorry`'d theorem — it is the DEFINING property of the opaque `x86Step`, owned
-  by Model.Machine: "x86Step IS fetch∘decode∘execute").  Every other obligation in this module is
-  PROVEN with no `sorry`: the LE imm/disp split/join (`ofLe32_le32`, by `bv_decide`), the whole
-  reg/reg b64 round-trip family (`decode_encode_regreg`, by case-dispatch onto `decode_encode_addRR`),
-  and `step_emitted` (derived from the bridge + the round-trip, not assumed).
+  TRUSTED BOUNDARY. No explicit axiom. The little-endian split/join and near-branch round-trips
+  are proved from bit extensionality and finite case analysis. Their audited dependencies
+  contain only standard logical axioms. Other existing proofs use `bv_decide`, whose
+  native-evaluation dependencies must be counted through `#print axioms`.
+  None of these model proofs establishes production Rust or hardware refinement.
 
-  SOUNDNESS GATE for the wide-effect `execInstr`.  `execInstr` models the WIDE (64-bit) integer
-  effect.  A real 32-bit ALU op zero-extends bits 32..63, so the bridge would be UNFAITHFUL for b32.
-  `decode` therefore REJECTS any non-REX.W (b32) byte (`if !wbit then none`), so only b64 reg/reg
-  forms can satisfy `step_emitted`'s round-trip premise and reach the trusted axiom — keeping the
-  axiom faithful.  (b16 already fails: its first byte is the 0x66 prefix, not a REX byte.)  The
-  stubbed mem/SSE/IDIV/XADD forms cannot round-trip either (their opcode bytes are not in `decode`'s
-  table), so their skeleton `execInstr` is never asserted-faithful via the axiom — they are simply
-  not-yet-supported, not unsound.
+  DECODER ADMISSION. Register ALU forms require both REX.W and ModRM mode 11.
+  Memory-addressing ModRM bytes cannot be interpreted as register operands.
+  Near Jcc/JMP forms consume exactly four displacement bytes and preserve the
+  remaining input. Other memory/SSE/IDIV/XADD forms still return none, so the model
+  machine takes no step on them.
   ─────────────────────────────────────────────────────────────────────────────────────────────
 -/
 import Std.Tactic.BVDecide
-import Trust.Model            -- the SINGLE-SOURCE-OF-TRUTH preamble (R, Val, Loc, MachState, x86Step…)
-import Trust.Cert.Obligation  -- the uniform `LoweredStep` / `InstrCert` shape this module builds
+import Trust.Model.Core
+import Trust.Model.RegisterBits       -- the state vocabulary (Val, Loc, MachState, Flags, Event …)
 
 namespace Trust
 namespace Model
@@ -78,12 +69,17 @@ def gprOfNum (n : BitVec 4) : GPR :=
 theorem gprOfNum_gprNum (r : GPR) : gprOfNum (gprNum r) = r := by
   cases r <;> decide
 
-def gprLo3 (r : GPR) : BitVec 3 := (gprNum r).truncate 3
+def gprLo3 (r : GPR) : BitVec 3 :=
+  BitVec.ofNat 3 (trust_cg_x86_low3 (UInt8.ofNat (gprNum r).toNat)).toNat
+
+/-- The shared Trust computation extracts exactly the model's three register bits. -/
+@[simp] theorem gprLo3_bits (r : GPR) : gprLo3 r = (gprNum r).truncate 3 := by
+  cases r <;> decide
 def gprHiBit (r : GPR) : Bool := (gprNum r).getMsbD 0
 
 theorem gprNum_split (r : GPR) :
     gprNum r = ((BitVec.ofBool (gprHiBit r)) ++ (gprLo3 r)).cast (by omega) := by
-  cases r <;> (simp only [gprNum, gprLo3, gprHiBit]; bv_decide)
+  cases r <;> (simp only [gprNum, gprLo3_bits, gprHiBit]; bv_decide)
 
 /-! ## 1.  Condition codes (Jcc / SETcc / CMOVcc). -/
 
@@ -117,6 +113,7 @@ abbrev Disp32 := BitVec 32
 
 inductive Instr
   | movRR   (sz : OSize) (dst src : GPR)
+  | movabsRI (dst : GPR) (imm : BitVec 64)
   | movRI   (sz : OSize) (dst : GPR) (imm : BitVec 32)
   | leaRM   (dst base : GPR) (disp : Disp32)
   | movLoadRM  (sz : OSize) (dst base : GPR) (disp : Disp32)
@@ -171,7 +168,7 @@ theorem modrmRR_fields (reg rm : GPR) :
     ((modrmRR reg rm) >>> (6 : BitVec 8)).truncate 2 = 0b11 ∧
     (((modrmRR reg rm) >>> (3 : BitVec 8)).truncate 3) = gprLo3 reg ∧
     ((modrmRR reg rm).truncate 3) = gprLo3 rm := by
-  simp only [modrmRR, modrmByte]
+  simp only [modrmRR, modrmByte, gprLo3_bits]
   refine ⟨?_, ?_, ?_⟩ <;> bv_decide
 
 /-! ## 4.  Little-endian immediate / displacement splitting. -/
@@ -201,16 +198,58 @@ theorem ofNat_toNat_bv8 (y : BitVec 8) : BitVec.ofNat 32 y.toNat = y.setWidth 32
   apply BitVec.eq_of_toNat_eq
   simp [BitVec.toNat_setWidth, Nat.mod_eq_of_lt (by have := y.isLt; omega : y.toNat < 2^32)]
 
+private theorem split_join32 (x : BitVec 32) :
+    (x.setWidth 8).setWidth 32 |||
+      (((x >>> (8 : Nat)).setWidth 8).setWidth 32 <<< (8 : Nat)) |||
+      (((x >>> (16 : Nat)).setWidth 8).setWidth 32 <<< (16 : Nat)) |||
+      (((x >>> (24 : Nat)).setWidth 8).setWidth 32 <<< (24 : Nat)) = x := by
+  ext i hi
+  simp only [BitVec.getElem_or, BitVec.getElem_shiftLeft, BitVec.getElem_setWidth,
+    BitVec.getLsbD_setWidth, BitVec.getLsbD_ushiftRight]
+  by_cases h8 : i < 8
+  · simp [h8, show i < 16 by omega, show i < 24 by omega, BitVec.getLsbD_eq_getElem, hi]
+  · by_cases h16 : i < 16
+    · simp [h8, h16, show i < 24 by omega, show i - 8 < 8 by omega,
+        show 8 + (i - 8) = i by omega, BitVec.getLsbD_eq_getElem, hi]
+    · by_cases h24 : i < 24
+      · simp [h8, h16, h24, show ¬ i - 8 < 8 by omega, show i - 16 < 8 by omega,
+          show 16 + (i - 16) = i by omega, BitVec.getLsbD_eq_getElem, hi]
+      · simp [h8, h16, h24, show ¬ i - 8 < 8 by omega, show ¬ i - 16 < 8 by omega,
+          show i - 24 < 8 by omega, show 24 + (i - 24) = i by omega,
+          BitVec.getLsbD_eq_getElem, hi]
+
 /-- LE32 split then join is the identity (and the tail is preserved).  FULLY PROVEN (no `sorry`):
     the four bytes coerce back through `toNat_b8`/`ofNat_toNat_bv8`, and the OR-of-shifted-bytes
-    reconstructs `x` by `bv_decide` (kernel-checked LRAT).  Off the keystone path either way. -/
+    reconstructs `x` by bit extensionality and arithmetic on bit indices. -/
 theorem ofLe32_le32 (x : BitVec 32) (rest : List UInt8) :
     ofLe32 (le32 x ++ rest) = some (x, rest) := by
   simp only [le32, ofLe32, List.cons_append, List.nil_append]
   rw [toNat_b8, toNat_b8, toNat_b8, toNat_b8,
       ofNat_toNat_bv8, ofNat_toNat_bv8, ofNat_toNat_bv8, ofNat_toNat_bv8]
   refine congrArg some (Prod.ext ?_ rfl)
-  bv_decide
+  simpa [BitVec.truncate, BitVec.ushiftRight_eq', BitVec.shiftLeft_eq'] using split_join32 x
+
+/-- Full-width immediate bytes, distinct from the C7 sign-extended imm32 form. -/
+def le64 (x : BitVec 64) : List UInt8 :=
+  le32 (x.setWidth 32) ++ le32 ((x >>> (32 : Nat)).setWidth 32)
+
+def ofLe64 (bytes : List UInt8) : Option (BitVec 64 × List UInt8) := do
+  let (lo, tail) ← ofLe32 bytes
+  let (hi, rest) ← ofLe32 tail
+  return (hi ++ lo, rest)
+
+theorem ofLe64_le64 (x : BitVec 64) (rest : List UInt8) :
+    ofLe64 (le64 x ++ rest) = some (x, rest) := by
+  unfold le64
+  rw [List.append_assoc]
+  unfold ofLe64
+  rw [ofLe32_le32]
+  simp only [bind, Option.bind]
+  rw [ofLe32_le32]
+  simp only [pure]
+  congr 2
+  rw [BitVec.setWidth_ushiftRight_eq_extractLsb, BitVec.setWidth_eq_extractLsb' (by decide)]
+  exact BitVec.extractLsb'_append_extractLsb'
 
 /-! ## 5.  `encode : Instr → List UInt8`. -/
 
@@ -223,6 +262,8 @@ def xmmNum : XMM → BitVec 4
   | .x12 => 12| .x13 => 13| .x14 => 14| .x15 => 15
 
 def encInstr : Instr → List UInt8
+  | .movabsRI dst imm =>
+      [b8 (rexRR .b64 .rax dst), b8 (0xB8 + (gprLo3 dst).setWidth 8)] ++ le64 imm
   | .movRR sz dst src =>
       osPrefix sz ++ [b8 (rexRR sz src dst), b8 0x89, b8 (modrmRR src dst)]
   | .movRI sz dst imm =>
@@ -303,13 +344,10 @@ theorem u8ToBv_b8 (x : BitVec 8) : u8ToBv (b8 x) = x := by
   unfold u8ToBv b8
   simp [BitVec.ofNat_toNat]
 
-/--
-  The decoder.  TOTAL (no `sorry`): it gives the full b64 register/register dispatch (the
-  proof-relevant, keystone-reachable core) and returns `none` for everything else — there is no
-  partial/stubbed parser, so an opcode outside the table simply cannot round-trip and cannot reach
-  the trusted `x86Step_decode` axiom.  The b64 gate (`if !wbit then none`) keeps the wide-effect
-  `execInstr` faithful (a 32-bit op would zero-extend bits 32..63, so b32 is rejected).
--/
+/-- Total decoder for REX.W register ALU forms, full-width immediate moves,
+    SHR imm8, and near Jcc/JMP branches.
+    Register forms require ModRM mode 11; unsupported opcodes and incomplete
+    displacements return none. The b64 gate keeps register effects faithful. -/
 def decode : List UInt8 → Option (Instr × List UInt8)
   | rexB :: opB :: modrmB :: rest =>
       let rex   := u8ToBv rexB
@@ -321,11 +359,20 @@ def decode : List UInt8 → Option (Instr × List UInt8)
         let sz := osizeOf false wbit
         -- SOUNDNESS GATE (b64-only): `execInstr` models the WIDE (64-bit) integer effect.  A real
         -- 32-bit ALU op ZERO-EXTENDS bits 32..63, which `execInstr`'s full-64 result does NOT match,
-        -- so the `x86Step_decode` bridge would be UNFAITHFUL for b32.  We therefore only admit the
-        -- REX.W (b64) reg/reg forms here; a non-W byte (b32) decodes to `none` and can never reach
+        -- so the fetch/decode/execute `x86Step` would be UNFAITHFUL for b32.  We therefore only admit the
+        -- REX.W (b64) forms here; a non-W byte (b32) decodes to `none` and can never reach
         -- the keystone with the wide-effect `execInstr`.
         if !wbit then none else
-        if      op == 0x89 then some (.movRR sz f1 f0, rest)
+        if op >>> (3 : BitVec 8) == 0x17 then
+          (ofLe64 (modrmB :: rest)).map fun (imm, tail) =>
+            (.movabsRI (gprOfNum ((BitVec.ofBool (rex.getLsbD 0)) ++ op.truncate 3)) imm, tail)
+        else
+        if ((modrm >>> (6 : BitVec 8)).truncate 2 != (0b11 : BitVec 2)) then none else
+        if op == 0xC1 && ((modrm >>> (3 : BitVec 8)) &&& 7) == 5 then
+          match rest with
+          | imm :: tail => some (.shrRI .b64 f1 (u8ToBv imm), tail)
+          | [] => none
+        else if      op == 0x89 then some (.movRR sz f1 f0, rest)
         else if op == 0x01 then some (.addRR sz f1 f0, rest)
         else if op == 0x11 then some (.adcRR sz f1 f0, rest)
         else if op == 0x29 then some (.subRR sz f1 f0, rest)
@@ -336,14 +383,43 @@ def decode : List UInt8 → Option (Instr × List UInt8)
         else if op == 0x09 then some (.orRR sz f1 f0, rest)
         else if op == 0x31 then some (.xorRR sz f1 f0, rest)
         else none
+      else if rex == 0x0F then
+        if (op >>> (4 : BitVec 8)) == 0x8 then
+          (ofLe32 (modrmB :: rest)).map fun (rel, tail) =>
+            (.jcc (condOfNum (op.truncate 4)) rel, tail)
+        else none
+      else if rex == 0xE9 then
+        (ofLe32 (opB :: modrmB :: rest)).map fun (rel, tail) => (.jmp rel, tail)
       else none
   | _ => none
+
+/-- All immediate bits and arbitrary following bytes survive decode. -/
+theorem decode_encode_movabsRI (dst : GPR) (imm : BitVec 64) (tail : List UInt8) :
+    decode (encode (.movabsRI dst imm) ++ tail) = some (.movabsRI dst imm, tail) := by
+  have hread := ofLe64_le64 imm tail
+  simp only [le64, le32, List.cons_append, List.nil_append] at hread
+  simp only [BitVec.truncate, BitVec.setWidth_setWidth_of_le _ (by decide : 8 ≤ 32)] at hread
+  cases dst <;>
+    simp [encode, encInstr, le64, le32, decode, u8ToBv_b8,
+      rexRR, rexByte, gprHiBit, gprLo3_bits, gprNum, gprOfNum] <;> exact hread
+
+/-- The entire imm8 domain shares the anchored three-byte prefix. -/
+theorem encode_shrRI_immediate (dst : GPR) (amt : BitVec 8) :
+    encode (.shrRI .b64 dst amt) = (encode (.shrRI .b64 dst 0)).take 3 ++ [b8 amt] := by
+  rfl
+
+/-- Register SHR decodes every raw imm8, preserving an arbitrary suffix. -/
+theorem decode_encode_shrRI (dst : GPR) (amt : BitVec 8) (tail : List UInt8) :
+    decode (encode (.shrRI .b64 dst amt) ++ tail) = some (.shrRI .b64 dst amt, tail) := by
+  cases dst <;>
+    simp [encode, encInstr, osPrefix, le8, decode, u8ToBv_b8, rexRR,
+      rexByte, modrmExtR, modrmByte, gprHiBit, gprLo3_bits, gprNum, decodeRR, gprOfNum]
 
 /-! ## 7.  `decode_encode` — the byte round-trip (left inverse). -/
 
 theorem decodeRR_roundtrip (reg rm : GPR) :
     decodeRR (rexRR OSize.b64 reg rm) (modrmRR reg rm) = (reg, rm) := by
-  simp only [decodeRR, rexRR, rexByte, modrmRR, modrmByte, gprLo3, gprHiBit]
+  simp only [decodeRR, rexRR, rexByte, modrmRR, modrmByte, gprLo3_bits, gprHiBit]
   have hreg : gprOfNum (gprNum reg) = reg := gprOfNum_gprNum reg
   have hrm  : gprOfNum (gprNum rm)  = rm  := gprOfNum_gprNum rm
   cases reg <;> cases rm <;>
@@ -354,16 +430,22 @@ theorem rexRR_b64_guard (reg rm : GPR) :
     (rexRR OSize.b64 reg rm).getLsbD 3 = true := by
   cases reg <;> cases rm <;> (simp only [rexRR, rexByte, gprHiBit, gprNum]; bv_decide)
 
+/-- The emitted register mode is checked independently of the opcode. -/
+theorem modrmRR_register_mode (reg rm : GPR) :
+    ((modrmRR reg rm) >>> (6 : BitVec 8)).truncate 2 = (0b11 : BitVec 2) := by
+  cases reg <;> cases rm <;> decide
+
 /-- `decode_encode` for the ADD reg/reg b64 form.  Fully proven from the round-trip helpers. -/
 theorem decode_encode_addRR (dst src : GPR) :
     decode (encode (.addRR OSize.b64 dst src)) = some (.addRR OSize.b64 dst src, []) := by
   have hg := (rexRR_b64_guard src dst).1
   have hw := (rexRR_b64_guard src dst).2
   have hd := decodeRR_roundtrip src dst
+  have hm := modrmRR_register_mode src dst
   simp only [encode, encInstr, osPrefix, if_neg (by decide : ¬ (OSize.b64 = OSize.b16)),
              List.nil_append, decode, u8ToBv_b8]
-  rw [hg, hw, hd]
-  simp only [osizeOf, if_true, BEq.beq, Bool.not_true, Bool.false_eq_true, if_false]
+  rw [hg, hw, hd, hm]
+  simp only [osizeOf, if_true, BEq.beq, Bool.not_true, Bool.false_eq_true, if_false, bne_self_eq_false]
   rfl
 
 /-- The round-trip for EVERY reg/reg ALU b64 opcode.  FULLY PROVEN (no `sorry`):
@@ -381,21 +463,46 @@ theorem decode_encode_regreg
   have hg := (rexRR_b64_guard src dst).1
   have hw := (rexRR_b64_guard src dst).2
   have hd := decodeRR_roundtrip src dst
+  have hm := modrmRR_register_mode src dst
   rcases hi with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
     (simp only [encode, encInstr, osPrefix, if_neg (by decide : ¬ (OSize.b64 = OSize.b16)),
                 List.nil_append, decode, u8ToBv_b8] <;>
-     rw [hg, hw, hd] <;>
-     simp only [osizeOf, if_true, BEq.beq, Bool.not_true, Bool.false_eq_true, if_false] <;>
+     rw [hg, hw, hd, hm] <;>
+     simp only [osizeOf, if_true, BEq.beq, Bool.not_true, Bool.false_eq_true, if_false, bne_self_eq_false] <;>
      rfl)
+
+/-- Near conditional branches preserve all four displacement bytes and the tail. -/
+theorem decode_encode_jcc (cc : Cond) (rel : BitVec 32) (tail : List UInt8) :
+    decode (encode (.jcc cc rel) ++ tail) = some (.jcc cc rel, tail) := by
+  have hread := ofLe32_le32 rel tail
+  simp only [le32, List.cons_append, List.nil_append, BitVec.truncate] at hread
+  cases cc <;>
+    simp [encode, encInstr, le32, decode, u8ToBv_b8, condNum, condOfNum] <;> exact hread
+
+/-- Near unconditional branches preserve their displacement and following bytes. -/
+theorem decode_encode_jmp (rel : BitVec 32) (tail : List UInt8) :
+    decode (encode (.jmp rel) ++ tail) = some (.jmp rel, tail) := by
+  have hread := ofLe32_le32 rel tail
+  simp only [le32, List.cons_append, List.nil_append, BitVec.truncate] at hread
+  simp [encode, encInstr, le32, decode, u8ToBv_b8]
+  exact hread
+
+/-- A memory-mode MOV must not decode as a register-to-register MOV. -/
+theorem decode_memory_modrm_refused : decode [0x48, 0x89, 0x08] = none := by decide
+
+/-- Truncated displacement and unsupported two-byte opcodes fail closed. -/
+theorem decode_truncated_jcc_refused : decode [0x0F, 0x84, 0x12, 0x34, 0x56] = none := by decide
+
+theorem decode_nonbranch_0f_refused : decode [0x0F, 0x74, 0xC0, 0, 0, 0] = none := by decide
 
 /-! ## 8.  `execInstr` — the architectural transfer function.
 
     FAITHFULNESS of the keystone-reachable set.  Every opcode that can round-trip through `decode`
-    (the b64 reg/reg ALU set: mov/add/adc/sub/sbb/cmp/test/and/or/xor) is modeled COMPLETELY here,
+    (the b64 register ALU set and near Jcc/JMP branches) is modeled here,
     INCLUDING its flag effect.  Modeling the FULL 64-bit effect is sound precisely because `decode`
     admits ONLY the REX.W (b64) forms (b32 is rejected at the gate).  The remaining skeleton forms
-    (mem/IDIV/LOCK-XADD/SSE) are NOT in `decode`'s table, so they can never reach the trusted
-    `x86Step_decode` axiom; their rip-only stub is unsupported-not-unsound. -/
+    (mem/IDIV/LOCK-XADD/SSE) are NOT in `decode`'s table, so the model `x86Step` never executes
+    them; their rip-only stub is unsupported-not-unsound. -/
 
 def writeBytes (mem : BitVec 64 → BitVec 8) (a : BitVec 64) (v : BitVec 64) (n : Nat) :
     BitVec 64 → BitVec 8 :=
@@ -451,6 +558,25 @@ def sbbFlags (a b : BitVec 64) (bin : Bool) (res : BitVec 64) : Flags :=
   , of := (a.getMsbD 0 != b.getMsbD 0) && (a.getMsbD 0 != res.getMsbD 0)
   , pf := parityFlag res }
 
+/-- REX.W shifts mask the immediate to six bits. -/
+def shrCount64 (amt : BitVec 8) : Nat := amt.toNat % 64
+
+theorem shrCount64_lt (amt : BitVec 8) : shrCount64 amt < 64 :=
+  Nat.mod_lt _ (by decide)
+
+/-- SHR's represented flags; OF is an explicit choice when the count exceeds one.
+    AF is not represented in Flags. The zero-count case preserves every flag. -/
+def shrFlags64 (old : Flags) (a : BitVec 64) (amt : BitVec 8)
+    (undefinedOF : Bool) : Flags :=
+  let count := shrCount64 amt
+  let res := a >>> count
+  if count = 0 then old else
+    { cf := a.getLsbD (count - 1)
+    , zf := res == 0
+    , sf := res.getMsbD 0
+    , of := if count = 1 then a.getMsbD 0 else undefinedOF
+    , pf := parityFlag res }
+
 def setReg (m : MachState) (r : GPR) (v : BitVec 64) : MachState :=
   { m with regs := fun q => if q = r then v else m.regs q }
 
@@ -471,6 +597,8 @@ def condHolds (cc : Cond) (f : Flags) : Bool :=
 def execInstr (i : Instr) (m : MachState) : MachState :=
   let len := (encode i).length
   match i with
+  | .movabsRI dst imm =>
+      { (setReg m dst imm) with rip := stepRip m len }
   | .addRR _ dst src =>
       let res := m.regs dst + m.regs src
       { (setReg m dst res) with flags := addFlags (m.regs dst) (m.regs src) res, rip := stepRip m len }
@@ -511,7 +639,8 @@ def execInstr (i : Instr) (m : MachState) : MachState :=
   | .shlRI _ dst amt =>
       { (setReg m dst (m.regs dst <<< (amt.setWidth 64))) with rip := stepRip m len }
   | .shrRI _ dst amt =>
-      { (setReg m dst (m.regs dst >>> (amt.setWidth 64))) with rip := stepRip m len }
+      { (setReg m dst (m.regs dst >>> shrCount64 amt)) with
+        flags := shrFlags64 m.flags (m.regs dst) amt false, rip := stepRip m len }
   | .sarRI _ dst amt =>
       { (setReg m dst ((m.regs dst).sshiftRight amt.toNat)) with rip := stepRip m len }
   | .jmp rel =>
@@ -529,61 +658,74 @@ def execInstr (i : Instr) (m : MachState) : MachState :=
   | _ =>
       { m with rip := stepRip m len }
 
+/-- All architectural choices for the represented undefined SHR overflow flag.
+    `execInstr` remains the canonical false-OF representative. -/
+def execInstrChoice (i : Instr) (m : MachState) (undefinedOF : Bool) : MachState :=
+  match i with
+  | .shrRI _ _ amt =>
+      if 1 < shrCount64 amt then
+        { execInstr i m with flags := { (execInstr i m).flags with of := undefinedOF } }
+      else execInstr i m
+  | _ => execInstr i m
+
+theorem execInstrChoice_false (i : Instr) (m : MachState) :
+    execInstrChoice i m false = execInstr i m := by
+  cases i <;> try rfl
+  rename_i sz dst amt
+  simp only [execInstrChoice]
+  split
+  · rename_i h
+    have h0 : shrCount64 amt ≠ 0 := by omega
+    have h1 : shrCount64 amt ≠ 1 := by omega
+    simp [execInstr, shrFlags64, h0, h1]
+  · rfl
+
+/-- Every OF choice has the same masked register effect. -/
+@[simp] theorem execInstrChoice_shrRI_regs (dst q : GPR) (amt : BitVec 8)
+    (m : MachState) (undefinedOF : Bool) :
+    (execInstrChoice (.shrRI .b64 dst amt) m undefinedOF).regs q =
+      if q = dst then m.regs dst >>> shrCount64 amt else m.regs q := by
+  simp only [execInstrChoice]
+  split <;> rfl
+
+/-- All defined flags agree with the masked SHR equation for every choice. -/
+theorem execInstrChoice_shrRI_flags (dst : GPR) (amt : BitVec 8)
+    (m : MachState) (undefinedOF : Bool) :
+    (execInstrChoice (.shrRI .b64 dst amt) m undefinedOF).flags =
+      shrFlags64 m.flags (m.regs dst) amt undefinedOF := by
+  simp only [execInstrChoice]
+  split
+  · rename_i h
+    have h0 : shrCount64 amt ≠ 0 := by omega
+    have h1 : shrCount64 amt ≠ 1 := by omega
+    simp [execInstr, shrFlags64, h0, h1]
+  · rename_i h
+    have hn : shrCount64 amt = 0 ∨ shrCount64 amt = 1 := by omega
+    rcases hn with hn | hn <;> simp [execInstr, shrFlags64, hn]
+
+/-- Every architectural choice preserves memory/SIMD and advances four bytes. -/
+theorem execInstrChoice_shrRI_frame (dst : GPR) (amt : BitVec 8)
+    (m : MachState) (undefinedOF : Bool) :
+    (execInstrChoice (.shrRI .b64 dst amt) m undefinedOF).mem = m.mem ∧
+    (execInstrChoice (.shrRI .b64 dst amt) m undefinedOF).xmms = m.xmms ∧
+    (execInstrChoice (.shrRI .b64 dst amt) m undefinedOF).rip = m.rip + 4 := by
+  simp only [execInstrChoice]
+  split <;> simp [execInstr, setReg, stepRip, encode, encInstr, osPrefix, le8]
+
 def eventOf : Instr → Event
   | .lockXaddMR _ _ _ _ => .tau
   | _                   => .tau
 
-/-! ## 9.  The opaque-machine bridge and the `step_emitted` keystone. -/
+/-! ## 9.  Resident bytes.
+
+    `BytesAt m a bs`: the bytes `bs` are in `m.mem` from address `a` on. `Trust.Model` defines
+    `x86Step` as: some `bs` resident at `rip` decodes completely to `i`, and the step is
+    `execInstr i m` with event `eventOf i`. The keystone `x86Step_decode` and the `LoweredStep`
+    builders over it are in `Model.EncoderStep`. -/
 
 def BytesAt (m : MachState) (a : BitVec 64) : List UInt8 → Prop
   | []       => True
   | bb :: bs => m.mem a = (BitVec.ofNat 8 bb.toNat) ∧ BytesAt m (a + 1) bs
-
-/-- THE BRIDGE.  The DEFINING property of the opaque `x86Step`, owned by Model.Machine. -/
-axiom x86Step_decode
-    (m : MachState) (i : Instr)
-    (hfetch : BytesAt m m.rip (encode i))
-    (hdec   : decode (encode i) = some (i, [])) :
-    x86Step m (eventOf i) (execInstr i m)
-
-theorem step_emitted
-    (m : MachState) (i : Instr)
-    (hfetch : BytesAt m m.rip (encode i))
-    (hrt    : decode (encode i) = some (i, [])) :
-    x86Step m (eventOf i) (execInstr i m) :=
-  x86Step_decode m i hfetch hrt
-
-theorem stepPlus_emitted
-    (m : MachState) (i : Instr)
-    (hfetch : BytesAt m m.rip (encode i))
-    (hrt    : decode (encode i) = some (i, [])) :
-    x86StepPlus m (eventOf i) (execInstr i m) :=
-  x86StepPlus.single (step_emitted m i hfetch hrt)
-
-/-! ## 10.  Building a `LoweredStep` for a single emitted instruction. -/
-
-def ResidentEverywhere (i : Instr) : Prop := ∀ m, BytesAt m m.rip (encode i)
-
-def singleInstrStep
-    (i : Instr)
-    (hres : ResidentEverywhere i)
-    (hrt  : decode (encode i) = some (i, [])) :
-    LoweredStep :=
-  { exec  := execInstr i
-  , event := eventOf i
-  , runs  := fun m => stepPlus_emitted m i (hres m) hrt }
-
-def singleInstrStep_regreg
-    (i : Instr)
-    (hform : ∃ sz dst src,
-        sz = OSize.b64 ∧
-        (i = .movRR sz dst src ∨ i = .addRR sz dst src ∨ i = .adcRR sz dst src ∨
-         i = .subRR sz dst src ∨ i = .sbbRR sz dst src ∨ i = .cmpRR sz dst src ∨
-         i = .testRR sz dst src ∨ i = .andRR sz dst src ∨ i = .orRR sz dst src ∨
-         i = .xorRR sz dst src))
-    (hres : ResidentEverywhere i) :
-    LoweredStep :=
-  singleInstrStep i hres (decode_encode_regreg i hform)
 
 /-! ## 11.  execInstr value lemmas. -/
 
@@ -633,19 +775,28 @@ def singleInstrStep_regreg
          else m.rip + BitVec.ofNat 64 (encode (.jcc cc rel)).length) := by
   simp only [execInstr, stepRip]
 
+/-- Full-width immediates replace exactly the destination register. -/
+@[simp] theorem execInstr_movabsRI_regs (dst q : GPR) (imm : BitVec 64) (m : MachState) :
+    (execInstr (.movabsRI dst imm) m).regs q = if q = dst then imm else m.regs q := by
+  rfl
+
+/-- Immediate moves preserve flags, memory and all SIMD registers. -/
+theorem execInstr_movabsRI_frame (dst : GPR) (imm : BitVec 64) (m : MachState) :
+    (execInstr (.movabsRI dst imm) m).flags = m.flags ∧
+    (execInstr (.movabsRI dst imm) m).mem = m.mem ∧
+    (execInstr (.movabsRI dst imm) m).xmms = m.xmms := by
+  exact ⟨rfl, rfl, rfl⟩
+
+@[simp] theorem execInstr_movabsRI_rip (dst : GPR) (imm : BitVec 64) (m : MachState) :
+    (execInstr (.movabsRI dst imm) m).rip = m.rip + 10 := by
+  simp [execInstr, stepRip, encode, encInstr, le64, le32]
+
 /-! ## 12.  Sanity facts. -/
 
 theorem encode_addRR_len (dst src : GPR) :
     (encode (.addRR OSize.b64 dst src)).length = 3 := by
   simp only [encode, encInstr, osPrefix, if_neg (by decide : ¬ (OSize.b64 = OSize.b16))]
   rfl
-
-theorem runs_of_resident
-    (i : Instr) (m : MachState)
-    (hres : BytesAt m m.rip (encode i))
-    (hrt  : decode (encode i) = some (i, [])) :
-    x86StepPlus m (eventOf i) (execInstr i m) :=
-  stepPlus_emitted m i hres hrt
 
 end Encoder
 end Model

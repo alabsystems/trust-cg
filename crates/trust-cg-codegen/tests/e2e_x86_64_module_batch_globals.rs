@@ -6,7 +6,8 @@
 // CT-BATCH STEP 4 compile+RUN proof (design
 // `docs/module-batching-design-2026-07-04.md`): merging GLOBAL-BEARING
 // per-function modules must preserve every global-address reference — a missed
-// or mis-remapped `0xFADE` stub is a silent WRONG DATA ADDRESS.
+// or mis-remapped global reference (a `GlobalAddr` id; formerly the `0xFADE`
+// stub) is a silent WRONG DATA ADDRESS.
 //
 // The scenario is exactly the collision batching creates:
 //
@@ -22,8 +23,8 @@
 // as index 1, so an unremapped merge would have B silently reading A's data
 // (b = 1111+777 = 1888 instead of 3333+777 = 4110) — a visible corruption the
 // run below would catch. The merge must produce ONE object where:
-//   * A's stub(0) resolves to A_PRIV, B's stub(0) to B_PRIV (indices shifted),
-//   * both stub(1)s resolve to the ONE deduplicated SHARED_TAB import,
+//   * A's global(0) resolves to A_PRIV, B's global(0) to B_PRIV (shifted),
+//   * both global(1)s resolve to the ONE deduplicated SHARED_TAB import,
 //   * A's call to B is an intra-object local resolution,
 // and the linked binary must print exactly what clang's reference computes.
 //
@@ -43,7 +44,6 @@ use std::process::Command;
 
 use trust_cg_codegen::Target;
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
-use trust_cg_codegen::global_stub::encode_global_addr_stub;
 use trust_cg_codegen::module_merge::merge_modules;
 
 use trust_ir::{
@@ -121,19 +121,38 @@ fn link_and_run(dir: &Path, tag: &str, objects: &[&Path], driver: &Path) -> (Str
 // trust_ir builders (the bridge's per-function global-bearing module shape)
 // =============================================================================
 
-/// Private immutable byte-data global holding one little-endian i64.
+/// Every input carries the host x86-64 target: module A alone has an FFI
+/// boundary (its bodyless declaration of `batch_read_b`), which trust-ir
+/// refuses without a pinned target (`TargetInfoRequired`; WS7.3), and the
+/// merge requires its inputs to agree on `target_info`.
+fn pin_target(m: &mut TrustIrModule) {
+    m.target_info = Some(trust_ir::TargetInfo {
+        triple: if cfg!(target_os = "macos") {
+            "x86_64-apple-darwin"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
+        .into(),
+        pointer_size: 8,
+        endianness: trust_ir::Endianness::Little,
+        abi: None,
+        struct_passing: trust_ir::StructPassingPolicy::NativeC,
+    });
+}
+
+/// Private immutable data global holding one little-endian i64. WS7.3: typed
+/// `i64` with its integer initializer (trust-ir refuses a byte aggregate at
+/// `ptr` as `ConstTypeMismatch`, and every ingestion entry refuses what the
+/// validator refuses).
 fn private_data_global(name: &str, value: i64) -> Global {
     Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: name.to_string(),
-        ty: Ty::Ptr,
+        ty: Ty::I64,
         mutable: false,
-        initializer: Some(Constant::Aggregate(
-            value
-                .to_le_bytes()
-                .iter()
-                .map(|&b| Constant::Int(i128::from(b)))
-                .collect(),
-        )),
+        initializer: Some(Constant::Int(i128::from(value))),
         linkage: Linkage::Internal,
         tls: None,
         align: None,
@@ -144,6 +163,9 @@ fn private_data_global(name: &str, value: i64) -> Global {
 /// C driver DEFINES this symbol in both link modes.
 fn shared_import_global() -> Global {
     Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "SHARED_TAB".to_string(),
         ty: Ty::Ptr,
         mutable: true,
@@ -154,13 +176,18 @@ fn shared_import_global() -> Global {
     }
 }
 
-/// `v(next) = load_i64(&globals[stub_idx])` via the 0xFADE stub the bridge
-/// emits: `Const I64 stub` then `Load I64` using the address value directly.
-fn push_global_load(body: &mut Vec<InstrNode>, stub_idx: u64, addr_v: u32, out_v: u32) {
+/// `v(next) = load_i64(&globals[global])` through the canonical `GlobalAddr`
+/// reference. (The legacy `0xFADE` integer stub — `Const I64 stub` loaded as
+/// an address — is not valid trust-ir: a load through an `i64` is
+/// `OperandNotPointer`, and since WS7.3 every ingestion entry refuses what the
+/// validator refuses. The bridge spells global references `GlobalAddr` or
+/// `SymbolAddr`; the stub re-pack itself stays unit-tested in
+/// `module_merge`.) The merge remaps a `GlobalAddr` id exactly as it re-packed
+/// a stub index, so the collision scenario is unchanged.
+fn push_global_load(body: &mut Vec<InstrNode>, global: u32, addr_v: u32, out_v: u32) {
     body.push(
-        InstrNode::new(Inst::Const {
-            ty: Ty::I64,
-            value: Constant::Int(encode_global_addr_stub(stub_idx, 0).expect("valid stub")),
+        InstrNode::new(Inst::GlobalAddr {
+            global: trust_ir::value::GlobalId::new(global),
         })
         .with_result(ValueId::new(addr_v)),
     );
@@ -180,11 +207,15 @@ fn push_global_load(body: &mut Vec<InstrNode>, stub_idx: u64, addr_v: u32, out_v
 /// exact per-function shape for a sibling call.
 fn build_module_a() -> TrustIrModule {
     let mut m = TrustIrModule::new("batch_a_mod");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    pin_target(&mut m);
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     m.globals
         .push(private_data_global("batch_read_a.const.alloc1", 1111)); // index 0
     m.globals.push(shared_import_global()); // index 1
@@ -227,11 +258,13 @@ fn build_module_a() -> TrustIrModule {
         params: vec![],
         body,
     }];
-    m.add_function(fa);
+    m.try_add_function(fa)
+        .expect("Module::try_add_function: test fixture");
 
     // Bodyless extern declaration of the sibling.
     let fb_decl = TrustIrFunction::new(FuncId::new(1), "batch_read_b", ft, BlockId::new(0));
-    m.add_function(fb_decl);
+    m.try_add_function(fb_decl)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -239,11 +272,15 @@ fn build_module_a() -> TrustIrModule {
 /// data is ALSO local global index 0 — the index collision under merge.
 fn build_module_b() -> TrustIrModule {
     let mut m = TrustIrModule::new("batch_b_mod");
-    let ft = m.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    pin_target(&mut m);
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     m.globals
         .push(private_data_global("batch_read_b.const.alloc1", 3333)); // index 0
     m.globals.push(shared_import_global()); // index 1
@@ -270,7 +307,8 @@ fn build_module_b() -> TrustIrModule {
         params: vec![],
         body,
     }];
-    m.add_function(fb);
+    m.try_add_function(fb)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -305,6 +343,7 @@ fn compile(
         emit_proofs,
         ..CompilerConfig::default()
     })
+    .with_codegen_license(permit_unlicensed())
     .compile(module)
     .expect("x86-64 compile should succeed")
 }
@@ -323,6 +362,7 @@ fn assert_relocation_proof_promotion_accepted(module: &TrustIrModule) {
         emit_proofs: true,
         ..CompilerConfig::default()
     })
+    .with_codegen_license(permit_unlicensed())
     .compile(module)
     .expect("proved x86-64 object relocation inventory must promote");
     assert!(
@@ -338,7 +378,7 @@ fn assert_relocation_proof_promotion_accepted(module: &TrustIrModule) {
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn step4_merged_global_bearing_modules_run_with_the_right_data() {
-    // ---- 1. The merge itself: one module, remapped stubs, deduped import.
+    // ---- 1. The merge itself: one module, remapped global ids, deduped import.
     let a = build_module_a();
     let b = build_module_b();
     let merged =
@@ -432,7 +472,7 @@ fn step4_merged_global_bearing_modules_run_with_the_right_data() {
     );
     assert_eq!(
         merged_out, clang_out,
-        "MERGED output diverges — a stub resolved to the WRONG global"
+        "MERGED output diverges — a global reference resolved to the WRONG global"
     );
     assert_eq!(
         merged_out, sep_out,
@@ -443,4 +483,13 @@ fn step4_merged_global_bearing_modules_run_with_the_right_data() {
     assert_eq!(clang_exit, 0);
 
     cleanup(&dir);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

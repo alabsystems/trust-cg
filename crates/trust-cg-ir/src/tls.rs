@@ -5,16 +5,15 @@
 //! TLS access models.
 //!
 //! Identifies how a thread-local storage reference is resolved to a
-//! concrete address. See `designs/2026-04-18-aarch64-tls-local-exec.md`
-//! for the background; issues #370 (MRS primitive, landed) and #383
+//! concrete address. See issues #370 (MRS primitive, landed) and #383
 //! (end-to-end wiring) for scope.
 //!
 //! | Model | Sequence | Runtime cost | JIT? |
 //! |-------|----------|--------------|------|
 //! | LocalExec | MRS + ADD [+ ADD] | no call | yes |
 //! | InitialExec | MRS + LDR (GOT) | GOT fixup | no — needs loader |
-//! | GeneralDynamic | call `__tls_get_addr` | TLSDESC/TLSGD | no |
-//! | LocalDynamic | call `__tls_get_addr` with module id | TLSDESC/TLSLD | no |
+//! | GeneralDynamic | TLSDESC resolver call (ELF) | TLSDESC | no |
+//! | LocalDynamic | same TLSDESC sequence as GeneralDynamic | TLSDESC | no |
 //! | Tlv | call `_tlv_bootstrap` (Darwin) | dyld callback | Darwin AOT only |
 
 use serde::{Deserialize, Serialize};
@@ -23,12 +22,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// The JIT currently only supports `LocalExec` — it owns TPIDR_EL0 on the
 /// target thread, allocates the TLS block, and resolves offsets at codegen
-/// time. AOT ELF supports `LocalExec` (linker-patched TPREL add pair) and
-/// `InitialExec` (GOT-indirect TPREL via the `R_AARCH64_TLSIE_*` pair); AOT
-/// Mach-O uses `Tlv`. `GeneralDynamic`/`LocalDynamic` stay fail-closed by
-/// VERDICT — they resolve dlopen'd-module TLS via a `__tls_get_addr`/TLSDESC
-/// runtime call, and trust-cg emits main-executable objects only (no
-/// dylib/dlopen production lane exists; see `isel.rs::select_tls_ref`).
+/// time. AOT ELF supports `LocalExec` (linker-patched TPREL add pair),
+/// `InitialExec` (GOT-indirect TPREL via the `R_AARCH64_TLSIE_*` pair) and
+/// `GeneralDynamic` through a TLS descriptor (the `R_AARCH64_TLSDESC_*`
+/// sequence; `LocalDynamic` reuses it). The ELF relocation model selects among
+/// them; AOT Mach-O uses `Tlv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TlsModel {
     /// Local-exec — `MRS Xd, TPIDR_EL0` + `ADD Xd, Xd, #tprel_hi12, LSL #12`
@@ -37,9 +35,11 @@ pub enum TlsModel {
     LocalExec,
     /// Initial-exec — `MRS` + GOT load. Requires loader.
     InitialExec,
-    /// General-dynamic — `__tls_get_addr` call. Requires loader.
+    /// General-dynamic — TLS-descriptor resolver call (ELF TLSDESC).
+    /// Requires loader.
     GeneralDynamic,
-    /// Local-dynamic — `__tls_get_addr(module_id, offset)`. Requires loader.
+    /// Local-dynamic — lowered exactly like `GeneralDynamic` (per-symbol
+    /// TLSDESC). Requires loader.
     LocalDynamic,
     /// Darwin TLV descriptor — `ARM64_RELOC_TLVP_LOAD_PAGE21` + LDR TLVP.
     /// Requires `_tlv_bootstrap` from dyld. Only reachable on Mach-O AOT.

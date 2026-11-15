@@ -1,5 +1,17 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+// Compiled only on an aarch64-apple-darwin host: another host builds this
+// target with no test in it, never one that passes without running (L06-P10).
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/darwin_native_prerequisites.rs"]
+mod darwin_native;
+#[path = "support/emitted_objects.rs"]
+mod emitted_objects_support;
+#[path = "support/positive_evidence.rs"]
+mod positive_evidence;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // E2E (aarch64-apple-darwin): a REAL `#[thread_local]` static, read and written
 // through the rustc bridge, links and runs with correct per-thread isolation.
@@ -20,14 +32,13 @@ mod target_dir_support;
 // variable's per-thread address). Before this, the bridge fail-closed every
 // `Rvalue::ThreadLocalRef`, so NO real Rust thread-local could compile.
 //
-// CROSS-OBJECT DESCRIPTOR MODEL. The bridge emits one object per `MonoItem`, so
-// the `#[thread_local] static X` (its `MonoItem::Static`) and the functions that
-// access it land in SEPARATE objects. A `#[thread_local]` has ONE program-wide
-// `tlv_descriptor`: it is DEFINED once (External `_X` + `_X$tlv$init` template +
-// `__tlv_bootstrap` import, in the static's own object) and IMPORTED (undefined
-// external `_X`) by every accessor object, whose `__text` TLVP relocation the
-// linker resolves to the single canonical descriptor. (Emitting a descriptor per
-// object would be a duplicate-symbol link error / divergent per-thread storage.)
+// CROSS-CRATE DESCRIPTOR MODEL. Compile the descriptor and its accessors as
+// separate Rust crates, so this checks cross-object TLS linkage independently
+// of how the compiler groups MonoItems into CGUs or combines their objects.
+// The descriptor crate DEFINES one External `_X` plus `_X$tlv$init` template
+// and `__tlv_bootstrap` import. The accessor crate IMPORTS `_X`; its TLVP
+// relocations must resolve to that single canonical descriptor. A duplicate
+// descriptor would fail linking or give the threads divergent storage.
 //
 // HOW CORRECTNESS IS OBSERVED. A C driver reads `X` in `main`, mutates `main`'s
 // copy, spawns a worker thread that mutates the worker's OWN copy, joins, and
@@ -36,87 +47,22 @@ mod target_dir_support;
 // by the worker (true per-thread isolation). The binary RUNS under `timeout 10`;
 // a botched TLV descriptor / BLR would hang or crash.
 //
-// PROOF GATE. Compiled with `TCG_NO_PROOF_CERTS=1`: the TLVP text relocations
-// and per-instruction mappings are proven, but the final Mach-O object also
-// carries two `ARM64_RELOC_UNSIGNED` descriptor rows per TLS definition plus
-// compact-unwind rows. The complete production-surface inventory exposes those
-// still-unproven object-side rows, so this lane pins semantics without claiming
-// certification or exact-object binding.
+// PROOFS-OFF DIAGNOSTIC: the bridge compile passes the backend's
+// `no-proof-certs` knob (`-Ztrust-ir-cg-args=no-proof-certs`; trustc refuses
+// the former `TCG_NO_PROOF_CERTS=1` environment spelling). This lane pins
+// semantics without claiming certification or exact-object binding. With
+// certificates on, the original combined fixture was refused at proof promotion
+// (`[TCG-PROOF-465]`,
+// measured 2026-09-29 on Trust 9192: the frame's `StpPreIndex` is statistical
+// sampling; the proof wall of ledger L07-P2).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TARGET: &str = "aarch64-apple-darwin";
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run tls test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
-}
-
-fn aarch64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
-}
-
-fn host_is_aarch64_macos() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
-fn has_cc() -> bool {
-    Command::new("cc")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    backend_artifact_support::current_test_backend()
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -126,7 +72,7 @@ fn workdir(stem: &str) -> PathBuf {
     dir
 }
 
-/// The thread-local crate:
+/// The descriptor and accessor crates jointly implement:
 /// ```rust
 /// #[thread_local] pub static mut X: i32 = 0xABCD;
 /// extern "C" fn read_x()       -> i32 { X }            // TLS read
@@ -134,23 +80,34 @@ fn workdir(stem: &str) -> PathBuf {
 /// ```
 /// `read_x` exercises `Rvalue::ThreadLocalRef` + a deref load; `bump_x` adds a
 /// deref STORE through the same TLV address (the write half of the access path).
-const TLS_CRATE: &str = "\
-#![crate_type = \"staticlib\"]\n\
-#![feature(thread_local)]\n\
-\n\
-#[no_mangle]\n\
-#[thread_local]\n\
-pub static mut X: i32 = 0xABCD;\n\
-\n\
-#[no_mangle]\n\
-pub extern \"C\" fn read_x() -> i32 {\n\
-    unsafe { X }\n\
-}\n\
-\n\
-#[no_mangle]\n\
-pub extern \"C\" fn bump_x(delta: i32) -> i32 {\n\
-    unsafe { X += delta; X }\n\
-}\n";
+const TLS_DESCRIPTOR_CRATE: &str = r#"
+#![crate_type = "staticlib"]
+#![feature(thread_local)]
+
+#[no_mangle]
+#[thread_local]
+pub static mut X: i32 = 0xABCD;
+"#;
+
+const TLS_ACCESSOR_CRATE: &str = r#"
+#![crate_type = "staticlib"]
+#![feature(thread_local)]
+
+unsafe extern "C" {
+    #[thread_local]
+    static mut X: i32;
+}
+
+#[no_mangle]
+pub extern "C" fn read_x() -> i32 {
+    unsafe { X }
+}
+
+#[no_mangle]
+pub extern "C" fn bump_x(delta: i32) -> i32 {
+    unsafe { X += delta; X }
+}
+"#;
 
 /// C driver: reads `X` in `main`, mutates main's copy, spawns a worker that
 /// mutates the WORKER's own copy, joins, and re-reads main's copy. Exit 0 iff the
@@ -189,60 +146,57 @@ int main(void) {
 
 #[test]
 fn thread_local_static_reads_writes_per_thread_isolated_aarch64() {
-    if !host_is_aarch64_macos() {
-        eprintln!("skipping: requires an aarch64-apple-darwin host");
-        return;
-    }
-    if !aarch64_std_available() {
-        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
-        return;
-    }
-    if !has_cc() {
-        eprintln!("skipping: cc not available");
-        return;
-    }
+    // The backend knob option, Darwin rust-std and `cc` are required here; a
+    // missing one fails the test by name instead of returning early.
+    darwin_native::require("tls_thread_local_aarch64", &["cc"]);
 
     let dylib = ensure_dylib_built();
     let dir = workdir("x");
 
-    // 1. Compile the thread-local crate THROUGH THE BRIDGE to objects.
-    let src_path = dir.join("tls.rs");
-    std::fs::write(&src_path, TLS_CRATE).expect("write source");
+    // Compile both sides of the TLS import through the same bridge. Separate
+    // output roots prevent a combined single-CGU object from hiding the ABI.
     let backend_arg = {
         let mut s = std::ffi::OsString::from("-Zcodegen-backend=");
         s.push(&dylib);
         s
     };
-    let obj_out = dir.join("tls");
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "staticlib"])
-        .arg(&backend_arg)
-        .env("TCG_NO_PROOF_CERTS", "1")
-        // One CGU keeps the bridge's per-MonoItem objects predictable; the TLS
-        // descriptor is still its own object (a `MonoItem::Static`).
-        .args(["-Ccodegen-units=1"])
-        // -O1 gives the clean `_p = &/*tls*/ X; _r = *_p` MIR shape (the -O0
-        // alignment-debug-assert sequence around the TLS ref is unrelated noise).
-        .args(["--target", TARGET, "-Cpanic=abort", "-Copt-level=1"])
-        .arg("--emit=obj")
-        .arg("-o")
-        .arg(&obj_out)
-        .arg(&src_path)
-        .output()
-        .expect("failed to spawn rustc via rustup");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "bridge failed to compile the thread-local crate. stderr: <<<{stderr}>>>"
-    );
-
-    // Collect every emitted object.
-    let all_objs: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("read workdir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "o"))
-        .collect();
+    let mut all_objs = Vec::new();
+    let mut stderr = String::new();
+    for (crate_name, source) in [
+        ("tls_descriptor", TLS_DESCRIPTOR_CRATE),
+        ("tls_accessors", TLS_ACCESSOR_CRATE),
+    ] {
+        let out = dir.join(crate_name);
+        std::fs::create_dir_all(&out).expect("create crate output directory");
+        let src_path = out.join(format!("{crate_name}.rs"));
+        std::fs::write(&src_path, source).expect("write source");
+        let obj_out = out.join(crate_name);
+        let output = toolchain_support::rustc_command()
+            .args(["--crate-type", "staticlib", "--crate-name", crate_name])
+            .arg(&backend_arg)
+            .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]))
+            .args(["-Ccodegen-units=1"])
+            // O1 keeps the TLS load/store MIR free of unrelated O0 alignment
+            // debug assertions, as in the original single-crate fixture.
+            .args(["--target", TARGET, "-Cpanic=abort", "-Copt-level=1"])
+            .arg("--emit=obj")
+            .arg("-o")
+            .arg(&obj_out)
+            .arg(&src_path)
+            .output()
+            .expect("failed to spawn trustc");
+        let crate_stderr = String::from_utf8_lossy(&output.stderr);
+        stderr.push_str(&format!("{crate_name}:\n{crate_stderr}\n"));
+        assert!(
+            output.status.success(),
+            "bridge failed to compile {crate_name}. stderr: <<<{crate_stderr}>>>"
+        );
+        all_objs.extend(
+            emitted_objects_support::emitted_objects(&obj_out).expect("read emitted objects"),
+        );
+    }
+    all_objs.sort();
+    all_objs.dedup();
     assert!(
         !all_objs.is_empty(),
         "bridge produced no object file. stderr: <<<{stderr}>>>"
@@ -349,10 +303,10 @@ fn thread_local_static_reads_writes_per_thread_isolated_aarch64() {
         String::from_utf8_lossy(&link.stderr)
     );
 
-    // 3. RUN natively on aarch64 under a watchdog: exit 0 iff the TLS reads/writes
-    //    are correct AND per-thread isolated.
+    // 3. RUN natively on aarch64 under an in-process watchdog: exit 0 iff the TLS
+    //    reads/writes are correct AND per-thread isolated.
     //
-    //    RETRY-ON-WATCHDOG-KILL (124): a freshly `cc`-linked Mach-O carrying a
+    //    RETRY-ON-WATCHDOG-KILL: a freshly `cc`-linked Mach-O carrying a
     //    Darwin TLV descriptor can stall in dyld's first-execution `__tlv_bootstrap`
     //    processing under heavy concurrent system load (e.g. parallel `rustc`
     //    compiles), tripping the watchdog BEFORE `main` runs (observed: empty
@@ -362,25 +316,28 @@ fn thread_local_static_reads_writes_per_thread_isolated_aarch64() {
     //    lowering). A run that reaches `main` is value-correct EVERY time (<0.2s),
     //    so a short per-attempt watchdog plus generous retries rides out a stall
     //    without ever masking an error: a WRONG value fails the value assertions
-    //    below, and a genuine in-code deadlock would 124 on every attempt and still
-    //    fail. Only the environmental cold-start stall is tolerated.
+    //    below, and a genuine in-code deadlock would be killed on every attempt and
+    //    still fail. Only the environmental cold-start stall is tolerated.
     let run_once = || {
-        Command::new("timeout")
-            .args(["6"])
-            .arg(&bin)
-            .output()
-            .or_else(|_| Command::new(&bin).output())
-            .expect("run linked binary")
+        darwin_native::run_with_deadline(&mut Command::new(&bin), std::time::Duration::from_secs(6))
     };
     let mut run = run_once();
     for _ in 0..30 {
-        if run.status.code() != Some(124) {
+        if run.is_ok() {
             break;
         }
         // Small backoff so a load spike has time to ease between attempts.
         std::thread::sleep(std::time::Duration::from_millis(200));
         run = run_once();
     }
+    let run = run.unwrap_or_else(|killed| {
+        panic!(
+            "tls driver was killed at the 6 s deadline on all 31 attempts, more than \
+             the cold-start stall the retries tolerate. stdout: {:?} stderr: {:?}",
+            String::from_utf8_lossy(&killed.stdout),
+            String::from_utf8_lossy(&killed.stderr)
+        )
+    });
     let stdout = String::from_utf8_lossy(&run.stdout);
     let code = run.status.code().expect("process terminated by signal");
     assert_eq!(
@@ -396,4 +353,12 @@ fn thread_local_static_reads_writes_per_thread_isolated_aarch64() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::Off,
+    );
 }
+
+// Linux ELF twin: `tls_thread_local_linux.rs` combines the descriptor and accessor
+// definitions in one crate and runs
+// this `DRIVER` for aarch64-unknown-linux-gnu; keep the two byte-identical.

@@ -3,10 +3,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
-// Reference: designs/2026-04-13-unified-solver-architecture.md (Phase 1)
-//
-// Implements the proof-guided target analysis pass from the unified solver
-// architecture. For each computation subgraph, this pass examines trust_ir proof
+// Implements the proof-guided target analysis pass. For each computation subgraph, this pass examines trust_ir proof
 // annotations to determine which compute targets (CPU scalar, SIMD, GPU,
 // Neural Engine) are legal. The key insight: trust_ir proofs PRUNE the search
 // space. Most computations will be CPU-only because they lack the proofs
@@ -1035,7 +1032,6 @@ mod tests {
 
     #[test]
     fn test_dot_product_example() {
-        // From designs/2026-04-13-unified-solver-architecture.md:
         // fn dot_product(a: &[f64; 1000], b: &[f64; 1000]) -> f64
         // Proofs: Pure, InBounds, ValidBorrow(a, b), Associative(+), Commutative(+)
         // Data: 1000 x f64 = 8000 bytes > 4KB GPU threshold

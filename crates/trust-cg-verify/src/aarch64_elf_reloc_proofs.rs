@@ -169,7 +169,9 @@ pub fn proof_call26_wrong_pcrel_refutes() -> ProofObligation {
 /// Theorem: forall S, A, P : BV64 . (P + ((S + A) - P)) == (S + A)
 ///
 /// The linker writes `S + A - P` into the 32-bit word (psABI overflow check:
-/// `-2^31 <= X < 2^32`); a consumer (EH tables, relative jump tables) adds
+/// `-2^31 <= X < 2^32` before aaelf64 2026Q2, `-2^31 <= X < 2^31` from
+/// 2026Q2; this identity does not model the 32-bit field, so the range is
+/// the linker's check); a consumer (EH tables, relative jump tables) adds
 /// back the word's own address `P`. Same ring identity as the branch rows —
 /// the field is data, not an instruction immediate, so there is no field-end
 /// bias to bridge (unlike x86 `PC32`'s baked `-4`).
@@ -494,6 +496,131 @@ pub fn proof_got_pair_wrong_pcrel_refutes() -> ProofObligation {
 }
 
 // ===========================================================================
+// 6. R_AARCH64_LDST{8,16,32,64,128}_ABS_LO12_NC — fused ADRP + LDR/STR
+// ===========================================================================
+
+/// The LDST field keeps bits [11:log2(size)] of the target: the linker writes
+/// `((S + A) & 0xFFF) >> log2(size)` and the CPU scales it back.
+fn mask_lo12_scaled(size: u64) -> SmtExpr {
+    SmtExpr::bv_const(0xFFF & !(size - 1), W)
+}
+
+fn ldst_lo12_name(size: u64) -> &'static str {
+    match size {
+        1 => "ELF AArch64: R_AARCH64_LDST8_ABS_LO12_NC ADRP+LDR/STR == S+A (byte access)",
+        2 => "ELF AArch64: R_AARCH64_LDST16_ABS_LO12_NC ADRP+LDR/STR == S+A (2-aligned access)",
+        4 => "ELF AArch64: R_AARCH64_LDST32_ABS_LO12_NC ADRP+LDR/STR == S+A (4-aligned access)",
+        8 => "ELF AArch64: R_AARCH64_LDST64_ABS_LO12_NC ADRP+LDR/STR == S+A (8-aligned access)",
+        16 => "ELF AArch64: R_AARCH64_LDST128_ABS_LO12_NC ADRP+LDR/STR == S+A (16-aligned access)",
+        _ => unreachable!("LDST access sizes are 1, 2, 4, 8 and 16"),
+    }
+}
+
+/// Proof: a fused `ADRP Xp, sym; LDR/STR Rt, [Xp, #:lo12:sym]` pair with an
+/// `R_AARCH64_LDST<8*size>_ABS_LO12_NC` relocation addresses exactly `S + A`
+/// when `S + A` is a multiple of the access size.
+///
+/// Theorem: forall S, A : BV64 . ((S + A) & (size - 1)) == 0 =>
+///   (page(S + A) + ((S + A) & (0xFFF & !(size - 1)))) == (S + A)
+///
+/// The precondition is the alignment the emitter establishes before fusing
+/// (a non-weak definition in the same object, placed at a declared
+/// alignment >= size, and a zero offset). For the byte form the mask is the
+/// whole low 12 bits and the precondition is vacuous. Dropping the
+/// precondition refutes for every larger size
+/// ([`aarch64_elf_ldst_lo12_negative_controls`]).
+pub fn proof_ldst_abs_lo12_pair(size: u64) -> ProofObligation {
+    let s = SmtExpr::var("S", W);
+    let a = SmtExpr::var("A", W);
+
+    let target = s.bvadd(a);
+    let aligned = target
+        .clone()
+        .bvand(SmtExpr::bv_const(size - 1, W))
+        .eq_expr(SmtExpr::bv_const(0, W));
+    let intended = target.clone();
+    let reconstructed = page(target.clone()).bvadd(target.bvand(mask_lo12_scaled(size)));
+
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: ldst_lo12_name(size).to_string(),
+        trust_ir_expr: intended,
+        aarch64_expr: reconstructed,
+        inputs: vec![("S".to_string(), W), ("A".to_string(), W)],
+        preconditions: if size == 1 { vec![] } else { vec![aligned] },
+        fp_inputs: vec![],
+        category: Some(TransvalCheckKind::InstructionLowering),
+    }
+}
+
+/// Negative control: an LDST form of `size > 1` WITHOUT the alignment
+/// precondition loses the low `log2(size)` bits of a misaligned target.
+/// REFUTABLE by design.
+pub fn proof_ldst_abs_lo12_without_alignment_refutes(size: u64) -> ProofObligation {
+    let s = SmtExpr::var("S", W);
+    let a = SmtExpr::var("A", W);
+
+    let target = s.bvadd(a);
+    let intended = target.clone();
+    let reconstructed = page(target.clone()).bvadd(target.bvand(mask_lo12_scaled(size)));
+
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: format!(
+            "ELF AArch64: LDST{}_ABS_LO12_NC without {size}-byte alignment must REFUTE",
+            size * 8
+        ),
+        trust_ir_expr: intended,
+        aarch64_expr: reconstructed,
+        inputs: vec![("S".to_string(), W), ("A".to_string(), W)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(TransvalCheckKind::InstructionLowering),
+    }
+}
+
+/// Negative control for the byte form: scaling its field as a halfword field
+/// drops address bit 0. REFUTABLE by design.
+pub fn proof_ldst8_abs_lo12_wrong_scale_refutes() -> ProofObligation {
+    let s = SmtExpr::var("S", W);
+    let a = SmtExpr::var("A", W);
+
+    let target = s.bvadd(a);
+    let intended = target.clone();
+    let reconstructed = page(target.clone()).bvadd(target.bvand(mask_lo12_scaled(2)));
+
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: "ELF AArch64: LDST8_ABS_LO12_NC scaled as a halfword field must REFUTE".to_string(),
+        trust_ir_expr: intended,
+        aarch64_expr: reconstructed,
+        inputs: vec![("S".to_string(), W), ("A".to_string(), W)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(TransvalCheckKind::InstructionLowering),
+    }
+}
+
+/// The five LDST lo12 positives (access sizes 1, 2, 4, 8, 16), registered in
+/// the proof database next to [`aarch64_elf_relocation_proofs`].
+pub fn aarch64_elf_ldst_lo12_proofs() -> Vec<ProofObligation> {
+    [1, 2, 4, 8, 16]
+        .into_iter()
+        .map(proof_ldst_abs_lo12_pair)
+        .collect()
+}
+
+/// Negative controls for the LDST lo12 rows (not registered; each refutes).
+pub fn aarch64_elf_ldst_lo12_negative_controls() -> Vec<ProofObligation> {
+    let mut controls: Vec<ProofObligation> = [2, 4, 8, 16]
+        .into_iter()
+        .map(proof_ldst_abs_lo12_without_alignment_refutes)
+        .collect();
+    controls.push(proof_ldst8_abs_lo12_wrong_scale_refutes());
+    controls
+}
+
+// ===========================================================================
 // Registry
 // ===========================================================================
 
@@ -601,6 +728,53 @@ mod tests {
                 p.name
             );
         }
+    }
+
+    #[test]
+    fn ldst_lo12_proofs_verify_and_their_controls_refute() {
+        let positives = aarch64_elf_ldst_lo12_proofs();
+        let controls = aarch64_elf_ldst_lo12_negative_controls();
+        assert_eq!(positives.len(), 5);
+        assert_eq!(controls.len(), 5);
+        for obligation in &positives {
+            assert!(
+                matches!(verify_by_evaluation(obligation), VerificationResult::Valid),
+                "LDST lo12 proof '{}' must verify",
+                obligation.name
+            );
+            assert!(obligation.is_genuinely_proven(), "{}", obligation.name);
+            assert!(obligation.name.starts_with("ELF AArch64:"));
+        }
+        for obligation in &controls {
+            assert!(
+                matches!(
+                    verify_by_evaluation(obligation),
+                    VerificationResult::Invalid { .. }
+                ),
+                "LDST lo12 negative control '{}' must refute",
+                obligation.name
+            );
+        }
+        // Only the byte form is unconditional; every wider form needs its
+        // alignment precondition.
+        let unconditional: Vec<usize> = positives
+            .iter()
+            .enumerate()
+            .filter(|(_, obligation)| obligation.preconditions.is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(unconditional, [0]);
+        let base = aarch64_elf_relocation_proofs();
+        let mut names: Vec<&str> = positives
+            .iter()
+            .chain(controls.iter())
+            .chain(base.iter())
+            .map(|obligation| obligation.name.as_str())
+            .collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate obligation names");
     }
 
     /// Registry shape pins: 8 positives (one per emitted kind) and 6 negative

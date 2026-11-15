@@ -1,4 +1,9 @@
-#![cfg(all(target_arch = "aarch64", target_os = "macos"))]
+// Cross-thread execution of a JIT function pointer published on another
+// thread. On Apple Silicon the caller thread must first enter MAP_JIT execute
+// mode (`ensure_jit_execute_mode`); on Linux that call is a no-op and the
+// control is plain cross-thread execution. Required-floor target: registered
+// in scripts/check_linux_aarch64.py.
+#![cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,13 +32,14 @@ fn build_smoke_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn compile_smoke_module() -> trust_cg_codegen::ExecutableBuffer {
     let mut config = CompilerConfig::jit_fast(Target::Aarch64);
     config.opt_level = OptLevel::O3;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&build_smoke_module(), &HashMap::new())
         .expect("compile smoke module")
         .buffer
@@ -84,4 +90,13 @@ fn jit_function_pointer_survives_cross_thread_execute_mode() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

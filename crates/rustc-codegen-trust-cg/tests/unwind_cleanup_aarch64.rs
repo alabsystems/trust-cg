@@ -1,5 +1,15 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+// Compiled only on an aarch64-apple-darwin host: another host builds this
+// target with no test in it, never one that passes without running (L06-P10).
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/darwin_native_prerequisites.rs"]
+mod darwin_native;
+#[path = "support/positive_evidence.rs"]
+mod positive_evidence;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // E2E (aarch64-apple-darwin): the bridge lowers rustc MIR `UnwindAction::Cleanup`
 // edges to trust-ir exception handling — `Inst::Invoke` (a call that may unwind),
@@ -18,8 +28,10 @@ mod target_dir_support;
 // compiled THROUGH THE BRIDGE under `-Cpanic=unwind`. Its MIR carries a genuine
 // `UnwindAction::Cleanup(bb)` edge on the throwing call (asserted from the MIR
 // dump, NOT from `panic=abort`), a `(cleanup)` block that drops the `Box` and
-// re-raises (`resume`). The bridge's EH lowering (gated behind
-// `TCG_ENABLE_UNWIND`, see `seed_eh_landing_pads`) turns that into:
+// re-raises (`resume`). The bridge's EH lowering (default ON, see
+// `seed_eh_landing_pads`; the live control is the `disable-unwind` OPT-OUT knob,
+// and the `TCG_ENABLE_UNWIND` name this line used to give was already dead) turns
+// that into:
 //
 //   * `Inst::Invoke ay_may_unwind -> normal, unwind=cleanup-pad`   (a `bl` whose
 //     LSDA call-site entry names the landing pad),
@@ -54,80 +66,32 @@ mod target_dir_support;
 // (e.g. C++ `catch(...)`) frame tries to catch one. That is correct Rust ABI
 // behavior, not a bridge defect; the catch driver here is therefore Rust.
 //
-// The DEFAULT path is asserted too: with `TCG_ENABLE_UNWIND` unset the same
+// The OPT-OUT path is asserted too: with the `disable-unwind` knob set the same
 // crate fails closed with the precise `TerminatorKind::Call with cleanup unwind`
 // diagnostic (never miscompiles, never silently aborts).
 //
-// PROOF GATE: bridge invocations set `TCG_NO_PROOF_CERTS=1`. EH objects emit
-// LSDA/personality/compact-unwind/DWARF relocation sidecars whose proof inventory
-// is intentionally rejected as incomplete; this lane validates their structure
-// and native behavior without promoting the object as certified.
+// PROOFS-OFF DIAGNOSTIC: bridge invocations pass the `no-proof-certs` knob.
+// Certified promotion refuses every object that carries exception tables:
+// LSDA, personality and CFI have no proof obligation (`[TCG-EH-UNPROVED]`,
+// which the bridge reports as `[TCG-PROOF-465]`; ledger L03-P14, LIMITATIONS
+// "No certified (proof-required) object contains exception tables"). This lane
+// validates their structure and native behavior without promoting the object
+// as certified. The emitted object does pass the exception-table obligations
+// of L03-P14 (testing grade, decided at emission); both compiles below trace
+// the gate's report (`eh-obligation-trace`) and require it.
+//
+// LINUX TWIN: `unwind_cleanup_linux.rs` runs `UNWIND_CRATE` and `PANICKER_CRATE`
+// byte-identically (plus user-`Drop` and nested-frame extensions) on
+// aarch64-unknown-linux-gnu, and is a required target of
+// `scripts/check_linux_aarch64_bridge.py`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TARGET: &str = "aarch64-apple-darwin";
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    for cand in [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ] {
-        if cand.exists() {
-            return cand;
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run unwind test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
-}
-
-fn host_is_aarch64_macos() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
-
-fn aarch64_std_available() -> bool {
-    Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == TARGET)
-        })
-        .unwrap_or(false)
+    backend_artifact_support::current_test_backend()
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -174,13 +138,18 @@ fn has_gcc_except_tab(obj: &Path) -> bool {
     .contains("sectname __gcc_except_tab")
 }
 
-/// Compile `UNWIND_CRATE` through the bridge with `env` overlaid and return
-/// `(rustc_succeeded, stderr, produced_objects_dir)`.
+/// Compile `UNWIND_CRATE` through the bridge with `extra_knobs` overlaid and
+/// return `(rustc_succeeded, stderr)`.
+///
+/// The knobs travel on the TRACKED `-Ztrust-ir-cg-args` option, not in the
+/// child's environment: trustc refuses every `TCG_*`/`TRUST_CG_*` variable as an
+/// untracked semantic/codegen control, so the old `&[(&str, &str)]` environment
+/// overlay made every call here fail before the backend loaded.
 fn compile_through_bridge(
     dylib: &Path,
     dir: &Path,
     panicker_rlib: &Path,
-    extra_env: &[(&str, &str)],
+    extra_knobs: &[&str],
 ) -> (bool, String) {
     let src = dir.join("box_unwind.rs");
     std::fs::write(&src, UNWIND_CRATE).expect("write source");
@@ -189,11 +158,12 @@ fn compile_through_bridge(
         s.push(dylib);
         s
     };
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "staticlib"])
+    let mut knobs = vec!["no-proof-certs"];
+    knobs.extend_from_slice(extra_knobs);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "staticlib"])
         .arg(&backend_arg)
-        .env("TCG_NO_PROOF_CERTS", "1")
+        .arg(toolchain_support::backend_knobs_arg(&knobs))
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .args(["-Cforce-unwind-tables=yes"])
         .arg("--extern")
@@ -206,23 +176,58 @@ fn compile_through_bridge(
         .arg("-o")
         .arg(dir.join("box_unwind.o"))
         .arg(&src);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
     let out = cmd.output().expect("spawn rustc via rustup");
-    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The emission gate decided the exception-table obligations (ledger
+/// L03-P14) for the object carrying `box_across_unwind`'s exception tables,
+/// and they held: the `eh-obligation-trace` knob prints one report line per
+/// gated object (`TCG_EH_OBLIGATIONS macho functions=.. eh_functions=..
+/// unwind_points=.. ..`), and a violation would have failed the compile.
+/// Every call of every gated object is reached (`unreached_calls=0`): the
+/// calls inside landing pads (`_Unwind_Resume`, the drops) are reached only
+/// through the exceptional edge, so a gate that stopped following it would
+/// exempt them from the frame check and report them here. These are
+/// testing-grade decisions, not a certificate.
+fn assert_eh_obligations_held(stderr: &str) {
+    let field = |line: &str, key: &str| -> usize {
+        line.split_whitespace()
+            .find_map(|word| word.strip_prefix(&format!("{key}=")))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("report line without {key}: {line}"))
+    };
+    let reports: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("TCG_EH_OBLIGATIONS macho "))
+        .collect();
+    for line in &reports {
+        assert_eq!(
+            field(line, "unreached_calls"),
+            0,
+            "every call of a gated object is an unwind point: {line}"
+        );
+    }
+    assert!(
+        reports.iter().any(|line| {
+            field(line, "eh_functions") >= 1
+                && field(line, "invokes") >= 1
+                && field(line, "landing_pads") >= 1
+                && field(line, "unwind_points") >= 1
+        }),
+        "the gate must have decided an object with an invoke, a landing pad and an unwind point; reports {reports:?}, stderr:\n{stderr}"
+    );
+    eprintln!("EH_OBLIGATIONS bridge objects: {reports:?}");
 }
 
 #[test]
 fn bridge_lowers_unwind_cleanup_to_eh_object_aarch64() {
-    if !host_is_aarch64_macos() {
-        eprintln!("skipping: requires an aarch64-apple-darwin host");
-        return;
-    }
-    if !aarch64_std_available() {
-        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
-        return;
-    }
+    // The backend knob option and Darwin rust-std are required here; a missing
+    // one fails the test by name instead of returning early.
+    darwin_native::require("unwind_cleanup_aarch64", &[]);
     let dylib = ensure_dylib_built();
     let dir = workdir("eh");
 
@@ -235,8 +240,10 @@ fn bridge_lowers_unwind_cleanup_to_eh_object_aarch64() {
     let src = dir.join("box_unwind.rs");
     std::fs::write(&src, UNWIND_CRATE).expect("write source");
     let mir_out = dir.join("box_unwind.mir");
-    let mir_status = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    // Captured, not inherited: the compiler's own stderr note would otherwise
+    // land inside libtest's `test ... ok` line and garble the transcript the
+    // Darwin bridge runner parses.
+    let mir_dump = toolchain_support::rustc_command()
         .args(["--crate-type", "lib"])
         .args(["--target", TARGET, "-Cpanic=unwind", "-Zmir-opt-level=0"])
         .arg("--extern")
@@ -249,9 +256,13 @@ fn bridge_lowers_unwind_cleanup_to_eh_object_aarch64() {
         .arg("-o")
         .arg(&mir_out)
         .arg(&src)
-        .status()
+        .output()
         .expect("spawn rustc for MIR dump");
-    assert!(mir_status.success(), "MIR dump compile failed");
+    assert!(
+        mir_dump.status.success(),
+        "MIR dump compile failed: {}",
+        String::from_utf8_lossy(&mir_dump.stderr)
+    );
     let mir = std::fs::read_to_string(&mir_out).expect("read MIR dump");
     assert!(
         mir.contains("unwind: bb") && mir.contains("(cleanup)"),
@@ -260,14 +271,14 @@ fn bridge_lowers_unwind_cleanup_to_eh_object_aarch64() {
          exercising unwind lowering. MIR:\n{mir}"
     );
 
-    // 1. OPT-OUT (TCG_DISABLE_UNWIND): unwind lowering is ON by default now, so
+    // 1. OPT-OUT (`disable-unwind`): unwind lowering is ON by default now, so
     //    the opt-out escape hatch must FAIL CLOSED with the precise diagnostic —
     //    never miscompile, never abort at runtime.
     let (ok_off, stderr_off) =
-        compile_through_bridge(&dylib, &dir, &panicker_rlib, &[("TCG_DISABLE_UNWIND", "1")]);
+        compile_through_bridge(&dylib, &dir, &panicker_rlib, &["disable-unwind"]);
     assert!(
         !ok_off,
-        "with TCG_DISABLE_UNWIND set the unwinding crate must fail closed, but it compiled"
+        "with the `disable-unwind` knob set the unwinding crate must fail closed, but it compiled"
     );
     assert!(
         stderr_off.contains("cleanup unwind"),
@@ -275,13 +286,21 @@ fn bridge_lowers_unwind_cleanup_to_eh_object_aarch64() {
     );
 
     // 2. GATE ON: the bridge lowers the unwind edges and emits the EH object.
+    //    No knob is passed. `TCG_ENABLE_UNWIND` was already DEAD when this was
+    //    written — the file header says so ("now default ON") and no code in the
+    //    backend has ever read that name — so setting it asserted nothing; it
+    //    merely happened to be harmless while the environment was still read at
+    //    all. Under the tracked option it would be a hard refusal for an unknown
+    //    knob, so the default lane is stated by passing nothing, which is what
+    //    the assertion has always actually tested.
     let _ = std::fs::remove_file(dir.join("box_unwind.o"));
     let (ok_on, stderr_on) =
-        compile_through_bridge(&dylib, &dir, &panicker_rlib, &[("TCG_ENABLE_UNWIND", "1")]);
+        compile_through_bridge(&dylib, &dir, &panicker_rlib, &["eh-obligation-trace"]);
     assert!(
         ok_on,
-        "with TCG_ENABLE_UNWIND=1 the bridge must lower the unwind cleanup. stderr:\n{stderr_on}"
+        "on the default lane the bridge must lower the unwind cleanup. stderr:\n{stderr_on}"
     );
+    assert_eh_obligations_held(&stderr_on);
 
     // rustc emits one object per CGU. Find the one defining `box_across_unwind`.
     let objs: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -323,6 +342,10 @@ fn bridge_lowers_unwind_cleanup_to_eh_object_aarch64() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+    positive_evidence::record(
+        positive_evidence::Evidence::Compiled,
+        positive_evidence::Certs::Off,
+    );
 }
 
 /// Build the `panicker` rlib (the external unwinding callee `ay_may_unwind`,
@@ -332,8 +355,7 @@ fn build_panicker_rlib(dir: &Path) -> PathBuf {
     let panicker_src = dir.join("panicker.rs");
     std::fs::write(&panicker_src, PANICKER_CRATE).expect("write panicker");
     let panicker_rlib = dir.join("libpanicker.rlib");
-    let pk = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let pk = toolchain_support::rustc_command()
         .args(["--crate-name", "panicker", "--crate-type", "rlib"])
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .arg("--emit=link")
@@ -388,33 +410,32 @@ fn extract_object_defining(rlib: &Path, sym: &str, out: &Path) {
 /// under a hard timeout (NO abort, NO hang).
 #[test]
 fn bridge_unwind_cleanup_real_panic_caught_aarch64() {
-    if !host_is_aarch64_macos() {
-        eprintln!("skipping: requires an aarch64-apple-darwin host");
-        return;
-    }
-    if !aarch64_std_available() {
-        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
-        return;
-    }
+    // The backend knob option and Darwin rust-std are required here; a missing
+    // one fails the test by name instead of returning early.
+    darwin_native::require("unwind_cleanup_aarch64", &[]);
     let dylib = ensure_dylib_built();
     let dir = workdir("eh_run");
     let panicker_rlib = build_panicker_rlib(&dir);
 
-    // Lower the unwinding crate through the bridge (gate ON) and collect the
-    // emitted CGU objects.
+    // Lower the unwinding crate through the bridge (default lane, unwind ON) and
+    // collect the emitted CGU objects. See the note on the dead
+    // `TCG_ENABLE_UNWIND` name in the test above.
     let (ok_on, stderr_on) =
-        compile_through_bridge(&dylib, &dir, &panicker_rlib, &[("TCG_ENABLE_UNWIND", "1")]);
+        compile_through_bridge(&dylib, &dir, &panicker_rlib, &["eh-obligation-trace"]);
     assert!(
         ok_on,
-        "with TCG_ENABLE_UNWIND=1 the bridge must lower the unwind cleanup. stderr:\n{stderr_on}"
+        "on the default lane the bridge must lower the unwind cleanup. stderr:\n{stderr_on}"
     );
+    assert_eh_obligations_held(&stderr_on);
     let bridge_objs: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("read workdir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "o"))
         .collect();
     assert!(
-        bridge_objs.iter().any(|o| nm(o).contains("_box_across_unwind")),
+        bridge_objs
+            .iter()
+            .any(|o| nm(o).contains("_box_across_unwind")),
         "no bridge object defines box_across_unwind; objects: {bridge_objs:?}"
     );
 
@@ -470,8 +491,7 @@ fn main() {\n\
     let bin = dir.join("driver_bin");
     let mut l = std::ffi::OsString::from("-L");
     l.push(&dir);
-    let link = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let link = toolchain_support::rustc_command()
         .args(["--target", TARGET, "-Cpanic=unwind", "-Copt-level=0"])
         .arg(&l)
         .args(["-l", "static=boxunwind"])
@@ -519,6 +539,10 @@ fn main() {\n\
         stdout.trim()
     );
     let _ = std::fs::remove_dir_all(&dir);
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::Off,
+    );
 }
 
 /// Run `bin` with a hard wall-clock timeout. Returns

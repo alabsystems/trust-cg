@@ -1,0 +1,9 @@
+; TrustIr text format v1
+module "_RNSNvYNCINvNtCshdpSglmLaqw_3std2rt10lang_startuE0INtNtNtCsiHPWGBzRfGA_4core3ops8function6FnOnceuE9call_once6vtableCs6xx8MlZbmVB_13b1_mispredict"
+
+functy.0 = () -> ()
+
+fn @_RNSNvYNCINvNtCshdpSglmLaqw_3std2rt10lang_startuE0INtNtNtCsiHPWGBzRfGA_4core3ops8function6FnOnceuE9call_once6vtableCs6xx8MlZbmVB_13b1_mispredict(functy.0) {
+bb0:
+    unreachable
+}

@@ -263,7 +263,9 @@ impl TryFrom<&trust_cg_ir::MachOperand> for RegAllocOperand {
             IrOp::FImm(f) => Ok(RegAllocOperand::FImm(*f)),
             IrOp::Block(b) => Ok(RegAllocOperand::Block(*b)),
             IrOp::StackSlot(s) => Ok(RegAllocOperand::StackSlot(*s)),
-            IrOp::Symbol(_) => Ok(RegAllocOperand::Imm(0)),
+            // These have no register use. Allocation rewrites only VRegs in
+            // the original instruction, preserving either symbol binding.
+            IrOp::Symbol(_) | IrOp::ExactModuleSymbol(_) => Ok(RegAllocOperand::Imm(0)),
             IrOp::JumpTableIndex(_) => Ok(RegAllocOperand::Imm(0)),
             IrOp::FrameIndex(fi) => Err(OperandConversionError {
                 message: format!(
@@ -342,20 +344,131 @@ impl RegAllocStackSlot {
 }
 
 impl RegAllocFunction {
-    /// Allocate a new stack slot for a spill.
-    pub fn alloc_stack_slot(&mut self, size: u32, align: u32) -> StackSlotId {
-        let id = StackSlotId(self.next_stack_slot);
-        self.next_stack_slot += 1;
-        self.stack_slots
-            .insert(id, RegAllocStackSlot::new(size, align));
-        id
+    /// Allocate a slot at or above the counter and above existing metadata and
+    /// arena slot references. Exhaustion leaves the function unchanged; the
+    /// final counter value `u32::MAX` cannot itself be issued as a slot ID.
+    /// Size/alignment validation remains the consuming frame layout's contract.
+    pub fn try_alloc_stack_slot(&mut self, size: u32, align: u32) -> Option<StackSlotId> {
+        let mut plan = self.stack_slot_allocation_plan();
+        let slot = plan.allocate(size, align)?;
+        plan.commit(self);
+        Some(slot)
     }
 
-    /// Allocate a new virtual register.
-    pub fn alloc_vreg(&mut self, class: RegClass) -> VReg {
-        let id = self.next_vreg;
-        self.next_vreg += 1;
-        VReg { id, class }
+    /// Plan spill slots without mutating the function. Commit only after all
+    /// required slots and associated instruction edits have been planned.
+    pub(crate) fn stack_slot_allocation_plan(&self) -> StackSlotAllocationPlan {
+        let arena_slots = self
+            .insts
+            .iter()
+            .flat_map(|inst| inst.defs.iter().chain(&inst.uses))
+            .filter_map(|op| match op {
+                RegAllocOperand::StackSlot(id) => Some(id.0),
+                _ => None,
+            });
+        StackSlotAllocationPlan {
+            ids: FreshIdCursor {
+                next: self.next_stack_slot,
+                highest_existing: self
+                    .stack_slots
+                    .keys()
+                    .map(|id| id.0)
+                    .chain(arena_slots)
+                    .max(),
+            },
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// Allocate above both the counter and all existing arena register IDs.
+    /// Exhaustion returns None without changing the function. The final
+    /// counter value `u32::MAX` cannot itself be issued as a register ID.
+    pub fn try_alloc_vreg(&mut self, class: RegClass) -> Option<VReg> {
+        let mut plan = self.vreg_allocation_plan();
+        let vreg = plan.allocate(class)?;
+        self.next_vreg = plan.next_vreg();
+        Some(vreg)
+    }
+
+    /// Plan IDs without consuming them in the function. A caller that holds
+    /// additional identities outside the arena must observe them before
+    /// allocating; commit the counter only after the complete plan succeeds.
+    pub(crate) fn vreg_allocation_plan(&self) -> VRegAllocationPlan {
+        VRegAllocationPlan {
+            ids: FreshIdCursor {
+                next: self.next_vreg,
+                highest_existing: self
+                    .insts
+                    .iter()
+                    .flat_map(|inst| inst.vreg_defs().chain(inst.vreg_uses()))
+                    .map(|reg| reg.id)
+                    .max(),
+            },
+        }
+    }
+}
+
+/// Private ID planning state shared by phi lowering and optional splits.
+/// Unlike a function clone, this copies only the allocation state; scanning
+/// existing identities happens once when a plan is created.
+pub(crate) struct VRegAllocationPlan {
+    ids: FreshIdCursor,
+}
+
+impl VRegAllocationPlan {
+    pub(crate) fn observe(&mut self, reg: VReg) {
+        self.ids.observe(reg.id);
+    }
+
+    pub(crate) fn allocate(&mut self, class: RegClass) -> Option<VReg> {
+        self.ids.allocate().map(|id| VReg::new(id, class))
+    }
+
+    pub(crate) fn next_vreg(&self) -> u32 {
+        self.ids.next
+    }
+}
+
+/// Slot IDs and metadata stay private until every requested allocation succeeds.
+pub(crate) struct StackSlotAllocationPlan {
+    ids: FreshIdCursor,
+    slots: BTreeMap<StackSlotId, RegAllocStackSlot>,
+}
+
+impl StackSlotAllocationPlan {
+    pub(crate) fn allocate(&mut self, size: u32, align: u32) -> Option<StackSlotId> {
+        let id = StackSlotId(self.ids.allocate()?);
+        self.slots.insert(id, RegAllocStackSlot::new(size, align));
+        Some(id)
+    }
+
+    /// Private callers keep the function's ID/slot state unchanged while planning.
+    pub(crate) fn commit(self, func: &mut RegAllocFunction) {
+        func.next_stack_slot = self.ids.next;
+        func.stack_slots.extend(self.slots);
+    }
+}
+
+/// Shared checked arithmetic for monotonically allocated register/slot IDs.
+/// The `u32::MAX` counter is exhausted; an empty plan need not allocate at all.
+struct FreshIdCursor {
+    next: u32,
+    highest_existing: Option<u32>,
+}
+
+impl FreshIdCursor {
+    fn observe(&mut self, id: u32) {
+        self.highest_existing = Some(self.highest_existing.map_or(id, |old| old.max(id)));
+    }
+
+    fn allocate(&mut self) -> Option<u32> {
+        let id = match self.highest_existing {
+            Some(highest) => self.next.max(highest.checked_add(1)?),
+            None => self.next,
+        };
+        let next = id.checked_add(1)?;
+        self.next = next;
+        Some(id)
     }
 }
 
@@ -363,6 +476,141 @@ impl RegAllocFunction {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    fn id_boundary_function(next_vreg: u32) -> RegAllocFunction {
+        RegAllocFunction {
+            name: "id_boundary".into(),
+            insts: vec![],
+            blocks: vec![],
+            block_order: vec![],
+            entry_block: BlockId(0),
+            next_vreg,
+            next_stack_slot: 0,
+            stack_slots: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn slot_boundary_checked_allocator_last_slot_and_stable_exhaustion() {
+        let mut func = id_boundary_function(0);
+        func.next_stack_slot = u32::MAX - 1;
+        let slot = func.try_alloc_stack_slot(16, 16).unwrap();
+        assert_eq!(slot, StackSlotId(u32::MAX - 1));
+        assert_eq!(func.stack_slots[&slot].size, 16);
+        assert_eq!(func.stack_slots[&slot].align, 16);
+        assert_eq!(func.next_stack_slot, u32::MAX);
+        let before = format!("{func:?}");
+        for _ in 0..3 {
+            assert_eq!(func.try_alloc_stack_slot(4, 4), None);
+            assert_eq!(format!("{func:?}"), before);
+        }
+    }
+
+    #[test]
+    fn slot_boundary_sparse_metadata_and_unlinked_arena_slots_are_reserved() {
+        for (def, used) in [(u32::MAX - 16, u32::MAX - 8), (u32::MAX - 8, u32::MAX - 16)] {
+            let mut func = id_boundary_function(0);
+            func.stack_slots
+                .insert(StackSlotId(u32::MAX - 10), RegAllocStackSlot::new(32, 32));
+            func.insts.push(RegAllocInst {
+                opcode: 0,
+                defs: vec![RegAllocOperand::StackSlot(StackSlotId(def))],
+                uses: vec![RegAllocOperand::StackSlot(StackSlotId(used))],
+                implicit_defs: vec![],
+                implicit_uses: vec![],
+                flags: InstFlags::default(),
+                tied_operands: vec![],
+            });
+            assert_eq!(
+                func.try_alloc_stack_slot(8, 8),
+                Some(StackSlotId(u32::MAX - 7))
+            );
+            assert_eq!(func.next_stack_slot, u32::MAX - 6);
+            assert_eq!(func.stack_slots[&StackSlotId(u32::MAX - 10)].size, 32);
+        }
+    }
+
+    #[test]
+    fn slot_boundary_maximum_metadata_or_arena_slot_declines_atomically() {
+        for source in 0..3 {
+            let mut func = id_boundary_function(0);
+            let slot = RegAllocOperand::StackSlot(StackSlotId(u32::MAX));
+            if source == 0 {
+                func.stack_slots
+                    .insert(StackSlotId(u32::MAX), RegAllocStackSlot::new(32, 32));
+            } else {
+                func.insts.push(RegAllocInst {
+                    opcode: 0,
+                    defs: if source == 1 {
+                        vec![slot.clone()]
+                    } else {
+                        vec![]
+                    },
+                    uses: if source == 2 { vec![slot] } else { vec![] },
+                    implicit_defs: vec![],
+                    implicit_uses: vec![],
+                    flags: InstFlags::default(),
+                    tied_operands: vec![],
+                });
+            }
+            let before = format!("{func:?}");
+            assert_eq!(func.try_alloc_stack_slot(8, 8), None);
+            assert_eq!(format!("{func:?}"), before);
+        }
+    }
+
+    #[test]
+    fn id_boundary_checked_allocator_exhaustion_is_stable() {
+        let mut func = id_boundary_function(u32::MAX - 1);
+        assert_eq!(
+            func.try_alloc_vreg(RegClass::Gpr64),
+            Some(VReg::new(u32::MAX - 1, RegClass::Gpr64))
+        );
+        let before = format!("{func:?}");
+        for _ in 0..3 {
+            assert_eq!(func.try_alloc_vreg(RegClass::Fpr128), None);
+            assert_eq!(format!("{func:?}"), before);
+        }
+    }
+
+    #[test]
+    fn id_boundary_sparse_arena_defs_and_uses_are_reserved() {
+        for (def, used) in [(u32::MAX - 16, u32::MAX - 8), (u32::MAX - 8, u32::MAX - 16)] {
+            let mut func = id_boundary_function(0);
+            // Deliberately unlinked: arena identities do not depend on layout.
+            func.insts.push(RegAllocInst {
+                opcode: 0,
+                defs: vec![RegAllocOperand::VReg(VReg::new(def, RegClass::Fpr64))],
+                uses: vec![RegAllocOperand::VReg(VReg::new(used, RegClass::Gpr64))],
+                implicit_defs: vec![],
+                implicit_uses: vec![],
+                flags: InstFlags::default(),
+                tied_operands: vec![],
+            });
+            assert_eq!(
+                func.try_alloc_vreg(RegClass::Gpr32),
+                Some(VReg::new(u32::MAX - 7, RegClass::Gpr32))
+            );
+            assert_eq!(func.next_vreg, u32::MAX - 6);
+        }
+    }
+
+    #[test]
+    fn id_boundary_maximum_arena_id_declines_without_mutation() {
+        let mut func = id_boundary_function(0);
+        func.insts.push(RegAllocInst {
+            opcode: 0,
+            defs: vec![],
+            uses: vec![RegAllocOperand::VReg(VReg::new(u32::MAX, RegClass::Gpr64))],
+            implicit_defs: vec![],
+            implicit_uses: vec![],
+            flags: InstFlags::default(),
+            tied_operands: vec![],
+        });
+        let before = format!("{func:?}");
+        assert_eq!(func.try_alloc_vreg(RegClass::Gpr64), None);
+        assert_eq!(format!("{func:?}"), before);
+    }
 
     #[test]
     fn reg_alloc_operand_as_vreg_returns_some_for_vreg_variant() {
@@ -497,8 +745,8 @@ mod tests {
             stack_slots: BTreeMap::new(),
         };
 
-        let first = func.alloc_stack_slot(8, 8);
-        let second = func.alloc_stack_slot(4, 4);
+        let first = func.try_alloc_stack_slot(8, 8).unwrap();
+        let second = func.try_alloc_stack_slot(4, 4).unwrap();
 
         assert_eq!(first, StackSlotId(3));
         assert_eq!(second, StackSlotId(4));
@@ -518,8 +766,8 @@ mod tests {
             stack_slots: BTreeMap::new(),
         };
 
-        let first = func.alloc_vreg(RegClass::Gpr32);
-        let second = func.alloc_vreg(RegClass::Fpr64);
+        let first = func.try_alloc_vreg(RegClass::Gpr32).unwrap();
+        let second = func.try_alloc_vreg(RegClass::Fpr64).unwrap();
 
         assert_eq!(first, VReg::new(11, RegClass::Gpr32));
         assert_eq!(second, VReg::new(12, RegClass::Fpr64));
@@ -539,7 +787,7 @@ mod tests {
             stack_slots: BTreeMap::new(),
         };
 
-        let slot_id = func.alloc_stack_slot(16, 8);
+        let slot_id = func.try_alloc_stack_slot(16, 8).unwrap();
 
         assert_eq!(func.stack_slots.len(), 1);
         assert_eq!(

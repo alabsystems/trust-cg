@@ -32,7 +32,7 @@ fn count_bcond_cc(func: &MachFunction, cc: i64) -> usize {
         .flat_map(|blk| blk.insts.iter().copied())
         .filter(|&id| {
             let inst = func.inst(id);
-            inst.opcode == AArch64Opcode::BCond && imm_of(&inst.operands[0]) == Some(cc)
+            inst.opcode == AArch64Opcode::BCond && inst.operands[0].as_imm() == Some(cc)
         })
         .count()
 }
@@ -44,7 +44,7 @@ fn count_movr_to(func: &MachFunction, reg: u32) -> usize {
         .filter(|&id| {
             let inst = func.inst(id);
             inst.opcode == AArch64Opcode::MovR
-                && vreg_of(&inst.operands[0]).map(|v| v.id) == Some(reg)
+                && inst.operands[0].as_vreg().map(|v| v.id) == Some(reg)
         })
         .count()
 }
@@ -320,7 +320,7 @@ fn fires_on_native_sieve_shape() {
     // The shared iv (x10) is advanced IN-PLACE inside the main body by an AddRR.
     let iv_advanced_in_mb = func.block(mb).insts.iter().any(|&id| {
         let ins = func.inst(id);
-        ins.opcode == AArch64Opcode::AddRR && vreg_of(&ins.operands[0]).map(|v| v.id) == Some(10)
+        ins.opcode == AArch64Opcode::AddRR && ins.operands[0].as_vreg().map(|v| v.id) == Some(10)
     });
     assert!(
         iv_advanced_in_mb,
@@ -430,7 +430,7 @@ fn coef(
                 iv,
                 stride,
                 base,
-                vreg_of(&inst.operands[1])?.id,
+                inst.operands[1].as_vreg()?.id,
                 depth - 1,
             )?;
             let b = coef(
@@ -438,7 +438,7 @@ fn coef(
                 iv,
                 stride,
                 base,
-                vreg_of(&inst.operands[2])?.id,
+                inst.operands[2].as_vreg()?.id,
                 depth - 1,
             )?;
             Some((a.0 + b.0, a.1 + b.1, a.2 + b.2))
@@ -448,7 +448,7 @@ fn coef(
             iv,
             stride,
             base,
-            vreg_of(&inst.operands[1])?.id,
+            inst.operands[1].as_vreg()?.id,
             depth - 1,
         ),
         _ => None,
@@ -464,7 +464,7 @@ fn check_unrolled_addresses(func: &MachFunction, mb: BlockId, base: u32, iv: u32
         .iter()
         .copied()
         .filter(|&id| func.inst(id).opcode == AArch64Opcode::StrbRI)
-        .map(|id| vreg_of(&func.inst(id).operands[1]).unwrap().id)
+        .map(|id| func.inst(id).operands[1].as_vreg().unwrap().id)
         .collect();
     assert_eq!(store_addrs.len(), 4, "four unrolled stores");
 
@@ -654,7 +654,7 @@ fn guard_correctness_structure_n1024_s2_q4() {
         .flat_map(|b| b.insts.iter().copied())
         .filter(|&id| {
             let ins = func.inst(id);
-            ins.opcode == AArch64Opcode::Movz && imm_of(&ins.operands[1]) == Some(1024)
+            ins.opcode == AArch64Opcode::Movz && ins.operands[1].as_imm() == Some(1024)
         })
         .count();
     assert_eq!(movz_1024, 1, "N=1024 re-materialized once in g1");
@@ -706,6 +706,16 @@ enum Side {
     TailCallExit,
 }
 
+/// What the in-body check compares `iv` against.
+#[derive(Clone, Copy, PartialEq)]
+enum Guard {
+    /// The loop's own bound `N` (1024): a bounds check of an array as long as
+    /// the loop, which no unrolled iteration can fail.
+    LoopBound,
+    /// An opaque register: a check that can fail at any iteration.
+    Opaque,
+}
+
 /// Where the in-body conditional sits relative to the store.
 #[derive(Clone, Copy, PartialEq)]
 enum CondAt {
@@ -722,7 +732,7 @@ enum CondAt {
 /// ```text
 /// bb0:    setup; B header
 /// header: iv_c = copy iv; cmp iv_c, Nreg; b.lo <first>; B exit
-/// chk:    cmp iv, guard; b.lo <next>; B <side>
+/// chk:    cmp iv, guard; b.lo <next>; B <side>      (guard: N, or opaque)
 /// st:     addr = base + iv; *addr = val; B <next>
 /// latch:  next = iv + stride; iv = copy next; B header
 /// exit:   ret
@@ -733,7 +743,7 @@ enum CondAt {
 ///
 /// `BeforeStore` orders `header -> chk -> st -> latch`; `AfterStore` orders
 /// `header -> st -> chk -> latch`.
-fn build_guarded_store(at: CondAt, side: Side) -> MachFunction {
+fn build_guarded_store(at: CondAt, side: Side, guard: Guard) -> MachFunction {
     use AArch64Opcode::*;
     let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
     let bb0 = func.entry;
@@ -766,7 +776,10 @@ fn build_guarded_store(at: CondAt, side: Side) -> MachFunction {
     push(&mut func, bb0, Copy, vec![x(2), x(2)]); // stride (invariant)
     push(&mut func, bb0, Movz, vec![w(3), i(1)]); // value
     push(&mut func, bb0, Movz, vec![x(11), i(1024)]); // N
-    push(&mut func, bb0, Copy, vec![x(14), x(14)]); // opaque guard operand
+    match guard {
+        Guard::LoopBound => push(&mut func, bb0, Movz, vec![x(14), i(1024)]),
+        Guard::Opaque => push(&mut func, bb0, Copy, vec![x(14), x(14)]),
+    }
     push(&mut func, bb0, Movz, vec![x(10), i(4)]); // iv = q0
     push(&mut func, bb0, B, vec![bl(header)]);
 
@@ -817,7 +830,7 @@ fn bails_on_conditional_store_that_rejoins_the_latch() {
     // `while q <u N { if c { base[q] = v; } q += s; }` — the store block does NOT
     // dominate the latch, so unrolling it would perform writes the source skips.
     // This is the shape that miscompiled p7-with-an-inner-`if` end-to-end.
-    let mut func = build_guarded_store(CondAt::BeforeStore, Side::Latch);
+    let mut func = build_guarded_store(CondAt::BeforeStore, Side::Latch, Guard::LoopBound);
     let before = count_op(&func, AArch64Opcode::StrbRI);
     let (changed, fired) = run(&mut func);
     assert!(
@@ -832,14 +845,14 @@ fn bails_on_conditional_store_that_rejoins_the_latch() {
 }
 
 #[test]
-fn fires_when_side_edge_diverges_and_store_dominates_latch() {
+fn fires_when_a_bounds_check_against_the_loop_bound_panics() {
     // The p7 residual bounds-check shape: the in-body branch's other edge LEAVES
-    // the loop into a DIVERGING panic block, so the store block still dominates
-    // the latch and runs on every header->latch path, and no `Ret` is reachable
-    // through the side edge. Must still fire (this is the pass's whole target),
-    // whether the check sits before or after the store.
+    // the loop into a panic block when `iv >=u N`, the loop's own bound, so no
+    // unrolled iteration can take it (the loop-state contract admits it by its
+    // own rule). Must still fire (this is the pass's whole target), whether the
+    // check sits before or after the store.
     for at in [CondAt::BeforeStore, CondAt::AfterStore] {
-        let mut func = build_guarded_store(at, Side::Panic);
+        let mut func = build_guarded_store(at, Side::Panic, Guard::LoopBound);
         let (changed, fired) = run(&mut func);
         assert!(
             changed && fired == 1,
@@ -853,15 +866,30 @@ fn fires_when_side_edge_diverges_and_store_dominates_latch() {
     }
 }
 
+#[test]
+fn bails_when_a_bounds_check_can_fail_in_the_unrolled_range() {
+    // The same panic edge, guarded by a length the loop's bound does not cover:
+    // the check can fail inside the unrolled range, where the replicated stores
+    // carry no check, so they would write past the array before the scalar
+    // remainder reaches the panic. This pass used to admit any edge into a
+    // diverging block; measured on a 64-byte slice under a 1024 bound it wrote
+    // past the slice (SIGSEGV where LLVM panics with memory intact).
+    for at in [CondAt::BeforeStore, CondAt::AfterStore] {
+        assert_bails_on_early_exit(at, Side::Panic, "bounds check that can fail");
+    }
+}
+
 // ---------------------------------------------------------------------------
-// NO-EARLY-NORMAL-EXIT GATE (no non-header body block may exit toward a `Ret`)
+// EARLY EXITS: refused by the loop-state contract (`crate::loop_contract`)
+// unless the exit is a bounds check no unrolled iteration can fail.
 // ---------------------------------------------------------------------------
 
-/// Every combination of an early NORMAL exit (the side edge reaches a `Ret`,
-/// directly or through a trampoline) and its position relative to the store
-/// must bail, byte-identically.
-fn assert_bails_on_early_normal_exit(at: CondAt, side: Side, why: &str) {
-    let mut func = build_guarded_store(at, side);
+/// Every combination of an early exit the contract does not admit (the side
+/// edge reaches a `Ret`, directly or through a trampoline or a tail call, or
+/// panics on a check against an opaque length) and its position relative to
+/// the store must bail, byte-identically.
+fn assert_bails_on_early_exit(at: CondAt, side: Side, why: &str) {
+    let mut func = build_guarded_store(at, side, Guard::Opaque);
     let before = count_op(&func, AArch64Opcode::StrbRI);
     let blocks_before = func.blocks.len();
     let (changed, fired) = run(&mut func);
@@ -880,14 +908,14 @@ fn bails_on_break_after_the_store() {
     // DOMINATES the latch (every completed iteration stored), so the dominance
     // gate alone ADMITS this loop; yet the source stops after the breaking
     // iteration's single store while the unrolled block would perform all four.
-    assert_bails_on_early_normal_exit(CondAt::AfterStore, Side::Ret, "break after the store");
+    assert_bails_on_early_exit(CondAt::AfterStore, Side::Ret, "break after the store");
 }
 
 #[test]
 fn bails_on_break_before_the_store() {
     // `while q <u N { if c { break; } base[q] = v; q += s; }` — same defect with
     // the test in front: the unrolled block never evaluates `c` for lanes 1..3.
-    assert_bails_on_early_normal_exit(CondAt::BeforeStore, Side::Ret, "break before the store");
+    assert_bails_on_early_exit(CondAt::BeforeStore, Side::Ret, "break before the store");
 }
 
 #[test]
@@ -896,7 +924,7 @@ fn bails_when_the_early_exit_reaches_ret_transitively() {
     // direct-successor check would call it diverging; the reachability walk
     // must not.
     for at in [CondAt::BeforeStore, CondAt::AfterStore] {
-        assert_bails_on_early_normal_exit(at, Side::RetViaTrampoline, "break via trampoline");
+        assert_bails_on_early_exit(at, Side::RetViaTrampoline, "break via trampoline");
     }
 }
 
@@ -909,7 +937,7 @@ fn bails_on_break_folded_into_a_tail_call() {
     // stores are observable. A "no `Ret` reachable" divergence test admits
     // this; the whitelist must not, in either order.
     for at in [CondAt::BeforeStore, CondAt::AfterStore] {
-        assert_bails_on_early_normal_exit(at, Side::TailCallExit, "break into a tail call");
+        assert_bails_on_early_exit(at, Side::TailCallExit, "break into a tail call");
     }
 }
 
@@ -917,7 +945,7 @@ fn bails_on_break_folded_into_a_tail_call() {
 fn tail_call_exit_fixture_has_no_ret_reachable() {
     // Pin the fixture's premise: from the tail-call exit block NO `Ret` is
     // reachable, so the defect really is the predicate, not the fixture.
-    let func = build_guarded_store(CondAt::AfterStore, Side::TailCallExit);
+    let func = build_guarded_store(CondAt::AfterStore, Side::TailCallExit, Guard::Opaque);
     let tail = block_with(&func, AArch64Opcode::TailCall);
     assert!(
         func.block(tail).succs.is_empty(),
@@ -931,56 +959,6 @@ fn tail_call_exit_fixture_has_no_ret_reachable() {
             .any(|&id| func.inst(id).opcode == AArch64Opcode::Ret),
         "tail-call block holds no `Ret`"
     );
-    assert!(
-        exit_diverges(&func, tail).is_err(),
-        "a lone `TailCall` is a NORMAL exit"
-    );
-}
-
-#[test]
-fn exit_diverges_is_a_whitelist() {
-    // A sink that merely ends in a call (no trap), a sink ending in an indirect
-    // `Br`, and an EMPTY sink are all unmodeled: none diverges.
-    use AArch64Opcode::*;
-    let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
-    let call_only = func.create_block();
-    let indirect = func.create_block();
-    let empty = func.create_block();
-    let trap_pseudo = func.create_block();
-    let guarded_trap = func.create_block();
-    let guarded_target = func.create_block();
-    let push = |func: &mut MachFunction, blk: BlockId, op, ops| {
-        let id = func.push_inst(MachInst::new(op, ops));
-        func.append_inst(blk, id);
-    };
-    push(&mut func, call_only, Bl, vec![i(0)]);
-    push(&mut func, indirect, Br, vec![x(9)]);
-    push(&mut func, trap_pseudo, Bl, vec![i(0)]);
-    push(&mut func, trap_pseudo, TrapOverflow, vec![]);
-    // A CONDITIONAL `TrapOverflow cc, Block(t)` falls through: not a sink trap.
-    push(
-        &mut func,
-        guarded_trap,
-        TrapOverflow,
-        vec![i(CC_LO), bl(guarded_target)],
-    );
-    push(&mut func, guarded_target, Ret, vec![]);
-    func.add_edge(guarded_trap, guarded_target);
-
-    assert!(exit_diverges(&func, call_only).is_err(), "bare call sink");
-    assert!(
-        exit_diverges(&func, indirect).is_err(),
-        "indirect `Br` sink"
-    );
-    assert!(exit_diverges(&func, empty).is_err(), "empty sink");
-    assert!(
-        exit_diverges(&func, guarded_trap).is_err(),
-        "guarded trap reaches `Ret`"
-    );
-    assert!(
-        exit_diverges(&func, trap_pseudo).is_ok(),
-        "`Bl abort; TrapOverflow` (select_trap's `unreachable`) diverges"
-    );
 }
 
 /// The block holding the first instruction with opcode `op`.
@@ -990,47 +968,6 @@ fn block_with(func: &MachFunction, op: AArch64Opcode) -> BlockId {
         .position(|b| b.insts.iter().any(|&id| func.inst(id).opcode == op))
         .map(|idx| BlockId(idx as u32))
         .unwrap_or_else(|| panic!("no block holds {op:?}"))
-}
-
-#[test]
-fn exit_diverges_walks_successors() {
-    // Normal: the `Ret` block, and transitively through the trampoline;
-    // diverging: the panic block (no successors, ends in `Brk`).
-    let func = build_guarded_store(CondAt::AfterStore, Side::RetViaTrampoline);
-    let exit = func
-        .blocks
-        .iter()
-        .position(|b| {
-            b.insts
-                .iter()
-                .any(|&id| func.inst(id).opcode == AArch64Opcode::Ret)
-        })
-        .map(|idx| BlockId(idx as u32))
-        .expect("ret block");
-    let panic = func
-        .blocks
-        .iter()
-        .position(|b| {
-            b.insts
-                .iter()
-                .any(|&id| func.inst(id).opcode == AArch64Opcode::Brk)
-        })
-        .map(|idx| BlockId(idx as u32))
-        .expect("panic block");
-    let tramp = func
-        .blocks
-        .iter()
-        .enumerate()
-        .find(|(_, b)| b.succs == vec![exit] && b.insts.len() == 1)
-        .map(|(idx, _)| BlockId(idx as u32))
-        .expect("trampoline block");
-    assert!(exit_diverges(&func, exit).is_err());
-    assert!(exit_diverges(&func, tramp).is_err());
-    assert!(exit_diverges(&func, panic).is_ok());
-    assert!(
-        exit_diverges(&func, func.entry).is_err(),
-        "the loop itself can return"
-    );
 }
 
 #[test]
@@ -1131,7 +1068,8 @@ fn second_run_is_a_no_op() {
 /// the primary test did not exercise).
 #[test]
 fn second_run_is_a_no_op_for_every_firing_variant() {
-    let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+    type Build = Box<dyn Fn() -> MachFunction>;
+    let cases: Vec<(&str, Build)> = vec![
         (
             "const-reg",
             Box::new(|| {
@@ -1152,11 +1090,11 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
         ),
         (
             "guarded-store-check-before",
-            Box::new(|| build_guarded_store(CondAt::BeforeStore, Side::Panic)),
+            Box::new(|| build_guarded_store(CondAt::BeforeStore, Side::Panic, Guard::LoopBound)),
         ),
         (
             "guarded-store-check-after",
-            Box::new(|| build_guarded_store(CondAt::AfterStore, Side::Panic)),
+            Box::new(|| build_guarded_store(CondAt::AfterStore, Side::Panic, Guard::LoopBound)),
         ),
     ];
     for (label, build) in cases {
@@ -1183,4 +1121,30 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the main loop replicates the
+// store and advances `iv` only.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    let iv = VReg::new(10, RegClass::Gpr64);
+    assert!(
+        run(&mut build_strided(Cfg::default())).0,
+        "plain fixture fires"
+    );
+    let mut wrong = Vec::new();
+    let mut carried = build_strided(Cfg::default());
+    crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+    if run(&mut carried).0 {
+        wrong.push("fired with a second accumulator");
+    }
+    let mut live_out = build_strided(Cfg::default());
+    crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+    if run(&mut live_out).0 {
+        wrong.push("fired with a live-out-only register");
+    }
+    assert!(wrong.is_empty(), "skipped register state: {wrong:?}");
 }

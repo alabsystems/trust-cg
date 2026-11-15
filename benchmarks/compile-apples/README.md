@@ -10,7 +10,7 @@ That is the right policy for a headline number, but it leaves the lane we
 actually optimise against untracked.
 
 This harness measures the narrow, specific target: with verification **off** on
-both sides — rustc's LLVM backend at `-C opt-level=N` versus trust-cg at the
+both sides — trustc's LLVM backend at `-C opt-level=N` versus trust-cg at the
 same `-C opt-level=N` — trust-cg should be strictly faster to compile on *every*
 program. Verification cost gets added back only once that holds.
 
@@ -58,10 +58,10 @@ Single-threaded wins CPU on 17/18 and loses wall on 11/18. So roughly 6.5 points
 of the CPU gap is thread-pool overhead that genuinely buys wall-clock time; the
 remaining ~12% is extra work trust-cg does that LLVM does not.
 
-**This matters for the goal.** A single interactive `rustc` invocation cares
-about wall clock, where we are close. A real build is `cargo -j N` with every
-core already busy — there is no idle core to hide CPU behind, and the CPU number
-is what the user pays. Claiming compile-time superiority on wall clock alone,
+**This matters for the goal.** A single interactive `trustc` invocation cares
+about wall clock, where we are close. A real build is
+`targo --unverified build -j N` with every core already busy — there is no idle
+core to hide CPU behind, and the CPU number is what the user pays. Claiming compile-time superiority on wall clock alone,
 while losing 18/18 on CPU, would not survive contact with a parallel build.
 
 ## Discipline
@@ -76,6 +76,16 @@ while losing 18/18 on CPU, would not survive contact with a parallel build.
   tree, so results are never attributed to the wrong build.
 
 ## Where the proofs-ON gap actually is (2026-08-25)
+
+> Historical analysis through 2026-08-26. As of 2026-09-01 the production lane
+> separates 15 indexed portable-certificate replays from two invariant
+> evaluation sweeps. Runtime validates only the exact selected certificate body.
+> Distinct portable hits replay concurrently for a direct compiler invocation;
+> Cargo-managed rustc processes defer replay to the ordinary walk by default.
+> Under Formal-on-miss, the direct-compiler init warm handles only portable
+> replay while invariant evaluation remains in the ordinary fallback. The
+> measurements below describe the earlier all-statistical implementation and
+> are retained as history.
 
 `compile-apples` reports 0.9588x with verification off on both sides. The
 production lane (`beat-llvm`, certs+solver on) reports ~2.0x. That whole
@@ -125,7 +135,7 @@ walk's selection), and four more levers followed it, each measured on this box
 | kind-parallel pre-warm | sweep the distinct kinds on a wide default-stack pool, walk against a warm memo | empty 1.270x -> 1.136x (3-prog, paired) |
 | sample chunking | split each kind's 100k samples across the pool; the LCG is affine, so chunk `i` starts at the exact sequential state — samples, verdicts and counterexample text byte-identical | corpus 1.257x -> 1.117x, 18/18 faster |
 | lane-batched evaluator | 8 samples per op dispatch on u64 lanes (poison as a per-lane bit); failing lanes re-checked by the scalar path | user CPU -35..-45%, 2891/3552 registry tapes |
-| speculative init sweep | the 13 registry kinds EVERY program needs, swept from backend `init` while rustc's front end runs | codegen_crate -3..-4ms |
+| speculative init sweep (removed 2026-09-17) | the 13 registry kinds EVERY program needs, swept from backend `init` while rustc's front end runs | codegen_crate -3..-4ms |
 | wide (u128-lane) evaluator | the NEON tapes (661 registry tapes; CntV.16B is 803 ops) | v3_popcount user CPU 396 -> 179ms; 3552/3552 tapes batched |
 
 | release the sweep pool at `join_codegen` end | its 20 workers are torn down while rustc links, not inside exit — 5-10ms of the after-join segment | p2_collatz 123.8 -> 118.8ms (n=11) |
@@ -167,7 +177,11 @@ n=25 even for identical dylibs, so only the 18-program geomean at n>=7 resolves
 The owner's decisions (2026-08-26): `DEFAULT_SAMPLE_COUNT` stays at 100,000 —
 the assurance is the product, and the compile-time gate is not to be met by
 weakening it; the init-time speculative sweep stays on the invariant kinds —
-no CPU spent on kinds a program does not use. With those fixed, the two G2
+no CPU spent on kinds a program does not use. (2026-09-17: registry theorems
+stopped being instruction credit, so no program uses those kinds any more; the
+speculative sweep and the per-CGU registry pre-warm were removed with that
+credit, per the same no-unused-kinds rule. These rows are history, not a
+baseline for the current lane.) With those fixed, the two G2
 gates remain unmet on this box by design, and the remaining routes are OWNER
 decisions rather than engineering ones: `DEFAULT_SAMPLE_COUNT`, a cross-process verdict cache (deliberately
 excluded — an attacker-writable verdict file must never establish proof
@@ -240,9 +254,11 @@ move was that, not drift; the once-per-wave block-level NZCV liveness that
 replaced it reads B/A 1.01 (identical code, 18/18). TST-fed branches now cite the TST
 obligation for their condition (`tst w64: ne`, CmpCombine), so with the flag on
 **every one of the corpus's 744 CMP / B.cond sites cites its own proof** (0
-fragment credits). Whether the refined citation becomes the default is the
-owner's call — it changes the certificate's `rule_name` and adds the cited
-kinds' sweeps to a compile that uses them, never the verdict or the code.
+fragment credits). Ruled 2026-10-02 (OD-42 in `docs/decision-record.md`): the
+refined citation becomes the default. It changes the certificate's `rule_name`
+and adds the cited kinds' sweeps to a compile that uses them, never the
+verdict or the code; flipping the default, re-pinning the citation golden and
+keeping the variable as an opt-out is still to do.
 
 ## Tools (`tools/`)
 
@@ -253,7 +269,7 @@ change), `ab.py` (paired interleaved LLVM/A/B compile-wall A/B; always run an
 identical-dylib control), `pass_times.py N A B [pass..]` (per-pass corpus
 time from `TRUST_CG_TIME_PASSES`), `ra_stages_all.py N A [B]` (regalloc /
 validator / post-RA / adapter stage timers), `timepasses.py N DYLIB PROG`
-(rustc `-Z time-passes`, LLVM vs bridge), `fixed_charge.py N DYLIB` (empty
+(`trustc -Z time-passes`, LLVM vs bridge), `fixed_charge.py N DYLIB` (empty
 `main` fixed per-process cost), `fixpoint_scan.py DYLIB` — the
 convergence scan that found the vectorizer remainder re-fire class — and
 `harness_row.sh [REPO] [DYLIB]`, the one-row evidence runner (`run.py --cold`

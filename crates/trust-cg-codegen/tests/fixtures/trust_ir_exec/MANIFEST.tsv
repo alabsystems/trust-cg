@@ -1,0 +1,34 @@
+# WS7.2 trust-ir -> native differential corpus (tests/trust_ir_interp_differential.rs).
+# Columns (TAB-separated): module file, entry function, argument vectors, and
+# optionally the hosts the row runs on (aarch64-macos, aarch64-linux,
+# x86_64-macos, x86_64-linux; absent = every JIT host). Vectors are
+# ';'-separated, each a ','-separated list of decimal or 0x-hex u64 arguments.
+# There is no expected-value column: the trust-ir reference interpreter is the
+# oracle. A vector on which it reports UndefinedBehavior is skipped; an entry
+# whose every vector is skipped fails the gate.
+#
+# Part A-Lean `should_emit/struct.trust_ir` (row FORMAT_HOME.native.struct)
+# and its private-seed twin.
+parta_lean_struct.trust_ir	dotOf	1,2,3,4;18446744073709551615,18446744073709551615,2,3;0,0,0,0;5,0x10000000000,7,9
+parta_lean_struct.distinct_seed.trust_ir	dotOf	1,2,3,4;18446744073709551615,18446744073709551615,2,3;0,0,0,0;5,0x10000000000,7,9
+# c13 (verify/c13_trustcg_insertfield_miscompile): shared seed, own seed, the
+# --emit-proofs gate module (two_inserts_sub(9,2) = 7; F-111 published 0), and
+# the Rust tuple shape a source-built trustc emits from safe Rust.
+c13_shared_seed.trust_ir	two_inserts	1,2;0,0;18446744073709551615,3
+c13_shared_seed.trust_ir	seed_survives	3;0;18446744073709551615
+c13_shared_seed.trust_ir	nonconst_base	1,2,4;9,8,7;0,0,0
+c13_own_seed.trust_ir	two_inserts	1,2;0,0;18446744073709551615,3
+c13_own_seed.trust_ir	seed_survives	3;0;18446744073709551615
+c13_own_seed.trust_ir	nonconst_base	1,2,4;9,8,7;0,0,0
+c13_shared_nomul.trust_ir	two_inserts_sub	9,2;2,9;0,0;18446744073709551615,1
+c13c_tuple.nolayout.trust_ir	c13_tuple	1,2;7,9;0,0	aarch64-macos
+# The WS7.1 families (aggregate loop headers, swaps, loop-carried loads,
+# parameter bases, insertelement, nested fields, packed structs, select).
+value_semantics_families.trust_ir	loop_old_after_update	1;2;5;9
+value_semantics_families.trust_ir	swap_loop	1;2;3;6
+value_semantics_families.trust_ir	loop_carried_load	1;2;4;7
+value_semantics_families.trust_ir	param_base_caller	0;7;123456789
+value_semantics_families.trust_ir	array_insert_element	5,0;5,1;99,1;3,2;3,0xffffffff
+value_semantics_families.trust_ir	nested_field	1,2;9,0;0,0
+value_semantics_families.trust_ir	packed_two_chains	1,2;0x0102030405060708,0xffff;0,0
+value_semantics_families.trust_ir	select_base	0,5;1,5;7,0

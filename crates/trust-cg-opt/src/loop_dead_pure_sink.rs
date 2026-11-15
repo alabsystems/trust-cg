@@ -65,7 +65,7 @@
 //! Kill switch: `TCG_NO_LOOP_DEAD_SINK` (pass stays registered, run is a
 //! no-op, bytes identical to a build without the pass).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstFlags, InstId, MachFunction, MachInst, MachOperand, RegClass,
@@ -105,10 +105,6 @@ impl MachinePass for LoopDeadPureSink {
     }
 }
 
-fn trace() -> bool {
-    std::env::var_os("TCG_LOOP_DEAD_SINK_TRACE").is_some()
-}
-
 fn run_pass(func: &mut MachFunction) -> bool {
     // Cheap gate: the transform requires at least one importer-licensed
     // libm-pure call. Skip the whole analysis when none exists (which is the
@@ -126,22 +122,14 @@ fn run_pass(func: &mut MachFunction) -> bool {
         return false;
     }
 
+    let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
     // Deterministic candidate order: loops by header id (BTreeMap order).
     let all: Vec<NaturalLoop> = loops.all_loops().cloned().collect();
     for c in &all {
         if let Some(plan) = plan_for_inner_loop(func, &dom, &loops, c) {
-            if trace() {
-                eprintln!(
-                    "[loop-dead-pure-sink] {}: firing on inner loop {:?} (outer {:?}), \
-                     {} stores, {} inputs, {} slice insts, trip {}",
-                    func.name,
-                    plan.c_header,
-                    plan.l_header,
-                    plan.stores.len(),
-                    plan.inputs.len(),
-                    plan.slice.len(),
-                    plan.bound
-                );
+            // Purity does not authorize cloning/deleting an Invoke identity.
+            if plan.slice.iter().any(|id| protected.contains(*id)) {
+                continue;
             }
             apply_plan(func, &plan);
             // One firing per run: the rewrite invalidates the analyses. The
@@ -170,8 +158,6 @@ struct StoreInfo {
 struct Plan {
     /// Inner counted loop C: header block (contains the stores + IV logic).
     c_header: BlockId,
-    /// Outer loop L that the computation is deferred past.
-    l_header: BlockId,
     /// L's single exit edge.
     exit_src: BlockId,
     exit_tgt: BlockId,
@@ -199,7 +185,7 @@ struct DefMap {
 
 impl DefMap {
     fn build(func: &MachFunction) -> Self {
-        let mut defs: HashMap<VReg, Vec<(InstId, BlockId)>> = HashMap::new();
+        let mut defs: HashMap<VReg, Vec<(InstId, BlockId)>> = HashMap::default();
         for &block_id in &func.block_order {
             for &inst_id in &func.block(block_id).insts {
                 let inst = func.inst(inst_id);
@@ -480,7 +466,6 @@ fn plan_for_inner_loop(
 
     Some(Plan {
         c_header: c.header,
-        l_header: l.header,
         exit_src,
         exit_tgt,
         iv,
@@ -648,6 +633,11 @@ fn qualifies_as_outer(
         return None;
     }
     let (exit_src, exit_tgt) = exits[0];
+    // The deferred blocks are inserted immediately before this target. A CFG
+    // edge alone does not establish that the target is present in the layout.
+    if !func.block_order.contains(&exit_tgt) {
+        return None;
+    }
     if !dom.dominates(c.header, exit_src) {
         return None;
     }
@@ -701,7 +691,7 @@ fn slot_accesses_admissible(
     let store_ids: HashSet<InstId> = stores.iter().map(|s| s.inst_id).collect();
 
     // Roots: every AddPCRel of this slot anywhere in the function.
-    let mut derived: HashSet<VReg> = HashSet::new();
+    let mut derived: HashSet<VReg> = HashSet::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
@@ -841,10 +831,10 @@ fn compute_slice(
         .map(|(i, id)| (*id, i))
         .collect();
 
-    let mut slice: HashSet<InstId> = HashSet::new();
+    let mut slice: HashSet<InstId> = HashSet::default();
     let mut inputs: Vec<(VReg, InstId)> = Vec::new();
-    let mut input_set: HashSet<VReg> = HashSet::new();
-    let mut invariants: HashSet<VReg> = HashSet::new();
+    let mut input_set: HashSet<VReg> = HashSet::default();
+    let mut invariants: HashSet<VReg> = HashSet::default();
     let mut worklist: Vec<VReg> = Vec::new();
 
     for s in stores {
@@ -852,7 +842,7 @@ fn compute_slice(
         worklist.push(s.value);
     }
 
-    let mut visited: HashSet<VReg> = HashSet::new();
+    let mut visited: HashSet<VReg> = HashSet::default();
     while let Some(v) = worklist.pop() {
         if !visited.insert(v) {
             continue;
@@ -1233,7 +1223,7 @@ fn flag_discipline_ok(
 /// True when every def produced by a slice (removed) instruction is used only
 /// by other slice instructions.
 fn removed_defs_have_no_external_uses(func: &MachFunction, slice: &HashSet<InstId>) -> bool {
-    let mut removed_defs: HashSet<VReg> = HashSet::new();
+    let mut removed_defs: HashSet<VReg> = HashSet::default();
     for &id in slice {
         let inst = func.inst(id);
         for (pos, op) in inst.operands.iter().enumerate() {
@@ -1390,7 +1380,7 @@ fn apply_plan(func: &mut MachFunction, plan: &Plan) {
     ];
 
     // Captured input loads; map original input vregs to the reloads.
-    let mut vmap: HashMap<VReg, VReg> = HashMap::new();
+    let mut vmap: HashMap<VReg, VReg> = HashMap::default();
     for (k, (input, _)) in plan.inputs.iter().enumerate() {
         let c_k = VReg::new(func.alloc_vreg(), RegClass::Fpr64);
         vmap.insert(*input, c_k);
@@ -1413,7 +1403,7 @@ fn apply_plan(func: &mut MachFunction, plan: &Plan) {
     //   * an input vreg maps to its scratch reload;
     //   * any other vreg (loop-invariant) passes through UNCHANGED — its def
     //     dominates the new blocks (checked during slice admission).
-    let mut slice_defs: HashSet<VReg> = HashSet::new();
+    let mut slice_defs: HashSet<VReg> = HashSet::default();
     for &orig_id in &plan.slice {
         let inst = func.inst(orig_id);
         for (pos, op) in inst.operands.iter().enumerate() {
@@ -1566,6 +1556,7 @@ fn apply_plan(func: &mut MachFunction, plan: &Plan) {
 
 #[cfg(test)]
 mod tests {
+    mod eh_call_custody_tests;
     use super::*;
     use trust_cg_ir::regs::{D0, SP, V0, V1};
     use trust_cg_ir::{PReg, Signature, Type};
@@ -1968,6 +1959,15 @@ mod tests {
             !bb4_succs.contains(&BlockId(5)),
             "exit edge must be split: {bb4_succs:?}"
         );
+    }
+
+    #[test]
+    fn exit_missing_from_layout_is_refused_without_mutation() {
+        let mut f = make_nest(true);
+        f.block_order.retain(|b| *b != BlockId(5));
+        let before = format!("{f:?}");
+        assert!(!run_pass(&mut f));
+        assert_eq!(format!("{f:?}"), before);
     }
 
     #[test]

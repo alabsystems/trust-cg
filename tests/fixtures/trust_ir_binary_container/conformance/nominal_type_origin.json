@@ -1,0 +1,266 @@
+{
+  "name": "nominal_type_origin",
+  "functions": [
+    {
+      "id": 0,
+      "name": "span_lo",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "U32",
+                  "value": {
+                    "Int": 7
+                  }
+                }
+              },
+              "results": [
+                0
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": {
+        "Gated": {
+          "authority": "conformance-fixture"
+        }
+      },
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [
+    {
+      "id": 0,
+      "name": "Span",
+      "fields": [
+        {
+          "name": "",
+          "ty": "U32",
+          "offset": null
+        },
+        {
+          "name": "",
+          "ty": "U32",
+          "offset": null
+        }
+      ],
+      "size": 8,
+      "align": 4,
+      "repr": "Rust",
+      "origin": {
+        "Rust": {
+          "stable_crate_id": 81985529216486895,
+          "def_path_hash": [
+            0,
+            17,
+            34,
+            51,
+            68,
+            85,
+            102,
+            119,
+            136,
+            153,
+            170,
+            187,
+            204,
+            221,
+            238,
+            255
+          ],
+          "args_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98,
+              98
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 1,
+      "name": "Unkeyed",
+      "fields": [
+        {
+          "name": "",
+          "ty": "U8",
+          "offset": null
+        }
+      ],
+      "size": 1,
+      "align": 1,
+      "repr": "Rust"
+    }
+  ],
+  "enums": [
+    {
+      "id": 0,
+      "name": "Nat",
+      "variants": [
+        {
+          "name": "Zero",
+          "fields": [],
+          "field_names": []
+        },
+        {
+          "name": "Succ",
+          "fields": [
+            "U64"
+          ],
+          "field_names": []
+        }
+      ],
+      "discriminants": [],
+      "repr": null,
+      "layout": null,
+      "origin": {
+        "Clean": {
+          "decl": "Trust.Nat",
+          "env_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81,
+              81
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [
+        "U32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "aapcs64",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

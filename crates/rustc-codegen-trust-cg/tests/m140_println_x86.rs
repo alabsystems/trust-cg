@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: `print!`/`println!`/`eprint!`/`eprintln!` through the
 // bridge — compiled + RUN for x86_64 and DIFFERENTIALLY compared against
@@ -12,8 +16,9 @@ mod target_dir_support;
 // Status: task m140 — the `std::io::_print`/`_eprint` interception (the
 // hello-world unblock). The interception decodes the `fmt::Arguments` shape
 // statically (the same four MIR shapes `format!` already decodes), synthesizes
-// the bytes in the caller's frame, and sinks them to fd 1/2 via the
-// `__trustcg_write_all` full-write helper. SOUND-PARTIAL: only the bounded
+// the bytes in the caller's frame, and hands them to the same std entry as a
+// string-literal `fmt::Arguments` (std's own buffered sink; see
+// `print_order_differential.rs`). SOUND-PARTIAL: only the bounded
 // `{}` subset of int/&str/char/bool is modeled; `{:?}`, padding/alignment,
 // named args, and u128/i128 FAIL CLOSED (pinned below — never a wrong byte).
 //
@@ -23,66 +28,15 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const OPT_LEVELS: [&str; 4] = ["0", "1", "2", "3"];
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m140 test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -113,15 +67,17 @@ fn run_llvm(dir: &Path, stem: &str, src: &str) -> RunResult {
     let src_path = dir.join(format!("{stem}.rs"));
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(format!("{stem}_llvm"));
-    let status = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let status = toolchain_support::rustc_command()
         .args(["--crate-type", "bin", "-Cpanic=abort", "-O"])
         .arg("-o")
         .arg(&bin)
         .arg(&src_path)
         .status()
         .expect("spawn rustc (LLVM)");
-    assert!(status.success(), "LLVM reference failed to compile: <<<{src}>>>");
+    assert!(
+        status.success(),
+        "LLVM reference failed to compile: <<<{src}>>>"
+    );
     run_bin(&bin)
 }
 
@@ -132,8 +88,7 @@ fn run_bridge(dir: &Path, dylib: &Path, stem: &str, src: &str, opt: &str) -> Opt
     let bin = dir.join(format!("{stem}_t{opt}"));
     let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
     backend_arg.push(dylib);
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "bin"])
         .arg(backend_arg)
         .args(["--target", TARGET, "-Cpanic=abort"])
@@ -226,11 +181,26 @@ fn unmodeled_println_shapes_fail_closed_or_match() {
     let dir = workdir("canaries");
 
     let cases: &[(&str, &str)] = &[
-        ("dbg", r#"fn main(){ println!("{:?}", std::hint::black_box(3i32)); }"#),
-        ("pad", r#"fn main(){ println!("{:>5}", std::hint::black_box(3i32)); }"#),
-        ("u128p", r#"fn main(){ println!("{}", std::hint::black_box(3u128)); }"#),
-        ("named", r#"fn main(){ let v=std::hint::black_box(9i32); println!("{v}"); }"#),
-        ("hexfmt", r#"fn main(){ println!("{:x}", std::hint::black_box(255u32)); }"#),
+        (
+            "dbg",
+            r#"fn main(){ println!("{:?}", std::hint::black_box(3i32)); }"#,
+        ),
+        (
+            "pad",
+            r#"fn main(){ println!("{:>5}", std::hint::black_box(3i32)); }"#,
+        ),
+        (
+            "u128p",
+            r#"fn main(){ println!("{}", std::hint::black_box(3u128)); }"#,
+        ),
+        (
+            "named",
+            r#"fn main(){ let v=std::hint::black_box(9i32); println!("{v}"); }"#,
+        ),
+        (
+            "hexfmt",
+            r#"fn main(){ println!("{:x}", std::hint::black_box(255u32)); }"#,
+        ),
     ];
 
     for (stem, src) in cases {

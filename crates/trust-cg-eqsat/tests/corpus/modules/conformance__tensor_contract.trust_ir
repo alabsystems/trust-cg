@@ -1,0 +1,12 @@
+; TrustIr text format v1
+module "tensor_contract"
+target "aarch64-apple-darwin" 8 little structpass=unclassified
+
+functy.0 = (tensor<i32, 2>, tensor<i32, 2>) -> (tensor<i32, 2>)
+
+fn @matmul(functy.0) {
+    ; #body-gate: ungated
+bb0(%0: tensor<i32, 2>, %1: tensor<i32, 2>):
+    %2 = tensor_contract tensor<i32, 2> %0, %1 batch [] contract [1:0]
+    ret %2
+}

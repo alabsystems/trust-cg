@@ -22,7 +22,7 @@ use trust_cg_ir::regs::{
     PReg, RegClass, SP, WSP, WZR, XZR, gpr32_to_gpr64, preg_class, reg_number, regs_overlap,
 };
 use trust_cg_ir::types::{InstId, StackSlotId};
-use trust_cg_opt::effects::{aarch64_def_operand_positions, is_lse_cas, is_lse_rmw};
+use trust_cg_opt::effects::{aarch64_def_operand_positions, has_explicit_atomic_operand_roles};
 
 use crate::dwarf_info::{LocationListEntry, VariableLocation};
 
@@ -152,10 +152,21 @@ impl<'a> DebugProvenanceAdapter<'a> {
         local: DebugProvenanceLocal,
         loc: &VarLocation,
     ) -> Option<LocationListEntry> {
-        let (low_pc, size) = self.range_byte_bounds(loc)?;
+        let (mut low_pc, mut size) = self.range_byte_bounds(loc)?;
         let dwarf_location = match loc.value {
             LocationExpr::Reg(preg) => {
                 self.validate_register_range(local, loc, preg)?;
+                // `loc.start` is the instruction that DEFINES `preg`; the
+                // register holds the value only once it has executed, so the
+                // DWARF range begins at the next instruction (the convention
+                // of LLVM's and GCC's location lists). A range whose only
+                // instruction is the definition describes nothing.
+                const AARCH64_INSTRUCTION_BYTES: u32 = 4;
+                size = size.checked_sub(AARCH64_INSTRUCTION_BYTES)?;
+                if size == 0 {
+                    return None;
+                }
+                low_pc += u64::from(AARCH64_INSTRUCTION_BYTES);
                 VariableLocation::Register(dwarf_register_number(preg)?)
             }
             LocationExpr::Stack(slot) => {
@@ -577,7 +588,7 @@ fn def_operand_positions(inst: &MachInst) -> Vec<usize> {
 }
 
 fn opcode_has_lse_atomic_operand_roles(opcode: AArch64Opcode) -> bool {
-    is_lse_rmw(opcode) || is_lse_cas(opcode)
+    has_explicit_atomic_operand_roles(opcode)
 }
 
 fn opcode_has_explicit_writeback_operand_roles(opcode: AArch64Opcode) -> bool {
@@ -718,9 +729,11 @@ mod tests {
         let adapter = DebugProvenanceAdapter::new(&func, &provenance, &[], 12, [local(var_id)]);
         let entries = adapter.location_list_entries(var_id);
 
+        // `first` (offset 0) defines X0; the value is in X0 from the next
+        // instruction until `ret` (offset 8).
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].low_pc, 0);
-        assert_eq!(entries[0].size, 8);
+        assert_eq!(entries[0].low_pc, 4);
+        assert_eq!(entries[0].size, 4);
     }
 
     #[test]

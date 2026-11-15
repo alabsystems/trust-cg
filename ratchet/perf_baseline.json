@@ -8,16 +8,42 @@
     "the climb to parity, not a parity gate): it fails on cliffs, not on parity misses.",
     "The regression baseline is NOT stored here: it is derived as the best committed",
     "EVIDENCE row per metric from ratchet/ledger.jsonl (headline_eligible only, same",
-    "host_arch). LOADED/dirty/smoke rows never become baselines. MISMATCH != 0 and",
+    "host_arch, host_model and target). LOADED/dirty/smoke rows never become baselines. MISMATCH != 0 and",
     "proof-weakening env (TCG_NO_PROOF_CERTS / TCG_REFINE_SOLVER=0 / TCG_NO_PROOF_CACHE)",
     "are unconditional rejects regardless of any threshold — not ratchetable.",
     "Noise floor rationale (contract section 2): runtime 10% > the max(5%, 2x spread)",
     "significance floor on a quiet machine; compile 25% catches the popcnt-canary class",
-    "(~9x) and the greedy-interferes class while tolerating verdict-cache variance."
+    "(~9x) and the greedy-interferes class while tolerating verdict-cache variance.",
+    "Size and memory (added 2026-09-26 with gates.json version 2, before any row measured",
+    "RSS on Linux): linked file size is deterministic for a given source and toolchain, and",
+    "the shared std dominates it, so 5% is a code-size cliff, not drift. Peak RSS repeats",
+    "within about 1% on a quiet host (five identical compiles, 2026-08-07 archive study),",
+    "so 10% (the runtime floor) catches cliffs such as a whole proof lane's retained memory",
+    "without reacting to allocator jitter. A new resolved program-RSS loss (gates.json R1)",
+    "is red like a coverage drop. A metric the baselines measured but the new evidence row",
+    "lacks is red: an unmeasured metric cannot show that it did not regress.",
+    "Emitted-code size (added 2026-09-29 with gates.json version 3, before any row measured it): the program's own code and read-only data bytes from the linker map are deterministic for a given source and toolchain, so any change is real; 5% flags a code-size cliff while leaving room for an optimization that trades bytes for speed. Peak RSS is now the median of 5 samples per lane; its 10% floors are unchanged."
   ],
   "thresholds": {
     "runtime_geomean_max_regress_pct": 10,
     "compile_warm_o2_max_regress_pct": 25,
+    "size_geomean_max_regress_pct": 5,
+    "emitted_size_geomean_max_regress_pct": 5,
+    "program_rss_geomean_max_regress_pct": 10,
+    "compile_rss_o2_max_regress_pct": 10,
+    "program_rss_new_resolved_loss_is_red": true,
+    "coverage_drop_is_red": true
+  },
+  "wasm32_notes": [
+    "wasm32 row family (benchmarks/wasm-vs-llvm, added 2026-10-01 with contract version 1, before any wasm32 row existed): consumed by scripts/wasm_perf_ratchet.py.",
+    "Deterministic metrics (file and code bytes, static instructions, declared locals, static and dynamic memory operations, dynamic instructions and calls, stack high-water) are fixed for a given source, backend dylib and toolchain: they are compared only with evidence rows of the same rustc, wasm-ld, sysroot, input grid and contract version, so ANY increase is a real change. Their floor is 0%: an optimization that trades one of them for another lands with an explicit reviewed change here or a new baseline row, never by drift.",
+    "Reviewed trade, round 7 (2026-10-01, P1 bridge constants/bit operations and P2 out-of-line 128-bit division; docs/wasm32_perf_roadmap.md section 0.1): against the 3af946d8f bridge on the same toolchain key, declared locals total vs LLVM -O2 rose 5.62486x -> 5.88639x (+4.65%, one local per SSA value in the bigger inline P1 code) and dynamic calls total rose 1.50683x -> 1.54303x (+2.40%, every new call is the division helper, in the 7 programs that divide 128-bit values), while dynamic instructions fell 11.0%, dynamic memory operations 35.4%, stack high-water 15.1% and file bytes 6.5%. Both measurements are non-evidence; no wasm32 evidence row exists at 3af946d8f. The first wasm32 evidence row must therefore be measured at or after the commit that lands round 7: a row taken at 3af946d8f would make every later row RED on these two metrics, and the floor stays 0%.",
+    "Timing (min of N per engine mode, compared only with the same host and node/V8) gets the native runtime floor of 10%.",
+    "A coverage drop is red. A MISMATCH is an unconditional reject, as for native rows."
+  ],
+  "wasm32_thresholds": {
+    "deterministic_max_regress_pct": 0,
+    "time_geomean_max_regress_pct": 10,
     "coverage_drop_is_red": true
   }
 }

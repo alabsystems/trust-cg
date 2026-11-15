@@ -7,8 +7,8 @@
 // values that are LIVE ACROSS A CALL must survive the call. The existing
 // jit_diff fuzzer only exercises call-free arithmetic, so the call-crossing
 // register-allocation path (especially under the `jit_fast` single-pass
-// allocator that `for_host_jit`/`jit_fast` profiles use in production) is never
-// differentially tested. This harness builds self-contained modules where the
+// allocator that `for_host_jit`/`jit_fast` profiles use in production) needs
+// separate differential coverage. This harness builds self-contained modules where the
 // entry keeps N independent values (GPR and/or FP) live across an in-module
 // call (which clobbers the caller-saved registers), with a configurable callee
 // arity (>8 forces stack-passed args / SP-16 alignment), then compares the
@@ -214,77 +214,225 @@ fn build_module(cfg: Cfg) -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
-#[derive(Clone, Copy)]
-enum Run {
-    Value(i64),
-    CompileErr,
-    SymbolMissing,
+type RunResult = Result<i64, String>;
+
+fn capture<T>(operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    panic::catch_unwind(panic::AssertUnwindSafe(operation)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic payload");
+        Err(format!("PANIC: {message}"))
+    })
 }
 
-fn jit_run(module: &trust_ir::Module, opt: OptLevel, jit_fast: bool, row: &[i64]) -> Run {
-    let externs: HashMap<String, *const u8> = HashMap::new();
-    let mut config = if jit_fast {
-        CompilerConfig::jit_fast(Target::host())
-    } else {
-        let mut c = CompilerConfig::for_host_jit();
-        c.enable_jit_fast_regalloc = false;
-        c
-    };
-    config.opt_level = opt;
-    let compiler = Compiler::new(config);
-    let buf = match compiler.compile_module_to_jit(module, &externs) {
-        Ok(r) => r.buffer,
-        Err(_) => return Run::CompileErr,
-    };
-    type Fn4 = extern "C" fn(i64, i64, i64, i64) -> i64;
-    let fptr = match unsafe { buf.get_fn_bound::<Fn4>(ENTRY) } {
-        Some(p) => p.into_inner(),
-        None => return Run::SymbolMissing,
-    };
-    let v = fptr(row[0], row[1], row[2], row[3]);
-    drop(buf);
-    Run::Value(v)
+/// Compile each module/configuration once, keeping its owned executable alive
+/// for every input row. Compile, lookup, execution, and panic failures remain
+/// results to compare, never missing comparisons. Signals and hangs are bounded
+/// by the matrix's process-group runner, not caught by Rust's unwind handler.
+fn run_rows<T>(
+    rows: &[[i64; 4]],
+    compile: impl FnOnce() -> Result<T, String>,
+    mut run: impl FnMut(&T, &[i64; 4]) -> RunResult,
+) -> Vec<RunResult> {
+    assert!(!rows.is_empty(), "a differential run needs input rows");
+    let compiled = capture(compile);
+    rows.iter()
+        .map(|row| match &compiled {
+            Ok(artifact) => capture(|| run(artifact, row)),
+            Err(error) => Err(error.clone()),
+        })
+        .collect()
 }
 
-/// Run the indirect-call entry natively, passing the JIT'd `clobber` address
-/// (looked up from the same buffer) as the function-pointer argument. Returns
-/// None if compilation/lookup fails.
-fn jit_run_indirect(
+fn jit_rows(
     module: &trust_ir::Module,
     opt: OptLevel,
     jit_fast: bool,
-    row: &[i64],
-) -> Option<i64> {
-    let externs: HashMap<String, *const u8> = HashMap::new();
-    let mut config = if jit_fast {
-        CompilerConfig::jit_fast(Target::host())
-    } else {
-        let mut c = CompilerConfig::for_host_jit();
-        c.enable_jit_fast_regalloc = false;
-        c
-    };
-    config.opt_level = opt;
-    let compiler = Compiler::new(config);
-    let buf = compiler
-        .compile_module_to_jit(module, &externs)
-        .ok()?
-        .buffer;
-    let clobber_ptr = buf.get_fn_ptr_bound("clobber")?;
-    type FnInd = extern "C" fn(*const u8, i64, i64, i64, i64) -> i64;
-    let fptr = unsafe { buf.get_fn_bound::<FnInd>(ENTRY) }?.into_inner();
-    let v = fptr(clobber_ptr.as_ptr(), row[0], row[1], row[2], row[3]);
-    drop(buf);
-    Some(v)
+    indirect: bool,
+    rows: &[[i64; 4]],
+) -> Vec<RunResult> {
+    run_rows(
+        rows,
+        || {
+            let externs: HashMap<String, *const u8> = HashMap::new();
+            let mut config = if jit_fast {
+                CompilerConfig::jit_fast(Target::host())
+            } else {
+                let mut config = CompilerConfig::for_host_jit();
+                config.enable_jit_fast_regalloc = false;
+                config
+            };
+            config.opt_level = opt;
+            Compiler::new(config)
+                .with_codegen_license(permit_unlicensed())
+                .compile_module_to_jit(module, &externs)
+                .map(|result| result.buffer)
+                .map_err(|error| format!("COMPILE_ERR: {error}"))
+        },
+        |buffer, row| {
+            if indirect {
+                let clobber = buffer
+                    .get_fn_ptr_bound("clobber")
+                    .ok_or_else(|| "SYMBOL_MISSING: clobber".to_owned())?;
+                type FnInd = extern "C" fn(*const u8, i64, i64, i64, i64) -> i64;
+                // build_module's indirect entry has this exact signature; the
+                // entry and clobber both belong to the still-live buffer.
+                let entry = unsafe { buffer.get_fn_bound::<FnInd>(ENTRY) }
+                    .ok_or_else(|| format!("SYMBOL_MISSING: {ENTRY}"))?;
+                Ok(entry.into_inner()(
+                    clobber.as_ptr(),
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                ))
+            } else {
+                type Fn4 = extern "C" fn(i64, i64, i64, i64) -> i64;
+                // build_module's direct entry has this exact signature and the
+                // borrowed buffer outlives the call.
+                let entry = unsafe { buffer.get_fn_bound::<Fn4>(ENTRY) }
+                    .ok_or_else(|| format!("SYMBOL_MISSING: {ENTRY}"))?;
+                Ok(entry.into_inner()(row[0], row[1], row[2], row[3]))
+            }
+        },
+    )
+}
+
+fn oracle_rows(module: &trust_ir::Module, rows: &[[i64; 4]]) -> Vec<RunResult> {
+    rows.iter()
+        .map(|row| {
+            capture(|| {
+                run_oracle_one(module, row).map_err(|error| format!("ORACLE_ERR: {error:?}"))
+            })
+        })
+        .collect()
+}
+
+fn reference_module(cfg: Cfg) -> trust_ir::Module {
+    // This fixture's only memory operation is a store of args[0] immediately
+    // followed by an I64 load from the same private alloca. Its address never
+    // escapes, and no call or other write intervenes. The register-only shape
+    // therefore computes the same expected value without asking the interpreter
+    // to model Alloca. Keep memory enabled in the JIT module under test. This is
+    // a generator-specific reference, never an error-triggered oracle fallback
+    // or a general permission to erase memory operations from arbitrary IR.
+    build_module(Cfg {
+        use_memory: false,
+        ..cfg
+    })
+}
+
+fn compare_results(expected: &RunResult, actual: &RunResult) -> Result<(), String> {
+    match (expected, actual) {
+        (Ok(expected), Ok(actual)) if expected == actual => Ok(()),
+        _ => Err(format!("expected={expected:?}, actual={actual:?}")),
+    }
+}
+
+#[test]
+fn harness_missing_results_and_equal_failures_are_not_agreement() {
+    let values = [
+        Ok(1),
+        Ok(2),
+        Err("compile failure".to_owned()),
+        Err("oracle failure".to_owned()),
+    ];
+    for expected in &values {
+        for actual in &values {
+            let real_agreement = matches!((expected, actual), (Ok(a), Ok(b)) if a == b);
+            assert_eq!(compare_results(expected, actual).is_ok(), real_agreement);
+        }
+    }
+}
+
+#[test]
+fn harness_compiles_once_and_executes_every_input_row() {
+    let rows = rows();
+    let mut compilations = 0;
+    let mut executions = 0;
+    let actual = run_rows(
+        &rows,
+        || {
+            compilations += 1;
+            Ok(42_i64)
+        },
+        |artifact, row| {
+            executions += 1;
+            Ok(artifact.wrapping_add(row[0]))
+        },
+    );
+    assert_eq!(compilations, 1);
+    assert_eq!(executions, rows.len());
+    assert_eq!(
+        actual,
+        rows.iter()
+            .map(|row| Ok(42_i64.wrapping_add(row[0])))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn harness_compile_and_execution_failures_preserve_all_rows() {
+    let rows = rows();
+    for panics in [false, true] {
+        let actual = run_rows::<()>(
+            &rows,
+            || {
+                if panics {
+                    panic!("compile panic control");
+                }
+                Err("compile error control".to_owned())
+            },
+            |_, _| panic!("failed compilation must never execute"),
+        );
+        assert_eq!(actual.len(), rows.len());
+        assert!(actual.iter().all(Result::is_err));
+    }
+    let mut executions = 0;
+    let actual = run_rows(
+        &rows,
+        || Ok(()),
+        |_, _| {
+            executions += 1;
+            match executions {
+                1 => panic!("execution panic control"),
+                2 => Err("missing symbol control".to_owned()),
+                _ => Ok(42),
+            }
+        },
+    );
+    assert_eq!(executions, rows.len());
+    assert!(actual[0].is_err());
+    assert!(actual[1].is_err());
+    assert!(actual[2..].iter().all(|result| result == &Ok(42)));
+}
+
+#[test]
+fn harness_memory_reference_executes_and_compares_every_row() {
+    let cfg = Cfg::gpr(8, 1, 0, true);
+    let rows = rows();
+    let expected = oracle_rows(&reference_module(cfg), &rows);
+    let actual = jit_rows(&build_module(cfg), OptLevel::O0, true, false, &rows);
+    assert_eq!(actual.len(), rows.len());
+    assert_eq!(expected.len(), rows.len());
+    assert!(expected.iter().all(Result::is_ok));
+    for (expected, actual) in expected.iter().zip(&actual) {
+        compare_results(expected, actual)
+            .expect("private store/load fixture must match its reference");
+    }
 }
 
 #[test]
 fn call_crossing_indirect_matches_direct() {
     // Build identical computations as direct-call and indirect-call modules.
-    // The direct form is already proven == interpreter, so any divergence here
-    // isolates the call_indirect lowering (x16/x17 IP scratch, blr ABI).
+    // Check both forms against the interpreter for each exact configuration,
+    // as well as against each other. Agreement of two JIT paths is not proof,
+    // and another sweep is not an oracle for this sweep's different shapes.
     let mut configs = Vec::new();
     for pressure in [4u32, 8, 12, 16, 20, 24, 32] {
         for callee_args in [8u32, 10, 12, 16] {
@@ -314,41 +462,24 @@ fn call_crossing_indirect_matches_direct() {
             ..base
         });
         n += 1;
-        for row in &rows {
-            let oracle = run_oracle_one(&direct_mod, row).ok();
-            for jit_fast in [true, false] {
-                for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
-                    let direct = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        jit_run(&direct_mod, opt, jit_fast, row)
-                    }));
-                    let indirect = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        jit_run_indirect(&indirect_mod, opt, jit_fast, row)
-                    }));
-                    let dval = match direct {
-                        Ok(Run::Value(v)) => Some(v),
-                        _ => None,
-                    };
-                    let ival = match indirect {
-                        Ok(Some(v)) => Some(v),
-                        Ok(None) => {
+        let oracle = oracle_rows(&direct_mod, &rows);
+        for jit_fast in [true, false] {
+            for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+                let direct = jit_rows(&direct_mod, opt, jit_fast, false, &rows);
+                let indirect = jit_rows(&indirect_mod, opt, jit_fast, true, &rows);
+                assert_eq!(direct.len(), rows.len());
+                assert_eq!(indirect.len(), rows.len());
+                for (index, row) in rows.iter().enumerate() {
+                    for (label, expected, actual) in [
+                        ("DIRECT/ORACLE", &oracle[index], &direct[index]),
+                        ("INDIRECT/ORACLE", &oracle[index], &indirect[index]),
+                        ("INDIRECT/DIRECT", &direct[index], &indirect[index]),
+                    ] {
+                        if let Err(error) = compare_results(expected, actual) {
                             defects.push(format!(
-                                "INDIRECT_COMPILE_FAIL p={pressure} args={callee_args} loop={loop_iters} calls={calls} fast={jit_fast} opt={opt:?}"
+                                "{label} cfg={base:?} row={row:?} fast={jit_fast} opt={opt:?}: {error}"
                             ));
-                            None
                         }
-                        Err(_) => {
-                            defects.push(format!(
-                                "INDIRECT_PANIC p={pressure} args={callee_args} loop={loop_iters} calls={calls} row={row:?} fast={jit_fast} opt={opt:?}"
-                            ));
-                            None
-                        }
-                    };
-                    if let (Some(dv), Some(iv)) = (dval, ival)
-                        && dv != iv
-                    {
-                        defects.push(format!(
-                                "INDIRECT!=DIRECT p={pressure} args={callee_args} loop={loop_iters} calls={calls} row={row:?} fast={jit_fast} opt={opt:?}: direct={dv} indirect={iv} oracle={oracle:?}"
-                            ));
                     }
                 }
             }
@@ -368,42 +499,30 @@ fn call_crossing_indirect_matches_direct() {
 }
 
 fn sweep(configs: &[Cfg], rows: &[[i64; 4]], defects: &mut Vec<String>) -> usize {
+    assert!(
+        !configs.is_empty(),
+        "a differential sweep needs configurations"
+    );
     let mut n = 0;
     for &cfg in configs {
-        // Indirect variant can't be run natively here (no host callee ptr).
+        // Indirect configurations belong to the paired sweep, not a silently
+        // skipped request in this direct-only helper.
         if cfg.indirect {
+            defects.push(format!("INVALID_DIRECT_SWEEP_CONFIG: {cfg:?}"));
             continue;
         }
         let module = build_module(cfg);
         n += 1;
-        for row in rows {
-            let oracle_val = match run_oracle_one(&module, row) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for jit_fast in [true, false] {
-                for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
-                    let got = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        jit_run(&module, opt, jit_fast, row)
-                    }));
-                    match got {
-                        Ok(Run::Value(v)) if v != oracle_val => defects.push(format!(
-                            "MISCOMPILE cfg={:?} row={:?} fast={} opt={:?}: interp={} jit={}",
-                            cfg, row, jit_fast, opt, oracle_val, v
-                        )),
-                        Ok(Run::Value(_)) => {}
-                        Ok(Run::CompileErr) => defects.push(format!(
-                            "COMPILE_ERR cfg={:?} fast={} opt={:?}",
-                            cfg, jit_fast, opt
-                        )),
-                        Ok(Run::SymbolMissing) => defects.push(format!(
-                            "SYMBOL_MISSING cfg={:?} fast={} opt={:?}",
-                            cfg, jit_fast, opt
-                        )),
-                        Err(_) => defects.push(format!(
-                            "PANIC cfg={:?} row={:?} fast={} opt={:?}",
-                            cfg, row, jit_fast, opt
-                        )),
+        let oracle = oracle_rows(&reference_module(cfg), rows);
+        for jit_fast in [true, false] {
+            for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+                let actual = jit_rows(&module, opt, jit_fast, false, rows);
+                assert_eq!(actual.len(), rows.len());
+                for (index, row) in rows.iter().enumerate() {
+                    if let Err(error) = compare_results(&oracle[index], &actual[index]) {
+                        defects.push(format!(
+                            "DIRECT/ORACLE cfg={cfg:?} row={row:?} fast={jit_fast} opt={opt:?}: {error}"
+                        ));
                     }
                 }
             }
@@ -515,4 +634,13 @@ fn call_crossing_fp_matches_oracle() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

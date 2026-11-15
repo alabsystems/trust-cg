@@ -1,0 +1,22 @@
+; TrustIr text format v1
+module "mir::closure::p_isnan"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_interp_float_probe_slice.rs"
+
+functy.0 = (ptr) -> (bool)
+
+functy.1 = (ptr) -> (u32)
+
+fn @_RNvMNtCs2EYQwhfuABO_4core3f64d6is_nanCsTtRAN68iY5_30trust_interp_float_probe_slice(functy.0) {
+}
+
+fn @p_isnan(functy.1) {
+bb0(%0: ptr):
+    %2 = call @func.0(%0)
+    br bb1(%2)
+bb1(%1: bool):
+    %3 = const u32 1
+    %4 = const u32 0
+    %5 = select u32 %1, %3, %4
+    ret %5
+}

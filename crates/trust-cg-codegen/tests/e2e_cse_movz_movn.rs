@@ -115,7 +115,7 @@ fn encode_naked_to_host_object(func: &MachFunction) -> Vec<u8> {
         let text = writer.add_text_section(&code);
         // STT_FUNC = 2; ELF symbols carry no leading underscore.
         writer.add_symbol(&func.name, text, 0, code.len() as u64, true, 2);
-        writer.write()
+        writer.write_checked().unwrap()
     }
 }
 

@@ -1,0 +1,9 @@
+; mutant-of: icmp_ult_self
+; mutation: wrong constant (x <u x is false)
+; subject: u64
+(rule icmp_ult_self
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (icmp.ult ?x ?x))
+  (rhs true)
+  (where))

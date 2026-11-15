@@ -37,6 +37,7 @@
 //! Reference: Intel 64 and IA-32 Architectures SDM, Volume 2
 //! Reference: ~/llvm-project-ref/llvm/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp
 
+pub mod backend_timing;
 pub mod decode_check;
 pub mod encode;
 pub mod pipeline;

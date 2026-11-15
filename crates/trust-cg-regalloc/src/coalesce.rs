@@ -392,7 +392,6 @@ pub fn coalesce_copies_tuned_with_numbering(
     let mut parent: Vec<Option<VReg>> = vec![None; n_vregs];
     let mut seen: Vec<VReg> = Vec::new();
     let mut result = CoalesceResult::default();
-    let debug_decisions = std::env::var("TRUST_CG_DEBUG_COALESCE").is_ok();
 
     // The conflated-position liveness model reports v0 and v1 as
     // overlapping at the copy instruction whenever v0's last use is the
@@ -491,34 +490,9 @@ pub fn coalesce_copies_tuned_with_numbering(
                         }))
             };
             if dst_interval.overlaps(&src_interval) && !overlap_ok(&dst_interval, &src_interval) {
-                if debug_decisions {
-                    eprintln!(
-                        "  coalesce REFUSE {:?}: dst {} {:?} src {} {:?} copy_pos {:?}",
-                        inst_id,
-                        dst_root,
-                        dst_interval
-                            .ranges
-                            .iter()
-                            .map(|r| (r.start, r.end))
-                            .collect::<Vec<_>>(),
-                        src_root,
-                        src_interval
-                            .ranges
-                            .iter()
-                            .map(|r| (r.start, r.end))
-                            .collect::<Vec<_>>(),
-                        inst_numbering.get(&inst_id),
-                    );
-                }
                 continue;
             }
 
-            if debug_decisions {
-                eprintln!(
-                    "  coalesce MERGE {:?}: {} <- {}",
-                    inst_id, dst_root, src_root
-                );
-            }
             // Coalesce: merge src into dst in the union-find.
             parent[src_root.id as usize] = Some(dst_root);
             merge_interval(intervals, dst_root.id, dst_root.class, src_root.id);

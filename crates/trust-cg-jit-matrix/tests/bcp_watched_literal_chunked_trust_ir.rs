@@ -342,7 +342,7 @@ fn watched_literal_handles_no_reason_buffer() {
 fn random_3sat_matches_native_on_small_formula() {
     use trust_cg_jit_matrix::bcp_baseline::random_3sat;
     let num_vars = 20;
-    let clauses = random_3sat(num_vars, 80, 0xC0FFEE);
+    let clauses = random_3sat(num_vars, 80, 0xC0FFEE).expect("valid 3-SAT fixture");
     let (jit_status, jit_vals) = run_jit(num_vars, &clauses, &[]);
     let (ref_status, ref_vals) = reference_run(num_vars, &clauses, &[]);
     assert_eq!(jit_status, ref_status);
@@ -353,7 +353,7 @@ fn random_3sat_matches_native_on_small_formula() {
 fn random_3sat_with_decisions_matches_native() {
     use trust_cg_jit_matrix::bcp_baseline::random_3sat;
     let num_vars = 30;
-    let clauses = random_3sat(num_vars, 120, 0xBEEF);
+    let clauses = random_3sat(num_vars, 120, 0xBEEF).expect("valid 3-SAT fixture");
     let input = vec![encode(3, false), encode(7, true), encode(11, false)];
     let (jit_status, jit_vals) = run_jit(num_vars, &clauses, &input);
     let (ref_status, ref_vals) = reference_run(num_vars, &clauses, &input);
@@ -368,7 +368,7 @@ fn chunked_watch_memory_is_proportional_to_num_clauses() {
     use trust_cg_jit_matrix::bcp_baseline::random_3sat;
     let num_vars = 100;
     let num_clauses = 430;
-    let clauses = random_3sat(num_vars, num_clauses, 0xDEC1A);
+    let clauses = random_3sat(num_vars, num_clauses, 0xDEC1A).expect("valid 3-SAT fixture");
     let provider =
         JitBcpWatchedLiteralChunkedKernelProvider::compile(num_vars, clauses, 8).unwrap();
     let bytes = provider.watch_memory_bytes();

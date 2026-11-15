@@ -164,7 +164,21 @@ pub fn proof_movz_hw0() -> ProofObligation {
     let width = 64;
     let imm16 = SmtExpr::var("imm16", 16);
     let target = imm16.clone().zero_ext(48); // desired value
-    let strategy = encode_movz(imm16, 0, width);
+    // Model MOVZ's architectural bit placement independently from the source
+    // zero-extension. A direct `zext << 0` restates the source expression and
+    // is folded to a bare contradiction before an offline producer can emit a
+    // query-bound proof. The instruction actually copies each immediate bit
+    // into the matching destination bit and zeros every other bit, which is
+    // exactly this OR of sixteen one-bit placements.
+    let mut strategy = SmtExpr::bv_const(0, width);
+    for bit in 0..16 {
+        let placed = imm16
+            .clone()
+            .extract(bit, bit)
+            .zero_ext(width - 1)
+            .bvshl(SmtExpr::bv_const(bit as u64, width));
+        strategy = strategy.bvor(placed);
+    }
 
     ProofObligation {
         machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,

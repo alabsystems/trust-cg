@@ -1,0 +1,1740 @@
+{
+ "schema": "trust-cg-bench-v2",
+ "provenance": {
+  "schema": "trust-cg-bench-v2",
+  "harness": "benchmarks/beat-llvm/run.py",
+  "timestamp_utc": "2026-10-14T14:15:14+00:00",
+  "git_sha": "efc47d3bc3e58412eae6c867769c394e65b45d60",
+  "git_dirty": false,
+  "git_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "untracked_count": 1,
+  "dylib_path": "$HOME/trust-cg-w19/perf-requalification-L14-P1/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib",
+  "dylib_sha256": "55cc7f2f8bf46d677004b1ba2284733fc6cea2d7ebd0e8b935802c700e0ce395",
+  "dylib_mtime": "2026-10-14T13:38:24+00:00",
+  "rustc_version": "rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)",
+  "rustc_path": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc",
+  "driver": {
+   "schema": "trust-cg-trust-toolchain-v1",
+   "selection": "explicit-driver",
+   "requested_driver": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc",
+   "compiler": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc",
+   "targo": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo",
+   "sysroot": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192",
+   "host": "aarch64-apple-darwin",
+   "commit": "321aaeda75478038420d97830f14724c33c8dc39",
+   "release": "1.99.0-dev",
+   "version": "rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)",
+   "targo_version": "targo 1.99.0-dev (321aaeda7 2026-09-17) (targo 0.1.0)",
+   "lane": "unverified",
+   "lane_label": "diagnostic: explicit unverified Trust lane (-Ztrust-verify=off for direct compiles, targo --unverified for builds); no Trust-verified compilation claim",
+   "compiler_flags": [
+    "-Ztrust-verify=off"
+   ],
+   "bridge_pin": {
+    "path": "$HOME/trust-cg-w19/perf-requalification-L14-P1/crates/rustc-codegen-trust-cg/rust-toolchain.toml",
+    "channel": "trust",
+    "sha256": "3261c2a5c636aaa1f7d68aa4bc7d510f7a9677a2cd21da76e4b65caa77ba4780"
+   }
+  },
+  "target": "aarch64-apple-darwin",
+  "target_selection": "driver host",
+  "host_arch": "arm64",
+  "host_model": "Apple M4 Max",
+  "host_model_source": "sysctl machdep.cpu.brand_string",
+  "host_name": "m110-macbook-M4-Max-48GB-1TB.local",
+  "machine_model": "Mac16,5",
+  "legacy_host_model": "Mac16,5",
+  "cpu_features": [
+   "arm.AdvSIMD",
+   "arm.AdvSIMD_HPFPCvt",
+   "arm.FEAT_AES",
+   "arm.FEAT_AFP",
+   "arm.FEAT_BF16",
+   "arm.FEAT_BTI",
+   "arm.FEAT_CRC32",
+   "arm.FEAT_CSV2",
+   "arm.FEAT_CSV3",
+   "arm.FEAT_DIT",
+   "arm.FEAT_DPB",
+   "arm.FEAT_DPB2",
+   "arm.FEAT_DotProd",
+   "arm.FEAT_ECV",
+   "arm.FEAT_FCMA",
+   "arm.FEAT_FHM",
+   "arm.FEAT_FP16",
+   "arm.FEAT_FPAC",
+   "arm.FEAT_FPACCOMBINE",
+   "arm.FEAT_FRINTTS",
+   "arm.FEAT_FlagM",
+   "arm.FEAT_FlagM2",
+   "arm.FEAT_I8MM",
+   "arm.FEAT_JSCVT",
+   "arm.FEAT_LRCPC",
+   "arm.FEAT_LRCPC2",
+   "arm.FEAT_LSE",
+   "arm.FEAT_LSE2",
+   "arm.FEAT_PACIMP",
+   "arm.FEAT_PAuth",
+   "arm.FEAT_PAuth2",
+   "arm.FEAT_PMULL",
+   "arm.FEAT_RDM",
+   "arm.FEAT_RPRES",
+   "arm.FEAT_SB",
+   "arm.FEAT_SHA1",
+   "arm.FEAT_SHA256",
+   "arm.FEAT_SHA3",
+   "arm.FEAT_SHA512",
+   "arm.FEAT_SME",
+   "arm.FEAT_SME2",
+   "arm.FEAT_SME_F64F64",
+   "arm.FEAT_SME_I16I64",
+   "arm.FEAT_WFxT",
+   "arm.FP_SyncExceptions",
+   "arm.SME_B16F32",
+   "arm.SME_BI32I32",
+   "arm.SME_F16F32",
+   "arm.SME_F32F32",
+   "arm.SME_I16I32",
+   "arm.SME_I8I32",
+   "arm64",
+   "armv8_1_atomics",
+   "armv8_2_fhm",
+   "armv8_2_sha3",
+   "armv8_2_sha512",
+   "armv8_3_compnum",
+   "armv8_crc32",
+   "armv8_gpi",
+   "floatingpoint",
+   "neon",
+   "neon_fp16",
+   "neon_hpfp",
+   "ucnormal_mem"
+  ],
+  "cpu_features_source": "sysctl hw.optional / machdep.cpu",
+  "cpu_features_sha256": "8109e26100af753c673ddc26c96e39495d05c26d9da560724815fba35df70f5c",
+  "cpu_policy": {
+   "target_cpu": "default",
+   "target_feature": "default",
+   "lane_parity": true,
+   "bridge_extra_flags": [
+    "-Zcodegen-backend=$HOME/trust-cg-w19/perf-requalification-L14-P1/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib"
+   ],
+   "llvm_only_flags": [],
+   "source": "derived from each lane's compile command",
+   "statement": "Both lanes receive the identical trustc command except -Zcodegen-backend. No -C target-cpu / -C target-feature is passed: the LLVM lane compiles for the target's default CPU (llvm_default_target_cpu); the trust-cg lane selects instructions by its own per-target ISA profile (AArch64: AArch64IsaProfile::for_aot_target in crates/trust-cg-codegen/src/target.rs).",
+   "llvm_default_target_cpu": null,
+   "llvm_default_target_features": [
+    "aes",
+    "crc",
+    "dit",
+    "dotprod",
+    "dpb",
+    "dpb2",
+    "fcma",
+    "fhm",
+    "flagm",
+    "flagm2",
+    "fp16",
+    "frintts",
+    "jsconv",
+    "lor",
+    "lse",
+    "lse2",
+    "neon",
+    "paca",
+    "pacg",
+    "pan",
+    "pmuv3",
+    "ras",
+    "rcpc",
+    "rcpc2",
+    "rdm",
+    "sb",
+    "sha2",
+    "sha3",
+    "ssbs",
+    "v8.1a",
+    "v8.2a",
+    "v8.3a",
+    "v8.4a",
+    "vh"
+   ]
+  },
+  "affinity": {
+   "policy": "none",
+   "core": null,
+   "method": null,
+   "selection": null,
+   "cpu_capacity": null,
+   "heterogeneous": true,
+   "topology_source": "sysctl hw.nperflevels 2"
+  },
+  "rss_sampling": {
+   "method": "getrusage(RUSAGE_CHILDREN).ru_maxrss read by a single-child Python wrapper (benchmarks/beat-llvm/peak_rss.py) after the child is reaped, normalised to bytes; the largest single process in the measured tree, not a sum",
+   "ru_maxrss_unit": "bytes",
+   "reported_unit": "bytes",
+   "peak_rss_bytes": "the compiled program: the median of N dedicated runs per lane (N = n_rss), lanes interleaved run by run, outside the timed loop",
+   "compile_peak_rss_bytes": "the compiler: the largest single process of the trustc invocation (trustc or its cc/ld link step); the median of N dedicated compiles per lane (N = n_rss), lanes interleaved compile by compile, outside the timed loop",
+   "noise_policy": "every reading is the exact median of an odd number of samples, each retained with its sampler status; a lane with any failed sample has no reading (never a median of the survivors); a program comparison's parity band is max(5%, 2 x the larger lane's relative sample spread (max-min)/median), and a comparison whose spread exceeds 0.25 is unresolved; evidence needs N >= 5",
+   "gate": "contract/gates.json version 3: R1 (fails if any program's bridge median exceeds max(its LLVM -O3 median, the floor) by more than its parity band; passes only when every program's comparison is resolved, above the floor and not noisy; otherwise unmeasured) and R2 (compiler peak-RSS geomean of medians <= 1.00x LLVM -O2, no floor-bound compiler reading); the program-RSS geomean is reported, not gated",
+   "floor_rule": "every reading is at least sampler_floor_bytes and one above it is the process's peak; a comparison is resolved only when both readings are above 2x sampler_floor_bytes",
+   "cross_check": {
+    "command": "python -c 'x = b\"\\x01\" * (64 << 20)'",
+    "allocation_bytes": 67108864,
+    "rusage_bytes": 82444288,
+    "rusage_covers_allocation": true,
+    "time_wrapper": "/usr/bin/time -l",
+    "time_wrapper_present": true,
+    "time_wrapper_bytes": 82395136,
+    "relative_difference": 0.0006,
+    "agree": true,
+    "floor_command": "/usr/bin/true",
+    "sampler_floor_bytes": 1261568,
+    "time_wrapper_floor_bytes": 1261568
+   }
+  },
+  "ncpu": 16,
+  "loadavg_before": 1.97,
+  "loadavg_after": 7.64,
+  "load_threshold": 8.0,
+  "load_threshold_overridden": false,
+  "dylib_build_command": "cd crates/rustc-codegen-trust-cg && CARGO_TARGET_DIR=target-bridge RUSTC=$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/targo --unverified build --release",
+  "cc_version": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "cc_path": "/usr/bin/cc",
+  "linker_version": "@(#)PROGRAM:ld PROJECT:ld-27037.1",
+  "os": "Darwin 25.6.0 arm64",
+  "aggregation": "median-of-N per program (compile N=3, run N=5 after 1 warmup, program and compiler peak RSS N=5); raw samples retained per program as times_s and rss_samples",
+  "size_definition": "emitted-code size: bytes of the linked executable placed from object files the compile wrote into its own private output directory (codegen units and the allocator shim, not sysroot rlib members, system objects or linker-synthesized atoms), in code sections (__TEXT,__text / .text*) plus read-only data sections (__TEXT constants and literals, __DATA_CONST,__const / .rodata*, .data.rel.ro*), after dead stripping, as the linker's own map attributes them",
+  "corpus_manifest_sha256": "25c1bd79b6efb728e0d307e60b22f283d636e1decc6f2bf86d9dd6232e368a40",
+  "dylib_stale_override": false,
+  "quiet": true,
+  "load_status": "QUIET",
+  "runaway_processes": [],
+  "tcg_env": {},
+  "bridge_cg_args": [],
+  "proof_checker_degraded": [],
+  "proof_checker": {
+   "tool": "clean",
+   "candidates": [
+    {
+     "path": "$HOME/Library/Application Support/aterm/pkg/store/clean/8606/bin/clean",
+     "route": "aterm-packaged",
+     "sha256": "9c594e838ff7e73815977c2d675238828f82417e77986abfe38d75b8ab060e16",
+     "runs": true,
+     "probe": "--version",
+     "returncode": 0,
+     "version": "clean 0.9.0"
+    },
+    {
+     "path": "$HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/clean",
+     "route": "toolchain-sysroot",
+     "sha256": "53937293d4bc49d6ccd4aa57b7739f3a02b27aa478f1c6e295f2ab9f0394e822",
+     "runs": true,
+     "probe": "--version",
+     "returncode": 0,
+     "version": "clean 0.9.0"
+    }
+   ],
+   "order": "aterm-packaged (PATH <prefix>/bin), then the driver's sysroot bin/clean"
+  },
+  "cache": {
+   "mode": "warm",
+   "dir": "$HOME/.cache/trust-cg/proof-cache",
+   "verdict_count": 0,
+   "fingerprint_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "cert_store": {
+    "dir": "$HOME/.cache/trust-cg/alethe-certs",
+    "cert_count": 11315,
+    "fingerprint_sha256": "4d700d7701b486af63eaaf02382acf22177256d6cb99404ca44273480ffc16cc",
+    "cert_count_after": 11315
+   },
+   "verdict_count_after": 0
+  },
+  "n_compile": 3,
+  "n_run": 5,
+  "n_rss": 5,
+  "warmup_runs": 1,
+  "missing_required_provenance": [],
+  "provenance_complete": true
+ },
+ "headline_eligible": true,
+ "ineligible_reasons": [],
+ "programs": {
+  "b1_mispredict": {
+   "source": "benchmarks/beat-llvm/progs/b1_mispredict.rs",
+   "category": "branch",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.309,
+      0.308,
+      0.308
+     ],
+     "median_s": 0.308,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.324,
+      0.321,
+      0.32
+     ],
+     "median_s": 0.321,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.319,
+      0.32,
+      0.319
+     ],
+     "median_s": 0.319,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 3.05,
+    "loadavg_at_retry": 2.89,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "h1_vec_push_sum": {
+   "source": "benchmarks/beat-llvm/progs/h1_vec_push_sum.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.308,
+      0.307,
+      0.308
+     ],
+     "median_s": 0.308,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.322,
+      0.321,
+      0.322
+     ],
+     "median_s": 0.322,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.322,
+      0.321,
+      0.322
+     ],
+     "median_s": 0.322,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 2.63,
+    "loadavg_at_retry": 2.54,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "h2_vec_grow": {
+   "source": "benchmarks/beat-llvm/progs/h2_vec_grow.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.307,
+      0.307,
+      0.306
+     ],
+     "median_s": 0.307,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.324,
+      0.32,
+      0.322
+     ],
+     "median_s": 0.322,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.322,
+      0.323,
+      0.323
+     ],
+     "median_s": 0.323,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 2.38,
+    "loadavg_at_retry": 2.48,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "h3_box_leak": {
+   "source": "benchmarks/beat-llvm/progs/h3_box_leak.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.312,
+      0.313
+     ],
+     "median_s": 0.313,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.324,
+      0.325,
+      0.326
+     ],
+     "median_s": 0.325,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.326,
+      0.331,
+      0.328
+     ],
+     "median_s": 0.328,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 2.95,
+    "loadavg_at_retry": 3.25,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "h4_vec_dropper": {
+   "source": "benchmarks/beat-llvm/progs/h4_vec_dropper.rs",
+   "category": "heap",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.311,
+      0.312,
+      0.31
+     ],
+     "median_s": 0.311,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.326,
+      0.325,
+      0.328
+     ],
+     "median_s": 0.326,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.327,
+      0.326,
+      0.328
+     ],
+     "median_s": 0.327,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 3.22,
+    "loadavg_at_retry": 3.03,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "m1_call_chain": {
+   "source": "benchmarks/beat-llvm/progs/m1_call_chain.rs",
+   "category": "multifn",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.305,
+      0.306,
+      0.305
+     ],
+     "median_s": 0.305,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.312,
+      0.317
+     ],
+     "median_s": 0.313,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.332,
+      0.326,
+      0.318
+     ],
+     "median_s": 0.326,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 3.03,
+    "loadavg_at_retry": 3.03,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "m2_call_heavy": {
+   "source": "benchmarks/beat-llvm/progs/m2_call_heavy.rs",
+   "category": "multifn",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "bridge fail-closed (quiet machine): error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": null,
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.305,
+      0.305,
+      0.304
+     ],
+     "median_s": 0.305,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.309,
+      0.31,
+      0.312
+     ],
+     "median_s": 0.31,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.314,
+      0.312,
+      0.31
+     ],
+     "median_s": 0.312,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      18
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 6.26,
+    "loadavg_at_retry": 6.26,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p1_xorshift": {
+   "source": "benchmarks/beat-llvm/progs/p1_xorshift.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 8.24->8.24 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.303,
+      0.301,
+      0.302
+     ],
+     "median_s": 0.302,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.312,
+      0.312,
+      0.312
+     ],
+     "median_s": 0.312,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.314,
+      0.312,
+      0.313
+     ],
+     "median_s": 0.313,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      14
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 8.24,
+    "loadavg_at_retry": 8.24,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p2_collatz": {
+   "source": "benchmarks/beat-llvm/progs/p2_collatz.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 10.87->10.87 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.305,
+      0.303,
+      0.303
+     ],
+     "median_s": 0.303,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.311,
+      0.312,
+      0.31
+     ],
+     "median_s": 0.311,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.312,
+      0.311
+     ],
+     "median_s": 0.312,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      14
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 10.87,
+    "loadavg_at_retry": 10.87,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p3_gcd": {
+   "source": "benchmarks/beat-llvm/progs/p3_gcd.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 11.84->11.84 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.304,
+      0.304,
+      0.303
+     ],
+     "median_s": 0.304,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.311,
+      0.311,
+      0.311
+     ],
+     "median_s": 0.311,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.311,
+      0.312,
+      0.311
+     ],
+     "median_s": 0.311,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 11.84,
+    "loadavg_at_retry": 11.84,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p4_matmul": {
+   "source": "benchmarks/beat-llvm/progs/p4_matmul.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 18.01->19.3 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.314,
+      0.314,
+      0.313
+     ],
+     "median_s": 0.314,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.328,
+      0.332,
+      0.331
+     ],
+     "median_s": 0.331,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.333,
+      0.332,
+      0.33
+     ],
+     "median_s": 0.332,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      16
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 18.01,
+    "loadavg_at_retry": 19.3,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p5_struct_acc": {
+   "source": "benchmarks/beat-llvm/progs/p5_struct_acc.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 18.31->18.31 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.303,
+      0.304,
+      0.303
+     ],
+     "median_s": 0.303,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.312,
+      0.312
+     ],
+     "median_s": 0.312,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.312,
+      0.313
+     ],
+     "median_s": 0.313,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      14
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 18.31,
+    "loadavg_at_retry": 18.31,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p6_branch_match": {
+   "source": "benchmarks/beat-llvm/progs/p6_branch_match.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 19.49->18.49 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.306,
+      0.305,
+      0.305
+     ],
+     "median_s": 0.305,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.314,
+      0.313,
+      0.319
+     ],
+     "median_s": 0.314,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.313,
+      0.314,
+      0.312
+     ],
+     "median_s": 0.313,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      18
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 19.49,
+    "loadavg_at_retry": 18.49,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p7_sieve": {
+   "source": "benchmarks/beat-llvm/progs/p7_sieve.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 16.72->15.27 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.305,
+      0.303,
+      0.314
+     ],
+     "median_s": 0.305,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.33,
+      0.326,
+      0.326
+     ],
+     "median_s": 0.326,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.351,
+      0.352,
+      0.354
+     ],
+     "median_s": 0.352,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 16.72,
+    "loadavg_at_retry": 15.27,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "p8_closure_nest": {
+   "source": "benchmarks/beat-llvm/progs/p8_closure_nest.rs",
+   "category": "scalar",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 14.29->14.29 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.304,
+      0.303,
+      0.302
+     ],
+     "median_s": 0.303,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.312,
+      0.312,
+      0.311
+     ],
+     "median_s": 0.312,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.312,
+      0.312,
+      0.314
+     ],
+     "median_s": 0.312,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      15
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 14.29,
+    "loadavg_at_retry": 14.29,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "v1_saxpy": {
+   "source": "benchmarks/beat-llvm/progs/v1_saxpy.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 11.11->10.46 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.303,
+      0.303,
+      0.305
+     ],
+     "median_s": 0.303,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.315,
+      0.313,
+      0.315
+     ],
+     "median_s": 0.315,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.315,
+      0.316,
+      0.317
+     ],
+     "median_s": 0.316,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      17
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 11.11,
+    "loadavg_at_retry": 10.46,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "v2_memfill": {
+   "source": "benchmarks/beat-llvm/progs/v2_memfill.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 9.78->9.16 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.31,
+      0.31,
+      0.314
+     ],
+     "median_s": 0.31,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.316,
+      0.315,
+      0.315
+     ],
+     "median_s": 0.315,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.315,
+      0.316,
+      0.314
+     ],
+     "median_s": 0.315,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      18
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 9.78,
+    "loadavg_at_retry": 9.16,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  },
+  "v3_popcount": {
+   "source": "benchmarks/beat-llvm/progs/v3_popcount.rs",
+   "category": "vectorizable",
+   "expected_bridge": "MATCH",
+   "verdict": "INCOMPLETE",
+   "reason": "NONDET-CANDIDATE: fail-closed twice under load (load 8.13->7.64 > 8.0); rejection under load is not a valid completeness datum \u2014 rerun on a quiet machine; both attempts reported the IDENTICAL error, so a deterministic completeness gap is the leading hypothesis. error: error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+   "label": "NONDET-CANDIDATE",
+   "compile": {
+    "llvm_o0": {
+     "ok": true,
+     "times_s": [
+      0.304,
+      0.303,
+      0.304
+     ],
+     "median_s": 0.304,
+     "err": ""
+    },
+    "llvm_o2": {
+     "ok": true,
+     "times_s": [
+      0.315,
+      0.319,
+      0.324
+     ],
+     "median_s": 0.319,
+     "err": ""
+    },
+    "llvm_o3": {
+     "ok": true,
+     "times_s": [
+      0.328,
+      0.321,
+      0.323
+     ],
+     "median_s": 0.323,
+     "err": ""
+    },
+    "bridge_warm": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]"
+    },
+    "bridge_cold": {
+     "ok": false,
+     "times_s": [],
+     "median_s": null,
+     "err": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+     "cache": "fresh private XDG_CACHE_HOME per measured compile",
+     "cache_entries_after": [
+      19
+     ]
+    }
+   },
+   "run": {},
+   "size_bytes": {},
+   "emitted_size_bytes": {},
+   "emitted_size": {},
+   "peak_rss_bytes": {},
+   "compile_peak_rss_bytes": {},
+   "rss_samples": {
+    "program": {},
+    "compiler": {}
+   },
+   "ratios": {},
+   "nondet": {
+    "loadavg_at_fail": 8.13,
+    "loadavg_at_retry": 7.64,
+    "load_threshold": 8.0,
+    "retry_ok": false,
+    "err_first": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_retry": "error: [TCG-MIR-UNSUPPORTED] rustc_codegen_trust_cg: cannot compile required function with unsupported MIR (failing closed rather than miscompiling): causes=[TCG-PROOF-465]",
+    "err_identical": true,
+    "err_is_solver_timeout": false
+   }
+  }
+ },
+ "aggregates": {
+  "total_programs": 18,
+  "match_count": 0,
+  "incomplete_count": 18,
+  "mismatch_count": 0,
+  "nondet_failclosed_count": 0,
+  "nondet_candidate_count": 11,
+  "coverage_pct": 0.0,
+  "runtime_geomean_vs_llvm_o3": null,
+  "runtime_worst_vs_llvm_o3": null,
+  "scalar_runtime_geomean_vs_llvm_o3": null,
+  "vectorizable_worst_runtime_vs_llvm_o3": null,
+  "by_category": {
+   "branch": {
+    "total": 1,
+    "match": 0,
+    "incomplete": 1,
+    "mismatch": 0,
+    "coverage_pct": 0.0,
+    "runtime_geomean_vs_llvm_o3": null
+   },
+   "heap": {
+    "total": 4,
+    "match": 0,
+    "incomplete": 4,
+    "mismatch": 0,
+    "coverage_pct": 0.0,
+    "runtime_geomean_vs_llvm_o3": null
+   },
+   "multifn": {
+    "total": 2,
+    "match": 0,
+    "incomplete": 2,
+    "mismatch": 0,
+    "coverage_pct": 0.0,
+    "runtime_geomean_vs_llvm_o3": null
+   },
+   "scalar": {
+    "total": 6,
+    "match": 0,
+    "incomplete": 6,
+    "mismatch": 0,
+    "coverage_pct": 0.0,
+    "runtime_geomean_vs_llvm_o3": null
+   },
+   "vectorizable": {
+    "total": 5,
+    "match": 0,
+    "incomplete": 5,
+    "mismatch": 0,
+    "coverage_pct": 0.0,
+    "runtime_geomean_vs_llvm_o3": null
+   }
+  },
+  "compile_warm_geomean_vs_llvm_o0": null,
+  "compile_cold_geomean_vs_llvm_o0": null,
+  "compile_warm_geomean_vs_llvm_o2": null,
+  "compile_cold_geomean_vs_llvm_o2": null,
+  "compile_warm_geomean_vs_llvm_o3": null,
+  "compile_cold_geomean_vs_llvm_o3": null,
+  "ratio_missing": {},
+  "runtime_geomean_reliable_only": null,
+  "runtime_reliable_program_count": 0,
+  "runtime_reliable_criteria": {
+   "min_llvm_median_s": 0.05,
+   "max_rel_spread": 0.25
+  },
+  "resource_measurement_complete": true,
+  "resource_missing": [],
+  "rss_sampler_floor_bytes": 1261568,
+  "rss_floor_bound_bytes": 2523136,
+  "size_geomean_vs_llvm_o3": null,
+  "size_worst_vs_llvm_o3": null,
+  "emitted_size_geomean_vs_llvm_o3": null,
+  "emitted_size_worst_vs_llvm_o3": null,
+  "rss_geomean_vs_llvm_o3": null,
+  "compile_rss_geomean_vs_llvm_o2": null,
+  "compile_rss_geomean_vs_llvm_o3": null,
+  "program_rss_floor_bound_count": null,
+  "program_rss_resolved_loss_count": null,
+  "program_rss_resolved_losses": null,
+  "compile_rss_floor_bound_count": null,
+  "rss_min_samples": null,
+  "program_rss_max_rel_spread": null,
+  "compile_rss_max_rel_spread": null
+ },
+ "retention": {
+  "dir": "reports/perf/2026-10-14-darwin-aarch64-requalification/2026-10-14-efc47d3bc3e5",
+  "harness_option": "--retain-dir"
+ }
+}

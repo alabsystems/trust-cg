@@ -90,16 +90,16 @@ pub enum PairOp {
 /// The 2-bit `opc` field selects the element width. Its meaning depends on the
 /// `V` (SIMD/FP) bit: for integer pairs (V=0) the legal values are `W32`=0b00
 /// and `X64`=0b10; for FP/SIMD pairs (V=1) they are `S32`(0b00), `D64`(0b01),
-/// and `Q128`(0b10). Only `D64` (used to save the low 64 bits of the callee-
-/// saved V8–V15 registers) and the two integer widths are needed by the frame
-/// lowering, so those are the variants modelled here.
+/// and `Q128`(0b10). The enum names are raw-opc aliases: use `W32` with V=1
+/// for S and `X64` with V=1 for Q. The unified typed pair encoder validates
+/// the register bank and scale before selecting these fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairSize {
-    /// 32-bit integer (W registers) — opc = 0b00
+    /// 32-bit W (V=0) or S (V=1) — opc = 0b00
     W32 = 0b00,
     /// 64-bit FP (D registers, V=1) — opc = 0b01
     D64 = 0b01,
-    /// 64-bit integer (X registers) — opc = 0b10
+    /// 64-bit X (V=0) or 128-bit Q (V=1) — opc = 0b10
     X64 = 0b10,
 }
 
@@ -381,7 +381,7 @@ pub fn encode_ldr_str_register_fields(
 /// opc(2) | 101 | V(1) | mode(2) | L(1) | imm7(7) | Rt2(5) | Rn(5) | Rt(5)
 /// ```
 ///
-/// * `pair_size` — W32 or X64
+/// * `pair_size` — raw opc field; interpret the width together with `v`
 /// * `v` — `true` for SIMD/FP registers
 /// * `pair_op` — load pair or store pair
 /// * `mode` — addressing mode (signed offset, pre-index, or post-index)

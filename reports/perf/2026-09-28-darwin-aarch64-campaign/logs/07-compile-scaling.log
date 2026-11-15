@@ -1,0 +1,36 @@
+compile-scaling: driver Trust compiler 321aaeda75478038420d97830f14724c33c8dc39 (rustc 1.99.0-dev (321aaeda7 2026-09-17) (trustc 0.1.0)) at $HOME/Library/Application Support/aterm/pkg/store/trust/9192/bin/trustc; lane: diagnostic: explicit unverified Trust lane (-Ztrust-verify=off for direct compiles, targo --unverified for builds); no Trust-verified compilation claim
+compile-scaling: target aarch64-apple-darwin (driver host); backend $HOME/trust-cg/.claude/worktrees/agent-workflow/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.dylib
+
+=== shape=blocks
+       n       LLVM    trust-cg   ratio
+     100     389.2ms      540.1ms    1.39x
+     200     392.1ms      539.7ms    1.38x
+     400     424.6ms      613.5ms    1.44x
+     800     531.5ms      764.8ms    1.44x
+  growth exponent: LLVM 0.15   trust-cg 0.17   excess +0.02   OK
+
+=== shape=loops
+       n       LLVM    trust-cg   ratio
+      15     381.5ms      561.6ms    1.47x
+      30     405.3ms      597.9ms    1.48x
+      60     457.5ms      778.6ms    1.70x
+     120     514.5ms     1368.0ms    2.66x
+  growth exponent: LLVM 0.15   trust-cg 0.42   excess +0.28   OK
+
+=== shape=funcs
+       n       LLVM    trust-cg   ratio
+      50     394.3ms      561.2ms    1.42x
+     100     409.2ms      606.9ms    1.48x
+     200     457.1ms      740.0ms    1.62x
+     400     522.3ms      997.7ms    1.91x
+  growth exponent: LLVM 0.14   trust-cg 0.28   excess +0.14   OK
+
+=== shape=arraysize
+       n       LLVM    trust-cg   ratio
+    4096     356.0ms      513.3ms    1.44x
+   16384     384.4ms      531.8ms    1.38x
+   65536     358.2ms      524.9ms    1.47x
+  262144     378.9ms      543.3ms    1.43x
+  growth exponent: LLVM 0.01   trust-cg 0.01   excess +0.00   OK
+
+compile-scaling: OK — no shape grows materially faster than LLVM

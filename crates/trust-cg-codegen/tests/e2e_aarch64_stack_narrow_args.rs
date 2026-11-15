@@ -20,13 +20,15 @@
 // load). This test pins BOTH directions bit-exactly against clang at -O2, where
 // clang trusts the ABI and does not re-narrow.
 //
+// The same two-direction value oracle now also runs with Linux GNU AArch64's
+// distinct eight-byte stack slots, using explicit target metadata and native
+// C compilation. The packed-offset ground truth above remains Darwin-specific.
+//
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-use std::fs;
-use std::process::Command;
-
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
+#[path = "common/aarch64_native.rs"]
+mod native;
 use trust_cg_codegen::pipeline::OptLevel;
 
 use trust_ir::{
@@ -34,10 +36,6 @@ use trust_ir::{
     Linkage, Module as TrustIrModule, Ty, ValueId,
 };
 use trust_ir::{BlockId, FuncId};
-
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-}
 
 // Params: 8x i64 (fill X0-X7) then i8, i16, i32, i8 (these four spill to the
 // stack). Both the callee (build_callee_module) and the caller
@@ -65,11 +63,14 @@ fn stack_narrow_params() -> Vec<Ty> {
 // ------------------------------------------------------------------------
 fn build_callee_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("stack_narrow_callee");
-    let ft = m.add_func_type(FuncTy {
-        params: stack_narrow_params(),
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: stack_narrow_params(),
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), "nsum", ft, BlockId::new(0));
     let params: Vec<(ValueId, Ty)> = stack_narrow_params()
         .into_iter()
@@ -111,7 +112,8 @@ fn build_callee_module() -> TrustIrModule {
         params,
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -124,22 +126,29 @@ fn build_caller_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("stack_narrow_caller");
 
     // External declaration of sink (provided by clang).
-    let sink_ft = m.add_func_type(FuncTy {
-        params: stack_narrow_params(),
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let sink_ft = m
+        .add_func_type(FuncTy {
+            params: stack_narrow_params(),
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut sink = TrustIrFunction::new(FuncId::new(0), "sink", sink_ft, BlockId::new(0));
     sink.blocks = vec![]; // bodyless import
     sink.linkage = Linkage::External;
-    m.add_function(sink);
+    m.try_add_function(sink)
+        .expect("Module::try_add_function: test fixture");
 
     // caller(a: i8, b: i16, c: i32, d: i8) -> i64
-    let caller_ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I8, Ty::I16, Ty::I32, Ty::I8],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let caller_ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I8, Ty::I16, Ty::I32, Ty::I8],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(FuncId::new(1), "caller", caller_ft, BlockId::new(0));
     // params a=%0 b=%1 c=%2 d=%3 ; %4 = const i64 0 (the eight register fillers)
     let mut body = Vec::new();
@@ -184,20 +193,13 @@ fn build_caller_module() -> TrustIrModule {
         ],
         body,
     }];
-    m.add_function(caller);
+    m.try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
 fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
-    let compiler = Compiler::new(CompilerConfig {
-        opt_level: opt,
-        ..CompilerConfig::default()
-    });
-    let r = compiler
-        .compile(module)
-        .expect("narrow-stack-arg module must compile");
-    assert!(!r.object_code.is_empty());
-    r.object_code
+    native::compile(module, opt)
 }
 
 const CALLEE_DRIVER: &str = r#"
@@ -247,48 +249,13 @@ int main(void){
 "#;
 
 fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
-        return None;
-    }
-    let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
-    let _ = fs::create_dir_all(&dir);
-    let obj_path = dir.join(format!("{tag}.o"));
-    let drv_path = dir.join("driver.c");
-    let bin_path = dir.join(format!("{tag}_bin"));
-    fs::write(&obj_path, obj).unwrap();
-    fs::write(&drv_path, driver).unwrap();
-    // -O2 is essential: at -O0 clang re-narrows narrow params, masking a layout
-    // or extension bug.
-    let link = Command::new("cc")
-        .args([
-            "-O2",
-            drv_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
-            "-o",
-            bin_path.to_str().unwrap(),
-        ])
-        .output()
-        .expect("cc");
-    assert!(
-        link.status.success(),
-        "link:\n{}",
-        String::from_utf8_lossy(&link.stderr)
-    );
-    let code = Command::new(bin_path.to_str().unwrap())
-        .output()
-        .unwrap()
-        .status
-        .code()
-        .unwrap_or(-1);
-    let _ = fs::remove_dir_all(&dir);
-    Some(code)
+    native::link_run(tag, obj, driver)
 }
 
 #[test]
 fn e2e_aarch64_callee_reads_narrow_stack_args() {
     let module = build_callee_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = compile_at(&module, opt);
         let Some(code) = link_run("stack_narrow_callee", &obj, CALLEE_DRIVER) else {
             return;
@@ -300,7 +267,7 @@ fn e2e_aarch64_callee_reads_narrow_stack_args() {
 #[test]
 fn e2e_aarch64_caller_stores_narrow_stack_args() {
     let module = build_caller_module();
-    for opt in [OptLevel::O0, OptLevel::O2] {
+    for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let obj = compile_at(&module, opt);
         let Some(code) = link_run("stack_narrow_caller", &obj, CALLER_DRIVER) else {
             return;

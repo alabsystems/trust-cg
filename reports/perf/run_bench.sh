@@ -166,7 +166,7 @@ echo "  toolchain: $TOOLCHAIN" >&2
 
 if [[ ! -f "$DYLIB" ]]; then
     echo "FATAL: bridge dylib not found at $DYLIB" >&2
-    echo "Build it first (see reports/perf/baseline_*.md header)." >&2
+    echo "Build it first with the nightly pinned in crates/rustc-codegen-trust-cg/rust-toolchain.toml." >&2
     exit 1
 fi
 

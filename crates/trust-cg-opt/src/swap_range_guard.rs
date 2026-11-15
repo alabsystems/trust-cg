@@ -60,9 +60,12 @@
 //! so the fast path runs exactly `C - x0` iterations and exits with `x == C`
 //! — precisely the scalar loop's own exit value.
 //!
-//! REGISTER STATE: recognition REQUIRES every vreg defined in the loop body
-//! (other than `x`) to be single-def and never used outside the loop, so
-//! skipping the scalar iterations cannot leave an observable stale register.
+//! REGISTER STATE: the crate's one loop-state contract
+//! ([`crate::loop_contract`]) admits the loop only when no register it writes
+//! other than `x` is live into the header or an exit, so skipping the scalar
+//! iterations cannot leave an observable stale register. Recognition also
+//! requires every body vreg other than `x` to be single-def (for the
+//! matchers).
 //!
 //! Every opcode emitted (`Movz`, `Movk`, `Madd`, `AddRR`, `AddRI`, `LdrRI`,
 //! `StrRI`, `CmpRR`, `CmpRI`, `BCond`, `B`, `MovR`) is already
@@ -74,7 +77,9 @@
 //! Default-ON at O2/Os/O3 (never O0/O1). Disable with
 //! `TRUST_CG_DISABLE_PASSES=swap_range_guard`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{ExitPlan, Handoff, LoopExit, LoopLocality, exit_of_test};
+use crate::mach_util::{branch_targets, copied_const, copy_like, strip_copies};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -160,12 +165,6 @@ impl SwapRangeGuardPass {
                 changed = true;
             }
         }
-        if changed && std::env::var("TRUST_CG_DUMP_SWAPRANGE").is_ok() {
-            eprintln!(
-                "[swap-range-guard] fn={} rewritten={}",
-                func.name, self.fired
-            );
-        }
         changed
     }
 }
@@ -197,6 +196,9 @@ struct Recognized {
     base: VReg,
     /// The shared bounds-check limit `K` (array length).
     k_const: i64,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[x]` (the induction). The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 impl Recognized {
@@ -207,29 +209,16 @@ impl Recognized {
         latch: BlockId,
         body: &HashSet<BlockId>,
     ) -> Option<Self> {
-        let dump = std::env::var("TRUST_CG_DUMP_SWAPRANGE").is_ok();
         macro_rules! bail {
             ($($t:tt)*) => {{
-                if dump {
-                    eprintln!("[swap-range-guard] bail@{}: {}", func.name, format!($($t)*));
-                }
                 return None;
             }};
-        }
-        if dump {
-            eprintln!(
-                "[swap-range-guard] consider@{} header={:?} latch={:?} body={}",
-                func.name,
-                header,
-                latch,
-                body.len()
-            );
         }
         // The exact 6-block chain: header + 4 check/access blocks + latch.
         if body.len() != 6 || header == latch {
             bail!("body is not the 6-block swap chain (len={})", body.len());
         }
-        let def = build_def_map(func);
+        let def = crate::effects::build_reaching_def_map(func);
 
         // Closed-world whitelist over the body.
         for &b in body {
@@ -268,21 +257,24 @@ impl Recognized {
             bail!("iv class not Gpr64");
         }
 
-        // Def discipline + no-escape (block-resident instructions only; see
-        // neon_iota_fill for the ghost-instruction rationale).
+        // Def discipline (block-resident instructions only; see neon_iota_fill
+        // for the ghost-instruction rationale): one definition per loop
+        // register, for the matchers below. Whether a loop register is
+        // observable after the fast path is the loop-state contract's
+        // question, asked last.
         let live_ids: Vec<InstId> = func
             .block_order
             .iter()
             .flat_map(|&bid| func.block(bid).insts.iter().copied())
             .collect();
-        let mut def_counts: HashMap<u32, usize> = HashMap::new();
+        let mut def_counts: HashMap<u32, usize> = HashMap::default();
         for &id in &live_ids {
             let inst = func.inst(id);
             crate::effects::for_each_inst_def(inst, |v| {
                 *def_counts.entry(v.id).or_insert(0) += 1;
             });
         }
-        let mut body_defs: HashSet<u32> = HashSet::new();
+        let mut body_defs: HashSet<u32> = HashSet::default();
         for &id in &loop_insts {
             let inst = func.inst(id);
             crate::effects::for_each_inst_def(inst, |v| {
@@ -304,19 +296,6 @@ impl Recognized {
                 }
             } else if n != 1 {
                 bail!("multi-def loop vreg v{}", vid);
-            }
-        }
-        for &id in &live_ids {
-            if loop_insts.contains(&id) {
-                continue;
-            }
-            for op in &func.inst(id).operands {
-                if let MachOperand::VReg(v) = op
-                    && v.id != iv.id
-                    && body_defs.contains(&v.id)
-                {
-                    bail!("loop-defined v{} used outside the loop", v.id);
-                }
             }
         }
 
@@ -496,13 +475,33 @@ impl Recognized {
         // 2^63 given the individual caps (C<=4095, S<=2^20, K<=2^31): maximum
         // ~2^32 + 2^31. Nothing further to check.
 
-        if dump {
-            eprintln!(
-                "[swap-range-guard] RECOGNIZED@{} iv={:?} y={:?} base={:?} C={} S={} K={}",
-                func.name, iv, y, base, c_const, s_const, k_const
-            );
+        // LOOP STATE (`crate::loop_contract`): the fast path runs only
+        // iterations the header's `x <u C` test continues, and reproduces only
+        // the induction `x`. The four chain checks' abort edges are the only
+        // other exits, and the preheader guards prove every one of them passes
+        // over `x in [x0, C)` (a pre-guard, so this pass claims them; see
+        // "ELIDED CHECKS"). Any other exit refuses the loop.
+        let Some(exit) = exit_of_test(func, body.iter().copied(), header) else {
+            bail!("the header test has no single exit");
+        };
+        let mut exits = ExitPlan::loop_test(header, exit);
+        for &b in &blocks_seq[..4] {
+            let (_, abort) = chain_block_targets(func, b, body)?;
+            exits = exits.and_proved_not_taken(LoopExit::Edge { from: b, to: abort });
         }
+        let locality = match LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &exits,
+            Handoff::HeaderOrExit,
+            &[iv],
+        ) {
+            Ok(locality) => locality,
+            Err(_escape) => bail!("loop state escapes: {:?}", _escape),
+        };
         Some(Recognized {
+            _locality: locality,
             header,
             preheader,
             preheader_term,
@@ -546,16 +545,16 @@ fn recognize_header(
         match inst.opcode {
             AArch64Opcode::MovR | AArch64Opcode::Copy => continue,
             AArch64Opcode::CmpRI if inst.operands.len() == 2 => {
-                last_cmp = Some((vreg_of(&inst.operands[0])?, imm_of(&inst.operands[1])));
+                last_cmp = Some((inst.operands[0].as_vreg()?, inst.operands[1].as_imm()));
             }
             AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
                 last_cmp = Some((
-                    vreg_of(&inst.operands[0])?,
-                    const_value(func, def, vreg_of(&inst.operands[1])?),
+                    inst.operands[0].as_vreg()?,
+                    copied_const(func, def, inst.operands[1].as_vreg()?),
                 ));
             }
             AArch64Opcode::BCond if inst.operands.len() == 2 => {
-                let cc = imm_of(&inst.operands[0])?;
+                let cc = inst.operands[0].as_imm()?;
                 let tgt = *branch_targets(inst).first()?;
                 if (cc == CC_LT || cc == CC_LO) && body.contains(&tgt) {
                     let (lhs, c) = last_cmp?;
@@ -585,7 +584,7 @@ fn chain_block_targets(
         let inst = func.inst(id);
         match inst.opcode {
             AArch64Opcode::BCond if inst.operands.len() == 2 => {
-                if imm_of(&inst.operands[0])? != CC_LO {
+                if inst.operands[0].as_imm()? != CC_LO {
                     return None;
                 }
                 let tgt = *branch_targets(inst).first()?;
@@ -631,10 +630,10 @@ fn match_idx_madd(
     if inst.opcode != AArch64Opcode::Madd || inst.operands.len() != 4 {
         return None;
     }
-    let f1 = vreg_of(&inst.operands[1])?;
-    let f2 = vreg_of(&inst.operands[2])?;
-    let f3 = vreg_of(&inst.operands[3])?;
-    let s_of = |v: VReg| const_value(func, def, v);
+    let f1 = inst.operands[1].as_vreg()?;
+    let f2 = inst.operands[2].as_vreg()?;
+    let f3 = inst.operands[3].as_vreg()?;
+    let s_of = |v: VReg| copied_const(func, def, v);
     // A: (y * S) + x  — f3 reaches iv; one factor const S, the other is y.
     let a = if reaches_reg(func, def, f3, iv) {
         if let Some(s) = s_of(f2) {
@@ -695,10 +694,10 @@ fn match_check(func: &MachFunction, id: InstId, want: VReg) -> Option<i64> {
     if inst.opcode != AArch64Opcode::CmpRI || inst.operands.len() != 2 {
         return None;
     }
-    if vreg_of(&inst.operands[0])? != want {
+    if inst.operands[0].as_vreg()? != want {
         return None;
     }
-    imm_of(&inst.operands[1])
+    inst.operands[1].as_imm()
 }
 
 struct AddrMatch {
@@ -717,18 +716,18 @@ fn match_addr_madd(
     if inst.opcode != AArch64Opcode::Madd || inst.operands.len() != 4 {
         return None;
     }
-    let f1 = vreg_of(&inst.operands[1])?;
-    let f2 = vreg_of(&inst.operands[2])?;
-    let base = vreg_of(&inst.operands[3])?;
+    let f1 = inst.operands[1].as_vreg()?;
+    let f2 = inst.operands[2].as_vreg()?;
+    let base = inst.operands[3].as_vreg()?;
     if f1 == idx {
         Some(AddrMatch {
             base,
-            es: const_value(func, def, f2)?,
+            es: copied_const(func, def, f2)?,
         })
     } else if f2 == idx {
         Some(AddrMatch {
             base,
-            es: const_value(func, def, f1)?,
+            es: copied_const(func, def, f1)?,
         })
     } else {
         None
@@ -741,10 +740,10 @@ fn match_load(func: &MachFunction, id: InstId, addr: VReg) -> Option<VReg> {
     if inst.opcode != AArch64Opcode::LdrRI || inst.operands.len() != 3 {
         return None;
     }
-    if vreg_of(&inst.operands[1])? != addr || imm_of(&inst.operands[2]) != Some(0) {
+    if inst.operands[1].as_vreg()? != addr || inst.operands[2].as_imm() != Some(0) {
         return None;
     }
-    vreg_of(&inst.operands[0])
+    inst.operands[0].as_vreg()
 }
 
 /// Match `StrRI w,[addr,#0]` for EXACTLY `addr`; returns the stored reg.
@@ -753,15 +752,15 @@ fn match_store(func: &MachFunction, id: InstId, addr: VReg) -> Option<VReg> {
     if inst.opcode != AArch64Opcode::StrRI || inst.operands.len() != 3 {
         return None;
     }
-    if vreg_of(&inst.operands[1])? != addr || imm_of(&inst.operands[2]) != Some(0) {
+    if inst.operands[1].as_vreg()? != addr || inst.operands[2].as_imm() != Some(0) {
         return None;
     }
-    vreg_of(&inst.operands[0])
+    inst.operands[0].as_vreg()
 }
 
 /// The def register of instruction `id` (operand 0).
 fn def_reg(func: &MachFunction, id: InstId) -> Option<VReg> {
-    vreg_of(func.inst(id).operands.first()?)
+    func.inst(id).operands.first()?.as_vreg()
 }
 
 /// `AddRI d, iv, #1` (the induction step, either in-place or the phi source).
@@ -769,8 +768,8 @@ fn is_iv_add1(func: &MachFunction, id: InstId, iv: VReg) -> bool {
     let inst = func.inst(id);
     inst.opcode == AArch64Opcode::AddRI
         && inst.operands.len() == 3
-        && vreg_of(&inst.operands[1]) == Some(iv)
-        && imm_of(&inst.operands[2]) == Some(1)
+        && inst.operands[1].as_vreg() == Some(iv)
+        && inst.operands[2].as_imm() == Some(1)
 }
 
 /// Find the `+1` Gpr64 induction writeback in the latch.
@@ -779,10 +778,10 @@ fn find_induction(func: &MachFunction, def: &HashMap<u32, InstId>, latch: BlockI
         let inst = func.inst(id);
         if inst.opcode == AArch64Opcode::AddRI
             && inst.operands.len() == 3
-            && imm_of(&inst.operands[2]) == Some(1)
+            && inst.operands[2].as_imm() == Some(1)
         {
-            let d = vreg_of(&inst.operands[0])?;
-            let s = vreg_of(&inst.operands[1])?;
+            let d = inst.operands[0].as_vreg()?;
+            let s = inst.operands[1].as_vreg()?;
             if d == s && d.class == RegClass::Gpr64 {
                 return Some(d);
             }
@@ -801,8 +800,8 @@ fn find_induction(func: &MachFunction, def: &HashMap<u32, InstId>, latch: BlockI
         let si = func.inst(sdef);
         if si.opcode == AArch64Opcode::AddRI
             && si.operands.len() == 3
-            && vreg_of(&si.operands[1]) == Some(d)
-            && imm_of(&si.operands[2]) == Some(1)
+            && si.operands[1].as_vreg() == Some(d)
+            && si.operands[2].as_imm() == Some(1)
         {
             return Some(d);
         }
@@ -826,12 +825,11 @@ fn reaches_reg(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg, tar
         if v == target {
             return true;
         }
-        let Some(&d) = def.get(&v.id) else {
-            return false;
-        };
-        match copy_like(func.inst(d)) {
-            Some((dst, src)) if dst == v => v = src,
-            _ => return false,
+        // Only a copy that is the register's ONLY def holds the copied value
+        // on every path.
+        match crate::mach_util::sole_copy_source(func, def, v) {
+            Some(src) => v = src,
+            None => return false,
         }
     }
     false
@@ -1118,136 +1116,6 @@ fn imm(v: i64) -> MachOperand {
 fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
 }
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
-    match inst.opcode {
-        AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
-        {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        _ => None,
-    }
-}
-
-/// Follow copy chains to the canonical name, walking ONLY through registers
-/// with exactly ONE block-resident def. A multi-def register (e.g. a 2-def
-/// phi merge or an outer-loop induction) STOPS the walk: which def produced
-/// the runtime value is path-dependent, so resolving through its last-in-
-/// layout def could canonicalize to a register holding a DIFFERENT value —
-/// the canonical name must be value-equal to `v` on every path (fail-closed).
-fn strip_copies(func: &MachFunction, _def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
-    for _ in 0..16 {
-        let Some(d) = single_def(func, v) else {
-            return v;
-        };
-        match copy_like(func.inst(d)) {
-            Some((dst, src)) if dst == v => v = src,
-            _ => return v,
-        }
-    }
-    v
-}
-
-/// The unique block-resident def of `v`, or `None` if `v` has zero or
-/// multiple defs.
-fn single_def(func: &MachFunction, v: VReg) -> Option<InstId> {
-    let mut found: Option<InstId> = None;
-    for &b in &func.block_order {
-        for &id in &func.block(b).insts {
-            if crate::effects::inst_defines_vreg(func.inst(id), v) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(id);
-            }
-        }
-    }
-    found
-}
-
-fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
-    let v = strip_copies(func, def, val);
-    let id = *def.get(&v.id)?;
-    let inst = func.inst(id);
-    match inst.opcode {
-        AArch64Opcode::Movz => {
-            let (dst, value) = crate::reaching_const::movz_value(inst)?;
-            if dst != v {
-                return None;
-            }
-            i64::try_from(value).ok()
-        }
-        AArch64Opcode::Movk => {
-            let blk = block_of_inst(func, id)?;
-            let insts = &func.block(blk).insts;
-            let pos = insts.iter().position(|&i| i == id)?;
-            let mut acc: Option<u64> = None;
-            for &pid in insts[..pos].iter() {
-                let pi = func.inst(pid);
-                if !crate::effects::inst_defines_vreg(pi, v) {
-                    continue;
-                }
-                match pi.opcode {
-                    AArch64Opcode::Movz => {
-                        let (dst, value) = crate::reaching_const::movz_value(pi)?;
-                        if dst != v {
-                            return None;
-                        }
-                        acc = Some(value);
-                    }
-                    AArch64Opcode::Movk => {
-                        acc = Some(crate::reaching_const::apply_movk(pi, v, acc?)?);
-                    }
-                    _ => return None,
-                }
-            }
-            let value = crate::reaching_const::apply_movk(inst, v, acc?)?;
-            i64::try_from(value).ok()
-        }
-        _ => None,
-    }
-}
-
-/// Def map over BLOCK-RESIDENT instructions only (ghost hygiene; see
-/// neon_iota_fill).
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    crate::effects::build_reaching_def_map(func)
-}
-
-fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
-    for (idx, blk) in func.blocks.iter().enumerate() {
-        if blk.insts.contains(&target) {
-            return Some(BlockId(idx as u32));
-        }
-    }
-    None
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|o| match o {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
-}
 
 fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
     let mut changed = false;
@@ -1296,7 +1164,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);

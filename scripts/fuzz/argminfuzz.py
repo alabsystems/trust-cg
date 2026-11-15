@@ -246,7 +246,7 @@ def run_bin(path):
 
 def compile_trustcg(tcg, tir, o, wd, tag):
     obj = os.path.join(wd, f"{tag}.o")
-    r = subprocess.run([tcg, "--format=text", "--target", "aarch64", f"-{o}", "-c", tir, "-o", obj],
+    r = subprocess.run([tcg, "--format=text", "--permit-unlicensed", "--target", "aarch64", f"-{o}", "-c", tir, "-o", obj],
                        capture_output=True, text=True)
     if r.returncode != 0:
         return None, (r.stderr or r.stdout).strip().splitlines()[-1:] or ['?']

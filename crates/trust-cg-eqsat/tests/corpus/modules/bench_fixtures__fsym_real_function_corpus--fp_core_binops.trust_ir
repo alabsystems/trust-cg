@@ -1,0 +1,93 @@
+; TrustIr text format v1
+module "fsym_real_fp_core_binops"
+
+functy.0 = (f32, f32) -> (f32)
+
+functy.1 = (f64, f64) -> (f64)
+
+functy.2 = (f64, f64) -> (i32)
+
+functy.3 = (i32) -> (i32)
+
+functy.4 = (f64) -> (f64)
+
+functy.5 = (f64, f64) -> (f64)
+
+functy.6 = (f64, f64) -> (f64)
+
+functy.7 = (f64, f64) -> (f64)
+
+functy.8 = (f64, f64) -> (f64)
+
+fn @add_f(functy.0) {
+bb0(%0: f32, %1: f32):
+    %2 = alloca f32
+    %3 = alloca f32
+    store f32 %0, ptr %2
+    store f32 %1, ptr %3
+    %4 = load f32, ptr %2
+    %5 = load f32, ptr %3
+    %6 = fadd f32 %4, %5
+    ret %6
+}
+
+fn @add_d(functy.1) {
+bb0(%0: f64, %1: f64):
+    %2 = alloca f64
+    %3 = alloca f64
+    store f64 %0, ptr %2
+    store f64 %1, ptr %3
+    %4 = load f64, ptr %2
+    %5 = load f64, ptr %3
+    %6 = fadd f64 %4, %5
+    ret %6
+}
+
+fn @cmp_lt(functy.2) {
+bb0(%0: f64, %1: f64):
+    %2 = fcmp olt f64 %0, %1
+    condbr %2, bb1, bb2
+bb1:
+    %3 = const i32 1
+    ret %3
+bb2:
+    %4 = const i32 2
+    ret %4
+}
+
+fn @roundtrip(functy.3) {
+bb0(%0: i32):
+    %1 = sitofp i32 %0 to f64
+    %2 = fptosi f64 %1 to i32
+    ret %2
+}
+
+fn @neg(functy.4) {
+bb0(%0: f64):
+    %1 = fneg f64 %0
+    ret %1
+}
+
+fn @binop_fadd(functy.5) {
+bb0(%0: f64, %1: f64):
+    %2 = fadd f64 %0, %1
+    ret %2
+}
+
+fn @binop_fsub(functy.6) {
+bb0(%0: f64, %1: f64):
+    %2 = fsub f64 %0, %1
+    ret %2
+}
+
+fn @binop_fmul(functy.7) {
+bb0(%0: f64, %1: f64):
+    %2 = fmul f64 %0, %1
+    ret %2
+}
+
+fn @binop_fdiv(functy.8) {
+bb0(%0: f64, %1: f64):
+    %2 = fdiv f64 %0, %1
+    ret %2
+}

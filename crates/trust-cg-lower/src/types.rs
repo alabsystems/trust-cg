@@ -430,12 +430,60 @@ impl Type {
 
     /// Returns true if this is a SIMD vector type.
     pub fn is_vector(&self) -> bool {
-        matches!(self, Self::V128)
+        matches!(self, Self::V64 | Self::V128)
     }
 
     /// Returns true if this is a scalar (non-aggregate) type.
     pub fn is_scalar(&self) -> bool {
         !self.is_aggregate()
+    }
+
+    /// The refusal every instruction selector returns for a WHOLE-AGGREGATE
+    /// memory access — a `Load`, `Store`, `VolatileLoad` or `VolatileStore`
+    /// (`store`/`volatile` name which) whose type is `self` — or `None` when
+    /// `self` is not an aggregate.
+    ///
+    /// # The contract this enforces
+    ///
+    /// LIR represents an aggregate value (`Struct`/`Array`/`Enum`) by its
+    /// ADDRESS: the selectors give it a pointer-width register class, bind
+    /// aggregate formals and call results as stack addresses, and read its
+    /// bytes THROUGH that address for `Memcpy`, call-argument temps and
+    /// aggregate returns. A `Load`/`Store` has no such lowering: a selector's
+    /// scalar path is ONE register-width access. On the AArch64 and x86-64
+    /// selectors an aggregate used to fall through to it, so a 16-byte
+    /// `Struct([I64, I64])` load moved only its first eight bytes (and bound
+    /// them as the value's address), and a four-byte `Struct([I32])` store
+    /// wrote eight bytes — the source's address — four of them past the
+    /// object. That silently miscompiled real producer output (a `let u = t`
+    /// of a `(u64, u64)` moved only field 0), so the AArch64, x86-64 and
+    /// RISC-V selectors all refuse the shape with this one text rather than
+    /// approximate it. A producer copies an aggregate's bytes with `Memcpy` of
+    /// its exact length, or passes its address through.
+    ///
+    /// `I128` and the `V64`/`V128` vector carriers are not aggregates; their
+    /// width-exact selections are unaffected.
+    pub fn whole_aggregate_memory_access_refusal(
+        &self,
+        store: bool,
+        volatile: bool,
+    ) -> Option<String> {
+        if !self.is_aggregate() {
+            return None;
+        }
+        let (opcode, access) = match (store, volatile) {
+            (false, false) => ("Load", "load"),
+            (false, true) => ("VolatileLoad", "load"),
+            (true, false) => ("Store", "store"),
+            (true, true) => ("VolatileStore", "store"),
+        };
+        Some(format!(
+            "{opcode} of aggregate type {self:?} ({} bytes) refused: an aggregate value is \
+             its address in LIR, so a whole-aggregate {access} would be selected as one \
+             register-width access that moves only part of the value or writes past it; \
+             copy its bytes with Memcpy (exact byte length) instead",
+            self.bytes()
+        ))
     }
 }
 
@@ -463,9 +511,7 @@ impl From<&Type> for trust_cg_ir::function::Type {
             Type::F64 => trust_cg_ir::function::Type::F64,
             Type::B1 => trust_cg_ir::function::Type::B1,
             Type::V128 => trust_cg_ir::function::Type::V128,
-            // V64 maps to I64 as a placeholder (same size, 8 bytes).
-            // TODO: Add a proper V64 variant to trust_cg_ir::function::Type.
-            Type::V64 => trust_cg_ir::function::Type::I64,
+            Type::V64 => trust_cg_ir::function::Type::V64,
             Type::Struct(fields) => {
                 let ir_fields: Vec<trust_cg_ir::function::Type> =
                     fields.iter().map(|f| f.into()).collect();
@@ -546,7 +592,7 @@ mod tests {
                 },
             }
         }
-        let mut seed = 0x71_1a_5eed_u64;
+        let mut seed = 0x711a_5eed_u64;
         let (mut types, mut offsets) = (0usize, 0usize);
         for case in 0..5_000 {
             let t = gen_type(&mut seed, 3);
@@ -673,6 +719,17 @@ mod tests {
     }
 
     #[test]
+    fn v64_is_a_distinct_vector_carrier() {
+        assert!(Type::V64.is_vector());
+        assert!(!Type::I64.is_vector());
+        assert!(Type::V64.is_scalar());
+        assert_eq!(Type::V64.bytes(), 8);
+        assert_eq!(Type::V64.align(), 8);
+        assert_eq!(Type::V64.bits(), 64);
+        assert_eq!(Type::V64.storage_bits(), 64);
+    }
+
+    #[test]
     fn struct_bytes_with_padding() {
         // struct { I8, I32 } -> 1 byte + 3 padding + 4 bytes = 8 bytes
         let s = Type::Struct(vec![Type::I8, Type::I32]);
@@ -758,6 +815,38 @@ mod tests {
         assert_eq!(IrType::from(Type::F64), IrType::F64);
         assert_eq!(IrType::from(Type::B1), IrType::B1);
         assert_eq!(IrType::from(Type::V128), IrType::V128);
+        assert_eq!(IrType::from(Type::V64), IrType::V64);
+    }
+
+    #[test]
+    fn from_v64_preserves_vector_identity_in_nested_aggregates() {
+        use trust_cg_ir::function::Type as IrType;
+
+        let lower = Type::Struct(vec![
+            Type::V64,
+            Type::Array(Box::new(Type::V64), 3),
+            Type::Enum {
+                tag_width: EnumTagWidth::U8,
+                variants: vec![vec![], vec![Type::V64]],
+            },
+        ]);
+        let ir = IrType::from(&lower);
+        assert_eq!(
+            ir,
+            IrType::Struct(vec![
+                IrType::V64,
+                IrType::Array(Box::new(IrType::V64), 3),
+                IrType::Enum {
+                    tag_width: EnumTagWidth::U8,
+                    variants: vec![vec![], vec![IrType::V64]],
+                },
+            ])
+        );
+        assert_eq!(ir.bytes(), lower.bytes());
+        assert_eq!(ir.align(), lower.align());
+        for index in 0..3 {
+            assert_eq!(ir.offset_of(index), lower.offset_of(index));
+        }
     }
 
     #[test]

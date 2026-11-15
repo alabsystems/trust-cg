@@ -1,0 +1,35 @@
+; TrustIr text format v1
+module "tensor_weight_blob"
+target "aarch64-apple-darwin" 8 little structpass=unclassified
+
+functy.0 = (tensor<i32, 1>) -> (tensor<i32, 0>)
+
+functy.1 = () -> (tensor<u8, 1>)
+
+functy.2 = () -> (tensor<i64, 1>)
+
+blob 0a1ce634879f6a487527c9a185b1a4a3de7f41238ad4139e3c6d9e0da723628c bytes<0100000002000000ffffffff>
+
+blob e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 bytes<>
+
+fn @dot(functy.0) {
+    ; #body-gate: ungated
+bb0(%0: tensor<i32, 1>):
+    %1 = const tensor<i32, 1> tensor_blob<0a1ce634879f6a487527c9a185b1a4a3de7f41238ad4139e3c6d9e0da723628c>[3]
+    %2 = tensor_contract tensor<i32, 0> %0, %1 batch [] contract [0:0]
+    ret %2
+}
+
+fn @raw(functy.1) {
+    ; #body-gate: ungated
+bb0:
+    %0 = const tensor<u8, 1> tensor_blob<0a1ce634879f6a487527c9a185b1a4a3de7f41238ad4139e3c6d9e0da723628c>[12]
+    ret %0
+}
+
+fn @none(functy.2) {
+    ; #body-gate: ungated
+bb0:
+    %0 = const tensor<i64, 1> tensor_blob<e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855>[0]
+    ret %0
+}

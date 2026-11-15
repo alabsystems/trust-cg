@@ -63,9 +63,12 @@
 //!     --crate-type=lib --mir-emit-closure build_mutual_rec_root <out.tir>
 //!
 //! Run this file's test ALONE (JIT accumulation — see jit-parallel-race-2026-06-29.md):
-//!   cargo test -p trust-cg-codegen --test e2e_mutual_recursor -- --test-threads=1
+//!   scripts/trust_cargo.sh test -p trust-cg-codegen --test e2e_mutual_recursor -- --test-threads=1
 
 #![cfg(target_arch = "aarch64")]
+
+#[path = "common/emitted_fixture.rs"]
+mod emitted_fixture;
 
 use std::collections::HashMap;
 
@@ -16179,7 +16182,7 @@ fn strip_lams(e: &Expr) -> &Expr {
 
 #[test]
 fn mir_mutual_recursor_even_odd_tree_forest_roundtrip() {
-    let module = trust_ir::parser::parse_module(MX_MUTUAL_REC_TRUST_IR)
+    let module = emitted_fixture::parse_emitted(MX_MUTUAL_REC_TRUST_IR)
         .expect("MIR-emitted mutual-recursor closure trust-ir text must parse");
 
     // The full mutual engine must be genuinely IN-MODULE (real bodies, not stubs).
@@ -16254,6 +16257,7 @@ fn mir_mutual_recursor_even_odd_tree_forest_roundtrip() {
 
     let externs = mx_externs();
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of the mutual-recursor closure failed")
         .buffer;
@@ -16523,4 +16527,13 @@ fn mir_mutual_recursor_even_odd_tree_forest_roundtrip() {
     );
 
     drop(buffer);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

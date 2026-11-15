@@ -12,7 +12,7 @@
 //! Algorithm: backwards dataflow analysis per block with iterative fixpoint
 //! for cross-block liveness.
 
-use crate::machine_types::{InstId, MachFunction, RegClass, VReg};
+use crate::machine_types::{BlockId, InstId, MachFunction, RegClass, VReg};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -90,6 +90,7 @@ impl LiveInterval {
 
     /// Returns true if this interval is live at the given instruction index.
     pub fn is_live_at(&self, idx: u32) -> bool {
+        crate::scan_work::charge(1);
         // `ranges` is sorted and non-overlapping, so binary search suffices.
         self.ranges
             .binary_search_by(|r| {
@@ -104,8 +105,59 @@ impl LiveInterval {
             .is_ok()
     }
 
+    /// Whether `ranges` holds the invariant [`Self::is_live_at`] relies on:
+    /// every range non-empty, the ranges ascending and pairwise disjoint.
+    pub fn has_ordered_ranges(&self) -> bool {
+        self.ranges.iter().all(|range| range.start < range.end)
+            && self
+                .ranges
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
+    }
+
+    /// The first element of `points` at which this interval is live and
+    /// `accept` holds. Always equal to
+    /// `points.iter().copied().find(|&p| self.is_live_at(p) && accept(p))`,
+    /// with `accept` called on the same points in the same order.
+    ///
+    /// `points_ascending` asserts `points` is non-decreasing. With that and
+    /// [`Self::has_ordered_ranges`], each range binary-searches `points` and
+    /// visits only the points inside it, so the cost is `O(R log P)` plus the
+    /// live points visited rather than `O(P log R)`. A caller that probes one
+    /// interval against every call site of a function (one reserved point per
+    /// call) is otherwise quadratic in the function's call count. Without
+    /// either precondition this is the literal scan.
+    pub fn first_live_point(
+        &self,
+        points: &[u32],
+        points_ascending: bool,
+        mut accept: impl FnMut(u32) -> bool,
+    ) -> Option<u32> {
+        if !(points_ascending && self.has_ordered_ranges()) {
+            return points
+                .iter()
+                .copied()
+                .find(|&pos| self.is_live_at(pos) && accept(pos));
+        }
+        for range in &self.ranges {
+            let first = points.partition_point(|&pos| pos < range.start);
+            crate::scan_work::charge(1);
+            for &pos in &points[first..] {
+                crate::scan_work::charge(1);
+                if pos >= range.end {
+                    break;
+                }
+                if accept(pos) {
+                    return Some(pos);
+                }
+            }
+        }
+        None
+    }
+
     /// Returns true if this interval overlaps with another.
     pub fn overlaps(&self, other: &LiveInterval) -> bool {
+        crate::scan_work::charge(1);
         // Fast whole-interval bounds reject: most pairs don't even come close.
         let (Some(a_first), Some(a_last)) = (self.ranges.first(), self.ranges.last()) else {
             return false;
@@ -216,61 +268,36 @@ pub struct LivenessResult {
 /// the O(n log n) `BTreeSet` operations the fixpoint previously paid on every
 /// block on every iteration — profiled as the dominant core-pipeline cost.
 /// Semantics are identical to the `BTreeSet<u32>` it replaces.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct LiveSet {
-    words: Vec<u64>,
+type LiveSet = crate::bitset::BitSet;
+
+/// Exact backwards transfer for one block. A local definition kills incoming
+/// liveness, except where an earlier use generates it again. Build this once;
+/// fixed-point visits need only word-parallel operations, not instruction scans.
+struct BlockTransfer {
+    generated: LiveSet,
+    killed: LiveSet,
 }
 
-impl LiveSet {
-    #[inline]
-    fn new(n_vregs: usize) -> Self {
-        Self {
-            words: vec![0u64; n_vregs.div_ceil(64)],
+impl BlockTransfer {
+    fn new(func: &MachFunction, block: &crate::machine_types::MachBlock, width: usize) -> Self {
+        let mut generated = LiveSet::new(width);
+        let mut killed = LiveSet::new(width);
+        for &inst_id in block.insts.iter().rev() {
+            let inst = &func.insts[inst_id.0 as usize];
+            for vreg in inst.vreg_defs() {
+                generated.remove(vreg.id);
+                killed.insert(vreg.id);
+            }
+            for vreg in inst.vreg_uses() {
+                generated.insert(vreg.id);
+            }
         }
+        Self { generated, killed }
     }
-    #[inline]
-    fn insert(&mut self, id: u32) {
-        self.words[id as usize / 64] |= 1u64 << (id % 64);
-    }
-    #[inline]
-    fn remove(&mut self, id: u32) {
-        self.words[id as usize / 64] &= !(1u64 << (id % 64));
-    }
-    #[inline]
-    fn contains(&self, id: u32) -> bool {
-        (self.words[id as usize / 64] >> (id % 64)) & 1 != 0
-    }
-    #[inline]
-    fn clear(&mut self) {
-        self.words.iter_mut().for_each(|w| *w = 0);
-    }
-    /// `self |= other` (both must be the same width).
-    #[inline]
-    fn union_from(&mut self, other: &LiveSet) {
-        for (a, b) in self.words.iter_mut().zip(&other.words) {
-            *a |= *b;
-        }
-    }
-    /// Copy `other` into `self` without reallocating (same width).
-    #[inline]
-    fn copy_from(&mut self, other: &LiveSet) {
-        self.words.copy_from_slice(&other.words);
-    }
-    /// Iterate the ids of set bits in ascending order.
-    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.words.iter().enumerate().flat_map(|(wi, &word)| {
-            let base = (wi * 64) as u32;
-            let mut bits = word;
-            std::iter::from_fn(move || {
-                if bits == 0 {
-                    None
-                } else {
-                    let b = bits.trailing_zeros();
-                    bits &= bits - 1;
-                    Some(base + b)
-                }
-            })
-        })
+
+    fn apply(&self, live: &mut LiveSet) {
+        live.subtract(&self.killed);
+        live.union_from(&self.generated);
     }
 }
 
@@ -341,6 +368,52 @@ impl DenseScratch {
     }
 }
 
+/// Postorder of the CFG from `func.entry_block` over `succs`, with blocks
+/// unreachable from the entry appended in `block_order` order. Every block
+/// appears exactly once. Iterative DFS so deep CFGs cannot overflow the
+/// call stack.
+fn postorder_from_entry(func: &MachFunction) -> Vec<BlockId> {
+    let num_blocks = func.blocks.len();
+    let mut visited = vec![false; num_blocks];
+    let mut order: Vec<BlockId> = Vec::with_capacity(num_blocks);
+    // (block, next successor index to descend into)
+    let mut stack: Vec<(BlockId, usize)> = Vec::new();
+    let entry = func.entry_block.0 as usize;
+    if entry < num_blocks {
+        visited[entry] = true;
+        stack.push((func.entry_block, 0));
+    }
+    while let Some(&(block_id, next_succ)) = stack.last() {
+        let succs = &func.blocks[block_id.0 as usize].succs;
+        if next_succ < succs.len() {
+            stack.last_mut().expect("stack non-empty in loop").1 += 1;
+            let succ = succs[next_succ];
+            let si = succ.0 as usize;
+            if si < num_blocks && !visited[si] {
+                visited[si] = true;
+                stack.push((succ, 0));
+            }
+        } else {
+            order.push(block_id);
+            stack.pop();
+        }
+    }
+    for &block_id in &func.block_order {
+        let bi = block_id.0 as usize;
+        if bi < num_blocks && !visited[bi] {
+            visited[bi] = true;
+            order.push(block_id);
+        }
+    }
+    // A block absent from block_order entirely still needs a live set.
+    for (bi, &seen) in visited.iter().enumerate() {
+        if !seen {
+            order.push(BlockId(bi as u32));
+        }
+    }
+    order
+}
+
 pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
     let mut inst_loop_depths: Vec<u32> = Vec::new();
     let vreg_classes = collect_vreg_classes(func);
@@ -391,6 +464,22 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
     let mut new_live_out = LiveSet::new(n_vregs);
     let mut new_live_in = LiveSet::new(n_vregs);
 
+    // Fixpoint visit order: postorder from the entry block. This is a
+    // backward analysis, so successors should be visited before their
+    // predecessors wherever the CFG allows; postorder gives that for every
+    // non-back edge. `func.block_order` is the emission layout (hot-chain
+    // order), not a traversal order: iterating its reverse can need O(N)
+    // passes on layout-adversarial CFGs (the order class upstream
+    // rust-lang/rust#160193 measured at ~16x extra iterations), which the
+    // 2N+10 bound below would then cut short with wrong live sets.
+    // Unreached blocks keep their layout relative order at the end; the
+    // least fixpoint is order-independent, only the pass count changes.
+    let fixpoint_order = postorder_from_entry(func);
+    let transfers: Vec<_> = fixpoint_order
+        .iter()
+        .map(|id| BlockTransfer::new(func, &func.blocks[id.0 as usize], n_vregs))
+        .collect();
+
     // Iterate to fixed point.
     // Safety bound: standard dataflow converges in at most N+1 iterations
     // (N = number of blocks). Use a generous bound to catch bugs.
@@ -408,8 +497,7 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
         iteration += 1;
         changed = false;
 
-        // Process blocks in reverse order for faster convergence.
-        for &block_id in func.block_order.iter().rev() {
+        for (&block_id, transfer) in fixpoint_order.iter().zip(&transfers) {
             let bi = block_id.0 as usize;
             let block = &func.blocks[bi];
 
@@ -421,18 +509,7 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
 
             // live_in[b] = use[b] union (live_out[b] - def[b])
             new_live_in.copy_from(&new_live_out);
-            // Walk instructions in reverse to compute local effect.
-            for &inst_id in block.insts.iter().rev() {
-                let inst = &func.insts[inst_id.0 as usize];
-                // Remove defs.
-                for vreg in inst.vreg_defs() {
-                    new_live_in.remove(vreg.id);
-                }
-                // Add uses.
-                for vreg in inst.vreg_uses() {
-                    new_live_in.insert(vreg.id);
-                }
-            }
+            transfer.apply(&mut new_live_in);
 
             if new_live_in != live_in[bi] || new_live_out != live_out[bi] {
                 changed = true;
@@ -441,6 +518,8 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
             }
         }
     }
+
+    drop(transfers);
 
     // Step 3: Build intervals from the computed liveness information.
     //
@@ -462,12 +541,12 @@ pub fn compute_live_intervals(func: &MachFunction) -> LivenessResult {
         let bi = block_id.0 as usize;
         let block = &func.blocks[bi];
 
-        if block.insts.is_empty() {
+        let Some(last_inst) = block.insts.last() else {
             continue;
-        }
+        };
 
         let block_start = inst_num_vec[block.insts[0].0 as usize];
-        let block_end = inst_num_vec[block.insts.last().unwrap().0 as usize] + 1;
+        let block_end = inst_num_vec[last_inst.0 as usize] + 1;
 
         // First pass: record the LAST definition of each vreg in this block.
         // Live-out intervals should extend from that last local def (if any)
@@ -893,6 +972,111 @@ mod tests {
         assert_eq!(interval.end(), 15);
     }
 
+    /// `first_live_point` is exactly the literal scan it replaces, including
+    /// which points `accept` sees and in what order, on ascending and
+    /// unordered point lists and on ranges inside and outside the invariant.
+    #[test]
+    fn first_live_point_matches_literal_scan() {
+        let mut state = 0x1f83_d9ab_fb41_bd6bu64;
+        let mut next = move |limit: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % limit
+        };
+        let mut fast_path_hits = 0usize;
+        for case in 0..2000 {
+            let mut interval = LiveInterval::new(VReg {
+                id: 0,
+                class: RegClass::Gpr64,
+            });
+            for _ in 0..next(5) {
+                let start = next(200) as u32;
+                interval.add_range(start, start + 1 + next(40) as u32);
+            }
+            if case % 7 == 0 && interval.ranges.len() > 1 {
+                interval.ranges.reverse();
+            }
+            let mut points: Vec<u32> = (0..next(60)).map(|_| next(260) as u32).collect();
+            let ascending = case % 3 != 0;
+            if ascending {
+                points.sort_unstable();
+            }
+            let rejected = next(260) as u32;
+
+            let mut literal_seen = Vec::new();
+            let mut literal_examined = 0usize;
+            let literal = points.iter().copied().find(|&pos| {
+                literal_examined += 1;
+                interval.is_live_at(pos) && {
+                    literal_seen.push(pos);
+                    pos != rejected
+                }
+            });
+            let mut fast_seen = Vec::new();
+            let (fast, units) = crate::scan_work::measure(|| {
+                interval.first_live_point(&points, ascending, |pos| {
+                    fast_seen.push(pos);
+                    pos != rejected
+                })
+            });
+            assert_eq!(fast, literal, "result differs in case {case}");
+            assert_eq!(
+                fast_seen, literal_seen,
+                "accept calls differ in case {case}"
+            );
+            if ascending && interval.has_ordered_ranges() {
+                // The range walk: one search per range, then only the points
+                // inside it (each one an `accept` call) and at most one past
+                // its end. The literal scan charges one `is_live_at` per point
+                // it examines, so where it examines more than this bound the
+                // case tells the two apart.
+                let bound = 2 * interval.ranges.len() as u64 + fast_seen.len() as u64;
+                assert!(
+                    units <= bound,
+                    "case {case}: {units} units charged, range walk bound {bound}"
+                );
+                if literal_examined as u64 > bound {
+                    fast_path_hits += 1;
+                }
+            }
+        }
+        assert!(fast_path_hits > 300, "fast-path hits: {fast_path_hits}");
+    }
+
+    /// Probing `n` short intervals against `n` ascending points costs `O(n)`
+    /// with the range walk. The literal scan (one `is_live_at` per point, the
+    /// form every reservation and call-crossing check had before L14-P6)
+    /// costs `O(n^2)` and fails this bound (see `crate::scan_work`).
+    #[test]
+    fn first_live_point_cost_grows_linearly() {
+        crate::scan_work::assert_near_linear("first_live_point", 256, |n| {
+            let points: Vec<u32> = (0..n as u32).map(|i| 4 * i).collect();
+            let intervals: Vec<LiveInterval> = (0..n as u32)
+                .map(|i| {
+                    let mut interval = LiveInterval::new(VReg {
+                        id: i,
+                        class: RegClass::Gpr64,
+                    });
+                    interval.add_range(4 * i, 4 * i + 2);
+                    interval
+                })
+                .collect();
+            let (accepted, units) = crate::scan_work::measure(|| {
+                intervals
+                    .iter()
+                    .filter(|interval| {
+                        interval
+                            .first_live_point(&points, true, |_| false)
+                            .is_some()
+                    })
+                    .count()
+            });
+            assert_eq!(accepted, 0);
+            units
+        });
+    }
+
     #[test]
     fn test_live_interval_is_live_at() {
         let mut interval = LiveInterval::new(VReg {
@@ -1024,6 +1208,91 @@ mod tests {
             next_stack_slot: 0,
             stack_slots: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Helper: a blocks-only function (no instructions) with the given
+    /// successor edges and layout order, for fixpoint-order tests.
+    fn make_cfg_function(
+        succs: Vec<Vec<u32>>,
+        layout: Vec<u32>,
+        entry: u32,
+    ) -> crate::machine_types::MachFunction {
+        use crate::machine_types::*;
+        MachFunction {
+            name: "cfg".into(),
+            insts: Vec::new(),
+            blocks: succs
+                .into_iter()
+                .map(|s| MachBlock {
+                    insts: Vec::new(),
+                    preds: Vec::new(),
+                    succs: s.into_iter().map(BlockId).collect(),
+                    loop_depth: 0,
+                })
+                .collect(),
+            block_order: layout.into_iter().map(BlockId).collect(),
+            entry_block: BlockId(entry),
+            next_vreg: 0,
+            next_stack_slot: 0,
+            stack_slots: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn postorder_visits_successors_before_predecessors() {
+        // Diamond with a loop back edge and an unreachable block, in a
+        // layout order that is nearly the reverse of flow order (the
+        // layout-reversed iteration this replaces).
+        // 0 -> {1, 2}; 1 -> {3}; 2 -> {3}; 3 -> {1, 4}; 4 -> {}; 5 unreachable.
+        let func = make_cfg_function(
+            vec![vec![1, 2], vec![3], vec![3], vec![1, 4], vec![], vec![]],
+            vec![5, 4, 3, 2, 1, 0],
+            0,
+        );
+        let order = postorder_from_entry(&func);
+        let ids: Vec<u32> = order.iter().map(|b| b.0).collect();
+        assert_eq!(ids.len(), 6, "every block exactly once: {ids:?}");
+        assert_eq!(ids.last(), Some(&5), "unreached block appended last");
+        let pos = |b: u32| ids.iter().position(|&x| x == b).unwrap();
+        assert!(pos(4) < pos(3) && pos(3) < pos(1) && pos(3) < pos(2));
+        assert!(
+            pos(1) < pos(0) && pos(2) < pos(0),
+            "entry is last of the reached set"
+        );
+    }
+
+    #[test]
+    fn postorder_of_chain_is_exit_first_under_adversarial_layout() {
+        // Chain 0->1->...->9 laid out in flow order: reverse-layout
+        // iteration is flow order, the worst order for a backward
+        // analysis (one block of propagation per pass). Postorder must
+        // be the exact reverse: 9 first, entry last.
+        let succs: Vec<Vec<u32>> = (0..10)
+            .map(|i| if i < 9 { vec![i + 1] } else { vec![] })
+            .collect();
+        let func = make_cfg_function(succs, (0..10).collect(), 0);
+        let ids: Vec<u32> = postorder_from_entry(&func).iter().map(|b| b.0).collect();
+        assert_eq!(ids, (0..10).rev().collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn postorder_tolerates_malformed_cfg_metadata() {
+        // Empty function: no blocks, entry names nothing.
+        let func = make_cfg_function(vec![], vec![], 0);
+        assert!(postorder_from_entry(&func).is_empty());
+
+        // Entry out of range: DFS is skipped and the layout sweep still
+        // covers every block exactly once.
+        let func = make_cfg_function(vec![vec![1], vec![2], vec![]], vec![2, 1, 0], 99);
+        let ids: Vec<u32> = postorder_from_entry(&func).iter().map(|b| b.0).collect();
+        assert_eq!(ids, vec![2, 1, 0]);
+
+        // Out-of-range successor (77), duplicated and out-of-range layout
+        // entries (1 twice, 55), and a block missing from the layout (2):
+        // valid blocks still appear exactly once, DFS order first.
+        let func = make_cfg_function(vec![vec![1, 77], vec![], vec![]], vec![1, 1, 0, 55], 0);
+        let ids: Vec<u32> = postorder_from_entry(&func).iter().map(|b| b.0).collect();
+        assert_eq!(ids, vec![1, 0, 2]);
     }
 
     #[test]
@@ -1259,6 +1528,132 @@ mod tests {
         assert_eq!(idx0, 0);
         assert_eq!(idx1, 1);
         assert_eq!(idx2, 2);
+    }
+
+    #[test]
+    fn block_transfer_matches_literal_walk_for_every_outgoing_subset() {
+        // Includes a same-instruction use/def, repeated definitions, a use
+        // before its local definition, and an empty block. The incoming set
+        // ranges across a word boundary as well as registers absent locally.
+        let func = make_custom_function(
+            vec![
+                vec![
+                    (vec![0], vec![0, 65]),
+                    (vec![65], vec![1]),
+                    (vec![0, 1], vec![65]),
+                    (vec![0], vec![]),
+                ],
+                vec![],
+            ],
+            vec![vec![1], vec![]],
+            vec![vec![], vec![0]],
+            vec![0, 0],
+        );
+        for block in &func.blocks {
+            let transfer = BlockTransfer::new(&func, block, 128);
+            for subset in 0u32..32 {
+                let mut expected = LiveSet::new(128);
+                for (bit, id) in [0, 1, 2, 65, 127].into_iter().enumerate() {
+                    if subset & (1 << bit) != 0 {
+                        expected.insert(id);
+                    }
+                }
+                let mut actual = expected.clone();
+                for &id in block.insts.iter().rev() {
+                    let inst = &func.insts[id.0 as usize];
+                    for v in inst.vreg_defs() {
+                        expected.remove(v.id);
+                    }
+                    for v in inst.vreg_uses() {
+                        expected.insert(v.id);
+                    }
+                }
+                transfer.apply(&mut actual);
+                assert_eq!(actual, expected, "outgoing subset {subset}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded liveness transfer timing; run explicitly"]
+    fn block_transfer_repeated_visit_probe() {
+        let instructions = (0..4096)
+            .map(|i| (vec![i % 128], vec![(i + 1) % 128]))
+            .collect();
+        let func = make_custom_function(vec![instructions], vec![vec![]], vec![vec![]], vec![0]);
+        let block = &func.blocks[0];
+        let transfer = BlockTransfer::new(&func, block, 128);
+        let mut old = LiveSet::new(128);
+        let start = std::time::Instant::now();
+        for _ in 0..1024 {
+            for &id in block.insts.iter().rev() {
+                let inst = &func.insts[id.0 as usize];
+                for v in inst.vreg_defs() {
+                    old.remove(v.id);
+                }
+                for v in inst.vreg_uses() {
+                    old.insert(v.id);
+                }
+            }
+            std::hint::black_box(&old);
+        }
+        let literal = start.elapsed();
+        let mut cached = LiveSet::new(128);
+        let start = std::time::Instant::now();
+        for _ in 0..1024 {
+            std::hint::black_box(&transfer).apply(&mut cached);
+            std::hint::black_box(&cached);
+        }
+        let prepared = start.elapsed();
+        assert_eq!(old, cached);
+        eprintln!(
+            "block_transfer_probe literal_us={} prepared_us={} instruction_visits={} transfer_words={} extra_bytes={}",
+            literal.as_micros(),
+            prepared.as_micros(),
+            4096 * 1024,
+            2 * 2 * 1024,
+            transfer.generated.storage_bytes() + transfer.killed.storage_bytes()
+        );
+    }
+
+    #[test]
+    #[ignore = "bounded complete-liveness comparison; run explicitly"]
+    fn complete_liveness_transfer_probe() {
+        let n = 64u32;
+        let blocks = (0..n)
+            .map(|b| {
+                (0..128)
+                    .map(|i| {
+                        let id = (b * 7 + i) % 256;
+                        (vec![id], vec![(id + 3) % 256, (id + 129) % 256])
+                    })
+                    .collect()
+            })
+            .collect();
+        let func = make_custom_function(
+            blocks,
+            (0..n).map(|b| vec![(b + 1) % n]).collect(),
+            (0..n).map(|b| vec![(b + n - 1) % n]).collect(),
+            vec![1; n as usize],
+        );
+        let start = std::time::Instant::now();
+        let mut checksum = 0u64;
+        for _ in 0..32 {
+            let result = compute_live_intervals(std::hint::black_box(&func));
+            for (id, interval) in &result.intervals {
+                checksum = checksum.wrapping_add(u64::from(*id));
+                for range in &interval.ranges {
+                    checksum =
+                        checksum.wrapping_add(u64::from(range.start) * 31 + u64::from(range.end));
+                }
+            }
+            std::hint::black_box(result);
+        }
+        eprintln!(
+            "complete_liveness_probe elapsed_us={} checksum={checksum} blocks={n} instructions=8192 runs=32",
+            start.elapsed().as_micros()
+        );
+        assert_ne!(checksum, 0);
     }
 
     // -----------------------------------------------------------------------

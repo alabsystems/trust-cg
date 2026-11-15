@@ -16,12 +16,14 @@
 //!   * a 16-byte (ptr,len) FAT-PAIR SLOT ([Ptr at +0, U64 len at +8]) whose
 //!     address is the AggByRef call-arg value — exactly the convention a
 //!     lowered callee models its own fat `&str` param with.
-//!     WHY NOT MODULE GLOBALS: trust-ir + the OBJECT path support rodata globals
-//!     (`Global`/`GlobalAddr`, e2e_aarch64_read_global.rs), but the in-process JIT
-//!     that runs every verification round-trip resolves ONLY Branch26 code fixups
-//!     (`jit.rs::patch_fixup` = `patch_branch26`); an ADRP/Page21 DATA relocation
-//!     is unresolvable there today. BACKEND NEXT-STEP (owner item): teach the JIT
-//!     data relocations, then move literals to true module globals.
+//!     WHY NOT MODULE GLOBALS: when these modules were emitted the in-process
+//!     JIT resolved ONLY Branch26 code fixups, so an ADRP/Page21 DATA
+//!     relocation was unresolvable. Since 2026-09-22 (L05-P10) the AArch64
+//!     JIT publishes module globals in a JIT-owned data image
+//!     (`e2e_aarch64_globals_darwin.rs` executes a string constant and a
+//!     mutable global through it); the embedded modules below keep the
+//!     frontend's heap-image shape verbatim, and moving the literals to true
+//!     module globals is a frontend re-emit (owner item), not a backend gap.
 //!
 //! MODELED BOUNDARIES (each also documented in the slice + the frontend
 //! change):
@@ -111,6 +113,7 @@ fn jit_module(
     );
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, externs)
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -1050,4 +1053,13 @@ fn str_const_hash_native_eq_jit() {
         jit, reversed,
         "negative control must FAIL: a reversed-concatenation hash should disagree with the JIT"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

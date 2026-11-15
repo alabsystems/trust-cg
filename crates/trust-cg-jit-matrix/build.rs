@@ -18,14 +18,11 @@ use std::path::{Path, PathBuf};
 #[path = "src/pipeline_source_identity.rs"]
 mod pipeline_source_identity;
 
-// `main` returns `Result` so the panic-family lint set is empty in this file,
-// the same discipline `trust-cg-sat-host` and `trust-cg-drat-trim` adopted in
-// 2c94d27d: the ratchet baseline's scope is `crates/*/src/**`, so a build
-// script can never be inventoried, and `check_panic_clippy.sh` compares it
-// against a baseline of 0 that no regeneration can satisfy. A build script's
-// only caller is cargo, and `Termination for Result` prints the error and exits
-// non-zero, so every path that aborted the build before still aborts it — with
-// a strictly more specific message. Nothing degrades to a silent fallback.
+// `main` returns `Result` instead of panicking, the same discipline
+// `trust-cg-sat-host` and `trust-cg-drat-trim` adopted in 2c94d27d. A build
+// script's only caller is cargo, and `Termination for Result` prints the error
+// and exits non-zero, so every path that aborts the build does so with a
+// specific message. Nothing degrades to a silent fallback.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir =
         env::var("CARGO_MANIFEST_DIR").map_err(|_| "CARGO_MANIFEST_DIR is not set by cargo")?;
@@ -37,8 +34,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let identity = pipeline_source_identity::compute_pipeline_source_identity(workspace_root)
         .map_err(|error| format!("compute machine-code pipeline source identity: {error}"))?;
 
-    // Cargo needs both file watches (content mutation/deletion) and directory
-    // watches (addition/rename). The identity itself is workspace-relative, so
+    // Cargo watches directories recursively: the compact plan retains every
+    // source tree while avoiding repeated reads of overlapping descendants.
+    // Standalone files remain explicit. The identity is workspace-relative, so
     // equivalent source trees in different worktrees still share cache entries.
     for path in &identity.watched_paths {
         println!("cargo:rerun-if-changed={}", path.display());

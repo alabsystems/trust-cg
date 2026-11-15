@@ -1071,6 +1071,113 @@ pub enum X86Opcode {
     /// Appended after AddMRSib to preserve older implicit opcode
     /// discriminants.
     RolRCl,
+    /// `MOVDQU xmm, [base + index*scale + disp]` — `F3 0F 6F /r` + SIB: the
+    /// scaled-index sibling of `MovdquRM`, standing to it exactly as
+    /// `MovsdRMSib` stands to `MovsdRM`. Operand schema
+    /// `[dst_xmm128, SibMemAddr]`. Unaligned, so no alignment precondition.
+    ///
+    /// Producer: the SIB address fold, extended to the 128-bit vector tier. The
+    /// vectorizer emits every packed element access as `LeaSib pc, [base+iv*s]`
+    /// followed by `MOVDQU`/`[pc+0]`, so each packed memory op in a vector body
+    /// paid a whole extra address-forming instruction that the SIB operand can
+    /// carry for free.
+    ///
+    /// Appended after RolRCl to preserve older implicit opcode discriminants.
+    MovdquRMSib,
+    /// `MOVDQU [base + index*scale + disp], xmm` — `F3 0F 7F /r` + SIB: the
+    /// scaled-index sibling of `MovdquMR`. Operand schema
+    /// `[SibMemAddr, src_xmm128]`, mirroring `MovMRSib`.
+    ///
+    /// This is the one that matters for `v2_memfill`: its packed fill loop is
+    /// `leaq (%r12,%rcx),%rax ; movdqu %xmm0,(%rax) ; addq $16,%rcx ; cmp ; jb`
+    /// — 512 iterations per rep, one quarter of which exists only because the
+    /// store could not carry a scaled-index address.
+    ///
+    /// Appended after MovdquRMSib to preserve older implicit opcode
+    /// discriminants.
+    MovdquMRSib,
+    /// Pseudo: the 128-bit atomic LOAD, expanded by the encoder to
+    /// `XOR EAX,EAX; XOR EDX,EDX; XOR EBX,EBX; XOR ECX,ECX;
+    /// LOCK CMPXCHG16B m128` (`31 C0 31 D2 31 DB 31 C9 F0 REX.W 0F C7 /1`).
+    ///
+    /// Intel SDM Vol. 2A, `CMPXCHG8B/CMPXCHG16B`: compares `RDX:RAX` with the
+    /// 16-byte memory operand; if equal, ZF := 1 and `RCX:RBX` is stored, else
+    /// ZF := 0 and the memory value is loaded into `RDX:RAX`. The destination
+    /// receives a write cycle in both branches. With all four registers zeroed
+    /// by the pseudo itself, both branches leave `RDX:RAX` = the 16 bytes and
+    /// the memory unchanged (LLVM's lowering of `load atomic i128` on a CX16
+    /// target). The operand must be 16-byte aligned (#GP otherwise), and
+    /// CMPXCHG16B exists only when CPUID.01H:ECX.CX16[bit 13] = 1.
+    ///
+    /// The zeroing is PART of this pseudo, not separate instructions: no pass
+    /// can delete, move or rewrite one of the four zeros apart from the
+    /// compare-exchange, the reconstruction models the whole expansion, and
+    /// ENC-3 decodes all five emitted instructions.
+    ///
+    /// Operand schema `[MemAddr { base, disp }]`. RAX, RDX, RBX and RCX are
+    /// IMPLICIT DEFS (clobbers) and nothing is an implicit use; the loaded
+    /// value is read out of RAX (low limb) and RDX (high limb) by the copies
+    /// the selector emits after it. The encoder refuses a base in any of the
+    /// four. The sole producer is `select_atomic_load` for `I128`; admission is
+    /// the trust-ir function's `cmpxchg16b` target-feature claim, checked by
+    /// the adapter's module floor before any function reaches ISel.
+    ///
+    /// Appended after MovdquMRSib to preserve older implicit opcode
+    /// discriminants.
+    AtomicLoadCmpxchg16b,
+    /// `MOVZX r32, m8` — `[REX] 0F B6 /r` with a `[base + disp]` memory
+    /// operand: a ZERO-EXTENDING byte load.
+    ///
+    /// `dst_r64 := zext8→64( mem8[ base + disp ] )`. The 32-bit destination
+    /// write zero-extends to 64 bits (SDM Vol 1 3.4.1.1), so the whole
+    /// register is defined: bits 8..63 are zero. That is the difference from
+    /// `MovRM8` (`mov r8, m8`, `8A /r`), which writes only the low byte and
+    /// keeps (MERGES) the destination's old bits 8..63: a dependency on the
+    /// register's previous value, which can sit on a loop-carried chain, and
+    /// upper bits that are whatever the allocated register held. This form
+    /// reads nothing but memory, so its destination is a pure definition
+    /// (DEF-ONLY) for register allocation, and that is the hardware
+    /// semantics, not an assumption. No REX byte is forced: the destination
+    /// is a 32-bit register, so the `AH`..`BH` byte-register trap of `MovRM8`
+    /// does not arise. Operand schema `[dst, MemAddr { base, disp }]`,
+    /// mirroring `MovRM8`. LLVM's `movzbl (m), %eax`.
+    ///
+    /// Appended after AtomicLoadCmpxchg16b to preserve older implicit opcode
+    /// discriminants.
+    MovzxRM8,
+    /// `MOVZX r32, m16` — `[REX] 0F B7 /r` with a `[base + disp]` memory
+    /// operand: a ZERO-EXTENDING word load.
+    ///
+    /// `dst_r64 := zext16→64( mem16[ base + disp ] )`. The word sibling of
+    /// `MovzxRM8`, standing to `MovRM16` (`66 8B /r`, which writes only the
+    /// low word) as `MovzxRM8` stands to `MovRM8`. No operand-size prefix:
+    /// the `0F B7` opcode itself selects the 16-bit source. Operand schema
+    /// `[dst, MemAddr { base, disp }]`. LLVM's `movzwl (m), %eax`.
+    ///
+    /// Appended after MovzxRM8 to preserve older implicit opcode
+    /// discriminants.
+    MovzxRM16,
+    /// `MOVZX r32, m8` with a scaled-index address — `[REX] 0F B6 /r` + SIB:
+    /// the scaled-index sibling of `MovzxRM8`, standing to it as `MovRM8Sib`
+    /// stands to `MovRM8`. Operand schema `[dst, SibMemAddr]`.
+    ///
+    /// Producer: the SIB address fold on byte arrays.
+    ///
+    /// Appended after MovzxRM16 to preserve older implicit opcode
+    /// discriminants.
+    MovzxRM8Sib,
+    /// Volatile `MOVZX r32, m8` (same encoding as `MovzxRM8`): one
+    /// architectural byte read, classified as an observable memory barrier
+    /// like the other volatile forms.
+    ///
+    /// Appended after MovzxRM8Sib to preserve older implicit opcode
+    /// discriminants.
+    VolatileMovzxRM8,
+    /// Volatile `MOVZX r32, m16` (same encoding as `MovzxRM16`).
+    ///
+    /// Appended after VolatileMovzxRM8 to preserve older implicit opcode
+    /// discriminants.
+    VolatileMovzxRM16,
 }
 
 impl X86Opcode {
@@ -1099,20 +1206,23 @@ impl X86Opcode {
             // Memory loads
             MovRM8 | MovRM16 | MovRM32 | MovRM | MovsdRM | MovssRM | MovdquRM | MovdqaRM
             | AddRM | SubRM | CmpRM | MovRMSib | MovsxdRMSib | MovRM32Sib | ImulRM | ImulRMSib
-            | MovsdRMSib | MovssRMSib | MovRM8Sib | MovRipRel | MovssRipRel | MovsdRipRel
-            | MovRipRelTlv => InstFlags::READS_MEMORY,
+            | MovsdRMSib | MovssRMSib | MovdquRMSib | MovRM8Sib | MovRipRel | MovssRipRel
+            | MovsdRipRel | MovRipRelTlv | MovzxRM8 | MovzxRM16 | MovzxRM8Sib => {
+                InstFlags::READS_MEMORY
+            }
 
             // Volatile loads: observable reads — mark HAS_SIDE_EFFECTS in
             // addition to READS_MEMORY so DCE never elides them even when the
             // loaded value is dead (an MMIO read must happen).
             VolatileMovRM8 | VolatileMovRM16 | VolatileMovRM32 | VolatileMovRM
-            | VolatileMovssRM | VolatileMovsdRM | VolatileMovdquRM | VolatileMovdqaRM => {
+            | VolatileMovssRM | VolatileMovsdRM | VolatileMovdquRM | VolatileMovdqaRM
+            | VolatileMovzxRM8 | VolatileMovzxRM16 => {
                 InstFlags::READS_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS)
             }
 
             // Memory stores
             MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR
-            | MovMRSib | MovMR32Sib | MovMR8Sib => {
+            | MovMRSib | MovMR32Sib | MovMR8Sib | MovdquMRSib => {
                 InstFlags::WRITES_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS)
             }
 
@@ -1147,8 +1257,8 @@ impl X86Opcode {
             }
 
             // Atomic / exchange forms conservatively model memory effects.
-            Xchg | Cmpxchg | Cmpxchg8 | Cmpxchg16 | AtomicRmwCasLoop | AtomicRmwCasLoop8
-            | AtomicRmwCasLoop16 => InstFlags::HAS_SIDE_EFFECTS
+            Xchg | Cmpxchg | Cmpxchg8 | Cmpxchg16 | AtomicLoadCmpxchg16b | AtomicRmwCasLoop
+            | AtomicRmwCasLoop8 | AtomicRmwCasLoop16 => InstFlags::HAS_SIDE_EFFECTS
                 .union(InstFlags::READS_MEMORY)
                 .union(InstFlags::WRITES_MEMORY),
 
@@ -1610,13 +1720,40 @@ mod tests {
             X86Opcode::ImulRMSib,
             X86Opcode::MovsdRMSib,
             X86Opcode::MovssRMSib,
+            X86Opcode::MovdquRMSib,
             X86Opcode::MovRipRel,
             X86Opcode::MovssRipRel,
             X86Opcode::MovsdRipRel,
+            X86Opcode::MovzxRM8,
+            X86Opcode::MovzxRM16,
+            X86Opcode::MovzxRM8Sib,
         ] {
             let flags = op.default_flags();
             assert!(flags.contains(InstFlags::READS_MEMORY), "{:?}", op);
             assert!(!flags.contains(InstFlags::WRITES_MEMORY), "{:?}", op);
+            assert!(!flags.contains(InstFlags::HAS_SIDE_EFFECTS), "{:?}", op);
+        }
+    }
+
+    /// The zero-extending loads are appended after the 128-bit atomic-load
+    /// pseudo (no older discriminant moves), and the volatile pair is an
+    /// observable read: DCE must never elide it.
+    #[test]
+    fn zero_extending_loads_are_appended_and_volatile_ones_are_observable() {
+        assert_eq!(
+            X86Opcode::MovzxRM8 as usize,
+            X86Opcode::AtomicLoadCmpxchg16b as usize + 1
+        );
+        assert_eq!(
+            X86Opcode::VolatileMovzxRM16 as usize,
+            X86Opcode::MovzxRM8 as usize + 4
+        );
+        for op in [X86Opcode::VolatileMovzxRM8, X86Opcode::VolatileMovzxRM16] {
+            let flags = op.default_flags();
+            assert!(flags.contains(InstFlags::READS_MEMORY), "{op:?}");
+            assert!(flags.contains(InstFlags::HAS_SIDE_EFFECTS), "{op:?}");
+            assert!(!flags.contains(InstFlags::WRITES_MEMORY), "{op:?}");
+            assert!(!op.is_pseudo(), "{op:?}");
         }
     }
 
@@ -1632,6 +1769,7 @@ mod tests {
             X86Opcode::MovdquMR,
             X86Opcode::MovdqaMR,
             X86Opcode::MovMRSib,
+            X86Opcode::MovdquMRSib,
         ] {
             let flags = op.default_flags();
             assert!(flags.contains(InstFlags::WRITES_MEMORY), "{:?}", op);
@@ -1681,6 +1819,7 @@ mod tests {
         for op in &[
             X86Opcode::Xchg,
             X86Opcode::Cmpxchg,
+            X86Opcode::AtomicLoadCmpxchg16b,
             X86Opcode::AtomicRmwCasLoop,
         ] {
             let flags = op.default_flags();

@@ -16,6 +16,10 @@ pub const IMAGE_SCN_ALIGN_16BYTES: u32 = 0x0050_0000;
 /// is `6 << 20`. Needed by the x86 JCC-erratum padding, which is only sound if
 /// the linker honours the 32-byte grid the padding was computed against.
 pub const IMAGE_SCN_ALIGN_32BYTES: u32 = 0x0060_0000;
+/// 64 bytes is `7 << 20`. Needed by the x86 loop-head containment aligner,
+/// which reasons about the 64-byte instruction-fetch line and is only
+/// effective if the linker honours that grid.
+pub const IMAGE_SCN_ALIGN_64BYTES: u32 = 0x0070_0000;
 pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 pub const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 
@@ -247,6 +251,7 @@ impl CoffWriter {
             3 => IMAGE_SCN_ALIGN_8BYTES,
             4 => IMAGE_SCN_ALIGN_16BYTES,
             5 => IMAGE_SCN_ALIGN_32BYTES,
+            6 => IMAGE_SCN_ALIGN_64BYTES,
             // PE encodes alignment as (log2 + 1) << 20 and tops out at 8192.
             // Anything outside the range this writer has constants for is a
             // caller bug; fall back to the 16-byte convention rather than
@@ -320,6 +325,24 @@ impl CoffWriter {
             value,
             IMAGE_SYM_DTYPE_FUNCTION,
             IMAGE_SYM_CLASS_EXTERNAL,
+        )
+    }
+
+    /// A function symbol only this object can name: `IMAGE_SYM_CLASS_STATIC`,
+    /// so no other object's reference resolves to it (an `Internal`/`Private`
+    /// trust-ir definition).
+    pub fn add_static_function_symbol(
+        &mut self,
+        name: &str,
+        section_number: u16,
+        value: u32,
+    ) -> u32 {
+        self.add_symbol(
+            name,
+            section_number as i16,
+            value,
+            IMAGE_SYM_DTYPE_FUNCTION,
+            IMAGE_SYM_CLASS_STATIC,
         )
     }
 

@@ -44,10 +44,11 @@ use crate::{
     },
     jit_contract::{
         AbiDescriptor, AbiValue, AbiValueKind, ArtifactChecksum, ArtifactContractError,
-        ArtifactManifestV1, Endianness, InvalidationKey, JitArtifactKind, LayoutManifest,
-        ProofEvidenceRejectionCode, ProofEvidenceSummary, ProofEvidenceVerdict, ProofMode,
-        ProofPolicy, SymbolLookupContract, SymbolSignature, SymbolVisibility, TargetDescriptor,
-        TypedSymbol,
+        ArtifactManifestV1, Endianness, ExecutableMemoryProtection, InvalidationKey,
+        JitArtifactKind, LayoutManifest, PageProtectionWitnessRefusal, PageProtectionWitnessSource,
+        PageProtectionWitnessStage, ProofEvidenceRejectionCode, ProofEvidenceSummary,
+        ProofEvidenceVerdict, ProofMode, ProofPolicy, SymbolLookupContract, SymbolSignature,
+        SymbolVisibility, TargetDescriptor, TypedSymbol, page_permissions_writable_and_executable,
     },
     jit_diagnostics::{
         JIT_REPLAY_SCHEMA, JIT_REPLAY_SCHEMA_VERSION, JitReplayReportMetadata, JitTrapStatusBlock,
@@ -299,8 +300,16 @@ pub enum CompileProfile {
     /// Caller-provided backend knobs.
     Custom {
         /// Object/compiler configuration.
+        ///
+        /// For executable-memory requests, its external-symbol resolution
+        /// policy is intersected with `jit` below. A strict request in either
+        /// configuration layer therefore wins.
         compiler: CompilerConfig,
         /// JIT configuration.
+        ///
+        /// For executable-memory requests, its external-symbol resolution
+        /// policy is intersected with `compiler` above. A strict request in
+        /// either configuration layer therefore wins.
         jit: JitConfig,
     },
 }
@@ -380,6 +389,12 @@ pub struct CompileServiceConfig {
     pub profile: CompileProfile,
     /// Optional durable compile artifact cache for object artifacts.
     pub compile_artifact_cache: Option<CompileArtifactCacheConfig>,
+    /// trust-ir v41 codegen-license policy applied to every compiler this
+    /// service builds (see [`trust_cg_lower::CodegenLicensePolicy`]). The
+    /// default recognizes `clean-kernel-tv` (evidence-bound: its body needs
+    /// its kernel-replayed certificate) and REFUSES claim-less bodies
+    /// (DG-73); an `Ungated` body is refused under every policy.
+    pub codegen_license: trust_cg_lower::CodegenLicensePolicy,
 }
 
 impl Default for CompileServiceConfig {
@@ -387,6 +402,7 @@ impl Default for CompileServiceConfig {
         Self {
             profile: CompileProfile::HostJitFast,
             compile_artifact_cache: None,
+            codegen_license: trust_cg_lower::CodegenLicensePolicy::default(),
         }
     }
 }
@@ -638,12 +654,15 @@ impl ArtifactIdentityInput {
     /// the same `Compiler` instance for identity and execution. Direct callers
     /// that reuse artifacts must also enforce [`crate::ArtifactReusePermit`]
     /// and authenticate the final payload digest.
-    pub fn identity(&self) -> ArtifactIdentity {
+    pub fn identity(&self) -> Result<ArtifactIdentity, crate::compile_policy::CompilePolicyError> {
         let compiler = Compiler::new(self.compiler.clone());
         self.identity_with_compiler(&compiler)
     }
 
-    fn identity_with_compiler(&self, compiler: &Compiler) -> ArtifactIdentity {
+    fn identity_with_compiler(
+        &self,
+        compiler: &Compiler,
+    ) -> Result<ArtifactIdentity, crate::compile_policy::CompilePolicyError> {
         debug_assert_eq!(compiler.config().target, self.compiler.target);
         let mut hasher = StableHasher::new();
         // v5 consumes the shared canonical policy contract as an output and
@@ -665,8 +684,7 @@ impl ArtifactIdentityInput {
         // profiling hook is threaded into executable compilation below.
         // Hashing the compiler-only scope avoids false cache misses when an
         // irrelevant low-level JIT control changes.
-        let policy = CompilePolicy::from_compiler(compiler.target_spec(), compiler.config())
-            .expect("Compiler target/config must form a bounded compile policy");
+        let policy = CompilePolicy::from_compiler(compiler.target_spec(), compiler.config())?;
         // ArtifactIdentity identifies emitted output and the install/proof
         // evidence attached to it, not request scheduling or trace mechanics.
         // Pair the two relevant disjoint projections. Full remains the right
@@ -695,7 +713,10 @@ impl ArtifactIdentityInput {
         }
         hash_proof_policy(&mut hasher, &self.proof_policy);
         hash_install_intent(&mut hasher, self.install_intent);
-        ArtifactIdentity::new(format!("trust-cg-stable128:{:032x}", hasher.finish128()))
+        Ok(ArtifactIdentity::new(format!(
+            "trust-cg-stable128:{:032x}",
+            hasher.finish128()
+        )))
     }
 }
 
@@ -950,11 +971,21 @@ pub struct EntryPointMetadata {
 }
 
 /// Stable schema for the non-circular installed executable payload binding.
+///
+/// v5 added [`InstalledPayloadBinding::executable_memory`], the observed
+/// page-protection and allocation state of the live mapping. v6 added its
+/// page-protection witness: on Linux the `/proc/self/maps` permissions of the
+/// whole allocation observed right after the read-execute seal, paired with
+/// the permissions the recorded protection implies, and observed again by the
+/// three checked installed routes (`get_contract_symbol_bound`,
+/// `native_install_gate_packet(_for_surface)`, `into_installed_artifact`);
+/// elsewhere an explicit recorded-only source. A v5 binding is
+/// refused as schema-mismatched, never migrated.
 pub const INSTALLED_PAYLOAD_BINDING_SCHEMA: &str =
-    "trust-cg.compile_service.installed_payload_binding.v4";
+    "trust-cg.compile_service.installed_payload_binding.v6";
 
 /// Stable numeric version for [`InstalledPayloadBinding`].
-pub const INSTALLED_PAYLOAD_BINDING_SCHEMA_VERSION: u32 = 4;
+pub const INSTALLED_PAYLOAD_BINDING_SCHEMA_VERSION: u32 = 6;
 
 /// One exact function range in an installed executable payload binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1018,6 +1049,20 @@ pub struct InstalledPayloadBinding {
     pub code_size_bytes: u64,
     /// Exact live executable allocation extent owned by the published buffer.
     pub allocation_size_bytes: u64,
+    /// Page-protection and allocation state observed on the live mapping
+    /// (allocator, allocation flags, raw write-phase/published protections,
+    /// `MAP_JIT`, write-protect support, published RX and the RW -> RX
+    /// protection-change outcome) plus its page-protection witness. Must
+    /// equal the Trust Codegen publication contract for
+    /// `authoritative_target`, the manifest's declared protection, and the
+    /// live buffer at every checked lookup. On a kernel-witnessed (Linux)
+    /// target, the three checked installed routes also observe the
+    /// allocation through `/proc/self/maps` and refuse by name unless the
+    /// kernel still reports the recorded permissions and no
+    /// writable-and-executable page. Raw installed and buffer lookups
+    /// (`InstalledArtifact::entrypoint`, `entrypoint_ptr`,
+    /// `ensure_published_entrypoint_ptr`) are not re-checked.
+    pub executable_memory: ExecutableMemoryProtection,
     /// Exact canonical function ranges and aliases.
     pub symbols: Vec<InstalledPayloadSymbolBinding>,
     /// SHA-256 over every preceding field in canonical order. Kept private so
@@ -1852,6 +1897,10 @@ pub struct FunctionArtifactMetadata {
     pub spill_slot_count: Option<usize>,
     /// Number of branch-like instructions for this function when known.
     pub branch_count: Option<usize>,
+    /// Existing prepared static-frame observation when retained by this route.
+    /// Name-only objects and replay-only metadata report `None`, not zero.
+    /// It is neither an install authority nor a whole-call-stack bound.
+    pub static_stack_frame: Option<crate::StaticStackFrameReport>,
 }
 
 impl FunctionArtifactMetadata {
@@ -1862,6 +1911,7 @@ impl FunctionArtifactMetadata {
             instruction_count: None,
             spill_slot_count: None,
             branch_count: None,
+            static_stack_frame: None,
         }
     }
 
@@ -1872,6 +1922,7 @@ impl FunctionArtifactMetadata {
             instruction_count: Some(metrics.instruction_count),
             spill_slot_count: Some(metrics.spill_slot_count),
             branch_count: Some(metrics.branch_count),
+            static_stack_frame: metrics.static_stack_frame,
         }
     }
 }
@@ -1892,6 +1943,10 @@ pub struct ObjectArtifactPayload {
     pub functions: Vec<FunctionArtifactMetadata>,
     /// Compile artifact cache telemetry emitted by the service object path.
     pub compile_artifact_cache_telemetry: Vec<CompileArtifactCacheTelemetry>,
+    /// Inline-only (`AvailableExternally`) bodies the object's code rests on
+    /// ([`crate::CompilationResult::inline_only_bodies`]): every body spliced
+    /// is a disclosed one-definition premise this compile did not check.
+    pub inline_only_bodies: crate::lir_module_prep::InlineOnlyBodyEvidence,
 }
 
 /// Executable-memory artifact payload.
@@ -1907,6 +1962,11 @@ pub struct ExecutableArtifactPayload {
     pub proofs: Option<Vec<ProofCertificate>>,
     /// Per-function metadata for the module.
     pub functions: Vec<FunctionArtifactMetadata>,
+    /// Inline-only (`AvailableExternally`) bodies the buffer's code rests on
+    /// ([`crate::compiler::JitCompilationResult::inline_only_bodies`]): every
+    /// body spliced is a disclosed one-definition premise this compile did
+    /// not check.
+    pub inline_only_bodies: crate::lir_module_prep::InlineOnlyBodyEvidence,
 }
 
 impl fmt::Debug for ExecutableArtifactPayload {
@@ -1918,6 +1978,7 @@ impl fmt::Debug for ExecutableArtifactPayload {
             .field("trace", &self.trace)
             .field("proofs", &self.proofs)
             .field("functions", &self.functions)
+            .field("inline_only_bodies", &self.inline_only_bodies)
             .finish()
     }
 }
@@ -2225,43 +2286,343 @@ impl CompileResponse {
         if self.status != CompileStatus::Compiled {
             return None;
         }
-        let mut artifact = self.artifact.take()?;
+        let artifact = self.artifact.take()?;
         let payload = match self.payload.take()? {
             ArtifactPayload::Executable(payload) => payload,
             ArtifactPayload::Object(_) => return None,
         };
-        validate_installed_payload_binding(
-            &artifact.install,
-            artifact.artifact_manifest.as_ref(),
-            &payload.buffer,
-        )
-        .ok()?;
-        let packet = native_install_gate_packet_for_artifact(
-            &artifact,
-            NativeInstallGateSurface::DirectCompileInstall,
-        );
-        let current = artifact
-            .artifact_manifest
-            .as_ref()
-            .map(NativeInstallGateRevalidationInput::from_manifest)
-            .unwrap_or_else(|| NativeInstallGateRevalidationInput::from_packet(&packet));
-        let verdict = validate_native_install_gate_packet_with_current(
-            &packet,
-            Some(packet.packet_hash),
-            &current,
-        );
-        if !verdict.disposition.is_installable() || !verdict.actions.expose_callable {
-            return None;
-        }
         if self.disposition != ArtifactInstallDisposition::Installable {
             return None;
         }
-        if artifact.install.disposition != ArtifactInstallDisposition::Installable {
-            return None;
-        }
-        artifact.install.native_install_gate = Some(packet);
-        Some(InstalledArtifact::new(payload.buffer, artifact.install))
+        install_compiled_buffer(artifact, payload.buffer)
     }
+}
+
+// Both the compile-service response and the consuming sealed-Core continuation
+// reach the same final payload/native-install gate before a callable owner exists.
+fn install_compiled_buffer(
+    mut artifact: CompiledArtifact,
+    buffer: Arc<ExecutableBuffer>,
+) -> Option<InstalledArtifact> {
+    validate_installed_payload_binding(
+        &artifact.install,
+        artifact.artifact_manifest.as_ref(),
+        &buffer,
+    )
+    .ok()?;
+    let packet = native_install_gate_packet_for_artifact(
+        &artifact,
+        NativeInstallGateSurface::DirectCompileInstall,
+    );
+    let current = artifact
+        .artifact_manifest
+        .as_ref()
+        .map(NativeInstallGateRevalidationInput::from_manifest)
+        .unwrap_or_else(|| NativeInstallGateRevalidationInput::from_packet(&packet));
+    let verdict = validate_native_install_gate_packet_with_current(
+        &packet,
+        Some(packet.packet_hash),
+        &current,
+    );
+    if !verdict.disposition.is_installable() || !verdict.actions.expose_callable {
+        return None;
+    }
+    if artifact.install.disposition != ArtifactInstallDisposition::Installable {
+        return None;
+    }
+    artifact.install.native_install_gate = Some(packet);
+    Some(InstalledArtifact::new(buffer, artifact.install))
+}
+
+#[cfg(feature = "verify")]
+pub(crate) fn preflight_core_publication(
+    compiler: &Compiler,
+    module: &trust_ir::Module,
+    manifest: &ArtifactManifestV1,
+    generation: CompileGeneration,
+    jit: JitConfig,
+) -> Result<(), String> {
+    if !manifest.proof_policy.requires_evidence() {
+        return Err("Core installation requires the existing certificate policy".into());
+    }
+    let mut request = CompileRequest::new("sealed-core-publication", generation)
+        .with_artifact_manifest(manifest.clone());
+    request.profile = CompileProfile::Custom {
+        compiler: compiler.config().clone(),
+        jit,
+    };
+    request.proof_policy = manifest.proof_policy.clone();
+    if let Some(refusal) =
+        required_strength_rejection_response(&request, compiler.target_spec().architecture)
+    {
+        return Err(format!("{refusal:?}"));
+    }
+    if let Some(error) =
+        manifest_contract_preflight_diagnostic(&request, compiler, "before_core_publication")
+    {
+        return Err(format!("{error:?}"));
+    }
+    if let Some(error) = manifest_module_signature_preflight_diagnostic(&request, module, compiler)
+    {
+        return Err(format!("{error:?}"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "verify")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_core_publication(
+    compiler: &Compiler,
+    module: &trust_ir::Module,
+    buffer: ExecutableBuffer,
+    manifest: ArtifactManifestV1,
+    generation: CompileGeneration,
+    identity: String,
+    lowering_count: usize,
+    verified_lowering_count: usize,
+    proof_bundle_digest: trust_ir::proof::ProofDigest,
+    jit: JitConfig,
+) -> Result<(InstalledArtifact, ArtifactManifestV1), String> {
+    finish_core_publication_with_aggregate(
+        compiler,
+        module,
+        buffer,
+        manifest,
+        generation,
+        identity,
+        lowering_count,
+        verified_lowering_count,
+        proof_bundle_digest,
+        jit,
+        None,
+    )
+}
+
+/// Private evidence transport minted only by the real checked-image overload.
+/// It is not a caller-supplied proof outcome or a per-function certificate.
+#[cfg(feature = "verify")]
+struct AggregateInstallEvidence<'a> {
+    module: &'a trust_ir::Module,
+    image: &'a [u8],
+    #[cfg(feature = "source-defined-call")]
+    identity: trust_ir::proof::ProofDigest,
+    #[cfg(feature = "source-defined-call")]
+    image_digest: trust_ir::proof::ProofDigest,
+    #[cfg(feature = "source-defined-call")]
+    caller: trust_ir::FuncId,
+    parts: usize,
+}
+
+/// Same payload/ABI/native-install owner, with a distinct genuine whole-image
+/// replay source. No missing per-function certificate or row is relabelled.
+#[cfg(feature = "source-defined-call")]
+pub(crate) fn finish_core_defined_call_publication(
+    compiler: &Compiler,
+    module: &trust_ir::Module,
+    buffer: ExecutableBuffer,
+    manifest: ArtifactManifestV1,
+    generation: CompileGeneration,
+    owner: &crate::compiler::CoreCheckedDefinedCallImage,
+    jit: JitConfig,
+) -> Result<(InstalledArtifact, ArtifactManifestV1), String> {
+    owner.validate_publication(module, buffer.code_slice(), &manifest.proof_policy)?;
+    let evidence = AggregateInstallEvidence {
+        module,
+        image: owner.linked().image(),
+        identity: owner.identity(),
+        image_digest: owner.linked().image_digest(),
+        caller: owner.caller(),
+        parts: owner.replayed_native_parts(),
+    };
+    finish_core_publication_with_aggregate(
+        compiler,
+        module,
+        buffer,
+        manifest,
+        generation,
+        owner.identity().to_string(),
+        0,
+        0,
+        owner.identity(),
+        jit,
+        Some(&evidence),
+    )
+}
+
+#[cfg(feature = "verify")]
+#[allow(clippy::too_many_arguments)]
+fn finish_core_publication_with_aggregate(
+    compiler: &Compiler,
+    module: &trust_ir::Module,
+    buffer: ExecutableBuffer,
+    mut manifest: ArtifactManifestV1,
+    generation: CompileGeneration,
+    identity: String,
+    lowering_count: usize,
+    verified_lowering_count: usize,
+    proof_bundle_digest: trust_ir::proof::ProofDigest,
+    jit: JitConfig,
+    aggregate: Option<&AggregateInstallEvidence<'_>>,
+) -> Result<(InstalledArtifact, ArtifactManifestV1), String> {
+    // Complete only the compiler-owned digest. Existing caller claims are
+    // preserved and independently checked by build_installed_payload_binding.
+    manifest
+        .metadata
+        .entry("native_payload_sha256".into())
+        .or_insert_with(|| format!("sha256:{}", sha256_hex(buffer.code_slice())));
+    let mut request = CompileRequest::new("sealed-core-publication", generation)
+        .with_artifact_manifest(manifest.clone());
+    request.profile = CompileProfile::Custom {
+        compiler: compiler.config().clone(),
+        jit,
+    };
+    request.proof_policy = manifest.proof_policy.clone();
+    let identity = ArtifactIdentity::from(identity);
+    let binding =
+        build_installed_payload_binding(compiler, module, &buffer, Some(&manifest), &identity)
+            .map_err(|error| format!("{error:?}"))?;
+    let proofs = if let Some(owner) = aggregate {
+        if !std::ptr::eq(owner.module, module)
+            || owner.image != buffer.code_slice()
+            || manifest.proof_policy.mode != crate::jit_contract::ProofMode::RequireReplay
+            || manifest.proof_policy.require_jit_certificate
+            || owner.parts == 0
+        {
+            return Err("private aggregate publication transport differs".into());
+        }
+        InstallProofSummary {
+            policy_status: ProofPolicyStatus::Satisfied,
+            rejection_code: None,
+            lowering_certificate_count: 0,
+            verified_lowering_certificate_count: 0,
+            jit_certificate_count: buffer.certificates().count(),
+            all_jit_certificates_verified: buffer.all_verified(),
+        }
+    } else {
+        install_proof_summary(
+            true,
+            lowering_count,
+            verified_lowering_count,
+            Some(buffer.certificates().count()),
+            buffer.all_verified(),
+            buffer.function_ranges().len(),
+        )
+    };
+    let entrypoints = buffer
+        .symbols()
+        .map(|(name, offset_bytes)| EntryPointMetadata {
+            name: name.into(),
+            offset_bytes,
+        })
+        .collect();
+    let functions = buffer
+        .function_ranges()
+        .iter()
+        .map(|(name, range)| {
+            let mut function = FunctionArtifactMetadata::from_trust_ir_name(name);
+            function.code_size_bytes = usize::try_from(range.end - range.start).ok();
+            function
+        })
+        .collect();
+    let replay = replay_report_metadata_from_executable_buffer(
+        &buffer,
+        &request,
+        &ArtifactProvenance::default(),
+        generation,
+        &identity,
+        &binding,
+    );
+    let details = InstallArtifactDetails {
+        exported_entrypoints: entrypoints,
+        functions,
+        proofs,
+        installed_payload_binding: Some(binding),
+        replay_report_metadata: Some(replay),
+        ..InstallArtifactDetails::default()
+    };
+    let metadata = artifact_metadata_from_compilation(
+        &request.profile,
+        compiler.config().target,
+        ArtifactKind::ExecutableMemory,
+        buffer.code_len(),
+        Some(buffer.allocated_size()),
+    );
+    let mut artifact = artifact_from_metadata(
+        &request,
+        generation,
+        ArtifactProvenance::default(),
+        metadata,
+        Duration::ZERO,
+        identity,
+        details,
+    );
+    attach_request_manifest(&request, &mut artifact);
+    apply_install_disposition_for_target(&request, compiler.target_spec(), &mut artifact);
+    #[cfg(feature = "source-defined-call")]
+    if let Some(owner) = aggregate {
+        // Complete independent source/native replay is its own evidence class;
+        // the old failed row report and actual certificate count stay intact.
+        let summary = &mut artifact.install.proof_evidence_summary;
+        summary.verifier = "trust-cg.source-bound-defined-call-aggregate.v1".into();
+        summary.strength = crate::jit_contract::EvidenceStrength::IndependentReplay {
+            checker: "Clean canonical kernel and Clean/Carcara".into(),
+        };
+        summary.metadata.insert(
+            "aggregate_checked_identity".into(),
+            owner.identity.to_string(),
+        );
+        summary.metadata.insert(
+            "aggregate_linked_image".into(),
+            owner.image_digest.to_string(),
+        );
+        summary.metadata.insert(
+            "aggregate_selected_entry".into(),
+            owner.caller.index().to_string(),
+        );
+        summary
+            .metadata
+            .insert("aggregate_replayed_parts".into(), owner.parts.to_string());
+        summary.metadata.insert(
+            "per_function_caller_certificate".into(),
+            "absent-original-report-rejected".into(),
+        );
+        summary.metadata.insert(
+            "proof_report_identity_kind".into(),
+            "checked-source-native-image-receipt".into(),
+        );
+        summary.metadata.insert(
+            "actual_jit_certificate_count".into(),
+            buffer.certificates().count().to_string(),
+        );
+        summary.metadata.insert(
+            "all_function_semantics_verified".into(),
+            buffer.all_verified().to_string(),
+        );
+        if !summary.satisfies_required_strength(manifest.proof_policy.required_strength) {
+            return Err("aggregate replay does not satisfy requested evidence class".into());
+        }
+    }
+    if !artifact
+        .install
+        .proof_evidence_report
+        .as_ref()
+        .is_some_and(ProofTvEvidenceReportV1::is_accepted)
+        || artifact.install.proof_evidence_summary.verdict != ProofEvidenceVerdict::Verified
+        || proof_bundle_digest.is_zero()
+    {
+        return Err("existing proof evidence owner refused Core publication".into());
+    }
+    // Exact payload plus either the legacy streamed row-proof commitment or
+    // the distinct checked source/native image receipt. Neither representation
+    // changes the old row report or certificate counts.
+    artifact
+        .install
+        .proof_evidence_summary
+        .native_payload_sha256 = format!("sha256:{}", sha256_hex(buffer.code_slice()));
+    artifact.install.proof_evidence_summary.proof_report_sha256 = proof_bundle_digest.to_string();
+    install_compiled_buffer(artifact, Arc::new(buffer))
+        .map(|installed| (installed, manifest))
+        .ok_or_else(|| "existing payload/native-install owner refused Core publication".into())
 }
 
 fn blocked_native_install_gate_packet_for_reporting(
@@ -2635,6 +2996,7 @@ fn functions_from_executable_replay_metadata(
             instruction_count: None,
             spill_slot_count: None,
             branch_count: None,
+            static_stack_frame: None,
         })
         .collect();
     functions.sort_by(|left, right| left.name.cmp(&right.name));
@@ -3428,7 +3790,8 @@ impl CompileService {
         target_spec: TargetSpec,
         request: &CompileRequest,
     ) -> Compiler {
-        let compiler = Compiler::new_for_target_spec(compiler_config, target_spec);
+        let compiler = Compiler::new_for_target_spec(compiler_config, target_spec)
+            .with_codegen_license(self.config.codegen_license.clone());
         match &self.config.compile_artifact_cache {
             Some(cache) => compiler.with_compile_artifact_cache(
                 cache
@@ -3505,6 +3868,10 @@ enum VerifierRejectionKind {
     DuplicateEdgeCopyDestinations,
     UnsupportedAbiCast,
     InvalidProvenanceAssumption,
+    /// WS7.3: every validator finding the three named kinds above do not
+    /// classify. Before WS7.3 these were dropped (`_ => {}`) and the module
+    /// went on to compile.
+    InvalidTrustIr,
 }
 
 impl VerifierRejectionKind {
@@ -3514,6 +3881,7 @@ impl VerifierRejectionKind {
             Self::DuplicateEdgeCopyDestinations => "trust_ir_duplicate_edge_copy_destinations",
             Self::UnsupportedAbiCast => "trust_ir_unsupported_abi_cast",
             Self::InvalidProvenanceAssumption => "trust_ir_invalid_provenance_assumption",
+            Self::InvalidTrustIr => "trust_ir_invalid_module",
         }
     }
 
@@ -3527,6 +3895,7 @@ impl VerifierRejectionKind {
             Self::InvalidProvenanceAssumption => {
                 "trust_ir verifier rejected invalid provenance assumptions"
             }
+            Self::InvalidTrustIr => "trust_ir verifier rejected the module",
         }
     }
 }
@@ -3539,10 +3908,14 @@ fn verifier_rejection_response(
     generation: CompileGeneration,
     identity: &ArtifactIdentity,
 ) -> Option<CompileResponse> {
-    let rejection = first_verifier_rejection(module)?;
+    let (rejection, detail) = first_verifier_rejection(module)?;
     let failure_code = rejection.failure_code();
-    let diagnostic = CompileDiagnostic::error(failure_code, rejection.message())
-        .with_phase("before_executable_allocation");
+    let message = match detail {
+        Some(detail) => format!("{}: {detail}", rejection.message()),
+        None => rejection.message().to_string(),
+    };
+    let diagnostic =
+        CompileDiagnostic::error(failure_code, message).with_phase("before_executable_allocation");
     let replay_report_metadata = verifier_rejection_replay_metadata(
         request,
         compiler.target_spec(),
@@ -3578,28 +3951,49 @@ fn verifier_rejection_response(
     })
 }
 
-fn first_verifier_rejection(module: &trust_ir::Module) -> Option<VerifierRejectionKind> {
+/// The service's pre-allocation verifier verdict: a named kind, plus (for
+/// [`VerifierRejectionKind::InvalidTrustIr`]) the findings it stands for.
+///
+/// Three validator findings keep their historical kinds; every OTHER finding
+/// of `validate_module` is [`VerifierRejectionKind::InvalidTrustIr`] (WS7.3 —
+/// it used to be dropped and the module compiled). The codegen layers
+/// (license, lowerability, `global_asm`) are then decided by the compiler's
+/// own ingestion admission, which this service's compile reaches.
+fn first_verifier_rejection(
+    module: &trust_ir::Module,
+) -> Option<(VerifierRejectionKind, Option<String>)> {
     if has_duplicate_block_param(module) {
-        return Some(VerifierRejectionKind::DuplicateEdgeCopyDestinations);
+        return Some((VerifierRejectionKind::DuplicateEdgeCopyDestinations, None));
     }
 
-    for error in trust_ir_build::validate::validate_module(module) {
+    let errors = trust_ir_build::validate::validate_module(module);
+    for error in &errors {
         match error {
             trust_ir_build::validate::ValidationError::BranchArgCountMismatch { .. } => {
-                return Some(VerifierRejectionKind::InvalidBlockArgs);
+                return Some((VerifierRejectionKind::InvalidBlockArgs, None));
             }
-            trust_ir_build::validate::ValidationError::CastIncompatible { .. } => {
-                return Some(VerifierRejectionKind::UnsupportedAbiCast);
-            }
-            trust_ir_build::validate::ValidationError::CastLayoutUnsupported { .. } => {
-                return Some(VerifierRejectionKind::UnsupportedAbiCast);
+            trust_ir_build::validate::ValidationError::CastIncompatible { .. }
+            | trust_ir_build::validate::ValidationError::CastLayoutUnsupported { .. } => {
+                return Some((VerifierRejectionKind::UnsupportedAbiCast, None));
             }
             _ => {}
         }
     }
 
     if has_invalid_provenance_assumption(module) {
-        return Some(VerifierRejectionKind::InvalidProvenanceAssumption);
+        return Some((VerifierRejectionKind::InvalidProvenanceAssumption, None));
+    }
+
+    if !errors.is_empty() {
+        let refusal = trust_cg_lower::InvalidTrustIr {
+            module: module.name.clone(),
+            stage: trust_cg_lower::AdmissionStage::Received,
+            errors,
+        };
+        return Some((
+            VerifierRejectionKind::InvalidTrustIr,
+            Some(refusal.to_string()),
+        ));
     }
 
     None
@@ -3651,6 +4045,11 @@ fn verifier_value_types(func: &trust_ir::Function) -> HashMap<u32, trust_ir::Ty>
                 | trust_ir::Inst::AtomicRMW { ty, .. }
                 | trust_ir::Inst::ExtractField { ty, .. }
                 | trust_ir::Inst::InsertField { ty, .. }
+                // `MakeAggregate` (trust-ir WS3.5) and `ArraySplat` (v50) carry
+                // the aggregate type they build, so their results are typed
+                // like their InsertField sibling.
+                | trust_ir::Inst::MakeAggregate { ty, .. }
+                | trust_ir::Inst::ArraySplat { ty, .. }
                 | trust_ir::Inst::ExtractElement { ty, .. }
                 | trust_ir::Inst::InsertElement { ty, .. }
                 | trust_ir::Inst::Const { ty, .. }
@@ -4695,6 +5094,20 @@ fn install_disposition_for_request(
 
 fn expanded_profile_for_request(request: &CompileRequest) -> ExpandedCompileProfile {
     let mut expanded = request.profile.expand();
+    if request.artifact_kind == ArtifactKind::ExecutableMemory {
+        // CompileService predates the high-level CompilerConfig JIT policy and
+        // therefore exposes both CompilerConfig and JitConfig in Custom
+        // profiles. Normalize them once, before compiler construction and
+        // ArtifactIdentityInput construction, using the intersection of their
+        // allowed lookup sources. This prevents either configuration layer
+        // from silently weakening an ExplicitOnly request in the other.
+        let external_symbol_resolution = expanded
+            .compiler
+            .jit_external_symbol_resolution
+            .fail_closed_intersection(expanded.jit.external_symbol_resolution);
+        expanded.compiler.jit_external_symbol_resolution = external_symbol_resolution;
+        expanded.jit.external_symbol_resolution = external_symbol_resolution;
+    }
     if request.proof_policy.requires_evidence() {
         expanded.compiler.emit_proofs = true;
         expanded.jit.verify = true;
@@ -4708,11 +5121,10 @@ fn authoritative_target_feature_names(
     artifact_kind: ArtifactKind,
 ) -> Vec<&'static str> {
     match (compiler.config().target, artifact_kind) {
-        (Target::Aarch64, ArtifactKind::Object) => {
-            AArch64IsaProfile::for_aot_target(compiler.target_spec())
-                .enabled_feature_names()
-                .collect()
-        }
+        (Target::Aarch64, ArtifactKind::Object) => compiler
+            .aarch64_object_isa_profile()
+            .enabled_feature_names()
+            .collect(),
         (Target::Aarch64, ArtifactKind::ExecutableMemory) => compiler
             .effective_aarch64_jit_isa_profile()
             .enabled_feature_names()
@@ -4931,6 +5343,15 @@ fn manifest_contract_preflight_diagnostic(
         Some(format!(
             "ABI mismatch: compiler authority is {:?}, manifest carries {:?}",
             expected_abi, manifest.abi
+        ))
+    } else if request.artifact_kind == ArtifactKind::ExecutableMemory
+        && manifest.executable_memory
+            != ExecutableMemoryProtection::for_trust_cg_target(&expected_target)
+    {
+        Some(format!(
+            "executable-memory protection mismatch: compiler publication contract is {:?}, manifest carries {:?}",
+            ExecutableMemoryProtection::for_trust_cg_target(&expected_target),
+            manifest.executable_memory
         ))
     } else if !core_layout_matches(&manifest.layout, &expected_layout) {
         Some(format!(
@@ -5215,7 +5636,7 @@ fn installed_payload_binding_transcript(
     push_installed_payload_binding_component(
         &mut bytes,
         "transcript.domain",
-        b"trust-cg.compile_service.installed_payload_binding.sha256.v4",
+        b"trust-cg.compile_service.installed_payload_binding.sha256.v6",
     );
     push_installed_payload_binding_component(
         &mut bytes,
@@ -5294,6 +5715,11 @@ fn installed_payload_binding_transcript(
     );
     push_installed_payload_binding_component(
         &mut bytes,
+        "binding.executable_memory.canonical",
+        &binding.executable_memory.canonical_bytes(),
+    );
+    push_installed_payload_binding_component(
+        &mut bytes,
         "binding.symbols.len",
         &(binding.symbols.len() as u64).to_le_bytes(),
     );
@@ -5355,9 +5781,75 @@ fn installed_payload_binding_sha256(
 
 fn compiler_symbol_visibility(function: &trust_ir::Function) -> SymbolVisibility {
     match function.linkage {
+        // The module-local arm: exactly trust-ir's proved
+        // `Linkage::is_module_local` (pinned by
+        // `v41_linkage_kinds_classify_without_a_wildcard`); kept an arm so the
+        // three-way map stays exhaustive.
         trust_ir::Linkage::Internal | trust_ir::Linkage::Private => SymbolVisibility::Internal,
-        trust_ir::Linkage::External | trust_ir::Linkage::Weak | trust_ir::Linkage::LinkOnce => {
-            SymbolVisibility::Exported
+        // Definitions this artifact emits. `WeakOdr`/`LinkOnceOdr` (v41) are
+        // the one-definition-rule twins of `Weak`/`LinkOnce`: the linker may
+        // drop duplicates, but a copy IS emitted here, so they publish exactly
+        // as their non-ODR forms do.
+        trust_ir::Linkage::External
+        | trust_ir::Linkage::Weak
+        | trust_ir::Linkage::LinkOnce
+        | trust_ir::Linkage::WeakOdr
+        | trust_ir::Linkage::LinkOnceOdr => SymbolVisibility::Exported,
+        // NOT definitions of this artifact (v41), so neither may be reported as
+        // exported — that would advertise a symbol this payload does not
+        // contain. `AvailableExternally` is available for inlining but never
+        // emitted, its definition living elsewhere; `ExternalWeak` is a weak
+        // DECLARATION that resolves to null when nothing defines it.
+        trust_ir::Linkage::AvailableExternally | trust_ir::Linkage::ExternalWeak => {
+            SymbolVisibility::Imported
+        }
+    }
+}
+
+#[cfg(test)]
+mod symbol_visibility_tests {
+    use super::{SymbolVisibility, compiler_symbol_visibility};
+
+    fn function_with(linkage: trust_ir::Linkage) -> trust_ir::Function {
+        let mut function = trust_ir::Function::new(
+            trust_ir::FuncId::new(0),
+            "entry",
+            trust_ir::FuncTyId::new(0),
+            trust_ir::BlockId::new(0),
+        );
+        function.linkage = linkage;
+        function
+    }
+
+    // trust-ir v41: every linkage kind classifies explicitly. The ODR kinds
+    // export like their base kinds; the two never-defined-here kinds are
+    // imports, never exports.
+    #[test]
+    fn v41_linkage_kinds_classify_without_a_wildcard() {
+        for (linkage, expected) in [
+            (trust_ir::Linkage::External, SymbolVisibility::Exported),
+            (trust_ir::Linkage::Weak, SymbolVisibility::Exported),
+            (trust_ir::Linkage::LinkOnce, SymbolVisibility::Exported),
+            (trust_ir::Linkage::WeakOdr, SymbolVisibility::Exported),
+            (trust_ir::Linkage::LinkOnceOdr, SymbolVisibility::Exported),
+            (trust_ir::Linkage::Internal, SymbolVisibility::Internal),
+            (trust_ir::Linkage::Private, SymbolVisibility::Internal),
+            (
+                trust_ir::Linkage::AvailableExternally,
+                SymbolVisibility::Imported,
+            ),
+            (trust_ir::Linkage::ExternalWeak, SymbolVisibility::Imported),
+        ] {
+            assert_eq!(
+                compiler_symbol_visibility(&function_with(linkage)),
+                expected,
+                "{linkage}"
+            );
+            assert_eq!(
+                expected == SymbolVisibility::Internal,
+                linkage.is_module_local(),
+                "{linkage}: the Internal arm is trust-ir's module-local table"
+            );
         }
     }
 }
@@ -5367,7 +5859,32 @@ fn compiler_abi_value_for_trust_ir_type(
     nullable_pointer: bool,
     target_spec: TargetSpec,
 ) -> Result<AbiValue, String> {
+    if ty.contains_dialect() {
+        return Err(format!(
+            "unlegalized dialect type {ty:?} cannot cross the exported ABI for target {}",
+            target_spec.triple()
+        ));
+    }
+    // v43: a handle NESTED in a pointee or aggregate. The pointer-family arms
+    // below answer `Ptr` without looking at what they point AT, so a bare
+    // `Ty::Handle` arm alone would let `&handle<Nat>` cross the exported
+    // boundary as an ordinary pointer. MEASURED by
+    // `compiler_abi_rejects_opaque_runtime_handles_at_the_exported_boundary`,
+    // which caught exactly that.
+    if !ty.is_handle()
+        && let Some(handle) = trust_cg_lower::inline_handle_identity(ty)
+    {
+        return Err(format!(
+            "unsupported exported ABI value {ty:?} for target {}; it reaches the opaque runtime \
+             handle handle<{:?}, {:?}> (trust-ir v43), which may cross a PINNED runtime call edge \
+             inside a module but never an exported boundary",
+            target_spec.triple(),
+            handle.name,
+            handle.runtime
+        ));
+    }
     let kind = match ty {
+        trust_ir::Ty::Ext(e) => e.unreachable(),
         trust_ir::Ty::Bool => AbiValueKind::I1,
         trust_ir::Ty::I8 | trust_ir::Ty::U8 => AbiValueKind::I8,
         trust_ir::Ty::I16 | trust_ir::Ty::U16 => AbiValueKind::I16,
@@ -5390,9 +5907,36 @@ fn compiler_abi_value_for_trust_ir_type(
                 target_spec.triple()
             ));
         }
+        // v43: a handle is one pointer word, but an EXPORTED ABI slot is
+        // reached by an arbitrary caller — the one thing a handle's origin
+        // pin exists to exclude. Admitting it here would let any caller
+        // present a forged word to a trusted runtime, so the boundary refuses
+        // and names the runtime whose word it declined to carry.
+        trust_ir::Ty::Handle(handle) => {
+            return Err(format!(
+                "unsupported exported ABI value handle<{:?}, {:?}> (trust-ir v43) for target {}; \
+                 an opaque runtime handle may cross a PINNED runtime call edge inside a module, \
+                 never an exported boundary an arbitrary caller can present a word to",
+                handle.name,
+                handle.runtime,
+                target_spec.triple()
+            ));
+        }
+        trust_ir::Ty::Storage(_) => {
+            return Err(format!(
+                "unsupported exported ABI Storage geometry {ty:?} for target {}; Storage has no initialized value representation",
+                target_spec.triple()
+            ));
+        }
+        trust_ir::Ty::Tensor(_, _) => {
+            return Err(format!(
+                "unsupported exported ABI Ty::Tensor {ty:?}; no native tensor layout or value ABI"
+            ));
+        }
         trust_ir::Ty::I128
         | trust_ir::Ty::U128
         | trust_ir::Ty::Error
+        | trust_ir::Ty::Dialect(_)
         | trust_ir::Ty::F16
         | trust_ir::Ty::Vector(_, _)
         | trust_ir::Ty::FatPtr(_)
@@ -5437,6 +5981,11 @@ fn compiler_symbol_signature(
         )
     })?;
     if function_type.is_vararg {
+        // A variadic DEFINITION is refused with the diagnostic every lowering
+        // entry shares; a variadic declaration still cannot be described by
+        // the installed ABI descriptor.
+        trust_cg_lower::reject_variadic_definition(function, module)
+            .map_err(|error| format!("exported function `{}`: {error}", function.name))?;
         return Err(format!(
             "exported function `{}` is variadic but the installed ABI descriptor rejects varargs",
             function.name
@@ -5462,11 +6011,13 @@ fn compiler_symbol_signature(
 
     let mut params = Vec::with_capacity(function_type.params.len());
     for (index, ty) in function_type.params.iter().enumerate() {
+        // v45: `ParamAttrs` is no longer `Copy` — `pass`'s `PassMode::Cast`
+        // carries a `Vec` of lane types.
         let attrs = function
             .attrs
             .params
             .get(index)
-            .copied()
+            .cloned()
             .unwrap_or_default();
         if attrs.byval || attrs.sret {
             return Err(format!(
@@ -5894,6 +6445,23 @@ fn build_installed_payload_binding(
                     .with_phase("compile_executable")
             })?;
     }
+    let executable_memory = buffer.executable_memory_protection();
+    validate_publication_page_protection_witness(buffer, &executable_memory).map_err(|error| {
+        CompileDiagnostic::error("compile.page_protection_witness", error.to_string())
+            .with_phase("compile_executable")
+    })?;
+    if let Some(manifest) = manifest
+        && manifest.executable_memory.as_ref() != Some(&executable_memory)
+    {
+        return Err(CompileDiagnostic::error(
+            "compile.manifest_payload_mismatch",
+            format!(
+                "caller manifest executable-memory protection {:?} does not match the published mapping {executable_memory:?}",
+                manifest.executable_memory
+            ),
+        )
+        .with_phase("compile_executable"));
+    }
     Ok(InstalledPayloadBinding {
         schema: INSTALLED_PAYLOAD_BINDING_SCHEMA.to_owned(),
         schema_version: INSTALLED_PAYLOAD_BINDING_SCHEMA_VERSION,
@@ -5909,6 +6477,7 @@ fn build_installed_payload_binding(
         published_image_sha256,
         code_size_bytes,
         allocation_size_bytes,
+        executable_memory,
         symbols,
         binding_sha256: String::new(),
     }
@@ -5919,6 +6488,176 @@ fn installed_payload_binding_mismatch(detail: impl Into<String>) -> ArtifactCont
     ArtifactContractError::InstalledPayloadBindingMismatch {
         detail: detail.into(),
     }
+}
+
+fn page_protection_witness_refused(
+    refusal: PageProtectionWitnessRefusal,
+    stage: PageProtectionWitnessStage,
+    detail: impl Into<String>,
+) -> ArtifactContractError {
+    ArtifactContractError::PageProtectionWitnessRefused {
+        refusal,
+        stage,
+        detail: detail.into(),
+    }
+}
+
+/// Compare a kernel permission string with the recorded one. A writable and
+/// executable observation is refused before, and independently of, the
+/// comparison.
+fn check_observed_page_permissions(
+    observed: &str,
+    recorded: &str,
+    stage: PageProtectionWitnessStage,
+    witness: &str,
+) -> Result<(), ArtifactContractError> {
+    if page_permissions_writable_and_executable(observed) {
+        return Err(page_protection_witness_refused(
+            PageProtectionWitnessRefusal::WritableExecutable,
+            stage,
+            format!(
+                "{witness} reports writable and executable permissions `{observed}` (recorded `{recorded}`)"
+            ),
+        ));
+    }
+    if observed != recorded {
+        return Err(page_protection_witness_refused(
+            PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+            stage,
+            format!("{witness} reports `{observed}`, but the recorded protection is `{recorded}`"),
+        ));
+    }
+    Ok(())
+}
+
+/// The observation the JIT took right after the read-execute seal must show
+/// exactly the recorded permissions before a binding is sealed over it.
+fn validate_publication_page_protection_witness(
+    buffer: &ExecutableBuffer,
+    protection: &ExecutableMemoryProtection,
+) -> Result<(), ArtifactContractError> {
+    use crate::jit_page_witness::PublicationPageWitness;
+    let stage = PageProtectionWitnessStage::Publication;
+    let recorded = &protection.page_protection_witness.recorded_permissions;
+    match buffer.publication_page_witness() {
+        PublicationPageWitness::RecordedOnly => Ok(()),
+        PublicationPageWitness::Observed(observation) => check_observed_page_permissions(
+            &observation.permissions(),
+            recorded,
+            stage,
+            &format!(
+                "/proc/self/maps for [{:#x}, {:#x}) right after the read-execute seal",
+                observation.start, observation.end
+            ),
+        ),
+        PublicationPageWitness::Failed(error) => Err(page_protection_witness_refused(
+            error.refusal(),
+            stage,
+            format!("the kernel did not witness the sealed allocation: {error}"),
+        )),
+        PublicationPageWitness::NotPublished => Err(page_protection_witness_refused(
+            PageProtectionWitnessRefusal::Unobservable,
+            stage,
+            "the buffer never went through a publish sequence",
+        )),
+    }
+}
+
+/// Check the sealed witness against the target's contract witness, once
+/// every other protection field already equals the contract.
+fn validate_sealed_page_protection_witness(
+    sealed: &ExecutableMemoryProtection,
+    contract: &ExecutableMemoryProtection,
+    triple: &str,
+) -> Result<(), ArtifactContractError> {
+    let stage = PageProtectionWitnessStage::Lookup;
+    let witness = &sealed.page_protection_witness;
+    let expected = &contract.page_protection_witness;
+    if witness.source != expected.source {
+        return Err(page_protection_witness_refused(
+            PageProtectionWitnessRefusal::SourceMismatch,
+            stage,
+            format!(
+                "sealed witness source is {} but {triple} publishes with {}",
+                witness.source.as_str(),
+                expected.source.as_str()
+            ),
+        ));
+    }
+    let derived = sealed.recorded_page_permissions();
+    if witness.recorded_permissions != derived {
+        return Err(page_protection_witness_refused(
+            PageProtectionWitnessRefusal::RecordedProtectionForged,
+            stage,
+            format!(
+                "sealed recorded permissions `{}` do not follow from the recorded raw protection {:#x} with allocation flags {:#x}, which imply `{derived}`",
+                witness.recorded_permissions, sealed.published_protection, sealed.allocation_flags
+            ),
+        ));
+    }
+    match (witness.source, witness.observed_permissions.as_deref()) {
+        (PageProtectionWitnessSource::KernelProcSelfMaps, Some(observed)) => {
+            check_observed_page_permissions(
+                observed,
+                &witness.recorded_permissions,
+                stage,
+                "the sealed publication observation",
+            )?;
+        }
+        (PageProtectionWitnessSource::KernelProcSelfMaps, None) => {
+            return Err(page_protection_witness_refused(
+                PageProtectionWitnessRefusal::Unobservable,
+                stage,
+                "a kernel-witnessed binding carries no publication observation",
+            ));
+        }
+        (PageProtectionWitnessSource::RecordedOnly, Some(observed)) => {
+            return Err(page_protection_witness_refused(
+                PageProtectionWitnessRefusal::SourceMismatch,
+                stage,
+                format!("a recorded-only binding carries an observation `{observed}`"),
+            ));
+        }
+        (PageProtectionWitnessSource::RecordedOnly, None) => {}
+    }
+    if witness != expected {
+        return Err(page_protection_witness_refused(
+            PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+            stage,
+            format!("sealed witness {witness:?} is not the {triple} contract witness {expected:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Observe the kernel's protection of the live allocation again before any
+/// of its bytes are read, and require the recorded permissions exactly. Runs
+/// on the three checked installed routes only.
+fn validate_live_page_protection_witness(
+    buffer: &ExecutableBuffer,
+    binding: &InstalledPayloadBinding,
+) -> Result<(), ArtifactContractError> {
+    let witness = &binding.executable_memory.page_protection_witness;
+    if witness.source == PageProtectionWitnessSource::RecordedOnly {
+        return Ok(());
+    }
+    let stage = PageProtectionWitnessStage::Lookup;
+    let observation = buffer.observe_kernel_page_protection().map_err(|error| {
+        page_protection_witness_refused(
+            error.refusal(),
+            stage,
+            format!("the kernel did not witness the installed allocation: {error}"),
+        )
+    })?;
+    check_observed_page_permissions(
+        &observation.permissions(),
+        &witness.recorded_permissions,
+        stage,
+        &format!(
+            "/proc/self/maps for the installed allocation [{:#x}, {:#x})",
+            observation.start, observation.end
+        ),
+    )
 }
 
 fn validate_bound_symbol_signature(
@@ -5996,6 +6735,12 @@ fn validate_manifest_against_installed_binding(
         return Err(installed_payload_binding_mismatch(format!(
             "manifest ABI {:?} does not structurally match compiler ABI {:?}",
             manifest.abi, binding.authoritative_abi
+        )));
+    }
+    if manifest.executable_memory.as_ref() != Some(&binding.executable_memory) {
+        return Err(installed_payload_binding_mismatch(format!(
+            "manifest executable-memory protection {:?} does not match the sealed published protection {:?}",
+            manifest.executable_memory, binding.executable_memory
         )));
     }
     if manifest.layout != binding.authoritative_layout {
@@ -6138,6 +6883,15 @@ fn validate_replay_against_installed_binding(
         )));
     }
     let allocation_size_bytes = binding.allocation_size_bytes.to_string();
+    let executable_memory_protection_sha256 = binding.executable_memory.canonical_sha256();
+    if replay.properties.get("executable_memory_protection_sha256")
+        != Some(&executable_memory_protection_sha256)
+    {
+        return Err(installed_payload_binding_mismatch(format!(
+            "replay executable-memory protection {:?} differs from the sealed protection {executable_memory_protection_sha256}",
+            replay.properties.get("executable_memory_protection_sha256")
+        )));
+    }
     if replay.artifact_id.as_deref() != Some(install.identity.as_str())
         || replay.target.as_deref() != Some(binding.compiler_target_triple.as_str())
         || replay.code_size != binding.code_size_bytes
@@ -6224,7 +6978,7 @@ fn validate_installed_payload_binding(
     buffer: &ExecutableBuffer,
 ) -> Result<(), ArtifactContractError> {
     let binding = install.installed_payload_binding.as_ref().ok_or_else(|| {
-        installed_payload_binding_mismatch("missing mandatory compiler-derived v4 binding")
+        installed_payload_binding_mismatch("missing mandatory compiler-derived v6 binding")
     })?;
     if binding.schema != INSTALLED_PAYLOAD_BINDING_SCHEMA
         || binding.schema_version != INSTALLED_PAYLOAD_BINDING_SCHEMA_VERSION
@@ -6281,6 +7035,30 @@ fn validate_installed_payload_binding(
             "sealed target/ABI/core-layout authority is not an exact Trust Codegen target contract",
         ));
     }
+    let not_the_contract = || {
+        installed_payload_binding_mismatch(format!(
+            "sealed executable-memory protection {:?} is not the W^X read-execute publication contract for {}",
+            binding.executable_memory, binding.authoritative_target.triple
+        ))
+    };
+    let contract = ExecutableMemoryProtection::for_trust_cg_target(&binding.authoritative_target)
+        .ok_or_else(not_the_contract)?;
+    let mut contract_with_sealed_witness = contract.clone();
+    contract_with_sealed_witness.page_protection_witness =
+        binding.executable_memory.page_protection_witness.clone();
+    if contract_with_sealed_witness != binding.executable_memory {
+        return Err(not_the_contract());
+    }
+    // Every other field is the contract's, so a remaining difference is in
+    // the witness alone; refuse it by name.
+    validate_sealed_page_protection_witness(
+        &binding.executable_memory,
+        &contract,
+        &binding.authoritative_target.triple,
+    )?;
+    if contract != binding.executable_memory {
+        return Err(not_the_contract());
+    }
 
     match (binding.manifest_checksum, manifest) {
         (Some(expected), Some(manifest)) if expected == manifest.checksum() => {
@@ -6320,6 +7098,10 @@ fn validate_installed_payload_binding(
         (None, None) => {}
     }
 
+    // The kernel's view of the live allocation is checked before any of its
+    // bytes are read, so an unmapped or no-access range is refused by name
+    // rather than faulting.
+    validate_live_page_protection_witness(buffer, binding)?;
     buffer.verify_published_code_integrity().map_err(|error| {
         installed_payload_binding_mismatch(format!(
             "live executable publication integrity failed: {error}"
@@ -6350,6 +7132,24 @@ fn validate_installed_payload_binding(
         return Err(installed_payload_binding_mismatch(format!(
             "live executable extent/digest differs from binding: live_len={}, live_allocation_size={live_allocation_size}, live_sha256={live_sha256}, live_published_image_sha256={live_published_image_sha256}",
             code.len(),
+        )));
+    }
+    let live_protection = buffer.executable_memory_protection();
+    if live_protection != binding.executable_memory {
+        return Err(installed_payload_binding_mismatch(format!(
+            "live executable-memory protection {live_protection:?} differs from the sealed protection {:?}; the payload was republished under different page protections",
+            binding.executable_memory
+        )));
+    }
+    if *buffer.teardown_policy() != binding.authoritative_abi.teardown_policy
+        || buffer.executable_memory_owner() != binding.authoritative_abi.executable_memory_owner
+    {
+        return Err(installed_payload_binding_mismatch(format!(
+            "live code lifetime (owner {:?}, teardown {}) differs from the sealed ABI lifetime contract (owner {:?}, teardown {})",
+            buffer.executable_memory_owner(),
+            crate::jit::teardown_policy_label(buffer.teardown_policy()),
+            binding.authoritative_abi.executable_memory_owner,
+            crate::jit::teardown_policy_label(&binding.authoritative_abi.teardown_policy),
         )));
     }
     validate_live_symbol_inventory(buffer, binding)?;
@@ -6383,6 +7183,7 @@ fn object_payload_from_result(
             .map(|func| FunctionArtifactMetadata::from_trust_ir_name(func.name.clone()))
             .collect(),
         compile_artifact_cache_telemetry: result.compile_artifact_cache_telemetry,
+        inline_only_bodies: result.inline_only_bodies,
     }
 }
 
@@ -6439,6 +7240,7 @@ fn executable_payload_from_result(result: JitCompilationResult) -> ExecutableArt
         trace: result.trace,
         proofs: result.proofs,
         functions,
+        inline_only_bodies: result.inline_only_bodies,
     }
 }
 
@@ -6498,7 +7300,25 @@ fn replay_report_metadata_from_executable_result(
     identity: &ArtifactIdentity,
     installed_payload_binding: &InstalledPayloadBinding,
 ) -> JitReplayReportMetadata {
-    let mut report = result.buffer.replay_report_metadata();
+    replay_report_metadata_from_executable_buffer(
+        &result.buffer,
+        request,
+        provenance,
+        generation,
+        identity,
+        installed_payload_binding,
+    )
+}
+
+fn replay_report_metadata_from_executable_buffer(
+    buffer: &ExecutableBuffer,
+    request: &CompileRequest,
+    provenance: &ArtifactProvenance,
+    generation: CompileGeneration,
+    identity: &ArtifactIdentity,
+    installed_payload_binding: &InstalledPayloadBinding,
+) -> JitReplayReportMetadata {
+    let mut report = buffer.replay_report_metadata();
     report.artifact_id = Some(identity.as_str().to_owned());
     report.target = Some(installed_payload_binding.compiler_target_triple.clone());
     report.properties.insert(
@@ -6635,7 +7455,13 @@ fn artifact_identity_for_module(
     if let Some(dependency_identity) = dependency_identity {
         input.dependency_identity = dependency_identity.clone();
     }
-    Ok(input.identity_with_compiler(compiler))
+    input.identity_with_compiler(compiler).map_err(|error| {
+        CompileDiagnostic::error(
+            "compile.identity_policy",
+            format!("could not bind compile policy to artifact identity: {error}"),
+        )
+        .with_phase("artifact_identity")
+    })
 }
 
 fn raw_extern_bindings_from_map(
@@ -6739,10 +7565,7 @@ fn hash_effective_backend_profile(
         }
         (Target::Aarch64, ArtifactKind::Object) => {
             hash_str(hasher, "aarch64_object_v2");
-            hash_aarch64_isa_profile(
-                hasher,
-                AArch64IsaProfile::for_aot_target(compiler.target_spec()),
-            );
+            hash_aarch64_isa_profile(hasher, compiler.aarch64_object_isa_profile());
         }
         (Target::Aarch64, ArtifactKind::ExecutableMemory) => {
             hash_str(hasher, "aarch64_host_jit_v2");
@@ -6883,8 +7706,33 @@ impl Default for CompileService {
 }
 
 #[cfg(test)]
+mod static_stack_frame_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This file's fixtures carry no codegen license (`body_gate: None`), which
+    /// the compile service REFUSES by default (roadmap WS7.5, decision gate
+    /// DG-73). Its services state `Permit` explicitly, so no request passes
+    /// because it was silently refused. `inline_only_payload_tests` reuses it:
+    /// its compound `#[cfg(all(test, ..))]` is read as production code by the
+    /// Permit census, so it must not spell the variant itself.
+    pub(super) fn permit_compile_service() -> crate::CompileService {
+        crate::CompileService::new(crate::CompileServiceConfig {
+            codegen_license: crate::CodegenLicensePolicy::default()
+                .with_unlicensed(crate::UnlicensedBodyPolicy::Permit),
+            ..crate::CompileServiceConfig::default()
+        })
+    }
+
+    /// This file's fixtures are hand-built and carry no codegen license
+    /// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+    /// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+    /// them passes because it was silently refused.
+    fn permit_unlicensed() -> crate::CodegenLicensePolicy {
+        crate::CodegenLicensePolicy::default().with_unlicensed(crate::UnlicensedBodyPolicy::Permit)
+    }
     use crate::compile_artifact_cache_profile::{
         CompileArtifactCacheBoundary, CompileArtifactCacheConfig, CompileArtifactCacheStatus,
         CompileArtifactDependencyIdentity, CompileArtifactProofPolicy,
@@ -6911,7 +7759,7 @@ mod tests {
     };
 
     fn service() -> CompileService {
-        CompileService::default()
+        permit_compile_service()
     }
 
     fn temp_cache_root(name: &str) -> std::path::PathBuf {
@@ -6969,7 +7817,7 @@ mod tests {
         let mut input =
             ArtifactIdentityInput::from_request(&request, module_bytes, exports.iter().copied());
         input.profile = profile_id;
-        input.identity()
+        input.identity().unwrap()
     }
 
     fn deterministic_manifest(artifact_id: &str) -> ArtifactManifestV1 {
@@ -7221,11 +8069,14 @@ mod tests {
 
     fn const_i64_module(module_name: &str, functions: &[(&str, i64)]) -> TrustIrModule {
         let mut module = TrustIrModule::new(module_name);
-        let ft_id = module.add_func_type(FuncTy {
-            params: vec![],
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
+        let ft_id = module
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::I64],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
 
         for (idx, (name, value)) in functions.iter().enumerate() {
             let mut func =
@@ -7244,9 +8095,68 @@ mod tests {
                     }),
                 ],
             }];
-            module.add_function(func);
+            module
+                .try_add_function(func)
+                .expect("Module::try_add_function: test fixture");
         }
 
+        module
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+        all(
+            target_arch = "x86_64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )
+    ))]
+    fn process_visible_external_call_module(symbol: &str) -> TrustIrModule {
+        let mut module = TrustIrModule::new("compile_service_external_symbol_policy");
+        // The external declaration is an FFI boundary, which needs a pinned
+        // target (`TargetInfoRequired`); every ingestion entry refuses what
+        // trust-ir's validator refuses (WS7.3). The fixture compiles for the
+        // host, so it names the host's exact target.
+        module.target_info = Some(
+            crate::core_admission::CoreHostJitTarget::detect()
+                .expect("a supported native host")
+                .trust_ir_target_info()
+                .clone(),
+        );
+        let signature = module
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::U32],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
+
+        let mut declaration =
+            TrustIrFunction::new(FuncId::new(0), symbol, signature, BlockId::new(0));
+        declaration.linkage = trust_ir::Linkage::External;
+        declaration.blocks.clear();
+        module
+            .try_add_function(declaration)
+            .expect("Module::try_add_function: test fixture");
+
+        let mut entry = TrustIrFunction::new(FuncId::new(1), "entry", signature, BlockId::new(0));
+        entry.blocks = vec![TrustIrBlock {
+            id: BlockId::new(0),
+            params: vec![],
+            body: vec![
+                InstrNode::new(Inst::Call {
+                    callee: FuncId::new(0),
+                    args: vec![],
+                })
+                .with_result(ValueId::new(0)),
+                InstrNode::new(Inst::Return {
+                    values: vec![ValueId::new(0)],
+                }),
+            ],
+        }];
+        module
+            .try_add_function(entry)
+            .expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -7329,14 +8239,19 @@ mod tests {
 
     fn verifier_reject_module(module_name: &str, blocks: Vec<TrustIrBlock>) -> TrustIrModule {
         let mut module = TrustIrModule::new(module_name);
-        let ft_id = module.add_func_type(FuncTy {
-            params: vec![],
-            returns: vec![Ty::I64],
-            is_vararg: false,
-        });
+        let ft_id = module
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::I64],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
         let mut func = TrustIrFunction::new(FuncId::new(0), "reject_me", ft_id, BlockId::new(0));
         func.blocks = blocks;
-        module.add_function(func);
+        module
+            .try_add_function(func)
+            .expect("Module::try_add_function: test fixture");
         module
     }
 
@@ -7643,6 +8558,100 @@ mod tests {
         assert_eq!(expanded.jit.profile_hooks, ProfileHookMode::None);
         assert!(!expanded.jit.emit_entry_counters);
         assert_eq!(expanded.artifact_kind, ArtifactKind::ExecutableMemory);
+    }
+
+    #[test]
+    fn executable_custom_profile_joins_external_resolution_policy_fail_closed() {
+        use crate::jit::JitExternalSymbolResolutionPolicy::{ExplicitOnly, ExplicitThenProcess};
+
+        let expanded = |compiler_policy, jit_policy| {
+            let mut request = CompileRequest::new("policy-join", CompileGeneration::new(1));
+            request.artifact_kind = ArtifactKind::ExecutableMemory;
+            request.profile = CompileProfile::Custom {
+                compiler: CompilerConfig {
+                    jit_external_symbol_resolution: compiler_policy,
+                    ..CompilerConfig::for_host_jit_unchecked()
+                },
+                jit: JitConfig {
+                    external_symbol_resolution: jit_policy,
+                    ..JitConfig::default()
+                },
+            };
+            expanded_profile_for_request(&request)
+        };
+
+        for (compiler_policy, jit_policy, expected) in [
+            (
+                ExplicitThenProcess,
+                ExplicitThenProcess,
+                ExplicitThenProcess,
+            ),
+            (ExplicitOnly, ExplicitThenProcess, ExplicitOnly),
+            (ExplicitThenProcess, ExplicitOnly, ExplicitOnly),
+            (ExplicitOnly, ExplicitOnly, ExplicitOnly),
+        ] {
+            let expanded = expanded(compiler_policy, jit_policy);
+            assert_eq!(expanded.compiler.jit_external_symbol_resolution, expected);
+            assert_eq!(expanded.jit.external_symbol_resolution, expected);
+        }
+    }
+
+    #[cfg(any(
+        all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")),
+        all(
+            target_arch = "x86_64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )
+    ))]
+    #[test]
+    fn compile_service_honors_strict_external_policy_from_either_custom_layer() {
+        use crate::jit::JitExternalSymbolResolutionPolicy::{ExplicitOnly, ExplicitThenProcess};
+
+        #[cfg(unix)]
+        let process_symbol = "getpid";
+        #[cfg(windows)]
+        let process_symbol = "GetCurrentProcessId";
+        assert!(
+            crate::jit::lookup_process_symbol(process_symbol).is_some(),
+            "fixture requires a process-visible symbol"
+        );
+        let module = process_visible_external_call_module(process_symbol);
+
+        for (label, compiler_policy, jit_policy) in [
+            ("compiler-only", ExplicitOnly, ExplicitThenProcess),
+            ("jit-only", ExplicitThenProcess, ExplicitOnly),
+        ] {
+            let mut request = CompileRequest::new(
+                format!("strict-external-{label}"),
+                CompileGeneration::new(1),
+            );
+            request.artifact_kind = ArtifactKind::ExecutableMemory;
+            request.profile = CompileProfile::Custom {
+                compiler: CompilerConfig {
+                    jit_external_symbol_resolution: compiler_policy,
+                    ..CompilerConfig::for_host_jit_unchecked()
+                },
+                jit: JitConfig {
+                    external_symbol_resolution: jit_policy,
+                    ..JitConfig::default()
+                },
+            };
+
+            let response = service().compile(request, &module);
+            assert_eq!(response.status, CompileStatus::Failed, "{label}");
+            let backend_error = response
+                .diagnostics
+                .first()
+                .and_then(|diagnostic| diagnostic.backend_error.as_deref());
+            assert!(
+                matches!(
+                    backend_error,
+                    Some(CompileError::Jit(crate::jit::JitError::UnresolvedSymbol(symbol)))
+                        if symbol == process_symbol
+                ),
+                "{label} strict policy returned {backend_error:?}"
+            );
+        }
     }
 
     #[test]
@@ -9170,7 +10179,9 @@ mod tests {
                 compiler,
                 jit: jit.clone(),
             };
-            ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"]).identity()
+            ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"])
+                .identity()
+                .unwrap()
         };
         let baseline = identity(base_compiler.clone());
 
@@ -9231,11 +10242,13 @@ mod tests {
         let apple = Compiler::new_for_target_spec(
             config.clone(),
             TargetSpec::parse("aarch64-apple-darwin").unwrap(),
-        );
+        )
+        .with_codegen_license(permit_unlicensed());
         let linux = Compiler::new_for_target_spec(
             config.clone(),
             TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
-        );
+        )
+        .with_codegen_license(permit_unlicensed());
         let mut request = CompileRequest::new("req", CompileGeneration::new(1));
         request.artifact_kind = ArtifactKind::Object;
         request.profile = CompileProfile::Custom {
@@ -9266,7 +10279,8 @@ mod tests {
 
     #[test]
     fn aarch64_executable_backend_identity_binds_captured_jit_isa_profile() {
-        let compiler = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64));
+        let compiler = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+            .with_codegen_license(permit_unlicensed());
         let jit = JitConfig::default();
         let mut actual = StableHasher::new();
         hash_effective_backend_profile(
@@ -9317,10 +10331,10 @@ mod tests {
             "trust",
         );
         assert!(input.dependency_identity.is_artifact_reuse_eligible());
-        let build_a = input.identity();
+        let build_a = input.identity().unwrap();
 
         input.dependency_identity.trust_cg_identity = "sha256:trust-cg-b".to_owned();
-        let build_b = input.identity();
+        let build_b = input.identity().unwrap();
         assert_ne!(build_a, build_b);
     }
 
@@ -9341,17 +10355,20 @@ mod tests {
 
         let disabled_install =
             ArtifactIdentityInput::from_request(&installable, b"canonical-module", ["entry"])
-                .identity();
+                .identity()
+                .unwrap();
         let mut proof_required = installable.clone();
         proof_required.proof_policy = required_proof_policy();
         let required_install =
             ArtifactIdentityInput::from_request(&proof_required, b"canonical-module", ["entry"])
-                .identity();
+                .identity()
+                .unwrap();
         let mut profile_only = installable.clone();
         profile_only.install_intent = InstallIntent::CompileOnly;
         let profile_only_identity =
             ArtifactIdentityInput::from_request(&profile_only, b"canonical-module", ["entry"])
-                .identity();
+                .identity()
+                .unwrap();
 
         assert_ne!(disabled_install, required_install);
         assert_ne!(disabled_install, profile_only_identity);
@@ -9375,10 +10392,12 @@ mod tests {
 
         let left =
             ArtifactIdentityInput::from_request(&left_request, b"canonical-module", ["entry"])
-                .identity();
+                .identity()
+                .unwrap();
         let right =
             ArtifactIdentityInput::from_request(&right_request, b"canonical-module", ["entry"])
-                .identity();
+                .identity()
+                .unwrap();
 
         assert_eq!(left, right);
     }
@@ -9485,12 +10504,14 @@ mod tests {
         request.artifact_kind = ArtifactKind::ExecutableMemory;
 
         let base = ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"])
-            .identity();
+            .identity()
+            .unwrap();
         request.artifact_kind = ArtifactKind::Object;
         assert_ne!(
             base,
             ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"])
                 .identity()
+                .unwrap()
         );
 
         request.artifact_kind = ArtifactKind::ExecutableMemory;
@@ -9512,11 +10533,12 @@ mod tests {
             base,
             ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"])
                 .identity()
+                .unwrap()
         );
     }
 
     #[test]
-    fn artifact_identity_hashes_consumed_policy_and_ignores_unwired_jit_knobs() {
+    fn artifact_identity_hashes_consumed_policy_and_ignores_other_unwired_jit_knobs() {
         let base_compiler = CompilerConfig::jit_fast(Target::Aarch64);
         let base_jit = JitConfig {
             opt_level: OptLevel::O1,
@@ -9525,13 +10547,40 @@ mod tests {
             profile_hooks: ProfileHookMode::None,
             emit_entry_counters: false,
             cache_certificates: true,
+            external_symbol_resolution:
+                crate::jit::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         };
         let identity = |compiler: CompilerConfig, jit: JitConfig| {
             let mut request = CompileRequest::new("req", CompileGeneration::new(1));
             request.profile = CompileProfile::Custom { compiler, jit };
-            ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"]).identity()
+            ArtifactIdentityInput::from_request(&request, b"canonical-module", ["entry"])
+                .identity()
+                .unwrap()
         };
         let baseline = identity(base_compiler.clone(), base_jit.clone());
+
+        let mut strict_compiler = base_compiler.clone();
+        strict_compiler.jit_external_symbol_resolution =
+            crate::jit::JitExternalSymbolResolutionPolicy::ExplicitOnly;
+        let compiler_only_strict = identity(strict_compiler.clone(), base_jit.clone());
+
+        let mut strict_jit = base_jit.clone();
+        strict_jit.external_symbol_resolution =
+            crate::jit::JitExternalSymbolResolutionPolicy::ExplicitOnly;
+        let jit_only_strict = identity(base_compiler.clone(), strict_jit.clone());
+        let both_strict = identity(strict_compiler, strict_jit);
+        assert_ne!(
+            baseline, compiler_only_strict,
+            "the effective external-symbol authority must be identity-bound"
+        );
+        assert_eq!(
+            compiler_only_strict, jit_only_strict,
+            "either strict layer normalizes to one canonical effective policy"
+        );
+        assert_eq!(
+            compiler_only_strict, both_strict,
+            "already-normalized strict policy must have the same identity"
+        );
 
         let mut fsym_preflight = base_compiler.clone();
         fsym_preflight.enable_fsym_trust_ir_preflight = true;
@@ -9830,6 +10879,67 @@ mod tests {
         }
     }
 
+    /// The JIT compile service refuses a variadic DEFINITION with the shared
+    /// lowering diagnostic on both artifact kinds and at the typed install
+    /// signature boundary, and keeps its own byval/sret install refusal.
+    #[test]
+    fn compile_service_refuses_variadic_definition_with_shared_diagnostic() {
+        let mut module = const_i64_module("compile_service_variadic", &[("answer", 42)]);
+        module.func_types[0].is_vararg = true;
+        for kind in [ArtifactKind::Object, ArtifactKind::ExecutableMemory] {
+            let mut request = CompileRequest::new("variadic", CompileGeneration::new(21));
+            request.artifact_kind = kind;
+            // Executable memory is the in-process JIT, so it must target the host
+            // (an AArch64 config on an x86-64 host stops at the JIT target-mismatch
+            // guard before lowering ever sees the variadic definition).
+            let compiler = match kind {
+                ArtifactKind::ExecutableMemory => CompilerConfig::for_host_jit(),
+                _ => CompilerConfig::jit_fast(Target::Aarch64),
+            };
+            request.profile = CompileProfile::Custom {
+                compiler,
+                jit: JitConfig::default(),
+            };
+            let response = service().compile(request, &module);
+            assert_eq!(response.status, CompileStatus::Failed, "{kind:?}");
+            assert!(response.payload.is_none());
+            assert!(
+                response
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("[TCG-VARIADIC-DEFINITION]")),
+                "{kind:?}: {:?}",
+                response.diagnostics
+            );
+        }
+
+        let target = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let error = compiler_symbol_signature(&module, &module.functions[0], target)
+            .expect_err("a variadic definition has no installed signature");
+        assert!(error.contains("[TCG-VARIADIC-DEFINITION]"), "{error}");
+
+        // A variadic DECLARATION is not a definition: the descriptor refusal
+        // stays specific to the install boundary.
+        let mut declaration = module.clone();
+        declaration.functions[0].blocks.clear();
+        let error = compiler_symbol_signature(&declaration, &declaration.functions[0], target)
+            .expect_err("the installed ABI descriptor has no varargs");
+        assert!(error.contains("rejects varargs"), "{error}");
+
+        let mut byval = const_i64_module("compile_service_byval", &[("answer", 42)]);
+        byval.func_types[0].params.push(Ty::Ptr);
+        byval.functions[0].blocks[0]
+            .params
+            .push((ValueId::new(9), Ty::Ptr));
+        byval.functions[0].attrs.params = vec![trust_ir::ParamAttrs {
+            byval: true,
+            ..trust_ir::ParamAttrs::default()
+        }];
+        let error = compiler_symbol_signature(&byval, &byval.functions[0], target)
+            .expect_err("byval stays refused at the typed install boundary");
+        assert!(error.contains("uses byval/sret"), "{error}");
+    }
+
     #[test]
     fn compile_plan_target_spec_is_authoritative_for_identity_output_and_evidence() {
         let module = const_i64_module("compile_plan_target_authority", &[("answer", 42)]);
@@ -9929,6 +11039,7 @@ mod tests {
         let service = CompileService::new(CompileServiceConfig {
             profile: CompileProfile::HostJitFast,
             compile_artifact_cache: Some(service_cache_config(&root)),
+            codegen_license: permit_unlicensed(),
         });
 
         let mut first_request =
@@ -10078,6 +11189,21 @@ mod tests {
             ("abi-structure", "ABI mismatch", |manifest| {
                 manifest.abi.shadow_space_bytes ^= 32;
             }),
+            (
+                "executable-memory-absent",
+                "executable-memory protection mismatch",
+                |manifest| {
+                    manifest.executable_memory = None;
+                },
+            ),
+            (
+                "executable-memory-map-jit",
+                "executable-memory protection mismatch",
+                |manifest| {
+                    let protection = manifest.executable_memory.as_mut().unwrap();
+                    protection.map_jit = !protection.map_jit;
+                },
+            ),
             ("layout-pointer-size", "core layout mismatch", |manifest| {
                 manifest.layout.pointer_size_bytes = 4;
             }),
@@ -10188,6 +11314,51 @@ mod tests {
     }
 
     #[test]
+    fn compiler_abi_rejects_unlegalized_dialect_types_before_pointer_erasure() {
+        let semantic = Ty::Dialect(Box::new(trust_ir::DialectTy::new("tla", "Value", 1)));
+        for ty in [
+            semantic.clone(),
+            Ty::Ref(Box::new(semantic.clone())),
+            Ty::PtrMut(Box::new(Ty::Tuple(vec![semantic]))),
+        ] {
+            let error = compiler_abi_value_for_trust_ir_type(
+                &ty,
+                false,
+                TargetSpec::default_for_architecture(Target::host()),
+            )
+            .expect_err("dialect values have no exported machine ABI");
+            assert!(error.contains("unlegalized dialect type"));
+        }
+    }
+
+    #[test]
+    fn compiler_abi_rejects_opaque_runtime_handles_at_the_exported_boundary() {
+        // A handle is one pointer word, so without an explicit arm it would
+        // classify with `Ptr` and silently cross an EXPORTED boundary — the one
+        // place an arbitrary caller supplies the word, which is exactly what
+        // the handle's origin pin excludes. Nested spellings are refused by the
+        // same clause via the reachability guard above it.
+        let handle = Ty::handle("Nat", "trust_bignum::Nat");
+        for ty in [
+            handle.clone(),
+            Ty::Ref(Box::new(handle.clone())),
+            Ty::PtrMut(Box::new(Ty::Tuple(vec![handle]))),
+        ] {
+            let error = compiler_abi_value_for_trust_ir_type(
+                &ty,
+                false,
+                TargetSpec::default_for_architecture(Target::host()),
+            )
+            .expect_err("an opaque runtime handle has no exported machine ABI");
+            assert!(
+                error.contains("opaque runtime handle")
+                    || error.contains("unsupported exported ABI value"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn compiler_abi_classifies_bare_function_pointer_as_nonnull_native_pointer() {
         let target_spec = TargetSpec::default_for_architecture(Target::host());
         let value = compiler_abi_value_for_trust_ir_type(
@@ -10198,6 +11369,21 @@ mod tests {
         .expect("bare function pointers are supported scalar ABI values");
 
         assert_eq!(value, AbiValue::new(AbiValueKind::Ptr));
+    }
+
+    #[test]
+    fn compiler_abi_refuses_tensor_values_without_a_native_layout() {
+        for rank in [0, 2] {
+            for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+                let error = compiler_abi_value_for_trust_ir_type(
+                    &Ty::Tensor(Box::new(Ty::I32), rank),
+                    false,
+                    TargetSpec::parse(triple).unwrap(),
+                )
+                .expect_err("an integer element type does not give a tensor a native ABI");
+                assert!(error.contains("Ty::Tensor"), "{error}");
+            }
+        }
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -10419,26 +11605,31 @@ mod tests {
                 });
             },
         );
-        assert_binding_mutation_rejected(&response, "private canonical seal", |response| {
-            let artifact = response.artifact.as_mut().expect("compiled artifact");
-            let manifest = artifact.artifact_manifest.clone();
-            let binding = artifact
-                .install
-                .installed_payload_binding
-                .as_mut()
-                .expect("installed payload binding");
-            let mut legacy_transcript =
-                installed_payload_binding_transcript(binding, manifest.as_ref());
-            let current_domain = b"trust-cg.compile_service.installed_payload_binding.sha256.v4";
-            let legacy_domain = b"trust-cg.compile_service.installed_payload_binding.sha256.v3";
-            let domain_offset = legacy_transcript
-                .windows(current_domain.len())
-                .position(|window| window == current_domain)
-                .expect("v4 transcript domain");
-            legacy_transcript[domain_offset..domain_offset + current_domain.len()]
-                .copy_from_slice(legacy_domain);
-            binding.binding_sha256 = format!("sha256:{}", sha256_hex(&legacy_transcript));
-        });
+        for legacy_domain in [
+            b"trust-cg.compile_service.installed_payload_binding.sha256.v4",
+            b"trust-cg.compile_service.installed_payload_binding.sha256.v5",
+        ] {
+            assert_binding_mutation_rejected(&response, "private canonical seal", |response| {
+                let artifact = response.artifact.as_mut().expect("compiled artifact");
+                let manifest = artifact.artifact_manifest.clone();
+                let binding = artifact
+                    .install
+                    .installed_payload_binding
+                    .as_mut()
+                    .expect("installed payload binding");
+                let mut legacy_transcript =
+                    installed_payload_binding_transcript(binding, manifest.as_ref());
+                let current_domain =
+                    b"trust-cg.compile_service.installed_payload_binding.sha256.v6";
+                let domain_offset = legacy_transcript
+                    .windows(current_domain.len())
+                    .position(|window| window == current_domain)
+                    .expect("v6 transcript domain");
+                legacy_transcript[domain_offset..domain_offset + current_domain.len()]
+                    .copy_from_slice(legacy_domain);
+                binding.binding_sha256 = format!("sha256:{}", sha256_hex(&legacy_transcript));
+            });
+        }
         assert_binding_mutation_rejected(
             &response,
             "sealed target/ABI/core-layout authority",
@@ -10549,6 +11740,10 @@ mod tests {
             (
                 "binding.allocation_size_bytes",
                 binding.allocation_size_bytes.to_le_bytes().to_vec(),
+            ),
+            (
+                "binding.executable_memory.canonical",
+                binding.executable_memory.canonical_bytes(),
             ),
         ] {
             assert!(
@@ -10758,6 +11953,710 @@ mod tests {
                 .exported_entrypoints
                 .pop();
         });
+    }
+
+    /// Replace the executable payload with the same bytes and symbol table
+    /// republished into a fresh mapping, then let `mutate` alter the new
+    /// buffer (for example its recorded page protections or lifetime).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn republish_payload(
+        response: &CompileResponse,
+        mutate: impl FnOnce(&mut ExecutableBuffer),
+    ) -> CompileResponse {
+        let mut republished = response.clone();
+        let Some(ArtifactPayload::Executable(payload)) = republished.payload.as_mut() else {
+            panic!("expected executable payload");
+        };
+        let original = Arc::clone(&payload.buffer);
+        // SAFETY: the bytes and symbol table are exactly those this test
+        // compiled for the live host contract a moment ago.
+        let mut buffer = unsafe {
+            crate::jit::publish_serialized_buffer_for_target(
+                original.code_slice(),
+                original.canonical_symbols().to_vec(),
+                original.symbol_offsets().clone(),
+                original.function_ranges().to_vec(),
+                &TargetDescriptor::for_trust_cg_host_jit(),
+            )
+        }
+        .expect("republish identical payload");
+        assert_ne!(
+            buffer.code_slice().as_ptr(),
+            original.code_slice().as_ptr(),
+            "republication must create a fresh mapping"
+        );
+        mutate(&mut buffer);
+        payload.buffer = Arc::new(buffer);
+        republished
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn installed_payload_binding_rejects_republication_under_different_protections() {
+        let module = const_i64_module("installed_binding_protection", &[("answer", 42)]);
+        let manifest = native_install_manifest("artifact-installed-binding-protection", 913);
+        let response = compile_manifest_bound_executable(
+            "installed-binding-protection",
+            &module,
+            manifest.clone(),
+        );
+        assert_eq!(response.status, CompileStatus::Compiled);
+        let artifact = response.artifact.as_ref().expect("compiled artifact");
+        let binding = artifact
+            .install
+            .installed_payload_binding
+            .as_ref()
+            .expect("installed payload binding");
+        let live = match response.payload.as_ref().expect("payload") {
+            ArtifactPayload::Executable(payload) => payload.buffer.executable_memory_protection(),
+            ArtifactPayload::Object(_) => panic!("expected executable payload"),
+        };
+        let sealed = binding.executable_memory.clone();
+        assert_eq!(sealed, live);
+        assert_eq!(manifest.executable_memory.as_ref(), Some(&sealed));
+        assert_eq!(
+            ExecutableMemoryProtection::for_trust_cg_target(&binding.authoritative_target),
+            Some(sealed.clone())
+        );
+        assert!(sealed.published_rx && sealed.mprotect_rx_ok);
+        assert_ne!(
+            sealed.write_phase_protection, sealed.published_protection,
+            "write phase and published protections are distinct W^X states"
+        );
+        assert_eq!(
+            sealed.map_jit,
+            cfg!(all(target_arch = "aarch64", target_os = "macos"))
+        );
+        assert_eq!(
+            artifact
+                .install
+                .replay_report_metadata
+                .as_ref()
+                .and_then(|replay| replay.properties.get("executable_memory_protection_sha256")),
+            Some(&sealed.canonical_sha256())
+        );
+
+        // Positive control: the same bytes republished under the SAME
+        // protections into a fresh mapping still validate, so every rejection
+        // below is caused by the protection change alone.
+        let same = republish_payload(&response, |_| {});
+        let buffer = match same.payload.as_ref().expect("payload") {
+            ArtifactPayload::Executable(payload) => Arc::clone(&payload.buffer),
+            ArtifactPayload::Object(_) => unreachable!(),
+        };
+        validate_installed_payload_binding(
+            &same.artifact.as_ref().unwrap().install,
+            same.artifact.as_ref().unwrap().artifact_manifest.as_ref(),
+            &buffer,
+        )
+        .expect("identical republication validates");
+
+        type Mutation = (&'static str, fn(&mut ExecutableMemoryProtection));
+        let mutations: [Mutation; 8] = [
+            ("map_jit", |p| p.map_jit = !p.map_jit),
+            ("write_protect_supported", |p| {
+                p.write_protect_supported = !p.write_protect_supported
+            }),
+            ("published_rx", |p| p.published_rx = false),
+            ("mprotect_rx_ok", |p| p.mprotect_rx_ok = false),
+            ("allocation_flags", |p| p.allocation_flags ^= 0x0800),
+            ("allocation_granule_bytes", |p| {
+                p.allocation_granule_bytes = if p.allocation_granule_bytes == 4096 {
+                    16 * 1024
+                } else {
+                    4096
+                }
+            }),
+            ("write_phase_protection", |p| {
+                p.write_phase_protection |= 0x4
+            }),
+            ("published_protection", |p| p.published_protection |= 0x2),
+        ];
+        for (field, mutation) in mutations {
+            let mut changed = sealed.clone();
+            mutation(&mut changed);
+            assert_ne!(changed, sealed, "{field} mutation must change the record");
+            let republished = republish_payload(&response, |buffer| {
+                buffer.force_executable_memory_state_for_tests(&changed);
+            });
+            let detail = installed_binding_validation_error(&republished);
+            assert!(
+                detail.contains("republished under different page protections"),
+                "{field}: {detail}"
+            );
+            assert!(republished.into_installed_artifact().is_none(), "{field}");
+        }
+
+        // A republication under a different lifetime policy is rejected too.
+        let lifetime = republish_payload(&response, |buffer| {
+            buffer
+                .set_teardown_policy(crate::jit_contract::TeardownPolicy::ProcessLifetime)
+                .expect("process lifetime is enforceable");
+        });
+        assert!(installed_binding_validation_error(&lifetime).contains("live code lifetime"));
+
+        // The sealed record must itself be the W^X publication contract.
+        assert_binding_mutation_rejected(
+            &response,
+            "is not the W^X read-execute publication contract",
+            |response| {
+                mutate_and_reseal_installed_binding(response, |binding| {
+                    binding.executable_memory.published_protection |= 0x2;
+                });
+            },
+        );
+        // Replay metadata recorded under other protections is rejected.
+        assert_binding_mutation_rejected(
+            &response,
+            "replay executable-memory protection",
+            |response| {
+                let mut other = sealed.clone();
+                other.map_jit = !other.map_jit;
+                response
+                    .artifact
+                    .as_mut()
+                    .unwrap()
+                    .install
+                    .replay_report_metadata
+                    .as_mut()
+                    .unwrap()
+                    .properties
+                    .insert(
+                        "executable_memory_protection_sha256".to_owned(),
+                        other.canonical_sha256(),
+                    );
+            },
+        );
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn manifest_declaring_other_page_protections_is_refused() {
+        let module = const_i64_module("manifest_protection", &[("answer", 42)]);
+        let exact = native_install_manifest("artifact-manifest-protection", 914);
+        let declared = exact
+            .executable_memory
+            .clone()
+            .expect("executable manifests declare their protection");
+
+        let mut other = exact.clone();
+        other.executable_memory = Some(ExecutableMemoryProtection {
+            map_jit: !declared.map_jit,
+            ..declared.clone()
+        });
+        let response =
+            compile_manifest_bound_executable("manifest-protection-other", &module, other);
+        assert_eq!(response.status, CompileStatus::Rejected);
+        assert!(
+            response.diagnostics[0]
+                .message
+                .contains("executable-memory protection"),
+            "{:?}",
+            response.diagnostics
+        );
+
+        let mut absent = exact;
+        absent.executable_memory = None;
+        let response =
+            compile_manifest_bound_executable("manifest-protection-absent", &module, absent);
+        assert_eq!(response.status, CompileStatus::Rejected);
+        assert!(
+            response.diagnostics[0]
+                .message
+                .contains("executable-memory protection")
+        );
+    }
+
+    /// The page-protection witness this host's publication contract promises.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn host_contract_page_witness() -> crate::jit_contract::PageProtectionWitness {
+        ExecutableMemoryProtection::for_trust_cg_target(&TargetDescriptor::for_trust_cg_host_jit())
+            .expect("host JIT publication contract")
+            .page_protection_witness
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn executable_payload_buffer(response: &CompileResponse) -> Arc<ExecutableBuffer> {
+        match response.payload.as_ref().expect("compiled payload") {
+            ArtifactPayload::Executable(payload) => Arc::clone(&payload.buffer),
+            ArtifactPayload::Object(_) => panic!("expected executable payload"),
+        }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn assert_page_witness_refusal(
+        error: &ArtifactContractError,
+        expected: PageProtectionWitnessRefusal,
+        stage: PageProtectionWitnessStage,
+        detail_fragment: &str,
+    ) {
+        match error {
+            ArtifactContractError::PageProtectionWitnessRefused {
+                refusal,
+                stage: actual_stage,
+                detail,
+            } => {
+                assert_eq!(*refusal, expected, "{error}");
+                assert_eq!(*actual_stage, stage, "{error}");
+                assert!(detail.contains(detail_fragment), "{error}");
+            }
+            other => panic!("expected {} refusal, got {other}", expected.code()),
+        }
+        assert!(error.to_string().starts_with(expected.code()), "{error}");
+    }
+
+    /// Positive row and schema boundary: a normal publication binds the
+    /// host's witness (kernel-observed `r-xp` on Linux, recorded-only
+    /// elsewhere) into binding v6 and manifest v3; a v5 binding and a v2
+    /// manifest are refused rather than migrated.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn installed_payload_binding_v6_binds_the_page_protection_witness() {
+        use crate::jit_page_witness::PublicationPageWitness;
+        let module = const_i64_module("installed_binding_witness", &[("answer", 42)]);
+        let manifest = native_install_manifest("artifact-installed-binding-witness", 915);
+        assert_eq!(manifest.schema, "trust-cg.artifact/v3");
+        assert_eq!(manifest.schema_version, 3);
+        let response = compile_manifest_bound_executable(
+            "installed-binding-witness",
+            &module,
+            manifest.clone(),
+        );
+        assert_eq!(response.status, CompileStatus::Compiled);
+        let artifact = response.artifact.as_ref().expect("compiled artifact");
+        let binding = artifact
+            .install
+            .installed_payload_binding
+            .as_ref()
+            .expect("installed payload binding");
+        assert_eq!(
+            binding.schema,
+            "trust-cg.compile_service.installed_payload_binding.v6"
+        );
+        assert_eq!(binding.schema_version, 6);
+        let witness = &binding.executable_memory.page_protection_witness;
+        assert_eq!(witness, &host_contract_page_witness());
+        assert_eq!(
+            manifest
+                .executable_memory
+                .as_ref()
+                .map(|protection| &protection.page_protection_witness),
+            Some(witness)
+        );
+        assert_eq!(witness.recorded_permissions, "r-xp");
+        assert_eq!(
+            witness.recorded_permissions,
+            binding.executable_memory.recorded_page_permissions()
+        );
+        let buffer = executable_payload_buffer(&response);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                witness.source,
+                PageProtectionWitnessSource::KernelProcSelfMaps
+            );
+            assert_eq!(witness.observed_permissions.as_deref(), Some("r-xp"));
+            let PublicationPageWitness::Observed(observation) = buffer.publication_page_witness()
+            else {
+                panic!(
+                    "Linux publication must be kernel-witnessed, got {:?}",
+                    buffer.publication_page_witness()
+                );
+            };
+            let base = buffer.code_slice().as_ptr() as u64;
+            assert_eq!(observation.start, base);
+            assert_eq!(observation.end, base + buffer.allocated_size() as u64);
+            assert_eq!(observation.permissions(), "r-xp");
+            let live = buffer
+                .observe_kernel_page_protection()
+                .expect("live kernel witness");
+            assert_eq!(live.permissions(), "r-xp");
+        } else {
+            assert_eq!(witness.source, PageProtectionWitnessSource::RecordedOnly);
+            assert_eq!(witness.observed_permissions, None);
+            assert_eq!(
+                buffer.publication_page_witness(),
+                &PublicationPageWitness::RecordedOnly
+            );
+        }
+        validate_installed_payload_binding(
+            &artifact.install,
+            artifact.artifact_manifest.as_ref(),
+            &buffer,
+        )
+        .expect("untampered v6 binding validates against itself and the manifest");
+
+        // The schema before the witness is refused, not migrated.
+        assert_binding_mutation_rejected(
+            &response,
+            "binding schema/version/kind or private canonical seal",
+            |response| {
+                mutate_and_reseal_installed_binding(response, |binding| {
+                    binding.schema =
+                        "trust-cg.compile_service.installed_payload_binding.v5".to_owned();
+                    binding.schema_version = 5;
+                });
+            },
+        );
+        let mut v2 = manifest.clone();
+        v2.schema = "trust-cg.artifact/v2".to_owned();
+        v2.schema_version = 2;
+        assert!(matches!(
+            v2.verify_schema(),
+            Err(ArtifactContractError::SchemaMismatch {
+                expected_version: 3,
+                actual_version: 2,
+                ..
+            })
+        ));
+        let rejected =
+            compile_manifest_bound_executable("installed-binding-witness-v2", &module, v2.clone());
+        assert_eq!(rejected.status, CompileStatus::Rejected);
+        assert!(
+            rejected.diagnostics[0].message.contains("schema"),
+            "{:?}",
+            rejected.diagnostics
+        );
+        validate_installed_payload_binding(&artifact.install, Some(&v2), &buffer)
+            .expect_err("a v2 manifest never validates against a v6 binding");
+    }
+
+    /// Forged witnesses in a resealed binding are refused by name, and a
+    /// buffer republished under a different witness is refused like any other
+    /// protection change.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn forged_page_protection_witnesses_are_refused_by_name() {
+        use crate::jit_contract::PageProtectionWitness;
+        let module = const_i64_module("installed_binding_witness_forgery", &[("answer", 42)]);
+        let manifest = native_install_manifest("artifact-installed-binding-witness-forgery", 916);
+        let response = compile_manifest_bound_executable(
+            "installed-binding-witness-forgery",
+            &module,
+            manifest,
+        );
+        assert_eq!(response.status, CompileStatus::Compiled);
+
+        type Forgery = (
+            &'static str,
+            PageProtectionWitnessRefusal,
+            fn(&mut PageProtectionWitness),
+        );
+        let mut forgeries: Vec<Forgery> = vec![
+            // A forged recorded protection, with or without a matching
+            // observation, no longer follows from the raw protection.
+            (
+                "recorded rwxp",
+                PageProtectionWitnessRefusal::RecordedProtectionForged,
+                |w| {
+                    w.recorded_permissions = "rwxp".to_owned();
+                    if w.observed_permissions.is_some() {
+                        w.observed_permissions = Some("rwxp".to_owned());
+                    }
+                },
+            ),
+            (
+                "recorded rw-p",
+                PageProtectionWitnessRefusal::RecordedProtectionForged,
+                |w| w.recorded_permissions = "rw-p".to_owned(),
+            ),
+            // The field never silently changes source.
+            (
+                "other source",
+                PageProtectionWitnessRefusal::SourceMismatch,
+                |w| match w.source {
+                    PageProtectionWitnessSource::KernelProcSelfMaps => {
+                        w.source = PageProtectionWitnessSource::RecordedOnly;
+                        w.observed_permissions = None;
+                    }
+                    PageProtectionWitnessSource::RecordedOnly => {
+                        w.source = PageProtectionWitnessSource::KernelProcSelfMaps;
+                        w.observed_permissions = Some(w.recorded_permissions.clone());
+                    }
+                },
+            ),
+        ];
+        if cfg!(target_os = "linux") {
+            forgeries.extend::<[Forgery; 4]>([
+                (
+                    "observed rwxp",
+                    PageProtectionWitnessRefusal::WritableExecutable,
+                    |w| w.observed_permissions = Some("rwxp".to_owned()),
+                ),
+                (
+                    "observed rw-p",
+                    PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+                    |w| w.observed_permissions = Some("rw-p".to_owned()),
+                ),
+                (
+                    "observed mixed",
+                    PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+                    |w| w.observed_permissions = Some("r-xp|r--p".to_owned()),
+                ),
+                (
+                    "observation dropped",
+                    PageProtectionWitnessRefusal::Unobservable,
+                    |w| w.observed_permissions = None,
+                ),
+            ]);
+        } else {
+            forgeries.push((
+                "recorded-only observation",
+                PageProtectionWitnessRefusal::SourceMismatch,
+                |w| w.observed_permissions = Some("r-xp".to_owned()),
+            ));
+        }
+        for (name, refusal, forge) in forgeries {
+            let mut forged = response.clone();
+            mutate_and_reseal_installed_binding(&mut forged, |binding| {
+                forge(&mut binding.executable_memory.page_protection_witness);
+            });
+            let artifact = forged.artifact.as_ref().expect("compiled artifact");
+            let error = validate_installed_payload_binding(
+                &artifact.install,
+                artifact.artifact_manifest.as_ref(),
+                &executable_payload_buffer(&forged),
+            )
+            .expect_err(name);
+            assert_page_witness_refusal(&error, refusal, PageProtectionWitnessStage::Lookup, "");
+            assert!(forged.native_install_gate_packet().is_none(), "{name}");
+            assert!(forged.into_installed_artifact().is_none(), "{name}");
+        }
+
+        // The same bytes republished with a different publication witness
+        // no longer match the sealed record.
+        let sealed = response
+            .artifact
+            .as_ref()
+            .and_then(|artifact| artifact.install.installed_payload_binding.as_ref())
+            .expect("installed payload binding")
+            .executable_memory
+            .clone();
+        let mut other = sealed.clone();
+        let witness = &mut other.page_protection_witness;
+        match witness.source {
+            PageProtectionWitnessSource::KernelProcSelfMaps => {
+                witness.observed_permissions = Some("rw-p".to_owned());
+            }
+            PageProtectionWitnessSource::RecordedOnly => {
+                witness.source = PageProtectionWitnessSource::KernelProcSelfMaps;
+                witness.observed_permissions = Some(witness.recorded_permissions.clone());
+            }
+        }
+        assert_ne!(other, sealed);
+        let republished = republish_payload(&response, |buffer| {
+            buffer.force_executable_memory_state_for_tests(&other);
+        });
+        assert!(
+            installed_binding_validation_error(&republished)
+                .contains("republished under different page protections")
+        );
+    }
+
+    /// Linux contract lookup observes the kernel again: a page made writable,
+    /// writable and executable, inaccessible or read-only after publication
+    /// is refused by name before any of its bytes are read, and lookup
+    /// recovers once the page is read-execute again. Kernel answers a live
+    /// process cannot safely produce (an uncovered or mixed range, a torn
+    /// text read) come from the thread-local maps hook, both at lookup and
+    /// at publication.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn installed_lookup_rereads_the_kernel_and_refuses_changed_protections_by_name() {
+        use crate::jit_page_witness::test_hooks::{override_maps, override_maps_reads};
+        use std::ffi::c_void;
+        unsafe extern "C" {
+            fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+        }
+        const PROT_NONE: i32 = 0;
+        const PROT_READ: i32 = 1;
+        const PROT_WRITE: i32 = 2;
+        const PROT_EXEC: i32 = 4;
+
+        let module = const_i64_module("installed_binding_kernel_witness", &[("answer", 42)]);
+        let signature = SymbolSignature::extern_c(vec![], vec![AbiValue::new(AbiValueKind::I64)]);
+        let mut manifest =
+            native_install_manifest("artifact-installed-binding-kernel-witness", 917);
+        manifest.symbols.push(crate::jit_contract::ArtifactSymbol {
+            name: "answer".to_owned(),
+            visibility: SymbolVisibility::Exported,
+            signature: signature.clone(),
+            offset_bytes: Some(0),
+            checksum: None,
+        });
+        let contract = SymbolLookupContract::new(
+            "answer",
+            signature,
+            manifest.target.checksum(),
+            manifest.abi.checksum(),
+            manifest.layout.checksum(),
+        )
+        .with_invalidation_checksum(manifest.invalidation.checksum())
+        .with_manifest_checksum(manifest.checksum());
+        let response = compile_manifest_bound_executable(
+            "installed-binding-kernel-witness",
+            &module,
+            manifest.clone(),
+        );
+        assert_eq!(response.status, CompileStatus::Compiled);
+        let installed = response
+            .into_installed_artifact()
+            .expect("installed artifact");
+        let call = |installed: &InstalledArtifact| -> Result<i64, ArtifactContractError> {
+            let typed = installed
+                .get_contract_symbol_bound::<extern "C" fn() -> i64>(&manifest, &contract)?;
+            // SAFETY: `answer` takes no arguments and returns an i64, as the
+            // manifest-bound contract above states.
+            let answer = unsafe { typed.into_fn() };
+            Ok(answer())
+        };
+        assert_eq!(call(&installed).expect("positive row"), 42);
+
+        let base = installed.buffer.code_slice().as_ptr() as *mut c_void;
+        let len = installed.buffer.allocated_size();
+        let protect = |prot: i32| {
+            // SAFETY: `base`/`len` are exactly this test's own live
+            // executable allocation; no other code runs on it meanwhile.
+            let status = unsafe { mprotect(base, len, prot) };
+            assert_eq!(status, 0, "mprotect({prot:#x}) failed");
+        };
+        for (prot, refusal, observed) in [
+            (
+                PROT_READ | PROT_WRITE,
+                PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+                "`rw-p`",
+            ),
+            (
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                PageProtectionWitnessRefusal::WritableExecutable,
+                "`rwxp`",
+            ),
+            (
+                PROT_NONE,
+                PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+                "`---p`",
+            ),
+            (
+                PROT_READ,
+                PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+                "`r--p`",
+            ),
+        ] {
+            protect(prot);
+            let result = call(&installed);
+            protect(PROT_READ | PROT_EXEC);
+            let error = result.expect_err("a changed protection must be refused");
+            assert_page_witness_refusal(
+                &error,
+                refusal,
+                PageProtectionWitnessStage::Lookup,
+                observed,
+            );
+            assert_eq!(call(&installed).expect("read-execute again"), 42);
+        }
+
+        let end = base as u64 + len as u64;
+        let row = |start: u64, end: u64, permissions: &str| {
+            format!("{start:x}-{end:x} {permissions} 00000000 00:00 0\n")
+        };
+        let mid = base as u64 + 0x800;
+        for (maps, refusal, fragment) in [
+            (
+                row(0x40_0000, 0x45_2000, "r-xp"),
+                PageProtectionWitnessRefusal::RangeNotCovered,
+                "does not cover",
+            ),
+            (
+                row(base as u64, end - 1, "r-xp"),
+                PageProtectionWitnessRefusal::RangeNotCovered,
+                "does not cover",
+            ),
+            (
+                "not a maps row\n".to_owned(),
+                PageProtectionWitnessRefusal::Unobservable,
+                "malformed",
+            ),
+            (
+                format!("{}{}", row(base as u64, mid, "r-xp"), row(mid, end, "rw-p")),
+                PageProtectionWitnessRefusal::ObservedRecordedMismatch,
+                "`r-xp|rw-p`",
+            ),
+            (
+                row(base as u64, end, "rwxp"),
+                PageProtectionWitnessRefusal::WritableExecutable,
+                "`rwxp`",
+            ),
+        ] {
+            let error = {
+                let _maps = override_maps(maps);
+                call(&installed).expect_err("an injected kernel answer must be refused")
+            };
+            assert_page_witness_refusal(
+                &error,
+                refusal,
+                PageProtectionWitnessStage::Lookup,
+                fragment,
+            );
+        }
+        assert_eq!(call(&installed).expect("real maps again"), 42);
+
+        // A torn read (the installed VMA listed, then listed again grown and
+        // writable from a later chunk) is retried, not read as a mixed
+        // range: a consistent next read is accepted; a torn read on every
+        // attempt is refused by name.
+        let torn = format!(
+            "{}{}",
+            row(base as u64, end - 0x800, "r-xp"),
+            row(base as u64, end + 0x1000, "rw-p")
+        );
+        {
+            let maps = override_maps_reads([torn.clone(), row(base as u64, end, "r-xp")]);
+            assert_eq!(call(&installed).expect("retried past a torn read"), 42);
+            assert_eq!(maps.reads_served(), 2);
+        }
+        let error = {
+            let maps = override_maps_reads([torn]);
+            let error = call(&installed).expect_err("no consistent read is refused");
+            assert_eq!(
+                maps.reads_served(),
+                crate::jit_page_witness::KERNEL_WITNESS_READ_ATTEMPTS
+            );
+            error
+        };
+        assert_page_witness_refusal(
+            &error,
+            PageProtectionWitnessRefusal::Unobservable,
+            PageProtectionWitnessStage::Lookup,
+            "no consistent /proc/self/maps snapshot",
+        );
+        assert_eq!(call(&installed).expect("real maps again"), 42);
+
+        // Publication: an allocation the kernel does not cover right after
+        // the seal is never bound.
+        let rejected = {
+            let _maps = override_maps(row(0x40_0000, 0x45_2000, "r-xp"));
+            compile_manifest_bound_executable(
+                "installed-binding-kernel-witness-publication",
+                &module,
+                native_install_manifest("artifact-installed-binding-kernel-witness-pub", 918),
+            )
+        };
+        assert_ne!(rejected.status, CompileStatus::Compiled);
+        let diagnostic = rejected
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "compile.page_protection_witness")
+            .unwrap_or_else(|| panic!("no witness diagnostic: {:?}", rejected.diagnostics));
+        assert!(
+            diagnostic
+                .message
+                .starts_with("[TCG-JIT-PAGE-WITNESS-UNCOVERED] artifact contract page-protection witness refused at publication"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(rejected.into_installed_artifact().is_none());
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -11487,5 +13386,205 @@ mod tests {
         let stale_response = service().compile(stale_request, &module);
         assert_eq!(stale_response.status, CompileStatus::Stale);
         assert!(stale_response.into_installed_artifact().is_none());
+    }
+}
+
+/// The service's artifact payloads carry the inline-only premises the
+/// backend disclosed (`docs/jit-inline-only-bodies.md`).
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod inline_only_payload_tests {
+    use super::*;
+    use crate::jit::JitConfig;
+    use crate::pipeline::OptLevel;
+    use trust_ir::{ICmpOp, Linkage, Ty};
+    use trust_ir_build::ModuleBuilder;
+
+    // This module's fixture is hand-built and carries no codegen license
+    // (`body_gate: None`), which the compile service REFUSES by default
+    // (roadmap WS7.5, decision gate DG-73). Its services state `Permit`
+    // explicitly (through the `#[cfg(test)]` helper: this module's compound
+    // cfg is scanned as production by the Permit census), so the inline-only
+    // disclosure is asserted on a compile the license admitted, never on one
+    // it silently refused.
+    use super::tests::permit_compile_service;
+
+    extern "C" fn host_read_slow(_table: *const i64, index: i64) -> i64 {
+        -1000 - index
+    }
+
+    extern "C" fn host_read(table: *const i64, index: i64) -> i64 {
+        // SAFETY: the test passes a table whose word 0 is its length.
+        let len = unsafe { *table };
+        if (index as u64) < (len as u64) {
+            // SAFETY: bounds-checked above.
+            unsafe { *table.add(1 + index as usize) }
+        } else {
+            host_read_slow(table, index)
+        }
+    }
+
+    /// `entry(t, i) = read(t, i) + read(t, i + 1)` with an inline-only body of
+    /// `read` (a bounds check and a load, else `read_slow`).
+    fn module() -> trust_ir::Module {
+        let mut mb = ModuleBuilder::new("service_inline_only_payloads");
+        let ft = mb.add_func_type(vec![Ty::Ptr, Ty::I64], vec![Ty::I64]);
+        let slow = mb.declare_function("read_slow", ft);
+        let read = {
+            let mut fb = mb.function("read", ft);
+            fb.set_linkage(Linkage::AvailableExternally);
+            let entry = fb.create_block();
+            let table = fb.add_block_param(entry, Ty::Ptr);
+            let index = fb.add_block_param(entry, Ty::I64);
+            let fast = fb.create_block();
+            let slow_block = fb.create_block();
+            fb.switch_to_block(entry);
+            let len = fb.load(Ty::I64, table);
+            let in_range = fb.icmp(ICmpOp::Ult, Ty::I64, index, len);
+            fb.condbr(in_range, fast, vec![], slow_block, vec![]);
+            fb.switch_to_block(fast);
+            let one = fb.iconst(Ty::I64, 1);
+            let slot = fb.add(Ty::I64, index, one);
+            let element = fb.gep(Ty::I64, table, vec![slot]);
+            let value = fb.load(Ty::I64, element);
+            fb.ret(vec![value]);
+            fb.switch_to_block(slow_block);
+            let rest = fb.call(slow, vec![table, index]);
+            fb.ret(vec![rest]);
+            fb.build()
+        };
+        {
+            let mut fb = mb.function("entry", ft);
+            let entry = fb.create_block();
+            let table = fb.add_block_param(entry, Ty::Ptr);
+            let index = fb.add_block_param(entry, Ty::I64);
+            fb.switch_to_block(entry);
+            let first = fb.call(read, vec![table, index]);
+            let one = fb.iconst(Ty::I64, 1);
+            let next = fb.add(Ty::I64, index, one);
+            let second = fb.call(read, vec![table, next]);
+            let sum = fb.add(Ty::I64, first, second);
+            fb.ret(vec![sum]);
+            fb.build();
+        }
+        let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
+        // `read_slow` is a bodyless external declaration, an FFI boundary,
+        // which needs a pinned target (`TargetInfoRequired`; WS7.3 ingestion
+        // admission). Every request below compiles for the host.
+        module.target_info = Some(
+            crate::core_admission::CoreHostJitTarget::detect()
+                .expect("a supported native host")
+                .trust_ir_target_info()
+                .clone(),
+        );
+        module
+    }
+
+    fn request(id: &str, kind: ArtifactKind, opt_level: OptLevel) -> CompileRequest {
+        let mut request = CompileRequest::new(id, CompileGeneration::new(1));
+        request.artifact_kind = kind;
+        request.profile = CompileProfile::Custom {
+            compiler: CompilerConfig {
+                opt_level,
+                ..CompilerConfig::jit_fast(Target::host())
+            },
+            jit: JitConfig::default(),
+        };
+        request.provenance.source_kind = SourceKind::TrustIrModule;
+        request
+    }
+
+    fn spliced(evidence: &crate::lir_module_prep::InlineOnlyBodyEvidence) -> Vec<(&str, usize)> {
+        evidence
+            .spliced
+            .iter()
+            .map(|use_| (use_.name.as_str(), use_.sites))
+            .collect()
+    }
+
+    #[test]
+    fn object_and_executable_payloads_disclose_the_spliced_bodies() {
+        let module = module();
+        for opt_level in [OptLevel::O0, OptLevel::O2] {
+            let expected: Vec<(&str, usize)> = if opt_level == OptLevel::O0 {
+                Vec::new()
+            } else {
+                vec![("read", 2)]
+            };
+
+            let response = permit_compile_service().compile(
+                request("inline-only-object", ArtifactKind::Object, opt_level),
+                &module,
+            );
+            assert_eq!(response.status, CompileStatus::Compiled, "{opt_level:?}");
+            let Some(ArtifactPayload::Object(object)) = response.payload.as_ref() else {
+                panic!("{opt_level:?}: expected an object payload");
+            };
+            assert_eq!(
+                spliced(&object.inline_only_bodies),
+                expected,
+                "{opt_level:?}"
+            );
+
+            let externs = HashMap::from([
+                ("read".to_string(), host_read as *const u8),
+                ("read_slow".to_string(), host_read_slow as *const u8),
+            ]);
+            let response = permit_compile_service().compile_with_extern_symbols(
+                request(
+                    "inline-only-executable",
+                    ArtifactKind::ExecutableMemory,
+                    opt_level,
+                ),
+                &module,
+                &externs,
+            );
+            assert_eq!(response.status, CompileStatus::Compiled, "{opt_level:?}");
+            let Some(ArtifactPayload::Executable(executable)) = response.payload.as_ref() else {
+                panic!("{opt_level:?}: expected an executable payload");
+            };
+            // Executable memory is the host JIT under its arch-default
+            // validation mode. A verifying mode (x86-64's `CachedVerified`)
+            // is a proof claim, which splices only AUTHENTICATED inline-only
+            // bodies: `read` has no authenticating dependency here, so it is
+            // withheld, disclosed as such, and stays an external call.
+            let jit_claims_proof =
+                crate::compiler::arch_default_jit_validation_mode(Target::host())
+                    .requires_jit_verification();
+            if jit_claims_proof {
+                assert_eq!(
+                    spliced(&executable.inline_only_bodies),
+                    Vec::new(),
+                    "{opt_level:?}"
+                );
+                if opt_level != OptLevel::O0 {
+                    assert!(
+                        executable
+                            .inline_only_bodies
+                            .withheld
+                            .iter()
+                            .any(|withheld| withheld.name == "read"),
+                        "{opt_level:?}: a proof-claiming JIT must disclose `read` as withheld: {:?}",
+                        executable.inline_only_bodies
+                    );
+                }
+            } else {
+                assert_eq!(
+                    spliced(&executable.inline_only_bodies),
+                    expected,
+                    "{opt_level:?}"
+                );
+            }
+            // SAFETY: `entry`'s signature is the module's.
+            let entry: extern "C" fn(*const i64, i64) -> i64 = unsafe {
+                executable
+                    .buffer
+                    .get_fn_bound("entry")
+                    .expect("entry symbol")
+                    .into_inner()
+            };
+            let table: [i64; 4] = [3, 10, 20, 30];
+            assert_eq!(entry(table.as_ptr(), 1), 50, "{opt_level:?}");
+            assert_eq!(entry(table.as_ptr(), 2), 30 - 1003, "{opt_level:?}");
+        }
     }
 }

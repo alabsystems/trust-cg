@@ -1,0 +1,20 @@
+; TrustIr text format v1
+module "first_struct"
+target "aarch64-unknown-linux-gnu" 8 little
+
+functy.0 = (&(u32, u32, u32)) -> (&u32)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @first_struct(functy.0) {
+bb0(%1: &(u32, u32, u32)):
+    ret %1
+}

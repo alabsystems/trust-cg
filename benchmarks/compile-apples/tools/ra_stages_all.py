@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """All regalloc stage timers in one pass: per program, min-of-N of each
 stage's per-compile SUM across functions; then summed over the corpus.
-usage: ra_stages_all.py N DYLIB [DYLIB_B]"""
+usage: ra_stages_all.py [--driver TRUSTC] N DYLIB [DYLIB_B]   (driver: see _trust_driver.py)"""
 import os, subprocess, sys, glob, re, collections
+from _trust_driver import resolve_from_argv
+home = os.path.expanduser("~")
+# STOCK EXCEPTION (Trust lacks rust-lld/gcc-ld; measured: no lib/rustlib/<host>/bin/{rust-lld,gcc-ld} in the Trust sysroot): the Linux linker shim comes from the stock stable toolchain's gcc-ld; the compilers come from the Trust package.
+os.environ["PATH"] = f"{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
+DRIVER = resolve_from_argv(sys.argv)
 n = int(sys.argv[1]); dylibs = sys.argv[2:]
 if n < 1:
     raise SystemExit("N must be at least 1")
 if not dylibs:
     raise SystemExit("at least one DYLIB is required")
-home = os.path.expanduser("~")
-os.environ["PATH"] = f"{home}/.cargo/bin:{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
-rustc = subprocess.check_output(["rustup", "which", "--toolchain", "nightly-2026-04-20", "rustc"], text=True).strip()
-flags = ["--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3"]
+rustc = DRIVER["compiler"]
+flags = [*DRIVER["compiler_flags"], "--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3"]
 pat = re.compile(r"\[trust-cg-time-regalloc\] func=(\S+) pass=\S+ stage=(\S+) elapsed_us=(\d+)")
 env = dict(os.environ, TRUST_CG_TIME_PASSES="1")
 progs = sorted(glob.glob(os.environ.get("TCG_PROGS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../beat-llvm/progs")) + "/*.rs"))

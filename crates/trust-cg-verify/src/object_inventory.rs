@@ -25,6 +25,16 @@ pub enum ObjectRelocationKind {
     AArch64ElfAdrGotPage,
     /// ELF `R_AARCH64_LD64_GOT_LO12_NC`.
     AArch64ElfLd64GotLo12Nc,
+    /// ELF `R_AARCH64_LDST8_ABS_LO12_NC` (fused ADRP + byte access).
+    AArch64ElfLdst8AbsLo12Nc,
+    /// ELF `R_AARCH64_LDST16_ABS_LO12_NC` (fused ADRP + halfword access).
+    AArch64ElfLdst16AbsLo12Nc,
+    /// ELF `R_AARCH64_LDST32_ABS_LO12_NC` (fused ADRP + word access).
+    AArch64ElfLdst32AbsLo12Nc,
+    /// ELF `R_AARCH64_LDST64_ABS_LO12_NC` (fused ADRP + doubleword access).
+    AArch64ElfLdst64AbsLo12Nc,
+    /// ELF `R_AARCH64_LDST128_ABS_LO12_NC` (fused ADRP + quadword access).
+    AArch64ElfLdst128AbsLo12Nc,
     /// ELF `R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21`.
     AArch64ElfTlsieAdrGottprelPage21,
     /// ELF `R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC`.
@@ -35,6 +45,14 @@ pub enum ObjectRelocationKind {
     AArch64ElfTlsleAddTprelLo12,
     /// ELF `R_AARCH64_TLSLE_ADD_TPREL_LO12_NC`.
     AArch64ElfTlsleAddTprelLo12Nc,
+    /// ELF `R_AARCH64_TLSDESC_ADR_PAGE21`.
+    AArch64ElfTlsdescAdrPage21,
+    /// ELF `R_AARCH64_TLSDESC_LD64_LO12`.
+    AArch64ElfTlsdescLd64Lo12,
+    /// ELF `R_AARCH64_TLSDESC_ADD_LO12`.
+    AArch64ElfTlsdescAddLo12,
+    /// ELF `R_AARCH64_TLSDESC_CALL`.
+    AArch64ElfTlsdescCall,
     /// AArch64 ELF relocation kind not yet modeled by a named inventory row.
     AArch64ElfOther(u32),
     /// Mach-O `ARM64_RELOC_PAGE21` (ADRP PC-relative page).
@@ -126,6 +144,21 @@ impl std::fmt::Display for ObjectRelocationKind {
             Self::AArch64ElfPrel32 => f.write_str("AArch64 ELF R_AARCH64_PREL32"),
             Self::AArch64ElfAdrGotPage => f.write_str("AArch64 ELF R_AARCH64_ADR_GOT_PAGE"),
             Self::AArch64ElfLd64GotLo12Nc => f.write_str("AArch64 ELF R_AARCH64_LD64_GOT_LO12_NC"),
+            Self::AArch64ElfLdst8AbsLo12Nc => {
+                f.write_str("AArch64 ELF R_AARCH64_LDST8_ABS_LO12_NC")
+            }
+            Self::AArch64ElfLdst16AbsLo12Nc => {
+                f.write_str("AArch64 ELF R_AARCH64_LDST16_ABS_LO12_NC")
+            }
+            Self::AArch64ElfLdst32AbsLo12Nc => {
+                f.write_str("AArch64 ELF R_AARCH64_LDST32_ABS_LO12_NC")
+            }
+            Self::AArch64ElfLdst64AbsLo12Nc => {
+                f.write_str("AArch64 ELF R_AARCH64_LDST64_ABS_LO12_NC")
+            }
+            Self::AArch64ElfLdst128AbsLo12Nc => {
+                f.write_str("AArch64 ELF R_AARCH64_LDST128_ABS_LO12_NC")
+            }
             Self::AArch64ElfTlsieAdrGottprelPage21 => {
                 f.write_str("AArch64 ELF R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21")
             }
@@ -141,6 +174,14 @@ impl std::fmt::Display for ObjectRelocationKind {
             Self::AArch64ElfTlsleAddTprelLo12Nc => {
                 f.write_str("AArch64 ELF R_AARCH64_TLSLE_ADD_TPREL_LO12_NC")
             }
+            Self::AArch64ElfTlsdescAdrPage21 => {
+                f.write_str("AArch64 ELF R_AARCH64_TLSDESC_ADR_PAGE21")
+            }
+            Self::AArch64ElfTlsdescLd64Lo12 => {
+                f.write_str("AArch64 ELF R_AARCH64_TLSDESC_LD64_LO12")
+            }
+            Self::AArch64ElfTlsdescAddLo12 => f.write_str("AArch64 ELF R_AARCH64_TLSDESC_ADD_LO12"),
+            Self::AArch64ElfTlsdescCall => f.write_str("AArch64 ELF R_AARCH64_TLSDESC_CALL"),
             Self::AArch64ElfOther(kind) => write!(f, "AArch64 ELF relocation {kind}"),
             Self::AArch64MachOPage21 => f.write_str("AArch64 Mach-O ARM64_RELOC_PAGE21"),
             Self::AArch64MachOPageoff12 => f.write_str("AArch64 Mach-O ARM64_RELOC_PAGEOFF12"),
@@ -209,6 +250,11 @@ impl ObjectRelocationKind {
             Self::AArch64ElfPrel32,
             Self::AArch64ElfAdrGotPage,
             Self::AArch64ElfLd64GotLo12Nc,
+            Self::AArch64ElfLdst8AbsLo12Nc,
+            Self::AArch64ElfLdst16AbsLo12Nc,
+            Self::AArch64ElfLdst32AbsLo12Nc,
+            Self::AArch64ElfLdst64AbsLo12Nc,
+            Self::AArch64ElfLdst128AbsLo12Nc,
         ]
     }
 
@@ -225,6 +271,25 @@ impl ObjectRelocationKind {
             Self::AArch64ElfTlsleAddTprelHi12,
             Self::AArch64ElfTlsleAddTprelLo12,
             Self::AArch64ElfTlsleAddTprelLo12Nc,
+        ]
+    }
+
+    /// Named AArch64 ELF TLS-descriptor (general-dynamic) relocation rows.
+    ///
+    /// The shared-object (`pic`) relocation model emits these four kinds for
+    /// every thread-local access. They are NAMED so proof-required promotion
+    /// reports the exact TLSDESC gap instead of `AArch64ElfOther`, but no
+    /// value obligation models them (nor the static linker's rewrite of the
+    /// four slots when it relaxes the sequence to initial-exec or
+    /// local-exec), so [`ObjectRelocationProofRegistry::aarch64_elf_production`]
+    /// deliberately carries no row for them: an object containing TLSDESC
+    /// fails proof-required promotion closed.
+    pub fn aarch64_elf_named_tlsdesc_rows() -> &'static [Self] {
+        &[
+            Self::AArch64ElfTlsdescAdrPage21,
+            Self::AArch64ElfTlsdescLd64Lo12,
+            Self::AArch64ElfTlsdescAddLo12,
+            Self::AArch64ElfTlsdescCall,
         ]
     }
 
@@ -310,11 +375,20 @@ impl ObjectRelocationKind {
             | Self::AArch64ElfPrel32
             | Self::AArch64ElfAdrGotPage
             | Self::AArch64ElfLd64GotLo12Nc
+            | Self::AArch64ElfLdst8AbsLo12Nc
+            | Self::AArch64ElfLdst16AbsLo12Nc
+            | Self::AArch64ElfLdst32AbsLo12Nc
+            | Self::AArch64ElfLdst64AbsLo12Nc
+            | Self::AArch64ElfLdst128AbsLo12Nc
             | Self::AArch64ElfTlsieAdrGottprelPage21
             | Self::AArch64ElfTlsieLd64GottprelLo12Nc
             | Self::AArch64ElfTlsleAddTprelHi12
             | Self::AArch64ElfTlsleAddTprelLo12
             | Self::AArch64ElfTlsleAddTprelLo12Nc
+            | Self::AArch64ElfTlsdescAdrPage21
+            | Self::AArch64ElfTlsdescLd64Lo12
+            | Self::AArch64ElfTlsdescAddLo12
+            | Self::AArch64ElfTlsdescCall
             | Self::AArch64ElfOther(_)
             | Self::X86_64ElfAbs64
             | Self::X86_64ElfPc32
@@ -507,12 +581,24 @@ impl ObjectRelocationProofRegistry {
     /// 2^24` window carried by `preconditions: vec![in_range]`), each with a
     /// paired DROP-the-precondition negative control that REFUTES — so the
     /// registry row does not need to express them, exactly as the ordinary
-    /// rows do not express CALL26's ±128MiB window. In both cases the
-    /// psABI makes the LINKER's overflow check discharge the precondition at
-    /// resolution time; the reparse-enforced binding pins what the emitter
-    /// wrote. (An earlier revision kept these rows out on the belief the
-    /// registry had to carry the range preconditions itself — inherited
-    /// caution, retired when the obligations landed them internally.)
+    /// rows do not express CALL26's ±128MiB window. The reparse-enforced
+    /// binding pins what the emitter wrote; a window that only the link
+    /// fixes is left to the static linker's overflow check, and the
+    /// linkers on the Linux AArch64 host do not all make it: GNU ld 2.42
+    /// writes the GOT-page `ADRP` kinds (`TLSIE_ADR_GOTTPREL_PAGE21` among
+    /// them) truncated and relaxes initial-exec and descriptor accesses to
+    /// a local-exec `MOVZ`/`MOVK` pair that truncates a `TPREL` of 2^32 or
+    /// more, gold 2.42 and LLD 22.1.6 write a `PREL32` (the `.eh_frame`
+    /// pointer row above) in `[2^31, 2^32)` truncated, and LLD 22 writes an
+    /// input's `LD64_GOTPAGE_LO15` truncated. trust-cg's link driver
+    /// re-reads the linked image for each of these and refuses it (the
+    /// codegen crate's `AArch64RelocType::relocation_limit` names who
+    /// discharges every emitted kind), but only for links it runs: a row
+    /// here says what the emitter wrote, not that a link made elsewhere
+    /// kept it in its window. (An earlier revision kept these rows out on
+    /// the belief the registry had to carry the range preconditions itself
+    /// — inherited caution, retired when the obligations landed them
+    /// internally.)
     ///
     /// The FIFTH named TLS kind — the checked non-NC
     /// `R_AARCH64_TLSLE_ADD_TPREL_LO12` — stays OUT: never emitted, and the
@@ -530,6 +616,14 @@ impl ObjectRelocationProofRegistry {
         verified.insert(ObjectRelocationKind::AArch64ElfAddAbsLo12Nc, LANE);
         verified.insert(ObjectRelocationKind::AArch64ElfAdrGotPage, LANE);
         verified.insert(ObjectRelocationKind::AArch64ElfLd64GotLo12Nc, LANE);
+        // The fused ADRP + LDR/STR lo12 rows cite the same lane's LDST
+        // obligations, which carry the access-size alignment of `S + A` as a
+        // precondition (the emitter fuses only placements that guarantee it).
+        verified.insert(ObjectRelocationKind::AArch64ElfLdst8AbsLo12Nc, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfLdst16AbsLo12Nc, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfLdst32AbsLo12Nc, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfLdst64AbsLo12Nc, LANE);
+        verified.insert(ObjectRelocationKind::AArch64ElfLdst128AbsLo12Nc, LANE);
         verified.insert(
             ObjectRelocationKind::AArch64ElfTlsieAdrGottprelPage21,
             TLS_LANE,
@@ -915,8 +1009,9 @@ mod tests {
         let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
         assert_eq!(
             ObjectRelocationKind::aarch64_elf_named_non_tls_rows().len(),
-            8,
-            "ordinary AArch64 ELF row inventory changed; audit its proof authority"
+            13,
+            "ordinary AArch64 ELF row inventory changed; audit its proof authority \
+             (the five LDST lo12 rows cite aarch64_elf_ldst_lo12_proofs)"
         );
         // Every ordinary row cites the aarch64_elf_reloc_proofs value lane…
         for kind in ObjectRelocationKind::aarch64_elf_named_non_tls_rows() {
@@ -1060,9 +1155,39 @@ mod tests {
     }
 
     #[test]
+    fn tlsdesc_rows_are_named_elf_rows_but_never_certified() {
+        let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
+        for kind in ObjectRelocationKind::aarch64_elf_named_tlsdesc_rows() {
+            assert_eq!(kind.container(), ObjectContainer::Elf, "{kind}");
+            assert!(
+                !registry.contains(*kind),
+                "TLSDESC row {kind} has no value obligation and must stay fail-closed"
+            );
+            assert!(
+                !ObjectRelocationKind::aarch64_elf_named_tls_rows().contains(kind)
+                    && !ObjectRelocationKind::aarch64_elf_named_non_tls_rows().contains(kind),
+                "{kind} is named exactly once"
+            );
+        }
+        let report = ObjectRelocationInventoryReport::from_emitted_kinds_with_registry_and_binding(
+            "tlsdesc.o",
+            ObjectRelocationKind::aarch64_elf_named_tlsdesc_rows()
+                .iter()
+                .copied(),
+            &registry,
+            ObjectProofBinding::ElfReparseEnforced,
+        );
+        assert!(
+            !report.is_promotable(),
+            "an object with TLSDESC relocations must fail proof-required promotion"
+        );
+        assert_eq!(report.uncovered_relocations().len(), 4);
+    }
+
+    #[test]
     fn aarch64_elf_production_registry_has_exactly_the_named_rows() {
         let registry = ObjectRelocationProofRegistry::aarch64_elf_production();
-        assert_eq!(registry.verified_kinds().count(), 12);
+        assert_eq!(registry.verified_kinds().count(), 17);
 
         for kind in ObjectRelocationKind::aarch64_elf_named_non_tls_rows() {
             assert!(
@@ -1242,7 +1367,7 @@ mod tests {
                 "x86_64-macho.o" => 9,
                 "aarch64-macho.o" => 9,
                 "x86_64-elf.o" => 4,
-                "aarch64-elf.o" => 12,
+                "aarch64-elf.o" => 17,
                 _ => 0,
             };
             assert_eq!(

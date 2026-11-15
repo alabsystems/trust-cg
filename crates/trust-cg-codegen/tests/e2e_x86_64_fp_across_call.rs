@@ -50,11 +50,14 @@ use trust_ir::{BlockId, FuncId, ValueId};
 /// XMM as implicit-defs, which is exactly the interference the allocator must
 /// honor for any float live across a call to it.
 fn append_sink(module: &mut TrustIrModule, func_id: u32, name: &str) -> u32 {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -77,7 +80,9 @@ fn append_sink(module: &mut TrustIrModule, func_id: u32, name: &str) -> u32 {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     func_id
 }
 
@@ -99,11 +104,14 @@ fn build_fp_one_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
     let sink = append_sink(&mut module, 0, "_sink");
 
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(1), "_fp_one_call", ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -170,7 +178,9 @@ fn build_fp_one_call_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -194,11 +204,14 @@ fn build_fp_two_calls_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
     let sink = append_sink(&mut module, 0, "_sink");
 
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(1), "_fp_two_calls", ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -278,7 +291,9 @@ fn build_fp_two_calls_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -298,11 +313,14 @@ fn build_f32_across_call_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
     let sink = append_sink(&mut module, 0, "_sink");
 
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::F32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::F32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(1), "_f32_across_call", ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -363,7 +381,9 @@ fn build_f32_across_call_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -509,11 +529,14 @@ fn build_fp_int_io_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
     let sink = append_sink(&mut module, 0, "_sink2");
 
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(1), "_fp_int_io", ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -601,7 +624,9 @@ fn build_fp_int_io_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 

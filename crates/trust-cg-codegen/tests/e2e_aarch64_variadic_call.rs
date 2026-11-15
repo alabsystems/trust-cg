@@ -20,6 +20,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
+#[path = "common/pinned_target.rs"]
+mod pinned_target;
+
 use std::fs;
 use std::process::Command;
 
@@ -40,16 +43,20 @@ fn can_link_and_run_aarch64_macho() -> bool {
 // Bodyless + Linkage::External => collected into external_func_ids, its
 // signature is used only to classify the call, no code is emitted for it.
 fn declare_variadic(m: &mut TrustIrModule, id: u32, name: &str, fixed: Vec<Ty>, ret: Ty) -> FuncId {
-    let ft = m.add_func_type(FuncTy {
-        params: fixed,
-        returns: vec![ret],
-        is_vararg: true,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: fixed,
+            returns: vec![ret],
+            abi: None,
+            is_vararg: true,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.linkage = Linkage::External;
     f.blocks = Vec::new(); // bodyless declaration
     let fid = f.id;
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     fid
 }
 
@@ -64,11 +71,14 @@ fn build_module() -> TrustIrModule {
     // int64_t drive_i(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e) {
     //     return vsum_i(5, a, b, c, d, e);   // 5 int varargs -> all on stack
     // }
-    let drive_i_sig = m.add_func_type(FuncTy {
-        params: vec![Ty::I64; 5],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let drive_i_sig = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 5],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut drive_i = TrustIrFunction::new(FuncId::new(2), "drive_i", drive_i_sig, BlockId::new(0));
     drive_i.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -96,16 +106,20 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(drive_i);
+    m.try_add_function(drive_i)
+        .expect("Module::try_add_function: test fixture");
 
     // double drive_d(double a, double b, double c, double d) {
     //     return vsum_d(4, a, b, c, d);   // 4 double varargs -> all on stack
     // }
-    let drive_d_sig = m.add_func_type(FuncTy {
-        params: vec![Ty::F64; 4],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let drive_d_sig = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64; 4],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut drive_d = TrustIrFunction::new(FuncId::new(3), "drive_d", drive_d_sig, BlockId::new(0));
     drive_d.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -132,7 +146,8 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(drive_d);
+    m.try_add_function(drive_d)
+        .expect("Module::try_add_function: test fixture");
 
     m
 }
@@ -141,9 +156,13 @@ fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Result<Vec<u8>, String> 
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
+    // `vsum_i` is an FFI boundary: the module pins the host target it is
+    // compiled for (`TargetInfoRequired`; WS7.3 ingestion admission).
+    let module = pinned_target::pinned(module, pinned_target::host_triple());
     compiler
-        .compile(module)
+        .compile(&module)
         .map(|r| r.object_code)
         .map_err(|e| format!("{e:?}"))
 }
@@ -231,4 +250,13 @@ fn e2e_aarch64_variadic_call_matches_clang() {
         };
         assert_eq!(code, 0, "variadic-call result mismatch at {opt:?}");
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

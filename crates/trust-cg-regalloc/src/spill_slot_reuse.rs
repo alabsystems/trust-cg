@@ -52,53 +52,159 @@ pub fn compute_spill_slot_reuse(
     }
 
     for spills in groups.values() {
-        // Coloring: assign each spill to a "color" (shared slot).
-        // Colors hold the list of vreg intervals assigned to them.
-        let mut colors: Vec<(StackSlotId, Vec<VReg>)> = Vec::new();
-
-        for &(vreg, original_slot) in spills {
-            let vreg_interval = match exact_interval_for_vreg(intervals, vreg) {
-                Some(iv) => iv,
-                None => {
-                    // No interval data — can't share.
-                    colors.push((original_slot, vec![vreg]));
-                    continue;
-                }
-            };
-
-            // Try to find an existing color that doesn't conflict.
-            let mut found_color = false;
-            for (color_slot, color_vregs) in &mut colors {
-                let conflicts = color_vregs.iter().any(|&existing_vreg| {
-                    if let Some(existing_interval) =
-                        exact_interval_for_vreg(intervals, existing_vreg)
-                    {
-                        existing_interval.overlaps(vreg_interval)
-                    } else {
-                        true // Conservative: assume conflict if no interval data.
-                    }
-                });
-
-                if !conflicts {
-                    // Reuse this slot.
-                    color_vregs.push(vreg);
-                    if original_slot != *color_slot {
-                        result.slot_rewrites.insert(original_slot, *color_slot);
-                        result.slots_eliminated += 1;
-                    }
-                    found_color = true;
-                    break;
-                }
-            }
-
-            if !found_color {
-                // Need a new color (keep original slot).
-                colors.push((original_slot, vec![vreg]));
-            }
+        // Every spill interval satisfies the ranges invariant (the usual case):
+        // color against each color's union of live ranges. Otherwise keep the
+        // pairwise first-fit scan.
+        if spills.iter().all(|&(vreg, _)| {
+            exact_interval_for_vreg(intervals, vreg).is_none_or(LiveInterval::has_ordered_ranges)
+        }) {
+            color_against_range_unions(spills, intervals, &mut result);
+        } else {
+            color_pairwise(spills, intervals, &mut result);
         }
     }
 
     result
+}
+
+/// The first-fit coloring of [`compute_spill_slot_reuse`] with one pairwise
+/// interval check per member: the form every group took before
+/// [`color_against_range_unions`], kept for intervals outside the ranges
+/// invariant.
+fn color_pairwise(
+    spills: &[(VReg, StackSlotId)],
+    intervals: &BTreeMap<u32, LiveInterval>,
+    result: &mut SpillSlotReuseResult,
+) {
+    // Coloring: assign each spill to a "color" (shared slot).
+    // Colors hold the list of vreg intervals assigned to them.
+    let mut colors: Vec<(StackSlotId, Vec<VReg>)> = Vec::new();
+
+    for &(vreg, original_slot) in spills {
+        let vreg_interval = match exact_interval_for_vreg(intervals, vreg) {
+            Some(iv) => iv,
+            None => {
+                // No interval data — can't share.
+                colors.push((original_slot, vec![vreg]));
+                continue;
+            }
+        };
+
+        // Try to find an existing color that doesn't conflict.
+        let mut found_color = false;
+        for (color_slot, color_vregs) in &mut colors {
+            let conflicts = color_vregs.iter().any(|&existing_vreg| {
+                if let Some(existing_interval) = exact_interval_for_vreg(intervals, existing_vreg) {
+                    existing_interval.overlaps(vreg_interval)
+                } else {
+                    true // Conservative: assume conflict if no interval data.
+                }
+            });
+
+            if !conflicts {
+                // Reuse this slot.
+                color_vregs.push(vreg);
+                if original_slot != *color_slot {
+                    result.slot_rewrites.insert(original_slot, *color_slot);
+                    result.slots_eliminated += 1;
+                }
+                found_color = true;
+                break;
+            }
+        }
+
+        if !found_color {
+            // Need a new color (keep original slot).
+            colors.push((original_slot, vec![vreg]));
+        }
+    }
+}
+
+/// The first-fit coloring of [`compute_spill_slot_reuse`], deciding each
+/// conflict against one set per color instead of against every member.
+///
+/// A spill conflicts with a color when any member has no interval data, or
+/// when some member's interval overlaps its own. With ordered ranges (checked
+/// by the caller for every spill), "overlaps some member" is "overlaps the
+/// union of the members' ranges": a range meets the union exactly when it
+/// meets one of the merged ranges, and every range is non-empty. The colors
+/// are tried in the same order, so every choice, rewrite and count is the
+/// same. Checking every member made a block of `s` mutually disjoint spills,
+/// all sharing the first color, cost `O(s^2)`.
+fn color_against_range_unions(
+    spills: &[(VReg, StackSlotId)],
+    intervals: &BTreeMap<u32, LiveInterval>,
+    result: &mut SpillSlotReuseResult,
+) {
+    struct Color {
+        slot: StackSlotId,
+        /// Some member has no interval data: every later spill conflicts.
+        has_unknown: bool,
+        /// Disjoint, non-touching `start -> end` ranges covering every member.
+        union: BTreeMap<u32, u32>,
+    }
+
+    fn union_overlaps(union: &BTreeMap<u32, u32>, interval: &LiveInterval) -> bool {
+        interval.ranges.iter().any(|range| {
+            crate::scan_work::charge(1);
+            union
+                .range(..range.end)
+                .next_back()
+                .is_some_and(|(_, &end)| end > range.start)
+        })
+    }
+
+    fn union_insert(union: &mut BTreeMap<u32, u32>, interval: &LiveInterval) {
+        for range in &interval.ranges {
+            let (mut start, mut end) = (range.start, range.end);
+            // Absorb every stored range that overlaps or touches this one.
+            while let Some((&other_start, &other_end)) = union.range(..=end).next_back() {
+                crate::scan_work::charge(1);
+                if other_end < start {
+                    break;
+                }
+                union.remove(&other_start);
+                start = start.min(other_start);
+                end = end.max(other_end);
+            }
+            union.insert(start, end);
+        }
+    }
+
+    let mut colors: Vec<Color> = Vec::new();
+    for &(vreg, original_slot) in spills {
+        let Some(vreg_interval) = exact_interval_for_vreg(intervals, vreg) else {
+            // No interval data — can't share.
+            colors.push(Color {
+                slot: original_slot,
+                has_unknown: true,
+                union: BTreeMap::new(),
+            });
+            continue;
+        };
+
+        let free = colors
+            .iter_mut()
+            .find(|color| !color.has_unknown && !union_overlaps(&color.union, vreg_interval));
+        match free {
+            Some(color) => {
+                union_insert(&mut color.union, vreg_interval);
+                if original_slot != color.slot {
+                    result.slot_rewrites.insert(original_slot, color.slot);
+                    result.slots_eliminated += 1;
+                }
+            }
+            None => {
+                let mut union = BTreeMap::new();
+                union_insert(&mut union, vreg_interval);
+                colors.push(Color {
+                    slot: original_slot,
+                    has_unknown: false,
+                    union,
+                });
+            }
+        }
+    }
 }
 
 fn exact_interval_for_vreg(
@@ -176,6 +282,81 @@ mod tests {
             iv.add_range(start, end);
         }
         iv
+    }
+
+    /// Coloring against per-color range unions makes exactly the choices of
+    /// the pairwise first-fit scan: same rewrites, same count.
+    #[test]
+    fn range_union_coloring_matches_pairwise_first_fit() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move |limit: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % limit
+        };
+        let mut shared = 0usize;
+        for case in 0..500 {
+            let count = 1 + next(80) as u32;
+            let mut intervals = BTreeMap::new();
+            let mut spills = Vec::new();
+            for id in 0..count {
+                spills.push((vreg(id), StackSlotId(100 + id)));
+                // Some spills carry no interval data.
+                if next(10) == 0 {
+                    continue;
+                }
+                let mut iv = LiveInterval::new(vreg(id));
+                for _ in 0..1 + next(3) {
+                    let start = next(400) as u32;
+                    iv.add_range(
+                        start,
+                        start + 1 + next(if case % 2 == 0 { 8 } else { 60 }) as u32,
+                    );
+                }
+                intervals.insert(id, iv);
+            }
+            let mut unions = SpillSlotReuseResult {
+                slots_eliminated: 0,
+                slot_rewrites: BTreeMap::new(),
+            };
+            color_against_range_unions(&spills, &intervals, &mut unions);
+            let mut pairwise = SpillSlotReuseResult {
+                slots_eliminated: 0,
+                slot_rewrites: BTreeMap::new(),
+            };
+            color_pairwise(&spills, &intervals, &mut pairwise);
+            assert_eq!(unions.slot_rewrites, pairwise.slot_rewrites, "case {case}");
+            assert_eq!(
+                unions.slots_eliminated, pairwise.slots_eliminated,
+                "case {case}"
+            );
+            shared += pairwise.slots_eliminated as usize;
+        }
+        assert!(shared > 1000, "slots shared: {shared}");
+    }
+
+    /// `s` mutually disjoint spills all share the first color. Coloring
+    /// against the color's range union costs `O(s)` probes; checking every
+    /// member pairwise (one `LiveInterval::overlaps` each) costs `O(s^2)` and
+    /// fails this bound (see `crate::scan_work`).
+    #[test]
+    fn spill_slot_coloring_cost_grows_linearly() {
+        crate::scan_work::assert_near_linear("compute_spill_slot_reuse", 128, |spills| {
+            let infos: Vec<SpillInfo> = (0..spills as u32)
+                .map(|id| SpillInfo {
+                    vreg: vreg(id),
+                    slot: StackSlotId(id),
+                })
+                .collect();
+            let intervals: BTreeMap<u32, LiveInterval> = (0..spills as u32)
+                .map(|id| (id, interval(id, &[(4 * id, 4 * id + 2)])))
+                .collect();
+            let (result, units) =
+                crate::scan_work::measure(|| compute_spill_slot_reuse(&infos, &intervals));
+            assert_eq!(result.slots_eliminated as usize, spills - 1);
+            units
+        });
     }
 
     #[test]

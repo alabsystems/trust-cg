@@ -42,9 +42,11 @@ fn load_fixture(name: &str) -> trust_ir::Module {
 /// Prepare every function of the module through the EXACT jit_fast aarch64
 /// pipeline: O1, enable_jit_fast_regalloc (LinearScan jit_latency profile).
 fn prepare_aarch64_jit_fast(module: &trust_ir::Module) -> Vec<MachFunction> {
-    let lir_functions = trust_cg_lower::translate_module_for_arch(
+    let lir_functions = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
         module,
         trust_cg_lower::GuardCarrierArch::AArch64,
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
     )
     .expect("adapter must translate the pinned IR");
 
@@ -54,12 +56,14 @@ fn prepare_aarch64_jit_fast(module: &trust_ir::Module) -> Vec<MachFunction> {
         verify_dispatch: DispatchVerifyMode::FallbackOnFailure,
         verify: false,
         cegis_superopt_budget_sec: None,
-        target_triple: String::new(),
+        target_triple: "aarch64-apple-darwin".to_string(),
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: true,
+        aarch64_force_frame_pointers: false,
         skip_cse_gvn: false,
         disabled_passes_override: None,
         contains4_scanner_batch_rewrite_override: None,
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
     });
 
     lir_functions
@@ -90,6 +94,7 @@ fn fmt_operand(op: &MachOperand) -> String {
         }
         MachOperand::Special(s) => format!("{s:?}"),
         MachOperand::Symbol(s) => format!("@{s}"),
+        MachOperand::ExactModuleSymbol(s) => format!("exact-module@{s}"),
         MachOperand::JumpTableIndex(i) => format!("jt{i}"),
         MachOperand::IncomingArg(o) => format!("inarg+{o}"),
     }
@@ -161,18 +166,22 @@ fn dump_function(func: &MachFunction) -> String {
 /// space that `select_switch_binary_search`'s next_block_id bump must clear.
 #[test]
 fn dump_aarch64_lir_blocks() {
-    let dump_dir = std::env::var("TCG_A64_DUMP_DIR").unwrap_or_else(|_| {
-        std::env::temp_dir()
-            .join("a64_scale_dump")
-            .display()
-            .to_string()
-    });
+    // Without TCG_A64_DUMP_DIR the dump goes to a directory removed when the
+    // test ends.
+    let dump_scratch = tempfile::Builder::new()
+        .prefix("a64_scale_dump-")
+        .tempdir()
+        .unwrap();
+    let dump_dir = std::env::var("TCG_A64_DUMP_DIR")
+        .unwrap_or_else(|_| dump_scratch.path().display().to_string());
     std::fs::create_dir_all(&dump_dir).unwrap();
     for fixture in ["mir_value_matches.tir", "mir_fold_binop.tir"] {
         let module = load_fixture(fixture);
-        let lir_functions = trust_cg_lower::translate_module_for_arch(
+        let lir_functions = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
             &module,
             trust_cg_lower::GuardCarrierArch::AArch64,
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
         )
         .expect("adapter");
         let mut out = String::new();
@@ -208,12 +217,14 @@ fn dump_aarch64_lir_blocks() {
 /// the dump.
 #[test]
 fn dump_aarch64_jit_fast_lowering() {
-    let dump_dir = std::env::var("TCG_A64_DUMP_DIR").unwrap_or_else(|_| {
-        std::env::temp_dir()
-            .join("a64_scale_dump")
-            .display()
-            .to_string()
-    });
+    // Without TCG_A64_DUMP_DIR the dump goes to a directory removed when the
+    // test ends.
+    let dump_scratch = tempfile::Builder::new()
+        .prefix("a64_scale_dump-")
+        .tempdir()
+        .unwrap();
+    let dump_dir = std::env::var("TCG_A64_DUMP_DIR")
+        .unwrap_or_else(|_| dump_scratch.path().display().to_string());
     std::fs::create_dir_all(&dump_dir).unwrap();
 
     for fixture in ["mir_value_matches.tir", "mir_fold_binop.tir"] {
@@ -280,9 +291,11 @@ fn pinned_irs_have_no_fused_block_segments() {
 #[test]
 fn edge_bounds_isel_limit_lifted() {
     let module = load_fixture("mir_edge_bounds.tir");
-    let lir_functions = trust_cg_lower::translate_module_for_arch(
+    let lir_functions = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
         &module,
         trust_cg_lower::GuardCarrierArch::AArch64,
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
     )
     .expect("adapter");
     let pipeline = Pipeline::new(PipelineConfig {
@@ -291,12 +304,14 @@ fn edge_bounds_isel_limit_lifted() {
         verify_dispatch: DispatchVerifyMode::FallbackOnFailure,
         verify: false,
         cegis_superopt_budget_sec: None,
-        target_triple: String::new(),
+        target_triple: "aarch64-apple-darwin".to_string(),
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: true,
+        aarch64_force_frame_pointers: false,
         skip_cse_gvn: false,
         disabled_passes_override: None,
         contains4_scanner_batch_rewrite_override: None,
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
     });
     let mut errors = Vec::new();
     for (lir_func, proof_ctx) in &lir_functions {
@@ -1436,4 +1451,13 @@ fn interp_fold_binop_matches_native_oracle() {
         failures.is_empty(),
         "aarch64 fold_binop behavioral mismatches (the A64-4 miscompile class): {failures:#?}"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its lowerings state `Permit` explicitly, so none of
+/// them passes (or is refused) because the license silently refused it.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

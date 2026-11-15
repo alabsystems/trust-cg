@@ -19,12 +19,83 @@ use trust_cg_verify::coverage_gate::{
     ALL_AARCH64_OPCODES, ALL_RISCV_OPCODES, ALL_WASM_OPCODES, ALL_X86_OPCODES, CoverageFinding,
     CoverageGate, GateArch, OpcodeClass, aarch64_deferred_value_op_reason,
     aarch64_width_polymorphic_proofs, classify_aarch64, classify_riscv, classify_wasm,
-    classify_x86, x86_width_polymorphic_proofs,
+    classify_x86, x86_deferred_value_op_reason, x86_width_polymorphic_proofs,
 };
 use trust_cg_verify::proof_database::ProofDatabase;
 
+/// The x86-64 SSE LANE credits stand on a CAPTURED corpus of emitted bytes, for
+/// the same reason `MovRI` does: the gate crate cannot run the encoder. A
+/// target that PINS the ratio those ten rows moved must not be able to stay
+/// green on a stale capture, so it re-derives the corpus from the LIVE encoder
+/// here. That placement is the whole point — while this re-derivation lived
+/// only in `x86_sse_lane_gate`, an encoder change that made these bytes wrong
+/// left every ratio-pinning target passing over frozen bytes.
+#[path = "support/sse_lane_live_encode.rs"]
+mod sse_lane_live;
+
+use sse_lane_live::assert_sse_lane_corpus_is_what_the_live_encoder_emits;
+
+/// The AArch64 decoded-value credits (register copies, SMULL, BFM, RBIT,
+/// `ADD #imm12, LSL #12`, MRS) stand on a CAPTURED corpus of encoder words for
+/// the same reason; this target pins their ratio, so it re-derives them too.
+#[path = "support/a64_value_live_encode.rs"]
+mod a64_value_live;
+
+use a64_value_live::assert_a64_value_corpus_is_what_the_live_encoder_emits;
+/// The `x86_64::MovsxdRMSib` credit stands on a CAPTURED corpus for the same
+/// reason, and the same re-derivation runs here so the ratio pin cannot go green
+/// on frozen bytes.
+#[path = "support/movsxd_sib_live_encode.rs"]
+mod movsxd_sib_live;
+
+use movsxd_sib_live::assert_movsxd_sib_corpus_is_what_the_live_encoder_emits;
+/// The wasm float credits (`f32.const`/`f64.const` payloads and the
+/// `f.min`/`f.max`/`copysign` bodies) stand on CAPTURED corpora for the same
+/// reason; this target pins the wasm ratio they moved, so it re-derives them
+/// from the live backend too.
+#[path = "support/wasm_float_live_emit.rs"]
+mod wasm_float_live;
+
+/// The wasm `memory.copy` / `memory.fill` credits stand on the captured guarded
+/// MemCopy / MemSet bodies; this target pins the ratio they moved, so it
+/// re-derives them from the live backend.
+#[path = "support/wasm_bulk_memory_live_emit.rs"]
+mod wasm_bulk_live;
+
+/// The wasm ratio excludes the v128 forms as never selected; this target pins
+/// it, so it checks the exclusion against the live backend's emission.
+#[path = "support/wasm_never_selected_live_scan.rs"]
+mod wasm_never_selected_live;
+
 /// Run `f` on a 64 MiB stack so `ProofDatabase::new()` does not overflow the
 /// default 8 MiB test-thread stack (proof_database.rs #205).
+/// Rows that fail only because this host's `drat-trim` is not one the
+/// bound-memory or atomic-memory manifest authorizes: the bound-memory and
+/// atomic rows (and the volatile rows that follow them) fail closed there as
+/// checker-identity misses, and exactly the manifests' qualification pins
+/// (`bound_memory_set_binds_the_exact_runtime_checker_bytes`,
+/// `atomic_memory_set_binds_the_exact_runtime_checker_bytes`) are red. On a
+/// qualified host there are none.
+fn checker_identity_misses(report: &trust_cg_verify::coverage_gate::CoverageReport) -> usize {
+    let misses = report
+        .rows
+        .iter()
+        .filter(|row| {
+            row.finding.is_some()
+                && row
+                    .note
+                    .contains(trust_cg_verify::bound_memory_authority::CHECKER_IDENTITY_MISS)
+        })
+        .count();
+    if trust_cg_verify::bound_memory_authority::bound_memory_checker_qualification().is_ok()
+        && trust_cg_verify::bound_memory_authority::atomic_memory_checker_qualification().is_ok()
+        && trust_cg_verify::bound_memory_authority::neon_memory_checker_qualification().is_ok()
+    {
+        assert_eq!(misses, 0, "a qualified host has no checker-identity miss");
+    }
+    misses
+}
+
 fn on_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .name("coverage-gate".to_string())
@@ -33,6 +104,40 @@ fn on_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .expect("spawn large-stack coverage-gate thread")
         .join()
         .expect("coverage-gate thread panicked")
+}
+
+/// The `x86_64::MovRI` credit stands on a CAPTURED corpus
+/// (`x86_encoding_proofs::EMITTED_X86_MOV_IMMEDIATES`), because the gate crate
+/// cannot run the encoder. A target that PINS that credit must not be able to
+/// stay green on a stale capture, so it re-derives every entry from the LIVE
+/// encoder here. `trust-cg-codegen` is a dev-dependency, which is allowed. Returns
+/// the number of entries checked.
+fn assert_movri_corpus_is_what_the_live_encoder_emits() -> usize {
+    use trust_cg_codegen::x86_64::{X86Encoder, X86InstOperands};
+    use trust_cg_ir::X86PReg;
+    use trust_cg_verify::x86_encoding_proofs::EMITTED_X86_MOV_IMMEDIATES;
+    let mut checked = 0usize;
+    for &(name, imm, captured) in EMITTED_X86_MOV_IMMEDIATES {
+        let reg = (0u16..64)
+            .map(X86PReg::new)
+            .find(|r| r.to_string() == name)
+            .unwrap_or_else(|| panic!("trust-cg-ir has no GPR named `{name}`"));
+        let mut encoder = X86Encoder::new();
+        encoder
+            .encode_instruction(X86Opcode::MovRI, &X86InstOperands::ri(reg, imm))
+            .unwrap_or_else(|e| panic!("live encoder refused MovRI {name},{imm:#x}: {e:?}"));
+        let live = encoder.finish();
+        assert_eq!(
+            live.as_slice(),
+            captured,
+            "STALE MovRI CORPUS: MOV {name},{imm:#x} is emitted as {live:02x?} by the live encoder \
+             but captured as {captured:02x?}. The x86-64 MovRI credit would rest on bytes the \
+             backend no longer emits; re-capture and re-run tests/x86_encoding_gate.rs"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 150, "MovRI corpus shrank to {checked}");
+    checked
 }
 
 /// Read the fieldless variants from an opcode enum's owning Rust source.
@@ -146,9 +251,10 @@ fn assert_inventory_matches_enum_source<T: std::fmt::Debug>(
 /// TLS-descriptor-load credit took it to 71/71, the UBFM/SBFM bitfield-
 /// extract-ENCODING credit took it to 73/73, the NEON BITWISE
 /// (AND/ORR/EOR/BIC/NOT) per-lane-intent credit brought the denominator to
-/// 78/78, and the scalar-FP gap closure (Fcmp FCMP→NZCV+CSET flag model +
-/// FmovImm VFPExpandImm encoding promoted out of the allowlist; FRINT{M,P,Z}
-/// moved to per-instruction reconstruction) took it to 81/81, and the dense-
+/// 78/78, and the historical scalar-FP rollout (Fcmp's representative
+/// FCMP→NZCV+CSET binding, since withdrawn because it lacked runtime
+/// applicability; FmovImm VFPExpandImm encoding promoted out of the allowlist;
+/// FRINT{M,P,Z} moved to per-instruction reconstruction) took it to 81/81, and the dense-
 /// `match` / fieldless-enum JUMP-TABLE dispatch credit (ADR PC-relative base +
 /// LDRSW scaled table-entry effective address) brings it to 83/83 (100%):
 ///   * +23 opcodes credited via the integer-ALU rollout: the pilot ALU
@@ -274,12 +380,75 @@ fn assert_inventory_matches_enum_source<T: std::fmt::Debug>(
 ///   model + the silicon-validated NEON-FP differential bridge. +5 covered
 ///   (+1 to the denominator: NeonFcmgtV is a NEW opcode).
 ///
-/// AArch64 accepted-obligation coverage is 156/248. The 92 RED rows are all
-/// explicit `DeferredUnfaithfulModel` findings. This ratio inventories evidence
+/// * NEON SCALAR PAIRWISE ADD (L04-P6): `NeonAddpScalar` (`ADDP Dd, Vn.2D`)
+///   left the fail-closed allowlist for the denominator and is credited by its
+///   FAITHFUL cross-lane obligation (all_neon_addp_proofs: the doubleword sum
+///   sliced from the raw D-halves against the `encode_neon_addp_scalar_2d`
+///   model, which the live silicon differential checks on this CPU;
+///   no-reduction, SUB, UMAXV-confusion, lane-miswire and `.4S`-size controls
+///   refute). +1 covered, +1 to the denominator.
+///
+/// * BOUND-MEMORY FORM CERTIFICATES (L04-P1, X-OPCODES-P1/P2): the 46
+///   single-instruction atomic rows (LDAR/STLR x3, CAS x4, SWP x4, LD<op> x32),
+///   the 18 scalar memory rows (LDR/STR/LDRB/LDRH/LDRSB/LDRSH/STRB/STRH
+///   immediate and register offset, W/X pre/post-index writeback; the H/S/D/Q
+///   forms judged by their exact word-bound memory-effect decomposition) and
+///   the six
+///   pair rows (STP/LDP signed offset, STP pre-index, LDP post-index, and the
+///   NEON Q-pair post-index STP/LDP) left the deferred table: each is
+///   credited only when EVERY legal form of the opcode
+///   has a committed form-theorem certificate that the independent checker
+///   replays in process, representative instructions credited through the
+///   Formal-only rule's clauses 2-4, and every machine defect refuted
+///   (`bound_memory_row_credit`); the six volatile rows follow their
+///   now-credited plain rows. +76 covered.
+///
+/// * CRC32 DECODED-WORD OBLIGATIONS (L04-P1): the eight FEAT_CRC32 rows
+///   (`Crc32B` .. `Crc32Cx`) left the deferred table. Each form's re-derived
+///   word, decoded independently and given its Arm ARM pseudocode (BitReverse,
+///   Poly32Mod2, BitReverse; Xd[63:32] cleared), equals the reflected
+///   LSB-first CRC intent for every register value, decided in process by
+///   GF(2)-affine evaluation (`aarch64_crc32_proofs`, `gf2_affine_decide`), and
+///   every word, width, polynomial, operand, bit- and byte-order control
+///   refutes. Testing grade: accepted regression evidence, not a formal proof.
+///   +8 covered.
+///
+/// * SUBS #imm DECODED-WORD OBLIGATION (L04-P1): `SubsRI` (the looped stack
+///   probe's `SUBS X16, X16, #1`) left the deferred table. For both widths,
+///   the destination value and N, Z, C, V of the independently decoded word
+///   (Arm `AddWithCarry(Rn, NOT(imm), 1)`) equal the operands' difference and
+///   comparison flags, each decided for every register value by the
+///   bit-serial automaton in process (`aarch64_subs_imm_proofs`), with ADDS,
+///   SUB, width, shifted-immediate, off-by-one, register and flag-meaning
+///   controls refuted. Testing grade, not a formal proof. +1 covered.
+///
+/// * NEON LD1/ST1 POST-INDEX FORM CERTIFICATES (L04-P1): `NeonLd1Post` and
+///   `NeonSt1Post` left the deferred table. Each of their seven arrangements
+///   has a form theorem (`aarch64_neon_structure_forms`: the element loop of
+///   the encoded fields against the operands' LDR/STR Dt|Qt intent, every
+///   register or memory byte and the writeback) with a committed certificate
+///   in its own set (`verdict_db/neon_memory_certs/`) that the independent
+///   checker replays in process; the gate credits a row only when every
+///   arrangement's certificate replays, representative instructions are
+///   credited through clauses 2-4 (clause 2: the exact word-bound
+///   memory-effect decomposition) and every machine defect refutes. +2
+///   covered.
+///
+/// AArch64 accepted-obligation coverage is 267/302. The 35 RED rows are exactly
+/// the 35 `DeferredUnfaithfulModel` findings; no row lacks a mapping. FCMP,
+/// CSET, CSEL, CSINC and CSNEG are credited by the NZCV producer/consumer
+/// family (`aarch64_flag_consumer_proofs`) and the four half-precision FCVT
+/// forms by decoded-word obligations (`aarch64_fcvt_half`). The five
+/// conditional trap carriers (L04-P12: `TrapNullIfZero`, `TrapDivZeroIfZero`,
+/// `TrapBoundsCheckExact`, `TrapShiftRangeIfOOB`, `TrapOverflowExact`) entered
+/// the denominator from the pseudo/trap bucket and are credited by the
+/// trap-expansion family (`aarch64_trap_expansion`), decided in process. This ratio inventories evidence
 /// acceptance for emitted value/effect opcodes; it is not a formal-correctness
 /// percentage.
 #[test]
 fn aarch64_emittable_coverage_is_honest_under_strict() {
+    // Thirteen rows below stand on captured encoder words; refuse a stale capture.
+    assert_a64_value_corpus_is_what_the_live_encoder_emits();
     let report = on_large_stack(|| CoverageGate::new().audit(GateArch::AArch64));
     // Always print the full audit so the allowlist + degenerate-backed rows stay
     // visible in CI logs (honest gate, not silently truncated).
@@ -290,312 +459,350 @@ fn aarch64_emittable_coverage_is_honest_under_strict() {
         "AArch64 audit found zero emittable opcodes — classifier is mis-wired"
     );
 
-    // HONEST NUMBERS (task #61 STRICT + #63 integer-ALU + FP/div/madd + FP-format
-    // cast + ADRP/ADD address-mode + direct-branch BRANCH26 + i128 carry-chain +
-    // TLVP + LdrGot GOT + UBFM/SBFM bitfield-extract + NEON bitwise per-lane-intent
-    // + the scalar-FP gap closure (Fcmp + FmovImm) + the dense-`match` JUMP-TABLE
-    // dispatch (Adr base + LdrswRO scaled address) + the NEON LANE-WISE COMPUTE
-    // extension + the NEON POPCOUNT-FOLD ops CntV/UaddlpV + the NEON SIGNED-ABS op
-    // AbsV + the NEON DOT-PRODUCT-ACCUMULATE op UdotV + the NEON BYTE-WINDOW
-    // EXTRACT op ExtV + the NEON SIGNED add-long-pairwise op SaddlpV + the NEON
-    // BITWISE-INSERT op BitV + the NEON FP LANE ops FaddV/FsubV/FmulV/FdivV and
-    // the NEW FP-compare op NeonFcmgtV, credited by the 30 per-lane FP
-    // LANE-PLUMBING obligations — see the honesty note above) + the scalar FUSED
-    // multiply-add FMADD (single-rounding `fp.fma` reconstruction): the prior
-    // pinned state was ALL 112 of 112 emittable opcodes genuinely covered — 64
-    // via the static DB (the prior 42 + 15 NEON lane-wise D-pair compute proofs
-    // + 2 NEON popcount-fold D-pair proofs + 1 NEON signed-abs D-pair proof + 1
-    // NEON dot-product-accumulate D-pair proof + 1 NEON byte-window extract op,
-    // credited by its 3 per-immediate D-pair proofs, + 1 NEON signed
-    // add-long-pairwise op NeonSaddlpV, credited by its 2 per-arrangement D-pair
-    // proofs with the sign-confusion SADDLP-as-UADDLP refute control, + 1 NEON
-    // bitwise insert-if-true op NeonBitV, credited by its per-byte-lane
-    // obligation with the BSL/BIT/BIF wiring-confusion refute controls) and 41
-    // via operand reconstruction (23 integer ALU + 15 FP/div/madd + 2 FP-format
-    // casts + FmovImm VFPExpandImm encoding).
+    // The denominator is every emitted AArch64 value/effect opcode. A covered
+    // row is credited by a non-degenerate accepted obligation (static-DB proof,
+    // reconstruction, or decoded-word obligation over the live encoder's words);
+    // every uncovered row is a named DeferredUnfaithfulModel RED row, and no
+    // emitted row lacks a mapping.
+    // Per-opcode ratio history: docs/archive/session-reports/2026-09-proof-gate-count-ladders.md.
     //
-    // UNIVERSE BACKFILL (112/112 -> 117/122): 28 enum variants existed OUTSIDE
-    // `ALL_AARCH64_OPCODES` — emittable-but-UNAUDITED blind spots (the classifier
-    // match is compiler-checked-total, but the AUDIT only iterates the array).
-    // Backfilling them:
-    //   * 18 exact-ordering LSE/CAS/SWP forms (A-form acquire-only, L-form
-    //     release-only, Casl/Swpa/Swpl) -> FailClosedAllowlisted with the same
-    //     AtomicOperations reason as their base/AL siblings (not in the
-    //     denominator);
-    //   * FmaxnmRR/FminnmRR (IEEE minNum/maxNum) -> +2 emittable, COVERED via
-    //     operand reconstruction (FpBinary Fmax/Fmin; the representative-inst
-    //     table previously fell through to GPR operands, silently failing to
-    //     reconstruct — fixed alongside the backfill);
-    //   * FrintmRR/FrintpRR/FrintzRR -> +3 emittable, COVERED via the unary-FP
-    //     operand reconstruction (floor/ceil/trunc rounding directions refute);
-    //   * NeonFmlaV/NeonFmlsV/NeonScvtfV/NeonUcvtfV/NeonDupScalarD -> +5
-    //     emittable, NOW COVERED: their FAITHFUL per-lane obligations landed
-    //     (`all_neon_fpred_proofs`, both `.2D` lanes per op, real-solver
-    //     discharged with wrong-encoding refute controls), moving them from the
-    //     honest `DeferredUnfaithfulModel` deferral to covered and emptying the
-    //     deferral table — exactly the handoff the universe backfill documented.
-    // 122/122 -> 124/124 (two independent landings): (a) UMOV EXTRACT —
-    // NeonUmovGen moved from FailClosedAllowlisted (out of the denominator) to
-    // EmittableNeedsProof, NOW COVERED via its FAITHFUL per-(size,lane) matrix
-    // (all_neon_umov_proofs — 30 obligations: `.16B` 16 lanes + `.8H` 8 + `.4S`
-    // 4 + `.2D` 2, real-solver discharged with wrong-lane / wrong-size refute
-    // controls); (b) TLS GOT-TPREL — LdrGottprel moved to EmittableNeedsProof,
-    // COVERED via aarch64_elf_tls_reloc_proofs (also +1 to the universe). Each
-    // is +1 emittable AND +1 covered — the gate stays covered == emittable,
-    // fully clean.
-    // 124/124 -> 126/126 (one landing, TWO opcodes): FCVTL/FCVTL2 — the vector
-    // `f32 -> f64` widening convert (NeonFcvtlV / NeonFcvtl2V) emitted by the FP
-    // array-reduction vectorizer (neon_farray) for the widening dot. Both moved
-    // to EmittableNeedsProof and are COVERED via their FAITHFUL per-lane
-    // obligations (all_neon_fcvtl_proofs — 4: {FCVTL low half, FCVTL2 high half}
-    // x `.2D` 2 lanes, real-solver discharged with wrong-half / wrong-lane refute
-    // controls). Widening `f32 -> f64` is EXACT (fpext, no rounding). Each is +1
-    // emittable AND +1 covered — the gate stays covered == emittable, fully clean.
-    // 126/126 -> 127/127 (EorRRShift): the EOR with a ROR-shifted second source
-    // (EOR Rd, Rn, Rm, ROR #k) emitted by the rotate-fusion peephole
-    // (eor_rotate_fuse) for the ARX `x ^= ROTL(v, r)` idiom. Moved to
-    // EmittableNeedsProof and COVERED via its FAITHFUL rotate-XOR obligations
-    // (all_eor_ror_shift_proofs — the SOURCE is the frontend ROTL-XOR idiom, the
-    // MACHINE is the shifted-register EOR-ROR model, structurally distinct /
-    // provably equal; wrong-amount / wrong-shift-kind / operand-swap refute
-    // controls; both W and X forms bound via aarch64_width_polymorphic_proofs).
-    // +1 emittable AND +1 covered — the gate stays covered == emittable, clean.
-    // 127/127 -> 128/128 (FcselRR): the scalar FP conditional select (FCSEL
-    // Sd/Dd,Sn,Sm,cc) emitted by the FP-`Select` isel path (CMP cond,#0 + FCSEL)
-    // in place of the FMOV(FPR->GPR)x2 + CSEL + FMOV(GPR->FPR) cross-bank route.
-    // Moved to EmittableNeedsProof and COVERED via its FAITHFUL bit-preserving-mux
-    // obligations (all_fcsel_proofs — the SOURCE is `ite(trust_ir icmp(cond,sel,0),
-    // a, b)` over RAW FPR bits, the MACHINE is `ite(eval_condition(from_intcc(cond),
-    // CMP(sel,0)), a, b)`, structurally distinct / provably equal; inverted-cond /
-    // operand-swap refute controls; both S and D forms bound via
-    // aarch64_width_polymorphic_proofs). +1 emittable AND +1 covered — the gate
-    // stays covered == emittable, clean.
-    // 128/128 -> 129/129 (NeonFmlaLaneV): the NEON FP fused multiply-accumulate
-    // BY ELEMENT (FMLA Vd.T, Vn.T, Vm.Ts[lane]) emitted by the elementwise-FP
-    // vectorizer (neon_fmap) for `y[i] += da*x[i]` — the scalar invariant `da`
-    // kept in a vector lane and broadcast as the multiplier (no DUP), clang's
-    // daxpy shape. Moved to EmittableNeedsProof and COVERED via its FAITHFUL
-    // per-(arrangement, dest lane, selector) obligations (all_neon_fmla_lane_proofs
-    // — {.4S selector 0..3 x dest 0..3 = 16} + {.2D selector 0..1 x dest 0..1 = 4}
-    // = 20; the SOURCE slices Vn[dest]/Vm[selector]/Vd[dest] from the raw D-halves
-    // and applies the SINGLE-rounding fp.fma, the MACHINE is the real
-    // encode_neon_fmla_lane over the reassembled register, structurally distinct /
-    // provably equal; wrong-lane-selector / FMLA<->FMLS polarity / accumulator-
-    // miswire refute controls; both .4S and .2D forms bound via
-    // aarch64_width_polymorphic_proofs). +1 emittable AND +1 covered — the gate
-    // stays covered == emittable, clean.
-    // 129/129 -> 131/131 (AddRRShift, SubRRShift): ADD/SUB with an LSL-shifted
-    // second source (ADD/SUB Rd, Rn, Rm, LSL #k) emitted by the shift-ALU fusion
-    // peephole (shift_alu_fuse) for an explicit `y + (x<<k)` / `y - (x<<k)` and
-    // the mul-by-constant strength reduction (LslRI + AddRR). Each moved to
-    // EmittableNeedsProof and COVERED via its FAITHFUL ring obligations
-    // (all_add_sub_lsl_shift_proofs — the SOURCE is `base +/- src*2^k` (bvmul),
-    // the MACHINE is `base +/- (src<<k)` (bvshl), structurally distinct / provably
-    // equal — the bvmul-vs-bvshl shape of proof_ldrsw_ro_scaled_addr; wrong-amount
-    // / ADD-vs-SUB / SUB operand-swap refute controls; both W and X forms bound
-    // via aarch64_width_polymorphic_proofs). +2 emittable AND +2 covered — the
-    // gate stays covered == emittable, clean.
-    // 131/131 -> 135/135 (NeonSmlalV/NeonSmlal2V/NeonUmlalV/NeonUmlal2V): the NEON
-    // widening multiply-accumulate-long (SMLAL/SMLAL2/UMLAL/UMLAL2 .4S -> .2D) the
-    // neon_array widening-dot vectorizer emits for `s(i64) += ext(a_i32[i]) *
-    // ext(b_i32[i])`. Each moved to EmittableNeedsProof and COVERED via its FAITHFUL
-    // D-pair accumulate obligation (all_neon_smlal_proofs — SOURCE `acc_j +
-    // EXT64(n_s)*EXT64(m_s)` from raw D-halves, MACHINE encode_neon_smlal over the
-    // reassembled register, structurally distinct; sign-confusion / no-accumulate /
-    // wrong-half / truncating-mul refute controls). +4 emittable AND +4 covered —
-    // the gate stays covered == emittable, clean.
-    // 135/135 -> 137/137 (NeonUaddwV/NeonUaddw2V): the NEON widening add-wide
-    // (UADDW/UADDW2 .4S -> .2D) the neon_array widening abs-sum vectorizer
-    // (TRACK D) emits for `s(i64) += zext64(abs_bits(a_i32[i] [+ inv]))`,
-    // replacing the UMLAL-by-ones MAC (per lane `acc_j + zext64(u_s)` ==
-    // `acc_j + zext64(u_s)*1`). Each moved to EmittableNeedsProof and COVERED via
-    // its FAITHFUL D-pair obligation (all_neon_uaddw_proofs — SOURCE `addend_j +
-    // zext64(m_s)` from raw D-halves, MACHINE encode_neon_uaddw over the
-    // reassembled register, structurally distinct; sign-confusion / no-addend /
-    // wrong-half / truncating-add refute controls). +2 emittable AND +2 covered —
-    // the gate stays covered == emittable, clean.
-    // 137/137 -> 139/139 (NeonSaddwV/NeonSaddw2V): the NEON SIGNED widening
-    // add-wide (SADDW/SADDW2 .4S -> .2D) the neon_predsum widening i64-acc
-    // condsum emits for `s(i64) += (a_i32[iv] as i64) [if pred]`, replacing the
-    // SMLAL-by-ones MAC (per lane `acc_j + sext64(masked_s)` ==
-    // `acc_j + sext64(masked_s)*sext64(1)`). Each moved to EmittableNeedsProof
-    // and COVERED via its FAITHFUL D-pair obligation (all_neon_saddw_proofs —
-    // SOURCE `addend_j + sext64(m_s)` from raw D-halves, MACHINE
-    // encode_neon_saddw over the reassembled register, structurally distinct;
-    // zext-confusion [SADDW-as-UADDW] / no-addend / wrong-half / truncating-add
-    // refute controls). +2 emittable AND +2 covered — the gate stays
-    // covered == emittable, clean.
-    // 139/139 -> 140/140 (AddRRShiftLsr): ADD with an LSR-shifted second source
-    // (ADD Rd, Rn, Rm, LSR #k) emitted by the shift-ALU fusion peephole
-    // (shift_alu_fuse) for the srem/sdiv-by-constant magic sign-bit correction
-    // (`lsr t, x, #31; add r, r, t`) and the udiv magic add-back. Moved to
-    // EmittableNeedsProof and COVERED via its FAITHFUL obligations
-    // (all_add_lsr_shift_proofs — the SOURCE is `base + src/2^k` (bvudiv), the
-    // MACHINE is `base + (src>>u k)` (bvlshr), structurally distinct / provably
-    // equal — the LSR analogue of the bvmul-vs-bvshl ring shape; wrong-amount /
-    // ASR-not-LSR / LSL-not-LSR / SUB-not-ADD refute controls; both W and X forms
-    // bound via aarch64_width_polymorphic_proofs). +1 emittable AND +1 covered —
-    // the gate stays covered == emittable, clean.
-    // The shifted-source EOR fusion adds EorRRLsl/EorRRLsr to the publication
-    // inventory. Both are reconstructed from their real opcode, register width,
-    // operands, and shift amount; the AY suite refutes wrong shift kinds and
-    // amounts. +2 emittable AND +2 covered. Complete packed-NZCV TST authority
-    // later moves one existing row from deferred to covered; combined with the
-    // independent UMULL and standalone-RorRI discharges below, this leaves 90
-    // named RED rows before the StrbRO/StrhRO universe backfill.
-    // 140/140 -> 141/141 (NeonRev64V): the NEON 32-bit pair swap (REV64 Vd.4S)
-    // the AoS complex-butterfly vectorizer (neon_butterfly) emits to swap each
-    // {rp, ip} pair in-register before the twiddle multiply. Moved from the
-    // fail-closed permute allowlist to EmittableNeedsProof and COVERED via its
-    // FAITHFUL D-pair obligation (proof_neon_rev64v_4s -- the SOURCE selects each
-    // output lane from the raw D-halves at the swapped index j^1, the MACHINE is
-    // the real encode_neon_rev64_4s whole-register shift/mask form; identity /
-    // doubleword-swap / half-lane-smear refute controls). +1 emittable AND +1
-    // covered -- the gate stays covered == emittable, clean.
-    // 141/141 -> 143/143 (NeonMlaV + NeonUadalpV): the NEON vector
-    // multiply-accumulate (MLA.4S — the neon_predsum MLA-by-mask condsum
-    // accumulate for the Gpr32 masked-add, replacing AND + ADD.4S with one op;
-    // the accumulators hold the NEGATED sum, folded by one wrapping SubRR)
-    // and the NEON pairwise widening accumulate (UADALP .4S -> .2D — the
-    // neon_array TRACK D abs-sum accumulate, replacing the UADDW/UADDW2 pair;
-    // adjacent-pair grouping is a pure mod-2^64 reassociation under the
-    // both-lanes drain). Each moved to EmittableNeedsProof and COVERED via
-    // its FAITHFUL D-pair obligation (all_neon_mla_proofs — SOURCE
-    // `acc_i + n_i*m_i` mod 2^32 from raw D-halves, MACHINE encode_neon_mla;
-    // MLS-confusion / MUL-no-accumulate / lane-swap refute controls;
-    // all_neon_uadalp_proofs — SOURCE `acc_j + zext64(n_2j) + zext64(n_2j+1)`
-    // from raw D-halves, MACHINE encode_neon_uadalp; SADALP-sign-confusion /
-    // UADDLP-no-accumulate / wrong-pairing refute controls). +2 emittable AND
-    // +2 covered — the gate stays covered == emittable, clean.
-    // 143/143 -> 144 covered of 144 at that stage (NeonRbitV): the NEON
-    // per-byte 8-bit reverse (RBIT
-    // Vd.16B) the neon-bitrev vectorizer emits for `out[i] = a[i].reverse_bits()`
-    // over a `[u8; N]` — the EXACT instruction LLVM -O3 emits for that loop
-    // (k4_bitrev). Moved from the fail-closed permute allowlist to
-    // EmittableNeedsProof and COVERED via its FAITHFUL D-pair obligation
-    // (proof_neon_rbitv_16b -- the SOURCE selects every output bit from the raw
-    // D-halves at the mirrored within-byte index 8k+7-p, the MACHINE is the real
-    // encode_neon_rbit_16b within-byte SWAR shift/mask form; identity /
-    // byte-swap [REV16.8B] / 16-bit-lane-reverse [wrong-width] refute controls).
-    // +1 emittable AND +1 covered -- the gate stays covered == emittable, clean.
-    //
-    // 153/246 -> 154/246 (Umull): the 32->64 UNSIGNED widening multiply (UMULL
-    // Xd, Wn, Wm — the UMADDL-with-XZR alias, emitted by the W32 magic-division
-    // isel path). UMULL has EXACTLY ONE legal form (sf=1 hardwired, W sources,
-    // X destination), so the opcode-level binding is faithful. Left the
-    // deferred RED table and became COVERED via its FAITHFUL widening
-    // obligation (lowering_proof::proof_umull_rr — SOURCE the Concat-zext ring
-    // form `concat(0,a)*concat(0,b)`, MACHINE the encoder-faithful
-    // `0 + ZeroExtend(a)*ZeroExtend(b)`, structurally distinct / provably equal
-    // over BV64; the SMULL sext confusion — exactly what separates UMULL from
-    // SMULL — and the truncating-MUL confusion REFUTE, umull_wrong_controls).
-    // SMULL deliberately stays a named RED row: the signed sibling must not
-    // inherit the unsigned zext proof. +1 covered, denominator unchanged;
-    // 93 -> 92 named RED rows. The complete packed-NZCV TST W/X pair then
-    // removes one more RED row, yielding 155/246 with 91 RED rows at that stage.
-    // RorRI — now emitted STANDALONE by the rotate recognizer when the EOR does
-    // not fuse — then left the deferred set with its faithful W+X rotate
-    // obligations (all_ror_immediate_proofs; wrong-amount / ROR-vs-LSR /
-    // rotate-direction refute controls), giving 156/246 with 90 RED rows.
-    // StrbRO and StrhRO subsequently entered the audited universe as emitted
-    // register-offset stores. Both fail closed pending a faithful memory-effect
-    // model, so the current inventory is 156/248 with 92 named RED rows.
     // RorRI's credit is DOUBLY sourced and both sources must stay wired: the
     // width-complete W+X registered rotate obligations AND the width- and
     // immediate-sensitive per-instruction EXTR-alias reconstruction — exactly
     // the two disjuncts its old deferred reason named as missing. The ordering
     // of the last two moves is immaterial: taking StrbRO/StrhRO first gives
     // 155/248 with 93 RED rows, and RorRI's discharge then lands on the same
-    // 156/248 inventory with 92 named RED rows.
+    // 156/248 inventory with 92 named RED rows (the checked-i128 Adcs/Sbcs
+    // rows then entered covered: 158/250 with the same 92 RED).
     //
     // PUBLICATION HONESTY: the emitted value/effect denominator includes the 94
     // forms previously hidden in the historical fail-closed/covered-elsewhere
     // bucket (memory effects, atomics, value copies/selects/conversions, and
     // emitted NEON permute/reduce/memory forms). Existing non-degenerate accepted
     // obligations still earn evidence credit; every unfaithfully modeled form is
-    // a named DeferredUnfaithfulModel RED row. This is accepted-obligation
+    // a named DeferredUnfaithfulModel RED row. No emitted row lacks a mapping.
+    // This is accepted-obligation
     // evidence coverage, not a formal-correctness percentage.
     assert_eq!(
         report.emittable_count(),
-        248,
+        302,
         "AArch64 emitted value/effect denominator changed; update the pin deliberately"
     );
+    // On a host whose checker a certificate manifest does not authorize, the
+    // bound-memory and atomic rows fail closed (`checker_identity_misses`).
+    let misses = checker_identity_misses(&report);
     assert_eq!(
-        report.covered_count(),
-        156,
+        report.covered_count() + misses,
+        267,
         "AArch64 accepted-obligation count changed; do not re-admit X==X identities or hide \
          emitted value/effect debt outside the denominator:\n{}",
         report.audit_log()
     );
-    assert!(
-        (report.coverage_percent() - (156.0 / 248.0 * 100.0)).abs() < f64::EPSILON,
-        "AArch64 accepted-obligation ratio drifted from the honest 156/248"
-    );
+    if misses == 0 {
+        assert!(
+            (report.coverage_percent() - (267.0 / 302.0 * 100.0)).abs() < f64::EPSILON,
+            "AArch64 accepted-obligation ratio drifted from the honest 267/302"
+        );
+    }
 
-    // All 92 uncovered rows must be explicitly named model debt. A generic
-    // mapping/discharge failure is a new wiring regression, while moving a row
-    // back to the exclusion bucket is denominator shrinkage.
+    // The 35-row table: FRINTN, the 29 LL/SC rows,
+    // the two TLSLE TPREL adds and the three TLSDESC slots. Any missing
+    // mapping or other finding class is a new regression; exclusion would
+    // shrink the denominator.
     assert!(
         !report.is_clean(),
         "AArch64 must honestly retain the pinned emitted value/effect model gaps"
     );
-    let failures = report.failures();
+    let failures: Vec<_> = report
+        .failures()
+        .into_iter()
+        .filter(|row| {
+            !row.note
+                .contains(trust_cg_verify::bound_memory_authority::CHECKER_IDENTITY_MISS)
+        })
+        .collect();
     assert_eq!(
         failures.len(),
-        92,
-        "AArch64 must have exactly the 92 pinned deferred rows:\n{}",
+        35,
+        "AArch64 must have exactly the 35 deferred rows:\n{}",
         report.failure_summary()
     );
-    assert!(
-        failures.iter().all(|row| matches!(
-            &row.finding,
-            Some(CoverageFinding::DeferredUnfaithfulModel { .. })
-        )),
-        "every AArch64 RED row must be a known DeferredUnfaithfulModel, not a generic wiring gap:\n{}",
-        report.failure_summary()
-    );
-    let expected_red: std::collections::HashSet<_> = ALL_AARCH64_OPCODES
+    let actual_unmapped: Vec<_> = failures
         .iter()
-        .copied()
-        .filter(|&op| aarch64_deferred_value_op_reason(op).is_some())
-        .map(|op| format!("AArch64::{op:?}"))
-        .collect();
-    let actual_red: std::collections::HashSet<_> = failures
-        .iter()
+        .filter(|row| matches!(row.finding, Some(CoverageFinding::NoProofMapping)))
         .map(|row| row.opcode_display.clone())
         .collect();
-    assert_eq!(
-        actual_red, expected_red,
-        "AArch64 RED rows must be exactly the named deferred debt table; unknown drift fails"
+    assert!(
+        actual_unmapped.is_empty(),
+        "no AArch64 row may be NoProofMapping: {actual_unmapped:?}"
     );
-
-    // The six volatile forms added after the original 93-row publication audit
-    // are emitted effects, not structural exclusions. Their byte-identical plain
-    // load/store encoding does not establish the volatile observation/ordering
-    // boundary, so all six must be explicit deferred RED denominator rows.
     for op in [
-        AArch64Opcode::VolatileLdrRI,
-        AArch64Opcode::VolatileLdrbRI,
-        AArch64Opcode::VolatileLdrhRI,
-        AArch64Opcode::VolatileStrRI,
-        AArch64Opcode::VolatileStrbRI,
-        AArch64Opcode::VolatileStrhRI,
+        AArch64Opcode::Fcmp,
+        AArch64Opcode::CSet,
+        AArch64Opcode::Csel,
+        AArch64Opcode::Csinc,
+        AArch64Opcode::Csneg,
     ] {
-        assert!(
-            matches!(classify_aarch64(op), OpcodeClass::EmittableNeedsProof),
-            "AArch64::{op:?} must stay in the emitted value/effect denominator"
-        );
         let row = report
             .rows
             .iter()
             .find(|row| row.opcode_display == format!("AArch64::{op:?}"))
             .unwrap_or_else(|| panic!("AArch64::{op:?} missing from audit universe"));
+        assert!(row.finding.is_none(), "{row:?}");
         assert!(
+            row.note.contains("NZCV PRODUCER/CONSUMER") && row.note.contains("NOT a formal proof"),
+            "AArch64::{op:?} must be credited by the flag-consumer family: {}",
+            row.note
+        );
+        assert!(aarch64_deferred_value_op_reason(op).is_none());
+    }
+    for op in trust_cg_verify::aarch64_crc32_proofs::CRC32_OPCODES {
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.opcode_display == format!("AArch64::{op:?}"))
+            .unwrap_or_else(|| panic!("AArch64::{op:?} missing from audit universe"));
+        assert!(row.finding.is_none(), "{row:?}");
+        assert!(
+            row.note.contains("CRC32 DECODED-WORD") && row.note.contains("NOT a formal proof"),
+            "AArch64::{op:?} must be credited by the CRC32 family: {}",
+            row.note
+        );
+        assert!(aarch64_deferred_value_op_reason(op).is_none());
+        assert!(
+            trust_cg_verify::FunctionVerifier::opcode_to_proof_query(op).is_none(),
+            "AArch64::{op:?} must not be credited opcode-wide"
+        );
+    }
+    let expected_deferred: std::collections::HashSet<_> = ALL_AARCH64_OPCODES
+        .iter()
+        .copied()
+        .filter(|&op| aarch64_deferred_value_op_reason(op).is_some())
+        .map(|op| format!("AArch64::{op:?}"))
+        .collect();
+    assert_eq!(
+        expected_deferred.len(),
+        35,
+        "the deferred table must retain the three TLSDESC slots, the 29 LL/SC atomic rows, \
+         the two TLSLE TPREL adds and FRINTN"
+    );
+    // The TLSLE TPREL adds: counted, RED, and bound to nothing in the
+    // function verifier (no opcode-wide query).
+    for op in [AArch64Opcode::AddTprelHi12, AArch64Opcode::AddTprelLo12] {
+        assert!(matches!(
+            classify_aarch64(op),
+            OpcodeClass::EmittableNeedsProof
+        ));
+        let reason = aarch64_deferred_value_op_reason(op)
+            .unwrap_or_else(|| panic!("AArch64::{op:?} must be a named deferred row"));
+        assert!(
+            reason.contains("TPREL") && reason.contains("ENC-5"),
+            "{reason}"
+        );
+        assert!(
+            trust_cg_verify::FunctionVerifier::opcode_to_proof_query(op).is_none(),
+            "AArch64::{op:?} must not be credited opcode-wide"
+        );
+    }
+    let actual_deferred: std::collections::HashSet<_> = failures
+        .iter()
+        .filter(|row| {
             matches!(
                 row.finding,
                 Some(CoverageFinding::DeferredUnfaithfulModel { .. })
-            ),
-            "AArch64::{op:?} must be explicit volatile-boundary RED debt: {row:?}"
+            )
+        })
+        .map(|row| row.opcode_display.clone())
+        .collect();
+    assert_eq!(
+        actual_deferred, expected_deferred,
+        "AArch64 deferred rows must be exactly the unchanged named debt table"
+    );
+    assert!(
+        failures.iter().all(|row| matches!(
+            row.finding,
+            Some(CoverageFinding::DeferredUnfaithfulModel { .. } | CoverageFinding::NoProofMapping)
+        )),
+        "an unrecognized AArch64 finding class is a regression:\n{}",
+        report.failure_summary()
+    );
+
+    // The LL/SC pseudos appear in every pre-allocation stream the function
+    // verifier sees and the exclusives/CLREX are emitted by their post-RA
+    // expansion: all 29 are named RED denominator rows, never exclusions.
+    for op in [
+        AArch64Opcode::Ldaxr,
+        AArch64Opcode::Stlxr,
+        AArch64Opcode::Ldxr,
+        AArch64Opcode::Ldxrb,
+        AArch64Opcode::Ldxrh,
+        AArch64Opcode::Ldaxrb,
+        AArch64Opcode::Ldaxrh,
+        AArch64Opcode::Stxr,
+        AArch64Opcode::Stxrb,
+        AArch64Opcode::Stxrh,
+        AArch64Opcode::Stlxrb,
+        AArch64Opcode::Stlxrh,
+        AArch64Opcode::Clrex,
+        AArch64Opcode::LlscRmw8,
+        AArch64Opcode::LlscRmw16,
+        AArch64Opcode::LlscRmw32,
+        AArch64Opcode::LlscRmw64,
+        AArch64Opcode::LlscCmpSwap8,
+        AArch64Opcode::LlscCmpSwap16,
+        AArch64Opcode::LlscCmpSwap32,
+        AArch64Opcode::LlscCmpSwap64,
+        AArch64Opcode::Ldxp,
+        AArch64Opcode::Ldaxp,
+        AArch64Opcode::Stxp,
+        AArch64Opcode::Stlxp,
+        AArch64Opcode::LlscLoad128,
+        AArch64Opcode::LlscStore128,
+        AArch64Opcode::LlscRmw128,
+        AArch64Opcode::LlscCmpSwap128,
+    ] {
+        assert!(
+            matches!(classify_aarch64(op), OpcodeClass::EmittableNeedsProof),
+            "AArch64::{op:?} must stay in the emitted value/effect denominator"
+        );
+        assert!(
+            aarch64_deferred_value_op_reason(op).is_some(),
+            "AArch64::{op:?} must be named LL/SC RED debt"
+        );
+    }
+
+    // The six volatile forms added after the original 93-row publication audit
+    // are emitted effects, not structural exclusions. Their preservation facet
+    // (X-OPCODES-P6: every path's volatile accesses kept in order, decided per
+    // compile) holds, and each is covered with its credited plain row
+    // (`aarch64_volatile_rows_need_both_facets`).
+    for op in [
+        AArch64Opcode::VolatileLdrRI,
+        AArch64Opcode::VolatileStrRI,
+        AArch64Opcode::VolatileLdrbRI,
+        AArch64Opcode::VolatileLdrhRI,
+        AArch64Opcode::VolatileStrbRI,
+        AArch64Opcode::VolatileStrhRI,
+    ] {
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.opcode_display == format!("AArch64::{op:?}"))
+            .unwrap_or_else(|| panic!("AArch64::{op:?} missing from audit universe"));
+        assert!(aarch64_deferred_value_op_reason(op).is_none());
+        if misses > 0 && row.finding.is_some() {
+            assert!(
+                row.note
+                    .contains(trust_cg_verify::bound_memory_authority::CHECKER_IDENTITY_MISS),
+                "{row:?}"
+            );
+            continue;
+        }
+        assert!(row.finding.is_none(), "{row:?}");
+        assert!(
+            row.note.starts_with("VOLATILE")
+                && row.note.contains("BOUND-MEMORY FORM CERTIFICATES")
+                && row.note.contains("volatile access preservation"),
+            "AArch64::{op:?} must be covered by both facets: {}",
+            row.note
+        );
+    }
+
+    // The bound-memory rows: every atomic opcode, every scalar memory opcode,
+    // every pair opcode and the two NEON LD1/ST1 post-index opcodes are
+    // covered by their per-form certificates, and nothing else is.
+    let bound: Vec<_> = report
+        .rows
+        .iter()
+        .filter(|row| row.note.starts_with("BOUND-MEMORY FORM CERTIFICATES"))
+        .map(|row| row.opcode_display.clone())
+        .collect();
+    let missed_bound = report
+        .rows
+        .iter()
+        .filter(|row| {
+            row.finding.is_some()
+                && row.note.starts_with("bound_memory_row_credit::")
+                && row
+                    .note
+                    .contains(trust_cg_verify::bound_memory_authority::CHECKER_IDENTITY_MISS)
+        })
+        .count();
+    assert_eq!(bound.len() + missed_bound, 46 + 18 + 6 + 2, "{bound:?}");
+    for op in trust_cg_verify::aarch64_atomic_forms::ATOMIC_MEMORY_OPCODES {
+        assert!(
+            misses > 0 || bound.contains(&format!("AArch64::{op:?}")),
+            "{op:?}"
+        );
+        assert!(aarch64_deferred_value_op_reason(op).is_none());
+    }
+}
+
+/// Ledger `L04-P3`: every emitted scalar FP conversion, rounding and
+/// arithmetic row carries the named IEEE 754 testing evidence in its note and
+/// no other row does. The annotation is a pure note append, so it credits
+/// nothing: FRINTN stays RED, every other row keeps whatever its own
+/// obligation decided, and the accepted count pinned above is unchanged.
+#[test]
+fn scalar_fp_rows_carry_named_ieee_evidence_without_credit() {
+    use trust_cg_verify::coverage_gate::{OpcodeAuditRow, with_named_fp_ieee_evidence};
+    use trust_cg_verify::fp_ieee_evidence;
+    const MARK: &str = "L04-P3 named TESTING evidence, NOT credit";
+    let named = fp_ieee_evidence::opcodes();
+    assert_eq!(named.len(), 24);
+    let report = on_large_stack(|| CoverageGate::new().audit(GateArch::AArch64));
+    for row in &report.rows {
+        let is_named = named
+            .iter()
+            .any(|op| row.opcode_display == format!("AArch64::{op:?}"));
+        assert_eq!(
+            row.note.contains(MARK),
+            is_named,
+            "{}: {}",
+            row.opcode_display,
+            row.note
+        );
+        if is_named {
+            assert_eq!(
+                row.class,
+                OpcodeClass::EmittableNeedsProof,
+                "{}",
+                row.opcode_display
+            );
+        }
+    }
+    let frintn = report
+        .rows
+        .iter()
+        .find(|row| row.opcode_display == "AArch64::FrintnRR")
+        .expect("FRINTN row");
+    assert!(
+        matches!(
+            frintn.finding,
+            Some(CoverageFinding::DeferredUnfaithfulModel { .. })
+        ),
+        "FRINTN must stay named RED debt: {frintn:?}"
+    );
+    for finding in [None, Some(CoverageFinding::NoProofMapping)] {
+        let row = OpcodeAuditRow {
+            opcode_display: "AArch64::FaddRR".into(),
+            class: OpcodeClass::EmittableNeedsProof,
+            finding,
+            note: "own obligation".into(),
+        };
+        let annotated = with_named_fp_ieee_evidence(AArch64Opcode::FaddRR, row.clone());
+        assert_eq!(
+            (&annotated.class, &annotated.finding),
+            (&row.class, &row.finding)
+        );
+        assert!(
+            annotated.note.starts_with("own obligation; L04-P3"),
+            "{}",
+            annotated.note
+        );
+        assert_eq!(
+            with_named_fp_ieee_evidence(AArch64Opcode::AddRR, row.clone()),
+            row
         );
     }
 }
@@ -643,6 +850,780 @@ fn aarch64_ror_immediate_is_covered_by_complete_width_pair() {
         aarch64_deferred_value_op_reason(AArch64Opcode::RorRI).is_none(),
         "RorRI is credited via all_ror_immediate_proofs and must not stay deferred"
     );
+}
+
+/// X-OPCODES-P10: MOVK and MOVN are polymorphic over (width, halfword shift).
+/// Their per-form obligations were already bound per instruction, but the gate
+/// had no mechanism to demand all of them, so both rows sat in the deferred
+/// table. The form-polymorphic gate must name EXACTLY the architecturally legal
+/// forms, each with the query the function verifier binds for that form, and
+/// every form's proof must be non-degenerate and discharge. The illegal W-form
+/// `#32`/`#48` shifts must bind nothing, and an incomplete, duplicated,
+/// illegal-form or mis-queried table must turn the row RED.
+#[test]
+fn aarch64_move_wide_rows_require_every_legal_form() {
+    use trust_cg_ir::{MachInst, MachOperand, RegClass, VReg};
+    use trust_cg_verify::FunctionVerifier;
+    use trust_cg_verify::const_materialize_proofs::{
+        MOVK_HALFWORD_FORMS, MOVN_FORMS, movk_halfword_query, movn_halfword_query,
+    };
+    use trust_cg_verify::coverage_gate::{
+        AARCH64_MOVE_WIDE_LEGAL_FORMS, FormProof, aarch64_form_polymorphic_proofs,
+    };
+    use trust_cg_verify::proof_database::ProofCategory;
+
+    let mut legal: Vec<(u32, u32)> = AARCH64_MOVE_WIDE_LEGAL_FORMS.to_vec();
+    legal.sort_unstable();
+    for (opcode, query_of, proof_forms) in [
+        (
+            AArch64Opcode::Movk,
+            movk_halfword_query as fn(u32, u32) -> Option<&'static str>,
+            MOVK_HALFWORD_FORMS,
+        ),
+        (AArch64Opcode::Movn, movn_halfword_query, MOVN_FORMS),
+    ] {
+        let forms = aarch64_form_polymorphic_proofs(opcode)
+            .unwrap_or_else(|| panic!("{opcode:?} must be form-polymorphic gated"));
+        let mut named: Vec<(u32, u32)> = forms.iter().map(|f| (f.width_bits, f.shift)).collect();
+        named.sort_unstable();
+        assert_eq!(named, legal, "{opcode:?} must name exactly the legal forms");
+        let mut registered = proof_forms.to_vec();
+        registered.sort_unstable();
+        assert_eq!(
+            registered, legal,
+            "{opcode:?} registers exactly one obligation per legal form"
+        );
+        assert!(
+            aarch64_width_polymorphic_proofs(opcode).is_none(),
+            "{opcode:?} must not also be width-gated"
+        );
+        assert!(aarch64_deferred_value_op_reason(opcode).is_none());
+        assert!(FunctionVerifier::opcode_to_proof_query(opcode).is_none());
+        for form in forms {
+            assert_eq!(form.category, ProofCategory::ConstantMaterialization);
+            assert_eq!(
+                Some(form.query),
+                query_of(form.width_bits, form.shift),
+                "{opcode:?} gate query drifted from the per-form query"
+            );
+            let class = if form.width_bits == 32 {
+                RegClass::Gpr32
+            } else {
+                RegClass::Gpr64
+            };
+            let inst = MachInst::new(
+                opcode,
+                vec![
+                    MachOperand::VReg(VReg::new(0, class)),
+                    MachOperand::Imm(0x1234),
+                    MachOperand::Imm(i64::from(form.shift)),
+                ],
+            );
+            assert_eq!(
+                FunctionVerifier::inst_to_proof_query(&inst),
+                Some((form.query, ProofCategory::ConstantMaterialization)),
+                "{opcode:?} (w{}, lsl #{}) must bind exactly the gated obligation",
+                form.width_bits,
+                form.shift
+            );
+        }
+        for shift in [32, 48] {
+            let illegal = MachInst::new(
+                opcode,
+                vec![
+                    MachOperand::VReg(VReg::new(0, RegClass::Gpr32)),
+                    MachOperand::Imm(0x1234),
+                    MachOperand::Imm(shift),
+                ],
+            );
+            assert_eq!(FunctionVerifier::inst_to_proof_query(&illegal), None);
+            assert_eq!(query_of(32, shift as u32), None);
+        }
+    }
+
+    let (report, broken_rows) = on_large_stack(|| {
+        let gate = CoverageGate::new();
+        let report = gate.audit(GateArch::AArch64);
+        let movk = aarch64_form_polymorphic_proofs(AArch64Opcode::Movk).unwrap();
+        let movn = aarch64_form_polymorphic_proofs(AArch64Opcode::Movn).unwrap();
+        let missing: Vec<FormProof> = movk[..movk.len() - 1].to_vec();
+        let mut duplicated = movk.to_vec();
+        duplicated.push(movk[0]);
+        let mut illegal = movk.to_vec();
+        illegal.push(FormProof {
+            shift: 32,
+            width_bits: 32,
+            ..movk[4]
+        });
+        // A form whose query names a proof that does not exist.
+        let mut absent = movk.to_vec();
+        absent[2].query = "movk xd #imm16, lsl #32 does not exist";
+        // A form whose query names a registered proof of the wrong category.
+        let mut wrong_category = movn.to_vec();
+        wrong_category[3].category = ProofCategory::Arithmetic;
+        let broken = [missing, duplicated, illegal, absent]
+            .iter()
+            .map(|table| gate.audit_aarch64_form_table(AArch64Opcode::Movk, table))
+            .chain(std::iter::once(gate.audit_aarch64_form_table(
+                AArch64Opcode::Movn,
+                &wrong_category,
+            )))
+            .collect::<Vec<_>>();
+        (report, broken)
+    });
+    let broken = broken_rows;
+    for opcode in [AArch64Opcode::Movk, AArch64Opcode::Movn] {
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.opcode_display == format!("AArch64::{opcode:?}"))
+            .expect("move-wide rows stay in the emitted value/effect denominator");
+        assert!(matches!(
+            classify_aarch64(opcode),
+            OpcodeClass::EmittableNeedsProof
+        ));
+        assert!(
+            row.finding.is_none(),
+            "{opcode:?} must be covered by every legal form: {}",
+            row.note
+        );
+        assert!(row.note.contains("FORM-POLYMORPHIC"), "{}", row.note);
+        // MOVN's only input is the 16-bit immediate, so each form is checked
+        // over its complete domain; MOVK also quantifies over the prior
+        // register value and is sampled. Neither is labelled a formal proof.
+        let (label, why) = match opcode {
+            AArch64Opcode::Movn => ("[Exhaustive]", "complete 16-bit immediate domain"),
+            _ => ("NOT a formal proof", "sampled evaluator acceptance"),
+        };
+        assert_eq!(
+            row.note.matches(label).count(),
+            AARCH64_MOVE_WIDE_LEGAL_FORMS.len(),
+            "every {opcode:?} form must carry its {why} label: {}",
+            row.note
+        );
+        assert!(!row.note.contains("[Formal]"), "{}", row.note);
+    }
+    assert_eq!(broken.len(), 5);
+    for row in &broken {
+        assert!(
+            row.finding.is_some(),
+            "a broken form table must leave the move-wide row RED: {}",
+            row.note
+        );
+    }
+}
+
+/// The sixteen rows X-OPCODES-P7/P8/P9 and L04-P11 (the typed
+/// post-allocation copies and the ORR (vector) register copy) credit through
+/// decoded-word obligations.
+const DECODED_VALUE_OPCODES: [AArch64Opcode; 16] = [
+    AArch64Opcode::MovR,
+    AArch64Opcode::MOVWrr,
+    AArch64Opcode::MOVXrr,
+    AArch64Opcode::FmovFprFpr,
+    AArch64Opcode::FmovFprGpr,
+    AArch64Opcode::FmovGprFpr,
+    AArch64Opcode::NeonOrrV,
+    AArch64Opcode::Smull,
+    AArch64Opcode::Bfm,
+    AArch64Opcode::Rbit,
+    AArch64Opcode::AddRIShift12,
+    AArch64Opcode::Mrs,
+    AArch64Opcode::FcvtHS,
+    AArch64Opcode::FcvtHD,
+    AArch64Opcode::FcvtSH,
+    AArch64Opcode::FcvtDH,
+];
+
+/// X-OPCODES-P7/P8/P9: the register copies, the scalar value forms and the
+/// half-precision FCVT forms leave the
+/// deferred table ONLY through decoded-word obligations. Each row stays in the
+/// denominator, names its decoded-word evidence and every form's registered
+/// obligation, and every form's query resolves, in the database the function
+/// verifier consults, to exactly that obligation. Every one of the sixteen
+/// opcodes binds one form per concrete instruction; since L04-P11 that
+/// includes the register copies (MovR, the typed post-allocation MOVWrr/MOVXrr
+/// and the FMOVs), which the function verifier used to promote per instruction
+/// as covered-elsewhere whatever their shape, and the ORR (vector) register
+/// copy, which it used to credit opcode-wide through the lanewise ORR
+/// obligation. That row also needs the lanewise obligation, which binds the
+/// three-register 16B OR per instruction.
+#[test]
+fn aarch64_decoded_value_rows_are_credited_by_every_form() {
+    use trust_cg_ir::{MachInst, MachOperand, RegClass, VReg};
+    use trust_cg_verify::FunctionVerifier;
+    use trust_cg_verify::aarch64_value_decode_proofs::{
+        A64_VALUE_OPCODES_BOUND_PER_INSTRUCTION, A64ValueForm, TPIDR_EL0_KEY, a64_value_forms,
+    };
+
+    assert_a64_value_corpus_is_what_the_live_encoder_emits();
+    let mut forms_seen = Vec::new();
+    for op in DECODED_VALUE_OPCODES {
+        assert!(matches!(
+            classify_aarch64(op),
+            OpcodeClass::EmittableNeedsProof
+        ));
+        assert!(
+            aarch64_deferred_value_op_reason(op).is_none(),
+            "{op:?} must have left the deferred table"
+        );
+        let forms = a64_value_forms(op).unwrap_or_else(|| panic!("{op:?} has no forms"));
+        assert!(forms.iter().all(|form| form.opcode() == op));
+        forms_seen.extend_from_slice(forms);
+    }
+    assert_eq!(forms_seen, A64ValueForm::ALL.to_vec());
+
+    let (report, resolved) = on_large_stack(|| {
+        let report = CoverageGate::new().audit(GateArch::AArch64);
+        let db = ProofDatabase::new();
+        let resolved: Vec<(A64ValueForm, Option<String>)> = A64ValueForm::ALL
+            .iter()
+            .map(|&form| {
+                let name = db
+                    .by_category(form.category())
+                    .into_iter()
+                    .find(|p| p.obligation.name.to_lowercase().contains(form.query()))
+                    .map(|p| p.obligation.name.clone());
+                (form, name)
+            })
+            .collect();
+        (report, resolved)
+    });
+    for (form, name) in resolved {
+        assert_eq!(
+            name.as_deref(),
+            Some(form.obligation_name()),
+            "{form:?} query must resolve to its own obligation"
+        );
+    }
+    for op in DECODED_VALUE_OPCODES {
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.opcode_display == format!("AArch64::{op:?}"))
+            .unwrap_or_else(|| panic!("{op:?} missing from the audit"));
+        assert!(
+            row.finding.is_none(),
+            "{op:?} must be credited: {}",
+            row.note
+        );
+        assert!(row.note.starts_with("DECODED-WORD"), "{}", row.note);
+        for form in a64_value_forms(op).unwrap() {
+            assert!(
+                row.note.contains(form.obligation_name()),
+                "{op:?} note must name {form:?}: {}",
+                row.note
+            );
+        }
+        assert!(!row.note.contains("[Formal]"), "{}", row.note);
+        if op == AArch64Opcode::NeonOrrV {
+            assert!(
+                row.note.contains("three-register 16B OR"),
+                "the ORR (vector) row must name its lanewise credit: {}",
+                row.note
+            );
+        }
+    }
+
+    for op in DECODED_VALUE_OPCODES {
+        // No opcode-wide credit: only a concrete instance binds, per form.
+        assert!(FunctionVerifier::opcode_to_proof_query(op).is_none());
+        assert!(A64_VALUE_OPCODES_BOUND_PER_INSTRUCTION.contains(&op));
+        assert!(
+            !trust_cg_verify::function_verifier::is_covered_elsewhere_indirect_branch(
+                trust_cg_verify::function_verifier::InstructionOpcode::AArch64(op)
+            ),
+            "{op:?} must not be promoted as covered-elsewhere"
+        );
+    }
+    let g64 = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+    let g32 = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr32));
+    let f16 = |id| MachOperand::VReg(VReg::new(id, RegClass::Fpr16));
+    let f32 = |id| MachOperand::VReg(VReg::new(id, RegClass::Fpr32));
+    let f64 = |id| MachOperand::VReg(VReg::new(id, RegClass::Fpr64));
+    let f128 = |id| MachOperand::VReg(VReg::new(id, RegClass::Fpr128));
+    let imm = MachOperand::Imm;
+    for (inst, form) in [
+        (
+            MachInst::new(AArch64Opcode::NeonOrrV, vec![f128(0), f128(1), f128(1)]),
+            A64ValueForm::MovV16B,
+        ),
+        (
+            MachInst::new(
+                AArch64Opcode::NeonOrrV,
+                vec![f64(0), f64(1), f64(1), imm(1)],
+            ),
+            A64ValueForm::MovV16B,
+        ),
+        (
+            MachInst::new(AArch64Opcode::MovR, vec![g64(0), g64(1)]),
+            A64ValueForm::MovX,
+        ),
+        (
+            MachInst::new(AArch64Opcode::MovR, vec![g32(0), g32(1)]),
+            A64ValueForm::MovW,
+        ),
+        (
+            MachInst::new(AArch64Opcode::MOVWrr, vec![g32(0), g32(1)]),
+            A64ValueForm::MovWrr,
+        ),
+        (
+            MachInst::new(AArch64Opcode::MOVXrr, vec![g64(0), g64(1)]),
+            A64ValueForm::MovXrr,
+        ),
+        (
+            MachInst::new(AArch64Opcode::FmovFprFpr, vec![f64(0), f64(1)]),
+            A64ValueForm::FmovD,
+        ),
+        (
+            MachInst::new(AArch64Opcode::FmovFprGpr, vec![g32(0), f32(1)]),
+            A64ValueForm::FmovWFromS,
+        ),
+        (
+            MachInst::new(AArch64Opcode::FmovGprFpr, vec![f64(0), g64(1)]),
+            A64ValueForm::FmovDFromX,
+        ),
+        (
+            MachInst::new(AArch64Opcode::FcvtHS, vec![f32(0), f16(1)]),
+            A64ValueForm::FcvtSFromH,
+        ),
+        (
+            MachInst::new(AArch64Opcode::FcvtHD, vec![f64(0), f16(1)]),
+            A64ValueForm::FcvtDFromH,
+        ),
+        (
+            MachInst::new(AArch64Opcode::FcvtSH, vec![f16(0), f32(1)]),
+            A64ValueForm::FcvtHFromS,
+        ),
+        (
+            MachInst::new(AArch64Opcode::FcvtDH, vec![f16(0), f64(1)]),
+            A64ValueForm::FcvtHFromD,
+        ),
+        (
+            MachInst::new(AArch64Opcode::Smull, vec![g64(0), g32(1), g32(2)]),
+            A64ValueForm::Smull,
+        ),
+        (
+            MachInst::new(AArch64Opcode::Bfm, vec![g32(0), g32(1), imm(24), imm(4)]),
+            A64ValueForm::BfmInsertW,
+        ),
+        (
+            MachInst::new(AArch64Opcode::Bfm, vec![g64(0), g64(1), imm(56), imm(4)]),
+            A64ValueForm::BfmInsertX,
+        ),
+        (
+            MachInst::new(AArch64Opcode::Rbit, vec![g32(0), g32(1)]),
+            A64ValueForm::RbitW,
+        ),
+        (
+            MachInst::new(AArch64Opcode::Rbit, vec![g64(0), g64(1)]),
+            A64ValueForm::RbitX,
+        ),
+        (
+            MachInst::new(AArch64Opcode::AddRIShift12, vec![g32(0), g32(1), imm(7)]),
+            A64ValueForm::AddLsl12W,
+        ),
+        (
+            MachInst::new(AArch64Opcode::AddRIShift12, vec![g64(0), g64(0), imm(7)]),
+            A64ValueForm::AddLsl12X,
+        ),
+        (
+            MachInst::new(
+                AArch64Opcode::Mrs,
+                vec![g64(0), imm(i64::from(TPIDR_EL0_KEY))],
+            ),
+            A64ValueForm::MrsTpidrEl0,
+        ),
+    ] {
+        assert_eq!(
+            FunctionVerifier::inst_to_proof_query(&inst),
+            Some((form.query(), form.category())),
+            "{inst:?} must bind exactly {form:?}"
+        );
+    }
+    // Refused shapes never fall back to an opcode-wide query.
+    for inst in [
+        MachInst::new(AArch64Opcode::Smull, vec![g32(0), g32(1), g32(2)]),
+        MachInst::new(AArch64Opcode::Bfm, vec![g64(0), g64(1), imm(4), imm(10)]),
+        MachInst::new(AArch64Opcode::AddRIShift12, vec![g64(0), g64(1), imm(4096)]),
+        MachInst::new(AArch64Opcode::Mrs, vec![g64(0), imm(0xDE83)]),
+        // Copies outside the forms: half precision and cross-width FMOVs.
+        MachInst::new(AArch64Opcode::FmovFprFpr, vec![f16(0), f16(1)]),
+        MachInst::new(AArch64Opcode::FmovFprGpr, vec![g64(0), f32(1)]),
+        MachInst::new(AArch64Opcode::MovR, vec![]),
+        // FCVT operand widths that name another conversion.
+        MachInst::new(AArch64Opcode::FcvtHS, vec![f64(0), f16(1)]),
+        MachInst::new(AArch64Opcode::FcvtSH, vec![f32(0), f16(1)]),
+        MachInst::new(AArch64Opcode::FcvtDH, vec![f16(0), f32(1)]),
+        // ORR (vector): the 8B OR, the 8B copy, the selector on a
+        // three-register OR, an unknown selector.
+        MachInst::new(AArch64Opcode::NeonOrrV, vec![f64(0), f64(1), f64(2)]),
+        MachInst::new(AArch64Opcode::NeonOrrV, vec![f64(0), f64(1), f64(1)]),
+        MachInst::new(
+            AArch64Opcode::NeonOrrV,
+            vec![f128(0), f128(1), f128(2), imm(1)],
+        ),
+        MachInst::new(
+            AArch64Opcode::NeonOrrV,
+            vec![f128(0), f128(1), f128(1), imm(7)],
+        ),
+    ] {
+        assert_eq!(
+            FunctionVerifier::inst_to_proof_query(&inst),
+            None,
+            "{inst:?}"
+        );
+    }
+    // The three-register 16B OR binds the lanewise ORR obligation.
+    assert_eq!(
+        FunctionVerifier::inst_to_proof_query(&MachInst::new(
+            AArch64Opcode::NeonOrrV,
+            vec![f128(0), f128(1), f128(2)],
+        )),
+        Some((
+            "orrv.16b lanewise-intent",
+            trust_cg_verify::proof_database::ProofCategory::NeonLowering
+        ))
+    );
+}
+
+/// A decoded-value hook that stops accepting must turn exactly the sixteen
+/// rows RED as `ProofNotDischarged` — never a quiet deferral — and cost
+/// exactly sixteen covered rows, leaving every other row unchanged.
+#[test]
+fn aarch64_decoded_value_hook_failure_is_red_in_the_whole_report() {
+    let (real, injected) = on_large_stack(|| {
+        let gate = CoverageGate::new();
+        let real = gate.audit(GateArch::AArch64);
+        let injected = gate.audit_aarch64_with_value_credit(&|_| {
+            Err("INJECTED: a negative control survived".to_string())
+        });
+        (real, injected)
+    });
+    assert_eq!(
+        injected.covered_count() + DECODED_VALUE_OPCODES.len(),
+        real.covered_count()
+    );
+    for (real_row, injected_row) in real.rows.iter().zip(&injected.rows) {
+        assert_eq!(real_row.opcode_display, injected_row.opcode_display);
+        let decoded = DECODED_VALUE_OPCODES
+            .iter()
+            .any(|op| real_row.opcode_display == format!("AArch64::{op:?}"));
+        if decoded {
+            match &injected_row.finding {
+                Some(CoverageFinding::ProofNotDischarged { detail, .. }) => {
+                    assert!(detail.contains("INJECTED"), "{detail}");
+                }
+                other => panic!(
+                    "{} must be ProofNotDischarged under a failing hook, got {other:?}",
+                    real_row.opcode_display
+                ),
+            }
+        } else {
+            assert_eq!(real_row.finding, injected_row.finding);
+        }
+    }
+}
+
+/// L04-P10: the `Umulh` row is covered only with BOTH its 64-bit checked-umul
+/// obligation and the i128 checked-multiply idiom family. With the real hook
+/// the row is covered and its note names the idiom credit; a hook that stops
+/// accepting (a surviving negative control) turns exactly that one row RED as
+/// `ProofNotDischarged` — never a quiet deferral — and costs exactly one
+/// covered row, leaving every other row unchanged.
+#[test]
+fn umulh_row_requires_the_i128_checked_mul_family_credit() {
+    let (real, injected) = on_large_stack(|| {
+        let gate = CoverageGate::new();
+        let real = gate.audit(GateArch::AArch64);
+        let injected = gate.audit_aarch64_with_checked_mul_i128_credit(&|| {
+            Err("INJECTED: a negative control survived".to_string())
+        });
+        (real, injected)
+    });
+    let umulh = real
+        .rows
+        .iter()
+        .find(|row| row.opcode_display == "AArch64::Umulh")
+        .expect("Umulh row");
+    assert_eq!(umulh.finding, None, "{}", umulh.note);
+    assert!(
+        umulh.note.contains("i128 checked-multiply idiom credit"),
+        "{}",
+        umulh.note
+    );
+    assert!(
+        umulh.note.contains("CheckedUmul_I64") && umulh.note.contains("CheckedUmul_I128"),
+        "both the 64-bit and the i128 obligations must be named: {}",
+        umulh.note
+    );
+    assert!(
+        umulh.note.contains("NOT a formal proof"),
+        "the note must state the evidence strength: {}",
+        umulh.note
+    );
+    assert_eq!(injected.covered_count() + 1, real.covered_count());
+    for (real_row, injected_row) in real.rows.iter().zip(&injected.rows) {
+        assert_eq!(real_row.opcode_display, injected_row.opcode_display);
+        if real_row.opcode_display == "AArch64::Umulh" {
+            match &injected_row.finding {
+                Some(CoverageFinding::ProofNotDischarged { detail, .. }) => {
+                    assert!(detail.contains("INJECTED"), "{detail}");
+                }
+                other => {
+                    panic!("Umulh must be ProofNotDischarged under a failing hook, got {other:?}")
+                }
+            }
+        } else {
+            assert_eq!(real_row.finding, injected_row.finding);
+        }
+    }
+}
+
+const VOLATILE_OPCODES: [AArch64Opcode; 6] = [
+    AArch64Opcode::VolatileLdrRI,
+    AArch64Opcode::VolatileLdrbRI,
+    AArch64Opcode::VolatileLdrhRI,
+    AArch64Opcode::VolatileStrRI,
+    AArch64Opcode::VolatileStrbRI,
+    AArch64Opcode::VolatileStrhRI,
+];
+
+/// The volatile rows whose plain counterpart is still RED: none since L04-P1.
+const VOLATILE_DEFERRED: [AArch64Opcode; 0] = [];
+
+/// X-OPCODES-P6: a volatile row needs BOTH facets. With the real hooks the
+/// preservation facet holds and every plain row is credited (L04-P1), so the
+/// six rows are covered, their notes recording both facets. A failing
+/// preservation hook turns exactly the six rows `ProofNotDischarged` (a
+/// regression, never a quiet deferral); a plain row injected as credited
+/// changes nothing more.
+#[test]
+fn aarch64_volatile_rows_need_both_facets() {
+    use trust_cg_verify::coverage_gate::{OpcodeAuditRow, aarch64_volatile_plain_counterpart};
+    use trust_cg_verify::volatile_access_preservation::volatile_preservation_credit;
+
+    let credited_plain = |plain: AArch64Opcode| OpcodeAuditRow {
+        opcode_display: format!("AArch64::{plain:?}"),
+        class: OpcodeClass::EmittableNeedsProof,
+        finding: None,
+        note: "ANTICIPATED plain memory-model credit (test seam)".to_string(),
+    };
+    let (real, failing, anticipated, anticipated_failing) = on_large_stack(move || {
+        let gate = CoverageGate::new();
+        let real = gate.audit(GateArch::AArch64);
+        let failing = gate.audit_aarch64_with_volatile_hooks(
+            &|| Err("INJECTED: a corrupted stream survived".to_string()),
+            None,
+        );
+        let anticipated = gate.audit_aarch64_with_volatile_hooks(
+            &volatile_preservation_credit,
+            Some(&credited_plain),
+        );
+        let anticipated_failing = gate.audit_aarch64_with_volatile_hooks(
+            &|| Err("INJECTED: a corrupted stream survived".to_string()),
+            Some(&credited_plain),
+        );
+        (real, failing, anticipated, anticipated_failing)
+    });
+    let volatile = |row: &OpcodeAuditRow| {
+        VOLATILE_OPCODES
+            .iter()
+            .any(|op| row.opcode_display == format!("AArch64::{op:?}"))
+    };
+    for op in VOLATILE_OPCODES {
+        let plain = aarch64_volatile_plain_counterpart(op).unwrap();
+        let deferred = VOLATILE_DEFERRED.contains(&op);
+        assert_eq!(
+            aarch64_deferred_value_op_reason(plain).is_some(),
+            deferred,
+            "{plain:?}"
+        );
+        assert_eq!(aarch64_deferred_value_op_reason(op).is_some(), deferred);
+    }
+    let misses = checker_identity_misses(&real);
+    for (index, row) in real.rows.iter().enumerate() {
+        if volatile(row) {
+            let deferred = VOLATILE_DEFERRED
+                .iter()
+                .any(|op| row.opcode_display == format!("AArch64::{op:?}"));
+            if misses > 0 && row.finding.is_some() {
+                // An unqualified host: the plain row is a checker-identity
+                // miss, so the volatile row is RED for that reason only.
+                assert!(
+                    row.note
+                        .contains(trust_cg_verify::bound_memory_authority::CHECKER_IDENTITY_MISS),
+                    "{row:?}"
+                );
+                continue;
+            }
+            assert!(
+                row.note.contains("volatile access preservation"),
+                "{}",
+                row.note
+            );
+            if deferred {
+                assert!(
+                    matches!(
+                        row.finding,
+                        Some(CoverageFinding::DeferredUnfaithfulModel { .. })
+                    ),
+                    "{row:?}"
+                );
+                assert!(row.note.contains("X-OPCODES-P1"), "{}", row.note);
+            } else {
+                assert!(row.finding.is_none(), "{row:?}");
+                assert!(
+                    row.note.contains("BOUND-MEMORY FORM CERTIFICATES"),
+                    "{}",
+                    row.note
+                );
+            }
+            assert!(
+                matches!(
+                    &failing.rows[index].finding,
+                    Some(CoverageFinding::ProofNotDischarged { detail, .. }) if detail.contains("INJECTED")
+                ),
+                "{:?}",
+                failing.rows[index]
+            );
+            assert!(
+                anticipated.rows[index].finding.is_none(),
+                "{:?}",
+                anticipated.rows[index]
+            );
+            assert!(anticipated.rows[index].note.starts_with("VOLATILE"));
+            assert!(matches!(
+                anticipated_failing.rows[index].finding,
+                Some(CoverageFinding::ProofNotDischarged { .. })
+            ));
+        } else {
+            assert_eq!(
+                row.finding, failing.rows[index].finding,
+                "{}",
+                row.opcode_display
+            );
+            assert_eq!(
+                row.finding, anticipated.rows[index].finding,
+                "{}",
+                row.opcode_display
+            );
+        }
+    }
+    let volatile_covered = real
+        .rows
+        .iter()
+        .filter(|row| volatile(row) && row.finding.is_none())
+        .count();
+    assert_eq!(
+        anticipated.covered_count(),
+        real.covered_count() + (VOLATILE_OPCODES.len() - volatile_covered)
+    );
+    assert_eq!(
+        failing.covered_count(),
+        real.covered_count() - volatile_covered
+    );
+    if misses == 0 {
+        assert_eq!(
+            volatile_covered,
+            VOLATILE_OPCODES.len() - VOLATILE_DEFERRED.len()
+        );
+    }
+}
+
+/// L04-P1: a failing bound-memory credit hook turns exactly the 72
+/// bound-memory rows and the six volatile rows that follow them out of the
+/// covered count (the bound rows `ProofNotDischarged`: a regression, never a
+/// quiet deferral).
+#[test]
+fn bound_memory_rows_need_every_form_and_a_failing_hook_is_red() {
+    use trust_cg_verify::bound_memory_row_credit::{
+        atomic_row_credit, neon_row_credit, pair_row_credit, scalar_row_credit,
+    };
+    let (real, failing) = on_large_stack(|| {
+        let gate = CoverageGate::new();
+        let real = gate.audit(GateArch::AArch64);
+        let failing = gate.audit_aarch64_with_bound_memory_credit(&|opcode| {
+            atomic_row_credit(opcode)
+                .or_else(|| scalar_row_credit(opcode))
+                .or_else(|| pair_row_credit(opcode))
+                .or_else(|| neon_row_credit(opcode))
+                .map(|_| Err("INJECTED: a form certificate did not replay".to_string()))
+        });
+        (real, failing)
+    });
+    let injected_finding = |injected: &trust_cg_verify::coverage_gate::OpcodeAuditRow| {
+        matches!(
+            &injected.finding,
+            Some(CoverageFinding::ProofNotDischarged { detail, .. }) if detail.contains("INJECTED")
+        ) || injected.note.contains("INJECTED")
+    };
+    let mut lost = 0;
+    let mut missed = 0;
+    for (row, injected) in real.rows.iter().zip(&failing.rows) {
+        if row.finding.is_none() && injected.finding.is_some() {
+            assert!(injected_finding(injected), "{injected:?}");
+            lost += 1;
+        } else if row.finding.is_some()
+            && row
+                .note
+                .contains(trust_cg_verify::bound_memory_authority::CHECKER_IDENTITY_MISS)
+        {
+            // On an unqualified host a row is already uncovered by its
+            // checker-identity miss; the failing hook replaces that refusal
+            // with its own, and the row stays uncovered.
+            assert!(injected_finding(injected), "{injected:?}");
+            missed += 1;
+        } else {
+            assert_eq!(row.finding, injected.finding, "{}", row.opcode_display);
+        }
+    }
+    assert_eq!(missed, checker_identity_misses(&real));
+    assert_eq!(lost + missed, 46 + 18 + 6 + 2 + 6);
+    assert_eq!(failing.covered_count(), real.covered_count() - lost);
+}
+
+/// UADDLP/SADDLP each encode both pairwise-widening stages under one opcode.
+/// Opcode-wide coverage must therefore require the exact theorem for both input
+/// arrangements instead of inheriting the historical `.16B->.8H` representative
+/// for an emitted `.8H->.4S` instruction.
+#[test]
+fn aarch64_addlp_gate_requires_both_widening_arrangements() {
+    for (opcode, prefix) in [
+        (AArch64Opcode::NeonUaddlpV, "uaddlpv"),
+        (AArch64Opcode::NeonSaddlpV, "saddlpv"),
+    ] {
+        let proofs = aarch64_width_polymorphic_proofs(opcode)
+            .unwrap_or_else(|| panic!("{opcode:?} must be arrangement-complete gated"));
+        assert_eq!(proofs.len(), 2, "{opcode:?} must demand both stages");
+        assert!(proofs.iter().any(|p| {
+            p.encoded_width_bits == 8 && p.query == format!("{prefix}.16b->.8h lanewise-intent")
+        }));
+        assert!(proofs.iter().any(|p| {
+            p.encoded_width_bits == 16 && p.query == format!("{prefix}.8h->.4s lanewise-intent")
+        }));
+    }
+
+    let report = on_large_stack(|| CoverageGate::new().audit(GateArch::AArch64));
+    for opcode in [AArch64Opcode::NeonUaddlpV, AArch64Opcode::NeonSaddlpV] {
+        let display = format!("AArch64::{opcode:?}");
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.opcode_display == display)
+            .unwrap_or_else(|| panic!("{display} missing from audit universe"));
+        assert!(
+            row.finding.is_none(),
+            "{opcode:?} must be covered by both arrangement theorems: {}",
+            row.note
+        );
+        assert!(
+            row.note.to_lowercase().contains("16b->.8h")
+                && row.note.to_lowercase().contains("8h->.4s"),
+            "{opcode:?} audit note must name both discharged stages: {}",
+            row.note
+        );
+    }
 }
 
 /// The by-element FMLA opcode has an immediate selector and two emitted vector
@@ -698,8 +1679,11 @@ fn aarch64_fmla_lane_gate_requires_full_selector_destination_matrix() {
 /// base+disp and SIB LeaSib base+index*scale+disp, moved out of the allowlist —
 /// +2 denominator), and the SSE4.1 mode-poly ROUNDSD/ROUNDSS (floor/ceil/trunc,
 /// faithfully modeled by the native FP round-to-integral evaluator). HONESTLY
-/// DEFERRED (left RED, not credited): MovRI (const==const, no independent
-/// constant model in the single instruction), Idiv/Div (the dividend is the
+/// DEFERRED at that stage (left RED, not credited): MovRI (const==const, no
+/// independent constant model in the single instruction — since CLOSED, and NOT
+/// by reconstruction: `x86_encoding_proofs` decodes the REAL emitted bytes with
+/// an independent SDM-derived decoder; see the MOV r,imm net below), Idiv/Div
+/// (the dividend is the
 /// implicit RDX:RAX pair set up by a separate CDQ/CQO+MOV sequence, not an
 /// operand of the single instruction), Cmovcc/Cmovcc32 (the select condition is
 /// the implicit RFLAGS state of a prior CMP, not an operand) — a single-
@@ -720,49 +1704,60 @@ fn aarch64_fmla_lane_gate_requires_full_selector_destination_matrix() {
 ///     not model RNE rounding, so crediting them would be dishonest.
 ///
 /// The publication audit pins the current result at 158 accepted of 187 emitted
-/// value/effect rows. Its 29 named gaps are explicit `DeferredUnfaithfulModel`
-/// debt; any generic mapping/discharge failure remains a regression.
+/// value/effect rows. Its named gaps (28 today) are explicit
+/// `DeferredUnfaithfulModel` debt; any generic mapping/discharge failure remains
+/// a regression.
 #[test]
 fn x86_emittable_coverage_is_honest_under_strict() {
     let report = on_large_stack(|| CoverageGate::new().audit(GateArch::X86_64));
     eprintln!("{}", report.audit_log());
+    // The pin below includes the corpus-based MovRI credit, the ten
+    // corpus-based SSE LANE credits and the corpus-based MOVSXD-SIB credit;
+    // refuse a stale corpus of any of them.
+    assert_movri_corpus_is_what_the_live_encoder_emits();
+    assert_sse_lane_corpus_is_what_the_live_encoder_emits();
+    assert_movsxd_sib_corpus_is_what_the_live_encoder_emits();
 
     assert!(
         report.emittable_count() > 0,
         "x86-64 audit found zero emittable opcodes — classifier is mis-wired"
     );
 
-    // HISTORICAL ACCEPTED-EVIDENCE GROWTH: 148 rows had genuinely
-    // non-degenerate / reconstructed discharged evidence before later additions
-    // and the publication denominator audit. The accepted set grew
-    // 123 -> 139 (MEMORY tier) -> 144 (IMPLICIT-OPERAND tier) -> 148 (PACKED
-    // 128-bit MOVE tier, this stage).
+    // What each x86-64 credit family establishes (the per-tier reconstruction
+    // contracts). Every credited row is either a non-degenerate static-DB proof,
+    // a reconstruction whose two sides are computed independently, or an
+    // independent SDM-derived decode of the real emitted bytes; no X==X
+    // identity is credited.
     //
-    // PACKED 128-bit MOVE tier (144 -> 148, this stage): the whole-XMM memory
-    // moves MOVDQU{RM,MR} (unaligned) and MOVDQA{RM,MR} (aligned), emitted for
-    // Fpr128 spill/reload, are GENUINELY RECONSTRUCTED as TWO 64-bit halves at
-    // effective addresses `ea` (low 64 bits) and `ea+8` (high 64 bits),
-    // little-endian, reusing the PROVEN scalar effective-address machinery
-    // (`x86_reconstruct_effective_address`): SOURCE addresses via trust_ir
-    // `encode_trust_ir_binop`, MACHINE addresses via the INDEPENDENT x86
-    // `encode_lea_*`. A wrong base/index/scale/disp (EA), a SWAPPED half, a wrong
-    // half OFFSET (`ea+16` for `ea+8`), a wrong access WIDTH, or (store) a
-    // wrong/dropped value half REFUTES. MOVDQA carries the HONEST `ea % 16 == 0`
-    // precondition (SSE MOVDQA #GP-faults on a non-16-aligned address); MOVDQU does
-    // not — and the alignment assumption NEVER weakens the value equality (see the
-    // `movdqa_*_alignment_*` refutations in tests/reconstruction_x86.rs). The
-    // reg-reg form MOVDQARR stays separate explicit deferred denominator debt.
-    //
-    // MEMORY tier (123 -> 139): GENUINE effective-address reconstruction of the
-    // load/store, memory-ALU, and in-place inc/dec families. The deterministic
+    // MEMORY tier: GENUINE effective-address reconstruction of the load/store,
+    // memory-ALU, and in-place inc/dec families. The deterministic
     // `SmtExpr::MemLoad` memory model treats `load(ea)` as a deterministic function
     // of the (effective-address, width, signedness) triple, so a wrong EA reads a
     // DIFFERENT value ⇒ REFUTE. The MACHINE EA is the INDEPENDENT x86 `encode_lea_*`
-    // encoder; the SOURCE EA is the trust_ir Iadd/Imul composition.
+    // encoder; the SOURCE EA is the trust_ir Iadd/Imul composition. The
+    // scaled-index MOVs (MovRMSib/MovMRSib, the 32-bit and 8-bit SIB pairs,
+    // ImulRMSib, and the scalar-FP loads MovsdRMSib/MovssRMSib) reconstruct via
+    // the SAME `x86_reconstruct_effective_address` `SibMemAddr` model on both
+    // sides; a wrong base/index/scale/disp REFUTES, and a store's value half ties
+    // the stored register to the IR store value.
     //
-    // IMPLICIT-OPERAND tier (139 -> 144, this stage): the last 5 rows, whose
-    // operative inputs are IMPLICIT (not explicit operands), reconstructed
-    // genuinely:
+    // PACKED 128-bit MOVE tier: the whole-XMM memory moves MOVDQU{RM,MR}
+    // (unaligned) and MOVDQA{RM,MR} (aligned), emitted for Fpr128 spill/reload,
+    // are GENUINELY RECONSTRUCTED as TWO 64-bit halves at effective addresses
+    // `ea` (low 64 bits) and `ea+8` (high 64 bits), little-endian, reusing the
+    // PROVEN scalar effective-address machinery. A wrong base/index/scale/disp
+    // (EA), a SWAPPED half, a wrong half OFFSET (`ea+16` for `ea+8`), a wrong
+    // access WIDTH, or (store) a wrong/dropped value half REFUTES. MOVDQA carries
+    // the HONEST `ea % 16 == 0` precondition (SSE MOVDQA #GP-faults on a
+    // non-16-aligned address); MOVDQU does not — and the alignment assumption
+    // NEVER weakens the value equality (see the `movdqa_*_alignment_*`
+    // refutations in tests/reconstruction_x86.rs). MovdquRMSib/MovdquMRSib are
+    // the same reconstruction over the SIB EA; they are deliberately
+    // UNALIGNED-ONLY, because re-forming the address as base+index*scale could
+    // invalidate MOVDQA's alignment precondition, so the aligned family gets no
+    // SIB sibling.
+    //
+    // IMPLICIT-OPERAND tier: rows whose operative inputs are IMPLICIT:
     //   * ImulRM (`dst = reg * load(ea)`): the register-memory signed multiply,
     //     reconstructed via the memory-ALU family (Imul over reg and load(ea)); a
     //     wrong op or wrong EA REFUTES.
@@ -773,8 +1768,8 @@ fn x86_emittable_coverage_is_honest_under_strict() {
     //     The source is the trust_ir single-width Sdiv/Srem (or Udiv/Urem). PRECOND:
     //     divisor != 0 AND no signed overflow (!(rax==INT_MIN && divisor==-1)). An
     //     IDIV-as-DIV (sext-vs-zext / sdiv-vs-udiv) bug DIVERGES on a negative
-    //     dividend ⇒ REFUTE. The evaluator's BvSDiv/BvUDiv gained 128-bit support so
-    //     the 64-bit divide's 128-bit dividend is modeled exactly (no truncation).
+    //     dividend ⇒ REFUTE. The evaluator's BvSDiv/BvUDiv model the 64-bit
+    //     divide's 128-bit dividend exactly (no truncation).
     //   * Cmovcc / Cmovcc32: the IMPLICIT RFLAGS condition, reconstructed as a
     //     genuine CMP+CMOV PAIR — machine = ite(eval_int_condition(cc,
     //     flags_of(a,b)), src, dst); source = ite(icmp(intcc_for(cc), a, b), src,
@@ -783,116 +1778,203 @@ fn x86_emittable_coverage_is_honest_under_strict() {
     //     L-for-GE) gives the complementary boolean ⇒ REFUTE. The gate requires ALL
     //     ten value-select condition codes to discharge (not just one).
     //
-    // HONEST-DEFERRED packed ops (NO faithful complete model, NOT credited,
-    // denominator RED): PSHUFD (imm8 shuffle), PBLENDVB (mask reg),
-    // PTEST/PMOVMSKB (cross-lane flag/sign reductions), PINSR*/PEXTR* (imm8 lane
-    // insert/extract), PUNPCK*/PACKUSWB (interleave/narrow shuffles), PMULUDQ
-    // (even-lane widening), MOVDQARR (128-bit register-register move, structural —
-    // the MOVDQA/MOVDQU MEMORY forms RM/MR are now reconstructed + covered).
-    // (148 -> 149). The prior 148 pin was STALE + RED on main, and this commit
-    // both corrects a slice-3 misclassification and adds slice 4:
-    //   (1) MFENCE (SeqCst fence, slice 3) is a NO-OP on single-thread data
-    //       state, so its only faithful value proof is structurally X==X. Slice 3
-    //       wrongly marked it EmittableNeedsProof -> the strict gate credits an
-    //       X==X ZERO -> Mfence was emittable-but-uncoverable -> the clean-tree
-    //       gate was actually RED at 148/149 vs the pinned 148/148. This commit
-    //       reclassifies Mfence FailClosedAllowlisted (coverage NOT claimed, same
-    //       disposition as RET/CALL/integer-loads); soundness is unchanged (the
-    //       identity is registered + witnessed by two refuting negative controls
-    //       under proof_gate_strict; ordering is the Intel-SDM axiom). With Mfence
-    //       allowlisted the base returns to a clean 148/148.
-    //   (2) CMPXCHG (compare_exchange, slice 4) flips FailClosedAllowlisted ->
-    //       EmittableNeedsProof (+1 emittable AND +1 covered), COVERED by the six
-    //       width-polymorphic conditional-data-flow proofs (Cmpxchg_I{32,64}
-    //       returns-old + conditional-store + success-flag), which
-    //       `x86_width_polymorphic_proofs` requires to ALL discharge -- genuine
-    //       (non-X==X) obligations over symbolic (mem, expected, desired) state;
-    //       the negative controls REFUTE. -> 149/149.
-    // Net: 149/149 = 100%, genuinely clean (no RED rows, NO X==X credited).
+    // MFENCE (SeqCst fence) is a NO-OP on single-thread data state, so its only
+    // faithful value proof is structurally X==X; it is FailClosedAllowlisted
+    // (coverage NOT claimed). Soundness is unchanged: the identity is registered
+    // and witnessed by two refuting negative controls under proof_gate_strict,
+    // and ordering is the Intel-SDM axiom.
     //
-    // (149 -> 151, OPT-7 / LEVER 1): the scaled-index 64-bit memory MOVs
-    // MovRMSib (`mov r64, [base+index*scale+disp]`) and MovMRSib
-    // (`mov [base+index*scale+disp], r64`) flip FailClosedAllowlisted ->
-    // EmittableNeedsProof (+2 emittable AND +2 covered). They are the SIB
-    // address-mode fold's outputs (`x86_peephole::sib_addr_fold_run_on_block`),
-    // and they reconstruct via the SAME `x86_reconstruct_effective_address`
-    // machinery as MovRM/MovMR: the shared encoder already models the
-    // `SibMemAddr` EA (`base + index*scale + disp`) on both the trust_ir and the
-    // INDEPENDENT x86 `encode_lea_base_index_scale_disp` sides, so they route to
-    // the genuine Load_I64 / Store_I64 memory proofs (NOT X==X) — a wrong
-    // base/index/scale/disp REFUTES, and the store's value half ties the stored
-    // register to the IR store value. -> 151/151.
+    // CMPXCHG (compare_exchange) is covered by the six width-polymorphic
+    // conditional-data-flow proofs (Cmpxchg_I{32,64} returns-old +
+    // conditional-store + success-flag), which `x86_width_polymorphic_proofs`
+    // requires to ALL discharge — genuine obligations over symbolic (mem,
+    // expected, desired) state; the negative controls REFUTE.
     //
-    // (151 -> 154, OPT-12 / VEC-Q): the packed 64-bit multiply compose the SSE2
-    // vectorizer emits for i64 saxpy-accumulate loops:
-    //   (1) PSLLQ/PSRLQ (NEW opcodes, +2 emittable AND +2 covered) — the i64x2
-    //       uniform-IMMEDIATE shifts, static-DB proofs exactly parallel to the
-    //       PSLLD/PSRLD dword forms (group-13 0x73 encoding vs group-12 0x72;
-    //       the wrong-lane-width negative control REFUTES a dword-model swap).
-    //   (2) PMULUDQ flips FailClosedAllowlisted -> EmittableNeedsProof
-    //       (+1 emittable AND +1 covered): its even-dword widening multiply IS
-    //       the same-width i64x2 lane op `lo32(a)*lo32(b)` (each qword lane's
-    //       result depends only on that lane's low dword), now backed by the
-    //       static-DB proof `V2I64 even-dword widening Umul -> PMULUDQ` whose
-    //       machine side is the INDEPENDENT SDM-structural even-dword-extract/
-    //       zext/mul model; odd-lane, sign-extending, and low-half-only wrong
-    //       models all REFUTE (negative controls). -> 154/154.
-    // (3) ImulRMSib (X9 slice 3, the RM-fusion producer) joins the
-    //     memory-ALU family as the SIB sibling of ImulRM: same Imul value
-    //     semantics, EA covered by the SAME `x86_reconstruct_effective_address`
-    //     SibMemAddr model as MovRMSib (a wrong base/index/scale/disp REFUTES).
-    //     +1 emittable AND +1 covered -> 155/155.
-    // (4) X10: the 32-bit SIB MOV pair MovRM32Sib/MovMR32Sib (the b06/b18
-    //     u32-array class) joins the memory tier — same shared SibMemAddr EA
-    //     reconstruction at Load_I32/Store_I32 width. +2 emittable AND
-    //     +2 covered -> 157/157.
-    // (5) Psadbw (horizontal byte SAD, the byte-sum vectorizer tier) joins via
-    //     the PsadbwByteSad reconstruction (encode_psadbw vs the independent
-    //     encode_trust_ir_byte_sad; a wrong lane-wise opcode REFUTES).
-    //     +1 emittable AND +1 covered -> 158/158.
-    // Publication audit: 13 actively emitted rows formerly hidden by the
-    // exclusion bucket (MOV r,imm, narrow CMPXCHG, ten packed ops) and all 16
-    // volatile memory opcodes are denominator-bearing RED debt. The accepted
-    // obligation count remains 158; the honest denominator is 187.
-    // The 158/187 -> 160/189 net: MovsdRMSib/MovssRMSib, the scaled-index
-    // scalar-FP loads. +2 emittable AND +2 covered, so coverage is not diluted —
-    // each is the COMPOSITION of two already-proven families (the shared
-    // SibMemAddr `x86_reconstruct_effective_address` that proves MovRMSib, and
-    // the MemLoad obligation that proves MovsdRM/MovssRM at opcode-fixed width).
-    // A wrong base/index/scale/disp refutes via the EA half; a wrong width or
-    // lane refutes via the FP-load half. No new trust root.
-    // The 160/189 -> 162/191 net: MovRM8Sib/MovMR8Sib extend the same
-    // independently reconstructed SIB load/store family to I8 width.
-    // The 162/191 -> 163/192 net: RolRI is inventoried and covered by the
-    // existing RotL_I operand reconstruction; wrong direction/count refutes.
-    // The 163/192 -> 167/196 net (RMW Stage 1): the memory-destination RMW ALU
-    // quartet XorMR/AddMR/XorMRSib/AddMRSib. +4 emittable AND +4 covered — the
+    // Packed 64-bit multiply compose (the SSE2 vectorizer's i64 saxpy loops):
+    // PSLLQ/PSRLQ are static-DB proofs parallel to the PSLLD/PSRLD dword forms
+    // (group-13 0x73 encoding vs group-12 0x72; the wrong-lane-width negative
+    // control REFUTES a dword-model swap). PMULUDQ's even-dword widening multiply
+    // is the same-width i64x2 lane op `lo32(a)*lo32(b)`, backed by the static-DB
+    // proof `V2I64 even-dword widening Umul -> PMULUDQ` whose machine side is the
+    // INDEPENDENT SDM-structural even-dword-extract/zext/mul model; odd-lane,
+    // sign-extending, and low-half-only wrong models all REFUTE.
+    //
+    // Psadbw (horizontal byte SAD) is covered by the PsadbwByteSad
+    // reconstruction (encode_psadbw vs the independent
+    // encode_trust_ir_byte_sad; a wrong lane-wise opcode REFUTES). RolRI is
+    // covered by the existing RotL_I operand reconstruction; wrong
+    // direction/count refutes.
+    //
+    // Memory-destination RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib: the
     // MemRmw reconstruction composes the proven MemStore shape (address half +
     // stored-value half) with the proven MemAlu shape (the REAL machine ALU
     // encoder over a load of the same EA) on the shared
     // `x86_reconstruct_effective_address`; wrong EA / Add-for-Xor /
     // dropped-or-wrong src / plain-store-for-RMW all REFUTE (mem_rmw controls
     // in reconstruction_x86.rs). NOTHING emits these opcodes yet: proofs land
-    // BEFORE the Stage-2 fusion peephole, whose admission gate is this very
+    // BEFORE the fusion peephole, whose admission gate is this very
     // reconstruction discharging Valid.
-    // The 167/196 -> 168/197 net (rotate Stage 1): RolRCl, the variable-count
-    // rotate. +1 emittable AND +1 covered — the RotlVar reconstruction pits
-    // the bridge's masked shl/shr/or rotate idiom (the exact expansion the
-    // Stage-2 peephole will delete) against the independent hardware-masked
-    // `encode_rol_rcl_masked`, TOTAL (no count<width precondition), machine
-    // half keyed off the real opcode. ROR-for-ROL / dropped wrap half /
-    // unmasked count / wrong mask 31 / SHL-for-ROL all REFUTE (rotl_var
-    // controls in reconstruction_x86.rs). NOTHING emits RolRCl yet: the
-    // Stage-2 variable-rotate peephole is admission-gated on this very
+    //
+    // RolRCl, the variable-count rotate: the RotlVar reconstruction pits the
+    // bridge's masked shl/shr/or rotate idiom against the independent
+    // hardware-masked `encode_rol_rcl_masked`, TOTAL (no count<width
+    // precondition), machine half keyed off the real opcode. ROR-for-ROL /
+    // dropped wrap half / unmasked count / wrong mask 31 / SHL-for-ROL all
+    // REFUTE (rotl_var controls in reconstruction_x86.rs). NOTHING emits RolRCl
+    // yet: the variable-rotate peephole is admission-gated on this very
     // reconstruction discharging Valid.
+    //
+    // MovRI (MOV r,imm): NOT a reconstruction credit and NOT a static-DB proof —
+    // `const == const` is the self-equality a retracted ledger entry was. The
+    // credit is `x86_encoding_proofs::mov_imm_discharges_valid` — an
+    // INDEPENDENT decoder written from the Intel SDM's instruction format (it
+    // models C6/C7 /0, AH..BH and the sign-extending REX.W C7 /0 id, none of
+    // which the encoder emits) run over the REAL emitted bytes, compared as a
+    // write to the 64-bit root register against the machine-IR intent
+    // (register NAME, i64 immediate), with canonicality and exact framing
+    // pinned. The hook refuses unless all 11 emitted physical form classes are
+    // present and EVERY negative control refutes FOR ITS STATED REASON CLASS:
+    // wrong register, flipped REX.B, sign-for-zero extension in both directions
+    // (on VALUE), truncated imm64, wrong-width form, wrong opcode, every
+    // single-byte immediate corruption, dropped forced REX, redundant prefixes,
+    // bad framing, and every source-side re-claim. tests/x86_encoding_gate.rs
+    // re-derives the captured corpus from the LIVE encoder. It says NOTHING
+    // about whether the lowering chose the right constant.
+    //
+    // Narrow LOCK CMPXCHG (Cmpxchg8/Cmpxchg16): NOT the i32/i64
+    // `Cmpxchg_I{32,64}` theorems — operand 0 is a Gpr32 carrier for BOTH i8
+    // and i16, so inheriting those would bind a BYTE CAS to a DOUBLEWORD proof
+    // (the degenerate-green trap; see
+    // `narrow_cmpxchg_never_binds_the_wide_cmpxchg_proofs`). The credit is the
+    // `X86SourceOp::CmpxchgNarrow` reconstruction: SOURCE =
+    // `encode_trust_ir_cmpxchg`, a transcription of the pinned trust-ir
+    // interpreter's `Inst::CmpXchg` arm over three w-bit VALUE leaves; MACHINE =
+    // `encode_lock_cmpxchg_narrow`, an SDM transcription over the FULL 64-bit
+    // RAX, the FULL 32-bit source carrier and a byte-addressable memory array at
+    // the INDEPENDENTLY encoded effective address. ONE `64 + 2w + 1`-bit joint
+    // obligation carries five facets: RAX[63:w] PRESERVED (the partial AL/AX
+    // write), returns-old, the conditional store, the ADJACENT cell untouched
+    // (which pins the store WIDTH), and ZF == success. Both opcodes must
+    // discharge at disp=0 AND disp=-24. Controls (tests/reconstruction_x86.rs
+    // `cmpxchg_narrow`): a zero-extending or 32-bit-write RAX merge, either
+    // wrong machine width, the Gpr32 class trap, an unconditional store, a
+    // suppressed store, a returns-desired variant, a missing failure load, a
+    // backwards / wide-compare / wrong-bit flag, swapped roles, the wrong source
+    // byte, a byte-swapped store, a wrong EA, a neighbour clobber, a
+    // clean-carrier SOURCE claim, and a corruption confined to concat bits above
+    // 64 ALL REFUTE. It says NOTHING about atomicity/LOCK ordering, nothing
+    // about the emitted BYTES (`decode_check.rs` still allowlists these two
+    // under NARROW_CMPXCHG, so REX / `0F B0` / the `66` prefix stay uncovered),
+    // nothing about the identity of the accumulator with the surrounding MOVs,
+    // and nothing tying w to the LIR type.
+    //
+    // The SSE lane family (Pshufd, Pmovmskb, MovdqaRR, Punpckldq, Punpcklqdq,
+    // Punpcklbw, Punpckhbw, Ptest, Pblendvb, Packuswb): NOT a reconstruction
+    // credit — every reconstruction the gate has is a per-lane same-width scalar
+    // model, and a permutation, a reduction to RFLAGS, a reduction to a GPR, an
+    // interleave, a saturating narrow and a whole-register copy are none of
+    // those. And explicitly NOT the `PackLowQwords` reconstruction, which is
+    // still the character-for-character `X == X` it always was and still
+    // credits nothing. The credit is
+    // `x86_sse_lane_proofs::sse_lane_discharges_valid`: an INDEPENDENT decoder
+    // written from the Intel SDM's `0F` / `0F 38` packed-integer maps (it models
+    // a dozen instructions the encoder never emits — PUNPCKLWD, PUNPCKHWD,
+    // PUNPCKHDQ, PUNPCKHQDQ, PACKSSWB, PACKSSDW, MOVDQU, MOVQ, PSHUFHW,
+    // PSHUFLW, BLENDVPS, BLENDVPD, the MOVDQA STORE direction and the MMX
+    // forms, so it cannot have been obtained by inverting `encode.rs`), run over
+    // the REAL emitted bytes, yielding an EXACT bit-level ROUTING denotation
+    // compared against a PARAMETRIC statement of the machine-IR intent. Equality
+    // of two such denotations decides the question for EVERY input — it is not a
+    // sampled equivalence. Two facets cannot be a routing and get their own
+    // obligations: PACKUSWB's unsigned-saturating narrow is settled EXHAUSTIVELY
+    // over all 65536 inputs (the SDM's arithmetic formulation against the
+    // machine IR's bit-pattern one), and PTEST's six status flags are settled by
+    // EVALUATION over a structured witness family that reaches ZF=1 (a random
+    // 128-bit sweep never does, so a `ZF = 0` model would otherwise survive).
+    // The hook refuses unless all ten rows have captured encodings and EVERY
+    // control refutes FOR ITS STATED REASON CLASS: the WRONG HALF (PUNPCKHBW
+    // for PUNPCKLBW) and the WRONG ELEMENT WIDTH (PUNPCKLWD / PUNPCKLDQ), plus
+    // swapped operands, identity passthrough, constant zero, the `_MM_SHUFFLE`
+    // ORDER-field reversal, PSHUFHW/PSHUFLW half-permutes, PMOVMSKB from bit 0 /
+    // reversed / sign-extended / 8-lane, PBLENDVB with the mask from the
+    // explicit source instead of XMM0 / on bit 0 / with swapped arms /
+    // dword- and qword-granular, PACKUSWB signed / halves-swapped /
+    // order-reversed, and the byte mutants (neighbour opcode bytes, prefix
+    // 66 to F3, the dropped 66, exchanged ModRM fields, mod cleared to 00, a
+    // redundant REX, a REX before the 66, a trailing byte, a truncated tail and
+    // corrupted ORDER fields). tests/x86_sse_lane_gate.rs re-derives the corpus
+    // from the LIVE encoder, sweeps all 256 register pairs per row and all 256
+    // PSHUFD immediates, and runs the SDM denotation against NATIVE SILICON. It
+    // says NOTHING about whether instruction selection chose the right
+    // instruction, permutation, mask or operands.
+    //
+    // MovsxdRMSib (the scaled SIGN-EXTENDING load) is in the denominator
+    // COVERED even though nothing emits it: emitted value/effect debt does not
+    // belong in the excluded bucket, the same posture the unemitted
+    // XorMR/AddMR RMW quartet and RolRCl hold. The SibMemAddr reconstruction
+    // cannot credit it: it builds BOTH sides of the address from the SAME
+    // operand with the SAME `recon_base`/`recon_index` symbols, so it cannot
+    // refute a wrong base, a wrong index or a base/index swap, and it has no
+    // sign-extending load model at all. `x86_movsxd_sib_proofs` supplies the
+    // missing shape: an INDEPENDENT SDM-derived decode of the REAL emitted
+    // bytes (it models the no-base SIB form, the no-index sentinel, the
+    // register-direct and RIP-relative forms, the non-SIB `[base+disp]` form,
+    // `63 /r` without REX.W and `8B /r` — none of which the MovsxdRMSib encoder
+    // arm emits, so it cannot have been obtained by inverting it), denoted as a
+    // write to the 64-bit destination ROOT over per-register leaves NAMED FROM
+    // THE DECODED REGISTER NUMBERS, against a parametric statement of the
+    // machine-IR intent. The two sides are structurally distinct by
+    // construction — a SHIFT by the raw SIB scale field against a MULTIPLY by
+    // the entry size, and an explicit sign-extend of a zero-filling load against
+    // a signed load — and the comparison REFUSES a machine side identical to the
+    // source side, so the credit cannot decay into the X==X that the retracted
+    // memory "proofs" were. The ADDRESS facet is EXACT for every 64-bit base and
+    // index (`base + index*s == base + (index << ss)` iff `s == 1 << ss`, by
+    // taking index = 1 for necessity); the VALUE facet is decided over a witness
+    // family that is REQUIRED to exercise both sign cases of the loaded
+    // doubleword. Every byte control (wrong destination, flipped REX.R/X/B,
+    // cleared REX.W, the MOV opcode, a rotated SIB scale, a rewritten SIB
+    // index/base, a dropped SIB byte, a register-direct ModR/M, a corrupted or
+    // dropped displacement, framing, a doubled REX and every redundant legacy
+    // prefix), every source re-claim, every WRONG-MODEL control run through the
+    // comparison itself (a zero-extending model, the raw `ss` as a factor, the
+    // base shifted instead of the index, a 64-bit access, a dropped
+    // displacement, a dropped index, and a machine side spelled exactly like the
+    // source side which must be refused as DEGENERATE) and every hand-written
+    // SDM decoder control must REFUTE for its stated class, with an unbuildable
+    // control counted as a battery defect rather than a refutation.
+    // tests/x86_movsxd_sib_gate.rs re-derives the corpus from the LIVE encoder,
+    // sweeps the whole destination x base x index x scale x displacement
+    // product, runs the full `verify_by_evaluation` sampling sweep and an
+    // EXHAUSTIVE sweep over a contiguous 2^16 address window. It claims NO
+    // runtime win and NO per-compile check: NOTHING EMITS THIS OPCODE, and
+    // `decode_check.rs` still allowlists it under JUMP_TABLE.
+    //
+    // `AtomicLoadCmpxchg16b`, the pseudo the selector emits for an I128
+    // `AtomicLoad` (four zeroing XORs + LOCK CMPXCHG16B), is COVERED JOINTLY:
+    // the byte-level address lane for its address, and the
+    // `X86SourceOp::AtomicLoadCmpxchg16b` reconstruction for its value (the
+    // whole expansion over arbitrary incoming registers vs the trust-ir
+    // AtomicLoad, plus the bare CMPXCHG16B vs the trust-ir CmpXchg; eleven facet
+    // equalities, per-facet non-degeneracy enforced by the reconstructor).
+    //
+    // 201 -> 206: the ZERO-EXTENDING loads `movzx r32, m8/m16` (`MovzxRM8`,
+    // `MovzxRM16`, `MovzxRM8Sib`, `VolatileMovzxRM8`, `VolatileMovzxRM16`), the
+    // selector's load for every byte and word, arrive COVERED: the byte-level
+    // address lane decodes their `[REX] 0F B6/B7 /r` bytes for the address AND
+    // the destination-write facet (the SDM register write of the decoded
+    // production against the zero-extended access value, with the merging-MOV,
+    // sign-extending and other-width models refuting through the same
+    // comparison), the MemLoad reconstruction carries the value leg, and the
+    // two volatile twins also need the VOL-x86 trace leg.
     assert_eq!(
         report.emittable_count(),
-        197,
+        206,
         "x86-64 emitted value/effect denominator changed; update the pin deliberately"
     );
     assert_eq!(
         report.covered_count(),
-        168,
+        206,
         "x86-64 GENUINE (non-degenerate / reconstructed-Valid) emittable coverage changed; \
          update the pinned numbers deliberately — do NOT re-admit X==X identities to inflate this, \
          do NOT credit a memory op without a faithful independent effective-address encoder, and \
@@ -900,44 +1982,16 @@ fn x86_emittable_coverage_is_honest_under_strict() {
         report.audit_log()
     );
     assert!(
-        (report.coverage_percent() - (168.0 / 197.0 * 100.0)).abs() < f64::EPSILON,
-        "x86-64 accepted-obligation ratio drifted from the honest 168/197"
+        (report.coverage_percent() - (206.0 / 206.0 * 100.0)).abs() < f64::EPSILON,
+        "x86-64 accepted-obligation ratio drifted from the honest 206/206"
     );
 
-    let expected_red: std::collections::HashSet<_> = [
-        X86Opcode::MovRI,
-        X86Opcode::Cmpxchg8,
-        X86Opcode::Cmpxchg16,
-        X86Opcode::Pshufd,
-        X86Opcode::Pmovmskb,
-        X86Opcode::MovdqaRR,
-        X86Opcode::Punpckldq,
-        X86Opcode::Punpcklqdq,
-        X86Opcode::Ptest,
-        X86Opcode::Pblendvb,
-        X86Opcode::Punpcklbw,
-        X86Opcode::Punpckhbw,
-        X86Opcode::Packuswb,
-        X86Opcode::VolatileMovRM8,
-        X86Opcode::VolatileMovRM16,
-        X86Opcode::VolatileMovRM32,
-        X86Opcode::VolatileMovRM,
-        X86Opcode::VolatileMovMR8,
-        X86Opcode::VolatileMovMR16,
-        X86Opcode::VolatileMovMR32,
-        X86Opcode::VolatileMovMR,
-        X86Opcode::VolatileMovssRM,
-        X86Opcode::VolatileMovssMR,
-        X86Opcode::VolatileMovsdRM,
-        X86Opcode::VolatileMovsdMR,
-        X86Opcode::VolatileMovdquRM,
-        X86Opcode::VolatileMovdquMR,
-        X86Opcode::VolatileMovdqaRM,
-        X86Opcode::VolatileMovdqaMR,
-    ]
-    .into_iter()
-    .map(|op| format!("x86_64::{op:?}"))
-    .collect();
+    // THE EXPECTED RED SET IS NOW EMPTY. It held exactly the sixteen volatile
+    // memory forms, and they were credited on a JOINT address + value +
+    // observation-boundary obligation. An empty set is the strongest form of
+    // this assertion, not the weakest: any opcode that loses its obligation
+    // appears here as an unexpected failure, and the sweep below still runs.
+    let expected_red: std::collections::HashSet<String> = std::collections::HashSet::new();
     let failures = report.failures();
     let actual_red: std::collections::HashSet<_> = failures
         .iter()
@@ -1027,156 +2081,26 @@ fn x86_unsupported_vector_pseudos_are_allowlisted_not_proof_required() {
 /// iterates `ALL_AARCH64_OPCODES`. This test independently parses the owning
 /// enum declaration and compares every variant name with the array's `Debug`
 /// names, while also rejecting duplicates. A newly classified variant omitted
-/// from the array therefore fails without relying on a maintainer to update the
-/// numeric release pin.
+/// from the array therefore fails.
 #[test]
-fn aarch64_universe_has_no_duplicates_and_matches_pinned_count() {
+fn aarch64_universe_has_no_duplicates() {
     assert_inventory_matches_enum_source(
         "AArch64",
         "AArch64Opcode",
         include_str!("../../trust-cg-ir/src/inst.rs"),
         ALL_AARCH64_OPCODES,
     );
-    // Release-baseline pin: bump intentionally after the source-vs-inventory
-    // comparison has forced the new opcode into the audit.
-    assert_eq!(
-        ALL_AARCH64_OPCODES.len(),
-        292,
-        "AArch64 opcode count changed — a variant was added/removed. Update the array AND this \
-         pinned count, and classify the new opcode in classify_aarch64 (the build already forced \
-         that). (261 = 232 + the UNIVERSE BACKFILL of 28 opcodes that existed in the enum but \
-         were absent from the audit array — compiler-checked classifier totality is NOT the \
-         same as audit coverage: the 15 exact-ordering LSE RMW forms (A-form acquire-only \
-         Ldclra/Ldeora/Ldseta/Ldsmaxa/Ldsmina/Ldumaxa/Ldumina and L-form release-only \
-         Ldaddl/Ldclrl/Ldeorl/Ldsetl/Ldsmaxl/Ldsminl/Ldumaxl/Lduminl), the 3 exact-ordering \
-         CAS/SWP forms (Casl/Swpa/Swpl) — all allowlisted with the same AtomicOperations \
-         reason as their base/AL siblings, + the 5 scalar FP ops FmaxnmRR/FminnmRR (IEEE \
-         minNum/maxNum) and FrintmRR/FrintpRR/FrintzRR (floor/ceil/trunc rounding), credited \
-         via operand reconstruction, + the 5 `.2D` FP-vectorizer NEON ops \
-         NeonFmlaV/NeonFmlsV/NeonScvtfV/NeonUcvtfV/NeonDupScalarD, credited via their 10 \
-         FAITHFUL per-lane obligations (all_neon_fpred_proofs, real-solver discharged with \
-         FMLA<->FMLS / accumulator-miswire / sign-confusion / wrong-lane refute controls). \
-         NeonUmovGen (the lane->GPR extract) then moved from FailClosedAllowlisted to \
-         EmittableNeedsProof, credited via its 30 FAITHFUL per-(size,lane) obligations \
-         (all_neon_umov_proofs: `.16B`/`.8H`/`.4S`/`.2D`, wrong-lane / wrong-size refute \
-         controls) — this does NOT change the universe LENGTH (it was already in the array), \
-         only its class. The +1 to 261 is LdrGottprel (TLS GOT-TPREL), a NEW array member \
-         classified EmittableNeedsProof and covered via aarch64_elf_tls_reloc_proofs. The \
-         +2 to 263 are NeonFcvtlV/NeonFcvtl2V (vector f32->f64 widen low/high), NEW array \
-         members covered via their 4 faithful per-lane fpext obligations \
-         (all_neon_fcvtl_proofs; wrong-half / wrong-lane refute controls). The +1 to 264 is \
-         EorRRShift (EOR Rd,Rn,Rm,ROR #k — the rotate-fusion peephole's shifted-register EOR), \
-         a NEW array member classified EmittableNeedsProof and covered via its faithful \
-         rotate-XOR obligations (all_eor_ror_shift_proofs, W+X; wrong-amount / wrong-shift-kind / \
-         operand-swap refute controls). The +1 to 265 is FcselRR (FCSEL Sd/Dd,Sn,Sm,cc — the \
-         FP-Select isel path's scalar FP conditional select), a NEW array member classified \
-         EmittableNeedsProof and covered via its faithful bit-preserving-mux obligations \
-         (all_fcsel_proofs, S+D; inverted-cond / operand-swap refute controls). The \
-         +1 to 266 is NeonFmlaLaneV (FMLA Vd.T,Vn.T,Vm.Ts[lane] — the FP fused \
-         multiply-accumulate BY ELEMENT the elementwise-FP vectorizer emits for \
-         y[i]+=da*x[i], the scalar invariant da broadcast from a lane, no DUP), a NEW \
-         array member classified EmittableNeedsProof and covered via its 20 faithful \
-         per-(arrangement,dest,selector) obligations (all_neon_fmla_lane_proofs, .4S+.2D; \
-         wrong-lane-selector / FMLA<->FMLS polarity / accumulator-miswire refute controls). \
-         The +2 to 268 are AddRRShift/SubRRShift (ADD/SUB Rd,Rn,Rm,LSL #k — the shift-ALU \
-         fusion peephole's shifted-register ADD/SUB), NEW array members classified \
-         EmittableNeedsProof and covered via their faithful ring obligations \
-         (all_add_sub_lsl_shift_proofs, W+X; wrong-amount / ADD-vs-SUB / SUB operand-swap \
-         refute controls). \
-         The +4 to 272 are NeonSmlalV/NeonSmlal2V/NeonUmlalV/NeonUmlal2V (SMLAL/SMLAL2/UMLAL/ \
-         UMLAL2 .4S -> .2D — the widening multiply-accumulate-long the neon_array widening-dot \
-         vectorizer emits for `s(i64) += ext(a_i32[i])*ext(b_i32[i])`), NEW array members \
-         classified EmittableNeedsProof and covered via their 4 faithful D-pair accumulate \
-         obligations (all_neon_smlal_proofs; sign-confusion / no-accumulate / wrong-half / \
-         truncating-mul refute controls). \
-         The +2 to 274 are NeonUaddwV/NeonUaddw2V (UADDW/UADDW2 .4S -> .2D — the widening \
-         add-wide the neon_array widening abs-sum vectorizer TRACK D emits for \
-         `s(i64) += zext64(abs_bits(a_i32[i] [+ inv]))`, replacing the UMLAL-by-ones MAC), \
-         NEW array members classified EmittableNeedsProof and covered via their 2 faithful \
-         D-pair obligations (all_neon_uaddw_proofs; sign-confusion / no-addend / wrong-half / \
-         truncating-add refute controls). \
-         The +2 to 276 are NeonSaddwV/NeonSaddw2V (SADDW/SADDW2 .4S -> .2D — the SIGNED \
-         widening add-wide the neon_predsum widening i64-acc condsum emits for \
-         `s(i64) += (a_i32[iv] as i64) [if pred]`, replacing the SMLAL-by-ones MAC), \
-         NEW array members classified EmittableNeedsProof and covered via their 2 faithful \
-         D-pair obligations (all_neon_saddw_proofs; zext-confusion [SADDW-as-UADDW] / \
-         no-addend / wrong-half / truncating-add refute controls). \
-         The +1 to 277 is AddRRShiftLsr (ADD Rd,Rn,Rm,LSR #k — the shift-ALU fusion \
-         peephole's LSR sibling, the srem/sdiv magic sign-bit correction), a NEW array \
-         entry covered via all_add_lsr_shift_proofs. \
-         The +2 to 279 are NeonMlaV (MLA.4S — the same-width tied-accumulator MAC the \
-         neon_predsum MLA-by-mask condsum accumulate emits for the Gpr32 masked-add, \
-         replacing AND + ADD.4S; NEGATED-sum accumulators folded by one wrapping SubRR) and \
-         NeonUadalpV (UADALP .4S -> .2D — the tied-accumulator pairwise widen the neon_array \
-         TRACK D abs-sum accumulate emits, replacing the UADDW/UADDW2 pair; adjacent-pair \
-         grouping is a pure mod-2^64 reassociation under the both-lanes drain), NEW array \
-         members classified EmittableNeedsProof and covered via their faithful D-pair \
-         obligations (all_neon_mla_proofs: MLS-confusion / MUL-no-accumulate / lane-swap \
-         refutes; all_neon_uadalp_proofs: SADALP-sign-confusion / UADDLP-no-accumulate / \
-         wrong-pairing refutes). \
-         The +6 to 285 are the volatile LDR/STR forms; all are denominator-bearing \
-         DeferredUnfaithfulModel RED rows because plain load/store evidence does not \
-         cover the volatile observation/ordering boundary. The +2 to 287 are the \
-         relocation-owned AddTprelHi12/AddTprelLo12 TLSLE skeletons, classified as \
-         explicit structural exclusions; the enum-source comparison caught that these \
-         classified variants were still missing from the audit array. \
-         The +1 to 288 is AlignNop (emission-time loop-head alignment padding \
-         that encodes to the architectural NOP 0xD503201F), a NEW array member \
-         classified FailClosedAllowlisted: it carries no value/memory/branch \
-         semantics to prove, its byte-exactness is enforced by the A64 \
-         decode-check arm (word must equal 0xD503201F) and its offset integrity \
-         by the EH `encoder offset == re-derived offset` cross-check; it is \
-         created only at emission by loop_align, never selected by the lowerer. \
-         The enum-source comparison caught that this classified variant was \
-         still missing from the audit array. \
-         The +2 to 290 are EorRRLsl/EorRRLsr (EOR Rd,Rn,Rm,LSL/LSR #k), \
-         the shifted-source EOR fusion forms; both are classified \
-         EmittableNeedsProof and covered through operand reconstruction with \
-         W/X and wrong-kind/wrong-amount real-solver refute controls. \
-         The +2 to 292 are StrbRO/StrhRO, narrow register-offset stores that \
-         were already classified EmittableNeedsProof but missing from the \
-         explicit audit universe; both remain honest DeferredUnfaithfulModel \
-         rows pending an independent faithful memory-effect model. \
-         The accepted/emitted-value-effect headline is 156/248 with 92 explicit \
-         DeferredUnfaithfulModel RED rows; see \
-         aarch64_emittable_coverage_is_honest_under_strict.)"
-    );
 }
 
 /// LOCKS IN universe completeness for x86-64, same rationale as the AArch64
 /// counterpart. Source of truth: crates/trust-cg-ir/src/x86_64_ops.rs.
 #[test]
-fn x86_universe_has_no_duplicates_and_matches_pinned_count() {
+fn x86_universe_has_no_duplicates() {
     assert_inventory_matches_enum_source(
         "x86-64",
         "X86Opcode",
         include_str!("../../trust-cg-ir/src/x86_64_ops.rs"),
         ALL_X86_OPCODES,
-    );
-    assert_eq!(
-        ALL_X86_OPCODES.len(),
-        230,
-        "x86-64 opcode count changed — a variant was added/removed. Update the array AND this \
-         pinned count, and classify the new opcode in classify_x86 (the build already forced that). \
-         (197 = 191 + the 2026-07-18 UNIVERSE BACKFILL of 6 opcodes that existed in the enum but \
-         were missing from the array: JmpR, MovsxdRMSib, MovRipRelTlv, Cmpxchg8, Cmpxchg16, \
-         Psadbw — the audit had been silently skipping them. The +16 to 216 are the \
-         volatile scalar/GPR/XMM memory forms; all are inventoried denominator rows. \
-         The +4 to 220 are the exact bounds/null/div-zero/shift-range proof carriers, \
-         classified as explicit pre-encoding exclusions; the enum-source comparison \
-         caught that they were still absent from the audit array. The +2 to 222 are \
-         MovsdRMSib/MovssRMSib, the scaled-index scalar-FP loads: EmittableNeedsProof, \
-         mapped by opcode_to_proof_query to the same MemLoad obligation as \
-         MovsdRM/MovssRM over the same shared SibMemAddr effective-address \
-         reconstruction that already proves MovRMSib — a composition of two proven \
-         families, adding no new trust root. The +2 to 224 are the 8-bit SIB load/store \
-         pair MovRM8Sib/MovMR8Sib; the +1 to 225 is RolRI. All three have real encoder, \
-         decoder, differential, and reconstructed-proof coverage. The +4 to 229 are the \
-         memory-destination RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib (RMW Stage 1): \
-         EmittableNeedsProof, covered by the MemRmw reconstruction — encoder, decode-check, \
-         and refutation-control coverage landed BEFORE any pass may emit them. The +1 to 230 \
-         is RolRCl, the variable-count rotate (rotate Stage 1): EmittableNeedsProof, covered \
-         by the RotlVar reconstruction — same proofs-before-emission posture.)"
     );
 }
 
@@ -1237,21 +2161,12 @@ fn riscv_inventory_pins_accepted_and_deferred_rows() {
 /// LOCKS IN universe completeness for RISC-V, same rationale as the AArch64 /
 /// x86-64 counterparts. Source of truth: crates/trust-cg-ir/src/riscv_ops.rs.
 #[test]
-fn riscv_universe_has_no_duplicates_and_matches_pinned_count() {
+fn riscv_universe_has_no_duplicates() {
     assert_inventory_matches_enum_source(
         "RISC-V",
         "RiscVOpcode",
         include_str!("../../trust-cg-ir/src/riscv_ops.rs"),
         ALL_RISCV_OPCODES,
-    );
-    // Release-baseline pin; the source comparison above is the systemic
-    // completeness check. The RiscVOpcode::tests::opcode_count test pins 83 too.
-    assert_eq!(
-        ALL_RISCV_OPCODES.len(),
-        83,
-        "RISC-V opcode count changed — a variant was added/removed. Update the array AND this \
-         pinned count, and classify the new opcode in classify_riscv (the build already forced \
-         that)."
     );
 }
 
@@ -1308,77 +2223,142 @@ fn riscv_idiom_bindings_are_non_degenerate() {
 /// NaN-mishandling lowering REFUTES. Only the 7 SIMD/v128 ops remain HONESTLY
 /// DEFERRED — left RED — pending lane-vector semantics.
 ///
-/// TRUE HONEST HEADLINE: 111 / 113 of the value-equivalence denominator. The two
-/// INTEGER constant forms are credited by P4's independent signed-LEB decode; the
-/// two FLOAT constant forms (f32.const 0x43 / f64.const 0x44) are explicit RED
-/// named deferrals, because their immediates are raw IEEE-754 payloads that the
-/// signed-LEB decoder does not reach. The three reserved v128 load/store/const
-/// forms are never selected and remain outside the denominator.
-/// The four LANE-WISE v128 value ops (i32x4.add/mul, f32x4.add/mul) are now
-/// faithfully reconstructed lane-wise (a wrong sub-opcode / lane width REFUTES).
+/// TRUE HONEST HEADLINE: 128 / 128 of the value-equivalence denominator. Of
+/// the 19 value-bearing ops the full wasm32 lowering added, 13 are
+/// reconstructed from their real bytes — clz/ctz (a clz byte for a ctz
+/// refutes), rotl/rotr (the other direction refutes), eqz (a nonzero test
+/// refutes), select (swapped values or an inverted condition refute) and
+/// copysign (over the operands' bit patterns; swapped operands, fabs or fneg
+/// refute; its captured emitted body fixes the operand order). f.min/f.max
+/// exist only inside the FMin/FMax sequence, so the 4 rows are credited by that
+/// captured emitted BODY, executed under the spec semantics for every
+/// permitted NaN result against the relational trust-ir contract (opposite-op,
+/// unguarded, inverted-guard and NaN-selecting controls refute; the -0/+0 tie
+/// is credited under trust-ir's unpinned reading). A trust-ir MemCopy/MemSet
+/// lowers to the guarded sequence (`if (n != 0)` around the op), so the
+/// memory.copy/fill rows are credited by the captured guarded BODIES, executed on a
+/// two-page memory under the spec semantics against the relational trust-ir
+/// contract (a zero count is a no-op whatever the pointers; the unguarded body
+/// refutes at a zero-byte out-of-memory range, and inverted-guard,
+/// guard-on-destination, swapped-operand, forward-byte-copy and operand
+/// truncation controls refute at their stated class; the battery observes every
+/// operand bit below the model width, and the operand-provenance check — the
+/// op's operands are the function's parameters — carries the bits above it).
+/// memory.fill is emitted only there; memory.copy is
+/// ALSO emitted, with a constant nonzero size, by the aggregate / lane / sret
+/// moves (`emit_copy`), which the credit does not cover — the MemoryCopy note
+/// must say so, and the live backend is required to emit every bulk op in one
+/// of those two forms. The two INTEGER constant forms are credited by P4's
+/// independent signed-LEB decode, the two FLOAT constant forms (f32.const 0x43
+/// / f64.const 0x44) by an independent decode of the raw IEEE-754 payload
+/// compared bit-exactly with the carrier's pattern, through a stated
+/// roundTiesToEven narrowing for f32. NOTHING in the lowerer selects a v128
+/// value, so the four lane-wise v128 value ops (i32x4.add/mul, f32x4.add/mul)
+/// and the three v128 load/store/const forms are excluded as never selected —
+/// checked, not assumed: a live corpus is scanned and must contain no
+/// 0xfd-prefixed instruction (a patched module that does is reported); the
+/// lane-wise reconstruction stays built and refutable in
+/// `reconstruction_wasm`.
 #[test]
 fn wasm_inventory_pins_accepted_and_deferred_rows() {
+    // The float credits stand on captured corpora; re-derive them from the
+    // live backend so this pin cannot stay green over frozen bytes.
+    wasm_float_live::assert_float_const_corpus_is_what_the_live_backend_emits();
+    wasm_float_live::assert_float_binop_bodies_are_what_the_live_backend_emits();
+    wasm_bulk_live::assert_bulk_memory_bodies_are_what_the_live_backend_emits();
+    // The scope the bulk-memory notes state: every emitted bulk op is either
+    // the guarded trust-ir lowering or a constant-nonzero-size aggregate copy.
+    assert!(wasm_bulk_live::assert_bulk_memory_emission_is_guarded_or_constant_sized() > 0);
+    wasm_bulk_live::assert_the_site_classifier_refuses_unguarded_and_zero_sized_ops();
+    // The never-selected exclusion is a fact about emission: no module of the
+    // live corpus contains an excluded opcode, and the scan reports one that
+    // does.
+    assert!(wasm_never_selected_live::assert_no_never_selected_opcode_is_emitted() > 0);
+    wasm_never_selected_live::assert_the_scan_reports_an_emitted_excluded_opcode();
     let report = on_large_stack(|| CoverageGate::new().audit(GateArch::Wasm));
     // Always print the full audit so the allowlist stays visible in CI logs.
     eprintln!("{}", report.audit_log());
 
-    // The denominator is the 113 value-bearing ops: 83 reconstructable scalar + 2
-    // popcnt + 4 reinterpret + 8 int->FP convert + 8 saturating trunc + 4 SIMD
-    // lane-wise value ops + 4 emitted scalar constants (2 integer + 2 float).
-    // The 3 reserved v128 forms (load/store/const) are never selected.
+    // The denominator is the 128 value-bearing ops the lowerer can emit: 83
+    // reconstructable scalar + 2 popcnt + 4 reinterpret + 8 int->FP convert + 8
+    // saturating trunc + 4 emitted scalar constants (2 integer + 2 float) + 19
+    // ops the full wasm32 lowering added (4 clz/ctz, 4 rotl/rotr, 2 eqz,
+    // select and 2 copysign, reconstructed; 4 f.min/f.max, credited by the
+    // emitted FMin/FMax body; memory.copy and memory.fill, credited by the
+    // emitted guarded MemCopy/MemSet body). The 4 lane-wise v128 value ops and
+    // the 3 v128 load/store/const forms are never selected.
     assert_eq!(
         report.emittable_count(),
-        113,
-        "wasm emittable (value-equivalence denominator) count changed — it must include the 4 \
-         SIMD lane-wise value ops and ALL FOUR scalar constants (i32/i64/f32/f64) but NOT the 3 \
+        128,
+        "wasm emittable (value-equivalence denominator) count changed — it must include ALL \
+         FOUR scalar constants (i32/i64/f32/f64) and memory.copy/fill but NOT the 7 \
          never-selected v128 forms; update deliberately. Re-check classify_wasm and \
          wasm_function_verifier::opcode_to_source_op."
     );
-    // COVERED = 83 scalar + 2 popcnt + 4 reinterpret + 16 conversion + 4 SIMD
-    // = 109 via stack-machine reconstruction, PLUS the 2 INTEGER scalar
-    // constants, which P4 credits by a different path: reconstruction cannot
-    // help a constant (const == const is a self-equality), so their evidence is
-    // an INDEPENDENT spec-derived signed-LEB decode of the real emitted
-    // immediate at canonical length. 111 total; the 2 FLOAT constants are RED.
+    // COVERED = 83 scalar + 2 popcnt + 4 reinterpret + 16 conversion + 4
+    // clz/ctz + 4 rotl/rotr + 2 eqz + select + 2 copysign = 118 via
+    // stack-machine reconstruction (copysign also needs its emitted body), PLUS
+    // 4 constants credited by a different path — reconstruction cannot help a
+    // constant (const == const is a self-equality) — an INDEPENDENT
+    // spec-derived decode of the real emitted immediate (signed-LEB at
+    // canonical length for the integers, the raw IEEE-754 payload bit-exact
+    // for the floats), PLUS the 4 f.min/f.max rows credited by the emitted
+    // FMin/FMax body, PLUS memory.copy/fill credited by the emitted guarded
+    // MemCopy/MemSet body. 128 total.
     assert_eq!(
         report.covered_count(),
-        111,
-        "wasm GENUINE covered count changed — must be 111 (83 scalar + 2 popcnt + 4 reinterpret + \
-         16 conversions + 4 SIMD lane-wise via reconstruction, + 2 INTEGER scalar constants via \
-         the P4 independent LEB decode). Do NOT inflate by crediting an op no path can faithfully \
-         model — f32.const/f64.const carry raw IEEE-754 payloads the LEB decoder cannot read.\n{}",
+        128,
+        "wasm GENUINE covered count changed — must be 128 (83 scalar + 2 popcnt + 4 reinterpret + \
+         16 conversions + 4 clz/ctz + 4 rotl/rotr + 2 eqz + select + 2 copysign via \
+         reconstruction, + 4 scalar constants via the independent LEB / float-payload decoders, \
+         + 4 f.min/f.max via the emitted FMin/FMax body, + memory.copy/fill via the emitted \
+         guarded MemCopy/MemSet body). Do NOT inflate by crediting a never-selected v128 form.\n{}",
         report.audit_log()
     );
     assert!(
-        (report.coverage_percent() - (111.0 / 113.0 * 100.0)).abs() < 0.01,
-        "wasm coverage_percent must be the honest 111/113"
+        (report.coverage_percent() - 100.0).abs() < 0.01,
+        "wasm coverage_percent must be the honest 128/128"
     );
 
-    // EXACTLY TWO RED ROWS REMAIN, and both are NAMED deferrals. This is a
-    // statement about THIS gate only — the per-instruction value-equivalence
-    // inventory — and it is emphatically NOT a claim that the wasm lane is
+    // No RED row. This is a statement about THIS gate only — the
+    // per-instruction value-equivalence inventory of the opcodes the lowerer
+    // emits — and it is emphatically NOT a claim that the wasm lane is
     // verified. The value-domain gate still carries its 4 named deferrals, the
     // CFG family's bisimulation is deferred, and the ABI family's host-memory
     // obligations are the host's. A new op that cannot be faithfully modelled
     // belongs HERE as a DeferredUnfaithfulModel RED row, never allowlisted out.
     let failures = report.failures();
-    let red: Vec<&str> = failures.iter().map(|r| r.opcode_display.as_str()).collect();
-    assert_eq!(
-        red,
-        vec!["wasm::F32Const", "wasm::F64Const"],
-        "the wasm denominator's RED rows must be exactly the two float constants:\n{}",
+    assert!(
+        failures.is_empty(),
+        "the wasm denominator has no named deferral left:\n{}",
         report.failure_summary()
     );
-    for row in &failures {
+    // The newly credited rows say what they rest on.
+    for (display, needle) in [
+        ("wasm::F32Const", "IEEE-754 payload"),
+        ("wasm::F64Const", "IEEE-754 payload"),
+        ("wasm::F32Min", "FMin/FMax body"),
+        ("wasm::F64Max", "FMin/FMax body"),
+        ("wasm::MemoryCopy", "guarded MemCopy/MemSet body"),
+        ("wasm::MemoryCopy", "does NOT cover those instances"),
+        ("wasm::MemoryCopy", "emit_copy"),
+        ("wasm::MemoryFill", "guarded MemCopy/MemSet body"),
+        (
+            "wasm::MemoryFill",
+            "emitted only by the guarded MemSet lowering",
+        ),
+        ("wasm::F32Copysign", "captured emitted body"),
+    ] {
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.opcode_display == display)
+            .unwrap_or_else(|| panic!("{display} row"));
         assert!(
-            matches!(
-                row.finding,
-                Some(CoverageFinding::DeferredUnfaithfulModel { .. })
-            ),
-            "wasm RED row {} must be an explicit DeferredUnfaithfulModel with a true reason, \
-             never a wiring gap: {:?}",
-            row.opcode_display,
-            row.finding
+            row.finding.is_none() && row.note.contains(needle),
+            "{display}: {:?} / {}",
+            row.finding,
+            row.note
         );
     }
 }
@@ -1387,34 +2367,29 @@ fn wasm_inventory_pins_accepted_and_deferred_rows() {
 /// AArch64 / x86-64 / RISC-V counterparts. Source of truth:
 /// crates/trust-cg-ir/src/wasm_ops.rs (the `WasmOpcode::tests::opcode_count` pin).
 #[test]
-fn wasm_universe_has_no_duplicates_and_matches_pinned_count() {
+fn wasm_universe_has_no_duplicates() {
     assert_inventory_matches_enum_source(
         "WebAssembly",
         "WasmOpcode",
         include_str!("../../trust-cg-ir/src/wasm_ops.rs"),
         ALL_WASM_OPCODES,
     );
-    // Release-baseline pin; the source comparison above is the systemic
-    // completeness check. The WasmOpcode::tests::opcode_count test pins 143 too.
-    assert_eq!(
-        ALL_WASM_OPCODES.len(),
-        143,
-        "wasm opcode count changed — a variant was added/removed. Update the array AND this \
-         pinned count, and classify the new opcode in classify_wasm (the build already forced \
-         that)."
-    );
 }
 
 /// LOCKS IN the DENOMINATOR-HONEST wasm partition.
 ///
 /// The value-equivalence denominator (classify_wasm EmittableNeedsProof) is now
-/// exactly 113 opcodes: the 83 reconstructable scalar value ops + the value-
+/// exactly 128 opcodes: the 83 reconstructable scalar value ops + the value-
 /// bearing ops that were wrongly allowlisted-out by the #71 bring-up (popcnt ×2,
-/// reinterpret ×4, int->FP convert ×8, saturating trunc ×8, SIMD lane ops ×4)
-/// plus the four emitted scalar constants (i32/i64 credited, f32/f64 RED). Only the
-/// GENUINELY STRUCTURAL ops (locals/globals, memory, control flow,
-/// calls) and the never-selected f.min/f.max are fail-closed-allowlisted with TRUE
-/// reasons; nop/unreachable are pseudo. This pins the partition so a value-bearing
+/// reinterpret ×4, int->FP convert ×8, saturating trunc ×8), the four emitted
+/// scalar constants (all credited by independent immediate decoders), and the
+/// 19 ops the full wasm32 lowering added (clz/ctz, rotl/rotr, eqz, select and
+/// copysign reconstructed; f.min/f.max credited by the emitted FMin/FMax body;
+/// memory.copy/fill by the emitted guarded MemCopy/MemSet body). Only the
+/// GENUINELY STRUCTURAL ops (locals/globals, word-sized memory, control flow,
+/// calls) and the never-selected v128 forms (the 4 lane-wise value ops and
+/// load/store/const) are fail-closed-allowlisted with TRUE reasons;
+/// nop/unreachable are pseudo. This pins the partition so a value-bearing
 /// op can never again be silently allowlisted OUT of the denominator to inflate
 /// the headline.
 #[test]
@@ -1436,9 +2411,11 @@ fn wasm_classifier_partition_is_honest() {
         }
     }
     assert_eq!(
-        emittable, 113,
-        "the value-equivalence denominator is 109 reconstructed rows plus the FOUR emitted scalar \
-         constants (i32/i64/f32/f64); the 3 reserved v128 load/store/const forms are never selected"
+        emittable, 128,
+        "the value-equivalence denominator is 105 reconstructed rows, the FOUR emitted scalar \
+         constants (i32/i64/f32/f64) and the 19 ops the full wasm32 lowering added (13 of them \
+         reconstructed, 4 credited by the FMin/FMax body, 2 by the guarded MemCopy/MemSet \
+         body); the 7 v128 forms (4 lane-wise value ops, load/store/const) are never selected"
     );
     assert_eq!(
         pseudo, 2,
@@ -1446,53 +2423,61 @@ fn wasm_classifier_partition_is_honest() {
     );
     assert_eq!(
         allowlisted,
-        ALL_WASM_OPCODES.len() - 113 - 2,
-        "only GENUINELY-structural opcodes are fail-closed-allowlisted (no value-bearing op may \
-         be allowlisted-out of the denominator); only the reserved never-selected v128 forms \
-         stay excluded"
+        ALL_WASM_OPCODES.len() - 128 - 2,
+        "only GENUINELY-structural opcodes are fail-closed-allowlisted (no emitted value-bearing \
+         op may be allowlisted-out of the denominator); only the never-selected v128 forms stay \
+         excluded"
     );
 }
 
-/// LOCKS IN the v128 partition after lane-wise reconstruction:
-///   * the 4 LANE-WISE value ops (i32x4.add/mul, f32x4.add/mul) are IN the
-///     value-equivalence denominator (`EmittableNeedsProof`) and are GENUINELY
-///     COVERED via reconstruction (no fake-cover, no deferral);
+/// LOCKS IN the v128 partition: the lowerer never selects a v128 value.
+///   * the 4 LANE-WISE value ops (i32x4.add/mul, f32x4.add/mul) are excluded
+///     from the value-equivalence denominator as NEVER SELECTED (no v128
+///     carrier, simd128 refused) — a credit for an opcode no emitted module
+///     contains would cover no emitted code — while their lane-wise
+///     reconstruction stays built and still discharges Valid, so they re-enter
+///     the denominator unchanged the moment selection lands;
 ///   * the 3 reserved forms (v128.load/store/const) are never selected and are
-///     allowlisted-OUT for that reason. Scalar constants are emitted and therefore
-///     do not share this classification.
-///     A regression that fake-covers a structural form, or fails to reconstruct a lane
-///     op, breaks this pin.
+///     allowlisted-OUT for the same reason. Scalar constants are emitted and
+///     therefore do not share this classification.
+///     A regression that credits a never-selected form, or loses the lane-wise
+///     reconstruction, breaks this pin.
 #[test]
 fn wasm_v128_lanewise_reconstructed_structural_allowlisted() {
     let report = on_large_stack(|| CoverageGate::new().audit(GateArch::Wasm));
 
-    // (a) The 4 lane-wise value ops are EmittableNeedsProof AND COVERED via
-    //     reconstruction (no finding).
+    // (a) The 4 lane-wise value ops are excluded as never selected, and their
+    //     reconstruction still discharges.
     for op in [
         WasmOpcode::I32x4Add,
         WasmOpcode::I32x4Mul,
         WasmOpcode::F32x4Add,
         WasmOpcode::F32x4Mul,
     ] {
-        assert!(
-            matches!(classify_wasm(op), OpcodeClass::EmittableNeedsProof),
-            "wasm::{op:?} v128 lane op must be EmittableNeedsProof (IN the denominator), got {:?}",
-            classify_wasm(op)
-        );
+        match classify_wasm(op) {
+            OpcodeClass::FailClosedAllowlisted { reason } => assert!(
+                reason.contains("never selected") && reason.contains("simd128"),
+                "wasm::{op:?} must disclose why it is never selected: {reason}"
+            ),
+            other => panic!("wasm::{op:?} must be never-selected, got {other:?}"),
+        }
         let row = report
             .rows
             .iter()
             .find(|r| r.opcode_display == format!("wasm::{op:?}"))
             .unwrap_or_else(|| panic!("wasm::{op:?} must appear in the audit"));
         assert!(
-            row.finding.is_none(),
-            "wasm::{op:?} v128 lane op must be COVERED via reconstruction (no finding), got {:?}",
+            row.finding.is_none() && matches!(row.class, OpcodeClass::FailClosedAllowlisted { .. }),
+            "wasm::{op:?} must be an excluded row, got {:?} / {:?}",
+            row.class,
             row.finding
         );
         assert!(
-            row.note.contains("RECONSTRUCTED"),
-            "wasm::{op:?} must be credited via reconstruction: {}",
-            row.note
+            trust_cg_verify::wasm_function_verifier::reconstruction_discharges_valid(
+                op,
+                &trust_cg_verify::lowering_proof::VerificationConfig::default()
+            ),
+            "wasm::{op:?}: the lane-wise reconstruction must stay discharging"
         );
     }
 
@@ -1765,251 +2750,6 @@ fn gate_reports_failure_for_an_emittable_opcode_with_no_proof() {
 // 6. Coverage percentage is a meaningful, monotone signal
 // ===========================================================================
 
-/// LOCKS IN the HONEST STRICT emittable coverage (task #61, STRICT decision).
-///
-/// The ratio is computed over emitted value/effect forms (not the whole enum,
-/// which includes pseudos and structural exclusions). Under STRICT, an opcode
-/// counts as accepted ONLY when its obligation is structurally non-degenerate
-/// (`trust_ir_expr != aarch64_expr`). The formerly-"genuine" 1:1 identities
-/// (Iadd->ADD etc.) are X==X model-consistency checks and credit ZERO — so the
-/// honest within-emittable coverage is NO LONGER 100%. Reconstruction credit
-/// still requires the machine side to be rebuilt from the real opcode and
-/// operands. The publication inventory pins:
-///   * AArch64: 156/248 accepted, with 92 named RED rows.
-///   * x86-64: 168/197 accepted, with 29 named RED rows.
-///   * RISC-V: 14/17 accepted, with 3 named RED rows.
-///   * WebAssembly: 111/113 accepted, with 2 named RED rows.
-///     Re-admitting an X==X identity, fake-covering a non-reconstructable opcode, or
-///     moving emitted value/effect debt out of the denominator trips this test.
-#[test]
-fn clean_tree_reports_honest_strict_emittable_coverage() {
-    let (aa_cov, aa_em, x86_cov, x86_em, rv_cov, rv_em, wasm_cov, wasm_em) = on_large_stack(|| {
-        let gate = CoverageGate::new();
-        let aa = gate.audit(GateArch::AArch64);
-        let x86 = gate.audit(GateArch::X86_64);
-        let rv = gate.audit(GateArch::RiscV);
-        let wasm = gate.audit(GateArch::Wasm);
-        (
-            aa.covered_count(),
-            aa.emittable_count(),
-            x86.covered_count(),
-            x86.emittable_count(),
-            rv.covered_count(),
-            rv.emittable_count(),
-            wasm.covered_count(),
-            wasm.emittable_count(),
-        )
-    });
-    // HONEST NUMBERS — genuine (non-degenerate / reconstructed-Valid) covered /
-    // emittable. AArch64 = 42 static-DB (23 + ADRP/AddPCRel reloc + B/Bl/BL
-    // branch26 + Adc/Sbc i128-carry-chain + LdrTlvp TLVP-PAGEOFF12 + LdrGot
-    // GOT_LOAD-PAGEOFF12 + Adr jump-table PC-relative base + LdrswRO jump-table
-    // scaled effective-address (AddressMode) + Ubfm/Sbfm bitfield-extract-ENCODING
-    // + 5 NEON bitwise per-lane-intent proofs + the Fcmp FCMP→NZCV+CSET flag-model
-    // proof + 15 NEON lane-wise D-pair compute proofs + 2 NEON popcount-fold D-pair
-    // proofs (CntV + UaddlpV) + 1 NEON signed-abs D-pair proof (AbsV) + 1 NEON
-    // dot-product-accumulate D-pair proof (UdotV) + 1 NEON byte-window extract op
-    // (ExtV, credited by its 5 per-immediate D-pair proofs #1/#4/#8/#12/#15) + 2 NEON signed
-    // add-long-pairwise D-pair proofs (SaddlpV) + 1 NEON bitwise insert-if-true
-    // proof (BitV) + 5 NEON FP vector ops FaddV/FsubV/FmulV/FdivV/FcmgtV, credited
-    // by the 30 per-lane FP LANE-PLUMBING obligations, both arrangements demanded)
-    // + 41
-    // reconstructed (23 integer ALU + 15 FP/div/madd + 2 FP-format casts + FmovImm
-    // VFPExpandImm encoding) = 104/104 (FULL, gate is clean). The +1 vs the prior 103
-    // is the signed add-long-pairwise op NeonSaddlpV, emitted by the widening
-    // sext(i8/i16)->i32 reduction lowering (+1 to the denominator).
-    // 111 -> 112 reconstructed: + the scalar FUSED multiply-add FMADD (the
-    // llvm.fmuladd/fma lowering, credited by its single-rounding `fp.fma`
-    // reconstruction; round-once vs round-twice refutes).
-    // 112/112 -> 122/122 (UNIVERSE BACKFILL + neon_fpred lane proofs): +10
-    // covered (FmaxnmRR/FminnmRR via the FpBinary Fmax/Fmin reconstruction +
-    // FrintmRR/FrintpRR/FrintzRR via the unary-FP reconstruction + the 5
-    // `.2D`-vectorizer NEON ops NeonFmlaV/FmlsV/ScvtfV/UcvtfV/DupScalarD via
-    // their 10 faithful per-lane obligations, all_neon_fpred_proofs) and +10
-    // emittable — back to covered == emittable, fully clean.
-    // 122/122 -> 124/124 (two independent landings): UMOV EXTRACT — NeonUmovGen
-    // moved allowlisted -> emittable, covered via its 30 faithful per-(size,lane)
-    // obligations (all_neon_umov_proofs); and TLS GOT-TPREL — LdrGottprel ->
-    // emittable, covered via aarch64_elf_tls_reloc_proofs (+1 universe too).
-    // +2 covered, +2 emittable, still clean.
-    // 124/124 -> 126/126 (FCVTL): NeonFcvtlV/NeonFcvtl2V — vector f32->f64
-    // widen (low/high halves), covered via 4 faithful per-lane fpext
-    // obligations (all_neon_fcvtl_proofs; wrong-half/wrong-lane refutes);
-    // +2 universe, +2 covered, +2 emittable, still clean.
-    // 126/126 -> 127/127 (EorRRShift): the rotate-fusion peephole's shifted-
-    // register EOR-ROR, covered via its faithful rotate-XOR obligations
-    // (all_eor_ror_shift_proofs, W+X; wrong-amount/wrong-shift-kind/operand-swap
-    // refutes); +1 universe, +1 covered, +1 emittable, still clean.
-    // 127/127 -> 128/128 (FcselRR): the FP-Select isel path's scalar FP
-    // conditional select, covered via its faithful bit-preserving-mux obligations
-    // (all_fcsel_proofs, S+D; inverted-cond/operand-swap refutes); +1 universe,
-    // +1 covered, +1 emittable, still clean.
-    // 128/128 -> 129/129 (NeonFmlaLaneV): the NEON FP fused multiply-accumulate
-    // BY ELEMENT (FMLA Vd.T,Vn.T,Vm.Ts[lane]) the elementwise-FP vectorizer emits
-    // for y[i]+=da*x[i] (da broadcast from a lane, no DUP), covered via its 20
-    // faithful per-(arrangement,dest,selector) obligations (all_neon_fmla_lane_proofs,
-    // .4S+.2D; wrong-lane-selector/FMLA<->FMLS polarity/accumulator-miswire refutes);
-    // +1 universe, +1 covered, +1 emittable, still clean.
-    // 129/129 -> 131/131 (AddRRShift, SubRRShift): the shift-ALU fusion peephole's
-    // shifted-register ADD/SUB (ADD/SUB Rd,Rn,Rm,LSL #k), each covered via its
-    // faithful ring obligations (all_add_sub_lsl_shift_proofs, W+X; wrong-amount /
-    // ADD-vs-SUB / SUB operand-swap refutes); +2 universe, +2 covered, +2 emittable,
-    // still clean.
-    // 131/131 -> 135/135 (NeonSmlalV/NeonSmlal2V/NeonUmlalV/NeonUmlal2V): the NEON
-    // widening multiply-accumulate-long (SMLAL/SMLAL2/UMLAL/UMLAL2 .4S -> .2D) the
-    // neon_array widening-dot vectorizer emits for `s(i64) += ext(a_i32[i]) *
-    // ext(b_i32[i])`, each covered via its faithful D-pair accumulate obligation
-    // (all_neon_smlal_proofs; sign-confusion / no-accumulate / wrong-half /
-    // truncating-mul refutes); +4 universe, +4 covered, +4 emittable, still clean.
-    // 135/135 -> 137/137 (NeonUaddwV/NeonUaddw2V): the NEON widening add-wide
-    // (UADDW/UADDW2 .4S -> .2D) the neon_array widening abs-sum vectorizer
-    // (TRACK D) emits for `s(i64) += zext64(abs_bits(a_i32[i] [+ inv]))`,
-    // each covered via its faithful D-pair obligation (all_neon_uaddw_proofs;
-    // sign-confusion / no-addend / wrong-half / truncating-add refutes);
-    // +2 universe, +2 covered, +2 emittable, still clean.
-    // 137/137 -> 139/139 (NeonSaddwV/NeonSaddw2V): the NEON SIGNED widening
-    // add-wide (SADDW/SADDW2 .4S -> .2D) the neon_predsum widening i64-acc
-    // condsum emits for `s(i64) += (a_i32[iv] as i64) [if pred]`, each covered
-    // via its faithful D-pair obligation (all_neon_saddw_proofs; zext-confusion
-    // [SADDW-as-UADDW] / no-addend / wrong-half / truncating-add refutes);
-    // +2 universe, +2 covered, +2 emittable, still clean.
-    // 139/139 -> 140/140 (AddRRShiftLsr): the shift-ALU fusion peephole's
-    // LSR-shifted ADD (ADD Rd,Rn,Rm,LSR #k — the srem/sdiv magic sign-bit
-    // correction), covered via its faithful obligations (all_add_lsr_shift_proofs,
-    // W+X; wrong-amount / ASR-not-LSR / LSL-not-LSR / SUB-not-ADD refutes);
-    // +1 universe, +1 covered, +1 emittable, still clean.
-    // 141/141 -> 143/143 (NeonMlaV + NeonUadalpV): the NEON vector
-    // multiply-accumulate (MLA.4S, the neon_predsum MLA-by-mask condsum
-    // accumulate) and pairwise widening accumulate (UADALP .4S -> .2D, the
-    // neon_array TRACK D abs-sum accumulate), each covered via its faithful
-    // D-pair obligation (all_neon_mla_proofs: MLS-confusion /
-    // MUL-no-accumulate / lane-swap refutes; all_neon_uadalp_proofs:
-    // SADALP-sign-confusion / UADDLP-no-accumulate / wrong-pairing refutes);
-    // +2 universe, +2 covered, +2 emittable, still clean.
-    // 143/143 -> 144 covered of 144 at that stage (NeonRbitV): the NEON
-    // per-byte 8-bit reverse (RBIT.16B,
-    // the neon-bitrev vectorizer's `a[i].reverse_bits()` over `[u8; N]`), covered
-    // via its faithful D-pair obligation (proof_neon_rbitv_16b: identity /
-    // byte-swap [REV16.8B] / 16-bit-lane-reverse [wrong-width] refutes); +1
-    // universe, +1 covered, +1 emittable. Publication re-audit then withdrew
-    // opcode-wide MOVN/MOVK credit. The publication audit then restored all
-    // emitted value/effect forms to the denominator, producing 145/238. The six
-    // volatile forms subsequently added to the enum are explicit RED rows,
-    // yielding the 151/244 inventory. NeonRev32V then left the deferred set
-    // (faithful per-byte within-32-bit-word reverse obligations at both emitted
-    // arrangements, .16B and .8B), giving 151/244. EorRRLsl/EorRRLsr then add
-    // two reconstructed shifted-source forms, giving 153/246. Umull then left
-    // the deferred set via its faithful widening obligation, giving 154/246;
-    // the complete packed-NZCV TST W/X authority removes another RED row. The
-    // combined packed-NZCV TST authority yields 155/246 with 91 RED rows.
-    // RorRI (now emitted STANDALONE by the rotate recognizer when the EOR does
-    // not fuse) then left the deferred set on BOTH counts its deferred reason
-    // named — its faithful width-complete W+X rotate obligations
-    // (all_ror_immediate_proofs; wrong-amount / ROR-vs-LSR / rotate-direction
-    // refute controls) AND the width- and immediate-sensitive per-instruction
-    // EXTR-alias reconstruction — giving 156/246 with 90 RED rows. Adding the
-    // previously omitted StrbRO/StrhRO audit rows — both honest
-    // DeferredUnfaithfulModel pending a faithful memory-effect model —
-    // produces the current 156/248 inventory with 92 explicit RED rows.
-    // RorRI is ONE opcode and moves ONE row: both lines of work promoted the
-    // same row, so the union is 156/248 with 92 RED, NOT 157/248 with 91.
-    // (Reversing the last two moves — StrbRO/StrhRO first at 155/248 with 93
-    // RED rows, then RorRI — reaches the identical inventory.)
-    assert_eq!(
-        (aa_cov, aa_em),
-        (156, 248),
-        "AArch64 accepted-obligation inventory changed; update the pins deliberately \
-         — do NOT re-admit X==X identities NOR fake-cover a non-reconstructable opcode"
-    );
-    assert_eq!(
-        (x86_cov, x86_em),
-        (168, 197),
-        "x86-64 strict emittable coverage changed; update the pinned honest numbers deliberately \
-         — do NOT re-admit X==X identities NOR fake-cover a non-reconstructable opcode. x86-64 is \
-         now at honest 168/197: 13 actively emitted former exclusions and 16 volatile memory \
-         forms are explicit DeferredUnfaithfulModel RED rows. The 167 -> 168 net (rotate Stage 1): \
-         RolRCl (ROL r/m64, CL) joins via the RotlVar reconstruction — the bridge's masked \
-         shl/shr/or rotate idiom vs the independent hardware-masked encode_rol_rcl_masked, TOTAL \
-         (precondition-free), machine half keyed off the real opcode; ROR-for-ROL / dropped wrap \
-         half / unmasked count / wrong mask 31 / SHL-for-ROL REFUTE (rotl_var controls). Nothing \
-         emits RolRCl yet: Stage-2's variable-rotate peephole is admission-gated on this very \
-         reconstruction. The 163 -> 167 net (RMW Stage 1): \
-         the memory-destination RMW ALU quartet XorMR/AddMR/XorMRSib/AddMRSib joins via the \
-         MemRmw reconstruction — the COMPOSITION of the proven MemStore shape (address half + \
-         stored-value half) and the proven MemAlu shape (the REAL encode_xor_rr/encode_add_rr \
-         over a load of the same EA) on the shared `x86_reconstruct_effective_address`; wrong EA / \
-         Add-for-Xor / dropped-or-wrong src / plain-store-for-RMW REFUTE (mem_rmw controls). \
-         Nothing emits the quartet yet: Stage-2's fusion peephole is admission-gated on this very \
-         reconstruction. The 155 -> 157 net (X10): the 32-bit \
-         SIB MOV pair MovRM32Sib/MovMR32Sib joins the memory tier via the SAME SibMemAddr EA \
-         reconstruction at I32 width (wrong base/index/scale/disp/width REFUTES). The \
-         154 -> 155 net (X9 slice 3): \
-         ImulRMSib, the scaled-index sibling of ImulRM produced by the RM-fusion peephole, joins \
-         the memory-ALU family — same Imul low-half value proof, SIB EA covered by the SAME \
-         independent `x86_reconstruct_effective_address` SibMemAddr encoders as MovRMSib (wrong \
-         base/index/scale/disp REFUTES). The 151 -> 154 net (OPT-12 / VEC-Q): \
-         PSLLQ/PSRLQ (new i64x2 uniform-immediate shifts, static-DB proofs parallel to \
-         PSLLD/PSRLD) +2/+2, and PMULUDQ FailClosedAllowlisted -> EmittableNeedsProof +1/+1 \
-         (faithful same-width i64x2 lane model `lo32(a)*lo32(b)` vs the INDEPENDENT SDM \
-         even-dword-extract/zext/mul machine model; odd-lane / sign-extend / low-half wrong \
-         models REFUTE). The 149 -> 151 net (OPT-7): the scaled- \
-         index 64-bit memory MOVs MovRMSib/MovMRSib flip FailClosedAllowlisted -> EmittableNeedsProof \
-         (+2/+2), COVERED by the SAME Load_I64/Store_I64 effective-address memory proofs as \
-         MovRM/MovMR (`x86_reconstruct_effective_address` already models the SibMemAddr \
-         `base+index*scale+disp` EA on both the trust_ir and INDEPENDENT machine encoders; a wrong \
-         base/index/scale/disp REFUTES). The earlier 148 -> 149 net: MFENCE (SeqCst \
-         fence, slice 3) is a single-thread no-op whose only faithful value proof is X==X, so it is \
-         correctly FailClosedAllowlisted (coverage NOT claimed, like RET/CALL) — slice 3 had wrongly \
-         marked it EmittableNeedsProof, leaving it emittable-but-uncoverable (the clean-tree gate was \
-         actually RED at 148/149); with Mfence allowlisted the base is a clean 148/148, and (+1) \
-         CMPXCHG (compare_exchange, slice 4) flips FailClosedAllowlisted -> EmittableNeedsProof, \
-         covered by the width-polymorphic Cmpxchg i32/i64 conditional-data-flow proofs (returns-old + \
-         conditional-store + success-flag; the negative controls REFUTE). The growth 123 -> 139 is the MEMORY \
-         tier (task #76): GENUINE effective-address reconstruction of loads/stores \
-         (MovRM*/MovMR*/MovsdRM/MovssRM/MovsdMR/MovssMR), memory-ALU (AddRM/SubRM/CmpRM = reg OP \
-         load(ea)), and in-place Inc/Dec, via the deterministic `SmtExpr::MemLoad` memory model. \
-         The growth 139 -> 144 is the IMPLICIT-OPERAND tier: ImulRM (reg-mem multiply via the \
-         memory-ALU family), Idiv/Div (the genuine double-width sext/zext RDX:RAX dividend with \
-         sdiv/udiv quotient+remainder, precond divisor!=0 & no-overflow; IDIV-as-DIV refutes on a \
-         negative dividend), and Cmovcc/Cmovcc32 (a genuine CMP+CMOV pair with a per-cc boolean \
-         over the real ZF/SF/CF/OF/PF flags; a wrong cc refutes). The growth 144 -> 148 is the \
-         PACKED 128-bit MOVE tier: MOVDQU/MOVDQA RM+MR whole-XMM spill/reload moves, \
-         reconstructed as two 64-bit halves at ea/ea+8 (little-endian) via the same independent \
-         effective-address encoders (MOVDQA carries the honest ea%16==0 precondition; a wrong \
-         EA/half/offset/width/value refutes). NO X==X anywhere"
-    );
-    assert_eq!(
-        (rv_cov, rv_em),
-        (14, 17),
-        "RISC-V accepted/deferred inventory changed from 14/17; LUI/XORI/SLTIU must remain \
-         denominator-bearing RED until individually reconstructed"
-    );
-    // wasm (task #71 + denominator-honesty + faithful-conversion + v128 lane-wise):
-    // the 4th backend, a STACK MACHINE. COVERED = 83 scalar + 2 popcnt + 4
-    // reinterpret + 16 conversion + 4 SIMD lane-wise = 109 (all via stack-machine
-    // reconstruction; wrong byte / width / wiring / signedness / saturation / NaN /
-    // SIMD sub-opcode / lane-width REFUTES). The 3 STRUCTURAL v128 forms
-    // (load/store/const) are never-selected and allowlisted-OUT. The two INTEGER
-    // scalar constants are credited by P4's INDEPENDENT spec-derived signed-LEB
-    // decode of the real emitted immediate (reconstruction cannot help a constant
-    // — const == const is a self-equality). The two FLOAT constants joined the
-    // mirror with the same P4 work and are RED: their immediates are raw
-    // IEEE-754 payloads the LEB decoder does not reach.
-    // HEADLINE: 111/113 on THIS gate, which is not a claim that the lane is
-    // verified — see wasm_deferred_value_op_reason and the P3 value-domain
-    // deferrals.
-    assert_eq!(
-        (wasm_cov, wasm_em),
-        (111, 113),
-        "wasm emittable coverage changed from 111/113 — a reconstructable opcode stopped \
-         discharging Valid (bad), or a value-bearing op was allowlisted-OUT of the denominator to \
-         inflate the headline (forbidden), or a structural v128 form was wrongly put back IN the \
-         denominator. If P4's LEB decoder stops discharging, the two integer constant rows must go \
-         RED again, never quietly allowlisted; f32.const/f64.const may only turn green on a real \
-         independent float-payload decode obligation. Update deliberately."
-    );
-}
-
 /// LOCKS IN the task #61 honesty fix at the DISCHARGE layer: a degenerate proof
 /// (`trust_ir_expr == aarch64_expr`, an X==X self-equality not on
 /// GENUINE_IDENTITY_ALLOWLIST) must NOT count as coverage even though it
@@ -2068,6 +2808,9 @@ fn degenerate_backed_opcodes_are_honestly_allowlisted_with_disclosing_reason() {
     // AArch64 canonical emitted value/effect forms stay proof-required.
     let aarch64_degen = [
         AArch64Opcode::MovR,
+        // The typed post-allocation copies are emitted by `lower_copies`.
+        AArch64Opcode::MOVWrr,
+        AArch64Opcode::MOVXrr,
         AArch64Opcode::FmovFprFpr,
         AArch64Opcode::Csel,
         AArch64Opcode::Csinc,
@@ -2090,10 +2833,9 @@ fn degenerate_backed_opcodes_are_honestly_allowlisted_with_disclosing_reason() {
         );
     }
 
-    // Typed aliases are never selected, and RET is a structural control edge.
+    // Typed STR aliases are never selected, and RET is a structural control
+    // edge. (The typed MOV aliases are emitted post-RA copies; see above.)
     for op in [
-        AArch64Opcode::MOVWrr,
-        AArch64Opcode::MOVXrr,
         AArch64Opcode::STRWui,
         AArch64Opcode::STRXui,
         AArch64Opcode::STRSui,
@@ -2111,13 +2853,15 @@ fn degenerate_backed_opcodes_are_honestly_allowlisted_with_disclosing_reason() {
         }
     }
 
-    // x86: MovRI is emitted value materialization and therefore remains explicit
-    // RED denominator debt. Jmp/Call/Ret are structural control edges. (Lea /
+    // x86: MovRI is emitted value materialization and therefore stays IN the
+    // denominator. Jmp/Call/Ret are structural control edges. (Lea /
     // LeaSib are NO LONGER in this list — they
     // are now CREDITED via operand reconstruction: the machine side is rebuilt
     // from the real effective-address encoder over fresh symbolic base/index, and
-    // a wrong scale/disp refutes. MovRI stays HONESTLY DEFERRED — const==const
-    // with no independent constant model in the single instruction.)
+    // a wrong scale/disp refutes. MovRI is const==const in the single
+    // instruction, so reconstruction can never help it; it is CREDITED instead
+    // by x86_encoding_proofs' independent SDM-derived decode of the real emitted
+    // bytes.)
     assert!(
         matches!(
             classify_x86(X86Opcode::MovRI),
@@ -2125,6 +2869,40 @@ fn degenerate_backed_opcodes_are_honestly_allowlisted_with_disclosing_reason() {
         ),
         "x86_64::MovRI is emitted value materialization and must stay in the denominator"
     );
+    {
+        let report = on_large_stack(|| CoverageGate::new().audit(GateArch::X86_64));
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.opcode_display == "x86_64::MovRI")
+            .expect("x86_64::MovRI missing from audit");
+        assert!(
+            row.finding.is_none(),
+            "x86_64::MovRI must be CREDITED by the independent SDM-derived MOV-immediate decode \
+             (x86_encoding_proofs) — it stays IN the denominator, and if that hook ever stops \
+             discharging it must return as an explicit ProofNotDischarged RED row rather than \
+             being allowlisted out: {:?}",
+            row.finding
+        );
+        assert!(
+            row.note.contains("DECODED")
+                && row.note.contains("x86_encoding_proofs")
+                && row.note.contains("mutants REFUTE")
+                && row.note.contains("Says nothing about whether the LOWERING"),
+            "x86_64::MovRI credit note must name its evidence and its non-claim: {}",
+            row.note
+        );
+        assert!(
+            !row.note.contains("[reconstruction]") && !row.note.contains("DEGENERATE"),
+            "x86_64::MovRI is NOT a reconstruction credit: {}",
+            row.note
+        );
+        assert!(
+            trust_cg_verify::coverage_gate::x86_deferred_value_op_reason(X86Opcode::MovRI)
+                .is_none(),
+            "a credited row must not also sit in the deferred table"
+        );
+    }
     for op in [X86Opcode::Jmp, X86Opcode::Call, X86Opcode::Ret] {
         match classify_x86(op) {
             OpcodeClass::FailClosedAllowlisted { reason } => assert!(
@@ -2168,6 +2946,221 @@ fn degenerate_backed_opcodes_are_honestly_allowlisted_with_disclosing_reason() {
             classify_riscv(op)
         );
     }
+}
+
+/// A FAILING MovRI HOOK IS RED IN THE WHOLE REPORT, NOT JUST IN ITS ROW.
+///
+/// The credit hook `x86_encoding_proofs::mov_imm_discharges_valid` reads a fixed
+/// corpus, so no ordinary test can make it return `Err`. Before this test
+/// existed, the gate's hook-failure arm never ran with a real `Err`. Rewriting that
+/// arm to report no finding left every test green, and with a broken obligation
+/// stacked on top the ratio pins still read the credited count. The gate is now
+/// handed an `Err` directly. The row must become `ProofNotDischarged` carrying
+/// the hook's reason, MovRI must be the ONE extra failure, and the covered count
+/// must drop by exactly one. With the real hook result, the injected audit must
+/// equal the ordinary one row for row.
+#[test]
+fn movri_hook_failure_is_red_in_the_whole_report() {
+    let (real, injected_ok, injected_err, real_credit) = on_large_stack(|| {
+        let gate = CoverageGate::new();
+        let real = gate.audit(GateArch::X86_64);
+        let real_credit = trust_cg_verify::x86_encoding_proofs::mov_imm_discharges_valid();
+        let injected_ok = gate.audit_x86_with_movri_credit(&real_credit);
+        let injected_err = gate
+            .audit_x86_with_movri_credit(&Err("INJECTED: a negative control survived".to_string()));
+        (real, injected_ok, injected_err, real_credit)
+    });
+    assert!(real_credit.is_ok(), "{real_credit:?}");
+    assert_eq!(
+        real.rows, injected_ok.rows,
+        "the injection seam must not change the audit when handed the real hook result"
+    );
+
+    let row = injected_err
+        .rows
+        .iter()
+        .find(|row| row.opcode_display == "x86_64::MovRI")
+        .expect("x86_64::MovRI missing from the injected audit");
+    match &row.finding {
+        Some(CoverageFinding::ProofNotDischarged { proof_name, detail }) => {
+            assert!(proof_name.contains("MOV r,imm"), "{proof_name}");
+            assert!(detail.contains("INJECTED"), "{detail}");
+        }
+        other => panic!(
+            "a failing MovRI hook must surface as ProofNotDischarged (a regression, not a \
+             deferral and not a credit), got {other:?}"
+        ),
+    }
+    assert_eq!(row.class, OpcodeClass::EmittableNeedsProof);
+    assert_eq!(
+        injected_err.emittable_count(),
+        real.emittable_count(),
+        "a failing hook must not move MovRI out of the denominator"
+    );
+    assert_eq!(
+        injected_err.covered_count() + 1,
+        real.covered_count(),
+        "a failing MovRI hook must cost exactly one covered row"
+    );
+    let real_red: std::collections::BTreeSet<_> = real
+        .failures()
+        .iter()
+        .map(|r| r.opcode_display.clone())
+        .collect();
+    let injected_red: std::collections::BTreeSet<_> = injected_err
+        .failures()
+        .iter()
+        .map(|r| r.opcode_display.clone())
+        .collect();
+    let extra: Vec<_> = injected_red.difference(&real_red).cloned().collect();
+    assert_eq!(extra, vec!["x86_64::MovRI".to_string()]);
+    assert!(real_red.is_subset(&injected_red));
+
+    // The row builder on its own, both arms.
+    let ok_row = trust_cg_verify::coverage_gate::x86_movri_audit_row(
+        "x86_64::MovRI".to_string(),
+        real_credit.clone(),
+    );
+    assert!(ok_row.finding.is_none());
+    let err_row = trust_cg_verify::coverage_gate::x86_movri_audit_row(
+        "x86_64::MovRI".to_string(),
+        Err("why".to_string()),
+    );
+    assert!(err_row.is_failure());
+}
+
+/// A FAILING MOVSXD-SIB HOOK IS RED IN THE WHOLE REPORT, NOT JUST IN ITS ROW.
+///
+/// The sibling of `movri_hook_failure_is_red_in_the_whole_report`, for the same
+/// reason: `x86_movsxd_sib_proofs::movsxd_sib_discharges_valid` reads a fixed
+/// corpus, so no ordinary test can make it return `Err`, and without this seam
+/// the gate's hook-failure arm would never run with a real `Err`. Rewriting that
+/// arm to report no finding would leave every test green while the ratio pins
+/// still read the credited count.
+///
+/// The row must become `ProofNotDischarged` carrying the hook's reason — NOT a
+/// `DeferredUnfaithfulModel`, because the tests that require every x86 RED row
+/// to be named deferral debt must then fail loudly — `MovsxdRMSib` must be the
+/// ONE extra failure, the denominator must not move, and the covered count must
+/// drop by exactly one.
+#[test]
+fn movsxd_sib_hook_failure_is_red_in_the_whole_report() {
+    let (real, injected_ok, injected_err, real_credit) = on_large_stack(|| {
+        let gate = CoverageGate::new();
+        let real = gate.audit(GateArch::X86_64);
+        let real_credit = trust_cg_verify::x86_movsxd_sib_proofs::movsxd_sib_discharges_valid();
+        let injected_ok = gate.audit_x86_with_movsxd_sib_credit(&real_credit);
+        let injected_err = gate.audit_x86_with_movsxd_sib_credit(&Err(
+            "INJECTED: a wrong-model control survived".to_string(),
+        ));
+        (real, injected_ok, injected_err, real_credit)
+    });
+    assert!(real_credit.is_ok(), "{real_credit:?}");
+    assert_eq!(
+        real.rows, injected_ok.rows,
+        "the injection seam must not change the audit when handed the real hook result"
+    );
+
+    let row = injected_err
+        .rows
+        .iter()
+        .find(|row| row.opcode_display == "x86_64::MovsxdRMSib")
+        .expect("x86_64::MovsxdRMSib missing from the injected audit");
+    match &row.finding {
+        Some(CoverageFinding::ProofNotDischarged { proof_name, detail }) => {
+            assert!(proof_name.contains("x86_movsxd_sib"), "{proof_name}");
+            assert!(detail.contains("INJECTED"), "{detail}");
+        }
+        other => panic!(
+            "a failing MOVSXD-SIB hook must surface as ProofNotDischarged (a regression, not a \
+             deferral and not a credit), got {other:?}"
+        ),
+    }
+    assert_eq!(row.class, OpcodeClass::EmittableNeedsProof);
+    assert_eq!(
+        injected_err.emittable_count(),
+        real.emittable_count(),
+        "a failing hook must not move MovsxdRMSib out of the denominator"
+    );
+    assert_eq!(
+        injected_err.covered_count() + 1,
+        real.covered_count(),
+        "a failing MOVSXD-SIB hook must cost exactly one covered row"
+    );
+    let real_red: std::collections::BTreeSet<_> = real
+        .failures()
+        .iter()
+        .map(|r| r.opcode_display.clone())
+        .collect();
+    let injected_red: std::collections::BTreeSet<_> = injected_err
+        .failures()
+        .iter()
+        .map(|r| r.opcode_display.clone())
+        .collect();
+    let extra: Vec<_> = injected_red.difference(&real_red).cloned().collect();
+    assert_eq!(extra, vec!["x86_64::MovsxdRMSib".to_string()]);
+    assert!(real_red.is_subset(&injected_red));
+
+    // The row builder on its own, both arms.
+    let ok_row = trust_cg_verify::coverage_gate::x86_movsxd_sib_audit_row(
+        "x86_64::MovsxdRMSib".to_string(),
+        real_credit.clone(),
+    );
+    assert!(ok_row.finding.is_none());
+    assert!(
+        ok_row.note.contains("NOTHING EMITS THIS OPCODE"),
+        "the credited row must say plainly that nothing emits it: {}",
+        ok_row.note
+    );
+    let err_row = trust_cg_verify::coverage_gate::x86_movsxd_sib_audit_row(
+        "x86_64::MovsxdRMSib".to_string(),
+        Err("why".to_string()),
+    );
+    assert!(err_row.is_failure());
+}
+
+/// `MovsxdRMSib` must be IN the denominator and CREDITED — never allowlisted out
+/// again, and never silently credited by the SibMemAddr reconstruction.
+///
+/// The old allowlist reason claimed the scaled effective address was already the
+/// `x86_reconstruct_effective_address` family's. It is not evidence: that
+/// reconstruction builds BOTH sides of a `SibMemAddr` from the SAME operand with
+/// the SAME `recon_base` / `recon_index` symbols, so a wrong base, a wrong index
+/// or a base/index swap cannot refute, and it has no sign-extending load model.
+/// This pins that the row is credited by the byte-level obligation instead.
+#[test]
+fn movsxd_sib_is_in_the_denominator_and_byte_credited() {
+    assert!(
+        matches!(
+            classify_x86(X86Opcode::MovsxdRMSib),
+            OpcodeClass::EmittableNeedsProof
+        ),
+        "MovsxdRMSib is emitted value/effect debt; it must never be allowlisted OUT of the \
+         denominator again"
+    );
+    assert!(
+        x86_deferred_value_op_reason(X86Opcode::MovsxdRMSib).is_none(),
+        "MovsxdRMSib is credited, not deferred model debt"
+    );
+    let row = on_large_stack(|| {
+        CoverageGate::new()
+            .audit(GateArch::X86_64)
+            .rows
+            .into_iter()
+            .find(|r| r.opcode_display == "x86_64::MovsxdRMSib")
+            .expect("x86_64::MovsxdRMSib row")
+    });
+    assert!(row.finding.is_none(), "{row:?}");
+    assert!(
+        row.note.contains("x86_movsxd_sib_proofs"),
+        "the row must name the byte-level obligation, not a reconstruction: {}",
+        row.note
+    );
+    assert!(
+        !row.note.contains("RECONSTRUCTED from real"),
+        "MovsxdRMSib must NOT be credited by the SibMemAddr reconstruction: {}",
+        row.note
+    );
 }
 
 // ===========================================================================
@@ -2468,12 +3461,30 @@ fn x86_wired_packed_opcodes_resolve_to_width_lane_exact_discharging_proofs() {
     }
 }
 
-/// LOCKS IN that the actively emitted packed opcodes without faithful models stay
-/// in the denominator as explicit RED rows. These cannot be reconstructed as a
-/// clean per-lane scalar op:
-/// PSHUFD (imm8 shuffle), PBLENDVB (mask reg), PTEST/PMOVMSKB (cross-lane flag/
-/// sign reductions), PUNPCK*/PACKUSWB (interleave/narrow shuffles), and MOVDQA
-/// register copy. PINSR*/PEXTR* remain excluded because they are never selected.
+/// LOCKS IN that the ten actively emitted SSE LANE opcodes stay IN the
+/// denominator and are credited by the SSE lane family — never allowlisted out,
+/// never quietly reclassified.
+///
+/// They were RED for a stated reason: none of them is a per-lane same-width
+/// scalar op, and a per-lane reconstruction was the only shape the gate had.
+/// PSHUFD is an imm8 permutation, PBLENDVB has a hidden third operand, PTEST
+/// reduces to RFLAGS, PMOVMSKB reduces to a GPR, PUNPCK*/PACKUSWB cross the lane
+/// boundary, and MOVDQA{RR} is a whole-register copy. `x86_sse_lane_proofs`
+/// supplies the shape that does fit: an INDEPENDENT SDM-derived decode of the
+/// real emitted bytes yielding an EXACT bit-level ROUTING denotation, compared
+/// against a PARAMETRIC statement of the machine-IR intent.
+///
+/// THIS TEST IS THE ANTI-LAUNDERING PIN. The forbidden move is promoting a row
+/// by deleting a table entry or by reclassifying it out of the denominator, so
+/// every row is asserted to be `EmittableNeedsProof` STILL — in the denominator,
+/// counted — and its note is asserted to name the SDM evidence, so a row that
+/// went green by any other route fails here. The `Punpcklqdq` row is the
+/// specific case the gate's own correction comment recorded: its degenerate
+/// `PackLowQwords` reconstruction is still `X == X` and still credits nothing,
+/// and the WRONG HALF / WRONG ELEMENT WIDTH controls that correction named as
+/// missing are what the credit now rests on.
+///
+/// PINSR*/PEXTR* remain excluded because they are never selected.
 ///
 /// NOTE: PANDN, PCMPEQQ, PCMPGTQ, PMULLW, PMULLD were PROMOTED out of this list —
 /// they are now GENUINELY RECONSTRUCTED lane-wise (see
@@ -2484,15 +3495,21 @@ fn x86_wired_packed_opcodes_resolve_to_width_lane_exact_discharging_proofs() {
 /// `x86_wired_packed_opcodes_resolve_to_width_lane_exact_discharging_proofs`).
 /// Do NOT re-add any of them here.
 #[test]
-fn x86_emitted_deferred_packed_opcodes_stay_red() {
+fn x86_emitted_sse_lane_opcodes_stay_in_the_denominator_and_are_sdm_credited() {
+    // These ten credits are corpus-based: the hook decodes CAPTURED bytes. Pin
+    // them to what the live encoder emits today, here, in the target that
+    // asserts they are green — otherwise an encoder change that made the bytes
+    // wrong would leave this test passing over a frozen capture, with only
+    // `x86_sse_lane_gate` catching it.
+    assert_sse_lane_corpus_is_what_the_live_encoder_emits();
     let report = on_large_stack(|| CoverageGate::new().audit(GateArch::X86_64));
     for op in [
         X86Opcode::Pshufd,
         X86Opcode::Pmovmskb,
-        // MovdqaRR (register-register) stays separate explicit RED debt; the MEMORY forms
-        // MovdqaRM/MovdqaMR (and MovdquRM/MovdquMR) are PROMOTED OUT — they are now
-        // genuinely reconstructed as two 64-bit halves at ea/ea+8 (see
-        // `x86_packed_128bit_moves_are_reconstructed`). Do NOT re-add RM/MR here.
+        // MovdqaRR (register-register) is credited by the SSE lane family; the
+        // MEMORY forms MovdqaRM/MovdqaMR (and MovdquRM/MovdquMR) are credited
+        // by the two-64-bit-halves-at-ea/ea+8 reconstruction instead (see
+        // `x86_packed_128bit_moves_are_reconstructed`). Do NOT move RM/MR here.
         X86Opcode::MovdqaRR,
         X86Opcode::Punpckldq,
         X86Opcode::Punpcklqdq,
@@ -2504,7 +3521,14 @@ fn x86_emitted_deferred_packed_opcodes_stay_red() {
     ] {
         assert!(
             matches!(classify_x86(op), OpcodeClass::EmittableNeedsProof),
-            "{op:?} is actively emitted value/effect debt and must stay in the denominator"
+            "{op:?} is actively emitted value/effect debt and must stay in the denominator — a \
+             credited row is still a COUNTED row, and reclassifying it out would launder the \
+             ratio"
+        );
+        assert_eq!(
+            x86_deferred_value_op_reason(op),
+            None,
+            "{op:?} is credited by the SSE lane family and must not also be named deferral debt"
         );
         let row = report
             .rows
@@ -2512,13 +3536,47 @@ fn x86_emitted_deferred_packed_opcodes_stay_red() {
             .find(|row| row.opcode_display == format!("x86_64::{op:?}"))
             .unwrap_or_else(|| panic!("x86_64::{op:?} missing from audit"));
         assert!(
-            matches!(
-                &row.finding,
-                Some(CoverageFinding::DeferredUnfaithfulModel { .. })
-            ),
-            "x86_64::{op:?} must be explicit deferred RED debt: {row:?}"
+            row.finding.is_none(),
+            "x86_64::{op:?} must be credited: {row:?}"
+        );
+        assert!(
+            row.note.contains("INDEPENDENT SDM-derived decoder")
+                && row.note.contains("x86_sse_lane_proofs"),
+            "x86_64::{op:?} went green by some other route than the SSE lane family, which is \
+             exactly the laundering this test exists to catch: {}",
+            row.note
         );
     }
+
+    // The credit is WITHHELD when the hook does not discharge, and the row then
+    // reports a REGRESSION rather than a deferral — so a broken obligation can
+    // never be absorbed as honest debt.
+    let failed: Result<trust_cg_verify::x86_sse_lane_proofs::SseLaneCredit, String> =
+        Err("simulated regression".to_string());
+    let degraded =
+        on_large_stack(move || CoverageGate::new().audit_x86_with_sse_lane_credit(&failed));
+    for op in [X86Opcode::Pshufd, X86Opcode::Ptest, X86Opcode::Packuswb] {
+        let row = degraded
+            .rows
+            .iter()
+            .find(|row| row.opcode_display == format!("x86_64::{op:?}"))
+            .unwrap();
+        assert!(
+            matches!(
+                &row.finding,
+                Some(CoverageFinding::ProofNotDischarged { .. })
+            ),
+            "a failing SSE lane hook must surface as ProofNotDischarged, not a deferral: {row:?}"
+        );
+    }
+    assert_eq!(
+        degraded.covered_count(),
+        206 - 10,
+        "withholding the SSE lane credit must cost exactly the ten rows (the baseline moved \
+         184 -> 200 when the sixteen volatile rows were credited, 200 -> 201 with the \
+         128-bit atomic load's AtomicLoadCmpxchg16b, and 201 -> 206 with the five \
+         zero-extending loads)"
+    );
 
     // These lane insert/extract opcodes are encodable but have no current
     // producer; they remain excluded with an exact never-selected reason.
@@ -2538,14 +3596,29 @@ fn x86_emitted_deferred_packed_opcodes_stay_red() {
 }
 
 /// LOCKS IN that the whole-XMM 128-bit MEMORY moves MOVDQU{RM,MR} (unaligned) and
-/// MOVDQA{RM,MR} (aligned) are EmittableNeedsProof AND credited COVERED via GENUINE
-/// two-64-bit-halves-at-ea/ea+8 reconstruction — NEVER an X==X vacuous vouch. The
-/// machine addresses come from the INDEPENDENT x86 `encode_lea_*` encoder; a wrong
-/// EA / swapped half / wrong offset / wrong width / (store) wrong value REFUTES
-/// (see tests/reconstruction_x86.rs). MOVDQARR (register-register) is a separate
-/// emitted value row and remains explicit deferred RED debt. This pins the honest
-/// credit so a regression that drops the reconstruction (or re-defers the memory
-/// forms) is caught.
+/// MOVDQA{RM,MR} (aligned) are EmittableNeedsProof AND credited COVERED.
+///
+/// Their evidence comes from TWO places, and the split matters:
+///
+///   * the VALUE facet from the two-64-bit-halves-at-`ea`/`ea+8` reconstruction
+///     — a swapped half, a wrong half offset, a wrong access width or (for a
+///     store) a wrong value REFUTES there, because each is a one-sided
+///     structural difference in the two-half model
+///     (see tests/reconstruction_x86.rs);
+///   * the ADDRESS facet from `x86_addressing_proofs`, which decodes the REAL
+///     emitted ModR/M+SIB bytes.
+///
+/// This docstring used to say the machine addresses came from "the INDEPENDENT
+/// x86 `encode_lea_*` encoder" and that a wrong EA refutes. That was FALSE:
+/// `x86_reconstruct_effective_address` builds BOTH of its address halves from
+/// the same operand with structurally identical encoders, so the address half
+/// is `X == X` and no wrong base, index, scale or displacement can refute
+/// through it. `the_shared_reconstruction_still_has_no_address_teeth` pins that
+/// measurement.
+///
+/// MOVDQARR (register-register) is a separate emitted value row and remains
+/// explicit deferred RED debt. This pins the honest credit so a regression that
+/// drops either facet (or re-defers the memory forms) is caught.
 #[test]
 fn x86_packed_128bit_moves_are_reconstructed() {
     let report = on_large_stack(|| CoverageGate::new().audit(GateArch::X86_64));
@@ -2566,15 +3639,28 @@ fn x86_packed_128bit_moves_are_reconstructed() {
             .find(|r| r.opcode_display == format!("x86_64::{op:?}"))
             .unwrap_or_else(|| panic!("x86_64::{op:?} must appear in the audit"));
         assert!(
-            row.finding.is_none() && row.note.contains("RECONSTRUCTED"),
-            "x86_64::{op:?} must be COVERED via genuine two-halves reconstruction (never X==X): \
-             finding={:?}, note={}",
+            row.finding.is_none(),
+            "x86_64::{op:?} must be COVERED: finding={:?}, note={}",
             row.finding,
             row.note
         );
+        assert!(
+            row.note
+                .contains("ADDRESS decoded from the REAL emitted bytes"),
+            "x86_64::{op:?} must carry its ADDRESS facet on the byte-level credit, not on the \
+             degenerate effective-address reconstruction: note={}",
+            row.note
+        );
     }
-    // MOVDQARR (register-register copy) is emitted and must stay denominator RED
-    // until an independent 128-bit copy obligation lands.
+    // MOVDQARR (register-register copy) stays in the denominator, and its
+    // deferral reason asked for exactly one thing: "an independently decoded
+    // 128-bit bit-preservation obligation". It now has one, from a DIFFERENT
+    // family than these memory forms — `x86_sse_lane_proofs` decodes the real
+    // emitted bytes with an independent SDM-derived decoder and states that
+    // they denote the full-width 128-bit copy with the intended direction and
+    // registers. It is NOT the ea/ea+8 reconstruction that covers RM/MR, and it
+    // does NOT claim MOVDQA differs from MOVDQU in VALUE — it does not; that
+    // separation is the mnemonic-identity conjunct.
     assert!(
         matches!(
             classify_x86(X86Opcode::MovdqaRR),
@@ -2587,10 +3673,16 @@ fn x86_packed_128bit_moves_are_reconstructed() {
         .iter()
         .find(|row| row.opcode_display == "x86_64::MovdqaRR")
         .expect("MovdqaRR must appear in the audit");
-    assert!(matches!(
-        &row.finding,
-        Some(CoverageFinding::DeferredUnfaithfulModel { .. })
-    ));
+    assert!(
+        row.finding.is_none() && row.note.contains("x86_sse_lane_proofs"),
+        "MovdqaRR must be credited by the SSE lane family, not by the memory-form \
+         reconstruction and not by anything else: {row:?}"
+    );
+    assert!(
+        row.note.contains("FULL-WIDTH 128-bit copy"),
+        "MovdqaRR's note must say what the credit actually is: {}",
+        row.note
+    );
 }
 
 /// LOCKS IN that the GENUINELY-RECONSTRUCTED packed value ops are
@@ -2667,13 +3759,14 @@ fn x86_packed_value_ops_are_lanewise_reconstructed() {
 /// CSEL/CSINC/CSNEG were once claimed COVERED via their IfConversion equivalence
 /// proofs, which were X==X self-equalities (the machine side mirrored the spec;
 /// no independent CSEL/CSINC/CSNEG encoder). #61 stopped counting them; #62
-/// RETRACTED the degenerate proofs entirely. So the honest disposition is now
-/// FailClosedAllowlisted with NO mapped value-proof at all — exactly like CSINV
-/// (which never had a proof). This test pins that (a) the coverage gate keeps
-/// them proof-required/RED, (b) `opcode_to_proof_query` now returns None
-/// (the degenerate proof is gone), and (c) the database contains NO degenerate
-/// IfConversion CSEL/CSINC/CSNEG self-equality any more. CSINV remains excluded
-/// because lowering does not select it.
+/// RETRACTED the degenerate proofs entirely. This test pins that (a) the
+/// coverage gate keeps them in the proof-required denominator (they are now
+/// credited only by the per-instruction NZCV producer/consumer family, see
+/// `aarch64_flag_consumer_gate`), (b) `opcode_to_proof_query` returns None —
+/// no opcode-level query can credit a select without its reaching producer —
+/// and (c) the database contains NO degenerate IfConversion CSEL/CSINC/CSNEG
+/// self-equality any more. CSINV remains excluded because lowering does not
+/// select it.
 #[test]
 fn aarch64_conditional_selects_have_no_proof_after_retraction_not_covered() {
     use trust_cg_verify::function_verifier::FunctionVerifier;
@@ -3262,37 +4355,54 @@ fn aarch64_smulh_umulh_have_statistical_not_formal_64bit_evidence() {
 
 /// LOCKS IN the #67 split: the i128 carry-chain (ADC/SBC) and the 32->64
 /// widening multiplies (SMULL/UMULL) stay emitted-value obligations in the
-/// denominator (SMULL is RED until modeled; UMULL is now COVERED via its
-/// faithful single-form zext64*zext64 obligation, proof_umull_rr — the SMULL
-/// sext confusion refutes, so the signed form cannot inherit the credit),
-/// while the never-emitted flag-setting immediate forms remain excluded.
+/// denominator, each covered by its OWN obligation — UMULL by the zext64*zext64
+/// proof_umull_rr, SMULL by its sign-extending decoded-word obligation — so the
+/// signed form never inherits the unsigned credit, while the never-emitted
+/// flag-setting immediate forms remain excluded.
 #[test]
-fn aarch64_widening_mul_stays_red_but_i128_carry_now_covered() {
+fn aarch64_widening_muls_have_their_own_obligations_and_i128_carry_is_covered() {
+    use trust_cg_verify::FunctionVerifier;
+    use trust_cg_verify::aarch64_value_decode_proofs::{A64ValueForm, a64_value_forms};
     for op in [AArch64Opcode::Smull, AArch64Opcode::Umull] {
         assert!(
             matches!(classify_aarch64(op), OpcodeClass::EmittableNeedsProof),
             "{op:?} is emitted value debt and must stay in the denominator"
         );
+        assert!(aarch64_deferred_value_op_reason(op).is_none());
     }
-    // SMULL must remain a named deferred RED row; UMULL must NOT (it is covered
-    // by its own faithful obligation, not by inheritance).
-    assert!(
-        aarch64_deferred_value_op_reason(AArch64Opcode::Smull).is_some(),
-        "SMULL has no faithful widening obligation and must stay named RED debt"
+    // SMULL is credited by its own form, whose query cannot resolve to UMULL's
+    // obligation, and UMULL keeps its opcode-level binding.
+    assert_eq!(
+        a64_value_forms(AArch64Opcode::Smull),
+        Some(&[A64ValueForm::Smull][..])
     );
+    assert!(a64_value_forms(AArch64Opcode::Umull).is_none());
+    let (umull_query, _) = FunctionVerifier::opcode_to_proof_query(AArch64Opcode::Umull)
+        .expect("UMULL keeps its binding");
     assert!(
-        aarch64_deferred_value_op_reason(AArch64Opcode::Umull).is_none(),
-        "UMULL is credited via proof_umull_rr and must not sit in the deferred table"
+        !A64ValueForm::Smull
+            .obligation_name()
+            .to_lowercase()
+            .contains(umull_query),
+        "the SMULL obligation must not answer UMULL's query"
     );
-    for op in [AArch64Opcode::AddsRI, AArch64Opcode::SubsRI] {
-        assert!(
-            matches!(
-                classify_aarch64(op),
-                OpcodeClass::FailClosedAllowlisted { .. }
-            ),
-            "{op:?} is never selected and should remain explicitly excluded"
-        );
-    }
+    assert!(FunctionVerifier::opcode_to_proof_query(AArch64Opcode::Smull).is_none());
+    assert!(
+        matches!(
+            classify_aarch64(AArch64Opcode::AddsRI),
+            OpcodeClass::FailClosedAllowlisted { .. }
+        ),
+        "AddsRI is never selected and should remain explicitly excluded"
+    );
+    // SubsRI IS emitted (the looped stack probe's `SUBS X16, X16, #1`), so it
+    // is counted; it is credited only by its decoded-word family
+    // (`aarch64_subs_imm_proofs`, L04-P1), never opcode-wide.
+    assert!(matches!(
+        classify_aarch64(AArch64Opcode::SubsRI),
+        OpcodeClass::EmittableNeedsProof
+    ));
+    assert!(aarch64_deferred_value_op_reason(AArch64Opcode::SubsRI).is_none());
+    assert!(FunctionVerifier::opcode_to_proof_query(AArch64Opcode::SubsRI).is_none());
     // Adc/Sbc are NOW credited to the FAITHFUL i128 whole-chain composition proof
     // (proof_iadd/isub_i128_whole_chain) — EmittableNeedsProof, not allowlisted.
     for op in [AArch64Opcode::Adc, AArch64Opcode::Sbc] {
@@ -3338,7 +4448,7 @@ fn historical_comment_lines(lines: &[&str]) -> Vec<bool> {
 /// The first `N/M` token stated after `alias` on `line`.
 ///
 /// The scan stops at the next architecture name, because these ratios are
-/// routinely listed four-to-a-line ("x86-64 168/197 (29 RED), RISC-V 14/17
+/// routinely listed four-to-a-line ("x86-64 206/206 (0 RED), RISC-V 14/17
 /// ..."); without that bound a fixed window reads the *next* architecture's
 /// ratio and reports a false mismatch.
 ///
@@ -3405,11 +4515,34 @@ fn ratio_after(line: &str, alias: &str, all_aliases: &[&str]) -> Option<(usize, 
 /// architecture name within `WINDOW` bytes is not checked.
 #[test]
 fn published_coverage_ratios_match_the_gate() {
+    // The published x86-64 ratio includes the corpus-based MovRI credit and the
+    // ten corpus-based SSE LANE credits; refuse a stale capture of either. The
+    // published AArch64 ratio includes fifteen corpus-based decoded-value credits.
+    assert_movri_corpus_is_what_the_live_encoder_emits();
+    assert_sse_lane_corpus_is_what_the_live_encoder_emits();
+    assert_a64_value_corpus_is_what_the_live_encoder_emits();
+    // The published x86-64 ratio includes the corpus-based MovRI credit, the
+    // ten corpus-based SSE LANE credits and the corpus-based MOVSXD-SIB credit;
+    // refuse a stale capture of any of them.
+    assert_movri_corpus_is_what_the_live_encoder_emits();
+    assert_sse_lane_corpus_is_what_the_live_encoder_emits();
+    assert_movsxd_sib_corpus_is_what_the_live_encoder_emits();
+    // The published WebAssembly ratio includes the float const and FMin/FMax/
+    // copysign body credits; refuse a stale capture of either corpus.
+    wasm_float_live::assert_float_const_corpus_is_what_the_live_backend_emits();
+    wasm_float_live::assert_float_binop_bodies_are_what_the_live_backend_emits();
+    wasm_bulk_live::assert_bulk_memory_bodies_are_what_the_live_backend_emits();
     let (aa, x86, rv, wasm) = on_large_stack(|| {
         let gate = CoverageGate::new();
+        // The published AArch64 ratio is the one a host whose checker the
+        // certificate manifests authorize computes; elsewhere the
+        // checker-identity misses are added back (their pins are red there).
         let audit = |arch| {
             let report = gate.audit(arch);
-            (report.covered_count(), report.emittable_count())
+            (
+                report.covered_count() + checker_identity_misses(&report),
+                report.emittable_count(),
+            )
         };
         (
             audit(GateArch::AArch64),
@@ -3430,9 +4563,7 @@ fn published_coverage_ratios_match_the_gate() {
         "README.md",
         "SOUNDNESS_CHECK.md",
         "scripts/soundness_check.sh",
-        "crates/trust-cg-opt/src/x86_vectorize.rs",
         "crates/trust-cg-verify/tests/coverage_gate_tests.rs",
-        "crates/trust-cg-verify/tests/soundness_manifest.rs",
         "crates/trust-cg-verify/tests/meta_theorems.rs",
     ];
 
@@ -3477,5 +4608,1538 @@ fn published_coverage_ratios_match_the_gate() {
          Update each site, or if the pin genuinely moved, update the pinned \
          assertions first and let this test confirm the docs followed.",
         stale.join("\n")
+    );
+}
+
+/// The note of a row the ADDRESS row credits (`x86_address_audit_row`).
+const X86_ADDRESS_ROW_NOTE: &str = "ADDRESS decoded from the REAL emitted bytes";
+/// The VALUE leg the ADDRESS row conjoins with its address, as its note states it.
+const X86_ADDRESS_ROW_VALUE_LEG: &str = "VALUE: RECONSTRUCTED from real";
+/// The note of a row the volatile JOINT row credits (`x86_volatile_joint_audit_row`).
+const X86_VOLATILE_JOINT_ROW_NOTE: &str = "VOLATILE, credited JOINTLY";
+/// The note of a row the COMPARE-EXCHANGE joint row credits
+/// (`x86_compare_exchange_joint_audit_row`), and the VALUE leg it states.
+const X86_COMPARE_EXCHANGE_ROW_NOTE: &str = "COMPARE-EXCHANGE, credited JOINTLY";
+const X86_COMPARE_EXCHANGE_ROW_VALUE_LEG: &str = "VALUE from the per-instruction reconstruction";
+
+/// The x86-64 ADDRESS credit is LIVE, COUNTED and GATED.
+///
+/// Three things must hold together, and the third is the one that has bitten
+/// this tree before:
+///   1. the credited rows really do route through the address lane, not
+///      silently past it into the degenerate reconstruction — the 37 plain rows
+///      through the ADDRESS row, which also requires their VALUE
+///      reconstruction, the 3 compare-exchange rows through their joint row,
+///      and the 18 volatile rows through the volatile JOINT row only;
+///   2. a FAILING address credit makes exactly those rows RED in the whole
+///      report and costs exactly that many covered rows;
+///   3. the loss is `ProofNotDischarged`, not `DeferredUnfaithfulModel` — a
+///      lane that stopped refuting is a broken proof, not acknowledged debt.
+#[test]
+fn x86_address_credit_is_live_counted_and_has_teeth() {
+    use trust_cg_verify::coverage_gate::{
+        CoverageFinding, CoverageGate, GateArch, x86_opcode_has_address_credit,
+        x86_opcode_is_compare_exchange_memory, x86_opcode_is_volatile_memory,
+    };
+    use trust_cg_verify::x86_addressing_proofs as addr;
+
+    let address_opcodes: Vec<X86Opcode> = trust_cg_verify::coverage_gate::ALL_X86_OPCODES
+        .iter()
+        .copied()
+        .filter(|&op| x86_opcode_has_address_credit(op))
+        .collect();
+    let covered_opcodes: Vec<String> = address_opcodes
+        .iter()
+        .map(|op| format!("x86_64::{op:?}"))
+        .collect();
+    // 53 -> 56: the three COMPARE-EXCHANGE rows (`Cmpxchg8`, `Cmpxchg16` and
+    // the 128-bit atomic-load pseudo `AtomicLoadCmpxchg16b`). The teeth audit
+    // now asks whether a perturbed-address obligation REFUTES rather than
+    // whether its halves are different trees, and theirs never refutes; they
+    // are credited jointly with their value reconstruction.
+    // 56 -> 61: the five ZERO-EXTENDING loads (`MovzxRM8`, `MovzxRM16`,
+    // `MovzxRM8Sib` and the two volatile twins), whose captured `0F B6/B7`
+    // encodings also carry the destination-write facet.
+    assert_eq!(
+        covered_opcodes.len(),
+        61,
+        "the address lane must cover the 40 opcodes the teeth audit found unable to refute an \
+         address error through the shared reconstruction (the 35 memory-ACCESS forms plus \
+         Lea/LeaSib, for which the address IS the value, plus the 3 zero-extending loads), PLUS \
+         the 18 VOLATILE forms, which are byte-identical to their plain siblings and so pose the \
+         same address question, PLUS the 3 COMPARE-EXCHANGE forms, whose reconstructions refute \
+         no address error either"
+    );
+    assert_eq!(
+        address_opcodes
+            .iter()
+            .filter(|&&op| x86_opcode_is_volatile_memory(op))
+            .count(),
+        18,
+        "eighteen of the address lane's rows are the volatile forms"
+    );
+    assert_eq!(
+        address_opcodes
+            .iter()
+            .filter(|&&op| x86_opcode_is_compare_exchange_memory(op))
+            .count(),
+        3,
+        "three of the address lane's rows are the compare-exchange forms"
+    );
+
+    // (1) The real credit discharges and the rows say so. A plain row's note
+    //     states both of the ADDRESS row's legs, and a compare-exchange row's
+    //     both of its joint row's; a volatile row must carry the volatile
+    //     JOINT row's note, because the ADDRESS row alone is exactly the
+    //     byte-identical plain MOV proof its deferral reason rejected.
+    let healthy = on_large_stack(|| CoverageGate::new().audit(GateArch::X86_64));
+    for (&op, name) in address_opcodes.iter().zip(&covered_opcodes) {
+        let row = healthy
+            .rows
+            .iter()
+            .find(|r| &r.opcode_display == name)
+            .unwrap_or_else(|| panic!("{name} row"));
+        assert!(row.finding.is_none(), "{name} must be covered: {row:?}");
+        if x86_opcode_is_volatile_memory(op) {
+            assert!(
+                row.note.starts_with(X86_VOLATILE_JOINT_ROW_NOTE)
+                    && !row.note.contains(X86_ADDRESS_ROW_NOTE),
+                "{name} is VOLATILE and must be credited by the joint row alone, not by the \
+                 address row: {}",
+                row.note
+            );
+        } else if x86_opcode_is_compare_exchange_memory(op) {
+            assert!(
+                row.note.starts_with(X86_COMPARE_EXCHANGE_ROW_NOTE)
+                    && row.note.contains(X86_ADDRESS_ROW_NOTE)
+                    && row.note.contains(X86_COMPARE_EXCHANGE_ROW_VALUE_LEG),
+                "{name} is a COMPARE-EXCHANGE row and must be credited by its joint row on \
+                 both its ADDRESS and its VALUE: {}",
+                row.note
+            );
+        } else {
+            assert!(
+                row.note.contains(X86_ADDRESS_ROW_NOTE),
+                "{name} is credited by some OTHER path, so the address lane is not actually \
+                 carrying it: {}",
+                row.note
+            );
+            assert!(
+                row.note.contains(X86_ADDRESS_ROW_VALUE_LEG),
+                "{name} is credited on its ADDRESS alone; the address row must also require \
+                 the VALUE reconstruction its note attributes the value facet to: {}",
+                row.note
+            );
+        }
+    }
+    let healthy_covered = healthy.rows.iter().filter(|r| r.finding.is_none()).count();
+
+    // (2) + (3) A failing credit costs exactly those rows, as ProofNotDischarged.
+    let broken: Result<addr::MemMovAddressCredit, String> =
+        Err("INJECTED: the address lane stopped refuting".to_string());
+    let failed = on_large_stack(move || CoverageGate::new().audit_x86_with_address_credit(&broken));
+    let failed_covered = failed.rows.iter().filter(|r| r.finding.is_none()).count();
+    assert_eq!(
+        healthy_covered - failed_covered,
+        covered_opcodes.len(),
+        "a failing address credit must cost EXACTLY the {} rows it carries",
+        covered_opcodes.len()
+    );
+    for (&op, name) in address_opcodes.iter().zip(&covered_opcodes) {
+        let row = failed
+            .rows
+            .iter()
+            .find(|r| &r.opcode_display == name)
+            .unwrap_or_else(|| panic!("{name} row"));
+        match &row.finding {
+            Some(CoverageFinding::ProofNotDischarged { proof_name, detail }) => {
+                assert!(proof_name.contains("ADDR-x86"), "{name}: {proof_name}");
+                assert!(detail.contains("INJECTED"), "{name}: {detail}");
+                assert_eq!(
+                    proof_name.starts_with("VOL-x86 joint"),
+                    x86_opcode_is_volatile_memory(op),
+                    "{name}: a volatile row fails as its JOINT obligation, a plain row as its \
+                     address row: {proof_name}"
+                );
+            }
+            other => panic!(
+                "{name} must go RED as ProofNotDischarged when the address lane fails, not \
+                 {other:?}"
+            ),
+        }
+    }
+}
+
+/// The sixteen x86-64 VOLATILE rows are credited by the JOINT row, never by
+/// the ADDRESS row.
+///
+/// A volatile MOV encodes byte for byte like its plain sibling, so the address
+/// lane answers the same question for both. That is exactly why its credit
+/// alone is the "byte-identical plain MOV proof" the rows' deferral reason
+/// called insufficient. From 88de9e199 the joint row's VALUE leg asked
+/// `X86FunctionVerifier::opcode_to_proof_query`, which has no volatile arm, so
+/// the joint row returned nothing for all sixteen and each fell through to the
+/// address row: all sixteen covered, with the VALUE and BOUNDARY legs gating
+/// nothing (still so on ea8492fd9). On that tree this test fails at the first
+/// volatile row.
+#[test]
+fn x86_volatile_rows_are_credited_by_the_joint_row_not_the_address_row() {
+    use trust_cg_verify::coverage_gate::x86_opcode_is_volatile_memory;
+
+    let volatile: Vec<String> = ALL_X86_OPCODES
+        .iter()
+        .filter(|&&op| x86_opcode_is_volatile_memory(op))
+        .map(|op| format!("x86_64::{op:?}"))
+        .collect();
+    assert_eq!(
+        volatile.len(),
+        18,
+        "the eighteen x86-64 volatile memory forms (sixteen MOV forms and the two \
+         zero-extending loads)"
+    );
+
+    let report = on_large_stack(|| CoverageGate::new().audit(GateArch::X86_64));
+    for name in &volatile {
+        let row = report
+            .rows
+            .iter()
+            .find(|r| &r.opcode_display == name)
+            .unwrap_or_else(|| panic!("{name} row"));
+        assert!(row.finding.is_none(), "{name} must be covered: {row:?}");
+        assert!(
+            row.note.starts_with(X86_VOLATILE_JOINT_ROW_NOTE),
+            "{name} is credited by a path other than the JOINT row, so its VALUE and BOUNDARY \
+             legs gate nothing: {}",
+            row.note
+        );
+        assert!(
+            !row.note.contains(X86_ADDRESS_ROW_NOTE),
+            "{name} carries the ADDRESS row's note, i.e. it is credited by the address lane \
+             alone: {}",
+            row.note
+        );
+    }
+}
+
+/// Assert that `report` differs from `healthy` in exactly the rows `lost`
+/// names, each RED as `ProofNotDischarged` whose proof name contains every
+/// entry of `names` and none of `absent`, and whose detail contains `detail`.
+fn assert_x86_rows_lost_to(
+    label: &str,
+    healthy: &trust_cg_verify::coverage_gate::CoverageReport,
+    report: &trust_cg_verify::coverage_gate::CoverageReport,
+    lost: &[X86Opcode],
+    names: &[&str],
+    absent: &[&str],
+    detail: &str,
+) {
+    let lost: std::collections::HashSet<String> =
+        lost.iter().map(|op| format!("x86_64::{op:?}")).collect();
+    assert_eq!(
+        healthy.covered_count() - report.covered_count(),
+        lost.len(),
+        "{label}: exactly the {} rows that require the failing leg must leave the covered count",
+        lost.len()
+    );
+    for (before, after) in healthy.rows.iter().zip(&report.rows) {
+        assert_eq!(before.opcode_display, after.opcode_display);
+        if !lost.contains(&after.opcode_display) {
+            assert_eq!(
+                before.finding.is_none(),
+                after.finding.is_none(),
+                "{label}: {} does not require the failing leg and must not move",
+                after.opcode_display
+            );
+            continue;
+        }
+        let name = &after.opcode_display;
+        assert!(
+            before.finding.is_none(),
+            "{label}: {name} is covered when healthy"
+        );
+        match &after.finding {
+            Some(CoverageFinding::ProofNotDischarged {
+                proof_name,
+                detail: why,
+            }) => {
+                for want in names {
+                    assert!(proof_name.contains(want), "{label}: {name}: {proof_name}");
+                }
+                for not in absent {
+                    assert!(!proof_name.contains(not), "{label}: {name}: {proof_name}");
+                }
+                assert!(why.contains(detail), "{label}: {name}: {why}");
+            }
+            other => panic!(
+                "{label}: {name} must go RED as ProofNotDischarged naming the failing leg, not \
+                 {other:?}"
+            ),
+        }
+    }
+}
+
+/// Each leg of the x86 volatile JOINT obligation is load-bearing.
+///
+/// With the ADDRESS lane still discharging, a failing VALUE leg or a failing
+/// BOUNDARY leg (`x86_volatile_trace`) must take exactly the sixteen volatile
+/// rows RED as `ProofNotDischarged` naming that leg, and move no other row. A
+/// volatile row that stayed green here would be credited by the address lane
+/// alone — the "byte-identical plain MOV proof" its deferral reason rejected.
+/// The row functions are pinned directly as well: the joint row credits only
+/// when all three legs hold, and the ADDRESS row refuses a volatile opcode even
+/// when both of its own legs hold.
+#[test]
+fn x86_volatile_joint_row_withholds_credit_when_any_leg_fails() {
+    use trust_cg_verify::coverage_gate::{
+        x86_address_audit_row, x86_opcode_is_volatile_memory, x86_volatile_joint_audit_row,
+    };
+    use trust_cg_verify::x86_64_function_verifier::reconstruction_discharges_valid;
+    use trust_cg_verify::x86_addressing_proofs::mem_mov_address_credit;
+    use trust_cg_verify::x86_volatile_trace::volatile_trace_credit;
+
+    let volatile: Vec<X86Opcode> = ALL_X86_OPCODES
+        .iter()
+        .copied()
+        .filter(|&op| x86_opcode_is_volatile_memory(op))
+        .collect();
+    assert_eq!(
+        volatile.len(),
+        18,
+        "the eighteen x86-64 volatile memory forms (sixteen MOV forms and the two \
+         zero-extending loads)"
+    );
+
+    let (healthy, no_value, no_boundary) = on_large_stack(|| {
+        let gate = CoverageGate::new();
+        let healthy = gate.audit(GateArch::X86_64);
+        let no_value = gate.audit_x86_with_value_and_trace_credit(
+            &|op, config| {
+                !x86_opcode_is_volatile_memory(op) && reconstruction_discharges_valid(op, config)
+            },
+            &volatile_trace_credit(),
+        );
+        let no_boundary = gate.audit_x86_with_value_and_trace_credit(
+            &reconstruction_discharges_valid,
+            &Err("INJECTED: a volatile hazard survived".to_string()),
+        );
+        (healthy, no_value, no_boundary)
+    });
+    let address = mem_mov_address_credit();
+    let trace = volatile_trace_credit();
+    assert!(
+        address.is_ok(),
+        "the ADDRESS leg must discharge throughout: {address:?}"
+    );
+    assert!(trace.is_ok(), "the BOUNDARY leg must discharge: {trace:?}");
+
+    assert_x86_rows_lost_to(
+        "VALUE leg failing",
+        &healthy,
+        &no_value,
+        &volatile,
+        &["VOL-x86 joint", "VALUE-x86"],
+        &["ADDR-x86", "VOL-x86-trace"],
+        "reconstruction",
+    );
+    assert_x86_rows_lost_to(
+        "BOUNDARY leg failing",
+        &healthy,
+        &no_boundary,
+        &volatile,
+        &["VOL-x86 joint", "VOL-x86-trace"],
+        &["ADDR-x86", "VALUE-x86"],
+        "INJECTED",
+    );
+
+    for &op in &volatile {
+        let display = format!("x86_64::{op:?}");
+        let joint = |address_ok: bool, value: bool, trace_ok: bool| {
+            x86_volatile_joint_audit_row(
+                &display,
+                op,
+                if address_ok {
+                    address.clone()
+                } else {
+                    Err("INJECTED address".to_string())
+                },
+                value,
+                if trace_ok {
+                    trace.clone()
+                } else {
+                    Err("INJECTED trace".to_string())
+                },
+            )
+        };
+        assert!(
+            joint(true, true, true).finding.is_none(),
+            "{display}: all three legs hold"
+        );
+        for (address_ok, value, trace_ok) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            assert!(
+                matches!(
+                    joint(address_ok, value, trace_ok).finding,
+                    Some(CoverageFinding::ProofNotDischarged { .. })
+                ),
+                "{display}: the joint row credited with a failing leg (address {address_ok}, \
+                 value {value}, trace {trace_ok})"
+            );
+        }
+        let address_row = x86_address_audit_row(display.clone(), op, address.clone(), true);
+        assert!(
+            matches!(
+                &address_row.finding,
+                Some(CoverageFinding::ProofNotDischarged { proof_name, .. })
+                    if proof_name.starts_with("VOL-x86 joint")
+            ),
+            "{display}: the ADDRESS row must refuse a volatile opcode even when its address \
+             and value legs hold: {address_row:?}"
+        );
+    }
+}
+
+/// The ADDRESS row requires the VALUE leg as well as the address.
+///
+/// The address lane proves the address from the real emitted bytes, and the
+/// row's note attributes the value facet to the reconstruction. Before this
+/// test the gate returned the address row without running the reconstruction
+/// at all, so the value facet of all 37 plain rows — memory-ALU forms such as
+/// `AddRM` and `XorMR` included — was checked by nothing. A failing VALUE leg
+/// must now take exactly those rows RED as `ProofNotDischarged` naming it, with
+/// the address lane still discharging. The three COMPARE-EXCHANGE rows read
+/// their VALUE leg through the same hook, so a failure injected there takes
+/// exactly those three RED as their joint row's failure. The row function is
+/// pinned directly as well: each leg alone refuses.
+#[test]
+fn x86_address_rows_conjoin_the_value_reconstruction() {
+    use trust_cg_verify::coverage_gate::{
+        x86_address_audit_row, x86_opcode_has_address_credit,
+        x86_opcode_is_compare_exchange_memory, x86_opcode_is_volatile_memory,
+    };
+    use trust_cg_verify::x86_64_function_verifier::reconstruction_discharges_valid;
+    use trust_cg_verify::x86_addressing_proofs::mem_mov_address_credit;
+    use trust_cg_verify::x86_volatile_trace::volatile_trace_credit;
+
+    let plain = |op: X86Opcode| {
+        x86_opcode_has_address_credit(op)
+            && !x86_opcode_is_volatile_memory(op)
+            && !x86_opcode_is_compare_exchange_memory(op)
+    };
+    let plain_rows: Vec<X86Opcode> = ALL_X86_OPCODES
+        .iter()
+        .copied()
+        .filter(|&op| plain(op))
+        .collect();
+    assert_eq!(
+        plain_rows.len(),
+        40,
+        "the 35 memory-ACCESS forms plus Lea/LeaSib, plus the 3 zero-extending loads"
+    );
+    let compare_exchange_rows: Vec<X86Opcode> = ALL_X86_OPCODES
+        .iter()
+        .copied()
+        .filter(|&op| x86_opcode_is_compare_exchange_memory(op))
+        .collect();
+    assert_eq!(
+        compare_exchange_rows.len(),
+        3,
+        "Cmpxchg8, Cmpxchg16 and AtomicLoadCmpxchg16b"
+    );
+
+    let (healthy, no_plain_value, no_cmpxchg_value) = on_large_stack(move || {
+        let gate = CoverageGate::new();
+        let healthy = gate.audit(GateArch::X86_64);
+        let no_plain_value = gate.audit_x86_with_value_and_trace_credit(
+            &|op, config| !plain(op) && reconstruction_discharges_valid(op, config),
+            &volatile_trace_credit(),
+        );
+        let no_cmpxchg_value = gate.audit_x86_with_value_and_trace_credit(
+            &|op, config| {
+                !x86_opcode_is_compare_exchange_memory(op)
+                    && reconstruction_discharges_valid(op, config)
+            },
+            &volatile_trace_credit(),
+        );
+        (healthy, no_plain_value, no_cmpxchg_value)
+    });
+    let address = mem_mov_address_credit();
+    assert!(
+        address.is_ok(),
+        "the ADDRESS leg must discharge: {address:?}"
+    );
+    assert_x86_rows_lost_to(
+        "VALUE leg failing on the plain address rows",
+        &healthy,
+        &no_plain_value,
+        &plain_rows,
+        &["VALUE-x86"],
+        &["ADDR-x86", "VOL-x86"],
+        "reconstruction",
+    );
+    assert_x86_rows_lost_to(
+        "VALUE leg failing on the compare-exchange rows",
+        &healthy,
+        &no_cmpxchg_value,
+        &compare_exchange_rows,
+        &["ADDR-x86 + reconstruction"],
+        &["VOL-x86"],
+        "VALUE",
+    );
+
+    for &op in &plain_rows {
+        let display = format!("x86_64::{op:?}");
+        let row = |address_ok: bool, value: bool| {
+            x86_address_audit_row(
+                display.clone(),
+                op,
+                if address_ok {
+                    address.clone()
+                } else {
+                    Err("INJECTED address".to_string())
+                },
+                value,
+            )
+        };
+        assert!(
+            row(true, true).finding.is_none(),
+            "{display}: both legs hold"
+        );
+        for (address_ok, value, leg) in [
+            (true, false, "VALUE-x86"),
+            (false, true, "ADDR-x86"),
+            (false, false, "ADDR-x86 + VALUE-x86"),
+        ] {
+            let red = row(address_ok, value);
+            assert!(
+                matches!(
+                    &red.finding,
+                    Some(CoverageFinding::ProofNotDischarged { proof_name, .. })
+                        if proof_name == &format!("{leg} ({op:?})")
+                ),
+                "{display}: the ADDRESS row credited, or misnamed, a failing leg (address \
+                 {address_ok}, value {value}): {red:?}"
+            );
+        }
+    }
+}
+
+/// An address-credited memory-ALU row whose VALUE reconstruction is WRONG stays
+/// RED, although its address is right.
+///
+/// The sibling of `x86_address_rows_conjoin_the_value_reconstruction` with a
+/// real evaluation in place of an injected verdict: the VALUE hook rebuilds
+/// each representative obligation of `AddRM`, `SubRM` and `ImulRM` from the
+/// real opcode, then flips bit 0 of the machine-side result — a memory-ALU form
+/// that loads from the right address and computes the wrong value — and
+/// evaluates it. The address lane still discharges on the real emitted bytes.
+/// Before the ADDRESS row required its VALUE leg, all three rows stayed green
+/// here, because the gate never ran the reconstruction for them.
+#[test]
+fn x86_address_row_with_a_wrong_value_reconstruction_stays_red() {
+    use trust_cg_verify::coverage_gate::{
+        x86_opcode_has_address_credit, x86_opcode_is_compare_exchange_memory,
+        x86_opcode_is_volatile_memory,
+    };
+    use trust_cg_verify::lowering_proof::{ProofObligation, verify_by_evaluation};
+    use trust_cg_verify::smt::SmtExpr;
+    use trust_cg_verify::verify::VerificationResult;
+    use trust_cg_verify::x86_64_function_verifier::{
+        reconstruct_alu_obligation, reconstruction_discharges_valid,
+        representative_reconstructable_inst,
+    };
+    use trust_cg_verify::x86_volatile_trace::volatile_trace_credit;
+
+    const WRONG_VALUE: [X86Opcode; 3] = [X86Opcode::AddRM, X86Opcode::SubRM, X86Opcode::ImulRM];
+    for op in WRONG_VALUE {
+        assert!(
+            x86_opcode_has_address_credit(op)
+                && !x86_opcode_is_volatile_memory(op)
+                && !x86_opcode_is_compare_exchange_memory(op),
+            "{op:?} must be a plain ADDRESS row"
+        );
+    }
+
+    /// The representative obligation of `op`, with its machine-side result
+    /// XORed with 1 when `corrupt`.
+    fn obligation(op: X86Opcode, corrupt: bool) -> ProofObligation {
+        let inst = representative_reconstructable_inst(op)
+            .unwrap_or_else(|| panic!("{op:?} has a representative instance"));
+        let mut obligation =
+            reconstruct_alu_obligation(&inst).unwrap_or_else(|| panic!("{op:?} reconstructs"));
+        if corrupt {
+            let width = obligation
+                .aarch64_expr
+                .try_bv_width()
+                .unwrap_or_else(|e| panic!("{op:?}: machine side is not a bitvector: {e:?}"));
+            obligation.aarch64_expr = obligation
+                .aarch64_expr
+                .clone()
+                .bvxor(SmtExpr::bv_const(1, width));
+        }
+        obligation
+    }
+
+    let (healthy, wrong_value) = on_large_stack(|| {
+        // The control: the uncorrupted reconstruction is Valid and the
+        // corrupted one is not, so the hook below withholds for the reason the
+        // test names and for no other.
+        for op in WRONG_VALUE {
+            assert!(
+                matches!(
+                    verify_by_evaluation(&obligation(op, false)),
+                    VerificationResult::Valid
+                ),
+                "{op:?}: the real reconstruction must be Valid"
+            );
+            assert!(
+                !matches!(
+                    verify_by_evaluation(&obligation(op, true)),
+                    VerificationResult::Valid
+                ),
+                "{op:?}: a machine side with bit 0 flipped must not be Valid"
+            );
+        }
+        let gate = CoverageGate::new();
+        let healthy = gate.audit(GateArch::X86_64);
+        let wrong_value = gate.audit_x86_with_value_and_trace_credit(
+            &|op, config| {
+                if WRONG_VALUE.contains(&op) {
+                    matches!(
+                        verify_by_evaluation(&obligation(op, true)),
+                        VerificationResult::Valid
+                    )
+                } else {
+                    reconstruction_discharges_valid(op, config)
+                }
+            },
+            &volatile_trace_credit(),
+        );
+        (healthy, wrong_value)
+    });
+    assert!(
+        trust_cg_verify::x86_addressing_proofs::mem_mov_address_credit().is_ok(),
+        "the ADDRESS leg must discharge"
+    );
+    assert_x86_rows_lost_to(
+        "a wrong VALUE reconstruction on memory-ALU rows",
+        &healthy,
+        &wrong_value,
+        &WRONG_VALUE,
+        &["VALUE-x86"],
+        &["ADDR-x86", "VOL-x86"],
+        "reconstruction",
+    );
+}
+
+/// Opcode names ENC-5 has no arm for: `check_one` on the opcode with no
+/// operands returns its catch-all `A64_UNDECODED_FAMILY` allowlist, which
+/// only the catch-all arm returns, whatever the operands or the word. An
+/// opcode with an arm returns something else, or panics on the empty operand
+/// list.
+fn aarch64_opcodes_without_an_enc5_arm() -> Vec<AArch64Opcode> {
+    use trust_cg_codegen::aarch64::decode_check::{A64_UNDECODED_FAMILY, A64DecodeCheck};
+    use trust_cg_codegen::decode_check::{DecodeCheck, DecodeCheckOutcome};
+
+    ALL_AARCH64_OPCODES
+        .iter()
+        .copied()
+        .filter(|&op| {
+            let inst = trust_cg_ir::MachInst::new(op, vec![]);
+            matches!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    A64DecodeCheck.check_one(&inst, &0u32.to_le_bytes(), None)
+                })),
+                Ok(DecodeCheckOutcome::Allowlisted(reason)) if reason == A64_UNDECODED_FAMILY
+            )
+        })
+        .collect()
+}
+
+/// ENC-5 does not decode every emitted AArch64 word. Derived from the code:
+/// the credited rows whose opcode ENC-5 has no arm for, split by how the
+/// function verifier binds them (opcode-wide: its per-instruction query binds
+/// even an instruction with no operands; otherwise per instruction, chosen or
+/// refused from the operands), and the emitted rows without an arm at all.
+/// Both lists and the count are pinned, so they only change deliberately, and
+/// LIMITATIONS.md's paragraph must name exactly these opcodes and counts.
+/// ENC-5's arms also return named allowlist reasons without decoding the word;
+/// those reasons are pinned too, and the shifted register-ALU exits are
+/// checked to allowlist only shapes the verifier refuses.
+#[test]
+fn credited_aarch64_rows_without_an_enc5_arm_are_pinned_and_disclosed() {
+    use trust_cg_verify::FunctionVerifier;
+    // E0.2: no row is credited opcode-wide any more. An operand-less
+    // instance names at most a registry theorem found by name, which is
+    // refused, so the opcode-wide list and its degenerate subset are empty
+    // and every gate-covered row without an ENC-5 arm is bound (if at all)
+    // per instruction.
+    const OPCODE_WIDE: [&str; 0] = [];
+    const DEGENERATE_FALLBACK: [&str; 0] = [];
+    // The rows that WERE opcode-wide on a degenerate X==X binding before
+    // E0.2; each is still first rebuilt from its operands when it can be.
+    const FORMERLY_DEGENERATE_FALLBACK: [&str; 16] = [
+        "Neg", "AndRI", "OrrRI", "EorRI", "FaddRR", "FsubRR", "FmulRR", "FdivRR", "FnegRR",
+        "FsqrtRR", "FcvtzsRR", "FcvtzuRR", "ScvtfRR", "UcvtfRR", "FcvtSD", "FcvtDS",
+    ];
+    const PER_INSTRUCTION: [&str; 0] = [];
+    // The opaque LL/SC carriers have no single-word encoding: the post-RA
+    // expansion replaces each with its exclusive loop (decoded by ENC-5)
+    // before encoding, and the encoder refuses a survivor by name.
+    const EMITTED_WITHOUT_ARM: [&str; 12] = [
+        "LlscRmw8",
+        "LlscRmw16",
+        "LlscRmw32",
+        "LlscRmw64",
+        "LlscCmpSwap8",
+        "LlscCmpSwap16",
+        "LlscCmpSwap32",
+        "LlscCmpSwap64",
+        "LlscLoad128",
+        "LlscStore128",
+        "LlscRmw128",
+        "LlscCmpSwap128",
+    ];
+    const ENC5_ARM_EXITS: [&str; 28] = [
+        "a64-fcmp: operand outside the scalar H/S/D register banks",
+        "a64-slice1: non-imm add/sub-imm operand",
+        "a64-slice1: non-imm move-wide source",
+        "a64-slice1: non-register add/sub-imm operand",
+        "a64-slice1: non-register branch-reg operand",
+        "a64-slice1: non-register cmp-branch operand",
+        "a64-slice1: non-register move-wide dst",
+        "a64-slice1: unresolved branch target (no fixup hole recorded)",
+        "a64-slice1: unresolved cmp-branch target",
+        "a64-slice3: non-immediate EOR shifted-register amount",
+        "a64-slice3: non-register EOR shifted-register operand",
+        "a64-slice3: non-register add/sub-reg operand",
+        "a64-slice3: non-register logical-reg operand",
+        "a64-slice3: shifted add/sub variant not yet decoded",
+        "a64-slice3: shifted logical variant not yet decoded",
+        "a64-slice5: non-imm BCond cond",
+        "a64-slice5: non-register MulRR operand",
+        "a64-slice5: non-register div operand",
+        "a64-slice5: non-register move operand",
+        "a64-slice5: unresolved BCond target",
+        "a64-slice6: non-immediate bitfield control",
+        "a64-slice6: non-register bitfield operand",
+        "a64-slice6: non-register extend operand",
+        "a64-slice6: non-register shift operand",
+        "a64-slice7: non-register ORN operand",
+        "a64-slice7: non-register madd/msub operand",
+        "a64-slice7: non-register variable-shift operand",
+        "a64-value: shape outside the decoded value model",
+    ];
+
+    let undecoded = aarch64_opcodes_without_an_enc5_arm();
+    let report = on_large_stack(|| CoverageGate::new().audit(GateArch::AArch64));
+    let mut opcode_wide = Vec::new();
+    let mut degenerate_fallback = Vec::new();
+    let mut per_instruction = Vec::new();
+    let mut emitted_without_arm = Vec::new();
+    for (&op, row) in ALL_AARCH64_OPCODES.iter().zip(&report.rows) {
+        assert_eq!(row.opcode_display, format!("AArch64::{op:?}"));
+        if row.class != OpcodeClass::EmittableNeedsProof || !undecoded.contains(&op) {
+            continue;
+        }
+        emitted_without_arm.push(format!("{op:?}"));
+        // A checker-identity miss (`checker_identity_misses`) is a row a
+        // qualified host credits. Skipping it here would make the lists below
+        // depend on the host, so it must not be a row without an ENC-5 arm.
+        assert!(
+            !(row.finding.is_some()
+                && row
+                    .note
+                    .contains(trust_cg_verify::bound_memory_authority::CHECKER_IDENTITY_MISS)),
+            "{op:?} is a checker-identity miss with no ENC-5 arm: {row:?}"
+        );
+        if row.finding.is_some() {
+            continue;
+        }
+        // Opcode-wide: an instruction with no operands at all still verifies
+        // and promotes. A degenerate (X==X) binding is recorded as such.
+        match verify_alone(trust_cg_ir::MachInst::new(op, vec![])) {
+            (trust_cg_verify::InstructionVerificationResult::Verified { degenerate, .. }, true) => {
+                opcode_wide.push(format!("{op:?}"));
+                if degenerate {
+                    degenerate_fallback.push(format!("{op:?}"));
+                }
+            }
+            _ => per_instruction.push(format!("{op:?}")),
+        }
+    }
+    assert_eq!(
+        opcode_wide, OPCODE_WIDE,
+        "credited opcode-wide with no ENC-5 arm; update the pin and LIMITATIONS.md deliberately"
+    );
+    assert_eq!(
+        per_instruction, PER_INSTRUCTION,
+        "credited per instruction with no ENC-5 arm; update the pin and LIMITATIONS.md deliberately"
+    );
+    assert_eq!(
+        degenerate_fallback, DEGENERATE_FALLBACK,
+        "opcode-wide rows whose operand-independent binding is degenerate; update the pin and \
+         LIMITATIONS.md deliberately"
+    );
+    // Each of those is first rebuilt from its operands when it can be.
+    for name in FORMERLY_DEGENERATE_FALLBACK {
+        let op = *ALL_AARCH64_OPCODES
+            .iter()
+            .find(|op| format!("{op:?}") == name)
+            .expect("an opcode");
+        let representative =
+            trust_cg_verify::function_verifier::representative_reconstructable_inst(op)
+                .unwrap_or_else(|| panic!("{name} has no reconstruction"));
+        assert!(
+            trust_cg_verify::reconstruct_alu_obligation(&representative).is_some(),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        emitted_without_arm, EMITTED_WITHOUT_ARM,
+        "emitted rows with no ENC-5 arm; update the pin and LIMITATIONS.md deliberately"
+    );
+    // The bitwise NEON ops left this list when ENC-5 began decoding their
+    // bound 16B shape, FRINTN when its FP data-processing arm landed.
+    for op in [
+        AArch64Opcode::NeonAndV,
+        AArch64Opcode::NeonOrrV,
+        AArch64Opcode::NeonEorV,
+        AArch64Opcode::NeonBicV,
+        AArch64Opcode::NeonNotV,
+        AArch64Opcode::FrintnRR,
+    ] {
+        assert!(!undecoded.contains(&op), "{op:?}");
+    }
+
+    let limitations = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../LIMITATIONS.md"),
+    )
+    .expect("read LIMITATIONS.md");
+    const MARKER: &str = "ENC-5 does not decode every emitted AArch64 word.";
+    let start = limitations
+        .find(MARKER)
+        .expect("LIMITATIONS.md must disclose the credited rows without an ENC-5 arm");
+    let paragraph = &limitations[start..];
+    let paragraph = &paragraph[..paragraph.find("\n\n").unwrap_or(paragraph.len())];
+    let names = |segment: &str| -> std::collections::BTreeSet<String> {
+        segment
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| {
+                ALL_AARCH64_OPCODES
+                    .iter()
+                    .any(|op| format!("{op:?}") == *token)
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let as_set = |list: &[&str]| -> std::collections::BTreeSet<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    };
+    // The paragraph names the opcode-wide rows, then (after "per
+    // instruction") the per-instruction rows, then (after "degenerate") the
+    // degenerate-fallback subset.
+    let per_at = paragraph
+        .find(" per instruction")
+        .expect("a per-instruction segment");
+    let degenerate_at = paragraph
+        .find("degenerate X==X")
+        .expect("a degenerate-fallback segment");
+    let emitted_at = paragraph
+        .find("emitted rows without an arm are")
+        .expect("an emitted-without-arm segment");
+    assert!(per_at < degenerate_at && degenerate_at < emitted_at);
+    assert_eq!(
+        names(&paragraph[..per_at]),
+        as_set(&OPCODE_WIDE),
+        "LIMITATIONS.md's opcode-wide list"
+    );
+    assert_eq!(
+        names(&paragraph[per_at..degenerate_at]),
+        as_set(&PER_INSTRUCTION),
+        "LIMITATIONS.md's per-instruction list"
+    );
+    assert_eq!(
+        names(&paragraph[degenerate_at..emitted_at]),
+        as_set(&DEGENERATE_FALLBACK),
+        "LIMITATIONS.md's degenerate-fallback list"
+    );
+    assert_eq!(
+        names(&paragraph[emitted_at..]),
+        as_set(&EMITTED_WITHOUT_ARM),
+        "LIMITATIONS.md's emitted-without-arm list"
+    );
+    // LIMITATIONS.md states the credited count a host whose checker the
+    // certificate manifests authorize computes; elsewhere the checker-identity
+    // misses are added back, as `published_coverage_ratios_match_the_gate`
+    // does (their qualification pins are red there).
+    for count in [
+        format!(
+            "{} of the {} credited rows",
+            OPCODE_WIDE.len() + PER_INSTRUCTION.len(),
+            report.covered_count() + checker_identity_misses(&report)
+        ),
+        format!("{} opcode-wide", OPCODE_WIDE.len()),
+        format!("{} per instruction", PER_INSTRUCTION.len()),
+        format!("{} of the opcode-wide rows", DEGENERATE_FALLBACK.len()),
+        format!(
+            "{} of the {} emitted rows",
+            EMITTED_WITHOUT_ARM.len(),
+            report.emittable_count()
+        ),
+    ] {
+        assert!(
+            paragraph.contains(&count),
+            "LIMITATIONS.md must state `{count}`"
+        );
+    }
+
+    // Named allowlist exits inside ENC-5's arms (the catch-all is exported
+    // as a constant and counted above).
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../trust-cg-codegen/src/aarch64/decode_check.rs"),
+    )
+    .expect("read the ENC-5 source");
+    let body = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+    let mut exits = std::collections::BTreeSet::new();
+    for (index, _) in body.match_indices("Allowlisted(") {
+        let rest = body[index + "Allowlisted(".len()..].trim_start();
+        if let Some(literal) = rest.strip_prefix('"') {
+            exits.insert(&literal[..literal.find('"').expect("closed literal")]);
+        }
+    }
+    assert_eq!(
+        exits.into_iter().collect::<Vec<_>>(),
+        ENC5_ARM_EXITS,
+        "ENC-5's named arm exits changed; update the pin and LIMITATIONS.md deliberately"
+    );
+    let exits_paragraph = &limitations[limitations
+        .find("ENC-5's arms also allowlist")
+        .expect("LIMITATIONS.md must disclose ENC-5's arm exits")..];
+    let stated = format!("{} named reasons", ENC5_ARM_EXITS.len());
+    assert!(
+        exits_paragraph.contains(&stated),
+        "LIMITATIONS.md must state `{stated}`"
+    );
+
+    // The shifted register-ALU exits: the three-register shape is decoded
+    // (live word Match, other word Mismatch); a shape with an extra operand
+    // reaches the exit, and the function verifier refuses it.
+    use trust_cg_codegen::aarch64::decode_check::A64DecodeCheck;
+    use trust_cg_codegen::aarch64::encode::encode_instruction;
+    use trust_cg_codegen::decode_check::{DecodeCheck, DecodeCheckOutcome};
+    use trust_cg_ir::{MachInst, MachOperand, PReg};
+    let x = |n: u16| MachOperand::PReg(PReg::new(n));
+    for op in [
+        AArch64Opcode::AddRR,
+        AArch64Opcode::SubRR,
+        AArch64Opcode::AndRR,
+        AArch64Opcode::OrrRR,
+        AArch64Opcode::EorRR,
+    ] {
+        let three = MachInst::new(op, vec![x(0), x(1), x(2)]);
+        let word = encode_instruction(&three).expect("encodes");
+        assert!(
+            matches!(
+                A64DecodeCheck.check_one(&three, &word.to_le_bytes(), None),
+                DecodeCheckOutcome::Match
+            ),
+            "{op:?}"
+        );
+        assert!(
+            matches!(
+                A64DecodeCheck.check_one(&three, &0xDEAD_BEEFu32.to_le_bytes(), None),
+                DecodeCheckOutcome::Mismatch(_)
+            ),
+            "{op:?}"
+        );
+        let four = MachInst::new(op, vec![x(0), x(1), x(2), MachOperand::Imm(3)]);
+        assert!(
+            matches!(
+                A64DecodeCheck.check_one(&four, &0xDEAD_BEEFu32.to_le_bytes(), None),
+                DecodeCheckOutcome::Allowlisted(_)
+            ),
+            "{op:?}"
+        );
+        assert_eq!(FunctionVerifier::inst_to_proof_query(&four), None, "{op:?}");
+    }
+
+    // The immediate shifts with a register (or missing) amount: the encoder
+    // refuses them, ENC-5 reports a mismatch for any word (it used to
+    // allowlist one), and the function verifier refuses the register form.
+    for op in [
+        AArch64Opcode::LslRI,
+        AArch64Opcode::LsrRI,
+        AArch64Opcode::AsrRI,
+    ] {
+        let good = MachInst::new(op, vec![x(0), x(1), MachOperand::Imm(3)]);
+        let word = encode_instruction(&good).expect("encodes");
+        assert!(
+            matches!(
+                A64DecodeCheck.check_one(&good, &word.to_le_bytes(), None),
+                DecodeCheckOutcome::Match
+            ),
+            "{op:?}"
+        );
+        for operands in [vec![x(0), x(1), x(2)], vec![x(0), x(1)]] {
+            let bad = MachInst::new(op, operands);
+            assert!(encode_instruction(&bad).is_err(), "{bad:?}");
+            assert!(
+                matches!(
+                    A64DecodeCheck.check_one(&bad, &0xDEAD_BEEFu32.to_le_bytes(), None),
+                    DecodeCheckOutcome::Mismatch(_)
+                ),
+                "{bad:?}"
+            );
+        }
+        let register_amount = MachInst::new(op, vec![x(0), x(1), x(2)]);
+        assert_eq!(
+            FunctionVerifier::inst_to_proof_query(&register_amount),
+            None,
+            "{op:?}"
+        );
+        assert!(trust_cg_verify::reconstruct_alu_obligation(&register_amount).is_none());
+    }
+}
+
+/// Verify one instruction alone: its result and whether it promotes.
+fn verify_alone(
+    inst: trust_cg_ir::MachInst,
+) -> (trust_cg_verify::InstructionVerificationResult, bool) {
+    let mut func = trust_cg_ir::MachFunction::new(
+        "alone".to_string(),
+        trust_cg_ir::Signature::new(vec![], vec![]),
+    );
+    let id = func.push_inst(inst);
+    let entry = func.entry;
+    func.append_inst(entry, id);
+    let report = trust_cg_verify::verify_function(&func);
+    let promotable = report.emitted_opcode_inventory().is_promotable();
+    (report.instructions[0].result.clone(), promotable)
+}
+
+/// Operand shapes for the trailing-operand inventory: every shape of up to
+/// three operands over a wide pool, four over a middle pool and five over a
+/// small one (each longer shape extends a shorter one from the same pool).
+fn trailing_operand_shapes() -> Vec<Vec<trust_cg_ir::MachOperand>> {
+    use trust_cg_ir::types::BlockId;
+    use trust_cg_ir::{MachOperand, PReg, SpecialReg};
+    let p = |n: u16| MachOperand::PReg(PReg::new(n));
+    let full = vec![
+        p(1),
+        p(2),
+        p(33),
+        p(34),
+        p(97),
+        p(98),
+        p(129),
+        p(130),
+        p(65),
+        p(66),
+        p(166),
+        p(31),
+        MachOperand::Special(SpecialReg::XZR),
+        MachOperand::Special(SpecialReg::WZR),
+        MachOperand::Special(SpecialReg::SP),
+        MachOperand::Imm(0),
+        MachOperand::Imm(1),
+        MachOperand::Imm(3),
+        MachOperand::Imm(12),
+        MachOperand::Imm(255),
+        MachOperand::Imm(4096),
+        MachOperand::Imm(0xF0F0),
+        MachOperand::FImm(1.0),
+        MachOperand::Symbol("s".into()),
+        MachOperand::Block(BlockId(1)),
+    ];
+    let middle = vec![
+        p(1),
+        p(2),
+        p(33),
+        p(34),
+        p(97),
+        p(129),
+        p(65),
+        p(66),
+        MachOperand::Special(SpecialReg::XZR),
+        MachOperand::Imm(0),
+        MachOperand::Imm(1),
+        MachOperand::Imm(3),
+        MachOperand::Imm(12),
+        MachOperand::Symbol("s".into()),
+    ];
+    let small = vec![
+        p(1),
+        p(33),
+        p(97),
+        p(65),
+        MachOperand::Imm(0),
+        MachOperand::Imm(1),
+        MachOperand::Imm(3),
+        MachOperand::Imm(12),
+    ];
+    let mut out = vec![vec![]];
+    let mut previous: Vec<Vec<MachOperand>> = vec![vec![]];
+    for arity in 1..=5 {
+        let pool = match arity {
+            1..=3 => &full,
+            4 => &middle,
+            _ => &small,
+        };
+        let mut next = Vec::new();
+        for base in &previous {
+            if !base.iter().all(|operand| pool.contains(operand)) {
+                continue;
+            }
+            for operand in pool {
+                let mut shape = base.clone();
+                shape.push(operand.clone());
+                next.push(shape);
+            }
+        }
+        out.extend(next.iter().cloned());
+        previous = next;
+    }
+    out
+}
+
+/// The encoder does not check arity: for many opcodes it ignores an operand
+/// after the ones its form encodes. Derived from the code: the opcodes with a
+/// shape (from [`trailing_operand_shapes`]) whose last operand, other than
+/// `#0`, leaves the encoded word unchanged, while the function verifier binds
+/// that shape to an obligation (per-instruction query or reconstruction). The
+/// list is pinned so it only changes deliberately, and LIMITATIONS.md must
+/// name exactly these opcodes. It is an open gap, not a claim that the words
+/// are wrong: ENC-5 ignores the extra operand too for most of them.
+#[test]
+fn credited_aarch64_shapes_with_an_ignored_trailing_operand_are_pinned_and_disclosed() {
+    use std::collections::BTreeMap;
+    use trust_cg_codegen::aarch64::encode::encode_instruction;
+    use trust_cg_ir::{MachInst, MachOperand};
+    use trust_cg_verify::FunctionVerifier;
+    const IGNORED_TRAILING_OPERAND: [&str; 117] = [
+        "AddRI",
+        "SubRI",
+        "MulRR",
+        "Msub",
+        "Umull",
+        "SDiv",
+        "UDiv",
+        "Madd",
+        "Smulh",
+        "Umulh",
+        "Adc",
+        "Sbc",
+        "EorRRShift",
+        "AddRRShift",
+        "SubRRShift",
+        "AddRRShiftLsr",
+        "LdrLiteral",
+        "STRWui",
+        "STRXui",
+        "STRSui",
+        "STRDui",
+        "LdrswRO",
+        "Adr",
+        "Adrp",
+        "AddPCRel",
+        "LdrGot",
+        "LdrTlvp",
+        "B",
+        "BCond",
+        "Bcc",
+        "Bl",
+        "BL",
+        "TailCall",
+        "Sxtb",
+        "Sxth",
+        "Sxtw",
+        "Uxtb",
+        "Uxth",
+        "Uxtw",
+        "FaddRR",
+        "FsubRR",
+        "FmulRR",
+        "FdivRR",
+        "FmaddRR",
+        "FnegRR",
+        "FabsRR",
+        "FsqrtRR",
+        "FmaxnmRR",
+        "FminnmRR",
+        "FcvtSD",
+        "FcvtDS",
+        "Ldar",
+        "Ldarb",
+        "Ldarh",
+        "Stlr",
+        "Stlrb",
+        "Stlrh",
+        "Cas",
+        "Casa",
+        "Casal",
+        "Casl",
+        "Ldadd",
+        "Ldadda",
+        "Ldaddal",
+        "Ldaddl",
+        "Ldclr",
+        "Ldclra",
+        "Ldclral",
+        "Ldclrl",
+        "Ldeor",
+        "Ldeora",
+        "Ldeoral",
+        "Ldeorl",
+        "Ldset",
+        "Ldseta",
+        "Ldsetal",
+        "Ldsetl",
+        "NeonAddV",
+        "NeonSubV",
+        "NeonMulV",
+        "NeonOrrV",
+        "NeonCmeqV",
+        "NeonCmgeV",
+        "NeonCmgtV",
+        "NeonCmhiV",
+        "NeonCmhsV",
+        "NeonFaddV",
+        "NeonFsubV",
+        "NeonFmulV",
+        "NeonFdivV",
+        "NeonFmlaV",
+        "NeonFmlsV",
+        "NeonUcvtfV",
+        "NeonScvtfV",
+        "NeonDupScalarD",
+        "NeonFmlaLaneV",
+        "NeonFcvtlV",
+        "NeonFcvtl2V",
+        "NeonFcmgtV",
+        "NeonSmaxV",
+        "NeonSminV",
+        "NeonUmaxV",
+        "NeonUminV",
+        "NeonDupGen",
+        "NeonDupElem",
+        "NeonInsGen",
+        "NeonUmovGen",
+        "NeonMovi",
+        "NeonRbitV",
+        "NeonRev32V",
+        "NeonRev64V",
+        "NeonCntV",
+        "NeonBitV",
+        "NeonUdotV",
+        "NeonExtV",
+        "NeonLd1Post",
+        "NeonSt1Post",
+    ];
+
+    let found = on_large_stack(|| {
+        let shapes = trailing_operand_shapes();
+        let mut found = Vec::new();
+        for &op in ALL_AARCH64_OPCODES {
+            let mut words: BTreeMap<String, u32> = BTreeMap::new();
+            let mut credited = false;
+            for shape in &shapes {
+                let inst = MachInst::new(op, shape.clone());
+                let Ok(Ok(word)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    encode_instruction(&inst)
+                })) else {
+                    continue;
+                };
+                words.insert(format!("{shape:?}"), word);
+                if credited || shape.len() < 2 || matches!(shape.last(), Some(MachOperand::Imm(0)))
+                {
+                    continue;
+                }
+                let prefix = format!("{:?}", &shape[..shape.len() - 1]);
+                if words.get(&prefix) != Some(&word) {
+                    continue;
+                }
+                credited = FunctionVerifier::inst_to_proof_query(&inst).is_some()
+                    || trust_cg_verify::reconstruct_alu_obligation(&inst).is_some();
+            }
+            if credited {
+                found.push(format!("{op:?}"));
+            }
+        }
+        found
+    });
+    assert_eq!(
+        found, IGNORED_TRAILING_OPERAND,
+        "credited shapes whose trailing operand the encoder ignores; update the pin and \
+         LIMITATIONS.md deliberately"
+    );
+    // The shapes the verifier refuses left this list.
+    for gone in [
+        "AddRR", "SubRR", "AndRR", "OrrRR", "EorRR", "AddsRR", "SubsRR", "Neg", "LslRI", "LsrRI",
+        "AsrRI",
+    ] {
+        assert!(!found.iter().any(|name| name == gone), "{gone}");
+    }
+
+    let limitations = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../LIMITATIONS.md"),
+    )
+    .expect("read LIMITATIONS.md");
+    const MARKER: &str = "The AArch64 encoder does not check arity.";
+    let start = limitations
+        .find(MARKER)
+        .expect("LIMITATIONS.md must disclose the ignored trailing operands");
+    let paragraph = &limitations[start..];
+    let paragraph = &paragraph[..paragraph.find("\n\n").unwrap_or(paragraph.len())];
+    let named: Vec<&str> = paragraph
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|token| {
+            ALL_AARCH64_OPCODES
+                .iter()
+                .any(|op| format!("{op:?}") == *token)
+        })
+        .collect();
+    let mut named_sorted = named.clone();
+    named_sorted.sort_unstable();
+    named_sorted.dedup();
+    let mut expected: Vec<&str> = IGNORED_TRAILING_OPERAND.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        named_sorted, expected,
+        "LIMITATIONS.md must name exactly these opcodes"
+    );
+    let stated = format!("{} opcodes", IGNORED_TRAILING_OPERAND.len());
+    assert!(
+        paragraph.contains(&stated),
+        "LIMITATIONS.md must state `{stated}`"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E0.2: the coverage gate is an inventory, not a credit path
+// ---------------------------------------------------------------------------
+
+/// Occurrences of the coverage gate as CODE (a path or type use) in one Rust
+/// source, one entry per use. Comments (line and block), string literals
+/// (including multi-line and raw strings) and char literals are dropped first,
+/// so a comment or message that says "mirrors coverage_gate" is not a use.
+fn coverage_gate_code_uses(source: &str) -> Vec<String> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut code = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            code.push(' ');
+        } else if c == 'r'
+            && (next == Some('"') || next == Some('#'))
+            && !code.ends_with(|p: char| p.is_ascii_alphanumeric() || p == '_')
+        {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while chars.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if chars.get(j) == Some(&'"') {
+                j += 1;
+                'raw: while j < chars.len() {
+                    if chars[j] == '"' && (1..=hashes).all(|k| chars.get(j + k) == Some(&'#')) {
+                        j += 1 + hashes;
+                        break 'raw;
+                    }
+                    j += 1;
+                }
+                code.push(' ');
+                i = j;
+            } else {
+                code.push(c);
+                i += 1;
+            }
+        } else if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+            code.push(' ');
+        } else if c == '\'' {
+            // A char literal ('x', '\n', '\''), else a lifetime or label.
+            if next == Some('\\') {
+                let mut j = i + 2;
+                while j < chars.len() && chars[j] != '\'' {
+                    j += 1;
+                }
+                i = j + 1;
+                code.push(' ');
+            } else if chars.get(i + 2) == Some(&'\'') {
+                i += 3;
+                code.push(' ');
+            } else {
+                code.push(c);
+                i += 1;
+            }
+        } else {
+            code.push(c);
+            i += 1;
+        }
+    }
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.lines()
+        .filter(|line| {
+            line.split(|c: char| !is_ident(c))
+                .any(|token| token == "coverage_gate" || token == "CoverageGate")
+        })
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
+/// The gate still credits an opcode row when a registry theorem found by name
+/// discharges, or when a REPRESENTATIVE reconstructed obligation discharges by
+/// sampling. Since E0.2 neither is instruction credit, and the gate is safe to
+/// keep only because nothing that decides promotion reads it: no crate other
+/// than `trust-cg-verify` (the codegen promotion gates, the CLI, the rustc
+/// bridge, the JIT) uses it as code. A promotion path that starts consulting
+/// the gate must turn this red and face the E0.2 decision explicitly.
+#[test]
+fn coverage_gate_is_not_consulted_by_any_promotion_crate() {
+    // The scanner itself must see each use and ignore each kind of mention.
+    let probe = [
+        "use trust_cg_verify::coverage_gate::CoverageGate;",
+        "let g = trust_cg_verify::coverage_gate::CoverageGate::new();",
+        "// mirrors coverage_gate discharge_one",
+        "/* coverage_gate */ let q = '\"';",
+        "let s = \"(mirrors coverage_gate\\",
+        "    discharge_one; CoverageGate)\";",
+        "let r = r#\"coverage_gate \"quoted\" CoverageGate\"#;",
+        "let t: &'static str = \"\\\"CoverageGate\";",
+    ]
+    .join("\n");
+    assert_eq!(
+        coverage_gate_code_uses(&probe),
+        vec![
+            "use trust_cg_verify::coverage_gate::CoverageGate;".to_string(),
+            "let g = trust_cg_verify::coverage_gate::CoverageGate::new();".to_string(),
+        ]
+    );
+
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/ directory");
+    let mut scanned = 0usize;
+    let mut offenders = Vec::new();
+    let mut stack = Vec::new();
+    for entry in std::fs::read_dir(crates).expect("read crates/") {
+        let path = entry.expect("crate entry").path();
+        if path
+            .file_name()
+            .is_some_and(|name| name == "trust-cg-verify")
+        {
+            continue;
+        }
+        let src = path.join("src");
+        if src.is_dir() {
+            stack.push(src);
+        }
+    }
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read source dir") {
+            let path = entry.expect("source entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).expect("read source");
+                scanned += 1;
+                for line in coverage_gate_code_uses(&source) {
+                    offenders.push(format!("{}: {line}", path.display()));
+                }
+            }
+        }
+    }
+    // The workspace has ~480 production sources outside the verifier;
+    // a tiny count means the walk found the wrong directory.
+    assert!(scanned > 400, "scanned only {scanned} source files");
+    assert!(
+        offenders.is_empty(),
+        "a promotion crate now uses the opcode coverage gate, whose rows are \
+         not instruction credit (E0.2):\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The eight CRC32 rows are covered only through the CRC32 family's credit
+/// hook (L04-P1): an injected failing hook turns each row RED
+/// (`ProofNotDischarged`), never a quiet deferral, and the real hook credits
+/// every form with its controls.
+#[test]
+fn crc32_rows_need_the_family_credit_and_a_failing_hook_is_red() {
+    use trust_cg_verify::aarch64_crc32_proofs::{CRC32_OPCODES, crc32_credit};
+    let gate = CoverageGate::new();
+    let credit = crc32_credit().expect("the CRC32 family holds");
+    assert_eq!(credit.forms, 8);
+    assert!(credit.controls_refuted >= 8 * 40, "{credit:?}");
+    for op in CRC32_OPCODES {
+        assert_eq!(classify_aarch64(op), OpcodeClass::EmittableNeedsProof);
+        let real = gate.audit_aarch64_crc32_with(op, &crc32_credit);
+        assert!(real.finding.is_none(), "{real:?}");
+        let refused = gate.audit_aarch64_crc32_with(op, &|| Err("injected refusal".into()));
+        assert!(
+            matches!(
+                refused.finding,
+                Some(CoverageFinding::ProofNotDischarged { .. })
+            ),
+            "{refused:?}"
+        );
+    }
+}
+
+/// The `SubsRI` row is covered only through its decoded-word family's credit
+/// hook (L04-P1): an injected failing hook turns it RED.
+#[test]
+fn subs_imm_row_needs_its_family_credit_and_a_failing_hook_is_red() {
+    use trust_cg_verify::aarch64_subs_imm_proofs::subs_imm_credit;
+    let gate = CoverageGate::new();
+    let real = gate.audit_aarch64_subs_imm_with(&subs_imm_credit);
+    assert!(real.finding.is_none(), "{real:?}");
+    assert!(
+        real.note.contains("SUBS #imm DECODED-WORD") && real.note.contains("NOT a formal proof"),
+        "{}",
+        real.note
+    );
+    let refused = gate.audit_aarch64_subs_imm_with(&|| Err("injected refusal".into()));
+    assert!(
+        matches!(
+            refused.finding,
+            Some(CoverageFinding::ProofNotDischarged { .. })
+        ),
+        "{refused:?}"
     );
 }

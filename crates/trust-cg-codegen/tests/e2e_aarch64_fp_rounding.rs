@@ -1,6 +1,6 @@
 // trust-cg-codegen/tests/e2e_aarch64_fp_rounding.rs
 //
-// End-to-end (compile -> link -> RUN on aarch64-apple-darwin) coverage for scalar
+// End-to-end (compile -> link -> RUN on AArch64 macOS or Linux GNU) coverage for scalar
 // FP round-to-integral: floor / ceil / trunc on f32 and f64.
 //
 // These fail-closed on AArch64 ("x86-64-only via SSE4.1 ROUNDSD/ROUNDSS") until
@@ -25,17 +25,25 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId, ValueId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// `fn name(x: T) -> T { op(x) }` for a scalar FP type T (F32 or F64).
 fn build_fp_unop(func_id: u32, name: &str, module: &mut TrustIrModule, ty: Ty, op: UnOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![ty.clone()],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![ty.clone()],
+            returns: vec![ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -52,7 +60,9 @@ fn build_fp_unop(func_id: u32, name: &str, module: &mut TrustIrModule, ty: Ty, o
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -70,7 +80,8 @@ fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("scalar FP round-to-integral must compile (proof/coverage gate included)");
@@ -120,8 +131,8 @@ int main(void) {
 "#;
 
 fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: link-and-run requires an aarch64-apple-darwin host");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: link-and-run requires an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -140,6 +151,7 @@ fn link_run_exit_code(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc available");
     assert!(
@@ -169,4 +181,13 @@ fn e2e_aarch64_scalar_fp_floor_ceil_trunc() {
             "scalar FP round-to-integral runtime mismatch at {opt:?} (failing-case code {code})",
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

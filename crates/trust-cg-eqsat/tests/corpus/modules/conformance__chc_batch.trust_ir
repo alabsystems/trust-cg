@@ -1,0 +1,17 @@
+; TrustIr text format v1
+module "chc_batch"
+
+functy.0 = (ptr, u64, ptr, u64, ptr, u64, ptr) -> (u32)
+
+fn @ay_chc_batch_eval(functy.0) {
+    ; #proof: deterministic, terminates, no_panic, no_undef, append_only_buffer, custom(1001), custom(1002), custom(1003), custom(1004), custom(1005)
+bb0(%0: ptr, %1: u64, %2: ptr, %3: u64, %4: ptr, %5: u64, %6: ptr):
+    %7 = const u32 0
+    ret %7
+}
+
+obligation 0 liveness pending "synthesized from function-level annotation(s) [terminates] on `ay_chc_batch_eval`" function 0
+
+obligation 1 panic_freedom pending "synthesized from function-level annotation(s) [no_panic] on `ay_chc_batch_eval`" function 0
+
+obligation 2 memory_safety pending "synthesized from function-level annotation(s) [no_undef] on `ay_chc_batch_eval`" function 0

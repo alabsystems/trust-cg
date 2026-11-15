@@ -19,14 +19,18 @@
 //! reads NO memory (exactly one store, zero loads) so there is no aliasing
 //! question. The store is UNCONDITIONAL: its block dominates the latch (and is
 //! not the header), so it runs on every header->latch path and never on the
-//! exiting pass — see the "unconditional-store gate" in `recognize`. The loop
-//! has NO EARLY NORMAL EXIT: a non-header body block may leave the loop only
-//! along an edge that provably DIVERGES (a bounds-check panic block: every
-//! reachable sink ends in a trap and nothing reachable is a `Ret`, a `TailCall`,
-//! an indirect `Br`, or a jump-table dispatch). That is a WHITELIST — a `break`
-//! (any `Ret` reachable), a `break` whose `Bl f; Ret` `TailCallOptimization`
-//! already folded into a lone `TailCall f`, or any unmodeled exit shape bails —
-//! see the "no-early-normal-exit gate".
+//! exiting pass — see the "unconditional-store gate" in `recognize`. Every way
+//! the loop can leave is accounted for by the crate's one loop-state contract
+//! (`crate::loop_contract`): the header's `iv <u N` test, and bounds checks on
+//! `iv` against a constant of at least `N`, which no unrolled iteration can
+//! fail. A `break`, a `return`, or a bounds check against a shorter or runtime
+//! length is refused. This pass used to admit any exit into a DIVERGING
+//! (panicking) region instead, and that was wrong: the unrolled stores have no
+//! bounds checks, so `while q < 1024 { a[q] = 1; q += p }` over a 64-byte slice
+//! wrote past the slice before the scalar remainder reached the bounds-check
+//! panic (aarch64, O2/O3, measured 2026-09-30: SIGSEGV where LLVM panics with
+//! memory intact). A panic is observable: its message, its hook, and the memory
+//! written before it.
 //! This is exactly the p7 sieve's `while q < M { comp[q] = 1; q += p }`
 //! marking loop, which LLVM 4x-unrolls; this pass matches it.
 //!
@@ -85,7 +89,11 @@
 //! `TCG_NO_STRIDED_STORE_UNROLL` (run() becomes a no-op). Per-pass bisect:
 //! `TRUST_CG_DISABLE_PASSES=strided_store_unroll`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{
+    ExitPlan, GuardBound, Handoff, InductionGuards, LoopLocality, exit_of_test,
+};
+use crate::mach_util::{branch_targets, copied_const, copy_like, strip_copies};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -203,12 +211,6 @@ impl StridedStoreUnroll {
                 changed = true;
             }
         }
-        if changed && std::env::var("TRUST_CG_DUMP_SSU").is_ok() {
-            eprintln!(
-                "[strided-store-unroll] fn={} unrolled={}",
-                func.name, self.fired
-            );
-        }
         changed
     }
 }
@@ -236,6 +238,9 @@ struct Recognized {
     value_op: MachOperand,
     /// The single store's offset immediate (required `== 0`).
     store_imm: i64,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv]`. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 impl Recognized {
@@ -247,12 +252,8 @@ impl Recognized {
         latch: BlockId,
         body: &HashSet<BlockId>,
     ) -> Option<Self> {
-        let dump = std::env::var("TRUST_CG_DUMP_SSU").is_ok();
         macro_rules! bail {
             ($($t:tt)*) => {{
-                if dump {
-                    eprintln!("[strided-store-unroll] bail@{}: {}", func.name, format!($($t)*));
-                }
                 return None;
             }};
         }
@@ -267,7 +268,7 @@ impl Recognized {
         // atomics, division, multiply, and anything unmodeled are NOT whitelisted
         // -> BAIL. Require EXACTLY ONE store and ZERO loads (the whitelist has no
         // load opcode), so the loop reads no memory: no aliasing question.
-        let mut loop_insts = HashSet::new();
+        let mut loop_insts = HashSet::default();
         let mut stores: Vec<InstId> = Vec::new();
         for &b in body {
             for &id in &func.block(b).insts {
@@ -328,49 +329,15 @@ impl Recognized {
             );
         }
 
-        // (2c) NO-EARLY-NORMAL-EXIT gate.
-        //
-        // Dominance of the latch is necessary but NOT sufficient. A body of the
-        // shape `while q <u N { base[q] = v; if c { break; } q += s; }` has its
-        // store block dominating the latch (every COMPLETED iteration stored),
-        // yet the ORIGINAL loop stops after the store of the breaking iteration
-        // while the unrolled main block performs all four stores of its group
-        // unconditionally — writes the source program never makes. So no
-        // non-header body block may leave the loop along an edge that RETURNS
-        // NORMALLY: control that resumes after such an exit can observe the
-        // extra stores.
-        //
-        // An out-of-body edge to a DIVERGING region is still admitted: the
-        // `base[q]` bounds check branching to a panic block is present in every
-        // real Rust sieve loop (compiled `panic=abort`), and control never
-        // resumes from it, so no unrolled store is observable through it.
-        // "Diverging" is a WHITELIST (`exit_diverges`): every block reachable
-        // from the edge target must be free of `Ret`/`TailCall`/indirect
-        // `Br`/jump-table dispatch, and every reachable sink must end in a
-        // trap. Anything else — including a `break` whose `Bl f; Ret` the
-        // earlier `TailCallOptimization` folded into a lone `TailCall f`, so
-        // that NO `Ret` remains to find — is a normal exit and bails. The
-        // header's own exit edge is the recognized `iv <u N` continue test,
-        // which the spliced `q <u N-3s` guard subsumes.
-        for &b in body {
-            if b == header {
-                continue;
-            }
-            for &s in &func.block(b).succs {
-                if body.contains(&s) {
-                    continue;
-                }
-                if let Err(why) = exit_diverges(func, s) {
-                    bail!(
-                        "body block {:?} takes an early exit to {:?} that is not proven \
-                         diverging ({}): control can resume and observe the unrolled stores",
-                        b,
-                        s,
-                        why
-                    );
-                }
-            }
-        }
+        // (2c) No early exit: dominance of the latch is necessary but NOT
+        // sufficient. `while q <u N { base[q] = v; if c { break; } q += s; }`
+        // has its store block dominating the latch, yet the ORIGINAL loop stops
+        // after the breaking iteration while the unrolled block performs all
+        // four stores of its group. Every way the loop can leave is the
+        // loop-state contract's to account for (`crate::loop_contract`, asked
+        // below): the header test, and bounds checks no unrolled iteration can
+        // fail. A diverging exit is no exception: the unrolled stores carry no
+        // bounds checks.
 
         // (1) Header preds == exactly {preheader, latch}; single latch.
         let hpreds = &func.block(header).preds;
@@ -390,7 +357,7 @@ impl Recognized {
 
         // (3) The strided Gpr64 induction, from the latch: `iv = MovR/Copy(next)`
         // with `next = AddRR(iv, stride)`; stride = the non-iv addend.
-        let Some((iv, stride)) = find_strided_induction(func, &def, latch) else {
+        let Some((iv, stride)) = find_strided_induction(func, def, latch) else {
             bail!("no `iv = MovR(iv + strideReg)` writeback in latch");
         };
         if iv.class != RegClass::Gpr64 {
@@ -403,26 +370,26 @@ impl Recognized {
         if stride == iv {
             bail!("stride aliases iv");
         }
-        if !is_loop_invariant(func, &def, dom, &loop_insts, preheader, stride) {
+        if !is_loop_invariant(func, def, dom, &loop_insts, preheader, stride) {
             bail!("stride not loop-invariant");
         }
 
         // (5) Store shape: `base[iv] = value` (byte address `AddRR(base, iv)`),
         // base loop-invariant, base != iv, value a loop-invariant register.
-        let Some((base, value_op, store_imm)) = store_shape(func, &def, &loop_insts, iv, store_id)
+        let Some((base, value_op, store_imm)) = store_shape(func, def, &loop_insts, iv, store_id)
         else {
             bail!("store is not base+iv byte-address unit-stride");
         };
         if base == iv {
             bail!("base aliases iv");
         }
-        if !is_loop_invariant(func, &def, dom, &loop_insts, preheader, base) {
+        if !is_loop_invariant(func, def, dom, &loop_insts, preheader, base) {
             bail!("base not loop-invariant");
         }
         let MachOperand::VReg(value_reg) = value_op else {
             bail!("store value operand is not a register");
         };
-        if !is_loop_invariant(func, &def, dom, &loop_insts, preheader, value_reg) {
+        if !is_loop_invariant(func, def, dom, &loop_insts, preheader, value_reg) {
             bail!("stored value not loop-invariant (reg={:?})", value_reg);
         }
         let store_opcode = func.inst(store_id).opcode;
@@ -430,7 +397,7 @@ impl Recognized {
         // (1 cont. / 6) NATIVE, COMPILE-TIME-CONSTANT bound: the `iv <u N`
         // continue test lives in the HEADER with the exit = header's non-body
         // successor. Rotated/do-while or runtime/multi-valued N => BAIL.
-        let Some(n) = recognize_native_const_bound(func, &def, body, header, iv) else {
+        let Some(n) = recognize_native_const_bound(func, def, body, header, iv) else {
             bail!("no NATIVE forward iv<const-N continue test in header");
         };
         // Wrap-freedom + materializability: N in [1, u32::MAX] makes 3s < 3N and
@@ -439,13 +406,47 @@ impl Recognized {
             bail!("const bound {} out of [1, u32::MAX]", n);
         }
 
-        if dump {
-            eprintln!(
-                "[strided-store-unroll] RECOGNIZED@{} iv={:?} stride={:?} base={:?} N={} store={:?}",
-                func.name, iv, stride, base, n, store_opcode
-            );
-        }
+        // LOOP STATE (`crate::loop_contract`): the main loop runs only
+        // iterations the header's `iv <u N` test continues (its `q <u N - 3s`
+        // guard subsumes it), and the loop may leave by no other exit except a
+        // bounds check on `iv` against a constant of at least `N`, which the
+        // contract admits by its own rule. The main loop replicates only the
+        // store and advances only `iv`; no other register the loop carries or
+        // leaves live may be skipped.
+        let Some(exit) = exit_of_test(func, body.iter().copied(), header) else {
+            bail!("the header test has no single exit");
+        };
+        let at_most_iv = |v: VReg| same_as_iv(func, def, v, iv);
+        let covers_loop_bound = |guard: GuardBound| match guard {
+            GuardBound::Imm(m) => (m as u64) >= (n as u64),
+            GuardBound::Reg(r) => {
+                crate::effects::live_def_count(func, r.id) == 1
+                    && copied_const(func, def, r).is_some_and(|m| (m as u64) >= (n as u64))
+            }
+        };
+        let exits = ExitPlan::loop_test(header, exit).and_induction_guards(
+            func,
+            body.iter().copied(),
+            header,
+            &InductionGuards {
+                iv,
+                at_most_iv: &at_most_iv,
+                covers_loop_bound: &covers_loop_bound,
+            },
+        );
+        let locality = match LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &exits,
+            Handoff::HeaderOrExit,
+            &[iv],
+        ) {
+            Ok(locality) => locality,
+            Err(_escape) => bail!("loop state escapes: {:?}", _escape),
+        };
         Some(Recognized {
+            _locality: locality,
             header,
             preheader,
             preheader_term,
@@ -482,8 +483,8 @@ fn find_strided_induction(
         };
         let si = func.inst(sdef);
         if si.opcode == AArch64Opcode::AddRR && si.operands.len() == 3 {
-            let a = vreg_of(&si.operands[1])?;
-            let b = vreg_of(&si.operands[2])?;
+            let a = si.operands[1].as_vreg()?;
+            let b = si.operands[2].as_vreg()?;
             if a == d {
                 return Some((d, b));
             }
@@ -496,12 +497,12 @@ fn find_strided_induction(
     for &id in &func.block(latch).insts {
         let inst = func.inst(id);
         if inst.opcode == AArch64Opcode::AddRR && inst.operands.len() == 3 {
-            let d = vreg_of(&inst.operands[0])?;
+            let d = inst.operands[0].as_vreg()?;
             if d.class != RegClass::Gpr64 {
                 continue;
             }
-            let a = vreg_of(&inst.operands[1])?;
-            let b = vreg_of(&inst.operands[2])?;
+            let a = inst.operands[1].as_vreg()?;
+            let b = inst.operands[2].as_vreg()?;
             if a == d {
                 return Some((d, b));
             }
@@ -529,12 +530,12 @@ fn store_shape(
             if inst.operands.len() != 3 {
                 return None;
             }
-            let imm = imm_of(&inst.operands[2])?;
+            let imm = inst.operands[2].as_imm()?;
             if imm != 0 {
                 return None;
             }
             let value_op = inst.operands[0].clone();
-            let addr = vreg_of(&inst.operands[1])?;
+            let addr = inst.operands[1].as_vreg()?;
             let base = resolve_addr_base(func, def, loop_insts, iv, addr)?;
             Some((base, value_op, imm))
         }
@@ -559,8 +560,8 @@ fn resolve_addr_base(
     }
     let inst = func.inst(ad);
     if inst.opcode == AArch64Opcode::AddRR && inst.operands.len() == 3 {
-        let a = vreg_of(&inst.operands[1])?;
-        let b = vreg_of(&inst.operands[2])?;
+        let a = inst.operands[1].as_vreg()?;
+        let b = inst.operands[2].as_vreg()?;
         if same_as_iv(func, def, a, iv) {
             return Some(b);
         }
@@ -586,12 +587,12 @@ fn find_iv_cmp(
         let inst = func.inst(id);
         let parts = match inst.opcode {
             AArch64Opcode::CmpRR if inst.operands.len() == 2 => (
-                vreg_of(&inst.operands[0])?,
+                inst.operands[0].as_vreg()?,
                 None,
-                vreg_of(&inst.operands[1]),
+                inst.operands[1].as_vreg(),
             ),
             AArch64Opcode::CmpRI if inst.operands.len() == 2 => {
-                (vreg_of(&inst.operands[0])?, imm_of(&inst.operands[1]), None)
+                (inst.operands[0].as_vreg()?, inst.operands[1].as_imm(), None)
             }
             _ => continue,
         };
@@ -620,7 +621,7 @@ fn recognize_native_const_bound(
     for &id in &func.block(header).insts {
         let inst = func.inst(id);
         if inst.opcode == AArch64Opcode::BCond && inst.operands.len() == 2 {
-            let cc = imm_of(&inst.operands[0])?;
+            let cc = inst.operands[0].as_imm()?;
             let tgt = *branch_targets(inst).first()?;
             if (cc == CC_LT || cc == CC_LO) && body.contains(&tgt) {
                 has_forward = true;
@@ -658,7 +659,7 @@ fn recognize_native_const_bound(
     if crate::effects::live_def_count(func, rhs.id) != 1 {
         return None;
     }
-    const_value(func, def, rhs)
+    copied_const(func, def, rhs)
 }
 
 /// A register is loop-invariant (w.r.t. the INNER loop being unrolled) iff:
@@ -757,92 +758,6 @@ fn allowed_loop_op(op: AArch64Opcode) -> bool {
 fn is_store(op: AArch64Opcode) -> bool {
     use AArch64Opcode::*;
     matches!(op, StrbRI | StrhRI | StrRI | StrRO)
-}
-
-/// Does control that leaves the loop at `start` DIVERGE — never resume anywhere
-/// the extra unrolled stores could be observed?
-///
-/// Tells a DIVERGING loop exit (a panic/abort block under `panic=abort`) from
-/// a NORMAL one (a `break`/`return` — control resumes). Decided as a WHITELIST
-/// so that an unmodeled construct is a normal exit, never a diverging one:
-/// every block reachable from `start` (inclusive) along CFG successor edges
-///
-/// * must contain no `Ret`, no `TailCall`, no indirect `Br`, and no jump-table
-///   dispatch (`JumpTableIndex` operand). Each of those leaves the local CFG
-///   along an edge `succs` does not enumerate. `TailCall` is the load-bearing
-///   one: `TailCallOptimization` runs BEFORE this pass and folds `Bl f; Ret`
-///   into a lone `TailCall f`, deleting the `Ret` — a "no `Ret` reachable"
-///   test would call that `break` diverging while control resumes in `f`;
-/// * and, if it is a sink (no successors), must end in a trap: `Brk`, or the
-///   unconditional operand-less `TrapOverflow` that ISel's `select_trap`
-///   emits after `Bl abort` for `unreachable`.
-///
-/// `Ok(())` when the region diverges; `Err(why)` naming the first offending
-/// block otherwise. The walk is bounded by the block count (visited set) and
-/// deterministic (successor order).
-fn exit_diverges(func: &MachFunction, start: BlockId) -> Result<(), String> {
-    let mut seen = HashSet::new();
-    let mut work = vec![start];
-    seen.insert(start);
-    while let Some(b) = work.pop() {
-        let blk = func.block(b);
-        for &id in &blk.insts {
-            let inst = func.inst(id);
-            if let Some(what) = local_cfg_escape(inst) {
-                return Err(format!("block {b:?} contains {what}"));
-            }
-        }
-        if blk.succs.is_empty() {
-            let ends_in_trap = blk
-                .insts
-                .last()
-                .is_some_and(|&id| is_unconditional_trap(func.inst(id)));
-            if !ends_in_trap {
-                return Err(format!("sink block {b:?} does not end in a trap"));
-            }
-        }
-        for &s in &blk.succs {
-            if seen.insert(s) {
-                work.push(s);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Name the way `inst` leaves the local CFG along an edge that `succs` does not
-/// enumerate (a return, a tail call, an indirect branch, a jump-table
-/// dispatch), or `None` when it stays local. Matched by opcode AND by flag so a
-/// return-like or call-terminator opcode this list does not name is still
-/// caught.
-fn local_cfg_escape(inst: &MachInst) -> Option<&'static str> {
-    use AArch64Opcode::*;
-    match inst.opcode {
-        Ret => Some("a `Ret`"),
-        TailCall => Some("a `TailCall`"),
-        Br => Some("an indirect `Br`"),
-        _ if inst.is_return() => Some("a returning instruction"),
-        _ if inst.is_call() && inst.is_terminator() => Some("a call terminator"),
-        _ if inst.operands.iter().any(MachOperand::is_jump_table_index) => {
-            Some("a jump-table dispatch")
-        }
-        _ => None,
-    }
-}
-
-/// Is `inst` a trap that never falls through: a real `Brk`, or the
-/// unconditional `TrapOverflow` (no `Block` target — `select_trap`'s
-/// `Bl abort; TrapOverflow` lowering of `unreachable`)? The conditional
-/// `TrapOverflow cc, Block(t)` guard is NOT one: it falls through.
-fn is_unconditional_trap(inst: &MachInst) -> bool {
-    match inst.opcode {
-        AArch64Opcode::Brk => true,
-        AArch64Opcode::TrapOverflow => !inst
-            .operands
-            .iter()
-            .any(|o| matches!(o, MachOperand::Block(_))),
-        _ => false,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,111 +971,10 @@ fn imm(v: i64) -> MachOperand {
 fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
 }
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
-/// `MovR(d, s)` / `Copy(d, s)` / `AddRI(d, s, 0)` copy idioms -> `(d, s)`.
-fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
-    match inst.opcode {
-        AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
-        {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        _ => None,
-    }
-}
 
 /// `v` equals `iv` up through `MovR`/`Copy` chains.
 fn same_as_iv(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, iv: VReg) -> bool {
     strip_copies(func, def, v) == strip_copies(func, def, iv)
-}
-
-/// Follow `MovR`/`Copy` chains to the underlying value.
-fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
-    for _ in 0..16 {
-        // A vreg with several live defs has no single reaching definition: the
-        // def map is LAST-WINS over the emitted layout, so it names whichever
-        // def comes last rather than the one that reaches this use. Every
-        // loop-carried variable is multi-def by construction (a preheader copy
-        // and a latch copy into the same vreg), and every `if`/`match` value has
-        // one def per arm — so walking one resolves an induction variable to its
-        // LATCH source, or a merge value to whichever arm came last.
-        //
-        // Confirmed wrong-code from this exact hole in neon_fill, mac_reg_block,
-        // mac_row_unroll, strided_store_unroll, neon_iota_fill and neon_bytesum.
-        // `swap_range_guard::single_def` and `neon_find`'s bound check were the
-        // in-tree precedents for doing it right.
-        if crate::effects::live_def_count(func, v.id) != 1 {
-            return v;
-        }
-        let Some(&d) = def.get(&v.id) else {
-            return v;
-        };
-        match copy_like(func.inst(d)) {
-            Some((dst, src)) if dst == v => v = src,
-            _ => return v,
-        }
-    }
-    v
-}
-
-/// 16-bit `Movz` constant, or a `Movz(lo16)`+`Movk(hi..)` chain, through copies.
-fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
-    let v = strip_copies(func, def, val);
-    let id = *def.get(&v.id)?;
-    let inst = func.inst(id);
-    match inst.opcode {
-        AArch64Opcode::Movz => {
-            let (dst, value) = crate::reaching_const::movz_value(inst)?;
-            if dst != v {
-                return None;
-            }
-            i64::try_from(value).ok()
-        }
-        AArch64Opcode::Movk => {
-            let blk = block_of_inst(func, id)?;
-            let insts = &func.block(blk).insts;
-            let pos = insts.iter().position(|&i| i == id)?;
-            // Accumulate every earlier Movz/Movk on the same reg in this block.
-            let mut acc: Option<u64> = None;
-            for &pid in insts[..pos].iter() {
-                let pi = func.inst(pid);
-                if !crate::effects::inst_defines_vreg(pi, v) {
-                    continue;
-                }
-                match pi.opcode {
-                    AArch64Opcode::Movz => {
-                        let (dst, value) = crate::reaching_const::movz_value(pi)?;
-                        if dst != v {
-                            return None;
-                        }
-                        acc = Some(value);
-                    }
-                    AArch64Opcode::Movk => {
-                        acc = Some(crate::reaching_const::apply_movk(pi, v, acc?)?);
-                    }
-                    _ => return None,
-                }
-            }
-            let value = crate::reaching_const::apply_movk(inst, v, acc?)?;
-            i64::try_from(value).ok()
-        }
-        _ => None,
-    }
 }
 
 pub(crate) static STRIDED_NANOS: std::sync::atomic::AtomicU64 =
@@ -1193,16 +1007,6 @@ fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
         }
     }
     None
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|o| match o {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
 }
 
 fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
@@ -1252,7 +1056,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);

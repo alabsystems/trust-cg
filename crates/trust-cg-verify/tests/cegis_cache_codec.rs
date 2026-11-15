@@ -199,6 +199,8 @@ fn every_variant_entry() -> CegisCacheEntry {
         },
         MachOperandBlob::PReg { encoding: 0 },
         MachOperandBlob::PReg { encoding: u16::MAX },
+        MachOperandBlob::ExactModuleSymbol("exact_callback".into()),
+        MachOperandBlob::Symbol("exact_callback".into()),
         MachOperandBlob::Imm(i64::MIN),
         MachOperandBlob::Imm(i64::MAX),
         MachOperandBlob::Imm(-1),
@@ -384,6 +386,7 @@ fn blob_of(inst: &MachInst) -> MachInstBlob {
                     MachOperandBlob::Special(SpecialRegBlob::WZR)
                 }
                 MachOperand::Symbol(s) => MachOperandBlob::Symbol(s.clone()),
+                MachOperand::ExactModuleSymbol(s) => MachOperandBlob::ExactModuleSymbol(s.clone()),
                 other => panic!("extend blob_of for {other:?}"),
             })
             .collect(),

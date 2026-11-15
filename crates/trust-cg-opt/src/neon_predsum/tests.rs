@@ -4,7 +4,196 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use super::*;
+use trust_cg_ir::MachInst;
 use trust_cg_ir::Signature;
+
+use crate::candidate::tests::support;
+
+#[test]
+fn candidate_lowering_refusal_preserves_live_function() {
+    for path in 0..2 {
+        let mut func = candidate_fixture(path);
+        let mut plan = candidate_plan(&func);
+        let missing = VReg::new(u32::MAX, RegClass::Gpr32);
+        match &mut plan {
+            Plan::Strict(rec) => rec.term = missing,
+            Plan::Chain(rec) => rec.reductions[0].addend = missing,
+        }
+        support::assert_refusal(&mut func, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_every_register_reservation_is_atomic() {
+    for (label, fixture) in candidate_variants() {
+        let plan = candidate_plan(&fixture);
+        support::every_reservation(label, &fixture, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_sparse_detached_and_metadata_ids_remain_fresh() {
+    for (_, fixture) in candidate_variants() {
+        let plan = candidate_plan(&fixture);
+        support::sparse_ids(&fixture, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_duplicate_setup_ownership_is_refused() {
+    for path in 0..2 {
+        let mut func = candidate_fixture(path);
+        let plan = candidate_plan(&func);
+        let (pre, guard) = candidate_anchors(&plan);
+        func.block_mut(guard).insts.push(pre);
+        support::assert_refusal(&mut func, |func| apply_candidate_plan(func, &plan));
+    }
+}
+
+#[test]
+fn candidate_public_routes_refuse_without_mutation() {
+    for (label, fixture) in candidate_variants() {
+        for analyses_route in [false, true] {
+            let mut positive = fixture.clone();
+            let mut pass = NeonPredSumPass::new();
+            assert!(
+                if analyses_route {
+                    pass.run_with_analyses(&mut positive, &mut AnalysisCache::new())
+                } else {
+                    pass.run(&mut positive)
+                },
+                "positive {label}"
+            );
+            assert_eq!(pass.fired(), 1);
+            for metadata in [false, true] {
+                let mut func = fixture.clone();
+                if metadata {
+                    func.noalias_params.push(u32::MAX);
+                } else {
+                    func.next_vreg = u32::MAX;
+                }
+                support::assert_refusal(&mut func, |func| {
+                    if analyses_route {
+                        pass.run_with_analyses(func, &mut AnalysisCache::new())
+                    } else {
+                        pass.run(func)
+                    }
+                });
+                assert_eq!(pass.fired(), 0, "{label}");
+            }
+        }
+    }
+}
+
+#[test]
+fn candidate_public_routes_remain_idempotent() {
+    for (label, mut func) in candidate_variants() {
+        let mut pass = NeonPredSumPass::new();
+        assert!(pass.run(&mut func), "{label}");
+        support::assert_refusal(&mut func, |func| pass.run(func));
+        assert_eq!(pass.fired(), 0);
+    }
+}
+
+fn candidate_plan(func: &MachFunction) -> Plan {
+    let dom = DomTree::compute(func);
+    let loops = LoopAnalysis::compute(func, &dom);
+    loops
+        .all_loops()
+        .find_map(|lp| {
+            Recognized::recognize(func, &dom, lp.header, lp.latch, &lp.body)
+                .map(Plan::Strict)
+                .or_else(|| {
+                    PredSumChainRecognized::recognize(func, &dom, lp.header, lp.latch, &lp.body)
+                        .map(Plan::Chain)
+                })
+        })
+        .expect("unmodified fixture must be recognized")
+}
+
+fn apply_candidate_plan(func: &mut MachFunction, plan: &Plan) -> bool {
+    match plan {
+        Plan::Strict(rec) => apply(func, rec),
+        Plan::Chain(rec) => apply_chain(func, rec),
+    }
+}
+
+fn candidate_fixture(path: usize) -> MachFunction {
+    match path {
+        0 => build_predsum_loop(Sel::ClampPos),
+        1 => build_chain_condsum(2048, true),
+        _ => unreachable!(),
+    }
+}
+
+fn candidate_anchors(plan: &Plan) -> (InstId, BlockId) {
+    match plan {
+        Plan::Strict(rec) => (rec.preheader_term, rec.guard),
+        Plan::Chain(rec) => (rec.preheader_term, rec.guard),
+    }
+}
+
+fn assert_candidate_refusal(path: usize, kind: usize) {
+    let mut func = candidate_fixture(path);
+    let plan = candidate_plan(&func);
+    let (pre, guard) = candidate_anchors(&plan);
+    support::corrupt(&mut func, pre, guard, kind);
+    support::assert_refusal(&mut func, |func| apply_candidate_plan(func, &plan));
+}
+
+macro_rules! candidate_refusal_test {
+    ($name:ident, $path:expr, $kind:expr) => {
+        #[test]
+        fn $name() {
+            assert_candidate_refusal($path, $kind);
+        }
+    };
+}
+candidate_refusal_test!(candidate_strict_early_exhaustion, 0, 0);
+candidate_refusal_test!(candidate_strict_late_exhaustion, 0, 1);
+candidate_refusal_test!(candidate_strict_metadata_exhaustion, 0, 2);
+candidate_refusal_test!(candidate_strict_splice_refusal, 0, 3);
+candidate_refusal_test!(candidate_strict_missing_setup, 0, 4);
+candidate_refusal_test!(candidate_strict_missing_layout, 0, 5);
+candidate_refusal_test!(candidate_chain_early_exhaustion, 1, 0);
+candidate_refusal_test!(candidate_chain_late_exhaustion, 1, 1);
+candidate_refusal_test!(candidate_chain_metadata_exhaustion, 1, 2);
+candidate_refusal_test!(candidate_chain_splice_refusal, 1, 3);
+candidate_refusal_test!(candidate_chain_missing_setup, 1, 4);
+candidate_refusal_test!(candidate_chain_missing_layout, 1, 5);
+
+fn candidate_variants() -> Vec<(&'static str, MachFunction)> {
+    let mut narrow = build_chain_condsum(2048, true);
+    for inst in &mut narrow.insts {
+        if inst.opcode == AArch64Opcode::BCond && inst.operands.first() == Some(&i(CC_GT)) {
+            inst.operands[0] = i(CC_NE);
+        }
+    }
+    vec![
+        ("strict-clamp", build_predsum_loop(Sel::ClampPos)),
+        ("strict-max", build_predsum_loop(Sel::TwoMax)),
+        ("strict-abs", build_predsum_loop(Sel::Abs)),
+        ("strict-count", build_predsum_loop(Sel::MaskConst)),
+        ("strict-mask", build_predsum_loop(Sel::MaskConstK)),
+        ("strict-i64-clamp", build_i64_clamp_loop()),
+        ("strict-i64-count", build_i64_count_loop()),
+        ("chain-wide", build_chain_condsum(2048, true)),
+        (
+            "chain-widening",
+            build_chain_condsum_i64_acc(2048, WidenAddend::Sxtw),
+        ),
+        ("chain-narrow", narrow),
+    ]
+}
+
+#[test]
+fn candidate_success_snapshots() {
+    for (label, mut func) in candidate_variants() {
+        let plan = candidate_plan(&func);
+        assert!(apply_candidate_plan(&mut func, &plan), "{label}");
+        println!("PREDSUM_CANDIDATE_SNAPSHOT {label}: {func:?}");
+    }
+}
 
 fn v(id: u32) -> MachOperand {
     MachOperand::VReg(VReg::new(id, RegClass::Gpr32))
@@ -384,8 +573,7 @@ fn bails_on_minmax_root() {
 /// zero-else fast path emits ONE proven `AND`; the guard is the i64 precheck +
 /// unsigned-compare pair. The single-op SMAX/ABS fast paths must NOT appear
 /// (no `.2D` form exists).
-#[test]
-fn vectorizes_i64_clamp_sum_on_2d() {
+fn build_i64_clamp_loop() -> MachFunction {
     let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
     let bb0 = func.entry;
     let guard = func.create_block();
@@ -439,6 +627,12 @@ fn vectorizes_i64_clamp_sum_on_2d() {
     func.add_edge(latch, header);
     func.add_edge(latch, exit);
     func.next_vreg = 128;
+    func
+}
+
+#[test]
+fn vectorizes_i64_clamp_sum_on_2d() {
+    let mut func = build_i64_clamp_loop();
     let mut pass = NeonPredSumPass::new();
     assert!(pass.run(&mut func), "i64 clamp-sum must vectorize on `.2D`");
     assert_eq!(pass.fired(), 1);
@@ -480,8 +674,7 @@ fn vectorizes_i64_clamp_sum_on_2d() {
 /// COUNTING fusion at `.2D`: one `CMEQ.2D` mask + one `SUB.2D` of the mask per
 /// accumulator — exactly clang's shape. `k` is a loop-invariant `Gpr64`
 /// broadcast (DUP.2D).
-#[test]
-fn vectorizes_i64_count_eq_cmeq_sub_2d() {
+fn build_i64_count_loop() -> MachFunction {
     let mut func = MachFunction::new("k".to_string(), Signature::new(vec![], vec![]));
     let bb0 = func.entry;
     let guard = func.create_block();
@@ -536,6 +729,12 @@ fn vectorizes_i64_count_eq_cmeq_sub_2d() {
     func.add_edge(latch, header);
     func.add_edge(latch, exit);
     func.next_vreg = 128;
+    func
+}
+
+#[test]
+fn vectorizes_i64_count_eq_cmeq_sub_2d() {
+    let mut func = build_i64_count_loop();
     let mut pass = NeonPredSumPass::new();
     assert!(pass.run(&mut func), "i64 count-eq must vectorize on .2D");
     assert_eq!(pass.fired(), 1);
@@ -1380,4 +1579,49 @@ fn second_run_is_a_no_op_for_every_firing_variant() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): both recognizers' vector loops
+// reproduce only the induction and the accumulators, so a second carried
+// register and a live-out-only register must each refuse.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build, VReg); 2] = [
+        (
+            "strict predicated sum",
+            || build_predsum_loop(Sel::ClampPos),
+            VReg::new(5, RegClass::Gpr32),
+        ),
+        (
+            "forward-chain conditional sum",
+            || build_chain_condsum(64, true),
+            VReg::new(5, RegClass::Gpr64),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, build, iv) in shapes {
+        assert!(
+            NeonPredSumPass::new().run(&mut build()),
+            "{name}: plain fires"
+        );
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if NeonPredSumPass::new().run(&mut carried) {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if NeonPredSumPass::new().run(&mut live_out) {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state:\n  {}",
+        wrong.join("\n  ")
+    );
 }

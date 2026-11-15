@@ -38,6 +38,7 @@ fn jit(module: &trust_ir::Module, opt: OptLevel, fast: bool, row: [i64; 4]) -> i
     };
     cfg.opt_level = opt;
     let buf = Compiler::new(cfg)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &externs)
         .expect("compile")
         .buffer;
@@ -63,7 +64,7 @@ fn build_fconst(ty: Ty, k: f64) -> trust_ir::Module {
     let r = fb.cast(CastOp::FPToSI, ty, Ty::I64, c);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -124,7 +125,7 @@ fn build_fcmp_select(pred: FCmpOp) -> trust_ir::Module {
     let sel = fb.select(Ty::I64, cond, c, d);
     fb.ret(vec![sel]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -153,4 +154,13 @@ fn all_fcmp_predicates_compile_and_match_oracle() {
             }
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

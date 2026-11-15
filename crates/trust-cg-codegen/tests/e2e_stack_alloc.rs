@@ -128,7 +128,8 @@ fn compile_link_run(module: &TrustIrModule, test_name: &str, driver_src: &str) -
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
 
     let result = compiler
         .compile(module)
@@ -234,7 +235,7 @@ fn e2e_stack_alloc_store_load_simple() {
     fb.ret(vec![loaded_val]);
 
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // NOTE: Single call from main, result used immediately then exit.
     // See KNOWN LIMITATION in file header re: FP corruption.
@@ -297,7 +298,7 @@ fn e2e_stack_alloc_store_load_argument() {
     fb.ret(vec![loaded]);
 
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // Single call, immediate use. See KNOWN LIMITATION re: FP corruption.
     let driver_src = r#"
@@ -361,7 +362,7 @@ fn e2e_stack_alloc_compute_store_reload() {
     fb.ret(vec![reloaded]);
 
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     // Single call. See KNOWN LIMITATION re: FP corruption.
     let driver_src = r#"
@@ -411,13 +412,14 @@ fn e2e_stack_alloc_compiles_all_opt_levels() {
     fb.ret(vec![loaded]);
 
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     for opt in &[OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let compiler = Compiler::new(CompilerConfig {
             opt_level: *opt,
             ..CompilerConfig::default()
-        });
+        })
+        .with_codegen_license(permit_unlicensed());
 
         let result = compiler
             .compile(&module)
@@ -478,13 +480,14 @@ fn e2e_stack_alloc_overwrite_compiles() {
     fb.ret(vec![sum]);
 
     fb.build();
-    let module = mb.build();
+    let module = mb.build().expect("ModuleBuilder::build: test fixture");
 
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O0,
         trace_level: CompilerTraceLevel::Full,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
 
     let result = compiler
         .compile(&module)
@@ -501,4 +504,13 @@ fn e2e_stack_alloc_overwrite_compiles() {
         "  store-overwrite-load compiled to {} bytes, {} instructions",
         result.metrics.code_size_bytes, result.metrics.instruction_count
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

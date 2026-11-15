@@ -1,0 +1,6 @@
+80b0e03aa609-dirty-20260929T142117Z.json: load 3.29->2.99 (QUIET); MATCH 18
+  compile geomean s: LLVM -O2 0.319, bridge warm 0.395, bridge cold 1.264, cold - warm 0.868
+  LLVM -O3 run geomean over 10 resolvable rows: 0.2447 s (b1_mispredict, m1_call_chain, m2_call_heavy, p1_xorshift, p2_collatz, p3_gcd, p5_struct_acc, p6_branch_match, p8_closure_nest, v1_saxpy)
+efc47d3bc3e5-20261014T150057Z.json: load 3.9->12.46 (LOADED); MATCH 18
+  compile geomean s: LLVM -O2 0.328, bridge warm 0.338, bridge cold 1.105, cold - warm 0.767
+  LLVM -O3 run geomean over 10 resolvable rows: 0.2495 s (b1_mispredict, m1_call_chain, m2_call_heavy, p1_xorshift, p2_collatz, p3_gcd, p5_struct_acc, p6_branch_match, p8_closure_nest, v1_saxpy)

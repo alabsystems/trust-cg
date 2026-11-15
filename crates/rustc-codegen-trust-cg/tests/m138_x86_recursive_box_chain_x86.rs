@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // E2E (x86_64-apple-darwin): FUZZ-10 pins for the RECURSIVE pure-Box drop glue
 // (commit 80eea9f: `boxed_payload_drop_recursively_lowerable` +
@@ -56,52 +60,11 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
+const TARGET: &str = host_target_support::X86_64_TARGET;
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    for cand in [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ] {
-        if cand.exists() {
-            return cand;
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m138 test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn host_is_x86_64_macos() -> bool {
@@ -109,16 +72,7 @@ fn host_is_x86_64_macos() -> bool {
 }
 
 fn x86_64_std_available() -> bool {
-    Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == TARGET)
-        })
-        .unwrap_or(false)
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -144,14 +98,14 @@ fn compile_bin(
     let src = dir.join(format!("{stem}.rs"));
     std::fs::write(&src, src_body).expect("write source");
     let bin = dir.join(stem);
-    let mut cmd = Command::new("rustup");
+    let mut cmd = toolchain_support::rustc_command();
     cmd.env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = dylib {
         let mut s = std::ffi::OsString::from("-Zcodegen-backend=");
         s.push(dylib);
-        cmd.arg(&s).env("TCG_NO_PROOF_CERTS", "1");
+        cmd.arg(&s)
+            .arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
     }
     cmd.args(["--target", TARGET])
         .arg(format!("-Cpanic={panic}"))
@@ -343,7 +297,12 @@ fn positives() -> Vec<Positive> {
             stem: "chain5",
             src: SRC_CHAIN5,
             expect_exit: 13,
-            configs: &[("0", "abort"), ("3", "abort"), ("0", "unwind"), ("3", "unwind")],
+            configs: &[
+                ("0", "abort"),
+                ("3", "abort"),
+                ("0", "unwind"),
+                ("3", "unwind"),
+            ],
         },
         Positive {
             stem: "rebox3",
@@ -435,8 +394,15 @@ fn recursive_box_chain_positive_shapes_match_llvm_and_heap_oracles_x86_64() {
     for case in positives() {
         for (opt, panic) in case.configs {
             let tag = format!("{}.p{panic}.O{opt}", case.stem);
-            let llvm = compile_bin(None, &dir, case.src, &format!("{}_l_{panic}_{opt}", case.stem), opt, panic)
-                .unwrap_or_else(|e| panic!("FIXTURE BROKEN: LLVM could not compile {tag}: {e}"));
+            let llvm = compile_bin(
+                None,
+                &dir,
+                case.src,
+                &format!("{}_l_{panic}_{opt}", case.stem),
+                opt,
+                panic,
+            )
+            .unwrap_or_else(|e| panic!("FIXTURE BROKEN: LLVM could not compile {tag}: {e}"));
             let tcg = match compile_bin(
                 Some(&dylib),
                 &dir,

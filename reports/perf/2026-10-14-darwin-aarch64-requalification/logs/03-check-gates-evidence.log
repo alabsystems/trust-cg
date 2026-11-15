@@ -1,0 +1,14 @@
+run is ELIGIBLE (quiet, clean tree, default gates, 0 MISMATCH)
+  unmeasured  G1a_scalar_runtime_M2  — scalar-integer corpus runtime geomean <= 1.30x LLVM -O3 (scalar category only, per manifest.json — the corpus now spans categories, BENCH-3)
+  unmeasured  G1b_vectorizable_M5  — each vectorizable kernel <= 2.0x LLVM -O3 (worst over the vectorizable category)
+  unmeasured  G1c_GATE_SB_M6  — strictly better: full intent-to-treat geomean < 1.00x AND no benchmark > 1.50x, coverage >= 80%
+  unmeasured  G2_M1_compile_warm_vs_O2  — warm certs-on compile geomean <= 1.00x LLVM -O2 (warm cache mode stamped)
+  unmeasured  G2_M1_compile_cold_vs_O2  — cold compile geomean <= 2.00x LLVM -O2 (true cold, not cold_proxy)
+  unmeasured  G2_endstate_compile_warm_vs_O3  — end-state: warm certs-on compile geomean < 1.00x LLVM -O3
+  fail        G5_coverage_M6  — intent-to-treat coverage >= 80% compile-and-match
+  unmeasured  S1_size_linked_parity_vs_O3  — linked executable file bytes (st_size, shared std included; not emitted-code size) geomean <= 1.10x LLVM -O3 (the roadmap BENCH-1 GATE-P2 threshold, applied to linked bytes)
+  unmeasured  S2_size_linked_SB_vs_O3  — linked executable file bytes geomean <= 1.00x LLVM -O3 (the roadmap BENCH-1 GATE-SB size threshold, applied to linked bytes)
+  unmeasured  S3_size_emitted_parity_vs_O3  — emitted-code bytes (the linked image's code and read-only data the linker map attributes to the program's own objects; shared std excluded) geomean <= 1.10x LLVM -O3 (roadmap GATE-P2 size)
+  unmeasured  S4_size_emitted_SB_vs_O3  — emitted-code bytes geomean <= 1.00x LLVM -O3 (roadmap GATE-SB size)
+  unmeasured  R1_program_rss_no_resolved_loss  — no MATCH program's bridge peak-RSS median exceeds max(its LLVM -O3 median, the sampler floor) by more than its parity band max(5%, 2 x the larger lane's relative sample spread) (a conclusive loss); passes only when every program's comparison is resolved (both medians above 2x the sampler floor and neither lane's relative sample spread above 0.25), otherwise unmeasured; one-sided: cannot certify a win or RSS <= 1.0x
+  unmeasured  R2_compile_rss_parity_vs_O2  — compiler peak RSS (largest single process of the trustc invocation, median of N compiles per lane) geomean <= 1.00x LLVM -O2, with no compiler median at or below 2x the sampler floor (mirrors G2-M1)

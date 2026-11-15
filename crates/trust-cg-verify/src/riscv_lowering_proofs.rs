@@ -18,11 +18,10 @@
 //   * The machine side (the `aarch64_expr` field, reused as the generic machine
 //     side here exactly as x86-64 does — DO NOT rename it) is ALWAYS built from
 //     `riscv_semantics::encode_*`, authored independently from the trust_ir spec.
-//   * For genuine 1:1 single-instruction lowerings (Iadd->ADD, ... Ushr->SRL),
-//     both sides independently compute the same bitvector op; the equivalence is
-//     an honest identity that PINS the emitted opcode to the source op (a wrong
-//     opcode choice, e.g. Iadd->SUB, would make the obligation FALSE and be
-//     caught). These are NOT contorted to force a syntactic difference.
+//   * 1:1 single-instruction lowerings (Iadd->ADD, ... Ushr->SRL) have no
+//     static obligation here: spec and machine side would build the same
+//     bitvector op, a degenerate X==X identity (#62 retraction). Those opcodes
+//     are credited by riscv_function_verifier's operand reconstruction instead.
 //   * For the comparison IDIOMS (Icmp Eq/Ne/Sge/Sgt/Sle/Uge/Ugt/Ule) the machine
 //     side models the FULL emitted multi-instruction RISC-V sequence (SUB+SLTIU,
 //     SUB+SLTU, SLT+XORI, swapped SLT, ...), which is genuinely DISTINCT from the
@@ -40,9 +39,7 @@
 
 use crate::lowering_proof::ProofObligation;
 use crate::riscv_semantics::{
-    RiscVOperandSize, encode_add, encode_and, encode_mul, encode_or, encode_sll, encode_slli,
-    encode_slt, encode_sltiu, encode_sltu, encode_sra, encode_srl, encode_srli, encode_sub,
-    encode_xor, encode_xori,
+    RiscVOperandSize, encode_slt, encode_sltiu, encode_sltu, encode_sub, encode_xori,
 };
 use crate::smt::SmtExpr;
 
@@ -56,337 +53,6 @@ fn ab64() -> (SmtExpr, SmtExpr) {
 
 fn ab_inputs() -> Vec<(String, u32)> {
     vec![("a".to_string(), I64_W), ("b".to_string(), I64_W)]
-}
-
-// ===========================================================================
-// Clean 1:1 dataflow ALU lowerings (i64)
-//
-// trust_ir spec op == RISC-V emitted op, both computing the same bitvector
-// operation. Honest identity (pins the opcode); no forced non-degeneracy.
-// ===========================================================================
-
-/// Proof: `trust_ir::Iadd(I64, a, b) -> RISC-V ADD rd, rs1, rs2`.
-pub fn proof_riscv_add_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_binop;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Iadd_I64 -> ADD".to_string(),
-        trust_ir_expr: encode_trust_ir_binop(&Opcode::Iadd, Type::I64, a.clone(), b.clone()),
-        aarch64_expr: encode_add(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Isub(I64, a, b) -> RISC-V SUB rd, rs1, rs2`.
-pub fn proof_riscv_sub_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_binop;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Isub_I64 -> SUB".to_string(),
-        trust_ir_expr: encode_trust_ir_binop(&Opcode::Isub, Type::I64, a.clone(), b.clone()),
-        aarch64_expr: encode_sub(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Imul(I64, a, b) -> RISC-V MUL rd, rs1, rs2` (low 64 bits).
-pub fn proof_riscv_mul_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_binop;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Imul_I64 -> MUL".to_string(),
-        trust_ir_expr: encode_trust_ir_binop(&Opcode::Imul, Type::I64, a.clone(), b.clone()),
-        aarch64_expr: encode_mul(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Band(I64, a, b) -> RISC-V AND rd, rs1, rs2`.
-pub fn proof_riscv_and_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_bitwise_binop;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Band_I64 -> AND".to_string(),
-        trust_ir_expr: encode_trust_ir_bitwise_binop(
-            &Opcode::Band,
-            Type::I64,
-            a.clone(),
-            b.clone(),
-        ),
-        aarch64_expr: encode_and(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Bor(I64, a, b) -> RISC-V OR rd, rs1, rs2`.
-pub fn proof_riscv_or_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_bitwise_binop;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Bor_I64 -> OR".to_string(),
-        trust_ir_expr: encode_trust_ir_bitwise_binop(&Opcode::Bor, Type::I64, a.clone(), b.clone()),
-        aarch64_expr: encode_or(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Bxor(I64, a, b) -> RISC-V XOR rd, rs1, rs2`.
-pub fn proof_riscv_xor_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_bitwise_binop;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Bxor_I64 -> XOR".to_string(),
-        trust_ir_expr: encode_trust_ir_bitwise_binop(
-            &Opcode::Bxor,
-            Type::I64,
-            a.clone(),
-            b.clone(),
-        ),
-        aarch64_expr: encode_xor(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Ishl(I64, a, b) -> RISC-V SLL rd, rs1, rs2`.
-///
-/// Both sides use SMT `bvshl`; over the in-range shift-amount domain the
-/// trust_ir type system guarantees, this is exactly the RV64 SLL `& 0x3F`
-/// result (see `riscv_semantics::encode_sll`). Matches the AArch64 i64
-/// `Ishl -> LSL` precedent.
-pub fn proof_riscv_sll_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_shift;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Ishl_I64 -> SLL".to_string(),
-        trust_ir_expr: encode_trust_ir_shift(&Opcode::Ishl, Type::I64, a.clone(), b.clone()),
-        aarch64_expr: encode_sll(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Ushr(I64, a, b) -> RISC-V SRL rd, rs1, rs2` (logical).
-pub fn proof_riscv_srl_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_shift;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Ushr_I64 -> SRL".to_string(),
-        trust_ir_expr: encode_trust_ir_shift(&Opcode::Ushr, Type::I64, a.clone(), b.clone()),
-        aarch64_expr: encode_srl(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Sshr(I64, a, b) -> RISC-V SRA rd, rs1, rs2` (arithmetic).
-pub fn proof_riscv_sra_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_shift;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Sshr_I64 -> SRA".to_string(),
-        trust_ir_expr: encode_trust_ir_shift(&Opcode::Sshr, Type::I64, a.clone(), b.clone()),
-        aarch64_expr: encode_sra(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-// ===========================================================================
-// Shift-by-immediate lowerings (i64)
-//
-// The shamt is a compile-time constant in [0, 63], so there is no masking
-// subtlety. We pin a representative non-degenerate shamt (5) and also expose
-// builders parameterized by shamt for the harness.
-// ===========================================================================
-
-/// Proof: `trust_ir::Ishl(I64, a, shamt) -> RISC-V SLLI rd, rs1, shamt`.
-///
-/// The trust_ir spec is `bvshl(a, bv_const(shamt))`; the machine side is
-/// `encode_slli` (also `bvshl` by the constant). Honest 1:1 for a fixed
-/// in-range immediate.
-pub fn proof_riscv_slli_i64_shamt(shamt: u32) -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_shift;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let a = SmtExpr::var("a", I64_W);
-    let shamt_const = SmtExpr::bv_const(shamt as u64, I64_W);
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: format!("riscv: Ishl_I64_imm{shamt} -> SLLI"),
-        trust_ir_expr: encode_trust_ir_shift(&Opcode::Ishl, Type::I64, a.clone(), shamt_const),
-        aarch64_expr: encode_slli(RiscVOperandSize::S64, a, shamt),
-        inputs: vec![("a".to_string(), I64_W)],
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Ushr(I64, a, shamt) -> RISC-V SRLI rd, rs1, shamt`.
-pub fn proof_riscv_srli_i64_shamt(shamt: u32) -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_shift;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let a = SmtExpr::var("a", I64_W);
-    let shamt_const = SmtExpr::bv_const(shamt as u64, I64_W);
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: format!("riscv: Ushr_I64_imm{shamt} -> SRLI"),
-        trust_ir_expr: encode_trust_ir_shift(&Opcode::Ushr, Type::I64, a.clone(), shamt_const),
-        aarch64_expr: encode_srli(RiscVOperandSize::S64, a, shamt),
-        inputs: vec![("a".to_string(), I64_W)],
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Iconst(I64, imm) / Copy / StructGep -> RISC-V ADDI`.
-///
-/// `ADDI rd, rs1, imm` computes `rs1 + imm`. This single dataflow proof covers
-/// the value-bearing roles of the multi-role ADDI (LI when rs1=x0; MV when
-/// imm=0; base+offset GEP). We verify the general `rs1 + imm` form against the
-/// trust_ir `Iadd` spec; the LI/MV/GEP specializations are instances of it.
-pub fn proof_riscv_addi_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_binop;
-    use trust_cg_lower::instructions::Opcode;
-    use trust_cg_lower::types::Type;
-
-    let a = SmtExpr::var("a", I64_W);
-    let imm = SmtExpr::var("imm", I64_W);
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Iadd_I64_imm -> ADDI".to_string(),
-        trust_ir_expr: encode_trust_ir_binop(&Opcode::Iadd, Type::I64, a.clone(), imm.clone()),
-        aarch64_expr: encode_addi_value(a, imm),
-        inputs: vec![("a".to_string(), I64_W), ("imm".to_string(), I64_W)],
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-fn encode_addi_value(rs1: SmtExpr, imm: SmtExpr) -> SmtExpr {
-    crate::riscv_semantics::encode_addi(RiscVOperandSize::S64, rs1, imm)
-}
-
-// ===========================================================================
-// Direct comparison-value lowerings (i64): SLT / SLTU
-//
-// trust_ir `Icmp Slt`/`Icmp Ult` lower to the single matching RISC-V
-// instruction. Both sides independently produce `ite(<pred>, 1, 0)` as a 1-bit
-// result. Honest 1:1 (pins the comparison opcode; SLT vs SLTU confusion would
-// be caught). NOT asserted non-degenerate (single-instruction value op).
-// ===========================================================================
-
-/// Proof: `trust_ir::Icmp(SignedLessThan, I64, a, b) -> RISC-V SLT`.
-pub fn proof_riscv_slt_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_icmp;
-    use trust_cg_lower::instructions::IntCC;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Icmp_SLT_I64 -> SLT".to_string(),
-        trust_ir_expr: encode_trust_ir_icmp(
-            &IntCC::SignedLessThan,
-            Type::I64,
-            a.clone(),
-            b.clone(),
-        ),
-        aarch64_expr: encode_slt(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
-}
-
-/// Proof: `trust_ir::Icmp(UnsignedLessThan, I64, a, b) -> RISC-V SLTU`.
-pub fn proof_riscv_sltu_i64() -> ProofObligation {
-    use crate::trust_ir_semantics::encode_trust_ir_icmp;
-    use trust_cg_lower::instructions::IntCC;
-    use trust_cg_lower::types::Type;
-
-    let (a, b) = ab64();
-    ProofObligation {
-        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
-        name: "riscv: Icmp_ULT_I64 -> SLTU".to_string(),
-        trust_ir_expr: encode_trust_ir_icmp(
-            &IntCC::UnsignedLessThan,
-            Type::I64,
-            a.clone(),
-            b.clone(),
-        ),
-        aarch64_expr: encode_sltu(RiscVOperandSize::S64, a, b),
-        inputs: ab_inputs(),
-        preconditions: vec![],
-        fp_inputs: vec![],
-        category: Some(CAT),
-    }
 }
 
 // ===========================================================================
@@ -600,14 +266,11 @@ pub fn proof_riscv_icmp_ule_i64() -> ProofObligation {
 // Registry
 // ===========================================================================
 
-/// All RISC-V (RV64) lowering proof obligations.
-///
-/// Ordering groups: clean 1:1 ALU, shift-by-immediate + ADDI value, direct
-/// comparison value ops (SLT/SLTU), then the comparison idioms.
+/// All RISC-V (RV64) lowering proof obligations: the comparison idioms.
 pub fn all_riscv_proofs() -> Vec<ProofObligation> {
-    // #62 retraction (group b): the 14 static "riscv: <op> -> <INSN>" 1:1 ALU/
-    // shift/imm/cmp obligations were degenerate X==X (the trust_ir spec and the
-    // machine side built the SAME bv op; no independent encoder). Those opcodes
+    // #62 retraction: static 1:1 "riscv: <op> -> <INSN>" ALU/shift/imm/cmp
+    // obligations would be degenerate X==X (the trust_ir spec and the machine
+    // side build the SAME bv op; no independent encoder). Those opcodes
     // (Add/Sub/Mul/And/Or/Xor/Sll/Srl/Sra/Slli/Srli/Addi/Slt/Sltu) are now
     // EmittableNeedsProof and CREDITED by the audit_riscv OPERAND RECONSTRUCTION
     // branch (riscv_function_verifier::opcode_to_source_op + reconstruction
@@ -672,8 +335,7 @@ mod tests {
         }
     }
 
-    /// Sanity: the clean 1:1 ALU proofs would FAIL if the wrong opcode were
-    /// chosen (e.g. Iadd -> SUB), demonstrating the identity proof is meaningful.
+    /// Sanity: the evaluator refutes a mis-lowered obligation (Iadd -> SUB).
     #[test]
     fn wrong_opcode_choice_is_caught() {
         use crate::trust_ir_semantics::encode_trust_ir_binop;

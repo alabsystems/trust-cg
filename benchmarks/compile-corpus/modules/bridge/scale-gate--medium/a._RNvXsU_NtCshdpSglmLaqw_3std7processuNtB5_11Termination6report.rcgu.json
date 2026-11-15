@@ -1,0 +1,10 @@
+{
+  "schema": "trust-cg.bridge-trust-ir-dump.v1",
+  "cgu": "_RNvXsU_NtCshdpSglmLaqw_3std7processuNtB5_11Termination6report",
+  "kind": "Regular",
+  "target": "Aarch64",
+  "opt_level": "O3",
+  "emit_proofs": true,
+  "panic_unwind": false,
+  "parallel": false
+}

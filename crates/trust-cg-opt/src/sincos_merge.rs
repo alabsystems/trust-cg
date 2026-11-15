@@ -45,17 +45,27 @@
 //!
 //! Kill switches: `TCG_NO_SINCOS_MERGE`, `TRUST_CG_DISABLE_PASSES=sincosmerge`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::regs::{D0, D1};
-use trust_cg_ir::{AArch64Opcode, InstId, MachFunction, MachInst, MachOperand, PReg, VReg};
+use trust_cg_ir::{
+    AArch64Opcode, InstFlags, InstId, MachFunction, MachInst, MachOperand, PReg, VReg,
+};
 
 use crate::pass_manager::MachinePass;
 
 /// The Darwin combined sin/cos entry point, WITHOUT the object emitter's leading
 /// `_` (it prepends one, matching the "sin"/"cos" symbols the importer emits, to
-/// yield the final `___sincos_stret`).
-const SINCOS_STRET_SYMBOL: &str = "__sincos_stret";
+/// yield the final `___sincos_stret`). It is on the shared runtime-symbol list,
+/// so the compiler refuses a module whose own definition would receive it.
+const SINCOS_STRET_SYMBOL: &str = trust_cg_lower::RuntimeSymbol::SincosStret.name();
+
+/// The callee names this pass interprets as libm's `sin` and `cos` (before
+/// the object emitter's leading `_`). It reads them on every non-exact `Bl`,
+/// so a module's own function spelled so would have its calls replaced by
+/// libm's: the compiler refuses a module-local `sin` or `cos` a body
+/// references wherever this pass runs (Apple AArch64 objects).
+pub const SINCOS_MERGE_CALLEES: [&str; 2] = ["sin", "cos"];
 
 pub struct SincosMerge {
     /// True only when the object target is Darwin/Mach-O arm64. Fail-closed:
@@ -100,11 +110,11 @@ struct CallSite {
 }
 
 fn run_pass(func: &mut MachFunction) -> bool {
-    let trace = std::env::var("TCG_SINCOS_TRACE").is_ok();
+    let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
     let mut changed = false;
     for bi in 0..func.block_order.len() {
         let block_id = func.block_order[bi];
-        changed |= merge_in_block(func, block_id, trace);
+        changed |= merge_in_block(func, block_id, &protected);
     }
     changed
 }
@@ -146,12 +156,12 @@ fn collect_sites(func: &MachFunction, block_id: trust_cg_ir::BlockId) -> Vec<Cal
     let mut sites = Vec::new();
     for (idx, &inst_id) in insts.iter().enumerate() {
         let inst = func.inst(inst_id);
-        if inst.opcode != AArch64Opcode::Bl {
+        if inst.opcode != AArch64Opcode::Bl || inst.flags.contains(InstFlags::EXACT_MODULE_CALL) {
             continue;
         }
         let is_sin = match inst.operands.first().and_then(|o| o.as_symbol()) {
-            Some("sin") => true,
-            Some("cos") => false,
+            Some(name) if name == SINCOS_MERGE_CALLEES[0] => true,
+            Some(name) if name == SINCOS_MERGE_CALLEES[1] => false,
             _ => continue,
         };
         // The call must take its single f64 argument in d0 and nothing else in
@@ -222,7 +232,11 @@ fn intervening_call(
     false
 }
 
-fn merge_in_block(func: &mut MachFunction, block_id: trust_cg_ir::BlockId, trace: bool) -> bool {
+fn merge_in_block(
+    func: &mut MachFunction,
+    block_id: trust_cg_ir::BlockId,
+    protected: &crate::eh_call_custody::ProtectedCalls,
+) -> bool {
     let sites = collect_sites(func, block_id);
     if sites.len() < 2 {
         return false;
@@ -230,7 +244,7 @@ fn merge_in_block(func: &mut MachFunction, block_id: trust_cg_ir::BlockId, trace
 
     // Group sites by argument vreg; a mergeable group is EXACTLY one sin + one
     // cos on the same argument. (Any other multiplicity is ambiguous -> skip.)
-    let mut by_arg: HashMap<VReg, Vec<CallSite>> = HashMap::new();
+    let mut by_arg: HashMap<VReg, Vec<CallSite>> = HashMap::default();
     for s in &sites {
         by_arg.entry(s.arg_vreg).or_default().push(*s);
     }
@@ -253,12 +267,16 @@ fn merge_in_block(func: &mut MachFunction, block_id: trust_cg_ir::BlockId, trace
     // Plan all merges against the ORIGINAL instruction order, then apply once so
     // index bookkeeping stays valid across multiple pairs in one block.
     let insts_snapshot = func.block(block_id).insts.clone();
-    let mut removals: HashSet<InstId> = HashSet::new();
+    let mut removals: HashSet<InstId> = HashSet::default();
     let mut retarget: Vec<InstId> = Vec::new();
     // anchor bl_id -> (sin_res, cos_res) to materialize d0/d1 reads after it.
     let mut inserts: Vec<(InstId, VReg, VReg)> = Vec::new();
 
     for (sin_site, cos_site) in pairs {
+        // Neither a retargeted anchor nor a deleted call may own an Invoke.
+        if protected.contains(sin_site.bl_id) || protected.contains(cos_site.bl_id) {
+            continue;
+        }
         // callA is the earlier call (kept, retargeted); callB the later (deleted).
         let (a, b) = if sin_site.bl_index < cos_site.bl_index {
             (sin_site, cos_site)
@@ -289,19 +307,6 @@ fn merge_in_block(func: &mut MachFunction, block_id: trust_cg_ir::BlockId, trace
             continue;
         }
 
-        if trace {
-            eprintln!(
-                "[sincos-merge] {} block {:?}: fuse sin(res={:?}) + cos(res={:?}) on arg {:?}; keep {:?} -> __sincos_stret, drop {:?}",
-                func.name,
-                block_id,
-                sin_site.res_vreg,
-                cos_site.res_vreg,
-                a.arg_vreg,
-                a.bl_id,
-                b.bl_id
-            );
-        }
-
         // callA keeps its arg-setup + Bl; delete callA's own result-read and the
         // whole of callB. Fresh reads give sin<-d0, cos<-d1 from the merged call.
         removals.insert(a.res_copy_id);
@@ -324,7 +329,7 @@ fn merge_in_block(func: &mut MachFunction, block_id: trust_cg_ir::BlockId, trace
 
     // Materialize the d0(sin)/d1(cos) result reads and remember their ids per
     // anchor so we can splice them in immediately after the retargeted call.
-    let mut after: HashMap<InstId, [InstId; 2]> = HashMap::new();
+    let mut after: HashMap<InstId, [InstId; 2]> = HashMap::default();
     for (anchor_bl, sin_res, cos_res) in inserts {
         let sin_copy = mk_result_copy(func, sin_res, D0);
         let cos_copy = mk_result_copy(func, cos_res, D1);
@@ -361,6 +366,7 @@ fn mk_result_copy(func: &mut MachFunction, res: VReg, preg: PReg) -> InstId {
 
 #[cfg(test)]
 mod tests {
+    mod eh_call_custody_tests;
     use super::*;
     use trust_cg_ir::regs::{V0, V1};
     use trust_cg_ir::{BlockId, RegClass, Signature, Type};

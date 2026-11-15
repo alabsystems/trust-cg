@@ -84,8 +84,8 @@ use trust_cg_ir::{
 };
 
 use crate::effects::{
-    aarch64_def_operand_positions, aarch64_use_operand_positions, opcode_effect, reads_flags,
-    writes_flags,
+    aarch64_def_operand_positions, aarch64_use_operand_positions, build_vreg_read_counts,
+    inst_defines_vreg, opcode_effect, reads_flags, writes_flags,
 };
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
@@ -149,7 +149,7 @@ fn run_if_conversion(
     let mut changed = false;
 
     // Collect diamond transforms first to avoid borrow issues.
-    let diamond_xforms = collect_diamond_transforms(func, loop_analysis);
+    let diamond_xforms = collect_diamond_transforms(func, loop_analysis, false);
     for xform in &diamond_xforms {
         apply_diamond_transform(func, xform, provenance.as_deref_mut());
         changed = true;
@@ -203,10 +203,52 @@ enum NewInstProvenance {
     Merged(Vec<InstId>),
 }
 
+/// True when `branch`, and the trailing unconditional branch of the explicit
+/// `B.cond T; B F` form when there is one, are the only instructions in
+/// `header` that transfer control to a block.
+///
+/// Every diamond/triangle recognizer reads its arm blocks off the header's
+/// final conditional branch and then deletes them, which is sound only when
+/// no other instruction in the header can reach an arm. The CFG edge lists
+/// cannot establish that: `cfg_simplify::rebuild_cfg_edges` deduplicates them,
+/// so the compare chain a multi-key `switch` lowers to
+/// (`CMP #1; B.EQ T; CMP #3; B.EQ T; B F`) still shows two successors and
+/// single-predecessor arms. Converting that header on its last compare drops
+/// the earlier keys and leaves their branches aimed at a deleted block.
+///
+/// Trap pseudos carry `IS_BRANCH` but never name a block (they flow control
+/// only by trapping), so they do not disqualify a header.
+pub(crate) fn header_branch_is_sole_block_exit(
+    func: &MachFunction,
+    header: BlockId,
+    branch: InstId,
+    trailing_branch: Option<InstId>,
+) -> bool {
+    func.block(header).insts.iter().all(|&inst_id| {
+        if inst_id == branch || Some(inst_id) == trailing_branch {
+            return true;
+        }
+        let inst = func.inst(inst_id);
+        let transfers_control = (inst.is_branch() || inst.is_terminator() || inst.is_return())
+            && !inst.opcode.is_trap_pseudo();
+        !transfers_control
+            && !inst.operands.iter().any(|operand| {
+                matches!(operand, MachOperand::Block(_)) || operand.as_jump_table_index().is_some()
+            })
+    })
+}
+
 /// Scan for diamond CFG patterns suitable for if-conversion.
+///
+/// `allow_join_edge_copy_bool` is true only at the late post-cmp-cleanup seam.
+/// The primary pass must leave the copy-wrapped form alone: converting it while
+/// the branch still tests an earlier materialized boolean would produce
+/// `CMP; CSET; CMP #0; CSET` and prevent cmp-branch-fusion from recovering the
+/// original comparison flags.
 fn collect_diamond_transforms(
     func: &MachFunction,
     loop_analysis: Option<&LoopAnalysis>,
+    allow_join_edge_copy_bool: bool,
 ) -> Vec<DiamondTransform> {
     let mut transforms = Vec::new();
 
@@ -234,6 +276,10 @@ fn collect_diamond_transforms(
         } else {
             continue;
         };
+        if !header_branch_is_sole_block_exit(func, header_id, bcond_inst_id, header_fallthrough_br)
+        {
+            continue;
+        }
 
         // BCond operands: [Imm(cond_code), Block(target)]
         let bcond = func.inst(bcond_inst_id);
@@ -316,10 +362,15 @@ fn collect_diamond_transforms(
         };
 
         // Blast-radius bound for the explicit two-edge header form (`BCond T; B F`,
-        // which is what real ISel emits). Two admissions are carved out; every
+        // which is what real ISel emits). Three admissions are carved out; every
         // other explicit-header diamond stays branchy (the general MOV-only
         // recognizers keep their prior fallthrough-form-only reach):
         //
+        //   * BOOLEAN MATERIALIZATION — exact `{1, 0}` arms writing the same
+        //     register, either directly or through the one edge-copy emitted
+        //     for a TrustIR join-block argument. CSET computes the same value
+        //     without speculating either arm and removes the edge copies plus
+        //     two unconditional branches.
         //   * DIV-GUARD collapse — a division arm, while `ifconv_div` is enabled.
         //   * LOOP DIAMOND — a loop-resident, non-div diamond whose branch is a
         //     hard-to-predict self-recurrence (its own merged value feeds, across
@@ -330,8 +381,18 @@ fn collect_diamond_transforms(
         //     so it fires here and NOT on well-predicted structural diamonds
         //     (bounds checks, monotone-IV parity), which a CSEL would regress.
         //     Kill switch: `TRUST_CG_DISABLE_PASSES=ifconv_loop`.
+        let bool_cset = try_bool_cset(
+            func,
+            true_block,
+            false_block,
+            &true_body,
+            &false_body,
+            cond,
+            allow_join_edge_copy_bool,
+        );
         let involves_div = diamond_involves_div(func, &true_body, &false_body);
         if header_fallthrough_br.is_some() {
+            let bool_admitted = bool_cset.is_some();
             let div_admitted = involves_div && div_collapse_enabled();
             let loop_admitted = !involves_div
                 && loop_ifconv_enabled()
@@ -343,7 +404,7 @@ fn collect_diamond_transforms(
                     &true_body,
                     &false_body,
                 );
-            if !div_admitted && !loop_admitted {
+            if !bool_admitted && !div_admitted && !loop_admitted {
                 continue;
             }
         }
@@ -392,6 +453,28 @@ fn collect_diamond_transforms(
                 false_br_inst_id: false_last_id,
                 header_fallthrough_br,
                 dead_condition_inst,
+            });
+            continue;
+        }
+
+        // Exact boolean materialization. This is deliberately handled before
+        // the general single-instruction recognizers: CSET can directly encode
+        // the constants 1 and 0, while CSEL cannot take immediate operands.
+        if let Some(mut bool_cset) = bool_cset {
+            apply_source_loc_fallback(&mut bool_cset.inst, source_loc_fallback);
+            transforms.push(DiamondTransform {
+                header: header_id,
+                true_block,
+                false_block,
+                join_block,
+                new_insts: vec![bool_cset.inst],
+                new_inst_provenance: vec![NewInstProvenance::Merged(bool_cset.source_inst_ids)],
+                condition_inst_id,
+                bcond_inst_id,
+                true_br_inst_id: true_last_id,
+                false_br_inst_id: false_last_id,
+                header_fallthrough_br,
+                dead_condition_inst: None,
             });
             continue;
         }
@@ -590,7 +673,7 @@ fn try_csinc(true_inst: &MachInst, false_inst: &MachInst, cond: CondCode) -> Opt
     if is_add_imm1(true_inst) && false_inst.opcode == AArch64Opcode::MovR {
         let false_src = mov_register_source(false_inst)?;
         let true_base = add_register_base(true_inst)?;
-        let inv = cond.invert();
+        let inv = cond.logical_complement()?;
         let mut inst = MachInst::new(
             AArch64Opcode::Csinc,
             vec![
@@ -633,7 +716,7 @@ fn try_csneg(true_inst: &MachInst, false_inst: &MachInst, cond: CondCode) -> Opt
     if true_inst.opcode == AArch64Opcode::Neg && false_inst.opcode == AArch64Opcode::MovR {
         let false_src = mov_register_source(false_inst)?;
         let neg_src = register_operand_at(true_inst, 1)?;
-        let inv = cond.invert();
+        let inv = cond.logical_complement()?;
         let mut inst = MachInst::new(
             AArch64Opcode::Csneg,
             vec![
@@ -675,6 +758,152 @@ fn try_general_csel(
     );
     inst.source_loc = true_inst.source_loc.or(false_inst.source_loc);
     Some(inst)
+}
+
+struct BoolCsetMatch {
+    inst: MachInst,
+    source_inst_ids: Vec<InstId>,
+}
+
+struct BoolArmMaterialization {
+    dst: MachOperand,
+    value: bool,
+    source_inst_ids: Vec<InstId>,
+    deleted_temp: Option<MachOperand>,
+    source_loc: Option<SourceLoc>,
+}
+
+/// Require the ordinary selector-emitted form before deleting an instruction.
+/// Bespoke implicit effects or flag metadata are outside this identity and
+/// therefore make the recognizer fail closed.
+fn canonical_bool_value_inst(inst: &MachInst) -> bool {
+    inst.implicit_defs.is_empty()
+        && inst.implicit_uses.is_empty()
+        && inst.flags == inst.opcode.default_flags()
+}
+
+fn bool_constant_value(inst: &MachInst) -> Option<bool> {
+    if !canonical_bool_value_inst(inst) {
+        return None;
+    }
+    if inst_materializes_one(inst) {
+        Some(true)
+    } else if inst_materializes_zero(inst) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Match one exact constant arm, including the edge-copy shape produced by the
+/// TrustIR block-argument lowering:
+///
+/// ```text
+/// Movz temp, #0|#1
+/// MovR merge, temp
+/// ```
+///
+/// The wrapped form is deliberately VReg-only, same-width, and non-tied.  Its
+/// temporary is deleted rather than speculated, so the caller separately proves
+/// that the temporary has no reads outside the two removed arm blocks.
+fn match_bool_arm(func: &MachFunction, body: &[InstId]) -> Option<BoolArmMaterialization> {
+    match body {
+        [value_id] => {
+            let value_inst = func.inst(*value_id);
+            let dst = value_inst.operands.first()?.clone();
+            if !matches!(dst, MachOperand::VReg(_) | MachOperand::PReg(_)) {
+                return None;
+            }
+            Some(BoolArmMaterialization {
+                dst,
+                value: bool_constant_value(value_inst)?,
+                source_inst_ids: vec![*value_id],
+                deleted_temp: None,
+                source_loc: value_inst.source_loc,
+            })
+        }
+        [value_id, copy_id] => {
+            let value_inst = func.inst(*value_id);
+            let copy = func.inst(*copy_id);
+            let value = bool_constant_value(value_inst)?;
+            if copy.opcode != AArch64Opcode::MovR
+                || copy.operands.len() != 2
+                || !canonical_bool_value_inst(copy)
+            {
+                return None;
+            }
+
+            let temp = value_inst.operands.first()?.as_vreg()?;
+            let copy_src = copy.operands.get(1)?.as_vreg()?;
+            let dst = copy.operands.first()?.as_vreg()?;
+            if copy_src != temp || dst == temp || dst.class != temp.class {
+                return None;
+            }
+
+            Some(BoolArmMaterialization {
+                dst: MachOperand::VReg(dst),
+                value,
+                source_inst_ids: vec![*value_id, *copy_id],
+                deleted_temp: Some(MachOperand::VReg(temp)),
+                source_loc: copy.source_loc.or(value_inst.source_loc),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Form CSET from exact boolean-materialization arms.
+///
+/// This recognizer is also the tightly bounded profitability admission for an
+/// explicit `BCond T; B F` diamond.  Each arm must write the same ordinary
+/// register and materialize exact complementary values 1 and 0, either in one
+/// instruction or through exactly one canonical join-edge copy.  Shifted,
+/// malformed, externally-used-temp, cross-width, or tied forms are rejected.
+fn try_bool_cset(
+    func: &MachFunction,
+    true_block: BlockId,
+    false_block: BlockId,
+    true_body: &[InstId],
+    false_body: &[InstId],
+    cond: CondCode,
+    allow_join_edge_copy: bool,
+) -> Option<BoolCsetMatch> {
+    if !allow_join_edge_copy && (true_body.len() != 1 || false_body.len() != 1) {
+        return None;
+    }
+    let true_arm = match_bool_arm(func, true_body)?;
+    let false_arm = match_bool_arm(func, false_body)?;
+    if true_arm.dst != false_arm.dst || true_arm.value == false_arm.value {
+        return None;
+    }
+
+    let deleted_temps: Vec<_> = [
+        true_arm.deleted_temp.clone(),
+        false_arm.deleted_temp.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if arm_defs_observable(func, &deleted_temps, &[true_block, false_block]) {
+        return None;
+    }
+
+    // CSET itself is an inverted-condition CSINC alias; AL/NV are excluded
+    // even when the requested result does not need an additional inversion.
+    let complement = cond.logical_complement()?;
+    let cset_cond = if true_arm.value { cond } else { complement };
+    let mut inst = MachInst::new(
+        AArch64Opcode::CSet,
+        vec![true_arm.dst, MachOperand::Imm(cset_cond.encoding() as i64)],
+    );
+    inst.source_loc = true_arm.source_loc.or(false_arm.source_loc);
+
+    let mut source_inst_ids = true_arm.source_inst_ids;
+    source_inst_ids.extend(false_arm.source_inst_ids);
+    Some(BoolCsetMatch {
+        inst,
+        source_inst_ids,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -819,13 +1048,16 @@ fn loop_ifconv_enabled() -> bool {
 //   * FALSE-arm fold: `F == t + 1` (wrapping) ⇒ `Csel(dst, T, t+1, cc) ==
 //     Csinc(dst, T, t, cc)` — same `cc`, `t` in the increment slot.
 //   * TRUE-arm fold: `T == t + 1` ⇒ `Csel(dst, t+1, F, cc) == Csinc(dst, F, t,
-//     invert(cc))` (`invert(cc) ? F : t+1` = `cc ? t+1 : F`).
-//   * The `+1` producer must be SINGLE-USE (only this CSEL reads it) so deleting
-//     it strands nothing, and the base `t` must NOT be redefined between the add
-//     and the CSEL (both in the same block) so the value the CSINC recomputes
-//     equals what the deleted add produced. Both are checked before firing;
-//     any unmet precondition BAILS (the CSEL is left intact — always correct).
-// `Csinc` is already emittable and gate-credited (no new opcode / proof).
+//     complement(cc))`. Requires cc in EQ..LE: AL/NV have no complement.
+//   * The `+1` result must be SINGLE-READ — the rewritten CSEL operand is the
+//     only operand in the function that reads it (`Csel d, v, v` reads it twice)
+//     — so deleting the add strands nothing; the add must be the def of that
+//     register reaching the CSEL (the last one before it in the same block);
+//     and the base `t` must NOT be redefined between the add and the CSEL, so
+//     the value the CSINC recomputes equals what the deleted add produced. All
+//     are checked before firing; any unmet precondition BAILS (the CSEL is left
+//     intact — always correct).
+// CSINC is already emittable; these rewrites do not add proof coverage.
 //
 // Kill switch: `TRUST_CG_DISABLE_PASSES=csincfold` (default ON).
 
@@ -927,10 +1159,10 @@ fn run_csinc_fold(func: &mut MachFunction, mut provenance: Option<&mut Provenanc
     true
 }
 
-/// Scan every block for a `Csel` whose selected value is a single-use `t + 1`
+/// Scan every block for a `Csel` whose selected value is a single-read `t + 1`
 /// and build the CSINC rewrite. Recognition reads the UNMUTATED function.
 fn collect_csinc_folds(func: &MachFunction) -> Vec<CsincRewrite> {
-    let use_count = build_vreg_use_counts(func);
+    let read_count = build_vreg_read_counts(func);
     let mut out = Vec::new();
     for &bid in &func.block_order {
         let block_insts = func.block(bid).insts.clone();
@@ -949,7 +1181,7 @@ fn collect_csinc_folds(func: &MachFunction) -> Vec<CsincRewrite> {
 
             // FALSE-arm fold: `Csel dst, T, (t+1), cc` -> `Csinc dst, T, t, cc`.
             if let Some((base, add_id, add_block)) =
-                add_of_one_base(func, &use_count, bid, iid, &fval)
+                add_of_one_base(func, &read_count, bid, iid, &fval)
             {
                 out.push(CsincRewrite {
                     csel_id: iid,
@@ -961,13 +1193,16 @@ fn collect_csinc_folds(func: &MachFunction) -> Vec<CsincRewrite> {
             }
             // TRUE-arm fold: `Csel dst, (t+1), F, cc` -> `Csinc dst, F, t, !cc`.
             if let Some((base, add_id, add_block)) =
-                add_of_one_base(func, &use_count, bid, iid, &tval)
+                add_of_one_base(func, &read_count, bid, iid, &tval)
             {
+                let Some(complement) = cond.logical_complement() else {
+                    continue;
+                };
                 out.push(CsincRewrite {
                     csel_id: iid,
                     add_id,
                     add_block,
-                    csinc: make_csinc(dst, fval, base, cond.invert(), src_loc),
+                    csinc: make_csinc(dst, fval, base, complement, src_loc),
                 });
                 continue;
             }
@@ -992,31 +1227,36 @@ fn make_csinc(
     inst
 }
 
-/// If `operand` is a single-use register defined (in the CSEL's own block, before
-/// the CSEL) by an `ADD base, #1` / `ADD base, one` whose base is not redefined
-/// between the add and the CSEL, return `(base, add_id, add_block)`. Otherwise
-/// `None` (BAIL — leave the CSEL intact).
+/// If `operand` is a single-read register whose definition reaching the CSEL is
+/// (in the CSEL's own block, before the CSEL) an `ADD base, #1` / `ADD base,
+/// one` whose base is not redefined between the add and the CSEL, return
+/// `(base, add_id, add_block)`. Otherwise `None` (BAIL — leave the CSEL intact).
 fn add_of_one_base(
     func: &MachFunction,
-    use_count: &std::collections::HashMap<VReg, usize>,
+    read_count: &crate::fast_hash::FxHashMap<VReg, u32>,
     csel_block: BlockId,
     csel_id: InstId,
     operand: &MachOperand,
 ) -> Option<(MachOperand, InstId, BlockId)> {
     let v = operand.as_vreg()?;
-    // SINGLE-USE: the only reader of the `+1` result is this CSEL, so deleting
-    // the add strands nothing. (`build_vreg_use_counts` counts every read.)
-    if use_count.get(&v).copied().unwrap_or(0) != 1 {
+    // SINGLE-READ: `operand` is the only operand in the function that reads the
+    // `+1` result, so rewriting it and deleting the add strands nothing. The
+    // count is per operand: `Csel d, v, v` reads `v` twice and BAILS, since the
+    // rewrite replaces only one of the two.
+    if read_count.get(&v).copied().unwrap_or(0) != 1 {
         return None;
     }
 
-    // Locate the add in the CSEL's OWN block, strictly before the CSEL. Same
-    // block bounds the "base unchanged between add and CSINC" reasoning to a
-    // local scan; a producer elsewhere BAILS.
+    // Locate the add in the CSEL's OWN block, strictly before the CSEL: the
+    // LAST def of `v` there, which is the one the CSEL reads (an earlier def is
+    // overwritten before the CSEL). Same block bounds the "base unchanged
+    // between add and CSINC" reasoning to a local scan; a producer elsewhere
+    // BAILS.
     let insts = &func.block(csel_block).insts;
     let csel_pos = insts.iter().position(|&id| id == csel_id)?;
     let add_id = *insts[..csel_pos]
         .iter()
+        .rev()
         .find(|&&id| inst_defines_vreg(func.inst(id), v))?;
     let add = func.inst(add_id);
 
@@ -1057,29 +1297,6 @@ fn add_of_one_base(
     }
 
     Some((base, add_id, csel_block))
-}
-
-/// Does `inst` define the vreg `v`?
-fn inst_defines_vreg(inst: &MachInst, v: VReg) -> bool {
-    inst_def_registers(inst)
-        .iter()
-        .any(|d| d.as_vreg() == Some(v))
-}
-
-/// Whole-function count of how many instructions READ each vreg (implicit and
-/// explicit uses). A vreg with count 1 is read by exactly one instruction.
-fn build_vreg_use_counts(func: &MachFunction) -> std::collections::HashMap<VReg, usize> {
-    let mut counts: std::collections::HashMap<VReg, usize> = std::collections::HashMap::new();
-    for &bid in &func.block_order {
-        for &iid in &func.block(bid).insts {
-            for u in inst_use_registers(func.inst(iid)) {
-                if let Some(v) = u.as_vreg() {
-                    *counts.entry(v).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-    counts
 }
 
 /// Does `inst` materialize the integer constant 1 into its destination? Accepts
@@ -1194,9 +1411,10 @@ fn is_profitable_loop_diamond(
 /// merge register is through the loop back-edge (the self-recurrence signal).
 fn build_inloop_def_map(
     func: &MachFunction,
-    body: &std::collections::HashSet<BlockId>,
-) -> std::collections::HashMap<VReg, Vec<InstId>> {
-    let mut map: std::collections::HashMap<VReg, Vec<InstId>> = std::collections::HashMap::new();
+    body: &crate::fast_hash::FxHashSet<BlockId>,
+) -> crate::fast_hash::FxHashMap<VReg, Vec<InstId>> {
+    let mut map: crate::fast_hash::FxHashMap<VReg, Vec<InstId>> =
+        crate::fast_hash::FxHashMap::default();
     for &bid in body {
         for &iid in &func.block(bid).insts {
             for d in inst_def_registers(func.inst(iid)) {
@@ -1215,11 +1433,11 @@ fn build_inloop_def_map(
 /// the walk (loops terminate).
 fn inloop_reaches(
     func: &MachFunction,
-    def_map: &std::collections::HashMap<VReg, Vec<InstId>>,
+    def_map: &crate::fast_hash::FxHashMap<VReg, Vec<InstId>>,
     seeds: &[MachOperand],
     target: VReg,
 ) -> bool {
-    let mut visited: std::collections::HashSet<VReg> = std::collections::HashSet::new();
+    let mut visited: crate::fast_hash::FxHashSet<VReg> = crate::fast_hash::FxHashSet::default();
     let mut work: Vec<VReg> = seeds.iter().filter_map(MachOperand::as_vreg).collect();
     while let Some(v) = work.pop() {
         if v == target {
@@ -1383,7 +1601,7 @@ fn may_read_flags(opcode: AArch64Opcode) -> bool {
 /// Loops terminate via the visited set.
 fn flags_dead_from_block(func: &MachFunction, start: BlockId) -> bool {
     let mut worklist = vec![start];
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = crate::fast_hash::FxHashSet::default();
     while let Some(bid) = worklist.pop() {
         if !visited.insert(bid) {
             continue;
@@ -1565,20 +1783,23 @@ fn try_div_diamond(
     }
 
     // --- CSEL VARIANT ---
-    // For the two-instruction arm the div writes a temp that now becomes live in
-    // the header; guard that the temp is not observed outside the two arms with
-    // its speculated value (sound conservative whole-function use scan).
-    if arm.copy_id.is_some()
-        && hoisted_defs_used_outside_arms(
+    // The speculated div now writes its destination on the else path too. For
+    // the two-instruction arm that is a temp, which must be local to the div
+    // arm ([`arm_defs_observable`]). For the one-instruction arm it is the
+    // merge register, which the CSEL recomputes right after; the CSEL's else
+    // source must then not be the merge register (in any view) the div just
+    // overwrote.
+    if arm.copy_id.is_some() {
+        if arm_defs_observable(
             func,
-            std::slice::from_ref(&arm.div_dst),
-            true_block,
-            false_block,
-        )
-    {
+            &insts_def_registers(func, &[arm.div_id]),
+            &[div_block],
+        ) {
+            return None;
+        }
+    } else if same_register(&else_src, &arm.merge) {
         return None;
     }
-    let _ = div_block; // (kept for symmetry / future per-arm scoping)
 
     let hoisted_div = func.inst(arm.div_id).clone(); // writes arm.div_dst
     let (on_true, on_false) = if div_in_true {
@@ -1648,71 +1869,34 @@ fn try_multi_inst_diamond(
     // The multi-instruction path hoists the non-final body instructions of
     // BOTH arms into the header, where they then execute *unconditionally* and
     // sequentially before the merged CSEL. That is sound only if speculating
-    // both arms cannot corrupt a value the merge depends on. The per-arm
-    // `all_safe_to_speculate` gate is opcode-only (purity / no flags / no
-    // control flow) and never compares one arm's defs against the other arm's
-    // uses or defs — so without this guard a hoisted def from one arm can
-    // overwrite a register the other arm reads (including the final MOV's
-    // source feeding the CSEL), or both arms can write the same intermediate
-    // temp, yielding valid-but-wrong machine code (a live O2/O3 miscompile).
-    //
-    // We refuse (return None, leaving the branchy diamond intact) whenever
-    // unconditional speculation of both arms could corrupt a value. The merged
-    // CSEL destination is the single register both arms are *allowed* to
-    // co-define (it is exactly what the CSEL recomputes); every other shared
-    // def, or any cross-arm def/use overlap, is a clobber. Correctness
-    // dominates: when in doubt, refuse.
+    // both arms cannot corrupt a value the merge or any later code depends on.
+    // The per-arm `all_safe_to_speculate` gate is opcode-only (purity / no
+    // flags / no control flow), so the register effects are checked here; any
+    // doubt refuses (return None, leaving the branchy diamond intact).
     //
     // The merged CSEL destination (`true_last.operands[0]`, validated equal to
     // `false_last.operands[0]` above) is the single register both arms are
-    // allowed to co-define and to be live-out — it is exactly what the CSEL
-    // recomputes. It is excluded from the DEF sets *by construction* below
-    // (`arm_hoisted_def_registers` skips each arm's final MOV), so no special-
-    // casing by value is needed in the checks.
-
-    // DEF sets are built over the HOISTED (non-final) instructions ONLY. The
-    // final MOV of each arm is folded into the CSEL — it is never emitted as a
-    // separate def — so its destination (`csel_dst`) is intentionally absent
-    // from these sets. `csel_dst` is the single register both arms are *allowed*
-    // to co-define and to be live past the diamond (the CSEL recomputes it);
-    // including it here would falsely reject the common `x = cond ? f(...) : x`
-    // idiom whose other-arm final MOV is `MOV dst, dst`.
+    // allowed to co-define and to be live past the diamond: the CSEL recomputes
+    // it. Each arm's final MOV is folded into the CSEL rather than hoisted, so
+    // it is outside both checks below; the common `x = cond ? f(...) : x` idiom,
+    // whose other-arm final MOV is `MOV dst, dst`, stays convertible.
     //
-    // USE sets cover ALL instructions of the arm INCLUDING the final MOV's
-    // source (the value feeding the CSEL): a hoisted def of one arm that
-    // overwrites the other arm's CSEL source is a real clobber that must be
-    // caught.
+    // (1) Every register an arm's hoisted instructions define must be local to
+    //     that arm ([`arm_defs_observable`]): not read by the other arm (whose
+    //     final MOV source is the CSEL's other input), the header, the join or
+    //     any other block, and not live into its own arm (a loop-carried
+    //     register the arm advances would advance on the other path too).
     let true_defs = arm_hoisted_def_registers(func, true_body);
     let false_defs = arm_hoisted_def_registers(func, false_body);
-    let true_uses = arm_use_registers(func, true_body);
-    let false_uses = arm_use_registers(func, false_body);
-
-    // (1) true arm hoisted-defines a register the false arm reads.
-    if registers_overlap(&true_defs, &false_uses) {
+    if arm_defs_observable(func, &true_defs, &[true_block])
+        || arm_defs_observable(func, &false_defs, &[false_block])
+    {
         return None;
     }
-    // (2) false arm hoisted-defines a register the true arm reads.
-    if registers_overlap(&false_defs, &true_uses) {
-        return None;
-    }
-    // (3) both arms hoisted-define the same register. Since `csel_dst` is
-    //     excluded from both DEF sets by construction, any overlap here is a
-    //     co-defined shared temp (corruption), never the legitimate merge dst.
+    // (2) Both arms must not hoist-define the same register, in any view: the
+    //     false arm's hoisted code runs after the true arm's and would
+    //     overwrite it.
     if registers_overlap(&true_defs, &false_defs) {
-        return None;
-    }
-
-    // (4) Live-out guard. The hoisted (non-final) defs now execute on BOTH paths
-    //     unconditionally; if any such temp is read OUTSIDE the two arms (the
-    //     join/merge block or any other block/successor) it becomes observable
-    //     with the speculated value on the path that did not originally compute
-    //     it -> miscompile. We use a sound conservative whole-function use-scan
-    //     (over-approximates the live-out set, so it can only refuse more).
-    let mut hoisted_defs = true_defs;
-    for d in false_defs {
-        push_register(&mut hoisted_defs, d);
-    }
-    if hoisted_defs_used_outside_arms(func, &hoisted_defs, true_block, false_block) {
         return None;
     }
 
@@ -1864,6 +2048,9 @@ fn collect_triangle_transforms(func: &MachFunction) -> Vec<TriangleTransform> {
         // Last instruction must be BCond.
         let last_inst = func.inst(last_inst_id);
         if last_inst.opcode != AArch64Opcode::BCond {
+            continue;
+        }
+        if !header_branch_is_sole_block_exit(func, header_id, last_inst_id, None) {
             continue;
         }
 
@@ -2087,6 +2274,13 @@ fn record_diamond_provenance(
         pass.clone(),
         "diamond arm branch removed after if-conversion",
     );
+    if let Some(fallthrough_br) = xform.header_fallthrough_br {
+        provenance.record_deletion(
+            fallthrough_br,
+            pass.clone(),
+            "explicit false-edge branch removed after if-conversion",
+        );
+    }
     if let Some(dead_cmp) = xform.dead_condition_inst {
         provenance.record_deletion(
             dead_cmp,
@@ -2204,9 +2398,22 @@ fn push_register(set: &mut Vec<MachOperand>, reg: MachOperand) {
     }
 }
 
-/// Returns true if the two register sets share at least one register.
+/// Register identity for the if-conversion speculation guard
+/// ([`arm_defs_observable`]): a VReg is one register whatever view an operand
+/// names it through (a W-view write zero-extends into the X view, and an X-view
+/// read sees a W-view write), so VRegs match by id, class-blind; a PReg or a
+/// Special matches only itself.
+fn same_register(a: &MachOperand, b: &MachOperand) -> bool {
+    match (a, b) {
+        (MachOperand::VReg(x), MachOperand::VReg(y)) => x.id == y.id,
+        _ => operands_equal(a, b),
+    }
+}
+
+/// Returns true if the two register sets share at least one register, in any
+/// view ([`same_register`]).
 fn registers_overlap(a: &[MachOperand], b: &[MachOperand]) -> bool {
-    a.iter().any(|r| contains_register(b, r))
+    a.iter().any(|r| b.iter().any(|s| same_register(r, s)))
 }
 
 /// Collect the explicit register operands of `inst` at the given operand
@@ -2258,11 +2465,16 @@ fn inst_use_registers(inst: &MachInst) -> Vec<MachOperand> {
 /// recomputes it). A single-instruction arm (`body.len() < 2`) contributes no
 /// hoisted defs (its only def is `csel_dst`).
 fn arm_hoisted_def_registers(func: &MachFunction, body: &[InstId]) -> Vec<MachOperand> {
-    let mut defs = Vec::new();
-    if body.len() < 2 {
-        return defs;
+    match body.split_last() {
+        Some((_, hoisted)) => insts_def_registers(func, hoisted),
+        None => Vec::new(),
     }
-    for &id in &body[..body.len() - 1] {
+}
+
+/// Union of the registers the instructions `ids` define.
+fn insts_def_registers(func: &MachFunction, ids: &[InstId]) -> Vec<MachOperand> {
+    let mut defs = Vec::new();
+    for &id in ids {
         for reg in inst_def_registers(func.inst(id)) {
             push_register(&mut defs, reg);
         }
@@ -2270,58 +2482,63 @@ fn arm_hoisted_def_registers(func: &MachFunction, body: &[InstId]) -> Vec<MachOp
     defs
 }
 
-/// Union of all registers read across every instruction of an arm (the hoisted
-/// body insts plus the final MovR, whose use is the CSEL source).
-fn arm_use_registers(func: &MachFunction, body: &[InstId]) -> Vec<MachOperand> {
-    let mut uses = Vec::new();
-    for &id in body {
-        for reg in inst_use_registers(func.inst(id)) {
-            push_register(&mut uses, reg);
-        }
-    }
-    uses
-}
-
-/// Sound live-out guard for hoisted (speculated) temps.
+/// Sound guard shared by every if-conversion that moves or deletes register
+/// writes of a diamond's arms. Returns true (REFUSE) unless every read of a
+/// register in `defs`, anywhere in the function, is an instruction of one of
+/// the `local` blocks that follows, in that same block, a def of the exact
+/// register operand it reads.
 ///
-/// After if-conversion the hoisted (non-final) instructions of BOTH arms execute
-/// *unconditionally* in the header. A register they define therefore holds the
-/// speculated value on EVERY path leaving the diamond — including the path that
-/// originally did not take that arm. If any such register is read OUTSIDE the
-/// two arms (in the join/merge block, or any other block / successor reachable
-/// in the function), the read would observe the speculated value instead of the
-/// value it had on the not-taken path, which is a miscompile.
+/// Callers that SPECULATE an arm's non-final instructions into the diamond
+/// header (the multi-instruction diamond, the two-instruction div-guard CSEL
+/// and tiny-loop-diamond) pass that arm's hoisted defs with that arm alone as
+/// `local`. A hoisted def of `r` then runs on every path that originally
+/// skipped the arm: the other arm, the join and everything after it and, in a
+/// loop, every later trip, including later entries of the arm itself. That is
+/// unobservable only when every read of `r` sees a value the arm wrote earlier
+/// in the same execution, so the guard refuses
+///   * a read in any other block: the other arm (including its final MOV,
+///     whose source the merged CSEL reads after the hoisted code), the header,
+///     the join, a successor, or any other block of an enclosing loop;
+///   * a read in the arm that no earlier instruction of the arm defines
+///     (upward-exposed): it observes the value live into the arm, carried from
+///     the header or around a loop back-edge, as in `EorRR t, p, k; MovR p, t`
+///     advancing a loop-carried `p`, or the identity source an arm writes back.
 ///
-/// This pass has no precomputed liveness available, so we use a sound,
-/// conservative whole-function use-scan: we examine every instruction in every
-/// block EXCEPT the two arm bodies (`true_block`, `false_block`) and refuse if
-/// any of them reads a hoisted def register. Pre-regalloc VRegs are uniquely
-/// identified, so this over-approximates the live-out set (it may also flag
-/// reads that are actually dead/dominated) and can therefore only ever cause us
-/// to REFUSE more transforms — never to permit an unsafe one. Refusal leaves the
-/// branchy diamond intact, which is always correct.
+/// The boolean CSET path DELETES its arm temps instead and passes both arms as
+/// `local`: such a temp no longer holds the arm's value after the diamond, so a
+/// read outside the arms would observe a stale value, while reads inside the
+/// arms disappear with them. [`match_bool_arm`] admits only a copy that reads
+/// its own temp right after defining it, so the in-arm rule refuses none of
+/// the arms it admits.
 ///
-/// `csel_dst` (the merged CSEL destination, folded from each arm's final MOV) is
-/// intentionally NOT part of `hoisted_defs`; it is allowed to be live-out
-/// because the emitted CSEL recomputes it. Callers must build `hoisted_defs` via
-/// [`arm_hoisted_def_registers`], which already excludes it.
-fn hoisted_defs_used_outside_arms(
-    func: &MachFunction,
-    hoisted_defs: &[MachOperand],
-    true_block: BlockId,
-    false_block: BlockId,
-) -> bool {
-    if hoisted_defs.is_empty() {
+/// A read is matched against `defs` with [`same_register`] (a narrower or
+/// wider view of a def is a read of it), but only an earlier same-block def of
+/// the exact operand it reads covers it; both choices can only refuse more.
+/// The merged register written by an arm's final MOV is not in `defs` (the
+/// CSEL recomputes it). The scan has no liveness and is position-insensitive
+/// outside `local`, so it over-approximates the observing reads and can only
+/// refuse more transforms, never permit an unsafe one; refusal leaves the
+/// branchy diamond, which is always correct.
+fn arm_defs_observable(func: &MachFunction, defs: &[MachOperand], local: &[BlockId]) -> bool {
+    if defs.is_empty() {
         return false;
     }
     for &bid in &func.block_order {
-        if bid == true_block || bid == false_block {
-            continue;
-        }
+        let in_local = local.contains(&bid);
+        // Registers an earlier instruction of this local block writes.
+        let mut written: Vec<MachOperand> = Vec::new();
         for &iid in &func.block(bid).insts {
-            let reads = inst_use_registers(func.inst(iid));
-            if registers_overlap(&reads, hoisted_defs) {
+            let inst = func.inst(iid);
+            let observes = inst_use_registers(inst).iter().any(|reg| {
+                defs.iter().any(|d| same_register(d, reg)) && !contains_register(&written, reg)
+            });
+            if observes {
                 return true;
+            }
+            if in_local {
+                for reg in inst_def_registers(inst) {
+                    push_register(&mut written, reg);
+                }
             }
         }
     }
@@ -2375,6 +2592,57 @@ fn decode_cond(encoding: u8) -> Option<CondCode> {
 }
 
 // ---------------------------------------------------------------------------
+// Late boolean-diamond if-conversion
+// ---------------------------------------------------------------------------
+//
+// The primary if-conversion pass runs before cmp-branch-fusion, DCE, and CFG
+// simplification. A source-level booleanization such as `if x < y { 1 } else
+// { 0 }` is still represented there as a materialized comparison feeding a
+// second comparison/branch, so its final constant-arm diamond is not yet in the
+// exact form recognized by [`try_bool_cset`]. The later cleanup passes expose
+// that form. This second, deliberately narrow pass runs at that seam and accepts
+// only transforms whose sole replacement instruction is CSET; all other
+// transformations collected by the general recognizer are discarded.
+
+/// Late exact `{1, 0}` / `{0, 1}` diamond-to-CSET conversion.
+pub struct LateBooleanDiamondConvert;
+
+impl MachinePass for LateBooleanDiamondConvert {
+    fn name(&self) -> &str {
+        "late-boolean-diamond"
+    }
+
+    fn run(&mut self, func: &mut MachFunction) -> bool {
+        run_late_boolean_diamond(func, None)
+    }
+
+    fn run_with_provenance(
+        &mut self,
+        func: &mut MachFunction,
+        provenance: &mut ProvenanceMap,
+    ) -> bool {
+        run_late_boolean_diamond(func, Some(provenance))
+    }
+}
+
+fn run_late_boolean_diamond(
+    func: &mut MachFunction,
+    mut provenance: Option<&mut ProvenanceMap>,
+) -> bool {
+    let transforms: Vec<_> = collect_diamond_transforms(func, None, true)
+        .into_iter()
+        .filter(|xform| {
+            matches!(xform.new_insts.as_slice(), [inst] if inst.opcode == AArch64Opcode::CSet)
+        })
+        .collect();
+    let changed = !transforms.is_empty();
+    for xform in &transforms {
+        apply_diamond_transform(func, xform, provenance.as_deref_mut());
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------
 // Late tiny-loop-diamond if-conversion (unpredictable non-affine-recurrence gate)
 // ---------------------------------------------------------------------------
 //
@@ -2400,10 +2668,13 @@ fn decode_cond(encoding: u8) -> Option<CondCode> {
 //
 // SOUNDNESS: identical to the primary diamond conversion — both arms are hoisted
 // and a CSEL recomputes the merge. The hoisted compute is `is_safe_to_speculate`
-// (pure, flag-neutral, non-trapping, non-memory, non-control) and its temps are
-// proven not live outside the arms. The CSEL is value-exact for the select. This
-// pass NEVER speculates a trapping/memory/div/call op (the arm-shape check
-// rejects anything but a single pure compute + register moves). No new opcode.
+// (pure, flag-neutral, non-trapping, non-memory, non-control) and every register
+// it defines is proven local to the compute arm ([`arm_defs_observable`]): no
+// read but the compute arm's own later instructions can observe it, so not the
+// identity arm's source, not a later trip of the loop and not any block outside
+// the arms. The CSEL is value-exact for the select. This pass NEVER speculates a
+// trapping/memory/div/call op (the arm-shape check rejects anything but a single
+// pure compute + register moves). No new opcode.
 //
 // Kill switch: `TRUST_CG_DISABLE_PASSES=tinyloop` (default ON).
 
@@ -2492,21 +2763,24 @@ fn run_tiny_loop_diamond(
 }
 
 /// The pure-compute arm of a tiny-loop diamond: its hoistable non-final
-/// instructions (an optional leading rename `MovR` plus one pure compute op) and
-/// the register the arm's value ultimately comes from (the final `MovR` source).
+/// instructions (one pure compute op plus at most one `MovR`, before or after
+/// it) and the register the arm's value ultimately comes from (the final `MovR`
+/// source).
 struct TinyComputeArm {
-    /// Non-final instructions to hoist into the header (rename?, compute).
+    /// Non-final instructions to hoist into the header, in arm order.
     hoist: Vec<InstId>,
     /// The register the arm's merged value is read from (final `MovR` src).
     value: MachOperand,
-    /// Registers the hoisted instructions define (for the live-out guard).
-    hoisted_defs: Vec<MachOperand>,
 }
 
-/// Recognize a tiny pure-compute arm body `[MovR tmp,src]? PURE_COMPUTE
-/// [MovR merge,result]` writing `merge`. Returns the hoist list + value source,
-/// or `None`. The compute op must be `is_safe_to_speculate` (pure/flag-neutral/
-/// non-trapping/non-memory/non-control) so hoisting it past the branch is sound.
+/// Recognize a tiny pure-compute arm body: one `is_safe_to_speculate` compute op
+/// and at most one `MovR` in either order, then `MovR merge, result`. Returns the
+/// hoist list + value source, or `None`. The opcode gate (pure/flag-neutral/
+/// non-trapping/non-memory/non-control) makes executing the hoisted
+/// instructions on the other path harmless in itself; whether a register they
+/// write may hold the speculated value there is the caller's
+/// [`arm_defs_observable`] check (a trailing `MovR acc, t` writes back a
+/// loop-carried register).
 fn parse_tiny_compute_arm(
     func: &MachFunction,
     body: &[InstId],
@@ -2521,20 +2795,21 @@ fn parse_tiny_compute_arm(
         return None;
     }
     let value = register_operand_at(last, 1)?;
-    // `front` (the hoisted body) must be 1 or 2 insts: [compute] or [rename, compute].
+    // `front` (the hoisted body) must be 1 or 2 insts: [compute] or a compute
+    // and one `MovR` in either order.
     if front.is_empty() || front.len() > 2 {
         return None;
     }
     // Every hoisted inst must be safe to speculate (pure, flag-neutral, no
-    // trap/memory/control). A leading rename `MovR` qualifies; the compute op
-    // (e.g. RorRI) qualifies. This is what forbids speculating a load/div/etc.
+    // trap/memory/control). A `MovR` qualifies; the compute op (e.g. RorRI)
+    // qualifies. This is what forbids speculating a load/div/etc.
     for &id in front {
         if !is_safe_to_speculate(func.inst(id).opcode) {
             return None;
         }
     }
-    // Exactly ONE of the hoisted insts is a non-move compute op; any leading move
-    // is a pure rename. (Two compute ops would exceed the "≤1 compute op" gate.)
+    // Exactly ONE of the hoisted insts is a non-move compute op. (Two compute
+    // ops would exceed the "≤1 compute op" gate.)
     let compute_count = front
         .iter()
         .filter(|&&id| func.inst(id).opcode != AArch64Opcode::MovR)
@@ -2542,16 +2817,9 @@ fn parse_tiny_compute_arm(
     if compute_count != 1 {
         return None;
     }
-    let mut hoisted_defs = Vec::new();
-    for &id in front {
-        for d in inst_def_registers(func.inst(id)) {
-            push_register(&mut hoisted_defs, d);
-        }
-    }
     Some(TinyComputeArm {
         hoist: front.to_vec(),
         value,
-        hoisted_defs,
     })
 }
 
@@ -2580,11 +2848,11 @@ fn parse_identity_arm(
 /// affine IV (Add/Sub-only cycle) never satisfies (b), so it is excluded.
 fn cond_reaches_nonaffine_recurrence(
     func: &MachFunction,
-    def_map: &std::collections::HashMap<VReg, Vec<InstId>>,
+    def_map: &crate::fast_hash::FxHashMap<VReg, Vec<InstId>>,
     cond_source_regs: &[MachOperand],
 ) -> bool {
     // Backward-reachable register set from the condition sources.
-    let mut reachable: std::collections::HashSet<VReg> = std::collections::HashSet::new();
+    let mut reachable: crate::fast_hash::FxHashSet<VReg> = crate::fast_hash::FxHashSet::default();
     let mut work: Vec<VReg> = cond_source_regs
         .iter()
         .filter_map(MachOperand::as_vreg)
@@ -2621,10 +2889,10 @@ fn cond_reaches_nonaffine_recurrence(
 /// on a def cycle)? A visited set bounds the walk.
 fn vreg_reaches_self(
     func: &MachFunction,
-    def_map: &std::collections::HashMap<VReg, Vec<InstId>>,
+    def_map: &crate::fast_hash::FxHashMap<VReg, Vec<InstId>>,
     target: VReg,
 ) -> bool {
-    let mut visited: std::collections::HashSet<VReg> = std::collections::HashSet::new();
+    let mut visited: crate::fast_hash::FxHashSet<VReg> = crate::fast_hash::FxHashSet::default();
     let mut work: Vec<VReg> = Vec::new();
     if let Some(defs) = def_map.get(&target) {
         for &d in defs {
@@ -2685,6 +2953,10 @@ fn collect_tiny_loop_diamonds(
             continue;
         };
 
+        if !header_branch_is_sole_block_exit(func, header_id, bcond_inst_id, header_fallthrough_br)
+        {
+            continue;
+        }
         let bcond = func.inst(bcond_inst_id);
         if bcond.operands.len() < 2 || header.succs.len() != 2 {
             continue;
@@ -2781,9 +3053,20 @@ fn collect_tiny_loop_diamonds(
             continue;
         }
 
-        // Live-out guard: hoisted temps must not be observed outside the arms.
-        if hoisted_defs_used_outside_arms(func, &compute_arm.hoisted_defs, true_block, false_block)
-        {
+        // The hoisted instructions now run on the identity path and ahead of
+        // later trips too: no read but the compute arm's own later
+        // instructions may see a register they define (not the identity arm's
+        // source, not a later trip, not any block outside the arms).
+        let compute_block = if compute_in_true {
+            true_block
+        } else {
+            false_block
+        };
+        if arm_defs_observable(
+            func,
+            &insts_def_registers(func, &compute_arm.hoist),
+            &[compute_block],
+        ) {
             continue;
         }
 
@@ -2978,6 +3261,23 @@ mod tests {
         func
     }
 
+    /// Add the explicit false edge emitted by real ISel: `BCond T; B F`.
+    fn make_explicit_diamond(
+        cmp: MachInst,
+        cond: CondCode,
+        true_insts: Vec<MachInst>,
+        false_insts: Vec<MachInst>,
+    ) -> MachFunction {
+        let mut func = make_diamond(cmp, cond, true_insts, false_insts);
+        let false_block = BlockId(2);
+        let false_edge = func.push_inst(MachInst::new(
+            AArch64Opcode::B,
+            vec![MachOperand::Block(false_block)],
+        ));
+        func.append_inst(func.entry, false_edge);
+        func
+    }
+
     /// Build a triangle CFG:
     /// bb0: CMP + BCond -> bb1, fallthrough -> bb2
     /// bb1 (then): then_inst + B bb2
@@ -3018,6 +3318,451 @@ mod tests {
         func.add_edge(bb1, bb2);
 
         func
+    }
+
+    // ---- Explicit boolean materialization ----
+
+    #[test]
+    fn test_al_nv_boolean_diamond_refuses_cset_transaction() {
+        // CSET is a CSINC-with-ZR alias requiring a representable complement,
+        // even when the one-valued arm is the original branch's true arm.
+        for cc in [CondCode::AL, CondCode::NV] {
+            for true_value in [0, 1] {
+                let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+                let t = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(true_value)]);
+                let f = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(1 - true_value)]);
+                let mut func = make_explicit_diamond(cmp, cc, vec![t], vec![f]);
+                let before = format!("{func:?}");
+                let mut provenance = ProvenanceMap::new();
+                assert!(
+                    !IfConversion.run_with_provenance(&mut func, &mut provenance),
+                    "{cc:?}/{true_value}"
+                );
+                assert_eq!(format!("{func:?}"), before);
+                assert_eq!(
+                    format!("{provenance:?}"),
+                    format!("{:?}", ProvenanceMap::new())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_explicit_boolean_diamond_forms_cset() {
+        let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let one = MachInst::new(AArch64Opcode::Movz, vec![vreg(2), imm(1), imm(0)]);
+        let zero = MachInst::new(AArch64Opcode::Movz, vec![vreg(2), imm(0), imm(0)]);
+        let mut func = make_explicit_diamond(cmp, CondCode::EQ, vec![one], vec![zero]);
+
+        let mut pass = IfConversion;
+        assert!(pass.run(&mut func));
+
+        let header = func.block(BlockId(0));
+        assert_eq!(header.insts.len(), 3, "CMP, CSET, and B join remain");
+        let cset = func.inst(header.insts[1]);
+        assert_eq!(cset.opcode, AArch64Opcode::CSet);
+        assert_eq!(
+            cset.operands,
+            vec![vreg(2), imm(CondCode::EQ.encoding() as i64)]
+        );
+        assert_eq!(func.inst(header.insts[2]).opcode, AArch64Opcode::B);
+        assert!(!func.block_order.contains(&BlockId(1)));
+        assert!(!func.block_order.contains(&BlockId(2)));
+    }
+
+    #[test]
+    fn test_explicit_inverted_boolean_diamond_forms_inverted_cset() {
+        let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let zero = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(0)]);
+        let one = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(1)]);
+        let mut func = make_explicit_diamond(cmp, CondCode::EQ, vec![zero], vec![one]);
+
+        let mut pass = IfConversion;
+        assert!(pass.run(&mut func));
+        let header = func.block(BlockId(0));
+        let cset = func.inst(header.insts[1]);
+        assert_eq!(cset.opcode, AArch64Opcode::CSet);
+        assert_eq!(cset.operands[1], imm(CondCode::NE.encoding() as i64));
+    }
+
+    #[test]
+    fn test_late_boolean_pass_converts_only_cset_class() {
+        let cmp = || MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let mut boolean = make_explicit_diamond(
+            cmp(),
+            CondCode::LO,
+            vec![MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(1)])],
+            vec![MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(0)])],
+        );
+        let mut late = LateBooleanDiamondConvert;
+        assert!(late.run(&mut boolean));
+        let header = boolean.block(BlockId(0));
+        assert_eq!(boolean.inst(header.insts[1]).opcode, AArch64Opcode::CSet);
+
+        // This implicit register-valued diamond is otherwise a valid general
+        // if-conversion candidate, but the late pass must not widen to CSEL.
+        let mut register_value = make_diamond(
+            cmp(),
+            CondCode::EQ,
+            vec![MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(3)])],
+            vec![MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(4)])],
+        );
+        assert!(!late.run(&mut register_value));
+        assert_eq!(register_value.block_order.len(), 4);
+    }
+
+    fn copy_wrapped_bool_arm(temp: u32, merge: u32, value: i64) -> Vec<MachInst> {
+        vec![
+            MachInst::new(AArch64Opcode::Movz, vec![vreg(temp), imm(value)]),
+            MachInst::new(AArch64Opcode::MovR, vec![vreg(merge), vreg(temp)]),
+        ]
+    }
+
+    #[test]
+    fn test_late_boolean_pass_folds_trust_ir_join_edge_copies_to_cset() {
+        let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let mut func = make_explicit_diamond(
+            cmp,
+            CondCode::LO,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+
+        let mut late = LateBooleanDiamondConvert;
+        assert!(late.run(&mut func));
+
+        let header = func.block(BlockId(0));
+        assert_eq!(header.insts.len(), 3, "CMP, CSET, B join");
+        let cset = func.inst(header.insts[1]);
+        assert_eq!(cset.opcode, AArch64Opcode::CSet);
+        assert_eq!(
+            cset.operands,
+            vec![vreg(2), imm(CondCode::LO.encoding() as i64)]
+        );
+        assert_eq!(func.inst(header.insts[2]).opcode, AArch64Opcode::B);
+        assert!(!func.block_order.contains(&BlockId(1)));
+        assert!(!func.block_order.contains(&BlockId(2)));
+    }
+
+    #[test]
+    fn test_late_boolean_copy_wrapped_form_fails_closed() {
+        let cmp = || MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+
+        // The edge copy must consume the constant defined immediately before
+        // it; an unrelated source is not a boolean materialization proof.
+        let mut wrong_source = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        let true_copy = wrong_source.block(BlockId(1)).insts[1];
+        wrong_source.inst_mut(true_copy).operands[1] = vreg(9);
+        let mut late = LateBooleanDiamondConvert;
+        assert!(!late.run(&mut wrong_source));
+
+        // A tied edge copy would redefine the constant temporary instead of
+        // transferring it into an independent join value.
+        let mut tied_copy = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        let true_value = tied_copy.block(BlockId(1)).insts[0];
+        let true_copy = tied_copy.block(BlockId(1)).insts[1];
+        tied_copy.inst_mut(true_value).operands[0] = vreg(2);
+        tied_copy.inst_mut(true_copy).operands[1] = vreg(2);
+        assert!(!late.run(&mut tied_copy));
+
+        // The CSET destination must have the same register width as the
+        // deleted constant temporary; implicit narrowing is not admitted.
+        let mut cross_width = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        let narrow_temp = MachOperand::VReg(VReg::new(3, RegClass::Gpr32));
+        let true_value = cross_width.block(BlockId(1)).insts[0];
+        let true_copy = cross_width.block(BlockId(1)).insts[1];
+        cross_width.inst_mut(true_value).operands[0] = narrow_temp.clone();
+        cross_width.inst_mut(true_copy).operands[1] = narrow_temp;
+        assert!(!late.run(&mut cross_width));
+
+        // Deleting an arm-local materialization is permitted only when its
+        // temporary is not observed outside the removed arm blocks.
+        let mut live_temp = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        let external_read =
+            live_temp.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vreg(8), vreg(3)]));
+        live_temp
+            .block_mut(BlockId(3))
+            .insts
+            .insert(0, external_read);
+        assert!(!late.run(&mut live_temp));
+
+        // Bespoke implicit effects are not the selector shape proved by the
+        // combine, even when the explicit operands look canonical.
+        let mut implicit_effect = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        let true_value = implicit_effect.block(BlockId(1)).insts[0];
+        implicit_effect.inst_mut(true_value).implicit_uses = &[trust_cg_ir::aarch64_regs::X0];
+        assert!(!late.run(&mut implicit_effect));
+    }
+
+    #[test]
+    fn test_late_boolean_copy_wrapped_provenance_merges_all_removed_values() {
+        let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+        let mut func = make_explicit_diamond(
+            cmp,
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        let cmp_id = func.block(BlockId(0)).insts[0];
+        let bcond_id = func.block(BlockId(0)).insts[1];
+        let false_edge_id = func.block(BlockId(0)).insts[2];
+        let true_value_ids = func.block(BlockId(1)).insts[..2].to_vec();
+        let false_value_ids = func.block(BlockId(2)).insts[..2].to_vec();
+        let true_br_id = *func.block(BlockId(1)).insts.last().unwrap();
+        let false_br_id = *func.block(BlockId(2)).insts.last().unwrap();
+
+        let mut provenance = ProvenanceMap::new();
+        let source_ids = [
+            cmp_id,
+            bcond_id,
+            false_edge_id,
+            true_value_ids[0],
+            true_value_ids[1],
+            false_value_ids[0],
+            false_value_ids[1],
+            true_br_id,
+            false_br_id,
+        ];
+        for (origin, &inst_id) in source_ids.iter().enumerate() {
+            provenance.record_lowering(
+                TrustIrInstId(200 + origin as u32),
+                &[inst_id],
+                PassId::new("isel"),
+            );
+        }
+
+        let mut late = LateBooleanDiamondConvert;
+        assert!(late.run_with_provenance(&mut func, &mut provenance));
+        let cset_id = func.block(BlockId(0)).insts[1];
+        let cset_entry = provenance
+            .get_entry(cset_id)
+            .expect("CSET must carry condition and all removed value origins");
+        for origin in [200, 201, 203, 204, 205, 206] {
+            assert!(cset_entry.trust_ir_origins.contains(&TrustIrInstId(origin)));
+        }
+        let merge = cset_entry.transforms.last().expect("CSET merge transform");
+        assert_eq!(merge.pass, PassId::new("if-convert"));
+        assert_eq!(
+            merge.kind,
+            TransformKind::Merged {
+                sources: vec![
+                    true_value_ids[0],
+                    true_value_ids[1],
+                    false_value_ids[0],
+                    false_value_ids[1],
+                    cset_id,
+                    bcond_id,
+                ]
+            }
+        );
+        for old in true_value_ids.iter().chain(&false_value_ids) {
+            assert!(provenance.get_entry(*old).is_none());
+        }
+        assert_optimized_away_by_if_convert(&provenance, false_edge_id);
+        assert_optimized_away_by_if_convert(&provenance, true_br_id);
+        assert_optimized_away_by_if_convert(&provenance, false_br_id);
+    }
+
+    /// Put `extra` at the front of `block`, ahead of its existing code. The
+    /// CFG edge lists are left alone: they are already the deduplicated form
+    /// `cfg_simplify::rebuild_cfg_edges` produces for a block that branches
+    /// to the same successor twice.
+    fn prepend_insts(func: &mut MachFunction, block: BlockId, extra: Vec<MachInst>) {
+        let ids: Vec<InstId> = extra.into_iter().map(|inst| func.push_inst(inst)).collect();
+        func.block_mut(block).insts.splice(0..0, ids);
+    }
+
+    fn cmp_imm(reg: u32, value: i64) -> MachInst {
+        MachInst::new(AArch64Opcode::CmpRI, vec![vreg(reg), imm(value)])
+    }
+
+    fn bcond_to(cond: CondCode, target: BlockId) -> MachInst {
+        MachInst::new(
+            AArch64Opcode::BCond,
+            vec![imm(cond.encoding() as i64), MachOperand::Block(target)],
+        )
+    }
+
+    /// The compare chain a two-key TrustIR `switch` lowers to when both keys
+    /// share the constant-`true` arm and the join takes a block parameter:
+    ///
+    /// ```text
+    ///   bb0: CMP v0, #1; B.EQ bb1; CMP v0, #3; B.EQ bb1; B bb2
+    ///   bb1: MOVZ v3, #1; MOV v2, v3; B bb3
+    ///   bb2: MOVZ v4, #0; MOV v2, v4; B bb3
+    ///   bb3: RET
+    /// ```
+    ///
+    /// The edge lists are deduplicated (bb0 -> {bb1, bb2}), exactly as
+    /// cfg-simplify leaves them before the late boolean-diamond pass.
+    fn make_two_key_switch_bool_diamond() -> MachFunction {
+        let mut func = make_explicit_diamond(
+            cmp_imm(0, 3),
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        prepend_insts(
+            &mut func,
+            BlockId(0),
+            vec![cmp_imm(0, 1), bcond_to(CondCode::EQ, BlockId(1))],
+        );
+        func
+    }
+
+    /// A header whose final `B.cond` is not its only branch into the arms is
+    /// not a diamond. Converting on the last compare alone would drop the
+    /// earlier switch key (`x == 1` would read `false`) and leave the earlier
+    /// `B.EQ bb1` aimed at a deleted arm, which the pipeline's structural
+    /// validator then refuses as "successor target absent from block_order"
+    /// (the O2/O3 refusal of every two-key switch sharing a boolean arm).
+    #[test]
+    fn test_late_boolean_refuses_header_with_an_earlier_branch_into_an_arm() {
+        let mut func = make_two_key_switch_bool_diamond();
+        assert_eq!(
+            func.block(BlockId(0)).succs,
+            vec![BlockId(1), BlockId(2)],
+            "the deduplicated edge list still reports exactly two successors"
+        );
+        assert_eq!(func.block(BlockId(1)).preds, vec![BlockId(0)]);
+        let before = format!("{func:?}");
+        assert!(!LateBooleanDiamondConvert.run(&mut func));
+        assert_eq!(format!("{func:?}"), before);
+
+        // The earlier branch may name the false arm instead.
+        let mut into_false_arm = make_two_key_switch_bool_diamond();
+        let early_branch = into_false_arm.block(BlockId(0)).insts[1];
+        into_false_arm.inst_mut(early_branch).operands[1] = MachOperand::Block(BlockId(2));
+        assert!(!LateBooleanDiamondConvert.run(&mut into_false_arm));
+
+        // A compare-and-branch counts the same as a `B.cond`.
+        let mut cbz_into_arm = make_two_key_switch_bool_diamond();
+        let early_cmp = cbz_into_arm.block(BlockId(0)).insts[0];
+        let early_branch = cbz_into_arm.block(BlockId(0)).insts[1];
+        *cbz_into_arm.inst_mut(early_branch) = MachInst::new(
+            AArch64Opcode::Cbz,
+            vec![vreg(0), MachOperand::Block(BlockId(1))],
+        );
+        cbz_into_arm
+            .block_mut(BlockId(0))
+            .insts
+            .retain(|&id| id != early_cmp);
+        assert!(!LateBooleanDiamondConvert.run(&mut cbz_into_arm));
+
+        // The primary pass shares the recognizer; direct `{1, 0}` arms (no
+        // join edge copy) are admitted there and must be refused the same way.
+        let mut direct_arms = make_explicit_diamond(
+            cmp_imm(0, 3),
+            CondCode::EQ,
+            vec![MachInst::new(
+                AArch64Opcode::Movz,
+                vec![vreg(2), imm(1), imm(0)],
+            )],
+            vec![MachInst::new(
+                AArch64Opcode::Movz,
+                vec![vreg(2), imm(0), imm(0)],
+            )],
+        );
+        prepend_insts(
+            &mut direct_arms,
+            BlockId(0),
+            vec![cmp_imm(0, 1), bcond_to(CondCode::EQ, BlockId(1))],
+        );
+        let before = format!("{direct_arms:?}");
+        assert!(!IfConversion.run(&mut direct_arms));
+        assert_eq!(format!("{direct_arms:?}"), before);
+
+        // Control: the same arms behind a single-branch header still fold.
+        let mut single_key = make_explicit_diamond(
+            cmp_imm(0, 3),
+            CondCode::EQ,
+            copy_wrapped_bool_arm(3, 2, 1),
+            copy_wrapped_bool_arm(4, 2, 0),
+        );
+        assert!(LateBooleanDiamondConvert.run(&mut single_key));
+        assert!(!single_key.block_order.contains(&BlockId(1)));
+    }
+
+    /// The triangle recognizer reads its `then` block off the header's final
+    /// `B.cond` and deletes it; an earlier branch to that block keeps it live.
+    #[test]
+    fn test_triangle_refuses_header_with_an_earlier_branch_into_then_block() {
+        let then_mov = || MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(3)]);
+        let mut func = make_triangle(cmp_imm(0, 3), CondCode::EQ, then_mov());
+        prepend_insts(
+            &mut func,
+            BlockId(0),
+            vec![cmp_imm(0, 1), bcond_to(CondCode::EQ, BlockId(1))],
+        );
+        let before = format!("{func:?}");
+        assert!(!IfConversion.run(&mut func));
+        assert_eq!(format!("{func:?}"), before);
+
+        // Control: the single-branch triangle still converts.
+        let mut single = make_triangle(cmp_imm(0, 3), CondCode::EQ, then_mov());
+        assert!(IfConversion.run(&mut single));
+        assert!(!single.block_order.contains(&BlockId(1)));
+    }
+
+    #[test]
+    fn test_explicit_non_boolean_or_mismatched_destination_stays_branchy() {
+        let cmp = || MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+
+        let mut non_boolean = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            vec![MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(2)])],
+            vec![MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(0)])],
+        );
+        let mut pass = IfConversion;
+        assert!(!pass.run(&mut non_boolean));
+
+        let mut mismatched_destination = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            vec![MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(1)])],
+            vec![MachInst::new(AArch64Opcode::MovI, vec![vreg(3), imm(0)])],
+        );
+        assert!(!pass.run(&mut mismatched_destination));
+
+        let mut shifted_one = make_explicit_diamond(
+            cmp(),
+            CondCode::EQ,
+            vec![MachInst::new(
+                AArch64Opcode::Movz,
+                vec![vreg(2), imm(1), imm(16)],
+            )],
+            vec![MachInst::new(
+                AArch64Opcode::Movz,
+                vec![vreg(2), imm(0), imm(0)],
+            )],
+        );
+        assert!(!pass.run(&mut shifted_one));
     }
 
     // ---- Provenance preservation ----
@@ -3573,6 +4318,84 @@ mod tests {
             func.inst(header.insts.last().copied().unwrap()).opcode,
             AArch64Opcode::BCond
         );
+    }
+
+    /// A hoisted def of a register live INTO its own arm (here a loop-carried
+    /// accumulator the arm advances in place) would advance on the other path
+    /// too, and the arm would read the advanced value on a later iteration.
+    ///
+    ///   bb0: B bb1
+    ///   bb1: CmpRR v0, v1; BCond EQ -> bb2 (falls through to bb3)
+    ///   bb2: EorRR v5, v5, v6; MovR v2, v5; B bb4
+    ///   bb3: MovR v2, v4; B bb4
+    ///   bb4: CmpRI v2, #0; BCond NE -> bb1; B bb5
+    ///   bb5: Ret
+    #[test]
+    fn test_diamond_hoisted_def_live_into_its_own_arm_is_refused() {
+        let mut func = MachFunction::new(
+            "test_if_convert_loop".to_string(),
+            Signature::new(vec![], vec![]),
+        );
+        let bb0 = func.entry;
+        let bb1 = func.create_block();
+        let bb2 = func.create_block();
+        let bb3 = func.create_block();
+        let bb4 = func.create_block();
+        let bb5 = func.create_block();
+        let branch = |cond: CondCode, target: BlockId| {
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![imm(cond.encoding() as i64), MachOperand::Block(target)],
+            )
+        };
+        let jump =
+            |target: BlockId| MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(target)]);
+        app(&mut func, bb0, jump(bb1));
+        app(
+            &mut func,
+            bb1,
+            MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]),
+        );
+        app(&mut func, bb1, branch(CondCode::EQ, bb2));
+        app(
+            &mut func,
+            bb2,
+            MachInst::new(AArch64Opcode::EorRR, vec![vreg(5), vreg(5), vreg(6)]),
+        );
+        app(
+            &mut func,
+            bb2,
+            MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(5)]),
+        );
+        app(&mut func, bb2, jump(bb4));
+        app(
+            &mut func,
+            bb3,
+            MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(4)]),
+        );
+        app(&mut func, bb3, jump(bb4));
+        app(
+            &mut func,
+            bb4,
+            MachInst::new(AArch64Opcode::CmpRI, vec![vreg(2), imm(0)]),
+        );
+        app(&mut func, bb4, branch(CondCode::NE, bb1));
+        app(&mut func, bb4, jump(bb5));
+        app(&mut func, bb5, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.add_edge(bb0, bb1);
+        func.add_edge(bb1, bb2);
+        func.add_edge(bb1, bb3);
+        func.add_edge(bb2, bb4);
+        func.add_edge(bb3, bb4);
+        func.add_edge(bb4, bb1);
+        func.add_edge(bb4, bb5);
+
+        assert!(
+            !IfConversion.run(&mut func),
+            "the accumulator update must stay on its own path"
+        );
+        assert!(func.block_order.contains(&bb2), "arms preserved");
+        assert!(!block_has_csel(&func, bb1));
     }
 
     #[test]
@@ -4171,6 +4994,38 @@ mod tests {
         assert_eq!(csel.operands[3], imm(CondCode::NE.encoding() as i64));
     }
 
+    /// The speculated div writes its temp on the else path too, so an else arm
+    /// that forwards that temp would select the quotient on both paths.
+    #[test]
+    fn test_div_guard_csel_refuses_else_reading_the_div_temp() {
+        let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(4), vreg(9)]);
+        let sdiv = MachInst::new(AArch64Opcode::SDiv, vec![vreg(5), vreg(3), vreg(4)]);
+        let copy = MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(5)]);
+        let else_mov = MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(5)]);
+        let mut func = make_diamond(cmp, CondCode::NE, vec![sdiv, copy], vec![else_mov]);
+
+        assert!(
+            !IfConversion.run(&mut func),
+            "else reads the speculated temp"
+        );
+        assert_eq!(func.block_order.len(), 4, "arms preserved");
+    }
+
+    /// The one-instruction div arm writes the merge register itself; an else
+    /// arm forwarding the merge register would read the quotient.
+    #[test]
+    fn test_div_guard_csel_refuses_else_forwarding_the_merge_register() {
+        let sdiv = MachInst::new(AArch64Opcode::SDiv, vec![vreg(2), vreg(3), vreg(4)]);
+        let keep = MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(2)]);
+        let mut func = make_div_diamond(sdiv, keep, CondCode::NE, vreg(4));
+
+        assert!(
+            !IfConversion.run(&mut func),
+            "else forwards the overwritten merge"
+        );
+        assert_eq!(func.block_order.len(), 4, "arms preserved");
+    }
+
     /// A guard that does NOT test the divisor (tests a different reg) must NOT
     /// full-collapse — it may only take the (still-sound) CSEL path.
     #[test]
@@ -4652,6 +5507,292 @@ mod tests {
             .any(|&i| func.inst(i).opcode == opc)
     }
 
+    // Independent finite control oracle: Arm DDI0602 ID062025, ConditionHolds
+    // p5947. This is test evidence over raw MachIR, not a wide-value proof.
+    fn select_test_condition(cc: u8, nzcv: u8) -> bool {
+        let (n, z, c, v) = (nzcv & 8 != 0, nzcv & 4 != 0, nzcv & 2 != 0, nzcv & 1 != 0);
+        match cc {
+            0 => z,
+            1 => !z,
+            2 => c,
+            3 => !c,
+            4 => n,
+            5 => !n,
+            6 => v,
+            7 => !v,
+            8 => c && !z,
+            9 => !c || z,
+            10 => n == v,
+            11 => n != v,
+            12 => !z && n == v,
+            13 => z || n != v,
+            14 | 15 => true,
+            _ => panic!("invalid test condition"),
+        }
+    }
+
+    fn eval_select_test(func: &MachFunction, nzcv: u8) -> u64 {
+        let mut values = crate::fast_hash::FxHashMap::<u32, u64>::default();
+        let mut return_value = None;
+        for &id in &func.block(func.entry).insts {
+            let inst = func.inst(id);
+            if inst.opcode == AArch64Opcode::Ret {
+                return return_value.expect("return carrier was written");
+            }
+            if let MachOperand::PReg(dst) = inst.operands[0] {
+                assert_eq!(inst.opcode, AArch64Opcode::MovR);
+                let src = inst.operands[1].as_vreg().unwrap();
+                let mask = if src.class == RegClass::Gpr32 {
+                    assert_eq!(dst, trust_cg_ir::aarch64_regs::W0);
+                    u32::MAX as u64
+                } else {
+                    assert_eq!(dst, trust_cg_ir::aarch64_regs::X0);
+                    u64::MAX
+                };
+                return_value = Some(values[&src.id] & mask);
+                continue;
+            }
+            let dst = inst.operands[0].as_vreg().unwrap();
+            let mask = if dst.class == RegClass::Gpr32 {
+                u32::MAX as u64
+            } else {
+                u64::MAX
+            };
+            let read = |index: usize| values[&inst.operands[index].as_vreg().unwrap().id] & mask;
+            let value = match inst.opcode {
+                AArch64Opcode::MovI => inst.operands[1].as_imm().unwrap() as u64,
+                AArch64Opcode::AddRI => {
+                    read(1).wrapping_add(inst.operands[2].as_imm().unwrap() as u64)
+                }
+                AArch64Opcode::Csel | AArch64Opcode::Csinc => {
+                    let n = read(1);
+                    let m = read(2);
+                    if select_test_condition(inst.operands[3].as_imm().unwrap() as u8, nzcv) {
+                        n
+                    } else if inst.opcode == AArch64Opcode::Csinc {
+                        m.wrapping_add(1)
+                    } else {
+                        m
+                    }
+                }
+                other => panic!("unexpected raw-MachIR test instruction {other:?}"),
+            };
+            values.insert(dst.id, value & mask);
+        }
+        panic!("test fixture has no return")
+    }
+
+    fn select_fold_test_fixture(
+        cc: CondCode,
+        class: RegClass,
+        increment_true: bool,
+        base: u64,
+        other: u64,
+    ) -> MachFunction {
+        let (mut func, bb) = single_block_func();
+        let (ty, return_reg, return_inst) = if class == RegClass::Gpr32 {
+            (
+                trust_cg_ir::Type::I32,
+                trust_cg_ir::aarch64_regs::W0,
+                MachInst::new(AArch64Opcode::Ret, vec![])
+                    .with_implicit_uses(&[trust_cg_ir::aarch64_regs::W0]),
+            )
+        } else {
+            (
+                trust_cg_ir::Type::I64,
+                trust_cg_ir::aarch64_regs::X0,
+                MachInst::new(AArch64Opcode::Ret, vec![])
+                    .with_implicit_uses(&[trust_cg_ir::aarch64_regs::X0]),
+            )
+        };
+        func.signature = Signature::new(vec![], vec![ty]);
+        let reg = |id| MachOperand::VReg(VReg::new(id, class));
+        for inst in [
+            MachInst::new(AArch64Opcode::MovI, vec![reg(10), imm(base as i64)]),
+            MachInst::new(AArch64Opcode::MovI, vec![reg(11), imm(other as i64)]),
+            MachInst::new(AArch64Opcode::AddRI, vec![reg(20), reg(10), imm(1)]),
+            MachInst::new(
+                AArch64Opcode::Csel,
+                vec![
+                    reg(30),
+                    reg(if increment_true { 20 } else { 11 }),
+                    reg(if increment_true { 11 } else { 20 }),
+                    imm(cc.encoding() as i64),
+                ],
+            ),
+            MachInst::new(
+                AArch64Opcode::MovR,
+                vec![MachOperand::PReg(return_reg), reg(30)],
+            ),
+            return_inst,
+        ] {
+            app(&mut func, bb, inst);
+        }
+        func.try_sync_vreg_counter().expect("fixture vreg ids fit");
+        func
+    }
+
+    #[test]
+    fn test_al_nv_csinc_true_arm_value_and_transaction() {
+        // Before the repair this valid unconditional raw-MachIR selection of
+        // 5+1 becomes CSINC other,5,NV/AL and incorrectly returns 99.
+        for cc in [CondCode::AL, CondCode::NV] {
+            for class in [RegClass::Gpr32, RegClass::Gpr64] {
+                let mut func = select_fold_test_fixture(cc, class, true, 5, 99);
+                assert_eq!(eval_select_test(&func, 0), 6);
+                let before = format!("{func:?}");
+                let mut provenance = ProvenanceMap::new();
+                provenance.record_lowering(
+                    TrustIrInstId(100),
+                    &func.block(func.entry).insts[2..4],
+                    PassId::new("isel"),
+                );
+                let before_provenance = format!("{provenance:?}");
+                let changed = CsincFold.run_with_provenance(&mut func, &mut provenance);
+                assert_eq!(eval_select_test(&func, 0), 6, "{cc:?}/{class:?}");
+                assert!(!changed, "unrepresentable complement must refuse");
+                assert_eq!(format!("{func:?}"), before);
+                assert_eq!(format!("{provenance:?}"), before_provenance);
+            }
+        }
+    }
+
+    #[test]
+    fn test_al_nv_false_arm_fold_remains_valid() {
+        for cc in [CondCode::AL, CondCode::NV] {
+            for class in [RegClass::Gpr32, RegClass::Gpr64] {
+                let mut func = select_fold_test_fixture(cc, class, false, 5, 99);
+                assert!(run_csinc(&mut func), "no complement needed for {cc:?}");
+                for nzcv in 0..16 {
+                    assert_eq!(eval_select_test(&func, nzcv), 99);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_csinc_fold_normal_conditions_all_nzcv() {
+        let mut rows = 0;
+        for encoding in 0..14 {
+            let cc = decode_cond(encoding).unwrap();
+            for class in [RegClass::Gpr32, RegClass::Gpr64] {
+                for increment_true in [false, true] {
+                    for (base, other) in [
+                        (5, 99),
+                        (u64::MAX, 37),
+                        (0x7fff_ffff, 0x8000_0000_0000_0001),
+                    ] {
+                        let mut func =
+                            select_fold_test_fixture(cc, class, increment_true, base, other);
+                        let expected: Vec<_> =
+                            (0..16).map(|nzcv| eval_select_test(&func, nzcv)).collect();
+                        assert!(run_csinc(&mut func), "{cc:?}/{class:?}/{increment_true}");
+                        for nzcv in 0..16 {
+                            assert_eq!(
+                                eval_select_test(&func, nzcv),
+                                expected[nzcv as usize],
+                                "{cc:?}/{class:?}/{increment_true}/{nzcv:04b}"
+                            );
+                            rows += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 2688);
+    }
+
+    #[test]
+    fn test_al_nv_swapped_diamond_arithmetic_refuses_complement() {
+        for cc in [CondCode::AL, CondCode::NV] {
+            let mov = MachInst::new(AArch64Opcode::MovR, vec![vreg(2), vreg(4)]);
+            let add = MachInst::new(AArch64Opcode::AddRI, vec![vreg(2), vreg(3), imm(1)]);
+            let neg = MachInst::new(AArch64Opcode::Neg, vec![vreg(2), vreg(3)]);
+            assert!(try_csinc(&add, &mov, cc).is_none());
+            assert!(try_csneg(&neg, &mov, cc).is_none());
+            assert!(try_csinc(&mov, &add, cc).is_some());
+            assert!(try_csneg(&mov, &neg, cc).is_some());
+        }
+    }
+
+    #[test]
+    fn test_conditional_diamond_arithmetic_all_nzcv() {
+        let mut checks = 0;
+        for encoding in 0..14 {
+            let cc = decode_cond(encoding).unwrap();
+            for class in [RegClass::Gpr32, RegClass::Gpr64] {
+                let reg = |id| MachOperand::VReg(VReg::new(id, class));
+                let mask = if class == RegClass::Gpr32 {
+                    u32::MAX as u64
+                } else {
+                    u64::MAX
+                };
+                for operation in [AArch64Opcode::Csinc, AArch64Opcode::Csneg] {
+                    for arithmetic_true in [false, true] {
+                        let mov = MachInst::new(AArch64Opcode::MovR, vec![reg(2), reg(4)]);
+                        let arithmetic = if operation == AArch64Opcode::Csinc {
+                            MachInst::new(AArch64Opcode::AddRI, vec![reg(2), reg(3), imm(1)])
+                        } else {
+                            MachInst::new(AArch64Opcode::Neg, vec![reg(2), reg(3)])
+                        };
+                        let (t, f) = if arithmetic_true {
+                            (&arithmetic, &mov)
+                        } else {
+                            (&mov, &arithmetic)
+                        };
+                        let actual = if operation == AArch64Opcode::Csinc {
+                            try_csinc(t, f, cc)
+                        } else {
+                            try_csneg(t, f, cc)
+                        }
+                        .expect("ordinary conditions remain optimizable");
+                        assert_eq!(actual.opcode, operation);
+                        for (base, other) in [
+                            (5u64, 99u64),
+                            (u64::MAX, 37),
+                            (0x8000_0000_0000_0000, 0x8000_0000),
+                        ] {
+                            let transform = |value: u64| {
+                                if operation == AArch64Opcode::Csinc {
+                                    value.wrapping_add(1) & mask
+                                } else {
+                                    value.wrapping_neg() & mask
+                                }
+                            };
+                            let read = |operand: &MachOperand| match operand.as_vreg().unwrap().id {
+                                3 => base & mask,
+                                4 => other & mask,
+                                id => panic!("wrong selected register {id}"),
+                            };
+                            for nzcv in 0..16 {
+                                let expected =
+                                    if select_test_condition(encoding, nzcv) == arithmetic_true {
+                                        transform(base)
+                                    } else {
+                                        other & mask
+                                    };
+                                let result = if select_test_condition(
+                                    actual.operands[3].as_imm().unwrap() as u8,
+                                    nzcv,
+                                ) {
+                                    read(&actual.operands[1])
+                                } else {
+                                    transform(read(&actual.operands[2]))
+                                };
+                                assert_eq!(
+                                    result, expected,
+                                    "{cc:?}/{class:?}/{operation:?}/{arithmetic_true}/{nzcv:04b}"
+                                );
+                                checks += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checks, 5376);
+    }
+
     /// FALSE-arm fold: `Csel dst, T, (t+1), EQ` (AddRI) -> `Csinc dst, T, t, EQ`.
     /// Pins the exact operand order and polarity (a wrong CSINC is a miscompile).
     #[test]
@@ -4863,6 +6004,73 @@ mod tests {
             "base redefined between add and csel must not fold"
         );
         assert!(has_op(&func, bb0, AArch64Opcode::Csel));
+    }
+
+    /// `Csel d, v, v` reads the `+1` result in BOTH operands. Rewriting one of
+    /// them and deleting the add would leave the other reading a register no
+    /// instruction defines (`tests/aarch64_csinc_fold_identical_select_arms.rs`).
+    #[test]
+    fn test_csinc_fold_select_reading_the_increment_twice_bails() {
+        for cond in [CondCode::EQ, CondCode::NE] {
+            let (mut func, bb0) = single_block_func();
+            app(
+                &mut func,
+                bb0,
+                MachInst::new(AArch64Opcode::AddRI, vec![vreg(20), vreg(10), imm(1)]),
+            );
+            app(
+                &mut func,
+                bb0,
+                MachInst::new(
+                    AArch64Opcode::Csel,
+                    vec![vreg(30), vreg(20), vreg(20), imm(cond.encoding() as i64)],
+                ),
+            );
+            app(&mut func, bb0, MachInst::new(AArch64Opcode::Ret, vec![]));
+
+            assert!(!run_csinc(&mut func), "{cond:?}: two reads must not fold");
+            assert!(has_op(&func, bb0, AArch64Opcode::Csel));
+            assert!(has_op(&func, bb0, AArch64Opcode::AddRI));
+        }
+    }
+
+    /// The CSEL reads the LAST def of its operand before it in the block. An
+    /// earlier `+1` def of the same register is overwritten before the CSEL and
+    /// must not be folded.
+    #[test]
+    fn test_csinc_fold_uses_the_def_reaching_the_select() {
+        let (mut func, bb0) = single_block_func();
+        app(
+            &mut func,
+            bb0,
+            MachInst::new(AArch64Opcode::AddRI, vec![vreg(20), vreg(10), imm(1)]),
+        );
+        app(
+            &mut func,
+            bb0,
+            MachInst::new(AArch64Opcode::MulRR, vec![vreg(20), vreg(12), vreg(13)]),
+        );
+        app(
+            &mut func,
+            bb0,
+            MachInst::new(
+                AArch64Opcode::Csel,
+                vec![
+                    vreg(30),
+                    vreg(11),
+                    vreg(20),
+                    imm(CondCode::EQ.encoding() as i64),
+                ],
+            ),
+        );
+        app(&mut func, bb0, MachInst::new(AArch64Opcode::Ret, vec![]));
+
+        assert!(
+            !run_csinc(&mut func),
+            "an overwritten +1 def is not the CSEL's operand"
+        );
+        assert!(has_op(&func, bb0, AArch64Opcode::Csel));
+        assert!(has_op(&func, bb0, AArch64Opcode::MulRR));
     }
 
     /// The kill switch leaves the CSEL intact.
@@ -5108,6 +6316,30 @@ mod tests {
         assert_eq!(csel.operands[3], imm(CondCode::EQ.encoding() as i64));
     }
 
+    /// A tiny-loop header with a second branch into an arm is not a diamond:
+    /// converting on the final compare would drop the earlier exit into the
+    /// rotate arm and leave that branch aimed at a deleted block.
+    #[test]
+    fn test_tiny_loop_refuses_header_with_an_earlier_branch_into_an_arm() {
+        let mut func = make_tiny_loop(true);
+        // bb1: LslRI; EorRR s2; <CMP s2, #7; B.EQ bb2>; AndRI; CMP; B.EQ bb2; B bb3
+        let early = [
+            func.push_inst(MachInst::new(AArch64Opcode::CmpRI, vec![vreg(13), imm(7)])),
+            func.push_inst(MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    imm(CondCode::EQ.encoding() as i64),
+                    MachOperand::Block(BlockId(2)),
+                ],
+            )),
+        ];
+        func.block_mut(BlockId(1)).insts.splice(2..2, early);
+        let before = format!("{func:?}");
+        assert!(!run_tinyloop(&mut func));
+        assert_eq!(format!("{func:?}"), before);
+        assert!(func.block_order.contains(&BlockId(2)), "arms preserved");
+    }
+
     /// An AFFINE (ADD) self-recurrence condition is PREDICTABLE — must stay
     /// branchy (the load-bearing non-affine requirement).
     #[test]
@@ -5119,6 +6351,125 @@ mod tests {
         );
         assert!(!block_has_csel(&func, BlockId(1)));
         assert!(func.block_order.contains(&BlockId(2)), "arms preserved");
+    }
+
+    /// Replace the compute arm (bb2) of [`make_tiny_loop`]`(true)` with `body`
+    /// followed by `B bb4`.
+    fn tiny_loop_with_compute_arm(body: Vec<MachInst>) -> MachFunction {
+        let mut func = make_tiny_loop(true);
+        let bb2 = BlockId(2);
+        func.block_mut(bb2).insts.clear();
+        for inst in body {
+            app(&mut func, bb2, inst);
+        }
+        app(
+            &mut func,
+            bb2,
+            MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(BlockId(4))]),
+        );
+        func
+    }
+
+    /// A compute arm that writes back the register the identity arm copies
+    /// (`RorRI rr, acc; MovR acc, rr; MovR merge, rr`): hoisting `MovR acc, rr`
+    /// above the CSEL would make the identity path (`MovR merge, acc`) select
+    /// the rotated value. Refused, and the function is left unchanged.
+    #[test]
+    fn test_tiny_loop_refuses_a_hoisted_write_the_identity_arm_reads() {
+        let (acc, rr, merge) = (vreg(11), vreg(15), vreg(16));
+        let mut func = tiny_loop_with_compute_arm(vec![
+            MachInst::new(AArch64Opcode::RorRI, vec![rr.clone(), acc.clone(), imm(57)]),
+            MachInst::new(AArch64Opcode::MovR, vec![acc, rr.clone()]),
+            MachInst::new(AArch64Opcode::MovR, vec![merge, rr]),
+        ]);
+        let before = format!("{func:?}");
+        assert!(!run_tinyloop(&mut func), "identity source clobbered");
+        assert_eq!(format!("{func:?}"), before);
+        assert!(func.block_order.contains(&BlockId(2)), "arms preserved");
+    }
+
+    /// `RorRI rr, p; MovR p, rr; MovR merge, rr` with `p` defined before the
+    /// loop and read nowhere else: `p` is carried around the loop into the
+    /// compute arm, so advancing it on the identity path changes what a later
+    /// compute iteration reads.
+    #[test]
+    fn test_tiny_loop_refuses_hoisted_write_to_a_register_carried_into_the_arm() {
+        let mut func = tiny_loop_with_compute_arm(vec![
+            MachInst::new(AArch64Opcode::RorRI, vec![vreg(15), vreg(17), imm(57)]),
+            MachInst::new(AArch64Opcode::MovR, vec![vreg(17), vreg(15)]),
+            MachInst::new(AArch64Opcode::MovR, vec![vreg(16), vreg(15)]),
+        ]);
+        let def_p = func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vreg(17), vreg(32)]));
+        func.block_mut(BlockId(0)).insts.insert(0, def_p);
+        assert!(!run_tinyloop(&mut func), "p is live into the compute arm");
+        assert!(func.block_order.contains(&BlockId(2)), "arms preserved");
+    }
+
+    /// A compute arm that advances a loop-carried register only it reads
+    /// (`k = k ror 57`, with no def of `k` outside the arm): the read is
+    /// upward-exposed in the arm, so hoisting the write would advance `k` on
+    /// the identity trips too. Refused although no block outside the arms
+    /// reads `k`.
+    #[test]
+    fn test_tiny_loop_refuses_a_loop_carried_write_back_read_only_in_its_arm() {
+        let (k, rr, merge) = (vreg(17), vreg(15), vreg(16));
+        let mut func = tiny_loop_with_compute_arm(vec![
+            MachInst::new(AArch64Opcode::RorRI, vec![rr.clone(), k.clone(), imm(57)]),
+            MachInst::new(AArch64Opcode::MovR, vec![k, rr.clone()]),
+            MachInst::new(AArch64Opcode::MovR, vec![merge, rr]),
+        ]);
+        let before = format!("{func:?}");
+        assert!(!run_tinyloop(&mut func), "loop-carried write-back hoisted");
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    /// `RorRI rr, acc; MovR k, rr; MovR merge, rr` where the join reads `k`
+    /// only through its W view: the hoisted `MovR k, rr` is observable there,
+    /// since a vreg is one register in every view. The same arm with the join
+    /// reading an unrelated W register converts, so the view read alone is
+    /// what refuses.
+    #[test]
+    fn test_tiny_loop_refuses_a_hoisted_write_a_narrower_view_reads() {
+        let build = |join_read: u32| {
+            let mut func = tiny_loop_with_compute_arm(vec![
+                MachInst::new(AArch64Opcode::RorRI, vec![vreg(15), vreg(11), imm(57)]),
+                MachInst::new(AArch64Opcode::MovR, vec![vreg(17), vreg(15)]),
+                MachInst::new(AArch64Opcode::MovR, vec![vreg(16), vreg(15)]),
+            ]);
+            let w = |id: u32| MachOperand::VReg(VReg::new(id, RegClass::Gpr32));
+            let def_k =
+                func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vreg(17), vreg(32)]));
+            func.block_mut(BlockId(0)).insts.insert(0, def_k);
+            let read = func.push_inst(MachInst::new(
+                AArch64Opcode::MovR,
+                vec![w(20), w(join_read)],
+            ));
+            func.block_mut(BlockId(4)).insts.insert(0, read);
+            func
+        };
+        let mut func = build(17);
+        let before = format!("{func:?}");
+        assert!(!run_tinyloop(&mut func), "the join reads k's W view");
+        assert_eq!(format!("{func:?}"), before);
+        let mut control = build(21);
+        assert!(run_tinyloop(&mut control), "an unrelated W read converts");
+        assert!(block_has_csel(&control, BlockId(1)));
+    }
+
+    /// A leading rename into an arm-local temp is still hoisted: every register
+    /// the hoisted code defines is written before it is read in the arm and is
+    /// read nowhere else.
+    #[test]
+    fn test_tiny_loop_converts_with_an_arm_local_rename() {
+        let (acc, t, rr, merge) = (vreg(11), vreg(18), vreg(15), vreg(16));
+        let mut func = tiny_loop_with_compute_arm(vec![
+            MachInst::new(AArch64Opcode::MovR, vec![t.clone(), acc]),
+            MachInst::new(AArch64Opcode::RorRI, vec![rr.clone(), t, imm(57)]),
+            MachInst::new(AArch64Opcode::MovR, vec![merge, rr]),
+        ]);
+        assert!(run_tinyloop(&mut func), "arm-local temps may be hoisted");
+        assert!(block_has_csel(&func, BlockId(1)));
+        assert!(!func.block_order.contains(&BlockId(2)), "true arm removed");
     }
 
     /// The kill switch leaves the tiny diamond branchy.

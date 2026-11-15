@@ -1,0 +1,21 @@
+; TrustIr text format v1
+module "tcg_val2"
+
+functy.0 = () -> (u64)
+
+global mut align(8) @tcg_val u64 = 42
+global mut align(8) @tcg_z u64 = 0
+
+fn @tcg_get(functy.0) {
+bb0:
+    %0 = global_addr @global.0
+    %1 = load u64, ptr %0
+    ret %1
+}
+
+fn @tcg_get_z(functy.0) {
+bb0:
+    %0 = global_addr @global.1
+    %1 = load u64, ptr %0
+    ret %1
+}

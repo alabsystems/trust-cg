@@ -155,7 +155,10 @@ fn build_if_else_diamond(mb: &mut ModuleBuilder) {
     fb.build();
 }
 
-/// `sum_to(n)` — one back edge (a counted loop with an accumulator).
+/// `xor_to(n)` — one back edge (a counted loop with an accumulator). The
+/// accumulator is an `xor`, not a sum: the optimizing lane's closed-form
+/// induction replaces an affine sum by its value, and this shape pins the
+/// relooper's `loop` scope, so the loop must reach it.
 fn build_counted_loop(mb: &mut ModuleBuilder) {
     let ft = mb.add_func_type(vec![Ty::I32, Ty::I32], vec![Ty::I32]);
     let mut fb = mb.function("counted_loop", ft);
@@ -177,7 +180,7 @@ fn build_counted_loop(mb: &mut ModuleBuilder) {
     fb.switch_to_block(body);
     let one = fb.iconst(Ty::I32, 1);
     let next_i = fb.add(Ty::I32, i, one);
-    let next_acc = fb.add(Ty::I32, acc, i);
+    let next_acc = fb.binop(trust_ir::BinOp::Xor, Ty::I32, acc, i);
     fb.br(header, vec![next_i, next_acc]);
     fb.switch_to_block(exit);
     fb.ret(vec![out]);
@@ -212,7 +215,8 @@ fn build_gcd(mb: &mut ModuleBuilder) {
     fb.build();
 }
 
-/// Two nested counted loops — two loop headers, so two `loop` scopes.
+/// Two nested counted loops — two loop headers, so two `loop` scopes. The
+/// inner accumulator is an `xor` for the reason `build_counted_loop` states.
 fn build_nested_loop(mb: &mut ModuleBuilder) {
     let ft = mb.add_func_type(vec![Ty::I32, Ty::I32], vec![Ty::I32]);
     let mut fb = mb.function("nested_loop", ft);
@@ -251,7 +255,7 @@ fn build_nested_loop(mb: &mut ModuleBuilder) {
     fb.switch_to_block(inner_body);
     let one = fb.iconst(Ty::I32, 1);
     let next_j = fb.add(Ty::I32, j, one);
-    let next_iacc = fb.add(Ty::I32, iacc, one);
+    let next_iacc = fb.binop(trust_ir::BinOp::Xor, Ty::I32, iacc, j);
     fb.br(inner, vec![next_j, next_iacc]);
 
     fb.switch_to_block(outer_latch);
@@ -320,12 +324,12 @@ fn build_switch(
     let v = fb.add_block_param(entry, Ty::I32);
     let x = fb.add_block_param(entry, Ty::I32);
     let case_blocks: Vec<_> = values.iter().map(|_| fb.create_block()).collect();
-    let own_default = fb.create_block();
-    let default_block = if default_is_a_case_target {
-        case_blocks[0]
-    } else {
-        own_default
-    };
+    // The default arm's own block exists only when the default edge reaches
+    // it: trust-ir refuses a block no edge reaches (`UnreachableBlock`), and
+    // every trust-cg ingestion entry refuses what the validator refuses
+    // (WS7.3).
+    let own_default = (!default_is_a_case_target).then(|| fb.create_block());
+    let default_block = own_default.unwrap_or(case_blocks[0]);
     fb.switch_to_block(entry);
     let cases: Vec<SwitchCase> = values
         .iter()
@@ -343,10 +347,12 @@ fn build_switch(
         let val = fb.add(Ty::I32, x, kc);
         fb.br(join, vec![val]);
     }
-    fb.switch_to_block(own_default);
-    let sentinel = fb.iconst(Ty::I32, -1);
-    let val = fb.add(Ty::I32, x, sentinel);
-    fb.br(join, vec![val]);
+    if let Some(own_default) = own_default {
+        fb.switch_to_block(own_default);
+        let sentinel = fb.iconst(Ty::I32, -1);
+        let val = fb.add(Ty::I32, x, sentinel);
+        fb.br(join, vec![val]);
+    }
     fb.switch_to_block(join);
     fb.ret(vec![r]);
     fb.build();
@@ -519,10 +525,14 @@ fn build_float_round_trip(mb: &mut ModuleBuilder) {
 fn compile(shape: &Shape) -> Vec<u8> {
     let mut mb = ModuleBuilder::new(shape.name);
     (shape.build)(&mut mb);
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.target_info = Some(wasm::target::wasm32_target_info());
-    wasm::compile_module(&module)
-        .unwrap_or_else(|e| panic!("wasm backend failed to compile `{}`: {e}", shape.name))
+    wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .unwrap_or_else(|e| panic!("wasm backend failed to compile `{}`: {e}", shape.name))
 }
 
 /// Every corpus shape, compiled once.
@@ -860,40 +870,60 @@ fn off_by_one_branch_depth_survey() {
 /// stack to the block's entry height, so a stray operand pushed just before one
 /// is legal wasm — no validator, this one or the reference implementation, can
 /// refute it. The mutation is therefore refutable exactly when the extra value
-/// reaches a REACHABLE join. Both counts are reported; the survivals are the
-/// `unreachable-code coverage` deferral showing up on real bytes.
+/// reaches a REACHABLE join. Like the off-by-one survey, it is applied to EVERY
+/// `local.set` of every corpus module, one at a time, rather than to a
+/// convenient first site: which sites the optimizing passes leave in front of
+/// a branch is the passes' choice, not the invariant's. Both counts are
+/// reported; the survivals are the `unreachable-code coverage` deferral
+/// showing up on real bytes.
 #[test]
 fn stack_discipline_mutation_is_refuted_where_the_spec_can_see_it() {
     let corpus = compiled_corpus();
     let mut applied = 0usize;
     let mut refuted = 0usize;
-    let mut absorbed = Vec::new();
+    let mut absorbed = 0usize;
+    let mut modules_refuted = Vec::new();
+    let mut modules_absorbed = Vec::new();
 
     for (name, _, bytes) in &corpus {
-        let Some(mutant) = cfg::mutate_local_set_to_get(bytes) else {
+        let mut nth = 0usize;
+        let mut any_refuted = false;
+        while let Some(mutant) = cfg::mutate_nth_local_set_to_get(bytes, nth) {
+            nth += 1;
+            applied += 1;
+            let verdict = cfg::check_module_structure(&mutant);
+            if verdict.is_refuted() {
+                refuted += 1;
+                any_refuted = true;
+            } else {
+                assert!(
+                    verdict.holds(),
+                    "`{name}` site {}: the stack-discipline mutant must either be refuted or \
+                     remain a legal module, got {verdict}",
+                    nth - 1
+                );
+                absorbed += 1;
+            }
+        }
+        if nth == 0 {
             continue;
-        };
-        applied += 1;
-        let verdict = cfg::check_module_structure(&mutant);
-        if verdict.is_refuted() {
-            refuted += 1;
+        }
+        if any_refuted {
+            modules_refuted.push(*name);
         } else {
-            assert!(
-                verdict.holds(),
-                "`{name}`: the stack-discipline mutant must either be refuted or remain a legal \
-                 module, got {verdict}"
-            );
-            absorbed.push(*name);
+            modules_absorbed.push(*name);
         }
     }
 
     eprintln!(
-        "stack-discipline mutation (local.set -> local.get): applied to {applied} real modules, \
-         {refuted} REFUTED at a reachable join, {} absorbed by the spec's post-branch stack \
-         polymorphism ({:?}) — the second number is the `unreachable-code coverage` deferral, \
-         measured",
-        absorbed.len(),
-        absorbed
+        "stack-discipline mutation (local.set -> local.get): applied at {applied} sites of {} \
+         real modules, {refuted} REFUTED at a reachable join, {absorbed} absorbed by the \
+         spec's post-branch stack polymorphism; modules with a refuted site {:?}, modules \
+         with every site absorbed {:?} — the absorbed count is the `unreachable-code \
+         coverage` deferral, measured",
+        modules_refuted.len() + modules_absorbed.len(),
+        modules_refuted,
+        modules_absorbed
     );
     assert!(applied > 0, "the mutation applied nowhere");
     assert!(
@@ -1162,4 +1192,13 @@ fn gate_invariant_rows_carry_their_does_not_cover_clause() {
             row.note
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

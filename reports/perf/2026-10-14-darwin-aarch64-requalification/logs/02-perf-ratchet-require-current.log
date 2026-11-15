@@ -1,0 +1,2 @@
+perf-ratchet: OK efc47d3bc3e5-20261014T142054Z.json (evidence=True, coverage 0.0%, runtime geomean None, warm-vs-O2 None, mismatches 0)
+perf-ratchet: CURRENT efc47d3bc3e5-20261014T142054Z.json measured HEAD efc47d3bc3e5 (eligible evidence)

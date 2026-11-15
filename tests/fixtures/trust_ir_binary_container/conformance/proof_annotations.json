@@ -1,0 +1,759 @@
+{
+  "name": "proof_annotations",
+  "functions": [
+    {
+      "id": 0,
+      "name": "carrier",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 0
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [
+                "NoOverflow",
+                "NoWrap",
+                "Commutative",
+                "Associative"
+              ],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [
+        "InBounds",
+        "NotNull",
+        "ValidBorrow",
+        "UniqueBorrow",
+        "SharedBorrow",
+        "ValidDealloc",
+        "NoOverflow",
+        "NoWrap",
+        "DivNonZero",
+        "ShiftInRange",
+        "Wrapping",
+        {
+          "BranchWeights": [
+            7,
+            1
+          ]
+        },
+        "Pure",
+        "Terminates",
+        "Deterministic",
+        "Associative",
+        "Commutative",
+        "DataRaceFree",
+        {
+          "AtomicOrdering": "Relaxed"
+        },
+        {
+          "AtomicOrdering": "Acquire"
+        },
+        {
+          "AtomicOrdering": "Release"
+        },
+        {
+          "AtomicOrdering": "AcqRel"
+        },
+        {
+          "AtomicOrdering": "SeqCst"
+        },
+        {
+          "BoundedOutput": {
+            "lo": -1.0,
+            "hi": 1.0
+          }
+        },
+        "Monotonic",
+        "NoAlias",
+        {
+          "Aligned": 16
+        },
+        "NoPanic",
+        "NoUndef",
+        "ReadonlyTable",
+        "AppendOnlyBuffer",
+        "AtomicSetInsert",
+        "ParallelMap",
+        {
+          "BoundedLoop": 1024
+        },
+        {
+          "DivergenceClass": "Uniform"
+        },
+        {
+          "DivergenceClass": "Low"
+        },
+        {
+          "DivergenceClass": "High"
+        },
+        {
+          "Custom": 42
+        },
+        {
+          "ValueRange": {
+            "lo": "-170141183460469231731687303715884105728",
+            "hi": "170141183460469231731687303715884105727"
+          }
+        },
+        {
+          "KnownBits": {
+            "zeros": 71777214294589695,
+            "ones": 18374686479671623680
+          }
+        },
+        {
+          "ProofRef": 7
+        }
+      ],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I64"
+      ],
+      "returns": [
+        "I64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "BoundsCheck",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [in_bounds] on `carrier`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 1,
+      "kind": "MemorySafety",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [not_null, valid_borrow, unique_borrow, shared_borrow, valid_dealloc, no_alias, aligned(16), no_undef] on `carrier`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 2,
+      "kind": "ArithmeticSafety",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [no_overflow, no_wrap, div_nonzero, shift_in_range] on `carrier`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 3,
+      "kind": "Liveness",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [terminates] on `carrier`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 4,
+      "kind": "TemporalSafety",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [data_race_free] on `carrier`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 5,
+      "kind": "PanicFreedom",
+      "status": "Pending",
+      "description": "synthesized from function-level annotation(s) [no_panic] on `carrier`",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 6,
+      "kind": "Precondition",
+      "status": "Pending",
+      "description": "Precondition/Pending",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(> x 0)",
+        "smtlib": "(> x 0)",
+        "sort": "Bool"
+      },
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 7,
+      "kind": "Precondition",
+      "status": "Discharged",
+      "description": "Precondition/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 8,
+      "kind": "Precondition",
+      "status": "Failed",
+      "description": "Precondition/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 9,
+      "kind": "Precondition",
+      "status": "Trusted",
+      "description": "Precondition/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 10,
+      "kind": "Postcondition",
+      "status": "Pending",
+      "description": "Postcondition/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 11,
+      "kind": "Postcondition",
+      "status": "Discharged",
+      "description": "Postcondition/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 12,
+      "kind": "Postcondition",
+      "status": "Failed",
+      "description": "Postcondition/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 13,
+      "kind": "Postcondition",
+      "status": "Trusted",
+      "description": "Postcondition/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 14,
+      "kind": "LoopInvariant",
+      "status": "Pending",
+      "description": "LoopInvariant/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 15,
+      "kind": "LoopInvariant",
+      "status": "Discharged",
+      "description": "LoopInvariant/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 16,
+      "kind": "LoopInvariant",
+      "status": "Failed",
+      "description": "LoopInvariant/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 17,
+      "kind": "LoopInvariant",
+      "status": "Trusted",
+      "description": "LoopInvariant/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 18,
+      "kind": "TypeInvariant",
+      "status": "Pending",
+      "description": "TypeInvariant/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 19,
+      "kind": "TypeInvariant",
+      "status": "Discharged",
+      "description": "TypeInvariant/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 20,
+      "kind": "TypeInvariant",
+      "status": "Failed",
+      "description": "TypeInvariant/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 21,
+      "kind": "TypeInvariant",
+      "status": "Trusted",
+      "description": "TypeInvariant/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 22,
+      "kind": "RefinementType",
+      "status": "Pending",
+      "description": "RefinementType/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 23,
+      "kind": "RefinementType",
+      "status": "Discharged",
+      "description": "RefinementType/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 24,
+      "kind": "RefinementType",
+      "status": "Failed",
+      "description": "RefinementType/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 25,
+      "kind": "RefinementType",
+      "status": "Trusted",
+      "description": "RefinementType/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 26,
+      "kind": "TranslationValidation",
+      "status": "Pending",
+      "description": "TranslationValidation/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 27,
+      "kind": "TranslationValidation",
+      "status": "Discharged",
+      "description": "TranslationValidation/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 28,
+      "kind": "TranslationValidation",
+      "status": "Failed",
+      "description": "TranslationValidation/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 29,
+      "kind": "TranslationValidation",
+      "status": "Trusted",
+      "description": "TranslationValidation/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 30,
+      "kind": "MemorySafety",
+      "status": "Pending",
+      "description": "MemorySafety/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 31,
+      "kind": "MemorySafety",
+      "status": "Discharged",
+      "description": "MemorySafety/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 32,
+      "kind": "MemorySafety",
+      "status": "Failed",
+      "description": "MemorySafety/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 33,
+      "kind": "MemorySafety",
+      "status": "Trusted",
+      "description": "MemorySafety/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 34,
+      "kind": "PanicFreedom",
+      "status": "Pending",
+      "description": "PanicFreedom/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 35,
+      "kind": "PanicFreedom",
+      "status": "Discharged",
+      "description": "PanicFreedom/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 36,
+      "kind": "PanicFreedom",
+      "status": "Failed",
+      "description": "PanicFreedom/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 37,
+      "kind": "PanicFreedom",
+      "status": "Trusted",
+      "description": "PanicFreedom/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 38,
+      "kind": "TemporalSafety",
+      "status": "Pending",
+      "description": "TemporalSafety/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 39,
+      "kind": "TemporalSafety",
+      "status": "Discharged",
+      "description": "TemporalSafety/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 40,
+      "kind": "TemporalSafety",
+      "status": "Failed",
+      "description": "TemporalSafety/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 41,
+      "kind": "TemporalSafety",
+      "status": "Trusted",
+      "description": "TemporalSafety/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 42,
+      "kind": "Liveness",
+      "status": "Pending",
+      "description": "Liveness/Pending",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 43,
+      "kind": "Liveness",
+      "status": "Discharged",
+      "description": "Liveness/Discharged",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 44,
+      "kind": "Liveness",
+      "status": "Failed",
+      "description": "Liveness/Failed",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 45,
+      "kind": "Liveness",
+      "status": "Trusted",
+      "description": "Liveness/Trusted",
+      "formula": null,
+      "function": null,
+      "source": null,
+      "site": null
+    }
+  ],
+  "proof_certificates": [
+    {
+      "obligation": 0,
+      "prover": "prover_0",
+      "evidence": {
+        "SmtProof": [
+          1,
+          2,
+          3
+        ]
+      }
+    },
+    {
+      "obligation": 1,
+      "prover": "prover_1",
+      "evidence": {
+        "LeanProof": "exact rfl"
+      }
+    },
+    {
+      "obligation": 2,
+      "prover": "prover_2",
+      "evidence": {
+        "KaniHarness": "#[kani::proof] fn check() {}"
+      }
+    },
+    {
+      "obligation": 3,
+      "prover": "prover_3",
+      "evidence": {
+        "GammaCrownBound": {
+          "epsilon": 0.001,
+          "verified_layers": 5
+        }
+      }
+    },
+    {
+      "obligation": 4,
+      "prover": "prover_4",
+      "evidence": {
+        "TranslationValidation": {
+          "rule_name": "const-fold",
+          "smt_hash": [
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171,
+            171
+          ]
+        }
+      }
+    },
+    {
+      "obligation": 5,
+      "prover": "prover_5",
+      "evidence": {
+        "Trusted": "manual audit by USER"
+      }
+    },
+    {
+      "obligation": 6,
+      "prover": "prover_6",
+      "evidence": {
+        "InheritedFromCallee": {
+          "callee": 0,
+          "obligation": 0,
+          "external": null
+        }
+      }
+    }
+  ],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

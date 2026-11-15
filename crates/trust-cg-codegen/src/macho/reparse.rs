@@ -46,7 +46,6 @@
 //                                               TCG_NO_PROOF_CERTS / ENC-3's
 //                                               TCG_NO_DECODE_CHECK; never
 //                                               weakens a default silently)
-//   TCG_TRACE_MACHO_REPARSE = 1                 per-object trace + summary
 //
 // `warn` records telemetry and prints every disagreement LOUDLY (P0 evidence of
 // a live writer bug) WITHOUT failing the compile — used to run the full
@@ -54,7 +53,6 @@
 // `enforce`. In `enforce` a disagreement is fail-closed (the writer's public
 // `write()` funnel aborts rather than return a malformed object).
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::writer::MachOTarget;
@@ -83,6 +81,7 @@ const RELOCATION_INFO_SIZE: usize = 8;
 
 // nlist n_type bits.
 const N_EXT: u8 = 0x01;
+const N_PEXT: u8 = 0x10;
 const N_TYPE_MASK: u8 = 0x0E;
 const N_UNDF: u8 = 0x00;
 const N_SECT: u8 = 0x0E;
@@ -90,6 +89,8 @@ const N_SECT: u8 = 0x0E;
 // nlist n_desc weak flags.
 const N_WEAK_REF: u16 = 0x0040;
 const N_WEAK_DEF: u16 = 0x0080;
+/// `n_desc`: the definition must not be dead-stripped (`#[used]` retention).
+const N_NO_DEAD_STRIP: u16 = 0x0020;
 
 // ---------------------------------------------------------------------------
 // Rollout mode
@@ -107,28 +108,22 @@ pub enum MachoReparseMode {
     Enforce,
 }
 
-/// Resolve the gate mode from the environment (cached process-wide).
+/// Resolve the gate mode for the current compile request.
 pub fn macho_reparse_mode() -> MachoReparseMode {
-    static MODE: OnceLock<MachoReparseMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        // Triage opt-out takes precedence, mirroring TCG_NO_PROOF_CERTS.
-        if std::env::var_os("TCG_NO_MACHO_REPARSE").is_some() {
-            return MachoReparseMode::Off;
-        }
-        match std::env::var("TCG_MACHO_REPARSE").ok().as_deref() {
-            Some("off") | Some("0") | Some("false") => MachoReparseMode::Off,
-            Some("warn") => MachoReparseMode::Warn,
-            Some("enforce") | Some("1") | Some("on") | Some("true") => MachoReparseMode::Enforce,
-            // DEFAULT-ON: any unset / unrecognized value enforces.
-            _ => MachoReparseMode::Enforce,
-        }
-    })
-}
-
-/// Whether per-object tracing is enabled (`TCG_TRACE_MACHO_REPARSE=1`).
-pub fn macho_reparse_trace_enabled() -> bool {
-    static TRACE: OnceLock<bool> = OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var_os("TCG_TRACE_MACHO_REPARSE").is_some())
+    // Triage opt-out takes precedence, mirroring TCG_NO_PROOF_CERTS.
+    if trust_cg_process_env::var_os("TCG_NO_MACHO_REPARSE").is_some() {
+        return MachoReparseMode::Off;
+    }
+    match trust_cg_process_env::var("TCG_MACHO_REPARSE")
+        .ok()
+        .as_deref()
+    {
+        Some("off") | Some("0") | Some("false") => MachoReparseMode::Off,
+        Some("warn") => MachoReparseMode::Warn,
+        Some("enforce") | Some("1") | Some("on") | Some("true") => MachoReparseMode::Enforce,
+        // DEFAULT-ON: any unset / unrecognized value enforces.
+        _ => MachoReparseMode::Enforce,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +210,10 @@ pub struct SymbolIntent {
     pub is_global: bool,
     /// Whether the symbol is weak.
     pub is_weak: bool,
+    /// Whether the symbol is PRIVATE EXTERNAL (`N_PEXT`, hidden visibility).
+    pub is_private_extern: bool,
+    /// Whether the DEFINITION carries `N_NO_DEAD_STRIP` (`#[used]` retention).
+    pub no_dead_strip: bool,
 }
 
 /// One intended relocation record's fields (arch-neutral `relocation_info`).
@@ -393,6 +392,15 @@ fn parse_object(b: &[u8]) -> Result<ParsedObject, MachoReparseError> {
         match cmd {
             LC_SEGMENT_64 => {
                 let nsects = rd_u32(b, lc + 64)?;
+                if (nsects as usize)
+                    .checked_mul(SECTION_64_SIZE)
+                    .and_then(|size| size.checked_add(SEGMENT_COMMAND_64_BASE))
+                    .is_none_or(|size| size > cmdsize)
+                {
+                    return err(format!(
+                        "load command {i}: {nsects} section headers do not fit in cmdsize {cmdsize}"
+                    ));
+                }
                 let mut so = lc + SEGMENT_COMMAND_64_BASE;
                 for _ in 0..nsects {
                     sections.push(ParsedSection {
@@ -471,6 +479,20 @@ fn parse_object(b: &[u8]) -> Result<ParsedObject, MachoReparseError> {
     // Per-section relocations.
     let mut section_relocs: Vec<Vec<RelocIntent>> = Vec::with_capacity(sections.len());
     for sec in &sections {
+        // Bound the table by the buffer before reserving for it.
+        let table_end = (sec.nreloc as usize)
+            .checked_mul(RELOCATION_INFO_SIZE)
+            .and_then(|size| (sec.reloff as usize).checked_add(size));
+        if table_end.is_none_or(|end| end > b.len()) {
+            return err(format!(
+                "section {},{}: relocation table of {} entries at offset {} exceeds the {}-byte object",
+                String::from_utf8_lossy(&sec.segname).trim_end_matches('\0'),
+                String::from_utf8_lossy(&sec.sectname).trim_end_matches('\0'),
+                sec.nreloc,
+                sec.reloff,
+                b.len()
+            ));
+        }
         let mut recs = Vec::with_capacity(sec.nreloc as usize);
         for j in 0..sec.nreloc as usize {
             recs.push(parse_reloc(
@@ -488,6 +510,186 @@ fn parse_object(b: &[u8]) -> Result<ParsedObject, MachoReparseError> {
         symbols,
         section_relocs,
         dysymtab,
+    })
+}
+
+/// Every relocation record in an emitted `target` Mach-O object, independently
+/// parsed from the raw bytes (spec layout only, no writer state): one entry per
+/// section in load-command order, tagged `segname,sectname`, with that
+/// section's records in FILE order (the order ld64 consumes them, so
+/// prefix/pair adjacency is exactly what the linker sees). An object whose
+/// `cputype` is not `target`'s is refused. The artifact side of the relocation
+/// inventory digest.
+pub fn relocation_records(
+    target: MachOTarget,
+    bytes: &[u8],
+) -> Result<Vec<(String, Vec<RelocIntent>)>, MachoReparseError> {
+    let parsed = parse_object(bytes)?;
+    if parsed.cputype != expected_cputype(target) {
+        return err(format!(
+            "cputype {:#x} is not the {target:?} cputype {:#x}",
+            parsed.cputype,
+            expected_cputype(target)
+        ));
+    }
+    Ok(parsed
+        .sections
+        .iter()
+        .zip(parsed.section_relocs)
+        .map(|(section, relocs)| {
+            let name = format!(
+                "{},{}",
+                String::from_utf8_lossy(&section.segname),
+                String::from_utf8_lossy(&section.sectname)
+            );
+            (name, relocs)
+        })
+        .collect())
+}
+
+/// One section of an emitted Mach-O object, as [`read_object_records`] reads
+/// it from the bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachoSectionRecord {
+    /// `segname`, trimmed of trailing NULs (e.g. `__TEXT`).
+    pub segname: String,
+    /// `sectname`, trimmed of trailing NULs (e.g. `__text`).
+    pub sectname: String,
+    /// `addr`: the section's address in the object's address space. Symbol
+    /// values are addresses in that space.
+    pub addr: u64,
+    /// `size` in bytes.
+    pub size: u64,
+    /// `flags`: section type and attributes.
+    pub flags: u32,
+    /// The section's file bytes; empty for a zero-fill section, which has
+    /// none.
+    pub data: Vec<u8>,
+}
+
+/// One `nlist_64` entry of an emitted Mach-O object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachoSymbolRecord {
+    /// The symbol's name as stored (C names carry their leading `_`).
+    pub name: String,
+    /// `n_type` (`N_STAB`, `N_PEXT`, `N_TYPE` and `N_EXT` bits).
+    pub n_type: u8,
+    /// `n_sect`: 1-based section ordinal, or 0 (`NO_SECT`).
+    pub n_sect: u8,
+    /// `n_desc`.
+    pub n_desc: u16,
+    /// `n_value`: an address for a section symbol.
+    pub n_value: u64,
+}
+
+impl MachoSymbolRecord {
+    /// A debugger (`N_STAB`) entry rather than a symbol.
+    pub fn is_stab(&self) -> bool {
+        self.n_type & 0xE0 != 0
+    }
+
+    /// `N_EXT`: visible to the static linker outside this object.
+    pub fn is_external(&self) -> bool {
+        self.n_type & N_EXT != 0
+    }
+
+    /// `N_PEXT`: a private external.
+    pub fn is_private_external(&self) -> bool {
+        self.n_type & N_PEXT != 0
+    }
+
+    /// Defined in a section (`N_SECT`), not a debugger entry.
+    pub fn is_section_definition(&self) -> bool {
+        !self.is_stab() && self.n_type & N_TYPE_MASK == N_SECT && self.n_sect != 0
+    }
+}
+
+/// Every section, symbol and relocation of an emitted Mach-O object, read by
+/// [`read_object_records`].
+#[derive(Clone, Debug)]
+pub struct MachoObjectRecords {
+    /// `cputype` from the header.
+    pub cputype: u32,
+    /// Sections in load-command order; ordinal `n` is `sections[n - 1]`.
+    pub sections: Vec<MachoSectionRecord>,
+    /// Symbols in symbol-table order: a relocation's `r_symbolnum` indexes
+    /// this vector when `r_extern` is set.
+    pub symbols: Vec<MachoSymbolRecord>,
+    /// Each section's relocation records in file order (same index as
+    /// `sections`).
+    pub section_relocations: Vec<Vec<RelocIntent>>,
+}
+
+impl MachoObjectRecords {
+    /// The section with 1-based ordinal `ordinal`, if any.
+    pub fn section(&self, ordinal: u8) -> Option<&MachoSectionRecord> {
+        usize::from(ordinal)
+            .checked_sub(1)
+            .and_then(|index| self.sections.get(index))
+    }
+}
+
+/// Read every section (with its bytes), symbol and relocation record of a
+/// Mach-O object with the independent reader above (spec layout only, no
+/// writer state). A section whose file bytes lie outside the object is
+/// refused; a zero-fill section carries no bytes.
+pub fn read_object_records(bytes: &[u8]) -> Result<MachoObjectRecords, MachoReparseError> {
+    const SECTION_TYPE_MASK: u32 = 0xFF;
+    const S_ZEROFILL: u32 = 0x01;
+    const S_GB_ZEROFILL: u32 = 0x0C;
+    const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+    let parsed = parse_object(bytes)?;
+    let mut sections = Vec::with_capacity(parsed.sections.len());
+    for section in &parsed.sections {
+        let zerofill = matches!(
+            section.flags & SECTION_TYPE_MASK,
+            S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+        );
+        let data = if zerofill {
+            Vec::new()
+        } else {
+            let start = section.offset as usize;
+            let end = usize::try_from(section.size)
+                .ok()
+                .and_then(|size| start.checked_add(size));
+            match end.and_then(|end| bytes.get(start..end)) {
+                Some(data) => data.to_vec(),
+                None => {
+                    return err(format!(
+                        "section {},{}: {} bytes at offset {} exceed the {}-byte object",
+                        String::from_utf8_lossy(&section.segname),
+                        String::from_utf8_lossy(&section.sectname),
+                        section.size,
+                        section.offset,
+                        bytes.len()
+                    ));
+                }
+            }
+        };
+        sections.push(MachoSectionRecord {
+            segname: String::from_utf8_lossy(&section.segname).into_owned(),
+            sectname: String::from_utf8_lossy(&section.sectname).into_owned(),
+            addr: section.addr,
+            size: section.size,
+            flags: section.flags,
+            data,
+        });
+    }
+    Ok(MachoObjectRecords {
+        cputype: parsed.cputype,
+        sections,
+        symbols: parsed
+            .symbols
+            .into_iter()
+            .map(|symbol| MachoSymbolRecord {
+                name: symbol.name,
+                n_type: symbol.n_type,
+                n_sect: symbol.n_sect,
+                n_desc: symbol.n_desc,
+                n_value: symbol.n_value,
+            })
+            .collect(),
+        section_relocations: parsed.section_relocs,
     })
 }
 
@@ -668,6 +870,17 @@ pub fn check_object(intent: &MachoObjectIntent, bytes: &[u8]) -> Result<(), Mach
                 want.name, got_ext, want_ext
             ));
         }
+        // N_PEXT (private extern / hidden visibility) must match the intent
+        // exactly: a spurious N_PEXT would demote an exported symbol at final
+        // link, a missing one would leak a hidden definition into the linked
+        // image's export surface.
+        let got_pext = got.n_type & N_PEXT != 0;
+        if got_pext != want.is_private_extern {
+            return err(format!(
+                "symbol {:?} N_PEXT {} != intended {}",
+                want.name, got_pext, want.is_private_extern
+            ));
+        }
         let want_type = if want.section == 0 { N_UNDF } else { N_SECT };
         if got.n_type & N_TYPE_MASK != want_type {
             return err(format!(
@@ -683,17 +896,23 @@ pub fn check_object(intent: &MachoObjectIntent, bytes: &[u8]) -> Result<(), Mach
                 want.name, got.n_sect, want.section
             ));
         }
-        // n_desc weak flag.
-        let want_desc: u16 = if !want.is_weak {
+        // n_desc: weak flags + no-dead-strip retention.
+        let want_weak: u16 = if !want.is_weak {
             0
         } else if want.section == 0 {
             N_WEAK_REF
         } else {
             N_WEAK_DEF
         };
+        let want_retain: u16 = if want.no_dead_strip && want.section != 0 {
+            N_NO_DEAD_STRIP
+        } else {
+            0
+        };
+        let want_desc = want_weak | want_retain;
         if got.n_desc != want_desc {
             return err(format!(
-                "symbol {:?} n_desc {:#x} != intended {:#x} (weak flags)",
+                "symbol {:?} n_desc {:#x} != intended {:#x} (weak / no-dead-strip flags)",
                 want.name, got.n_desc, want_desc
             ));
         }
@@ -799,26 +1018,10 @@ pub fn run_macho_reparse_gate(
     if mode == MachoReparseMode::Off {
         return Ok(());
     }
-    let trace = macho_reparse_trace_enabled();
     N_OBJECTS_CHECKED.fetch_add(1, Ordering::Relaxed);
     match check_object(intent, bytes) {
         Ok(()) => {
             N_OBJECTS_MATCHED.fetch_add(1, Ordering::Relaxed);
-            if trace {
-                let c = macho_reparse_counters();
-                eprintln!(
-                    "macho-reparse OK [{:?}] {} bytes, {} sections, {} symbols \
-                     (totals: objects={} sections={} symbols={} relocs={})",
-                    intent.target,
-                    bytes.len(),
-                    intent.sections.len(),
-                    intent.symbols.len(),
-                    c.objects_checked,
-                    c.sections_checked,
-                    c.symbols_checked,
-                    c.relocs_checked,
-                );
-            }
             Ok(())
         }
         Err(e) => {
@@ -933,6 +1136,40 @@ mod tests {
         );
     }
 
+    /// A relocation count that overruns the object is refused before any
+    /// storage is reserved for it (it used to reserve `nreloc` entries first).
+    #[test]
+    fn refutation_relocation_count_past_the_object_is_refused_before_reserving() {
+        let w = build_x86_writer();
+        let mut bytes = w.write().unwrap();
+        // section_64[0].nreloc is at header(32) + segment_base(72) + 60.
+        let nreloc_off = MACH_HEADER_64_SIZE + SEGMENT_COMMAND_64_BASE + 60;
+        bytes[nreloc_off..nreloc_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let error = parse_object(&bytes).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("relocation table of 4294967295 entries"),
+            "{error:?}"
+        );
+    }
+
+    /// Section headers must fit inside their LC_SEGMENT_64's cmdsize.
+    #[test]
+    fn refutation_section_count_past_the_segment_command_is_refused() {
+        let w = build_x86_writer();
+        let mut bytes = w.write().unwrap();
+        // segment_command_64.nsects is at header(32) + 64.
+        let nsects_off = MACH_HEADER_64_SIZE + 64;
+        let nsects = u32::from_le_bytes(bytes[nsects_off..nsects_off + 4].try_into().unwrap());
+        bytes[nsects_off..nsects_off + 4].copy_from_slice(&(nsects + 1).to_le_bytes());
+        let error = parse_object(&bytes).unwrap_err();
+        assert!(
+            error.message.contains("section headers do not fit"),
+            "{error:?}"
+        );
+    }
+
     // Refutation 3: flip a symbol n_value in an nlist entry.
     #[test]
     fn refutation_corrupt_symbol_value_fails_closed() {
@@ -988,7 +1225,7 @@ mod tests {
     }
 
     // Overhead measurement (run explicitly:
-    //   TRUST_CG_RUN_MEASUREMENT_TESTS=1 cargo test -p trust-cg-codegen \
+    //   TRUST_CG_RUN_MEASUREMENT_TESTS=1 scripts/trust_cargo.sh test -p trust-cg-codegen \
     //     --lib --release reparse::tests::bench -- --nocapture
     // ). Reports the reparse-gate cost relative to producing the object bytes.
     #[test]

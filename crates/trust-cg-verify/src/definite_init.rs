@@ -166,17 +166,103 @@ pub fn check_function(function: &Function) -> InitCheckResult {
                         s.loaded_through = Some(*ptr);
                     }
                 }
+                // A bulk write initializes its destination like a Store (its
+                // pointer operands are also escapes under
+                // `mark_pointer_escapes`, which already keeps such a cell
+                // unflagged; the write is recorded here so the tally does not
+                // depend on that), and a `CoroSuspend` stores the resume state
+                // into its frame before returning.
                 Inst::Store { ptr, .. }
                 | Inst::AtomicStore { ptr, .. }
                 | Inst::AtomicRMW { ptr, .. }
-                | Inst::CmpXchg { ptr, .. } => {
+                | Inst::CmpXchg { ptr, .. }
+                | Inst::MemCopy { dst: ptr, .. }
+                | Inst::MemSet { dst: ptr, .. }
+                | Inst::CoroSuspend { frame: ptr, .. } => {
                     if let Some(cell) = prov.cell_of(*ptr)
                         && let Some(s) = state.get_mut(&cell)
                     {
                         s.stored = true;
                     }
                 }
-                _ => {}
+                // Exhaustive on purpose (no wildcard): a new instruction that
+                // reads or writes memory must be classified here. None of
+                // these is a load of a value out of a cell or a write into
+                // one. `MemCopy`'s SOURCE is not a load either: copying
+                // uninitialized bytes is defined (the init state is copied).
+                Inst::Dealloc { .. }
+                | Inst::Fence { .. }
+                | Inst::Call { .. }
+                | Inst::CallIndirect { .. }
+                | Inst::CallCannotUnwind { .. }
+                | Inst::CallIndirectCannotUnwind { .. }
+                | Inst::Const { .. }
+                | Inst::NullPtr
+                | Inst::Alloca { .. }
+                | Inst::HeapAlloc { .. }
+                | Inst::Copy { .. }
+                | Inst::Cast { .. }
+                | Inst::BinOp { .. }
+                | Inst::UnOp { .. }
+                | Inst::Overflow { .. }
+                | Inst::ICmp { .. }
+                | Inst::FCmp { .. }
+                | Inst::Select { .. }
+                | Inst::GEP { .. }
+                | Inst::PtrData { .. }
+                | Inst::PtrMetadata { .. }
+                | Inst::PtrFromParts { .. }
+                | Inst::ExtractField { .. }
+                | Inst::InsertField { .. }
+                | Inst::ExtractElement { .. }
+                | Inst::InsertElement { .. }
+                | Inst::MakeAggregate { .. }
+                // Construction itself reads/writes no pointee memory. Any
+                // captured cell pointer escapes through the generic SSA uses
+                // above, just as a pointer stored in an aggregate does.
+                | Inst::MakeClosure { .. }
+                | Inst::ArraySplat { .. }
+                // The tensor region (v67-v69) builds values only; no tensor
+                // instruction reads or writes pointee memory.
+                | Inst::TensorContract { .. }
+                | Inst::TensorMap { .. }
+                | Inst::TensorReduce { .. }
+                | Inst::TensorView { .. }
+                | Inst::TensorGather { .. }
+                | Inst::TensorScatter { .. }
+                | Inst::GlobalAddr { .. }
+                | Inst::Undef { .. }
+                | Inst::Assume { .. }
+                | Inst::Assert { .. }
+                | Inst::SeqMapAddK { .. }
+                | Inst::SeqMapNot { .. }
+                | Inst::SeqMap { .. }
+                | Inst::Borrow { .. }
+                | Inst::BorrowMut { .. }
+                | Inst::EndBorrow { .. }
+                | Inst::Retain { .. }
+                | Inst::Release { .. }
+                | Inst::IsUnique { .. }
+                | Inst::OpenFrame { .. }
+                | Inst::BindSlot { .. }
+                | Inst::LoadSlot { .. }
+                | Inst::CloseFrame { .. }
+                | Inst::LandingPad { .. }
+                | Inst::DialectOp(_)
+                | Inst::Br { .. }
+                | Inst::CondBr { .. }
+                | Inst::Switch { .. }
+                | Inst::Return { .. }
+                | Inst::Unreachable
+                | Inst::Invoke { .. }
+                | Inst::InvokeIndirect { .. }
+                | Inst::AssertInvoke { .. }
+                | Inst::Resume { .. } => {}
+                // A drop (v47), and its v55 unwinding twin `DropInvoke`, runs
+                // a destructor through its pointer, which
+                // `mark_pointer_escapes` treats as an escape, so its cell is
+                // never flagged; the backend refuses both anyway.
+                Inst::Drop { .. } | Inst::DropInvoke { .. } => {}
             }
         }
     }
@@ -646,6 +732,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn call_boundary_arguments_and_indirect_callee_escape_cells() {
+        for inst in [
+            Inst::CallCannotUnwind {
+                callee: FuncId::new(1),
+                args: vec![v(2)],
+            },
+            Inst::CallIndirectCannotUnwind {
+                callee: v(0),
+                sig: FuncTyId::new(0),
+                args: vec![v(2)],
+                calling_conv: trust_ir::CallingConv::C,
+            },
+            Inst::CallIndirectCannotUnwind {
+                callee: v(2),
+                sig: FuncTyId::new(0),
+                args: vec![],
+                calling_conv: trust_ir::CallingConv::C,
+            },
+        ] {
+            let mut function = uninitialized_cell();
+            // The derived pointer escapes before the uninitialized load. A
+            // boundary forbids crossing unwind, not arbitrary callee writes.
+            function.blocks[0].body.insert(2, InstrNode::new(inst));
+            assert!(check_function(&function).is_ok());
+        }
+        let mut function = uninitialized_cell();
+        function.blocks[0].body.insert(
+            2,
+            InstrNode::new(Inst::CallCannotUnwind {
+                callee: FuncId::new(1),
+                args: vec![],
+            }),
+        );
+        assert!(
+            check_function(&function).is_err(),
+            "a boundary with no escaped cell pointer must not invent initialization"
+        );
+    }
+
+    #[test]
+    fn runtime_closure_pointer_capture_escapes_without_inventing_a_store() {
+        for (captures, escapes) in [(vec![v(2), v(2)], true), (vec![v(0)], false)] {
+            let mut function = uninitialized_cell();
+            function.blocks[0].body.insert(
+                2,
+                InstrNode::new(Inst::MakeClosure {
+                    ty: trust_ir::ClosureTyId::new(0),
+                    func: FuncId::new(1),
+                    captures,
+                })
+                .with_result(v(4)),
+            );
+            assert_eq!(
+                check_function(&function).is_ok(),
+                escapes,
+                "only capturing the cell pointer removes its local-only provenance guarantee"
+            );
+        }
+    }
+
     /// A cell whose address is used as a STORE VALUE (stored into other memory)
     /// escapes and is not flagged.
     #[test]
@@ -930,5 +1077,46 @@ mod tests {
             .push(InstrNode::new(Inst::Return { values: vec![v(3)] }));
         f.blocks = vec![bb0];
         assert!(check_function(&f).is_ok());
+    }
+    /// A cell initialized only by a bulk fill (`MemSet`) and then loaded is
+    /// initialized: it must not be flagged.
+    #[test]
+    fn memset_initialized_cell_is_not_flagged() {
+        let mut f = empty_fn();
+        let mut bb0 = Block::new(b(0)).with_param(v(0), Ty::U64);
+        bb0.body.push(
+            InstrNode::new(Inst::Alloca {
+                ty: Ty::I64,
+                count: None,
+                align: None,
+            })
+            .with_result(v(1)),
+        );
+        bb0.body.push(
+            InstrNode::new(Inst::Const {
+                ty: Ty::U8,
+                value: trust_ir::Constant::Int(0),
+            })
+            .with_result(v(2)),
+        );
+        bb0.body.push(InstrNode::new(Inst::MemSet {
+            dst: v(1),
+            byte: v(2),
+            bytes: v(0),
+        }));
+        bb0.body.push(
+            InstrNode::new(Inst::Load {
+                ty: Ty::I64,
+                ptr: v(1),
+                volatile: false,
+                align: None,
+            })
+            .with_result(v(3)),
+        );
+        bb0.body
+            .push(InstrNode::new(Inst::Return { values: vec![v(3)] }));
+        f.blocks = vec![bb0];
+
+        assert_eq!(check_function(&f), Ok(()));
     }
 }

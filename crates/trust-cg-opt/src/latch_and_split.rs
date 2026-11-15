@@ -55,7 +55,7 @@
 //! to order the two tests so the hot path falls through (see
 //! TCG_LATCH_SPLIT_SWAP).
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, CondCode, InstId, MachFunction, MachInst, MachOperand, VReg,
@@ -215,7 +215,7 @@ fn decode_cond(enc: i64) -> Option<CondCode> {
 /// over-approximates). For a boolean defined once and consumed once this is
 /// exactly 2 — anything else means an extra live consumer we must not orphan.
 fn total_operand_appearances(func: &MachFunction) -> HashMap<VReg, u32> {
-    let mut m: HashMap<VReg, u32> = HashMap::new();
+    let mut m: HashMap<VReg, u32> = HashMap::default();
     for &block in &func.block_order {
         for &iid in &func.blocks[block.0 as usize].insts {
             for op in &func.inst(iid).operands {
@@ -230,6 +230,12 @@ fn total_operand_appearances(func: &MachFunction) -> HashMap<VReg, u32> {
 
 fn find_split(func: &MachFunction, hotness: &ProfileHotness) -> Option<SplitPlan> {
     let appearances = total_operand_appearances(func);
+
+    // Both gates are loop-invariant for this scan. Hoisted out of the per-block
+    // walk (read once per call, NOT memoized) so the ordering switch is still
+    // observed by the next call if it is flipped in-process.
+    let log_decisions = log_decisions();
+    let swap_order = swap_order();
 
     for &b in func.block_order.iter() {
         let insts = &func.blocks[b.0 as usize].insts;
@@ -326,7 +332,7 @@ fn find_split(func: &MachFunction, hotness: &ProfileHotness) -> Option<SplitPlan
             continue;
         };
         let in_band = (TAKEN_RATE_LO..=TAKEN_RATE_HI).contains(&rate);
-        if log_decisions() {
+        if log_decisions {
             eprintln!(
                 "[latch-and-split] func={} block={} then={} taken_rate={:.4} verdict={}",
                 func.name,
@@ -357,13 +363,13 @@ fn find_split(func: &MachFunction, hotness: &ProfileHotness) -> Option<SplitPlan
         // default (pair-B first). `TCG_LATCH_SPLIT_SWAP` flips the chosen order
         // for A/B measurement.
         let profile_first_a = rate <= 0.5;
-        let first_a = profile_first_a ^ swap_order();
+        let first_a = profile_first_a ^ swap_order;
         let (x_cmp, x_cond, y_cmp, y_cond) = if first_a {
             (tail[0], cca, tail[2], ccb)
         } else {
             (tail[2], ccb, tail[0], cca)
         };
-        if log_decisions() {
+        if log_decisions {
             eprintln!(
                 "[latch-and-split] func={} block={} order={} (profile_first_a={} swap_env={})",
                 func.name,
@@ -374,7 +380,7 @@ fn find_split(func: &MachFunction, hotness: &ProfileHotness) -> Option<SplitPlan
                     "pair-B-first"
                 },
                 profile_first_a,
-                swap_order()
+                swap_order
             );
         }
 

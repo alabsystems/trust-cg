@@ -7,7 +7,7 @@
 //! (`verdict_db/canary_certs/*.lratcert`), consumed by the per-compile
 //! CERT-SKIP tier (`trust_cg_verify::canary_cert`).
 //!
-//! For each of the sixteen fixed portable canary obligations this tool either
+//! For each of the 33 fixed portable canary obligations this tool either
 //! cryptographically upgrades a query-bound existing proof payload or:
 //!
 //!  1. re-proves the obligation `unsat` with a LIVE run of the real `ay`
@@ -19,7 +19,7 @@
 //!
 //! An existing payload is reusable only when its producer+exact-current-query
 //! key matches and the current checker replays it. Set
-//! `TCG_CANARY_REGEN_ALL=1` to force all sixteen through the fresh AY path.
+//! `TCG_CANARY_REGEN_ALL=1` to force all 33 through the fresh AY path.
 //!
 //! Publishes nothing unless every obligation independently checks and every
 //! distinct staged payload is replayed once more by the exact checker bytes
@@ -35,7 +35,7 @@
 //! Usage (from the repo):
 //!
 //! ```text
-//! cargo run --release -p trust-cg-verify --bin regen_canary_certs [out-dir]
+//! scripts/trust_cargo.sh run --release -p trust-cg-verify --bin regen_canary_certs [out-dir]
 //! ```
 
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from(default_out));
 
     eprintln!(
-        "regen_canary_certs: proving + certifying the canary obligations with a live solver..."
+        "regen_canary_certs: replaying current query-bound certificates; producing missing/stale payloads with AY..."
     );
     let started = std::time::Instant::now();
     match trust_cg_verify::canary_cert::regen_canary_certs(&out_dir) {
@@ -61,6 +61,7 @@ fn main() {
                 out_dir.display(),
             );
             eprintln!("  solver: {}", report.solver_path);
+            eprintln!("  solver-admission: {}", report.solver_admission);
             eprintln!("  solver-sha256: {}", report.solver_identity);
             eprintln!("  drat-trim-sha256: {}", report.checker_identity);
             for (name, len) in &report.certs {
@@ -68,11 +69,11 @@ fn main() {
             }
             eprintln!(
                 "regen_canary_certs: rebuild trust-cg-verify (certs are embedded via \
-                 include_str!) and commit the new .lratcert file(s)"
+                 include_str!) and review the .lratcert files plus manifest.v1"
             );
         }
         Err(e) => {
-            eprintln!("regen_canary_certs: FAILED — nothing committed: {e}");
+            eprintln!("regen_canary_certs: FAILED: {e}");
             std::process::exit(1);
         }
     }

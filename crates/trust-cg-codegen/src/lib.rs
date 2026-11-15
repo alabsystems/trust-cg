@@ -63,6 +63,9 @@ pub const BUILD_FEATURE_IDENTITY: &str =
     };
 
 pub mod aarch64;
+pub mod aarch64_dispatch;
+pub mod aot_frame_inputs;
+pub mod apple_deployment;
 pub mod async_compile_service;
 pub mod ay_lra_proof_manifest;
 pub mod ay_pb_pbo_checked_arithmetic_contract;
@@ -74,10 +77,13 @@ pub mod compile_artifact_cache_profile;
 pub mod compile_policy;
 pub mod compile_service;
 pub mod compiler;
+pub mod composed_transition;
 pub mod constant_pool;
+pub mod core_admission;
 pub mod coreml_emitter;
 pub mod debug_provenance;
 pub mod decode_check;
+pub mod dialect_legalization;
 pub mod dialect_pipeline;
 pub mod dwarf_cfi;
 pub mod dwarf_cfi_decode_check;
@@ -90,11 +96,13 @@ pub use trust_cg_process_env::{
     COMPILER_CONTROL_ENV_PREFIXES, artifact_reuse_environment_safety,
     artifact_reuse_environment_safety_from, artifact_reuse_permit,
 };
+mod aot_profile;
 pub mod error;
 pub mod exception_handling;
 pub mod frame;
 pub mod global_stub;
 pub mod guard_ledger;
+pub mod ingest;
 pub mod interpreter;
 pub mod jit;
 pub mod jit_ay_canary_allowlist;
@@ -104,24 +112,45 @@ pub mod jit_control_plane;
 pub mod jit_diagnostics;
 pub mod jit_install_gate;
 pub mod jit_nomination;
+pub mod jit_page_witness;
 pub mod jit_profile_cache;
 pub mod jit_release;
 pub mod jit_shadow_replay;
 pub mod jit_ty_canary_allowlist;
+pub mod jit_unwind;
 pub mod layout;
+#[cfg(test)]
+#[path = "../../test_support/legacy_module_capture.rs"]
+mod legacy_module_capture;
+pub mod link_driver;
+pub mod lir_module_prep;
+pub mod llsc;
 pub mod loop_align;
 pub mod lower;
 pub mod macho;
 pub mod metal_emitter;
 pub mod module_merge;
+pub mod object_sections;
+mod stack_resources;
+pub use stack_resources::StaticStackFrameReport;
+#[cfg(test)]
+#[path = "../../trust-cg-lower/src/source_scan.rs"]
+mod source_scan;
+pub use aot_profile::AotProfileError;
+mod aarch64_prepared_dump;
 pub mod pgo_runner;
 pub mod pipeline;
+pub use aarch64_prepared_dump::set_directory as set_aarch64_prepared_dump_directory;
+pub mod post_ra_value_flow;
 pub mod proof_evidence;
 pub mod relax;
 pub mod resource_limits;
 pub mod rewrite_admission;
 pub mod riscv;
+pub mod runtime_deps;
+pub mod strict_adapter;
 pub mod target;
+pub mod tier_up;
 pub mod trust_ir_bitfield_builder;
 pub mod ty_reducer_evidence;
 pub mod unwind;
@@ -171,17 +200,70 @@ pub use compile_service::{
     InstallMetadata, InstallProofSummary, InstalledArtifact, ObjectArtifactPayload,
     ProofInstallTelemetrySummary, RawExternBinding, SourceKind,
 };
+#[cfg(feature = "verify")]
+pub use compiler::CoreNativeAggregateSourceEvents;
+#[cfg(feature = "verify")]
+pub use compiler::CoreNativeAggregateTargetEvents;
 pub use compiler::{
-    CompilationMetrics, CompilationResult, CompileError, Compiler, CompilerConfig, CompilerTrace,
-    CompilerTraceLevel, FunctionQualityMetrics, JitCompilationResult, ProofCertificate,
+    CompilationMetrics, CompilationResult, CompileError, Compiler, CompilerConfig,
+    CompilerTargetSelection, CompilerTrace, CompilerTraceLevel, CoreAddressFreeFixup,
+    CoreAddressFreeFixupInventory, CoreAddressFreeFixupTarget, CoreAddressFreeMachineArtifact,
+    CoreAddressFreeMachineCompilationError, CoreAddressFreeMachineCompilationFailure,
+    CoreAddressFreeMachineIdentity, CoreAggregateResultFunction, CoreAggregateResultTransportError,
+    CoreAggregateResultTransports, CoreJitCompilationPlan, CoreJitEffectiveOptions,
+    CoreJitFastRegallocSelection, CoreJitPlanIdentity, CoreJitPlanningError,
+    CoreJitPlanningFailure, CoreJitProofGradeQualificationError,
+    CoreJitProofGradeQualificationFailure, FunctionQualityMetrics, JitCompilationResult,
+    PolicyQualifiedCoreJitCompilationPlan, ProofCertificate, TargetSelectionOrigin,
+};
+#[cfg(feature = "verify")]
+pub use compiler::{CoreRejectedFrameContext, CoreRejectedFrameError};
+pub use core_admission::{
+    CORE_DECLARED_IMPORT_MANIFEST_SCHEMA, CORE_DECLARED_IMPORT_MANIFEST_SCHEMA_VERSION,
+    CORE_LIR_NATIVE_DEPENDENCY_BINDINGS_SCHEMA, CORE_LIR_NATIVE_DEPENDENCY_BINDINGS_SCHEMA_VERSION,
+    CORE_NATIVE_DEPENDENCY_REFERENCE_MAP_SCHEMA,
+    CORE_NATIVE_DEPENDENCY_REFERENCE_MAP_SCHEMA_VERSION, CORE_NATIVE_RUNTIME_CATALOG_SCHEMA,
+    CORE_NATIVE_RUNTIME_CATALOG_SCHEMA_VERSION, CORE_TARGET_CONTRACT_SCHEMA,
+    CORE_TARGET_CONTRACT_SCHEMA_VERSION, CoreAdmissionError, CoreAdmissionFailure,
+    CoreAdmittedModule, CoreArenaCensus, CoreConsumptionIntegrityError, CoreDeclaredImportManifest,
+    CoreDeclaredImportManifestError, CoreExecutableSurface, CoreHostDeterminism,
+    CoreHostFunctionEffects, CoreHostFunctionImport, CoreHostGlobalImport, CoreHostImport,
+    CoreHostJitMachineProfile, CoreHostJitTarget, CoreHostMemoryEffect, CoreJitPlanIntegrityError,
+    CoreLirNativeDependencyBinding, CoreLirNativeDependencyBindingCoverage,
+    CoreLirNativeDependencyBindingError, CoreLirNativeDependencyBindings, CoreModuleClosureError,
+    CoreNativeDependencyOrigin, CoreNativeDependencyReference,
+    CoreNativeDependencyReferenceCoverage, CoreNativeDependencyReferenceMap,
+    CoreNativeDependencyReferenceMapError, CoreNativeRuntimeCatalog,
+    CoreNativeRuntimeCatalogCoverage, CoreNativeRuntimeCatalogError, CoreNativeRuntimeEntry,
+    CorePermittedNativeMode, CoreProofCensus, CoreRuntimeIdentity, CoreSharedAdmissionFailure,
+    CoreTargetContract, CoreTargetContractError, CoreTrustedEvidenceOccurrence,
+    IDENTITY_CORE_POLICY_SCHEMA, IDENTITY_CORE_POLICY_SCHEMA_VERSION, IdentityCorePolicy,
+    IdentityTransformReceipt, admit_identity_core_module_for_host_jit,
+    try_admit_identity_core_module_for_host_jit,
+    try_admit_shared_identity_core_module_for_host_jit,
 };
 pub use error::{CodegenError, TrustCgError};
+pub use lir_module_prep::{
+    AdmittedInlineOnlyBodies, INLINE_ONLY_BODIES_KILL_SWITCH, InlineOnlyAdmission,
+    InlineOnlyAuthentication, InlineOnlyAuthority, InlineOnlyBodyEvidence,
+    JIT_LIR_PREPARE_KILL_SWITCH, JitExternBindings, LirModulePreparation, admit_inline_only_bodies,
+    admit_inline_only_bodies_with_authority, jit_interposable_definitions, prepare_jit_lir_module,
+    prepare_jit_lir_module_with_authority, unvalidated_lir_passes_run,
+};
+pub use tier_up::{
+    ServiceTierBackend, TIER_UP_MAX_TIERS, TIER_UP_REPORT_SCHEMA, TierBackend, TierEntryError,
+    TierEntryTable, TierExport, TierFailure, TierInstall, TierInstaller, TierOutcome, TierOutput,
+    TierPlan, TierPlanError, TierRecord, TierRefusal, TierRequest, TierStartFailure, TierUpPoll,
+    TierUpReport, TierUpSession,
+};
+// trust-ir v41 codegen license: the adapter decides it, the compiler, service and
+// CLI configure it, so the policy vocabulary is reachable from this crate root.
 pub use interpreter::{
     InterpreterConfig, InterpreterError, InterpreterValue, interpret, interpret_with_config,
 };
 pub use jit::{
-    ExecutableBuffer, JitCompiler, JitConfig, JitError, ProfileHookMode, ProfileStats,
-    ensure_jit_execute_mode,
+    ExecutableBuffer, JitCompiler, JitConfig, JitError, JitExternalSymbolResolutionPolicy,
+    ProfileHookMode, ProfileStats, ensure_jit_execute_mode,
 };
 pub use jit_ay_canary_allowlist::{
     AYCanaryActivationPrecheckDecision, AYCanaryAllowlist, AYCanaryAllowlistDecision,
@@ -556,18 +638,19 @@ pub use pgo_runner::{
     TRUST_CG_HOST_JIT_PGO_PROVENANCE_DESCRIPTOR_SCHEMA,
     TRUST_CG_HOST_JIT_PGO_PROVENANCE_DESCRIPTOR_SCHEMA_VERSION, TRUST_CG_PROFILE_REPORT_SCHEMA_V1,
     TY_PARENT_SUMMARY_SLOTS, TyParentLoopSummary, compile_host_jit_with_profile_use,
-    compile_host_jit_with_profile_use_and_symbols, host_jit_pgo_provenance_descriptor,
+    compile_host_jit_with_profile_use_and_symbols,
+    compile_host_jit_with_profile_use_and_symbols_and_license, host_jit_pgo_provenance_descriptor,
     pgo_cache_key, pgo_opt_level_name, pgo_opt_level_num, pgo_target_cpu, pgo_target_features,
     pgo_target_triple, profile_use_enables_optimization, run_host_jit_pgo,
-    run_host_jit_pgo_with_symbols,
+    run_host_jit_pgo_with_symbols, run_host_jit_pgo_with_symbols_and_license,
 };
 pub use pipeline::{
-    AArch64ModuleEmission, CegisPassRun, CegisPassStats, CegisRunOutcome, CoreMLOutput,
-    DispatchVerifyMode, FormatMode, InputFormat, PhaseTimings, Pipeline, PipelineConfig,
-    PipelineError, PreparationMetrics, ProofOptimizationCertificateCitation,
-    ProofOptimizationConsumedFactCitation, compile_to_object, detect_input_format,
-    emit_coreml_program, generate_cpu_only_plan, generate_lsda_for_function, load_module,
-    load_module_as, load_module_from_bytes,
+    AArch64ModuleEmission, CegisPassRun, CegisPassStats, CegisRunOutcome, CheckedAarch64Function,
+    CheckedAarch64Functions, CoreMLOutput, DispatchVerifyMode, FormatMode, InputFormat,
+    PhaseTimings, Pipeline, PipelineConfig, PipelineError, PreparationMetrics,
+    ProofOptimizationCertificateCitation, ProofOptimizationConsumedFactCitation, compile_to_object,
+    decode_binary, detect_input_format, emit_coreml_program, generate_cpu_only_plan,
+    generate_lsda_for_function, load_module, load_module_as, load_module_from_bytes,
 };
 pub use relax::{BranchRelaxation, RelaxError, RelaxedCode};
 pub use rewrite_admission::{
@@ -575,14 +658,138 @@ pub use rewrite_admission::{
     REWRITE_ADMISSION_RECORD_SCHEMA_VERSION, RewriteAdmissionDisposition, RewriteAdmissionRecord,
     RewriteAdmissionRejection,
 };
+pub use strict_adapter::{
+    StrictCoreAdapterError, StrictCoreAdapterResult, StrictCoreAdapterTarget,
+    StrictCoreObjectFormat, translate_core_module_for_target_with_validation,
+};
 pub use target::{
     AArch64IsaFeature, AArch64IsaProfile, AArch64MachineCodeEvidence, AArch64TargetMachine,
     AdmittedTargetFeatures, CallingConvention, OutputTargetFeatures, RiscVIsaFeature, Target,
     TargetFeature, TargetFeatureSet, TargetFeatureSetError, TargetIdentity, TargetMachine,
     TargetMachineError, host_has_aarch64_dotprod, host_has_aarch64_fp16, host_has_aarch64_lse,
 };
+pub use trust_cg_ir::NativeDependencyId;
+// The JIT's rule for an explicit `Global.section`, for every JIT lane: the
+// compiler's JIT entry and a consumer's own JIT lane assembled from trust-cg
+// parts call the same function.
+pub use object_sections::refuse_jit_object_sections;
+pub use trust_cg_lower::{
+    AuthenticatedImportSet, CLEAN_KERNEL_TV_AUTHORITY, CodegenLicensePolicy, DefinitionBinding,
+    LinkedDependency, LinkedImportRefusal, MUTATION_KNOBS, RelocationModel, SymbolBinding,
+    UnlicensedBodyPolicy, UnlicensedPermitException, authenticate_linked_imports,
+    definition_is_link_replaceable,
+};
+// The x86 vectorizer's tracked trace/opt-out settings, re-exported so an
+// embedder that depends only on this crate (the rustc bridge) can forward its
+// `-Ztrust-ir-cg-args` knobs without a direct `trust-cg-opt` dependency. Under
+// trustc the passes' `TCG_*` environment fallbacks are refused before the
+// backend loads, so these setters are the only channel that reaches them.
+pub use loop_align::set_a64_loop_head_align_enabled;
+pub use pipeline::set_x86_spill_reload_cse_xblock_enabled;
+pub use trust_cg_lower::x86_64_isel::set_x86_jump_table_disabled;
+pub use trust_cg_opt::and_cmp_fuse::set_and_cmp_fuse_rr_enabled;
+pub use trust_cg_opt::loop_unroll::set_const_addr_unroll_disabled;
+pub use trust_cg_opt::loop_unroll::set_partial_unroll_disabled;
+pub use trust_cg_opt::loop_unroll::set_runtime_partial_unroll_enabled;
+pub use trust_cg_opt::x86_block_merge::set_block_merge_disabled as set_x86_block_merge_disabled;
+pub use trust_cg_opt::x86_bounds_check_elim::set_bce_carrier_enabled as set_x86_bce_carrier_enabled;
+pub use trust_cg_opt::x86_bounds_check_elim::set_bce_disabled as set_x86_bce_disabled;
+pub use trust_cg_opt::x86_bounds_check_elim::set_bce_early_copy_disabled as set_x86_bce_early_copy_disabled;
+pub use trust_cg_opt::x86_bounds_check_elim::set_bce_pointer_reload_enabled as set_x86_bce_pointer_reload_enabled;
+pub use trust_cg_opt::x86_bounds_check_elim::set_bce_reload_disabled as set_x86_bce_reload_disabled;
+pub use trust_cg_opt::x86_bounds_check_elim::set_bce_trace_enabled as set_x86_bce_trace_enabled;
+pub use trust_cg_opt::x86_copy_prop::set_alu_barrier_rewrite_enabled as set_x86_copyprop_alu_enabled;
+pub use trust_cg_opt::x86_cse::set_cse_load_transparent_enabled as set_x86_cse_load_transparent_enabled;
+pub use trust_cg_opt::x86_latch_dup::set_x86_latch_dup_enabled;
+pub use trust_cg_opt::x86_latch_dup::set_x86_latch_dup_max_insts;
+pub use trust_cg_opt::x86_latch_dup::set_x86_latch_dup_trace_enabled;
+pub use trust_cg_opt::x86_licm::set_guarded_hoist_enabled as set_x86_licm_guarded_hoist_enabled;
+pub use trust_cg_opt::x86_licm::set_licm_disabled as set_x86_licm_disabled;
+pub use trust_cg_opt::x86_licm::set_outer_iv_invariance_enabled as set_x86_licm_outer_iv_enabled;
+pub use trust_cg_opt::x86_licm::set_pointer_base_loads_disabled as set_x86_licm_pointer_base_loads_disabled;
+pub use trust_cg_opt::x86_licm::set_pure_call_hoist_disabled as set_x86_pure_call_hoist_disabled;
+pub use trust_cg_opt::x86_loop_simplify::set_x86_loop_simplify_enabled;
+pub use trust_cg_opt::x86_loop_simplify::set_x86_loop_simplify_trace_enabled;
+pub use trust_cg_opt::x86_loop_top::set_x86_loop_top_enabled;
+pub use trust_cg_opt::x86_loop_top::set_x86_loop_top_trace_enabled;
+pub use trust_cg_opt::x86_loop_top::x86_loop_top_registered;
+pub use trust_cg_opt::x86_loop_unroll::set_loop_unroll_disabled as set_x86_loop_unroll_disabled;
+pub use trust_cg_opt::x86_peephole::set_add_fuse_disabled as set_x86_add_fuse_disabled;
+pub use trust_cg_opt::x86_peephole::set_latch_advance_window_enabled as set_x86_latch_advance_window_enabled;
+pub use trust_cg_opt::x86_peephole::set_lea_writeback_disabled as set_x86_lea_writeback_disabled;
+pub use trust_cg_opt::x86_peephole::set_peephole_entry_trace_enabled as set_x86_peephole_entry_trace_enabled;
+pub use trust_cg_opt::x86_peephole::set_rmw_fuse_disabled as set_x86_rmw_fuse_disabled;
+pub use trust_cg_opt::x86_peephole::set_rmw_fuse_sdef_disabled as set_x86_rmw_fuse_sdef_disabled;
+pub use trust_cg_opt::x86_peephole::set_rmw_fuse_trace_enabled;
+pub use trust_cg_opt::x86_peephole::set_sib_crossblock_flags_disabled as set_x86_sib_crossblock_flags_disabled;
+pub use trust_cg_opt::x86_peephole::set_sib_scale1_fold_disabled as set_x86_sib_scale1_fold_disabled;
+pub use trust_cg_opt::x86_peephole::set_test_elide_enabled as set_x86_test_elide_enabled;
+pub use trust_cg_opt::x86_rotate::set_loop_rotate_disabled as set_x86_loop_rotate_disabled;
+pub use trust_cg_opt::x86_slot_forward::set_slot_forward_disabled as set_x86_slot_forward_disabled;
+pub use trust_cg_opt::x86_slot_forward::set_slot_forward_trace_enabled as set_x86_slot_forward_trace_enabled;
+pub use trust_cg_opt::x86_sroa::set_sroa_multi_block_enabled as set_x86_sroa_multi_block_enabled;
+pub use trust_cg_opt::x86_sroa::set_trace_enabled as set_x86_sroa_trace_enabled;
+pub use trust_cg_opt::x86_strength_reduce::set_flag_safe_seed_enabled as set_x86_sr_flag_safe_seed_enabled;
+pub use trust_cg_opt::x86_strength_reduce::set_strength_reduce_disabled as set_x86_strength_reduce_disabled;
+pub use trust_cg_opt::x86_strength_reduce::set_strength_reduce_trace_enabled as set_x86_strength_reduce_trace_enabled;
+pub use trust_cg_opt::x86_two_addr_expand::set_commute_enabled as set_x86_twoaddr_commute_enabled;
+pub use trust_cg_opt::x86_two_addr_expand::set_expand_all_enabled as set_x86_twoaddr_expand_all_enabled;
+pub use trust_cg_opt::x86_two_addr_expand::set_register_enabled as set_x86_twoaddr_expand_enabled;
+pub use trust_cg_opt::x86_vectorize::set_bound_remat_disabled as set_x86_vec_bound_remat_disabled;
+pub use trust_cg_opt::x86_vectorize::set_regarg_disabled as set_x86_vec_regarg_disabled;
+pub use trust_cg_opt::x86_vectorize::set_regarg_unroll_k as set_x86_vec_unroll_k;
+pub use trust_cg_opt::x86_vectorize::set_saxpyq_scalar_mul_enabled as set_x86_saxpyq_scalar_mul_enabled;
+pub use trust_cg_opt::x86_vectorize::set_vec_ownlen_reload_disabled as set_x86_vec_ownlen_reload_disabled;
+pub use trust_cg_opt::x86_vectorize::set_x86_rowreg_memory_rmw_disabled;
+pub use trust_cg_opt::x86_vectorize::set_x86_rowreg_packed_mul_enabled;
+pub use trust_cg_opt::x86_vectorize::x86_rowreg_memory_rmw_withheld;
+pub use trust_cg_opt::x86_vectorize::{
+    set_bail_trace_enabled as set_x86_vectorize_bail_trace_enabled,
+    set_const_bound_disabled as set_x86_vectorize_const_bound_disabled,
+    set_fill_memset_disabled as set_x86_fill_memset_disabled,
+    set_late_run_enabled as set_x86_vectorize_late_enabled,
+    set_post_sroa_run_disabled as set_x86_vectorize_post_sroa_disabled,
+    set_raise_sink_disabled as set_x86_vectorize_raise_sink_disabled,
+    set_trace_dump_enabled as set_x86_vectorize_trace_dump_enabled,
+    set_trace_enabled as set_x86_vectorize_trace_enabled,
+    set_zero_remainder_disabled as set_x86_vec_zero_remainder_disabled,
+};
+pub use trust_cg_opt::x86_xorshift_demanded_bits::set_x86_xorshift_demanded_bits_disabled;
+pub use trust_cg_opt::x86_xorshift_demanded_bits::set_x86_xorshift_demanded_bits_trace_enabled;
 pub use ty_reducer_evidence::{
     TY_REDUCER_EVIDENCE_PACKET_SCHEMA, TY_REDUCER_EVIDENCE_PACKET_SCHEMA_VERSION,
     TyReducerCallbackObservation, TyReducerEvidencePacket, TyReducerEvidenceRow,
     TyReducerEvidenceStatus,
 };
+pub use x86_64::pipeline::set_branch_layout_fallthrough_enabled as set_x86_branch_layout_fallthrough_enabled;
+pub use x86_64::pipeline::set_jcc_align_disabled as set_x86_jcc_align_disabled;
+pub use x86_64::pipeline::set_vectorize_disabled as set_x86_vectorize_disabled;
+pub use x86_64::pipeline::set_x86_branch_layout_disabled;
+pub use x86_64::pipeline::set_x86_cmov_swap_disabled;
+pub use x86_64::pipeline::set_x86_cold_arm_sink_enabled;
+pub use x86_64::pipeline::set_x86_cold_trap_layout_disabled;
+pub use x86_64::pipeline::set_x86_if_convert_disabled;
+pub use x86_64::pipeline::set_x86_lea_writeback_collapse_enabled;
+pub use x86_64::pipeline::set_x86_licm_loads_disabled;
+pub use x86_64::pipeline::set_x86_loop_align_log_enabled;
+pub use x86_64::pipeline::set_x86_loop_align_max_body;
+pub use x86_64::pipeline::set_x86_loop_align_max_skip;
+pub use x86_64::pipeline::set_x86_loop_align_seam_pad;
+pub use x86_64::pipeline::set_x86_loop_exit_layout_disabled;
+pub use x86_64::pipeline::set_x86_loop_head_align_disabled;
+pub use x86_64::pipeline::set_x86_reload_elide_disabled;
+pub use x86_64::pipeline::set_x86_sroa_disabled;
+
+/// The codegen license the crate's unit tests compile their hand-built
+/// fixtures under. Those fixtures carry no codegen license (`body_gate:
+/// None`), which trust-cg REFUSES by default (roadmap WS7.5, decision gate
+/// DG-73), so they state `Permit` explicitly: none of them passes (or is
+/// refused) because the license silently refused it. Declared under a plain
+/// `#[cfg(test)]`, so the production `Permit` census never counts it.
+#[cfg(test)]
+pub(crate) mod license_test_support {
+    /// The default policy with claim-less bodies permitted.
+    pub(crate) fn permit_unlicensed() -> crate::CodegenLicensePolicy {
+        crate::CodegenLicensePolicy::default().with_unlicensed(crate::UnlicensedBodyPolicy::Permit)
+    }
+}

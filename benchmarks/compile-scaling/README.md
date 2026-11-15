@@ -49,6 +49,13 @@ Fails when trust-cg's exponent exceeds LLVM's by more than `--max-excess`
 ./run.py --max-excess 0.3      # tighten the ratchet
 ```
 
+Both arms compile for the resolved Trust compiler's host. The backend is the
+newest built `librustc_codegen_trust_cg` with this host's shared-library suffix
+(`scripts/bridge_backend.py`), or `--dylib`; a backend older than its build
+inputs is refused unless `--allow-stale-dylib` is given, and such a run is not
+evidence. The trust-cg arm passes `no-proof-certs` and `refine-solver=0`, so
+every exponent here is a proofs-off measurement.
+
 ## Current state
 
 It is a **ratchet**. It was committed failing on two shapes; both have since been
@@ -71,3 +78,13 @@ regression.
 
 Do not "fix" a failure here by relaxing `--max-excess`. Either land the upstream
 patch, or change the driver design deliberately and say so.
+
+These ladders stop at 400 functions, so they missed the growth
+`beat-llvm/scale_gate.py` found on `aarch64-apple-darwin` at 800 and 2,400 functions
+(L14-P6). That growth was quadratic in the number of calls in one basic block: the
+pre-RA scheduler's call-barrier edges and three register-allocation scans. The
+fixes and measurements are in
+[the L14-P6 report](../../reports/perf/2026-09-28-darwin-scaling-l14p6/README.md).
+`crates/trust-cg-codegen/tests/aarch64_compile_scaling.rs` now bounds that shape
+with deterministic metrics (heap bytes and allocations, instructions retired on
+macOS), without a driver.

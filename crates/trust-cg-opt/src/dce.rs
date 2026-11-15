@@ -35,7 +35,7 @@
 //!
 //! Reference: LLVM `DeadMachineInstrElim.cpp`
 
-use std::collections::HashSet;
+use crate::fast_hash::FxHashSet as HashSet;
 
 use serde::{Deserialize, Serialize};
 use trust_cg_ir::{
@@ -45,7 +45,8 @@ use trust_cg_ir::{
 use crate::cache::StableHasher;
 use crate::effects::{
     MemoryEffect, aarch64_for_each_def_position, aarch64_for_each_use_position,
-    aarch64_use_operand_positions, opcode_effect, reads_flags, single_inst_def, writes_flags,
+    aarch64_use_operand_positions, definitely_writes_flags, nzcv_unknown, opcode_effect,
+    reads_nzcv, single_inst_def,
 };
 use crate::pass_manager::{
     CertifiedPassCheckerRecord, CertifiedPassRunRecord, CertifiedPassRunStatus, MachinePass,
@@ -370,7 +371,10 @@ fn run_impl(
     let mut changed = false;
     let mut certificates = Vec::new();
     let mut failures = Vec::new();
-    let mut seen_failures = HashSet::new();
+    let mut seen_failures = HashSet::default();
+    // Keep originals through every removal wave: certificates may name a
+    // NextWriter that is itself removed later. Tombstones are not proof inputs.
+    let mut retired_flag_writes = HashSet::default();
 
     loop {
         // Step 1: Collect all VRegs that are *used* (appear as source
@@ -380,8 +384,8 @@ fn run_impl(
         // Step 2: Find instructions to remove. An instruction is dead if:
         //   (a) it defines a VReg not in the used set, AND
         //   (b) it has no side effects.
-        let mut dead_insts: HashSet<InstId> = HashSet::new();
-        let mut dead_flag_writes: HashSet<InstId> = HashSet::new();
+        let mut dead_insts: HashSet<InstId> = HashSet::default();
+        let mut dead_flag_writes: HashSet<InstId> = HashSet::default();
         // NZCV liveness for this wave (removals change positions, so per wave).
         let nzcv = NzcvLiveness::compute(func);
 
@@ -506,14 +510,13 @@ fn run_impl(
             let mut removed: Vec<_> = dead_insts.iter().copied().collect();
             removed.sort_unstable();
             for inst_id in removed {
+                if dead_flag_writes.contains(&inst_id) {
+                    continue;
+                }
                 provenance.record_deletion(
                     inst_id,
                     PassId::new("dce"),
-                    if dead_flag_writes.contains(&inst_id) {
-                        "flags-only write overwritten before any NZCV reader"
-                    } else {
-                        "unused instruction has no side effects"
-                    },
+                    "unused instruction has no side effects",
                 );
             }
         }
@@ -521,6 +524,33 @@ fn run_impl(
         for block_id in func.block_order.clone() {
             let block = func.block_mut(block_id);
             block.insts.retain(|id| !dead_insts.contains(id));
+        }
+        retired_flag_writes.extend(dead_flag_writes);
+    }
+
+    // One whole-function link scan, not one scan per removed ID. In particular,
+    // a block omitted from block_order still owns its instruction references.
+    // Never sweep unrelated pre-existing orphan arena entries.
+    if !retired_flag_writes.is_empty() {
+        for block in &func.blocks {
+            for id in &block.insts {
+                retired_flag_writes.remove(id);
+            }
+        }
+        let mut retired: Vec<_> = retired_flag_writes.into_iter().collect();
+        retired.sort_unstable();
+        for id in retired {
+            if let Some(provenance) = provenance.as_deref_mut() {
+                provenance.record_deletion(
+                    id,
+                    PassId::new("dce"),
+                    "flags-only write dead before any NZCV reader on every path",
+                );
+            }
+            // Stable IDs and lowering-provenance sidecars remain historical.
+            // Drop the removed instruction's executable operands/metadata only
+            // after the original local checker snapshots have been retained.
+            *func.inst_mut(id) = trust_cg_ir::MachInst::new(AArch64Opcode::Nop, vec![]);
         }
     }
 
@@ -549,7 +579,7 @@ fn push_unique_dce_failure(
 
 /// Collect all VRegs that appear as source operands in the shared role model.
 fn collect_used_vregs(func: &MachFunction) -> HashSet<VReg> {
-    let mut used = HashSet::new();
+    let mut used = HashSet::default();
 
     for block_id in &func.block_order {
         let block = func.block(*block_id);
@@ -598,6 +628,69 @@ fn is_flags_only_writer(opcode: AArch64Opcode) -> bool {
     )
 }
 
+/// The exact existing encoder grammar for the removable integer CMP/TST slice,
+/// also admitting well-typed in-arena VRegs before register allocation. Invalid
+/// effects/shapes stay visible for later refusal; an annotation is not licensed
+/// for erasure merely because the instruction's NZCV result is dead.
+fn canonical_flags_only_writer(func: &MachFunction, inst: &trust_cg_ir::MachInst) -> bool {
+    use AArch64Opcode::*;
+    if !is_flags_only_writer(inst.opcode)
+        || inst.flags != inst.opcode.default_flags()
+        || !inst.implicit_defs.is_empty()
+        || !inst.implicit_uses.is_empty()
+        || inst.proof.is_some()
+    {
+        return false;
+    }
+    let [lhs, rhs] = inst.operands.as_slice() else {
+        return false;
+    };
+    let immediate_cmp = matches!(inst.opcode, CmpRI | CMPWri | CMPXri);
+    let Some(width) = comparison_register_width(func, lhs, immediate_cmp) else {
+        return false;
+    };
+    if matches!(inst.opcode, CMPWrr | CMPWri) && width != 32
+        || matches!(inst.opcode, CMPXrr | CMPXri) && width != 64
+    {
+        return false;
+    }
+    if immediate_cmp {
+        matches!(rhs, MachOperand::Imm(0..=4095))
+    } else if inst.opcode == Tst
+        && let MachOperand::Imm(mask) = rhs
+    {
+        crate::const_materialize::is_logical_immediate(*mask as u64, width)
+    } else {
+        comparison_register_width(func, rhs, false) == Some(width)
+    }
+}
+
+/// Register 31 is SP for immediate CMP and ZR for register CMP/TST. These
+/// encodable domains are intentionally not inferred from generic use roles.
+fn comparison_register_width(
+    func: &MachFunction,
+    operand: &MachOperand,
+    immediate_cmp: bool,
+) -> Option<u32> {
+    use trust_cg_ir::regs::{RegClass, SpecialReg};
+    match operand {
+        MachOperand::VReg(vreg) if vreg.id < func.next_vreg => match vreg.class {
+            RegClass::Gpr32 => Some(32),
+            RegClass::Gpr64 => Some(64),
+            _ => None,
+        },
+        MachOperand::PReg(reg) => match (reg.encoding(), immediate_cmp) {
+            (0..=30, _) | (31, true) | (160, false) => Some(64),
+            (32..=62, _) | (63, true) | (161, false) => Some(32),
+            _ => None,
+        },
+        MachOperand::Special(SpecialReg::SP) if immediate_cmp => Some(64),
+        MachOperand::Special(SpecialReg::XZR) if !immediate_cmp => Some(64),
+        MachOperand::Special(SpecialReg::WZR) if !immediate_cmp => Some(32),
+        _ => None,
+    }
+}
+
 /// `TCG_TRACE_DEADFLAGS=1`: why a cross-block flag-liveness scan answered
 /// "live" (diagnostic; one line per refusal).
 fn trace_dead_flags(msg: impl FnOnce() -> String) {
@@ -605,12 +698,6 @@ fn trace_dead_flags(msg: impl FnOnce() -> String) {
     if *ON.get_or_init(|| std::env::var_os("TCG_TRACE_DEADFLAGS").is_some()) {
         eprintln!("TCG_DEADFLAGS live: {}", msg());
     }
-}
-
-/// Conditional branches read NZCV without being in `effects::reads_flags`
-/// (they are branches, not value producers).
-fn branch_reads_flags(opcode: AArch64Opcode) -> bool {
-    matches!(opcode, AArch64Opcode::BCond | AArch64Opcode::Bcc)
 }
 
 /// What an instruction does to a live NZCV value, for the liveness below.
@@ -636,23 +723,42 @@ struct NzcvLiveness {
     events: Vec<Vec<(usize, FlagEvent, u32)>>,
     /// Per block: NZCV live on entry.
     live_in: Vec<bool>,
+    /// Flags-only IDs linked exactly once across ALL blocks. Removing a shared
+    /// ID based on one dead occurrence must not erase another live occurrence.
+    unique_flag_writes: HashSet<InstId>,
 }
 
 impl NzcvLiveness {
-    fn event_of(inst: &trust_cg_ir::MachInst) -> Option<FlagEvent> {
+    fn event_of(func: &MachFunction, inst: &trust_cg_ir::MachInst) -> Option<FlagEvent> {
         let op = inst.opcode;
-        if reads_flags(op) || branch_reads_flags(op) {
+        if reads_nzcv(inst) {
             return Some(FlagEvent::Read);
         }
-        if writes_flags(op) {
-            return Some(FlagEvent::Kill);
+        if nzcv_unknown(inst) {
+            return Some(FlagEvent::Opaque);
         }
-        if !inst.is_call()
-            && ((inst.is_pseudo() && !inst.is_nop())
-                || !inst.implicit_defs.is_empty()
-                || !inst.implicit_uses.is_empty())
+        // Preserve DCE's conservative reader-after-call policy. Ordinary ABI
+        // argument/clobber lists are not NZCV reads; explicit NZCV operands
+        // have already been handled above. A forged IS_CALL bit is not an ABI.
+        if op.default_flags().contains(InstFlags::IS_CALL) {
+            return None;
+        }
+        if (inst.is_pseudo() && !inst.is_nop())
+            || !inst.implicit_defs.is_empty()
+            || !inst.implicit_uses.is_empty()
         {
             return Some(FlagEvent::Opaque);
+        }
+        if definitely_writes_flags(op) {
+            // Do not let a malformed or annotated comparison hide an earlier
+            // producer by claiming a well-formed guaranteed overwrite.
+            return Some(
+                if is_flags_only_writer(op) && !canonical_flags_only_writer(func, inst) {
+                    FlagEvent::Opaque
+                } else {
+                    FlagEvent::Kill
+                },
+            );
         }
         None
     }
@@ -660,17 +766,23 @@ impl NzcvLiveness {
     fn compute(func: &MachFunction) -> Self {
         let nblocks = func.blocks.len();
         let mut events: Vec<Vec<(usize, FlagEvent, u32)>> = vec![Vec::new(); nblocks];
+        let mut unique_flag_writes = HashSet::default();
+        let mut shared_flag_writes = HashSet::default();
         for (b, block) in func.blocks.iter().enumerate() {
             for (pos, &inst_id) in block.insts.iter().enumerate() {
                 let Some(inst) = func.insts.get(inst_id.0 as usize) else {
                     events[b].push((pos, FlagEvent::Opaque, inst_id.0));
                     continue;
                 };
-                if let Some(ev) = Self::event_of(inst) {
+                if is_flags_only_writer(inst.opcode) && !unique_flag_writes.insert(inst_id) {
+                    shared_flag_writes.insert(inst_id);
+                }
+                if let Some(ev) = Self::event_of(func, inst) {
                     events[b].push((pos, ev, inst_id.0));
                 }
             }
         }
+        unique_flag_writes.retain(|id| !shared_flag_writes.contains(id));
         // Least fixpoint: live_in[b] = first event is Read/Opaque, or (no
         // event) any successor live on entry.
         let mut live_in = vec![false; nblocks];
@@ -694,7 +806,11 @@ impl NzcvLiveness {
                 break;
             }
         }
-        Self { events, live_in }
+        Self {
+            events,
+            live_in,
+            unique_flag_writes,
+        }
     }
 
     /// If the NZCV written by the flags-only writer at `pos` of block `b` is
@@ -703,11 +819,9 @@ impl NzcvLiveness {
     /// facts; `None` when a reader or something opaque comes first.
     fn dead_flags_write(&self, func: &MachFunction, b: usize, pos: usize) -> Option<DceFlagsFacts> {
         let block = func.blocks.get(b)?;
-        let inst = func.inst(*block.insts.get(pos)?);
-        if !is_flags_only_writer(inst.opcode)
-            || !inst.implicit_defs.is_empty()
-            || !inst.implicit_uses.is_empty()
-        {
+        let id = *block.insts.get(pos)?;
+        let inst = func.inst(id);
+        if !self.unique_flag_writes.contains(&id) || !canonical_flags_only_writer(func, inst) {
             return None;
         }
         let evs = &self.events[b];
@@ -924,6 +1038,7 @@ fn format_operand(operand: &MachOperand) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dce_obligation_hash(
     inst_id: InstId,
     source_opcode: &str,
@@ -1022,6 +1137,10 @@ fn check_dce_obligation(
 }
 
 #[cfg(test)]
+#[path = "dce_retirement_tests.rs"]
+mod retirement_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::pass_manager::{AnalysisCache, MachinePass};
@@ -1050,6 +1169,7 @@ mod tests {
             let id = func.push_inst(inst);
             func.append_inst(block, id);
         }
+        func.try_sync_vreg_counter().expect("test VReg arena fits");
         func
     }
 
@@ -1448,6 +1568,7 @@ mod tests {
             func.add_edge(entry, body);
             func.add_edge(body, body);
             func.add_edge(body, exit);
+            func.try_sync_vreg_counter().expect("test VReg arena fits");
             (func, dead)
         };
 
@@ -1759,14 +1880,14 @@ mod tests {
         let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
         let mut func = make_func_with_insts(vec![add, ret]);
 
-        let mut graph_outputs = HashSet::new();
+        let mut graph_outputs = HashSet::default();
         graph_outputs.insert(0);
         let mut dce = DeadCodeElimination;
         let run = dce.run_certified_with_options(
             &mut func,
             DceCertifiedOptions {
                 graph_output_vregs: graph_outputs,
-                certificate_visible_vregs: HashSet::new(),
+                certificate_visible_vregs: HashSet::default(),
             },
         );
 
@@ -1786,13 +1907,13 @@ mod tests {
         let ret = MachInst::new(AArch64Opcode::Ret, vec![]);
         let mut func = make_func_with_insts(vec![add, ret]);
 
-        let mut certificate_visible = HashSet::new();
+        let mut certificate_visible = HashSet::default();
         certificate_visible.insert(0);
         let mut dce = DeadCodeElimination;
         let run = dce.run_certified_with_options(
             &mut func,
             DceCertifiedOptions {
-                graph_output_vregs: HashSet::new(),
+                graph_output_vregs: HashSet::default(),
                 certificate_visible_vregs: certificate_visible,
             },
         );
@@ -1853,5 +1974,89 @@ mod tests {
 
         let block = func.block(func.entry);
         assert_eq!(block.insts.len(), 3);
+    }
+
+    fn mrs_observed_before_overwrite(with_mrs: bool) -> MachFunction {
+        let mut insts = vec![
+            MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]).with_source_loc(
+                trust_cg_ir::SourceLoc {
+                    file: 3,
+                    line: 8,
+                    col: 5,
+                },
+            ),
+        ];
+        if with_mrs {
+            insts.extend([
+                MachInst::new(AArch64Opcode::Mrs, vec![vreg(2), imm(0xDA10)]).with_source_loc(
+                    trust_cg_ir::SourceLoc {
+                        file: 3,
+                        line: 9,
+                        col: 7,
+                    },
+                ),
+                MachInst::new(AArch64Opcode::StrRI, vec![vreg(2), vreg(6), imm(0)]),
+            ]);
+        }
+        insts.extend([
+            MachInst::new(AArch64Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            MachInst::new(AArch64Opcode::CSet, vec![vreg(3), imm(0)]),
+            MachInst::new(AArch64Opcode::StrRI, vec![vreg(3), vreg(6), imm(8)]),
+            MachInst::new(AArch64Opcode::Ret, vec![]),
+        ]);
+        make_func_with_insts(insts)
+    }
+
+    #[test]
+    fn dce_mrs_nzcv_observation_preserves_original_writer_in_plain_and_certified_modes() {
+        for certified in [false, true] {
+            let mut func = mrs_observed_before_overwrite(true);
+            let before = format!("{func:?}");
+            let mut provenance = ProvenanceMap::new();
+            for index in 0..func.insts.len() {
+                provenance.record_lowering(
+                    TrustIrInstId(index as u32),
+                    &[InstId(index as u32)],
+                    PassId::new("isel"),
+                );
+            }
+            let before_provenance = format!("{provenance:?}");
+            let mut pass = DeadCodeElimination;
+            if certified {
+                let run = pass.run_certified_with_provenance(&mut func, &mut provenance);
+                assert!(!run.changed);
+                assert!(run.is_certified(), "{run:?}");
+                assert!(run.certificates.is_empty());
+            } else {
+                assert!(!pass.run_with_provenance(&mut func, &mut provenance));
+            }
+            assert_eq!(format!("{func:?}"), before);
+            assert_eq!(format!("{provenance:?}"), before_provenance);
+        }
+    }
+
+    #[test]
+    fn dce_mrs_unobserved_overwrite_twin_preserves_exact_original_certificate_fields() {
+        let mut func = mrs_observed_before_overwrite(false);
+        let dead = func.block(func.entry).insts[0];
+        let live = func.block(func.entry).insts[1];
+        let original = func.inst(dead).clone();
+        let expected_operands: Vec<_> = original.operands.iter().map(format_operand).collect();
+        let run = DeadCodeElimination.run_certified(&mut func);
+        assert!(run.changed && run.is_certified(), "{run:?}");
+        assert_eq!(run.certificates.len(), 1);
+        let certificate = &run.certificates[0];
+        assert_eq!(certificate.source_opcode, "CmpRR");
+        assert_eq!(certificate.source_operands, expected_operands);
+        assert_eq!(certificate.source_location.as_deref(), Some("file:3:8:5"));
+        assert_eq!(certificate.contract, DceContract::DeadNzcvWriteUnobservable);
+        assert_eq!(
+            certificate.nzcv.as_ref().unwrap().exit,
+            DeadFlagsExit::NextWriter { inst_id: live.0 }
+        );
+        assert_eq!(func.inst(dead).opcode, AArch64Opcode::Nop);
+        assert!(!func.block(func.entry).insts.contains(&dead));
+        assert!(func.block(func.entry).insts.contains(&live));
+        assert!(!DeadCodeElimination.run(&mut func));
     }
 }

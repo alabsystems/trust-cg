@@ -2168,6 +2168,42 @@ fn encode_zero_extend(xn: SmtExpr, from_width: u32, width: u32) -> SmtExpr {
     xn.bvand(SmtExpr::bv_const(mask, width))
 }
 
+/// Proof: an I8 ABI return may bypass `AND Wn, #255; UXTB`.
+///
+/// This is deliberately a demanded-bits theorem, not a full-W-register
+/// identity.  A function with exactly one `I8` result exposes only W0[7:0] to
+/// its caller.  Both the mask and UXTB preserve those bits, so the return copy
+/// may read the original 32-bit source directly:
+///
+/// `low8(UXTB(AND32(x, 255))) == low8(x)`.
+pub fn proof_i8_return_and255_demanded_bits() -> ProofObligation {
+    use trust_cg_opt::i8_return_demanded_bits::{
+        I8_RETURN_DEMANDED_BITS_CONTAINER_BITS, I8_RETURN_DEMANDED_BITS_MASK,
+        I8_RETURN_DEMANDED_BITS_OBSERVED_BITS, I8_RETURN_DEMANDED_BITS_PROOF_ID,
+    };
+
+    let width = I8_RETURN_DEMANDED_BITS_CONTAINER_BITS;
+    let xn = SmtExpr::var("xn", width);
+    let mask = u64::try_from(I8_RETURN_DEMANDED_BITS_MASK)
+        .expect("the shared I8 return mask must be non-negative");
+    let masked = xn.clone().bvand(SmtExpr::bv_const(mask, width));
+    let narrowed = encode_zero_extend(masked, I8_RETURN_DEMANDED_BITS_OBSERVED_BITS, width);
+    let observed_high = I8_RETURN_DEMANDED_BITS_OBSERVED_BITS - 1;
+
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: format!(
+            "{I8_RETURN_DEMANDED_BITS_PROOF_ID}: I8 return low8(UXTB(ANDW(Xn,#255))) ≡ low8(Xn)"
+        ),
+        trust_ir_expr: narrowed.extract(observed_high, 0),
+        aarch64_expr: xn.extract(observed_high, 0),
+        inputs: vec![("xn".to_string(), width)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::PeepholeOptimization),
+    }
+}
+
 /// Proof: `UXTB(UXTB(Xn))` is equivalent to `UXTB(Xn)`.
 ///
 /// Theorem: forall xn : BV64 . zext8(zext8(xn)) == zext8(xn)
@@ -2488,7 +2524,7 @@ pub fn all_peephole_proofs() -> Vec<ProofObligation> {
     ]
 }
 
-/// Return all 9 peephole identity proofs at 32-bit width (W-register).
+/// Return all 10 peephole proofs at 32-bit width (W-register).
 pub fn all_peephole_proofs_i32() -> Vec<ProofObligation> {
     vec![
         proof_add_zero_identity_w32(),
@@ -2500,10 +2536,11 @@ pub fn all_peephole_proofs_i32() -> Vec<ProofObligation> {
         proof_orr_self_identity_w32(),
         proof_and_self_identity_w32(),
         proof_eor_zero_identity_w32(),
+        proof_i8_return_and255_demanded_bits(),
     ]
 }
 
-/// Return all peephole proofs including 32-bit variants (60 total: 51x64 + 9x32).
+/// Return all peephole proofs including 32-bit variants (61 total: 51x64 + 10x32).
 pub fn all_peephole_proofs_with_32bit() -> Vec<ProofObligation> {
     let mut proofs = all_peephole_proofs();
     proofs.extend(all_peephole_proofs_i32());
@@ -2566,7 +2603,9 @@ pub fn all_peephole_proofs_i8() -> Vec<ProofObligation> {
 
 /// Return all peephole proofs across all widths (64-bit, 32-bit, and 8-bit).
 ///
-/// Total: 51 (64-bit) + 9 (32-bit) + 39 (8-bit) = 99 proofs.
+/// Total: 51 (64-bit) + 10 (32-bit) + 39 (8-bit), minus the retracted
+/// same-arm CSEL self-equality = 99 registered obligations. Registration is
+/// not itself evidence that an obligation has been discharged.
 pub fn all_peephole_proofs_all_widths() -> Vec<ProofObligation> {
     let mut proofs = all_peephole_proofs_with_32bit();
     proofs.extend(all_peephole_proofs_i8());
@@ -2702,6 +2741,47 @@ mod tests {
         assert_valid(&proof_eor_zero_identity_w32());
     }
 
+    #[test]
+    fn test_proof_i8_return_and255_demanded_bits() {
+        use trust_cg_opt::i8_return_demanded_bits::I8_RETURN_DEMANDED_BITS_PROOF_ID;
+
+        let obligation = proof_i8_return_and255_demanded_bits();
+        assert!(
+            obligation
+                .name
+                .starts_with(I8_RETURN_DEMANDED_BITS_PROOF_ID),
+            "the registry obligation must carry the transform's provenance proof id"
+        );
+        assert_ne!(
+            format!("{:?}", obligation.trust_ir_expr),
+            format!("{:?}", obligation.aarch64_expr),
+            "the demanded-bits proof must not collapse to a syntactic X == X"
+        );
+        assert_valid(&obligation);
+    }
+
+    #[test]
+    fn i8_return_proof_does_not_authorize_a_full_w_register_bypass() {
+        use trust_cg_opt::i8_return_demanded_bits::{
+            I8_RETURN_DEMANDED_BITS_CONTAINER_BITS, I8_RETURN_DEMANDED_BITS_OBSERVED_BITS,
+        };
+
+        let width = I8_RETURN_DEMANDED_BITS_CONTAINER_BITS;
+        let xn = SmtExpr::var("xn", width);
+        let masked = encode_zero_extend(xn.clone(), I8_RETURN_DEMANDED_BITS_OBSERVED_BITS, width);
+        let narrowed = encode_zero_extend(masked, I8_RETURN_DEMANDED_BITS_OBSERVED_BITS, width);
+        let mut invalid = proof_i8_return_and255_demanded_bits();
+        invalid.trust_ir_expr = narrowed;
+        invalid.aarch64_expr = xn;
+
+        match verify_by_evaluation(&invalid) {
+            VerificationResult::Invalid { .. } => {}
+            other => panic!(
+                "upper W-register bits differ; expected an Invalid counterexample, got {other:?}"
+            ),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 8-bit exhaustive variant tests
     // -----------------------------------------------------------------------
@@ -2775,7 +2855,7 @@ mod tests {
     #[test]
     fn test_all_peephole_proofs_i32() {
         let proofs = all_peephole_proofs_i32();
-        assert_eq!(proofs.len(), 9, "Expected 9 32-bit proofs");
+        assert_eq!(proofs.len(), 10, "Expected 10 32-bit proofs");
         for obligation in &proofs {
             assert_valid(obligation);
         }

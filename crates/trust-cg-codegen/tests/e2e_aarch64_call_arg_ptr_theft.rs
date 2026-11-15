@@ -40,8 +40,13 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// Two-function module exercising the "pointer both dereferenced and passed"
@@ -60,11 +65,14 @@ fn build_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("call_arg_ptr_theft");
 
     // fn sink(p: ptr, tag: i64) -> i64 { *p = tag; return *p }
-    let sink_sig = m.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let sink_sig = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut sink = TrustIrFunction::new(FuncId::new(0), "sink", sink_sig, BlockId::new(0));
     sink.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -89,14 +97,18 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(sink);
+    m.try_add_function(sink)
+        .expect("Module::try_add_function: test fixture");
 
     // fn thief(base: ptr, i: i64, tag: i64) -> i64 { ... }
-    let thief_sig = m.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let thief_sig = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut thief = TrustIrFunction::new(FuncId::new(1), "thief", thief_sig, BlockId::new(0));
     thief.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -141,7 +153,8 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(thief);
+    m.try_add_function(thief)
+        .expect("Module::try_add_function: test fixture");
 
     m
 }
@@ -161,17 +174,23 @@ fn build_swap_module() -> TrustIrModule {
     let mut m = TrustIrModule::new("call_arg_swap");
 
     // Signature of the target reached through the pointer: (i64,i64)->(i64).
-    let callee_sig = m.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let callee_sig = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
-    let caller_sig = m.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let caller_sig = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller =
         TrustIrFunction::new(FuncId::new(0), "swap_caller", caller_sig, BlockId::new(0));
     caller.blocks = vec![TrustIrBlock {
@@ -195,7 +214,8 @@ fn build_swap_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(caller);
+    m.try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
 
     m
 }
@@ -204,7 +224,8 @@ fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Result<Vec<u8>, String> 
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|r| r.object_code)
@@ -250,8 +271,8 @@ int main(void){
 "#;
 
 fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -268,6 +289,7 @@ fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -333,4 +355,13 @@ fn genuine_arg_register_swap_serializes() {
             "genuine arg-register swap mis-serialized at {opt:?} (exit {code})",
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -14,10 +14,8 @@
 //! including the driver-gated `trust-cg-ws2-import` binary, out of the policy.
 //! `trust-cg-fuzz` had no `[lints]` table at all.
 //!
-//! Nothing else catches this. `cargo run -p trust-cg-test --quiet -- ratchet
-//! warnings` builds with
-//! default features and counts `warning:` lines, so it never compiles
-//! feature-gated code and cannot see a crate that silently stopped denying.
+//! Nothing else catches this: a build only reports the warnings of the code it
+//! compiles, so it cannot see a crate that silently stopped denying.
 
 use std::fs;
 use std::path::{Path, PathBuf};

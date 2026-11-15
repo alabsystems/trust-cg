@@ -46,6 +46,14 @@ log() {
 log "build host: $(uname -a)"
 log "build cwd:  $SCRIPT_DIR"
 
+# STOCK EXCEPTION (no x86_64-unknown-linux-gnu Trust package exists (X12);
+# `trustc --target x86_64-unknown-linux-gnu` -> E0463): the SAT-Comp/StarExec
+# build uses stock Rust. The tree's rust-toolchain.toml pins the Trust
+# toolchain (owner directive 2026-09-28), so name the stock toolchain for
+# rustup explicitly; a caller's RUSTUP_TOOLCHAIN wins.
+RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}"
+export RUSTUP_TOOLCHAIN
+
 # Locate cargo. Rustup installs to ~/.cargo/bin by default, which is
 # not on the StarExec build sandbox's PATH. Fall back gracefully.
 if ! command -v cargo >/dev/null 2>&1; then

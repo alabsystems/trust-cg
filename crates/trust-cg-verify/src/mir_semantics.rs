@@ -11,7 +11,7 @@
 // casts/extensions, Use/Copy/Move, scalar Assign) as `SmtExpr` bitvector
 // formulas. It then builds a *refinement obligation* that asserts the trust-ir
 // block the bridge produced is equivalent to the MIR specification, and
-// discharges it through the SAME ay/z3 path used by every other lowering proof.
+// discharges it through the same AY + independent Clean path as other lowering proofs.
 //
 // WHY THIS CLOSES A GAP
 // ---------------------
@@ -43,8 +43,7 @@
 // 1:1 translation, not a redesign. See the module-level DESIGN notes at the
 // bottom for the control-flow / memory / `emit_proofs=true` extension path.
 //
-// Reference: designs/2026-04-13-verification-architecture.md (translation
-// validation), Alive2 (PLDI 2021).
+// Reference: Alive2 (PLDI 2021).
 
 //! MIR rvalue/statement semantics encoded as [`SmtExpr`] bitvector formulas,
 //! plus a refinement-obligation generator for the MIR -> trust-ir boundary.
@@ -262,7 +261,8 @@ pub enum MirRvalue {
     ///   * `overflow_flag` is the shared UNINTERPRETED function
     ///     [`overflow_flag_uf`] keyed by (op, width, lhs, rhs), the SAME symbol
     ///     the IMPL side (`loop_backedge_symexec`) binds `Inst::Overflow`'s flag
-    ///     result to.
+    ///     result to. The 128-bit Add/Sub forms instead retain exact flag
+    ///     expressions, matching the bridge's composed arithmetic lowering.
     ///
     /// The UF lets the threading VC PROVE `impl_flag == spec_flag` by congruence
     /// WITHOUT the exact (signedness-dependent) flag formula — which the trust-ir
@@ -338,6 +338,8 @@ pub enum MirOperand {
     Var { name: String, ty: MirScalarTy },
     /// An integer constant of the given type.
     ConstInt { value: u64, ty: MirScalarTy },
+    /// All 128 bits of a wide integer, including the high limb of negatives.
+    ConstInt128 { value: u128, signed: bool },
     /// A float constant.
     ConstFloat { value: f64, ty: MirScalarTy },
 }
@@ -348,6 +350,8 @@ impl MirOperand {
             MirOperand::Var { ty, .. }
             | MirOperand::ConstInt { ty, .. }
             | MirOperand::ConstFloat { ty, .. } => ty.clone(),
+            MirOperand::ConstInt128 { signed: true, .. } => MirScalarTy::SInt(Type::I128),
+            MirOperand::ConstInt128 { signed: false, .. } => MirScalarTy::UInt(Type::I128),
         }
     }
 
@@ -379,12 +383,23 @@ impl MirOperand {
             MirOperand::ConstInt { value, ty } => {
                 SmtExpr::bv_const(mask(*value, ty.bits()), ty.bits())
             }
+            MirOperand::ConstInt128 { value, .. } => encode_u128_constant(*value),
             MirOperand::ConstFloat { value, ty } => match ty {
                 MirScalarTy::Float(Type::F32) => SmtExpr::fp32_const(*value as f32),
                 MirScalarTy::Float(Type::F64) => SmtExpr::fp64_const(*value),
                 _ => SmtExpr::fp64_const(*value),
             },
         }
+    }
+}
+
+/// Exact 128-bit constant in the SMT AST, whose literal payload is only u64.
+/// Keep small constants in one node and concatenate both limbs otherwise.
+pub fn encode_u128_constant(value: u128) -> SmtExpr {
+    if value <= u64::MAX as u128 {
+        SmtExpr::bv_const(value as u64, 128)
+    } else {
+        SmtExpr::bv_const((value >> 64) as u64, 64).concat(SmtExpr::bv_const(value as u64, 64))
     }
 }
 
@@ -654,7 +669,11 @@ fn encode_mir_unop(op: MirUnOp, ty: MirScalarTy, operand: SmtExpr) -> SmtExpr {
         // Integer NOT: bitwise complement.
         MirUnOp::Not => {
             let w = ty.bits();
-            let all_ones = SmtExpr::bv_const(mask(u64::MAX, w), w);
+            let all_ones = if w == 128 {
+                encode_u128_constant(u128::MAX)
+            } else {
+                SmtExpr::bv_const(mask(u64::MAX, w), w)
+            };
             operand.bvxor(all_ones)
         }
     }
@@ -894,6 +913,42 @@ fn encode_trust_ir_overflow(
         .expect("overflow op encodes for Add/Sub/Mul on integer types")
 }
 
+/// Exact 128-bit add/sub semantics for loop threading. The bridge composes
+/// these operations from ordinary arithmetic and comparisons, so their flag
+/// must stay concrete. Wide multiplication uses the canonical `Inst::Overflow`
+/// instead and shares `overflow_flag_uf` with the implementation-side walk.
+fn encode_wide_loop_overflow(
+    op: MirBinOp,
+    signed: bool,
+    lhs: SmtExpr,
+    rhs: SmtExpr,
+) -> Result<(SmtExpr, SmtExpr), String> {
+    if lhs.try_bv_width().ok() != Some(128) || rhs.try_bv_width().ok() != Some(128) {
+        return Err("wide overflow operands must both be 128 bits".to_owned());
+    }
+    let zero = encode_u128_constant(0);
+    let wrapped = match op {
+        MirBinOp::Add => lhs.clone().bvadd(rhs.clone()),
+        MirBinOp::Sub => lhs.clone().bvsub(rhs.clone()),
+        _ => return Err("wide composed overflow supports Add/Sub only".to_owned()),
+    };
+    let flag = match op {
+        MirBinOp::Add | MirBinOp::Sub if signed => {
+            let signs = lhs.clone().bvxor(rhs.clone());
+            let signs = if op == MirBinOp::Add {
+                signs.bvxor(encode_u128_constant(u128::MAX))
+            } else {
+                signs
+            };
+            bool1(signs.bvand(lhs.bvxor(wrapped.clone())).bvslt(zero))
+        }
+        MirBinOp::Add => bool1(wrapped.clone().bvult(lhs)),
+        MirBinOp::Sub => bool1(lhs.bvult(rhs)),
+        _ => unreachable!("operation checked above"),
+    };
+    Ok((wrapped, flag))
+}
+
 /// Encode a MIR scalar `Cast` per Rust semantics.
 ///
 /// The signedness of the SOURCE drives int<->int extension and int->float
@@ -962,12 +1017,14 @@ fn encode_mir_cast(
                 // Signed bounds. INT_MIN = -2^(dw-1) is exactly representable;
                 // INT_MAX rounds to 2^(dw-1), which is the correct saturation
                 // threshold (any float >= that threshold saturates to INT_MAX).
-                let int_min_i = -(1i128 << (dw - 1));
-                let int_max_i = (1i128 << (dw - 1)) - 1;
+                let int_min_i = i128::MIN >> (128 - dw);
+                let int_max_i = i128::MAX >> (128 - dw);
                 let min_f = fp_from_i128(int_min_i, eb, sb);
                 let max_f = fp_from_i128(int_max_i, eb, sb);
-                let int_min_bv = SmtExpr::bv_const(mask(int_min_i as u64, dw), dw);
-                let int_max_bv = SmtExpr::bv_const(mask(int_max_i as u64, dw), dw);
+                // Preserve both limbs at width 128; a u64 constant payload
+                // would silently discard the sign bit and upper maximum bits.
+                let int_min_bv = int_min_bv(dw);
+                let int_max_bv = all_ones_bv(dw).bvlshr(SmtExpr::bv_const(1, dw));
                 let trunc = SmtExpr::fp_to_sbv(RoundingMode::RTZ, operand.clone(), dw);
                 let le_min = operand.clone().fp_le(min_f);
                 let ge_max = operand.fp_ge(max_f);
@@ -979,10 +1036,14 @@ fn encode_mir_cast(
             } else {
                 // Unsigned bounds: clamp to [0, 2^dw - 1]; NaN and negatives map
                 // to 0. UMAX rounds to 2^dw, the correct saturation threshold.
-                let umax_i = (1i128 << dw) - 1;
-                let umax_f = fp_from_i128(umax_i, eb, sb);
+                let umax_i = u128::MAX >> (128 - dw);
+                let umax_f = match (eb, sb) {
+                    (8, 24) => SmtExpr::fp32_const(umax_i as f32),
+                    (11, 53) => SmtExpr::fp64_const(umax_i as f64),
+                    _ => unreachable!("source fp_format checked above"),
+                };
                 let zero_f = fp_from_i128(0, eb, sb);
-                let umax_bv = SmtExpr::bv_const(mask(umax_i as u64, dw), dw);
+                let umax_bv = all_ones_bv(dw);
                 let trunc = SmtExpr::fp_to_ubv(RoundingMode::RTZ, operand.clone(), dw);
                 let le_zero = operand.clone().fp_le(zero_f);
                 let ge_max = operand.fp_ge(umax_f);
@@ -1664,7 +1725,7 @@ pub enum RefinementOutcome {
 }
 
 /// Discharge a refinement obligation through the SAME path the rest of the
-/// verifier uses: formal ay/z3 when a solver is available, falling back to the
+/// verifier uses: formal AY + Clean when that route is available, falling back to the
 /// exhaustive/statistical mock evaluator otherwise.
 ///
 /// This is the P0-aligned behaviour: prefer formal, never silently pass on
@@ -1778,12 +1839,23 @@ pub fn discharge_refinement(obligation: &ProofObligation, config: &AYConfig) -> 
                 RefinementOutcome::Refined
             }
             VerificationResult::Valid => RefinementOutcome::Inconclusive {
-                reason: "no solver available: refusing to credit a >8-bit/FP refinement \
-                         obligation on a statistical (100k-sample) verdict — only \
-                         exhaustively-decidable (<=8-bit integer) obligations are \
-                         admitted without a solver (install a solver to verify wider \
-                         obligations)"
-                    .to_string(),
+                // A refused AY is a named, terminal identity decision, not an
+                // absent installation: surface its `TCG-AY-IDENTITY-*` code
+                // instead of advising to "install a solver".
+                reason: match ay_bridge::solver_identity_refusal() {
+                    Some(refusal) => format!(
+                        "{refusal} — no AY is admitted, so this >8-bit/FP refinement \
+                         obligation is not credited on a statistical (100k-sample) verdict; \
+                         only exhaustively-decidable (<=8-bit integer) obligations are \
+                         admitted without the solver"
+                    ),
+                    None => "no solver available: refusing to credit a >8-bit/FP refinement \
+                             obligation on a statistical (100k-sample) verdict — only \
+                             exhaustively-decidable (<=8-bit integer) obligations are \
+                             admitted without a solver (install a solver to verify wider \
+                             obligations)"
+                        .to_string(),
+                },
             },
             VerificationResult::Invalid { counterexample } => {
                 RefinementOutcome::Refuted { counterexample }
@@ -2400,6 +2472,10 @@ fn encode_block_rvalue(bs: &mut BlockStore, rv: &MirRvalue) -> Result<SmtExpr, S
                 .ok_or_else(|| format!("CheckedOverflowPacked op {op:?} is not Add/Sub/Mul"))?;
             let l = bs.resolve(lhs);
             let r = bs.resolve(rhs);
+            if w == 128 && matches!(op, MirBinOp::Add | MirBinOp::Sub) {
+                let (wrapped, flag) = encode_wide_loop_overflow(*op, ty.is_signed(), l, r)?;
+                return Ok(flag.concat(wrapped));
+            }
             let wrapped = match op {
                 MirBinOp::Add => l.clone().bvadd(r.clone()),
                 MirBinOp::Sub => l.clone().bvsub(r.clone()),
@@ -2433,6 +2509,40 @@ fn encode_block_rvalue(bs: &mut BlockStore, rv: &MirRvalue) -> Result<SmtExpr, S
                      {} (= value_width {value_width} + 1 flag bit)",
                     value_width + 1
                 ));
+            }
+            // FOLD `extract` THROUGH THE `Concat` THIS PROJECTION READS.
+            //
+            // `CheckedOverflowPacked` builds `flag(1) :: wrapped(N)` and this arm
+            // immediately projects it back out. Leaving the projection as a literal
+            // `Extract` node makes the SPEC side `extract(N-1, 0, concat(UF, bvmul))`
+            // while the IMPL side binds the BARE `bvmul` (see the `Inst::Overflow`
+            // arm in `loop_backedge_symexec`). `edge_equality_holds_structurally` is
+            // an EXACT tree comparison with no normalization anywhere, so those two
+            // never match and the solver-free lane declines on a pair of terms that
+            // are definitionally equal. Folding here is what lets it fire.
+            //
+            // SOUND: extract over a concat AT AN EXACT OPERAND BOUNDARY *is* that
+            // operand — this rewrites a term to a definitionally equal one, it does
+            // not weaken an obligation. The boundary is CHECKED, not assumed: the
+            // high operand must be exactly 1 bit and the low exactly `value_width`.
+            // Any other shape (a non-`Concat` source, a re-associated or differently
+            // sized one) falls back to the literal extract, so this can only ever
+            // turn a decline into a discharge — never admit a mismatched pair.
+            let folded = match &packed {
+                SmtExpr::Concat { hi, lo, .. }
+                    if hi.try_bv_width().ok() == Some(1)
+                        && lo.try_bv_width().ok() == Some(*value_width) =>
+                {
+                    match field {
+                        0 => Some((**lo).clone()),
+                        1 => Some((**hi).clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(e) = folded {
+                return Ok(e);
             }
             match field {
                 0 => Ok(packed.extract(value_width - 1, 0)),
@@ -2537,17 +2647,117 @@ pub fn build_edge_equality_obligations(
 /// less informative. The cost is that a modeling bug which renders preconditions
 /// contradictory is no longer surfaced for identity-discharged slots.
 ///
+/// The local lane also checks the unsigned power-of-two division identity
+/// below. It compares the independently derived operands and all widths; it
+/// never assumes that the backend's chosen shift is correct.
+///
 /// Set `TCG_NO_STRUCTURAL_EDGE_LANE=1` to force every obligation through the
 /// solver. That can only make verification slower and stricter, never weaker.
+/// Rewrite UNSIGNED division by a power of two into the equivalent logical shift.
+///
+/// `x /u 2^k == x >>l k` for every `x` — this is a definitional identity of
+/// unsigned bitvector semantics, not a heuristic or an approximation, so
+/// rewriting BOTH sides through it before an exact tree compare preserves
+/// exactly the obligation being asked.
+///
+/// It exists because the two sides of an edge-equality obligation come from
+/// INDEPENDENT producers that legitimately disagree on term SHAPE: the bridge
+/// strength-reduces `exp /= 2` to `BvLshr(l2, 1)` while the MIR spec keeps
+/// `BvUDiv(l2, 2)`. Measured on `core::num::<uN>::overflowing_pow`, that single
+/// difference is what made `structural_identity=false` at slot 0, pushing a
+/// trivially-true equality onto the solver — where it needs bitvector ARITHMETIC
+/// semantics, which ay exports as an unprovable `hole`. Normalizing here keeps
+/// it in the solver-free lane.
+///
+/// NARROW AND FAIL-SAFE: only `BvUDiv` by a `BvConst` that is a non-zero power of
+/// two. A zero divisor (UB / trap semantics) and a non-power-of-two are left
+/// alone, as is every SIGNED division — `x /s 2^k` is NOT `x >>l k` for negative
+/// `x`, and conflating them would be a real unsoundness. Anything not rewritten
+/// simply falls through to the solver lane exactly as before.
+fn normalize_udiv_pow2(e: &SmtExpr) -> SmtExpr {
+    match e {
+        SmtExpr::BvUDiv { lhs, rhs, width } => {
+            let l = normalize_udiv_pow2(lhs);
+            let r = normalize_udiv_pow2(rhs);
+            if let SmtExpr::BvConst { value, width: cw } = &r
+                && *value != 0
+                && value.is_power_of_two()
+            {
+                let k = value.trailing_zeros();
+                return l.bvlshr(SmtExpr::bv_const(u64::from(k), *cw));
+            }
+            SmtExpr::BvUDiv {
+                lhs: std::sync::Arc::new(l),
+                rhs: std::sync::Arc::new(r),
+                width: *width,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 fn edge_equality_holds_structurally(ob: &ProofObligation) -> bool {
     if crate::env_lock::var_os("TCG_NO_STRUCTURAL_EDGE_LANE").is_some() {
         return false;
     }
-    let identical = ob.trust_ir_expr == ob.aarch64_expr;
-    if crate::env_lock::var_os("TCG_BACKEDGE_TRACE").is_some() {
+    let identical = ob.trust_ir_expr == ob.aarch64_expr
+        || normalize_udiv_pow2(&ob.trust_ir_expr) == normalize_udiv_pow2(&ob.aarch64_expr);
+    if crate::diag::backedge_trace_enabled() {
         eprintln!("TCG_BACKEDGE {} structural_identity={identical}", ob.name);
+        if !identical {
+            // The whole point of this lane is an EXACT tree compare, so a
+            // `false` is only actionable with both trees in hand — otherwise the
+            // reader knows a mismatch exists and nothing about what to fix.
+            eprintln!("TCG_BACKEDGE   trust_ir(impl) = {:?}", ob.trust_ir_expr);
+            eprintln!("TCG_BACKEDGE   aarch64(spec)  = {:?}", ob.aarch64_expr);
+        }
     }
     identical
+}
+
+/// For an unsigned w-bit integer x and 0 <= k < w, floor(x / 2^k)
+/// discards exactly the low k bits: it is the logical shift x >> k.
+/// Check that precise identity over equal, well-sorted operand trees. Zero,
+/// non-powers of two, signed operations and mismatched shifts do not match.
+#[cfg(test)]
+fn unsigned_pow2_division_equals_shift(div: &SmtExpr, shift: &SmtExpr) -> bool {
+    let (
+        SmtExpr::BvUDiv {
+            lhs: dividend,
+            rhs: divisor,
+            width,
+        },
+        SmtExpr::BvLshr {
+            lhs: shifted,
+            rhs: amount,
+            width: shift_width,
+        },
+    ) = (div, shift)
+    else {
+        return false;
+    };
+    let (
+        SmtExpr::BvConst {
+            value: divisor,
+            width: divisor_width,
+        },
+        SmtExpr::BvConst {
+            value: amount,
+            width: amount_width,
+        },
+    ) = (&**divisor, &**amount)
+    else {
+        return false;
+    };
+    (1..=64).contains(width)
+        && shift_width == width
+        && divisor_width == width
+        && amount_width == width
+        && dividend == shifted
+        && dividend.try_bv_width().ok() == Some(*width)
+        && divisor.is_power_of_two()
+        && (*width == 64 || *divisor < (1u64 << width))
+        && *amount == u64::from(divisor.trailing_zeros())
 }
 
 pub fn build_edge_equality_obligations_pre(
@@ -2594,9 +2804,10 @@ pub fn build_edge_equality_obligations_pre(
     Ok(obligations)
 }
 
-/// Discharge every edge-equality obligation a block raises and fold the verdicts:
-/// `Refined` only if ALL slots/edges refine; the FIRST `Refuted` (a dropped /
-/// stale / swapped block arg) is returned with its counterexample; an
+/// Discharge every edge-equality obligation a block raises and fold the verdicts
+/// ([`combined_refinement_outcome`]): `Refined` only if ALL slots/edges refine; a
+/// `Refuted` slot (a dropped / stale / swapped block arg) is returned with its
+/// counterexample even when another slot is undecided; otherwise an
 /// `Inconclusive` (timeout/unknown) is surfaced, never downgraded (P0).
 ///
 /// This is the block-level entry the bridge wiring would call with the real
@@ -2608,17 +2819,34 @@ pub fn check_block_arg_threading(
     bridge_edges: &[BridgeEdgeArgs],
     config: &AYConfig,
 ) -> Result<RefinementOutcome, String> {
+    discharge_block_arg_threading(name_prefix, block, bridge_edges, config)
+        .map(|verdicts| combined_refinement_outcome(&verdicts))
+}
+
+/// [`check_block_arg_threading`] with each discharged slot's own verdict.
+pub fn discharge_block_arg_threading(
+    name_prefix: &str,
+    block: &MirBlock,
+    bridge_edges: &[BridgeEdgeArgs],
+    config: &AYConfig,
+) -> Result<Vec<ObligationVerdict>, String> {
     let obligations = build_edge_equality_obligations(name_prefix, block, bridge_edges)?;
-    for ob in &obligations {
-        if edge_equality_holds_structurally(ob) {
-            continue;
-        }
-        match discharge_refinement(ob, config) {
-            RefinementOutcome::Refined => {}
-            other => return Ok(other),
-        }
-    }
-    Ok(RefinementOutcome::Refined)
+    Ok(discharge_edge_obligations(&obligations, config))
+}
+
+/// Discharge every edge-equality obligation that does not hold by structural
+/// identity ([`edge_equality_holds_structurally`]; those are not sent to the
+/// solver and are not listed), in order, whatever an earlier one answered.
+fn discharge_edge_obligations(
+    obligations: &[ProofObligation],
+    config: &AYConfig,
+) -> Vec<ObligationVerdict> {
+    let solver_bound: Vec<ProofObligation> = obligations
+        .iter()
+        .filter(|ob| !edge_equality_holds_structurally(ob))
+        .cloned()
+        .collect();
+    discharge_each(&solver_bound, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -2756,9 +2984,10 @@ impl MirLoop {
 /// Both bridge edges' args MUST be driven by the caller from the SAME header-param
 /// vars the latch store reads (`SmtExpr::var(param_name, width)`), so the VC is a
 /// REAL dataflow check and a swap cannot be hidden. Arities are checked against
-/// the header param count. Folds the verdicts: `Refined` only if EVERY slot of
-/// BOTH edges refines; the first `Refuted` (with counterexample) or `Inconclusive`
-/// (never downgraded — P0) is surfaced.
+/// the header param count. Folds the verdicts ([`combined_refinement_outcome`]):
+/// `Refined` only if EVERY slot of BOTH edges refines; a `Refuted` slot (with
+/// counterexample) is surfaced even when another slot is undecided, otherwise the
+/// first `Inconclusive` (never downgraded — P0).
 pub fn check_loop_carried_threading(
     name_prefix: &str,
     lp: &MirLoop,
@@ -2766,18 +2995,27 @@ pub fn check_loop_carried_threading(
     bridge_latch_edge: &BridgeEdgeArgs,
     config: &AYConfig,
 ) -> Result<RefinementOutcome, String> {
+    discharge_loop_carried_threading(
+        name_prefix,
+        lp,
+        bridge_preheader_edge,
+        bridge_latch_edge,
+        config,
+    )
+    .map(|verdicts| combined_refinement_outcome(&verdicts))
+}
+
+/// [`check_loop_carried_threading`] with each discharged slot's own verdict.
+pub fn discharge_loop_carried_threading(
+    name_prefix: &str,
+    lp: &MirLoop,
+    bridge_preheader_edge: &BridgeEdgeArgs,
+    bridge_latch_edge: &BridgeEdgeArgs,
+    config: &AYConfig,
+) -> Result<Vec<ObligationVerdict>, String> {
     let obligations =
         build_loop_carried_obligations(name_prefix, lp, bridge_preheader_edge, bridge_latch_edge)?;
-    for ob in &obligations {
-        if edge_equality_holds_structurally(ob) {
-            continue;
-        }
-        match discharge_refinement(ob, config) {
-            RefinementOutcome::Refined => {}
-            other => return Ok(other),
-        }
-    }
-    Ok(RefinementOutcome::Refined)
+    Ok(discharge_edge_obligations(&obligations, config))
 }
 
 /// Build the per-slot edge-equality obligations for both in-edges of a loop
@@ -2903,7 +3141,9 @@ fn back_edge_guard_precondition(lp: &MirLoop) -> Result<Vec<SmtExpr>, String> {
             // the excluded inputs; supplying the true condition is the caller's
             // obligation, not something this slice can rederive.
             match g {
-                MirOperand::ConstInt { .. } | MirOperand::ConstFloat { .. } => {
+                MirOperand::ConstInt { .. }
+                | MirOperand::ConstInt128 { .. }
+                | MirOperand::ConstFloat { .. } => {
                     return Err("loop back-edge guard must be a header-parameter \
                                 condition, not a constant (a constant guard is \
                                 vacuous-false or meaningless-true)"
@@ -2963,8 +3203,9 @@ fn back_edge_guard_precondition(lp: &MirLoop) -> Result<Vec<SmtExpr>, String> {
 ///     list (width-checked against the spec's own inputs).
 ///
 /// Verdict folding matches [`check_loop_carried_threading`]: `Refined` only if
-/// EVERY slot refines; the first `Refuted` (counterexample) or `Inconclusive`
-/// is surfaced, never downgraded. The vacuous-precondition guard inside
+/// EVERY slot refines; a `Refuted` slot (counterexample) is surfaced even when
+/// another slot is undecided, otherwise the first `Inconclusive`, never
+/// downgraded. The vacuous-precondition guard inside
 /// [`discharge_refinement`] protects against an unsatisfiable precondition set
 /// minting a meaningless `Refined` (LOOP-1).
 ///
@@ -2980,6 +3221,26 @@ pub fn check_back_edge_threading(
     extra_inputs: &[(String, u32)],
     config: &AYConfig,
 ) -> Result<RefinementOutcome, String> {
+    discharge_back_edge_threading(
+        name_prefix,
+        latch,
+        bridge_latch,
+        preconditions,
+        extra_inputs,
+        config,
+    )
+    .map(|verdicts| combined_refinement_outcome(&verdicts))
+}
+
+/// [`check_back_edge_threading`] with each discharged slot's own verdict.
+pub fn discharge_back_edge_threading(
+    name_prefix: &str,
+    latch: &MirBlock,
+    bridge_latch: &BridgeEdgeArgs,
+    preconditions: &[SmtExpr],
+    extra_inputs: &[(String, u32)],
+    config: &AYConfig,
+) -> Result<Vec<ObligationVerdict>, String> {
     if bridge_latch.edge != EdgeKind::Goto {
         return Err(format!(
             "{name_prefix}: back-edge bridge edge must be EdgeKind::Goto (got {:?})",
@@ -3018,16 +3279,7 @@ pub fn check_back_edge_threading(
             }
         }
     }
-    for ob in &obligations {
-        if edge_equality_holds_structurally(ob) {
-            continue;
-        }
-        match discharge_refinement(ob, config) {
-            RefinementOutcome::Refined => {}
-            other => return Ok(other),
-        }
-    }
-    Ok(RefinementOutcome::Refined)
+    Ok(discharge_edge_obligations(&obligations, config))
 }
 
 // ===========================================================================
@@ -3497,8 +3749,11 @@ fn sequence_has_unknown_alias(ops: &[MirMemOp]) -> bool {
 /// soundly.
 ///
 /// Returns `Refined` only if EVERY load-value and final-memory-cell obligation
-/// refines; the first `Refuted` (with counterexample) or `Inconclusive` is
-/// surfaced and never downgraded (P0).
+/// refines. Every obligation is discharged, whatever an earlier one answered,
+/// and the verdict is [`combined_refinement_outcome`]: a `Refuted` obligation
+/// (with its counterexample) outranks an `Inconclusive` one wherever the two
+/// sit, and neither is ever downgraded (P0). [`discharge_memory_sequence`]
+/// returns each obligation's own verdict.
 pub fn check_memory_sequence(
     name: &str,
     source_ops: &[MirMemOp],
@@ -3506,10 +3761,99 @@ pub fn check_memory_sequence(
     cfg: &MemCheckConfig,
     config: &AYConfig,
 ) -> Result<RefinementOutcome, String> {
+    Ok(discharge_memory_sequence(name, source_ops, bridge_ops, cfg, config)?.outcome())
+}
+
+/// One refinement obligation and the verdict its own discharge returned.
+#[derive(Debug, Clone)]
+pub struct ObligationVerdict {
+    /// The obligation's name.
+    pub obligation: String,
+    /// What [`discharge_refinement`] returned for it.
+    pub outcome: RefinementOutcome,
+}
+
+/// Discharge EVERY obligation in `obligations`, in order, through
+/// [`discharge_refinement`], and return each one's verdict. Nothing is skipped
+/// after a refutation or an undecided obligation, so the solver sees the same
+/// queries whatever each answer is.
+pub fn discharge_each(
+    obligations: &[ProofObligation],
+    config: &AYConfig,
+) -> Vec<ObligationVerdict> {
+    obligations
+        .iter()
+        .map(|obligation| ObligationVerdict {
+            obligation: obligation.name.clone(),
+            outcome: discharge_refinement(obligation, config),
+        })
+        .collect()
+}
+
+/// The single verdict of obligations that must ALL refine: the first `Refuted`
+/// if ANY is refuted, otherwise the first `Inconclusive`, otherwise `Refined`.
+///
+/// A refutation outranks an undecided obligation wherever the two sit in the
+/// list. The default refinement lanes fail the compile closed on `Refuted` and
+/// skip an `Inconclusive`, so an order-based verdict would let an undecided
+/// obligation (for example AY's disclosed proof hole) hide a later
+/// refutation, and a wrong lowering would compile.
+pub fn combined_refinement_outcome(verdicts: &[ObligationVerdict]) -> RefinementOutcome {
+    verdicts
+        .iter()
+        .find(|verdict| matches!(verdict.outcome, RefinementOutcome::Refuted { .. }))
+        .or_else(|| {
+            verdicts
+                .iter()
+                .find(|verdict| matches!(verdict.outcome, RefinementOutcome::Inconclusive { .. }))
+        })
+        .map_or(RefinementOutcome::Refined, |verdict| {
+            verdict.outcome.clone()
+        })
+}
+
+/// What discharging a memory-op sequence found.
+#[derive(Debug, Clone)]
+pub enum MemorySequenceDischarge {
+    /// The source sequence has an unknown-alias pair and no disjointness
+    /// precondition was supplied, so NOTHING was discharged (the fail-closed
+    /// keystone).
+    Refused {
+        /// Why the sequence was not discharged.
+        reason: String,
+    },
+    /// Every load-value and final-memory-cell obligation, in order, with its
+    /// own verdict.
+    Discharged(Vec<ObligationVerdict>),
+}
+
+impl MemorySequenceDischarge {
+    /// The sequence's verdict: `Inconclusive` when refused, otherwise
+    /// [`combined_refinement_outcome`] over every obligation.
+    pub fn outcome(&self) -> RefinementOutcome {
+        match self {
+            Self::Refused { reason } => RefinementOutcome::Inconclusive {
+                reason: reason.clone(),
+            },
+            Self::Discharged(verdicts) => combined_refinement_outcome(verdicts),
+        }
+    }
+}
+
+/// [`check_memory_sequence`] with every obligation's own verdict: builds the
+/// obligations ([`build_memory_obligations`]) and discharges each one
+/// ([`discharge_each`]).
+pub fn discharge_memory_sequence(
+    name: &str,
+    source_ops: &[MirMemOp],
+    bridge_ops: &[MirMemOp],
+    cfg: &MemCheckConfig,
+    config: &AYConfig,
+) -> Result<MemorySequenceDischarge, String> {
     let obligations = build_memory_obligations(name, source_ops, bridge_ops, cfg)?;
     let Some(obligations) = obligations else {
         // Unknown-alias without a disjointness precondition: fail closed.
-        return Ok(RefinementOutcome::Inconclusive {
+        return Ok(MemorySequenceDischarge::Refused {
             reason: format!(
                 "{name}: sequence has an unknown-alias pair and no disjointness \
                  precondition was supplied; refusing to discharge a may-alias VC \
@@ -3518,13 +3862,10 @@ pub fn check_memory_sequence(
             ),
         });
     };
-    for ob in &obligations {
-        match discharge_refinement(ob, config) {
-            RefinementOutcome::Refined => {}
-            other => return Ok(other),
-        }
-    }
-    Ok(RefinementOutcome::Refined)
+    Ok(MemorySequenceDischarge::Discharged(discharge_each(
+        &obligations,
+        config,
+    )))
 }
 
 /// Build the load-value + final-memory-cell obligations for a memory-sequence
@@ -3788,7 +4129,7 @@ pub fn split_at_spec(ptr: &str, len: &str, mid: &str, elem_size: u64) -> SplitAt
 /// # What this lane does and does NOT claim
 ///
 /// It certifies the *allocation identity* of the header: that the requested byte
-/// count matches the capacity actually recorded, that capacity is `max(n, 1)`,
+/// count matches the capacity actually recorded, that capacity is exactly `n`,
 /// that `len == n`, and that `len <= cap`. It says NOTHING about the subsequent
 /// fill/copy loop (that is `check_memory_sequence`'s territory), and it does NOT
 /// attempt to prove the returned buffer is fresh or non-aliasing.
@@ -3802,15 +4143,15 @@ pub fn split_at_spec(ptr: &str, len: &str, mid: &str, elem_size: u64) -> SplitAt
 /// model), not as a discharged VC. Do not "restore" it without an assumption
 /// that is strictly weaker than the goal.
 ///
-/// # Anti-tautology
+/// # Source contract
 ///
-/// The spec states capacity CANONICALLY as `ITE(n == 0, 1, n)`. The bridge emits
-/// it as `n >u 1 ? n : 1`. These are equivalent but syntactically different
-/// formulas, and they meet only on the shared name `n` — so an emission that
-/// drops the max, inverts the comparison, or uses a signed compare yields a
-/// genuinely different formula and is REFUTED. `elem_size`/`elem_align` are
-/// RE-QUERIED from the layout oracle at capture rather than read back out of the
-/// emitted constants, so a wrong size/align constant also refutes.
+/// A non-ZST slice copy requests exactly `n` elements. At `n == 0`, its
+/// capacity and byte count are zero, it makes no allocation, and its data
+/// pointer is the aligned dangling value `elem_align`. The specification is
+/// source-derived; syntactic differences from an emission are not a substitute
+/// for that independence. `elem_size`/`elem_align` come from the layout oracle,
+/// so a wrong emitted size or alignment still refutes. The conditional
+/// allocation CFG needs its own emitted-CFG model before it earns proof credit.
 ///
 /// # Assumed source-side well-formedness
 ///
@@ -3822,7 +4163,7 @@ pub fn split_at_spec(ptr: &str, len: &str, mid: &str, elem_size: u64) -> SplitAt
 /// without an explicit no-overflow obligation.
 #[derive(Debug, Clone)]
 pub struct SliceToVecHeaderSpec {
-    /// `cap == max(n, 1)`, stated canonically as `ITE(n == 0, 1, n)`.
+    /// `cap == n`, including capacity zero for an empty source.
     pub cap: SmtExpr,
     /// `alloc_bytes == cap * elem_size` (wrapping; see the note above).
     pub alloc_bytes: SmtExpr,
@@ -3832,6 +4173,10 @@ pub struct SliceToVecHeaderSpec {
     pub len_le_cap: SmtExpr,
     /// The alignment the allocation must request, from the layout oracle.
     pub alloc_align: SmtExpr,
+    /// An allocation is required exactly when `n != 0`.
+    pub alloc_required: SmtExpr,
+    /// The empty-source data pointer, from the actual element alignment.
+    pub empty_data_ptr: SmtExpr,
     /// Shared symbolic inputs (name, width).
     pub inputs: Vec<(String, u32)>,
 }
@@ -3840,15 +4185,16 @@ pub struct SliceToVecHeaderSpec {
 pub fn slice_to_vec_header_spec(n: &str, elem_size: u64, elem_align: u64) -> SliceToVecHeaderSpec {
     let count = SmtExpr::var(n, 64);
     let zero = SmtExpr::bv_const(0, 64);
-    let one = SmtExpr::bv_const(1, 64);
-    // Canonical `max(n, 1)`, deliberately NOT the emission's `n >u 1 ? n : 1`.
-    let cap = SmtExpr::ite(count.clone().eq_expr(zero), one, count.clone());
+    let alloc_required = count.clone().eq_expr(zero).not_expr();
+    let cap = count.clone();
     SliceToVecHeaderSpec {
         alloc_bytes: cap.clone().bvmul(SmtExpr::bv_const(elem_size, 64)),
         len_le_cap: count.clone().bvule(cap.clone()),
         cap,
         len: count,
         alloc_align: SmtExpr::bv_const(elem_align, 64),
+        alloc_required,
+        empty_data_ptr: SmtExpr::bv_const(elem_align, 64),
         inputs: vec![(n.to_string(), 64)],
     }
 }
@@ -3858,65 +4204,106 @@ pub fn slice_to_vec_header_spec(n: &str, elem_size: u64, elem_align: u64) -> Sli
 // stride-iterator CONSTRUCTOR translation-validation SPEC
 // ---------------------------------------------------------------------------
 
+/// Which state a slice STRIDE-ITERATOR constructor builds over the receiver
+/// `s = { data, len }`, as std's `new` builds it (`n` the chunk/window size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrideIterCtorKind {
+    /// `windows(n)` / `chunks(n)` / `rchunks(n)`: `v = s`.
+    Whole,
+    /// `chunks_exact(n)`: with `r = len % n`, `v = s[..len - r]` and
+    /// `rem = s[len - r..]`.
+    ChunksExact,
+    /// `rchunks_exact(n)`: with `r = len % n`, `v = s[r..]` and `rem = s[..r]`.
+    RChunksExact,
+}
+
 /// The Rust-defined meaning of the slice STRIDE-ITERATOR constructors
 /// (`chunks(n)` / `windows(n)` / `chunks_exact(n)` / `rchunks(n)` /
-/// `rchunks_exact(n)`) at the point the bridge builds its `{ ptr, end, n }` cursor
-/// over a slice `s = { data, len }`, as SMT bitvector formulas over the SHARED
+/// `rchunks_exact(n)`) at the point the bridge writes std's own iterator state
+/// (`v: &[T]`, `chunk_size`/`size`, and for the `*_exact` kinds `rem: &[T]`) over
+/// a slice `s = { data, len }`, as SMT bitvector formulas over the SHARED
 /// symbolic 64-bit names `data`/`len`/`n` and a CONSTANT element stride
 /// `elem_size` (bytes). This is the SPEC side of the stride-iter refinement lane;
 /// the bridge side is reconstructed INDEPENDENTLY from the trust-ir the bridge
 /// ACTUALLY EMITTED (see
 /// `rustc_codegen_trust_cg::mem_refine::fold_emitted_stride_iter_ctor`), and the
 /// two meet only on these shared names — so a bridge that drops/inverts the
-/// non-zero-`n` check, scales `end` by the wrong `elem_size`, computes `end` off
-/// the wrong base, or swaps the cursor fields yields a genuinely different formula
-/// and is REFUTED.
+/// non-zero-`n` check, scales an address by the wrong `elem_size`, offsets it
+/// from the wrong base, splits at the wrong index, or swaps two state fields
+/// yields a genuinely different formula and is REFUTED.
 ///
 /// Definition (all arithmetic 64-bit two's complement — the `usize`/pointer
 /// width; the guard `n == 0` matches std's "chunk/window size must be non-zero"
-/// panic, which every one of the five constructors performs):
+/// panic, which every one of the five constructors performs), with
+/// `r = len % n` for the `*_exact` kinds:
 ///   * PANIC (a trap) iff `n == 0`.
-///   * `cursor.ptr == data`                  (the cursor starts at the slice data).
-///   * `cursor.end == data + len*elem_size`  (one past the last element).
-///   * `cursor.n   == n`                     (the window/chunk stride).
-///
-/// SCOPE: the CORE cursor `{ ptr, end, n }` + the `n != 0` trap, common to ALL
-/// FIVE variants. The `*_exact` PRECOMPUTED remainder (`rem_data`/`rem_len` at
-/// offsets 24/32) is OUT OF SCOPE — the lane ABSTAINS on it (the remainder stores
-/// are simply not among the reconstructed cursor stores the obligation checks),
-/// never falsely Refined.
+///   * `size == n` (the window/chunk size).
+///   * `Whole`: `v = { data, len }`.
+///   * `ChunksExact`: `v = { data, len - r }`,
+///     `rem = { data + (len - r)*elem_size, r }`.
+///   * `RChunksExact`: `v = { data + r*elem_size, len - r }`, `rem = { data, r }`.
 pub struct StrideIterCtorSpec {
     /// The trap predicate (a Bool): construction PANICS iff `n == 0`.
     pub trap: SmtExpr,
-    /// `cursor.ptr == data` (the cursor's front pointer is the slice data).
-    pub ptr: SmtExpr,
-    /// `cursor.end == data + len*elem_size` (one past the last element).
-    pub end: SmtExpr,
-    /// `cursor.n == n` (the window/chunk size).
-    pub n: SmtExpr,
+    /// `v`'s data pointer.
+    pub v_data: SmtExpr,
+    /// `v`'s length.
+    pub v_len: SmtExpr,
+    /// The window/chunk size (`n`).
+    pub size: SmtExpr,
+    /// `rem`'s (data pointer, length) for the `*_exact` kinds; `None` for `Whole`.
+    pub rem: Option<(SmtExpr, SmtExpr)>,
     /// The symbolic 64-bit inputs the formulas reference (`data`/`len`/`n`).
     pub inputs: Vec<(String, u32)>,
 }
 
-/// Build the [`StrideIterCtorSpec`] for a stride-iterator constructor over the
-/// shared symbolic names `data`/`len`/`n` (each a 64-bit `usize`/pointer) and a
-/// constant `elem_size` (element stride in bytes). Reuses the standard `SmtExpr`
+/// Build the [`StrideIterCtorSpec`] for a `kind` stride-iterator constructor over
+/// the shared symbolic names `data`/`len`/`n` (each a 64-bit `usize`/pointer) and
+/// a constant `elem_size` (element stride in bytes). Reuses the standard `SmtExpr`
 /// bitvector builders so the spec is encoded on the SAME substrate the bridge
 /// reconstruction folds into. See [`StrideIterCtorSpec`] for each field's meaning.
-pub fn stride_iter_ctor_spec(data: &str, len: &str, n: &str, elem_size: u64) -> StrideIterCtorSpec {
+pub fn stride_iter_ctor_spec(
+    kind: StrideIterCtorKind,
+    data: &str,
+    len: &str,
+    n: &str,
+    elem_size: u64,
+) -> StrideIterCtorSpec {
     let d = SmtExpr::var(data, 64);
     let l = SmtExpr::var(len, 64);
     let nn = SmtExpr::var(n, 64);
     let size = SmtExpr::bv_const(elem_size, 64);
+    // The address of element `index`: `data + index*elem_size`, with a byte
+    // element's scale left out (`index*1 == index`), so a byte slice's
+    // obligation is the same term on both sides rather than an identity the
+    // solver must prove.
+    let element = |index: SmtExpr| {
+        if elem_size == 1 {
+            d.clone().bvadd(index)
+        } else {
+            d.clone().bvadd(index.bvmul(size.clone()))
+        }
+    };
+    let r = l.clone().bvurem(nn.clone());
+    let (v_data, v_len, rem) = match kind {
+        StrideIterCtorKind::Whole => (d.clone(), l.clone(), None),
+        StrideIterCtorKind::ChunksExact => {
+            let fst_len = l.clone().bvsub(r.clone());
+            (d.clone(), fst_len.clone(), Some((element(fst_len), r)))
+        }
+        StrideIterCtorKind::RChunksExact => (
+            element(r.clone()),
+            l.clone().bvsub(r.clone()),
+            Some((d.clone(), r)),
+        ),
+    };
     StrideIterCtorSpec {
         // trap  <=>  n == 0
         trap: nn.clone().eq_expr(SmtExpr::bv_const(0, 64)),
-        // cursor.ptr = data
-        ptr: d.clone(),
-        // cursor.end = data + len*elem_size
-        end: d.bvadd(l.bvmul(size)),
-        // cursor.n = n
-        n: nn,
+        v_data,
+        v_len,
+        size: nn,
+        rem,
         inputs: vec![
             (data.to_string(), 64),
             (len.to_string(), 64),
@@ -4538,6 +4925,11 @@ pub fn step_by_next_spec(
 /// arms, wrong-cell stores, and store width lies (the obligations are
 /// width-exact).
 ///
+/// No bridge lowering emits this packed state any more: an unsigned `Range`
+/// source holds core's countdown state ([`step_by_countdown_next_spec`]). The
+/// spec remains the reference of the bridge's test-only packed refutation
+/// suite.
+///
 /// This is the SPEC side of the StepBy v2 packed refinement (lane 12); the
 /// bridge side is folded INDEPENDENTLY from the trust-ir the bridge ACTUALLY
 /// EMITTED (`rustc_codegen_trust_cg::mem_refine::fold_emitted_step_by_next` —
@@ -4611,6 +5003,118 @@ pub fn step_by_next_packed_spec(
         payload: y,
         inputs: vec![
             (state.to_string(), 64),
+            (start.to_string(), 64),
+            (end.to_string(), 64),
+        ],
+    }
+}
+
+/// The Rust-defined meaning of core's COUNTDOWN `spec_next` for
+/// `<StepBy<Range<u64|usize>> as Iterator>::next(&mut self)` on a target whose
+/// `usize` is 64 bits (lowered branchless in `lower_step_by_countdown_next`),
+/// at the point the bridge writes the resulting `Option<T>` AND the advanced
+/// iterator state back to memory, as SMT bitvector formulas over the SHARED
+/// symbolic 64-bit names `sm` (the `step_minus_one: usize` cell) and
+/// `start`/`end` (the inner `Range<T>` cells).
+///
+/// core's `spec_int_ranges!` (library/core/src/iter/adapters/step_by.rs)
+/// specializes `StepBy<Range<T>>` for the unsigned `T` no wider than `usize`.
+/// `StepBy::new` runs `SpecRangeSetup::setup`, which turns `end` into the
+/// number of items still to yield (`div_ceil(len, step)`), and `spec_next`
+/// counts it down:
+///
+/// ```text
+/// step = T::try_from(step_minus_one + 1).unwrap_or(T::MAX)
+/// if end > 0 { val = start; start = val.wrapping_add(step); end -= 1; Some(val) }
+/// else { None }
+/// ```
+///
+/// For `T` = `u64`, or `usize` on a 64-bit target, `step_minus_one + 1`
+/// always fits `T`, so `step = sm + 1` and:
+///
+/// ```text
+/// cond      = end != 0
+/// new_start = if cond { start + (sm + 1) } else { start }  // 64-bit wrapping
+/// new_end   = if cond { end - 1 } else { end }
+/// tag       = if cond { some_discr } else { none_discr }
+/// payload   = start                                      // the PRE-state start
+/// ```
+///
+/// `first_take` is neither read nor written by this `spec_next`, so it is not
+/// an input; the obligation builder's exact store set keeps it unwritten.
+/// `step_minus_one == usize::MAX` is excluded by `StepBy`'s type invariant
+/// (core adds 1 with `unchecked_add`). At that value `sm + 1` wraps to 0 on
+/// both sides, so the obligations hold without stating the invariant as a
+/// precondition.
+///
+/// REFUTES: a countdown that stops one early or decrements by the wrong
+/// amount, a step of `step_minus_one` instead of `step_minus_one + 1`, an
+/// advance-when-done, an `end` decremented unconditionally (an exhausted
+/// iterator's count wraps to `T::MAX` and it restarts), a payload taken after
+/// the step, a payload that consults `first_take` the way the default
+/// `spec_next` does, swapped tag arms, and swapped `start`/`end` write-backs.
+/// Wrong-cell stores and width lies fail the obligation builder's
+/// width-exact store-set check instead.
+///
+/// This is the SPEC side of the countdown StepBy refinement (lane 12c); the
+/// bridge side is folded INDEPENDENTLY from the trust-ir the bridge ACTUALLY
+/// EMITTED (`rustc_codegen_trust_cg::mem_refine::fold_emitted_step_by_next`).
+/// The two meet only on the pre-state load symbols.
+pub struct StepByCountdownNextSpec {
+    /// `ITE(cond, start + (sm + 1), start)`: the post-state `range.start` cell.
+    pub new_start: SmtExpr,
+    /// `ITE(cond, end - 1, end)`: the post-state `range.end` cell (items left).
+    pub new_end: SmtExpr,
+    /// `ITE(cond, some_discr, none_discr)`: the `Option` tag word (constants
+    /// masked to the layout tag width).
+    pub tag: SmtExpr,
+    /// `start`: the yielded `Some` payload (the PRE-state cursor).
+    pub payload: SmtExpr,
+    /// The symbolic 64-bit inputs the formulas reference (`sm`/`start`/`end`).
+    pub inputs: Vec<(String, u32)>,
+}
+
+/// Build the [`StepByCountdownNextSpec`] for core's countdown
+/// `<StepBy<Range<u64|usize>> as Iterator>::next` over the shared symbolic
+/// pre-state names `sm`/`start`/`end` and the destination `Option`'s
+/// `Some`/`None` discriminant values (`tag_width` = the LAYOUT tag scalar's
+/// byte width; the discriminant constants are masked to it). Reuses the
+/// standard `SmtExpr` bitvector builders so the spec is encoded on the SAME
+/// substrate the bridge reconstruction folds into. See
+/// [`StepByCountdownNextSpec`] for each field's meaning.
+pub fn step_by_countdown_next_spec(
+    sm: &str,
+    start: &str,
+    end: &str,
+    some_discr: u64,
+    none_discr: u64,
+    tag_width: u32,
+) -> StepByCountdownNextSpec {
+    let sm_v = SmtExpr::var(sm, 64);
+    let s = SmtExpr::var(start, 64);
+    let e = SmtExpr::var(end, 64);
+    let one = SmtExpr::bv_const(1, 64);
+    // step = sm + 1 (`original_step`; it fits a 64-bit `T`, so no `T::MAX`
+    // clamp).
+    let step = sm_v.bvadd(one.clone());
+    // cond = end != 0 (`remaining > 0` for an unsigned count).
+    let cond = e.clone().eq_expr(SmtExpr::bv_const(0, 64)).not_expr();
+    let tag_mask: u64 = if tag_width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * tag_width)) - 1
+    };
+    StepByCountdownNextSpec {
+        new_start: SmtExpr::ite(cond.clone(), s.clone().bvadd(step), s.clone()),
+        new_end: SmtExpr::ite(cond.clone(), e.clone().bvsub(one), e),
+        tag: SmtExpr::ite(
+            cond,
+            SmtExpr::bv_const(some_discr & tag_mask, 64),
+            SmtExpr::bv_const(none_discr & tag_mask, 64),
+        ),
+        payload: s,
+        inputs: vec![
+            (sm.to_string(), 64),
             (start.to_string(), 64),
             (end.to_string(), 64),
         ],
@@ -4820,17 +5324,39 @@ mod tests {
         crate::ay_bridge::z3_available()
     }
 
-    /// The MIR-refinement sibling of `mem_refine.rs::alethe_crosscheck_gap`
-    /// (see `crate::formal_gap` for the measured mechanism): `Some(reason)`
-    /// while the outcome is `Inconclusive` on EXACTLY one of the fail-closed
-    /// certification-gap diagnostics — AY establishes UNSAT but the
-    /// constellation cannot independently certify the bit-vector family. A
-    /// guarded test prints the loud skip and returns; every other outcome
-    /// (`Refuted`, a bare or unrecognized unknown, timeout, error) falls
-    /// through to its original assertion, so the exemption un-arms itself the
-    /// moment an authority ships externally checkable proofs.
+    /// The MIR-refinement sibling of the plugin's
+    /// `solver_test_support::refinement_is_certification_gap` (see
+    /// `crate::formal_gap`): `Some(reason)` while the outcome is `Inconclusive`
+    /// on AY's disclosed proof hole. A guarded test prints the loud skip and
+    /// returns; every other outcome (`Refuted`, a checker or self-check
+    /// rejection, a bare or unrecognized unknown, timeout, error) falls through
+    /// to its original assertion, so the exemption un-arms itself the moment AY
+    /// ships a checkable proof.
     fn certification_gap_reason_of(outcome: &RefinementOutcome) -> Option<&str> {
         crate::formal_gap::refinement_gap_reason(outcome)
+    }
+
+    /// [`check_memory_sequence`] as a guarded test must read it: every
+    /// obligation is discharged and the verdicts are folded by
+    /// `crate::formal_gap::test_outcome`, so a disclosed hole on one obligation
+    /// cannot stand in for another obligation's failure.
+    fn memory_sequence_test_outcome(
+        name: &str,
+        source_ops: &[MirMemOp],
+        bridge_ops: &[MirMemOp],
+        cfg: &MemCheckConfig,
+        config: &AYConfig,
+    ) -> Result<RefinementOutcome, String> {
+        Ok(
+            match discharge_memory_sequence(name, source_ops, bridge_ops, cfg, config)? {
+                MemorySequenceDischarge::Refused { reason } => {
+                    RefinementOutcome::Inconclusive { reason }
+                }
+                MemorySequenceDischarge::Discharged(verdicts) => {
+                    crate::formal_gap::test_outcome(name, &verdicts)
+                }
+            },
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -4841,10 +5367,141 @@ mod tests {
     /// be stated in a form that is NOT the emission's `n >u 1 ? n : 1` — the
     /// two meet only on `n`, which is what gives the obligation refutational
     /// content instead of making it an identity.
+    /// PROVES THE FOLD FIRES. `CheckedOverflowPacked` builds `flag :: wrapped` and
+    /// `PackedOverflowField` immediately projects it back out. Without the fold the
+    /// projection is a literal `Extract` node, and `edge_equality_holds_structurally`
+    /// — an EXACT tree comparison with no normalization — can never match it against
+    /// the IMPL side's BARE `bvmul` / bare UF. With the fold the projection IS the
+    /// operand, so the two sides compare equal and the solver-free lane can fire.
+    ///
+    /// The negative half is what makes this a check rather than a restatement: a
+    /// packed source whose operand widths do NOT line up must NOT be folded, so a
+    /// mismatched pair can never be silently rewritten into a match.
+    /// PROVES THE udiv/lshr NORMALIZATION FIRES, AND THAT IT STAYS NARROW.
+    ///
+    /// The two sides of an edge-equality obligation come from independent
+    /// producers that legitimately disagree on SHAPE: measured on
+    /// `core::num::<uN>::overflowing_pow`, the bridge strength-reduces `exp /= 2`
+    /// to `BvLshr(l2, 1)` while the MIR spec keeps `BvUDiv(l2, 2)`. Without the
+    /// normalization `structural_identity=false` at slot 0 and a trivially-true
+    /// equality goes to the solver, where it needs bitvector ARITHMETIC semantics
+    /// that ay exports as an unprovable `hole`.
     #[test]
-    fn slice_to_vec_header_spec_capacity_is_max_n_1() {
+    fn unsigned_div_by_power_of_two_normalizes_to_the_shift() {
+        let x = SmtExpr::var("l2", 32);
+        let div = SmtExpr::BvUDiv {
+            lhs: std::sync::Arc::new(x.clone()),
+            rhs: std::sync::Arc::new(SmtExpr::bv_const(2, 32)),
+            width: 32,
+        };
+        let shift = x.clone().bvlshr(SmtExpr::bv_const(1, 32));
+        assert_ne!(
+            div, shift,
+            "the two producers really do emit different trees"
+        );
+        assert_eq!(
+            normalize_udiv_pow2(&div),
+            normalize_udiv_pow2(&shift),
+            "`x /u 2` and `x >>l 1` must normalize to the same term"
+        );
+
+        // NARROW, both directions. A non-power-of-two divisor is left alone...
+        let by3 = SmtExpr::BvUDiv {
+            lhs: std::sync::Arc::new(x.clone()),
+            rhs: std::sync::Arc::new(SmtExpr::bv_const(3, 32)),
+            width: 32,
+        };
+        assert_eq!(
+            normalize_udiv_pow2(&by3),
+            by3,
+            "x /u 3 must not be rewritten"
+        );
+        // ...and a ZERO divisor (trap/UB semantics) must never become a shift.
+        let by0 = SmtExpr::BvUDiv {
+            lhs: std::sync::Arc::new(x.clone()),
+            rhs: std::sync::Arc::new(SmtExpr::bv_const(0, 32)),
+            width: 32,
+        };
+        assert_eq!(
+            normalize_udiv_pow2(&by0),
+            by0,
+            "x /u 0 must not be rewritten — a divide-by-zero is not a shift"
+        );
+    }
+
+    #[test]
+    fn packed_overflow_projection_folds_through_its_own_concat() {
+        let w = 32u32;
+        let l = SmtExpr::var("l", w);
+        let r = SmtExpr::var("r", w);
+        let wrapped = l.clone().bvmul(r.clone());
+        let flag = overflow_flag_uf("mul", w, l.clone(), r.clone());
+        let packed = flag.clone().concat(wrapped.clone());
+
+        let mut bs = BlockStore::default();
+        bs.store.insert("p".to_string(), packed.clone());
+
+        let got0 = encode_block_rvalue(
+            &mut bs,
+            &MirRvalue::PackedOverflowField {
+                src: "p".into(),
+                field: 0,
+                value_width: w,
+            },
+        )
+        .expect("field 0 encodes");
+        let got1 = encode_block_rvalue(
+            &mut bs,
+            &MirRvalue::PackedOverflowField {
+                src: "p".into(),
+                field: 1,
+                value_width: w,
+            },
+        )
+        .expect("field 1 encodes");
+
+        assert_eq!(
+            got0, wrapped,
+            "field .0 must fold to the BARE wrapped term — this is exactly what the IMPL \
+             side binds, and structural equality is an exact tree comparison"
+        );
+        assert_eq!(
+            got1, flag,
+            "field .1 must fold to the BARE overflow UF — the same application the impl binds"
+        );
+        assert_ne!(
+            got0,
+            packed.clone().extract(w - 1, 0),
+            "the unfolded Extract node must NOT be what we emit; if it is, the fold did not fire \
+             and the structural lane stays dead"
+        );
+
+        // NEGATIVE: a packed source whose low operand is NOT `value_width` wide is a
+        // different shape and must fall back to the literal extract rather than be
+        // rewritten into a spurious match.
+        let odd = flag.concat(SmtExpr::var("other", w + 1));
+        let mut bs2 = BlockStore::default();
+        bs2.store.insert("p".to_string(), odd.clone());
+        let mismatched = encode_block_rvalue(
+            &mut bs2,
+            &MirRvalue::PackedOverflowField {
+                src: "p".into(),
+                field: 0,
+                value_width: w + 1,
+            },
+        )
+        .expect("encodes");
+        assert_eq!(
+            mismatched,
+            SmtExpr::var("other", w + 1),
+            "a correctly-sized operand still folds"
+        );
+    }
+
+    #[test]
+    fn slice_to_vec_header_spec_capacity_is_exact_source_count() {
         let spec = slice_to_vec_header_spec("n", 4, 4);
-        for (n, want_cap) in [(0u64, 1u64), (1, 1), (2, 2), (7, 7)] {
+        for (n, want_cap) in [(0u64, 0u64), (1, 1), (2, 2), (7, 7)] {
             let mut env = HashMap::new();
             env.insert("n".to_string(), n);
             assert_eq!(
@@ -4852,6 +5509,10 @@ mod tests {
                 EvalResult::Bv(want_cap),
                 "cap for n={n}"
             );
+            assert_eq!(spec.alloc_required.eval(&env), EvalResult::Bool(n != 0));
+            if n == 0 {
+                assert_eq!(spec.empty_data_ptr.eval(&env), EvalResult::Bv(4));
+            }
             // alloc_bytes must track the SAME capacity, scaled by elem_size.
             assert_eq!(
                 spec.alloc_bytes.eval(&env),
@@ -4868,32 +5529,103 @@ mod tests {
         }
     }
 
-    /// The spec is written as `ITE(n == 0, 1, n)` while the bridge emits
-    /// `n >u 1 ? n : 1`. Pin that the spec is NOT syntactically the emission —
-    /// if someone "simplifies" the spec into the emission's shape the lane
-    /// silently degrades to `X == X` and certifies nothing.
+    /// The stride-iterator constructor spec is std's `new` state, field by field,
+    /// on concrete inputs: `v` whole for `windows`/`chunks`/`rchunks` (`Whole`); for
+    /// `chunks_exact` `v` truncated to whole chunks and `rem` the tail; for
+    /// `rchunks_exact` `rem` the head and `v` the rest. The expected values are
+    /// computed here the way `ChunksExact::new` / `RChunksExact::new` split the
+    /// slice (`split_at(len - len % n)` / `split_at(len % n)`), independently of
+    /// the spec's formulas. Also: a trap exactly at `n == 0`, and the bridge's
+    /// former private cursor (`end = data + len * size` in `v.len`'s place) is
+    /// NOT the spec's state.
     #[test]
-    fn slice_to_vec_header_spec_is_not_the_emission_shape() {
+    fn stride_iter_ctor_spec_is_std_new_state() {
+        let data = 0x1000u64;
+        for size in [1u64, 4] {
+            for kind in [
+                StrideIterCtorKind::Whole,
+                StrideIterCtorKind::ChunksExact,
+                StrideIterCtorKind::RChunksExact,
+            ] {
+                let spec = stride_iter_ctor_spec(kind, "d", "l", "n", size);
+                assert_eq!(
+                    spec.rem.is_some(),
+                    kind != StrideIterCtorKind::Whole,
+                    "{kind:?}"
+                );
+                for (len, n) in [
+                    (0u64, 1u64),
+                    (1, 1),
+                    (7, 3),
+                    (1000, 256),
+                    (1000, 250),
+                    (5, 9),
+                ] {
+                    let mut env = HashMap::new();
+                    env.insert("d".to_string(), data);
+                    env.insert("l".to_string(), len);
+                    env.insert("n".to_string(), n);
+                    let (want_v, want_rem) = match kind {
+                        StrideIterCtorKind::ChunksExact => {
+                            let mid = len - len % n;
+                            ((data, mid), Some((data + mid * size, len - mid)))
+                        }
+                        StrideIterCtorKind::RChunksExact => {
+                            let mid = len % n;
+                            ((data + mid * size, len - mid), Some((data, mid)))
+                        }
+                        _ => ((data, len), None),
+                    };
+                    let at = format!("{kind:?} size={size} len={len} n={n}");
+                    assert_eq!(spec.trap.eval(&env), EvalResult::Bool(false), "{at}");
+                    assert_eq!(spec.v_data.eval(&env), EvalResult::Bv(want_v.0), "{at}");
+                    assert_eq!(spec.v_len.eval(&env), EvalResult::Bv(want_v.1), "{at}");
+                    assert_eq!(spec.size.eval(&env), EvalResult::Bv(n), "{at}");
+                    if let (Some((rp, rl)), Some((want_rp, want_rl))) = (&spec.rem, want_rem) {
+                        assert_eq!(rp.eval(&env), EvalResult::Bv(want_rp), "{at}");
+                        assert_eq!(rl.eval(&env), EvalResult::Bv(want_rl), "{at}");
+                    }
+                    if len > 0 {
+                        assert_ne!(
+                            spec.v_len.eval(&env),
+                            EvalResult::Bv(data + len * size),
+                            "the former private cursor's end pointer is not std's length ({at})"
+                        );
+                    }
+                }
+                let mut env = HashMap::new();
+                env.insert("d".to_string(), data);
+                env.insert("l".to_string(), 7);
+                env.insert("n".to_string(), 0);
+                assert_eq!(
+                    spec.trap.eval(&env),
+                    EvalResult::Bool(true),
+                    "{kind:?} traps on n == 0"
+                );
+            }
+        }
+    }
+
+    /// The former minimum-one allocation disagrees with the source contract
+    /// exactly on the empty slice, even though nonempty copies agree.
+    #[test]
+    fn slice_to_vec_header_spec_rejects_minimum_one_empty_allocation() {
         let spec = slice_to_vec_header_spec("n", 8, 8);
         let emission_shape = SmtExpr::ite(
             SmtExpr::var("n", 64).bvugt(SmtExpr::bv_const(1, 64)),
             SmtExpr::var("n", 64),
             SmtExpr::bv_const(1, 64),
         );
-        assert_ne!(
-            format!("{:?}", spec.cap),
-            format!("{emission_shape:?}"),
-            "spec capacity must not be re-derived in the emission's own shape"
-        );
-        // ...but must AGREE with it on every value (equivalent, not identical).
         for n in [0u64, 1, 2, 3, 64, u64::MAX] {
             let mut env = HashMap::new();
             env.insert("n".to_string(), n);
-            assert_eq!(
-                spec.cap.eval(&env),
-                emission_shape.clone().eval(&env),
-                "spec and emission must agree at n={n}"
-            );
+            if n == 0 {
+                assert_ne!(spec.cap.eval(&env), emission_shape.clone().eval(&env));
+                assert_eq!(spec.alloc_bytes.eval(&env), EvalResult::Bv(0));
+                assert_eq!(spec.alloc_required.eval(&env), EvalResult::Bool(false));
+            } else {
+                assert_eq!(spec.cap.eval(&env), emission_shape.clone().eval(&env));
+            }
         }
     }
 
@@ -4904,10 +5636,9 @@ mod tests {
         let spec = slice_to_vec_header_spec("n", 4, 4);
         let mut env = HashMap::new();
         env.insert("n".to_string(), 0u64);
-        // Mutant: cap = n (drops the max) — differs from the spec at n == 0,
-        // which is exactly the zero-length `to_vec()` case.
-        let cap_is_n = SmtExpr::var("n", 64);
-        assert_ne!(spec.cap.eval(&env), cap_is_n.eval(&env));
+        // Mutant: reserve one element for an empty source.
+        let cap_is_one = SmtExpr::bv_const(1, 64);
+        assert_ne!(spec.cap.eval(&env), cap_is_one.eval(&env));
         // Mutant: alloc_bytes = cap (forgets to scale by elem_size).
         env.insert("n".to_string(), 3u64);
         assert_ne!(spec.alloc_bytes.eval(&env), spec.cap.eval(&env));
@@ -5970,6 +6701,83 @@ mod tests {
             eval_agree(&ob, &HashMap::new()).unwrap_or_else(|e| {
                 panic!("correct saturating FloatToInt disagreed at v={v}: {e}")
             });
+        }
+    }
+
+    #[test]
+    fn saturating_float_to_i128_preserves_both_limbs() {
+        // The full std graph reaches f64 -> i128 through gimli. Besides the
+        // previous bound-construction panic, values above 64 bits exercise the
+        // concrete evaluator's result carrier independently of the MIR encoder.
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.9,
+            -1.9,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2.0f64.powi(64),
+            -2.0f64.powi(64),
+            2.0f64.powi(80),
+            i128::MIN as f64,
+            i128::MAX as f64,
+            u128::MAX as f64,
+            f32::MAX as f64,
+            -(f32::MAX as f64),
+            f64::MAX,
+            f64::MIN,
+        ];
+        for exponent in [63, 64, 80, 126, 127, 128] {
+            let bits = 2.0f64.powi(exponent).to_bits();
+            for offset in -2i64..=2 {
+                let value = f64::from_bits(bits.wrapping_add_signed(offset));
+                values.extend([value, -value]);
+            }
+        }
+        let mut state = 0x9182_fecd_3124_ab67u64;
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(f64::from_bits(state));
+            values.push(f32::from_bits(state as u32) as f64);
+        }
+        for value in values {
+            for (source, operand, v) in [
+                (Type::F64, SmtExpr::fp64_const(value), value),
+                (
+                    Type::F32,
+                    SmtExpr::fp32_const(value as f32),
+                    (value as f32) as f64,
+                ),
+            ] {
+                for signed in [false, true] {
+                    let destination = if signed {
+                        MirScalarTy::SInt(Type::I128)
+                    } else {
+                        MirScalarTy::UInt(Type::I128)
+                    };
+                    let expr = encode_mir_cast(
+                        MirCastKind::FloatToInt,
+                        MirScalarTy::Float(source.clone()),
+                        destination,
+                        operand.clone(),
+                    )
+                    .unwrap();
+                    let expected = if signed {
+                        (v as i128) as u128
+                    } else {
+                        v as u128
+                    };
+                    assert_eq!(
+                        expr.try_eval(&HashMap::new()).unwrap().as_u128(),
+                        expected,
+                        "{source:?} signed={signed} bits={:016x}",
+                        v.to_bits()
+                    );
+                }
+            }
         }
     }
 
@@ -7163,6 +7971,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsigned_pow2_division_rule_checks_values_widths_and_shift_counts() {
+        for width in 1..=64 {
+            for k in 0..width {
+                let x = SmtExpr::var("x", width);
+                let div = x.clone().bvudiv(SmtExpr::bv_const(1u64 << k, width));
+                let shift = x.clone().bvlshr(SmtExpr::bv_const(k as u64, width));
+                assert!(unsigned_pow2_division_equals_shift(&div, &shift));
+                let values: Vec<u64> = if width <= 8 {
+                    (0..1u64 << width).collect()
+                } else {
+                    vec![
+                        0,
+                        1,
+                        1u64 << k,
+                        (1u64 << k) - 1,
+                        u64::MAX,
+                        1u64 << (width - 1),
+                    ]
+                };
+                for value in values {
+                    let env = std::collections::HashMap::from([("x".to_owned(), value)]);
+                    assert_eq!(div.try_eval(&env).unwrap(), shift.try_eval(&env).unwrap());
+                }
+                let wrong = x.clone().bvlshr(SmtExpr::bv_const((k + 1) as u64, width));
+                assert!(!unsigned_pow2_division_equals_shift(&div, &wrong));
+                let wrong = SmtExpr::var("y", width).bvlshr(SmtExpr::bv_const(k as u64, width));
+                assert!(!unsigned_pow2_division_equals_shift(&div, &wrong));
+                let signed = x.clone().bvsdiv(SmtExpr::bv_const(1u64 << k, width));
+                assert!(!unsigned_pow2_division_equals_shift(&signed, &shift));
+                let arithmetic = x.bvashr(SmtExpr::bv_const(k as u64, width));
+                assert!(!unsigned_pow2_division_equals_shift(&div, &arithmetic));
+            }
+        }
+        let x = SmtExpr::var("x", 32);
+        let shift = x.clone().bvlshr(SmtExpr::bv_const(1, 32));
+        for divisor in [0, 3, 6, 1u64 << 32] {
+            assert!(!unsigned_pow2_division_equals_shift(
+                &x.clone().bvudiv(SmtExpr::bv_const(divisor, 32)),
+                &shift,
+            ));
+        }
+        let bad_divisor_width = x.clone().bvudiv(SmtExpr::bv_const(2, 64));
+        assert!(!unsigned_pow2_division_equals_shift(
+            &bad_divisor_width,
+            &shift
+        ));
+        let div = x.clone().bvudiv(SmtExpr::bv_const(2, 32));
+        let bad_shift_width = x.bvlshr(SmtExpr::bv_const(1, 64));
+        assert!(!unsigned_pow2_division_equals_shift(&div, &bad_shift_width));
+    }
+
     /// The kill switch forces every obligation back through the solver lane.
     /// It may only ever make verification stricter, never weaker.
     #[test]
@@ -7625,7 +8485,7 @@ mod tests {
             edge: EdgeKind::Goto,
             args: swapped,
         };
-        match check_back_edge_threading(
+        let verdicts = discharge_back_edge_threading(
             "be_vacuous",
             &latch,
             &bridge,
@@ -7633,21 +8493,21 @@ mod tests {
             &[],
             &cfg(),
         )
-        .unwrap()
-        {
+        .unwrap();
+        match crate::formal_gap::test_outcome("be_vacuous", &verdicts) {
             RefinementOutcome::Inconclusive { reason } => {
-                // Certification-gap guard (crate::formal_gap): while the gap
-                // is live the main VC fail-closes BEFORE the vacuity
+                // Certification-gap guard (crate::formal_gap): while AY's hole
+                // disclosure is live the main VC fail-closes BEFORE the vacuity
                 // pre-check can label the contradictory guard, so the reason
-                // is the gap diagnostic instead of "vacuous"/"preconditions".
+                // is the hole disclosure instead of "vacuous"/"preconditions".
                 // Either way the outcome this test pins holds — a vacuous
                 // precondition NEVER minted Refined — so skip loudly on the
-                // exact gap diagnostic only.
-                let gap_confirmed = reason.strip_prefix("unknown: ").is_some_and(|s| {
-                    crate::formal_gap::ay_reason_is_certification_gap(s)
-                        || crate::formal_gap::ay_reason_is_self_check_rejection(s)
-                });
-                if gap_confirmed {
+                // disclosed hole only, and only when EVERY undecided slot is one
+                // (`test_outcome` prefers any other reason).
+                if reason
+                    .strip_prefix("unknown: ")
+                    .is_some_and(crate::gap_classify::ay_reason_is_disclosed_proof_hole)
+                {
                     crate::formal_gap::print_gap_skip(
                         "back_edge_threading_vacuous_precondition_fails_closed",
                         &reason,
@@ -7758,7 +8618,7 @@ mod tests {
             },
         ];
         let bridge = source.clone();
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "store_load_same",
             &source,
             &bridge,
@@ -7835,7 +8695,7 @@ mod tests {
         }
         // MUTATION PROBE: the correct bridge (load p+0) Refines on the same source.
         let bridge_fixed = source.clone();
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "wrong_offset_probe",
             &source,
             &bridge_fixed,
@@ -7905,7 +8765,7 @@ mod tests {
         }
         // MUTATION PROBE: restoring the store Refines on the same source.
         let bridge_fixed = source.clone();
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "dropped_store_probe",
             &source,
             &bridge_fixed,
@@ -7975,7 +8835,7 @@ mod tests {
         }
         // MUTATION PROBE: both stores -> final memory matches -> Refines.
         let bridge_fixed = source.clone();
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "dropped_no_load_probe",
             &source,
             &bridge_fixed,
@@ -8054,7 +8914,7 @@ mod tests {
         }
         // MUTATION PROBE: original order Refines.
         let bridge_fixed = source.clone();
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "reorder_alias_probe",
             &source,
             &bridge_fixed,
@@ -8120,7 +8980,7 @@ mod tests {
                 width: 4,
             },
         ];
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "reorder_distinct",
             &source,
             &bridge_swapped,
@@ -8241,7 +9101,7 @@ mod tests {
         let mem_cfg = MemCheckConfig {
             disjointness_preconditions: disjoint_bases_precondition("p", "q", 4),
         };
-        match check_memory_sequence("unknown_alias_pre", &source, &bridge, &mem_cfg, &cfg())
+        match memory_sequence_test_outcome("unknown_alias_pre", &source, &bridge, &mem_cfg, &cfg())
             .unwrap()
         {
             RefinementOutcome::Refined => {}
@@ -8531,34 +9391,11 @@ mod tests {
         .unwrap()
         {
             RefinementOutcome::Refuted { .. } => {}
-            other => {
-                // Certification-gap guard (crate::formal_gap), MEASURED
-                // mechanism: the sequence check discharges the LOAD-VALUE VC
-                // first (captured live: a 4-byte load at `p` compared across
-                // both memories — CORRECTLY unsat, since the spurious store
-                // at `p+100..p+103` can never alias `p..p+3` in 64-bit
-                // arithmetic), and while the constellation cannot certify
-                // that intermediate proof the check fail-closes to
-                // Inconclusive BEFORE reaching the FINAL-MEMORY VC whose
-                // mismatch at `p+100` refutes. The refutation lane itself is
-                // pinned by the solver-less evaluation run of this same test
-                // (it Refutes there). Skip ONLY on the exact gap disclosure —
-                // a `Refined` here still fails hard.
-                if let Some(reason) = certification_gap_reason_of(&other) {
-                    crate::formal_gap::print_gap_skip(
-                        "mem2_spurious_bridge_store_at_distinct_offset_is_refuted_with_probe \
-                         (negative half; load-value VC gap-blocked before the refuting \
-                         final-memory VC)",
-                        reason,
-                    );
-                    return;
-                }
-                panic!("MEM-2: spurious bridge store at p+100 must be Refuted, got {other:?}")
-            }
+            other => panic!("MEM-2: spurious bridge store at p+100 must be Refuted, got {other:?}"),
         }
         // MUTATION PROBE: without the spurious store, the bridge Refines.
         let bridge_fixed = source.clone();
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "mem2_probe",
             &source,
             &bridge_fixed,
@@ -8621,7 +9458,7 @@ mod tests {
                 dst: "impl".into(),
             },
         ];
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "p1_field_load",
             &spec,
             &bridge,
@@ -8696,7 +9533,7 @@ mod tests {
         }
         // MUTATION PROBE: the correct bridge (load base+16) Refines on the same spec.
         let bridge_fixed = spec.clone();
-        match check_memory_sequence(
+        match memory_sequence_test_outcome(
             "p1_field_load_probe",
             &spec,
             &bridge_fixed,
@@ -9009,6 +9846,44 @@ mod tests {
         (mir, bridge)
     }
 
+    /// Measured in round 4: `trustc` with `AY_SOLVER_PATH` naming another AY
+    /// build failed with `INCONCLUSIVE (no solver available ... install a
+    /// solver ...)`, hiding the identity refusal. A refused AY must surface as
+    /// its named `TCG-AY-IDENTITY-*` diagnostic.
+    #[cfg(unix)]
+    #[test]
+    fn refused_ay_surfaces_its_identity_code_in_the_refinement_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let other_ay = directory.path().join("other-ay-build");
+        std::fs::write(&other_ay, "#!/bin/sh\n# not the recorded AY\nexit 70\n").unwrap();
+        std::fs::set_permissions(&other_ay, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mir, bridge) = batch_correct_add_u32();
+        let encoded = encode_mir_rvalue(&mir).unwrap();
+        let obligation = build_refinement_obligation("refused-ay-diagnostic", &bridge, &encoded);
+        let outcome = trust_cg_process_env::with_env_edits(|environment| {
+            environment.set("AY_SOLVER_PATH", other_ay.as_os_str());
+            environment.remove(crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV);
+            environment.set("TCG_CANARY_NO_CACHE", "1");
+            discharge_refinement(&obligation, &AYConfig::default())
+        });
+        let code = if crate::ay_identity::recorded_toolchain_ay_identity().is_ok() {
+            "[TCG-AY-IDENTITY-MISMATCH]"
+        } else {
+            "[TCG-AY-IDENTITY-UNRECORDED]"
+        };
+        match outcome {
+            RefinementOutcome::Inconclusive { reason } => {
+                assert!(reason.starts_with(code), "{reason}");
+                assert!(!reason.contains("no solver available"), "{reason}");
+                assert!(!reason.contains("install a solver"), "{reason}");
+            }
+            other => {
+                panic!("a 32-bit refinement cannot be credited without the admitted AY: {other:?}")
+            }
+        }
+    }
+
     /// A WRONG wide lowering: `u32` MIR Add lowered as trust-ir Isub. Its
     /// negated equivalence is SAT (any a,b with b!=0) -> a batched window of
     /// `sat`. Structurally distinct sides force a genuine decision.
@@ -9089,7 +9964,7 @@ mod tests {
     #[test]
     fn frontend_batch_sat_unsat_isolation_both_orders() {
         let _guard = ay_bridge::formal_solver_test_lock();
-        let Some(_ay) = ay_bridge::resolved_solver_path() else {
+        let Some(_ay) = ay_bridge::resolved_solver() else {
             eprintln!("frontend_batch_sat_unsat_isolation_both_orders: no ay; skipping");
             return;
         };
@@ -9135,7 +10010,7 @@ mod tests {
     #[test]
     fn frontend_batch_equals_fresh_process() {
         let _guard = ay_bridge::formal_solver_test_lock();
-        let Some(_ay) = ay_bridge::resolved_solver_path() else {
+        let Some(_ay) = ay_bridge::resolved_solver() else {
             eprintln!("frontend_batch_equals_fresh_process: no ay; skipping");
             return;
         };
@@ -9189,7 +10064,7 @@ mod tests {
     #[test]
     fn frontend_verdict_only_batch_never_primes_proof_authority() {
         let _guard = ay_bridge::formal_solver_test_lock();
-        let Some(_ay) = ay_bridge::resolved_solver_path() else {
+        let Some(_ay) = ay_bridge::resolved_solver() else {
             eprintln!("frontend_batch_refuted_still_gates_closed: no ay; skipping");
             return;
         };
@@ -9259,14 +10134,16 @@ mod tests {
         );
 
         // Now the independently checked inline discharge: the correct rule is
-        // either Refined (complete proof accepted) or explicitly Inconclusive
-        // (proof evidence missing/holey), never Refuted. The wrong rule must
-        // still be Refuted.
+        // either Refined (complete proof accepted) or pending on AY's disclosed
+        // proof hole (the one tracked gap, `crate::formal_gap`), never Refuted.
+        // A checker or self-check rejection, missing proof evidence and a bare
+        // unknown fail. The wrong rule must still be Refuted.
         match check_rvalue_lowering("e2e-correct", &cm, &cb, &cfg()).unwrap() {
             RefinementOutcome::Refined => {}
-            RefinementOutcome::Inconclusive { reason } => assert!(
-                reason.contains("proof") || reason.contains("unknown"),
-                "correct obligation may remain pending only for explicit proof authority: {reason}"
+            outcome @ RefinementOutcome::Inconclusive { .. } => assert!(
+                crate::formal_gap::refinement_gap_reason(&outcome).is_some(),
+                "correct obligation may remain pending only on AY's disclosed proof hole: \
+                 {outcome:?}"
             ),
             other => panic!("correct obligation must not be refuted, got {other:?}"),
         }
@@ -9277,5 +10154,480 @@ mod tests {
 
         // The RAII guards above restore TCG_REFINE_BATCH / TCG_REFINE_SOLVER /
         // TCG_NO_PROOF_CACHE to their prior values on return.
+    }
+
+    // -----------------------------------------------------------------------
+    // Every obligation of a memory sequence is discharged (fake AY)
+    // -----------------------------------------------------------------------
+
+    /// The production fold: a refutation outranks an undecided obligation
+    /// wherever the two sit, then the first undecided one, then `Refined`.
+    #[test]
+    fn combined_outcome_surfaces_a_refutation_behind_an_undecided_obligation() {
+        let verdict = |obligation: &str, outcome| ObligationVerdict {
+            obligation: obligation.to_string(),
+            outcome,
+        };
+        let undecided = |reason: &str| RefinementOutcome::Inconclusive {
+            reason: reason.to_string(),
+        };
+        let refuted = |cex: &str| RefinementOutcome::Refuted {
+            counterexample: cex.to_string(),
+        };
+        let verdicts = [
+            verdict("a", RefinementOutcome::Refined),
+            verdict("b", undecided("first")),
+            verdict("c", refuted("[x = 1]")),
+            verdict("d", refuted("[x = 2]")),
+        ];
+        assert!(matches!(
+            combined_refinement_outcome(&verdicts),
+            RefinementOutcome::Refuted { counterexample } if counterexample == "[x = 1]"
+        ));
+        // A refutation is never downgraded by an undecided obligation after it,
+        // whether it comes first or sits between two of them.
+        let verdicts = [
+            verdict("a", refuted("[x = 1]")),
+            verdict("b", undecided("after")),
+        ];
+        assert!(matches!(
+            combined_refinement_outcome(&verdicts),
+            RefinementOutcome::Refuted { counterexample } if counterexample == "[x = 1]"
+        ));
+        let verdicts = [
+            verdict("a", RefinementOutcome::Refined),
+            verdict("b", undecided("before")),
+            verdict("c", refuted("[x = 1]")),
+            verdict("d", undecided("after")),
+        ];
+        assert!(matches!(
+            combined_refinement_outcome(&verdicts),
+            RefinementOutcome::Refuted { counterexample } if counterexample == "[x = 1]"
+        ));
+        let verdicts = [
+            verdict("a", undecided("first")),
+            verdict("b", RefinementOutcome::Refined),
+            verdict("c", undecided("second")),
+        ];
+        assert!(matches!(
+            combined_refinement_outcome(&verdicts),
+            RefinementOutcome::Inconclusive { reason } if reason == "first"
+        ));
+        assert!(matches!(
+            combined_refinement_outcome(&[verdict("a", RefinementOutcome::Refined)]),
+            RefinementOutcome::Refined
+        ));
+        assert!(matches!(
+            combined_refinement_outcome(&[]),
+            RefinementOutcome::Refined
+        ));
+    }
+
+    /// A fake proof authority in `dir`. `ay` answers the resident protocol with
+    /// `unsat` for every window (AY's plain verdict, which the bridge replays);
+    /// the first obligation's `hole_queries` proof-bearing queries answer
+    /// `unsat` with a disclosed hole certificate
+    /// (`unproved_steps=1 foreign_assumes=no`), and every later one runs `later`
+    /// (shell). This includes the lowered query and the exact-query fallback. A verdict-only query (the SAT model replay)
+    /// answers `sat`. `clean` passes only the known-good control proof, so the
+    /// fake can never certify anything. Returns the two executable paths; the
+    /// count of proof-bearing queries is in `<ay>.oneshot`.
+    #[cfg(unix)]
+    fn fake_hole_first_authority(
+        dir: &std::path::Path,
+        hole_queries: usize,
+        later: &str,
+    ) -> (String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let write = |name: &str, body: String| {
+            let path = dir.join(name);
+            // An admitted AY runs from a private copy of its bytes, so the
+            // fake names its own `.oneshot` counter by path, not by `$0`.
+            std::fs::write(
+                &path,
+                crate::ay_identity::test_fixtures::bind_self(
+                    &path,
+                    &format!("#!/bin/sh\n{body}\n"),
+                ),
+            )
+            .expect("write fake");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake");
+            path.to_str().expect("utf-8 path").to_string()
+        };
+        let ay = write(
+            "ay",
+            format!(
+                r#"if [ "$1" = "--incremental" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      '(echo "'*'")')
+        marker=${{line#'(echo "'}}
+        marker=${{marker%'")'}}
+        printf 'unsat\n%s\n' "$marker"
+        ;;
+    esac
+  done
+  exit 0
+fi
+if [ "$1" = "-smt2" ] && [ "$3" = "--strict-proofs" ]; then
+  n=$(( $(cat "$0.oneshot" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$0.oneshot"
+  if [ "$n" -le {hole_queries} ]; then
+    printf '(assume h0 true)\n' > "$5"
+    printf 'unsat\n'
+    printf 'c ay.proof.certificate path=%s unproved_steps=1 foreign_assumes=no trust_free=no ay_self_checkable=yes\n' "$5" >&2
+    exit 0
+  fi
+  {later}
+  exit 0
+fi
+printf 'sat\n'"#
+            ),
+        );
+        let clean = write(
+            "clean",
+            r#"if grep -qF '(assume t0 p)\n(assume t1 (not p))\n(step t2 (cl) :rule resolution :premises (t1 t0))' "$3"; then
+  printf 'External certificate verification: PASSED\nType: Alethe SMT proof\nProof status: fully verified\n'
+  exit 0
+fi
+printf 'External certificate verification: FAILED\n'
+exit 1"#
+                .to_string(),
+        );
+        (ay, clean)
+    }
+
+    /// Run `body` against the fake authority (thread-local overrides only).
+    /// The fake AY is admitted the way every unit-test AY fixture is: its
+    /// exact bytes are declared to `ay_identity`.
+    #[cfg(unix)]
+    fn with_fake_authority<T>(ay: &str, clean: &str, body: impl FnOnce() -> T) -> T {
+        let declaration = crate::ay_identity::test_fixtures::declare(&[std::path::Path::new(ay)]);
+        trust_cg_process_env::with_env_overrides(
+            &[
+                ("AY_SOLVER_PATH", ay),
+                (
+                    crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV,
+                    declaration.as_str(),
+                ),
+                ("TCG_EXTERNAL_CLEAN_CHECKER", clean),
+                ("TCG_NO_PROOF_CACHE", "1"),
+            ],
+            body,
+        )
+    }
+
+    /// Three obligations: the value the load observes, and the final memory at
+    /// each of the two stored cells.
+    fn three_obligation_sequence() -> Vec<MirMemOp> {
+        vec![
+            MirMemOp::Store {
+                addr: MemAddr::at("p", 0),
+                value: val32("v1"),
+                width: 4,
+            },
+            MirMemOp::Store {
+                addr: MemAddr::at("p", 8),
+                value: val32("v2"),
+                width: 4,
+            },
+            MirMemOp::Load {
+                addr: MemAddr::at("p", 0),
+                width: 4,
+                dst: "r".into(),
+            },
+        ]
+    }
+
+    fn queries_per_memory_obligation(ops: &[MirMemOp]) -> usize {
+        let obligations =
+            build_memory_obligations("hole_query_shapes", ops, ops, &MemCheckConfig::default())
+                .unwrap()
+                .expect("the fixture has provably distinct addresses");
+        assert_eq!(obligations.len(), 3);
+        for obligation in &obligations {
+            assert_eq!(
+                ay_bridge::generate_lowered_queries(obligation, &cfg()).len(),
+                1,
+                "each obligation tries its array-free form before its exact query"
+            );
+        }
+        2
+    }
+
+    fn proof_bearing_queries(ay: &str) -> usize {
+        std::fs::read_to_string(format!("{ay}.oneshot"))
+            .map_or(0, |count| count.trim().parse().expect("query count"))
+    }
+
+    /// Reproduces the hidden-obligation defect: AY discloses a proof hole on
+    /// the FIRST obligation and rejects its own proof of every later one. A
+    /// check that stopped at the first undecided obligation sent one query and
+    /// reported only the hole, the one gap a test may skip on.
+    #[cfg(unix)]
+    #[test]
+    fn a_hole_on_the_first_obligation_does_not_hide_a_later_rejection() {
+        let _serial = crate::ay_bridge::formal_solver_test_lock();
+        let dir = tempfile::tempdir().expect("fake authority dir");
+        let ops = three_obligation_sequence();
+        let queries = queries_per_memory_obligation(&ops);
+        let (ay, clean) = fake_hole_first_authority(
+            dir.path(),
+            queries,
+            "printf 'unknown\\n'; printf '(:reason-unknown (incomplete self-check-rejected))\\n' >&2",
+        );
+        let (discharge, outcome) = with_fake_authority(&ay, &clean, || {
+            assert!(
+                ay_bridge::z3_available(),
+                "the fake authority must be selected"
+            );
+            (
+                discharge_memory_sequence(
+                    "hole_then_rejection",
+                    &ops,
+                    &ops,
+                    &MemCheckConfig::default(),
+                    &cfg(),
+                )
+                .expect("no structural error"),
+                check_memory_sequence(
+                    "hole_then_rejection",
+                    &ops,
+                    &ops,
+                    &MemCheckConfig::default(),
+                    &cfg(),
+                )
+                .expect("no structural error"),
+            )
+        });
+        let MemorySequenceDischarge::Discharged(verdicts) = &discharge else {
+            panic!("a provably-distinct sequence is discharged, got {discharge:?}");
+        };
+        assert_eq!(verdicts.len(), 3, "{verdicts:?}");
+        assert_eq!(
+            proof_bearing_queries(&ay),
+            6 * queries,
+            "every obligation tried both query forms, in both calls"
+        );
+        let reasons: Vec<_> = verdicts
+            .iter()
+            .map(|verdict| match &verdict.outcome {
+                RefinementOutcome::Inconclusive { reason } => reason.clone(),
+                other => panic!(
+                    "{}: expected an undecided verdict, got {other:?}",
+                    verdict.obligation
+                ),
+            })
+            .collect();
+        assert!(
+            crate::formal_gap::refinement_gap_reason(&verdicts[0].outcome).is_some(),
+            "{reasons:?}"
+        );
+        for reason in &reasons[1..] {
+            assert_eq!(
+                reason,
+                "unknown: (:reason-unknown (incomplete self-check-rejected))"
+            );
+        }
+        // Production fails closed on the sequence (strict lane refuses, default
+        // lane withholds the refinement).
+        assert!(matches!(outcome, RefinementOutcome::Inconclusive { .. }));
+        // A test sees the rejection, not the hole, so it fails instead of
+        // skipping.
+        let seen = crate::formal_gap::test_outcome("hole_then_rejection", verdicts);
+        assert!(
+            crate::formal_gap::refinement_gap_reason(&seen).is_none(),
+            "{seen:?}"
+        );
+        assert!(
+            format!("{seen:?}").contains("self-check-rejected"),
+            "{seen:?}"
+        );
+    }
+
+    /// The production half of the same defect: the default refinement lane
+    /// fails the compile closed on `Refuted` and SKIPS an `Inconclusive`, so a
+    /// hole on the first obligation used to hide a refutation of a later one
+    /// and a wrong lowering compiled. Every obligation is now discharged and the
+    /// refutation wins.
+    #[cfg(unix)]
+    #[test]
+    fn a_hole_on_the_first_obligation_does_not_hide_a_later_refutation() {
+        let _serial = crate::ay_bridge::formal_solver_test_lock();
+        let dir = tempfile::tempdir().expect("fake authority dir");
+        let ops = three_obligation_sequence();
+        let queries = queries_per_memory_obligation(&ops);
+        let (ay, clean) = fake_hole_first_authority(dir.path(), queries, "printf 'sat\\n'");
+        let outcome = with_fake_authority(&ay, &clean, || {
+            assert!(
+                ay_bridge::z3_available(),
+                "the fake authority must be selected"
+            );
+            check_memory_sequence(
+                "hole_then_refutation",
+                &ops,
+                &ops,
+                &MemCheckConfig::default(),
+                &cfg(),
+            )
+            .expect("no structural error")
+        });
+        assert!(
+            matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "a refuted obligation must fail the sequence closed even behind a hole, got \
+             {outcome:?}"
+        );
+        assert_eq!(
+            proof_bearing_queries(&ay),
+            3 * queries,
+            "every obligation tried both query forms"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lane 12c: core's countdown `StepBy<Range<u64|usize>>::next`
+    // -----------------------------------------------------------------------
+
+    /// core's countdown `spec_next` for `StepBy<Range<u64>>` with a 64-bit
+    /// `usize`, transcribed from `spec_int_ranges!`: the yield and the
+    /// post-state `(start, end)`.
+    fn core_countdown_spec_next(sm: u64, start: u64, end: u64) -> (Option<u64>, u64, u64) {
+        // `original_step()` is `step_minus_one + 1`, which StepBy's type
+        // invariant keeps from overflowing; `u64::try_from` of a 64-bit
+        // `usize` never takes the `T::MAX` fallback.
+        let step = sm
+            .checked_add(1)
+            .expect("StepBy invariant: step_minus_one != usize::MAX");
+        let remaining = end;
+        if remaining > 0 {
+            let val = start;
+            (Some(val), val.wrapping_add(step), remaining - 1)
+        } else {
+            (None, start, end)
+        }
+    }
+
+    /// One countdown pull evaluated through the spec formulas:
+    /// `(tag, payload, new_start, new_end)`.
+    fn countdown_spec_pull(
+        spec: &StepByCountdownNextSpec,
+        sm: u64,
+        start: u64,
+        end: u64,
+    ) -> (u64, u64, u64, u64) {
+        let env: HashMap<String, u64> = [
+            ("sm".to_string(), sm),
+            ("start".to_string(), start),
+            ("end".to_string(), end),
+        ]
+        .into_iter()
+        .collect();
+        let eval = |e: &SmtExpr| e.try_eval(&env).expect("closed formula").as_u64();
+        (
+            eval(&spec.tag),
+            eval(&spec.payload),
+            eval(&spec.new_start),
+            eval(&spec.new_end),
+        )
+    }
+
+    /// The spec agrees with core's `spec_next` on every state of a grid that
+    /// covers an exhausted count, the last item, a step that wraps `start`,
+    /// and the largest `step_minus_one` the type invariant admits; at both a
+    /// 1-byte and an 8-byte tag.
+    #[test]
+    fn step_by_countdown_next_spec_matches_core_spec_next() {
+        const SOME: u64 = 1;
+        const NONE: u64 = 0;
+        for tag_width in [1u32, 8] {
+            let spec = step_by_countdown_next_spec("sm", "start", "end", SOME, NONE, tag_width);
+            assert_eq!(
+                spec.inputs,
+                vec![
+                    ("sm".to_string(), 64),
+                    ("start".to_string(), 64),
+                    ("end".to_string(), 64)
+                ]
+            );
+            for sm in [0, 1, 2, 6, 0xFFFF_FFFF, 1 << 32, u64::MAX - 1] {
+                for start in [0, 1, 5, 1 << 40, u64::MAX - 3, u64::MAX] {
+                    for end in [0, 1, 2, 7, u64::MAX] {
+                        let (want, want_start, want_end) = core_countdown_spec_next(sm, start, end);
+                        let (tag, payload, got_start, got_end) =
+                            countdown_spec_pull(&spec, sm, start, end);
+                        let at = format!("sm={sm} start={start} end={end} tag_width={tag_width}");
+                        assert_eq!(got_start, want_start, "new start at {at}");
+                        assert_eq!(got_end, want_end, "new end at {at}");
+                        match want {
+                            Some(value) => {
+                                assert_eq!(tag, SOME, "tag at {at}");
+                                assert_eq!(payload, value, "payload at {at}");
+                            }
+                            None => assert_eq!(tag, NONE, "tag at {at}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iterating the spec from the state `StepBy::new` leaves (`end =
+    /// div_ceil(len, k)`, `step_minus_one = k - 1`) yields exactly what the
+    /// host's own `core` `(a..b).step_by(k)` yields, then stays exhausted
+    /// with its state unchanged; for `u64` and, on a 64-bit host, `usize`.
+    #[test]
+    fn step_by_countdown_next_spec_replays_core_step_by() {
+        let spec = step_by_countdown_next_spec("sm", "start", "end", 1, 0, 8);
+        let cases: &[(u64, u64, u64)] = &[
+            (0, 10, 1),
+            (0, 10, 3),
+            (0, 9, 3),
+            (3, 4, 7),
+            (5, 5, 2),
+            (9, 3, 2),
+            (0, 0, 1),
+            (7, 100, 1 << 40),
+            (u64::MAX - 10, u64::MAX, 3),
+            (u64::MAX - 10, u64::MAX, 4),
+            (u64::MAX - 1, u64::MAX, 1),
+            (0, u64::MAX, 1 << 62),
+            (1, u64::MAX, u64::MAX),
+        ];
+        let replay = |a: u64, b: u64, k: u64| -> Vec<u64> {
+            let len = b.saturating_sub(a);
+            let (sm, mut start, mut end) = (k - 1, a, len.div_ceil(k));
+            let mut got = Vec::new();
+            // Every case yields at most 10 items.
+            for _ in 0..=11 {
+                let (tag, payload, new_start, new_end) = countdown_spec_pull(&spec, sm, start, end);
+                if tag == 0 {
+                    assert_eq!(
+                        (new_start, new_end),
+                        (start, end),
+                        "an exhausted pull leaves the state unchanged ({a}..{b}).step_by({k})"
+                    );
+                    let (again, ..) = countdown_spec_pull(&spec, sm, new_start, new_end);
+                    assert_eq!(again, 0, "({a}..{b}).step_by({k}) stays exhausted");
+                    return got;
+                }
+                got.push(payload);
+                (start, end) = (new_start, new_end);
+            }
+            panic!("({a}..{b}).step_by({k}) never reported None");
+        };
+        for &(a, b, k) in cases {
+            let step = usize::try_from(k).expect("64-bit host step");
+            let want: Vec<u64> = (a..b).step_by(step).collect();
+            assert_eq!(replay(a, b, k), want, "u64 ({a}..{b}).step_by({k})");
+            #[cfg(target_pointer_width = "64")]
+            {
+                let want_usize: Vec<u64> = (a as usize..b as usize)
+                    .step_by(step)
+                    .map(|v| v as u64)
+                    .collect();
+                assert_eq!(replay(a, b, k), want_usize, "usize ({a}..{b}).step_by({k})");
+            }
+        }
     }
 }

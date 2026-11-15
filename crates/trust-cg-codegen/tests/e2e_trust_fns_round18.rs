@@ -103,11 +103,14 @@ const FBINOPS: [(BinOp, &str); 6] = [
 /// `fn fcmp_<name>(a: f64, b: f64) -> i64 { (a <op> b) as i64 }`: an `FCmp` producing
 /// a bool, then a `Select` mapping bool→{1,0} for a clean integer JIT ABI.
 fn build_fcmp_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCmpOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -142,7 +145,9 @@ fn build_fcmp_fn(func_id: u32, name: &str, module: &mut TrustIrModule, op: FCmpO
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_fcmp_module() -> TrustIrModule {
@@ -156,11 +161,14 @@ fn build_fcmp_module() -> TrustIrModule {
 /// One-op module `fn <name>(a: f64, b: f64) -> f64 { a <op> b }`.
 fn build_fbinop_module(name: &str, op: BinOp) -> TrustIrModule {
     let mut module = TrustIrModule::new("interp_fbinop");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -178,7 +186,9 @@ fn build_fbinop_module(name: &str, op: BinOp) -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -310,6 +320,7 @@ type FbinFn = unsafe extern "C" fn(f64, f64) -> f64;
 fn jit_buffer(module: &TrustIrModule) -> trust_cg_codegen::jit::ExecutableBuffer {
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .expect("hand-built FP module must JIT-compile (backend supports FP)")
         .buffer
@@ -668,7 +679,9 @@ fn trust_interp_float_hollow_leaf_jit_link_fails_pinned() {
     // lowered. JIT compile must FAIL (F4 UnresolvedSymbol), proving the "emit-OK" is a
     // hollow stub, not real float support.
     let config = CompilerConfig::jit_fast(Target::Aarch64);
-    let result = Compiler::new(config).compile_module_to_jit(&module, &HashMap::new());
+    let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
+        .compile_module_to_jit(&module, &HashMap::new());
     match result {
         Ok(_) => panic!(
             "PIN STALE: the hollow float-intrinsic stub now JIT-compiles — the \
@@ -680,4 +693,13 @@ fn trust_interp_float_hollow_leaf_jit_link_fails_pinned() {
             eprintln!("PIN ARMED (FINDING A): hollow float-intrinsic stub fails to JIT: {msg}");
         }
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

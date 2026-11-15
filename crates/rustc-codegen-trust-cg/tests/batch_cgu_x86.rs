@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test: CT-BATCH Step 2/3 — per-CGU module batching
 // (`TCG_BATCH_CGU=1`, `docs/module-batching-design-2026-07-04.md`).
@@ -24,68 +28,17 @@ mod target_dir_support;
 // is exercised by the ineligible-module corpus programs (globals / fn-pointer
 // values) in the differential harness; this test pins the happy path.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run batch test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -133,8 +86,9 @@ struct CompileOut {
 }
 
 /// Compile `SRC` through the bridge into `--out-dir` (so every emitted object
-/// is observable) with the given extra envs; returns the sorted object list.
-fn bridge_compile(stem: &str, envs: &[(&str, &str)]) -> CompileOut {
+/// is observable) with the given extra backend knobs; returns the sorted object
+/// list.
+fn bridge_compile(stem: &str, knobs: &[&str]) -> CompileOut {
     let dylib = ensure_dylib_built();
     let dir = workdir(stem);
     let src_path = dir.join("prog.rs");
@@ -145,9 +99,8 @@ fn bridge_compile(stem: &str, envs: &[(&str, &str)]) -> CompileOut {
         s.push(&dylib);
         s
     };
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.arg("--crate-type")
         .arg("bin")
         .arg(&backend_arg)
         .args([
@@ -162,10 +115,14 @@ fn bridge_compile(stem: &str, envs: &[(&str, &str)]) -> CompileOut {
         .arg("--out-dir")
         .arg(&dir)
         .arg(&src_path);
-    for (k, v) in envs {
-        cmd.env(k, v);
+    // Backend knobs travel on the TRACKED `-Ztrust-ir-cg-args` option, never in
+    // the child's environment: trustc refuses every `TCG_*`/`TRUST_CG_*`
+    // variable as an untracked semantic/codegen control, so an environment
+    // overlay here would fail the compile before the backend loaded.
+    if !knobs.is_empty() {
+        cmd.arg(toolchain_support::backend_knobs_arg(knobs));
     }
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
@@ -193,7 +150,7 @@ fn link_run(out: &CompileOut) -> i32 {
         let nm = Command::new("nm").arg("-u").arg(obj).output().expect("nm");
         for line in String::from_utf8_lossy(&nm.stdout).lines() {
             let sym = line.trim().trim_start_matches('U').trim();
-            if sym.contains("panic") && seen.insert(sym.to_owned()) {
+            if toolchain_support::is_abort_stub_symbol(sym) && seen.insert(sym.to_owned()) {
                 let c = sym.strip_prefix('_').unwrap_or(sym);
                 stubs.push_str(&format!(
                     "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -234,7 +191,7 @@ fn batched_cgu_fires_matches_legacy_and_is_deterministic() {
     // Legacy (gate OFF, explicit): one object per surviving function. The
     // panic-handler shim is GC-dropped from the LINK but its temp object file
     // still lands in --out-dir, so expect the 5 fn objects + 1 dropped shim.
-    let legacy = bridge_compile("off", &[("TCG_BATCH_CGU", "0")]);
+    let legacy = bridge_compile("off", &["batch-cgu=0"]);
     assert!(
         legacy.objects.len() > 1,
         "gate OFF must keep one-object-per-function (got {})",
@@ -244,10 +201,7 @@ fn batched_cgu_fires_matches_legacy_and_is_deterministic() {
     assert_eq!(legacy_exit, EXPECTED_EXIT, "legacy exit code");
 
     // Batched (gate ON): the CGU's five functions merge into ONE object.
-    let batched = bridge_compile(
-        "on",
-        &[("TCG_BATCH_CGU", "1"), ("TCG_BATCH_TRACE", "1")],
-    );
+    let batched = bridge_compile("on", &["batch-cgu=1", "batch-trace"]);
     assert!(
         batched.stderr.contains("BATCHED"),
         "expected a TCG_BATCH BATCHED trace line; stderr: <<<{}>>>",
@@ -265,10 +219,7 @@ fn batched_cgu_fires_matches_legacy_and_is_deterministic() {
 
     // Determinism: a second batched compile is byte-identical (also pins the
     // parallel fan-out, which the batched path enables).
-    let batched2 = bridge_compile(
-        "on2",
-        &[("TCG_BATCH_CGU", "1"), ("TCG_BATCH_TRACE", "1")],
-    );
+    let batched2 = bridge_compile("on2", &["batch-cgu=1", "batch-trace"]);
     assert_eq!(batched2.objects.len(), 1);
     let a = std::fs::read(&batched.objects[0]).expect("read batched object");
     let b = std::fs::read(&batched2.objects[0]).expect("read batched2 object");

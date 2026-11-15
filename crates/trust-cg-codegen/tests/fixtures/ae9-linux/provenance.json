@@ -1,0 +1,53 @@
+{
+  "schema": "trust-cg.tc-stitch-fixtures.v2",
+  "compiler": {
+    "version": "rustc 1.99.0-dev (ae9c2c1da 2026-09-21) (trustc 0.1.0)",
+    "commit": "ae9c2c1daa0fc80afbfd380e493f5581ac714acb",
+    "target": "aarch64-unknown-linux-gnu",
+    "tool_files": {
+      "/home/ayates/trust-cg-soundness-20260914/trust-authored-qualified-20260924/trust-ae9c2c1d/bin/targo": "4d877f14d86c786a1c077d5423f14304493d56ecf058447d6d8244cbb8a446ba",
+      "/home/ayates/trust-cg-soundness-20260914/trust-authored-qualified-20260924/trust-ae9c2c1d/bin/trustc": "b2d4fa4bb1ce8106539d7c2967f1eb3f3f613293b8c905de586fbb4f5ffa4212",
+      "/home/ayates/trust-cg-soundness-20260914/trust-authored-qualified-20260924/trust-ae9c2c1d/lib/librustc_driver-3d85360a91bba93f.so": "1e9c5dded395234c61bed09a99a70e25f5898d8332782ce1c95a673a01b39050"
+    }
+  },
+  "clean_revision": "6a1050f3d9692a3740c345c41484bd8fa7857447",
+  "frontend_sha256": "004b3aea7827bc051ab319beb09140e29d7b5d34656f0404a8b333f88f77a7f1",
+  "source": "crates/trust-cg-codegen/tests/slices/clean_tc_stitch_slice.rs",
+  "source_sha256": "b8cc46eda9707e3a22993589069a85c981a20d7b639a8466898bef1a5b412b99",
+  "profile": [
+    "--crate-name",
+    "clean_tc_stitch_slice",
+    "--crate-type=lib",
+    "--edition=2021",
+    "--target",
+    "aarch64-unknown-linux-gnu",
+    "-C",
+    "panic=abort",
+    "-C",
+    "overflow-checks=off",
+    "-C",
+    "debug-assertions=off"
+  ],
+  "fixtures": {
+    "clean_tc_stitch_proj.tir": {
+      "root": "tc_proj_root",
+      "sha256": "ed834f19f3e60ce7ee4f74be3fd32386dbf6c4e7e482425f001e0a60ec3ee52e",
+      "bytes": 1006902,
+      "closure_members": 136
+    },
+    "clean_tc_stitch_whnf.tir": {
+      "root": "tc_whnf_route_root",
+      "sha256": "7b32a8637320c54d283ac906ead5b48155df5ebb52851c941361ae05992876f6",
+      "bytes": 456682,
+      "closure_members": 89
+    }
+  },
+  "consumer_trust_ir_revision": "be4018498bc33a9416c4e9ebec317b762f0d7751",
+  "generator_base_revision": "14b37845e84b3dfd3cbfa3284e4f3b9a7d0dc3ab",
+  "generator_changed_sources_sha256": {
+    "frontend/src/mir_lower.rs": "7084b1e0776ad776dfda7259b27942d9cbb997edd84329d8e419e96a539ea3ef",
+    "frontend/tests/fixtures/shared_globals_corpus.rs": "ff56a0f2e4c4dbba0dade97000d5deda6a59de56f50fc0f8c048a763e82fdbe8",
+    "frontend/tests/shared_globals.rs": "925f299a482658e751b16323cea3de553828ef4d1fd480a8609d916c57f5f5bf"
+  },
+  "generation_record_sha256": "f0e44092f96993916adecb41e7893156931748a0ef1b5a289c8b6ed2dd339e5b"
+}

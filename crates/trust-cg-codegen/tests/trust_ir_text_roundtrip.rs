@@ -12,8 +12,6 @@
 // The upstream round-trip contract is:
 //     parse(display(m)) == m          (structural equality on fields)
 //     display(parse(display(m))) == display(m)   (Display is canonical)
-//
-// See `designs/2026-04-16-trust_ir-transport-architecture.md` Layer 3.
 
 use trust_cg_codegen::pipeline::{
     FormatMode, InputFormat, detect_input_format, encode_trust_ir_text, load_module_as,
@@ -32,7 +30,7 @@ fn make_const_module(name: &str) -> TrustIrModule {
     let r = fb.iconst(Ty::I64, 42);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Build a module with a trivial `fn add(a, b) -> i64 { a + b }`.
@@ -47,7 +45,7 @@ fn make_add_module() -> TrustIrModule {
     let sum = fb.add(Ty::I64, a, b);
     fb.ret(vec![sum]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 // ---------------------------------------------------------------------------

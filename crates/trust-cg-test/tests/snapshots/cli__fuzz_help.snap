@@ -41,34 +41,25 @@ Options:
 
           See the selected subcommand's help for its output type and default.
 
+  -q, --quiet
+          Log errors only (sets the stderr log level to `error`)
+
       --seeds <N>
           Planned seed cap; ignored in v0.1.0
-
-      --timeout <SECS>
-          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
 
       --optlevel <N>
           Planned optimization level; ignored in v0.1.0
 
           [default: 2]
 
-      --parallel <N>
-          Worker count (honors cargo-serialization lock). Default: auto
-
-  -q, --quiet
-          Suppress progress bars; errors still go to stderr
-
-      --reduce
-          Planned reduction control; no reducer runs in v0.1.0
-
   -v, --verbose...
           Show debug-level events. Repeat for more: -vv, -vvv
 
-      --no-cache
-          Ignore proof / corpus caches
-
       --dry-run
           Print what would run without executing external tools
+
+      --reduce
+          Planned reduction control; no reducer runs in v0.1.0
 
   -h, --help
           Print help (see a summary with '-h')

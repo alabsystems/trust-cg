@@ -36,15 +36,28 @@
 //!
 //! RUN ONE TEST AT A TIME (JIT module-accumulation SIGTRAPs a full-suite
 //! single process; see jit-parallel-race-2026-06-29.md):
-//!   cargo test -p trust-cg-codegen --test e2e_eta_struct_ext -- --exact \
+//!   scripts/trust_cargo.sh test -p trust-cg-codegen --test e2e_eta_struct_ext -- --exact \
 //!     mir_eta_struct_params_roundtrip --test-threads=1
 
 #![cfg(target_arch = "aarch64")]
 
-#[cfg(kernel_fixture_layout_unknown)]
+// A lint driver (`clippy-driver`/`tippy-driver`) links no test binary, so
+// under `kernel_fixture_layout_lint_only` this target is compiled only to BE
+// LINTED; the fixtures still cannot run, because every JIT entry point below
+// refuses at runtime under that same cfg. The ae9 Linux compiler selects its
+// own separately generated fixtures.
+#[cfg(all(
+    kernel_fixture_layout_unknown,
+    not(kernel_fixture_ae9_linux),
+    not(kernel_fixture_layout_lint_only)
+))]
 compile_error!(
     "kernel JIT fixtures require exact Rust 1.95.0, Rust 1.97.1, or the certified Trust compiler"
 );
+
+#[cfg(kernel_fixture_layout_lint_only)]
+#[path = "common/kernel_fixture_guard.rs"]
+mod kernel_fixture_guard;
 
 use std::collections::HashMap;
 
@@ -66,8 +79,10 @@ use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 ///     frontend also materializes explicit `drop_glue` leaves (bound no-op —
 ///     everything leaks by design). Each drifted shim is cfg-selected below.
 ///     Both certified fixture lanes run all tests; nothing is ignored.
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const MIR_ETA_EXT_CLOSURE_TRUST_IR: &str = include_str!("clean_eta_ext.trust.tir");
+#[cfg(kernel_fixture_ae9_linux)]
+const MIR_ETA_EXT_CLOSURE_TRUST_IR: &str = include_str!("fixtures/ae9-linux/clean_eta_ext.tir");
 #[cfg(kernel_fixture_layout_matches)]
 const MIR_ETA_EXT_CLOSURE_TRUST_IR: &str = r#"; TrustIr text format v1
 module "mir::closure::eta_ext_root"
@@ -17849,8 +17864,11 @@ bb1(%1: u32):
 /// VERBATIM `--mir-emit-closure expand_eta_root` output over clean_eta_ext_slice.rs.
 /// stable = inline below; trust = `clean_expand_eta.trust.tir` (re-emitted by the
 /// current frontend). Same cfg-gate + cfg-selected shims as the eta_ext fixture.
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const MIR_EXPAND_ETA_CLOSURE_TRUST_IR: &str = include_str!("clean_expand_eta.trust.tir");
+#[cfg(kernel_fixture_ae9_linux)]
+const MIR_EXPAND_ETA_CLOSURE_TRUST_IR: &str =
+    include_str!("fixtures/ae9-linux/clean_expand_eta.tir");
 #[cfg(kernel_fixture_layout_matches)]
 const MIR_EXPAND_ETA_CLOSURE_TRUST_IR: &str = r#"; TrustIr text format v1
 module "mir::closure::expand_eta_root"
@@ -37618,7 +37636,13 @@ type EtaExtFn = extern "C" fn(u32, u32) -> i32;
 /// ABI of the MIR-emitted expand_eta_root: (out sret-style ptr, scenario) -> i32.
 type ExpandEtaFn = extern "C" fn(*mut nslice::Expr, u32) -> i32;
 
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_eta_ext_root() -> (trust_cg_codegen::jit::ExecutableBuffer, EtaExtFn) {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_eta_ext_root");
     let module = trust_ir::parser::parse_module(MIR_ETA_EXT_CLOSURE_TRUST_IR)
         .expect("MIR-emitted eta_ext closure trust-ir text must parse");
 
@@ -37678,6 +37702,7 @@ fn jit_eta_ext_root() -> (trust_cg_codegen::jit::ExecutableBuffer, EtaExtFn) {
 
     let externs = bind_eta_externs(MIR_ETA_EXT_CLOSURE_TRUST_IR);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted eta_ext closure failed")
         .buffer;
@@ -37920,7 +37945,15 @@ fn jit_expand(f: ExpandEtaFn, scenario: u32) -> Option<nslice::Expr> {
 /// dependent structure (DStruct), and all four guards (already-ctor-app /
 /// not-structure-like / type-head mismatch / Prop-typed structure).
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_expand_eta_struct_recursor_major_roundtrip() {
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_expand_eta_struct_recursor_major_roundtrip",
+    );
     let module = trust_ir::parser::parse_module(MIR_EXPAND_ETA_CLOSURE_TRUST_IR)
         .expect("MIR-emitted expand_eta closure trust-ir text must parse");
 
@@ -37975,6 +38008,7 @@ fn mir_expand_eta_struct_recursor_major_roundtrip() {
 
     let externs = bind_eta_externs(MIR_EXPAND_ETA_CLOSURE_TRUST_IR);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted expand_eta closure failed")
         .buffer;
@@ -38088,4 +38122,13 @@ fn mir_expand_eta_struct_recursor_major_roundtrip() {
     );
 
     drop(buffer);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

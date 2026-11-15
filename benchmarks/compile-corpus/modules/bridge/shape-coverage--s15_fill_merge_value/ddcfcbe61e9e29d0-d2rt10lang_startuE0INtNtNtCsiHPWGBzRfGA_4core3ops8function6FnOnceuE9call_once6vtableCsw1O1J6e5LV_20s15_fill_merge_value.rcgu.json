@@ -1,0 +1,10 @@
+{
+  "schema": "trust-cg.bridge-trust-ir-dump.v1",
+  "cgu": "_RNSNvYNCINvNtCshdpSglmLaqw_3std2rt10lang_startuE0INtNtNtCsiHPWGBzRfGA_4core3ops8function6FnOnceuE9call_once6vtableCsw1O1J6e5LV_20s15_fill_merge_value",
+  "kind": "Regular",
+  "target": "Aarch64",
+  "opt_level": "O2",
+  "emit_proofs": true,
+  "panic_unwind": false,
+  "parallel": false
+}

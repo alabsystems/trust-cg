@@ -1,0 +1,23 @@
+; TrustIr text format v1
+module "abi_function_symbol"
+target "x86_64-unknown-linux-gnu" 8 little abi="sysv64"
+
+functy.0 = (i32) -> (i32)
+
+fn @imported_protected(functy.0) {
+    ; #visibility: protected
+}
+
+fn @hidden_helper(functy.0) {
+    ; #section: "__TEXT,__text_hidden"
+    ; #visibility: hidden
+    ; #retained: true
+bb0(%0: i32):
+    %1 = call @func.0(%0)
+    ret %1
+}
+
+fn @plain(functy.0) {
+bb0(%0: i32):
+    ret %0
+}

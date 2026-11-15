@@ -19,6 +19,7 @@ use std::process::Command;
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::{AArch64IsaProfile, TargetSpec};
 
 use trust_ir::{
     Block as TrustIrBlock, CastOp, FuncTy, Function as TrustIrFunction, Inst, InstrNode,
@@ -26,16 +27,24 @@ use trust_ir::{
 };
 use trust_ir::{BlockId, FuncId};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 fn build_sat(func_id: u32, name: &str, m: &mut TrustIrModule, op: CastOp, src: Ty, dst: Ty) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![src.clone()],
-        returns: vec![dst.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![src.clone()],
+            returns: vec![dst.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -53,7 +62,8 @@ fn build_sat(func_id: u32, name: &str, m: &mut TrustIrModule, op: CastOp, src: T
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -68,7 +78,8 @@ fn compile_ok(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let r = compiler
         .compile(module)
         .expect("register-width saturating casts must compile (certs included)");
@@ -111,8 +122,8 @@ int main(void) {
 "#;
 
 fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -131,6 +142,7 @@ fn link_run(tag: &str, obj: &[u8], driver: &str) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -208,19 +220,88 @@ int main(void) {
 }
 "#;
 
+/// The f16 sources need FEAT_FP16 (`FCVTZS/FCVTZU H`). Darwin's AOT target
+/// contract admits it, so the production `Compiler` lane runs there; generic
+/// Linux AOT refuses it by name (pinned below), so every native host also runs
+/// the explicit-FP16 pipeline lane, the only admitted FP16 lane on Linux GNU.
+/// A host CPU without FP16 is a failure, never a skip.
+fn narrow_objects_at(module: &TrustIrModule, opt: OptLevel) -> Vec<(&'static str, Vec<u8>)> {
+    let mut objects = Vec::new();
+    if !native_host::LINUX_GNU {
+        objects.push(("darwin-aot", compile_ok(module, opt)));
+    }
+    if native_host::NATIVE {
+        assert!(
+            AArch64IsaProfile::FP16.is_supported_by_host(),
+            "the explicit FP16 native lane requires host FP16"
+        );
+        let object = native_host::compile_with_isa_profile(module, opt, AArch64IsaProfile::FP16)
+            .unwrap_or_else(|error| panic!("explicit FP16 {opt:?}: {error}"));
+        objects.push(("explicit-fp16", object));
+    }
+    objects
+}
+
+/// Generic Linux AOT keeps refusing f16 saturating conversions by name.
+/// Object-level, so it runs on every host.
+#[test]
+fn generic_linux_aot_refuses_fp16_saturating_casts_by_name() {
+    let error = Compiler::new_for_target_spec(
+        CompilerConfig::default(),
+        TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&build_narrow_module())
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("FEAT_FP16 is not admitted"), "{error}");
+}
+
 #[test]
 fn e2e_aarch64_narrow_saturating_casts_exhaustive() {
     // i8/i16/i32/u8/u16/u32 saturating casts: FCVTZS/FCVTZU to i64 (NaN->0,
     // i64-saturating) then a destination-width clamp then truncate.
     let module = build_narrow_module();
     for opt in [OptLevel::O0, OptLevel::O2] {
-        let obj = compile_ok(&module, opt);
-        let Some(code) = link_run("narrow_sat", &obj, NARROW_DRIVER) else {
+        let objects = narrow_objects_at(&module, opt);
+        if objects.is_empty() {
+            eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
             return;
-        };
-        assert_eq!(
-            code, 0,
-            "narrow saturating cast mismatch at {opt:?} (case code {code})",
-        );
+        }
+        for (lane, obj) in objects {
+            let Some(code) = link_run(&format!("narrow_sat_{lane}"), &obj, NARROW_DRIVER) else {
+                return;
+            };
+            assert_eq!(
+                code, 0,
+                "narrow saturating cast mismatch at {opt:?} via {lane} (case code {code})",
+            );
+        }
     }
+}
+
+/// The Linux GNU explicit-FP16 lane's object, checked at object level on every
+/// host: the f16 saturating casts compile for the generic Linux triple.
+#[test]
+fn explicit_fp16_linux_saturating_cast_object_is_elf_aarch64() {
+    for opt in [OptLevel::O0, OptLevel::O2] {
+        let object = native_host::compile_with_isa_profile_for(
+            "aarch64-unknown-linux-gnu",
+            &build_narrow_module(),
+            opt,
+            AArch64IsaProfile::FP16,
+        )
+        .unwrap_or_else(|error| panic!("{opt:?}: {error}"));
+        native_host::assert_elf_aarch64_object(&object);
+        assert!(!native_host::text_words(&object).is_empty());
+    }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

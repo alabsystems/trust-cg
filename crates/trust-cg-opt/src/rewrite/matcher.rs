@@ -12,7 +12,7 @@
 //!
 //! [`Constraint`]: super::Constraint
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, MachInst, OpcodeCategory, VReg};
 
@@ -187,7 +187,7 @@ mod tests {
         block_id: BlockId,
         up_to_exclusive: usize,
     ) -> HashMap<VReg, InstId> {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         let ids = func.block(block_id).insts.clone();
         for &inst_id in ids.iter().take(up_to_exclusive) {
             let inst = func.inst(inst_id);

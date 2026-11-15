@@ -365,6 +365,44 @@ pub const X86_ARG_XMMS: [X86PReg; 8] = [XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6
 /// Return-value XMM registers. XMM0 for the first FP return, XMM1 for the second.
 pub const X86_RET_XMMS: [X86PReg; 2] = [XMM0, XMM1];
 
+/// TrustCG's INTERNAL multi-result return file, System V AMD64 only: the
+/// integer registers in which a function with several independent scalar IR
+/// results returns them, in allocation order.
+///
+/// This is NOT a C ABI rule. A C function has one return value; System V
+/// returns it in [`X86_RET_GPRS`] (RAX,RDX) and [`X86_RET_XMMS`] (XMM0,XMM1)
+/// when it fits two eightbytes and through a hidden `sret` pointer otherwise.
+/// A TrustIR function with more independent results than that file holds has
+/// no C spelling at all. The AArch64 backend already places such results in
+/// X0-X7 / V0-V7 (`AppleAArch64ABI::classify_returns`); this is the x86-64
+/// counterpart.
+///
+/// * **Prefix.** The C file is a same-index PREFIX of this one, and both are
+///   allocated in order from the front, one counter per class. Every scalar
+///   return sequence that fits the C file is therefore placed IDENTICALLY
+///   under both; only a sequence that exhausts the C file reaches the
+///   extension. `x86_internal_return_file_extends_the_c_file` pins that.
+/// * **Caller-saved only.** A result cannot live in a register the callee must
+///   restore, so no callee-saved register (RBX, RBP, R12-R15) appears.
+/// * **Not R10/R11.** They are caller-saved, but this backend reserves them as
+///   its post-register-allocation scratch — spill/reload materialization,
+///   parallel-copy cycle breaking, the profiling counter trampoline — and
+///   never allocates them. A result parked in one could be overwritten by a
+///   reload emitted between the return moves and `ret`, or between a call and
+///   the caller's extraction of its results. The file stops at R9 instead of
+///   proving every such emitter avoids them.
+///
+/// Admission is the adapter's job, not this table's: an edge that exhausts the
+/// C file is compiled only under a TrustCG-owned calling convention (`Fast` or
+/// `Cold`); `C` and every other foreign ABI is refused by name (see
+/// `trust_cg_lower::adapter`, `[TCG-X86-MULTI-RESULT]`).
+pub const X86_INTERNAL_RET_GPRS: [X86PReg; 7] = [RAX, RDX, RCX, RSI, RDI, R8, R9];
+
+/// The SSE half of [`X86_INTERNAL_RET_GPRS`]: XMM0-XMM7, the eight System V
+/// argument XMMs. [`X86_RET_XMMS`] is its same-index prefix. XMM14/XMM15 (the
+/// System V spill and parallel-copy scratch) are outside it.
+pub const X86_INTERNAL_RET_XMMS: [X86PReg; 8] = [XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7];
+
 /// Registers clobbered by a CALL instruction (superset of caller-saved).
 ///
 /// Includes all caller-saved GPRs. RSP is also modified (by the implicit
@@ -844,6 +882,49 @@ mod tests {
         assert!(!x86_regs_overlap(RAX, RBX));
         assert!(!x86_regs_overlap(EAX, EBX));
         assert!(!x86_regs_overlap(RAX, XMM0)); // different groups
+    }
+
+    /// The internal multi-result file must extend the System V C return file
+    /// as a same-index prefix (so every C-shaped return is placed identically),
+    /// hold only caller-saved registers, and stay clear of the post-RA scratch
+    /// registers R10/R11 and XMM14/XMM15.
+    #[test]
+    fn x86_internal_return_file_extends_the_c_file() {
+        assert_eq!(X86_INTERNAL_RET_GPRS[..X86_RET_GPRS.len()], X86_RET_GPRS);
+        assert_eq!(X86_INTERNAL_RET_XMMS[..X86_RET_XMMS.len()], X86_RET_XMMS);
+        for reg in X86_INTERNAL_RET_GPRS {
+            assert!(
+                X86_CALLER_SAVED_GPRS.contains(&reg),
+                "{reg} is not caller-saved"
+            );
+            assert!(
+                !X86_CALLEE_SAVED_GPRS.contains(&reg),
+                "{reg} is callee-saved"
+            );
+            assert!(
+                reg != R10 && reg != R11,
+                "{reg} is reserved post-RA scratch"
+            );
+        }
+        for reg in X86_INTERNAL_RET_XMMS {
+            assert!(
+                X86_CALLER_SAVED_XMMS.contains(&reg),
+                "{reg} is not caller-saved"
+            );
+            assert!(
+                reg != XMM14 && reg != XMM15,
+                "{reg} is reserved post-RA scratch"
+            );
+        }
+        let mut seen = X86_INTERNAL_RET_GPRS.to_vec();
+        seen.extend(X86_INTERNAL_RET_XMMS);
+        seen.sort_by_key(|reg| reg.encoding());
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            X86_INTERNAL_RET_GPRS.len() + X86_INTERNAL_RET_XMMS.len(),
+            "a register appears twice in the internal return file"
+        );
     }
 
     #[test]

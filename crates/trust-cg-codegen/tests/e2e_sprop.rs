@@ -32,6 +32,11 @@
 #![allow(non_snake_case)]
 #![allow(unused_imports)]
 
+// Host-target loading of the frozen Clean fixtures (rewrites the AArch64
+// `target` header line to this host; see the module for the evidence).
+#[path = "common/kernel_fixture.rs"]
+mod kernel_fixture;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use trust_cg_codegen::Target;
@@ -138,7 +143,8 @@ fn externs() -> HashMap<String, *const u8> {
 }
 
 fn parse_validate(text: &str, what: &str) -> trust_ir::Module {
-    let m = trust_ir::parser::parse_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
+    let m =
+        kernel_fixture::parse_host_module(text).unwrap_or_else(|e| panic!("{what} parse: {e:?}"));
     let errs = trust_ir_build::validate_module(&m);
     assert!(errs.is_empty(), "{what} validate: {errs:?}");
     m
@@ -159,8 +165,9 @@ fn jit_with_externs(
             );
         }
     }
-    let config = CompilerConfig::jit_fast(Target::Aarch64);
+    let config = CompilerConfig::jit_fast(kernel_fixture::host_jit_target());
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, ext)
         .unwrap_or_else(|e| panic!("JIT compile {what} failed: {e:?}"))
         .buffer
@@ -585,4 +592,13 @@ fn sprop_armed_golden_corruption() {
     eprintln!(
         "armed: SProp disc 11->10 flips the SProp accept to reject in JIT (native still accepts); Prop path unaffected"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

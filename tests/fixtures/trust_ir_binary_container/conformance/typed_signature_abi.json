@@ -1,0 +1,307 @@
+{
+  "name": "typed_signature_abi",
+  "functions": [],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Ptr",
+        "I8",
+        "U64",
+        "F64",
+        {
+          "Tuple": [
+            "F32",
+            "F32",
+            "F32"
+          ]
+        },
+        "Ptr"
+      ],
+      "returns": [],
+      "is_vararg": false,
+      "abi": {
+        "target": {
+          "triple": "aarch64-apple-darwin",
+          "data_layout": "e-m:o-p:64:64-i64:64-i128:128-n32:64-S128",
+          "abi": "darwinpcs",
+          "cpu": "apple-m5",
+          "features": [
+            "+fp-armv8",
+            "+neon"
+          ],
+          "target_spec": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "pointer_bytes": 8,
+          "little_endian": true
+        },
+        "frontend": {
+          "name": "trustc",
+          "revision": "450403669"
+        },
+        "convention": "C",
+        "lowered_convention": "C",
+        "source_abi": "C",
+        "can_unwind": false,
+        "variadic": false,
+        "fixed_count": 5,
+        "arguments": [
+          {
+            "size": 0,
+            "align": 1,
+            "mode": "Ignore",
+            "bindings": []
+          },
+          {
+            "size": 1,
+            "align": 1,
+            "mode": {
+              "Direct": {
+                "register": {
+                  "class": "Integer",
+                  "bytes": 1
+                },
+                "source_offset": 0,
+                "source_bytes": 1,
+                "value_bits": 8,
+                "attributes": {
+                  "extension": "Sign",
+                  "in_reg": false,
+                  "no_alias": false,
+                  "nonnull": false,
+                  "readonly": false,
+                  "no_undef": false,
+                  "writable": false,
+                  "no_free": false,
+                  "capture": "Any",
+                  "pointee_size": 0,
+                  "pointee_align": null
+                }
+              }
+            },
+            "bindings": [
+              {
+                "place": {
+                  "Parameter": 1
+                },
+                "source_offset": 0,
+                "source_bytes": 1,
+                "carrier_offset": 0,
+                "carrier_bytes": 1
+              }
+            ]
+          },
+          {
+            "size": 16,
+            "align": 8,
+            "mode": {
+              "Pair": [
+                {
+                  "register": {
+                    "class": "Integer",
+                    "bytes": 8
+                  },
+                  "source_offset": 0,
+                  "source_bytes": 8,
+                  "value_bits": 64,
+                  "attributes": {
+                    "extension": "None",
+                    "in_reg": false,
+                    "no_alias": false,
+                    "nonnull": false,
+                    "readonly": false,
+                    "no_undef": false,
+                    "writable": false,
+                    "no_free": false,
+                    "capture": "Any",
+                    "pointee_size": 0,
+                    "pointee_align": null
+                  }
+                },
+                {
+                  "register": {
+                    "class": "Float",
+                    "bytes": 8
+                  },
+                  "source_offset": 8,
+                  "source_bytes": 8,
+                  "value_bits": 64,
+                  "attributes": {
+                    "extension": "None",
+                    "in_reg": false,
+                    "no_alias": false,
+                    "nonnull": false,
+                    "readonly": false,
+                    "no_undef": false,
+                    "writable": false,
+                    "no_free": false,
+                    "capture": "Any",
+                    "pointee_size": 0,
+                    "pointee_align": null
+                  }
+                }
+              ]
+            },
+            "bindings": [
+              {
+                "place": {
+                  "Parameter": 2
+                },
+                "source_offset": 0,
+                "source_bytes": 8,
+                "carrier_offset": 0,
+                "carrier_bytes": 8
+              },
+              {
+                "place": {
+                  "Parameter": 3
+                },
+                "source_offset": 8,
+                "source_bytes": 8,
+                "carrier_offset": 0,
+                "carrier_bytes": 8
+              }
+            ]
+          },
+          {
+            "size": 16,
+            "align": 16,
+            "mode": {
+              "Cast": {
+                "pad_i32": false,
+                "prefix": [],
+                "rest_offset": null,
+                "rest": {
+                  "unit": {
+                    "class": "Float",
+                    "bytes": 4
+                  },
+                  "total": 12,
+                  "consecutive": true
+                },
+                "attributes": {
+                  "extension": "None",
+                  "in_reg": false,
+                  "no_alias": false,
+                  "nonnull": false,
+                  "readonly": false,
+                  "no_undef": false,
+                  "writable": false,
+                  "no_free": false,
+                  "capture": "Any",
+                  "pointee_size": 0,
+                  "pointee_align": null
+                }
+              }
+            },
+            "bindings": [
+              {
+                "place": {
+                  "Parameter": 4
+                },
+                "source_offset": 0,
+                "source_bytes": 12,
+                "carrier_offset": 0,
+                "carrier_bytes": 12
+              }
+            ]
+          },
+          {
+            "size": 24,
+            "align": 8,
+            "mode": {
+              "Indirect": {
+                "attributes": {
+                  "extension": "None",
+                  "in_reg": false,
+                  "no_alias": false,
+                  "nonnull": false,
+                  "readonly": false,
+                  "no_undef": false,
+                  "writable": false,
+                  "no_free": false,
+                  "capture": "Any",
+                  "pointee_size": 24,
+                  "pointee_align": 8
+                },
+                "metadata_attributes": null,
+                "on_stack": false,
+                "caller_copy": true
+              }
+            },
+            "bindings": [
+              {
+                "place": {
+                  "Parameter": 5
+                },
+                "source_offset": 0,
+                "source_bytes": 24,
+                "carrier_offset": 0,
+                "carrier_bytes": 8
+              }
+            ]
+          }
+        ],
+        "result": {
+          "size": 24,
+          "align": 8,
+          "mode": {
+            "Indirect": {
+              "attributes": {
+                "extension": "None",
+                "in_reg": false,
+                "no_alias": false,
+                "nonnull": false,
+                "readonly": false,
+                "no_undef": false,
+                "writable": false,
+                "no_free": false,
+                "capture": "Any",
+                "pointee_size": 24,
+                "pointee_align": 8
+              },
+              "metadata_attributes": null,
+              "on_stack": false,
+              "caller_copy": false
+            }
+          },
+          "bindings": [
+            {
+              "place": {
+                "HiddenResult": 0
+              },
+              "source_offset": 0,
+              "source_bytes": 24,
+              "carrier_offset": 0,
+              "carrier_bytes": 8
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": "darwinpcs",
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

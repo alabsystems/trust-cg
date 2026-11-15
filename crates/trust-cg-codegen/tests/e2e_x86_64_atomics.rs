@@ -70,9 +70,9 @@ fn cleanup(dir: &Path) {
 }
 
 /// Compile a trust_ir module to an x86-64 Mach-O object via the public Compiler.
-fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
+fn compile_trust_ir_module_x86_64_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
-        opt_level: OptLevel::O0,
+        opt_level,
         target: Target::X86_64,
         emit_proofs: false,
         trace_level: CompilerTraceLevel::None,
@@ -82,8 +82,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -107,10 +118,19 @@ fn differential_test(
     module: &TrustIrModule,
     c_source: &str,
 ) -> Result<(), String> {
+    differential_test_at(test_name, module, c_source, OptLevel::O0)
+}
+
+fn differential_test_at(
+    test_name: &str,
+    module: &TrustIrModule,
+    c_source: &str,
+    opt_level: OptLevel,
+) -> Result<(), String> {
     let dir = make_test_dir(test_name);
 
     // --- trust-cg path ---
-    let obj_bytes = compile_trust_ir_module_x86_64(module);
+    let obj_bytes = compile_trust_ir_module_x86_64_at(module, opt_level);
     let obj_path = dir.join("trust_cg.o");
     fs::write(&obj_path, &obj_bytes).map_err(|e| format!("write .o: {}", e))?;
 
@@ -231,11 +251,14 @@ fn differential_test(
 /// `i64 _atomic_load_store(i64 v) { _Atomic long s; store(s, v); return load(s); }`
 fn build_atomic_load_store_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_atomic_load_store", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -267,7 +290,9 @@ fn build_atomic_load_store_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -278,11 +303,14 @@ fn build_atomic_load_store_module() -> TrustIrModule {
 /// value and the value actually written back.
 fn build_atomic_rmw_module(name: &str, op: AtomicRMWOp) -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -332,7 +360,9 @@ fn build_atomic_rmw_module(name: &str, op: AtomicRMWOp) -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -341,11 +371,14 @@ fn build_atomic_rmw_module(name: &str, op: AtomicRMWOp) -> TrustIrModule {
 /// Sensitive to both the returned previous value and whether the swap happened.
 fn build_atomic_cmpxchg_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_atomic_cmpxchg", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -368,7 +401,8 @@ fn build_atomic_cmpxchg_module() -> TrustIrModule {
                 volatile: false,
                 align: Some(8),
             }),
-            // old = cmpxchg(slot, expected, desired) -- result[0] is the previous value
+            // old = cmpxchg(slot, expected, desired) -- result[0] is the previous value,
+            // result[1] the success flag (trust-ir's two-result `cmpxchg`; unused here)
             InstrNode::new(Inst::CmpXchg {
                 ty: Ty::I64,
                 ptr: ValueId::new(3),
@@ -376,8 +410,10 @@ fn build_atomic_cmpxchg_module() -> TrustIrModule {
                 desired: ValueId::new(2),
                 success: Ordering::SeqCst,
                 failure: Ordering::SeqCst,
+                weak: false,
             })
-            .with_result(ValueId::new(4)),
+            .with_result(ValueId::new(4))
+            .with_result(ValueId::new(9)),
             // final = load slot
             InstrNode::new(Inst::Load {
                 ty: Ty::I64,
@@ -413,7 +449,9 @@ fn build_atomic_cmpxchg_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -422,11 +460,14 @@ fn build_atomic_cmpxchg_module() -> TrustIrModule {
 /// Exercises Fence emission around ordinary stores; observable value is `b`.
 fn build_atomic_fence_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_atomic_fence", ft, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -467,7 +508,9 @@ fn build_atomic_fence_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -790,4 +833,212 @@ int main(void) {
 "#;
     let r = differential_test("atomic_fence", &module, c_source);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+/// `u64 _atomic_load_u128_pressure(u128 *p, u128 *out, u64 a, u64 b, u64 c, u64 d)`:
+/// four values live ACROSS a 128-bit atomic load whose operand setup pins RAX,
+/// RDX, RBX and RCX — and `a`/`b` ARRIVE in RDX/RCX — then the loaded value is
+/// stored to `out` and the four values are folded into the return value.
+fn build_atomic_load_u128_module(claims_cmpxchg16b: bool) -> TrustIrModule {
+    let mut module = TrustIrModule::new("test");
+    let ptr = || Ty::PtrMut(Box::new(Ty::U128));
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![ptr(), ptr(), Ty::U64, Ty::U64, Ty::U64, Ty::U64],
+            returns: vec![Ty::U64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let mut func = TrustIrFunction::new(
+        FuncId::new(0),
+        "_atomic_load_u128_pressure",
+        ft,
+        BlockId::new(0),
+    );
+    if claims_cmpxchg16b {
+        func.attrs.target_features = vec!["cmpxchg16b".to_string()];
+    }
+    let v = ValueId::new;
+    let binop = |op: BinOp, lhs: u32, rhs: u32, result: u32| {
+        InstrNode::new(Inst::BinOp {
+            op,
+            ty: Ty::U64,
+            lhs: v(lhs),
+            rhs: v(rhs),
+        })
+        .with_result(v(result))
+    };
+    func.blocks = vec![TrustIrBlock {
+        id: BlockId::new(0),
+        params: vec![
+            (v(0), ptr()),
+            (v(1), ptr()),
+            (v(2), Ty::U64),
+            (v(3), Ty::U64),
+            (v(4), Ty::U64),
+            (v(5), Ty::U64),
+        ],
+        body: vec![
+            binop(BinOp::Mul, 2, 3, 6),
+            binop(BinOp::Xor, 4, 5, 7),
+            binop(BinOp::Add, 2, 5, 8),
+            binop(BinOp::Sub, 3, 4, 9),
+            InstrNode::new(Inst::AtomicLoad {
+                ty: Ty::U128,
+                ptr: v(0),
+                ordering: Ordering::SeqCst,
+            })
+            .with_result(v(10)),
+            InstrNode::new(Inst::Store {
+                ty: Ty::U128,
+                ptr: v(1),
+                value: v(10),
+                volatile: false,
+                align: Some(16),
+            }),
+            binop(BinOp::Xor, 6, 7, 11),
+            binop(BinOp::Xor, 11, 8, 12),
+            binop(BinOp::Xor, 12, 9, 13),
+            InstrNode::new(Inst::Return {
+                values: vec![v(13)],
+            }),
+        ],
+    }];
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
+    module
+}
+
+#[test]
+fn test_x86_64_atomic_load_u128_cmpxchg16b() {
+    if !x86_64_oracle_enabled() {
+        return;
+    }
+    let module = build_atomic_load_u128_module(true);
+    // The reference is a plain load: single-threaded VALUE semantics only (no
+    // libatomic dependency on hosts whose C baseline lacks CX16).
+    // `rbx_probe` calls f(p, out, 1, 2, 3, 4) with a sentinel in RBX, which is
+    // callee-saved and which the pseudo's `XOR EBX,EBX` overwrites.
+    let c_source = r#"
+#include <stdio.h>
+#include <stdint.h>
+typedef unsigned __int128 u128;
+
+#ifndef EXTERN_ONLY
+uint64_t _atomic_load_u128_pressure(u128 *p, u128 *out, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    uint64_t x1 = a * b, x2 = c ^ d, x3 = a + d, x4 = b - c;
+    *out = *p;
+    return x1 ^ x2 ^ x3 ^ x4;
+}
+#endif
+#ifdef EXTERN_ONLY
+extern uint64_t _atomic_load_u128_pressure(u128 *p, u128 *out, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+#endif
+
+int rbx_probe(uint64_t (*f)(u128 *, u128 *, uint64_t, uint64_t, uint64_t, uint64_t), u128 *p, u128 *out);
+__asm__(
+#ifdef __APPLE__
+    ".globl _rbx_probe\n_rbx_probe:\n"
+#else
+    ".globl rbx_probe\nrbx_probe:\n"
+#endif
+    "  pushq %rbx\n"
+    "  movq %rdi, %rax\n"
+    "  movq %rsi, %rdi\n"
+    "  movq %rdx, %rsi\n"
+    "  movl $1, %edx\n"
+    "  movl $2, %ecx\n"
+    "  movl $3, %r8d\n"
+    "  movl $4, %r9d\n"
+    "  movabsq $0x5a5a1234deadbeef, %rbx\n"
+    "  callq *%rax\n"
+    "  movabsq $0x5a5a1234deadbeef, %rcx\n"
+    "  xorl %eax, %eax\n"
+    "  cmpq %rcx, %rbx\n"
+    "  sete %al\n"
+    "  popq %rbx\n"
+    "  retq\n");
+
+static void hex(const char *tag, u128 v) {
+    printf("%s=%016llx%016llx", tag, (unsigned long long)(v >> 64), (unsigned long long)v);
+}
+
+int main(void) {
+    static _Alignas(16) u128 cells[4];
+    cells[0] = ((u128)0x0123456789abcdefULL << 64) | 0xfedcba9876543210ULL;
+    cells[1] = 0;
+    cells[2] = ~(u128)0;
+    cells[3] = (u128)0x8000000000000001ULL << 64;
+    for (int i = 0; i < 4; i++) {
+        _Alignas(16) u128 out = 7;
+        uint64_t r = _atomic_load_u128_pressure(&cells[i], &out, 11 + i, 22, 33, 44);
+        printf("cell%d ", i);
+        hex("out", out);
+        printf(" r=%llu ", (unsigned long long)r);
+        hex("cell", cells[i]);
+        printf("\n");
+    }
+    _Alignas(16) u128 probed = 0;
+    int kept = rbx_probe(_atomic_load_u128_pressure, &cells[0], &probed);
+    printf("rbx_preserved=%d ", kept);
+    hex("out", probed);
+    printf("\n");
+    return kept ? 0 : 3;
+}
+"#;
+    for opt_level in [OptLevel::O0, OptLevel::O2, OptLevel::O3] {
+        // The object carries the pseudo's whole expansion, zeroing first:
+        // 31 C0 31 D2 31 DB 31 C9 F0 REX.W[+B] 0F C7.
+        let object = compile_trust_ir_module_x86_64_at(&module, opt_level);
+        assert!(
+            object.windows(12).any(
+                |w| w[..8] == [0x31, 0xC0, 0x31, 0xD2, 0x31, 0xDB, 0x31, 0xC9]
+                    && w[8] == 0xF0
+                    && (w[9] == 0x48 || w[9] == 0x49)
+                    && w[10] == 0x0F
+                    && w[11] == 0xC7
+            ),
+            "{opt_level:?}: the 128-bit atomic load must be the zeroing XORs immediately followed \
+             by LOCK CMPXCHG16B"
+        );
+        let r = differential_test_at(
+            &format!("atomic_load_u128_{opt_level:?}"),
+            &module,
+            c_source,
+            opt_level,
+        );
+        assert!(r.is_ok(), "{opt_level:?}: {}", r.unwrap_err());
+    }
+}
+
+/// Without the function's `cmpxchg16b` claim the adapter floor refuses the
+/// 128-bit atomic before ISel: the x86-64 baseline does not guarantee CX16.
+#[test]
+fn test_x86_64_atomic_load_u128_requires_the_cmpxchg16b_claim() {
+    let module = build_atomic_load_u128_module(false);
+    let compiler = Compiler::new(CompilerConfig {
+        opt_level: OptLevel::O0,
+        target: Target::X86_64,
+        emit_proofs: false,
+        ..CompilerConfig::default()
+    })
+    .with_codegen_license(permit_unlicensed());
+    match compiler.compile(&module) {
+        Ok(_) => panic!("a 128-bit x86-64 atomic without the cmpxchg16b claim must be refused"),
+        Err(error) => {
+            let text = format!("{error} {error:?}");
+            assert!(text.contains("TCG-ATOMIC128-CX16"), "{text}");
+        }
+    }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -22,12 +22,13 @@
 
 use crate::prng::Prng;
 use trust_ir::{BinOp, ICmpOp, Module as TrustIrModule, Ty};
-use trust_ir_build::ModuleBuilder;
+use trust_ir_build::{BuildError, ModuleBuilder};
 
 /// Configuration for trust_ir random generation.
 #[derive(Debug, Clone)]
 pub struct GenConfig {
-    /// Number of i64 parameters to the generated function.
+    /// Number of i64 parameters. Zero-parameter functions start from a
+    /// deterministic seed-derived constant instead of an absent operand.
     pub num_params: u32,
     /// Number of binop instructions in the entry block.
     pub num_ops: u32,
@@ -118,7 +119,7 @@ pub const CONSUMER_STATUS_BYTES: usize = 24;
 /// Build a random module from a seed. The returned module has exactly one
 /// function named [`FUZZ_FN_NAME`] with `cfg.num_params` i64 parameters and
 /// a single i64 return.
-pub fn gen_module(seed: u64, cfg: &GenConfig) -> TrustIrModule {
+pub fn gen_module(seed: u64, cfg: &GenConfig) -> Result<TrustIrModule, BuildError> {
     let mut rng = Prng::new(seed);
     let mut mb = ModuleBuilder::new(format!("fuzz_{}", seed));
 
@@ -131,12 +132,22 @@ pub fn gen_module(seed: u64, cfg: &GenConfig) -> TrustIrModule {
 
     let entry = fb.create_block();
     // Bind block params.
-    let mut values: Vec<_> = Vec::with_capacity((cfg.num_params + cfg.num_ops) as usize);
+    let mut values = Vec::new();
+    let mut final_value = None;
     for _ in 0..cfg.num_params {
         let v = fb.add_block_param(entry, Ty::I64);
         values.push(v);
+        final_value = Some(v);
     }
     fb.switch_to_block(entry);
+    let mut final_value = match final_value {
+        Some(value) => value,
+        None => {
+            let value = fb.iconst(Ty::I64, i128::from(rng.next_u64() as i64));
+            values.push(value);
+            value
+        }
+    };
 
     let ops = op_pool(cfg);
     for _ in 0..cfg.num_ops {
@@ -147,11 +158,11 @@ pub fn gen_module(seed: u64, cfg: &GenConfig) -> TrustIrModule {
         let op = ops[rng.gen_range_usize(ops.len())];
         let result = fb.binop(op, Ty::I64, lhs, rhs);
         values.push(result);
+        final_value = result;
     }
 
     // Return the final computed value.
-    let last = *values.last().expect("at least one value exists (params)");
-    fb.ret(vec![last]);
+    fb.ret(vec![final_value]);
     fb.build();
 
     mb.build()
@@ -211,7 +222,7 @@ fn write_status_record(
 /// - Status-output-like pointer buffer writes: status/deopt/value/detail.
 /// - GEP + stores, plus a reload from the output buffer on the ok path.
 /// - Scalar control oracle: no callbacks and no host memory in the interpreter.
-pub fn gen_consumer_shape_module(seed: u64) -> TrustIrModule {
+pub fn gen_consumer_shape_module(seed: u64) -> Result<TrustIrModule, BuildError> {
     let mut mb = ModuleBuilder::new(format!("consumer_shape_{}", seed));
     let ty = mb.add_func_type(
         vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64, Ty::Ptr],

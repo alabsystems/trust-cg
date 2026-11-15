@@ -36,8 +36,15 @@ use trust_ir::{
 
 const ANSWER: u64 = 0x0000_0000_0000_4243; // 16963
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/fresh_dir.rs"]
+mod fresh_dir;
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O): `Compiler::new` derives the
+/// host's object format and ABI, and the host `cc` links it.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
 }
 
 /// `_ag_read() -> i64` returns `*(&_ag_answer)`, where `_ag_answer` is a local
@@ -46,26 +53,26 @@ fn build_read_global_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("readglobal");
 
     module.globals.push(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "_ag_answer".to_string(),
         ty: Ty::I64,
         mutable: false,
-        initializer: Some(Constant::Aggregate(
-            ANSWER
-                .to_le_bytes()
-                .iter()
-                .map(|b| Constant::Int(*b as i128))
-                .collect(),
-        )),
+        initializer: Some(Constant::Int(i128::from(ANSWER))),
         linkage: Linkage::External,
         tls: None,
         align: None,
     });
 
-    let ret_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ret_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut entry = TrustIrFunction::new(FuncId::new(0), "_ag_read", ret_ft, BlockId::new(0));
     entry.blocks = vec![TrustIrBlock {
@@ -90,7 +97,9 @@ fn build_read_global_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(entry);
+    module
+        .try_add_function(entry)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -104,11 +113,11 @@ fn build_read_global_module() -> TrustIrModule {
 // authorize Certified object promotion (the x86 348021a1 composition).
 
 /// Full end-to-end: compile -> .o -> cc-link -> run -> read the global's value.
-/// Runs only on an aarch64-apple-darwin host (this host qualifies).
+/// Runs on an AArch64 macOS (Mach-O) or Linux GNU (ELF) host.
 #[test]
 fn aarch64_read_global_links_runs_and_reads_correct_value() {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: requires an aarch64-apple-darwin host");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: requires an AArch64 Linux GNU or macOS host");
         return;
     }
 
@@ -116,7 +125,8 @@ fn aarch64_read_global_links_runs_and_reads_correct_value() {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(&module)
         .expect("aarch64 read-global compile should succeed");
@@ -125,9 +135,8 @@ fn aarch64_read_global_links_runs_and_reads_correct_value() {
         "object code must be non-empty"
     );
 
-    let dir = std::env::temp_dir().join("trust_cg_aarch64_read_global");
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create test dir");
+    // A fresh directory per run, removed when `dir` drops (fresh_dir.rs).
+    let dir = fresh_dir::create("trust_cg_aarch64_read_global-");
 
     let obj_path = dir.join("read_global.o");
     fs::write(&obj_path, &result.object_code).expect("write .o");
@@ -149,6 +158,7 @@ fn aarch64_read_global_links_runs_and_reads_correct_value() {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc should be available");
     assert!(
@@ -170,4 +180,31 @@ fn aarch64_read_global_links_runs_and_reads_correct_value() {
         "the read-back global value must equal 0x4243 = 16963 (a wrong relocation or \
          wrong section type silently miscompiles this)"
     );
+}
+
+/// The Linux GNU native lane's object, checked at object level on every host.
+#[test]
+fn aarch64_read_global_linux_object_is_elf_aarch64() {
+    let object = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: OptLevel::O0,
+            ..CompilerConfig::default()
+        },
+        trust_cg_codegen::target::TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&build_read_global_module())
+    .expect("the Linux GNU object must compile")
+    .object_code;
+    native_host::assert_elf_aarch64_object(&object);
+    assert!(!native_host::text_words(&object).is_empty());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

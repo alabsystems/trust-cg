@@ -6,8 +6,6 @@
 // Copyright (c) 2012-2021 Yann Collet | BSD-2-Clause
 // See third_party/vendor/xxhash-LICENSE.
 //
-// Reference: designs/2026-04-18-cache-and-cegis.md
-//
 // Stable hashing uses an in-tree xxh3-inspired mixer with a fixed seed so
 // cache keys are deterministic across runs, processes, Rust versions, and
 // machines (modulo CPU feature differences which are part of the key).
@@ -422,12 +420,21 @@ impl CacheBackend for InMemoryCache {
     }
 }
 
+// The creation rule every Trust Codegen cache shares: each directory it
+// creates is `0700` and each file `0600`, whatever the umask, and nothing that
+// already exists is changed (`trust_cg_process_env::private_fs`).
+pub use trust_cg_process_env::private_fs::{create_private_dir_all, create_private_file};
+
 /// File-per-key on-disk cache.
 ///
 /// Layout: `{root}/{first_two_hex}/{full_hex}`. The two-character prefix
 /// directory avoids flooding a single directory when the key space grows.
 /// Writes go to a temp file inside the shard directory and are atomically
 /// renamed into place, so a crash mid-write never leaves a partial entry.
+/// On Unix the directories this cache creates are `0700` and its entries
+/// `0600` ([`create_private_dir_all`], [`create_private_file`]), so only the
+/// owner can read or replace them; a root that already exists keeps its
+/// mode, and judging it is the caller's business.
 ///
 /// There is **no eviction** in this MVP — callers that need a size cap
 /// should wrap the backend or prune externally.
@@ -439,12 +446,12 @@ pub struct FileCache {
 static FILE_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl FileCache {
-    /// Create a [`FileCache`] rooted at `root`. The directory is created
-    /// if it does not already exist. Returns an error if the directory
-    /// cannot be created.
+    /// Create a [`FileCache`] rooted at `root`. The directory and any missing
+    /// parent are created ([`create_private_dir_all`]) if they do not already
+    /// exist. Returns an error if the directory cannot be created.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        std::fs::create_dir_all(&root)?;
+        create_private_dir_all(&root)?;
         Ok(Self { root })
     }
 
@@ -474,12 +481,19 @@ impl FileCache {
         let shard_dir = target
             .parent()
             .ok_or_else(|| io::Error::other("cache target has no parent dir"))?;
-        std::fs::create_dir_all(shard_dir)?;
+        create_private_dir_all(shard_dir)?;
 
         // Temp file name includes a per-call nonce so same-process writers
         // racing on the same key never share a staging path.
         let tmp = self.tmp_path_for(key, shard_dir);
-        std::fs::write(&tmp, value)?;
+        let written = create_private_file(&tmp).and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(value)
+        });
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         match std::fs::rename(&tmp, &target) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -870,6 +884,41 @@ mod tests {
             first, second,
             "same-key writes must not reuse a temp path within one process",
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whatever the umask, the root, the shard directory and the entry this
+    /// cache creates are private to the owner (the host umask is 002, under
+    /// which `create_dir_all` and `fs::write` gave 0775 and 0664).
+    #[cfg(unix)]
+    #[test]
+    fn test_file_cache_creates_private_directories_and_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tmpdir("private_modes");
+        let root = parent.join("nested").join("root");
+        let cache = FileCache::new(&root).unwrap();
+        let k = key(0x0600, 2);
+        cache.put(&k, b"private");
+        let entry = cache.path_for(&k);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&parent.join("nested")), 0o700);
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(entry.parent().unwrap()), 0o700);
+        assert_eq!(mode(&entry), 0o600);
+        assert_eq!(cache.get(&k).as_deref(), Some(&b"private"[..]));
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The staging file is created exclusively: a file already sitting at its
+    /// path is neither written through nor truncated.
+    #[test]
+    fn test_create_private_file_refuses_an_existing_path() {
+        let root = tmpdir("exclusive");
+        let path = root.join("staged");
+        std::fs::write(&path, b"planted").unwrap();
+        let err = create_private_file(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"planted");
         let _ = std::fs::remove_dir_all(&root);
     }
 

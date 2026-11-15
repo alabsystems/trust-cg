@@ -1,0 +1,6049 @@
+{
+ "schema": "trust-cg.compile-corpus.manifest.v1",
+ "entries": [
+  {
+   "name": "ay-jit-matrix/bcp-propagate",
+   "file": "modules/jit-matrix/bcp-propagate.trust_irbin",
+   "origin": "ay-jit-matrix",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "builder": "compile_corpus dump-builtin --module bcp-propagate"
+   }
+  },
+  {
+   "name": "ay-jit-matrix/bcp-propagate-with-decisions",
+   "file": "modules/jit-matrix/bcp-propagate-with-decisions.trust_irbin",
+   "origin": "ay-jit-matrix",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "builder": "compile_corpus dump-builtin --module bcp-propagate-with-decisions"
+   }
+  },
+  {
+   "name": "ay-jit-matrix/bcp-watched-literal",
+   "file": "modules/jit-matrix/bcp-watched-literal.trust_irbin",
+   "origin": "ay-jit-matrix",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "builder": "compile_corpus dump-builtin --module bcp-watched-literal"
+   }
+  },
+  {
+   "name": "ay-jit-matrix/bcp-watched-literal-chunked",
+   "file": "modules/jit-matrix/bcp-watched-literal-chunked.trust_irbin",
+   "origin": "ay-jit-matrix",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "builder": "compile_corpus dump-builtin --module bcp-watched-literal-chunked"
+   }
+  },
+  {
+   "name": "ay-jit-matrix/parent-loop",
+   "file": "modules/jit-matrix/parent-loop.trust_irbin",
+   "origin": "ay-jit-matrix",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "builder": "compile_corpus dump-builtin --module parent-loop"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--bitreverse_intrinsics",
+   "file": "modules/fixtures/fsym_real_function_corpus--bitreverse_intrinsics.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/bitreverse_intrinsics.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--casttest3",
+   "file": "modules/fixtures/fsym_real_function_corpus--casttest3.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/casttest3.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--casttest_trunc_i8",
+   "file": "modules/fixtures/fsym_real_function_corpus--casttest_trunc_i8.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/casttest_trunc_i8.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--fp_core_binops",
+   "file": "modules/fixtures/fsym_real_function_corpus--fp_core_binops.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/fp_core_binops.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--mutable_byte_globals",
+   "file": "modules/fixtures/fsym_real_function_corpus--mutable_byte_globals.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/mutable_byte_globals.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--objectsize_intrinsic",
+   "file": "modules/fixtures/fsym_real_function_corpus--objectsize_intrinsic.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/objectsize_intrinsic.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--printf_string_global",
+   "file": "modules/fixtures/fsym_real_function_corpus--printf_string_global.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/printf_string_global.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--switch_dispatch",
+   "file": "modules/fixtures/fsym_real_function_corpus--switch_dispatch.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/switch_dispatch.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--switch_narrow_widths",
+   "file": "modules/fixtures/fsym_real_function_corpus--switch_narrow_widths.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/switch_narrow_widths.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--ws2_divtest",
+   "file": "modules/fixtures/fsym_real_function_corpus--ws2_divtest.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/ws2_divtest.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fsym_real_function_corpus--ws2_nottest",
+   "file": "modules/fixtures/fsym_real_function_corpus--ws2_nottest.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-verify/tests/fixtures/fsym_real_function_corpus/ws2_nottest.trust_ir.json"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/aggregate_insert--corpus",
+   "file": "modules/fixtures/aggregate_insert--corpus.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/aggregate_insert/corpus.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/aggregate_insert--zero_sized",
+   "file": "modules/fixtures/aggregate_insert--zero_sized.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/aggregate_insert/zero_sized.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/large_aggregate_args--corpus",
+   "file": "modules/fixtures/large_aggregate_args--corpus.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/large_aggregate_args/corpus.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/large_aggregate_args--invoke",
+   "file": "modules/fixtures/large_aggregate_args--invoke.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/large_aggregate_args/invoke.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/large_aggregate_args--invoke_variadic",
+   "file": "modules/fixtures/large_aggregate_args--invoke_variadic.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/large_aggregate_args/invoke_variadic.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/large_aggregate_args--scaling",
+   "file": "modules/fixtures/large_aggregate_args--scaling.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/large_aggregate_args/scaling.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/large_aggregate_args--tail",
+   "file": "modules/fixtures/large_aggregate_args--tail.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/large_aggregate_args/tail.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/large_aggregate_args--variadic",
+   "file": "modules/fixtures/large_aggregate_args--variadic.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/large_aggregate_args/variadic.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/hfa_zero_sized--corpus",
+   "file": "modules/fixtures/hfa_zero_sized--corpus.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "crates/trust-cg-codegen/tests/fixtures/hfa_zero_sized/corpus.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--abs",
+   "file": "modules/fixtures/fuzz--abs.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/abs.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--axpy",
+   "file": "modules/fixtures/fuzz--axpy.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/axpy.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--ceq",
+   "file": "modules/fixtures/fuzz--ceq.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/ceq.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--crcx",
+   "file": "modules/fixtures/fuzz--crcx.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/crcx.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--fdot",
+   "file": "modules/fixtures/fuzz--fdot.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/fdot.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--fib",
+   "file": "modules/fixtures/fuzz--fib.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/fib.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--fsum",
+   "file": "modules/fixtures/fuzz--fsum.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/fsum.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--fsum64",
+   "file": "modules/fixtures/fuzz--fsum64.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/fsum64.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--mm_ijk",
+   "file": "modules/fixtures/fuzz--mm_ijk.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/mm_ijk.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--mm_ikj",
+   "file": "modules/fixtures/fuzz--mm_ikj.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/mm_ikj.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--pc",
+   "file": "modules/fixtures/fuzz--pc.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/pc.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--pm",
+   "file": "modules/fixtures/fuzz--pm.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/pm.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--prodi64",
+   "file": "modules/fixtures/fuzz--prodi64.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/prodi64.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--st",
+   "file": "modules/fixtures/fuzz--st.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/st.trust_ir"
+   }
+  },
+  {
+   "name": "trust-cg-fixture/fuzz--trib",
+   "file": "modules/fixtures/fuzz--trib.trust_irbin",
+   "origin": "trust-cg-fixture",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked",
+    "aot-object"
+   ],
+   "provenance": {
+    "source": "scripts/fuzz/trib.trust_ir"
+   }
+  },
+  {
+   "name": "ty-semantic/ABCorrectness/0",
+   "file": "modules/ty/ty-semantic--ABCorrectness--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "d0ccf0e0174ff5e5003dd199b42bf4ce5cae9a1f476c6557d9df0a790ccb6b8a",
+    "bytes": 99857
+   }
+  },
+  {
+   "name": "ty-semantic/ABCorrectness/1",
+   "file": "modules/ty/ty-semantic--ABCorrectness--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "2ad2348956f6691ffe1650bd055e20f2b61561246da6231e5de1e5af96e7a0dc",
+    "bytes": 5503
+   }
+  },
+  {
+   "name": "ty-semantic/ABCorrectness/2",
+   "file": "modules/ty/ty-semantic--ABCorrectness--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "df45f2d712ecbb8e9a23e89b200d7bf28f26a244c0041fc2d6b249a006f3026e",
+    "bytes": 3894
+   }
+  },
+  {
+   "name": "ty-semantic/ACP_NB_TLC/0",
+   "file": "modules/ty/ty-semantic--ACP_NB_TLC--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "b6c23d4d5919d2945c6dc8e11a0a53627c79768bd4eb00d9754ff49ee415d9cb",
+    "bytes": 557912
+   }
+  },
+  {
+   "name": "ty-semantic/ACP_SB_TLC/0",
+   "file": "modules/ty/ty-semantic--ACP_SB_TLC--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "d5fbe61dbd02eecf171a3ff52cc5aadaee7ea0d86115994654f9dd1b262c4b0f",
+    "bytes": 391467
+   }
+  },
+  {
+   "name": "ty-semantic/AsyncTerminationDetection/0",
+   "file": "modules/ty/ty-semantic--AsyncTerminationDetection--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "24604851c40a936ac389c103c1494a3bef5b96015c200d5ff0e4a15d84ba2448",
+    "bytes": 159899
+   }
+  },
+  {
+   "name": "ty-semantic/AsynchInterface/0",
+   "file": "modules/ty/ty-semantic--AsynchInterface--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "bd23df3b7987d371f6edd42992c0bfea6f8e4db1e8aed23e4d24cc95fd44af71",
+    "bytes": 60115
+   }
+  },
+  {
+   "name": "ty-semantic/AsynchInterface/1",
+   "file": "modules/ty/ty-semantic--AsynchInterface--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "942ec8556682e3fdcf0de8ec1f4e5f71c8149cd458b02be2930303b9f2b4c868",
+    "bytes": 4780
+   }
+  },
+  {
+   "name": "ty-semantic/AsynchInterface/2",
+   "file": "modules/ty/ty-semantic--AsynchInterface--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8a38f21f4266ec8f53fba4b52e9347fdf2d220d335e23d3e898fd14bc86b872b",
+    "bytes": 2573
+   }
+  },
+  {
+   "name": "ty-semantic/Barrier/0",
+   "file": "modules/ty/ty-semantic--Barrier--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "af5f3f00d5e23c6fed7063dd4a4ff9abc03b0b75e42612847a7699fad1508126",
+    "bytes": 53173
+   }
+  },
+  {
+   "name": "ty-semantic/Barrier/1",
+   "file": "modules/ty/ty-semantic--Barrier--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "0db0e3426c8ad2c0e1384b3c8e0289fe39950ad5e1188d453e866598b588d2e2",
+    "bytes": 12766
+   }
+  },
+  {
+   "name": "ty-semantic/Barrier/2",
+   "file": "modules/ty/ty-semantic--Barrier--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "bf76ee64a35943a7d94454bdff375c14c544f044a1e5e7525277ba69419c2575",
+    "bytes": 2184
+   }
+  },
+  {
+   "name": "ty-semantic/Barrier/3",
+   "file": "modules/ty/ty-semantic--Barrier--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "5ee55ddb3f50573fb750e2e2e3b08e51d07cd3e8f635fd3cd8fb51a778925dbb",
+    "bytes": 5064
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/0",
+   "file": "modules/ty/ty-semantic--Barriers--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_69",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_72",
+    "__ty_trust_ir_func_73",
+    "__ty_trust_ir_func_74",
+    "__ty_trust_ir_func_75",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "c3c53b68fc751034b7bd728c969a0f92abb51cd18acf6645b2bf88083bf1abcd",
+    "bytes": 547526
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/1",
+   "file": "modules/ty/ty-semantic--Barriers--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "6882810ca392fd8fc4c5a739ee2d2119ebaf7ff9440563037915808c7eeadd58",
+    "bytes": 41968
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/2",
+   "file": "modules/ty/ty-semantic--Barriers--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "736da15e3eec5a5c0afeaa6b4469ae8c7a2223ed2650c7d034e38cff845ffe21",
+    "bytes": 38946
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/3",
+   "file": "modules/ty/ty-semantic--Barriers--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "b0c91a6a4b9db0bf597664b64e561a79b3007a3dcc3a41aced0e93cab792cf4a",
+    "bytes": 40928
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/4",
+   "file": "modules/ty/ty-semantic--Barriers--4.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "6e3cbbd222bbc413d4bd02cb917961f21b8674499c3611cb1c3a8fedb7563f02",
+    "bytes": 37306
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/5",
+   "file": "modules/ty/ty-semantic--Barriers--5.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ee0dc382184d9572af3ce276b6228a288e3c1bced5028a233f012b2186ff53b3",
+    "bytes": 34194
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/6",
+   "file": "modules/ty/ty-semantic--Barriers--6.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ed1127c71245748fc33c60a0d5cd35c830ca36e96c1d4c8da148dee22f7852b4",
+    "bytes": 4743
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/7",
+   "file": "modules/ty/ty-semantic--Barriers--7.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "18b9a3dbcb447c30529557f9ee2093a182cc4e261135c8e88e7c0eff8bb60dce",
+    "bytes": 6492
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/8",
+   "file": "modules/ty/ty-semantic--Barriers--8.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "75843691c3bc18633d0e294fd61e50af2d7b6247c1ab3c2162aca0c681dae9b1",
+    "bytes": 51444
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/9",
+   "file": "modules/ty/ty-semantic--Barriers--9.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "b3c42ad09172c7ce8a67930dae7783fc61b8d1186b269954956be276ae774a0d",
+    "bytes": 11195
+   }
+  },
+  {
+   "name": "ty-semantic/Barriers/10",
+   "file": "modules/ty/ty-semantic--Barriers--10.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "72bcabb9933fa086ad3c646490a8fa61a493fd80134cb5a25e1870cb23bccfba",
+    "bytes": 34456
+   }
+  },
+  {
+   "name": "ty-semantic/CatEvenBoxes/0",
+   "file": "modules/ty/ty-semantic--CatEvenBoxes--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "26b2d4a925f882d21e51a88091fbcd5c5408b06b3abadd11efd297dad6e0d4aa",
+    "bytes": 74355
+   }
+  },
+  {
+   "name": "ty-semantic/Chameneos/0",
+   "file": "modules/ty/ty-semantic--Chameneos--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_69",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_73",
+    "__ty_trust_ir_func_74",
+    "__ty_trust_ir_func_75",
+    "__ty_trust_ir_func_76",
+    "__ty_trust_ir_func_77",
+    "__ty_trust_ir_func_78",
+    "__ty_trust_ir_func_79",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_80",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "dc133d844756bfb6eae35e822828d85b93577efbef9bef9f4ab8836a44bab90e",
+    "bytes": 129354
+   }
+  },
+  {
+   "name": "ty-semantic/Channel/0",
+   "file": "modules/ty/ty-semantic--Channel--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "4ea7d075882c366a9cec43b9b56e76865a4c36a4caeeaa558e2521265265bd43",
+    "bytes": 58177
+   }
+  },
+  {
+   "name": "ty-semantic/Channel/1",
+   "file": "modules/ty/ty-semantic--Channel--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8085139651b34504246eb2c25706e26260c893b6415adec14f2ba6bb23cf0046",
+    "bytes": 7163
+   }
+  },
+  {
+   "name": "ty-semantic/Channel/2",
+   "file": "modules/ty/ty-semantic--Channel--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "b3d649a9f629c307adccab3d075c355fb292b0e6b0466cd646831a670bf41d55",
+    "bytes": 2806
+   }
+  },
+  {
+   "name": "ty-semantic/Consensus/0",
+   "file": "modules/ty/ty-semantic--Consensus--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "600cb2e65a5acea287282b1d9da0709ee1e8be09310d298d1d8172b6a18bcba6",
+    "bytes": 21242
+   }
+  },
+  {
+   "name": "ty-semantic/DiningPhilosophers/0",
+   "file": "modules/ty/ty-semantic--DiningPhilosophers--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_69",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_72",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "fda5aa724241d6504b0fa5b4e1b311aee5501a4b23c6177510a13c5900625cf5",
+    "bytes": 200112
+   }
+  },
+  {
+   "name": "ty-semantic/HourClock/0",
+   "file": "modules/ty/ty-semantic--HourClock--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8e165120306a3b4bf251fd4843aab3b3d47d68ea79359df8fe8ed50b83b8197b",
+    "bytes": 17055
+   }
+  },
+  {
+   "name": "ty-semantic/HourClock/1",
+   "file": "modules/ty/ty-semantic--HourClock--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "a4795d7b8322cc3e304764e25e07dd556c724b7006085537a14fa791755e35fc",
+    "bytes": 932
+   }
+  },
+  {
+   "name": "ty-semantic/HourClock/2",
+   "file": "modules/ty/ty-semantic--HourClock--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ad1b1bade2ac847545c03c78f9f56eb2ae8e7d1922b273d856f3605401415550",
+    "bytes": 1284
+   }
+  },
+  {
+   "name": "ty-semantic/HourClock2/0",
+   "file": "modules/ty/ty-semantic--HourClock2--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8719304f6be2508177c5ae178a9d5101d645028bf61db4fa2e51095a9d809f46",
+    "bytes": 14768
+   }
+  },
+  {
+   "name": "ty-semantic/HourClock2/1",
+   "file": "modules/ty/ty-semantic--HourClock2--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "33a4e48151e65f7b417e6c38a896a17de4c9b4800890d6400139b2bab9f05467",
+    "bytes": 1536
+   }
+  },
+  {
+   "name": "ty-semantic/LiveHourClock/0",
+   "file": "modules/ty/ty-semantic--LiveHourClock--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "b1313a3de251590fe10895e6a19d5e9da07bcb06768ec92959bca230c1a9f494",
+    "bytes": 14768
+   }
+  },
+  {
+   "name": "ty-semantic/Lock/0",
+   "file": "modules/ty/ty-semantic--Lock--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "37e74fb0304ca372d12267dc68088c1d8468ecdbedfe9261e1097334d9e364e5",
+    "bytes": 118072
+   }
+  },
+  {
+   "name": "ty-semantic/Lock/1",
+   "file": "modules/ty/ty-semantic--Lock--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "db103da80144319f07a6f1a3a21190ded9a1507f40c90ea5fcbba44ebb03d4ab",
+    "bytes": 10475
+   }
+  },
+  {
+   "name": "ty-semantic/Lock/2",
+   "file": "modules/ty/ty-semantic--Lock--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "91cf29be552d28139c7a59b0d9fa11b2f196478aff910e8b73dfd5823766f280",
+    "bytes": 2929
+   }
+  },
+  {
+   "name": "ty-semantic/Lock/3",
+   "file": "modules/ty/ty-semantic--Lock--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8970bfd84143ef3ea60da07e7c48793aa19d793f52b9bec994ce89bf93535991",
+    "bytes": 5142
+   }
+  },
+  {
+   "name": "ty-semantic/MCConsensus/0",
+   "file": "modules/ty/ty-semantic--MCConsensus--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "1f5a8d6ae4a4aa09e573ff3e000779c9b1bef345856783014cb073a848f083ab",
+    "bytes": 30518
+   }
+  },
+  {
+   "name": "ty-semantic/MCConsensus/1",
+   "file": "modules/ty/ty-semantic--MCConsensus--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "7b98a4ffae785f0cf8dc87d6669ef42c844a7af59b17a7ac45ec746465dca7a9",
+    "bytes": 2312
+   }
+  },
+  {
+   "name": "ty-semantic/MCConsensus/2",
+   "file": "modules/ty/ty-semantic--MCConsensus--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "909e666cf0af4ed6591fae137967c2eaaecdf4092573e95ba08d6455b07e36d5",
+    "bytes": 1796
+   }
+  },
+  {
+   "name": "ty-semantic/MCConsensus_2/0",
+   "file": "modules/ty/ty-semantic--MCConsensus_2--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "875092c6f1e6da5fdcfd4743df20b5973c02a515f87a67fa6c534bf22ec3a2a3",
+    "bytes": 21485
+   }
+  },
+  {
+   "name": "ty-semantic/MCConsensus_2/1",
+   "file": "modules/ty/ty-semantic--MCConsensus_2--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "3385c93456979006271bb47ee407ee1f03ed125376a7b7ee9b8f032ec87f0618",
+    "bytes": 2312
+   }
+  },
+  {
+   "name": "ty-semantic/MCConsensus_2/2",
+   "file": "modules/ty/ty-semantic--MCConsensus_2--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8e1ede525a3526ef0a619cf094b9c0964f78597f2656c0b96656f2ba83056f2d",
+    "bytes": 1796
+   }
+  },
+  {
+   "name": "ty-semantic/MCInnerFIFO/0",
+   "file": "modules/ty/ty-semantic--MCInnerFIFO--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "c3d98c7a9aea7141ceb307f12221977bb43176c8a60efba59b02d2045b5ca3d1",
+    "bytes": 154485
+   }
+  },
+  {
+   "name": "ty-semantic/MCInternalMemory/0",
+   "file": "modules/ty/ty-semantic--MCInternalMemory--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_69",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "16549a31447398e519715296ae46a7dde5eb4c86217ec4872b4c57f0d3b7c609",
+    "bytes": 172414
+   }
+  },
+  {
+   "name": "ty-semantic/MCLiveInternalMemory/0",
+   "file": "modules/ty/ty-semantic--MCLiveInternalMemory--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_69",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ee84c3655316f9c9eb5af4376eeb0725b52a0c031bdb32f09b2cd5b0d39ad55e",
+    "bytes": 162766
+   }
+  },
+  {
+   "name": "ty-semantic/Peterson/0",
+   "file": "modules/ty/ty-semantic--Peterson--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "1b18d571045a9672c3038733742367a6281c927ded0dced18284281f4d3bdd34",
+    "bytes": 209813
+   }
+  },
+  {
+   "name": "ty-semantic/Peterson/1",
+   "file": "modules/ty/ty-semantic--Peterson--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "4e60f27a6d9b0726f115e1450e68b5fa95af1103a8290680e31127fc011a8784",
+    "bytes": 27121
+   }
+  },
+  {
+   "name": "ty-semantic/Peterson/2",
+   "file": "modules/ty/ty-semantic--Peterson--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ff11641b90309c86558ee2a874939b63e374cbc59e7ddd520939fcc380194553",
+    "bytes": 4466
+   }
+  },
+  {
+   "name": "ty-semantic/Peterson/3",
+   "file": "modules/ty/ty-semantic--Peterson--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "9725a0ae6d0610ca8e0bf4d0f0beb341e0d61a0858a3088243ea040d0a8adcf2",
+    "bytes": 10702
+   }
+  },
+  {
+   "name": "ty-semantic/Prisoner/0",
+   "file": "modules/ty/ty-semantic--Prisoner--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_69",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_72",
+    "__ty_trust_ir_func_73",
+    "__ty_trust_ir_func_74",
+    "__ty_trust_ir_func_75",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ddc5c358b3933e495fd7f16dc8a7330619745808062b4b284fc4b726491d4256",
+    "bytes": 138555
+   }
+  },
+  {
+   "name": "ty-semantic/Simple/0",
+   "file": "modules/ty/ty-semantic--Simple--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "863fb6e0cbb88950a0d57db8f96b95dc95d82ef81d8ae319ff33c9fb7fba78ba",
+    "bytes": 149526
+   }
+  },
+  {
+   "name": "ty-semantic/Simple/1",
+   "file": "modules/ty/ty-semantic--Simple--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "1a7491c20cffc69a84bb1384e04ae1091fca216b751e56e92173ffde1a15946b",
+    "bytes": 37307
+   }
+  },
+  {
+   "name": "ty-semantic/Simple/2",
+   "file": "modules/ty/ty-semantic--Simple--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "84e3f2fb90202d4679f71ded31c175b1d9aa2f15fa6c42c3bb72d8e213ff761c",
+    "bytes": 5029
+   }
+  },
+  {
+   "name": "ty-semantic/Simple/3",
+   "file": "modules/ty/ty-semantic--Simple--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "b296f55305156abaed0947f6d9d9df9c431d3dcc584fff26ec17c3b22830a712",
+    "bytes": 7964
+   }
+  },
+  {
+   "name": "ty-semantic/Simple/4",
+   "file": "modules/ty/ty-semantic--Simple--4.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ef8e79cdeb761d1fc00e0232e0ef169b68b677cf95f33a943190261ebcd2c960",
+    "bytes": 17175
+   }
+  },
+  {
+   "name": "ty-semantic/SimpleRegular/0",
+   "file": "modules/ty/ty-semantic--SimpleRegular--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "4ff7433af158f0a6f0a4ccbee42ff6d4c2aa34afc11a5203cc88ac28d3c20899",
+    "bytes": 179855
+   }
+  },
+  {
+   "name": "ty-semantic/SimpleRegular/1",
+   "file": "modules/ty/ty-semantic--SimpleRegular--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "42972415e1e103d46ed148f5ddbdfe07bffe609cfd019bedb317a933ca8fd46e",
+    "bytes": 81348
+   }
+  },
+  {
+   "name": "ty-semantic/SimpleRegular/2",
+   "file": "modules/ty/ty-semantic--SimpleRegular--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "a411e7842237a9073903e335117b0915eef6ba3c95572d90acac94b9fa2eb059",
+    "bytes": 71990
+   }
+  },
+  {
+   "name": "ty-semantic/SimpleRegular/3",
+   "file": "modules/ty/ty-semantic--SimpleRegular--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "c41bf3a1735ccb39425d5a099692876ed665726055e58f23218f877ed0a736b4",
+    "bytes": 4266
+   }
+  },
+  {
+   "name": "ty-semantic/SimpleRegular/4",
+   "file": "modules/ty/ty-semantic--SimpleRegular--4.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "9da5a4da20986f45ee9933c7d247aeeccd2409a8b408e1c1b8e1e5252f1158ff",
+    "bytes": 5029
+   }
+  },
+  {
+   "name": "ty-semantic/SpanTree/0",
+   "file": "modules/ty/ty-semantic--SpanTree--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_69",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_72",
+    "__ty_trust_ir_func_73",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "b458ee495b16005bcd88890ba0845de6caf1143b48d3fea4c581b01e2645bc46",
+    "bytes": 69563
+   }
+  },
+  {
+   "name": "ty-semantic/SyncTerminationDetection/0",
+   "file": "modules/ty/ty-semantic--SyncTerminationDetection--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "55222efc3fa137abf2e99e08c5d320bad102ddb1e4f4c0735f28fd4cbc388e34",
+    "bytes": 100728
+   }
+  },
+  {
+   "name": "ty-semantic/TCommit/0",
+   "file": "modules/ty/ty-semantic--TCommit--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "4f8f6afe92e762d98bd99920239d2b513f6d4c0e09652b7e68d8116197d5cf44",
+    "bytes": 87641
+   }
+  },
+  {
+   "name": "ty-semantic/TCommit/1",
+   "file": "modules/ty/ty-semantic--TCommit--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "2960c996828ba40b4fb8fe4c27e82f0cd641c578c3b38f92311d295184c27380",
+    "bytes": 25525
+   }
+  },
+  {
+   "name": "ty-semantic/TCommit/2",
+   "file": "modules/ty/ty-semantic--TCommit--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "fca88c384e3903cc170551e7fb07401d853e8e49b8327d7128b4e4145121a681",
+    "bytes": 2111
+   }
+  },
+  {
+   "name": "ty-semantic/TCommit/3",
+   "file": "modules/ty/ty-semantic--TCommit--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "db5c91baac715c7559bd8c379c51053ae9cb6e9579f42a55b0a0e2c27ccce911",
+    "bytes": 3531
+   }
+  },
+  {
+   "name": "ty-semantic/TwoPhase/0",
+   "file": "modules/ty/ty-semantic--TwoPhase--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "14f086f8d41704dc812bdf853497c80c8024ae46c33dbca4434bc5cacaa26247",
+    "bytes": 188178
+   }
+  },
+  {
+   "name": "ty-semantic/VoucherLifeCycle/0",
+   "file": "modules/ty/ty-semantic--VoucherLifeCycle--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "cfd26815e9968937c772a5a704204f1c472c0b8877d54b2a6da39e9acc6ea537",
+    "bytes": 137756
+   }
+  },
+  {
+   "name": "ty-semantic/VoucherLifeCycle/1",
+   "file": "modules/ty/ty-semantic--VoucherLifeCycle--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ab51de228991961b278311324c2e45cc3443312f29e585c55cd4b18e251a8cd9",
+    "bytes": 22666
+   }
+  },
+  {
+   "name": "ty-semantic/VoucherLifeCycle/2",
+   "file": "modules/ty/ty-semantic--VoucherLifeCycle--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "000d56f1791e3e98e190bc5e6d14c8e06be6d9331a5d5834df8291d735b2ef10",
+    "bytes": 4028
+   }
+  },
+  {
+   "name": "ty-semantic/VoucherLifeCycle/3",
+   "file": "modules/ty/ty-semantic--VoucherLifeCycle--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "75e2507974afcd21b43c9ebd2becbd9c147a6688ccf4e385111217022ee34677",
+    "bytes": 7119
+   }
+  },
+  {
+   "name": "ty-semantic/clean/0",
+   "file": "modules/ty/ty-semantic--clean--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "3ab7576164d018488cc4fa014f5b978755c09c5b329808a4059fd951a10a62f6",
+    "bytes": 114103
+   }
+  },
+  {
+   "name": "ty-semantic/clean/1",
+   "file": "modules/ty/ty-semantic--clean--1.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_3"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "3cd356f79e188d2b2062e1b7d573d70940d188572cdb88d00b20fe1858e102b4",
+    "bytes": 9502
+   }
+  },
+  {
+   "name": "ty-semantic/clean/2",
+   "file": "modules/ty/ty-semantic--clean--2.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "18dc08b261f91c7a594668efb31c370c06020d15c49d08b2d8b19c3dfeb050ae",
+    "bytes": 1801
+   }
+  },
+  {
+   "name": "ty-semantic/clean/3",
+   "file": "modules/ty/ty-semantic--clean--3.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "9f6a5fc96aff5ab1e95ffbd6398c971d483e97bb07b8a9d2f2bc66a723a99ae0",
+    "bytes": 430
+   }
+  },
+  {
+   "name": "ty-semantic/clean/4",
+   "file": "modules/ty/ty-semantic--clean--4.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "72e6d086e3e4107aa5e48e1aa2275a4ff26cf7c9043a9185e2be30c594629944",
+    "bytes": 1922
+   }
+  },
+  {
+   "name": "ty-semantic/clean/5",
+   "file": "modules/ty/ty-semantic--clean--5.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "74f3556ab5372c2639d231ccf4f9bb7e354c7cc3178a6c9bb9c0f707e89d18a1",
+    "bytes": 3838
+   }
+  },
+  {
+   "name": "ty-semantic/dijkstra-mutex_LSpec-model/0",
+   "file": "modules/ty/ty-semantic--dijkstra-mutex_LSpec-model--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8855d6057a6dfba28c23b4e5b6707671e8f8f9727e07a20e2e6c6a2cd18f779d",
+    "bytes": 449201
+   }
+  },
+  {
+   "name": "ty-semantic/kvstore/0",
+   "file": "modules/ty/ty-semantic--kvstore--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "34ca1548199b0afa2b299ff160524aea91058891247a1c4cb301f4cc5c458780",
+    "bytes": 260522
+   }
+  },
+  {
+   "name": "ty-semantic/nbacc_ray97/0",
+   "file": "modules/ty/ty-semantic--nbacc_ray97--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_51",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_58",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_67",
+    "__ty_trust_ir_func_68",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_70",
+    "__ty_trust_ir_func_71",
+    "__ty_trust_ir_func_72",
+    "__ty_trust_ir_func_73",
+    "__ty_trust_ir_func_74",
+    "__ty_trust_ir_func_75",
+    "__ty_trust_ir_func_76",
+    "__ty_trust_ir_func_77",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "40cb8fcae4e5d6dfbef86ca9e70b83dde47154e95726790c782728c1f37933f8",
+    "bytes": 216321
+   }
+  },
+  {
+   "name": "ty-semantic/nbacg_guer01/0",
+   "file": "modules/ty/ty-semantic--nbacg_guer01--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_29",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_35",
+    "__ty_trust_ir_func_36",
+    "__ty_trust_ir_func_37",
+    "__ty_trust_ir_func_38",
+    "__ty_trust_ir_func_39",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_40",
+    "__ty_trust_ir_func_41",
+    "__ty_trust_ir_func_42",
+    "__ty_trust_ir_func_43",
+    "__ty_trust_ir_func_44",
+    "__ty_trust_ir_func_45",
+    "__ty_trust_ir_func_46",
+    "__ty_trust_ir_func_47",
+    "__ty_trust_ir_func_48",
+    "__ty_trust_ir_func_49",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_50",
+    "__ty_trust_ir_func_52",
+    "__ty_trust_ir_func_53",
+    "__ty_trust_ir_func_54",
+    "__ty_trust_ir_func_55",
+    "__ty_trust_ir_func_56",
+    "__ty_trust_ir_func_57",
+    "__ty_trust_ir_func_59",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_60",
+    "__ty_trust_ir_func_61",
+    "__ty_trust_ir_func_62",
+    "__ty_trust_ir_func_63",
+    "__ty_trust_ir_func_64",
+    "__ty_trust_ir_func_65",
+    "__ty_trust_ir_func_66",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "120cddb4b4d99db8294361b17c798f75536a425e8ba9578f1559eca93d1b4a05",
+    "bytes": 407128
+   }
+  },
+  {
+   "name": "ty-semantic/stages/0",
+   "file": "modules/ty/ty-semantic--stages--0.trust_irbin",
+   "origin": "ty-semantic",
+   "opt_level": "O2",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_0",
+    "__ty_trust_ir_func_1",
+    "__ty_trust_ir_func_10",
+    "__ty_trust_ir_func_11",
+    "__ty_trust_ir_func_12",
+    "__ty_trust_ir_func_13",
+    "__ty_trust_ir_func_14",
+    "__ty_trust_ir_func_15",
+    "__ty_trust_ir_func_16",
+    "__ty_trust_ir_func_17",
+    "__ty_trust_ir_func_18",
+    "__ty_trust_ir_func_19",
+    "__ty_trust_ir_func_2",
+    "__ty_trust_ir_func_20",
+    "__ty_trust_ir_func_21",
+    "__ty_trust_ir_func_22",
+    "__ty_trust_ir_func_23",
+    "__ty_trust_ir_func_24",
+    "__ty_trust_ir_func_25",
+    "__ty_trust_ir_func_26",
+    "__ty_trust_ir_func_27",
+    "__ty_trust_ir_func_28",
+    "__ty_trust_ir_func_3",
+    "__ty_trust_ir_func_30",
+    "__ty_trust_ir_func_31",
+    "__ty_trust_ir_func_32",
+    "__ty_trust_ir_func_33",
+    "__ty_trust_ir_func_34",
+    "__ty_trust_ir_func_4",
+    "__ty_trust_ir_func_5",
+    "__ty_trust_ir_func_6",
+    "__ty_trust_ir_func_7",
+    "__ty_trust_ir_func_8",
+    "__ty_trust_ir_func_9"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "75252958a1edf371250b932aa0ea877da6aebc85626d21af2dfe1afe960a30ff",
+    "bytes": 154215
+   }
+  },
+  {
+   "name": "ty-prod/Barrier/0",
+   "file": "modules/ty/ty-prod--Barrier--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "e856435dfd7f9637d40e10d52cbee6ed97d992a01858667077769e15b5b2da43",
+    "bytes": 14790
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/0",
+   "file": "modules/ty/ty-prod--Barriers--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "00420778593934e2a16b3da85cab3ebc2a1935db83e1b80410c6cf8f90993764",
+    "bytes": 39811
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/1",
+   "file": "modules/ty/ty-prod--Barriers--1.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8f1453c442bc4af2670f6d1c906d34bbe8658483f3bc930b0c14a2bc0a4e7a81",
+    "bytes": 40337
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/2",
+   "file": "modules/ty/ty-prod--Barriers--2.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ecb63b7f373c6eea7088cd21c33087b6617e3dd580ba6f4cc44771e75151fa22",
+    "bytes": 40489
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/3",
+   "file": "modules/ty/ty-prod--Barriers--3.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "26cda59f21fbfd0495820280510146776197017b9e7b04820b65d728f608ba5c",
+    "bytes": 38135
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/4",
+   "file": "modules/ty/ty-prod--Barriers--4.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O0",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_1"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "c0a8588e9468735b6af8df59b1fb96e202ddcc484748e01d1a1de3b84bdb44ae",
+    "bytes": 34570
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/5",
+   "file": "modules/ty/ty-prod--Barriers--5.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "0f9a157c64c28fc165ff04ff91329c16faf0b4e91ca7385be442377efe262b67",
+    "bytes": 4743
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/6",
+   "file": "modules/ty/ty-prod--Barriers--6.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "a20a8e9f7b337edb1c234ca8d515e3f681e5742c5a1c097a955fad570c8405d4",
+    "bytes": 6492
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/7",
+   "file": "modules/ty/ty-prod--Barriers--7.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "0a64a801b00a01a8539faa65918a17d3491a6e6060a0d2774e745db5903a5735",
+    "bytes": 51444
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/8",
+   "file": "modules/ty/ty-prod--Barriers--8.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "c0445ca873148a75955db37599c7947d04ca33e0271c76fbb4d0d21b924a83b0",
+    "bytes": 11195
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/9",
+   "file": "modules/ty/ty-prod--Barriers--9.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "885e64ad1becbb27b38f82bfa3c6ade47c45a8e93158f9c1b58b5f50b0a9af1d",
+    "bytes": 34456
+   }
+  },
+  {
+   "name": "ty-prod/Barriers/10",
+   "file": "modules/ty/ty-prod--Barriers--10.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "67899c64579791d58a616136e40f4e1921e8552c15b48a92f27a86a16fc41de2",
+    "bytes": 14577
+   }
+  },
+  {
+   "name": "ty-prod/HourClock/0",
+   "file": "modules/ty/ty-prod--HourClock--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "6ab4628bc84020a29f4ae917c383a9a1322200cc674ba94c4250dca8d129b74a",
+    "bytes": 12938
+   }
+  },
+  {
+   "name": "ty-prod/HourClock2/0",
+   "file": "modules/ty/ty-prod--HourClock2--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "7a367c0748f3139febe78627e735605b0b20a469eeba269adc79039582ed2417",
+    "bytes": 15084
+   }
+  },
+  {
+   "name": "ty-prod/Lock/0",
+   "file": "modules/ty/ty-prod--Lock--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "caf305ca1fa618634b9f40ae4ffa19f7194c269ff43496715f7ef4b803735a60",
+    "bytes": 13052
+   }
+  },
+  {
+   "name": "ty-prod/MCConsensus/0",
+   "file": "modules/ty/ty-prod--MCConsensus--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "c22ec07ae2e26073941e7ff9a418274fd68b857709b92125e0f01fb80e7eb904",
+    "bytes": 12724
+   }
+  },
+  {
+   "name": "ty-prod/MCConsensus_2/0",
+   "file": "modules/ty/ty-prod--MCConsensus_2--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "9e9a8f0dddb7df6968e48f308af86f3e85190562ffae832f961d8c4a6b772534",
+    "bytes": 12724
+   }
+  },
+  {
+   "name": "ty-prod/Simple/0",
+   "file": "modules/ty/ty-prod--Simple--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8b8a06635196f8289cd37fe05325ba4516412ebb0c38b87d6823db56d1d71d26",
+    "bytes": 12644
+   }
+  },
+  {
+   "name": "ty-prod/SimpleRegular/0",
+   "file": "modules/ty/ty-prod--SimpleRegular--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "e1fc21a96e8754e828fa1574fba14f92641ade6d28e6dd048f7d1c512a7e5676",
+    "bytes": 12644
+   }
+  },
+  {
+   "name": "ty-prod/clean/0",
+   "file": "modules/ty/ty-prod--clean--0.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_4"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "aebd2e6cc493aaafbfbcdd8282ff479e6bdfc3acb028ee15b659284990d05669",
+    "bytes": 9502
+   }
+  },
+  {
+   "name": "ty-prod/clean/1",
+   "file": "modules/ty/ty-prod--clean--1.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "ff6f9f804f1216299d703473fbed4c2be44d7fdd31a8892cc4cf53d453acf787",
+    "bytes": 1801
+   }
+  },
+  {
+   "name": "ty-prod/clean/2",
+   "file": "modules/ty/ty-prod--clean--2.trust_irbin",
+   "origin": "ty-prod",
+   "opt_level": "O1",
+   "lanes": [
+    "jit-raw",
+    "jit-raw-checked"
+   ],
+   "externs": [
+    "__ty_trust_ir_func_40000",
+    "__ty_trust_ir_func_40001",
+    "__ty_trust_ir_func_40002"
+   ],
+   "provenance": {
+    "ty_commit": "ca44ddb789",
+    "stage": "compile_module_native.pre_jit",
+    "sha256": "8ee8e76697b199031517980591e2084795d201e33a061e10997227471ad97481",
+    "bytes": 24745
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/b1_mispredict",
+   "file": "modules/bridge/beat-llvm--b1_mispredict",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/b1_mispredict.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/h1_vec_push_sum",
+   "file": "modules/bridge/beat-llvm--h1_vec_push_sum",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/h1_vec_push_sum.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/h2_vec_grow",
+   "file": "modules/bridge/beat-llvm--h2_vec_grow",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/h2_vec_grow.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/h3_box_leak",
+   "file": "modules/bridge/beat-llvm--h3_box_leak",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/h3_box_leak.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/h4_vec_dropper",
+   "file": "modules/bridge/beat-llvm--h4_vec_dropper",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/h4_vec_dropper.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/m1_call_chain",
+   "file": "modules/bridge/beat-llvm--m1_call_chain",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/m1_call_chain.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/m2_call_heavy",
+   "file": "modules/bridge/beat-llvm--m2_call_heavy",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/m2_call_heavy.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p1_xorshift",
+   "file": "modules/bridge/beat-llvm--p1_xorshift",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p1_xorshift.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p2_collatz",
+   "file": "modules/bridge/beat-llvm--p2_collatz",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p2_collatz.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p3_gcd",
+   "file": "modules/bridge/beat-llvm--p3_gcd",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p3_gcd.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p4_matmul",
+   "file": "modules/bridge/beat-llvm--p4_matmul",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p4_matmul.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p5_struct_acc",
+   "file": "modules/bridge/beat-llvm--p5_struct_acc",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p5_struct_acc.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p6_branch_match",
+   "file": "modules/bridge/beat-llvm--p6_branch_match",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p6_branch_match.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p7_sieve",
+   "file": "modules/bridge/beat-llvm--p7_sieve",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p7_sieve.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/p8_closure_nest",
+   "file": "modules/bridge/beat-llvm--p8_closure_nest",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/p8_closure_nest.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/v1_saxpy",
+   "file": "modules/bridge/beat-llvm--v1_saxpy",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/v1_saxpy.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/v2_memfill",
+   "file": "modules/bridge/beat-llvm--v2_memfill",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/v2_memfill.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/beat-llvm/v3_popcount",
+   "file": "modules/bridge/beat-llvm--v3_popcount",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/progs/v3_popcount.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/fmt-selfhost/abi_aggregate_return",
+   "file": "modules/bridge/fmt-selfhost--abi_aggregate_return",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/fmt-selfhost/progs/abi_aggregate_return.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/fmt-selfhost/argtype_shape",
+   "file": "modules/bridge/fmt-selfhost--argtype_shape",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/fmt-selfhost/progs/argtype_shape.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/fmt-selfhost/fmt_format",
+   "file": "modules/bridge/fmt-selfhost--fmt_format",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/fmt-selfhost/progs/fmt_format.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/fmt-selfhost/fmt_panic",
+   "file": "modules/bridge/fmt-selfhost--fmt_panic",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/fmt-selfhost/progs/fmt_panic.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/fmt-selfhost/fmt_println",
+   "file": "modules/bridge/fmt-selfhost--fmt_println",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/fmt-selfhost/progs/fmt_println.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/fmt-selfhost/fmt_write",
+   "file": "modules/bridge/fmt-selfhost--fmt_write",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/fmt-selfhost/progs/fmt_write.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 10
+   }
+  },
+  {
+   "name": "rustc-bridge/fmt-selfhost/selfhost_live_reader",
+   "file": "modules/bridge/fmt-selfhost--selfhost_live_reader",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/fmt-selfhost/progs/selfhost_live_reader.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 16
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s01_fill_f32",
+   "file": "modules/bridge/shape-coverage--s01_fill_f32",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s01_fill_f32.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s02_fill_f64",
+   "file": "modules/bridge/shape-coverage--s02_fill_f64",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s02_fill_f64.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s03_fill_u16",
+   "file": "modules/bridge/shape-coverage--s03_fill_u16",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s03_fill_u16.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s04_matmul_i32",
+   "file": "modules/bridge/shape-coverage--s04_matmul_i32",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s04_matmul_i32.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s05_matmul_i64",
+   "file": "modules/bridge/shape-coverage--s05_matmul_i64",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s05_matmul_i64.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s06_seeded_reduction",
+   "file": "modules/bridge/shape-coverage--s06_seeded_reduction",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s06_seeded_reduction.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s07_seeded_reduction_i64",
+   "file": "modules/bridge/shape-coverage--s07_seeded_reduction_i64",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s07_seeded_reduction_i64.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s08_cond_store",
+   "file": "modules/bridge/shape-coverage--s08_cond_store",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s08_cond_store.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s09_bitrev_carried",
+   "file": "modules/bridge/shape-coverage--s09_bitrev_carried",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s09_bitrev_carried.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s10_mixed_types",
+   "file": "modules/bridge/shape-coverage--s10_mixed_types",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s10_mixed_types.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s11_slice_sum_u64",
+   "file": "modules/bridge/shape-coverage--s11_slice_sum_u64",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s11_slice_sum_u64.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s12_fp_reduction",
+   "file": "modules/bridge/shape-coverage--s12_fp_reduction",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s12_fp_reduction.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s13_zero_trip",
+   "file": "modules/bridge/shape-coverage--s13_zero_trip",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s13_zero_trip.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s14_i8_i16_reduce",
+   "file": "modules/bridge/shape-coverage--s14_i8_i16_reduce",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s14_i8_i16_reduce.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s15_fill_merge_value",
+   "file": "modules/bridge/shape-coverage--s15_fill_merge_value",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s15_fill_merge_value.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s16_reassigned_bound",
+   "file": "modules/bridge/shape-coverage--s16_reassigned_bound",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s16_reassigned_bound.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s17_mac_offset_index",
+   "file": "modules/bridge/shape-coverage--s17_mac_offset_index",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s17_mac_offset_index.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s18_strided_offset_index",
+   "file": "modules/bridge/shape-coverage--s18_strided_offset_index",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s18_strided_offset_index.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s19_iota_merge_addend",
+   "file": "modules/bridge/shape-coverage--s19_iota_merge_addend",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s19_iota_merge_addend.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s20_iota_merge_bound",
+   "file": "modules/bridge/shape-coverage--s20_iota_merge_bound",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s20_iota_merge_bound.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s21_bytesum_ptr_offset",
+   "file": "modules/bridge/shape-coverage--s21_bytesum_ptr_offset",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s21_bytesum_ptr_offset.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s22_bytesum_merge_bound",
+   "file": "modules/bridge/shape-coverage--s22_bytesum_merge_bound",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s22_bytesum_merge_bound.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s23_abi_stack_arg_return_clobber",
+   "file": "modules/bridge/shape-coverage--s23_abi_stack_arg_return_clobber",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s23_abi_stack_arg_return_clobber.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s24_sret_nested_indirect_return",
+   "file": "modules/bridge/shape-coverage--s24_sret_nested_indirect_return",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s24_sret_nested_indirect_return.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s25_const_range_into_iter",
+   "file": "modules/bridge/shape-coverage--s25_const_range_into_iter",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s25_const_range_into_iter.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s26_dyn_dispatch_boxarray",
+   "file": "modules/bridge/shape-coverage--s26_dyn_dispatch_boxarray",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s26_dyn_dispatch_boxarray.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s27_dyn_box_drop",
+   "file": "modules/bridge/shape-coverage--s27_dyn_box_drop",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s27_dyn_box_drop.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 10
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s28_closures_generic",
+   "file": "modules/bridge/shape-coverage--s28_closures_generic",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s28_closures_generic.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s29_nested_aggregates",
+   "file": "modules/bridge/shape-coverage--s29_nested_aggregates",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s29_nested_aggregates.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s30_iterator_chain",
+   "file": "modules/bridge/shape-coverage--s30_iterator_chain",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s30_iterator_chain.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 19
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s31_vec_sort_dedup",
+   "file": "modules/bridge/shape-coverage--s31_vec_sort_dedup",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s31_vec_sort_dedup.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 10
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s32_dyn_mut_ref",
+   "file": "modules/bridge/shape-coverage--s32_dyn_mut_ref",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s32_dyn_mut_ref.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s33_unsigned_divrem_hibit",
+   "file": "modules/bridge/shape-coverage--s33_unsigned_divrem_hibit",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s33_unsigned_divrem_hibit.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s34_signed_div_edge",
+   "file": "modules/bridge/shape-coverage--s34_signed_div_edge",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s34_signed_div_edge.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s35_mixed_int_casts",
+   "file": "modules/bridge/shape-coverage--s35_mixed_int_casts",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s35_mixed_int_casts.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s36_bit_count_rotate",
+   "file": "modules/bridge/shape-coverage--s36_bit_count_rotate",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s36_bit_count_rotate.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s37_float_narrow_int_saturate",
+   "file": "modules/bridge/shape-coverage--s37_float_narrow_int_saturate",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s37_float_narrow_int_saturate.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s38_vec_float_narrow_saturate",
+   "file": "modules/bridge/shape-coverage--s38_vec_float_narrow_saturate",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s38_vec_float_narrow_saturate.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s39_fma_no_spurious_fusion",
+   "file": "modules/bridge/shape-coverage--s39_fma_no_spurious_fusion",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s39_fma_no_spurious_fusion.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s40_mixed_int_float_abi",
+   "file": "modules/bridge/shape-coverage--s40_mixed_int_float_abi",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s40_mixed_int_float_abi.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s41_u128_multilimb",
+   "file": "modules/bridge/shape-coverage--s41_u128_multilimb",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s41_u128_multilimb.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s42_bit_intrinsics_widths",
+   "file": "modules/bridge/shape-coverage--s42_bit_intrinsics_widths",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s42_bit_intrinsics_widths.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s43_recursion_forms",
+   "file": "modules/bridge/shape-coverage--s43_recursion_forms",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s43_recursion_forms.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 16
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s44_float_reduction_order",
+   "file": "modules/bridge/shape-coverage--s44_float_reduction_order",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s44_float_reduction_order.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s45_packed_unaligned",
+   "file": "modules/bridge/shape-coverage--s45_packed_unaligned",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s45_packed_unaligned.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s46_float_int_boundary",
+   "file": "modules/bridge/shape-coverage--s46_float_int_boundary",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s46_float_int_boundary.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s47_narrow_div_overflow",
+   "file": "modules/bridge/shape-coverage--s47_narrow_div_overflow",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s47_narrow_div_overflow.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s48_aggregate_swap_copy",
+   "file": "modules/bridge/shape-coverage--s48_aggregate_swap_copy",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s48_aggregate_swap_copy.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s49_option_niche",
+   "file": "modules/bridge/shape-coverage--s49_option_niche",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s49_option_niche.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 17
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s50_labeled_control_flow",
+   "file": "modules/bridge/shape-coverage--s50_labeled_control_flow",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s50_labeled_control_flow.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s51_match_patterns",
+   "file": "modules/bridge/shape-coverage--s51_match_patterns",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s51_match_patterns.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 16
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s52_raii_guard_drop",
+   "file": "modules/bridge/shape-coverage--s52_raii_guard_drop",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s52_raii_guard_drop.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s53_const_generics",
+   "file": "modules/bridge/shape-coverage--s53_const_generics",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s53_const_generics.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s54_array_const_subslice",
+   "file": "modules/bridge/shape-coverage--s54_array_const_subslice",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s54_array_const_subslice.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s55_vec_const_subslice",
+   "file": "modules/bridge/shape-coverage--s55_vec_const_subslice",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s55_vec_const_subslice.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s56_slice_ops",
+   "file": "modules/bridge/shape-coverage--s56_slice_ops",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s56_slice_ops.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s57_const_ref_arg",
+   "file": "modules/bridge/shape-coverage--s57_const_ref_arg",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s57_const_ref_arg.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s58_option_methods",
+   "file": "modules/bridge/shape-coverage--s58_option_methods",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s58_option_methods.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 19
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s59_result_methods",
+   "file": "modules/bridge/shape-coverage--s59_result_methods",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s59_result_methods.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s60_const_aggregate_ref_arg",
+   "file": "modules/bridge/shape-coverage--s60_const_aggregate_ref_arg",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s60_const_aggregate_ref_arg.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s61_const_enum_ref_arg",
+   "file": "modules/bridge/shape-coverage--s61_const_enum_ref_arg",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s61_const_enum_ref_arg.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s62_soa_mut_slice",
+   "file": "modules/bridge/shape-coverage--s62_soa_mut_slice",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s62_soa_mut_slice.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s63_state_machine",
+   "file": "modules/bridge/shape-coverage--s63_state_machine",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s63_state_machine.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s64_question_mark",
+   "file": "modules/bridge/shape-coverage--s64_question_mark",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s64_question_mark.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s65_generics",
+   "file": "modules/bridge/shape-coverage--s65_generics",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s65_generics.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 22
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s66_closures",
+   "file": "modules/bridge/shape-coverage--s66_closures",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s66_closures.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 13
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s67_method_chains",
+   "file": "modules/bridge/shape-coverage--s67_method_chains",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s67_method_chains.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 24
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s68_byte_conversions",
+   "file": "modules/bridge/shape-coverage--s68_byte_conversions",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s68_byte_conversions.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s69_iter_filter_count",
+   "file": "modules/bridge/shape-coverage--s69_iter_filter_count",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s69_iter_filter_count.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 14
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s70_operator_overload",
+   "file": "modules/bridge/shape-coverage--s70_operator_overload",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s70_operator_overload.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s71_custom_index",
+   "file": "modules/bridge/shape-coverage--s71_custom_index",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s71_custom_index.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 11
+   }
+  },
+  {
+   "name": "rustc-bridge/shape-coverage/s72_mut_ref_return",
+   "file": "modules/bridge/shape-coverage--s72_mut_ref_return",
+   "origin": "rustc-bridge",
+   "opt_level": "O2",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/shape-coverage/progs/s72_mut_ref_return.rs",
+    "rustc_flags": "-Copt-level=2 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 12
+   }
+  },
+  {
+   "name": "rustc-bridge/scale-gate/medium",
+   "file": "modules/bridge/scale-gate--medium",
+   "origin": "rustc-bridge",
+   "opt_level": "O3",
+   "lanes": [
+    "aot-object",
+    "aot-proofs"
+   ],
+   "provenance": {
+    "source": "benchmarks/beat-llvm/scale_gate.py generate(200)",
+    "rustc_flags": "-Copt-level=3 -Cpanic=abort --target aarch64-apple-darwin",
+    "bridge_exit": 1,
+    "modules": 211
+   }
+  }
+ ]
+}

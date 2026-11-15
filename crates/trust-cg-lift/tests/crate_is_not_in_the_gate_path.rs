@@ -38,9 +38,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Run `cargo tree -i CRATE -e <edges>` and return the lines naming a package.
+/// Run `targo tree -i CRATE -e <edges>` and return the lines naming a package.
 ///
-/// `cargo tree -i` prints the queried crate first, then its reverse
+/// `targo tree -i` prints the queried crate first, then its reverse
 /// dependencies over the selected edge kinds. Cargo computes the edge kinds, so
 /// this test does not re-implement dependency resolution.
 fn reverse_deps(edges: &str) -> Vec<String> {
@@ -50,13 +50,13 @@ fn reverse_deps(edges: &str) -> Vec<String> {
         ])
         .current_dir(workspace_root())
         .output()
-        .unwrap_or_else(|e| panic!("run cargo tree -e {edges}: {e}"));
+        .unwrap_or_else(|e| panic!("run targo tree -e {edges}: {e}"));
     assert!(
         out.status.success(),
-        "cargo tree -e {edges} failed: {}",
+        "targo tree -e {edges} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8(out.stdout).expect("cargo tree output is utf-8");
+    let stdout = String::from_utf8(out.stdout).expect("targo tree output is utf-8");
     stdout
         .lines()
         .map(str::trim)
@@ -90,7 +90,7 @@ fn trust_cg_lift_has_no_non_dev_dependents() {
 
 /// Guard against the above passing VACUOUSLY.
 ///
-/// If the crate were renamed, orphaned, or dropped from the workspace, `cargo
+/// If the crate were renamed, orphaned, or dropped from the workspace, `targo
 /// tree --invert` would report no dependents and the real assertion would pass
 /// while checking nothing. Pin the dev edge that is supposed to exist.
 #[test]
@@ -99,7 +99,7 @@ fn trust_cg_lift_is_still_reachable_as_a_dev_dependency() {
     assert!(
         dependents.iter().any(|d| d == "trust-cg-codegen"),
         "expected `trust-cg-codegen` to depend on `{CRATE}` as a dev-dependency, but \
-         cargo tree reports dependents {dependents:?}. If that edge really is gone, \
+         targo tree reports dependents {dependents:?}. If that edge really is gone, \
          this crate has no consumer and both tests here are vacuous — delete them \
          together with the crate, do not weaken them."
     );

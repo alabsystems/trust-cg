@@ -15,7 +15,7 @@
 // AArch64 triple-oracle harness (fibonacci, gcd, sum_1_to_n, factorial, max,
 // abs) plus integer power — see `tests/common/x86_64_corpus.rs`.
 //
-// Part of #301 / WS0 of docs/x86_64_completion_plan.md — x86-64 oracle.
+// Part of #301 / WS0 of docs/archive/x86_64_completion_plan.md — x86-64 oracle.
 
 mod common;
 use common::x86_64_corpus::{

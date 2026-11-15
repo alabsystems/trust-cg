@@ -1,5 +1,5 @@
 //! `TCG_PERF_STATS` — x86 per-function / per-innermost-loop instruction-mix
-//! attribution (STEP 0 of `docs/x86-perf-plan.md`).
+//! attribution (STEP 0 of `docs/archive/x86-perf-plan.md`).
 //!
 //! This is the "attribution tool that does not exist yet": it answers, for a
 //! hot kernel, *how many x86 instructions per loop iteration does trust-cg

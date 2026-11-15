@@ -776,8 +776,19 @@ fn compile_replay_trust_ir(bundle: &ReplayBundle) -> Result<CompileEvidence, Str
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
     })
+    .with_codegen_license(permit_unlicensed())
     .compile(&module)
     .map_err(|err| {
         format!(
@@ -797,17 +808,13 @@ fn compile_replay_trust_ir(bundle: &ReplayBundle) -> Result<CompileEvidence, Str
 }
 
 fn compile_replay_trust_ir_to_jit(bundle: &ReplayBundle) -> Result<ReplayJit, String> {
-    if bundle.metadata.target != Target::Aarch64 {
-        return Err(format!(
-            "replay JIT reducer only supports AArch64, got {:?}",
-            bundle.metadata.target
-        ));
-    }
+    require_host_target(bundle.metadata.target, "replay JIT reducer")?;
 
     let module = load_replay_trust_ir_module(bundle)?;
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(bundle.metadata.target);
     config.opt_level = bundle.metadata.opt_level;
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .map_err(|err| {
             format!(
@@ -839,12 +846,7 @@ fn compile_replay_trust_ir_to_jit(bundle: &ReplayBundle) -> Result<ReplayJit, St
 fn compile_replay_trust_ir_through_low_level_jit(
     artifact: &ReplayTrustIrArtifact,
 ) -> Result<LowLevelJitCompileEvidence, String> {
-    if artifact.metadata.target != Target::Aarch64 {
-        return Err(format!(
-            "low-level replay JIT reducer only supports AArch64, got {:?}",
-            artifact.metadata.target
-        ));
-    }
+    require_host_target(artifact.metadata.target, "low-level replay JIT reducer")?;
 
     let mut module = load_replay_trust_ir_artifact_module(artifact)?;
     trust_cg_codegen::dialect_pipeline::lower_dialects(&mut module).map_err(|err| {
@@ -854,7 +856,7 @@ fn compile_replay_trust_ir_through_low_level_jit(
         )
     })?;
 
-    let lowered = trust_cg_lower::translate_module(&module).map_err(|err| {
+    let lowered = permit_translate_module(&module).map_err(|err| {
         format!(
             "translate replay trust_ir {}: {err}",
             artifact.trust_ir_json_path.display()
@@ -995,7 +997,7 @@ fn build_minimal_request_module() -> TrustIrModule {
     fb.switch_to_block(entry);
     fb.ret(vec![]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn fixture_metadata_path(root: &Path) -> PathBuf {
@@ -1050,7 +1052,7 @@ fn write_fixture_bundle(root: &Path) -> Result<(), String> {
                 "bodyless_external_declarations": []
             },
             "opt_level": "O3",
-            "target_triple": "aarch64-apple-darwin",
+            "target_triple": ty_contract::host_target_triple(),
             "files": {
                 "serde_json_trust_ir": TRUST_IR_JSON_NAME,
                 "canonical_trust_ir": "000001-compile_module_native.linked-Request__1_1.trust_ir",
@@ -1229,13 +1231,24 @@ fn blank_ty_git_commit(metadata: &mut Value) {
     metadata["source_revisions"]["ty_git_commit"] = json!(" \t\n ");
 }
 
-fn host_supports_aarch64_jit(test_name: &str) -> bool {
-    if cfg!(target_arch = "aarch64") {
-        true
-    } else {
-        eprintln!("skipping {test_name}: AArch64 host JIT is required");
-        false
+/// The in-process JIT executes a bundle only on the bundle's own target.
+fn require_host_target(target: Target, what: &str) -> Result<(), String> {
+    match Target::try_host() {
+        Some(host) if host == target => Ok(()),
+        host => Err(format!(
+            "{what} executes a bundle only on its own target: bundle {target:?}, host {host:?}"
+        )),
     }
+}
+
+/// The host JIT target, or `None` (with the skip printed) on a host without
+/// an in-process JIT.
+fn host_jit_target_or_skip(test_name: &str) -> Option<Target> {
+    let host = Target::try_host();
+    if host.is_none() {
+        eprintln!("skipping {test_name}: an in-process JIT host is required");
+    }
+    host
 }
 
 #[test]
@@ -1247,7 +1260,10 @@ fn minimal_ty_request_replay_bundle_parses_and_compiles() {
         compile_replay_trust_ir(&bundle).expect("minimal replay trust_ir should compile");
 
     assert_eq!(bundle.metadata.module_name, REQUEST_SYMBOL);
-    assert_eq!(bundle.metadata.target_triple, "aarch64-apple-darwin");
+    assert_eq!(
+        bundle.metadata.target_triple,
+        ty_contract::host_target_triple()
+    );
     assert_eq!(bundle.metadata.function_count, 1);
     assert_eq!(
         bundle.metadata.source_revisions.trust_cg_pipeline_version,
@@ -1352,7 +1368,7 @@ fn ty_request_replay_bundle_rejects_missing_or_blank_source_revisions_before_rep
 
 #[test]
 fn minimal_ty_request_replay_bundle_jit_invokes_through_contract_lookup() {
-    if !host_supports_aarch64_jit("minimal fixture JIT invocation") {
+    if host_jit_target_or_skip("minimal fixture JIT invocation").is_none() {
         return;
     }
 
@@ -1600,7 +1616,7 @@ fn env_ty_request_replay_bundle_parses_and_compiles_when_present() {
     assert_eq!(bundle.root, root);
     assert_eq!(bundle.metadata.module_name, REQUEST_SYMBOL);
     assert_eq!(bundle.metadata.opt_level, OptLevel::O3);
-    assert_eq!(bundle.metadata.target, Target::Aarch64);
+    assert_eq!(Some(bundle.metadata.target), Target::try_host());
     assert_eq!(bundle.metadata.stage, LINKED_STAGE);
     assert_eq!(bundle.crash.pc_map_offset, Some(0));
     assert_eq!(bundle.callout.function_address, bundle.crash.fault_pc);
@@ -1643,7 +1659,7 @@ fn env_ty_request_replay_bundle_low_level_compile_raw_alloc_size_matches_proof_w
         eprintln!("skipping real TY low-level replay bundle reducer: {BUNDLE_ENV} is not set");
         return;
     };
-    if !host_supports_aarch64_jit("env replay bundle low-level compile_raw") {
+    if host_jit_target_or_skip("env replay bundle low-level compile_raw").is_none() {
         return;
     }
 
@@ -1662,7 +1678,7 @@ fn env_ty_request_replay_bundle_low_level_compile_raw_alloc_size_matches_proof_w
 
     assert_eq!(artifact.root, root);
     assert_eq!(artifact.metadata.module_name, REQUEST_SYMBOL);
-    assert_eq!(artifact.metadata.target, Target::Aarch64);
+    assert_eq!(Some(artifact.metadata.target), Target::try_host());
     assert_eq!(artifact.metadata.stage, LINKED_STAGE);
     assert_eq!(
         evidence.function_count as u64,
@@ -1709,7 +1725,7 @@ fn env_ty_request_replay_bundle_jit_invokes_in_child_when_present() {
         eprintln!("skipping real TY replay bundle JIT invocation: {BUNDLE_ENV} is not set");
         return;
     };
-    if !host_supports_aarch64_jit("env replay bundle JIT invocation") {
+    if host_jit_target_or_skip("env replay bundle JIT invocation").is_none() {
         return;
     }
 
@@ -1773,4 +1789,28 @@ fn env_ty_request_replay_bundle_jit_invokes_in_child_when_present() {
 
     eprintln!("{}", String::from_utf8_lossy(&output.stdout));
     eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

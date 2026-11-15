@@ -74,6 +74,7 @@ fn jit_module(text: &str, what: &str) -> trust_cg_codegen::jit::ExecutableBuffer
         .unwrap_or_else(|e| panic!("MIR-emitted `{what}` trust-ir text must parse: {e:?}"));
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &HashMap::new())
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -839,7 +840,7 @@ fn nat_reorder_str_ri(op: P, flags: PFlags) -> bool {
 fn native_opcode_row(idx: u32, flags_bits: u32) -> [u32; 6] {
     let op = prod_opcode(idx);
     let (lat, port) = prod_opcode_latency(op); // LINKED dual oracle
-    let flags = PFlags::from_bits(flags_bits as u16);
+    let flags = PFlags::from_bits(u32::from(flags_bits as u16));
     [
         lat,
         pport_tag(port),
@@ -1105,4 +1106,13 @@ fn trust_f5_norepr_call_clobbers_fixed_bl_blr() {
     );
     // The repr(u8) Slice B workaround is no longer needed for correctness (the no-repr
     // enum now lowers correctly too).
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

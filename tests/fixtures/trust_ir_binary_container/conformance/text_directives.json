@@ -1,0 +1,350 @@
+{
+  "name": "text_directives",
+  "functions": [
+    {
+      "id": 0,
+      "name": "sink",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Ptr"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [
+          {
+            "dereferenceable": null,
+            "nonnull": true,
+            "align": null,
+            "noalias": false,
+            "readonly": false,
+            "byval": false,
+            "sret": false,
+            "ext": "None"
+          }
+        ],
+        "naked": false,
+        "target_features": [
+          "neon",
+          "crc"
+        ]
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "spin",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Ptr"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Call": {
+                  "callee": 0,
+                  "args": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": {
+                "assumes": [],
+                "establishes": [
+                  0,
+                  1
+                ]
+              }
+            },
+            {
+              "inst": {
+                "Br": {
+                  "target": 1,
+                  "args": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        },
+        {
+          "id": 1,
+          "params": [
+            [
+              1,
+              "Ptr"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Br": {
+                  "target": 1,
+                  "args": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": {
+        "schema": 1,
+        "compiler_source_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17
+          ]
+        },
+        "semantic_body_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            51,
+            166,
+            209,
+            224,
+            224,
+            72,
+            143,
+            5,
+            158,
+            89,
+            234,
+            167,
+            134,
+            120,
+            214,
+            68,
+            101,
+            153,
+            119,
+            229,
+            193,
+            217,
+            76,
+            246,
+            98,
+            65,
+            176,
+            192,
+            250,
+            167,
+            35,
+            104
+          ]
+        },
+        "binding_digest": {
+          "algorithm": "Sha256",
+          "bytes": [
+            58,
+            71,
+            210,
+            25,
+            113,
+            191,
+            173,
+            201,
+            41,
+            84,
+            168,
+            191,
+            86,
+            39,
+            181,
+            61,
+            176,
+            188,
+            139,
+            224,
+            27,
+            25,
+            77,
+            147,
+            12,
+            221,
+            238,
+            76,
+            33,
+            60,
+            135,
+            113
+          ]
+        },
+        "loops": [
+          {
+            "source_loop_id": 0,
+            "hir_local_id": 71,
+            "header": 1,
+            "bindings": [
+              {
+                "name": "cursor",
+                "hir_local_id": 72,
+                "place": {
+                  "LoopParameter": {
+                    "index": 0
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Ptr"
+      ],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "Precondition",
+      "status": "Pending",
+      "description": "sink: p is non-null",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    },
+    {
+      "id": 1,
+      "kind": "Precondition",
+      "status": "Pending",
+      "description": "sink: p is aligned",
+      "formula": null,
+      "function": 0,
+      "source": null,
+      "site": null
+    }
+  ],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

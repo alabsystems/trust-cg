@@ -42,13 +42,16 @@
 //!   branch operand.
 //! - Both MOVs must write to the same destination register.
 //! - For CSET: one MOV must be `MovI dst, #1` and the other `MovI dst, #0`.
-//! - The header block's last instruction must be a BCond.
+//! - The header block's last instruction must be a BCond, and no other
+//!   instruction in the header may branch to a block (see
+//!   `if_convert::header_branch_is_sole_block_exit`).
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, CondCode, InstId, MachFunction, MachInst, MachOperand, PassId,
     ProvenanceMap, SpecialReg,
 };
 
+use crate::if_convert::header_branch_is_sole_block_exit;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
 /// AArch64 compare/select combine pass.
@@ -152,9 +155,12 @@ fn collect_diamond_transforms(func: &MachFunction) -> Vec<DiamondTransform> {
             continue;
         };
 
-        // Last instruction must be BCond.
+        // Last instruction must be BCond, and the header's only branch.
         let last_inst = func.inst(last_inst_id);
         if last_inst.opcode != AArch64Opcode::BCond {
+            continue;
+        }
+        if !header_branch_is_sole_block_exit(func, header_id, last_inst_id, None) {
             continue;
         }
 
@@ -297,6 +303,9 @@ fn collect_diamond_transforms(func: &MachFunction) -> Vec<DiamondTransform> {
 /// True arm: MovI dst, #1 and false arm: MovI dst, #0 -> CSET dst, cond
 /// True arm: MovI dst, #0 and false arm: MovI dst, #1 -> CSET dst, inverted_cond
 fn try_cset(true_mov: &MachInst, false_mov: &MachInst, cond: CondCode) -> Option<MachInst> {
+    // CSET's CSINC alias inverts the encoded condition, so neither orientation
+    // can represent an AL/NV Boolean with this instruction.
+    let complement = cond.logical_complement()?;
     // Both must be MovI.
     if true_mov.opcode != AArch64Opcode::MovI || false_mov.opcode != AArch64Opcode::MovI {
         return None;
@@ -317,10 +326,9 @@ fn try_cset(true_mov: &MachInst, false_mov: &MachInst, cond: CondCode) -> Option
         ))
     } else if true_val == 0 && false_val == 1 {
         // Invert: CSET dst, !cond
-        let inv = cond.invert();
         Some(MachInst::new(
             AArch64Opcode::CSet,
-            vec![dst, MachOperand::Imm(inv.encoding() as i64)],
+            vec![dst, MachOperand::Imm(complement.encoding() as i64)],
         ))
     } else {
         None
@@ -570,6 +578,38 @@ mod tests {
         assert!(join.preds.contains(&BlockId(0)));
     }
 
+    /// A header whose final `B.cond` is not its only branch into the arms is
+    /// not a diamond, although the deduplicated edge lists still show two
+    /// successors and single-predecessor arms. Converting on the last compare
+    /// would drop the `v0 == 1` key and leave its branch aimed at a deleted arm.
+    #[test]
+    fn test_header_with_an_earlier_branch_into_an_arm_stays_branchy() {
+        let cmp = |value| MachInst::new(AArch64Opcode::CmpRI, vec![vreg(0), imm(value)]);
+        let one = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(1)]);
+        let zero = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(0)]);
+        let mut func = make_diamond(cmp(3), CondCode::EQ, one.clone(), zero.clone());
+        let early = [
+            func.push_inst(cmp(1)),
+            func.push_inst(MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    imm(CondCode::EQ.encoding() as i64),
+                    MachOperand::Block(BlockId(1)),
+                ],
+            )),
+        ];
+        func.block_mut(BlockId(0)).insts.splice(0..0, early);
+        let before = format!("{func:?}");
+
+        assert!(!CmpSelectCombine.run(&mut func));
+        assert_eq!(format!("{func:?}"), before);
+
+        // Control: the single-branch header still forms CSET.
+        let mut single = make_diamond(cmp(3), CondCode::EQ, one, zero);
+        assert!(CmpSelectCombine.run(&mut single));
+        assert!(!single.block_order.contains(&BlockId(1)));
+    }
+
     #[test]
     fn test_movi_non_bool_values_do_not_form_invalid_csel() {
         // Diamond: CMP v0, v1; B.GE bb1
@@ -643,6 +683,29 @@ mod tests {
         assert_eq!(cset.opcode, AArch64Opcode::CSet);
         assert_eq!(cset.operands[0], vreg(2)); // dst
         assert_eq!(cset.operands[1], imm(CondCode::EQ.encoding() as i64));
+    }
+
+    #[test]
+    fn test_al_nv_cset_diamond_refuses_transaction() {
+        for cc in [CondCode::AL, CondCode::NV] {
+            for true_value in [0, 1] {
+                let cmp = MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(1)]);
+                let t = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(true_value)]);
+                let f = MachInst::new(AArch64Opcode::MovI, vec![vreg(2), imm(1 - true_value)]);
+                let mut func = make_diamond(cmp, cc, t, f);
+                let before = format!("{func:?}");
+                let mut provenance = ProvenanceMap::new();
+                assert!(
+                    !CmpSelectCombine.run_with_provenance(&mut func, &mut provenance),
+                    "{cc:?}/{true_value}"
+                );
+                assert_eq!(format!("{func:?}"), before);
+                assert_eq!(
+                    format!("{provenance:?}"),
+                    format!("{:?}", ProvenanceMap::new())
+                );
+            }
+        }
     }
 
     #[test]

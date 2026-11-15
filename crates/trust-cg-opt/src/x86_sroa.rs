@@ -161,6 +161,7 @@ fn operand_kind(op: Option<&X86ISelOperand>) -> &'static str {
         Some(X86ISelOperand::Block(_)) => "Block",
         Some(X86ISelOperand::CondCode(_)) => "CondCode",
         Some(X86ISelOperand::Symbol(_)) => "Symbol",
+        Some(X86ISelOperand::ExactModuleSymbol(_)) => "ExactModuleSymbol",
         Some(X86ISelOperand::StackSlot(_)) => "StackSlot",
         Some(_) => "mem/other",
     }
@@ -170,13 +171,39 @@ fn operand_kind(op: Option<&X86ISelOperand>) -> &'static str {
 /// distinct refusal points, so the interesting question — WHICH use form
 /// escaped — is invisible without this.
 fn sroa_escape_detail(detail: &str) {
-    if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+    if sroa_trace_enabled() {
         eprintln!("x86_sroa:   escape-detail: {detail}");
     }
 }
 
+static TRACE_SETTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the per-slot decline trace setting from a TRACKED compiler option,
+/// once (`-Ztrust-ir-cg-args=sroa-trace`); same contract as
+/// [`crate::x86_vectorize::set_trace_enabled`].
+///
+/// Without this channel the trace is UNREACHABLE under trustc: the driver
+/// refuses the whole `TCG_*` environment family before the backend loads, so
+/// the environment read below only ever fires for standalone (non-rustc) use.
+/// This pass's canonical win is the slice fat-pointer reload, so "which slot
+/// declined, and why" is exactly the question a missing-vectorization triage
+/// asks first.
+pub fn set_trace_enabled(enabled: bool) -> bool {
+    match TRACE_SETTING.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => TRACE_SETTING.get() == Some(&requested),
+    }
+}
+
+fn sroa_trace_enabled() -> bool {
+    if let Some(enabled) = TRACE_SETTING.get() {
+        return *enabled;
+    }
+    crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some()
+}
+
 fn sroa_trace(slot: u32, reason: &str) {
-    if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+    if sroa_trace_enabled() {
         eprintln!(
             "x86_sroa: DECLINE fn={} slot={slot} reason={reason}",
             sroa_fn()
@@ -243,7 +270,26 @@ fn sroa_fn() -> String {
 /// front-end-bound program. It must NOT go default-on without an 18-program
 /// paired A/B showing a suite gain. "The guard looks over-conservative, widen
 /// it" is the exact shape of the bridge→LEA change that failed 7/18 closed.
+static SROA_MULTI_BLOCK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the multi-BLOCK writer tier of x86 SROA (promoting a slot written from more than one block) from a TRACKED compiler option, once. DEFAULT OFF.
+///
+/// Until 2026-09-30 the only channel was `TCG_X86_SROA_MULTI_BLOCK`, and `trustc` refuses every `TCG_*`
+/// variable before the backend loads, so this opt-in had never been measured through the
+/// bridge. Three levers found the same way turned out to carry recorded numbers that no
+/// longer reproduced, and a fourth (the vectorizer's reduction unroll factor) was leaving
+/// 23% on the table, so an unmeasured opt-in here is an open question, not a settled one.
+pub fn set_sroa_multi_block_enabled(enabled: bool) -> bool {
+    match SROA_MULTI_BLOCK.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => SROA_MULTI_BLOCK.get() == Some(&requested),
+    }
+}
+
 fn multi_block_writer_allowed() -> bool {
+    if let Some(enabled) = SROA_MULTI_BLOCK.get() {
+        return *enabled;
+    }
     crate::env_lock::var_os("TCG_X86_SROA_MULTI_BLOCK").is_some_and(|v| v != "0")
 }
 
@@ -268,7 +314,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
     // ACCEPT nor a DECLINE, so it is invisible to the decline trace and looks
     // like "the pass considered it and said no" when the pass never saw it.
     // Report both sets so that distinction is a read, not an inference.
-    if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+    if sroa_trace_enabled() {
         let mut with_roots: Vec<u32> = roots.iter().map(|(s, _)| *s).collect();
         with_roots.sort_unstable();
         with_roots.dedup();
@@ -356,7 +402,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                 // covers ~20 distinct refusal points. Report the opcodes that
                 // actually reference the root vreg so the offending use form is
                 // a read rather than a deduction.
-                if crate::env_lock::var_os("TCG_X86_SROA_TRACE").is_some() {
+                if sroa_trace_enabled() {
                     let mut opcodes: Vec<String> = collect_user_sites(func, root_vreg)
                         .into_iter()
                         .map(|(b, i)| format!("{:?}", func.blocks[&b].insts[i].opcode))
@@ -1008,7 +1054,7 @@ fn mem_base_disp(op: Option<&X86ISelOperand>, vreg: VReg) -> Option<i64> {
 
 fn accesses_have_reaching_stores(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
     accesses: &[Access],
 ) -> bool {
     if accesses.is_empty() {
@@ -1044,7 +1090,7 @@ fn accesses_have_reaching_stores(
 
 fn compute_dominators(
     func: &X86ISelFunction,
-    preds: &HashMap<Block, Vec<Block>>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
 ) -> HashMap<Block, HashSet<Block>> {
     let all_blocks: HashSet<Block> = func.block_order.iter().copied().collect();
     let Some(entry) = func.block_order.first().copied() else {
@@ -1129,7 +1175,7 @@ fn block_has_store(accesses: &[Access], block_id: Block, byte_offset: i64) -> bo
 }
 
 fn predecessor_path_has_store(
-    preds: &HashMap<Block, Vec<Block>>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
     accesses: &[Access],
     block_id: Block,
     byte_offset: i64,

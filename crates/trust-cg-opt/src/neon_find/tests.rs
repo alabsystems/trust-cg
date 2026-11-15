@@ -849,3 +849,45 @@ fn second_run_is_a_no_op() {
         assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the block-skipping filter
+// reproduces only `iv`. The old gate checked only latch writebacks (the carried
+// half), so a register that is only live out was not refused.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refuses_skipped_register_state() {
+    type Build = fn() -> MachFunction;
+    let shapes: [(&str, Build, VReg); 2] = [
+        (
+            "strict find",
+            || build_find(Corrupt::None),
+            VReg::new(6, RegClass::Gpr32),
+        ),
+        (
+            "forward-chain find",
+            || build_find_chain(ChainCorrupt::None),
+            VReg::new(30, RegClass::Gpr64),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, build, iv) in shapes {
+        assert!(NeonFindPass::new().run(&mut build()), "{name}: plain fires");
+        let mut carried = build();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if NeonFindPass::new().run(&mut carried) {
+            wrong.push(format!("{name}: fired with a second accumulator"));
+        }
+        let mut live_out = build();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if NeonFindPass::new().run(&mut live_out) {
+            wrong.push(format!("{name}: fired with a live-out-only register"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "skipped register state:\n  {}",
+        wrong.join("\n  ")
+    );
+}

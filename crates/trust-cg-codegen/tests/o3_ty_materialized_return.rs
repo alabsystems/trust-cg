@@ -1,11 +1,11 @@
 // Regression for TY-style materialized helper returns surviving a later call.
 
-#![cfg(target_arch = "aarch64")]
+#![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use std::collections::HashMap;
 
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer, Target};
+use trust_cg_codegen::{Compiler, CompilerConfig, ExecutableBuffer};
 use trust_ir::{
     BinOp, Block, BlockId, CastOp, Constant, FuncId, FuncTy, FuncTyId, Function, Inst, InstrNode,
     Module, Ty, ValueId,
@@ -363,58 +363,78 @@ fn build_entry(ty: FuncTyId) -> Function {
 
 fn build_module() -> Module {
     let mut module = Module::new("o3_ty_materialized_return");
-    let entry_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let retbuf_helper_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let clobber_ty = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-        ],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let entry_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let retbuf_helper_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let clobber_ty = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+            ],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
-    module.add_function(build_entry(entry_ty));
-    module.add_function(build_retbuf_helper(
-        FuncId::new(1),
-        "exact_set_return_retbuf",
-        retbuf_helper_ty,
-        &[1, 1, 0, 0],
-    ));
-    module.add_function(build_retbuf_helper(
-        FuncId::new(2),
-        "materialized_set_diff_return_retbuf",
-        retbuf_helper_ty,
-        &[1, 1, 1, 0, 0],
-    ));
-    module.add_function(build_clobber(FuncId::new(3), clobber_ty));
-    module.add_function(build_retbuf_helper(
-        FuncId::new(4),
-        "unused_later_materialized_return_retbuf",
-        retbuf_helper_ty,
-        &[7, 8, 9],
-    ));
+    module
+        .try_add_function(build_entry(entry_ty))
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(build_retbuf_helper(
+            FuncId::new(1),
+            "exact_set_return_retbuf",
+            retbuf_helper_ty,
+            &[1, 1, 0, 0],
+        ))
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(build_retbuf_helper(
+            FuncId::new(2),
+            "materialized_set_diff_return_retbuf",
+            retbuf_helper_ty,
+            &[1, 1, 1, 0, 0],
+        ))
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(build_clobber(FuncId::new(3), clobber_ty))
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(build_retbuf_helper(
+            FuncId::new(4),
+            "unused_later_materialized_return_retbuf",
+            retbuf_helper_ty,
+            &[7, 8, 9],
+        ))
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 fn compile_to_jit(module: &Module, opt_level: OptLevel) -> ExecutableBuffer {
-    let mut config = CompilerConfig::jit_fast(Target::Aarch64);
+    let mut config = CompilerConfig::jit_fast(ty_contract::host_jit_target());
     config.opt_level = opt_level;
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &HashMap::new())
         .unwrap_or_else(|err| panic!("{opt_level:?} compile failed: {err}"))
         .buffer
@@ -440,4 +460,13 @@ fn ty_materialized_retbuf_returns_survive_later_clobber_o1_o3() {
             "{opt_level:?} should preserve both materialized retbuf helper returns across the later call"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

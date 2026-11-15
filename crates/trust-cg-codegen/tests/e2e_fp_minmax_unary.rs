@@ -81,11 +81,14 @@ fn build_binop_jit(
     f_ty: Ty,
     op: BinOp,
 ) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![int_ty.clone(), int_ty.clone()],
-        returns: vec![int_ty.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![int_ty.clone(), int_ty.clone()],
+            returns: vec![int_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -127,16 +130,20 @@ fn build_binop_jit(
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// JIT unary op, integer-bits in/out: fn(iN)->iN via Bitcast at the boundary.
 fn build_unop_jit(func_id: u32, name: &str, m: &mut TrustIrModule, int_ty: Ty, f_ty: Ty, op: UnOp) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![int_ty.clone()],
-        returns: vec![int_ty.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![int_ty.clone()],
+            returns: vec![int_ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -167,16 +174,20 @@ fn build_unop_jit(func_id: u32, name: &str, m: &mut TrustIrModule, int_ty: Ty, f
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// Interpreter binop, f64 Float in/out (interpreter models floats as native f64).
 fn build_binop_interp_f64(func_id: u32, name: &str, m: &mut TrustIrModule, op: BinOp) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -194,7 +205,8 @@ fn build_binop_interp_f64(func_id: u32, name: &str, m: &mut TrustIrModule, op: B
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -204,6 +216,7 @@ fn build_binop_interp_f64(func_id: u32, name: &str, m: &mut TrustIrModule, op: B
 fn jit_buffer(m: &TrustIrModule) -> trust_cg_codegen::jit::ExecutableBuffer {
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(m, &HashMap::new())
         .expect("hand-built fp min/max/unary module must JIT-compile")
         .buffer
@@ -1118,4 +1131,13 @@ fn fp_unary_armed_controls() {
          a low-bit chop, and {prec_caught} differ from an f32-precision-widened sqrt. A no-op / \
          wrong-precision / chop sqrt lowering WOULD be caught. The clean bills are load-bearing."
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

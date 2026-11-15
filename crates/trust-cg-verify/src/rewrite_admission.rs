@@ -257,10 +257,10 @@ impl RewriteAdmissionRecord {
                 record.admission_state = AdmissionState::Rejected;
                 record
             }
-            RuleResult::Inconclusive => {
+            RuleResult::Inconclusive(cegis) => {
                 let mut record = self;
                 record.evidence = SolverEvidence::Inconclusive {
-                    reason: "rule_discovery_inconclusive".to_string(),
+                    reason: format!("rule_discovery_inconclusive: {cegis:?}"),
                     reducer: reducer.take(),
                 };
                 record.admission_state = AdmissionState::PendingProof;

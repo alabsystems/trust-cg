@@ -1,0 +1,18 @@
+; TrustIr text format v1
+module "abi_enum_tag_repr"
+target "x86_64-unknown-linux-gnu" 8 little abi="sysv64"
+
+enum @WideU repr(u128) { A = 0, B = 18446744073709551616 } id=0
+
+enum @WideI repr(i128) { Neg = -18446744073709551616, Pos = 18446744073709551616 } id=1
+
+functy.0 = () -> ()
+
+type ty.0 = enum.0
+
+type ty.1 = enum.1
+
+fn @wide_tags(functy.0) {
+bb0:
+    ret
+}

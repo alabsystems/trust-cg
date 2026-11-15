@@ -1,5 +1,15 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+// Compiled only on an aarch64-apple-darwin host: another host builds this
+// target with no test in it, never one that passes without running (L06-P10).
+#![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/darwin_native_prerequisites.rs"]
+mod darwin_native;
+#[path = "support/positive_evidence.rs"]
+mod positive_evidence;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test for the rustc_codegen_trust_cg M1 hello-loop path.
 //
@@ -9,11 +19,10 @@ mod target_dir_support;
 //
 // Status: WS4 milestone M1.
 //
-// The end-goal of this test (per the WS4 M0 brief in
-// `designs/2026-04-19-proving-trust-cg-replaces-llvm.md`) is to:
+// The end-goal of this test is to:
 //
-//     1. Build `librustc_codegen_trust_cg.dylib`.
-//     2. Invoke `rustc -Zcodegen-backend=<dylib> --target aarch64-apple-darwin`
+//     1. Build the backend library (Cargo builds it for this test).
+//     2. Invoke `trustc -Zcodegen-backend=<dylib> --target aarch64-apple-darwin`
 //        on a source file containing `fn main() { loop {} }`.
 //     3. Run the resulting binary for up to 1s, expect it to block forever
 //        (SIGKILL = success; the infinite loop IS the program's semantics).
@@ -24,84 +33,21 @@ mod target_dir_support;
 //
 // Running this test:
 //
-//     cd crates/rustc_codegen_trust_cg
-//     cargo test --release -- --nocapture
+//     cd crates/rustc-codegen-trust-cg
+//     targo --unverified test --release -- --nocapture
 //
-// Prerequisites: the `rust-toolchain.toml` pinned toolchain with
-// `rustc-dev`, `rust-src`, and `llvm-tools` components.
+// Prerequisites: the installed Trust package this crate pins
+// (`rust-toolchain.toml` `channel = "trust"`; it ships the rustc_private crates
+// and llvm-tools).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
-
-/// Return the path to the freshly-built `librustc_codegen_trust_cg.dylib`,
-/// building it via `cargo build --release` from the crate root if it is
-/// not already present. Using `CARGO_TARGET_DIR` honours the workspace's
-/// per-worktree cargo target isolation.
+/// The backend sibling of this Cargo test executable, not another profile or
+/// whichever cached library happens to have the newest modification time.
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    // Preferred path: rely on cargo having built us already as a byproduct
-    // of `cargo test`. cargo's `tests/*.rs` integration tests already
-    // build the crate's `cdylib` / `dylib` artifacts, so the binary is
-    // guaranteed to be fresh.
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-
-    // `cargo test` in release mode puts the artifact under
-    // `target/release/`; in debug mode under `target/debug/`.
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-
-    // Fallback: build explicitly with the crate's pinned toolchain. We
-    // do NOT invoke `cargo test` recursively here — that would loop forever.
-    let pinned_cargo_toolchain = format!("+{}", pinned_toolchain());
-    let status = Command::new("cargo")
-        .arg(pinned_cargo_toolchain)
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(
-        status.success(),
-        "cargo build failed; cannot run M0 smoke test"
-    );
-
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(
-        built.exists(),
-        "expected dylib at {:?} but it was not produced",
-        built
-    );
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 /// Write `contents` to a temp file with the requested filename stem.
@@ -118,14 +64,12 @@ fn write_temp_source(stem: &str, contents: &str) -> PathBuf {
 
 #[test]
 fn m1_hello_loop_compiles_and_runs_until_killed() {
-    // This M0 smoke test drives `rustc --target aarch64-apple-darwin` against a
-    // freshly built `.dylib` (see the module comment); on any other host it can
-    // only fail for environmental reasons, so skip EXPLICITLY rather than
-    // report a spurious failure in every Linux suite run.
-    if !cfg!(target_os = "macos") {
-        eprintln!("hello_loop: SKIPPED — this M0 smoke test targets aarch64-apple-darwin hosts");
-        return;
-    }
+    // This M0 smoke test drives the host compile (`aarch64-apple-darwin`, the
+    // only host this target is built for) against the backend Cargo built for
+    // this test. The bridge-notes assertion below needs the backend's
+    // `bridge-notes` knob, which only a compiler carrying `-Ztrust-ir-cg-args`
+    // can express; a missing prerequisite fails by name.
+    darwin_native::require("hello_loop", &[]);
     // The smallest possible Rust program. This is literally the WS4 M0
     // target: when this compiles end-to-end and runs, we are done with
     // M0.
@@ -152,11 +96,10 @@ fn m1_hello_loop_compiles_and_runs_until_killed() {
         s.push(&dylib);
         s
     };
-    let toolchain = pinned_toolchain();
     // ASK for the bridge notes; do not hope the environment carries them.
     // The success path below asserts on the "#574 entry wrapper uses lang_start"
     // line, and 13989b40 moved every such note behind `bridge_notes_enabled()`
-    // — i.e. behind `TCG_BRIDGE_NOTES` being set — because they fired on every
+    // — i.e. behind the `bridge-notes` knob being set — because they fired on every
     // compile into every build log. The assertion therefore only held on a
     // developer shell that happened to export the variable, and could never
     // hold in a clean one. The publication gate runs the anonymous clone with a
@@ -164,23 +107,27 @@ fn m1_hello_loop_compiles_and_runs_until_killed() {
     // nothing else), so it stripped the variable and this test failed there
     // with an EMPTY stderr and a rustc that had exited 0.
     //
-    // The staleness was invisible until now: while lowering `lang_start`'s
-    // closure was still fail-closed, this test always took the early-return
-    // skip branch above, whose diagnostics come from `tcx.dcx().fatal(...)` and
-    // are never gated. Lowering landed, the success path ran for the first
+    // The staleness was invisible until then: while lowering `lang_start`'s
+    // closure was still fail-closed, this test always took an early-return
+    // skip branch (since removed), whose diagnostics come from
+    // `tcx.dcx().fatal(...)` and are never gated. Lowering landed, the success path ran for the first
     // time, and the latent coupling surfaced as a release-gate failure.
     //
     // Setting it on the child makes the observation hermetic — the test now
     // depends on what the backend DOES, not on what the ambient shell exports.
-    let output = Command::new("rustup")
-        .args(["run", toolchain.as_str(), "rustc", "--edition=2021"])
+    //
+    // It is passed as a TRACKED compiler option, not an environment variable:
+    // trustc refuses every `TCG_*`/`TRUST_CG_*` variable as an untracked
+    // semantic/codegen control, so `TCG_BRIDGE_NOTES=1` on the child now makes
+    // the compile fail before the backend loads at all.
+    let output = toolchain_support::rustc_command()
         .arg(&backend_arg)
+        .arg(toolchain_support::backend_knobs_arg(&["bridge-notes"]))
         .arg("-o")
         .arg(&out_bin)
         .arg(&src_path)
-        .env("TCG_BRIDGE_NOTES", "1")
         .output()
-        .expect("failed to spawn rustc via rustup");
+        .expect("failed to spawn trustc");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -190,45 +137,19 @@ fn m1_hello_loop_compiles_and_runs_until_killed() {
 
     let _ = std::fs::remove_file(&src_path);
 
-    // A std `fn main` is currently BLOCKED at the last step: lowering
-    // `std::rt::lang_start::<()>`, whose MIR builds a closure and a `&dyn Fn`
-    // trait object the backend cannot yet lower. The bridge fails closed with a
-    // precise diagnostic (see `std_main_compute_x86.rs`). Until closure +
-    // trait-object lowering lands, this end-to-end run cannot succeed; treat the
-    // documented fail-closed as a skip so the suite stays green and this test
-    // flips back on automatically once `lang_start` lowers. We still assert the
-    // *entry wrapper* (blocker #1) and *allocator shim* (blocker #2) progress:
-    // the bridge must have reported using the lang_start entry wrapper and must
-    // fail closed specifically on the lang_start closure — not on the allocator
-    // (`__rust_alloc`) link error that used to block this program earlier.
-    if !output.status.success() {
-        // The fail-closed abort fires inside the codegen loop while lowering
-        // `lang_start`, before the entry-wrapper synthesis (which prints the
-        // "#574 entry wrapper uses lang_start" line), so we do NOT require that
-        // line here. We DO require the precise lang_start closure diagnostic,
-        // and that we are NOT blocked on the allocator anymore.
-        assert!(
-            stderr.contains("lang_start")
-                && (stderr.contains("AggregateKind::Closure")
-                    || stderr.contains("closure")
-                    || stderr.contains("dyn Fn"))
-                && stderr.contains("failing closed"),
-            "hello-loop failed for an unexpected reason (expected the documented \
-             fail-closed on lowering lang_start's closure / `&dyn Fn`). stderr was: <<<{stderr}>>>"
-        );
-        assert!(
-            !stderr.contains("Undefined symbols")
-                || (!stderr.contains("___rust_alloc") && !stderr.contains("___rust_dealloc")),
-            "hello-loop regressed to the allocator-shim link blocker (#2); the allocator \
-             shim should now satisfy `__rust_alloc` &c. stderr was: <<<{stderr}>>>"
-        );
-        eprintln!(
-            "skipping hello-loop end-to-end run: std `fn main` is fail-closed on lowering \
-             `std::rt::lang_start::<()>`'s closure / `&dyn Fn` trait object (the documented \
-             next blocker); entry wrapper + allocator shim progress is asserted above"
-        );
-        return;
-    }
+    // The compile must succeed; no refusal is an accepted early return. The
+    // branch that used to treat a failed compile as a skip accepted any
+    // refusal naming `lang_start`, a closure and `failing closed`, so on
+    // aarch64-apple-darwin it credited the certificates-on proof-promotion
+    // refusal of `std::rt::lang_start` and its shims (`[TCG-PROOF-465]`,
+    // measured 2026-09-29 on Trust 9192) as a pass (ledger L06-P10). Lowering
+    // `lang_start`'s closure landed long ago; a refusal of any kind fails here.
+    assert!(
+        output.status.success(),
+        "hello-loop did not compile through the bridge in the default \
+         (certificates-on) lane; a refusal is a failure, never a skip. \
+         stderr was: <<<{stderr}>>>"
+    );
 
     assert!(
         stderr.contains("rustc_codegen_trust_cg: #574 entry wrapper uses lang_start"),
@@ -284,4 +205,8 @@ fn m1_hello_loop_compiles_and_runs_until_killed() {
     assert_eq!(run_stderr, "", "hello-loop unexpectedly wrote stderr");
 
     let _ = std::fs::remove_file(&out_bin);
+    positive_evidence::record(
+        positive_evidence::Evidence::NativeRun,
+        positive_evidence::Certs::On,
+    );
 }

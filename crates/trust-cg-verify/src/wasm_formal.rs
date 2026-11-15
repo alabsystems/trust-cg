@@ -49,38 +49,21 @@ pub fn discharge(ob: &ProofObligation) -> Formal {
     }
 }
 
-/// Assert an obligation is formally PROVEN (`unsat`). Panics otherwise.
-/// (Currently reached only through [`prove_or_certification_gap_skip`], which
-/// inlines this exact panic as its fall-through; kept as the canonical
-/// unguarded spelling for tests outside the certification-gap window.)
-#[allow(dead_code)]
-#[track_caller]
-pub fn prove(ob: &ProofObligation) {
-    match discharge(ob) {
-        Formal::Proven => {}
-        other => panic!(
-            "obligation `{}` NOT formally proven via ay: {other:?}",
-            ob.name
-        ),
-    }
-}
-
-/// [`prove`] parked behind the certification-gap guard
-/// ([`crate::formal_gap`]): PROVEN passes (returns `true`); the exact
-/// fail-closed certification-gap diagnostics skip LOUDLY (returns `false`),
-/// with a server-truncated bare `unknown` first re-confirmed through the
-/// fresh one-shot transcript; every other outcome — `Refuted` (a genuine
-/// soundness failure), `Timeout`, an unrecognized reason — panics with the
-/// ORIGINAL [`prove`] message, so no solver regression can hide behind the
-/// guard and the exemption un-arms itself the moment an authority ships
-/// externally checkable proofs.
+/// Assert an obligation is formally PROVEN (`unsat`), behind the
+/// certification-gap guard ([`crate::formal_gap`]): PROVEN passes (returns
+/// `true`); the exact AY's disclosed proof hole skips LOUDLY (returns
+/// `false`); every other outcome — `Refuted` (a genuine soundness failure), a
+/// checker or self-check rejection, a bare unknown, `Timeout`, an unrecognized
+/// reason — panics with a "NOT formally proven" message, so no solver
+/// regression can hide behind the guard and the exemption un-arms itself the
+/// moment AY ships a checkable proof.
 #[track_caller]
 pub fn prove_or_certification_gap_skip(ob: &ProofObligation) -> bool {
     let verdict = discharge(ob);
     if matches!(verdict, Formal::Proven) {
         return true;
     }
-    if let Some(reason) = certification_gap_reason(ob, &verdict) {
+    if let Some(reason) = certification_gap_reason(&verdict) {
         crate::formal_gap::print_gap_skip(&format!("wasm obligation `{}`", ob.name), &reason);
         return false;
     }
@@ -91,20 +74,18 @@ pub fn prove_or_certification_gap_skip(ob: &ProofObligation) -> bool {
 }
 
 /// Shared classification for the guarded wasm tests: `Some(reason)` iff the
-/// non-Proven `verdict` is EXACTLY the certification gap (re-probing a bare
-/// server-truncated `unknown` through the fresh transcript); `None` for
-/// everything the original assertions must keep failing on.
-pub fn certification_gap_reason(ob: &ProofObligation, verdict: &Formal) -> Option<String> {
-    use crate::ay_bridge::{AYConfig, AYResult};
+/// non-Proven `verdict` is AY's disclosed proof hole
+/// ([`crate::formal_gap::disclosed_proof_hole`]); `None` for everything the
+/// original assertions must keep failing on.
+pub fn certification_gap_reason(verdict: &Formal) -> Option<String> {
     let Formal::Inconclusive(reason) = verdict else {
         return None;
     };
     // Undo the discharge spelling ("unknown: {ay reason}") back to the
-    // AYResult the shared classifier speaks; the re-probe re-runs the exact
-    // obligation under the same 180 s config `discharge` used.
-    let ay_result = AYResult::Unknown(reason.strip_prefix("unknown: ")?.to_string());
-    let config = AYConfig::default().with_timeout(180_000);
-    crate::formal_gap::confirmed_certification_gap(ob, &config, &ay_result)
+    // AYResult the shared classifier speaks.
+    crate::formal_gap::disclosed_proof_hole(&crate::ay_bridge::AYResult::Unknown(
+        reason.strip_prefix("unknown: ")?.to_string(),
+    ))
 }
 
 /// Assert an obligation is formally REFUTED (`sat`) — for anti-tautology guards.

@@ -1,0 +1,67 @@
+; TrustIr text format v1
+module "twins"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "twins.rs"
+
+functy.0 = (u8, u8) -> (u8)
+
+functy.1 = (i8) -> (i8)
+
+rustcc fn @_RNvCs4yeZn5H3quv_5twins8add_twin(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "add_twin"
+    ; #names: %0="a", %1="b"
+bb0(%0: u8, %1: u8):
+    %2 = const u8 100  ; #loc: 0 2 42
+    %3 = icmp ule u8 %0, %2  ; #loc: 0 2 37
+    condbr %3, bb1, bb2  ; #loc: 0 2 37
+bb1:
+    %5 = const u8 100  ; #loc: 0 2 54
+    %6 = icmp ule u8 %1, %5  ; #loc: 0 2 49
+    br bb3(%6)  ; #loc: 0 2 37
+bb2:
+    %7 = const bool false  ; #loc: 0 2 37
+    br bb3(%7)  ; #loc: 0 2 37
+bb3(%4: bool):
+    condbr %4, bb4, bb5  ; #loc: 0 2 34
+bb4:
+    %8, %9 = add.overflow u8 %0, %1  ; #loc: 0 2 60
+    %10 = const bool false  ; #loc: 0 2 60
+    %11 = const bool true  ; #loc: 0 2 60
+    %12 = select bool %9, %10, %11  ; #loc: 0 2 60
+    assert %12, overflow add  ; #proof: no_overflow  ; #loc: 0 2 60
+    br bb6(%8)  ; #loc: 0 2 34
+bb5:
+    %13 = const u8 0  ; #loc: 0 2 75
+    br bb6(%13)  ; #loc: 0 2 34
+bb6(%14: u8):
+    ret %14  ; #loc: 0 2 80
+}
+
+rustcc fn @_RNvCs4yeZn5H3quv_5twins10below_twin(functy.1) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #display-path: "below_twin"
+    ; #names: %0="x"
+bb0(%0: i8):
+    %1 = const i8 0  ; #loc: 0 3 36
+    %2 = icmp slt i8 %0, %1  ; #loc: 0 3 32
+    condbr %2, bb1, bb2  ; #loc: 0 3 29
+bb1:
+    %3 = const i8 100  ; #loc: 0 3 44
+    %4, %5 = add.overflow i8 %0, %3  ; #loc: 0 3 40
+    %6 = const bool false  ; #loc: 0 3 40
+    %7 = const bool true  ; #loc: 0 3 40
+    %8 = select bool %5, %6, %7  ; #loc: 0 3 40
+    assert %8, overflow add  ; #proof: no_overflow  ; #loc: 0 3 40
+    br bb3(%4)  ; #loc: 0 3 29
+bb2:
+    br bb3(%0)  ; #loc: 0 3 29
+bb3(%9: i8):
+    ret %9  ; #loc: 0 3 62
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L2C60 of `twins::add_twin`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "twins::add_twin#L2C60#overflow#o0" range 0 2 60 2 65 site f0/bb4#4
+
+obligation 1 arithmetic_safety pending "direct THIR Assert (overflow) at L3C40 of `twins::below_twin`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 1 source "trust-thir-lower/direct-assert@1" assertion "twins::below_twin#L3C40#overflow#o0" range 0 3 40 3 47 site f1/bb1#5

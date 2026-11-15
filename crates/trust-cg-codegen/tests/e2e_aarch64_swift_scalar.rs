@@ -38,11 +38,14 @@ fn can_link_and_run_aarch64_macho() -> bool {
 // swiftcc `fn name(a,b,c,d: i64) -> i64 { a + b*2 + c*3 + d*4 }` -- four integer
 // scalars, all in registers.
 fn build_swift_add4(m: &mut TrustIrModule) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I64; 4],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 4],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), "sw_add4", ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     // b*2, c*3, d*4, then sum with a.
@@ -101,18 +104,22 @@ fn build_swift_add4(m: &mut TrustIrModule) {
         params: (0..4).map(|i| (ValueId::new(i), Ty::I64)).collect(),
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // swiftcc `fn name(a,b,c,d,e,f,g,h,i,j: i64) -> i64 { a + h*8 + i*9 + j*10 }`
 // -- ten integer scalars: eight in x0..x7, two spilled to the stack. Verifies
 // the register-exhaustion spill matches C.
 fn build_swift_add10(m: &mut TrustIrModule) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I64; 10],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 10],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(1), "sw_add10", ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     let mut body = Vec::new();
@@ -176,18 +183,22 @@ fn build_swift_add10(m: &mut TrustIrModule) {
         params: (0..10).map(|i| (ValueId::new(i), Ty::I64)).collect(),
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // swiftcc `fn name(a: i128, b: i128) -> i128 { a*b + a }` -- i128 uses aligned
 // GPR pairs (x0:x1, x2:x3) and returns in x0:x1, identically under Swift and C
 // (verified in-register / spilled / mixed by disassembly).
 fn build_swift_i128(m: &mut TrustIrModule) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::I128, Ty::I128],
-        returns: vec![Ty::I128],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::I128, Ty::I128],
+            returns: vec![Ty::I128],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(2), "sw_i128", ft, BlockId::new(0));
     f.calling_conv = CallingConv::Swift;
     f.blocks = vec![TrustIrBlock {
@@ -213,7 +224,8 @@ fn build_swift_i128(m: &mut TrustIrModule) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -228,7 +240,8 @@ fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Result<Vec<u8>, String> 
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     compiler
         .compile(module)
         .map(|r| r.object_code)
@@ -307,4 +320,13 @@ fn e2e_aarch64_swift_scalar_matches_c_abi() {
         };
         assert_eq!(code, 0, "scalar swiftcc / C-ABI mismatch at {opt:?}");
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -1,0 +1,40 @@
+; TrustIr text format v1
+module "_RNvCs51KMIqAAksu_19s43_recursion_forms3fib"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (u64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCs51KMIqAAksu_19s43_recursion_forms3fib(functy.0) {
+bb0(%1: u64):
+    %8 = const u64 2
+    %7 = icmp ult u64 %1, %8
+    condbr %7, bb1, bb2
+bb2:
+    %10 = const u64 1
+    %9 = sub u64 %1, %10
+    %11 = call @func.0(%9)
+    br bb3
+bb3:
+    %13 = const u64 2
+    %12 = sub u64 %1, %13
+    %14 = call @func.0(%12)
+    br bb4
+bb4:
+    %15 = add u64 %11, %14
+    br bb5(%15)
+bb1:
+    %16 = copy u64 %1
+    br bb5(%16)
+bb5(%17: u64):
+    ret %17
+}

@@ -89,6 +89,8 @@ pub enum Instruction {
     LoadStorePair(LoadStorePair),
     LoadStoreAcquireRelease(LoadStoreAcquireRelease),
     LoadStoreExclusiveAcquireRelease(LoadStoreExclusiveAcquireRelease),
+    LoadStoreExclusive(LoadStoreExclusive),
+    LoadStoreExclusivePair(LoadStoreExclusivePair),
     CompareAndSwap(CompareAndSwap),
     LseAtomicRmw(LseAtomicRmw),
     CompareBranch(CompareBranch),
@@ -104,6 +106,7 @@ pub enum Instruction {
     Nop,
     Brk(Brk),
     SystemBarrier(SystemBarrier),
+    ClearExclusive(ClearExclusive),
     SystemRegisterRead(SystemRegisterRead),
     NeonIntVec3Same(NeonIntVec3Same),
     NeonVecLogic(NeonVecLogic),
@@ -318,6 +321,34 @@ pub struct LoadStoreExclusiveAcquireRelease {
     pub rt: u8,
 }
 
+/// Single-register load/store exclusive forms NOT covered by
+/// [`LoadStoreExclusiveAcquireRelease`] (which keeps exactly the 32/64-bit
+/// LDAXR/STLXR it always decoded): every LDXR/STXR (`o0 = 0`) at any size,
+/// and the byte/halfword LDAXRB/LDAXRH/STLXRB/STLXRH (`o0 = 1`, size 00/01).
+/// `ordered` is `o0`: acquire for a load, release for a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadStoreExclusive {
+    pub size: u8,
+    pub load: bool,
+    pub ordered: bool,
+    pub rs: u8,
+    pub rn: u8,
+    pub rt: u8,
+}
+
+/// LDXP/LDAXP/STXP/STLXP. `wide` is `sz` (X pair when set, W pair when
+/// clear); `ordered` is `o0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadStoreExclusivePair {
+    pub wide: bool,
+    pub load: bool,
+    pub ordered: bool,
+    pub rs: u8,
+    pub rt2: u8,
+    pub rn: u8,
+    pub rt: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompareAndSwap {
     pub size: u8,
@@ -472,6 +503,13 @@ pub enum SystemBarrierKind {
     Dsb,
     Dmb,
     Isb,
+}
+
+/// CLREX {#CRm}: clear the local exclusive monitor (`CRm` is ignored by the
+/// architecture; assemblers default it to 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClearExclusive {
+    pub crm: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1350,27 +1388,70 @@ fn decode_load_store_acquire_release(word: u32) -> Result<Instruction, DecodeErr
         }));
     }
 
-    if !o2 && !o1 && o0 && rt2 == 0b11111 && matches!(size, 0b10 | 0b11) {
-        let is_ldaxr = bit22 && rs == 0b11111;
-        let is_stlxr = !bit22;
-        if is_ldaxr || is_stlxr {
+    if bit(word, 31) && !o2 && o1 {
+        // Load/store exclusive pair: 1 sz 001000 0 L 1 Rs o0 Rt2 Rn Rt.
+        let is_load = bit22 && rs == 0b11111;
+        let is_store = !bit22;
+        if is_load || is_store {
             let rn = bits(word, 5, 5) as u8;
             let rt = bits(word, 0, 5) as u8;
-            if is_stlxr && (rs == rt || (rs == rn && rn != 31)) {
+            if is_load && rt == rt2 {
+                return Err(DecodeError::ConstrainedUnpredictable {
+                    word,
+                    reason: "load-exclusive pair names one destination register twice",
+                });
+            }
+            if is_store && (rs == rt || rs == rt2 || (rs == rn && rn != 31)) {
+                return Err(DecodeError::ConstrainedUnpredictable {
+                    word,
+                    reason: "store-exclusive pair status register aliases a data or address register",
+                });
+            }
+            return Ok(Instruction::LoadStoreExclusivePair(
+                LoadStoreExclusivePair {
+                    wide: bit(word, 30),
+                    load: bit22,
+                    ordered: o0,
+                    rs,
+                    rt2,
+                    rn,
+                    rt,
+                },
+            ));
+        }
+    }
+
+    if !o2 && !o1 && rt2 == 0b11111 {
+        let is_load = bit22 && rs == 0b11111;
+        let is_store = !bit22;
+        if is_load || is_store {
+            let rn = bits(word, 5, 5) as u8;
+            let rt = bits(word, 0, 5) as u8;
+            if is_store && (rs == rt || (rs == rn && rn != 31)) {
                 return Err(DecodeError::ConstrainedUnpredictable {
                     word,
                     reason: "store-exclusive status register aliases its data or address register",
                 });
             }
-            return Ok(Instruction::LoadStoreExclusiveAcquireRelease(
-                LoadStoreExclusiveAcquireRelease {
-                    size,
-                    load: bit22,
-                    rs,
-                    rn,
-                    rt,
-                },
-            ));
+            if o0 && matches!(size, 0b10 | 0b11) {
+                return Ok(Instruction::LoadStoreExclusiveAcquireRelease(
+                    LoadStoreExclusiveAcquireRelease {
+                        size,
+                        load: bit22,
+                        rs,
+                        rn,
+                        rt,
+                    },
+                ));
+            }
+            return Ok(Instruction::LoadStoreExclusive(LoadStoreExclusive {
+                size,
+                load: bit22,
+                ordered: o0,
+                rs,
+                rn,
+                rt,
+            }));
         }
     }
 
@@ -1651,6 +1732,17 @@ fn decode_system(word: u32) -> Result<Instruction, DecodeError> {
         return Ok(Instruction::SystemRegisterRead(SystemRegisterRead {
             sysreg: bits(word, 5, 16) as u16,
             rt: bits(word, 0, 5) as u8,
+        }));
+    }
+
+    if op0 == 0
+        && bits(word, 16, 3) == 0b011
+        && bits(word, 12, 4) == 0b0011
+        && bits(word, 0, 5) == 0b11111
+        && bits(word, 5, 3) == 0b010
+    {
+        return Ok(Instruction::ClearExclusive(ClearExclusive {
+            crm: bits(word, 8, 4) as u8,
         }));
     }
 

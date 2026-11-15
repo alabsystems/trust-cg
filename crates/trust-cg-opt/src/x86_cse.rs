@@ -8,7 +8,8 @@
 //! This pass tracks available expressions, caps the number of tracked
 //! expressions, and only rewrites duplicate pure virtual-register computations
 //! into virtual-register copies at the duplicate point. It never crosses
-//! memory, call, side-effect, fixed-register, or flag barriers within a block.
+//! call, side-effect, fixed-register, or flag barriers within a block. Loads
+//! remain barriers by default; the opt-in relaxation preserves their writes.
 //!
 //! # Cross-block (global) availability
 //!
@@ -32,9 +33,9 @@
 //!      here via the shared `crate::mach_view::predecessor_map`) and a
 //!      dominator tree over `X86ISelFunction`'s `Block` CFG
 //!      (`crate::mach_view::compute_idom` / `CfgAnalysis` provide the
-//!      generalized implementation). ISel output is single-assignment over
-//!      vregs, which is what makes "an expression's def dominates the use"
-//!      equivalent to "the value is still live at the use".
+//!      generalized implementation). ISel output can contain multiple
+//!      definitions of a vreg, so availability also requires tracking kills
+//!      of the expression's input and result registers.
 //!
 //!   2. **Forward dataflow with a meet over predecessors.** Compute, per block,
 //!      `in[B] = ∩ over preds P of out[P]` and
@@ -73,7 +74,10 @@ use trust_cg_ir::{InstFlags, X86Opcode};
 use trust_cg_lower::instructions::Block;
 use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
-use crate::effects::{x86_inst_effect, x86_produces_value, x86_reads_flags, x86_writes_flags};
+use crate::effects::{
+    FlagOverwrite, MemoryEffect, condition_flag_overwrite, x86_inst_effect,
+    x86_operand0_may_be_read, x86_produces_value, x86_reads_flags, x86_writes_flags,
+};
 use crate::mach_view::predecessor_map;
 use crate::x86_pass_manager::X86MachinePass;
 
@@ -198,7 +202,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                 invalidate_available_depending_on_flags(&mut available);
             }
 
-            if let Some(def) = defined_vreg(&block.insts[index]) {
+            for def in crate::effects::x86_may_defined_vregs(&block.insts[index]) {
                 invalidate_available_with_vreg(&mut available, def);
             }
 
@@ -281,13 +285,13 @@ fn is_pure_control_flow_terminator(inst: &X86ISelInst) -> bool {
 ///      which fails (2). Restricting to forward single edges means `pred`'s
 ///      exit set has already been computed in this same linear pass.
 ///
-/// Because ISel output is single-assignment over virtual registers, a value
-/// computed in `pred` is not redefined before `block`, so the carried
-/// available expressions remain valid (their source vregs are unchanged and
-/// the def vreg holds the same value).
+/// The edge itself preserves virtual registers. When processing `block`,
+/// every redefinition of an expression's source or result register invalidates
+/// that entry, including definitions in the multi-def forms produced by phi
+/// lowering and loop transformations.
 fn single_pred_source(
     block: &Block,
-    predecessors: &HashMap<Block, Vec<Block>>,
+    predecessors: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
     order_index: &HashMap<Block, usize>,
 ) -> Option<Block> {
     let preds = predecessors.get(block)?;
@@ -328,7 +332,7 @@ fn make_candidate(insts: &[X86ISelInst], index: usize) -> Option<Candidate> {
     let inst = &insts[index];
     let flags = inst.flags;
 
-    if !is_supported_cse_opcode(inst.opcode) {
+    if inst.proof_origin.is_some() || !is_supported_cse_opcode(inst.opcode) {
         return None;
     }
     if !x86_inst_effect(inst).is_pure() || !x86_produces_value(inst.opcode) {
@@ -352,7 +356,12 @@ fn make_candidate(insts: &[X86ISelInst], index: usize) -> Option<Candidate> {
     if x86_writes_flags(inst.opcode) && !flags_written_here_are_dead(insts, index) {
         return None;
     }
-    if first_operand_is_def_and_use(inst) || inst_touches_fixed_register(inst) {
+    // A form that also reads its destination computes a function of the OLD
+    // destination, which the key (opcode, sources) does not carry: the tied
+    // `AddRR [d, s]` is `d := d + s`, so `AddRR [d1, s]` and `AddRR [d2, s]`
+    // are different values. Decided per form by the shared classifier; the
+    // private opcode-level list this used missed the two-operand RR forms.
+    if x86_operand0_may_be_read(inst) || inst_touches_fixed_register(inst) {
         return None;
     }
 
@@ -376,7 +385,7 @@ fn make_candidate(insts: &[X86ISelInst], index: usize) -> Option<Candidate> {
         canon_operands.sort_by(canon_operand_cmp);
     }
 
-    if source_vregs.contains(&def_vreg) {
+    if source_vregs.iter().any(|source| source.id == def_vreg.id) {
         return None;
     }
 
@@ -445,19 +454,12 @@ fn movrr_opcode_for_class(class: RegClass) -> X86Opcode {
     }
 }
 
-fn defined_vreg(inst: &X86ISelInst) -> Option<VReg> {
-    if !x86_produces_value(inst.opcode) {
-        return None;
-    }
-
-    match inst.operands.first() {
-        Some(X86ISelOperand::VReg(vreg)) => Some(*vreg),
-        _ => None,
-    }
-}
-
 fn invalidate_available_with_vreg(available: &mut HashMap<ExprKey, AvailableExpr>, def: VReg) {
-    available.retain(|_, expr| expr.def_vreg != def && !expr.source_vregs.contains(&def));
+    // Width/class views share writable storage, while expression keys retain
+    // full VRegs: killing aliases must not equate differently typed values.
+    available.retain(|_, expr| {
+        expr.def_vreg.id != def.id && !expr.source_vregs.iter().any(|source| source.id == def.id)
+    });
 }
 
 fn invalidate_available_depending_on_flags(available: &mut HashMap<ExprKey, AvailableExpr>) {
@@ -570,8 +572,67 @@ fn collect_address_reg(operand: &X86ISelOperand, source_vregs: &mut HashSet<VReg
     }
 }
 
+static CSE_LOAD_TRANSPARENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the load-transparent CSE relaxation from a TRACKED compiler option,
+/// once (`-Ztrust-ir-cg-args=x86-cse-load-transparent`). DEFAULT OFF.
+///
+/// See `is_hard_barrier` for the soundness argument and for why this is opt-in
+/// rather than the default: it changes this pass's contract and fires on nothing
+/// in the ported corpus.
+pub fn set_cse_load_transparent_enabled(enabled: bool) -> bool {
+    match CSE_LOAD_TRANSPARENT.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => CSE_LOAD_TRANSPARENT.get() == Some(&requested),
+    }
+}
+
+fn cse_load_transparent_enabled() -> bool {
+    if let Some(enabled) = CSE_LOAD_TRANSPARENT.get() {
+        return *enabled;
+    }
+    crate::tcg_env_flag("TCG_X86_CSE_LOAD_TRANSPARENT")
+}
+
 fn is_hard_barrier(inst: &X86ISelInst) -> bool {
     let flags = inst.flags;
+
+    // This pass cannot transfer operand-bound proof custody to a new copy.
+    if inst.proof_origin.is_some() {
+        return true;
+    }
+
+    // A plain LOAD need not be a barrier for this pass, and by default still is.
+    //
+    // The argument that it need not be: every tracked expression is register-only
+    // — `make_candidate` requires `x86_inst_effect(..).is_pure()` and rejects
+    // `reads_memory`/`writes_memory` — so no memory ACCESS can change the value
+    // any of them denotes. The one thing a load does is DEFINE a vreg, and the
+    // per-def `invalidate_available_with_vreg` in the scan below kills exactly the
+    // entries reading OR defining that vreg; the blanket clear merely subsumed it.
+    //
+    // OPT-IN (`-Ztrust-ir-cg-args=x86-cse-load-transparent`), because it is a
+    // CONTRACT CHANGE to this pass with NO measured benefit: all 14 ported
+    // beat-llvm programs compile byte-identically with it on. It was written for
+    // `p4_matmul`, whose innermost loop computes `i*N + j` twice across the
+    // bounds-check diamonds, and it does not fire there either — post-RA one base
+    // arrives via a spill slot and the other in a register, so unifying them needs
+    // value numbering across a reload, which syntactic CSE cannot do and this
+    // crate's `GlobalValueNumbering` (an AArch64 `MachinePass`) does not cover for
+    // x86.
+    if cse_load_transparent_enabled()
+        && x86_inst_effect(inst) == MemoryEffect::Load
+        && !inst_touches_fixed_register(inst)
+        && !flags.is_call()
+        && !flags.is_branch()
+        && !flags.is_terminator()
+        && !flags.is_return()
+        && !flags.has_side_effects()
+        && !flags.is_pseudo()
+        && !matches!(inst.opcode, X86Opcode::Phi | X86Opcode::StackAlloc)
+    {
+        return false;
+    }
 
     !x86_inst_effect(inst).is_pure()
         || inst_touches_fixed_register(inst)
@@ -595,7 +656,7 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
         if x86_reads_flags(inst.opcode) {
             return false;
         }
-        if x86_writes_flags(inst.opcode) {
+        if condition_flag_overwrite(inst) == FlagOverwrite::Full {
             return true;
         }
         if instruction_may_export_flags(inst) {
@@ -629,34 +690,6 @@ fn operand_touches_fixed_register(operand: &X86ISelOperand) -> bool {
         }
         _ => false,
     }
-}
-
-fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
-    use X86Opcode::*;
-
-    matches!(
-        inst.opcode,
-        Neg | Not
-            | Inc
-            | Dec
-            | AddRI
-            | SubRI
-            | AndRI
-            | OrRI
-            | XorRI
-            | AddRM
-            | SubRM
-            | ImulRM
-            | ImulRMSib
-            | ShlRI
-            | ShrRI
-            | SarRI
-            | ShlRR
-            | ShrRR
-            | SarRR
-            // Rotate-by-CL: same tied [dst, src] shape as the CL shifts.
-            | RolRCl
-    )
 }
 
 #[cfg(test)]
@@ -724,6 +757,153 @@ mod tests {
         entry_insts(func).iter().map(|inst| inst.opcode).collect()
     }
 
+    #[test]
+    fn load_transparency_policy_and_aliases_isolated() {
+        const CHILD: &str = "CG_CSE_CUSTODY";
+        let Ok(case) = std::env::var(CHILD) else {
+            let mut failures = Vec::new();
+            for case in [
+                "default",
+                "zero",
+                "one",
+                "empty",
+                "installed_on",
+                "installed_off",
+                "source",
+                "result",
+                "alias_source",
+                "alias_result",
+                "volatile",
+                "call",
+            ] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "x86_cse::tests::load_transparency_policy_and_aliases_isolated",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, case)
+                    .env_remove("TCG_X86_CSE_LOAD_TRANSPARENT");
+                if case != "default" {
+                    command.env(
+                        "TCG_X86_CSE_LOAD_TRANSPARENT",
+                        match case {
+                            "zero" | "installed_on" => "0",
+                            "empty" => "",
+                            _ => "1",
+                        },
+                    );
+                }
+                let output = command.output().unwrap();
+                eprintln!(
+                    "case {case}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success() {
+                    failures.push(case);
+                }
+            }
+            assert!(failures.is_empty(), "failed cases: {failures:?}");
+            return;
+        };
+        if case.starts_with("installed_") {
+            let enabled = case == "installed_on";
+            assert!(set_cse_load_transparent_enabled(enabled));
+            assert!(set_cse_load_transparent_enabled(enabled));
+            assert!(!set_cse_load_transparent_enabled(!enabled));
+        }
+        let dest = match case.as_str() {
+            "source" => vreg(1),
+            "result" => vreg(2),
+            "alias_source" => X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr32)),
+            "alias_result" => X86ISelOperand::VReg(VReg::new(2, RegClass::Gpr32)),
+            _ => vreg(5),
+        };
+        let opcode = match case.as_str() {
+            "alias_source" | "alias_result" => X86Opcode::MovRM32,
+            "volatile" => X86Opcode::VolatileMovRM,
+            "call" => X86Opcode::Call,
+            _ => X86Opcode::MovRM,
+        };
+        let middle = if case == "call" {
+            X86ISelInst::new(opcode, vec![])
+        } else {
+            X86ISelInst::new(
+                opcode,
+                vec![
+                    dest,
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(vreg(4)),
+                        disp: 8,
+                    },
+                ],
+            )
+        };
+        let mut func = duplicate_add_sequence(middle);
+        let before = entry_insts(&func).to_vec();
+        let expected = matches!(case.as_str(), "one" | "empty" | "installed_on");
+        let changed = X86CommonSubexpressionElimination.run_on_function(&mut func);
+        assert_eq!(changed, expected, "{case}");
+        for (index, (old, new)) in before.iter().zip(entry_insts(&func)).enumerate() {
+            if expected && index == 2 {
+                assert_eq!(new.opcode, X86Opcode::MovRR);
+                assert_eq!(new.operands, vec![vreg(3), vreg(2)]);
+            } else {
+                assert_eq!(new.opcode, old.opcode);
+                assert_eq!(new.operands, old.operands);
+                assert_eq!(new.flags, old.flags);
+                assert_eq!(new.proof_origin, old.proof_origin);
+            }
+        }
+    }
+
+    #[test]
+    fn cse_custody_preserves_annotated_duplicate() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::Lea, vec![vreg(2), mem_addr(vreg(0), 8)]),
+            X86ISelInst::new(X86Opcode::Lea, vec![vreg(3), mem_addr(vreg(0), 8)])
+                .with_proof_origin(trust_cg_lower::x86_64_isel::X86ProofOrigin::AtomicLoad),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let before = entry_insts(&func).to_vec();
+        assert!(!X86CommonSubexpressionElimination.run_on_function(&mut func));
+        for (old, new) in before.iter().zip(entry_insts(&func)) {
+            assert_eq!(new.opcode, old.opcode);
+            assert_eq!(new.operands, old.operands);
+            assert_eq!(new.flags, old.flags);
+            assert_eq!(new.proof_origin, old.proof_origin);
+        }
+    }
+
+    #[test]
+    fn cse_custody_rejects_self_aliasing_address_candidate() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(VReg::new(2, RegClass::Gpr32)),
+                    mem_addr(vreg(2), 8),
+                ],
+            ),
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(VReg::new(3, RegClass::Gpr32)),
+                    mem_addr(vreg(2), 8),
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(!X86CommonSubexpressionElimination.run_on_function(&mut func));
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![X86Opcode::Lea, X86Opcode::Lea, X86Opcode::Ret]
+        );
+    }
+
     fn duplicate_add_sequence(middle: X86ISelInst) -> X86ISelFunction {
         make_func(vec![
             X86ISelInst::new(X86Opcode::AddRR, vec![vreg(2), vreg(0), vreg(1)]),
@@ -732,6 +912,23 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(3), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ])
+    }
+
+    #[test]
+    fn x86_cse_preserves_flags_across_partial_writes() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(2), vreg(0), vreg(1)]),
+            X86ISelInst::new(X86Opcode::SubRR, vec![vreg(4), vreg(6), vreg(7)]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(3), vreg(0), vreg(1)]),
+            X86ISelInst::new(X86Opcode::Inc, vec![vreg(5)]),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vreg32(6), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        X86CommonSubexpressionElimination.run_on_function(&mut func);
+        assert_eq!(entry_insts(&func)[2].opcode, X86Opcode::AddRR);
     }
 
     // --- cross-block (global) CSE helpers ---
@@ -1257,6 +1454,9 @@ mod tests {
         );
     }
 
+    /// The ORIGINAL committed contract, unchanged: by DEFAULT a load is a hard
+    /// barrier. The load-transparent relaxation is opt-in (see `is_hard_barrier`),
+    /// so this must keep holding.
     #[test]
     fn x86_cse_does_not_cross_memory_barrier() {
         let load_addr = X86ISelOperand::MemAddr {
@@ -1278,6 +1478,60 @@ mod tests {
                 X86Opcode::CmpRI,
                 X86Opcode::Ret,
             ]
+        );
+    }
+
+    /// THE load-specific safety case: the load defines a SOURCE of the tracked
+    /// expression, so the second computation is a different value and must stay.
+    #[test]
+    fn x86_cse_keeps_a_duplicate_whose_source_a_load_redefined() {
+        let load_addr = X86ISelOperand::MemAddr {
+            base: Box::new(vreg(4)),
+            disp: 8,
+        };
+        // The load writes `v1`, which both `AddRR`s read.
+        let mut func =
+            duplicate_add_sequence(X86ISelInst::new(X86Opcode::MovRM, vec![vreg(1), load_addr]));
+        let mut cse = X86CommonSubexpressionElimination;
+
+        assert!(!cse.run_on_function(&mut func));
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::AddRR,
+                X86Opcode::MovRM,
+                X86Opcode::AddRR,
+                X86Opcode::CmpRI,
+                X86Opcode::Ret,
+            ],
+            "a redefined source makes the second computation a different value"
+        );
+    }
+
+    /// The other load-specific safety case: the load redefines the register the
+    /// copy would read FROM, so the earlier result is no longer available there.
+    #[test]
+    fn x86_cse_keeps_a_duplicate_whose_earlier_result_a_load_clobbered() {
+        let load_addr = X86ISelOperand::MemAddr {
+            base: Box::new(vreg(4)),
+            disp: 8,
+        };
+        // The load writes `v2`, which is the FIRST `AddRR`'s destination.
+        let mut func =
+            duplicate_add_sequence(X86ISelInst::new(X86Opcode::MovRM, vec![vreg(2), load_addr]));
+        let mut cse = X86CommonSubexpressionElimination;
+
+        assert!(!cse.run_on_function(&mut func));
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::AddRR,
+                X86Opcode::MovRM,
+                X86Opcode::AddRR,
+                X86Opcode::CmpRI,
+                X86Opcode::Ret,
+            ],
+            "a clobbered result register cannot be the copy source"
         );
     }
 
@@ -1471,6 +1725,44 @@ mod tests {
                 X86Opcode::Ret,
             ]
         );
+    }
+
+    /// The tied two-operand form `AddRR [d, s]` is `d := d + s`: its value
+    /// depends on the old `d`, which the key `(AddRR, [s])` does not carry. Two
+    /// such adds into different destinations are different expressions.
+    #[test]
+    fn x86_cse_does_not_merge_tied_two_operand_rr_forms() {
+        for opcode in [
+            X86Opcode::AddRR,
+            X86Opcode::SubRR,
+            X86Opcode::ImulRR,
+            X86Opcode::AndRR,
+            X86Opcode::OrRR,
+            X86Opcode::XorRR,
+        ] {
+            let mut func = make_func(vec![
+                X86ISelInst::new(X86Opcode::MovRI, vec![vreg(1), X86ISelOperand::Imm(10)]),
+                X86ISelInst::new(X86Opcode::MovRI, vec![vreg(2), X86ISelOperand::Imm(20)]),
+                X86ISelInst::new(X86Opcode::MovRI, vec![vreg(3), X86ISelOperand::Imm(3)]),
+                X86ISelInst::new(opcode, vec![vreg(1), vreg(3)]),
+                X86ISelInst::new(opcode, vec![vreg(2), vreg(3)]),
+                // Fully overwrites RFLAGS, so both flag writes above are dead.
+                X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(1), vreg(2)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            let mut cse = X86CommonSubexpressionElimination;
+
+            assert!(!cse.run_on_function(&mut func), "{opcode:?}");
+
+            let insts = entry_insts(&func);
+            assert_eq!(insts[3].opcode, opcode);
+            assert_eq!(insts[3].operands, vec![vreg(1), vreg(3)]);
+            assert_eq!(
+                insts[4].opcode, opcode,
+                "{opcode:?} [v2, v3] must not become a copy of v1"
+            );
+            assert_eq!(insts[4].operands, vec![vreg(2), vreg(3)]);
+        }
     }
 
     #[test]

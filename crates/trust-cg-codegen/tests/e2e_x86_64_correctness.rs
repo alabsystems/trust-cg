@@ -4,8 +4,12 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
 // End-to-end tests that compile x86-64 functions through the Trust Codegen pipeline,
-// link them with C drivers, run under Rosetta 2, and verify COMPUTED RESULTS
-// are correct (not just "it runs without crashing").
+// link them with C drivers, run them, and verify COMPUTED RESULTS are correct (not
+// just "it runs without crashing"). The link/run legs use the x86-64 driver that
+// `common::rosetta::x86_64_link_run` proved on this host (native x86-64, opted-in
+// Rosetta 2, or a cross driver plus binfmt_misc/qemu-user). A host without one
+// prints a `SKIP:` line for the link/run leg only; every test still compiles its
+// function and checks the emitted object's container and symbols.
 //
 // Part of #301 -- x86-64 add produces wrong results (originally)
 // Fixed by #305 -- two-address fixup pass inserted in pipeline
@@ -27,8 +31,9 @@ use std::process::{Command, Output};
 mod common;
 use common::rosetta::{
     codegen_link_timeout, codegen_run_timeout, command_output_with_timeout,
-    run_executable_with_timeout,
+    run_executable_with_timeout, x86_64_cc, x86_64_link_run_or_skip,
 };
+use common::x86_64_object::assert_host_x86_64_object;
 
 use trust_cg_codegen::x86_64::pipeline::X86RegAllocMode;
 use trust_cg_codegen::x86_64::{
@@ -49,10 +54,6 @@ use trust_cg_regalloc::AllocStrategy;
 // ===========================================================================
 // Test infrastructure (mirrors e2e_x86_64_link.rs)
 // ===========================================================================
-
-fn has_cc_x86_64() -> bool {
-    common::rosetta::has_cc_x86_64_link_run()
-}
 
 fn make_test_dir(test_name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("trust_cg_e2e_x86_64_correctness_{}", test_name));
@@ -82,21 +83,15 @@ fn output_text(output: &Output) -> (String, String) {
 
 fn link_x86_64(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> PathBuf {
     let binary = dir.join(output_name);
-    let mut link_cmd = Command::new("cc");
-    link_cmd
-        .args(if cfg!(target_os = "macos") {
-            &["-arch", "x86_64"][..]
-        } else {
-            &[][..]
-        })
-        .args([
-            "-o",
-            binary.to_str().unwrap(),
-            driver_c.to_str().unwrap(),
-            obj.to_str().unwrap(),
-        ]);
+    let mut link_cmd = x86_64_cc();
+    link_cmd.args([
+        "-o",
+        binary.to_str().unwrap(),
+        driver_c.to_str().unwrap(),
+        obj.to_str().unwrap(),
+    ]);
     let result = command_output_with_timeout(&mut link_cmd, codegen_link_timeout())
-        .expect("Failed to run cc -arch x86_64");
+        .expect("Failed to run the x86-64 C driver");
 
     if result.timed_out || !result.output.status.success() {
         let (stdout, stderr) = output_text(&result.output);
@@ -127,17 +122,25 @@ fn link_x86_64(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> Pa
     binary
 }
 
-/// Compile an ISel function to Mach-O, link with C driver, run, return (exit_code, stdout).
+/// Compile an ISel function to the host's x86-64 object format and check the
+/// object defines the function for the C driver; then, where this host can link
+/// and run x86-64 executables, link with the C driver, run, and return
+/// `Some((exit_code, stdout))`. Returns `None` after printing a `SKIP:` line for
+/// the link/run leg on a host that cannot.
 fn compile_link_run(
     test_name: &str,
     func: &X86ISelFunction,
     driver_src: &str,
     config: X86PipelineConfig,
-) -> (i32, String) {
+) -> Option<(i32, String)> {
     let pipeline = X86Pipeline::new(config);
     let bytes = pipeline
         .compile_function(func)
         .expect("x86-64 compilation should succeed");
+    assert_host_x86_64_object(test_name, &bytes, &[func.name.as_str()], &[]);
+    if !x86_64_link_run_or_skip(test_name, "x86-64 link/run leg") {
+        return None;
+    }
 
     let dir = make_test_dir(test_name);
     let obj_path = write_object_file(&dir, &format!("{}.o", test_name), &bytes);
@@ -162,7 +165,7 @@ fn compile_link_run(
     }
 
     let run_result = run_executable_with_timeout(&binary, codegen_run_timeout())
-        .expect("should be able to run the x86_64 binary (Rosetta 2)");
+        .expect("should be able to run the x86_64 binary");
     if run_result.timed_out {
         let (stdout, stderr) = output_text(&run_result.output);
         panic!(
@@ -187,24 +190,20 @@ fn compile_link_run(
 
     let _ = fs::remove_dir_all(&dir);
 
-    (exit_code, stdout)
+    Some((exit_code, stdout))
 }
 
-/// Compile and run a C source file as golden truth, return (exit_code, stdout).
+/// Compile and run a C source file as x86-64 golden truth with the proven
+/// x86-64 driver, return (exit_code, stdout). Reached only after a link/run leg
+/// (or [`x86_64_link_run_or_skip`]) confirmed the driver.
 fn compile_run_c_golden(test_name: &str, c_source: &str) -> (i32, String) {
     let dir = make_test_dir(&format!("{}_golden", test_name));
     let src_path = dir.join("golden.c");
     let bin_path = dir.join("golden");
     fs::write(&src_path, c_source).expect("Failed to write golden C source");
 
-    let mut compile_cmd = Command::new("cc");
-    compile_cmd
-        .args(if cfg!(target_os = "macos") {
-            &["-arch", "x86_64"][..]
-        } else {
-            &[][..]
-        })
-        .args(["-o", bin_path.to_str().unwrap(), src_path.to_str().unwrap()]);
+    let mut compile_cmd = x86_64_cc();
+    compile_cmd.args(["-o", bin_path.to_str().unwrap(), src_path.to_str().unwrap()]);
     let result = command_output_with_timeout(&mut compile_cmd, codegen_link_timeout())
         .expect("Failed to compile golden C");
 
@@ -250,9 +249,18 @@ fn compile_run_c_golden(test_name: &str, c_source: &str) -> (i32, String) {
     (exit_code, stdout)
 }
 
+/// The object format the host's `cc` links: Mach-O on macOS, ELF elsewhere.
+fn host_object_format() -> X86OutputFormat {
+    if cfg!(target_os = "macos") {
+        X86OutputFormat::MachO
+    } else {
+        X86OutputFormat::Elf
+    }
+}
+
 fn default_macho_config() -> X86PipelineConfig {
     X86PipelineConfig {
-        output_format: X86OutputFormat::MachO,
+        output_format: host_object_format(),
         emit_frame: true,
         ..X86PipelineConfig::default()
     }
@@ -260,7 +268,7 @@ fn default_macho_config() -> X86PipelineConfig {
 
 fn greedy_macho_config() -> X86PipelineConfig {
     X86PipelineConfig {
-        output_format: X86OutputFormat::MachO,
+        output_format: host_object_format(),
         emit_frame: true,
         regalloc_mode: X86RegAllocMode::Full(AllocStrategy::Greedy),
         ..X86PipelineConfig::default()
@@ -714,11 +722,6 @@ fn build_neg() -> X86ISelFunction {
 
 #[test]
 fn test_correctness_const42() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_x86_const_test_function();
     let driver = r#"
 #include <stdio.h>
@@ -730,8 +733,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("const42_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("const42_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "const42() should return 42. stdout: {}",
@@ -770,11 +776,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_identity() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_identity();
     let driver = r#"
 #include <stdio.h>
@@ -791,8 +792,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("identity_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("identity_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "identity should pass through values. stdout: {}",
@@ -806,11 +810,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_add_two_address_safe() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_add_correct();
     let driver = r#"
 #include <stdio.h>
@@ -827,8 +826,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("add_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("add_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Two-address-safe add MUST produce correct results. stdout: {}",
@@ -872,11 +874,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_add_three_address_fixed() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     // The original add function uses three-address form:
     // ADD v2, v0, v1 (where v2 != v0)
     // Previously this produced WRONG results due to the two-address constraint bug.
@@ -892,12 +889,14 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = compile_link_run(
+    let Some((exit_code, stdout)) = compile_link_run(
         "add_three_address_fixed",
         &func,
         driver,
         default_macho_config(),
-    );
+    ) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Three-address add(30,12) should return 42 after two-address fixup. stdout: {}",
@@ -916,11 +915,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_sub_two_address_safe() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_sub_correct();
     let driver = r#"
 #include <stdio.h>
@@ -937,8 +931,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("sub_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("sub_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Two-address-safe sub MUST produce correct results. stdout: {}",
@@ -957,11 +954,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_mul_two_address_safe() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_mul_correct();
     let driver = r#"
 #include <stdio.h>
@@ -978,8 +970,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("mul_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("mul_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Two-address-safe mul MUST produce correct results. stdout: {}",
@@ -998,11 +993,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_add_immediate() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_add_imm();
     let driver = r#"
 #include <stdio.h>
@@ -1017,8 +1007,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("add_imm_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("add_imm_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "ADD reg, imm should produce correct results. stdout: {}",
@@ -1032,11 +1025,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_neg() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_neg();
     let driver = r#"
 #include <stdio.h>
@@ -1051,8 +1039,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("neg_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("neg_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "NEG should negate values correctly. stdout: {}",
@@ -1066,11 +1057,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_and_two_address_safe() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_and_correct();
     let driver = r#"
 #include <stdio.h>
@@ -1085,8 +1071,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("and_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("and_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Bitwise AND should produce correct results. stdout: {}",
@@ -1100,11 +1089,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_add_greedy_regalloc() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_add_correct();
     let driver = r#"
 #include <stdio.h>
@@ -1116,7 +1100,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = compile_link_run("add_greedy", &func, driver, greedy_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("add_greedy", &func, driver, greedy_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Greedy regalloc add should produce 42. stdout: {}",
@@ -1131,11 +1119,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_add_three_address_greedy_fixed() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     // Three-address add with greedy regalloc — now fixed by two-address fixup.
     let func = build_x86_add_test_function();
     let driver = r#"
@@ -1148,12 +1131,14 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = compile_link_run(
+    let Some((exit_code, stdout)) = compile_link_run(
         "add_greedy_three_addr",
         &func,
         driver,
         greedy_macho_config(),
-    );
+    ) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Three-address add with greedy regalloc should return 42 after fixup. stdout: {}",
@@ -1172,11 +1157,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_add_then_sub() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     // Build: fn add_sub(a: i64, b: i64) -> i64 { (a + b) - 1 }
     let sig = Signature {
         params: vec![Type::I64, Type::I64],
@@ -1257,8 +1237,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("add_sub_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("add_sub_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "add_sub(30,13) should return 42. stdout: {}",
@@ -1272,8 +1255,7 @@ int main(void) {
 
 #[test]
 fn test_correctness_golden_add() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
+    if !x86_64_link_run_or_skip("test_correctness_golden_add", "x86-64 golden C run") {
         return;
     }
 
@@ -1310,11 +1292,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_summary() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     eprintln!("\n=== x86-64 Correctness Test Summary ===");
     eprintln!("All functions MUST compute correct results:");
     eprintln!("  - const42()        -> 42    [no arithmetic, trivially correct]");
@@ -2016,11 +1993,6 @@ fn build_large_const() -> X86ISelFunction {
 
 #[test]
 fn test_correctness_or() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_or_correct();
     let driver = r#"
 #include <stdio.h>
@@ -2034,7 +2006,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) = compile_link_run("or_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("or_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "OR should produce correct results. stdout: {}",
@@ -2070,11 +2046,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_xor() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_xor_correct();
     let driver = r#"
 #include <stdio.h>
@@ -2088,8 +2059,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("xor_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("xor_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "XOR should produce correct results. stdout: {}",
@@ -2125,11 +2099,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_shl() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_shl_correct();
     let driver = r#"
 #include <stdio.h>
@@ -2143,8 +2112,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("shl_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("shl_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "SHL should produce correct results. stdout: {}",
@@ -2158,11 +2130,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_shr() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_shr_correct();
     let driver = r#"
 #include <stdio.h>
@@ -2176,8 +2143,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("shr_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("shr_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "SHR should produce correct results. stdout: {}",
@@ -2191,11 +2161,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_max_cmov() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_max_cmov();
     let driver = r#"
 #include <stdio.h>
@@ -2212,8 +2177,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("max_cmov_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("max_cmov_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "CMOV max should produce correct results. stdout: {}",
@@ -2252,11 +2220,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_abs() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_abs_val();
     let driver = r#"
 #include <stdio.h>
@@ -2273,8 +2236,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("abs_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("abs_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "ABS should produce correct results. stdout: {}",
@@ -2313,11 +2279,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_combined_arith() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_combined_arith();
     let driver = r#"
 #include <stdio.h>
@@ -2333,8 +2294,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("combined_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("combined_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Combined arith should produce correct results. stdout: {}",
@@ -2372,11 +2336,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_max_branch() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_max_branch();
     let driver = r#"
 #include <stdio.h>
@@ -2393,8 +2352,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("max_branch_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("max_branch_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Branch max should produce correct results. stdout: {}",
@@ -2433,11 +2395,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_signed_arithmetic() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_signed_arithmetic();
     let driver = r#"
 #include <stdio.h>
@@ -2453,12 +2410,14 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) = compile_link_run(
+    let Some((exit_code, stdout)) = compile_link_run(
         "signed_arith_correct",
         &func,
         driver,
         default_macho_config(),
-    );
+    ) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Signed arith should produce correct results. stdout: {}",
@@ -2496,11 +2455,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_large_const() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_large_const();
     let driver = r#"
 #include <stdio.h>
@@ -2511,8 +2465,11 @@ int main(void) {
     return (result == 4294967296L) ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("large_const_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("large_const_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Large const should return 4294967296. stdout: {}",
@@ -2545,11 +2502,6 @@ int main(void) {
 
 #[test]
 fn test_correctness_large_multiply() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP");
-        return;
-    }
-
     let func = build_mul_correct();
     let driver = r#"
 #include <stdio.h>
@@ -2562,8 +2514,11 @@ int main(void) {
     return ok ? 0 : 1;
 }
 "#;
-    let (exit_code, stdout) =
-        compile_link_run("large_mul_correct", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("large_mul_correct", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "Large multiply should produce 64-bit results. stdout: {}",
@@ -2699,11 +2654,6 @@ fn build_stack_args_sum() -> X86ISelFunction {
 
 #[test]
 fn test_correctness_stack_args_sum() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_stack_args_sum();
     let driver = r#"
 #include <stdio.h>
@@ -2721,8 +2671,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("stack_args_sum", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("stack_args_sum", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "8-arg stack_args_sum should produce correct results. stdout: {}",
@@ -2861,11 +2814,6 @@ fn build_stack_args_sum10() -> X86ISelFunction {
 
 #[test]
 fn test_correctness_stack_args_sum10() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_stack_args_sum10();
     let driver = r#"
 #include <stdio.h>
@@ -2883,8 +2831,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("stack_args_sum10", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("stack_args_sum10", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "10-arg stack_args_sum10 should produce correct results. stdout: {}",
@@ -3075,11 +3026,6 @@ fn build_stack_args_weighted() -> X86ISelFunction {
 
 #[test]
 fn test_correctness_stack_args_weighted() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_stack_args_weighted();
     let driver = r#"
 #include <stdio.h>
@@ -3101,8 +3047,11 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) =
-        compile_link_run("stack_args_weighted", &func, driver, default_macho_config());
+    let Some((exit_code, stdout)) =
+        compile_link_run("stack_args_weighted", &func, driver, default_macho_config())
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "8-arg weighted sum should produce correct results. stdout: {}",

@@ -272,6 +272,75 @@ fn budget_exhaustion_never_publishes_or_replays_an_empty_prefix() {
     assert_eq!(retry.stats().cache_puts, 1);
 }
 
+// The budget elapsing while the final solver-backed verification runs leaves
+// no candidate unverified, so the search is complete and commits; the later
+// non-candidate instructions do not consult the budget.
+#[test]
+fn budget_elapsing_during_the_final_verification_keeps_the_complete_search() {
+    let cache = Arc::new(RecordingCache::default());
+    let mut pass = CegisSuperoptPass::new(make_config(Some(cache.clone()), 1)).with_test_hooks(
+        CegisSuperoptTestHooks {
+            force_deadline_after_verifications: Some(1),
+            ..equivalent_hook()
+        },
+    );
+    let (mut func, mul_id) = layer_a_func("payload_budget_elapses_in_final_query");
+
+    let outcome = pass.run_with_outcome(&mut func);
+
+    assert_eq!(outcome, CegisRunOutcome::Complete { committed: true });
+    assert_eq!(func.inst(mul_id).opcode, AArch64Opcode::Movz);
+    assert_eq!(pass.stats().budget_exhausted, 0);
+    assert_eq!(pass.stats().verified, 1);
+    assert_eq!(pass.stats().layer_a_committed, 1);
+    assert_eq!(pass.stats().cache_puts, 1);
+    let entry = cache.last_entry();
+    assert_eq!(entry.completion, CegisSearchCompletion::Complete);
+    assert_eq!(entry.proven_rewrites.len(), 1);
+}
+
+// The same budget still refuses to start a further verification, and the
+// search then fails closed without exposing the rewrite it already proved.
+#[test]
+fn budget_elapsed_before_a_further_verification_rolls_back_the_search() {
+    let cache = Arc::new(RecordingCache::default());
+    let mut pass = CegisSuperoptPass::new(make_config(Some(cache.clone()), 1)).with_test_hooks(
+        CegisSuperoptTestHooks {
+            force_deadline_after_verifications: Some(1),
+            ..equivalent_hook()
+        },
+    );
+    let (mut func, mul_id) = layer_a_then_layer_b_func("payload_budget_refuses_second_query");
+    let before = scheduled_snapshot(&func);
+
+    let outcome = pass.run_with_outcome(&mut func);
+
+    assert_eq!(
+        outcome,
+        CegisRunOutcome::Incomplete {
+            completion: CegisSearchCompletion::DeadlineExceeded,
+        }
+    );
+    assert_eq!(scheduled_snapshot(&func), before);
+    assert_eq!(func.inst(mul_id).opcode, AArch64Opcode::MulRR);
+    assert_eq!(pass.stats().budget_exhausted, 1);
+    assert_eq!(pass.stats().verified, 1, "the first verification ran");
+    assert_eq!(pass.stats().layer_a_candidates, 1);
+    assert_eq!(
+        pass.stats().layer_b_candidates,
+        1,
+        "the Layer B candidate was matched but never verified"
+    );
+    assert_eq!(pass.stats().layer_a_committed, 0);
+    assert_eq!(pass.stats().layer_b_committed, 0);
+    assert_eq!(pass.stats().cache_puts, 0);
+    assert_eq!(
+        cache.entry_count(),
+        0,
+        "an incomplete search must not publish"
+    );
+}
+
 #[test]
 fn solver_error_is_counted_without_commit() {
     let cache = Arc::new(RecordingCache::default());
@@ -481,4 +550,86 @@ fn cache_hit_replay_is_deterministic_and_solver_free() {
     assert_eq!(hot_pass.stats().verified, cold_pass.stats().verified);
     assert_eq!(hot_func.inst(hot_mul).opcode, AArch64Opcode::Movz);
     assert_eq!(scheduled_snapshot(&hot_func), cold_post);
+}
+
+/// Layer C through the real solver: the uncorrupted mask fusion is proven
+/// and committed; a rotated mask or the mask register as the source is
+/// refuted by the verification (its concrete phase; the lib test
+/// `corrupted_replacements_are_refuted_by_the_solver` has AY refute them with
+/// no seeds); an `AddRI` of the mask has no `imm12` encoding and is rejected
+/// before any query. A store that also reads the
+/// mask at operand 0 keeps the whole window (search revision 2 dropped it).
+#[test]
+fn layer_c_obligation_is_discharged_and_refutes_corrupted_masks() {
+    use trust_cg_verify::cegis_pass::ReplacementMutation;
+
+    let (mut func, and_id, _) = layer_c_and_mask_func("payload_layer_c_real_solver");
+    let mut pass = CegisSuperoptPass::new(make_config(None, 10));
+    let outcome = pass.run_with_outcome(&mut func);
+    eprintln!(
+        "TCG_CEGIS_PASS layer=C control: {outcome:?} {:?}",
+        pass.stats()
+    );
+    if pass.stats().verifier_errors > 0 {
+        eprintln!(
+            "skipping assertion: the Layer C obligation reached a verifier error; \
+             see the proof-tool availability of this machine"
+        );
+        return;
+    }
+    assert_eq!(outcome, CegisRunOutcome::Complete { committed: true });
+    assert_eq!(func.inst(and_id).opcode, AArch64Opcode::AndRI);
+
+    for mutation in [
+        ReplacementMutation::Immediate,
+        ReplacementMutation::SourceRegister,
+        ReplacementMutation::Operation,
+    ] {
+        let (mut func, _, _) = layer_c_and_mask_func("payload_layer_c_mutation");
+        let before = scheduled_snapshot(&func);
+        let mut pass =
+            CegisSuperoptPass::new(make_config(None, 10)).with_test_hooks(CegisSuperoptTestHooks {
+                corrupt_replacement: Some(mutation),
+                ..Default::default()
+            });
+        let outcome = pass.run_with_outcome(&mut func);
+        let stats = pass.stats();
+        eprintln!("TCG_CEGIS_PASS_MUTATION layer=C {mutation:?}: {outcome:?} {stats:?}");
+        assert_eq!(
+            outcome,
+            CegisRunOutcome::Complete { committed: false },
+            "{mutation:?}"
+        );
+        assert_eq!(
+            (stats.candidates, stats.verified, stats.rejected),
+            (1, 0, 1),
+            "{mutation:?}"
+        );
+        assert_eq!(
+            (stats.verifier_errors, stats.timeouts, stats.panics),
+            (0, 0, 0),
+            "{mutation:?}"
+        );
+        assert_eq!(scheduled_snapshot(&func), before, "{mutation:?}");
+    }
+
+    // A store reading the mask register keeps the window.
+    let (mut func, and_id, materializers) = layer_c_and_mask_func("payload_layer_c_store");
+    let mask = func.inst(and_id).operands[2].clone();
+    let base = func.inst(and_id).operands[1].clone();
+    let store = func.push_inst(MachInst::new(
+        AArch64Opcode::StrRI,
+        vec![mask, base, MachOperand::Imm(8)],
+    ));
+    let entry = func.entry;
+    let at = func.block(entry).insts.len() - 1;
+    func.block_mut(entry).insts.insert(at, store);
+    let before = scheduled_snapshot(&func);
+    let mut pass = CegisSuperoptPass::new(make_config(None, 10)).with_test_hooks(equivalent_hook());
+    assert!(!pass.run(&mut func));
+    assert_eq!(pass.stats().candidates, 0);
+    assert_eq!(scheduled_snapshot(&func), before);
+    for materializer in materializers {
+        assert!(func.block(entry).insts.contains(&materializer));
+    }
 }

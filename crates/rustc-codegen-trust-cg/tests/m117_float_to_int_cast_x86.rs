@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Differential regression test for Rust's SATURATING float->int `as` casts on x86_64,
 // run under the DEFAULT per-compile proof gate (certs ON).
@@ -32,65 +36,14 @@ mod target_dir_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m117 test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -111,7 +64,7 @@ fn write_panic_stubs(dir: &Path, objs: &[PathBuf]) -> PathBuf {
     let mut stubs = String::from("#include <stdlib.h>\n");
     for line in String::from_utf8_lossy(&nm.stdout).lines() {
         let sym = line.trim().trim_start_matches('U').trim();
-        if sym.contains("panic") && seen.insert(sym.to_owned()) {
+        if toolchain_support::is_abort_stub_symbol(sym) && seen.insert(sym.to_owned()) {
             let c = sym.strip_prefix('_').unwrap_or(sym);
             stubs.push_str(&format!(
                 "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -140,10 +93,8 @@ fn compile_link_run(stem: &str, body: &str, opt: &str, dylib: Option<&Path>) -> 
     );
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
@@ -157,7 +108,7 @@ fn compile_link_run(stem: &str, body: &str, opt: &str, dylib: Option<&Path>) -> 
         .arg("--out-dir")
         .arg(&dir)
         .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&dir);
         if dylib.is_some() {
@@ -262,33 +213,57 @@ fn cast_prog(fty: &str, val: &str, ity: &str, uw: &str) -> String {
 /// 1e30_f32 as i32 -> i32::MAX (2147483647). 2147483647 % 113 = 7. (indefinite MIN -> 8.)
 #[test]
 fn f32_overflow_high_to_i32_saturates_max() {
-    matches_both_opts("f32_ovf_hi_i32", &cast_prog("f32", "1e30f32", "i32", "u32"), 7);
+    matches_both_opts(
+        "f32_ovf_hi_i32",
+        &cast_prog("f32", "1e30f32", "i32", "u32"),
+        7,
+    );
 }
 
 /// f32::NAN as i32 -> 0. (indefinite -> i32::MIN -> 8.)
 #[test]
 fn f32_nan_to_i32_is_zero() {
-    matches_both_opts("f32_nan_i32", &cast_prog("f32", "f32::NAN", "i32", "u32"), 0);
+    matches_both_opts(
+        "f32_nan_i32",
+        &cast_prog("f32", "f32::NAN", "i32", "u32"),
+        0,
+    );
 }
 
 /// +inf as i32 -> i32::MAX -> 7. -inf as i32 -> i32::MIN (2147483648 as u32 % 113 = 8).
 #[test]
 fn f32_pos_inf_to_i32_saturates_max() {
-    matches_both_opts("f32_pinf_i32", &cast_prog("f32", "f32::INFINITY", "i32", "u32"), 7);
+    matches_both_opts(
+        "f32_pinf_i32",
+        &cast_prog("f32", "f32::INFINITY", "i32", "u32"),
+        7,
+    );
 }
 #[test]
 fn f32_neg_inf_to_i32_saturates_min() {
-    matches_both_opts("f32_ninf_i32", &cast_prog("f32", "f32::NEG_INFINITY", "i32", "u32"), 8);
+    matches_both_opts(
+        "f32_ninf_i32",
+        &cast_prog("f32", "f32::NEG_INFINITY", "i32", "u32"),
+        8,
+    );
 }
 
 /// f64 1e300 as i64 -> i64::MAX ; f64::NAN as i64 -> 0.
 #[test]
 fn f64_overflow_high_to_i64_saturates_max() {
-    matches_both_opts("f64_ovf_hi_i64", &cast_prog("f64", "1e300f64", "i64", "u64"), 14);
+    matches_both_opts(
+        "f64_ovf_hi_i64",
+        &cast_prog("f64", "1e300f64", "i64", "u64"),
+        14,
+    );
 }
 #[test]
 fn f64_nan_to_i64_is_zero() {
-    matches_both_opts("f64_nan_i64", &cast_prog("f64", "f64::NAN", "i64", "u64"), 0);
+    matches_both_opts(
+        "f64_nan_i64",
+        &cast_prog("f64", "f64::NAN", "i64", "u64"),
+        0,
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -298,7 +273,11 @@ fn f64_nan_to_i64_is_zero() {
 /// 1e30_f32 as u32 -> u32::MAX (4294967295 % 113 = 15).
 #[test]
 fn f32_overflow_to_u32_saturates_max() {
-    matches_both_opts("f32_ovf_u32", &cast_prog("f32", "1e30f32", "u32", "u32"), 15);
+    matches_both_opts(
+        "f32_ovf_u32",
+        &cast_prog("f32", "1e30f32", "u32", "u32"),
+        15,
+    );
 }
 
 /// -5.0_f32 as u32 -> 0 (negative -> 0 for unsigned). f32::NAN as u32 -> 0.
@@ -308,13 +287,21 @@ fn f32_negative_to_u32_is_zero() {
 }
 #[test]
 fn f32_nan_to_u32_is_zero() {
-    matches_both_opts("f32_nan_u32", &cast_prog("f32", "f32::NAN", "u32", "u32"), 0);
+    matches_both_opts(
+        "f32_nan_u32",
+        &cast_prog("f32", "f32::NAN", "u32", "u32"),
+        0,
+    );
 }
 
 /// 1e300_f64 as u64 -> u64::MAX (% 113 = 29).
 #[test]
 fn f64_overflow_to_u64_saturates_max() {
-    matches_both_opts("f64_ovf_u64", &cast_prog("f64", "1e300f64", "u64", "u64"), 29);
+    matches_both_opts(
+        "f64_ovf_u64",
+        &cast_prog("f64", "1e300f64", "u64", "u64"),
+        29,
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -341,7 +328,11 @@ fn f64_just_over_u8_saturates_max() {
 /// 70000.0_f32 as u16 -> 65535 (saturate; truncation would give 4464). 65535 % 113 = 108.
 #[test]
 fn f32_to_u16_saturates_not_truncates() {
-    matches_both_opts("f32_u16_sat", &cast_prog("f32", "70000.0f32", "u16", "u16"), 108);
+    matches_both_opts(
+        "f32_u16_sat",
+        &cast_prog("f32", "70000.0f32", "u16", "u16"),
+        108,
+    );
 }
 
 /// 200.0_f32 as i8 -> 127 (14) ; -200.0_f32 as i8 -> -128 (15).
@@ -361,9 +352,17 @@ fn f32_to_i8_saturates_min() {
 /// 2.9_f64 as i32 -> 2 ; -1.5_f64 as i32 -> -1 (truncate toward zero).
 #[test]
 fn f64_in_range_truncates_toward_zero_positive() {
-    matches_both_opts("f64_trunc_pos", &cast_prog("f64", "2.9f64", "i32", "u32"), 2);
+    matches_both_opts(
+        "f64_trunc_pos",
+        &cast_prog("f64", "2.9f64", "i32", "u32"),
+        2,
+    );
 }
 #[test]
 fn f64_in_range_truncates_toward_zero_negative() {
-    matches_both_opts("f64_trunc_neg", &cast_prog("f64", "-1.5f64", "i32", "u32"), 15);
+    matches_both_opts(
+        "f64_trunc_neg",
+        &cast_prog("f64", "-1.5f64", "i32", "u32"),
+        15,
+    );
 }

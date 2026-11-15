@@ -100,8 +100,9 @@
 //! the do-while must be SKIPPED (it would store `w[j+1+k]` — the rotated
 //! remainder-0 class), so a `iv > j` guard routes to the loop's true exit
 //! setting `ivs = iv = j+1` — the exact value the scalar exit produces.
-//! Recognition verifies NO other loop-defined value (flags included: the exit
-//! path re-defines NZCV before any read) is observable outside.
+//! Recognition verifies, through the crate's one loop-state contract
+//! ([`crate::loop_contract`]), that NO other loop-defined value (flags
+//! included) is live into the header or an exit.
 //!
 //! If ANY premise fails — a different op tree or operand order, an extra
 //! load/store/opcode, an f64 field, a non-`+1` step, an out-of-loop use of a
@@ -112,14 +113,17 @@
 //! loop's multi-store body). Disable with
 //! `TRUST_CG_DISABLE_PASSES=neon_butterfly`.
 
-use std::collections::{HashMap, HashSet};
+use crate::candidate::{alloc, commit, emit, insert_new_blocks_before, splice_edge};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{ExitPlan, Handoff, LoopLocality};
+use crate::mach_util::{branch_targets, const_value};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
 };
 
 use crate::dom::DomTree;
-use crate::effects::{self, for_each_inst_def, inst_defines_vreg};
+use crate::effects::{for_each_inst_def, inst_defines_vreg};
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -218,33 +222,6 @@ impl NeonButterflyPass {
 // Recognition
 // ---------------------------------------------------------------------------
 
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
-/// 16-bit `Movz` constant value of `val`, if any.
-fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
-    let inst = func.inst(*def.get(&val.id)?);
-    if inst.opcode == AArch64Opcode::Movz
-        && inst.operands.len() == 2
-        && let Some(v) = imm_of(&inst.operands[1])
-        && (0..=0xFFFF).contains(&v)
-    {
-        return Some(v);
-    }
-    None
-}
-
 /// A resolved address recipe: `base + Σ invs[..]*8 (+ iv*8 if has_iv) + off`
 /// with `base`/`invs` loop-invariant `Gpr64` registers.
 #[derive(Clone)]
@@ -302,6 +279,9 @@ struct RecognizedButterfly {
     /// Twiddle cell: `e.rp` at `[e_root + e_off]`, `e.ip` at `+4`.
     e_root: VReg,
     e_off: i64,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv, ivs]`. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 /// Opcodes permitted anywhere in the loop body (fail-closed on anything else).
@@ -347,7 +327,7 @@ impl RecognizedButterfly {
         if header == latch || body.len() != 2 || !body.contains(&header) || !body.contains(&latch) {
             return None;
         }
-        let mut loop_insts = HashSet::new();
+        let mut loop_insts = HashSet::default();
         for &b in [header, latch].iter() {
             for &id in &func.block(b).insts {
                 if !allowed_op(func.inst(id).opcode) {
@@ -356,10 +336,10 @@ impl RecognizedButterfly {
                 loop_insts.insert(id);
             }
         }
-        let def = build_def_map(func);
+        let def = crate::effects::build_reaching_def_map(func);
         // All registers DEFINED inside the loop (non-SSA: the def map alone
         // cannot decide invariance — see [`is_invariant`]).
-        let mut loop_defs: HashSet<u32> = HashSet::new();
+        let mut loop_defs: HashSet<u32> = HashSet::default();
         for &id in &loop_insts {
             let inst = func.inst(id);
             for_each_inst_def(inst, |d| {
@@ -375,7 +355,7 @@ impl RecognizedButterfly {
         let wb = func.inst(latch_insts[0]);
         let (iv, ivs) = match wb.opcode {
             AArch64Opcode::MovR | AArch64Opcode::Copy if wb.operands.len() == 2 => {
-                (vreg_of(&wb.operands[0])?, vreg_of(&wb.operands[1])?)
+                (wb.operands[0].as_vreg()?, wb.operands[1].as_vreg()?)
             }
             _ => return None,
         };
@@ -393,8 +373,8 @@ impl RecognizedButterfly {
         }
         let ivs_inst = func.inst(ivs_def);
         if ivs_inst.opcode != AArch64Opcode::AddRI
-            || vreg_of(&ivs_inst.operands[1]) != Some(iv)
-            || imm_of(&ivs_inst.operands[2]) != Some(1)
+            || ivs_inst.operands[1].as_vreg() != Some(iv)
+            || ivs_inst.operands[2].as_imm() != Some(1)
         {
             return None;
         }
@@ -412,16 +392,16 @@ impl RecognizedButterfly {
             hinsts[hinsts.len() - 1],
         ];
         let cmp = func.inst(cmp_id);
-        if cmp.opcode != AArch64Opcode::CmpRR || vreg_of(&cmp.operands[0]) != Some(iv) {
+        if cmp.opcode != AArch64Opcode::CmpRR || cmp.operands[0].as_vreg() != Some(iv) {
             return None;
         }
-        let bound = vreg_of(&cmp.operands[1])?;
+        let bound = cmp.operands[1].as_vreg()?;
         if bound.class != RegClass::Gpr64 {
             return None;
         }
         let bcond = func.inst(bcond_id);
         if bcond.opcode != AArch64Opcode::BCond
-            || imm_of(&bcond.operands[0]) != Some(CC_LT)
+            || bcond.operands[0].as_imm() != Some(CC_LT)
             || branch_targets(bcond) != vec![latch]
         {
             return None;
@@ -458,7 +438,7 @@ impl RecognizedButterfly {
         }
 
         // (R6) resolve every load / store address into chains; collect cells.
-        let mut chain_insts: HashSet<InstId> = HashSet::new();
+        let mut chain_insts: HashSet<InstId> = HashSet::default();
         let resolve = |func: &MachFunction, addr: VReg, extra_off: i64| -> Option<AddrChain> {
             let mut chain = AddrChain {
                 base: addr,
@@ -482,13 +462,13 @@ impl RecognizedButterfly {
                 let inst = func.inst(did);
                 match inst.opcode {
                     AArch64Opcode::AddRI if inst.operands.len() == 3 => {
-                        chain.off += imm_of(&inst.operands[2])?;
+                        chain.off += inst.operands[2].as_imm()?;
                         chain.insts.push(did);
-                        cur = vreg_of(&inst.operands[1])?;
+                        cur = inst.operands[1].as_vreg()?;
                     }
                     AArch64Opcode::Madd if inst.operands.len() == 4 => {
-                        let idx = vreg_of(&inst.operands[1])?;
-                        let mul = vreg_of(&inst.operands[2])?;
+                        let idx = inst.operands[1].as_vreg()?;
+                        let mul = inst.operands[2].as_vreg()?;
                         if const_value(func, &def, mul) != Some(ELEM_BYTES) {
                             return None;
                         }
@@ -507,7 +487,7 @@ impl RecognizedButterfly {
                             chain.invs.push(idx);
                         }
                         chain.insts.push(did);
-                        cur = vreg_of(&inst.operands[3])?;
+                        cur = inst.operands[3].as_vreg()?;
                     }
                     _ => return None,
                 }
@@ -516,19 +496,19 @@ impl RecognizedButterfly {
         };
 
         // Loads: map result vreg id -> (chain, cell offset). Stores collected.
-        let mut load_cells: HashMap<u32, AddrChain> = HashMap::new();
+        let mut load_cells: HashMap<u32, AddrChain> = HashMap::default();
         let mut es_reg: Option<VReg> = None;
         let mut stores: Vec<(InstId, AddrChain, VReg)> = Vec::new();
         for &id in &func.block(header).insts {
             let inst = func.inst(id);
             match inst.opcode {
                 AArch64Opcode::LdrRI => {
-                    let dst = vreg_of(&inst.operands[0])?;
+                    let dst = inst.operands[0].as_vreg()?;
                     if dst.class != RegClass::Fpr32 {
                         return None;
                     }
-                    let addr = vreg_of(&inst.operands[1])?;
-                    let off = imm_of(&inst.operands[2])?;
+                    let addr = inst.operands[1].as_vreg()?;
+                    let off = inst.operands[2].as_imm()?;
                     let chain = resolve(func, addr, off)?;
                     for &cid in &chain.insts {
                         chain_insts.insert(cid);
@@ -538,12 +518,12 @@ impl RecognizedButterfly {
                     }
                 }
                 AArch64Opcode::StrRI => {
-                    let val = vreg_of(&inst.operands[0])?;
+                    let val = inst.operands[0].as_vreg()?;
                     if val.class != RegClass::Fpr32 {
                         return None;
                     }
-                    let addr = vreg_of(&inst.operands[1])?;
-                    let off = imm_of(&inst.operands[2])?;
+                    let addr = inst.operands[1].as_vreg()?;
+                    let off = inst.operands[2].as_imm()?;
                     let chain = resolve(func, addr, off)?;
                     for &cid in &chain.insts {
                         chain_insts.insert(cid);
@@ -559,7 +539,7 @@ impl RecognizedButterfly {
                 for &cid in &c.insts {
                     let inst = func.inst(cid);
                     if inst.opcode == AArch64Opcode::Madd {
-                        let mul = vreg_of(&inst.operands[2])?;
+                        let mul = inst.operands[2].as_vreg()?;
                         match es_reg {
                             None => es_reg = Some(mul),
                             Some(e) if e.id == mul.id => {}
@@ -603,8 +583,8 @@ impl RecognizedButterfly {
         type StreamKey = (u32, Vec<u32>, bool);
         type StoreGroup = (StreamKey, VReg, VReg);
 
-        let mut store_groups: HashMap<StreamKey, Vec<(i64, VReg)>> = HashMap::new();
-        let mut store_recipes: HashMap<StreamKey, StreamRecipe> = HashMap::new();
+        let mut store_groups: HashMap<StreamKey, Vec<(i64, VReg)>> = HashMap::default();
+        let mut store_recipes: HashMap<StreamKey, StreamRecipe> = HashMap::default();
         for (_, chain, val) in &stores {
             if !chain.has_iv || !(chain.off == 0 || chain.off == 4) {
                 return None;
@@ -667,13 +647,13 @@ impl RecognizedButterfly {
             return None;
         }
 
-        let mut matched: HashSet<InstId> = HashSet::new();
+        let mut matched: HashSet<InstId> = HashSet::default();
         // a0 = Fadd(load(S1,0), load(S2,0)) — S1/S2 DEFINED here by position.
         let (a0i, a0id) = fp_def(a0)?;
         if a0i.opcode != AArch64Opcode::FaddRR {
             return None;
         }
-        let (x, y) = (vreg_of(&a0i.operands[1])?, vreg_of(&a0i.operands[2])?);
+        let (x, y) = (a0i.operands[1].as_vreg()?, a0i.operands[2].as_vreg()?);
         let (s1c, s1off) = cell_of(x)?;
         let (s2c, s2off) = cell_of(y)?;
         if s1off != 0 || s2off != 0 || !s1c.has_iv || !s2c.has_iv {
@@ -704,8 +684,8 @@ impl RecognizedButterfly {
         // a4 = Fadd(load(S1,4), load(S2,4)).
         let (a4i, a4id) = fp_def(a4)?;
         if a4i.opcode != AArch64Opcode::FaddRR
-            || !is_cell(vreg_of(&a4i.operands[1])?, &s1_key, 4)
-            || !is_cell(vreg_of(&a4i.operands[2])?, &s2_key, 4)
+            || !is_cell(a4i.operands[1].as_vreg()?, &s1_key, 4)
+            || !is_cell(a4i.operands[2].as_vreg()?, &s2_key, 4)
         {
             return None;
         }
@@ -716,7 +696,7 @@ impl RecognizedButterfly {
         if b0i.opcode != AArch64Opcode::FmaddRR || b0i.operands.len() != 4 {
             return None;
         }
-        let er_v = vreg_of(&b0i.operands[1])?;
+        let er_v = b0i.operands[1].as_vreg()?;
         let (ec, e_off) = cell_of(er_v)?;
         if ec.has_iv || !ec.invs.is_empty() || !(0..=MAX_E_OFF).contains(&e_off) {
             return None;
@@ -727,8 +707,8 @@ impl RecognizedButterfly {
         let match_diff = |v: VReg, f: i64, matched: &mut HashSet<InstId>| -> Option<()> {
             let (i, id) = fp_def(v)?;
             if i.opcode != AArch64Opcode::FsubRR
-                || !is_cell(vreg_of(&i.operands[1])?, &s1_key, f)
-                || !is_cell(vreg_of(&i.operands[2])?, &s2_key, f)
+                || !is_cell(i.operands[1].as_vreg()?, &s1_key, f)
+                || !is_cell(i.operands[2].as_vreg()?, &s2_key, f)
             {
                 return None;
             }
@@ -736,20 +716,20 @@ impl RecognizedButterfly {
             Some(())
         };
         // b0 = Fmadd(er, dr, Fmul(ei, Fneg(di)))
-        match_diff(vreg_of(&b0i.operands[2])?, 0, &mut matched)?;
+        match_diff(b0i.operands[2].as_vreg()?, 0, &mut matched)?;
         {
-            let (mi, mid) = fp_def(vreg_of(&b0i.operands[3])?)?;
+            let (mi, mid) = fp_def(b0i.operands[3].as_vreg()?)?;
             if mi.opcode != AArch64Opcode::FmulRR {
                 return None;
             }
-            if !is_cell(vreg_of(&mi.operands[1])?, &e_key, e_off + 4) {
+            if !is_cell(mi.operands[1].as_vreg()?, &e_key, e_off + 4) {
                 return None;
             }
-            let (ni, nid) = fp_def(vreg_of(&mi.operands[2])?)?;
+            let (ni, nid) = fp_def(mi.operands[2].as_vreg()?)?;
             if ni.opcode != AArch64Opcode::FnegRR {
                 return None;
             }
-            match_diff(vreg_of(&ni.operands[1])?, 4, &mut matched)?;
+            match_diff(ni.operands[1].as_vreg()?, 4, &mut matched)?;
             matched.insert(mid);
             matched.insert(nid);
         }
@@ -758,19 +738,19 @@ impl RecognizedButterfly {
         let (b4i, b4id) = fp_def(b4)?;
         if b4i.opcode != AArch64Opcode::FmaddRR
             || b4i.operands.len() != 4
-            || !is_cell(vreg_of(&b4i.operands[1])?, &e_key, e_off)
+            || !is_cell(b4i.operands[1].as_vreg()?, &e_key, e_off)
         {
             return None;
         }
-        match_diff(vreg_of(&b4i.operands[2])?, 4, &mut matched)?;
+        match_diff(b4i.operands[2].as_vreg()?, 4, &mut matched)?;
         {
-            let (mi, mid) = fp_def(vreg_of(&b4i.operands[3])?)?;
+            let (mi, mid) = fp_def(b4i.operands[3].as_vreg()?)?;
             if mi.opcode != AArch64Opcode::FmulRR
-                || !is_cell(vreg_of(&mi.operands[1])?, &e_key, e_off + 4)
+                || !is_cell(mi.operands[1].as_vreg()?, &e_key, e_off + 4)
             {
                 return None;
             }
-            match_diff(vreg_of(&mi.operands[2])?, 0, &mut matched)?;
+            match_diff(mi.operands[2].as_vreg()?, 0, &mut matched)?;
             matched.insert(mid);
         }
         matched.insert(b4id);
@@ -791,7 +771,7 @@ impl RecognizedButterfly {
             let inst = func.inst(id);
             match inst.opcode {
                 AArch64Opcode::LdrRI => {
-                    let dst = vreg_of(&inst.operands[0]);
+                    let dst = inst.operands[0].as_vreg();
                     let ok = dst
                         .and_then(|d| load_cells.get(&d.id))
                         .map(z_cell_ok)
@@ -833,40 +813,25 @@ impl RecognizedButterfly {
             return None;
         }
 
-        // (R11) LIVE-OUT scan: no loop-defined value except `ivs` is USED by
-        // any instruction outside the loop (`iv` may be REdefined outside —
-        // that is a def, not a use). Uses are taken from the shared operand
-        // ROLES (tied def-use positions count as uses).
-        for (idx, inst) in func.insts.iter().enumerate() {
-            let id = InstId(idx as u32);
-            if loop_insts.contains(&id) {
-                continue;
-            }
-            // Skip unlinked (removed) instructions.
-            if block_of_inst(func, id).is_none() {
-                continue;
-            }
-            let mut bad = false;
-            effects::aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
-                if let Some(MachOperand::VReg(v)) = inst.operands.get(pos)
-                    && v.id != ivs.id
-                    && loop_defs.contains(&v.id)
-                {
-                    bad = true;
-                }
-            });
-            if bad {
-                return None;
-            }
-        }
-
-        // (R12) FLAGS: the exit path must redefine NZCV before any read (the
-        // vector exit leaves different flags than the scalar exit compare).
-        if !flags_reset_before_read(func, exit) {
-            return None;
-        }
+        // (R11) LOOP STATE, the crate's one loop-state contract
+        // (`crate::loop_contract`): the vector loop runs only iterations the
+        // header's `iv < bound` test continues, and the loop may leave by no
+        // other exit. It reproduces `iv` and `ivs` (the `skip` edge sets
+        // `ivs = iv` before the true exit). No other register the loop writes,
+        // the flags included, may be live into the header or an exit: the
+        // vector exit leaves different flags than the scalar exit compare.
+        let locality = LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &ExitPlan::loop_test(header, exit),
+            Handoff::HeaderOrExit,
+            &[iv, ivs],
+        )
+        .ok()?;
 
         Some(RecognizedButterfly {
+            _locality: locality,
             preheader,
             preheader_term,
             header,
@@ -883,83 +848,6 @@ impl RecognizedButterfly {
             e_off,
         })
     }
-}
-
-/// True iff every path from `from` re-defines the NZCV flags before any
-/// instruction reads them (bounded DFS over successors; conservative: an
-/// opcode not proven flag-free counts as a reader).
-fn flags_reset_before_read(func: &MachFunction, from: BlockId) -> bool {
-    let mut visited: HashSet<BlockId> = HashSet::new();
-    let mut work = vec![from];
-    while let Some(b) = work.pop() {
-        if !visited.insert(b) {
-            continue;
-        }
-        let mut resolved = false;
-        for &id in &func.block(b).insts {
-            let op = func.inst(id).opcode;
-            if effects::reads_flags(op) {
-                return false;
-            }
-            if effects::writes_flags(op) {
-                resolved = true;
-                break;
-            }
-            if !flag_free(op) {
-                return false; // unknown flag behavior: fail closed
-            }
-        }
-        if !resolved {
-            let succs = func.block(b).succs.clone();
-            if succs.is_empty() {
-                continue; // path ends without reading flags
-            }
-            work.extend(succs);
-        }
-    }
-    true
-}
-
-/// Opcodes PROVEN not to read or write NZCV (a conservative allowlist for the
-/// exit-path flag walk; anything else is treated as a potential reader).
-fn flag_free(op: AArch64Opcode) -> bool {
-    use AArch64Opcode::*;
-    matches!(
-        op,
-        AddRR
-            | AddRI
-            | SubRR
-            | SubRI
-            | Madd
-            | Msub
-            | Movz
-            | Movk
-            | Movn
-            | MovR
-            | Copy
-            | Sxtw
-            | Uxtw
-            | LslRI
-            | LsrRI
-            | AsrRI
-            | LdrRI
-            | StrRI
-            | LdrbRI
-            | StrbRI
-            | LdrhRI
-            | StrhRI
-            | FaddRR
-            | FsubRR
-            | FmulRR
-            | FdivRR
-            | FmaddRR
-            | FnegRR
-            | B
-            | Ret
-            | Nop
-            | Cbz
-            | Cbnz
-    )
 }
 
 fn iv_def_dominates_preheader(
@@ -986,6 +874,10 @@ fn iv_def_dominates_preheader(
 // ---------------------------------------------------------------------------
 
 fn apply_butterfly(func: &mut MachFunction, rec: &RecognizedButterfly) -> bool {
+    commit(func, |candidate| apply_candidate(candidate, rec))
+}
+
+fn apply_candidate(func: &mut MachFunction, rec: &RecognizedButterfly) -> Option<()> {
     use AArch64Opcode::*;
 
     // Range-pair list (store range x other range), lengths chosen below.
@@ -993,37 +885,39 @@ fn apply_butterfly(func: &mut MachFunction, rec: &RecognizedButterfly) -> bool {
     // Pairs: (A,S1) (A,S2) (A,E) (B,S1) (B,S2) (B,E) (A,B) — 7 x 2 blocks.
     const N_PAIRS: usize = 7;
 
-    let g1 = func.create_block();
-    let g2 = func.create_block();
-    let g3 = func.create_block();
-    let av0 = func.create_block();
-    let cblocks: Vec<BlockId> = (0..2 * N_PAIRS).map(|_| func.create_block()).collect();
-    let vpre = func.create_block();
-    let vh = func.create_block();
-    let vb = func.create_block();
-    let vl = func.create_block();
-    let vxe = func.create_block();
-    let skip = func.create_block();
+    let g1 = func.try_create_block()?;
+    let g2 = func.try_create_block()?;
+    let g3 = func.try_create_block()?;
+    let av0 = func.try_create_block()?;
+    let cblocks: Vec<BlockId> = (0..2 * N_PAIRS)
+        .map(|_| func.try_create_block())
+        .collect::<Option<Vec<_>>>()?;
+    let vpre = func.try_create_block()?;
+    let vh = func.try_create_block()?;
+    let vb = func.try_create_block()?;
+    let vl = func.try_create_block()?;
+    let vxe = func.try_create_block()?;
+    let skip = func.try_create_block()?;
 
     let mut fresh = vec![g1, g2, g3, av0];
     fresh.extend(cblocks.iter().copied());
     fresh.extend([vpre, vh, vb, vl, vxe, skip]);
-    insert_new_blocks_before(func, rec.header, &fresh);
+    insert_new_blocks_before(func, rec.header, &fresh)?;
 
     // --- g1/g2: magnitude gates. Any high bit (bit >= 31) in `bound` or `iv`
     // (negative or >= 2^31) routes to the scalar loop — afterwards both are in
     // [0, 2^31) so `T8 = (bound - iv + 1) * 8 < 2^34` computes exactly.
-    let hi_j = alloc(func, RegClass::Gpr64);
-    emit(func, g1, LsrRI, vec![vreg(hi_j), vreg(rec.bound), imm(31)]);
-    emit(func, g1, Cbnz, vec![vreg(hi_j), block(rec.header)]);
-    emit(func, g1, B, vec![block(g2)]);
+    let hi_j = alloc(func, RegClass::Gpr64)?;
+    emit(func, g1, LsrRI, vec![vreg(hi_j), vreg(rec.bound), imm(31)])?;
+    emit(func, g1, Cbnz, vec![vreg(hi_j), block(rec.header)])?;
+    emit(func, g1, B, vec![block(g2)])?;
     func.add_edge(g1, rec.header);
     func.add_edge(g1, g2);
 
-    let hi_i = alloc(func, RegClass::Gpr64);
-    emit(func, g2, LsrRI, vec![vreg(hi_i), vreg(rec.iv), imm(31)]);
-    emit(func, g2, Cbnz, vec![vreg(hi_i), block(rec.header)]);
-    emit(func, g2, B, vec![block(g3)]);
+    let hi_i = alloc(func, RegClass::Gpr64)?;
+    emit(func, g2, LsrRI, vec![vreg(hi_i), vreg(rec.iv), imm(31)])?;
+    emit(func, g2, Cbnz, vec![vreg(hi_i), block(rec.header)])?;
+    emit(func, g2, B, vec![block(g3)])?;
     func.add_edge(g2, rec.header);
     func.add_edge(g2, g3);
 
@@ -1031,70 +925,70 @@ fn apply_butterfly(func: &mut MachFunction, rec: &RecognizedButterfly) -> bool {
     // `iv < bound` (lanes iv and iv+1 are both iterations the scalar do-while
     // performs). `iv >= bound` (including the impossible-but-unproven
     // single-trip `iv == bound` and empty shapes) => untouched scalar loop.
-    emit(func, g3, CmpRR, vec![vreg(rec.iv), vreg(rec.bound)]);
-    emit(func, g3, BCond, vec![imm(CC_GE), block(rec.header)]);
-    emit(func, g3, B, vec![block(av0)]);
+    emit(func, g3, CmpRR, vec![vreg(rec.iv), vreg(rec.bound)])?;
+    emit(func, g3, BCond, vec![imm(CC_GE), block(rec.header)])?;
+    emit(func, g3, B, vec![block(av0)])?;
     func.add_edge(g3, rec.header);
     func.add_edge(g3, av0);
 
     // --- av0: range starts + lengths.
     // T8 = (bound - iv + 1) * 8 — exact (see g1/g2), the byte length of every
     // array range: lane i in [iv, bound] touches [start + (i-iv)*8, +8).
-    let t = alloc(func, RegClass::Gpr64);
+    let t = alloc(func, RegClass::Gpr64)?;
     emit(
         func,
         av0,
         SubRR,
         vec![vreg(t), vreg(rec.bound), vreg(rec.iv)],
-    );
-    let t1 = alloc(func, RegClass::Gpr64);
-    emit(func, av0, AddRI, vec![vreg(t1), vreg(t), imm(1)]);
-    let t8 = alloc(func, RegClass::Gpr64);
-    emit(func, av0, LslRI, vec![vreg(t8), vreg(t1), imm(3)]);
-    let e8 = alloc(func, RegClass::Gpr64);
-    emit(func, av0, Movz, vec![vreg(e8), imm(ELEM_BYTES)]);
+    )?;
+    let t1 = alloc(func, RegClass::Gpr64)?;
+    emit(func, av0, AddRI, vec![vreg(t1), vreg(t), imm(1)])?;
+    let t8 = alloc(func, RegClass::Gpr64)?;
+    emit(func, av0, LslRI, vec![vreg(t8), vreg(t1), imm(3)])?;
+    let e8 = alloc(func, RegClass::Gpr64)?;
+    emit(func, av0, Movz, vec![vreg(e8), imm(ELEM_BYTES)])?;
 
     // Range start of an iv-rooted stream at the CURRENT iv (= i0 here):
     // base + Σ inv*8 + iv*8 (mod 2^64 — the same arithmetic the scalar loop's
     // Madd chains perform, so the range is exactly its access set).
-    let start_of = |func: &mut MachFunction, blk: BlockId, r: &StreamRecipe| -> VReg {
+    let address_of = |func: &mut MachFunction, blk: BlockId, r: &StreamRecipe| -> Option<VReg> {
         let mut cur = r.base;
         for inv in &r.invs {
-            let n = alloc(func, RegClass::Gpr64);
+            let n = alloc(func, RegClass::Gpr64)?;
             emit(
                 func,
                 blk,
                 Madd,
                 vec![vreg(n), vreg(*inv), vreg(rec.es), vreg(cur)],
-            );
+            )?;
             cur = n;
         }
-        let n = alloc(func, RegClass::Gpr64);
+        let n = alloc(func, RegClass::Gpr64)?;
         emit(
             func,
             blk,
             Madd,
             vec![vreg(n), vreg(rec.iv), vreg(rec.es), vreg(cur)],
-        );
-        n
+        )?;
+        Some(n)
     };
-    let s_a = start_of(func, av0, &rec.sa);
-    let s_b = start_of(func, av0, &rec.sb);
-    let s_1 = start_of(func, av0, &rec.s1);
-    let s_2 = start_of(func, av0, &rec.s2);
+    let s_a = address_of(func, av0, &rec.sa)?;
+    let s_b = address_of(func, av0, &rec.sb)?;
+    let s_1 = address_of(func, av0, &rec.s1)?;
+    let s_2 = address_of(func, av0, &rec.s2)?;
     let s_e = if rec.e_off == 0 {
         rec.e_root
     } else {
-        let n = alloc(func, RegClass::Gpr64);
+        let n = alloc(func, RegClass::Gpr64)?;
         emit(
             func,
             av0,
             AddRI,
             vec![vreg(n), vreg(rec.e_root), imm(rec.e_off)],
-        );
+        )?;
         n
     };
-    emit(func, av0, B, vec![block(cblocks[0])]);
+    emit(func, av0, B, vec![block(cblocks[0])])?;
     func.add_edge(av0, cblocks[0]);
 
     // --- Disjointness chain. Ranges [x, x+Lx) and [y, y+Ly) (byte sets mod
@@ -1119,19 +1013,19 @@ fn apply_butterfly(func: &mut MachFunction, rec: &RecognizedButterfly) -> bool {
         } else {
             vpre
         };
-        let d1 = alloc(func, RegClass::Gpr64);
-        emit(func, c1, SubRR, vec![vreg(d1), vreg(*y), vreg(*x)]);
-        emit(func, c1, CmpRR, vec![vreg(d1), vreg(*lx)]);
-        emit(func, c1, BCond, vec![imm(CC_LO), block(rec.header)]);
-        emit(func, c1, B, vec![block(c2)]);
+        let d1 = alloc(func, RegClass::Gpr64)?;
+        emit(func, c1, SubRR, vec![vreg(d1), vreg(*y), vreg(*x)])?;
+        emit(func, c1, CmpRR, vec![vreg(d1), vreg(*lx)])?;
+        emit(func, c1, BCond, vec![imm(CC_LO), block(rec.header)])?;
+        emit(func, c1, B, vec![block(c2)])?;
         func.add_edge(c1, rec.header);
         func.add_edge(c1, c2);
 
-        let d2 = alloc(func, RegClass::Gpr64);
-        emit(func, c2, SubRR, vec![vreg(d2), vreg(*x), vreg(*y)]);
-        emit(func, c2, CmpRR, vec![vreg(d2), vreg(*ly)]);
-        emit(func, c2, BCond, vec![imm(CC_LO), block(rec.header)]);
-        emit(func, c2, B, vec![block(next)]);
+        let d2 = alloc(func, RegClass::Gpr64)?;
+        emit(func, c2, SubRR, vec![vreg(d2), vreg(*x), vreg(*y)])?;
+        emit(func, c2, CmpRR, vec![vreg(d2), vreg(*ly)])?;
+        emit(func, c2, BCond, vec![imm(CC_LO), block(rec.header)])?;
+        emit(func, c2, B, vec![block(next)])?;
         func.add_edge(c2, rec.header);
         func.add_edge(c2, next);
     }
@@ -1139,148 +1033,127 @@ fn apply_butterfly(func: &mut MachFunction, rec: &RecognizedButterfly) -> bool {
     // --- vpre: hoisted twiddle broadcasts (licensed: E is disjoint from both
     // store ranges, and the scalar loop's first iteration — which runs on
     // every path reaching here, `iv < bound` — performs these exact reads).
-    let er = alloc(func, RegClass::Fpr32);
+    let er = alloc(func, RegClass::Fpr32)?;
     emit(
         func,
         vpre,
         LdrRI,
         vec![vreg(er), vreg(rec.e_root), imm(rec.e_off)],
-    );
-    let ei = alloc(func, RegClass::Fpr32);
+    )?;
+    let ei = alloc(func, RegClass::Fpr32)?;
     emit(
         func,
         vpre,
         LdrRI,
         vec![vreg(ei), vreg(rec.e_root), imm(rec.e_off + 4)],
-    );
-    let ver = alloc(func, RegClass::Fpr128);
+    )?;
+    let ver = alloc(func, RegClass::Fpr128)?;
     emit(
         func,
         vpre,
         NeonDupElem,
         vec![vreg(ver), vreg(er), imm(0), imm(ELEM_S)],
-    );
-    let vei = alloc(func, RegClass::Fpr128);
+    )?;
+    let vei = alloc(func, RegClass::Fpr128)?;
     emit(
         func,
         vpre,
         NeonDupElem,
         vec![vreg(vei), vreg(ei), imm(0), imm(ELEM_S)],
-    );
+    )?;
     // MASK = [0x8000_0000, 0, 0x8000_0000, 0] (.4S view): DUP.2D of the GPR
     // 0x0000_0000_8000_0000 — each 64-bit lane's LOW word is the f32 sign bit.
-    let mk16 = alloc(func, RegClass::Gpr64);
-    emit(func, vpre, Movz, vec![vreg(mk16), imm(0x8000)]);
-    let mk = alloc(func, RegClass::Gpr64);
-    emit(func, vpre, LslRI, vec![vreg(mk), vreg(mk16), imm(16)]);
-    let vmask = alloc(func, RegClass::Fpr128);
+    let mk16 = alloc(func, RegClass::Gpr64)?;
+    emit(func, vpre, Movz, vec![vreg(mk16), imm(0x8000)])?;
+    let mk = alloc(func, RegClass::Gpr64)?;
+    emit(func, vpre, LslRI, vec![vreg(mk), vreg(mk16), imm(16)])?;
+    let vmask = alloc(func, RegClass::Fpr128)?;
     emit(
         func,
         vpre,
         NeonDupGen,
         vec![vreg(vmask), vreg(mk), imm(ELEM_D)],
-    );
+    )?;
     // WALKING POINTERS: each stream's address is materialized ONCE at the
     // entry `iv` (= i0) and then advanced by the POST-INDEX `LD1`/`ST1`
     // (+16 bytes = one complex pair per iteration, exactly `iv += 2` in step —
     // the pointer registers are loop-carried and stay in lock-step with the
     // guard's `iv`). Each stream gets its OWN register: the post-index is a
     // tied use-def, so no chain value is ever reused after being bumped.
-    let addr_of = |func: &mut MachFunction, r: &StreamRecipe| -> VReg {
-        let mut cur = r.base;
-        for inv in &r.invs {
-            let n = alloc(func, RegClass::Gpr64);
-            emit(
-                func,
-                vpre,
-                Madd,
-                vec![vreg(n), vreg(*inv), vreg(rec.es), vreg(cur)],
-            );
-            cur = n;
-        }
-        let n = alloc(func, RegClass::Gpr64);
-        emit(
-            func,
-            vpre,
-            Madd,
-            vec![vreg(n), vreg(rec.iv), vreg(rec.es), vreg(cur)],
-        );
-        n
-    };
-    let p1 = addr_of(func, &rec.s1);
-    let p2 = addr_of(func, &rec.s2);
-    let pa = addr_of(func, &rec.sa);
-    let pb = addr_of(func, &rec.sb);
-    emit(func, vpre, B, vec![block(vh)]);
+    let p1 = address_of(func, vpre, &rec.s1)?;
+    let p2 = address_of(func, vpre, &rec.s2)?;
+    let pa = address_of(func, vpre, &rec.sa)?;
+    let pb = address_of(func, vpre, &rec.sb)?;
+    emit(func, vpre, B, vec![block(vh)])?;
     func.add_edge(vpre, vh);
 
     // --- vh: `iv < bound` (signed; both stay in [0, 2^31+1) on this path)
     // admits lanes {iv, iv+1} — both iterations the scalar do-while performs.
-    emit(func, vh, CmpRR, vec![vreg(rec.iv), vreg(rec.bound)]);
-    emit(func, vh, BCond, vec![imm(CC_LT), block(vb)]);
-    emit(func, vh, B, vec![block(vxe)]);
+    emit(func, vh, CmpRR, vec![vreg(rec.iv), vreg(rec.bound)])?;
+    emit(func, vh, BCond, vec![imm(CC_LT), block(vb)])?;
+    emit(func, vh, B, vec![block(vxe)])?;
     func.add_edge(vh, vb);
     func.add_edge(vh, vxe);
 
     // --- vb: one complex PAIR per iteration on the walking pointers.
-    let q1 = alloc(func, RegClass::Fpr128);
-    emit(func, vb, NeonLd1Post, vec![vreg(q1), vreg(p1), imm(ARR_S4)]);
-    let q2 = alloc(func, RegClass::Fpr128);
-    emit(func, vb, NeonLd1Post, vec![vreg(q2), vreg(p2), imm(ARR_S4)]);
+    let q1 = alloc(func, RegClass::Fpr128)?;
+    emit(func, vb, NeonLd1Post, vec![vreg(q1), vreg(p1), imm(ARR_S4)])?;
+    let q2 = alloc(func, RegClass::Fpr128)?;
+    emit(func, vb, NeonLd1Post, vec![vreg(q2), vreg(p2), imm(ARR_S4)])?;
     // sum -> A store.
-    let vsum = alloc(func, RegClass::Fpr128);
+    let vsum = alloc(func, RegClass::Fpr128)?;
     emit(
         func,
         vb,
         NeonFaddV,
         vec![vreg(vsum), vreg(q1), vreg(q2), imm(FARR_S4)],
-    );
+    )?;
     emit(
         func,
         vb,
         NeonSt1Post,
         vec![vreg(vsum), vreg(pa), imm(ARR_S4)],
-    );
+    )?;
     // diff, pair-swap, sign-flip (the scalar FNEG on the di lanes), twiddle.
-    let vd = alloc(func, RegClass::Fpr128);
+    let vd = alloc(func, RegClass::Fpr128)?;
     emit(
         func,
         vb,
         NeonFsubV,
         vec![vreg(vd), vreg(q1), vreg(q2), imm(FARR_S4)],
-    );
-    let vsw = alloc(func, RegClass::Fpr128);
-    emit(func, vb, NeonRev64V, vec![vreg(vsw), vreg(vd), imm(ARR_S4)]);
-    let vsg = alloc(func, RegClass::Fpr128);
-    emit(func, vb, NeonEorV, vec![vreg(vsg), vreg(vsw), vreg(vmask)]);
-    let vm = alloc(func, RegClass::Fpr128);
+    )?;
+    let vsw = alloc(func, RegClass::Fpr128)?;
+    emit(func, vb, NeonRev64V, vec![vreg(vsw), vreg(vd), imm(ARR_S4)])?;
+    let vsg = alloc(func, RegClass::Fpr128)?;
+    emit(func, vb, NeonEorV, vec![vreg(vsg), vreg(vsw), vreg(vmask)])?;
+    let vm = alloc(func, RegClass::Fpr128)?;
     emit(
         func,
         vb,
         NeonFmulV,
         vec![vreg(vm), vreg(vei), vreg(vsg), imm(FARR_S4)],
-    );
+    )?;
     // FMLA is a tied read-modify-write: copy the addend into a fresh Vd.
-    let vres = alloc(func, RegClass::Fpr128);
-    emit(func, vb, NeonOrrV, vec![vreg(vres), vreg(vm), vreg(vm)]);
+    let vres = alloc(func, RegClass::Fpr128)?;
+    emit(func, vb, NeonOrrV, vec![vreg(vres), vreg(vm), vreg(vm)])?;
     emit(
         func,
         vb,
         NeonFmlaV,
         vec![vreg(vres), vreg(ver), vreg(vd), imm(FARR_S4)],
-    );
+    )?;
     emit(
         func,
         vb,
         NeonSt1Post,
         vec![vreg(vres), vreg(pb), imm(ARR_S4)],
-    );
-    emit(func, vb, B, vec![block(vl)]);
+    )?;
+    emit(func, vb, B, vec![block(vl)])?;
     func.add_edge(vb, vl);
 
     // --- vl: advance the induction by one complex PAIR.
-    emit(func, vl, AddRI, vec![vreg(rec.iv), vreg(rec.iv), imm(2)]);
-    emit(func, vl, B, vec![block(vh)]);
+    emit(func, vl, AddRI, vec![vreg(rec.iv), vreg(rec.iv), imm(2)])?;
+    emit(func, vl, B, vec![block(vh)])?;
     func.add_edge(vl, vh);
 
     // --- vxe: `iv ∈ {bound, bound+1}` here. `iv == bound` => ONE leftover
@@ -1289,28 +1162,24 @@ fn apply_butterfly(func: &mut MachFunction, rec: &RecognizedButterfly) -> bool {
     // SKIPPED (it would store one past the end — the remainder-0 class);
     // `skip` materializes the exit live-out `ivs = iv` (= bound+1 — exactly
     // the value the scalar exit computes) and branches to the true exit.
-    emit(func, vxe, CmpRR, vec![vreg(rec.iv), vreg(rec.bound)]);
-    emit(func, vxe, BCond, vec![imm(CC_GT), block(skip)]);
-    emit(func, vxe, B, vec![block(rec.header)]);
+    emit(func, vxe, CmpRR, vec![vreg(rec.iv), vreg(rec.bound)])?;
+    emit(func, vxe, BCond, vec![imm(CC_GT), block(skip)])?;
+    emit(func, vxe, B, vec![block(rec.header)])?;
     func.add_edge(vxe, skip);
     func.add_edge(vxe, rec.header);
 
-    emit(func, skip, MovR, vec![vreg(rec.ivs), vreg(rec.iv)]);
-    emit(func, skip, B, vec![block(rec.exit)]);
+    emit(func, skip, MovR, vec![vreg(rec.ivs), vreg(rec.iv)])?;
+    emit(func, skip, B, vec![block(rec.exit)])?;
     func.add_edge(skip, rec.exit);
 
     // --- COMMIT: route the preheader into the gate chain.
-    if !rewrite_block_target(func.inst_mut(rec.preheader_term), rec.header, g1) {
-        return false;
-    }
-    remove_cfg_edge(func, rec.preheader, rec.header);
-    func.add_edge(rec.preheader, g1);
+    splice_edge(func, rec.preheader, rec.preheader_term, rec.header, g1)?;
 
-    true
+    Some(())
 }
 
 // ---------------------------------------------------------------------------
-// Small local IR helpers (kept independent of the sibling NEON passes)
+// Local operand/recognition helpers; checked mutation lives in candidate.rs
 // ---------------------------------------------------------------------------
 
 fn vreg(v: VReg) -> MachOperand {
@@ -1321,87 +1190,6 @@ fn imm(v: i64) -> MachOperand {
 }
 fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
-}
-
-fn emit(
-    func: &mut MachFunction,
-    b: BlockId,
-    op: AArch64Opcode,
-    operands: Vec<MachOperand>,
-) -> InstId {
-    let id = func.push_inst(MachInst::new(op, operands));
-    func.append_inst(b, id);
-    id
-}
-
-fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
-    // Allocate a vreg id strictly greater than every id currently in use so we
-    // never alias an existing value.
-    let max_existing = func
-        .insts
-        .iter()
-        .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
-        .map(|v| v.id)
-        .max()
-        .unwrap_or(0);
-    let mut id = func.alloc_vreg();
-    while id <= max_existing {
-        id = func.alloc_vreg();
-    }
-    VReg::new(id, class)
-}
-
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    crate::effects::build_reaching_def_map(func)
-}
-
-fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
-    for (idx, block) in func.blocks.iter().enumerate() {
-        if block.insts.contains(&target) {
-            return Some(BlockId(idx as u32));
-        }
-    }
-    None
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|op| match op {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
-}
-
-fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
-    let mut changed = false;
-    for op in &mut inst.operands {
-        if matches!(op, MachOperand::Block(b) if *b == old) {
-            *op = MachOperand::Block(new);
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn remove_cfg_edge(func: &mut MachFunction, from: BlockId, to: BlockId) {
-    func.block_mut(from).succs.retain(|&s| s != to);
-    func.block_mut(to).preds.retain(|&p| p != from);
-}
-
-fn insert_new_blocks_before(func: &mut MachFunction, before: BlockId, new_blocks: &[BlockId]) {
-    let mut reordered = Vec::with_capacity(func.block_order.len() + new_blocks.len());
-    for &b in &func.block_order {
-        if b == before {
-            reordered.extend(new_blocks.iter().copied());
-        }
-        if !new_blocks.contains(&b) {
-            reordered.push(b);
-        }
-    }
-    func.block_order = reordered;
 }
 
 #[cfg(test)]

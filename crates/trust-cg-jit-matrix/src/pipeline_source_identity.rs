@@ -12,6 +12,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[path = "pipeline_watch_plan.rs"]
+mod pipeline_watch_plan;
+use pipeline_watch_plan::compact_recursive_watches;
+
 /// Local Rust crates in the executable-buffer production and admission path.
 pub const PIPELINE_CRATES: &[&str] = &[
     "trust-cg-jit-matrix",
@@ -42,7 +46,7 @@ const PIPELINE_FILES: &[&str] = &[
     "third_party/vendor/drat-trim/drat-trim.c",
 ];
 
-/// The identity and every file/directory Cargo must watch to keep it current.
+/// The identity and recursive roots/standalone files Cargo must watch to keep it current.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineSourceIdentity {
     pub hex: String,
@@ -125,8 +129,7 @@ pub fn compute_pipeline_source_identity(
             .map(|byte| format!("{byte:02x}"))
             .collect();
     }
-    identity.watched_paths.sort();
-    identity.watched_paths.dedup();
+    compact_recursive_watches(&mut identity.watched_paths);
     Ok(identity)
 }
 
@@ -150,8 +153,7 @@ fn compute_clean_source_identity(root: &Path) -> io::Result<PipelineSourceIdenti
     }
     let mut identity = compute_source_identity(root, &trees, &files)?;
     identity.watched_paths.extend(crate_roots);
-    identity.watched_paths.sort();
-    identity.watched_paths.dedup();
+    compact_recursive_watches(&mut identity.watched_paths);
     Ok(identity)
 }
 
@@ -171,8 +173,7 @@ fn compute_trust_ir_source_identity(root: &Path) -> io::Result<PipelineSourceIde
     }
     let mut identity = compute_source_identity(root, &trees, &files)?;
     identity.watched_paths.extend(crate_roots);
-    identity.watched_paths.sort();
-    identity.watched_paths.dedup();
+    compact_recursive_watches(&mut identity.watched_paths);
     Ok(identity)
 }
 
@@ -205,8 +206,7 @@ pub fn compute_source_identity(
         relative_key(workspace_root, left).cmp(&relative_key(workspace_root, right))
     });
     hashed_files.dedup();
-    watched_paths.sort();
-    watched_paths.dedup();
+    compact_recursive_watches(&mut watched_paths);
 
     let mut hasher = Sha256::new();
     hasher.update(b"trust-cg.machine-code-pipeline.source-identity.v2\0");

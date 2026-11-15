@@ -1,0 +1,36 @@
+diff --git a/crates/rustc-codegen-trust-cg/src/lib.rs b/crates/rustc-codegen-trust-cg/src/lib.rs
+index f7221ec3d..4095492ee 100644
+--- a/crates/rustc-codegen-trust-cg/src/lib.rs
++++ b/crates/rustc-codegen-trust-cg/src/lib.rs
+@@ -12579,7 +12579,9 @@ fn mir_to_trust_ir_for_body_with_cells<'tcx>(
+     // They stay SEPARATE (rather than only the union being kept) because they
+     // drive different allocations: `backed` feeds `memory_backed_local_layout`
+     // into `ctx.memory_slots`, `cells` feeds `memory_scalar_leaf_ty` into
+-    // `ctx.scalar_cells`, and a local in BOTH correctly receives both allocas.
++    // `ctx.scalar_cells`. A closure with an aggregate home must not also get a
++    // scalar cell: its incoming value initializes the aggregate home, while a
++    // captured borrow would otherwise address an uninitialized second home.
+     // Dead `format!`/`write!`-feeder locals (the `&value` refs, the args tuple,
+     // the `[Argument; N]` array, the `fmt::Arguments` value). Their assignments
+     // are skipped by `lower_statement`. Computed once per function, and computed
+@@ -12596,6 +12598,20 @@ fn mir_to_trust_ir_for_body_with_cells<'tcx>(
+     // the loop-carried scalar phi machinery: their identity is the stable cell
+     // pointer, not an SSA value threaded through block parameters.
+     let mut scalar_cell_only = compute_scalar_cell_locals(&ctx, body)?;
++    if ctx.tcx.sess.target.arch.desc() == "aarch64"
++        && ctx.tcx.sess.target.os == rustc_target::spec::Os::Linux
++    {
++        // A one-capture closure can also satisfy memory_scalar_leaf_ty. Keep
++        // its canonical environment slot for both direct calls and captures by
++        // another closure, including a generic function's by-value parameter.
++        scalar_cell_only.retain(|local| {
++            !memory_backed_only.contains(local)
++                || !matches!(
++                    ctx.monomorphize_ty(local_rust_ty(&ctx, body, *local)).kind(),
++                    ty::Closure(..)
++                )
++        });
++    }
+     // The SSA-071 cell retry's extra cells (empty on a first attempt). Only
+     // `ssa071_cell_retry_candidates`-vetted primitive integer / bool / char locals
+     // reach here, so `allocate_memory_slots` (`memory_scalar_leaf_ty`) accepts every

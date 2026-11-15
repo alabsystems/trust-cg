@@ -7,7 +7,6 @@
 // Production ComputeGraph-to-CoreML emission remains unavailable until TrustIR
 // carries an exact tensor recipe; see COREML_COMPUTE_GRAPH_EMISSION_SUPPORTED.
 //
-// Design doc: designs/2026-04-14-coreml-ane-lowering.md
 // Reference: Apple. "Core ML Model Specification." coremltools documentation.
 // Reference: Apple. "MIL Ops." coremltools source, converters/mil/mil/ops.
 
@@ -160,8 +159,6 @@ impl fmt::Display for MilDataType {
 /// Static tensor shape for MIL operations (NCHW layout).
 ///
 /// All dimensions must be known at compile time for ANE execution.
-/// Mirrors `AneTensorShape` from `ane_semantics.rs` but decoupled from
-/// the SMT encoding layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MilTensorShape {
     /// Batch dimension (N). 1 for non-batched.
@@ -631,11 +628,9 @@ fn op_input_refs(op: &MilOperation) -> Vec<String> {
 
 /// Emits MIL programs from ANE operation descriptors.
 ///
-/// The emitter translates high-level ANE operations (matching those verified
-/// by `ane_semantics.rs`) into MIL SSA operations. The resulting `MilProgram`
-/// can be serialized to protobuf for `.mlmodel` output.
-///
-/// Ref: designs/2026-04-14-coreml-ane-lowering.md
+/// The emitter translates high-level ANE operations into MIL SSA operations.
+/// The resulting `MilProgram` can be serialized to protobuf for `.mlmodel`
+/// output.
 pub struct CoreMLEmitter {
     /// Auto-incrementing counter for SSA value names.
     next_id: u32,
@@ -665,8 +660,6 @@ impl CoreMLEmitter {
     }
 
     /// Emit a matrix multiply operation: `C = matmul(A, B)`.
-    ///
-    /// Corresponds to `encode_ane_gemm()` in `ane_semantics.rs`.
     pub fn emit_matmul(
         &mut self,
         program: &mut MilProgram,
@@ -687,8 +680,6 @@ impl CoreMLEmitter {
     }
 
     /// Emit an element-wise binary operation.
-    ///
-    /// Corresponds to `encode_ane_elementwise()` in `ane_semantics.rs`.
     pub fn emit_elementwise(
         &mut self,
         program: &mut MilProgram,
@@ -707,8 +698,6 @@ impl CoreMLEmitter {
     }
 
     /// Emit an activation function.
-    ///
-    /// Corresponds to `encode_ane_activation()` in `ane_semantics.rs`.
     pub fn emit_activation(
         &mut self,
         program: &mut MilProgram,
@@ -725,8 +714,6 @@ impl CoreMLEmitter {
     }
 
     /// Emit a 2D convolution operation.
-    ///
-    /// Corresponds to `encode_ane_conv2d()` in `ane_semantics.rs`.
     pub fn emit_conv2d(
         &mut self,
         program: &mut MilProgram,

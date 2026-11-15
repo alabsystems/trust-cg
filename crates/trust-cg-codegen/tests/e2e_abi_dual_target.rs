@@ -61,22 +61,25 @@ use trust_ir::{
 /// bare `ret`, as it can for `return i0` where X0 is both input and output.
 fn build_abi_mix_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("abi_mix_test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::F64,
-            Ty::F64,
-        ],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::F64,
+                Ty::F64,
+            ],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     // Name prefixed with `_` per Mach-O / macOS ABI convention (see other tests).
     let mut func = TrustIrFunction::new(FuncId::new(0), "_abi_mix", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -113,7 +116,9 @@ fn build_abi_mix_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -176,8 +181,19 @@ fn compile_for(target: Target, module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .unwrap_or_else(|e| panic!("{:?} compile failed: {}", target, e));
@@ -526,4 +542,13 @@ fn test_abi_dual_target_first_arg_register() {
         "x86-64 should reference rdi/edi (first int arg); got:\n{}",
         x86_disasm
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -3,17 +3,18 @@ source: crates/trust-cg-test/tests/cli.rs
 expression: "help_of(&[\"lint-linux\"])"
 ---
 Cross-compile check for the Linux `#[cfg(target_os = "linux")]` paths in trust-cg-codegen. Runs
-`cargo check --target <T> -p <P>` for each installed Linux target. Missing targets are skipped (they
-are environmental, not a failure) so this subcommand is safe to wire into CI on macOS-only developer
-boxes.
+`targo --unverified check --target <T> -p <P>` for each installed Linux target. Missing targets are
+skipped (they are environmental, not a failure) so this subcommand is safe to wire into CI on
+macOS-only developer boxes.
 
-Installed targets are discovered via `rustup target list --installed`. Install one with e.g. `rustup
-target add x86_64-unknown-linux-gnu`.
+A target is installed when the Trust package's sysroot ships its std (`<trustc --print
+sysroot>/lib/rustlib/<T>/lib`). The Darwin Trust package ships no Linux std today, so both targets
+are skipped there.
 
 Exit codes:
   0 — every installed target compiled (or all targets skipped).
   1 — at least one installed target failed to compile.
-  2 — cargo missing from PATH.
+  2 — targo missing from PATH.
 
 # Examples
 
@@ -47,20 +48,11 @@ Options:
       --package <PACKAGE>
           Package(s) to check. Defaults to `trust-cg-codegen`. Repeatable
 
-      --timeout <SECS>
-          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
-
-      --parallel <N>
-          Worker count (honors cargo-serialization lock). Default: auto
-
   -q, --quiet
-          Suppress progress bars; errors still go to stderr
+          Log errors only (sets the stderr log level to `error`)
 
   -v, --verbose...
           Show debug-level events. Repeat for more: -vv, -vvv
-
-      --no-cache
-          Ignore proof / corpus caches
 
       --dry-run
           Print what would run without executing external tools

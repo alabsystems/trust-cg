@@ -1,4 +1,4 @@
-// trust-cg-opt - SOUND aarch64 scalar matmul 1D register-blocking (T=8) fast-path
+// trust-cg-opt - fail-closed aarch64 scalar matmul 1D register-blocking (T=12 or 8) fast-path
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -21,7 +21,8 @@
 //! where `a`, `b`, `c` are three DISTINCT stack-local arrays (`AddPCRel(sp,
 //! StackSlot)` bases with pairwise-distinct slot ids), `a`/`b` are read-only in
 //! the nest and `c`'s ONLY store is `c[i*N+j]`, `N` is a compile-time constant
-//! that is an exact multiple of the tile `T=8`, and the common array length `L`
+//! that is an exact multiple of the tile `T` (12, else 8: see [`tile_for`]),
+//! and the common array length `L`
 //! (from the surviving `idx <u L` bounds checks) satisfies `L >= N*N` so every
 //! tiled index is provably in-bounds WITHOUT a per-access check.
 //!
@@ -30,12 +31,12 @@
 //! It splices, in FRONT of the untouched checked nest (kept as the fallback,
 //! reached on a runtime guard, so `mac-row-unroll` still fires on it), a
 //! CHECK-FREE register-blocked fast path that interchanges the `k` and `j`
-//! loops and keeps a tile of `T=8` `c` accumulators in registers across the
+//! loops and keeps a tile of `T` `c` accumulators in registers across the
 //! whole `k`-loop:
 //!
 //! ```text
 //! for i in 0..N {
-//!   for jt in (0..N step T) {                  // T=8 exact tiles
+//!   for jt in (0..N step T) {                  // exact tiles, T = 12 or 8
 //!     let mut acc[0..T] = c[i*N + jt .. i*N + jt + T];   // T loads
 //!     for k in 0..N {
 //!       let aik = a[i*N + k];
@@ -83,7 +84,12 @@
 //! base) encodes equally well and computes the same values, but chains every
 //! subsequent load behind the base write and measured ~2.5% slower.
 //!
-//! ## Why this is SOUND
+//! ## Why the rewrite preserves the nest (informal argument)
+//!
+//! This is the argument the recognizer's guards discharge by construction; it
+//! is not a machine-checked proof. The executed evidence is the native
+//! on/off/C-reference differential
+//! `trust-cg-codegen/tests/e2e_aarch64_mac_reg_block_differential.rs`.
 //!
 //! 1. **Same values, k-order preserved.** For each fixed `(i, j=jt+m)` the fast
 //!    path computes `acc = c[i*N+j] + sum_{k=0}^{N-1} a[i*N+k]*b[k*N+j]`,
@@ -103,7 +109,14 @@
 //!    is `<= (N-1)*N + (N-1) = N*N-1 < L`. All three facts are compile-time
 //!    constants at recognition, so the fast path needs no per-access bounds
 //!    check; the loop-bound guards `i<N`, `jt<N`, `k<N` are the ordinary loop
-//!    structure.
+//!    structure. EVERY bounds check in the nest, the k-loop's `a[i*N+k]`
+//!    check included, must compare a recognized index against a length
+//!    `>= N*N`, and each backing stack slot must hold `N*N` 8-byte elements
+//!    (`review_bar`). Each recognized index is defined in a non-header block
+//!    of its own loop, before the check on every path and in the same loop,
+//!    so the compared value is `x*N + y` of the current iteration's counters
+//!    (both `< N`, since the header test passed): no check the fast path
+//!    skips can fail, and no unchecked access leaves its slot.
 //! 4. **Additive + guarded fallback.** The checked nest is left byte-for-byte
 //!    intact; only new blocks are spliced before it and the i-loop preheader
 //!    terminator is redirected (at a final COMMIT) to a guard that dispatches to
@@ -117,12 +130,31 @@
 //!    def/def-use operand roles (`effects::fill_operand_roles`); `LdpRI` is in
 //!    any case what `mem-pair-formation` already folded this loop's `LdrRI`
 //!    pairs into. No division, no new emittable opcode in the backend.
+//! 5. **Nothing else observable (publication review bar, `review_bar`).**
+//!    Every transferred and multiplied value is a 64-bit GPR (data width, not
+//!    just stride). Every conditional branch in the nest is a counted-loop
+//!    header test or one of the passing bounds checks above, and each header
+//!    leaves exactly to its parent loop, so the scalar nest has no early exit
+//!    or conditional store the fast path would skip (mandatory control flow).
+//!    A header runs once more than its body, with the counter at `N`, so it
+//!    may hold only copies, the counter compare and its branches; every
+//!    recognized index, address, load, multiply-add and the store sits in a
+//!    non-header block of its own loop, so each runs exactly once per
+//!    iteration the fast path replays. Every single-definition value the
+//!    nest reads is defined on every path before the read. Each loop counter
+//!    is reset to 0 once per parent iteration, and is read only inside its
+//!    own loop and never after its latch step. No vreg the nest writes is
+//!    live into the nest exit, so skipping the scalar nest bypasses no
+//!    live-out; NZCV at the exit is `cmp N, N` on both paths. The nest
+//!    touches no physical register, stack-slot or special operand.
 //!
 //! Default-ON at O2/O3 (never O0/O1). Compile-time kill switch:
 //! `TCG_NO_MAC_REG_BLOCK`. Per-pass bisect:
 //! `TRUST_CG_DISABLE_PASSES=mac_reg_block`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::LoopLocality;
+use crate::mach_util::{branch_targets, copied_const, copy_like, strip_copies};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, StackSlotId,
@@ -133,8 +165,11 @@ use crate::dom::DomTree;
 use crate::loops::LoopAnalysis;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
+mod review_bar;
 #[cfg(test)]
 mod tests;
+
+use review_bar::NestReject;
 
 /// AArch64 condition code for unsigned lower (`LO`) — the native forward
 /// `iv < N` continue test (accepted alongside `LT`).
@@ -147,9 +182,29 @@ const CC_HS: i64 = 2;
 /// AArch64 condition code for not-equal (`NE`) — the fallback dispatch guard.
 const CC_NE: i64 = 1;
 
-/// Register-block tile width. Eight `c` accumulators held in registers across
-/// the `k`-loop (the shippable 1D T=8).
-const TILE: i64 = 8;
+/// Register-block tile widths, widest first: the number of `c` accumulators
+/// held in registers across the `k`-loop.
+///
+/// Twelve lanes keep 18 values live in the k-loop (12 accumulators, `aik`,
+/// two `b` lanes, the `a` and `b` pointers and `k`), inside the allocator's
+/// 25 allocatable GPRs with room for the outer loop's values. In the
+/// writeback shape the k-loop is `T/2` pair loads, `T` multiply-adds, the
+/// `a` load and three loop instructions: 22 per 12 multiply-adds against 16
+/// per 8. On p4_matmul (N = 24, Apple M4 Max, min of 7 runs) that is 566M
+/// instead of 610M instructions retired and 116.3M instead of 119.8M cycles
+/// (LLVM -O3: 524.6M, 115.7M). A 16-accumulator tile pair measured slower
+/// on p4_matmul: it pushed the outer induction values into frame spills
+/// (docs/archive/compile-time-attribution-2026-07-25.md, 2026-08-13).
+const TILES: [i64; 2] = [12, 8];
+
+/// The narrowest tile: every admitted `N` is at least this.
+const MIN_TILE: i64 = 8;
+
+/// The tile width for `N`: the widest of [`TILES`] that divides `N` exactly
+/// (the fast path has no remainder tile), or `None`.
+fn tile_for(n: i64) -> Option<i64> {
+    TILES.into_iter().find(|&tile| n >= tile && n % tile == 0)
+}
 
 /// Compile-time kill switch: set `TCG_NO_MAC_REG_BLOCK` (any value) to disable
 /// the pass (run() is a no-op). Default ON at O2/O3.
@@ -157,8 +212,12 @@ fn mrb_enabled() -> bool {
     crate::env_lock::var_os("TCG_NO_MAC_REG_BLOCK").is_none()
 }
 
+/// Cached `TRUST_CG_DUMP_MRB` dump gate — a pure diagnostic that selects only
+/// whether `eprintln!`s fire, read from inside per-block/per-loop walks.
 fn dumping() -> bool {
-    std::env::var("TRUST_CG_DUMP_MRB").is_ok()
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TRUST_CG_DUMP_MRB").is_ok())
 }
 
 /// Whether any live block contains the opcode every recognized MAC nest needs.
@@ -242,7 +301,7 @@ impl MacRegBlock {
         let mut plan = None;
         // One whole-arena def map for the sweep; the scan is read-only (it
         // breaks on the first recognition, and the plan is applied after).
-        let def_map = build_def_map(func);
+        let def_map = crate::effects::build_reaching_def_map(func);
         for lp in loops.all_loops() {
             // Only consider a loop that is the innermost (j) loop.
             let is_innermost = loops
@@ -251,7 +310,7 @@ impl MacRegBlock {
             if !is_innermost {
                 continue;
             }
-            if let Some(rec) = Recognized::recognize(func, dom, &def_map, loops, lp.header) {
+            if let Ok(rec) = Recognized::recognize(func, dom, &def_map, loops, lp.header) {
                 plan = Some(rec);
                 break;
             }
@@ -264,7 +323,7 @@ impl MacRegBlock {
             if dumping() {
                 eprintln!(
                     "[mac-reg-block] fn={} register-blocked (T={})",
-                    func.name, TILE
+                    func.name, rec.tile
                 );
             }
             true
@@ -286,8 +345,10 @@ struct Recognized {
     i_header: BlockId,
     /// The block control leaves the i-loop to (the non-body successor).
     exit_target: BlockId,
-    /// Compile-time bound `N` (`>= TILE`, `N % TILE == 0`, `<= u32::MAX`).
+    /// Compile-time bound `N` (`>= tile`, `N % tile == 0`, `<= u32::MAX`).
     n_const: i64,
+    /// Tile width (accumulators per tile), from [`tile_for`].
+    tile: i64,
     /// The loop-invariant register holding `N` (reused as a `madd` multiplier
     /// and the guard bound).
     n_reg: VReg,
@@ -297,9 +358,22 @@ struct Recognized {
     a_base: VReg,
     b_base: VReg,
     c_base: VReg,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// no register but proven pass-through carriers, handing off only at the nest exit. The plan
+    /// cannot be built without it.
+    _locality: LoopLocality,
 }
 
 impl Recognized {
+    /// Recognize the nest whose innermost (`j`) loop is headed by `j_header`.
+    ///
+    /// Every structural mismatch is [`NestReject::Shape`]; each publication
+    /// review-bar condition (data width, array bounds, mandatory control
+    /// flow, bypassed live-outs) and each closed-world/aliasing condition has
+    /// its own named [`NestReject`] so the unit tests pin WHICH guard refused.
+    /// Where an earlier guard refuses every input a later one would (the
+    /// bounds-check premise behind [`NestReject::HeaderWork`]), the unit tests
+    /// also call the later check directly.
     #[allow(clippy::too_many_lines)]
     fn recognize(
         func: &MachFunction,
@@ -307,18 +381,29 @@ impl Recognized {
         def: &HashMap<u32, InstId>,
         loops: &LoopAnalysis,
         j_header: BlockId,
-    ) -> Option<Self> {
+    ) -> Result<Self, NestReject> {
         let dump = dumping();
         macro_rules! bail {
             ($($t:tt)*) => {{
                 if dump {
                     eprintln!("[mac-reg-block] bail@{}: {}", func.name, format!($($t)*));
                 }
-                return None;
+                return Err(NestReject::Shape);
+            }};
+        }
+        macro_rules! reject {
+            ($reason:expr) => {{
+                let reason: NestReject = $reason;
+                if dump {
+                    eprintln!("[mac-reg-block] reject@{}: {}", func.name, reason);
+                }
+                return Err(reason);
             }};
         }
 
-        let j_loop = loops.get_loop(j_header)?;
+        let Some(j_loop) = loops.get_loop(j_header) else {
+            bail!("no loop headed by {:?}", j_header);
+        };
         let j_body = &j_loop.body;
         let Some(j_latch) = single_latch(func, j_header, j_body) else {
             bail!("j-loop has no single latch");
@@ -331,16 +416,18 @@ impl Recognized {
         // measured at ~99% of eight sibling passes this session.
 
         // ---- (1) inner MAC recognition (the `c[i*N+j] += aik*b[k*N+j]` shape).
-        let Some(inner) = recognize_inner_mac(func, dom, j_header, j_latch, j_body, j_pre, &def)
+        let Some(inner) = recognize_inner_mac(func, dom, j_header, j_latch, j_body, j_pre, def)
         else {
             bail!("inner MAC j-loop not recognized");
         };
 
         // ---- (1b) the j-loop itself must be a clean `0..N` unit-stride counted
         // loop over the recognized j iv (my fast path replays j = 0..N-1).
-        if !verify_counted_0_n(func, &def, j_body, j_header, inner.iv, inner.n_const, dump) {
+        let Some(j_counter) =
+            verify_counted_0_n(func, def, j_body, j_header, inner.iv, inner.n_const, dump)
+        else {
             bail!("j-loop is not a clean 0..N counted loop");
-        }
+        };
 
         // ---- (2) k-loop = parent of the j-loop. Verify k is a clean `0..N`
         // counted loop over the recognized k, the read-only `a[i*N+k]` load, and
@@ -348,25 +435,28 @@ impl Recognized {
         let Some(k_header) = j_loop.parent else {
             bail!("j-loop has no parent (k) loop");
         };
-        let k_loop = loops.get_loop(k_header)?;
+        let Some(k_loop) = loops.get_loop(k_header) else {
+            bail!("no loop headed by {:?}", k_header);
+        };
         if only_child(loops, k_header, j_header).is_none() {
             bail!("k-loop does not have the j-loop as its unique child");
         }
-        if !verify_counted_0_n(
+        let Some(k_counter) = verify_counted_0_n(
             func,
-            &def,
+            def,
             &k_loop.body,
             k_header,
             inner.k_reg,
             inner.n_const,
             dump,
-        ) {
+        ) else {
             bail!("k-loop is not a clean 0..N counted loop over k");
-        }
+        };
         // The read-only `a` load: `aik = LdrRI[Madd(Madd(i,N,k), scale, a_base), #0]`.
-        let Some(a_base) = recognize_a_load(func, &def, &k_loop.body, &inner) else {
+        let Some(a_load) = recognize_a_load(func, def, &k_loop.body, &inner) else {
             bail!("read-only a[i*N+k] load not recognized");
         };
+        let a_base = a_load.base;
 
         // ---- (3) i-loop = parent of the k-loop. Verify i is a clean `0..N`
         // counted loop over the recognized i and that the k-loop is its ONLY
@@ -374,21 +464,23 @@ impl Recognized {
         let Some(i_header) = k_loop.parent else {
             bail!("k-loop has no parent (i) loop");
         };
-        let i_loop = loops.get_loop(i_header)?;
+        let Some(i_loop) = loops.get_loop(i_header) else {
+            bail!("no loop headed by {:?}", i_header);
+        };
         if only_child(loops, i_header, k_header).is_none() {
             bail!("i-loop does not have the k-loop as its unique child");
         }
-        if !verify_counted_0_n(
+        let Some(i_counter) = verify_counted_0_n(
             func,
-            &def,
+            def,
             &i_loop.body,
             i_header,
             inner.i_reg,
             inner.n_const,
             dump,
-        ) {
+        ) else {
             bail!("i-loop is not a clean 0..N counted loop over i");
-        }
+        };
         let Some(preheader) = i_loop.preheader else {
             bail!("i-loop has no unique preheader");
         };
@@ -427,46 +519,55 @@ impl Recognized {
 
         // ---- (4) distinct-locals + read-only a/b + single c-store + closed
         // world, all over the WHOLE i-loop body.
-        let ss_a = base_stack_slot(func, &def, a_base)?;
-        let ss_b = base_stack_slot(func, &def, inner.b_base)?;
-        let ss_c = base_stack_slot(func, &def, inner.c_base)?;
+        let (Some(ss_a), Some(ss_b), Some(ss_c)) = (
+            base_stack_slot(func, def, a_base),
+            base_stack_slot(func, def, inner.b_base),
+            base_stack_slot(func, def, inner.c_base),
+        ) else {
+            reject!(NestReject::ArrayBaseNotStackSlot);
+        };
         if ss_a == ss_b || ss_a == ss_c || ss_b == ss_c {
-            bail!(
-                "a/b/c are not three distinct stack slots ({:?} {:?} {:?})",
-                ss_a,
-                ss_b,
-                ss_c
-            );
+            if dump {
+                eprintln!(
+                    "[mac-reg-block] a/b/c slots ({:?} {:?} {:?}) are not distinct",
+                    ss_a, ss_b, ss_c
+                );
+            }
+            reject!(NestReject::AliasedArrays);
         }
         if !verify_closed_world(
             func,
-            &def,
+            def,
             &i_loop.body,
             a_base,
             inner.b_base,
             inner.c_base,
             dump,
         ) {
-            return None;
+            reject!(NestReject::OpenWorld);
         }
 
         // ---- (5) tile / bound arithmetic (all compile-time constants).
         let n = inner.n_const;
         let scale = inner.scale_const;
-        if n < TILE || n % TILE != 0 {
-            bail!("N {} is not a multiple of TILE {}", n, TILE);
-        }
+        let Some(tile) = tile_for(n) else {
+            reject!(NestReject::NotTileMultiple);
+        };
         // L >= N*N  (so every tiled index <= N*N-1 < L is in-bounds).
-        let nn = n.checked_mul(n)?;
+        let Some(nn) = n.checked_mul(n) else {
+            bail!("N*N overflows");
+        };
         if inner.l_const < nn {
-            bail!(
-                "array length {} < N*N {} (cannot prove in-bounds)",
-                inner.l_const,
-                nn
-            );
+            if dump {
+                eprintln!(
+                    "[mac-reg-block] array length {} < N*N {} (cannot prove in-bounds)",
+                    inner.l_const, nn
+                );
+            }
+            reject!(NestReject::BoundsCheckMayFail);
         }
         // Encodable immediates: per-k b advance `N*scale`, per-lane offset
-        // `(TILE-1)*scale`, per-tile/per-row advance `TILE*scale`/`N*scale`.
+        // `(tile-1)*scale`, per-tile/per-row advance `tile*scale`/`N*scale`.
         // WRONG-CODE GUARD (2026-08-17): `apply` emits the whole kernel with
         // `RegClass::Gpr64` lanes and 64-bit `LdrRI`/`LdpRI` loads, so it is
         // correct ONLY for an 8-byte element. Recognition previously admitted
@@ -481,15 +582,18 @@ impl Recognized {
         // Fail closed on every element width this kernel does not model. Any
         // future non-8 support must widen `apply` (lane class, load opcode and
         // element packing) FIRST — this gate is what makes that a deliberate
-        // change rather than a silent one.
+        // change rather than a silent one. The STRIDE is only half of the
+        // width contract: `review_bar::check_data_width` pins the transferred
+        // and multiplied VALUES to 64-bit lanes too.
         if !kernel_supports_scale(scale) {
-            bail!(
-                "element scale {} unsupported; the register-blocked kernel \
-                 emits 64-bit lanes and would transfer the wrong width",
-                scale
-            );
+            reject!(NestReject::ElementScale);
         }
-        if n.checked_mul(scale)? > 4095 || (TILE - 1).checked_mul(scale)? > 4095 {
+        let (Some(n_scale), Some(lane_span)) =
+            (n.checked_mul(scale), (tile - 1).checked_mul(scale))
+        else {
+            bail!("scale {} / N {} immediates overflow", scale, n);
+        };
+        if n_scale > 4095 || lane_span > 4095 {
             bail!(
                 "scale {} / N {} out of AddRI/ldst-immediate range",
                 scale,
@@ -509,10 +613,51 @@ impl Recognized {
             if v.class != RegClass::Gpr64 {
                 bail!("{} not Gpr64", name);
             }
-            if !is_loop_invariant(func, &def, dom, &i_loop_insts, preheader, v) {
+            if !is_loop_invariant(func, def, dom, &i_loop_insts, preheader, v) {
                 bail!("{} not invariant across the i-loop", name);
             }
         }
+
+        // ---- (7) the publication review bar (L10-P4): data width, all array
+        // bounds, mandatory control flow and bypassed loop live-outs, each a
+        // named fail-closed refusal. See `review_bar`.
+        let facts = review_bar::NestFacts {
+            i_body: &i_loop.body,
+            k_body: &k_loop.body,
+            j_body,
+            headers: [i_header, k_header, j_header],
+            counters: [i_counter, k_counter, j_counter],
+            exit_target,
+            indices: [a_load.index, inner.cidx, inner.bidx, inner.cidx2],
+            lane_values: [
+                a_load.value,
+                inner.aik,
+                inner.bval,
+                inner.cval,
+                inner.store_val,
+            ],
+            k_level_values: [a_load.index, a_load.addr, a_load.value],
+            j_level_values: [
+                inner.cidx,
+                inner.caddr,
+                inner.cval,
+                inner.bidx,
+                inner.baddr,
+                inner.bval,
+                inner.cidx2,
+                inner.store_addr,
+                inner.store_val,
+            ],
+            store: inner.store,
+            slots: [ss_a, ss_b, ss_c],
+            scale_reg: inner.scale_reg,
+            n,
+            scale,
+        };
+        let locality = match review_bar::check(func, dom, def, &facts) {
+            Ok(locality) => locality,
+            Err(reason) => reject!(reason),
+        };
 
         if dump {
             eprintln!(
@@ -532,12 +677,14 @@ impl Recognized {
                 exit_target
             );
         }
-        Some(Recognized {
+        Ok(Recognized {
+            _locality: locality,
             preheader,
             preheader_term,
             i_header,
             exit_target,
             n_const: n,
+            tile,
             n_reg: inner.n_reg,
             scale_const: scale,
             a_base,
@@ -563,6 +710,32 @@ struct InnerMac {
     scale_reg: VReg,
     scale_const: i64,
     aik: VReg,
+    /// `c` load index `Madd(i, N, j)`, address and loaded value.
+    cidx: VReg,
+    caddr: VReg,
+    cval: VReg,
+    /// `b` load index `Madd(k, N, j)`, address and loaded value.
+    bidx: VReg,
+    baddr: VReg,
+    bval: VReg,
+    /// `c` store index `Madd(i, N, j)`, address and stored value.
+    cidx2: VReg,
+    store_addr: VReg,
+    store_val: VReg,
+    /// The single `c` store.
+    store: InstId,
+}
+
+/// The recognized read-only `aik = a[i*N+k]` load in the k-loop.
+struct ALoad {
+    /// `a` base register (a stack-slot address).
+    base: VReg,
+    /// Index `Madd(i, N, k)`.
+    index: VReg,
+    /// Address `Madd(index, scale, base)`.
+    addr: VReg,
+    /// The loaded value (the `LdrRI` destination).
+    value: VReg,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -579,7 +752,7 @@ fn recognize_inner_mac(
         return None;
     }
     // Closed-world whitelist + exactly one StrRI, two LdrRI in the j-loop.
-    let mut loop_insts = HashSet::new();
+    let mut loop_insts = HashSet::default();
     let mut stores: Vec<InstId> = Vec::new();
     let mut loads = 0usize;
     for &b in body {
@@ -614,11 +787,11 @@ fn recognize_inner_mac(
 
     // Work backward from the single store: StrRI [val, addr, #0].
     let store = func.inst(store_id);
-    if store.operands.len() != 3 || imm_of(&store.operands[2]) != Some(0) {
+    if store.operands.len() != 3 || store.operands[2].as_imm() != Some(0) {
         return None;
     }
-    let store_val = vreg_of(&store.operands[0])?;
-    let store_addr = vreg_of(&store.operands[1])?;
+    let store_val = store.operands[0].as_vreg()?;
+    let store_addr = store.operands[1].as_vreg()?;
     let (cidx2, scale_r_s, cbase_s) = madd_addr(func, def, store_addr)?;
     let (i_r2, n_r2, jc_a) = madd_index(func, def, cidx2)?;
     if !same_as(func, def, jc_a, iv) {
@@ -655,13 +828,13 @@ fn recognize_inner_mac(
         return None;
     }
     let scale_reg = scale_r_c;
-    let scale_const = const_value(func, def, scale_reg)?;
+    let scale_const = copied_const(func, def, scale_reg)?;
     if n_r2 != n_r_c || n_r_b != n_r_c {
         return None;
     }
     let n_reg = n_r_c;
-    let n_const = const_value(func, def, n_reg)?;
-    if !(TILE..=i64::from(u32::MAX)).contains(&n_const) {
+    let n_const = copied_const(func, def, n_reg)?;
+    if !(MIN_TILE..=i64::from(u32::MAX)).contains(&n_const) {
         return None;
     }
     // header uses the same native forward `iv < N` test with the same constant.
@@ -692,24 +865,35 @@ fn recognize_inner_mac(
         scale_reg,
         scale_const,
         aik,
+        cidx,
+        caddr,
+        cval,
+        bidx,
+        baddr,
+        bval,
+        cidx2,
+        store_addr,
+        store_val,
+        store: store_id,
     })
 }
 
 /// Recognize the k-loop's read-only `aik = a[i*N+k]` load:
 /// `LdrRI [aik, Madd(Madd(i,N,k), scale, a_base), #0]`, with the loaded reg
-/// being exactly the `aik` the inner mac multiplies. Returns `a_base`.
+/// being exactly the `aik` the inner mac multiplies.
 fn recognize_a_load(
     func: &MachFunction,
     def: &HashMap<u32, InstId>,
     k_body: &HashSet<BlockId>,
     inner: &InnerMac,
-) -> Option<VReg> {
-    let aik_def = *def.get(&strip_copies(func, def, inner.aik).id)?;
+) -> Option<ALoad> {
+    let value = strip_copies(func, def, inner.aik);
+    let aik_def = *def.get(&value.id)?;
     // aik must be produced by a LdrRI whose def-block is in the k-loop body.
     let ai = func.inst(aik_def);
     if ai.opcode != AArch64Opcode::LdrRI
         || ai.operands.len() != 3
-        || imm_of(&ai.operands[2]) != Some(0)
+        || ai.operands[2].as_imm() != Some(0)
     {
         return None;
     }
@@ -717,7 +901,7 @@ fn recognize_a_load(
     if !k_body.contains(&blk) {
         return None;
     }
-    let addr = vreg_of(&ai.operands[1])?;
+    let addr = ai.operands[1].as_vreg()?;
     let (aidx, scale_r, a_base) = madd_addr(func, def, addr)?;
     if scale_r != inner.scale_reg {
         return None;
@@ -730,7 +914,12 @@ fn recognize_a_load(
     {
         return None;
     }
-    Some(a_base)
+    Some(ALoad {
+        base: a_base,
+        index: aidx,
+        addr,
+        value,
+    })
 }
 
 /// Fail-closed closed-world check over the WHOLE i-loop body: only whitelisted
@@ -755,6 +944,18 @@ fn verify_closed_world(
             let inst = func.inst(id);
             if !allowed_nest_op(inst.opcode) {
                 bail!("disallowed nest op {:?}", inst.opcode);
+            }
+            // The fast path defines only fresh vregs and replays no physical
+            // register, stack-slot or special-register traffic; a nest that
+            // writes or reads any such operand (a `Copy` into an ABI lane, a
+            // frame address) has effects the rewrite would drop.
+            if let Some(op) = inst.operands.iter().find(|op| {
+                !matches!(
+                    op,
+                    MachOperand::VReg(_) | MachOperand::Imm(_) | MachOperand::Block(_)
+                )
+            }) {
+                bail!("non-virtual operand {:?} in {:?}", op, inst.opcode);
             }
             match inst.opcode {
                 AArch64Opcode::StrRI => {
@@ -789,28 +990,38 @@ fn store_base(func: &MachFunction, def: &HashMap<u32, InstId>, store: &MachInst)
     if store.operands.len() != 3 {
         return None;
     }
-    let addr = vreg_of(&store.operands[1])?;
+    let addr = store.operands[1].as_vreg()?;
     let (_, _, base) = madd_addr(func, def, addr)?;
     Some(base)
 }
 
 /// The distinct stack slot a base register points at:
 /// `base = AddPCRel(sp, StackSlot(id))`. Through copies.
+///
+/// Only the exact three-operand stack-address form
+/// `AddPCRel [dst, sp, StackSlot(id)]` names the START of slot `id`; any
+/// other operand list (an extra offset, a frame index, a symbol) is refused,
+/// so the slot size the review bar checks is the extent the base can reach.
+/// The base must also have exactly one definition, so the slot is the one
+/// every use sees.
 fn base_stack_slot(
     func: &MachFunction,
     def: &HashMap<u32, InstId>,
     base: VReg,
 ) -> Option<StackSlotId> {
     let v = strip_copies(func, def, base);
-    let d = *def.get(&v.id)?;
-    let inst = func.inst(d);
-    if inst.opcode != AArch64Opcode::AddPCRel {
+    if crate::effects::live_def_count(func, v.id) != 1 {
         return None;
     }
-    inst.operands.iter().find_map(|o| match o {
-        MachOperand::StackSlot(s) => Some(*s),
+    let d = *def.get(&v.id)?;
+    let inst = func.inst(d);
+    if inst.opcode != AArch64Opcode::AddPCRel || inst.operands.len() != 3 {
+        return None;
+    }
+    match (&inst.operands[0], &inst.operands[2]) {
+        (MachOperand::VReg(dst), MachOperand::StackSlot(slot)) if *dst == v => Some(*slot),
         _ => None,
-    })
+    }
 }
 
 /// Return `Some(child)` iff `child_header` is the UNIQUE loop whose parent is
@@ -831,14 +1042,14 @@ fn preheader_is_reg_block_guard(
         match inst.opcode {
             AArch64Opcode::CmpRI
                 if inst.operands.len() == 2
-                    && vreg_of(&inst.operands[0]) == Some(n_reg)
-                    && imm_of(&inst.operands[1]) == Some(n_const) =>
+                    && inst.operands[0].as_vreg() == Some(n_reg)
+                    && inst.operands[1].as_imm() == Some(n_const) =>
             {
                 cmp = true;
             }
             AArch64Opcode::BCond
                 if inst.operands.len() == 2
-                    && imm_of(&inst.operands[0]) == Some(CC_NE)
+                    && inst.operands[0].as_imm() == Some(CC_NE)
                     && branch_targets(inst).first() == Some(&i_header) =>
             {
                 bne = true;
@@ -911,10 +1122,10 @@ fn kernel_supports_scale(scale: i64) -> bool {
 /// * `scale == 8` — the pass allocates `Gpr64` lanes and `Ldp` of a 64-bit
 ///   register pair transfers 8 bytes per lane, so an element scale other than
 ///   8 would silently transfer the wrong width.
-/// * `TILE` even — lanes are consumed two at a time.
+/// * `tiles` even — lanes are consumed two at a time.
 /// * every pair offset in the LDP signed-imm7 range. That immediate is scaled
 ///   by 8 for a 64-bit pair, giving `[-64*8, 63*8] = [-512, 504]`, and the
-///   offsets used are `m*scale` for even `m` in `2..TILE` plus the writeback
+///   offsets used are `m*scale` for even `m` in `2..tiles` plus the writeback
 ///   amount `N*scale`. Both are non-negative here, so the upper bound is the
 ///   only binding one; the lower bound is asserted anyway for clarity.
 fn pair_writeback_ok(scale: i64, n_scale: i64, tiles: i64) -> bool {
@@ -931,8 +1142,8 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     let n = rec.n_const;
     let scale = rec.scale_const;
     let n_scale = n * scale; // per-k b advance / per-i row advance
-    let tile_scale = TILE * scale; // per-tile advance
-    let tiles = TILE; // lanes
+    let tiles = rec.tile; // lanes
+    let tile_scale = tiles * scale; // per-tile advance
 
     // Fresh blocks.
     let guard = func.create_block();
@@ -1093,10 +1304,10 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     //
     // * WRITEBACK shape (the fast one, taken whenever the offsets encode):
     //   `aik` is loaded with a post-indexed `LdrPostIndex [pa], #scale` and the
-    //   `b` tile is read as `TILE/2` `Ldp`s issued in DESCENDING lane order,
+    //   `b` tile is read as `T/2` `Ldp`s issued in DESCENDING lane order,
     //   the LAST of which (`m == 0`) is an `LdpPostIndex [pb], #N*scale`. The
     //   two separate `AddRI` pointer bumps disappear into those two loads, so
-    //   the k-loop shrinks from `2*TILE + 6` to `2*TILE + 4` instructions.
+    //   the k-loop shrinks from `2*T + 6` to `2*T + 4` instructions.
     //   Descending order is deliberate: it keeps the three non-writeback `Ldp`s
     //   OFF the base-update recurrence (they read the pre-bump `pb`), which
     //   measured ~2.5% faster on p4_matmul than the ascending order that hangs
@@ -1218,7 +1429,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
         func,
         tstore,
         AArch64Opcode::AddRI,
-        vec![vreg(jt_next), vreg(jt_iv), imm(TILE)],
+        vec![vreg(jt_next), vreg(jt_iv), imm(tiles)],
     );
     emit(
         func,
@@ -1291,25 +1502,13 @@ fn imm(v: i64) -> MachOperand {
 fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
 }
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
 
 fn madd_parts_val(inst: &MachInst) -> Option<(VReg, VReg, VReg)> {
     if inst.opcode == AArch64Opcode::Madd && inst.operands.len() == 4 {
         Some((
-            vreg_of(&inst.operands[1])?,
-            vreg_of(&inst.operands[2])?,
-            vreg_of(&inst.operands[3])?,
+            inst.operands[1].as_vreg()?,
+            inst.operands[2].as_vreg()?,
+            inst.operands[3].as_vreg()?,
         ))
     } else {
         None
@@ -1339,9 +1538,9 @@ fn ldr_addr(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg) -> Option<
     let inst = func.inst(d);
     if inst.opcode == AArch64Opcode::LdrRI
         && inst.operands.len() == 3
-        && imm_of(&inst.operands[2]) == Some(0)
+        && inst.operands[2].as_imm() == Some(0)
     {
-        vreg_of(&inst.operands[1])
+        inst.operands[1].as_vreg()
     } else {
         None
     }
@@ -1359,7 +1558,7 @@ fn find_unit_induction(
             }
             if let Some(&sdef) = def.get(&s.id) {
                 let si = func.inst(sdef);
-                if is_add1(si) && vreg_of(&si.operands[1]) == Some(d) {
+                if is_add1(si) && si.operands[1].as_vreg() == Some(d) {
                     return Some(d);
                 }
             }
@@ -1368,8 +1567,8 @@ fn find_unit_induction(
     for &id in &func.block(latch).insts {
         let inst = func.inst(id);
         if is_add1(inst) {
-            let d = vreg_of(&inst.operands[0])?;
-            if d.class == RegClass::Gpr64 && vreg_of(&inst.operands[1]) == Some(d) {
+            let d = inst.operands[0].as_vreg()?;
+            if d.class == RegClass::Gpr64 && inst.operands[1].as_vreg() == Some(d) {
                 return Some(d);
             }
         }
@@ -1380,30 +1579,71 @@ fn find_unit_induction(
 fn is_add1(inst: &MachInst) -> bool {
     inst.opcode == AArch64Opcode::AddRI
         && inst.operands.len() == 3
-        && imm_of(&inst.operands[2]) == Some(1)
+        && inst.operands[2].as_imm() == Some(1)
 }
 
+/// `(index, constant length)` of a proof-only bounds carrier
+/// `TrapBoundsCheckExact [base, index, Imm(len)]`, which traps iff
+/// `!(index <u len)`. The base operand is identity metadata for proof
+/// binding and does not take part in the runtime check. A carrier whose
+/// length is a register (the dynamic-length form) is not a compile-time
+/// length and yields `None`.
+fn bounds_carrier(inst: &MachInst) -> Option<(VReg, i64)> {
+    if inst.opcode != AArch64Opcode::TrapBoundsCheckExact || inst.operands.len() != 3 {
+        return None;
+    }
+    inst.operands[0].as_vreg()?;
+    Some((inst.operands[1].as_vreg()?, inst.operands[2].as_imm()?))
+}
+
+/// The constant length a bounds check of `idx` in `body` compares against.
+///
+/// Two check forms are recognized. A trust-ir `icmp ult` + `condbr` to a
+/// failure block lowers to the expanded `CmpRI/CmpRR idx, L ; BCond LO/LT ->
+/// body ; B -> outside` diamond. The rustc bridge emits a MIR
+/// `Assert(BoundsCheck)` in this form, its failure block calling
+/// `panic_bounds_check(index, len, &Location)` and then `unreachable`. The
+/// proof-only carrier `TrapBoundsCheckExact [idx, idx, #L]` inside a
+/// straight-line block traps on failure and expands to `CMP; B.LO; BRK` only
+/// after optimization. It is what a same-block `const` + `icmp ult` +
+/// `assert` triple lowered to: the bridge's spelling of a constant-length
+/// check before TrustIR v52, which the shared admission floor now refuses as
+/// a kindless source `assert`, so the bridge no longer reaches this pass with
+/// carriers. Either form names `L`. This only locates the length; the review
+/// bar classifies EVERY check and carrier in the nest
+/// (`review_bar::check_mandatory_control_flow`).
 fn find_bounds_check(
     func: &MachFunction,
     def: &HashMap<u32, InstId>,
     body: &HashSet<BlockId>,
     idx: VReg,
 ) -> Option<i64> {
+    let mut blocks: Vec<BlockId> = body.iter().copied().collect();
+    blocks.sort_unstable();
+    for &b in &blocks {
+        for &id in &func.block(b).insts {
+            if let Some((index, len)) = bounds_carrier(func.inst(id))
+                && same_as(func, def, index, idx)
+            {
+                return Some(len);
+            }
+        }
+    }
     for &b in body {
         let mut bound: Option<i64> = None;
         for &id in &func.block(b).insts {
             let inst = func.inst(id);
             match inst.opcode {
                 AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
-                    if same_as(func, def, vreg_of(&inst.operands[0])?, idx) {
-                        bound = const_value(func, def, vreg_of(&inst.operands[1])?);
+                    if same_as(func, def, inst.operands[0].as_vreg()?, idx) {
+                        bound = copied_const(func, def, inst.operands[1].as_vreg()?);
                     }
                 }
                 AArch64Opcode::CmpRI
                     if inst.operands.len() == 2
-                        && same_as(func, def, vreg_of(&inst.operands[0])?, idx) =>
+                        && same_as(func, def, inst.operands[0].as_vreg()?, idx) =>
                 {
-                    bound = imm_of(&inst.operands[1]);
+                    bound = inst.operands[1].as_imm();
                 }
                 _ => {}
             }
@@ -1414,7 +1654,7 @@ fn find_bounds_check(
         for &id in &func.block(b).insts {
             let inst = func.inst(id);
             if inst.opcode == AArch64Opcode::BCond && inst.operands.len() == 2 {
-                let cc = imm_of(&inst.operands[0])?;
+                let cc = inst.operands[0].as_imm()?;
                 let tgt = *branch_targets(inst).first()?;
                 if (cc == CC_LO || cc == CC_LT) && body.contains(&tgt) {
                     lo_to_body = true;
@@ -1445,15 +1685,15 @@ fn recognize_native_const_bound(
         let inst = func.inst(id);
         match inst.opcode {
             AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
-                if same_as(func, def, vreg_of(&inst.operands[0])?, iv) {
-                    cmp_bound = const_value(func, def, vreg_of(&inst.operands[1])?);
+                if same_as(func, def, inst.operands[0].as_vreg()?, iv) {
+                    cmp_bound = copied_const(func, def, inst.operands[1].as_vreg()?);
                 }
             }
             AArch64Opcode::CmpRI
                 if inst.operands.len() == 2
-                    && same_as(func, def, vreg_of(&inst.operands[0])?, iv) =>
+                    && same_as(func, def, inst.operands[0].as_vreg()?, iv) =>
             {
-                cmp_bound = imm_of(&inst.operands[1]);
+                cmp_bound = inst.operands[1].as_imm();
             }
             _ => {}
         }
@@ -1463,7 +1703,7 @@ fn recognize_native_const_bound(
     for &id in &func.block(header).insts {
         let inst = func.inst(id);
         if inst.opcode == AArch64Opcode::BCond && inst.operands.len() == 2 {
-            let cc = imm_of(&inst.operands[0])?;
+            let cc = inst.operands[0].as_imm()?;
             let tgt = *branch_targets(inst).first()?;
             if (cc == CC_LT || cc == CC_LO) && body.contains(&tgt) {
                 has_forward = true;
@@ -1486,6 +1726,10 @@ fn recognize_native_const_bound(
 /// loop's counter is the same loop-carried value as `index_iv` (the register
 /// used in the nest's index `madd`s). Robust to the conventional-SSA `MovR`-phi
 /// / body-copy / self-copy forms; fail-closed on anything else.
+///
+/// Returns the loop-carried counter, its latch step and its init, which the
+/// review bar uses to refuse a read of the counter after that step or outside
+/// the loop, and an init that does not run once per parent iteration.
 fn verify_counted_0_n(
     func: &MachFunction,
     def: &HashMap<u32, InstId>,
@@ -1494,9 +1738,9 @@ fn verify_counted_0_n(
     index_iv: VReg,
     n_const: i64,
     dump: bool,
-) -> bool {
+) -> Option<review_bar::CountedLoop> {
     macro_rules! nope {
-        ($($t:tt)*) => {{ if dump { eprintln!("[mac-reg-block] counted-loop reject: {}", format!($($t)*)); } return false; }};
+        ($($t:tt)*) => {{ if dump { eprintln!("[mac-reg-block] counted-loop reject: {}", format!($($t)*)); } return None; }};
     }
     let Some(latch) = single_latch(func, header, body) else {
         nope!("no single latch");
@@ -1522,12 +1766,13 @@ fn verify_counted_0_n(
     let counter = c_t;
     // (3) the counter's defs: exactly one `+1` step in the latch and one
     // `init = 0` from outside the loop (self-copies of the counter ignored).
-    let mut init_ok = false;
-    let mut step_ok = false;
+    // An init inside the body would reset the counter mid-loop, so the
+    // non-latch def must lie OUTSIDE the loop body; the review bar also
+    // requires it once per parent iteration (`check_counter_inits`).
+    let mut init = None;
+    let mut step = None;
     for d in find_all_defs(func, counter) {
-        let Some(blk) = block_of_inst(func, d) else {
-            return false;
-        };
+        let blk = block_of_inst(func, d)?;
         let inst = func.inst(d);
         // Ignore a degenerate self-copy `counter = MovR(counter)`.
         if let Some((dst, src)) = copy_like(inst)
@@ -1537,32 +1782,44 @@ fn verify_counted_0_n(
             continue;
         }
         if blk == latch {
-            if step_ok {
+            if step.is_some() {
                 nope!("multiple latch defs of the counter");
             }
             if !latch_def_is_unit_step(func, def, inst, counter, latch) {
                 nope!("latch def of the counter is not a +1 step");
             }
-            step_ok = true;
+            step = Some(d);
         } else {
-            if init_ok {
+            if body.contains(&blk) {
+                nope!("a non-latch def of the counter lies inside the loop body");
+            }
+            if init.is_some() {
                 nope!("multiple out-of-loop defs of the counter");
             }
             let z = if let Some((dst, src)) = copy_like(inst) {
-                dst == counter && const_value(func, def, src) == Some(0)
+                dst == counter && copied_const(func, def, src) == Some(0)
             } else {
                 is_movz_zero(inst)
             };
             if !z {
                 nope!("out-of-loop init of the counter is not 0");
             }
-            init_ok = true;
+            init = Some(d);
         }
     }
-    if !(init_ok && step_ok) {
-        nope!("counter missing init(0)={} step(+1)={}", init_ok, step_ok);
-    }
-    true
+    let (Some(init), Some(step)) = (init, step) else {
+        nope!(
+            "counter missing init(0)={} step(+1)={}",
+            init.is_some(),
+            step.is_some()
+        );
+    };
+    Some(review_bar::CountedLoop {
+        counter,
+        latch,
+        step,
+        init,
+    })
 }
 
 /// The latch def of the counter must be a `+1` step: either the in-place
@@ -1577,7 +1834,9 @@ fn latch_def_is_unit_step(
 ) -> bool {
     // in-place: counter = AddRI(x, 1)
     if is_add1(inst) {
-        return vreg_of(&inst.operands[1]).and_then(|x| resolve_to_carried(func, x, latch))
+        return inst.operands[1]
+            .as_vreg()
+            .and_then(|x| resolve_to_carried(func, x, latch))
             == Some(counter);
     }
     // copy: counter = MovR(inc), inc = AddRI(x, 1)
@@ -1589,7 +1848,9 @@ fn latch_def_is_unit_step(
         for d in find_all_defs(func, inc) {
             let ii = func.inst(d);
             if is_add1(ii) {
-                return vreg_of(&ii.operands[1]).and_then(|x| resolve_to_carried(func, x, latch))
+                return ii.operands[1]
+                    .as_vreg()
+                    .and_then(|x| resolve_to_carried(func, x, latch))
                     == Some(counter);
             }
         }
@@ -1600,7 +1861,7 @@ fn latch_def_is_unit_step(
 fn is_movz_zero(inst: &MachInst) -> bool {
     inst.opcode == AArch64Opcode::Movz
         && inst.operands.len() == 2
-        && imm_of(&inst.operands[1]) == Some(0)
+        && inst.operands[1].as_imm() == Some(0)
 }
 
 /// Resolve a value to its loop-carried counter: follow single non-self copy
@@ -1619,7 +1880,7 @@ fn resolve_to_carried(func: &MachFunction, v: VReg, latch: BlockId) -> Option<VR
             return Some(cur);
         }
         // Otherwise follow the unique non-self copy source.
-        let mut srcs: HashSet<VReg> = HashSet::new();
+        let mut srcs: HashSet<VReg> = HashSet::default();
         for &d in &defs {
             let ii = func.inst(d);
             match copy_like(ii) {
@@ -1651,7 +1912,7 @@ fn find_header_iv_test(
     for &id in &func.block(header).insts {
         let inst = func.inst(id);
         if inst.opcode == AArch64Opcode::BCond && inst.operands.len() == 2 {
-            let cc = imm_of(&inst.operands[0])?;
+            let cc = inst.operands[0].as_imm()?;
             let tgt = *branch_targets(inst).first()?;
             if (cc == CC_LT || cc == CC_LO) && body.contains(&tgt) {
                 has_forward = true;
@@ -1666,14 +1927,14 @@ fn find_header_iv_test(
         let inst = func.inst(id);
         match inst.opcode {
             AArch64Opcode::CmpRR if inst.operands.len() == 2 => {
-                let t = vreg_of(&inst.operands[0])?;
-                if let Some(b) = const_value(func, def, vreg_of(&inst.operands[1])?) {
+                let t = inst.operands[0].as_vreg()?;
+                if let Some(b) = copied_const(func, def, inst.operands[1].as_vreg()?) {
                     found = Some((t, b));
                 }
             }
             AArch64Opcode::CmpRI if inst.operands.len() == 2 => {
-                let t = vreg_of(&inst.operands[0])?;
-                if let Some(b) = imm_of(&inst.operands[1]) {
+                let t = inst.operands[0].as_vreg()?;
+                if let Some(b) = inst.operands[1].as_imm() {
                     found = Some((t, b));
                 }
             }
@@ -1724,107 +1985,51 @@ fn is_loop_invariant(
     dom.dominates(db, preheader)
 }
 
-/// Whitelist for the inner j-loop body (exactly the mac-row-unroll shape).
+/// Whitelist for the inner j-loop body (the mac-row-unroll shape, with its
+/// bounds checks either expanded or as `TrapBoundsCheckExact` carriers).
 fn allowed_inner_op(op: AArch64Opcode) -> bool {
     use AArch64Opcode::*;
     matches!(
         op,
-        Madd | AddRI | MovR | Copy | CmpRR | CmpRI | BCond | B | LdrRI | StrRI
+        Madd | AddRI
+            | MovR
+            | Copy
+            | CmpRR
+            | CmpRI
+            | BCond
+            | B
+            | LdrRI
+            | StrRI
+            | TrapBoundsCheckExact
     )
 }
 
 /// Whitelist for the WHOLE i-loop body (the inner shape plus the k/i loop
 /// machinery, which is the same opcode set — index `Madd`s, iv `AddRI`s, phi
-/// `MovR`s, guards, and the three loads / one store).
+/// `MovR`s, guards or bounds carriers, and the three loads / one store).
+/// Admitting `TrapBoundsCheckExact` here is safe only because the review bar
+/// classifies every carrier in the nest as a check of a recognized current
+/// index against a constant length of at least `N*N`
+/// (`review_bar::check_bounds_carrier`); no other trap pseudo is admitted.
 fn allowed_nest_op(op: AArch64Opcode) -> bool {
     use AArch64Opcode::*;
     matches!(
         op,
-        Madd | AddRI | MovR | Copy | CmpRR | CmpRI | BCond | B | LdrRI | StrRI
+        Madd | AddRI
+            | MovR
+            | Copy
+            | CmpRR
+            | CmpRI
+            | BCond
+            | B
+            | LdrRI
+            | StrRI
+            | TrapBoundsCheckExact
     )
-}
-
-fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
-    match inst.opcode {
-        AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
-        {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        _ => None,
-    }
 }
 
 fn same_as(func: &MachFunction, def: &HashMap<u32, InstId>, v: VReg, w: VReg) -> bool {
     strip_copies(func, def, v) == strip_copies(func, def, w)
-}
-
-fn strip_copies(func: &MachFunction, def: &HashMap<u32, InstId>, mut v: VReg) -> VReg {
-    for _ in 0..16 {
-        // A vreg with several live defs has no single reaching definition: the
-        // def map is LAST-WINS over the emitted layout, so it names whichever
-        // def comes last rather than the one that reaches this use. Every
-        // loop-carried variable is multi-def by construction — the frontend
-        // lowers a block parameter to one copy per predecessor, giving a
-        // preheader copy and a latch copy into the same vreg — so walking one
-        // resolves the INDUCTION VARIABLE to its latch source `iv + 1`. Then
-        // `same_as(iv + 1, iv)` is TRUE and an index of `j + 1` passes as an
-        // index of `j`, which is a wrong-address store.
-        if crate::effects::live_def_count(func, v.id) != 1 {
-            return v;
-        }
-        let Some(&d) = def.get(&v.id) else {
-            return v;
-        };
-        match copy_like(func.inst(d)) {
-            Some((dst, src)) if dst == v => v = src,
-            _ => return v,
-        }
-    }
-    v
-}
-
-fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
-    let v = strip_copies(func, def, val);
-    let id = *def.get(&v.id)?;
-    let inst = func.inst(id);
-    match inst.opcode {
-        AArch64Opcode::Movz if inst.operands.len() == 2 => imm_of(&inst.operands[1]),
-        AArch64Opcode::Movk if inst.operands.len() == 3 => {
-            let hi = imm_of(&inst.operands[1])?;
-            let sh = imm_of(&inst.operands[2])?;
-            let blk = block_of_inst(func, id)?;
-            let insts = &func.block(blk).insts;
-            let pos = insts.iter().position(|&i| i == id)?;
-            let mut acc: Option<i64> = None;
-            for &pid in insts[..pos].iter() {
-                let pi = func.inst(pid);
-                if vreg_of(&pi.operands[0]) != Some(v) {
-                    continue;
-                }
-                match pi.opcode {
-                    AArch64Opcode::Movz if pi.operands.len() == 2 => {
-                        acc = imm_of(&pi.operands[1]);
-                    }
-                    AArch64Opcode::Movk if pi.operands.len() == 3 => {
-                        let h = imm_of(&pi.operands[1])?;
-                        let s = imm_of(&pi.operands[2])?;
-                        acc = Some(acc.unwrap_or(0) & !(0xFFFF << s) | (h << s));
-                    }
-                    _ => {}
-                }
-            }
-            Some(acc.unwrap_or(0) & !(0xFFFF << sh) | (hi << sh))
-        }
-        _ => None,
-    }
-}
-
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    crate::effects::build_reaching_def_map(func)
 }
 
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
@@ -1837,23 +2042,13 @@ fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
 }
 
 fn collect_insts(func: &MachFunction, body: &HashSet<BlockId>) -> HashSet<InstId> {
-    let mut set = HashSet::new();
+    let mut set = HashSet::default();
     for &b in body {
         for &id in &func.block(b).insts {
             set.insert(id);
         }
     }
     set
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|o| match o {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
 }
 
 fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
@@ -1926,7 +2121,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);

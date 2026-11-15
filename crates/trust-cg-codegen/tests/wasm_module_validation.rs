@@ -24,7 +24,9 @@
 //! function), and the whole corpus is also compiled as ONE module (exercising
 //! the shared type section, function table, and stack-pointer global).
 
-use std::path::PathBuf;
+#[path = "common/fresh_dir.rs"]
+mod fresh_dir;
+
 use std::process::Command;
 
 use trust_ir::{BinOp, CastOp, Constant, ICmpOp, SwitchCase, Ty, UnOp};
@@ -188,7 +190,7 @@ fn corpus() -> Vec<Shape> {
 /// fail-closes on target-free modules, so every corpus module carries the
 /// canonical wasm32 `TargetInfo`.
 fn finish_wasm32(mb: ModuleBuilder) -> trust_ir::Module {
-    let mut module = mb.build();
+    let mut module = mb.build().expect("ModuleBuilder::build: test fixture");
     module.target_info = Some(wasm::target::wasm32_target_info());
     module
 }
@@ -209,8 +211,12 @@ fn validate(what: &str, bytes: &[u8]) {
 /// Compile `module` and run the reference validator; `what` names the failing
 /// function (or corpus lane) in every panic message.
 fn compile_and_validate(what: &str, module: &trust_ir::Module) {
-    let bytes = wasm::compile_module(module)
-        .unwrap_or_else(|e| panic!("wasm backend failed to compile `{what}`: {e}"));
+    let bytes = wasm::compile_module_with_policy_and_license(
+        module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .unwrap_or_else(|e| panic!("wasm backend failed to compile `{what}`: {e}"));
     validate(what, &bytes);
 }
 
@@ -221,8 +227,9 @@ fn compile_and_validate_with_policy(
     module: &trust_ir::Module,
     policy: &WasmModulePolicy,
 ) -> (Vec<u8>, Vec<String>) {
-    let (bytes, evidence) = wasm::compile_module_with_evidence_and_policy(module, policy)
-        .unwrap_or_else(|e| panic!("wasm backend failed to compile `{what}`: {e}"));
+    let (bytes, evidence) =
+        wasm::compile_module_with_evidence_policy_and_license(module, policy, &permit_unlicensed())
+            .unwrap_or_else(|e| panic!("wasm backend failed to compile `{what}`: {e}"));
     validate(what, &bytes);
     (bytes, evidence.host_contract)
 }
@@ -245,13 +252,17 @@ fn every_emitted_module_validates_per_function() {
 fn target_free_corpus_module_is_refused() {
     let mut mb = ModuleBuilder::new("target_free");
     build_if_else_diamond(&mut mb);
-    let module = mb.build(); // deliberately NOT stamped
+    let module = mb.build().expect("ModuleBuilder::build: test fixture"); // deliberately NOT stamped
     assert!(
         module.target_info.is_none(),
         "corpus builder must not stamp target_info itself"
     );
-    let err = wasm::compile_module(&module)
-        .expect_err("a target-free module must not enter the wasm32 lane");
+    let err = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect_err("a target-free module must not enter the wasm32 lane");
     let msg = err.to_string();
     assert!(
         msg.contains("target_info"),
@@ -1077,7 +1088,7 @@ fn build_narrow_casts(mb: &mut ModuleBuilder) {
     let zx = fb.cast(CastOp::ZExt, Ty::I8, Ty::I32, i8v);
     let sx = fb.cast(CastOp::SExt, Ty::U8, Ty::I32, u8v);
     let u16v = fb.cast(CastOp::Trunc, Ty::I32, Ty::U16, x);
-    let i16v = fb.cast(CastOp::Trunc, Ty::U16, Ty::I16, u16v);
+    let i16v = fb.cast(CastOp::Bitcast, Ty::U16, Ty::I16, u16v);
     let wide = fb.cast(CastOp::SExt, Ty::I16, Ty::I64, i16v);
     let widened = fb.cast(CastOp::ZExt, Ty::U8, Ty::U64, u8v);
     let back0 = fb.cast(CastOp::Trunc, Ty::I64, Ty::I8, wide);
@@ -1177,12 +1188,11 @@ fn build_switch(
     let v = fb.add_block_param(entry, Ty::I32);
     let x = fb.add_block_param(entry, Ty::I32);
     let case_blocks: Vec<_> = values.iter().map(|_| fb.create_block()).collect();
-    let own_default = fb.create_block();
-    let default_block = if default_is_a_case_target {
-        case_blocks[0]
-    } else {
-        own_default
-    };
+    // The default arm's own block exists only when the default edge reaches
+    // it: trust-ir refuses a block no edge reaches (`UnreachableBlock`), and
+    // every ingestion entry refuses what the validator refuses (WS7.3).
+    let own_default = (!default_is_a_case_target).then(|| fb.create_block());
+    let default_block = own_default.unwrap_or(case_blocks[0]);
     fb.switch_to_block(entry);
     let cases: Vec<SwitchCase> = values
         .iter()
@@ -1200,13 +1210,12 @@ fn build_switch(
         let val = fb.add(Ty::I32, x, kc);
         fb.br(join, vec![val]);
     }
-    // `own_default` stays in the function even when it is not the default edge
-    // (an unreachable block the whole-function scans still walk); give it a
-    // terminator.
-    fb.switch_to_block(own_default);
-    let sentinel = fb.iconst(Ty::I32, -1);
-    let val = fb.add(Ty::I32, x, sentinel);
-    fb.br(join, vec![val]);
+    if let Some(own_default) = own_default {
+        fb.switch_to_block(own_default);
+        let sentinel = fb.iconst(Ty::I32, -1);
+        let val = fb.add(Ty::I32, x, sentinel);
+        fb.br(join, vec![val]);
+    }
     fb.switch_to_block(join);
     fb.ret(vec![r]);
     fb.build();
@@ -1219,6 +1228,9 @@ fn build_static_table(mb: &mut ModuleBuilder) {
     let u8_ty = mb.add_type(Ty::U8);
     let global_index = 0u32;
     mb.add_global(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "STATIC_TABLE".to_string(),
         ty: Ty::Array(u8_ty, 8),
         mutable: false,
@@ -1342,16 +1354,8 @@ fn global_indices(bytes: &[u8]) -> Vec<Vec<u32>> {
     out
 }
 
-fn unique_temp_dir(tag: &str) -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock should be after UNIX epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "trust_cg_wasm_island_{tag}_{}_{}",
-        std::process::id(),
-        stamp
-    ))
+fn unique_temp_dir(tag: &str) -> fresh_dir::ScratchDir {
+    fresh_dir::create(&format!("trust_cg_wasm_island_{tag}_"))
 }
 
 /// EXECUTE `bytes` under node with `driver` (an ES module taking the `.wasm`
@@ -1364,7 +1368,6 @@ fn run_under_node(tag: &str, bytes: &[u8], driver: &str) {
         return;
     }
     let dir = unique_temp_dir(tag);
-    std::fs::create_dir_all(&dir).expect("create temp dir");
     let wasm_path = dir.join("island.wasm");
     let driver_path = dir.join("driver.mjs");
     std::fs::write(&wasm_path, bytes).expect("write wasm");
@@ -1438,7 +1441,20 @@ fn k_func_imports_shift_every_defined_call_target() {
         func_imports: WasmFuncImportPolicy::FromModule(island_host_namespace("calls")),
         ..WasmModulePolicy::closed()
     };
-    let (bytes, contract) = compile_and_validate_with_policy("island_calls", &module, &policy);
+    // The call must survive to be checked: without the mid-end, whose
+    // inliner would splice `callee` into `caller`.
+    let (bytes, evidence) = wasm::compile_module_with_evidence_policy_license_options(
+        &module,
+        &policy,
+        &permit_unlicensed(),
+        wasm::WasmOptOptions {
+            level: trust_cg_codegen::pipeline::OptLevel::O2,
+            mid_end: false,
+        },
+    )
+    .unwrap_or_else(|e| panic!("wasm backend failed to compile `island_calls`: {e}"));
+    validate("island_calls", &bytes);
+    let contract = evidence.host_contract;
 
     assert_eq!(
         contract,
@@ -1523,10 +1539,12 @@ fn an_imports_only_module_validates() {
 }
 
 /// Imports plus the funcref table: `fn_addr` lowers a function pointer to its
-/// FUNCTION index, and the element segment must fill the table so that element
-/// `i` is function `i` — over the WHOLE index space, imports included. The two
-/// host imports again share the target's signature, so a forgotten shift would
-/// dispatch into the imported `host_a` and still type-check.
+/// table index `closed_table_index(funcidx)` = funcidx + 1, and the element
+/// segment must fill the table so that element `funcidx + 1` is function
+/// `funcidx` — over the WHOLE index space, imports included (element 0 stays
+/// the null funcref). The two host imports again share the target's
+/// signature, so a forgotten shift would dispatch into the imported `host_a`
+/// and still type-check.
 #[test]
 fn an_indirect_call_beside_imports_dispatches_through_the_shifted_table() {
     let mut mb = ModuleBuilder::new("island_table");
@@ -1569,9 +1587,9 @@ fn an_indirect_call_beside_imports_dispatches_through_the_shifted_table() {
         ]
     );
 
-    // The table must be big enough for the whole index space (2 imports + 2
-    // definitions); a table sized to the definitions alone would make element
-    // 2 out of bounds and the element segment invalid.
+    // The table must be big enough for the null slot plus the whole index
+    // space (2 imports + 2 definitions); a table sized to the definitions alone
+    // would make element 3 out of bounds and the element segment invalid.
     let mut table_min = None;
     for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
         if let wasmparser::Payload::TableSection(reader) = payload.expect("parse") {
@@ -1580,9 +1598,14 @@ fn an_indirect_call_beside_imports_dispatches_through_the_shifted_table() {
             }
         }
     }
-    assert_eq!(table_min, Some(4), "table must cover imports + definitions");
+    assert_eq!(
+        table_min,
+        Some(5),
+        "table must cover the null slot + imports + definitions"
+    );
 
-    // `dispatch` pushes `imul`'s function index as its pointer: 2, not 0.
+    // `dispatch` pushes `imul`'s table index as its pointer: funcidx 2 + 1,
+    // not 1 (imported host_a).
     let mut fn_ptr_consts = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("parse") {
@@ -1597,8 +1620,8 @@ fn an_indirect_call_beside_imports_dispatches_through_the_shifted_table() {
     }
     assert_eq!(
         fn_ptr_consts[1],
-        vec![2],
-        "the function pointer must be `imul`'s shifted index 2, not 0 (imported host_a)"
+        vec![3],
+        "the function pointer must be `imul`'s shifted table index 3, not 1 (imported host_a)"
     );
 
     let driver = r#"
@@ -1615,8 +1638,10 @@ console.log('OK');
     run_under_node("table_shift", &bytes, driver);
 }
 
-/// roundtrip(x) = { let c = alloca i32; *c = x; *c } — the smallest shape that
-/// needs a shadow-stack frame, and therefore an address.
+/// roundtrip(x) = { let c = alloca i32; *c = x; read_volatile(c) } — the
+/// smallest shape that needs a shadow-stack frame, and therefore an address.
+/// The read is volatile so that the trust-ir mid-end (on at the default
+/// level) does not forward the store to it and remove the slot.
 fn build_frame_module(name: &'static str) -> trust_ir::Module {
     let mut mb = ModuleBuilder::new(name);
     let ft = mb.add_func_type(vec![Ty::I32], vec![Ty::I32]);
@@ -1626,7 +1651,7 @@ fn build_frame_module(name: &'static str) -> trust_ir::Module {
     fb.switch_to_block(e);
     let cell = fb.alloca(Ty::I32);
     fb.store(Ty::I32, cell, x);
-    let r = fb.load(Ty::I32, cell);
+    let r = fb.load_volatile(Ty::I32, cell);
     fb.ret(vec![r]);
     fb.build();
     finish_wasm32(mb)
@@ -1754,7 +1779,12 @@ fn a_pointer_load_without_an_alloca_still_gets_a_memory() {
     fb.build();
     let module = finish_wasm32(mb);
 
-    let bytes = wasm::compile_module(&module).expect("a pointer load must compile");
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("a pointer load must compile");
     validate("ptr_load", &bytes);
     assert!(
         defines_memory(&bytes),
@@ -1777,7 +1807,7 @@ fn a_memory_access_under_the_absent_policy_is_refused() {
         memory: WasmMemoryPolicy::Absent,
         ..WasmModulePolicy::closed()
     };
-    let err = wasm::compile_module_with_policy(&module, &policy)
+    let err = wasm::compile_module_with_policy_and_license(&module, &policy, &permit_unlicensed())
         .expect_err("a module needing memory must not compile under Absent");
     assert!(matches!(err, WasmLowerError::MemoryUnavailable(_)), "{err}");
     let msg = err.to_string();
@@ -1801,7 +1831,7 @@ fn a_frame_in_imported_memory_without_a_host_base_is_refused() {
         func_imports: WasmFuncImportPolicy::Forbidden,
         ..WasmModulePolicy::closed()
     };
-    let err = wasm::compile_module_with_policy(&module, &policy)
+    let err = wasm::compile_module_with_policy_and_license(&module, &policy, &permit_unlicensed())
         .expect_err("a private stack top inside a host's memory must be refused");
     assert!(
         matches!(err, WasmLowerError::StackBaseUnavailable(_)),
@@ -1822,8 +1852,12 @@ fn a_body_less_function_is_refused_without_an_import_policy() {
     mb.function("host_only", ft).build();
     let module = finish_wasm32(mb);
 
-    let err = wasm::compile_module(&module)
-        .expect_err("the closed lane must refuse a declaration it cannot define");
+    let err = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect_err("the closed lane must refuse a declaration it cannot define");
     assert!(
         matches!(err, WasmLowerError::UnboundDeclaration(_)),
         "{err}"
@@ -1846,7 +1880,12 @@ fn compile_shape(name: &'static str, build: fn(&mut ModuleBuilder)) -> Vec<u8> {
     let mut mb = ModuleBuilder::new(name);
     build(&mut mb);
     let module = finish_wasm32(mb);
-    let bytes = wasm::compile_module(&module).unwrap_or_else(|e| panic!("compiling `{name}`: {e}"));
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .unwrap_or_else(|e| panic!("compiling `{name}`: {e}"));
     validate(name, &bytes);
     bytes
 }
@@ -1894,9 +1933,11 @@ fn a_dense_switch_dispatches_through_br_table() {
         "8 contiguous cases must use br_table"
     );
     let (labels, default) = br_table_targets(&bytes).expect("a br_table");
-    // Eight arms, at depths 1..=8, with the default one past them.
-    assert_eq!(labels, (1..=8).collect::<Vec<u32>>());
-    assert_eq!(default, 9);
+    // Eight arms, at depths 0..=7, with the default one past them (at the
+    // default level the emission pass's control cleanup unwraps the block no
+    // branch names around the table).
+    assert_eq!(labels, (0..=7).collect::<Vec<u32>>());
+    assert_eq!(default, 8);
 
     let driver = r#"
 import { readFileSync } from 'node:fs';
@@ -1926,7 +1967,8 @@ fn br_table_normalizes_the_index_and_routes_holes_to_the_default() {
     assert!(uses_br_table(&holes));
     let (labels, default) = br_table_targets(&holes).expect("a br_table");
     // Span 10..=16 is seven entries; 12, 14 and 15 are holes → the default.
-    assert_eq!(labels, vec![1, 2, default, 3, default, default, 4]);
+    assert_eq!(labels, vec![0, 1, default, 2, default, default, 3]);
+    assert_eq!(default, 4);
     let driver = r#"
 import { readFileSync } from 'node:fs';
 const { instance } = await WebAssembly.instantiate(readFileSync(process.argv[2]), {});
@@ -2005,13 +2047,18 @@ fn a_wide_dense_switch_nests_and_dispatches() {
     let mut mb = ModuleBuilder::new("switch_wide");
     build_switch(&mut mb, "switch_wide", &values, false);
     let module = finish_wasm32(mb);
-    let bytes = wasm::compile_module(&module).expect("a 256-case switch must compile");
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("a 256-case switch must compile");
     validate("switch_wide", &bytes);
     assert!(uses_br_table(&bytes));
     let (labels, default) = br_table_targets(&bytes).expect("a br_table");
     assert_eq!(labels.len(), 256, "one entry per covered value");
-    assert_eq!(labels, (1..=256).collect::<Vec<u32>>());
-    assert_eq!(default, 257);
+    assert_eq!(labels, (0..=255).collect::<Vec<u32>>());
+    assert_eq!(default, 256);
 
     let driver = r#"
 import { readFileSync } from 'node:fs';
@@ -2172,8 +2219,12 @@ fn an_island_writes_static_data_where_the_host_reserved_it() {
     };
 
     // Fail closed first: the default island policy has no reserved region.
-    let err = wasm::compile_module_with_policy(&island_table(), &WasmModulePolicy::island("tab"))
-        .expect_err("static data in a host memory needs the host's grant");
+    let err = wasm::compile_module_with_policy_and_license(
+        &island_table(),
+        &WasmModulePolicy::island("tab"),
+        &permit_unlicensed(),
+    )
+    .expect_err("static data in a host memory needs the host's grant");
     assert!(
         matches!(err, WasmLowerError::HostMemoryNotGranted(_)),
         "{err}"
@@ -2250,9 +2301,15 @@ fn the_closed_policy_reproduces_the_default_bytes() {
         let mut mb = ModuleBuilder::new(shape.name);
         (shape.build)(&mut mb);
         let module = finish_wasm32(mb);
-        let default_bytes = wasm::compile_module(&module).expect("default compile");
+        let default_bytes = wasm::compile_module_with_policy_and_license(
+            &module,
+            &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+            &permit_unlicensed(),
+        )
+        .expect("default compile");
         let policy_bytes =
-            wasm::compile_module_with_policy(&module, &closed).expect("closed-policy compile");
+            wasm::compile_module_with_policy_and_license(&module, &closed, &permit_unlicensed())
+                .expect("closed-policy compile");
         assert_eq!(
             default_bytes, policy_bytes,
             "`{}` differs between compile_module and the closed policy",
@@ -2267,7 +2324,22 @@ fn the_closed_policy_reproduces_the_default_bytes() {
     }
     let module = finish_wasm32(mb);
     assert_eq!(
-        wasm::compile_module(&module).expect("default compile"),
-        wasm::compile_module_with_policy(&module, &closed).expect("closed-policy compile"),
+        wasm::compile_module_with_policy_and_license(
+            &module,
+            &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+            &permit_unlicensed()
+        )
+        .expect("default compile"),
+        wasm::compile_module_with_policy_and_license(&module, &closed, &permit_unlicensed())
+            .expect("closed-policy compile"),
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

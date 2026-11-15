@@ -10,17 +10,16 @@
 // Run with `--features unsafe-unrelocated-buffer-cache-test-hooks`; the binary
 // deliberately exercises quarantined same-process executable-buffer replay.
 //
-// Defaults reproduce the 50-variable/218-clause random-3SAT shape used by the
-// `JitBcpKernelProvider::compile` 1.4-1.7 ms measurement in
-// `benchmarks/benchmark_study.md`.
+// Defaults use the historical 50-variable/218-clause random-3SAT workload.
+// Timings are local diagnostic measurements, not release evidence.
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use std::collections::HashMap;
-use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use clap::Parser;
 
 use trust_cg_codegen::Compiler;
@@ -78,21 +77,27 @@ impl PhaseAccum {
     }
 }
 
-fn main() -> ExitCode {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    anyhow::ensure!(args.repetitions > 0, "repetitions must be positive");
+    anyhow::ensure!(
+        (3..=i32::MAX as usize).contains(&args.num_vars),
+        "num-vars must be in 3..=i32::MAX"
+    );
 
-    let clauses = random_3sat(args.num_vars, args.num_clauses, args.seed);
+    let clauses = random_3sat(args.num_vars, args.num_clauses, args.seed)?;
 
     // Warmup: pre-touch the JIT plumbing so we don't bake one-shot allocator
     // and mmap costs into the first sample.
     for _ in 0..args.warmup {
-        let module = build_bcp_propagate_module();
+        let module = build_bcp_propagate_module()?;
         let mut config = CompilerConfig::for_host_jit();
         config.trace_level = CompilerTraceLevel::Full;
         let extern_symbols: HashMap<String, *const u8> = HashMap::new();
         let _ = Compiler::new(config)
+            .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
             .compile_module_to_jit(&module, &extern_symbols)
-            .expect("warmup compile");
+            .with_context(|| "warmup compile")?;
     }
 
     // Accumulators.
@@ -116,7 +121,7 @@ fn main() -> ExitCode {
     for _ in 0..args.repetitions {
         // 1. Time `build_bcp_propagate_module()` alone.
         let t = Instant::now();
-        let module = build_bcp_propagate_module();
+        let module = build_bcp_propagate_module()?;
         module_construction.record(t.elapsed());
 
         // 2. Time `Compiler::compile_module_to_jit` and capture its trace.
@@ -125,8 +130,9 @@ fn main() -> ExitCode {
         let extern_symbols: HashMap<String, *const u8> = HashMap::new();
         let t = Instant::now();
         let result = Compiler::new(config)
+            .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
             .compile_module_to_jit(&module, &extern_symbols)
-            .expect("compile_module_to_jit");
+            .with_context(|| "compile_module_to_jit")?;
         compile_module_to_jit_total.record(t.elapsed());
 
         // 3. Decompose the compile via the captured trace + per-function
@@ -160,7 +166,7 @@ fn main() -> ExitCode {
         // 5. Time the full provider end-to-end for cross-reference.
         let t = Instant::now();
         let provider = JitBcpKernelProvider::compile(args.num_vars, clauses.clone())
-            .expect("JitBcpKernelProvider::compile");
+            .with_context(|| "JitBcpKernelProvider::compile")?;
         full_provider.record(t.elapsed());
         std::hint::black_box(provider);
     }
@@ -266,36 +272,21 @@ fn main() -> ExitCode {
     println!("## JIT compile cache: L2 disk-cold vs L2 disk-warm (ExecutableBuffer)");
     println!();
 
-    // Use a per-process tempdir as the cache root for both tiers so
-    // this microbench cannot disturb the developer's real
-    // `~/.cache/trust-cg/`. `tempfile` is a dev-dep only, so we
-    // construct the directory directly under `std::env::temp_dir()`.
-    let pid = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let bench_tmp = std::env::temp_dir().join(format!("trust-cg-jit-buf-bench-{pid}-{ts}"));
-    std::fs::create_dir_all(&bench_tmp).expect("microbench tempdir");
-    trust_cg_jit_matrix::jit_disk_cache::set_disk_cache_root_for_tests(Some(bench_tmp.clone()));
-    // SAFETY: the unique tempdir is owned for this process only; this benchmark
-    // uses an empty extern map and keeps profiling instrumentation disabled.
-    unsafe {
-        trust_cg_jit_matrix::executable_buffer_cache::set_buffer_cache_root_for_tests(Some(
-            bench_tmp.clone(),
-        ));
-    }
+    // Own both override slots and the unique directory through every error
+    // return. The benchmark cannot reach the user's persistent cache root.
+    let _cache_directory = CacheDirectory::new()?;
 
-    let l2_module = build_bcp_propagate_module();
+    let l2_module = build_bcp_propagate_module()?;
     let l2_config = CompilerConfig::for_host_jit();
     let l2_externs: HashMap<String, *const u8> = HashMap::new();
     // Pre-compute a serialized buffer for the L2-warm path so each
     // iteration measures only the disk + decode + mmap cost.
     let warm_buffer = Compiler::new(l2_config.clone())
+        .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
         .compile_module_to_jit(&l2_module, &l2_externs)
-        .expect("warmup compile")
+        .with_context(|| "warmup compile")?
         .buffer;
-    let warm_bytes = serialize_buffer(&warm_buffer);
+    let warm_bytes = serialize_buffer(&warm_buffer)?;
     drop(warm_buffer); // free the live mapping; we replay from bytes
 
     let mut cold_compile = PhaseAccum::default();
@@ -313,8 +304,8 @@ fn main() -> ExitCode {
         clear_disk_cache();
         trust_cg_jit_matrix::executable_buffer_cache::clear_buffer_cache();
         let t = Instant::now();
-        let provider =
-            JitBcpKernelProvider::compile(args.num_vars, clauses.clone()).expect("cold compile");
+        let provider = JitBcpKernelProvider::compile(args.num_vars, clauses.clone())
+            .with_context(|| "cold compile")?;
         cold_compile.record(t.elapsed());
         std::hint::black_box(&provider);
 
@@ -328,12 +319,12 @@ fn main() -> ExitCode {
         // Prime L3 only: invoke `compile_or_get_cached` once so the IR
         // text lands on disk, then clear in-memory + L2 again.
         let _ = JitBcpKernelProvider::compile_or_get_cached(args.num_vars, clauses.clone())
-            .expect("prime l3");
+            .with_context(|| "prime l3")?;
         reset_jit_compile_caches_for_tests();
         trust_cg_jit_matrix::executable_buffer_cache::clear_buffer_cache();
         let t = Instant::now();
         let provider = JitBcpKernelProvider::compile_or_get_cached(args.num_vars, clauses.clone())
-            .expect("L3 hit");
+            .with_context(|| "L3 hit")?;
         l3_ir_text.record(t.elapsed());
         std::hint::black_box(provider);
 
@@ -344,7 +335,7 @@ fn main() -> ExitCode {
         trust_cg_jit_matrix::executable_buffer_cache::clear_buffer_cache();
         let t = Instant::now();
         let provider = JitBcpKernelProvider::compile_or_get_cached(args.num_vars, clauses.clone())
-            .expect("L2 cold (writes L2+L3)");
+            .with_context(|| "L2 cold (writes L2+L3)")?;
         l2_disk_cold.record(t.elapsed());
         std::hint::black_box(provider);
 
@@ -355,14 +346,14 @@ fn main() -> ExitCode {
         reset_jit_compile_caches_for_tests();
         let t = Instant::now();
         let provider = JitBcpKernelProvider::compile_or_get_cached(args.num_vars, clauses.clone())
-            .expect("L2 warm");
+            .with_context(|| "L2 warm")?;
         l2_disk_warm.record(t.elapsed());
         std::hint::black_box(provider);
 
         // 5. in-memory warm: same cache, second invocation.
         let t = Instant::now();
         let arc = JitBcpKernelProvider::compile_or_get_cached(args.num_vars, clauses.clone())
-            .expect("L1 warm");
+            .with_context(|| "L1 warm")?;
         in_mem_warm.record(t.elapsed());
         std::hint::black_box(arc);
     }
@@ -374,11 +365,11 @@ fn main() -> ExitCode {
     let mut bytes_replay = PhaseAccum::default();
     for _ in 0..args.repetitions {
         let t = Instant::now();
-        let payload = decode_buffer_payload(&warm_bytes).expect("decode");
+        let payload = decode_buffer_payload(&warm_bytes).with_context(|| "decode")?;
         // SAFETY: `payload` was serialized immediately above from a buffer
         // produced by this live Trust Codegen process and has not crossed an
         // untrusted persistence boundary.
-        let replayed = unsafe { publish_decoded_payload(payload) }.expect("publish");
+        let replayed = unsafe { publish_decoded_payload(payload) }.with_context(|| "publish")?;
         bytes_replay.record(t.elapsed());
         std::hint::black_box(replayed);
     }
@@ -423,16 +414,49 @@ fn main() -> ExitCode {
         "L2 disk-warm speedup over L3 IR-text:   {l3_vs_l2:.1}x ({l3_us:.1} us -> {warm_us:.1} us)"
     );
 
-    // Restore the override slots so a subsequent process invocation
-    // does not see this run's tempdir leak in.
-    trust_cg_jit_matrix::jit_disk_cache::set_disk_cache_root_for_tests(None);
-    // SAFETY: clearing the process-private override cannot expose a replay.
-    unsafe {
-        trust_cg_jit_matrix::executable_buffer_cache::set_buffer_cache_root_for_tests(None);
-    }
-    let _ = std::fs::remove_dir_all(&bench_tmp);
+    Ok(())
+}
 
-    ExitCode::SUCCESS
+struct CacheDirectory {
+    _directory: tempfile::TempDir,
+}
+
+impl CacheDirectory {
+    fn new() -> std::io::Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("trust-cg-jit-buf-bench-")
+            .tempdir()?;
+        // The IR-text disk cache is used only below a directory no other
+        // user can write (`0777 & !umask` otherwise).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        trust_cg_jit_matrix::jit_disk_cache::set_disk_cache_root_for_tests(Some(
+            directory.path().to_owned(),
+        ));
+        // SAFETY: this process owns the unique directory, uses an empty extern
+        // map, and keeps profiling instrumentation disabled during replay.
+        unsafe {
+            trust_cg_jit_matrix::executable_buffer_cache::set_buffer_cache_root_for_tests(Some(
+                directory.path().to_owned(),
+            ));
+        }
+        Ok(Self {
+            _directory: directory,
+        })
+    }
+}
+
+impl Drop for CacheDirectory {
+    fn drop(&mut self) {
+        trust_cg_jit_matrix::jit_disk_cache::set_disk_cache_root_for_tests(None);
+        // SAFETY: clearing the process-private override cannot expose replay.
+        unsafe {
+            trust_cg_jit_matrix::executable_buffer_cache::set_buffer_cache_root_for_tests(None);
+        }
+    }
 }
 
 fn print_row(name: &str, us: f64, denom_us: f64) {

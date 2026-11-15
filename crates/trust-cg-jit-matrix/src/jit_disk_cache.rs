@@ -12,7 +12,7 @@
 // cache always starts cold. This module persists the trust-ir module
 // text (the format consumed by `Compiler::compile_module_to_jit`) to
 // `$XDG_CACHE_HOME/trust-cg/jit/<hash>-<kernel>-<builder-id>.trust_ir` (or
-// `~/.cache/trust-cg/jit/` when XDG is not set), so cross-process
+// `~/.cache/trust-cg/jit/` when XDG_CACHE_HOME is not an absolute path), so cross-process
 // invocations can skip module construction and re-enter the JIT
 // compiler directly with the cached IR.
 //
@@ -34,14 +34,33 @@
 // control could affect that builder, so lookup and publication share the same
 // fail-closed environment guard as compiled-provider L1 and executable L2.
 //
+// # Custody
+//
+// A hit is parsed, JIT-compiled and executed, so an entry another user
+// could plant would choose the code that runs. The cache is therefore used
+// only from an owner-private canonical directory, the rule the TCJ2
+// executable store holds (`private_fs::canonical_owner_private_directory`:
+// every canonical ancestor owned by this user or root and renamable by
+// nobody else, the directory itself not group/other-writable). A directory
+// that fails is ignored, never repaired: lookups miss and nothing is written
+// into it. Every entry is named from the canonical path the check returned,
+// never from `$XDG_CACHE_HOME`'s spelling, which may lead there through a
+// symlink another user can re-point. Each entry's integrity tag is an
+// HMAC-SHA256 under a random 32-byte key kept beside the entries in an
+// owner-private (`0600`) file (`IR_TEXT_SEAL_KEY_FILE`), over the entry's
+// file name and payload, so an entry nobody holding that key wrote (an
+// unkeyed digest anyone could recompute, before X-HOST-P13's fourth closure
+// audit) misses instead of being compiled.
+//
 // # Failure mode
 //
 // Every disk I/O failure in this module degrades to "act as if the
 // disk cache did not exist": missing directories, permission errors,
-// unreadable files, corrupt content, and concurrent-writer races all
-// fall back to a fresh in-process compile. The kernel-construction
-// path therefore NEVER fails because of disk issues - it only fails
-// because of an actual JIT-compile error.
+// unreadable files, corrupt content, a non-private directory, a missing or
+// non-private seal key, and concurrent-writer races all fall back to a
+// fresh in-process compile. The kernel-construction path therefore NEVER
+// fails because of disk issues - it only fails because of an actual
+// JIT-compile error.
 
 use std::fs;
 use std::io::Write;
@@ -49,8 +68,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-
-use sha2::{Digest, Sha256};
 
 /// Default eviction bound: keep at most this many cached IR files on
 /// disk. The watched-literal kernel's text representation is currently
@@ -75,17 +92,29 @@ const DISK_CACHE_EXT: &str = "trust_ir";
 /// 0       8       magic = b"TCGIRTXT"
 /// 8       4       schema version (u32)
 /// 12      8       payload length (u64)
-/// 20      32      SHA-256(payload)
+/// 20      32      HMAC-SHA256(seal key, domain || file name || payload length || payload)
 /// 52      ...     UTF-8 Trust-IR module text
 /// ```
 ///
 /// The schema and exact length make format changes and truncation fail
-/// closed; the digest rejects otherwise well-formed corruption or
-/// substitution. The filename independently carries the complete local
+/// closed; the keyed tag rejects corruption, substitution, an entry moved to
+/// another slot's name, and an entry written by anyone without the seal key
+/// (schema 1's unkeyed SHA-256 could be recomputed by whoever wrote the
+/// file). The filename independently carries the complete local
 /// builder/pipeline identity.
 const CACHE_ENTRY_MAGIC: &[u8; 8] = b"TCGIRTXT";
-const CACHE_ENTRY_SCHEMA: u32 = 1;
+const CACHE_ENTRY_SCHEMA: u32 = 2;
 const CACHE_ENTRY_HEADER_LEN: usize = CACHE_ENTRY_MAGIC.len() + 4 + 8 + 32;
+/// Domain separation of the entry tag from every other use of a seal key.
+const CACHE_ENTRY_TAG_DOMAIN: &[u8] = b"trust-cg.jit-ir-text-cache.entry.v2\0";
+/// The seal key's file in the cache directory: 32 random bytes, created
+/// exclusively with mode `0600` and read only when this user owns it and no
+/// other user can read or write it (the TCJ2 store's key discipline,
+/// `executable_buffer_cache::open_seal_key`). Not a `.trust_ir` file, so no
+/// eviction or clear removes it.
+pub const IR_TEXT_SEAL_KEY_FILE: &str = "ir-text-seal.key";
+/// An entry larger than this is refused before it is read.
+const CACHE_ENTRY_MAX_BYTES: u64 = 64 << 20;
 
 /// Environment variable that gates *all* disk-cache I/O. When unset
 /// (the default), every `disk_lookup` and `disk_store` returns the
@@ -146,28 +175,34 @@ pub fn set_disk_cache_root_for_tests(path: Option<PathBuf>) {
 }
 
 /// Resolve the on-disk cache directory. Returns the override path when
-/// set; otherwise consults `$XDG_CACHE_HOME` and falls back to
-/// `$HOME/.cache/trust-cg/jit`. Returns `None` when neither variable is
-/// usable, which the caller treats as a cold miss with no error.
+/// set; otherwise `<user cache>/trust-cg/jit`, the user cache by the one
+/// rule every trust-cg cache root shares
+/// (`trust_cg_process_env::private_fs::user_cache_base`: an absolute
+/// `$XDG_CACHE_HOME`, else an absolute `$HOME/.cache`). Returns `None` when
+/// neither variable names an absolute directory, which the caller treats as
+/// a cold miss with no error.
 pub fn disk_cache_dir() -> Option<PathBuf> {
     if let Ok(guard) = override_slot().lock()
         && let Some(p) = guard.as_ref()
     {
         return Some(p.clone());
     }
-    if let Some(root) = std::env::var_os("XDG_CACHE_HOME") {
-        let p = PathBuf::from(root);
-        if !p.as_os_str().is_empty() {
-            return Some(p.join(DISK_CACHE_SUBDIR));
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let p = PathBuf::from(home);
-        if !p.as_os_str().is_empty() {
-            return Some(p.join(".cache").join(DISK_CACHE_SUBDIR));
-        }
-    }
-    None
+    default_disk_cache_dir(
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// `<user cache>/trust-cg/jit` for these `XDG_CACHE_HOME` and `HOME` values,
+/// by the one user-cache rule every trust-cg cache root shares: an empty or
+/// relative XDG_CACHE_HOME is ignored, a relative HOME names no cache.
+fn default_disk_cache_dir(
+    xdg_cache_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    trust_cg_process_env::private_fs::user_cache_base(xdg_cache_home, home)
+        .ok()
+        .map(|base| base.join(DISK_CACHE_SUBDIR))
 }
 
 /// Build the per-(hash, kernel, builder-identity) filename. Kernel name is included as a
@@ -199,8 +234,11 @@ fn cache_filename_with_identity(
     format!("{hash:016x}-{kernel_name}-{identity}.{DISK_CACHE_EXT}")
 }
 
+/// The entry's path in the cache directory as [`private_cache_dir`] names it
+/// (`None` when the directory is missing or not private).
+#[cfg(test)]
 fn cache_path(hash: u64, kernel_name: &str) -> Option<PathBuf> {
-    Some(disk_cache_dir()?.join(cache_filename(hash, kernel_name)))
+    Some(private_cache_dir(false)?.join(cache_filename(hash, kernel_name)))
 }
 
 fn temporary_cache_filename(
@@ -216,44 +254,170 @@ fn temporary_cache_filename(
     )
 }
 
-/// Ensure the cache directory exists. Idempotent: a pre-existing
-/// directory is success; a creation failure is logged once and treated
-/// as "no disk cache available". Returns `Some(path)` when the
-/// directory is ready for use.
-fn ensure_cache_dir() -> Option<PathBuf> {
+/// Whether a refusal of a non-private cache directory was already reported
+/// in this process (reported once, not per lookup).
+static REFUSAL_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The cache directory's canonical path, only when no other user can change
+/// it or any entry along it
+/// (`private_fs::canonical_owner_private_directory`, the rule the TCJ2
+/// executable store holds). With `create`, a missing directory (and its
+/// missing ancestors) is first created `0700` whatever the umask; an
+/// existing one is never changed. `None` (a cold miss, nothing written) for
+/// no cache location, a missing directory without `create`, or a directory
+/// the rule refuses, which is reported once per process. Every entry is named
+/// from the returned canonical path.
+fn private_cache_dir(create: bool) -> Option<PathBuf> {
     let dir = disk_cache_dir()?;
-    match fs::create_dir_all(&dir) {
-        Ok(()) => Some(dir),
-        Err(err) => {
+    if create {
+        // Under `<cache>/trust-cg`, the root the AY private copy is created
+        // under: every directory created is `0700` whatever the umask.
+        if let Err(err) = trust_cg_process_env::private_fs::create_private_dir_all(&dir) {
             eprintln!(
                 "trust-cg jit disk cache: failed to create {} ({err}); falling back to in-memory only",
                 dir.display()
             );
+            return None;
+        }
+    }
+    match trust_cg_process_env::private_fs::canonical_owner_private_directory(&dir) {
+        Ok(canonical) => Some(canonical),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            if !REFUSAL_REPORTED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "trust-cg jit disk cache: ignoring {} ({err}): another user could plant an \
+                     entry there; using the in-memory cache only (an existing directory is never \
+                     changed: make it and its ancestors writable by you alone, or point \
+                     XDG_CACHE_HOME at a private directory)",
+                    dir.display()
+                );
+            }
             None
         }
     }
 }
 
+/// The seal key in the canonical cache directory `dir`: read when present
+/// and owner-private; with `create`, published when absent, and a wrong-size
+/// or all-zero key replaced ([`publish_seal_key`]). `None` otherwise.
+fn cache_seal_key(dir: &Path, create: bool) -> Option<[u8; 32]> {
+    let key_path = dir.join(IR_TEXT_SEAL_KEY_FILE);
+    match crate::executable_buffer_cache::read_seal_key(&key_path) {
+        Ok(key) => Some(key),
+        Err(error)
+            if create
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                ) =>
+        {
+            publish_seal_key(
+                dir,
+                &key_path,
+                error.kind() == std::io::ErrorKind::InvalidData,
+            )
+            .ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// Distinguishes the staging names of one process's concurrent key creators.
+static SEAL_KEY_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Publish a fresh random seal key at `key_path` in the canonical cache
+/// directory `dir` and return the key every opener then holds.
+///
+/// The key is written whole into a private (`0600`, `O_EXCL`) staging file
+/// first and only then given its final name, so the final name never holds a
+/// partly written key. A missing key (`replace` false) is published with a
+/// hard link, which fails when a key is already there: one creator wins, and
+/// every other one reads the winner's complete key. Before X-HOST-P13's fifth
+/// closure audit the key was created under its final name and written
+/// afterwards; a concurrent opener that read the short file in between
+/// replaced it with its own key, the two then sealed under different keys,
+/// and entries sealed under the lost key missed and were removed
+/// (`concurrent_writes_do_not_corrupt` failed 20 times in 200). The TCJ2
+/// store keeps its in-place creation (`executable_buffer_cache::open_seal_key`,
+/// measured cheaper per fresh store); this key is created once per cache
+/// directory.
+///
+/// A wrong-size or all-zero key (`replace` true: a crash's remains, since the
+/// key is not fsynced) is replaced by renaming the staging file over it, and
+/// the key is read back, so a later opener uses whichever replacement landed
+/// last. Two concurrent replacements can still leave one opener holding a
+/// key no longer on disk until it reopens; its entries then miss, which
+/// costs a rebuild, never soundness.
+fn publish_seal_key(dir: &Path, key_path: &Path, replace: bool) -> std::io::Result<[u8; 32]> {
+    let key = crate::executable_buffer_cache::random_seal_key()?;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sequence = SEAL_KEY_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    // `.tmp.` in the name: a crashed creator's staging file is pruned with
+    // the other stale temporaries (`enforce_file_cap`).
+    let staging = dir.join(format!(
+        "{IR_TEXT_SEAL_KEY_FILE}.tmp.{}.{nanos}.{sequence}",
+        std::process::id()
+    ));
+    let written = (|| {
+        let mut file = trust_cg_process_env::private_fs::create_private_file(&staging)?;
+        file.write_all(&key)
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    if replace {
+        let renamed = fs::rename(&staging, key_path);
+        if let Err(error) = renamed {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
+        }
+        return crate::executable_buffer_cache::read_seal_key(key_path);
+    }
+    let linked = fs::hard_link(&staging, key_path);
+    let _ = fs::remove_file(&staging);
+    match linked {
+        Ok(()) => Ok(key),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            crate::executable_buffer_cache::read_seal_key(key_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Attempt to read the trust-ir text for `(hash, kernel_name)`.
 /// Returns `None` on any failure (missing file, permission error,
-/// unreadable bytes) and also when disk I/O has not been enabled for
-/// this process via `TRUST_CG_JIT_DISK_CACHE` or a test override. On
-/// success, also bumps the file's mtime so touch-based LRU sees it
-/// as recently used.
+/// unreadable bytes, a cache directory another user could change, no seal
+/// key, an entry whose keyed tag does not verify) and also when disk I/O has
+/// not been enabled for this process via `TRUST_CG_JIT_DISK_CACHE` or a test
+/// override. On success, also bumps the file's mtime so touch-based LRU sees
+/// it as recently used.
 pub fn disk_lookup(hash: u64, kernel_name: &str) -> Option<String> {
     if !crate::env_lock::artifact_reuse_environment_safety().is_reuse_safe() || !disk_io_enabled() {
         return None;
     }
-    let path = cache_path(hash, kernel_name)?;
+    let dir = private_cache_dir(false)?;
+    let name = cache_filename(hash, kernel_name);
+    let path = dir.join(&name);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > CACHE_ENTRY_MAX_BYTES {
+        return None;
+    }
+    let seal_key = cache_seal_key(&dir, false)?;
     let encoded = fs::read(&path).ok()?;
-    let text = match decode_cache_entry(&encoded) {
+    let text = match decode_cache_entry(&seal_key, &name, &encoded) {
         Some(text) => text,
         None => {
             // Cache entries are disposable. Once bytes have been read and
-            // proven malformed, remove them so every future lookup does not
-            // repeat the same failed validation. A concurrent writer uses an
-            // atomic rename, so readers never observe its partial staging
-            // file; removal is best-effort and semantically only a cold miss.
+            // proven malformed or not sealed under this cache's key, remove
+            // them so every future lookup does not repeat the same failed
+            // validation. A concurrent writer uses an atomic rename, so
+            // readers never observe its partial staging file; removal is
+            // best-effort and semantically only a cold miss.
             let _ = fs::remove_file(&path);
             return None;
         }
@@ -264,22 +428,43 @@ pub fn disk_lookup(hash: u64, kernel_name: &str) -> Option<String> {
     Some(text)
 }
 
-fn encode_cache_entry(module_text: &str) -> Option<Vec<u8>> {
+/// The keyed tag of an entry named `name` holding `payload`.
+fn cache_entry_tag(seal_key: &[u8; 32], name: &str, payload: &[u8]) -> Option<[u8; 32]> {
+    let payload_len = u64::try_from(payload.len()).ok()?;
+    let name_len = u64::try_from(name.len()).ok()?;
+    let mut message = Vec::with_capacity(
+        CACHE_ENTRY_TAG_DOMAIN
+            .len()
+            .checked_add(16)?
+            .checked_add(name.len())?
+            .checked_add(payload.len())?,
+    );
+    message.extend_from_slice(CACHE_ENTRY_TAG_DOMAIN);
+    message.extend_from_slice(&name_len.to_le_bytes());
+    message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(&payload_len.to_le_bytes());
+    message.extend_from_slice(payload);
+    Some(crate::executable_buffer_cache::hmac_sha256(
+        seal_key, &message,
+    ))
+}
+
+fn encode_cache_entry(seal_key: &[u8; 32], name: &str, module_text: &str) -> Option<Vec<u8>> {
     let payload = module_text.as_bytes();
     let payload_len = u64::try_from(payload.len()).ok()?;
     let capacity = CACHE_ENTRY_HEADER_LEN.checked_add(payload.len())?;
-    let digest = Sha256::digest(payload);
+    let tag = cache_entry_tag(seal_key, name, payload)?;
 
     let mut encoded = Vec::with_capacity(capacity);
     encoded.extend_from_slice(CACHE_ENTRY_MAGIC);
     encoded.extend_from_slice(&CACHE_ENTRY_SCHEMA.to_le_bytes());
     encoded.extend_from_slice(&payload_len.to_le_bytes());
-    encoded.extend_from_slice(&digest);
+    encoded.extend_from_slice(&tag);
     encoded.extend_from_slice(payload);
     Some(encoded)
 }
 
-fn decode_cache_entry(encoded: &[u8]) -> Option<String> {
+fn decode_cache_entry(seal_key: &[u8; 32], name: &str, encoded: &[u8]) -> Option<String> {
     if encoded.len() < CACHE_ENTRY_HEADER_LEN
         || &encoded[..CACHE_ENTRY_MAGIC.len()] != CACHE_ENTRY_MAGIC
     {
@@ -301,32 +486,36 @@ fn decode_cache_entry(encoded: &[u8]) -> Option<String> {
         return None;
     }
 
-    let digest_offset = length_offset + 8;
-    let expected_digest = &encoded[digest_offset..digest_offset + 32];
+    let tag_offset = length_offset + 8;
+    let stored_tag = &encoded[tag_offset..tag_offset + 32];
     let payload = &encoded[CACHE_ENTRY_HEADER_LEN..];
-    let actual_digest = Sha256::digest(payload);
-    if actual_digest.as_slice() != expected_digest {
+    let expected_tag = cache_entry_tag(seal_key, name, payload)?;
+    if !crate::executable_buffer_cache::constant_time_eq(&expected_tag, stored_tag) {
         return None;
     }
 
     String::from_utf8(payload.to_vec()).ok()
 }
 
-/// Persist `module_text` for `(hash, kernel_name)` inside a versioned,
-/// SHA-256-protected envelope. Creates the cache directory if needed.
-/// Writes atomically via tmpfile + rename so a concurrent reader never
-/// observes a partial file. Failures are logged (once per call site) but
-/// never propagated; the caller's compile proceeds normally on a write
-/// error.
+/// Persist `module_text` for `(hash, kernel_name)` inside a versioned
+/// envelope sealed under the cache's key. Creates the cache directory and
+/// its seal key if needed, and writes only into an owner-private canonical
+/// directory ([`private_cache_dir`]). Writes atomically via tmpfile + rename
+/// so a concurrent reader never observes a partial file. Failures are
+/// logged (once per call site) but never propagated; the caller's compile
+/// proceeds normally on a write error.
 pub fn disk_store(hash: u64, kernel_name: &str, module_text: &str) {
     if !crate::env_lock::artifact_reuse_environment_safety().is_reuse_safe() || !disk_io_enabled() {
         return;
     }
-    let dir = match ensure_cache_dir() {
-        Some(d) => d,
-        None => return,
+    let Some(dir) = private_cache_dir(true) else {
+        return;
     };
-    let final_path = dir.join(cache_filename(hash, kernel_name));
+    let Some(seal_key) = cache_seal_key(&dir, true) else {
+        return;
+    };
+    let name = cache_filename(hash, kernel_name);
+    let final_path = dir.join(&name);
 
     // The monotonic discriminator guarantees that same-process writers do not
     // collide even when the filesystem clock returns the same timestamp.
@@ -338,13 +527,15 @@ pub fn disk_store(hash: u64, kernel_name: &str, module_text: &str) {
     let tmp_name = temporary_cache_filename(hash, kernel_name, pid, nanos);
     let tmp_path = dir.join(&tmp_name);
 
-    let encoded = match encode_cache_entry(module_text) {
+    let encoded = match encode_cache_entry(&seal_key, &name, module_text) {
         Some(encoded) => encoded,
         None => return,
     };
 
     let write_res: std::io::Result<()> = (|| {
-        let mut f = fs::File::create(&tmp_path)?;
+        // `0600` whatever the umask, like every file under `<cache>/trust-cg`
+        // (`private_fs`); `File::create` made it `0664` under umask `0002`.
+        let mut f = trust_cg_process_env::private_fs::create_private_file(&tmp_path)?;
         f.write_all(&encoded)?;
         f.sync_data()?;
         drop(f);
@@ -469,7 +660,8 @@ pub fn clear_disk_cache() {
     if !disk_io_enabled() {
         return;
     }
-    let dir = match disk_cache_dir() {
+    // Only a private directory, by its canonical name, is ever written.
+    let dir = match private_cache_dir(false) {
         Some(d) => d,
         None => return,
     };
@@ -524,6 +716,43 @@ mod tests {
     /// Held for the lifetime of the guard, dropped at test exit.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
+    /// The default directory follows the one user-cache rule: an empty or
+    /// relative `XDG_CACHE_HOME` is ignored and a relative `HOME` names no
+    /// cache, never a directory below the working directory.
+    #[test]
+    fn default_disk_cache_dir_is_the_one_user_cache_rule() {
+        use std::ffi::OsStr;
+        let at = |xdg: Option<&str>, home: Option<&str>| {
+            default_disk_cache_dir(xdg.map(OsStr::new), home.map(OsStr::new))
+        };
+        assert_eq!(
+            at(Some("/xdg"), Some("/h")),
+            Some(PathBuf::from("/xdg/trust-cg/jit"))
+        );
+        for ignored in ["", "relative"] {
+            assert_eq!(
+                at(Some(ignored), Some("/h")),
+                Some(PathBuf::from("/h/.cache/trust-cg/jit"))
+            );
+        }
+        assert_eq!(at(Some("relative"), Some("relative-home")), None);
+        assert_eq!(at(None, Some("")), None);
+    }
+
+    /// A temporary directory only this user can write: the cache is used
+    /// only below one (`private_cache_dir`), and `TempDir::new` makes it
+    /// `0777 & !umask` (`0775` under umask `0002`).
+    fn private_tempdir() -> TempDir {
+        let tmp = TempDir::new().expect("create tempdir for disk cache test");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700))
+                .expect("make the test cache root private");
+        }
+        tmp
+    }
+
     /// Guard that points the disk cache at a private tempdir for the
     /// duration of a single test and restores the previous override
     /// when dropped. Holds `TEST_SERIAL` so concurrent test threads
@@ -539,7 +768,7 @@ mod tests {
             let serial = TEST_SERIAL
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let tmp = TempDir::new().expect("create tempdir for disk cache test");
+            let tmp = private_tempdir();
             let previous = override_slot().lock().ok().and_then(|g| g.clone());
             set_disk_cache_root_for_tests(Some(tmp.path().to_path_buf()));
             Self {
@@ -554,6 +783,34 @@ mod tests {
         fn drop(&mut self) {
             set_disk_cache_root_for_tests(self.previous.clone());
         }
+    }
+
+    /// The cache directory and every entry are private whatever the umask:
+    /// entries were written with `File::create`, `0664` under umask `0002`
+    /// (`0644` under `0022`), beside the AY private copy's `<cache>/trust-cg`
+    /// (X-HOST-P13). Asserting `0600` fails the old writer under any umask
+    /// that leaves group or other bits.
+    #[cfg(unix)]
+    #[test]
+    fn stored_entries_and_created_directories_are_private() {
+        use std::os::unix::fs::MetadataExt;
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        let guard = CacheRootGuard::new();
+        let root = guard._tmp.path().join("cache").join("trust-cg").join("jit");
+        set_disk_cache_root_for_tests(Some(root.clone()));
+        disk_store(7, "private-kernel", "module text body");
+        assert_eq!(mode(&guard._tmp.path().join("cache")), 0o700);
+        assert_eq!(
+            mode(&guard._tmp.path().join("cache").join("trust-cg")),
+            0o700
+        );
+        assert_eq!(mode(&root), 0o700);
+        let entry = cache_path(7, "private-kernel").expect("cache path");
+        assert_eq!(mode(&entry), 0o600, "{}", entry.display());
+        assert_eq!(
+            disk_lookup(7, "private-kernel").as_deref(),
+            Some("module text body")
+        );
     }
 
     #[test]
@@ -675,26 +932,28 @@ mod tests {
                 |_buffer| -> Result<String, &'static str> {
                     Err("the quarantined executable tier must remain cold")
                 },
-                |disk_text| -> Result<(String, Vec<u8>, String), &'static str> {
+                |disk_text| -> Result<(String, Option<Vec<u8>>, String), &'static str> {
                     let (module, module_text) = match disk_text {
                         Some(text) => match parse_trust_ir_text(&text) {
                             Ok(module) => (module, text),
                             Err(_) => {
                                 rebuilds.set(rebuilds.get() + 1);
-                                let module = build_bcp_propagate_module();
+                                let module =
+                                    build_bcp_propagate_module().expect("the kernel module builds");
                                 let text = encode_trust_ir_text(&module);
                                 (module, text)
                             }
                         },
                         None => {
                             rebuilds.set(rebuilds.get() + 1);
-                            let module = build_bcp_propagate_module();
+                            let module =
+                                build_bcp_propagate_module().expect("the kernel module builds");
                             let text = encode_trust_ir_text(&module);
                             (module, text)
                         }
                     };
                     let _ = module;
-                    Ok(("compiled".to_owned(), Vec::new(), module_text))
+                    Ok(("compiled".to_owned(), None, module_text))
                 },
             )
         };
@@ -759,11 +1018,139 @@ mod tests {
 
     #[test]
     fn unknown_schema_is_rejected() {
-        let mut encoded = encode_cache_entry("module text").expect("encode cache entry");
+        let key = [7u8; 32];
+        let mut encoded = encode_cache_entry(&key, "slot", "module text").expect("encode");
+        assert_eq!(
+            decode_cache_entry(&key, "slot", &encoded).as_deref(),
+            Some("module text")
+        );
         let schema_offset = CACHE_ENTRY_MAGIC.len();
         encoded[schema_offset..schema_offset + 4]
             .copy_from_slice(&(CACHE_ENTRY_SCHEMA + 1).to_le_bytes());
-        assert!(decode_cache_entry(&encoded).is_none());
+        assert!(decode_cache_entry(&key, "slot", &encoded).is_none());
+    }
+
+    /// The schema-1 envelope: an unkeyed SHA-256 of the payload, which
+    /// anyone who can write the file can compute.
+    fn unkeyed_schema_1_entry(module_text: &str) -> Vec<u8> {
+        let payload = module_text.as_bytes();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(CACHE_ENTRY_MAGIC);
+        encoded.extend_from_slice(&1u32.to_le_bytes());
+        encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(&<sha2::Sha256 as sha2::Digest>::digest(payload));
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
+    /// An entry nobody holding this cache's seal key wrote never matches,
+    /// however well formed: an unkeyed envelope (schema 1), one sealed under
+    /// another key, and one moved from another slot's name each miss and are
+    /// removed; the genuine entry still hits (X-HOST-P13 fourth closure
+    /// audit: the unkeyed digest made a planted entry valid).
+    #[test]
+    fn an_entry_not_sealed_under_this_caches_key_misses() {
+        let _g = CacheRootGuard::new();
+        disk_store(51, "sealed", "genuine module text");
+        let path = cache_path(51, "sealed").expect("cache path");
+        let genuine = fs::read(&path).expect("read the genuine entry");
+        assert_eq!(
+            disk_lookup(51, "sealed").as_deref(),
+            Some("genuine module text")
+        );
+        let name = cache_filename(51, "sealed");
+        let other_slot = cache_filename(52, "sealed");
+        let dir = private_cache_dir(false).expect("private cache dir");
+        let key = cache_seal_key(&dir, false).expect("the cache's seal key");
+        let planted = [
+            unkeyed_schema_1_entry("PLANTED module text"),
+            encode_cache_entry(&[0x42; 32], &name, "PLANTED module text").unwrap(),
+            encode_cache_entry(&key, &other_slot, "PLANTED module text").unwrap(),
+        ];
+        for (index, forged) in planted.iter().enumerate() {
+            fs::write(&path, forged).expect("plant an entry");
+            assert_eq!(disk_lookup(51, "sealed"), None, "planted entry {index}");
+            assert!(!path.exists(), "planted entry {index} is removed");
+        }
+        fs::write(&path, &genuine).expect("restore the genuine entry");
+        assert_eq!(
+            disk_lookup(51, "sealed").as_deref(),
+            Some("genuine module text")
+        );
+    }
+
+    /// A cache directory, or a seal key, another user could change is
+    /// ignored, never repaired: lookups miss, nothing is written into it,
+    /// and its mode is left as it was. The rule is the TCJ2 store's
+    /// (`canonical_owner_private_directory`).
+    #[cfg(unix)]
+    #[test]
+    fn a_non_private_cache_is_ignored_and_never_written() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let set_mode = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        let guard = CacheRootGuard::new();
+        let base = guard._tmp.path().canonicalize().unwrap();
+        set_mode(&base, 0o700);
+        let root = base.join("jit");
+        set_disk_cache_root_for_tests(Some(root.clone()));
+        disk_store(61, "k", "private payload");
+        assert_eq!(disk_lookup(61, "k").as_deref(), Some("private payload"));
+        assert_eq!(mode(&root.join(IR_TEXT_SEAL_KEY_FILE)), 0o600);
+
+        // The cache directory group-writable.
+        set_mode(&root, 0o775);
+        assert_eq!(disk_lookup(61, "k"), None);
+        disk_store(62, "k", "must not be written");
+        assert!(!root.join(cache_filename(62, "k")).exists());
+        assert_eq!(mode(&root), 0o775, "an existing directory is never changed");
+        set_mode(&root, 0o700);
+        assert_eq!(disk_lookup(61, "k").as_deref(), Some("private payload"));
+
+        // The seal key readable or writable by others.
+        let key = root.join(IR_TEXT_SEAL_KEY_FILE);
+        for loose in [0o644, 0o660] {
+            set_mode(&key, loose);
+            assert_eq!(disk_lookup(61, "k"), None, "{loose:o}");
+            disk_store(63, "k", "must not be written");
+            assert!(!root.join(cache_filename(63, "k")).exists());
+            assert_eq!(mode(&key), loose, "the key is never changed");
+        }
+        set_mode(&key, 0o600);
+
+        // An ancestor others can rename entries in, named directly and
+        // through a symlink.
+        let shared = base.join("shared");
+        fs::create_dir(&shared).unwrap();
+        set_mode(&shared, 0o777);
+        let inner = shared.join("jit");
+        set_disk_cache_root_for_tests(Some(inner.clone()));
+        disk_store(64, "k", "must not be written");
+        assert!(
+            fs::read_dir(&inner).map_or(true, |mut read| read.next().is_none()),
+            "nothing is written below an open ancestor"
+        );
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&inner, &alias).unwrap();
+        set_disk_cache_root_for_tests(Some(alias));
+        assert_eq!(disk_lookup(64, "k"), None);
+
+        // A private cache reached through a symlink in the open directory is
+        // used by its canonical name.
+        let link = shared.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        set_disk_cache_root_for_tests(Some(link.clone()));
+        assert_eq!(disk_lookup(61, "k").as_deref(), Some("private payload"));
+        disk_store(65, "k", "through the link");
+        assert!(root.join(cache_filename(65, "k")).is_file());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -827,7 +1214,7 @@ mod tests {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let tmp = TempDir::new().expect("create tempdir for cross-process IR-cache test");
+        let tmp = private_tempdir();
         let test_binary = std::env::current_exe().expect("resolve current test binary");
 
         // Scope each real backend control to a child process instead of
@@ -951,13 +1338,97 @@ mod tests {
         assert!(final_text.starts_with("payload-shared-"));
     }
 
+    /// Concurrent first openers of a cache directory all hold one complete
+    /// seal key, the one on disk: the key reaches its final name only whole
+    /// ([`publish_seal_key`]). Before X-HOST-P13's fifth closure audit a
+    /// creator wrote the key after creating its final name, a concurrent
+    /// opener that read the short file replaced it with its own key, and an
+    /// entry sealed under the lost key missed and was removed
+    /// (`concurrent_writes_do_not_corrupt` failed 20 times in 200). A short
+    /// key a crash left is replaced and read back, never by a lookup, and a
+    /// crashed creator's staging file is never taken as the key.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_first_openers_share_one_complete_seal_key() {
+        use crate::executable_buffer_cache::read_seal_key;
+        use std::os::unix::fs::PermissionsExt;
+        const OPENERS: usize = 8;
+        let private_dir = |path: &Path| {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        let write_private = |path: &Path, bytes: &[u8]| {
+            trust_cg_process_env::private_fs::create_private_file(path)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        };
+        let base = tempfile::tempdir().unwrap();
+        fs::set_permissions(base.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        for round in 0..64 {
+            let dir = base.path().join(format!("round-{round}"));
+            private_dir(&dir);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+            let openers: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    let dir = dir.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        cache_seal_key(&dir, true)
+                    })
+                })
+                .collect();
+            let keys: Vec<_> = openers
+                .into_iter()
+                .map(|opener| opener.join().unwrap())
+                .collect();
+            let on_disk = read_seal_key(&dir.join(IR_TEXT_SEAL_KEY_FILE))
+                .unwrap_or_else(|error| panic!("round {round}: one complete key: {error}"));
+            for key in keys {
+                assert_eq!(
+                    key,
+                    Some(on_disk),
+                    "round {round}: every opener holds the key on disk"
+                );
+            }
+            let names: Vec<_> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                names,
+                [IR_TEXT_SEAL_KEY_FILE],
+                "round {round}: no staging file is left"
+            );
+        }
+
+        let dir = base.path().join("crashed");
+        private_dir(&dir);
+        let key_path = dir.join(IR_TEXT_SEAL_KEY_FILE);
+        write_private(
+            &dir.join(format!("{IR_TEXT_SEAL_KEY_FILE}.tmp.1.2.3")),
+            &[7; 32],
+        );
+        write_private(&key_path, &[9; 5]);
+        assert_eq!(
+            cache_seal_key(&dir, false),
+            None,
+            "a lookup never repairs a key"
+        );
+        let replaced = cache_seal_key(&dir, true).expect("a short key is replaced");
+        assert_ne!(replaced, [7; 32], "a staging file is never the key");
+        assert_eq!(read_seal_key(&key_path).unwrap(), replaced);
+        assert_eq!(cache_seal_key(&dir, false), Some(replaced));
+    }
+
     #[test]
     fn missing_dir_is_cold_miss_not_error() {
         let _serial = TEST_SERIAL
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         // Point at a directory we never create, then look up.
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = private_tempdir();
         let bogus = tmp.path().join("does-not-exist-yet");
         let previous = override_slot().lock().ok().and_then(|g| g.clone());
         set_disk_cache_root_for_tests(Some(bogus));

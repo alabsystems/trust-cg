@@ -5,28 +5,21 @@
 
 //! Conservative dead code elimination for x86-64 ISel-output functions.
 //!
-//! This pass is intentionally scoped to the x86 pass-manager surface. It is not
-//! part of the default x86 codegen pipeline.
-
-use std::collections::HashSet;
+//! Runs in the x86 optimization pipeline and through the standalone pass manager.
 
 use trust_cg_ir::{VReg, X86Opcode};
 use trust_cg_lower::{X86ISelFunction, X86ISelInst, X86ISelOperand};
 
 use crate::effects::{
-    x86_inst_effect, x86_is_removable, x86_produces_value, x86_reads_flags, x86_writes_flags,
+    FlagOverwrite, condition_flag_overwrite, x86_inst_effect, x86_is_removable,
+    x86_operand0_may_be_read, x86_produces_value, x86_reads_flags,
 };
+use crate::fast_hash::{FxHashMap, FxHashSet as HashSet};
+use crate::x86_flag_liveness::X86FlagLiveness;
 use crate::x86_pass_manager::X86MachinePass;
 
 /// Dead Code Elimination for x86-64 ISel-output machine functions.
 pub struct X86DeadCodeElimination;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FlagOverwrite {
-    None,
-    Partial,
-    Full,
-}
 
 impl X86DeadCodeElimination {
     /// Run x86 DCE directly on an ISel function.
@@ -47,10 +40,15 @@ impl X86MachinePass for X86DeadCodeElimination {
 
 fn run_impl(func: &mut X86ISelFunction) -> bool {
     let mut changed = false;
-    let local_tier = local_dce_enabled();
 
     loop {
         let used_vregs = collect_used_vregs(func);
+        // Recomputed every iteration. Within one iteration the snapshot stays
+        // valid because every deletion below is justified by "the flags this
+        // instruction writes are dead", which is exactly the condition under
+        // which a deletion cannot change what any reader observes — see the
+        // module docs of [`crate::x86_flag_liveness`].
+        let flag_liveness = X86FlagLiveness::analyze(func);
         let mut iteration_changed = false;
 
         for block_id in func.block_order.clone() {
@@ -59,13 +57,18 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
             };
 
             let old_len = block.insts.len();
-            let remove: Vec<bool> = block
-                .insts
-                .iter()
-                .enumerate()
-                .map(|(index, inst)| {
+            let remove: Vec<bool> = (0..block.insts.len())
+                .map(|index| {
+                    let inst = &block.insts[index];
                     is_dead_instruction(inst, &used_vregs)
                         || is_dead_flag_only_instruction(&block.insts, index)
+                        || is_dead_flag_writing_alu(
+                            &block.insts,
+                            index,
+                            &used_vregs,
+                            &flag_liveness,
+                            block_id,
+                        )
                 })
                 .collect();
             let mut next_insts = Vec::with_capacity(block.insts.len());
@@ -75,7 +78,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                 }
             }
             block.insts = next_insts;
-            if local_tier && local_per_def_dce_on_block(&mut block.insts) {
+            if local_per_def_dce_on_block(&mut block.insts) {
                 iteration_changed = true;
             }
             iteration_changed |= block.insts.len() != old_len;
@@ -91,7 +94,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Per-def local deadness tier (DEFAULT-ON; `TCG_NO_X86_DCE_LOCAL` opts out)
+// Per-def local deadness tier
 //
 // The function-wide `used_vregs` model above keeps EVERY def of a vreg id
 // alive as long as ANY use of that id exists anywhere — sound, but blind in a
@@ -111,8 +114,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
 // def's value, not the candidate's (same vreg, straight-line between). Reads
 // on another path: impossible — no control flow leaves the window. The
 // redefining instruction itself must not READ the vreg (tied forms): checked
-// via `first_operand_is_def_and_use` + an operand scan of its non-def
-// operands.
+// via `redef_reads_operand0` + an operand scan of its non-def operands.
 //
 // What may be deleted (each fail-closed beyond the window proof):
 //   - the pure no-flag set `x86_is_removable` (MovRR/MovRI/Lea/…);
@@ -120,23 +122,28 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
 //     SubRI/ImulRR/ImulRRI/AndRR/AndRI/OrRR/OrRI/XorRR/XorRI/ShlRI/ShrRI/
 //     SarRI), additionally requiring `flags_written_here_are_dead` — the
 //     same obligation the flag-only deletion above discharges;
-//   - direct stack-slot loads `MovRM [StackSlot + d]` (never trap: frame
-//     slots are mapped for the function's lifetime; deleting a dead
-//     non-faulting load is unobservable), requiring no proof_origin (an
-//     atomic/volatile load carries one and is never deleted).
+//   - [REJECTED, NOT IMPLEMENTED] direct stack-slot loads
+//     `MovRM [StackSlot + d]`. This tier was considered and REJECTED in
+//     review — see the `LocalDceClass` note below, "memory reads stay out of
+//     scope entirely" — so no such deletion exists. The description is kept
+//     only to record what was turned down.
+//
+//     Its stated precondition was ALSO wrong, which is the more useful thing
+//     to record: it claimed "an atomic/volatile load carries [a proof_origin]
+//     and is never deleted". An ATOMIC load does. A VOLATILE load does NOT —
+//     `X86ProofOrigin` has exactly three variants (`AtomicLoad`,
+//     `AtomicStore`, `FenceSeqCst`) and x86 volatile is lowered to the
+//     dedicated `Volatile*` opcodes instead. What keeps volatile loads out of
+//     this pass is their `MemoryEffect::Call` classification and their
+//     HAS_SIDE_EFFECTS flags, not a proof_origin. Anyone reinstating this tier
+//     on the strength of the original sentence would have deleted volatile
+//     loads.
 // No operand may be a PReg (fixed-register contracts are ABI-observable).
 // ---------------------------------------------------------------------------
 
-/// DEFAULT-ON after the 2026-07-20 record (the Cmovcc/tied-shadow classes
-/// are excluded by the closed `full_unconditional_overwrite` allowlist and
-/// pinned by teeth); `TCG_NO_X86_DCE_LOCAL` is the forensic opt-out.
-fn local_dce_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_DCE_LOCAL").is_none()
-}
-
 /// Pure flag-writing ALU allowlist for the per-def local tier. Closed set:
 /// every member writes RFLAGS as its only effect beyond the operand-0 def.
-fn local_dce_pure_flag_alu(opcode: X86Opcode) -> bool {
+pub(crate) fn local_dce_pure_flag_alu(opcode: X86Opcode) -> bool {
     use X86Opcode::*;
     matches!(
         opcode,
@@ -201,6 +208,11 @@ pub(crate) fn full_unconditional_overwrite(opcode: X86Opcode) -> bool {
             | MovRM
             | MovRM32
             | MovRMSib
+            // The zero-extending loads write the whole register (a 32-bit
+            // write zero-extends to 64); `MovRM8`/`MovRM16` merge and are out.
+            | MovzxRM8
+            | MovzxRM16
+            | MovzxRM8Sib
             | Lea
             | LeaSib
             | Movzx
@@ -227,64 +239,228 @@ pub(crate) fn full_unconditional_overwrite(opcode: X86Opcode) -> bool {
 }
 
 /// Whether a value-producing instruction READS its operand-0 (the tied-form
-/// question, answered per FORM rather than per opcode). The blanket
-/// `first_operand_is_def_and_use` returns true for the whole immediate ALU
-/// family, but the THREE-operand forms (`AddRI d, s, imm`) do not read `d` —
-/// only the 2-operand tied forms do. Used by the shadow-redef acceptance;
-/// anything unrecognized answers `true` (fail-closed: treated as tied).
+/// question, answered EXACTLY per form for the shadow-redef allowlist).
+///
+/// [`x86_operand0_may_be_read`] over-approximates on purpose (it counts the
+/// whole immediate ALU family as tied), which is right for liveness but would
+/// refuse every three-operand shadow: `AddRI d, s, imm` does not read `d`, only
+/// the two-operand `AddRI d, imm` does. The callers (this tier's shadow
+/// acceptance and the peephole's) gate on [`full_unconditional_overwrite`]
+/// first; everything outside the forms decided here falls back to the
+/// over-approximation, so an unrecognized opcode answers as tied (fail-closed).
 pub(crate) fn redef_reads_operand0(inst: &X86ISelInst) -> bool {
     use X86Opcode::*;
-    if !first_operand_is_def_and_use(inst) {
-        // 2-operand tied RR ALU forms (`AddRR d, s`) read operand 0 too;
-        // the 3-operand forms do not.
-        return matches!(inst.opcode, AddRR | SubRR | ImulRR | AndRR | OrRR | XorRR)
-            && inst.operands.len() == 2;
-    }
     match inst.opcode {
-        // Immediate / shift-immediate families: tied iff 2 operands
-        // ([d, imm]); the 3-operand form is [d, s, imm].
+        // Register-register ALU: `[d, s]` is tied, `[d, a, b]` is not.
+        AddRR | SubRR | ImulRR | AndRR | OrRR | XorRR => inst.operands.len() == 2,
+        // Immediate / shift-immediate families: `[d, imm]` is tied,
+        // `[d, s, imm]` is not.
         AddRI | SubRI | AndRI | OrRI | XorRI | ShlRI | ShrRI | SarRI => inst.operands.len() == 2,
         // Register-count shifts (and the CL-count rotate): tied iff 2
         // operands ([d, src]).
         ShlRR | ShrRR | SarRR | RolRCl => inst.operands.len() == 2,
-        // Neg/Not/Inc/Dec ([d]) and the RM ALU forms ([d, mem]) always
-        // read their destination.
-        _ => true,
+        _ => x86_operand0_may_be_read(inst),
     }
 }
 
-/// Per-inst use collection mirroring `collect_used_vregs` (tied first
-/// operands count as uses; addressing regs inside memory operands count) —
-/// PLUS one strictly-more-conservative extension: a two-operand RR ALU form
-/// (`AddRR d, s` = d := d OP s) reads its operand 0, but the RR family is not
-/// in `first_operand_is_def_and_use` (the pre-RA dialect is three-operand).
-/// If a tied two-operand RR form ever appears, treating operand 0 as a use is
-/// required for soundness here (it only ever blocks deletions, never enables
-/// them).
-fn local_dce_inst_uses(inst: &X86ISelInst, used: &mut HashSet<VReg>) {
-    let has_def = x86_produces_value(inst.opcode);
-    let tied_rr_two_operand = matches!(
-        inst.opcode,
-        X86Opcode::AddRR
-            | X86Opcode::SubRR
-            | X86Opcode::ImulRR
-            | X86Opcode::AndRR
-            | X86Opcode::OrRR
-            | X86Opcode::XorRR
-    ) && inst.operands.len() == 2;
-    let first_operand_is_use = first_operand_is_def_and_use(inst) || tied_rr_two_operand;
+/// Collect every vreg `inst` may READ — the one use model both tiers share.
+///
+/// Operand 0 is skipped only when it is a pure def: the opcode produces a
+/// value ([`x86_produces_value`]) AND the form does not also read it
+/// ([`x86_operand0_may_be_read`] — tied two-operand forms such as the
+/// `AddRR [off, base]` of the jump-table dispatch, read-modify-write and
+/// conditional writes). Even then, a memory operand in that slot would still
+/// read its base and index registers, so those are collected.
+fn inst_uses(inst: &X86ISelInst, used: &mut HashSet<VReg>) {
+    let operand0_is_pure_def = x86_produces_value(inst.opcode) && !x86_operand0_may_be_read(inst);
     for (index, operand) in inst.operands.iter().enumerate() {
-        if index == 0 && has_def && !first_operand_is_use {
+        if index == 0 && operand0_is_pure_def {
+            collect_address_vregs(operand, used);
             continue;
         }
         collect_operand_vregs(operand, used);
     }
 }
 
+/// Why a window instruction stops the per-def scan of a candidate def.
+fn is_window_barrier(w: &X86ISelInst) -> bool {
+    let f = w.flags;
+    // Window barriers: any control flow, opaque pseudo, or the exchange
+    // family (hidden defs beyond operand 0 — an `Xchg v, x` both reads AND
+    // writes v, which the operand-0 redef model below cannot represent; fail
+    // closed).
+    f.is_branch()
+        || f.is_call()
+        || f.is_terminator()
+        || f.is_return()
+        || f.is_pseudo()
+        || matches!(
+            w.opcode,
+            X86Opcode::Xchg
+                | X86Opcode::Cmpxchg
+                | X86Opcode::Cmpxchg8
+                | X86Opcode::Cmpxchg16
+                | X86Opcode::AtomicRmwCasLoop
+                | X86Opcode::AtomicRmwCasLoop8
+                | X86Opcode::AtomicRmwCasLoop16
+        )
+}
+
+/// What one window instruction that mentions the candidate's register id
+/// decides about the candidate def of `v`.
+enum WindowStep {
+    /// The def is observed (or may be): keep it.
+    Keep,
+    /// A full, unconditional overwrite of `v` that does not read it: the def
+    /// is shadowed.
+    Shadowed,
+    /// Neither: scan on.
+    Continue,
+}
+
+fn window_step(w: &X86ISelInst, v: VReg) -> WindowStep {
+    // Narrow-view aliasing (the dirty-high-bits class): a VReg with the SAME
+    // id but a DIFFERENT class is an aliased width view of the same
+    // underlying register. Any such mention in the window — def OR use —
+    // makes per-def reasoning on `v` unsound here; bail.
+    let mut mentions = HashSet::default();
+    for op in &w.operands {
+        collect_operand_vregs(op, &mut mentions);
+    }
+    if mentions.iter().any(|m| m.id == v.id && m.class != v.class) {
+        return WindowStep::Keep;
+    }
+    let redefines = x86_produces_value(w.opcode)
+        && matches!(w.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == v);
+    if redefines {
+        // The shadow must be a FULL, UNCONDITIONAL overwrite. A closed
+        // allowlist is the only sound shape here: Cmovcc writes its
+        // destination CONDITIONALLY (the not-taken path keeps the candidate's
+        // value alive), Setcc writes only the low byte — treating either as a
+        // shadow deletes a live def (the select false-arm miscompile class).
+        // Anything not on the list refuses, including future opcodes.
+        if !full_unconditional_overwrite(w.opcode) {
+            return WindowStep::Keep;
+        }
+        // The redefining inst must not itself READ v. Tied FORMS do (e.g.
+        // 2-operand `AddRI d, imm`); the 3-operand forms (`AddRI d, s, imm`)
+        // do not — `redef_reads_operand0` is the per-form precise answer, and
+        // any read of v through a NON-first operand (e.g. `AddRI v, v, 8`
+        // three-op) is caught by the explicit scan of operands[1..].
+        let mut src_uses = HashSet::default();
+        for operand in w.operands.iter().skip(1) {
+            collect_operand_vregs(operand, &mut src_uses);
+        }
+        if redef_reads_operand0(w) || src_uses.contains(&v) {
+            return WindowStep::Keep;
+        }
+        return WindowStep::Shadowed;
+    }
+    // A use of v anywhere in the window keeps the def.
+    let mut uses = HashSet::default();
+    inst_uses(w, &mut uses);
+    if uses.contains(&v) {
+        return WindowStep::Keep;
+    }
+    WindowStep::Continue
+}
+
 /// One sweep of the per-def local tier over a block. Deletes at most many
 /// instructions per call; the caller's fixpoint loop handles cascades (a
 /// chain's upper links become locally dead only after the lower links go).
+///
+/// A candidate def of `v` at `i` is deleted when, scanning forward, a full
+/// unconditional overwrite of `v` that does not read it comes before any
+/// barrier ([`is_window_barrier`]), any use of `v` and any other-class view
+/// of its id, and (for a flag-writing ALU) its flags are dead. Every scan
+/// and the flag check look only FORWARD of the candidate, and deletions
+/// happen only at the candidate, so each verdict is the same over the block
+/// as it stood before the sweep: the sweep decides every candidate against
+/// the original block and removes the deleted ones once. Only an instruction
+/// that is a barrier or mentions `v`'s id can stop a scan (a use or a redef
+/// of `v` mentions it), so a scan visits exactly those, found through an
+/// index built once per sweep: linear in the block plus the mentions,
+/// instead of quadratic (measured: 5.5 s in this pass for one 51100-
+/// instruction function of the iteration-coverage program on x86-64). The
+/// verdicts are [`local_per_def_dce_on_block_reference`]'s; a test holds
+/// the two equal.
 fn local_per_def_dce_on_block(insts: &mut Vec<X86ISelInst>) -> bool {
+    let mut barriers: Vec<usize> = Vec::new();
+    let mut mentions_of: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    let mut scratch = HashSet::default();
+    for (index, inst) in insts.iter().enumerate() {
+        if is_window_barrier(inst) {
+            barriers.push(index);
+        }
+        scratch.clear();
+        for op in &inst.operands {
+            collect_operand_vregs(op, &mut scratch);
+        }
+        let mut ids: Vec<u32> = scratch.iter().map(|reg| reg.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            mentions_of.entry(id).or_default().push(index);
+        }
+    }
+    let mut delete = vec![false; insts.len()];
+    for i in 0..insts.len() {
+        let Some(class) = local_dce_class(&insts[i]) else {
+            continue;
+        };
+        let Some(v) = get_def_vreg(&insts[i]) else {
+            continue;
+        };
+        // The first barrier after `i` ends the window (no later redef in
+        // the block either: the value may be live-out).
+        let stop = barriers[barriers.partition_point(|&b| b <= i)..]
+            .first()
+            .copied()
+            .unwrap_or(insts.len());
+        let Some(positions) = mentions_of.get(&v.id) else {
+            continue;
+        };
+        let mut shadowed = false;
+        for &j in &positions[positions.partition_point(|&p| p <= i)..] {
+            if j >= stop {
+                break;
+            }
+            match window_step(&insts[j], v) {
+                WindowStep::Keep => break,
+                WindowStep::Shadowed => {
+                    shadowed = true;
+                    break;
+                }
+                WindowStep::Continue => {}
+            }
+        }
+        if !shadowed {
+            continue;
+        }
+        // Flag obligation for flag-writing ALU.
+        if matches!(class, LocalDceClass::PureFlags) && !local_flags_dead(insts, i) {
+            continue;
+        }
+        delete[i] = true;
+    }
+    if !delete.contains(&true) {
+        return false;
+    }
+    let mut index = 0usize;
+    insts.retain(|_| {
+        let keep = !delete[index];
+        index += 1;
+        keep
+    });
+    true
+}
+
+/// The per-def local tier as it was first written: a forward scan from every
+/// candidate def, with an operand set built per scanned instruction and one
+/// `Vec::remove` per deletion, quadratic in the block length. Kept as the
+/// oracle [`local_per_def_dce_on_block`] is tested against.
+#[cfg(test)]
+fn local_per_def_dce_on_block_reference(insts: &mut Vec<X86ISelInst>) -> bool {
     let mut changed = false;
     let mut i = 0usize;
     'outer: while i < insts.len() {
@@ -331,7 +507,7 @@ fn local_per_def_dce_on_block(insts: &mut Vec<X86ISelInst>) -> bool {
             // the SAME id but a DIFFERENT class is an aliased width view of
             // the same underlying register. Any such mention in the window —
             // def OR use — makes per-def reasoning on `v` unsound here; bail.
-            let mut mentions = HashSet::new();
+            let mut mentions = HashSet::default();
             for op in &w.operands {
                 collect_operand_vregs(op, &mut mentions);
             }
@@ -340,8 +516,8 @@ fn local_per_def_dce_on_block(insts: &mut Vec<X86ISelInst>) -> bool {
                 continue 'outer;
             }
             // A use of v anywhere in the window keeps the def.
-            let mut uses = HashSet::new();
-            local_dce_inst_uses(w, &mut uses);
+            let mut uses = HashSet::default();
+            inst_uses(w, &mut uses);
             let redefines = x86_produces_value(w.opcode)
                 && matches!(w.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == v);
             if redefines {
@@ -362,7 +538,7 @@ fn local_per_def_dce_on_block(insts: &mut Vec<X86ISelInst>) -> bool {
                 // per-form precise answer, and any read of v through a
                 // NON-first operand (e.g. `AddRI v, v, 8` three-op) is caught
                 // by the explicit scan of operands[1..].
-                let mut src_uses = HashSet::new();
+                let mut src_uses = HashSet::default();
                 for operand in w.operands.iter().skip(1) {
                     collect_operand_vregs(operand, &mut src_uses);
                 }
@@ -442,7 +618,10 @@ fn is_dead_flag_only_instruction(insts: &[X86ISelInst], index: usize) -> bool {
 fn is_removable_flag_only_candidate(inst: &X86ISelInst) -> bool {
     let flags = inst.flags;
 
-    is_supported_flag_only_opcode(inst.opcode)
+    // Dead flags alone do not authorize erasing a source-proof obligation.
+    // Preserve every origin carrier, including unexpected opcode/origin pairs.
+    inst.proof_origin.is_none()
+        && is_supported_flag_only_opcode(inst.opcode)
         && has_supported_flag_only_operands(inst)
         && x86_inst_effect(inst).is_pure()
         && !inst_touches_fixed_register(inst)
@@ -471,6 +650,18 @@ fn is_supported_flag_only_opcode(opcode: X86Opcode) -> bool {
             // `reads_memory` guard) — see the soundness note there.
             | X86Opcode::Ucomisd
             | X86Opcode::Ucomiss
+            // `BT r64, imm8` sets CF from one bit and produces NO register or
+            // memory result, so if its flags are dead it is dead -- exactly the
+            // CMP/TEST argument. `effects.rs` already classifies it as
+            // `MemoryEffect::Pure` and documents that it "writes only CF".
+            //
+            // Omitting it had a measured cost. A `c & 1 == 0` test inside a hot
+            // loop lowers to `bt $0,r ; <flag-clobbering work> ; bt $0,r ;
+            // cmovb`: the selector is tested, the flags are destroyed by the
+            // arithmetic of both arms, and the test is RE-MATERIALISED for the
+            // cmov. The first `bt` is dead and was being kept, one wasted
+            // instruction per iteration in `p2_collatz`'s inner loop.
+            | X86Opcode::BtRI
     )
 }
 
@@ -480,7 +671,10 @@ fn has_supported_flag_only_operands(inst: &X86ISelInst) -> bool {
             inst.operands.as_slice(),
             [X86ISelOperand::VReg(_), X86ISelOperand::VReg(_)]
         ),
-        X86Opcode::CmpRI | X86Opcode::CmpRI8 | X86Opcode::TestRI => matches!(
+        // `BtRI` shares the `[VReg, Imm]` shape: the encoder reads a `dst`
+        // register and one `imm8` bit index, so a memory-operand form cannot
+        // reach here.
+        X86Opcode::CmpRI | X86Opcode::CmpRI8 | X86Opcode::TestRI | X86Opcode::BtRI => matches!(
             inst.operands.as_slice(),
             [X86ISelOperand::VReg(_), X86ISelOperand::Imm(_)]
         ),
@@ -523,7 +717,24 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
 
         match condition_flag_overwrite(inst) {
             FlagOverwrite::None => {}
-            FlagOverwrite::Partial => return false,
+            // A PARTIAL overwrite is TRANSPARENT for this question, and that is
+            // not a relaxation of the safety argument -- it is the argument.
+            //
+            // The only way to reach the `Full` arm is with ZERO flag readers in
+            // between, because the `x86_reads_flags` check above returns false on
+            // the first one. So if a full overwrite is reached, NOTHING ever
+            // observed the flags written at `index`, whichever bits a partial
+            // writer happened to leave intact. Returning false here instead
+            // refused a provable case: it only ever mattered when a partial
+            // writer sat between a dead flag write and the full overwrite that
+            // buries it.
+            //
+            // Measured cost of the old behaviour: `p2_collatz`'s inner loop is
+            // `bt $0,c ; mov ; shr $1 ; lea ; add $1 ; bt $0,c ; cmovb`. The
+            // first `bt` is dead -- `AddRI` fully overwrites the flags before the
+            // `cmovb` reads the SECOND one -- but the scan stopped at the `shr`,
+            // a partial writer, and kept a wasted instruction in the hot loop.
+            FlagOverwrite::Partial => {}
             FlagOverwrite::Full => return true,
         }
 
@@ -533,43 +744,6 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
     }
 
     false
-}
-
-fn condition_flag_overwrite(inst: &X86ISelInst) -> FlagOverwrite {
-    use FlagOverwrite::*;
-    use X86Opcode::*;
-
-    match inst.opcode {
-        Not => None,
-        ShlRI | ShrRI | SarRI if shift_immediate_is_zero(inst) => None,
-
-        AddRR | AddRI | AddRM | SubRR | SubRI | SubRM | Neg | AndRR | AndRI | OrRR | OrRI
-        | XorRR | XorRI | CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM | Ucomisd
-        | Ucomiss | Popcnt => Full,
-
-        // RolRCl is Partial like the CL shifts (writes only CF/OF, and only
-        // when the runtime CL count is nonzero — never a Full overwrite).
-        // RolRI reaches Partial via the x86_writes_flags fallback below.
-        Inc | Dec | ImulRR | ImulRRI | ImulRM | ImulRMSib | Idiv | Div | Mul | ShlRR | ShlRI
-        | ShrRR | ShrRI | SarRR | SarRI | RolRCl | Bsf | Bsr | Tzcnt | Lzcnt | BtRI | Cmpxchg => {
-            Partial
-        }
-
-        _ if x86_writes_flags(inst.opcode) => Partial,
-        _ => None,
-    }
-}
-
-fn shift_immediate_is_zero(inst: &X86ISelInst) -> bool {
-    matches!(
-        inst.operands.as_slice(),
-        [X86ISelOperand::VReg(_), X86ISelOperand::Imm(0)]
-            | [
-                X86ISelOperand::VReg(_),
-                X86ISelOperand::VReg(_),
-                X86ISelOperand::Imm(0),
-            ]
-    )
 }
 
 fn instruction_may_export_flags(inst: &X86ISelInst) -> bool {
@@ -582,8 +756,66 @@ fn instruction_may_export_flags(inst: &X86ISelInst) -> bool {
         || flags.has_side_effects()
 }
 
+/// A pure flag-writing ALU def that NOTHING in the function reads, whose
+/// RFLAGS write is dead ACROSS blocks.
+///
+/// This closes a hole the three tiers above leave open between them.
+/// [`is_dead_instruction`] requires [`x86_is_removable`], which EXCLUDES every
+/// flag-writing ALU by design (they set RFLAGS, so the def is not the only
+/// effect). The per-def local tier admits exactly this closed allowlist, but
+/// proves deadness only from a LATER FULL REDEF of the vreg in the same block —
+/// a vreg that is simply never read again has no redef, so that tier bails out
+/// (`continue 'outer`) BEFORE it ever reaches its flag check. And
+/// [`is_dead_flag_only_instruction`] covers only instructions that produce no
+/// value at all. So `AddRR v4, v1, v3` with `v4` unread anywhere survives all
+/// three.
+///
+/// The hole matters only WITH cross-block flag liveness, which is why this tier
+/// did not exist before. Measured: closing it against the block-local
+/// `flags_written_here_are_dead` fires zero times across the codegen corpus,
+/// because whenever a block-local flag proof succeeds the peephole's scale-8 SIB
+/// arm has already retired the whole address chain. The cases that survive are
+/// exactly the ones whose flag kill is in a SUCCESSOR, so the tier is wired to
+/// [`X86FlagLiveness`].
+///
+/// SOUNDNESS. The value this instruction writes can be observed ONLY through a
+/// read of its destination vreg, and [`collect_used_vregs`] finds no read of
+/// that vreg anywhere in the function. That scan over-approximates in the safe
+/// direction: it counts any operand mention, including a memory operand's base
+/// and index registers and the tied first operand of a read-modify-write form
+/// (via [`x86_operand0_may_be_read`]), so a tied `AddRR v, s` — which reads `v`
+/// — never qualifies. Every other precondition is delegated to the SAME vetted
+/// gate the local tier uses, unchanged: [`local_dce_class`] refuses a
+/// `proof_origin` carrier, any fixed-register (ABI-observable) operand, any
+/// instance whose flags differ from its opcode default, and any impure effect.
+/// The RFLAGS obligation is discharged by [`X86FlagLiveness::flags_dead_after`],
+/// which reads this block's instructions LIVE and consults only successor
+/// verdicts from the snapshot.
+fn is_dead_flag_writing_alu(
+    insts: &[X86ISelInst],
+    index: usize,
+    used_vregs: &HashSet<VReg>,
+    flag_liveness: &X86FlagLiveness,
+    block_id: trust_cg_lower::instructions::Block,
+) -> bool {
+    let inst = &insts[index];
+
+    if !matches!(local_dce_class(inst), Some(LocalDceClass::PureFlags)) {
+        return false;
+    }
+
+    let Some(dst) = get_def_vreg(inst) else {
+        return false;
+    };
+    if used_vregs.contains(&dst) {
+        return false;
+    }
+
+    flag_liveness.flags_dead_after(insts, block_id, index)
+}
+
 fn collect_used_vregs(func: &X86ISelFunction) -> HashSet<VReg> {
-    let mut used = HashSet::new();
+    let mut used = HashSet::default();
 
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
@@ -591,15 +823,7 @@ fn collect_used_vregs(func: &X86ISelFunction) -> HashSet<VReg> {
         };
 
         for inst in &block.insts {
-            let has_def = x86_produces_value(inst.opcode);
-            let first_operand_is_use = first_operand_is_def_and_use(inst);
-
-            for (index, operand) in inst.operands.iter().enumerate() {
-                if index == 0 && has_def && !first_operand_is_use {
-                    continue;
-                }
-                collect_operand_vregs(operand, &mut used);
-            }
+            inst_uses(inst, &mut used);
         }
     }
 
@@ -617,15 +841,41 @@ fn get_def_vreg(inst: &X86ISelInst) -> Option<VReg> {
     }
 }
 
-fn collect_operand_vregs(operand: &X86ISelOperand, used: &mut HashSet<VReg>) {
+pub(crate) fn collect_operand_vregs(operand: &X86ISelOperand, used: &mut HashSet<VReg>) {
+    for_each_operand_vreg(operand, &mut |vreg| {
+        used.insert(vreg);
+    });
+}
+
+/// Visit every virtual register `operand` names, in operand order: the
+/// register itself, or the base and index registers of a memory operand. A
+/// register named twice is visited twice.
+pub(crate) fn for_each_operand_vreg(operand: &X86ISelOperand, visit: &mut dyn FnMut(VReg)) {
     match operand {
-        X86ISelOperand::VReg(vreg) => {
-            used.insert(*vreg);
+        X86ISelOperand::VReg(vreg) => visit(*vreg),
+        X86ISelOperand::MemAddr { .. } | X86ISelOperand::SibMemAddr { .. } => {
+            for_each_address_vreg(operand, visit);
         }
-        X86ISelOperand::MemAddr { base, .. } => collect_operand_vregs(base, used),
+        _ => {}
+    }
+}
+
+/// The base and index registers a memory operand reads; nothing for any
+/// other operand form.
+pub(crate) fn collect_address_vregs(operand: &X86ISelOperand, used: &mut HashSet<VReg>) {
+    for_each_address_vreg(operand, &mut |vreg| {
+        used.insert(vreg);
+    });
+}
+
+/// [`for_each_operand_vreg`] over the base and index registers a memory
+/// operand reads; nothing for any other operand form.
+pub(crate) fn for_each_address_vreg(operand: &X86ISelOperand, visit: &mut dyn FnMut(VReg)) {
+    match operand {
+        X86ISelOperand::MemAddr { base, .. } => for_each_operand_vreg(base, visit),
         X86ISelOperand::SibMemAddr { base, index, .. } => {
-            collect_operand_vregs(base, used);
-            collect_operand_vregs(index, used);
+            for_each_operand_vreg(base, visit);
+            for_each_operand_vreg(index, visit);
         }
         _ => {}
     }
@@ -660,35 +910,117 @@ fn operand_touches_fixed_register(operand: &X86ISelOperand) -> bool {
     }
 }
 
-fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
-    use X86Opcode::*;
-
-    matches!(
-        inst.opcode,
-        Neg | Not
-            | Inc
-            | Dec
-            | AddRI
-            | SubRI
-            | AndRI
-            | OrRI
-            | XorRI
-            | AddRM
-            | SubRM
-            | ImulRM
-            | ImulRMSib
-            | ShlRI
-            | ShrRI
-            | SarRI
-            | ShlRR
-            | ShrRR
-            | SarRR
-            | RolRCl
-    )
-}
-
 #[cfg(test)]
 mod tests {
+
+    /// A multi-block function, one `Vec` of instructions per block, in layout
+    /// order. The cross-block tests need real successors, which the
+    /// single-block helpers below cannot express.
+    fn func_with(blocks: Vec<Vec<X86ISelInst>>) -> X86ISelFunction {
+        let sig = Signature {
+            params: vec![],
+            returns: vec![Type::I64],
+        };
+        let mut f = X86ISelFunction::new("dce_probe".to_string(), sig);
+        for (i, insts) in blocks.into_iter().enumerate() {
+            let b = Block(i as u32);
+            f.ensure_block(b);
+            for inst in insts {
+                f.push_inst(b, inst);
+            }
+        }
+        f
+    }
+
+    fn opcodes(f: &X86ISelFunction, b: u32) -> Vec<X86Opcode> {
+        f.blocks[&Block(b)].insts.iter().map(|i| i.opcode).collect()
+    }
+
+    /// b1's shape END TO END through the pass: a value-dead `add` at the tail of
+    /// a block whose fall-through successor kills RFLAGS. Block-local reasoning
+    /// cannot justify the deletion; the cross-block tier does.
+    ///
+    /// `v4` is read by nothing, and the chain feeding it (`MovRR v5 = v13`) goes
+    /// on the next fixpoint iteration once the `add` is gone — which is also the
+    /// evidence that the tier CASCADES rather than deleting one instruction.
+    #[test]
+    fn cross_block_kill_sweeps_the_value_dead_add_and_its_feeder() {
+        let mut f = func_with(vec![
+            vec![
+                // v5 = v13 feeds only the dead add.
+                X86ISelInst::new(X86Opcode::MovRR, vec![vreg(5), vreg(13)]),
+                // v4 is never read anywhere: value-dead.
+                X86ISelInst::new(X86Opcode::AddRR, vec![vreg(4), vreg(5), vreg(3)]),
+                // A store keeps the block non-empty and is flag-transparent.
+                X86ISelInst::new(
+                    X86Opcode::MovMR,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(vreg(9)),
+                            disp: 0,
+                        },
+                        vreg(6),
+                    ],
+                ),
+            ],
+            vec![
+                X86ISelInst::new(X86Opcode::MovRR, vec![vreg(7), vreg(8)]),
+                X86ISelInst::new(
+                    X86Opcode::AndRI,
+                    vec![vreg(7), vreg(7), X86ISelOperand::Imm(6)],
+                ),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+        ]);
+
+        assert!(run_impl(&mut f), "the pass must report a change");
+        assert_eq!(
+            opcodes(&f, 0),
+            vec![X86Opcode::MovMR],
+            "the value-dead `add` and the copy that fed it are both swept, leaving \
+             only the store"
+        );
+    }
+
+    /// The negative control on the identical function, with ONE edit: the
+    /// successor now READS flags first. The same `add` is just as value-dead, and
+    /// must survive, because its RFLAGS write is observable.
+    #[test]
+    fn cross_block_reader_keeps_the_value_dead_add() {
+        let mut f = func_with(vec![
+            vec![
+                X86ISelInst::new(X86Opcode::MovRR, vec![vreg(5), vreg(13)]),
+                X86ISelInst::new(X86Opcode::AddRR, vec![vreg(4), vreg(5), vreg(3)]),
+                X86ISelInst::new(
+                    X86Opcode::MovMR,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(vreg(9)),
+                            disp: 0,
+                        },
+                        vreg(6),
+                    ],
+                ),
+            ],
+            vec![
+                // Cmovcc READS RFLAGS: the `add`'s flags reach it.
+                X86ISelInst::new(
+                    X86Opcode::Cmovcc,
+                    vec![vreg(7), vreg(8), X86ISelOperand::CondCode(X86CondCode::E)],
+                ),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ],
+        ]);
+
+        run_impl(&mut f);
+        assert!(
+            opcodes(&f, 0).contains(&X86Opcode::AddRR),
+            "the successor observes the `add`'s flags, so it must survive however \
+             dead its value is: {:?}",
+            opcodes(&f, 0)
+        );
+    }
+
     use super::*;
 
     use trust_cg_ir::regs::{RegClass, VReg};
@@ -1125,6 +1457,241 @@ mod tests {
         );
     }
 
+    // -- operand-0 reads (NEW-CG-JMPR) ------------------------------------
+    //
+    // Each shape below has a vreg whose ONLY reads sit in operand 0 of an
+    // instruction the def-use model used to read as a pure def. The global
+    // tier then saw the vreg as unused and deleted its removable def, leaving
+    // the kept instruction reading a register nothing wrote.
+
+    /// The dense-switch dispatch `select_switch` emits, verbatim:
+    /// `LeaRip base; MovRMSib off, [base + norm*8]; AddRR off, base; JmpR off`.
+    /// Both `AddRR [off, base]` (tied two-operand form) and `JmpR [off]` read
+    /// `off`; neither read was counted.
+    #[test]
+    fn x86_dce_counts_both_jump_table_dispatch_reads_of_the_target() {
+        let base = VReg::new(1, RegClass::Gpr64);
+        let off = VReg::new(2, RegClass::Gpr64);
+        let func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(0), X86ISelOperand::Imm(3)]),
+            X86ISelInst::new(
+                X86Opcode::LeaRip,
+                vec![
+                    X86ISelOperand::VReg(base),
+                    X86ISelOperand::JumpTableIndex(0),
+                ],
+            ),
+            X86ISelInst::new(
+                X86Opcode::MovRMSib,
+                vec![
+                    X86ISelOperand::VReg(off),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(X86ISelOperand::VReg(base)),
+                        index: Box::new(vreg(0)),
+                        scale: 8,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![X86ISelOperand::VReg(off), X86ISelOperand::VReg(base)],
+            ),
+            X86ISelInst::new(X86Opcode::JmpR, vec![X86ISelOperand::VReg(off)]),
+        ]);
+
+        let used = collect_used_vregs(&func);
+        assert!(used.contains(&off), "the dispatch target is read: {used:?}");
+
+        let reads_of =
+            |index: usize| collect_used_vregs(&make_func(vec![entry_insts(&func)[index].clone()]));
+        assert_eq!(
+            reads_of(4),
+            HashSet::from_iter([off]),
+            "JmpR reads its target"
+        );
+        assert_eq!(
+            reads_of(3),
+            HashSet::from_iter([off, base]),
+            "two-operand AddRR reads its destination"
+        );
+    }
+
+    #[test]
+    fn x86_dce_keeps_the_def_of_an_indirect_jump_target() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::LeaRip,
+                vec![vreg(1), X86ISelOperand::JumpTableIndex(0)],
+            ),
+            X86ISelInst::new(X86Opcode::MovRR, vec![vreg(2), vreg(1)]),
+            X86ISelInst::new(X86Opcode::JmpR, vec![vreg(2)]),
+        ]);
+        let mut dce = X86DeadCodeElimination;
+
+        assert!(!dce.run_on_function(&mut func));
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![X86Opcode::LeaRip, X86Opcode::MovRR, X86Opcode::JmpR]
+        );
+    }
+
+    /// `AddRR [d, s]` computes `d := d + s`. Its result is dead here but its
+    /// overflow flag is not, so the add stays — and so must the `MovRI` that
+    /// gives `d` its value.
+    #[test]
+    fn x86_dce_keeps_the_def_read_by_a_two_operand_tied_add() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(1), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::MovRI, vec![vreg(2), X86ISelOperand::Imm(9)]),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(1), vreg(2)]),
+            X86ISelInst::new(
+                X86Opcode::Setcc,
+                vec![vreg(3), X86ISelOperand::CondCode(X86CondCode::O)],
+            ),
+            X86ISelInst::new(X86Opcode::Movzx, vec![vreg(3), vreg(3)]),
+            X86ISelInst::new(X86Opcode::MovRR, vec![X86ISelOperand::PReg(RAX), vreg(3)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut dce = X86DeadCodeElimination;
+
+        assert!(!dce.run_on_function(&mut func));
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::MovRI,
+                X86Opcode::MovRI,
+                X86Opcode::AddRR,
+                X86Opcode::Setcc,
+                X86Opcode::Movzx,
+                X86Opcode::MovRR,
+                X86Opcode::Ret,
+            ]
+        );
+    }
+
+    /// `select_memory_store` for a volatile store to a stack slot:
+    /// `Lea a, [slot]; VolatileMovMR [a + 0], v`. The store's operand 0 is its
+    /// destination address.
+    #[test]
+    fn x86_dce_keeps_the_address_of_a_volatile_store() {
+        for store in [
+            X86Opcode::VolatileMovMR8,
+            X86Opcode::VolatileMovMR16,
+            X86Opcode::VolatileMovMR32,
+            X86Opcode::VolatileMovMR,
+        ] {
+            let mut func = make_func(vec![
+                X86ISelInst::new(
+                    X86Opcode::Lea,
+                    vec![
+                        vreg(1),
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(X86ISelOperand::StackSlot(0)),
+                            disp: 0,
+                        },
+                    ],
+                ),
+                X86ISelInst::new(X86Opcode::MovRI, vec![vreg(2), X86ISelOperand::Imm(5)]),
+                X86ISelInst::new(
+                    store,
+                    vec![
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(vreg(1)),
+                            disp: 0,
+                        },
+                        vreg(2),
+                    ],
+                ),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            let mut dce = X86DeadCodeElimination;
+
+            assert!(!dce.run_on_function(&mut func), "{store:?}");
+            assert_eq!(
+                entry_opcodes(&func),
+                vec![X86Opcode::Lea, X86Opcode::MovRI, store, X86Opcode::Ret],
+                "{store:?}"
+            );
+        }
+    }
+
+    /// `select_cmpxchg`: `MovRR32 desired', desired; CMPXCHG [desired', MemAddr]`.
+    /// Operand 0 of every compare-exchange width is the desired value.
+    #[test]
+    fn x86_dce_keeps_the_desired_value_copy_of_every_cmpxchg_width() {
+        for cmpxchg in [
+            X86Opcode::Cmpxchg,
+            X86Opcode::Cmpxchg8,
+            X86Opcode::Cmpxchg16,
+        ] {
+            let mut func = make_func(vec![
+                X86ISelInst::new(
+                    X86Opcode::MovRR32,
+                    vec![
+                        vreg_class(4, RegClass::Gpr32),
+                        vreg_class(3, RegClass::Gpr32),
+                    ],
+                ),
+                X86ISelInst::new(
+                    cmpxchg,
+                    vec![
+                        vreg_class(4, RegClass::Gpr32),
+                        X86ISelOperand::MemAddr {
+                            base: Box::new(vreg(1)),
+                            disp: 0,
+                        },
+                    ],
+                ),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            let mut dce = X86DeadCodeElimination;
+
+            assert!(!dce.run_on_function(&mut func), "{cmpxchg:?}");
+            assert_eq!(
+                entry_opcodes(&func),
+                vec![X86Opcode::MovRR32, cmpxchg, X86Opcode::Ret],
+                "{cmpxchg:?}"
+            );
+        }
+    }
+
+    /// The shadow question stays EXACT per form on the full-overwrite
+    /// allowlist (a three-operand `AddRI d, s, imm` is a clean shadow), and
+    /// falls back to the may-read over-approximation everywhere else.
+    #[test]
+    fn redef_reads_operand0_is_exact_on_the_shadow_allowlist() {
+        use X86Opcode::*;
+        let with =
+            |opcode, count: u32| X86ISelInst::new(opcode, (0..count).map(vreg).collect::<Vec<_>>());
+        for opcode in [
+            MovRI, MovRR, MovRR32, MovRM, MovRM32, MovRMSib, Lea, LeaSib, Movzx, MovzxW, MovsxB,
+            MovsxW, Movsx, ImulRRI,
+        ] {
+            assert!(full_unconditional_overwrite(opcode), "{opcode:?}");
+            for count in 1..=3 {
+                assert!(
+                    !redef_reads_operand0(&with(opcode, count)),
+                    "{opcode:?}/{count}"
+                );
+            }
+        }
+        for opcode in [
+            AddRR, SubRR, ImulRR, AndRR, OrRR, XorRR, AddRI, SubRI, AndRI, OrRI, XorRI, ShlRI,
+            ShrRI, SarRI,
+        ] {
+            assert!(full_unconditional_overwrite(opcode), "{opcode:?}");
+            assert!(redef_reads_operand0(&with(opcode, 2)), "{opcode:?} tied");
+            assert!(
+                !redef_reads_operand0(&with(opcode, 3)),
+                "{opcode:?} three-operand"
+            );
+        }
+        for (opcode, count) in [(Cmovcc, 3), (Inc, 1), (AddRM, 2), (Xchg, 2), (JmpR, 1)] {
+            assert!(redef_reads_operand0(&with(opcode, count)), "{opcode:?}");
+        }
+    }
+
     #[test]
     fn x86_dce_preserves_memory_calls_and_terminators() {
         let store_addr = X86ISelOperand::MemAddr {
@@ -1417,8 +1984,19 @@ mod tests {
         let changed = {
             let mut c = false;
             // Mirror the pass's fixpoint: cascade until stable.
+            let mut reference = block.insts.clone();
             loop {
-                let round = local_per_def_dce_on_block(&mut block.insts);
+                let before = reference.clone();
+                let reference_round = local_per_def_dce_on_block_reference(&mut reference);
+                let mut fast = before;
+                let round = local_per_def_dce_on_block(&mut fast);
+                assert_eq!(round, reference_round, "the indexed sweep's verdict");
+                assert_eq!(
+                    format!("{fast:?}"),
+                    format!("{reference:?}"),
+                    "the indexed sweep deletes what the reference scan deletes"
+                );
+                block.insts = fast;
                 c |= round;
                 if !round {
                     break;
@@ -1760,5 +2338,262 @@ mod tests {
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
         assert!(!changed);
+    }
+
+    fn flag_only_origin_control(candidate: X86ISelInst, survives: bool) {
+        let mut func = make_func(vec![
+            candidate.clone(),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), X86ISelOperand::Imm(7)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        X86DeadCodeElimination.run_on_function(&mut func);
+        let insts = entry_insts(&func);
+        assert_eq!(insts.len(), if survives { 3 } else { 2 });
+        if survives {
+            assert_eq!(insts[0].opcode, candidate.opcode);
+            assert_eq!(insts[0].operands, candidate.operands);
+            assert_eq!(insts[0].proof_origin, candidate.proof_origin);
+        }
+    }
+
+    #[test]
+    fn flag_only_origin_annotated_bt_is_preserved() {
+        flag_only_origin_control(
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)])
+                .with_proof_origin(trust_cg_lower::x86_64_isel::X86ProofOrigin::AtomicLoad),
+            true,
+        );
+    }
+
+    #[test]
+    fn flag_only_origin_annotated_cmp_is_preserved() {
+        flag_only_origin_control(
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(1), X86ISelOperand::Imm(0)])
+                .with_proof_origin(trust_cg_lower::x86_64_isel::X86ProofOrigin::AtomicLoad),
+            true,
+        );
+    }
+
+    #[test]
+    fn flag_only_origin_malformed_and_fixed_bt_are_preserved() {
+        flag_only_origin_control(X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1)]), true);
+        flag_only_origin_control(
+            X86ISelInst::new(
+                X86Opcode::BtRI,
+                vec![X86ISelOperand::PReg(RAX), X86ISelOperand::Imm(0)],
+            ),
+            true,
+        );
+    }
+
+    #[test]
+    fn flag_only_origin_unannotated_bt_is_removed() {
+        flag_only_origin_control(
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
+            false,
+        );
+    }
+
+    /// `c & 1 == 0` inside a hot loop lowers to a bit test whose flags the
+    /// arithmetic of both arms destroys, so the test is re-materialised for the
+    /// `cmov`. The FIRST one is dead and must go: `AddRI` fully overwrites the
+    /// condition flags before any reader.
+    #[test]
+    fn dead_bit_test_before_a_full_flag_overwrite_is_removed() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![vreg(2), vreg(3), X86ISelOperand::Imm(1)],
+            ),
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![vreg(4), vreg(2), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut dce = X86DeadCodeElimination;
+        dce.run_on_function(&mut func);
+        assert_eq!(
+            entry_insts(&func)
+                .iter()
+                .filter(|i| i.opcode == X86Opcode::BtRI)
+                .count(),
+            1,
+            "only the bit test the cmov actually reads survives"
+        );
+    }
+
+    /// The SECOND bit test is the one the `cmov` reads; nothing may remove it.
+    #[test]
+    fn a_bit_test_whose_flags_a_cmov_reads_is_kept() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![vreg(4), vreg(2), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut dce = X86DeadCodeElimination;
+        dce.run_on_function(&mut func);
+        assert_eq!(
+            entry_insts(&func)
+                .iter()
+                .filter(|i| i.opcode == X86Opcode::BtRI)
+                .count(),
+            1,
+            "a live bit test must never be removed"
+        );
+    }
+
+    /// The ordering that makes partial-transparency sound: a flag READER after a
+    /// partial writer must still block the elimination, because that reader can
+    /// see bits the partial writer did not touch.
+    #[test]
+    fn a_reader_after_a_partial_overwrite_still_keeps_the_flag_write() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
+            // `ShrRI` by a non-zero count: writes CF/OF/SF/ZF/PF, leaves AF
+            // undefined, so it is a PARTIAL overwrite.
+            X86ISelInst::new(
+                X86Opcode::ShrRI,
+                vec![vreg(2), vreg(3), X86ISelOperand::Imm(1)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![vreg(4), vreg(2), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut dce = X86DeadCodeElimination;
+        dce.run_on_function(&mut func);
+        assert_eq!(
+            entry_insts(&func)
+                .iter()
+                .filter(|i| i.opcode == X86Opcode::BtRI)
+                .count(),
+            1,
+            "a reader downstream of a partial overwrite keeps the flag write"
+        );
+    }
+
+    /// And the case partial-transparency unlocks: a partial writer between the
+    /// dead flag write and the FULL overwrite that buries it, with no reader.
+    /// This is `p2_collatz`'s shape.
+    #[test]
+    fn a_partial_overwrite_does_not_block_a_later_full_overwrite() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(
+                X86Opcode::ShrRI,
+                vec![vreg(2), vreg(3), X86ISelOperand::Imm(1)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![vreg(5), vreg(6), X86ISelOperand::Imm(1)],
+            ),
+            X86ISelInst::new(X86Opcode::BtRI, vec![vreg(1), X86ISelOperand::Imm(0)]),
+            X86ISelInst::new(
+                X86Opcode::Cmovcc,
+                vec![vreg(4), vreg(2), X86ISelOperand::CondCode(X86CondCode::B)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut dce = X86DeadCodeElimination;
+        dce.run_on_function(&mut func);
+        assert_eq!(
+            entry_insts(&func)
+                .iter()
+                .filter(|i| i.opcode == X86Opcode::BtRI)
+                .count(),
+            1,
+            "the first bit test dies through the partial writer"
+        );
+    }
+
+    /// The indexed per-def sweep against the reference scan over generated
+    /// blocks: every opcode family the window logic distinguishes (pure and
+    /// flag-writing defs, tied and three-operand forms, conditional and
+    /// partial writes, memory operands, an other-class view of an id, the
+    /// exchange family, branches, calls and returns), few register ids so
+    /// windows collide. Each block runs to the cascade's fixpoint; every
+    /// round must delete exactly what the reference deletes.
+    #[test]
+    fn indexed_local_sweep_matches_the_reference_scan() {
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut deleted = 0usize;
+        for _ in 0..4000 {
+            let len = 1 + next(24) as usize;
+            let mut insts = Vec::with_capacity(len);
+            for _ in 0..len {
+                let a = next(5) as u32;
+                let b = next(5) as u32;
+                let c = next(5) as u32;
+                let mem = |base: u32| X86ISelOperand::MemAddr {
+                    base: Box::new(vreg(base)),
+                    disp: 8,
+                };
+                let inst = match next(18) {
+                    0 | 1 => {
+                        X86ISelInst::new(X86Opcode::MovRI, vec![vreg(a), X86ISelOperand::Imm(5)])
+                    }
+                    2 | 3 => X86ISelInst::new(X86Opcode::MovRR, vec![vreg(a), vreg(b)]),
+                    4 => X86ISelInst::new(X86Opcode::AddRR, vec![vreg(a), vreg(b), vreg(c)]),
+                    5 => X86ISelInst::new(X86Opcode::AddRR, vec![vreg(a), vreg(b)]),
+                    6 => X86ISelInst::new(
+                        X86Opcode::SubRI,
+                        vec![vreg(a), vreg(b), X86ISelOperand::Imm(1)],
+                    ),
+                    7 => X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(a), vreg(b)]),
+                    8 => X86ISelInst::new(
+                        X86Opcode::Cmovcc,
+                        vec![vreg(a), vreg(b), X86ISelOperand::CondCode(X86CondCode::E)],
+                    ),
+                    9 => X86ISelInst::new(
+                        X86Opcode::Setcc,
+                        vec![vreg(a), X86ISelOperand::CondCode(X86CondCode::NE)],
+                    ),
+                    10 => X86ISelInst::new(X86Opcode::MovRM, vec![vreg(a), mem(b)]),
+                    11 => X86ISelInst::new(X86Opcode::MovMR, vec![mem(a), vreg(b)]),
+                    12 => X86ISelInst::new(
+                        X86Opcode::MovRR,
+                        vec![
+                            vreg_class(a, RegClass::Gpr32),
+                            vreg_class(b, RegClass::Gpr32),
+                        ],
+                    ),
+                    13 => X86ISelInst::new(X86Opcode::Xchg, vec![vreg(a), vreg(b)]),
+                    14 => X86ISelInst::new(X86Opcode::XorRR, vec![vreg(a), vreg(a), vreg(b)]),
+                    15 => X86ISelInst::new(X86Opcode::ImulRR, vec![vreg(a), vreg(b)]),
+                    16 => X86ISelInst::new(X86Opcode::Call, vec![X86ISelOperand::Imm(0)]),
+                    _ => X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Imm(0)]),
+                };
+                insts.push(inst);
+            }
+            insts.push(X86ISelInst::new(X86Opcode::Ret, vec![]));
+            let mut reference = insts.clone();
+            let mut fast = insts;
+            loop {
+                let reference_round = local_per_def_dce_on_block_reference(&mut reference);
+                let before = fast.len();
+                let round = local_per_def_dce_on_block(&mut fast);
+                assert_eq!(round, reference_round);
+                assert_eq!(format!("{fast:?}"), format!("{reference:?}"));
+                deleted += before - fast.len();
+                if !round {
+                    break;
+                }
+            }
+        }
+        // The generator must exercise deletions, not only refusals.
+        assert!(deleted > 1000, "only {deleted} deletions generated");
     }
 }

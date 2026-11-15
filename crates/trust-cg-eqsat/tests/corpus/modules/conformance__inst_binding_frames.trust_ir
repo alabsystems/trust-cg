@@ -1,0 +1,15 @@
+; TrustIr text format v1
+module "inst_binding_frames"
+
+functy.0 = (i64) -> (i64)
+
+fn @exists_in_set(functy.0) {
+bb0(%0: i64):
+    %1 = open_frame #0 "exists_i" {i: i64}
+    %2 = const i64 42
+    %3 = bind_slot %1, 0, %2
+    %4 = load_slot i64 %1, 0
+    %5 = add i64 %4, %0
+    close_frame %1
+    ret %5
+}

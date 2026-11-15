@@ -1,0 +1,21 @@
+; TrustIr text format v1
+module "_RNvXsU_NtCshdpSglmLaqw_3std7processuNtB5_11Termination6report"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = () -> (u8)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvXsU_NtCshdpSglmLaqw_3std7processuNtB5_11Termination6report(functy.0) {
+bb0:
+    %2 = const u8 0
+    ret %2
+}

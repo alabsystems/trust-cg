@@ -1,0 +1,27 @@
+; TrustIr text format v1
+module "fresh_after_stale_loop"
+
+functy.0 = (i64) -> (i64)
+
+fn @main(functy.0) {
+bb0(%0: i64):
+    %1 = open_frame #1 "seed" {x: i64}
+    %2 = bind_slot %1, 0, %0
+    close_frame %1
+    %3 = const i32 0
+    br bb1(%2, %3)
+bb1(%4: ptr, %5: i32):
+    %6 = open_frame #0 "iteration" {x: i64}
+    %7 = bind_slot %6, 0, %0
+    %8 = const i32 0
+    %9 = icmp eq i32 %5, %8
+    condbr %9, bb2(%7), bb3(%7, %4)
+bb2(%10: ptr):
+    close_frame %10
+    %11 = const i32 1
+    br bb1(%10, %11)
+bb3(%12: ptr, %13: ptr):
+    %14 = load_slot i64 %12, 0
+    close_frame %12
+    ret %14
+}

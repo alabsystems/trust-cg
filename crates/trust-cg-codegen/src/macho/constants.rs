@@ -91,6 +91,10 @@ pub const S_ZEROFILL: u32 = 0x1;
 /// Section with only literal C strings.
 pub const S_CSTRING_LITERALS: u32 = 0x2;
 
+/// Section of pointers to module initialization functions
+/// (`__mod_init_func`): dyld calls each entry before `main`, in order.
+pub const S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
+
 // --- Thread-local section types (Darwin TLV) ---
 // Reference: S_THREAD_LOCAL_* in mach-o/loader.h. These hold the per-thread
 // initial-value template (`__thread_data`/`__thread_bss`) and the TLV
@@ -107,9 +111,10 @@ pub const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 /// thread-local read addresses, one per thread-local variable symbol.
 pub const S_THREAD_LOCAL_VARIABLES: u32 = 0x13;
 
-/// Pointers to TLV descriptors (`__thread_ptr`). Reserved; the AArch64 emitter
-/// references the descriptor symbol directly via TLVP relocations and does not
-/// currently materialize a separate pointer section.
+/// Pointers to TLV descriptors (`__thread_ptrs`). Object emitters reference
+/// the descriptor symbol through TLVP relocations; the standalone linker
+/// materializes these slots in `__DATA_CONST,__thread_ptrs` and refuses input
+/// sections of this type.
 pub const S_THREAD_LOCAL_VARIABLE_POINTERS: u32 = 0x14;
 
 // --- Section attributes (upper 24 bits of section flags) ---
@@ -119,6 +124,9 @@ pub const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
 
 /// Section contains some machine instructions.
 pub const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x0000_0400;
+
+/// The linker must not dead-strip any block of this section.
+pub const S_ATTR_NO_DEAD_STRIP: u32 = 0x1000_0000;
 
 // --- VM protection flags ---
 

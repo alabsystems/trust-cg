@@ -3,12 +3,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-//! Minimal `trust_types` compatibility types consumed by Trust Codegen's optional
-//! translation-validation bridge.
+//! Minimal `trust_types` compatibility types: a scalar formula and
+//! refinement-VC surface.
 //!
-//! The full tRust compiler workspace is too large and workspace-coupled to be
-//! resolved by every Trust Codegen build. Trust Codegen only needs this scalar formula and
-//! refinement-VC surface for bridge conversion tests.
+//! No Trust Codegen crate uses them. They are kept only for trust-wp's
+//! standalone P6 spike (`spikes/trust-cg-tv-discharge`), which path-depends on
+//! this crate.
 
 /// Formula sort vocabulary used by the trust/Trust Codegen SMT bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]

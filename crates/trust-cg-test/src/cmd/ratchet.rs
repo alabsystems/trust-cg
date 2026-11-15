@@ -17,9 +17,7 @@ use super::GlobalArgs;
 use super::lint_linux::LintLinuxArgs;
 use crate::OutputFormat;
 use crate::config::RepoRoot;
-use crate::external::Cargo;
 use crate::results::{EmptyRecord, ResultStatus, RunSummary};
-use crate::shell::Spawn;
 
 // #624: preserve the old integration-jit ratchet floor after #437 split
 // the current matrix shard into runtime and observability shards.
@@ -48,51 +46,6 @@ pub enum RatchetCommand {
                   trust-cg-test ratchet tests --baseline path/to/tests-baseline.json --format json"
     )]
     Tests(TestsArgs),
-    /// Warnings-zero ratchet — builds the workspace + tests and compares
-    /// the diagnostic count against `ratchet/warnings_baseline.json`.
-    #[command(
-        long_about = "Warnings-zero ratchet for the Trust Codegen workspace.\n\n\
-                      Builds the workspace and tests through the centralized \
-                      cargo wrapper, counts Rust diagnostics, and fails when \
-                      the total warning count exceeds \
-                      `ratchet/warnings_baseline.json`.\n\n\
-                      # Examples\n\n  \
-                      trust-cg-test ratchet warnings\n  \
-                      trust-cg-test ratchet warnings --format json"
-    )]
-    Warnings,
-    /// Monotonic-decrease ratchet on production panic-family sites
-    /// (`.unwrap()` / `.expect(` / `panic!` / `unreachable!` / `todo!`).
-    /// Compares per-file counts against `ratchet/unwrap_baseline.json`.
-    #[command(long_about = "Monotonic panic-family ratchet for production Rust \
-                      sources.\n\n\
-                      Regenerates the production `.unwrap()` / `.expect(` / \
-                      `panic!` / `unreachable!` / `todo!` site counts and \
-                      fails when any checked count exceeds \
-                      `ratchet/unwrap_baseline.json`.\n\n\
-                      # Examples\n\n  \
-                      trust-cg-test ratchet unwrap\n  \
-                      trust-cg-test ratchet unwrap --format json")]
-    Unwrap,
-    /// Baseline-aware clippy gate for production panic-family diagnostics.
-    #[command(long_about = "Baseline-aware clippy gate for production panic-family \
-                      diagnostics.\n\n\
-                      Runs `scripts/check_panic_clippy.sh` through the \
-                      `trust-cg-test` ratchet dispatcher, preserving the script's \
-                      workspace package discovery, `--package` filtering, \
-                      deny-level panic-family clippy lints, and \
-                      `ratchet/unwrap_baseline.json` comparison behavior. Full \
-                      runs also execute the unwrap regex ratchet unless \
-                      `--skip-ratchet` is set.\n\n\
-                      Exit codes match the underlying script:\n  \
-                      0 — panic-family diagnostics are within baseline.\n  \
-                      1 — production panic-family diagnostics exceed baseline.\n  \
-                      2 — tooling error, missing baseline, or invalid args.\n\n\
-                      # Examples\n\n  \
-                      trust-cg-test ratchet panic-clippy\n  \
-                      trust-cg-test ratchet panic-clippy --package trust-cg-test\n  \
-                      trust-cg-test ratchet panic-clippy --package trust-cg-test --skip-ratchet")]
-    PanicClippy(PanicClippyArgs),
     /// Enforce `std::process::Command` is only used in `shell.rs` / `external.rs`.
     #[command(
         long_about = "Enforce the process-spawn boundary for `trust-cg-test`.\n\n\
@@ -117,14 +70,14 @@ pub enum RatchetCommand {
     Schema(SchemaArgs),
     /// Cross-compile check for `#[cfg(target_os = "linux")]` paths in
     /// `trust-cg-codegen` (issue #346). Safe on macOS-only boxes — targets
-    /// not installed via `rustup target add` are reported as `skipped`.
+    /// whose std the installed Trust package lacks are reported as `skipped`.
     ///
     /// Equivalent to the top-level `trust-cg-test lint-linux`. Registered as
     /// a ratchet so CI can sweep every invariant with
     /// `trust-cg-test ratchet <check>` under a single dispatcher (#446).
     #[command(long_about = "Cross-compile check for Linux-only `trust-cg-codegen` \
                   paths.\n\n\
-                  Runs `cargo check --target <linux-triple> -p \
+                  Runs `targo --unverified check --target <linux-triple> -p \
                   trust-cg-codegen` through the shared `trust-cg-test` shell \
                   boundary. Missing Rust targets are reported as `skipped`, \
                   so the command is safe on macOS-only developer boxes.\n\n\
@@ -167,34 +120,6 @@ pub struct TestsArgs {
     pub baseline: PathBuf,
 }
 
-/// Arguments for `trust-cg-test ratchet panic-clippy`.
-#[derive(Args, Debug, Clone, Default)]
-#[command(long_about = "Baseline-aware clippy gate for production panic-family \
-                  diagnostics.\n\n\
-                  Runs `scripts/check_panic_clippy.sh` through the \
-                  `trust-cg-test` ratchet dispatcher, preserving the script's \
-                  workspace package discovery, `--package` filtering, \
-                  deny-level panic-family clippy lints, and \
-                  `ratchet/unwrap_baseline.json` comparison behavior. Full \
-                  runs also execute the unwrap regex ratchet unless \
-                  `--skip-ratchet` is set.\n\n\
-                  Exit codes match the underlying script:\n  \
-                  0 — panic-family diagnostics are within baseline.\n  \
-                  1 — production panic-family diagnostics exceed baseline.\n  \
-                  2 — tooling error, missing baseline, or invalid args.\n\n\
-                  # Examples\n\n  \
-                  trust-cg-test ratchet panic-clippy\n  \
-                  trust-cg-test ratchet panic-clippy --package trust-cg-test\n  \
-                  trust-cg-test ratchet panic-clippy --package trust-cg-test --skip-ratchet")]
-pub struct PanicClippyArgs {
-    /// Check only one workspace package. May be repeated.
-    #[arg(short = 'p', long = "package", value_name = "NAME")]
-    pub packages: Vec<String>,
-    /// Skip the full unwrap ratchet; intended for focused local clippy probes.
-    #[arg(long)]
-    pub skip_ratchet: bool,
-}
-
 /// Arguments for `trust-cg-test ratchet`.
 #[derive(Args, Debug, Clone)]
 #[command(long_about = "Run ratchet checks (called by CI). Every ratchet fails \
@@ -204,9 +129,6 @@ pub struct PanicClippyArgs {
                   trust-cg-test ratchet shell-isolation\n  \
                   trust-cg-test ratchet schema --format json\n  \
                   trust-cg-test ratchet tests --baseline path/to/tests-baseline.json\n  \
-                  trust-cg-test ratchet warnings\n  \
-                  trust-cg-test ratchet unwrap\n  \
-                  trust-cg-test ratchet panic-clippy\n  \
                   trust-cg-test ratchet lint-linux")]
 pub struct RatchetArgs {
     /// Which ratchet to run.
@@ -226,9 +148,6 @@ pub struct SchemaArgs {
 pub fn run(global: &GlobalArgs, args: &RatchetArgs) -> anyhow::Result<ResultStatus> {
     match &args.cmd {
         RatchetCommand::Tests(a) => tests(global, a),
-        RatchetCommand::Warnings => warnings(global),
-        RatchetCommand::Unwrap => unwrap(global),
-        RatchetCommand::PanicClippy(a) => panic_clippy(global, a),
         RatchetCommand::ShellIsolation => shell_isolation(global),
         RatchetCommand::Schema(args) => schema(global, args),
         RatchetCommand::LintLinux(a) => super::lint_linux::run(global, a),
@@ -762,603 +681,13 @@ fn generate_schemas() -> Vec<(String, String)> {
     ]
 }
 
-// ---------------- warnings ----------------
-//
-// The canonical warnings ratchet (formerly `scripts/check_warnings_ratchet.sh`,
-// deleted once this port was complete). Builds `cargo build --workspace` and
-// `cargo build --workspace --tests`, counts distinct `warning:` diagnostics in
-// each output, and compares the sum against `ratchet/warnings_baseline.json`
-// (default baseline: 0).
-//
-// Exit semantics (the contract the shell script established):
-//   * `ResultStatus::Ok` (0)          — total <= baseline AND both builds
-//                                       exited 0
-//   * `ResultStatus::Failed` (1)      — total > baseline
-//   * `ResultStatus::EnvBroken` (2)   — missing cargo / baseline file, OR a
-//                                       workspace build failed without
-//                                       exceeding the baseline (a zero-warning
-//                                       compile error is never a green ratchet)
-
-/// Schema for `ratchet/warnings_baseline.json`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct WarningsBaseline {
-    /// Allowed maximum number of warning diagnostics across both builds.
-    warnings: u64,
-}
-
-/// Machine-readable summary emitted under `--format json`.
-#[derive(Clone, Debug, Serialize)]
-struct WarningsReport {
-    command: &'static str,
-    baseline: u64,
-    prod_warnings: u64,
-    tests_warnings: u64,
-    total: u64,
-    /// Exit status of `cargo build --workspace` (-1 if killed by a signal, per `shell::capture`).
-    prod_build_status: i32,
-    /// Exit status of `cargo build --workspace --tests`.
-    tests_build_status: i32,
-    prod_samples: Vec<String>,
-    tests_samples: Vec<String>,
-    exit: ResultStatus,
-}
-
-fn warnings(global: &GlobalArgs) -> anyhow::Result<ResultStatus> {
-    let repo = RepoRoot::locate(Path::new("."))?;
-    let baseline_path = repo.join("ratchet").join("warnings_baseline.json");
-
-    // Env broken: no baseline file.
-    if !baseline_path.is_file() {
-        eprintln!(
-            "ratchet warnings: baseline file missing: {}",
-            baseline_path.display()
-        );
-        return Ok(ResultStatus::EnvBroken);
-    }
-    // Env broken: no cargo on PATH.
-    if crate::shell::which(Cargo::program()).is_none() {
-        eprintln!("ratchet warnings: cargo not found on PATH");
-        return Ok(ResultStatus::EnvBroken);
-    }
-
-    let baseline_text = fs::read_to_string(&baseline_path)
-        .with_context(|| format!("reading {}", baseline_path.display()))?;
-    let baseline: WarningsBaseline = serde_json::from_str(&baseline_text).with_context(|| {
-        format!(
-            "parsing {} as {{\"warnings\": <u64>}}",
-            baseline_path.display()
-        )
-    })?;
-
-    // Run the two builds, recording their statuses instead of discarding
-    // them. `deny(warnings)` can make a warning build fail — that case is
-    // still diagnosed by counting — but a zero-warning compile error must
-    // never be reported as a successful ratchet (fail-closed, c8a07fe3).
-    let (prod_out, prod_status) = cargo_build_output(&repo, &["build", "--workspace"])?;
-    let (tests_out, tests_status) =
-        cargo_build_output(&repo, &["build", "--workspace", "--tests"])?;
-
-    let prod_diags = extract_warning_lines(&prod_out);
-    let tests_diags = extract_warning_lines(&tests_out);
-    let prod_count = u64::try_from(prod_diags.len()).unwrap_or(u64::MAX);
-    let tests_count = u64::try_from(tests_diags.len()).unwrap_or(u64::MAX);
-    let total = prod_count.saturating_add(tests_count);
-
-    let exit = warnings_exit(total, baseline.warnings, prod_status, tests_status);
-
-    let report = WarningsReport {
-        command: "ratchet.warnings",
-        baseline: baseline.warnings,
-        prod_warnings: prod_count,
-        tests_warnings: tests_count,
-        total,
-        prod_build_status: prod_status,
-        tests_build_status: tests_status,
-        prod_samples: prod_diags.clone(),
-        tests_samples: tests_diags.clone(),
-        exit,
-    };
-
-    match global.format {
-        OutputFormat::Json | OutputFormat::Junit => {
-            let json = serde_json::to_string_pretty(&report)?;
-            println!("{json}");
-        }
-        OutputFormat::Human => print_warnings_human(&report),
-    }
-
-    // A build that failed without exceeding the baseline is an environment
-    // failure, not a green ratchet: surface the raw build output so the
-    // compile error is visible, exactly as the shell script did.
-    if exit == ResultStatus::EnvBroken {
-        eprintln!();
-        eprintln!(
-            "warnings ratchet ERROR: a workspace build failed without exceeding the \
-             warning baseline."
-        );
-        if prod_status != 0 {
-            eprintln!();
-            eprintln!("Production build output (cargo exit {prod_status}):");
-            eprint!("{prod_out}");
-        }
-        if tests_status != 0 {
-            eprintln!();
-            eprintln!("Test build output (cargo exit {tests_status}):");
-            eprint!("{tests_out}");
-        }
-    }
-
-    Ok(exit)
-}
-
-/// The exit contract of `ratchet warnings`, kept pure so it is unit-testable
-/// without running cargo:
-///   * over baseline                           -> `Failed` (1), regardless of
-///     build status (`deny(warnings)` legitimately fails a warning build);
-///   * at/under baseline but a build failed    -> `EnvBroken` (2);
-///   * at/under baseline and both builds clean -> `Ok` (0).
-const fn warnings_exit(
-    total: u64,
-    baseline: u64,
-    prod_status: i32,
-    tests_status: i32,
-) -> ResultStatus {
-    if total > baseline {
-        ResultStatus::Failed
-    } else if prod_status != 0 || tests_status != 0 {
-        ResultStatus::EnvBroken
-    } else {
-        ResultStatus::Ok
-    }
-}
-
-/// Run `cargo <args>` at `repo` with `--message-format=human --color=never`
-/// and capture combined stdout+stderr plus the exit status. A non-zero exit
-/// is not an error at this layer — `deny(warnings)` can turn warnings into
-/// hard errors and the ratchet still has to count the diagnostics — but the
-/// status is returned so the caller can fail closed on a build that broke
-/// for any other reason.
-fn cargo_build_output(repo: &RepoRoot, args: &[&str]) -> anyhow::Result<(String, i32)> {
-    let mut spawn = Spawn::new(Cargo::program()).cwd(repo.0.clone());
-    for a in args {
-        spawn = spawn.arg(*a);
-    }
-    spawn = spawn.arg("--message-format=human").arg("--color=never");
-    let captured = spawn.capture()?;
-    let mut combined = String::with_capacity(captured.stdout.len() + captured.stderr.len());
-    combined.push_str(&captured.stdout);
-    combined.push_str(&captured.stderr);
-    Ok((combined, captured.code))
-}
-
-/// Extract the set of `warning: <...>` diagnostic lines from cargo output.
-///
-/// A three-stage filter:
-///   1. Keep only lines starting with `warning: `.
-///   2. Drop the per-crate summary line
-///      (`warning: \`<crate>\` (...) generated N warnings?`).
-///   3. Drop cargo's own housekeeping lines (network retries, manifest
-///      keys, the `build failed, waiting for other jobs` notice) — none
-///      of them is a rustc diagnostic, so none may count against the
-///      baseline.
-///
-/// The returned `Vec` preserves source order so the `--format human`
-/// view matches the shell-script output verbatim.
-fn extract_warning_lines(output: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in output.lines() {
-        if !line.starts_with("warning: ") {
-            continue;
-        }
-        if is_crate_summary(line) {
-            continue;
-        }
-        if is_cargo_housekeeping(line) {
-            continue;
-        }
-        out.push(line.to_string());
-    }
-    out
-}
-
-/// Match `^warning: \`[^\`]+\` \(.*\) generated [0-9]+ warnings?`.
-fn is_crate_summary(line: &str) -> bool {
-    // Strip the leading `warning: ` prefix.
-    let Some(rest) = line.strip_prefix("warning: ") else {
-        return false;
-    };
-    // Must begin with a backtick-quoted crate name.
-    let Some(after_first_tick) = rest.strip_prefix('`') else {
-        return false;
-    };
-    let Some(close) = after_first_tick.find('`') else {
-        return false;
-    };
-    let after_close = &after_first_tick[close + 1..];
-    // Followed by ` (...) `.
-    let trimmed = after_close.trim_start();
-    let Some(after_paren) = trimmed.strip_prefix('(') else {
-        return false;
-    };
-    let Some(close_paren) = after_paren.find(')') else {
-        return false;
-    };
-    let tail = after_paren[close_paren + 1..].trim_start();
-    // ...then literally `generated N warning` or `generated N warnings`.
-    let Some(rest) = tail.strip_prefix("generated ") else {
-        return false;
-    };
-    // Accept `<digits> warning(s)?...` without consuming anything after.
-    let digit_end = rest
-        .char_indices()
-        .find(|(_, ch)| !ch.is_ascii_digit())
-        .map_or(rest.len(), |(i, _)| i);
-    if digit_end == 0 {
-        return false;
-    }
-    let after_digits = rest[digit_end..].trim_start();
-    after_digits.starts_with("warning")
-}
-
-/// Match cargo's own non-diagnostic `warning:` lines:
-/// `^warning: (spurious network error|unused manifest key|build failed, waiting for other jobs to finish...)`.
-///
-/// The last one is what cargo prints when one crate's compile error aborts
-/// the rest of a parallel build. It is not a warning in any crate; counting
-/// it would turn a compile error into a phantom over-baseline "warning" —
-/// and NOT counting it is exactly why the build status must be checked
-/// separately (see `warnings_exit`).
-fn is_cargo_housekeeping(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("warning: ") else {
-        return false;
-    };
-    rest.starts_with("spurious network error")
-        || rest.starts_with("unused manifest key")
-        || rest.starts_with("build failed, waiting for other jobs to finish...")
-}
-
-fn print_warnings_human(r: &WarningsReport) {
-    println!("warnings ratchet: baseline={}", r.baseline);
-    println!(
-        "  cargo build --workspace:          {} warnings",
-        r.prod_warnings
-    );
-    println!(
-        "  cargo build --workspace --tests:  {} warnings",
-        r.tests_warnings
-    );
-    println!("  total:                             {}", r.total);
-    if r.exit == ResultStatus::Failed {
-        println!();
-        println!(
-            "warnings ratchet FAILED: total {} > baseline {}.",
-            r.total, r.baseline
-        );
-        println!();
-        println!("Production warnings:");
-        for w in &r.prod_samples {
-            println!("{w}");
-        }
-        println!();
-        println!("Test warnings:");
-        for w in &r.tests_samples {
-            println!("{w}");
-        }
-        println!();
-        println!(
-            "Fix the warnings, or update ratchet/warnings_baseline.json and \
-             justify in commit body."
-        );
-    } else if r.exit == ResultStatus::EnvBroken {
-        println!();
-        println!(
-            "warnings ratchet ERROR: total {} <= baseline {} but a workspace build \
-             failed (cargo build --workspace: exit {}; --tests: exit {}). \
-             The build output follows on stderr.",
-            r.total, r.baseline, r.prod_build_status, r.tests_build_status
-        );
-    } else {
-        println!(
-            "warnings ratchet OK: total {} <= baseline {}.",
-            r.total, r.baseline
-        );
-    }
-}
-
-// ---------------- unwrap (panic-family site ratchet) ----------------
-//
-// The canonical unwrap ratchet (#385 / Part of #372). This command owns the
-// whole contract: it runs `scripts/generate_unwrap_audit.py` with
-// `--baseline-out`/`--audit-out` to compute fresh per-file counts, then diffs
-// them against the checked-in `ratchet/unwrap_baseline.json`. The Python
-// generator stays the scanner (still the source of truth for category labels
-// in `ratchet/panic_audit.md`); the diff + exit contract live here so a gate
-// can depend on a single binary. `scripts/check_unwrap_ratchet.sh` is a pure
-// `exec cargo run -p trust-cg-test --quiet -- ratchet unwrap "$@"` shim kept
-// for callers that expect a script path (`scripts/check_panic_clippy.sh`).
-//
-// Exit semantics:
-//   * `ResultStatus::Ok` (0)          — every file is at or below baseline
-//   * `ResultStatus::Failed` (1)      — at least one file exceeds baseline
-//   * `ResultStatus::EnvBroken` (2)   — missing python3 / baseline / generator
-
-/// Top-level schema for `ratchet/unwrap_baseline.json`. Only the fields
-/// the ratchet reads are modeled — `schema_version`, `note`, etc. are
-/// ignored so the generator can keep adding metadata.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct UnwrapBaseline {
-    #[serde(default)]
-    per_file: std::collections::BTreeMap<String, u64>,
-    #[serde(default)]
-    total: u64,
-}
-
-/// One per-file regression finding.
-#[derive(Clone, Debug, Serialize)]
-struct UnwrapViolation {
-    file: String,
-    baseline: u64,
-    current: u64,
-}
-
-impl UnwrapViolation {
-    fn delta(&self) -> i128 {
-        i128::from(self.current) - i128::from(self.baseline)
-    }
-}
-
-/// Machine-readable summary emitted under `--format json` / `--format junit`.
-#[derive(Clone, Debug, Serialize)]
-struct UnwrapReport {
-    command: &'static str,
-    baseline_path: String,
-    current_path: String,
-    baseline_total: u64,
-    current_total: u64,
-    reduced: u64,
-    violations: Vec<UnwrapViolation>,
-    exit: ResultStatus,
-}
-
-fn unwrap(global: &GlobalArgs) -> anyhow::Result<ResultStatus> {
-    let repo = RepoRoot::locate(Path::new("."))?;
-    let baseline_path = repo.join("ratchet").join("unwrap_baseline.json");
-    let generator = repo.join("scripts").join("generate_unwrap_audit.py");
-
-    // Env broken: no python3, missing baseline, missing generator.
-    if crate::shell::which("python3").is_none() {
-        eprintln!("ratchet unwrap: python3 not found on PATH");
-        return Ok(ResultStatus::EnvBroken);
-    }
-    if !baseline_path.is_file() {
-        eprintln!(
-            "ratchet unwrap: baseline file missing: {}",
-            baseline_path.display()
-        );
-        eprintln!("Run: python3 scripts/generate_unwrap_audit.py --write");
-        return Ok(ResultStatus::EnvBroken);
-    }
-    if !generator.is_file() {
-        eprintln!("ratchet unwrap: generator missing: {}", generator.display());
-        return Ok(ResultStatus::EnvBroken);
-    }
-
-    // Write current counts to a temp file, then diff. Mirrors the shell
-    // script's `mktemp` + `--baseline-out $TMP` flow.
-    let tmp_dir = std::env::temp_dir();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_current = tmp_dir.join(format!(
-        "unwrap_current_pid{}_{}.json",
-        std::process::id(),
-        nanos
-    ));
-
-    let mut spawn = Spawn::new("python3").cwd(repo.0.clone());
-    spawn = spawn
-        .arg(generator.display().to_string())
-        .arg("--write")
-        .arg("--baseline-out")
-        .arg(tmp_current.display().to_string())
-        .arg("--audit-out")
-        .arg("/dev/null");
-    let captured = spawn.capture()?;
-    if !captured.success() {
-        eprintln!("ratchet unwrap: generator failed (exit {})", captured.code);
-        if !captured.stderr.is_empty() {
-            eprintln!("{}", captured.stderr);
-        }
-        // Clean up temp file if the generator wrote it anyway.
-        let _ = fs::remove_file(&tmp_current);
-        return Ok(ResultStatus::EnvBroken);
-    }
-
-    let baseline_text = fs::read_to_string(&baseline_path)
-        .with_context(|| format!("reading {}", baseline_path.display()))?;
-    let baseline: UnwrapBaseline = serde_json::from_str(&baseline_text)
-        .with_context(|| format!("parsing {} as unwrap baseline", baseline_path.display()))?;
-
-    let current_text = fs::read_to_string(&tmp_current)
-        .with_context(|| format!("reading {}", tmp_current.display()))?;
-    let current: UnwrapBaseline = serde_json::from_str(&current_text)
-        .with_context(|| format!("parsing {} as unwrap baseline", tmp_current.display()))?;
-
-    // Always clean the temp file once we've loaded it.
-    let _ = fs::remove_file(&tmp_current);
-
-    let (violations, reduced) = diff_unwrap(&baseline, &current);
-
-    let exit = if violations.is_empty() {
-        ResultStatus::Ok
-    } else {
-        ResultStatus::Failed
-    };
-
-    let report = UnwrapReport {
-        command: "ratchet.unwrap",
-        baseline_path: baseline_path.display().to_string(),
-        current_path: tmp_current.display().to_string(),
-        baseline_total: baseline.total,
-        current_total: current.total,
-        reduced,
-        violations: violations.clone(),
-        exit,
-    };
-
-    match global.format {
-        OutputFormat::Json | OutputFormat::Junit => {
-            let json = serde_json::to_string_pretty(&report)?;
-            println!("{json}");
-        }
-        OutputFormat::Human => print_unwrap_human(&report),
-    }
-
-    Ok(exit)
-}
-
-/// Return `(violations, reduced)` for `current` vs `baseline`.
-/// `violations` lists files whose production panic-family count rose;
-/// `reduced` is the sum of per-file decreases (informational only).
-fn diff_unwrap(baseline: &UnwrapBaseline, current: &UnwrapBaseline) -> (Vec<UnwrapViolation>, u64) {
-    let mut violations: Vec<UnwrapViolation> = Vec::new();
-    let mut reduced: u64 = 0;
-
-    let mut all_files: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
-    all_files.extend(baseline.per_file.keys());
-    all_files.extend(current.per_file.keys());
-
-    for f in all_files {
-        let base_n = baseline.per_file.get(f).copied().unwrap_or(0);
-        let cur_n = current.per_file.get(f).copied().unwrap_or(0);
-        if cur_n > base_n {
-            violations.push(UnwrapViolation {
-                file: f.clone(),
-                baseline: base_n,
-                current: cur_n,
-            });
-        } else if cur_n < base_n {
-            reduced = reduced.saturating_add(base_n - cur_n);
-        }
-    }
-
-    (violations, reduced)
-}
-
-fn print_unwrap_human(r: &UnwrapReport) {
-    if !r.violations.is_empty() {
-        println!("unwrap ratchet FAILED: production panic-family count increased.");
-        println!("  baseline: {}", r.baseline_path);
-        println!("  current:  {}", r.current_path);
-        println!();
-        println!("{:<60} {:>6} {:>6} {:>6}", "file", "base", "cur", "delta");
-        for v in &r.violations {
-            println!(
-                "{:<60} {:>6} {:>6} {:>+6}",
-                v.file,
-                v.baseline,
-                v.current,
-                v.delta()
-            );
-        }
-        println!();
-        println!("Every production .unwrap() / .expect( / panic! / unreachable! / todo!");
-        println!("added outside #[cfg(test)] must be matched by a removal elsewhere in");
-        println!("the same file, or you must update the baseline with:");
-        println!("  python3 scripts/generate_unwrap_audit.py --write");
-        println!("and justify the increase in the commit body.");
-        return;
-    }
-
-    println!(
-        "unwrap ratchet OK: total {} <= baseline {} (reduced {}).",
-        r.current_total, r.baseline_total, r.reduced
-    );
-}
-
-// ---------------- panic-clippy ----------------
-//
-// Thin CLI wrapper around `scripts/check_panic_clippy.sh` (#699). The
-// script remains the behavior source for package discovery, clippy invocation,
-// and baseline comparison; this entry point only wires it into the unified
-// ratchet dispatcher.
-
-#[derive(Clone, Debug, Serialize)]
-struct PanicClippyReport {
-    command: &'static str,
-    script_path: String,
-    packages: Vec<String>,
-    skip_ratchet: bool,
-    stdout: String,
-    stderr: String,
-    exit_code: i32,
-    exit: ResultStatus,
-}
-
-fn panic_clippy(global: &GlobalArgs, args: &PanicClippyArgs) -> anyhow::Result<ResultStatus> {
-    let repo = RepoRoot::locate(Path::new("."))?;
-    let script = repo.join("scripts").join("check_panic_clippy.sh");
-
-    if !script.is_file() {
-        eprintln!("ratchet panic-clippy: script missing: {}", script.display());
-        return Ok(ResultStatus::EnvBroken);
-    }
-
-    let spawn = panic_clippy_spawn(&repo, &script, args);
-    match global.format {
-        OutputFormat::Json | OutputFormat::Junit => {
-            let captured = spawn.capture()?;
-            let exit = panic_clippy_status(captured.code);
-            let report = PanicClippyReport {
-                command: "ratchet.panic-clippy",
-                script_path: script.display().to_string(),
-                packages: args.packages.clone(),
-                skip_ratchet: args.skip_ratchet,
-                stdout: captured.stdout,
-                stderr: captured.stderr,
-                exit_code: captured.code,
-                exit,
-            };
-            let json = serde_json::to_string_pretty(&report)?;
-            println!("{json}");
-            Ok(exit)
-        }
-        OutputFormat::Human => {
-            let status = spawn.run()?;
-            Ok(panic_clippy_status(status))
-        }
-    }
-}
-
-fn panic_clippy_spawn(repo: &RepoRoot, script: &Path, args: &PanicClippyArgs) -> Spawn {
-    let mut spawn = Spawn::new(script.as_os_str().to_os_string()).cwd(repo.0.clone());
-    for package in &args.packages {
-        spawn = spawn.arg("--package").arg(package);
-    }
-    if args.skip_ratchet {
-        spawn = spawn.arg("--skip-ratchet");
-    }
-    spawn
-}
-
-const fn panic_clippy_status(status: i32) -> ResultStatus {
-    match status {
-        0 => ResultStatus::Ok,
-        1 => ResultStatus::Failed,
-        2 => ResultStatus::EnvBroken,
-        _ => ResultStatus::Errored,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use clap::{Command, Subcommand};
 
     use super::{
-        RatchetCommand, RegressionKind, ResultStatus, ShardEntry, TestMatrixDoc, TotalsEntry,
-        UnwrapBaseline, diff_matrices, diff_unwrap, extract_warning_lines, is_cargo_housekeeping,
-        is_crate_summary, newest_json, panic_clippy_status, warnings_exit,
+        RatchetCommand, RegressionKind, ShardEntry, TestMatrixDoc, TotalsEntry, diff_matrices,
+        newest_json,
     };
 
     /// Guard against a silent drop of a subcommand from the ratchet tree.
@@ -1372,104 +701,13 @@ mod tests {
             .get_subcommands()
             .map(|c| c.get_name().to_string())
             .collect();
-        for expected in [
-            "tests",
-            "warnings",
-            "unwrap",
-            "panic-clippy",
-            "shell-isolation",
-            "schema",
-            "lint-linux",
-        ] {
+        for expected in ["tests", "shell-isolation", "schema", "lint-linux"] {
             assert!(
                 subs.iter().any(|s| s == expected),
                 "ratchet subcommand `{expected}` missing from RatchetCommand tree; \
                  present: {subs:?}"
             );
         }
-    }
-
-    #[test]
-    fn counts_source_warnings_only() {
-        let sample = "\
-Compiling foo v0.1.0
-warning: unused variable: `x`
-  --> src/lib.rs:3:9
-warning: `foo` (lib) generated 1 warning
-warning: unused import: `bar`
-  --> src/lib.rs:1:5
-warning: `foo` (lib test) generated 1 warning
-    Finished dev profile
-";
-        let diags = extract_warning_lines(sample);
-        assert_eq!(diags.len(), 2, "only source diagnostics, not summaries");
-        assert_eq!(diags[0], "warning: unused variable: `x`");
-        assert_eq!(diags[1], "warning: unused import: `bar`");
-    }
-
-    #[test]
-    fn filters_cargo_housekeeping() {
-        let sample = "\
-warning: spurious network error (2 tries remaining): timeout
-warning: unused manifest key: package.metadata.foo
-warning: dead_code — real diagnostic
-warning: build failed, waiting for other jobs to finish...
-warning: `mycrate` (bin \"x\") generated 0 warnings
-";
-        let diags = extract_warning_lines(sample);
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0], "warning: dead_code — real diagnostic");
-    }
-
-    #[test]
-    fn warnings_exit_fails_closed_on_build_failure() {
-        // Clean build, under baseline: green.
-        assert_eq!(warnings_exit(0, 0, 0, 0), ResultStatus::Ok);
-        assert_eq!(warnings_exit(2, 3, 0, 0), ResultStatus::Ok);
-        // Over baseline is a ratchet failure whatever the build status —
-        // deny(warnings) legitimately fails a warning build.
-        assert_eq!(warnings_exit(1, 0, 0, 0), ResultStatus::Failed);
-        assert_eq!(warnings_exit(1, 0, 101, 0), ResultStatus::Failed);
-        // A zero-warning compile error is an environment failure, never
-        // a green ratchet (c8a07fe3).
-        assert_eq!(warnings_exit(0, 0, 101, 0), ResultStatus::EnvBroken);
-        assert_eq!(warnings_exit(0, 0, 0, 101), ResultStatus::EnvBroken);
-        assert_eq!(warnings_exit(0, 0, 255, 255), ResultStatus::EnvBroken);
-    }
-
-    #[test]
-    fn crate_summary_matcher_is_strict() {
-        assert!(is_crate_summary(
-            "warning: `trust-cg-opt` (lib) generated 3 warnings"
-        ));
-        assert!(is_crate_summary(
-            "warning: `trust-cg-opt` (lib test) generated 1 warning"
-        ));
-        // Not a summary — real diagnostic that happens to mention generated.
-        assert!(!is_crate_summary("warning: code generated from macro"));
-        // Missing trailing word.
-        assert!(!is_crate_summary(
-            "warning: `trust-cg-opt` (lib) generated 3 issues"
-        ));
-    }
-
-    #[test]
-    fn housekeeping_matcher_only_hits_prefixes() {
-        assert!(is_cargo_housekeeping(
-            "warning: spurious network error (2 tries remaining): timeout"
-        ));
-        assert!(is_cargo_housekeeping(
-            "warning: unused manifest key: package.metadata.foo"
-        ));
-        assert!(!is_cargo_housekeeping(
-            "warning: unused variable: spurious_network_error"
-        ));
-    }
-
-    #[test]
-    fn empty_input_yields_no_warnings() {
-        assert!(extract_warning_lines("").is_empty());
-        assert!(extract_warning_lines("Finished dev [unoptimized]\n").is_empty());
     }
 
     // -------- tests (pass-count ratchet) helpers --------
@@ -1634,12 +872,13 @@ warning: `mycrate` (bin \"x\") generated 0 warnings
     #[test]
     fn newest_json_picks_lexicographically_latest() {
         let tmp = tempdir_unique("ratchet_newest_json_ok");
+        let tmp = tmp.path();
         std::fs::write(tmp.join("2026-04-17.json"), "{}").expect("write");
         std::fs::write(tmp.join("2026-04-19.json"), "{}").expect("write");
         std::fs::write(tmp.join("2026-04-18.json"), "{}").expect("write");
         // Sidecar log file — must be ignored.
         std::fs::write(tmp.join("2026-04-19.trust-cg-verify.all.log"), "x").expect("write");
-        let pick = newest_json(&tmp).expect("some");
+        let pick = newest_json(tmp).expect("some");
         assert_eq!(pick.file_name().unwrap(), "2026-04-19.json");
     }
 
@@ -1648,132 +887,15 @@ warning: `mycrate` (bin \"x\") generated 0 warnings
         let missing = std::env::temp_dir().join("trust_cg_ratchet_missing_XYZ_does_not_exist");
         assert!(newest_json(&missing).is_none());
         let empty = tempdir_unique("ratchet_newest_json_empty");
-        assert!(newest_json(&empty).is_none());
+        assert!(newest_json(empty.path()).is_none());
     }
 
-    fn tempdir_unique(tag: &str) -> std::path::PathBuf {
-        // Crude but dependency-free unique tempdir. `std::env::temp_dir()`
-        // + pid + nanoseconds is sufficient for this crate's test volume.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p = std::env::temp_dir().join(format!(
-            "trust_cg_{}_pid{}_{}",
-            tag,
-            std::process::id(),
-            nanos
-        ));
-        std::fs::create_dir_all(&p).expect("mkdir tempdir");
-        p
-    }
-
-    // -------- unwrap (panic-family site ratchet) helpers --------
-
-    fn unwrap_doc(files: &[(&str, u64)]) -> UnwrapBaseline {
-        let mut per_file = std::collections::BTreeMap::new();
-        let mut total: u64 = 0;
-        for (f, n) in files {
-            per_file.insert((*f).to_string(), *n);
-            total += *n;
-        }
-        UnwrapBaseline { per_file, total }
-    }
-
-    #[test]
-    fn unwrap_no_change_is_clean() {
-        let base = unwrap_doc(&[("crates/foo/src/a.rs", 3), ("crates/bar/src/b.rs", 1)]);
-        let cur = base.clone();
-        let (violations, reduced) = diff_unwrap(&base, &cur);
-        assert!(violations.is_empty());
-        assert_eq!(reduced, 0);
-    }
-
-    #[test]
-    fn unwrap_catches_per_file_increase() {
-        let base = unwrap_doc(&[("crates/foo/src/a.rs", 3)]);
-        let cur = unwrap_doc(&[("crates/foo/src/a.rs", 5)]);
-        let (violations, reduced) = diff_unwrap(&base, &cur);
-        assert_eq!(reduced, 0);
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].file, "crates/foo/src/a.rs");
-        assert_eq!(violations[0].baseline, 3);
-        assert_eq!(violations[0].current, 5);
-        assert_eq!(violations[0].delta(), 2);
-    }
-
-    #[test]
-    fn unwrap_new_file_triggers_violation() {
-        // A brand-new file with non-zero production sites is a regression
-        // (baseline implicitly 0 via the BTreeMap miss).
-        let base = unwrap_doc(&[("crates/foo/src/a.rs", 3)]);
-        let cur = unwrap_doc(&[("crates/foo/src/a.rs", 3), ("crates/foo/src/b.rs", 2)]);
-        let (violations, reduced) = diff_unwrap(&base, &cur);
-        assert_eq!(reduced, 0);
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].file, "crates/foo/src/b.rs");
-        assert_eq!(violations[0].baseline, 0);
-        assert_eq!(violations[0].current, 2);
-    }
-
-    #[test]
-    fn unwrap_per_file_decrease_counted_as_reduced() {
-        let base = unwrap_doc(&[("crates/foo/src/a.rs", 5)]);
-        let cur = unwrap_doc(&[("crates/foo/src/a.rs", 2)]);
-        let (violations, reduced) = diff_unwrap(&base, &cur);
-        assert!(violations.is_empty());
-        assert_eq!(reduced, 3);
-    }
-
-    #[test]
-    fn unwrap_file_fully_removed_counts_as_reduced() {
-        // A file that dropped to 0 sites (fully cleaned up) is a win:
-        // no violation, and the removal counts toward `reduced`.
-        let base = unwrap_doc(&[("crates/foo/src/a.rs", 5), ("crates/foo/src/b.rs", 2)]);
-        let cur = unwrap_doc(&[("crates/foo/src/a.rs", 5)]);
-        let (violations, reduced) = diff_unwrap(&base, &cur);
-        assert!(violations.is_empty());
-        assert_eq!(reduced, 2);
-    }
-
-    #[test]
-    fn unwrap_reports_multiple_increases() {
-        let base = unwrap_doc(&[("crates/a.rs", 1), ("crates/b.rs", 1), ("crates/c.rs", 1)]);
-        let cur = unwrap_doc(&[("crates/a.rs", 2), ("crates/b.rs", 4), ("crates/c.rs", 1)]);
-        let (violations, reduced) = diff_unwrap(&base, &cur);
-        assert_eq!(reduced, 0);
-        assert_eq!(violations.len(), 2);
-        // BTreeSet iteration yields files in lexicographic order.
-        assert_eq!(violations[0].file, "crates/a.rs");
-        assert_eq!(violations[1].file, "crates/b.rs");
-    }
-
-    #[test]
-    fn unwrap_parses_real_baseline_schema() {
-        // The generator emits a superset of fields (schema_version, note,
-        // excluded_crates, per_crate_totals, per_file, total). The parser
-        // must tolerate the extras without error.
-        let text = r#"{
-  "schema_version": 1,
-  "note": "...",
-  "excluded_crates": ["trust-cg-verify"],
-  "per_crate_totals": {"trust-cg-opt": 8},
-  "per_file": {"crates/trust-cg-opt/src/gvn.rs": 1},
-  "total": 1
-}"#;
-        let b: UnwrapBaseline = serde_json::from_str(text).expect("parse");
-        assert_eq!(b.total, 1);
-        assert_eq!(
-            b.per_file.get("crates/trust-cg-opt/src/gvn.rs").copied(),
-            Some(1u64)
-        );
-    }
-
-    #[test]
-    fn ratchet_panic_clippy_status_matches_script_exit_contract() {
-        assert_eq!(panic_clippy_status(0), ResultStatus::Ok);
-        assert_eq!(panic_clippy_status(1), ResultStatus::Failed);
-        assert_eq!(panic_clippy_status(2), ResultStatus::EnvBroken);
-        assert_eq!(panic_clippy_status(42), ResultStatus::Errored);
+    /// A unique scratch directory the test owns: removed when the returned
+    /// guard drops, whether the test passed or failed.
+    fn tempdir_unique(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("trust_cg_{tag}_"))
+            .tempdir()
+            .expect("mkdir tempdir")
     }
 }

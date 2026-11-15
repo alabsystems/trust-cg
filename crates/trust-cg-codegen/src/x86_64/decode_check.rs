@@ -38,7 +38,20 @@
 // reg/imm, reg/mem; MOV (rr/ri/mem loads+stores/SIB/RIP-rel); MOVZX/MOVSX; LEA
 // (+SIB, +RIP); shifts; IMUL; unary (NEG/NOT/INC/DEC/MUL/DIV/IDIV/CDQ/CQO);
 // branches (RET/CALL/CALL-ind/JMP/Jcc); PUSH/POP; SETcc; CMOVcc; bit-manip
-// (BSF/BSR/TZCNT/LZCNT/POPCNT/BT/BSWAP); XCHG/CMPXCHG/MFENCE/UD2/multi-NOP.
+// (BSF/BSR/TZCNT/LZCNT/POPCNT/BT/BSWAP); XCHG/CMPXCHG/MFENCE/UD2/multi-NOP;
+// the NARROW `CMPXCHG r/m8, r8` / `r/m16, r16` pair (`Cmpxchg8`/`Cmpxchg16`),
+// whose operand width exists ONLY in the encoding and which was allowlisted
+// until the narrow-CAS coverage credit was repaired; and the 128-bit
+// atomic-load pseudo (`AtomicLoadCmpxchg16b`), checked as the FIVE instructions
+// it expands to — `XOR EAX,EAX`, `XOR EDX,EDX`, `XOR EBX,EBX`, `XOR ECX,ECX`
+// and `LOCK CMPXCHG16B m128` — so the zeroing its load semantics depends on is
+// decoded from the bytes, and CMPXCHG16B's 16-byte width, which exists only in
+// its REX.W bit (without it the same `0F C7 /1` is the 8-byte CMPXCHG8B), is
+// compared. For CMPXCHG the LOCK prefix is compared too: a dropped `F0` is an
+// atomicity defect no operand comparison can see.
+// `MovRI` additionally has to pass `trust_cg_verify::x86_encoding_proofs`'
+// denotation obligation. The structural comparison alone is blind to a
+// sign-/zero-extension alias bug (see `check_one`).
 //
 // ALLOWLISTED (counted-with-reason, never silently skipped): SSE scalar/packed
 // FP, SSE2 packed integer, GPR<->XMM transfer, SSE RIP-rel loads, FP converts,
@@ -86,10 +99,6 @@ const XMM_XFER: &str = "GPR<->XMM transfer (ENC-2 offline lane; decoder extensio
 const PSEUDO_FAIL_CLOSED: &str =
     "fail-closed pseudo carrier: the emitter rejects it before any bytes exist";
 const PSEUDO_EXPANSION: &str = "CAS-loop multi-instruction expansion: component opcodes are covered; sequence lane is a follow-on";
-const NARROW_CMPXCHG: &str = "narrow LOCK CMPXCHG (r/m8: F0 0F B0; r/m16: F0 66 0F B1) — AtomicU8/U16 \
-     compare-exchange; the decoder round-trip extension for the byte/word forms is a \
-     follow-on (32/64-bit CMPXCHG is Covered)";
-
 const JUMP_TABLE: &str = "jump-table dispatch idiom (indirect JMP r64 / MOVSXD r64,[base+idx*4] SIB); the decoder \
      round-trip extension for these forms is a follow-on";
 
@@ -149,6 +158,11 @@ fn coverage(op: X86Opcode) -> Coverage {
         | O::MovMR8Sib
         | O::MovRipRel
         | O::MovRipRelTlv => Covered,
+        // The zero-extending loads (`0F B6`/`0F B7` + memory ModR/M), decoded
+        // with their source width (`ext_src_bits`) and 32-bit destination.
+        O::MovzxRM8 | O::MovzxRM16 | O::MovzxRM8Sib | O::VolatileMovzxRM8 | O::VolatileMovzxRM16 => {
+            Covered
+        }
         O::Movzx | O::MovzxW | O::MovsxB | O::MovsxW | O::Movsx => Covered,
         O::Lea | O::LeaSib | O::LeaRip => Covered,
         O::Ret | O::Call | O::CallR | O::CallM | O::Jmp | O::Jcc => Covered,
@@ -156,6 +170,24 @@ fn coverage(op: X86Opcode) -> Coverage {
         O::Setcc | O::Cmovcc | O::Cmovcc32 => Covered,
         O::Bsf | O::Bsr | O::Tzcnt | O::Lzcnt | O::Popcnt | O::BtRI | O::Bswap => Covered,
         O::Xchg | O::Cmpxchg | O::Mfence | O::Ud2 | O::NopMulti => Covered,
+        // The NARROW compare-exchange pair. These were `Allowlisted(NARROW_CMPXCHG)`
+        // until the narrow-CAS coverage credit was repaired: the whole content of
+        // those two proof rows is the operand WIDTH, and for `CMPXCHG r/m8, r8`
+        // versus `CMPXCHG r/m16, r16` the width is PURELY an encoding fact, so an
+        // allowlist left `emit_byte(0xB0)` -> `0xB1` (a byte CAS silently becoming a
+        // 4-byte one) undetectable by every gate in the tree. The decoder derives the
+        // width from the bytes alone -- `0F B0` is 8, `66 0F B1` is 16, a bare
+        // `0F B1` is 32 -- so a drifted opcode byte or a dropped `66` now fails the
+        // compile closed. ENC-2's offline llvm-objdump differential carries 72
+        // narrow-CAS vectors and is this decoder's external anchor for them.
+        O::Cmpxchg8 | O::Cmpxchg16 => Covered,
+        // The 128-bit atomic-load pseudo: four zeroing `XOR r32,r32` and
+        // `LOCK CMPXCHG16B m128` (`F0 REX.W 0F C7 /1`), decoded as a SEQUENCE
+        // (`check_atomic_load_cmpxchg16b`). COVERED from the day it is emitted:
+        // the zeros are the precondition of its load semantics, its whole
+        // width claim is the REX.W bit (a dropped REX.W is CMPXCHG8B, an 8-byte
+        // CAS on half the object), and its atomicity is the F0 prefix.
+        O::AtomicLoadCmpxchg16b => Covered,
 
         // ---- allowlisted (counted-with-reason) ----
         O::Addsd
@@ -174,6 +206,10 @@ fn coverage(op: X86Opcode) -> Coverage {
         | O::Ucomisd
         | O::MovdquRM
         | O::MovdquMR
+        // Scaled-index 128-bit MOVDQU load/store: the same SSE_FP family as
+        // MovdquRM / MovdquMR, differing only in the effective-address form.
+        | O::MovdquRMSib
+        | O::MovdquMRSib
         | O::Addss
         | O::Subss
         | O::Mulss
@@ -278,7 +314,6 @@ fn coverage(op: X86Opcode) -> Coverage {
             Allowlisted(PSEUDO_EXPANSION)
         }
         O::JmpR | O::MovsxdRMSib => Allowlisted(JUMP_TABLE),
-        O::Cmpxchg8 | O::Cmpxchg16 => Allowlisted(NARROW_CMPXCHG),
         // Pseudo (zero bytes) — never recorded, but classify for exhaustiveness.
         O::Phi | O::StackAlloc | O::Nop => Allowlisted(PSEUDO_FAIL_CLOSED),
     }
@@ -336,6 +371,9 @@ enum Mnem {
     Bswap,
     Xchg,
     Cmpxchg,
+    /// `0F C7 /1`: CMPXCHG8B (`bits == 64`) / CMPXCHG16B (`bits == 128`,
+    /// REX.W). Memory operand only.
+    CmpxchgNb,
     Cdq,
     Cqo,
     Mfence,
@@ -377,9 +415,23 @@ struct Canon {
     len: usize,
     /// True for XCHG/CMPXCHG, where the explicit operands are compared as a set.
     unordered: bool,
+    /// The `F0` LOCK prefix. Set by the CMPXCHG decoder arms from the emitted
+    /// bytes and by the CMPXCHG intent arms from the opcode, and compared:
+    /// every `CMPXCHG` the emitter produces is a LOCKed read-modify-write, and
+    /// a dropped `F0` is an ATOMICITY defect that the structural operand
+    /// comparison would otherwise accept. Left `false` on both sides for every
+    /// other family, where it is inert.
+    lock: bool,
     /// True for MOV r,imm — comparison uses the width-reduced-value rule to
     /// tolerate the encoder's zero-extend/movabs width auto-selection.
     mov_imm: bool,
+    /// The SOURCE width of a MOVZX/MOVSX (`0F B6`/`0F BE` = 8, `0F B7`/`0F BF`
+    /// = 16), 0 for every other form. A memory operand carries no width of its
+    /// own, so for `movzx r32, m8` against `movzx r32, m16` this field is the
+    /// only place the access width lives: a `B6` drifting to `B7` (a byte load
+    /// silently becoming a word load) is refuted here. Set from the bytes by
+    /// the decoder and from the opcode by the intent, and compared.
+    ext_src_bits: u8,
 }
 
 fn width_bits(reg: X86PReg) -> u8 {
@@ -440,6 +492,13 @@ struct Prefixes {
     rex_r: bool,
     rex_x: bool,
     rex_b: bool,
+    /// Whether ANY REX byte (`40`..`4F`) was present. Not the same question as
+    /// "were any of W/R/X/B set": in 64-bit mode a BARE `REX` (`0x40`) is what
+    /// makes ModR/M register numbers 4..7 mean SPL/BPL/SIL/DIL in an 8-bit
+    /// operand instead of the legacy AH/CH/DH/BH (SDM Vol 2A 2.2.1.2). The
+    /// narrow-CAS decoder needs it to tell `CMPXCHG [rbx], sil` from
+    /// `CMPXCHG [rbx], dh`, which are the SAME ModR/M byte.
+    rex_present: bool,
     opsize: bool,
     rep: bool,   // F3
     repne: bool, // F2
@@ -466,6 +525,7 @@ fn read_prefixes(r: &mut Reader<'_>) -> Result<Prefixes, String> {
         rex_r: false,
         rex_x: false,
         rex_b: false,
+        rex_present: false,
         opsize: false,
         rep: false,
         repne: false,
@@ -488,6 +548,7 @@ fn read_prefixes(r: &mut Reader<'_>) -> Result<Prefixes, String> {
     }
     let byte = *r.b.get(r.i).ok_or_else(|| "truncated at REX".to_string())?;
     if (0x40..=0x4F).contains(&byte) {
+        p.rex_present = true;
         p.rex_w = byte & 0x08 != 0;
         p.rex_r = byte & 0x04 != 0;
         p.rex_x = byte & 0x02 != 0;
@@ -616,7 +677,9 @@ fn decode_one(bytes: &[u8]) -> Result<Canon, String> {
         rel_off: None,
         len: 0,
         unordered: false,
+        lock: false,
         mov_imm: false,
+        ext_src_bits: 0,
     };
 
     // ALU r/m, r (reg is source, r/m is dest): 01/29/11/19/21/09/31/39, TEST 85,
@@ -965,7 +1028,9 @@ fn decode_0f(r: &mut Reader<'_>, p: &Prefixes, _bytes: &[u8]) -> Result<Canon, S
         rel_off: None,
         len: 0,
         unordered: false,
+        lock: false,
         mov_imm: false,
+        ext_src_bits: 0,
     };
 
     // Jcc rel32: 0F 80+cc.
@@ -1026,6 +1091,7 @@ fn decode_0f(r: &mut Reader<'_>, p: &Prefixes, _bytes: &[u8]) -> Result<Canon, S
             let src = modrm_rm_operand(&m, src_bits)?;
             let mut inst = mk(Mnem::Movzx, bits);
             inst.ops = vec![dst, src];
+            inst.ext_src_bits = src_bits;
             inst.disp_off = m.disp_off;
             inst.len = r.i;
             Ok(inst)
@@ -1038,6 +1104,7 @@ fn decode_0f(r: &mut Reader<'_>, p: &Prefixes, _bytes: &[u8]) -> Result<Canon, S
             let src = modrm_rm_operand(&m, src_bits)?;
             let mut inst = mk(Mnem::Movsx, bits);
             inst.ops = vec![dst, src];
+            inst.ext_src_bits = src_bits;
             inst.disp_off = m.disp_off;
             inst.len = r.i;
             Ok(inst)
@@ -1102,7 +1169,12 @@ fn decode_0f(r: &mut Reader<'_>, p: &Prefixes, _bytes: &[u8]) -> Result<Canon, S
             inst.len = r.i;
             Ok(inst)
         }
-        // CMPXCHG r/m, r: 0F B1 /r (LOCK optional).
+        // CMPXCHG r/m, r: 0F B1 /r. The operand-size attribute is the ONLY
+        // thing that separates the 16-bit narrow form from the 32/64-bit one:
+        // `66 0F B1` is `CMPXCHG r/m16, r16`, a bare `0F B1` is `r/m32`, and
+        // `REX.W 0F B1` is `r/m64` — all the same opcode byte. `opsize_bits`
+        // reads that off the prefixes, so a dropped `66` surfaces as a width
+        // mismatch against the intent rather than as a silent 4-byte CAS.
         0xB1 => {
             let m = read_modrm(r, p)?;
             let dst = modrm_rm_operand(&m, bits)?;
@@ -1111,6 +1183,53 @@ fn decode_0f(r: &mut Reader<'_>, p: &Prefixes, _bytes: &[u8]) -> Result<Canon, S
             inst.ops = vec![dst, src];
             inst.disp_off = m.disp_off;
             inst.unordered = true;
+            inst.lock = p.lock;
+            inst.len = r.i;
+            Ok(inst)
+        }
+        // CMPXCHG r/m8, r8: 0F B0 /r — a SEPARATE opcode byte, fixed at an
+        // 8-bit operand size whatever the prefixes say. This is the byte-level
+        // half of the narrow-CAS width claim: `0F B0` denotes a ONE-byte
+        // compare-and-swap that writes AL only, `0F B1` denotes at least four
+        // bytes and zero-extends RAX, and nothing but this byte distinguishes
+        // them (ISel carries the source for BOTH widths in a Gpr32 carrier).
+        0xB0 => {
+            let m = read_modrm(r, p)?;
+            let dst = byte_rm_operand(&m, p)?;
+            let src = COp::Reg {
+                num: byte_reg_num(m.reg, p),
+                bits: 8,
+            };
+            let mut inst = mk(Mnem::Cmpxchg, 8);
+            inst.ops = vec![dst, src];
+            inst.disp_off = m.disp_off;
+            inst.unordered = true;
+            inst.lock = p.lock;
+            inst.len = r.i;
+            Ok(inst)
+        }
+        // CMPXCHG8B m64 / CMPXCHG16B m128: 0F C7 /1. The ModR/M reg field is an
+        // opcode EXTENSION (it must be exactly 1 — a set REX.R is not the
+        // canonical encoding and is refused), the operand must be memory
+        // (mod=11 is #UD), and REX.W alone selects the 16-byte form: the
+        // decoded width is 128 with it and 64 without, so a dropped REX.W
+        // surfaces as a width mismatch against the 128-bit intent. No
+        // operand-size / REP prefix is part of either form.
+        0xC7 => {
+            let m = read_modrm(r, p)?;
+            if m.reg != 1 {
+                return Err(format!("0F C7 /{} not modeled", m.reg));
+            }
+            let Some(mem) = m.mem else {
+                return Err("0F C7 /1 with a register operand is #UD".to_string());
+            };
+            if p.opsize || p.rep || p.repne {
+                return Err("prefixed 0F C7 /1 is not CMPXCHG8B/16B".to_string());
+            }
+            let mut inst = mk(Mnem::CmpxchgNb, if p.rex_w { 128 } else { 64 });
+            inst.ops = vec![mem];
+            inst.disp_off = m.disp_off;
+            inst.lock = p.lock;
             inst.len = r.i;
             Ok(inst)
         }
@@ -1145,6 +1264,40 @@ fn decode_0f(r: &mut Reader<'_>, p: &Prefixes, _bytes: &[u8]) -> Result<Canon, S
         }
         other => Err(format!("0F {other:#04x} not modeled")),
     }
+}
+
+/// The number of an 8-bit ModR/M register field, in a namespace that keeps the
+/// LEGACY HIGH-BYTE registers distinct.
+///
+/// Without any REX prefix, 8-bit register numbers 4..7 are AH/CH/DH/BH — the
+/// high byte of RAX/RCX/RDX/RBX. With any REX present (even a bare `0x40`) the
+/// same numbers are SPL/BPL/SIL/DIL. `x86_hw_encoding` on the intent side
+/// yields 0..15 for the low-byte registers, so tagging the high-byte reading
+/// with [`HIGH_BYTE_TAG`] makes a MISSING forced REX a structural mismatch
+/// instead of a silent "same register number". The emitter forces a REX for
+/// exactly these four encodings (`low_byte_reg_needs_rex` in `encode.rs`), so
+/// on faithful output the tag never appears.
+const HIGH_BYTE_TAG: u8 = 0x20;
+
+fn byte_reg_num(num: u8, p: &Prefixes) -> u8 {
+    if !p.rex_present && (4..=7).contains(&num) {
+        num | HIGH_BYTE_TAG
+    } else {
+        num
+    }
+}
+
+/// [`modrm_rm_operand`] at an 8-bit operand size, applying the high-byte rule
+/// to a register-form `rm` field. Memory forms are unaffected: address
+/// registers are always 64-bit.
+fn byte_rm_operand(m: &ModRMDec, p: &Prefixes) -> Result<COp, String> {
+    if let Some(num) = m.rm_reg {
+        return Ok(COp::Reg {
+            num: byte_reg_num(num, p),
+            bits: 8,
+        });
+    }
+    modrm_rm_operand(m, 8)
 }
 
 fn modrm_rm_operand(m: &ModRMDec, bits: u8) -> Result<COp, String> {
@@ -1250,7 +1403,9 @@ fn base_canon(mnem: Mnem, bits: u8) -> Canon {
         rel_off: None,
         len: 0,
         unordered: false,
+        lock: false,
         mov_imm: false,
+        ext_src_bits: 0,
     }
 }
 
@@ -1404,6 +1559,10 @@ fn render_intent(intent: &X86IntentInst) -> Result<Canon, String> {
         // SIB byte generically (exactly as 0x89 does for MovMR32Sib).
         O::MovRM8Sib => mem_load(Mnem::Mov, 8, ops)?,
         O::MovMR8Sib => mem_store(Mnem::Mov, 8, ops)?,
+        // The zero-extending loads: the decoder's existing `0F B6`/`0F B7`
+        // arm reads a memory ModR/M (+SIB) generically through `read_modrm`.
+        O::MovzxRM8 | O::VolatileMovzxRM8 | O::MovzxRM8Sib => movzx_mem_load(8, ops)?,
+        O::MovzxRM16 | O::VolatileMovzxRM16 => movzx_mem_load(16, ops)?,
         // Memory-destination RMW ALU: canonical `[mem, reg]` — exactly the
         // shape the independent decoder's `alu_mr` map (0x31/0x01 with a
         // memory ModRM, SIB handled generically by `read_modrm`) produces.
@@ -1594,14 +1753,72 @@ fn render_intent(intent: &X86IntentInst) -> Result<Canon, String> {
                     reg_at(d, c.bits),
                 ];
                 c.unordered = true;
+                c.lock = true;
                 c
             } else {
                 let s = src()?;
                 let mut c = base_canon(Mnem::Cmpxchg, rr_bits(d, s));
                 c.ops = vec![reg_at(d, c.bits), reg_at(s, c.bits)];
                 c.unordered = true;
+                c.lock = true;
                 c
             }
+        }
+        // NARROW compare-exchange: `LOCK CMPXCHG r/m8, r8` and
+        // `LOCK CMPXCHG r/m16, r16`, emitted for AtomicU8/AtomicU16
+        // `compare_exchange`. The operand WIDTH comes from the OPCODE here and
+        // from the emitted bytes on the decoder side, which is the whole point:
+        // ISel hands both widths a Gpr32 carrier (`reg_class_for_type` maps i8
+        // and i16 alike), so the register operand cannot disambiguate them and
+        // only the `0F B0` / `66 0F B1` distinction can. The register NUMBER is
+        // the carrier's — `x86_hw_encoding` is width-independent, and the
+        // emitter's `atomic_rmw_narrow_alias` preserves it — while the decoder
+        // reports the high-byte namespace when the forced REX is missing.
+        O::Cmpxchg8 | O::Cmpxchg16 => {
+            let d = dst()?;
+            let base = ops
+                .base
+                .ok_or_else(|| "narrow CMPXCHG requires a memory operand".to_string())?;
+            let bits = if intent.opcode == O::Cmpxchg16 { 16 } else { 8 };
+            let mut c = base_canon(Mnem::Cmpxchg, bits);
+            c.ops = vec![
+                COp::Mem {
+                    base: Some(x86_hw_encoding(base)),
+                    index: None,
+                    scale: 1,
+                    disp: ops.disp,
+                    rip: false,
+                },
+                reg_at(d, bits),
+            ];
+            c.unordered = true;
+            c.lock = true;
+            c
+        }
+        // The LAST instruction of the 128-bit atomic-load pseudo,
+        // `LOCK CMPXCHG16B [base + disp]` (`check_atomic_load_cmpxchg16b`
+        // renders the four zeroing XORs ahead of it): the width (128) and the
+        // LOCK prefix come from the OPCODE here and from the emitted bytes on
+        // the decoder side; the only explicit operand is the memory operand
+        // (RDX:RAX and RCX:RBX are implicit), so a stray register or index in
+        // the intent is itself a render failure.
+        O::AtomicLoadCmpxchg16b => {
+            let base = ops
+                .base
+                .ok_or_else(|| "CMPXCHG16B requires a memory operand".to_string())?;
+            if ops.dst.is_some() || ops.src.is_some() || ops.index.is_some() {
+                return Err("CMPXCHG16B takes only a [base+disp] memory operand".to_string());
+            }
+            let mut c = base_canon(Mnem::CmpxchgNb, 128);
+            c.ops = vec![COp::Mem {
+                base: Some(x86_hw_encoding(base)),
+                index: None,
+                scale: 1,
+                disp: ops.disp,
+                rip: false,
+            }];
+            c.lock = true;
+            c
         }
         O::Mfence => base_canon(Mnem::Mfence, 0),
         O::Ud2 => base_canon(Mnem::Ud2, 0),
@@ -1640,6 +1857,25 @@ fn mem_load(mnem: Mnem, bits: u8, ops: &X86InstOperands) -> Result<Canon, String
     Ok(c)
 }
 
+/// `movzx r32, m8` / `movzx r32, m16` (`0F B6` / `0F B7` with a memory
+/// ModR/M): a 32-bit destination (no REX.W), the memory operand, and the
+/// source width the opcode fixes.
+fn movzx_mem_load(src_bits: u8, ops: &X86InstOperands) -> Result<Canon, String> {
+    let d = ops
+        .dst
+        .ok_or_else(|| "movzx load missing dst".to_string())?;
+    let mut c = base_canon(Mnem::Movzx, 32);
+    c.ops = vec![
+        COp::Reg {
+            num: x86_hw_encoding(d),
+            bits: 32,
+        },
+        mem_op(ops, false)?,
+    ];
+    c.ext_src_bits = src_bits;
+    Ok(c)
+}
+
 fn mem_store(mnem: Mnem, bits: u8, ops: &X86InstOperands) -> Result<Canon, String> {
     // The store's source register is carried in `dst`.
     let s = ops.dst.ok_or_else(|| "mem store missing src".to_string())?;
@@ -1658,6 +1894,10 @@ fn movext(mnem: Mnem, src_bits: u8, ops: &X86InstOperands) -> Result<Canon, Stri
     let d = ops.dst.ok_or_else(|| "movext missing dst".to_string())?;
     let s = ops.src.ok_or_else(|| "movext missing src".to_string())?;
     let mut c = base_canon(mnem, 64);
+    // `0F B6/B7/BE/BF` carry their source width; MOVSXD (`63`) does not.
+    if src_bits < 32 {
+        c.ext_src_bits = src_bits;
+    }
     c.ops = vec![
         COp::Reg {
             num: x86_hw_encoding(d),
@@ -1732,6 +1972,21 @@ fn compare(intended: &Canon, decoded: &Canon, hole: Option<&FixupHole>) -> Resul
         return Err(format!(
             "condition code: intended {:?}, decoded {:?}",
             intended.cc, decoded.cc
+        ));
+    }
+    if intended.ext_src_bits != decoded.ext_src_bits {
+        return Err(format!(
+            "extension source width: intended {}b, decoded {}b",
+            intended.ext_src_bits, decoded.ext_src_bits
+        ));
+    }
+    // The LOCK prefix. Inert for every family that leaves it false on both
+    // sides; for CMPXCHG a missing `F0` is an atomicity defect that the
+    // operand comparison below cannot see, because LOCK changes no operand.
+    if intended.lock != decoded.lock {
+        return Err(format!(
+            "LOCK prefix: intended {}, decoded {}",
+            intended.lock, decoded.lock
         ));
     }
 
@@ -1844,6 +2099,76 @@ fn check_hole_placement(decoded: &Canon, hole: &FixupHole) -> Result<(), String>
     }
 }
 
+/// ENC-3 for the 128-bit atomic-load pseudo: the emitted bytes must decode to
+/// EXACTLY `XOR EAX,EAX; XOR EDX,EDX; XOR EBX,EBX; XOR ECX,ECX;
+/// LOCK CMPXCHG16B [base + disp]`, in that order, and nothing else.
+///
+/// The zeros are the precondition that makes the compare-exchange a load (with
+/// a non-zero comparand a cell equal to it is overwritten with `RCX:RBX`), so
+/// each zeroing is decoded, not assumed: a dropped, reordered or retargeted XOR
+/// is a mismatch. Each XOR must be the bare two-byte form (no prefix, no REX):
+/// the structural comparison does not see a stray LOCK on an ALU form, and a
+/// 2-byte `XOR r32,r32` admits no prefix at all. The CMPXCHG16B is compared as
+/// every other covered instruction is — width from REX.W, LOCK, the `/1`
+/// extension, the memory operand and its displacement. The pseudo has no
+/// fixup hole.
+fn check_atomic_load_cmpxchg16b(
+    intent: &X86IntentInst,
+    bytes: &[u8],
+    hole: Option<&FixupHole>,
+) -> Result<(), String> {
+    use trust_cg_ir::x86_64_regs::{EAX, EBX, ECX, EDX};
+
+    if let Some(h) = hole {
+        return Err(format!(
+            "the CMPXCHG16B atomic-load pseudo has no fixup hole, but one was recorded \
+             ({:?} at +{})",
+            h.kind, h.offset_in_inst
+        ));
+    }
+    let mut components: Vec<(String, Canon, Option<usize>)> = Vec::new();
+    for zeroed in [EAX, EDX, EBX, ECX] {
+        let xor = X86IntentInst {
+            opcode: X86Opcode::XorRR,
+            ops: X86InstOperands::rr(zeroed, zeroed),
+        };
+        let canon = render_intent(&xor).map_err(|e| format!("intent-render failed: {e}"))?;
+        components.push((format!("XOR {zeroed},{zeroed}"), canon, Some(2)));
+    }
+    let cas = render_intent(intent).map_err(|e| format!("intent-render failed: {e}"))?;
+    components.push(("LOCK CMPXCHG16B".to_string(), cas, None));
+
+    let mut offset = 0usize;
+    for (label, want, exact_len) in &components {
+        let rest = bytes.get(offset..).unwrap_or(&[]);
+        if rest.is_empty() {
+            return Err(format!(
+                "the pseudo's expansion ends before `{label}` (emitted {} bytes)",
+                bytes.len()
+            ));
+        }
+        let got = decode_one(rest).map_err(|e| format!("`{label}` undecodable ({e})"))?;
+        if let Some(len) = exact_len
+            && got.len != *len
+        {
+            return Err(format!(
+                "`{label}` must be the bare {len}-byte form, decoded {} bytes ({:02x?})",
+                got.len,
+                &rest[..got.len.min(rest.len())]
+            ));
+        }
+        compare(want, &got, None).map_err(|e| format!("`{label}`: {e}"))?;
+        offset += got.len;
+    }
+    if offset != bytes.len() {
+        return Err(format!(
+            "length drift: emitted {} bytes, the five-instruction expansion decoded {offset}",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The DecodeCheck impl
 // ---------------------------------------------------------------------------
@@ -1912,6 +2237,15 @@ impl DecodeCheck for X86DecodeCheck {
             };
         }
 
+        // The 128-bit atomic-load pseudo is the other multi-instruction intent:
+        // four zeroing XORs and the LOCK CMPXCHG16B, each decoded and compared.
+        if intent.opcode == X86Opcode::AtomicLoadCmpxchg16b {
+            return match check_atomic_load_cmpxchg16b(intent, bytes, hole) {
+                Ok(()) => DecodeCheckOutcome::Match,
+                Err(message) => DecodeCheckOutcome::Mismatch(DecodeCheckError { message }),
+            };
+        }
+
         let intended = match render_intent(intent) {
             Ok(c) => c,
             Err(e) => {
@@ -1938,10 +2272,44 @@ impl DecodeCheck for X86DecodeCheck {
                 ),
             });
         }
-        match compare(&intended, &decoded, hole) {
-            Ok(()) => DecodeCheckOutcome::Match,
-            Err(e) => DecodeCheckOutcome::Mismatch(DecodeCheckError { message: e }),
+        if let Err(e) = compare(&intended, &decoded, hole) {
+            return DecodeCheckOutcome::Mismatch(DecodeCheckError { message: e });
         }
+        // MOV r,imm: the structural comparison above compares the register
+        // NUMBER and only the low `enc_bits` of the immediate, because it must
+        // tolerate the encoder's zero-extending alias. It therefore ACCEPTS
+        // `B8 FF FF FF FF` for `MOV RAX,-1`, which leaves RAX =
+        // 0x00000000_FFFFFFFF. So every MovRI also has to pass the independent
+        // denotation obligation `trust_cg_verify::x86_encoding_proofs`. That
+        // obligation decodes the same bytes by the SDM register-write rules and
+        // compares the full 64-bit write to the destination root register
+        // against the intent, with canonicality and exact framing. A
+        // refutation is a Mismatch, and in the default `enforce` mode it fails
+        // the compile. This is the per-compile run that
+        // `function_verifier::is_covered_elsewhere_indirect_branch` names for
+        // MovRI.
+        if intent.opcode == X86Opcode::MovRI {
+            let Some(dst) = intent.ops.dst else {
+                return DecodeCheckOutcome::Mismatch(DecodeCheckError {
+                    message: "MOV r,imm intent has no destination register".to_string(),
+                });
+            };
+            if let Err(refutation) = trust_cg_verify::x86_encoding_proofs::mov_imm_check_for_preg(
+                dst,
+                intent.ops.imm,
+                bytes,
+            ) {
+                return DecodeCheckOutcome::Mismatch(DecodeCheckError {
+                    message: format!(
+                        "x86_encoding_proofs REFUTED MOV {dst},{imm:#x} = {bytes:02x?} \
+                         ({class:?}): {refutation}",
+                        imm = intent.ops.imm,
+                        class = refutation.class(),
+                    ),
+                });
+            }
+        }
+        DecodeCheckOutcome::Match
     }
 }
 

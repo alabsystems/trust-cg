@@ -64,7 +64,8 @@ fn compile_trust_ir_module(module: &TrustIrModule) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: OptLevel::O0,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("Trust Codegen compilation should succeed");
@@ -252,11 +253,14 @@ fn differential_test(
 /// `fn _add_two(a: i32, b: i32) -> i32 { a + b }`
 fn build_trust_ir_add_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_add_two", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -274,18 +278,23 @@ fn build_trust_ir_add_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `fn _max_val(a: i64, b: i64) -> i64 { if a > b { a } else { b } }`
 fn build_trust_ir_max_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_max_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -323,18 +332,23 @@ fn build_trust_ir_max_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// `fn _abs_val(x: i64) -> i64 { if x < 0 { 0 - x } else { x } }`
 fn build_trust_ir_abs_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_abs_val", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -386,7 +400,9 @@ fn build_trust_ir_abs_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -400,11 +416,14 @@ fn build_trust_ir_abs_module() -> TrustIrModule {
 /// bb5: return acc
 fn build_trust_ir_factorial_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_factorial", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0: check n <= 1
@@ -525,7 +544,9 @@ fn build_trust_ir_factorial_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -537,11 +558,14 @@ fn build_trust_ir_factorial_module() -> TrustIrModule {
 /// bb3: return sum
 fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum_1_to_n", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0: init
@@ -628,7 +652,9 @@ fn build_trust_ir_sum_1_to_n_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -866,11 +892,14 @@ int main(void) {
 /// `fn _bitwise_and(a: i32, b: i32) -> i32 { a & b }`
 fn build_trust_ir_bitwise_and_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_bitwise_and", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -888,7 +917,9 @@ fn build_trust_ir_bitwise_and_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -940,11 +971,14 @@ int main(void) {
 /// `fn _bitwise_or(a: i32, b: i32) -> i32 { a | b }`
 fn build_trust_ir_bitwise_or_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_bitwise_or", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -962,7 +996,9 @@ fn build_trust_ir_bitwise_or_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1015,11 +1051,14 @@ int main(void) {
 /// `fn _bitwise_xor(a: i32, b: i32) -> i32 { a ^ b }`
 fn build_trust_ir_bitwise_xor_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_bitwise_xor", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1037,7 +1076,9 @@ fn build_trust_ir_bitwise_xor_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1090,11 +1131,14 @@ int main(void) {
 /// `fn _urem(a: i32, b: i32) -> i32 { a %u b }`
 fn build_trust_ir_urem_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_urem", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1112,7 +1156,9 @@ fn build_trust_ir_urem_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1164,11 +1210,14 @@ int main(void) {
 /// `fn _srem(a: i32, b: i32) -> i32 { a % b }`
 fn build_trust_ir_srem_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_srem", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1186,7 +1235,9 @@ fn build_trust_ir_srem_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1240,11 +1291,14 @@ int main(void) {
 /// `fn _shl(a: i32, b: i32) -> i32 { a << (b & 31) }`
 fn build_trust_ir_shl_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_shl", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1274,7 +1328,9 @@ fn build_trust_ir_shl_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1329,11 +1385,14 @@ int main(void) {
 /// `fn _lshr(a: i32, b: i32) -> i32 { ((unsigned)a) >> (b & 31) }`
 fn build_trust_ir_lshr_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_lshr", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1363,7 +1422,9 @@ fn build_trust_ir_lshr_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1418,11 +1479,14 @@ int main(void) {
 /// `fn _ashr(a: i32, b: i32) -> i32 { a >> (b & 31) }`
 fn build_trust_ir_ashr_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_ashr", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1452,7 +1516,9 @@ fn build_trust_ir_ashr_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1507,11 +1573,14 @@ int main(void) {
 /// `fn _sext_i32_to_i64(x: i32) -> i64 { x as i64 }`
 fn build_trust_ir_sext_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sext_i32_to_i64", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1529,7 +1598,9 @@ fn build_trust_ir_sext_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1581,11 +1652,14 @@ int main(void) {
 /// `fn _trunc_i64_to_i32(x: i64) -> i32 { x as i32 }`
 fn build_trust_ir_trunc_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "_trunc_i64_to_i32", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -1604,7 +1678,9 @@ fn build_trust_ir_trunc_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1658,11 +1734,14 @@ int main(void) {
 /// `fn _combined_bitops(a: i32, b: i32) -> i32 { (a & b) | ((a ^ b) << 1) }`
 fn build_trust_ir_combined_bitops_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_combined_bitops", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1706,7 +1785,9 @@ fn build_trust_ir_combined_bitops_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1758,11 +1839,14 @@ int main(void) {
 /// `fn _fp_add(a: f64, b: f64) -> f64 { a + b }`
 fn build_trust_ir_fp_add_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1780,7 +1864,9 @@ fn build_trust_ir_fp_add_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1828,11 +1914,14 @@ int main(void) {
 /// `fn _fp_sub(a: f64, b: f64) -> f64 { a - b }`
 fn build_trust_ir_fp_sub_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_sub", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1850,7 +1939,9 @@ fn build_trust_ir_fp_sub_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1898,11 +1989,14 @@ int main(void) {
 /// `fn _fp_mul(a: f64, b: f64) -> f64 { a * b }`
 fn build_trust_ir_fp_mul_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_mul", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1920,7 +2014,9 @@ fn build_trust_ir_fp_mul_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -1968,11 +2064,14 @@ int main(void) {
 /// `fn _fp_div(a: f64, b: f64) -> f64 { a / b }`
 fn build_trust_ir_fp_div_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_div", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -1990,7 +2089,9 @@ fn build_trust_ir_fp_div_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2038,11 +2139,14 @@ int main(void) {
 /// `fn _fp_neg(x: f64) -> f64 { -x }`
 fn build_trust_ir_fp_neg_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_neg", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2059,7 +2163,9 @@ fn build_trust_ir_fp_neg_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2107,11 +2213,14 @@ int main(void) {
 /// `fn _fp_cmp_lt(a: f64, b: f64) -> i32 { if a < b { 1 } else { 0 } }`
 fn build_trust_ir_fp_cmp_lt_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_cmp_lt", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -2163,7 +2272,9 @@ fn build_trust_ir_fp_cmp_lt_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2212,11 +2323,14 @@ int main(void) {
 /// `fn _fp_discriminant(a: f64, b: f64, c: f64) -> f64 { b*b - 4.0*a*c }`
 fn build_trust_ir_fp_discriminant_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_discriminant", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2264,7 +2378,9 @@ fn build_trust_ir_fp_discriminant_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2313,11 +2429,14 @@ int main(void) {
 /// `fn _fp32_add(a: f32, b: f32) -> f32 { a + b }`
 fn build_trust_ir_fp32_add_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F32, Ty::F32],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F32, Ty::F32],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp32_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2335,7 +2454,9 @@ fn build_trust_ir_fp32_add_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2383,11 +2504,14 @@ int main(void) {
 /// `fn _int_neg(x: i64) -> i64 { -x }`
 fn build_trust_ir_int_neg_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_int_neg", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2404,7 +2528,9 @@ fn build_trust_ir_int_neg_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2458,11 +2584,14 @@ int main(void) {
 /// `fn _bitwise_not(x: i64) -> i64 { !x }`
 fn build_trust_ir_bitwise_not_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_bitwise_not", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2479,7 +2608,9 @@ fn build_trust_ir_bitwise_not_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2528,11 +2659,14 @@ int main(void) {
 /// `fn _icmp_eq(a: i64, b: i64) -> i64 { if a == b { 1 } else { 0 } }`
 fn build_trust_ir_icmp_eq_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_icmp_eq", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -2584,7 +2718,9 @@ fn build_trust_ir_icmp_eq_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2636,11 +2772,14 @@ int main(void) {
 /// `fn _icmp_ne(a: i64, b: i64) -> i64 { if a != b { 1 } else { 0 } }`
 fn build_trust_ir_icmp_ne_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_icmp_ne", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -2692,7 +2831,9 @@ fn build_trust_ir_icmp_ne_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2744,11 +2885,14 @@ int main(void) {
 /// `fn _icmp_ult(a: i64, b: i64) -> i64 { if a <u b { 1 } else { 0 } }`
 fn build_trust_ir_icmp_ult_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_icmp_ult", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -2800,7 +2944,9 @@ fn build_trust_ir_icmp_ult_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2852,11 +2998,14 @@ int main(void) {
 /// `fn _sdiv(a: i32, b: i32) -> i32 { a / b }`
 fn build_trust_ir_sdiv_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sdiv", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2874,7 +3023,9 @@ fn build_trust_ir_sdiv_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -2929,11 +3080,14 @@ int main(void) {
 /// `fn _udiv(a: i32, b: i32) -> i32 { a /u b }`
 fn build_trust_ir_udiv_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_udiv", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -2951,7 +3105,9 @@ fn build_trust_ir_udiv_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3003,11 +3159,14 @@ int main(void) {
 /// `fn _zext_i32_to_i64(x: i32) -> i64 { x as u64 }`
 fn build_trust_ir_zext_i32_to_i64_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_zext_i32_to_i64", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -3025,7 +3184,9 @@ fn build_trust_ir_zext_i32_to_i64_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3076,21 +3237,30 @@ int main(void) {
 fn build_trust_ir_i32_abi_high_bits_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let observe_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let probe_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Func(observe_ty), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let ret_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let observe_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let probe_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Func(observe_ty), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let ret_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut probe = TrustIrFunction::new(
         FuncId::new(0),
@@ -3144,8 +3314,12 @@ fn build_trust_ir_i32_abi_high_bits_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(probe);
-    module.add_function(ret);
+    module
+        .try_add_function(probe)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(ret)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3230,11 +3404,14 @@ int main(void) {
 /// `fn _select_val(cond_a: i64, cond_b: i64, x: i64, y: i64) -> i64 { if cond_a > cond_b { x } else { y } }`
 fn build_trust_ir_select_val_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_select_val", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -3264,7 +3441,9 @@ fn build_trust_ir_select_val_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3314,11 +3493,14 @@ int main(void) {
 /// `fn _clamp(x: i64, lo: i64, hi: i64) -> i64 { if x < lo { lo } else if x > hi { hi } else { x } }`
 fn build_trust_ir_clamp_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_clamp", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -3380,7 +3562,9 @@ fn build_trust_ir_clamp_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3441,11 +3625,14 @@ int main(void) {
 /// `fn _fp_cmp_gt(a: f64, b: f64) -> i32 { if a > b { 1 } else { 0 } }`
 fn build_trust_ir_fp_cmp_gt_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_cmp_gt", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -3497,7 +3684,9 @@ fn build_trust_ir_fp_cmp_gt_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3546,11 +3735,14 @@ int main(void) {
 /// `fn _sub64(a: i64, b: i64) -> i64 { a - b }`
 fn build_trust_ir_sub64_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sub64", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -3568,7 +3760,9 @@ fn build_trust_ir_sub64_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3621,11 +3815,14 @@ int main(void) {
 /// `fn _mul32(a: i32, b: i32) -> i32 { a * b }`
 fn build_trust_ir_mul32_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_mul32", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -3643,7 +3840,9 @@ fn build_trust_ir_mul32_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3696,11 +3895,14 @@ int main(void) {
 /// `fn _polynomial(x: i64) -> i64 { x*x*x - 2*x*x + 3*x - 4 }`
 fn build_trust_ir_polynomial_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_polynomial", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -3785,7 +3987,9 @@ fn build_trust_ir_polynomial_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3837,11 +4041,14 @@ int main(void) {
 // Test 39: while_countdown
 fn build_trust_ir_while_countdown_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_while_countdown", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -3921,7 +4128,9 @@ fn build_trust_ir_while_countdown_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -3964,11 +4173,14 @@ int main(void) {
 // Test 40: nested_if_in_loop
 fn build_trust_ir_nested_if_in_loop_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "_nested_if_in_loop", ft_id, BlockId::new(0));
     func.blocks = vec![
@@ -4096,7 +4308,9 @@ fn build_trust_ir_nested_if_in_loop_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4142,11 +4356,14 @@ int main(void) {
 // Test 41: loop_in_if
 fn build_trust_ir_loop_in_if_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_loop_in_if", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -4251,7 +4468,9 @@ fn build_trust_ir_loop_in_if_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4298,11 +4517,14 @@ int main(void) {
 // Test 42: collatz_steps
 fn build_trust_ir_collatz_steps_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_collatz_steps", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -4504,7 +4726,9 @@ fn build_trust_ir_collatz_steps_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4554,11 +4778,14 @@ int main(void) {
 // Test 43: multi_call_sequence
 fn build_trust_ir_multi_call_sequence_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(
         FuncId::new(0),
         "_multi_call_sequence",
@@ -4593,7 +4820,9 @@ fn build_trust_ir_multi_call_sequence_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4634,11 +4863,14 @@ int main(void) {
 // Test 44: gcd_euclidean
 fn build_trust_ir_gcd_euclidean_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_gcd_euclidean", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -4699,7 +4931,9 @@ fn build_trust_ir_gcd_euclidean_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4741,11 +4975,14 @@ int main(void) {
 // Test 45: many_live_vars
 fn build_trust_ir_many_live_vars_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_many_live_vars", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -4901,7 +5138,9 @@ fn build_trust_ir_many_live_vars_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -4952,11 +5191,14 @@ int main(void) {
 // (same regalloc aliasing bug). Both bugs are tracked separately.
 fn build_trust_ir_mixed_width_sext_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "_mixed_width_sext", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -5002,7 +5244,9 @@ fn build_trust_ir_mixed_width_sext_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5042,11 +5286,14 @@ int main(void) {
 // Test 47: mixed_width_zext
 fn build_trust_ir_mixed_width_zext_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "_mixed_width_zext", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -5077,7 +5324,9 @@ fn build_trust_ir_mixed_width_zext_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5114,11 +5363,14 @@ int main(void) {
 // Test 48: chain_of_selects
 fn build_trust_ir_chain_of_selects_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "_chain_of_selects", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
@@ -5162,7 +5414,9 @@ fn build_trust_ir_chain_of_selects_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5200,11 +5454,14 @@ int main(void) {
 // Test 49: diamond_merge
 fn build_trust_ir_diamond_merge_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_diamond_merge", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -5284,7 +5541,9 @@ fn build_trust_ir_diamond_merge_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5327,11 +5586,14 @@ int main(void) {
 // Test 50: nested_loops
 fn build_trust_ir_nested_loops_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_nested_loops", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -5476,7 +5738,9 @@ fn build_trust_ir_nested_loops_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5532,11 +5796,14 @@ fn build_trust_ir_caller_callee_basic_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
     // Function 0: callee
-    let ft_id_0 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_0 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut callee = TrustIrFunction::new(FuncId::new(0), "_callee", ft_id_0, BlockId::new(0));
     callee.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -5573,11 +5840,14 @@ fn build_trust_ir_caller_callee_basic_module() -> TrustIrModule {
     }];
 
     // Function 1: caller
-    let ft_id_1 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_1 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller =
         TrustIrFunction::new(FuncId::new(1), "_multi_caller", ft_id_1, BlockId::new(0));
     caller.blocks = vec![TrustIrBlock {
@@ -5607,8 +5877,12 @@ fn build_trust_ir_caller_callee_basic_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(callee);
-    module.add_function(caller);
+    module
+        .try_add_function(callee)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5660,11 +5934,14 @@ fn build_trust_ir_recursive_fact_double_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
     // Function 0: recursive helper
-    let ft_id_0 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_0 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut fact_helper =
         TrustIrFunction::new(FuncId::new(0), "_fact_helper", ft_id_0, BlockId::new(0));
     fact_helper.blocks = vec![
@@ -5736,11 +6013,14 @@ fn build_trust_ir_recursive_fact_double_module() -> TrustIrModule {
     ];
 
     // Function 1: chained caller
-    let ft_id_1 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_1 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut fact_double =
         TrustIrFunction::new(FuncId::new(1), "_fact_double", ft_id_1, BlockId::new(0));
     fact_double.blocks = vec![TrustIrBlock {
@@ -5775,8 +6055,12 @@ fn build_trust_ir_recursive_fact_double_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(fact_helper);
-    module.add_function(fact_double);
+    module
+        .try_add_function(fact_helper)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(fact_double)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -5833,11 +6117,14 @@ fn build_trust_ir_multi_return_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
     // Function 0: multi-return callee
-    let ft_id_0 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_0 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut multi_return =
         TrustIrFunction::new(FuncId::new(0), "_multi_return", ft_id_0, BlockId::new(0));
     multi_return.blocks = vec![
@@ -5968,11 +6255,14 @@ fn build_trust_ir_multi_return_module() -> TrustIrModule {
     ];
 
     // Function 1: caller
-    let ft_id_1 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_1 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut classify = TrustIrFunction::new(FuncId::new(1), "_classify", ft_id_1, BlockId::new(0));
     classify.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -6001,8 +6291,12 @@ fn build_trust_ir_multi_return_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(multi_return);
-    module.add_function(classify);
+    module
+        .try_add_function(multi_return)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(classify)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6064,11 +6358,14 @@ fn build_trust_ir_pair_combine_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
     // Function 0: sum helper
-    let ft_id_0 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_0 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut pair_sum = TrustIrFunction::new(
         FuncId::new(0),
         "_compute_pair_sum",
@@ -6093,11 +6390,14 @@ fn build_trust_ir_pair_combine_module() -> TrustIrModule {
     }];
 
     // Function 1: diff helper
-    let ft_id_1 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_1 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut pair_diff = TrustIrFunction::new(
         FuncId::new(1),
         "_compute_pair_diff",
@@ -6122,11 +6422,14 @@ fn build_trust_ir_pair_combine_module() -> TrustIrModule {
     }];
 
     // Function 2: combine helpers
-    let ft_id_2 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_2 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut pair_combine =
         TrustIrFunction::new(FuncId::new(2), "_pair_combine", ft_id_2, BlockId::new(0));
     pair_combine.blocks = vec![TrustIrBlock {
@@ -6156,9 +6459,15 @@ fn build_trust_ir_pair_combine_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(pair_sum);
-    module.add_function(pair_diff);
-    module.add_function(pair_combine);
+    module
+        .try_add_function(pair_sum)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(pair_diff)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(pair_combine)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6230,20 +6539,23 @@ fn build_trust_ir_sum_eight_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
     // Function 0: 8-argument callee
-    let ft_id_0 = module.add_func_type(FuncTy {
-        params: vec![
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-            Ty::I64,
-        ],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_0 = module
+        .add_func_type(FuncTy {
+            params: vec![
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+                Ty::I64,
+            ],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut sum_eight =
         TrustIrFunction::new(FuncId::new(0), "_sum_eight", ft_id_0, BlockId::new(0));
     sum_eight.blocks = vec![TrustIrBlock {
@@ -6322,11 +6634,14 @@ fn build_trust_ir_sum_eight_module() -> TrustIrModule {
     }];
 
     // Function 1: caller that prepares 8 arguments and calls sum_eight
-    let ft_id_1 = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id_1 = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut call_sum_eight =
         TrustIrFunction::new(FuncId::new(1), "_call_sum_eight", ft_id_1, BlockId::new(0));
     call_sum_eight.blocks = vec![TrustIrBlock {
@@ -6445,8 +6760,12 @@ fn build_trust_ir_sum_eight_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(sum_eight);
-    module.add_function(call_sum_eight);
+    module
+        .try_add_function(sum_eight)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(call_sum_eight)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6501,11 +6820,14 @@ int main(void) {
 /// `fn _overflow_add(a: u32, b: u32) -> u32 { a + b }`
 fn build_trust_ir_overflow_add_u32_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_overflow_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -6523,7 +6845,9 @@ fn build_trust_ir_overflow_add_u32_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6573,11 +6897,14 @@ int main(void) {
 /// `fn _overflow_mul(a: u32, b: u32) -> u32 { a * b }`
 fn build_trust_ir_overflow_mul_u32_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_overflow_mul", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -6595,7 +6922,9 @@ fn build_trust_ir_overflow_mul_u32_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6645,11 +6974,14 @@ int main(void) {
 /// `fn _overflow_sub(a: u32, b: u32) -> u32 { a - b }`
 fn build_trust_ir_overflow_sub_u32_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_overflow_sub", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -6667,7 +6999,9 @@ fn build_trust_ir_overflow_sub_u32_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6717,11 +7051,14 @@ int main(void) {
 /// `fn _switch_basic(x: i32) -> i32 { switch x { 0=>10, 1=>20, 2=>30, default=>99 } }`
 fn build_trust_ir_switch_basic_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_switch_basic", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0: entry with switch
@@ -6813,7 +7150,9 @@ fn build_trust_ir_switch_basic_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6870,11 +7209,14 @@ int main(void) {
 /// `fn _nested_select2(x: i64, y: i64, z: i64) -> i64`
 fn build_trust_ir_nested_select2_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_nested_select2", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -6927,7 +7269,9 @@ fn build_trust_ir_nested_select2_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -6980,11 +7324,14 @@ int main(void) {
 /// `fn _deeply_nested(a: i64, b: i64, c: i64, d: i64) -> i64`
 fn build_trust_ir_deeply_nested_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64, Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_deeply_nested", ft_id, BlockId::new(0));
     func.blocks = vec![
         // bb0: if a > 0
@@ -7060,14 +7407,9 @@ fn build_trust_ir_deeply_nested_module() -> TrustIrModule {
                 }),
             ],
         },
-        // bb3: unused (numbering gap)
-        TrustIrBlock {
-            id: BlockId::new(3),
-            params: vec![],
-            body: vec![InstrNode::new(Inst::Return {
-                values: vec![ValueId::new(10)],
-            })],
-        },
+        // (No bb3: the block ids keep a numbering gap. trust-ir refuses a
+        // block no edge reaches, `UnreachableBlock`, and since WS7.3 every
+        // ingestion entry refuses what the validator refuses.)
         // bb4: merge — return result
         TrustIrBlock {
             id: BlockId::new(4),
@@ -7077,7 +7419,9 @@ fn build_trust_ir_deeply_nested_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -7140,11 +7484,14 @@ int main(void) {
 /// `fn _loop_early_break(n: i64, limit: i64) -> i64`
 fn build_trust_ir_loop_early_break_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func =
         TrustIrFunction::new(FuncId::new(0), "_loop_early_break", ft_id, BlockId::new(0));
     func.blocks = vec![
@@ -7264,7 +7611,9 @@ fn build_trust_ir_loop_early_break_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -7319,11 +7668,14 @@ int main(void) {
 /// `fn _sum_ten(a..j: i64) -> i64 { a+b+c+d+e+f+g+h+i+j }`
 fn build_trust_ir_sum_ten_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64; 10],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 10],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_sum_ten", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -7397,7 +7749,9 @@ fn build_trust_ir_sum_ten_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -7447,11 +7801,14 @@ int main(void) {
 /// `fn _fp_special(a: f64, b: f64) -> f64 { a + b }`
 fn build_trust_ir_fp_special_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_special", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -7469,7 +7826,9 @@ fn build_trust_ir_fp_special_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -7524,11 +7883,14 @@ int main(void) {
 /// `fn _fp_mul_special(a: f64, b: f64) -> f64 { a * b }`
 fn build_trust_ir_fp_mul_special_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F64, Ty::F64],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F64, Ty::F64],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp_mul_special", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -7546,7 +7908,9 @@ fn build_trust_ir_fp_mul_special_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -7603,11 +7967,14 @@ int main(void) {
 /// `fn _switch_many(x: i32) -> i32 { switch x { 0=>0, 1=>11, ..., 7=>77, default=>-1 } }`
 fn build_trust_ir_switch_many_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_switch_many", ft_id, BlockId::new(0));
 
     let mut blocks = vec![TrustIrBlock {
@@ -7664,7 +8031,9 @@ fn build_trust_ir_switch_many_module() -> TrustIrModule {
     });
 
     func.blocks = blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -7730,11 +8099,14 @@ int main(void) {
 /// `fn _icmp_boundary(a: i64, b: i64) -> i64 { lt + eq*2 + gt*4 }`
 fn build_trust_ir_icmp_boundary_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_icmp_boundary", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -7825,7 +8197,9 @@ fn build_trust_ir_icmp_boundary_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -7883,11 +8257,14 @@ int main(void) {
 /// `fn _ucmp_classify(a: i64, b: i64) -> i64` (1=ult, 2=eq, 4=ugt)
 fn build_trust_ir_ucmp_classify_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_ucmp_classify", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -7978,7 +8355,9 @@ fn build_trust_ir_ucmp_classify_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -8038,16 +8417,22 @@ int main(void) {
 fn build_trust_ir_call_with_stack_args_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
 
-    let ft_sum = module.add_func_type(FuncTy {
-        params: vec![Ty::I64; 10],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
-    let ft_call = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_sum = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64; 10],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
+    let ft_call = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     // _sum_ten_impl: sum all 10 args
     let mut sum_fn = TrustIrFunction::new(FuncId::new(0), "_sum_ten_impl", ft_sum, BlockId::new(0));
@@ -8261,8 +8646,12 @@ fn build_trust_ir_call_with_stack_args_module() -> TrustIrModule {
         ],
     }];
 
-    module.add_function(sum_fn);
-    module.add_function(call_fn);
+    module
+        .try_add_function(sum_fn)
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(call_fn)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -8317,11 +8706,14 @@ int main(void) {
 /// `fn _fp32_mul_add(a: f32, b: f32, c: f32) -> f32 { a * b + c }`
 fn build_trust_ir_fp32_mul_add_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::F32, Ty::F32, Ty::F32],
-        returns: vec![Ty::F32],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::F32, Ty::F32, Ty::F32],
+            returns: vec![Ty::F32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_fp32_mul_add", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -8350,7 +8742,9 @@ fn build_trust_ir_fp32_mul_add_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -8389,4 +8783,13 @@ int main(void) {
         "Differential fp32_mul_add test failed: {}",
         result.unwrap_err()
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

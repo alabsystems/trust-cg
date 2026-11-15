@@ -171,7 +171,8 @@ fn compile_module(module: &trust_ir::Module, opt_level: OptLevel) -> Vec<u8> {
         opt_level,
         parallel: false,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("compile xxh3 medium/long module");
@@ -269,8 +270,9 @@ fn xxh3_len160_ref(data: &[u8]) -> u64 {
     xxh3_avalanche_ref(acc.wrapping_add(acc_end))
 }
 
+/// `value`'s bit pattern, as the signed i64 lane value TrustIR types.
 fn c64(fb: &mut FunctionBuilder<'_>, value: u64) -> ValueId {
-    fb.iconst(Ty::I64, value as i128)
+    fb.iconst(Ty::I64, i128::from(value as i64))
 }
 
 fn xor64(fb: &mut FunctionBuilder<'_>, lhs: ValueId, rhs: ValueId) -> ValueId {
@@ -411,7 +413,7 @@ fn build_xxh3_medium_long_module() -> trust_ir::Module {
         fb.build();
     }
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn assert_no_trust_ir_calls(module: &trust_ir::Module) {
@@ -485,4 +487,13 @@ fn test_xxh3_medium_long_e2e_o0_o2() {
 
     run_e2e_case(OptLevel::O0, "o0");
     run_e2e_case(OptLevel::O2, "o2");
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

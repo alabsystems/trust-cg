@@ -1,0 +1,716 @@
+{
+  "schema": "cg-fixture-qualification-artifacts-v1",
+  "artifacts": [
+    {
+      "path": "qualification/INPUTS.json",
+      "bytes": 33969,
+      "sha256": "582dab79e0c6c3d8c2c28ead209b6a4cf14e2b2682c9971aa07d412975a0b9a5"
+    },
+    {
+      "path": "qualification/RESULT.json",
+      "bytes": 34321,
+      "sha256": "dd01ee4a4f0d87deabc2670cedf2812fa0a1bc529fbc0101f713986dad7df895"
+    },
+    {
+      "path": "qualification/SOURCE.patch",
+      "bytes": 1539,
+      "sha256": "4e4e9e1de4993b68dc448bc00008e2432d50af92ebf810182177293c0e5e7169"
+    },
+    {
+      "path": "qualification/native.log",
+      "bytes": 1157027,
+      "sha256": "37e4287ecc49d86e397df5ab9725fe5af9ef6f4a04544a04c33c45bc07b6c4c5"
+    },
+    {
+      "path": "final-controls/0.log",
+      "bytes": 102,
+      "sha256": "b2300d1aafe0595c9c54a615ef485e8d42fbb732d33a076b213da446a6aafe8f"
+    },
+    {
+      "path": "final-controls/1.log",
+      "bytes": 162,
+      "sha256": "4b2bf6507f3034e090f9aa2e0da4ff0231c9a8f943e3855b1999e465ef159b47"
+    },
+    {
+      "path": "final-controls/2.log",
+      "bytes": 87,
+      "sha256": "367a2819b366278854f46d55efa2665fcda90bf59ecc31cdd73cba6f9438e898"
+    },
+    {
+      "path": "final-controls/INPUTS.json",
+      "bytes": 2233,
+      "sha256": "02e7e6521a8d5364ed20131597ab0eb00f75c06a8cd60d6bc841f696dc5af176"
+    },
+    {
+      "path": "final-controls/RESULT.json",
+      "bytes": 3029,
+      "sha256": "6d983a80c3646dabd156cd05ac99db50b246b9eea1e25c6124c84e038bd952e6"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-1.log",
+      "bytes": 8944,
+      "sha256": "fa8c9e29496c133a944252718a4c4b949923736c20bed29034e34c28d27ca43c"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-10.log",
+      "bytes": 8943,
+      "sha256": "f1d001a424ae413455e95d7c421ca2bb7005d6525f146d20f597f10b978d3bbb"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-100.log",
+      "bytes": 8954,
+      "sha256": "7d204294010821d85e260213bac94e77e48190396df2e6bb5d824ad602f15db3"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-101.log",
+      "bytes": 8954,
+      "sha256": "f7968f8cd8ba1e93a2d4c9aecb61e55cff3daac656c027447baf5995fcb68bb0"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-102.log",
+      "bytes": 8957,
+      "sha256": "b69cc0d72bfd54503172a17e8ce119d42df399ce42a5c6f4d7a9ff914c499dd1"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-103.log",
+      "bytes": 8951,
+      "sha256": "d3ca2bf943ca6e9990af87d4de5eb52829fff915e09610865d2e4d1d0ff27323"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-104.log",
+      "bytes": 8952,
+      "sha256": "f87d3b442f4f3176b6aae37c50ad0e62a419635fa97be7e393fc34cac31f03a0"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-105.log",
+      "bytes": 8949,
+      "sha256": "3bc088a854b1682a3d19cdf5caa28dd4554cb56a93722e531771ea6ee27ee73a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-106.log",
+      "bytes": 8951,
+      "sha256": "491999b8927381090f224e69dbbb8c39b657360a9bc0839d0ccf2527e5bfe66f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-107.log",
+      "bytes": 8958,
+      "sha256": "d63d11ba192ba9f5640ea2a568f31e51a6bebfe68cb44b1826a74953432e4a8e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-108.log",
+      "bytes": 8953,
+      "sha256": "f753ccf0169c81d3ed2efb6dd5868bf48cdac9d1f00bfb7962e88824c38ed7ad"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-109.log",
+      "bytes": 8974,
+      "sha256": "89b8d75779cc1d3cb8c06c8efa1a334cfd5a8be430c9d39797842d628f2f9eab"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-11.log",
+      "bytes": 8935,
+      "sha256": "d4bb4ffbb5a73cbd8a457c29e4d4ad4d8eb0e5191aa41f9778722cb260d12413"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-110.log",
+      "bytes": 8953,
+      "sha256": "cd91aed50df8715e4ee4234a3bc830c7a87dd32e69ed3dd601fca7a10d056766"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-111.log",
+      "bytes": 8951,
+      "sha256": "4eee6e7fcfcee8020fa4cb06c66f21c31ce64555edd967dfeff1fb475c31d8e7"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-112.log",
+      "bytes": 8952,
+      "sha256": "349b3d0a69a320938523a09debcbe74f749771d817e1a09cb84ddff8998c9bcf"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-113.log",
+      "bytes": 8955,
+      "sha256": "09b8ed0414f9c5c3ea72ea274a8eb589e7b123caf5ef0d0c29e1d6dde7ed4b57"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-114.log",
+      "bytes": 8949,
+      "sha256": "d0cef77eafc97b2f2a4c22918185656a091f8e1f3740f18d63e9589403a45685"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-115.log",
+      "bytes": 8951,
+      "sha256": "2c0dfbbab2f82dd5ea5df6e656b66fe4ff05a4ed06abed0c604e73bf5b96c74e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-116.log",
+      "bytes": 8949,
+      "sha256": "20d94e3e1639c636eb0077739dcd5b5004368b2a18a7873e11eb7175eb35b40a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-117.log",
+      "bytes": 8969,
+      "sha256": "740f97487de2e5a4d4c5d887bb73d209b2e2e6802e4efb2d2f5acdc52af4ba44"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-118.log",
+      "bytes": 8957,
+      "sha256": "034febf18779aa861e3cd91b4e34524ae698fccabedd029375cd2b7260cf6fc2"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-12.log",
+      "bytes": 8933,
+      "sha256": "404a2cf150667630ce6cc070713b981c1278fe9a4e063f7365b98ea6294a6f5e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-13.log",
+      "bytes": 8939,
+      "sha256": "2b2e05787f48ff88a7597e7ff0f44d377b3a35c3edb4c6dc4a691e9a96940fe3"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-14.log",
+      "bytes": 8942,
+      "sha256": "a1d86ee308bcbc5673a8dc8ff947e852da4afc8265c82773115ea83861d8e3b6"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-15.log",
+      "bytes": 8947,
+      "sha256": "fcfc2e4199bfd4eca2fb16925d55985de86900e8c61388cee64371eee30f9818"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-16.log",
+      "bytes": 8957,
+      "sha256": "60856d40db9e6fdea999bf6a801036ead692d8b0ce4f325430cbe6ec382c30fa"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-17.log",
+      "bytes": 8946,
+      "sha256": "b2743f29a5303ac831ccdded0b88ec806f50e6bd798d47a21993937a57cbdef4"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-18.log",
+      "bytes": 8943,
+      "sha256": "2b502aec8ed68db45bb1461e607d079943998dfcb6a777e25a3d235c822026a2"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-19.log",
+      "bytes": 8941,
+      "sha256": "29d44b41b8a151b263af28a29038ee9bbc877e5a6274344853db1115bb17b92f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-2.log",
+      "bytes": 8941,
+      "sha256": "0baf43e1b04ff220f6a646e62b72c04a409f406f4c4d0fbc29df2a9069503ef8"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-20.log",
+      "bytes": 8948,
+      "sha256": "59af9ac7072e8f2e7f36dea06a6a3ce61baa4a11e819ac02bae449daefa2f238"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-21.log",
+      "bytes": 8945,
+      "sha256": "c0d0b2f363bbf9019d3861cbba46d88c840a2209f9e273663e21b559b160294c"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-22.log",
+      "bytes": 8942,
+      "sha256": "697cf3cab9e6dde5025fb8e38b673304003d17a3853a73769272c7f099d1a7be"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-23.log",
+      "bytes": 8937,
+      "sha256": "f86ef5fc1c77aaca255ca4a8a8bc1f0cd7c80fd849dde262e69bf8c02a3b17ec"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-24.log",
+      "bytes": 8944,
+      "sha256": "ff1dd53c1109b3e8eca5d2413129e8f2dc20a110dfcef5400a22a0721d94c151"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-25.log",
+      "bytes": 8944,
+      "sha256": "b3f1df3f53746346a3c438996d49ac57707e22c930b2ddf8258d5ae7fec65915"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-26.log",
+      "bytes": 8938,
+      "sha256": "6c3db2413d32093bf47440d2b2e87f85b3e7ae55772fe858d130fbc1c19c3cab"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-27.log",
+      "bytes": 8935,
+      "sha256": "4f9faba4907d1f769c0a7eb9c5e54cba7327d3e3a0fb9b12920601ce902f9a8e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-28.log",
+      "bytes": 8933,
+      "sha256": "3c7445103b93931a59ec65804f21b11894dcee46a69b666367449494a261c795"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-29.log",
+      "bytes": 8940,
+      "sha256": "7ee298a13141d865474cf557ae095f5887e590ba4fa81e7a618f676b50a88e2a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-3.log",
+      "bytes": 8939,
+      "sha256": "764dae20711568ae09fc9f9e21f911c8b8e88d545e82c87f23d503d65921618e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-30.log",
+      "bytes": 8945,
+      "sha256": "0ca3587fd525dd4f87c0e8d528444361bbe048f7d225a131d0bc4f5c5586429d"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-31.log",
+      "bytes": 8935,
+      "sha256": "5a35898e48856ff346a4f93068e26f7ebe4ab05d41c111ae4942b4b6827933db"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-32.log",
+      "bytes": 8942,
+      "sha256": "e18d5d800ba6ec9e156542522f0d7025e5969904e0654a60ef07de3aa37748e0"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-33.log",
+      "bytes": 8946,
+      "sha256": "f6d6b5f391a2558edf8577ac201cdc1484ba535fd834be398d6628256eaab930"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-34.log",
+      "bytes": 8952,
+      "sha256": "695cbf891de32516ce5d6231052ffefe74637dd3dc664b6120b57f331a1be93e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-35.log",
+      "bytes": 8947,
+      "sha256": "913ee612b44289bfde577380b615e27da3a83fcaa75d70d0c0d8e756c90d5f38"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-36.log",
+      "bytes": 8971,
+      "sha256": "c7dbc14ad8d22ab39f50c89b37590d28e55bfb713a97541eb950fb47e85efc0b"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-37.log",
+      "bytes": 8969,
+      "sha256": "c82cc90ce7d3b08beab8a7a8a1118e860697dda1974b3e16c37190e584734edc"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-38.log",
+      "bytes": 8959,
+      "sha256": "4bc82c29a64b480dfc178f49d0ec1567f06c9318136f4485a337228fc9fcd065"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-39.log",
+      "bytes": 8956,
+      "sha256": "50888a14d38e9dda8db8dd4e58704a779c00ffe4f5fa4e13049c7e52fb1f2380"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-4.log",
+      "bytes": 8946,
+      "sha256": "b72b348fc663ddd488f6ede3be46573131522b11599e751581581357427a4612"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-40.log",
+      "bytes": 8964,
+      "sha256": "33f13e8ece21976a0cdd7cf60f1d0f3d1099ad4f121bd1ad0173d19d390e2df6"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-41.log",
+      "bytes": 8955,
+      "sha256": "a0d12927dd576e5c3462f4f2c1d2973b60730134d66d5292680a18e2d0806999"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-42.log",
+      "bytes": 8943,
+      "sha256": "f9e46fd07b354913c8b4d03a9231f07137dab6b477ff92b1b1343a1a0adbee18"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-43.log",
+      "bytes": 8942,
+      "sha256": "fc01b5b72022e5d9a1d0ef3b5104bb4bf160ae67eba12df6b5a83ff93f8a6d7f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-44.log",
+      "bytes": 8951,
+      "sha256": "a6a04f04c1f4b4930f527a31775063cd17338df5331c4c5b8a7f83d5716d79ab"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-45.log",
+      "bytes": 8963,
+      "sha256": "c8ac54120b0facf1814c14faa1416c0cf50acbec54285a020d154e2bf6bfb358"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-46.log",
+      "bytes": 8960,
+      "sha256": "861837c064ed41db86aca3e3602f116d291367ef8535e79b1683298db0755f28"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-47.log",
+      "bytes": 8963,
+      "sha256": "0ba248faea63c31f420682b3acbdd416515a3e3d6c57d0d1bf8aec0b041fff69"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-48.log",
+      "bytes": 8953,
+      "sha256": "0189ff8f3afa3c4250924914e262bfefa98ec6adb4937b70758becf0cfdf40d7"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-49.log",
+      "bytes": 8950,
+      "sha256": "c4dbd7cc0e5bb7f68e9e1750b4c80a24e07a7d6c6ef59efae73bcb3814a2a579"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-5.log",
+      "bytes": 8938,
+      "sha256": "1903dcb02ed33c31c6e7e65af85d973ff1c60bcd4cc4696bba4dba80d84d93c3"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-50.log",
+      "bytes": 8965,
+      "sha256": "9c1db7cc6f2199b70c1a2adb85a3a31e5e700d9b940f91acb8640917e0b4a10f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-51.log",
+      "bytes": 8949,
+      "sha256": "a94762b9eb20f2870c6f5db0194de6b8e2fdea25c1f53a673b3cde554edf0f2c"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-52.log",
+      "bytes": 8964,
+      "sha256": "e75828e24b18ae947dfd9f81cc00bb5b7b31ea7eebc854a1ed226f672fdd007c"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-53.log",
+      "bytes": 8956,
+      "sha256": "8def7391767a0c2ec7207105fca03857d2ca32048005e90479788671e84f656b"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-54.log",
+      "bytes": 8955,
+      "sha256": "44ad54d49c9f40252eac27a5f62fcfcfd3421772f54bf93c2d58064bf51108f2"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-55.log",
+      "bytes": 8967,
+      "sha256": "c040a66d2d7abc659f1f3fe30f812a2aabc731dd963b31d01345dd4dad5ba970"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-56.log",
+      "bytes": 8957,
+      "sha256": "6ee95d875548179ead16dcf762e7495cdf4be395f5b327c3cfca9e3b57bea686"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-57.log",
+      "bytes": 8963,
+      "sha256": "7162842839046614206a9e5ccad53fc91b791f7186f60dccde63c4429cb64275"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-58.log",
+      "bytes": 8950,
+      "sha256": "0d8d762010048a5fbe86d2654addecb2b9f4c5b92a0c99ef962e38b16900d499"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-59.log",
+      "bytes": 8967,
+      "sha256": "58e180098f3daba0a3118835e47fc2286ce8c0e4c8a8b2d98557d7e0d0480373"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-6.log",
+      "bytes": 8939,
+      "sha256": "7249f7320112302b5535eba38f7227cdf56c6e3d10a8c55cdef02932f269ed0a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-60.log",
+      "bytes": 8955,
+      "sha256": "19a1fac216bf462d1ba6305047635e1f19cd5bd55cde9938d8888aae0ccabf55"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-61.log",
+      "bytes": 8975,
+      "sha256": "9112e7ec6002cd3f9223639d281642f51380ea4af870dd411d23bb792606ef4b"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-62.log",
+      "bytes": 8957,
+      "sha256": "2ebb24f0d0496123a632aca975dd24faaedadac3227a2287309f7100a22c2303"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-63.log",
+      "bytes": 8961,
+      "sha256": "c9f81ef24efd824ae53689323d6dbccc9579f12b8d51fc8801a5c55e083459a3"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-64.log",
+      "bytes": 8968,
+      "sha256": "6d136e03d505e969e1ab2b2688ff917b850ff01441d122f2482bed5dad9781be"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-65.log",
+      "bytes": 8965,
+      "sha256": "ffc962abcb7568c7273eea3406e193d1297b088749d84147bfda145e2150adb5"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-66.log",
+      "bytes": 8955,
+      "sha256": "d30b5ed0cfda2098ec22dfb620d0f8770ec289aed149221878550a85d4384642"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-67.log",
+      "bytes": 8964,
+      "sha256": "6f5a46660c214cc4c4994fd40296caf68c903f2a39bbe5a434f65f5af6afab67"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-68.log",
+      "bytes": 8966,
+      "sha256": "afd856d142b5d404ce8be303bd9d98f9f87cfbe7d63df509fb3d21b4ff664d8c"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-69.log",
+      "bytes": 8959,
+      "sha256": "df2e5793c51f3e872fe1c9329088f2b72d144cda25255112b8b6e9224fcc332b"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-7.log",
+      "bytes": 8930,
+      "sha256": "4e0248e437bb279f923b56b6c556509cc6cabcdfc7cfc3d7a5d05aaa58fa0f43"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-70.log",
+      "bytes": 8960,
+      "sha256": "46d27ca1fd1502843c2ba5c26bbac25d54df2b02dd7d4730b6c612ca332e2923"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-71.log",
+      "bytes": 8954,
+      "sha256": "f2477c8534f9ef6f496b58178912409c08f4ec0495f2a93cff27500ddc66a98c"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-72.log",
+      "bytes": 8962,
+      "sha256": "909d022b76687494904e6c4be140001f4b1faee70dcd0e72a32529dc9a15a1db"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-73.log",
+      "bytes": 8958,
+      "sha256": "26b919e4f9225bbdffb6c6a5abc5c2f08743d155102dfb4fd60495769c43982e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-74.log",
+      "bytes": 8967,
+      "sha256": "0f68afc36b0a66e063c39c8cc6ab9b03733064754c9b5acb290f4becd512a1af"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-75.log",
+      "bytes": 8951,
+      "sha256": "ea05d7e612a3cb8473460c6743675639b4af19ca7d15e5709644569b58ac6123"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-76.log",
+      "bytes": 8963,
+      "sha256": "c3b3e19cb9b86baebfcfe941f23f891a99a32c4e22e86299965addf304d4b117"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-77.log",
+      "bytes": 8962,
+      "sha256": "e9885b7d6497e3c888750d00eb86e280e433c02a76c2db93eee8e468fa568640"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-78.log",
+      "bytes": 8963,
+      "sha256": "ce706b7ce354d240c8c06e0991b20e7b16870a432adc7e855e9a02d4c22d6820"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-79.log",
+      "bytes": 8956,
+      "sha256": "ae857dc12accbff0ffd49a68c176834e11f801ef809931483549d73349437509"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-8.log",
+      "bytes": 8935,
+      "sha256": "9d64d0e7763d2a8a798d2f3a4abdda173e0300f4198eb7ad64cadb59e2ac2b9a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-80.log",
+      "bytes": 8955,
+      "sha256": "0e0ab37254661d3faf382e874e1f453a207c611cd16517e61c1c50eb937c2a93"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-81.log",
+      "bytes": 8954,
+      "sha256": "897b6de0e1cb55d59112608b8840f465d36b850c4d3dcf6d3b6f55f921a34a94"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-82.log",
+      "bytes": 8950,
+      "sha256": "b55434852088a6b7e59ed410ab92dcd00ea2ebba7ea966c9a15a64d952685cc8"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-83.log",
+      "bytes": 8959,
+      "sha256": "84824a82a79eea67e5430ca3504bdfe2b1ea916b5ccf0e44e8532153a50186e2"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-84.log",
+      "bytes": 8967,
+      "sha256": "0ee8afab781f35ad48961c8c43708607404a8fbe173ac647a03c792c643e18eb"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-85.log",
+      "bytes": 8954,
+      "sha256": "6a9fc4fc48b884af704fb6a55e473d5ad0ade3ce3df7d8b3d7cd2b1736dccd9f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-86.log",
+      "bytes": 8959,
+      "sha256": "dc9fd4fa6c62c79b664197611d866ffef32ce2e5e16b0041c946d5c7e028e7bc"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-87.log",
+      "bytes": 8960,
+      "sha256": "c7d84ff08fa8c0921c8ec3295caa66da8c3335bec13f53209be192853b094efa"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-88.log",
+      "bytes": 8954,
+      "sha256": "511c459c69f1614cab5edf2b0ffacc944095ccfb8519bfb82e573e8349e68405"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-89.log",
+      "bytes": 8955,
+      "sha256": "82f8bee9a683b67fb8b2ca5860965fff8b9446ada12f10a5bb816efbeba36d6f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-9.log",
+      "bytes": 8948,
+      "sha256": "d46c52ac36aa562c567e14f07695ec43bef09d0889e2ed021868472315a8fdb1"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-90.log",
+      "bytes": 8954,
+      "sha256": "9a6eba7c12b293efdd1c9803aa58213fbbf5f0c0394faad5960c32914d32866b"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-91.log",
+      "bytes": 8955,
+      "sha256": "142e8ed51d4f540ad445306ad28f3dc17fe679f2dcb2e2d66ea9fcff92e8075a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-92.log",
+      "bytes": 8953,
+      "sha256": "391855566a0ee1c736e1278f6c4805abb42d107fb5dec69d6e20f2cde04f503a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-93.log",
+      "bytes": 8953,
+      "sha256": "587fa58594bca488153ce547eb770418c10fad7de3e2b012e5cbeffd4f49733f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-94.log",
+      "bytes": 8948,
+      "sha256": "66ccd0851cd1e53265652dbebc2c1e3dd13e485565ac899dc915368691e76997"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-95.log",
+      "bytes": 8950,
+      "sha256": "1e27104fa2e7a579b15f5a25da072bbe72e921fcf2e6eccae953fc7430f978ac"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-96.log",
+      "bytes": 8954,
+      "sha256": "7bb4eb6cf528f07ef2f7c0032a4375dfe87f5a1f27619cd604015a5f69970a41"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-97.log",
+      "bytes": 8954,
+      "sha256": "bf53e2da97ae8d8195e8a5d0d304825d58cce9497e686a190cb26e69492b1422"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-98.log",
+      "bytes": 8966,
+      "sha256": "63be49151cb53d1cac0753133045de340cbdf2a37b6bc36eb0d885192b165c8b"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/case-99.log",
+      "bytes": 8963,
+      "sha256": "cd04def6d4fb16936af0e3495b645cd7246311ac7df15a8fbdab263f43179359"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_binding_defeq.inventory.log",
+      "bytes": 198,
+      "sha256": "1c45f9debc2c5bda274136207b26a4aaa7238f1db2868de5702b10be949eba43"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_ctx_whnf_defeq.inventory.log",
+      "bytes": 203,
+      "sha256": "e1a46f01bf0971c8815b0767734ed4c1646b8ad8aa3edf77b3a4317dcb324b4e"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_defeq_cache.inventory.log",
+      "bytes": 318,
+      "sha256": "1924103cc591b05cd800afde1104c0590048e0ff9e7330aa8212656984596396"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_eta_struct_ext.inventory.log",
+      "bytes": 134,
+      "sha256": "815a9aa38a2fe2e4e7e2daf870a8aeaafc17c8c4d127878d80be1aa5536d68c1"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_frontend_roundtrip.inventory.log",
+      "bytes": 3200,
+      "sha256": "0cd4d504ff3b9c47cbf1abdd2b9cdef2ef7665ca79f3756e979e8e044fad1c6f"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_fvar_opening.inventory.log",
+      "bytes": 167,
+      "sha256": "56a918805b82948ce64488456d7a5cec760c03d1bc30e4a0a2c7526e3bd4845b"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_lazy_delta.inventory.log",
+      "bytes": 250,
+      "sha256": "f2e75b820f45085f3d6cff322aa0f3c9948fe204d413709eecaff66ab489813c"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_phase_completion.inventory.log",
+      "bytes": 155,
+      "sha256": "0dca0dce89daf260d0d0e8f0a54aa8f47178288c6647df08b1d173b561252c26"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_tc_stitching.inventory.log",
+      "bytes": 254,
+      "sha256": "47ba81ee8149dde6a2a08f715991b2b2f0d8e4d27d5ec97d6db9b3d63757a65a"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_universe_integration.inventory.log",
+      "bytes": 44,
+      "sha256": "bbc73b351aed88a768782ef1ba444d27881e2d45e13b00d53fb2242322c7f3d6"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/e2e_universe_realnames.inventory.log",
+      "bytes": 259,
+      "sha256": "6e101ab372f2872b3ea6710b8628dabd7cf62acc9f02cd113d0ccd4c35607668"
+    },
+    {
+      "path": "runner-evidence/kernel-layout-fixtures/policy.txt",
+      "bytes": 2234,
+      "sha256": "a071aaa1b51d367a1d867406dfb60e0030abea65496fb704cc3f6f7904623456"
+    },
+    {
+      "path": "runner-evidence/summary.json",
+      "bytes": 2766,
+      "sha256": "ee2620f3f94e17248e5c33331defc71142104755a5b98f66befacaa9733f9d00"
+    },
+    {
+      "path": "runners/run_fixture_29_2.py",
+      "bytes": 2456,
+      "sha256": "a47d19f223b772e729b5b1aace655b7616d8d31ad9261f991f1ec67ba8948731"
+    },
+    {
+      "path": "runners/run_fixture_final_controls.py",
+      "bytes": 1395,
+      "sha256": "8cb54fde13b359a0f36f5881959c4bb245adee043b57274f7eefbd14a0678e8a"
+    }
+  ],
+  "archive_sha256": "5fd642b43f1e5bb0884cd691b4c1599044cf86cbd3ea2ecbd3a22752c9977a7e"
+}

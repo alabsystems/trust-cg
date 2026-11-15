@@ -1,0 +1,31 @@
+; TrustIr text format v1
+module "closure_layout"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+
+functy.0 = (u8, u64, u64) -> (u64)
+
+functy.1 = (u64) -> (u64)
+
+functy.2 = () -> (u64)
+
+closure_layout closure.0 size=16 align=8 offsets=[8,0]
+
+closure_ty functy.1 { u8, u64 }
+
+fn @add_lo_hi(functy.0) {
+    ; #body-gate: gated "conformance-fixture"
+bb0(%0: u8, %1: u64, %2: u64):
+    %3 = zext u8 %0 to u64
+    %4 = add u64 %3, %1
+    %5 = add u64 %4, %2
+    ret %5
+}
+
+fn @program(functy.2) {
+    ; #body-gate: gated "conformance-fixture"
+bb0:
+    %0 = const closure.0 closure<func.0>{ 3, 5 }
+    %1 = const u64 16
+    %2 = call_indirect %0(functy.1)(%1)
+    ret %2
+}

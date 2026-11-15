@@ -1,0 +1,204 @@
+; TrustIr text format v1
+module "bcp_propagate"
+
+functy.0 = (ptr, ptr, i64) -> (i64)
+
+fn @bcp_propagate_scan(functy.0) {
+bb0(%0: ptr, %1: ptr, %2: i64):
+    %40 = const i64 0
+    %41 = const i64 1
+    %42 = const i32 0
+    %43 = const i64 32
+    %44 = load i64, ptr %0
+    %45 = inttoptr i64 %44 to ptr
+    %46 = gep i64, ptr %45, %40
+    %47 = load i64, ptr %46
+    %48 = gep i64, ptr %45, %41
+    %49 = load i64, ptr %48
+    %50 = const i64 2
+    %51 = gep i64, ptr %45, %50
+    %52 = load i64, ptr %51
+    %53 = inttoptr i64 %52 to ptr
+    %54 = const i64 3
+    %55 = gep i64, ptr %45, %54
+    %56 = load i64, ptr %55
+    %57 = inttoptr i64 %56 to ptr
+    %58 = const i64 4
+    %59 = gep i64, ptr %45, %58
+    %60 = load i64, ptr %59
+    %61 = inttoptr i64 %60 to ptr
+    %62 = const i64 5
+    %63 = gep i64, ptr %45, %62
+    %64 = load i64, ptr %63
+    %65 = inttoptr i64 %64 to ptr
+    %66 = const i64 6
+    %67 = gep i64, ptr %45, %66
+    %68 = load i64, ptr %67
+    %69 = inttoptr i64 %68 to ptr
+    %70 = const i64 0
+    %71 = const i64 1
+    %72 = const i64 13
+    %73 = gep i64, ptr %0, %72
+    %74 = load i64, ptr %73
+    %75 = const i64 14
+    %76 = gep i64, ptr %0, %75
+    %77 = load i64, ptr %76
+    %78 = icmp ne i64 %74, %70
+    condbr %78, bb12, bb11
+bb1(%3: i64, %4: i64):
+    %90 = icmp eq i64 %4, %40
+    condbr %90, bb10(%3), bb2(%3)
+bb2(%5: i64):
+    br bb3(%40, %5, %40)
+bb3(%6: i64, %7: i64, %8: i64):
+    %91 = icmp sge i64 %6, %49
+    condbr %91, bb1(%7, %8), bb4(%6, %7, %8)
+bb4(%9: i64, %10: i64, %11: i64):
+    %92 = gep u32, ptr %57, %9
+    %93 = load u32, ptr %92
+    %94 = zext u32 %93 to i64
+    %95 = add i64 %9, %41
+    %96 = gep u32, ptr %57, %95
+    %97 = load u32, ptr %96
+    %98 = zext u32 %97 to i64
+    br bb5(%94, %98, %9, %10, %11, %40, %42, %40)
+bb5(%12: i64, %13: i64, %14: i64, %15: i64, %16: i64, %17: i64, %18: i32, %19: i64):
+    %99 = icmp sge i64 %12, %13
+    condbr %99, bb7(%14, %15, %16, %17, %18, %19), bb6(%12, %13, %14, %15, %16, %17, %18, %19)
+bb6(%20: i64, %21: i64, %22: i64, %23: i64, %24: i64, %25: i64, %26: i32, %27: i64):
+    %100 = gep i32, ptr %53, %20
+    %101 = load i32, ptr %100
+    %102 = sub i32 %42, %101
+    %103 = icmp slt i32 %101, %42
+    %104 = select i32 %103, %102, %101
+    %105 = sext i32 %104 to i64
+    %106 = gep i8, ptr %61, %105
+    %107 = load i8, ptr %106
+    %108 = sext i8 %107 to i32
+    %109 = icmp eq i32 %108, %42
+    %110 = sub i32 %42, %108
+    %111 = select i32 %103, %110, %108
+    %112 = icmp sgt i32 %111, %42
+    %113 = zext bool %112 to i64
+    %114 = or i64 %27, %113
+    %115 = zext bool %109 to i64
+    %116 = add i64 %25, %115
+    %117 = icmp eq i64 %25, %40
+    %118 = zext bool %117 to i64
+    %119 = and i64 %118, %115
+    %120 = icmp ne i64 %119, %40
+    %121 = select i32 %120, %101, %26
+    %122 = add i64 %20, %41
+    br bb5(%122, %21, %22, %23, %24, %116, %121, %114)
+bb7(%28: i64, %29: i64, %30: i64, %31: i64, %32: i32, %33: i64):
+    %123 = add i64 %28, %41
+    %124 = icmp ne i64 %33, %40
+    condbr %124, bb3(%123, %29, %30), bb15(%28, %29, %30, %31, %32)
+bb8(%34: i64, %35: i64, %36: i32):
+    %138 = sub i32 %42, %36
+    %139 = icmp slt i32 %36, %42
+    %140 = select i32 %139, %138, %36
+    %141 = sext i32 %140 to i64
+    %142 = const i8 1
+    %143 = const i8 -1
+    %144 = select i8 %139, %143, %142
+    %145 = gep i8, ptr %61, %141
+    store i8 %144, ptr %145
+    %146 = load i64, ptr %69
+    %147 = gep i32, ptr %65, %146
+    store i32 %36, ptr %147
+    %148 = add i64 %146, %41
+    store i64 %148, ptr %69
+    %149 = add i64 %35, %41
+    %150 = add i64 %34, %41
+    %151 = const i64 6
+    %152 = const i64 7
+    %153 = const i64 8
+    %154 = gep i64, ptr %0, %151
+    %155 = gep i64, ptr %0, %152
+    %156 = gep i64, ptr %0, %153
+    %157 = load i64, ptr %154
+    %158 = inttoptr i64 %157 to ptr
+    %159 = load i64, ptr %155
+    %160 = load i64, ptr %156
+    %161 = icmp ult i64 %160, %159
+    condbr %161, bb17, bb18
+bb9(%37: i64, %38: i64):
+    %187 = trunc i64 %38 to i32
+    %188 = const i64 9
+    %189 = gep i64, ptr %0, %188
+    store i32 %187, ptr %189
+    %190 = shl i64 %37, %43
+    %191 = or i64 %190, %41
+    ret %191
+bb10(%39: i64):
+    %192 = shl i64 %39, %43
+    ret %192
+bb11:
+    br bb1(%40, %41)
+bb12:
+    %79 = add i64 %47, %71
+    %80 = icmp ult i64 %77, %79
+    %81 = select i64 %80, %77, %79
+    %82 = inttoptr i64 %74 to ptr
+    br bb13(%70)
+bb13(%83: i64):
+    %85 = icmp sge i64 %83, %81
+    condbr %85, bb11, bb14(%83)
+bb14(%84: i64):
+    %86 = gep i8, ptr %82, %84
+    %87 = load i8, ptr %86
+    %88 = gep i8, ptr %61, %84
+    store i8 %87, ptr %88
+    %89 = add i64 %84, %71
+    br bb13(%89)
+bb15(%125: i64, %126: i64, %127: i64, %128: i64, %129: i32):
+    %135 = icmp eq i64 %128, %40
+    condbr %135, bb9(%126, %125), bb16(%125, %126, %127, %128, %129)
+bb16(%130: i64, %131: i64, %132: i64, %133: i64, %134: i32):
+    %136 = icmp eq i64 %133, %41
+    %137 = add i64 %130, %41
+    condbr %136, bb8(%130, %131, %134), bb3(%137, %131, %132)
+bb17:
+    %162 = gep i32, ptr %158, %160
+    store i32 %36, ptr %162
+    %163 = const i64 10
+    %164 = gep i64, ptr %0, %163
+    %165 = load i64, ptr %164
+    %166 = const i64 0
+    %167 = icmp ne i64 %165, %166
+    condbr %167, bb19, bb20
+bb18:
+    %184 = const i64 -1
+    %185 = const i64 8
+    %186 = gep i64, ptr %0, %185
+    store i64 %184, ptr %186
+    br bb3(%150, %149, %41)
+bb19:
+    %168 = inttoptr i64 %165 to ptr
+    %169 = const i64 12
+    %170 = gep i64, ptr %0, %169
+    %171 = load i64, ptr %170
+    %172 = const i64 0
+    %173 = icmp ne i64 %171, %172
+    condbr %173, bb21, bb22
+bb20:
+    %180 = const i64 1
+    %181 = add i64 %160, %180
+    %182 = const i64 8
+    %183 = gep i64, ptr %0, %182
+    store i64 %181, ptr %183
+    br bb3(%150, %149, %41)
+bb21:
+    %176 = inttoptr i64 %171 to ptr
+    %177 = gep i32, ptr %176, %34
+    %178 = load i32, ptr %177
+    %179 = gep i32, ptr %168, %160
+    store i32 %178, ptr %179
+    br bb20
+bb22:
+    %174 = trunc i64 %34 to i32
+    %175 = gep i32, ptr %168, %160
+    store i32 %174, ptr %175
+    br bb20
+}

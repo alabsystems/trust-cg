@@ -108,11 +108,14 @@ fn build_conv(
     dst_f32: bool,
 ) {
     let dst = if dst_f32 { Ty::F32 } else { Ty::F64 };
-    let ft = m.add_func_type(FuncTy {
-        params: vec![param_ty.clone()],
-        returns: vec![dst.clone()],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![param_ty.clone()],
+            returns: vec![dst.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
 
     let mut body = vec![];
@@ -152,13 +155,15 @@ fn build_conv(
         params: vec![(ValueId::new(0), param_ty)],
         body,
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 // ── JIT harness ─────────────────────────────────────────────────────────────────
 fn jit_buffer(m: &TrustIrModule) -> trust_cg_codegen::jit::ExecutableBuffer {
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(m, &HashMap::new())
         .expect("hand-built int->float module must JIT-compile (backend supports SCVTF/UCVTF)")
         .buffer
@@ -723,11 +728,14 @@ fn narrow_signed_int_to_float_clean_bill() {
 
     // ── (b) DIRECT i32 parameter (no Trunc): the bug is not an artifact of Trunc ──
     let mut md = TrustIrModule::new("i2f_direct_s32".to_string());
-    let ft = md.add_func_type(FuncTy {
-        params: vec![Ty::I32],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let ft = md
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(0), "d_s32", ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -745,7 +753,8 @@ fn narrow_signed_int_to_float_clean_bill() {
             }),
         ],
     }];
-    md.add_function(f);
+    md.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
     let bufd = jit_buffer(&md);
     let d_s32: unsafe extern "C" fn(i32) -> f64 =
         unsafe { std::mem::transmute(bind(&bufd, "d_s32")) };
@@ -968,4 +977,13 @@ fn armed_controls_precision_and_rounding() {
          i64->f32(2^24+1)=16777216 rounded); RNE load-bearing (2^53+1 ties-to-even ->2^53, \
          2^53+3 rounds-up ->2^53+4). The differential is real."
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

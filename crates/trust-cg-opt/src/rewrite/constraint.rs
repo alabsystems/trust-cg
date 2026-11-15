@@ -330,7 +330,7 @@ impl Constraint for InterfacePure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::fast_hash::FxHashMap as HashMap;
     use trust_cg_ir::{
         AArch64Target, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, Signature,
         TargetInfo, VReg,
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn imm_equals_hits_zero() {
         let func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
-        let def_map: HashMap<VReg, InstId> = HashMap::new();
+        let def_map: HashMap<VReg, InstId> = HashMap::default();
         let inst = MachInst::new(
             AArch64Opcode::AddRI,
             vec![
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn imm_is_pred() {
         let func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
-        let def_map: HashMap<VReg, InstId> = HashMap::new();
+        let def_map: HashMap<VReg, InstId> = HashMap::default();
         let inst = MachInst::new(
             AArch64Opcode::AddRI,
             vec![
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn imm_power_of_two() {
         let func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
-        let def_map: HashMap<VReg, InstId> = HashMap::new();
+        let def_map: HashMap<VReg, InstId> = HashMap::default();
         let c = ImmIsPowerOfTwo { idx: 2 };
         for (v, want) in [
             (1, true),
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn imm_negative_non_min() {
         let func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
-        let def_map: HashMap<VReg, InstId> = HashMap::new();
+        let def_map: HashMap<VReg, InstId> = HashMap::default();
         let c = ImmNegativeNonMin { idx: 2 };
         for (v, want) in [
             (-1i64, true),
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn operands_equal_vregs() {
         let func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
-        let def_map: HashMap<VReg, InstId> = HashMap::new();
+        let def_map: HashMap<VReg, InstId> = HashMap::default();
         let same = VReg::new(7, trust_cg_ir::RegClass::Gpr64);
         let other = VReg::new(8, trust_cg_ir::RegClass::Gpr64);
         let equal_inst = MachInst::new(
@@ -537,7 +537,7 @@ mod tests {
                 MachOperand::VReg(VReg::new(1, trust_cg_ir::RegClass::Gpr64)),
             ],
         );
-        let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_map: HashMap<VReg, InstId> = HashMap::default();
         def_map.insert(VReg::new(1, trust_cg_ir::RegClass::Gpr64), sxtb_id);
         let ctx = make_ctx(&func, &outer, InstId(99), BlockId(0), &def_map);
 
@@ -557,7 +557,7 @@ mod tests {
     #[test]
     fn defined_by_one_of_block_param_false() {
         let func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
-        let def_map: HashMap<VReg, InstId> = HashMap::new();
+        let def_map: HashMap<VReg, InstId> = HashMap::default();
         let outer = MachInst::new(
             AArch64Opcode::Sxtw,
             vec![
@@ -595,7 +595,7 @@ mod tests {
                 MachOperand::VReg(VReg::new(3, trust_cg_ir::RegClass::Gpr64)),
             ],
         );
-        let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_map: HashMap<VReg, InstId> = HashMap::default();
         def_map.insert(VReg::new(1, trust_cg_ir::RegClass::Gpr64), movi_id);
         let ctx = make_ctx(&func, &outer, InstId(42), BlockId(0), &def_map);
 
@@ -642,7 +642,7 @@ mod tests {
                 MachOperand::VReg(VReg::new(2, trust_cg_ir::RegClass::Gpr64)),
             ],
         );
-        let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_map: HashMap<VReg, InstId> = HashMap::default();
         def_map.insert(VReg::new(1, trust_cg_ir::RegClass::Gpr64), sub_id);
         let ctx = make_ctx(&func, &outer, InstId(99), BlockId(0), &def_map);
 
@@ -684,7 +684,7 @@ mod tests {
                 vreg_class(2, RegClass::Gpr64),
             ],
         );
-        let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_map: HashMap<VReg, InstId> = HashMap::default();
         def_map.insert(VReg::new(1, RegClass::Gpr64), sub_id);
         let ctx = make_ctx(&func, &outer, InstId(99), BlockId(0), &def_map);
 
@@ -703,7 +703,7 @@ mod tests {
     fn definer_operand_equals_outer_no_definer_false() {
         // Block param: no in-block definer, constraint must be false.
         let func = MachFunction::new("t".into(), Signature::new(vec![], vec![]));
-        let def_map: HashMap<VReg, InstId> = HashMap::new();
+        let def_map: HashMap<VReg, InstId> = HashMap::default();
         let outer = MachInst::new(
             AArch64Opcode::AddRR,
             vec![
@@ -745,7 +745,7 @@ mod tests {
                 MachOperand::VReg(VReg::new(2, trust_cg_ir::RegClass::Gpr64)),
             ],
         );
-        let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_map: HashMap<VReg, InstId> = HashMap::default();
         def_map.insert(VReg::new(1, trust_cg_ir::RegClass::Gpr64), addi_id);
         let ctx = make_ctx(&func, &outer, InstId(9), BlockId(0), &def_map);
 
@@ -788,7 +788,7 @@ mod tests {
                     MachOperand::VReg(VReg::new(3, trust_cg_ir::RegClass::Gpr64)),
                 ],
             );
-            let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+            let mut def_map: HashMap<VReg, InstId> = HashMap::default();
             def_map.insert(VReg::new(1, trust_cg_ir::RegClass::Gpr64), movi_id);
             let ctx = make_ctx(&func, &outer, InstId(7), BlockId(0), &def_map);
             let c = DefinerImmIsPowerOfTwo {
@@ -813,7 +813,7 @@ mod tests {
                 ],
             ),
         );
-        let mut def_map: HashMap<VReg, InstId> = HashMap::new();
+        let mut def_map: HashMap<VReg, InstId> = HashMap::default();
         def_map.insert(VReg::new(1, trust_cg_ir::RegClass::Gpr64), lsr_id);
         let c = DefinerImmEqualsOuterImm {
             outer_imm_idx: 2,

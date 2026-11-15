@@ -61,6 +61,7 @@ fn jit(module: &trust_ir::Module, opt: OptLevel, fast: bool, row: [i64; 4]) -> R
     };
     cfg.opt_level = opt;
     let buf = Compiler::new(cfg)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(module, &externs)
         .map_err(|e| format!("compile_err: {e:?}"))?
         .buffer;
@@ -130,7 +131,7 @@ where
     fb.switch_to_block(e);
     body(&mut fb, [a, b, c, d]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// Like `build_module`, but pre-interns an `[elem; len]` array type and passes
@@ -153,7 +154,7 @@ where
     fb.switch_to_block(e);
     body(&mut fb, [a, b, c, d], arr_ty);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 const ROWS: &[[i64; 4]] = &[
@@ -612,7 +613,7 @@ where
     hb.ret(vec![r]);
     hb.build();
 
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 fn helper_h(x: i64) -> i64 {
@@ -855,8 +856,8 @@ fn array_i8_eight_lanes() {
 // ===========================================================================
 // ESCALATION 2 — NESTED AGGREGATE / MULTI-INDEX GEP.
 //
-// [[i64; 2]; 2] indexed with TWO GEP indices (outer, inner), at least one
-// computed at runtime. Exercises the multi-index aggregate-layout walk.
+// [[i64; 2]; 2] indexed by row and column. Flatten the row into scalar
+// elements before GEP: TrustIR scales every index by the same pointee size.
 // ===========================================================================
 
 #[test]
@@ -876,33 +877,26 @@ fn nested_array_multi_index() {
     let base = fb.alloca(outer.clone());
     // store args into [r][col] for (r,col) in row-major: (0,0)=a (0,1)=b (1,0)=c (1,1)=d
     //
-    // GEP CONVENTION (ABI-critical, see adapter translate_gep / translate_multi_
-    // index_gep): the LEADING index strides by sizeof(pointee_ty), and only the
-    // SUBSEQUENT indices descend the aggregate. To index *within one* `outer`
-    // value (rather than treating `base` as `*[outer]`), the leading index must
-    // be 0 so we stay at the slot, then `r` descends `outer` -> inner (stride
-    // sizeof([i64;2])=16) and `col` descends inner -> i64 (stride 8). Net offset
-    // `base + 0*32 + r*16 + col*8`, which is exactly `grid[r][col]` and stays in
-    // bounds. A 2-index `[r, col]` here would stride r by 32 (whole-grid size)
-    // and write out of bounds.
+    // Scalar element offset = row * 2 + column. Both indices of the GEP
+    // have an i64 pointee and therefore the same eight-byte stride.
     let coords = [(0i64, 0i64, a), (0, 1, b), (1, 0, c), (1, 1, d)];
     for (r, col, v) in coords {
-        let z = fb.iconst(Ty::I64, 0);
-        let ri = fb.iconst(Ty::I64, r as i128);
+        let ri = fb.iconst(Ty::I64, (r * 2) as i128);
         let ci = fb.iconst(Ty::I64, col as i128);
-        let p = fb.gep(outer.clone(), base, vec![z, ri, ci]);
+        let p = fb.gep(Ty::I64, base, vec![ri, ci]);
         fb.store(Ty::I64, p, v);
     }
     // read [r1][c1] where r1 = (c & 1), c1 = (d & 1)  (runtime indices)
     let one = fb.iconst(Ty::I64, 1);
     let r1 = fb.binop(BinOp::And, Ty::I64, c, one);
     let c1 = fb.binop(BinOp::And, Ty::I64, d, one);
-    let zr = fb.iconst(Ty::I64, 0);
-    let rp = fb.gep(outer, base, vec![zr, r1, c1]);
+    let two = fb.iconst(Ty::I64, 2);
+    let row_offset = fb.binop(BinOp::Mul, Ty::I64, r1, two);
+    let rp = fb.gep(Ty::I64, base, vec![row_offset, c1]);
     let v = fb.load(Ty::I64, rp);
     fb.ret(vec![v]);
     fb.build();
-    let m = mb.build();
+    let m = mb.build().expect("ModuleBuilder::build: test fixture");
     check("nested_array_multi_index", &m, ROWS, |row| {
         let grid = [[row[0], row[1]], [row[2], row[3]]];
         grid[(row[2] & 1) as usize][(row[3] & 1) as usize]
@@ -1045,4 +1039,13 @@ fn may_alias_forwarding() {
     check("may_alias_forwarding", &m, ROWS, |row| {
         if row[2] & 1 != 0 { row[1] } else { row[0] }
     });
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

@@ -60,7 +60,7 @@ fn bench_module_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("parent_loop_compile_breakdown");
     group.bench_function("module_construction", |b| {
         b.iter(|| {
-            let module = build_parent_loop_module();
+            let module = build_parent_loop_module().expect("the kernel module builds");
             black_box(module);
         });
     });
@@ -71,12 +71,13 @@ fn bench_compile_module_to_jit_total_jit_fast(c: &mut Criterion) {
     let mut group = c.benchmark_group("parent_loop_compile_breakdown");
     group.bench_function("compile_module_to_jit_total_jit_fast", |b| {
         b.iter_batched(
-            build_parent_loop_module,
+            || build_parent_loop_module().expect("the kernel module builds"),
             |module| {
                 let config = CompilerConfig::for_host_jit();
                 assert!(config.enable_jit_fast_regalloc);
                 let extern_symbols: HashMap<String, *const u8> = HashMap::new();
                 let result = Compiler::new(config)
+                    .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
                     .compile_module_to_jit(&module, &extern_symbols)
                     .expect("compile_module_to_jit (jit_fast)");
                 black_box(result);
@@ -91,12 +92,13 @@ fn bench_compile_module_to_jit_total_baseline(c: &mut Criterion) {
     let mut group = c.benchmark_group("parent_loop_compile_breakdown");
     group.bench_function("compile_module_to_jit_total_baseline_no_jit_fast", |b| {
         b.iter_batched(
-            build_parent_loop_module,
+            || build_parent_loop_module().expect("the kernel module builds"),
             |module| {
                 let mut config = CompilerConfig::for_host_jit();
                 config.enable_jit_fast_regalloc = false;
                 let extern_symbols: HashMap<String, *const u8> = HashMap::new();
                 let result = Compiler::new(config)
+                    .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
                     .compile_module_to_jit(&module, &extern_symbols)
                     .expect("compile_module_to_jit (no_jit_fast)");
                 black_box(result);
@@ -169,11 +171,12 @@ fn bench_sub_phases_jit_fast(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    let module = build_parent_loop_module();
+                    let module = build_parent_loop_module().expect("the kernel module builds");
                     let mut config = CompilerConfig::for_host_jit();
                     config.trace_level = CompilerTraceLevel::Full;
                     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
                     let result = Compiler::new(config)
+                        .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
                         .compile_module_to_jit(&module, &extern_symbols)
                         .expect("compile_module_to_jit (trace, jit_fast)");
                     total += extract_phase(&result, &phase_name);
@@ -211,12 +214,13 @@ fn bench_sub_phases_baseline(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    let module = build_parent_loop_module();
+                    let module = build_parent_loop_module().expect("the kernel module builds");
                     let mut config = CompilerConfig::for_host_jit();
                     config.enable_jit_fast_regalloc = false;
                     config.trace_level = CompilerTraceLevel::Full;
                     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
                     let result = Compiler::new(config)
+                        .with_codegen_license(trust_cg_jit_matrix::in_process_kernel_license())
                         .compile_module_to_jit(&module, &extern_symbols)
                         .expect("compile_module_to_jit (trace, no_jit_fast)");
                     total += extract_phase(&result, &phase_name);

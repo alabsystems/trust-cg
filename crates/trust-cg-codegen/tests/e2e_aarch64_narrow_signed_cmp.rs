@@ -34,11 +34,14 @@ fn can_link_and_run_aarch64_macho() -> bool {
 /// `fn name(a: i32, b: i32) -> i32 { let x = a as NARROW; let y = b as NARROW;
 ///  (x cmp y) as i32 }` — truncates to the narrow type, then compares.
 fn build_trunc_cmp(func_id: u32, name: &str, module: &mut TrustIrModule, narrow: Ty, cmp: ICmpOp) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -87,18 +90,23 @@ fn build_trunc_cmp(func_id: u32, name: &str, module: &mut TrustIrModule, narrow:
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// `fn name(a: i32, b: i32) -> i32 { let x = a as NARROW; let y = b as NARROW;
 ///  x.overflowing_add(y).1 as i32 }` — exposes the narrow checked-overflow class
 /// (audit U2/U3): the final overflow Icmp is on narrow operands.
 fn build_narrow_add_ovf(func_id: u32, name: &str, module: &mut TrustIrModule, narrow: Ty) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I32, Ty::I32],
-        returns: vec![Ty::I32],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -147,7 +155,9 @@ fn build_narrow_add_ovf(func_id: u32, name: &str, module: &mut TrustIrModule, na
             }),
         ],
     }];
-    module.add_function(f);
+    module
+        .try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -173,7 +183,8 @@ fn compile_to_obj_at(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8> {
             ..CompilerConfig::default()
         },
         TargetSpec::parse("aarch64-apple-darwin").expect("parse aarch64-apple-darwin target spec"),
-    );
+    )
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("narrow compare must compile");
@@ -347,4 +358,13 @@ fn e2e_aarch64_narrow_signed_compare() {
             "narrow i8/i16 compare miscompiled at {opt:?} (failing-case code {code})",
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

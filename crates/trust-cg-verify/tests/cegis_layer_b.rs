@@ -258,3 +258,93 @@ fn layer_b_cache_replay_on_second_run_applies_rewrite() {
         "hot-run `verified` must equal rewrites actually applied, matching cold run"
     );
 }
+
+/// `Movz v_imm, #7; AddRR v_dst, v_src, v_imm; <reader of v_imm>` where the
+/// reader reads `v_imm` at operand 0. Search revision 2 skipped operand 0
+/// when counting reads, rewrote the add to `AddRI #7` and spliced out the
+/// Movz the reader still needs (wrong code).
+#[test]
+fn layer_b_does_not_fuse_when_a_compare_or_store_reads_the_movz() {
+    for (reader, operands) in [
+        (AArch64Opcode::CmpRR, 2usize),
+        (AArch64Opcode::StrRI, 3),
+        (AArch64Opcode::Cbz, 2),
+    ] {
+        let (mut func, v_src, v_imm, _v_dst, movz, add, ret) = layer_b_func();
+        let mut read = vec![MachOperand::VReg(v_imm), MachOperand::VReg(v_src)];
+        if operands == 3 {
+            read.push(MachOperand::Imm(8));
+        } else if reader == AArch64Opcode::Cbz {
+            read[1] = MachOperand::Block(func.entry);
+        }
+        let read = func.push_inst(MachInst::new(reader, read));
+        let entry = func.entry;
+        func.block_mut(entry).insts = vec![movz, add, read, ret];
+        let before = format!("{func:?}");
+
+        let mut pass = CegisSuperoptPass::new(make_config(None));
+        assert!(!pass.run(&mut func), "{reader:?}: nothing may commit");
+        assert_eq!(
+            format!("{func:?}"),
+            before,
+            "{reader:?}: the window must stay"
+        );
+        assert_eq!(pass.stats().layer_b_candidates, 0, "{reader:?}");
+    }
+}
+
+/// The mutation control, through the whole pass: each deliberately corrupted
+/// replacement (wrong immediate, wrong register, wrong operation) reaches a
+/// verification and is refuted, here already by its concrete edge-case phase
+/// (the lib test `corrupted_replacements_are_refuted_by_the_solver` has AY
+/// refute each one with no seeds). Nothing commits, nothing errors, and the
+/// function is untouched. Revision 2's obligation (`y + 7 == y + 7`) never
+/// looked at the replacement and accepted all three.
+#[test]
+fn layer_b_obligation_refutes_every_corrupted_rewrite() {
+    use trust_cg_verify::CegisRunOutcome;
+    use trust_cg_verify::cegis_pass::{CegisSuperoptTestHooks, ReplacementMutation};
+
+    // Control: the uncorrupted rewrite is proven and committed.
+    let (mut control, ..) = layer_b_func();
+    let mut pass = CegisSuperoptPass::new(make_config(None));
+    let outcome = pass.run_with_outcome(&mut control);
+    if !outcome.committed() && independent_checker_unavailable_blocks_layer_b() {
+        eprintln!("{INDEPENDENT_CHECKER_GAP_SKIP_NOTICE}");
+        return;
+    }
+    assert_eq!(outcome, CegisRunOutcome::Complete { committed: true });
+
+    for mutation in [
+        ReplacementMutation::Immediate,
+        ReplacementMutation::SourceRegister,
+        ReplacementMutation::Operation,
+    ] {
+        let (mut func, ..) = layer_b_func();
+        let before = format!("{func:?}");
+        let mut pass =
+            CegisSuperoptPass::new(make_config(None)).with_test_hooks(CegisSuperoptTestHooks {
+                corrupt_replacement: Some(mutation),
+                ..Default::default()
+            });
+        let outcome = pass.run_with_outcome(&mut func);
+        let stats = pass.stats();
+        eprintln!("TCG_CEGIS_PASS_MUTATION layer=B {mutation:?}: {outcome:?} {stats:?}");
+        assert_eq!(
+            outcome,
+            CegisRunOutcome::Complete { committed: false },
+            "{mutation:?}"
+        );
+        assert_eq!(
+            (stats.layer_b_candidates, stats.verified, stats.rejected),
+            (1, 0, 1),
+            "{mutation:?}: {stats:?}"
+        );
+        assert_eq!(
+            (stats.verifier_errors, stats.timeouts, stats.panics),
+            (0, 0, 0),
+            "{mutation:?}: {stats:?}"
+        );
+        assert_eq!(format!("{func:?}"), before, "{mutation:?}");
+    }
+}

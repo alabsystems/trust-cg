@@ -6,7 +6,7 @@
 // Reads a `.ll` file, imports it to `trust_ir::Module`, and compiles through
 // `trust-cg-codegen` to a Mach-O object file.
 //
-// Contract (consumed by `scripts/run_llvm_test_suite.sh`):
+// Contract (consumed by the trust-cg-fuzz csmith/yarpgen drivers):
 //
 //   trust-cg-ws2-import <input.ll> <output.o>
 //   trust-cg-ws2-import --target aarch64-apple-darwin --opt-level 2 \
@@ -53,11 +53,10 @@ use trust_cg_codegen::compiler::{CompilationResult, Compiler, CompilerConfig, Co
 use trust_cg_codegen::pgo_runner::pgo_cache_key;
 use trust_cg_codegen::pipeline::OptLevel;
 use trust_cg_codegen::target::{Target, TargetSpec};
-use trust_cg_llvm_import::{Error, import_text};
+use trust_cg_llvm_import::{Error, RelocationModel, import_text_for_compile, read_module_text};
 use trust_cg_opt::pgo::{CounterMap, CounterSite, ProfData, build_profdata_from_counters_with_key};
 
 const WS2_APPLE_AARCH64_TARGET: &str = "aarch64-apple-darwin";
-const MAX_LLVM_IR_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 // AArch64 AOT counter loads/stores use a scaled unsigned 12-bit offset, so
 // the backend can address slots 0..=4095 and deliberately rejects larger maps.
 const PGO_MAX_COUNTER_SITES: usize = 4096;
@@ -211,23 +210,28 @@ fn read_bytes_with_limit<R: Read>(reader: R, limit: u64) -> std::io::Result<(Vec
     Ok((bytes, exceeded))
 }
 
-fn read_and_import_module(path: &Path) -> Result<(String, trust_ir::Module), Error> {
-    let input = fs::File::open(path)?;
-    let (bytes, exceeded) = read_bytes_with_limit(input, MAX_LLVM_IR_INPUT_BYTES)?;
-    if exceeded {
-        return Err(Error::Unsupported(format!(
-            "LLVM IR input '{}' exceeds importer limit {} while reading",
-            path.display(),
-            MAX_LLVM_IR_INPUT_BYTES
-        )));
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|error| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))?;
+/// Import the module at `path` for `target_spec` and `relocation_model`, the
+/// target and model it is compiled for: the target's triple, resolved as the
+/// compiler resolves an architecture-only spec, takes the place of the
+/// module's `target triple` (llc's `-mtriple`), and the model is llc's
+/// `-relocation-model`, so the importer's target- and model-dependent rules
+/// read the compile the object is built by.
+fn read_and_import_module(
+    path: &Path,
+    target_spec: TargetSpec,
+    relocation_model: RelocationModel,
+) -> Result<(String, trust_ir::Module), Error> {
+    let text = read_module_text(path)?;
     let module_name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("module");
-    let module = import_text(&text, module_name)?;
+    let module = import_text_for_compile(
+        &text,
+        module_name,
+        &target_spec.with_default_os_abi().triple(),
+        relocation_model,
+    )?;
     Ok((text, module))
 }
 
@@ -275,26 +279,37 @@ fn main() -> ExitCode {
         }
     }
 
-    let (input, module) = match read_and_import_module(&args.input) {
-        Ok(imported) => imported,
-        Err(Error::Unsupported(reason)) => {
-            // Agreed prefix with scripts/run_llvm_test_suite.sh.
-            eprintln!("unsupported: {reason}");
-            return ExitCode::from(1);
-        }
-        Err(Error::Parse { line, message }) => {
-            eprintln!("parse: line {line}: {message}");
-            return ExitCode::from(1);
-        }
-        Err(Error::Io(e)) => {
-            eprintln!("io: {e}");
-            return ExitCode::from(1);
-        }
-    };
+    // The driver compiles under the configuration's default relocation model
+    // (`static`, the one every object path admits), and imports for it.
+    let relocation_model = CompilerConfig::default().relocation_model;
+    let (input, module) =
+        match read_and_import_module(&args.input, args.target_spec, relocation_model) {
+            Ok(imported) => imported,
+            Err(Error::Unsupported(reason)) => {
+                // Stable prefix: a driver classifies this as `unsupported`.
+                eprintln!("unsupported: {reason}");
+                return ExitCode::from(1);
+            }
+            Err(Error::Parse { line, message }) => {
+                eprintln!("parse: line {line}: {message}");
+                return ExitCode::from(1);
+            }
+            Err(Error::Io(e)) => {
+                eprintln!("io: {e}");
+                return ExitCode::from(1);
+            }
+            // A trust-ir table or id space refused a row the import needed: an
+            // importer error (exit 1), not an unsupported feature, so it keeps
+            // its own prefix and a driver never classifies it as `unsupported`.
+            Err(Error::ModuleRefused(reason)) => {
+                eprintln!("module-refused: {reason}");
+                return ExitCode::from(1);
+            }
+        };
 
-    // O0 matches clang -O0 on the reference side. Target is AArch64
-    // because that's the fully functional backend on the host (Apple
-    // Silicon). The supported target boundary is stated in LIMITATIONS.md.
+    // O0 is the default; the command line selects the optimization level and
+    // target. PGO's narrower AArch64/O2-or-O3 boundary was checked above.
+    // LIMITATIONS.md describes the supported compilation subset.
     let cfg = CompilerConfig {
         opt_level: args.opt_level,
         target: args.target_spec.architecture,
@@ -308,7 +323,11 @@ fn main() -> ExitCode {
         // conservative defaults (no fast regalloc, no validation override).
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution: Default::default(),
         panic_unwind: false,
+        // The model the module was imported for (above).
+        relocation_model,
+        ..CompilerConfig::default()
     };
     // 2-pass AOT PGO wiring (env-driven; both unset = today's exact path).
     let pgo_producer_digest = if pgo_active {
@@ -334,7 +353,19 @@ fn main() -> ExitCode {
     };
     drop(input);
 
-    let mut compiler = Compiler::new_for_target_spec(cfg.clone(), args.target_spec);
+    // trust-ir codegen LICENSE (roadmap WS7.5, DG-73): the module was
+    // translated from LLVM IR, which has no licensing concept, so it carries
+    // no `body_gate`, and trust-cg's default policy now refuses a claim-less
+    // body. It compiles under the NAMED, COUNTED exception `LlvmImport`
+    // (census: trust-cg-lower
+    // `the_unlicensed_permit_exceptions_are_named_and_counted`), never under
+    // a silent default.
+    let mut compiler = Compiler::new_for_target_spec(cfg.clone(), args.target_spec)
+        .with_codegen_license(
+            trust_cg_codegen::CodegenLicensePolicy::default().with_unlicensed_permit_exception(
+                trust_cg_codegen::UnlicensedPermitException::LlvmImport,
+            ),
+        );
     let mut gen_sink: Option<Arc<Mutex<CounterMap>>> = None;
     if pgo_gen.is_some() {
         let sink = Arc::new(Mutex::new(CounterMap::new()));
@@ -892,8 +923,10 @@ fn load_pgo_profile(base: &str, key: &trust_cg_opt::CacheKey) -> Result<ProfData
         ));
     }
     let counters: Vec<u64> = raw
-        .chunks_exact(8)
-        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8)")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_le_bytes(*chunk))
         .collect();
 
     Ok(build_profdata_from_counters_with_key(key, &map, &counters))
@@ -997,6 +1030,15 @@ fn proof_report_json_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This file's fixtures are hand-built and carry no codegen license
+    /// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+    /// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+    /// them passes because it was silently refused.
+    fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+        trust_cg_codegen::CodegenLicensePolicy::default()
+            .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     use trust_cg_codegen::compiler::{
         CompilationMetrics, FsymTrustIrMetrics, ProofOptimizationMetrics,
@@ -1116,7 +1158,9 @@ mod tests {
             enable_fsym_trust_ir_preflight: false,
             enable_jit_fast_regalloc: false,
             jit_validation_mode_override: None,
+            jit_external_symbol_resolution: Default::default(),
             panic_unwind: false,
+            ..CompilerConfig::default()
         }
     }
 
@@ -1793,12 +1837,95 @@ mod tests {
         }
     }
 
+    /// The driver imports a module for the target it compiles for, which
+    /// takes the place of the module's `target triple` as llc's `-mtriple`
+    /// does: a `\01` asm label, which the importer reads only for a Mach-O
+    /// target, is read for `aarch64-apple-darwin` and refused for Linux, and
+    /// an architecture-only spec is read as the compiler resolves it (the
+    /// sixth verifier round of L02-P15).
+    #[test]
+    fn modules_are_imported_for_the_driver_target() {
+        let files = TestPgoFiles::new("import-target");
+        let path = files.directory.join("label.ll");
+        fs::write(
+            &path,
+            "target triple = \"aarch64-unknown-linux-gnu\"\ndeclare i64 @\"\\01_bar\"()\n",
+        )
+        .expect("write the module");
+        let apple = TargetSpec::parse(WS2_APPLE_AARCH64_TARGET).expect("Apple spec");
+        let (_, module) =
+            read_and_import_module(&path, apple, RelocationModel::Static).expect("a Mach-O label");
+        assert!(
+            module
+                .functions
+                .iter()
+                .any(|function| function.name == "bar")
+        );
+        let linux = TargetSpec::parse("aarch64-unknown-linux-gnu").expect("Linux spec");
+        let error = read_and_import_module(&path, linux, RelocationModel::Static)
+            .map(drop)
+            .expect_err("an ELF label");
+        assert!(
+            matches!(&error, Error::Unsupported(reason) if reason.contains("not Mach-O")),
+            "{error}"
+        );
+        let alias = TargetSpec::unknown_for_architecture(Target::Aarch64);
+        assert_eq!(
+            read_and_import_module(&path, alias, RelocationModel::Static).is_ok(),
+            cfg!(target_os = "macos")
+        );
+    }
+
+    /// The driver imports a module for the relocation model it compiles
+    /// under (`static`, the configuration's default): rustc's
+    /// `-C relocation-model=static` output reading an `extern` static (a
+    /// `dso_local` declaration whose address the code takes) imports for an
+    /// AArch64 Linux target, where llc's PC-relative reference and the
+    /// backend's GOT load are one address in every non-PIE link (LD-31), and
+    /// is refused for the Mach-O target, whose form was not compared.
+    #[test]
+    fn modules_are_imported_for_the_driver_relocation_model() {
+        assert_eq!(
+            CompilerConfig::default().relocation_model,
+            RelocationModel::Static
+        );
+        let files = TestPgoFiles::new("import-model");
+        let path = files.directory.join("extread.ll");
+        fs::write(
+            &path,
+            "@ext_data = external dso_local local_unnamed_addr global i64, align 8\n\
+             define i64 @read_ext() {\n  %v = load i64, ptr @ext_data, align 8\n  ret i64 %v\n}\n",
+        )
+        .expect("write the module");
+        let linux = TargetSpec::parse("aarch64-unknown-linux-gnu").expect("Linux spec");
+        read_and_import_module(&path, linux, RelocationModel::Static)
+            .expect("an addressed dso_local declaration under static on AArch64 ELF");
+        for (spec, model) in [
+            (linux, RelocationModel::Pie),
+            (linux, RelocationModel::Pic),
+            (
+                TargetSpec::parse(WS2_APPLE_AARCH64_TARGET).expect("Apple spec"),
+                RelocationModel::Static,
+            ),
+        ] {
+            let error = read_and_import_module(&path, spec, model)
+                .map(drop)
+                .expect_err("refused");
+            assert!(
+                matches!(&error, Error::Unsupported(reason)
+                    if reason.contains("global declaration `@ext_data` is `dso_local`")),
+                "{model:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn pgo_multi_function_generate_sidecar_to_use_compile() {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/revertBits_clang_o0.ll");
         let (input, module) =
-            read_and_import_module(&fixture).expect("import existing multi-function LLVM fixture");
+            read_and_import_module(&fixture, default_target_spec(), RelocationModel::Static)
+                .expect("import existing multi-function LLVM fixture");
         let config = test_config(OptLevel::O2, None);
         let key = pgo_compatibility_key(
             input.as_bytes(),
@@ -1809,6 +1936,7 @@ mod tests {
         let sink = Arc::new(Mutex::new(CounterMap::new()));
 
         let generated = Compiler::new_for_target_spec(config.clone(), default_target_spec())
+            .with_codegen_license(permit_unlicensed())
             .with_profile_generate(sink.clone())
             .compile(&module)
             .expect("multi-function profile-generate compile");
@@ -1853,6 +1981,7 @@ mod tests {
         }
 
         let used = Compiler::new_for_target_spec(config, default_target_spec())
+            .with_codegen_license(permit_unlicensed())
             .with_profile_use(profile)
             .compile(&module)
             .expect("multi-function profile-use compile");
@@ -1981,6 +2110,7 @@ mod tests {
             }],
         };
         let result = CompilationResult {
+            aarch64_frame_inputs: Vec::new(),
             object_code: vec![0, 1, 2, 3],
             metrics: CompilationMetrics {
                 code_size_bytes: 4,
@@ -1993,12 +2123,20 @@ mod tests {
                     ..ProofOptimizationMetrics::default()
                 },
                 fsym_trust_ir: FsymTrustIrMetrics::default(),
+                ..CompilationMetrics::default()
             },
             trace: None,
             proofs: None,
             certified_pass_chain: None,
             proof_optimization_certificates: vec![certificate],
             compile_artifact_cache_telemetry: Vec::new(),
+            target_selection: trust_cg_codegen::compiler::CompilerTargetSelection {
+                triple: "aarch64-apple-darwin".to_owned(),
+                origin: trust_cg_codegen::compiler::TargetSelectionOrigin::Explicit,
+            },
+            inline_only_bodies: Default::default(),
+            stack_limits: None,
+            dialect_legalization: None,
         };
 
         let report = proof_report_json_value(

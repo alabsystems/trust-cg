@@ -1,0 +1,754 @@
+Tensor gather/scatter and weight-blob wire70 intake, 2026-11-14:
+  Target IR: 96f7ff19a7e68ae68ad2bfbd08054be91e465015
+  Co-owned Clean: 550ad0858df6a00c61a7cdabc7f37fa0bc975258
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  All64 top-level binary/JSON pairs copied from exact immutable Git blobs:
+  new tensor_gather_scatter (v69) and tensor_weight_blob (v70), and the 59
+  JSON twins whose bytes changed since cffe8d25 (each now spells the
+  always-serialized closure_layouts table).
+  New tensor payloads remain DATA: every tensor instruction,
+  Constant::TensorBlob and non-empty Module::blobs is refused by name; no
+  native tensor lowering or weight-blob placement is claimed.
+  Frozen compat_v22_composition and inherited fixtures remain unchanged.
+  Atomic pin/inventory/corpus guards and native consumers remain required.
+
+Needed-prefix proof producer / coherent wire68 intake, 2026-11-14:
+  Target IR: cffe8d25477529bc1460e5d9b036192566e01190
+  Co-owned Clean: 550ad0858df6a00c61a7cdabc7f37fa0bc975258
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  All62 top-level binary/JSON pairs copied from exact immutable Git blobs.
+  Upstream unpaired native-request/proof-lineage/vector-oracle metadata JSON
+  is outside this module payload inventory; it is not vendored as a module.
+  New tensor_map_reduce_view payload remains DATA, with no native lowering.
+  Frozen compat_v22_composition and inherited fixtures remain unchanged.
+  Atomic pin/inventory/corpus guards and native consumers remain required.
+
+Conditional producer DATA / current public source intake, 2026-11-13:
+  Target IR: e664453c489b61a2d1b4bd52845690e9f1759394
+  Co-owned Clean: 550ad0858df6a00c61a7cdabc7f37fa0bc975258
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  All60 top-level binary/JSON pairs are byte-identical to this exact public
+  commit through the maintained source-cache authority and Git OID checks.
+  The separate compat_v22_composition control retains its prior bytes.
+  Source-value conditional DATA is independently vendored under
+  tests/fixtures/trust_ir_source_value, with complete source/proof records.
+  Corpus counts, wire66, guards and proof/native refusals remain unchanged.
+  Normal atomic pin and actual affected consumer qualification remain required.
+
+Finite CPS-prefix / current-kernel intake, 2026-11-13:
+  Target IR: bd95fb312fe37c013288a0d9fcfd5ad43842801d
+  Co-owned Clean: 550ad0858df6a00c61a7cdabc7f37fa0bc975258
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  All 60 top-level binary/JSON pairs match that immutable target's Git blobs.
+  Only certificate_binding.{tmbc,json} changes, copied verbatim from upstream
+  maintained current-kernel fixture regeneration.
+  Every other golden and the frozen compatibility refusal retain their bytes.
+  No corpus counts, expected verdicts, proof policy, source license or cap change.
+  The guarded cohort transaction and ordinary native/proof consumers still run.
+
+Canonical checked readonly-call / kernel intake, 2026-11-12:
+  Target IR: 81a6f0cf41ab153e3260c95a0db53592cc34e9a4
+  Co-owned Clean: 550ad0858df6a00c61a7cdabc7f37fa0bc975258
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  The upstream maintained generator refreshed only certificate_binding for
+  the actual new kernel lineage/environment identities. Copy its exact public
+  binary/JSON Git blobs through native Agh; do not hand-edit certificate data.
+  All60 top-level binary/JSON pairs equal the immutable target; the separate
+  compat_v22_composition control retains its prior bytes. All other payloads
+  retain their prior bytes. Wire66, counts and every old refusal stay fixed.
+  This is source-data custody, not a transferred proof or native grade. The
+  normal canonical pin owner and actual affected consumers must still pass.
+
+Canonical closure-origin wire66 intake, 2026-11-12:
+  Target IR: 90c58078c6323c6e3dc4475520a2361d4680a009
+  Co-owned Clean: 86978067f1503784f3ae3b65c786580d4da1cf62
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  The maintained upstream generator adds closure_frame_origin.tmbc/json.
+  Copy those exact immutable Git blobs; all59 prior binary/JSON pairs remain
+  byte-identical. There are60 pairs and exactly one newest wire66 payload.
+  New binary151 bytes SHA256 dc14f51b417ab4d3f8ae6400b28dd61b2185807cd79f69beab9729a5e242db65.
+  The frame has a nominal Rust origin, zero captures and no functions, globals,
+  certificate, codegen license or callable target. It adds serialization data,
+  not execution or source/proof authority. Preserve every prior named refusal.
+  Canonical fresh source authority and all backend corpus/container/native
+  consumers must execute before ordinary source publication.
+
+Stored closure source intake, 2026-11-12:
+  Target IR: 627e5ceac5517f948d02c89360c1c14de0bc64e1
+  Co-owned Clean: 86978067f1503784f3ae3b65c786580d4da1cf62
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  All59 top-level binary/JSON pairs equal the immutable target Git blobs.
+  No fixture bytes are regenerated or modified. The new optional nominal
+  closure-origin surface raises the module reader to wire66; origin-absent
+  historical goldens retain their exact previous versions and bytes.
+  This local source-DATA audit adds no fresh network, native or proof grade.
+  Canonical fresh authority, pin/inventory/container/corpus and actual native
+  stored-frame consumers must pass before ordinary source publication.
+Symbolic enumeration / coherent kernel intake, 2026-11-12:
+  Target IR: 5906322cf597dabc8ef2358d99e8335c2229a5a6
+  Co-owned Clean: 86978067f1503784f3ae3b65c786580d4da1cf62
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  All59 top-level binary/JSON golden pairs remain byte-identical to the
+  preceding a43891b6 cohort and the immutable target. Four unpaired historical
+  JSON controls remain unchanged. No fixture payload, expected count, guard,
+  source policy or cap changes. The canonical owner and source-only train
+  still execute their checks; this intake creates no attestation grade.
+
+Ordinary loop-image / forward-kernel intake, 2026-11-12:
+  Target IR: c4fe79906a991ffc5cc464fe189291057c5b60cd
+  Co-owned Clean: 0592c55d4dc274f798451de914043cf65cc2a494
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  All59 top-level binary/JSON golden pairs equal the immutable target bytes.
+  Four unpaired historical JSON controls remain unchanged; they are not the
+  paired module goldens. No certificate payload is hand-edited or regenerated.
+  Canonical pin/inventory/container/corpus guards still must execute.
+  No proof/native/source-model authority follows from this source intake.
+
+Ordinary source cohort requalification, 2026-11-10:
+  Target IR: 3490944264616b6ff86ec64d039e7c22f8fb3a5e
+  Co-owned Clean: 83d1c29f21e6fe2c4505555853751cf3d600442c
+  AY remains: add70f658ebe48a4d6a112a68a9d2866dab68970
+  The entire TrustIR conformance source is byte-identical to the preceding
+  81b1fa6b63c100e2cd365d681085adb6db8c9f60 cohort. Existing corpus/census,
+  container and refusal guards passed against the new immutable target.
+  No fixture payload was regenerated or modified here. Original producer
+  provenance below is retained; this source intake adds no attestation grade.
+  See reports/2026-11-10-uniform-ir-clean83-cohort for scoped qualification.
+
+Canonical BitVec-kernel certificate intake, 2026-11-10:
+  Source commit: 6e84a736a58831de9aa6059acf653fe78b44152b
+  Only certificate_binding.{tmbc,json} differs from the previous corpus.
+  Exact immutable target bytes are copied after maintained fixture regeneration
+  and separate strict four-format replay at the selected kernel. All other
+  top-level pairs and frozen compat controls remain unchanged.
+
+Canonical SingleInhabited65 intake, 2026-11-09:
+  Source commit: ed99d57c33de34f142c7d51d59b14e4ed172e1f6
+  Every one of the 59 top-level binary/JSON pairs equals that immutable
+  TrustIR source. Only single_inhabited_enums.{tmbc,json} is new relative
+  to the preceding cohort; every old pair, including certificate_binding,
+  and the frozen compat22 refusal control remains byte-identical.
+  The new v65 fixture retains empty nominal enum declarations and names the
+  sole inhabited payload explicitly at either declared variant position.
+  This is source-byte provenance; no proof grade or source license is added.
+
+Canonical Storage64 intake, 2026-11-07:
+  Source commit: 432f7642cdb02251e3de34e04f3dad35ec767bda
+  All58 top-level conformance binary/JSON pairs were copied from immutable
+  Git objects and SHA256-recorded in reports/2026-11-07-field-storage-cohort-intake/fixture-identity.json.
+  Only storage_only.{tmbc,json} are new; every old pair and frozen compat22
+  remains byte-identical. Storage's bare header64/root body_gateNone retains
+  the named producer-omission refusal. No source license or grade is added.
+
+Vendored binary trust-ir module fixtures for the TRUST_IR container gate
+(roadmap increment WS7.4, finding F-115). Read by
+crates/trust-cg-codegen/tests/trust_ir_binary_container.rs and
+crates/trust-cg-cli/tests/trust_ir_binary_container.rs.
+
+conformance/
+  Vendored from: alabsystems/trust-ir
+  Source commit: eb5d764e0efea54221c87f6dee49b2f4a78ce8e4
+  Source path:   crates/trust-ir-conformance/tests/fixtures/<name>.{tmbc,json}
+  Every top-level .tmbc fixture at that commit with its JSON twin, unchanged
+  (57 fixtures; copied from immutable Git objects in trust-ir). The .tmbc
+  files are BARE canonical trust-ir binary (magic
+  "TRUST_IR"), not trust-cg's tMBC envelope, despite the extension.
+  Re-vendored 2026-11-07 for exact published Clean6c8fda90/kernel69b:
+  IR eb5d764e0efea54221c87f6dee49b2f4a78ce8e4 genuinely regenerates the
+  bound certificate through its maintained current-kernel producer. The old
+  stored positive is retained with its actual CLI refusal; current all-policy
+  production and subsequent read-only stored replay check both certificates
+  in all four formats. Only two environment digests and their derived lineage
+  digests differ (127 changed bytes). Bodies/statements/proof/source/import/
+  gate data and v61 header are unchanged. Copy the exact binary/JSON pair; all
+  114 corpus files now match that immutable IR commit. No expected verdict,
+  source/body license, grade, refusal or denominator changes.
+
+  Historical refresh 2026-11-07 for exact Clean C0
+  27154040c7f1a31239886712c05176d3ef01c101: IR f8441bcbe018377bb78dfa5f518b8dd225eff172
+  regenerates certificate_binding with the genuine canonical generator. Its
+  two environment digests and matching v8 lineage bindings change; bodies,
+  obligations, body-gate evidence and binary v61 are unchanged. All four
+  upstream stored formats replay both kernel certificate references, with
+  environment/statement/callee binding mutations refused. This consumer
+  copies the exact binary/JSON pair; every other one of the 57 pairs was
+  compared byte-for-byte to that immutable IR commit and is unchanged.
+  The existing positive verdict and all refusal/denominator checks remain.
+
+  compat_v22_composition.tmbc is compat/v22_composition.tmbc: a real v22 blob,
+  below the pinned reader's v23 floor, kept as a refusal control.
+  Re-vendored 2026-10-29 for the lattice train to Clean 55410ba0b: trust-ir
+  9feac032 (in 1e05bd01) re-blessed certificate_binding for that Clean's prelude
+  environment (R168 moves the environment digest its two certificates bind),
+  so certificate_binding.{tmbc,json} are copied from it; all 56
+  canonical .tmbc files and their 56 JSON twins then equal immutable Git
+  objects at 1e05bd01. The v22 refusal control is unchanged. This byte check
+  is not Linux execution credit.
+
+  Historical check 2026-10-25: all 56 .tmbc files and their JSON twins equal
+  immutable Git objects at 553bde17941812414b66219c5462f16c6b553e7a.
+  Checked 2026-10-25 after ordinarily merging CG main 852f6e3bf:
+  all 56 canonical .tmbc files and their 56 JSON twins equal immutable Git
+  objects at 553bde17. The upstream Clean be021965d move changes no fixture
+  bytes from b5782bd0; no fixture or checksum value is edited by this check.
+  The v22 refusal control is unchanged. This is not Linux execution credit.
+
+  Historical check 2026-10-24 after ordinarily merging CG main c09d597d6:
+  all 56 canonical .tmbc files and their 56 JSON twins equal immutable Git
+  objects at b5782bd0. Upstream already re-vendored certificate_binding for
+  Clean e3228bc5d; no other fixture differs from 1395d068. The v22 refusal
+  control is unchanged. This byte check is not Linux execution credit.
+
+  Historical check 2026-10-24 after main8fa's IR1395/Clean1da move: all 56
+  canonical .tmbc fixtures and their 56 JSON twins match immutable Git
+  objects at 1395d068. The existing certificate_binding pair already carries
+  that pin's Clean environment; no fixture bytes change in this check. The
+  v22 refusal control remains unchanged. The previously copied files retain
+  their historical provenance below.
+  Historical candidate ef069954 (typed float model repair) had the same corpus,
+  38 template files and 235 must-refuse files as 1395d068. This comparison
+  does not adopt that candidate or replace the seven-guard pin transaction.
+
+  Re-vendored 2026-09-23 from d41fa3f8 (33 fixtures): every .tmbc present at
+  both commits is byte-identical; trust-ir renamed body_gate_v41 to body_gate
+  and ty_handle_v43 to ty_handle (same bytes), added the v44/v45 fixtures
+  import_scheme and abi_{calling_conv,enum_tag_repr,function_symbol,
+  param_facts} plus lean_library_envelope and text_directives, and re-emitted
+  every JSON twin with the fields its newer serializer writes.
+  Re-vendored 2026-09-23 from 7b9146ba (40 fixtures): every .tmbc present at
+  both commits is byte-identical; trust-ir added spec_carrier (the typed spec
+  carrier, wire v46) and re-emitted seven JSON twins (chc_batch,
+  frontend_emission_subset, frontend_panic_obligations,
+  lean_library_envelope, proof_annotations, proof_diagnostics,
+  text_directives) with the fields its newer serializer writes.
+
+  Re-vendored 2026-09-24 from 4f09dab8 (41 fixtures): no fixtures added or
+  removed; all 42 conformance .tmbc files, including the v22 refusal control,
+  are byte-identical. Thirty-nine JSON twins now explicitly carry the empty
+  tuple_layouts field required by the new serializer; abi_param_facts and
+  declared_tuple_v42 already carried that field and remain unchanged. No
+  completeness claim is added: absent completeness still means no claim.
+
+  Re-vendored 2026-09-27 from 066e1765a244f29ef75fdb332476b48c74c7333f
+  (42 fixtures): every previously vendored .tmbc and JSON twin, including the
+  v22 refusal control, is byte-identical; trust-ir added array_splat (the v50
+  `Constant::Splat` / `Inst::ArraySplat` golden, header 50), vendored here
+  with its JSON twin. It is at the pinned writer's wire version (50), so
+  pinned_writer/ is not regenerated: crystal_lane_v49 keeps its v49 header.
+
+  Checked 2026-09-27 at the pin move to
+  7b0947ee92d808799b254465f049aeb8af5e96f6 (no wire change): `git diff
+  --name-status 066e1765 7b0947ee -- crates/trust-ir-conformance/tests/fixtures`
+  lists only must-refuse rows under refuse/, which are not vendored here, so
+  every vendored fixture is still the source commit's bytes; nothing re-vendored.
+
+  Re-vendored 2026-09-30 at the pin move to
+  9674bea5c017bfdddd2e7bc91b40b793d90607a3 (43 fixtures): every previously
+  vendored .tmbc and JSON twin, including the v22 refusal control, is
+  byte-identical at that commit (87 files compared); trust-ir added
+  inst_wire_batch (the v51 INST wire batch golden: MakeAggregate, MemCopy,
+  MemSet, RotL/RotR/FCopySign, CtLz/CtTz/BSwap/BitReverse; header 51),
+  vendored here with its JSON twin. It is at the pinned writer's wire version
+  (51) and carries that version for the container tests, so pinned_writer/ is
+  not regenerated: crystal_lane_v49 keeps its v49 header.
+
+  Re-vendored 2026-10-01 at the pin move to
+  8cf20223fe15916cb9df3a2f310c0b5a1cbb4a6b (45 fixtures): every previously
+  vendored .tmbc and JSON twin is byte-identical at that commit (86 files
+  compared; the v22 refusal control is TrustCG's own). trust-ir added
+  assert_kind (the v52 golden: `Inst::Assert` names the Rust panic its
+  failure is, d3b92867; header 52) and proof_surface (the WS4.4 proof-surface
+  golden, 29b000de; header 41), both vendored here with their JSON twins. The
+  v52 adoption (acb3403fe) moved the pinned reader to v52 without this
+  re-vendor, so the two container tests that require a vendored fixture at
+  the pinned writer's version were red on trust-cg main; assert_kind now
+  carries that version, so pinned_writer/ is not regenerated:
+  crystal_lane_v49 keeps its v49 header.
+
+  Re-vendored 2026-10-01 at the pin move to
+  8a0d54c0481355da303a1b829f57158f6d1fee00 (46 fixtures): every previously
+  vendored .tmbc and JSON twin is byte-identical at that commit (90 files
+  compared; the v22 refusal control is TrustCG's own). trust-ir added
+  call_unwind_boundary (the v53 golden: `Inst::CallCannotUnwind` /
+  `Inst::CallIndirectCannotUnwind`, the enforce-or-refuse non-propagating
+  call boundary, ade6c31c; header 53), vendored here with its JSON twin. It
+  carries the pinned writer's version (53), so pinned_writer/ is not
+  regenerated: crystal_lane_v49 keeps its v49 header. This backend refuses
+  both boundaries by name on the adapter's shared floor.
+
+  Re-vendored 2026-10-02 at the pin move to
+  6f2dfce645cc1dcb61d12f789b843d1338fa8b5a (48 fixtures): every previously
+  vendored .tmbc is byte-identical at that commit, as are all JSON twins but
+  two: assert_kind.json and inst_control.json, which the v54 serializer
+  re-emits with each assert's `kind` written out (`"kind": "Unspecified"`,
+  previously skipped), refreshed here. trust-ir added the two v54 panic-site
+  goldens (amendment P: a sited `Inst::Assert` and the `Inst::AssertInvoke`
+  terminator, header 54), assert_panic_site and assert_invoke, vendored here
+  with their JSON twins. assert_panic_site carries the pinned writer's
+  version (54), so pinned_writer/ is not regenerated: crystal_lane_v49 keeps
+  its v49 header. This backend refuses both panic-site spellings by name on
+  the adapter's shared floor.
+
+  Re-vendored 2026-10-02 at the pin move to
+  0be81d5c207bd8c74f9386ad2e2a805548d4546c (50 fixtures): every previously
+  vendored .tmbc, including the v22 refusal control (TrustCG's own), is
+  byte-identical at that commit; every JSON twin is refreshed, because the
+  amendment-D serializer ALWAYS writes `"completeness": null` (the field is no
+  longer the trailing skipped one; `drop_glue` follows it), the only change in
+  each. trust-ir added the v55 golden drop_glue (the module drop-glue table and
+  `Inst::DropInvoke`, header 55) and the v56 golden unwind_twins
+  (`Inst::InvokeIndirect`, header 56), vendored here with their JSON twins.
+  unwind_twins carries the pinned writer's version (56), so pinned_writer/ is
+  not regenerated: crystal_lane_v49 keeps its v49 header. This backend refuses
+  `Inst::DropInvoke` and `Inst::InvokeIndirect` by name on the adapter's shared
+  floor; the drop-glue table is carried inert.
+
+  Checked 2026-10-02 at the pin move to
+  2a9aedaef50bc4a8971bb6af0fdab7bd695a3486 (a wire reservation only: `git diff
+  --name-status 0be81d5c 2a9aedae -- crates/trust-ir-conformance/tests/fixtures`
+  lists nothing), so every vendored fixture is still the source commit's bytes;
+  nothing re-vendored.
+
+  Checked 2026-10-02 at the pin move to
+  fb477354c726f2d05f3d7b69c383bfa4e80dbc4b (the layout table: no wire change;
+  `git diff --name-status 2a9aedae fb477354 --
+  crates/trust-ir-conformance/tests/fixtures` lists nothing); nothing
+  re-vendored.
+
+  Checked 2026-10-02 at the pin move to
+  0f24392586995a5f8404df02129310d9d67353e7 (amendment S, v57: level-S
+  generic templates). `git diff --name-status fb477354 0f243925 --
+  crates/trust-ir-conformance/tests/fixtures` adds only template fixtures
+  (templates/, refuse_templates/, compat/template_ident_param, all `.tmbs`
+  template blobs or their twins) and three module must-refuse rows under
+  refuse/, none of which is vendored here; no top-level fixture changed, so
+  every vendored fixture is still the source commit's bytes; nothing
+  re-vendored. v57 is a template blob's version floor that no module writes,
+  so the newest MODULE version stays v56, carried by unwind_twins
+  (`NEWEST_MODULE_VERSION` in crates/trust-cg-codegen/tests/
+  trust_ir_binary_container.rs); pinned_writer/ is not regenerated.
+
+  Checked 2026-10-05 at the pin move to
+  137e2b55d34e64155dec2ba6c75ef671c2c697c1 (typed LAUNDER in analysis /
+  function_dependencies, trust-ir-conformance generator and trust-ir-diff
+  fixes: no wire change; `git diff --name-status 0f243925 137e2b55 --
+  crates/trust-ir-conformance/tests/fixtures` lists nothing); nothing
+  re-vendored.
+
+  Re-vendored 2026-10-07 at the pin move to
+  695fcf510e047fac392b952e7d9d8432d7018fc3 (52 fixtures): every previously
+  vendored .tmbc, including the v22 refusal control (TrustCG's own), is
+  byte-identical at that commit; every JSON twin is refreshed, because the
+  v58 serializer ALWAYS writes `"drop_glue": []` (the field is no longer the
+  trailing skipped one; `closure_layouts` follows it), the only change in
+  each. trust-ir added the two v58 goldens (header 58), closure_layout (a
+  declared closure frame, `Module.closure_layouts`) and nominal_type_origin
+  (`StructDef.origin` / `EnumDef.origin`), vendored here with their JSON
+  twins. They carry the pinned writer's version (58), the newest MODULE
+  version again (v57 is the template floor), so pinned_writer/ is not
+  regenerated: crystal_lane_v49 keeps its v49 header. This backend refuses a
+  declared closure layout by name on the adapter's shared floor
+  (`DeclaredClosureLayoutUnsupported`, OD-145).
+
+  Checked 2026-10-07 at the pin move to
+  d23ded062392801b8cdaaaab009351c4ab76746b (the trust-ir codec's module-format
+  resolver, module-diff fingerprinting, and Clean world-constructor proof
+  construction in trust-ir-build: no wire change; `git diff --name-status
+  695fcf51 d23ded06 -- crates/trust-ir-conformance/tests/fixtures` lists
+  nothing), so every vendored fixture is still the source commit's bytes;
+  nothing re-vendored. The newest module version stays v58, so
+  pinned_writer/ is not regenerated.
+
+  Checked 2026-10-07 at the pin move to
+  c44f6e94f7c42519b94e1a78591fe5fe59a042f3 (Clean byte-site metadata reuse
+  and closed memory and empty-branch transports, all in trust-ir-build's
+  core_execution modules: no change under crates/trust-ir/src, no wire
+  change; `git diff --name-status d23ded06 c44f6e94 --
+  crates/trust-ir-conformance/tests/fixtures` lists nothing), so every
+  vendored fixture is still the source commit's bytes; nothing re-vendored.
+
+  Checked 2026-10-07 at the pin move to
+  0faf3c27d4246cfc936833f1adb683a99ce4f28b (strict byte-run composition in
+  trust-ir-build's core execution; canonical text now carries a switch's
+  `exhaustive_enum_unreachable` as a trailing ` exhaustive` keyword, WS4.5;
+  `git diff --name-status c44f6e94 0faf3c27 --
+  crates/trust-ir-conformance/tests/fixtures` lists nothing); nothing
+  re-vendored.
+
+  Checked 2026-10-08 at the pin moves to
+  a1eed445629182cd721e107d092ed49fe4fa6d82 (strict-composition lint
+  evidence bound to its retained digest) and
+  588390da827167e50818985d40d75f61199da501 (shared endpoint conversion
+  and closed conditional branches in trust-ir-build's core execution, and
+  the bit-exact module merger `merge_into` in trust-ir-build, WS4.11),
+  re-read when the wasm32 round-17 branch merged them: `git diff
+  --name-status c44f6e94 588390da -- crates/trust-ir-conformance/tests/fixtures`
+  lists nothing, and under crates/trust-ir/src only a doc comment of
+  `Switch::exhaustive_enum_unreachable` changes (the ` exhaustive` text
+  keyword the parser already read at c44f6e94); no wire change, so every
+  vendored fixture is still the source commit's bytes; nothing re-vendored.
+  The newest module version stays v58, so pinned_writer/ is not
+  regenerated.
+
+  Re-vendored 2026-10-10 at the pin
+  54682f96120aef15d7b3cba06809f93bc796c21e (54 fixtures): `git diff
+  --name-status 588390da 54682f96 -- crates/trust-ir-conformance/tests/fixtures`
+  adds, at top level, the two goldens effect_summaries (WS1.14 typed effect
+  summaries, 1d31d4c0; header 59) and typed_signature_abi (checked source ABI
+  placement, 1ede2d9e; header 60), vendored here with their JSON twins; the
+  other additions are must-refuse rows under refuse/ and JSON-only fixtures
+  with no .tmbc twin, none vendored here. Every previously vendored .tmbc and
+  JSON twin is byte-identical at 54682f96. typed_signature_abi carries the
+  pinned writer's version (60), the newest MODULE version, so pinned_writer/ is
+  not regenerated: crystal_lane_v49 keeps its v49 header. The pin had reached
+  v60 without this re-vendor, so the two container tests that require a
+  vendored fixture at the newest version, and the version-chain pin, were red
+  on trust-cg main.
+
+  Checked 2026-10-10 at the pin move to
+  1a3d10635baa6b356707ca86dff4ed11c42b3f6a (named-only inward reuse in
+  trust-ir-build: no change under crates/trust-ir/src and `git diff
+  --name-status 54682f96 1a3d1063 -- crates/trust-ir-conformance/tests/fixtures`
+  lists nothing), so every vendored fixture is still the source commit's
+  bytes; nothing re-vendored.
+
+  Checked 2026-10-10 at the pin move to
+  1a0d08493df1ce4daae2b4c9046831355b05e4bb (finite-prefix simulation in
+  trust-ir-build's core execution: `git diff --name-only 1a3d1063 1a0d0849`
+  touches only README.md and crates/trust-ir-build, so no fixture and no wire
+  version changes); nothing re-vendored.
+
+  Re-vendored 2026-10-14 at the pin move from
+  461d5439c58c60f72b949abf1319a95ded266da8 to
+  cb6397762d73f19f0ef8e290a019927afc8c38f4 (55 fixtures): `git diff
+  --name-status 461d5439 cb639776 -- crates/trust-ir-conformance/tests/fixtures`
+  adds, at top level, the v61 golden certificate_binding (wire v61
+  `certificate-binding`, the WS6.7 wire line 7c4cab5d..827056dd: a bound
+  `CleanCicKernelRecheck` and `Gated` licenses carrying `GateEvidence`;
+  header 61), vendored here with its JSON twin; the other additions are two
+  must-refuse rows under refuse/ and the golden's msgpack/text forms, none
+  vendored here. Every previously vendored .tmbc and JSON twin (108 files,
+  the v22 refusal control excluded) is byte-identical at cb639776.
+  certificate_binding carries the pinned writer's version (61), the newest
+  MODULE version, so pinned_writer/ is not regenerated: crystal_lane_v49
+  keeps its v49 header.
+  The trust-cg CLI compiles certificate_binding (both `clean-kernel-tv`
+  licenses carry `GateEvidence` that holds), and from this pin refuses
+  lean_library_envelope, whose pre-v61 `clean-kernel-tv` license records no
+  evidence (`UnevidencedGate`, decision record OD-V61-GATE-EVIDENCE-20261014).
+
+  Re-vendored 2026-10-16 at the pin dc2b80739ea947557a34b59a10f6c8510e690de7
+  (56 fixtures; the pin moves cb639776 -> 8d304e36 -> dc2b8073 re-vendored
+  nothing). `git diff --name-status cb639776 dc2b8073 --
+  crates/trust-ir-conformance/tests/fixtures` (refuse/ aside) modifies
+  certificate_binding in its four forms and adds param_pointee_place in
+  four; every other vendored .tmbc and JSON twin is byte-identical at
+  dc2b8073.
+  - certificate_binding.{tmbc,json} refreshed: trust-ir 11a23715 (inside
+    8d304e36, "pin: Clean 80f09a7e9") regenerated the golden because Clean's
+    prelude grew (2,151 -> 2,161 constants), which moves the two
+    certificates' binding-environment digests and the lineage digests over
+    them; the proof terms are byte-identical. The cb639776 bytes carried the
+    old digests, so under the pinned Clean their certificates were not
+    kernel-replayed and the admission refused `double` ("the
+    clean_backend_tv certificate of TranslationValidation obligation 0 was
+    not kernel-replayed in this validation pass"). The dc2b8073 bytes compile
+    under the default license and under `--permit-unlicensed`, from binary
+    and JSON alike.
+  - param_pointee_place added with its JSON twin: the v62 golden (the
+    entry-state pointee clause place `ParamPointeeEntry`, header 62). It
+    carries the pinned writer's version (62), so pinned_writer/ is not
+    regenerated: crystal_lane_v49 keeps its v49 header. The CLI refuses it
+    as affirmatively ungated (`bump`, `body_gate: ungated`).
+  Decision record LD-81.
+
+  Checked 2026-10-17 at the pin move to
+  6382da385e2652576e69a92448070937bfdc2d11 (trust-ir's Clean pin moves to
+  e05c6fdd6, the kernel fix that finds an inductive's result level up to
+  whnf): `git diff --name-status dc2b8073 6382da38 -- crates/trust-ir-conformance
+  crates/trust-ir/src crates/trust-ir-build/src` lists nothing, so every
+  vendored fixture is still the source commit's bytes; nothing re-vendored.
+  certificate_binding still compiles under the moved Clean: trust-ir's
+  certificate_binding goldens, which embed the kernel environment digest,
+  are byte-identical at 6382da38. Decision record LD-PIN6382-1.
+
+clean/
+  lean_library.tmbc is the Clean-lowered (every function Producer::Clean)
+  Lean library module: the bytes of module_binary_hex in
+  reports/2026-09-17-two-language-proof-program/parta-lean/out/lib.irlib.json
+  at trust-ir commit f9e85d43 (sha256 below equals that envelope's
+  module_sha256). It is the exact artifact the LEAN.consumer.binary_container
+  row fed to trust-cg. lean_library.json was copied from out/lib.json at the
+  same historical commit: the trust-ir CLI's JSON conversion of those bytes
+  (original JSON sha256:
+  9ad6d61563bd928997a199ced0bdaca4c5f8218205a4965c97e37cfc972d1c13).
+  Its 2026-09-24 schema-only refresh adds only an empty tuple_layouts field,
+  matching the serializer at 29744d5f950da6f65360ba6d64efc73f79371ca6.
+  All other JSON bytes and the historical .tmbc bytes remain unchanged; no
+  new lowering, completeness claim, or proof is asserted by this refresh.
+
+pinned_writer/
+  crystal_lane_v49.{tmbc,json}: the one fixture written at the pinned
+  reader's wire version when the pin moved to trust-ir
+  794227ad0df4656634a7906825e242e0edc20aa1 (2026-09-26). No trust-ir
+  conformance fixture is newer than v46 at that commit, so this one is
+  GENERATED, not vendored: a hand-authored JSON module (one `ungated` bodied
+  function whose body is a (i64, i64) `Const` with an unwritten lane, a
+  `drop i64`, and a `cmpxchg weak`) converted by that commit's own CLI,
+  built from `git archive 794227ad` with `targo --unverified build --locked
+  -p trust-ir-cli`:
+    trust-ir convert --from json --to bin authored.json crystal_lane_v49.tmbc
+    trust-ir convert --from bin --to json crystal_lane_v49.tmbc crystal_lane_v49.json
+  The .tmbc header is v49; the JSON twin is the CLI's conversion of those
+  bytes and equals the authored module. `trust-ir validate` at that commit
+  reports it well-formed (v41 producer rule checked): the validator accepts
+  all three constructs. The trust-cg CLI refuses it, from binary and JSON
+  alike, by the codegen license (`body_gate: ungated`), which it checks
+  first; the adapter floor's by-name refusal of each construct
+  (AdapterError::UnmodeledTrustIrConstruct) is pinned by trust-cg-lower
+  tests/pin_move_floor.rs.
+
+When the trust-ir pin moves, re-vendor conformance/ from the new pin and
+refresh this list; when the new pin's writer is newer than every vendored
+fixture, regenerate pinned_writer/ with that pin's CLI. Do it before the move:
+scripts/bump_trust_ir_pin.py runs both container targets as guards and rolls
+back a move that leaves them red, and the codegen target's
+the_vendored_conformance_fixtures_are_the_pinned_corpus_bytes requires
+conformance/ (compat_v22_composition.tmbc aside) to be exactly the pinned
+corpus's top-level .tmbc goldens with their .json twins, byte for byte
+(decision record LD-84).
+
+Revalidated 2026-10-20 against 9a15a7ac: conformance source tree
+09b7ea8873882248d7f4fe5155e3343d9face6e3 is unchanged from the previous
+6382da385e pin. All current goldens and JSON twins match the pinned corpus;
+the frozen v22 refusal remains additional to its top-level fixtures.
+
+Re-vendored 2026-10-20 for the coordinated Clean kernel cohort at
+5ba91a986ecda7f1aefe79b8203201ed822c5903: source fixture tree
+9b0639962b283f140da82c30e086430eb0ad4345, with 56 top-level binary
+fixtures and their JSON twins. Only certificate_binding.json and
+certificate_binding.tmbc differ from the previous 9a15a7ac corpus.
+These are the exact canonical upstream bytes re-minted by its real
+bound-certificate producer for Clean 1e1baba3 and kernel 43a8446; no
+certificate or environment binding is edited here. The other 110 files,
+the frozen v22 refusal and pinned_writer/ remain byte-identical. The
+wire versions and refusal/corpus denominators do not change.
+
+Revalidated 2026-10-20 at the standalone-feature repair pin move to
+26050b47317f8dc8f4b3e581bdd9283039b9947d: conformance source tree
+9b0639962b283f140da82c30e086430eb0ad4345 is unchanged from 5ba91a98.
+All 112 canonical binary/JSON files and the five frozen compatibility,
+Clean and pinned-writer files remain byte-identical. The upstream source
+repair imports native request types from their unconditional request::
+owners; it changes no wire version, corpus denominator or kernel binding.
+No fixture, certificate or admission rule is rewritten for this move.
+
+Current vendored byte SHA256 (2026-11-07, source eb5d764e):
+c492fe31d2ac79474188b0741469d04bf0c1fc34a185363c31cbf7dada782011  ./clean/lean_library.json
+7eba879961ce6bc7b119a18f53cc1b03a9d172526314feba16020854d3cfe20d  ./clean/lean_library.tmbc
+2bba8a8981de77d29a068e0e87863d565088eb2ec4a464fef527c1badbb5c701  ./conformance/abi_calling_conv.json
+dafcac138fa93ffa342247715ffe2547e6cf344769401c3b2d75908fbb7bbd40  ./conformance/abi_calling_conv.tmbc
+261dc634c4e6580b9b6b03a25aa06f5d18e998d3d5fab71f45a1dfe1cd1dc194  ./conformance/abi_enum_tag_repr.json
+b667dc2c6b2a4b6c08776e365dba6b1c79934fc0353c19284adc9fd3cb4127e3  ./conformance/abi_enum_tag_repr.tmbc
+2b2135c4a668e7c9923be4071ac9066f03e2655800fec635ffb9cd300cbe9e2c  ./conformance/abi_function_symbol.json
+90a056c940cfc55a44bb197b5102018b8fd6da0cff41f153346f54370f5c53bc  ./conformance/abi_function_symbol.tmbc
+1185239324452b87b589927b98061571720514c32c4f9ee0c7ad567ebb9ea603  ./conformance/abi_param_facts.json
+b93bd82f493f02778368d377800f7ad7eec1a13dfd8848dc57872731e17a8133  ./conformance/abi_param_facts.tmbc
+0dc9f9b2efd5e5d3efc1d473b11cde586adf289e1dde74761f581566600e0f36  ./conformance/array_splat.json
+d34118d637fcad8739929d3c7d32dc5141504d35387c03ee371f9aef06a59241  ./conformance/array_splat.tmbc
+2ea3f1bab0946cd429a9a8292bd8c0e3a6e7a1491d19f4d01896d289ef9234b6  ./conformance/assert_invoke.json
+daca537d701877ea8785ae4c44a42c65130c424bdc76979d155067715eba091d  ./conformance/assert_invoke.tmbc
+948cf9cf6f306713e4c40d4a90913be72db070c084c5fb8c62e9c8125ad3f529  ./conformance/assert_kind.json
+ed0b65325dce2358d6553111563c339f1ed72feb9e2d0c71ec76922585996014  ./conformance/assert_kind.tmbc
+ad20948ef7b907d4221be80592ddf95899bb2a40667faac420e14a393199b30e  ./conformance/assert_panic_site.json
+c2523bafb654cfd68517ab5f4ba1ece97bcaee76aea6d646164a8c64fcf5c60e  ./conformance/assert_panic_site.tmbc
+59f6b2fe5c1b1c34191d2bae735b55fdde19f4a6b289c17e7b146658a9d92a1d  ./conformance/b1_scalars.json
+73a7e7068d734bdc60d5f0cdb584aa8cf4a02dfb558383141e26df44fd87ea51  ./conformance/b1_scalars.tmbc
+26588bf8513ead70d7e201776ecceee1db27ff2b8ccc898809f1f954bae0fbeb  ./conformance/body_gate.json
+ddb1dad51d04f9b06c9282ed4d8f3f8b8f5dec0faabe9a01ef0950866b250679  ./conformance/body_gate.tmbc
+384ab0593b4b68b8901a6ed70a437f7f8f09466f4adb9de69e98bdf35997db56  ./conformance/bytes_constants.json
+6011dad7b08d2cd6ef39d6a73cb639666547005f980d342512b3848b3fdb840a  ./conformance/bytes_constants.tmbc
+2398060c6768dc2294d7ae8f3b0b940e79953bafa15fbc77bb01bf44aed46453  ./conformance/call_unwind_boundary.json
+3864acc78166392c2fe407cbe59d72cd1672b55f5ce3e913f6cd01cae0b1b66e  ./conformance/call_unwind_boundary.tmbc
+462d0e2575a7bca24c72c76e9a411cdb6c054fea2df5dbf1c984fb12593dde84  ./conformance/certificate_binding.json
+f470adfe466071aa71e2bd3a6146a4fa464f6fae479896d1e31673405b32df55  ./conformance/certificate_binding.tmbc
+abdcf751aaade73ddbbeb457e3be9015ea3b0dd7143fc65a595f58851a917978  ./conformance/chc_batch.json
+678af92e05b03613f0e09825131ba3e740f8b365da9a9e964de96269f4233595  ./conformance/chc_batch.tmbc
+6ef4cb98a60b8fc9b4422473cd6fc5d6932a6050934ae8df63f0acae91e9dd01  ./conformance/closure_layout.json
+c7ad82ecbf45e0417f4eb6932119d330cad15f0572f86c1f09f94c68311a168e  ./conformance/closure_layout.tmbc
+d40c45b842df17c0c7c29b1edd8fb0408cd68771c637ae6cd0dccbe854514d02  ./conformance/compat_v22_composition.tmbc
+14c8ec63ea9cea68be42471e98628e6be21a8d615db5f9313f15443af9235842  ./conformance/composition.json
+4c637526c3a7010668c4ed86b104075272876ac6efbd7eb22e64778373dddbe4  ./conformance/composition.tmbc
+2e539b079d34af71450f9262e548b73cfddaae8c2c1cabdd27ede53cac5ec558  ./conformance/debug_metadata_v33.json
+55267449de765b4a1ea2e9b60429272fb01a65401e510593e78c05637b3bc775  ./conformance/debug_metadata_v33.tmbc
+8a093a6485c29c5ae3fe8c91a0b47a3dbcde89750f60a3cbde6f7444521ef253  ./conformance/declared_tuple_v42.json
+ebaec9732eceaf864f51608d96ab85cd3255310cd8c25ff42121b629ef3a9c2c  ./conformance/declared_tuple_v42.tmbc
+fdb6369b0347a33dbc25d1e8daec4ca8700b19e2061a7bc33e9eb43f710e449a  ./conformance/drop_glue.json
+47879e0ad354d6be0a7d27113203b39a6f5eccfbaed0c9840c34b6b467a5e6ec  ./conformance/drop_glue.tmbc
+e98f99ffe752b8ec15983672058f86f715741fd2d167d3850cd6b599a29e52bf  ./conformance/effect_summaries.json
+5f7e1c9dc757bb043f721e89429156b099cf939cc807bfca92f330e6f73fe736  ./conformance/effect_summaries.tmbc
+2086e86e870aedf4438e4c693c0f6ce7fdcdbb26a8e7231fe42676dde6b45687  ./conformance/frontend_emission_subset.json
+58b683d2525bfdb7bb5a0b4537e938458cab18822b48df54d0581b2df7acd4b8  ./conformance/frontend_emission_subset.tmbc
+39b47ca55c5e0865bc68bd2685026aa6c74ec5d4f6b35dda359cdd8092784a1b  ./conformance/frontend_panic_obligations.json
+99a822ba3c15249bff7ee7a637df1f5fc60a35873c89e63c75eba120a8a77817  ./conformance/frontend_panic_obligations.tmbc
+c3bac5ca8415046ca3fe6d394e67481ffce9065d276bba9a3db3e672efb6a12d  ./conformance/func_param_abi.json
+4748728a16d1bfa8e3d52a1d151c9b8de16add7cdccfef787b9ed4687eb3f4de  ./conformance/func_param_abi.tmbc
+47874883f4050650d3b89aa09ea4c5443bfd59cd62ef026e776c6603d73e697f  ./conformance/import_scheme.json
+e0fcdf36104eab96d2cffa38df9537e42608f2fd3a2d31a657803a69cf14a548  ./conformance/import_scheme.tmbc
+19bd6d4352b6bc24686d469ed7e36108275cc8572dc62e844db31577fbc55afe  ./conformance/inst_arithmetic.json
+5ad1acb6b3e72fca15da8176dc58a8161fb1bc7bb9338b936592e71161c9b7ca  ./conformance/inst_arithmetic.tmbc
+6221ce6715835c57674bf3647ed56c55a7bba39d498a00bbd7c41fd12cc528d6  ./conformance/inst_atomic.json
+32a3d67171b921c43eb55f3952f54c285b482d1827d38bddb9deb2076914bb6c  ./conformance/inst_atomic.tmbc
+13cf2ea154f354b7ff17595c052c40ccc7225fceade495609984515961c5f2d4  ./conformance/inst_binding_frames.json
+bfd123e47e3a9afe2ae9ff40af7271b96f0cc09fd79f909169264ec539ce4509  ./conformance/inst_binding_frames.tmbc
+774e36c54ff76211946761a49a3da2d89c510f7e720ff4158dd7816c5d76f0ec  ./conformance/inst_borrow_arc.json
+f32d516f966ab116437ff157a712839a6f36f51ebd1b7130bfb6bbc669a5380a  ./conformance/inst_borrow_arc.tmbc
+a81df9625137e1f88d7ae8dd45d1efb7d11d8676bd1a0285c5b5b1f87478cc3a  ./conformance/inst_control.json
+c97acdb8fc4674197588fc0666e8799c0772b65088d66d97b02b31c7dfd79e85  ./conformance/inst_control.tmbc
+bcbb226898df9f8df2f011c9747db5219ba81da1f73c8d31db862374433a3c23  ./conformance/inst_dialect.json
+b4b90ac0b81b52c3af03baff321f2b0a1edcd3a97d56459b6ec53560263d533b  ./conformance/inst_dialect.tmbc
+dcc81d69a4c0fcbbf3bddf2a9fc211e4b391409764b4e68cae7cd427154a8439  ./conformance/inst_memory.json
+29413b4519634a4289f91e93a1473000373d2552f1185f507fe80e2e7d90756b  ./conformance/inst_memory.tmbc
+0299aa6a65377d1085ca6bede51e3d55a02404b970e665474cde6d7e29069413  ./conformance/inst_seq_map.json
+aa7d0909d7573e75ba4219d9deb8046afec8d93ed8853720656896e76847da17  ./conformance/inst_seq_map.tmbc
+d572ec90944479678ed3c67fca94a0bf0b487815fc34dd2acdf9a54532a295db  ./conformance/inst_seq_map_general.json
+6ea38d865a96a9644f46493addbb52246f450722631d56e5d65b1b7cf31d0245  ./conformance/inst_seq_map_general.tmbc
+9f2a90cd7adb355eb08215389cc6ec01189996637f0b4556bb4a151c1e546237  ./conformance/inst_seq_map_not.json
+8172795967023beb2223a67ca11b5f7c621cea9a1371a408f696d688376b3fde  ./conformance/inst_seq_map_not.tmbc
+3f4be9bcea9c7173863efab07b4fdf84955f14a8caf2082d9b104f0ce0871505  ./conformance/inst_vector.json
+2cf1bc346e7feb675604d50f847b83773536e5377207b8e17684a7d0c87f9be2  ./conformance/inst_vector.tmbc
+1965c73b87af9d3ff9ed76341927bb3583ec36a37fbaaec59d7c4bb70f65e034  ./conformance/inst_vector_crosslane.json
+9c7d451917c3c38713f94124c42d970645276035d3c8a01391d113d206a9d4b7  ./conformance/inst_vector_crosslane.tmbc
+f90c5051c5bfd3cedf46f35c72b72bc3f4717e543bc654cbfbddaaa51df307fc  ./conformance/inst_vector_dialect.json
+11502ec1a722e34d8244dbd4c576386d97e806aeef98ee3e19579f77ad7d58e1  ./conformance/inst_vector_dialect.tmbc
+3549222a9cf67c4e0401a78461c56d7766e4fca6c93e7f8f18d441485887344a  ./conformance/inst_wire_batch.json
+306c942a62cab3830cf0f3c07f98a809bf8a041936362d081ac46baa3975fab6  ./conformance/inst_wire_batch.tmbc
+c0ce67c3bafe61bf7fc5b610c4fda7d88a1809212dc88d713039545f29bf9286  ./conformance/lean_library_envelope.json
+10e9f49114b22da4e531d72e196de0f6732c64b9b96dcc6d40e700d053d9f171  ./conformance/lean_library_envelope.tmbc
+48ede81a0b0928eb19961a6b6d050402c1645ba8737885490fbec6034fa0da49  ./conformance/mixed_producer_module.json
+08cb59a5d16543d2b5e19b04949c85167f8e665786bf48c7425858a5c20be463  ./conformance/mixed_producer_module.tmbc
+69d56893b52e0f134251b0cb4dfb9fbfcc59fc854d14f0319457bbd8693052cf  ./conformance/nominal_type_origin.json
+c0608ebb708af838da0b687f499ae1e86f16993ec8e3c6bfea7cc80e0918ab01  ./conformance/nominal_type_origin.tmbc
+72178756dddf40c1186ff1b74d1cac796b9a64f1ed7a6f48c6a94d7897989c2a  ./conformance/param_pointee_place.json
+de7124239551fef488fa828be1281b1c85dfb3fd3c7ce02a187fc1fe197e7fca  ./conformance/param_pointee_place.tmbc
+b5af56e7b3f837687dfbb9610fae69cdaef9a6f124c5a38ece42c611543d2599  ./conformance/producer_provenance.json
+b1271118bf2080f3a1e92a26a0e99ec5291c5f7aa7451b178a44818fab7d4b81  ./conformance/producer_provenance.tmbc
+092c4b7ef4fe5d4a55b4d0ab80973f3ff15c612b9ea2a4daa2c3b2acba7dc4da  ./conformance/proof_annotations.json
+fa41fb8c95a4f22bb97326ec7c9b9fc2f7172c4de8af61692488ab086f43d02e  ./conformance/proof_annotations.tmbc
+508d2d0b29384a718877a085bb780caeb9186713fa46f11f1859cc21cb0ee668  ./conformance/proof_diagnostics.json
+e3afd57150fa1cf88de3ffa8eec43db897956bdebf54bf9c513582345d01ac54  ./conformance/proof_diagnostics.tmbc
+99a6a190617861648df8d265b9f6f6cd13659300f112d1be6d704c9d579f4d53  ./conformance/proof_surface.json
+2c40815c06a2226188ee324cb97d951b9a934520bb58549eae3efd84da06460e  ./conformance/proof_surface.tmbc
+f503447dbb3e35b3916bb0cac52b8e27146543e626bb79ae932106504c79032b  ./conformance/spec_carrier.json
+0b4c6c771449400986da3aa43b385a252db552128d880010ca64b053a88eb1cc  ./conformance/spec_carrier.tmbc
+27b2f8cc738ce3b116adc5596494ba179ef7d334db32b178307c1773b9e01da0  ./conformance/text_directives.json
+cae229da7cdcc7c6cb00ea926d1151964244bacf333ef342be274d72e5d3bf59  ./conformance/text_directives.tmbc
+a5107da8e0813c1cee565179e6c5da348653465a5104f49a1f94369e1d31eb14  ./conformance/ty_composite.json
+2eae29a350542a3861a884058a43464edb0801cbb331a114b4bb69038b324586  ./conformance/ty_composite.tmbc
+29fede43fc5e0b25e824361b2d59bdd7ab2b37677eca696c71f1893426af7f9c  ./conformance/ty_container_vtable.json
+cb604960dbe4270698829d66d0e0325370a96c9f402ed11a3851da5b800bb08c  ./conformance/ty_container_vtable.tmbc
+a56334f60a3850156c152c600221c14aba21f5c830b3b11535763b2774691531  ./conformance/ty_dialect_v39.json
+5fb1a1f0fa0728dab442eb8839002c2c6b6cd297b31c00628cb89e83d1ea9922  ./conformance/ty_dialect_v39.tmbc
+2d05bc27e5ab367894c8d64092ef5a4b71d6d3a703c4ab8802a8675c2f63c52e  ./conformance/ty_handle.json
+920ce4b83bf75b28a79107ad5d9eab55a80ea11cabc0fc53e0c6e38edf74b66a  ./conformance/ty_handle.tmbc
+989210e03beec1516084da896e494b50a9320547c980e1aa9e29f79e89532cd8  ./conformance/ty_primitives.json
+82100d2a21260447f26d2584670d30430eeb89b375f39fead64142942cf66a55  ./conformance/ty_primitives.tmbc
+1ab738ed200a82d02eef75842f8b6c35c3eb8b63383cb8c4b46523c3ac9b6b1d  ./conformance/typed_signature_abi.json
+b89fe3f5cfc7086397dd9af14c19366165ad92f7cc85d1c813523d5cc628a3c1  ./conformance/typed_signature_abi.tmbc
+697be8d08d74237ff3f0e1f43ab253ea6b9a26f48cae616395f59108657e9345  ./conformance/u128_constants.json
+0cbfc1f58ee4678be0c1a8be4b941bb45fb2ba7049d6bf9d7f5675154f63063f  ./conformance/u128_constants.tmbc
+b87ef4c875be7b9cf69c70f1eb97ba4fba6ced896c001e7313242f0131d7c736  ./conformance/unwind_twins.json
+cdf9848493c8090b778d521875d10af8e94923b7e66376a7f33c0734403340d1  ./conformance/unwind_twins.tmbc
+3ada9a6c43bdb9c267695d2d8c2622ad268ef155a8bea1483ed987e7bdcc3059  ./pinned_writer/crystal_lane_v49.json
+c26054779a45276c8ea93ff0f203506b1204ed334505d3c10648ecb5cbf71c0f  ./pinned_writer/crystal_lane_v49.tmbc
+
+  Checked 2026-10-20 at the pin move to
+  1943c2f4d27ff2954331b841bedeaf641f6fa723 (the proved wasm32 byte model,
+  normative lowering subset v5). The immutable conformance fixture tree is
+  unchanged from 26050b47: 9b0639962b283f140da82c30e086430eb0ad4345.
+  Every canonical and frozen fixture byte is preserved. The subset-model
+  expansion changes no wire version or fixture verdict; the original exact
+  census, container and must-refuse guards remain mandatory.
+
+Checked 2026-11-03 at IR 6d2e381183a1ce31a051a72a50caca3e5c34fe8b:
+conformance tree c9d75333cdf52e229c841dfb6cef66d03fb37b1b is unchanged from f4683868;
+all 112 canonical binary/JSON bytes and all historical controls remain frozen.
+The reader/writer advances to wire v63 (MakeClosure), so added
+pinned_writer/runtime_closure_v63.{tmbc,json}, generated by the exact pinned
+trust-ir-cli, built through scripts/run-targo.sh build --locked -p trust-ir-cli
+with genuine Trust trustc20565c325 in its explicit unverified lane.
+Authored a valid host that constructs an unused closure with three ordered
+live I64 captures and a correctly typed physical target. Both bodies wear
+Ungated. Commands: convert --from json --to bin authored.json runtime_closure_v63.tmbc;
+convert --from bin --to json runtime_closure_v63.tmbc runtime_closure_v63.json;
+validate runtime_closure_v63.tmbc (PASS). Runtime ABI support is not claimed;
+the CLI must refuse by the unchanged Ungated license. Focused native/WASM/Core
+controls exercise the constructor refusal with licensing explicitly permitted.
+
+sha256 (new v63 writer fixture):
+c429c9395c1614d56f15fb545ad6af6a01c86cb9b6a511cc8cbd7b0cddcb2aa4  ./pinned_writer/runtime_closure_v63.tmbc
+0ebe8659f20696c908b4043109d08f691e024ded2034a8fa299883c709adba81  ./pinned_writer/runtime_closure_v63.json
+
+Checked 2026-11-05 at IR 7fbde1f5dc51a406d4ce1648eb3e5748f37a9b3c:
+all existing canonical fixture bytes are unchanged. Add the canonical
+make_closure binary/JSON pair (57 conformance fixtures). Runtime closure
+construction already has native execution coverage; this adds its actual
+codec corpus row and retains every admission/refusal check.
+01d2b96669f1e07668812d0e78f9cece8a11a6abef13a956fd3c2ea460dc9050  ./conformance/make_closure.json
+4b99a87600879ba84388907f61703bd3db205b11c33a26cc253648b437eeb656  ./conformance/make_closure.tmbc
+
+Checked 2026-11-06 at IR 424049d872d6943e78b1e3b50fcceb5e3127484f /
+Clean 4b85a3bdc9b2d136b878c9e582e9cdc04061b050: all 57 canonical fixtures
+and their JSON twins pass the immutable pinned-source equality checks. The
+v22 refusal control is unchanged. The new make_closure_capture_count row is
+in refuse/, read by the upstream corpus guard rather than vendored here.
+No fixture bytes changed for the scoped proof-component adoption.
+
+Rechecked 2026-11-06 at IR 75470482669580bc83f51612ea4bef107afb1084:
+all 57 top-level fixtures and their JSON twins remain byte-identical to the
+immutable upstream source. The endpoint-bound scoped translation API changes
+no fixture bytes or existing refusal policy.
+
+Rechecked 2026-11-06 at immutable IR
+aa79b2c189e18310f2a58e39ee3c87cba060e63e and Clean
+3cfd68fff309cd0ae30157a360786f178b6be706: all57 canonical binary fixtures
+and57 JSON twins are byte-identical to target Git objects. No vendored bytes,
+corpus denominator, named refusal, or v22 control changes. The ranked original
+site-guard candidate changes proof construction, not the fixture contract.
+
+Re-vendored all 57 binary/JSON pairs from immutable IR cebbff22b4b64fece4c3c7ef11e557016b10185f.
+Only certificate_binding changes for the qualified C0 environment; all expected
+compiling fixtures and named refusals remain unchanged. Source staging only;
+the complete native pin transaction and certificate gate remain required.
+
+Rechecked 2026-11-07 at combined Root99171d5f77ba05b0c25f414517dabf0cb2ec4007:
+all57 binary/JSON pairs match immutable Git, including the same current C0
+certificate_binding pair already adopted by backend main2ea528129. The v22
+refusal control is unchanged. This stages bytes, not a native PASS; the new
+canonical pin transaction remains required.
+
+Source-value cohort check, 2026-11-08:
+  Revalidated all 58 top-level binary/JSON pairs byte-for-byte against immutable
+  TrustIR 1a28b022388992a780ff9fcdb4f88e1d59d7bb0a. No fixture bytes, licenses,
+  proof grades or frozen compat22 control were changed. The new
+  refuse/storage_by_value_signature row is counted in the full upstream corpus;
+  it does not replace an existing conformance pair. This check supplies no
+  new producer, native execution, SDK or proof qualification.
+
+2026-11-12: remeasure against published original entry-prefix image cohort
+a43891b6f33ac9cc8f05b2e8ecc388fa5e9bbea8 (co-owned Clean0592, AYadd70 unchanged).
+All59 paired top-level tmbc/JSON goldens are byte-identical. The four unpaired
+source-only JSONs remain outside this vendored module corpus, as before; no
+fixture, inventory, expected count or refusal guard is edited for this move.
+The canonical owner must execute all seven guards before publishing the tuple.
+
+2026-11-14: native tensor wire-v67 intake for immutable TrustIR
+9ca701119a5dd00f8ccebfdd1d4a79380c71c557, co-owned Clean
+550ad0858df6a00c61a7cdabc7f37fa0bc975258. Vendored tensor_contract.tmbc and
+tensor_contract.json directly from that commit's conformance fixture blobs.
+The existing 60 paired goldens and compat_v22_composition retain their bytes.
+Tensor transport/roundtrip is distinct from machine admission: no native
+tensor layout, value ABI or contraction lowering is claimed. The canonical
+pin transaction and all eight actual guards still must qualify the move.
+
+2026-11-14: root normal-post cohort: copy every top-level tMBC and paired JSON byte-for-byte from public TrustIR bd313b4fbfae2c2826bade463e23224f1df9a61a (64 pairs), preserving compat_v22_composition. Adds actual v69 tensor_gather_scatter and v70 tensor_weight_blob. No generated bytes or manual digest edits.

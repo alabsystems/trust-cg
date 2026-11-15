@@ -5,7 +5,8 @@
 # never re-run to fish for a favourable row.
 #   usage: harness_row.sh [REPO=.] [DYLIB=target-bridge/release/librustc_codegen_trust_cg.so]
 set -euo pipefail
-export PATH="$HOME/.cargo/bin:$HOME/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH"
+# STOCK EXCEPTION (Trust lacks rust-lld/gcc-ld; measured: no lib/rustlib/<host>/bin/{rust-lld,gcc-ld} in the Trust sysroot): the Linux linker shim comes from the stock stable toolchain's gcc-ld; the compilers come from scripts/trust_toolchain.py.
+export PATH="$HOME/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:$PATH"
 REPO=${1:-$(cd "$(dirname "$0")/../../.." && pwd)}
 DYLIB=${2:-$REPO/crates/rustc-codegen-trust-cg/target-bridge/release/librustc_codegen_trust_cg.so}
 TARGET=${TCG_TARGET:-aarch64-unknown-linux-gnu}
@@ -31,5 +32,5 @@ if [[ -z "$J" ]]; then
   exit 1
 fi
 echo "results: $J"
-python3 benchmarks/beat-llvm/contract/check_gates.py "$J" | grep -E 'PASS|FAIL|ELIGIBLE'
+python3 benchmarks/beat-llvm/contract/check_gates.py "$J" | grep -E 'PASS|fail|FAIL|unmeasured|ELIGIBLE'
 python3 scripts/check_perf_ratchet.py --append "$J" 2>&1 | tail -2

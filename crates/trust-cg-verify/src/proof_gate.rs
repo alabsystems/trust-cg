@@ -11,18 +11,17 @@
 // `AYVerificationMode::MockOnly` and the runner reports `VerificationStrength::
 // Statistical` / `Exhaustive` results as "passing". For 32/64-bit obligations
 // statistical mock is 100K random samples (see `lowering_proof::DEFAULT_SAMPLE_
-// COUNT`), which is NOT a formal proof and has hidden ~17 miscompiles' worth of
-// gaps in the surrounding (non-SMT) code.
+// COUNT`), which is NOT a formal proof.
 //
 // This module adds a *fail-closed* gate that:
-//   1. ERRORS (never downgrades) when no external ay/Z3 solver is available.
+//   1. ERRORS (never downgrades) when AY plus independent Clean checking is unavailable.
 //   2. Treats an obligation as passing ONLY if it is formally `AYResult::Verified`
-//      via the ay solver. A statistical-mock-only pass does NOT count.
+//      via AY plus independent Clean checking. A statistical pass does NOT count.
 //   3. Surfaces Timeout / Unknown / Error / CounterExample as gate FAILURES,
 //      each enumerated with its category and detail.
 //
 // It is built on the real ay bridge:
-//   - `ay_bridge::z3_available()`  — CLI solver detection.
+//   - `ay_bridge::ay_available()` — AY + capable Clean detection.
 //   - `ay_bridge::verify_with_ay(&obligation, &config)` — formal discharge.
 //     Dispatches to the external solver subprocess and returns `AYResult`.
 //   - `AYResult::Verified` is the ONLY outcome that counts as a formal proof.
@@ -32,11 +31,17 @@
 // ---------------------------------------------------------------------------
 // A `Verified` from this gate is only as sound as the components it trusts.
 // The gate's TCB explicitly INCLUDES:
-//   1. The ay/z3 solver itself (it answers sat/unsat).
+//   1. Clean's independent Alethe checker and the artifact/identity binding.
+//      AY produces candidate proofs; its UNSAT answer alone is not authority.
 //   2. `ay_bridge::verify_with_ay` and the SMT-LIB2 emission it drives. The
 //      local bitvector simplifier (`ay_bridge::prepare_formula_for_smt` ->
 //      `simplify_solver_expr`) still runs BEFORE the solver to help it, but is
-//      no longer trusted to *decide* an obligation by itself — see below.
+//      no longer trusted to *decide* an obligation by itself — see below. A
+//      floating-point or array obligation is first asked in its bit-vector
+//      lowering (`fp_bv_lowering`, `array_row_lowering`), whose checked UNSAT
+//      counts for the original query: those lowerings' soundness arguments,
+//      bit-level definitions and array axioms are part of this item
+//      (docs/trusted-base-ledger.md TB-15).
 //
 // CLOSED TCB CAVEAT (the simplifier can no longer mint a `Verified` alone):
 //   The gate proves a lowering correct by asking the solver whether the NEGATED
@@ -52,8 +57,8 @@
 //   already `false`). In that case it does NOT trust the simplified form: it
 //   re-emits the UN-simplified raw negated equivalence (bounded quantifiers
 //   still expanded — a sound mechanical unroll) and requires the SOLVER to
-//   return `unsat` on it. Only a SOLVER `unsat` on the real formula yields
-//   `Verified`; a satisfiable formula the simplifier wrongly folded would now
+//   prove UNSAT on it, followed by independent Clean checking. Only the checked
+//   proof can yield `Verified`; a satisfiable formula wrongly folded would now
 //   surface as a CounterExample (gate failure), never a pass. The fast
 //   simplified path is kept for every non-degenerate obligation. A genuinely
 //   tautological obligation (raw form already constant `false`) is the real
@@ -62,7 +67,7 @@
 //   final `AYResult`, not the simplified SMT body.)
 //
 // Reference: crates/trust-cg-verify/src/verification_runner.rs (select_auto_mode),
-//            crates/trust-cg-verify/src/ay_bridge.rs (z3_available, verify_with_ay,
+//            crates/trust-cg-verify/src/ay_bridge.rs (ay_available, verify_with_ay,
 //            prepare_formula_for_smt, simplify_solver_expr,
 //            simplifier_alone_proved_unsat, generate_smt2_query_raw,
 //            AYConfig, AYResult, ProofDatabaseAYReport),
@@ -72,8 +77,8 @@
 //!
 //! Unlike [`select_auto_mode`], which downgrades to mock verification when no
 //! solver is present, [`GateConfig::discharge`] *fails closed*: it requires a
-//! real SMT solver and counts an obligation as passing only when ay reports
-//! [`AYResult::Verified`].
+//! AY and a capable independent Clean checker, and counts an obligation as
+//! passing only when their proof route returns [`AYResult::Verified`].
 //!
 //! [`select_auto_mode`]: crate::verification_runner::select_auto_mode
 //! [`AYResult::Verified`]: crate::ay_bridge::AYResult::Verified
@@ -90,9 +95,14 @@
 //! GateConfig::strict().discharge(&db).expect("formal gate must pass");
 //! ```
 
+mod pool;
+
 use std::time::{Duration, Instant};
 
-use crate::ay_bridge::{AYConfig, AYResult, verify_with_ay, z3_available};
+use crate::ay_bridge::{
+    AYConfig, AYResult, AyVerdictSource, verify_with_ay_attributed, z3_available,
+};
+use crate::ay_identity::PinnedAy;
 use crate::proof_database::{ProofCategory, ProofDatabase};
 
 /// Per-obligation solver timeout the STRICT gate grants, in milliseconds (120 s).
@@ -186,8 +196,9 @@ pub enum FailureClass {
     /// check (error). A bug or a broken environment — must be fixed.
     Soundness,
     /// The solver ran but did not decide within budget (timeout) or returned an
-    /// ordinary incompleteness/resource `unknown`. Proof-authority rejection and
-    /// internal-error unknown reasons are promoted to [`Self::Soundness`]. A
+    /// ordinary incompleteness/resource `unknown`. Proof-authority rejection (AY's
+    /// own self-check, or a working independent checker refusing the exact proof)
+    /// and internal-error unknown reasons are promoted to [`Self::Soundness`]. A
     /// capacity-bound obligation is reported as formally PENDING, never passed.
     SolverCapacity,
 }
@@ -211,6 +222,11 @@ pub struct GateObligationResult {
     pub category: ProofCategory,
     /// The raw ay outcome.
     pub ay_result: AYResult,
+    /// The admitted AY this outcome is attributable to (`None`: no AY was
+    /// admitted, or a portable certificate answered).
+    pub solver: Option<PinnedAy>,
+    /// How the outcome was obtained (live run, memo, certificate, not run).
+    pub source: AyVerdictSource,
     /// Time taken to discharge this obligation.
     pub duration: Duration,
 }
@@ -242,16 +258,14 @@ impl GateObligationResult {
     /// it still fails the gate (`is_formally_valid()` is false), but the report
     /// can list it separately from a genuine [`FailureClass::Soundness`] failure.
     /// AY's stable `self-check-rejected`, legacy `proof-trusted`, and
-    /// `internal-error` unknown reasons are not capacity failures: they mean the
-    /// proof authority rejected a computed verdict or the solver malfunctioned,
-    /// so this method promotes them to `Soundness` fail-closed.
+    /// `internal-error` unknown reasons, and a working independent checker's
+    /// rejection of the exact Alethe proof
+    /// (`ay_bridge::WORKING_CHECKER_REJECTED_THIS_PROOF`), are not
+    /// capacity failures: they mean a proof authority rejected a computed verdict
+    /// or the solver malfunctioned, so this method promotes them to `Soundness`
+    /// fail-closed.
     pub fn failure_class(&self) -> Option<FailureClass> {
-        match &self.ay_result {
-            AYResult::Unknown(reason) if unknown_is_hard_failure(reason) => {
-                Some(FailureClass::Soundness)
-            }
-            _ => self.failure_kind().map(|kind| kind.class()),
-        }
+        failure_class_of(&self.ay_result)
     }
 
     /// Human-readable failure detail (counterexample assignment, reason text).
@@ -275,15 +289,45 @@ impl GateObligationResult {
     }
 }
 
-/// AY reason-unknown markers that describe a broken/rejected authority path,
-/// not search incompleteness or resource exhaustion. AY deliberately exposes
-/// `self-check-rejected` as a greppable soundness-gate result; treating it as
-/// solver capacity would allow a caught wrong answer to enter a PENDING ledger.
-fn unknown_is_hard_failure(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    reason.contains("self-check-rejected")
-        || reason.contains("proof-trusted")
-        || reason.contains("internal-error")
+/// [`GateObligationResult::failure_class`] of a bare outcome: the coarse class
+/// of a non-passing outcome, or `None` if formally valid.
+pub(crate) fn failure_class_of(result: &AYResult) -> Option<FailureClass> {
+    let kind = match result {
+        AYResult::Verified => return None,
+        AYResult::Unknown(reason) if unknown_is_hard_failure(reason) => {
+            return Some(FailureClass::Soundness);
+        }
+        AYResult::SolverUnsat | AYResult::Unknown(_) => GateFailureKind::Unknown,
+        AYResult::CounterExample(_) => GateFailureKind::CounterExample,
+        AYResult::Timeout => GateFailureKind::Timeout,
+        AYResult::Error(_) => GateFailureKind::Error,
+    };
+    Some(kind.class())
+}
+
+/// Unknown reasons that describe a broken/rejected authority path, not search
+/// incompleteness or resource exhaustion. AY deliberately exposes
+/// `self-check-rejected` as a greppable soundness-gate result, and the bridge
+/// marks a working independent checker's refusal of the exact proof with
+/// [`crate::ay_bridge::WORKING_CHECKER_REJECTED_THIS_PROOF`]; AY's own model gate
+/// catching an invalid model is named by
+/// [`crate::gap_classify::ay_reason_is_soundness_gate_refusal`]. Treating any of
+/// them as solver capacity would allow a caught wrong answer to enter a PENDING
+/// ledger.
+pub(crate) fn unknown_is_hard_failure(reason: &str) -> bool {
+    // AY's ALWAYS-ON model gate caught one of AY's own theory-search paths
+    // returning a model that falsifies an assertion. That is the same
+    // argument as `self-check-rejected`, only stronger: a caught wrong answer
+    // must not enter a PENDING(solver-capacity) ledger. Delegated to the
+    // canonical classifier so the spelling cannot drift.
+    if crate::gap_classify::ay_reason_is_soundness_gate_refusal(reason) {
+        return true;
+    }
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("self-check-rejected")
+        || lower.contains("proof-trusted")
+        || lower.contains("internal-error")
+        || reason.contains(crate::ay_bridge::WORKING_CHECKER_REJECTED_THIS_PROOF)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +360,11 @@ pub enum GateError {
     /// Carries the full report so the caller can enumerate every offending
     /// obligation (counterexamples, timeouts, unknowns, errors).
     NotAllVerified(GateReport),
+    /// Infrastructure failure; a complete report is retained when available.
+    Scheduling {
+        detail: std::borrow::Cow<'static, str>,
+        report: Option<Box<GateReport>>,
+    },
 }
 
 impl std::fmt::Display for GateError {
@@ -326,14 +375,19 @@ impl std::fmt::Display for GateError {
                 detail,
             } => write!(
                 f,
-                "strict proof gate FAILED: no SMT solver available (native ay compiled: {}). {} \
+                "strict proof gate FAILED: AY + Clean proof toolchain unavailable (native ay compiled: {}). {} \
                  The gate refuses to downgrade to statistical mock verification. \
-                 Install an `ay` or `z3` binary on PATH and re-run.",
+                 Check `aterm pkg doctor`; AY is the sole SMT solver and Clean ships with aterm.",
                 native_ay_compiled, detail
             ),
             GateError::EmptyDatabase => {
                 write!(f, "strict proof gate FAILED: proof database is empty")
             }
+            GateError::Scheduling { detail, report } => write!(
+                f,
+                "strict proof gate FAILED: scheduling: {detail}; completed report rows: {}",
+                report.as_ref().map_or(0, |report| report.total())
+            ),
             GateError::NotAllVerified(report) => write!(
                 f,
                 "strict proof gate FAILED: {}/{} obligations not formally Verified \
@@ -361,8 +415,13 @@ pub struct GateReport {
     pub results: Vec<GateObligationResult>,
     /// Whether the native ay API was compiled in for this run.
     pub native_ay_compiled: bool,
-    /// Solver identity string (`ay_bridge::solver_info()`), for the run header.
+    /// The AY this run was bound to — resolved ONCE at the start of the run
+    /// and used for every obligation — or why none was admitted. Never a
+    /// re-selection after the fact.
     pub solver_info: String,
+    /// That AY (`None` when none was admitted). Boxed so the report stays a
+    /// small error payload.
+    pub solver: Option<Box<PinnedAy>>,
     /// Total wall-clock duration.
     pub total_duration: Duration,
 }
@@ -607,7 +666,7 @@ impl std::fmt::Display for GateReport {
 /// Note: [`AYConfig`] derives neither `Debug` nor `Clone`, so `GateConfig`
 /// intentionally derives neither.
 pub struct GateConfig {
-    /// ay/z3 solver configuration (timeout, model production, binary path).
+    /// AY configuration (timeout, model production, explicit executable path).
     pub ay_config: AYConfig,
     /// If `true`, the gate ERRORS when no solver is available rather than
     /// downgrading. Strict mode sets this `true`.
@@ -673,6 +732,10 @@ impl GateConfig {
     /// so the no-solver fail-closed contract can be asserted UNCONDITIONALLY,
     /// on every machine, regardless of whether a solver happens to be installed.
     pub fn discharge(&self, db: &ProofDatabase) -> Result<GateReport, GateError> {
+        pool::validate_policy().map_err(|detail| GateError::Scheduling {
+            detail,
+            report: None,
+        })?;
         self.discharge_with_availability(db, self.solver_available())
     }
 
@@ -695,14 +758,44 @@ impl GateConfig {
         db: &ProofDatabase,
         available: bool,
     ) -> Result<GateReport, GateError> {
+        self.discharge_scheduled(db, available, usize::MAX)
+    }
+
+    /// Restrict concurrency for a comparison or a smaller resource allocation.
+    /// The limit can only reduce the process's admitted CARGO_BUILD_JOBS share.
+    /// Solver identity, proof requirements and per-query budgets are unchanged.
+    pub fn discharge_with_worker_limit(
+        &self,
+        db: &ProofDatabase,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<GateReport, GateError> {
+        pool::validate_policy().map_err(|detail| GateError::Scheduling {
+            detail,
+            report: None,
+        })?;
+        self.discharge_scheduled(db, self.solver_available(), limit.get())
+    }
+
+    fn discharge_scheduled(
+        &self,
+        db: &ProofDatabase,
+        available: bool,
+        worker_limit: usize,
+    ) -> Result<GateReport, GateError> {
+        pool::check_process().map_err(|detail| GateError::Scheduling {
+            detail,
+            report: None,
+        })?;
         if self.require_solver && !available {
             return Err(GateError::NoSolver {
                 native_ay_compiled: native_ay_compiled(),
                 detail: format!(
-                    "solver available = {}, z3_available() = {}, solver_info = {:?}",
+                    "AY + Clean available = {}, solver_info = {:?}; {}",
                     available,
-                    z3_available(),
-                    crate::ay_bridge::solver_info()
+                    crate::ay_bridge::solver_info(),
+                    crate::ay_bridge::proof_toolchain_unavailable_reason().unwrap_or_else(|| {
+                        "availability was explicitly disabled by the caller".to_string()
+                    }),
                 ),
             });
         }
@@ -712,31 +805,101 @@ impl GateConfig {
         }
 
         let start = Instant::now();
-        let results: Vec<GateObligationResult> = db
-            .all()
-            .iter()
-            .map(|cp| {
+        // Bind the whole run to ONE admitted AY: the configured one, else the
+        // one the identity rule admits now. Every obligation runs under exactly
+        // that AY, and the report names exactly that AY.
+        let run_solver = match &self.ay_config.solver {
+            Some(solver) => Ok(solver.clone()),
+            None => crate::ay_identity::resolve_for_process(),
+        };
+        let run_config = AYConfig {
+            solver: run_solver.as_ref().ok().cloned(),
+            timeout_ms: self.ay_config.timeout_ms,
+            produce_models: self.ay_config.produce_models,
+        };
+        let share = crate::resource_limits::admitted_job_share().map_err(|error| {
+            GateError::Scheduling {
+                detail: error.to_string().into(),
+                report: None,
+            }
+        })?;
+        let workers = share
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(crate::ay_bridge::MAX_PROOF_GATE_WORKERS)
+            .min(db.all().len())
+            .min(worker_limit);
+        let scheduled = pool::ordered(
+            db.all().len(),
+            workers,
+            |index| {
+                let cp = &db.all()[index];
                 let proof_start = Instant::now();
-                // Formal path only. In v0.1.0 `verify_with_ay` dispatches to
-                // the external solver CLI, never to statistical evaluation.
-                let ay_result = verify_with_ay(&cp.obligation, &self.ay_config);
+                let verdict = match &run_solver {
+                    // Formal path only. In v0.1.0 `verify_with_ay` dispatches to
+                    // the external solver CLI, never to statistical evaluation.
+                    Ok(_) => verify_with_ay_attributed(&cp.obligation, &run_config),
+                    // A refused AY is never re-selected per obligation.
+                    Err(refusal) => crate::ay_bridge::AyVerdict {
+                        result: AYResult::Error(refusal.to_string()),
+                        solver: None,
+                        source: AyVerdictSource::NotRun,
+                    },
+                };
                 GateObligationResult {
                     name: cp.obligation.name.clone(),
                     category: cp.category,
-                    ay_result,
+                    ay_result: verdict.result,
+                    solver: verdict.solver,
+                    source: verdict.source,
                     duration: proof_start.elapsed(),
                 }
-            })
-            .collect();
+            },
+            |index, elapsed| GateObligationResult {
+                name: db.all()[index].obligation.name.clone(),
+                category: db.all()[index].category,
+                ay_result: AYResult::Error(
+                    "proof worker panicked; obligation was not certified".into(),
+                ),
+                solver: None,
+                source: AyVerdictSource::NotRun,
+                duration: elapsed,
+            },
+        );
+        let (results, scheduling_failure) = match scheduled {
+            Ok(results) => (results, None),
+            Err(pool::Failure {
+                results: Some(results),
+                detail,
+            }) => (results, Some(detail)),
+            Err(pool::Failure {
+                results: None,
+                detail,
+            }) => {
+                return Err(GateError::Scheduling {
+                    detail,
+                    report: None,
+                });
+            }
+        };
         let total_duration = start.elapsed();
 
         let report = GateReport {
             results,
             native_ay_compiled: native_ay_compiled(),
-            solver_info: crate::ay_bridge::solver_info(),
+            solver_info: match &run_solver {
+                Ok(solver) => format!("ay at {} [{}]", solver.path().display(), solver.describe()),
+                Err(refusal) => format!("no AY solver admitted: {refusal}"),
+            },
+            solver: run_solver.ok().map(Box::new),
             total_duration,
         };
 
+        if let Some(detail) = scheduling_failure {
+            return Err(GateError::Scheduling {
+                detail,
+                report: Some(Box::new(report)),
+            });
+        }
         if report.all_verified() {
             Ok(report)
         } else {
@@ -790,6 +953,8 @@ mod tests {
             name: name.to_string(),
             category: ProofCategory::Arithmetic,
             ay_result: AYResult::CounterExample(vec![("a".to_string(), 0x2a)]),
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         }
     }
@@ -799,6 +964,8 @@ mod tests {
             name: name.to_string(),
             category: ProofCategory::Arithmetic,
             ay_result: AYResult::Verified,
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         }
     }
@@ -808,6 +975,7 @@ mod tests {
             results,
             native_ay_compiled: native_ay_compiled(),
             solver_info: "test-solver".to_string(),
+            solver: None,
             total_duration: Duration::from_millis(2),
         }
     }
@@ -821,6 +989,8 @@ mod tests {
             name: "to".to_string(),
             category: ProofCategory::Division,
             ay_result: AYResult::Timeout,
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         };
         // Critical: a timeout must NOT count as a pass.
@@ -831,6 +1001,8 @@ mod tests {
             name: "uk".to_string(),
             category: ProofCategory::Division,
             ay_result: AYResult::Unknown("incomplete".to_string()),
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         };
         assert!(!unknown.is_formally_valid());
@@ -840,6 +1012,8 @@ mod tests {
             name: "uncertified".to_string(),
             category: ProofCategory::Arithmetic,
             ay_result: AYResult::SolverUnsat,
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         };
         assert!(!solver_unsat.is_formally_valid());
@@ -853,6 +1027,8 @@ mod tests {
             name: name.to_string(),
             category: ProofCategory::Arithmetic,
             ay_result,
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         };
         let r = report(vec![
@@ -926,12 +1102,14 @@ mod tests {
     fn no_solver_error_is_descriptive() {
         let err = GateError::NoSolver {
             native_ay_compiled: false,
-            detail: "z3_available() = false".to_string(),
+            detail: "AY + Clean available = false".to_string(),
         };
         let msg = format!("{}", err);
-        assert!(msg.contains("no SMT solver"));
+        assert!(msg.contains("AY + Clean proof toolchain unavailable"));
         assert!(msg.contains("refuses to downgrade"));
-        assert!(msg.contains("ay` or `z3"));
+        assert!(msg.contains("aterm pkg doctor"));
+        assert!(msg.contains("AY is the sole SMT solver"));
+        assert!(!msg.contains("z3"));
     }
 
     #[test]
@@ -949,6 +1127,8 @@ mod tests {
             name: name.to_string(),
             category: ProofCategory::Arithmetic,
             ay_result: AYResult::Timeout,
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         }
     }
@@ -958,6 +1138,8 @@ mod tests {
             name: name.to_string(),
             category: ProofCategory::Division,
             ay_result: AYResult::Unknown("incomplete".to_string()),
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         }
     }
@@ -967,6 +1149,8 @@ mod tests {
             name: name.to_string(),
             category: ProofCategory::Division,
             ay_result: AYResult::Unknown(reason.to_string()),
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         }
     }
@@ -976,6 +1160,8 @@ mod tests {
             name: name.to_string(),
             category: ProofCategory::Arithmetic,
             ay_result: AYResult::Error("solver unavailable".to_string()),
+            solver: None,
+            source: AyVerdictSource::NotRun,
             duration: Duration::from_millis(1),
         }
     }
@@ -1007,11 +1193,33 @@ mod tests {
             unknown("u").failure_class(),
             Some(FailureClass::SolverCapacity)
         );
-        // A proof-authority rejection is a caught wrong answer, not capacity.
+        // A disclosed proof hole (the tracked BvBitBlast capability gap) stays
+        // capacity-pending.
+        assert_eq!(
+            authority_rejected_unknown(
+                "hole",
+                "incomplete AY proof certificate: c ay.proof.certificate unproved_steps=1 \
+                 foreign_assumes=no trust_free=no",
+            )
+            .failure_class(),
+            Some(FailureClass::SolverCapacity)
+        );
+        // A proof-authority rejection is a caught wrong answer, not capacity:
+        // AY's own self-check, or a working independent checker refusing the
+        // exact proof.
+        let checker_rejection = crate::ay_bridge::working_checker_rejection_reason(
+            std::path::Path::new("/pkg/store/clean/8606/bin/clean"),
+        );
         for reason in [
             "(:reason-unknown (incomplete self-check-rejected))",
             "(:reason-unknown (incomplete proof-trusted))",
             "(:reason-unknown internal-error)",
+            checker_rejection.as_str(),
+            // AY's ALWAYS-ON model gate caught one of AY's OWN theory-search
+            // paths returning a model that falsifies an assertion. Strictly
+            // worse than the self-check envelope above: a caught invalid
+            // model must not land in the PENDING(solver-capacity) ledger.
+            crate::gap_classify::AY_SOUNDNESS_GATE_REASON,
         ] {
             let rejected = authority_rejected_unknown("rejected", reason);
             assert_eq!(
@@ -1103,5 +1311,136 @@ mod tests {
         assert!(!r.has_soundness_failure());
         assert!(r.solver_capacity_pending().is_empty());
         assert!(r.soundness_failures().is_empty());
+    }
+
+    fn one_obligation_db(name: &str) -> ProofDatabase {
+        use crate::smt::SmtExpr;
+        let x = SmtExpr::var("gate_provenance_x", 8);
+        ProofDatabase::from_proofs(vec![crate::proof_database::CategorizedProof {
+            obligation: crate::lowering_proof::ProofObligation {
+                machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+                name: name.to_string(),
+                trust_ir_expr: x.clone().bvadd(SmtExpr::bv_const(1, 8)),
+                aarch64_expr: x,
+                inputs: vec![("gate_provenance_x".to_string(), 8)],
+                preconditions: vec![],
+                fp_inputs: vec![],
+                category: None,
+            },
+            category: ProofCategory::Arithmetic,
+        }])
+    }
+
+    /// Measured round-4 defect: a gate configured with one AY ran it, then
+    /// re-ran default selection to fill `solver_info`, naming a DIFFERENT AY.
+    /// The report must name the AY every obligation actually ran under.
+    #[cfg(unix)]
+    #[test]
+    fn strict_gate_report_names_the_ay_that_ran() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = directory.path().join("gate-ay");
+        std::fs::write(
+            &fixture,
+            crate::ay_identity::test_fixtures::bind_self(
+                &fixture,
+                &crate::ay_identity::test_fixtures::with_warm_guard(
+                    "#!/bin/sh\nprintf 'ran\\n' >> \"$0.calls\"\nprintf 'unknown\\n'\n",
+                ),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Started once (uncounted) before the gate's deadline: its private
+        // copy is a new file (`test_fixtures::warm`).
+        crate::ay_identity::test_fixtures::warm(&fixture);
+        let solver = crate::ay_identity::test_fixtures::pin(&fixture);
+        let gate = GateConfig::strict_with_ay(
+            AYConfig::default()
+                .with_timeout(10_000)
+                .with_solver(solver.clone()),
+        );
+        let result = trust_cg_process_env::with_env_overrides(
+            &[
+                ("TCG_NO_SOLVER_SERVER", "1"),
+                ("TCG_NO_CERT_STORE", "1"),
+                ("TCG_CANARY_NO_CACHE", "1"),
+            ],
+            || gate.discharge_with_availability(&one_obligation_db("gate_provenance"), true),
+        );
+        let Err(GateError::NotAllVerified(report)) = result else {
+            panic!("an `unknown` fixture cannot pass the strict gate: {result:?}");
+        };
+        let calls =
+            std::fs::read_to_string(directory.path().join("gate-ay.calls")).unwrap_or_default();
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "the configured AY ran exactly once"
+        );
+        assert_eq!(report.solver.as_deref(), Some(&solver));
+        assert!(
+            report.solver_info.contains(&fixture.display().to_string())
+                && report.solver_info.contains(solver.sha256())
+                && report.solver_info.contains("route=explicit-pinned-ay"),
+            "the report must name the AY that ran: {}",
+            report.solver_info
+        );
+        if let Ok(default_ay) = crate::ay_identity::resolve_for_process() {
+            assert!(
+                !report.solver_info.contains(default_ay.sha256()),
+                "the report must not re-select the default AY: {}",
+                report.solver_info
+            );
+        }
+        let [result] = report.results.as_slice() else {
+            panic!("one obligation, one result: {report:?}");
+        };
+        assert!(
+            matches!(result.ay_result, AYResult::Unknown(_)),
+            "{result:?}"
+        );
+        assert_eq!(result.solver.as_ref(), Some(&solver));
+        assert_eq!(result.source, AyVerdictSource::LiveSolve);
+    }
+
+    /// A refused default AY is named in the report and on every obligation, and
+    /// is never re-selected per obligation.
+    #[cfg(unix)]
+    #[test]
+    fn strict_gate_report_names_a_refused_ay() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-ay");
+        let gate = GateConfig::strict();
+        let result = trust_cg_process_env::with_env_edits(|environment| {
+            environment.set("AY_SOLVER_PATH", missing.as_os_str());
+            environment.remove(crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV);
+            gate.discharge_with_availability(&one_obligation_db("gate_refusal"), true)
+        });
+        let Err(GateError::NotAllVerified(report)) = result else {
+            panic!("a refused AY cannot pass the strict gate: {result:?}");
+        };
+        let code = if crate::ay_identity::recorded_toolchain_ay_identity().is_ok() {
+            "TCG-AY-IDENTITY-OVERRIDE-MISSING"
+        } else {
+            "TCG-AY-IDENTITY-UNRECORDED"
+        };
+        assert!(report.solver.is_none());
+        assert!(
+            report
+                .solver_info
+                .starts_with(&format!("no AY solver admitted: [{code}]")),
+            "{}",
+            report.solver_info
+        );
+        let [result] = report.results.as_slice() else {
+            panic!("one obligation, one result: {report:?}");
+        };
+        assert!(
+            matches!(&result.ay_result, AYResult::Error(message) if message.contains(code)),
+            "{result:?}"
+        );
+        assert_eq!(result.source, AyVerdictSource::NotRun);
+        assert!(result.solver.is_none());
     }
 }

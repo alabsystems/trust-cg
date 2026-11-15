@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Completeness gap #97 — fn-pointer-as-value / fn-pointer-table programs.
 //
@@ -32,75 +36,25 @@ mod target_dir_support;
 // passed as a `fn(..)` parameter and called; a fn returned from a fn; a struct
 // field holding a fn pointer; a branch-varying (phi) fn-pointer value then called.
 //
-// FAIL-CLOSED (safe; pinned NOT to miscompile): a non-capturing closure coerced
-// to `fn(..)` (`ClosureFnPointer` — its call-once reify shim was observed to land
-// at the wrong code, so it is left to fail closed); `fn(..) as usize`
-// (`PointerExposeProvenance`, a separate cast surface). For these the test pins
-// the SAFETY INVARIANT: trust-cg must EITHER fail closed OR match the LLVM oracle,
-// never silently return a different value.
+// FAIL-CLOSED-OR-CORRECT (pinned NOT to miscompile): a non-capturing closure
+// coerced to `fn(..)` (`ClosureFnPointer` — the pointer names a module-local entry
+// with the pointer's untupled signature, whose in-module address a native object
+// writer may still refuse to materialize); `fn(..) as usize` (`PointerExposeProvenance`,
+// a separate cast surface). For these the test pins the SAFETY INVARIANT:
+// trust-cg must EITHER fail closed OR match the LLVM oracle, never silently
+// return a different value.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build", "--release"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m97 test");
-    let built = target_dir
-        .join("release")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn workdir(stem: &str) -> PathBuf {
@@ -115,7 +69,7 @@ fn write_panic_stubs(dir: &Path, obj: &Path) -> PathBuf {
     let mut stubs = String::from("#include <stdlib.h>\n");
     for line in String::from_utf8_lossy(&nm.stdout).lines() {
         let sym = line.trim().trim_start_matches('U').trim();
-        if sym.contains("panic") {
+        if toolchain_support::is_abort_stub_symbol(sym) {
             let c = sym.strip_prefix('_').unwrap_or(sym);
             stubs.push_str(&format!(
                 "void {c}(void) __asm__(\"{sym}\"); void {c}(void){{ abort(); }}\n"
@@ -143,16 +97,14 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> O
     let src_path = dir.join("prog.rs");
     std::fs::write(&src_path, src).expect("write source");
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .arg("--crate-type")
-        .arg("bin");
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.arg("--crate-type").arg("bin");
     if let Some(dylib) = dylib {
         // `TCG_NO_PROOF_CERTS=1`: skip the per-compile lowering proof certs so the
         // differential exercises functionality (fn-address materialization) in
         // isolation. The default-certs sanity is covered separately by
         // `m97_default_certs_sanity`.
-        cmd.env("TCG_NO_PROOF_CERTS", "1");
+        cmd.arg(toolchain_support::backend_knobs_arg(&["no-proof-certs"]));
         let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
         backend_arg.push(dylib);
         cmd.arg(&backend_arg);
@@ -163,7 +115,7 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> O
         .arg("--out-dir")
         .arg(&dir)
         .arg(&src_path);
-    let output = cmd.output().expect("failed to spawn rustc via rustup");
+    let output = cmd.output().expect("failed to spawn trustc");
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         if dylib.is_some() {
@@ -178,7 +130,10 @@ fn compile_link_run(stem: &str, src: &str, opt: &str, dylib: Option<&Path>) -> O
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "o"))
         .collect();
-    assert!(!objs.is_empty(), "{stem} (opt={opt}): no object file produced");
+    assert!(
+        !objs.is_empty(),
+        "{stem} (opt={opt}): no object file produced"
+    );
 
     let stubs_path = write_panic_stubs(&dir, &objs[0]);
 
@@ -384,9 +339,8 @@ fn m97_fn_pointer_branch_select() {
 // Fail-closed shapes — MUST fail closed OR be correct, NEVER silently wrong.
 // ---------------------------------------------------------------------------
 
-/// A non-capturing closure coerced to `fn(..)` (`ClosureFnPointer`). Left to fail
-/// closed (its call-once reify shim lands at the wrong code), pinned not to
-/// miscompile.
+/// A non-capturing closure coerced to `fn(..)` (`ClosureFnPointer`), pinned not
+/// to miscompile: its entry takes the pointer's untupled arguments.
 #[test]
 fn m97_closure_to_fn_pointer_safe() {
     no_silent_miscompile(
@@ -436,8 +390,7 @@ fn m97_default_certs_sanity() {
     // DEFAULT config: no TCG_NO_PROOF_CERTS env — proof certs ON.
     let mut backend_arg = std::ffi::OsString::from("-Zcodegen-backend=");
     backend_arg.push(&dylib);
-    let output = Command::new("rustup")
-        .args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
+    let output = toolchain_support::rustc_command()
         .args(["--crate-type", "bin"])
         .arg(&backend_arg)
         .args(["--target", TARGET, "-Cpanic=abort", "-Coverflow-checks=off"])

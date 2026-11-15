@@ -122,6 +122,8 @@ use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
 use trust_cg_lower::instructions::Block;
 use trust_cg_lower::{X86ISelBlock, X86ISelFunction, X86ISelInst, X86ISelOperand};
 
+use crate::x86_trap_block::is_pure_trap_block;
+
 use crate::generic_branch_layout::analyze_branch_layout;
 use crate::mach_view::{CfgAnalysis, GenericLoop};
 use crate::x86_pass_manager::X86MachinePass;
@@ -373,7 +375,25 @@ impl X86MachinePass for X86BranchLayout {
                 }
                 // Latch rule (profile-independent): back-edge on the JMP ->
                 // move it onto the taken JCC, saving one branch per iteration.
-                Some(&(header, _)) if jump_target == header => self.config.latch_rule,
+                //
+                // ⚑ UNLESS the `jmp` back-edge is already the layout successor.
+                // The rule's whole premise is that a back-edge riding the
+                // unconditional `jmp` costs a taken branch; when the header is
+                // the NEXT laid-out block the encoder elides that `jmp`, so the
+                // back-edge costs ZERO and swapping would turn a free
+                // fall-through into a taken `jcc` — strictly worse on every
+                // path. This is the same guard the generic fall-through rule
+                // below already carries, for the same reason.
+                //
+                // That layout was unreachable until `x86_loop_top` began
+                // placing a latch immediately before its header, which is why
+                // the omission never bit: at O3 the pass manager runs to
+                // FIXPOINT, so without this the two rules flip the same pair
+                // every iteration and the emitted orientation is decided by
+                // the parity of the iteration budget, not by either rule.
+                Some(&(header, _)) if jump_target == header => {
+                    self.config.latch_rule && !exit.jump_is_layout_next
+                }
                 // Non-latch two-way exit. Three rules can fire here:
                 //
                 //  * Cold-trap rule (profile-FREE-correct, default ON): the
@@ -529,14 +549,6 @@ impl X86MachinePass for X86BranchLayout {
     }
 }
 
-/// True iff `block` is a provably-COLD trap sink: it exists and every one of
-/// its non-pseudo instructions is `Ud2`, with at least one such instruction.
-/// These are the bounds-check / null-check / panic=abort failure exits (a
-/// correct program never transfers control into them), so a layout that puts
-/// the trap on a never-taken conditional branch is a pure win — the cold-trap
-/// rule's soundness rests on this being a genuine dead-end sink, not on any
-/// profile estimate. A `Ud2` block has no successors (it faults), so no edge
-/// probability is being assumed away.
 /// True iff some natural loop in `cfg` contains `block` and `cond_target` but
 /// NOT `jump_target` — i.e. the terminal `jmp` rides a genuine loop-exit edge
 /// while the conditional branch stays inside the loop (the loop-exit rule's
@@ -562,21 +574,18 @@ fn jmp_rides_a_loop_exit_edge(
     })
 }
 
+/// True iff `block` is a provably-COLD trap sink: the shared pure-trap
+/// predicate (`crate::x86_trap_block`) — a no-successor block that is exactly
+/// `[Ud2]` or `[Call abort, Ud2]` modulo pseudo padding. These are the
+/// bounds-check / null-check / panic=abort failure exits (a correct program
+/// never transfers control into them), so a layout that puts the trap on a
+/// never-taken conditional branch is a pure win — the cold-trap rule's
+/// soundness rests on this being a genuine dead-end sink, not on any profile
+/// estimate. Both shapes have no successors (they die), so no edge
+/// probability is being assumed away. Any other real instruction means the
+/// block does work — not a pure trap sink — and fails closed (not cold).
 fn block_is_cold_trap(func: &X86ISelFunction, block: Block) -> bool {
-    let Some(b) = func.blocks.get(&block) else {
-        return false;
-    };
-    let mut saw_ud2 = false;
-    for inst in &b.insts {
-        match inst.opcode {
-            X86Opcode::Nop | X86Opcode::Phi | X86Opcode::StackAlloc => continue,
-            X86Opcode::Ud2 => saw_ud2 = true,
-            // Any other real instruction means the block does work — not a
-            // pure trap sink. Fail closed (do not treat as cold).
-            _ => return false,
-        }
-    }
-    saw_ud2
+    is_pure_trap_block(func, block)
 }
 
 // ===========================================================================
@@ -857,6 +866,22 @@ fn plan_cold_arm_sink(
         .filter(|&i| lp.body.contains(&order[i]))
         .max()?;
     let anchor = order[anchor_pos];
+
+    // F12 — the move must actually REMOVE the arm from the hot path. When the
+    // anchor IS the kept arm, the arm is merely swapped with its immediate
+    // neighbour and stays inside the loop's laid-out span: measured on h1/h3/
+    // h4 (2026-08-30 objdump A/B), that degenerate case ADDS one in-loop `jmp`
+    // per program (h3 also +32 bytes of `main`), while the one genuine sink
+    // (h2, anchor != kept) removed 5 instructions, 4 of them in-loop. The
+    // pass's own ACCEPT log cannot see this — it reports `anchor_jmp=None`
+    // (the rule materialized nothing) while the ENCODER stops eliding a
+    // fall-through `jmp` that the permutation made non-adjacent. Only
+    // disassembly shows it, which is why this guard is structural rather than
+    // a cost model: an arm whose landing site is the very block it branches
+    // past has not been sunk out of anything.
+    if anchor == kept {
+        return None;
+    }
 
     // Seam repair, decided from OLD layout facts before any mutation: after
     // inserting the arm behind the anchor, the anchor's layout successor
@@ -1266,6 +1291,30 @@ mod tests {
     }
 
     #[test]
+    fn latch_rule_declines_a_back_edge_that_already_falls_through() {
+        // The layout `x86_loop_top` produces: the latch sits immediately
+        // BEFORE its header, so the latch's `jmp header` is the layout
+        // successor and the encoder elides it — the back-edge already costs
+        // ZERO branches. Swapping would put it on a TAKEN `jcc`, which is
+        // strictly worse, and at O3 (fixpoint) the two rules would flip the
+        // same pair every iteration.
+        let mut f = two_branch_latch_loop();
+        f.block_order = vec![Block(0), Block(2), Block(1), Block(3)];
+
+        let mut pass = X86BranchLayout::new(admit_exact);
+        assert!(
+            !pass.run(&mut f),
+            "the latch rule must decline a back-edge that is already a fall-through"
+        );
+        assert_eq!(pass.last_run_swaps, 0);
+
+        let (cc, t, jf) = terminator_shape(&f, Block(2));
+        assert_eq!(cc, X86CondCode::GE, "condition untouched");
+        assert_eq!(t, Block(3), "exit stays on the jcc");
+        assert_eq!(jf, Block(1), "the back-edge stays on the elidable jmp");
+    }
+
+    #[test]
     fn rotated_latch_is_never_swapped_away() {
         // Latch already ends `jcc L header; jmp exit` — optimal. The
         // fallthrough rule must NOT swap it back even though the jcc target
@@ -1412,6 +1461,54 @@ mod tests {
         assert_eq!(t, Block(2), "trap moved onto the (never-taken) jcc");
         assert_eq!(jf, Block(1), "hot path is now the fall-through jmp");
         assert_eq!(f.blocks[&Block(0)].successors, succs_before);
+    }
+
+    #[test]
+    fn cold_trap_rule_fires_on_abort_call_trap() {
+        // The bridge's `[Call abort, Ud2]` panic=abort assert block is as cold
+        // as a bare `Ud2`: the rule inverts so the trap rides the never-taken
+        // jcc.
+        let mut f = cold_trap_diamond();
+        f.blocks.get_mut(&Block(2)).unwrap().insts = vec![
+            X86ISelInst::new(
+                X86Opcode::Call,
+                vec![X86ISelOperand::Symbol("abort".to_string())],
+            ),
+            X86ISelInst::new(X86Opcode::Ud2, vec![]),
+        ];
+        assert!(block_is_cold_trap(&f, Block(2)));
+        let mut pass = X86BranchLayout::with_config(admit_exact, X86BranchLayoutConfig::default());
+        assert!(
+            pass.run(&mut f),
+            "cold-trap inversion must fire on the abort block"
+        );
+        assert_eq!(pass.last_run_swaps, 1);
+        let (cc, t, jf) = terminator_shape(&f, Block(0));
+        assert_eq!(cc, X86CondCode::NE);
+        assert_eq!(t, Block(2), "trap moved onto the (never-taken) jcc");
+        assert_eq!(jf, Block(1));
+    }
+
+    #[test]
+    fn cold_trap_rule_ignores_other_call_sink() {
+        // `[Call exit, Ud2]`: a call to any other symbol is real work — not a
+        // cold trap sink. The rule must not fire.
+        let mut f = cold_trap_diamond();
+        f.blocks.get_mut(&Block(2)).unwrap().insts = vec![
+            X86ISelInst::new(
+                X86Opcode::Call,
+                vec![X86ISelOperand::Symbol("exit".to_string())],
+            ),
+            X86ISelInst::new(X86Opcode::Ud2, vec![]),
+        ];
+        assert!(!block_is_cold_trap(&f, Block(2)));
+        let before = terminator_shape(&f, Block(0));
+        let mut pass = X86BranchLayout::with_config(admit_exact, X86BranchLayoutConfig::default());
+        assert!(
+            !pass.run(&mut f),
+            "cold-trap rule must not fire on a non-abort call sink"
+        );
+        assert_eq!(terminator_shape(&f, Block(0)), before);
     }
 
     #[test]
@@ -1918,6 +2015,28 @@ mod tests {
                 "block {i}: successors must be untouched"
             );
         }
+    }
+
+    #[test]
+    fn cold_arm_sink_declines_when_the_anchor_is_the_kept_arm() {
+        // F12: an arm whose landing site is the very block it branches past
+        // has not been sunk out of anything — it is swapped with its
+        // neighbour and stays in the loop span. Measured on h1/h3/h4
+        // (2026-08-30): that shape ADDS one in-loop `jmp` per program
+        // (h3 also +32 bytes) because the encoder stops eliding a
+        // fall-through the permutation made non-adjacent. Only the genuine
+        // case (h2, anchor != kept) removed instructions.
+        let mut f = intra_loop_call_arm_diamond();
+        // Lay the latch (b4) BEFORE the diamond so the kept arm (b3) is the
+        // last in-loop block after the cold arm (b2): the anchor and the kept
+        // arm coincide and nothing remains to sink past. Loop membership is
+        // successor-derived, so the loop is unchanged; only layout moves.
+        f.block_order = vec![Block(0), Block(4), Block(1), Block(2), Block(3), Block(5)];
+        let before = f.block_order.clone();
+        let mut pass = X86BranchLayout::with_config(admit_exact, default_plus_sink_config());
+        pass.run(&mut f);
+        assert_eq!(pass.last_run_sinks, 0, "degenerate swap must not sink");
+        assert_eq!(f.block_order, before, "layout must be untouched");
     }
 
     #[test]

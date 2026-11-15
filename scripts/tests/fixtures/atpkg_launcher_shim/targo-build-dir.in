@@ -1,0 +1,73 @@
+#!/bin/sh
+# atpkg shim — exec so the tool authenticates at its real path.
+# aterm: build intermediates out of Spotlight
+__atb_t=
+__atb_c=${HOME-}/Library/Caches/aterm/cargo-build.noindex
+__atb=
+case ${HOME-} in /?*) case ${PWD-} in "$HOME"/*) __atb=1 ;; esac ;; esac
+case ${HOME-} in *[\'[:cntrl:]]*) __atb= ;; esac
+case ${HOME-}${PWD-} in *[{}]*) __atb= ;; esac
+case ${PWD-} in "$__atb_c" | "$__atb_c"/*) __atb= ;; esac
+[ -n "${CARGO_TARGET_DIR+1}${CARGO_BUILD_TARGET_DIR+1}${CARGO_BUILD_BUILD_DIR+1}" ] && __atb=
+__atb_scan() {
+  for __atb_f in "$1/config.toml" "$1/config"; do
+    [ -f "$__atb_f" ] || continue
+    [ -r "$__atb_f" ] || { __atb=; return; }
+    while IFS= read -r __atb_l || [ -n "$__atb_l" ]; do
+      case $__atb_l in *target-dir* | *build-dir*)
+        case ${__atb_l#"${__atb_l%%[![:blank:]]*}"} in [#]*) ;; *) __atb=; return ;; esac ;;
+      esac
+    done < "$__atb_f"
+  done
+}
+__atb_ok() {
+  case $1 in
+    c) case $2 in *target-dir* | *build-dir*) __atb= ;; *=*) ;; *) __atb= ;; esac ;;
+    m) case $2 in *..* | *[{}]* | "$__atb_c"/*) __atb= ;; "$HOME"/* | [!/]*) ;; *) __atb= ;; esac ;;
+  esac
+}
+if [ -n "$__atb" ]; then
+  __atb_v=$__atb_t __atb_u= __atb_n=
+  for __atb_a in "$@"; do
+    case $__atb_n in
+      c | m) __atb_ok "$__atb_n" "$__atb_a"; __atb_n=; continue ;;
+      s) __atb_n=; continue ;;
+    esac
+    case $__atb_a in
+      --) break ;;
+      --unverified) __atb_u=1 ;;
+      --config) __atb_n=c ;;
+      --config=*) __atb_ok c "${__atb_a#--config=}" ;;
+      --manifest-path) __atb_n=m ;;
+      --manifest-path=*) __atb_ok m "${__atb_a#--manifest-path=}" ;;
+      --target-dir | --target-dir=* | -C | -C?*) __atb= ;;
+      -Z | --color | --explain) [ -n "$__atb_v" ] || __atb_n=s ;;
+      -*) ;;
+      *) [ -n "$__atb_v" ] || __atb_v=$__atb_a ;;
+    esac
+  done
+  [ -z "$__atb_n" ] || __atb=
+  case $__atb_v in
+    clean | tippy | clippy) ;;
+    build | b | check | c | test | t | run | r | bench | doc | d | rustc | rustdoc | fix) [ -n "$__atb_u" ] || __atb= ;;
+    *) __atb= ;;
+  esac
+fi
+if [ -n "$__atb" ]; then
+  __atb_d=$PWD
+  while [ -n "$__atb" ]; do
+    if [ -h "$__atb_d" ]; then __atb=; break; fi
+    __atb_scan "$__atb_d/.cargo"
+    [ -n "$__atb_d" ] || break
+    __atb_d=${__atb_d%/*}
+  done
+fi
+[ -n "$__atb" ] && __atb_scan "${CARGO_HOME:-$HOME/.cargo}"
+if [ -n "$__atb" ]; then
+  if [ -d "$__atb_c" ]; then [ -w "$__atb_c" ] || __atb=
+  elif [ -d "${__atb_c%/*}" ]; then [ -w "${__atb_c%/*}" ] || __atb=
+  else [ -w "$HOME/Library/Caches" ] || __atb=
+  fi
+fi
+[ -n "$__atb" ] && set -- --config "build.build-dir='$__atb_c{workspace-root}/.cargo-build'" "$@"
+exec '@TARGET@' "$@"

@@ -41,17 +41,21 @@ pub const WASM32_TRIPLE: &str = "wasm32-unknown-unknown";
 /// Callers building modules for this backend stamp
 /// `module.target_info = Some(wasm32_target_info())` before compiling.
 ///
-/// `struct_passing` is [`trust_ir::StructPassingPolicy::Unclassified`] — the
-/// honest declaration for producers that perform no aggregate classification.
-/// The wasm lane needs none: by-value aggregates in signatures are refused at
-/// type mapping, so no classification claim is ever consumed.
+/// `struct_passing` is [`trust_ir::StructPassingPolicy::NativeC`]: the lane
+/// passes a by-value aggregate by the WebAssembly Basic C ABI (the classifier
+/// in `lower/abi.rs`), so a module stamped with this shape claims exactly the
+/// classification the lane applies. A producer that performed no aggregate
+/// classification stamps `Unclassified` itself, and the lane refuses such a
+/// module once an aggregate crosses a call edge by value
+/// (`trust_cg_lower::reject_unconsumed_struct_passing`); `AlwaysMemory` is
+/// refused outright.
 pub fn wasm32_target_info() -> trust_ir::TargetInfo {
     trust_ir::TargetInfo {
         triple: WASM32_TRIPLE.to_string(),
         pointer_size: 4,
         endianness: trust_ir::Endianness::Little,
         abi: None,
-        struct_passing: trust_ir::StructPassingPolicy::Unclassified,
+        struct_passing: trust_ir::StructPassingPolicy::NativeC,
     }
 }
 
@@ -85,9 +89,6 @@ mod tests {
         assert_eq!(ti.pointer_size, 4);
         assert_eq!(ti.endianness, trust_ir::Endianness::Little);
         assert_eq!(ti.abi, None);
-        assert_eq!(
-            ti.struct_passing,
-            trust_ir::StructPassingPolicy::Unclassified
-        );
+        assert_eq!(ti.struct_passing, trust_ir::StructPassingPolicy::NativeC);
     }
 }

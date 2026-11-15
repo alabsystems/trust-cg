@@ -18,7 +18,8 @@
 //      compared against an undefined register.
 //
 // Both are fixed and this test pins them bit-exact against C11 `<stdatomic.h>`
-// on real Apple Silicon at O0 and O2. Single-threaded suffices to catch the
+// at O0 and O2 on AArch64 macOS (Darwin AOT and explicit-LSE pipeline lanes)
+// and Linux GNU (explicit LSE). Single-threaded suffices to catch the
 // value bug (the read-modify-write arithmetic and the compare-exchange logic).
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
@@ -35,19 +36,108 @@ use trust_ir::{BlockId, FuncId};
 
 use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
+use trust_cg_codegen::target::{AArch64IsaProfile, TargetSpec};
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O) can link and run the objects.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
+}
+
+/// The optional ISA feature this family needs. Darwin's AOT target contract
+/// admits it, so the production `Compiler` lane runs there; generic Linux AOT
+/// has no LSE and lowers the family through LL/SC loops instead (pinned
+/// below; executed by `e2e_aarch64_llsc_atomics`), so every native host also
+/// runs the explicit-profile pipeline lane, which is the only LSE lane on
+/// Linux GNU. A host CPU without LSE is a failure, never a skip.
+const PROFILE: AArch64IsaProfile = AArch64IsaProfile::LSE;
+
+fn objects_at(module: &TrustIrModule, opt: OptLevel) -> Vec<(&'static str, Vec<u8>)> {
+    let mut objects = Vec::new();
+    if !native_host::LINUX_GNU {
+        objects.push(("darwin-aot", compile_at(module, opt)));
+    }
+    if native_host::NATIVE {
+        assert!(
+            PROFILE.is_supported_by_host(),
+            "the explicit LSE native lane requires host LSE"
+        );
+        let object = native_host::compile_with_isa_profile(module, opt, PROFILE)
+            .unwrap_or_else(|error| panic!("explicit LSE {opt:?}: {error}"));
+        objects.push(("explicit-lse", object));
+    }
+    objects
+}
+
+/// Generic Linux AOT has no LSE capability, so it never emits an LSE word
+/// for this family: every SeqCst atomic lowers to one LL/SC retry loop (one
+/// LDAXR{B,H} and one STLXR{B,H}, natively executed by
+/// `e2e_aarch64_llsc_atomics`). Only the explicit profile admits LSE.
+/// Object-level, so it runs on every host.
+#[test]
+fn generic_linux_aot_lowers_lse_family_through_llsc_without_lse_words() {
+    let object = Compiler::new_for_target_spec(
+        CompilerConfig::default(),
+        TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&build_module())
+    .unwrap_or_else(|error| panic!("generic Linux AOT must lower through LL/SC: {error}"))
+    .object_code;
+    let words = native_host::text_words(&object);
+    // CAS/CASA/CASL/CASAL{B,H} and the LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}/SWP
+    // atomic memory operations, at every size and ordering.
+    let lse: Vec<_> = words
+        .iter()
+        .filter(|word| **word & 0x3fa0_7c00 == 0x08a0_7c00 || **word & 0x3f20_0c00 == 0x3820_0000)
+        .collect();
+    assert!(
+        lse.is_empty(),
+        "generic Linux AOT emitted LSE words {lse:08x?}"
+    );
+    // Single-register load/store exclusives: bit 22 is L, bit 15 is o0
+    // (acquire for a load, release for a store), bits 31:30 the size.
+    let exclusives: Vec<u32> = words
+        .iter()
+        .copied()
+        .filter(|word| word & 0x3fa0_7c00 == 0x0800_7c00)
+        .collect();
+    assert!(
+        exclusives.iter().all(|word| (word >> 15) & 1 == 1),
+        "SeqCst LL/SC loops use LDAXR/STLXR: {exclusives:08x?}"
+    );
+    // Per-size expectation table for a family that grows: the sizes here are the
+    // encoding's 31:30 field, and only the doubleword row is populated while this
+    // module builds I64 atomics, so clippy sees one element.
+    #[allow(clippy::single_element_loop)]
+    for (size, expected) in [(3u32, 12usize)] {
+        let of_size = |load: bool| {
+            exclusives
+                .iter()
+                .filter(|word| *word >> 30 == size && ((*word >> 22) & 1 == 1) == load)
+                .count()
+        };
+        assert_eq!(
+            (of_size(true), of_size(false)),
+            (expected, expected),
+            "size {size}: one load- and one store-exclusive per atomic"
+        );
+    }
 }
 
 // `fn name(p: *mut i64, v: i64) -> i64 { atomicrmw <op> seq_cst *p, v }`
 // returns the OLD value.
 fn build_rmw(id: u32, name: &str, m: &mut TrustIrModule, op: AtomicRMWOp) {
-    let ft = m.add_func_type(FuncTy {
-        params: vec![Ty::PtrMut(Box::new(Ty::I64)), Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::PtrMut(Box::new(Ty::I64)), Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut f = TrustIrFunction::new(FuncId::new(id), name, ft, BlockId::new(0));
     f.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -69,7 +159,8 @@ fn build_rmw(id: u32, name: &str, m: &mut TrustIrModule, op: AtomicRMWOp) {
             }),
         ],
     }];
-    m.add_function(f);
+    m.try_add_function(f)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_module() -> TrustIrModule {
@@ -92,11 +183,14 @@ fn build_module() -> TrustIrModule {
     }
 
     // `fn cas_old(p, expected, desired) -> i64` returns the loaded value.
-    let cas_ft = m.add_func_type(FuncTy {
-        params: vec![Ty::PtrMut(Box::new(Ty::I64)), Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let cas_ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::PtrMut(Box::new(Ty::I64)), Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut cas_old = TrustIrFunction::new(FuncId::new(100), "cas_old", cas_ft, BlockId::new(0));
     cas_old.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -113,6 +207,7 @@ fn build_module() -> TrustIrModule {
                 desired: ValueId::new(2),
                 success: Ordering::SeqCst,
                 failure: Ordering::SeqCst,
+                weak: false,
             })
             .with_results(vec![ValueId::new(3), ValueId::new(4)]),
             InstrNode::new(Inst::Return {
@@ -120,14 +215,18 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(cas_old);
+    m.try_add_function(cas_old)
+        .expect("Module::try_add_function: test fixture");
 
     // `fn cas_ok(p, expected, desired) -> i64` returns the success flag (0/1).
-    let cas_ok_ft = m.add_func_type(FuncTy {
-        params: vec![Ty::PtrMut(Box::new(Ty::I64)), Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let cas_ok_ft = m
+        .add_func_type(FuncTy {
+            params: vec![Ty::PtrMut(Box::new(Ty::I64)), Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut cas_ok = TrustIrFunction::new(FuncId::new(101), "cas_ok", cas_ok_ft, BlockId::new(0));
     cas_ok.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -144,6 +243,7 @@ fn build_module() -> TrustIrModule {
                 desired: ValueId::new(2),
                 success: Ordering::SeqCst,
                 failure: Ordering::SeqCst,
+                weak: false,
             })
             .with_results(vec![ValueId::new(3), ValueId::new(4)]),
             InstrNode::new(Inst::Cast {
@@ -158,7 +258,8 @@ fn build_module() -> TrustIrModule {
             }),
         ],
     }];
-    m.add_function(cas_ok);
+    m.try_add_function(cas_ok)
+        .expect("Module::try_add_function: test fixture");
     m
 }
 
@@ -166,7 +267,8 @@ fn compile_at(module: &TrustIrModule, opt: OptLevel) -> Vec<u8> {
     let compiler = Compiler::new(CompilerConfig {
         opt_level: opt,
         ..CompilerConfig::default()
-    });
+    })
+    .with_codegen_license(permit_unlicensed());
     let r = compiler
         .compile(module)
         .expect("atomics module must compile");
@@ -203,8 +305,8 @@ int main(void){
 "#;
 
 fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: needs aarch64-apple-darwin");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
     }
     let dir = std::env::temp_dir().join(format!("trust_cg_{tag}_e2e"));
@@ -222,6 +324,7 @@ fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
             "-o",
             bin_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc");
     assert!(
@@ -243,13 +346,52 @@ fn link_run(tag: &str, obj: &[u8]) -> Option<i32> {
 fn e2e_aarch64_atomicrmw_and_cmpxchg() {
     let module = build_module();
     for opt in [OptLevel::O0, OptLevel::O2] {
-        let obj = compile_at(&module, opt);
-        let Some(code) = link_run("atomics", &obj) else {
+        let objects = objects_at(&module, opt);
+        if objects.is_empty() {
+            eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
             return;
-        };
-        assert_eq!(
-            code, 0,
-            "atomic op mismatch at {opt:?} (failing code {code})"
+        }
+        for (lane, obj) in objects {
+            let Some(code) = link_run(&format!("atomics_{lane}"), &obj) else {
+                return;
+            };
+            assert_eq!(
+                code, 0,
+                "atomic op mismatch at {opt:?} via {lane} (failing code {code})"
+            );
+        }
+    }
+}
+
+/// The Linux GNU explicit-lse lane's object, checked at object level on
+/// every host: it compiles for the generic Linux triple and carries the
+/// feature's instructions.
+#[test]
+fn explicit_lse_linux_object_carries_feature_instructions() {
+    for opt in [OptLevel::O0, OptLevel::O2] {
+        let object = native_host::compile_with_isa_profile_for(
+            "aarch64-unknown-linux-gnu",
+            &build_module(),
+            opt,
+            AArch64IsaProfile::LSE,
+        )
+        .unwrap_or_else(|error| panic!("{opt:?}: {error}"));
+        native_host::assert_elf_aarch64_object(&object);
+        // LSE atomic memory operations: CAS* (0x08a07c00 family) and LD<op>/SWP
+        // (0x38200000 family with V=0, bit 21 set).
+        let lse = |w: u32| w & 0x3fa0_7c00 == 0x08a0_7c00 || w & 0x3f20_0c00 == 0x3820_0000;
+        assert!(
+            native_host::text_words(&object).into_iter().any(lse),
+            "{opt:?}: explicit lse Linux object lacks the feature instructions"
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

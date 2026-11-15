@@ -1,0 +1,9 @@
+; mutant-of: mul_one
+; mutation: wrong constant (x * 2 is not x)
+; subject: i32
+(rule mul_one
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x (const 2)))
+  (rhs ?x)
+  (where))

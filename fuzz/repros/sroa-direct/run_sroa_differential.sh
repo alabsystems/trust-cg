@@ -14,14 +14,26 @@
 # Usage (from any cwd): [OPT=3] fuzz/repros/sroa-direct/run_sroa_differential.sh
 #   TCG_BRIDGE_DYLIB  librustc_codegen_trust_cg.{so,dylib} to test (default: the
 #                     release build under crates/rustc-codegen-trust-cg/target/)
-#   TC                rustup toolchain for the bridge (default nightly-2026-04-20)
+#   TRUSTC            the Trust compiler that loads the bridge (default: the
+#                     package scripts/trust_toolchain.py resolves)
 #   TARGET            optional --target triple (default: host). The promotion is
 #                     an x86 lane (TCG_X86_SROA_DIRECT), so run on an x86_64 host.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(git -C "$HERE" rev-parse --show-toplevel)" || { echo "FATAL: $HERE is not inside a git checkout" >&2; exit 2; }
-export PATH="$HOME/.cargo/bin:$PATH"
-TC="${TC:-nightly-2026-04-20}"
+# BLOCKED on the Trust toolchain. ALab systems build with Trust (owner
+# directive 2026-09-28), and the bridge dylib is built by and loaded into the
+# Trust compiler, so the retired stock nightly-2026-04-20 lane this runner used
+# can no longer load it. On trustc the arm under test cannot be switched:
+# TCG_X86_SROA_DIRECT is read from the environment by trust-cg-opt, and trustc refuses
+# every TCG_* variable (measured: "environment variable `TCG_X` is an
+# untracked Trust semantic/codegen control"). The arm is also x86-only, and no
+# x86_64 Trust package exists (X12). To revive this runner, port the knob to
+# -Ztrust-ir-cg-args (crates/rustc-codegen-trust-cg/src/knobs.rs) and run it on
+# an x86_64 Trust package; the compile lines below already use trustc.
+echo "BLOCKED: $(basename "$0") needs TCG_X86_SROA_DIRECT as a -Ztrust-ir-cg-args knob and an x86_64 Trust package (see the header)" >&2
+exit 2
+TRUSTC="${TRUSTC:-$(python3 -B "$ROOT/scripts/trust_toolchain.py" --print compiler)}" || { echo "FATAL: no installed Trust package resolves" >&2; exit 2; }
 OPT="${OPT:-3}"
 if [[ -n "${TCG_BRIDGE_DYLIB:-}" ]]; then
   DYLIB="$TCG_BRIDGE_DYLIB"
@@ -48,10 +60,10 @@ link() { # <objdir> <bin>
 
 compile() { # <src> <sroa:0|1> <bin>
   local src="$1" sroa="$2" bin="$3"
-  local pre=(TCG_NO_PROOF_CERTS=1)
+  local pre=()
   [[ "$sroa" == 1 ]] && pre+=(TCG_X86_SROA_DIRECT=1)
   local od; od=$(mktemp -d)
-  env "${pre[@]}" rustup run "$TC" rustc -Zcodegen-backend="$DYLIB" --edition=2021 \
+  env ${pre[@]+"${pre[@]}"} "$TRUSTC" -Ztrust-verify=off -Ztrust-ir-cg-args=no-proof-certs -Zcodegen-backend="$DYLIB" --edition=2021 \
     --crate-type bin ${TARGET_FLAGS[@]+"${TARGET_FLAGS[@]}"} -Cpanic=abort -Coverflow-checks=off \
     -Ccodegen-units=1 -Copt-level="$OPT" --emit=obj -o "$od/o.o" "$src" \
     >/dev/null 2>/dev/null || { rm -rf "$od"; return 1; }

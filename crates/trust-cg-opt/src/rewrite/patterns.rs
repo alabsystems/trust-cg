@@ -8,9 +8,7 @@
 //!
 //! These rules are the active implementation of former hand-written peephole
 //! patterns 1-52. Pattern 53 needs cross-block dominator information and lives
-//! in [`crate::rotate_idiom`]. See
-//! `designs/2026-04-19-rewrite-wave3-plan.md` for the migration inventory and
-//! wave breakdown.
+//! in [`crate::rotate_idiom`].
 //!
 //! # Migrated (single-instruction)
 //!
@@ -47,6 +45,7 @@
 //! | 28 | `sxtb(sxtb(x))`, `sxth(sxth(x))`, `sxtw(sxtw(x))` | collapse to one |
 //! | 46 | `uxtb(uxtb(x))` | collapse |
 //! | 47 | `uxth(uxth(x))` | collapse |
+//! | -- | `uxtb(and(x, #255))` | → copy the already-masked result |
 //!
 //! # Migrated (Wave 4, definer-driven)
 //!
@@ -412,6 +411,15 @@ fn add_self_to_shl_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
     if ctx.inst.operands.len() != 3 {
         return RewriteAction::None;
     }
+    // A source-attributed ADD must keep its source class until a checked
+    // source-to-shift rebind exists; an in-place rewrite retains its TV-1 stamp.
+    if ctx
+        .func
+        .inst_lowering_provenance(ctx.inst_id)
+        .is_source_attributed()
+    {
+        return RewriteAction::None;
+    }
     RewriteAction::Replace(MachInst::new(
         AArch64Target::shl_ri(),
         vec![
@@ -645,6 +653,66 @@ pub fn rule_uxth_uxth() -> Rule {
 /// `uxtw(uxtw(x))` → `uxtw(x)` (pattern 46/47 companion).
 pub fn rule_uxtw_uxtw() -> Rule {
     rule_same_ext_collapse("uxtw-uxtw-collapse", AArch64Opcode::Uxtw)
+}
+
+// =========================================================================
+// Exact byte-mask redundancy: uxtb(and(x, #255)) → copy the AND result
+// =========================================================================
+
+/// Build the exact `uxtb(and.w(x, #255))` → `Copy` rule.
+///
+/// A 32-bit `AndRI #255` already makes bits 31:8 zero, so applying `Uxtb` to
+/// its result cannot change any bit. The replacement deliberately copies the
+/// AND result rather than bypassing the AND: bypassing it would be unsound for
+/// a later 32-bit consumer. Restricting every register operand to GPR32 also
+/// keeps the equivalence independent of cross-width register semantics.
+pub fn rule_uxtb_of_and_ri_255() -> Rule {
+    RuleBuilder::match_opcode("uxtb-of-and-ri-255-to-copy", AArch64Opcode::Uxtb)
+        .benefit(16)
+        .constrain(DefinedByOpcode {
+            idx: 1,
+            opcode: AArch64Opcode::AndRI,
+        })
+        .constrain(DefinerImmEquals {
+            idx: 1,
+            def_operand_idx: 2,
+            value: 255,
+        })
+        .rewrite_with(uxtb_of_and_ri_255_rewrite)
+}
+
+fn uxtb_of_and_ri_255_rewrite(ctx: &MatchCtx<'_>) -> RewriteAction {
+    if ctx.inst.operands.len() != 2 {
+        return RewriteAction::None;
+    }
+    let def = match ctx.definer_of(1) {
+        Some(def) if def.operands.len() == 3 => def,
+        _ => return RewriteAction::None,
+    };
+
+    // Definer lookup is keyed by the full VReg identity, but keep the relation
+    // explicit here so future def-map representations cannot widen this rule.
+    if def.operands[0] != ctx.inst.operands[1] || !matches!(def.operands[2], MachOperand::Imm(255))
+    {
+        return RewriteAction::None;
+    }
+
+    if [
+        &ctx.inst.operands[0],
+        &ctx.inst.operands[1],
+        &def.operands[0],
+        &def.operands[1],
+    ]
+    .into_iter()
+    .any(|operand| operand_register_width(operand) != Some(32))
+    {
+        return RewriteAction::None;
+    }
+
+    RewriteAction::Replace(MachInst::new(
+        AArch64Opcode::Copy,
+        vec![ctx.inst.operands[0].clone(), ctx.inst.operands[1].clone()],
+    ))
 }
 
 // =========================================================================
@@ -921,7 +989,7 @@ fn mul_to_mov_from_op2(ctx: &MatchCtx<'_>) -> RewriteAction {
 }
 
 fn mul_to_neg_from_op1(ctx: &MatchCtx<'_>) -> RewriteAction {
-    if ctx.inst.operands.len() < 3 {
+    if ctx.inst.operands.len() < 3 || source_attributed_mul_to_neg(ctx) {
         return RewriteAction::None;
     }
     RewriteAction::Replace(MachInst::new(
@@ -931,13 +999,21 @@ fn mul_to_neg_from_op1(ctx: &MatchCtx<'_>) -> RewriteAction {
 }
 
 fn mul_to_neg_from_op2(ctx: &MatchCtx<'_>) -> RewriteAction {
-    if ctx.inst.operands.len() < 3 {
+    if ctx.inst.operands.len() < 3 || source_attributed_mul_to_neg(ctx) {
         return RewriteAction::None;
     }
     RewriteAction::Replace(MachInst::new(
         AArch64Opcode::Neg,
         vec![ctx.inst.operands[0].clone(), ctx.inst.operands[2].clone()],
     ))
+}
+
+fn source_attributed_mul_to_neg(ctx: &MatchCtx<'_>) -> bool {
+    // An Imul source stamp is not a proof of a Neg lowering. The in-place
+    // rewrite would retain that stamp without a checked class rebind.
+    ctx.func
+        .inst_lowering_provenance(ctx.inst_id)
+        .is_source_attributed()
 }
 
 /// Pattern 34: `mul x, y, MovI(#0)` → `mov x, #0`.
@@ -1832,6 +1908,7 @@ pub fn register_migrated(engine: &mut RewriteEngine) {
     engine.register(rule_uxtb_uxtb());
     engine.register(rule_uxth_uxth());
     engine.register(rule_uxtw_uxtw());
+    engine.register(rule_uxtb_of_and_ri_255());
     // Wave 4 (definer-driven).
     engine.register(rule_add_neg_rhs());
     engine.register(rule_add_neg_lhs());
@@ -1890,12 +1967,17 @@ pub fn register_migrated(engine: &mut RewriteEngine) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trust_cg_ir::provenance::{LoweringProvenance, SourceInstDigest, SourceInstId};
     use trust_cg_ir::{
         AArch64Opcode, BlockId, MachFunction, OpcodeCategory, RegClass, Signature, VReg,
     };
 
     fn vreg(id: u32) -> MachOperand {
         MachOperand::VReg(VReg::new(id, RegClass::Gpr64))
+    }
+
+    fn vreg32(id: u32) -> MachOperand {
+        MachOperand::VReg(VReg::new(id, RegClass::Gpr32))
     }
 
     fn single_block_func(insts: Vec<MachInst>) -> (MachFunction, BlockId) {
@@ -2442,6 +2524,29 @@ mod tests {
     }
 
     #[test]
+    fn source_attributed_add_self_retains_its_proof_class() {
+        let (mut func, entry) = single_block_func(vec![MachInst::new(
+            AArch64Opcode::AddRR,
+            vec![vreg(0), vreg(3), vreg(3)],
+        )]);
+        let id = func.block(entry).insts[0];
+        let stamp = LoweringProvenance::SourceInst {
+            id: SourceInstId { block: 0, index: 0 },
+            digest: SourceInstDigest::compute("Iadd", 2, 1),
+            trust_ir_inst: None,
+        };
+        func.set_inst_lowering_provenance(id, stamp);
+
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_add_self_to_shl());
+        let stats = engine.run_to_fixpoint(&mut func, 4);
+
+        assert_eq!(stats.rewrites, 0);
+        assert_eq!(func.inst(id).opcode, AArch64Opcode::AddRR);
+        assert_eq!(func.inst_lowering_provenance(id), stamp);
+    }
+
+    #[test]
     fn add_rr_distinct_operands_does_not_fire() {
         let (mut func, _) = single_block_func(vec![MachInst::new(
             AArch64Opcode::AddRR,
@@ -2699,6 +2804,97 @@ mod tests {
         let second = func.inst(func.block(entry).insts[1]);
         assert_eq!(second.opcode, AArch64Opcode::Uxtb);
         assert_eq!(second.operands[1], vreg(0));
+    }
+
+    #[test]
+    fn uxtb_of_and_ri_255_gpr32_becomes_copy_of_masked_result() {
+        let (mut func, entry) = single_block_func(vec![
+            MachInst::new(
+                AArch64Opcode::AndRI,
+                vec![vreg32(1), vreg32(0), MachOperand::Imm(255)],
+            ),
+            MachInst::new(AArch64Opcode::Uxtb, vec![vreg32(2), vreg32(1)]),
+        ]);
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_uxtb_of_and_ri_255());
+        let stats = engine.run_to_fixpoint(&mut func, 4);
+        assert_eq!(stats.rewrites, 1);
+
+        let insts = &func.block(entry).insts;
+        assert_eq!(func.inst(insts[0]).opcode, AArch64Opcode::AndRI);
+        let replacement = func.inst(insts[1]);
+        assert_eq!(replacement.opcode, AArch64Opcode::Copy);
+        assert_eq!(replacement.operands, vec![vreg32(2), vreg32(1)]);
+    }
+
+    #[test]
+    fn uxtb_of_and_ri_non_byte_mask_does_not_fire() {
+        let (mut func, _) = single_block_func(vec![
+            MachInst::new(
+                AArch64Opcode::AndRI,
+                vec![vreg32(1), vreg32(0), MachOperand::Imm(0x1ff)],
+            ),
+            MachInst::new(AArch64Opcode::Uxtb, vec![vreg32(2), vreg32(1)]),
+        ]);
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_uxtb_of_and_ri_255());
+        assert_eq!(engine.run_to_fixpoint(&mut func, 4).rewrites, 0);
+    }
+
+    #[test]
+    fn uxtb_of_and_ri_255_requires_gpr32_operands() {
+        let (mut func, _) = single_block_func(vec![
+            MachInst::new(
+                AArch64Opcode::AndRI,
+                vec![vreg(1), vreg(0), MachOperand::Imm(255)],
+            ),
+            MachInst::new(AArch64Opcode::Uxtb, vec![vreg(2), vreg(1)]),
+        ]);
+        let mut engine = RewriteEngine::new();
+        engine.register(rule_uxtb_of_and_ri_255());
+        assert_eq!(engine.run_to_fixpoint(&mut func, 4).rewrites, 0);
+    }
+
+    #[test]
+    fn uxtb_of_and_ri_255_rejects_malformed_or_nonlocal_definer() {
+        let cases = [
+            vec![
+                MachInst::new(AArch64Opcode::AndRI, vec![vreg32(1), vreg32(0)]),
+                MachInst::new(AArch64Opcode::Uxtb, vec![vreg32(2), vreg32(1)]),
+            ],
+            // `v1` may have been defined in another block, but the block-local
+            // def map intentionally has no entry for it here.
+            vec![MachInst::new(
+                AArch64Opcode::Uxtb,
+                vec![vreg32(2), vreg32(1)],
+            )],
+        ];
+
+        for insts in cases {
+            let (mut func, _) = single_block_func(insts);
+            let mut engine = RewriteEngine::new();
+            engine.register(rule_uxtb_of_and_ri_255());
+            assert_eq!(engine.run_to_fixpoint(&mut func, 4).rewrites, 0);
+        }
+    }
+
+    #[test]
+    fn uxtb_of_and_ri_255_is_registered_in_migrated_ruleset() {
+        let (mut func, entry) = single_block_func(vec![
+            MachInst::new(
+                AArch64Opcode::AndRI,
+                vec![vreg32(1), vreg32(0), MachOperand::Imm(255)],
+            ),
+            MachInst::new(AArch64Opcode::Uxtb, vec![vreg32(2), vreg32(1)]),
+        ]);
+        let mut engine = RewriteEngine::new();
+        register_migrated(&mut engine);
+        let stats = engine.run_to_fixpoint(&mut func, 4);
+        assert_eq!(stats.rewrites, 1);
+        assert_eq!(
+            func.inst(func.block(entry).insts[1]).opcode,
+            AArch64Opcode::Copy
+        );
     }
 
     #[test]
@@ -3215,6 +3411,34 @@ mod tests {
     }
 
     #[test]
+    fn source_attributed_mul_by_neg_one_retains_its_proof_class() {
+        for (rule, operands) in [
+            (rule_mul_by_neg_one_rhs(), vec![vreg(2), vreg(1), vreg(0)]),
+            (rule_mul_by_neg_one_lhs(), vec![vreg(2), vreg(0), vreg(1)]),
+        ] {
+            let (mut func, entry) = single_block_func(vec![
+                MachInst::new(AArch64Opcode::MovI, vec![vreg(0), MachOperand::Imm(-1)]),
+                MachInst::new(AArch64Opcode::MulRR, operands),
+            ]);
+            let id = func.block(entry).insts[1];
+            let stamp = LoweringProvenance::SourceInst {
+                id: SourceInstId { block: 0, index: 0 },
+                digest: SourceInstDigest::compute("Imul", 2, 1),
+                trust_ir_inst: None,
+            };
+            func.set_inst_lowering_provenance(id, stamp);
+
+            let mut engine = RewriteEngine::new();
+            engine.register(rule);
+            let stats = engine.run_to_fixpoint(&mut func, 4);
+
+            assert_eq!(stats.rewrites, 0);
+            assert_eq!(func.inst(id).opcode, AArch64Opcode::MulRR);
+            assert_eq!(func.inst_lowering_provenance(id), stamp);
+        }
+    }
+
+    #[test]
     fn mul_by_non_const_does_not_fire() {
         // Divisor is not produced by MovI.
         let (mut func, _) = single_block_func(vec![MachInst::new(
@@ -3442,7 +3666,8 @@ mod tests {
     /// admitted the 4-operand forms.
     #[test]
     fn eor_cancel_shifted_outer_does_not_fire() {
-        let rules: Vec<(&str, fn() -> Rule)> = vec![
+        type RuleCtor = fn() -> Rule;
+        let rules: Vec<(&str, RuleCtor)> = vec![
             (
                 "lhs_def_rhs_rhs",
                 rule_eor_cancel_lhs_def_outer_rhs_matches_inner_rhs,

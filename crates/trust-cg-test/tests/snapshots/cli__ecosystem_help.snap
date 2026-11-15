@@ -37,20 +37,11 @@ Options:
       --cache-dir <PATH>
           Planned source-cache directory; not read or created in v0.1.0
 
-      --timeout <SECS>
-          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
-
-      --parallel <N>
-          Worker count (honors cargo-serialization lock). Default: auto
-
   -q, --quiet
-          Suppress progress bars; errors still go to stderr
+          Log errors only (sets the stderr log level to `error`)
 
   -v, --verbose...
           Show debug-level events. Repeat for more: -vv, -vvv
-
-      --no-cache
-          Ignore proof / corpus caches
 
       --dry-run
           Print what would run without executing external tools

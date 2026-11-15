@@ -1,0 +1,207 @@
+# AArch64 bridge corpus census, read by tests/bridge_differential_aarch64.rs.
+#
+# One line per corpus cell that does NOT build and match LLVM natively:
+#   <lane> <case> O<opt> <refusal>
+# lane: proofs-off (`no-proof-certs`, -O0/-O2/-O3) or certs-on (-O2), or llvm
+# for a program LLVM itself cannot build for the host's AArch64 triple.
+# refusal: the first [TCG-*] code of the backend's refusal, joined by `/` to
+# the code its first failing function's reason carries.
+#
+# Every cell not listed must build and match LLVM (exit status, stdout,
+# stderr); a divergence is a miscompile and is never listed here. A listed
+# cell that starts to build and match fails the test until its line is
+# removed, so this file only shrinks by review. Measured 2026-10-01, and held
+# unchanged on 2026-10-06 after merging origin/main 530a9319a and on
+# 2026-10-07 after merging origin/main caed91de9 (with the stricter
+# [TCG-CLOSURE-DROP] check), on aarch64-apple-darwin (Apple M4 Max, Trust
+# package 9192). Relabelled 2026-10-14 (WS7.1 (b) stacked on origin/main
+# 3b501a37c), no cell added or removed: ffi_c_abi_sse_aggregate's proofs-off
+# cells refuse at the bridge's field-store gate (TCG-FIELD-STORE-TYPE) instead
+# of the adapter (TCG-IR-LOWER). Both refuse the same instruction, an
+# ExtractField declaring the two-lane slot type over the (i64, f64) SSE
+# parameter; origin/main's text: "ExtractField result type Array(TyId(3), 2)
+# does not match field 0 of Tuple([I64, F64]): expected I64".
+certs-on aggregate_ref_stored_as_value O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on array_repeat_fill O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on atomics_cxchg_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+certs-on atomics_fence_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+certs-on atomics_slice1_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+certs-on atomics_slice2_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+certs-on c6_mut_ref_to_join_local O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on cell O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on celled_index_arg_custom_mir O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on celled_index_local_custom_mir O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on celled_index_readers_custom_mir O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on closure_slice_arg O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on closure_zst_upvar O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on cma_signed_fallback O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on cma_u128_fallback O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on cmp_ordering O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on cmp_ordering_methods O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on const_bounds_check_elim O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on copy_nonoverlapping O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on copy_nonoverlapping_runtime O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on copy_overlapping O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on dom_bounds_check_elim O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on dom_bounds_check_keep O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on entry_ref_field_address O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on ffi_c_abi_sse_aggregate O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on ffi_extern_c_foreign_call O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_o_box_referent_probe O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_o_identity_nonlocal_callee O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_o_nonnull_as_mut_scalarized_temp O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_o_ref_of_ref_referent_probe O2 TCG-MIR-UNSUPPORTED
+certs-on fix_o_wrapping_and_rawptr_referents O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_q_agg_field_through_deref O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_q_control_flow_from_residual O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_q_single_upvar_closure_leaf O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_q_slice_arg_from_struct_field O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_refret_cell_nonprimitive O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_return_celled_local O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_thin_raw_ptr_metadata O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fix_u128_leading_ones_pow2 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on float_to_int_unchecked O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fn_item_shim_aggregate_arg O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz2_filter_map_take_reduction O2 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+certs-on fuzz2_rev_enumerate_order O2 TCG-MIR-UNSUPPORTED
+certs-on fuzz2_scan_reduction O2 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+certs-on fuzz3_abi_struct_mixed_ret O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_abi_struct_pad O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_alias_store_load O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_nan_through_union O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_ptr_width_pun O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_reprc_nested O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_signed_mixed_struct O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_signed_packed O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_static_mut_array O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_store_u64_load_u32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_struct_ptr_field_byval O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_transmute_struct_ints O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz3_union_write_field O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on fuzz4_float_nan_cast_const O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_array_slot O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_byval_aggregate_abi O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_clz_ctz O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_count_ones O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_eq_switch O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_mul_overflow_signed O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_neg O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_overflow_addsub O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_rotate O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_saturating O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_signed_sat O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_store_roundtrip O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_swap_rev O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_u128_arith O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on i128_u128_literal O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on indirect_arg_lanes O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on indirect_scalar_newtype_lanes O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on inline_hot_loop O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on int_byte_transmute O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m143_nonnull_slice_boundary O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m51_signed_narrow_sar O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m54_call_arg_parallel_move O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m55_byref_closure_capture O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m56_narrow_repr_enum O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m67_overflowing_mul_by_zero O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m69_byval_mixed_int_sse_aggregate O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m71_loop_carried_aggregate_field O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on m72_nested_closure_wrapping_shl O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on maybe_uninit O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on maybe_uninit_aggregate O2 TCG-MIR-UNSUPPORTED
+certs-on maybe_uninit_o0 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on nested_aggregate_field_projection O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on niche_nested_enum O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on niche_nested_enum_ref O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on nonnull_holder_field O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on nonnull_str_field_through_ref O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on nonzero_niche O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on opt_u128_pair_args O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on option_take_loop O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on ovf_tuple_loop O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on padded_scalar_home_alignment O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on pair_arg_exhaustion O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on pair_arg_lanes O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on panic_location_unwrap O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on partial_eightbyte_blackbox O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on pointee_lanes_simd_overaligned O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on pointee_lanes_tuple_nested O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on raw_ptr_deref_field O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on raw_ptr_field_elem O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on raw_ptr_int_roundtrip O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on raw_ptr_writethrough O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on rev_range_iter O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on sib_addr_fold_matmul O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on small_classes_batch2 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on ssa071_cell_retry_loops O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on ssa071_celled_return_place O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on stale_celled_entry_arg O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on stale_celled_local_copy O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on static_mut_basic O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on static_mut_cross_fn O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on static_mut_loop_rmw O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on strength_reduce_matmul O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on struct_int_transmute O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on u128_mul_overflow O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on union_fat_leaf O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on union_float_pun O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on union_loop_carried O2 TCG-MIR-UNSUPPORTED
+certs-on unsafe_cell O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_add_i32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_fill_iota O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_fill_pointer O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_fill_struct_field O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_fill_variable O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_loop_carried O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_offset O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_reduce_float_dot O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_reduce_float_sum O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_reduce_nonassoc O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_reduce_prefix O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_regarg_crosslen O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_regarg_store O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_same_array O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_saxpy_aliased O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_saxpy_carried O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_saxpy_offset O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_saxpy_reduction O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_saxpy_variant O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_adv_stride2 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_fill_i32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_reduce_dot_i32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_reduce_sum_i32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_regarg_sum_i64 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_saxpy_dest_add O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_saxpy_i32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_sub_i32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+certs-on vectorize_xor_i32 O2 TCG-MIR-UNSUPPORTED/TCG-PROOF-465
+proofs-off atomics_cxchg_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off atomics_cxchg_x86 O3 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off atomics_fence_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off atomics_fence_x86 O3 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off atomics_slice1_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off atomics_slice1_x86 O3 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off atomics_slice2_x86 O2 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off atomics_slice2_x86 O3 TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT
+proofs-off entry_ref_field_address O0 TCG-MIR-UNSUPPORTED
+proofs-off entry_ref_field_address O2 TCG-MIR-UNSUPPORTED
+proofs-off entry_ref_field_address O3 TCG-MIR-UNSUPPORTED
+proofs-off ffi_c_abi_sse_aggregate O0 TCG-MIR-UNSUPPORTED/TCG-FIELD-STORE-TYPE
+proofs-off ffi_c_abi_sse_aggregate O2 TCG-MIR-UNSUPPORTED/TCG-FIELD-STORE-TYPE
+proofs-off ffi_c_abi_sse_aggregate O3 TCG-MIR-UNSUPPORTED/TCG-FIELD-STORE-TYPE
+proofs-off fix_o_ref_of_ref_referent_probe O0 TCG-MIR-UNSUPPORTED
+proofs-off fix_o_ref_of_ref_referent_probe O2 TCG-MIR-UNSUPPORTED
+proofs-off fix_o_ref_of_ref_referent_probe O3 TCG-MIR-UNSUPPORTED
+proofs-off fuzz2_filter_map_take_reduction O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off fuzz2_filter_map_take_reduction O2 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off fuzz2_filter_map_take_reduction O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off fuzz2_rev_enumerate_order O2 TCG-MIR-UNSUPPORTED
+proofs-off fuzz2_rev_enumerate_order O3 TCG-MIR-UNSUPPORTED
+proofs-off fuzz2_scan_reduction O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off fuzz2_scan_reduction O2 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off fuzz2_scan_reduction O3 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
+proofs-off maybe_uninit_aggregate O2 TCG-MIR-UNSUPPORTED
+proofs-off maybe_uninit_aggregate O3 TCG-MIR-UNSUPPORTED
+proofs-off union_loop_carried O0 TCG-MIR-UNSUPPORTED
+proofs-off union_loop_carried O2 TCG-MIR-UNSUPPORTED
+proofs-off union_loop_carried O3 TCG-MIR-UNSUPPORTED

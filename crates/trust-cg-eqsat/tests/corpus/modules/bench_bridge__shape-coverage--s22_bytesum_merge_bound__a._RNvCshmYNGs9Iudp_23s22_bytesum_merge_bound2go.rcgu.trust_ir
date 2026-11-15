@@ -1,0 +1,64 @@
+; TrustIr text format v1
+module "_RNvCshmYNGs9Iudp_23s22_bytesum_merge_bound2go"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (*const u8, u32) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCshmYNGs9Iudp_23s22_bytesum_merge_bound2go(functy.0) {
+bb0(%1: *const u8, %2: u32):
+    switch %2 [ 0: bb3 1: bb2 default: bb1 ]
+bb3:
+    %15 = const u64 8
+    br bb4(%15)
+bb2:
+    %16 = const u64 12
+    br bb4(%16)
+bb1:
+    %17 = const u64 4096
+    br bb4(%17)
+bb4(%18: u64):
+    %19 = const u64 0
+    %20 = const u64 0
+    br bb5(%19, %18, %20)
+bb5(%21: u64, %22: u64, %23: u64):
+    %24 = copy u64 %23
+    %25 = copy u64 %22
+    %26 = icmp ult u64 %24, %25
+    condbr %26, bb6, bb7
+bb7:
+    ret %21
+bb6:
+    %27 = copy u64 %23
+    %29 = ptrtoptr *const u8 %1 to ptr
+    %30 = ptrtoint ptr %29 to i64
+    %31 = bitcast u64 %27 to i64
+    %32 = add i64 %30, %31
+    %33 = inttoptr i64 %32 to ptr
+    %28 = ptrtoptr ptr %33 to *const u8
+    %34 = load u8, ptr %28
+    %35 = zext u8 %34 to u32
+    %36 = zext u32 %35 to i64
+    %37 = const i64 4294967295
+    %38 = and i64 %36, %37
+    %39 = ctpop i64 %38
+    %40 = trunc i64 %39 to u32
+    %41 = copy u32 %40
+    br bb8
+bb8:
+    %42 = zext u32 %41 to u64
+    %43 = add u64 %21, %42
+    %44 = copy u64 %43
+    %46 = const u64 1
+    %45 = add u64 %23, %46
+    br bb5(%44, %22, %45)
+}

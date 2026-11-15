@@ -1,0 +1,10 @@
+; control: the limb identity with one cross product omitted (`limb-one-cross`) must be satisfiable
+(set-logic ALL)
+(define-fun P64 () Int 18446744073709551616)
+(define-fun P128 () Int 340282366920938463463374607431768211456)
+(define-fun r64 ((x Int)) Bool (and (<= 0 x) (< x P64)))
+(declare-const ah Int) (declare-const al Int) (declare-const bh Int) (declare-const bl Int)
+(assert (and (r64 ah) (r64 al) (r64 bh) (r64 bl)))
+(assert (not (= (mod (* (+ (* ah P64) al) (+ (* bh P64) bl)) P128)
+                (mod (+ (* al bl) (* (mod (mod (* ah bl) P64) P64) P64)) P128))))
+(check-sat)

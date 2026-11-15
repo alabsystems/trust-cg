@@ -17,7 +17,6 @@
 // (`{name}_lo`, `{name}_hi`) concatenated via `hi.concat(lo)`. This is
 // required because the mock evaluator uses u64 concrete values.
 //
-// Reference: designs/2026-04-13-verification-architecture.md
 // Reference: ARM Architecture Reference Manual (DDI 0487), Sections C7.2
 
 //! NEON SIMD lowering verification proofs.
@@ -451,10 +450,15 @@ pub fn proof_vector_bic_16b() -> ProofObligation {
 // (ORR where the source is AND, or BIC without the `~vm` complement) makes the
 // two sides differ on some input and REFUTES.
 //
-// Emission: the isel emits these on `Type::V128` (isel.rs `select_logic` ~7799
-// for AND/ORR/EOR/BIC; the `Mvn` arm ~4303 for NOT); the encoder's `q=1` selects
-// the `.16B` whole-register form (encode.rs `NeonAndV`/etc. ~2390+), which is
-// exactly what the whole-register machine side models. ARM DDI 0487 C7.2.9 AND /
+// Emission: isel emits AND/ORR/EOR/BIC on `Type::V128` AND `Type::V64` (the
+// logic lowering; the encoder infers `Q` from the destination class, so V64
+// operands encode the `.8B` form), NOT on `Type::V128` (the `Mvn` arm) and after
+// a vector compare-not-equal; the vectorizers emit the `.16B` forms. These
+// obligations state the `.16B` whole-register operation only: an `.8B` word
+// writes zero to the upper half, which they do not state. So the function
+// verifier binds them per instruction to the 16B shape alone (Q registers, no
+// selector: `aarch64_value_decode_proofs::neon_bitwise_16b_bound_query`), whose
+// word ENC-5 decodes, and refuses the 8B shapes. ARM DDI 0487 C7.2.9 AND /
 // C7.2.215 ORR / C7.2.71 EOR / C7.2.15 BIC / C7.2.210 NOT (vector).
 
 /// `.16B` — the byte arrangement the `Type::V128` bitwise ops actually encode to
@@ -4124,6 +4128,115 @@ pub fn all_neon_umaxv_proofs() -> Vec<ProofObligation> {
     vec![proof_neon_umaxv_4s()]
 }
 
+// ---------------------------------------------------------------------------
+// FAITHFUL cross-lane horizontal add proof (ADDP Dd, Vn.2D)
+// ---------------------------------------------------------------------------
+//
+// SOUNDNESS -- credits the coverage gate for `NeonAddpScalar`, the scalar
+// pairwise add `ADDP Dd, Vn.2D` (`Dd = Vn.D[0] + Vn.D[1]`, modular). ADDP
+// (scalar) is architecturally defined ONLY at `.2D` (`size = 11`; every other
+// size is reserved), the codegen encoder refuses every other arrangement and
+// any destination but a `D` register, and ENC-5 decodes the word field by
+// field, so the one obligation is arrangement-COMPLETE.
+//
+// The second CROSS-LANE obligation after UMAXV.4S: the result is a scalar
+// function of both lanes. The SOURCE slices each doubleword DIRECTLY from the
+// raw 64-bit D-half `Var`s and adds them; the MACHINE is the real
+// `neon_semantics::encode_neon_addp_scalar_2d` over the reassembled
+// `Concat(vn_hi, vn_lo)` register -- structurally distinct leaves
+// (`Extract(Var)` vs `Extract(Concat)`), so the obligation cannot collapse to
+// X==X. The model's agreement with the CPU is checked by the live silicon
+// differential (`tests/aarch64_neon_silicon_differential.rs`).
+
+/// FAITHFUL SOURCE for `ADDP Dd, Vn.2D`: the two doublewords sliced from the
+/// raw D-halves, added modulo 2^64.
+fn neon_source_addp_2d_from_halves() -> SmtExpr {
+    let vn_lo = SmtExpr::var("vn_lo", 64);
+    let vn_hi = SmtExpr::var("vn_hi", 64);
+    lane_from_halves(&vn_lo, &vn_hi, VectorArrangement::D2, 0).bvadd(lane_from_halves(
+        &vn_lo,
+        &vn_hi,
+        VectorArrangement::D2,
+        1,
+    ))
+}
+
+/// Assemble an ADDP-shaped obligation: D-pair SOURCE vs a `machine` expression
+/// over the reassembled register. The result is the 64-bit scalar destination.
+fn neon_addp_obligation(name: &str, source: SmtExpr, machine: SmtExpr) -> ProofObligation {
+    ProofObligation {
+        machine_side_provenance: crate::lowering_proof::MachineSideProvenance::StaticDb,
+        name: name.to_string(),
+        trust_ir_expr: source,
+        aarch64_expr: machine,
+        inputs: vec![("vn_lo".to_string(), 64), ("vn_hi".to_string(), 64)],
+        preconditions: vec![],
+        fp_inputs: vec![],
+        category: Some(crate::lowering_proof::TransvalCheckKind::Vectorization),
+    }
+}
+
+/// FAITHFUL: trust_ir doubleword horizontal sum == NEON `ADDP Dd, Vn.2D`.
+pub fn proof_neon_addp_scalar_2d() -> ProofObligation {
+    neon_addp_obligation(
+        "NEON AddpScalar.2D cross-lane-sum-intent == D-pair doubleword horizontal add (faithful)",
+        neon_source_addp_2d_from_halves(),
+        crate::neon_semantics::encode_neon_addp_scalar_2d(&var_128("vn")),
+    )
+}
+
+/// NEGATIVE CONTROLS for `NeonAddpScalar`; each MUST refute.
+///   * NO REDUCTION -- lane 0 passed through.
+///   * WRONG OPERATION -- the lanes subtracted, or their unsigned maximum
+///     (UMAXV-confusion).
+///   * WRONG LANE -- lane 1 doubled (a lane-0 miswire).
+///   * WRONG ELEMENT SIZE -- the two low `.4S` words added and zero-extended
+///     (a pairwise add at the 32-bit size).
+pub fn neon_addp_wrong_encoding_controls() -> Vec<ProofObligation> {
+    let vn = var_128("vn");
+    let d0 = lane_extract(&vn, VectorArrangement::D2, 0);
+    let d1 = lane_extract(&vn, VectorArrangement::D2, 1);
+    let s0 = lane_extract(&vn, VectorArrangement::S4, 0);
+    let s1 = lane_extract(&vn, VectorArrangement::S4, 1);
+    let source = neon_source_addp_2d_from_halves;
+    vec![
+        neon_addp_obligation(
+            "WRONG: AddpScalar.2D encoded as lane0 passthrough (no cross-lane add) must REFUTE",
+            source(),
+            d0.clone(),
+        ),
+        neon_addp_obligation(
+            "WRONG: AddpScalar.2D encoded as lane0 - lane1 (SUB for ADD) must REFUTE",
+            source(),
+            d0.clone().bvsub(d1.clone()),
+        ),
+        neon_addp_obligation(
+            "WRONG: AddpScalar.2D encoded as the unsigned lane maximum (UMAXV-confusion) \
+             must REFUTE",
+            source(),
+            SmtExpr::ite(d0.clone().bvugt(d1.clone()), d0, d1.clone()),
+        ),
+        neon_addp_obligation(
+            "WRONG: AddpScalar.2D encoded as lane1 + lane1 (lane-0 miswire) must REFUTE",
+            source(),
+            d1.clone().bvadd(d1),
+        ),
+        neon_addp_obligation(
+            "WRONG: AddpScalar.2D encoded as a .4S pairwise add of the low words \
+             (wrong element SIZE) must REFUTE",
+            source(),
+            s0.bvadd(s1).zero_ext(32),
+        ),
+    ]
+}
+
+/// The FAITHFUL cross-lane obligation the coverage gate CREDITS for
+/// `NeonAddpScalar`. `.2D` is arrangement-COMPLETE (the only architectural
+/// form of scalar ADDP).
+pub fn all_neon_addp_proofs() -> Vec<ProofObligation> {
+    vec![proof_neon_addp_scalar_2d()]
+}
+
 /// FAITHFUL SOURCE for `REV32.16B`: each output BYTE is sliced DIRECTLY from the
 /// raw D-halves at the container-reversed index. A 32-bit container holds 4
 /// bytes, so reversing within it is `j ^ 3` — the exact analogue of REV64.16B's
@@ -6019,6 +6132,7 @@ pub fn all_neon_lowering_proofs() -> Vec<ProofObligation> {
     proofs.extend(all_neon_dup_gen_proofs());
     proofs.extend(all_neon_dup_elem_proofs());
     proofs.extend(all_neon_umaxv_proofs());
+    proofs.extend(all_neon_addp_proofs());
     proofs.extend(all_neon_rev32_proofs());
     proofs.extend(all_neon_rev64_proofs());
     proofs.extend(all_neon_rbit_proofs());
@@ -6446,7 +6560,7 @@ mod tests {
         let proofs = all_neon_lowering_proofs();
         assert_eq!(
             proofs.len(),
-            285,
+            286,
             "expected 36 base proofs + USHR.4S + SSHR.4S (the <4 x i32> \
              lane-wise right-shift lowerings) = 38, + 5 FAITHFUL per-lane-intent \
              == whole-register bitwise proofs (AndV/OrrV/EorV/BicV/NotV) = 43, \
@@ -6524,7 +6638,11 @@ mod tests {
              Concat chain, REPLACING the degenerate replicated-byte identity) = 281, + 4 PARTIAL post-index base-register WRITEBACK obligations (Ld1Post/St1Post \
              16B + LdpQPost/StpQPost 32B — machine side DECODES imm7/Q out of the real \
              instruction word; these prove the base advance ONLY and the four opcodes \
-             deliberately STAY DeferredUnfaithfulModel RED on the transfer) = 285 proofs"
+             deliberately STAY DeferredUnfaithfulModel RED on the transfer) = 285, + 1 \
+             FAITHFUL cross-lane horizontal-add obligation (AddpScalar.2D, L04-P6 — the \
+             doubleword sum sliced from the raw D-halves vs the real ADDP model; \
+             no-reduction / SUB / UMAXV-confusion / lane-miswire / .4S-size refute \
+             controls) = 286 proofs"
         );
         for obligation in &proofs {
             assert_valid(obligation);
@@ -7317,30 +7435,27 @@ mod tests {
     }
 
     #[test]
-    fn neon_post_index_memory_opcodes_stay_deferred_red() {
+    fn neon_post_index_memory_opcodes_are_credited_only_by_form_certificates() {
         // The writeback obligations above are PARTIAL: they prove the base
-        // advances correctly and say NOTHING about the memory transfer. These
-        // four opcodes must therefore REMAIN explicit DeferredUnfaithfulModel
-        // rows. Crediting them as covered on the strength of the writeback alone
-        // would be exactly the overclaim the RED row exists to prevent.
+        // advances correctly and say NOTHING about the memory transfer, so
+        // they never credit a post-index row. All four rows are credited only
+        // through `bound_memory_row_credit`, by the replayed certificates of
+        // form theorems that state the transfers AND the writeback: the
+        // Q-pair forms of `aarch64_pair_memory_forms` and (since L04-P1) the
+        // LD1/ST1 forms of `aarch64_neon_structure_forms`.
         use trust_cg_ir::AArch64Opcode as O;
-        for op in [
-            O::NeonLd1Post,
-            O::NeonSt1Post,
-            O::NeonLdpQPost,
-            O::NeonStpQPost,
-        ] {
-            let reason = crate::coverage_gate::aarch64_deferred_value_op_reason(op);
-            assert!(
-                reason.is_some(),
-                "{op:?} must KEEP its honest deferral — the vector dereference is still \
-                 unmodeled; only the base-register writeback is proven"
-            );
-            let reason = reason.unwrap_or_default();
-            assert!(
-                reason.contains("writeback") || reason.contains("base-register"),
-                "{op:?} deferral reason must NAME the writeback evidence that now exists, so \
-                 the residue is stated precisely rather than as blanket debt: {reason}"
+        for op in [O::NeonLdpQPost, O::NeonStpQPost] {
+            assert!(crate::coverage_gate::aarch64_deferred_value_op_reason(op).is_none());
+            assert!(crate::bound_memory_row_credit::pair_row_credit(op).is_some());
+        }
+        for op in [O::NeonLd1Post, O::NeonSt1Post] {
+            assert!(crate::coverage_gate::aarch64_deferred_value_op_reason(op).is_none());
+            assert!(crate::bound_memory_row_credit::neon_row_credit(op).is_some());
+            assert!(crate::bound_memory_row_credit::pair_row_credit(op).is_none());
+            assert_eq!(
+                crate::aarch64_neon_structure_forms::neon_opcode_forms(op).map(|forms| forms.len()),
+                Some(7),
+                "{op:?} must demand every arrangement's form theorem"
             );
         }
     }
@@ -7519,6 +7634,55 @@ mod tests {
             4,
             "umaxv needs SMAXV-signedness + lane0-passthrough + .16B and .8H \
              wrong-element-size controls"
+        );
+        for c in &controls {
+            let result = verify_by_evaluation(c);
+            assert!(
+                matches!(result, VerificationResult::Invalid { .. }),
+                "NEGATIVE control '{}' did not refute: {:?}",
+                c.name,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn neon_addp_proof_discharges_exhaustively_on_edges_and_is_non_degenerate() {
+        let proofs = all_neon_addp_proofs();
+        assert_eq!(proofs.len(), 1, "one ADDP obligation (the only, .2D, form)");
+        for p in &proofs {
+            assert!(
+                p.is_genuinely_proven(),
+                "addp proof '{}' is DEGENERATE (X==X)",
+                p.name
+            );
+            assert_valid(p);
+        }
+        // Carry across bit 63 and the all-ones lanes: the modular sum.
+        let p = proof_neon_addp_scalar_2d();
+        for (lo, hi) in [
+            (0u64, 0u64),
+            (u64::MAX, 1),
+            (u64::MAX, u64::MAX),
+            (1 << 63, 1 << 63),
+            (0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210),
+        ] {
+            let mut env = crate::smt::EvalEnv::default();
+            env.insert("vn_lo".into(), lo);
+            env.insert("vn_hi".into(), hi);
+            let machine = p.aarch64_expr.try_eval(&env).unwrap();
+            assert_eq!(machine, crate::smt::EvalResult::Bv(lo.wrapping_add(hi)));
+        }
+    }
+
+    #[test]
+    fn neon_addp_wrong_encodings_refute() {
+        let controls = neon_addp_wrong_encoding_controls();
+        assert_eq!(
+            controls.len(),
+            5,
+            "addp needs lane0-passthrough + SUB + UMAXV-confusion + lane miswire + \
+             .4S wrong-element-size controls"
         );
         for c in &controls {
             let result = verify_by_evaluation(c);

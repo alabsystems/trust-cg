@@ -1,5 +1,9 @@
-#[path = "support/target_dir.rs"]
-mod target_dir_support;
+#[path = "support/backend_artifact.rs"]
+mod backend_artifact_support;
+#[path = "support/host_target.rs"]
+mod host_target_support;
+#[path = "support/toolchain.rs"]
+mod toolchain_support;
 
 // Integration test (#m93): passing an intercepted COLLECTION BY REFERENCE
 // (`&Vec`/`&mut Vec`, `&HashMap`/`&mut HashMap`, `&BTreeMap`/`&mut BTreeMap`) to
@@ -38,69 +42,30 @@ mod target_dir_support;
 // must equal the LLVM exit code (a wrong collection result would be a miscompile,
 // so equal exit codes are the differential we assert). This file gates exactly
 // the by-reference-collection-to-helper shapes that compile + run today.
+//
+// THE MAP SHAPES NOW FAIL CLOSED ([TCG-FOREIGN-MAP]). A helper's `&HashMap` /
+// `&mut BTreeMap` parameter is a map the HELPER did not construct: the same
+// lowering read a map an LLVM-compiled caller passed (rustc's real layout) as
+// the bridge's slot image and returned wrong values or crashed
+// (`foreign_map_provenance_differential.rs`). A map intercept now applies only
+// to a map its own function built, and the caller's map is read back from
+// memory the helper could have rewritten, so both sides refuse. Restoring
+// these shapes needs an interprocedural receipt (every caller of a
+// non-escaping helper passes, and gets back, a bridge-built map); until then
+// `map_by_reference_to_helper_fails_closed` pins the refusal and keeps the
+// LLVM oracle, so a restored lowering is promoted back here.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const TARGET: &str = "x86_64-apple-darwin";
-
-fn pinned_toolchain() -> String {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let toolchain = std::fs::read_to_string(crate_dir.join("rust-toolchain.toml"))
-        .expect("failed to read rust-toolchain.toml");
-    for line in toolchain.lines() {
-        let line = line.trim();
-        if let Some(raw_channel) = line.strip_prefix("channel") {
-            let Some((_, value)) = raw_channel.split_once('=') else {
-                continue;
-            };
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml did not contain a channel");
-}
+const TARGET: &str = host_target_support::X86_64_TARGET;
 
 fn ensure_dylib_built() -> PathBuf {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_dir = target_dir_support::cargo_target_dir(crate_dir);
-    let candidates = [
-        target_dir
-            .join("release")
-            .join("librustc_codegen_trust_cg.dylib"),
-        target_dir
-            .join("debug")
-            .join("librustc_codegen_trust_cg.dylib"),
-    ];
-    for cand in &candidates {
-        if cand.exists() {
-            return cand.clone();
-        }
-    }
-    let status = Command::new("cargo")
-        .arg(format!("+{}", pinned_toolchain()))
-        .args(["build"])
-        .current_dir(crate_dir)
-        .status()
-        .expect("failed to invoke `cargo build`");
-    assert!(status.success(), "cargo build failed; cannot run m93 test");
-    let built = target_dir
-        .join("debug")
-        .join("librustc_codegen_trust_cg.dylib");
-    assert!(built.exists(), "expected dylib at {built:?} but none produced");
-    built
+    backend_artifact_support::current_test_backend()
 }
 
 fn x86_64_std_available() -> bool {
-    let output = Command::new("rustup")
-        .args(["target", "list", "--installed", "--toolchain"])
-        .arg(pinned_toolchain())
-        .output();
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == TARGET),
-        Err(_) => false,
-    }
+    toolchain_support::target_std_available(TARGET)
 }
 
 fn host_is_x86_64() -> bool {
@@ -131,9 +96,8 @@ fn try_compile(
     std::fs::write(&src_path, src).expect("write source");
     let bin = dir.join(name);
 
-    let mut cmd = Command::new("rustup");
-    cmd.args(["run", pinned_toolchain().as_str(), "rustc", "--edition=2021"])
-        .args(["--crate-type", "bin"]);
+    let mut cmd = toolchain_support::rustc_command();
+    cmd.args(["--crate-type", "bin"]);
     if let Some(dylib) = backend {
         cmd.arg(backend_arg(dylib));
     }
@@ -151,7 +115,11 @@ fn compile(dir: &Path, name: &str, src: &str, backend: Option<&Path>, opt: &str)
     assert!(
         output.status.success(),
         "compile of `{name}` failed ({} backend, {opt}). stderr: <<<{}>>>",
-        if backend.is_some() { "trust-cg" } else { "llvm" },
+        if backend.is_some() {
+            "trust-cg"
+        } else {
+            "llvm"
+        },
         String::from_utf8_lossy(&output.stderr)
     );
     bin
@@ -255,6 +223,97 @@ fn mutref_collection_to_helper_runs_and_matches_llvm() {
             8,
             Opt::Both,
         ),
+    ];
+
+    for (name, src, expected, opt_support) in shapes {
+        let opts: &[&str] = match opt_support {
+            Opt::Both => &["0", "3"],
+            Opt::ZeroOnly => &["0"],
+        };
+        for opt in opts {
+            let suffix = format!("o{opt}");
+            let llvm_bin = compile(&dir, &format!("{name}_{suffix}_llvm"), src, None, opt);
+            let tcg_bin = compile(
+                &dir,
+                &format!("{name}_{suffix}_tcg"),
+                src,
+                Some(&dylib),
+                opt,
+            );
+            let llvm_exit = run_exit_code(&llvm_bin);
+            let tcg_exit = run_exit_code(&tcg_bin);
+            assert_eq!(
+                llvm_exit, *expected,
+                "LLVM backend exit code for `{name}` (-Copt-level={opt}) is {llvm_exit}, \
+                 expected {expected}"
+            );
+            assert_eq!(
+                tcg_exit, llvm_exit,
+                "trust-cg exit code for `{name}` (-Copt-level={opt}) is {tcg_exit}, LLVM is \
+                 {llvm_exit} (must match)"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `Vec`-by-reference-to-helper shape now RUNS and MATCHES LLVM at `-O3`
+/// (the `Vec`-at-`-O3` inlined-construction/index gap this test once pinned as
+/// fail-closed is fixed — see `m94_vec_o3_x86.rs`). A `&mut Vec` helper pushes a
+/// loop; `main` reads back `v.len()` through the inlined `len`-field projection.
+/// The exit code must equal LLVM's at `-O3` (a divergence is a miscompile).
+#[test]
+fn vec_mutref_helper_runs_and_matches_llvm_o3() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let dir = workdir("vec_o3");
+
+    let src = "use std::hint::black_box; \
+               fn fill(v: &mut Vec<i64>, n: i64) { let mut i = 0; while i < n { v.push(i); i += 1; } } \
+               fn main() { let mut v: Vec<i64> = Vec::new(); fill(&mut v, black_box(5)); \
+               std::process::exit(v.len() as i32); }";
+
+    let llvm_bin = compile(&dir, "vec_o3_llvm", src, None, "3");
+    let tcg_bin = compile(&dir, "vec_o3_tcg", src, Some(&dylib), "3");
+    let llvm_exit = run_exit_code(&llvm_bin);
+    let tcg_exit = run_exit_code(&tcg_bin);
+    assert_eq!(llvm_exit, 5, "LLVM Vec helper len -O3 should be 5");
+    assert_eq!(
+        tcg_exit, llvm_exit,
+        "trust-cg Vec helper len -O3 is {tcg_exit}, LLVM is {llvm_exit} (must match)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The map-by-reference-to-helper shapes (formerly run+match): the helper's map
+/// parameter, and the caller's map read back after the call, have no
+/// construction receipt, so the bridge refuses them by provenance
+/// ([TCG-FOREIGN-MAP]) instead of reading whatever map the pointer names as its
+/// own slot image. The LLVM oracle must still produce the shape's value.
+#[test]
+fn map_by_reference_to_helper_fails_closed() {
+    if !host_is_x86_64() {
+        eprintln!("skipping: x86_64 run requires an x86_64 host");
+        return;
+    }
+    if !x86_64_std_available() {
+        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
+        return;
+    }
+    let dylib = ensure_dylib_built();
+    let dir = workdir("map_refuse");
+
+    // (name, source, expected LLVM exit code, opt levels).
+    let shapes: &[(&str, &str, i32, Opt)] = &[
         // (6) `&mut HashMap` to a helper that inserts in a loop. get(&3)=30, len=5 -> 35.
         (
             "map_mut_insert",
@@ -317,9 +376,8 @@ fn mutref_collection_to_helper_runs_and_matches_llvm() {
         // (11) helper READS a `BTreeMap` via `&` and returns get + len. get(&2)=20, len=3 -> 23.
         // `-O0` only: at `-O3` rustc inlines `BTreeMap::get` THROUGH the `&BTreeMap`
         // parameter into the real B-tree node descent (no inner-`hashbrown`
-        // indirection to intercept, unlike `HashMap`), which is unlowerable, so the
-        // helper fails CLOSED at `-O3` (never miscompiles). The mutable-insert
-        // BTreeMap helper (shape 10) does intercept at `-O3` and matches.
+        // indirection to intercept, unlike `HashMap`), which already refused
+        // before the provenance rule, by another gate.
         (
             "btm_imm_get",
             "use std::hint::black_box; use std::collections::BTreeMap; \
@@ -339,59 +397,24 @@ fn mutref_collection_to_helper_runs_and_matches_llvm() {
             Opt::ZeroOnly => &["0"],
         };
         for opt in opts {
-            let suffix = format!("o{opt}");
-            let llvm_bin = compile(&dir, &format!("{name}_{suffix}_llvm"), src, None, opt);
-            let tcg_bin = compile(&dir, &format!("{name}_{suffix}_tcg"), src, Some(&dylib), opt);
-            let llvm_exit = run_exit_code(&llvm_bin);
-            let tcg_exit = run_exit_code(&tcg_bin);
+            let llvm_bin = compile(&dir, &format!("{name}_o{opt}_llvm"), src, None, opt);
             assert_eq!(
-                llvm_exit, *expected,
-                "LLVM backend exit code for `{name}` (-Copt-level={opt}) is {llvm_exit}, \
-                 expected {expected}"
+                run_exit_code(&llvm_bin),
+                *expected,
+                "LLVM backend exit code for `{name}` (-Copt-level={opt})"
             );
-            assert_eq!(
-                tcg_exit, llvm_exit,
-                "trust-cg exit code for `{name}` (-Copt-level={opt}) is {tcg_exit}, LLVM is \
-                 {llvm_exit} (must match)"
+            let (output, bin) =
+                try_compile(&dir, &format!("{name}_o{opt}_tcg"), src, Some(&dylib), opt);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success() && !bin.exists() && stderr.contains("[TCG-FOREIGN-MAP]"),
+                "trust-cg must refuse `{name}` at -O{opt} by map provenance \
+                 ([TCG-FOREIGN-MAP]); if it now lowers a helper's map CORRECTLY (verify \
+                 against LLVM and against an LLVM-built map), promote it back into \
+                 `mutref_collection_to_helper_runs_and_matches_llvm`. stderr: <<<{stderr}>>>"
             );
         }
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The `Vec`-by-reference-to-helper shape now RUNS and MATCHES LLVM at `-O3`
-/// (the `Vec`-at-`-O3` inlined-construction/index gap this test once pinned as
-/// fail-closed is fixed — see `m94_vec_o3_x86.rs`). A `&mut Vec` helper pushes a
-/// loop; `main` reads back `v.len()` through the inlined `len`-field projection.
-/// The exit code must equal LLVM's at `-O3` (a divergence is a miscompile).
-#[test]
-fn vec_mutref_helper_runs_and_matches_llvm_o3() {
-    if !host_is_x86_64() {
-        eprintln!("skipping: x86_64 run requires an x86_64 host");
-        return;
-    }
-    if !x86_64_std_available() {
-        eprintln!("skipping: rust-std for {TARGET} not installed for pinned toolchain");
-        return;
-    }
-    let dylib = ensure_dylib_built();
-    let dir = workdir("vec_o3");
-
-    let src = "use std::hint::black_box; \
-               fn fill(v: &mut Vec<i64>, n: i64) { let mut i = 0; while i < n { v.push(i); i += 1; } } \
-               fn main() { let mut v: Vec<i64> = Vec::new(); fill(&mut v, black_box(5)); \
-               std::process::exit(v.len() as i32); }";
-
-    let llvm_bin = compile(&dir, "vec_o3_llvm", src, None, "3");
-    let tcg_bin = compile(&dir, "vec_o3_tcg", src, Some(&dylib), "3");
-    let llvm_exit = run_exit_code(&llvm_bin);
-    let tcg_exit = run_exit_code(&tcg_bin);
-    assert_eq!(llvm_exit, 5, "LLVM Vec helper len -O3 should be 5");
-    assert_eq!(
-        tcg_exit, llvm_exit,
-        "trust-cg Vec helper len -O3 is {tcg_exit}, LLVM is {llvm_exit} (must match)"
-    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

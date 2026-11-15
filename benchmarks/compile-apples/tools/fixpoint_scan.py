@@ -4,13 +4,17 @@ re-fire class, 2026-08-27): compile every corpus program with
 TRUST_CG_TIME_PASSES=1 and report, per function, (a) any pass that still
 reports changed=true in the LAST fixpoint iteration and (b) instruction
 counts that GROW between iterations. Both are non-idempotent-pass suspects.
-usage: fixpoint_scan.py DYLIB   (TCG_PROGS overrides the corpus dir)"""
+usage: fixpoint_scan.py [--driver TRUSTC] DYLIB   (TCG_PROGS overrides the corpus dir;
+driver: see _trust_driver.py)"""
 import os, subprocess, sys, glob, re, collections
-dylib = sys.argv[1]
+from _trust_driver import resolve_from_argv
 home = os.path.expanduser("~")
-os.environ["PATH"] = f"{home}/.cargo/bin:{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
-rustc = subprocess.check_output(["rustup", "which", "--toolchain", "nightly-2026-04-20", "rustc"], text=True).strip()
-flags = ["--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3"]
+# STOCK EXCEPTION (Trust lacks rust-lld/gcc-ld; measured: no lib/rustlib/<host>/bin/{rust-lld,gcc-ld} in the Trust sysroot): the Linux linker shim comes from the stock stable toolchain's gcc-ld; the compilers come from the Trust package.
+os.environ["PATH"] = f"{home}/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld:" + os.environ.get("PATH", "")
+DRIVER = resolve_from_argv(sys.argv)
+dylib = sys.argv[1]
+rustc = DRIVER["compiler"]
+flags = [*DRIVER["compiler_flags"], "--edition=2021", "--crate-type", "bin", "--target", "aarch64-unknown-linux-gnu", "-Cpanic=abort", "-Copt-level=3"]
 pat = re.compile(r"\[trust-cg-time-pass\] end func=(\S+) iter=(\d+) pass=(\S+) changed=(true|false) elapsed_us=(\d+) blocks=(\d+) insts=(\d+)")
 progs = sorted(glob.glob(os.environ.get("TCG_PROGS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../beat-llvm/progs")) + "/*.rs"))
 if not progs:

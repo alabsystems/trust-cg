@@ -38,7 +38,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use crate::ay_bridge::{
-    AYConfig, AYResult, generate_smt2_query, generate_smt2_query_raw, resolved_solver_path,
+    AYConfig, AYResult, generate_smt2_query, generate_smt2_query_raw,
     simplifier_alone_proved_unsat, solver_identity_hash, verdict_cache_key_v2,
 };
 use crate::lowering_proof::{ProofObligation, VerificationConfig};
@@ -46,7 +46,7 @@ use crate::proof_database::{ProofCategory, ProofDatabase};
 use crate::verify::VerificationStrength;
 
 /// The committed tier-0 DB, embedded at build time. Regenerate with
-/// `cargo run -p trust-cg-verify --bin regen_verdict_db` (requires the real
+/// `scripts/trust_cargo.sh run -p trust-cg-verify --bin regen_verdict_db` (requires the real
 /// `ay` solver; see `verdict_db/README.md`), then rebuild + commit.
 const EMBEDDED_TIER0_VDB: &str = include_str!("../verdict_db/tier0.vdb");
 
@@ -364,7 +364,7 @@ fn embedded_tier0() -> Option<&'static Tier0Db> {
 /// trusted. Opt out entirely with `TCG_NO_VERDICT_DB=1` (or all verdict reuse
 /// with `TCG_NO_PROOF_CACHE=1`, which the caller gates).
 fn tier0_candidate_verified(solver_path: &str, key: &str) -> bool {
-    if std::env::var_os("TCG_NO_VERDICT_DB").is_some() {
+    if trust_cg_process_env::var_os("TCG_NO_VERDICT_DB").is_some() {
         return false;
     }
     // SELF-DISABLE EARLY. The identity comparison below is the same one
@@ -375,11 +375,6 @@ fn tier0_candidate_verified(solver_path: &str, key: &str) -> bool {
     //
     // A matching host is unaffected: it falls through to the full parse exactly
     // as before, including its strict validation.
-    // Same short-circuit as the session cache and the cert tier: a `-dirty`
-    // solver can never match the committed manifest.
-    if crate::ay_bridge::default_solver_reports_dirty_build(solver_path) {
-        return false;
-    }
     let Some(expected) = embedded_tier0_identity() else {
         return false;
     };
@@ -424,13 +419,13 @@ fn tier0_candidate_in(db: &Tier0Db, solver_path: &str, key: &str) -> bool {
 /// path).
 pub(crate) const DB_VERDICT_TIMEOUT_MS: u64 = 30_000;
 
-/// The canonical solver config for DB-obligation verdicts. `solver_path` does
+/// The canonical solver config for DB-obligation verdicts. `solver` does
 /// NOT affect the emitted SMT2 (only `timeout_ms` + `produce_models` do), so
 /// the offline regen (which pins the resolved solver) and the per-compile
 /// lookup (`None`) produce byte-identical queries under this config.
 pub(crate) fn db_verdict_config() -> AYConfig {
     AYConfig {
-        solver_path: None,
+        solver: None,
         timeout_ms: DB_VERDICT_TIMEOUT_MS,
         produce_models: true,
     }
@@ -455,27 +450,91 @@ pub(crate) fn db_obligation_smt2(obligation: &ProofObligation) -> String {
     }
 }
 
-/// Process-wide resolution of `(solver_path, solver_identity)` for tier-0
-/// obligation lookups. Resolved ONCE per process (`find_solver_binary` can
-/// spawn `which`; the binary-bytes hash is itself memoized in
-/// [`solver_identity_hash`]).
-fn tier0_solver() -> Option<&'static (String, String)> {
-    static SOLVER: OnceLock<Option<(String, String)>> = OnceLock::new();
-    SOLVER
-        .get_or_init(|| {
-            let path = resolved_solver_path()?;
-            let identity = solver_identity_hash(&path)?;
-            Some((path, identity))
-        })
-        .as_ref()
+/// Replay an independently checked portable certificate for the exact,
+/// path-stable DB query of `obligation`.
+///
+/// This authority is deliberately separate from tier-0: it neither needs nor
+/// consults a live AY binary, and `TCG_NO_VERDICT_DB` does not disable it.
+/// [`crate::canary_cert::cert_skip_verified`] still honors the global proof-
+/// cache and portable-certificate kill switches and binds the exact query,
+/// certificate, and checker bytes before returning `true`.
+pub(crate) fn portable_cert_verified_obligation(obligation: &ProofObligation) -> bool {
+    crate::canary_cert::cert_skip_verified(&db_obligation_smt2(obligation))
+}
+
+/// Resolve `(solver_path, solver_identity)` for the current request. Solver
+/// discovery and identity hashing have their own path/content-keyed memos; this
+/// layer must not freeze the first request's explicit solver authority.
+#[cfg(test)]
+fn tier0_solver() -> Option<(String, String)> {
+    let solver = crate::ay_bridge::resolved_solver()?;
+    Some((
+        solver.path().to_string_lossy().into_owned(),
+        solver.sha256().to_owned(),
+    ))
 }
 
 /// The process-wide memo for [`tier0_lookup_obligation`], keyed by the FULL
 /// obligation content (a lookup can never serve a verdict for different
 /// content). Bounded by the number of DISTINCT registry obligations.
-fn tier0_obligation_memo() -> &'static Mutex<HashMap<ProofObligation, bool>> {
-    static MEMO: OnceLock<Mutex<HashMap<ProofObligation, bool>>> = OnceLock::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Tier0LookupOutcome {
+    Verified,
+    Refuted { counterexample: String },
+    Inconclusive,
+    Miss,
+}
+
+impl Tier0LookupOutcome {
+    /// Whether this outcome is durable proof evidence for an exact obligation.
+    ///
+    /// A timeout, solver/process error, or lookup miss says nothing about what
+    /// a later attempt can establish. Keeping those outcomes out of the memo is
+    /// what lets a temporarily unavailable verifier recover within one process.
+    fn is_stable(&self) -> bool {
+        matches!(self, Self::Verified | Self::Refuted { .. })
+    }
+}
+
+type Tier0ObligationMemo = HashMap<[u8; 32], HashMap<ProofObligation, Tier0LookupOutcome>>;
+
+fn tier0_obligation_memo() -> &'static Mutex<Tier0ObligationMemo> {
+    static MEMO: OnceLock<Mutex<Tier0ObligationMemo>> = OnceLock::new();
     MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tier0_lookup_memoized_in(
+    memo: &Mutex<Tier0ObligationMemo>,
+    request: &crate::ay_bridge::PreparedAyQuery,
+    uncached: impl FnOnce() -> Option<crate::ay_bridge::CapturedAyResult>,
+) -> Tier0LookupOutcome {
+    let authority_id = request.authority_id();
+    let obligation = request.obligation();
+    if let Some(hit) = memo
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&authority_id)
+        .and_then(|by_obligation| by_obligation.get(obligation))
+        .cloned()
+    {
+        return hit;
+    }
+
+    let Some(discharge) = uncached() else {
+        return Tier0LookupOutcome::Miss;
+    };
+    if !discharge.matches_request(request) {
+        return Tier0LookupOutcome::Inconclusive;
+    }
+    let outcome = tier0_outcome(discharge.result());
+    if outcome.is_stable() && discharge.reusable_for(request) {
+        memo.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(authority_id)
+            .or_default()
+            .insert(obligation.clone(), outcome.clone());
+    }
+    outcome
 }
 
 /// Per-compile tier-0 preference (PROOF-4 B1): does a committed candidate for
@@ -485,70 +544,60 @@ fn tier0_obligation_memo() -> &'static Mutex<HashMap<ProofObligation, bool>> {
 /// The DB is an optimization hint only. A row is attacker-forgeable data, not a
 /// certificate; a hit therefore invokes the selected solver on the obligation
 /// and credits `Formal` only when that live invocation returns `Verified`.
-/// Successful and failed revalidations are memoized by full obligation content
-/// for this process. Opt out with `TCG_NO_VERDICT_DB=1` /
-/// `TCG_NO_PROOF_CACHE=1`.
-pub(crate) fn tier0_lookup_obligation(obligation: &ProofObligation) -> bool {
-    // No tier-0 solver on this host (a per-process constant): every path
-    // below answers `false`, so answer it here — before the env reads, the
-    // global memo lock and the full-obligation hash that ran per instruction
-    // of every certificate walk.
-    if tier0_solver().is_none() {
-        return false;
-    }
-    if std::env::var_os("TCG_NO_VERDICT_DB").is_some()
+/// Stable proofs and genuine refutations are memoized by full obligation
+/// content for this process. Misses and inconclusive attempts remain retryable.
+/// Opt out with `TCG_NO_VERDICT_DB=1` / `TCG_NO_PROOF_CACHE=1`.
+pub(crate) fn tier0_lookup_obligation(obligation: &ProofObligation) -> Tier0LookupOutcome {
+    // Honor explicit no-cache policy before solver discovery or the relatively
+    // expensive solver-binary content hash. A caller asking for no DB/cache
+    // must not pay the initialization cost of the facility it disabled.
+    if trust_cg_process_env::var_os("TCG_NO_VERDICT_DB").is_some()
         || crate::env_lock::var_os("TCG_NO_PROOF_CACHE").is_some()
     {
-        return false;
+        return Tier0LookupOutcome::Miss;
     }
-    if let Some(hit) = tier0_obligation_memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(obligation)
-        .copied()
-    {
-        return hit;
-    }
-    let hit = tier0_lookup_obligation_uncached(obligation);
-    tier0_obligation_memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(obligation.clone(), hit);
-    hit
+    let Some(request) = crate::ay_bridge::PreparedAyQuery::capture(obligation, db_verdict_config())
+    else {
+        return Tier0LookupOutcome::Miss;
+    };
+    tier0_lookup_memoized_in(tier0_obligation_memo(), &request, || {
+        tier0_lookup_obligation_uncached(&request)
+    })
 }
 
 /// Core of [`tier0_lookup_obligation`] (no memo). A candidate hit is always
 /// followed by live solver revalidation before returning `true`.
-fn tier0_lookup_obligation_uncached(obligation: &ProofObligation) -> bool {
-    // BEFORE `tier0_solver()`, which computes the ~320ms content hash: a
-    // `-dirty` solver can never match the committed manifest, so this tier is
-    // going to decline anyway. Checking here (~10ms, memoized) rather than
-    // after keeps the hash off the compile path entirely on a developer box.
-    // Decline-only, exactly as in `tier0_candidate_verified` — see
-    // `ay_bridge::solver_reports_dirty_build`.
-    if let Some(path) = resolved_solver_path()
-        && crate::ay_bridge::default_solver_reports_dirty_build(&path)
-    {
-        return false;
+fn tier0_lookup_obligation_uncached(
+    request: &crate::ay_bridge::PreparedAyQuery,
+) -> Option<crate::ay_bridge::CapturedAyResult> {
+    if !tier0_candidate_verified(request.solver_path(), request.query_key()) {
+        return None;
     }
-    let Some((path, identity)) = tier0_solver() else {
-        return false;
-    };
-    let smt2 = db_obligation_smt2(obligation);
-    let key = verdict_cache_key_v2(identity, &smt2);
-    if !tier0_candidate_verified(path, &key) {
-        return false;
-    }
-    revalidate_obligation_with_solver(obligation, path)
+    Some(request.execute())
 }
 
-fn revalidate_obligation_with_solver(obligation: &ProofObligation, solver_path: &str) -> bool {
+#[cfg(test)]
+fn revalidate_obligation_with_solver(
+    obligation: &ProofObligation,
+    solver: &crate::ay_identity::PinnedAy,
+) -> Tier0LookupOutcome {
     let mut config = db_verdict_config();
-    config.solver_path = Some(solver_path.to_owned());
-    matches!(
-        crate::ay_bridge::verify_with_ay(obligation, &config),
-        AYResult::Verified
-    )
+    config.solver = Some(solver.clone());
+    // Retain the ordinary public-entry counterfeit-proof control independently
+    // of prepared-query tests; raw SAT/UNSAT must actually reach this solver.
+    tier0_outcome(&crate::ay_bridge::verify_with_ay(obligation, &config))
+}
+
+fn tier0_outcome(result: &AYResult) -> Tier0LookupOutcome {
+    match result {
+        AYResult::Verified => Tier0LookupOutcome::Verified,
+        AYResult::CounterExample(counterexample) => Tier0LookupOutcome::Refuted {
+            counterexample: format!("{counterexample:?}"),
+        },
+        AYResult::SolverUnsat | AYResult::Timeout | AYResult::Unknown(_) | AYResult::Error(_) => {
+            Tier0LookupOutcome::Inconclusive
+        }
+    }
 }
 
 /// Test-only: the [`tier0_lookup_obligation_uncached`] derivation against an
@@ -573,120 +622,239 @@ pub(crate) fn tier0_candidate_obligation_in(
 #[cfg(test)]
 pub(crate) fn tier0_revalidated_obligation_in(
     db: &Tier0Db,
-    solver_path: &str,
+    solver: &crate::ay_identity::PinnedAy,
     obligation: &ProofObligation,
 ) -> bool {
-    if !tier0_candidate_obligation_in(db, solver_path, obligation) {
+    if !tier0_candidate_obligation_in(db, &solver.path().to_string_lossy(), obligation) {
         return false;
     }
-    revalidate_obligation_with_solver(obligation, solver_path)
+    matches!(
+        revalidate_obligation_with_solver(obligation, solver),
+        Tier0LookupOutcome::Verified
+    )
 }
 
 // ---------------------------------------------------------------------------
-// Per-compile live-solver fallback for RECONSTRUCTED obligations (PROOF-5 B2)
+// Per-compile live formal replay of source-bound obligations
 // ---------------------------------------------------------------------------
+//
+// There is no live route for registry theorems. The former formal-on-miss
+// upgrade (`lowering_proof::try_formal_on_miss` and its function-request twin)
+// existed only to lift a Statistical registry verdict to Formal; it was deleted
+// with the withdrawal of substring, representative and statistical credit
+// (Trust core architecture v2, E0.2/E0.5). As recorded in the Trust self-host
+// campaign ledger (2026-09-14, solo `library/core`), that route made 148
+// attempts with zero successes, re-solving the same registry queries
+// 40x/28x/17x; the per-key two-attempt cap (f992f4fc) bounded the cost but still
+// allowed one repeat per key. Without the route, no registry query is ever
+// issued from a compile, so no such repeat can occur.
 
-/// PROOF-5 B2: is the per-compile LIVE-solver fallback for reconstructed
-/// obligations enabled? **Off by default** — the PRIMARY statistical-retirement
-/// mechanism is the OFFLINE tier-0 parametric DB (a pure lookup, no solver
-/// spawn), which covers the hot integer ALU/shift/neg/not surface. The live
-/// fallback spawns a solver per tier-0 MISS, so it is reserved for an explicit
-/// STRICT lane and must be OPTED IN with `TCG_RECON_SOLVER_ROUTE=1`; it then
-/// additionally requires a usable solver present and the solver lane not
-/// disabled via `TCG_REFINE_SOLVER=0`.
-///
-/// Default posture (this returns `false`): tier-0 lookup credits the covered
-/// families `Formal`, and any uncovered family keeps a clearly-labeled
-/// `Statistical` fallback — never fail-closed, never a compile-time regression.
-/// A solver-ABSENT host always returns `false` (statistical fallback preserved).
-pub(crate) fn reconstructed_live_solver_enabled() -> bool {
-    // Opt-in only (the hot-path solver spawn is a deliberate strict-lane choice).
-    if std::env::var_os("TCG_RECON_SOLVER_ROUTE").is_none_or(|v| v == "0") {
-        return false;
-    }
-    if crate::env_lock::var_os("TCG_NO_PROOF_CACHE").is_some() {
-        return false;
-    }
-    // `TCG_REFINE_SOLVER=0` (bridge escape hatch) also disables this lane.
-    if crate::env_lock::var_os("TCG_REFINE_SOLVER").is_some_and(|v| v == "0") {
-        return false;
-    }
-    tier0_solver().is_some()
-}
-
-/// Bounded per-compile solver budget (ms) for the reconstructed live-solve
-/// fallback. Deliberately SHORTER than [`DB_VERDICT_TIMEOUT_MS`] (the offline
-/// regen budget): a genuinely solver-hard reconstructed family (e.g. signed
-/// div/rem over the INT_MIN/-1 corner) times out quickly and falls back to the
-/// statistical posture rather than stalling the compile; the common fast
-/// families (LEA effective-address, FP conversions, uncovered ALU widths)
-/// discharge in well under a second. Overridable via `TCG_RECON_SOLVER_MS`.
-const RECON_LIVE_SOLVE_TIMEOUT_MS: u64 = 5_000;
-
-fn recon_live_solve_config() -> AYConfig {
-    let timeout_ms = std::env::var("TCG_RECON_SOLVER_MS")
+/// Live solver budget for a replayed source-bound obligation, overridable via
+/// `TCG_RECON_SOLVER_MS` for compatibility.
+fn live_formal_solve_config_with_default(default_timeout_ms: u64) -> AYConfig {
+    let timeout_ms = trust_cg_process_env::var("TCG_RECON_SOLVER_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(RECON_LIVE_SOLVE_TIMEOUT_MS);
+        .unwrap_or(default_timeout_ms);
     AYConfig {
-        solver_path: None,
+        solver: None,
         timeout_ms,
         produce_models: true,
     }
 }
 
-/// Process-wide memo for [`live_discharge_reconstructed`], keyed by full
-/// obligation content — so at most ONE solver spawn per DISTINCT reconstructed
-/// obligation per process (repeated instances of the same lowering share the
-/// verdict), and a Timeout is not re-attempted within the process.
-fn live_recon_memo()
--> &'static Mutex<HashMap<ProofObligation, Option<crate::verify::VerificationResult>>> {
-    static MEMO: OnceLock<
-        Mutex<HashMap<ProofObligation, Option<crate::verify::VerificationResult>>>,
-    > = OnceLock::new();
-    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+/// The configuration a source-bound replay renders and runs its query under
+/// (the thirty-second default budget unless `TCG_RECON_SOLVER_MS` sets one).
+/// The `x86-body-dump` diagnostic renders with it too, so a dumped query is
+/// the replayed one byte for byte. The budget is the AY solve's: the Clean
+/// check of AY's proof runs under the checker's own deadline (OD-223,
+/// `obligation_cert_store::proof_check_timeout_ms`, 180 s by default).
+pub(crate) fn live_source_bound_config() -> AYConfig {
+    live_formal_solve_config_with_default(30_000)
 }
 
-/// PROOF-5 B2: discharge a reconstructed obligation with a LIVE solver run
-/// (consulting the dde503a disk cache first via [`crate::ay_bridge::verify_with_ay`]).
+/// Replay a source-bound owner's exact obligation: the AArch64 frame theorem
+/// (whose array certificate motivated the thirty-second default budget), an
+/// AArch64 bound ALU theorem or the x86-64 whole-body theorem. An explicit
+/// existing timeout remains binding. Keep it out of the normalized registry
+/// memo: the owned query and existing AY session/certificate caches bind the
+/// exact unsimplified query bytes. Tier-0 recording and `TCG_REFINE_SOLVER=0`
+/// refuse replay; only an independently checked proof maps to `Valid`.
 ///
-/// - `Some(Valid)` on `Verified` — SolverProven, credited `Formal`.
-/// - `Some(Invalid{..})` on a genuine `CounterExample` — the caller fails CLOSED
-///   (the P0 miscompile catch; QF_BV counterexamples are deterministic).
-/// - `None` on Timeout/Unknown/Error — INCONCLUSIVE; the caller keeps the
-///   statistical fallback (never a nondeterministic reject).
+/// Every owner (the AArch64 frame and ALU theorems, the x86-64 body theorem
+/// and the x86-64 envelope parts) takes this one path, so the source-bound
+/// negative memo ([`crate::source_bound_negative_memo`]) serves all of them
+/// on the reusable route: a query AY did not certify under the identical
+/// configuration replays that non-credit outcome without running AY, inside
+/// its retry budget. The fresh route below (no reusable authority) never
+/// consults it.
 ///
-/// Never spawns while the regen recorder is armed (the offline builder owns that
-/// path). Process-memoized by full obligation content.
-pub(crate) fn live_discharge_reconstructed(
-    obligation: &ProofObligation,
-) -> Option<crate::verify::VerificationResult> {
-    // The offline regen drives its own solver runs with the recorder armed;
-    // never re-enter the live path from underneath it.
-    if recording_active() {
-        return None;
+/// Returns the verdict, whether a Valid one was bound to the request's reusable
+/// authority, and diagnostic provenance: a refusal/non-credit outcome, or the
+/// actual constructive producer of a Valid theorem (AY did not run). The text never
+/// changes the verdict or the binding.
+pub(crate) fn live_source_bound_replay_explained<O>(
+    owner: &O,
+    request: &crate::FunctionVerificationRequest,
+) -> (
+    Option<crate::verify::VerificationResult>,
+    bool,
+    Option<String>,
+)
+where
+    O: crate::source_bound_replay::SourceBoundReplay + ?Sized,
+{
+    if request.recording_active() {
+        return (
+            None,
+            false,
+            Some("replay refused: the tier-0 recorder is armed".into()),
+        );
     }
-    if let Some(hit) = live_recon_memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(obligation)
-        .cloned()
+    if crate::env_lock::var_os("TCG_REFINE_SOLVER").is_some_and(|v| v == "0") {
+        return (
+            None,
+            false,
+            Some("replay refused: TCG_REFINE_SOLVER=0".into()),
+        );
+    }
+    let config = live_source_bound_config();
+    let explained = |result: &AYResult| {
+        let verdict = live_formal_outcome(owner.replayed_obligation(), result);
+        // OD-223: a Clean check outcome is labelled as one, never as AY's.
+        let why = verdict
+            .is_none()
+            .then(|| crate::ay_bridge::replay_outcome_label(result));
+        (verdict, why)
+    };
+    if request.may_reuse()
+        && let Some(query) = request.ay().prepare_source_bound(
+            owner,
+            AYConfig {
+                solver: config.solver.clone(),
+                timeout_ms: config.timeout_ms,
+                produce_models: config.produce_models,
+            },
+        )
     {
-        return hit;
+        let captured = query.execute_without_portable();
+        if !captured.matches_request(&query) {
+            return (
+                None,
+                false,
+                Some("replay refused: the executed query is not the request's".into()),
+            );
+        }
+        let (verdict, why) = explained(captured.result());
+        // A negative-memo replay says so: AY did not run for this occurrence.
+        let why = match captured.source() {
+            crate::ay_bridge::AyVerdictSource::NegativeMemo => {
+                why.map(|why| format!("negative memo (AY not run): {why}"))
+            }
+            crate::ay_bridge::AyVerdictSource::ClosedDefinitionProof { .. } => {
+                Some(captured.verdict().provenance())
+            }
+            _ => why,
+        };
+        return (verdict, captured.reusable_for(&query), why);
     }
-    let verdict = live_discharge_reconstructed_uncached(obligation);
-    live_recon_memo()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(obligation.clone(), verdict.clone());
-    verdict
+    let result = request
+        .ay()
+        .verify_fresh_source_bound_attributed(owner, &config);
+    let (verdict, why) = explained(&result.result);
+    let why = if matches!(
+        result.source,
+        crate::ay_bridge::AyVerdictSource::ClosedDefinitionProof { .. }
+    ) {
+        Some(result.provenance())
+    } else {
+        why
+    };
+    (verdict, false, why)
 }
 
-fn live_discharge_reconstructed_uncached(
+/// Replay one word-bound obligation (a memory-effect part) exactly as
+/// [`live_source_bound_replay_explained`] replays a source-bound owner: the
+/// same raw query, budget, refusals and acceptance (`Valid` only for an AY
+/// proof Clean fully verified). The caller records the verdict; a word-bound
+/// `Valid` is never proof credit.
+pub(crate) fn live_word_bound_replay_explained<O>(
+    owner: &O,
+    request: &crate::FunctionVerificationRequest,
+) -> (Option<crate::verify::VerificationResult>, Option<String>)
+where
+    O: crate::source_bound_replay::WordBoundReplay + ?Sized,
+{
+    if request.recording_active() {
+        return (
+            None,
+            Some("replay refused: the tier-0 recorder is armed".into()),
+        );
+    }
+    if crate::env_lock::var_os("TCG_REFINE_SOLVER").is_some_and(|v| v == "0") {
+        return (None, Some("replay refused: TCG_REFINE_SOLVER=0".into()));
+    }
+    let config = live_source_bound_config();
+    let explained = |result: &AYResult| {
+        let verdict = live_formal_outcome(owner.replayed_obligation(), result);
+        // OD-223: a Clean check outcome is labelled as one, never as AY's.
+        let why = verdict
+            .is_none()
+            .then(|| crate::ay_bridge::replay_outcome_label(result));
+        (verdict, why)
+    };
+    if request.may_reuse()
+        && let Some(query) = request.ay().prepare_word_bound(
+            owner,
+            AYConfig {
+                solver: config.solver.clone(),
+                timeout_ms: config.timeout_ms,
+                produce_models: config.produce_models,
+            },
+        )
+    {
+        let captured = query.execute_without_portable();
+        if !captured.matches_request(&query) {
+            return (
+                None,
+                Some("replay refused: the executed query is not the request's".into()),
+            );
+        }
+        return explained(captured.result());
+    }
+    explained(&request.ay().verify_fresh_word_bound(owner, &config))
+}
+
+fn live_formal_outcome(
     obligation: &ProofObligation,
+    result: &AYResult,
 ) -> Option<crate::verify::VerificationResult> {
     use crate::verify::VerificationResult;
-    match crate::ay_bridge::verify_with_ay(obligation, &recon_live_solve_config()) {
+    if crate::diag::solve_trace_enabled() {
+        eprintln!(
+            "TCG_SOLVE_TRACE promotion_result obligation={:?} result={result:?}",
+            obligation.name
+        );
+    }
+    // Diagnostic only (`x86-body-trace`): the raw outcome behind an x86 body
+    // replay that credits nothing, with the class `proof_gate` gives it. A
+    // proof-authority rejection (AY's self-check, or a working checker
+    // refusing the exact proof) is SOUNDNESS-class there, although the live
+    // lanes leave its rows Unverified.
+    if crate::diag::x86_body_trace_enabled()
+        && (obligation.name == crate::x86_source_bound_body::X86_BODY_OBLIGATION_NAME
+            || crate::x86_source_bound_body::is_x86_body_part_name(&obligation.name)
+            || crate::x86_source_bound_body::is_x86_body_claim_name(&obligation.name)
+            || crate::x86_source_bound_body::is_x86_body_generalized_name(&obligation.name)
+            || crate::x86_source_bound_envelope::is_x86_envelope_part_name(&obligation.name))
+        && let Some(class) = crate::proof_gate::failure_class_of(result)
+    {
+        eprintln!(
+            "[TCG-X86-BODY-TRACE] replay outcome={result:?} proof_gate_class={}",
+            class.label()
+        );
+    }
+    match result {
         AYResult::Verified => Some(VerificationResult::Valid),
         AYResult::SolverUnsat => None,
         AYResult::CounterExample(model) => Some(VerificationResult::Invalid {
@@ -822,12 +990,16 @@ pub struct Tier0RegenReport {
 /// `Verified` on a live run — a Timeout/Refuted/Unknown seed can never be
 /// committed.
 pub fn regen_tier0_db(out_path: &Path) -> Result<Tier0RegenReport, String> {
-    let solver_path = crate::ay_bridge::resolved_solver_path().ok_or_else(|| {
-        "no ay solver binary found (build ~/ay or set AY_SOLVER_PATH)".to_string()
+    let solver = crate::ay_bridge::resolved_solver().ok_or_else(|| {
+        crate::ay_bridge::solver_identity_refusal().map_or_else(
+            || "no independent Clean checker is available for the admitted AY".to_string(),
+            |refusal| format!("no ay solver admitted: {refusal}"),
+        )
     })?;
-    let solver_identity = solver_identity_hash(&solver_path)
-        .ok_or_else(|| format!("cannot read/hash solver binary at {solver_path}"))?;
-    let solver_version = crate::ay_bridge::solver_version_string(&solver_path);
+    let solver_path = solver.path().to_string_lossy().into_owned();
+    let solver_identity = solver.sha256().to_owned();
+    // The recorded build of the admitted bytes; nothing is executed to read it.
+    let solver_version = solver.identity().build().map(|build| build.describe());
 
     // Enumerate the eligible ProofDatabase registry obligations (fixed,
     // program-independent, discharged STATISTICALLY at >8-bit today — the ones
@@ -863,8 +1035,8 @@ pub fn regen_tier0_db(out_path: &Path) -> Result<Tier0RegenReport, String> {
     // The registry + reconstruction phases run WHILE the recorder is armed:
     // every `Verified` funnel result is captured as a tier-0 row; per-obligation
     // exemptions / refutations are tracked from the returned AYResult.
-    let db_outcome = prove_registry_obligations(&solver_path, &eligible);
-    let recon_outcome = prove_reconstructed_obligations(&solver_path, &reconstructed);
+    let db_outcome = prove_registry_obligations(&solver, &eligible);
+    let recon_outcome = prove_reconstructed_obligations(&solver, &reconstructed);
     let recorded = record_take();
     seed_result?;
     let mut exemptions = db_outcome?; // P0 refutation propagates here (nothing written)
@@ -978,16 +1150,16 @@ fn enumerate_regen_eligible() -> Result<Vec<RegenObligation>, String> {
 
 /// Prove each eligible registry obligation with a LIVE run of the real solver
 /// (recorder armed → each `Verified` is captured as a tier-0 row). The solver
-/// is PINNED to `solver_path` (the manifest binary) so every committed row is
+/// is PINNED to `solver` (the manifest binary) so every committed row is
 /// genuinely proven by the binary the manifest names. Returns the exemption
 /// list (Timeout / Unknown / Error). A solver COUNTEREXAMPLE aborts with a P0
 /// error (nothing is written).
 fn prove_registry_obligations(
-    solver_path: &str,
+    solver: &crate::ay_identity::PinnedAy,
     eligible: &[RegenObligation],
 ) -> Result<Vec<Tier0Exemption>, String> {
     let config = AYConfig {
-        solver_path: Some(solver_path.to_string()),
+        solver: Some(solver.clone()),
         timeout_ms: DB_VERDICT_TIMEOUT_MS,
         produce_models: true,
     };
@@ -1070,10 +1242,11 @@ fn enumerate_reconstruct_regen_obligations() -> Result<Vec<ProofObligation>, Str
     on_large_stack(|| {
         let mut out = crate::x86_64_function_verifier::enumerate_reconstruct_tier0_obligations();
         out.extend(crate::function_verifier::enumerate_reconstruct_tier0_obligations());
-        // Only genuinely-reconstructed obligations belong in tier-0 (defensive:
-        // every enumerated form is 32/64-bit and Reconstructed). A commutative
-        // ALU form is structurally X==X yet still a real solver proof and the
-        // reconstructed-credit rule credits it, so degeneracy is NOT filtered.
+        // Only genuinely reconstructed obligations belong in this theorem set
+        // (defensive: every enumerated form is 32/64-bit and Reconstructed).
+        // A commutative ALU form may be structurally X==X; keep it for exact
+        // artifact/query identity, but do not mistake it for source-lowering
+        // authority at per-instruction discharge.
         out.retain(|ob| ob.is_reconstructed());
         let mut deduped: Vec<ProofObligation> = Vec::new();
         for ob in out {
@@ -1087,16 +1260,16 @@ fn enumerate_reconstruct_regen_obligations() -> Result<Vec<ProofObligation>, Str
 
 /// PROOF-5: prove each CANONICAL (parametric) reconstruction obligation with a
 /// LIVE run of the real solver (recorder armed → each `Verified` becomes a
-/// tier-0 row). The solver is PINNED to `solver_path` (the manifest binary).
+/// tier-0 row). The solver is PINNED to `solver` (the manifest binary).
 /// Returns the exemption list (Timeout / Unknown / Error). A solver
 /// COUNTEREXAMPLE aborts with a P0 error (nothing is written) — a previously
 /// sample-accepted reconstruction coming back solver-REFUTED is a miscompile.
 fn prove_reconstructed_obligations(
-    solver_path: &str,
+    solver: &crate::ay_identity::PinnedAy,
     obligations: &[ProofObligation],
 ) -> Result<Vec<Tier0Exemption>, String> {
     let config = AYConfig {
-        solver_path: Some(solver_path.to_string()),
+        solver: Some(solver.clone()),
         timeout_ms: DB_VERDICT_TIMEOUT_MS,
         produce_models: true,
     };
@@ -1452,7 +1625,11 @@ mod tests {
             "the attacker-controlled row is intentionally a valid candidate"
         );
         assert!(
-            !tier0_revalidated_obligation_in(&db, &solver, &obligation),
+            !tier0_revalidated_obligation_in(
+                &db,
+                &crate::ay_identity::test_fixtures::pin(Path::new(&solver)),
+                &obligation
+            ),
             "a candidate must not become Formal when the live solver reports SAT"
         );
 
@@ -1465,11 +1642,54 @@ mod tests {
             }],
         );
         assert!(
-            !tier0_revalidated_obligation_in(&unsat_db, &unsat_solver, &obligation),
+            !tier0_revalidated_obligation_in(
+                &unsat_db,
+                &crate::ay_identity::test_fixtures::pin(Path::new(&unsat_solver)),
+                &obligation
+            ),
             "a forged candidate plus a raw live UNSAT still lacks independently checked proof \
              authority"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_outcome_refuses_raw_unsat_without_checked_proof() {
+        use crate::lowering_proof::MachineSideProvenance;
+        use crate::smt::SmtExpr;
+
+        let dir = temp_dir("live_outcome_raw_unsat");
+        let (solver, _identity) = fake_executable_solver(&dir, "raw-unsat-solver", "unsat");
+        let input = format!("formal_on_miss_x_{}", std::process::id());
+        let x = SmtExpr::var(&input, 32);
+        let obligation = ProofObligation {
+            machine_side_provenance: MachineSideProvenance::StaticDb,
+            name: "live replay raw UNSAT authority guard".to_owned(),
+            trust_ir_expr: x.clone(),
+            aarch64_expr: x,
+            inputs: vec![(input, 32)],
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: None,
+        };
+        let config = AYConfig {
+            solver: Some(crate::ay_identity::test_fixtures::pin(Path::new(&solver))),
+            timeout_ms: 1_000,
+            produce_models: true,
+        };
+
+        // The composition every remaining live replay (source-bound frame and
+        // arithmetic) applies to a solver answer.
+        assert!(
+            live_formal_outcome(
+                &obligation,
+                &crate::ay_bridge::verify_with_ay(&obligation, &config)
+            )
+            .is_none(),
+            "raw solver UNSAT must remain inconclusive without a Clean/Carcara-checked proof"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1644,7 +1864,7 @@ mod tests {
     /// mandatory live revalidation path:
     ///
     /// ```text
-    /// TRUST_CG_RUN_MEASUREMENT_TESTS=1 cargo test --release \
+    /// TRUST_CG_RUN_MEASUREMENT_TESTS=1 scripts/trust_cargo.sh test --release \
     ///     -p trust-cg-verify tier0_popcnt_canary_timing_probe -- --nocapture
     /// ```
     #[test]
@@ -1761,11 +1981,11 @@ mod tests {
     ///
     /// ```text
     /// # tier-0 candidates ON: matching rows are revalidated live
-    /// TRUST_CG_RUN_MEASUREMENT_TESTS=1 cargo test -p trust-cg-verify \
+    /// TRUST_CG_RUN_MEASUREMENT_TESTS=1 scripts/trust_cargo.sh test -p trust-cg-verify \
     ///     --lib tier0_registry_discharge_timing_probe -- --nocapture
     /// # tier-0 OFF (sweeps): expect all Statistical, seconds
     /// TCG_NO_VERDICT_DB=1 TRUST_CG_RUN_MEASUREMENT_TESTS=1 \
-    ///     cargo test -p trust-cg-verify --lib \
+    ///     scripts/trust_cargo.sh test -p trust-cg-verify --lib \
     ///     tier0_registry_discharge_timing_probe -- --nocapture
     /// ```
     #[test]
@@ -1894,7 +2114,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PROOF-5 / TV-9 (B2): parametric reconstruction credit flip
+    // PROOF-5 / TV-9 (B2): parametric reconstruction theorem identity
     // -----------------------------------------------------------------------
 
     use crate::verify::{VerificationResult, VerificationStrength};
@@ -1905,6 +2125,92 @@ mod tests {
 
     fn g32(id: u32) -> X86ISelOperand {
         X86ISelOperand::VReg(X86VReg::new(id, X86RegClass::Gpr32))
+    }
+
+    #[test]
+    fn aarch64_canonical_immediates_share_the_register_family_query() {
+        use crate::function_verifier::{
+            canonical_reconstruct_obligation, reconstruct_alu_obligation,
+        };
+        use trust_cg_ir::regs::VReg;
+        use trust_cg_ir::{AArch64Opcode as A, MachInst, MachOperand, RegClass};
+
+        for class in [RegClass::Gpr32, RegClass::Gpr64] {
+            let r = |id| MachOperand::VReg(VReg::new(id, class));
+            for (ri, rr) in [
+                (A::AddRI, A::AddRR),
+                (A::SubRI, A::SubRR),
+                (A::AndRI, A::AndRR),
+                (A::OrrRI, A::OrrRR),
+                (A::EorRI, A::EorRR),
+                (A::LslRI, A::LslRR),
+                (A::LsrRI, A::LsrRR),
+                (A::AsrRI, A::AsrRR),
+            ] {
+                let register = MachInst::new(rr, vec![r(0), r(1), r(2)]);
+                let family = reconstruct_alu_obligation(&register).unwrap();
+                for immediate in [7, 17] {
+                    let inst = MachInst::new(ri, vec![r(0), r(1), MachOperand::Imm(immediate)]);
+                    let instance = reconstruct_alu_obligation(&inst).unwrap();
+                    let canonical = canonical_reconstruct_obligation(&inst).unwrap();
+                    assert_ne!(
+                        db_obligation_smt2(&instance),
+                        db_obligation_smt2(&canonical),
+                        "{ri:?}/{class:?}/{immediate}: the instance must retain its immediate"
+                    );
+                    assert_eq!(
+                        db_obligation_smt2(&canonical),
+                        db_obligation_smt2(&family),
+                        "{ri:?}/{class:?}/{immediate}: canonicalization must preserve the family"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aarch64_canonicalization_does_not_repair_malformed_immediate_instructions() {
+        use crate::function_verifier::{
+            canonical_reconstruct_obligation, reconstruct_alu_obligation,
+        };
+        use trust_cg_ir::regs::VReg;
+        use trust_cg_ir::{AArch64Opcode as A, MachInst, MachOperand, RegClass, SpecialReg};
+
+        let r = |id| MachOperand::VReg(VReg::new(id, RegClass::Gpr64));
+        for opcode in [
+            A::AddRI,
+            A::SubRI,
+            A::AndRI,
+            A::OrrRI,
+            A::EorRI,
+            A::LslRI,
+            A::LsrRI,
+            A::AsrRI,
+        ] {
+            for operands in [
+                vec![r(0), r(1), r(2)],
+                vec![r(0), r(1), MachOperand::Special(SpecialReg::XZR)],
+                vec![r(0), r(1), MachOperand::Imm(7), MachOperand::Imm(1)],
+                vec![r(0), r(1)],
+                vec![
+                    r(0),
+                    MachOperand::VReg(VReg::new(1, RegClass::Gpr32)),
+                    MachOperand::Imm(7),
+                ],
+                vec![
+                    MachOperand::Special(SpecialReg::XZR),
+                    r(1),
+                    MachOperand::Imm(7),
+                ],
+            ] {
+                let inst = MachInst::new(opcode, operands);
+                assert!(reconstruct_alu_obligation(&inst).is_none(), "{inst:?}");
+                assert!(
+                    canonical_reconstruct_obligation(&inst).is_none(),
+                    "{inst:?}"
+                );
+            }
+        }
     }
 
     /// PART A drift guard: the PARAMETRIC (free-immediate) canonical obligation is
@@ -2142,6 +2448,475 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tier0_memo_retries_transient_outcomes_and_keeps_stable_evidence() {
+        let obligation = super::enumerate_reconstruct_regen_obligations()
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("at least one reconstructed obligation");
+        let memo = Mutex::new(Tier0ObligationMemo::new());
+        let request_a = crate::ay_bridge::PreparedAyQuery::memo_control(
+            &obligation,
+            [0xA1; 32],
+            DB_VERDICT_TIMEOUT_MS,
+            true,
+        );
+        let request_b = crate::ay_bridge::PreparedAyQuery::memo_control(
+            &obligation,
+            [0xB2; 32],
+            DB_VERDICT_TIMEOUT_MS,
+            true,
+        );
+        let attempts = std::cell::Cell::new(0_u32);
+        let attempt = |outcome: Option<AYResult>| {
+            tier0_lookup_memoized_in(&memo, &request_a, || {
+                attempts.set(attempts.get() + 1);
+                outcome.map(|result| {
+                    crate::ay_bridge::CapturedAyResult::memo_control(&request_a, result)
+                })
+            })
+        };
+
+        assert_eq!(
+            attempt(Some(AYResult::Timeout)),
+            Tier0LookupOutcome::Inconclusive
+        );
+        assert_eq!(attempt(None), Tier0LookupOutcome::Miss);
+        let expected_refutation = Tier0LookupOutcome::Refuted {
+            counterexample: format!("{:?}", vec![("x".to_owned(), 1_u64)]),
+        };
+        assert_eq!(
+            attempt(Some(AYResult::CounterExample(vec![("x".to_owned(), 1)]))),
+            expected_refutation
+        );
+        assert_eq!(attempts.get(), 3, "both transient attempts must be retried");
+
+        let cached = tier0_lookup_memoized_in(&memo, &request_a, || {
+            panic!("a genuine refutation must be memoized")
+        });
+        assert_eq!(cached, expected_refutation);
+
+        let verified = tier0_lookup_memoized_in(&memo, &request_b, || {
+            Some(crate::ay_bridge::CapturedAyResult::memo_control(
+                &request_b,
+                AYResult::Verified,
+            ))
+        });
+        assert_eq!(verified, Tier0LookupOutcome::Verified);
+        assert_eq!(
+            tier0_lookup_memoized_in(&memo, &request_b, || {
+                panic!("a verified result must be memoized")
+            }),
+            Tier0LookupOutcome::Verified
+        );
+    }
+
+    #[test]
+    fn registry_memos_reject_a_b_a_recapture_and_query_policy_receipts() {
+        use crate::ay_bridge::PreparedAyQuery;
+
+        let obligation = super::enumerate_reconstruct_regen_obligations()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let expected = PreparedAyQuery::memo_control(&obligation, [0xA1; 32], 5_000, true);
+        let mut other_obligation = obligation.clone();
+        other_obligation.trust_ir_expr = crate::smt::SmtExpr::bv_const(7, 32);
+        other_obligation.aarch64_expr = crate::smt::SmtExpr::bv_const(9, 32);
+        let alternatives = [
+            PreparedAyQuery::memo_control(&obligation, [0xB2; 32], 5_000, true),
+            PreparedAyQuery::memo_control(&obligation, [0xA1; 32], 10_000, true),
+            PreparedAyQuery::memo_control(&obligation, [0xA1; 32], 5_000, false),
+            PreparedAyQuery::memo_control(&other_obligation, [0xA1; 32], 5_000, true),
+        ];
+        for actual in &alternatives {
+            let tier0 = Mutex::new(Tier0ObligationMemo::new());
+            // Model a recapture mutant: the outer endpoint remains A before
+            // and after, but the actual discharge carries B's receipt. Bare
+            // favorable outcomes must not hide that mismatch in the memo.
+            assert_eq!(
+                tier0_lookup_memoized_in(&tier0, &expected, || {
+                    Some(crate::ay_bridge::CapturedAyResult::memo_control(
+                        actual,
+                        AYResult::Verified,
+                    ))
+                }),
+                Tier0LookupOutcome::Inconclusive
+            );
+            assert!(tier0.lock().unwrap().is_empty());
+            assert_eq!(
+                tier0_lookup_memoized_in(&tier0, &expected, || {
+                    Some(
+                        crate::ay_bridge::CapturedAyResult::unreceipted_memo_control(
+                            actual,
+                            AYResult::Verified,
+                        ),
+                    )
+                }),
+                Tier0LookupOutcome::Inconclusive
+            );
+        }
+        let tier0 = Mutex::new(Tier0ObligationMemo::new());
+        assert_eq!(
+            tier0_lookup_memoized_in(&tier0, &expected, || {
+                Some(
+                    crate::ay_bridge::CapturedAyResult::unreceipted_memo_control(
+                        &expected,
+                        AYResult::Verified,
+                    ),
+                )
+            }),
+            Tier0LookupOutcome::Verified
+        );
+        assert!(
+            tier0.lock().unwrap().is_empty(),
+            "correctly bound portable/no-cache evidence stays valid but uncacheable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_prepared_query_executes_captured_authority_and_counts_memo_reuse() {
+        use crate::ay_bridge::PreparedAyQuery;
+        use crate::lowering_proof::MachineSideProvenance;
+        use crate::smt::SmtExpr;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = crate::ay_bridge::formal_solver_test_lock();
+        let _recorder = recorder_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Each is a new file, started once before the solver deadlines below
+        // (`test_fixtures::warm`; the guard answers that start before anything
+        // is counted or marked ready).
+        let make_script = |name: &str, body: &str| {
+            use crate::ay_identity::test_fixtures::{bind_self, warm, warm_guard};
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                bind_self(&path, &format!("#!/bin/sh\n{}\n{body}\n", warm_guard())),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            warm(&path);
+            path
+        };
+        // These tools test launch/receipt/memo plumbing, NOT proof validity.
+        // The checker deliberately recognizes only a controlled success
+        // transcript; no result is a real Clean/kernel qualification.
+        let checker_body = r#"
+printf '%s\n' "$GOVERN_AY_MB" >> "$0.calls"
+printf 'External certificate verification: PASSED\nType: Alethe SMT proof\nProof status: fully verified\n'
+"#;
+        let checker_a = make_script("checker-a", checker_body);
+        let checker_b = make_script("checker-b", checker_body);
+        let solver_body = r#"
+test "$#" = 7 && test "$1" = -smt2 && test "$3" = --strict-proofs &&
+test "$4" = --proof && test "$5" = "$2.alethe" &&
+test "$6" = --proof-format && test "$7" = alethe || exit 91
+printf '%s\n' "$GOVERN_AY_MB" >> "$0.calls"
+cp "$2" "$0.last-query" || exit 92
+printf 'transport-only fixture proof\n' > "$5"
+printf 'unsat\n'
+"#;
+        let solver_a = make_script("solver-a", solver_body);
+        let solver_b = make_script("solver-b", &format!("# distinct B contents\n{solver_body}"));
+        let retry_solver = make_script(
+            "solver-retry",
+            &format!(
+                r#"
+if test ! -f "$0.ready"; then
+    printf '%s\n' "$GOVERN_AY_MB" >> "$0.calls"
+    : > "$0.ready"
+    printf 'unknown\n'
+    exit 0
+fi
+{solver_body}
+"#
+            ),
+        );
+        let refuting_solver = make_script(
+            "solver-refuted",
+            r#"
+printf '%s\n' "$GOVERN_AY_MB" >> "$0.calls"
+printf '%s\n' "$#" >> "$0.arg-counts"
+cp "$2" "$0.last-query" || exit 92
+printf 'sat\n((registry_captured_x #x00000001))\n'
+"#,
+        );
+        let drifting_solver = make_script(
+            "solver-drift",
+            &format!("{solver_body}\nprintf '# changed after producing this proof\\n' >> \"$0\"\n"),
+        );
+        // The solver fixtures are admitted by the same identity rule, as the
+        // recorded AY for this test's scope (`ay_identity::test_fixtures`).
+        let declaration = crate::ay_identity::test_fixtures::declare(&[&solver_a, &solver_b]);
+        let pin = |path: &Path| crate::ay_identity::test_fixtures::pin(path);
+        let lines = |path: &Path| {
+            std::fs::read_to_string(path.with_extension("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let x = SmtExpr::var("registry_captured_x", 32);
+        let obligation = ProofObligation {
+            machine_side_provenance: MachineSideProvenance::StaticDb,
+            name: format!("captured registry authority {}", dir.path().display()),
+            trust_ir_expr: x.clone().bvadd(SmtExpr::bv_const(0, 32)),
+            aarch64_expr: x,
+            inputs: vec![("registry_captured_x".to_owned(), 32)],
+            preconditions: vec![],
+            fp_inputs: vec![],
+            category: None,
+        };
+        let config = db_verdict_config;
+        crate::env_lock::with_env_overrides(
+            &[
+                ("AY_SOLVER_PATH", solver_a.to_str().unwrap()),
+                (
+                    crate::ay_identity::test_fixtures::FIXTURE_DIGESTS_ENV,
+                    declaration.as_str(),
+                ),
+                ("TCG_EXTERNAL_CLEAN_CHECKER", checker_a.to_str().unwrap()),
+                ("GOVERN_AY_MB", "128"),
+                ("TCG_NO_SOLVER_SERVER", "1"),
+                ("TCG_NO_CERT_STORE", "1"),
+                ("TCG_CANARY_NO_CACHE", "1"),
+                ("TCG_BLOCKING_IDENTITY", "1"),
+            ],
+            || {
+                crate::env_lock::with_env_overrides_removed(&["TCG_NO_PROOF_CACHE"], || {
+                    let request_a = PreparedAyQuery::capture(&obligation, config()).unwrap();
+                    let memo = Mutex::new(Tier0ObligationMemo::new());
+                    let checker_a_before = lines(&checker_a).len();
+                    let (live, restored_result) = crate::env_lock::with_env_overrides(
+                        &[
+                            ("AY_SOLVER_PATH", solver_b.to_str().unwrap()),
+                            ("TCG_EXTERNAL_CLEAN_CHECKER", checker_b.to_str().unwrap()),
+                            ("GOVERN_AY_MB", "256"),
+                        ],
+                        || {
+                            assert_eq!(
+                                tier0_lookup_memoized_in(&memo, &request_a, || Some(
+                                    request_a.execute()
+                                )),
+                                Tier0LookupOutcome::Verified
+                            );
+                            assert_eq!(lines(&solver_a), ["128"]);
+                            assert!(
+                                lines(&solver_b).is_empty(),
+                                "captured execution must never rediscover B"
+                            );
+                            assert!(
+                                lines(&checker_a).len() > checker_a_before,
+                                "actual proof replay, not only capture-time capability probing"
+                            );
+                            assert!(lines(&checker_a).iter().all(|line| line == "128"));
+                            let actual_query =
+                                std::fs::read_to_string(solver_a.with_extension("last-query"))
+                                    .unwrap();
+                            assert_eq!(
+                                actual_query,
+                                db_obligation_smt2(&obligation),
+                                "prepared Tier0 query must stay byte-identical to the committed-row generator"
+                            );
+                            assert_eq!(
+                                verdict_cache_key_v2(request_a.solver_identity(), &actual_query),
+                                request_a.query_key()
+                            );
+                            assert_eq!(
+                                tier0_lookup_memoized_in(&memo, &request_a, || panic!(
+                                    "same-authority hit must not discharge"
+                                )),
+                                Tier0LookupOutcome::Verified
+                            );
+                            assert_eq!(lines(&solver_a), ["128"]);
+
+                            // Inject the old recapture shape deliberately: a genuine
+                            // completed fixture B discharge is returned to an A-keyed
+                            // caller. Neither caller credit nor memo publication
+                            // may acquire B's authority under A, even after restoring A.
+                            let request_b =
+                                PreparedAyQuery::capture(&obligation, config()).unwrap();
+                            assert_ne!(request_a.authority_id(), request_b.authority_id());
+                            let mutant_memo = Mutex::new(Tier0ObligationMemo::new());
+                            assert_eq!(
+                                tier0_lookup_memoized_in(&mutant_memo, &request_a, || Some(
+                                    request_b.execute()
+                                )),
+                                Tier0LookupOutcome::Inconclusive
+                            );
+                            assert!(
+                                mutant_memo.lock().unwrap().is_empty(),
+                                "recapture mutant must fail the memo publication contract"
+                            );
+                            assert_eq!(lines(&solver_b), ["256"]);
+                            assert!(lines(&checker_b).iter().all(|line| line == "256"));
+                            assert_eq!(lines(&solver_a), ["128"]);
+                            (request_a, request_b.execute())
+                        },
+                    );
+                    assert_eq!(crate::env_lock::var("GOVERN_AY_MB").unwrap(), "128");
+                    // Actual A→B→A: B executed above, but ambient A is restored
+                    // before this outer memo receives the favorable B result.
+                    let restored_memo = Mutex::new(Tier0ObligationMemo::new());
+                    assert_eq!(
+                        tier0_lookup_memoized_in(&restored_memo, &live, || Some(restored_result)),
+                        Tier0LookupOutcome::Inconclusive
+                    );
+                    assert!(restored_memo.lock().unwrap().is_empty());
+                    let retry_request = PreparedAyQuery::capture(
+                        &obligation,
+                        AYConfig::default()
+                            .with_solver(pin(&retry_solver))
+                            .with_timeout(5_000),
+                    )
+                    .unwrap();
+                    let retry_memo = Mutex::new(Tier0ObligationMemo::new());
+                    assert_eq!(
+                        tier0_lookup_memoized_in(&retry_memo, &retry_request, || Some(
+                            retry_request.execute()
+                        )),
+                        Tier0LookupOutcome::Inconclusive
+                    );
+                    assert!(retry_memo.lock().unwrap().is_empty());
+                    assert_eq!(
+                        tier0_lookup_memoized_in(&retry_memo, &retry_request, || Some(
+                            retry_request.execute()
+                        )),
+                        Tier0LookupOutcome::Verified
+                    );
+                    assert_eq!(
+                        tier0_lookup_memoized_in(&retry_memo, &retry_request, || panic!(
+                            "retry success must become an eligible warm hit"
+                        )),
+                        Tier0LookupOutcome::Verified
+                    );
+                    assert_eq!(lines(&retry_solver), ["128", "128"]);
+
+                    let mut false_obligation = obligation.clone();
+                    false_obligation.trust_ir_expr =
+                        SmtExpr::var("registry_captured_x", 32).bvadd(SmtExpr::bv_const(1, 32));
+                    let refuting_request = PreparedAyQuery::capture(
+                        &false_obligation,
+                        AYConfig::default()
+                            .with_solver(pin(&refuting_solver))
+                            .with_timeout(5_000),
+                    )
+                    .unwrap();
+                    let refuted_memo = Mutex::new(Tier0ObligationMemo::new());
+                    assert!(matches!(
+                        tier0_lookup_memoized_in(&refuted_memo, &refuting_request, || Some(
+                            refuting_request.execute()
+                        )),
+                        Tier0LookupOutcome::Refuted { .. }
+                    ));
+                    assert!(matches!(
+                        tier0_lookup_memoized_in(&refuted_memo, &refuting_request, || panic!(
+                            "same-query refutation must be reused"
+                        )),
+                        Tier0LookupOutcome::Refuted { .. }
+                    ));
+                    assert_eq!(
+                        lines(&refuting_solver),
+                        ["128", "128"],
+                        "SAT uses one verdict query and its separate model query, then memo reuse"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(refuting_solver.with_extension("arg-counts"))
+                            .unwrap(),
+                        "7\n2\n"
+                    );
+                    assert!(
+                        std::fs::read_to_string(refuting_solver.with_extension("last-query"))
+                            .unwrap()
+                            .contains("(get-value (registry_captured_x))")
+                    );
+
+                    let no_cache =
+                        crate::env_lock::with_env_overrides(&[("TCG_NO_PROOF_CACHE", "1")], || {
+                            live.execute()
+                        });
+                    assert_eq!(no_cache.result(), &AYResult::Verified);
+                    // The captured result names the admitted AY that produced
+                    // it: solver A's exact bytes, named by AY_SOLVER_PATH, run
+                    // live.
+                    assert_eq!(no_cache.solver().path(), solver_a.as_path());
+                    assert_eq!(no_cache.solver().sha256(), pin(&solver_a).sha256());
+                    assert_eq!(
+                        no_cache.solver().route(),
+                        crate::ay_identity::AyRoute::EnvironmentOverride
+                    );
+                    assert_eq!(no_cache.solver(), live.solver());
+                    assert_eq!(
+                        no_cache.source(),
+                        &crate::ay_bridge::AyVerdictSource::LiveSolve
+                    );
+                    let provenance = no_cache.verdict().provenance();
+                    assert!(
+                        provenance.contains(pin(&solver_a).sha256())
+                            && provenance.contains(&solver_a.display().to_string()),
+                        "{provenance}"
+                    );
+                    assert!(no_cache.matches_request(&live) && !no_cache.reusable_for(&live));
+                    assert_eq!(lines(&solver_a), ["128", "128"]);
+
+                    struct ResetRecorder;
+                    impl Drop for ResetRecorder {
+                        fn drop(&mut self) {
+                            let _ = record_take();
+                        }
+                    }
+                    record_begin();
+                    let reset_recorder = ResetRecorder;
+                    let recorded = live.execute();
+                    let rows = record_take();
+                    drop(reset_recorder);
+                    assert_eq!(recorded.result(), &AYResult::Verified);
+                    assert!(recorded.matches_request(&live) && !recorded.reusable_for(&live));
+                    assert_eq!(rows.len(), 1, "recording must observe the real fresh query");
+                    assert_eq!(rows[0].smt2, db_obligation_smt2(&obligation));
+                    assert_eq!(lines(&solver_a), ["128", "128", "128"]);
+
+                    let drifting = PreparedAyQuery::capture(
+                        &obligation,
+                        AYConfig::default()
+                            .with_solver(pin(&drifting_solver))
+                            .with_timeout(5_000),
+                    )
+                    .unwrap();
+                    let drift_memo = Mutex::new(Tier0ObligationMemo::new());
+                    assert_eq!(
+                        tier0_lookup_memoized_in(&drift_memo, &drifting, || Some(
+                            drifting.execute()
+                        )),
+                        Tier0LookupOutcome::Verified
+                    );
+                    assert!(
+                        drift_memo.lock().unwrap().is_empty(),
+                        "observed post-query identity drift denies reuse, even with an accepted exact-query proof"
+                    );
+                    assert_eq!(
+                        tier0_lookup_memoized_in(&drift_memo, &drifting, || Some(
+                            drifting.execute()
+                        )),
+                        Tier0LookupOutcome::Inconclusive
+                    );
+                    assert_eq!(
+                        lines(&drifting_solver),
+                        ["128"],
+                        "pre-query drift must not spawn the replacement executable"
+                    );
+                    eprintln!(
+                        "authority fixture only: A=3 proof calls (ordinary/no-cache/recording), B=1, retry=2, SAT=2 (verdict+model), drift=1; memo hits and wrong-request refusals observed"
+                    );
+                });
+            },
+        );
+    }
+
     /// PART A landed: the COMMITTED tier-0 DB holds the parametric candidate for
     /// EVERY enumerated reconstruction obligation. Only meaningful with the
     /// manifest solver present (tier-0 self-disables under a foreign/absent
@@ -2154,67 +2929,58 @@ mod tests {
         let Some(db) = embedded_tier0() else {
             return;
         };
-        if identity != &db.solver_identity {
+        if identity != db.solver_identity {
             return;
         }
         let obs = super::enumerate_reconstruct_regen_obligations().unwrap();
         for ob in &obs {
             assert!(
-                tier0_candidate_obligation_in(db, path, ob),
+                tier0_candidate_obligation_in(db, &path, ob),
                 "committed tier-0 must hold the parametric verdict for {:?} — run regen_verdict_db",
                 ob.name
             );
         }
     }
 
-    /// PART B / M3 criterion (d): with the manifest solver present, ZERO
-    /// tier-0-covered reconstructed obligations are credited via
-    /// `method=Statistical` — every one is `Formal` (SolverProven) via the
-    /// committed PARAMETRIC candidate after a live solver result. No-op on a
-    /// solver-absent / foreign-solver host (tier-0 self-disables there; the
-    /// `Statistical` fallback is legitimate — see the next test).
+    /// A committed tier-0 theorem for a target-reconstructed family is not an
+    /// exact source-lowering binding. Even with its manifest solver present,
+    /// the candidate must not upgrade an instruction to Formal until the
+    /// actual source opcode, width, and operands are independently bound.
     #[test]
-    fn reconstructed_discharge_zero_statistical_when_solver_present() {
-        let Some((_, identity)) = tier0_solver() else {
+    fn reconstructed_tier0_candidate_does_not_bypass_source_binding() {
+        let Some((path, identity)) = tier0_solver() else {
             return;
         };
         let Some(db) = embedded_tier0() else {
             return;
         };
-        if identity != &db.solver_identity {
+        if identity != db.solver_identity {
             return;
         }
         let cfg = VerificationConfig::default();
         let obs = super::enumerate_reconstruct_regen_obligations().unwrap();
-        let mut statistical = 0usize;
-        for ob in &obs {
-            // instance == canonical for the enumerated (already-free) forms.
-            let (res, strength) =
-                crate::lowering_proof::discharge_reconstructed_obligation(ob, ob, &cfg);
-            assert!(
-                matches!(res, VerificationResult::Valid),
-                "{:?} must discharge Valid",
-                ob.name
-            );
-            if matches!(strength, VerificationStrength::Statistical { .. }) {
-                statistical += 1;
-            }
-        }
-        assert_eq!(
-            statistical,
-            0,
-            "M3: with a solver present, 0 of {} tier-0-covered reconstructed obligations \
-             may be credited Statistical (all must be Formal/SolverProven)",
-            obs.len()
+        let ob = obs
+            .first()
+            .expect("reconstruction tier-0 set must not be empty");
+        assert!(tier0_candidate_obligation_in(db, &path, ob));
+        let (res, strength) =
+            crate::lowering_proof::discharge_reconstructed_obligation(ob, ob, &cfg);
+        assert!(
+            matches!(res, VerificationResult::Valid),
+            "{:?} must still discharge Valid",
+            ob.name
+        );
+        assert!(
+            matches!(strength, VerificationStrength::Statistical { .. }),
+            "a target-only tier-0 theorem must not confer Formal lowering authority: {strength:?}"
         );
     }
 
     /// PART B: a reconstructed family NOT in the offline tier-0 DB (a DIVISION
     /// obligation — the solver-hard INT_MIN/-1 exemption class) keeps a
-    /// clearly-labeled `Statistical` fallback in the DEFAULT lane (the opt-in
-    /// live-solver route is off), and the build is NEVER failed closed. This is
-    /// exactly the solver-absent posture: no tier-0 hit, no live solve, honest
-    /// Statistical label, still `Valid`.
+    /// clearly-labeled `Statistical` result, and the build is NEVER failed
+    /// closed. No tier-0/live authority is consulted without source binding;
+    /// the represented theorem is still checked and remains `Valid`.
     #[test]
     fn reconstructed_discharge_falls_back_to_statistical_for_uncovered_family() {
         let idiv = X86ISelInst::new(X86Opcode::Idiv, vec![g32(0)]);
@@ -2227,9 +2993,8 @@ mod tests {
             VerificationStrength::for_obligation_with_config(&ob, &cfg),
             VerificationStrength::Statistical { .. }
         ));
-        // Default lane: the opt-in live route is OFF, so this must not spawn a
-        // solver and must not fail closed.
-        assert!(!reconstructed_live_solver_enabled());
+        // Reconstructed discharge cannot spawn a solver without an exact
+        // source-binding token and must not fail closed.
         let (res, strength) =
             crate::lowering_proof::discharge_reconstructed_obligation(&ob, &ob, &cfg);
         assert!(

@@ -1,0 +1,50 @@
+; TrustIr text format v1
+module "_RNvCs51KMIqAAksu_19s43_recursion_forms3ack"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (u64, u64) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCs51KMIqAAksu_19s43_recursion_forms3ack(functy.0) {
+bb0(%1: u64, %2: u64):
+    switch %1 [ 0: bb1 default: bb2 ]
+bb1:
+    %8 = const u64 1
+    %7 = add u64 %2, %8
+    br bb9(%7)
+bb2:
+    switch %2 [ 0: bb3 default: bb5 ]
+bb3:
+    %10 = const u64 1
+    %9 = sub u64 %1, %10
+    %11 = const u64 1
+    %12 = call @func.0(%9, %11)
+    br bb4
+bb4:
+    br bb8(%12)
+bb5:
+    %14 = const u64 1
+    %13 = sub u64 %1, %14
+    %16 = const u64 1
+    %15 = sub u64 %2, %16
+    %17 = call @func.0(%1, %15)
+    br bb6
+bb6:
+    %18 = call @func.0(%13, %17)
+    br bb7
+bb7:
+    br bb8(%18)
+bb8(%19: u64):
+    br bb9(%19)
+bb9(%20: u64):
+    ret %20
+}

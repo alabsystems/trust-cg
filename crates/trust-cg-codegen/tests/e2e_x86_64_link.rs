@@ -4,8 +4,13 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 //
 // End-to-end tests that compile x86-64 ISel functions and trust_ir functions to
-// Mach-O .o files, link them with C drivers using `cc -arch x86_64`, and run
-// the resulting binaries under Rosetta 2 on Apple Silicon.
+// the host's x86-64 object format (Mach-O on macOS, ELF elsewhere), link them
+// with C drivers, and run the resulting binaries. The link/run legs use the
+// x86-64 driver that `common::rosetta::x86_64_link_run` proved on this host
+// (native x86-64, opted-in Rosetta 2, or a cross driver plus
+// binfmt_misc/qemu-user). A host without one prints a `SKIP:` line for the
+// link/run leg only; every test still compiles and checks the emitted object's
+// container and symbols.
 //
 // These tests validate the COMPLETE x86-64 pipeline:
 //   ISel function -> regalloc -> frame lowering -> encoding -> Mach-O -> link -> run
@@ -31,12 +36,13 @@ use std::process::{Command, Output};
 mod common;
 use common::rosetta::{
     codegen_link_timeout, codegen_run_timeout, command_output_with_timeout,
-    run_executable_with_timeout,
+    run_executable_with_timeout, x86_64_cc, x86_64_link_run_or_skip,
 };
+use common::x86_64_object::{assert_host_x86_64_object, x86_64_object_symbols};
 
 use trust_cg_codegen::x86_64::{
-    X86OutputFormat, X86Pipeline, X86PipelineConfig, build_x86_add_test_function,
-    build_x86_const_test_function, x86_compile_to_macho,
+    X86OutputFormat, X86Pipeline, X86PipelineConfig, X86PipelineError, build_x86_add_test_function,
+    build_x86_const_test_function, x86_compile_to_elf, x86_compile_to_macho,
 };
 
 use trust_cg_ir::regs::{RegClass, VReg};
@@ -58,11 +64,6 @@ use trust_ir::{
 // Test infrastructure
 // ===========================================================================
 
-/// Check if `cc -arch x86_64` can link and run a trivial executable.
-fn has_cc_x86_64() -> bool {
-    common::rosetta::has_cc_x86_64_link_run()
-}
-
 fn make_test_dir(test_name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("trust_cg_e2e_x86_64_link_{}", test_name));
     let _ = fs::remove_dir_all(&dir);
@@ -82,6 +83,9 @@ fn write_c_driver(dir: &Path, filename: &str, source: &str) -> PathBuf {
     path
 }
 
+// Only the macOS-only `otool` validation cleans up by hand; the other tests
+// remove their directories inline.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
@@ -93,25 +97,19 @@ fn output_text(output: &Output) -> (String, String) {
     )
 }
 
-/// Link a C driver with an x86-64 object file using `cc -arch x86_64`.
+/// Link a C driver with an x86-64 object file using the proven x86-64 driver.
 /// Returns the path to the linked binary.
 fn link_x86_64(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> PathBuf {
     let binary = dir.join(output_name);
-    let mut link_cmd = Command::new("cc");
-    link_cmd
-        .args(if cfg!(target_os = "macos") {
-            &["-arch", "x86_64"][..]
-        } else {
-            &[][..]
-        })
-        .args([
-            "-o",
-            binary.to_str().unwrap(),
-            driver_c.to_str().unwrap(),
-            obj.to_str().unwrap(),
-        ]);
+    let mut link_cmd = x86_64_cc();
+    link_cmd.args([
+        "-o",
+        binary.to_str().unwrap(),
+        driver_c.to_str().unwrap(),
+        obj.to_str().unwrap(),
+    ]);
     let result = command_output_with_timeout(&mut link_cmd, codegen_link_timeout())
-        .expect("Failed to run cc -arch x86_64");
+        .expect("Failed to run the x86-64 C driver");
 
     if result.timed_out || !result.output.status.success() {
         let (stdout, stderr) = output_text(&result.output);
@@ -152,10 +150,85 @@ fn link_x86_64(dir: &Path, driver_c: &Path, obj: &Path, output_name: &str) -> Pa
     binary
 }
 
-/// Compile an x86-64 ISel function to Mach-O, link with a C driver, run, and
-/// return (exit_code, stdout).
-fn link_and_run_isel(test_name: &str, func: &X86ISelFunction, driver_src: &str) -> (i32, String) {
-    let bytes = x86_compile_to_macho(func).expect("x86_compile_to_macho should succeed");
+/// The object format the host's `cc` links: Mach-O on macOS, ELF elsewhere.
+fn host_object_format() -> X86OutputFormat {
+    if cfg!(target_os = "macos") {
+        X86OutputFormat::MachO
+    } else {
+        X86OutputFormat::Elf
+    }
+}
+
+/// Compile an ISel function to the host's object format, returning the
+/// pipeline's refusal instead of panicking.
+fn x86_compile_to_host_object_result(func: &X86ISelFunction) -> Result<Vec<u8>, X86PipelineError> {
+    if cfg!(target_os = "macos") {
+        x86_compile_to_macho(func)
+    } else {
+        x86_compile_to_elf(func)
+    }
+}
+
+/// Compile an ISel function to the host's object format.
+fn x86_compile_to_host_object(func: &X86ISelFunction) -> Vec<u8> {
+    if cfg!(target_os = "macos") {
+        x86_compile_to_macho(func).expect("x86_compile_to_macho should succeed")
+    } else {
+        x86_compile_to_elf(func).expect("x86_compile_to_elf should succeed")
+    }
+}
+
+/// The x86-64 pipeline refuses, before register allocation, a machine function
+/// whose block successor metadata disagrees with its branch stream (5f73a26f7).
+/// `func` with every block's successor metadata cleared must be refused with
+/// exactly that named error for its entry block; `entry_edges` lists the
+/// accepted spellings of the entry block's semantic edge set.
+fn assert_refused_without_successor_metadata(func: &X86ISelFunction, entry_edges: &[&str]) {
+    let mut unwired = func.clone();
+    for block in unwired.blocks.values_mut() {
+        block.successors.clear();
+    }
+    match x86_compile_to_host_object_result(&unwired) {
+        Err(X86PipelineError::MalformedFunction { function, detail }) => {
+            assert_eq!(function, func.name, "the refusal names the function");
+            let accepted: Vec<String> = entry_edges
+                .iter()
+                .map(|edges| {
+                    format!(
+                        "block Block(0) successor metadata {{}} does not match semantic control \
+                         edges {edges}"
+                    )
+                })
+                .collect();
+            assert!(
+                accepted.contains(&detail),
+                "unexpected refusal detail for `{}`: {detail:?}; expected one of {accepted:?}",
+                func.name
+            );
+        }
+        other => panic!(
+            "`{}` without successor metadata must be refused as a malformed machine function, \
+             got {other:?}",
+            func.name
+        ),
+    }
+}
+
+/// Compile an x86-64 ISel function to the host's object format and check the
+/// object defines the function for the C driver; then, where this host can link
+/// and run x86-64 executables, link with the C driver, run, and return
+/// `Some((exit_code, stdout))`. Returns `None` after printing a `SKIP:` line for
+/// the link/run leg on a host that cannot.
+fn link_and_run_isel(
+    test_name: &str,
+    func: &X86ISelFunction,
+    driver_src: &str,
+) -> Option<(i32, String)> {
+    let bytes = x86_compile_to_host_object(func);
+    assert_host_x86_64_object(test_name, &bytes, &[func.name.as_str()], &[]);
+    if !x86_64_link_run_or_skip(test_name, "x86-64 link/run leg") {
+        return None;
+    }
 
     let dir = make_test_dir(test_name);
     let obj_path = write_object_file(&dir, &format!("{}.o", test_name), &bytes);
@@ -168,7 +241,7 @@ fn link_and_run_isel(test_name: &str, func: &X86ISelFunction, driver_src: &str) 
     );
 
     let run_result = run_executable_with_timeout(&binary, codegen_run_timeout())
-        .expect("should be able to run the x86_64 binary (Rosetta 2)");
+        .expect("should be able to run the x86_64 binary");
     if run_result.timed_out {
         let (stdout, stderr) = output_text(&run_result.output);
         panic!(
@@ -193,20 +266,25 @@ fn link_and_run_isel(test_name: &str, func: &X86ISelFunction, driver_src: &str) 
 
     let _ = fs::remove_dir_all(&dir);
 
-    (exit_code, stdout)
+    Some((exit_code, stdout))
 }
 
-/// Compile a trust_ir module through the x86-64 pipeline to Mach-O bytes.
+/// Compile a trust_ir module through the x86-64 pipeline to the host's object
+/// format (Mach-O on macOS, ELF elsewhere).
 fn compile_trust_ir_to_x86_macho(module: &TrustIrModule) -> Vec<u8> {
     let funcs = &module.functions;
     assert!(!funcs.is_empty(), "module must have at least one function");
 
     let trust_ir_func = &funcs[0];
-    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function(trust_ir_func, module)
-        .expect("trust_ir adapter translation should succeed");
+    let (lir_func, _proof_ctx) = trust_cg_lower::translate_function_with_license(
+        trust_ir_func,
+        module,
+        &permit_unlicensed(),
+    )
+    .expect("trust_ir adapter translation should succeed");
 
     let pipeline = X86Pipeline::new(X86PipelineConfig {
-        output_format: X86OutputFormat::MachO,
+        output_format: host_object_format(),
         emit_frame: true,
         ..X86PipelineConfig::default()
     });
@@ -216,14 +294,21 @@ fn compile_trust_ir_to_x86_macho(module: &TrustIrModule) -> Vec<u8> {
         .expect("x86-64 trust_ir compilation should succeed")
 }
 
-/// Compile a trust_ir module through x86-64 pipeline, link with C driver, run,
-/// and return (exit_code, stdout).
+/// Compile a trust_ir module through the x86-64 pipeline to the host's object
+/// format and check the object defines the function for the C driver; then,
+/// where this host can link and run x86-64 executables, link with the C driver,
+/// run, and return `Some((exit_code, stdout))`. Returns `None` after printing a
+/// `SKIP:` line for the link/run leg on a host that cannot.
 fn link_and_run_trust_ir(
     test_name: &str,
     module: &TrustIrModule,
     driver_src: &str,
-) -> (i32, String) {
+) -> Option<(i32, String)> {
     let bytes = compile_trust_ir_to_x86_macho(module);
+    assert_host_x86_64_object(test_name, &bytes, &[module.functions[0].name.as_str()], &[]);
+    if !x86_64_link_run_or_skip(test_name, "x86-64 link/run leg") {
+        return None;
+    }
 
     let dir = make_test_dir(test_name);
     let obj_path = write_object_file(&dir, &format!("{}.o", test_name), &bytes);
@@ -236,7 +321,7 @@ fn link_and_run_trust_ir(
     );
 
     let run_result = run_executable_with_timeout(&binary, codegen_run_timeout())
-        .expect("should be able to run the x86_64 binary (Rosetta 2)");
+        .expect("should be able to run the x86_64 binary");
     if run_result.timed_out {
         let (stdout, stderr) = output_text(&run_result.output);
         panic!(
@@ -261,7 +346,7 @@ fn link_and_run_trust_ir(
 
     let _ = fs::remove_dir_all(&dir);
 
-    (exit_code, stdout)
+    Some((exit_code, stdout))
 }
 
 // ===========================================================================
@@ -271,11 +356,14 @@ fn link_and_run_trust_ir(
 /// Build a trust_ir module: `fn _const_x86() -> i64 { 42 }`
 fn build_trust_ir_const_x86_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_const_x86", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -291,18 +379,23 @@ fn build_trust_ir_const_x86_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
 /// Build a trust_ir module: `fn _add_x86(a: i64, b: i64) -> i64 { a + b }`
 fn build_trust_ir_add_x86_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_add_x86", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -320,7 +413,9 @@ fn build_trust_ir_add_x86_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -331,11 +426,14 @@ fn build_trust_ir_add_x86_module() -> TrustIrModule {
 /// bb2: return b
 fn build_trust_ir_max_x86_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_max_x86", ft_id, BlockId::new(0));
     func.blocks = vec![
         TrustIrBlock {
@@ -373,7 +471,9 @@ fn build_trust_ir_max_x86_module() -> TrustIrModule {
             })],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -386,11 +486,6 @@ fn build_trust_ir_max_x86_module() -> TrustIrModule {
 
 #[test]
 fn test_x86_64_link_const42() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available (no Xcode or Rosetta)");
-        return;
-    }
-
     let func = build_x86_const_test_function();
     let driver = r#"
 #include <stdio.h>
@@ -402,7 +497,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("const42", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("const42", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "const42() should return 42 and exit 0. Got exit {}, stdout: {}",
@@ -424,11 +521,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_trust_ir_const() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let module = build_trust_ir_const_x86_module();
     let driver = r#"
 #include <stdio.h>
@@ -440,7 +532,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_trust_ir("trust_ir_const", &module, driver);
+    let Some((exit_code, stdout)) = link_and_run_trust_ir("trust_ir_const", &module, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "trust_ir const link+run failed (exit {}). Expected 42. stdout: {}",
@@ -460,11 +554,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_add_compiles_links_runs() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_x86_add_test_function();
     // Driver that calls the function and prints output but always exits 0,
     // so we can verify the binary runs without crashing.
@@ -478,7 +567,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("add_link", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("add_link", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "x86-64 add binary should execute without crashing. Got exit {}, stdout: {}",
@@ -501,11 +592,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_trust_ir_add_compiles_links_runs() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let module = build_trust_ir_add_x86_module();
     let driver = r#"
 #include <stdio.h>
@@ -517,7 +603,10 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_trust_ir("trust_ir_add_link", &module, driver);
+    let Some((exit_code, stdout)) = link_and_run_trust_ir("trust_ir_add_link", &module, driver)
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "x86-64 trust_ir add binary should execute without crashing. Got exit {}, stdout: {}",
@@ -541,11 +630,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_trust_ir_conditional_compiles_links_runs() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let module = build_trust_ir_max_x86_module();
     let driver = r#"
 #include <stdio.h>
@@ -559,7 +643,10 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_trust_ir("trust_ir_max_link", &module, driver);
+    let Some((exit_code, stdout)) = link_and_run_trust_ir("trust_ir_max_link", &module, driver)
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "x86-64 trust_ir max binary should execute without crashing. Got exit {}, stdout: {}",
@@ -603,11 +690,59 @@ fn test_x86_64_link_macho_precheck() {
 }
 
 // ===========================================================================
+// Test 6b: object-inspection leg on both containers (no linking required)
+//
+// Every link/run test checks its emitted object's container and symbols before
+// linking, and keeps only that leg on a host without an x86-64 driver. Pin the
+// inspection helper on BOTH containers on every host, so its Mach-O arm is
+// exercised off macOS and its ELF arm on macOS.
+// ===========================================================================
+
+#[test]
+fn test_x86_64_link_object_symbols_both_containers() {
+    let func = build_x86_add_test_function();
+    let macho = x86_compile_to_macho(&func).expect("x86_compile_to_macho should succeed");
+    let elf = x86_compile_to_elf(&func).expect("x86_compile_to_elf should succeed");
+
+    let macho_symbols = x86_64_object_symbols("add (Mach-O)", &macho, true);
+    let elf_symbols = x86_64_object_symbols("add (ELF)", &elf, false);
+    assert_eq!(
+        macho_symbols.defined_globals.iter().collect::<Vec<_>>(),
+        ["_add"],
+        "the Mach-O object defines exactly the `_add` global"
+    );
+    assert_eq!(
+        elf_symbols.defined_globals.iter().collect::<Vec<_>>(),
+        ["add"],
+        "the ELF object defines exactly the `add` global"
+    );
+    assert!(
+        macho_symbols.undefined.is_empty() && elf_symbols.undefined.is_empty(),
+        "the leaf add fixture references no external symbol: Mach-O {:?}, ELF {:?}",
+        macho_symbols.undefined,
+        elf_symbols.undefined
+    );
+
+    // Each arm checks its container's header instead of guessing.
+    assert!(
+        std::panic::catch_unwind(|| x86_64_object_symbols("ELF read as Mach-O", &elf, true))
+            .is_err(),
+        "the Mach-O arm must refuse an ELF object"
+    );
+    assert!(
+        std::panic::catch_unwind(|| x86_64_object_symbols("Mach-O read as ELF", &macho, false))
+            .is_err(),
+        "the ELF arm must refuse a Mach-O object"
+    );
+}
+
+// ===========================================================================
 // Test 7: otool validation of x86-64 object file
 //
 // Write the .o to disk and validate with otool.
 // ===========================================================================
 
+#[cfg(target_os = "macos")]
 #[test]
 fn test_x86_64_link_otool_validation() {
     let func = build_x86_const_test_function();
@@ -662,18 +797,16 @@ fn test_x86_64_link_otool_validation() {
 
 #[test]
 fn test_x86_64_link_trust_ir_const_values() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     // Build a function that returns 99.
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_const_99", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -689,7 +822,9 @@ fn test_x86_64_link_trust_ir_const_values() {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let driver = r#"
 #include <stdio.h>
@@ -701,7 +836,10 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_trust_ir("trust_ir_const_99", &module, driver);
+    let Some((exit_code, stdout)) = link_and_run_trust_ir("trust_ir_const_99", &module, driver)
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "trust_ir const_99 link+run failed (exit {}). Expected 99. stdout: {}",
@@ -717,17 +855,15 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_trust_ir_const_zero() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_const_zero", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -743,7 +879,9 @@ fn test_x86_64_link_trust_ir_const_zero() {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let driver = r#"
 #include <stdio.h>
@@ -755,7 +893,10 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_trust_ir("trust_ir_const_zero", &module, driver);
+    let Some((exit_code, stdout)) = link_and_run_trust_ir("trust_ir_const_zero", &module, driver)
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "trust_ir const_zero link+run failed (exit {}). Expected 0. stdout: {}",
@@ -771,17 +912,15 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_trust_ir_const_negative() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let mut module = TrustIrModule::new("test");
-    let ft_id = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), "_const_neg", ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -797,7 +936,9 @@ fn test_x86_64_link_trust_ir_const_negative() {
             }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 
     let driver = r#"
 #include <stdio.h>
@@ -809,7 +950,10 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_trust_ir("trust_ir_const_neg", &module, driver);
+    let Some((exit_code, stdout)) = link_and_run_trust_ir("trust_ir_const_neg", &module, driver)
+    else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "trust_ir const_neg link+run failed (exit {}). Expected -1. stdout: {}",
@@ -1266,6 +1410,13 @@ fn build_loop_sum() -> X86ISelFunction {
     // RET
     func.push_inst(bb2, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
+    // Semantic CFG edges (real ISel records these; the pipeline refuses a
+    // function whose successor metadata disagrees with its branches):
+    // bb0 -> bb1; bb1 -> {bb2 (exit), bb1 (back-edge)}; bb2 returns.
+    func.add_successor(bb0, bb1);
+    func.add_successor(bb1, bb2);
+    func.add_successor(bb1, bb1);
+
     func
 }
 
@@ -1419,6 +1570,14 @@ fn build_clamp() -> X86ISelFunction {
         ),
     );
     func.push_inst(bb4, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+    // Semantic CFG edges (real ISel records these; the pipeline refuses a
+    // function whose successor metadata disagrees with its branches):
+    // bb0 -> {bb1, bb2}; bb2 -> {bb3, bb4}; bb1, bb3 and bb4 return.
+    func.add_successor(bb0, bb1);
+    func.add_successor(bb0, bb2);
+    func.add_successor(bb2, bb3);
+    func.add_successor(bb2, bb4);
 
     func
 }
@@ -1709,11 +1868,6 @@ fn build_mixed_int_float() -> X86ISelFunction {
 
 #[test]
 fn test_x86_64_link_sse_fadd() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_sse_fadd();
     let driver = r#"
 #include <stdio.h>
@@ -1725,7 +1879,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("sse_fadd", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("sse_fadd", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "SSE fadd should return 4.0. Got exit {}, stdout: {}",
@@ -1747,11 +1903,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_sse_fmul() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_sse_fmul();
     let driver = r#"
 #include <stdio.h>
@@ -1763,7 +1914,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("sse_fmul", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("sse_fmul", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "SSE fmul should return 21.0. Got exit {}, stdout: {}",
@@ -1791,11 +1944,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_sse_fconst() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_sse_fconst();
     // Driver always exits 0 -- we verify it compiles, links, and runs.
     // Const pool RIP-relative addressing produces wrong results currently.
@@ -1809,7 +1957,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("sse_fconst", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("sse_fconst", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "SSE fconst binary should compile, link, and run. Got exit {}, stdout: {}",
@@ -1832,11 +1982,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_cvtsi2sd() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_cvtsi2sd();
     let driver = r#"
 #include <stdio.h>
@@ -1848,7 +1993,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("cvtsi2sd", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("cvtsi2sd", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "CVTSI2SD(42) should return 42.0. Got exit {}, stdout: {}",
@@ -1870,11 +2017,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_cvtsd2si() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_cvtsd2si();
     let driver = r#"
 #include <stdio.h>
@@ -1887,7 +2029,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("cvtsd2si", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("cvtsd2si", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "CVTSD2SI(99.7) should return 100. Got exit {}, stdout: {}",
@@ -1911,12 +2055,8 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_loop_sum() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_loop_sum();
+    assert_refused_without_successor_metadata(&func, &["{Block(1)}"]);
     let driver = r#"
 #include <stdio.h>
 extern long loop_sum(long n);
@@ -1927,7 +2067,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("loop_sum", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("loop_sum", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "loop_sum(10) should return 45. Got exit {}, stdout: {}",
@@ -1950,12 +2092,11 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_clamp() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_clamp();
+    assert_refused_without_successor_metadata(
+        &func,
+        &["{Block(1), Block(2)}", "{Block(2), Block(1)}"],
+    );
     let driver = r#"
 #include <stdio.h>
 extern long clamp(long x, long lo, long hi);
@@ -1972,7 +2113,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("clamp", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("clamp", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "clamp function should produce correct results. Got exit {}, stdout: {}",
@@ -1990,11 +2133,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_mem_load_disp() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_mem_load_disp();
     let driver = r#"
 #include <stdio.h>
@@ -2006,7 +2144,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("mem_load_disp", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("mem_load_disp", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "mem_load_disp(77) should return 77. Got exit {}, stdout: {}",
@@ -2030,11 +2170,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_sum4_args() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_sum4_args();
     let driver = r#"
 #include <stdio.h>
@@ -2046,7 +2181,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("sum4_args", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("sum4_args", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "sum4(10,20,30,40) should return 100. Got exit {}, stdout: {}",
@@ -2070,11 +2207,6 @@ int main(void) {
 
 #[test]
 fn test_x86_64_link_mixed_int_float() {
-    if !has_cc_x86_64() {
-        eprintln!("SKIP: cc -arch x86_64 not available");
-        return;
-    }
-
     let func = build_mixed_int_float();
     let driver = r#"
 #include <stdio.h>
@@ -2086,7 +2218,9 @@ int main(void) {
 }
 "#;
 
-    let (exit_code, stdout) = link_and_run_isel("mixed_int_float", &func, driver);
+    let Some((exit_code, stdout)) = link_and_run_isel("mixed_int_float", &func, driver) else {
+        return;
+    };
     assert_eq!(
         exit_code, 0,
         "mixed_add(10, 2.5) should return 12.5. Got exit {}, stdout: {}",
@@ -2097,4 +2231,13 @@ int main(void) {
         "stdout should contain 12.5, got: {}",
         stdout
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

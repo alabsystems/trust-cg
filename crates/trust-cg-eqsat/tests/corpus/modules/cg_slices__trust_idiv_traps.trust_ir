@@ -1,0 +1,64 @@
+; TrustIr text format v1
+module "mir::closure::idiv_traps_root"
+target "aarch64-apple-darwin" 8 little
+file 0 "trust_fp_bitmodel_slice.rs"
+
+functy.0 = (u32, ptr) -> ()
+
+functy.1 = (u8) -> (bool)
+
+fn @idiv_traps_root(functy.0) {
+bb0(%0: u32, %1: ptr):
+    %11 = alloca i8, align 1
+    %12 = alloca i32, align 4
+    %13 = alloca i8, align 1
+    %14 = const u32 0
+    %15 = icmp eq u32 %0, %14
+    condbr %15, bb1(%1), bb2(%1)
+bb1(%2: ptr):
+    %16 = const i8 0
+    store i8 %16, ptr %11
+    br bb3(%2)
+bb2(%3: ptr):
+    %17 = const i8 1
+    store i8 %17, ptr %11
+    br bb3(%3)
+bb3(%4: ptr):
+    %18 = load i8, ptr %11
+    store i8 %18, ptr %13
+    %19 = load u8, ptr %13
+    %20 = call @func.1(%19)
+    br bb4(%4, %20)
+bb4(%5: ptr, %6: bool):
+    condbr %6, bb5(%5), bb6(%5)
+bb5(%7: ptr):
+    %21 = const u32 1
+    br bb7(%7, %21)
+bb6(%8: ptr):
+    %22 = const u32 0
+    br bb7(%8, %22)
+bb7(%9: ptr, %10: u32):
+    store u32 %10, ptr %12
+    %23 = load i32, ptr %12
+    store i32 %23, ptr %9
+    ret
+}
+
+fn @TargetArch__idiv_traps(functy.1) {
+bb0(%0: u8):
+    %2 = alloca i8, align 1
+    store u8 %0, ptr %2
+    %3 = load i8, ptr %2
+    %4 = sext i8 %3 to i64
+    switch %4 [ 0: bb3 1: bb2 default: bb1 ]
+bb1:
+    unreachable
+bb2:
+    %5 = const bool true
+    br bb4(%5)
+bb3:
+    %6 = const bool false
+    br bb4(%6)
+bb4(%1: bool):
+    ret %1
+}

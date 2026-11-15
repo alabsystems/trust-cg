@@ -1,0 +1,53 @@
+; TrustIr text format v1
+module "_RNvCsjeDzu0hyKij_22s21_bytesum_ptr_offset2go"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (*const u8) -> (u64)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCsjeDzu0hyKij_22s21_bytesum_ptr_offset2go(functy.0) {
+bb0(%1: *const u8):
+    %12 = const u64 0
+    %13 = const u64 0
+    br bb1(%12, %13)
+bb1(%14: u64, %15: u64):
+    %16 = copy u64 %15
+    %18 = const u64 4096
+    %17 = icmp ult u64 %16, %18
+    condbr %17, bb2, bb3
+bb3:
+    ret %14
+bb2:
+    %20 = const u64 1
+    %19 = add u64 %15, %20
+    %22 = ptrtoptr *const u8 %1 to ptr
+    %23 = ptrtoint ptr %22 to i64
+    %24 = bitcast u64 %19 to i64
+    %25 = add i64 %23, %24
+    %26 = inttoptr i64 %25 to ptr
+    %21 = ptrtoptr ptr %26 to *const u8
+    %27 = load u8, ptr %21
+    %28 = zext u8 %27 to u32
+    %29 = zext u32 %28 to i64
+    %30 = const i64 4294967295
+    %31 = and i64 %29, %30
+    %32 = ctpop i64 %31
+    %33 = trunc i64 %32 to u32
+    %34 = copy u32 %33
+    br bb4
+bb4:
+    %35 = zext u32 %34 to u64
+    %36 = add u64 %14, %35
+    %37 = copy u64 %36
+    %38 = copy u64 %19
+    br bb1(%37, %38)
+}

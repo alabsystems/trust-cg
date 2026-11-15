@@ -1,0 +1,18 @@
+; TrustIr text format v1
+module "storage_only"
+target "aarch64-apple-darwin" 8 little structpass=unclassified
+
+struct @StorageParent { head: u64 @0, backing: storage<80, 8> @8, tail: u64 @88 } size=96 align=8 id=0
+
+functy.0 = () -> (u64)
+
+fn @root(functy.0) {
+bb0:
+    %0 = alloca struct.0
+    %1 = const i64 88
+    %2 = gep inbounds i8, ptr %0, %1  ; #proof: in_bounds
+    %3 = const u64 7
+    store u64 %3, ptr %2
+    %4 = load u64, ptr %2
+    ret %4
+}

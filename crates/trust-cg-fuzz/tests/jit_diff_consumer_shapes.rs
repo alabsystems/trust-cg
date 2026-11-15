@@ -38,7 +38,7 @@ fn assert_consumer_row(module: &trust_ir::Module, row: [i64; 4]) {
 
 #[test]
 fn consumer_shape_jit_matches_scalar_status_oracle() {
-    let module = gen_consumer_shape_module(797);
+    let module = gen_consumer_shape_module(797).expect("the generated module builds");
 
     assert_consumer_row(&module, [3, 4, 0, 7]);
     assert_consumer_row(&module, [-5, 9, 4, 7]);

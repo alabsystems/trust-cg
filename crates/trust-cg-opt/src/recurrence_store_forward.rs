@@ -91,7 +91,8 @@
 //! `TCG_NO_RECURRENCE_STORE_FWD` (run() becomes a no-op). Per-pass bisect:
 //! `TRUST_CG_DISABLE_PASSES=recurrence_store_fwd`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::mach_util::branch_targets;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -194,12 +195,6 @@ impl RecurrenceStoreForward {
             self.fired += 1;
             changed = true;
         }
-        if changed && std::env::var("TRUST_CG_DUMP_RSF").is_ok() {
-            eprintln!(
-                "[recurrence-store-forward] fn={} forwarded={}",
-                func.name, self.fired
-            );
-        }
         changed
     }
 }
@@ -249,16 +244,8 @@ impl Recognized {
         latch: BlockId,
         body: &HashSet<BlockId>,
     ) -> Option<Self> {
-        let dump = std::env::var("TRUST_CG_DUMP_RSF").is_ok();
         macro_rules! bail {
             ($($t:tt)*) => {{
-                if dump {
-                    eprintln!(
-                        "[recurrence-store-forward] bail@{}: {}",
-                        func.name,
-                        format!($($t)*)
-                    );
-                }
                 return None;
             }};
         }
@@ -414,16 +401,16 @@ impl Recognized {
         // traversal).
         let store = func.inst(store_id);
         let store_pos = pos(store_id)?;
-        if store.operands.len() != 3 || imm_of(&store.operands[2]) != Some(0) {
+        if store.operands.len() != 3 || store.operands[2].as_imm() != Some(0) {
             bail!("store shape not `StrRI [v, addr, #0]`");
         }
-        let vs = vreg_of(&store.operands[0])?;
+        let vs = store.operands[0].as_vreg()?;
         let width: i64 = match vs.class {
             RegClass::Gpr32 => 4,
             RegClass::Gpr64 => 8,
             _ => bail!("store value class {:?} unsupported", vs.class),
         };
-        let store_addr = vreg_of(&store.operands[1])?;
+        let store_addr = store.operands[1].as_vreg()?;
         let Some(store_madd) = single_def(store_addr).filter(|id| cycle_insts.contains(id)) else {
             bail!("store address is not a single-def in-cycle Madd");
         };
@@ -466,7 +453,7 @@ impl Recognized {
         let ivp1 = func.inst(ivp1_def);
         if ivp1.opcode != AArch64Opcode::AddRI
             || ivp1.operands.len() != 3
-            || imm_of(&ivp1.operands[2]) != Some(1)
+            || ivp1.operands[2].as_imm() != Some(1)
         {
             bail!("store index def is not `AddRI(_, 1)`");
         }
@@ -474,7 +461,7 @@ impl Recognized {
         if ivp1_pos >= store_madd_pos || ivp1_pos >= redef_pos {
             bail!("store index computed too late");
         }
-        let ivp1_src = vreg_of(&ivp1.operands[1])?;
+        let ivp1_src = ivp1.operands[1].as_vreg()?;
         if !is_iv_copy_before(
             func,
             &single_def,
@@ -520,10 +507,10 @@ impl Recognized {
         for (load_id, load_block) in load_ids {
             let load = func.inst(load_id);
             let load_pos = pos(load_id)?;
-            if load.operands.len() != 3 || imm_of(&load.operands[2]) != Some(0) {
+            if load.operands.len() != 3 || load.operands[2].as_imm() != Some(0) {
                 bail!("load shape not `LdrRI [dst, addr, #0]`");
             }
-            let dst = vreg_of(&load.operands[0])?;
+            let dst = load.operands[0].as_vreg()?;
             if dst.class != vs.class {
                 bail!(
                     "load width class {:?} != vS class {:?}",
@@ -537,7 +524,7 @@ impl Recognized {
             if dst == vs || dst == iv || dst == base || dst == scale_reg {
                 bail!("load dst aliases loop plumbing");
             }
-            let addr = vreg_of(&load.operands[1])?;
+            let addr = load.operands[1].as_vreg()?;
             let Some(madd_id) = single_def(addr).filter(|id| cycle_insts.contains(id)) else {
                 bail!("load address is not a single-def in-cycle Madd");
             };
@@ -579,7 +566,7 @@ impl Recognized {
                     bail!("load dst read outside (pos(load), pos(def vS)]");
                 }
             }
-            let madd_dst = vreg_of(&func.inst(madd_id).operands[0])?;
+            let madd_dst = func.inst(madd_id).operands[0].as_vreg()?;
             let madd_block = block_of_inst(func, madd_id)?;
             loads.push(LoadSite {
                 load_id,
@@ -637,19 +624,6 @@ impl Recognized {
             }
         }
 
-        if dump {
-            eprintln!(
-                "[recurrence-store-forward] RECOGNIZED@{} iv={:?} base={:?} vS={:?} \
-                 loads={} iv0={} N={}",
-                func.name,
-                iv,
-                base,
-                vs,
-                loads.len(),
-                iv0,
-                n
-            );
-        }
         Some(Recognized {
             preheader,
             iv,
@@ -701,7 +675,7 @@ fn cycle_order(
 
 /// Map every body instruction to its cycle-relative position.
 fn build_pos_map(func: &MachFunction, order: &[BlockId]) -> HashMap<InstId, CyclePos> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for (rank, &b) in order.iter().enumerate() {
         for (idx, &id) in func.block(b).insts.iter().enumerate() {
             map.insert(id, (rank, idx));
@@ -742,11 +716,11 @@ fn find_unit_induction(
             let si = func.inst(sdef);
             if si.opcode != AArch64Opcode::AddRI
                 || si.operands.len() != 3
-                || imm_of(&si.operands[2]) != Some(1)
+                || si.operands[2].as_imm() != Some(1)
             {
                 continue;
             }
-            let Some(x) = vreg_of(&si.operands[1]) else {
+            let Some(x) = si.operands[1].as_vreg() else {
                 continue;
             };
             // x == d directly, or x := MovR/Copy(d) single-def in-cycle.
@@ -797,7 +771,7 @@ fn recognize_const_bound(
     if bcond.operands.len() != 2 {
         return None;
     }
-    let cc = imm_of(&bcond.operands[0])?;
+    let cc = bcond.operands[0].as_imm()?;
     if cc != CC_LO && cc != CC_LT {
         return None;
     }
@@ -828,7 +802,7 @@ fn recognize_const_bound(
     if cmp.operands.len() != 2 {
         return None;
     }
-    let lhs = vreg_of(&cmp.operands[0])?;
+    let lhs = cmp.operands[0].as_vreg()?;
     let cmp_pos = *pos_of.get(&cmp_id)?;
     if !is_iv_copy_before(
         func,
@@ -843,9 +817,9 @@ fn recognize_const_bound(
         return None;
     }
     let n = match cmp.opcode {
-        AArch64Opcode::CmpRI => imm_of(&cmp.operands[1])?,
+        AArch64Opcode::CmpRI => cmp.operands[1].as_imm()?,
         AArch64Opcode::CmpRR => {
-            let rhs = vreg_of(&cmp.operands[1])?;
+            let rhs = cmp.operands[1].as_vreg()?;
             let rhs_def = single_def(rhs)?;
             if cycle_insts.contains(&rhs_def) {
                 return None;
@@ -949,7 +923,7 @@ fn side_exit_not_taken_at_iv0(
     if bcond.operands.len() != 2 {
         return false;
     }
-    let Some(cc) = imm_of(&bcond.operands[0]) else {
+    let Some(cc) = bcond.operands[0].as_imm() else {
         return false;
     };
     let Some(&taken) = branch_targets(bcond).first() else {
@@ -977,7 +951,7 @@ fn side_exit_not_taken_at_iv0(
     let Some(&cmp_pos) = pos_of.get(&cmp_id) else {
         return false;
     };
-    let Some(lhs) = vreg_of(&cmp.operands[0]) else {
+    let Some(lhs) = cmp.operands[0].as_vreg() else {
         return false;
     };
     // `lhs` is `iv` itself, or the in-cycle `AddRI(iv-copy, 1)` the store index
@@ -1000,11 +974,11 @@ fn side_exit_not_taken_at_iv0(
         let d = func.inst(def);
         if d.opcode != AArch64Opcode::AddRI
             || d.operands.len() != 3
-            || imm_of(&d.operands[2]) != Some(1)
+            || d.operands[2].as_imm() != Some(1)
         {
             return false;
         }
-        let Some(src) = vreg_of(&d.operands[1]) else {
+        let Some(src) = d.operands[1].as_vreg() else {
             return false;
         };
         let Some(&def_pos) = pos_of.get(&def) else {
@@ -1025,12 +999,12 @@ fn side_exit_not_taken_at_iv0(
         iv0 + 1
     };
     let k = match cmp.opcode {
-        AArch64Opcode::CmpRI => match imm_of(&cmp.operands[1]) {
+        AArch64Opcode::CmpRI => match cmp.operands[1].as_imm() {
             Some(v) => v,
             None => return false,
         },
         _ => {
-            let Some(rhs) = vreg_of(&cmp.operands[1]) else {
+            let Some(rhs) = cmp.operands[1].as_vreg() else {
                 return false;
             };
             let Some(rdef) = single_def(rhs) else {
@@ -1069,9 +1043,9 @@ fn madd_parts(inst: &MachInst) -> Option<(VReg, VReg, VReg)> {
         return None;
     }
     Some((
-        vreg_of(&inst.operands[1])?,
-        vreg_of(&inst.operands[2])?,
-        vreg_of(&inst.operands[3])?,
+        inst.operands[1].as_vreg()?,
+        inst.operands[2].as_vreg()?,
+        inst.operands[3].as_vreg()?,
     ))
 }
 
@@ -1240,24 +1214,12 @@ fn apply(func: &mut MachFunction, rec: &Recognized) {
 fn vreg(v: VReg) -> MachOperand {
     MachOperand::VReg(v)
 }
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
 
 /// `MovR(d, s)` / `Copy(d, s)` -> `(d, s)`.
 fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
     match inst.opcode {
         AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
+            Some((inst.operands[0].as_vreg()?, inst.operands[1].as_vreg()?))
         }
         _ => None,
     }
@@ -1267,7 +1229,7 @@ fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
 fn reads_vreg(inst: &MachInst, v: VReg) -> bool {
     let mut reads = false;
     aarch64_for_each_use_position(inst.opcode, inst.operands.len(), |pos| {
-        if inst.operands.get(pos).and_then(vreg_of) == Some(v) {
+        if inst.operands.get(pos).and_then(MachOperand::as_vreg) == Some(v) {
             reads = true;
         }
     });
@@ -1283,7 +1245,7 @@ fn is_linked(func: &MachFunction, target: InstId) -> bool {
 
 /// ALL defs of every vreg across block-linked instructions.
 fn build_all_defs(func: &MachFunction) -> HashMap<VReg, Vec<InstId>> {
-    let mut map: HashMap<VReg, Vec<InstId>> = HashMap::new();
+    let mut map: HashMap<VReg, Vec<InstId>> = HashMap::default();
     for &b in &func.block_order {
         for &id in &func.block(b).insts {
             let inst = func.inst(id);
@@ -1311,7 +1273,7 @@ fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
 /// entry), no path can reach `target` without hitting the barrier, so this is
 /// `false` — correctly sound.
 fn reaches_avoiding(func: &MachFunction, from: BlockId, target: BlockId, barrier: BlockId) -> bool {
-    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seen: HashSet<BlockId> = HashSet::default();
     let mut work: Vec<BlockId> = Vec::new();
     let push = |b: BlockId, work: &mut Vec<BlockId>, seen: &mut HashSet<BlockId>| -> bool {
         if b == barrier {
@@ -1340,22 +1302,12 @@ fn reaches_avoiding(func: &MachFunction, from: BlockId, target: BlockId, barrier
     false
 }
 
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|o| match o {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
-}
-
 fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
     let max_existing = func
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);

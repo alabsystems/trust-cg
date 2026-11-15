@@ -382,3 +382,25 @@ fn second_run_is_a_no_op() {
         assert_eq!(func.blocks.len(), blocks, "run {again} added blocks");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Loop-state contract (`crate::loop_contract`): the fast path reproduces only
+// the induction `x`. A loop register the single-def discipline admits (one
+// definition, in the loop) but that is read after the loop must refuse; the
+// contract alone refuses it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bails_when_a_loop_register_is_read_after_the_loop() {
+    let (_, fires) = run(Variant::Good);
+    assert!(fires, "plain fixture fires");
+    let mut func = build_swap(Variant::Good);
+    // `build_swap` creates entry, header, c1..c4, latch, two abort joins, exit.
+    let exit = BlockId(9);
+    let read = func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![w(70), w(11)]));
+    func.block_mut(exit).insts.insert(0, read);
+    assert!(
+        !SwapRangeGuardPass::new().run(&mut func),
+        "the loaded `a[x*S+y]` read after the loop must stay scalar"
+    );
+}

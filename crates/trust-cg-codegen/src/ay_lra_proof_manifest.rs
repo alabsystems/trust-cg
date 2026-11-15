@@ -3551,7 +3551,11 @@ fn aarch64_aapcs64_abi_bound(abi: &AbiDescriptor) -> bool {
         && string_list_matches(
             &abi.callee_saved_registers,
             &[
-                "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+                // AAPCS64 §6.1.1–6.1.2 preserves x19–x29 and only the low
+                // 64 bits of v8–v15 (the D views). Do not admit the old
+                // truncated GPR-only descriptor or claim full V preservation.
+                "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "d8",
+                "d9", "d10", "d11", "d12", "d13", "d14", "d15",
             ],
         )
         && abi.executable_memory_owner == ExecutableMemoryOwner::TrustCg
@@ -4077,4 +4081,38 @@ fn join_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
 
 fn missing_required_text(value: &str) -> bool {
     value.trim().is_empty()
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+    use crate::Target;
+
+    #[test]
+    fn current_aarch64_descriptor_satisfies_the_lra_abi_contract() {
+        assert!(aarch64_aapcs64_abi_bound(
+            &AbiDescriptor::for_trust_cg_target(Target::Aarch64)
+        ));
+    }
+
+    #[test]
+    fn incomplete_or_overstated_callee_save_contracts_are_rejected() {
+        let complete = AbiDescriptor::for_trust_cg_target(Target::Aarch64);
+        for removed in 0..complete.callee_saved_registers.len() {
+            let mut incomplete = complete.clone();
+            incomplete.callee_saved_registers.remove(removed);
+            assert!(!aarch64_aapcs64_abi_bound(&incomplete));
+        }
+        let mut legacy = complete.clone();
+        legacy.callee_saved_registers.truncate(10);
+        assert!(!aarch64_aapcs64_abi_bound(&legacy));
+
+        let mut overstated = complete;
+        for register in &mut overstated.callee_saved_registers {
+            if register.starts_with('d') {
+                *register = register.replacen('d', "v", 1);
+            }
+        }
+        assert!(!aarch64_aapcs64_abi_bound(&overstated));
+    }
 }

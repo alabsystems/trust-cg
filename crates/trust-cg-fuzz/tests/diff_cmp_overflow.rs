@@ -16,7 +16,9 @@
 // source `trust-cg-codegen/src/interpreter.rs`):
 //   The interpreter keeps ALL integers as i128 and its `eval_icmp` compares the
 //   FULL i128 values (signed via `<`, unsigned via `as u128`). It never masks
-//   to the operand bit width, and ZExt/SExt/Trunc are no-ops at the i128 level.
+//   to the operand bit width, and ZExt/SExt/Trunc are no-ops at the i128 level,
+//   except `sext Bool`, which makes true `-1` (trust-ir's meaning, LLVM's
+//   `sext i1`; the interpreter returned `1` before `1d65e8e64`).
 //   Consequences that drive how this test compares against the oracle:
 //     - SIGNED compares: oracle is valid iff every operand's stored i128 already
 //       equals its canonical signed value at the compare width. We guarantee
@@ -27,9 +29,15 @@
 //       unsigned interpretation when the stored i128 is non-negative AND fits
 //       in w bits. So for unsigned oracle comparison we ONLY use operands whose
 //       stored value is in [0, 2^w). HIGH-BIT-SET unsigned operands (e.g. an
-//       i64 0x8000…) are NOT oracle-comparable; those shapes are checked by
-//       cross-opt / cross-allocator JIT agreement (all 8 JIT configs must
-//       agree) and are explicitly flagged oracle_comparable=false.
+//       i64 0x8000…) are not interpreter-comparable. A separate width-aware
+//       Rust scalar reference checks those shapes as well as every other shape.
+//       All eight JIT configurations also remain cross-compared.
+//
+// The interpreter is an additional required reference where its model applies;
+// an unexpected error is a defect. For the private immediate store/reload shape,
+// its reference uses the equivalent bool zext because Alloca is unsupported.
+// The tested JIT module retains the actual memory operations. Each module is
+// compiled once per configuration and executed on every original input row.
 //
 // Every module's entry is `fuzz_fn` : (i64,i64,i64,i64) -> i64, and every
 // narrow / boolean result is explicitly widened to i64 before `ret`, so the
@@ -37,17 +45,15 @@
 
 #![cfg(target_arch = "aarch64")]
 
-use std::collections::HashMap;
-use std::panic;
-
-use trust_cg_codegen::Target;
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_fuzz::jit_diff::{project_widthless_bool_sext_i64, run_oracle_one};
+use trust_cg_fuzz::jit_diff::{bool_sext_i64_oracle_result, run_oracle_one};
 use trust_ir::{BinOp, ICmpOp, Ty};
 use trust_ir_build::ModuleBuilder;
 
 const ENTRY: &str = "fuzz_fn";
+
+#[path = "common/jit_matrix.rs"]
+mod jit_matrix;
 
 const ALL_CMPS: [ICmpOp; 10] = [
     ICmpOp::Eq,
@@ -111,7 +117,8 @@ struct CmpShape {
     rhs_const: Option<i128>,
     /// Whether this shape only uses operands whose stored i128 is a faithful
     /// width-`w` unsigned value (non-negative & in range). Determines whether
-    /// the oracle may be consulted for unsigned predicates.
+    /// the interpreter may be consulted for unsigned predicates. The scalar
+    /// reference always applies, including when this flag is false.
     oracle_ok: bool,
 }
 
@@ -184,7 +191,7 @@ fn build_cmp_module(shape: CmpShape) -> trust_ir::Module {
     };
     fb.ret(vec![out]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 /// A "chained comparison" module: r = (a<op1>b) <op2> (c<op3>d), all bool
@@ -230,72 +237,34 @@ fn build_chain_module(op1: ICmpOp, op2: ICmpOp, op3: ICmpOp, width: Width) -> tr
     let out = fb.binop(BinOp::Add, Ty::I64, combined, pc);
     fb.ret(vec![out]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Run {
-    Value(i64),
-    CompileErr,
-    SymbolMissing,
-    Panic,
-}
-
-fn jit_run(module: &trust_ir::Module, opt: OptLevel, jit_fast: bool, row: &[i64; 4]) -> Run {
-    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let externs: HashMap<String, *const u8> = HashMap::new();
-        let mut config = if jit_fast {
-            CompilerConfig::jit_fast(Target::host())
-        } else {
-            let mut c = CompilerConfig::for_host_jit();
-            c.enable_jit_fast_regalloc = false;
-            c
-        };
-        config.opt_level = opt;
-        let compiler = Compiler::new(config);
-        let buf = match compiler.compile_module_to_jit(module, &externs) {
-            Ok(r) => r.buffer,
-            Err(_) => return Run::CompileErr,
-        };
-        type Fn4 = extern "C" fn(i64, i64, i64, i64) -> i64;
-        let fptr = match unsafe { buf.get_fn_bound::<Fn4>(ENTRY) } {
-            Some(p) => p.into_inner(),
-            None => return Run::SymbolMissing,
-        };
-        let v = fptr(row[0], row[1], row[2], row[3]);
-        drop(buf);
-        Run::Value(v)
-    }));
-    res.unwrap_or(Run::Panic)
-}
-
-const OPTS: [OptLevel; 4] = [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3];
-
-/// Projection from the interpreter's deliberately widthless integer model to
-/// the result semantics exercised by the native JIT. Most result shapes are
-/// already represented exactly. `sext Bool -> i64` is the one exception: the
-/// interpreter leaves the raw Bool `1` unchanged, while a one-bit signed `1`
-/// sign-extends to the native i64 value `-1`.
+/// The domain an interpreter result must lie in before it is compared with
+/// the scalar reference. Every shape's result is the interpreter's own value;
+/// `sext Bool -> i64` must in addition be a one-bit sign extension, `0` or
+/// `-1` ([`bool_sext_i64_oracle_result`]), so the widthless `1` the
+/// interpreter returned before `1d65e8e64` is a named defect, never a value.
 #[derive(Clone, Copy, Debug)]
-enum OracleResultProjection {
-    Exact,
+enum OracleResultDomain {
+    Integer,
     BoolSextI64,
 }
 
-fn oracle_result_projection(mat: Materialize) -> OracleResultProjection {
+fn oracle_result_domain(mat: Materialize) -> OracleResultDomain {
     match mat {
-        Materialize::SextI64 => OracleResultProjection::BoolSextI64,
+        Materialize::SextI64 => OracleResultDomain::BoolSextI64,
         Materialize::ZextI64
         | Materialize::SelectI64
         | Materialize::StoreReloadI64
-        | Materialize::CtpopI64 => OracleResultProjection::Exact,
+        | Materialize::CtpopI64 => OracleResultDomain::Integer,
     }
 }
 
-fn project_oracle_result(raw: i64, projection: OracleResultProjection) -> Option<i64> {
-    match projection {
-        OracleResultProjection::Exact => Some(raw),
-        OracleResultProjection::BoolSextI64 => project_widthless_bool_sext_i64(raw),
+fn oracle_result_in_domain(raw: i64, domain: OracleResultDomain) -> Option<i64> {
+    match domain {
+        OracleResultDomain::Integer => Some(raw),
+        OracleResultDomain::BoolSextI64 => bool_sext_i64_oracle_result(raw),
     }
 }
 
@@ -317,75 +286,134 @@ fn rows() -> Vec<[i64; 4]> {
     ]
 }
 
-/// Run a module across all 8 JIT configs. Returns (jit_values, defects-from-
-/// compile/panic). Each entry is keyed by (jit_fast, opt).
+/// Single-row convenience for the armed harness controls.
 fn run_all_jit(
     module: &trust_ir::Module,
     row: &[i64; 4],
     label: &str,
     defects: &mut Vec<String>,
 ) -> Vec<((bool, OptLevel), i64)> {
-    let mut out = Vec::new();
-    for jit_fast in [true, false] {
-        for opt in OPTS {
-            match jit_run(module, opt, jit_fast, row) {
-                Run::Value(v) => out.push(((jit_fast, opt), v)),
-                Run::CompileErr => defects.push(format!(
-                    "COMPILE_ERR {label} row={row:?} fast={jit_fast} opt={opt:?}"
-                )),
-                Run::SymbolMissing => defects.push(format!(
-                    "SYMBOL_MISSING {label} row={row:?} fast={jit_fast} opt={opt:?}"
-                )),
-                Run::Panic => defects.push(format!(
-                    "PANIC {label} row={row:?} fast={jit_fast} opt={opt:?}"
-                )),
-            }
-        }
-    }
-    out
+    jit_matrix::run_jit_matrix(module, ENTRY, std::slice::from_ref(row), label, defects)
+        .into_iter()
+        .map(|(config, values)| (config, values[0]))
+        .collect()
 }
 
-/// Compare all JIT results against each other and (when allowed) the oracle.
-/// `consult_oracle` gates oracle comparison for unsigned-with-wide-operands.
+/// Compare every row/configuration with an independent scalar reference. The
+/// interpreter is an additional required check when its width model applies.
 fn check(
     module: &trust_ir::Module,
-    row: &[i64; 4],
+    rows: &[[i64; 4]],
     label: &str,
-    consult_oracle: bool,
-    oracle_projection: OracleResultProjection,
+    expected: impl Fn(&[i64; 4]) -> i64,
+    interpreter: Option<(&trust_ir::Module, OracleResultDomain)>,
     defects: &mut Vec<String>,
 ) {
-    let jits = run_all_jit(module, row, label, defects);
-    if jits.is_empty() {
-        return;
-    }
-    // cross-JIT agreement (oracle-free): every config must agree.
-    let (ref_key, ref_val) = jits[0];
-    for &(key, val) in &jits[1..] {
-        if val != ref_val {
-            defects.push(format!(
-                "JIT_DISAGREE {label} row={row:?}: {:?}={} vs {:?}={}",
-                ref_key, ref_val, key, val
-            ));
+    let jits = jit_matrix::run_jit_matrix(module, ENTRY, rows, label, defects);
+    for (index, row) in rows.iter().enumerate() {
+        let expected = expected(row);
+        if let Some((reference, domain)) = interpreter {
+            match run_oracle_one(reference, row) {
+                Err(error) => {
+                    defects.push(format!("ORACLE_UNAVAILABLE {label} row={row:?}: {error:?}"))
+                }
+                Ok(raw) => match oracle_result_in_domain(raw, domain) {
+                    None => defects.push(format!(
+                        "ORACLE_RESULT_OUT_OF_DOMAIN {label} row={row:?}: {raw}"
+                    )),
+                    Some(value) if value != expected => defects.push(format!(
+                        "ORACLE_DISAGREE {label} row={row:?}: scalar={expected} interpreter={value}"
+                    )),
+                    Some(_) => {}
+                },
+            }
         }
-    }
-    // oracle agreement (only when provably comparable).
-    if consult_oracle && let Ok(raw_ov) = run_oracle_one(module, row) {
-        let Some(ov) = project_oracle_result(raw_ov, oracle_projection) else {
-            defects.push(format!(
-                    "ORACLE_RESULT_OUT_OF_DOMAIN {label} row={row:?}: raw={raw_ov} projection={oracle_projection:?}"
-                ));
-            return;
-        };
-        for &(key, val) in &jits {
-            if val != ov {
+        for (key, values) in &jits {
+            let value = values[index];
+            if value != expected {
                 defects.push(format!(
-                    "MISCOMPILE {label} row={row:?} {:?}: jit={} oracle={}",
-                    key, val, ov
+                    "MISCOMPILE {label} row={row:?} {key:?}: jit={value} scalar={expected}"
+                ));
+            }
+            if let Some((reference_key, reference_values)) = jits.first()
+                && value != reference_values[index]
+            {
+                defects.push(format!(
+                    "JIT_DISAGREE {label} row={row:?}: {reference_key:?}={} vs {key:?}={value}",
+                    reference_values[index]
                 ));
             }
         }
     }
+}
+
+fn scalar_compare(width: Width, op: ICmpOp, lhs: i128, rhs: i128) -> bool {
+    let (signed_lhs, signed_rhs, unsigned_lhs, unsigned_rhs) = match width {
+        Width::I32 => (
+            lhs as i32 as i64,
+            rhs as i32 as i64,
+            lhs as u32 as u64,
+            rhs as u32 as u64,
+        ),
+        Width::I64 => (lhs as i64, rhs as i64, lhs as u64, rhs as u64),
+    };
+    match op {
+        ICmpOp::Eq => unsigned_lhs == unsigned_rhs,
+        ICmpOp::Ne => unsigned_lhs != unsigned_rhs,
+        ICmpOp::Ult => unsigned_lhs < unsigned_rhs,
+        ICmpOp::Ule => unsigned_lhs <= unsigned_rhs,
+        ICmpOp::Ugt => unsigned_lhs > unsigned_rhs,
+        ICmpOp::Uge => unsigned_lhs >= unsigned_rhs,
+        ICmpOp::Slt => signed_lhs < signed_rhs,
+        ICmpOp::Sle => signed_lhs <= signed_rhs,
+        ICmpOp::Sgt => signed_lhs > signed_rhs,
+        ICmpOp::Sge => signed_lhs >= signed_rhs,
+    }
+}
+
+fn scalar_cmp(shape: CmpShape, row: &[i64; 4]) -> i64 {
+    let lhs = shape.lhs_const.unwrap_or((row[0] & 0xffff) as i128);
+    let rhs = shape.rhs_const.unwrap_or((row[1] & 0xffff) as i128);
+    let comparison = scalar_compare(shape.width, shape.op, lhs, rhs);
+    match shape.mat {
+        Materialize::ZextI64 | Materialize::StoreReloadI64 | Materialize::CtpopI64 => {
+            i64::from(comparison)
+        }
+        Materialize::SextI64 => -i64::from(comparison),
+        Materialize::SelectI64 => {
+            if comparison {
+                row[2]
+            } else {
+                row[3]
+            }
+        }
+    }
+}
+
+fn check_shape(shape: CmpShape, rows: &[[i64; 4]], label: &str, defects: &mut Vec<String>) {
+    let module = build_cmp_module(shape);
+    // The tested JIT module retains its private immediate i64 store/reload.
+    // The widthless interpreter cannot allocate memory, so its additional
+    // reference uses the equivalent bool zext. The independent scalar model
+    // checks every shape, including memory and wide unsigned comparisons.
+    let memory_reference = matches!(shape.mat, Materialize::StoreReloadI64).then(|| {
+        build_cmp_module(CmpShape {
+            mat: Materialize::ZextI64,
+            ..shape
+        })
+    });
+    let interpreter = (!is_unsigned(shape.op) || shape.oracle_ok).then_some((
+        memory_reference.as_ref().unwrap_or(&module),
+        oracle_result_domain(shape.mat),
+    ));
+    check(
+        &module,
+        rows,
+        label,
+        |row| scalar_cmp(shape, row),
+        interpreter,
+        defects,
+    );
 }
 
 /// Canonical extreme constants per width. For i32 they fit the i32 range; for
@@ -412,6 +440,130 @@ fn extremes(w: Width) -> Vec<(i128, bool /* unsigned_ok */)> {
             (0x0123_4567_89ab_cdef, true),
         ],
     }
+}
+
+#[test]
+fn requested_oracle_failure_is_a_defect() {
+    let module = build_cmp_module(CmpShape {
+        width: Width::I64,
+        op: ICmpOp::Slt,
+        mat: Materialize::StoreReloadI64,
+        lhs_const: None,
+        rhs_const: None,
+        oracle_ok: true,
+    });
+    let row = [1, 2, 0, 0];
+    assert!(
+        run_oracle_one(&module, &row).is_err(),
+        "control requires the interpreter's unsupported Alloca path"
+    );
+    let mut defects = Vec::new();
+    check(
+        &module,
+        &[row],
+        "required interpreter",
+        |_| 1,
+        Some((&module, OracleResultDomain::Integer)),
+        &mut defects,
+    );
+    assert!(
+        defects
+            .iter()
+            .any(|defect| defect.contains("ORACLE_UNAVAILABLE")),
+        "missing oracle result was silently discarded: {defects:?}"
+    );
+}
+
+#[test]
+fn scalar_reference_checks_wide_unsigned_and_memory_shapes() {
+    let rows = [[0, 0, 11, 22], [-1, 7, i64::MIN, i64::MAX]];
+    let mut defects = Vec::new();
+    for width in [Width::I32, Width::I64] {
+        for mat in ALL_MAT {
+            for (op, truth) in [(ICmpOp::Ugt, true), (ICmpOp::Ult, false)] {
+                let shape = CmpShape {
+                    width,
+                    op,
+                    mat,
+                    lhs_const: Some(-1),
+                    rhs_const: Some(0),
+                    oracle_ok: false,
+                };
+                for row in rows {
+                    let expected = match mat {
+                        Materialize::SextI64 => {
+                            if truth {
+                                -1
+                            } else {
+                                0
+                            }
+                        }
+                        Materialize::SelectI64 => {
+                            if truth {
+                                row[2]
+                            } else {
+                                row[3]
+                            }
+                        }
+                        _ => i64::from(truth),
+                    };
+                    assert_eq!(scalar_cmp(shape, &row), expected);
+                }
+                check_shape(shape, &rows, "wide unsigned control", &mut defects);
+            }
+        }
+    }
+    assert!(defects.is_empty(), "{defects:?}");
+}
+
+#[test]
+fn an_armed_scalar_mismatch_is_reported_for_every_jit_configuration() {
+    let module = build_cmp_module(CmpShape {
+        width: Width::I64,
+        op: ICmpOp::Slt,
+        mat: Materialize::ZextI64,
+        lhs_const: None,
+        rhs_const: None,
+        oracle_ok: true,
+    });
+    let mut defects = Vec::new();
+    check(
+        &module,
+        &[[1, 2, 0, 0]],
+        "armed mismatch",
+        |_| 0,
+        None,
+        &mut defects,
+    );
+    assert_eq!(defects.len(), 8, "{defects:?}");
+    assert!(defects.iter().all(|defect| defect.contains("MISCOMPILE")));
+}
+
+#[test]
+fn jit_matrix_rejects_empty_rows_and_incompatible_entry_abi() {
+    let mut module = build_cmp_module(CmpShape {
+        width: Width::I64,
+        op: ICmpOp::Slt,
+        mat: Materialize::ZextI64,
+        lhs_const: None,
+        rhs_const: None,
+        oracle_ok: true,
+    });
+    let mut defects = Vec::new();
+    assert!(jit_matrix::run_jit_matrix(&module, ENTRY, &[], "empty rows", &mut defects).is_empty());
+    assert_eq!(defects.len(), 8);
+    assert!(defects.iter().all(|defect| defect.contains("NO_ROWS")));
+    module.func_types[0].params[0] = Ty::I32;
+    defects.clear();
+    assert!(
+        jit_matrix::run_jit_matrix(&module, ENTRY, &[[0; 4]], "wrong ABI", &mut defects).is_empty()
+    );
+    assert_eq!(defects.len(), 8);
+    assert!(
+        defects
+            .iter()
+            .all(|defect| defect.contains("ENTRY_ABI_MISMATCH"))
+    );
 }
 
 #[test]
@@ -453,12 +605,14 @@ fn harness_selfcheck_oracle_live_and_sensitive() {
     // MIN < (anything non-negative) -> true -> 1.
     assert_eq!(run_oracle_one(&me, &[0, 7, 0, 0]).unwrap(), 1);
 
-    // The interpreter's documented widthless cast model leaves `sext Bool`
-    // true as raw `1`. Prove that assumption remains live, then prove the
-    // harness projects it to the native one-bit sign extension `-1` and that
-    // every JIT configuration agrees. This is an armed guard against either
-    // silently reintroducing the false-positive oracle comparison or masking
-    // a future interpreter change.
+    // `sext Bool` true is all ones: trust-ir widens `as_signed()` of the
+    // 1-bit value (its reference interpreter's `eval_cast`) and LLVM's
+    // `sext i1 true` is -1. The interpreter computes that directly since
+    // `1d65e8e64`; before, it returned the raw Bool `1` and this harness
+    // projected it. Prove the interpreter's true and false results, that the
+    // domain check passes them and refuses the retired `1`, and that every JIT
+    // configuration agrees. This is an armed guard against a return of the
+    // widthless model in the interpreter or a harness that normalizes it.
     let ms = build_cmp_module(CmpShape {
         width: Width::I64,
         op: ICmpOp::Slt,
@@ -468,11 +622,19 @@ fn harness_selfcheck_oracle_live_and_sensitive() {
         oracle_ok: true,
     });
     let raw = run_oracle_one(&ms, &row).expect("oracle must accept Bool SExt module");
-    assert_eq!(raw, 1, "widthless interpreter Bool SExt model changed");
     assert_eq!(
-        project_oracle_result(raw, OracleResultProjection::BoolSextI64),
+        raw, -1,
+        "the interpreter's Bool SExt of true must be all ones"
+    );
+    assert_eq!(
+        oracle_result_in_domain(raw, OracleResultDomain::BoolSextI64),
         Some(-1),
-        "Bool true must sign-extend from one bit to native i64 -1"
+        "Bool true sign-extends from one bit to i64 -1"
+    );
+    assert_eq!(
+        oracle_result_in_domain(1, OracleResultDomain::BoolSextI64),
+        None,
+        "the retired widthless `1` is outside the Bool SExt domain"
     );
     let sext_jits = run_all_jit(&ms, &row, "selfcheck-bool-sext", &mut Vec::new());
     assert_eq!(
@@ -491,7 +653,7 @@ fn harness_selfcheck_oracle_live_and_sensitive() {
         "false Bool SExt oracle result must remain zero"
     );
     assert_eq!(
-        project_oracle_result(raw_false, OracleResultProjection::BoolSextI64),
+        oracle_result_in_domain(raw_false, OracleResultDomain::BoolSextI64),
         Some(0),
         "false Bool must sign-extend to native i64 zero"
     );
@@ -530,19 +692,9 @@ fn cmp_single_shapes() {
                     rhs_const: None,
                     oracle_ok: true,
                 };
-                let m = build_cmp_module(shape);
                 let label = format!("dyn {width:?} {op:?} {mat:?}");
                 configs += 1;
-                for row in &rows {
-                    check(
-                        &m,
-                        row,
-                        &label,
-                        true,
-                        oracle_result_projection(mat),
-                        &mut defects,
-                    );
-                }
+                check_shape(shape, &rows, &label, &mut defects);
 
                 // (2) extreme-constant LHS vs dynamic RHS and vice-versa, plus
                 //     const-vs-const, sweeping the INT_MIN/MAX/0/-1 edges.
@@ -567,24 +719,9 @@ fn cmp_single_shapes() {
                         oracle_ok: uok,
                     };
                     for (tag, s) in [("cL", s1), ("cR", s2)] {
-                        let m = build_cmp_module(s);
                         let label = format!("{tag} {width:?} {op:?} {mat:?} k={k:#x}");
                         configs += 1;
-                        // For unsigned ops, only consult the oracle when the
-                        // constant operand is a faithful width-w unsigned value
-                        // (dynamic side is always faithful). Signed ops are
-                        // always faithful here.
-                        let consult = if is_unsigned(op) { s.oracle_ok } else { true };
-                        for row in &rows {
-                            check(
-                                &m,
-                                row,
-                                &label,
-                                consult,
-                                oracle_result_projection(mat),
-                                &mut defects,
-                            );
-                        }
+                        check_shape(s, &rows, &label, &mut defects);
                     }
                 }
             }
@@ -606,26 +743,24 @@ fn cmp_single_shapes() {
                         rhs_const: Some(kr),
                         oracle_ok: ulok && urok,
                     };
-                    let m = build_cmp_module(s);
                     let label = format!("cc {width:?} {op:?} l={kl:#x} r={kr:#x}");
                     configs += 1;
-                    let consult = if is_unsigned(op) { ulok && urok } else { true };
-                    for row in &rows {
-                        check(
-                            &m,
-                            row,
-                            &label,
-                            consult,
-                            OracleResultProjection::Exact,
-                            &mut defects,
-                        );
-                    }
+                    check_shape(s, &rows, &label, &mut defects);
                 }
             }
         }
     }
 
-    eprintln!("cmp_single: {configs} configs, {} defects", defects.len());
+    assert_eq!(
+        configs, 2020,
+        "reviewed single-comparison shape census changed"
+    );
+    assert_eq!(rows.len(), 13, "reviewed input-row census changed");
+    eprintln!(
+        "cmp_single: {configs} shapes x 8 JIT configurations x {} rows, {} defects",
+        rows.len(),
+        defects.len()
+    );
     assert!(
         defects.is_empty(),
         "{}",
@@ -660,22 +795,48 @@ fn cmp_chains() {
                     let m = build_chain_module(op1, op2, op3, width);
                     let label = format!("chain {width:?} {op1:?}/{op2:?}/{op3:?}");
                     configs += 1;
-                    for row in &rows {
-                        // Fully faithful operands -> oracle always valid.
-                        check(
-                            &m,
-                            row,
-                            &label,
-                            true,
-                            OracleResultProjection::Exact,
-                            &mut defects,
-                        );
-                    }
+                    check(
+                        &m,
+                        &rows,
+                        &label,
+                        |row| {
+                            let first = scalar_compare(
+                                width,
+                                op1,
+                                (row[0] & 0xffff) as i128,
+                                (row[1] & 0xffff) as i128,
+                            );
+                            let second = scalar_compare(
+                                width,
+                                op3,
+                                (row[2] & 0xffff) as i128,
+                                (row[3] & 0xffff) as i128,
+                            );
+                            let outer = scalar_compare(
+                                Width::I64,
+                                op2,
+                                i128::from(first),
+                                i128::from(second),
+                            );
+                            i64::from(outer) + i64::from(first) + i64::from(second)
+                        },
+                        Some((&m, OracleResultDomain::Integer)),
+                        &mut defects,
+                    );
                 }
             }
         }
     }
-    eprintln!("cmp_chains: {configs} configs, {} defects", defects.len());
+    assert_eq!(
+        configs, 300,
+        "reviewed chained-comparison shape census changed"
+    );
+    assert_eq!(rows.len(), 13, "reviewed input-row census changed");
+    eprintln!(
+        "cmp_chains: {configs} shapes x 8 JIT configurations x {} rows, {} defects",
+        rows.len(),
+        defects.len()
+    );
     assert!(
         defects.is_empty(),
         "{}",
@@ -690,8 +851,8 @@ fn cmp_chains() {
 
 /// Dedicated wide-unsigned probe: i64 / i32 unsigned compares where operands
 /// have the high bit set (INT_MIN, -1). These are NOT oracle-comparable (the
-/// interpreter's i128 `as u128` diverges from width-w hardware unsigned), so we
-/// rely purely on cross-opt / cross-allocator JIT AGREEMENT (all 8 must match).
+/// interpreter's i128 `as u128` diverges from width-w hardware unsigned). The
+/// independent width-aware scalar model still checks all eight JIT configurations.
 #[test]
 fn cmp_wide_unsigned_jit_agreement() {
     let rows = rows();
@@ -710,27 +871,18 @@ fn cmp_wide_unsigned_jit_agreement() {
                             rhs_const: rc,
                             oracle_ok: false,
                         };
-                        let m = build_cmp_module(s);
                         let label = format!("wideU {tag} {width:?} {op:?} {mat:?} k={k:#x}");
                         configs += 1;
-                        for row in &rows {
-                            // oracle-free: JIT agreement only.
-                            check(
-                                &m,
-                                row,
-                                &label,
-                                false,
-                                oracle_result_projection(mat),
-                                &mut defects,
-                            );
-                        }
+                        check_shape(s, &rows, &label, &mut defects);
                     }
                 }
             }
         }
     }
+    assert_eq!(configs, 160, "reviewed wide-unsigned shape census changed");
+    assert_eq!(rows.len(), 13, "reviewed input-row census changed");
     eprintln!(
-        "cmp_wide_unsigned: {configs} configs (oracle-free JIT-agreement), {} defects",
+        "cmp_wide_unsigned: {configs} shapes (scalar reference and JIT agreement), {} defects",
         defects.len()
     );
     assert!(

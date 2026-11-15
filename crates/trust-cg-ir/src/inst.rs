@@ -1033,6 +1033,17 @@ pub enum AArch64Opcode {
     /// SBC Xd, Xn, Xm — subtract with carry/borrow (for i128 high-half subtraction).
     /// Reads carry/borrow flag from previous SUBS. Always 64-bit.
     Sbc,
+    /// ADCS Xd, Xn, Xm — add with carry, SETTING flags (checked-i128 high
+    /// half: after `ADDS lo; ADCS hi`, C is the unsigned carry-out of the
+    /// full 128-bit sum and V its signed overflow, so a following
+    /// `CSET HS`/`CSET VS` materializes the checked-add overflow bit).
+    /// Reads carry from the previous ADDS. Always 64-bit.
+    Adcs,
+    /// SBCS Xd, Xn, Xm — subtract with carry/borrow, SETTING flags (the
+    /// checked-i128 twin of [`Self::Adcs`]: after `SUBS lo; SBCS hi`, C
+    /// clear is the unsigned borrow of the full 128-bit difference and V its
+    /// signed overflow — `CSET LO`/`CSET VS`). Always 64-bit.
+    Sbcs,
     /// UMULH Xd, Xn, Xm — unsigned multiply high (upper 64 bits of 64x64->128 product).
     /// Always 64-bit (no 32-bit variant).
     Umulh,
@@ -1274,6 +1285,179 @@ pub enum AArch64Opcode {
     ///
     /// Operands: none. Appended to preserve all earlier opcode discriminants.
     AlignNop,
+
+    // -- ELF general-dynamic TLS through a TLS descriptor (TLSDESC) --
+    //
+    // The AArch64 TLSDESC access is the fixed four-instruction sequence
+    //
+    //   ADRP x0, :tlsdesc:sym            R_AARCH64_TLSDESC_ADR_PAGE21
+    //   LDR  x1, [x0, #:tlsdesc_lo12:sym] R_AARCH64_TLSDESC_LD64_LO12
+    //   ADD  x0, x0, #:tlsdesc_lo12:sym  R_AARCH64_TLSDESC_ADD_LO12
+    //   BLR  x1                          R_AARCH64_TLSDESC_CALL
+    //
+    // after which x0 holds the variable's offset from TPIDR_EL0. Static
+    // linkers relax the sequence to initial-exec or local-exec by rewriting
+    // these exact instruction slots with FIXED registers (x0 result, x1
+    // resolver), so the registers are part of the ABI and nothing between the
+    // four slots may touch x0. ISel therefore emits one call-like
+    // `TlsDescCall` that register allocation sees as an ordinary call; frame
+    // lowering expands it into the four real instructions below with physical
+    // X0/X1 operands, after every pass that could separate or reallocate them.
+    /// ELF TLSDESC call sequence before expansion. Operands: `[Symbol]`.
+    /// Implicit defs carry the conservative AAPCS64 call-clobber set (the
+    /// ABI's stronger preservation guarantee is not modeled). Never encoded:
+    /// the encoder fails closed if one survives to emission. Appended to
+    /// preserve all earlier opcode discriminants.
+    TlsDescCall,
+    /// `LDR Xt, [Xn, #:tlsdesc_lo12:sym]` — load the TLS descriptor's
+    /// resolver. Same hardware encoding as [`Self::LdrGot`]; structurally
+    /// distinct so encode-time ADRP pairing selects the TLSDESC relocations.
+    /// Operands: `[Xt, Xn, Symbol]`. Created only by TLSDESC expansion.
+    LdrTlsdesc,
+    /// `ADD Xd, Xn, #:tlsdesc_lo12:sym` — form the TLS descriptor address
+    /// (`R_AARCH64_TLSDESC_ADD_LO12`). Operands: `[Xd, Xn, Symbol]`. Created
+    /// only by TLSDESC expansion.
+    AddTlsdescLo12,
+    /// `BLR Xn` annotated `.tlsdesccall sym` (`R_AARCH64_TLSDESC_CALL`):
+    /// call the descriptor resolver with the descriptor address in x0; it
+    /// returns the TP-relative offset in x0. Operands: `[Xn, Symbol]`.
+    /// Created only by TLSDESC expansion.
+    BlrTlsdesc,
+
+    // -- Baseline (non-LSE) exclusive monitor instructions --
+    //
+    // Appended after the TLSDESC opcodes to preserve every older
+    // discriminant. These real encodings are produced ONLY by the
+    // post-register-allocation LL/SC expansion (`trust_cg_codegen::llsc`) of
+    // the opaque `LlscRmw*` / `LlscCmpSwap*` pseudos below, so no spill,
+    // reload or other memory access can be scheduled between a
+    // load-exclusive and its store-exclusive.
+    // Operand shapes mirror `Ldaxr` / `Stlxr`: loads are `[Rt, Xn|SP]` and
+    // stores are `[Ws (status), Rt, Xn|SP]`. The word forms derive W/X width
+    // from `Rt`; the byte/halfword forms require a W data register.
+    /// LDXR Wt|Xt, [Xn] — load exclusive register (no acquire).
+    Ldxr,
+    /// LDXRB Wt, [Xn] — load exclusive byte, zero-extended.
+    Ldxrb,
+    /// LDXRH Wt, [Xn] — load exclusive halfword, zero-extended.
+    Ldxrh,
+    /// LDAXRB Wt, [Xn] — load-acquire exclusive byte, zero-extended.
+    Ldaxrb,
+    /// LDAXRH Wt, [Xn] — load-acquire exclusive halfword, zero-extended.
+    Ldaxrh,
+    /// STXR Ws, Wt|Xt, [Xn] — store exclusive register (no release).
+    /// Ws receives 0 on success and 1 on failure.
+    Stxr,
+    /// STXRB Ws, Wt, [Xn] — store exclusive byte.
+    Stxrb,
+    /// STXRH Ws, Wt, [Xn] — store exclusive halfword.
+    Stxrh,
+    /// STLXRB Ws, Wt, [Xn] — store-release exclusive byte.
+    Stlxrb,
+    /// STLXRH Ws, Wt, [Xn] — store-release exclusive halfword.
+    Stlxrh,
+    /// CLREX #15 — clear the local exclusive monitor. Operands: none.
+    /// Emitted on the compare-failure exit of an expanded LL/SC
+    /// compare-and-swap, where a load-exclusive has no store-exclusive.
+    Clrex,
+
+    // -- Opaque LL/SC atomic pseudos (baseline armv8.0 atomics) --
+    //
+    // Selected by AArch64 ISel for `AtomicRmw` / `CmpXchg` when the target
+    // profile does not admit FEAT_LSE. Register allocation sees ONE
+    // instruction whose register defs are all written after all register uses
+    // are read (the allocator's def/use interference gives every def a
+    // register distinct from every use and from every other def). After
+    // allocation, frame lowering and spill materialization,
+    // `trust_cg_codegen::llsc::expand_llsc_atomics` replaces each pseudo with
+    // a fixed load-exclusive / operation / store-exclusive / CBNZ retry loop in
+    // place, so the exclusive window contains only register ALU work. The
+    // encoder rejects any pseudo that survives to encoding.
+    //
+    // `LlscRmw{8,16,32,64}` operands:
+    //   [Def old, Def new, Def status (W), Use value, Use addr (X),
+    //    Imm(LlscRmwOp), Imm(LlscOrdering)]
+    // `LlscCmpSwap{8,16,32,64}` operands:
+    //   [Def old, Def status (W), Use expected, Use desired, Use addr (X),
+    //    Imm(LlscOrdering)]
+    // The suffix is the memory access width in bits.
+    /// Opaque 8-bit LL/SC read-modify-write pseudo.
+    LlscRmw8,
+    /// Opaque 16-bit LL/SC read-modify-write pseudo.
+    LlscRmw16,
+    /// Opaque 32-bit LL/SC read-modify-write pseudo.
+    LlscRmw32,
+    /// Opaque 64-bit LL/SC read-modify-write pseudo.
+    LlscRmw64,
+    /// Opaque 8-bit LL/SC compare-and-swap pseudo.
+    LlscCmpSwap8,
+    /// Opaque 16-bit LL/SC compare-and-swap pseudo.
+    LlscCmpSwap16,
+    /// Opaque 32-bit LL/SC compare-and-swap pseudo.
+    LlscCmpSwap32,
+    /// Opaque 64-bit LL/SC compare-and-swap pseudo.
+    LlscCmpSwap64,
+
+    // -- 128-bit exclusive pairs and pseudos --
+    //
+    // Appended after `LlscCmpSwap64`. The pair exclusives transfer two X
+    // registers: loads are `[Xt1, Xt2, Xn|SP]` (Xt1 != Xt2), stores are
+    // `[Ws (status), Xt1, Xt2, Xn|SP]`. Armv8.0 guarantees a 128-bit
+    // single-copy-atomic read only when the LDXP is followed by a successful
+    // STXP of the same location, so every 128-bit pseudo below writes back.
+    /// LDXP Xt1, Xt2, [Xn] — load exclusive pair of doublewords.
+    Ldxp,
+    /// LDAXP Xt1, Xt2, [Xn] — load-acquire exclusive pair.
+    Ldaxp,
+    /// STXP Ws, Xt1, Xt2, [Xn] — store exclusive pair.
+    Stxp,
+    /// STLXP Ws, Xt1, Xt2, [Xn] — store-release exclusive pair.
+    Stlxp,
+    /// Opaque 128-bit atomic load: `[Def lo, Def hi, Def status (W),
+    /// Use addr (X), Imm(LlscOrdering)]`, expanded to an LD{A}XP/ST{L}XP
+    /// write-back retry loop.
+    LlscLoad128,
+    /// Opaque 128-bit atomic store: `[Def scratch_lo, Def scratch_hi,
+    /// Def status (W), Use value_lo, Use value_hi, Use addr (X),
+    /// Imm(LlscOrdering)]`.
+    LlscStore128,
+    /// Opaque 128-bit LL/SC read-modify-write: `[Def old_lo, Def old_hi,
+    /// Def new_lo, Def new_hi, Def status (W), Use value_lo, Use value_hi,
+    /// Use addr (X), Imm(LlscRmwOp), Imm(LlscOrdering)]`.
+    LlscRmw128,
+    /// Opaque 128-bit LL/SC compare-and-swap: `[Def old_lo, Def old_hi,
+    /// Def status (W), Use expected_lo, Use expected_hi, Use desired_lo,
+    /// Use desired_hi, Use addr (X), Imm(LlscOrdering)]`.
+    LlscCmpSwap128,
+    /// FRINTN Sd/Dd, Sn/Dn — nearest integer, ties to even.
+    FrintnRR,
+
+    // -- FEAT_CRC32 checksums --
+    //
+    // Appended after `FrintnRR`. Each folds a data operand into a 32-bit CRC
+    // accumulator, bit-reflected (least-significant bit first), exactly as
+    // LLVM's `llvm.aarch64.crc32*` intrinsics: `Wd = crc(Wn, Rm<size-1:0>)`.
+    // CRC32* use the IEEE 802.3 polynomial 0x04C11DB7, CRC32C* the Castagnoli
+    // polynomial 0x1EDC6F41. Operands: `[Wd, Wn (accumulator), Wm (data)]`,
+    // and `[Wd, Wn, Xm]` for the 64-bit-data X forms. Selected only when the
+    // function's admission includes FEAT_CRC32 (`crc`); otherwise instruction
+    // selection expands the same function from baseline shifts and XORs.
+    /// CRC32B Wd, Wn, Wm — IEEE CRC-32 of one byte.
+    Crc32B,
+    /// CRC32H Wd, Wn, Wm — IEEE CRC-32 of one halfword.
+    Crc32H,
+    /// CRC32W Wd, Wn, Wm — IEEE CRC-32 of one word.
+    Crc32W,
+    /// CRC32X Wd, Wn, Xm — IEEE CRC-32 of one doubleword.
+    Crc32X,
+    /// CRC32CB Wd, Wn, Wm — Castagnoli CRC-32C of one byte.
+    Crc32Cb,
+    /// CRC32CH Wd, Wn, Wm — Castagnoli CRC-32C of one halfword.
+    Crc32Ch,
+    /// CRC32CW Wd, Wn, Wm — Castagnoli CRC-32C of one word.
+    Crc32Cw,
+    /// CRC32CX Wd, Wn, Xm — Castagnoli CRC-32C of one doubleword.
+    Crc32Cx,
 }
 
 impl AArch64Opcode {
@@ -1309,6 +1493,12 @@ impl AArch64Opcode {
                 .union(InstFlags::HAS_SIDE_EFFECTS)
                 .union(InstFlags::READS_MEMORY)
                 .union(InstFlags::WRITES_MEMORY),
+            // The TLSDESC resolver call (before and after expansion) is a
+            // call: it clobbers the caller-saved set and may read memory.
+            TlsDescCall | BlrTlsdesc => InstFlags::IS_CALL
+                .union(InstFlags::HAS_SIDE_EFFECTS)
+                .union(InstFlags::READS_MEMORY)
+                .union(InstFlags::WRITES_MEMORY),
 
             // Return
             Ret => InstFlags::IS_RETURN.union(InstFlags::IS_TERMINATOR),
@@ -1320,7 +1510,7 @@ impl AArch64Opcode {
             LdrPreIndex | LdrPostIndex => {
                 InstFlags::READS_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS)
             }
-            LdrLiteral | LdrGot | LdrTlvp | LdrGottprel => InstFlags::READS_MEMORY,
+            LdrLiteral | LdrGot | LdrTlvp | LdrGottprel | LdrTlsdesc => InstFlags::READS_MEMORY,
             LdpRI | LdpPostIndex => InstFlags::READS_MEMORY,
             NeonLd1Post => InstFlags::READS_MEMORY,
             NeonLdpQPost => InstFlags::READS_MEMORY,
@@ -1376,8 +1566,24 @@ impl AArch64Opcode {
                 .union(InstFlags::HAS_SIDE_EFFECTS),
 
             // Exclusive load/store (LL/SC legacy path)
-            Ldaxr => InstFlags::READS_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS),
-            Stlxr => InstFlags::WRITES_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS),
+            Ldaxr | Ldxr | Ldxrb | Ldxrh | Ldaxrb | Ldaxrh | Ldxp | Ldaxp => {
+                InstFlags::READS_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS)
+            }
+            Stlxr | Stxr | Stxrb | Stxrh | Stlxrb | Stlxrh | Stxp | Stlxp => {
+                InstFlags::WRITES_MEMORY.union(InstFlags::HAS_SIDE_EFFECTS)
+            }
+            // CLREX changes exclusive-monitor state; never delete or move it.
+            Clrex => InstFlags::HAS_SIDE_EFFECTS,
+
+            // Opaque LL/SC atomic pseudos: an atomic read AND write of memory.
+            // Deliberately NOT `IS_PSEUDO`: every encoder walk skips pseudo
+            // instructions, so a survivor must reach the encoder and fail
+            // closed there instead of silently emitting nothing.
+            LlscRmw8 | LlscRmw16 | LlscRmw32 | LlscRmw64 | LlscCmpSwap8 | LlscCmpSwap16
+            | LlscCmpSwap32 | LlscCmpSwap64 | LlscLoad128 | LlscStore128 | LlscRmw128
+            | LlscCmpSwap128 => InstFlags::READS_MEMORY
+                .union(InstFlags::WRITES_MEMORY)
+                .union(InstFlags::HAS_SIDE_EFFECTS),
 
             // Memory barriers: pure side effects (enforce ordering)
             Dmb | Dsb | Isb => InstFlags::HAS_SIDE_EFFECTS,
@@ -1413,8 +1619,9 @@ impl AArch64Opcode {
             // Checked arithmetic: produce a result AND set flags (side effect)
             AddsRR | AddsRI | SubsRR | SubsRI => InstFlags::HAS_SIDE_EFFECTS,
 
-            // i128 multi-register: ADC/SBC read NZCV flags from preceding ADDS/SUBS
-            Adc | Sbc => InstFlags::HAS_SIDE_EFFECTS,
+            // i128 multi-register: ADC/SBC read NZCV flags from preceding ADDS/SUBS;
+            // ADCS/SBCS additionally write them (checked-i128 high half).
+            Adc | Sbc | Adcs | Sbcs => InstFlags::HAS_SIDE_EFFECTS,
 
             // Trap/guard pseudo-instructions: control-flowing side effects
             // until proof opts remove them or lowering/encoding materializes a trap.
@@ -1618,6 +1825,38 @@ impl AArch64Opcode {
         )
     }
 
+    /// The subset of [`Self::is_trap_pseudo`] that FALLS THROUGH: a guard that
+    /// traps only when its condition holds, so the instructions after it in the
+    /// same block are LIVE.
+    ///
+    /// Every one of these expands (in `trust_cg_codegen::lower`) to a
+    /// `CMP`/`Umulh`-style test, a CONDITIONAL branch over the trap, and a
+    /// `BRK` — `expand_trap_bounds_check_exact`, `expand_trap_null_if_zero`,
+    /// `expand_trap_div_zero_if_zero`, `expand_trap_shift_range_if_oob`,
+    /// `expand_trap_overflow_exact`. The BARE spellings
+    /// (`TrapBoundsCheck`/`TrapOverflow`/`TrapNull`/`TrapDivZero`/
+    /// `TrapShiftRange`) are deliberately NOT here: those are the degraded
+    /// carriers the expansions fall back to when an operand is missing, and the
+    /// encoder emits each as an UNCONDITIONAL `BRK #1`, which really does end
+    /// its block. A consumer asking "does control continue past this
+    /// instruction?" must use THIS predicate, not `is_trap_pseudo`.
+    ///
+    /// The motivating consumer is TV-3's block-level structural check
+    /// (`trust_cg_verify::dataflow_integrity`): aarch64 stamps all ten pseudos
+    /// `IS_BRANCH | IS_TERMINATOR`, so reading the raw flags reported every
+    /// guarded table index as code after an unconditional terminator.
+    pub const fn is_falls_through_trap_pseudo(self) -> bool {
+        use AArch64Opcode::*;
+        matches!(
+            self,
+            TrapBoundsCheckExact
+                | TrapNullIfZero
+                | TrapDivZeroIfZero
+                | TrapShiftRangeIfOOB
+                | TrapOverflowExact
+        )
+    }
+
     /// Returns true if this opcode produces a value (operand[0] is a def).
     ///
     /// Instructions that don't produce values: CMP, TST, STR, STP, branches,
@@ -1647,11 +1886,15 @@ impl AArch64Opcode {
             // Architectural and emission-time padding NOPs: no def.
             Nop | AlignNop => false,
             // Calls: produce result via implicit defs; for simple model, not a value producer
-            Bl | Blr | BL | BLR => false,
+            Bl | Blr | BL | BLR | TlsDescCall | BlrTlsdesc => false,
             // Memory barriers: no register def
             Dmb | Dsb | Isb => false,
-            // Atomic stores: no register def for the store itself
-            Stlr | Stlrb | Stlrh | Stlxr => false,
+            // CLREX has no operands and defines no register.
+            Clrex => false,
+            // Ordinary atomic stores have no register result. STLXR instead
+            // defines its W-status operand, even when the exclusive store
+            // fails and memory is unchanged.
+            Stlr | Stlrb | Stlrh => false,
             // Everything else produces a value in operand[0]
             _ => true,
         }
@@ -1662,9 +1905,9 @@ impl AArch64Opcode {
 // InstFlags (manual bitflags, no external crate)
 // ---------------------------------------------------------------------------
 
-/// Instruction property flags, packed as a u16 bitfield.
+/// Instruction property flags, packed as a u32 bitfield.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InstFlags(u16);
+pub struct InstFlags(u32);
 
 impl InstFlags {
     pub const EMPTY: Self = Self(0);
@@ -1694,11 +1937,11 @@ impl InstFlags {
     /// of mutable global state (see `trust-cg-lower`'s
     /// `compute_structural_pure_func_ids`). It is set from deterministic
     /// module-structural analysis and is read ONLY by the x86 LICM pure-call
-    /// cluster-hoist tier (gated behind `TCG_PURE_CALL_HOIST`). No other pass
+    /// cluster-hoist tier (`hoist_pure_call_clusters`). No other pass
     /// consumes it, so a call carrying this flag is otherwise treated exactly
     /// like any other call (its
     /// `HAS_SIDE_EFFECTS`/barrier flags are deliberately left intact — this flag
-    /// enables ONLY the explicit, gated hoist, never implicit DCE/reordering).
+    /// enables ONLY that explicit hoist, never implicit DCE/reordering).
     pub const PURE_CALL_HOISTABLE: Self = Self(0x800);
     /// Semantic provenance: this `FmaddRR` came from LLVM's fusion-licensed
     /// `llvm.fmuladd` carrier, whose contract permits either fused or separate
@@ -1724,6 +1967,54 @@ impl InstFlags {
     /// left intact — this bit enables ONLY that explicit, gated transform,
     /// never implicit DCE/reordering (mirrors `PURE_CALL_HOISTABLE`).
     pub const LIBM_PURE_CALL: Self = Self(0x2000);
+    /// Semantic provenance: this direct call is authorized to target one exact
+    /// validated module function, never a same-name host/JIT override. The
+    /// encoded instruction is unchanged; relocation/fixup resolution consumes
+    /// this bit and must resolve internally or fail closed.
+    pub const EXACT_MODULE_CALL: Self = Self(0x4000);
+    /// Semantic provenance (NOT an encoding property): this single-register
+    /// load/store is a register-allocation spill access — a spill store of an
+    /// allocated value into its dedicated spill slot, a reload from it, or the
+    /// emergency save/restore of a register an LL/SC pseudo borrows around
+    /// itself. Stamped where AArch64 spill code is materialized (GPR, H, S, D
+    /// and Q data registers; never a pair) and carried through frame-index
+    /// elimination and offset legalization, which rewrite operands in place.
+    /// Read by the final-stream frame dataflow net
+    /// (`trust_cg_verify::post_ra_spill_slots`), which requires every flagged
+    /// reload to read bytes written by flagged spill stores on every path; the
+    /// final-stream checks refuse a flagged access of any other shape by name.
+    /// A pass that rewrites the instruction into anything other than the same
+    /// spill access must clear it.
+    pub const SPILL_SLOT_ACCESS: Self = Self(0x8000);
+    /// Semantic provenance (NOT an encoding property): this call cannot unwind
+    /// whatever its target register holds, because its target is a platform
+    /// routine that never raises: the thunk of a Darwin thread-local variable's
+    /// TLV descriptor (`tlv_get_addr`), which AArch64 instruction selection
+    /// calls through `BLR` for every `#[thread_local]` access. Stamped by
+    /// AArch64 ISel on that `Blr` only, and copied with the instruction by
+    /// every pass that clones it. Read by the non-unwinding frame's call-site
+    /// region rule (`trust_cg_codegen::pipeline::aarch64_call_may_unwind`),
+    /// which treats such a call like a direct call to a `nounwind` callee,
+    /// and by pass validation's semantic effect key
+    /// (`trust_cg_opt::pass_validation::semantics::flags_key`,
+    /// OD-UNWIND-CALL-VALIDATION-20261010), which counts a call that gains or
+    /// loses it as a different instruction. A pass that rewrites the call
+    /// into anything other than the same call must clear it.
+    pub const CANNOT_UNWIND_CALL: Self = Self(0x1_0000);
+    /// Semantic provenance (NOT an encoding property): this direct `Bl` is
+    /// the C library routine its symbol names (`memcpy`, `memmove`,
+    /// `memset`), called by AArch64 instruction selection for the LIR
+    /// `Opcode::Memcpy`/`Memmove`/`Memset` it lowers, which trust-cg-lower
+    /// forms only from a C library routine, an LLVM memory intrinsic or a
+    /// trust-ir bulk-memory instruction. A source call of a function of the
+    /// same name (one the adapter lowered as an ordinary call, because its
+    /// declaration is not C's prototype) never carries it. Read by SROA's
+    /// memcpy-fill match (`trust_cg_opt::sroa`), which replaces the call by
+    /// the copy it performs and must not do so for a `bl memcpy` that is
+    /// only named so. Metadata like `LIBM_PURE_CALL`: a pass that rewrites
+    /// the call into anything else must clear it, and losing it only keeps
+    /// the call.
+    pub const LIBRARY_ROUTINE_CALL: Self = Self(0x2_0000);
 
     /// Returns true if all bits in `other` are set in `self`.
     #[inline]
@@ -1763,16 +2054,16 @@ impl InstFlags {
 
     /// Raw bits.
     #[inline]
-    pub const fn bits(self) -> u16 {
+    pub const fn bits(self) -> u32 {
         self.0
     }
 
     /// Create from raw bits (e.g., `InstFlags::from_bits(IS_CALL | IS_BRANCH)`).
     ///
-    /// Used by crates that construct InstFlags from u16 constants
+    /// Used by crates that construct InstFlags from integer constants
     /// (e.g., regalloc test helpers, pipeline adapters).
     #[inline]
-    pub const fn from_bits(bits: u16) -> Self {
+    pub const fn from_bits(bits: u32) -> Self {
         Self(bits)
     }
 
@@ -1837,6 +2128,12 @@ impl InstFlags {
     pub const fn fmuladd_may_unfuse(self) -> bool {
         self.contains(Self::FMULADD_MAY_UNFUSE)
     }
+
+    /// Whether this access is register-allocation spill traffic.
+    #[inline]
+    pub const fn is_spill_slot_access(self) -> bool {
+        self.contains(Self::SPILL_SLOT_ACCESS)
+    }
 }
 
 impl Default for InstFlags {
@@ -1886,6 +2183,9 @@ impl core::fmt::Debug for InstFlags {
             (Self::PURE_CALL_HOISTABLE, "PURE_CALL_HOISTABLE"),
             (Self::FMULADD_MAY_UNFUSE, "FMULADD_MAY_UNFUSE"),
             (Self::LIBM_PURE_CALL, "LIBM_PURE_CALL"),
+            (Self::SPILL_SLOT_ACCESS, "SPILL_SLOT_ACCESS"),
+            (Self::CANNOT_UNWIND_CALL, "CANNOT_UNWIND_CALL"),
+            (Self::LIBRARY_ROUTINE_CALL, "LIBRARY_ROUTINE_CALL"),
         ];
         write!(f, "InstFlags(")?;
         for (flag, name) in &flags {
@@ -2128,6 +2428,39 @@ pub struct SourceLoc {
 }
 
 // ---------------------------------------------------------------------------
+// Implicit register lists
+// ---------------------------------------------------------------------------
+
+/// The shared `'static` copy of an implicit def/use list built while compiling.
+///
+/// [`MachInst::implicit_defs`] and [`MachInst::implicit_uses`] are `'static`
+/// slices. A list computed per instruction (a call's argument and clobber
+/// registers, a return's result registers, the allocator's rebuilt lists) is
+/// stored once per distinct contents and shared by every instruction that
+/// carries it, so compiling the same shapes again allocates nothing and no
+/// list is orphaned when its function is dropped. The table holds at most one
+/// copy of each distinct list of physical registers the compiler builds.
+pub fn intern_pregs(pregs: &[PReg]) -> &'static [PReg] {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock, PoisonError};
+
+    static LISTS: OnceLock<Mutex<HashSet<&'static [PReg]>>> = OnceLock::new();
+    if pregs.is_empty() {
+        return &[];
+    }
+    let mut lists = LISTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(&stored) = lists.get(pregs) {
+        return stored;
+    }
+    let stored: &'static [PReg] = Box::leak(pregs.to_vec().into_boxed_slice());
+    lists.insert(stored);
+    stored
+}
+
+// ---------------------------------------------------------------------------
 // MachInst
 // ---------------------------------------------------------------------------
 
@@ -2309,6 +2642,40 @@ mod tests {
     }
 
     #[test]
+    fn tlsdesc_opcodes_are_calls_or_value_forms() {
+        for opcode in [AArch64Opcode::TlsDescCall, AArch64Opcode::BlrTlsdesc] {
+            assert!(!opcode.produces_value(), "{opcode:?}");
+            assert!(!opcode.is_pseudo(), "{opcode:?} must never be skipped");
+            let flags = opcode.default_flags();
+            assert!(flags.contains(InstFlags::IS_CALL), "{opcode:?}");
+            assert!(flags.contains(InstFlags::HAS_SIDE_EFFECTS), "{opcode:?}");
+        }
+        assert!(AArch64Opcode::LdrTlsdesc.produces_value());
+        assert!(
+            AArch64Opcode::LdrTlsdesc
+                .default_flags()
+                .contains(InstFlags::READS_MEMORY)
+        );
+        assert!(AArch64Opcode::AddTlsdescLo12.produces_value());
+        assert!(!AArch64Opcode::AddTlsdescLo12.is_pseudo());
+    }
+
+    #[test]
+    fn exclusive_store_defines_status_without_losing_memory_effects() {
+        assert!(AArch64Opcode::Stlxr.produces_value());
+        let flags = AArch64Opcode::Stlxr.default_flags();
+        assert!(flags.contains(InstFlags::WRITES_MEMORY));
+        assert!(flags.contains(InstFlags::HAS_SIDE_EFFECTS));
+        for opcode in [
+            AArch64Opcode::Stlr,
+            AArch64Opcode::Stlrb,
+            AArch64Opcode::Stlrh,
+        ] {
+            assert!(!opcode.produces_value(), "{opcode:?} has no status result");
+        }
+    }
+
+    #[test]
     fn volatile_opcodes_are_appended_after_the_preexisting_surface() {
         assert_eq!(
             AArch64Opcode::VolatileLdrRI as usize,
@@ -2472,6 +2839,59 @@ mod tests {
                 flags.contains(InstFlags::IS_PSEUDO),
                 "{:?} should have IS_PSEUDO",
                 op
+            );
+        }
+    }
+
+    /// The trap pseudos PARTITION into the ones that fall through and the ones
+    /// that do not, and a new pseudo must be placed in exactly one half.
+    /// `is_falls_through_trap_pseudo` must be a strict subset of
+    /// `is_trap_pseudo`, and the complement must be exactly the five bare
+    /// spellings the encoder emits as an unconditional `BRK #1`.
+    #[test]
+    fn falls_through_trap_pseudos_partition_the_trap_pseudos() {
+        use AArch64Opcode::*;
+        let all = [
+            TrapOverflow,
+            TrapOverflowExact,
+            TrapBoundsCheck,
+            TrapBoundsCheckExact,
+            TrapNull,
+            TrapNullIfZero,
+            TrapDivZero,
+            TrapDivZeroIfZero,
+            TrapShiftRange,
+            TrapShiftRangeIfOOB,
+        ];
+        for op in all {
+            assert!(op.is_trap_pseudo(), "{op:?} must be a trap pseudo");
+            if op.is_falls_through_trap_pseudo() {
+                assert!(
+                    matches!(
+                        op,
+                        TrapBoundsCheckExact
+                            | TrapNullIfZero
+                            | TrapDivZeroIfZero
+                            | TrapShiftRangeIfOOB
+                            | TrapOverflowExact
+                    ),
+                    "{op:?} claims to fall through but is not one of the conditional carriers"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        op,
+                        TrapOverflow | TrapBoundsCheck | TrapNull | TrapDivZero | TrapShiftRange
+                    ),
+                    "{op:?} claims NOT to fall through but is not one of the bare BRK carriers"
+                );
+            }
+        }
+        // Nothing outside the trap family may answer yes.
+        for op in [B, Br, Ret, Brk, Bl, AddRR, Cbz] {
+            assert!(
+                !op.is_falls_through_trap_pseudo(),
+                "{op:?} is not a trap pseudo at all"
             );
         }
     }
@@ -2766,6 +3186,22 @@ mod tests {
         let inst = MachInst::new(AArch64Opcode::Bl, vec![]).with_implicit_defs(DEFS);
         assert_eq!(inst.implicit_defs, DEFS);
         assert!(inst.implicit_uses.is_empty());
+    }
+
+    #[test]
+    fn interned_implicit_lists_are_shared_by_contents() {
+        let first = intern_pregs(&[X0, X1]);
+        let owned: Vec<PReg> = [X0, X1].to_vec();
+        let again = intern_pregs(&owned);
+        assert_eq!(first, &[X0, X1]);
+        assert!(
+            std::ptr::eq(first, again),
+            "equal lists share one allocation"
+        );
+        let other = intern_pregs(&[X1, X0]);
+        assert_eq!(other, &[X1, X0]);
+        assert!(!std::ptr::eq(first, other), "order is part of the contents");
+        assert!(intern_pregs(&[]).is_empty());
     }
 
     #[test]

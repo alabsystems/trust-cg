@@ -483,7 +483,9 @@ mod tests {
 
     fn row(reducer_family: &str, case_name: &str) -> TyReducerEvidenceRow {
         TyReducerEvidenceRow {
-            command: "cargo test -p trust-cg-codegen --test ty_reducer_evidence_packet".to_owned(),
+            command:
+                "scripts/trust_cargo.sh test -p trust-cg-codegen --test ty_reducer_evidence_packet"
+                    .to_owned(),
             target_tuple: "aarch64-apple-darwin".to_owned(),
             trust_cg_revision: "trust-cg-test-revision".to_owned(),
             opt_level: "O1/O3".to_owned(),

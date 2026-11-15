@@ -1,0 +1,10 @@
+; TrustIr text format v1
+module "inst_dialect"
+
+functy.0 = (i32) -> (i32)
+
+fn @dialect_roundtrip(functy.0) {
+bb0(%0: i32):
+    %1 = dialect_op verif.bfs_step(%0) -> i32 [i64_attr=i64:-7] [u64_attr=u64:42] [f64_attr=f64:3.5] [bool_attr=bool:true] [str_attr=str:"hello"] [bytes_attr=bytes:4:deadbeef] [ty_attr=ty:i32]
+    ret %1
+}

@@ -17,15 +17,15 @@
 //!     u32 domain: surrogates answer 1 (they are not `char`s; island spec
 //!     decision), `cp > 0x10FFFF` answers 1.
 //!
-//! The generator consumes a JSON dump of the tables (produced from the aterm
-//! checkout by the site's build lane; the exporter reads the crates' PUBLIC
-//! statics) and authors both spellings from that one input: the trust-ir
+//! The generator consumes a JSON dump of the tables (`scripts/export_vt_tables.py`
+//! compiles the committed aterm table sources and reads their public APIs)
+//! and authors both spellings from that one input: the trust-ir
 //! functions as balanced compare TREES (pure code, no tables in memory), and
 //! a rustc/LLVM twin that embeds the tables and INDEXES them — deliberately
 //! different algorithms for the same spec, so the shipped differential
 //! compares two compilers *and* two computation strategies.
 //!
-//!     cargo run --example wasm_vt_islands -- <tables.json> <outdir>
+//!     scripts/trust_cargo.sh run --example wasm_vt_islands -- <tables.json> <outdir>
 //!
 //! That dump is COMMON-MODE input: it feeds the island, the twin AND the
 //! expectations, so a table nobody authored would be believed unanimously and
@@ -428,6 +428,9 @@ fn build_vt_step_table(mb: &mut ModuleBuilder, vt: &[Vec<(u32, u32)>]) -> trust_
     let image_len = image.len() as u64;
     let u8_ty = mb.add_type(Ty::U8);
     mb.add_global(Global {
+        section: None,
+        visibility: trust_ir::Visibility::Default,
+        retained: false,
         name: "VT_TABLE".to_string(),
         ty: Ty::Array(u8_ty, image_len),
         mutable: false,
@@ -647,7 +650,9 @@ fn main() {
     let vt_fid = build_vt_step(&mut mb, &vt);
     let vt_tbl_fid = build_vt_step_table(&mut mb, &vt);
     let wc_fid = build_wcwidth(&mut mb, &runs);
-    let mut module = mb.build();
+    let mut module = mb
+        .build()
+        .expect("ModuleBuilder::build: the example module");
     assert_eq!(
         module.globals.len(),
         1,
@@ -657,7 +662,7 @@ fn main() {
     let interp = Interpreter::with_module(&module).with_options(InterpretOptions {
         fuel: 1_000_000_000,
         max_call_depth: 16,
-        mem_budget: 16 * 1024 * 1024,
+        panic_strategy: trust_ir::interpret::PanicStrategy::Abort,
     });
     let run1 = |fid, x: u32| -> u32 {
         let args = vec![InterpretValue::int(Ty::I32, x as i32 as i128).unwrap()];
@@ -803,7 +808,12 @@ fn main() {
     // fail-closes the other way (reference execution wants the canonical
     // 64-bit layout), so the wasm32 pin is stamped after interpretation.
     module.target_info = Some(wasm::wasm32_target_info());
-    let bytes = wasm::compile_module(&module).expect("compile_module");
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .expect("compile_module");
     let _ = wc_fid;
     std::fs::File::create(format!("{out}/vt_islands.wasm"))
         .unwrap()
@@ -824,4 +834,13 @@ fn main() {
         runs.len(),
         vt.len()
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

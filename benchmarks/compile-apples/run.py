@@ -12,7 +12,7 @@ is the right policy for a headline number, but it leaves the lane we actually
 optimise against untracked.
 
 The target this measures is narrow and specific: with verification turned OFF
-on both sides -- rustc's LLVM backend at `-C opt-level=N` versus trust-cg at the
+on both sides -- trustc's LLVM backend at `-C opt-level=N` versus trust-cg at the
 same `-C opt-level=N` -- trust-cg should be strictly faster to compile on EVERY
 program, not merely at parity in the geomean. Once that holds, verification cost
 gets added back on top of a lane that is already ahead.
@@ -26,8 +26,20 @@ MEASUREMENT DISCIPLINE
   and is not the thing users pay for.
 * **Median, not mean.** One descheduled run should not move the number.
 * **Load gate.** A loaded machine produces numbers that are not evidence.
+
+DRIVER
+------
+The bridge pins channel = "trust", so both arms use the Trust compiler that pin
+names (the backend cannot load into a stock compiler). scripts/trust_toolchain.py
+resolves the PATH trustc/targo package, or the package trustc named by --driver,
+and refuses the retired stock nightly-2026-04-20 and any unidentified compiler
+(exit 2). Both arms compile in Trust's explicit unverified frontend lane
+(-Ztrust-verify=off), the vanilla frontend this comparison always measured; that
+lane is diagnostic and makes no Trust-verified compilation claim. The results
+JSON records the exact driver identity.
 """
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -41,19 +53,31 @@ import time
 REPO = pathlib.Path(__file__).resolve().parents[2]
 PROGS = REPO / "benchmarks" / "beat-llvm" / "progs"
 DYLIB_REL = "crates/rustc-codegen-trust-cg/target/release/librustc_codegen_trust_cg.so"
-PROOFS_OFF = {"TCG_NO_PROOF_CERTS": "1", "TCG_REFINE_SOLVER": "0"}
+# Proof certificates and the refinement solver are switched off through the
+# backend's TRACKED knob option; trustc refuses the former TCG_NO_PROOF_CERTS /
+# TCG_REFINE_SOLVER environment variables as untracked codegen controls.
+PROOFS_OFF_FLAGS = ["-Ztrust-ir-cg-args=no-proof-certs", "-Ztrust-ir-cg-args=refine-solver=0"]
 BASE = [
     "--edition=2021", "--crate-type", "bin", "-Cpanic=abort",
     "-Coverflow-checks=off", "-Ccodegen-units=1", "-Cdefault-linker-libraries=y",
 ]
 
 
-def rustc_path() -> str:
-    out = subprocess.run(
-        ["rustup", "which", "--toolchain", "nightly-2026-04-20", "rustc"],
-        capture_output=True, text=True,
-    )
-    return out.stdout.strip() if out.returncode == 0 else "rustc"
+_TRUST_SPEC = importlib.util.spec_from_file_location(
+    "trust_cg_trust_toolchain", REPO / "scripts" / "trust_toolchain.py")
+TRUST_TOOLCHAIN = importlib.util.module_from_spec(_TRUST_SPEC)
+_TRUST_SPEC.loader.exec_module(TRUST_TOOLCHAIN)
+# Explicit unverified frontend lane for both arms (see DRIVER above).
+LANE_FLAGS = list(TRUST_TOOLCHAIN.UNVERIFIED_COMPILER_FLAGS)
+
+
+def resolve_driver(explicit=None):
+    """The pinned Trust compiler record, or None after reporting why it is unusable."""
+    try:
+        return TRUST_TOOLCHAIN.resolve(explicit)
+    except TRUST_TOOLCHAIN.ToolchainError as error:
+        print(f"compile-apples: FATAL: cannot resolve the pinned Trust compiler: {error}")
+        return None
 
 
 def compile_once(rustc, src, out, opt, dylib=None):
@@ -66,11 +90,11 @@ def compile_once(rustc, src, out, opt, dylib=None):
     (user+sys) is not perturbed by descheduling, so it separates "our compiler
     did more work" from "the machine was busy".
     """
-    cmd = [rustc, *BASE, f"-Copt-level={opt}", "-o", str(out), str(src)]
+    cmd = [rustc, *LANE_FLAGS, *BASE, f"-Copt-level={opt}", "-o", str(out), str(src)]
     env = dict(os.environ)
     if dylib:
         cmd.insert(1, f"-Zcodegen-backend={dylib}")
-        env.update(PROOFS_OFF)
+        cmd[2:2] = PROOFS_OFF_FLAGS
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     t0 = time.perf_counter()
     r = subprocess.run(cmd, capture_output=True, env=env)
@@ -85,6 +109,8 @@ def main() -> int:
     ap.add_argument("--opt", default="2", help="-C opt-level for BOTH arms")
     ap.add_argument("-n", type=int, default=5, help="repetitions (median-of-N)")
     ap.add_argument("--dylib", default=None)
+    ap.add_argument("--driver", default=None,
+                    help="explicit Trust package trustc (default: the PATH trustc/targo package)")
     ap.add_argument("--progs", nargs="*", default=None)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--allow-loaded", action="store_true")
@@ -110,7 +136,11 @@ def main() -> int:
               f"Rebuild before measuring.")
         return 2
 
-    rustc = rustc_path()
+    driver = resolve_driver(args.driver)
+    if driver is None:
+        return 2
+    rustc = driver["compiler"]
+    print(f"compile-apples: driver {TRUST_TOOLCHAIN.summary(driver)}")
     out_dir = pathlib.Path(args.out_dir) if args.out_dir else REPO / "benchmarks" / "compile-apples" / "results"
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -180,7 +210,10 @@ def main() -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    payload = {"opt": args.opt, "n": args.n, "geomean": geo, "load1": load1, "rows": rows}
+    payload = {"opt": args.opt, "n": args.n, "geomean": geo, "load1": load1, "rows": rows,
+               "driver": {key: driver[key] for key in (
+                   "compiler", "sysroot", "commit", "version", "lane", "lane_label",
+                   "compiler_flags", "selection")}}
     (out_dir / f"compile-apples-{stamp}.json").write_text(json.dumps(payload, indent=2))
     print(f"\nresults: {out_dir}/compile-apples-{stamp}.json")
     return 0

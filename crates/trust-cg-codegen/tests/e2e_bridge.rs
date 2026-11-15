@@ -236,8 +236,14 @@ fn build_bridge_add() -> Function {
         debug_meta: Default::default(),
         debug_value_bindings: Vec::new(),
         stack_protector: Default::default(),
+        stack_limit: None,
         param_pointee_types: Vec::new(),
+        abi_sret_param: None,
+        sret_arg_callees: HashSet::new(),
+        sret_arg_indirect_callees: HashSet::new(),
         eh_info: Default::default(),
+        eh_type_table: trust_cg_lower::function::EhTypeTable::new(),
+        target_features: Vec::new(),
     }
 }
 
@@ -288,8 +294,14 @@ fn build_bridge_const42() -> Function {
         debug_meta: Default::default(),
         debug_value_bindings: Vec::new(),
         stack_protector: Default::default(),
+        stack_limit: None,
         param_pointee_types: Vec::new(),
+        abi_sret_param: None,
+        sret_arg_callees: HashSet::new(),
+        sret_arg_indirect_callees: HashSet::new(),
         eh_info: Default::default(),
+        eh_type_table: trust_cg_lower::function::EhTypeTable::new(),
+        target_features: Vec::new(),
     }
 }
 
@@ -371,8 +383,14 @@ fn build_bridge_midpoint() -> Function {
         debug_meta: Default::default(),
         debug_value_bindings: Vec::new(),
         stack_protector: Default::default(),
+        stack_limit: None,
         param_pointee_types: Vec::new(),
+        abi_sret_param: None,
+        sret_arg_callees: HashSet::new(),
+        sret_arg_indirect_callees: HashSet::new(),
         eh_info: Default::default(),
+        eh_type_table: trust_cg_lower::function::EhTypeTable::new(),
+        target_features: Vec::new(),
     }
 }
 
@@ -481,8 +499,14 @@ fn build_bridge_pick() -> Function {
         debug_meta: Default::default(),
         debug_value_bindings: Vec::new(),
         stack_protector: Default::default(),
+        stack_limit: None,
         param_pointee_types: Vec::new(),
+        abi_sret_param: None,
+        sret_arg_callees: HashSet::new(),
+        sret_arg_indirect_callees: HashSet::new(),
         eh_info: Default::default(),
+        eh_type_table: trust_cg_lower::function::EhTypeTable::new(),
+        target_features: Vec::new(),
     }
 }
 

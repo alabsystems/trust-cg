@@ -1,0 +1,83 @@
+{
+  "ledger": "L04-P3",
+  "revision": "82e983a09047f0187563593517daa57cc08884d3",
+  "reproduces": "the first recorded run, at 99b754813f6f3531d78f177f3a6918a4c426d4af on 2026-10-08 (before origin/main 1359b3bca was merged), on the same host and toolchain: every per-form and per-case count is identical (1,274 s and 389 s wall on 10 threads at load average 10-34)",
+  "tree": "clean (git status --porcelain empty before the build)",
+  "host": {
+    "cpu": "Apple M4 Max",
+    "model": "Mac16,5",
+    "logical_cpus": 16,
+    "os": "macOS 26.6.2 (25G83)"
+  },
+  "toolchain": "targo 1.99.0-dev (321aaeda7 2026-09-17), --unverified lane (no proof claim about the build)",
+  "profile": "release",
+  "fpcr": "0 (round to nearest even, FZ = FZ16 = DN = AH = 0), asserted by every worker thread",
+  "environment": {
+    "TRUST_CG_FP_IEEE_EXHAUSTIVE": "1",
+    "TRUST_CG_FP_IEEE_THREADS": "10"
+  },
+  "strength": "testing evidence on one CPU; exhaustive over the sets whose strength says so, statistical otherwise; not a proof and not coverage-gate credit",
+  "runs": [
+    {
+      "target": "trust-cg-verify tests/aarch64_fp_ieee_differential.rs",
+      "record": "differential.jsonl",
+      "command": "TRUST_CG_FP_IEEE_EXHAUSTIVE=1 TRUST_CG_FP_IEEE_THREADS=10 TRUST_CG_FP_IEEE_RECORD=<path> scripts/trust_cargo.sh test --release --locked -p trust-cg-verify --test aarch64_fp_ieee_differential -- --test-threads=1",
+      "started_utc": "2026-10-12T23:52:35Z",
+      "finished_utc": "2026-10-13T00:24:03Z",
+      "wall_seconds": 1887.7,
+      "user_cpu_seconds": 12008.5,
+      "max_rss_bytes": 97959936,
+      "load_average_start": [
+        18.36,
+        13.92,
+        15.39
+      ],
+      "load_average_end": [
+        68.82,
+        61.75,
+        51.26
+      ],
+      "tests": "10 passed",
+      "forms": 87,
+      "comparisons": 130677880598,
+      "exhaustive_comparisons": 128850067456,
+      "cpu_reference_mismatches": 0,
+      "model_verdicts": {
+        "exact": 112968929608,
+        "nan-class": 28327842,
+        "boundary:signaling-min/max": 259877518,
+        "boundary:signed-zero-min/max": 6
+      }
+    },
+    {
+      "target": "trust-cg-codegen tests/e2e_aarch64_fp_ieee_lowering.rs",
+      "record": "lowering.jsonl",
+      "command": "TRUST_CG_FP_IEEE_EXHAUSTIVE=1 TRUST_CG_FP_IEEE_THREADS=10 TRUST_CG_FP_IEEE_RECORD=<path> scripts/trust_cargo.sh test --release --locked -p trust-cg-codegen --test e2e_aarch64_fp_ieee_lowering -- --test-threads=1",
+      "started_utc": "2026-10-13T00:24:03Z",
+      "finished_utc": "2026-10-13T00:36:56Z",
+      "wall_seconds": 773.6,
+      "user_cpu_seconds": 3270.0,
+      "max_rss_bytes": 95993856,
+      "load_average_start": [
+        68.82,
+        61.75,
+        51.26
+      ],
+      "load_average_end": [
+        48.93,
+        45.64,
+        48.02
+      ],
+      "tests": "5 passed",
+      "cases": 121,
+      "route_coverage": "AOT O2 proof-grade and JIT O1 run every input of every set; AOT O0, O1 and O3 proof-grade and JIT O2 run every input of the binary16 and 8/16-bit integer sets and the first 50,000 inputs of every other set",
+      "calls": 330388523524,
+      "verdicts": {
+        "Exact": 294617067704,
+        "Undefined": 29040213010,
+        "NanArmBits": 6731242746,
+        "EitherZero": 64
+      }
+    }
+  ]
+}

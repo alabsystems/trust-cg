@@ -19,7 +19,7 @@
 //! out of `exit_block`. Loops carry `K+1` (live + a data-independent trip
 //! counter) so termination is guaranteed regardless of the random body.
 //!
-//!   cargo run -p trust-cg-codegen --example wasm_cfg_fuzz -- /tmp/fuzz [N] [seed]
+//!   scripts/trust_cargo.sh run -p trust-cg-codegen --example wasm_cfg_fuzz -- /tmp/fuzz [N] [seed]
 //!   node crates/trust-cg-codegen/examples/wasm_difftest.mjs /tmp/fuzz.wasm /tmp/fuzz.json
 
 use std::io::Write;
@@ -235,7 +235,7 @@ impl<'a, 'b> Gen<'a, 'b> {
 
 /// Build a module of `n` random reducible CFGs for `seed` (shared by `main` and
 /// the regression test).
-fn build_fuzz_module(seed: u64, n: usize) -> trust_ir::Module {
+pub(crate) fn build_fuzz_module(seed: u64, n: usize) -> trust_ir::Module {
     let mut mb = ModuleBuilder::new("cfg_fuzz");
     let ft = mb.add_func_type(vec![Ty::I32; K], vec![Ty::I32]);
     for idx in 0..n {
@@ -255,6 +255,7 @@ fn build_fuzz_module(seed: u64, n: usize) -> trust_ir::Module {
         fb.build();
     }
     mb.build()
+        .expect("ModuleBuilder::build: the example module")
 }
 
 /// Pin `module` to the wasm32 lane. Stamped AFTER any interpreter reference
@@ -263,24 +264,6 @@ fn build_fuzz_module(seed: u64, n: usize) -> trust_ir::Module {
 /// the canonical 64-bit layout).
 fn stamp_wasm32(module: &mut trust_ir::Module) {
     module.target_info = Some(wasm::wasm32_target_info());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    /// The relooper must compile every CFG the generator produces (the generator
-    /// only emits reducible structured regions). A failure here is either a
-    /// relooper bug or a generator bug — both worth catching. CI-runnable via
-    /// `cargo test --example wasm_cfg_fuzz`.
-    #[test]
-    fn relooper_compiles_random_reducible_cfgs() {
-        for seed in 0..64u64 {
-            let mut module = build_fuzz_module(seed.wrapping_mul(0x100000001B3) ^ 0xABCD, 20);
-            stamp_wasm32(&mut module);
-            wasm::compile_module(&module)
-                .unwrap_or_else(|e| panic!("seed {seed}: compile_module failed: {e}"));
-        }
-    }
 }
 
 fn main() {
@@ -303,7 +286,7 @@ fn main() {
     let interp = Interpreter::with_module(&module).with_options(InterpretOptions {
         fuel: 50_000_000,
         max_call_depth: 256,
-        mem_budget: 256 * 1024 * 1024,
+        panic_strategy: trust_ir::interpret::PanicStrategy::Abort,
     });
 
     // Inputs are derived from the same base seed, independent of generation.
@@ -346,8 +329,12 @@ fn main() {
     json.push_str("]}");
     stamp_wasm32(&mut module);
 
-    let bytes = wasm::compile_module(&module)
-        .unwrap_or_else(|e| panic!("compile_module failed (relooper bug?): {e}"));
+    let bytes = wasm::compile_module_with_policy_and_license(
+        &module,
+        &trust_cg_codegen::wasm::WasmModulePolicy::closed(),
+        &permit_unlicensed(),
+    )
+    .unwrap_or_else(|e| panic!("compile_module failed (relooper bug?): {e}"));
     std::fs::File::create(format!("{out}.wasm"))
         .unwrap()
         .write_all(&bytes)
@@ -361,4 +348,31 @@ fn main() {
          interpreter-checked inputs, seed {base_seed:#x})",
         bytes.len()
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// The relooper must compile every CFG the generator produces (the generator
+    /// only emits reducible structured regions). A failure here is either a
+    /// relooper bug or a generator bug — both worth catching. CI-runnable via
+    /// `scripts/trust_cargo.sh test --example wasm_cfg_fuzz`.
+    #[test]
+    fn relooper_compiles_random_reducible_cfgs() {
+        for seed in 0..64u64 {
+            let mut module = build_fuzz_module(seed.wrapping_mul(0x100000001B3) ^ 0xABCD, 20);
+            stamp_wasm32(&mut module);
+            wasm::compile_module_with_license(&module, &permit_unlicensed())
+                .unwrap_or_else(|e| panic!("seed {seed}: compile_module failed: {e}"));
+        }
+    }
 }

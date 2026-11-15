@@ -90,7 +90,7 @@ def main():
 
     on_o = os.path.join(wd,"on.o"); off_o = os.path.join(wd,"off.o"); cl_o = os.path.join(wd,"cl.o")
     env = dict(os.environ); env["TRUST_CG_DUMP_NEONARRAY"]="1"
-    r = subprocess.run([tcg,"--format=text","--target","aarch64","-O2","-c",tir,"-o",on_o],
+    r = subprocess.run([tcg,"--format=text","--permit-unlicensed","--target","aarch64","-O2","-c",tir,"-o",on_o],
                        capture_output=True,text=True,env=env)
     if r.returncode != 0:
         print("COMPILE_ON failed:\n", r.stderr); sys.exit(2)
@@ -102,7 +102,7 @@ def main():
     has_udot = "udot" in dis
 
     envoff = dict(os.environ); envoff["TRUST_CG_DISABLE_PASSES"]="neon_array"
-    if subprocess.run([tcg,"--format=text","--target","aarch64","-O2","-c",tir,"-o",off_o],
+    if subprocess.run([tcg,"--format=text","--permit-unlicensed","--target","aarch64","-O2","-c",tir,"-o",off_o],
                       capture_output=True,text=True,env=envoff).returncode != 0:
         print("COMPILE_OFF failed"); sys.exit(2)
     if subprocess.run(["cc","-O2","-c",cref,"-o",cl_o],capture_output=True).returncode != 0:

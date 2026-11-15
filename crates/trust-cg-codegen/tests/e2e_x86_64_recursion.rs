@@ -76,8 +76,19 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         enable_fsym_trust_ir_preflight: false,
         enable_jit_fast_regalloc: false,
         jit_validation_mode_override: None,
+        jit_external_symbol_resolution:
+            trust_cg_codegen::JitExternalSymbolResolutionPolicy::ExplicitThenProcess,
         panic_unwind: false,
-    });
+        relocation_model: trust_cg_codegen::RelocationModel::Static,
+        function_sections: false,
+        aarch64_isa_profile: None,
+        aarch64_force_frame_pointers: false,
+        never_inline: Default::default(),
+        eh_frames_cannot_unwind: false,
+        eh_nounwind_callees: Default::default(),
+        link_unit_definitions: Default::default(),
+    })
+    .with_codegen_license(permit_unlicensed());
     let result = compiler
         .compile(module)
         .expect("x86-64 trust-cg compilation should succeed");
@@ -259,11 +270,14 @@ fn triple_oracle(
 /// across many frames (a call with two formal args plus a nested-call return).
 fn build_ackermann_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("ackermann_test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64, Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let me = FuncId::new(0);
     let mut func = TrustIrFunction::new(me, "_ackermann", ft, BlockId::new(0));
     func.blocks = vec![
@@ -414,7 +428,9 @@ fn build_ackermann_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -426,11 +442,14 @@ fn build_ackermann_module() -> TrustIrModule {
 ///              = is_even(n-1) otherwise
 fn build_even_odd_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("even_odd_test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let even_id = FuncId::new(0);
     let odd_id = FuncId::new(1);
 
@@ -510,8 +529,12 @@ fn build_even_odd_module() -> TrustIrModule {
         f
     };
 
-    module.add_function(build(even_id, "_is_even", 1, odd_id));
-    module.add_function(build(odd_id, "_is_odd", 0, even_id));
+    module
+        .try_add_function(build(even_id, "_is_even", 1, odd_id))
+        .expect("Module::try_add_function: test fixture");
+    module
+        .try_add_function(build(odd_id, "_is_odd", 0, even_id))
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -521,11 +544,14 @@ fn build_even_odd_module() -> TrustIrModule {
 ///          = fib(n-1) + fib(n-2)
 fn build_fib_rec_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("fib_rec_test");
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::I64],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let me = FuncId::new(0);
     let mut func = TrustIrFunction::new(me, "_fib_rec", ft, BlockId::new(0));
     func.blocks = vec![
@@ -620,7 +646,9 @@ fn build_fib_rec_module() -> TrustIrModule {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -800,4 +828,13 @@ int main(void) {
     ];
     let r = triple_oracle("fib_rec", &module, "_fib_rec", c_source, &cases);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

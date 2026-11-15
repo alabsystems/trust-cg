@@ -59,16 +59,21 @@ fn add_variadic_extern(
     fixed_params: Vec<Ty>,
     returns: Vec<Ty>,
 ) -> FuncId {
-    let ft_id = module.add_func_type(FuncTy {
-        params: fixed_params,
-        returns,
-        is_vararg: true,
-    });
+    let ft_id = module
+        .add_func_type(FuncTy {
+            params: fixed_params,
+            returns,
+            abi: None,
+            is_vararg: true,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut decl = TrustIrFunction::new(FuncId::new(id), name, ft_id, BlockId::new(0));
     decl.blocks = vec![]; // bodyless declaration
     decl.linkage = Linkage::External;
     let fid = decl.id;
-    module.add_function(decl);
+    module
+        .try_add_function(decl)
+        .expect("Module::try_add_function: test fixture");
     fid
 }
 
@@ -85,11 +90,14 @@ fn build_call_vsum_module(func_name: &str, vals: &[i64]) -> TrustIrModule {
     let vsum = add_variadic_extern(&mut module, 1, "vsum", vec![Ty::I32], vec![Ty::I64]);
 
     // long _call_vsum_N(void) { return vsum(N, vals[0], vals[1], ...); }
-    let caller_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let caller_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(FuncId::new(0), func_name, caller_ty, BlockId::new(0));
 
     let mut body = Vec::new();
@@ -141,7 +149,9 @@ fn build_call_vsum_module(func_name: &str, vals: &[i64]) -> TrustIrModule {
         params: vec![],
         body,
     }];
-    module.add_function(caller);
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -156,11 +166,14 @@ fn build_call_vmix_module(func_name: &str, vals: &[f64]) -> TrustIrModule {
     // extern double vmix(int n, ...);
     let vmix = add_variadic_extern(&mut module, 1, "vmix", vec![Ty::I32], vec![Ty::F64]);
 
-    let caller_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::F64],
-        is_vararg: false,
-    });
+    let caller_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::F64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(FuncId::new(0), func_name, caller_ty, BlockId::new(0));
 
     let mut body = Vec::new();
@@ -210,7 +223,9 @@ fn build_call_vmix_module(func_name: &str, vals: &[f64]) -> TrustIrModule {
         params: vec![],
         body,
     }];
-    module.add_function(caller);
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -227,11 +242,14 @@ fn build_call_vmix2_module(func_name: &str) -> TrustIrModule {
     // extern double vmix2(int n, ...);
     let vmix2 = add_variadic_extern(&mut module, 1, "vmix2", vec![Ty::I32], vec![Ty::F64]);
 
-    let caller_ty = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let caller_ty = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(FuncId::new(0), func_name, caller_ty, BlockId::new(0));
 
     let v = |i: u32| ValueId::new(i);
@@ -288,7 +306,9 @@ fn build_call_vmix2_module(func_name: &str) -> TrustIrModule {
         params: vec![],
         body,
     }];
-    module.add_function(caller);
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -316,11 +336,14 @@ fn build_call_snprintf_module(func_name: &str) -> TrustIrModule {
         vec![Ty::I32],
     );
 
-    let caller_ty = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let caller_ty = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut caller = TrustIrFunction::new(FuncId::new(0), func_name, caller_ty, BlockId::new(0));
 
     let v = |i: u32| ValueId::new(i);
@@ -372,7 +395,9 @@ fn build_call_snprintf_module(func_name: &str) -> TrustIrModule {
         params: vec![(v(0), Ty::Ptr), (v(1), Ty::Ptr)],
         body,
     }];
-    module.add_function(caller);
+    module
+        .try_add_function(caller)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 

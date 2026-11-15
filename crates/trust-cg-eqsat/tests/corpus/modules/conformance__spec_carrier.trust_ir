@@ -1,0 +1,29 @@
+; TrustIr text format v1
+module "spec_carrier"
+
+functy.0 = (i32) -> (i32)
+
+fn @identity(functy.0) {
+bb0(%0: i32):
+    ret %0
+}
+
+obligation 0 liveness pending "eventually the ring is full" formula "smtlib2" "(= seq 7)" smtlib "(= seq 7)" sort "Bool" bind "seq" int spec_var(0) spec "ring" "EventuallyFull"
+
+spec_module "ring" {
+  origin embedded
+  enforcement design-only
+  var "seq" : "0..7" sort int
+  var "empty" : "Bool" sort bool
+  action "Push"
+  action "Pop"
+  invariant "BoundedSeq" : "(<= seq 7)" typed formula "smtlib2" "(<= seq 7)" smtlib "(<= seq 7)" sort "Bool" bind "seq" int spec_var(0)
+  invariant "Untyped" : "(>= seq 0)"
+  proof machine "ring" action "Push" name "ring_push_refines" kind "clean-theorem" theorem "Ring.push_refines"
+  proof machine "ring" action "Pop" name "ring_pop_refines" kind "kani"
+  temporal "AlwaysBounded" always formula "smtlib2" "(<= seq 7)" smtlib "(<= seq 7)" sort "Bool" bind "seq" int spec_var(0)
+  temporal "EventuallyFull" eventually formula "smtlib2" "(= seq 7)" smtlib "(= seq 7)" sort "Bool" bind "seq" int spec_var(0)
+  temporal "NonEmptyLeadsToFull" leads_to formula "smtlib2" "(not empty)" smtlib "(not empty)" sort "Bool" bind "empty" bool spec_var(1) formula "smtlib2" "(= seq 7)" smtlib "(= seq 7)" sort "Bool" bind "seq" int spec_var(0)
+  temporal "PushFair" weak_fair "Push" formula "smtlib2" "(= seq_next (+ seq 1))" smtlib "(= seq_next (+ seq 1))" sort "Bool" bind "seq" int spec_var(0) bind "seq_next" int spec_var_next(0)
+  temporal "PopFair" strong_fair "Pop"
+}

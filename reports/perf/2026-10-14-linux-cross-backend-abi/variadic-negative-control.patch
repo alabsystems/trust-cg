@@ -1,0 +1,13 @@
+diff --git a/crates/rustc-codegen-trust-cg/src/variadic.rs b/crates/rustc-codegen-trust-cg/src/variadic.rs
+--- a/crates/rustc-codegen-trust-cg/src/variadic.rs
++++ b/crates/rustc-codegen-trust-cg/src/variadic.rs
+@@ -143,7 +143,8 @@ pub(super) fn call<'tcx>(
+     let (mut declared, mut arg_starts) = (fixed.params, fixed.arg_starts);
+     for (offset, ty) in types.iter().copied().enumerate() {
+         arg_starts.push((inputs.len() + offset, declared.len()));
+-        declared.push(rust_ty_to_trust_ir_ty(ctx.tcx, ty)?);
++        // NEGATIVE CONTROL (never committed): every anonymous argument an f64.
++        declared.push({ let _ = rust_ty_to_trust_ir_ty(ctx.tcx, ty)?; TrustIrTy::F64 });
+     }
+     ctx.check_signature_placement(call_source, &declared, fixed.sret, &arg_starts)?;
+     let (mut values, mut reloads) =

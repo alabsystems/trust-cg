@@ -4,7 +4,7 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 //! KILL-OR-COMMIT measurement for PER-USE live-range splitting
-//! (docs/per-use-splitting-plan.md, "THE KILL-OR-COMMIT FIRST SLICE").
+//! (docs/archive/per-use-splitting-plan.md, "THE KILL-OR-COMMIT FIRST SLICE").
 //!
 //! STATS-ONLY, INERT BY DEFAULT: everything here is gated on the
 //! `TCG_AY_KILLCOMMIT` env var, and even when enabled nothing in this module
@@ -63,19 +63,16 @@ pub(crate) fn enabled() -> bool {
 /// killcommit stats probe wants it, and — feature-gated — the AY whole-vreg
 /// solve consumes it as the greedy-as-incumbent warm start (the hard `<= G-1`
 /// bound). With both env gates unset this is false and every hook stays a
-/// single cheap boolean check (default-path byte-identical).
+/// single cheap boolean check.
 #[must_use]
 pub(crate) fn recording_enabled() -> bool {
-    if enabled() {
-        return true;
-    }
     #[cfg(feature = "ay-regalloc")]
     {
-        crate::ay_regalloc::enabled()
+        enabled() || crate::ay_regalloc::enabled()
     }
     #[cfg(not(feature = "ay-regalloc"))]
     {
-        false
+        enabled()
     }
 }
 
@@ -1003,7 +1000,7 @@ pub(crate) mod probe {
         })
     }
 
-    /// Per-vreg candidate boundary set (docs/per-use-splitting-plan.md):
+    /// Per-vreg candidate boundary set (docs/archive/per-use-splitting-plan.md):
     /// greedy's recorded realized points (NEVER dropped — required for the
     /// exact embedding) U call-site boundaries `{p, p+1}` from reserved points
     /// live inside the range U top-3 gap midpoints

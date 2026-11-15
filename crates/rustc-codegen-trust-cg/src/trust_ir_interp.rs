@@ -65,7 +65,7 @@
 // state, signed Div/Rem bodies, non-reconstructible guards over trapping
 // bodies, memory-backed/celled loop state (which has no header phi at all).
 //
-// GATING: solver-lane ONLY (`TCG_P3C_REFINE` / legacy `TCG_REFINE`); loop ints
+// GATING: solver-lane ONLY (`p3c-refine` / legacy `refine`); loop ints
 // are wider than the fast lane's exhaustive 8-bit subset. FAIL-CLOSED on
 // Refuted/Inconclusive, exactly like the P3c rvalue tail.
 
@@ -78,11 +78,11 @@ use rustc_middle::mir::{
 use rustc_middle::ty;
 
 use trust_cg_lower::types::Type as LowerType;
-use trust_cg_verify::mir_semantics as refine;
 use trust_cg_verify::SmtExpr;
+use trust_cg_verify::mir_semantics as refine;
 use trust_ir::{
-    BinOp as TrustIrBinOp, Block, BlockId, CastOp, Constant, Function as TrustIrFunction,
-    ICmpOp, Inst, InstrNode, Ty as TrustIrTy, UnOp as TrustIrUnOp, ValueId,
+    BinOp as TrustIrBinOp, Block, BlockId, CastOp, Constant, Function as TrustIrFunction, ICmpOp,
+    Inst, InstrNode, Ty as TrustIrTy, UnOp as TrustIrUnOp, ValueId,
 };
 
 use crate::{MirLoweringCtx, ScalarBlockParam};
@@ -180,7 +180,15 @@ pub(crate) fn interp_inst(env: &mut HashMap<ValueId, SmtExpr>, node: &InstrNode)
                 | TrustIrBinOp::FDiv
                 | TrustIrBinOp::FRem
                 | TrustIrBinOp::FMin
-                | TrustIrBinOp::FMax => return None,
+                | TrustIrBinOp::FMax
+                // trust-ir WS3.20 rotates and copySign: RotL/RotR are emitted
+                // only on wasm32 (`lower_bitmanip_call_wasm32` and the
+                // self-funnel rotate). This interpreter carries no encoding
+                // for them, so a loop that uses one is skipped (fails closed,
+                // no threading credit).
+                | TrustIrBinOp::RotL
+                | TrustIrBinOp::RotR
+                | TrustIrBinOp::FCopySign => return None,
                 // BOOLEAN connectives (trust-ir 4b06918): UNREACHABLE from this
                 // bridge, not merely unsupported. Rust MIR has no boolean-connective
                 // BinOp — `&&`/`||` lower to control flow — and this bridge's sole
@@ -216,7 +224,14 @@ pub(crate) fn interp_inst(env: &mut HashMap<ValueId, SmtExpr>, node: &InstrNode)
                 | TrustIrUnOp::FFloor
                 | TrustIrUnOp::FCeil
                 | TrustIrUnOp::FTrunc
-                | TrustIrUnOp::CtPop => return None,
+                | TrustIrUnOp::CtPop
+                // trust-ir WS3.20 bit intrinsics: emitted only on wasm32
+                // (`lower_bitmanip_call_wasm32`) and not encoded here; a loop
+                // that uses one is skipped (fails closed) like CtPop.
+                | TrustIrUnOp::CtLz
+                | TrustIrUnOp::CtTz
+                | TrustIrUnOp::BSwap
+                | TrustIrUnOp::BitReverse => return None,
             }
         }
         Inst::ICmp { op, ty, lhs, rhs } => {
@@ -241,7 +256,12 @@ pub(crate) fn interp_inst(env: &mut HashMap<ValueId, SmtExpr>, node: &InstrNode)
             // 1-bit CSET shape, matching encode_trust_ir_icmp.
             SmtExpr::ite(cmp, SmtExpr::bv_const(1, 1), SmtExpr::bv_const(0, 1))
         }
-        Inst::Cast { op, src_ty, dst_ty, operand } => {
+        Inst::Cast {
+            op,
+            src_ty,
+            dst_ty,
+            operand,
+        } => {
             let sw = int_width(src_ty)?;
             let dw = int_width(dst_ty)?;
             let o = env_get(env, operand)?;
@@ -273,7 +293,13 @@ pub(crate) fn interp_inst(env: &mut HashMap<ValueId, SmtExpr>, node: &InstrNode)
 fn edges_to<'a>(inst: &'a Inst, target: BlockId) -> Vec<&'a Vec<ValueId>> {
     match inst {
         Inst::Br { target: t, args } if *t == target => vec![args],
-        Inst::CondBr { cond: _, then_target, then_args, else_target, else_args } => {
+        Inst::CondBr {
+            cond: _,
+            then_target,
+            then_args,
+            else_target,
+            else_args,
+        } => {
             let mut out = Vec::new();
             if *then_target == target {
                 out.push(then_args);
@@ -283,7 +309,13 @@ fn edges_to<'a>(inst: &'a Inst, target: BlockId) -> Vec<&'a Vec<ValueId>> {
             }
             out
         }
-        Inst::Switch { value: _, default, default_args, cases, .. } => {
+        Inst::Switch {
+            value: _,
+            default,
+            default_args,
+            cases,
+            ..
+        } => {
             let mut out = Vec::new();
             if *default == target {
                 out.push(default_args);
@@ -503,13 +535,19 @@ fn conv_operand<'tcx>(
                 return None;
             }
             let scalar_ty = mir_scalar_ty_of_local(ctx, body, local)?;
-            Some(refine::MirOperand::Var { name: canonical_name(local), ty: scalar_ty })
+            Some(refine::MirOperand::Var {
+                name: canonical_name(local),
+                ty: scalar_ty,
+            })
         }
         Operand::Constant(constant) => {
             let evaluated = ctx.eval_const_operand(constant);
             let scalar_ty = mir_scalar_ty_of_rust_ty(ctx.tcx, evaluated.ty())?;
             let value = crate::const_to_scalar_i128(&evaluated)?;
-            Some(refine::MirOperand::ConstInt { value: value as u64, ty: scalar_ty })
+            Some(refine::MirOperand::ConstInt {
+                value: value as u64,
+                ty: scalar_ty,
+            })
         }
         _ => None,
     }
@@ -557,13 +595,12 @@ fn conv_statements<'tcx>(
             let dst = plain_local(place)?;
             let dst_ty = mir_scalar_ty_of_local(ctx, body, dst)?;
             let converted = match rvalue {
-                Rvalue::Use(operand) => refine::MirRvalue::Use {
+                Rvalue::Use(operand, _) => refine::MirRvalue::Use {
                     src: conv_operand(ctx, body, operand, &readable)?,
                 },
                 Rvalue::BinaryOp(op, operands) => {
                     let spec_op = conv_binop(*op)?;
-                    let lhs_rust_ty =
-                        crate::operand_rust_ty(ctx, body, &operands.0).ok()?;
+                    let lhs_rust_ty = crate::operand_rust_ty(ctx, body, &operands.0).ok()?;
                     let operand_ty = mir_scalar_ty_of_rust_ty(ctx.tcx, lhs_rust_ty)?;
                     // Signed Div/Rem: out of slice (trap-sentinel spec — module doc).
                     if matches!(spec_op, refine::MirBinOp::Div | refine::MirBinOp::Rem) {
@@ -574,8 +611,7 @@ fn conv_statements<'tcx>(
                     }
                     // Both operand widths must agree (the encoder builds the rhs
                     // at its own width; a mixed-width shift would be ill-sorted).
-                    let rhs_rust_ty =
-                        crate::operand_rust_ty(ctx, body, &operands.1).ok()?;
+                    let rhs_rust_ty = crate::operand_rust_ty(ctx, body, &operands.1).ok()?;
                     let rhs_ty = mir_scalar_ty_of_rust_ty(ctx.tcx, rhs_rust_ty)?;
                     if rhs_ty.bits() != operand_ty.bits() {
                         return None;
@@ -616,7 +652,10 @@ fn conv_statements<'tcx>(
                 _ => return None,
             };
             let _ = dst_ty;
-            stmts.push(refine::MirStmt { dst: canonical_name(dst), rvalue: converted });
+            stmts.push(refine::MirStmt {
+                dst: canonical_name(dst),
+                rvalue: converted,
+            });
             readable.insert(dst);
         }
     }
@@ -654,7 +693,7 @@ fn resolve_to_param(
             _ => None,
         })?;
         match rvalue {
-            Rvalue::Use(op) => {
+            Rvalue::Use(op, _) => {
                 local = operand_plain_local(op)?;
                 idx = i;
             }
@@ -687,7 +726,7 @@ fn resolve_cond_shape<'tcx>(
             _ => None,
         })?;
         match rvalue {
-            Rvalue::Use(op) => {
+            Rvalue::Use(op, _) => {
                 local = operand_plain_local(op)?;
                 idx = i;
             }
@@ -764,7 +803,9 @@ fn resolve_entry_value<'tcx>(
     // destination would be invisible to the statement scan).
     if !matches!(
         body.basic_blocks[preheader].terminator().kind,
-        TerminatorKind::Goto { .. } | TerminatorKind::SwitchInt { .. } | TerminatorKind::Assert { .. }
+        TerminatorKind::Goto { .. }
+            | TerminatorKind::SwitchInt { .. }
+            | TerminatorKind::Assert { .. }
     ) {
         return None;
     }
@@ -791,7 +832,7 @@ fn resolve_entry_value<'tcx>(
             return None;
         };
         match rvalue {
-            Rvalue::Use(op) => {
+            Rvalue::Use(op, _) => {
                 if let Some(m) = operand_plain_local(op) {
                     local = m;
                     idx = i;
@@ -862,27 +903,32 @@ fn build_mir_loop_model<'tcx>(
 
     // Loop condition + the continue arm (and the EXIT arm, checked below).
     let header_data = &body.basic_blocks[header];
-    let (guard_param, body_entry, exit_arm) = match &header_data.terminator().kind {
-        TerminatorKind::Goto { target } => (None, *target, None),
-        TerminatorKind::SwitchInt { discr, targets } => {
-            // Canonical two-way shape: one explicit `0` case + otherwise.
-            let mut iter = targets.iter();
-            let (case_value, zero_target) = iter.next()?;
-            if iter.next().is_some() || case_value != 0 {
-                return None;
-            }
-            let otherwise = targets.otherwise();
-            let discr_local = operand_plain_local(discr)?;
-            match resolve_cond_shape(ctx, &header_data.statements, discr_local, &param_set)? {
-                // continue iff p != 0.
-                CondShape::Param(p) | CondShape::NeZero(p) => {
-                    (Some(p), otherwise, Some(zero_target))
+    let (guard_param, body_entry, exit_arm) = if let Some(goto) =
+        crate::mir_goto::view(&header_data.terminator().kind)
+    {
+        (None, goto.target(), None)
+    } else {
+        match &header_data.terminator().kind {
+            TerminatorKind::SwitchInt { discr, targets } => {
+                // Canonical two-way shape: one explicit `0` case + otherwise.
+                let mut iter = targets.iter();
+                let (case_value, zero_target) = iter.next()?;
+                if iter.next().is_some() || case_value != 0 {
+                    return None;
                 }
-                // c = Eq(p, 0): continue (body) on the 0 arm, also iff p != 0.
-                CondShape::EqZero(p) => (Some(p), zero_target, Some(otherwise)),
+                let otherwise = targets.otherwise();
+                let discr_local = operand_plain_local(discr)?;
+                match resolve_cond_shape(ctx, &header_data.statements, discr_local, &param_set)? {
+                    // continue iff p != 0.
+                    CondShape::Param(p) | CondShape::NeZero(p) => {
+                        (Some(p), otherwise, Some(zero_target))
+                    }
+                    // c = Eq(p, 0): continue (body) on the 0 arm, also iff p != 0.
+                    CondShape::EqZero(p) => (Some(p), zero_target, Some(otherwise)),
+                }
             }
+            _ => return None,
         }
-        _ => return None,
     };
 
     // Walk the straight-line body chain (Goto/Assert only) back to the header.
@@ -894,10 +940,15 @@ fn build_mir_loop_model<'tcx>(
             return None;
         }
         chain.push(current);
-        let next = match &body.basic_blocks[current].terminator().kind {
-            TerminatorKind::Goto { target } => *target,
-            TerminatorKind::Assert { target, .. } => *target,
-            _ => return None,
+        let next = if let Some(goto) =
+            crate::mir_goto::view(&body.basic_blocks[current].terminator().kind)
+        {
+            goto.target()
+        } else {
+            match &body.basic_blocks[current].terminator().kind {
+                TerminatorKind::Assert { target, .. } => *target,
+                _ => return None,
+            }
         };
         if next == header {
             break;
@@ -983,11 +1034,19 @@ fn build_mir_loop_model<'tcx>(
         preheader_args,
         latch: refine::MirBlock {
             stmts,
-            terminator: refine::MirTerminator::Goto { target: header.index(), args: latch_args },
+            terminator: refine::MirTerminator::Goto {
+                target: header.index(),
+                args: latch_args,
+            },
         },
         back_edge_guard,
     };
-    Some(MirLoopModel { mir_loop, chain, preheader, param_tys })
+    Some(MirLoopModel {
+        mir_loop,
+        chain,
+        preheader,
+        param_tys,
+    })
 }
 
 // ===========================================================================
@@ -1106,8 +1165,14 @@ fn build_bridge_edges<'tcx>(
     }
 
     Some((
-        refine::BridgeEdgeArgs { edge: refine::EdgeKind::Goto, args: preheader_args },
-        refine::BridgeEdgeArgs { edge: refine::EdgeKind::Goto, args: latch_args },
+        refine::BridgeEdgeArgs {
+            edge: refine::EdgeKind::Goto,
+            args: preheader_args,
+        },
+        refine::BridgeEdgeArgs {
+            edge: refine::EdgeKind::Goto,
+            args: latch_args,
+        },
     ))
 }
 
@@ -1122,7 +1187,9 @@ fn build_bridge_edges<'tcx>(
 /// Inconclusive verdict, mirroring the P3c rvalue tail; out-of-slice loops and
 /// verifier structural `Err`s are skipped (sound: less coverage, never a wrong
 /// verdict — structural arity/dominance bugs are the default-on P1.3 gate's
-/// job).
+/// job). That skip is this check's own scope, not a queued refinement job:
+/// the strict lane refuses a queued job its drain cannot state
+/// (`[TCG-REFINE-SHAPE]`, `refinement_job_unmodeled`), but not a loop here.
 pub(crate) fn check_loop_threading_refinements<'tcx>(
     ctx: &MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -1134,7 +1201,7 @@ pub(crate) fn check_loop_threading_refinements<'tcx>(
     if header_scalar_params.is_empty() {
         return Ok(());
     }
-    let trace = std::env::var_os("TCG_REFINE_TRACE").is_some();
+    let trace = crate::knobs::is_enabled(crate::knobs::REFINE_TRACE);
     let config = trust_cg_verify::ay_bridge::AYConfig::default();
 
     // Deterministic order; dedup identical (loop, edges) obligations.
@@ -1147,7 +1214,9 @@ pub(crate) fn check_loop_threading_refinements<'tcx>(
         let name = format!("{symbol}_loop_bb{}", header.index());
         let Some(model) = build_mir_loop_model(ctx, body, predecessors, header, params) else {
             if trace {
-                eprintln!("TCG_REFINE_TRACE {symbol}: loop-threading {name} SKIPPED (MIR side out of slice)");
+                eprintln!(
+                    "TCG_REFINE_TRACE {symbol}: loop-threading {name} SKIPPED (MIR side out of slice)"
+                );
             }
             continue;
         };
@@ -1155,7 +1224,9 @@ pub(crate) fn check_loop_threading_refinements<'tcx>(
             build_bridge_edges(ctx, body, func, header, params, &model)
         else {
             if trace {
-                eprintln!("TCG_REFINE_TRACE {symbol}: loop-threading {name} SKIPPED (emitted trust-ir out of the interpreter slice)");
+                eprintln!(
+                    "TCG_REFINE_TRACE {symbol}: loop-threading {name} SKIPPED (emitted trust-ir out of the interpreter slice)"
+                );
             }
             continue;
         };
@@ -1184,7 +1255,7 @@ pub(crate) fn check_loop_threading_refinements<'tcx>(
             }
             Ok(refine::RefinementOutcome::Refuted { counterexample }) => {
                 // Additive diagnostics: same message, [TCG-REFINE-071]-prefixed
-                // (+ typed JSON under TCG_DIAG_JSON=1). No gate decision changes.
+                // (+ typed JSON under diag-json). No gate decision changes.
                 let why = format!(
                     "{symbol}: MIR->trust-ir loop-threading refinement failed: {name} REFUTED \
                      (counterexample: {counterexample})"
@@ -1207,10 +1278,13 @@ pub(crate) fn check_loop_threading_refinements<'tcx>(
                 ));
             }
             // Verifier structural error (e.g. an arity it rejects): out of the
-            // encodable slice, not a verdict — skip, like the rvalue tail's Err.
+            // encodable slice, not a verdict — skip. (The rvalue tail's `Err` is
+            // a queued job, which the strict lane refuses instead.)
             Err(e) => {
                 if trace {
-                    eprintln!("TCG_REFINE_TRACE {symbol}: loop-threading {name} SKIPPED (verifier: {e})");
+                    eprintln!(
+                        "TCG_REFINE_TRACE {symbol}: loop-threading {name} SKIPPED (verifier: {e})"
+                    );
                 }
             }
         }
@@ -1252,11 +1326,19 @@ mod tests {
         block.params.push((V_A, TrustIrTy::U8));
         block.params.push((V_B, TrustIrTy::U8));
         block.body.push(node(
-            Inst::Const { ty: TrustIrTy::U8, value: Constant::Int(0) },
+            Inst::Const {
+                ty: TrustIrTy::U8,
+                value: Constant::Int(0),
+            },
             V_ZERO,
         ));
         block.body.push(node(
-            Inst::ICmp { op: ICmpOp::Ne, ty: TrustIrTy::U8, lhs: V_B, rhs: V_ZERO },
+            Inst::ICmp {
+                op: ICmpOp::Ne,
+                ty: TrustIrTy::U8,
+                lhs: V_B,
+                rhs: V_ZERO,
+            },
             V_COND,
         ));
         block.body.push(InstrNode::new(Inst::CondBr {
@@ -1273,19 +1355,33 @@ mod tests {
     /// `back_args` to the header — the CORRECT rotation is `(t, a % b)`.
     fn emitted_latch(back_args: Vec<ValueId>) -> Block {
         let mut block = Block::new(LATCH);
-        block
-            .body
-            .push(node(Inst::Copy { ty: TrustIrTy::U8, operand: V_B }, V_T));
         block.body.push(node(
-            Inst::BinOp { op: TrustIrBinOp::URem, ty: TrustIrTy::U8, lhs: V_A, rhs: V_B },
+            Inst::Copy {
+                ty: TrustIrTy::U8,
+                operand: V_B,
+            },
+            V_T,
+        ));
+        block.body.push(node(
+            Inst::BinOp {
+                op: TrustIrBinOp::URem,
+                ty: TrustIrTy::U8,
+                lhs: V_A,
+                rhs: V_B,
+            },
             V_REM,
         ));
-        block
-            .body
-            .push(node(Inst::Copy { ty: TrustIrTy::U8, operand: V_T }, V_A2));
-        block
-            .body
-            .push(InstrNode::new(Inst::Br { target: HEADER, args: back_args }));
+        block.body.push(node(
+            Inst::Copy {
+                ty: TrustIrTy::U8,
+                operand: V_T,
+            },
+            V_A2,
+        ));
+        block.body.push(InstrNode::new(Inst::Br {
+            target: HEADER,
+            args: back_args,
+        }));
         block
     }
 
@@ -1302,13 +1398,22 @@ mod tests {
     /// `b != 0` guard excludes the divide-by-zero trap inputs.
     fn euclid_mir_loop() -> refine::MirLoop {
         let u8t = refine::MirScalarTy::UInt(LowerType::I8);
-        let var = |n: &str| refine::MirOperand::Var { name: n.to_string(), ty: u8t.clone() };
+        let var = |n: &str| refine::MirOperand::Var {
+            name: n.to_string(),
+            ty: u8t.clone(),
+        };
         refine::MirLoop {
-            header_params: vec![("a".to_string(), u8t.clone()), ("b".to_string(), u8t.clone())],
+            header_params: vec![
+                ("a".to_string(), u8t.clone()),
+                ("b".to_string(), u8t.clone()),
+            ],
             preheader_args: vec![var("arg1"), var("arg2")],
             latch: refine::MirBlock {
                 stmts: vec![
-                    refine::MirStmt { dst: "t".to_string(), rvalue: refine::MirRvalue::Use { src: var("b") } },
+                    refine::MirStmt {
+                        dst: "t".to_string(),
+                        rvalue: refine::MirRvalue::Use { src: var("b") },
+                    },
                     refine::MirStmt {
                         dst: "b".to_string(),
                         rvalue: refine::MirRvalue::BinaryOp {
@@ -1318,9 +1423,15 @@ mod tests {
                             rhs: var("b"),
                         },
                     },
-                    refine::MirStmt { dst: "a".to_string(), rvalue: refine::MirRvalue::Use { src: var("t") } },
+                    refine::MirStmt {
+                        dst: "a".to_string(),
+                        rvalue: refine::MirRvalue::Use { src: var("t") },
+                    },
                 ],
-                terminator: refine::MirTerminator::Goto { target: 1, args: vec![var("a"), var("b")] },
+                terminator: refine::MirTerminator::Goto {
+                    target: 1,
+                    args: vec![var("a"), var("b")],
+                },
             },
             back_edge_guard: Some(var("b")),
         }
@@ -1341,8 +1452,12 @@ mod tests {
             target: HEADER,
             args: vec![ValueId::new(1), ValueId::new(2)],
         }));
-        let mut func =
-            TrustIrFunction::new(trust_ir::FuncId::new(0), "euclid_test", trust_ir::FuncTyId::new(0), PRE);
+        let mut func = TrustIrFunction::new(
+            trust_ir::FuncId::new(0),
+            "euclid_test",
+            trust_ir::FuncTyId::new(0),
+            PRE,
+        );
         func.blocks.push(pre);
         let base = |v: ValueId| -> Option<SmtExpr> {
             match v.index() {
@@ -1356,8 +1471,14 @@ mod tests {
         refine::check_loop_carried_threading(
             "unit_euclid",
             &euclid_mir_loop(),
-            &refine::BridgeEdgeArgs { edge: refine::EdgeKind::Goto, args: pre_args },
-            &refine::BridgeEdgeArgs { edge: refine::EdgeKind::Goto, args: latch_exprs },
+            &refine::BridgeEdgeArgs {
+                edge: refine::EdgeKind::Goto,
+                args: pre_args,
+            },
+            &refine::BridgeEdgeArgs {
+                edge: refine::EdgeKind::Goto,
+                args: latch_exprs,
+            },
             &AYConfig::default(),
         )
         .expect("obligations build")
@@ -1379,7 +1500,10 @@ mod tests {
     fn interpreted_swapped_back_edge_is_refuted() {
         match discharge(vec![V_REM, V_A2]) {
             refine::RefinementOutcome::Refuted { counterexample } => {
-                assert!(!counterexample.is_empty(), "refutation carries a counterexample");
+                assert!(
+                    !counterexample.is_empty(),
+                    "refutation carries a counterexample"
+                );
             }
             other => panic!("swapped emitted back-edge must be Refuted, got {other:?}"),
         }
@@ -1391,7 +1515,10 @@ mod tests {
     fn interpreted_stale_back_edge_is_refuted() {
         match discharge(vec![V_A, V_REM]) {
             refine::RefinementOutcome::Refuted { counterexample } => {
-                assert!(!counterexample.is_empty(), "refutation carries a counterexample");
+                assert!(
+                    !counterexample.is_empty(),
+                    "refutation carries a counterexample"
+                );
             }
             other => panic!("stale emitted back-edge must be Refuted, got {other:?}"),
         }
@@ -1403,9 +1530,15 @@ mod tests {
     #[test]
     fn interpreted_masked_shift_matches_spec() {
         let u8t = refine::MirScalarTy::UInt(LowerType::I8);
-        let var = |n: &str| refine::MirOperand::Var { name: n.to_string(), ty: u8t.clone() };
+        let var = |n: &str| refine::MirOperand::Var {
+            name: n.to_string(),
+            ty: u8t.clone(),
+        };
         let mir_loop = refine::MirLoop {
-            header_params: vec![("a".to_string(), u8t.clone()), ("b".to_string(), u8t.clone())],
+            header_params: vec![
+                ("a".to_string(), u8t.clone()),
+                ("b".to_string(), u8t.clone()),
+            ],
             preheader_args: vec![var("arg1"), var("arg2")],
             latch: refine::MirBlock {
                 stmts: vec![refine::MirStmt {
@@ -1417,7 +1550,10 @@ mod tests {
                         rhs: var("b"),
                     },
                 }],
-                terminator: refine::MirTerminator::Goto { target: 1, args: vec![var("a"), var("b")] },
+                terminator: refine::MirTerminator::Goto {
+                    target: 1,
+                    args: vec![var("a"), var("b")],
+                },
             },
             back_edge_guard: None,
         };
@@ -1425,15 +1561,24 @@ mod tests {
         let mut header = Block::new(HEADER);
         header.params.push((V_A, TrustIrTy::U8));
         header.params.push((V_B, TrustIrTy::U8));
-        header.body.push(InstrNode::new(Inst::Br { target: LATCH, args: Vec::new() }));
+        header.body.push(InstrNode::new(Inst::Br {
+            target: LATCH,
+            args: Vec::new(),
+        }));
         let mut latch = Block::new(LATCH);
         latch.body.push(node(
-            Inst::BinOp { op: TrustIrBinOp::Shl, ty: TrustIrTy::U8, lhs: V_A, rhs: V_B },
+            Inst::BinOp {
+                op: TrustIrBinOp::Shl,
+                ty: TrustIrTy::U8,
+                lhs: V_A,
+                rhs: V_B,
+            },
             V_T,
         ));
-        latch
-            .body
-            .push(InstrNode::new(Inst::Br { target: HEADER, args: vec![V_T, V_B] }));
+        latch.body.push(InstrNode::new(Inst::Br {
+            target: HEADER,
+            args: vec![V_T, V_B],
+        }));
         let blocks = [&header, &latch];
         let latch_exprs =
             interpret_chain_to_back_edge(&blocks, HEADER, seed()).expect("shift chain interprets");
@@ -1441,7 +1586,10 @@ mod tests {
             edge: refine::EdgeKind::Goto,
             args: vec![SmtExpr::var("arg1", 8), SmtExpr::var("arg2", 8)],
         };
-        let latch_edge = refine::BridgeEdgeArgs { edge: refine::EdgeKind::Goto, args: latch_exprs };
+        let latch_edge = refine::BridgeEdgeArgs {
+            edge: refine::EdgeKind::Goto,
+            args: latch_exprs,
+        };
         match refine::check_loop_carried_threading(
             "unit_shift",
             &mir_loop,
@@ -1463,12 +1611,18 @@ mod tests {
         let header = emitted_header();
         let mut latch = Block::new(LATCH);
         latch.body.push(node(
-            Inst::Load { ty: TrustIrTy::U8, ptr: V_A, volatile: false, align: None },
+            Inst::Load {
+                ty: TrustIrTy::U8,
+                ptr: V_A,
+                volatile: false,
+                align: None,
+            },
             V_T,
         ));
-        latch
-            .body
-            .push(InstrNode::new(Inst::Br { target: HEADER, args: vec![V_T, V_B] }));
+        latch.body.push(InstrNode::new(Inst::Br {
+            target: HEADER,
+            args: vec![V_T, V_B],
+        }));
         let blocks = [&header, &latch];
         assert!(
             interpret_chain_to_back_edge(&blocks, HEADER, seed()).is_none(),
@@ -1498,9 +1652,10 @@ mod tests {
         }));
         // Clean MID: falls through to the latch on both arms' worth of a plain Br.
         let mut mid_clean = Block::new(MID);
-        mid_clean
-            .body
-            .push(InstrNode::new(Inst::Br { target: LATCH, args: Vec::new() }));
+        mid_clean.body.push(InstrNode::new(Inst::Br {
+            target: LATCH,
+            args: Vec::new(),
+        }));
         // Rogue MID: one arm to the latch, one arm BACK TO THE HEADER threading
         // the header params themselves (V_A, V_B).
         let mut mid_rogue = Block::new(MID);
@@ -1534,9 +1689,17 @@ mod tests {
     fn interpreter_bails_on_signed_rem() {
         let mut env = seed();
         let srem = node(
-            Inst::BinOp { op: TrustIrBinOp::SRem, ty: TrustIrTy::U8, lhs: V_A, rhs: V_B },
+            Inst::BinOp {
+                op: TrustIrBinOp::SRem,
+                ty: TrustIrTy::U8,
+                lhs: V_A,
+                rhs: V_B,
+            },
             V_REM,
         );
-        assert!(interp_inst(&mut env, &srem).is_none(), "SRem must be out of slice");
+        assert!(
+            interp_inst(&mut env, &srem).is_none(),
+            "SRem must be out of slice"
+        );
     }
 }

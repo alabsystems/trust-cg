@@ -59,9 +59,9 @@ use std::collections::{BTreeMap, HashMap};
 use trust_cg_ir::regs::{RegClass, VReg};
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
 use trust_cg_ir::x86_64_regs::{
-    self, AL, AX, R10, R10B, R10D, R10W, R11, R11D, RBP, RSP, X86_ALLOCATABLE_GPRS,
+    self, AL, AX, R10, R10B, R10D, R10W, R11, R11D, RBP, RSP, X86_ALL_XMMS, X86_ALLOCATABLE_GPRS,
     X86_ALLOCATABLE_XMMS, X86_ARG_GPRS, X86_ARG_XMMS, X86_CALLEE_SAVED_GPRS, X86PReg, XMM0, XMM4,
-    XMM5, XMM14, XMM15, x86_containing_gpr64,
+    XMM5, XMM14, XMM15, x86_containing_gpr64, x86_preg_name,
 };
 use trust_cg_ir::{Target, TargetFeature};
 
@@ -106,6 +106,10 @@ pub struct X86CallFixup {
     /// Name of the callee symbol (unmangled; the Mach-O / ELF emitter adds
     /// any platform-specific prefix such as `_`).
     pub callee: String,
+    /// The LIR edge was replay-validated as one exact module-function call.
+    /// JIT/AOT resolution must choose the compiled definition or fail closed;
+    /// an explicit extern entry is not an admissible substitute.
+    pub exact_module: bool,
 }
 
 /// Exact final-encoding byte ranges for machine calls, keyed by the call's
@@ -129,6 +133,9 @@ pub enum X86SymbolRefFixupKind {
     /// `MOV r64, [RIP + symbol@TLVP]` Mach-O thread-local descriptor load
     /// (`X86_64_RELOC_TLV`). Darwin-only: the ELF/COFF arms fail closed.
     TlsTlv,
+    /// RIP-relative address of exactly one emitted local function, never a
+    /// global-data symbol, import, host override, or spelling alias.
+    ExactFunctionAddr,
 }
 
 /// A pending relocation for an x86-64 RIP-relative symbol-address
@@ -419,6 +426,7 @@ struct X86EhData {
 /// relocations.
 #[derive(Debug, Clone)]
 struct X86EncodedFunc {
+    has_body_instructions: bool,
     /// Unmangled function name (as declared in the trust_ir module).
     name: String,
     /// Length of the function's code bytes in the combined section.
@@ -473,6 +481,467 @@ pub(crate) struct X86AssembledModule {
     raw_code_size: usize,
     /// The effective output format the assembly was built for.
     effective_format: X86OutputFormat,
+}
+
+/// The function-symbol facts an x86-64 module emitter writes beyond its
+/// default, which binds every function definition as a global,
+/// default-visible symbol.
+///
+/// They come from the trust-ir module (`Compiler::compile_x86_64`), never
+/// from the assembly: a binding is a SYMBOL-TABLE attribute only and changes
+/// no byte of the text section nor any function's offset in it, so one
+/// [`X86AssembledModule`] serves any facts.
+///
+/// Two facts exist, each the binding of one function this module DEFINES
+/// ([`crate::pipeline::FunctionSymbolBinding`], derived from trust-ir linkage
+/// and v45 visibility by `FunctionSymbolBinding::for_trust_ir_definition` so
+/// this emitter never re-classifies linkage itself):
+///
+/// * a HIDDEN definition (trust-ir `External` + `Hidden`), which the Mach-O
+///   module emitter spells as a private extern, `N_SECT | N_EXT | N_PEXT`: it
+///   resolves across the objects of one static link like any external
+///   definition, and the final link demotes it to a local, so it never
+///   reaches a linked image's export surface and another image cannot bind to
+///   it. The rustc bridge emits a CGU-private copy of a rustc `Internal`
+///   function this way (one copy per codegen unit, each under its own
+///   CGU-qualified name), admitted by trust-cg-lower's
+///   `ObjectSymbolPolicy::X86_64_MACHO_MODULE`. Never weak, never coalesced.
+///   The ELF module emitter spells it `STB_GLOBAL` + `STV_HIDDEN`; COFF
+///   refuses it ([`X86PipelineError::FunctionVisibilityUnsupported`]) rather
+///   than emit it default-visible.
+///
+/// * a LOCAL definition (trust-ir `Internal`/`Private`), which the ELF module
+///   emitter spells `STB_LOCAL` in the symbol table's local partition, so
+///   every `R_X86_64_PLT32` call and every `R_X86_64_64` address slot in this
+///   object reaches THIS object's definition and no other input's, and the
+///   name never enters a linked image's export surface. Visibility is vacuous
+///   on it (`FunctionSymbolBinding::new` normalizes it to default). The Mach-O
+///   module emitter spells it as a non-external `N_SECT` symbol and the COFF
+///   one as `IMAGE_SYM_CLASS_STATIC`, so no other object's reference or weak
+///   definition binds to the body; `Compiler::compile` states the fact on
+///   COFF only for an UNREFERENCED definition. ELF and Mach-O carry references
+///   with emitted-byte binding checks ([`crate::compiler`]'s
+///   `aot_object_binds_module_local_functions`; ruling
+///   OD-X86-BINDING-ONE-CARRIER-20261105). The raw-bytes form has no symbol
+///   table and refuses it by name
+///   ([`X86PipelineError::FunctionLinkageUnsupported`]).
+///
+/// A fact this emitter cannot spell is REFUSED, never emitted as the default
+/// (that is the whole point of carrying it): [`Self::check_against`] decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct X86FunctionSymbolFacts {
+    /// The binding of each DEFINED function whose binding is not this
+    /// emitter's default (`FunctionSymbolBinding::GLOBAL`), keyed by the
+    /// function's name. A name absent here is a strong, default-visible
+    /// global definition, exactly as before these facts existed.
+    bindings: std::collections::BTreeMap<String, crate::pipeline::FunctionSymbolBinding>,
+    /// Names of UNDEFINED function references this object emits `STB_WEAK`
+    /// (trust-ir `ExternalWeak`): a reference that resolves to 0 when nothing
+    /// defines it, instead of failing the link.
+    weak_undefined: std::collections::BTreeSet<String>,
+    /// The visibility of an UNDEFINED function reference (trust-ir v45
+    /// `Function.visibility` on a codegen declaration), keyed by symbol. On
+    /// ELF the visibility of an undefined symbol BINDS the definition another
+    /// input supplies — the most constraining one wins (gABI) — so a hidden
+    /// reference keeps that definition out of the linked image's `.dynsym`.
+    undefined_visibility: std::collections::BTreeMap<String, trust_ir::Visibility>,
+    /// Declarations whose undefined symbol is written even when nothing in
+    /// this object references them, as llc 22 writes one whose linkage or
+    /// visibility it must state. Each must be weak or carry a non-default
+    /// visibility; a plain strong default-visible declaration that nothing
+    /// references is written by no one.
+    declared_undefined: std::collections::BTreeSet<String>,
+}
+
+impl X86FunctionSymbolFacts {
+    /// Facts stating one binding per named DEFINITION. A binding equal to the
+    /// emitter's default (`FunctionSymbolBinding::GLOBAL`) is dropped, so
+    /// `Default::default()` and "every definition stated global" are the same
+    /// facts and the emitter has one shape to check.
+    pub(crate) fn with_definition_bindings(
+        bindings: impl IntoIterator<Item = (String, crate::pipeline::FunctionSymbolBinding)>,
+    ) -> Self {
+        Self {
+            bindings: bindings
+                .into_iter()
+                .filter(|(_, binding)| *binding != crate::pipeline::FunctionSymbolBinding::GLOBAL)
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// These facts plus the UNDEFINED-reference facts: which references are
+    /// weak, each reference's non-default visibility, and the declarations
+    /// whose symbol is written even when unreferenced.
+    pub(crate) fn with_undefined_references(
+        mut self,
+        weak_undefined: std::collections::BTreeSet<String>,
+        undefined_visibility: std::collections::BTreeMap<String, trust_ir::Visibility>,
+        declared_undefined: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.weak_undefined = weak_undefined;
+        self.undefined_visibility = undefined_visibility;
+        self.declared_undefined = declared_undefined;
+        self
+    }
+
+    /// Whether any UNDEFINED-reference fact is stated at all. The emitters
+    /// that cannot spell one check this before anything else.
+    fn states_undefined_facts(&self) -> bool {
+        !self.weak_undefined.is_empty()
+            || !self.undefined_visibility.is_empty()
+            || !self.declared_undefined.is_empty()
+    }
+
+    /// How the undefined symbol for `name` binds: `(is_weak, STV_*)`. A name
+    /// no fact mentions is a strong, default-visible reference, exactly as
+    /// before these facts existed.
+    fn undefined_reference(&self, name: &str) -> (bool, u8) {
+        (
+            self.weak_undefined.contains(name),
+            crate::pipeline::elf_symbol_visibility(
+                self.undefined_visibility
+                    .get(name)
+                    .copied()
+                    .unwrap_or(trust_ir::Visibility::Default),
+            ),
+        )
+    }
+
+    /// Whether a reference to `name` must be taken through the GOT: a weak
+    /// undefined symbol's address is 0 when nothing defines it, which only an
+    /// indirection can represent — a PC-relative displacement to it is a
+    /// link-time constant that cannot be null.
+    fn undefined_reference_needs_got(&self, name: &str) -> bool {
+        self.weak_undefined.contains(name)
+    }
+
+    /// The declared names this object must write an undefined symbol for and
+    /// has not written yet, in a stable order.
+    fn unreferenced_declarations<'a>(
+        &'a self,
+        written: &'a std::collections::HashMap<String, u32>,
+    ) -> impl Iterator<Item = &'a String> + 'a {
+        self.declared_undefined
+            .iter()
+            .filter(move |name| !written.contains_key(name.as_str()))
+    }
+
+    /// The binding stated for `function`'s definition: the emitter's default
+    /// (`GLOBAL`, strong and default-visible) when no fact names it.
+    fn binding_of(&self, function: &str) -> crate::pipeline::FunctionSymbolBinding {
+        self.bindings
+            .get(function)
+            .copied()
+            .unwrap_or(crate::pipeline::FunctionSymbolBinding::GLOBAL)
+    }
+
+    /// Whether the definition of `function` is hidden (the Mach-O emitter's
+    /// one fact: it spells `N_PEXT` and nothing else).
+    fn is_hidden_definition(&self, function: &str) -> bool {
+        self.binding_of(function).visibility() == trust_ir::Visibility::Hidden
+    }
+
+    /// Refuse facts `format`'s emitter cannot honour for `encoded`.
+    ///
+    /// On every format: a stated name the module does not define (the facts
+    /// and the assembly would disagree about what this object defines), and a
+    /// name whose stated binding contradicts the config's
+    /// `weak_function_definitions` (`weak`) — the one place weakness is
+    /// decided, so a second source of truth is refused rather than silently
+    /// preferred. A hidden or local definition is never weak: a CGU-private
+    /// copy is not coalesced, and rustc gives no `Internal` function weak
+    /// linkage.
+    ///
+    /// Then per format, which is the capability boundary:
+    ///
+    /// * `Elf` spells `STB_LOCAL` and `STV_HIDDEN`/`STV_PROTECTED`;
+    /// * `MachO` spells a local definition (non-external `N_SECT`) and `N_PEXT`
+    ///   for `External` + `Hidden` — `Protected` (which Mach-O has no spelling
+    ///   for) is refused;
+    /// * `Coff` spells a local definition (`IMAGE_SYM_CLASS_STATIC`) and no
+    ///   visibility, which it refuses;
+    /// * `RawBytes` has no symbol table and refuses both.
+    fn check_against(
+        &self,
+        encoded: &[X86EncodedFunc],
+        format: X86OutputFormat,
+        weak: &std::collections::BTreeSet<String>,
+    ) -> Result<(), X86PipelineError> {
+        use crate::pipeline::FunctionSymbolLinkage;
+        // The UNDEFINED-reference facts first: only the ELF emitter spells
+        // either of them, and a fact about a name this object DEFINES is a
+        // disagreement between the facts and the assembly whatever the format.
+        if self.states_undefined_facts() {
+            if format != X86OutputFormat::Elf {
+                let (function, visibility) = self
+                    .undefined_visibility
+                    .iter()
+                    .map(|(name, visibility)| (name.clone(), *visibility))
+                    .next()
+                    .unwrap_or_else(|| {
+                        let name = self
+                            .weak_undefined
+                            .iter()
+                            .chain(self.declared_undefined.iter())
+                            .next()
+                            .cloned()
+                            .unwrap_or_default();
+                        (name, trust_ir::Visibility::Default)
+                    });
+                return Err(X86PipelineError::FunctionVisibilityUnsupported {
+                    function,
+                    visibility,
+                    format,
+                    reason: "only the x86-64 ELF module emitter spells a weak undefined \
+                             reference or a visibility on an undefined function symbol",
+                });
+            }
+            for function in self
+                .weak_undefined
+                .iter()
+                .chain(self.undefined_visibility.keys())
+                .chain(self.declared_undefined.iter())
+            {
+                if encoded.iter().any(|ef| ef.name == *function) {
+                    return Err(X86PipelineError::FunctionLinkageUnsupported {
+                        function: function.clone(),
+                        linkage: FunctionSymbolLinkage::Global,
+                        format,
+                        reason: "an UNDEFINED-reference fact names a function this module \
+                                 DEFINES; the facts and the assembly disagree about what this \
+                                 object defines",
+                    });
+                }
+            }
+            // llc writes an unreferenced declaration's symbol only when it has
+            // a linkage or visibility to state. A strong, default-visible one
+            // would be a symbol no producer writes.
+            for function in &self.declared_undefined {
+                let weak = self.weak_undefined.contains(function);
+                let visible = self
+                    .undefined_visibility
+                    .get(function)
+                    .is_some_and(|visibility| *visibility != trust_ir::Visibility::Default);
+                if !weak && !visible {
+                    return Err(X86PipelineError::FunctionVisibilityUnsupported {
+                        function: function.clone(),
+                        visibility: trust_ir::Visibility::Default,
+                        format,
+                        reason: "an unreferenced declaration is written only when it is weak or \
+                                 states a non-default visibility; a strong default-visible one \
+                                 is a symbol no producer writes",
+                    });
+                }
+            }
+        }
+        for (function, binding) in &self.bindings {
+            // Facts and assembly must agree on what this object defines,
+            // whatever the fact says.
+            if !encoded.iter().any(|ef| ef.name == *function) {
+                return Err(Self::linkage_or_visibility_refusal(
+                    function,
+                    *binding,
+                    format,
+                    "the module emits no definition of it",
+                ));
+            }
+            // Weakness is the config's (`weak_function_definitions`); a fact
+            // that disagrees is refused, never merged.
+            if weak.contains(function) {
+                return Err(Self::linkage_or_visibility_refusal(
+                    function,
+                    *binding,
+                    format,
+                    "the module emits it as a weak definition, which neither a hidden \
+                     (CGU-private) nor a module-local definition ever is",
+                ));
+            }
+            match (format, binding.linkage(), binding.visibility()) {
+                // The ELF module emitter's two facts.
+                (X86OutputFormat::Elf, FunctionSymbolLinkage::Local, _)
+                | (
+                    X86OutputFormat::Elf,
+                    FunctionSymbolLinkage::Global,
+                    trust_ir::Visibility::Hidden | trust_ir::Visibility::Protected,
+                ) => {}
+                // The Mach-O module emitter's two facts.
+                (X86OutputFormat::MachO, FunctionSymbolLinkage::Local, _)
+                | (
+                    X86OutputFormat::MachO,
+                    FunctionSymbolLinkage::Global,
+                    trust_ir::Visibility::Hidden,
+                ) => {}
+                // The COFF module emitter's one fact.
+                (X86OutputFormat::Coff, FunctionSymbolLinkage::Local, _) => {}
+                (_, FunctionSymbolLinkage::Local, _) => {
+                    return Err(X86PipelineError::FunctionLinkageUnsupported {
+                        function: function.clone(),
+                        linkage: FunctionSymbolLinkage::Local,
+                        format,
+                        reason: "only the x86-64 ELF, Mach-O and COFF module emitters bind a \
+                                 module-local function definition local; the raw-bytes form \
+                                 has no symbol table to bind it in",
+                    });
+                }
+                (_, _, visibility) => {
+                    return Err(X86PipelineError::FunctionVisibilityUnsupported {
+                        function: function.clone(),
+                        visibility,
+                        format,
+                        reason: "only the x86-64 ELF module emitter spells STV_HIDDEN and \
+                                 STV_PROTECTED on a function definition, and the Mach-O one \
+                                 a hidden External definition (N_PEXT)",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The refusal for a fact about `function` that names the stated
+    /// binding's own facet: its linkage when it is local (where visibility is
+    /// vacuous), else its visibility.
+    fn linkage_or_visibility_refusal(
+        function: &str,
+        binding: crate::pipeline::FunctionSymbolBinding,
+        format: X86OutputFormat,
+        reason: &'static str,
+    ) -> X86PipelineError {
+        if binding.linkage() == crate::pipeline::FunctionSymbolLinkage::Local {
+            X86PipelineError::FunctionLinkageUnsupported {
+                function: function.to_string(),
+                linkage: crate::pipeline::FunctionSymbolLinkage::Local,
+                format,
+                reason,
+            }
+        } else {
+            X86PipelineError::FunctionVisibilityUnsupported {
+                function: function.to_string(),
+                visibility: binding.visibility(),
+                format,
+                reason,
+            }
+        }
+    }
+}
+
+/// Refuse, on COFF, any emitted weak or link-once definition (`weak`, the
+/// config's `weak_function_definitions`): the COFF module emitter places every
+/// function in one `.text` section and writes no COMDAT section or weak
+/// external, so the definition would be a strong `IMAGE_SYM_CLASS_EXTERNAL`
+/// symbol (`Compiler::compile` refuses such a module by name after trust-ir to
+/// LIR lowering and before instruction selection and emission; this is the
+/// emitter's own backstop). A module-local fact that disagrees with `weak` is
+/// [`X86FunctionSymbolFacts::check_against`]'s to refuse, and a definition
+/// cannot be stated both local and hidden (one binding per name).
+fn refuse_x86_coff_weak_definitions(
+    encoded: &[X86EncodedFunc],
+    format: X86OutputFormat,
+    weak: &std::collections::BTreeSet<String>,
+) -> Result<(), X86PipelineError> {
+    if format == X86OutputFormat::Coff
+        && let Some(ef) = encoded.iter().find(|ef| weak.contains(&ef.name))
+    {
+        return Err(X86PipelineError::ObjectEmission(format!(
+            "x86-64 COFF module emission: `{}` is a weak or link-once definition, which the COFF \
+             module emitter cannot spell (it writes no COMDAT section or weak external, so the \
+             definition would be a strong IMAGE_SYM_CLASS_EXTERNAL symbol) (fail-closed)",
+            ef.name
+        )));
+    }
+    Ok(())
+}
+
+/// Add the UNDEFINED symbol for `name` with the binding `facts` states:
+/// `STB_WEAK` for a weak reference, `STB_GLOBAL` otherwise, and the
+/// reference's `STV_*` in `st_other`.
+///
+/// EVERY undefined symbol `emit_module_elf` adds goes through here. That is
+/// the point: the emitter has five sites that can create one (a data slot, the
+/// EH personality, a `GlobalRef` to a data import, an `ExternRefGot` and a
+/// call fixup), and a site that reached past this helper would write a weak or
+/// hidden reference as a strong default-visible one — exactly the silent
+/// widening these facts exist to prevent. The symbol is global whatever its
+/// weakness (`add_symbol_with_attrs` forces `is_global || is_weak`), so no
+/// caller's symbol-index arithmetic moves partitions.
+fn add_x86_elf_undefined_symbol(
+    writer: &mut crate::elf::ElfWriter,
+    facts: &X86FunctionSymbolFacts,
+    name: &str,
+    sym_type: u8,
+) {
+    let (is_weak, visibility) = facts.undefined_reference(name);
+    writer.add_symbol_with_attrs(name, 0, 0, 0, true, is_weak, sym_type, visibility);
+}
+
+/// Whether an x86-64 object emitter writes zPLR unwind tables for a module —
+/// a CIE with a personality and an LSDA per described function: when any
+/// function carries its own exception-handling structure, or, under
+/// whole-program `panic=unwind`, when any function has a frame (the
+/// cross-object walk-through coverage). The ONE trigger the Mach-O emitter
+/// (`emit_module_macho`'s filler pass), the ELF planner
+/// ([`plan_x86_64_elf_module_unwind`]), the relocation inventory
+/// (`x86_object_relocation_inventory_rows_into`) and the certified-object
+/// exception-table census ([`X86Pipeline::exception_table_functions`]) read.
+fn x86_module_emits_eh_frame(panic_unwind: bool, encoded: &[X86EncodedFunc]) -> bool {
+    encoded.iter().any(|ef| ef.eh.is_some())
+        || (panic_unwind && encoded.iter().any(|ef| ef.frame_metadata.is_some()))
+}
+
+/// Whether a function of a Mach-O module with zPLR tables gets the synthetic
+/// all-filler LSDA (and so a personality reference): a frame-covered function
+/// without exception-handling structure of its own. Shared by the Mach-O
+/// emitter's filler pass and the certified-object exception-table census.
+fn x86_macho_gets_filler_lsda(ef: &X86EncodedFunc) -> bool {
+    ef.eh.is_none() && ef.frame_metadata.is_some()
+}
+
+impl X86Pipeline {
+    /// The functions of `assembled` whose object form carries an LSDA and a
+    /// personality reference, from the decisions the emitters make:
+    ///
+    /// * Mach-O: every function with exception-handling structure and, when
+    ///   the module gets zPLR tables ([`x86_module_emits_eh_frame`],
+    ///   `panic=unwind` included), every function that gets the all-filler
+    ///   LSDA ([`x86_macho_gets_filler_lsda`]);
+    /// * ELF: every function, when [`plan_x86_64_elf_module_unwind`] plans the
+    ///   unwind surface (every FDE under its zPLR CIE carries an LSDA); the
+    ///   planner's own refusals are returned as they would be at emission;
+    /// * COFF and raw bytes: the functions with exception-handling structure
+    ///   (refused for COFF before assembly).
+    ///
+    /// A certified compile therefore refuses exactly the exception tables the
+    /// object would carry, walk-through filler tables included. Each name
+    /// comes with whether its tables are walk-through tables only (no EH
+    /// structure of its own), which the refusal names.
+    #[cfg(feature = "verify")]
+    pub(crate) fn exception_table_functions(
+        &self,
+        assembled: &X86AssembledModule,
+    ) -> Result<Vec<(String, bool)>, X86PipelineError> {
+        let encoded = &assembled.encoded;
+        // (name, walk-through only: the tables of a function without EH
+        // structure of its own).
+        let names = |keep: &dyn Fn(&X86EncodedFunc) -> bool| {
+            encoded
+                .iter()
+                .filter(|ef| keep(ef))
+                .map(|ef| (ef.name.clone(), ef.eh.is_none()))
+                .collect()
+        };
+        Ok(match assembled.effective_format {
+            X86OutputFormat::MachO => {
+                let fillers = x86_module_emits_eh_frame(self.config.panic_unwind, encoded);
+                names(&|ef| ef.eh.is_some() || (fillers && x86_macho_gets_filler_lsda(ef)))
+            }
+            X86OutputFormat::Elf => match plan_x86_64_elf_module_unwind(&self.config, encoded)? {
+                Some(_) => names(&|_| true),
+                None => names(&|ef| ef.eh.is_some()),
+            },
+            X86OutputFormat::Coff | X86OutputFormat::RawBytes => names(&|ef| ef.eh.is_some()),
+        })
+    }
 }
 
 impl X86AssembledModule {
@@ -765,6 +1234,8 @@ impl Default for X86TargetFeatures {
 /// Errors during x86-64 compilation.
 #[derive(Debug)]
 pub enum X86PipelineError {
+    /// Operator configuration cannot supply a valid execution budget.
+    ResourceBudget(trust_cg_process_env::resource_budget::ResourceBudgetError),
     /// Instruction selection failed.
     ISel(String),
     /// Register allocation ran out of registers.
@@ -829,6 +1300,57 @@ pub enum X86PipelineError {
         symbol: String,
         reason: String,
     },
+    /// A weak undefined data reference (`ObjectGlobal { is_import, is_weak }`,
+    /// trust-ir `ExternalWeak`) reached an x86-64 object writer, none of which
+    /// spells one. Emitting it strong would replace null-on-missing semantics.
+    WeakUndefinedReferenceUnsupported {
+        symbol: String,
+        format: X86OutputFormat,
+    },
+    /// A data import with a stated hidden or protected visibility
+    /// (`ObjectGlobal { is_import, visibility }`) reached an x86-64 object
+    /// writer, none of which spells visibility on an undefined symbol.
+    /// Emitting it default-visible would widen it.
+    ImportVisibilityUnsupported {
+        symbol: String,
+        visibility: trust_ir::Visibility,
+        format: X86OutputFormat,
+    },
+    /// A function-symbol fact ([`X86FunctionSymbolFacts`]) this x86-64
+    /// emitter cannot honour: a hidden or protected definition off ELF, a
+    /// protected one on Mach-O, or a name the module does not define.
+    /// Emitting the function default-visible would export it.
+    FunctionVisibilityUnsupported {
+        function: String,
+        visibility: trust_ir::Visibility,
+        format: X86OutputFormat,
+        reason: &'static str,
+    },
+    /// Two symbols the x86-64 Mach-O module emitter writes would carry the
+    /// same nlist name (`symbol`, written `nlist`): a definition, an LSDA
+    /// label or the EH personality coincide with another definition or LSDA
+    /// label (`existing`). One nlist name names one symbol, so a reference
+    /// could not be bound to the one it means.
+    MachOSymbolNameCollision {
+        symbol: String,
+        nlist: String,
+        kind: &'static str,
+        existing: &'static str,
+    },
+    /// A module-local function definition fact ([`X86FunctionSymbolFacts`])
+    /// this x86-64 emitter cannot honour: the raw-bytes form has no symbol
+    /// table, so only the ELF, Mach-O and COFF module emitters bind a
+    /// definition local (`STB_LOCAL`, a non-external `N_SECT` symbol,
+    /// `IMAGE_SYM_CLASS_STATIC`), and a fact that disagrees with the module's
+    /// definitions or its weak set is refused too. Emitting it global would
+    /// export the body from any shared object the result is linked into and
+    /// let another input preempt this object's calls to it.
+    FunctionLinkageUnsupported {
+        function: String,
+        linkage: crate::pipeline::FunctionSymbolLinkage,
+        format: X86OutputFormat,
+        reason: &'static str,
+    },
     /// COFF object emission failed.
     Coff(crate::coff::CoffError),
     /// Mach-O relocation emission failed validation.
@@ -844,11 +1366,35 @@ pub enum X86PipelineError {
     /// writer's intent (a would-be malformed object). Fail-closed redundancy
     /// gate; also the per-object binding the relocation inventory claims.
     ElfReparse(String),
+    /// The object writer refused: section layout, the symbol table, a
+    /// relocation or its addend, or a module-level call/address target could
+    /// not be represented in the emitted Mach-O/ELF/COFF object.
+    ///
+    /// Typed apart from the code-generation variants (`ISel`, `RegAlloc`,
+    /// `ConstantPool`, `FrameLowering`, ...) so the layer that refused is the
+    /// variant, not a guess from the message (trust-core architecture AD-8).
+    ObjectEmission(String),
+    /// The exception-handling / unwind layer refused: EH structure
+    /// validation, `__eh_frame` CIE/FDE construction, LSDA / personality
+    /// symbols, or Windows `.pdata`/`.xdata` unwind records.
+    Unwind(String),
+    /// A function's exception-handling metadata (landing pads, call-site
+    /// ranges, resolved exception table) is malformed or cannot be laid out.
+    MalformedEh { function: String, detail: String },
+    /// JIT block-profiling instrumentation refused: its counter trampolines
+    /// could not be spliced into an already-encoded function body (block
+    /// offsets, branch retargeting, rel32 patches after the splice), or the
+    /// configuration cannot host them (a Windows x64 host under simplified
+    /// register allocation, which may allocate the R10 the trampoline uses).
+    BlockProfiling(String),
+    /// The parallel worker pool the encoder runs on could not be built.
+    WorkerPool(rayon::ThreadPoolBuildError),
 }
 
 impl core::fmt::Display for X86PipelineError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::ResourceBudget(error) => write!(f, "invalid execution resource budget: {error}"),
             Self::ISel(msg) => write!(f, "x86-64 ISel failed: {}", msg),
             Self::RegAlloc(msg) => write!(f, "x86-64 regalloc failed: {}", msg),
             Self::RegAllocRematerializationReplayUnsupported { opcode } => write!(
@@ -932,6 +1478,47 @@ impl core::fmt::Display for X86PipelineError {
                     "x86-64 ExternRef from {function} to {symbol} is unsupported: {reason}"
                 )
             }
+            Self::WeakUndefinedReferenceUnsupported { symbol, format } => write!(
+                f,
+                "x86-64 {format:?} emission does not spell weak undefined reference `{symbol}` (fail-closed)"
+            ),
+            Self::ImportVisibilityUnsupported {
+                symbol,
+                visibility,
+                format,
+            } => write!(
+                f,
+                "x86-64 {format:?} emission does not spell visibility `{visibility}` on undefined data reference `{symbol}` (fail-closed)"
+            ),
+            Self::FunctionVisibilityUnsupported {
+                function,
+                visibility,
+                format,
+                reason,
+            } => write!(
+                f,
+                "x86-64 {format:?} emission cannot bind function `{function}` with visibility `{visibility}`: {reason} (fail-closed)"
+            ),
+            Self::MachOSymbolNameCollision {
+                symbol,
+                nlist,
+                kind,
+                existing,
+            } => write!(
+                f,
+                "[TCG-MACHO-SYMBOL-COLLISION] x86-64 Mach-O emission cannot name the {kind} \
+                 `{symbol}` `{nlist}`: that nlist name already names this object's {existing} \
+                 (fail-closed)"
+            ),
+            Self::FunctionLinkageUnsupported {
+                function,
+                linkage,
+                format,
+                reason,
+            } => write!(
+                f,
+                "x86-64 {format:?} emission cannot bind function `{function}` with linkage `{linkage:?}`: {reason} (fail-closed)"
+            ),
             Self::Coff(e) => write!(f, "x86-64 COFF object emission failed: {}", e),
             Self::MachORelocation(e) => {
                 write!(f, "x86-64 Mach-O relocation emission failed: {e}")
@@ -943,6 +1530,14 @@ impl core::fmt::Display for X86PipelineError {
             Self::ElfReparse(msg) => {
                 write!(f, "x86-64 ELF reparse gate rejected serialization: {}", msg)
             }
+            Self::ObjectEmission(msg) => write!(f, "x86-64 object emission failed: {msg}"),
+            Self::Unwind(msg) => write!(f, "x86-64 exception-handling/unwind failed: {msg}"),
+            Self::MalformedEh { function, detail } => write!(
+                f,
+                "malformed x86-64 exception-handling metadata in `{function}`: {detail}"
+            ),
+            Self::BlockProfiling(msg) => write!(f, "x86-64 JIT block profiling failed: {msg}"),
+            Self::WorkerPool(error) => write!(f, "parallel worker pool error: {error}"),
         }
     }
 }
@@ -1174,11 +1769,13 @@ fn x86_symbol_ref_unsupported(
     reason: impl Into<String>,
 ) -> X86PipelineError {
     match kind {
-        X86SymbolRefFixupKind::GlobalRef => X86PipelineError::GlobalRefUnsupported {
-            function,
-            symbol,
-            reason: reason.into(),
-        },
+        X86SymbolRefFixupKind::GlobalRef | X86SymbolRefFixupKind::ExactFunctionAddr => {
+            X86PipelineError::GlobalRefUnsupported {
+                function,
+                symbol,
+                reason: reason.into(),
+            }
+        }
         X86SymbolRefFixupKind::ExternRefGot => X86PipelineError::ExternRefUnsupported {
             function,
             symbol,
@@ -1191,6 +1788,47 @@ fn x86_symbol_ref_unsupported(
             symbol,
             reason: reason.into(),
         },
+    }
+}
+
+fn reject_exact_x86_object_address(function: &str, symbol: &str) -> X86PipelineError {
+    X86PipelineError::GlobalRefUnsupported {
+        function: function.into(), symbol: symbol.into(),
+        reason: "exact function addresses require non-preemptible object symbol bindings; use the exact local JIT path".into(),
+    }
+}
+
+// Scalar/unary operands allocate nothing; only pending SIB siblings need stack
+// storage. Malformed nested exact symbols must not become register-zero inputs.
+fn x86_operand_contains_exact_symbol(operand: &X86ISelOperand) -> bool {
+    let mut current = operand;
+    let mut pending = Vec::new();
+    loop {
+        match current {
+            X86ISelOperand::ExactModuleSymbol(_) => return true,
+            X86ISelOperand::MemAddr { base, .. } => {
+                current = base;
+                continue;
+            }
+            X86ISelOperand::SibMemAddr { base, index, .. } => {
+                match index.as_ref() {
+                    X86ISelOperand::ExactModuleSymbol(_) => return true,
+                    // Only adversarial nested address trees need a work stack.
+                    // Ordinary register-indexed operands allocate nothing.
+                    X86ISelOperand::MemAddr { .. } | X86ISelOperand::SibMemAddr { .. } => {
+                        pending.push(index.as_ref());
+                    }
+                    _ => {}
+                }
+                current = base;
+                continue;
+            }
+            _ => {}
+        }
+        match pending.pop() {
+            Some(next) => current = next,
+            None => return false,
+        }
     }
 }
 
@@ -1218,9 +1856,137 @@ fn reject_x86_thread_local_globals(
     Ok(())
 }
 
+/// A direct call (`R_X86_64_PLT32`) whose callee names a known DATA object
+/// global is a malformed module, not an external function: the relocation
+/// would bind to an `STT_OBJECT` symbol and the linker would route a call
+/// through a data address. The emitter and the relocation inventory share
+/// this preflight so the inventory cannot certify an object emission refuses.
+///
+/// A function and a data global under ONE name are refused first, as the
+/// duplicate symbol they are: otherwise a call to that function would be
+/// reported as a call into data.
+fn reject_x86_elf_calls_to_object_globals(
+    encoded: &[X86EncodedFunc],
+    globals: &[crate::pipeline::ObjectGlobal],
+) -> Result<(), X86PipelineError> {
+    reject_x86_elf_function_data_name_collisions(encoded, globals)?;
+    let objects: std::collections::HashSet<&str> =
+        globals.iter().map(|global| global.name.as_str()).collect();
+    for function in encoded {
+        if let Some(fixup) = function
+            .call_fixups
+            .iter()
+            .find(|fixup| objects.contains(fixup.callee.as_str()))
+        {
+            // An object/link refusal, not a machine-code one: the emitter and the
+            // relocation inventory raise it, like AArch64's
+            // `AotCodeReferenceReachesData`. As `MalformedFunction` the bridge
+            // filed it under TCG-REGALLOC-063.
+            return Err(X86PipelineError::ObjectEmission(format!(
+                "function `{}`: direct call targets the known data object global `{}`; an \
+                 R_X86_64_PLT32 relocation cannot bind to an STT_OBJECT symbol (fail-closed)",
+                function.name, fixup.callee
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Check every `.symtab` index the x86-64 ELF module emitter computed by its
+/// own locals-first arithmetic against the order the writer serializes.
+///
+/// The emitter never calls `ElfWriter::final_symbol_index` (which freezes the
+/// table mid-emission): it counts the LOCAL symbols up front and hands each
+/// symbol its final index at insertion, writing that index straight into
+/// relocations. A local added anywhere without a reservation shifts every
+/// global behind it, and every relocation naming one then binds to a
+/// different symbol. The writer's reparse gate cannot see that — it checks
+/// the relocation records as supplied — so the emitter checks that each index
+/// it handed out names, in the serialized table, the symbol it was handed to.
+fn check_x86_elf_symbol_indices<'a>(
+    writer: &ElfWriter,
+    assigned: impl IntoIterator<Item = (&'a str, u32)>,
+) -> Result<(), X86PipelineError> {
+    let order = writer.symbols_in_final_order();
+    let mut assigned: Vec<(&str, u32)> = assigned.into_iter().collect();
+    // Report the lowest mis-wired index, whatever the map's iteration order.
+    assigned.sort_unstable_by_key(|&(name, index)| (index, name));
+    for (name, index) in assigned {
+        let serialized = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|slot| order.get(slot))
+            .map(|symbol| symbol.name.as_str());
+        if serialized != Some(name) {
+            return Err(X86PipelineError::ObjectEmission(format!(
+                "x86-64 ELF symbol `{name}` was assigned .symtab index {index}, but the writer \
+                 serializes {} there; a local symbol outside the reserved count shifted the \
+                 index and would mis-wire every relocation naming it (fail-closed)",
+                serialized.map_or_else(|| "no symbol".to_string(), |other| format!("`{other}`"))
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One x86-64 ELF object names every function and data global in one symbol
+/// table, so a function and a data global sharing a name are a duplicate
+/// symbol: one `.symtab` entry cannot be both, and whichever the emitter
+/// wrote second would shadow the first in every relocation naming it.
+fn reject_x86_elf_function_data_name_collisions(
+    encoded: &[X86EncodedFunc],
+    globals: &[crate::pipeline::ObjectGlobal],
+) -> Result<(), X86PipelineError> {
+    let functions: std::collections::HashSet<&str> = encoded
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    if let Some(global) = globals
+        .iter()
+        .find(|global| functions.contains(global.name.as_str()))
+    {
+        return Err(X86PipelineError::ObjectEmission(format!(
+            "x86-64 ELF module declares `{}` as both a function and a data global; one \
+             symbol table cannot name two entities with one symbol (duplicate symbol, \
+             fail-closed)",
+            global.name
+        )));
+    }
+    Ok(())
+}
+
+/// trust-ir v41 `Global.section` has no x86-64 placement: the x86-64 Mach-O,
+/// ELF and COFF emitters place globals only by mutability/initializer.
+/// Refuse with the named `[TCG-SECTION-TARGET]` diagnostic rather than drop
+/// the request (the AArch64 emitters honor valid names).
+fn reject_x86_explicit_section_globals(
+    globals: &[crate::pipeline::ObjectGlobal],
+) -> Result<(), X86PipelineError> {
+    if let Some(global) = globals.iter().find(|global| global.section.is_some()) {
+        return Err(X86PipelineError::GlobalRefUnsupported {
+            function: String::new(),
+            symbol: global.name.clone(),
+            reason: format!(
+                "[{}] explicit section `{}` (trust-ir v41) is not placed by the x86-64 object emitters (fail-closed)",
+                crate::object_sections::SectionRefusal::TargetUnsupported,
+                global.section.as_deref().unwrap_or_default()
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl From<X86EncodeError> for X86PipelineError {
     fn from(e: X86EncodeError) -> Self {
         Self::Encoding(e)
+    }
+}
+
+/// An ELF section the writer refuses (its type, flags, alignment, entry size
+/// or zero-fill content) is an object-emission refusal.
+impl From<crate::elf::ElfSectionError> for X86PipelineError {
+    fn from(error: crate::elf::ElfSectionError) -> Self {
+        Self::ObjectEmission(error.to_string())
     }
 }
 
@@ -1307,8 +2073,20 @@ fn align_vec_to(bytes: &mut Vec<u8>, alignment: usize) {
 /// address. Those coincide only if every function begins on a 32-byte boundary,
 /// which needs BOTH this section alignment AND per-function padding in
 /// `combined_code`; either alone leaves the boundaries off in the final image.
+///
+/// The loop-head containment aligner needs 64 (2^6) for exactly the same
+/// reason at twice the granularity: at 32-byte function alignment, function
+/// starts land at `0 mod 64` and `32 mod 64` in roughly equal numbers, so a
+/// function-relative 64-byte aligner would target the wrong grid in about half
+/// of all functions. See `x86_loop_head_align_enabled`.
 fn x86_text_align_log2() -> u32 {
-    if x86_jcc_align_enabled() { 5 } else { 4 }
+    if x86_loop_head_align_enabled() {
+        6
+    } else if x86_jcc_align_enabled() {
+        5
+    } else {
+        4
+    }
 }
 
 /// Pad a code buffer up to `alignment` with one-byte `NOP`s (0x90).
@@ -1340,20 +2118,17 @@ pub struct X86RegAssignment {
     pub used_callee_saved: Vec<X86PReg>,
     /// Windows x64 callee-saved XMM registers that need 128-bit save/restore.
     pub used_callee_saved_xmms: Vec<X86PReg>,
-    /// Number of spill slots needed.
-    pub num_spills: u32,
-    #[allow(dead_code)]
+    /// Spill slots the full allocator requested; `install_x86_spill_slots`
+    /// turns each into an ordinary frame stack slot.
     spill_plan: X86SpillPlan,
 }
 
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 struct X86SpillPlan {
     slots: Vec<X86SpillSlot>,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct X86SpillSlot {
     vreg: VReg,
     size: u32,
@@ -1427,6 +2202,57 @@ fn x86_callee_saved_gpr_save_root(abi: X86CallAbi, reg: X86PReg) -> Option<X86PR
         .then_some(root)
 }
 
+/// Add to `used_callee_saved` every callee-saved GPR root that a FIXED
+/// register def writes: an explicit `PReg` def operand, or an implicit def of
+/// the opcode (`x86_inst_implicit_gpr64_roots`).
+///
+/// [`x86_used_callee_saved_from_allocation`] sees only the VReg allocation, so
+/// a callee-saved register written through a fixed def — the 128-bit atomic
+/// load pseudo's `XOR EBX,EBX`, which `AtomicLoadCmpxchg16b` declares as an
+/// implicit RBX def — would be clobbered with no prologue save: a silent ABI
+/// break in the CALLER, which no post-RA gate checks (TV-5 leaves callee-saved
+/// restore correctness out of scope). RBP (the frame pointer, saved by the
+/// frame itself) and RSP are never added. No other opcode's implicit defs
+/// (RAX, RDX, R10) and no SysV lowering's explicit fixed defs name a
+/// callee-saved register, so no other frame changes. The list stays sorted by
+/// encoding, like the allocation-derived set.
+fn x86_merge_fixed_callee_saved_gpr_defs(
+    func: &X86ISelFunction,
+    abi: X86CallAbi,
+    used_callee_saved: &mut Vec<X86PReg>,
+) {
+    let add = |reg: X86PReg, used_callee_saved: &mut Vec<X86PReg>| {
+        if let Some(root) = x86_callee_saved_gpr_save_root(abi, reg)
+            && root != RBP
+            && root != RSP
+            && !used_callee_saved.contains(&root)
+        {
+            used_callee_saved.push(root);
+        }
+    };
+    for block_id in &func.block_order {
+        let Some(block) = func.blocks.get(block_id) else {
+            continue;
+        };
+        for inst in &block.insts {
+            for (idx, operand) in inst.operands.iter().enumerate() {
+                if let X86ISelOperand::PReg(preg) = operand
+                    && x86_operand_access(inst, idx).is_def
+                {
+                    add(*preg, used_callee_saved);
+                }
+            }
+            let mut implicit_uses = Vec::new();
+            let mut implicit_defs = Vec::new();
+            x86_inst_implicit_gpr64_roots(inst, &mut implicit_uses, &mut implicit_defs);
+            for reg in implicit_defs {
+                add(reg, used_callee_saved);
+            }
+        }
+    }
+    used_callee_saved.sort_by_key(|reg| reg.encoding());
+}
+
 fn x86_used_callee_saved_from_allocation(
     abi: X86CallAbi,
     allocation: &HashMap<VReg, X86PReg>,
@@ -1485,7 +2311,6 @@ fn apply_x86_abi_allocatable_regs(config: &mut trust_cg_regalloc::AllocConfig, a
     config.allocatable_regs.insert(RegClass::Fpr32, x86_xmms);
 }
 
-#[allow(dead_code)]
 fn remove_allocatable_x86_preg(config: &mut trust_cg_regalloc::AllocConfig, reg: X86PReg) {
     let Some(preg) = x86_to_preg(reg) else {
         return;
@@ -1496,7 +2321,6 @@ fn remove_allocatable_x86_preg(config: &mut trust_cg_regalloc::AllocConfig, reg:
     }
 }
 
-#[allow(dead_code)]
 fn reserve_x86_spill_scratch_regs(config: &mut trust_cg_regalloc::AllocConfig, abi: X86CallAbi) {
     remove_allocatable_x86_preg(config, R10);
     remove_allocatable_x86_preg(config, R10D);
@@ -1507,7 +2331,6 @@ fn reserve_x86_spill_scratch_regs(config: &mut trust_cg_regalloc::AllocConfig, a
     }
 }
 
-#[allow(dead_code)]
 fn x86_spill_gpr_scratch_regs(class: RegClass) -> [X86PReg; 2] {
     if class == RegClass::Gpr32 {
         [R10D, R11D]
@@ -1516,7 +2339,6 @@ fn x86_spill_gpr_scratch_regs(class: RegClass) -> [X86PReg; 2] {
     }
 }
 
-#[allow(dead_code)]
 fn x86_spill_xmm_scratch_regs(abi: X86CallAbi) -> [X86PReg; 2] {
     match abi {
         X86CallAbi::SystemV => [XMM14, XMM15],
@@ -1570,6 +2392,8 @@ fn is_x86_volatile_load(opcode: X86Opcode) -> bool {
             | X86Opcode::VolatileMovsdRM
             | X86Opcode::VolatileMovdquRM
             | X86Opcode::VolatileMovdqaRM
+            | X86Opcode::VolatileMovzxRM8
+            | X86Opcode::VolatileMovzxRM16
     )
 }
 
@@ -1634,7 +2458,6 @@ fn x86_spill_store_opcode(class: RegClass) -> X86Opcode {
     }
 }
 
-#[allow(dead_code)]
 fn x86_spill_stack_mem(slot: u32) -> X86ISelOperand {
     X86ISelOperand::MemAddr {
         base: Box::new(X86ISelOperand::StackSlot(slot)),
@@ -1662,6 +2485,25 @@ impl X86RegAssignment {
         func: &X86ISelFunction,
         abi: X86CallAbi,
     ) -> Result<Self, X86PipelineError> {
+        // This first-appearance allocator models no fixed-register interference
+        // and derives the callee-saved set from its own allocation only, while
+        // the 128-bit atomic-load pseudo clobbers RAX/RDX/RBX/RCX, including
+        // the callee-saved RBX. Refuse rather than place a live value (or the
+        // address base) in a register the pseudo's zeroing overwrites.
+        if func.block_order.iter().any(|block| {
+            func.blocks.get(block).is_some_and(|mblock| {
+                mblock
+                    .insts
+                    .iter()
+                    .any(|inst| inst.opcode == X86Opcode::AtomicLoadCmpxchg16b)
+            })
+        }) {
+            return Err(X86PipelineError::RegAlloc(
+                "the CMPXCHG16B atomic-load pseudo requires the full register allocator (its \
+                 RAX/RDX/RBX/RCX clobbers and the callee-saved RBX save)"
+                    .to_string(),
+            ));
+        }
         let mut allocation: HashMap<VReg, X86PReg> = HashMap::new();
         let mut used_gprs: HashSet<X86PReg> = HashSet::new();
         let mut used_xmms: HashSet<X86PReg> = HashSet::new();
@@ -1821,7 +2663,6 @@ impl X86RegAssignment {
             allocation,
             used_callee_saved,
             used_callee_saved_xmms,
-            num_spills: 0,
             spill_plan: X86SpillPlan::default(),
         })
     }
@@ -1924,8 +2765,11 @@ fn reject_unsupported_x86_sib_isel_inst(inst: &X86ISelInst) -> Result<(), X86Pip
             | X86Opcode::MovMR32Sib
             | X86Opcode::MovsdRMSib
             | X86Opcode::MovssRMSib
+            | X86Opcode::MovdquRMSib
+            | X86Opcode::MovdquMRSib
             | X86Opcode::MovRM8Sib
             | X86Opcode::MovMR8Sib
+            | X86Opcode::MovzxRM8Sib
             | X86Opcode::XorMRSib
             | X86Opcode::AddMRSib
     ) && !inst
@@ -2141,15 +2985,20 @@ fn resolve_inst_operands(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> 
             }
         }
 
-        // MOV r, [base+disp] (load)
+        // MOV r, [base+disp] (load), and the zero-extending MOVZX r32, m8/m16
+        // loads with the same `[dst, MemAddr]` schema.
         X86Opcode::MovRM8
         | X86Opcode::MovRM16
         | X86Opcode::MovRM32
         | X86Opcode::MovRM
+        | X86Opcode::MovzxRM8
+        | X86Opcode::MovzxRM16
         | X86Opcode::VolatileMovRM8
         | X86Opcode::VolatileMovRM16
         | X86Opcode::VolatileMovRM32
-        | X86Opcode::VolatileMovRM => {
+        | X86Opcode::VolatileMovRM
+        | X86Opcode::VolatileMovzxRM8
+        | X86Opcode::VolatileMovzxRM16 => {
             if let Some(op) = inst.operands.first() {
                 ops.dst = resolve_operand(op, alloc);
             }
@@ -2575,6 +3424,23 @@ fn resolve_inst_operands(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> 
             }
         }
 
+        // The 128-bit atomic-load pseudo: [MemAddr] only. RAX/RDX/RBX/RCX are
+        // implicit clobbers (`add_x86_fixed_implicit_operands`), never operands,
+        // so `dst`/`src` stay empty. A stray register operand is surfaced in
+        // `dst`/`src` rather than dropped, so the encoder refuses it.
+        X86Opcode::AtomicLoadCmpxchg16b => {
+            for op in &inst.operands {
+                match op {
+                    X86ISelOperand::MemAddr { base, disp } => {
+                        ops.base = resolve_operand(base, alloc);
+                        ops.disp = *disp as i64;
+                    }
+                    other if ops.dst.is_none() => ops.dst = resolve_operand(other, alloc),
+                    other => ops.src = resolve_operand(other, alloc),
+                }
+            }
+        }
+
         // AtomicRmwCasLoop pseudo: [dst, value, mem, op-kind].
         X86Opcode::AtomicRmwCasLoop
         | X86Opcode::AtomicRmwCasLoop8
@@ -2719,7 +3585,9 @@ fn resolve_inst_operands(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> 
         | X86Opcode::MovRM32Sib
         | X86Opcode::MovsdRMSib
         | X86Opcode::MovssRMSib
-        | X86Opcode::MovRM8Sib => {
+        | X86Opcode::MovdquRMSib
+        | X86Opcode::MovRM8Sib
+        | X86Opcode::MovzxRM8Sib => {
             if let Some(op) = inst.operands.first() {
                 ops.dst = resolve_operand(op, alloc);
             }
@@ -2732,6 +3600,9 @@ fn resolve_inst_operands(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> 
         X86Opcode::MovMRSib
         | X86Opcode::MovMR32Sib
         | X86Opcode::MovMR8Sib
+        // Scaled-index 128-bit packed store: same [SibMemAddr, src_xmm]
+        // resolution as the GPR SIB stores (dst field holds the source register).
+        | X86Opcode::MovdquMRSib
         // Memory-destination RMW ALU, SIB forms: same [SibMemAddr, src]
         // resolution as the SIB stores (dst field holds the source register).
         | X86Opcode::XorMRSib
@@ -2795,7 +3666,34 @@ const X86_JCC_BOUNDARY: usize = 32;
 ///
 /// Padding is semantically neutral (multi-byte NOPs), so the cost of being
 /// wrong here is size and speed, never correctness.
+static JCC_ALIGN_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the JCC-erratum padding opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-jcc-align`).
+///
+/// The environment kill switch below is refused by `trustc` before this backend
+/// loads, so without this setter the pass could not be A/B'd through the bridge —
+/// and it is a pass that emits NOPs into real hot loops, so being unmeasurable is
+/// not a small gap.
+///
+/// This knob disables branch padding AND the associated per-function and
+/// section alignment (see [`x86_jcc_align_enabled`]). An A/B therefore measures
+/// the combined alignment regime, not the cost of each padding byte alone.
+/// Even on a target unaffected by the erratum, a speedup does not follow from
+/// removing padding: layout changes can affect instruction delivery. Retain the
+/// default unless matched measurements support a different policy for the
+/// intended target and workload.
+pub fn set_jcc_align_disabled(disabled: bool) -> bool {
+    match JCC_ALIGN_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => JCC_ALIGN_DISABLED.get() == Some(&requested),
+    }
+}
+
 fn x86_jcc_align_enabled() -> bool {
+    if let Some(disabled) = JCC_ALIGN_DISABLED.get() {
+        return !*disabled;
+    }
     !crate::env_lock::var_os("TCG_NO_X86_JCC_ALIGN").is_some_and(|v| v != "0")
 }
 
@@ -2942,6 +3840,433 @@ fn resolved_encode_opcode(inst: &X86ISelInst, ops: &X86InstOperands) -> X86Opcod
     } else {
         inst.opcode
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loop-head 64-byte containment aligner (`x86_loop_head_align`)
+// ---------------------------------------------------------------------------
+
+/// L1 instruction-fetch line this pass reasons about.
+///
+/// ⚑ 64, NOT 32 and NOT 16, and the distinction is the whole pass:
+///
+/// * 32 is the JCC-erratum boundary (`X86_JCC_BOUNDARY`). The 32-byte
+///   DSB-window hypothesis was REFUTED on p1/p5 and EXCLUDED for p7 (window
+///   count constant across a 1.6x swing) — do not resurrect it here.
+/// * 16 is what the reverted 2026-07-16 x86 loop aligner used, and a 16-byte
+///   grid does not decide 64-byte containment at all: a 16-aligned head still
+///   lands at 0/16/32/48 mod 64, so a 25-byte body still straddles one time in
+///   four, deterministically, wherever the arithmetic lands.
+const X86_LOOP_ALIGN_BOUNDARY: usize = 64;
+
+/// Default cap on the loop body this pass will try to contain.
+///
+/// A body longer than one fetch line CANNOT be contained, so padding it is
+/// pure displacement noise. That is the exact inverse of the 2026-07-16
+/// `span >= 96B` heuristic, which padded only loops that could never be
+/// contained and relocated a −50% catastrophe onto b02_sieve.
+const X86_LOOP_ALIGN_DEFAULT_MAX_BODY: usize = 64;
+
+/// Default cap on the pad itself: a full line, i.e. always align when the
+/// other gates say the loop is a containment candidate.
+const X86_LOOP_ALIGN_DEFAULT_MAX_SKIP: usize = 63;
+
+/// Default pad budget at a LIVE (fall-through) seam: the same as at a dead one.
+///
+/// ⚑ **THIS WAS 0 — REFUSE — UNTIL 2026-09-29, AND THE REFUSAL COST 14.8% ON
+/// `h3_box_leak`.** The refusal was imported from the aarch64 pass's only
+/// measured failure mode (huffbench: 3.0e9 retired pad NOPs inside a hot
+/// enclosing loop, for an alignment worth 0 — `loop_align.rs` module docs), on
+/// the stated ground that on this corpus 41 of 45 innermost heads sit behind a
+/// non-elided `jmp` so refusing "costs nothing today". That was measured on the
+/// then-current code, and it stopped being true the moment an unrelated pass
+/// changed h3's instruction count: `h3_box_leak`'s inner loop then landed on a
+/// LIVE seam, straddled a fetch line, and this gate refused to repair it —
+/// 26.75 ms against 23.28 ms with the pad allowed, i.e. 1.1421x LLVM -O3 versus
+/// 0.9935x, on a byte-identical-copy floor of 0.1%.
+///
+/// # Why the huffbench failure mode cannot recur here, as an ARGUMENT
+///
+/// G5 admits only a body of at most one fetch line and G6 pads only a body that
+/// STRADDLES where it stands. Write `h` for the head offset and `len` for the
+/// body length WHERE IT STANDS, with the JCC-erratum NOPs it carries there.
+/// Straddling means `h mod 64 + len > 64`, and the pad is `64 - (h mod 64)`.
+/// Subtracting, **the pad is strictly SMALLER than the body as it stands,
+/// always** — a straddling loop cannot need a pad as long as itself. The
+/// ALIGNED body can be shorter than the pad: aligning moves the 32-byte JCC
+/// grid under the body and can remove those NOPs (the factorial of
+/// `e2e_x86_64_differential`: pad 58, aligned body 54).
+///
+/// The pad retires once per ENTRY to the loop; the body as it stands retires
+/// once per ITERATION. So the worst case is one sub-iteration of extra fetch
+/// per entry against one saved line crossing (and any removed JCC NOPs) per
+/// iteration, and the trade pays from about the second iteration on.
+/// Huffbench's case is excluded by G6, not by this
+/// gate: there the alignment was "worth 0", which means the loop was not a
+/// containment repair at all.
+///
+/// The knob `-Ztrust-ir-cg-args=x86-loop-align-seam-pad=0` restores the refusal,
+/// which is how this policy stays falsifiable.
+const X86_LOOP_ALIGN_DEFAULT_SEAM_PAD: usize = X86_LOOP_ALIGN_DEFAULT_MAX_SKIP;
+
+/// Is the loop-head containment aligner enabled? Kill switch
+/// `TCG_NO_X86_LOOP_HEAD_ALIGN=1`.
+///
+/// ⚑ LIKE THE JCC FLAG, THIS ALSO CONTROLS FUNCTION AND SECTION ALIGNMENT,
+/// and for the same reason: the pass can only see `encoder.position()`, an
+/// offset relative to the START OF THE FUNCTION, while fetch-line containment
+/// is a property of the ABSOLUTE address. Function starts are 32-byte aligned
+/// today, so they land at `0 mod 64` and `32 mod 64` in roughly equal numbers
+/// (measured: 32 in p7_sieve / v2_memfill / p1_xorshift, 0 in p4_matmul) and a
+/// function-relative 64-byte aligner would target the WRONG grid in about half
+/// of all functions. That is the identical half-effective failure already
+/// documented for the JCC pass. `x86_text_align_log2` and `combined_code`'s
+/// per-function padding move to 64 with this flag, or the pass is a lie.
+///
+/// Padding is semantically neutral (multi-byte NOPs), so the cost of being
+/// wrong here is size and speed, never correctness.
+///
+/// ⚑ UNCACHED on purpose: this is a SEMANTIC switch and the unit tests flip it
+/// in-process.
+fn x86_loop_head_align_enabled() -> bool {
+    if let Some(disabled) = LOOP_HEAD_ALIGN_DISABLED.get() {
+        return !*disabled;
+    }
+    !crate::env_lock::var_os("TCG_NO_X86_LOOP_HEAD_ALIGN").is_some_and(|v| v != "0")
+}
+
+/// Read a `usize` A/B knob for this pass. Uncached (semantic; tests flip it).
+///
+/// `override_` is the TRACKED compiler option's value when one was installed; it
+/// wins over the environment. Every lever of this pass used to be reachable ONLY
+/// through a `TCG_*` environment variable, which `trustc` refuses before the
+/// backend loads — so under the Trust driver the pass had no A/B surface at all,
+/// and its defaults (all four chosen on AArch64 evidence) could not be
+/// re-measured on x86. That is not a small gap for a pass whose refusal to pad
+/// one seam measured **14.8%** on `h3_box_leak`.
+fn x86_loop_align_knob(
+    override_: &std::sync::OnceLock<usize>,
+    name: &str,
+    default: usize,
+) -> usize {
+    if let Some(value) = override_.get() {
+        return *value;
+    }
+    crate::env_lock::var_os(name)
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+static LOOP_ALIGN_SEAM_PAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static LOOP_ALIGN_MAX_BODY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static LOOP_ALIGN_MAX_SKIP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static LOOP_ALIGN_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static LOOP_HEAD_ALIGN_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the fall-through-seam pad budget from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=x86-loop-align-seam-pad=<bytes>`).
+///
+/// DEFAULT `X86_LOOP_ALIGN_DEFAULT_SEAM_PAD` (63), i.e. the same budget as at a dead
+/// seam. It was 0 — refuse — until 2026-09-29, and this line still said so after
+/// the default moved; the refusal is what cost `h3_box_leak` 14.8%. Pass `0` to
+/// restore it, which is how that policy stays falsifiable.
+pub fn set_x86_loop_align_seam_pad(bytes: usize) -> bool {
+    match LOOP_ALIGN_SEAM_PAD.set(bytes) {
+        Ok(()) => true,
+        Err(requested) => LOOP_ALIGN_SEAM_PAD.get() == Some(&requested),
+    }
+}
+
+/// Install the body cap from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=x86-loop-align-max-body=<bytes>`). `0` disables all
+/// padding while LEAVING the 64-byte function/section alignment in place, which
+/// is the arm that separates this pass's effect from the one-time global
+/// placement re-roll the alignment bump causes by itself.
+pub fn set_x86_loop_align_max_body(bytes: usize) -> bool {
+    match LOOP_ALIGN_MAX_BODY.set(bytes) {
+        Ok(()) => true,
+        Err(requested) => LOOP_ALIGN_MAX_BODY.get() == Some(&requested),
+    }
+}
+
+/// Install the pad cap from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=x86-loop-align-max-skip=<bytes>`). DEFAULT 63.
+pub fn set_x86_loop_align_max_skip(bytes: usize) -> bool {
+    match LOOP_ALIGN_MAX_SKIP.set(bytes) {
+        Ok(()) => true,
+        Err(requested) => LOOP_ALIGN_MAX_SKIP.get() == Some(&requested),
+    }
+}
+
+/// Install the per-function decision log from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=trace-x86-loop-align`).
+pub fn set_x86_loop_align_log_enabled(enabled: bool) -> bool {
+    match LOOP_ALIGN_LOG.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => LOOP_ALIGN_LOG.get() == Some(&requested),
+    }
+}
+
+/// Install this pass's OPT-OUT from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-loop-head-align`). DEFAULT ON.
+pub fn set_x86_loop_head_align_disabled(disabled: bool) -> bool {
+    match LOOP_HEAD_ALIGN_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LOOP_HEAD_ALIGN_DISABLED.get() == Some(&requested),
+    }
+}
+
+fn x86_loop_align_log_enabled() -> bool {
+    LOOP_ALIGN_LOG.get().copied().unwrap_or(false)
+        || crate::env_lock::var_os("TCG_X86_LOOP_ALIGN_LOG").is_some()
+}
+
+/// `TCG_X86_LOOP_ALIGN_MAX_BODY=<bytes>`; **0 disables all padding while
+/// leaving the 64-byte function/section alignment in place** — that is the
+/// "Arm 1" measurement arm, and it has to exist: without it, a suite move
+/// cannot be attributed to the pass rather than to the one-time global
+/// placement re-roll that the alignment bump causes on its own.
+fn x86_loop_align_max_body() -> usize {
+    x86_loop_align_knob(
+        &LOOP_ALIGN_MAX_BODY,
+        "TCG_X86_LOOP_ALIGN_MAX_BODY",
+        X86_LOOP_ALIGN_DEFAULT_MAX_BODY,
+    )
+}
+
+/// `TCG_X86_LOOP_ALIGN_MAX_SKIP=<bytes>`.
+fn x86_loop_align_max_skip() -> usize {
+    x86_loop_align_knob(
+        &LOOP_ALIGN_MAX_SKIP,
+        "TCG_X86_LOOP_ALIGN_MAX_SKIP",
+        X86_LOOP_ALIGN_DEFAULT_MAX_SKIP,
+    )
+}
+
+/// `TCG_X86_LOOP_ALIGN_SEAM_PAD=<bytes>` — pad budget at a fall-through seam.
+fn x86_loop_align_seam_pad() -> usize {
+    x86_loop_align_knob(
+        &LOOP_ALIGN_SEAM_PAD,
+        "TCG_X86_LOOP_ALIGN_SEAM_PAD",
+        X86_LOOP_ALIGN_DEFAULT_SEAM_PAD,
+    )
+}
+
+/// Innermost backedge-target heads: LAYOUT INDEX of the head -> LAYOUT INDEX
+/// of the last block that branches back to it.
+///
+/// Transplanted from `loop_align::backedge_spans`. At this point in the
+/// pipeline the CFG side tables may be stale but the final layout is
+/// authoritative: block H is a BACKEDGE TARGET if some branch in a block at
+/// layout position >= H's targets H, its SPAN runs to the furthest such
+/// source, and H is INNERMOST if no other backedge target's span nests inside
+/// it. On the contiguous layouts this backend produces that equals loop
+/// innermost-ness; on scattered layouts it degrades to a heuristic, which is
+/// fine — alignment is perf-only and can never miscompile.
+fn x86_innermost_loop_head_spans(
+    block_order: &[LirBlock],
+    branch_targets: &HashMap<(LirBlock, usize), LirBlock>,
+) -> HashMap<usize, usize> {
+    let mut layout_pos: HashMap<LirBlock, usize> = HashMap::with_capacity(block_order.len());
+    for (idx, &block) in block_order.iter().enumerate() {
+        // A repeated block would make "layout position" ambiguous; keep the
+        // FIRST, which is the one the encode loop's offsets would describe.
+        layout_pos.entry(block).or_insert(idx);
+    }
+
+    let mut spans: HashMap<usize, usize> = HashMap::new();
+    for (&(src_block, _), &target) in branch_targets {
+        let (Some(&src_pos), Some(&target_pos)) =
+            (layout_pos.get(&src_block), layout_pos.get(&target))
+        else {
+            continue;
+        };
+        if src_pos < target_pos {
+            continue;
+        }
+        let end = spans.entry(target_pos).or_insert(src_pos);
+        if src_pos > *end {
+            *end = src_pos;
+        }
+    }
+
+    let all: Vec<(usize, usize)> = spans.iter().map(|(&h, &e)| (h, e)).collect();
+    all.iter()
+        .copied()
+        .filter(|&(head, end)| {
+            !all.iter()
+                .any(|&(h2, e2)| (h2, e2) != (head, end) && h2 >= head && e2 <= end)
+        })
+        .collect()
+}
+
+/// Everything `x86_probe_span_len` needs to replay the encode loop's own
+/// length decisions. Held by reference; constructed once per function.
+struct X86SpanProbe<'a> {
+    func: &'a X86ISelFunction,
+    alloc: &'a HashMap<VReg, X86PReg>,
+    branch_targets: &'a HashMap<(LirBlock, usize), LirBlock>,
+    layout_successor: &'a HashMap<LirBlock, LirBlock>,
+    elide_fallthrough_jmp: bool,
+    jcc_align_on: bool,
+}
+
+/// Byte length the span `head_idx..=span_end_idx` would occupy if the head's
+/// first byte were placed at `start_pos`, or `None` if it exceeds `max_len`.
+///
+/// ⚑ THIS MUST REPLAY THE ENCODER, NOT MEASURE THE CURRENT LAYOUT. Moving a
+/// head changes where the JCC-erratum padder fires INSIDE the body (it pads
+/// when a macro-fused ALU+Jcc unit crosses a 32-byte boundary), which changes
+/// the body's length, which changes containment. So the pseudo skip, the
+/// fall-through-jmp elision, the JCC pad and the exact `x86_encoded_len` all
+/// have to be re-derived from the hypothetical start. `estimate_inst_size` is
+/// documented-conservative (`_ => 7`) and would be wrong here.
+///
+/// Bounded work: the caller passes `max_len <= 64`, so this walks at most a
+/// fetch line's worth of instructions before bailing.
+fn x86_probe_span_len(
+    probe: &X86SpanProbe<'_>,
+    head_idx: usize,
+    span_end_idx: usize,
+    start_pos: usize,
+    max_len: usize,
+) -> Option<usize> {
+    let blocks = probe.func.block_order.get(head_idx..=span_end_idx)?;
+    let mut pos = start_pos;
+    let mut last_end: Option<usize> = None;
+
+    for &block_id in blocks {
+        let mblock = probe.func.blocks.get(&block_id)?;
+        for (inst_idx, inst) in mblock.insts.iter().enumerate() {
+            if matches!(
+                inst.opcode,
+                X86Opcode::Nop | X86Opcode::Phi | X86Opcode::StackAlloc
+            ) {
+                continue;
+            }
+            if probe.elide_fallthrough_jmp
+                && inst.opcode == X86Opcode::Jmp
+                && probe.layout_successor.contains_key(&block_id)
+                && probe.branch_targets.get(&(block_id, inst_idx)).copied()
+                    == probe.layout_successor.get(&block_id).copied()
+                && mblock.insts[inst_idx + 1..].iter().all(|later| {
+                    matches!(
+                        later.opcode,
+                        X86Opcode::Nop | X86Opcode::Phi | X86Opcode::StackAlloc
+                    )
+                })
+            {
+                continue;
+            }
+
+            let mut ops = resolve_inst_operands(inst, probe.alloc);
+            let opcode = resolved_encode_opcode(inst, &ops);
+
+            if probe.jcc_align_on
+                && let Some(pad) =
+                    x86_jcc_erratum_pad(pos, opcode, &ops, &mblock.insts, inst_idx, probe.alloc)
+            {
+                pos += pad;
+            }
+
+            // Mirror the encode loop's pre-encode operand mutations. Every one
+            // of these forms is fixed-width disp32 so the length does not
+            // actually move — but the probe must not diverge from the encoder
+            // on a SHAPE, and the post-emit self-check is what would catch it.
+            if matches!(opcode, X86Opcode::MovssRipRel | X86Opcode::MovsdRipRel) {
+                ops.disp = 0;
+                ops.imm = 0;
+            } else if matches!(
+                opcode,
+                X86Opcode::LeaRip | X86Opcode::MovRipRel | X86Opcode::MovRipRelTlv
+            ) && inst.operands.iter().any(|op| {
+                matches!(
+                    op,
+                    X86ISelOperand::Symbol(_)
+                        | X86ISelOperand::ExactModuleSymbol(_)
+                        | X86ISelOperand::JumpTableIndex(_)
+                )
+            }) {
+                ops.disp = 0;
+            }
+
+            pos += x86_encoded_len(opcode, &ops)?;
+            last_end = Some(pos);
+            if pos.saturating_sub(start_pos) > max_len {
+                return None;
+            }
+        }
+    }
+
+    Some(last_end? - start_pos)
+}
+
+/// Emit `bytes` of multi-byte NOP, recording each chunk as a decode-check item.
+///
+/// Shared by the JCC-erratum padder and the loop-head aligner. **No new
+/// opcode**: `NopMulti` is already emitted in production by the JCC pass, so
+/// the proof perimeter is untouched and no obligation changes. ⚑ If anyone
+/// ever tries to LENGTHEN A REAL INSTRUCTION to align (LLVM's
+/// `x86-pad-for-align`), that is a new encoding decision and needs Phase-2
+/// reconstruction credit — it does not belong in this helper.
+fn x86_emit_nop_run(
+    encoder: &mut X86Encoder,
+    dc_items: &mut Vec<
+        crate::decode_check::DecodeCheckItem<crate::x86_64::decode_check::X86IntentInst>,
+    >,
+    dc_recording: bool,
+    bytes: usize,
+) -> Result<(), X86PipelineError> {
+    let mut left = bytes;
+    while left > 0 {
+        // The encoder clamps NopMulti to 1..=15 bytes; chunk deterministically
+        // rather than widening that contract, which lives in a different crate
+        // from the decode-check canonical-byte table and must move in lockstep
+        // with it.
+        let chunk = left.min(15);
+        let mut nop_ops = X86InstOperands::none();
+        nop_ops.imm = chunk as i64;
+        let nop_start = encoder.position();
+        encoder
+            .encode_instruction(X86Opcode::NopMulti, &nop_ops)
+            .map_err(X86PipelineError::from)?;
+        let nop_end = encoder.position();
+        if dc_recording {
+            dc_items.push(crate::decode_check::DecodeCheckItem {
+                start: nop_start,
+                end: nop_end,
+                intent: crate::x86_64::decode_check::X86IntentInst {
+                    opcode: X86Opcode::NopMulti,
+                    ops: nop_ops,
+                },
+                hole: None,
+            });
+        }
+        left -= chunk;
+    }
+    Ok(())
+}
+
+/// Per-function accept/decline counters for the loop-head aligner.
+///
+/// ⚑ MANDATORY, not decoration. Passes in this backend have repeatedly fired
+/// ZERO times while looking healthy, and only an accept counter has ever
+/// caught it. `miss` is the post-emit self-check: a non-zero value means the
+/// probe and the encoder disagree about the emitted bytes, and a pass that
+/// cannot predict its own output must not ship.
+#[derive(Default)]
+struct X86LoopAlignStats {
+    heads: usize,
+    padded: usize,
+    pad_bytes: usize,
+    already: usize,
+    decline_nested_head: usize,
+    decline_pad_too_big: usize,
+    decline_body_too_big: usize,
+    decline_already_contained: usize,
+    decline_live_seam: usize,
+    miss: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -3553,6 +4878,15 @@ fn x86_inst_implicit_gpr64_roots(
             push_root(uses, x86_64_regs::RAX);
             push_root(defs, x86_64_regs::RAX);
         }
+        // The 128-bit atomic-load pseudo zeroes RAX/RDX/RBX/RCX itself before
+        // its LOCK CMPXCHG16B, so it reads none of them and writes all four
+        // (RDX:RAX = the loaded value, RCX:RBX = 0).
+        X86Opcode::AtomicLoadCmpxchg16b => {
+            push_root(defs, x86_64_regs::RAX);
+            push_root(defs, x86_64_regs::RDX);
+            push_root(defs, x86_64_regs::RBX);
+            push_root(defs, x86_64_regs::RCX);
+        }
         X86Opcode::AtomicRmwCasLoop
         | X86Opcode::AtomicRmwCasLoop8
         | X86Opcode::AtomicRmwCasLoop16 => {
@@ -3571,6 +4905,11 @@ fn x86_inst_implicit_gpr64_roots(
         // a value copied into a return register live into the `ret`.
         push_root(uses, x86_64_regs::RAX);
         push_root(uses, x86_64_regs::RDX);
+        // Plus any internal multi-result register this `ret` delivers beyond
+        // the C file (empty unless the signature exhausts RAX,RDX / XMM0,XMM1).
+        for result in &inst.internal_return_regs {
+            push_root(uses, result.reg);
+        }
     }
 }
 
@@ -3886,10 +5225,9 @@ fn compute_x86_gpr64_live_out(
 /// which is exactly the case the rewrite is meant to serve. It is a guaranteed
 /// one-instruction reduction with no effect on allocation.
 ///
-/// Returns `b` together with the add's own `[dst, src1, src2]` operands
-/// (cloned, so the caller repackages exactly what was matched and never has
-/// to re-destructure the instruction) when the caller should delete the copy
-/// at `copy_pos`.
+/// Returns the add's own `[dst, src1, src2]` operands (cloned, so the caller
+/// repackages exactly what was matched and never has to re-destructure the
+/// instruction) when the caller should delete the copy at `copy_pos`.
 ///
 /// # Soundness
 ///
@@ -3911,10 +5249,7 @@ fn x86_try_collapse_bridge_into_lea(
     d_root: X86PReg,
     a_root: X86PReg,
     alloc: &HashMap<VReg, X86PReg>,
-) -> Option<(X86PReg, [X86ISelOperand; 3])> {
-    if !bridge_into_lea_enabled() {
-        return None;
-    }
+) -> Option<[X86ISelOperand; 3]> {
     if d != d_root || a != a_root || d_root == a_root {
         return None;
     }
@@ -3947,7 +5282,7 @@ fn x86_try_collapse_bridge_into_lea(
     if !x86_add_flags_dead_after(insts, copy_pos + 1) {
         return None;
     }
-    Some((b, [o0.clone(), o1.clone(), o2.clone()]))
+    Some([o0.clone(), o1.clone(), o2.clone()])
 }
 
 /// Immediate-step analogue of [`x86_try_collapse_bridge_into_lea`]:
@@ -3963,9 +5298,9 @@ fn x86_try_collapse_bridge_into_lea(
 /// its induction variable by a CONSTANT (`addq $0x10, …`), which lowers to
 /// `AddRI` and so fell out of scope entirely — the two-address `mov/add/mov`
 /// bridge survived in the hottest loop of every counted-loop program. This was
-/// established behaviourally, not by grep: rebuilding v2_memfill with
-/// `TCG_NO_X86_COPY_OP_WRITEBACK=1` produced a BYTE-IDENTICAL `..4main`, proving
-/// the existing pass never fires there.
+/// established behaviourally, not by grep: with the pass disabled, v2_memfill
+/// rebuilt to a BYTE-IDENTICAL `..4main`, proving the register form never fires
+/// there.
 ///
 /// # Soundness
 ///
@@ -3992,9 +5327,6 @@ fn x86_try_collapse_bridge_into_lea_imm(
     a_root: X86PReg,
     alloc: &HashMap<VReg, X86PReg>,
 ) -> Option<(i32, [X86ISelOperand; 2])> {
-    if !bridge_into_lea_enabled() {
-        return None;
-    }
     if d != d_root || a != a_root || d_root == a_root {
         return None;
     }
@@ -4048,11 +5380,6 @@ fn x86_add_flags_dead_after(insts: &[X86ISelInst], idx: usize) -> bool {
     false
 }
 
-/// Kill switch for the post-RA bridge-into-LEA collapse.
-fn bridge_into_lea_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_BRIDGE_LEA").is_none()
-}
-
 fn x86_try_collapse_producer_writeback(
     insts: &[X86ISelInst],
     wb_pos: usize,
@@ -4063,7 +5390,7 @@ fn x86_try_collapse_producer_writeback(
     block_live_out: &HashSet<X86PReg>,
     alloc: &HashMap<VReg, X86PReg>,
 ) -> bool {
-    if !copy_op_writeback_enabled() || wb_pos == 0 {
+    if wb_pos == 0 {
         return false;
     }
     // Whole 64-bit GPRs only: sub-register writebacks would need width
@@ -4074,15 +5401,8 @@ fn x86_try_collapse_producer_writeback(
     let prod_idx = wb_pos - 1;
     let prod = &insts[prod_idx];
 
-    let tracing = std::env::var_os("TCG_X86_COPY_OP_WRITEBACK_TRACE").is_some();
     macro_rules! decline {
         ($why:expr) => {{
-            if tracing && x86_collapsible_two_address_alu(prod.opcode) {
-                eprintln!(
-                    "[cow-trace] DECLINE({}) {:?} {:?} ; mov {:?}<-{:?}",
-                    $why, prod.opcode, prod.operands, a, d,
-                );
-            }
             return false;
         }};
     }
@@ -4182,9 +5502,358 @@ fn x86_collapsible_two_address_alu(opcode: X86Opcode) -> bool {
     )
 }
 
-/// Kill switch for the copy/op/writeback collapse (paired A/B in ONE dylib).
-fn copy_op_writeback_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_COPY_OP_WRITEBACK").is_none()
+// ---------------------------------------------------------------------------
+// Post-RA LEA self-writeback collapse (runtime performance)
+// ---------------------------------------------------------------------------
+//
+// THE GAP. Every unit-stride induction variable leaves this pair in the hottest
+// block of a counted loop:
+//
+// ```text
+//   leaq 0x1(%rdi), %rax      ; d <- a + 1     (producer, at wb_pos - 1)
+//   movq %rax, %rdi           ; a <- d         (writeback, at wb_pos)
+//   cmpq $N, %rax             ; the trip test still reads `d`
+//   jb   .Lloop
+// ```
+//
+// gcc-16 writes the increment in place (`incq %rdi` / `addq $1, %rdi`) and pays
+// no copy at all. `incq` appears ZERO times in trust-cg-emitted code, and 11 of
+// 12 `leaq 1(r), tmp` sites in the bench corpus are followed by exactly this
+// copy back. Layout-marginalized, min-of-9, byte-controlled microbenchmark on
+// p1_xorshift's kernel: gcc 6.408 cyc/iter, trust-cg 7.710 (1.203x), trust-cg
+// with THIS ONE COPY COALESCED 6.660 (1.039x) — 81% of the gap. It is the COPY,
+// not the opcode: in-place `lea`, `incq` and `addq $1` all land within 0.08
+// cyc/iter of each other. These loops run at their recurrence bound with zero
+// issue margin, where an off-path reg-reg `mov` still costs ~0.29 cyc even
+// though the rename stage eliminates most of its latency.
+//
+// WHY THE EXISTING MACHINERY DOES NOT FIRE. `x86_try_collapse_producer_writeback`
+// is written for the `d = a op X ; a = d` shape and declines here twice over:
+// its allowlist `x86_collapsible_two_address_alu` has no `Lea` entry (the
+// producer is a LEA either from the pre-RA `AddRI` bridge or from
+// `x86_try_collapse_bridge_into_lea_imm` earlier in this very sweep), and it
+// requires `d` to be DEAD after the writeback, which the trip test's
+// `cmpq $N, %rax` refutes. `x86_try_rename_coalesce_copy` anchors on the same
+// `MovRR` but renames in the OTHER direction (later reads of `a` to `d`) and
+// bails because `a` — the loop-carried induction variable — is block-live-out.
+//
+// THE REWRITE. Redirect the LEA's destination to the writeback's destination
+// and rename the trailing reads of `d` to `a`:
+//
+// ```text
+//   leaq 0x1(%rdi), %rdi
+//   cmpq $N, %rdi
+//   jb   .Lloop
+// ```
+//
+// SOUNDNESS.
+//
+// * `a`'s OLD value needs no scan at all. The producer sits immediately before
+//   the writeback, so the interval between them is EMPTY, and the writeback
+//   already killed `a` there in the original stream. The producer reads `a` as
+//   an address component, and x86 reads every source before writing the
+//   destination, so `lea a, [a + k]` is well defined. Requiring the address to
+//   be BASED ON `a` is what makes this an in-place self-increment rather than a
+//   general destination redirect.
+// * `d` is no longer written, so every read of `d` from `wb_pos + 1` up to
+//   `d_root`'s next FULL redefinition must be renameable to `a`: an exact
+//   full-width pure use (a partial-width read or a tied read-modify cannot be
+//   renamed), occurring before any write to `a_root` (after which `a` no longer
+//   carries the value). The rename is value-preserving precisely because the
+//   deleted writeback established `a == d`. If `d_root` is never fully
+//   redefined in-block it must be outside the block's live-out.
+// * A PARTIAL later write of `d_root` declines: it would merge bits this stream
+//   no longer produces.
+// * No address component of the producer may touch `d_root` — post-collapse
+//   nothing writes that register.
+// * Neither root may carry implicit traffic at the producer or the writeback,
+//   and no instruction in the scan window may implicitly use either root.
+// * Calls and returns are hard barriers (caller-saved clobbers are deliberately
+//   not modeled as defs, and argument/return registers are read implicitly).
+// * RSP/RBP are excluded outright: `x86_inst_implicit_gpr64_roots` does not
+//   model `push`/`pop`/`ret` stack traffic, so no liveness claim about the
+//   frame registers is trustworthy.
+//
+// FLAGS need no reasoning: `LEA` writes none before or after, and the deleted
+// `MovRR` wrote none. Nothing is reordered. The `cmpq` that follows still
+// computes the identical comparison from the identical value.
+//
+// PROOF PERIMETER: ZERO new opcodes. The producer keeps its opcode and its
+// address operand; only the destination register changes, and that is exactly
+// the renaming class the coalescer around it already performs.
+//
+// ⚑ LANDED OPT-IN under `TCG_X86_LEA_WRITEBACK`. The rewrite is a win on every
+// program measured under layout control, but p7_sieve's shipped binary pays a
+// 1.44x PLACEMENT penalty that this pass can neither see nor control. The full
+// argument, the numbers and the flip criterion are on
+// `x86_lea_writeback_collapse_enabled`.
+
+/// OPT-IN switch for the LEA self-writeback collapse (paired A/B in ONE dylib).
+///
+/// # Why this is opt-in and not default-on
+///
+/// The rewrite itself is a measured win — layout-marginalised, p1_xorshift is
+/// `0.8535` ON/OFF (min-of-9 across eight distinct loop placements, range
+/// 0.843-0.866), and m2_call_heavy, p8_closure_nest and p5_struct_acc are all
+/// between -1% and -4%. But p7_sieve's SHIPPED binary regresses 1.44x, and
+/// that is not the rewrite's doing:
+///
+/// * Splicing the collapsed instruction sequence into the UNCOLLAPSED binary
+///   at the uncollapsed loop's address makes p7 3.3% FASTER (0.967, against a
+///   0.993 self-patched null control). The new sequence is strictly better.
+/// * p7's marking loop is four instructions with a ~1.5 cycle recurrence. In
+///   the uncollapsed build it lands at an address where the whole body fits
+///   inside ONE 64-byte instruction-fetch line; removing the writeback shrinks
+///   the body by three bytes, everything downstream shifts, and the loop ends
+///   up straddling the line boundary. Same instructions, +0.9 cycles/iteration.
+///
+/// So the cost is a LAYOUT lottery on a front-end-bound loop, and x86 has no
+/// loop-head aligner to win it deliberately: `crate::loop_align` is aarch64
+/// only (`AArch64Opcode`, "the Apple Silicon fetch-line size"), and the one
+/// x86 layout pass, the JCC-erratum padder, controls where BRANCHES sit, not
+/// whether a loop BODY fits in a line. Shipping a known 1.44x regression on a
+/// corpus program is not acceptable even when the mechanism is placement
+/// rather than the rewrite, so this lands opt-in — the same posture cold-arm
+/// sinking took under `TCG_X86_COLD_ARM_SINK` for the same reason.
+///
+/// FLIP CRITERION, explicitly: once an x86 loop-head aligner exists, re-measure
+/// and default this ON. The p1 win is layout-robust; only p7 is hostage to
+/// placement, and an aligner is exactly what stops it being hostage.
+/// Install the LEA-writeback collapse setting from a TRACKED option, once.
+/// **DEFAULT ON since 2026-09-30**; the opt-out is
+/// `-Ztrust-ir-cg-args=no-x86-lea-writeback-collapse`.
+///
+/// # The flip criterion was finally evaluable, and BOTH SIDES OF IT HAD EXPIRED
+///
+/// The doc above records an explicit criterion — "once an x86 loop-head aligner exists,
+/// re-measure and default this ON" — resting on `p1_xorshift` at 0.8535 ON/OFF (14.6%
+/// faster) and blocked only by `p7_sieve` regressing 1.44x for a layout reason. The aligner
+/// it names now exists and is default-on (`x86_loop_head_align`, the 64-byte fetch-line
+/// containment pass), so the criterion became checkable. Until 2026-09-30 it was NOT
+/// checkable at all: the only channel was `TCG_X86_LEA_WRITEBACK`, which `trustc` refuses
+/// before the backend loads.
+///
+/// Re-measured, 90 interleaved rounds, `taskset -c 2`, minimum, arms duplicated:
+///
+/// * **`p1_xorshift`'s 14.6% win is GONE** — 0.9996 -> 0.9998, inside a 0.0002 floor.
+/// * **`p7_sieve`'s 1.44x block is GONE** — 0.7118 -> 0.7142, inside a 0.0053 floor.
+///
+/// So the criterion cannot be honoured on its own terms: the win that motivated it no longer
+/// exists on this host and on this code. The default flips anyway, on a DIFFERENT and much
+/// smaller justification, stated here so nobody reads the 14.6% as live:
+///
+/// | program | OFF | ON | |
+/// | --- | ---: | ---: | --- |
+/// | `p2_collatz` | 1.0231 | **1.0105** | a parity VIOLATION, halved |
+/// | `m2_call_heavy` | 0.7506 | 0.7557 | 0.7% worse, stays 24% BELOW parity |
+/// | `p6_branch_match` | 0.9796 | 0.9822 | 0.3% worse, stays below parity |
+/// | everything else | — | — | inside noise, `b1`/`p4`/`h4`/`h1` included |
+///
+/// The objective is a MAX-GAP one, so what counts is that a violation halves while no new
+/// violation appears and the suite maximum is unchanged (`b1` 1.0964 -> 1.0968, noise). The
+/// two costs land on programs that remain comfortably under parity. Suite geomean is flat
+/// (0.8333 -> 0.8328).
+///
+/// It fires on 11 of the 18 corpus programs, with every exit code matching LLVM.
+pub fn set_x86_lea_writeback_collapse_enabled(enabled: bool) -> bool {
+    match LEA_WRITEBACK_COLLAPSE.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => LEA_WRITEBACK_COLLAPSE.get() == Some(&requested),
+    }
+}
+
+static LEA_WRITEBACK_COLLAPSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn x86_lea_writeback_collapse_enabled() -> bool {
+    // The tracked option wins when installed. The env fallback is kept NOT memoized on
+    // purpose: it is a SEMANTIC switch, and `x86_lea_self_writeback_is_opt_in` flips it
+    // inside a live process and requires the next call to observe the new value.
+    if let Some(enabled) = LEA_WRITEBACK_COLLAPSE.get() {
+        return *enabled;
+    }
+    // DEFAULT ON. The legacy `TCG_X86_LEA_WRITEBACK` was the opt-IN while this was
+    // default-off; with the default flipped the environment fallback is the opt-OUT
+    // `TCG_NO_X86_LEA_WRITEBACK_COLLAPSE`, so a forensic rollback needs no tracked option.
+    !crate::env_lock::var_os("TCG_NO_X86_LEA_WRITEBACK_COLLAPSE").is_some_and(|v| v != "0")
+}
+
+/// Memoized diagnostic-log gate (ACCEPT path, per function, per rayon worker —
+/// an uncached `var_os` here is a `getenv` scan under the process environ lock).
+fn x86_lea_writeback_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_lock::var_os("TCG_X86_LEA_WRITEBACK_LOG").is_some())
+}
+
+/// Try to collapse `LEA d, [a + …] ; MOV a, d` into the in-place `LEA a, [a + …]`,
+/// renaming later reads of `d` to `a`.
+///
+/// `a` is the writeback's DESTINATION (the induction variable) and `d` its
+/// SOURCE (the LEA's temporary) — the same `(pdst, psrc)` the caller resolved
+/// from the anchoring `MovRR`.
+///
+/// On success the producer at `wb_pos - 1` and the rename window have been
+/// mutated in place and `true` is returned, so the caller deletes the writeback
+/// at `wb_pos`. See the section comment above for the soundness argument.
+#[allow(clippy::too_many_arguments)]
+fn x86_try_collapse_lea_self_writeback(
+    insts: &mut [X86ISelInst],
+    wb_pos: usize,
+    a: X86PReg,
+    d: X86PReg,
+    a_root: X86PReg,
+    d_root: X86PReg,
+    block_live_out: &HashSet<X86PReg>,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> bool {
+    if !x86_lea_writeback_collapse_enabled() || wb_pos == 0 {
+        return false;
+    }
+    // Whole 64-bit GPRs only, distinct roots: a sub-register writeback would
+    // need width reasoning the caller's `MovRR` match does not establish.
+    if a != a_root || d != d_root || a_root == d_root {
+        return false;
+    }
+    // ⚑ The frame registers are OUTSIDE the allocator's model (see the
+    // `x86_try_collapse_gpr_bridge_into_op` note): never rewrite either.
+    if [a_root, d_root]
+        .iter()
+        .any(|r| *r == x86_64_regs::RSP || *r == x86_64_regs::RBP)
+    {
+        return false;
+    }
+    // The writeback itself must be an ordinary, unattributed `MovRR`.
+    if insts[wb_pos].proof_origin.is_some()
+        || insts[wb_pos].flags != X86Opcode::MovRR.default_flags()
+    {
+        return false;
+    }
+
+    let prod_idx = wb_pos - 1;
+    {
+        let prod = &insts[prod_idx];
+        // Address-arithmetic producer only, unattributed, stock flags. `Lea`
+        // and `LeaSib` both carry `InstFlags::EMPTY`: no memory, no side
+        // effects, no flag write.
+        if !matches!(prod.opcode, X86Opcode::Lea | X86Opcode::LeaSib)
+            || prod.flags != prod.opcode.default_flags()
+            || prod.proof_origin.is_some()
+            || prod.operands.len() != 2
+        {
+            return false;
+        }
+        // The producer must define exactly `d`, and FULLY (both LEA forms write
+        // the whole 64-bit destination; asserted rather than assumed).
+        if resolve_operand(&prod.operands[0], alloc) != Some(d)
+            || !x86_inst_full_def_of_gpr64_root(prod, alloc, d_root)
+        {
+            return false;
+        }
+        // ⚑ The address must be BASED ON `a`. This is the self-increment shape
+        // `a = a + k`, and it is what makes the empty-interval argument above
+        // apply: the producer's only reader of `a`'s old value is the producer
+        // itself. A general destination redirect is deliberately out of scope.
+        let base_is_a = match &prod.operands[1] {
+            X86ISelOperand::MemAddr { base, .. } => resolve_operand(base, alloc) == Some(a),
+            X86ISelOperand::SibMemAddr { base, .. } => resolve_operand(base, alloc) == Some(a),
+            _ => false,
+        };
+        if !base_is_a {
+            return false;
+        }
+        // No address component may touch `d_root`: post-collapse nothing writes
+        // that register, so such a source would read a value this stream no
+        // longer produces.
+        {
+            let mut pregs = Vec::new();
+            x86_operand_resolved_pregs(&prod.operands[1], alloc, &mut pregs);
+            if pregs
+                .iter()
+                .any(|&p| x86_64_regs::x86_containing_gpr64(p) == Some(d_root))
+            {
+                return false;
+            }
+        }
+        // No implicit register traffic in either root at the producer or the
+        // writeback.
+        for inst in [prod, &insts[wb_pos]] {
+            let mut iuses = Vec::new();
+            let mut idefs = Vec::new();
+            x86_inst_implicit_gpr64_roots(inst, &mut iuses, &mut idefs);
+            if iuses.contains(&a_root)
+                || iuses.contains(&d_root)
+                || idefs.contains(&a_root)
+                || idefs.contains(&d_root)
+            {
+                return false;
+            }
+        }
+    }
+
+    // Forward scan from `wb_pos + 1`: every read of `d` must be renameable to
+    // `a`, and `a` must still carry the value at each such read.
+    let mut d_killed = false; // `d_root` fully redefined => window closed
+    let mut a_written = false; // any write to `a_root` ends the rename window
+    let mut last_d_read: Option<usize> = None;
+
+    let mut i = wb_pos + 1;
+    while i < insts.len() && !d_killed {
+        let inst = &insts[i];
+        // Hard barrier: caller-saved clobbers are deliberately not modeled as
+        // defs, and argument/return registers are read implicitly.
+        if inst.flags.is_call() || inst.flags.is_return() {
+            return false;
+        }
+        if x86_inst_implicit_uses_gpr64_root(inst, d_root)
+            || x86_inst_implicit_uses_gpr64_root(inst, a_root)
+        {
+            return false;
+        }
+
+        // READS come before WRITES: x86 reads every source before writing back.
+        let (d_full, d_partial) = x86_inst_explicit_reads_of_root(inst, alloc, d_root, d);
+        // A partial-width read, or a tied read-modify, cannot be renamed.
+        if d_partial {
+            return false;
+        }
+        if d_full {
+            if a_written {
+                return false;
+            }
+            last_d_read = Some(i);
+        }
+
+        // WRITES.
+        if x86_inst_clobbers_gpr64_root(inst, alloc, a_root) {
+            a_written = true;
+        }
+        if x86_inst_clobbers_gpr64_root(inst, alloc, d_root) {
+            if !x86_inst_full_def_of_gpr64_root(inst, alloc, d_root) {
+                // A partial write merges bits this stream no longer produces.
+                return false;
+            }
+            d_killed = true;
+        }
+        i += 1;
+    }
+
+    // Nothing redefines `d` in-block, so deleting its only definition would drop
+    // an edge commit the successors may read.
+    if !d_killed && block_live_out.contains(&d_root) {
+        return false;
+    }
+
+    // Apply. ⚑ REUSE THE WRITEBACK'S OWN DESTINATION OPERAND for the producer's
+    // destination slot (cfa78287): re-spelling it as a raw `PReg` would orphan
+    // the vreg identity TV-5 tracks, leaving the destination vreg with no
+    // definition at this instruction even though its register is still written.
+    let dst_spelling = insts[wb_pos].operands[0].clone();
+    insts[prod_idx].operands[0] = dst_spelling;
+    if let Some(last) = last_d_read {
+        for inst in &mut insts[wb_pos + 1..=last] {
+            x86_rename_reads_pdst_to_psrc(inst, d, a, alloc);
+        }
+    }
+    true
 }
 
 fn x86_try_rename_coalesce_copy(
@@ -4259,7 +5928,7 @@ fn x86_try_rename_coalesce_copy(
     }
 
     // Dead-copy case: `pdst` never read after the copy.
-    if last_dst_use.is_none() {
+    let Some(last_use) = last_dst_use else {
         let Some(redef) = dst_redef else {
             // `pdst` may be live-out; conservatively keep the copy.
             return false;
@@ -4276,9 +5945,7 @@ fn x86_try_rename_coalesce_copy(
                     || x86_inst_implicit_uses_gpr64_root(inst, pdst_root))
         });
         return !reads_after;
-    }
-
-    let last_use = last_dst_use.expect("checked Some above");
+    };
 
     if let Some(sr) = src_redef
         && sr <= last_use
@@ -4311,6 +5978,288 @@ fn x86_try_rename_coalesce_copy(
     // Apply: rewrite all reads of `pdst` in [start..=last_use] to `psrc`.
     for inst in &mut insts[start..=last_use] {
         x86_rename_reads_pdst_to_psrc(inst, pdst, psrc, alloc);
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Post-fixup GPR tied-RMW bridge collapse (runtime performance)
+// ---------------------------------------------------------------------------
+//
+// THE STRUCTURAL GAP THIS CLOSES. `tied_operands` is `vec![]` at every
+// construction site in `trust-cg-regalloc`'s x86 adapter, so the allocator
+// never learns that `ADD v2, v0, v1` must land `v2` and `v0` in the same
+// register. `fixup_two_address` repairs that AFTER allocation by emitting an
+// unconditional `MOV dst, lhs` bridge with no liveness test at all. The
+// existing cleanup, `x86_try_rename_coalesce_copy`, then bails on 100% of
+// those bridges by construction: its very first guard rejects a copy whose
+// destination is read-modified by a later instruction, and the instruction
+// immediately after a fixup bridge IS that tied read-modify. The pass that
+// creates the copies and the pass that removes them were structurally
+// incompatible, which is where p1_xorshift's ~4 surplus reg-reg moves per
+// iteration (3 of them ON the critical recurrence) and p5_struct_acc's ~3
+// come from.
+//
+// This arm is the GPR analogue of `x86_try_collapse_xmm_bridge_into_op` —
+// the same rewrite the XMM lane already performs and TV-5 already accepts:
+//
+// ```text
+//   movq %rsrc, %rdst            ; pdst <- psrc      (bridge, at copy_pos)
+//   addq %rrhs, %rdst            ; [pdst, ghost psrc, rhs]
+// ==>
+//   addq %rrhs, %rsrc            ; [psrc, ghost psrc, rhs]  self-tied
+// ```
+//
+// with later reads of `pdst` renamed to `psrc` (the result now lives there).
+// `dst == src1` is exactly the shape `fixup_two_address` leaves alone, so the
+// encoding is byte-identical to an unbridged tied op and TV-5's tied-operand
+// obligation is discharged the same way the XMM arm discharges it.
+//
+// WHY HERE AND NOT IN `fixup_two_address`. Making the fixup itself prefer a
+// dying tied source would need liveness over a stream that does not exist yet
+// (the fixup is what builds it), and — decisively — it would move the rewrite
+// to the WRONG SIDE of the verification net: `run_x86_movrr_coalesce_with_
+// captured_spec` snapshots the value routing of the stream immediately AFTER
+// `fixup_two_address` and replays it against the coalesced stream. A rewrite
+// performed inside the fixup would be baked into the spec and check itself.
+// Performed here it is checked, under `TCG_POST_RA_SPEC=enforce`, fail-closed.
+//
+// SOUNDNESS. `pdst` and `psrc` are distinct 64-bit roots. Post-rewrite the op
+// writes `psrc` instead of `pdst`, so:
+//
+// * `psrc` must be DEAD after the op — its old value is destroyed. Any read of
+//   `psrc`'s root at any width before a FULL redefinition of that root
+//   declines; a PARTIAL write of the root also declines (it would merge bits
+//   this stream no longer produces). No full redefinition in-block requires
+//   `psrc_root` outside the block's live-out.
+// * `pdst` must be dead too, in the sense that every read of it between the op
+//   and `pdst_root`'s next full redefinition is RENAMEABLE to `psrc`: an exact
+//   full-width pure use (a partial-width read or a tied read-modify cannot be
+//   renamed), occurring before any write to `psrc_root` (after which `psrc` no
+//   longer carries the value). No full redefinition in-block requires
+//   `pdst_root` outside the block's live-out, because deleting the bridge
+//   drops `pdst`'s edge commit.
+// * The op must FULLY define `pdst_root` (64- or 32-bit write). An 8/16-bit
+//   tied op merges the destination's old bits, which the bridge supplied.
+// * No source of the op from operand 2 on may touch `pdst_root` — post-collapse
+//   nothing writes that register anymore. (`fixup_two_address` never produces
+//   this shape; an rhs aliasing dst takes the swap or scratch path. Guarded
+//   anyway, since a previous rename sweep could in principle introduce it.)
+// * Neither root may carry implicit traffic in the op (`ShlRR`'s CL, the
+//   `Idiv`/`Mul` RAX:RDX pair, …), and no instruction in the scan window may
+//   implicitly use either root.
+// * Calls and returns are hard barriers in both scans (caller-saved clobbers
+//   are deliberately not modeled as defs, and argument/return registers are
+//   read implicitly).
+//
+// FLAGS need no reasoning: the op computes the identical value from the
+// identical operands, so it writes the identical RFLAGS, and the deleted
+// `MovRR` wrote none. Nothing is reordered.
+//
+// ⚑ GHOST-SOURCE SHAPE, and ⚑ NEVER RE-SPELL OPERANDS (cfa78287): the op's
+// destination slot is filled with a clone of the BRIDGE'S OWN source operand,
+// which `fixup_two_address` itself cloned from the op's operand 1 — so the
+// vreg identity TV-5 tracks survives and the op ends up literally self-tied.
+//
+// PROOF PERIMETER: zero new opcodes. This is a register renaming in exactly
+// the class the coalescer already performs.
+
+fn x86_tied_copy_elide_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env_lock::var_os("TCG_X86_TIED_COPY_ELIDE_LOG").is_some())
+}
+
+fn x86_tied_copy_elide_enabled() -> bool {
+    // NOT memoized on purpose: this is a SEMANTIC kill switch, and
+    // `x86_tied_copy_elide_kill_switch_reverts_the_arm` flips it inside a live
+    // process and requires the next call to observe the new value.
+    crate::env_lock::var_os("TCG_NO_X86_TIED_COPY_ELIDE").is_none()
+}
+
+/// Try to collapse `MOV pdst, psrc ; OP pdst, rhs` (post-fixup tied form) into
+/// the self-tied `OP psrc, rhs`, renaming later reads of `pdst` to `psrc`.
+///
+/// On success the op at `copy_pos + 1` and the rename window have been mutated
+/// in place and `true` is returned, so the caller deletes the bridge copy at
+/// `copy_pos`. See the section comment above for the soundness argument.
+#[allow(clippy::too_many_arguments)]
+fn x86_try_collapse_gpr_bridge_into_op(
+    insts: &mut [X86ISelInst],
+    copy_pos: usize,
+    pdst: X86PReg,
+    psrc: X86PReg,
+    pdst_root: X86PReg,
+    psrc_root: X86PReg,
+    block_live_out: &HashSet<X86PReg>,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> bool {
+    // ⚑ The frame registers are OUTSIDE the allocator's model: `x86_inst_
+    // implicit_gpr64_roots` does not record `ret`/`push`/`pop`'s implicit RSP
+    // traffic, so no liveness statement this pass can make about RSP or RBP is
+    // trustworthy. Never rename either.
+    if [pdst_root, psrc_root]
+        .iter()
+        .any(|r| *r == x86_64_regs::RSP || *r == x86_64_regs::RBP)
+    {
+        return false;
+    }
+
+    // The bridge itself must be an ordinary, unattributed `MovRR`.
+    {
+        let copy = &insts[copy_pos];
+        if copy.proof_origin.is_some() || copy.flags != X86Opcode::MovRR.default_flags() {
+            return false;
+        }
+    }
+
+    let Some(op) = insts.get(copy_pos + 1) else {
+        return false;
+    };
+
+    // Shape: a pure-GPR tied ALU op in the post-fixup GHOST-SOURCE form
+    // `[pdst, ghost psrc, rhs…]`, bridged with `MovRR`, unattributed, with
+    // stock flags and no memory traffic.
+    if !x86_collapsible_two_address_alu(op.opcode)
+        || x86_two_address_lhs_operand_index(op) != Some(1)
+        || x86_two_address_fixup_copy_opcode(op) != X86Opcode::MovRR
+        || op.flags != op.opcode.default_flags()
+        || op.proof_origin.is_some()
+        || op.flags.reads_memory()
+        || op.flags.writes_memory()
+        || op.flags.has_side_effects()
+        || op.flags.is_call()
+        || op.flags.is_return()
+        || op.flags.is_branch()
+        || op.flags.is_terminator()
+    {
+        return false;
+    }
+    if resolve_operand(&op.operands[0], alloc) != Some(pdst)
+        || resolve_operand(&op.operands[1], alloc) != Some(psrc)
+    {
+        return false;
+    }
+    // ⚑ The bridge's source and the op's ghost source must be the SAME OPERAND
+    // SPELLING, not merely the same physical register. `fixup_two_address`
+    // clones the op's operand 1 into the bridge, so every genuine bridge
+    // satisfies this — and requiring it means the destination slot we overwrite
+    // below keeps the exact vreg identity TV-5 tracks (the cfa78287 class:
+    // a raw-`PReg` destination has no vreg definition at that instruction, and
+    // TV-5 then walks back to the vreg's previous def and refuses with
+    // `call-severed-vreg-read`).
+    if insts[copy_pos].operands[1] != op.operands[1] {
+        return false;
+    }
+    // The op must FULLY overwrite `pdst_root` (no 8/16-bit merge form).
+    if !x86_inst_full_def_of_gpr64_root(op, alloc, pdst_root) {
+        return false;
+    }
+    // No remaining source may touch `pdst_root`: post-collapse nothing writes it.
+    for operand in &op.operands[2..] {
+        let mut pregs = Vec::new();
+        x86_operand_resolved_pregs(operand, alloc, &mut pregs);
+        if pregs
+            .iter()
+            .any(|&p| x86_64_regs::x86_containing_gpr64(p) == Some(pdst_root))
+        {
+            return false;
+        }
+    }
+    // No implicit register traffic in either root at the op.
+    {
+        let mut iuses = Vec::new();
+        let mut idefs = Vec::new();
+        x86_inst_implicit_gpr64_roots(op, &mut iuses, &mut idefs);
+        if iuses.contains(&pdst_root)
+            || iuses.contains(&psrc_root)
+            || idefs.contains(&pdst_root)
+            || idefs.contains(&psrc_root)
+        {
+            return false;
+        }
+    }
+
+    // Single forward scan from `copy_pos + 2` establishing BOTH obligations.
+    let mut psrc_dead = false; // `psrc_root` fully redefined => old value gone
+    let mut psrc_written = false; // any write to `psrc_root` ends the rename window
+    let mut pdst_killed = false; // `pdst_root` fully redefined => window closed
+    let mut last_pdst_read: Option<usize> = None;
+
+    let mut i = copy_pos + 2;
+    while i < insts.len() {
+        if psrc_dead && pdst_killed {
+            break;
+        }
+        let inst = &insts[i];
+        // Hard barrier: caller-saved clobbers are deliberately not modeled as
+        // defs, and argument/return registers are read implicitly.
+        if inst.flags.is_call() || inst.flags.is_return() {
+            return false;
+        }
+        if x86_inst_implicit_uses_gpr64_root(inst, pdst_root)
+            || x86_inst_implicit_uses_gpr64_root(inst, psrc_root)
+        {
+            return false;
+        }
+
+        // READS come before WRITES: x86 reads every source before writing back.
+        if !psrc_dead {
+            let (s_full, s_partial) = x86_inst_explicit_reads_of_root(inst, alloc, psrc_root, psrc);
+            if s_full || s_partial {
+                return false;
+            }
+        }
+        if !pdst_killed {
+            let (d_full, d_partial) = x86_inst_explicit_reads_of_root(inst, alloc, pdst_root, pdst);
+            // A partial-width read, or a tied read-modify, cannot be renamed.
+            if d_partial {
+                return false;
+            }
+            if d_full {
+                if psrc_written {
+                    return false;
+                }
+                last_pdst_read = Some(i);
+            }
+        }
+
+        // WRITES.
+        if !psrc_dead && x86_inst_clobbers_gpr64_root(inst, alloc, psrc_root) {
+            psrc_written = true;
+            if !x86_inst_full_def_of_gpr64_root(inst, alloc, psrc_root) {
+                // A partial write merges bits this stream no longer produces.
+                return false;
+            }
+            psrc_dead = true;
+        }
+        if !pdst_killed && x86_inst_clobbers_gpr64_root(inst, alloc, pdst_root) {
+            if !x86_inst_full_def_of_gpr64_root(inst, alloc, pdst_root) {
+                return false;
+            }
+            pdst_killed = true;
+        }
+        i += 1;
+    }
+
+    if !psrc_dead && block_live_out.contains(&psrc_root) {
+        return false;
+    }
+    if !pdst_killed && block_live_out.contains(&pdst_root) {
+        return false;
+    }
+
+    // Apply. ⚑ REUSE THE BRIDGE'S OWN SOURCE OPERAND for the op's destination
+    // slot (cfa78287): re-spelling it as a raw `PReg` would orphan the vreg
+    // identity TV-5 tracks. `fixup_two_address` cloned that operand FROM the
+    // op's operand 1, so the op becomes literally self-tied `[s, s, x]` — the
+    // encoding is byte-identical to the `dst == src1` form the fixup leaves
+    // alone.
+    let src_spelling = insts[copy_pos].operands[1].clone();
+    insts[copy_pos + 1].operands[0] = src_spelling;
+    if let Some(last) = last_pdst_read {
+        for inst in &mut insts[copy_pos + 2..=last] {
+            x86_rename_reads_pdst_to_psrc(inst, pdst, psrc, alloc);
+        }
     }
     true
 }
@@ -4378,6 +6327,8 @@ fn x86_try_rename_coalesce_copy(
 /// Kill switch for the XMM bridge-copy collapse (disables ONLY this arm; the
 /// GPR arms and the single-sweep behavior they had before it are unaffected).
 fn x86_xmm_bridge_collapse_enabled() -> bool {
+    // NOT memoized on purpose: semantic kill switch, flipped in-process by
+    // `x86_xmm_bridge_collapse_kill_switch`.
     crate::env_lock::var_os("TCG_NO_X86_XMM_BRIDGE_COLLAPSE").is_none()
 }
 
@@ -4469,6 +6420,13 @@ fn x86_inst_implicit_xmm_uses(inst: &X86ISelInst, uses: &mut Vec<X86PReg>) {
         // XMM0 only — modeling both only over-approximates).
         uses.push(x86_64_regs::XMM0);
         uses.push(x86_64_regs::XMM1);
+        // Plus any internal multi-result XMM this `ret` delivers beyond the C
+        // file (XMM2-XMM7; empty for every C-shaped return).
+        for result in &inst.internal_return_regs {
+            if result.reg.is_xmm() {
+                uses.push(result.reg);
+            }
+        }
     }
 }
 
@@ -4616,9 +6574,9 @@ fn x86_try_collapse_xmm_bridge_into_op(
     // shape (an rhs aliasing dst takes the swap or scratch path instead), but
     // a prior rename sweep could in principle introduce it, and post-collapse
     // such a source would read a register nothing writes anymore.
-    for idx in 2..op.operands.len() {
+    for operand in &op.operands[2..] {
         let mut pregs = Vec::new();
-        x86_operand_resolved_pregs(&op.operands[idx], alloc, &mut pregs);
+        x86_operand_resolved_pregs(operand, alloc, &mut pregs);
         if pregs.contains(&d) {
             return false;
         }
@@ -4767,6 +6725,7 @@ fn coalesce_x86_redundant_movrr_copies(
     // function runs exactly one sweep per block, bit-identical to its
     // pre-XMM-arm behavior (the fixpoint below never iterates).
     let xmm_arm_enabled = x86_xmm_bridge_collapse_enabled();
+    let tied_arm_enabled = x86_tied_copy_elide_enabled();
     let xmm_live_out = xmm_arm_enabled.then(|| compute_x86_xmm_live_out(func, alloc));
     let mut total = 0usize;
 
@@ -4834,11 +6793,9 @@ fn coalesce_x86_redundant_movrr_copies(
                     ) {
                         delete[pos] = true;
                         total += 1;
-                    } else if let Some((b_reg, [dst_op, a_op, b_op])) =
-                        x86_try_collapse_bridge_into_lea(
-                            &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
-                        )
-                    {
+                    } else if let Some([dst_op, a_op, b_op]) = x86_try_collapse_bridge_into_lea(
+                        &insts, pos, pdst, psrc, pdst_root, psrc_root, alloc,
+                    ) {
                         // `mov d,a ; add d,d,b`  =>  `lea d,[a+b]`; drop the bridge.
                         //
                         // ⚑ REUSE THE ADD'S OWN OPERANDS. Rebuilding these from raw
@@ -4866,12 +6823,6 @@ fn coalesce_x86_redundant_movrr_copies(
                                 disp: 0,
                             },
                         ];
-                        if std::env::var_os("TCG_X86_BRIDGE_LEA_LOG").is_some() {
-                            eprintln!(
-                                "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {:?}] in `{}`",
-                                pdst, psrc, b_reg, func.name,
-                            );
-                        }
                         delete[pos] = true;
                         total += 1;
                     } else if let Some((k, [dst_op, a_op])) = x86_try_collapse_bridge_into_lea_imm(
@@ -4899,12 +6850,6 @@ fn coalesce_x86_redundant_movrr_copies(
                                 disp: k,
                             },
                         ];
-                        if std::env::var_os("TCG_X86_BRIDGE_LEA_LOG").is_some() {
-                            eprintln!(
-                                "[bridge-lea] ACCEPT lea {:?} <- [{:?} + {}] in `{}`",
-                                pdst, psrc, k, func.name,
-                            );
-                        }
                         delete[pos] = true;
                         total += 1;
                     } else if pos > 0
@@ -4944,11 +6889,56 @@ fn coalesce_x86_redundant_movrr_copies(
                             delete[prod_idx - 1] = true;
                             total += 1;
                         }
-                        if std::env::var_os("TCG_X86_COPY_OP_WRITEBACK_LOG").is_some() {
+                        delete[pos] = true;
+                        total += 1;
+                    } else if pos > 0
+                        && !delete[pos - 1]
+                        && x86_try_collapse_lea_self_writeback(
+                            &mut insts,
+                            pos,
+                            pdst,
+                            psrc,
+                            pdst_root,
+                            psrc_root,
+                            &blk_live_out,
+                            alloc,
+                        )
+                    {
+                        // `lea d,[a + …] ; mov a,d`  =>  `lea a,[a + …]`; the
+                        // writeback is dead. The producer's destination now
+                        // carries the writeback's own destination operand and
+                        // the trailing reads of `d` have been renamed to `a`.
+                        if x86_lea_writeback_log_enabled() {
                             eprintln!(
-                                "[copy-op-writeback] ACCEPT {:?} ops={:?} dest {:?} <- {:?} in `{}`",
-                                insts[prod_idx].opcode,
-                                insts[prod_idx].operands,
+                                "[lea-writeback] ACCEPT {:?} ops={:?} dest {:?} <- {:?} in `{}`",
+                                insts[pos - 1].opcode,
+                                insts[pos - 1].operands,
+                                pdst,
+                                psrc,
+                                func.name,
+                            );
+                        }
+                        delete[pos] = true;
+                        total += 1;
+                    } else if tied_arm_enabled
+                        && x86_try_collapse_gpr_bridge_into_op(
+                            &mut insts,
+                            pos,
+                            pdst,
+                            psrc,
+                            pdst_root,
+                            psrc_root,
+                            &blk_live_out,
+                            alloc,
+                        )
+                    {
+                        // The tied op at pos + 1 is now self-tied on the bridge
+                        // source; the bridge itself is dead. Drop it.
+                        if x86_tied_copy_elide_log_enabled() {
+                            eprintln!(
+                                "[tied-copy-elide] ACCEPT {:?} ops={:?} bridge {:?} <- {:?} in `{}`",
+                                insts[pos + 1].opcode,
+                                insts[pos + 1].operands,
                                 pdst,
                                 psrc,
                                 func.name,
@@ -4978,16 +6968,6 @@ fn coalesce_x86_redundant_movrr_copies(
                 {
                     // The tied op at pos + 1 is now self-tied on the bridge
                     // source; the bridge itself is dead. Drop it.
-                    if std::env::var_os("TCG_X86_XMM_BRIDGE_COLLAPSE_LOG").is_some() {
-                        eprintln!(
-                            "[xmm-bridge-collapse] ACCEPT {:?} ops={:?} bridge {:?} <- {:?} in `{}`",
-                            insts[pos + 1].opcode,
-                            insts[pos + 1].operands,
-                            d,
-                            s,
-                            func.name,
-                        );
-                    }
                     delete[pos] = true;
                     total += 1;
                 }
@@ -5000,7 +6980,7 @@ fn coalesce_x86_redundant_movrr_copies(
                 .filter_map(|(idx, inst)| if delete[idx] { None } else { Some(inst) })
                 .collect();
             insts = rebuilt;
-            if !xmm_arm_enabled || total == sweep_start_total || sweep >= 4 {
+            if (!xmm_arm_enabled && !tied_arm_enabled) || total == sweep_start_total || sweep >= 4 {
                 break;
             }
         }
@@ -5198,15 +7178,21 @@ fn formal_collect_sysv_aggregate_leaves(
     }
 }
 
-/// Number of valid (live) bytes mapping to a representable eightbyte lane:
-/// full 8-byte and 4/2/1-byte partial tails are modeled (one width-correct GPR
-/// access per lane); 3/5/6/7-byte partials have no single non-over-reading access
-/// and are rejected (return `false`) so we fail closed instead of miscompiling.
-/// Mirrors ISel `sysv_eightbyte_lane_type`; both must admit the same widths so the
-/// classifiers stay in lockstep (`formal_arg_prologue_len` counts one copy per
-/// lane regardless of lane width).
+/// Number of valid (live) bytes mapping to a representable eightbyte lane.
+///
+/// EVERY width 1..=8 is now modeled. A power-of-two width is one width-correct
+/// GPR access; a 3/5/6/7-byte partial tail has no single non-over-reading
+/// access and is instead moved by the width-exact sequence ISel's
+/// `sysv_lane_byte_accesses` computes (3 as I16@+0 then I8@+2, and so on), so
+/// no access reaches past the object.
+///
+/// Mirrors ISel `sysv_eightbyte_lane_type`; both must admit the same widths or
+/// the formal-arg prologue refuses with "pipeline/ISel ABI classifiers
+/// disagree". That guard is what caught this function when the ISel side was
+/// widened first, which is exactly its purpose — the two are a matched pair and
+/// must move together.
 fn formal_sysv_eightbyte_lane_representable(valid_bytes: u32) -> bool {
-    matches!(valid_bytes, 8 | 4 | 2 | 1)
+    matches!(valid_bytes, 1..=8)
 }
 
 fn formal_sysv_packed_i32_pair_aggregate_layout(ty: &Type) -> Option<FormalSysVAggregateLayout> {
@@ -5524,6 +7510,8 @@ fn is_formal_stack_arg_load(inst: &X86ISelInst) -> bool {
     match inst.opcode {
         X86Opcode::MovRM8
         | X86Opcode::MovRM16
+        | X86Opcode::MovzxRM8
+        | X86Opcode::MovzxRM16
         | X86Opcode::MovRM32
         | X86Opcode::MovRM
         | X86Opcode::MovsdRM
@@ -5581,6 +7569,17 @@ fn gpr_copy_opcode_uses_32bit(opcode: X86Opcode) -> bool {
 
 fn formal_gpr_copy_error(message: impl Into<String>) -> X86PipelineError {
     X86PipelineError::RegAlloc(message.into())
+}
+
+/// The text of a formal-argument prologue refusal, for composing one refusal
+/// out of two (the value-level proof's, plus why the unreordered route did not
+/// apply). Any other error variant is rendered structurally rather than
+/// flattened, so nothing is lost.
+fn formal_refusal_message(err: &X86PipelineError) -> String {
+    match err {
+        X86PipelineError::RegAlloc(message) => message.clone(),
+        other => format!("{other:?}"),
+    }
 }
 
 fn gpr_root(reg: X86PReg) -> Result<X86PReg, X86PipelineError> {
@@ -5824,6 +7823,1572 @@ fn resolve_xmm_physreg_parallel_copy(copies: &[PhysRegCopy], scratch: X86PReg) -
     result
 }
 
+// ---------------------------------------------------------------------------
+// Formal-argument prologue ordering proof (segment-wise path, #497/#499)
+// ---------------------------------------------------------------------------
+
+/// The canonical representative of a physical register's storage: the 64-bit
+/// GPR a GPR alias lives in, or the XMM register itself.
+///
+/// This is the key [`FormalPrefixState`] indexes register contents by. It is
+/// derived from the register file's own `x86_containing_gpr64` and
+/// `X86_ALL_XMMS` rather than from a second copy of the encoding table, so it
+/// agrees with [`x86_64_regs::x86_regs_overlap`] by construction: two
+/// registers overlap exactly when this returns the same representative for
+/// both. `None` is a register the proof does not model, which its callers turn
+/// into a refusal — never a silent pass.
+fn formal_prefix_storage_root(reg: X86PReg) -> Option<X86PReg> {
+    if let Some(gpr64) = x86_containing_gpr64(reg) {
+        return Some(gpr64);
+    }
+    X86_ALL_XMMS.iter().copied().find(|xmm| *xmm == reg)
+}
+
+/// Whether `opcode` DEFINES the whole destination's storage, or writes only
+/// part of it and leaves the rest as it was.
+///
+/// This distinction is load-bearing for the ordering proof: a partial write
+/// makes the destination's new contents a function of its OLD contents, so
+/// moving another write across it changes the result even when the two writes
+/// appear to simply clobber one another.
+///
+/// x86-64 semantics, per form:
+/// * `mov r64, r/m64` and `mov r32, r/m32` fully define the 64-bit register —
+///   a 32-bit destination write zeroes the upper doubleword. So do the
+///   zero-extending loads `movzx r32, m8` / `movzx r32, m16` (`0F B6` / `0F B7`,
+///   [`X86Opcode::MovzxRM8`] / [`X86Opcode::MovzxRM16`]), the forms the
+///   selector now emits for a narrow stack-passed formal.
+/// * `mov r8, m8` (`8A /r`, [`X86Opcode::MovRM8`]) and `mov r16, m16`
+///   (`66 8B /r`, [`X86Opcode::MovRM16`]) write only the low byte / word and
+///   PRESERVE the rest of the register. These are the opcodes
+///   [`is_formal_stack_arg_load`] accepts for a narrow stack-passed formal, so
+///   this arm is reached by real prologues, not hypothetical ones.
+/// * `movdqa xmm1, xmm2` and `movdqu xmm, m128` write all 128 bits.
+/// * the MEMORY forms `movss xmm, m32` / `movsd xmm, m64` zero the upper
+///   lanes, while the REGISTER forms `movss xmm1, xmm2` / `movsd xmm1, xmm2`
+///   MERGE into them. That asymmetry is exactly why this is keyed on the
+///   opcode and not on the operand width.
+/// * a spill store writes its slot's low `width` bytes; the proof models every
+///   store as a merge into the slot, which is the conservative direction.
+///
+/// `None` for any other opcode: an opcode the proof does not model is a
+/// fail-closed input to it.
+fn formal_prefix_opcode_fully_defines_dst(opcode: X86Opcode) -> Option<bool> {
+    match opcode {
+        X86Opcode::MovRR
+        | X86Opcode::MovRR32
+        | X86Opcode::MovRM
+        | X86Opcode::MovRM32
+        | X86Opcode::MovdqaRR
+        | X86Opcode::MovdquRM
+        | X86Opcode::MovssRM
+        | X86Opcode::MovsdRM
+        | X86Opcode::MovzxRM8
+        | X86Opcode::MovzxRM16 => Some(true),
+        X86Opcode::MovRM8
+        | X86Opcode::MovRM16
+        | X86Opcode::MovssRR
+        | X86Opcode::MovsdRR
+        | X86Opcode::MovMR
+        | X86Opcode::MovMR32
+        | X86Opcode::MovssMR
+        | X86Opcode::MovsdMR
+        | X86Opcode::MovdquMR => Some(false),
+        _ => None,
+    }
+}
+
+/// A value the formal-argument prologue computes, as a SYNTACTIC term over the
+/// function's entry state.
+///
+/// Every term denotes a deterministic function of state no prologue
+/// instruction writes: the incoming contents of the argument registers
+/// (`Entry`), the incoming stack-argument area (`IncomingArg`), and the
+/// uninitialized contents of a spill slot (`SlotEntry`). So two EQUAL terms
+/// denote the same runtime value, which is what makes term equality a sound
+/// proof that two orderings of the same instructions compute the same thing.
+///
+/// The converse does NOT hold — two syntactically different terms can denote
+/// the same value — so a mismatch is a refusal, not a proof of a miscompile.
+/// The abstraction is deliberately on the conservative side of that.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum FormalPrefixTerm {
+    /// The contents of a register's storage at function entry.
+    Entry(X86PReg),
+    /// The incoming stack argument at `[RBP + disp]`.
+    IncomingArg(i32),
+    /// A spill slot's contents before the prologue stored anything there.
+    SlotEntry(u32),
+    /// `opcode` applied to `src`, merged into the destination's previous
+    /// contents `prev` when the opcode writes only part of the destination.
+    Move {
+        opcode: X86Opcode,
+        src: Box<FormalPrefixTerm>,
+        prev: Option<Box<FormalPrefixTerm>>,
+    },
+}
+
+impl FormalPrefixTerm {
+    /// A compact rendering for refusal diagnostics.
+    fn render(&self) -> String {
+        match self {
+            Self::Entry(reg) => format!("entry({})", x86_preg_name(*reg)),
+            Self::IncomingArg(disp) => format!("incoming_arg[rbp+{disp}]"),
+            Self::SlotEntry(slot) => format!("uninit(slot{slot})"),
+            Self::Move { opcode, src, prev } => match prev {
+                Some(prev) => format!("{opcode:?}({}, keeping {})", src.render(), prev.render()),
+                None => format!("{opcode:?}({})", src.render()),
+            },
+        }
+    }
+}
+
+/// Build the term a move deposits, failing closed on an opcode whose
+/// destination-defining behaviour the proof does not model.
+fn formal_prefix_move_term(
+    opcode: X86Opcode,
+    src: FormalPrefixTerm,
+    prev: FormalPrefixTerm,
+) -> Result<FormalPrefixTerm, X86PipelineError> {
+    let fully_defines = formal_prefix_opcode_fully_defines_dst(opcode).ok_or_else(|| {
+        formal_gpr_copy_error(format!(
+            "x86-64 formal-arg prologue ordering proof does not model {opcode:?}'s \
+             destination width; refusing to reorder (fail-closed)"
+        ))
+    })?;
+    Ok(FormalPrefixTerm::Move {
+        opcode,
+        src: Box::new(src),
+        prev: (!fully_defines).then(|| Box::new(prev)),
+    })
+}
+
+/// Build the term a move deposits into a SPILL-REPLAY SCRATCH register, which
+/// must fully define it.
+///
+/// This is the enforcement point for the second half of the replay-locality
+/// argument in [`formal_barrier_ends_for_value_proof`]: the scratch’s contents on
+/// entry to a replay group are not observable state, so a move that would MERGE
+/// into them has no term in this domain and is refused instead of guessed.
+fn formal_prefix_scratch_move_term(
+    opcode: X86Opcode,
+    src: FormalPrefixTerm,
+    what: &str,
+) -> Result<FormalPrefixTerm, X86PipelineError> {
+    match formal_prefix_opcode_fully_defines_dst(opcode) {
+        Some(true) => Ok(FormalPrefixTerm::Move {
+            opcode,
+            src: Box::new(src),
+            prev: None,
+        }),
+        Some(false) => Err(formal_gpr_copy_error(format!(
+            "x86-64 formal-arg prologue ordering proof cannot model {opcode:?} writing {what}: \
+             it merges into the spill-replay scratch register’s incoming contents, which the \
+             replay-locality argument does not supply; refusing to reorder (fail-closed)"
+        ))),
+        None => Err(formal_gpr_copy_error(format!(
+            "x86-64 formal-arg prologue ordering proof does not model {opcode:?}’s destination \
+             width; refusing to reorder (fail-closed)"
+        ))),
+    }
+}
+
+/// Abstract register and spill-slot state the ordering proof runs over.
+#[derive(Clone, Default)]
+struct FormalPrefixState {
+    /// One entry per WRITTEN storage root (see [`formal_prefix_storage_root`]).
+    /// A root with no entry still holds its function-entry contents.
+    regs: Vec<(X86PReg, FormalPrefixTerm)>,
+    /// One entry per WRITTEN spill slot, keyed by slot index.
+    slots: Vec<(u32, FormalPrefixTerm)>,
+}
+
+impl FormalPrefixState {
+    fn root(reg: X86PReg) -> Result<X86PReg, X86PipelineError> {
+        formal_prefix_storage_root(reg).ok_or_else(|| {
+            formal_gpr_copy_error(format!(
+                "x86-64 formal-arg prologue ordering proof cannot model register {reg:?}; \
+                 refusing to reorder (fail-closed)"
+            ))
+        })
+    }
+
+    fn read(&self, reg: X86PReg) -> Result<FormalPrefixTerm, X86PipelineError> {
+        let root = Self::root(reg)?;
+        Ok(self
+            .regs
+            .iter()
+            .find(|(candidate, _)| *candidate == root)
+            .map(|(_, term)| term.clone())
+            .unwrap_or(FormalPrefixTerm::Entry(root)))
+    }
+
+    fn write(&mut self, reg: X86PReg, term: FormalPrefixTerm) -> Result<(), X86PipelineError> {
+        let root = Self::root(reg)?;
+        match self
+            .regs
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == root)
+        {
+            Some(entry) => entry.1 = term,
+            None => self.regs.push((root, term)),
+        }
+        Ok(())
+    }
+
+    fn read_slot(&self, slot: u32) -> FormalPrefixTerm {
+        self.slots
+            .iter()
+            .find(|(candidate, _)| *candidate == slot)
+            .map(|(_, term)| term.clone())
+            .unwrap_or(FormalPrefixTerm::SlotEntry(slot))
+    }
+
+    fn write_slot(&mut self, slot: u32, term: FormalPrefixTerm) {
+        match self
+            .slots
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == slot)
+        {
+            Some(entry) => entry.1 = term,
+            None => self.slots.push((slot, term)),
+        }
+    }
+}
+
+/// One step of a formal-argument prologue ORDER, at the granularity the
+/// ordering proof reasons about.
+#[derive(Clone)]
+enum FormalPrefixStep {
+    /// A single formal intake, read with the pass's CONTRACT semantics: it must
+    /// deliver the argument register's FUNCTION-ENTRY contents, whatever has
+    /// happened to that register since. This is what the reference order
+    /// models, and it is exactly the guarantee this pass exists to provide.
+    ContractIntake {
+        dst: X86PReg,
+        src: X86PReg,
+        opcode: X86Opcode,
+    },
+    /// One segment's intakes, as the emitted order performs them: a single
+    /// parallel copy in which every copy reads the state on ENTRY to the group.
+    /// `resolve_gpr_physreg_parallel_copy` / `resolve_xmm_physreg_parallel_copy`
+    /// are what realize that; this step is the contract they are trusted for,
+    /// and it is pre-existing on this path.
+    ParallelIntakes(Vec<PhysRegCopy>),
+    /// A stack-argument load out of the incoming argument area.
+    Load {
+        dst: X86PReg,
+        disp: i32,
+        opcode: X86Opcode,
+    },
+    /// A split-replay connector. `id` identifies the SAME connector in both
+    /// orders, so the proof can compare the value it READS and not only the
+    /// state it leaves behind.
+    ///
+    /// Either end may be a SPILL SLOT rather than a register: the allocator is
+    /// free to spill a split piece, and `materialize_x86_spills` then replays
+    /// that end through a reload or a store. [`FormalBarrierEnd`] carries which,
+    /// with the opcode the replay uses.
+    Barrier {
+        id: usize,
+        dst: FormalBarrierEnd,
+        src: FormalBarrierEnd,
+        opcode: X86Opcode,
+    },
+    /// A spilled formal's save: a copy through a scratch register, then the
+    /// store. `id` identifies the same save in both orders.
+    SpillSave {
+        id: usize,
+        src: X86PReg,
+        scratch: X86PReg,
+        copy_opcode: X86Opcode,
+        store_opcode: X86Opcode,
+        slot: u32,
+    },
+}
+
+/// What one order OBSERVED while it ran: the value each connector read and the
+/// value each spilled-formal save stored, keyed by the step's `id`.
+///
+/// Comparing final state alone is not enough — a connector's read and a save's
+/// store are the prologue's other two externally visible effects.
+#[derive(Default, PartialEq)]
+struct FormalPrefixObservations {
+    connector_reads: Vec<(usize, FormalPrefixTerm)>,
+    spill_stores: Vec<(usize, FormalPrefixTerm)>,
+}
+
+/// Run one order over the abstract state, returning the final state and what
+/// the order observed on the way.
+fn run_formal_prefix_order(
+    steps: &[FormalPrefixStep],
+) -> Result<(FormalPrefixState, FormalPrefixObservations), X86PipelineError> {
+    let mut state = FormalPrefixState::default();
+    let mut observed = FormalPrefixObservations::default();
+    for step in steps {
+        match step {
+            FormalPrefixStep::ContractIntake { dst, src, opcode } => {
+                let src_root = FormalPrefixState::root(*src)?;
+                let term = formal_prefix_move_term(
+                    *opcode,
+                    FormalPrefixTerm::Entry(src_root),
+                    state.read(*dst)?,
+                )?;
+                state.write(*dst, term)?;
+            }
+            FormalPrefixStep::ParallelIntakes(copies) => {
+                // Read every source against the group's ENTRY state, then
+                // apply: that is what a parallel copy means.
+                let mut deposits = Vec::with_capacity(copies.len());
+                for copy in copies {
+                    deposits.push((
+                        copy.dst,
+                        formal_prefix_move_term(
+                            copy.opcode,
+                            state.read(copy.src)?,
+                            state.read(copy.dst)?,
+                        )?,
+                    ));
+                }
+                for (dst, term) in deposits {
+                    state.write(dst, term)?;
+                }
+            }
+            FormalPrefixStep::Load { dst, disp, opcode } => {
+                let term = formal_prefix_move_term(
+                    *opcode,
+                    FormalPrefixTerm::IncomingArg(*disp),
+                    state.read(*dst)?,
+                )?;
+                state.write(*dst, term)?;
+            }
+            FormalPrefixStep::Barrier {
+                id,
+                dst,
+                src,
+                opcode,
+            } => {
+                // What the connector CONSUMES: a register’s contents, or the
+                // reload the spill replay puts immediately in front of it.
+                let src_term = match src {
+                    FormalBarrierEnd::Reg(reg) => state.read(*reg)?,
+                    FormalBarrierEnd::Slot {
+                        slot,
+                        opcode: reload,
+                        scratch,
+                    } => {
+                        let reloaded = formal_prefix_scratch_move_term(
+                            *reload,
+                            state.read_slot(*slot),
+                            "a reloaded connector source",
+                        )?;
+                        // The reload CLOBBERS a scratch register. Nothing
+                        // compares its contents, but a later step may read one
+                        // as the `prev` of a partial write — a spilled formal’s
+                        // `MovssRR`/`MovsdRR` save copy is the one that can — and
+                        // that save is HOISTED above this connector, so the two
+                        // orders must be shown to agree about it rather than
+                        // assumed to. Marking both candidates is conservative;
+                        // see `FormalBarrierEnd::Slot`.
+                        for candidate in scratch {
+                            state.write(*candidate, reloaded.clone())?;
+                        }
+                        reloaded
+                    }
+                };
+                observed.connector_reads.push((*id, src_term.clone()));
+                match dst {
+                    FormalBarrierEnd::Reg(reg) => {
+                        let term = formal_prefix_move_term(*opcode, src_term, state.read(*reg)?)?;
+                        state.write(*reg, term)?;
+                    }
+                    FormalBarrierEnd::Slot {
+                        slot,
+                        opcode: store,
+                        scratch,
+                    } => {
+                        // The connector writes the replay’s scratch — fully, or
+                        // this refuses — and the store immediately after it
+                        // merges that into the slot.
+                        let in_scratch = formal_prefix_scratch_move_term(
+                            *opcode,
+                            src_term,
+                            "a spilled connector destination",
+                        )?;
+                        let stored = formal_prefix_move_term(
+                            *store,
+                            in_scratch.clone(),
+                            state.read_slot(*slot),
+                        )?;
+                        state.write_slot(*slot, stored);
+                        for candidate in scratch {
+                            state.write(*candidate, in_scratch.clone())?;
+                        }
+                    }
+                }
+            }
+            FormalPrefixStep::SpillSave {
+                id,
+                src,
+                scratch,
+                copy_opcode,
+                store_opcode,
+                slot,
+            } => {
+                let copied = formal_prefix_move_term(
+                    *copy_opcode,
+                    state.read(*src)?,
+                    state.read(*scratch)?,
+                )?;
+                state.write(*scratch, copied.clone())?;
+                let stored =
+                    formal_prefix_move_term(*store_opcode, copied, state.read_slot(*slot))?;
+                observed.spill_stores.push((*id, stored.clone()));
+                state.write_slot(*slot, stored);
+            }
+        }
+    }
+    Ok((state, observed))
+}
+
+/// Prove that `emitted` computes exactly what `reference` computes.
+///
+/// `reference` is the formal-argument prologue in SCAN order, with each intake
+/// carrying the pass's contract semantics (it delivers its argument register's
+/// function-entry contents). `emitted` is the order this pass is about to write
+/// into the block, with each segment's intakes collapsed into one parallel copy
+/// and every other instruction at the position the placement rule gave it.
+///
+/// Three things are compared, and all three must agree:
+/// 1. the value every split-replay connector READS,
+/// 2. the value every spilled-formal save STORES,
+/// 3. the final contents of every register the prologue writes, and of every
+///    spill slot it stores to.
+///
+/// `compared` names the register roots of (3). A spilled formal's scratch
+/// register is deliberately NOT among them: the store that immediately follows
+/// the copy is the save's only consumer, and that store's value is compared by
+/// (2) — pinning the scratch's end-of-prologue contents as well would refuse
+/// the hoist that both resolution paths have always performed.
+///
+/// A disagreement is a refusal naming the register (or connector, or slot) and
+/// both terms, never a repair: the pass has no license to invent an ordering
+/// the proof did not clear.
+///
+/// # What this does NOT establish
+///
+/// This is an ORDER-EQUIVALENCE proof, not a proof that the prologue ISel and
+/// regalloc produced is itself correct. It shows that the order about to be
+/// emitted computes what the scan order computes, with each intake carrying its
+/// contract value. If the allocator had already assigned two overlapping live
+/// ranges to one register, the scan order is wrong and so is the emitted one —
+/// this proof says only that the reordering did not make it worse, which is
+/// exactly the question the refusal it replaces was about. It is also not a
+/// width-fidelity proof: a term carries its move's opcode, so the same opcode
+/// applied to the same source is the same term in both orders whether or not
+/// that opcode's width is the right one for the formal.
+fn prove_formal_prefix_orders_agree(
+    reference: &[FormalPrefixStep],
+    emitted: &[FormalPrefixStep],
+    compared: &[X86PReg],
+) -> Result<(), X86PipelineError> {
+    let (reference_state, reference_observed) = run_formal_prefix_order(reference)?;
+    let (emitted_state, emitted_observed) = run_formal_prefix_order(emitted)?;
+
+    for (id, want) in &reference_observed.connector_reads {
+        let got = emitted_observed
+            .connector_reads
+            .iter()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, term)| term);
+        if got != Some(want) {
+            return Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix ordering proof failed: split connector {id} would read {} \
+                 instead of the {} the prologue's own order gives it; refusing to reorder \
+                 (fail-closed)",
+                got.map(FormalPrefixTerm::render)
+                    .unwrap_or_else(|| "nothing".to_string()),
+                want.render(),
+            )));
+        }
+    }
+
+    for (id, want) in &reference_observed.spill_stores {
+        let got = emitted_observed
+            .spill_stores
+            .iter()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, term)| term);
+        if got != Some(want) {
+            return Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix ordering proof failed: spilled formal {id} would store {} \
+                 instead of {}; refusing to reorder (fail-closed)",
+                got.map(FormalPrefixTerm::render)
+                    .unwrap_or_else(|| "nothing".to_string()),
+                want.render(),
+            )));
+        }
+    }
+
+    for reg in compared {
+        let want = reference_state.read(*reg)?;
+        let got = emitted_state.read(*reg)?;
+        if want != got {
+            return Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix ordering proof failed: {} would end the prologue holding {} \
+                 instead of {}; refusing to reorder (fail-closed)",
+                x86_preg_name(*reg),
+                got.render(),
+                want.render(),
+            )));
+        }
+    }
+
+    for (slot, want) in &reference_state.slots {
+        let got = emitted_state.read_slot(*slot);
+        if *want != got {
+            return Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix ordering proof failed: spill slot {slot} would end the \
+                 prologue holding {} instead of {}; refusing to reorder (fail-closed)",
+                got.render(),
+                want.render(),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Where a formal stack-argument load's value lands after register allocation.
+#[derive(Debug)]
+enum FormalLoadDestination {
+    /// The allocator gave the load's destination a physical register. The load
+    /// writes that register, and the ordering proof models the write.
+    Register(X86PReg),
+    /// The allocator SPILLED the load's destination.
+    ///
+    /// `materialize_x86_spills` then rewrites THIS instruction in place, into a
+    /// reload into one of `x86_spill_gpr_scratch_regs` / and
+    /// `x86_spill_xmm_scratch_regs`'s two candidates plus an ADJACENT store to
+    /// `slot` (it emits each instruction's reloads immediately before it and its
+    /// stores immediately after it, per instruction). So this load writes no
+    /// register the rest of the prologue can observe — the scratch is written
+    /// and consumed inside that pair, wherever the pair sits — and its value
+    /// reaches its consumers through `slot`.
+    ///
+    /// The proof therefore models NO register or slot effect for such a load,
+    /// and its caller discharges the two premises that licenses instead:
+    /// the slot is distinct from every spilled formal's slot (nothing else in
+    /// the prologue writes it, and nothing in the prologue READS a slot at all),
+    /// and the intakes the load would be reordered against do not touch a
+    /// scratch register the pair could pick.
+    ///
+    /// OPEN, PRE-EXISTING, AND CURRENTLY LOAD-BEARING: "writes no register the
+    /// rest of the prologue can observe" is true of the VALUE, but this variant
+    /// contributes NO effect to either order while its replay really does write
+    /// scratch candidate[0] — R10, or XMM14/XMM4 — which is the SAME register a
+    /// partial-width `SpillSave` copy reads as its `prev`
+    /// (`x86_spill_formal_copy_opcode`, and the save takes candidate[0]). In the
+    /// reference order the load may precede that save; in the emitted order the
+    /// save is hoisted above it. So the two orders genuinely differ in what
+    /// `prev` holds, while the model shows no difference at all.
+    ///
+    /// That is benign TODAY only because of a width coincidence between two
+    /// independent opcode tables, not because anything enforces it:
+    /// `x86_spill_store_opcode` never stores more bytes than
+    /// `x86_spill_formal_copy_opcode` defines — Gpr32 `MovRR32`/`MovMR32` 4/4,
+    /// Fpr32 `MovssRR`/`MovssMR` 4/4, Fpr64 `MovsdRR`/`MovsdMR` 8/8, and
+    /// Fpr128/Gpr64 write the register in full so there is no `prev` to carry.
+    /// The partial-write classes are therefore exactly the ones whose store
+    /// width equals their defined width, so `prev` is never observable in the
+    /// stored value. Adding a class whose store is WIDER than its copy, or a
+    /// narrower copy in an existing class, breaks this and needs the load's
+    /// scratch write modelled rather than dropped.
+    Spilled { slot: u32, class: RegClass },
+}
+
+/// Destructure a formal stack-argument load into the parts the ordering proof
+/// needs: where its value lands, which incoming argument it reads, and the
+/// opcode that reads it.
+///
+/// Fails closed rather than guessing for a destination the allocator left in
+/// NEITHER map (nothing downstream would give it a home) or in BOTH (a
+/// regalloc invariant violation: `materialize_x86_spills` would rewrite the
+/// instruction and the physical assignment would be a lie).
+fn formal_stack_arg_load_destination(
+    inst: &X86ISelInst,
+    alloc: &HashMap<VReg, X86PReg>,
+    installed_spills: &HashMap<VReg, u32>,
+) -> Result<(FormalLoadDestination, i32, X86Opcode), X86PipelineError> {
+    let shape_error = || {
+        formal_gpr_copy_error(format!(
+            "formal-arg prefix stack-arg load {:?} is not the shape the ordering proof \
+             reads; refusing to reorder (fail-closed)",
+            inst.opcode
+        ))
+    };
+    if !is_formal_stack_arg_load(inst) {
+        return Err(shape_error());
+    }
+    let X86ISelOperand::VReg(dst_vreg) = &inst.operands[0] else {
+        return Err(shape_error());
+    };
+    let X86ISelOperand::MemAddr { disp, .. } = &inst.operands[1] else {
+        return Err(shape_error());
+    };
+    let assigned = alloc.get(dst_vreg).copied();
+    let spilled = installed_spills.get(dst_vreg).copied();
+    match (assigned, spilled) {
+        (Some(preg), None) => Ok((FormalLoadDestination::Register(preg), *disp, inst.opcode)),
+        (None, Some(slot)) => Ok((
+            FormalLoadDestination::Spilled {
+                slot,
+                class: dst_vreg.class,
+            },
+            *disp,
+            inst.opcode,
+        )),
+        (None, None) => Err(formal_gpr_copy_error(format!(
+            "formal-arg prefix stack-arg load from [rbp+{disp}] has neither an allocated \
+             destination nor a spill slot; refusing to reorder (fail-closed)"
+        ))),
+        (Some(preg), Some(slot)) => Err(formal_gpr_copy_error(format!(
+            "formal-arg prefix stack-arg load from [rbp+{disp}] is both assigned {} and \
+             spilled to slot {slot}; refusing to reorder (fail-closed)",
+            x86_preg_name(preg)
+        ))),
+    }
+}
+
+/// The scratch registers `materialize_x86_spills` may pick when it replays a
+/// spilled value of `class` — both candidates, since the proof must not depend
+/// on which one that pass reaches for.
+fn formal_spill_replay_scratch_candidates(
+    class: RegClass,
+    abi: X86CallAbi,
+) -> Result<[X86PReg; 2], X86PipelineError> {
+    match x86_reg_bank_for_class(class) {
+        Some(X86RegBank::Gpr) => Ok(x86_spill_gpr_scratch_regs(class)),
+        Some(X86RegBank::Xmm) => Ok(x86_spill_xmm_scratch_regs(abi)),
+        None => Err(formal_gpr_copy_error(format!(
+            "formal-arg prefix stack-arg load spilled a {class:?} value, which the spill \
+             replay has no scratch bank for; refusing to reorder (fail-closed)"
+        ))),
+    }
+}
+
+/// The `(destination, source)` pregs a split-replay connector moves between, as
+/// the allocator assigned them. Either end is `None` when the allocator left
+/// that vreg unassigned, or when the operand shape is not a two-register move.
+fn formal_barrier_operand_pregs(
+    inst: &X86ISelInst,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> (Option<X86PReg>, Option<X86PReg>) {
+    match inst.operands.as_slice() {
+        [X86ISelOperand::PReg(d), X86ISelOperand::PReg(s)] => (Some(*d), Some(*s)),
+        [X86ISelOperand::VReg(d), X86ISelOperand::VReg(s)] => {
+            (alloc.get(d).copied(), alloc.get(s).copied())
+        }
+        [X86ISelOperand::PReg(d), X86ISelOperand::VReg(s)] => (Some(*d), alloc.get(s).copied()),
+        [X86ISelOperand::VReg(d), X86ISelOperand::PReg(s)] => (alloc.get(d).copied(), Some(*s)),
+        _ => (None, None),
+    }
+}
+
+/// Where one end of a split-replay connector lives after register allocation.
+enum FormalConnectorEnd {
+    /// A physical register, either written into the instruction by ISel or
+    /// assigned to its vreg by the allocator.
+    Reg(X86PReg),
+    /// A SPILLED vreg. The prologue reaches it through the spiller’s
+    /// reload/store replay, whose scratch registers are the two candidates
+    /// [`formal_spill_replay_scratch_candidates`] names for `class`, and whose
+    /// externally visible traffic is `slot` — which is how
+    /// [`formal_barrier_ends_for_value_proof`] models it.
+    Spilled { slot: u32, class: RegClass },
+}
+
+/// Classify one end of a split-replay connector, failing closed for an end the
+/// allocator left in NEITHER map (nothing downstream would give it a home) or in
+/// BOTH (a regalloc invariant violation: `materialize_x86_spills` would rewrite
+/// the instruction and the physical assignment would be a lie).
+fn formal_connector_end(
+    operand: Option<&X86ISelOperand>,
+    which: &str,
+    alloc: &HashMap<VReg, X86PReg>,
+    installed_spills: &HashMap<VReg, u32>,
+) -> Result<FormalConnectorEnd, X86PipelineError> {
+    match operand {
+        Some(X86ISelOperand::PReg(preg)) => Ok(FormalConnectorEnd::Reg(*preg)),
+        Some(X86ISelOperand::VReg(vreg)) => match (alloc.get(vreg), installed_spills.get(vreg)) {
+            (Some(preg), None) => Ok(FormalConnectorEnd::Reg(*preg)),
+            (None, Some(slot)) => Ok(FormalConnectorEnd::Spilled {
+                slot: *slot,
+                class: vreg.class,
+            }),
+            (Some(preg), Some(slot)) => Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix split connector's {which} is both assigned {} and \
+                     spilled to slot {slot}; refusing to reorder (fail-closed)",
+                x86_preg_name(*preg)
+            ))),
+            (None, None) => Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix split connector's {which} has neither an allocated \
+                     register nor a spill slot; refusing to reorder (fail-closed)"
+            ))),
+        },
+        _ => Err(formal_gpr_copy_error(
+            "formal-arg prefix split connector is not a two-register move; refusing to \
+             reorder (fail-closed)"
+                .to_string(),
+        )),
+    }
+}
+
+/// One end of a split-replay connector, as the VALUE-LEVEL proof models it.
+///
+/// An end the allocator gave a register IS that register. An end it SPILLED is
+/// reached through `materialize_x86_spills`’ replay, and the proof models that
+/// replay by its SLOT traffic alone — the reload’s source, or the store’s
+/// destination — never by the scratch register in between. See
+/// [`formal_barrier_ends_for_value_proof`] for why that is sound and what it
+/// requires.
+#[derive(Clone, Copy)]
+enum FormalBarrierEnd {
+    /// A physical register, read or written directly.
+    Reg(X86PReg),
+    /// A spill slot the replay reloads FROM (a source end) or stores TO (a
+    /// destination end), with the opcode `materialize_x86_spills` uses for it
+    /// and BOTH scratch registers it may route the value through.
+    ///
+    /// `scratch` is a CLOBBER MARKER, not a claim about which candidate the
+    /// spiller picks. Replay locality says the scratch’s contents are
+    /// unobservable from outside the group, so nothing compares them; marking
+    /// both keeps the proof independent of that choice, and marking one the
+    /// spiller would not pick can only add a refusal.
+    ///
+    /// PREMISE — SAVES PRECEDE CONNECTORS IN THE EMITTED ORDER. "Can only add a
+    /// refusal" needs that premise, and it is not free: the marking is a
+    /// SUPERSET of the writes the spiller really performs, and for the
+    /// term-equality comparison in [`prove_formal_prefix_orders_agree`] a
+    /// superset of writes can in principle MASK a real difference rather than
+    /// only manufacture a spurious one. It would take two connectors whose
+    /// scratch terms are syntactically equal straddling a partial-copy
+    /// `SpillSave` differently in the two orders. That is unreachable here only
+    /// because `prove_formal_arg_prefix_admits_loads` builds `emitted` as
+    /// `saves.clone()` and pushes every other step after it, so a `SpillSave`'s
+    /// predecessor is always `Entry(scratch)` in the emitted order and any
+    /// barrier preceding a save in the REFERENCE order forces a mismatch — a
+    /// refusal, never a false agreement. A change that interleaves the save
+    /// hoist with the connectors invalidates this lemma and must re-derive it.
+    Slot {
+        slot: u32,
+        opcode: X86Opcode,
+        scratch: [X86PReg; 2],
+    },
+}
+
+/// Both ends of a split-replay connector as the VALUE-LEVEL proof needs them,
+/// or a refusal naming the end it could not model and why.
+///
+/// ## The replay a spilled end expands into
+///
+/// `materialize_x86_spills` rewrites the connector IN PLACE, with a FRESH
+/// `X86SpillScratchState` per instruction, and emits that instruction’s reloads
+/// immediately before it and its stores immediately after it. A connector
+/// `op dst, src` therefore becomes one CONTIGUOUS group:
+///
+/// ```text
+///   [ x86_spill_load_opcode(src.class)   SCRATCH_s, [slot_s] ]  # src spilled
+///     op                                 D,         S           # preg or scratch
+///   [ x86_spill_store_opcode(dst.class)  [slot_d],  SCRATCH_d ] # dst spilled
+/// ```
+///
+/// ## REPLAY LOCALITY — the lemma this rests on
+///
+/// Every scratch register that group writes is written and last read INSIDE the
+/// group. Two facts give that, and neither is an assumption about the prologue:
+/// the scratch state is constructed per instruction, so no other instruction can
+/// be handed the same binding; and `reserve_x86_spill_scratch_regs` removes
+/// `x86_spill_gpr_scratch_regs` and `x86_spill_xmm_scratch_regs` from
+/// `allocatable_regs` on EVERY x86 function, so no allocated value lives in one
+/// across the group. The one configuration that hands those registers out,
+/// `TCG_X86_RA_FULL_POOL`, is kept only when its allocation SPILLS NOTHING — and
+/// then `materialize_x86_spills` early-returns and there is no replay group at
+/// all, nor a spilled connector end to model.
+/// The group’s behaviour is therefore a function of the REGISTERS and SLOTS it
+/// reads, and its effects are the registers and slots it writes — the scratch is
+/// invisible from outside, wherever the group sits.
+///
+/// That is the same argument [`FormalLoadDestination::Spilled`] already makes
+/// for a spilled stack-argument load. Here it buys something stronger: because
+/// the SLOT is modelled, the connector’s READ can be compared across the two
+/// orders instead of dropped, which is exactly what
+/// [`prove_formal_prefix_orders_agree`] needs from a connector.
+///
+/// ## The preconditions, checked rather than assumed
+///
+/// The lemma says the scratch’s contents ON ENTRY to the group are not
+/// observable. That holds only if nothing in the group READS them:
+///
+/// * a spilled SOURCE is reloaded by `x86_spill_load_opcode`, which must fully
+///   define the scratch, and
+/// * a spilled DESTINATION is written by the CONNECTOR’S OWN opcode, which must
+///   fully define the scratch.
+///
+/// `MovssRR` and `MovsdRR` merge into their destination’s upper lanes, and
+/// `first_operand_is_def_and_use` is false for them, so the spiller emits no
+/// reload of a spilled destination to merge into: such a connector reads the
+/// scratch’s incoming contents, which is order-dependent state this proof cannot
+/// supply. It is refused by name rather than modelled.
+///
+/// A connector whose two ends resolve to the SAME slot is refused too:
+/// `materialize_x86_spills` ELIDES a spilled self-copy (its dead spill-copy
+/// arm), so the emitted group is not the shape above and this model would not
+/// describe it.
+///
+/// ## What is deliberately conservative
+///
+/// With `TCG_X86_SPILL_REMAT` set a reload can become a recompute that never
+/// touches the slot. Modelling it as a slot read gives the proof a dependence
+/// the emitted code may not have, which can only cost a refusal — never buy an
+/// admission.
+///
+/// ## What this does NOT establish
+///
+/// Nothing about whether the allocator was right to spill that end, and nothing
+/// about the replay’s own correctness: this says only what the replay reads and
+/// writes, so that reordering the prologue around it can be proved or refused.
+fn formal_barrier_ends_for_value_proof(
+    inst: &X86ISelInst,
+    alloc: &HashMap<VReg, X86PReg>,
+    installed_spills: &HashMap<VReg, u32>,
+    abi: X86CallAbi,
+) -> Result<(FormalBarrierEnd, FormalBarrierEnd), X86PipelineError> {
+    let dst_end = formal_connector_end(
+        inst.operands.first(),
+        "destination",
+        alloc,
+        installed_spills,
+    )?;
+    let src_end = formal_connector_end(inst.operands.get(1), "source", alloc, installed_spills)?;
+
+    if let (
+        FormalConnectorEnd::Spilled { slot: dst_slot, .. },
+        FormalConnectorEnd::Spilled { slot: src_slot, .. },
+    ) = (&dst_end, &src_end)
+        && dst_slot == src_slot
+    {
+        return Err(formal_gpr_copy_error(format!(
+            "formal-arg prefix split connector moves spill slot {dst_slot} to itself, which \
+             spill materialization elides instead of replaying; refusing to reorder \
+             (fail-closed)"
+        )));
+    }
+
+    let dst = match dst_end {
+        FormalConnectorEnd::Reg(preg) => FormalBarrierEnd::Reg(preg),
+        FormalConnectorEnd::Spilled { slot, class } => {
+            if formal_prefix_opcode_fully_defines_dst(inst.opcode) != Some(true) {
+                return Err(formal_gpr_copy_error(format!(
+                    "formal-arg prefix split connector {:?} writes only part of its \
+                     destination, which the allocator SPILLED to slot {slot}: the spill \
+                     replay would merge into its scratch register’s incoming contents, which \
+                     this ordering proof cannot supply; refusing to reorder (fail-closed)",
+                    inst.opcode
+                )));
+            }
+            FormalBarrierEnd::Slot {
+                slot,
+                opcode: x86_spill_store_opcode(class),
+                scratch: formal_spill_replay_scratch_candidates(class, abi)?,
+            }
+        }
+    };
+    let src = match src_end {
+        FormalConnectorEnd::Reg(preg) => FormalBarrierEnd::Reg(preg),
+        FormalConnectorEnd::Spilled { slot, class } => {
+            let reload = x86_spill_load_opcode(class);
+            if formal_prefix_opcode_fully_defines_dst(reload) != Some(true) {
+                return Err(formal_gpr_copy_error(format!(
+                    "formal-arg prefix split connector’s source is SPILLED to slot {slot} and \
+                     its reload {reload:?} writes only part of the scratch register, whose \
+                     incoming contents this ordering proof cannot supply; refusing to reorder \
+                     (fail-closed)"
+                )));
+            }
+            FormalBarrierEnd::Slot {
+                slot,
+                opcode: reload,
+                scratch: formal_spill_replay_scratch_candidates(class, abi)?,
+            }
+        }
+    };
+    Ok((dst, src))
+}
+
+/// Every spill slot a split-replay connector in `residue` READS or WRITES.
+///
+/// The term proof sees these slots; a spilled stack-argument load’s slot it does
+/// NOT (see [`FormalLoadDestination::Spilled`]). Its caller uses this to refuse
+/// the one shape where the two could coincide.
+fn formal_connector_replay_slots(
+    residue: &[FormalPrefixResidue],
+    alloc: &HashMap<VReg, X86PReg>,
+    installed_spills: &HashMap<VReg, u32>,
+    abi: X86CallAbi,
+) -> Result<Vec<u32>, X86PipelineError> {
+    let mut slots = Vec::new();
+    for item in residue {
+        if !item.is_connector {
+            continue;
+        }
+        let (dst, src) =
+            formal_barrier_ends_for_value_proof(&item.inst, alloc, installed_spills, abi)?;
+        for end in [dst, src] {
+            if let FormalBarrierEnd::Slot { slot, .. } = end
+                && !slots.contains(&slot)
+            {
+                slots.push(slot);
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// The destination preg of a split-replay connector, or `None` when unresolved.
+fn formal_barrier_dst_preg(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Option<X86PReg> {
+    formal_barrier_operand_pregs(inst, alloc).0
+}
+
+/// One SEGMENT of the formal-argument prologue: the intakes between two
+/// split-replay connectors, plus the connector that closes it.
+///
+/// Each intake is carried with its position in the prefix scan, because the
+/// load-placement analysis has to know which intakes FOLLOW a given
+/// stack-argument load — the pair `resolve_gpr_physreg_parallel_copy` makes
+/// simultaneous. The index travels with the copy so the duplicate-destination
+/// filter cannot separate the two.
+struct FormalCopySegment {
+    gpr: Vec<(PhysRegCopy, usize)>,
+    xmm: Vec<(PhysRegCopy, usize)>,
+    barrier: Option<X86ISelInst>,
+}
+
+/// One instruction of the formal-arg prefix that is re-emitted verbatim: a
+/// split-replay connector (an order barrier) or a stack-argument load.
+struct FormalPrefixResidue {
+    inst: X86ISelInst,
+    /// A split-replay connector; `false` is a stack-argument load.
+    is_connector: bool,
+    /// Index of the segment this instruction was scanned INSIDE. A connector
+    /// closes its segment, so it is the last residue carrying that index.
+    segment: usize,
+    /// Position in the prefix scan, on the same axis as the intakes' indices.
+    scan: usize,
+}
+
+/// A formal argument the allocator spilled: the prologue copies its incoming
+/// argument register through a scratch and stores it to the formal's slot.
+struct FormalSpilledSave {
+    vreg: VReg,
+    src: X86PReg,
+    slot: u32,
+    /// Position in the prefix scan, on the same axis as the intakes' indices.
+    scan: usize,
+}
+
+/// Every physical register the formal-argument prefix WRITES, paired with the
+/// scan position of the instruction that writes it.
+///
+/// Intake destinations, the resolvable physical end of a connector, and a
+/// register-destination stack-arg load are direct writes. A SPILLED end is not a
+/// register write at all — the spiller replays it through an adjacent
+/// reload/store pair — but that pair does write its scratch register, so both
+/// candidates it might pick are listed too. `x86_reg_bank_for_class` returning
+/// nothing for a spilled end is a fail-closed input.
+fn formal_prefix_register_writes(
+    segments: &[FormalCopySegment],
+    residue: &[FormalPrefixResidue],
+    alloc: &HashMap<VReg, X86PReg>,
+    installed_spills: &HashMap<VReg, u32>,
+    abi: X86CallAbi,
+) -> Result<Vec<(usize, X86PReg)>, X86PipelineError> {
+    let mut writes: Vec<(usize, X86PReg)> = Vec::new();
+    for seg in segments {
+        for (copy, scan) in seg.gpr.iter().chain(seg.xmm.iter()) {
+            writes.push((*scan, copy.dst));
+        }
+    }
+    for item in residue {
+        if item.is_connector {
+            // A SPILLED end is not a register write, but the replay pair that
+            // reaches it does write its scratch — so list BOTH candidates it
+            // might pick, which keeps this independent of the spiller's choice.
+            // An end in neither map has no home downstream and is a refusal, not
+            // an assumed spill.
+            for (operand, which) in [
+                (item.inst.operands.first(), "destination"),
+                (item.inst.operands.get(1), "source"),
+            ] {
+                match formal_connector_end(operand, which, alloc, installed_spills)? {
+                    FormalConnectorEnd::Reg(preg) => {
+                        if which == "destination" {
+                            writes.push((item.scan, preg));
+                        }
+                    }
+                    FormalConnectorEnd::Spilled { class, .. } => {
+                        for candidate in formal_spill_replay_scratch_candidates(class, abi)? {
+                            writes.push((item.scan, candidate));
+                        }
+                    }
+                }
+            }
+        } else {
+            match formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)? {
+                (FormalLoadDestination::Register(dst), _, _) => writes.push((item.scan, dst)),
+                (FormalLoadDestination::Spilled { class, .. }, _, _) => {
+                    for candidate in formal_spill_replay_scratch_candidates(class, abi)? {
+                        writes.push((item.scan, candidate));
+                    }
+                }
+            }
+        }
+    }
+    Ok(writes)
+}
+
+/// Whether this pass is about to REORDER anything in the prefix, and if not,
+/// whether the prologue it received already satisfies the pass's contract.
+///
+/// Its theorem is weaker in form but stronger in kind: it does not show that a
+/// reordering preserved the prologue’s meaning, it shows there was no reordering
+/// to preserve. It therefore needs no value model at all — which is why it is
+/// tried first, and why it still admits prologues whose connector opcodes or
+/// slots [`formal_barrier_ends_for_value_proof`] declines to model.
+///
+/// The segment-wise emission reorders exactly three things, and this rules all
+/// three out:
+///
+/// * a segment's intakes, which the parallel-copy resolution makes simultaneous
+///   — invisible to everything outside the segment, and the pre-existing core
+///   of this pass;
+/// * a stack-arg load, relative to the intakes of its OWN segment that follow it
+///   in scan order — so this requires that no load has any;
+/// * the spilled-formal saves, which are hoisted to the top of the prologue — so
+///   this requires that there are none.
+///
+/// With those excluded, every instruction is emitted at the position ISel
+/// emitted it, and the pass has changed nothing that could need proving.
+///
+/// What is left to discharge is the one thing the pass OWES beyond preserving
+/// order: its contract that every intake delivers its argument register's
+/// FUNCTION-ENTRY contents. The scan order can violate that on its own — a load
+/// whose destination the allocator picked is free to be an argument register a
+/// later segment's intake still has to read, which is why the duplicate-free
+/// path sinks loads below the whole group. So every intake's source register
+/// must be untouched by everything positioned before its segment. Registers a
+/// spill replay's scratch could clobber are counted as writes there, although
+/// no spill scratch on either ABI is an argument register, so that clause is a
+/// belt on a brace.
+///
+/// NOT established here: that the prologue ISel and regalloc produced is itself
+/// correct. A connector that reads a register some earlier instruction had
+/// already overwritten reads the wrong value in the order this pass received it,
+/// and emitting that same order neither introduces nor repairs it — exactly the
+/// boundary the segment-wise path has always drawn around connectors.
+fn formal_arg_prefix_needs_no_reordering(
+    segments: &[FormalCopySegment],
+    residue: &[FormalPrefixResidue],
+    spilled: &[FormalSpilledSave],
+    alloc: &HashMap<VReg, X86PReg>,
+    installed_spills: &HashMap<VReg, u32>,
+    abi: X86CallAbi,
+) -> Result<(), X86PipelineError> {
+    if let Some(save) = spilled.first() {
+        return Err(formal_gpr_copy_error(format!(
+            "formal-arg prefix hoists the spilled-formal save of {} to the top of the \
+             prologue, so the emitted order is not the scanned one",
+            x86_preg_name(save.src)
+        )));
+    }
+    for item in residue {
+        if item.is_connector {
+            continue;
+        }
+        let Some(segment) = segments.get(item.segment) else {
+            return Err(formal_gpr_copy_error(
+                "formal-arg prefix stack-arg load names a segment the scan did not record; \
+                 refusing to reorder (fail-closed)"
+                    .to_string(),
+            ));
+        };
+        if let Some((copy, scan)) = segment
+            .gpr
+            .iter()
+            .chain(segment.xmm.iter())
+            .find(|(_, scan)| *scan > item.scan)
+        {
+            return Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix would move a stack-arg load past the formal intake {} <- {} \
+                 at prefix position {scan} in its own segment",
+                x86_preg_name(copy.dst),
+                x86_preg_name(copy.src),
+            )));
+        }
+    }
+
+    // The contract premise: every intake's source register must still hold its
+    // function-entry contents when its segment runs.
+    let writes = formal_prefix_register_writes(segments, residue, alloc, installed_spills, abi)?;
+    for seg in segments {
+        let Some(start) = seg
+            .gpr
+            .iter()
+            .chain(seg.xmm.iter())
+            .map(|(_, scan)| *scan)
+            .min()
+        else {
+            continue;
+        };
+        for (copy, _) in seg.gpr.iter().chain(seg.xmm.iter()) {
+            for (scan, written) in &writes {
+                if *scan < start && x86_64_regs::x86_regs_overlap(*written, copy.src) {
+                    return Err(formal_gpr_copy_error(format!(
+                        "formal-arg prefix writes {} at prefix position {scan}, before the \
+                         formal intake {} <- {} that must read its incoming value; refusing to \
+                         reorder (fail-closed)",
+                        x86_preg_name(*written),
+                        x86_preg_name(copy.dst),
+                        x86_preg_name(copy.src),
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Discharge the per-instruction dependence analysis that the segment-wise
+/// formal-argument prologue needs before it may emit stack-argument loads.
+///
+/// ## What the refusal this replaces protected
+///
+/// On the segment-wise path the prologue is inherently sequential: a
+/// split-replay connector reads a formal's assigned preg at the exact position
+/// the allocator modelled, so segments and connectors must keep their order.
+/// Stack-argument loads had always been SUNK below the whole group instead,
+/// because a load's destination may be an incoming argument register that a
+/// later intake still has to read. Sinking a load below a connector that READS
+/// its destination is a miscompile (`movw 16(%rbp),%dx` feeding
+/// `movl %edx,%r8d`), and sinking it below a later write to the same register
+/// makes the load, not that later write, the surviving one. Neither is visible
+/// without looking at what each load reads and what each barrier writes — so
+/// the combination was refused outright, which is what this function replaces
+/// with the analysis the refusal's comment asked for.
+///
+/// ## The placement rule, and why it is the minimal one
+///
+/// Each load is emitted at its OWN position among the segments and connectors:
+/// after the resolved copies of the segment it was scanned inside, before that
+/// segment's closing connector, in scan order among that segment's other loads.
+/// Relative to every connector, every other segment and every other load the
+/// emitted order is therefore IDENTICAL to the one ISel emitted. The only
+/// instructions a load moves across are the intakes of its own segment that
+/// followed it — and those become simultaneous with the ones that preceded it
+/// anyway, because the segment is resolved as a parallel copy.
+///
+/// ## Two routes
+///
+/// A prefix is admitted by whichever of two arguments applies.
+///
+/// ROUTE 1, `formal_arg_prefix_needs_no_reordering`: the pass is about to emit
+/// every instruction at the position it received it, so there is no reordering
+/// to justify — only the pass’s own contract to discharge.
+///
+/// ROUTE 2, below: something does move, so prove that what is emitted computes
+/// what the scanned order computes, saying in the same breath why route 1 did
+/// not apply.
+///
+/// A split connector whose end the allocator SPILLED used to be admitted only by
+/// route 1, because route 2 reasoned over physical registers alone. It is now in
+/// route 2 as well: [`formal_barrier_ends_for_value_proof`] models such an end by
+/// the SLOT its reload or store touches, which is sound because the spiller emits
+/// each instruction’s replay as one contiguous group whose scratch registers are
+/// dead outside it — and which is strictly better than dropping the connector,
+/// because the value it READS is then comparable across the two orders. The
+/// shapes that argument does not cover (a partial-write connector into a spilled
+/// destination; a connector between one slot and itself) stay refused, by name.
+///
+/// ## What route 2 proves
+///
+/// Memory independence is structural, not assumed. The only memory a prologue
+/// READS is the incoming argument area: [`is_formal_stack_arg_load`] accepts a
+/// load only at `[RBP + disp]` with `disp >= 16`, at or above the return
+/// address, in the caller's frame. The only memory it WRITES is spill slots,
+/// and `compute_x86_stack_frame_layout` gives every stack slot a NEGATIVE
+/// displacement from RBP (`stack_slot_offsets.push(Some(-offset))`, and
+/// `x86_spill_stack_mem` adds displacement 0), so no spill store can alias any
+/// incoming argument. That is why [`FormalPrefixState`] keeps registers,
+/// argument memory and spill slots in three disjoint spaces — and why this
+/// function first refuses any prologue that writes RBP itself, which is the
+/// premise both halves rest on.
+///
+/// Register independence is decided by running both orders over the syntactic
+/// term domain of [`FormalPrefixTerm`] and requiring that they agree on every
+/// connector's read, every spilled formal's store, and the final contents of
+/// every register the prologue writes — see
+/// [`prove_formal_prefix_orders_agree`]. Before that, the reordered pairs are
+/// enumerated directly so that a refusal can name a PAIR and not only the
+/// register whose contents came out wrong.
+///
+/// Anything the proof cannot clear stays refused.
+fn prove_formal_arg_prefix_admits_loads(
+    segments: &[FormalCopySegment],
+    residue: &[FormalPrefixResidue],
+    spilled: &[FormalSpilledSave],
+    alloc: &HashMap<VReg, X86PReg>,
+    installed_spills: &HashMap<VReg, u32>,
+    abi: X86CallAbi,
+    xmm_scratch: X86PReg,
+) -> Result<(), X86PipelineError> {
+    // The spilled-formal saves, in scan order, exactly as
+    // `emit_spilled_formal_saves` will emit them (including the classes it
+    // emits nothing for, which this must mirror rather than model).
+    let mut saves: Vec<FormalPrefixStep> = Vec::new();
+    let mut save_scans: Vec<usize> = Vec::new();
+    for (id, save) in spilled.iter().enumerate() {
+        let Some(bank) = x86_reg_bank_for_class(save.vreg.class) else {
+            continue;
+        };
+        let scratch = match bank {
+            X86RegBank::Gpr => x86_spill_gpr_scratch_regs(save.vreg.class)[0],
+            X86RegBank::Xmm => x86_spill_xmm_scratch_regs(abi)[0],
+        };
+        saves.push(FormalPrefixStep::SpillSave {
+            id,
+            src: save.src,
+            scratch,
+            copy_opcode: x86_spill_formal_copy_opcode(save.vreg.class),
+            store_opcode: x86_spill_store_opcode(save.vreg.class),
+            slot: save.slot,
+        });
+        save_scans.push(save.scan);
+    }
+
+    // Every register the prologue's intakes, loads and connectors write. This
+    // is both the input to the frame-pointer premise check below and the set
+    // whose end-of-prologue contents the term proof compares.
+    let mut written: Vec<X86PReg> = Vec::new();
+    for seg in segments {
+        for (copy, _) in seg.gpr.iter().chain(seg.xmm.iter()) {
+            written.push(copy.dst);
+        }
+    }
+    for item in residue {
+        if item.is_connector {
+            if let Some(dst) = formal_barrier_dst_preg(&item.inst, alloc) {
+                written.push(dst);
+            }
+        } else if let (FormalLoadDestination::Register(dst), _, _) =
+            formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)?
+        {
+            // A SPILLED load writes no register the prologue can observe; see
+            // `FormalLoadDestination::Spilled`.
+            written.push(dst);
+        }
+    }
+    // A load addresses the incoming argument area through RBP. If the prologue
+    // wrote RBP the address itself would move, and the memory-disjointness
+    // argument above would not hold — refuse rather than reason past it. The
+    // spilled-formal scratches are checked here too even though they are not
+    // compared later, because they are writes all the same.
+    let mut frame_pointer_writes = written.clone();
+    for step in &saves {
+        if let FormalPrefixStep::SpillSave { scratch, .. } = step {
+            frame_pointer_writes.push(*scratch);
+        }
+    }
+    for dst in &frame_pointer_writes {
+        if x86_64_regs::x86_regs_overlap(*dst, RBP) || x86_64_regs::x86_regs_overlap(*dst, RSP) {
+            return Err(formal_gpr_copy_error(format!(
+                "formal-arg prefix writes {}, which the stack-arg loads address from; \
+                 refusing to reorder (fail-closed)",
+                x86_preg_name(*dst)
+            )));
+        }
+    }
+
+    // ROUTE 1: nothing is reordered. Then there is no reordering to justify,
+    // only the pass's own contract to discharge — and, unlike the value-level
+    // proof below, this needs no model of a spilled connector's reload/store
+    // replay. See `formal_arg_prefix_needs_no_reordering`.
+    let obstruction = match formal_arg_prefix_needs_no_reordering(
+        segments,
+        residue,
+        spilled,
+        alloc,
+        installed_spills,
+        abi,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(why) => formal_refusal_message(&why),
+    };
+
+    // ROUTE 2: something moves, so prove that what is emitted computes what the
+    // scanned order computes. Every refusal from here carries WHY route 1 did
+    // not apply, because that is the other half of what a reader needs.
+    let value_proof = (|| -> Result<(), X86PipelineError> {
+        // Name the reordered pairs directly. The placement rule moves a load
+        // across exactly two kinds of instruction: the intakes of its own segment
+        // that FOLLOW it (which the parallel copy makes simultaneous), and the
+        // spilled-formal saves that follow it (which are hoisted to the top).
+        //
+        // A following intake whose SOURCE the load's destination aliases is NOT a
+        // conflict: that intake's contract value is its argument register's
+        // function-entry contents, and placing the load after the resolved group
+        // is exactly what preserves them. A shared DESTINATION is a conflict: the
+        // prologue's order makes the later intake the surviving write, the emitted
+        // order would make the load's write survive.
+        for item in residue {
+            if item.is_connector {
+                continue;
+            }
+            let (destination, disp, _) =
+                formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)?;
+            let Some(segment) = segments.get(item.segment) else {
+                return Err(formal_gpr_copy_error(
+                    "formal-arg prefix stack-arg load names a segment the scan did not record; \
+                 refusing to reorder (fail-closed)"
+                        .to_string(),
+                ));
+            };
+            let load_dst = match destination {
+                FormalLoadDestination::Register(dst) => dst,
+                FormalLoadDestination::Spilled { slot, class } => {
+                    // A spilled load's value reaches its consumers through its slot.
+                    // Nothing in the prologue READS a slot, so the only way the
+                    // hoisted spilled-formal saves could disturb it is by writing
+                    // the SAME slot.
+                    for save in spilled {
+                        if save.slot == slot {
+                            return Err(formal_gpr_copy_error(format!(
+                                "formal-arg prefix cannot separate the stack-arg load from \
+                             [rbp+{disp}] from the spilled formal in {}: both are stored to \
+                             slot {slot}; refusing to reorder (fail-closed)",
+                                x86_preg_name(save.src),
+                            )));
+                        }
+                    }
+                    // The reload/store pair the spiller will put here carries the
+                    // value through one of two scratch registers. The pair is
+                    // self-contained, so its scratch cannot be clobbered from
+                    // outside — but moving the pair across an intake that USES or
+                    // DEFINES that scratch does change what the intake sees or
+                    // leaves behind. Refuse that, naming the pair.
+                    let candidates = formal_spill_replay_scratch_candidates(class, abi)?;
+                    for (copy, intake_scan) in segment.gpr.iter().chain(segment.xmm.iter()) {
+                        if *intake_scan <= item.scan {
+                            continue;
+                        }
+                        for candidate in candidates {
+                            if x86_64_regs::x86_regs_overlap(copy.dst, candidate)
+                                || x86_64_regs::x86_regs_overlap(copy.src, candidate)
+                            {
+                                return Err(formal_gpr_copy_error(format!(
+                                    "formal-arg prefix cannot separate the spilled stack-arg load \
+                                 from [rbp+{disp}] from the later formal intake {} <- {} in \
+                                 the same segment: the load's spill-replay pair may use {}, \
+                                 which that intake touches; refusing to reorder (fail-closed)",
+                                    x86_preg_name(copy.dst),
+                                    x86_preg_name(copy.src),
+                                    x86_preg_name(candidate),
+                                )));
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            for (copy, intake_scan) in segment.gpr.iter().chain(segment.xmm.iter()) {
+                if *intake_scan > item.scan && x86_64_regs::x86_regs_overlap(copy.dst, load_dst) {
+                    return Err(formal_gpr_copy_error(format!(
+                        "formal-arg prefix cannot separate the stack-arg load of {} from \
+                     [rbp+{disp}] from the later formal intake {} <- {} in the same segment: \
+                     both write {}, and resolving the segment as a parallel copy would make \
+                     the load the surviving write; refusing to reorder (fail-closed)",
+                        x86_preg_name(load_dst),
+                        x86_preg_name(copy.dst),
+                        x86_preg_name(copy.src),
+                        x86_preg_name(copy.dst),
+                    )));
+                }
+            }
+            for (step, scan) in saves.iter().zip(save_scans.iter()) {
+                let FormalPrefixStep::SpillSave { src, scratch, .. } = step else {
+                    continue;
+                };
+                if *scan <= item.scan {
+                    continue;
+                }
+                if x86_64_regs::x86_regs_overlap(*src, load_dst) {
+                    return Err(formal_gpr_copy_error(format!(
+                        "formal-arg prefix cannot separate the stack-arg load of {} from \
+                     [rbp+{disp}] from the later spilled-formal save of {}: the save is \
+                     hoisted above the load and would store the loaded value instead of the \
+                     incoming argument; refusing to reorder (fail-closed)",
+                        x86_preg_name(load_dst),
+                        x86_preg_name(*src),
+                    )));
+                }
+                if x86_64_regs::x86_regs_overlap(*scratch, load_dst) {
+                    return Err(formal_gpr_copy_error(format!(
+                        "formal-arg prefix cannot separate the stack-arg load of {} from \
+                     [rbp+{disp}] from the later spilled-formal save through scratch {}: \
+                     the hoisted save and the load write the same register; refusing to \
+                     reorder (fail-closed)",
+                        x86_preg_name(load_dst),
+                        x86_preg_name(*scratch),
+                    )));
+                }
+            }
+        }
+
+        // A load's destination must also survive every segment's cycle-breaking.
+        // The GPR scratch is chosen to avoid it (see the `scratch_avoid` list in
+        // `fixup_formal_arg_parallel_copy`); the XMM scratch is FIXED per ABI, so
+        // a load into it is refused instead.
+        for item in residue {
+            if item.is_connector {
+                continue;
+            }
+            if let (FormalLoadDestination::Register(load_dst), disp, _) =
+                formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)?
+                && x86_64_regs::x86_regs_overlap(load_dst, xmm_scratch)
+            {
+                return Err(formal_gpr_copy_error(format!(
+                    "formal-arg prefix stack-arg load from [rbp+{disp}] targets {}, this ABI's \
+                 fixed XMM cycle-breaking scratch, which a segment may clobber; refusing to \
+                 reorder (fail-closed)",
+                    x86_preg_name(load_dst)
+                )));
+            }
+        }
+
+        // A spilled stack-arg load appears in NEITHER order (see
+        // `FormalLoadDestination::Spilled`), so the term proof cannot see the
+        // store its replay makes to that load’s slot. A spilled connector end
+        // READS or WRITES a slot, and the proof does see those. Refuse the one
+        // shape where the invisible write and a visible slot could be the same
+        // storage — `install_x86_spill_slots` gives each spilled vreg its own
+        // slot, so this is a premise about the input, not a hazard it expects.
+        let connector_slots = formal_connector_replay_slots(residue, alloc, installed_spills, abi)?;
+        for item in residue {
+            if item.is_connector {
+                continue;
+            }
+            if let (FormalLoadDestination::Spilled { slot, .. }, disp, _) =
+                formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)?
+                && connector_slots.contains(&slot)
+            {
+                return Err(formal_gpr_copy_error(format!(
+                    "formal-arg prefix stack-arg load from [rbp+{disp}] is spilled to slot \
+                     {slot}, the same slot a split connector’s spill replay uses, so the \
+                     ordering proof would be reasoning past a store it does not model; \
+                     refusing to reorder (fail-closed)"
+                )));
+            }
+        }
+
+        // Build the two orders. The reference is the prefix in SCAN order with each
+        // intake carrying its contract value; the emitted order is what this pass
+        // is about to write into the block.
+        let mut reference: Vec<(usize, FormalPrefixStep)> = Vec::new();
+        for seg in segments {
+            for (copy, scan) in seg.gpr.iter().chain(seg.xmm.iter()) {
+                reference.push((
+                    *scan,
+                    FormalPrefixStep::ContractIntake {
+                        dst: copy.dst,
+                        src: copy.src,
+                        opcode: copy.opcode,
+                    },
+                ));
+            }
+        }
+        for (id, item) in residue.iter().enumerate() {
+            if item.is_connector {
+                let (dst, src) =
+                    formal_barrier_ends_for_value_proof(&item.inst, alloc, installed_spills, abi)?;
+                reference.push((
+                    item.scan,
+                    FormalPrefixStep::Barrier {
+                        id,
+                        dst,
+                        src,
+                        opcode: item.inst.opcode,
+                    },
+                ));
+            } else if let (FormalLoadDestination::Register(dst), disp, opcode) =
+                formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)?
+            {
+                reference.push((item.scan, FormalPrefixStep::Load { dst, disp, opcode }));
+            }
+        }
+        for (step, scan) in saves.iter().zip(save_scans.iter()) {
+            reference.push((*scan, step.clone()));
+        }
+        reference.sort_by_key(|(scan, _)| *scan);
+        let reference: Vec<FormalPrefixStep> =
+            reference.into_iter().map(|(_, step)| step).collect();
+
+        let mut emitted: Vec<FormalPrefixStep> = saves.clone();
+        for (index, seg) in segments.iter().enumerate() {
+            emitted.push(FormalPrefixStep::ParallelIntakes(
+                seg.gpr
+                    .iter()
+                    .chain(seg.xmm.iter())
+                    .map(|(copy, _)| *copy)
+                    .collect(),
+            ));
+            for (id, item) in residue.iter().enumerate() {
+                if item.segment != index {
+                    continue;
+                }
+                if item.is_connector {
+                    let (dst, src) = formal_barrier_ends_for_value_proof(
+                        &item.inst,
+                        alloc,
+                        installed_spills,
+                        abi,
+                    )?;
+                    emitted.push(FormalPrefixStep::Barrier {
+                        id,
+                        dst,
+                        src,
+                        opcode: item.inst.opcode,
+                    });
+                } else if let (FormalLoadDestination::Register(dst), disp, opcode) =
+                    formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)?
+                {
+                    // A SPILLED load appears in NEITHER order: it writes no register
+                    // and no slot the prologue can observe, and the premises that
+                    // licenses were discharged above. See
+                    // `FormalLoadDestination::Spilled`.
+                    emitted.push(FormalPrefixStep::Load { dst, disp, opcode });
+                }
+            }
+        }
+
+        prove_formal_prefix_orders_agree(&reference, &emitted, &written)
+    })();
+    value_proof.map_err(|err| {
+        formal_gpr_copy_error(format!(
+            "{} (and the prefix could not be emitted unreordered either: {obstruction})",
+            formal_refusal_message(&err)
+        ))
+    })
+}
+
 /// Post-regalloc fixup for the formal-argument parallel copy (#497, #499).
 ///
 /// `lower_formal_arguments` emits a formal-preservation prefix before any
@@ -5905,11 +9470,6 @@ fn fixup_formal_arg_parallel_copy(
     //    sequential segment/connector order is preserved exactly as the
     //    replay emitted it. Within-segment reordering stays invisible
     //    outside the segment, which is the whole soundness argument.
-    struct FormalCopySegment {
-        gpr: Vec<PhysRegCopy>,
-        xmm: Vec<PhysRegCopy>,
-        barrier: Option<X86ISelInst>,
-    }
     let mut prefix_len: usize = 0;
     // `segments` holds the CLOSED segments in scan order; `open_segment` is
     // the one currently being filled. It is closed (barrier recorded, pushed)
@@ -5922,11 +9482,13 @@ fn fixup_formal_arg_parallel_copy(
         xmm: Vec::new(),
         barrier: None,
     };
-    let mut spilled_formals: Vec<(VReg, X86PReg, u32)> = Vec::new();
-    // (inst, is_connector): scan-order residue sunk below the group on the
-    // duplicate-free path. Keeping loads and connectors interleaved in scan
-    // order preserves the pre-existing behavior exactly on that path.
-    let mut post_preserve_prefix: Vec<(X86ISelInst, bool)> = Vec::new();
+    let mut spilled_formals: Vec<FormalSpilledSave> = Vec::new();
+    // Scan-order residue: the connectors and stack-arg loads that are
+    // re-emitted verbatim. On the duplicate-free path the whole residue is sunk
+    // below the group in scan order, which preserves the pre-existing behavior
+    // exactly there. On the segment-wise path each entry is placed at the
+    // position its `segment`/`scan` record gives it.
+    let mut post_preserve_prefix: Vec<FormalPrefixResidue> = Vec::new();
     let mut scan_len: usize = 0;
     for inst in &block.insts {
         if prefix_len >= formal_count_limit {
@@ -5934,43 +9496,67 @@ fn fixup_formal_arg_parallel_copy(
         }
         match classify_formal_arg_mov(inst, alloc) {
             Some((dst, src, X86Opcode::MovRR)) => {
-                open_segment.gpr.push(PhysRegCopy {
-                    dst,
-                    src,
-                    opcode: X86Opcode::MovRR,
-                });
+                open_segment.gpr.push((
+                    PhysRegCopy {
+                        dst,
+                        src,
+                        opcode: X86Opcode::MovRR,
+                    },
+                    scan_len,
+                ));
                 prefix_len += 1;
             }
             Some((dst, src, X86Opcode::MovRR32)) => {
-                open_segment.gpr.push(PhysRegCopy {
-                    dst,
-                    src,
-                    opcode: X86Opcode::MovRR32,
-                });
+                open_segment.gpr.push((
+                    PhysRegCopy {
+                        dst,
+                        src,
+                        opcode: X86Opcode::MovRR32,
+                    },
+                    scan_len,
+                ));
                 prefix_len += 1;
             }
             Some((dst, src, X86Opcode::MovsdRR))
             | Some((dst, src, X86Opcode::MovssRR))
             | Some((dst, src, X86Opcode::MovdqaRR)) => {
-                open_segment.xmm.push(PhysRegCopy {
-                    dst,
-                    src,
-                    opcode: inst.opcode,
-                });
+                open_segment.xmm.push((
+                    PhysRegCopy {
+                        dst,
+                        src,
+                        opcode: inst.opcode,
+                    },
+                    scan_len,
+                ));
                 prefix_len += 1;
             }
             Some(_) => break, // unreachable: classify_formal_arg_mov filters opcodes
             None => {
                 if is_formal_stack_arg_load(inst) {
-                    post_preserve_prefix.push((inst.clone(), false));
+                    post_preserve_prefix.push(FormalPrefixResidue {
+                        inst: inst.clone(),
+                        is_connector: false,
+                        segment: segments.len(),
+                        scan: scan_len,
+                    });
                     prefix_len += 1;
                 } else if let Some((vreg, src, slot, _opcode)) =
                     classify_spilled_formal_arg_mov(inst, installed_spills)
                 {
-                    spilled_formals.push((vreg, src, slot));
+                    spilled_formals.push(FormalSpilledSave {
+                        vreg,
+                        src,
+                        slot,
+                        scan: scan_len,
+                    });
                     prefix_len += 1;
                 } else if prefix_len > 0 && is_interleaved_split_replay_copy(inst) {
-                    post_preserve_prefix.push((inst.clone(), true));
+                    post_preserve_prefix.push(FormalPrefixResidue {
+                        inst: inst.clone(),
+                        is_connector: true,
+                        segment: segments.len(),
+                        scan: scan_len,
+                    });
                     open_segment.barrier = Some(inst.clone());
                     segments.push(std::mem::replace(
                         &mut open_segment,
@@ -6017,7 +9603,7 @@ fn fixup_formal_arg_parallel_copy(
     //    local reordering — fail closed rather than miscompile.
     let all_gpr: Vec<PhysRegCopy> = segments
         .iter()
-        .flat_map(|s| s.gpr.iter().copied())
+        .flat_map(|s| s.gpr.iter().map(|(copy, _)| *copy))
         .collect();
     // The seed-19149 hazard exists ONLY when an intake FOLLOWS a connector
     // in scan order (a later-range formal re-defining a preg the connector
@@ -6029,18 +9615,6 @@ fn fixup_formal_arg_parallel_copy(
     // loads/connectors keep their mutual order (a connector may read a
     // stack-load's dst, e.g. `movw 16(%rbp),%dx` feeding `movl %edx,%r8d`
     // — the s23006 shape a barrier-always design miscompiled).
-
-    let barrier_pregs = |inst: &X86ISelInst| -> (Option<X86PReg>, Option<X86PReg>) {
-        match inst.operands.as_slice() {
-            [X86ISelOperand::PReg(d), X86ISelOperand::PReg(s)] => (Some(*d), Some(*s)),
-            [X86ISelOperand::VReg(d), X86ISelOperand::VReg(s)] => {
-                (alloc.get(d).copied(), alloc.get(s).copied())
-            }
-            [X86ISelOperand::PReg(d), X86ISelOperand::VReg(s)] => (Some(*d), alloc.get(s).copied()),
-            [X86ISelOperand::VReg(d), X86ISelOperand::PReg(s)] => (alloc.get(d).copied(), Some(*s)),
-            _ => (None, None),
-        }
-    };
 
     // Barriers are needed iff some LATER intake's dst overlaps a
     // connector's SOURCE preg (the actual overwrite). An intake after a
@@ -6055,9 +9629,9 @@ fn fixup_formal_arg_parallel_copy(
             let Some(barrier) = &seg.barrier else {
                 continue;
             };
-            let (_, barrier_src) = barrier_pregs(barrier);
+            let (_, barrier_src) = formal_barrier_operand_pregs(barrier, alloc);
             for later in &segments[i + 1..] {
-                for copy in later.gpr.iter().chain(later.xmm.iter()) {
+                for (copy, _) in later.gpr.iter().chain(later.xmm.iter()) {
                     match barrier_src {
                         Some(src) => {
                             if x86_64_regs::x86_regs_overlap(copy.dst, src) {
@@ -6074,33 +9648,34 @@ fn fixup_formal_arg_parallel_copy(
 
     if needs_barriers {
         // Segment-wise path (rare: recursive-split connectors interleaved
-        // INSIDE the intake group). Stack-arg loads cannot be ordered
-        // against barriers without per-instruction dependence analysis —
-        // fail closed on the combination rather than guess.
-        if post_preserve_prefix
-            .iter()
-            .any(|(_, is_connector)| !is_connector)
-        {
-            return Err(formal_gpr_copy_error(
-                "formal-arg prefix mixes intake-interleaved split connectors \
-                 with stack-arg loads; refusing to reorder (fail-closed)",
-            ));
-        }
+        // INSIDE the intake group).
+        //
+        // Stack-arg loads used to be refused outright here, because they
+        // "cannot be ordered against barriers without per-instruction
+        // dependence analysis". That analysis is
+        // `prove_formal_arg_prefix_admits_loads`, run below once the segments
+        // are final: each load is emitted at its OWN position among the
+        // segments and connectors, and the placement is admitted only when
+        // running both orders over a syntactic value domain shows they compute
+        // the same thing. Anything it cannot clear is still refused, by name.
+        //
         // A duplicate dst WITHIN one segment means the
         // earlier write is DEAD: the allocator only reuses a preg across
         // disjoint ranges, every intake source is an ENTRY arg-preg value
         // (never a written assigned preg), connectors force a segment
-        // split, and spilled-formal saves read arg pregs directly — so
-        // nothing can observe the earlier value before the later write.
+        // split, spilled-formal saves read arg pregs directly, and a
+        // stack-arg load reads only RBP and the incoming argument area — so
+        // nothing in the prefix can observe the earlier value before the
+        // later write.
         // Keep only the LAST write per destination (dead-arg preg reuse,
         // e.g. an unused formal whose preg is recycled by a later one).
         for seg in &mut segments {
             for bank in [&mut seg.gpr, &mut seg.xmm] {
                 let mut keep = vec![true; bank.len()];
-                for (i, a) in bank.iter().enumerate() {
+                for (i, (a, _)) in bank.iter().enumerate() {
                     if bank[i + 1..]
                         .iter()
-                        .any(|b| x86_64_regs::x86_regs_overlap(a.dst, b.dst))
+                        .any(|(b, _)| x86_64_regs::x86_regs_overlap(a.dst, b.dst))
                     {
                         keep[i] = false;
                     }
@@ -6110,7 +9685,7 @@ fn fixup_formal_arg_parallel_copy(
                     .iter()
                     .zip(keep)
                     .filter(|(_, keep)| *keep)
-                    .map(|(copy, _)| *copy)
+                    .map(|(entry, _)| *entry)
                     .collect();
             }
         }
@@ -6118,14 +9693,15 @@ fn fixup_formal_arg_parallel_copy(
         // must still hold its ENTRY value when its segment runs, and every
         // barrier chain reg must survive untouched by later segments.
         for (i, earlier) in segments.iter().enumerate() {
-            let mut earlier_dsts: Vec<X86PReg> = earlier.gpr.iter().map(|c| c.dst).collect();
+            let mut earlier_dsts: Vec<X86PReg> =
+                earlier.gpr.iter().map(|(copy, _)| copy.dst).collect();
             if let Some(b) = &earlier.barrier
-                && let (Some(d), _) = barrier_pregs(b)
+                && let (Some(d), _) = formal_barrier_operand_pregs(b, alloc)
             {
                 earlier_dsts.push(d);
             }
             for later in &segments[i + 1..] {
-                let later_srcs = later.gpr.iter().map(|c| c.src);
+                let later_srcs = later.gpr.iter().map(|(copy, _)| copy.src);
                 for src in later_srcs {
                     if earlier_dsts
                         .iter()
@@ -6148,15 +9724,36 @@ fn fixup_formal_arg_parallel_copy(
         // must survive any segment's cycle-breaking).
         let mut scratch_avoid = all_gpr.clone();
         for seg in &segments {
+            // Each RESOLVABLE end, separately: a connector one of whose ends the
+            // allocator spilled still carries a value through the other end, and
+            // that end must survive any segment's cycle-breaking just the same.
             if let Some(b) = &seg.barrier {
-                let (d, s) = barrier_pregs(b);
-                if let (Some(d), Some(s)) = (d, s) {
+                let (d, s) = formal_barrier_operand_pregs(b, alloc);
+                for end in [d, s].into_iter().flatten() {
                     scratch_avoid.push(PhysRegCopy {
-                        dst: d,
-                        src: s,
+                        dst: end,
+                        src: end,
                         opcode: b.opcode,
                     });
                 }
+            }
+        }
+        // A stack-arg load's destination must survive every segment's
+        // cycle-breaking, so the scratch has to avoid it too. (Only the
+        // register fields are read; `PhysRegCopy` is the shape the selector
+        // takes.) Without this a load into R11 would be clobbered by a later
+        // segment's scratch use — the one hazard the placement rule below
+        // cannot see, because the resolver's scratch is not in either order.
+        for item in &post_preserve_prefix {
+            if !item.is_connector
+                && let Ok((FormalLoadDestination::Register(dst), _, opcode)) =
+                    formal_stack_arg_load_destination(&item.inst, alloc, installed_spills)
+            {
+                scratch_avoid.push(PhysRegCopy {
+                    dst,
+                    src: dst,
+                    opcode,
+                });
             }
         }
         let gpr_scratch = select_gpr_parallel_copy_scratch(&scratch_avoid)?;
@@ -6164,12 +9761,30 @@ fn fixup_formal_arg_parallel_copy(
             X86CallAbi::SystemV => XMM15,
             X86CallAbi::WindowsX64 => XMM4,
         };
+
+        // The per-instruction dependence analysis. Only needed when the prefix
+        // actually carries stack-arg loads: with none, the emission below is
+        // the segment/connector order this path has always produced.
+        if post_preserve_prefix.iter().any(|item| !item.is_connector) {
+            prove_formal_arg_prefix_admits_loads(
+                &segments,
+                &post_preserve_prefix,
+                &spilled_formals,
+                alloc,
+                installed_spills,
+                abi,
+                xmm_scratch,
+            )?;
+        }
+
         let tail: Vec<X86ISelInst> = block.insts.drain(scan_len..).collect();
         block.insts.clear();
         emit_spilled_formal_saves(block, &spilled_formals, abi);
-        for seg in segments {
-            let resolved_gpr = resolve_gpr_physreg_parallel_copy(&seg.gpr, gpr_scratch)?;
-            let resolved_xmm = resolve_xmm_physreg_parallel_copy(&seg.xmm, xmm_scratch);
+        for (index, seg) in segments.into_iter().enumerate() {
+            let gpr: Vec<PhysRegCopy> = seg.gpr.iter().map(|(copy, _)| *copy).collect();
+            let xmm: Vec<PhysRegCopy> = seg.xmm.iter().map(|(copy, _)| *copy).collect();
+            let resolved_gpr = resolve_gpr_physreg_parallel_copy(&gpr, gpr_scratch)?;
+            let resolved_xmm = resolve_xmm_physreg_parallel_copy(&xmm, xmm_scratch);
             for copy in resolved_gpr.into_iter().chain(resolved_xmm) {
                 block.insts.push(X86ISelInst::new(
                     copy.opcode,
@@ -6179,15 +9794,20 @@ fn fixup_formal_arg_parallel_copy(
                     ],
                 ));
             }
+            // This segment's stack-arg loads, at the position the analysis
+            // proved safe: after the resolved copies, before the connector that
+            // closes the segment, in scan order among themselves. Relative to
+            // every connector, every other segment and every other load this is
+            // exactly the order ISel emitted.
+            for item in &post_preserve_prefix {
+                if item.segment == index && !item.is_connector {
+                    block.insts.push(item.inst.clone());
+                }
+            }
             if let Some(barrier) = seg.barrier {
                 block.insts.push(barrier);
             }
         }
-        block.insts.extend(
-            post_preserve_prefix
-                .into_iter()
-                .filter_map(|(inst, is_connector)| (!is_connector).then_some(inst)),
-        );
         block.insts.extend(tail);
         return Ok(());
     }
@@ -6203,7 +9823,7 @@ fn fixup_formal_arg_parallel_copy(
     let mut gpr_copies = all_gpr;
     let mut xmm_copies: Vec<PhysRegCopy> = segments
         .iter()
-        .flat_map(|s| s.xmm.iter().copied())
+        .flat_map(|s| s.xmm.iter().map(|(copy, _)| *copy))
         .collect();
     for bank in [&mut gpr_copies, &mut xmm_copies] {
         let mut keep = vec![true; bank.len()];
@@ -6253,7 +9873,7 @@ fn fixup_formal_arg_parallel_copy(
     }
     block
         .insts
-        .extend(post_preserve_prefix.into_iter().map(|(inst, _)| inst));
+        .extend(post_preserve_prefix.into_iter().map(|item| item.inst));
     block.insts.extend(tail);
     Ok(())
 }
@@ -6262,22 +9882,28 @@ fn fixup_formal_arg_parallel_copy(
 /// resolution paths of [`fixup_formal_arg_parallel_copy`]).
 fn emit_spilled_formal_saves(
     block: &mut trust_cg_lower::x86_64_isel::X86ISelBlock,
-    spilled_formals: &[(VReg, X86PReg, u32)],
+    spilled_formals: &[FormalSpilledSave],
     abi: X86CallAbi,
 ) {
-    for (vreg, src, slot) in spilled_formals {
-        let scratch = match x86_reg_bank_for_class(vreg.class) {
-            Some(X86RegBank::Gpr) => x86_spill_gpr_scratch_regs(vreg.class)[0],
+    for save in spilled_formals {
+        let scratch = match x86_reg_bank_for_class(save.vreg.class) {
+            Some(X86RegBank::Gpr) => x86_spill_gpr_scratch_regs(save.vreg.class)[0],
             Some(X86RegBank::Xmm) => x86_spill_xmm_scratch_regs(abi)[0],
             None => continue,
         };
         block.insts.push(X86ISelInst::new(
-            x86_spill_formal_copy_opcode(vreg.class),
-            vec![X86ISelOperand::PReg(scratch), X86ISelOperand::PReg(*src)],
+            x86_spill_formal_copy_opcode(save.vreg.class),
+            vec![
+                X86ISelOperand::PReg(scratch),
+                X86ISelOperand::PReg(save.src),
+            ],
         ));
         block.insts.push(X86ISelInst::new(
-            x86_spill_store_opcode(vreg.class),
-            vec![x86_spill_stack_mem(*slot), X86ISelOperand::PReg(scratch)],
+            x86_spill_store_opcode(save.vreg.class),
+            vec![
+                x86_spill_stack_mem(save.slot),
+                X86ISelOperand::PReg(scratch),
+            ],
         ));
     }
 }
@@ -6343,17 +9969,13 @@ fn compute_x86_stack_frame_layout(
     func: &X86ISelFunction,
     num_callee_saved: usize,
     num_callee_saved_xmms: usize,
-    num_spills: u32,
 ) -> Result<X86StackFrameLayout, X86PipelineError> {
+    // Register spills are ordinary entries of `func.stack_slots`
+    // (`install_x86_spill_slots`), laid out below with every other slot.
     let callee_saved_bytes = (num_callee_saved as u32)
         .checked_mul(8)
         .ok_or_else(|| X86PipelineError::FrameLowering("x86-64 frame size overflow".to_string()))?;
-    let spill_bytes = num_spills
-        .checked_mul(8)
-        .ok_or_else(|| X86PipelineError::FrameLowering("x86-64 frame size overflow".to_string()))?;
-    let mut cursor = callee_saved_bytes
-        .checked_add(spill_bytes)
-        .ok_or_else(|| X86PipelineError::FrameLowering("x86-64 frame size overflow".to_string()))?;
+    let mut cursor = callee_saved_bytes;
     let mut xmm_save_offsets = Vec::with_capacity(num_callee_saved_xmms);
     if num_callee_saved_xmms > 0 {
         cursor = align_up(cursor, 16)?;
@@ -6633,29 +10255,49 @@ fn effective_x86_output_format(config: &X86PipelineConfig) -> X86OutputFormat {
     }
 }
 
+/// Which x86 emission lane is about to consume a function's EH sidecar.
+///
+/// The Mach-O and ELF MODULE emitters serialize the whole LSDA / personality /
+/// FDE bundle; the single-function emitters do not, whatever their configured
+/// format, so the two lanes admit different formats and must be named apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X86EhEmissionLane {
+    /// Whole-module object emission (`compile_module` / `emit_assembled_module`).
+    Module,
+    /// Single-function object emission (`compile_function` and its evidence
+    /// siblings), which wraps ONE body with no module symbol table.
+    SingleFunction,
+}
+
 /// Fail closed before lowering an EH function for an output format whose
 /// writer cannot carry the exact LSDA/personality/FDE bundle.
 ///
-/// Mach-O module emission is the sole wired x86 EH path. Raw bytes have no
-/// unwind metadata at all, the ELF writer currently emits only LSDA-less
-/// backtrace FDEs, and the COFF writer has no `.pdata`/`.xdata` EH path.
+/// Mach-O and ELF MODULE emission are the wired x86 EH paths
+/// (`emit_module_macho` / `emit_module_elf`). Raw bytes have no unwind metadata
+/// at all, the COFF writer has no `.pdata`/`.xdata` EH path, and the
+/// single-function ELF emitter has no `.gcc_except_table`, no section anchors
+/// and no `DW.ref` personality slot — only its module sibling does.
 fn reject_unwired_x86_eh_output(
     config: &X86PipelineConfig,
     func: &X86ISelFunction,
+    lane: X86EhEmissionLane,
 ) -> Result<(), X86PipelineError> {
     if func.eh_info.is_empty() {
         return Ok(());
     }
     let format = effective_x86_output_format(config);
-    let reason = match format {
-        X86OutputFormat::MachO => return Ok(()),
-        X86OutputFormat::RawBytes => {
+    let reason = match (format, lane) {
+        (X86OutputFormat::MachO, _) => return Ok(()),
+        (X86OutputFormat::Elf, X86EhEmissionLane::Module) => return Ok(()),
+        (X86OutputFormat::Elf, X86EhEmissionLane::SingleFunction) => {
+            "single-function ELF emission writes no .gcc_except_table, no section \
+             anchors and no DW.ref personality slot; only the ELF MODULE emitter \
+             serializes the LSDA/personality/FDE bundle"
+        }
+        (X86OutputFormat::RawBytes, _) => {
             "raw bytes cannot carry LSDA, personality, or unwind-frame metadata"
         }
-        X86OutputFormat::Elf => {
-            "the ELF writer emits no LSDA/personality-bearing FDEs for language-level EH"
-        }
-        X86OutputFormat::Coff => {
+        (X86OutputFormat::Coff, _) => {
             "the COFF writer emits no .pdata/.xdata language-level EH metadata"
         }
     };
@@ -6716,9 +10358,6 @@ fn windows_coff_unwind_requirement_reason(
     }
     if function_has_x86_calls(func) {
         return Some("direct or indirect call in a non-leaf function".to_string());
-    }
-    if assignment.num_spills > 0 {
-        return Some(format!("{} register spill slot(s)", assignment.num_spills));
     }
     if !assignment.used_callee_saved.is_empty() {
         return Some(format!(
@@ -6850,6 +10489,17 @@ fn estimate_x86_base_disp_mem_reg_size(inst: &X86ISelInst) -> usize {
     };
 
     x86_base_disp_mem_reg_encoded_size(reg, base, disp, w, operand_size_prefix, byte_reg)
+}
+
+/// `[REX] 0F B6/B7 /r` with a `[base + disp]` operand: the two-byte opcode,
+/// a REX only when a register needs one (never forced: the destination is a
+/// 32-bit register), and the base's ModR/M tail. 9 bytes when the operands are
+/// not yet physical (REX + 2 + ModRM + SIB + disp32 is the most it can take).
+fn estimate_x86_movzx_load_size(inst: &X86ISelInst) -> usize {
+    let Some((reg, base, disp)) = x86_simple_mem_reg_operands(inst) else {
+        return 9;
+    };
+    x86_mem_reg_rex_len(reg, base, false, false) + 2 + x86_base_disp_mem_operand_size(base, disp)
 }
 
 fn estimate_x86_base_disp_rm_alu_size(inst: &X86ISelInst, opcode_len: usize) -> usize {
@@ -7051,13 +10701,13 @@ fn x86_64_coff_unwind_info(metadata: &X86FrameMetadata) -> Result<Vec<u8>, X86Pi
         });
     }
     if !metadata.frame_size.is_multiple_of(8) {
-        return Err(X86PipelineError::FrameLowering(format!(
+        return Err(X86PipelineError::Unwind(format!(
             "Windows x64 frame size {} is not 8-byte aligned",
             metadata.frame_size
         )));
     }
     if metadata.callee_saved_xmms.len() != metadata.xmm_save_offsets.len() {
-        return Err(X86PipelineError::FrameLowering(format!(
+        return Err(X86PipelineError::Unwind(format!(
             "Windows x64 XMM save metadata length mismatch: {} register(s), {} offset(s)",
             metadata.callee_saved_xmms.len(),
             metadata.xmm_save_offsets.len()
@@ -7270,13 +10920,13 @@ fn build_x86_64_coff_unwind_sections(
             .text_offset
             .checked_add(record.code_len)
             .ok_or_else(|| {
-                X86PipelineError::FrameLowering("COFF unwind function range overflow".to_string())
+                X86PipelineError::Unwind("COFF unwind function range overflow".to_string())
             })?;
         pdata.extend_from_slice(&end.to_le_bytes());
         pdata.extend_from_slice(&record.unwind_info_offset.to_le_bytes());
 
         if xdata.len() != record.unwind_info_offset as usize {
-            return Err(X86PipelineError::FrameLowering(
+            return Err(X86PipelineError::Unwind(
                 "COFF unwind .xdata offset mismatch".to_string(),
             ));
         }
@@ -7382,7 +11032,9 @@ fn expand_x86_popcnt_inst(
     let copy_opcode = x86_gpr_copy_opcode(class);
     let tmp = x86_fresh_vreg_operand(func, class);
     let mask = x86_fresh_vreg_operand(func, class);
-    let mut replacement = Vec::with_capacity(if class == RegClass::Gpr64 { 31 } else { 27 });
+    // 24 instructions for Gpr32, 27 for Gpr64 (one more fold); pinned by
+    // `popcnt_emitter_denotes_the_certified_model`.
+    let mut replacement = Vec::with_capacity(if class == RegClass::Gpr64 { 27 } else { 24 });
 
     let push_masked_tmp = |shift: i64, mask_value: i64, out: &mut Vec<X86ISelInst>| {
         x86_push_inst(copy_opcode, vec![tmp.clone(), dst.clone()], out);
@@ -8348,15 +12000,72 @@ fn validate_guard_carrier_canary_cached(
 /// default and disabled by setting `TCG_NO_BRANCH_LAYOUT` (forensic
 /// rollback / A-B comparison; mirrors `TCG_NO_PROOF_CERTS`).
 fn x86_branch_layout_enabled() -> bool {
-    std::env::var_os("TCG_NO_BRANCH_LAYOUT").is_none()
+    if let Some(disabled) = BRANCH_LAYOUT_DISABLED.get() {
+        return !*disabled;
+    }
+    // Env fallback with the project's flag policy (`=0` does not disable). The tracked
+    // option is `no-x86-branch-layout`; before 2026-09-30 this env var was the ONLY
+    // channel and `trustc` refuses it, so the pass was unmeasurable through the bridge.
+    !crate::env_lock::var_os("TCG_NO_BRANCH_LAYOUT").is_some_and(|v| v != "0")
 }
 
 /// OPT-11 kill switch: if-conversion (the `X86IfConvert` pass — value-select
 /// diamonds to branchless `CMOVcc`) is ON by default and disabled by setting
 /// `TCG_NO_IFCONVERT` (forensic rollback / A-B comparison; mirrors
 /// `TCG_NO_BRANCH_LAYOUT`).
+static IF_CONVERT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static CMOV_SWAP_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the if-conversion opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-ifconvert`). DEFAULT ON.
+///
+/// ⚑ Until 2026-09-30 the only channel was `TCG_NO_IFCONVERT`, a raw
+/// `std::env::var_os` with no tracked twin — and `trustc` refuses every `TCG_*`
+/// variable before the backend loads. So this DEFAULT-ON pass, which rewrites
+/// hot-loop control flow into `Cmovcc`, had never been A/B'd through the real
+/// driver. That is the same defect this backend has already found fifteen times.
+///
+/// It matters more here than for most levers, because trust-cg's x86 lane has
+/// TWO default-on branch->cmov passes (this and `X86CmovSwap`) and NO
+/// cmov->branch pass, with no profitability term in either. LLVM's design is
+/// deliberately the opposite pairing: a generous converter plus
+/// `X86CmovConversion` to undo it, including an UNCONDITIONAL rule that any
+/// cmov group with a memory operand becomes a branch again
+/// (`ForceMemOperand`, `cl::init(true)`), on the stated ground that "a CMOV will
+/// dramatically amplify any memory latency by blocking speculative execution".
+/// So an unmeasured branch->cmov pass can be a silent loss, not just a missed
+/// win.
+pub fn set_x86_if_convert_disabled(disabled: bool) -> bool {
+    match IF_CONVERT_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => IF_CONVERT_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Install the cmov-swap opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-cmov-swap`). DEFAULT ON. Same reachability
+/// defect as [`set_x86_if_convert_disabled`]: its only channel was
+/// `TCG_NO_X86_CMOV_SWAP`.
+pub fn set_x86_cmov_swap_disabled(disabled: bool) -> bool {
+    match CMOV_SWAP_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => CMOV_SWAP_DISABLED.get() == Some(&requested),
+    }
+}
+
 fn x86_if_convert_enabled() -> bool {
-    std::env::var_os("TCG_NO_IFCONVERT").is_none()
+    if let Some(disabled) = IF_CONVERT_DISABLED.get() {
+        return !*disabled;
+    }
+    // An explicit `0` does not opt out, matching every other tracked Boolean here.
+    !crate::env_lock::var_os("TCG_NO_IFCONVERT").is_some_and(|v| v != "0")
+}
+
+fn x86_cmov_swap_enabled() -> bool {
+    if let Some(disabled) = CMOV_SWAP_DISABLED.get() {
+        return !*disabled;
+    }
+    !crate::env_lock::var_os("TCG_NO_X86_CMOV_SWAP").is_some_and(|v| v != "0")
 }
 
 /// OPT-12 kill switch: the conservative SSE2 integer vectorizer
@@ -8365,19 +12074,45 @@ fn x86_if_convert_enabled() -> bool {
 /// pass only ever rewrites a loop whose legality is provable by construction
 /// (element-wise map over distinct fixed-size local arrays); with the switch
 /// set every candidate loop stays scalar (always correct).
+static VECTORIZE_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the whole-vectorizer opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-vectorize`).
+///
+/// The SSE2 integer vectorizer is the largest single optimization in this
+/// backend, and its only lever was `TCG_NO_VECTORIZE`, which `trustc` refuses
+/// before the backend loads. So its NET effect per program had never been
+/// measured through the real compiler — only inferred from the presence of vector
+/// opcodes.
+pub fn set_vectorize_disabled(disabled: bool) -> bool {
+    match VECTORIZE_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => VECTORIZE_DISABLED.get() == Some(&requested),
+    }
+}
+
 fn x86_vectorize_enabled() -> bool {
-    std::env::var_os("TCG_NO_VECTORIZE").is_none()
+    if let Some(disabled) = VECTORIZE_DISABLED.get() {
+        return !*disabled;
+    }
+    !std::env::var_os("TCG_NO_VECTORIZE").is_some_and(|v| v != "0")
 }
 
 /// Kill switch for dominated-identical-compare bounds-check elimination
-/// (`X86BoundsCheckElimination`). ON by default at O2/O3; set `TCG_NO_X86_BCE`
-/// for forensic rollback / A-B comparison (mirrors `TCG_NO_VECTORIZE`). This
-/// pass is safety-critical and sound by construction: it removes a bounds-check
-/// trap edge only when a dominating IDENTICAL compare proves it dead, and keeps
-/// the check on any doubt. With the switch set every bounds check is kept
-/// (always correct).
+/// (`X86BoundsCheckElimination`). ON by default at O2/O3; disabled by
+/// `-Ztrust-ir-cg-args=no-x86-bce` (or `TCG_NO_X86_BCE` standalone) for forensic
+/// rollback / A-B comparison (mirrors `TCG_NO_VECTORIZE`). This pass is
+/// safety-critical and sound by construction: it removes a bounds-check trap
+/// edge only when a dominating IDENTICAL compare proves it dead, and keeps the
+/// check on any doubt. With the switch set every bounds check is kept (always
+/// correct).
+///
+/// Delegates to the pass's own gate so the tracked option and the environment
+/// fallback have exactly ONE implementation; a second copy here would silently
+/// ignore `-Ztrust-ir-cg-args=no-x86-bce` and make an A/B read as "no
+/// difference" while both arms ran the pass.
 fn x86_bce_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_BCE").is_none()
+    trust_cg_opt::x86_bounds_check_elim::bce_enabled()
 }
 
 /// OPT-3a kill switch: induction-variable strength reduction
@@ -8386,22 +12121,49 @@ fn x86_bce_enabled() -> bool {
 /// (forensic rollback / A-B comparison; mirrors `TCG_NO_VECTORIZE`). With the
 /// switch set every candidate multiply stays a multiply (always correct).
 fn x86_strength_reduce_enabled() -> bool {
-    std::env::var_os("TCG_NO_STRENGTH_REDUCE").is_none()
+    // The gate is the TRACKED `-Ztrust-ir-cg-args=no-x86-strength-reduce`, with the legacy
+    // environment variable kept as a fallback through `tcg_env_flag` (so `=0` means "do
+    // not disable"). Until 2026-09-29 the env var was the ONLY channel, and `trustc`
+    // refuses every `TCG_*` variable before the backend loads — so a pass that is ON by
+    // default and rewrites address arithmetic in hot loops had never been A/B'd through
+    // the bridge, and "it is enabled but the multiply is still there" was not actionable.
+    // `-Ztrust-ir-cg-args=trace-x86-strength-reduce` now names the declining condition.
+    trust_cg_opt::x86_strength_reduce::strength_reduce_enabled_default()
 }
 
-/// X9 slice 1: full unrolling of small constant-trip loops
-/// (`X86LoopUnroll`) at O2/O3. DEFAULT-ON since 2026-07-20: the recognizer
-/// is fail-closed on every dialect deviation, and the exact default
-/// configuration (unroll + the slice-2/3 cleanup passes) carries the
-/// pre-flip record — 500-seed 15-family soak + 600+ array-kernel
-/// differential seeds CLEAN at TCG_OPT_LEVEL 0/2/3, 18/18 bench checksums,
-/// proofs-ON discharge, b05 exit-80 differential at every stage.
-/// `TCG_NO_X86_UNROLL` is the forensic opt-out (the legacy `TCG_X86_UNROLL`
-/// opt-in name remains accepted and redundant). See
-/// `trust_cg_opt::x86_loop_unroll` (module docs) for the recognizer's
-/// fail-closed conditions and the soundness argument.
-fn x86_unroll_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_UNROLL").is_none()
+/// Disable ONLY the per-branch JCC NOP padding, keeping the per-function 32-byte padding
+/// and the `__text` section alignment that [`x86_jcc_align_enabled`] also controls.
+///
+/// WHY THIS EXISTS. `no-x86-jcc-align` toggles THREE coupled mechanisms at once — this
+/// pass's per-branch NOPs, the per-function padding in `combined_code`, and
+/// [`x86_text_align_log2`] — and its own doc says an A/B of it "measures the combined
+/// alignment regime, not the cost of each padding byte alone". Measured, that combined
+/// regime costs `p2_collatz` 1.8% and BUYS `b1_mispredict` 1.1%: a trade with no way to
+/// say which mechanism does which, because nothing separated them. This is that lever. It
+/// removes the in-loop NOP bytes and leaves every alignment guarantee in place.
+///
+/// The coupling argument in [`x86_jcc_align_enabled`] is about the MITIGATION being
+/// EFFECTIVE — it needs absolute 32-byte addresses, hence all three together. It is not an
+/// argument that the three must move together to be CORRECT: padding is semantically
+/// neutral either way (multi-byte NOPs), so dropping only the per-branch NOPs merely
+/// forgoes the erratum mitigation, which on an AMD host does not apply at all.
+fn x86_jcc_branch_pad_disabled() -> bool {
+    if let Some(v) = JCC_BRANCH_PAD_DISABLED.get() {
+        return *v;
+    }
+    // Environment fallback with the project's flag policy: present and not literally `0`.
+    crate::env_lock::var_os("TCG_NO_X86_JCC_BRANCH_PAD").is_some_and(|v| v != "0")
+}
+
+static JCC_BRANCH_PAD_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the per-branch-padding opt-out from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=no-x86-jcc-branch-pad`).
+pub fn set_x86_jcc_branch_pad_disabled(disabled: bool) -> bool {
+    match JCC_BRANCH_PAD_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => JCC_BRANCH_PAD_DISABLED.get() == Some(&requested),
+    }
 }
 
 /// Kill switch for the LICM invariant stack-slot load tier (O2/O3 only; O1
@@ -8409,20 +12171,32 @@ fn x86_unroll_enabled() -> bool {
 /// for forensic rollback / A-B comparison (mirrors `TCG_NO_VECTORIZE`). With
 /// the switch set every loop load stays in the loop (always correct).
 fn x86_licm_load_hoisting_enabled() -> bool {
-    std::env::var_os("TCG_NO_LICM_LOADS").is_none()
+    !LICM_LOADS_DISABLED.get().copied().unwrap_or(false)
+        && std::env::var_os("TCG_NO_LICM_LOADS").is_none()
 }
 
-/// Kill switch for the LICM invariant flag-writing-arithmetic tier (Lever B;
-/// O2/O3 only). Hoists a provably loop-invariant, non-trapping `imul` (the inner
-/// loop's `i*n` index product) whose written RFLAGS is proven dead at both its
-/// original site and the preheader insertion point. ON by default; set
-/// `TCG_NO_LICM_FLAG_ARITH` for forensic rollback / A-B comparison (mirrors
-/// `TCG_NO_LICM_LOADS`). With the switch set every invariant multiply stays in
-/// the loop (always correct). Sound by construction: only relocates a flag
-/// write whose flags no reader can observe — see `trust_cg_opt::x86_licm`
-/// (module docs, "Lever-B" section).
-fn x86_licm_flag_arith_enabled() -> bool {
-    std::env::var_os("TCG_NO_LICM_FLAG_ARITH").is_none()
+static LICM_LOADS_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SROA_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the LICM load tier's opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-licm-loads`). DEFAULT ON. With it set LICM runs
+/// its pure-only tier, as at O1. `TCG_NO_LICM_LOADS` remains the in-process
+/// channel for tests; `trustc` refuses it.
+pub fn set_x86_licm_loads_disabled(disabled: bool) -> bool {
+    match LICM_LOADS_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LICM_LOADS_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Install the x86 SROA opt-out from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-sroa`). DEFAULT ON. `TCG_NO_X86_SROA` remains
+/// the in-process channel for tests; `trustc` refuses it.
+pub fn set_x86_sroa_disabled(disabled: bool) -> bool {
+    match SROA_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => SROA_DISABLED.get() == Some(&requested),
+    }
 }
 
 /// Kill switch for x86 Scalar Replacement of Aggregates (O2/O3 only). Promotes
@@ -8435,7 +12209,7 @@ fn x86_licm_flag_arith_enabled() -> bool {
 /// address provably never escapes (strict `trace_addr_uses` allowlist) — see
 /// `trust_cg_opt::x86_sroa` (module docs, "Soundness / correctness").
 fn x86_sroa_enabled() -> bool {
-    std::env::var_os("TCG_NO_X86_SROA").is_none()
+    !SROA_DISABLED.get().copied().unwrap_or(false) && std::env::var_os("TCG_NO_X86_SROA").is_none()
 }
 
 /// Whether the stats-only register-allocator spill probes are enabled (cached).
@@ -8487,19 +12261,159 @@ fn x86_ra_full_pool_enabled() -> bool {
 ///
 /// All switches are read through `crate::env_lock`, so tests configure them
 /// with thread-local override scopes (no process-env mutation).
+static BRANCH_LAYOUT_FALLTHROUGH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the branch-layout FALLTHROUGH rule from a TRACKED compiler option,
+/// once. **DEFAULT ON since 2026-09-30**; the opt-out is
+/// `-Ztrust-ir-cg-args=no-branch-layout-fallthrough`.
+///
+/// The rule inverts `jcc T; jmp F` when `T` is the layout successor, so the trailing
+/// `jmp` targets the layout successor and the encoder elides it to zero bytes.
+///
+/// # Why the default flipped, measured
+///
+/// It was deferred off for two recorded reasons, and BOTH are now refuted on this host.
+/// The doc above asked for exactly this re-measurement ("WHY IT IS WORTH RE-MEASURING
+/// NOW"), because `p6_branch_match`'s dispatch became a jump table and is no longer the
+/// shape that regressed.
+///
+/// 90 interleaved rounds, `taskset -c 2`, minimum statistic, the base arm carried twice as
+/// its own noise floor, versus LLVM -O3:
+///
+/// | program | off (was default) | ON | note |
+/// | --- | ---: | ---: | --- |
+/// | `p6_branch_match` | 0.9795 | 0.9784 | the ORIGINAL reason (+4.3%): REFUTED, noise |
+/// | `p7_sieve` | 0.7354 | 0.7210 | the knob's recorded +23.5%: REFUTED, 1.6% FASTER |
+/// | `b1_mispredict` | 1.1216 | **1.0971** | the suite's WORST program, 2.2% faster |
+/// | `h1_vec_push_sum` | 0.9768 | 1.0009 | the real COST: 2.4% slower, lands at parity |
+/// | `p3_gcd` | 0.9320 | 0.9390 | 0.8% slower, still far below parity |
+/// | `p2_collatz` | 1.0198 | 1.0223 | 0.2% slower |
+/// | suite geomean | 0.8409 | **0.8372** | |
+/// | suite WORST | 1.1216 | **1.0971** | |
+///
+/// The objective this serves is a MAX-GAP one (every program at least matching LLVM), and
+/// the maximum improves by 2.2%. The count of programs above parity is FIVE either way —
+/// the flip swaps `v2_memfill` (1.0014 -> 0.9995) out for `h1_vec_push_sum` (0.9768 ->
+/// 1.0009), both within ~0.1% of parity — so no meaningful new violation appears.
+///
+/// # Why it works here
+///
+/// `b1_mispredict` is where it pays, and b1's gap is dominated by MISPREDICTION rather than
+/// instruction count: rewriting its branches to be predictable (`i & 1` instead of `s & 1`)
+/// shrinks the bridge's gap from 1.1210 to 1.0389, so roughly two thirds of b1's cost is
+/// mispredict recovery. Removing a branch-to-branch (`jae` to a `jmp`) takes one taken jump
+/// out of the mispredicted path, which is why this lever moves b1 when every
+/// instruction-count lever measured zero.
+///
+/// # The known cost
+///
+/// `h1_vec_push_sum` genuinely regresses 2.4% and crosses from 0.9768 to 1.0009. That is
+/// the thing to fix or to revert against; it is recorded here rather than left for someone
+/// to rediscover.
+pub fn set_branch_layout_fallthrough_enabled(enabled: bool) -> bool {
+    match BRANCH_LAYOUT_FALLTHROUGH.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => BRANCH_LAYOUT_FALLTHROUGH.get() == Some(&requested),
+    }
+}
+
+fn x86_branch_layout_fallthrough_enabled() -> bool {
+    if let Some(enabled) = BRANCH_LAYOUT_FALLTHROUGH.get() {
+        return *enabled;
+    }
+    // DEFAULT ON. The legacy `TCG_BRANCH_LAYOUT_FALLTHROUGH` was an opt-IN when the rule
+    // was default-off; with the default flipped the environment fallback is the opt-OUT,
+    // `TCG_NO_BRANCH_LAYOUT_FALLTHROUGH`, so a forensic rollback stays possible without a
+    // tracked option.
+    !crate::env_lock::var_os("TCG_NO_BRANCH_LAYOUT_FALLTHROUGH")
+        .is_some_and(|value| value != std::ffi::OsStr::new("0"))
+}
+
+static BRANCH_LAYOUT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static COLD_TRAP_LAYOUT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static LOOP_EXIT_LAYOUT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static COLD_ARM_SINK_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the OPT-8 branch-layout pass's kill switch from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=no-x86-branch-layout`). DEFAULT ON.
+///
+/// Its only channel was `TCG_NO_BRANCH_LAYOUT`, refused by `trustc`, so the whole pass's
+/// contribution had never been measured through the bridge — and this pass matters: one of
+/// its four rules (`fallthrough`) was worth 2.2% on the suite's worst program once it became
+/// measurable.
+pub fn set_x86_branch_layout_disabled(disabled: bool) -> bool {
+    match BRANCH_LAYOUT_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => BRANCH_LAYOUT_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Install the COLD-TRAP inversion rule's kill switch from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=no-x86-cold-trap-layout`). DEFAULT ON.
+pub fn set_x86_cold_trap_layout_disabled(disabled: bool) -> bool {
+    match COLD_TRAP_LAYOUT_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => COLD_TRAP_LAYOUT_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Install the LOOP-EXIT inversion rule's kill switch from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=no-x86-loop-exit-layout`). DEFAULT ON.
+pub fn set_x86_loop_exit_layout_disabled(disabled: bool) -> bool {
+    match LOOP_EXIT_LAYOUT_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LOOP_EXIT_LAYOUT_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Install the COLD-ARM SINK rule's opt-in from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=x86-cold-arm-sink`). DEFAULT OFF.
+///
+/// The rule's doc says it is "OPT-IN for its soak ... After the paired A/B the intended flip
+/// shape is a `TCG_NO_X86_COLD_ARM_SINK` kill switch with the rule default-ON." That A/B
+/// could not be run: the opt-in's only channel was a `TCG_*` variable `trustc` refuses. This
+/// is the channel the soak needs.
+pub fn set_x86_cold_arm_sink_enabled(enabled: bool) -> bool {
+    match COLD_ARM_SINK_ENABLED.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => COLD_ARM_SINK_ENABLED.get() == Some(&requested),
+    }
+}
+
+fn x86_cold_trap_layout_enabled() -> bool {
+    if let Some(disabled) = COLD_TRAP_LAYOUT_DISABLED.get() {
+        return !*disabled;
+    }
+    !crate::env_lock::var_os("TCG_NO_X86_COLD_TRAP_LAYOUT").is_some_and(|v| v != "0")
+}
+
+fn x86_loop_exit_layout_enabled() -> bool {
+    if let Some(disabled) = LOOP_EXIT_LAYOUT_DISABLED.get() {
+        return !*disabled;
+    }
+    !crate::env_lock::var_os("TCG_NO_X86_LOOP_EXIT_LAYOUT").is_some_and(|v| v != "0")
+}
+
+fn x86_cold_arm_sink_enabled() -> bool {
+    if let Some(enabled) = COLD_ARM_SINK_ENABLED.get() {
+        return *enabled;
+    }
+    crate::env_lock::var_os("TCG_X86_COLD_ARM_SINK").is_some_and(|v| v != "0")
+}
+
 fn x86_branch_layout_config() -> trust_cg_opt::X86BranchLayoutConfig {
     trust_cg_opt::X86BranchLayoutConfig {
         latch_rule: true,
-        fallthrough_rule: crate::env_lock::var_os("TCG_BRANCH_LAYOUT_FALLTHROUGH").is_some(),
+        fallthrough_rule: x86_branch_layout_fallthrough_enabled(),
         // Cold-trap fall-through inversion (bounds/null/abort exits): profile-
         // free-correct, default ON. `TCG_NO_X86_COLD_TRAP_LAYOUT` opts out.
-        cold_trap_rule: crate::env_lock::var_os("TCG_NO_X86_COLD_TRAP_LAYOUT").is_none(),
+        cold_trap_rule: x86_cold_trap_layout_enabled(),
         // Loop-exit fall-through inversion (the p6-safe subset of the
         // deferred fallthrough rule): profile-independent, default ON.
         // `TCG_NO_X86_LOOP_EXIT_LAYOUT` opts out.
-        loop_exit_rule: crate::env_lock::var_os("TCG_NO_X86_LOOP_EXIT_LAYOUT").is_none(),
+        loop_exit_rule: x86_loop_exit_layout_enabled(),
         // Cold-arm sinking: OPT-IN (soak) — see the doc comment above.
-        cold_arm_sink_rule: crate::env_lock::var_os("TCG_X86_COLD_ARM_SINK").is_some(),
+        cold_arm_sink_rule: x86_cold_arm_sink_enabled(),
     }
 }
 
@@ -8639,29 +12553,43 @@ fn admit_x86_strength_reduce_recurrence(width: u32, step: i64, stride: i64) -> b
 
     static ADMITTED: OnceLock<Mutex<HashMap<(u32, i64, i64), bool>>> = OnceLock::new();
     let memo = ADMITTED.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&admitted) = memo
-        .lock()
-        .expect("strength-reduce admission memo")
-        .get(&(width, step, stride))
+    memoized_x86_admission(memo, (width, step, stride), || {
+        let validator =
+            StrengthReduceRecurrenceValidator::new("x86-strength-reduce", width, step, stride);
+        // Preserve the exact structural discharge and fail-closed solver fallback.
+        let entry = match validator.certify_by_ring_axiom("x86-strength-reduce-recurrence", 0) {
+            Some(entry) => Ok(entry),
+            None => validator.certify("x86-strength-reduce-recurrence", 0),
+        };
+        match entry {
+            Ok(entry) => CertifiedPassChain::from_entries(vec![entry]).is_ok(),
+            Err(_) => false,
+        }
+    })
+}
+
+/// Memoize optional peephole admission, with verification outside the lock.
+/// Poison declines the rewrite, including poison observed after verification.
+/// No damaged entry is reused and poison is never cleared. Each production
+/// caller keeps its existing unoptimized instruction sequence on `false`.
+fn memoized_x86_admission<K: Eq + std::hash::Hash>(
+    memo: &std::sync::Mutex<HashMap<K, bool>>,
+    key: K,
+    verify: impl FnOnce() -> bool,
+) -> bool {
     {
-        return admitted;
+        let Ok(state) = memo.lock() else {
+            return false;
+        };
+        if let Some(&admitted) = state.get(&key) {
+            return admitted;
+        }
     }
-    let validator =
-        StrengthReduceRecurrenceValidator::new("x86-strength-reduce", width, step, stride);
-    // Fast path: the obligation is the always-true ring-recurrence identity;
-    // recognize it and discharge by the cited ring axioms (no solve). Falls
-    // through to the solver iff the posed obligation is not that exact shape.
-    let entry = match validator.certify_by_ring_axiom("x86-strength-reduce-recurrence", 0) {
-        Some(entry) => Ok(entry),
-        None => validator.certify("x86-strength-reduce-recurrence", 0),
+    let admitted = verify();
+    let Ok(mut state) = memo.lock() else {
+        return false;
     };
-    let admitted = match entry {
-        Ok(entry) => CertifiedPassChain::from_entries(vec![entry]).is_ok(),
-        Err(_) => false,
-    };
-    memo.lock()
-        .expect("strength-reduce admission memo")
-        .insert((width, step, stride), admitted);
+    state.insert(key, admitted);
     admitted
 }
 
@@ -8670,15 +12598,23 @@ fn admit_x86_strength_reduce_recurrence(width: u32, step: i64, stride: i64) -> b
 /// Stage 2 — `XorMR`/`AddMR`/`XorMRSib`/`AddMRSib`) and the variable-count
 /// rotate collapse (p6 rotate arc Stage 2 — `RolRCl`). Admit CREATING the
 /// opcode ONLY when its representative reconstruction obligations discharge
-/// `Valid` — the SAME `x86_reconstruction_discharges_valid` criterion the
-/// coverage gate credits the opcode with (`coverage_gate.rs::audit_x86`). If
+/// `Valid` — the SAME `x86_reconstruction_discharges_valid` criterion by which
+/// the coverage-gate inventory marks the opcode's row covered
+/// (`coverage_gate.rs::audit_x86`), which since E0.2 is not instruction credit
+/// and is read by nothing that decides promotion. If
 /// the Stage-1 reconstruction arm were ever missing, mis-tabled, or failing
 /// to discharge, this returns `false`, the peephole never rewrites, and the
 /// opcode is never emitted: architecture-enforced fail-closed, not
 /// convention.
 ///
-/// Admission gate, not a rejection gate: `false` leaves the (correct,
-/// itself proof-covered) generic shape — the load/ALU/store triple, the
+/// This is rewrite ADMISSION on representative forms, not proof credit: the
+/// criterion accepts a sampled sweep as `Valid`, and since E0.2 the function
+/// verifier still checks each emitted instruction from its own operands and
+/// reports a sampled discharge as unverified, so an admitted rewrite earns no
+/// promotion by being admitted.
+///
+/// Admission gate, not a rejection gate: `false` leaves the (correct) generic
+/// shape — the load/ALU/store triple, the
 /// shl/shr/or rotate expansion — in place and the compile proceeds
 /// unoptimized; it never fails the compile. Injected into
 /// `X86Peephole::new` because trust-cg-opt must not depend on trust-cg-verify
@@ -8692,29 +12628,77 @@ fn admit_x86_reconstructed_opcode(opcode: trust_cg_ir::X86Opcode) -> bool {
 
     static ADMITTED: OnceLock<Mutex<HashMap<trust_cg_ir::X86Opcode, bool>>> = OnceLock::new();
     let memo = ADMITTED.get_or_init(|| Mutex::new(HashMap::new()));
-    // INVARIANT (panic-audit C): `lock()` fails only if the mutex is POISONED,
-    // i.e. a thread panicked while holding it. Both critical sections below
-    // are a single `HashMap::get` / `HashMap::insert` with a derived-`Hash`
-    // key and a `bool` value — no user code, no closure, nothing that can
-    // unwind — and the verifier call that CAN fail runs between them with the
-    // guard already dropped. So neither `expect` is reachable; they are not
-    // softened into `PoisonError::into_inner` because a poisoned admission
-    // memo is exactly the state a verified backend must never read past.
-    if let Some(&admitted) = memo
-        .lock()
-        .expect("reconstructed-opcode admission memo")
-        .get(&opcode)
-    {
-        return admitted;
-    }
-    let admitted = trust_cg_verify::x86_64_function_verifier::reconstruction_discharges_valid(
-        opcode,
-        &trust_cg_verify::VerificationConfig::default(),
-    );
-    memo.lock()
-        .expect("reconstructed-opcode admission memo")
-        .insert(opcode, admitted);
-    admitted
+    memoized_x86_admission(memo, opcode, || {
+        trust_cg_verify::x86_64_function_verifier::reconstruction_discharges_valid(
+            opcode,
+            &trust_cg_verify::VerificationConfig::default(),
+        )
+    })
+}
+
+/// Fail-closed proof admission for the const-multiply strength reduction in
+/// `x86_peephole`: rewriting `IMUL d, s, (2^a ± 1)` into `SHL d, s, a ;
+/// ADD/SUB d, d, s`.
+///
+/// Unlike [`admit_x86_reconstructed_opcode`] this gate is NOT about opcodes —
+/// `ShlRI`/`AddRR`/`SubRR` are pre-existing emittable surface, each verified
+/// per-instruction by the function verifier from its real opcode + operands.
+/// What it discharges is the one ALGEBRAIC step the rewrite rests on, the ring
+/// identity
+///
+/// ```text
+///   forall x : bv<width> .  x * (2^a ± 1) == (x << a) ± x
+/// ```
+///
+/// stated as a registered obligation whose SOURCE side is a `bvmul` by the
+/// baked constant and whose MACHINE side is a `bvshl` composed with the real
+/// ADD/SUB encoders (`x86_64_lowering_proofs::proof_x86_constmul_shift_add` /
+/// `_sub`). The two sides are structurally distinct, so a wrong shift amount,
+/// a wrong opcode, or a swapped SUB operand order all REFUTE — the family's
+/// negative controls assert exactly that. Degeneracy is re-checked here rather
+/// than assumed: an `X == X` obligation is never admitted, whatever its name.
+///
+/// Shared-local discipline: the pass calls this with the SAME `width`, `a` and
+/// `plus_one` it writes into the emitted `ShlRI` + `AddRR`/`SubRR`, so the
+/// proof and the emitted code cannot drift. ADMISSION gate, not a rejection
+/// gate: `false` leaves the (correct, itself proof-covered) `IMUL` in place and
+/// the compile proceeds unoptimized; it never fails the compile. Memoized per
+/// `(width, a, plus_one)` in-process, and the discharge is additionally
+/// content-keyed by `memoized_verify_by_evaluation`.
+fn admit_x86_constmul_shift(width: u32, a: u32, plus_one: bool) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use trust_cg_verify::x86_64_semantics::X86OperandSize;
+
+    static ADMITTED: OnceLock<Mutex<HashMap<(u32, u32, bool), bool>>> = OnceLock::new();
+    let memo = ADMITTED.get_or_init(|| Mutex::new(HashMap::new()));
+    // Structural range check FIRST: the obligation constructors debug-assert
+    // `1 <= a < width`, so an out-of-range request must be declined here rather
+    // than reach them.
+    let size = match width {
+        32 => X86OperandSize::S32,
+        64 => X86OperandSize::S64,
+        _ => return false,
+    };
+    memoized_x86_admission(memo, (width, a, plus_one), || {
+        if a == 0 || a >= width {
+            false
+        } else {
+            let obligation = if plus_one {
+                trust_cg_verify::x86_64_lowering_proofs::proof_x86_constmul_shift_add(size, a)
+            } else {
+                trust_cg_verify::x86_64_lowering_proofs::proof_x86_constmul_shift_sub(size, a)
+            };
+            !obligation.is_degenerate()
+                && matches!(
+                    trust_cg_verify::lowering_proof::memoized_verify_by_evaluation(
+                        &obligation,
+                        &trust_cg_verify::VerificationConfig::default(),
+                    ),
+                    trust_cg_verify::verify::VerificationResult::Valid
+                )
+        }
+    })
 }
 
 /// Sentinel S5 — expand surviving proof-only bounds-check carriers into real
@@ -9398,7 +13382,7 @@ fn resolve_x86_eh_offsets(
 ) -> Result<ResolvedX86Eh, X86PipelineError> {
     use crate::exception_handling::LandingPadDesc;
 
-    let malformed = |detail: String| X86PipelineError::MalformedFunction {
+    let malformed = |detail: String| X86PipelineError::MalformedEh {
         function: func.name.clone(),
         detail: format!("invalid x86 EH metadata/layout: {detail}"),
     };
@@ -9625,7 +13609,7 @@ fn x86_lsda_for_function(
             .to_string();
     let resolved = resolve_x86_eh_offsets(func, block_offsets, encoded_call_ranges, code_len)?;
     let lsda = generate_x86_lsda(&resolved, &personality).map_err(|error| {
-        X86PipelineError::MalformedFunction {
+        X86PipelineError::MalformedEh {
             function: func.name.clone(),
             detail: format!("invalid resolved exception table: {error}"),
         }
@@ -9953,7 +13937,7 @@ mod x86_eh_lsda_tests {
             0x30,
         )
         .expect_err("block-granular metadata cannot guess which call is protected");
-        assert!(matches!(err, X86PipelineError::MalformedFunction { .. }));
+        assert!(matches!(err, X86PipelineError::MalformedEh { .. }));
         assert!(err.to_string().contains("contains 2 eligible calls"));
     }
 
@@ -10029,8 +14013,13 @@ mod x86_eh_lsda_tests {
     }
 }
 
-fn build_x86_64_eh_frame_cfi(records: &[X86EhFrameRecord]) -> DwarfCfiSection {
-    let mut section = DwarfCfiSection::new_x86_64();
+fn build_x86_64_eh_frame_cfi(
+    records: &[X86EhFrameRecord],
+) -> Result<DwarfCfiSection, X86PipelineError> {
+    // The GNU/Linux zR lane: byte-identical to the Darwin zR CIE, named
+    // separately because its FDE pointers are resolved by `R_X86_64_PC32`
+    // relocations rather than baked self-relative values.
+    let mut section = DwarfCfiSection::new_x86_64_elf();
     for record in records {
         let fde = x86_64_fde_from_prologue(
             &record.callee_saved,
@@ -10038,10 +14027,11 @@ fn build_x86_64_eh_frame_cfi(records: &[X86EhFrameRecord]) -> DwarfCfiSection {
             0,
             record.code_len,
             record.symbol_index,
-        );
+        )
+        .map_err(|error| X86PipelineError::Unwind(error.to_string()))?;
         section.add_fde(fde);
     }
-    section
+    Ok(section)
 }
 
 /// Overwrite the little-endian `i32` at `offset` in the `__eh_frame` bytes.
@@ -10049,10 +14039,10 @@ fn build_x86_64_eh_frame_cfi(records: &[X86EhFrameRecord]) -> DwarfCfiSection {
 fn bake_le_i32(eh_frame: &mut [u8], offset: u32, value: i32) -> Result<(), X86PipelineError> {
     let start = offset as usize;
     let end = start.checked_add(4).ok_or_else(|| {
-        X86PipelineError::FrameLowering("x86-64 eh_frame i32 bake offset overflow".to_string())
+        X86PipelineError::Unwind("x86-64 eh_frame i32 bake offset overflow".to_string())
     })?;
     let slot = eh_frame.get_mut(start..end).ok_or_else(|| {
-        X86PipelineError::FrameLowering("x86-64 eh_frame i32 bake offset out of range".to_string())
+        X86PipelineError::Unwind("x86-64 eh_frame i32 bake offset out of range".to_string())
     })?;
     slot.copy_from_slice(&value.to_le_bytes());
     Ok(())
@@ -10064,10 +14054,10 @@ fn bake_le_i32(eh_frame: &mut [u8], offset: u32, value: i32) -> Result<(), X86Pi
 fn bake_le_i64(eh_frame: &mut [u8], offset: u32, value: i64) -> Result<(), X86PipelineError> {
     let start = offset as usize;
     let end = start.checked_add(8).ok_or_else(|| {
-        X86PipelineError::FrameLowering("x86-64 eh_frame i64 bake offset overflow".to_string())
+        X86PipelineError::Unwind("x86-64 eh_frame i64 bake offset overflow".to_string())
     })?;
     let slot = eh_frame.get_mut(start..end).ok_or_else(|| {
-        X86PipelineError::FrameLowering("x86-64 eh_frame i64 bake offset out of range".to_string())
+        X86PipelineError::Unwind("x86-64 eh_frame i64 bake offset out of range".to_string())
     })?;
     slot.copy_from_slice(&value.to_le_bytes());
     Ok(())
@@ -10091,15 +14081,14 @@ fn patch_x86_64_macho_eh_frame_addends(
         .into_iter()
         .chain(cfi.fde_lsda_relocation_offsets());
     for slot_offset in pcrel_slots {
-        let addend = -i32::try_from(slot_offset).map_err(|_| {
-            X86PipelineError::FrameLowering("x86-64 eh_frame offset overflow".to_string())
-        })?;
+        let addend = -i32::try_from(slot_offset)
+            .map_err(|_| X86PipelineError::Unwind("x86-64 eh_frame offset overflow".to_string()))?;
         let offset = slot_offset as usize;
         let end = offset.checked_add(4).ok_or_else(|| {
-            X86PipelineError::FrameLowering("x86-64 eh_frame offset overflow".to_string())
+            X86PipelineError::Unwind("x86-64 eh_frame offset overflow".to_string())
         })?;
         let Some(slot) = eh_frame.get_mut(offset..end) else {
-            return Err(X86PipelineError::FrameLowering(
+            return Err(X86PipelineError::Unwind(
                 "x86-64 eh_frame relocation offset out of range".to_string(),
             ));
         };
@@ -10121,21 +14110,30 @@ fn x86_64_dynamic_eh_frame_record(
     })
 }
 
-fn add_x86_64_eh_frame_to_elf(writer: &mut ElfWriter, records: &[X86EhFrameRecord]) {
+fn add_x86_64_eh_frame_to_elf(
+    writer: &mut ElfWriter,
+    records: &[X86EhFrameRecord],
+) -> Result<(), X86PipelineError> {
     use crate::elf::constants::{SHF_ALLOC, SHT_PROGBITS};
     use crate::elf::reloc::{Elf64Rela, X86_64RelocType};
 
     if records.is_empty() {
-        return;
+        return Ok(());
     }
 
-    let cfi = build_x86_64_eh_frame_cfi(records);
+    let cfi = build_x86_64_eh_frame_cfi(records)?;
     let eh_frame = cfi.to_bytes();
     if eh_frame.is_empty() {
-        return;
+        return Ok(());
     }
+    // ENC-EHDC, the same fail-closed honesty gate the Mach-O and AArch64 ELF
+    // emitters run: the independent decoder must read these exact bytes back to
+    // the emitter's CIE/FDE intent (PC-begin fields still at their sentinel 0)
+    // before any of them is emitted.
+    crate::dwarf_cfi_decode_check::verify_eh_frame_roundtrip(&cfi, &eh_frame)
+        .map_err(|error| X86PipelineError::Unwind(error.to_string()))?;
 
-    let section = writer.add_section(".eh_frame", &eh_frame, SHT_PROGBITS, SHF_ALLOC, 8);
+    let section = writer.add_section(".eh_frame", &eh_frame, SHT_PROGBITS, SHF_ALLOC, 8)?;
     let section_index = usize::from(section - 1);
     for (offset, record) in cfi
         .fde_pc_begin_relocation_offsets()
@@ -10152,6 +14150,214 @@ fn add_x86_64_eh_frame_to_elf(writer: &mut ElfWriter, records: &[X86EhFrameRecor
             ),
         );
     }
+    Ok(())
+}
+
+/// One function's FDE in the x86-64 ELF EH lane, with the two relocation
+/// addends the emitter needs for it.
+///
+/// Both pointer fields are 4-byte `DW_EH_PE_pcrel|sdata4` slots that stay at
+/// their sentinel 0; `R_X86_64_PC32` against a LOCAL `STT_SECTION` anchor plus
+/// the addend below resolves each one. Naming the section rather than the
+/// function/LSDA symbol is what makes the reference a link-time constant in a
+/// shared object, and it binds the FDE to THIS object's body even if a public
+/// symbol of the same name is interposed.
+#[derive(Debug, Clone)]
+struct X86ElfFdePlan {
+    /// The FDE the emitter serializes (PC-begin / LSDA fields at 0).
+    fde: crate::dwarf_cfi::DwarfFde,
+    /// Addend of the pc-begin relocation against the `.text` anchor: the
+    /// function's byte offset in the combined text section.
+    text_offset: i64,
+    /// Addend of the LSDA relocation against the `.gcc_except_table` anchor:
+    /// this function's entry offset in that section.
+    lsda_offset: i64,
+}
+
+/// The whole x86-64 ELF module unwind surface, planned before any symbol index
+/// is handed out so the emitter can reserve the LOCAL symbols its anchors need.
+#[derive(Debug, Clone)]
+struct X86ElfUnwindPlan {
+    /// The module's single personality routine (one shared zPLR CIE).
+    personality: String,
+    /// `.gcc_except_table` bytes: every function's LSDA, each 4-byte aligned.
+    except_table: Vec<u8>,
+    /// One entry per encoded function, in `encoded` order.
+    fdes: Vec<X86ElfFdePlan>,
+}
+
+/// Plan the x86-64 ELF module's EH unwind surface, or `None` when the module
+/// carries none.
+///
+/// This is the ELF analogue of `emit_module_macho`'s EH Lane 5 filler pass plus
+/// its `add_x86_64_eh_frame_to_macho` inputs, and the ELF analogue of
+/// `pipeline::emit_aarch64_elf_module_with_unwind`'s planning half. ELF has no
+/// compact-unwind section, so when the module carries EH at all, EVERY function
+/// gets an FDE under the ONE shared zPLR CIE, and every FDE therefore carries an
+/// LSDA field (libunwind reads it whenever the CIE declares "L", so an
+/// LSDA-less FDE under a zPLR CIE is malformed):
+///
+/// * an EH function contributes its REAL LSDA;
+/// * every other function contributes a synthetic ALL-FILLER LSDA (one
+///   `landing_pad == 0` region covering `[0, code_len)`), the personality's
+///   "no handler here, keep unwinding" answer. It can only tell the unwinder to
+///   KEEP WALKING; it can never dispatch to a wrong pad.
+///
+/// A frame with no FDE stops phase-1 unwinding dead (`_URC_END_OF_STACK` —
+/// libstd aborts with "failed to initiate panic, error 5"), skipping every
+/// cleanup Drop, so a function this lane cannot describe is REFUSED rather than
+/// emitted without one:
+///
+/// * no frame metadata (`emit_frame: false`): the FDE generator describes a
+///   `PUSH RBP` / `MOV RBP, RSP` prologue that such a function does not have;
+/// * an empty body: a zero-length FDE covers no PC at all;
+/// * two distinct personalities in one module: one shared CIE holds one.
+///
+/// [`X86Pipeline::x86_object_relocation_inventory_rows_into`] predicts the ELF EH
+/// relocation surface by CALLING this function, not by mirroring its predicate,
+/// so predicted == emitted by construction. The trigger covers the cross-object
+/// `panic=unwind` case where a frame-covered object with NO local EH function
+/// still needs full walkable FDE coverage (the bridge emits one object per mono
+/// item, so a pass-through frame on the panic path has no local EH function of
+/// its own).
+fn plan_x86_64_elf_module_unwind(
+    config: &X86PipelineConfig,
+    encoded: &[X86EncodedFunc],
+) -> Result<Option<X86ElfUnwindPlan>, X86PipelineError> {
+    if !x86_module_emits_eh_frame(config.panic_unwind, encoded) {
+        return Ok(None);
+    }
+
+    // One personality per module (one shared CIE). A pass-through-only object
+    // has no local EH function and therefore no local personality; its filler
+    // LSDAs name libstd's extern `rust_eh_personality`, the same routine a real
+    // Rust EH function would name. A "keep walking, never dispatch" table is
+    // sound under any Rust personality.
+    let personality = encoded
+        .iter()
+        .find_map(|ef| ef.eh.as_ref().map(|eh| eh.personality.clone()))
+        .unwrap_or_else(|| crate::exception_handling::RUST_EH_PERSONALITY_SYMBOL.to_string());
+    if let Some(ef) = encoded.iter().find(|ef| {
+        ef.eh
+            .as_ref()
+            .is_some_and(|eh| eh.personality != personality)
+    }) {
+        let other = ef
+            .eh
+            .as_ref()
+            .map(|eh| eh.personality.clone())
+            .unwrap_or_default();
+        return Err(X86PipelineError::Unwind(format!(
+            "x86-64 ELF .eh_frame: distinct personalities in one object \
+             ({personality} vs {other}, at `{}`) require multiple CIEs (fail-closed)",
+            ef.name
+        )));
+    }
+
+    let mut except_table: Vec<u8> = Vec::new();
+    let mut fdes: Vec<X86ElfFdePlan> = Vec::with_capacity(encoded.len());
+    for ef in encoded {
+        let Some(metadata) = ef.frame_metadata.as_ref() else {
+            return Err(X86PipelineError::Unwind(format!(
+                "x86-64 ELF module carries exception-handling structure, so EVERY \
+                 function needs an .eh_frame FDE (a frame without one stops \
+                 unwinding at phase 1 — skipped cleanup Drops at run time), but \
+                 `{}` was compiled without frame lowering (emit_frame=false), so \
+                 no prologue-describing FDE exists for it (fail-closed)",
+                ef.name
+            )));
+        };
+        // Defence in depth: `compile_module` cannot reach this today, because the
+        // machine-function layout validation refuses a blockless function first
+        // (pinned by `x86_64_elf_eh_blockless_function_is_refused_before_unwind_planning`).
+        if ef.code_len == 0 {
+            return Err(X86PipelineError::Unwind(format!(
+                "x86-64 ELF module carries exception-handling structure, but `{}` \
+                 encoded to zero bytes; a zero-length FDE covers no PC and would \
+                 leave its frame unwalkable (fail-closed)",
+                ef.name
+            )));
+        }
+        let lsda_bytes = match ef.eh.as_ref() {
+            Some(eh) => eh.lsda_bytes.clone(),
+            None => {
+                let resolved = ResolvedX86Eh {
+                    landing_pads: Vec::new(),
+                    call_site_ranges: vec![(0, ef.code_len, 0)],
+                };
+                // An exception-table refusal, like the Mach-O filler pass's
+                // twin in `emit_module_macho`: `MalformedEh` (TCG-EH-UNWIND),
+                // not `MalformedFunction` (a machine-function layout refusal).
+                generate_x86_lsda(&resolved, &personality).map_err(|error| {
+                    X86PipelineError::MalformedEh {
+                        function: ef.name.clone(),
+                        detail: format!("invalid synthetic filler exception table: {error}"),
+                    }
+                })?
+            }
+        };
+        align_vec_to(&mut except_table, 4);
+        // An R_X86_64_PC32 addend is written into a 32-bit field, so the bound is
+        // i32, not i64: a `.gcc_except_table` past 2 GiB would otherwise truncate
+        // silently and point the LSDA at the wrong table.
+        let lsda_offset = i64::from(i32::try_from(except_table.len()).map_err(|_| {
+            X86PipelineError::ObjectFieldTooLarge {
+                function: ef.name.clone(),
+                field: "ELF .gcc_except_table offset (R_X86_64_PC32 addend)",
+                value: except_table.len() as u128,
+                max: u128::try_from(i32::MAX).expect("i32::MAX fits u128"),
+            }
+        })?);
+        except_table.extend_from_slice(&lsda_bytes);
+
+        // Same 32-bit field, same reason: bound the pc-begin addend by i32.
+        let text_offset = i64::from(i32::try_from(ef.text_offset).map_err(|_| {
+            X86PipelineError::ObjectFieldTooLarge {
+                function: ef.name.clone(),
+                field: "ELF .eh_frame pc-begin text offset (R_X86_64_PC32 addend)",
+                value: u128::from(ef.text_offset),
+                max: u128::try_from(i32::MAX).expect("i32::MAX fits u128"),
+            }
+        })?);
+        // symbol_index is unused on this lane (every relocation is emitted
+        // explicitly below against a section anchor); pass 0. function_offset
+        // stays 0: the pc-begin field is the relocated sentinel.
+        let fde = x86_64_fde_from_prologue(
+            &metadata.callee_saved,
+            metadata.frame_size,
+            0,
+            ef.code_len,
+            0,
+        )
+        .map_err(|error| X86PipelineError::Unwind(error.to_string()))?
+        .with_lsda();
+        fdes.push(X86ElfFdePlan {
+            fde,
+            text_offset,
+            lsda_offset,
+        });
+    }
+
+    Ok(Some(X86ElfUnwindPlan {
+        personality,
+        except_table,
+        fdes,
+    }))
+}
+
+/// The LOCAL `.symtab` symbols the x86-64 ELF EH lane adds, in the order it
+/// adds them. The module emitter hands out final symbol indices by counting
+/// locals up front (it never calls `ElfWriter::final_symbol_index`, which would
+/// freeze the table mid-emission), so this count has to be known before the
+/// first symbol is registered.
+///
+/// * the `.text` `STT_SECTION` anchor (FDE pc-begin base),
+/// * the `.gcc_except_table` `STT_SECTION` anchor (FDE LSDA base),
+/// * and, only for a personality this object defines `STB_LOCAL`, its
+///   object-local `DW.ref.<personality>` slot symbol. An external personality's
+///   slot is WEAK, so it lands in the GLOBAL partition instead.
+fn x86_64_elf_eh_local_symbol_count(personality_binds_locally: bool) -> usize {
+    2 + usize::from(personality_binds_locally)
 }
 
 /// Per-function unwind input for the x86-64 Mach-O `__eh_frame` emitter.
@@ -10209,7 +14415,7 @@ fn add_x86_64_eh_frame_to_macho(
                 personality_symbol = Some(eh.personality_symbol_id);
             }
             Some(existing) if existing != eh.personality.as_str() => {
-                return Err(X86PipelineError::FrameLowering(format!(
+                return Err(X86PipelineError::Unwind(format!(
                     "x86-64 Mach-O eh_frame: distinct personalities in one object \
                      ({existing} vs {}) require multiple CIEs (unsupported)",
                     eh.personality
@@ -10229,7 +14435,8 @@ fn add_x86_64_eh_frame_to_macho(
         // symbol_index is unused for Mach-O (relocations are emitted below via
         // the writer's final symbol indices); pass 0.
         let mut fde =
-            x86_64_fde_from_prologue(&input.callee_saved, input.frame_size, 0, input.code_len, 0);
+            x86_64_fde_from_prologue(&input.callee_saved, input.frame_size, 0, input.code_len, 0)
+                .map_err(|error| X86PipelineError::Unwind(error.to_string()))?;
         if input.eh.is_some() {
             fde = fde.with_lsda();
         }
@@ -10246,7 +14453,7 @@ fn add_x86_64_eh_frame_to_macho(
     // pre-patch sentinel 0 for PC-begin / LSDA / personality). trust-cg refuses
     // to emit an unwind table it cannot round-trip back to its own intent.
     crate::dwarf_cfi_decode_check::verify_eh_frame_roundtrip(&cfi, &eh_frame)
-        .map_err(|e| X86PipelineError::FrameLowering(e.to_string()))?;
+        .map_err(|e| X86PipelineError::Unwind(e.to_string()))?;
 
     // LD-PRIME COMPAT (x86 EH executed lane): the modern Mach-O linker
     // (ld-prime, default since Xcode 15) PARSES a relocatable object's
@@ -10326,7 +14533,7 @@ fn add_x86_64_eh_frame_to_macho(
             let personality_index = writer
                 .final_symbol_index(personality_symbol_id)?
                 .ok_or_else(|| {
-                    X86PipelineError::FrameLowering(
+                    X86PipelineError::Unwind(
                         "x86-64 Mach-O personality symbol missing before relocation emission"
                             .to_string(),
                     )
@@ -10358,7 +14565,7 @@ fn add_x86_64_eh_frame_to_macho(
         writer
             .final_symbol_index(eh_frame_symbol_id)?
             .ok_or_else(|| {
-                X86PipelineError::FrameLowering(
+                X86PipelineError::Unwind(
                     "x86-64 Mach-O EH frame section symbol missing before relocation emission"
                         .to_string(),
                 )
@@ -10374,7 +14581,7 @@ fn add_x86_64_eh_frame_to_macho(
         let function_symbol_index = writer
             .final_symbol_index(input.function_symbol_id)?
             .ok_or_else(|| {
-                X86PipelineError::FrameLowering(
+                X86PipelineError::Unwind(
                     "x86-64 Mach-O function symbol missing before unwind relocation emission"
                         .to_string(),
                 )
@@ -10408,7 +14615,7 @@ fn add_x86_64_eh_frame_to_macho(
         .zip(eh_lsda_symbols)
     {
         let lsda_symbol_index = writer.final_symbol_index(lsda_symbol_id)?.ok_or_else(|| {
-            X86PipelineError::FrameLowering(
+            X86PipelineError::Unwind(
                 "x86-64 Mach-O LSDA symbol missing before unwind relocation emission".to_string(),
             )
         })?;
@@ -10440,6 +14647,108 @@ fn add_x86_64_eh_frame_to_macho(
 /// like `__udivti3` resolve against the `___udivti3` the linker provides.
 fn macho_x86_64_symbol_name(name: &str) -> String {
     format!("_{name}")
+}
+
+/// The x86-64 Mach-O module emitter's symbols, keyed by nlist name only.
+///
+/// Every lookup of a trust-ir name `x` goes through its nlist name `_x`
+/// ([`macho_x86_64_symbol_name`]), and nothing is keyed by the bare trust-ir
+/// name. A map keyed by both spellings would let a reference spelled `_x`,
+/// whose nlist name is `__x`, find the definition of `x` under its nlist key
+/// `_x`: a declared external `@_mc_local` would call the module-local
+/// `mc_local`, a `symaddr<_cb_local>` would address the module-local
+/// `cb_local`, a call to the external definition `_md_g` would reach the
+/// internal `md_g`, and an internal `___udivti3` would capture the backend's
+/// own `__udivti3` call (the L02-P1 round-2 reproducers, 2026-10-24).
+/// The mangling is injective, so distinct trust-ir names keep distinct keys.
+/// The emitter's own LSDA labels (`_GCC_except_table_<fn>`) share the
+/// namespace: a definition whose nlist name another definition or label
+/// already holds, and a reference (a call, an address, a data import, the EH
+/// personality) whose nlist name is an LSDA label, are refused by name
+/// ([`X86PipelineError::MachOSymbolNameCollision`]).
+#[derive(Debug, Default, Clone)]
+struct MachOX86SymbolMap {
+    /// nlist name -> writer symbol id, with what kind of symbol holds it.
+    by_nlist: std::collections::HashMap<String, (crate::macho::writer::SymbolId, &'static str)>,
+}
+
+/// The kind [`MachOX86SymbolMap`] records for the emitter's own LSDA labels
+/// (`_GCC_except_table_<fn>`), which no trust-ir reference names.
+const MACHO_X86_LSDA_LABEL: &str = "LSDA label";
+
+impl MachOX86SymbolMap {
+    /// The symbol a reference to the trust-ir name `name` binds to: the
+    /// symbol named `_<name>`, never one of the emitter's LSDA labels.
+    fn get(&self, name: &str) -> Option<crate::macho::writer::SymbolId> {
+        self.by_nlist
+            .get(&macho_x86_64_symbol_name(name))
+            .filter(|(_, kind)| *kind != MACHO_X86_LSDA_LABEL)
+            .map(|(id, _)| *id)
+    }
+
+    /// The symbol whose nlist name is `nlist`.
+    fn get_nlist(&self, nlist: &str) -> Option<crate::macho::writer::SymbolId> {
+        self.by_nlist.get(nlist).map(|(id, _)| *id)
+    }
+
+    /// Record the definition `id` (a `kind`, trust-ir or label name
+    /// `symbol`) under `nlist`, refusing a second symbol of that name.
+    fn define(
+        &mut self,
+        nlist: String,
+        id: crate::macho::writer::SymbolId,
+        symbol: &str,
+        kind: &'static str,
+    ) -> Result<(), X86PipelineError> {
+        match self.by_nlist.entry(nlist) {
+            std::collections::hash_map::Entry::Occupied(entry) => Err(macho_x86_symbol_collision(
+                symbol,
+                entry.key(),
+                kind,
+                entry.get().1,
+            )),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((id, kind));
+                Ok(())
+            }
+        }
+    }
+
+    /// The symbol a reference to the trust-ir name `name` binds to: the
+    /// symbol already named `_<name>`, or a new undefined external of that
+    /// name.
+    fn get_or_add_undefined(
+        &mut self,
+        writer: &mut crate::macho::MachOWriter,
+        name: &str,
+    ) -> Result<crate::macho::writer::SymbolId, X86PipelineError> {
+        let nlist = macho_x86_64_symbol_name(name);
+        if let Some((id, kind)) = self.by_nlist.get(&nlist) {
+            if *kind == MACHO_X86_LSDA_LABEL {
+                return Err(macho_x86_symbol_collision(name, &nlist, "reference", kind));
+            }
+            return Ok(*id);
+        }
+        let id = writer.add_symbol(&nlist, 0, 0, true)?;
+        self.by_nlist.insert(nlist, (id, "undefined external"));
+        Ok(id)
+    }
+}
+
+/// The [`X86PipelineError::MachOSymbolNameCollision`] refusal of naming the
+/// `kind` `symbol` `nlist`, which already names an `existing`.
+fn macho_x86_symbol_collision(
+    symbol: &str,
+    nlist: &str,
+    kind: &'static str,
+    existing: &'static str,
+) -> X86PipelineError {
+    X86PipelineError::MachOSymbolNameCollision {
+        symbol: symbol.to_string(),
+        nlist: nlist.to_string(),
+        kind,
+        existing,
+    }
 }
 
 fn coff_x86_64_import_symbol_name(name: &str) -> String {
@@ -10675,6 +14984,14 @@ fn estimate_inst_size(inst: &X86ISelInst) -> usize {
         | X86Opcode::MovMR32
         | X86Opcode::MovMR
         | X86Opcode::Lea => estimate_x86_base_disp_mem_reg_size(inst),
+        // MOVZX r32, m8/m16: optional REX + 0F B6/B7 + ModRM [+ SIB] [+ disp].
+        // Exact for physical registers; never under-reported otherwise.
+        X86Opcode::MovzxRM8
+        | X86Opcode::MovzxRM16
+        | X86Opcode::VolatileMovzxRM8
+        | X86Opcode::VolatileMovzxRM16 => estimate_x86_movzx_load_size(inst),
+        // MOVZX r32, m8 + SIB: optional REX + 0F B6 + ModRM + SIB + disp32 = 9.
+        X86Opcode::MovzxRM8Sib => 9,
 
         // GPR base+disp reg-memory operations: exact for physical regs, conservative otherwise.
         X86Opcode::AddRM | X86Opcode::SubRM | X86Opcode::CmpRM | X86Opcode::TestRM => {
@@ -10704,10 +15021,20 @@ fn estimate_inst_size(inst: &X86ISelInst) -> usize {
         // 0F escape + opcode + ModRM + SIB + disp32 = 10 bytes max. This MUST
         // NOT be under-estimated: branch displacements are laid out against it.
         X86Opcode::MovsdRMSib | X86Opcode::MovssRMSib => 10,
+        // Packed 128-bit SIB MOVDQU load/store: identical byte budget to the
+        // scalar-FP SIB loads — mandatory F3 prefix + optional REX + 0F escape +
+        // opcode + ModRM + SIB + disp32 = 10 bytes max. Same "must not
+        // under-report" rule: branch displacements are laid out against it.
+        X86Opcode::MovdquRMSib | X86Opcode::MovdquMRSib => 10,
         // SIB memory with a two-byte opcode: REX.W + 0F AF + ModRM + SIB +
         // disp32 = 9 bytes max (the 0F escape replaces the single-byte MOV
         // opcode, net identical to the row above).
         X86Opcode::ImulRMSib => 9,
+        // The 128-bit atomic-load pseudo: four 2-byte `XOR r32,r32` zeroings
+        // (8 bytes) + LOCK CMPXCHG16B [base+disp] (F0 + REX.W + 0F C7 + ModRM +
+        // SIB for an RSP/R12 base + disp32 = 10 bytes max) = 18 bytes max. Must
+        // not under-report: branch displacements are laid out against it.
+        X86Opcode::AtomicLoadCmpxchg16b => 18,
 
         // SSE: 4-5 bytes.
         X86Opcode::Addsd
@@ -11201,7 +15528,7 @@ fn x86_block_offset(
     purpose: &str,
 ) -> Result<usize, X86PipelineError> {
     block_offsets.get(&block).copied().ok_or_else(|| {
-        X86PipelineError::ConstantPool(format!(
+        X86PipelineError::BlockProfiling(format!(
             "x86 block profiling: block {:?} missing byte offset while {}",
             block, purpose
         ))
@@ -11225,31 +15552,78 @@ fn x86_block_shift_for_offset(
             return Ok((idx + 1) * X86_64_JIT_PROFILE_COUNTER_TRAMPOLINE_BYTES);
         }
     }
-    Err(X86PipelineError::ConstantPool(format!(
+    Err(X86PipelineError::BlockProfiling(format!(
         "x86 block profiling: byte offset {} is outside function body length {}",
         offset, code_len
     )))
+}
+
+/// Why [`patch_x86_rel32`] could not write a rel32 displacement.
+///
+/// Deliberately carries no layer and no caller context: the helper is shared by
+/// generic branch resolution ([`patch_x86_branch_fixups_to_block_offsets`], an
+/// encoding step) and by JIT block profiling
+/// ([`retarget_x86_block_profiling_branches`]), so its text describes only the
+/// rel32 patch itself and each caller files the refusal under the variant of
+/// its own layer (trust-core architecture AD-8), prefixed with its own context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum X86Rel32PatchError {
+    /// The 4-byte displacement field does not lie inside the code buffer.
+    SiteOutsideCode {
+        disp32_offset: usize,
+        code_len: usize,
+    },
+    /// The target is not reachable with a signed 32-bit displacement.
+    TargetOutOfRange {
+        target: usize,
+        disp32_offset: usize,
+        distance: i64,
+    },
+}
+
+impl core::fmt::Display for X86Rel32PatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SiteOutsideCode {
+                disp32_offset,
+                code_len,
+            } => write!(
+                f,
+                "rel32 patch site {} outside code length {}",
+                disp32_offset, code_len
+            ),
+            Self::TargetOutOfRange {
+                target,
+                disp32_offset,
+                distance,
+            } => write!(
+                f,
+                "rel32 target {} from patch site {} is out of range ({})",
+                target, disp32_offset, distance
+            ),
+        }
+    }
 }
 
 fn patch_x86_rel32(
     code: &mut [u8],
     disp32_offset: usize,
     target: usize,
-) -> Result<(), X86PipelineError> {
+) -> Result<(), X86Rel32PatchError> {
     if disp32_offset + 4 > code.len() {
-        return Err(X86PipelineError::ConstantPool(format!(
-            "x86 block profiling: rel32 patch site {} outside code length {}",
+        return Err(X86Rel32PatchError::SiteOutsideCode {
             disp32_offset,
-            code.len()
-        )));
+            code_len: code.len(),
+        });
     }
     let inst_end = disp32_offset + 4;
     let distance = target as i64 - inst_end as i64;
     if distance < i32::MIN as i64 || distance > i32::MAX as i64 {
-        return Err(X86PipelineError::ConstantPool(format!(
-            "x86 block profiling: rel32 target {} from patch site {} is out of range ({})",
-            target, disp32_offset, distance
-        )));
+        return Err(X86Rel32PatchError::TargetOutOfRange {
+            target,
+            disp32_offset,
+            distance,
+        });
     }
     code[disp32_offset..disp32_offset + 4].copy_from_slice(&(distance as i32).to_le_bytes());
     Ok(())
@@ -11267,7 +15641,74 @@ fn patch_x86_branch_fixups_to_block_offsets(
                 branch.target
             ))
         })?;
-        patch_x86_rel32(code, branch.disp32_offset, target)?;
+        // Generic branch resolution is an encoding step: its rel32 refusals
+        // keep the machine-code variant they always had, under this step's own
+        // context (they are not block profiling).
+        patch_x86_rel32(code, branch.disp32_offset, target).map_err(|error| {
+            X86PipelineError::ConstantPool(format!("x86 branch resolution: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+/// Retarget every branch of a JIT block-counter body at the trampoline that
+/// now precedes its target block, after [`splice_x86_block_counter_trampolines`]
+/// shifted the body.
+///
+/// Both arms of [`X86Pipeline::compile_function_with_jit_block_counters_after_x86_passes`]
+/// (with and without a constant pool) run this one loop, so every refusal here
+/// is a JIT block-profiling refusal and carries
+/// [`X86PipelineError::BlockProfiling`] — including the rel32 patch refusals of
+/// the helper it shares with generic branch resolution.
+fn retarget_x86_block_profiling_branches(
+    spliced: &mut [u8],
+    block_order: &[LirBlock],
+    block_offsets: &HashMap<LirBlock, usize>,
+    code_len: usize,
+    block_trampoline_starts: &HashMap<LirBlock, usize>,
+    branch_fixups: Vec<X86BranchFixup>,
+) -> Result<(), X86PipelineError> {
+    for branch in branch_fixups {
+        let shift =
+            x86_block_shift_for_offset(block_order, block_offsets, code_len, branch.disp32_offset)?;
+        let disp32_offset = branch.disp32_offset + shift;
+        let target = block_trampoline_starts
+            .get(&branch.target)
+            .copied()
+            .ok_or_else(|| {
+                X86PipelineError::BlockProfiling(format!(
+                    "x86 block profiling: branch target {:?} missing trampoline start",
+                    branch.target
+                ))
+            })?;
+        patch_x86_rel32(spliced, disp32_offset, target).map_err(|error| {
+            X86PipelineError::BlockProfiling(format!("x86 block profiling: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+/// Refuse JIT block counters on a Windows x64 host under simplified register
+/// allocation.
+///
+/// The counter trampoline this instrumentation splices in is stack-neutral
+/// because it clobbers R10, and simplified allocation may hand R10 to the
+/// function body. The refusal belongs to the block-profiling instrumentation
+/// (it is that layer's trampoline that cannot coexist with the allocation
+/// mode), so it carries [`X86PipelineError::BlockProfiling`], not `RegAlloc`:
+/// no register allocator ran or failed. `host_is_windows_x64` is a parameter
+/// (the caller passes the `cfg!` host test) so the refusal is testable on
+/// every host.
+fn reject_x86_jit_block_counter_regalloc_mode(
+    host_is_windows_x64: bool,
+    regalloc_mode: X86RegAllocMode,
+) -> Result<(), X86PipelineError> {
+    if host_is_windows_x64 && regalloc_mode == X86RegAllocMode::Simplified {
+        return Err(X86PipelineError::BlockProfiling(
+            "Windows x86_64 JIT block counters require full regalloc: \
+             the stack-neutral counter trampoline uses R10, and simplified regalloc may allocate R10"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -11285,7 +15726,7 @@ fn splice_x86_block_counter_trampolines(
     X86PipelineError,
 > {
     if func.block_order.is_empty() {
-        return Err(X86PipelineError::ConstantPool(
+        return Err(X86PipelineError::BlockProfiling(
             "x86 block profiling: empty block order".to_string(),
         ));
     }
@@ -11311,7 +15752,7 @@ fn splice_x86_block_counter_trampolines(
             body_bytes.len()
         };
         if start > end || end > body_bytes.len() {
-            return Err(X86PipelineError::ConstantPool(format!(
+            return Err(X86PipelineError::BlockProfiling(format!(
                 "x86 block profiling: block {:?} byte range {}..{} outside body length {}",
                 block,
                 start,
@@ -11330,7 +15771,7 @@ fn splice_x86_block_counter_trampolines(
                 .get(&block)
                 .copied()
                 .ok_or_else(|| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::BlockProfiling(format!(
                         "x86 block profiling: missing computed trampoline start for block {:?}",
                         block
                     ))
@@ -11382,13 +15823,36 @@ pub struct X86PipelineConfig {
     pub target_features: X86TargetFeatures,
     /// Whole-program `panic=unwind` mode (FUZZ-7 / EH Lane 5, cross-object).
     ///
-    /// When true, the Mach-O emitter extends EH Lane 5 (all-filler walkable FDE
-    /// coverage) to EVERY frame-covered object — not just objects carrying a
-    /// local exception-handling function — so a panic can unwind through
-    /// pass-through frames (`lang_start` closure, `rust_begin_short_backtrace`,
-    /// `main`) that live in objects with no local landing pad. Read ONLY inside
-    /// the `X86OutputFormat::MachO` arms; false keeps the object byte-identical.
+    /// When true, exception tables cover EVERY frame-covered object — not just
+    /// objects carrying a local exception-handling function — so a panic can
+    /// unwind through pass-through frames (`lang_start` closure,
+    /// `rust_begin_short_backtrace`, `main`) that live in objects with no local
+    /// landing pad (`x86_module_emits_eh_frame` is the trigger):
+    ///
+    /// * Mach-O: each frame-covered function gets a compact-unwind entry and a
+    ///   zPLR FDE with an all-filler LSDA;
+    /// * ELF (`plan_x86_64_elf_module_unwind`): the module gets
+    ///   `.gcc_except_table`, a zPLR `.eh_frame` with an FDE and an LSDA for
+    ///   every function, and the `DW.ref.<personality>` slot;
+    /// * COFF and raw bytes: not read.
+    ///
+    /// False keeps every object byte-identical.
     pub panic_unwind: bool,
+    /// `LC_BUILD_VERSION` of emitted Mach-O objects: platform and minimum OS
+    /// from the target triple ([`crate::apple_deployment::MachOBuildVersion`]).
+    /// Read only by the `X86OutputFormat::MachO` arms; the default is the
+    /// historical macOS 14.0.
+    pub macho_build_version: crate::apple_deployment::MachOBuildVersion,
+    /// The function definitions whose trust-ir linkage is `Weak`/`LinkOnce`
+    /// or an ODR twin (`WeakOdr`/`LinkOnceOdr`): the Mach-O and ELF module
+    /// emitters bind them weak (`N_EXT | N_WEAK_DEF` / `STB_WEAK`), so the
+    /// static linker keeps one of several objects' copies instead of refusing
+    /// a duplicate. The COFF module emitter writes no COMDAT section or weak
+    /// external and refuses one (`Compiler::compile` refuses the module
+    /// after trust-ir to LIR lowering and before instruction selection and
+    /// emission); raw bytes do not read it. Empty keeps every object
+    /// byte-identical.
+    pub weak_function_definitions: std::collections::BTreeSet<String>,
 }
 
 impl Default for X86PipelineConfig {
@@ -11402,6 +15866,8 @@ impl Default for X86PipelineConfig {
             call_abi: X86CallAbi::SystemV,
             target_features: X86TargetFeatures::default(),
             panic_unwind: false,
+            macho_build_version: crate::apple_deployment::MachOBuildVersion::DEFAULT,
+            weak_function_definitions: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -11644,6 +16110,47 @@ fn x86_pseudo_copy_to_isel(inst: &RegAllocInst) -> Result<X86ISelInst, X86Pipeli
     ))
 }
 
+/// The instruction ids of the allocator's INPUT stream (`before`): the ids the
+/// replay matches original instructions by. An instruction outside this set is
+/// one the allocator inserted.
+fn x86_regalloc_input_inst_ids(before: &RegAllocFunction) -> HashSet<InstId> {
+    before
+        .blocks
+        .iter()
+        .flat_map(|block| block.insts.iter().copied())
+        .collect()
+}
+
+/// The destination of `inst` when it is a copy the allocator inserted, in the
+/// sense of the rule on [`replay_x86_regalloc_stream_mutations`]: a
+/// `PSEUDO_COPY` whose id is not in `input_ids`, with exactly one def, a
+/// class-exact VReg whose id is fresh (allocated by the allocator).
+fn x86_regalloc_inserted_fresh_copy_dst(
+    inst_id: InstId,
+    inst: &RegAllocInst,
+    input_ids: &HashSet<InstId>,
+    fresh: &std::ops::Range<u32>,
+) -> Option<VReg> {
+    if inst.opcode != trust_cg_regalloc::phi_elim::PSEUDO_COPY || input_ids.contains(&inst_id) {
+        return None;
+    }
+    let [RegAllocOperand::VReg(dst)] = inst.defs.as_slice() else {
+        return None;
+    };
+    fresh.contains(&dst.id).then_some(*dst)
+}
+
+/// Computes the omission set of the rule on
+/// [`replay_x86_regalloc_stream_mutations`]: the destinations of the copies
+/// the allocator inserted that no instruction the replay emits reads.
+///
+/// Liveness runs over the block-resident instructions of `after` (in
+/// `block_order`), never the `after.insts` arena: an instruction no block holds
+/// is not replayed, so it keeps nothing alive. Every VReg use of a
+/// block-resident instruction that is not an inserted copy is live, original
+/// copies included, whatever their destination (the greedy splitter renames
+/// original defs to fresh VRegs). A live inserted copy makes its source live,
+/// to a least fixed point. VRegs are class-exact.
 fn x86_regalloc_dead_fresh_copy_vregs(
     before: &RegAllocFunction,
     after: &RegAllocFunction,
@@ -11651,69 +16158,101 @@ fn x86_regalloc_dead_fresh_copy_vregs(
     if after.next_vreg <= before.next_vreg {
         return HashSet::new();
     }
+    let fresh = before.next_vreg..after.next_vreg;
+    let input_ids = x86_regalloc_input_inst_ids(before);
 
-    let fresh_start = before.next_vreg;
-    let fresh_end = after.next_vreg;
-    let mut copy_defined = HashSet::new();
-    let mut copy_successors: HashMap<VReg, Vec<VReg>> = HashMap::new();
-    let mut non_copy_referenced = HashSet::new();
-
-    for inst in &after.insts {
-        let is_pseudo_copy = inst.opcode == trust_cg_regalloc::phi_elim::PSEUDO_COPY;
-        if is_pseudo_copy
-            && let (Some(dst), Some(src)) = (
-                inst.defs.first().and_then(x86_regalloc_operand_vreg),
-                inst.uses.first().and_then(x86_regalloc_operand_vreg),
-            )
-            && (fresh_start..fresh_end).contains(&dst.id)
-            && (fresh_start..fresh_end).contains(&src.id)
-        {
-            copy_successors.entry(src).or_default().push(dst);
-        }
-        for vreg in inst.vreg_defs() {
-            if (fresh_start..fresh_end).contains(&vreg.id) && is_pseudo_copy {
-                copy_defined.insert(vreg);
+    // Inserted copies: destination -> the sources of every inserted copy that
+    // defines it.
+    let mut inserted_sources: HashMap<VReg, Vec<VReg>> = HashMap::new();
+    let mut live = HashSet::new();
+    let mut worklist = Vec::new();
+    for block_id in &after.block_order {
+        let Some(block) = after.blocks.get(block_id.0 as usize) else {
+            continue;
+        };
+        for &inst_id in &block.insts {
+            let Some(inst) = after.insts.get(inst_id.0 as usize) else {
+                continue;
+            };
+            if let Some(dst) =
+                x86_regalloc_inserted_fresh_copy_dst(inst_id, inst, &input_ids, &fresh)
+            {
+                inserted_sources
+                    .entry(dst)
+                    .or_default()
+                    .extend(inst.vreg_uses());
+            } else {
+                for vreg in inst.vreg_uses() {
+                    if live.insert(vreg) {
+                        worklist.push(vreg);
+                    }
+                }
             }
         }
-        for vreg in inst.vreg_uses() {
-            if !is_pseudo_copy && (fresh_start..fresh_end).contains(&vreg.id) {
-                non_copy_referenced.insert(vreg);
+    }
+    while let Some(vreg) = worklist.pop() {
+        for &source in inserted_sources.get(&vreg).into_iter().flatten() {
+            if live.insert(source) {
+                worklist.push(source);
             }
         }
     }
 
-    let mut dead = HashSet::new();
-    for vreg in copy_defined {
-        if !x86_fresh_vreg_reaches_non_copy_reference(vreg, &copy_successors, &non_copy_referenced)
-        {
-            dead.insert(vreg);
-        }
-    }
-
-    dead
+    inserted_sources
+        .into_keys()
+        .filter(|dst| !live.contains(dst))
+        .collect()
 }
 
-fn x86_fresh_vreg_reaches_non_copy_reference(
-    vreg: VReg,
-    copy_successors: &HashMap<VReg, Vec<VReg>>,
-    non_copy_referenced: &HashSet<VReg>,
-) -> bool {
-    let mut stack = vec![vreg];
-    let mut seen = HashSet::new();
+/// Every VReg `inst` reads: a VReg operand the x86 access model marks as a
+/// use, and every VReg base or index of a memory operand.
+fn x86_isel_inst_vreg_reads(inst: &X86ISelInst) -> impl Iterator<Item = VReg> + '_ {
+    inst.operands
+        .iter()
+        .enumerate()
+        .flat_map(move |(idx, operand)| match operand {
+            X86ISelOperand::VReg(vreg) if x86_operand_access(inst, idx).is_use => vec![*vreg],
+            X86ISelOperand::MemAddr { base, .. } => match base.as_ref() {
+                X86ISelOperand::VReg(vreg) => vec![*vreg],
+                _ => Vec::new(),
+            },
+            X86ISelOperand::SibMemAddr { base, index, .. } => [base.as_ref(), index.as_ref()]
+                .into_iter()
+                .filter_map(|operand| match operand {
+                    X86ISelOperand::VReg(vreg) => Some(*vreg),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+}
 
-    while let Some(current) = stack.pop() {
-        if non_copy_referenced.contains(&current) {
-            return true;
-        }
-        if !seen.insert(current) {
+/// The postcondition of [`replay_x86_regalloc_stream_mutations`]: no
+/// instruction of the replayed `func` reads a VReg whose defining copy the
+/// replay omitted (`omitted`). Checked by name, so a destination defined by two
+/// copies, one omitted, is still caught.
+fn x86_check_replay_reads_no_omitted_copy(
+    func: &X86ISelFunction,
+    omitted: &HashSet<VReg>,
+) -> Result<(), X86PipelineError> {
+    if omitted.is_empty() {
+        return Ok(());
+    }
+    for block_id in &func.block_order {
+        let Some(block) = func.blocks.get(block_id) else {
             continue;
-        }
-        if let Some(successors) = copy_successors.get(&current) {
-            stack.extend(successors.iter().copied());
+        };
+        for (idx, inst) in block.insts.iter().enumerate() {
+            if let Some(vreg) = x86_isel_inst_vreg_reads(inst).find(|vreg| omitted.contains(vreg)) {
+                return Err(X86PipelineError::RegAlloc(format!(
+                    "x86-64 regalloc replay omitted the copy defining v{} ({:?}) as dead, but \
+                     replayed instruction #{idx} ({:?}) in block {} reads it",
+                    vreg.id, vreg.class, inst.opcode, block_id.0
+                )));
+            }
         }
     }
-
-    false
+    Ok(())
 }
 
 fn x86_regalloc_operand_vreg(operand: &RegAllocOperand) -> Option<VReg> {
@@ -11813,6 +16352,11 @@ impl<'a> X86RegAllocOperandCursor<'a> {
         Ok(after_vreg)
     }
 
+    /// The next unconsumed regalloc operand, if any.
+    fn peek(&self) -> Option<&RegAllocOperand> {
+        self.before.get(self.next)
+    }
+
     fn finish(&self) -> Result<(), X86PipelineError> {
         if self.next != self.before.len() || self.next != self.after.len() {
             return Err(X86PipelineError::RegAlloc(format!(
@@ -11866,13 +16410,6 @@ fn x86_replay_sib_memaddr_operand_rewrite(
     }
     uses.consume_exact(RegAllocOperand::Imm(i64::from(scale)))?;
     Ok(())
-}
-
-fn x86_pseudo_copy_dst(inst: &RegAllocInst) -> Option<VReg> {
-    if inst.opcode != trust_cg_regalloc::phi_elim::PSEUDO_COPY {
-        return None;
-    }
-    inst.defs.first().and_then(x86_regalloc_operand_vreg)
 }
 
 fn x86_validate_removed_original_copy(
@@ -11950,7 +16487,19 @@ fn x86_replay_existing_operand_rewrite(
                     *vreg = uses.consume_vreg(*vreg)?;
                 }
             }
-            X86ISelOperand::PReg(_) => {}
+            X86ISelOperand::PReg(preg) => {
+                // An internal multi-result return move's destination is the one
+                // physical register the conversion states as an EXPLICIT def
+                // (`x86_internal_return_window_start`); every other physical
+                // operand is implicit and has no regalloc operand to replay.
+                if access.is_def
+                    && idx == 0
+                    && let Some(expected) = x86_fixed_operand_to_preg(*preg)
+                    && defs.peek() == Some(&RegAllocOperand::PReg(expected))
+                {
+                    defs.consume_exact(RegAllocOperand::PReg(expected))?;
+                }
+            }
             X86ISelOperand::Imm(imm) => {
                 uses.consume_exact(RegAllocOperand::Imm(*imm))?;
             }
@@ -11960,7 +16509,9 @@ fn x86_replay_existing_operand_rewrite(
             X86ISelOperand::Block(block) => {
                 uses.consume_exact(RegAllocOperand::Block(BlockId(block.0)))?;
             }
-            X86ISelOperand::CondCode(_) | X86ISelOperand::Symbol(_) => {
+            X86ISelOperand::CondCode(_)
+            | X86ISelOperand::Symbol(_)
+            | X86ISelOperand::ExactModuleSymbol(_) => {
                 uses.consume_exact(RegAllocOperand::Imm(0))?;
             }
             X86ISelOperand::StackSlot(slot) => {
@@ -11993,6 +16544,23 @@ fn x86_replay_existing_operand_rewrite(
     Ok(rewritten)
 }
 
+/// Replays the register allocator's stream mutations (`before` is its input,
+/// `after` its output) into the x86 ISel stream `func`.
+///
+/// The rule: the replay transcribes the allocator's block-resident stream
+/// exactly, except that it may omit a copy the allocator inserted (a
+/// block-resident `PSEUDO_COPY` whose `InstId` is in no block of `before`,
+/// whose one definition is a fresh VReg) when no instruction the replay emits
+/// reads that destination. Original instructions are matched by `InstId` and
+/// never omitted, whatever their destination. A dead split child has no
+/// allocation (a zero-length interval) and nothing reserves a register around
+/// its copy, so emitting it could clobber a live value.
+///
+/// [`x86_regalloc_dead_fresh_copy_vregs`] computes the omission set;
+/// [`x86_check_replay_reads_no_omitted_copy`] checks the emitted stream against
+/// it, so a break of the rule is a `RegAlloc` error, never a read of a
+/// register nothing wrote. On any error from that check `func` is left as it
+/// was.
 fn replay_x86_regalloc_stream_mutations(
     func: &mut X86ISelFunction,
     before: &RegAllocFunction,
@@ -12016,6 +16584,9 @@ fn replay_x86_regalloc_stream_mutations(
     }
 
     let dead_fresh_copy_vregs = x86_regalloc_dead_fresh_copy_vregs(before, after);
+    let input_inst_ids = x86_regalloc_input_inst_ids(before);
+    let fresh_vreg_ids = before.next_vreg..after.next_vreg;
+    let mut omitted_copy_vregs = HashSet::new();
 
     if func.block_order.len() != before.blocks.len() {
         return Err(X86PipelineError::RegAlloc(format!(
@@ -12124,9 +16695,14 @@ fn replay_x86_regalloc_stream_mutations(
             }
 
             if after_inst.opcode == trust_cg_regalloc::phi_elim::PSEUDO_COPY {
-                if x86_pseudo_copy_dst(after_inst)
-                    .is_some_and(|dst| dead_fresh_copy_vregs.contains(&dst))
+                if let Some(dst) = x86_regalloc_inserted_fresh_copy_dst(
+                    *after_inst_id,
+                    after_inst,
+                    &input_inst_ids,
+                    &fresh_vreg_ids,
+                ) && dead_fresh_copy_vregs.contains(&dst)
                 {
+                    omitted_copy_vregs.insert(dst);
                     continue;
                 }
                 replayed_insts.push(x86_pseudo_copy_to_isel(after_inst)?);
@@ -12169,6 +16745,10 @@ fn replay_x86_regalloc_stream_mutations(
         block.insts = replayed_insts;
     }
 
+    if let Err(err) = x86_check_replay_reads_no_omitted_copy(func, &omitted_copy_vregs) {
+        *func = original_func;
+        return Err(err);
+    }
     func.next_vreg = after.next_vreg;
     Ok(())
 }
@@ -12403,6 +16983,7 @@ fn x86_regalloc_opcode_is_fixed_reg_clobber(opcode: u16) -> bool {
         || opcode == Cmpxchg as u16
         || opcode == Cmpxchg8 as u16
         || opcode == Cmpxchg16 as u16
+        || opcode == AtomicLoadCmpxchg16b as u16
         || opcode == AtomicRmwCasLoop as u16
         || opcode == AtomicRmwCasLoop8 as u16
         || opcode == AtomicRmwCasLoop16 as u16
@@ -12515,80 +17096,127 @@ fn x86_regalloc_splitting_supported_cfg(func: &RegAllocFunction) -> bool {
 // X86ISelFunction -> RegAllocFunction conversion
 // ---------------------------------------------------------------------------
 
-/// Classify whether an x86-64 opcode's first operand is a definition.
+/// Whether operand 0 of an x86-64 opcode is a definition.
 ///
-/// Returns `true` if the first operand is a def (output), `false` if all
-/// operands are uses (e.g., branches, returns, compares, stores).
+/// This is the shared exhaustive classifier
+/// [`trust_cg_opt::effects::x86_produces_value`], so the register allocator
+/// and the machine passes cannot disagree about which register an instruction
+/// writes. `false` means every explicit operand is a use: branches (including
+/// the indirect `JmpR [target]`), returns, compares, stores, the fixed-register
+/// implicit writers, the compare-exchange family (see [`x86_operand_access`])
+/// and the trap carriers. It used to be a private list here ending in
+/// `_ => true` that did not name `JmpR`, so the allocator read the jump-table
+/// target as a dead def, and spill materialization stored after the jump
+/// instead of reloading before it.
 fn opcode_has_def(opcode: X86Opcode) -> bool {
-    use X86Opcode::*;
-    match opcode {
-        // Control flow: no defs (all operands are uses or implicit).
-        Jmp | Jcc | Ret | Call | CallR | CallM | Ud2 => false,
-
-        // Compares/tests: set flags only, no register def.
-        CmpRR | CmpRI | CmpRI8 | TestRR | TestRI | TestRM | Ucomisd | Ucomiss | CmpRM | BtRI
-        | Ptest => false,
-
-        // Memory stores: write to memory, no register def.
-        MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR | MovMRSib
-        | MovMR8Sib | MovMR32Sib | VolatileMovMR8 | VolatileMovMR16 | VolatileMovMR32
-        | VolatileMovMR | VolatileMovssMR | VolatileMovsdMR | VolatileMovdquMR
-        | VolatileMovdqaMR => false,
-
-        // Memory-destination RMW ALU: destination is the memory slot; every
-        // register operand (source value + address components) is a use.
-        XorMR | AddMR | XorMRSib | AddMRSib => false,
-
-        // Stack manipulation: implicit RSP modification, no register def.
-        Push => false,
-
-        // CDQ/CQO: implicit operands only (writes RDX).
-        Cdq | Cqo => false,
-
-        // IDIV/DIV: implicit RDX:RAX operands.
-        Idiv | Div | Mul => false,
-
-        // Pseudo/no-def instructions.
-        Nop | NopMulti | Mfence => false,
-
-        // StackAlloc materializes the returned runtime stack address in operand 0.
-        StackAlloc => true,
-
-        // PHI: def is first operand.
-        Phi => true,
-
-        // Everything else: first operand is a def.
-        _ => true,
-    }
+    trust_cg_opt::effects::x86_produces_value(opcode)
 }
 
-/// Returns `true` if the instruction's first operand is both read and written.
+/// Returns `true` if the instruction's first operand is both read and written:
+/// the register allocator's per-form two-address tie.
+///
+/// EXHAUSTIVE on purpose (no `_` arm): a new opcode does not compile until its
+/// tie is decided, form by form. The answer only matters where
+/// [`opcode_has_def`] is `true`; where it is `false`, operand 0 is a use
+/// whatever this says.
 ///
 /// This covers:
-/// - Unary in-place ops like `NEG dst`
-/// - RI/RM/shift forms like `ADD dst, imm` where operand 0 is live-in
+/// - two-operand forms of the two-address ALU, SSE and packed ops
+///   (`ADD dst, src` as `[dst, src]`);
+/// - in-place immediate and memory-source forms (`[dst, imm]`, `[dst, mem]`);
+/// - unary in-place ops (`NEG dst` as `[dst]`) and CL shifts/rotates;
+/// - read-modify-write and conditional writes in every form.
 ///
-/// RR/SSE three-address forms do not need special handling here because a
-/// two-address-safe instruction already carries the live-in value explicitly
-/// as operand 1 (`ADD v0, v0, v1`).
+/// The three-address forms (`ADD v2, v0, v1`, `NEG v1, v0`) are not tied: the
+/// post-RA two-address fixup carries the live-in value explicitly as operand
+/// 1 and inserts `MOV v2, v0` where the registers differ.
+///
+/// [`trust_cg_opt::effects::x86_operand0_may_be_read`] over-approximates this
+/// (it is the union of this tie and the machine passes' opcode-level list), so
+/// every form tied here is a may-read there.
 fn first_operand_is_def_and_use(inst: &X86ISelInst) -> bool {
     use X86Opcode::*;
 
-    if inst.operands.len() == 2 && is_x86_two_address_rr(inst.opcode) {
-        return true;
-    }
-    if inst.operands.len() == 2 && is_x86_three_address_ri(inst.opcode) {
-        return true;
-    }
-
+    let operand_count = inst.operands.len();
     match inst.opcode {
-        Neg | Not => inst.operands.len() == 1,
-        Inc | Dec => true,
-        Bswap | Cmovcc | Cmovcc32 | Xchg | Cmpxchg | Cmpxchg8 | Cmpxchg16 | Pblendvb => true,
-        Pinsrd | Pinsrq => inst.operands.len() == 3,
-        AddRM | SubRM | ImulRM | ImulRMSib | ShlRI | ShrRI | SarRI => inst.operands.len() == 2,
-        ShlRR | ShrRR | SarRR | RolRCl => inst.operands.len() == 1,
-        _ => false,
+        // -- No register defined: every operand is a use and the tie does
+        // not arise. --
+        CmpRR | CmpRI | CmpRI8 | CmpRM | TestRR | TestRI | TestRM | Ucomisd | Ucomiss | BtRI
+        | Ptest => false,
+        MovMR8 | MovMR16 | MovMR32 | MovMR | MovsdMR | MovssMR | MovdquMR | MovdqaMR | MovMRSib
+        | MovMR32Sib | MovMR8Sib | MovdquMRSib | VolatileMovMR8 | VolatileMovMR16
+        | VolatileMovMR32 | VolatileMovMR | VolatileMovssMR | VolatileMovsdMR
+        | VolatileMovdquMR | VolatileMovdqaMR => false,
+        XorMR | AddMR | XorMRSib | AddMRSib => false,
+        Jmp | JmpR | Jcc | Call | CallR | CallM | Ret | Push | Nop | NopMulti | Mfence | Ud2 => {
+            false
+        }
+        Cdq | Cqo | Idiv | Div | Mul => false,
+        // The 128-bit atomic-load pseudo: `[MemAddr]` only; RAX/RDX/RBX/RCX
+        // are written implicitly.
+        AtomicLoadCmpxchg16b => false,
+        TrapBoundsCheckExact | TrapNullIfZeroExact | TrapDivZeroExact | TrapShiftRangeExact => {
+            false
+        }
+
+        // -- Two-address binary ops: `[d, s]` is tied, `[d, a, b]` is not. --
+        AddRR | SubRR | AdcRR | SbbRR | AndRR | OrRR | XorRR | ImulRR => operand_count == 2,
+        Addsd | Subsd | Mulsd | Divsd | Andpd | Addss | Subss | Mulss | Divss | Andps | Minsd
+        | Maxsd | Minss | Maxss | Cmpsd | Cmpss => operand_count == 2,
+        Pand | Pandn | Por | Pxor | Pcmpeqb | Pcmpeqw | Pcmpgtb | Pcmpgtw | Pcmpeqd | Pcmpgtd
+        | Paddb | Paddw | Paddd | Psubb | Psubw | Psubd | Paddq | Psubq | Pmullw | Pmuludq
+        | Punpcklbw | Punpckldq | Packuswb | Punpckhbw | Punpcklqdq | Pmulld | Psadbw | Pcmpeqq
+        | Pcmpgtq => operand_count == 2,
+        Addps | Subps | Mulps | Divps | Addpd | Subpd | Mulpd | Divpd => operand_count == 2,
+
+        // -- Immediate and memory sources: `[d, imm]` / `[d, mem]` is tied,
+        // `[d, s, imm]` is not. The encoder emits the two-operand form of a
+        // shift or rotate as `op d, imm` in place. --
+        AddRI | SubRI | AndRI | OrRI | XorRI => operand_count == 2,
+        ShlRI | ShrRI | SarRI | RolRI | Pslld | Psrld | Psrad | Psllq | Psrlq => operand_count == 2,
+        AddRM | SubRM | ImulRM | ImulRMSib => operand_count == 2,
+        // Lane insert: `[d, s, imm]` is tied, `[d, a, s, imm]` is not.
+        Pinsrd | Pinsrq => operand_count == 3,
+
+        // -- Unary in place: `[d]` is tied, `[d, s]` is not. The CL shifts
+        // and rotate carry only the destination (the count is implicit). --
+        Neg | Not => operand_count == 1,
+        ShlRR | ShrRR | SarRR | RolRCl => operand_count == 1,
+
+        // -- Read-modify-write or conditional in every form. `Xchg` and the
+        // compare-exchange family are refined by `x86_operand_access`. --
+        Inc | Dec | Bswap | Cmovcc | Cmovcc32 | Pblendvb => true,
+        Xchg | Cmpxchg | Cmpxchg8 | Cmpxchg16 => true,
+
+        // -- Operand 0 is only written. --
+        MovRR | MovRR32 | MovRI | Movzx | MovzxW | MovsxB | MovsxW | Movsx | Lea | LeaSib
+        | LeaRip => false,
+        MovRM8 | MovRM16 | MovRM32 | MovRM | MovRMSib | MovRM32Sib | MovRM8Sib | MovsxdRMSib
+        | MovRipRel | MovssRipRel | MovsdRipRel | MovRipRelTlv => false,
+        // The zero-extending loads write the whole register (a 32-bit write
+        // zero-extends to 64): a pure definition in hardware, not only for
+        // the allocator.
+        MovzxRM8 | MovzxRM16 | MovzxRM8Sib | VolatileMovzxRM8 | VolatileMovzxRM16 => false,
+        VolatileMovRM8 | VolatileMovRM16 | VolatileMovRM32 | VolatileMovRM | VolatileMovssRM
+        | VolatileMovsdRM | VolatileMovdquRM | VolatileMovdqaRM => false,
+        MovsdRR | MovssRR | MovdqaRR | MovsdRM | MovssRM | MovsdRMSib | MovssRMSib | MovdquRM
+        | MovdquRMSib | MovdqaRM => false,
+        // `Setcc` writes only the low byte, so treating it as a pure def is
+        // sound only while its result is read through ISel's following
+        // `Movzx d, d`, which reads only that byte. No pass may drop that
+        // Movzx and rely on bits 31:8 surviving the `Setcc` (the retired
+        // x86 peephole setcc-flag-hoist did; see
+        // `setcc_bool_survives_peephole_and_spill_materialization`).
+        Setcc => false,
+        ImulRRI => false,
+        Sqrtsd | Sqrtss | Roundsd | Roundss | Cvtsi2sd | Cvtsd2si | Cvttsd2si | Cvtsi2ss
+        | Cvtss2si | Cvttss2si | Cvtsd2ss | Cvtss2sd | MovdToXmm | MovdFromXmm | MovqToXmm
+        | MovqFromXmm => false,
+        Bsf | Bsr | Tzcnt | Lzcnt | Popcnt => false,
+        Pshufd | Pmovmskb | Pextrd | Pextrq | V4I32MaskExtract | V16I8MaskExtract
+        | V8I16MaskExtract | V2I64MaskExtract | V128BoolSelect => false,
+        AtomicRmwCasLoop | AtomicRmwCasLoop8 | AtomicRmwCasLoop16 => false,
+        Pop | Phi | StackAlloc => false,
     }
 }
 
@@ -12791,6 +17419,23 @@ fn add_x86_fixed_implicit_operands(
             push_unique_x86_preg(implicit_uses, acc);
             push_unique_x86_preg(implicit_defs, acc);
         }
+        // The 128-bit atomic-load pseudo zeroes RAX/RDX/RBX/RCX itself and
+        // then runs LOCK CMPXCHG16B: all four are CLOBBERED (implicit defs) and
+        // none is read. A def at the pseudo's position reserves the register
+        // there, so the allocator keeps every value live across it — and the
+        // address base, which is used AT it — out of all four (the encoder
+        // refuses such a base as a second line). The loaded RDX:RAX is read by
+        // the two copies the selector emits right after the pseudo.
+        X86Opcode::AtomicLoadCmpxchg16b => {
+            for fixed in [
+                x86_64_regs::RAX,
+                x86_64_regs::RDX,
+                x86_64_regs::RBX,
+                x86_64_regs::RCX,
+            ] {
+                push_unique_x86_preg(implicit_defs, fixed);
+            }
+        }
         X86Opcode::AtomicRmwCasLoop
         | X86Opcode::AtomicRmwCasLoop8
         | X86Opcode::AtomicRmwCasLoop16 => {
@@ -12813,15 +17458,29 @@ fn add_x86_fixed_implicit_operands(
 }
 
 /// The rbp-relative displacements of the regalloc-created spill slots: the
-/// LAST `num_spills` entries of the frame layout ([`install_x86_spill_slots`]
-/// appends spill slots after every frontend-created slot). Feeds recheck (5).
-fn x86_spill_slot_disps(layout: &X86StackFrameLayout, num_spills: u32) -> HashSet<i32> {
-    layout
-        .stack_slot_offsets
+/// slot ids [`install_x86_spill_slots`] returned, mapped through the frame
+/// layout. Later stages may append other slots after the spill slots, so this
+/// never infers spill slots by position. Feeds recheck (5). A spill slot with
+/// no fixed offset is a frame-lowering invariant violation and fails closed.
+fn x86_spill_slot_disps(
+    layout: &X86StackFrameLayout,
+    installed_spills: &HashMap<VReg, u32>,
+) -> Result<HashSet<i32>, X86PipelineError> {
+    installed_spills
         .iter()
-        .rev()
-        .take(num_spills as usize)
-        .filter_map(|o| *o)
+        .map(|(vreg, &slot)| {
+            layout
+                .stack_slot_offsets
+                .get(slot as usize)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    X86PipelineError::FrameLowering(format!(
+                        "x86-64 spill slot {slot} of v{} has no fixed frame offset",
+                        vreg.id
+                    ))
+                })
+        })
         .collect()
 }
 
@@ -12856,6 +17515,7 @@ fn x86_uninitialized_spill_read(func: &X86ISelFunction, spill_disps: &HashSet<i3
                 | X86Opcode::MovMRSib
                 | X86Opcode::MovMR32Sib
                 | X86Opcode::MovMR8Sib
+                | X86Opcode::MovdquMRSib
                 | X86Opcode::VolatileMovMR8
                 | X86Opcode::VolatileMovMR16
                 | X86Opcode::VolatileMovMR32
@@ -13053,6 +17713,9 @@ fn build_x86_spill_remat_map(func: &X86ISelFunction) -> HashMap<VReg, X86SpillRe
     // exchanged value). This mirrors the unroller / fold / DCE hidden-def
     // discipline.
     let mut def_count: HashMap<VReg, u32> = HashMap::new();
+    // The same count keyed by register id alone, so a write through another
+    // width view of the register is seen. The `AddRI` hop below requires it.
+    let mut def_count_by_id: HashMap<u32, u32> = HashMap::new();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -13071,6 +17734,7 @@ fn build_x86_spill_remat_map(func: &X86ISelFunction) -> HashMap<VReg, X86SpillRe
                 for op in &inst.operands {
                     if let X86ISelOperand::VReg(v) = op {
                         *def_count.entry(*v).or_insert(0) += 1;
+                        *def_count_by_id.entry(v.id).or_insert(0) += 1;
                     }
                 }
                 continue;
@@ -13079,6 +17743,7 @@ fn build_x86_spill_remat_map(func: &X86ISelFunction) -> HashMap<VReg, X86SpillRe
                 && let Some(X86ISelOperand::VReg(d)) = inst.operands.first()
             {
                 *def_count.entry(*d).or_insert(0) += 1;
+                *def_count_by_id.entry(d.id).or_insert(0) += 1;
             }
         }
     }
@@ -13177,6 +17842,38 @@ fn build_x86_spill_remat_map(func: &X86ISelFunction) -> HashMap<VReg, X86SpillRe
                             && !map.contains_key(d)
                             && let Some(&X86SpillRemat::FrameAddr { slot, disp: d0 }) = map.get(s)
                             && let Some(sum) = d0.checked_add(*disp)
+                        {
+                            map.insert(*d, X86SpillRemat::FrameAddr { slot, disp: sum });
+                            added = true;
+                        }
+                    }
+                    // The same derived-address hop in its other spelling:
+                    // three-operand `AddRI d, s, k`. The optimizer rewrites
+                    // `AddRR(base, MovRI k)` field addresses to this form, and
+                    // LICM hoists them out of every loop that reads the field,
+                    // so they are live across the whole function and spill.
+                    // With the `Lea` hop alone none of them was in the map:
+                    // h2_vec_grow's `main` reloaded 12 such pointers from the
+                    // stack and dereferenced each (`mov -0x138(%rbp),%r10;
+                    // mov (%r10),%r15`) where the `Lea`-spelled twin folds to
+                    // `mov -0x30(%rbp),%r15`. The value is `s + k` exactly; the
+                    // flags `AddRI` writes belong to the ORIGINAL def, which
+                    // stays in place, and the recompute is a flag-neutral
+                    // `Lea`. Gpr64 on both sides, as for the `Lea` hop, and `d`
+                    // has one def counted over every width view of it.
+                    X86Opcode::AddRI => {
+                        if let [
+                            X86ISelOperand::VReg(d),
+                            X86ISelOperand::VReg(s),
+                            X86ISelOperand::Imm(k),
+                        ] = inst.operands.as_slice()
+                            && d.class == RegClass::Gpr64
+                            && s.class == RegClass::Gpr64
+                            && def_count_by_id.get(&d.id).copied() == Some(1)
+                            && !map.contains_key(d)
+                            && let Some(&X86SpillRemat::FrameAddr { slot, disp: d0 }) = map.get(s)
+                            && let Ok(k) = i32::try_from(*k)
+                            && let Some(sum) = d0.checked_add(k)
                         {
                             map.insert(*d, X86SpillRemat::FrameAddr { slot, disp: sum });
                             added = true;
@@ -13486,6 +18183,7 @@ fn x86_sib_opcode_base_only_form(opcode: X86Opcode) -> Option<X86Opcode> {
         X86Opcode::MovMRSib => Some(X86Opcode::MovMR),
         X86Opcode::MovRM8Sib => Some(X86Opcode::MovRM8),
         X86Opcode::MovMR8Sib => Some(X86Opcode::MovMR8),
+        X86Opcode::MovzxRM8Sib => Some(X86Opcode::MovzxRM8),
         X86Opcode::LeaSib => Some(X86Opcode::Lea),
         X86Opcode::ImulRMSib => Some(X86Opcode::ImulRM),
         X86Opcode::MovRM32Sib => Some(X86Opcode::MovRM32),
@@ -13669,6 +18367,384 @@ fn try_presequence_x86_sib_address(
     state.reserve_gpr_scratch();
 
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Post-RA redundant spill-reload elision
+// ---------------------------------------------------------------------------
+
+/// How many spill slots this pass tracks per block before it gives up. A block
+/// with more live spill slots than this is pathological; the bound only stops the
+/// map from growing without limit.
+const X86_RELOAD_TRACK_CAP: usize = 64;
+
+/// A spill slot whose current contents are ALSO in a physical register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X86ReloadedSlot {
+    /// The register holding the value, at its exact width spelling. Exactness
+    /// matters: `MovRM32 R10D, [s]` ZEROES the upper half of R10, so a 64-bit
+    /// R10 holder does not satisfy it and vice versa.
+    holder: X86PReg,
+    /// Bytes of the slot the holder covers (4 or 8).
+    bytes: u8,
+}
+
+/// Elide spill RELOADS whose slot value is already in a register.
+///
+/// # The defect this removes
+///
+/// `materialize_x86_spills` emits each instruction's reloads immediately in front
+/// of it and its spill stores immediately after it, with NO memory of the previous
+/// instruction's. Two consecutive instructions reading one spilled vreg therefore
+/// each get their own `mov scratch, [slot]`, into the SAME scratch register,
+/// with nothing in between that touches either the register or the slot. Measured
+/// on `h2_vec_grow` and `h4_vec_dropper`, whose hot loops each carry such a pair
+/// plus a store-then-reload of one slot.
+///
+/// This is the x86 counterpart of `trust_cg_opt`'s AArch64
+/// `elide_redundant_spill_slot_reloads`, which operates on `IrMachFunction` and
+/// cannot be reused: this pipeline keeps the `X86ISelFunction` as the source of
+/// truth and resolves virtual registers through `alloc` rather than rewriting
+/// them.
+///
+/// # Position
+///
+/// Runs AFTER `fixup_two_address` — the last stage that INSERTS instructions, so
+/// nothing can appear between a reload and its consumer afterwards — and BEFORE
+/// the `MovRR` coalescer, so a reload this pass turns into a register copy is
+/// still offered to the coalescer that can delete it.
+///
+/// # Soundness
+///
+/// An entry says "slot `s`'s current contents are also in register `holder`,
+/// covering `bytes` bytes". It is established only by a recognised spill store to
+/// `s` or a recognised reload from `s`, and killed by:
+///
+/// 1. any instruction that CLOBBERS the holder's 64-bit root, via the same
+///    `x86_inst_clobbers_gpr64_root` the `MovRR` coalescer uses (it resolves
+///    virtual registers through `alloc` and accounts for implicit defs);
+/// 1b. any instruction with a DEF operand this pass cannot resolve to a physical
+///    register, which clears the whole map. `resolve_operand` answers `None` for a
+///    vreg missing from `alloc`, and an unresolved def is indistinguishable from a
+///    def of a holder — so an incomplete allocation must not silently look like
+///    "clobbers nothing";
+/// 2. any recognised spill store to `s` (which re-establishes a new entry);
+/// 3. a CALL or RETURN, which clears the whole map: a call clobbers the scratch
+///    registers and may write any slot whose address escaped;
+/// 4. any OTHER memory write, which clears the whole map — this pass does not
+///    reason about what an unrecognised store can reach;
+/// 5. a proof-carrying, pseudo, atomic or fence instruction, and every block
+///    boundary. Nothing crosses a block: physical-register liveness across edges
+///    is exactly the reasoning this pass declines to do.
+///
+/// A deletion is admitted only when the holder is the reload's destination at the
+/// IDENTICAL width spelling, so the deleted instruction's full effect — including
+/// x86's implicit zero-extension of a 32-bit destination — is already in place. A
+/// rewrite to `MovRR`/`MovRR32` is admitted at the same width and replaces a
+/// memory read with a register read of a value the block already holds.
+///
+/// ⚑ TV-5 (`trust_cg_verify::post_ra_dataflow`) does NOT police this. Its
+/// documented v1 misses include spill-slot and memory dataflow, so the conditions
+/// above are the whole argument, exactly as they are for
+/// `x86_try_rename_coalesce_copy`.
+fn elide_redundant_x86_spill_reloads(
+    func: &mut X86ISelFunction,
+    installed_spills: &HashMap<VReg, u32>,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> X86ReloadElideEvidence {
+    let mut evidence = X86ReloadElideEvidence::default();
+    if installed_spills.is_empty() || !x86_spill_reload_elide_enabled() {
+        return evidence;
+    }
+    let spill_slots: HashSet<u32> = installed_spills.values().copied().collect();
+
+    for block_id in func.block_order.clone() {
+        let Some(block) = func.blocks.get_mut(&block_id) else {
+            continue;
+        };
+        let mut held: HashMap<u32, X86ReloadedSlot> = HashMap::new();
+        let mut doomed: Vec<usize> = Vec::new();
+
+        for index in 0..block.insts.len() {
+            // Rule 3/5: a hard barrier discards everything.
+            if x86_reload_elide_barrier(&block.insts[index]) {
+                held.clear();
+                continue;
+            }
+
+            // A RELOAD this pass understands.
+            if let Some((dest, slot, bytes)) =
+                x86_spill_reload_shape(&block.insts[index], &spill_slots)
+            {
+                if let Some(entry) = held.get(&slot).copied()
+                    && entry.bytes == bytes
+                {
+                    if entry.holder == dest {
+                        // The register already holds exactly this, at exactly this
+                        // width spelling: the reload is a no-op.
+                        doomed.push(index);
+                        evidence.deleted += 1;
+                        continue;
+                    }
+                    if let Some(opcode) = x86_reload_copy_opcode(bytes)
+                        && !x86_64_regs::x86_regs_overlap(entry.holder, dest)
+                    {
+                        block.insts[index] = X86ISelInst::new(
+                            opcode,
+                            vec![
+                                X86ISelOperand::PReg(dest),
+                                X86ISelOperand::PReg(entry.holder),
+                            ],
+                        );
+                        evidence.rewritten += 1;
+                        // `dest` now also holds the slot; prefer it so the next
+                        // consumer reads the shorter live range.
+                        x86_reload_kill_root(&mut held, dest);
+                        held.insert(
+                            slot,
+                            X86ReloadedSlot {
+                                holder: dest,
+                                bytes,
+                            },
+                        );
+                        continue;
+                    }
+                }
+                x86_reload_kill_root(&mut held, dest);
+                if held.len() < X86_RELOAD_TRACK_CAP {
+                    held.insert(
+                        slot,
+                        X86ReloadedSlot {
+                            holder: dest,
+                            bytes,
+                        },
+                    );
+                }
+                continue;
+            }
+
+            // A STORE this pass understands re-establishes the slot's holder.
+            if let Some((source, slot, bytes)) =
+                x86_spill_store_shape(&block.insts[index], &spill_slots, alloc)
+            {
+                held.remove(&slot);
+                if held.len() < X86_RELOAD_TRACK_CAP {
+                    held.insert(
+                        slot,
+                        X86ReloadedSlot {
+                            holder: source,
+                            bytes,
+                        },
+                    );
+                }
+                continue;
+            }
+
+            // Rule 4: any other memory write is unaccounted for.
+            if block.insts[index].flags.writes_memory() {
+                held.clear();
+                continue;
+            }
+
+            // Rule 1b: an unresolvable def makes every clobber question
+            // unanswerable for this instruction.
+            if x86_inst_has_unresolvable_def(&block.insts[index], alloc) {
+                held.clear();
+                continue;
+            }
+
+            // Rule 1: a clobber of a holder's root kills that entry. Collected
+            // first so the scan borrows the instruction and the map separately.
+            let clobbered: Vec<u32> = held
+                .iter()
+                .filter(|(_, entry)| {
+                    match x86_64_regs::x86_containing_gpr64(entry.holder) {
+                        Some(root) => {
+                            x86_inst_clobbers_gpr64_root(&block.insts[index], alloc, root)
+                        }
+                        // A non-GPR holder is not modelled here; drop it.
+                        None => true,
+                    }
+                })
+                .map(|(slot, _)| *slot)
+                .collect();
+            for slot in clobbered {
+                held.remove(&slot);
+            }
+        }
+
+        for index in doomed.into_iter().rev() {
+            block.insts.remove(index);
+        }
+    }
+
+    evidence
+}
+
+/// What [`elide_redundant_x86_spill_reloads`] did. Diagnostic, not a performance
+/// metric.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct X86ReloadElideEvidence {
+    /// Reloads removed because the value was already in the destination.
+    deleted: usize,
+    /// Reloads replaced by a register-to-register copy.
+    rewritten: usize,
+}
+
+impl X86ReloadElideEvidence {
+    /// Only the tests ask for the combined count; the pipeline binds the whole
+    /// struct so a future metric can plumb the two numbers separately.
+    #[cfg(test)]
+    fn total(&self) -> usize {
+        self.deleted + self.rewritten
+    }
+}
+
+/// Whether any DEF operand of `inst` names a register this pass cannot resolve to
+/// a physical one (rule 1b). A `PReg` always resolves; a `VReg` resolves only when
+/// `alloc` maps it.
+fn x86_inst_has_unresolvable_def(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> bool {
+    (0..inst.operands.len()).any(|i| {
+        x86_operand_access(inst, i).is_def
+            && matches!(&inst.operands[i], X86ISelOperand::VReg(v) if !alloc.contains_key(v))
+    })
+}
+
+/// Drop every entry whose holder shares a 64-bit root with `reg`.
+fn x86_reload_kill_root(held: &mut HashMap<u32, X86ReloadedSlot>, reg: X86PReg) {
+    let Some(root) = x86_64_regs::x86_containing_gpr64(reg) else {
+        held.clear();
+        return;
+    };
+    held.retain(|_, entry| x86_64_regs::x86_containing_gpr64(entry.holder) != Some(root));
+}
+
+fn x86_reload_copy_opcode(bytes: u8) -> Option<X86Opcode> {
+    match bytes {
+        8 => Some(X86Opcode::MovRR),
+        4 => Some(X86Opcode::MovRR32),
+        _ => None,
+    }
+}
+
+/// Whether `inst` forces the whole tracking map to be discarded.
+fn x86_reload_elide_barrier(inst: &X86ISelInst) -> bool {
+    if inst.proof_origin.is_some() {
+        return true;
+    }
+    if matches!(
+        inst.opcode,
+        X86Opcode::Phi
+            | X86Opcode::StackAlloc
+            | X86Opcode::Mfence
+            | X86Opcode::Xchg
+            | X86Opcode::Cmpxchg
+            | X86Opcode::Cmpxchg8
+            | X86Opcode::Cmpxchg16
+            | X86Opcode::AtomicLoadCmpxchg16b
+            | X86Opcode::AtomicRmwCasLoop
+            | X86Opcode::AtomicRmwCasLoop8
+            | X86Opcode::AtomicRmwCasLoop16
+    ) {
+        return true;
+    }
+    let flags = inst.flags;
+    flags.is_call()
+        || flags.is_return()
+        || flags.is_branch()
+        || flags.is_terminator()
+        || flags.is_pseudo()
+}
+
+/// `Some((dest, slot, bytes))` iff `inst` is a plain GPR reload of a WHOLE spill
+/// slot into a physical register.
+fn x86_spill_reload_shape(
+    inst: &X86ISelInst,
+    spill_slots: &HashSet<u32>,
+) -> Option<(X86PReg, u32, u8)> {
+    if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
+        return None;
+    }
+    let bytes = match inst.opcode {
+        X86Opcode::MovRM => 8u8,
+        X86Opcode::MovRM32 => 4u8,
+        _ => return None,
+    };
+    let [
+        X86ISelOperand::PReg(dest),
+        X86ISelOperand::MemAddr { base, disp },
+    ] = inst.operands.as_slice()
+    else {
+        return None;
+    };
+    if *disp != 0 {
+        return None;
+    }
+    let X86ISelOperand::StackSlot(slot) = base.as_ref() else {
+        return None;
+    };
+    spill_slots.contains(slot).then_some((*dest, *slot, bytes))
+}
+
+/// `Some((source, slot, bytes))` iff `inst` is a plain GPR store of a WHOLE spill
+/// slot from a register whose physical identity `alloc` resolves.
+fn x86_spill_store_shape(
+    inst: &X86ISelInst,
+    spill_slots: &HashSet<u32>,
+    alloc: &HashMap<VReg, X86PReg>,
+) -> Option<(X86PReg, u32, u8)> {
+    if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
+        return None;
+    }
+    let bytes = match inst.opcode {
+        X86Opcode::MovMR => 8u8,
+        X86Opcode::MovMR32 => 4u8,
+        _ => return None,
+    };
+    let [X86ISelOperand::MemAddr { base, disp }, source] = inst.operands.as_slice() else {
+        return None;
+    };
+    if *disp != 0 {
+        return None;
+    }
+    let X86ISelOperand::StackSlot(slot) = base.as_ref() else {
+        return None;
+    };
+    if !spill_slots.contains(slot) {
+        return None;
+    }
+    let source = resolve_operand(source, alloc)?;
+    // A store's source must be a GPR of exactly the stored width, or the holder
+    // would not cover the slot bytes the way a reload of them would.
+    let ok = match bytes {
+        8 => source.is_gpr64(),
+        4 => source.is_gpr32(),
+        _ => false,
+    };
+    ok.then_some((source, *slot, bytes))
+}
+
+static X86_RELOAD_ELIDE_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install this pass's OPT-OUT from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-reload-elide`). DEFAULT ON.
+///
+/// The environment kill switch below is refused by `trustc` before this backend
+/// loads, so without this setter the pass could not be A/B'd through the bridge at
+/// all — and a pass that DELETES instructions from real hot loops must be
+/// measurable both ways from one dylib.
+pub fn set_x86_reload_elide_disabled(disabled: bool) -> bool {
+    match X86_RELOAD_ELIDE_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => X86_RELOAD_ELIDE_DISABLED.get() == Some(&requested),
+    }
+}
+
+fn x86_spill_reload_elide_enabled() -> bool {
+    if let Some(disabled) = X86_RELOAD_ELIDE_DISABLED.get() {
+        return !*disabled;
+    }
+    !crate::env_lock::var_os("TCG_NO_X86_RELOAD_ELIDE").is_some_and(|v| v != "0")
 }
 
 fn materialize_x86_spills(
@@ -14056,6 +19132,91 @@ fn x86_block_loop_depths(func: &X86ISelFunction) -> Vec<u32> {
     depths
 }
 
+/// The RETURN-MOVE WINDOW of a block whose `ret` delivers results in TrustCG's
+/// internal multi-result registers: `(first, ret)`, the index of the first of
+/// the fixed-register writes `lower_return` emits immediately before that
+/// `ret` and the index of the `ret` itself (not necessarily the block's last
+/// instruction: a trailing pseudo may follow it), or `None` for every other
+/// block (including every block of every function whose return fits the
+/// System V C file).
+///
+/// The register allocator must see those writes as EXPLICIT physical
+/// producers and the `ret` as reading every register they write (return
+/// sinks). Otherwise a written result register looks dead until the `ret`,
+/// and the allocator may place a split copy of a result still to be moved into
+/// a register an earlier return move already filled: measured on a seven-result
+/// relay, where a copy of result 6 was parked in RAX after RAX had received
+/// result 0. Fails closed unless the window writes EVERY result register of
+/// the function's return — the C-file part (RAX, RDX, XMM0, XMM1) as well as
+/// the internal registers the `ret` declares — so a return move moved out of
+/// the trailing run by some earlier pass cannot silently lose its sink.
+fn x86_internal_return_window_start(
+    block_id: LirBlock,
+    block: &trust_cg_lower::x86_64_isel::X86ISelBlock,
+    returns: &[trust_cg_lower::types::Type],
+) -> Result<Option<(usize, usize)>, X86PipelineError> {
+    let Some(ret_index) = block
+        .insts
+        .iter()
+        .position(|inst| inst.flags.is_return() && !inst.internal_return_regs.is_empty())
+    else {
+        return Ok(None);
+    };
+    let ret = &block.insts[ret_index];
+    let mut start = ret_index;
+    while start > 0 {
+        let inst = &block.insts[start - 1];
+        let writes_fixed_register = matches!(inst.operands.first(), Some(X86ISelOperand::PReg(_)))
+            && x86_operand_access(inst, 0).is_def
+            && !inst.flags.is_call()
+            && !inst.flags.is_branch()
+            && !inst.flags.is_return();
+        if !writes_fixed_register {
+            break;
+        }
+        start -= 1;
+    }
+    let written: Vec<X86PReg> = block.insts[start..ret_index]
+        .iter()
+        .filter_map(|inst| match inst.operands.first() {
+            Some(X86ISelOperand::PReg(reg)) => {
+                x86_64_regs::x86_containing_gpr64(*reg).or_else(|| reg.is_xmm().then_some(*reg))
+            }
+            _ => None,
+        })
+        .collect();
+    // Internal return registers exist only under System V.
+    let declared =
+        trust_cg_lower::x86_64_isel::x86_scalar_return_result_regs(returns, X86CallAbi::SystemV)
+            .unwrap_or_default();
+    let refuse = |what: String| {
+        X86PipelineError::RegAlloc(format!(
+            "[TCG-X86-MULTI-RESULT] block {} returns through TrustCG's internal multi-result \
+             convention, but {what}; its return-move window writes {written:?}. Refusing to \
+             allocate a return whose result producers cannot be identified",
+            block_id.0
+        ))
+    };
+    if !ret
+        .internal_return_regs
+        .iter()
+        .all(|result| declared.contains(result))
+    {
+        return Err(refuse(format!(
+            "the `ret` declares {:?}, which the signature's return classification \
+             {declared:?} does not contain",
+            ret.internal_return_regs
+        )));
+    }
+    if let Some(missing) = declared
+        .iter()
+        .find(|result| !written.contains(&result.reg))
+    {
+        return Err(refuse(format!("no return move writes {}", missing.reg)));
+    }
+    Ok(Some((start, ret_index)))
+}
+
 fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86PipelineError> {
     let block_loop_depths = x86_block_loop_depths(func);
 
@@ -14104,10 +19265,18 @@ fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86P
         })?;
 
         let mut inst_ids: Vec<InstId> = Vec::new();
+        // Internal multi-result returns only (see
+        // `x86_internal_return_window_start`): their return moves become
+        // explicit physical producers and their `ret` reads what those moves
+        // wrote. Every other block converts exactly as before.
+        let return_window = x86_internal_return_window_start(*blk, isel_block, &func.sig.returns)?;
+        let mut return_window_defs: Vec<trust_cg_regalloc::PReg> = Vec::new();
 
-        for isel_inst in &isel_block.insts {
+        for (inst_index, isel_inst) in isel_block.insts.iter().enumerate() {
             let inst_id = InstId(ra_insts.len() as u32);
             inst_ids.push(inst_id);
+            let in_return_window =
+                return_window.is_some_and(|(start, ret)| (start..ret).contains(&inst_index));
 
             let opcode = x86_regalloc_opcode_for_isel_inst(isel_inst);
             let flags = isel_inst.flags;
@@ -14130,9 +19299,14 @@ fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86P
                         }
                     }
                     X86ISelOperand::PReg(x86_preg) => {
-                        // Physical registers go to implicit defs/uses.
+                        // Physical registers go to implicit defs/uses — except
+                        // an internal multi-result return move's destination,
+                        // which is an explicit return-value producer.
                         if let Some(preg) = x86_fixed_operand_to_preg(*x86_preg) {
-                            if access.is_def {
+                            if access.is_def && in_return_window && i == 0 {
+                                defs.push(RegAllocOperand::PReg(preg));
+                                return_window_defs.push(preg);
+                            } else if access.is_def {
                                 push_unique_preg(&mut implicit_defs, preg);
                             }
                             if access.is_use {
@@ -14154,7 +19328,7 @@ fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86P
                         // regalloc's purposes — store as Imm(0) placeholder.
                         uses.push(RegAllocOperand::Imm(0));
                     }
-                    X86ISelOperand::Symbol(_s) => {
+                    X86ISelOperand::Symbol(_s) | X86ISelOperand::ExactModuleSymbol(_s) => {
                         // Symbols are relocation targets, not register operands.
                         uses.push(RegAllocOperand::Imm(0));
                     }
@@ -14216,6 +19390,11 @@ fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86P
             }
 
             add_x86_fixed_implicit_operands(isel_inst, &mut implicit_defs, &mut implicit_uses);
+            if return_window.is_some_and(|(_, ret)| ret == inst_index) {
+                for preg in &return_window_defs {
+                    push_unique_preg(&mut implicit_uses, *preg);
+                }
+            }
 
             // NOTE: no `tied_operands` are stamped here. `is_two_address_opcode`
             // matches raw ModRM byte constants (0x01/0x81/...) but is fed
@@ -14329,7 +19508,7 @@ impl X86Pipeline {
 
     #[cfg(test)]
     fn default_x86_pass_manager() -> trust_cg_opt::X86PassManager {
-        Self::x86_o2_pass_manager()
+        Self::x86_o2_pass_manager(X86PipelineConfig::default().call_abi)
     }
 
     fn x86_o1_pass_manager() -> trust_cg_opt::X86PassManager {
@@ -14376,8 +19555,9 @@ impl X86Pipeline {
             // peephole are admission-gated on the REAL reconstruction
             // discharge (fail-closed `|_| false` default in
             // `X86Peephole::default`).
-            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(
+            .with_pass(Box::new(trust_cg_opt::X86Peephole::with_admissions(
                 admit_x86_reconstructed_opcode,
+                admit_x86_constmul_shift,
             )))
             .with_pass(Box::new(trust_cg_opt::X86DeadCodeElimination));
         if x86_if_convert_enabled() {
@@ -14391,14 +19571,29 @@ impl X86Pipeline {
                 x86_branch_layout_config(),
             )));
         }
+        // Loop-top selection (OPT-IN `x86-loop-top`): AFTER branch layout on
+        // purpose -- it reads the layout that pass chose and RE-INVERTS the
+        // latch pair the latch rule just produced, because the reorder needs
+        // the header as the latch's fall-through and the latch rule needs the
+        // exit. Registering it first would let the latch rule undo the
+        // reorder's whole saving. Self-gated, so the default schedule and the
+        // `optimization_passes_run` pin are unchanged.
+        if trust_cg_opt::x86_loop_top::x86_loop_top_registered() {
+            pm = pm.with_pass(Box::new(trust_cg_opt::X86LoopTop::new(
+                admit_x86_cc_inversion,
+            )));
+        }
         pm
     }
 
-    fn x86_o2_pass_manager() -> trust_cg_opt::X86PassManager {
-        Self::x86_o2_pass_manager_with_branch_layout(x86_branch_layout_enabled())
+    fn x86_o2_pass_manager(call_abi: X86CallAbi) -> trust_cg_opt::X86PassManager {
+        Self::x86_o2_pass_manager_with_branch_layout(x86_branch_layout_enabled(), call_abi)
     }
 
-    fn x86_o2_pass_manager_with_branch_layout(branch_layout: bool) -> trust_cg_opt::X86PassManager {
+    fn x86_o2_pass_manager_with_branch_layout(
+        branch_layout: bool,
+        call_abi: X86CallAbi,
+    ) -> trust_cg_opt::X86PassManager {
         // LICM runs first so the loop-invariant constant materializations it
         // hoists into the preheader are exposed to copy-prop/CSE/DCE, and the
         // now-shorter loop body is cleaned up by the subsequent passes. LICM is
@@ -14413,7 +19608,9 @@ impl X86Pipeline {
         // raw post-ISel loop shape, before LICM/copy-prop/CSE rename or relocate
         // the loop body. It only ever rewrites a loop whose legality is provable
         // by construction; anything else stays scalar. Kill switch:
-        // `TCG_NO_VECTORIZE`.
+        // `TCG_NO_VECTORIZE`. It is told this pipeline's C call ABI so its
+        // fill tier may stage a `memset` libcall (SystemV only; any other ABI
+        // keeps the inline store loop) — see `x86_vectorize::apply_fill_memset`.
         //
         // Strength reduction (OPT-3a) runs right after LICM: LICM has hoisted
         // the loop-invariant constant materializations (the stride vregs) into
@@ -14424,8 +19621,24 @@ impl X86Pipeline {
         // step) recurrence proof via `admit_x86_strength_reduce_recurrence`.
         // Kill switch: `TCG_NO_STRENGTH_REDUCE`.
         let mut pm = trust_cg_opt::X86PassManager::new();
+        // Loop preheader insertion (OPT-IN `x86-loop-simplify`): give every
+        // natural loop header a UNIQUE out-of-loop predecessor by splitting its
+        // out-of-loop in-edges into a fresh block. FIRST, before the vectorizer,
+        // because `mach_view::find_preheader` yields a preheader only for a
+        // header with exactly one non-loop predecessor and every loop-consuming
+        // pass reads `GenericLoop::preheader` — so a header fronted by a
+        // bounds-check diamond is declined for CFG SHAPE rather than for any
+        // property of the loop. `p4_matmul`'s k loop is that case, and the tier
+        // it blocks (`recognize_saxpyq_rowreg_loop`) is the one that keeps the
+        // c row in XMM accumulators across the k loop. See
+        // `trust_cg_opt::x86_loop_simplify`.
+        if trust_cg_opt::x86_loop_simplify::enabled_for_schedule() {
+            pm = pm.with_pass(Box::new(trust_cg_opt::X86LoopSimplify));
+        }
         if x86_vectorize_enabled() {
-            pm = pm.with_pass(Box::new(trust_cg_opt::X86Vectorize::default()));
+            pm = pm.with_pass(Box::new(
+                trust_cg_opt::X86Vectorize::default().with_fill_memset_abi(call_abi),
+            ));
         }
         // The invariant stack-slot load tier (O2+ only; kill switch
         // `TCG_NO_LICM_LOADS`) additionally hoists provably invariant,
@@ -14448,9 +19661,35 @@ impl X86Pipeline {
                 trust_cg_opt::X86ScalarReplacementOfAggregates::new(),
             ));
         }
+        // OPT-12 POST-SROA RUN (DEFAULT ON). The tracked forensic opt-out is
+        // `-Ztrust-ir-cg-args=no-vectorize-post-sroa`.
+        //
+        // The position the recognizers' own dialect wants. The early run above
+        // meets an owning-container reduction with its slice fat-pointer still in
+        // memory — a `(ptr, len)` store and reload every iteration, which fails
+        // every length-invariance test, plus two-level loads. SROA has just
+        // promoted that non-escaped slot to registers, and the peephole has NOT
+        // yet re-spelled the header test, the increment or the element address, so
+        // the loop is in exactly the raw-ISel dialect the recognizers encode.
+        //
+        // An ADDITIONAL run, not a move, so nothing the early run handles changes.
+        if trust_cg_opt::x86_loop_simplify::enabled_for_schedule() {
+            pm = pm.with_pass(Box::new(trust_cg_opt::X86LoopSimplify));
+        }
+        if x86_vectorize_enabled() && trust_cg_opt::x86_vectorize::post_sroa_run_enabled() {
+            pm = pm.with_pass(Box::new(
+                trust_cg_opt::X86Vectorize::default().with_fill_memset_abi(call_abi),
+            ));
+        }
         let licm = if x86_licm_load_hoisting_enabled() {
             trust_cg_opt::X86LoopInvariantCodeMotion::with_invariant_load_hoisting()
-                .with_flag_arith(x86_licm_flag_arith_enabled())
+                .with_flag_arith(true)
+            // The POINTER-BASE arm is DEFAULT ON and `with_invariant_load_hoisting`
+            // reads that default itself, so there is nothing to wire here.
+            // `-Ztrust-ir-cg-args=no-licm-pointer-loads` opts out; see
+            // `trust_cg_opt::x86_licm::pointer_base_load_is_hoistable` for the
+            // h3_box_leak measurement that turned it on and the h1_vec_push_sum
+            // one that had kept it off.
         } else {
             trust_cg_opt::X86LoopInvariantCodeMotion::pure_only()
         };
@@ -14460,21 +19699,20 @@ impl X86Pipeline {
                 admit_x86_strength_reduce_recurrence,
             )));
         }
-        // Full unrolling of small constant-trip loops (X9 slice 1, OPT-IN
-        // `TCG_X86_UNROLL=1`). After LICM/strength-reduce (canonicalized IVs),
+        // Full unrolling of small constant-trip loops (X9 slice 1; default ON
+        // since fa7ee295a, tracked opt-out `no-x86-loop-unroll`, which the pass
+        // reads itself). After LICM/strength-reduce (canonicalized IVs),
         // before const-fold/copy-prop/CSE/peephole/BCE/DCE so the replicated
         // straight-line body — whose IV chain the pass seeds with its proven
         // initial constant — collapses in the same pass-manager run; before
         // LoopRotate so the recognizer sees the frontend's top-tested shape.
-        if x86_unroll_enabled() {
-            pm = pm.with_pass(Box::new(trust_cg_opt::X86LoopUnroll));
-        }
+        pm = pm.with_pass(Box::new(trust_cg_opt::X86LoopUnroll));
         let mut pm = pm.with_pass(Box::new(trust_cg_opt::X86ConstantFolding));
         // Const-index guard elimination: deletes guard pseudos whose
         // assertion is statically true by the SAME block-local constant
-        // authority const-fold just applied (the unrolled-body shape). Runs
-        // only under the unroll opt-in and respects the BCE kill switch.
-        if x86_unroll_enabled() && x86_bce_enabled() {
+        // authority const-fold just applied (the unrolled-body shape). Runs in
+        // the default schedule and respects the BCE opt-out (`no-x86-bce`).
+        if x86_bce_enabled() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86ConstGuardElim));
         }
         // Straight-line block merging (`TCG_NO_X86_BLOCK_MERGE` to opt out).
@@ -14486,15 +19724,30 @@ impl X86Pipeline {
         //     like they do not reconverge (this is what kept b1_mispredict's
         //     rotate diamond a mispredicting branch).
         // Measured 123 mergeable pairs across all 18 beat-llvm programs.
+        let mut pm = pm.with_pass(Box::new(trust_cg_opt::X86BlockMerge::new()));
+        // Frame-slot value forwarding (DEFAULT ON; `no-x86-slot-forward` opts
+        // out). Placed between the merge and the copy-prop/CSE/DCE cluster for
+        // both of its neighbours' reasons: the merge has just widened the
+        // block-local window this pass scans, and every rewrite it makes is a
+        // register copy that copy-prop forwards and DCE then deletes, so the net
+        // effect is one fewer memory operation rather than one more move.
+        //
+        // It covers what SROA structurally cannot: SROA's recogniser is rooted at
+        // a MATERIALIZED slot address, so a slot the ISel addresses directly as
+        // `[StackSlot(N)+d]` — a memory-backed scalar local — is not a candidate
+        // at all and keeps every load it was lowered with, redundant or not. See
+        // `trust_cg_opt::x86_slot_forward` for the two kill rules that are the
+        // whole aliasing argument.
+        pm = pm.with_pass(Box::new(trust_cg_opt::X86SlotForward::new()));
         let mut pm = pm
-            .with_pass(Box::new(trust_cg_opt::X86BlockMerge::new()))
             .with_pass(Box::new(trust_cg_opt::X86CopyPropagation))
             .with_pass(Box::new(trust_cg_opt::X86CommonSubexpressionElimination))
             // The RMW fusion and the variable-rotate collapse inside the
             // peephole are admission-gated on the REAL reconstruction
             // discharge — see `admit_x86_reconstructed_opcode`.
-            .with_pass(Box::new(trust_cg_opt::X86Peephole::new(
+            .with_pass(Box::new(trust_cg_opt::X86Peephole::with_admissions(
                 admit_x86_reconstructed_opcode,
+                admit_x86_constmul_shift,
             )));
         // Dominated-identical-compare bounds-check elimination (safety-critical,
         // sound by construction). Runs AFTER the peephole's cmp+setcc+zero-test
@@ -14506,7 +19759,49 @@ impl X86Pipeline {
         if x86_bce_enabled() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86BoundsCheckElimination::new()));
         }
+        // Xorshift demanded bits (default on, with explicit opt-out): let a
+        // consumer that reads only bits `[0, k)` of `x ^ (x << k)` read `x`
+        // instead, shortening the chain feeding it by one shift-and-xor.
+        //
+        // AFTER the peephole on purpose: `BtRI` — the one-bit consumer this
+        // targets, and the shape b1's `s & 1` branch takes — does not exist in
+        // ISel output. The peephole SYNTHESIZES it from `AndRI` + `CmpRI 0` +
+        // `Jcc` (x86_peephole.rs, the BtRI build), so a position before the
+        // peephole would see no consumer at all.
+        //
+        // REGISTRATION is gated, not just the rewrite: a self-gated no-op pass
+        // still changes the default pass schedule, which two pipeline tests pin.
+        if trust_cg_opt::x86_xorshift_demanded_bits::x86_xorshift_demanded_bits_registered() {
+            pm = pm.with_pass(Box::new(trust_cg_opt::X86XorshiftDemandedBits));
+        }
         let mut pm = pm.with_pass(Box::new(trust_cg_opt::X86DeadCodeElimination));
+        // OPT-12 SECOND RUN (DEFAULT OFF; `-Ztrust-ir-cg-args=vectorize-late`).
+        //
+        // The early run above sees the RAW post-ISel shape, which is right for
+        // every loop it already recognises and wrong for one whose recognisable
+        // form only exists after the cleanup cluster. Measured on
+        // `h1_vec_push_sum`: at the early run its inner `while k < v.len() { acc +=
+        // v[k] }` is two-level loads through the `Vec` header PLUS a slice-temp
+        // `(ptr, len)` store and reload every iteration, and it is DECLINED by
+        // every recognizer; by this point the same loop is a pointer base and a
+        // length in registers defined in the preheader, which is what the
+        // heap-slice / reg-arg i64 sum-reduction tiers are shaped for.
+        //
+        // Placed HERE deliberately: after SROA/LICM/peephole/BCE/DCE so the body
+        // is minimal, and BEFORE `X86LoopRotate` so the recognizers still see the
+        // frontend's TOP-TESTED shape (the same reason `X86LoopUnroll` sits ahead
+        // of rotation).
+        //
+        // This is an ADDITIONAL run, not a move, so no loop the early run already
+        // vectorizes can change behaviour. Both runs honour `TCG_NO_VECTORIZE`.
+        if trust_cg_opt::x86_loop_simplify::enabled_for_schedule() {
+            pm = pm.with_pass(Box::new(trust_cg_opt::X86LoopSimplify));
+        }
+        if x86_vectorize_enabled() && trust_cg_opt::x86_vectorize::late_run_enabled() {
+            pm = pm.with_pass(Box::new(
+                trust_cg_opt::X86Vectorize::default().with_fill_memset_abi(call_abi),
+            ));
+        }
         // Loop rotation (task #72 pass 1): thread latch `Jmp header` through
         // pure-test headers so hot loops bottom-test (one branch/iteration
         // instead of test+Jcc+Jmp). Runs after DCE so headers are in their
@@ -14527,7 +19822,7 @@ impl X86Pipeline {
         // all checksum==LLVM, proofs-ON compile+run verified. See
         // `trust_cg_opt::x86_cmov_swap` (module docs) for the recognizer's
         // fail-closed conditions and the soundness argument.
-        if crate::env_lock::var_os("TCG_NO_X86_CMOV_SWAP").is_none() {
+        if x86_cmov_swap_enabled() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86CmovSwap::new()));
         }
         if x86_if_convert_enabled() {
@@ -14539,6 +19834,18 @@ impl X86Pipeline {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86BranchLayout::with_config(
                 admit_x86_cc_inversion,
                 x86_branch_layout_config(),
+            )));
+        }
+        // Loop-top selection (OPT-IN `x86-loop-top`): AFTER branch layout on
+        // purpose -- it reads the layout that pass chose and RE-INVERTS the
+        // latch pair the latch rule just produced, because the reorder needs
+        // the header as the latch's fall-through and the latch rule needs the
+        // exit. Registering it first would let the latch rule undo the
+        // reorder's whole saving. Self-gated, so the default schedule and the
+        // `optimization_passes_run` pin are unchanged.
+        if trust_cg_opt::x86_loop_top::x86_loop_top_registered() {
+            pm = pm.with_pass(Box::new(trust_cg_opt::X86LoopTop::new(
+                admit_x86_cc_inversion,
             )));
         }
         // Two-address pre-expansion (OPT-IN `TCG_X86_TWOADDR_EXPAND`): the LAST
@@ -14568,7 +19875,19 @@ impl X86Pipeline {
         //     gate, and TCG_X86_TWOADDR_EXPAND_ALL) remains available
         //     opt-in for future levers with a different admission story
         //     (e.g. a post-RA measured-copy-count feedback gate).
-        if crate::env_lock::var_os("TCG_X86_TWOADDR_EXPAND").is_some() {
+        // The gate is the TRACKED `-Ztrust-ir-cg-args=x86-twoaddr-expand`, with the
+        // legacy environment variable kept as a fallback. Until 2026-09-29 it was
+        // the environment variable ALONE, and `trustc` refuses every `TCG_*` variable
+        // before the backend loads — so through the bridge this pass was not merely
+        // default-off, it was UNREACHABLE, and its two tracked sub-knobs
+        // (`x86-twoaddr-commute`, `x86-twoaddr-expand-all`) each measured
+        // byte-identical on every program because they configure a pass that was
+        // never in the schedule. `register_enabled` also routes the environment
+        // fallback through `tcg_env_flag`, so `TCG_X86_TWOADDR_EXPAND=0` now means
+        // OFF; the old `var_os(..).is_some()` test enabled the pass for `=0`.
+        // STILL DEFAULT OFF: default-on is refuted above, so the default schedule
+        // and the `optimization_passes_run` pin are unchanged.
+        if trust_cg_opt::x86_two_addr_expand::register_enabled() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86TwoAddressExpand));
         }
         pm
@@ -14576,13 +19895,14 @@ impl X86Pipeline {
 
     fn x86_pass_manager_for_opt_level(
         opt_level: trust_cg_opt::OptLevel,
+        call_abi: X86CallAbi,
     ) -> trust_cg_opt::X86PassManager {
         match opt_level {
             trust_cg_opt::OptLevel::O0 => trust_cg_opt::X86PassManager::new(),
             trust_cg_opt::OptLevel::O1 => Self::x86_o1_pass_manager(),
             trust_cg_opt::OptLevel::O2
             | trust_cg_opt::OptLevel::Os
-            | trust_cg_opt::OptLevel::O3 => Self::x86_o2_pass_manager(),
+            | trust_cg_opt::OptLevel::O3 => Self::x86_o2_pass_manager(call_abi),
         }
     }
 
@@ -14598,7 +19918,8 @@ impl X86Pipeline {
         let stats = if self.config.opt_level == trust_cg_opt::OptLevel::O0 {
             trust_cg_opt::X86PassStats::default()
         } else {
-            let mut pass_manager = Self::x86_pass_manager_for_opt_level(self.config.opt_level);
+            let mut pass_manager =
+                Self::x86_pass_manager_for_opt_level(self.config.opt_level, self.config.call_abi);
             match self.config.opt_level {
                 trust_cg_opt::OptLevel::O0 => trust_cg_opt::X86PassStats::default(),
                 trust_cg_opt::OptLevel::O1
@@ -14818,15 +20139,18 @@ impl X86Pipeline {
             .collect();
         bind_x86_dead_volatile_load_defs(func, &mut allocation, self.config.call_abi)?;
 
-        // 6. Determine which callee-saved registers were used.
-        let (used_callee_saved, used_callee_saved_xmms) =
+        // 6. Determine which callee-saved registers were used: every allocated
+        //    register, plus every callee-saved register a FIXED def writes (the
+        //    128-bit atomic-load pseudo's implicit RBX def), which the
+        //    allocation map cannot show.
+        let (mut used_callee_saved, used_callee_saved_xmms) =
             x86_used_callee_saved_from_allocation(self.config.call_abi, &allocation);
+        x86_merge_fixed_callee_saved_gpr_defs(func, self.config.call_abi, &mut used_callee_saved);
 
         Ok(X86RegAssignment {
             allocation,
             used_callee_saved,
             used_callee_saved_xmms,
-            num_spills: 0,
             spill_plan,
         })
     }
@@ -14868,7 +20192,7 @@ impl X86Pipeline {
         func: &X86ISelFunction,
     ) -> Result<(Vec<u8>, X86RegallocPressureEvidence), X86PipelineError> {
         validate_x86_function_layout(func)?;
-        reject_unwired_x86_eh_output(&self.config, func)?;
+        reject_unwired_x86_eh_output(&self.config, func, X86EhEmissionLane::SingleFunction)?;
         let mut func = func.clone();
         expand_x86_vector_bool_selects(&mut func, self.config.target_features)?;
         expand_x86_vector_mask_extracts(&mut func)?;
@@ -14921,6 +20245,16 @@ impl X86Pipeline {
         let two_address_fixup_copy_count =
             fixup_two_address(&mut func, &assignment.allocation, self.config.call_abi)?;
 
+        // Phase 2a-: post-RA redundant spill-reload elision. Placed HERE
+        // deliberately: AFTER `fixup_two_address`, the last stage that INSERTS
+        // instructions, so nothing can appear between a reload and its consumer
+        // afterwards; and BEFORE the `MovRR` coalescer, so a reload this turns
+        // into a register copy is still offered to the pass that can delete it.
+        // `elide_redundant_x86_spill_reloads` carries the whole soundness
+        // argument: TV-5 does not police spill-slot or memory dataflow.
+        let _reload_elide =
+            elide_redundant_x86_spill_reloads(&mut func, &installed_spills, &assignment.allocation);
+
         // Phase 2b: Post-fixup redundant-`MovRR` coalescing (runtime perf). The
         // pre-RA interference coalescer cannot remove `movq %src,%dst` scratch
         // copies whose source and destination are both live (they interfere); a
@@ -14932,6 +20266,24 @@ impl X86Pipeline {
         // against the post-fixup spec (WARN-only rollout). Skipped at O0 to
         // keep the unoptimized stream untouched.
         self.run_x86_movrr_coalesce_with_captured_spec(&mut func, &assignment.allocation)?;
+
+        // Loop-latch duplication into diamond arms (OPT-IN `x86-latch-dup`):
+        // clone a small loop latch into the arm that is NOT its layout
+        // predecessor, so each arm carries its own copy of the counter update
+        // and its own backedge. This is the transform LLVM applies to
+        // `b1_mispredict`, whose `main` has two backedges to two targets where
+        // this backend emits one.
+        //
+        // POST-RA on purpose, and this position is the whole point: LLVM's
+        // instruction budget of 4 counts POST-RA machine instructions
+        // (MachineBlockPlacement runs with `PreRegAlloc = false`). Measured
+        // pre-RA, b1's latch holds 16 instructions and was declined by a budget
+        // that describes its post-RA form; after allocation and the `MovRR`
+        // coalescer it is four. Runs here — after `fixup_two_address` and the
+        // coalescer, before frame lowering and branch resolution — so the counts
+        // it compares are the ones the constant was borrowed from, and
+        // `block_order` is final so the layout predecessor is well defined.
+        let _latch_dup = trust_cg_opt::x86_latch_dup::run_on_function(&mut func);
 
         prepare_x86_windows_fixed_outgoing_frame(&self.config, &mut func);
         reject_windows_coff_without_unwind_metadata(&self.config, &func, &assignment)?;
@@ -14945,7 +20297,6 @@ impl X86Pipeline {
                 &func,
                 assignment.used_callee_saved.len(),
                 assignment.used_callee_saved_xmms.len(),
-                assignment.num_spills,
             )?;
             frame_metadata = Some(X86FrameMetadata {
                 callee_saved: assignment.used_callee_saved.clone(),
@@ -14954,7 +20305,7 @@ impl X86Pipeline {
                 frame_size: layout.frame_size,
                 has_dynamic_alloc: layout.has_dynamic_alloc,
             });
-            spill_disps = x86_spill_slot_disps(&layout, assignment.num_spills);
+            spill_disps = x86_spill_slot_disps(&layout, &installed_spills)?;
             resolve_x86_stack_slots(&mut func, &layout)?;
             expand_x86_dynamic_stack_allocs(&mut func, &assignment.allocation)?;
             self.insert_prologue_epilogue(&mut func, &assignment, &layout);
@@ -14987,6 +20338,7 @@ impl X86Pipeline {
             block_offsets,
             encoded_call_ranges,
             branch_fixups,
+            has_body_instructions,
         ) = self.encode_function_with_all_fixups_and_block_metadata(
             &func,
             &assignment.allocation,
@@ -15020,7 +20372,7 @@ impl X86Pipeline {
                 func.name.clone(),
                 fixup.symbol.clone(),
                 match fixup.kind {
-                    X86SymbolRefFixupKind::GlobalRef => {
+                    X86SymbolRefFixupKind::GlobalRef | X86SymbolRefFixupKind::ExactFunctionAddr => {
                         "single-function emission has no in-module symbol table"
                     }
                     X86SymbolRefFixupKind::ExternRefGot => {
@@ -15046,7 +20398,7 @@ impl X86Pipeline {
                     let entry_offset =
                         x86_constant_pool_fixup_offset(&pool, &isel_to_pool_idx, *entry_idx)?;
                     let addend = i32::try_from(entry_offset).map_err(|_| {
-                        X86PipelineError::ConstantPool(format!(
+                        X86PipelineError::ObjectEmission(format!(
                             "COFF constant-pool entry offset {entry_offset} does not fit in REL32 addend"
                         ))
                     })?;
@@ -15117,6 +20469,7 @@ impl X86Pipeline {
                 combined_code.extend_from_slice(&const_pool_data);
                 let instruction_code_len = checked_x86_code_len(&func.name, instruction_code_len)?;
                 let encoded = X86EncodedFunc {
+                    has_body_instructions,
                     name: func.name.clone(),
                     code_len: instruction_code_len,
                     const_pool_len: const_pool_data.len(),
@@ -15129,7 +20482,12 @@ impl X86Pipeline {
                     eh,
                 };
                 Ok((
-                    self.emit_module_macho(&[encoded], &combined_code, &[])?,
+                    self.emit_module_macho(
+                        &[encoded],
+                        &combined_code,
+                        &[],
+                        &X86FunctionSymbolFacts::default(),
+                    )?,
                     evidence,
                 ))
             }
@@ -15189,7 +20547,7 @@ impl X86Pipeline {
     ) -> Result<(Vec<u8>, Vec<u8>, Vec<X86CallFixup>, Vec<X86GlobalRefFixup>), X86PipelineError>
     {
         reject_x86_eh_sidecar_drop(&self.config, func, "compile_function_with_fixups")?;
-        let (code, const_pool_data, call_fixups, global_ref_fixups, _, _, _) =
+        let (code, const_pool_data, call_fixups, global_ref_fixups, _, _, _, _) =
             self.compile_function_with_fixups_and_frame(func)?;
         Ok((code, const_pool_data, call_fixups, global_ref_fixups))
     }
@@ -15197,7 +20555,7 @@ impl X86Pipeline {
     pub(crate) fn compile_function_with_jit_block_counters_after_x86_passes(
         &self,
         func: &X86ISelFunction,
-    ) -> Result<X86JitBlockCounterFunction, X86PipelineError> {
+    ) -> Result<(X86JitBlockCounterFunction, bool), X86PipelineError> {
         validate_x86_function_layout(func)?;
         reject_x86_eh_sidecar_drop(
             &self.config,
@@ -15230,15 +20588,10 @@ impl X86Pipeline {
         expand_x86_shift_range_check_carriers(&mut func)?;
         prune_unused_x86_stack_slots(&mut func);
         reject_unsupported_x86_isel(&func, self.config.target_features)?;
-        if cfg!(all(target_arch = "x86_64", target_os = "windows"))
-            && self.config.regalloc_mode == X86RegAllocMode::Simplified
-        {
-            return Err(X86PipelineError::RegAlloc(
-                "Windows x86_64 JIT block counters require full regalloc: \
-                 the stack-neutral counter trampoline uses R10, and simplified regalloc may allocate R10"
-                    .to_string(),
-            ));
-        }
+        reject_x86_jit_block_counter_regalloc_mode(
+            cfg!(all(target_arch = "x86_64", target_os = "windows")),
+            self.config.regalloc_mode,
+        )?;
 
         let assignment = match self.config.regalloc_mode {
             X86RegAllocMode::Simplified => {
@@ -15258,6 +20611,16 @@ impl X86Pipeline {
 
         fixup_two_address(&mut func, &assignment.allocation, self.config.call_abi)?;
 
+        // Phase 2a-: post-RA redundant spill-reload elision. Placed HERE
+        // deliberately: AFTER `fixup_two_address`, the last stage that INSERTS
+        // instructions, so nothing can appear between a reload and its consumer
+        // afterwards; and BEFORE the `MovRR` coalescer, so a reload this turns
+        // into a register copy is still offered to the pass that can delete it.
+        // `elide_redundant_x86_spill_reloads` carries the whole soundness
+        // argument: TV-5 does not police spill-slot or memory dataflow.
+        let _reload_elide =
+            elide_redundant_x86_spill_reloads(&mut func, &installed_spills, &assignment.allocation);
+
         // Phase 2b: post-fixup redundant-`MovRR` coalescing (runtime perf). See
         // the companion call in `compile_function_after_x86_passes_with_pressure_evidence`.
         // Soundness is the pass's own scan conditions; TV-5 (inside
@@ -15265,6 +20628,24 @@ impl X86Pipeline {
         // the Stage A captured-spec check inside this wrapper covers non-tied
         // register value flow (WARN-only rollout).
         self.run_x86_movrr_coalesce_with_captured_spec(&mut func, &assignment.allocation)?;
+
+        // Loop-latch duplication into diamond arms (OPT-IN `x86-latch-dup`):
+        // clone a small loop latch into the arm that is NOT its layout
+        // predecessor, so each arm carries its own copy of the counter update
+        // and its own backedge. This is the transform LLVM applies to
+        // `b1_mispredict`, whose `main` has two backedges to two targets where
+        // this backend emits one.
+        //
+        // POST-RA on purpose, and this position is the whole point: LLVM's
+        // instruction budget of 4 counts POST-RA machine instructions
+        // (MachineBlockPlacement runs with `PreRegAlloc = false`). Measured
+        // pre-RA, b1's latch holds 16 instructions and was declined by a budget
+        // that describes its post-RA form; after allocation and the `MovRR`
+        // coalescer it is four. Runs here — after `fixup_two_address` and the
+        // coalescer, before frame lowering and branch resolution — so the counts
+        // it compares are the ones the constant was borrowed from, and
+        // `block_order` is final so the layout predecessor is well defined.
+        let _latch_dup = trust_cg_opt::x86_latch_dup::run_on_function(&mut func);
 
         prepare_x86_windows_fixed_outgoing_frame(&self.config, &mut func);
         reject_windows_x64_frameless_non_leaf(&self.config, &func)?;
@@ -15275,9 +20656,8 @@ impl X86Pipeline {
                 &func,
                 assignment.used_callee_saved.len(),
                 assignment.used_callee_saved_xmms.len(),
-                assignment.num_spills,
             )?;
-            spill_disps = x86_spill_slot_disps(&layout, assignment.num_spills);
+            spill_disps = x86_spill_slot_disps(&layout, &installed_spills)?;
             resolve_x86_stack_slots(&mut func, &layout)?;
             expand_x86_dynamic_stack_allocs(&mut func, &assignment.allocation)?;
             self.insert_prologue_epilogue(&mut func, &assignment, &layout);
@@ -15309,6 +20689,7 @@ impl X86Pipeline {
             block_offsets,
             _encoded_call_ranges,
             branch_fixups,
+            has_body_instructions,
         ) = self.encode_function_with_all_fixups_and_block_metadata(
             &func,
             &assignment.allocation,
@@ -15321,25 +20702,14 @@ impl X86Pipeline {
             let (mut spliced, counter_patch_sites, block_trampoline_starts) =
                 splice_x86_block_counter_trampolines(&func, &code, &block_offsets)?;
 
-            for branch in branch_fixups {
-                let shift = x86_block_shift_for_offset(
-                    &func.block_order,
-                    &block_offsets,
-                    code.len(),
-                    branch.disp32_offset,
-                )?;
-                let disp32_offset = branch.disp32_offset + shift;
-                let target = block_trampoline_starts
-                    .get(&branch.target)
-                    .copied()
-                    .ok_or_else(|| {
-                        X86PipelineError::ConstantPool(format!(
-                            "x86 block profiling: branch target {:?} missing trampoline start",
-                            branch.target
-                        ))
-                    })?;
-                patch_x86_rel32(&mut spliced, disp32_offset, target)?;
-            }
+            retarget_x86_block_profiling_branches(
+                &mut spliced,
+                &func.block_order,
+                &block_offsets,
+                code.len(),
+                &block_trampoline_starts,
+                branch_fixups,
+            )?;
 
             let mut shifted_call_fixups = Vec::with_capacity(call_fixups.len());
             for mut fixup in call_fixups {
@@ -15382,14 +20752,17 @@ impl X86Pipeline {
                     .copy_from_slice(&(rip_disp as i32).to_le_bytes());
             }
 
-            return Ok(X86JitBlockCounterFunction {
-                code: spliced,
-                const_pool: cp_bytes,
-                call_fixups: shifted_call_fixups,
-                global_ref_fixups: shifted_global_ref_fixups,
-                counter_patch_sites,
-                machine_code_evidence,
-            });
+            return Ok((
+                X86JitBlockCounterFunction {
+                    code: spliced,
+                    const_pool: cp_bytes,
+                    call_fixups: shifted_call_fixups,
+                    global_ref_fixups: shifted_global_ref_fixups,
+                    counter_patch_sites,
+                    machine_code_evidence,
+                },
+                has_body_instructions,
+            ));
         } else {
             Vec::new()
         };
@@ -15397,25 +20770,14 @@ impl X86Pipeline {
         let (mut spliced, counter_patch_sites, block_trampoline_starts) =
             splice_x86_block_counter_trampolines(&func, &code, &block_offsets)?;
 
-        for branch in branch_fixups {
-            let shift = x86_block_shift_for_offset(
-                &func.block_order,
-                &block_offsets,
-                code.len(),
-                branch.disp32_offset,
-            )?;
-            let disp32_offset = branch.disp32_offset + shift;
-            let target = block_trampoline_starts
-                .get(&branch.target)
-                .copied()
-                .ok_or_else(|| {
-                    X86PipelineError::ConstantPool(format!(
-                        "x86 block profiling: branch target {:?} missing trampoline start",
-                        branch.target
-                    ))
-                })?;
-            patch_x86_rel32(&mut spliced, disp32_offset, target)?;
-        }
+        retarget_x86_block_profiling_branches(
+            &mut spliced,
+            &func.block_order,
+            &block_offsets,
+            code.len(),
+            &block_trampoline_starts,
+            branch_fixups,
+        )?;
 
         let mut shifted_call_fixups = Vec::with_capacity(call_fixups.len());
         for mut fixup in call_fixups {
@@ -15441,14 +20803,17 @@ impl X86Pipeline {
             shifted_global_ref_fixups.push(fixup);
         }
 
-        Ok(X86JitBlockCounterFunction {
-            code: spliced,
-            const_pool: const_pool_data,
-            call_fixups: shifted_call_fixups,
-            global_ref_fixups: shifted_global_ref_fixups,
-            counter_patch_sites,
-            machine_code_evidence,
-        })
+        Ok((
+            X86JitBlockCounterFunction {
+                code: spliced,
+                const_pool: const_pool_data,
+                call_fixups: shifted_call_fixups,
+                global_ref_fixups: shifted_global_ref_fixups,
+                counter_patch_sites,
+                machine_code_evidence,
+            },
+            has_body_instructions,
+        ))
     }
 
     /// TV-5 Stage A wrapper around the post-fixup `MovRR` coalescer: capture
@@ -15470,6 +20835,44 @@ impl X86Pipeline {
         alloc: &HashMap<VReg, X86PReg>,
     ) -> Result<(), X86PipelineError> {
         if self.config.opt_level == trust_cg_opt::OptLevel::O0 || x86_movrr_coalesce_disabled() {
+            return Ok(());
+        }
+        // x86 is still in the WARN-only rollout phase of this check, exactly
+        // like AArch64's dataflow-integrity walk before `f0fa291e`
+        // ("perf(aarch64): skip default warn-only integrity walk"). Preserve
+        // the ordinary non-proof compile fast path for the same reason its
+        // comment gives: capture allocates and the evaluator walks the whole
+        // post-fixup stream, but a default Warn verdict CANNOT reject code —
+        // it only prints telemetry. Measured on this box: the warn stream is
+        // ~25 messages per generated program (6,298 across one 250-program
+        // fuzz run), and the walk shows up in a main-thread `sample` of an
+        // ordinary compile.
+        //
+        // An explicit `TCG_POST_RA_SPEC=warn|enforce` opts any build back in,
+        // so the corpus evidence needed to promote this to Enforce is still
+        // collectable on demand, and enforce mode is completely unaffected.
+        // Once the x86 corpus supports flipping the default, this branch goes
+        // away and every build runs the gate.
+        //
+        // Difference from the AArch64 precedent, stated because it matters:
+        // that one also kept the walk for proof-PRODUCING builds. This layer
+        // has no proof flag (certificates are decided at the bridge/compiler
+        // layer, not in `X86PipelineConfig`), so the condition here is mode +
+        // explicit opt-in only. That is sound for the same reason the skip is:
+        // a Warn verdict cannot reject code or alter a proof — it prints
+        // telemetry. Emitted machine code is byte-identical either way.
+        //
+        // The evidence boundary this leaves, stated in LIMITATIONS (x86-64 body
+        // theorem) and with ruling OD-225: at O1 and above this coalescer
+        // rewrites register copies AFTER the body theorem's subject (the
+        // pre-RA ISel stream) with no enforced check, and the rustc bridge
+        // cannot enable one (trustc refuses `TCG_*` variables, so
+        // `TCG_POST_RA_SPEC` never reaches it). No O1+ proof credit covers it.
+        let mode = trust_cg_verify::post_ra_captured_spec::post_ra_spec_mode();
+        if mode == trust_cg_verify::post_regalloc_recheck::PostRegallocRecheckMode::Warn
+            && crate::env_lock::var_os("TCG_POST_RA_SPEC").is_none()
+        {
+            let _ = coalesce_x86_redundant_movrr_copies(func, alloc);
             return Ok(());
         }
         let spec = trust_cg_verify::post_ra_captured_spec::capture_x86_post_fixup_spec(func);
@@ -15599,6 +21002,7 @@ impl X86Pipeline {
             Option<X86FrameMetadata>,
             Vec<X86ConstPoolRel32Fixup>,
             Option<X86EhData>,
+            bool,
         ),
         X86PipelineError,
     > {
@@ -15620,6 +21024,7 @@ impl X86Pipeline {
             Option<X86FrameMetadata>,
             Vec<X86ConstPoolRel32Fixup>,
             Option<X86EhData>,
+            bool,
         ),
         X86PipelineError,
     > {
@@ -15632,6 +21037,7 @@ impl X86Pipeline {
             const_pool_rel32_fixups,
             _machine_code_evidence,
             eh,
+            has_body_instructions,
         ) = self.compile_function_with_fixups_frame_and_evidence_after_x86_passes(func)?;
         Ok((
             code,
@@ -15641,6 +21047,7 @@ impl X86Pipeline {
             frame_metadata,
             const_pool_rel32_fixups,
             eh,
+            has_body_instructions,
         ))
     }
 
@@ -15654,6 +21061,7 @@ impl X86Pipeline {
             Vec<X86CallFixup>,
             Vec<X86GlobalRefFixup>,
             X86MachineCodeEvidence,
+            bool,
         ),
         X86PipelineError,
     > {
@@ -15671,6 +21079,7 @@ impl X86Pipeline {
             _const_pool_rel32_fixups,
             machine_code_evidence,
             _eh,
+            has_body_instructions,
         ) = self.compile_function_with_fixups_frame_and_evidence_after_x86_passes(func)?;
         Ok((
             code,
@@ -15678,6 +21087,7 @@ impl X86Pipeline {
             call_fixups,
             global_ref_fixups,
             machine_code_evidence,
+            has_body_instructions,
         ))
     }
 
@@ -15694,11 +21104,18 @@ impl X86Pipeline {
             Vec<X86ConstPoolRel32Fixup>,
             X86MachineCodeEvidence,
             Option<X86EhData>,
+            bool,
         ),
         X86PipelineError,
     > {
         validate_x86_function_layout(func)?;
-        reject_unwired_x86_eh_output(&self.config, func)?;
+        // The MODULE lane: this entry point is the per-function half of
+        // `assemble_module`. Its other caller
+        // (`compile_function_with_fixups_and_evidence_after_x86_passes`) refuses
+        // an EH sidecar outright through `reject_x86_eh_sidecar_drop` before
+        // reaching here, so no single-function API widens its EH surface via
+        // this lane.
+        reject_unwired_x86_eh_output(&self.config, func, X86EhEmissionLane::Module)?;
 
         // STEP-0 perf attribution (inert unless TCG_PERF_STATS is set): capture
         // the post-optimizer, PRE-regalloc instruction mix + the innermost-loop
@@ -15716,6 +21133,9 @@ impl X86Pipeline {
             None
         };
 
+        // DIAGNOSTIC only: the key the inert `TCG_TIME_X86FN` per-stage
+        // timers below attribute to. Cloned once, never read by any stage.
+        let fn_timing_name = func.name.clone();
         let mut func = func.clone();
         expand_x86_vector_bool_selects(&mut func, self.config.target_features)?;
         expand_x86_vector_mask_extracts(&mut func)?;
@@ -15744,28 +21164,46 @@ impl X86Pipeline {
         reject_unsupported_x86_isel(&func, self.config.target_features)?;
 
         // Phase 1: Register allocation (full greedy/linear-scan, or simplified).
-        let assignment = match self.config.regalloc_mode {
-            X86RegAllocMode::Simplified => {
-                X86RegAssignment::assign_with_abi(&func, self.config.call_abi)?
+        let assignment = crate::x86_64::backend_timing::timed("regalloc", &fn_timing_name, || {
+            match self.config.regalloc_mode {
+                X86RegAllocMode::Simplified => {
+                    X86RegAssignment::assign_with_abi(&func, self.config.call_abi)
+                }
+                X86RegAllocMode::Full(strategy) => self.run_full_regalloc(&mut func, strategy),
             }
-            X86RegAllocMode::Full(strategy) => self.run_full_regalloc(&mut func, strategy)?,
-        };
+        })?;
 
         // Phase 1b: Resolve the formal-argument parallel copy (#497, #499).
         // Must run BEFORE fixup_two_address so the latter sees correct PRegs.
         let installed_spills = install_x86_spill_slots(&mut func, &assignment.spill_plan);
-        fixup_formal_arg_parallel_copy(
-            &mut func,
-            &assignment.allocation,
-            &installed_spills,
-            self.config.call_abi,
-        )?;
+        crate::x86_64::backend_timing::timed("formal_arg_fixup", &fn_timing_name, || {
+            fixup_formal_arg_parallel_copy(
+                &mut func,
+                &assignment.allocation,
+                &installed_spills,
+                self.config.call_abi,
+            )
+        })?;
         let perf_spill_evidence =
-            materialize_x86_spills(&mut func, &installed_spills, self.config.call_abi)?;
+            crate::x86_64::backend_timing::timed("materialize_spills", &fn_timing_name, || {
+                materialize_x86_spills(&mut func, &installed_spills, self.config.call_abi)
+            })?;
 
         // Phase 2: Two-address fixup — insert MOV copies for dst != lhs.
         let perf_two_addr_copies =
-            fixup_two_address(&mut func, &assignment.allocation, self.config.call_abi)?;
+            crate::x86_64::backend_timing::timed("two_address_fixup", &fn_timing_name, || {
+                fixup_two_address(&mut func, &assignment.allocation, self.config.call_abi)
+            })?;
+
+        // Phase 2a-: post-RA redundant spill-reload elision. Placed HERE
+        // deliberately: AFTER `fixup_two_address`, the last stage that INSERTS
+        // instructions, so nothing can appear between a reload and its consumer
+        // afterwards; and BEFORE the `MovRR` coalescer, so a reload this turns
+        // into a register copy is still offered to the pass that can delete it.
+        // `elide_redundant_x86_spill_reloads` carries the whole soundness
+        // argument: TV-5 does not police spill-slot or memory dataflow.
+        let _reload_elide =
+            elide_redundant_x86_spill_reloads(&mut func, &installed_spills, &assignment.allocation);
 
         // Phase 2b: post-fixup redundant-`MovRR` coalescing (runtime perf). This
         // is the object-emission path used by the rustc backend. Soundness is the
@@ -15773,7 +21211,17 @@ impl X86Pipeline {
         // fail-closes tied-site/bridge corruption and the Stage A captured-spec
         // check inside this wrapper covers non-tied register value flow
         // (WARN-only rollout).
-        self.run_x86_movrr_coalesce_with_captured_spec(&mut func, &assignment.allocation)?;
+        crate::x86_64::backend_timing::timed("movrr_coalesce", &fn_timing_name, || {
+            self.run_x86_movrr_coalesce_with_captured_spec(&mut func, &assignment.allocation)
+        })?;
+
+        // Loop-latch duplication into diamond arms (OPT-IN `x86-latch-dup`). See
+        // `trust_cg_opt::x86_latch_dup`. THIS is the object-emission path the
+        // rustc backend uses, which is the whole reason the call is here as well
+        // as on the two other post-RA sequences: placed only on those, the pass
+        // traced NOTHING through the real driver, because neither of them is the
+        // path a `-Zcodegen-backend` compilation takes.
+        let _latch_dup = trust_cg_opt::x86_latch_dup::run_on_function(&mut func);
 
         prepare_x86_windows_fixed_outgoing_frame(&self.config, &mut func);
         reject_windows_coff_without_unwind_metadata(&self.config, &func, &assignment)?;
@@ -15787,7 +21235,6 @@ impl X86Pipeline {
                 &func,
                 assignment.used_callee_saved.len(),
                 assignment.used_callee_saved_xmms.len(),
-                assignment.num_spills,
             )?;
             frame_metadata = Some(X86FrameMetadata {
                 callee_saved: assignment.used_callee_saved.clone(),
@@ -15796,10 +21243,13 @@ impl X86Pipeline {
                 frame_size: layout.frame_size,
                 has_dynamic_alloc: layout.has_dynamic_alloc,
             });
-            spill_disps = x86_spill_slot_disps(&layout, assignment.num_spills);
-            resolve_x86_stack_slots(&mut func, &layout)?;
-            expand_x86_dynamic_stack_allocs(&mut func, &assignment.allocation)?;
-            self.insert_prologue_epilogue(&mut func, &assignment, &layout);
+            spill_disps = x86_spill_slot_disps(&layout, &installed_spills)?;
+            crate::x86_64::backend_timing::timed("frame_lowering", &fn_timing_name, || {
+                resolve_x86_stack_slots(&mut func, &layout)?;
+                expand_x86_dynamic_stack_allocs(&mut func, &assignment.allocation)?;
+                self.insert_prologue_epilogue(&mut func, &assignment, &layout);
+                Ok::<(), X86PipelineError>(())
+            })?;
         } else if function_has_x86_stack_slot_operands(&func)
             || function_has_x86_dynamic_stack_alloc_pseudos(&func)
         {
@@ -15816,10 +21266,14 @@ impl X86Pipeline {
         // TV-4/TV-5: post-regalloc re-verification of the FINAL post-fixup
         // stream (structural + register dataflow), immediately before encoding
         // (default-ON, fail-closed).
-        self.recheck_post_regalloc(&func, &assignment.allocation, &spill_disps)?;
+        crate::x86_64::backend_timing::timed("recheck_post_regalloc", &fn_timing_name, || {
+            self.recheck_post_regalloc(&func, &assignment.allocation, &spill_disps)
+        })?;
 
         let machine_code_evidence =
-            collect_x86_machine_code_evidence(&func, self.config.target_features);
+            crate::x86_64::backend_timing::timed("machine_code_evidence", &fn_timing_name, || {
+                collect_x86_machine_code_evidence(&func, self.config.target_features)
+            });
 
         // Phase 5: Encode all instructions (track constant pool + call fixups).
         let (
@@ -15830,11 +21284,14 @@ impl X86Pipeline {
             block_offsets,
             encoded_call_ranges,
             branch_fixups,
-        ) = self.encode_function_with_all_fixups_and_block_metadata(
-            &func,
-            &assignment.allocation,
-            &branch_targets,
-        )?;
+            has_body_instructions,
+        ) = crate::x86_64::backend_timing::timed("encode", &fn_timing_name, || {
+            self.encode_function_with_all_fixups_and_block_metadata(
+                &func,
+                &assignment.allocation,
+                &branch_targets,
+            )
+        })?;
         patch_x86_branch_fixups_to_block_offsets(&mut code, &block_offsets, branch_fixups)?;
 
         // EH Lane 2: resolve the function's exception-handling structure against
@@ -15951,6 +21408,7 @@ impl X86Pipeline {
             const_pool_rel32_fixups,
             machine_code_evidence,
             eh,
+            has_body_instructions,
         ))
     }
 
@@ -16047,24 +21505,26 @@ impl X86Pipeline {
         // SECTION-BASED compact-unwind `X86_64_RELOC_UNSIGNED` per
         // frame-covered function plus the single zPLR personality
         // `X86_64_RELOC_GOT` — is now ENUMERATED by
-        // `x86_object_relocation_inventory_rows` (mirroring
+        // `x86_object_relocation_inventory_rows_into` (mirroring
         // `emit_module_macho`'s exact emission conditions), so a `panic=unwind`
         // Mach-O module produces a complete report instead of failing closed.
         // Only the Mach-O emitter can serialize the LSDA/FDE sidecar
         // (`emit_assembled_module` refuses every other format), so a non-Mach-O
         // EH assembly still refuses here rather than returning a report for an
         // object that can never be emitted.
-        if assembled.effective_format != X86OutputFormat::MachO
-            && let Some(func) = assembled.encoded.iter().find(|func| func.eh.is_some())
+        if !matches!(
+            assembled.effective_format,
+            X86OutputFormat::MachO | X86OutputFormat::Elf
+        ) && let Some(func) = assembled.encoded.iter().find(|func| func.eh.is_some())
         {
             return Err(X86PipelineError::EhOutputUnsupported {
                 function: func.name.clone(),
                 format: assembled.effective_format,
-                reason: "the carried assembly contains an LSDA/FDE sidecar, but only the Mach-O emitter can serialize it; refusing to inventory an object that cannot be emitted (fail-closed)"
+                reason: "the carried assembly contains an LSDA/FDE sidecar, but only the Mach-O and ELF module emitters can serialize it; refusing to inventory an object that cannot be emitted (fail-closed)"
                     .to_string(),
             });
         }
-        let emitted = self.x86_object_relocation_inventory_rows(
+        let (emitted, exception_table_rows) = self.x86_object_relocation_inventory_rows_marked(
             &assembled.encoded,
             &assembled.combined_rdata,
             assembled.effective_format,
@@ -16123,13 +21583,69 @@ impl X86Pipeline {
                 trust_cg_verify::ObjectProofBinding::Unbound,
             ),
         };
-        Ok(
+        let mut report =
             trust_cg_verify::ObjectRelocationInventoryReport::from_emitted_kinds_with_registry_and_binding(
                 object_name,
                 emitted,
                 &registry,
                 binding,
-            ),
+            );
+        // The exception-table rows (zPLR CIE personality, FDE pc-begin and
+        // LSDA pointers, the `DW.ref` slot, Mach-O compact-unwind entries of
+        // an EH module) point into tables with no proof obligation: the same
+        // rule as the AArch64 inventory, so no report of an object with
+        // exception tables is promotable.
+        crate::pipeline::mark_exception_table_entries_unverified(&mut report, exception_table_rows);
+        Ok(report)
+    }
+
+    /// [`Self::x86_object_relocation_inventory_rows_into`] plus the index range of
+    /// the rows the exception-handling surface adds (Mach-O: the
+    /// compact-unwind entries and the CIE personality GOT row of a module
+    /// with zPLR tables; ELF: the CIE personality, every FDE's pc-begin and
+    /// LSDA, and the `DW.ref` slot row). Empty without exception tables.
+    #[cfg(feature = "verify")]
+    fn x86_object_relocation_inventory_rows_marked(
+        &self,
+        encoded: &[X86EncodedFunc],
+        combined_rdata: &[u8],
+        effective_format: X86OutputFormat,
+        globals: &[crate::pipeline::ObjectGlobal],
+    ) -> Result<
+        (
+            Vec<trust_cg_verify::ObjectRelocationKind>,
+            std::ops::Range<usize>,
+        ),
+        X86PipelineError,
+    > {
+        let mut exception_table_rows = 0..0;
+        let emitted = self.x86_object_relocation_inventory_rows_into(
+            encoded,
+            combined_rdata,
+            effective_format,
+            globals,
+            &mut exception_table_rows,
+        )?;
+        Ok((emitted, exception_table_rows))
+    }
+
+    /// [`Self::x86_object_relocation_inventory_rows_into`] without the
+    /// exception-table range, for tests.
+    #[cfg(all(test, feature = "verify"))]
+    fn x86_object_relocation_inventory_rows(
+        &self,
+        encoded: &[X86EncodedFunc],
+        combined_rdata: &[u8],
+        effective_format: X86OutputFormat,
+        globals: &[crate::pipeline::ObjectGlobal],
+    ) -> Result<Vec<trust_cg_verify::ObjectRelocationKind>, X86PipelineError> {
+        let mut exception_table_rows = 0..0;
+        self.x86_object_relocation_inventory_rows_into(
+            encoded,
+            combined_rdata,
+            effective_format,
+            globals,
+            &mut exception_table_rows,
         )
     }
 
@@ -16171,13 +21687,17 @@ impl X86Pipeline {
     ///   zero relocations for them (ld64's x86-64 `__eh_frame` reader does not
     ///   consume subtractor pairs); the pair belongs to the non-EH zR path
     ///   ONLY. The LSDA section itself carries zero relocations.
+    ///
+    /// `exception_table_rows` receives the index range of the rows the
+    /// exception-handling surface adds (pushed contiguously).
     #[cfg(feature = "verify")]
-    fn x86_object_relocation_inventory_rows(
+    fn x86_object_relocation_inventory_rows_into(
         &self,
         encoded: &[X86EncodedFunc],
         combined_rdata: &[u8],
         effective_format: X86OutputFormat,
         globals: &[crate::pipeline::ObjectGlobal],
+        exception_table_rows: &mut std::ops::Range<usize>,
     ) -> Result<Vec<trust_cg_verify::ObjectRelocationKind>, X86PipelineError> {
         use trust_cg_verify::ObjectRelocationKind;
 
@@ -16197,9 +21717,8 @@ impl X86Pipeline {
                 // trigger so predicted == emitted, including the cross-object
                 // `panic=unwind` case where a frame-covered object with NO local
                 // EH function still emits full walkable FDE coverage.
-                let module_emits_eh_frame = encoded.iter().any(|ef| ef.eh.is_some())
-                    || (self.config.panic_unwind
-                        && encoded.iter().any(|ef| ef.frame_metadata.is_some()));
+                let module_emits_eh_frame =
+                    x86_module_emits_eh_frame(self.config.panic_unwind, encoded);
                 if module_emits_eh_frame {
                     // Mirror emission's fail-closed: an EH function without
                     // frame metadata cannot get an FDE/LSDA, so the module
@@ -16208,12 +21727,13 @@ impl X86Pipeline {
                         .iter()
                         .find(|ef| ef.eh.is_some() && ef.frame_metadata.is_none())
                     {
-                        return Err(X86PipelineError::FrameLowering(format!(
+                        return Err(X86PipelineError::Unwind(format!(
                             "x86-64 Mach-O: EH function `{}` has no frame metadata; \
                              cannot emit its FDE/LSDA",
                             ef.name
                         )));
                     }
+                    let first_exception_table_row = emitted.len();
                     // (a) `__LD,__compact_unwind`: one SECTION-BASED
                     // (r_extern=0, `__text`) UNSIGNED per 32-byte entry — one
                     // entry per function with frame metadata (the filler pass
@@ -16229,6 +21749,7 @@ impl X86Pipeline {
                     // CIE personality pointer. The FDE PC-begin/LSDA pointers
                     // are baked self-relative (zero relocations).
                     emitted.push(ObjectRelocationKind::X86_64MachOGot);
+                    *exception_table_rows = first_exception_table_row..emitted.len();
                 }
                 for global in globals {
                     emitted.extend(
@@ -16254,6 +21775,9 @@ impl X86Pipeline {
                     }
                     for gf in &ef.global_ref_fixups {
                         match gf.kind {
+                            X86SymbolRefFixupKind::ExactFunctionAddr => {
+                                return Err(reject_exact_x86_object_address(&ef.name, &gf.symbol));
+                            }
                             X86SymbolRefFixupKind::GlobalRef => {
                                 if !defined.contains(gf.symbol.as_str()) {
                                     return Err(X86PipelineError::GlobalRefUnsupported {
@@ -16282,11 +21806,33 @@ impl X86Pipeline {
                 }
             }
             X86OutputFormat::Elf => {
+                reject_x86_elf_calls_to_object_globals(encoded, globals)?;
                 let defined: std::collections::BTreeSet<_> = encoded
                     .iter()
                     .map(|ef| ef.name.as_str())
                     .chain(globals.iter().map(|g| g.name.as_str()))
                     .collect();
+                // EH surface predictor, ELF lane. `plan_x86_64_elf_module_unwind`
+                // is the SAME function `emit_module_elf` plans with (trigger
+                // predicate, fail-closed refusals and per-function FDE list
+                // included), so predicted == emitted by construction rather than
+                // by a mirrored copy of the predicate.
+                let unwind = plan_x86_64_elf_module_unwind(&self.config, encoded)?;
+                if let Some(plan) = unwind.as_ref() {
+                    let first_exception_table_row = emitted.len();
+                    // `.rela.eh_frame`: one PC32 for the zPLR CIE personality
+                    // (the `DW.ref.<personality>` slot), then pc-begin + LSDA
+                    // PC32 per FDE.
+                    emitted.push(ObjectRelocationKind::X86_64ElfPc32);
+                    for _ in &plan.fdes {
+                        emitted.push(ObjectRelocationKind::X86_64ElfPc32);
+                        emitted.push(ObjectRelocationKind::X86_64ElfPc32);
+                    }
+                    // The slot's own 8-byte cell holds the personality's
+                    // absolute address.
+                    emitted.push(ObjectRelocationKind::X86_64ElfAbs64);
+                    *exception_table_rows = first_exception_table_row..emitted.len();
+                }
                 for global in globals {
                     emitted.extend(
                         global
@@ -16296,15 +21842,22 @@ impl X86Pipeline {
                     );
                 }
                 for ef in encoded {
-                    if ef
-                        .frame_metadata
-                        .as_ref()
-                        .is_some_and(|m| m.has_dynamic_alloc)
+                    // The backtrace-only zR FDE's pc-begin. On the EH lane that
+                    // emitter does not run at all (its FDEs are the zPLR ones
+                    // counted above), so this row must not be double-counted.
+                    if unwind.is_none()
+                        && ef
+                            .frame_metadata
+                            .as_ref()
+                            .is_some_and(|m| m.has_dynamic_alloc)
                     {
                         emitted.push(ObjectRelocationKind::X86_64ElfPc32);
                     }
                     for gf in &ef.global_ref_fixups {
                         match gf.kind {
+                            X86SymbolRefFixupKind::ExactFunctionAddr => {
+                                return Err(reject_exact_x86_object_address(&ef.name, &gf.symbol));
+                            }
                             X86SymbolRefFixupKind::GlobalRef => {
                                 if !defined.contains(gf.symbol.as_str()) {
                                     return Err(X86PipelineError::GlobalRefUnsupported {
@@ -16356,7 +21909,7 @@ impl X86Pipeline {
                 }
                 for ef in encoded {
                     if !ef.const_pool_rel32_fixups.is_empty() && combined_rdata.is_empty() {
-                        return Err(X86PipelineError::ConstantPool(
+                        return Err(X86PipelineError::ObjectEmission(
                             "module x86-64 COFF has .text constant-pool relocations but no .rdata"
                                 .to_string(),
                         ));
@@ -16376,6 +21929,9 @@ impl X86Pipeline {
                         emitted.push(ObjectRelocationKind::X86_64CoffRel32);
                     }
                     for gf in &ef.global_ref_fixups {
+                        if gf.kind == X86SymbolRefFixupKind::ExactFunctionAddr {
+                            return Err(reject_exact_x86_object_address(&ef.name, &gf.symbol));
+                        }
                         if gf.kind == X86SymbolRefFixupKind::GlobalRef
                             && !defined.contains(gf.symbol.as_str())
                         {
@@ -16409,7 +21965,7 @@ impl X86Pipeline {
                             )?;
                             xdata_offset =
                                 xdata_offset.checked_add(unwind_info_len).ok_or_else(|| {
-                                    X86PipelineError::FrameLowering(
+                                    X86PipelineError::Unwind(
                                         "COFF unwind .xdata size overflow".to_string(),
                                     )
                                 })?;
@@ -16436,7 +21992,8 @@ impl X86Pipeline {
     /// produced by `compile_function_with_fixups_and_frame*`, a pure function of
     /// `(&self, func)` (register allocation + frame lowering + byte encoding)
     /// with no shared mutable output state. When `parallel` is set and there are
-    /// enough functions to justify the pool ([`worker_count_for_items`]), the
+    /// enough functions to justify the pool
+    /// (`resource_limits::x86_encode_worker_count_for_items`), the
     /// encodes fan out across a bounded rayon pool; otherwise they run serially.
     ///
     /// DETERMINISM: `par_iter().map().collect::<Result<Vec<_>>>()` is an indexed
@@ -16460,33 +22017,42 @@ impl X86Pipeline {
             Option<X86FrameMetadata>,
             Vec<X86ConstPoolRel32Fixup>,
             Option<X86EhData>,
+            bool,
         )>,
         X86PipelineError,
     > {
         let encode_one = |func: &X86ISelFunction| {
             #[cfg(test)]
             record_test_x86_function_backend_invocation();
-            if run_x86_passes {
-                self.compile_function_with_fixups_and_frame(func)
-            } else {
-                self.compile_function_with_fixups_and_frame_after_x86_passes(func)
-            }
+            crate::x86_64::backend_timing::timed("fn_total", &func.name, || {
+                if run_x86_passes {
+                    self.compile_function_with_fixups_and_frame(func)
+                } else {
+                    self.compile_function_with_fixups_and_frame_after_x86_passes(func)
+                }
+            })
         };
 
         let pool = if parallel {
-            crate::resource_limits::worker_count_for_items(functions.len())
+            crate::resource_limits::x86_encode_worker_count_for_items(functions.len())
+                .map_err(X86PipelineError::ResourceBudget)?
                 .map(crate::resource_limits::build_rayon_pool)
                 .transpose()
-                .map_err(|err| {
-                    X86PipelineError::RegAlloc(format!("parallel worker pool error: {err}"))
-                })?
+                .map_err(X86PipelineError::WorkerPool)?
         } else {
             None
         };
 
         if let Some(pool) = pool.as_ref() {
             use rayon::prelude::*;
-            pool.install(|| functions.par_iter().map(&encode_one).collect())
+            let encoding_environment =
+                trust_cg_process_env::EnvOverrideSnapshot::capture_current_thread();
+            pool.install(|| {
+                functions
+                    .par_iter()
+                    .map(|func| encoding_environment.run(|| encode_one(func)))
+                    .collect()
+            })
         } else {
             functions.iter().map(&encode_one).collect()
         }
@@ -16559,6 +22125,7 @@ impl X86Pipeline {
                 frame_metadata,
                 const_pool_rel32_fixups,
                 eh,
+                has_body_instructions,
             ),
         ) in functions.iter().zip(per_func)
         {
@@ -16576,7 +22143,7 @@ impl X86Pipeline {
             // output, not as a claim that arbitrary raw-byte placement is aligned.
             // The kill switch returns both this padding and object-section
             // alignment to the 16-byte convention.
-            if x86_jcc_align_enabled() {
+            if x86_jcc_align_enabled() || x86_loop_head_align_enabled() {
                 let alignment = 1 << x86_text_align_log2();
                 align_code_vec_with_nops(&mut combined_code, alignment);
                 // Preserve the old RawBytes metrics layout independently of
@@ -16603,6 +22170,7 @@ impl X86Pipeline {
             }
 
             encoded.push(X86EncodedFunc {
+                has_body_instructions,
                 name: func.name.clone(),
                 code_len,
                 const_pool_len: const_pool.len(),
@@ -16620,6 +22188,41 @@ impl X86Pipeline {
             effective_format == X86OutputFormat::Coff || raw_code_size == combined_code.len(),
             "non-COFF native assembly must match the RawBytes metric layout"
         );
+
+        // A publicly constructible machine flag is never authority by itself.
+        // Even after compiler-level replay, the relocation funnel independently
+        // requires every exact-module reference to name one emitted function. This
+        // prevents all object formats from quietly manufacturing an undefined
+        // external when an exact target is absent.
+        let mut defined_functions: HashMap<&str, (usize, bool)> =
+            HashMap::with_capacity(encoded.len());
+        for function in &encoded {
+            let entry = defined_functions.entry(function.name.as_str()).or_default();
+            entry.0 += 1;
+            entry.1 = function.has_body_instructions;
+        }
+        for caller in &encoded {
+            for fixup in &caller.call_fixups {
+                if fixup.exact_module
+                    && defined_functions.get(fixup.callee.as_str()) != Some(&(1, true))
+                {
+                    return Err(X86PipelineError::ObjectEmission(format!(
+                        "exact module call from `{}` targets missing, ambiguous, or empty compiled function `{}`",
+                        caller.name, fixup.callee
+                    )));
+                }
+            }
+            for fixup in &caller.global_ref_fixups {
+                if fixup.kind == X86SymbolRefFixupKind::ExactFunctionAddr
+                    && defined_functions.get(fixup.symbol.as_str()) != Some(&(1, true))
+                {
+                    return Err(X86PipelineError::ObjectEmission(format!(
+                        "exact function address from `{}` targets missing, ambiguous, or empty compiled function `{}`",
+                        caller.name, fixup.symbol
+                    )));
+                }
+            }
+        }
 
         Ok(X86AssembledModule {
             encoded,
@@ -16644,6 +22247,25 @@ impl X86Pipeline {
         assembled: X86AssembledModule,
         globals: &[crate::pipeline::ObjectGlobal],
     ) -> Result<Vec<u8>, X86PipelineError> {
+        self.emit_assembled_module_with_function_symbols(
+            assembled,
+            globals,
+            &X86FunctionSymbolFacts::default(),
+        )
+    }
+
+    /// [`Self::emit_assembled_module`] with the trust-ir module's
+    /// function-symbol facts ([`X86FunctionSymbolFacts`]): the Mach-O
+    /// emitter writes a hidden definition as a private extern; every other
+    /// format refuses one. A fact about a function the assembly does not
+    /// define is refused on every format.
+    pub(crate) fn emit_assembled_module_with_function_symbols(
+        &self,
+        assembled: X86AssembledModule,
+        globals: &[crate::pipeline::ObjectGlobal],
+        function_symbols: &X86FunctionSymbolFacts,
+    ) -> Result<Vec<u8>, X86PipelineError> {
+        reject_x86_explicit_section_globals(globals)?;
         let X86AssembledModule {
             encoded,
             combined_code,
@@ -16651,18 +22273,90 @@ impl X86Pipeline {
             raw_code_size: _,
             effective_format,
         } = assembled;
+        function_symbols.check_against(
+            &encoded,
+            effective_format,
+            &self.config.weak_function_definitions,
+        )?;
+        refuse_x86_coff_weak_definitions(
+            &encoded,
+            effective_format,
+            &self.config.weak_function_definitions,
+        )?;
         if encoded.is_empty() {
             // Mirror `compile_module_impl`'s empty-module backstop (an empty
             // module emits an empty object, not a bare object wrapper).
             return Ok(Vec::new());
         }
-        if effective_format != X86OutputFormat::MachO
-            && let Some(eh_func) = encoded.iter().find(|func| func.eh.is_some())
+        // No x86-64 writer spells a weak undefined reference; an import is
+        // otherwise emitted as a strong undefined symbol, which would silently
+        // replace `ExternalWeak`'s null-on-missing meaning.
+        if let Some(global) = globals
+            .iter()
+            .find(|global| global.is_import && global.is_weak)
+        {
+            return Err(X86PipelineError::WeakUndefinedReferenceUnsupported {
+                symbol: global.name.clone(),
+                format: effective_format,
+            });
+        }
+        // Nor visibility on an undefined symbol: a hidden or protected import
+        // emitted default-visible would bind to another image.
+        if let Some(global) = globals
+            .iter()
+            .find(|global| global.is_import && global.visibility != trust_ir::Visibility::Default)
+        {
+            return Err(X86PipelineError::ImportVisibilityUnsupported {
+                symbol: global.name.clone(),
+                visibility: global.visibility,
+                format: effective_format,
+            });
+        }
+        // An import marked retained (LLVM's `@llvm.used` lists the
+        // declaration) is written as llc writes it only on ELF, where llc
+        // writes nothing for the flag. llc's Mach-O writer gives it an
+        // `N_NO_DEAD_STRIP` undefined symbol and its COFF writer a
+        // `/INCLUDE:` linker directive (`.drectve`), even when nothing
+        // references it; neither writer here spells its format's form
+        // (`crate::pipeline::ObjectGlobal::retained`).
+        if effective_format != X86OutputFormat::Elf
+            && let Some(global) = globals
+                .iter()
+                .find(|global| global.is_import && global.retained)
+        {
+            let llc_form = match effective_format {
+                X86OutputFormat::MachO => "llc's Mach-O writer gives it an `N_NO_DEAD_STRIP` \
+                                           undefined symbol, referenced or not, which the \
+                                           x86-64 Mach-O emitter does not write"
+                    .to_string(),
+                X86OutputFormat::Coff => format!(
+                    "llc's COFF writer gives it a `/INCLUDE:{}` linker directive (`.drectve`), \
+                     referenced or not, which the x86-64 COFF emitter does not write",
+                    global.name
+                ),
+                X86OutputFormat::RawBytes | X86OutputFormat::Elf => {
+                    "raw machine code has no symbol table to state it in".to_string()
+                }
+            };
+            return Err(X86PipelineError::GlobalRefUnsupported {
+                function: String::new(),
+                symbol: global.name.clone(),
+                reason: format!(
+                    "the import is marked retained (LLVM's `@llvm.used` lists the declaration); \
+                     only the ELF emitter admits one, writing nothing for the flag as llc's ELF \
+                     writer does, while {llc_form} (fail-closed)"
+                ),
+            });
+        }
+        if !matches!(
+            effective_format,
+            X86OutputFormat::MachO | X86OutputFormat::Elf
+        ) && let Some(eh_func) = encoded.iter().find(|func| func.eh.is_some())
         {
             return Err(X86PipelineError::EhOutputUnsupported {
                 function: eh_func.name.clone(),
                 format: effective_format,
-                reason: "the carried assembly contains an LSDA/FDE sidecar, but only the Mach-O emitter can serialize it; refusing to discard it at the final emission boundary (fail-closed)"
+                reason: "the carried assembly contains an LSDA/FDE sidecar, but only the Mach-O and ELF module emitters can serialize it; refusing to discard it at the final emission boundary (fail-closed)"
                     .to_string(),
             });
         }
@@ -16677,20 +22371,33 @@ impl X86Pipeline {
                 // MachO / ELF / COFF paths below.
                 Ok(combined_code)
             }
-            X86OutputFormat::MachO => self.emit_module_macho(&encoded, &combined_code, globals),
-            X86OutputFormat::Elf => self.emit_module_elf(&encoded, &combined_code, globals),
-            X86OutputFormat::Coff => {
-                self.emit_module_coff(&encoded, &combined_code, &combined_rdata, globals)
+            X86OutputFormat::MachO => {
+                self.emit_module_macho(&encoded, &combined_code, globals, function_symbols)
             }
+            X86OutputFormat::Elf => {
+                self.emit_module_elf(&encoded, &combined_code, globals, function_symbols)
+            }
+            X86OutputFormat::Coff => self.emit_module_coff(
+                &encoded,
+                &combined_code,
+                &combined_rdata,
+                globals,
+                function_symbols,
+            ),
         }
     }
 
     /// Emit a multi-function Mach-O object with x86-64 CALL relocations (#464).
+    ///
+    /// Every function definition is a global (`N_EXT`) symbol, except one
+    /// `function_symbols` names hidden, a private extern (`N_EXT | N_PEXT`),
+    /// or local, a non-external `N_SECT` symbol.
     fn emit_module_macho(
         &self,
         encoded: &[X86EncodedFunc],
         combined_code: &[u8],
         globals: &[crate::pipeline::ObjectGlobal],
+        function_symbols: &X86FunctionSymbolFacts,
     ) -> Result<Vec<u8>, X86PipelineError> {
         use crate::macho::constants::S_REGULAR;
         use crate::macho::x86_64_reloc::X86_64Relocation;
@@ -16732,9 +22439,8 @@ impl X86Pipeline {
         // trigger Lane 5 for EVERY frame-covered object even with zero local EH,
         // giving each frame-covered function the all-filler walkable FDE. The
         // trigger predicate is shared VERBATIM with the relocation inventory
-        // (`x86_object_relocation_inventory_rows`) so predicted == emitted.
-        let module_emits_eh_frame = encoded.iter().any(|ef| ef.eh.is_some())
-            || (self.config.panic_unwind && encoded.iter().any(|ef| ef.frame_metadata.is_some()));
+        // (`x86_object_relocation_inventory_rows_into`) so predicted == emitted.
+        let module_emits_eh_frame = x86_module_emits_eh_frame(self.config.panic_unwind, encoded);
         let encoded_storage: Vec<X86EncodedFunc>;
         let encoded: &[X86EncodedFunc] = if module_emits_eh_frame {
             // A pass-through-only object has no local personality; every filler
@@ -16750,14 +22456,14 @@ impl X86Pipeline {
                 });
             let mut with_filler = encoded.to_vec();
             for ef in &mut with_filler {
-                if ef.eh.is_none() && ef.frame_metadata.is_some() {
+                if x86_macho_gets_filler_lsda(ef) {
                     let resolved = ResolvedX86Eh {
                         landing_pads: Vec::new(),
                         call_site_ranges: vec![(0, ef.code_len, 0)],
                     };
                     let lsda_bytes =
                         generate_x86_lsda(&resolved, &personality).map_err(|error| {
-                            X86PipelineError::MalformedFunction {
+                            X86PipelineError::MalformedEh {
                                 function: ef.name.clone(),
                                 detail: format!(
                                     "invalid synthetic filler exception table: {error}"
@@ -16777,20 +22483,69 @@ impl X86Pipeline {
         };
 
         let mut writer = MachOWriter::for_target(MachOTarget::X86_64);
+        writer.set_build_version(self.config.macho_build_version);
         writer.add_text_section_with_align(combined_code, x86_text_align_log2());
 
-        // Build symbol table: one global symbol per function at its text offset.
+        // Build symbol table: one external symbol per function at its text
+        // offset, a weak definition (`N_WEAK_DEF`) for a `Weak`/`LinkOnce`
+        // (or ODR) function (`X86PipelineConfig::weak_function_definitions`).
         // Mach-O convention: prefix external symbol names with '_'.
         //
-        // symbol_map maps both the unmangled and mangled names to the symbol
-        // table index, so call-site fixups can resolve by either spelling.
-        let mut symbol_map: std::collections::HashMap<String, crate::macho::writer::SymbolId> =
-            std::collections::HashMap::new();
+        // The ONLY place a function's binding is honoured on the x86-64
+        // Mach-O path: a module-local (`Internal`/`Private`) definition
+        // (a `FunctionSymbolLinkage::Local` fact of `function_symbols`) is a
+        // non-external `N_SECT` symbol, so no other object's reference or
+        // weak definition binds to it; a hidden definition keeps `N_EXT`
+        // and adds `N_PEXT` (private extern), so the objects of one static
+        // link resolve it while the final link demotes it to a local; every
+        // other definition is a plain global. The writer orders the nlist
+        // table (locals, then external definitions — private externs among
+        // them — then undefined) itself.
+        //
+        // `symbol_map` is keyed by nlist name ONLY (`MachOX86SymbolMap`): a
+        // trust-ir name `x` is always looked up as `_x`, so a reference spelled
+        // `_x` (nlist `__x`) can never bind to the definition of `x` (nlist
+        // `_x`), and two definitions whose nlist names coincide are refused.
+        let mut symbol_map = MachOX86SymbolMap::default();
+        let is_local_function = |name: &str| {
+            function_symbols.binding_of(name).linkage()
+                == crate::pipeline::FunctionSymbolLinkage::Local
+        };
         for ef in encoded {
-            let mangled = format!("_{}", ef.name);
-            let symbol_id = writer.add_symbol(&mangled, 1, ef.text_offset, true)?;
-            symbol_map.insert(ef.name.clone(), symbol_id);
-            symbol_map.insert(mangled, symbol_id);
+            let mangled = macho_x86_64_symbol_name(&ef.name);
+            let symbol_id = if is_local_function(&ef.name) {
+                writer.add_symbol(&mangled, 1, ef.text_offset, false)?
+            } else if function_symbols.is_hidden_definition(&ef.name) {
+                writer.add_private_extern_symbol(&mangled, 1, ef.text_offset)?
+            } else if self.config.weak_function_definitions.contains(&ef.name) {
+                writer.add_weak_symbol(&mangled, 1, ef.text_offset, true)?
+            } else {
+                writer.add_symbol(&mangled, 1, ef.text_offset, true)?
+            };
+            symbol_map.define(mangled, symbol_id, &ef.name, "function")?;
+        }
+        // The `__eh_frame` CIE reaches the personality through an
+        // `X86_64_RELOC_GOT` against its symbol, which this emitter has
+        // measured only against an external one (an undefined import, or a
+        // global definition). A module-local personality would make that
+        // relocation name a non-external symbol: refused by name.
+        if module_emits_eh_frame
+            && let Some(ef) = encoded.iter().find(|ef| {
+                ef.eh
+                    .as_ref()
+                    .is_some_and(|eh| is_local_function(&eh.personality))
+            })
+        {
+            return Err(X86PipelineError::EhOutputUnsupported {
+                function: ef.name.clone(),
+                format: X86OutputFormat::MachO,
+                reason: format!(
+                    "its personality `{}` is a module-local function, which the Mach-O module \
+                     emitter binds non-external, and the `__eh_frame` personality GOT \
+                     relocation against a non-external symbol is not measured (fail-closed)",
+                    ef.eh.as_ref().map_or("", |eh| eh.personality.as_str())
+                ),
+            });
         }
 
         // EH Lane 2 Step 3: emit the `__gcc_except_tab` (LSDA) section + its
@@ -16810,13 +22565,13 @@ impl X86Pipeline {
         // symbol ids are recovered from `symbol_map` by name in Step 4.
         if encoded.iter().any(|ef| ef.eh.is_some()) {
             let mut lsda_section_data: Vec<u8> = Vec::new();
-            let mut lsda_offsets: Vec<(usize, u64)> = Vec::new();
-            for (i, ef) in encoded.iter().enumerate() {
+            let mut lsda_offsets = Vec::new();
+            for ef in encoded {
                 let Some(eh) = ef.eh.as_ref() else {
                     continue;
                 };
                 align_vec_to(&mut lsda_section_data, 4);
-                lsda_offsets.push((i, lsda_section_data.len() as u64));
+                lsda_offsets.push((ef, eh, lsda_section_data.len() as u64));
                 lsda_section_data.extend_from_slice(&eh.lsda_bytes);
             }
             let lsda_section = writer.add_custom_section(
@@ -16826,21 +22581,22 @@ impl X86Pipeline {
                 2, // 2^2 = 4-byte alignment (matching LLVM)
                 S_REGULAR,
             );
-            for (i, offset) in lsda_offsets {
-                let ef = &encoded[i];
-                let eh = ef.eh.as_ref().expect("EH function has EH data");
+            for (ef, eh, offset) in lsda_offsets {
                 let lsda_name = format!("_GCC_except_table_{}", ef.name);
                 let lsda_symbol_id =
                     writer.add_symbol(&lsda_name, lsda_section + 1, offset, false)?;
-                symbol_map.insert(lsda_name, lsda_symbol_id);
+                symbol_map.define(
+                    lsda_name.clone(),
+                    lsda_symbol_id,
+                    &lsda_name,
+                    MACHO_X86_LSDA_LABEL,
+                )?;
 
-                let personality_name = format!("_{}", eh.personality);
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    symbol_map.entry(personality_name)
-                {
-                    let id = writer.add_symbol(entry.key(), 0, 0, true)?;
-                    entry.insert(id);
-                }
+                // The personality binds to this module's own definition of
+                // it (a global one: a module-local personality is refused
+                // above) or else to an undefined external, never to an LSDA
+                // label (refused by name).
+                symbol_map.get_or_add_undefined(&mut writer, &eh.personality)?;
             }
         }
 
@@ -16920,10 +22676,11 @@ impl X86Pipeline {
                 let global_offset = data.len() as u64;
                 offsets.push(global_offset);
                 data.extend_from_slice(&g.data);
-                // Bake any non-zero addend into the 8-byte slot now (while we
+                // Write the declared addend into the 8-byte slot now (while we
                 // still own the section bytes). Mach-O `X86_64_RELOC_UNSIGNED`
-                // adds the resolved symbol address to the in-place value, so a
-                // non-zero addend must already be present in the section data.
+                // adds the resolved symbol address to the in-place value, so
+                // the write is unconditional: a declared zero addend must erase
+                // any nonzero placeholder bytes left in the slot.
                 for sref in &g.symbol_refs {
                     let bytes = sref.addend.to_le_bytes();
                     let local_slot = checked_x86_symbol_initializer_slot(
@@ -16932,34 +22689,31 @@ impl X86Pipeline {
                         sref.offset,
                         g.data.len(),
                     )?;
-                    if sref.addend != 0 {
-                        let slot = global_offset_usize
-                            .checked_add(local_slot.start)
-                            .ok_or_else(|| X86PipelineError::GlobalRefUnsupported {
-                                function: g.name.clone(),
-                                symbol: sref.symbol.clone(),
-                                reason:
-                                    "section-relative symbol-initializer offset overflows usize"
-                                        .to_string(),
-                            })?;
-                        let end = slot.checked_add(local_slot.len()).ok_or_else(|| {
-                            X86PipelineError::GlobalRefUnsupported {
-                                function: g.name.clone(),
-                                symbol: sref.symbol.clone(),
-                                reason: "section-relative symbol-initializer range overflows usize"
-                                    .to_string(),
-                            }
+                    let slot = global_offset_usize
+                        .checked_add(local_slot.start)
+                        .ok_or_else(|| X86PipelineError::GlobalRefUnsupported {
+                            function: g.name.clone(),
+                            symbol: sref.symbol.clone(),
+                            reason: "section-relative symbol-initializer offset overflows usize"
+                                .to_string(),
                         })?;
-                        let target = data.get_mut(slot..end).ok_or_else(|| {
-                            X86PipelineError::GlobalRefUnsupported {
-                                function: g.name.clone(),
-                                symbol: sref.symbol.clone(),
-                                reason: "symbol-initializer slot is outside emitted section data"
-                                    .to_string(),
-                            }
-                        })?;
-                        target.copy_from_slice(&bytes);
-                    }
+                    let end = slot.checked_add(local_slot.len()).ok_or_else(|| {
+                        X86PipelineError::GlobalRefUnsupported {
+                            function: g.name.clone(),
+                            symbol: sref.symbol.clone(),
+                            reason: "section-relative symbol-initializer range overflows usize"
+                                .to_string(),
+                        }
+                    })?;
+                    let target = data.get_mut(slot..end).ok_or_else(|| {
+                        X86PipelineError::GlobalRefUnsupported {
+                            function: g.name.clone(),
+                            symbol: sref.symbol.clone(),
+                            reason: "symbol-initializer slot is outside emitted section data"
+                                .to_string(),
+                        }
+                    })?;
+                    target.copy_from_slice(&bytes);
                 }
             }
             let section_index = writer.add_custom_section(
@@ -16988,13 +22742,18 @@ impl X86Pipeline {
                 // two x86 modules whose pools shared an index collided at link
                 // ("duplicate symbol '_const.allocN'") — first surfaced by the
                 // wp10-x86 whole-corpus link (2600 objects, one ld invocation).
-                let symbol_id = if g.is_weak {
-                    writer.add_weak_symbol(&mangled, section_ordinal, offset, g.is_external)
-                } else {
-                    writer.add_symbol(&mangled, section_ordinal, offset, g.is_external)
-                }?;
-                symbol_map.insert(g.name.clone(), symbol_id);
-                symbol_map.insert(mangled, symbol_id);
+                // trust-ir v41: visibility (`N_PEXT` for hidden) and `#[used]`
+                // retention (`N_NO_DEAD_STRIP`) ride the same nlist entry.
+                let symbol_id = writer.add_defined_symbol_with_attrs(
+                    &mangled,
+                    section_ordinal,
+                    offset,
+                    g.is_external,
+                    g.is_weak,
+                    g.visibility,
+                    g.retained,
+                )?;
+                symbol_map.define(mangled, symbol_id, &g.name, "data global")?;
                 for sref in &g.symbol_refs {
                     let section_offset = checked_x86_object_u64_sum(
                         &g.name,
@@ -17035,15 +22794,14 @@ impl X86Pipeline {
         let (tls_descriptor_symbols, pending_tls_relocs) =
             crate::pipeline::add_tls_global_sections(&mut writer, &tls_globals).map_err(
                 |error| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "x86-64 Mach-O thread-local descriptor section emission failed: {error}"
                     ))
                 },
             )?;
         for (name, symbol_id) in tls_descriptor_symbols {
             let mangled = macho_x86_64_symbol_name(&name);
-            symbol_map.insert(name, symbol_id);
-            symbol_map.insert(mangled, symbol_id);
+            symbol_map.define(mangled, symbol_id, &name, "thread-local descriptor")?;
         }
 
         let defined_symbol_map = symbol_map.clone();
@@ -17062,46 +22820,23 @@ impl X86Pipeline {
         // table so a later local/definition cannot silently shift an earlier
         // reference.
         for (_, _, symbol, _) in &data_reloc_work {
-            if symbol_map
-                .get(symbol)
-                .or_else(|| symbol_map.get(&macho_x86_64_symbol_name(symbol)))
-                .is_none()
-            {
-                let symbol_name = macho_x86_64_symbol_name(symbol);
-                let symbol_id = writer.add_symbol(&symbol_name, 0, 0, true)?;
-                symbol_map.insert(symbol.clone(), symbol_id);
-                symbol_map.insert(symbol_name, symbol_id);
-            }
+            symbol_map.get_or_add_undefined(&mut writer, symbol)?;
         }
         for ef in encoded {
             for gf in &ef.global_ref_fixups {
                 let may_be_undefined = match gf.kind {
+                    X86SymbolRefFixupKind::ExactFunctionAddr => {
+                        return Err(reject_exact_x86_object_address(&ef.name, &gf.symbol));
+                    }
                     X86SymbolRefFixupKind::GlobalRef => import_symbols.contains(gf.symbol.as_str()),
                     X86SymbolRefFixupKind::ExternRefGot | X86SymbolRefFixupKind::TlsTlv => true,
                 };
-                if may_be_undefined
-                    && symbol_map
-                        .get(&gf.symbol)
-                        .or_else(|| symbol_map.get(&macho_x86_64_symbol_name(&gf.symbol)))
-                        .is_none()
-                {
-                    let symbol_name = macho_x86_64_symbol_name(&gf.symbol);
-                    let symbol_id = writer.add_symbol(&symbol_name, 0, 0, true)?;
-                    symbol_map.insert(gf.symbol.clone(), symbol_id);
-                    symbol_map.insert(symbol_name, symbol_id);
+                if may_be_undefined {
+                    symbol_map.get_or_add_undefined(&mut writer, &gf.symbol)?;
                 }
             }
             for cf in &ef.call_fixups {
-                if symbol_map
-                    .get(&cf.callee)
-                    .or_else(|| symbol_map.get(&macho_x86_64_symbol_name(&cf.callee)))
-                    .is_none()
-                {
-                    let symbol_name = macho_x86_64_symbol_name(&cf.callee);
-                    let symbol_id = writer.add_symbol(&symbol_name, 0, 0, true)?;
-                    symbol_map.insert(cf.callee.clone(), symbol_id);
-                    symbol_map.insert(symbol_name, symbol_id);
-                }
+                symbol_map.get_or_add_undefined(&mut writer, &cf.callee)?;
             }
         }
 
@@ -17118,7 +22853,7 @@ impl X86Pipeline {
             let has_eh = ef.eh.is_some();
             let Some(metadata) = ef.frame_metadata.as_ref() else {
                 if has_eh {
-                    return Err(X86PipelineError::FrameLowering(format!(
+                    return Err(X86PipelineError::Unwind(format!(
                         "x86-64 Mach-O: EH function `{}` has no frame metadata; \
                          cannot emit its FDE/LSDA",
                         ef.name
@@ -17126,9 +22861,9 @@ impl X86Pipeline {
                 }
                 continue;
             };
-            let Some(&function_symbol_id) = symbol_map.get(&ef.name) else {
+            let Some(function_symbol_id) = symbol_map.get(&ef.name) else {
                 if has_eh {
-                    return Err(X86PipelineError::FrameLowering(format!(
+                    return Err(X86PipelineError::Unwind(format!(
                         "x86-64 Mach-O: EH function `{}` symbol missing before unwind emission",
                         ef.name
                     )));
@@ -17138,15 +22873,15 @@ impl X86Pipeline {
             let eh = match ef.eh.as_ref() {
                 Some(eh_data) => {
                     let lsda_name = format!("_GCC_except_table_{}", ef.name);
-                    let personality_name = format!("_{}", eh_data.personality);
-                    let lsda_symbol_id = *symbol_map.get(&lsda_name).ok_or_else(|| {
-                        X86PipelineError::FrameLowering(format!(
+                    let personality_name = macho_x86_64_symbol_name(&eh_data.personality);
+                    let lsda_symbol_id = symbol_map.get_nlist(&lsda_name).ok_or_else(|| {
+                        X86PipelineError::Unwind(format!(
                             "x86-64 Mach-O: LSDA symbol {lsda_name} missing before unwind emission"
                         ))
                     })?;
                     let personality_symbol_id =
-                        *symbol_map.get(&personality_name).ok_or_else(|| {
-                            X86PipelineError::FrameLowering(format!(
+                        symbol_map.get(&eh_data.personality).ok_or_else(|| {
+                            X86PipelineError::Unwind(format!(
                                 "x86-64 Mach-O: personality symbol {personality_name} missing \
                                  before unwind emission"
                             ))
@@ -17255,15 +22990,13 @@ impl X86Pipeline {
         for (section_index, section_offset, symbol, _addend) in &data_reloc_work {
             let symbol_id = symbol_map
                 .get(symbol)
-                .or_else(|| symbol_map.get(&macho_x86_64_symbol_name(symbol)))
-                .copied()
                 .ok_or_else(|| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "x86-64 Mach-O data-reloc symbol {symbol} was not registered before symbol-table freeze"
                     ))
                 })?;
             let sym_idx = writer.final_symbol_index(symbol_id)?.ok_or_else(|| {
-                X86PipelineError::ConstantPool(format!(
+                X86PipelineError::ObjectEmission(format!(
                     "x86-64 Mach-O data-reloc symbol {symbol} missing before relocation emission"
                 ))
             })?;
@@ -17284,7 +23017,7 @@ impl X86Pipeline {
         // was registered by `add_tls_global_sections` above, before the freeze.
         for reloc in &pending_tls_relocs {
             let final_index = writer.final_symbol_index(reloc.symbol_id)?.ok_or_else(|| {
-                X86PipelineError::ConstantPool(
+                X86PipelineError::ObjectEmission(
                     "x86-64 Mach-O TLV descriptor relocation symbol missing before emission"
                         .to_string(),
                 )
@@ -17302,10 +23035,11 @@ impl X86Pipeline {
         for ef in encoded {
             for gf in &ef.global_ref_fixups {
                 let reloc = match gf.kind {
+                    X86SymbolRefFixupKind::ExactFunctionAddr => {
+                        return Err(reject_exact_x86_object_address(&ef.name, &gf.symbol));
+                    }
                     X86SymbolRefFixupKind::GlobalRef => {
-                        let symbol_id = if let Some(&symbol_id) = defined_symbol_map
-                            .get(&gf.symbol)
-                            .or_else(|| defined_symbol_map.get(&format!("_{}", gf.symbol)))
+                        let symbol_id = if let Some(symbol_id) = defined_symbol_map.get(&gf.symbol)
                         {
                             symbol_id
                         } else if import_symbols.contains(gf.symbol.as_str()) {
@@ -17316,18 +23050,7 @@ impl X86Pipeline {
                             // statically linked into the same image, so no GOT
                             // indirection is needed (mirrors the call-fixup undefined
                             // external below).
-                            let symbol_name = macho_x86_64_symbol_name(&gf.symbol);
-                            if let Some(&id) = symbol_map
-                                .get(&gf.symbol)
-                                .or_else(|| symbol_map.get(&symbol_name))
-                            {
-                                id
-                            } else {
-                                let id = writer.add_symbol(&symbol_name, 0, 0, true)?;
-                                symbol_map.insert(gf.symbol.clone(), id);
-                                symbol_map.insert(symbol_name, id);
-                                id
-                            }
+                            symbol_map.get_or_add_undefined(&mut writer, &gf.symbol)?
                         } else {
                             return Err(X86PipelineError::GlobalRefUnsupported {
                                 function: ef.name.clone(),
@@ -17355,18 +23078,7 @@ impl X86Pipeline {
                         X86_64Relocation::signed(relocation_offset, sym_idx)
                     }
                     X86SymbolRefFixupKind::ExternRefGot => {
-                        let symbol_id = if let Some(&symbol_id) = symbol_map
-                            .get(&gf.symbol)
-                            .or_else(|| symbol_map.get(&format!("_{}", gf.symbol)))
-                        {
-                            symbol_id
-                        } else {
-                            let symbol_name = macho_x86_64_symbol_name(&gf.symbol);
-                            let symbol_id = writer.add_symbol(&symbol_name, 0, 0, true)?;
-                            symbol_map.insert(gf.symbol.clone(), symbol_id);
-                            symbol_map.insert(symbol_name, symbol_id);
-                            symbol_id
-                        };
+                        let symbol_id = symbol_map.get_or_add_undefined(&mut writer, &gf.symbol)?;
                         let sym_idx = writer.final_symbol_index(symbol_id)?.ok_or_else(|| {
                             x86_symbol_ref_unsupported(
                                 gf.kind,
@@ -17391,18 +23103,7 @@ impl X86Pipeline {
                         // like the GOT case; ld64 relaxes the load to LEA for
                         // image-local TLVs and the descriptor address lands in
                         // the register.
-                        let symbol_id = if let Some(&symbol_id) = symbol_map
-                            .get(&gf.symbol)
-                            .or_else(|| symbol_map.get(&format!("_{}", gf.symbol)))
-                        {
-                            symbol_id
-                        } else {
-                            let symbol_name = macho_x86_64_symbol_name(&gf.symbol);
-                            let symbol_id = writer.add_symbol(&symbol_name, 0, 0, true)?;
-                            symbol_map.insert(gf.symbol.clone(), symbol_id);
-                            symbol_map.insert(symbol_name, symbol_id);
-                            symbol_id
-                        };
+                        let symbol_id = symbol_map.get_or_add_undefined(&mut writer, &gf.symbol)?;
                         let sym_idx = writer.final_symbol_index(symbol_id)?.ok_or_else(|| {
                             x86_symbol_ref_unsupported(
                                 gf.kind,
@@ -17435,20 +23136,9 @@ impl X86Pipeline {
             for cf in &ef.call_fixups {
                 // Missing callees are valid Mach-O undefined externals; the
                 // linker or dynamic loader resolves or rejects them later.
-                let symbol_id = if let Some(&symbol_id) = symbol_map
-                    .get(&cf.callee)
-                    .or_else(|| symbol_map.get(&format!("_{}", cf.callee)))
-                {
-                    symbol_id
-                } else {
-                    let symbol_name = macho_x86_64_symbol_name(&cf.callee);
-                    let symbol_id = writer.add_symbol(&symbol_name, 0, 0, true)?;
-                    symbol_map.insert(cf.callee.clone(), symbol_id);
-                    symbol_map.insert(symbol_name, symbol_id);
-                    symbol_id
-                };
+                let symbol_id = symbol_map.get_or_add_undefined(&mut writer, &cf.callee)?;
                 let sym_idx = writer.final_symbol_index(symbol_id)?.ok_or_else(|| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "x86-64 Mach-O callee symbol {} missing before call relocation emission",
                         cf.callee
                     ))
@@ -17468,39 +23158,148 @@ impl X86Pipeline {
     }
 
     /// Emit a multi-function ELF object with x86-64 PLT32 CALL relocations (#464).
+    ///
+    /// Every function definition is a strong, default-visible `STB_GLOBAL`
+    /// symbol, except one `function_symbols` binds otherwise
+    /// ([`X86FunctionSymbolFacts`]): a module-local definition is `STB_LOCAL`
+    /// in the local partition, and a hidden or protected one carries its
+    /// `STV_*` in `st_other`. A weak definition is the config's
+    /// (`weak_function_definitions`), as before.
     fn emit_module_elf(
         &self,
         encoded: &[X86EncodedFunc],
         combined_code: &[u8],
         globals: &[crate::pipeline::ObjectGlobal],
+        function_symbols: &X86FunctionSymbolFacts,
     ) -> Result<Vec<u8>, X86PipelineError> {
-        use crate::elf::constants::{SHF_ALLOC, SHF_WRITE, SHT_PROGBITS, STT_FUNC, STT_OBJECT};
+        use crate::elf::constants::{
+            SHF_ALLOC, SHF_WRITE, SHT_PROGBITS, STT_FUNC, STT_OBJECT, STT_SECTION, STV_DEFAULT,
+            STV_HIDDEN,
+        };
         use crate::elf::reloc::{Elf64Rela, X86_64RelocType};
 
         // Thread-local globals are not wired for the x86-64 ELF emitter (no
         // `.tdata`/`.tbss` + TLS relocations). Fail closed rather than miscompile.
         reject_x86_thread_local_globals(globals)?;
+        reject_x86_elf_calls_to_object_globals(encoded, globals)?;
+
+        // The EH lane's whole surface is planned BEFORE any symbol is handed an
+        // index: its `.text` / `.gcc_except_table` anchors (and, for a
+        // module-local personality, its `DW.ref` slot) are LOCAL symbols, and
+        // this emitter's index arithmetic needs the local count up front.
+        let unwind = plan_x86_64_elf_module_unwind(&self.config, encoded)?;
 
         let mut writer = ElfWriter::new(ElfMachine::X86_64);
-        writer.add_text_section_with_align(combined_code, 1u64 << x86_text_align_log2());
+        writer.add_text_section_with_align(combined_code, 1u64 << x86_text_align_log2())?;
 
         // Build symbol table: one STT_FUNC per function at its text offset.
         //
         // ELF symbol indices start at 1 (index 0 is the null STN_UNDEF symbol,
-        // automatically emitted by the writer). ElfWriter::add_symbol appends
-        // to the symbol list in insertion order; our first add_symbol call
-        // therefore corresponds to symbol index 1. The writer's stable
-        // locals-before-globals partition preserves insertion order within the
-        // all-global symbol set we emit here, so insertion order == final
-        // symbol index. All data globals are emitted as global symbols too to
-        // keep that invariant.
+        // automatically emitted by the writer). The writer serializes every
+        // LOCAL symbol first, then every global/weak one, each partition in
+        // insertion order (`ElfWriter::final_symbol_index`). The locals this
+        // emitter adds are the module-private data definitions, the
+        // module-local FUNCTION definitions `function_symbols` names
+        // (`FunctionSymbolLinkage::Local`), plus, on the EH lane, the unwind
+        // anchors (`x86_64_elf_eh_local_symbol_count`) — all
+        // known up front, so the local partition is exactly `1..=local_count`
+        // and the global partition starts right after it: two counters give
+        // every symbol its FINAL index at insertion time, whatever the
+        // interleaving. This emitter never calls
+        // `ElfWriter::final_symbol_index` (which FREEZES the table, so a later
+        // append would fail `write_checked`); the arithmetic is the whole
+        // mechanism, and an EH local left out of this count would silently shift
+        // every global index and mis-wire a CALL relocation to the wrong callee.
+        let is_local_definition =
+            |g: &crate::pipeline::ObjectGlobal| !g.is_import && !g.is_external && !g.is_weak;
+        let local_data_definition_count = globals.iter().filter(|g| is_local_definition(g)).count();
+        // A personality this object defines STB_LOCAL gets an object-local
+        // `DW.ref` slot, as GCC gives a `static` personality a private constant:
+        // a shared weak slot would let the linker keep another object's cell, so
+        // this object's frames would run that object's personality. An
+        // STB_GLOBAL definition (a function this module compiled) and an
+        // undefined import both take the weak hidden COMDAT slot.
+        //
+        // Either kind of definition can be the local one: a private DATUM
+        // spelled like the personality, or — since this emitter binds
+        // module-local FUNCTIONS (ruling OD-X86-ELF-LOCAL-BINDING-20261027) —
+        // a module-local personality function the module itself compiled, as
+        // two objects each with their own `rust_eh_personality` have on
+        // AArch64 ELF. Reading only the globals here would give such a module
+        // the shared COMDAT slot, and its frames could then run another
+        // object's personality.
+        let personality_binds_locally = unwind.as_ref().is_some_and(|plan| {
+            globals
+                .iter()
+                .any(|g| g.name == plan.personality && is_local_definition(g))
+                || (encoded.iter().any(|ef| ef.name == plan.personality)
+                    && function_symbols.binding_of(&plan.personality).linkage()
+                        == crate::pipeline::FunctionSymbolLinkage::Local)
+        });
+        let eh_local_symbol_count = if unwind.is_some() {
+            x86_64_elf_eh_local_symbol_count(personality_binds_locally)
+        } else {
+            0
+        };
+        // The module-local FUNCTION definitions, counted from the same facts
+        // the loop below reads, so the partition size and the per-symbol
+        // decision can never disagree.
+        let local_function_definition_count = encoded
+            .iter()
+            .filter(|ef| {
+                function_symbols.binding_of(&ef.name).linkage()
+                    == crate::pipeline::FunctionSymbolLinkage::Local
+            })
+            .count();
+        let local_definition_count =
+            local_data_definition_count + local_function_definition_count + eh_local_symbol_count;
+        let mut next_local_symbol_index = 1u32;
+        let mut next_symbol_index = u32::try_from(local_definition_count)
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| X86PipelineError::ObjectFieldTooLarge {
+                function: encoded
+                    .first()
+                    .map(|ef| ef.name.clone())
+                    .unwrap_or_default(),
+                field: "ELF local data-symbol count",
+                value: local_definition_count as u128,
+                max: u128::from(u32::MAX - 1),
+            })?;
         let mut symbol_map: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
-        let mut next_symbol_index = 1u32;
         for ef in encoded {
-            writer.add_symbol(&ef.name, 1, ef.text_offset, 0, true, STT_FUNC);
-            symbol_map.insert(ef.name.clone(), next_symbol_index);
-            next_symbol_index += 1;
+            // A `Weak`/`LinkOnce` (or ODR) function is an `STB_WEAK`
+            // definition (`X86PipelineConfig::weak_function_definitions`),
+            // placed in the global partition like every other function. A
+            // module-local (`Internal`/`Private`) definition is `STB_LOCAL`
+            // in the local partition, so this object's own `R_X86_64_PLT32`
+            // calls and `R_X86_64_64` address slots reach THIS body and the
+            // name never enters a linked image's export surface; a hidden or
+            // protected definition stays in the global partition and carries
+            // its `STV_*`. `check_against` above has already refused a fact
+            // that disagrees with `weak_function_definitions`, so a symbol is
+            // never both weak and local here.
+            let binding = function_symbols.binding_of(&ef.name);
+            let is_local = binding.linkage() == crate::pipeline::FunctionSymbolLinkage::Local;
+            let is_weak = self.config.weak_function_definitions.contains(&ef.name);
+            writer.add_symbol_with_attrs(
+                &ef.name,
+                1,
+                ef.text_offset,
+                0,
+                !is_local,
+                is_weak,
+                STT_FUNC,
+                crate::pipeline::elf_symbol_visibility(binding.visibility()),
+            );
+            let counter = if is_local {
+                &mut next_local_symbol_index
+            } else {
+                &mut next_symbol_index
+            };
+            symbol_map.insert(ef.name.clone(), *counter);
+            *counter += 1;
         }
 
         // Emit module-level data globals into `.data` (mutable) or `.rodata`
@@ -17513,61 +23312,135 @@ impl X86Pipeline {
         // sections (its `GlobalRef` registers it as an undefined external
         // below); emitting it as a definition would be a duplicate symbol —
         // mirroring `emit_module_macho`'s import exclusion.
-        let mutable_globals: Vec<&crate::pipeline::ObjectGlobal> = globals
-            .iter()
-            .filter(|g| !g.is_import && g.mutable)
-            .collect();
-        let immutable_globals: Vec<&crate::pipeline::ObjectGlobal> = globals
-            .iter()
-            .filter(|g| !g.is_import && !g.mutable)
-            .collect();
+        //
+        // An immutable global whose bytes hold symbol ADDRESSES (a vtable, a
+        // function-pointer table, a `&'static` to another global) cannot live
+        // in `.rodata`: its `R_X86_64_64` slots are resolved by the dynamic
+        // loader, and a position-independent executable — the default link on
+        // GNU/Linux — refuses an absolute relocation in a read-only section
+        // ("relocation R_X86_64_64 cannot be used against symbol ...;
+        // recompile with -fPIC", measured 2026-09-20 on every std program the
+        // bridge emitted, through `std::rt::lang_start`'s closure vtable). It
+        // goes in `.data.rel.ro`, writable at load and made read-only by RELRO
+        // once relocated, exactly where LLVM and the AArch64 ELF emitter
+        // (`emit_module_elf` in `pipeline.rs`) put it.
+        let class_of = |g: &crate::pipeline::ObjectGlobal| {
+            if g.mutable {
+                (".data", SHF_ALLOC | SHF_WRITE)
+            } else if g.symbol_refs.is_empty() {
+                (".rodata", SHF_ALLOC)
+            } else {
+                (".data.rel.ro", SHF_ALLOC | SHF_WRITE)
+            }
+        };
+        let mut data_sections: Vec<(String, Vec<&crate::pipeline::ObjectGlobal>, u64)> = Vec::new();
+        for (base, sh_flags) in [
+            (".data", SHF_ALLOC | SHF_WRITE),
+            (".rodata", SHF_ALLOC),
+            (".data.rel.ro", SHF_ALLOC | SHF_WRITE),
+        ] {
+            let members: Vec<&crate::pipeline::ObjectGlobal> = globals
+                .iter()
+                .filter(|g| !g.is_import && !g.retained && class_of(g).0 == base)
+                .collect();
+            if !members.is_empty() {
+                data_sections.push((base.to_string(), members, sh_flags));
+            }
+        }
+        // trust-ir v41 `#[used]` retention: each retained definition gets its
+        // own `<base>.<symbol>` section flagged `SHF_GNU_RETAIN` (the writer
+        // stamps the GNU OSABI so linkers honor it), as LLVM places an
+        // `@llvm.used` global, so the flag keeps that definition alone, never
+        // its neighbours. This emitter has no `.bss`: a zero-filled writable
+        // retained global is `.data.<symbol>`, where llc writes
+        // `.bss.<symbol>`, as for every zero-filled global here. A symbol
+        // that would move the name into another linker placement rule is
+        // refused by name, as on AArch64.
+        for g in globals.iter().filter(|g| !g.is_import && g.retained) {
+            let (base, sh_flags) = class_of(g);
+            let name = format!("{base}.{}", g.name);
+            crate::object_sections::check_unique_section(g, base, &name).map_err(
+                |(code, reason)| X86PipelineError::GlobalRefUnsupported {
+                    function: String::new(),
+                    symbol: g.name.clone(),
+                    reason: format!("[{code}] {reason} (fail-closed)"),
+                },
+            )?;
+            data_sections.push((
+                name,
+                vec![g],
+                sh_flags | crate::pipeline::elf_retain_flag(g),
+            ));
+        }
         // Deferred data-section relocations from symbol-address slots. Stored
         // as `(reloc_section_idx_0based, section_relative_offset, symbol,
         // addend)`. ELF `RELA` carries the addend explicitly, so the slot stays
         // zero and `addend` is the rela's r_addend.
         let mut data_reloc_work: Vec<(usize, u64, String, i64)> = Vec::new();
-        for (section_name, section_globals, sh_flags) in [
-            (".data", &mutable_globals, SHF_ALLOC | SHF_WRITE),
-            (".rodata", &immutable_globals, SHF_ALLOC),
-        ] {
-            if section_globals.is_empty() {
-                continue;
-            }
+        for (section_name, section_globals, sh_flags) in &data_sections {
+            let (section_name, sh_flags) = (section_name.as_str(), *sh_flags);
+            // Each global starts at an offset aligned to its OWN declared
+            // alignment, and the section alignment covers the strictest one
+            // (never below the historical 8-byte floor), so an over-aligned
+            // static (`#[repr(align(64))]`, an atomic) is correctly aligned
+            // after linking instead of packed back-to-back.
             let mut data = Vec::new();
             let mut offsets = Vec::with_capacity(section_globals.len());
+            let mut section_align: u32 = 8;
             for g in section_globals.iter() {
+                let align = g.align.max(1);
+                if !align.is_power_of_two() {
+                    // Same error shape as the other data-global layout
+                    // refusals in this emitter.
+                    return Err(X86PipelineError::GlobalRefUnsupported {
+                        function: g.name.clone(),
+                        symbol: g.name.clone(),
+                        reason: format!(
+                            "ELF data-global alignment {align} is not a power of two (fail-closed)"
+                        ),
+                    });
+                }
+                section_align = section_align.max(align);
+                let padding = (align as usize - data.len() % align as usize) % align as usize;
+                data.resize(data.len() + padding, 0);
                 offsets.push(data.len() as u64);
                 data.extend_from_slice(&g.data);
             }
             // `add_section` returns the 1-based section header table index,
             // which is exactly what `add_symbol`'s `section` field expects.
             // `add_relocation` uses the 0-based user-section index, hence -1.
-            let section_idx = writer.add_section(section_name, &data, SHT_PROGBITS, sh_flags, 8);
+            let section_idx = writer.add_section(
+                section_name,
+                &data,
+                SHT_PROGBITS,
+                sh_flags,
+                u64::from(section_align),
+            )?;
             let reloc_section_idx = (section_idx - 1) as usize;
             for (g, offset) in section_globals.iter().zip(offsets) {
-                // A weak DEFINITION gets STB_WEAK (coalescable across objects); a
-                // strong one stays STB_GLOBAL. Both live in the writer's global
-                // partition, so insertion order == final symbol index is preserved.
-                if g.is_weak {
-                    writer.add_weak_symbol(
-                        &g.name,
-                        section_idx,
-                        offset,
-                        g.data.len() as u64,
-                        STT_OBJECT,
-                    );
+                // A weak DEFINITION gets STB_WEAK (coalescable across objects);
+                // a strong exported one STB_GLOBAL. A module-private
+                // (`!is_external`) definition is STB_LOCAL, as on the Mach-O
+                // path: exporting it would make two objects' private
+                // `const.allocN` pools collide at link time.
+                let is_local = is_local_definition(g);
+                writer.add_symbol_with_attrs(
+                    &g.name,
+                    section_idx,
+                    offset,
+                    g.data.len() as u64,
+                    !is_local,
+                    g.is_weak,
+                    STT_OBJECT,
+                    crate::pipeline::elf_symbol_visibility(g.visibility),
+                );
+                let counter = if is_local {
+                    &mut next_local_symbol_index
                 } else {
-                    writer.add_symbol(
-                        &g.name,
-                        section_idx,
-                        offset,
-                        g.data.len() as u64,
-                        true,
-                        STT_OBJECT,
-                    );
-                }
-                symbol_map.insert(g.name.clone(), next_symbol_index);
-                next_symbol_index += 1;
+                    &mut next_symbol_index
+                };
+                symbol_map.insert(g.name.clone(), *counter);
+                *counter += 1;
                 for sref in &g.symbol_refs {
                     checked_x86_symbol_initializer_slot(
                         &g.name,
@@ -17590,6 +23463,28 @@ impl X86Pipeline {
                 }
             }
         }
+        // Every local the partition reserved for this point was emitted: the
+        // module-local FUNCTION definitions from the loop above plus the
+        // module-private data definitions here. The EH lane's anchors continue
+        // the same counter below and are the only other locals, so the global
+        // indices assigned above stay final. A miss here shifts every global
+        // index already handed out, so it is a refusal in every build profile,
+        // not a debug assertion.
+        let reserved_before_eh = local_function_definition_count + local_data_definition_count;
+        if next_local_symbol_index as usize != reserved_before_eh + 1 {
+            return Err(X86PipelineError::ObjectEmission(format!(
+                "x86-64 ELF data emission reserved {reserved_before_eh} local symbol(s) \
+                 ({local_function_definition_count} module-local function(s) + \
+                 {local_data_definition_count} private data definition(s)) but emitted {}; an \
+                 unreserved local shifts every global symbol index and mis-wires relocations \
+                 (fail-closed)",
+                next_local_symbol_index - 1
+            )));
+        }
+        // The indices this emitter handed out that are not in `symbol_map`
+        // (the EH lane's anchors and personality slot), checked with it against
+        // the serialized order before the object is written.
+        let mut anchor_symbols: Vec<(String, u32)> = Vec::new();
         let defined_symbol_map = symbol_map.clone();
         // Names of cross-object data IMPORTS: a `GlobalRef` to one of these
         // resolves to an undefined external the linker satisfies, rather than
@@ -17614,7 +23509,12 @@ impl X86Pipeline {
             } else {
                 let idx = next_symbol_index;
                 next_symbol_index += 1;
-                writer.add_symbol(symbol, 0, 0, 0, true, crate::elf::constants::STT_NOTYPE);
+                add_x86_elf_undefined_symbol(
+                    &mut writer,
+                    function_symbols,
+                    symbol,
+                    crate::elf::constants::STT_NOTYPE,
+                );
                 symbol_map.insert(symbol.clone(), idx);
                 idx
             };
@@ -17622,15 +23522,252 @@ impl X86Pipeline {
             writer.add_relocation(*reloc_section_idx, rela);
         }
 
-        let unwind_records: Vec<_> = encoded
-            .iter()
-            .filter_map(|ef| {
-                let metadata = ef.frame_metadata.as_ref()?;
-                let symbol_index = *symbol_map.get(&ef.name)?;
-                x86_64_dynamic_eh_frame_record(metadata, ef.code_len, symbol_index)
-            })
-            .collect();
-        add_x86_64_eh_frame_to_elf(&mut writer, &unwind_records);
+        // ----- Unwind tables ---------------------------------------------------
+        // Two mutually exclusive lanes. The EH lane (this module carries
+        // exception-handling structure, or whole-program `panic=unwind` covers
+        // it) emits a `.gcc_except_table`, a zPLR `.eh_frame` with an FDE for
+        // EVERY function, and the `DW.ref.<personality>` slot. Otherwise the
+        // historical backtrace-only lane emits a zR FDE per dynamic-alloc
+        // function and nothing else.
+        if let Some(plan) = unwind.as_ref() {
+            // (1) `.gcc_except_table`: every function's LSDA, 4-byte aligned,
+            // exactly as the Mach-O `__gcc_except_tab` pass concatenates them.
+            // Added here — after every data section, before the text relocation
+            // loops — so the anchors below are registered before any index this
+            // emitter has already handed out could shift.
+            let except_shndx = writer.add_section(
+                ".gcc_except_table",
+                &plan.except_table,
+                SHT_PROGBITS,
+                SHF_ALLOC,
+                4,
+            )?;
+
+            // (2) the two LOCAL `STT_SECTION` anchors the FDE pointers name.
+            // Reserved by `x86_64_elf_eh_local_symbol_count` above.
+            let text_anchor_index = next_local_symbol_index;
+            next_local_symbol_index += 1;
+            writer.add_symbol_with_attrs(".text", 1, 0, 0, false, false, STT_SECTION, STV_DEFAULT);
+            anchor_symbols.push((".text".to_string(), text_anchor_index));
+            let except_anchor_index = next_local_symbol_index;
+            next_local_symbol_index += 1;
+            writer.add_symbol_with_attrs(
+                "",
+                except_shndx,
+                0,
+                0,
+                false,
+                false,
+                STT_SECTION,
+                STV_DEFAULT,
+            );
+            anchor_symbols.push((String::new(), except_anchor_index));
+
+            // (3) the personality symbol itself. Normally an undefined external
+            // the linker resolves out of libstdc++ / Rust std; already present
+            // when this module defines it.
+            let personality_symbol_index = match symbol_map.get(&plan.personality) {
+                Some(&index) => index,
+                None => {
+                    let index = next_symbol_index;
+                    next_symbol_index += 1;
+                    add_x86_elf_undefined_symbol(
+                        &mut writer,
+                        function_symbols,
+                        &plan.personality,
+                        STT_FUNC,
+                    );
+                    symbol_map.insert(plan.personality.clone(), index);
+                    index
+                }
+            };
+
+            // (4) the GCC-shaped indirect personality slot: an 8-byte writable
+            // cell holding the personality's absolute address (`R_X86_64_64`, a
+            // dynamic reloc under PIE), which the CIE's
+            // `DW_EH_PE_indirect|pcrel|sdata4` field points at. The personality
+            // lives in a SHARED library, and a direct `R_X86_64_PC32` against a
+            // preemptible symbol is unrepresentable in a shared object.
+            //
+            // For an external personality the slot is, as GCC emits it, a WEAK
+            // HIDDEN definition alone in a `GRP_COMDAT` group it signs: every
+            // object's copy coalesces to one cell, and HIDDEN is what makes the
+            // `.eh_frame` `R_X86_64_PC32` naming it a link-time constant in a
+            // shared object (GNU ld and LLD refuse one against a
+            // default-visibility weak symbol, which may bind externally) while
+            // keeping the slot out of `.dynsym`.
+            let dw_ref_name = format!("DW.ref.{}", plan.personality);
+            let dw_ref_section_name = format!(".data.{dw_ref_name}");
+            let slot_flags = SHF_ALLOC | SHF_WRITE;
+            let (dw_ref_shndx, dw_ref_symbol_index) = if personality_binds_locally {
+                let shndx = writer.add_section(
+                    &dw_ref_section_name,
+                    &[0u8; 8],
+                    SHT_PROGBITS,
+                    slot_flags,
+                    8,
+                )?;
+                let index = next_local_symbol_index;
+                next_local_symbol_index += 1;
+                writer.add_symbol_with_attrs(
+                    &dw_ref_name,
+                    shndx,
+                    0,
+                    8,
+                    false,
+                    false,
+                    STT_OBJECT,
+                    STV_DEFAULT,
+                );
+                (shndx, index)
+            } else {
+                let group = writer.add_comdat_group();
+                let shndx = writer.add_group_member_section(
+                    group,
+                    &dw_ref_section_name,
+                    &[0u8; 8],
+                    SHT_PROGBITS,
+                    slot_flags,
+                    8,
+                    0,
+                )?;
+                let index = next_symbol_index;
+                next_symbol_index += 1;
+                let id = writer
+                    .add_checked_symbol(crate::elf::ElfSymbol {
+                        name: dw_ref_name.clone(),
+                        section: shndx,
+                        value: 0,
+                        size: 8,
+                        is_global: true,
+                        sym_type: STT_OBJECT,
+                        is_weak: true,
+                        visibility: STV_HIDDEN,
+                    })
+                    .map_err(|error| X86PipelineError::ObjectEmission(error.to_string()))?;
+                writer
+                    .bind_comdat_group_signature(group, id)
+                    .map_err(|error| X86PipelineError::ObjectEmission(error.to_string()))?;
+                (shndx, index)
+            };
+            anchor_symbols.push((dw_ref_name.clone(), dw_ref_symbol_index));
+
+            // Every local this lane reserved was emitted, and no other local
+            // follows: the global indices handed out above stay final. A miss
+            // here would shift every global symbol index and mis-wire a CALL
+            // relocation to the wrong callee, so it is a hard refusal rather
+            // than a debug assertion.
+            if next_local_symbol_index as usize != local_definition_count + 1 {
+                return Err(X86PipelineError::ObjectEmission(format!(
+                    "x86-64 ELF unwind emission reserved {local_definition_count} local \
+                     symbol(s) but emitted {}; an unreserved local shifts every global \
+                     symbol index and mis-wires relocations (fail-closed)",
+                    next_local_symbol_index - 1
+                )));
+            }
+
+            // (5) `.eh_frame`: one zPLR CIE + one LSDA-bearing FDE per function.
+            let mut cfi = DwarfCfiSection::new_x86_64_elf_with_eh();
+            for entry in &plan.fdes {
+                cfi.add_fde(entry.fde.clone());
+            }
+            let mut eh_frame = cfi.to_bytes();
+            // ENC-EHDC: the independent decoder must read the FULL serialization
+            // (terminator included, every relocated field still at its intent
+            // value 0) back to the emitter's CIE/FDE intent before a byte is
+            // emitted. trust-cg refuses to emit an unwind table it cannot
+            // round-trip to its own intent.
+            crate::dwarf_cfi_decode_check::verify_eh_frame_roundtrip(&cfi, &eh_frame)
+                .map_err(|error| X86PipelineError::Unwind(error.to_string()))?;
+            // GNU objects carry no per-object terminator (crtend.o owns the
+            // final one), so it is stripped only AFTER the check above.
+            crate::pipeline::strip_verified_eh_frame_terminator(&mut eh_frame)
+                .map_err(|error| X86PipelineError::Unwind(error.to_string()))?;
+            let eh_frame_shndx =
+                writer.add_section(".eh_frame", &eh_frame, SHT_PROGBITS, SHF_ALLOC, 8)?;
+            let eh_frame_user_idx = usize::from(eh_frame_shndx - 1);
+
+            // (6) the relocations.
+            //
+            // ORDER MATTERS: GNU ld's `.eh_frame` parser walks the section once
+            // with a monotonically advancing relocation cursor, so
+            // `.rela.eh_frame` MUST be sorted by ascending `r_offset` ("error in
+            // <obj>(.eh_frame); no .eh_frame_hdr table will be created"
+            // otherwise — and without the `PT_GNU_EH_FRAME` search table the
+            // unwinder finds no FDEs at run time). Section layout is CIE
+            // (personality field) then FDEs in add order, and within an FDE
+            // pc-begin precedes the LSDA field, so personality -> per-FDE
+            // (pc-begin, LSDA) yields ascending offsets.
+            //
+            // Every addend is the offset INSIDE the anchored section and every
+            // relocation is `R_X86_64_PC32` (`S + A - P`), which is field-START
+            // relative exactly like `DW_EH_PE_pcrel`: no Darwin-style `+4`
+            // field-end bias.
+            let personality_offset = cfi.cie_personality_relocation_offset().ok_or_else(|| {
+                X86PipelineError::Unwind(
+                    "x86-64 ELF module unwind emission: EH module CIE has no personality \
+                     field (fail-closed)"
+                        .to_string(),
+                )
+            })?;
+            writer.add_relocation(
+                eh_frame_user_idx,
+                Elf64Rela::x86_64(
+                    u64::from(personality_offset),
+                    dw_ref_symbol_index,
+                    X86_64RelocType::Pc32,
+                    0,
+                ),
+            );
+            let pc_begin_offsets = cfi.fde_pc_begin_relocation_offsets();
+            let lsda_field_offsets = cfi.fde_lsda_relocation_offsets();
+            if pc_begin_offsets.len() != plan.fdes.len()
+                || lsda_field_offsets.len() != plan.fdes.len()
+            {
+                return Err(X86PipelineError::Unwind(format!(
+                    "x86-64 ELF module unwind emission: {} planned FDEs but {} pc-begin \
+                     and {} LSDA fields were serialized under a zPLR CIE (fail-closed)",
+                    plan.fdes.len(),
+                    pc_begin_offsets.len(),
+                    lsda_field_offsets.len()
+                )));
+            }
+            for (index, entry) in plan.fdes.iter().enumerate() {
+                writer.add_relocation(
+                    eh_frame_user_idx,
+                    Elf64Rela::x86_64(
+                        u64::from(pc_begin_offsets[index]),
+                        text_anchor_index,
+                        X86_64RelocType::Pc32,
+                        entry.text_offset,
+                    ),
+                );
+                writer.add_relocation(
+                    eh_frame_user_idx,
+                    Elf64Rela::x86_64(
+                        u64::from(lsda_field_offsets[index]),
+                        except_anchor_index,
+                        X86_64RelocType::Pc32,
+                        entry.lsda_offset,
+                    ),
+                );
+            }
+            // The slot's own content: the personality's absolute address.
+            writer.add_relocation(
+                usize::from(dw_ref_shndx - 1),
+                Elf64Rela::x86_64(0, personality_symbol_index, X86_64RelocType::Abs64, 0),
+            );
+        } else {
+            let unwind_records: Vec<_> = encoded
+                .iter()
+                .filter_map(|ef| {
+                    let metadata = ef.frame_metadata.as_ref()?;
+                    let symbol_index = *symbol_map.get(&ef.name)?;
+                    x86_64_dynamic_eh_frame_record(metadata, ef.code_len, symbol_index)
+                })
+                .collect();
+            add_x86_64_eh_frame_to_elf(&mut writer, &unwind_records)?;
+        }
 
         for ef in encoded {
             for gf in &ef.global_ref_fixups {
@@ -17641,6 +23778,9 @@ impl X86Pipeline {
                     gf.offset,
                 )?;
                 let (sym_idx, reloc_type) = match gf.kind {
+                    X86SymbolRefFixupKind::ExactFunctionAddr => {
+                        return Err(reject_exact_x86_object_address(&ef.name, &gf.symbol));
+                    }
                     X86SymbolRefFixupKind::GlobalRef => {
                         let sym_idx = if let Some(&sym_idx) = defined_symbol_map.get(&gf.symbol) {
                             sym_idx
@@ -17652,12 +23792,10 @@ impl X86Pipeline {
                             } else {
                                 let sym_idx = next_symbol_index;
                                 next_symbol_index += 1;
-                                writer.add_symbol(
+                                add_x86_elf_undefined_symbol(
+                                    &mut writer,
+                                    function_symbols,
                                     &gf.symbol,
-                                    0,
-                                    0,
-                                    0,
-                                    true,
                                     crate::elf::constants::STT_NOTYPE,
                                 );
                                 symbol_map.insert(gf.symbol.clone(), sym_idx);
@@ -17680,12 +23818,10 @@ impl X86Pipeline {
                         } else {
                             let sym_idx = next_symbol_index;
                             next_symbol_index += 1;
-                            writer.add_symbol(
+                            add_x86_elf_undefined_symbol(
+                                &mut writer,
+                                function_symbols,
                                 &gf.symbol,
-                                0,
-                                0,
-                                0,
-                                true,
                                 crate::elf::constants::STT_NOTYPE,
                             );
                             symbol_map.insert(gf.symbol.clone(), sym_idx);
@@ -17720,12 +23856,37 @@ impl X86Pipeline {
                     ef.text_offset,
                     cf.offset,
                 )?;
+                // A direct `R_X86_64_PLT32` call cannot reach a WEAK undefined
+                // callee: the relocation is a link-time displacement, and a
+                // weak reference that nothing defines must read as 0, which
+                // only an indirection can represent. The adapter addresses
+                // every declaration through the GOT
+                // (`RelocationModel::symbol_address_is_got_indirect`), so a
+                // direct edge to one is a disagreement with that model rather
+                // than something to encode — refuse it by name. (The AArch64
+                // ELF emitter has the same backstop for its PC-relative
+                // forms, `reject_aarch64_object_relocation_model_violations`;
+                // x86-64 had none, because it spelled no weak reference.)
+                if function_symbols.undefined_reference_needs_got(&cf.callee) {
+                    return Err(X86PipelineError::FunctionLinkageUnsupported {
+                        function: cf.callee.clone(),
+                        linkage: crate::pipeline::FunctionSymbolLinkage::Weak,
+                        format: X86OutputFormat::Elf,
+                        reason: "a direct PLT32 call cannot reach a weak undefined callee; its \
+                                 address must come from the GOT",
+                    });
+                }
                 let sym_idx = if let Some(&sym_idx) = symbol_map.get(&cf.callee) {
                     sym_idx
                 } else {
                     let sym_idx = next_symbol_index;
                     next_symbol_index += 1;
-                    writer.add_symbol(&cf.callee, 0, 0, 0, true, STT_FUNC);
+                    add_x86_elf_undefined_symbol(
+                        &mut writer,
+                        function_symbols,
+                        &cf.callee,
+                        STT_FUNC,
+                    );
                     symbol_map.insert(cf.callee.clone(), sym_idx);
                     sym_idx
                 };
@@ -17733,6 +23894,47 @@ impl X86Pipeline {
                 writer.add_relocation(0, rela);
             }
         }
+
+        // The declarations llc writes as undefined symbols even when NOTHING
+        // references them: a weak one, and one that states a visibility. Such
+        // a symbol changes the link without a reference — a hidden or
+        // protected one keeps the definition another input supplies out of the
+        // dynamic symbol table (and GNU ld refuses the link when nothing
+        // defines it), and the output records a weak reference. Added last, so
+        // every index already handed out is unchanged; `check_against` has
+        // refused a declared name this object defines, and one that is neither
+        // weak nor visible.
+        for name in function_symbols
+            .unreferenced_declarations(&symbol_map)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let sym_idx = next_symbol_index;
+            next_symbol_index += 1;
+            add_x86_elf_undefined_symbol(
+                &mut writer,
+                function_symbols,
+                &name,
+                crate::elf::constants::STT_NOTYPE,
+            );
+            symbol_map.insert(name, sym_idx);
+        }
+
+        // Every index handed out by the arithmetic above must still name its
+        // symbol in the order the writer serializes: the reparse gate compares
+        // relocation records only as supplied, so it cannot see a shift.
+        check_x86_elf_symbol_indices(
+            &writer,
+            symbol_map
+                .iter()
+                .chain(anchor_symbols.iter().map(|(name, index)| (name, index)))
+                .map(|(name, &index)| (name.as_str(), index)),
+        )?;
+
+        // Mark the stack non-executable (added last so every earlier section
+        // index is unchanged): an input object without `.note.GNU-stack`
+        // makes GNU ld assume the object needs an executable stack.
+        writer.add_note_gnu_stack();
 
         // Serialize through the checked funnel: the ELF reparse gate
         // independently re-parses the emitted bytes against intent and (at
@@ -17751,6 +23953,7 @@ impl X86Pipeline {
         combined_code: &[u8],
         combined_rdata: &[u8],
         globals: &[crate::pipeline::ObjectGlobal],
+        function_symbols: &X86FunctionSymbolFacts,
     ) -> Result<Vec<u8>, X86PipelineError> {
         use crate::coff::{CoffRelocation, CoffWriter};
 
@@ -17777,34 +23980,34 @@ impl X86Pipeline {
         for ef in encoded {
             for fixup in &ef.const_pool_rel32_fixups {
                 if combined_rdata.is_empty() {
-                    return Err(X86PipelineError::ConstantPool(
+                    return Err(X86PipelineError::ObjectEmission(
                         "module x86-64 COFF has .text constant-pool relocations but no .rdata"
                             .to_string(),
                     ));
                 }
                 let fixup_offset = u64::try_from(fixup.disp32_offset).map_err(|_| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "COFF constant-pool relocation offset {} does not fit in u64",
                         fixup.disp32_offset
                     ))
                 })?;
                 let section_offset = ef.text_offset.checked_add(fixup_offset).ok_or_else(|| {
-                    X86PipelineError::ConstantPool(
+                    X86PipelineError::ObjectEmission(
                         "COFF constant-pool relocation offset overflow".to_string(),
                     )
                 })?;
                 let start = usize::try_from(section_offset).map_err(|_| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "COFF constant-pool relocation offset {section_offset} does not fit in usize"
                     ))
                 })?;
                 let end = start.checked_add(4).ok_or_else(|| {
-                    X86PipelineError::ConstantPool(
+                    X86PipelineError::ObjectEmission(
                         "COFF constant-pool relocation patch range overflow".to_string(),
                     )
                 })?;
                 if end > text_bytes.len() {
-                    return Err(X86PipelineError::ConstantPool(format!(
+                    return Err(X86PipelineError::ObjectEmission(format!(
                         "COFF constant-pool relocation range {start}..{end} exceeds .text size {}",
                         text_bytes.len()
                     )));
@@ -17813,18 +24016,18 @@ impl X86Pipeline {
                     .const_pool_rdata_offset
                     .checked_add(u64::from(fixup.const_pool_offset))
                     .ok_or_else(|| {
-                        X86PipelineError::ConstantPool(
+                        X86PipelineError::ObjectEmission(
                             "COFF constant-pool .rdata addend overflow".to_string(),
                         )
                     })?;
                 let addend = i32::try_from(addend).map_err(|_| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "COFF constant-pool .rdata addend {addend} does not fit in REL32 field"
                     ))
                 })?;
                 text_bytes[start..end].copy_from_slice(&addend.to_le_bytes());
                 let virtual_address = u32::try_from(section_offset).map_err(|_| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "COFF constant-pool relocation offset {section_offset} does not fit in u32"
                     ))
                 })?;
@@ -17857,9 +24060,7 @@ impl X86Pipeline {
                         record.unwind_info.len(),
                     )?;
                     xdata_offset = xdata_offset.checked_add(unwind_info_len).ok_or_else(|| {
-                        X86PipelineError::FrameLowering(
-                            "COFF unwind .xdata size overflow".to_string(),
-                        )
+                        X86PipelineError::Unwind("COFF unwind .xdata size overflow".to_string())
                     })?;
                     unwind_records.push(record);
                 }
@@ -17882,6 +24083,12 @@ impl X86Pipeline {
             Some(writer.add_exception_data_section(&pdata_bytes))
         };
 
+        // A module-local (`Internal`/`Private`) function is a static
+        // (`IMAGE_SYM_CLASS_STATIC`) symbol, so no other object's reference
+        // resolves to it (a `FunctionSymbolLinkage::Local` fact of
+        // `function_symbols`, which `check_against` admitted); every other
+        // function is external. COFF symbol indices are insertion order,
+        // whatever the storage class.
         let mut symbol_map: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
         for ef in encoded {
@@ -17890,7 +24097,13 @@ impl X86Pipeline {
                 "COFF function symbol offset",
                 ef.text_offset,
             )?;
-            let symbol_index = writer.add_function_symbol(&ef.name, text, text_offset);
+            let symbol_index = if function_symbols.binding_of(&ef.name).linkage()
+                == crate::pipeline::FunctionSymbolLinkage::Local
+            {
+                writer.add_static_function_symbol(&ef.name, text, text_offset)
+            } else {
+                writer.add_function_symbol(&ef.name, text, text_offset)
+            };
             symbol_map.insert(ef.name.clone(), symbol_index);
         }
         let mut import_symbol_map: std::collections::HashMap<String, u32> =
@@ -17902,7 +24115,7 @@ impl X86Pipeline {
         let mut text_relocations = Vec::new();
         if !rdata_reloc_offsets.is_empty() {
             let Some(rdata_symbol) = rdata_symbol else {
-                return Err(X86PipelineError::ConstantPool(
+                return Err(X86PipelineError::ObjectEmission(
                     "module x86-64 COFF has .text constant-pool relocations but no .rdata symbol"
                         .to_string(),
                 ));
@@ -17929,6 +24142,9 @@ impl X86Pipeline {
             }
             for gf in &ef.global_ref_fixups {
                 let sym_idx = match gf.kind {
+                    X86SymbolRefFixupKind::ExactFunctionAddr => {
+                        return Err(reject_exact_x86_object_address(&ef.name, &gf.symbol));
+                    }
                     X86SymbolRefFixupKind::GlobalRef => {
                         let Some(&sym_idx) = symbol_map.get(&gf.symbol) else {
                             return Err(X86PipelineError::GlobalRefUnsupported {
@@ -18038,7 +24254,7 @@ impl X86Pipeline {
         use trust_cg_lower::x86_64_isel::X86InstructionSelector;
 
         input.validate_eh_structure().map_err(|reason| {
-            X86PipelineError::ISel(format!(
+            X86PipelineError::Unwind(format!(
                 "invalid exception-handling structure in `{}`: {reason}",
                 input.name
             ))
@@ -18092,7 +24308,7 @@ impl X86Pipeline {
 
         let isel_func = isel
             .finalize_with_eh_info(&input.eh_info)
-            .map_err(|e| X86PipelineError::ISel(e.to_string()))?;
+            .map_err(|e| X86PipelineError::Unwind(e.to_string()))?;
         // This public convenience API performs ISel directly instead of
         // entering `Compiler::compile_x86_64`. Apply the same production gate
         // to the exact pre-pass ISel/LIR pair before any pass can erase the
@@ -18120,7 +24336,7 @@ impl X86Pipeline {
         use trust_cg_lower::x86_64_isel::X86InstructionSelector;
 
         input.validate_eh_structure().map_err(|reason| {
-            X86PipelineError::ISel(format!(
+            X86PipelineError::Unwind(format!(
                 "invalid exception-handling structure in `{}`: {reason}",
                 input.name
             ))
@@ -18164,7 +24380,7 @@ impl X86Pipeline {
 
         let isel_func = isel
             .finalize_with_eh_info(&input.eh_info)
-            .map_err(|e| X86PipelineError::ISel(e.to_string()))?;
+            .map_err(|e| X86PipelineError::Unwind(e.to_string()))?;
         reject_x86_eh_sidecar_drop(
             &self.config,
             &isel_func,
@@ -18261,7 +24477,7 @@ impl X86Pipeline {
         ),
         X86PipelineError,
     > {
-        let (code, cp_fixups, call_fixups, global_ref_fixups, _, _, _) =
+        let (code, cp_fixups, call_fixups, global_ref_fixups, _, _, _, _) =
             self.encode_function_with_all_fixups_and_block_metadata(func, alloc, &HashMap::new())?;
         Ok((code, cp_fixups, call_fixups, global_ref_fixups))
     }
@@ -18280,12 +24496,14 @@ impl X86Pipeline {
             HashMap<LirBlock, usize>,
             X86EncodedCallRanges,
             Vec<X86BranchFixup>,
+            bool,
         ),
         X86PipelineError,
     > {
         validate_x86_resolved_function_layout(func)?;
 
         let mut encoder = X86Encoder::new();
+        let mut has_body_instructions = false;
         let mut cp_fixups: Vec<(usize, usize)> = Vec::new();
         // Jump-table LeaRip fixups: (disp32_byte_offset, jump_table_index). Patched
         // after the block loop, once block_offsets are final, by appending the
@@ -18305,6 +24523,13 @@ impl X86Pipeline {
         // This is the SINGLE encode funnel used by BOTH the AOT emission paths
         // and the profiling x86 JIT path, so hooking it here covers both.
         let dc_mode = crate::decode_check::decode_check_mode();
+        #[cfg(all(test, feature = "verify"))]
+        crate::decode_check::lane_probe::record(&func.name, || {
+            crate::decode_check::lane_probe::Event::Encode {
+                check: "ENC-3",
+                mode: dc_mode,
+            }
+        });
         let dc_recording = !matches!(dc_mode, crate::decode_check::DecodeCheckMode::Off);
         let mut dc_items: Vec<
             crate::decode_check::DecodeCheckItem<crate::x86_64::decode_check::X86IntentInst>,
@@ -18315,7 +24540,10 @@ impl X86Pipeline {
         // `TCG_X86_JCC_ALIGN_LOG=1`. ⚑ Both controls are mandatory here: passes
         // in this backend have repeatedly fired ZERO times while looking healthy,
         // and only an accept counter has ever caught it.
-        let jcc_align_on = x86_jcc_align_enabled();
+        // NOTE the extra conjunct: `no-x86-jcc-branch-pad` suppresses the in-loop NOP
+        // bytes WITHOUT touching `x86_text_align_log2` or the per-function padding, so the
+        // alignment regime is preserved. See `x86_jcc_branch_pad_disabled`.
+        let jcc_align_on = x86_jcc_align_enabled() && !x86_jcc_branch_pad_disabled();
         let mut jcc_pads = 0usize;
         let mut jcc_pad_bytes = 0usize;
 
@@ -18335,10 +24563,189 @@ impl X86Pipeline {
         let layout_successor: HashMap<LirBlock, LirBlock> =
             func.block_order.windows(2).map(|w| (w[0], w[1])).collect();
 
-        for &block_id in &func.block_order {
+        // Loop-head 64-byte containment aligner. Default-on; kill switch
+        // `TCG_NO_X86_LOOP_HEAD_ALIGN=1` (which also reverts
+        // `x86_text_align_log2`, so a disabled build is byte-identical to a
+        // pre-pass build). Counters via `TCG_X86_LOOP_ALIGN_LOG=1`.
+        let loop_align_on = x86_loop_head_align_enabled();
+        // ⚑ FAIL CLOSED ON AN EMPTY BRANCH-TARGET MAP.
+        // `encode_function_with_all_fixups` calls this with `&HashMap::new()`;
+        // with no targets every block classifies as a non-head and the pass
+        // would silently do nothing while looking healthy. Refuse instead of
+        // guessing — this path also cannot contain a real branch (the encoder
+        // fails closed on any Jmp/Jcc without a target entry).
+        let loop_align_heads: HashMap<usize, usize> =
+            if loop_align_on && func.block_order.len() >= 2 && !branch_targets.is_empty() {
+                x86_innermost_loop_head_spans(&func.block_order, branch_targets)
+            } else {
+                HashMap::new()
+            };
+        let loop_align_active = loop_align_on && !loop_align_heads.is_empty();
+        let loop_align_max_body = x86_loop_align_max_body();
+        let loop_align_max_skip = x86_loop_align_max_skip();
+        let loop_align_seam_pad = x86_loop_align_seam_pad();
+        let mut la_stats = X86LoopAlignStats::default();
+        // Post-emit self-check inputs: (head block, span end LAYOUT index,
+        // predicted body length).
+        let mut la_checks: Vec<(LirBlock, usize, usize)> = Vec::new();
+        // Encoder position at the TOP of each block's iteration, i.e. BEFORE
+        // any containment pad. `block_offsets` records the post-pad position
+        // (so branches land after the NOPs); the self-check needs the pre-pad
+        // one to reconstruct the true end of the preceding block.
+        let mut la_pre_pad_pos: HashMap<LirBlock, usize> = HashMap::new();
+        // G7 state: was the last EMITTED instruction an unconditional transfer?
+        // An elided fall-through jmp deliberately does not set it — the seam is
+        // live in that case. Never reset per block: fall-through carries.
+        let mut last_emitted_was_hard_terminator = false;
+        let loop_probe = X86SpanProbe {
+            func,
+            alloc,
+            branch_targets,
+            layout_successor: &layout_successor,
+            elide_fallthrough_jmp,
+            jcc_align_on,
+        };
+
+        for (layout_idx, &block_id) in func.block_order.iter().enumerate() {
+            if loop_align_active {
+                la_pre_pad_pos.entry(block_id).or_insert(encoder.position());
+                if let Some(&span_end_idx) = loop_align_heads.get(&layout_idx)
+                    // G2: never the entry block. Its offset is the function
+                    // symbol; padding there would move the symbol, not the head.
+                    && layout_idx > 0
+                {
+                    la_stats.heads += 1;
+                    let pos = encoder.position();
+                    let pad = (X86_LOOP_ALIGN_BOUNDARY - pos % X86_LOOP_ALIGN_BOUNDARY)
+                        % X86_LOOP_ALIGN_BOUNDARY;
+                    // A second head inside this span would itself be padded by
+                    // this same pass, which the probe does not model — so it
+                    // could not predict its own bytes. Refuse; counted.
+                    let nested = loop_align_heads
+                        .keys()
+                        .any(|&h| h > layout_idx && h <= span_end_idx);
+                    if nested {
+                        la_stats.decline_nested_head += 1;
+                    } else if pad == 0 {
+                        // G3: already on the grid. Nothing to do — and note the
+                        // pass PINS these: a later change that moves them is
+                        // exactly the lottery this pass exists to remove.
+                        la_stats.already += 1;
+                    } else if pad > loop_align_max_skip {
+                        la_stats.decline_pad_too_big += 1;
+                    } else {
+                        // G5: does the body FIT in a line once aligned? A body
+                        // that cannot be contained must never be padded — that
+                        // is the exact inverse of the reverted 2026-07-16
+                        // `span >= 96B` heuristic.
+                        match x86_probe_span_len(
+                            &loop_probe,
+                            layout_idx,
+                            span_end_idx,
+                            pos + pad,
+                            loop_align_max_body,
+                        ) {
+                            None => la_stats.decline_body_too_big += 1,
+                            Some(aligned_len) => {
+                                // G6: REPAIR ONLY, NEVER RELOCATE. If the body
+                                // already lies inside one line where it stands,
+                                // do nothing. This is the property the
+                                // 2026-07-16 pass lacked and the direct cause
+                                // of its b03 −56%.
+                                //
+                                // The body lies inside its line exactly when it
+                                // fits in the `pad` bytes left in that line, so
+                                // the probe is bounded by `pad`: `Some` is
+                                // "contained", `None` is "straddles". It must
+                                // not be bounded by `max_body`: a body that
+                                // fits where it stands can exceed a smaller
+                                // cap, and reading that as "straddles" would
+                                // relocate a contained loop.
+                                let contained_now = x86_probe_span_len(
+                                    &loop_probe,
+                                    layout_idx,
+                                    span_end_idx,
+                                    pos,
+                                    pad,
+                                )
+                                .is_some();
+                                if contained_now {
+                                    la_stats.decline_already_contained += 1;
+                                } else {
+                                    // Here the body as it stands is LONGER than
+                                    // the pad. `aligned_len` can be shorter than
+                                    // the pad: aligning the head moves the
+                                    // JCC-erratum padder's 32-byte grid under the
+                                    // body, which can remove NOPs the body carries
+                                    // where it stands (`e2e_x86_64_differential`'s
+                                    // factorial: pad 58, aligned body 54).
+                                    //
+                                    // G7: the pad budget. At a DEAD site the pad
+                                    // is unreachable bytes, so only `max_skip`
+                                    // bounds it. At a LIVE fall-through seam the
+                                    // pad RETIRES on every entry to the loop, and
+                                    // the budget is the seam knob — whose default
+                                    // is now the same as `max_skip`, on the
+                                    // argument recorded at
+                                    // `X86_LOOP_ALIGN_DEFAULT_SEAM_PAD`: for any
+                                    // loop this pass pads, the pad is SHORTER than
+                                    // one iteration of the body as it stands, so it
+                                    // is bounded by one sub-iteration per entry
+                                    // against one saved line crossing per
+                                    // iteration.
+                                    let budget = if last_emitted_was_hard_terminator {
+                                        loop_align_max_skip
+                                    } else {
+                                        loop_align_seam_pad
+                                    };
+                                    if pad > budget {
+                                        la_stats.decline_live_seam += 1;
+                                    } else {
+                                        x86_emit_nop_run(
+                                            &mut encoder,
+                                            &mut dc_items,
+                                            dc_recording,
+                                            pad,
+                                        )?;
+                                        la_stats.padded += 1;
+                                        la_stats.pad_bytes += pad;
+                                        la_checks.push((block_id, span_end_idx, aligned_len));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             block_offsets.insert(block_id, encoder.position());
             if let Some(mblock) = func.blocks.get(&block_id) {
                 for (inst_idx, inst) in mblock.insts.iter().enumerate() {
+                    for (index, operand) in inst.operands.iter().enumerate() {
+                        if x86_operand_contains_exact_symbol(operand)
+                            && !(inst.opcode == X86Opcode::LeaRip
+                                && index == 1
+                                && inst.operands.len() == 2
+                                && matches!(operand, X86ISelOperand::ExactModuleSymbol(_))
+                                && match &inst.operands[0] {
+                                    X86ISelOperand::PReg(register) => register.is_gpr64(),
+                                    X86ISelOperand::VReg(register) => {
+                                        register.class == RegClass::Gpr64
+                                            && alloc
+                                                .get(register)
+                                                .is_some_and(|physical| physical.is_gpr64())
+                                    }
+                                    _ => false,
+                                })
+                        {
+                            return Err(X86PipelineError::MalformedFunction {
+                                function: func.name.clone(),
+                                detail: format!(
+                                    "exact module symbol unsupported at {:?} operand {index}",
+                                    inst.opcode
+                                ),
+                            });
+                        }
+                    }
                     // Skip pseudo-instructions.
                     if matches!(
                         inst.opcode,
@@ -18391,39 +24798,33 @@ impl X86Pipeline {
                             alloc,
                         )
                     {
-                        let mut left = pad;
-                        while left > 0 {
-                            // The encoder clamps NopMulti to 1..=15 bytes; chunk
-                            // deterministically rather than widening that contract,
-                            // which lives in a different crate from the decode-check
-                            // canonical-byte table and must move in lockstep with it.
-                            let chunk = left.min(15);
-                            let mut nop_ops = X86InstOperands::none();
-                            nop_ops.imm = chunk as i64;
-                            let nop_start = encoder.position();
-                            encoder
-                                .encode_instruction(X86Opcode::NopMulti, &nop_ops)
-                                .map_err(X86PipelineError::from)?;
-                            let nop_end = encoder.position();
-                            if dc_recording {
-                                dc_items.push(crate::decode_check::DecodeCheckItem {
-                                    start: nop_start,
-                                    end: nop_end,
-                                    intent: crate::x86_64::decode_check::X86IntentInst {
-                                        opcode: X86Opcode::NopMulti,
-                                        ops: nop_ops,
-                                    },
-                                    hole: None,
-                                });
-                            }
-                            left -= chunk;
-                        }
+                        x86_emit_nop_run(&mut encoder, &mut dc_items, dc_recording, pad)?;
                         jcc_pads += 1;
                         jcc_pad_bytes += pad;
                     }
 
                     // ENC-3: byte offset at which THIS instruction's bytes begin.
                     let dc_start = encoder.position();
+
+                    // G7 state for the loop-head containment aligner: a pad
+                    // before the NEXT block's head is DEAD BYTES only if the
+                    // instruction physically preceding it is an unconditional
+                    // transfer. Set here, after the pseudo skip and the
+                    // fall-through elision (an elided jmp emits nothing and
+                    // leaves a LIVE seam), and unconditionally before the
+                    // emission below, so it always describes the last
+                    // instruction whose bytes actually reached the buffer.
+                    //
+                    // ⚑ This is the gate that keeps the aarch64 pass's only
+                    // real failure mode (retired pad NOPs inside a hot
+                    // enclosing loop) unreachable. It is dynamic on purpose:
+                    // if a future block-layout change stops emitting
+                    // `jmp exit` before loop heads, the pass degrades to
+                    // "refuses to pad", never to "quietly executes NOPs".
+                    last_emitted_was_hard_terminator = matches!(
+                        opcode,
+                        X86Opcode::Jmp | X86Opcode::JmpR | X86Opcode::Ret | X86Opcode::Ud2
+                    );
 
                     // For RIP-relative constant pool loads, the imm field holds
                     // the entry index. Record fixup and set disp=0 as placeholder.
@@ -18471,6 +24872,9 @@ impl X86Pipeline {
                             call_fixups.push(X86CallFixup {
                                 offset: disp32_offset,
                                 callee: name,
+                                exact_module: inst
+                                    .flags
+                                    .contains(trust_cg_ir::inst::InstFlags::EXACT_MODULE_CALL),
                             });
                         }
                         // Indirect CALLs with no Symbol operand (CallR / CallM,
@@ -18480,13 +24884,17 @@ impl X86Pipeline {
                         opcode,
                         X86Opcode::LeaRip | X86Opcode::MovRipRel | X86Opcode::MovRipRelTlv
                     ) {
-                        let symbol_name = inst.operands.iter().find_map(|op| {
-                            if let X86ISelOperand::Symbol(s) = op {
-                                Some(s.clone())
-                            } else {
-                                None
+                        let symbol_name = match inst.operands.get(1) {
+                            // The exact carrier's complete shape and resolved
+                            // 64-bit destination were checked before encoding.
+                            Some(X86ISelOperand::ExactModuleSymbol(symbol)) => {
+                                Some((symbol.clone(), true))
                             }
-                        });
+                            _ => inst.operands.iter().find_map(|op| match op {
+                                X86ISelOperand::Symbol(symbol) => Some((symbol.clone(), false)),
+                                _ => None,
+                            }),
+                        };
                         // A jump-table LeaRip (`lea base, [rip + JT]`) carries a
                         // JumpTableIndex instead of a Symbol; its disp32 is patched
                         // post-layout to the table base (appended after the body).
@@ -18507,11 +24915,13 @@ impl X86Pipeline {
                             .map_err(X86PipelineError::from)?;
                         let after = encoder.position();
 
-                        if let Some(symbol) = symbol_name {
+                        if let Some((symbol, exact)) = symbol_name {
                             global_ref_fixups.push(X86GlobalRefFixup {
                                 offset: after - 4,
                                 symbol,
-                                kind: if matches!(opcode, X86Opcode::MovRipRel) {
+                                kind: if exact {
+                                    X86SymbolRefFixupKind::ExactFunctionAddr
+                                } else if matches!(opcode, X86Opcode::MovRipRel) {
                                     X86SymbolRefFixupKind::ExternRefGot
                                 } else if matches!(opcode, X86Opcode::MovRipRelTlv) {
                                     X86SymbolRefFixupKind::TlsTlv
@@ -18600,6 +25010,10 @@ impl X86Pipeline {
                         }
                     }
 
+                    // Count only bytes emitted for an actual instruction: not
+                    // alignment padding, later inline tables/pools, or profiling.
+                    has_body_instructions |= encoder.position() > dc_start;
+
                     // ENC-3: record this instruction's emitted byte range + the
                     // intended (resolved opcode, ops) + any fixup hole, for the
                     // end-of-function decode-check. `ops` here is post-mutation,
@@ -18609,10 +25023,13 @@ impl X86Pipeline {
                         if dc_end > dc_start {
                             use crate::decode_check::{FixupHole, FixupHoleKind};
                             let hole_off = (dc_end - dc_start).saturating_sub(4);
-                            let has_symbol = inst
-                                .operands
-                                .iter()
-                                .any(|op| matches!(op, X86ISelOperand::Symbol(_)));
+                            let has_symbol = inst.operands.iter().any(|op| {
+                                matches!(
+                                    op,
+                                    X86ISelOperand::Symbol(_)
+                                        | X86ISelOperand::ExactModuleSymbol(_)
+                                )
+                            });
                             let has_jt = inst
                                 .operands
                                 .iter()
@@ -18688,6 +25105,65 @@ impl X86Pipeline {
             eprintln!(
                 "[jcc-align] ACCEPT {jcc_pads} pads, {jcc_pad_bytes} bytes in `{}`",
                 func.name
+            );
+        }
+
+        // Loop-head aligner: POST-EMIT SELF-CHECK, then the counters.
+        //
+        // The probe models the encoder (pseudo skip, fall-through elision, JCC
+        // padding, exact encoded lengths). If that model is wrong, the pass is
+        // padding to a boundary the bytes do not actually respect — silently.
+        // So re-derive each padded head's REAL byte span from the final
+        // `block_offsets` and confirm containment. `miss` is a defect signal:
+        // do not ship a pass that cannot predict its own output.
+        if !la_checks.is_empty() {
+            let body_end = encoder.position();
+            let log = x86_loop_align_log_enabled();
+            for &(head_block, span_end_idx, predicted_len) in &la_checks {
+                let Some(&start) = block_offsets.get(&head_block) else {
+                    la_stats.miss += 1;
+                    continue;
+                };
+                // End of the span = the pre-pad position of the block laid out
+                // after it (pre-pad, because a containment pad belonging to the
+                // NEXT head is not part of this body), or the end of the body.
+                let end = func
+                    .block_order
+                    .get(span_end_idx + 1)
+                    .and_then(|next| la_pre_pad_pos.get(next).copied())
+                    .unwrap_or(body_end);
+                let actual = end.saturating_sub(start);
+                let contained = actual > 0
+                    && start / X86_LOOP_ALIGN_BOUNDARY
+                        == (start + actual - 1) / X86_LOOP_ALIGN_BOUNDARY;
+                if actual != predicted_len || !contained {
+                    la_stats.miss += 1;
+                    if log {
+                        eprintln!(
+                            "[loop-align] MISS in `{}` head {:?}: predicted {predicted_len} B, \
+                             actual {actual} B at offset {start} (contained={contained})",
+                            func.name, head_block
+                        );
+                    }
+                }
+            }
+        }
+        if (la_stats.heads > 0 || la_stats.miss > 0) && x86_loop_align_log_enabled() {
+            eprintln!(
+                "[loop-align] `{}`: heads={} already={} padded={} (+{} bytes) miss={} | \
+                 declines: nested_head={} pad_too_big={} body_too_big={} \
+                 already_contained={} live_seam={}",
+                func.name,
+                la_stats.heads,
+                la_stats.already,
+                la_stats.padded,
+                la_stats.pad_bytes,
+                la_stats.miss,
+                la_stats.decline_nested_head,
+                la_stats.decline_pad_too_big,
+                la_stats.decline_body_too_big,
+                la_stats.decline_already_contained,
+                la_stats.decline_live_seam,
             );
         }
 
@@ -18807,6 +25283,7 @@ impl X86Pipeline {
             block_offsets,
             encoded_call_ranges,
             branch_fixups,
+            has_body_instructions,
         ))
     }
 
@@ -18838,17 +25315,19 @@ impl X86Pipeline {
         use crate::elf::constants::{SHF_ALLOC, SHT_PROGBITS};
 
         let mut writer = ElfWriter::new(ElfMachine::X86_64);
-        writer.add_text_section_with_align(code, 1u64 << x86_text_align_log2());
+        writer.add_text_section_with_align(code, 1u64 << x86_text_align_log2())?;
         if !rodata.is_empty() {
-            writer.add_section(".rodata", rodata, SHT_PROGBITS, SHF_ALLOC, 8);
+            writer.add_section(".rodata", rodata, SHT_PROGBITS, SHF_ALLOC, 8)?;
         }
         writer.add_symbol(func_name, 1, 0, code.len() as u64, true, 2); // STT_FUNC
         if let Some(metadata) = frame_metadata {
             let code_len = checked_x86_code_len(func_name, code.len())?;
             if let Some(record) = x86_64_dynamic_eh_frame_record(metadata, code_len, 1) {
-                add_x86_64_eh_frame_to_elf(&mut writer, &[record]);
+                add_x86_64_eh_frame_to_elf(&mut writer, &[record])?;
             }
         }
+        // Non-executable stack marker, as in the module emitter.
+        writer.add_note_gnu_stack();
         // Same checked funnel as the module emitter: every x86-64 ELF object
         // this pipeline serializes is reparse-gated.
         writer
@@ -18873,6 +25352,7 @@ impl X86Pipeline {
         use crate::macho::constants::S_REGULAR;
 
         let mut writer = MachOWriter::for_target(MachOTarget::X86_64);
+        writer.set_build_version(self.config.macho_build_version);
         writer.add_text_section_with_align(code, x86_text_align_log2());
         if !rodata.is_empty() {
             // Use __TEXT,__const for read-only constant data (float literals).
@@ -18912,7 +25392,7 @@ impl X86Pipeline {
         frame_metadata: Option<&X86FrameMetadata>,
     ) -> Result<Vec<u8>, X86PipelineError> {
         if rodata.is_empty() && !rdata_rel32_offsets.is_empty() {
-            return Err(X86PipelineError::ConstantPool(
+            return Err(X86PipelineError::ObjectEmission(
                 "single-function x86-64 COFF has .text constant-pool relocations but no .rdata"
                     .to_string(),
             ));
@@ -18952,7 +25432,7 @@ impl X86Pipeline {
             let rdata_symbol = writer.add_static_section_symbol(".rdata", rdata);
             for &offset in rdata_rel32_offsets {
                 let virtual_address = u32::try_from(offset).map_err(|_| {
-                    X86PipelineError::ConstantPool(format!(
+                    X86PipelineError::ObjectEmission(format!(
                         "COFF constant-pool relocation offset {offset} does not fit in u32"
                     ))
                 })?;
@@ -19195,6 +25675,10 @@ pub fn build_x86_const_test_function() -> X86ISelFunction {
 // ===========================================================================
 
 #[cfg(test)]
+#[path = "pipeline_refusal_layer_tests.rs"]
+mod refusal_layer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use trust_cg_ir::function::StackSlotSizeSource;
@@ -19212,6 +25696,75 @@ mod tests {
         X86ISelConstPoolEntry, X86ISelFunction, X86ISelInst, X86ISelOperand,
     };
 
+    #[test]
+    fn admission_memo_poison_declines_previously_admitted_rewrites() {
+        let memo = std::sync::Mutex::new(HashMap::from([(7, true)]));
+        poison_admission_memo(&memo);
+        for key in [7, 8] {
+            assert!(!memoized_x86_admission(&memo, key, || {
+                panic!("poisoned memo must decline without running the verifier")
+            }));
+        }
+        assert!(memo.is_poisoned());
+    }
+
+    #[test]
+    fn admission_memo_poison_during_verification_declines_the_rewrite() {
+        let memo = std::sync::Mutex::new(HashMap::new());
+        assert!(!memoized_x86_admission(&memo, 7, || {
+            poison_admission_memo(&memo);
+            true
+        }));
+        assert!(memo.is_poisoned());
+        assert!(!memo.lock().unwrap_err().into_inner().contains_key(&7));
+    }
+
+    #[test]
+    fn admission_memo_caches_both_verdicts_without_locking_the_verifier() {
+        let memo = std::sync::Mutex::new(HashMap::new());
+        for (key, verdict) in [(7, true), (8, false)] {
+            assert_eq!(
+                memoized_x86_admission(&memo, key, || {
+                    assert!(
+                        memo.try_lock().is_ok(),
+                        "verification must run outside the lock"
+                    );
+                    verdict
+                }),
+                verdict
+            );
+            assert_eq!(
+                memoized_x86_admission(&memo, key, || {
+                    panic!("cache hit must not invoke verification twice")
+                }),
+                verdict
+            );
+        }
+    }
+
+    #[test]
+    fn admission_memo_verifier_panic_does_not_poison_or_populate_the_memo() {
+        let memo = std::sync::Mutex::new(HashMap::new());
+        let result = std::panic::catch_unwind(|| {
+            memoized_x86_admission(&memo, 7, || panic!("armed verifier panic"))
+        });
+        assert!(result.is_err());
+        assert!(!memo.is_poisoned());
+        assert!(memo.lock().unwrap().is_empty());
+        assert!(memoized_x86_admission(&memo, 7, || true));
+    }
+
+    fn poison_admission_memo(memo: &std::sync::Mutex<HashMap<i32, bool>>) {
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = memo.lock().unwrap();
+                panic!("armed admission-memo poison");
+            })
+            .is_err()
+        );
+        assert!(memo.is_poisoned());
+    }
+
     // -----------------------------------------------------------------------
     // Helper: build a minimal ISel function
     // -----------------------------------------------------------------------
@@ -19227,6 +25780,226 @@ mod tests {
         func
     }
 
+    fn exact_address_fixture(target: &str) -> X86ISelFunction {
+        let mut function = minimal_func("materialize");
+        function.sig.returns = vec![Type::I64];
+        let value = VReg::new(0, RegClass::Gpr64);
+        function.next_vreg = 1;
+        function.push_inst(
+            Block(0),
+            X86ISelInst::new(
+                X86Opcode::LeaRip,
+                vec![
+                    X86ISelOperand::VReg(value),
+                    X86ISelOperand::ExactModuleSymbol(target.into()),
+                ],
+            ),
+        );
+        function.push_inst(
+            Block(0),
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RAX), X86ISelOperand::VReg(value)],
+            ),
+        );
+        function.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        function
+    }
+
+    #[test]
+    fn x86_exact_function_address_encoder_requires_complete_typed_shape() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig::default());
+        let exact = X86ISelOperand::ExactModuleSymbol("callee".into());
+        let virtual_reg = VReg::new(0, RegClass::Gpr64);
+        let fixture = |operands| {
+            let mut function = minimal_func("address_shape");
+            function.push_inst(Block(0), X86ISelInst::new(X86Opcode::LeaRip, operands));
+            function.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+            function
+        };
+        for operands in [
+            vec![X86ISelOperand::Symbol("ordinary".into()), exact.clone()],
+            vec![
+                X86ISelOperand::PReg(RAX),
+                exact.clone(),
+                X86ISelOperand::Imm(0),
+            ],
+            vec![X86ISelOperand::PReg(EAX), exact.clone()],
+            vec![X86ISelOperand::PReg(XMM0), exact.clone()],
+            vec![X86ISelOperand::VReg(virtual_reg), exact.clone()],
+        ] {
+            assert!(
+                pipeline
+                    .encode_function_with_all_fixups(&fixture(operands), &HashMap::new())
+                    .is_err()
+            );
+        }
+        // Simplified RA may retain virtual operands; the complete allocation
+        // must resolve their Gpr64 destination, never synthesize register zero.
+        let function = fixture(vec![X86ISelOperand::VReg(virtual_reg), exact]);
+        assert!(
+            pipeline
+                .encode_function_with_all_fixups(&function, &HashMap::from([(virtual_reg, EAX)]))
+                .is_err()
+        );
+        let (_, _, _, fixups) = pipeline
+            .encode_function_with_all_fixups(&function, &HashMap::from([(virtual_reg, RAX)]))
+            .unwrap();
+        assert_eq!(fixups[0].kind, X86SymbolRefFixupKind::ExactFunctionAddr);
+        assert_eq!(fixups[0].symbol, "callee");
+    }
+
+    #[test]
+    fn x86_exact_function_address_survives_passes_regalloc_and_encoding() {
+        // This is cross-host encoding evidence; it does not execute x86 code.
+        for level in [
+            trust_cg_opt::OptLevel::O0,
+            trust_cg_opt::OptLevel::O2,
+            trust_cg_opt::OptLevel::O3,
+        ] {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                opt_level: level,
+                ..X86PipelineConfig::default()
+            });
+            for target in ["callee", "_callee"] {
+                let (code, _, calls, references) = pipeline
+                    .compile_function_with_fixups(&exact_address_fixture(target))
+                    .unwrap();
+                assert!(calls.is_empty());
+                assert_eq!(references.len(), 1, "{level:?}");
+                let reference = &references[0];
+                assert_eq!(reference.symbol, target);
+                assert_eq!(reference.kind, X86SymbolRefFixupKind::ExactFunctionAddr);
+                assert_eq!(code[reference.offset - 2], 0x8d, "RIP-relative LEA opcode");
+                assert_eq!(
+                    code[reference.offset - 1] & 0xc7,
+                    0x05,
+                    "RIP-relative addressing"
+                );
+                assert_eq!(&code[reference.offset..reference.offset + 4], &[0; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn x86_exact_function_address_module_requires_one_canonical_function() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            opt_level: trust_cg_opt::OptLevel::O0,
+            ..Default::default()
+        });
+        let mut target = minimal_func("callee");
+        target.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let caller = exact_address_fixture("callee");
+        assert!(
+            pipeline
+                .compile_module(&[caller.clone(), target.clone()])
+                .is_ok()
+        );
+        assert!(
+            pipeline
+                .compile_module(std::slice::from_ref(&caller))
+                .is_err()
+        );
+        assert!(
+            pipeline
+                .compile_module(&[caller.clone(), target.clone(), target])
+                .is_err()
+        );
+        let mut alias = minimal_func("_callee");
+        alias.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        assert!(pipeline.compile_module(&[caller, alias]).is_err());
+    }
+
+    #[test]
+    fn x86_exact_function_address_rejects_zero_byte_target() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            opt_level: trust_cg_opt::OptLevel::O0,
+            emit_frame: false,
+            ..Default::default()
+        });
+        let empty = minimal_func("callee");
+        let (code, _, _, _) = pipeline.compile_function_with_fixups(&empty).unwrap();
+        assert!(
+            code.is_empty(),
+            "control must really encode a zero-byte target"
+        );
+        let error = pipeline
+            .compile_module(&[exact_address_fixture("callee"), empty])
+            .unwrap_err();
+        assert!(
+            matches!(error, X86PipelineError::ObjectEmission(reason) if reason.contains("empty compiled function"))
+        );
+    }
+
+    #[test]
+    fn x86_exact_function_address_objects_refuse_preemptible_binding() {
+        // Object writers currently lack non-preemptible function-linkage metadata.
+        // The generic AOT Compiler already rejects this local-identity case.
+        for format in [
+            X86OutputFormat::MachO,
+            X86OutputFormat::Elf,
+            X86OutputFormat::Coff,
+        ] {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                opt_level: trust_cg_opt::OptLevel::O0,
+                output_format: format,
+                ..Default::default()
+            });
+            let mut target = minimal_func("callee");
+            target.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+            let functions = [exact_address_fixture("callee"), target];
+            let error = pipeline.compile_module(&functions).unwrap_err();
+            assert!(
+                matches!(error, X86PipelineError::GlobalRefUnsupported { reason, .. }
+                if reason.contains("non-preemptible")),
+                "{format:?}"
+            );
+            #[cfg(feature = "verify")]
+            {
+                let assembled = pipeline.assemble_module(&functions, true, false).unwrap();
+                assert!(
+                    pipeline
+                        .x86_object_relocation_inventory_rows(
+                            &assembled.encoded,
+                            &assembled.combined_rdata,
+                            assembled.effective_format,
+                            &[]
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x86_exact_function_address_rejects_unsupported_or_nested_carriers() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            opt_level: trust_cg_opt::OptLevel::O0,
+            ..Default::default()
+        });
+        for (opcode, operand) in [
+            (
+                X86Opcode::MovRipRel,
+                X86ISelOperand::ExactModuleSymbol("callee".into()),
+            ),
+            (
+                X86Opcode::MovRM,
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::ExactModuleSymbol("callee".into())),
+                    disp: 0,
+                },
+            ),
+        ] {
+            let mut function = minimal_func("bad_carrier");
+            function.push_inst(
+                Block(0),
+                X86ISelInst::new(opcode, vec![X86ISelOperand::PReg(RAX), operand]),
+            );
+            function.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+            assert!(pipeline.compile_function_with_fixups(&function).is_err());
+        }
+    }
+
     #[test]
     fn x86_jcc_alignment_control_is_default_on_and_nonzero_kill_switch() {
         crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_JCC_ALIGN"], || {
@@ -19238,6 +26011,458 @@ mod tests {
         crate::env_lock::with_env_overrides(&[("TCG_NO_X86_JCC_ALIGN", "1")], || {
             assert!(!x86_jcc_align_enabled());
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Loop-head 64-byte containment aligner
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn x86_loop_head_align_control_is_default_on_and_nonzero_kill_switch() {
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_LOOP_HEAD_ALIGN"], || {
+            assert!(x86_loop_head_align_enabled());
+        });
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "0")], || {
+            assert!(x86_loop_head_align_enabled());
+        });
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+            assert!(!x86_loop_head_align_enabled());
+        });
+    }
+
+    /// The pass and the grid it reasons on must move together, or it is
+    /// provably half-effective: at 32-byte function alignment, function starts
+    /// land at `0 mod 64` and `32 mod 64` in roughly equal numbers, so a
+    /// function-relative 64-byte aligner targets the wrong grid in about half
+    /// of all functions.
+    #[test]
+    fn x86_loop_head_align_owns_the_text_alignment_grid() {
+        crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_X86_LOOP_HEAD_ALIGN", "TCG_NO_X86_JCC_ALIGN"],
+            || {
+                assert_eq!(x86_text_align_log2(), 6);
+            },
+        );
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+            crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_JCC_ALIGN"], || {
+                assert_eq!(x86_text_align_log2(), 5);
+            });
+        });
+        crate::env_lock::with_env_overrides(
+            &[
+                ("TCG_NO_X86_LOOP_HEAD_ALIGN", "1"),
+                ("TCG_NO_X86_JCC_ALIGN", "1"),
+            ],
+            || {
+                assert_eq!(x86_text_align_log2(), 4);
+            },
+        );
+    }
+
+    /// Build `[B0: <filler>; jmp B2] [B1: add rax,1; jcc B1] [B2: ret]`.
+    ///
+    /// `B0`'s `jmp` targets `B2`, NOT its layout successor, so it is not elided
+    /// and the seam before `B1` is a DEAD pad site — the shape 41 of 45
+    /// innermost heads in the benchmark corpus actually have. `B1` is a
+    /// self-backedge innermost head with a body far under one fetch line.
+    fn loop_head_align_fixture(name: &str, filler: usize, dead_seam: bool) -> X86ISelFunction {
+        let mut func = minimal_func(name);
+        func.ensure_block(Block(1));
+        func.ensure_block(Block(2));
+        for _ in 0..filler {
+            func.push_inst(
+                Block(0),
+                X86ISelInst::new(
+                    X86Opcode::AddRI,
+                    vec![X86ISelOperand::PReg(RAX), X86ISelOperand::Imm(1)],
+                ),
+            );
+        }
+        func.push_inst(
+            Block(0),
+            if dead_seam {
+                // Unconditional transfer to a NON-successor block: emitted, so
+                // the bytes after it are unreachable.
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))])
+            } else {
+                // Conditional: control falls through into B1, so the seam is
+                // LIVE and any pad there would retire every entry.
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::E),
+                        X86ISelOperand::Block(Block(2)),
+                    ],
+                )
+            },
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![X86ISelOperand::PReg(RAX), X86ISelOperand::Imm(1)],
+            ),
+        );
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::E),
+                    X86ISelOperand::Block(Block(1)),
+                ],
+            ),
+        );
+        func.push_inst(Block(2), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.block_order = vec![Block(0), Block(1), Block(2)];
+        func.blocks.get_mut(&Block(0)).unwrap().successors = if dead_seam {
+            vec![Block(2)]
+        } else {
+            vec![Block(2), Block(1)]
+        };
+        func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(1), Block(2)];
+        func
+    }
+
+    fn loop_head_offset(func: &X86ISelFunction) -> usize {
+        let pipeline = X86Pipeline::new(X86PipelineConfig::default());
+        let targets = collect_x86_branch_targets(func);
+        let (_, _, _, _, block_offsets, _, _, _) = pipeline
+            .encode_function_with_all_fixups_and_block_metadata(func, &HashMap::new(), &targets)
+            .expect("fixture must encode");
+        block_offsets[&Block(1)]
+    }
+
+    #[test]
+    fn x86_innermost_loop_head_spans_keeps_only_the_inner_loop() {
+        // Layout 0..=3 with an outer backedge 3 -> 1 and an inner backedge
+        // 2 -> 2. Only the inner one is innermost.
+        let order = vec![Block(0), Block(1), Block(2), Block(3)];
+        let mut targets: HashMap<(LirBlock, usize), LirBlock> = HashMap::new();
+        targets.insert((Block(3), 0), Block(1));
+        targets.insert((Block(2), 0), Block(2));
+        let spans = x86_innermost_loop_head_spans(&order, &targets);
+        assert_eq!(spans.len(), 1, "outer head must be dropped: {spans:?}");
+        assert_eq!(spans.get(&2).copied(), Some(2));
+
+        // A forward branch is never a backedge.
+        let mut forward: HashMap<(LirBlock, usize), LirBlock> = HashMap::new();
+        forward.insert((Block(0), 0), Block(2));
+        assert!(x86_innermost_loop_head_spans(&order, &forward).is_empty());
+    }
+
+    /// The pass fires at a dead seam, and the POSITIVE CONTROL is in the test:
+    /// the same head must be provably OFF the 64-byte grid with the pass
+    /// disabled. A containment test whose subject was already contained proves
+    /// nothing.
+    #[test]
+    fn x86_loop_head_align_contains_a_small_loop_at_a_dead_seam() {
+        let func = loop_head_align_fixture("loop_head_align_dead_seam", 13, true);
+
+        let unpadded =
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+                loop_head_offset(&func)
+            });
+        assert!(
+            !unpadded.is_multiple_of(X86_LOOP_ALIGN_BOUNDARY),
+            "POSITIVE CONTROL FAILED: the fixture head is already 64-aligned at \
+             offset {unpadded} without the pass, so this test cannot observe it. \
+             Re-tune `filler`."
+        );
+
+        let padded = crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_X86_LOOP_HEAD_ALIGN", "TCG_X86_LOOP_ALIGN_MAX_BODY"],
+            || loop_head_offset(&func),
+        );
+        assert!(
+            padded.is_multiple_of(X86_LOOP_ALIGN_BOUNDARY),
+            "head landed at {padded}, not on the 64-byte grid"
+        );
+        assert!(padded > unpadded, "the pass must only ever ADD bytes");
+    }
+
+    /// G6: REPAIR ONLY, NEVER RELOCATE. A head whose body already lies inside
+    /// one fetch line must not be moved, however far off the grid it sits.
+    /// This is the property the reverted 2026-07-16 x86 aligner lacked, and
+    /// the direct cause of its −56% single-program catastrophe: once a pass
+    /// moves loops that were already fine, its effect is pure displacement
+    /// noise and every fixed heuristic only relocates the damage.
+    #[test]
+    fn x86_loop_head_align_never_relocates_an_already_contained_loop() {
+        let func = loop_head_align_fixture("loop_head_align_contained", 5, true);
+        let unpadded =
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+                loop_head_offset(&func)
+            });
+        assert!(
+            !unpadded.is_multiple_of(X86_LOOP_ALIGN_BOUNDARY),
+            "the fixture head must be OFF the grid, or 'did not move' is vacuous"
+        );
+        let with_pass = crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_X86_LOOP_HEAD_ALIGN", "TCG_X86_LOOP_ALIGN_MAX_BODY"],
+            || loop_head_offset(&func),
+        );
+        assert_eq!(
+            with_pass, unpadded,
+            "an already-contained loop must never be relocated"
+        );
+    }
+
+    /// G7, BOTH DIRECTIONS. A live fall-through seam IS padded by default since
+    /// 2026-09-29 — refusing it cost 14.8% on `h3_box_leak` — and
+    /// `TCG_X86_LOOP_ALIGN_SEAM_PAD=0` restores the old refusal, which is what
+    /// keeps the new policy falsifiable: without that arm, a fixture the pass
+    /// silently failed to reach would satisfy the first half vacuously.
+    #[test]
+    fn x86_loop_head_align_pads_a_live_fallthrough_seam_and_the_knob_restores_the_refusal() {
+        // ⚑ `filler` is tuned so the head genuinely STRADDLES here: with a
+        // contained head G6 would decline first and this test would pass
+        // vacuously without ever reaching the seam gate.
+        let func = loop_head_align_fixture("loop_head_align_live_seam", 13, false);
+        let unpadded =
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+                loop_head_offset(&func)
+            });
+        assert!(
+            !unpadded.is_multiple_of(X86_LOOP_ALIGN_BOUNDARY),
+            "POSITIVE CONTROL FAILED: the fixture head is already 64-aligned at \
+             offset {unpadded} without the pass. Re-tune `filler`."
+        );
+
+        let padded = crate::env_lock::with_env_overrides_removed(
+            &[
+                "TCG_NO_X86_LOOP_HEAD_ALIGN",
+                "TCG_X86_LOOP_ALIGN_MAX_BODY",
+                "TCG_X86_LOOP_ALIGN_SEAM_PAD",
+            ],
+            || loop_head_offset(&func),
+        );
+        assert!(
+            padded.is_multiple_of(X86_LOOP_ALIGN_BOUNDARY),
+            "a straddling live-seam head must now be contained; landed at {padded}"
+        );
+        assert!(padded > unpadded, "the pass must only ever ADD bytes");
+
+        let refused =
+            crate::env_lock::with_env_overrides(&[("TCG_X86_LOOP_ALIGN_SEAM_PAD", "0")], || {
+                loop_head_offset(&func)
+            });
+        assert_eq!(
+            refused, unpadded,
+            "seam-pad=0 must restore the refusal exactly"
+        );
+    }
+
+    /// `MAX_BODY=0` is the Arm-1 measurement arm: 64-byte function alignment
+    /// with ZERO padding, so a suite move can be attributed to the pass rather
+    /// than to the one-time global placement re-roll the grid change causes.
+    #[test]
+    fn x86_loop_head_align_max_body_zero_pads_nothing_but_keeps_the_grid() {
+        let func = loop_head_align_fixture("loop_head_align_arm1", 13, true);
+        let unpadded =
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+                loop_head_offset(&func)
+            });
+        crate::env_lock::with_env_overrides(&[("TCG_X86_LOOP_ALIGN_MAX_BODY", "0")], || {
+            assert_eq!(loop_head_offset(&func), unpadded);
+            assert_eq!(
+                x86_text_align_log2(),
+                6,
+                "Arm 1 must keep the 64-byte grid — that is the whole point of it"
+            );
+        });
+    }
+
+    /// A loop body that cannot fit inside one fetch line must get NO padding.
+    /// This is the exact inverse of the reverted 2026-07-16 `span >= 96B`
+    /// heuristic, which padded only loops that could never be contained and
+    /// relocated a -50% catastrophe onto another program.
+    #[test]
+    fn x86_loop_head_align_never_pads_a_body_that_cannot_be_contained() {
+        let mut func = loop_head_align_fixture("loop_head_align_big_body", 13, true);
+        // Grow B1 well past 64 bytes; each AddRI is 4 bytes.
+        for _ in 0..24 {
+            func.blocks.get_mut(&Block(1)).unwrap().insts.insert(
+                0,
+                X86ISelInst::new(
+                    X86Opcode::AddRI,
+                    vec![X86ISelOperand::PReg(RAX), X86ISelOperand::Imm(1)],
+                ),
+            );
+        }
+        let unpadded =
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+                loop_head_offset(&func)
+            });
+        let with_pass = crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_X86_LOOP_HEAD_ALIGN", "TCG_X86_LOOP_ALIGN_MAX_BODY"],
+            || loop_head_offset(&func),
+        );
+        assert_eq!(with_pass, unpadded);
+    }
+
+    /// Every knob these tests' default-policy arms must not inherit.
+    const LOOP_HEAD_ALIGN_KNOBS: [&str; 7] = [
+        "TCG_NO_X86_LOOP_HEAD_ALIGN",
+        "TCG_X86_LOOP_ALIGN_MAX_BODY",
+        "TCG_X86_LOOP_ALIGN_MAX_SKIP",
+        "TCG_X86_LOOP_ALIGN_SEAM_PAD",
+        "TCG_NO_X86_JCC_ALIGN",
+        "TCG_NO_X86_JCC_BRANCH_PAD",
+        "TCG_NO_BRANCH_LAYOUT",
+    ];
+
+    /// Build `[B0: add x filler; jmp B3] [B1: add x m; je B3] [B2: add x p;
+    /// jmp B1] [B3: ret]` (every `add` is `add rax, 1`, 4 bytes).
+    ///
+    /// The loop is `B1..=B2` (backedge `B2 -> B1`) behind a dead seam. B1's
+    /// last `add` and its `je` form one macro-fused unit, so where the head
+    /// lands decides whether the JCC-erratum padder puts NOPs INSIDE the body:
+    /// the body's length depends on its own position.
+    fn loop_head_align_jcc_body_fixture(
+        name: &str,
+        filler: usize,
+        m: usize,
+        p: usize,
+    ) -> X86ISelFunction {
+        let add = || {
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![X86ISelOperand::PReg(RAX), X86ISelOperand::Imm(1)],
+            )
+        };
+        let mut func = minimal_func(name);
+        for block in 1..=3 {
+            func.ensure_block(Block(block));
+        }
+        for _ in 0..filler {
+            func.push_inst(Block(0), add());
+        }
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(3))]),
+        );
+        for _ in 0..m {
+            func.push_inst(Block(1), add());
+        }
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::E),
+                    X86ISelOperand::Block(Block(3)),
+                ],
+            ),
+        );
+        for _ in 0..p {
+            func.push_inst(Block(2), add());
+        }
+        func.push_inst(
+            Block(2),
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(1))]),
+        );
+        func.push_inst(Block(3), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.block_order = vec![Block(0), Block(1), Block(2), Block(3)];
+        func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(3)];
+        func.blocks.get_mut(&Block(1)).unwrap().successors = vec![Block(3), Block(2)];
+        func.blocks.get_mut(&Block(2)).unwrap().successors = vec![Block(1)];
+        func
+    }
+
+    /// The fixture's head offset with the pass off, the pad to the next line,
+    /// and the loop body's length (replayed by the pass's own probe, under the
+    /// default JCC and branch-layout policy) where it stands and once aligned.
+    fn loop_head_align_jcc_body_geometry(func: &X86ISelFunction) -> (usize, usize, usize, usize) {
+        let unpadded =
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+                loop_head_offset(func)
+            });
+        let pad = (X86_LOOP_ALIGN_BOUNDARY - unpadded % X86_LOOP_ALIGN_BOUNDARY)
+            % X86_LOOP_ALIGN_BOUNDARY;
+        let (len_now, aligned_len) =
+            crate::env_lock::with_env_overrides_removed(&LOOP_HEAD_ALIGN_KNOBS, || {
+                let targets = collect_x86_branch_targets(func);
+                let layout_successor: HashMap<LirBlock, LirBlock> =
+                    func.block_order.windows(2).map(|w| (w[0], w[1])).collect();
+                let alloc = HashMap::new();
+                let probe = X86SpanProbe {
+                    func,
+                    alloc: &alloc,
+                    branch_targets: &targets,
+                    layout_successor: &layout_successor,
+                    elide_fallthrough_jmp: x86_branch_layout_enabled(),
+                    jcc_align_on: x86_jcc_align_enabled() && !x86_jcc_branch_pad_disabled(),
+                };
+                let at = |start| x86_probe_span_len(&probe, 1, 2, start, X86_LOOP_ALIGN_BOUNDARY);
+                (at(unpadded), at(unpadded + pad))
+            });
+        (
+            unpadded,
+            pad,
+            len_now.expect("the fixture body fits the probe bound where it stands"),
+            aligned_len.expect("the fixture body fits the probe bound once aligned"),
+        )
+    }
+
+    /// A straddling body is contained even when aligning it makes it SHORTER
+    /// than the pad.
+    ///
+    /// Aligning a head moves the JCC-erratum padder's 32-byte grid under the
+    /// body. Here B1's fused `add; je` crosses a 32-byte boundary at the
+    /// unpadded head, so the body carries NOPs where it stands, and does not
+    /// cross once aligned. The body straddles its line where it stands (it is
+    /// longer than the pad), while the aligned body is no longer than the pad.
+    /// That is the shape of `e2e_x86_64_differential`'s factorial (pad 58,
+    /// aligned body 54), which tripped a debug assertion that compared the pad
+    /// with the ALIGNED length instead of the length the straddle is measured
+    /// on.
+    #[test]
+    fn x86_loop_head_align_contains_a_straddling_body_that_aligning_shortens() {
+        let func = loop_head_align_jcc_body_fixture("loop_head_align_jcc_body", 2, 4, 5);
+        let (unpadded, pad, len_now, aligned_len) = loop_head_align_jcc_body_geometry(&func);
+        assert!(
+            pad > 0 && len_now > pad && aligned_len <= pad && aligned_len < len_now,
+            "POSITIVE CONTROL FAILED: head {unpadded}, pad {pad}, body {len_now} bytes \
+             where it stands and {aligned_len} aligned; the fixture must straddle where it \
+             stands with an aligned body no longer than the pad. Re-tune the fixture."
+        );
+        let padded = crate::env_lock::with_env_overrides_removed(&LOOP_HEAD_ALIGN_KNOBS, || {
+            loop_head_offset(&func)
+        });
+        assert_eq!(
+            padded,
+            unpadded + pad,
+            "the straddling head must be padded onto the 64-byte grid"
+        );
+    }
+
+    /// G6 does not depend on the body cap. Whether the body lies inside its
+    /// line where it stands is decided by the bytes LEFT in that line. A cap
+    /// that admits the aligned body but not the (longer) body where it stands
+    /// must not turn "fits where it stands" into "straddles": that would
+    /// relocate an already-contained loop.
+    #[test]
+    fn x86_loop_head_align_contained_decision_ignores_the_body_cap() {
+        let func = loop_head_align_jcc_body_fixture("loop_head_align_jcc_cap", 2, 2, 0);
+        let (unpadded, pad, len_now, aligned_len) = loop_head_align_jcc_body_geometry(&func);
+        assert!(
+            pad > 0 && len_now <= pad && aligned_len < len_now,
+            "POSITIVE CONTROL FAILED: head {unpadded}, pad {pad}, body {len_now} bytes \
+             where it stands and {aligned_len} aligned; the fixture must lie inside its line \
+             where it stands and be shorter once aligned. Re-tune the fixture."
+        );
+        let cap = aligned_len.to_string();
+        let with_cap = crate::env_lock::with_env_overrides_removed(&LOOP_HEAD_ALIGN_KNOBS, || {
+            crate::env_lock::with_env_overrides(
+                &[("TCG_X86_LOOP_ALIGN_MAX_BODY", cap.as_str())],
+                || loop_head_offset(&func),
+            )
+        });
+        assert_eq!(
+            with_cap, unpadded,
+            "a loop contained where it stands must never be relocated, whatever the body cap"
+        );
     }
 
     #[test]
@@ -20323,7 +27548,7 @@ mod tests {
         let pipeline = raw_no_frame_generic_x86_pipeline();
         let func = ptest_self_jcc_func("generic_ptest_self_zero_test_fallback", X86CondCode::NE);
 
-        let (_, _, _, _, evidence) = pipeline
+        let (_, _, _, _, evidence, _) = pipeline
             .compile_function_with_fixups_and_evidence_after_x86_passes(&func)
             .expect("generic x86-64 should expand PTEST self zero tests before feature gating");
 
@@ -20349,7 +27574,7 @@ mod tests {
             X86CondCode::NE,
         );
 
-        let (_, _, _, _, evidence) = pipeline
+        let (_, _, _, _, evidence, _) = pipeline
             .compile_function_with_fixups_and_evidence_after_x86_passes(&func)
             .expect("generic x86-64 should expand virtual-register PTEST self zero tests");
 
@@ -20641,6 +27866,142 @@ mod tests {
     /// compute the population count (and that `validate_x86_popcnt_expansion_canary`
     /// checks on every x86 compile). If the emitter's masks drift, the canary
     /// would be validating a model the encoder no longer emits — so pin them.
+    /// The certified model IS the emitted instruction stream: interpreting
+    /// the exact `X86ISelInst`s `expand_x86_popcnt_inst` emits (each op as
+    /// `dst = dst_old OP src`) rebuilds, node for node, the SWAR side of
+    /// `PopcntSwarExpansionValidator::x86_generic(_, w).obligation()` at both
+    /// shipping widths. Any opcode the model does not describe is a panic, and
+    /// the instruction count is pinned, so an emitter drift that the mask pin
+    /// below would miss — a reordered fold, an extra shift, a changed shift
+    /// amount — breaks the binding rather than the proof's meaning.
+    #[test]
+    fn popcnt_emitter_denotes_the_certified_model() {
+        use trust_cg_verify::pass_validators::{PassValidator, PopcntSwarExpansionValidator};
+        use trust_cg_verify::smt::SmtExpr;
+
+        for (class, width, expected_len) in
+            [(RegClass::Gpr32, 32u32, 24usize), (RegClass::Gpr64, 64, 27)]
+        {
+            let mut func = minimal_func("popcnt_model");
+            // Allocate through the function so the expansion's fresh
+            // `tmp`/`mask` vregs cannot collide with these ids.
+            let dst = X86ISelOperand::VReg(VReg::new(func.next_vreg, class));
+            let src = X86ISelOperand::VReg(VReg::new(func.next_vreg + 1, class));
+            func.next_vreg += 2;
+            func.push_inst(
+                Block(0),
+                X86ISelInst::new(X86Opcode::Popcnt, vec![dst.clone(), src.clone()]),
+            );
+            expand_x86_generic_popcnts(&mut func, X86TargetFeatures::generic_x86_64()).unwrap();
+            let insts = &func.blocks[&Block(0)].insts;
+            assert_eq!(insts.len(), expected_len, "{class:?} expansion length");
+
+            // A tiny symbolic interpreter over exactly the opcodes the
+            // expansion may use. Operands are compared structurally (VReg
+            // identity), so the environment is a small association list.
+            let mut env: Vec<(X86ISelOperand, SmtExpr)> =
+                vec![(src.clone(), SmtExpr::var("x", width))];
+            let get = |env: &Vec<(X86ISelOperand, SmtExpr)>, op: &X86ISelOperand| -> SmtExpr {
+                env.iter()
+                    .find(|(k, _)| k == op)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| panic!("read of an undefined operand {op:?}"))
+            };
+            let set =
+                |env: &mut Vec<(X86ISelOperand, SmtExpr)>, op: &X86ISelOperand, v: SmtExpr| {
+                    if let Some(slot) = env.iter_mut().find(|(k, _)| k == op) {
+                        slot.1 = v;
+                    } else {
+                        env.push((op.clone(), v));
+                    }
+                };
+            let imm = |op: &X86ISelOperand| -> SmtExpr {
+                match op {
+                    X86ISelOperand::Imm(v) => SmtExpr::bv_const(*v as u64, width),
+                    other => panic!("expected an immediate, got {other:?}"),
+                }
+            };
+            for inst in insts {
+                let o = &inst.operands;
+                match inst.opcode {
+                    X86Opcode::MovRR | X86Opcode::MovRR32 => {
+                        let v = get(&env, &o[1]);
+                        set(&mut env, &o[0], v);
+                    }
+                    X86Opcode::MovRI => {
+                        let v = imm(&o[1]);
+                        set(&mut env, &o[0], v);
+                    }
+                    X86Opcode::ShrRI => {
+                        let v = get(&env, &o[0]).bvlshr(imm(&o[1]));
+                        set(&mut env, &o[0], v);
+                    }
+                    X86Opcode::AndRI => {
+                        let v = get(&env, &o[0]).bvand(imm(&o[1]));
+                        set(&mut env, &o[0], v);
+                    }
+                    X86Opcode::AndRR | X86Opcode::AddRR | X86Opcode::SubRR => {
+                        let (a, b) = (get(&env, &o[1]), get(&env, &o[2]));
+                        let v = match inst.opcode {
+                            X86Opcode::AndRR => a.bvand(b),
+                            X86Opcode::AddRR => a.bvadd(b),
+                            _ => a.bvsub(b),
+                        };
+                        set(&mut env, &o[0], v);
+                    }
+                    other => panic!("the certified model does not describe {other:?}"),
+                }
+            }
+            let denoted = get(&env, &dst);
+            let model = PopcntSwarExpansionValidator::x86_generic("popcnt-expand", width)
+                .obligation()
+                .aarch64_expr;
+            assert_eq!(
+                denoted, model,
+                "{class:?}: the emitted stream must denote the certified model node for node"
+            );
+        }
+    }
+
+    #[test]
+    fn popcnt_expansion_respects_selected_features() {
+        let generic = X86TargetFeatures::generic_x86_64();
+        let hardware = generic.with_feature(X86TargetFeature::Popcnt);
+        for class in [RegClass::Gpr32, RegClass::Gpr64] {
+            let mut original = minimal_func("selected_popcnt");
+            original.next_vreg = 2;
+            original.push_inst(
+                Block(0),
+                X86ISelInst::new(
+                    X86Opcode::Popcnt,
+                    vec![
+                        X86ISelOperand::VReg(VReg::new(0, class)),
+                        X86ISelOperand::VReg(VReg::new(1, class)),
+                    ],
+                ),
+            );
+            let mut native = original.clone();
+            expand_x86_generic_popcnts(&mut native, hardware).unwrap();
+            assert_eq!(
+                format!("{:?}", native.blocks[&Block(0)].insts),
+                format!("{:?}", original.blocks[&Block(0)].insts)
+            );
+            assert_eq!(native.next_vreg, original.next_vreg);
+            expand_x86_generic_popcnts(
+                &mut original,
+                hardware.without_feature(X86TargetFeature::Popcnt),
+            )
+            .unwrap();
+            assert!(
+                !original.blocks[&Block(0)]
+                    .insts
+                    .iter()
+                    .any(|inst| inst.opcode == X86Opcode::Popcnt)
+            );
+            assert!(original.next_vreg > native.next_vreg);
+        }
+    }
+
     #[test]
     fn popcnt_swar_expansion_emits_the_proven_fold_masks() {
         let mut func = minimal_func("popcnt64");
@@ -20925,7 +28286,7 @@ mod tests {
         let pipeline = raw_no_frame_x86_pipeline_with_features(X86TargetFeatures::current());
         let func = v128_bool_select_func("v128_bool_select_current_pipeline");
 
-        let (_, _, _, _, evidence) = pipeline
+        let (_, _, _, _, evidence, _) = pipeline
             .compile_function_with_fixups_and_evidence_after_x86_passes(&func)
             .expect("current x86-64 should expand boolean V128 select through PBLENDVB");
 
@@ -20937,7 +28298,7 @@ mod tests {
         let pipeline = raw_no_frame_generic_x86_pipeline();
         let func = v128_bool_select_func("v128_bool_select_generic_pipeline");
 
-        let (_, _, _, _, evidence) = pipeline
+        let (_, _, _, _, evidence, _) = pipeline
             .compile_function_with_fixups_and_evidence_after_x86_passes(&func)
             .expect("generic x86-64 should keep boolean V128 select on SSE2 fallback");
 
@@ -21899,6 +29260,101 @@ mod tests {
         assert_eq!(ra_func.insts[0].flags, InstFlags::READS_MEMORY);
     }
 
+    /// An internal multi-result `ret` (results past RAX,RDX / XMM0,XMM1): its
+    /// return moves reach the allocator as EXPLICIT physical producers and the
+    /// `ret` reads every register they wrote, so a written result register is
+    /// reserved until the return. A C-shaped return converts exactly as it
+    /// always did: implicit physical defs, no return sinks.
+    #[test]
+    fn x86_isel_to_regalloc_models_internal_multi_result_returns_as_sinks() {
+        use trust_cg_lower::x86_64_isel::X86CallResultReg;
+        let returns = [
+            (RAX, 0u32),
+            (RDX, 1),
+            (x86_64_regs::RCX, 2),
+            (x86_64_regs::RSI, 3),
+        ];
+        let build = |internal: Vec<X86CallResultReg>, moves: &[(X86PReg, u32)]| {
+            let mut func = minimal_func("internal_ret");
+            // Four I64 results: RAX, RDX (C file), then RCX, RSI (internal)
+            // when the ret declares them; two (the C-shaped control) otherwise.
+            func.sig.returns = vec![Type::I64; if internal.is_empty() { 2 } else { 4 }];
+            for (reg, vreg) in moves {
+                func.push_inst(
+                    Block(0),
+                    X86ISelInst::new(
+                        X86Opcode::MovRR,
+                        vec![X86ISelOperand::PReg(*reg), test_vreg_op(*vreg)],
+                    ),
+                );
+            }
+            func.push_inst(
+                Block(0),
+                X86ISelInst::new(X86Opcode::Ret, vec![]).with_internal_return_regs(internal),
+            );
+            func
+        };
+        let internal = vec![
+            X86CallResultReg::new(x86_64_regs::RCX, 64),
+            X86CallResultReg::new(x86_64_regs::RSI, 64),
+        ];
+
+        let ra = x86_isel_to_regalloc(&build(internal.clone(), &returns)).unwrap();
+        let fixed: Vec<_> = returns
+            .iter()
+            .map(|(reg, _)| x86_fixed_operand_to_preg(*reg).unwrap())
+            .collect();
+        for (index, preg) in fixed.iter().enumerate() {
+            assert_eq!(ra.insts[index].defs, vec![RegAllocOperand::PReg(*preg)]);
+            assert!(ra.insts[index].implicit_defs.is_empty());
+        }
+        let ret = ra.insts.last().unwrap();
+        assert_eq!(
+            ret.implicit_uses, fixed,
+            "the ret reads every result it returns"
+        );
+
+        // A C-shaped return: unchanged representation.
+        let ra = x86_isel_to_regalloc(&build(vec![], &returns[..2])).unwrap();
+        for (index, preg) in fixed[..2].iter().enumerate() {
+            assert!(ra.insts[index].defs.is_empty());
+            assert_eq!(ra.insts[index].implicit_defs, vec![*preg]);
+        }
+        assert!(ra.insts.last().unwrap().implicit_uses.is_empty());
+
+        // Fail closed when a declared internal result has no producer...
+        let error = x86_isel_to_regalloc(&build(internal.clone(), &returns[..3])).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("no return move writes rsi"),
+            "{error:?}"
+        );
+        // A pseudo after the `ret` does not hide it: the window and the sinks
+        // are still found.
+        let mut func = build(internal.clone(), &returns);
+        func.push_inst(Block(0), X86ISelInst::new(X86Opcode::Nop, vec![]));
+        let ra = x86_isel_to_regalloc(&func).unwrap();
+        assert_eq!(ra.insts[0].defs, vec![RegAllocOperand::PReg(fixed[0])]);
+        assert_eq!(ra.insts[returns.len()].implicit_uses, fixed);
+        // ...and when a C-file result's move is not in the window.
+        let mut func = build(internal, &returns[1..]);
+        let entry = func.blocks.get_mut(&Block(0)).unwrap();
+        entry.insts.insert(
+            0,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RAX), test_vreg_op(9)],
+            ),
+        );
+        entry
+            .insts
+            .insert(1, X86ISelInst::new(X86Opcode::Nop, vec![]));
+        let error = x86_isel_to_regalloc(&func).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("no return move writes rax"),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn x86_isel_to_regalloc_preserves_ptest_operand_precise_memory_flags() {
         let mut func = minimal_func("ptest_flags_to_regalloc");
@@ -21955,16 +29411,29 @@ mod tests {
             vec![
                 "x86-vectorize",
                 "x86-sroa",
+                // The SECOND vectorizer run, immediately after SROA, is part of the
+                // DEFAULT schedule since 2026-09-29: it is where an owning-container
+                // reduction first has a recognisable shape (slice temp promoted, the
+                // peephole not yet having re-spelled the header test or the element
+                // address), and it is what takes h1_vec_push_sum from 2.4890x to
+                // 1.0023x LLVM. `no-vectorize-post-sroa` is the forensic opt-out.
+                "x86-vectorize",
                 "x86-licm",
                 "x86-strength-reduce",
                 "x86-loop-unroll",
                 "x86-const-fold",
                 "x86-const-guard-elim",
                 "x86-block-merge",
+                "x86-slot-forward",
                 "x86-copy-prop",
                 "x86-cse",
                 "x86-peephole",
                 "x86-bounds-check-elim",
+                // DEFAULT ON since 2026-10-01: b1_mispredict 1.0959 -> 1.0260,
+                // ~60x its noise floor. Runs AFTER the peephole because `BtRI`
+                // — the one-bit consumer it targets — is SYNTHESIZED there and
+                // does not exist in ISel output.
+                "x86-xorshift-demanded-bits",
                 "x86-dce",
                 "x86-loop-rotate",
                 "x86-cmov-swap",
@@ -21977,7 +29446,10 @@ mod tests {
     #[test]
     fn x86_opt_level_pass_schedules_match_policy() {
         let pass_names = |level| {
-            let pm = X86Pipeline::x86_pass_manager_for_opt_level(level);
+            let pm = X86Pipeline::x86_pass_manager_for_opt_level(
+                level,
+                X86PipelineConfig::default().call_abi,
+            );
             pm.pass_names()
                 .into_iter()
                 .map(str::to_string)
@@ -22000,16 +29472,21 @@ mod tests {
         let production_order = vec![
             "x86-vectorize".to_string(),
             "x86-sroa".to_string(),
+            // The SECOND vectorizer run, part of the DEFAULT schedule since
+            // 2026-09-29 (see the note on the other expectation in this file).
+            "x86-vectorize".to_string(),
             "x86-licm".to_string(),
             "x86-strength-reduce".to_string(),
             "x86-loop-unroll".to_string(),
             "x86-const-fold".to_string(),
             "x86-const-guard-elim".to_string(),
             "x86-block-merge".to_string(),
+            "x86-slot-forward".to_string(),
             "x86-copy-prop".to_string(),
             "x86-cse".to_string(),
             "x86-peephole".to_string(),
             "x86-bounds-check-elim".to_string(),
+            "x86-xorshift-demanded-bits".to_string(),
             "x86-dce".to_string(),
             "x86-loop-rotate".to_string(),
             "x86-cmov-swap".to_string(),
@@ -22021,9 +29498,129 @@ mod tests {
         assert_eq!(pass_names(trust_cg_opt::OptLevel::O3), production_order);
     }
 
-    /// The `TCG_NO_BRANCH_LAYOUT` kill switch removes exactly the OPT-8 pass
-    /// from both schedules (deterministic variants — no env mutation in
-    /// tests).
+    /// Fresh processes isolate tracked policy; thread-local overrides isolate
+    /// environment fallback. Exercise actual inversion with production admission.
+    #[test]
+    fn branch_layout_fallthrough_isolated_policy() {
+        const CHILD: &str = "CG_BRANCH_LAYOUT_POLICY_CASE";
+        const TEST: &str = "x86_64::pipeline::tests::branch_layout_fallthrough_isolated_policy";
+        let Ok(case) = std::env::var(CHILD) else {
+            let mut failures = Vec::new();
+            for case in [
+                "default",
+                "zero",
+                "one",
+                "empty",
+                "installed_on",
+                "installed_off",
+            ] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", TEST, "--nocapture", "--test-threads=1"]);
+                command.env(CHILD, case);
+                let output = command.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                println!(
+                    "case {case}:\n{stdout}{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if !output.status.success() || !stdout.contains("running 1 test") {
+                    failures.push(case);
+                }
+            }
+            assert!(failures.is_empty(), "failed cases: {failures:?}");
+            return;
+        };
+        // The rule is DEFAULT ON since 2026-09-30, so the environment fallback is the
+        // opt-OUT `TCG_NO_BRANCH_LAYOUT_FALLTHROUGH`. `=0` therefore means "do not
+        // disable" (still on) and `=1` / `=""` mean disabled — the mirror of the old
+        // opt-in table.
+        let env_value = match case.as_str() {
+            "zero" | "installed_on" => Some("0"),
+            "one" | "installed_off" => Some("1"),
+            "empty" => Some(""),
+            _ => None,
+        };
+        if case.starts_with("installed_") {
+            let enabled = case == "installed_on";
+            assert!(set_branch_layout_fallthrough_enabled(enabled));
+            assert!(set_branch_layout_fallthrough_enabled(enabled));
+            assert!(!set_branch_layout_fallthrough_enabled(!enabled));
+        }
+        // DEFAULT ON: the rule is enabled unless the opt-out says otherwise. `zero`
+        // (`=0`) does not opt out, so it stays enabled, and `default` is enabled too.
+        let enabled = matches!(case.as_str(), "default" | "zero" | "installed_on");
+        let check = || {
+            use trust_cg_opt::X86MachinePass;
+            let config = x86_branch_layout_config();
+            assert_eq!(config.fallthrough_rule, enabled);
+            let mut func = X86ISelFunction::new(
+                "policy".into(),
+                Signature {
+                    params: vec![],
+                    returns: vec![],
+                },
+            );
+            for b in [Block(0), Block(1), Block(2)] {
+                func.ensure_block(b);
+            }
+            func.push_inst(
+                Block(0),
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::E),
+                        X86ISelOperand::Block(Block(1)),
+                    ],
+                ),
+            );
+            func.push_inst(
+                Block(0),
+                X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(Block(2))]),
+            );
+            for b in [Block(1), Block(2)] {
+                func.push_inst(b, X86ISelInst::new(X86Opcode::Ret, vec![]));
+            }
+            func.blocks.get_mut(&Block(0)).unwrap().successors = vec![Block(1), Block(2)];
+            trust_cg_opt::X86BranchLayout::with_config(admit_x86_cc_inversion, config)
+                .run(&mut func);
+            let block = &func.blocks[&Block(0)];
+            assert_eq!(
+                block.insts[0].operands,
+                vec![
+                    X86ISelOperand::CondCode(if enabled {
+                        X86CondCode::NE
+                    } else {
+                        X86CondCode::E
+                    }),
+                    X86ISelOperand::Block(Block(if enabled { 2 } else { 1 }))
+                ]
+            );
+            assert_eq!(
+                block.insts[1].operands,
+                vec![X86ISelOperand::Block(Block(if enabled { 1 } else { 2 }))]
+            );
+        };
+        crate::env_lock::with_env_overrides_removed(
+            &[
+                "TCG_NO_BRANCH_LAYOUT_FALLTHROUGH",
+                "TCG_NO_X86_COLD_TRAP_LAYOUT",
+                "TCG_NO_X86_LOOP_EXIT_LAYOUT",
+                "TCG_X86_COLD_ARM_SINK",
+            ],
+            || {
+                if let Some(value) = env_value {
+                    crate::env_lock::with_env_overrides(
+                        &[("TCG_NO_BRANCH_LAYOUT_FALLTHROUGH", value)],
+                        check,
+                    );
+                } else {
+                    check();
+                }
+            },
+        );
+    }
+
+    /// The kill switch removes exactly the OPT-8 pass from both schedules.
     #[test]
     fn x86_branch_layout_kill_switch_removes_only_that_pass() {
         let names = |pm: &trust_cg_opt::X86PassManager| {
@@ -22041,8 +29638,9 @@ mod tests {
         );
         assert_eq!(names(&o1_on)[..names(&o1_on).len() - 1], names(&o1_off)[..]);
 
-        let o2_on = X86Pipeline::x86_o2_pass_manager_with_branch_layout(true);
-        let o2_off = X86Pipeline::x86_o2_pass_manager_with_branch_layout(false);
+        let call_abi = X86PipelineConfig::default().call_abi;
+        let o2_on = X86Pipeline::x86_o2_pass_manager_with_branch_layout(true, call_abi);
+        let o2_off = X86Pipeline::x86_o2_pass_manager_with_branch_layout(false, call_abi);
         assert_eq!(
             names(&o2_on).last().map(String::as_str),
             Some("x86-branch-layout")
@@ -22263,14 +29861,19 @@ mod tests {
             &[
                 "TCG_NO_X86_LOOP_EXIT_LAYOUT",
                 "TCG_NO_X86_COLD_TRAP_LAYOUT",
-                "TCG_BRANCH_LAYOUT_FALLTHROUGH",
+                "TCG_NO_BRANCH_LAYOUT_FALLTHROUGH",
             ],
             || {
                 let c = x86_branch_layout_config();
                 assert!(c.latch_rule, "latch rule is unconditionally on");
                 assert!(c.cold_trap_rule, "cold-trap rule is default-on");
                 assert!(c.loop_exit_rule, "loop-exit rule is default-on");
-                assert!(!c.fallthrough_rule, "fallthrough rule is deferred off");
+                assert!(
+                    c.fallthrough_rule,
+                    "fallthrough rule is DEFAULT ON since 2026-09-30 (both recorded \
+                     deferral reasons refuted by measurement; b1_mispredict 1.1216 -> \
+                     1.0971)"
+                );
             },
         );
         // Kill switch: TCG_NO_X86_LOOP_EXIT_LAYOUT disables EXACTLY the
@@ -22399,25 +30002,37 @@ mod tests {
             );
         });
 
-        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_EXIT_LAYOUT", "1")], || {
-            let mut func = build();
-            run_o1(&mut func);
-            let header = &func.blocks[&b1].insts;
-            let n = header.len();
-            assert_eq!(
-                header[n - 2].operands,
-                vec![
-                    X86ISelOperand::CondCode(X86CondCode::B),
-                    X86ISelOperand::Block(b2),
-                ],
-                "kill switch: header jcc must be untouched"
-            );
-            assert_eq!(
-                header[n - 1].operands,
-                vec![X86ISelOperand::Block(b3)],
-                "kill switch: header jmp must be untouched"
-            );
-        });
+        // Isolate the LOOP-EXIT rule's kill switch from the FALLTHROUGH rule, which became
+        // DEFAULT ON on 2026-09-30 and independently inverts this same header (its own
+        // trigger is "T is the layout successor", which this fixture also satisfies).
+        // Without the second override the assertion below would be testing the wrong rule:
+        // the header would still invert, via fallthrough, and the loop-exit kill switch
+        // would look broken when it is not.
+        crate::env_lock::with_env_overrides(
+            &[
+                ("TCG_NO_X86_LOOP_EXIT_LAYOUT", "1"),
+                ("TCG_NO_BRANCH_LAYOUT_FALLTHROUGH", "1"),
+            ],
+            || {
+                let mut func = build();
+                run_o1(&mut func);
+                let header = &func.blocks[&b1].insts;
+                let n = header.len();
+                assert_eq!(
+                    header[n - 2].operands,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::B),
+                        X86ISelOperand::Block(b2),
+                    ],
+                    "kill switch: header jcc must be untouched"
+                );
+                assert_eq!(
+                    header[n - 1].operands,
+                    vec![X86ISelOperand::Block(b3)],
+                    "kill switch: header jmp must be untouched"
+                );
+            },
+        );
     }
 
     /// The cold-arm sink rule (rule 4) is OPT-IN for its soak:
@@ -22436,7 +30051,10 @@ mod tests {
             assert!(c.latch_rule, "latch rule unaffected");
             assert!(c.cold_trap_rule, "cold-trap rule unaffected");
             assert!(c.loop_exit_rule, "loop-exit rule unaffected");
-            assert!(!c.fallthrough_rule, "fallthrough rule stays deferred off");
+            assert!(
+                c.fallthrough_rule,
+                "fallthrough rule stays DEFAULT ON, unaffected by this opt-in"
+            );
         });
         crate::env_lock::with_env_overrides(&[("TCG_X86_COLD_ARM_SINK", "1")], || {
             let c = x86_branch_layout_config();
@@ -22448,8 +30066,8 @@ mod tests {
             assert!(c.cold_trap_rule, "cold-trap rule unaffected by the opt-in");
             assert!(c.loop_exit_rule, "loop-exit rule unaffected by the opt-in");
             assert!(
-                !c.fallthrough_rule,
-                "the refuted fallthrough rule must NOT ride in on the opt-in"
+                c.fallthrough_rule,
+                "the fallthrough rule is default-on and unaffected by this opt-in"
             );
         });
     }
@@ -22599,37 +30217,46 @@ mod tests {
             let _ = pipeline.run_x86_optimization_passes(func);
         };
 
-        crate::env_lock::with_env_overrides(&[("TCG_X86_COLD_ARM_SINK", "1")], || {
-            let mut func = build();
-            run_o1(&mut func);
-            assert_eq!(
-                func.block_order,
-                vec![b0, b1, b3, b4, b2, b5],
-                "opted in: the call arm must sink past the loop span"
-            );
-            // The diamond terminators are untouched (no cc inversion — the
-            // sink is layout-only): still `jcc E b2; jmp b3`, with b3 now the
-            // layout successor so the jmp elides at encode.
-            let entry = &func.blocks[&b1].insts;
-            let n = entry.len();
-            assert_eq!(
-                entry[n - 2].operands,
-                vec![
-                    X86ISelOperand::CondCode(X86CondCode::E),
-                    X86ISelOperand::Block(b2),
-                ],
-                "sink must not invert or retarget the jcc"
-            );
-            assert_eq!(
-                entry[n - 1].operands,
-                vec![X86ISelOperand::Block(b3)],
-                "sink must not retarget the jmp"
-            );
-            // The permuted layout satisfies the pipeline validator the
-            // sink's self-check mirrors.
-            validate_x86_function_layout(&func)
-                .expect("post-sink layout must pass the pipeline layout validator");
-        });
+        // Isolate the COLD-ARM SINK rule from the FALLTHROUGH rule (default ON since
+        // 2026-09-30), which also mutates `block_order` on this fixture. The expected order
+        // below is the sink rule's own contribution.
+        crate::env_lock::with_env_overrides(
+            &[
+                ("TCG_X86_COLD_ARM_SINK", "1"),
+                ("TCG_NO_BRANCH_LAYOUT_FALLTHROUGH", "1"),
+            ],
+            || {
+                let mut func = build();
+                run_o1(&mut func);
+                assert_eq!(
+                    func.block_order,
+                    vec![b0, b1, b3, b4, b2, b5],
+                    "opted in: the call arm must sink past the loop span"
+                );
+                // The diamond terminators are untouched (no cc inversion — the
+                // sink is layout-only): still `jcc E b2; jmp b3`, with b3 now the
+                // layout successor so the jmp elides at encode.
+                let entry = &func.blocks[&b1].insts;
+                let n = entry.len();
+                assert_eq!(
+                    entry[n - 2].operands,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::E),
+                        X86ISelOperand::Block(b2),
+                    ],
+                    "sink must not invert or retarget the jcc"
+                );
+                assert_eq!(
+                    entry[n - 1].operands,
+                    vec![X86ISelOperand::Block(b3)],
+                    "sink must not retarget the jmp"
+                );
+                // The permuted layout satisfies the pipeline validator the
+                // sink's self-check mirrors.
+                validate_x86_function_layout(&func)
+                    .expect("post-sink layout must pass the pipeline layout validator");
+            },
+        );
 
         crate::env_lock::with_env_overrides_removed(&["TCG_X86_COLD_ARM_SINK"], || {
             let mut func = build();
@@ -22664,8 +30291,9 @@ mod tests {
     /// The production reconstruction-opcode admission callback: the four
     /// Stage-1 RMW opcodes AND the variable-count rotate are admitted because
     /// (and ONLY because) their representative reconstruction obligations
-    /// discharge `Valid` — the same criterion the coverage gate credits them
-    /// with. Anything else is refused outright (fail-closed: no
+    /// discharge `Valid` — the same criterion by which the coverage-gate
+    /// inventory marks their rows covered (an inventory, not instruction
+    /// credit, since E0.2). Anything else is refused outright (fail-closed: no
     /// reconstruction arm, no emission).
     #[test]
     fn admit_x86_reconstructed_opcode_admits_only_reconstruction_covered_opcodes() {
@@ -22706,15 +30334,10 @@ mod tests {
         let o2_stats = o2_pipeline.run_x86_optimization_passes(&mut o2_func);
 
         assert_eq!(o0_stats.total_pass_runs(), 0);
-        // Sixteen production passes: vectorize, SROA, LICM, strength-reduce,
-        // loop-unroll, const-fold, const-guard-elim, block-merge, copy-prop,
-        // CSE, peephole, bounds-check-elim, DCE, loop-rotate, cmov-swap,
-        // if-convert, and branch-layout.
-        // (SROA added in c70e396; dominated-compare bounds-check elimination
-        // in f6f73d3; loop rotation defaulted on in c033ba54; full unroll +
-        // const-guard-elim defaulted on 2026-07-20; straight-line block-merge
-        // 2026-08-09.)
-        assert_eq!(o2_stats.total_pass_runs(), 17);
+        // Twenty production pass runs, including the post-SROA vectorizer
+        // and default-on xorshift demanded bits after peephole/BCE, before DCE.
+        // Keep this exact count alongside the O2/Os/O3 schedule pin above.
+        assert_eq!(o2_stats.total_pass_runs(), 20);
         assert!(
             entry_opcodes(&o0_func).contains(&X86Opcode::AddRI),
             "O0 must preserve the optimizable AddRI before regalloc"
@@ -22743,7 +30366,8 @@ mod tests {
 
         assert!(stats.iterations <= TCG_X86_O3_FIXPOINT_MAX_ITERATIONS);
         assert!(
-            stats.total_pass_runs() >= X86Pipeline::x86_o2_pass_manager().num_passes(),
+            stats.total_pass_runs()
+                >= X86Pipeline::x86_o2_pass_manager(pipeline.config.call_abi).num_passes(),
             "O3 should run at least one production-order iteration"
         );
         assert_eq!(
@@ -22755,16 +30379,29 @@ mod tests {
             vec![
                 "x86-vectorize",
                 "x86-sroa",
+                // The SECOND vectorizer run, immediately after SROA, is part of the
+                // DEFAULT schedule since 2026-09-29: it is where an owning-container
+                // reduction first has a recognisable shape (slice temp promoted, the
+                // peephole not yet having re-spelled the header test or the element
+                // address), and it is what takes h1_vec_push_sum from 2.4890x to
+                // 1.0023x LLVM. `no-vectorize-post-sroa` is the forensic opt-out.
+                "x86-vectorize",
                 "x86-licm",
                 "x86-strength-reduce",
                 "x86-loop-unroll",
                 "x86-const-fold",
                 "x86-const-guard-elim",
                 "x86-block-merge",
+                "x86-slot-forward",
                 "x86-copy-prop",
                 "x86-cse",
                 "x86-peephole",
                 "x86-bounds-check-elim",
+                // DEFAULT ON since 2026-10-01: b1_mispredict 1.0959 -> 1.0260,
+                // ~60x its noise floor. Runs AFTER the peephole because `BtRI`
+                // — the one-bit consumer it targets — is SYNTHESIZED there and
+                // does not exist in ISel output.
+                "x86-xorshift-demanded-bits",
                 "x86-dce",
                 "x86-loop-rotate",
                 "x86-cmov-swap",
@@ -22942,6 +30579,7 @@ mod tests {
             instructions.push(Instruction {
                 opcode: Opcode::Call {
                     name: "callee".to_string(),
+                    binding: Default::default(),
                 },
                 args: vec![Value(1); 8],
                 results: vec![],
@@ -23509,7 +31147,7 @@ mod tests {
         let mut func = minimal_func("windows_fixed_outgoing");
         func.max_outgoing_call_bytes = 48;
 
-        let layout = compute_x86_stack_frame_layout(&func, 0, 0, 0).unwrap();
+        let layout = compute_x86_stack_frame_layout(&func, 0, 0).unwrap();
 
         assert_eq!(layout.frame_size, 48);
         assert_eq!(layout.stack_slot_offsets, Vec::<Option<i32>>::new());
@@ -23521,7 +31159,7 @@ mod tests {
         func.stack_slots.push(StackSlotInfo::new(8, 8));
         func.max_outgoing_call_bytes = 48;
 
-        let layout = compute_x86_stack_frame_layout(&func, 0, 0, 0).unwrap();
+        let layout = compute_x86_stack_frame_layout(&func, 0, 0).unwrap();
 
         assert_eq!(layout.stack_slot_offsets, vec![Some(-8)]);
         assert!(layout.frame_size >= 56);
@@ -23550,7 +31188,7 @@ mod tests {
             ),
         );
 
-        let layout = compute_x86_stack_frame_layout(&func, 0, 0, 0).unwrap();
+        let layout = compute_x86_stack_frame_layout(&func, 0, 0).unwrap();
         assert_eq!(layout.stack_slot_offsets, vec![Some(-8), Some(-32)]);
         assert_ne!(layout.stack_slot_offsets[1], Some(1));
 
@@ -23590,7 +31228,7 @@ mod tests {
             ),
         );
 
-        let layout = compute_x86_stack_frame_layout(&func, 0, 0, 0).unwrap();
+        let layout = compute_x86_stack_frame_layout(&func, 0, 0).unwrap();
         let err = resolve_x86_stack_slots(&mut func, &layout).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("runtime-sized x86-64 stack slot 0"));
@@ -23749,9 +31387,9 @@ mod tests {
             ),
         );
 
-        let before = compute_x86_stack_frame_layout(&func, 0, 0, 0).unwrap();
+        let before = compute_x86_stack_frame_layout(&func, 0, 0).unwrap();
         prune_unused_x86_stack_slots(&mut func);
-        let after = compute_x86_stack_frame_layout(&func, 0, 0, 0).unwrap();
+        let after = compute_x86_stack_frame_layout(&func, 0, 0).unwrap();
 
         assert_eq!(before.frame_size, 48);
         assert_eq!(after.frame_size, 16);
@@ -23796,7 +31434,7 @@ mod tests {
             ..X86PipelineConfig::default()
         });
 
-        let (_, _, _, _, frame, _, _) = pipeline
+        let (_, _, _, _, frame, _, _, _) = pipeline
             .compile_function_with_fixups_and_frame_after_x86_passes(&func)
             .unwrap();
 
@@ -24412,6 +32050,232 @@ mod tests {
         assert_eq!(r_info as u32, R_X86_64_PC32);
     }
 
+    /// The x86-64 ELF EH lane's whole object shape, read back by the
+    /// independent ELF reader (`elf::reparse::read_object_records`), not by the
+    /// writer that produced it.
+    ///
+    /// Pins what GNU ld and libgcc's unwinder actually require, and what the
+    /// Darwin lane's documented failure modes say goes wrong when it is missing:
+    ///
+    /// * `.gcc_except_table` (`SHF_ALLOC`, 4-byte aligned) and a zPLR
+    ///   `.eh_frame`, with an FDE for EVERY function — a frame with no FDE stops
+    ///   phase-1 unwinding dead and skips every cleanup Drop;
+    /// * the `DW.ref.<personality>` slot: WEAK + HIDDEN, `STT_OBJECT`, 8 bytes,
+    ///   in its own `GRP_COMDAT` group, holding an `R_X86_64_64` to the
+    ///   personality — the indirection the `0x9b` CIE encoding names;
+    /// * `.rela.eh_frame`: every record `R_X86_64_PC32`, offsets STRICTLY
+    ///   ASCENDING (GNU ld walks the section with one monotonic relocation
+    ///   cursor and otherwise creates no `.eh_frame_hdr` / `PT_GNU_EH_FRAME`, so
+    ///   the unwinder finds no FDEs at run time), naming the `DW.ref` slot once,
+    ///   then a LOCAL `.text` anchor and a LOCAL `.gcc_except_table` anchor per
+    ///   FDE with the function's text offset and the LSDA's section offset as
+    ///   their addends;
+    /// * no `.eh_frame` terminator (crtend.o owns the final one).
+    #[test]
+    fn x86_64_elf_eh_module_object_round_trips_its_unwind_surface() {
+        use crate::elf::constants::{
+            R_X86_64_64, R_X86_64_PC32, SHF_ALLOC, STB_LOCAL, STB_WEAK, STT_OBJECT, STT_SECTION,
+            STV_HIDDEN,
+        };
+        use crate::elf::metadata::SHT_GROUP;
+
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            emit_frame: true,
+            output_format: X86OutputFormat::Elf,
+            ..X86PipelineConfig::default()
+        });
+        // One EH function and one plain sibling: the plain one must still get an
+        // FDE (and an all-filler LSDA), because a panic raised below it unwinds
+        // through its frame.
+        let functions = [
+            build_x86_eh_test_function("eh_elf_module_fn"),
+            minimal_func("eh_elf_module_plain"),
+        ];
+        let object = pipeline
+            .compile_module(&functions)
+            .expect("x86-64 ELF module with EH structure must emit");
+        assert_eq!(&object[0..4], &[0x7F, b'E', b'L', b'F']);
+
+        let records =
+            crate::elf::reparse::read_object_records(&object).expect("independent ELF readback");
+        let section = |name: &str| {
+            records
+                .sections
+                .iter()
+                .position(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing section {name}"))
+        };
+        let except_shndx = section(".gcc_except_table");
+        let eh_frame_shndx = section(".eh_frame");
+        assert_eq!(
+            records.sections[except_shndx].sh_flags & SHF_ALLOC,
+            SHF_ALLOC
+        );
+        assert_eq!(records.sections[except_shndx].align, 4);
+        assert!(records.sections[except_shndx].size > 0);
+        assert_eq!(records.sections[eh_frame_shndx].align, 8);
+
+        // The `.eh_frame` body decodes to one CIE + one FDE per function, with no
+        // terminator: the writer's own decoder would accept a terminated section,
+        // so read the record lengths here instead.
+        let eh = {
+            let shoff = read_u64(&object, 40) as usize;
+            let shentsize = read_u16(&object, 58) as usize;
+            let shdr = shoff + eh_frame_shndx * shentsize;
+            let offset = read_u64(&object, shdr + 24) as usize;
+            let size = read_u64(&object, shdr + 32) as usize;
+            &object[offset..offset + size]
+        };
+        let mut cursor = 0usize;
+        let mut records_seen = 0usize;
+        while cursor + 4 <= eh.len() {
+            let length = read_u32(eh, cursor) as usize;
+            assert_ne!(
+                length, 0,
+                "an object's .eh_frame must carry no zero-length terminator record \
+                 (crtend.o owns the final one)"
+            );
+            cursor += 4 + length;
+            records_seen += 1;
+        }
+        assert_eq!(cursor, eh.len(), ".eh_frame records must tile the section");
+        assert_eq!(records_seen, 1 + functions.len(), "one CIE + one FDE each");
+
+        // The `DW.ref` slot: weak, hidden, 8 bytes, in its own COMDAT group.
+        let dw_ref = records
+            .symbols
+            .iter()
+            .find(|sym| sym.name == "DW.ref.rust_eh_personality")
+            .expect("the zPLR CIE's indirect personality slot symbol");
+        assert_eq!(dw_ref.binding, STB_WEAK);
+        assert_eq!(dw_ref.visibility, STV_HIDDEN);
+        assert_eq!(dw_ref.symbol_type, STT_OBJECT);
+        assert_eq!(dw_ref.size, 8);
+        let slot_shndx = usize::from(dw_ref.section_index);
+        assert_eq!(
+            records.sections[slot_shndx].name,
+            ".data.DW.ref.rust_eh_personality"
+        );
+        assert!(
+            records.sections.iter().any(|s| s.sh_type == SHT_GROUP),
+            "an external personality's slot coalesces through a GRP_COMDAT group"
+        );
+        let personality = records
+            .symbols
+            .iter()
+            .position(|sym| sym.name == "rust_eh_personality" && sym.is_undefined_reference())
+            .expect("the personality itself stays an undefined external");
+
+        // The slot's content relocation: the personality's absolute address.
+        let slot_relocs: Vec<_> = records
+            .relocations
+            .iter()
+            .filter(|r| r.target_section == slot_shndx)
+            .collect();
+        assert_eq!(slot_relocs.len(), 1);
+        assert_eq!(slot_relocs[0].record.reloc_type, R_X86_64_64);
+        assert_eq!(slot_relocs[0].record.r_offset, 0);
+        assert_eq!(slot_relocs[0].record.r_addend, 0);
+        assert_eq!(slot_relocs[0].record.symbol_index as usize, personality);
+
+        // `.rela.eh_frame`: ascending PC32 records, personality then per-FDE
+        // (pc-begin, LSDA).
+        let eh_relocs: Vec<_> = records
+            .relocations
+            .iter()
+            .filter(|r| r.target_section == eh_frame_shndx)
+            .collect();
+        assert_eq!(
+            eh_relocs.len(),
+            1 + 2 * functions.len(),
+            "one personality field plus pc-begin and LSDA per FDE"
+        );
+        for window in eh_relocs.windows(2) {
+            assert!(
+                window[0].record.r_offset < window[1].record.r_offset,
+                "GNU ld requires ascending .rela.eh_frame offsets: {:?}",
+                eh_relocs
+                    .iter()
+                    .map(|r| r.record.r_offset)
+                    .collect::<Vec<_>>()
+            );
+        }
+        for reloc in &eh_relocs {
+            assert_eq!(reloc.record.reloc_type, R_X86_64_PC32);
+        }
+        let dw_ref_index = records
+            .symbols
+            .iter()
+            .position(|sym| sym.name == "DW.ref.rust_eh_personality")
+            .expect("slot symbol index");
+        assert_eq!(eh_relocs[0].record.symbol_index as usize, dw_ref_index);
+        assert_eq!(
+            eh_relocs[0].record.r_addend, 0,
+            "R_X86_64_PC32 is field-START relative, exactly like DW_EH_PE_pcrel: \
+             no Darwin-style +4 GOT bias"
+        );
+        // The anchors the FDE fields name are LOCAL section symbols, not the
+        // (preemptible, possibly interposed) function and LSDA symbols.
+        let anchor_of = |index: u32| &records.symbols[index as usize];
+        for (fde, pair) in eh_relocs[1..].as_chunks::<2>().0.iter().enumerate() {
+            let pc_begin = anchor_of(pair[0].record.symbol_index);
+            let lsda = anchor_of(pair[1].record.symbol_index);
+            for anchor in [pc_begin, lsda] {
+                assert_eq!(anchor.binding, STB_LOCAL, "FDE[{fde}] anchor binding");
+                assert_eq!(anchor.symbol_type, STT_SECTION, "FDE[{fde}] anchor type");
+                assert_eq!(anchor.value, 0, "FDE[{fde}] anchor offset");
+            }
+            assert_eq!(
+                usize::from(lsda.section_index),
+                except_shndx,
+                "FDE[{fde}] LSDA anchors .gcc_except_table"
+            );
+            assert_eq!(
+                records.sections[usize::from(pc_begin.section_index)].name,
+                ".text",
+                "FDE[{fde}] pc-begin anchors .text"
+            );
+        }
+        // Function 0 starts .text and owns the first LSDA; function 1 follows
+        // both, so its addends are strictly greater.
+        let addends: Vec<(i64, i64)> = eh_relocs[1..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| (pair[0].record.r_addend, pair[1].record.r_addend))
+            .collect();
+        assert_eq!(addends[0], (0, 0));
+        assert!(
+            addends[1].0 > 0 && addends[1].1 > 0,
+            "the second function's text and LSDA addends must advance: {addends:?}"
+        );
+    }
+
+    /// An ELF module with NO exception-handling structure and `panic_unwind` off
+    /// keeps the historical backtrace-only surface: no `.gcc_except_table`, no
+    /// `DW.ref` slot, no COMDAT group.
+    #[test]
+    fn x86_64_elf_module_without_eh_keeps_no_except_table_or_personality_slot() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            emit_frame: true,
+            output_format: X86OutputFormat::Elf,
+            ..X86PipelineConfig::default()
+        });
+        let object = pipeline
+            .compile_module(&[minimal_func("plain_elf_fn")])
+            .expect("plain x86-64 ELF module must emit");
+        assert!(find_elf_section(&object, ".gcc_except_table").is_none());
+        assert!(!obj_contains(&object, b"DW.ref."));
+        let records =
+            crate::elf::reparse::read_object_records(&object).expect("independent ELF readback");
+        assert!(
+            !records
+                .sections
+                .iter()
+                .any(|s| s.sh_type == crate::elf::metadata::SHT_GROUP)
+        );
+    }
+
     #[test]
     fn test_compile_trust_ir_runtime_stack_addr_macho_object_emits_eh_frame() {
         use crate::macho::constants::{X86_64_RELOC_SUBTRACTOR, X86_64_RELOC_UNSIGNED};
@@ -24456,6 +32320,7 @@ mod tests {
 
         let encoded = X86EncodedFunc {
             name: "f".to_string(),
+            has_body_instructions: true,
             code_len: 6,
             const_pool_len: 0,
             const_pool_rdata_offset: 0,
@@ -24486,6 +32351,10 @@ mod tests {
             is_import: false,
             is_weak: false,
             align: 1,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
         }];
         let pipeline = X86Pipeline::new(X86PipelineConfig {
             output_format: X86OutputFormat::MachO,
@@ -24493,12 +32362,1850 @@ mod tests {
         });
 
         let obj = pipeline
-            .emit_module_macho(&[encoded], &[0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3], &globals)
+            .emit_module_macho(
+                &[encoded],
+                &[0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3],
+                &globals,
+                &X86FunctionSymbolFacts::default(),
+            )
             .expect("all symbols must be created before data relocation indices freeze");
         let eh_frame = find_macho_section(&obj, b"__eh_frame").expect("missing __eh_frame");
         assert_eq!(eh_frame.reloc_count, 2);
         let data = find_macho_section(&obj, b"__data").expect("missing __data");
         assert_eq!(data.reloc_count, 1);
+    }
+
+    /// `name -> (n_type, nlist index)` of every symbol of a Mach-O object,
+    /// read from the raw `LC_SYMTAB` load command and nlist_64 table (not the
+    /// writer's model), and every `__text` relocation as `(r_symbolnum,
+    /// r_extern)`.
+    fn macho_symbols_and_text_relocs(
+        bytes: &[u8],
+    ) -> (BTreeMap<String, (u8, u32)>, Vec<(u32, bool)>) {
+        const LC_SYMTAB: u32 = 0x2;
+        let ncmds = read_u32(bytes, 16);
+        let mut cursor = 32usize;
+        let mut symbols = BTreeMap::new();
+        for _ in 0..ncmds {
+            if read_u32(bytes, cursor) == LC_SYMTAB {
+                let symoff = read_u32(bytes, cursor + 8) as usize;
+                let nsyms = read_u32(bytes, cursor + 12);
+                let stroff = read_u32(bytes, cursor + 16) as usize;
+                for index in 0..nsyms {
+                    let entry = symoff + index as usize * 16;
+                    let name = cstr(&bytes[stroff + read_u32(bytes, entry) as usize..]);
+                    assert!(
+                        symbols
+                            .insert(name.to_owned(), (bytes[entry + 4], index))
+                            .is_none(),
+                        "duplicate nlist name `{name}`"
+                    );
+                }
+            }
+            cursor += read_u32(bytes, cursor + 4) as usize;
+        }
+        let text = find_macho_section(bytes, b"__text").expect("missing __text");
+        let relocs = (0..text.reloc_count as usize)
+            .map(|index| {
+                let info = read_u32(bytes, text.reloc_offset + index * 8 + 4);
+                (info & 0x00ff_ffff, info & (1 << 27) != 0)
+            })
+            .collect();
+        (symbols, relocs)
+    }
+
+    /// The x86-64 Mach-O module emitter spells a hidden function definition
+    /// ([`X86FunctionSymbolFacts`], the rustc bridge's CGU-private copy of a
+    /// rustc `Internal` function) as a private extern, `N_SECT | N_EXT |
+    /// N_PEXT`, and every other definition as `N_SECT | N_EXT`. The facts
+    /// are a symbol-table attribute only: the `__text` bytes are identical
+    /// with and without them, and the call to the hidden function still
+    /// relocates (extern) against its one definition. Off Mach-O, and for a
+    /// name the module does not define, the emitter refuses instead of
+    /// emitting the function default-visible.
+    #[test]
+    fn x86_macho_hidden_function_definition_is_a_private_extern() {
+        const N_SECT: u8 = 0x0e;
+        const N_EXT: u8 = 0x01;
+        const N_PEXT: u8 = 0x10;
+        let functions = || {
+            let mut api = build_x86_const_test_function();
+            api.name = "api".to_string();
+            api.blocks
+                .get_mut(&Block(0))
+                .expect("entry block")
+                .insts
+                .insert(
+                    0,
+                    X86ISelInst::new(
+                        X86Opcode::Call,
+                        vec![X86ISelOperand::Symbol("helper".to_string())],
+                    ),
+                );
+            let mut helper = build_x86_const_test_function();
+            helper.name = "helper".to_string();
+            [api, helper]
+        };
+        let pipeline_for = |output_format| {
+            X86Pipeline::new(X86PipelineConfig {
+                output_format,
+                emit_frame: true,
+                call_abi: X86CallAbi::SystemV,
+                ..X86PipelineConfig::default()
+            })
+        };
+        let emit = |output_format, facts: &X86FunctionSymbolFacts| {
+            let pipeline = pipeline_for(output_format);
+            let assembled = pipeline
+                .assemble_module_after_x86_passes(&functions(), false)
+                .expect("assemble");
+            pipeline.emit_assembled_module_with_function_symbols(assembled, &[], facts)
+        };
+        let hidden = X86FunctionSymbolFacts::with_definition_bindings([(
+            "helper".to_string(),
+            crate::pipeline::FunctionSymbolBinding::HIDDEN,
+        )]);
+
+        let plain = emit(X86OutputFormat::MachO, &X86FunctionSymbolFacts::default())
+            .expect("the default-binding control");
+        let private = emit(X86OutputFormat::MachO, &hidden).expect("the hidden definition");
+        let (plain_symbols, plain_relocs) = macho_symbols_and_text_relocs(&plain);
+        let (symbols, relocs) = macho_symbols_and_text_relocs(&private);
+        assert_eq!(plain_symbols["_helper"].0, N_SECT | N_EXT);
+        assert_eq!(
+            symbols["_helper"].0,
+            N_SECT | N_EXT | N_PEXT,
+            "a hidden definition is a private extern"
+        );
+        assert_eq!(plain_symbols["_api"].0, N_SECT | N_EXT);
+        assert_eq!(
+            symbols["_api"].0,
+            N_SECT | N_EXT,
+            "an exported definition stays global"
+        );
+        assert_eq!(
+            plain_symbols.keys().collect::<Vec<_>>(),
+            symbols.keys().collect::<Vec<_>>(),
+            "the facts add or drop no symbol"
+        );
+        let text = |bytes: &[u8]| {
+            let section = find_macho_section(bytes, b"__text").expect("__text");
+            bytes[section.offset..section.offset + section.size].to_vec()
+        };
+        assert_eq!(
+            text(&plain),
+            text(&private),
+            "the facts change no text byte"
+        );
+        // The one call relocates (extern) against `_helper`'s own nlist entry.
+        assert_eq!(plain_relocs, vec![(plain_symbols["_helper"].1, true)]);
+        assert_eq!(relocs, vec![(symbols["_helper"].1, true)]);
+
+        // The ELF emitter spells the same fact in `st_other`
+        // (`STV_HIDDEN`), keeping the definition `STB_GLOBAL` so it still
+        // resolves across one static link while staying out of a shared
+        // object's `.dynsym`.
+        let elf_hidden = emit(X86OutputFormat::Elf, &hidden).expect("ELF spells STV_HIDDEN");
+        let elf_visibility = |object: &[u8], name: &str| {
+            crate::elf::reparse::read_object_records(object)
+                .expect("reparse ELF")
+                .symbols
+                .into_iter()
+                .find(|symbol| symbol.name == name)
+                .map(|symbol| (symbol.binding, symbol.visibility))
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+        };
+        assert_eq!(
+            elf_visibility(&elf_hidden, "helper"),
+            (
+                crate::elf::constants::STB_GLOBAL,
+                crate::elf::constants::STV_HIDDEN
+            ),
+            "a hidden definition is a global symbol with STV_HIDDEN on ELF"
+        );
+        assert_eq!(
+            elf_visibility(&elf_hidden, "api"),
+            (
+                crate::elf::constants::STB_GLOBAL,
+                crate::elf::constants::STV_DEFAULT
+            ),
+            "an exported definition stays default-visible"
+        );
+        // COFF and the raw-bytes form spell no function visibility at all, so
+        // each refuses the fact rather than emit the function
+        // default-visible.
+        for format in [X86OutputFormat::Coff, X86OutputFormat::RawBytes] {
+            match emit(format, &hidden) {
+                Err(X86PipelineError::FunctionVisibilityUnsupported {
+                    function,
+                    visibility: trust_ir::Visibility::Hidden,
+                    format: refused,
+                    ..
+                }) => assert_eq!((function.as_str(), refused), ("helper", format)),
+                other => panic!("{format:?} must refuse a hidden definition: {other:?}"),
+            }
+        }
+        for format in [
+            X86OutputFormat::Elf,
+            X86OutputFormat::Coff,
+            X86OutputFormat::RawBytes,
+        ] {
+            emit(format, &X86FunctionSymbolFacts::default())
+                .unwrap_or_else(|error| panic!("{format:?} default-binding control: {error}"));
+        }
+        let mut weak_config = X86PipelineConfig {
+            output_format: X86OutputFormat::MachO,
+            emit_frame: true,
+            call_abi: X86CallAbi::SystemV,
+            ..X86PipelineConfig::default()
+        };
+        weak_config
+            .weak_function_definitions
+            .insert("helper".to_string());
+        let weak_pipeline = X86Pipeline::new(weak_config);
+        let emit_weak = |facts: &X86FunctionSymbolFacts| {
+            let assembled = weak_pipeline
+                .assemble_module_after_x86_passes(&functions(), false)
+                .expect("assemble");
+            weak_pipeline.emit_assembled_module_with_function_symbols(assembled, &[], facts)
+        };
+        emit_weak(&X86FunctionSymbolFacts::default()).expect("the weak-definition control");
+        match emit_weak(&hidden) {
+            Err(X86PipelineError::FunctionVisibilityUnsupported {
+                function, reason, ..
+            }) => {
+                assert_eq!(function, "helper");
+                assert!(reason.contains("weak"), "{reason}");
+            }
+            other => panic!("a hidden definition that is also weak must be refused: {other:?}"),
+        }
+        let absent = X86FunctionSymbolFacts::with_definition_bindings([(
+            "elsewhere".to_string(),
+            crate::pipeline::FunctionSymbolBinding::HIDDEN,
+        )]);
+        match emit(X86OutputFormat::MachO, &absent) {
+            Err(X86PipelineError::FunctionVisibilityUnsupported {
+                function, reason, ..
+            }) => {
+                assert_eq!(function, "elsewhere");
+                assert!(reason.contains("no definition"), "{reason}");
+            }
+            other => panic!("a hidden name the module does not define must be refused: {other:?}"),
+        }
+    }
+
+    /// `sh_flags` of the ELF section named `name`, read from the section
+    /// header table (the module's other helper reads offsets and relocation
+    /// counts only).
+    fn elf_section_flags(bytes: &[u8], name: &str) -> Option<u64> {
+        let shoff = read_u64(bytes, 40) as usize;
+        let shentsize = read_u16(bytes, 58) as usize;
+        let shnum = read_u16(bytes, 60) as usize;
+        let shstrndx = read_u16(bytes, 62) as usize;
+        let shstr_offset = read_u64(bytes, shoff + shstrndx * shentsize + 24) as usize;
+        (0..shnum).find_map(|index| {
+            let shdr = shoff + index * shentsize;
+            let name_offset = shstr_offset + read_u32(bytes, shdr) as usize;
+            let end = bytes[name_offset..].iter().position(|&b| b == 0)? + name_offset;
+            (&bytes[name_offset..end] == name.as_bytes()).then(|| read_u64(bytes, shdr + 8))
+        })
+    }
+
+    /// PIE-safe data placement: an immutable global whose bytes hold symbol
+    /// addresses goes in `.data.rel.ro` (writable until RELRO seals it), never
+    /// `.rodata`, where its `R_X86_64_64` slots would be text relocations the
+    /// default GNU/Linux link refuses. A plain immutable global stays in
+    /// `.rodata`, read-only.
+    #[test]
+    fn test_module_elf_places_relocated_immutable_globals_in_data_rel_ro() {
+        use crate::elf::constants::{SHF_ALLOC, SHF_WRITE};
+        use crate::pipeline::{GlobalSymbolRef, ObjectGlobal};
+
+        let encoded = X86EncodedFunc {
+            name: "f".to_string(),
+            has_body_instructions: true,
+            code_len: 6,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: Vec::new(),
+            call_fixups: Vec::new(),
+            global_ref_fixups: Vec::new(),
+            text_offset: 0,
+            frame_metadata: None,
+            eh: None,
+        };
+        let plain = ObjectGlobal {
+            name: "RO".to_string(),
+            data: vec![1, 2, 3, 4],
+            mutable: false,
+            is_external: true,
+            symbol_refs: Vec::new(),
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 1,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let vtable = ObjectGlobal {
+            name: "VTBL".to_string(),
+            data: vec![0; 8],
+            symbol_refs: vec![GlobalSymbolRef {
+                offset: 0,
+                symbol: "f".to_string(),
+                addend: 0,
+            }],
+            ..plain.clone()
+        };
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            ..X86PipelineConfig::default()
+        });
+        let obj = pipeline
+            .emit_module_elf(
+                &[encoded],
+                &[0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3],
+                &[plain, vtable],
+                &X86FunctionSymbolFacts::default(),
+            )
+            .expect("ELF module emission");
+        assert_eq!(&obj[0..4], &[0x7F, b'E', b'L', b'F']);
+        assert_eq!(elf_section_flags(&obj, ".rodata"), Some(SHF_ALLOC));
+        assert_eq!(
+            elf_section_flags(&obj, ".data.rel.ro"),
+            Some(SHF_ALLOC | SHF_WRITE)
+        );
+        assert!(
+            find_elf_section(&obj, ".rela.data.rel.ro").is_some(),
+            "the vtable's absolute slot must relocate `.data.rel.ro`"
+        );
+        assert!(
+            find_elf_section(&obj, ".rela.rodata").is_none(),
+            "`.rodata` must carry no relocation"
+        );
+        let rodata = find_elf_section(&obj, ".rodata").expect("missing .rodata");
+        assert_eq!(
+            &obj[rodata.offset..rodata.offset + rodata.size],
+            &[1, 2, 3, 4]
+        );
+    }
+
+    /// trust-ir v41 retention on x86-64 ELF: each retained definition is
+    /// alone in its own `<class>.<symbol>` section flagged `SHF_GNU_RETAIN`
+    /// (as llc places an `@llvm.used` global), and the shared `.data`,
+    /// `.rodata` and `.data.rel.ro` sections its unretained neighbours keep
+    /// are never retained, so `--gc-sections` may still drop them. A symbol
+    /// that would move its own section into another linker rule is refused
+    /// by name.
+    #[test]
+    fn test_module_elf_retains_each_retained_global_alone() {
+        use crate::elf::constants::{SHF_ALLOC, SHF_GNU_RETAIN, SHF_WRITE};
+        use crate::pipeline::{GlobalSymbolRef, ObjectGlobal};
+
+        let encoded = || X86EncodedFunc {
+            name: "f".to_string(),
+            has_body_instructions: true,
+            code_len: 6,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: Vec::new(),
+            call_fixups: Vec::new(),
+            global_ref_fixups: Vec::new(),
+            text_offset: 0,
+            frame_metadata: None,
+            eh: None,
+        };
+        let plain = ObjectGlobal {
+            name: "RO".to_string(),
+            data: vec![1, 2, 3, 4],
+            mutable: false,
+            is_external: true,
+            symbol_refs: Vec::new(),
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 1,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let globals = vec![
+            plain.clone(),
+            ObjectGlobal {
+                name: "KEEP_RO".to_string(),
+                retained: true,
+                ..plain.clone()
+            },
+            ObjectGlobal {
+                name: "DATA".to_string(),
+                mutable: true,
+                ..plain.clone()
+            },
+            ObjectGlobal {
+                name: "KEEP_DATA".to_string(),
+                mutable: true,
+                retained: true,
+                ..plain.clone()
+            },
+            ObjectGlobal {
+                name: "KEEP_VTBL".to_string(),
+                data: vec![0; 8],
+                retained: true,
+                symbol_refs: vec![GlobalSymbolRef {
+                    offset: 0,
+                    symbol: "f".to_string(),
+                    addend: 0,
+                }],
+                ..plain.clone()
+            },
+        ];
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            ..X86PipelineConfig::default()
+        });
+        let code = [0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3];
+        let obj = pipeline
+            .emit_module_elf(
+                &[encoded()],
+                &code,
+                &globals,
+                &X86FunctionSymbolFacts::default(),
+            )
+            .expect("ELF module emission");
+        for (name, flags) in [
+            (".rodata", Some(SHF_ALLOC)),
+            (".rodata.KEEP_RO", Some(SHF_ALLOC | SHF_GNU_RETAIN)),
+            (".data", Some(SHF_ALLOC | SHF_WRITE)),
+            (
+                ".data.KEEP_DATA",
+                Some(SHF_ALLOC | SHF_WRITE | SHF_GNU_RETAIN),
+            ),
+            (
+                ".data.rel.ro.KEEP_VTBL",
+                Some(SHF_ALLOC | SHF_WRITE | SHF_GNU_RETAIN),
+            ),
+            // No unretained relocated global: no shared `.data.rel.ro`.
+            (".data.rel.ro", None),
+        ] {
+            assert_eq!(elf_section_flags(&obj, name), flags, "{name}");
+        }
+        // A mutable retained global named `rel.ro` would land in
+        // `.data.rel.ro` (PT_GNU_RELRO): refused by name, never renamed.
+        let colliding = ObjectGlobal {
+            name: "rel.ro".to_string(),
+            mutable: true,
+            retained: true,
+            ..plain
+        };
+        let error = pipeline
+            .emit_module_elf(
+                &[encoded()],
+                &code,
+                &[colliding],
+                &X86FunctionSymbolFacts::default(),
+            )
+            .expect_err("a retained section leaving its rule is refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("[TCG-SECTION-READONLY]") && text.contains("implicit retained section"),
+            "{text}"
+        );
+    }
+
+    /// Mach-O `X86_64_RELOC_UNSIGNED` adds the resolved address to the
+    /// in-place bytes, so the emitter must write the declared implicit addend
+    /// into every relocated slot, zero included. `ObjectGlobal` is public:
+    /// a producer that leaves placeholder bytes in the slot must not have
+    /// them silently added to the target address.
+    #[test]
+    fn x86_64_macho_zero_addend_erases_nonzero_pointer_placeholder() {
+        use crate::pipeline::{GlobalSymbolRef, ObjectGlobal};
+
+        let global = ObjectGlobal {
+            name: "ADVERSARIAL_POINTER".to_string(),
+            data: vec![0xA5; 8],
+            mutable: true,
+            is_external: false,
+            symbol_refs: vec![GlobalSymbolRef {
+                offset: 0,
+                symbol: "const42".to_string(),
+                addend: 0,
+            }],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::MachO,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+
+        let object = pipeline
+            .compile_module_with_globals(&[build_x86_const_test_function()], &[global])
+            .expect("x86-64 Mach-O pointer initializer should emit");
+        let data = find_macho_section(&object, b"__data").expect("missing __data");
+        assert_eq!(
+            &object[data.offset..data.offset + data.size],
+            &[0; 8],
+            "the declared zero implicit addend must replace placeholder bytes"
+        );
+        assert_eq!(data.reloc_count, 1);
+        let relocation_word = read_u32(&object, data.reloc_offset + 4);
+        assert_eq!(
+            relocation_word >> 28,
+            crate::macho::x86_64_reloc::X86_64RelocKind::Unsigned as u32
+        );
+    }
+
+    /// `(sh_type, sh_flags, sh_size, sh_addralign)` of the ELF section `name`.
+    fn elf_section_header_fields(bytes: &[u8], name: &str) -> Option<(u32, u64, u64, u64)> {
+        let records = crate::elf::reparse::read_object_records(bytes).expect("reparse ELF");
+        records
+            .sections
+            .iter()
+            .find(|section| section.name == name)
+            .map(|section| {
+                (
+                    section.sh_type,
+                    section.sh_flags,
+                    section.size,
+                    section.align,
+                )
+            })
+    }
+
+    /// Every x86-64 ELF object must carry `.note.GNU-stack`: an input
+    /// without it makes GNU ld assume the object needs an executable stack.
+    #[test]
+    fn x86_64_production_elf_marks_stack_non_executable() {
+        let single = x86_compile_to_elf(&build_x86_const_test_function())
+            .expect("representative x86-64 ELF should emit");
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            ..X86PipelineConfig::default()
+        });
+        let module = pipeline
+            .compile_module(&[build_x86_const_test_function()])
+            .expect("representative x86-64 ELF module should emit");
+        for object in [single, module] {
+            assert_eq!(
+                elf_section_header_fields(&object, ".note.GNU-stack"),
+                Some((crate::elf::constants::SHT_PROGBITS, 0, 0, 1)),
+                "production ELF must carry the GNU non-executable-stack marker"
+            );
+        }
+    }
+
+    /// Every `.symtab` row as `(name, st_info, st_shndx, st_value, st_size)`.
+    fn elf_symbols(bytes: &[u8]) -> Vec<(String, u8, u16, u64, u64)> {
+        let records = crate::elf::reparse::read_object_records(bytes).expect("reparse ELF");
+        records
+            .symbols
+            .into_iter()
+            .map(|symbol| {
+                (
+                    symbol.name,
+                    (symbol.binding << 4) | symbol.symbol_type,
+                    symbol.section_index,
+                    symbol.value,
+                    symbol.size,
+                )
+            })
+            .collect()
+    }
+
+    /// Each ELF data global lands at an offset aligned to its OWN declared
+    /// alignment, and the section's `sh_addralign` covers the strictest one,
+    /// so a `#[repr(align(64))]` static is 64-aligned after linking.
+    #[test]
+    fn x86_64_elf_globals_honor_offsets_and_section_alignment() {
+        use crate::pipeline::ObjectGlobal;
+
+        let make_global = |name: &str, byte: u8, align: u32| ObjectGlobal {
+            name: name.to_string(),
+            data: vec![byte],
+            mutable: true,
+            is_external: true,
+            symbol_refs: vec![],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let globals = [
+            make_global("GLOBAL_A", 0xA1, 1),
+            make_global("GLOBAL_B", 0xB2, 64),
+        ];
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+
+        let object = pipeline
+            .compile_module_with_globals(&[build_x86_const_test_function()], &globals)
+            .expect("over-aligned x86-64 ELF globals should emit");
+        assert_eq!(elf_section_addralign(&object, ".data"), Some(64));
+        let data = find_elf_section(&object, ".data").expect("missing .data");
+        let bytes = &object[data.offset..data.offset + data.size];
+        assert_eq!(bytes.len(), 65);
+        assert_eq!(bytes[0], 0xA1);
+        assert!(bytes[1..64].iter().all(|byte| *byte == 0));
+        assert_eq!(bytes[64], 0xB2);
+        let symbols = elf_symbols(&object);
+        let value = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.0 == name)
+                .map(|symbol| symbol.3)
+        };
+        assert_eq!(value("GLOBAL_A"), Some(0));
+        assert_eq!(value("GLOBAL_B"), Some(64));
+    }
+
+    /// A data global whose alignment is not a power of two is refused by
+    /// name — never rounded — on the x86-64 ELF path, as AArch64's
+    /// `validate_aarch64_object_globals` refuses it; a power of two is kept,
+    /// in `.data` and in `.rodata` alike.
+    #[test]
+    fn x86_64_elf_refuses_a_non_power_of_two_global_alignment_and_keeps_a_power_of_two() {
+        use crate::pipeline::ObjectGlobal;
+
+        let global = |align: u32, mutable: bool| ObjectGlobal {
+            name: "ALIGNED_BYTES".to_string(),
+            data: vec![0xA5; 3],
+            mutable,
+            is_external: true,
+            symbol_refs: vec![],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+        for (mutable, section) in [(true, ".data"), (false, ".rodata")] {
+            let error = pipeline
+                .compile_module_with_globals(
+                    &[build_x86_const_test_function()],
+                    &[global(3, mutable)],
+                )
+                .expect_err("an alignment of 3 must be refused, not rounded");
+            match error {
+                X86PipelineError::GlobalRefUnsupported { symbol, reason, .. } => {
+                    assert_eq!(symbol, "ALIGNED_BYTES");
+                    assert!(
+                        reason.contains("alignment 3 is not a power of two"),
+                        "{reason}"
+                    );
+                }
+                other => panic!("{section}: expected GlobalRefUnsupported, got {other:?}"),
+            }
+
+            let object = pipeline
+                .compile_module_with_globals(
+                    &[build_x86_const_test_function()],
+                    &[global(8, mutable)],
+                )
+                .expect("an alignment of 8 must emit");
+            assert_eq!(
+                elf_section_addralign(&object, section),
+                Some(8),
+                "{section}"
+            );
+            let bytes = find_elf_section(&object, section).expect("section present");
+            assert_eq!(
+                &object[bytes.offset..bytes.offset + bytes.size],
+                &[0xA5; 3],
+                "{section}"
+            );
+            let symbols = elf_symbols(&object);
+            let placed = symbols
+                .iter()
+                .find(|symbol| symbol.0 == "ALIGNED_BYTES")
+                .expect("symbol present");
+            assert_eq!((placed.3, placed.4), (0, 3), "{section}");
+        }
+    }
+
+    /// A function and a data global sharing one name are refused as the
+    /// duplicate symbol they are — with or without a call naming it — not
+    /// reported as a call into data (the relocation inventory's preflight
+    /// runs the same check).
+    #[test]
+    fn x86_64_elf_refuses_a_function_and_data_global_sharing_a_name() {
+        use crate::pipeline::ObjectGlobal;
+
+        let shared_data = ObjectGlobal {
+            name: "shared".to_string(),
+            data: vec![0; 8],
+            mutable: true,
+            is_external: true,
+            symbol_refs: vec![],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let function = |name: &str, text_offset: u64, calls: &[&str]| X86EncodedFunc {
+            name: name.to_string(),
+            has_body_instructions: true,
+            code_len: 8,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: Vec::new(),
+            call_fixups: calls
+                .iter()
+                .map(|callee| X86CallFixup {
+                    offset: 1,
+                    callee: callee.to_string(),
+                    exact_module: false,
+                })
+                .collect(),
+            global_ref_fixups: Vec::new(),
+            text_offset,
+            frame_metadata: None,
+            eh: None,
+        };
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+        for encoded in [
+            vec![
+                function("caller", 0, &["shared"]),
+                function("shared", 8, &[]),
+            ],
+            vec![function("shared", 0, &[])],
+        ] {
+            let error = pipeline
+                .emit_module_elf(
+                    &encoded,
+                    &[0x90; 16],
+                    std::slice::from_ref(&shared_data),
+                    &X86FunctionSymbolFacts::default(),
+                )
+                .expect_err("one name for a function and a data global");
+            let X86PipelineError::ObjectEmission(message) = error else {
+                panic!("expected ObjectEmission, got {error:?}");
+            };
+            assert!(
+                message.contains("`shared` as both a function and a data global")
+                    && message.contains("duplicate symbol"),
+                "{message}"
+            );
+        }
+    }
+
+    /// The x86-64 ELF module emitter hands out FINAL symbol indices by its
+    /// own arithmetic, so `check_x86_elf_symbol_indices` must refuse an index
+    /// that a LOCAL symbol outside the reservation shifted — the hazard the
+    /// emitter used to guard only with a `debug_assert!`.
+    #[test]
+    fn x86_elf_symbol_index_check_refuses_an_unreserved_local() {
+        use crate::elf::constants::{STT_FUNC, STT_NOTYPE, STV_DEFAULT};
+
+        let mut writer = ElfWriter::new(ElfMachine::X86_64);
+        writer.add_text_section(&[0x90; 8]);
+        writer.add_symbol("callee", 0, 0, 0, true, STT_FUNC);
+        // No local reserved: `callee` is index 1.
+        check_x86_elf_symbol_indices(&writer, [("callee", 1)]).expect("exact index");
+        writer.add_symbol_with_attrs("late_local", 1, 0, 0, false, false, STT_NOTYPE, STV_DEFAULT);
+        let error = check_x86_elf_symbol_indices(&writer, [("callee", 1)])
+            .expect_err("an unreserved local shifted `callee` to index 2");
+        let X86PipelineError::ObjectEmission(message) = error else {
+            panic!("expected ObjectEmission, got {error:?}");
+        };
+        assert!(
+            message.contains("`callee` was assigned .symtab index 1")
+                && message.contains("serializes `late_local` there"),
+            "{message}"
+        );
+        // Reserving the local makes the same arithmetic exact again.
+        check_x86_elf_symbol_indices(&writer, [("callee", 2), ("late_local", 1)])
+            .expect("reserved local");
+        // An index past the table (or the null slot) names no symbol.
+        for index in [0, 3] {
+            let error = check_x86_elf_symbol_indices(&writer, [("callee", index)])
+                .expect_err("no symbol at that index");
+            assert!(
+                matches!(&error, X86PipelineError::ObjectEmission(message) if message.contains("no symbol")),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// The emitted `.symtab` of a module that interleaves module-private
+    /// (`STB_LOCAL`) and exported data definitions is locals-first, its
+    /// `sh_info` is one past the last local, and every text relocation still
+    /// names the symbol it means.
+    #[test]
+    fn x86_64_elf_module_symtab_is_locals_first_and_sh_info_bounds_the_locals() {
+        use crate::elf::constants::STB_LOCAL;
+        use crate::pipeline::ObjectGlobal;
+
+        let data = |name: &str, is_external: bool| ObjectGlobal {
+            name: name.to_string(),
+            data: vec![0xA1; 8],
+            mutable: true,
+            is_external,
+            symbol_refs: vec![],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let globals = [
+            data("PRIVATE_A", false),
+            data("EXPORTED_B", true),
+            data("PRIVATE_C", false),
+        ];
+        let global_ref = |offset: usize, symbol: &str| X86GlobalRefFixup {
+            offset,
+            symbol: symbol.to_string(),
+            kind: X86SymbolRefFixupKind::GlobalRef,
+        };
+        let caller = X86EncodedFunc {
+            name: "partition_caller".to_string(),
+            has_body_instructions: true,
+            code_len: 24,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: Vec::new(),
+            call_fixups: vec![X86CallFixup {
+                offset: 1,
+                callee: "partition_external".to_string(),
+                exact_module: false,
+            }],
+            global_ref_fixups: vec![
+                global_ref(8, "PRIVATE_C"),
+                global_ref(12, "EXPORTED_B"),
+                global_ref(16, "PRIVATE_A"),
+            ],
+            text_offset: 0,
+            frame_metadata: None,
+            eh: None,
+        };
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+        let object = pipeline
+            .emit_module_elf(
+                &[caller],
+                &[0x90; 24],
+                &globals,
+                &X86FunctionSymbolFacts::default(),
+            )
+            .expect("an ELF module with interleaved private and exported data should emit");
+
+        // `elf_symbols` includes the null symbol, so a position is an index.
+        let symbols = elf_symbols(&object);
+        let is_local = |symbol: &(String, u8, u16, u64, u64)| symbol.1 >> 4 == STB_LOCAL;
+        let first_global = symbols
+            .iter()
+            .position(|symbol| !is_local(symbol))
+            .expect("globals present");
+        assert!(
+            symbols[first_global..]
+                .iter()
+                .all(|symbol| !is_local(symbol)),
+            "a local follows a global: {symbols:?}"
+        );
+        let locals: Vec<&str> = symbols[1..first_global]
+            .iter()
+            .map(|symbol| symbol.0.as_str())
+            .collect();
+        assert_eq!(locals, ["PRIVATE_A", "PRIVATE_C"]);
+
+        let shoff = read_u64(&object, 40) as usize;
+        let shentsize = usize::from(read_u16(&object, 58));
+        let shnum = usize::from(read_u16(&object, 60));
+        let symtab_info = (0..shnum)
+            .map(|index| shoff + index * shentsize)
+            .find(|&header| read_u32(&object, header + 4) == crate::elf::constants::SHT_SYMTAB)
+            .map(|header| read_u32(&object, header + 44))
+            .expect(".symtab present");
+        assert_eq!(
+            symtab_info as usize, first_global,
+            "sh_info is one past the last local"
+        );
+
+        assert_eq!(
+            elf_relocation_targets(&object, ".text"),
+            vec![
+                (1, "partition_external".to_string()),
+                (8, "PRIVATE_C".to_string()),
+                (12, "EXPORTED_B".to_string()),
+                (16, "PRIVATE_A".to_string()),
+            ],
+            "text relocations must name their exact targets"
+        );
+    }
+
+    /// A function definition `X86FunctionSymbolFacts` names module-local is
+    /// an `STB_LOCAL` `STT_FUNC` symbol in the local partition, the `PLT32`
+    /// call to it names THAT symbol, and the partition arithmetic still
+    /// places every other symbol where its index says.
+    ///
+    /// This is the object-level half of ruling
+    /// OD-X86-ELF-LOCAL-BINDING-20261027: before it, every x86-64 ELF
+    /// function definition was `STB_GLOBAL`, so a module-private helper was
+    /// exported from any shared object the result was linked into and
+    /// another input could preempt this object's calls to it.
+    #[test]
+    fn x86_64_elf_module_local_function_definition_binds_stb_local() {
+        use crate::elf::constants::{STB_GLOBAL, STB_LOCAL, STT_FUNC};
+        use crate::pipeline::{FunctionSymbolBinding, ObjectGlobal};
+
+        let private_data = ObjectGlobal {
+            name: "PRIVATE_D".to_string(),
+            data: vec![0xA1; 8],
+            mutable: true,
+            is_external: false,
+            symbol_refs: vec![],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let function = |name: &str, text_offset: u64, callee: Option<&str>| X86EncodedFunc {
+            name: name.to_string(),
+            has_body_instructions: true,
+            code_len: 16,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: Vec::new(),
+            call_fixups: callee
+                .map(|callee| {
+                    vec![X86CallFixup {
+                        offset: 1,
+                        callee: callee.to_string(),
+                        exact_module: false,
+                    }]
+                })
+                .unwrap_or_default(),
+            global_ref_fixups: vec![X86GlobalRefFixup {
+                offset: 8,
+                symbol: "PRIVATE_D".to_string(),
+                kind: X86SymbolRefFixupKind::GlobalRef,
+            }],
+            text_offset,
+            frame_metadata: None,
+            eh: None,
+        };
+        let encoded = [
+            function("entry", 0, Some("helper")),
+            function("helper", 16, None),
+        ];
+        let facts = X86FunctionSymbolFacts::with_definition_bindings([(
+            "helper".to_string(),
+            FunctionSymbolBinding::LOCAL,
+        )]);
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+        let object = pipeline
+            .emit_module_elf(
+                &encoded,
+                &[0x90; 32],
+                std::slice::from_ref(&private_data),
+                &facts,
+            )
+            .expect("an ELF module with a module-local function should emit");
+
+        let symbols = elf_symbols(&object);
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.0 == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}: {symbols:?}"))
+        };
+        // `helper` is a defined local function; `entry` stays global.
+        let helper = find("helper");
+        assert_eq!(
+            (helper.1 >> 4, helper.1 & 0xf, helper.2, helper.3),
+            (STB_LOCAL, STT_FUNC, 1, 16),
+            "the local definition must be STB_LOCAL STT_FUNC in .text at its offset: {symbols:?}"
+        );
+        let entry = find("entry");
+        assert_eq!(
+            (entry.1 >> 4, entry.1 & 0xf, entry.2),
+            (STB_GLOBAL, STT_FUNC, 1),
+            "an unstated definition stays a global function: {symbols:?}"
+        );
+        // Locals first, and both locals are in that partition.
+        let is_local = |symbol: &(String, u8, u16, u64, u64)| symbol.1 >> 4 == STB_LOCAL;
+        let first_global = symbols
+            .iter()
+            .position(|symbol| !is_local(symbol))
+            .expect("globals present");
+        assert!(
+            symbols[first_global..]
+                .iter()
+                .all(|symbol| !is_local(symbol)),
+            "a local follows a global: {symbols:?}"
+        );
+        let locals: Vec<&str> = symbols[1..first_global]
+            .iter()
+            .map(|symbol| symbol.0.as_str())
+            .collect();
+        // Insertion order inside the local partition: the function loop runs
+        // before the data-global loop, so the local FUNCTION comes first.
+        assert_eq!(locals, ["helper", "PRIVATE_D"]);
+        // The call and the data reference still name their exact targets,
+        // which is what the two-counter arithmetic has to get right now that
+        // a FUNCTION can land in the local partition.
+        assert_eq!(
+            elf_relocation_targets(&object, ".text"),
+            vec![
+                (1, "helper".to_string()),
+                (8, "PRIVATE_D".to_string()),
+                (24, "PRIVATE_D".to_string()),
+            ],
+            "text relocations must name their exact targets"
+        );
+    }
+
+    /// An UNDEFINED function reference carries the weakness and visibility
+    /// the facts state: `STB_WEAK` for a weak reference, its `STV_*` in
+    /// `st_other`, and a declared-only name gets a symbol even though nothing
+    /// in the object references it.
+    ///
+    /// Before this, `emit_module_elf` created every undefined symbol through
+    /// `ElfWriter::add_symbol`, which hardcodes `is_weak: false` and
+    /// `STV_DEFAULT` — so a hidden reference was written default-visible (it
+    /// would bind a definition another image could interpose) and a weak one
+    /// strong (the link would fail instead of resolving it to 0).
+    #[test]
+    fn x86_64_elf_undefined_function_references_carry_weakness_and_visibility() {
+        use crate::elf::constants::{STB_GLOBAL, STB_WEAK, STV_DEFAULT, STV_HIDDEN, STV_PROTECTED};
+
+        let caller = X86EncodedFunc {
+            name: "entry".to_string(),
+            has_body_instructions: true,
+            code_len: 24,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: Vec::new(),
+            call_fixups: vec![X86CallFixup {
+                offset: 1,
+                callee: "strong_callee".to_string(),
+                exact_module: false,
+            }],
+            global_ref_fixups: vec![
+                X86GlobalRefFixup {
+                    offset: 8,
+                    symbol: "weak_addressed".to_string(),
+                    kind: X86SymbolRefFixupKind::ExternRefGot,
+                },
+                X86GlobalRefFixup {
+                    offset: 14,
+                    symbol: "hidden_addressed".to_string(),
+                    kind: X86SymbolRefFixupKind::ExternRefGot,
+                },
+            ],
+            text_offset: 0,
+            frame_metadata: None,
+            eh: None,
+        };
+        let facts = X86FunctionSymbolFacts::default().with_undefined_references(
+            ["weak_addressed".to_string()].into_iter().collect(),
+            [
+                ("hidden_addressed".to_string(), trust_ir::Visibility::Hidden),
+                ("weak_addressed".to_string(), trust_ir::Visibility::Default),
+                (
+                    "declared_protected".to_string(),
+                    trust_ir::Visibility::Protected,
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ["declared_protected".to_string()].into_iter().collect(),
+        );
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+        let object = pipeline
+            .emit_module_elf(&[caller], &[0x90; 24], &[], &facts)
+            .expect("an ELF module with weak and visible undefined references should emit");
+
+        let symbols = elf_symbols(&object);
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.0 == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}: {symbols:?}"))
+        };
+        // `elf_symbols` gives (name, st_info, st_shndx, value, size); the
+        // visibility needs the reparsed record.
+        let visibility = |name: &str| {
+            crate::elf::reparse::read_object_records(&object)
+                .expect("reparse ELF")
+                .symbols
+                .into_iter()
+                .find(|symbol| symbol.name == name)
+                .map(|symbol| (symbol.binding, symbol.visibility, symbol.section_index))
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+        };
+        assert_eq!(
+            visibility("weak_addressed"),
+            (STB_WEAK, STV_DEFAULT, 0),
+            "a weak undefined reference is STB_WEAK and undefined"
+        );
+        assert_eq!(
+            visibility("hidden_addressed"),
+            (STB_GLOBAL, STV_HIDDEN, 0),
+            "a hidden undefined reference keeps STB_GLOBAL and carries STV_HIDDEN"
+        );
+        assert_eq!(
+            visibility("strong_callee"),
+            (STB_GLOBAL, STV_DEFAULT, 0),
+            "a reference no fact names stays strong and default-visible"
+        );
+        assert_eq!(
+            visibility("declared_protected"),
+            (STB_GLOBAL, STV_PROTECTED, 0),
+            "a declared-only name gets an undefined symbol with its visibility"
+        );
+        assert_eq!(find("entry").2, 1, "the definition is still in .text");
+        // The relocations still name their exact targets, which is what the
+        // index arithmetic has to get right now that a symbol is added after
+        // every other site has handed out its index.
+        let targets = elf_relocation_targets(&object, ".text");
+        assert!(
+            targets.contains(&(1, "strong_callee".to_string()))
+                && targets.contains(&(8, "weak_addressed".to_string()))
+                && targets.contains(&(14, "hidden_addressed".to_string())),
+            "text relocations must name their exact targets: {targets:?}"
+        );
+    }
+
+    /// The undefined-reference facts are refused where they cannot be spelled
+    /// or where they contradict the object: off ELF, for a name this module
+    /// DEFINES, for an unreferenced declaration with nothing to state, and for
+    /// a weak callee reached by a direct `PLT32` call.
+    #[test]
+    fn x86_64_undefined_reference_facts_are_refused_when_unspellable_or_contradicted() {
+        use crate::pipeline::FunctionSymbolLinkage;
+
+        // `entry` calls `weak_callee`, so the weak-callee case has a real
+        // direct edge; the other cases only need a module that emits.
+        let functions = || {
+            let mut entry = build_x86_const_test_function();
+            entry.name = "entry".to_string();
+            entry
+                .blocks
+                .get_mut(&Block(0))
+                .expect("entry block")
+                .insts
+                .insert(
+                    0,
+                    X86ISelInst::new(
+                        X86Opcode::Call,
+                        vec![X86ISelOperand::Symbol("weak_callee".to_string())],
+                    ),
+                );
+            [entry]
+        };
+        let undefined =
+            |weak: &[&str], visible: &[(&str, trust_ir::Visibility)], declared: &[&str]| {
+                X86FunctionSymbolFacts::default().with_undefined_references(
+                    weak.iter().map(|name| (*name).to_string()).collect(),
+                    visible
+                        .iter()
+                        .map(|(name, visibility)| ((*name).to_string(), *visibility))
+                        .collect(),
+                    declared.iter().map(|name| (*name).to_string()).collect(),
+                )
+            };
+        let emit = |format, facts: &X86FunctionSymbolFacts| {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                output_format: format,
+                emit_frame: true,
+                call_abi: X86CallAbi::SystemV,
+                ..X86PipelineConfig::default()
+            });
+            let assembled = pipeline
+                .assemble_module_after_x86_passes(&functions(), false)
+                .expect("assemble");
+            pipeline.emit_assembled_module_with_function_symbols(assembled, &[], facts)
+        };
+
+        // Off ELF: no x86-64 emitter spells either fact.
+        for format in [
+            X86OutputFormat::MachO,
+            X86OutputFormat::Coff,
+            X86OutputFormat::RawBytes,
+        ] {
+            let error = emit(
+                format,
+                &undefined(&[], &[("elsewhere", trust_ir::Visibility::Hidden)], &[]),
+            )
+            .expect_err("only the ELF emitter spells an undefined-reference fact");
+            assert!(
+                matches!(
+                    &error,
+                    X86PipelineError::FunctionVisibilityUnsupported { reason, .. }
+                        if reason.contains("undefined")
+                ),
+                "{format:?}: {error:?}"
+            );
+        }
+        // A fact about a function this module DEFINES.
+        let error = emit(X86OutputFormat::Elf, &undefined(&["entry"], &[], &[]))
+            .expect_err("a fact naming a definition is refused");
+        assert!(
+            matches!(
+                &error,
+                X86PipelineError::FunctionLinkageUnsupported { function, reason, .. }
+                    if function == "entry" && reason.contains("DEFINES")
+            ),
+            "{error:?}"
+        );
+        // An unreferenced declaration with neither weakness nor visibility.
+        let error = emit(X86OutputFormat::Elf, &undefined(&[], &[], &["bare"]))
+            .expect_err("a strong default-visible unreferenced declaration is written by no one");
+        assert!(
+            matches!(
+                &error,
+                X86PipelineError::FunctionVisibilityUnsupported { function, reason, .. }
+                    if function == "bare" && reason.contains("unreferenced declaration")
+            ),
+            "{error:?}"
+        );
+        // A weak undefined callee reached by a DIRECT call: its address must
+        // come from the GOT, so the direct edge is refused by name.
+        let error = emit(X86OutputFormat::Elf, &undefined(&["weak_callee"], &[], &[]))
+            .expect_err("a direct PLT32 call cannot reach a weak undefined callee");
+        assert!(
+            matches!(
+                &error,
+                X86PipelineError::FunctionLinkageUnsupported {
+                    function,
+                    linkage: FunctionSymbolLinkage::Weak,
+                    reason,
+                    ..
+                } if function == "weak_callee" && reason.contains("GOT")
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// The ELF, Mach-O and COFF emitters spell a module-local function
+    /// definition (`STB_LOCAL`, a non-external `N_SECT` symbol,
+    /// `IMAGE_SYM_CLASS_STATIC`; ruling OD-X86-BINDING-ONE-CARRIER-20261105,
+    /// before which only ELF did and the other two refused it), the raw-bytes
+    /// form refuses it, and a fact must agree with the assembly and with the
+    /// config's weak set. Every other shape is refused by name rather than
+    /// emitted as a default-visible global.
+    #[test]
+    fn x86_64_module_local_function_fact_is_spelled_per_format_and_refused_when_contradicted() {
+        use crate::pipeline::{FunctionSymbolBinding, FunctionSymbolLinkage};
+
+        let functions = || {
+            let mut entry = build_x86_const_test_function();
+            entry.name = "entry".to_string();
+            entry
+                .blocks
+                .get_mut(&Block(0))
+                .expect("entry block")
+                .insts
+                .insert(
+                    0,
+                    X86ISelInst::new(
+                        X86Opcode::Call,
+                        vec![X86ISelOperand::Symbol("helper".to_string())],
+                    ),
+                );
+            let mut helper = build_x86_const_test_function();
+            helper.name = "helper".to_string();
+            [entry, helper]
+        };
+        let local = |name: &str| {
+            X86FunctionSymbolFacts::with_definition_bindings([(
+                name.to_string(),
+                FunctionSymbolBinding::LOCAL,
+            )])
+        };
+        let emit_with = |config: X86PipelineConfig, facts: &X86FunctionSymbolFacts| {
+            let pipeline = X86Pipeline::new(config);
+            let assembled = pipeline
+                .assemble_module_after_x86_passes(&functions(), false)
+                .expect("assemble");
+            pipeline.emit_assembled_module_with_function_symbols(assembled, &[], facts)
+        };
+        let config_for = |output_format| X86PipelineConfig {
+            output_format,
+            emit_frame: true,
+            call_abi: X86CallAbi::SystemV,
+            ..X86PipelineConfig::default()
+        };
+        // ELF spells it.
+        emit_with(config_for(X86OutputFormat::Elf), &local("helper"))
+            .expect("ELF binds a module-local definition");
+        // Mach-O spells it as a non-external `N_SECT` symbol, `entry` staying
+        // external.
+        let macho = emit_with(config_for(X86OutputFormat::MachO), &local("helper"))
+            .expect("Mach-O binds a module-local definition");
+        let records = crate::macho::reparse::read_object_records(&macho).expect("reparse Mach-O");
+        let macho_external = |name: &str| {
+            let spelled: Vec<_> = records
+                .symbols
+                .iter()
+                .filter(|symbol| !symbol.is_stab() && symbol.name == name)
+                .collect();
+            let [symbol] = spelled.as_slice() else {
+                panic!("one {name}: {spelled:?}");
+            };
+            assert!(symbol.is_section_definition(), "{name}: {symbol:?}");
+            symbol.is_external()
+        };
+        assert!(!macho_external("_helper"), "the local definition");
+        assert!(macho_external("_entry"), "an unstated definition");
+        // COFF spells it `IMAGE_SYM_CLASS_STATIC`, `entry` staying external.
+        let coff = emit_with(config_for(X86OutputFormat::Coff), &local("helper"))
+            .expect("COFF binds a module-local definition");
+        let symbols = crate::coff::reparse::read_symbols(&coff).expect("reparse COFF");
+        let coff_class = |name: &str| {
+            let spelled: Vec<_> = symbols
+                .iter()
+                .filter(|symbol| symbol.name == name)
+                .collect();
+            let [symbol] = spelled.as_slice() else {
+                panic!("one {name}: {spelled:?}");
+            };
+            symbol.storage_class
+        };
+        assert_eq!(coff_class("helper"), crate::coff::IMAGE_SYM_CLASS_STATIC);
+        assert_eq!(coff_class("entry"), crate::coff::IMAGE_SYM_CLASS_EXTERNAL);
+        // The raw-bytes form has no symbol table and refuses it by name.
+        match emit_with(config_for(X86OutputFormat::RawBytes), &local("helper")) {
+            Err(X86PipelineError::FunctionLinkageUnsupported {
+                function,
+                linkage: FunctionSymbolLinkage::Local,
+                format: X86OutputFormat::RawBytes,
+                ..
+            }) => assert_eq!(function, "helper"),
+            other => panic!("raw bytes must refuse a module-local definition: {other:?}"),
+        }
+        // A fact about a function the module does not define is refused: the
+        // facts and the assembly would disagree about what this object
+        // defines.
+        match emit_with(config_for(X86OutputFormat::Elf), &local("elsewhere")) {
+            Err(X86PipelineError::FunctionLinkageUnsupported {
+                function, reason, ..
+            }) => {
+                assert_eq!(function, "elsewhere");
+                assert!(reason.contains("no definition"), "{reason}");
+            }
+            other => panic!("a local name the module does not define must be refused: {other:?}"),
+        }
+        // Weakness is the config's (`weak_function_definitions`): a local
+        // fact about a weak definition is refused, never merged with it.
+        let mut weak_config = config_for(X86OutputFormat::Elf);
+        weak_config
+            .weak_function_definitions
+            .insert("helper".to_string());
+        emit_with(weak_config.clone(), &X86FunctionSymbolFacts::default())
+            .expect("the weak-definition control");
+        match emit_with(weak_config, &local("helper")) {
+            Err(X86PipelineError::FunctionLinkageUnsupported {
+                function, reason, ..
+            }) => {
+                assert_eq!(function, "helper");
+                assert!(reason.contains("weak"), "{reason}");
+            }
+            other => panic!("a weak definition is never module-local: {other:?}"),
+        }
+    }
+
+    /// Every relocation against section `name` as `(r_offset, symbol name)`,
+    /// sorted by offset.
+    fn elf_relocation_targets(bytes: &[u8], name: &str) -> Vec<(u64, String)> {
+        let records = crate::elf::reparse::read_object_records(bytes).expect("reparse ELF");
+        let section = records
+            .sections
+            .iter()
+            .position(|section| section.name == name)
+            .expect("relocated section exists");
+        let mut rows: Vec<(u64, String)> = records
+            .relocations
+            .iter()
+            .filter(|relocation| relocation.target_section == section)
+            .map(|relocation| {
+                (
+                    relocation.record.r_offset,
+                    records.symbols[relocation.record.symbol_index as usize]
+                        .name
+                        .clone(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A module-private (`!is_external`) data global is an `STB_LOCAL`
+    /// definition, never an exported `STB_GLOBAL` one; imports stay undefined
+    /// globals. Every relocation still names the right symbol once locals
+    /// are partitioned ahead of globals in `.symtab`.
+    #[test]
+    fn x86_64_elf_imports_are_undefined_and_private_globals_stay_local() {
+        use crate::elf::constants::{STB_GLOBAL, STB_LOCAL, STT_OBJECT};
+        use crate::pipeline::{GlobalSymbolRef, ObjectGlobal};
+
+        let private = ObjectGlobal {
+            name: "PRIVATE_BYTES".to_string(),
+            data: vec![0xA1],
+            mutable: true,
+            is_external: false,
+            symbol_refs: vec![],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 1,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let exported_pointer = ObjectGlobal {
+            name: "EXPORTED_POINTER".to_string(),
+            data: vec![0; 16],
+            is_external: true,
+            symbol_refs: vec![
+                GlobalSymbolRef {
+                    offset: 0,
+                    symbol: "PRIVATE_BYTES".to_string(),
+                    addend: 0,
+                },
+                GlobalSymbolRef {
+                    offset: 8,
+                    symbol: "read_both".to_string(),
+                    addend: 0,
+                },
+            ],
+            align: 8,
+            ..private.clone()
+        };
+        let import = ObjectGlobal {
+            name: "IMPORTED_BYTES".to_string(),
+            data: vec![],
+            is_external: true,
+            is_import: true,
+            ..private.clone()
+        };
+        let encoded = X86EncodedFunc {
+            name: "read_both".to_string(),
+            has_body_instructions: true,
+            code_len: 8,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: vec![],
+            call_fixups: vec![],
+            global_ref_fixups: vec![
+                X86GlobalRefFixup {
+                    offset: 0,
+                    symbol: "IMPORTED_BYTES".to_string(),
+                    kind: X86SymbolRefFixupKind::GlobalRef,
+                },
+                X86GlobalRefFixup {
+                    offset: 4,
+                    symbol: "PRIVATE_BYTES".to_string(),
+                    kind: X86SymbolRefFixupKind::GlobalRef,
+                },
+            ],
+            text_offset: 0,
+            frame_metadata: None,
+            eh: None,
+        };
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: false,
+            ..X86PipelineConfig::default()
+        });
+
+        let object = pipeline
+            .emit_module_elf(
+                &[encoded],
+                &[0; 8],
+                &[private, exported_pointer, import],
+                &X86FunctionSymbolFacts::default(),
+            )
+            .expect("an ELF module with private, exported and imported data should emit");
+        let symbols = elf_symbols(&object);
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|symbol| symbol.0 == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+        };
+        let private = find("PRIVATE_BYTES");
+        assert_eq!(
+            private.1 >> 4,
+            STB_LOCAL,
+            "a private global must stay local"
+        );
+        assert_eq!(private.1 & 0x0f, STT_OBJECT);
+        assert_ne!(private.2, 0);
+        assert_eq!(private.4, 1);
+        let exported = find("EXPORTED_POINTER");
+        assert_eq!(exported.1 >> 4, STB_GLOBAL);
+        let import = find("IMPORTED_BYTES");
+        assert_eq!(import.1 >> 4, STB_GLOBAL);
+        assert_eq!(import.2, 0, "an import must remain undefined");
+        assert_eq!(import.4, 0);
+
+        assert_eq!(
+            elf_relocation_targets(&object, ".text"),
+            vec![
+                (0, "IMPORTED_BYTES".to_string()),
+                (4, "PRIVATE_BYTES".to_string())
+            ],
+            "text relocations must name their exact targets"
+        );
+        assert_eq!(
+            elf_relocation_targets(&object, ".data"),
+            vec![
+                (8, "PRIVATE_BYTES".to_string()),
+                (16, "read_both".to_string())
+            ],
+            "data relocations must name their exact targets"
+        );
+    }
+
+    /// The EH lane adds LOCAL symbols — the `.text` and `.gcc_except_table`
+    /// `STT_SECTION` anchors — and this emitter hands out FINAL symbol indices by
+    /// counting locals UP FRONT (it never calls `ElfWriter::final_symbol_index`,
+    /// which would freeze the table mid-emission). An EH local left out of that
+    /// count shifts every global index and silently mis-wires a CALL relocation
+    /// to the wrong callee: the exact hazard the AArch64 emitter documents.
+    ///
+    /// So check, through the INDEPENDENT reader, that every relocation still
+    /// names the symbol it means, with a module-private data global occupying the
+    /// local partition alongside the anchors.
+    #[test]
+    fn x86_64_elf_eh_module_relocations_still_name_their_exact_targets() {
+        use crate::elf::constants::{STB_LOCAL, STT_SECTION};
+        use crate::pipeline::ObjectGlobal;
+
+        let private = ObjectGlobal {
+            name: "EH_PRIVATE_BYTES".to_string(),
+            data: vec![0xA1; 8],
+            mutable: true,
+            is_external: false,
+            symbol_refs: vec![],
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let exported = ObjectGlobal {
+            name: "EH_EXPORTED_BYTES".to_string(),
+            is_external: true,
+            ..private.clone()
+        };
+
+        let lsda = |code_len: u32| {
+            generate_x86_lsda(
+                &ResolvedX86Eh {
+                    landing_pads: Vec::new(),
+                    call_site_ranges: vec![(0, code_len, 0)],
+                },
+                crate::exception_handling::RUST_EH_PERSONALITY_SYMBOL,
+            )
+            .expect("filler LSDA")
+        };
+        let frame = || X86FrameMetadata {
+            callee_saved: Vec::new(),
+            callee_saved_xmms: Vec::new(),
+            xmm_save_offsets: Vec::new(),
+            frame_size: 0,
+            has_dynamic_alloc: false,
+        };
+        let caller = X86EncodedFunc {
+            name: "eh_index_caller".to_string(),
+            has_body_instructions: true,
+            code_len: 16,
+            const_pool_len: 0,
+            const_pool_rdata_offset: 0,
+            const_pool_rel32_fixups: Vec::new(),
+            call_fixups: vec![X86CallFixup {
+                offset: 1,
+                callee: "eh_index_callee".to_string(),
+                exact_module: false,
+            }],
+            global_ref_fixups: vec![X86GlobalRefFixup {
+                offset: 8,
+                symbol: "EH_PRIVATE_BYTES".to_string(),
+                kind: X86SymbolRefFixupKind::GlobalRef,
+            }],
+            text_offset: 0,
+            frame_metadata: Some(frame()),
+            eh: None,
+        };
+        let callee = X86EncodedFunc {
+            name: "eh_index_callee".to_string(),
+            code_len: 16,
+            call_fixups: Vec::new(),
+            global_ref_fixups: Vec::new(),
+            text_offset: 16,
+            eh: Some(X86EhData {
+                personality: crate::exception_handling::RUST_EH_PERSONALITY_SYMBOL.to_string(),
+                lsda_bytes: lsda(16),
+            }),
+            ..caller.clone()
+        };
+
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            emit_frame: true,
+            ..X86PipelineConfig::default()
+        });
+        let object = pipeline
+            .emit_module_elf(
+                &[caller, callee],
+                &[0x90; 32],
+                &[private, exported.clone()],
+                &X86FunctionSymbolFacts::default(),
+            )
+            .expect("an EH-bearing ELF module with data globals should emit");
+
+        // The `.text` relocations: the PLT32 call names the CALLEE, and the PC32
+        // symbol-address reference names the PRIVATE global — not whatever
+        // symbols those indices would hold if the EH anchors were unaccounted.
+        assert_eq!(
+            elf_relocation_targets(&object, ".text"),
+            vec![
+                (1, "eh_index_callee".to_string()),
+                (8, "EH_PRIVATE_BYTES".to_string()),
+            ],
+            "text relocations must name their exact targets with the unwind \
+             anchors in the local partition"
+        );
+        // The `.eh_frame` relocations: the personality slot, then per FDE the
+        // `.text` anchor and the (unnamed) `.gcc_except_table` anchor.
+        let eh_rows = elf_relocation_targets(&object, ".eh_frame");
+        assert_eq!(eh_rows.len(), 5, "{eh_rows:?}");
+        assert!(
+            eh_rows
+                .iter()
+                .any(|(_, name)| name == "DW.ref.rust_eh_personality"),
+            "{eh_rows:?}"
+        );
+        assert_eq!(
+            eh_rows.iter().filter(|(_, name)| name == ".text").count(),
+            2,
+            "one pc-begin anchor per FDE: {eh_rows:?}"
+        );
+        assert_eq!(
+            eh_rows.iter().filter(|(_, name)| name.is_empty()).count(),
+            2,
+            "one .gcc_except_table anchor per FDE: {eh_rows:?}"
+        );
+        // Both anchors are LOCAL section symbols.
+        let symbols = elf_symbols(&object);
+        let anchors: Vec<_> = symbols
+            .iter()
+            .filter(|symbol| symbol.1 == (STB_LOCAL << 4) | STT_SECTION)
+            .collect();
+        assert_eq!(anchors.len(), 2, "{anchors:?}");
+        // And the slot's own cell points at the personality.
+        assert_eq!(
+            elf_relocation_targets(&object, ".data.DW.ref.rust_eh_personality"),
+            vec![(0, "rust_eh_personality".to_string())]
+        );
+    }
+
+    /// A direct call (`R_X86_64_PLT32`) whose callee is a known data object
+    /// global is a malformed module, not a function import: refuse it
+    /// (the relocation inventory shares the preflight) instead of binding a
+    /// PLT32 relocation to an `STT_OBJECT` symbol.
+    #[test]
+    fn x86_elf_rejects_direct_calls_to_known_object_globals() {
+        use crate::pipeline::ObjectGlobal;
+
+        for is_import in [false, true] {
+            let encoded = X86EncodedFunc {
+                name: "caller".to_string(),
+                has_body_instructions: true,
+                code_len: 5,
+                const_pool_len: 0,
+                const_pool_rdata_offset: 0,
+                const_pool_rel32_fixups: Vec::new(),
+                call_fixups: vec![X86CallFixup {
+                    offset: 1,
+                    callee: "data".to_string(),
+                    exact_module: false,
+                }],
+                global_ref_fixups: Vec::new(),
+                text_offset: 0,
+                frame_metadata: None,
+                eh: None,
+            };
+            let global = ObjectGlobal {
+                name: "data".to_string(),
+                data: if is_import { vec![] } else { vec![0; 8] },
+                mutable: false,
+                is_external: true,
+                symbol_refs: vec![],
+                is_thread_local: false,
+                is_import,
+                is_weak: false,
+                align: 1,
+                visibility: trust_ir::Visibility::Default,
+                retained: false,
+                section: None,
+                comdat: false,
+            };
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                output_format: X86OutputFormat::Elf,
+                ..X86PipelineConfig::default()
+            });
+
+            let error = pipeline
+                .emit_module_elf(
+                    &[encoded],
+                    &[0xE8, 0, 0, 0, 0],
+                    std::slice::from_ref(&global),
+                    &X86FunctionSymbolFacts::default(),
+                )
+                .expect_err("an ELF PLT32 call must not bind to an object global");
+            assert!(
+                error.to_string().contains("direct call") && error.to_string().contains("data"),
+                "is_import={is_import}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_module_emission_refuses_weak_undefined_data_reference() {
+        use crate::pipeline::ObjectGlobal;
+
+        let import = |weak: bool| ObjectGlobal {
+            name: "maybe_data".to_string(),
+            data: Vec::new(),
+            mutable: true,
+            is_external: true,
+            symbol_refs: Vec::new(),
+            is_thread_local: false,
+            is_import: true,
+            is_weak: weak,
+            align: 8,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            section: None,
+            comdat: false,
+        };
+        let ret_only = || {
+            let mut function = minimal_func("weak_import_probe");
+            function.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+            function
+        };
+        // No x86-64 writer spells a weak undefined reference; emitting the
+        // import strong would replace null-on-missing semantics.
+        for format in [
+            X86OutputFormat::MachO,
+            X86OutputFormat::Elf,
+            X86OutputFormat::Coff,
+            X86OutputFormat::RawBytes,
+        ] {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                output_format: format,
+                ..X86PipelineConfig::default()
+            });
+            match pipeline.compile_module_with_globals(&[ret_only()], &[import(true)]) {
+                Err(X86PipelineError::WeakUndefinedReferenceUnsupported { symbol, .. }) => {
+                    assert_eq!(symbol, "maybe_data", "{format:?}");
+                }
+                other => panic!("{format:?}: expected a weak-reference refusal, got {other:?}"),
+            }
+        }
+        // Control: the same strong import still emits.
+        for format in [X86OutputFormat::MachO, X86OutputFormat::Elf] {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                output_format: format,
+                ..X86PipelineConfig::default()
+            });
+            pipeline
+                .compile_module_with_globals(&[ret_only()], &[import(false)])
+                .unwrap_or_else(|error| panic!("{format:?}: strong import emits: {error}"));
+        }
+        // Nor does any spell a hidden or protected undefined data symbol
+        // (L02-P6; only the AArch64 ELF emitters do).
+        for format in [
+            X86OutputFormat::MachO,
+            X86OutputFormat::Elf,
+            X86OutputFormat::Coff,
+            X86OutputFormat::RawBytes,
+        ] {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                output_format: format,
+                ..X86PipelineConfig::default()
+            });
+            for visibility in [
+                trust_ir::Visibility::Hidden,
+                trust_ir::Visibility::Protected,
+            ] {
+                let hidden = ObjectGlobal {
+                    visibility,
+                    ..import(false)
+                };
+                match pipeline.compile_module_with_globals(&[ret_only()], &[hidden]) {
+                    Err(X86PipelineError::ImportVisibilityUnsupported {
+                        symbol,
+                        visibility: refused,
+                        ..
+                    }) => assert_eq!((symbol.as_str(), refused), ("maybe_data", visibility)),
+                    other => panic!(
+                        "{format:?} {visibility}: expected an import-visibility refusal, got {other:?}"
+                    ),
+                }
+            }
+        }
     }
 
     /// Build a three-block x86 function carrying exception-handling structure:
@@ -24564,6 +34271,7 @@ mod tests {
                 params: vec![],
                 instructions: vec![Instruction {
                     opcode: Opcode::Invoke {
+                        binding: trust_cg_lower::instructions::DirectCallBinding::Interposable,
                         name: "may_unwind".to_string(),
                         normal_dest: normal,
                         unwind_dest: pad,
@@ -24676,7 +34384,7 @@ mod tests {
                 .expect_err("module object must not emit an unrelocated TType entry"),
         ] {
             assert!(
-                matches!(error, X86PipelineError::MalformedFunction { .. }),
+                matches!(error, X86PipelineError::MalformedEh { .. }),
                 "{error}"
             );
             assert!(
@@ -24783,11 +34491,10 @@ mod tests {
 
     #[test]
     fn test_x86_unwired_eh_formats_and_sidecar_dropping_api_fail_closed() {
-        for format in [
-            X86OutputFormat::RawBytes,
-            X86OutputFormat::Elf,
-            X86OutputFormat::Coff,
-        ] {
+        // RawBytes has no container and COFF no `.pdata`/`.xdata` language-level
+        // EH path, so BOTH the single-function and the module API still refuse an
+        // EH function for them.
+        for format in [X86OutputFormat::RawBytes, X86OutputFormat::Coff] {
             let func = build_x86_eh_test_function("eh_unsupported_format");
             let pipeline = X86Pipeline::new(X86PipelineConfig {
                 emit_frame: true,
@@ -24810,6 +34517,37 @@ mod tests {
                 ));
             }
         }
+
+        // ELF SPLITS the two lanes, deliberately: the MODULE emitter serializes
+        // the bundle (`.gcc_except_table`, a zPLR `.eh_frame`, the `DW.ref`
+        // personality slot), the SINGLE-FUNCTION one has none of those sections
+        // and still refuses rather than emitting a body whose landing pads are
+        // stranded.
+        let func = build_x86_eh_test_function("eh_elf_lane_split");
+        let elf = X86Pipeline::new(X86PipelineConfig {
+            emit_frame: true,
+            output_format: X86OutputFormat::Elf,
+            ..X86PipelineConfig::default()
+        });
+        let err = elf
+            .compile_function(&func)
+            .expect_err("single-function ELF EH has no LSDA section to carry the sidecar");
+        match err {
+            X86PipelineError::EhOutputUnsupported {
+                format: X86OutputFormat::Elf,
+                ref reason,
+                ..
+            } => assert!(
+                reason.contains("MODULE emitter"),
+                "the diagnostic must point at the module emitter: {reason}"
+            ),
+            other => panic!("expected the single-function ELF EH refusal, got {other:?}"),
+        }
+        let object = elf
+            .compile_module(std::slice::from_ref(&func))
+            .expect("x86-64 ELF MODULE emission now carries the EH bundle");
+        assert!(find_elf_section(&object, ".gcc_except_table").is_some());
+        assert!(find_elf_section(&object, ".eh_frame").is_some());
 
         let func = build_x86_eh_test_function("eh_fixup_sidecar_drop");
         let pipeline = X86Pipeline::new(X86PipelineConfig {
@@ -24885,7 +34623,7 @@ mod tests {
             let err = pipeline
                 .compile_trust_ir_function(&stale)
                 .expect_err("metadata-only EH must fail the shared LIR structural guard");
-            assert!(matches!(err, X86PipelineError::ISel(_)), "{err}");
+            assert!(matches!(err, X86PipelineError::Unwind(_)), "{err}");
             assert!(
                 err.to_string().contains("has no Invoke/LandingPad/Resume"),
                 "{err}"
@@ -25308,6 +35046,7 @@ mod tests {
                     Instruction {
                         opcode: Opcode::Call {
                             name: "target".to_string(),
+                            binding: Default::default(),
                         },
                         args: vec![],
                         results: vec![],
@@ -25369,6 +35108,7 @@ mod tests {
                     Instruction {
                         opcode: Opcode::Call {
                             name: "target".to_string(),
+                            binding: Default::default(),
                         },
                         args: vec![],
                         results: vec![],
@@ -25456,7 +35196,7 @@ mod tests {
         use trust_cg_ir::x86_64_regs::{XMM6, XMM15};
 
         let func = minimal_func("windows_xmm_frame");
-        let layout = compute_x86_stack_frame_layout(&func, 0, 2, 0).unwrap();
+        let layout = compute_x86_stack_frame_layout(&func, 0, 2).unwrap();
 
         assert_eq!(layout.xmm_save_offsets.len(), 2);
         assert!(layout.frame_size >= 32);
@@ -25537,24 +35277,57 @@ mod tests {
             )
         };
 
-        let enabled =
-            crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_JCC_ALIGN"], inspect);
-        let disabled =
-            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_JCC_ALIGN", "1")], inspect);
+        // Three tiers, because two padding passes now claim the grid and each
+        // is only sound if the LINKER honours the grid it computed against:
+        // the loop-head containment aligner needs 64, the JCC-erratum pass 32,
+        // and with both off we owe nothing beyond the System V 16.
+        //
+        // ⚑ The COFF arm is the one that catches a silent downgrade:
+        // `add_text_section_with_align` falls back to IMAGE_SCN_ALIGN_16BYTES
+        // for any exponent it has no constant for, so a grid bump that forgot
+        // the writer would emit 64-byte-relative padding into a 16-byte
+        // section and be half-effective in exactly the documented way.
+        let both = crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_X86_LOOP_HEAD_ALIGN", "TCG_NO_X86_JCC_ALIGN"],
+            inspect,
+        );
+        let jcc_only =
+            crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LOOP_HEAD_ALIGN", "1")], || {
+                crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_JCC_ALIGN"], inspect)
+            });
+        let neither = crate::env_lock::with_env_overrides(
+            &[
+                ("TCG_NO_X86_LOOP_HEAD_ALIGN", "1"),
+                ("TCG_NO_X86_JCC_ALIGN", "1"),
+            ],
+            inspect,
+        );
 
         assert_eq!(
-            enabled,
-            (32, crate::coff::writer::IMAGE_SCN_ALIGN_32BYTES),
-            "default-on JCC padding requires an exact 32-byte .text grid in both object formats"
+            both,
+            (64, crate::coff::writer::IMAGE_SCN_ALIGN_64BYTES),
+            "default-on loop-head containment requires an exact 64-byte .text grid \
+             in both object formats"
         );
         assert_eq!(
-            disabled,
+            jcc_only,
+            (32, crate::coff::writer::IMAGE_SCN_ALIGN_32BYTES),
+            "with only the JCC pass on, the grid must fall back to exactly 32 bytes"
+        );
+        assert_eq!(
+            neither,
             (16, crate::coff::IMAGE_SCN_ALIGN_16BYTES),
-            "the kill switch must restore both object formats to their 16-byte convention"
+            "the kill switches must restore both object formats to their 16-byte convention"
         );
         assert_ne!(
-            enabled, disabled,
-            "the control must prove that the kill switch changes the serialized section headers"
+            both, jcc_only,
+            "the control must prove that the loop-head kill switch changes the \
+             serialized section headers"
+        );
+        assert_ne!(
+            jcc_only, neither,
+            "the control must prove that the JCC kill switch changes the \
+             serialized section headers"
         );
     }
 
@@ -25801,15 +35574,22 @@ mod tests {
         let xdata = find_coff_section(&bytes, ".xdata").expect("missing .xdata");
 
         // Function 1 is 19 bytes; function 2 is 6. Packed back-to-back that was
-        // 25 total with fn2 at offset 19. With JCC-erratum function alignment
-        // fn2 starts at 32, so .text is 38.
+        // 25 total with fn2 at offset 19. With function alignment fn2 starts on
+        // the next grid boundary after 19 (32 under the JCC-erratum grid, 64
+        // under the loop-head containment grid), so .text is that plus 6.
         //
-        // ⚑ The point of this test after that change: the unwind records must
-        // MOVE WITH the padding. They are derived from `text_offset`, which is
-        // taken AFTER the alignment NOPs — if padding were inserted anywhere
-        // that bypassed it, pdata would still say 19 and Windows would unwind
-        // from the middle of the padding. The `32` below is that check.
-        assert_eq!(text.size, 38);
+        // ⚑ The point of this test: the unwind records must MOVE WITH the
+        // padding. They are derived from `text_offset`, which is taken AFTER
+        // the alignment NOPs — if padding were inserted anywhere that bypassed
+        // it, pdata would still say 19 and Windows would unwind from the middle
+        // of the padding. `expected_fn2_begin` below is that check. It is
+        // derived from `x86_text_align_log2` rather than hardcoded so that the
+        // pin tracks the grid instead of silently pinning a stale one, and it
+        // is an EXACT value (not `% align == 0`), so over-padding still fails.
+        let text_align = 1u32 << x86_text_align_log2();
+        let expected_fn2_begin = 19u32.div_ceil(text_align) * text_align;
+        let expected_text_size = expected_fn2_begin + 6;
+        assert_eq!(text.size, expected_text_size as usize);
         assert_eq!(text.reloc_count, 1);
         assert_eq!(read_u32(&bytes, text.reloc_offset), 9);
         assert_eq!(
@@ -25822,14 +35602,11 @@ mod tests {
         assert_eq!(read_u32(&bytes, pdata.offset + 4), 19);
         assert_eq!(read_u32(&bytes, pdata.offset + 8), 0);
         let fn2_begin = read_u32(&bytes, pdata.offset + 12);
-        assert_eq!(fn2_begin, 32, "fn2 must start on the aligned boundary");
         assert_eq!(
-            fn2_begin % (1u32 << x86_text_align_log2()),
-            0,
-            "every function's unwind BeginAddress must sit on the alignment grid \
-             the padding assumed"
+            fn2_begin, expected_fn2_begin,
+            "fn2 must start on the aligned boundary"
         );
-        assert_eq!(read_u32(&bytes, pdata.offset + 16), 38);
+        assert_eq!(read_u32(&bytes, pdata.offset + 16), expected_text_size);
         assert_eq!(read_u32(&bytes, pdata.offset + 20), 12);
         assert_eq!(xdata.size, 20);
         assert_eq!(
@@ -26507,16 +36284,117 @@ mod tests {
         );
     }
 
+    /// Every row of `report` is an exception-table row: Unverified with the
+    /// shared detail, so the report never promotes.
+    #[cfg(feature = "verify")]
+    fn assert_all_exception_table_rows_unverified(
+        report: &trust_cg_verify::ObjectRelocationInventoryReport,
+    ) {
+        assert!(!report.is_promotable(), "{report:?}");
+        assert_eq!(
+            report.uncovered_relocations().len(),
+            report.entries.len(),
+            "{report:?}"
+        );
+        for entry in &report.entries {
+            assert!(
+                entry
+                    .detail
+                    .contains("exception tables carry no proof obligation"),
+                "{entry:?}"
+            );
+        }
+    }
+
+    /// Only the exception-table rows of an x86-64 inventory are Unverified: in
+    /// a module mixing an EH function with a function that calls another by
+    /// name, the call rows keep their proof lane and binding, and the EH
+    /// surface's rows (Mach-O compact unwind + personality GOT; ELF CIE
+    /// personality, per-FDE pc-begin and LSDA PC32, `DW.ref` ABS64) are
+    /// exactly the Unverified ones. Without EH nothing is marked.
     #[cfg(feature = "verify")]
     #[test]
-    fn test_x86_64_macho_eh_module_inventory_enumerates_rows_and_promotes() {
+    fn x86_64_inventories_mark_exactly_the_exception_table_rows_unverified() {
+        use trust_cg_verify::ObjectRelocationKind as K;
+        let caller = || {
+            let mut caller = minimal_func("caller");
+            caller.push_inst(
+                Block(0),
+                X86ISelInst::new(
+                    X86Opcode::Call,
+                    vec![X86ISelOperand::Symbol("callee".to_string())],
+                ),
+            );
+            caller.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+            caller
+        };
+        let callee = || {
+            let mut callee = minimal_func("callee");
+            callee.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+            callee
+        };
+        for (format, call_kind, eh_rows) in [
+            (X86OutputFormat::MachO, K::X86_64MachOBranch, 4usize),
+            (X86OutputFormat::Elf, K::X86_64ElfPlt32, 8usize),
+        ] {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                emit_frame: true,
+                output_format: format,
+                ..X86PipelineConfig::default()
+            });
+            let with_eh = pipeline
+                .module_relocation_inventory_report_after_x86_passes(
+                    &[build_x86_eh_test_function("eh_main"), caller(), callee()],
+                    &[],
+                    "mixed.o",
+                    false,
+                )
+                .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+            let uncovered = with_eh.uncovered_relocations();
+            assert_eq!(uncovered.len(), eh_rows, "{format:?}: {with_eh:?}");
+            for entry in &uncovered {
+                assert!(
+                    entry
+                        .detail
+                        .contains("exception tables carry no proof obligation")
+                        && entry.kind != call_kind,
+                    "{format:?}: {entry:?}"
+                );
+            }
+            let calls: Vec<_> = with_eh
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == call_kind)
+                .collect();
+            assert!(!calls.is_empty(), "{format:?}: the call row");
+            assert!(
+                calls.iter().all(|entry| entry.status.is_promotable()),
+                "{format:?}: {calls:?}"
+            );
+            assert!(!with_eh.is_promotable());
+
+            let without_eh = pipeline
+                .module_relocation_inventory_report_after_x86_passes(
+                    &[caller(), callee()],
+                    &[],
+                    "plain.o",
+                    false,
+                )
+                .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+            assert!(without_eh.is_promotable(), "{format:?}: {without_eh:?}");
+        }
+    }
+
+    #[cfg(feature = "verify")]
+    #[test]
+    fn test_x86_64_macho_eh_module_inventory_enumerates_rows_and_marks_them_unverified() {
         // EH Lane 5 un-darkening: a `panic=unwind` (EH-carrying) Mach-O module
         // must produce a COMPLETE relocation inventory instead of failing
         // closed, and the predicted multiset must equal what `emit_module_macho`
         // emits: one SECTION-BASED compact-unwind UNSIGNED per frame-covered
         // function + exactly ONE zPLR personality GOT. Both kinds carry
-        // solver value proofs; under the Enforce reparse binding the report
-        // promotes.
+        // solver value proofs, but the rows belong to exception tables, so
+        // the report marks them Unverified and never promotes.
         let pipeline = X86Pipeline::new(X86PipelineConfig {
             emit_frame: true,
             output_format: X86OutputFormat::MachO,
@@ -26558,9 +36436,10 @@ mod tests {
             "exactly one zPLR personality GOT per EH module: {report:?}"
         );
         assert_eq!(report.entries.len(), 3, "{report:?}");
-        // UNSIGNED/GOT are covered lanes under the Enforce reparse binding.
-        assert!(report.is_promotable(), "{report:?}");
-        assert_eq!(report.uncovered_relocations().len(), 0);
+        // UNSIGNED/GOT are covered lanes under the Enforce reparse binding,
+        // but every row here belongs to the exception tables, which carry no
+        // proof obligation: all Unverified, the report never promotable.
+        assert_all_exception_table_rows_unverified(&report);
 
         // PREDICTED == EMITTED: the actual object's relocation counts must
         // match the inventory rows (the multiset-predictor soundness contract).
@@ -26621,8 +36500,7 @@ mod tests {
         );
         // Still exactly the EH surface: 2 compact-unwind UNSIGNED + 1 GOT.
         assert_eq!(report.entries.len(), 3, "{report:?}");
-        assert!(report.is_promotable(), "{report:?}");
-        assert_eq!(report.uncovered_relocations().len(), 0);
+        assert_all_exception_table_rows_unverified(&report);
 
         // Differential: the emitted object agrees.
         let obj = pipeline
@@ -26686,8 +36564,8 @@ mod tests {
         );
         assert_eq!(got_rows, 1, "exactly one personality GOT: {report:?}");
         assert_eq!(report.entries.len(), 3, "{report:?}");
-        assert!(report.is_promotable(), "{report:?}");
-        assert_eq!(report.uncovered_relocations().len(), 0);
+        // The walk-through filler tables are exception tables too.
+        assert_all_exception_table_rows_unverified(&report);
 
         // PREDICTED == EMITTED for the pass-through-only object.
         let obj = unwind_pipeline
@@ -26741,6 +36619,265 @@ mod tests {
         assert!(
             find_macho_section(&abort_obj, b"__compact_unwind").is_none(),
             "abort mode must emit no __compact_unwind"
+        );
+    }
+
+    /// FUZZ-7 task #16 on ELF ([TCG-EH-WALK], cross-object): the ELF twin of
+    /// `test_x86_64_macho_panic_unwind_covers_pass_through_only_object`.
+    ///
+    /// A `panic=unwind` object holding ONLY pass-through frames — NO local
+    /// exception-handling function, the real bridge shape for `lang_start`'s
+    /// closure and `rust_begin_short_backtrace` — must still get full
+    /// per-function walkable FDE coverage, or a panic unwinding from another
+    /// object stops dead at its frames.
+    ///
+    /// It also re-establishes the "unwind opt-in never miscompiles" contract on
+    /// ELF from the other side: with the flag OFF the SAME module emits no
+    /// `.eh_frame`, no `.gcc_except_table`, no `DW.ref` slot and no COMDAT group,
+    /// so nothing this lane adds can reach an object that did not ask for it.
+    #[cfg(feature = "verify")]
+    #[test]
+    fn x86_64_elf_panic_unwind_covers_pass_through_only_object_and_stays_inert_when_off() {
+        use trust_cg_verify::ObjectRelocationKind;
+
+        let mut plain_a = minimal_func("pass_through_a");
+        plain_a.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let mut plain_b = minimal_func("pass_through_b");
+        plain_b.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let funcs = vec![plain_a, plain_b];
+
+        let unwind_pipeline = X86Pipeline::new(X86PipelineConfig {
+            emit_frame: true,
+            output_format: X86OutputFormat::Elf,
+            panic_unwind: true,
+            ..X86PipelineConfig::default()
+        });
+        let report = unwind_pipeline
+            .module_relocation_inventory_report_after_x86_passes(
+                &funcs,
+                &[],
+                "x86-elf-passthrough-unwind.o",
+                false,
+            )
+            .expect("panic=unwind pass-through ELF module inventory must enumerate");
+        let count =
+            |kind: ObjectRelocationKind| report.entries.iter().filter(|e| e.kind == kind).count();
+        assert_eq!(
+            count(ObjectRelocationKind::X86_64ElfPc32),
+            5,
+            "one personality field plus pc-begin and LSDA per FDE: {report:?}"
+        );
+        assert_eq!(
+            count(ObjectRelocationKind::X86_64ElfAbs64),
+            1,
+            "the DW.ref slot's own absolute personality pointer: {report:?}"
+        );
+        assert_eq!(report.entries.len(), 6, "{report:?}");
+        // The walk-through filler tables are exception tables too.
+        assert_all_exception_table_rows_unverified(&report);
+
+        // PREDICTED == EMITTED for the pass-through-only object.
+        let object = unwind_pipeline
+            .compile_module(&funcs)
+            .expect("panic=unwind pass-through ELF module must emit");
+        let records =
+            crate::elf::reparse::read_object_records(&object).expect("independent ELF readback");
+        let shndx = |name: &str| {
+            records
+                .sections
+                .iter()
+                .position(|section| section.name == name)
+                .unwrap_or_else(|| panic!("missing section {name}"))
+        };
+        let relocs_in = |index: usize| {
+            records
+                .relocations
+                .iter()
+                .filter(|reloc| reloc.target_section == index)
+                .count()
+        };
+        assert_eq!(
+            relocs_in(shndx(".eh_frame")),
+            5,
+            "the personality field plus pc-begin and LSDA per FDE"
+        );
+        assert_eq!(
+            relocs_in(shndx(".gcc_except_table")),
+            0,
+            "an all-filler LSDA references no symbol"
+        );
+        assert_eq!(relocs_in(shndx(".data.DW.ref.rust_eh_personality")), 1);
+        // Both pass-through frames are walkable: one CIE + one FDE each.
+        let eh_frame = shndx(".eh_frame");
+        let eh = {
+            let shoff = read_u64(&object, 40) as usize;
+            let shentsize = read_u16(&object, 58) as usize;
+            let shdr = shoff + eh_frame * shentsize;
+            let offset = read_u64(&object, shdr + 24) as usize;
+            let size = read_u64(&object, shdr + 32) as usize;
+            &object[offset..offset + size]
+        };
+        let mut cursor = 0usize;
+        let mut entries = 0usize;
+        while cursor + 4 <= eh.len() {
+            let length = read_u32(eh, cursor) as usize;
+            assert_ne!(length, 0, "no mid-object terminator");
+            cursor += 4 + length;
+            entries += 1;
+        }
+        assert_eq!(cursor, eh.len());
+        assert_eq!(entries, 1 + funcs.len(), "one CIE + one FDE per frame");
+
+        // ABORT MODE (flag off): the SAME module carries no EH sidecar at all.
+        let abort_pipeline = X86Pipeline::new(X86PipelineConfig {
+            emit_frame: true,
+            output_format: X86OutputFormat::Elf,
+            panic_unwind: false,
+            ..X86PipelineConfig::default()
+        });
+        let abort_report = abort_pipeline
+            .module_relocation_inventory_report_after_x86_passes(
+                &funcs,
+                &[],
+                "x86-elf-passthrough-abort.o",
+                false,
+            )
+            .expect("abort-mode pass-through ELF module inventory must enumerate");
+        assert!(
+            abort_report.entries.is_empty(),
+            "abort mode predicts no relocation at all: {abort_report:?}"
+        );
+        let abort_object = abort_pipeline
+            .compile_module(&funcs)
+            .expect("abort-mode pass-through ELF module must emit");
+        for absent in [".eh_frame", ".gcc_except_table"] {
+            assert!(
+                find_elf_section(&abort_object, absent).is_none(),
+                "abort mode must emit no {absent}"
+            );
+        }
+        assert!(!obj_contains(&abort_object, b"DW.ref."));
+        let abort_records = crate::elf::reparse::read_object_records(&abort_object)
+            .expect("independent ELF readback");
+        assert!(
+            !abort_records
+                .sections
+                .iter()
+                .any(|section| section.sh_type == crate::elf::metadata::SHT_GROUP)
+        );
+        assert!(abort_records.relocations.is_empty());
+    }
+
+    /// The ELF over-prediction guard: `panic_unwind: true` with ZERO frame-covered
+    /// functions (`emit_frame: false`) emits no unwind surface, and the inventory
+    /// predicts none — a naive `|| panic_unwind` predicate would over-predict the
+    /// personality row.
+    #[cfg(feature = "verify")]
+    #[test]
+    fn x86_64_elf_panic_unwind_with_zero_frame_covered_functions_emits_nothing() {
+        let mut plain = minimal_func("frameless_leaf");
+        plain.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let funcs = vec![plain];
+
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            emit_frame: false,
+            output_format: X86OutputFormat::Elf,
+            panic_unwind: true,
+            regalloc_mode: X86RegAllocMode::Simplified,
+            ..X86PipelineConfig::default()
+        });
+        let report = pipeline
+            .module_relocation_inventory_report_after_x86_passes(
+                &funcs,
+                &[],
+                "x86-elf-frameless-unwind.o",
+                false,
+            )
+            .expect("frameless panic=unwind ELF module inventory must enumerate");
+        assert!(report.entries.is_empty(), "{report:?}");
+        let object = pipeline
+            .compile_module(&funcs)
+            .expect("frameless panic=unwind ELF module must emit");
+        assert!(find_elf_section(&object, ".eh_frame").is_none());
+        assert!(find_elf_section(&object, ".gcc_except_table").is_none());
+    }
+
+    /// An EH function whose module was compiled WITHOUT frame lowering has no
+    /// prologue for the FDE generator to describe, so ELF emission REFUSES it by
+    /// name rather than emitting a body whose frame the unwinder cannot walk.
+    #[test]
+    fn x86_64_elf_eh_without_frame_lowering_is_refused_by_name() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            emit_frame: false,
+            output_format: X86OutputFormat::Elf,
+            regalloc_mode: X86RegAllocMode::Simplified,
+            ..X86PipelineConfig::default()
+        });
+        let error = pipeline
+            .compile_module(&[build_x86_eh_test_function("eh_frameless")])
+            .expect_err("an undescribable EH frame must not be emitted");
+        // AD-8 / E0.3: the unwind layer refuses, so the bridge files it TCG-EH-UNWIND.
+        assert!(
+            matches!(error, X86PipelineError::Unwind(_)),
+            "expected X86PipelineError::Unwind, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("EVERY function needs an .eh_frame FDE")
+                && message.contains("emit_frame=false"),
+            "the diagnostic must name the missing frame lowering: {message}"
+        );
+    }
+
+    /// The zero-length arm of the ELF unwind planner is DEFENCE IN DEPTH, not a
+    /// reachable path: an EH function with no blocks is refused earlier, by the
+    /// machine-function layout validation, before any unwind planning runs. This
+    /// pins that ordering, so if the earlier validation is ever relaxed the
+    /// planner's own arm is what stops a zero-length FDE — and this test starts
+    /// failing, which is the signal to test the planner arm directly.
+    #[test]
+    fn x86_64_elf_eh_blockless_function_is_refused_before_unwind_planning() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            regalloc_mode: X86RegAllocMode::Simplified,
+            ..X86PipelineConfig::default()
+        });
+        let mut empty = build_x86_eh_test_function("eh_zero_len");
+        empty.blocks.clear();
+        let error = pipeline
+            .compile_module(&[empty])
+            .expect_err("a zero-length EH function must not be emitted");
+        let message = error.to_string();
+        assert!(
+            message.contains("entry block") && message.contains("absent from the block map"),
+            "the earlier layout validation must own this refusal: {message}"
+        );
+    }
+
+    #[test]
+    fn x86_64_elf_eh_distinct_personalities_are_refused_by_name() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            regalloc_mode: X86RegAllocMode::Simplified,
+            ..X86PipelineConfig::default()
+        });
+        let mut first = build_x86_eh_test_function("eh_personality_a");
+        let mut second = build_x86_eh_test_function("eh_personality_b");
+        first.eh_info.personality = Some("__gxx_personality_v0".to_string());
+        second.eh_info.personality = Some("rust_eh_personality".to_string());
+        let error = pipeline
+            .compile_module(&[first, second])
+            .expect_err("two personalities in one object must not be emitted");
+        // AD-8 / E0.3: the unwind layer refuses, so the bridge files it TCG-EH-UNWIND.
+        assert!(
+            matches!(error, X86PipelineError::Unwind(_)),
+            "expected X86PipelineError::Unwind, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("distinct personalities in one object")
+                && message.contains("require multiple CIEs"),
+            "the diagnostic must name the personality conflict: {message}"
         );
     }
 
@@ -27684,6 +37821,61 @@ mod tests {
                 "{regalloc_mode:?} must retain RET"
             );
         }
+    }
+
+    /// TV-3 requires a stamped instruction for every volatile load, used or
+    /// not. Unused volatile loads of every x86-64 register file compile from
+    /// LIR through `compile_trust_ir_function`, which enforces TV-3 on the
+    /// exact pre-pass ISel/LIR pair.
+    #[test]
+    fn unused_volatile_loads_pass_the_x86_dataflow_integrity_gate() {
+        let entry = Block(0);
+        let mut func = LirFunction::new(
+            "unused_volatile_loads",
+            Signature {
+                params: vec![Type::I64],
+                returns: vec![],
+            },
+        );
+        func.entry_block = entry;
+        func.block_order = vec![entry];
+        let mut instructions: Vec<Instruction> = [
+            (Type::I8, 1),
+            (Type::I16, 2),
+            (Type::I32, 4),
+            (Type::I64, 8),
+            (Type::F32, 4),
+            (Type::F64, 8),
+            (Type::V128, 16),
+        ]
+        .into_iter()
+        .zip(1u32..)
+        .map(|((ty, align), result)| Instruction {
+            opcode: Opcode::VolatileLoad {
+                ty,
+                align: Some(align),
+            },
+            args: vec![Value(0)],
+            results: vec![Value(result)],
+        })
+        .collect();
+        instructions.push(Instruction {
+            opcode: Opcode::Return,
+            args: vec![],
+            results: vec![],
+        });
+        func.blocks.insert(
+            entry,
+            BasicBlock {
+                params: vec![],
+                instructions,
+                source_locs: vec![],
+            },
+        );
+        let code = raw_no_frame_x86_pipeline()
+            .compile_trust_ir_function(&func)
+            .unwrap_or_else(|error| panic!("unused volatile loads must compile: {error}"));
+        assert_eq!(code.last(), Some(&0xc3), "{code:02x?}");
     }
 
     #[test]
@@ -29125,6 +39317,387 @@ mod tests {
         );
     }
 
+    /// The first instruction of `block` that reads a VReg no earlier
+    /// instruction of the block defines, as `(index, vreg)`. Reads and defs are
+    /// the regalloc conversion's (`x86_isel_to_regalloc`) view of the stream,
+    /// so a memory-address base or index counts as a read.
+    fn first_vreg_read_without_earlier_def(
+        func: &X86ISelFunction,
+        block: Block,
+    ) -> Option<(usize, VReg)> {
+        let ra = x86_isel_to_regalloc(func).expect("the replayed x86 stream must convert");
+        let mut defined = HashSet::new();
+        for (idx, inst_id) in ra.blocks[block.0 as usize].insts.iter().enumerate() {
+            let inst = &ra.insts[inst_id.0 as usize];
+            if let Some(vreg) = inst.vreg_uses().find(|vreg| !defined.contains(vreg)) {
+                return Some((idx, vreg));
+            }
+            defined.extend(inst.vreg_defs());
+        }
+        None
+    }
+
+    /// `v0 = MovRI 7; v1 = MovRR v0; MovRR RAX, v1; Ret`, then the allocator's
+    /// split of `v0` at the original copy: an inserted `v10 = PSEUDO_COPY v0`
+    /// before it, and the original copy rewritten to read the child `v10`. The
+    /// child's only reader is that ORIGINAL copy, which the replay always emits.
+    fn split_child_read_by_original_copy_fixture()
+    -> (X86ISelFunction, RegAllocFunction, RegAllocFunction) {
+        let mut func = minimal_func("split_child_read_by_original_copy");
+        let entry = Block(0);
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        let v1 = VReg::new(1, RegClass::Gpr64);
+        let child = VReg::new(10, RegClass::Gpr64);
+        func.next_vreg = 2;
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRI,
+                vec![X86ISelOperand::VReg(v0), X86ISelOperand::Imm(7)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(v1), X86ISelOperand::VReg(v0)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![
+                    X86ISelOperand::PReg(x86_64_regs::RAX),
+                    X86ISelOperand::VReg(v1),
+                ],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+        let before = x86_isel_to_regalloc(&func).unwrap();
+        assert_eq!(
+            before.insts[1].opcode,
+            trust_cg_regalloc::phi_elim::PSEUDO_COPY,
+            "the original x86 copy reaches the allocator as a PSEUDO_COPY"
+        );
+        let mut after = before.clone();
+        after.next_vreg = 11;
+        let copy_id = InstId(after.insts.len() as u32);
+        after.insts.push(regalloc_pseudo_copy(child, v0));
+        after.blocks[0].insts.insert(1, copy_id);
+        after.insts[1].uses = vec![RegAllocOperand::VReg(child)];
+        (func, before, after)
+    }
+
+    #[test]
+    fn dead_fresh_copy_keeps_a_split_child_read_by_an_original_copy() {
+        let (_func, before, after) = split_child_read_by_original_copy_fixture();
+        let child = VReg::new(10, RegClass::Gpr64);
+
+        let dead = x86_regalloc_dead_fresh_copy_vregs(&before, &after);
+
+        assert!(
+            !dead.contains(&child),
+            "a split child read by a replayed original copy is live, not dead: {dead:?}"
+        );
+    }
+
+    #[test]
+    fn replay_keeps_the_split_copy_an_original_copy_reads() {
+        let (mut func, before, after) = split_child_read_by_original_copy_fixture();
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        let v1 = VReg::new(1, RegClass::Gpr64);
+        let child = VReg::new(10, RegClass::Gpr64);
+
+        replay_x86_regalloc_stream_mutations(&mut func, &before, &after, &HashSet::new())
+            .expect("a split copy read by an original copy should replay");
+
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::MovRI,
+                X86Opcode::MovRR,
+                X86Opcode::MovRR,
+                X86Opcode::MovRR,
+                X86Opcode::Ret,
+            ],
+            "the split copy must be in the replayed stream"
+        );
+        let insts = entry_insts(&func);
+        assert_eq!(
+            insts[1].operands,
+            vec![X86ISelOperand::VReg(child), X86ISelOperand::VReg(v0)]
+        );
+        assert_eq!(
+            insts[2].operands,
+            vec![X86ISelOperand::VReg(v1), X86ISelOperand::VReg(child)]
+        );
+        assert_eq!(
+            first_vreg_read_without_earlier_def(&func, Block(0)),
+            None,
+            "every read in the replayed stream must have an earlier definition"
+        );
+    }
+
+    #[test]
+    fn dead_fresh_copy_liveness_reads_only_block_resident_instructions() {
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        let v1 = VReg::new(1, RegClass::Gpr64);
+        let child = VReg::new(10, RegClass::Gpr64);
+        // Both legs are judged before the test fails, so a mutation that breaks
+        // either leg shows on its own.
+        let mut failures = Vec::new();
+
+        // Leg (a): an arena-only NON-copy instruction reads the child. No block
+        // holds it, so the replay never emits it and it keeps nothing alive.
+        {
+            let mut func = minimal_func("arena_only_non_copy_reader");
+            let entry = Block(0);
+            func.next_vreg = 2;
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRI,
+                    vec![X86ISelOperand::VReg(v0), X86ISelOperand::Imm(7)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::VReg(v0),
+                    ],
+                ),
+            );
+            func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+            let before = x86_isel_to_regalloc(&func).unwrap();
+            let mut after = before.clone();
+            after.next_vreg = 11;
+            let copy_id = InstId(after.insts.len() as u32);
+            after.insts.push(regalloc_pseudo_copy(child, v0));
+            after.blocks[0].insts.insert(1, copy_id);
+            after.insts.push(RegAllocInst {
+                opcode: X86Opcode::AddRR as u16,
+                defs: vec![RegAllocOperand::VReg(v1)],
+                uses: vec![RegAllocOperand::VReg(v1), RegAllocOperand::VReg(child)],
+                implicit_defs: Vec::new(),
+                implicit_uses: Vec::new(),
+                tied_operands: Vec::new(),
+                flags: trust_cg_ir::inst::InstFlags::default(),
+            });
+
+            let dead = x86_regalloc_dead_fresh_copy_vregs(&before, &after);
+            if !dead.contains(&child) {
+                failures.push(format!(
+                    "leg (a): an arena-only non-copy read kept the child alive: {dead:?}"
+                ));
+            }
+            match replay_x86_regalloc_stream_mutations(&mut func, &before, &after, &HashSet::new())
+            {
+                Err(err) => failures.push(format!("leg (a): the replay failed: {err}")),
+                Ok(())
+                    if entry_opcodes(&func)
+                        != vec![X86Opcode::MovRI, X86Opcode::MovRR, X86Opcode::Ret] =>
+                {
+                    failures.push(format!(
+                        "leg (a): the dead split copy materialized: {:?}",
+                        entry_opcodes(&func)
+                    ));
+                }
+                Ok(()) => {}
+            }
+        }
+
+        // Leg (b): an arena-only ORIGINAL copy reads the child: the coalescer
+        // removed it from its block and left it in the arena. It is not
+        // replayed either, so it keeps nothing alive.
+        {
+            let mut func = minimal_func("arena_only_original_copy_reader");
+            let entry = Block(0);
+            func.next_vreg = 2;
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRI,
+                    vec![X86ISelOperand::VReg(v0), X86ISelOperand::Imm(7)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![X86ISelOperand::VReg(v1), X86ISelOperand::VReg(v0)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![
+                        X86ISelOperand::PReg(x86_64_regs::RAX),
+                        X86ISelOperand::VReg(v0),
+                    ],
+                ),
+            );
+            func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+            let before = x86_isel_to_regalloc(&func).unwrap();
+            let mut after = before.clone();
+            after.next_vreg = 11;
+            after.blocks[0].insts.remove(1);
+            after.insts[1].uses = vec![RegAllocOperand::VReg(child)];
+            let copy_id = InstId(after.insts.len() as u32);
+            after.insts.push(regalloc_pseudo_copy(child, v0));
+            after.blocks[0].insts.insert(1, copy_id);
+
+            let dead = x86_regalloc_dead_fresh_copy_vregs(&before, &after);
+            if !dead.contains(&child) {
+                failures.push(format!(
+                    "leg (b): a removed original copy left in the arena kept the child \
+                     alive: {dead:?}"
+                ));
+            }
+            match replay_x86_regalloc_stream_mutations(&mut func, &before, &after, &HashSet::new())
+            {
+                Err(err) => failures.push(format!("leg (b): the replay failed: {err}")),
+                Ok(())
+                    if entry_opcodes(&func)
+                        != vec![X86Opcode::MovRI, X86Opcode::MovRR, X86Opcode::Ret] =>
+                {
+                    failures.push(format!(
+                        "leg (b): the removed copy or the dead split copy materialized: {:?}",
+                        entry_opcodes(&func)
+                    ));
+                }
+                Ok(()) => {}
+            }
+        }
+
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn dead_fresh_copy_candidates_are_the_copies_the_replay_inserted() {
+        // The greedy splitter renames the definitions of ORIGINAL instructions
+        // at and after a split point to the fresh child (`split.rs`,
+        // `rewrite_split_operands_uncounted`), so an original x86 copy can carry
+        // a fresh destination. It is still an original instruction: the replay
+        // matches it by `InstId` and always emits it, so its read keeps the
+        // inserted copy that defines its source alive.
+        let mut func = minimal_func("original_copy_with_fresh_destination");
+        let entry = Block(0);
+        let v0 = VReg::new(0, RegClass::Gpr64);
+        let v1 = VReg::new(1, RegClass::Gpr64);
+        let child = VReg::new(10, RegClass::Gpr64);
+        let renamed = VReg::new(11, RegClass::Gpr64);
+        func.next_vreg = 2;
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRI,
+                vec![X86ISelOperand::VReg(v0), X86ISelOperand::Imm(7)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(v1), X86ISelOperand::VReg(v0)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![
+                    X86ISelOperand::PReg(x86_64_regs::RAX),
+                    X86ISelOperand::VReg(v0),
+                ],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+        let before = x86_isel_to_regalloc(&func).unwrap();
+        let mut after = before.clone();
+        after.next_vreg = 12;
+        let copy_id = InstId(after.insts.len() as u32);
+        after.insts.push(regalloc_pseudo_copy(child, v0));
+        after.blocks[0].insts.insert(1, copy_id);
+        after.insts[1].defs = vec![RegAllocOperand::VReg(renamed)];
+        after.insts[1].uses = vec![RegAllocOperand::VReg(child)];
+
+        replay_x86_regalloc_stream_mutations(&mut func, &before, &after, &HashSet::new())
+            .expect("an original copy with a fresh destination should replay");
+
+        assert!(
+            entry_insts(&func).iter().any(|inst| {
+                inst.opcode == X86Opcode::MovRR
+                    && inst.operands == vec![X86ISelOperand::VReg(child), X86ISelOperand::VReg(v0)]
+            }),
+            "the inserted copy defining the original copy's source must be emitted: {:?}",
+            entry_insts(&func)
+        );
+        assert_eq!(
+            first_vreg_read_without_earlier_def(&func, Block(0)),
+            None,
+            "every read in the replayed stream must have an earlier definition"
+        );
+    }
+
+    #[test]
+    fn replay_refuses_an_omitted_copy_whose_destination_is_read() {
+        let (mut func, before, after) = split_child_read_by_original_copy_fixture();
+        let child = VReg::new(10, RegClass::Gpr64);
+        replay_x86_regalloc_stream_mutations(&mut func, &before, &after, &HashSet::new())
+            .expect("the fixture replays with its split copy");
+        let omitted = HashSet::from([child]);
+
+        // Drop the split copy, as the classifier before this check did: the
+        // original copy, now instruction #1, still reads the child.
+        let mut dropped = func.clone();
+        dropped.blocks.get_mut(&Block(0)).unwrap().insts.remove(1);
+        let err = x86_check_replay_reads_no_omitted_copy(&dropped, &omitted)
+            .expect_err("a read of an omitted copy's destination must be refused");
+        let X86PipelineError::RegAlloc(msg) = err else {
+            panic!("expected a regalloc replay error, got {err:?}");
+        };
+        assert!(
+            msg.contains("omitted the copy defining v10")
+                && msg.contains("instruction #1 (MovRR) in block 0"),
+            "the refusal must name the VReg and the reading instruction: {msg}"
+        );
+
+        // A memory-address base read is a read too.
+        let mut through_memory = dropped.clone();
+        through_memory.blocks.get_mut(&Block(0)).unwrap().insts[1] = X86ISelInst::new(
+            X86Opcode::MovRM,
+            vec![
+                X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64)),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::VReg(child)),
+                    disp: 8,
+                },
+            ],
+        );
+        assert!(
+            x86_check_replay_reads_no_omitted_copy(&through_memory, &omitted).is_err(),
+            "a memory-address base naming an omitted destination must be refused"
+        );
+
+        // Nothing omitted, or an omitted VReg nothing reads: accepted.
+        x86_check_replay_reads_no_omitted_copy(&func, &HashSet::new())
+            .expect("a stream with nothing omitted is accepted");
+        x86_check_replay_reads_no_omitted_copy(
+            &func,
+            &HashSet::from([VReg::new(10, RegClass::Fpr64)]),
+        )
+        .expect("an omitted VReg of another class that nothing reads is accepted");
+    }
+
     #[test]
     fn test_replay_regalloc_stream_replays_split_use_rewrite_to_fresh_vreg() {
         let mut func = minimal_func("split_rewrites_use");
@@ -30088,6 +40661,105 @@ mod tests {
         }
     }
 
+    /// Recheck (5) [TCG-POST-RA-SPILL-INIT] end to end on a REAL spilling
+    /// function: the spill displacements come from the slots
+    /// `install_x86_spill_slots` created, so they are non-empty whenever the
+    /// allocator spilled (an always-zero spill count once made this set empty
+    /// and the check vacuous), the untouched stream passes, and the same
+    /// stream with one spill slot's stores dropped is refused.
+    #[test]
+    fn test_spill_init_recheck_runs_on_a_real_spilling_function() {
+        for strategy in [AllocStrategy::LinearScan, AllocStrategy::Greedy] {
+            let pipeline = X86Pipeline::new(X86PipelineConfig {
+                opt_level: trust_cg_opt::OptLevel::O0,
+                regalloc_mode: X86RegAllocMode::Full(strategy),
+                ..X86PipelineConfig::default()
+            });
+            let abi = pipeline.config.call_abi;
+            // The high-pressure fixture with every value redefined once
+            // (`v = v + v`): a multi-def value is never rematerialized, so its
+            // spill slot is really reloaded rather than replaced by a MovRI.
+            let mut func = build_x86_high_gpr_pressure_function(15);
+            let entry = Block(0);
+            let insts = &mut func.blocks.get_mut(&entry).expect("entry block").insts;
+            for id in (0..15u32).rev() {
+                let v = X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr64));
+                insts.insert(
+                    15,
+                    X86ISelInst::new(X86Opcode::AddRR, vec![v.clone(), v.clone(), v]),
+                );
+            }
+            prune_unused_x86_stack_slots(&mut func);
+            let assignment = pipeline
+                .run_full_regalloc(&mut func, strategy)
+                .unwrap_or_else(|err| panic!("{strategy:?} regalloc failed: {err}"));
+            let installed_spills = install_x86_spill_slots(&mut func, &assignment.spill_plan);
+            assert!(
+                !installed_spills.is_empty(),
+                "{strategy:?}: the high-pressure fixture must spill"
+            );
+            fixup_formal_arg_parallel_copy(
+                &mut func,
+                &assignment.allocation,
+                &installed_spills,
+                abi,
+            )
+            .expect("formal-arg fixup");
+            materialize_x86_spills(&mut func, &installed_spills, abi).expect("spill replay");
+            fixup_two_address(&mut func, &assignment.allocation, abi).expect("two-address fixup");
+            let layout = compute_x86_stack_frame_layout(
+                &func,
+                assignment.used_callee_saved.len(),
+                assignment.used_callee_saved_xmms.len(),
+            )
+            .expect("frame layout");
+            let spill_disps =
+                x86_spill_slot_disps(&layout, &installed_spills).expect("spill displacements");
+            assert_eq!(
+                spill_disps.len(),
+                installed_spills.len(),
+                "{strategy:?}: every installed spill slot must have its own displacement"
+            );
+            resolve_x86_stack_slots(&mut func, &layout).expect("stack slot resolution");
+            pipeline.insert_prologue_epilogue(&mut func, &assignment, &layout);
+            resolve_x86_branches(&mut func);
+            pipeline
+                .recheck_post_regalloc(&func, &assignment.allocation, &spill_disps)
+                .unwrap_or_else(|err| panic!("{strategy:?}: intact stream refused: {err}"));
+
+            // Drop every store to one spill slot that the stream also reads.
+            let is_spill_access = |inst: &X86ISelInst, disp: i32| {
+                inst.operands.iter().any(|op| {
+                    matches!(op, X86ISelOperand::MemAddr { base, disp: d }
+                        if *d == disp && matches!(base.as_ref(), X86ISelOperand::PReg(p) if *p == RBP))
+                })
+            };
+            let is_store = |op: X86Opcode| matches!(op, X86Opcode::MovMR | X86Opcode::MovMR32);
+            let target = spill_disps
+                .iter()
+                .copied()
+                .find(|&disp| {
+                    let insts = || func.blocks.values().flat_map(|b| b.insts.iter());
+                    insts().any(|i| is_store(i.opcode) && is_spill_access(i, disp))
+                        && insts().any(|i| !is_store(i.opcode) && is_spill_access(i, disp))
+                })
+                .unwrap_or_else(|| panic!("{strategy:?}: no spill slot is both stored and read"));
+            let mut broken = func.clone();
+            for block in broken.blocks.values_mut() {
+                block
+                    .insts
+                    .retain(|inst| !(is_store(inst.opcode) && is_spill_access(inst, target)));
+            }
+            let err = pipeline
+                .recheck_post_regalloc(&broken, &assignment.allocation, &spill_disps)
+                .expect_err("a spill slot read with its stores dropped must be refused");
+            assert!(
+                err.to_string().contains("[TCG-POST-RA-SPILL-INIT]"),
+                "{strategy:?}: expected the spill-init refusal, got: {err}"
+            );
+        }
+    }
+
     #[test]
     fn test_greedy_regalloc_high_pressure_uses_single_block_generic_splitting() {
         let mut func = build_x86_high_gpr_pressure_function(15);
@@ -30113,6 +40785,100 @@ mod tests {
             .expect("greedy high-pressure compile should succeed");
         assert!(!code.is_empty(), "greedy regalloc should produce code");
         assert_eq!(*code.last().unwrap(), 0xC3, "last byte should be RET");
+    }
+
+    /// `n` constants `v_i = MovRI i+1`, then for every `i` in `1..n` a copy
+    /// `t = MovRR v_i` and `v0 = AddRR v0, v0, t`, with ONE shared,
+    /// multiply-defined `t` so the coalescer cannot merge the copies, then
+    /// `MovRR RAX, v0; Ret`. Under greedy splitting (n >= 13 on the x86 pool)
+    /// a split child's only readers are those original copies.
+    fn build_x86_shared_copy_pressure_function(n: u32) -> X86ISelFunction {
+        let gpr = |id: u32| X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr64));
+        let mut func = minimal_func(&format!("shared_copy_pressure_{n}"));
+        let entry = Block(0);
+        func.next_vreg = 2 * n;
+        for id in 0..n {
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRI,
+                    vec![gpr(id), X86ISelOperand::Imm(i64::from(id) + 1)],
+                ),
+            );
+        }
+        for id in 1..n {
+            func.push_inst(
+                entry,
+                X86ISelInst::new(X86Opcode::MovRR, vec![gpr(n), gpr(id)]),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(X86Opcode::AddRR, vec![gpr(0), gpr(0), gpr(n)]),
+            );
+        }
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(x86_64_regs::RAX), gpr(0)],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func
+    }
+
+    #[test]
+    fn greedy_split_child_read_only_by_copies_is_defined_in_the_replay() {
+        let pipeline = X86Pipeline::new(X86PipelineConfig {
+            opt_level: trust_cg_opt::OptLevel::O0,
+            regalloc_mode: X86RegAllocMode::Full(AllocStrategy::Greedy),
+            ..X86PipelineConfig::default()
+        });
+        for n in [13, 16] {
+            let mut func = build_x86_shared_copy_pressure_function(n);
+            let fresh_start = func.next_vreg;
+            pipeline
+                .run_full_regalloc(&mut func, AllocStrategy::Greedy)
+                .unwrap_or_else(|err| panic!("n = {n}: greedy regalloc should replay: {err}"));
+
+            // Non-vacuity: the allocator split, and some split child is read
+            // only by copies, which is the shape under test.
+            assert!(
+                func.next_vreg > fresh_start,
+                "n = {n}: greedy must split this function"
+            );
+            let ra = x86_isel_to_regalloc(&func).expect("the replayed x86 stream must convert");
+            let mut readers: HashMap<VReg, Vec<bool>> = HashMap::new();
+            for inst_id in &ra.blocks[0].insts {
+                let inst = &ra.insts[inst_id.0 as usize];
+                let is_copy = inst.opcode == trust_cg_regalloc::phi_elim::PSEUDO_COPY;
+                for vreg in inst.vreg_uses() {
+                    if (fresh_start..func.next_vreg).contains(&vreg.id) {
+                        readers.entry(vreg).or_default().push(is_copy);
+                    }
+                }
+            }
+            assert!(
+                readers
+                    .values()
+                    .any(|is_copy| is_copy.iter().all(|&is_copy| is_copy)),
+                "n = {n}: no split child is read only by copies, so the test is vacuous"
+            );
+
+            assert_eq!(
+                first_vreg_read_without_earlier_def(&func, Block(0)),
+                None,
+                "n = {n}: every read in the replayed stream must have an earlier definition"
+            );
+            let code = pipeline
+                .compile_function(&build_x86_shared_copy_pressure_function(n))
+                .unwrap_or_else(|err| panic!("n = {n}: compile should succeed: {err}"));
+            assert_eq!(
+                *code.last().unwrap(),
+                0xC3,
+                "n = {n}: last byte should be RET"
+            );
+        }
     }
 
     #[test]
@@ -31358,6 +42124,509 @@ mod tests {
         );
     }
 
+    /// Build the canonical post-fixup GPR tied bridge:
+    ///
+    /// ```text
+    ///   movq  a, d              <- the two-address bridge (a = psrc, d = pdst)
+    ///   xorq  d, ghost a, b     <- tied xor
+    ///   addq  c, c, d           <- consumer: a renameable pure read of `d`
+    /// ```
+    ///
+    /// plus whatever the caller appends. The block has no successors, so its
+    /// GPR live-out is empty.
+    ///
+    /// ⚑ `XorRR`, not `AddRR`: an `AddRR` bridge with dead flags is claimed by
+    /// the earlier bridge-into-LEA arm, which would make this fixture test
+    /// that arm instead of this one.
+    fn tied_bridge_func(name: &str) -> (X86ISelFunction, Block) {
+        use trust_cg_ir::x86_64_regs::{RBX, RCX, RDI, RDX};
+        let entry = Block(0);
+        let mut func = minimal_func(name);
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RCX), X86ISelOperand::PReg(RBX)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::XorRR,
+                vec![
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::PReg(RBX),
+                    X86ISelOperand::PReg(RDX),
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![
+                    X86ISelOperand::PReg(RDI),
+                    X86ISelOperand::PReg(RDI),
+                    X86ISelOperand::PReg(RCX),
+                ],
+            ),
+        );
+        (func, entry)
+    }
+
+    /// The tied-RMW arm: `mov a,d ; add d,b` collapses to the self-tied
+    /// `add a,b` with later reads of `d` renamed to `a`, and TV-5 accepts it.
+    ///
+    /// This is the copy class `x86_try_rename_coalesce_copy` can NEVER remove:
+    /// its first guard rejects any copy whose destination is read-modified
+    /// later, and the instruction after a `fixup_two_address` bridge is BY
+    /// CONSTRUCTION exactly that. The cleanup pass and the pass that creates
+    /// the copies were structurally incompatible until this arm existed.
+    #[test]
+    fn x86_tied_copy_elide_collapses_bridge_and_passes_tv5() {
+        use trust_cg_ir::x86_64_regs::{RBX, RDI, RDX};
+        use trust_cg_verify::post_ra_dataflow;
+        use trust_cg_verify::post_regalloc_recheck::PostRegallocRecheckMode;
+
+        let (mut func, entry) = tied_bridge_func("tied_copy_elide");
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+        assert_eq!(removed, 1, "the tied bridge copy must be collapsed");
+
+        let insts = &func.blocks[&entry].insts;
+        assert_eq!(insts.len(), 2, "bridge deleted; tied xor + consumer remain");
+        assert_eq!(insts[0].opcode, X86Opcode::XorRR);
+        assert_eq!(
+            insts[0].operands,
+            vec![
+                X86ISelOperand::PReg(RBX),
+                X86ISelOperand::PReg(RBX),
+                X86ISelOperand::PReg(RDX),
+            ],
+            "the xor must be SELF-TIED on the bridge source"
+        );
+        assert_eq!(
+            insts[1].operands,
+            vec![
+                X86ISelOperand::PReg(RDI),
+                X86ISelOperand::PReg(RDI),
+                X86ISelOperand::PReg(RBX),
+            ],
+            "the downstream read of the old destination must be renamed"
+        );
+
+        assert!(
+            post_ra_dataflow::evaluate(&func, &alloc, "x86_64", PostRegallocRecheckMode::Enforce)
+                .is_none(),
+            "a self-tied op discharges TV-5's tied obligation"
+        );
+    }
+
+    /// THE soundness condition: the bridge SOURCE must be dead after the op,
+    /// because the collapsed op overwrites it with the result. A later read of
+    /// the source must decline.
+    #[test]
+    fn x86_tied_copy_elide_declines_when_bridge_source_is_still_read() {
+        use trust_cg_ir::x86_64_regs::{RBX, RSI};
+
+        let (mut func, entry) = tied_bridge_func("tied_copy_elide_src_live");
+        // `movq %rbx, %rsi` — a plain read of the bridge SOURCE after the op.
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RSI), X86ISelOperand::PReg(RBX)],
+            ),
+        );
+        let before: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+        assert_eq!(removed, 0, "a live bridge source must decline the collapse");
+        let after: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        assert_eq!(after, before, "declining must leave the stream untouched");
+    }
+
+    /// A downstream read of the bridge DESTINATION that cannot be rewritten to
+    /// the source — here a tied read-modify, the same shape that makes the
+    /// existing rename arm bail — must decline: renaming it would redirect a
+    /// definition, and NOT renaming it would read a register the collapse no
+    /// longer writes.
+    #[test]
+    fn x86_tied_copy_elide_declines_on_unrenameable_destination_read() {
+        use trust_cg_ir::x86_64_regs::{RCX, RSI};
+
+        let (mut func, entry) = tied_bridge_func("tied_copy_elide_rmw_read");
+        // `addq %rsi, %rcx` in tied form: operand 0 is a read-modify of RCX.
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::PReg(RSI),
+                ],
+            ),
+        );
+        let before: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
+        assert_eq!(
+            removed, 0,
+            "an unrenameable read of the bridge destination must decline"
+        );
+        let after: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        assert_eq!(after, before, "declining must leave the stream untouched");
+    }
+
+    /// Run `body` with the LEA self-writeback arm opted IN.
+    ///
+    /// ⚑ The arm is OFF by default (see `x86_lea_writeback_collapse_enabled`),
+    /// so every test below — including the DECLINE tests — must opt in. A
+    /// decline test that ran at the default would pass vacuously: it would be
+    /// asserting that a disabled arm does nothing, not that the guard holds.
+    fn with_lea_writeback_on<T>(body: impl FnOnce() -> T) -> T {
+        crate::env_lock::with_env_overrides(&[("TCG_X86_LEA_WRITEBACK", "1")], body)
+    }
+
+    /// `lea d,[a+1] ; mov a,d ; cmp d,N` — the unit-stride induction-variable
+    /// shape at the bottom of every counted loop.
+    fn lea_self_writeback_func(name: &str) -> (X86ISelFunction, Block) {
+        use trust_cg_ir::x86_64_regs::{RCX, RDI};
+        let entry = Block(0);
+        let mut func = minimal_func(name);
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::PReg(RDI)),
+                        disp: 1,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RDI), X86ISelOperand::PReg(RCX)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::CmpRI,
+                vec![X86ISelOperand::PReg(RCX), X86ISelOperand::Imm(64)],
+            ),
+        );
+        (func, entry)
+    }
+
+    /// The LEA self-writeback arm: `lea d,[a+1] ; mov a,d` collapses to the
+    /// in-place `lea a,[a+1]`, with the trip test's read of `d` renamed to `a`.
+    ///
+    /// This is the copy neither existing arm can remove. The producer-writeback
+    /// arm has no `Lea` in its allowlist AND requires `d` dead, which the trip
+    /// test refutes; the rename arm coalesces in the other direction and bails
+    /// because `a` — the induction variable — is loop-carried.
+    #[test]
+    fn x86_lea_self_writeback_collapses_and_passes_tv5() {
+        use trust_cg_ir::x86_64_regs::RDI;
+        use trust_cg_verify::post_ra_dataflow;
+        use trust_cg_verify::post_regalloc_recheck::PostRegallocRecheckMode;
+
+        let (mut func, entry) = lea_self_writeback_func("lea_self_writeback");
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let removed =
+            with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc));
+        assert_eq!(removed, 1, "the induction-variable writeback must collapse");
+
+        let insts = &func.blocks[&entry].insts;
+        assert_eq!(insts.len(), 2, "writeback deleted; lea + trip test remain");
+        assert_eq!(insts[0].opcode, X86Opcode::Lea);
+        assert_eq!(
+            insts[0].operands,
+            vec![
+                X86ISelOperand::PReg(RDI),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::PReg(RDI)),
+                    disp: 1,
+                },
+            ],
+            "the lea must increment the induction variable IN PLACE"
+        );
+        assert_eq!(
+            insts[1].operands,
+            vec![X86ISelOperand::PReg(RDI), X86ISelOperand::Imm(64)],
+            "the trip test's read of the dead temporary must be renamed"
+        );
+
+        assert!(
+            post_ra_dataflow::evaluate(&func, &alloc, "x86_64", PostRegallocRecheckMode::Enforce)
+                .is_none(),
+            "an in-place lea is ordinary value routing TV-5 accepts"
+        );
+    }
+
+    /// THE shape condition: the address must be BASED ON the writeback's
+    /// destination. Redirecting the destination of a lea that does not read `a`
+    /// would be a general destination redirect, which this arm's empty-interval
+    /// soundness argument does not cover — it must decline.
+    #[test]
+    fn x86_lea_self_writeback_declines_when_base_is_not_the_writeback_destination() {
+        use trust_cg_ir::x86_64_regs::{RCX, RDI, RDX};
+
+        let entry = Block(0);
+        let mut func = minimal_func("lea_self_writeback_foreign_base");
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::PReg(RDX)),
+                        disp: 1,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RDI), X86ISelOperand::PReg(RCX)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::CmpRI,
+                vec![X86ISelOperand::PReg(RCX), X86ISelOperand::Imm(64)],
+            ),
+        );
+        let before: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        assert_eq!(
+            with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc)),
+            0,
+            "a lea whose base is not the writeback destination must decline"
+        );
+        let after: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        assert_eq!(after, before, "declining must leave the stream untouched");
+    }
+
+    /// A downstream read of the LEA's temporary that cannot be rewritten — here
+    /// a tied read-modify — must decline: renaming it would redirect a
+    /// definition, and NOT renaming it would read a register the collapse no
+    /// longer writes.
+    #[test]
+    fn x86_lea_self_writeback_declines_on_unrenameable_temporary_read() {
+        use trust_cg_ir::x86_64_regs::{RCX, RSI};
+
+        let (mut func, entry) = lea_self_writeback_func("lea_self_writeback_rmw_read");
+        // `addq %rsi, %rcx` in tied form: operand 0 is a read-modify of RCX.
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::PReg(RSI),
+                ],
+            ),
+        );
+        let before: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        assert_eq!(
+            with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc)),
+            0,
+            "an unrenameable read of the lea temporary must decline"
+        );
+        let after: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        assert_eq!(after, before, "declining must leave the stream untouched");
+    }
+
+    /// The rename is only value-preserving while `a` still carries `d`'s value.
+    /// A write to `a` BEFORE a surviving read of `d` must decline.
+    #[test]
+    fn x86_lea_self_writeback_declines_when_a_is_overwritten_before_the_read() {
+        use trust_cg_ir::x86_64_regs::{RCX, RDI, RSI};
+
+        let entry = Block(0);
+        let mut func = minimal_func("lea_self_writeback_a_clobbered");
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::PReg(RCX),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::PReg(RDI)),
+                        disp: 1,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RDI), X86ISelOperand::PReg(RCX)],
+            ),
+        );
+        // `addq %rsi, %rdi` (tied) — `a` no longer carries the lea's result.
+        // ⚑ A tied read-modify rather than a plain `mov`: a full redefinition of
+        // `a` would make the writeback outright DEAD, and the pre-existing
+        // rename arm would remove it first, so the fixture would not exercise
+        // this guard at all.
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![
+                    X86ISelOperand::PReg(RDI),
+                    X86ISelOperand::PReg(RDI),
+                    X86ISelOperand::PReg(RSI),
+                ],
+            ),
+        );
+        // …so this read of `d` can no longer be renamed to it.
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::CmpRI,
+                vec![X86ISelOperand::PReg(RCX), X86ISelOperand::Imm(64)],
+            ),
+        );
+        let before: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        assert_eq!(
+            with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc)),
+            0,
+            "a clobbered `a` before a surviving read of `d` must decline"
+        );
+        let after: Vec<_> = func.blocks[&entry]
+            .insts
+            .iter()
+            .map(|i| (i.opcode, i.operands.clone()))
+            .collect();
+        assert_eq!(after, before, "declining must leave the stream untouched");
+    }
+
+    /// The arm is DEFAULT ON since 2026-09-30, and ONE flag must be the whole difference.
+    ///
+    /// ⚑ THE DEFAULT IS STILL THE LOAD-BEARING HALF of this test; only its polarity moved.
+    /// The previous version asserted "off unless asked" and said so in exactly these terms:
+    /// flipping the polarity by mistake must not pass the suite. That property is preserved
+    /// here in the new direction — the assertions below run on a stream the arm is KNOWN to
+    /// collapse, so a wiring slip in either direction fails.
+    ///
+    /// WHY THE POLARITY MOVED, since the old reason is recorded in the git history and looks
+    /// authoritative. The old posture rested on `p7_sieve`'s shipped binary regressing 1.44x
+    /// on placement with the arm on, and on `p1_xorshift` gaining 14.6%. Both figures were
+    /// re-measured on 2026-09-30, once a tracked option made the arm askable through the
+    /// bridge at all (its only channel had been a `TCG_*` variable `trustc` refuses), and
+    /// BOTH had expired: p1 0.9996 -> 0.9998 and p7 0.7118 -> 0.7142, each inside its own
+    /// noise floor. The flip stands on a different and smaller basis — `p2_collatz` 1.0231 ->
+    /// 1.0105, a parity violation halved, against `m2_call_heavy` and `p6_branch_match`
+    /// losing 0.7% and 0.3% while staying below parity. See
+    /// `set_x86_lea_writeback_collapse_enabled`.
+    #[test]
+    fn x86_lea_self_writeback_is_default_on_and_its_opt_out_restores_the_writeback() {
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_LEA_WRITEBACK_COLLAPSE"], || {
+            assert!(
+                x86_lea_writeback_collapse_enabled(),
+                "the arm is DEFAULT ON; absent the opt-out it must fire"
+            );
+            let (mut func, entry) = lea_self_writeback_func("lea_self_writeback_default");
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            assert_eq!(
+                coalesce_x86_redundant_movrr_copies(&mut func, &alloc),
+                1,
+                "by default the writeback must be collapsed"
+            );
+            assert_eq!(func.blocks[&entry].insts.len(), 2);
+        });
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_LEA_WRITEBACK_COLLAPSE", "1")], || {
+            assert!(
+                !x86_lea_writeback_collapse_enabled(),
+                "the opt-out must disable the arm"
+            );
+            let (mut func, entry) = lea_self_writeback_func("lea_self_writeback_optout");
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            assert_eq!(
+                coalesce_x86_redundant_movrr_copies(&mut func, &alloc),
+                0,
+                "with the opt-out the writeback must survive"
+            );
+            assert_eq!(func.blocks[&entry].insts.len(), 3);
+        });
+    }
+
+    /// The kill switch must be a real one-flag revert of the arm.
+    #[test]
+    fn x86_tied_copy_elide_kill_switch_reverts_the_arm() {
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_TIED_COPY_ELIDE"], || {
+            assert!(x86_tied_copy_elide_enabled());
+            let (mut func, entry) = tied_bridge_func("tied_copy_elide_on");
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            assert_eq!(coalesce_x86_redundant_movrr_copies(&mut func, &alloc), 1);
+            assert_eq!(func.blocks[&entry].insts.len(), 2);
+        });
+        crate::env_lock::with_env_overrides(&[("TCG_NO_X86_TIED_COPY_ELIDE", "1")], || {
+            assert!(!x86_tied_copy_elide_enabled());
+            let (mut func, entry) = tied_bridge_func("tied_copy_elide_off");
+            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            assert_eq!(
+                coalesce_x86_redundant_movrr_copies(&mut func, &alloc),
+                0,
+                "with the kill switch set the bridge must survive"
+            );
+            assert_eq!(func.blocks[&entry].insts.len(), 3);
+        });
+    }
+
     /// PINNED (bridge-into-LEA x TV-5): the collapse must REUSE the `AddRR`'s
     /// own operands, so the destination keeps its VREG identity.
     ///
@@ -32253,6 +43522,409 @@ mod tests {
         }
     }
 
+    /// The jump-table dispatch `emit_x86_jump_table` emits:
+    /// `LeaRip base; MovRMSib off, [base + norm*8]; AddRR [off, base];
+    /// JmpR [off]`. Returns `(func, base, off)`.
+    fn jump_table_dispatch_fixture() -> (X86ISelFunction, VReg, VReg) {
+        let mut func = minimal_func("jump_table_dispatch");
+        let entry = Block(0);
+        let norm = VReg::new(0, RegClass::Gpr64);
+        let base = VReg::new(1, RegClass::Gpr64);
+        let off = VReg::new(2, RegClass::Gpr64);
+        func.next_vreg = 3;
+        for inst in [
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(norm), X86ISelOperand::PReg(RDI)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::LeaRip,
+                vec![
+                    X86ISelOperand::VReg(base),
+                    X86ISelOperand::JumpTableIndex(0),
+                ],
+            ),
+            X86ISelInst::new(
+                X86Opcode::MovRMSib,
+                vec![
+                    X86ISelOperand::VReg(off),
+                    X86ISelOperand::SibMemAddr {
+                        base: Box::new(X86ISelOperand::VReg(base)),
+                        index: Box::new(X86ISelOperand::VReg(norm)),
+                        scale: 8,
+                        disp: 0,
+                    },
+                ],
+            ),
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![X86ISelOperand::VReg(off), X86ISelOperand::VReg(base)],
+            ),
+            X86ISelInst::new(X86Opcode::JmpR, vec![X86ISelOperand::VReg(off)]),
+        ] {
+            func.push_inst(entry, inst);
+        }
+        (func, base, off)
+    }
+
+    /// `JmpR [target]` READS its target. `opcode_has_def` used to end in
+    /// `_ => true` without naming `JmpR`, so the allocator saw the jump-table
+    /// target defined (dead) at the jump and read nowhere after the tied add.
+    #[test]
+    fn regalloc_reads_the_indirect_jump_target() {
+        let (func, base, off) = jump_table_dispatch_fixture();
+
+        let ra = x86_isel_to_regalloc(&func).unwrap();
+
+        let jump = &ra.insts[4];
+        assert_eq!(jump.opcode, X86Opcode::JmpR as u16);
+        assert_eq!(jump.uses, vec![RegAllocOperand::VReg(off)]);
+        assert!(jump.defs.is_empty(), "JmpR defines nothing: {jump:?}");
+        let add = &ra.insts[3];
+        assert_eq!(add.defs, vec![RegAllocOperand::VReg(off)]);
+        assert_eq!(
+            add.uses,
+            vec![RegAllocOperand::VReg(off), RegAllocOperand::VReg(base)],
+            "the tied AddRR [off, base] reads both registers"
+        );
+    }
+
+    /// A spilled jump target must be reloaded BEFORE the indirect jump. With
+    /// `JmpR` modelled as a def, spill materialization emitted no reload (the
+    /// jump read an unwritten scratch register) and appended a store AFTER the
+    /// terminator.
+    #[test]
+    fn spill_materialization_reloads_a_spilled_indirect_jump_target() {
+        let (mut func, _base, off) = jump_table_dispatch_fixture();
+        func.stack_slots.push(StackSlotInfo::new(8, 8));
+
+        let installed_spills = HashMap::from([(off, 0)]);
+        materialize_x86_spills(&mut func, &installed_spills, X86CallAbi::SystemV).unwrap();
+
+        let insts = entry_insts(&func);
+        let jump = insts.last().expect("block keeps its terminator");
+        assert_eq!(
+            jump.opcode,
+            X86Opcode::JmpR,
+            "nothing may follow the indirect jump: {insts:#?}"
+        );
+        let [X86ISelOperand::PReg(target)] = jump.operands.as_slice() else {
+            panic!("the spilled target is rewritten to a scratch register: {jump:?}");
+        };
+        let reload = &insts[insts.len() - 2];
+        assert_eq!(
+            reload.opcode,
+            X86Opcode::MovRM,
+            "the jump must be preceded by a reload of its target: {insts:#?}"
+        );
+        assert_eq!(
+            reload.operands,
+            vec![X86ISelOperand::PReg(*target), x86_spill_stack_mem(0)]
+        );
+    }
+
+    /// `opcode_has_def` agrees with the shared exhaustive classifier
+    /// `trust_cg_opt::effects::x86_produces_value`, including the control
+    /// transfers and trap carriers the old `_ => true` default answered
+    /// wrongly, and `StackAlloc`, which the two used to disagree on.
+    #[test]
+    fn opcode_has_def_matches_the_shared_classifier() {
+        for opcode in [
+            X86Opcode::JmpR,
+            X86Opcode::Jmp,
+            X86Opcode::CallR,
+            X86Opcode::TrapBoundsCheckExact,
+            X86Opcode::TrapNullIfZeroExact,
+            X86Opcode::TrapDivZeroExact,
+            X86Opcode::TrapShiftRangeExact,
+        ] {
+            assert!(!opcode_has_def(opcode), "{opcode:?} defines no register");
+        }
+        for opcode in [
+            X86Opcode::JmpR,
+            X86Opcode::StackAlloc,
+            X86Opcode::TrapDivZeroExact,
+            X86Opcode::AddRR,
+            X86Opcode::MovMR,
+        ] {
+            assert_eq!(
+                opcode_has_def(opcode),
+                trust_cg_opt::effects::x86_produces_value(opcode),
+                "{opcode:?}"
+            );
+        }
+        assert!(opcode_has_def(X86Opcode::StackAlloc));
+    }
+
+    /// The in-place immediate shifts and rotates `[d, imm]` read `d` (the
+    /// encoder emits `op d, imm`), exactly like `ShlRI [d, imm]`; the
+    /// three-address `[d, s, imm]` form only writes `d`.
+    #[test]
+    fn regalloc_ties_every_in_place_immediate_shift() {
+        for opcode in [
+            X86Opcode::ShlRI,
+            X86Opcode::ShrRI,
+            X86Opcode::SarRI,
+            X86Opcode::RolRI,
+            X86Opcode::Pslld,
+            X86Opcode::Psrld,
+            X86Opcode::Psrad,
+            X86Opcode::Psllq,
+            X86Opcode::Psrlq,
+        ] {
+            let d = X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr64));
+            let s = X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64));
+            let tied = X86ISelInst::new(opcode, vec![d.clone(), X86ISelOperand::Imm(3)]);
+            let access = x86_operand_access(&tied, 0);
+            assert!(access.is_def && access.is_use, "{opcode:?} [d, imm]");
+            let three = X86ISelInst::new(opcode, vec![d, s, X86ISelOperand::Imm(3)]);
+            let access = x86_operand_access(&three, 0);
+            assert!(access.is_def && !access.is_use, "{opcode:?} [d, s, imm]");
+        }
+    }
+
+    /// Every form the allocator ties is a may-read for the machine passes:
+    /// `trust_cg_opt::effects::x86_operand0_may_be_read` over-approximates
+    /// this tie, so no x86 pass treats as dead a value the allocator keeps
+    /// live through a tied operand 0. The list is every opcode with a
+    /// non-constant or `true` arm in `first_operand_is_def_and_use`.
+    #[test]
+    fn every_regalloc_tie_is_a_machine_pass_may_read() {
+        use X86Opcode::*;
+
+        let mut ties = 0;
+        for opcode in [
+            AddRR, SubRR, AdcRR, SbbRR, AndRR, OrRR, XorRR, ImulRR, Addsd, Subsd, Mulsd, Divsd,
+            Andpd, Addss, Subss, Mulss, Divss, Andps, Minsd, Maxsd, Minss, Maxss, Cmpsd, Cmpss,
+            Pand, Pandn, Por, Pxor, Pcmpeqb, Pcmpeqw, Pcmpgtb, Pcmpgtw, Pcmpeqd, Pcmpgtd, Paddb,
+            Paddw, Paddd, Psubb, Psubw, Psubd, Paddq, Psubq, Pmullw, Pmuludq, Punpcklbw, Punpckldq,
+            Packuswb, Punpckhbw, Punpcklqdq, Pmulld, Psadbw, Pcmpeqq, Pcmpgtq, Addps, Subps, Mulps,
+            Divps, Addpd, Subpd, Mulpd, Divpd, AddRI, SubRI, AndRI, OrRI, XorRI, ShlRI, ShrRI,
+            SarRI, RolRI, Pslld, Psrld, Psrad, Psllq, Psrlq, AddRM, SubRM, ImulRM, ImulRMSib,
+            Pinsrd, Pinsrq, Neg, Not, ShlRR, ShrRR, SarRR, RolRCl, Inc, Dec, Bswap, Cmovcc,
+            Cmovcc32, Pblendvb, Xchg, Cmpxchg, Cmpxchg8, Cmpxchg16,
+        ] {
+            for operand_count in 0..=4u32 {
+                let inst = X86ISelInst::new(
+                    opcode,
+                    (0..operand_count)
+                        .map(|id| X86ISelOperand::VReg(VReg::new(id, RegClass::Gpr64)))
+                        .collect(),
+                );
+                if opcode_has_def(opcode) && first_operand_is_def_and_use(&inst) {
+                    ties += 1;
+                    assert!(
+                        trust_cg_opt::effects::x86_operand0_may_be_read(&inst),
+                        "{opcode:?} with {operand_count} operands is tied for regalloc"
+                    );
+                }
+            }
+        }
+        assert!(ties > 90, "only {ties} tied forms checked");
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-RA redundant spill-reload elision
+    // -----------------------------------------------------------------------
+
+    /// Build the shape the spiller produces for two consecutive instructions
+    /// that each read ONE spilled vreg: `mov R10,[slot]` in front of each. The
+    /// function is run through the REAL `materialize_x86_spills`, so the test
+    /// pins what the spiller actually emits rather than a hand-written guess.
+    fn reload_elide_fixture(
+        extra: Vec<X86ISelInst>,
+    ) -> (X86ISelFunction, HashMap<VReg, u32>, HashMap<VReg, X86PReg>) {
+        use trust_cg_ir::x86_64_regs::{RAX, RCX, RDX};
+
+        let mut func = minimal_func("reload_elide");
+        let entry = Block(0);
+        let spilled = VReg::new(0, RegClass::Gpr64);
+        let a = VReg::new(1, RegClass::Gpr64);
+        let b = VReg::new(2, RegClass::Gpr64);
+        func.next_vreg = 3;
+        func.stack_slots.push(StackSlotInfo::new(8, 8));
+
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![X86ISelOperand::VReg(a), X86ISelOperand::VReg(spilled)],
+            ),
+        );
+        for inst in extra {
+            func.push_inst(entry, inst);
+        }
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![X86ISelOperand::VReg(b), X86ISelOperand::VReg(spilled)],
+            ),
+        );
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+        let installed = HashMap::from([(spilled, 0u32)]);
+        // A COMPLETE allocation: rule 1b clears the map on any def this pass
+        // cannot resolve, so an incomplete map would make every test vacuous.
+        let alloc = HashMap::from([(spilled, RAX), (a, RCX), (b, RDX)]);
+        materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
+        (func, installed, alloc)
+    }
+
+    /// The canonical win: the spiller emitted two reloads of one slot into the
+    /// SAME scratch with nothing between that touches either, and the second is
+    /// deleted.
+    #[test]
+    fn x86_reload_elide_deletes_a_second_reload_of_one_slot() {
+        let (mut func, installed, alloc) = reload_elide_fixture(vec![]);
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::MovRM,
+                X86Opcode::AddRR,
+                X86Opcode::MovRM,
+                X86Opcode::AddRR,
+                X86Opcode::Ret
+            ],
+            "the spiller must emit two reloads for this shape"
+        );
+
+        let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &alloc);
+        assert_eq!(evidence.deleted, 1);
+        assert_eq!(evidence.rewritten, 0);
+        assert_eq!(
+            entry_opcodes(&func),
+            vec![
+                X86Opcode::MovRM,
+                X86Opcode::AddRR,
+                X86Opcode::AddRR,
+                X86Opcode::Ret
+            ]
+        );
+    }
+
+    /// Rule 1: an instruction that CLOBBERS the holder between the two reloads
+    /// keeps the second. Without this the pass would read a stale scratch.
+    #[test]
+    fn x86_reload_elide_refuses_across_a_clobber_of_the_holder() {
+        use trust_cg_ir::x86_64_regs::R10;
+        let clobber = X86ISelInst::new(
+            X86Opcode::MovRI,
+            vec![X86ISelOperand::PReg(R10), X86ISelOperand::Imm(7)],
+        );
+        let (mut func, installed, alloc) = reload_elide_fixture(vec![clobber]);
+        let before = entry_opcodes(&func);
+        let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &alloc);
+        assert_eq!(evidence.total(), 0, "a clobbered holder must not be reused");
+        assert_eq!(entry_opcodes(&func), before);
+    }
+
+    /// Rule 3: a CALL clears everything — it clobbers the scratch registers and
+    /// may write any slot whose address escaped.
+    #[test]
+    fn x86_reload_elide_refuses_across_a_call() {
+        let call = X86ISelInst::new(
+            X86Opcode::Call,
+            vec![X86ISelOperand::Symbol("callee".to_string())],
+        );
+        let (mut func, installed, alloc) = reload_elide_fixture(vec![call]);
+        let before = entry_opcodes(&func);
+        let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &alloc);
+        assert_eq!(evidence.total(), 0);
+        assert_eq!(entry_opcodes(&func), before);
+    }
+
+    /// Rule 4: a store this pass does not recognise could have written the slot,
+    /// so everything goes.
+    #[test]
+    fn x86_reload_elide_refuses_across_an_unrecognized_store() {
+        use trust_cg_ir::x86_64_regs::{RCX, RSI};
+        let store = X86ISelInst::new(
+            X86Opcode::MovMR,
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::PReg(RSI)),
+                    disp: 0,
+                },
+                X86ISelOperand::PReg(RCX),
+            ],
+        );
+        let (mut func, installed, alloc) = reload_elide_fixture(vec![store]);
+        let before = entry_opcodes(&func);
+        let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &alloc);
+        assert_eq!(evidence.total(), 0);
+        assert_eq!(entry_opcodes(&func), before);
+    }
+
+    /// Rule 1b: a def this pass cannot resolve to a physical register clears the
+    /// map. An incomplete allocation must not read as "clobbers nothing" —
+    /// that is the difference between fail-closed and a wrong-value reuse.
+    #[test]
+    fn x86_reload_elide_fails_closed_on_an_unresolvable_def() {
+        let (mut func, installed, alloc) = reload_elide_fixture(vec![]);
+        let mut partial = alloc.clone();
+        partial.remove(&VReg::new(1, RegClass::Gpr64));
+        let before = entry_opcodes(&func);
+        let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &partial);
+        assert_eq!(
+            evidence.total(),
+            0,
+            "an unmapped def must clear the map, not be treated as harmless"
+        );
+        assert_eq!(entry_opcodes(&func), before);
+
+        // The same function under the COMPLETE allocation DOES fire, so the
+        // refusal above is about the allocation and not about the shape.
+        let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &alloc);
+        assert_eq!(evidence.deleted, 1);
+    }
+
+    /// Nothing crosses a block boundary: physical-register liveness across edges
+    /// is exactly the reasoning this pass declines to do.
+    #[test]
+    fn x86_reload_elide_does_not_cross_a_block_boundary() {
+        use trust_cg_ir::x86_64_regs::{RAX, RCX};
+
+        let mut func = minimal_func("reload_elide_blocks");
+        let entry = Block(0);
+        let next = Block(1);
+        func.ensure_block(next);
+        let spilled = VReg::new(0, RegClass::Gpr64);
+        let a = VReg::new(1, RegClass::Gpr64);
+        func.next_vreg = 2;
+        func.stack_slots.push(StackSlotInfo::new(8, 8));
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![X86ISelOperand::VReg(a), X86ISelOperand::VReg(spilled)],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(X86Opcode::Jmp, vec![X86ISelOperand::Block(next)]),
+        );
+        func.push_inst(
+            next,
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![X86ISelOperand::VReg(a), X86ISelOperand::VReg(spilled)],
+            ),
+        );
+        func.push_inst(next, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+        let installed = HashMap::from([(spilled, 0u32)]);
+        let alloc = HashMap::from([(spilled, RAX), (a, RCX)]);
+        materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
+        let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &alloc);
+        assert_eq!(evidence.total(), 0);
+        assert_eq!(
+            func.blocks[&next].insts[0].opcode,
+            X86Opcode::MovRM,
+            "the second block's reload must survive"
+        );
+    }
+
     #[test]
     fn test_materialize_spills_reloads_two_operand_add_lhs() {
         use trust_cg_ir::x86_64_regs::R10;
@@ -32399,6 +44071,217 @@ mod tests {
             ),
             "add must read two distinct scratches with dst==rhs: {add:?}"
         );
+    }
+
+    /// Concrete x86-64 execution of the closed post-spill subset the
+    /// materialized `Icmp` bool sequence uses. Registers are keyed by hardware
+    /// encoding so `r10d`/`r10b`/`r10` alias exactly as on hardware; `setcc`
+    /// writes only bits 7:0 and a 32-bit write zero-extends. Anything outside
+    /// the subset panics (fail-closed: an unknown instruction cannot pass).
+    fn run_setcc_spill_subset(
+        insts: &[X86ISelInst],
+        vregs: &HashMap<VReg, u64>,
+        slots: &mut HashMap<u32, u64>,
+    ) {
+        use trust_cg_ir::x86_64_regs::{X86RegClass, x86_hw_encoding, x86_preg_class};
+        let mut gpr = [0xA5A5_A5A5_A5A5_A5A5u64; 16];
+        let mut vregs = vregs.clone();
+        let mut signed_less: Option<bool> = None;
+        let width = |op: &X86ISelOperand| match op {
+            X86ISelOperand::PReg(p) => match x86_preg_class(*p) {
+                X86RegClass::Gpr64 => 64,
+                X86RegClass::Gpr32 => 32,
+                other => panic!("register class {other:?} outside the subset"),
+            },
+            X86ISelOperand::VReg(v) => match v.class {
+                RegClass::Gpr64 => 64,
+                RegClass::Gpr32 => 32,
+                other => panic!("vreg class {other:?} outside the subset"),
+            },
+            other => panic!("operand {other:?} outside the subset"),
+        };
+        let slot_of = |op: &X86ISelOperand| match op {
+            X86ISelOperand::MemAddr { base, disp: 0 } => match base.as_ref() {
+                X86ISelOperand::StackSlot(s) => *s,
+                other => panic!("memory base {other:?} outside the subset"),
+            },
+            other => panic!("memory operand {other:?} outside the subset"),
+        };
+        let read = |gpr: &[u64; 16], vregs: &HashMap<VReg, u64>, op: &X86ISelOperand| {
+            let full = match op {
+                X86ISelOperand::PReg(p) => gpr[usize::from(x86_hw_encoding(*p))],
+                X86ISelOperand::VReg(v) => vregs[v],
+                other => panic!("operand {other:?} outside the subset"),
+            };
+            if width(op) == 32 {
+                full & 0xFFFF_FFFF
+            } else {
+                full
+            }
+        };
+        // A 32-bit or 64-bit register write: x86-64 zero-extends a 32-bit
+        // destination into the full register.
+        let write = |gpr: &mut [u64; 16],
+                     vregs: &mut HashMap<VReg, u64>,
+                     op: &X86ISelOperand,
+                     value: u64| {
+            let value = if width(op) == 32 {
+                value & 0xFFFF_FFFF
+            } else {
+                value
+            };
+            match op {
+                X86ISelOperand::PReg(p) => gpr[usize::from(x86_hw_encoding(*p))] = value,
+                X86ISelOperand::VReg(v) => {
+                    vregs.insert(*v, value);
+                }
+                other => panic!("operand {other:?} outside the subset"),
+            }
+        };
+        for inst in insts {
+            let ops = inst.operands.as_slice();
+            match (inst.opcode, ops) {
+                (X86Opcode::MovRM32 | X86Opcode::MovRM, [dst, mem]) => {
+                    let value = slots[&slot_of(mem)];
+                    write(&mut gpr, &mut vregs, dst, value);
+                }
+                (X86Opcode::MovMR32, [mem, src]) => {
+                    let slot = slot_of(mem);
+                    let old = slots[&slot];
+                    let low = read(&gpr, &vregs, src);
+                    slots.insert(slot, (old & !0xFFFF_FFFF) | low);
+                }
+                (X86Opcode::MovMR, [mem, src]) => {
+                    let value = read(&gpr, &vregs, src);
+                    slots.insert(slot_of(mem), value);
+                }
+                (X86Opcode::XorRR, [dst, src]) => {
+                    let value = read(&gpr, &vregs, dst) ^ read(&gpr, &vregs, src);
+                    write(&mut gpr, &mut vregs, dst, value);
+                    signed_less = None;
+                }
+                (X86Opcode::CmpRR, [lhs, rhs]) => {
+                    assert_eq!(width(lhs), 64, "the fixture compares 64-bit values");
+                    let (l, r) = (read(&gpr, &vregs, lhs), read(&gpr, &vregs, rhs));
+                    signed_less = Some((l as i64) < (r as i64));
+                }
+                (X86Opcode::Setcc, [dst, X86ISelOperand::CondCode(X86CondCode::L)]) => {
+                    let bit = u64::from(signed_less.expect("setcc reads live CMP flags"));
+                    // SETcc r8 writes bits 7:0 only; bits 63:8 keep their value.
+                    match dst {
+                        X86ISelOperand::PReg(p) => {
+                            let r = &mut gpr[usize::from(x86_hw_encoding(*p))];
+                            *r = (*r & !0xFF) | bit;
+                        }
+                        X86ISelOperand::VReg(v) => {
+                            let r = vregs.entry(*v).or_insert(0xA5A5_A5A5_A5A5_A5A5);
+                            *r = (*r & !0xFF) | bit;
+                        }
+                        other => panic!("setcc destination {other:?} outside the subset"),
+                    }
+                }
+                (X86Opcode::Movzx, [dst, src]) => {
+                    let byte = read(&gpr, &vregs, src) & 0xFF;
+                    write(&mut gpr, &mut vregs, dst, byte);
+                }
+                (X86Opcode::Ret, []) => return,
+                _ => panic!("instruction {inst:?} outside the subset"),
+            }
+        }
+        panic!("the fixture block must end in ret");
+    }
+
+    /// The default-on peephole followed by spill materialization must leave a
+    /// materialized `a < b` bool equal to 0 or 1 in its stack slot.
+    ///
+    /// The retired setcc-hoist rewrote `cmp a,b; setl d; movzx d,d` into
+    /// `xor d,d; cmp a,b; setl d`, relying on `setl` keeping the xor's zero in
+    /// bits 31:8. Every register model (`x86_operand_access`,
+    /// `effects::x86_operand0_may_be_read`, the post-RA dataflow check) treats
+    /// `Setcc` as a pure def of operand 0, so the xor's value was dead there:
+    /// with `d` and `a` spilled the `setl` got a fresh scratch (`r10d`, still
+    /// holding `a` from the compare's reload) and stored
+    /// `(a & !0xff) | cc` instead of `cc`.
+    #[test]
+    fn setcc_bool_survives_peephole_and_spill_materialization() {
+        const GARBAGE: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        for (a, b) in [
+            (0x1234_5678_i64, 0x7FFF_FFFF_i64),
+            (0x7FFF_FF00, -1),
+            (-0x100, 0x100),
+            (0x100, 0x100),
+        ] {
+            let mut func = minimal_func("setcc_bool_spilled");
+            let entry = Block(0);
+            let va = VReg::new(0, RegClass::Gpr64);
+            let vb = VReg::new(1, RegClass::Gpr64);
+            let vd = VReg::new(2, RegClass::Gpr32);
+            func.next_vreg = 3;
+            func.stack_slots.push(StackSlotInfo::new(4, 4));
+            func.stack_slots.push(StackSlotInfo::new(8, 8));
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::CmpRR,
+                    vec![X86ISelOperand::VReg(va), X86ISelOperand::VReg(vb)],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::Setcc,
+                    vec![
+                        X86ISelOperand::VReg(vd),
+                        X86ISelOperand::CondCode(X86CondCode::L),
+                    ],
+                ),
+            );
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::Movzx,
+                    vec![X86ISelOperand::VReg(vd), X86ISelOperand::VReg(vd)],
+                ),
+            );
+            func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+            trust_cg_opt::X86Peephole::default().run_on_function(&mut func);
+
+            let insts = func.blocks[&entry].insts.clone();
+
+            // Value check: spill `d` and `a`, materialize, and execute.
+            let installed = HashMap::from([(vd, 0u32), (va, 1u32)]);
+            materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
+            let mut slots = HashMap::from([(0u32, GARBAGE), (1u32, a as u64)]);
+            let vregs = HashMap::from([(vb, b as u64)]);
+            run_setcc_spill_subset(&func.blocks[&entry].insts, &vregs, &mut slots);
+            let expected = u64::from(a < b);
+            assert_eq!(
+                slots[&0] & 0xFFFF_FFFF,
+                expected,
+                "a={a:#x} b={b:#x}: the spilled bool must be exactly a<b; \
+                 materialized block: {:?}",
+                func.blocks[&entry].insts
+            );
+
+            // Model check: a `Setcc` whose destination is not immediately
+            // zero-extended exposes bits 31:8, so a register model that reads
+            // it as a pure def must never see one.
+            for (i, inst) in insts.iter().enumerate() {
+                if inst.opcode == X86Opcode::Setcc {
+                    let dst = inst.operands[0].clone();
+                    assert!(
+                        matches!(
+                            insts.get(i + 1),
+                            Some(next) if next.opcode == X86Opcode::Movzx
+                                && next.operands == vec![dst.clone(), dst.clone()]
+                        ),
+                        "Setcc at {i} is not zero-extended, but every register model \
+                         reads it as a pure def: {insts:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -32598,6 +44481,106 @@ mod tests {
             map.get(&copy),
             Some(X86SpillRemat::FrameAddr { slot: 5, disp: 16 })
         ));
+    }
+
+    /// `Lea root, [StackSlot(5)+8]` then `AddRI derived, <base>, <imm>` with
+    /// the given classes, base and immediate.
+    fn remat_add_imm_hop_func(
+        derived: VReg,
+        base_of: impl Fn(VReg) -> VReg,
+        imm: i64,
+        second_def: bool,
+    ) -> X86ISelFunction {
+        let mut func = minimal_func("remat_add_imm_hop");
+        let entry = Block(0);
+        let root = VReg::new(0, RegClass::Gpr64);
+        func.next_vreg = 3;
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::Lea,
+                vec![
+                    X86ISelOperand::VReg(root),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::StackSlot(5)),
+                        disp: 8,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::AddRI,
+                vec![
+                    X86ISelOperand::VReg(derived),
+                    X86ISelOperand::VReg(base_of(root)),
+                    X86ISelOperand::Imm(imm),
+                ],
+            ),
+        );
+        if second_def {
+            func.push_inst(
+                entry,
+                X86ISelInst::new(
+                    X86Opcode::MovRI,
+                    vec![X86ISelOperand::VReg(derived), X86ISelOperand::Imm(0)],
+                ),
+            );
+        }
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func
+    }
+
+    #[test]
+    fn test_spill_remat_map_chases_add_imm_hop_of_frame_addr() {
+        // The `&v.len` field address in the optimizer's `AddRI` spelling.
+        let derived = VReg::new(1, RegClass::Gpr64);
+        let func = remat_add_imm_hop_func(derived, |root| root, 16, false);
+        assert!(matches!(
+            build_x86_spill_remat_map(&func).get(&derived),
+            Some(X86SpillRemat::FrameAddr { slot: 5, disp: 24 })
+        ));
+    }
+
+    #[test]
+    fn test_spill_remat_map_add_imm_hop_declines_everything_else() {
+        let wide = VReg::new(1, RegClass::Gpr64);
+        // A 32-bit add truncates the address.
+        let narrow = VReg::new(1, RegClass::Gpr32);
+        let func = remat_add_imm_hop_func(narrow, |root| root, 16, false);
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&narrow));
+        // A narrow view of the base is not the frame address.
+        let func =
+            remat_add_imm_hop_func(wide, |root| VReg::new(root.id, RegClass::Gpr32), 16, false);
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&wide));
+        // A base that is not a frame address.
+        let func = remat_add_imm_hop_func(wide, |_| VReg::new(2, RegClass::Gpr64), 16, false);
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&wide));
+        // An in-place add has no single-def frame-address source.
+        let func = remat_add_imm_hop_func(wide, |_| wide, 16, false);
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&wide));
+        // A second def could change the value between def and use.
+        let func = remat_add_imm_hop_func(wide, |root| root, 16, true);
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&wide));
+        // So could a write through a 32-bit view of the same register.
+        let mut func = remat_add_imm_hop_func(wide, |root| root, 16, false);
+        func.blocks.get_mut(&Block(0)).unwrap().insts.insert(
+            2,
+            X86ISelInst::new(
+                X86Opcode::MovRI,
+                vec![
+                    X86ISelOperand::VReg(VReg::new(wide.id, RegClass::Gpr32)),
+                    X86ISelOperand::Imm(0),
+                ],
+            ),
+        );
+        assert!(!build_x86_spill_remat_map(&func).contains_key(&wide));
+        // The displacement must stay a 32-bit frame offset.
+        for imm in [i64::from(i32::MAX), i64::from(i32::MAX) + 1, i64::MIN] {
+            let func = remat_add_imm_hop_func(wide, |root| root, imm, false);
+            assert!(!build_x86_spill_remat_map(&func).contains_key(&wide));
+        }
     }
 
     #[test]
@@ -34456,6 +46439,88 @@ mod tests {
     }
 
     #[test]
+    fn test_fixup_formal_arg_spilled_connector_partial_write_is_refused() {
+        // `MovsdRR` merges into its destination's upper lanes and the spiller
+        // emits no reload of a def-only operand, so a spilled destination would
+        // read the scratch register's incoming contents. The replay-locality
+        // argument cannot supply that, so the shape stays refused by name.
+        use trust_cg_ir::x86_64_regs::{XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6};
+
+        let sig = Signature {
+            params: vec![Type::F64; 9],
+            returns: vec![],
+        };
+        let mut func = X86ISelFunction::new("fixup_formal_spilled_xmm_connector".to_string(), sig);
+        let entry = Block(0);
+        func.ensure_block(entry);
+
+        let spilled_formal = VReg::new(0, RegClass::Fpr64);
+        let v1 = VReg::new(1, RegClass::Fpr64);
+        let v_stack = VReg::new(2, RegClass::Fpr64);
+        let v2 = VReg::new(3, RegClass::Fpr64);
+        let connector_dst = VReg::new(4, RegClass::Fpr64);
+        let v3 = VReg::new(5, RegClass::Fpr64);
+        func.next_vreg = 6;
+
+        let mov = |dst: VReg, src: X86PReg| {
+            X86ISelInst::new(
+                X86Opcode::MovsdRR,
+                vec![X86ISelOperand::VReg(dst), X86ISelOperand::PReg(src)],
+            )
+        };
+        func.push_inst(entry, mov(spilled_formal, XMM0));
+        func.push_inst(entry, mov(v1, XMM1));
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovsdRM,
+                vec![
+                    X86ISelOperand::VReg(v_stack),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::PReg(RBP)),
+                        disp: 16,
+                    },
+                ],
+            ),
+        );
+        func.push_inst(entry, mov(v2, XMM3));
+        func.push_inst(
+            entry,
+            X86ISelInst::new(
+                X86Opcode::MovsdRR,
+                vec![
+                    X86ISelOperand::VReg(connector_dst),
+                    X86ISelOperand::VReg(v1),
+                ],
+            ),
+        );
+        func.push_inst(entry, mov(v3, XMM4));
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+
+        let mut alloc = HashMap::new();
+        alloc.insert(v1, XMM2);
+        alloc.insert(v_stack, XMM5);
+        alloc.insert(v2, XMM6);
+        alloc.insert(v3, XMM2); // overlaps the connector's source
+
+        let mut spills = HashMap::new();
+        spills.insert(spilled_formal, 0u32);
+        spills.insert(connector_dst, 1u32);
+
+        let err = fixup_formal_arg_parallel_copy(&mut func, &alloc, &spills, X86CallAbi::SystemV)
+            .expect_err("a partial-write connector into a spilled destination must be refused");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("writes only part of its destination"),
+            "refusal must name the partial write: {message}"
+        );
+        assert!(
+            message.contains("SPILLED to slot 1"),
+            "refusal must name the slot: {message}"
+        );
+    }
+
+    #[test]
     fn test_fixup_formal_arg_parallel_copy_shared_preg_keeps_connector_order() {
         // The seed-19149 miscompile shape: recursive splitting lets TWO
         // formals legally share one preg over disjoint ranges (v0 and v5
@@ -34559,6 +46624,801 @@ mod tests {
              (v0@{v0_intake} connector@{connector} v5@{v5_intake})"
         );
         assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
+    }
+
+    /// Build the entry block of a formal-argument prologue from a compact
+    /// description, for the load-placement tests below.
+    ///
+    /// Every instruction is exactly what ISel emits for the shape named:
+    /// `Intake` is `MOV vreg, PReg(arg)`, `Load` is `MOV vreg, [RBP+disp]` out
+    /// of the incoming argument area, and `Connector` is the `MOV vreg, vreg`
+    /// a recursive split replays. The order is the scan order.
+    enum FormalPrefixFixture {
+        Intake(u32, X86PReg),
+        Load(u32, i32, X86Opcode),
+        Connector(u32, u32),
+    }
+
+    fn build_formal_prefix_fixture(
+        name: &str,
+        params: usize,
+        items: &[FormalPrefixFixture],
+        assignment: &[(u32, X86PReg)],
+    ) -> (X86ISelFunction, Block, HashMap<VReg, X86PReg>) {
+        let sig = Signature {
+            params: vec![Type::I64; params],
+            returns: vec![],
+        };
+        let mut func = X86ISelFunction::new(name.to_string(), sig);
+        let entry = Block(0);
+        func.ensure_block(entry);
+        let mut highest = 0;
+        for item in items {
+            let inst = match item {
+                FormalPrefixFixture::Intake(dst, src) => {
+                    highest = highest.max(*dst);
+                    X86ISelInst::new(
+                        X86Opcode::MovRR,
+                        vec![
+                            X86ISelOperand::VReg(VReg::new(*dst, RegClass::Gpr64)),
+                            X86ISelOperand::PReg(*src),
+                        ],
+                    )
+                }
+                FormalPrefixFixture::Load(dst, disp, opcode) => {
+                    highest = highest.max(*dst);
+                    X86ISelInst::new(
+                        *opcode,
+                        vec![
+                            X86ISelOperand::VReg(VReg::new(*dst, RegClass::Gpr64)),
+                            X86ISelOperand::MemAddr {
+                                base: Box::new(X86ISelOperand::PReg(RBP)),
+                                disp: *disp,
+                            },
+                        ],
+                    )
+                }
+                FormalPrefixFixture::Connector(dst, src) => {
+                    highest = highest.max(*dst).max(*src);
+                    X86ISelInst::new(
+                        X86Opcode::MovRR,
+                        vec![
+                            X86ISelOperand::VReg(VReg::new(*dst, RegClass::Gpr64)),
+                            X86ISelOperand::VReg(VReg::new(*src, RegClass::Gpr64)),
+                        ],
+                    )
+                }
+            };
+            func.push_inst(entry, inst);
+        }
+        func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
+        func.next_vreg = highest + 1;
+        let alloc: HashMap<VReg, X86PReg> = assignment
+            .iter()
+            .map(|(id, preg)| (VReg::new(*id, RegClass::Gpr64), *preg))
+            .collect();
+        (func, entry, alloc)
+    }
+
+    fn formal_prefix_position(
+        insts: &[X86ISelInst],
+        opcode: X86Opcode,
+        operands: Vec<X86ISelOperand>,
+    ) -> usize {
+        insts
+            .iter()
+            .position(|inst| inst.opcode == opcode && inst.operands == operands)
+            .unwrap_or_else(|| panic!("emitted prologue has no {opcode:?} {operands:?}"))
+    }
+
+    /// The gap the segment-wise path used to refuse outright: a prefix whose
+    /// recursive-split connectors are interleaved INSIDE the intake group AND
+    /// which also loads a stack-passed formal — and where the load FEEDS the
+    /// connector that closes its segment (the `movw 16(%rbp),%dx` /
+    /// `movl %edx,%r8d` shape). The dependence analysis admits it because the
+    /// placement rule leaves the load exactly where ISel put it: after its own
+    /// segment's resolved copies, before that segment's connector.
+    ///
+    /// This is the assertion that a sunk load would violate: sinking it below
+    /// the connector makes the connector read the register's stale contents.
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_admits_stack_load_feeding_a_connector() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R12, R13, R14, R15, RBX, RDI, RDX, RSI};
+
+        // v0 and v2 legally share RBX over disjoint split ranges, with the
+        // connector between their intakes — the shape that forces the
+        // segment-wise, barrier-ordered path.
+        let (mut func, entry, alloc) = build_formal_prefix_fixture(
+            "formal_load_feeds_connector",
+            8,
+            &[
+                F::Intake(0, RDI),
+                F::Intake(1, RSI),
+                F::Connector(100, 0),
+                F::Intake(2, RDX),
+                F::Load(3, 16, X86Opcode::MovRM),
+                F::Connector(101, 3),
+            ],
+            &[
+                (0, RBX),
+                (1, R13),
+                (2, RBX),
+                (3, R14),
+                (100, R12),
+                (101, R15),
+            ],
+        );
+
+        fixup_formal_arg_parallel_copy(&mut func, &alloc, &HashMap::new(), X86CallAbi::SystemV)
+            .expect("the dependence analysis must admit a load that only feeds its connector");
+
+        let insts = &func.blocks[&entry].insts;
+        let first_rbx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDI)],
+        );
+        let split_connector = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::VReg(VReg::new(100, RegClass::Gpr64)),
+                X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr64)),
+            ],
+        );
+        let second_rbx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDX)],
+        );
+        let load = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::MovRM)
+            .expect("the stack-arg load must still be emitted");
+        let load_connector = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::VReg(VReg::new(101, RegClass::Gpr64)),
+                X86ISelOperand::VReg(VReg::new(3, RegClass::Gpr64)),
+            ],
+        );
+
+        assert!(
+            first_rbx < split_connector && split_connector < second_rbx,
+            "the split connector must stay between the two RBX intakes \
+             (first@{first_rbx} connector@{split_connector} second@{second_rbx})"
+        );
+        assert!(
+            second_rbx < load,
+            "the load's destination is preserved after its segment's copies \
+             (second RBX intake@{second_rbx} load@{load})"
+        );
+        assert!(
+            load < load_connector,
+            "the connector READS the load's destination, so the load must stay \
+             BEFORE it — sinking it below the group is the miscompile this \
+             analysis exists to rule out (load@{load} connector@{load_connector})"
+        );
+        assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
+    }
+
+    /// A load that genuinely cannot be separated from the intakes it would be
+    /// reordered against: a LATER intake in the same segment writes the same
+    /// register. Resolving the segment as a parallel copy puts that intake
+    /// before the load, which would make the load the surviving write instead
+    /// of the intake. Still refused — and the diagnostic names the pair.
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_refuses_stack_load_over_later_intake() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R12, R14, RBX, RDI, RDX, RSI};
+
+        let (mut func, _entry, alloc) = build_formal_prefix_fixture(
+            "formal_load_waw_refusal",
+            8,
+            &[
+                F::Intake(0, RDI),
+                F::Connector(100, 0),
+                F::Load(1, 16, X86Opcode::MovRM),
+                F::Intake(2, RSI),
+                F::Intake(3, RDX),
+            ],
+            &[(0, RBX), (1, R14), (2, R14), (3, RBX), (100, R12)],
+        );
+
+        let err =
+            fixup_formal_arg_parallel_copy(&mut func, &alloc, &HashMap::new(), X86CallAbi::SystemV)
+                .expect_err("a load sharing a destination with a LATER intake must stay refused");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("cannot separate the stack-arg load of r14 from [rbp+16]")
+                && message.contains("later formal intake r14 <- rsi")
+                && message.contains("fail-closed"),
+            "the refusal must name the pair it could not separate: {message}"
+        );
+    }
+
+    /// A load that cannot be separated from a LATER SEGMENT, which the pairwise
+    /// enumeration does not cover and the term-level proof does: the load
+    /// clobbers an incoming argument register that a later segment's intake
+    /// still has to read, so that intake would deliver the loaded value instead
+    /// of the argument. The pre-existing cross-segment hazard check does not see
+    /// this — it compares segment sources against segment DESTINATIONS, and a
+    /// load is neither.
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_refuses_stack_load_clobbering_a_later_arg() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R12, R13, RBX, RDI, RDX, RSI};
+
+        let (mut func, _entry, alloc) = build_formal_prefix_fixture(
+            "formal_load_clobbers_later_arg",
+            8,
+            &[
+                F::Intake(0, RDI),
+                F::Load(1, 16, X86Opcode::MovRM),
+                F::Connector(100, 0),
+                F::Intake(2, RSI),
+                F::Intake(3, RDX),
+            ],
+            &[(0, RBX), (1, RSI), (2, R13), (3, RBX), (100, R12)],
+        );
+
+        let err =
+            fixup_formal_arg_parallel_copy(&mut func, &alloc, &HashMap::new(), X86CallAbi::SystemV)
+                .expect_err(
+                    "a load that destroys a later segment's incoming argument must stay refused",
+                );
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("ordering proof failed")
+                && message.contains("incoming_arg[rbp+16]")
+                && message.contains("entry(rsi)")
+                && message.contains("fail-closed"),
+            "the refusal must name the register and both values: {message}"
+        );
+    }
+
+    /// The x86-64 semantics the ordering proof rests on, pinned per opcode.
+    ///
+    /// A partial write makes the destination's new contents a function of its
+    /// OLD contents, so misclassifying one would let the proof clear a
+    /// reordering that changes the result. The pair that matters most here is
+    /// `MovRM8` (`8A /r`, low byte only) against `MovRM32` (`8B /r`, which
+    /// zero-extends): the committed Clean fixtures load their stack-passed
+    /// `b1` formals with `MovRM8`, so the partial arm is the reached one.
+    #[test]
+    fn test_formal_prefix_opcode_destination_width_classification() {
+        for opcode in [
+            X86Opcode::MovRR,
+            X86Opcode::MovRR32,
+            X86Opcode::MovRM,
+            X86Opcode::MovRM32,
+            X86Opcode::MovdqaRR,
+            X86Opcode::MovdquRM,
+            X86Opcode::MovssRM,
+            X86Opcode::MovsdRM,
+        ] {
+            assert_eq!(
+                formal_prefix_opcode_fully_defines_dst(opcode),
+                Some(true),
+                "{opcode:?} writes the whole destination register"
+            );
+        }
+        for opcode in [
+            X86Opcode::MovRM8,
+            X86Opcode::MovRM16,
+            X86Opcode::MovssRR,
+            X86Opcode::MovsdRR,
+        ] {
+            assert_eq!(
+                formal_prefix_opcode_fully_defines_dst(opcode),
+                Some(false),
+                "{opcode:?} merges into the destination register"
+            );
+        }
+        assert_eq!(
+            formal_prefix_opcode_fully_defines_dst(X86Opcode::AddRR),
+            None,
+            "an unmodelled opcode must be a fail-closed input, not a default"
+        );
+    }
+
+    /// A stack-argument load whose destination the allocator SPILLED. It writes
+    /// no register the prologue can observe — `materialize_x86_spills` rewrites
+    /// this very instruction into a reload into a scratch plus an ADJACENT store
+    /// to its slot — so the placement rule may put it after its segment's
+    /// resolved copies even though two of those intakes followed it in scan
+    /// order. This is the O1 shape: at O1 the committed Clean fixtures spill the
+    /// destinations of their stack-passed formals, and the first version of this
+    /// analysis refused every one of them for having "no allocated destination".
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_admits_spilled_stack_load() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R12, R13, RBX, RDI, RDX, RSI};
+
+        let (mut func, entry, alloc) = build_formal_prefix_fixture(
+            "formal_spilled_load_admitted",
+            8,
+            &[
+                F::Intake(0, RDI),
+                F::Connector(100, 0),
+                F::Load(1, 16, X86Opcode::MovRM),
+                F::Intake(2, RSI),
+                F::Intake(3, RDX),
+            ],
+            // v1, the load's destination, is deliberately absent: it is spilled.
+            &[(0, RBX), (2, R13), (3, RBX), (100, R12)],
+        );
+        let installed_spills: HashMap<VReg, u32> = [(VReg::new(1, RegClass::Gpr64), 3u32)]
+            .into_iter()
+            .collect();
+
+        fixup_formal_arg_parallel_copy(&mut func, &alloc, &installed_spills, X86CallAbi::SystemV)
+            .expect("a spilled stack-arg load writes no observable register and must be admitted");
+
+        let insts = &func.blocks[&entry].insts;
+        let connector = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::VReg(VReg::new(100, RegClass::Gpr64)),
+                X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr64)),
+            ],
+        );
+        let second_rbx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDX)],
+        );
+        let load = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::MovRM)
+            .expect("the spilled stack-arg load must still be emitted, for the spiller to rewrite");
+        assert!(
+            connector < second_rbx && second_rbx < load,
+            "the load belongs after its segment's resolved copies \
+             (connector@{connector} second RBX intake@{second_rbx} load@{load})"
+        );
+        assert_eq!(
+            insts[load].operands[0],
+            X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64)),
+            "the load must be re-emitted verbatim, with its spilled destination vreg intact"
+        );
+        assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
+    }
+
+    /// The premise the previous test rests on, held up to a shape that breaks it:
+    /// the spill-replay pair carries the loaded value through one of two scratch
+    /// registers, so a later intake in the same segment that TOUCHES one of them
+    /// cannot be reordered against the load. Still refused, and the refusal names
+    /// the pair and the scratch.
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_refuses_spilled_stack_load_over_scratch_intake() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R12, RBX, RDI, RDX, RSI};
+
+        let (mut func, _entry, alloc) = build_formal_prefix_fixture(
+            "formal_spilled_load_scratch_refusal",
+            8,
+            &[
+                F::Intake(0, RDI),
+                F::Connector(100, 0),
+                F::Load(1, 16, X86Opcode::MovRM),
+                F::Intake(2, RSI),
+                F::Intake(3, RDX),
+            ],
+            // v2 lands in R10 — one of the two GPR scratches the spill replay
+            // may use for the load that would now be reordered past it.
+            &[(0, RBX), (2, R10), (3, RBX), (100, R12)],
+        );
+        let installed_spills: HashMap<VReg, u32> = [(VReg::new(1, RegClass::Gpr64), 3u32)]
+            .into_iter()
+            .collect();
+
+        let err = fixup_formal_arg_parallel_copy(
+            &mut func,
+            &alloc,
+            &installed_spills,
+            X86CallAbi::SystemV,
+        )
+        .expect_err("a spilled load must not be reordered past an intake using its scratch");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("cannot separate the spilled stack-arg load from [rbp+16]")
+                && message.contains("later formal intake r10 <- rsi")
+                && message.contains("spill-replay pair may use r10")
+                && message.contains("fail-closed"),
+            "the refusal must name the pair and the scratch: {message}"
+        );
+    }
+
+    /// A stack-argument load whose destination the allocator left in NEITHER map
+    /// has no home downstream, and one in BOTH is a regalloc invariant
+    /// violation whose physical assignment `materialize_x86_spills` would
+    /// overwrite. Both are refusals, not guesses.
+    #[test]
+    fn test_formal_stack_arg_load_destination_fails_closed_on_an_unresolved_vreg() {
+        use trust_cg_ir::x86_64_regs::RAX;
+
+        let load = X86ISelInst::new(
+            X86Opcode::MovRM,
+            vec![
+                X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64)),
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::PReg(RBP)),
+                    disp: 24,
+                },
+            ],
+        );
+        let empty_alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let empty_spills: HashMap<VReg, u32> = HashMap::new();
+        let err = formal_stack_arg_load_destination(&load, &empty_alloc, &empty_spills)
+            .expect_err("an unresolved destination must fail closed");
+        assert!(
+            format!("{err:?}").contains("neither an allocated destination nor a spill slot"),
+            "{err:?}"
+        );
+
+        let both_alloc: HashMap<VReg, X86PReg> =
+            [(VReg::new(1, RegClass::Gpr64), RAX)].into_iter().collect();
+        let both_spills: HashMap<VReg, u32> = [(VReg::new(1, RegClass::Gpr64), 2u32)]
+            .into_iter()
+            .collect();
+        let err = formal_stack_arg_load_destination(&load, &both_alloc, &both_spills)
+            .expect_err("a destination that is both assigned and spilled must fail closed");
+        assert!(
+            format!("{err:?}").contains("is both assigned rax and spilled to slot 2"),
+            "{err:?}"
+        );
+    }
+
+    /// The route that admits the O1 Clean-fixture shape: a split connector whose
+    /// DESTINATION the allocator spilled, so the prologue moves it through the
+    /// spiller's reload/store replay, which the value-level proof's register
+    /// domain cannot carry — together with a stack-arg load that NOTHING moves
+    /// past. There is no reordering to justify, so the pass admits it on that
+    /// ground and on its contract instead.
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_admits_spilled_connector_without_reordering() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R13, R14, RBX, RDI, RDX, RSI};
+
+        let (mut func, entry, alloc) = build_formal_prefix_fixture(
+            "formal_spilled_connector_unreordered",
+            8,
+            &[
+                F::Intake(0, RDI),
+                F::Connector(100, 0),
+                F::Intake(2, RSI),
+                F::Intake(3, RDX),
+                // The load follows every intake of its own segment, so nothing
+                // moves past it.
+                F::Load(1, 16, X86Opcode::MovRM),
+            ],
+            // v100, the connector's destination, is spilled rather than assigned.
+            &[(0, RBX), (1, R14), (2, R13), (3, RBX)],
+        );
+        let installed_spills: HashMap<VReg, u32> = [(VReg::new(100, RegClass::Gpr64), 7u32)]
+            .into_iter()
+            .collect();
+
+        fixup_formal_arg_parallel_copy(&mut func, &alloc, &installed_spills, X86CallAbi::SystemV)
+            .expect("a prefix this pass does not reorder needs no value-level proof");
+
+        let insts = &func.blocks[&entry].insts;
+        let connector = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::VReg(VReg::new(100, RegClass::Gpr64)),
+                X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr64)),
+            ],
+        );
+        let first_rbx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDI)],
+        );
+        let second_rbx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDX)],
+        );
+        let load = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::MovRM)
+            .expect("the stack-arg load must still be emitted");
+        assert!(
+            first_rbx < connector && connector < second_rbx && second_rbx < load,
+            "the emitted order must be the order ISel emitted \
+             (first RBX@{first_rbx} connector@{connector} second RBX@{second_rbx} load@{load})"
+        );
+        assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
+    }
+
+    /// The same spilled connector, but with the load moved so that two intakes of
+    /// its own segment now follow it. The unreordered route no longer applies, so
+    /// the placement has to be PROVED.
+    ///
+    /// This shape was refused outright until the value-level proof learned to
+    /// model a spilled connector end by the slot its replay touches
+    /// (`formal_barrier_ends_for_value_proof`). The assertions below are what
+    /// replaced that refusal: the exact emitted order, not merely that the pass
+    /// returned `Ok`.
+    #[test]
+    fn test_fixup_formal_arg_parallel_copy_proves_spilled_connector_once_a_load_moves() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R13, R14, RBX, RDI, RDX, RSI};
+
+        let (mut func, entry, alloc) = build_formal_prefix_fixture(
+            "formal_spilled_connector_reordered",
+            8,
+            &[
+                F::Intake(0, RDI),
+                F::Connector(100, 0),
+                F::Load(1, 16, X86Opcode::MovRM),
+                F::Intake(2, RSI),
+                F::Intake(3, RDX),
+            ],
+            &[(0, RBX), (1, R14), (2, R13), (3, RBX)],
+        );
+        let installed_spills: HashMap<VReg, u32> = [(VReg::new(100, RegClass::Gpr64), 7u32)]
+            .into_iter()
+            .collect();
+
+        fixup_formal_arg_parallel_copy(&mut func, &alloc, &installed_spills, X86CallAbi::SystemV)
+            .expect("the spilled connector's slot traffic is modelled, so this is provable");
+
+        let insts = &func.blocks[&entry].insts;
+        let first_rbx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDI)],
+        );
+        let connector = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::VReg(VReg::new(100, RegClass::Gpr64)),
+                X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr64)),
+            ],
+        );
+        let second_rbx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RBX), X86ISelOperand::PReg(RDX)],
+        );
+        let r13 = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(R13), X86ISelOperand::PReg(RSI)],
+        );
+        let load = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::MovRM)
+            .expect("the stack-arg load must still be emitted");
+
+        // Relative to the connector, nothing moved: RBX is still preserved
+        // before the connector reads it, and the later RBX intake still
+        // overwrites it after.
+        assert!(
+            first_rbx < connector && connector < second_rbx,
+            "the connector must keep its position between the two RBX writes \
+             (first@{first_rbx} connector@{connector} second@{second_rbx})"
+        );
+        // What DID move is the load: it sinks below the two intakes of its own
+        // segment, which the parallel copy makes simultaneous. Its destination
+        // R14 is touched by neither.
+        assert!(
+            r13 < load && second_rbx < load,
+            "the load must be emitted after its own segment's resolved copies \
+             (r13@{r13} rbx@{second_rbx} load@{load})"
+        );
+        assert_eq!(
+            insts[load].operands[0],
+            X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64))
+        );
+        assert_eq!(x86_preg_name(R14), "r14");
+        assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
+    }
+
+    /// The Clean-kernel prologue shape itself: a SPILLED formal (whose save is
+    /// hoisted, so route 1 does not apply), a stack-argument load, and a split
+    /// connector whose DESTINATION the allocator spilled. Every fixture in the
+    /// corpus reaches this once the split cascade is bounded, and each one
+    /// refused here until the proof modelled the spilled end.
+    #[test]
+    fn test_fixup_formal_arg_spilled_connector_destination_is_proved() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R8, R10, RAX, RBX, RCX, RDI, RDX, RSI};
+
+        let (mut func, entry, alloc) = build_formal_prefix_fixture(
+            "formal_spilled_connector_with_save",
+            7,
+            &[
+                // v0 is spilled, so this intake becomes a hoisted save.
+                F::Intake(0, RDI),
+                F::Intake(1, RSI),
+                F::Load(2, 16, X86Opcode::MovRM),
+                F::Intake(3, RCX),
+                F::Connector(100, 1),
+                // A later intake writing the connector's SOURCE preg: this is
+                // what makes the prefix sequential and the proof necessary.
+                F::Intake(4, R8),
+            ],
+            &[(1, RDX), (2, RAX), (3, RBX), (4, RDX)],
+        );
+        let installed_spills: HashMap<VReg, u32> = [
+            (VReg::new(0, RegClass::Gpr64), 0u32),
+            (VReg::new(100, RegClass::Gpr64), 1u32),
+        ]
+        .into_iter()
+        .collect();
+
+        fixup_formal_arg_parallel_copy(&mut func, &alloc, &installed_spills, X86CallAbi::SystemV)
+            .expect("a spilled connector destination beside a hoisted save must be provable");
+
+        let insts = &func.blocks[&entry].insts;
+        // The save leads the prologue: a copy through the first spill scratch,
+        // then the store to its slot.
+        assert_eq!(
+            formal_prefix_position(
+                insts,
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(R10), X86ISelOperand::PReg(RDI)],
+            ),
+            0
+        );
+        assert_eq!(
+            formal_prefix_position(
+                insts,
+                X86Opcode::MovMR,
+                vec![x86_spill_stack_mem(0), X86ISelOperand::PReg(R10)],
+            ),
+            1
+        );
+
+        let intake_rdx = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RDX), X86ISelOperand::PReg(RSI)],
+        );
+        let load = insts
+            .iter()
+            .position(|inst| inst.opcode == X86Opcode::MovRM)
+            .expect("the stack-arg load must still be emitted");
+        let connector = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::VReg(VReg::new(100, RegClass::Gpr64)),
+                X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64)),
+            ],
+        );
+        let later_intake = formal_prefix_position(
+            insts,
+            X86Opcode::MovRR,
+            vec![X86ISelOperand::PReg(RDX), X86ISelOperand::PReg(R8)],
+        );
+
+        assert!(
+            intake_rdx < load && load < connector && connector < later_intake,
+            "the load stays inside its segment and the connector still reads RDX \
+             before the later intake redefines it (intake@{intake_rdx} load@{load} \
+             connector@{connector} later@{later_intake})"
+        );
+        assert_eq!(insts.last().unwrap().opcode, X86Opcode::Ret);
+    }
+
+    /// A connector between one spill slot and ITSELF. `materialize_x86_spills`
+    /// elides that instruction outright, so the three-instruction replay group the
+    /// proof models is not what would be emitted — refuse rather than reason about
+    /// a group that does not exist.
+    #[test]
+    fn test_fixup_formal_arg_spilled_connector_self_copy_is_refused() {
+        use FormalPrefixFixture as F;
+        use trust_cg_ir::x86_64_regs::{R8, R12, RAX, RBX, RCX, RDI, RDX, RSI};
+
+        let (mut func, _entry, alloc) = build_formal_prefix_fixture(
+            "formal_self_copy_connector",
+            7,
+            &[
+                F::Intake(0, RDI),
+                F::Intake(1, RSI),
+                F::Load(2, 16, X86Opcode::MovRM),
+                F::Intake(3, RCX),
+                F::Connector(100, 100),
+                F::Intake(4, R8),
+            ],
+            &[(1, RDX), (2, RAX), (3, RBX), (4, R12)],
+        );
+        let installed_spills: HashMap<VReg, u32> = [
+            (VReg::new(0, RegClass::Gpr64), 0u32),
+            (VReg::new(100, RegClass::Gpr64), 7u32),
+        ]
+        .into_iter()
+        .collect();
+
+        let err = fixup_formal_arg_parallel_copy(
+            &mut func,
+            &alloc,
+            &installed_spills,
+            X86CallAbi::SystemV,
+        )
+        .expect_err("a slot-to-itself connector must be refused");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("moves spill slot 7 to itself"),
+            "the refusal must name the elided self-copy: {message}"
+        );
+        assert!(
+            message.contains("could not be emitted unreordered either"),
+            "the refusal must also say why route 1 did not apply: {message}"
+        );
+    }
+
+    /// Every register alias resolves to the storage the overlap predicate
+    /// agrees on, so the ordering proof's state cannot key two aliases of one
+    /// register to two different entries.
+    #[test]
+    fn test_formal_prefix_storage_root_agrees_with_overlap() {
+        use trust_cg_ir::x86_64_regs::{EBX, RBX, XMM3, XMM4};
+
+        for a in [RBX, EBX, R11D, R11, XMM3, XMM4, AL, AX] {
+            let root_a = formal_prefix_storage_root(a).expect("modelled register");
+            for b in [RBX, EBX, R11D, R11, XMM3, XMM4, AL, AX] {
+                let root_b = formal_prefix_storage_root(b).expect("modelled register");
+                assert_eq!(
+                    root_a == root_b,
+                    x86_64_regs::x86_regs_overlap(a, b),
+                    "{a:?} and {b:?} must share a storage root exactly when they overlap"
+                );
+            }
+        }
+    }
+
+    /// The memory-disjointness premise of the load-placement proof, measured on
+    /// the frame layout rather than asserted in a comment: every stack slot —
+    /// spill slots included — lands at a NON-POSITIVE displacement from RBP,
+    /// while `is_formal_stack_arg_load` only accepts a load at `disp >= 16`. So
+    /// no spill store the prologue hoists can alias an incoming argument, which
+    /// is what lets the proof keep the two in disjoint address spaces.
+    #[test]
+    fn test_x86_stack_slots_never_alias_the_incoming_argument_area() {
+        let sig = Signature {
+            params: vec![Type::I64],
+            returns: vec![],
+        };
+        let mut func = X86ISelFunction::new("slot_disjointness".to_string(), sig);
+        for size in [1u32, 4, 8, 16, 64] {
+            func.stack_slots.push(StackSlotInfo::new(size, 8));
+        }
+        for num_spills in [0usize, 1, 7] {
+            // Spill slots are appended as ordinary 8-byte stack slots, exactly
+            // as `install_x86_spill_slots` does.
+            let mut func = func.clone();
+            for _ in 0..num_spills {
+                func.stack_slots.push(StackSlotInfo::new(8, 8));
+            }
+            for callee_saved in [0usize, 3] {
+                let layout =
+                    compute_x86_stack_frame_layout(&func, callee_saved, 0).expect("frame layout");
+                for (index, offset) in layout.stack_slot_offsets.iter().enumerate() {
+                    let offset = offset.expect("fixed-size slot has an offset");
+                    assert!(
+                        offset <= 0,
+                        "stack slot {index} landed at rbp{offset:+}, which is in the \
+                         incoming argument area the formal-arg loads read"
+                    );
+                    assert!(
+                        offset < 16,
+                        "stack slot {index} at rbp{offset:+} could alias a formal stack \
+                         argument (is_formal_stack_arg_load accepts disp >= 16)"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

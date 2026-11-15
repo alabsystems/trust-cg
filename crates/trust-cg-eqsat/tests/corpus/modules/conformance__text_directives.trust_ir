@@ -1,0 +1,26 @@
+; TrustIr text format v1
+module "text_directives"
+
+functy.0 = (ptr) -> ()
+
+fn @sink(functy.0) {
+    ; #target_features: "neon", "crc"
+    ; #param_attrs 0: nonnull
+bb0(%0: ptr):
+    ret
+}
+
+fn @spin(functy.0) {
+    ; #source-provenance: schema 1 compiler "sha256:1111111111111111111111111111111111111111111111111111111111111111" semantic "sha256:33a6d1e0e0488f059e59eaa78678d644659977e5c1d94cf66241b0c0faa72368" binding "sha256:3a47d21971bfadc92954a8bf5627b53db0bc8be01b194d930cddee4c213c8771"
+    ; #source-loop: 0 hir 71 header 1
+    ; #source-binding: loop 0 name "cursor" hir 72 loop-param 0
+bb0(%0: ptr):
+    call @func.0(%0)  ; #proof_ctx: assumes[] establishes[0,1]
+    br bb1(%0)
+bb1(%1: ptr):
+    br bb1(%1)
+}
+
+obligation 0 precondition pending "sink: p is non-null" function 0
+
+obligation 1 precondition pending "sink: p is aligned" function 0

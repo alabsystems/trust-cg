@@ -1,0 +1,21 @@
+; TrustIr text format v1
+module "_RNvCskmnCJB1mrvH_32s23_abi_stack_arg_return_clobber1f"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = (u64, u64, u64, u64, u64, u64, u64, u16, u64, u64) -> (u32)
+
+type ty.0 = i8
+
+type ty.1 = i16
+
+type ty.2 = i32
+
+type ty.3 = i64
+
+type ty.4 = i128
+
+fn @_RNvCskmnCJB1mrvH_32s23_abi_stack_arg_return_clobber1f(functy.0) {
+bb0(%1: u64, %2: u64, %3: u64, %4: u64, %5: u64, %6: u64, %7: u64, %8: u16, %9: u64, %10: u64):
+    %11 = trunc u64 %1 to u32
+    ret %11
+}

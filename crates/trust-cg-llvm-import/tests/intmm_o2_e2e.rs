@@ -2,22 +2,36 @@
 
 // trust-cg-llvm-import / tests / intmm_o2_e2e.rs
 //
-// O2 linked-binary regression coverage for the IntMM Initmatrix shape.
+// O2 linked-binary regression coverage for the IntMM Initmatrix shape. Each C
+// program's clang -O0 LLVM IR is imported, compiled at O2 for this host's
+// explicit triple (ELF on AArch64 Linux GNU, Mach-O on AArch64 macOS), linked
+// with `cc` and run natively; its stdout must equal the C program's own.
+//
+// The IR comes from the host `clang` when one is on PATH, and the reference
+// binary from that clang. Otherwise (the Linux AArch64 floor host installs
+// only GCC) the IR is the committed clang 18.1.3 -O0 output in
+// tests/fixtures/intmm_*_clang_o0.ll, whose header must reproduce the C
+// source here, and the reference binary comes from the host `cc`. Either way
+// the reference stdout must also equal the pinned expected output.
+//
+// A host clang that defaults to `-fcommon` (Apple clang) spells the programs'
+// uninitialized file-scope globals as `common` tentative definitions. The
+// importer refuses that linkage by name (trust-ir has none for it), and the
+// test requires exactly that refusal before it re-emits the IR, and builds the
+// reference, with `-fno-common`.
+
+mod common;
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use trust_cg_codegen::compiler::{Compiler, CompilerConfig, CompilerTraceLevel};
+use common::{compile_for_host, describe_status, native_host_or_skip, unique_temp_dir};
 use trust_cg_codegen::pipeline::OptLevel;
-use trust_cg_codegen::target::TargetSpec;
-use trust_cg_llvm_import::import_text;
-
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use trust_cg_llvm_import::{Error, import_text};
 
 const INTMM_INITMATRIX_C: &str = r#"
 #include <stdio.h>
@@ -116,32 +130,25 @@ int main(void) {
 }
 "#;
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before unix epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "trust-cg-import-{name}-{}-{nanos}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
+/// clang 18.1.3 -O0 IR of [`INTMM_INITMATRIX_C`] for aarch64-unknown-linux-gnu.
+const INTMM_INITMATRIX_CLANG_O0_LL: &str = include_str!("fixtures/intmm_initmatrix_clang_o0.ll");
+/// clang 18.1.3 -O0 IR of [`INTMM_MAIN_LOOP_C`] for aarch64-unknown-linux-gnu.
+const INTMM_MAIN_LOOP_CLANG_O0_LL: &str = include_str!("fixtures/intmm_main_loop_clang_o0.ll");
 
-fn describe_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit {code}");
-    }
-    #[cfg(unix)]
-    if let Some(signal) = status.signal() {
-        return format!("signal {signal}");
-    }
-    "unknown status".to_string()
-}
+/// The C programs' output (LP64 `long`; identical under clang and GCC).
+const INTMM_INITMATRIX_STDOUT: &str = "36 -33\n";
+const INTMM_MAIN_LOOP_STDOUT: &str =
+    "-6984\n5732\n8656\n-2156\n-3040\n-2684\n-8664\n852\n560\n300\n";
 
-fn ensure_clang_available() -> bool {
-    match Command::new("clang").arg("--version").output() {
+/// Whether a working `clang` is available (the selected developer compiler
+/// on Darwin, PATH elsewhere). A compiler that fails `--version` is broken,
+/// not absent.
+fn clang_available() -> bool {
+    #[cfg(target_os = "macos")]
+    let mut command = common::native_c_command();
+    #[cfg(not(target_os = "macos"))]
+    let mut command = Command::new("clang");
+    match command.arg("--version").output() {
         Ok(output) if output.status.success() => true,
         Ok(output) => {
             panic!(
@@ -151,22 +158,24 @@ fn ensure_clang_available() -> bool {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            eprintln!("skipping: clang not found");
-            false
-        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
         Err(err) => panic!("run clang --version: {err}"),
     }
 }
 
-fn run_clang(args: &[&str]) {
-    let output = Command::new("clang")
+/// Run the C compiler `driver` with `args`, requiring success.
+fn run_c_compiler(driver: &str, args: &[&str]) {
+    #[cfg(target_os = "macos")]
+    let mut command = common::native_c_command();
+    #[cfg(not(target_os = "macos"))]
+    let mut command = Command::new(driver);
+    let output = command
         .args(args)
         .output()
-        .expect("run clang");
+        .unwrap_or_else(|e| panic!("run {driver}: {e}"));
     assert!(
         output.status.success(),
-        "clang {:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
+        "{driver} {:?} failed with {}\nstdout:\n{}\nstderr:\n{}",
         args,
         describe_status(output.status),
         String::from_utf8_lossy(&output.stdout),
@@ -174,8 +183,26 @@ fn run_clang(args: &[&str]) {
     );
 }
 
+/// The C source embedded in a committed fixture's `; | ` header block.
+fn fixture_c_source(fixture: &str) -> String {
+    let mut source = String::new();
+    for line in fixture
+        .lines()
+        .skip_while(|line| !line.starts_with("; |"))
+        .take_while(|line| line.starts_with("; |"))
+    {
+        let text = line.strip_prefix("; | ").unwrap_or_else(|| {
+            assert_eq!(line, "; |", "malformed fixture source line {line:?}");
+            ""
+        });
+        source.push_str(text);
+        source.push('\n');
+    }
+    source
+}
+
 fn link_with_cc(obj_path: &Path, bin_path: &Path) {
-    let output = Command::new("cc")
+    let output = common::native_c_command()
         .arg(obj_path)
         .arg("-o")
         .arg(bin_path)
@@ -234,88 +261,130 @@ fn run_binary_with_timeout(bin_path: &Path, timeout: Duration) -> Vec<u8> {
     }
 }
 
-fn assert_o2_linked_binary_matches_clang_stdout(src: &str, name: &str) {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        eprintln!(
-            "skipping: test requires aarch64-apple-darwin (host is {} / {})",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
-        return;
-    }
-    if !ensure_clang_available() {
+fn assert_o2_linked_binary_matches_clang_stdout(
+    test: &str,
+    src: &str,
+    committed_ll: &str,
+    expected_stdout: &str,
+    name: &str,
+) {
+    assert_eq!(
+        fixture_c_source(committed_ll),
+        src,
+        "{name}: the committed clang -O0 fixture was generated from another C source; \
+         regenerate it with the command in its header"
+    );
+    if !native_host_or_skip(test) {
         return;
     }
 
     let dir = unique_temp_dir(name);
     let c_path = dir.join(format!("{name}.c"));
     let ll_path = dir.join(format!("{name}.ll"));
-    let clang_bin = dir.join(format!("{name}.clang"));
+    let reference_bin = dir.join(format!("{name}.reference"));
     let trust_cg_obj = dir.join(format!("{name}.trust-cg.o"));
     let trust_cg_bin = dir.join(format!("{name}.trust-cg"));
-
     fs::write(&c_path, src).expect("write C source");
-    run_clang(&[
-        "-O0",
-        "-S",
-        "-emit-llvm",
-        "-o",
-        ll_path.to_str().expect("ll path utf8"),
-        c_path.to_str().expect("c path utf8"),
-    ]);
-    run_clang(&[
-        "-O0",
-        c_path.to_str().expect("c path utf8"),
-        "-o",
-        clang_bin.to_str().expect("clang bin path utf8"),
-    ]);
+    let c_arg = c_path.to_str().expect("c path utf8");
 
-    let clang_stdout = run_binary(&clang_bin);
-    let ll_src = fs::read_to_string(&ll_path).expect("read generated ll");
-    let object = compile_to_aarch64_object(&ll_src, name, OptLevel::O2);
+    let (ll_src, reference_compiler, c_flags): (String, &str, &[&str]) = if clang_available() {
+        let emit_ll = |flags: &[&str]| {
+            let mut args = vec!["-O0"];
+            args.extend_from_slice(flags);
+            args.extend([
+                "-S",
+                "-emit-llvm",
+                "-o",
+                ll_path.to_str().expect("ll utf8"),
+                c_arg,
+            ]);
+            run_c_compiler("clang", &args);
+            fs::read_to_string(&ll_path).expect("read generated ll")
+        };
+        let default_ll = emit_ll(&[]);
+        match import_text(&default_ll, name) {
+            Ok(_) => (default_ll, "clang", &[]),
+            // A clang that defaults to `-fcommon` (Apple clang for Darwin
+            // targets; upstream clang before 11) spells these file-scope
+            // tentative definitions `common`, which the importer refuses by
+            // name: trust-ir has no linkage for a definition the linker
+            // merges by largest size. The same program with `-fno-common`
+            // (the upstream default, and the committed fixture's IR) defines
+            // each one as an ordinary zero-initialized global, which links
+            // the same way in this one-object program.
+            Err(Error::Unsupported(reason))
+                if reason
+                    .starts_with("global `@seed`: linkage `common` (a tentative definition") =>
+            {
+                assert!(
+                    default_ll.contains("@seed = common global i64 0, align 8"),
+                    "{name}: the importer refused `common` for a module that does not spell \
+                     it: {reason}"
+                );
+                let no_common_ll = emit_ll(&["-fno-common"]);
+                assert!(
+                    !no_common_ll.contains(" common global "),
+                    "{name}: clang -fno-common still emitted a common global"
+                );
+                (no_common_ll, "clang", &["-fno-common"])
+            }
+            Err(error) => panic!("{name}: import of the clang -O0 IR failed: {error}"),
+        }
+    } else {
+        eprintln!(
+            "{test}: no clang on PATH; importing the committed clang 18.1.3 -O0 IR \
+             (tests/fixtures/{name_stem}_clang_o0.ll) and running the host cc's binary as \
+             the reference",
+            name_stem = name.trim_end_matches("_o2")
+        );
+        (committed_ll.to_owned(), "cc", &[])
+    };
+    let mut reference_args = vec!["-O0"];
+    reference_args.extend_from_slice(c_flags);
+    reference_args.extend([
+        c_arg,
+        "-o",
+        reference_bin.to_str().expect("reference bin path utf8"),
+    ]);
+    run_c_compiler(reference_compiler, &reference_args);
+
+    let reference_stdout = run_binary(&reference_bin);
+    assert_eq!(
+        String::from_utf8_lossy(&reference_stdout),
+        expected_stdout,
+        "{name}: the {reference_compiler} -O0 reference binary disagrees with the pinned output"
+    );
+    let object = compile_for_host(&ll_src, name, OptLevel::O2);
     fs::write(&trust_cg_obj, object).expect("write object");
     link_with_cc(&trust_cg_obj, &trust_cg_bin);
     let trust_cg_stdout = run_binary(&trust_cg_bin);
 
     assert!(
-        trust_cg_stdout == clang_stdout,
-        "Trust Codegen O2 stdout should match clang for {name}\nclang:\n{}\ntrust-cg:\n{}",
-        String::from_utf8_lossy(&clang_stdout),
+        trust_cg_stdout == reference_stdout,
+        "Trust Codegen O2 stdout should match {reference_compiler} for {name}\n{reference_compiler}:\n{}\ntrust-cg:\n{}",
+        String::from_utf8_lossy(&reference_stdout),
         String::from_utf8_lossy(&trust_cg_stdout)
     );
 }
 
-fn compile_to_aarch64_object(src: &str, module_name: &str, opt_level: OptLevel) -> Vec<u8> {
-    let module = import_text(src, module_name).expect("import");
-    let target_spec = TargetSpec::parse("aarch64-apple-darwin").expect("target spec");
-    let compiler = Compiler::new_for_target_spec(
-        CompilerConfig {
-            opt_level,
-            target: target_spec.architecture,
-            emit_proofs: false,
-            trace_level: CompilerTraceLevel::None,
-            emit_debug: false,
-            parallel: false,
-            cegis_superopt_budget_sec: None,
-            enable_fsym_trust_ir_preflight: false,
-            enable_jit_fast_regalloc: false,
-            jit_validation_mode_override: None,
-            panic_unwind: false,
-        },
-        target_spec,
-    );
-    compiler
-        .compile(&module)
-        .unwrap_or_else(|e| panic!("compile `{module_name}` failed: {e}"))
-        .object_code
-}
-
 #[test]
 fn intmm_initmatrix_o2_linked_binary_matches_clang_stdout() {
-    assert_o2_linked_binary_matches_clang_stdout(INTMM_INITMATRIX_C, "intmm_initmatrix_o2");
+    assert_o2_linked_binary_matches_clang_stdout(
+        "intmm_initmatrix_o2_linked_binary_matches_clang_stdout",
+        INTMM_INITMATRIX_C,
+        INTMM_INITMATRIX_CLANG_O0_LL,
+        INTMM_INITMATRIX_STDOUT,
+        "intmm_initmatrix_o2",
+    );
 }
 
 #[test]
 fn intmm_main_loop_o2_linked_binary_matches_clang_stdout() {
-    assert_o2_linked_binary_matches_clang_stdout(INTMM_MAIN_LOOP_C, "intmm_main_loop_o2");
+    assert_o2_linked_binary_matches_clang_stdout(
+        "intmm_main_loop_o2_linked_binary_matches_clang_stdout",
+        INTMM_MAIN_LOOP_C,
+        INTMM_MAIN_LOOP_CLANG_O0_LL,
+        INTMM_MAIN_LOOP_STDOUT,
+        "intmm_main_loop_o2",
+    );
 }

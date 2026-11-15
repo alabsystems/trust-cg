@@ -26,14 +26,13 @@
 //! - Nested loops are not unrolled (only innermost loops).
 //!
 //! Besides the 2-block copy-dialect full unroll, two multi-block full
-//! unrollers live here: the bounded-early-exit unroll (Queens' trial loop,
-//! `TCG_NO_BOUNDED_EARLY_EXIT_UNROLL`) and the diamond-body constant-trip
-//! unroll (ReedSolomon's encode shift-register loop,
-//! `TCG_NO_DIAMOND_CONST_TRIP_UNROLL`).
+//! unrollers live here: the bounded-early-exit unroll (Queens' trial loop)
+//! and the diamond-body constant-trip unroll (ReedSolomon's encode
+//! shift-register loop).
 //!
 //! Reference: LLVM `LoopUnrollPass.cpp`
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::{
     AArch64Opcode, AArch64Target, BlockId, CondCode, InstId, MachFunction, MachInst, MachOperand,
@@ -44,10 +43,12 @@ use crate::addr_mode::is_encodable_offset;
 use crate::dom::DomTree;
 use crate::effects::{
     aarch64_for_each_def_position, aarch64_for_each_use_position, for_each_inst_def,
-    for_each_inst_use,
+    for_each_inst_use, inst_clobbers_vreg_id, may_clobber_nzcv,
 };
+use crate::loop_contract::{CoveredLoop, DeadWork, Lanes, Remainder, StateReg, publish_covered};
 use crate::loop_iv::analyze_trip_count;
-use crate::loops::{LoopAnalysis, NaturalLoop};
+use crate::loops::{LoopAnalysis, NaturalLoop, body_is_acyclic_dag};
+use crate::mach_util::body_clone_reproduces_out_edges;
 use crate::pass_manager::{AnalysisCache, MachinePass};
 use crate::pgo::ProfileHotness;
 
@@ -95,56 +96,30 @@ const DIAMOND_UNROLL_MAX_BODY_INSTS: usize = 64;
 /// Diamond-body unroll: cap on total cloned instructions (code growth).
 const DIAMOND_UNROLL_MAX_CLONED_INSTS: usize = 640;
 
-/// Compile-time kill switch for the bounded-early-exit full unroll: set
-/// `TCG_NO_BOUNDED_EARLY_EXIT_UNROLL` (any value) to disable it.
-fn bounded_early_exit_unroll_enabled() -> bool {
-    std::env::var_os("TCG_NO_BOUNDED_EARLY_EXIT_UNROLL").is_none()
-}
-
-/// Multiple exit edges in the bounded-early-exit full unroll (default ON).
-/// Kill switch `TCG_NO_BEE_MULTI_EXIT` (any value) restores the historical
-/// exactly-one-exit-edge gate, which the clang -O2 shape of Stanford `Queens`'s
-/// `Try` fails (three exit edges: the trip test, the post-recursion early
-/// return, and the `*q = true` landing pad). See the exit-edge policy note in
-/// [`analyze_bounded_early_exit_loop`] for why extra exits need no rewriting.
-fn bee_multi_exit_enabled() -> bool {
-    std::env::var_os("TCG_NO_BEE_MULTI_EXIT").is_none()
-}
-
 /// Compile-time kill switch for the const-addr full unroll: set
 /// `TCG_NO_CONST_ADDR_UNROLL` (any value) to disable it.
+static CONST_ADDR_UNROLL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the const-address loop unrolling kill switch from a TRACKED compiler option, once. DEFAULT ON.
+///
+/// Until 2026-09-30 the only channel was `TCG_NO_CONST_ADDR_UNROLL`, which `trustc` refuses before the
+/// backend loads, so this pass could not be A/B'd through the bridge. It is not a neutral
+/// gap: unrolling a constant-trip inner loop DESTROYS the loop the vectorizer needs, and
+/// `p4_matmul` written with `get_unchecked` loses 1.90x against LLVM exactly that way — its
+/// `j` loop arrives at the vectorizer already unrolled by 24 (stride 0x18, 96 scalar `imul`,
+/// ZERO `pmuludq`), while the checked build keeps an 8-element loop with 12 `pmuludq`.
+pub fn set_const_addr_unroll_disabled(disabled: bool) -> bool {
+    match CONST_ADDR_UNROLL_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => CONST_ADDR_UNROLL_DISABLED.get() == Some(&requested),
+    }
+}
+
 fn const_addr_unroll_enabled() -> bool {
+    if let Some(disabled) = CONST_ADDR_UNROLL_DISABLED.get() {
+        return !*disabled;
+    }
     std::env::var_os("TCG_NO_CONST_ADDR_UNROLL").is_none()
-}
-
-/// Compile-time kill switch for the diamond-body constant-trip full unroll:
-/// set `TCG_NO_DIAMOND_CONST_TRIP_UNROLL` (any value) to disable it.
-fn diamond_unroll_enabled() -> bool {
-    std::env::var_os("TCG_NO_DIAMOND_CONST_TRIP_UNROLL").is_none()
-}
-
-/// Compile-time kill switch for the BOUNDED-trip extension of the diamond-body
-/// unroll (trip count proven `<= M` by a dominating guard rather than exactly
-/// `M`; every clone but the last keeps a real exit test): set
-/// `TCG_NO_DIAMOND_BOUNDED_TRIP_UNROLL` (any value) to disable it and fall back
-/// to exact-constant trip counts only.
-fn diamond_bounded_trip_enabled() -> bool {
-    std::env::var_os("TCG_NO_DIAMOND_BOUNDED_TRIP_UNROLL").is_none()
-}
-
-/// Compile-time kill switch for per-clone vreg renaming inside the
-/// bounded-early-exit full unroll: set `TCG_NO_BEE_UNROLL_RENAME` (any value) to
-/// fall back to the old vreg-reusing clone (for A/B and object-identity checks).
-fn bee_unroll_rename_enabled() -> bool {
-    std::env::var_os("TCG_NO_BEE_UNROLL_RENAME").is_none()
-}
-
-/// Kill switch for the profile-hotness trip-count bump: set
-/// `TCG_PGO_NO_HOT_UNROLL` (any value) to keep the static
-/// `TCG_MAX_UNROLL_TRIP_COUNT` cap even when a profile marks the loop header
-/// hot (for PGO effect attribution A/B runs). Inert without a profile.
-fn pgo_hot_unroll_enabled() -> bool {
-    std::env::var_os("TCG_PGO_NO_HOT_UNROLL").is_none()
 }
 
 /// Loop unrolling pass.
@@ -216,6 +191,7 @@ impl LoopUnroll {
             return false;
         }
 
+        let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
         let mut changed = false;
 
         // Collect innermost loops only (no children).
@@ -235,20 +211,45 @@ impl LoopUnroll {
         // that defines it per the shared operand-role model. The importer's
         // SSA-destructed MIR is NOT SSA (loop-carried vregs are defined by
         // copies in both the preheader and the latch), so a vreg may have
-        // several defs.
-        let def_map = build_def_map(func);
+        // several defs. Every unroll rewrites instructions in place (an IV
+        // increment becomes its first iteration's `Movz`) and adds new defs,
+        // so the map is rebuilt after each one: a later loop must not read an
+        // earlier loop's IV through a stale single-def entry as a constant.
+        let mut def_map = build_def_map(func);
+        let mut def_map_stale = false;
 
         // Trip-count simulation cap: with the const-addr unroll enabled the
         // copy-counted recognizer must be able to PROVE trip counts up to
         // `CONST_ADDR_UNROLL_MAX_TRIP`; with its kill switch set, keep the
         // historical bound so behavior is bit-identical.
-        let sim_cap = if const_addr_unroll_enabled() {
+        // The three tier kill switches are loop-invariant for this scan. Hoisted
+        // out of the per-loop walk (read once per pass run, NOT memoized) so an
+        // in-process flip is still observed by the next run.
+        let const_addr_unroll = const_addr_unroll_enabled();
+
+        let sim_cap = if const_addr_unroll {
             HOT_MAX_TRIP_COUNT.max(CONST_ADDR_UNROLL_MAX_TRIP) + 1
         } else {
             HOT_MAX_TRIP_COUNT + 1
         };
 
         for lp in &innermost {
+            // Unrolling cannot clone a selected Invoke without transporting
+            // each clone's exceptional continuation, which this pass does not.
+            if !protected.is_empty()
+                && lp.body.iter().any(|b| {
+                    func.block(*b)
+                        .insts
+                        .iter()
+                        .any(|id| protected.contains(*id))
+                })
+            {
+                continue;
+            }
+            if def_map_stale {
+                def_map = build_def_map(func);
+                def_map_stale = false;
+            }
             let max_trip_count = max_trip_count_for_loop(func, lp, profile_hotness);
 
             // Primary path: the real importer dialect (copy-based / rotated /
@@ -262,7 +263,8 @@ impl LoopUnroll {
                     && unroll_copy_based(func, lp, &cl, None, provenance.as_deref_mut())
                 {
                     changed = true;
-                } else if const_addr_unroll_enabled()
+                    def_map_stale = true;
+                } else if const_addr_unroll
                     && cl.trip_count > max_trip_count
                     && cl.trip_count <= CONST_ADDR_UNROLL_MAX_TRIP
                     && cl.cloned_body_len() <= CONST_ADDR_UNROLL_MAX_BODY_INSTS
@@ -270,6 +272,7 @@ impl LoopUnroll {
                     && unroll_copy_based(func, lp, &cl, Some(&plan), provenance.as_deref_mut())
                 {
                     changed = true;
+                    def_map_stale = true;
                 }
                 // A recognized copy-based loop never matches the legacy Phi
                 // recognizer; do not double-process.
@@ -280,13 +283,28 @@ impl LoopUnroll {
             // multi-block trial-loop shape whose backedge is guarded by
             // `AndRR(CSet(iv_next != K), CSet(dynamic))` with a compile-time
             // constant limit K and constant step (Queens' `Try`). See
-            // `analyze_bounded_early_exit_loop`. Kill switch:
-            // `TCG_NO_BOUNDED_EARLY_EXIT_UNROLL`.
-            if bounded_early_exit_unroll_enabled()
-                && let Some(bel) = analyze_bounded_early_exit_loop(func, lp, &def_map)
-            {
-                if unroll_bounded_early_exit(func, lp, &bel, provenance.as_deref_mut()) {
+            // `analyze_bounded_early_exit_loop`.
+            if let Some(bel) = analyze_bounded_early_exit_loop(func, lp, &def_map) {
+                // The loop-state contract's iteration-coverage clause runs the
+                // unrolled copies against the loop before they are published.
+                let published = publish_covered(
+                    func,
+                    provenance.as_deref_mut(),
+                    &bel.scope,
+                    |candidate, provenance| {
+                        let (headers, clones) =
+                            unroll_bounded_early_exit(candidate, lp, &bel, provenance);
+                        let lanes = Lanes {
+                            blocks: headers.into_iter().map(|header| (header, 1)).collect(),
+                            remainder: Remainder::None,
+                            copies: clones,
+                        };
+                        Some((lanes, ()))
+                    },
+                );
+                if published.is_ok() {
                     changed = true;
+                    def_map_stale = true;
                 }
                 continue;
             }
@@ -295,13 +313,11 @@ impl LoopUnroll {
             // body carries internal if/else control flow (diamond/triangle) but
             // whose single exit test is a pure compile-time-provable IV trip
             // test (ReedSolomon's encode shift-register loop). See
-            // `analyze_diamond_const_trip_loop`. Kill switch:
-            // `TCG_NO_DIAMOND_CONST_TRIP_UNROLL`.
-            if diamond_unroll_enabled()
-                && let Some(dcl) = analyze_diamond_const_trip_loop(func, lp, &def_map)
-            {
+            // `analyze_diamond_const_trip_loop`.
+            if let Some(dcl) = analyze_diamond_const_trip_loop(func, lp, &def_map) {
                 if unroll_diamond_const_trip(func, lp, &dcl, provenance.as_deref_mut()) {
                     changed = true;
+                    def_map_stale = true;
                 }
                 continue;
             }
@@ -317,6 +333,7 @@ impl LoopUnroll {
                     && unroll_loop(func, lp, trip_count as usize, provenance.as_deref_mut())
                 {
                     changed = true;
+                    def_map_stale = true;
                 }
             }
         }
@@ -360,6 +377,13 @@ fn loop_unroll_pass_id() -> PassId {
 // straight-line unroll because every loop-carried value flows through a phi-copy
 // and every other value is recomputed each iteration.
 //
+// The loop exits from its HEADER, so a run of `N` iterations executes the
+// header `N` times and the latch `N - 1` times: the last header execution
+// leaves before the back edge. The straight line is `H L H L ... L H`, with
+// no latch part after the final header part. A latch phi-copy executed after
+// it would hand the exit the NEXT iteration's value of every carried register
+// the exit reads (the header's `x` directly, or as the exit's parameter).
+//
 // SOUNDNESS of the trip count:
 //   * Integer, constant init & bound: simulated exactly with W-bit wraparound.
 //   * Integer, symbolic init & bound sharing a base (e.g. `IntLoc..IntLoc+1`):
@@ -388,8 +412,13 @@ struct CopyCountedLoop {
     in_loop_succ: BlockId,
     /// The exit block (the header successor outside the loop body).
     exit_block: BlockId,
-    /// The instructions (in body order) that will be cloned per extra iteration.
+    /// The instructions cloned per extra iteration: the header part (the
+    /// header minus its trip-test control and branches), then the latch part
+    /// (the latch minus its back-edge branch).
     body_insts: Vec<InstId>,
+    /// `body_insts[..header_part_len]` is the header part. The latch part runs
+    /// only on the back edge, so the final iteration does not run it.
+    header_part_len: usize,
     /// The loop-carried IV `(iv_vreg, init, step)` when init and bound are
     /// ABSOLUTE constants (integer path only). Enables the const-addr unroll.
     const_iv: Option<(VReg, i128, i128)>,
@@ -447,14 +476,24 @@ fn unique_def<'a>(
     Some(func.inst(defs[0]))
 }
 
-/// Express `v` as `base + offset`, walking single-def copy/extend/add chains.
+/// Express `v` as `base + offset` modulo `2^bits`, walking single-def
+/// copy/extend/add chains.
 ///
-/// Transparent ops (copies, truncations via `MovR`, sign/zero extensions) keep
-/// the low bits, so the resulting affine form is exact modulo the comparison
-/// width — which is all the EQ/NE difference reasoning relies on (the shared
-/// base cancels). A vreg whose unique def is not one of these becomes the base
-/// itself (an opaque symbol); a multiply-defined vreg stops the walk as a base.
-fn affine_of(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v: VReg) -> Affine {
+/// A step is walked only when it keeps at least `bits` low bits: a transparent
+/// op ([`transparent_step`]: a copy, a truncating `MovR`, an extension from a
+/// source at least `bits` wide) or an `AddRI`/`SubRI` computed in registers at
+/// least `bits` wide. The resulting affine form is then exact modulo `2^bits`,
+/// the comparison width a trip model evaluates at (a `Sxth` read at 32 bits is
+/// NOT `x`: it replaces bits 16..32). A step keeping fewer bits, a vreg whose
+/// unique def is none of these, or a multiply-defined vreg becomes the base
+/// itself (an opaque symbol). `bits == 0` claims no exactness (a profitability
+/// estimate).
+fn affine_of(
+    func: &MachFunction,
+    def_map: &HashMap<VReg, Vec<InstId>>,
+    v: VReg,
+    bits: u32,
+) -> Affine {
     // Guard against pathological cycles in malformed MIR.
     let mut cur = v;
     let mut offset: i128 = 0;
@@ -498,7 +537,8 @@ fn affine_of(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v: VReg)
                 if let (Some(src), Some(imm)) = (
                     inst.operands.get(1).and_then(|op| op.as_vreg()),
                     inst.operands.get(2).and_then(|op| op.as_imm()),
-                ) {
+                ) && width_of(cur).min(width_of(src)) >= bits
+                {
                     offset += imm as i128;
                     cur = src;
                     continue;
@@ -512,7 +552,8 @@ fn affine_of(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v: VReg)
                 if let (Some(src), Some(imm)) = (
                     inst.operands.get(1).and_then(|op| op.as_vreg()),
                     inst.operands.get(2).and_then(|op| op.as_imm()),
-                ) {
+                ) && width_of(cur).min(width_of(src)) >= bits
+                {
                     offset -= imm as i128;
                     cur = src;
                     continue;
@@ -530,7 +571,9 @@ fn affine_of(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v: VReg)
             | AArch64Opcode::Uxth
             | AArch64Opcode::Sxtb
             | AArch64Opcode::Uxtb => {
-                if let Some(src) = inst.operands.get(1).and_then(|op| op.as_vreg()) {
+                if let Some((src, kept)) = transparent_step(inst)
+                    && kept >= bits
+                {
                     cur = src;
                     continue;
                 }
@@ -553,37 +596,56 @@ fn affine_of(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v: VReg)
     }
 }
 
+/// A value-transparent step `dst = f(src)`: its source and how many LOW bits of
+/// `src` it carries into `dst` unchanged. A `MovR`/`Copy` keeps the narrower of
+/// the two register widths (a copy into a W register truncates, a copy out of
+/// one zero-extends); an extension keeps only its source width (`Sxtb`/`Uxtb` 8, `Sxth`/`Uxth` 16,
+/// `Sxtw`/`Uxtw` 32) and REPLACES every bit above it. An extension is therefore
+/// an identity only modulo `2^source_width`, not at the destination's width.
+fn transparent_step(inst: &MachInst) -> Option<(VReg, u32)> {
+    let src = inst.operands.get(1)?.as_vreg()?;
+    let kept = match inst.opcode {
+        AArch64Opcode::MovR | AArch64Opcode::Copy => {
+            width_of(inst.operands.first()?.as_vreg()?).min(width_of(src))
+        }
+        AArch64Opcode::Sxtb | AArch64Opcode::Uxtb => 8,
+        AArch64Opcode::Sxth | AArch64Opcode::Uxth => 16,
+        AArch64Opcode::Sxtw | AArch64Opcode::Uxtw => 32,
+        _ => return None,
+    };
+    Some((src, kept))
+}
+
+/// [`resolve_through_copies`], also returning the fewest low bits any step of
+/// the walk kept ([`transparent_step`]), `u32::MAX` when `v` resolves to
+/// itself. `v` equals its resolution modulo `2^bits` and in no wider sense.
+fn resolve_through_copies_keeping(
+    func: &MachFunction,
+    def_map: &HashMap<VReg, Vec<InstId>>,
+    v: VReg,
+) -> (VReg, u32) {
+    let mut cur = v;
+    let mut kept = u32::MAX;
+    for _ in 0..64 {
+        let Some((src, bits)) = unique_def(func, def_map, cur).and_then(transparent_step) else {
+            return (cur, kept);
+        };
+        kept = kept.min(bits);
+        cur = src;
+    }
+    (cur, kept)
+}
+
 /// Resolve `v` through single-def transparent copies/extends to the underlying
 /// value-defining vreg (used to find the IV increment behind a narrowing copy).
+/// The two are the same value only modulo the bits the walk kept; a caller that
+/// models the VALUE `v` holds reads [`resolve_through_copies_keeping`].
 fn resolve_through_copies(
     func: &MachFunction,
     def_map: &HashMap<VReg, Vec<InstId>>,
     v: VReg,
 ) -> VReg {
-    let mut cur = v;
-    for _ in 0..64 {
-        let Some(inst) = unique_def(func, def_map, cur) else {
-            return cur;
-        };
-        match inst.opcode {
-            AArch64Opcode::MovR
-            | AArch64Opcode::Copy
-            | AArch64Opcode::Sxtw
-            | AArch64Opcode::Uxtw
-            | AArch64Opcode::Sxth
-            | AArch64Opcode::Uxth
-            | AArch64Opcode::Sxtb
-            | AArch64Opcode::Uxtb => {
-                if let Some(src) = inst.operands.get(1).and_then(|op| op.as_vreg()) {
-                    cur = src;
-                    continue;
-                }
-                return cur;
-            }
-            _ => return cur,
-        }
-    }
-    cur
+    resolve_through_copies_keeping(func, def_map, v).0
 }
 
 /// Decode a condition-code immediate operand into a [`CondCode`].
@@ -781,6 +843,9 @@ fn nearest_flag_setter(func: &MachFunction, insts: &[InstId], pos: usize) -> Opt
         if AArch64Target::writes_flags(inst.opcode) {
             return Some(insts[i]);
         }
+        if may_clobber_nzcv(inst) {
+            return None;
+        }
     }
     None
 }
@@ -881,6 +946,30 @@ fn analyze_copy_counted_loop(
     // The compare feeding the CSet: the nearest flag-setter before it.
     let cset_pos = hinsts.iter().position(|&id| id == cset_id)?;
     let flag_cmp = nearest_flag_setter(func, &hinsts, cset_pos)?;
+
+    // The full unroll deletes this trip test (`flag_cmp`, the CSet, the
+    // branch's `CmpRI cond, #0` and both branches) from every copy, so
+    // nothing else may read what it computes: the loop-state contract's
+    // deletion rule (`crate::loop_contract::DeadWork`) decides that on every
+    // path from each deleted instruction, through the back edge and the exit.
+    // A surviving reader would see a value or flags nothing defines any more
+    // (3b0797875, 20a84bd06: a reader of the trip boolean and of the deleted
+    // compare's flags at the exit).
+    let at = |id: InstId| {
+        hinsts
+            .iter()
+            .position(|&other| other == id)
+            .map(|index| (header, index))
+    };
+    let deleted = [
+        at(flag_cmp)?,
+        at(cset_id)?,
+        at(brif_cmp)?,
+        at(bcond)?,
+        at(b_last)?,
+    ];
+    DeadWork::check(func, &deleted, &[]).ok()?;
+
     let flag_inst = func.inst(flag_cmp);
     let is_fp = flag_inst.opcode == AArch64Opcode::Fcmp;
 
@@ -909,9 +998,13 @@ fn analyze_copy_counted_loop(
         _ => return None,
     };
 
+    // The COMPARE width (operand `a`), not the IV register width: the IV may be
+    // compared at a narrower width via a truncating copy, and the exact
+    // wraparound simulation must model the width the flags see.
+    let cmp_width = width_of(op_a);
     let mut found: Option<IvInc> = None;
     for (cand, is_a) in candidates {
-        if let Some(inc) = try_iv_increment(func, def_map, lp, cand, is_fp) {
+        if let Some(inc) = try_iv_increment(func, def_map, lp, cand, is_fp, cmp_width) {
             if found.is_some() {
                 // Ambiguous: both operands look like an IV — bail.
                 return None;
@@ -935,7 +1028,6 @@ fn analyze_copy_counted_loop(
         };
         return finish_fp(
             func,
-            lp,
             header,
             latch,
             exit_block,
@@ -955,22 +1047,18 @@ fn analyze_copy_counted_loop(
             taken_when_cond_true,
         );
     } else {
-        let init = affine_of(func, def_map, iv.init_src);
+        let init = affine_of(func, def_map, iv.init_src, cmp_width);
         let bound = if let Some(imm) = op_b_imm {
             Affine {
                 base: None,
                 offset: imm as i128,
             }
         } else if iv.is_a {
-            affine_of(func, def_map, op_b_vreg?)
+            affine_of(func, def_map, op_b_vreg?, cmp_width)
         } else {
-            affine_of(func, def_map, op_a)
+            affine_of(func, def_map, op_a, cmp_width)
         };
-        // Use the COMPARE width (operand `a`), not the IV register width: the IV
-        // may be compared at a narrower width via a truncating copy, and the
-        // exact wraparound simulation must model the width the flags see.
-        let w = width_of(op_a);
-        (init, bound, w)
+        (init, bound, cmp_width)
     };
 
     // Normalize the relation onto (X = iv_next, L = bound).
@@ -989,7 +1077,8 @@ fn analyze_copy_counted_loop(
     let trip_count = simulate_trip(init_aff, bound_aff, iv.int_step, exit_rel, width, sim_cap)?;
 
     let control_insts = vec![flag_cmp, cset_id, brif_cmp];
-    let body_insts = collect_copy_body_insts(func, lp, &control_insts, bcond, b_last);
+    let (body_insts, header_part_len) =
+        collect_copy_body_insts(func, header, latch, &control_insts, bcond, b_last);
 
     // Absolute-constant init: expose the IV for the const-addr unroll path.
     let const_iv = (init_aff.base.is_none()).then_some((iv.iv_vreg, init_aff.offset, iv.int_step));
@@ -1003,6 +1092,7 @@ fn analyze_copy_counted_loop(
         in_loop_succ: latch,
         exit_block,
         body_insts,
+        header_part_len,
         const_iv,
         iv_inc,
     })
@@ -1029,14 +1119,27 @@ struct IvInc {
 /// Try to interpret `cand` (a compare operand) as the incremented IV: resolve
 /// copies to `AddRI/SubRI(iv,#k)` (or `FaddRR/FsubRR iv, kconst`) whose source
 /// `iv` is loop-carried via preheader+latch phi-copies.
+///
+/// For an integer IV every trip model built on the result counts the compared
+/// value as `init + m*step` modulo `2^cmp_width` (the compare's width). That
+/// holds only when each register carrying the IV around the loop and into the
+/// compare keeps at least `cmp_width` low bits: the compare operand's
+/// resolution chain, the increment and the IV registers themselves, the latch
+/// phi-copy and its source chain, and the preheader init copy. An `i8`/`i16`
+/// IV lives in a W register whose `AddRI` does not wrap at 8/16 bits, and the
+/// `Sxtb`/`Sxth` feeding a 32-bit compare replaces bits 8/16..32, so the
+/// compared value is `sext(init + m)`, not `init + m`: such a chain keeps 8/16
+/// bits and is refused here. The init and bound values themselves are the
+/// caller's ([`affine_of`] at the same width).
 fn try_iv_increment(
     func: &MachFunction,
     def_map: &HashMap<VReg, Vec<InstId>>,
     lp: &NaturalLoop,
     cand: VReg,
     is_fp: bool,
+    cmp_width: u32,
 ) -> Option<IvInc> {
-    let resolved = resolve_through_copies(func, def_map, cand);
+    let (resolved, cand_kept) = resolve_through_copies_keeping(func, def_map, cand);
     let inc_defs = def_map.get(&resolved)?;
     if inc_defs.len() != 1 {
         return None;
@@ -1094,7 +1197,8 @@ fn try_iv_increment(
         return None;
     }
     let latch_src = latch_inst.operands.get(1)?.as_vreg()?;
-    if resolve_through_copies(func, def_map, latch_src) != resolved {
+    let (latch_resolved, latch_kept) = resolve_through_copies_keeping(func, def_map, latch_src);
+    if latch_resolved != resolved {
         return None;
     }
     // Preheader def source is the init value.
@@ -1105,6 +1209,23 @@ fn try_iv_increment(
         // init materialized directly into the IV register (e.g. Movz iv, #c).
         iv
     };
+    if !is_fp {
+        // Exactness modulo `2^cmp_width` (see the doc comment). A latch or
+        // preheader move outside `transparent_step` (e.g. `MOVWrr`) keeps an
+        // unmodeled width and is refused.
+        let move_keeps = |inst: &MachInst| {
+            !inst.opcode.is_move() || transparent_step(inst).is_some_and(|(_, k)| k >= cmp_width)
+        };
+        if cand_kept < cmp_width
+            || latch_kept < cmp_width
+            || width_of(resolved) < cmp_width
+            || width_of(iv) < cmp_width
+            || !move_keeps(latch_inst)
+            || !move_keeps(ph_inst)
+        {
+            return None;
+        }
+    }
 
     Some(IvInc {
         init_src,
@@ -1154,8 +1275,7 @@ fn fp_int_const(
 #[allow(clippy::too_many_arguments)]
 fn finish_fp(
     func: &MachFunction,
-    lp: &NaturalLoop,
-    _header: BlockId,
+    header: BlockId,
     latch: BlockId,
     exit_block: BlockId,
     _hinsts: &[InstId],
@@ -1202,7 +1322,8 @@ fn finish_fp(
         HOT_MAX_TRIP_COUNT + 1,
     )?;
     let control_insts = vec![flag_cmp, cset_id, brif_cmp];
-    let body_insts = collect_copy_body_insts(func, lp, &control_insts, bcond, b_last);
+    let (body_insts, header_part_len) =
+        collect_copy_body_insts(func, header, latch, &control_insts, bcond, b_last);
     Some(CopyCountedLoop {
         trip_count,
         control_insts,
@@ -1211,38 +1332,38 @@ fn finish_fp(
         in_loop_succ: latch,
         exit_block,
         body_insts,
+        header_part_len,
         const_iv: None,
         iv_inc: None,
     })
 }
 
-/// The body instructions to replicate per extra iteration: everything in the
-/// loop body blocks except the branch terminators and the identified control
-/// instructions. No renaming is performed on clone (see module note).
+/// The body instructions to replicate per extra iteration, in execution
+/// order: the header's, then the latch's, each without the branch terminators
+/// and the identified control instructions. Returns them with the header
+/// part's length. No renaming is performed on clone (see module note).
 fn collect_copy_body_insts(
     func: &MachFunction,
-    lp: &NaturalLoop,
+    header: BlockId,
+    latch: BlockId,
     control_insts: &[InstId],
     bcond: InstId,
     header_uncond_b: InstId,
-) -> Vec<InstId> {
-    let mut out = Vec::new();
-    for &block_id in &func.block_order {
-        if !lp.body.contains(&block_id) {
-            continue;
-        }
-        for &inst_id in &func.block(block_id).insts {
-            if inst_id == bcond || inst_id == header_uncond_b || control_insts.contains(&inst_id) {
-                continue;
-            }
+) -> (Vec<InstId>, usize) {
+    let cloned_part = |block: BlockId| {
+        func.block(block).insts.iter().copied().filter(|&inst_id| {
             let inst = func.inst(inst_id);
-            if inst.flags.is_branch() || inst.flags.is_terminator() {
-                continue;
-            }
-            out.push(inst_id);
-        }
-    }
-    out
+            inst_id != bcond
+                && inst_id != header_uncond_b
+                && !control_insts.contains(&inst_id)
+                && !inst.flags.is_branch()
+                && !inst.flags.is_terminator()
+        })
+    };
+    let mut out: Vec<InstId> = cloned_part(header).collect();
+    let header_part_len = out.len();
+    out.extend(cloned_part(latch));
+    (out, header_part_len)
 }
 
 // ===========================================================================
@@ -1356,6 +1477,11 @@ fn plan_const_addr_unroll(
     let (iv_vreg, init, step) = cl.const_iv?;
     let (inc_inst, inc_dst) = cl.iv_inc?;
     let trip = cl.trip_count as i128;
+    // Iteration 0's `Madd`s are rewritten in place; a single-iteration unroll
+    // removes the latch part, which may hold one.
+    if trip < 2 {
+        return None;
+    }
 
     // Every materialized IV value (`init + m*step` for m in 0..=trip) must be
     // an exact small non-negative constant: no register-width wraparound, and
@@ -1529,10 +1655,12 @@ fn vreg_used_outside_loop(func: &MachFunction, lp: &NaturalLoop, v: VReg) -> boo
 /// (no renaming). See the module note for the soundness argument.
 ///
 /// The clones are appended directly into the latch block (before its
-/// terminator) rather than into fresh blocks: iteration 0's body lives in the
-/// header, its phi-copies plus iterations `1..trip_count` live in the latch,
-/// and the latch then falls through to the exit. This creates NO new blocks,
-/// keeping the CFG a clean header->latch->exit chain.
+/// terminator) rather than into fresh blocks: iteration 0's header part lives
+/// in the header, its latch part plus iterations `1..trip_count` live in the
+/// latch, and the latch then falls through to the exit. The final iteration
+/// contributes only its header part: the source exits from the header before
+/// that iteration's back-edge copies (see the module note). This creates NO
+/// new blocks, keeping the CFG a clean header->latch->exit chain.
 ///
 /// With `const_addr` set (the const-addr unroll), each cloned iteration
 /// additionally rewrites the planned `Madd` address computations into fresh
@@ -1559,14 +1687,38 @@ fn unroll_copy_based(
     let latch_term_loc = func.inst(latch_term_id).source_loc;
     func.block_mut(latch).insts.pop();
 
-    // Append (trip_count - 1) verbatim clones of the loop body into the latch,
-    // after iteration 0's phi-copies (which already sit at the latch head).
+    let (header_part, latch_part) = cl.body_insts.split_at(cl.header_part_len);
+    // A single iteration never takes the back edge: iteration 0's latch part,
+    // the latch's own instructions, does not run.
+    if trip_count == 1 {
+        func.block_mut(latch)
+            .insts
+            .retain(|iid| !latch_part.contains(iid));
+        if let Some(provenance) = provenance.as_deref_mut() {
+            for &iid in latch_part {
+                provenance.record_deletion(
+                    iid,
+                    loop_unroll_pass_id(),
+                    "loop-unroll removed the back-edge copies of a single-iteration loop",
+                );
+            }
+        }
+    }
+
+    // Append iterations `1..trip_count` into the latch, after iteration 0's
+    // latch part (which already sits at the latch head): each iteration's
+    // header part, and its latch part unless it is the final iteration.
     // With a const-addr plan, iteration `iter`'s clone rewrites the planned
     // `Madd`s into fresh constant-offset `AddRI`s (renaming their dst uses
     // within the clone) and the IV increment into its exact constant.
     for iter in 1..trip_count {
-        let mut rename: HashMap<VReg, VReg> = HashMap::new();
-        for &iid in &cl.body_insts {
+        let mut rename: HashMap<VReg, VReg> = HashMap::default();
+        let cloned: &[InstId] = if iter + 1 < trip_count {
+            &cl.body_insts
+        } else {
+            header_part
+        };
+        for &iid in cloned {
             let (opcode, operands, source_loc) = {
                 let inst = func.inst(iid);
                 (inst.opcode, inst.operands.clone(), inst.source_loc)
@@ -1578,8 +1730,8 @@ fn unroll_copy_based(
                     movz_inst(plan.inc_dst, value, source_loc)
                 } else if let Some(mr) = plan.madds.iter().find(|mr| mr.inst_id == iid) {
                     let offset = (plan.init + iter as i128 * plan.step) * mr.k;
-                    let fresh = VReg::new(func.next_vreg, mr.dst.class);
-                    func.next_vreg += 1;
+                    // The counter allocator, never a hand-built ID (L10-P5).
+                    let fresh = VReg::new(func.alloc_vreg(), mr.dst.class);
                     rename.insert(mr.dst, fresh);
                     let mut addri = MachInst::new(
                         AArch64Opcode::AddRI,
@@ -1756,6 +1908,10 @@ struct BoundedEarlyExitLoop {
     b_term: InstId,
     /// All loop body blocks, in `block_order`.
     body_blocks: Vec<BlockId>,
+    /// The loop-state contract's deletion rule admitted dropping the trip
+    /// test, and the loop its iteration-coverage clause checks the copies
+    /// against.
+    scope: CoveredLoop<BlockId>,
 }
 
 /// Recognize the bounded early-exit trial loop and prove a constant trip count.
@@ -1765,7 +1921,13 @@ fn analyze_bounded_early_exit_loop(
     lp: &NaturalLoop,
     def_map: &HashMap<VReg, Vec<InstId>>,
 ) -> Option<BoundedEarlyExitLoop> {
-    let dbg = std::env::var("TCG_BEE_DEBUG").as_deref() == Ok("1");
+    // Cached: a PURE diagnostic (it selects only whether the decline trace
+    // prints), read once per innermost loop per pass run.
+    let dbg = {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("TCG_BEE_DEBUG").as_deref() == Ok("1"))
+    };
     macro_rules! gate {
         ($n:expr, $why:expr) => {{
             if dbg {
@@ -1836,6 +1998,21 @@ fn analyze_bounded_early_exit_loop(
             gate!(1, format!("second back-edge into the header from B{}", p.0));
         }
     }
+    // ---- EDGES THE CLONES CAN REPRODUCE ----------------------------------
+    // Each iteration's copy is `clone_inst_remap` (rewrites `Block` operands
+    // only) wired by `wire_out_edges` (edges from those operands only). A
+    // jump-table dispatch keeps indexing the shared `func.jump_tables` entry,
+    // whose targets are iteration 1's blocks, so every later copy would
+    // dispatch back into iteration 1 and never reach its own exit test; a
+    // fall-through edge would be dropped. Refuse any body block whose
+    // out-edges are not exactly its `Block` operands.
+    if !body_clone_reproduces_out_edges(func, &lp.body) {
+        gate!(
+            1,
+            "a body block has an out-edge its clone cannot reproduce \
+             (jump table or unnamed edge)"
+        );
+    }
 
     // ---- The exit-test block `T` and the exit block `X` ---------------------
     // `T` is derived from the LATCH (not from the exit-edge set): the latch is
@@ -1891,9 +2068,6 @@ fn analyze_bounded_early_exit_loop(
     // whose SOURCE is the latch would silently lose its path on the last
     // iteration. (`lsuccs == [header]` above already implies this; the explicit
     // check is the pin.)
-    //
-    // Kill switch `TCG_NO_BEE_MULTI_EXIT=1` restores the historical
-    // exactly-one-exit-edge gate (byte-identical output).
     let mut all_exits: Vec<(BlockId, BlockId)> = Vec::new();
     for &b in &lp.body {
         for &s in &func.block(b).succs {
@@ -1906,19 +2080,6 @@ fn analyze_bounded_early_exit_loop(
     all_exits.dedup();
     if !all_exits.contains(&(t, x)) {
         gate!(2, "the trip-test exit edge is missing from the exit set");
-    }
-    if !bee_multi_exit_enabled() && all_exits.len() != 1 {
-        gate!(
-            2,
-            format!(
-                "{} exit edges (multi-exit disabled) {:?}",
-                all_exits.len(),
-                all_exits
-                    .iter()
-                    .map(|(a, b)| (a.0, b.0))
-                    .collect::<Vec<_>>()
-            )
-        );
     }
     for &(s, d) in &all_exits {
         if s == latch {
@@ -2080,6 +2241,45 @@ fn analyze_bounded_early_exit_loop(
         );
     }
 
+    // ---- The unroll deletes the trip test (`trip_cmp`, the trip `CSet` and
+    //      the `AndRR`) from every copy, and the last copy, which always
+    //      exits, also drops the branch compare `CmpRI vcond, #0` and its
+    //      `BCond`. Every other copy re-points the branch compare from `vcond`
+    //      to `dyn_cond` (equal whenever the trip test is true; `dyn_cond` is a
+    //      0/1 boolean, gate 12). The loop-state contract's deletion rule
+    //      (`crate::loop_contract::DeadWork`) decides that nothing reads what
+    //      the deleted instructions computed, on every path from each of them:
+    //      before it a private scan here missed a reader of the trip boolean
+    //      on an exit edge and a reader of the dropped branch compare's flags
+    //      at the exit (`e6dbb93df`).
+    let at = |id: InstId| {
+        tinsts
+            .iter()
+            .position(|&other| other == id)
+            .map(|index| (t, index))
+    };
+    let (cmp_at, cset_at, and_at, vcmp_at, bcond_at) = (
+        at(trip.cmp_id)?,
+        at(trip.cset_id)?,
+        at(andrr)?,
+        at(vcond_cmp)?,
+        at(bcond)?,
+    );
+    let every_copy = DeadWork::check(
+        func,
+        &[cmp_at, cset_at, and_at],
+        &[(vcmp_at, StateReg::Virtual(vcond))],
+    );
+    let last_copy = DeadWork::check(func, &[cmp_at, cset_at, and_at, vcmp_at, bcond_at], &[]);
+    let (Ok(work), Ok(_)) = (every_copy, last_copy) else {
+        gate!(15, "the unroll would strand a reader of the trip test");
+    };
+    let Some(scope) =
+        CoveredLoop::unrolled(&work, lp.body.iter().copied(), header, _preheader, (t, x))
+    else {
+        gate!(15, "the loop's scope is malformed");
+    };
+
     Some(BoundedEarlyExitLoop {
         trip_count: m as u64,
         iv_next: trip.iv_next,
@@ -2096,6 +2296,7 @@ fn analyze_bounded_early_exit_loop(
         bcond,
         b_term,
         body_blocks,
+        scope,
     })
 }
 
@@ -2123,9 +2324,6 @@ fn analyze_bounded_early_exit_loop(
 /// Termination: `seen` blocks re-entry, so a cyclic copy web is rejected (it is
 /// visited once, then its second visit returns `false`). A vreg with NO
 /// definition (a function argument, or a physreg-defined value) is NOT boolean.
-///
-/// Kill switch `TCG_NO_BEE_BOOL_PHI` (any value) restores the historical
-/// CSet-only test, which is the `seen`-free special case.
 fn vreg_is_boolean(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v: VReg) -> bool {
     /// `memo[v]`: `Some(r)` = settled, `None` = in progress on the current DFS
     /// path (a copy cycle) which settles to `false` — fail closed.
@@ -2134,7 +2332,6 @@ fn vreg_is_boolean(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v:
         def_map: &HashMap<VReg, Vec<InstId>>,
         v: VReg,
         memo: &mut HashMap<VReg, Option<bool>>,
-        copies: bool,
     ) -> bool {
         match memo.get(&v) {
             Some(Some(r)) => return *r,
@@ -2149,8 +2346,8 @@ fn vreg_is_boolean(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v:
                     AArch64Opcode::CSet => true,
                     // `MovR dst, src` (a block-argument / phi copy): boolean iff
                     // `src` is.
-                    AArch64Opcode::MovR if copies => match inst.operands.get(1) {
-                        Some(MachOperand::VReg(src)) => go(func, def_map, *src, memo, copies),
+                    AArch64Opcode::MovR => match inst.operands.get(1) {
+                        Some(MachOperand::VReg(src)) => go(func, def_map, *src, memo),
                         _ => false,
                     },
                     _ => matches!(
@@ -2166,9 +2363,8 @@ fn vreg_is_boolean(func: &MachFunction, def_map: &HashMap<VReg, Vec<InstId>>, v:
         memo.insert(v, Some(r));
         r
     }
-    let copies = std::env::var_os("TCG_NO_BEE_BOOL_PHI").is_none();
-    let mut memo = HashMap::new();
-    go(func, def_map, v, &mut memo, copies)
+    let mut memo = HashMap::default();
+    go(func, def_map, v, &mut memo)
 }
 
 /// A matched trip-limit CSet: `CSet cset, NE` fed by `CmpRI iv_next, #K`, where
@@ -2231,9 +2427,14 @@ fn match_trip_cset(
     {
         return None;
     }
-    // Validate loop-carried threading and recover the constant init & step.
-    let iv = try_iv_increment(func, def_map, lp, iv_next, false)?;
-    let init_aff = affine_of(func, def_map, iv.init_src);
+    // Validate loop-carried threading and recover the constant init & step,
+    // exact at the width `CmpRI z, #K` compares (`z`'s chain to `iv_next`
+    // included).
+    let iv = try_iv_increment(func, def_map, lp, z, false, width_of(z))?;
+    if iv.inc_dst != iv_next {
+        return None;
+    }
+    let init_aff = affine_of(func, def_map, iv.init_src, width_of(z));
     if init_aff.base.is_some() {
         return None; // symbolic init: cannot materialize a constant IV
     }
@@ -2274,7 +2475,7 @@ fn renamable_body_vregs(func: &MachFunction, body: &[BlockId], iv_next: VReg) ->
     let body_set: HashSet<BlockId> = body.iter().copied().collect();
 
     // Def sites of each vreg inside the body: (block, position-within-block).
-    let mut defs: HashMap<VReg, Vec<(BlockId, usize)>> = HashMap::new();
+    let mut defs: HashMap<VReg, Vec<(BlockId, usize)>> = HashMap::default();
     for &b in body {
         for (pos, &iid) in func.block(b).insts.iter().enumerate() {
             let inst = func.inst(iid);
@@ -2304,7 +2505,7 @@ fn renamable_body_vregs(func: &MachFunction, body: &[BlockId], iv_next: VReg) ->
 
     // A vreg is unsafe if ANY of its uses (whole function) is out-of-body or is
     // not dominated by an in-body def.
-    let mut unsafe_vregs: HashSet<VReg> = HashSet::new();
+    let mut unsafe_vregs: HashSet<VReg> = HashSet::default();
     for &b in &func.block_order {
         let in_body = body_set.contains(&b);
         for (pos, &iid) in func.block(b).insts.iter().enumerate() {
@@ -2332,12 +2533,16 @@ fn renamable_body_vregs(func: &MachFunction, body: &[BlockId], iv_next: VReg) ->
 /// Fully unroll a recognized bounded early-exit loop, retaining the dynamic
 /// early exit and materializing the per-iteration constant IV. See the section
 /// note for the soundness argument.
+/// Returns the header of every copy, in iteration order: each runs one
+/// iteration (the coverage clause counts them); and every block cloned for
+/// iterations 2.. with the loop block it clones, `(clone, original)`, so the
+/// coverage clause reads a clone's retained early exit as the original's.
 fn unroll_bounded_early_exit(
     func: &mut MachFunction,
     lp: &NaturalLoop,
     bel: &BoundedEarlyExitLoop,
     mut provenance: Option<&mut ProvenanceMap>,
-) -> bool {
+) -> (Vec<BlockId>, Vec<(BlockId, BlockId)>) {
     let header = lp.header;
     let latch = lp.latch;
     let t = bel.test_block;
@@ -2348,11 +2553,7 @@ fn unroll_bounded_early_exit(
     // Vregs safe to rename to fresh per-clone ids (see `renamable_body_vregs`).
     // Computed on the ORIGINAL (pre-mutation) function so dominance is exact.
     // Empty when the kill switch is set -> byte-identical to the old clone.
-    let renamable: Vec<VReg> = if bee_unroll_rename_enabled() {
-        renamable_body_vregs(func, &body, bel.iv_next)
-    } else {
-        Vec::new()
-    };
+    let renamable: Vec<VReg> = renamable_body_vregs(func, &body, bel.iv_next);
 
     // `T`'s kept (verbatim) instructions: everything except the trip-limit
     // control and both branch terminators (the terminator is rebuilt per copy).
@@ -2384,7 +2585,7 @@ fn unroll_bounded_early_exit(
     let mut maps: Vec<HashMap<BlockId, BlockId>> = Vec::new();
     for k in 2..=m {
         let is_last = k == m;
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         for &bo in &body {
             if is_last && bo == latch {
                 continue;
@@ -2529,8 +2730,13 @@ fn unroll_bounded_early_exit(
     // shifted-add that otherwise spike register pressure across the unrolled
     // body.
     let consts = collect_single_def_movz_consts(func);
+    let loop_blocks: HashSet<BlockId> = body
+        .iter()
+        .copied()
+        .chain(maps.iter().flat_map(|map| map.values().copied()))
+        .collect();
     let iv1 = bel.iv_init + bel.iv_step;
-    fold_const_index_addresses(func, &body, bel.iv_next, iv1, &consts);
+    fold_const_index_addresses(func, &body, &loop_blocks, bel.iv_next, iv1, &consts);
     for k in 2..=m {
         let iv_k = bel.iv_init + (k as i128) * bel.iv_step;
         let blocks: Vec<BlockId> = {
@@ -2538,10 +2744,15 @@ fn unroll_bounded_early_exit(
             v.sort_unstable();
             v
         };
-        fold_const_index_addresses(func, &blocks, bel.iv_next, iv_k, &consts);
+        fold_const_index_addresses(func, &blocks, &loop_blocks, bel.iv_next, iv_k, &consts);
     }
 
-    true
+    let mut clones: Vec<(BlockId, BlockId)> = maps
+        .iter()
+        .flat_map(|map| map.iter().map(|(&original, &clone)| (clone, original)))
+        .collect();
+    clones.sort_unstable();
+    ((1..=m).map(header_of).collect(), clones)
 }
 
 // ===========================================================================
@@ -2596,7 +2807,10 @@ fn unroll_bounded_early_exit(
 // vregs proven clone-local, (b) the IV increment -> its exact constant, (c)
 // dropping branch control whose outcome is proven per-clone, (d) address
 // folds substituting exact IV constants. Anything unproven fails closed (no
-// unroll). Kill switch: `TCG_NO_DIAMOND_CONST_TRIP_UNROLL`.
+// unroll). The source leaves the loop from `T` straight to `X`, so the latch
+// runs once per taken back edge: `M - 1` times. The last clone's latch
+// therefore keeps only its branch to `X`; its phi-copies would hand `X` the
+// next iteration's value of every carried register it reads.
 // ===========================================================================
 
 /// The BOUNDED-trip variant of the diamond unroll: the trip count is not a
@@ -3064,39 +3278,6 @@ fn dominating_bounds(
     (lo, hi)
 }
 
-/// The body blocks minus the back edge form a DAG whose DFS from `header`
-/// visits every body block (no inner cycle — each body block executes at most
-/// once per iteration).
-fn body_is_acyclic_dag(func: &MachFunction, lp: &NaturalLoop) -> bool {
-    let header = lp.header;
-    let mut state: HashMap<BlockId, u8> = HashMap::new(); // 1 = on stack, 2 = done
-    let mut stack: Vec<(BlockId, usize)> = vec![(header, 0)];
-    state.insert(header, 1);
-    while let Some(&(b, idx)) = stack.last() {
-        let succs = &func.block(b).succs;
-        if idx < succs.len() {
-            stack.last_mut().expect("nonempty").1 += 1;
-            let s = succs[idx];
-            // Skip the back edge and loop-exit edges.
-            if s == header || !lp.body.contains(&s) {
-                continue;
-            }
-            match state.get(&s) {
-                Some(1) => return false, // cycle inside the body
-                Some(_) => {}
-                None => {
-                    state.insert(s, 1);
-                    stack.push((s, 0));
-                }
-            }
-        } else {
-            state.insert(b, 2);
-            stack.pop();
-        }
-    }
-    lp.body.iter().all(|b| state.contains_key(b))
-}
-
 /// Recognize the diamond-body constant-trip loop and prove its trip count.
 /// Fails closed on anything it cannot prove exactly.
 fn analyze_diamond_const_trip_loop(
@@ -3159,6 +3340,15 @@ fn analyze_diamond_const_trip_loop(
     // block (each block executes at most once per iteration, and every
     // completed iteration funnels through `T` -> latch).
     if !body_is_acyclic_dag(func, lp) {
+        return None;
+    }
+
+    // Each iteration's copy is `clone_inst_remap` wired by `wire_out_edges`:
+    // only `Block`-operand edges survive the copy. A jump-table dispatch would
+    // keep landing in iteration 1's case blocks (its table is shared), and a
+    // fall-through edge would be dropped, so every body block's out-edges must
+    // be exactly its `Block` operands.
+    if !body_clone_reproduces_out_edges(func, &lp.body) {
         return None;
     }
 
@@ -3237,23 +3427,22 @@ fn analyze_diamond_const_trip_loop(
     }
     let vcond = vcmp_inst.operands.first()?.as_vreg()?;
 
-    // CSet vcond, cc — and `vcond` must have NO other use anywhere (the whole
-    // tail is dropped; a surviving reader would see a dead value).
+    // CSet vcond, cc.
     let cset_inst = func.inst(cset);
     if cset_inst.opcode != AArch64Opcode::CSet || cset_inst.operands.first()?.as_vreg()? != vcond {
         return None;
     }
     let cc_set = cc_from_operand(cset_inst.operands.get(1)?)?;
-    for &blk in &func.block_order {
-        for &iid in &func.block(blk).insts {
-            if iid == vcond_cmp {
-                continue;
-            }
-            if inst_uses_vreg(func.inst(iid), vcond) {
-                return None;
-            }
-        }
-    }
+    // The whole tail is dropped from every clone (a bounded clone tests a
+    // compare of its own), so nothing else may read what it computes: the
+    // trip boolean, or the flags of either compare, on any path from them,
+    // through the back edge and the exit. The loop-state contract's deletion
+    // rule (`crate::loop_contract::DeadWork`) decides it. Before it a scan for
+    // other readers of `vcond` alone left the flags out: an exit that read
+    // them saw the flags of an earlier compare in the last clone.
+    let tail = tinsts.len() - 5;
+    let deleted: Vec<(BlockId, usize)> = (tail..tinsts.len()).map(|index| (t, index)).collect();
+    DeadWork::check(func, &deleted, &[]).ok()?;
 
     // The flag-setting compare feeding the CSet: integer CmpRR/CmpRI only.
     let flag_inst = func.inst(flag_cmp);
@@ -3281,7 +3470,8 @@ fn analyze_diamond_const_trip_loop(
     };
     let mut found: Option<(IvInc, bool, VReg)> = None; // (inc, pre_inc, cand)
     for (cand, is_a) in candidates {
-        let m = if let Some(inc) = try_iv_increment(func, def_map, lp, cand, false) {
+        let m = if let Some(inc) = try_iv_increment(func, def_map, lp, cand, false, width_of(op_a))
+        {
             Some((IvInc { is_a, ..inc }, false, cand))
         } else {
             try_pre_increment_iv(func, def_map, lp, cand)
@@ -3418,9 +3608,6 @@ fn analyze_diamond_const_trip_loop(
             (tc, None)
         }
         None => {
-            if !diamond_bounded_trip_enabled() {
-                return None;
-            }
             let bv = bound_vreg?;
             // Only the ASCENDING signed form (`while x < K` / `x <= K`): the
             // "no (M+1)-th iteration" proof reads an UPPER bound on the limit,
@@ -3539,8 +3726,9 @@ fn analyze_diamond_const_trip_loop(
             ) else {
                 continue;
             };
-            let aff_a = affine_of(func, def_map, a);
-            let aff_b = affine_of(func, def_map, bb);
+            // Profitability only: no exactness claimed.
+            let aff_a = affine_of(func, def_map, a, 0);
+            let aff_b = affine_of(func, def_map, bb, 0);
             let mult = if aff_a.base == Some(iv.iv_vreg) && aff_b.base.is_none() {
                 aff_b.offset
             } else if aff_b.base == Some(iv.iv_vreg) && aff_a.base.is_none() {
@@ -3618,10 +3806,11 @@ fn unroll_diamond_const_trip(
     };
 
     // ---- Pre-create clone blocks for iterations 2..=m (every body block,
-    //      including the latch: its phi-copies keep live-out values exact). ----
+    //      including the latch, which is empty but for its branch in the
+    //      last iteration). ----
     let mut maps: Vec<HashMap<BlockId, BlockId>> = Vec::new();
     for _k in 2..=m {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         for &bo in &body {
             let nb = func.create_block();
             map.insert(bo, nb);
@@ -3704,7 +3893,13 @@ fn unroll_diamond_const_trip(
             let kept: Vec<InstId> = if bo == t {
                 t_kept.clone()
             } else if bo == latch {
-                latch_body.clone()
+                // The last iteration leaves through `T -> X` in the source:
+                // its back-edge copies never run.
+                if is_last {
+                    Vec::new()
+                } else {
+                    latch_body.clone()
+                }
             } else {
                 func.block(bo).insts.clone()
             };
@@ -3985,7 +4180,7 @@ fn fold_iv_affine_addresses(
 /// scale/const materializations). Multiply-defined vregs (e.g. the per-iteration
 /// IV) are excluded — their value is not globally determined.
 fn collect_single_def_movz_consts(func: &MachFunction) -> HashMap<VReg, i64> {
-    let mut def_count: HashMap<VReg, u32> = HashMap::new();
+    let mut def_count: HashMap<VReg, u32> = HashMap::default();
     for &blk in &func.block_order {
         for &iid in &func.block(blk).insts {
             let inst = func.inst(iid);
@@ -3994,7 +4189,7 @@ fn collect_single_def_movz_consts(func: &MachFunction) -> HashMap<VReg, i64> {
             });
         }
     }
-    let mut out: HashMap<VReg, i64> = HashMap::new();
+    let mut out: HashMap<VReg, i64> = HashMap::default();
     for &blk in &func.block_order {
         for &iid in &func.block(blk).insts {
             let inst = func.inst(iid);
@@ -4024,9 +4219,11 @@ fn gpr_access_size(op: &MachOperand) -> Option<u8> {
 /// Within one unrolled iteration's `blocks` (where `iv_next` holds the constant
 /// `iv_val`), fold constant-index `Madd` addresses into the offsets of the
 /// `LdrRI`/`StrRI` that use them, deleting the `Madd` when all its users fold.
+/// `loop_blocks` are every block of the unrolled loop, its copies included.
 fn fold_const_index_addresses(
     func: &mut MachFunction,
     blocks: &[BlockId],
+    loop_blocks: &HashSet<BlockId>,
     iv_next: VReg,
     iv_val: i128,
     consts: &HashMap<VReg, i64>,
@@ -4059,10 +4256,15 @@ fn fold_const_index_addresses(
                 None
             };
             // `base` must be a genuine pointer register, not the IV or another
-            // materialized constant (else `[base, #off]` would be nonsense).
+            // materialized constant (else `[base, #off]` would be nonsense),
+            // and one the unrolled loop does not define: a reader re-pointed
+            // to `[base, #off]` gets the `Madd`'s address only while `base`
+            // holds what the `Madd` read, and a definition in the loop can
+            // run between them.
             if let Some(off) = off
                 && base != iv_next
                 && !consts.contains_key(&base)
+                && !defined_in_blocks(func, loop_blocks, base)
             {
                 candidates.push((iid, dst, base, off));
             }
@@ -4070,45 +4272,67 @@ fn fold_const_index_addresses(
     }
 
     for (madd, dst, base, off) in candidates {
-        // Every use of `dst` in this iteration must be the base operand of a
-        // `LdrRI`/`StrRI` with an encodable resulting offset; otherwise we can
-        // neither rewrite it nor drop the `Madd`.
+        // Re-pointing a load or store from `dst` to `[base, #off]` gives it
+        // THIS iteration's address, so it must read this `Madd`'s value: every
+        // operand anywhere in the function that names `dst`, other than the
+        // `Madd`'s own, must be the base of a `LdrRI`/`StrRI` in this
+        // iteration's `blocks` with an encodable resulting offset. The `Madd`
+        // is then the only definition of `dst` and each reader is in its
+        // iteration. When the loop carries `dst` (an address computed for the
+        // next iteration and loaded through first), every iteration names it
+        // and the fold is refused; the loop-state contract's deletion rule
+        // alone walks forward from the `Madd`, never sees a reader ahead of
+        // it, and admitted the last iteration's fold (`95660b90e`). The rule
+        // (`crate::loop_contract::DeadWork`) still decides the deletion: no
+        // other reader of the `Madd`'s value on any path from it. A `dst` read
+        // after the loop is kept under one name in every iteration
+        // (`renamable_body_vregs`) and the exit reads the copy of the
+        // iteration that left, so its `Madd`s must all survive (`e6dbb93df`).
         let mut rewrites: Vec<(InstId, i64)> = Vec::new();
+        let mut positions: Vec<((BlockId, usize), StateReg)> = Vec::new();
+        let mut madd_at: Option<(BlockId, usize)> = None;
         let mut foldable = true;
-        'scan: for &blk in blocks {
-            for &iid in &func.block(blk).insts {
+        'scan: for &blk in &func.block_order {
+            let in_blocks = block_set.contains(&blk);
+            for (index, &iid) in func.block(blk).insts.iter().enumerate() {
                 if iid == madd {
+                    madd_at = Some((blk, index));
                     continue;
                 }
                 let inst = func.inst(iid);
                 for (oi, op) in inst.operands.iter().enumerate() {
-                    if op.as_vreg() != Some(dst) {
+                    if op.as_vreg().map(|v| v.id) != Some(dst.id) {
                         continue;
                     }
-                    if !matches!(inst.opcode, AArch64Opcode::LdrRI | AArch64Opcode::StrRI)
-                        || oi != 1
-                    {
-                        foldable = false;
-                        break 'scan;
-                    }
-                    let Some(asize) = inst.operands.first().and_then(gpr_access_size) else {
-                        foldable = false;
-                        break 'scan;
-                    };
+                    let rewritable = in_blocks
+                        && oi == 1
+                        && matches!(inst.opcode, AArch64Opcode::LdrRI | AArch64Opcode::StrRI);
                     let existing = inst.operands.get(2).and_then(|o| o.as_imm()).unwrap_or(0);
                     let newoff = off + existing as i128;
-                    if newoff < 0
-                        || newoff > i64::MAX as i128
-                        || !is_encodable_offset(newoff as i64, asize)
-                    {
-                        foldable = false;
-                        break 'scan;
+                    match inst.operands.first().and_then(gpr_access_size) {
+                        Some(asize)
+                            if rewritable
+                                && (0..=i64::MAX as i128).contains(&newoff)
+                                && is_encodable_offset(newoff as i64, asize) =>
+                        {
+                            rewrites.push((iid, newoff as i64));
+                            positions.push(((blk, index), StateReg::Virtual(dst)));
+                        }
+                        _ => {
+                            foldable = false;
+                            break 'scan;
+                        }
                     }
-                    rewrites.push((iid, newoff as i64));
                 }
             }
         }
-        if !foldable || rewrites.is_empty() {
+        let Some(madd_at) = madd_at else {
+            continue;
+        };
+        if !foldable
+            || rewrites.is_empty()
+            || DeadWork::check(&*func, &[madd_at], &positions).is_err()
+        {
             continue;
         }
         for (iid, newoff) in rewrites {
@@ -4121,6 +4345,34 @@ fn fold_const_index_addresses(
             func.block_mut(blk).insts.retain(|&id| id != madd);
         }
     }
+}
+
+/// Whether an instruction in one of `blocks` may clobber `vreg`'s storage.
+/// W/X views share a numeric ID even when their operand classes differ. For
+/// a GPR base, the canonical SIMD banks and named system registers are
+/// disjoint; an unresolved physical GPR or unknown definition keeps the
+/// address computation. No physical-register number is a virtual ID.
+fn defined_in_blocks(func: &MachFunction, blocks: &HashSet<BlockId>, vreg: VReg) -> bool {
+    let gpr_base = matches!(
+        vreg.class,
+        trust_cg_ir::RegClass::Gpr32 | trust_cg_ir::RegClass::Gpr64
+    );
+    blocks.iter().any(|&blk| {
+        func.block(blk).insts.iter().any(|&iid| {
+            let inst = func.inst(iid);
+            inst_clobbers_vreg_id(inst, vreg.id)
+                || inst.implicit_defs.iter().any(|&defined| {
+                    !gpr_base
+                        || (!defined.is_fpr()
+                            && !matches!(
+                                defined,
+                                trust_cg_ir::regs::NZCV
+                                    | trust_cg_ir::regs::FPCR
+                                    | trust_cg_ir::regs::FPSR
+                            ))
+                })
+        })
+    })
 }
 
 /// Build a `Movz dst, #value` (16-bit immediate), carrying `loc`.
@@ -4264,7 +4516,7 @@ fn max_trip_count_for_loop(
         return TCG_MAX_UNROLL_TRIP_COUNT;
     };
 
-    if block_hotness.class.is_hot() && pgo_hot_unroll_enabled() {
+    if block_hotness.class.is_hot() {
         HOT_MAX_TRIP_COUNT
     } else {
         TCG_MAX_UNROLL_TRIP_COUNT
@@ -4405,7 +4657,7 @@ fn unroll_loop(
     // We'll insert duplicated instructions into a new block for each unrolled copy,
     // then replace the back-edge with a fall-through.
 
-    let mut prev_rename: HashMap<VReg, VReg> = HashMap::new();
+    let mut prev_rename: HashMap<VReg, VReg> = HashMap::default();
     let mut new_blocks: Vec<BlockId> = Vec::new();
     let latch_branch_id = func.block(lp.latch).insts.last().copied();
     let latch_branch_source_loc = latch_branch_id.and_then(|id| func.inst(id).source_loc);
@@ -4416,7 +4668,7 @@ fn unroll_loop(
         new_blocks.push(new_block);
 
         // Build rename map: old vreg -> new vreg for this iteration.
-        let mut rename: HashMap<VReg, VReg> = HashMap::new();
+        let mut rename: HashMap<VReg, VReg> = HashMap::default();
         for &vreg in &defined_vregs {
             let new_id = func.alloc_vreg();
             rename.insert(vreg, VReg::new(new_id, vreg.class));
@@ -4687,8 +4939,12 @@ fn rewrite_branch_target(
 //   * Total executions: `r + q*K = N`. Bit-identical to the original.
 //
 // Nothing else is edited: the test, the bound, the IV step and the exit edge
-// are untouched, so a mis-modeled trip count cannot silently drop or duplicate
-// iterations — it can only refuse to fire.
+// are untouched. The split is nevertheless exact ONLY for the `N` the model
+// proves: with a wrong `N` the peel count `r` and the test points `r + m*K`
+// are wrong, and a real exit between two test points is run past. The model
+// therefore admits only chains that are exact modulo the compare width
+// ([`try_iv_increment`], [`affine_of`]): a sign extension feeding the compare
+// is not a copy.
 //
 // FAIL-CLOSED preconditions: exact 2-block shape; the loop control is a
 // CONTIGUOUS suffix of the header (so the split into "body" and "control" is
@@ -4741,24 +4997,36 @@ fn rewrite_branch_target(
 /// The losers share a shape: the unrolled loop is not hot, so the growth buys
 /// nothing and costs fetch. That is the same disease `PARTIAL_MAX_GROWTH_INSTS`
 /// and the function budget were introduced for on the constant tier, and the
-/// same one `pgo_hot_unroll_enabled` addresses with profile data. A hotness (or
-/// better cost) gate is what this tier needs before it can default ON.
+/// same one `max_trip_count_for_loop` addresses with profile data (a hot header
+/// gets `HOT_MAX_TRIP_COUNT`). A hotness (or better cost) gate is what this
+/// tier needs before it can default ON.
 ///
 /// ⚠ This tier does NOT reach Stanford/Puzzle, which is what motivated building
 /// it: Puzzle's three hot loops are FOUR-block diamonds and this recognizer
 /// requires the two-block do-while. The 4x-unroll win measured there
 /// (0.9554/0.9568, and 0.9227/0.9279 under the R3 control) still needs a
 /// multi-block tier.
-fn runtime_partial_unroll_enabled() -> bool {
-    std::env::var_os("TCG_RUNTIME_PARTIAL_UNROLL").is_some()
+static RUNTIME_PARTIAL_UNROLL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install runtime partial loop unrolling (a trip count not known at compile time) from a TRACKED compiler option, once. DEFAULT OFF.
+///
+/// Until 2026-09-30 the only channel was `TCG_RUNTIME_PARTIAL_UNROLL`, and `trustc` refuses every `TCG_*`
+/// variable before the backend loads, so this opt-in had never been measured through the
+/// bridge. Three levers found the same way turned out to carry recorded numbers that no
+/// longer reproduced, and a fourth (the vectorizer's reduction unroll factor) was leaving
+/// 23% on the table, so an unmeasured opt-in here is an open question, not a settled one.
+pub fn set_runtime_partial_unroll_enabled(enabled: bool) -> bool {
+    match RUNTIME_PARTIAL_UNROLL.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => RUNTIME_PARTIAL_UNROLL.get() == Some(&requested),
+    }
 }
 
-/// Kill switch for the PROFILE-GATED runtime partial unroll: set
-/// `TCG_NO_PGO_RUNTIME_PARTIAL` (any value) to keep the tier off even where a
-/// profile marks the loop header hot, for PGO effect attribution A/B runs.
-/// Inert without a profile.
-fn pgo_runtime_partial_enabled() -> bool {
-    std::env::var_os("TCG_NO_PGO_RUNTIME_PARTIAL").is_none()
+fn runtime_partial_unroll_enabled() -> bool {
+    if let Some(enabled) = RUNTIME_PARTIAL_UNROLL.get() {
+        return *enabled;
+    }
+    std::env::var_os("TCG_RUNTIME_PARTIAL_UNROLL").is_some()
 }
 
 /// May the runtime-trip tier fire on this loop?
@@ -4804,9 +5072,6 @@ fn runtime_partial_unroll_allowed(
 ) -> bool {
     if runtime_partial_unroll_enabled() {
         return true;
-    }
-    if !pgo_runtime_partial_enabled() {
-        return false;
     }
     let Some(hotness) = hotness else {
         return false;
@@ -4883,7 +5148,27 @@ const PARTIAL_MAX_FUNC_GROWTH_INSTS: usize = 400;
 
 /// Compile-time kill switch for the partial (factor) unroll: set
 /// `TCG_NO_PARTIAL_UNROLL` (any value) to disable it.
+static PARTIAL_UNROLL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the PARTIAL loop unrolling kill switch from a TRACKED compiler option, once. DEFAULT ON.
+///
+/// Until 2026-09-30 the only channel was `TCG_NO_PARTIAL_UNROLL`, which `trustc` refuses before the
+/// backend loads, so this pass could not be A/B'd through the bridge. It is not a neutral
+/// gap: unrolling a constant-trip inner loop DESTROYS the loop the vectorizer needs, and
+/// `p4_matmul` written with `get_unchecked` loses 1.90x against LLVM exactly that way — its
+/// `j` loop arrives at the vectorizer already unrolled by 24 (stride 0x18, 96 scalar `imul`,
+/// ZERO `pmuludq`), while the checked build keeps an 8-element loop with 12 `pmuludq`.
+pub fn set_partial_unroll_disabled(disabled: bool) -> bool {
+    match PARTIAL_UNROLL_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => PARTIAL_UNROLL_DISABLED.get() == Some(&requested),
+    }
+}
+
 fn partial_unroll_enabled() -> bool {
+    if let Some(disabled) = PARTIAL_UNROLL_DISABLED.get() {
+        return !*disabled;
+    }
     std::env::var_os("TCG_NO_PARTIAL_UNROLL").is_none()
 }
 
@@ -4980,9 +5265,10 @@ fn partial_cloneable(inst: &MachInst) -> bool {
 /// Cloning a `Bl`/`Blr` verbatim is sound for exactly the reason cloning any
 /// other instruction is: the replicator copies the whole iteration in order, so
 /// each clone's argument setup still immediately precedes its own call and each
-/// clone's result reads still immediately follow it. A call carries no
-/// position-dependent state — the ABI clobber set is a property of the opcode
-/// that register allocation re-derives at every site — and `TailCall` stays
+/// clone's result reads still immediately follow it. Selected Invoke identities
+/// are excluded before planning: their exceptional continuation is position-
+/// dependent state this replicator does not transport. The ABI clobber set is
+/// re-derived at every remaining site, and `TailCall` stays
 /// refused because it is also `IS_TERMINATOR`. What calls cost is CODE, which
 /// is why the general partial tier declines them and this tier prices them
 /// explicitly (see `CALL_UNROLL_MIN_TRIP`).
@@ -5185,9 +5471,10 @@ fn analyze_partial_loop(
         (None, Some(_)) => vec![(op_a, true)],
         _ => return None,
     };
+    let width = width_of(op_a);
     let mut found: Option<IvInc> = None;
     for (cand, is_a) in candidates {
-        if let Some(inc) = try_iv_increment(func, def_map, lp, cand, is_fp) {
+        if let Some(inc) = try_iv_increment(func, def_map, lp, cand, is_fp, width) {
             if found.is_some() {
                 return None; // ambiguous
             }
@@ -5202,16 +5489,16 @@ fn analyze_partial_loop(
     }
 
     // ---- Trip count -------------------------------------------------------
-    let init_aff = affine_of(func, def_map, iv.init_src);
+    let init_aff = affine_of(func, def_map, iv.init_src, width);
     let bound_aff = if let Some(imm) = op_b_imm {
         Affine {
             base: None,
             offset: imm as i128,
         }
     } else if iv.is_a {
-        affine_of(func, def_map, op_b_vreg?)
+        affine_of(func, def_map, op_b_vreg?, width)
     } else {
-        affine_of(func, def_map, op_a)
+        affine_of(func, def_map, op_a, width)
     };
     // Both affine bases must be loop-INVARIANT: `simulate_trip` cancels them
     // symbolically, which is only sound if neither changes across iterations.
@@ -5220,7 +5507,6 @@ fn analyze_partial_loop(
             return None;
         }
     }
-    let width = width_of(op_a);
     let p = rel_from_int_cc(cc_set)?;
     let rel_xl = if iv.is_a { p } else { swap_rel(p) };
     let goes_to_exit_when_taken = t_target == exit_block;
@@ -5359,10 +5645,10 @@ fn runtime_partial_apply(
     // ---- 1. Clone {header, latch} verbatim as the remainder loop -----------
     let r_header = func.create_block();
     let r_latch = func.create_block();
-    let mut bmap: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut bmap: HashMap<BlockId, BlockId> = HashMap::default();
     bmap.insert(header, r_header);
     bmap.insert(latch, r_latch);
-    let vmap: HashMap<VReg, VReg> = HashMap::new();
+    let vmap: HashMap<VReg, VReg> = HashMap::default();
     for (src_b, dst_b) in [(header, r_header), (latch, r_latch)] {
         for iid in func.block(src_b).insts.clone() {
             let inst = clone_inst_remap(func, iid, &bmap, &vmap);
@@ -5593,7 +5879,7 @@ fn partial_unroll_apply(
     let at = pl.ctrl_start;
     let ids: Vec<InstId> = cloned.iter().map(|&(_, id)| id).collect();
     func.block_mut(header).insts.splice(at..at, ids);
-    if let Some(p) = provenance.as_deref_mut() {
+    if let Some(p) = provenance {
         for (src, dst) in cloned {
             p.record_clone(src, dst, loop_unroll_pass_id());
         }
@@ -5934,8 +6220,9 @@ fn call_unroll_min_trip() -> u64 {
 /// the header's control suffix. The trip test then fails on its first execution
 /// and the latch becomes unreachable, so the loop control costs one evaluation
 /// per loop ENTRY instead of `N`. Nothing about the trip test, the bound, the
-/// step or the exit edge is rewritten, so a mis-modeled trip count can only
-/// make the tier refuse, never miscompile.
+/// step or the exit edge is rewritten, but the `N-1` spliced copies run
+/// unconditionally: the tier is exact only when `N` is the real trip count,
+/// which the shared model (`analyze_partial_loop`) must prove.
 ///
 /// # Admission
 ///
@@ -5973,8 +6260,8 @@ impl CallUnroll {
         if !call_unroll_enabled() || loop_analysis.is_empty() {
             return false;
         }
-        let dump = std::env::var_os("TRUST_CG_DUMP_CALL_UNROLL").is_some();
         let min_trip = call_unroll_min_trip();
+        let protected = crate::eh_call_custody::ProtectedCalls::collect(func);
         let all_loops: Vec<NaturalLoop> = loop_analysis.all_loops().cloned().collect();
         let innermost: Vec<&NaturalLoop> = all_loops
             .iter()
@@ -5991,6 +6278,16 @@ impl CallUnroll {
         // every candidate is innermost and edits only its own header).
         let mut plans: Vec<(NaturalLoop, PartialLoop)> = Vec::new();
         for lp in &innermost {
+            if !protected.is_empty()
+                && lp.body.iter().any(|b| {
+                    func.block(*b)
+                        .insts
+                        .iter()
+                        .any(|id| protected.contains(*id))
+                })
+            {
+                continue;
+            }
             let Some(pl) = analyze_partial_loop(func, lp, &def_map, call_unroll_cloneable) else {
                 continue;
             };
@@ -6010,18 +6307,6 @@ impl CallUnroll {
                 && body_len > 0
                 && body_len <= CALL_UNROLL_MAX_BODY_INSTS
                 && cloned <= CALL_UNROLL_MAX_CLONED_INSTS;
-            if dump {
-                eprintln!(
-                    "[call-unroll] {}: header={:?} trip={} body={} call={} cloned={} {}",
-                    func.name,
-                    pl.header,
-                    pl.trip_count,
-                    body_len,
-                    has_call,
-                    cloned,
-                    if admit { "ADMIT" } else { "DECLINED" }
-                );
-            }
             if admit {
                 plans.push(((*lp).clone(), pl));
             }
@@ -6088,6 +6373,7 @@ impl MachinePass for CallUnroll {
 
 #[cfg(test)]
 mod tests {
+    mod eh_call_custody_tests;
     use super::*;
     use crate::pass_manager::MachinePass;
     use crate::pgo::{BlockProfile, FunctionProfile, ProfData, ProfileHotness};
@@ -6188,7 +6474,7 @@ mod tests {
         assert!(inst_defines_vreg(&atomic, result));
         assert!(!inst_defines_vreg(&atomic, update));
 
-        let rename = HashMap::from([(update, fresh_update), (address, fresh_address)]);
+        let rename = HashMap::from_iter([(update, fresh_update), (address, fresh_address)]);
         rewrite_renamed_uses(&mut atomic, &rename);
         assert_eq!(atomic.operands[0].as_vreg(), Some(fresh_update));
         assert_eq!(atomic.operands[1].as_vreg(), Some(result));
@@ -6645,8 +6931,11 @@ mod tests {
         let ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
         func.append_inst(pad, ret);
 
-        // bb2 currently ends in `B bb3`; replace with a conditional split.
+        // bb2 currently ends in `B bb3`; replace with a conditional split. The
+        // CSet materializes its own compare, as the selector emits it.
         func.block_mut(bb2).insts.pop();
+        let test = func.push_inst(MachInst::new(AArch64Opcode::CmpRI, vec![vreg(6), imm(0)]));
+        func.append_inst(bb2, test);
         let cs = func.push_inst(MachInst::new(AArch64Opcode::CSet, vec![vreg(7), imm(0)]));
         func.append_inst(bb2, cs);
         let cmp = func.push_inst(MachInst::new(AArch64Opcode::CmpRI, vec![vreg(7), imm(0)]));
@@ -6802,6 +7091,674 @@ mod tests {
         *func.inst_mut(movz_id) = MachInst::new(AArch64Opcode::MovR, vec![vreg(8), vreg(3)]);
         let mut pass = LoopUnroll::default();
         assert!(!pass.run(&mut func), "a cyclic copy web must fail closed");
+    }
+
+    #[test]
+    fn test_bounded_early_exit_refuses_trip_test_readers() {
+        // The unroll deletes the trip test (`CmpRI v2,#K; CSet v4,NE; AndRR
+        // v5,v4,v3`) from every iteration. A reader of the trip boolean v4 or
+        // of the AndRR result v5 (here in the exit block, the copy an exit
+        // edge carrying the boolean gets), or of the trip compare's NZCV (a
+        // CSEL between the compare and its CSET), would be left reading a
+        // value or flags nothing defines any more.
+        let readers: [(BlockId, usize, MachInst); 3] = [
+            (
+                BlockId(5),
+                0,
+                MachInst::new(AArch64Opcode::MovR, vec![vreg(20), vreg(4)]),
+            ),
+            (
+                BlockId(5),
+                0,
+                MachInst::new(AArch64Opcode::MovR, vec![vreg(20), vreg(5)]),
+            ),
+            (
+                BlockId(3),
+                3,
+                MachInst::new(
+                    AArch64Opcode::Csel,
+                    vec![vreg(21), vreg(6), vreg(1), cc_imm(CondCode::NE)],
+                ),
+            ),
+        ];
+        for (block, position, reader) in readers {
+            let mut func = make_bounded_early_exit_loop(3);
+            let id = func.push_inst(reader);
+            func.block_mut(block).insts.insert(position, id);
+            let before = format!("{func:?}");
+            assert!(
+                !LoopUnroll::default().run(&mut func),
+                "a trip-test reader at {block:?}[{position}] must fail closed"
+            );
+            assert_eq!(format!("{func:?}"), before);
+        }
+    }
+
+    #[test]
+    fn test_bounded_early_exit_refuses_an_exit_reader_of_the_dropped_branch_compare() {
+        // The last iteration always exits, so its copy of `T` drops the branch
+        // compare `CmpRI v5,#0` as well and falls straight into the exit. The
+        // exit's CSEL reads that compare's flags (Z=1: the loop left because
+        // v5 == 0). In the last copy it would read the flags of the surviving
+        // dynamic compare `CmpRI v1,#0` instead.
+        let mut func = make_bounded_early_exit_loop(3);
+        let reader = func.push_inst(MachInst::new(
+            AArch64Opcode::Csel,
+            vec![vreg(21), vreg(0), vreg(1), cc_imm(CondCode::EQ)],
+        ));
+        func.block_mut(BlockId(5)).insts.insert(0, reader);
+        let before = format!("{func:?}");
+
+        assert!(!LoopUnroll::default().run(&mut func));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    /// Give the bounded early-exit loop the constant-index guard load of
+    /// Queens' `b[j]`: `v10` an opaque base pointer and `v11 = 8` in the
+    /// preheader, `v12 = Madd v2, v11, v10 ; v13 = LdrRI [v12, #0]` in the
+    /// header right after the IV increment.
+    fn add_constant_index_load(func: &mut MachFunction) {
+        let bb0 = func.entry;
+        let before_branch = func.block(bb0).insts.len() - 1;
+        let base = func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vreg(10), vreg(20)]));
+        let scale = func.push_inst(MachInst::new(AArch64Opcode::Movz, vec![vreg(11), imm(8)]));
+        func.block_mut(bb0).insts.insert(before_branch, base);
+        func.block_mut(bb0).insts.insert(before_branch + 1, scale);
+        let madd = func.push_inst(MachInst::new(
+            AArch64Opcode::Madd,
+            vec![vreg(12), vreg(2), vreg(11), vreg(10)],
+        ));
+        let load = func.push_inst(MachInst::new(
+            AArch64Opcode::LdrRI,
+            vec![vreg(13), vreg(12), imm(0)],
+        ));
+        func.block_mut(BlockId(1)).insts.insert(1, madd);
+        func.block_mut(BlockId(1)).insts.insert(2, load);
+        // Hand-numbered vregs: keep `alloc_vreg` (per-clone renaming) from
+        // colliding with them.
+        func.next_vreg = 100;
+    }
+
+    #[test]
+    fn test_bounded_early_exit_address_fold_keeps_a_live_out_address() {
+        let address_defs = |func: &MachFunction| -> usize {
+            func.block_order
+                .iter()
+                .flat_map(|&b| func.block(b).insts.iter().copied())
+                .filter(|&iid| inst_defines_vreg(func.inst(iid), VReg::new(12, RegClass::Gpr64)))
+                .count()
+        };
+
+        // Each iteration's IV is a constant, so its `Madd` folds into the
+        // load (`LdrRI [v10, #8k]`) and is dropped.
+        let mut func = make_bounded_early_exit_loop(3);
+        add_constant_index_load(&mut func);
+        assert!(LoopUnroll::default().run(&mut func));
+        assert_eq!(address_defs(&func), 0);
+
+        // The exit also stores through the address the search stopped at, so
+        // `v12` is live out: every iteration redefines it under that one name
+        // and the exit reads the value of the iteration that left. Each
+        // iteration must keep its `Madd`, or nothing defines what the exit
+        // reads.
+        let mut func = make_bounded_early_exit_loop(3);
+        add_constant_index_load(&mut func);
+        let copy = func.push_inst(MachInst::new(AArch64Opcode::MovR, vec![vreg(14), vreg(12)]));
+        let store = func.push_inst(MachInst::new(
+            AArch64Opcode::StrRI,
+            vec![vreg(15), vreg(14), imm(0)],
+        ));
+        func.block_mut(BlockId(5)).insts.insert(0, copy);
+        func.block_mut(BlockId(5)).insts.insert(1, store);
+        assert!(LoopUnroll::default().run(&mut func));
+        assert_eq!(address_defs(&func), 3);
+    }
+
+    /// Where a bounded early-exit loop's constant-index load sits relative to
+    /// the `Madd` that computes its address `v12`.
+    #[derive(Debug, Clone, Copy)]
+    enum CarriedAddress {
+        /// `v12 = Madd ...; v13 = LdrRI [v12]`: the load reads this
+        /// iteration's address (the ordinary fold).
+        MaddThenLoad,
+        /// `v13 = LdrRI [v12]; v12 = Madd ...`: the load reads the address the
+        /// previous iteration computed (the preheader's base, first).
+        LoadThenMadd,
+        /// The same, with the `Madd` in the next block of the iteration.
+        LoadThenMaddInNextBlock,
+        /// `v12 = Madd ...; v10 = AddRI v10, #8; v13 = LdrRI [v12]`: the
+        /// `Madd`'s base moves before the load reads the address.
+        MaddThenBaseBumpThenLoad,
+    }
+
+    /// A bounded early-exit loop that sums `a[j]` through a constant-index
+    /// address and leaves early when it loads a 0 (none of the loaded values
+    /// is 0, so it runs its `K` trips); the exit stores the sum through `v21`.
+    /// `v20` is the array base. A shape that loads ahead of the `Madd` enters
+    /// the loop with `v12 = MovR v10`.
+    ///
+    /// ```text
+    ///   bb0: v0=Movz#0; v1=MovR v0; v10=MovR v20; v11=Movz#8; [v12=MovR v10]
+    ///        v30=Movz#0; B bb1
+    ///   bb1: v2=AddRI v1,#1; <load, Madd and base bump, by shape>; B bb2
+    ///   bb2: v30=AddRR v30,v13; B bb3
+    ///   bb3: CmpRI v13,#0; CSet v3,NE; CmpRI v2,#K; CSet v4,NE
+    ///        AndRR v5,v4,v3; CmpRI v5,#0; BCond[NE] bb4; B bb5
+    ///   bb4: v1=MovR v2; B bb1
+    ///   bb5: StrRI v30,[v21,#0]; Ret
+    /// ```
+    /// where the load is `v13 = LdrRI [v12,#0]` and the `Madd` is
+    /// `v12 = Madd v2,v11,v10` (`&a[iv_next]`).
+    fn make_bee_loop_with_an_indexed_load(k: i64, shape: CarriedAddress) -> MachFunction {
+        let mut func = MachFunction::new("bee_load".to_string(), Signature::new(vec![], vec![]));
+        let bb0 = func.entry;
+        let [bb1, bb2, bb3, bb4, bb5] = std::array::from_fn(|_| func.create_block());
+        let push = |func: &mut MachFunction, blk, op, ops: Vec<MachOperand>| {
+            let id = func.push_inst(MachInst::new(op, ops));
+            func.append_inst(blk, id);
+        };
+        let load = || vec![vreg(13), vreg(12), imm(0)];
+        let madd = || vec![vreg(12), vreg(2), vreg(11), vreg(10)];
+        push(&mut func, bb0, AArch64Opcode::Movz, vec![vreg(0), imm(0)]);
+        push(&mut func, bb0, AArch64Opcode::MovR, vec![vreg(1), vreg(0)]);
+        push(
+            &mut func,
+            bb0,
+            AArch64Opcode::MovR,
+            vec![vreg(10), vreg(20)],
+        );
+        push(&mut func, bb0, AArch64Opcode::Movz, vec![vreg(11), imm(8)]);
+        if matches!(
+            shape,
+            CarriedAddress::LoadThenMadd | CarriedAddress::LoadThenMaddInNextBlock
+        ) {
+            push(
+                &mut func,
+                bb0,
+                AArch64Opcode::MovR,
+                vec![vreg(12), vreg(10)],
+            );
+        }
+        push(&mut func, bb0, AArch64Opcode::Movz, vec![vreg(30), imm(0)]);
+        push(
+            &mut func,
+            bb0,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+
+        push(
+            &mut func,
+            bb1,
+            AArch64Opcode::AddRI,
+            vec![vreg(2), vreg(1), imm(1)],
+        );
+        match shape {
+            CarriedAddress::MaddThenLoad => {
+                push(&mut func, bb1, AArch64Opcode::Madd, madd());
+                push(&mut func, bb1, AArch64Opcode::LdrRI, load());
+            }
+            CarriedAddress::LoadThenMadd => {
+                push(&mut func, bb1, AArch64Opcode::LdrRI, load());
+                push(&mut func, bb1, AArch64Opcode::Madd, madd());
+            }
+            CarriedAddress::LoadThenMaddInNextBlock => {
+                push(&mut func, bb1, AArch64Opcode::LdrRI, load());
+            }
+            CarriedAddress::MaddThenBaseBumpThenLoad => {
+                push(&mut func, bb1, AArch64Opcode::Madd, madd());
+                push(
+                    &mut func,
+                    bb1,
+                    AArch64Opcode::AddRI,
+                    vec![vreg(10), vreg(10), imm(8)],
+                );
+                push(&mut func, bb1, AArch64Opcode::LdrRI, load());
+            }
+        }
+        push(
+            &mut func,
+            bb1,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb2)],
+        );
+
+        push(
+            &mut func,
+            bb2,
+            AArch64Opcode::AddRR,
+            vec![vreg(30), vreg(30), vreg(13)],
+        );
+        if matches!(shape, CarriedAddress::LoadThenMaddInNextBlock) {
+            push(&mut func, bb2, AArch64Opcode::Madd, madd());
+        }
+        push(
+            &mut func,
+            bb2,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb3)],
+        );
+
+        push(&mut func, bb3, AArch64Opcode::CmpRI, vec![vreg(13), imm(0)]);
+        push(
+            &mut func,
+            bb3,
+            AArch64Opcode::CSet,
+            vec![vreg(3), cc_imm(CondCode::NE)],
+        );
+        push(&mut func, bb3, AArch64Opcode::CmpRI, vec![vreg(2), imm(k)]);
+        push(
+            &mut func,
+            bb3,
+            AArch64Opcode::CSet,
+            vec![vreg(4), cc_imm(CondCode::NE)],
+        );
+        push(
+            &mut func,
+            bb3,
+            AArch64Opcode::AndRR,
+            vec![vreg(5), vreg(4), vreg(3)],
+        );
+        push(&mut func, bb3, AArch64Opcode::CmpRI, vec![vreg(5), imm(0)]);
+        push(
+            &mut func,
+            bb3,
+            AArch64Opcode::BCond,
+            vec![cc_imm(CondCode::NE), MachOperand::Block(bb4)],
+        );
+        push(
+            &mut func,
+            bb3,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb5)],
+        );
+
+        push(&mut func, bb4, AArch64Opcode::MovR, vec![vreg(1), vreg(2)]);
+        push(
+            &mut func,
+            bb4,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb1)],
+        );
+
+        push(
+            &mut func,
+            bb5,
+            AArch64Opcode::StrRI,
+            vec![vreg(30), vreg(21), imm(0)],
+        );
+        push(&mut func, bb5, AArch64Opcode::Ret, vec![]);
+
+        for (from, to) in [
+            (bb0, bb1),
+            (bb1, bb2),
+            (bb2, bb3),
+            (bb3, bb4),
+            (bb3, bb5),
+            (bb4, bb1),
+        ] {
+            func.add_edge(from, to);
+        }
+        // Hand-numbered vregs: keep per-clone renaming from colliding.
+        func.next_vreg = 100;
+        func
+    }
+
+    /// The sum `func` stores, run by the vectorizer tests' strict MachIR
+    /// interpreter with `a[j] = j * j + 7` (8-byte words, `j < 16`) at `v20`.
+    fn run_bee_loop_with_an_indexed_load(func: &MachFunction) -> u64 {
+        use crate::vectorize::tests::mach_interp::{self, MachState, Region};
+        const ARRAY: u64 = 0x1000;
+        const SUM: u64 = 0x8000;
+        let array = Region {
+            start: ARRAY,
+            bytes: (0..16u64).flat_map(|j| (j * j + 7).to_le_bytes()).collect(),
+        };
+        let sum = Region {
+            start: SUM,
+            bytes: vec![0; 8],
+        };
+        let state = MachState::new(vec![array, sum])
+            .with_reg(VReg::new(20, RegClass::Gpr64), u128::from(ARRAY))
+            .with_reg(VReg::new(21, RegClass::Gpr64), u128::from(SUM));
+        let end = mach_interp::run(func, state, 10_000)
+            .unwrap_or_else(|err| panic!("{} does not run: {err}", func.name));
+        let word: [u8; 8] = end.regions[1].bytes[..8].try_into().expect("8 bytes");
+        u64::from_le_bytes(word)
+    }
+
+    /// The constant-index address fold re-points the loads of one unrolled
+    /// iteration from the `Madd`'s address to `[base, #iv*scale]`. A load
+    /// ahead of the `Madd` reads the address the PREVIOUS iteration computed,
+    /// so re-pointing it loads `a[j + 1]` for `a[j]`. From `95660b90e` the
+    /// fold's only guard was the loop-state contract's deletion rule
+    /// (`DeadWork`), which walks forward from the deleted `Madd` and never
+    /// sees that earlier reader: in the last iteration, where no later one
+    /// reads `v12`, the fold was admitted (K=2: a sum of 18 for 15; K=3: 31
+    /// for 26). Every reader of the address must read this iteration's
+    /// `Madd`, as the scan before `95660b90e` required.
+    #[test]
+    fn test_bounded_early_exit_address_fold_refuses_a_load_of_the_previous_address() {
+        let address_madds = |func: &MachFunction| -> usize {
+            func.block_order
+                .iter()
+                .flat_map(|&b| func.block(b).insts.iter().copied())
+                .filter(|&iid| {
+                    let inst = func.inst(iid);
+                    inst.opcode == AArch64Opcode::Madd
+                        && inst_defines_vreg(inst, VReg::new(12, RegClass::Gpr64))
+                })
+                .count()
+        };
+        for k in [2, 3, 5] {
+            for shape in [
+                CarriedAddress::MaddThenLoad,
+                CarriedAddress::LoadThenMadd,
+                CarriedAddress::LoadThenMaddInNextBlock,
+            ] {
+                let scalar = make_bee_loop_with_an_indexed_load(k, shape);
+                let mut unrolled = scalar.clone();
+                assert!(
+                    LoopUnroll::default().run(&mut unrolled),
+                    "K={k} {shape:?}: the bounded early-exit loop unrolls"
+                );
+                assert_eq!(
+                    run_bee_loop_with_an_indexed_load(&unrolled),
+                    run_bee_loop_with_an_indexed_load(&scalar),
+                    "K={k} {shape:?}: the unrolled loop must sum what the scalar loop sums"
+                );
+                let kept = match shape {
+                    // Every iteration's address folds into its load.
+                    CarriedAddress::MaddThenLoad => 0,
+                    // Every iteration's load reads the previous address.
+                    CarriedAddress::LoadThenMadd | CarriedAddress::LoadThenMaddInNextBlock => {
+                        k as usize
+                    }
+                    // Its own row: each copy renames that address.
+                    CarriedAddress::MaddThenBaseBumpThenLoad => unreachable!(),
+                };
+                assert_eq!(address_madds(&unrolled), kept, "K={k} {shape:?}");
+            }
+        }
+    }
+
+    /// `[base, #iv*scale]` is the `Madd`'s address only while `base` holds
+    /// what the `Madd` read. With `v10 = AddRI v10, #8` between the `Madd`
+    /// and its load, every unrolled iteration's load was re-pointed past the
+    /// bump and loaded `a[2j]` for `a[2j - 1]` (interpreted sums: K=2 34 for
+    /// 24, K=3 77 for 56, K=5 255 for 200; the scan before `95660b90e` had
+    /// no base check either). The fold refuses a base the unrolled loop
+    /// defines.
+    #[test]
+    fn test_bounded_early_exit_address_fold_refuses_a_base_the_loop_redefines() {
+        for (k, sum) in [(2, 24), (3, 56), (5, 200)] {
+            let shape = CarriedAddress::MaddThenBaseBumpThenLoad;
+            let scalar = make_bee_loop_with_an_indexed_load(k, shape);
+            assert_eq!(run_bee_loop_with_an_indexed_load(&scalar), sum, "K={k}");
+            let mut unrolled = scalar.clone();
+            assert!(
+                LoopUnroll::default().run(&mut unrolled),
+                "K={k}: the bounded early-exit loop unrolls"
+            );
+            assert_eq!(
+                run_bee_loop_with_an_indexed_load(&unrolled),
+                sum,
+                "K={k}: the unrolled loop must sum what the scalar loop sums"
+            );
+            let madds = unrolled
+                .block_order
+                .iter()
+                .flat_map(|&b| unrolled.block(b).insts.iter().copied())
+                .filter(|&iid| unrolled.inst(iid).opcode == AArch64Opcode::Madd)
+                .count();
+            assert_eq!(madds, k as usize, "K={k}: every iteration keeps its Madd");
+        }
+    }
+
+    #[test]
+    fn test_bounded_early_exit_address_fold_refuses_w_x_alias_base_writes() {
+        let madd_count = |func: &MachFunction| {
+            func.block_order
+                .iter()
+                .flat_map(|&b| func.block(b).insts.iter().copied())
+                .filter(|&id| func.inst(id).opcode == AArch64Opcode::Madd)
+                .count()
+        };
+        let base = VReg::new(10, RegClass::Gpr64);
+        for k in [2, 3, 5] {
+            let mut source = make_bee_loop_with_an_indexed_load(k, CarriedAddress::MaddThenLoad);
+            let header = BlockId(1);
+            let at = source
+                .block(header)
+                .insts
+                .iter()
+                .position(|&id| source.inst(id).opcode == AArch64Opcode::Madd)
+                .expect("the original address computation");
+            let write = MachInst::new(
+                AArch64Opcode::MovI,
+                vec![vreg_class(base.id, RegClass::Gpr32), imm(0x2000)],
+            );
+            assert!(!inst_defines_vreg(&write, base));
+            assert!(inst_clobbers_vreg_id(&write, base.id));
+            let write_id = source.push_inst(write);
+            source.block_mut(header).insts.insert(at + 1, write_id);
+            let blocks: HashSet<_> = [BlockId(1), BlockId(2), BlockId(3), BlockId(4)]
+                .into_iter()
+                .collect();
+            assert!(defined_in_blocks(&source, &blocks, base));
+
+            // Exercise the real bounded-early-exit unroll and address-fold
+            // route, including the original first copy and typed clone
+            // renaming. This is a conservative structural refusal control:
+            // the strict test interpreter rejects mixed-class reads, so it
+            // is not relabeled as a native or semantic differential.
+            let mut unrolled = source.clone();
+            assert!(LoopUnroll::default().run(&mut unrolled), "K={k}");
+            assert_eq!(madd_count(&unrolled), k as usize, "K={k}");
+
+            // Unchanged positive: a stable base still folds in every copy,
+            // and the existing strict oracle checks its stored result.
+            let scalar = make_bee_loop_with_an_indexed_load(k, CarriedAddress::MaddThenLoad);
+            let mut folded = scalar.clone();
+            assert!(LoopUnroll::default().run(&mut folded), "K={k}");
+            assert_eq!(madd_count(&folded), 0, "K={k}");
+            assert_eq!(
+                run_bee_loop_with_an_indexed_load(&folded),
+                run_bee_loop_with_an_indexed_load(&scalar),
+                "K={k}: the unmodified positive retains its memory result",
+            );
+        }
+    }
+
+    #[test]
+    fn test_constant_index_address_fold_uses_the_canonical_implicit_register_banks() {
+        use trust_cg_ir::regs::{B0, D0, FPCR, FPSR, H0, NZCV, S0, SP, V0, W0, WSP, WZR, X0, XZR};
+        const UNKNOWN: PReg = PReg::new(u16::MAX);
+        let cases: &[(&'static [PReg], bool)] = &[
+            (&[], false),
+            (&[X0], true),
+            (&[W0], true),
+            (&[SP], true),
+            (&[WSP], true),
+            (&[XZR], true),
+            (&[WZR], true),
+            (&[UNKNOWN], true),
+            (&[NZCV], false),
+            (&[FPCR], false),
+            (&[FPSR], false),
+            (&[V0], false),
+            (&[D0], false),
+            (&[S0], false),
+            (&[H0], false),
+            (&[B0], false),
+            (&[NZCV, V0], false),
+            (&[NZCV, V0, W0], true),
+            (&[V0, UNKNOWN], true),
+        ];
+        for &(definitions, refuse) in cases {
+            let mut source = make_bee_loop_with_an_indexed_load(2, CarriedAddress::MaddThenLoad);
+            let header = BlockId(1);
+            let at = source
+                .block(header)
+                .insts
+                .iter()
+                .position(|&id| source.inst(id).opcode == AArch64Opcode::Madd)
+                .expect("the original address computation");
+            let madd = source.block(header).insts[at];
+            let load = source.block(header).insts[at + 1];
+            let clobber = source.push_inst(
+                MachInst::new(AArch64Opcode::Nop, vec![]).with_implicit_defs(definitions),
+            );
+            source.block_mut(header).insts.insert(at + 1, clobber);
+            let body = [BlockId(1), BlockId(2), BlockId(3), BlockId(4)];
+            let blocks: HashSet<_> = body.into_iter().collect();
+            assert!(!inst_clobbers_vreg_id(source.inst(clobber), 10));
+            assert_eq!(
+                defined_in_blocks(&source, &blocks, VReg::new(10, RegClass::Gpr64)),
+                refuse,
+                "{definitions:?}",
+            );
+            // The bank separation is conditional on an actual GPR base;
+            // do not reuse it for a malformed/non-GPR Madd carrier.
+            if !definitions.is_empty() {
+                assert!(defined_in_blocks(
+                    &source,
+                    &blocks,
+                    VReg::new(10, RegClass::Fpr128),
+                ));
+            }
+
+            // Isolate the fold seam: the loop-state gate can refuse opaque
+            // implicit effects earlier when checking deleted flags. For
+            // Madd's virtual result, this operand-free Nop names no reader;
+            // the unchanged DeadWork check still decides its deletion.
+            let old_madd = format!("{:?}", source.inst(madd));
+            let old_load = format!("{:?}", source.inst(load));
+            let old_clobber = format!("{:?}", source.inst(clobber));
+            let constants: HashMap<_, _> =
+                [(VReg::new(11, RegClass::Gpr64), 8)].into_iter().collect();
+            fold_const_index_addresses(
+                &mut source,
+                &body,
+                &blocks,
+                VReg::new(2, RegClass::Gpr64),
+                1,
+                &constants,
+            );
+            assert_eq!(source.block(header).insts.contains(&madd), refuse);
+            assert_eq!(format!("{:?}", source.inst(madd)), old_madd);
+            assert_eq!(format!("{:?}", source.inst(clobber)), old_clobber);
+            if refuse {
+                assert_eq!(format!("{:?}", source.inst(load)), old_load);
+            } else {
+                assert_eq!(source.inst(load).operands, vec![vreg(13), vreg(10), imm(8)]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_later_loop_does_not_read_an_unrolled_iv_as_a_constant() {
+        // The bounded early-exit loop A (bb1-bb4) hands its IV `v2` to a later
+        // counted loop B as its bound:
+        //   bb5: v30 = MovR v2 ; v31 = Movz #0 ; v32 = MovR v31 ; B bb6
+        //   bb6: v40 = AddRI v32,#10 ; v33 = AddRI v32,#1 ; CmpRR v33,v30
+        //        CSet v34,HS ; CmpRI v34,#0 ; BCond[NE] bb7 ; B bb8
+        //   bb7: Ret
+        //   bb8: v32 = MovR v33 ; B bb6
+        // A stops at a run-time iteration, so B's bound is not a constant.
+        // Unrolling A rewrites its increment in place to `v2 = Movz #1` and
+        // adds a `Movz v2` per clone. Read through a def map taken before that
+        // rewrite, `v2` still has the one definition, now the constant 1, and
+        // B would be fully unrolled as a one-trip loop.
+        let mut func = make_bounded_early_exit_loop(3);
+        let bb5 = BlockId(5);
+        let bb6 = func.create_block();
+        let bb7 = func.create_block();
+        let bb8 = func.create_block();
+        let push = |func: &mut MachFunction, blk, op, ops: Vec<MachOperand>| {
+            let id = func.push_inst(MachInst::new(op, ops));
+            func.append_inst(blk, id);
+        };
+        func.block_mut(bb5).insts.clear();
+        push(&mut func, bb5, AArch64Opcode::MovR, vec![vreg(30), vreg(2)]);
+        push(&mut func, bb5, AArch64Opcode::Movz, vec![vreg(31), imm(0)]);
+        push(
+            &mut func,
+            bb5,
+            AArch64Opcode::MovR,
+            vec![vreg(32), vreg(31)],
+        );
+        push(
+            &mut func,
+            bb5,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb6)],
+        );
+        push(
+            &mut func,
+            bb6,
+            AArch64Opcode::AddRI,
+            vec![vreg(40), vreg(32), imm(10)],
+        );
+        push(
+            &mut func,
+            bb6,
+            AArch64Opcode::AddRI,
+            vec![vreg(33), vreg(32), imm(1)],
+        );
+        push(
+            &mut func,
+            bb6,
+            AArch64Opcode::CmpRR,
+            vec![vreg(33), vreg(30)],
+        );
+        push(
+            &mut func,
+            bb6,
+            AArch64Opcode::CSet,
+            vec![vreg(34), cc_imm(CondCode::HS)],
+        );
+        push(&mut func, bb6, AArch64Opcode::CmpRI, vec![vreg(34), imm(0)]);
+        push(
+            &mut func,
+            bb6,
+            AArch64Opcode::BCond,
+            vec![cc_imm(CondCode::NE), MachOperand::Block(bb7)],
+        );
+        push(
+            &mut func,
+            bb6,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb8)],
+        );
+        push(&mut func, bb7, AArch64Opcode::Ret, vec![]);
+        push(
+            &mut func,
+            bb8,
+            AArch64Opcode::MovR,
+            vec![vreg(32), vreg(33)],
+        );
+        push(
+            &mut func,
+            bb8,
+            AArch64Opcode::B,
+            vec![MachOperand::Block(bb6)],
+        );
+        func.add_edge(bb5, bb6);
+        func.add_edge(bb6, bb7);
+        func.add_edge(bb6, bb8);
+        func.add_edge(bb8, bb6);
+        func.next_vreg = 100;
+
+        assert!(LoopUnroll::default().run(&mut func), "loop A unrolls");
+        assert!(
+            !func.block(BlockId(4)).succs.contains(&BlockId(1)),
+            "loop A is fully unrolled"
+        );
+        assert!(
+            func.block(bb8).succs.contains(&bb6),
+            "loop B's bound is A's run-time exit IV: B must keep its back edge"
+        );
     }
 
     #[test]
@@ -7318,6 +8275,127 @@ mod tests {
         }
     }
 
+    /// The loop exits from its header, so a run of `N` iterations executes the
+    /// latch's back-edge copy `v1 = v10` only `N - 1` times. The unrolled
+    /// straight line ends on the final header part: one more copy would hand
+    /// an exit reader of `v1` the next iteration's value.
+    #[test]
+    fn test_copy_based_final_iteration_runs_no_back_edge_copy() {
+        for limit in 1..=4 {
+            let mut func = make_copy_counted_loop(0, 1, limit);
+            assert!(
+                LoopUnroll::default().run(&mut func),
+                "trip {limit} copy-loop should unroll"
+            );
+            let back_edge_copies = func
+                .block_order
+                .iter()
+                .flat_map(|&b| func.block(b).insts.iter().copied())
+                .filter(|&iid| {
+                    let inst = func.inst(iid);
+                    inst.opcode == AArch64Opcode::MovR && inst.operands == vec![vreg(1), vreg(10)]
+                })
+                .count();
+            assert_eq!(
+                back_edge_copies,
+                limit as usize - 1,
+                "trip {limit}: the back-edge copy runs once per taken back edge"
+            );
+            assert_eq!(count_body_work(&func), limit as usize);
+            let latch = func.block(BlockId(3));
+            assert_eq!(
+                latch.succs,
+                vec![BlockId(2)],
+                "the latch falls into the exit"
+            );
+            let tail: Vec<AArch64Opcode> = latch
+                .insts
+                .iter()
+                .rev()
+                .take(2)
+                .map(|&iid| func.inst(iid).opcode)
+                .collect();
+            if limit == 1 {
+                assert_eq!(tail, vec![AArch64Opcode::B], "trip 1 runs no latch part");
+            } else {
+                // The final header part's IV increment, then the exit branch.
+                assert_eq!(tail, vec![AArch64Opcode::B, AArch64Opcode::AddRI]);
+            }
+        }
+    }
+
+    /// `make_copy_counted_loop(0, 1, limit)` whose compare reads `dst = op(v10)`
+    /// instead of the increment `v10` itself.
+    fn copy_counted_loop_comparing_through(
+        limit: i64,
+        op: AArch64Opcode,
+        dst: MachOperand,
+    ) -> MachFunction {
+        let mut func = make_copy_counted_loop(0, 1, limit);
+        let header = BlockId(1);
+        let cmp_pos = func
+            .block(header)
+            .insts
+            .iter()
+            .position(|&id| func.inst(id).opcode == AArch64Opcode::CmpRR)
+            .expect("header compare");
+        let ext = func.push_inst(MachInst::new(op, vec![dst.clone(), vreg(10)]));
+        func.block_mut(header).insts.insert(cmp_pos, ext);
+        let cmp = func.block(header).insts[cmp_pos + 1];
+        func.inst_mut(cmp).operands[0] = dst;
+        func
+    }
+
+    /// A compare of `Sxth(iv + 1)` at 32 bits sees `sext16(init + m)`, not the
+    /// `init + m` the trip model counts: neither the full nor the factor tier
+    /// may model it (the chain keeps 16 bits of a 32-bit compare).
+    #[test]
+    fn test_trip_models_refuse_an_iv_compared_through_an_extension() {
+        let mut full = copy_counted_loop_comparing_through(
+            4,
+            AArch64Opcode::Sxth,
+            vreg_class(30, RegClass::Gpr32),
+        );
+        assert!(
+            !LoopUnroll::default().run(&mut full),
+            "full unroll modeled Sxth"
+        );
+        let mut factor = copy_counted_loop_comparing_through(
+            13,
+            AArch64Opcode::Sxth,
+            vreg_class(30, RegClass::Gpr32),
+        );
+        assert!(
+            !PartialUnroll::new(None).run(&mut factor),
+            "partial unroll modeled Sxth"
+        );
+    }
+
+    /// Positive control: a TRUNCATING copy into a W register keeps all 32 bits
+    /// the 32-bit compare reads, so both tiers still model the trip count.
+    #[test]
+    fn test_trip_models_admit_an_iv_compared_through_a_truncating_copy() {
+        let mut full = copy_counted_loop_comparing_through(
+            4,
+            AArch64Opcode::MovR,
+            vreg_class(30, RegClass::Gpr32),
+        );
+        assert!(
+            LoopUnroll::default().run(&mut full),
+            "full unroll of a W compare"
+        );
+        assert_eq!(count_body_work(&full), 4);
+        let mut factor = copy_counted_loop_comparing_through(
+            13,
+            AArch64Opcode::MovR,
+            vreg_class(30, RegClass::Gpr32),
+        );
+        assert!(
+            PartialUnroll::new(None).run(&mut factor),
+            "partial unroll of a W compare"
+        );
+    }
+
     #[test]
     fn test_copy_based_refuses_trip_over_max() {
         // (5-0)/1 = 5 > TCG_MAX_UNROLL_TRIP_COUNT (4).
@@ -7327,6 +8405,215 @@ mod tests {
         assert!(!pass.run(&mut func), "trip 5 must not unroll");
         assert_eq!(func.num_blocks(), before);
         assert!(func.block(BlockId(3)).succs.contains(&BlockId(1)));
+    }
+
+    #[test]
+    fn test_copy_based_refuses_trip_test_readers() {
+        // The full unroll deletes the trip test (`CMP; CSET v12; CMP v12,#0`).
+        // A reader of v12 (here in the exit block, or a CSEL in the header)
+        // or of the compare's NZCV (a CSEL between the CMP and the CSET)
+        // would be left reading a value or flags nothing defines any more.
+        let readers: [(BlockId, usize, MachInst); 3] = [
+            (
+                BlockId(2),
+                0,
+                MachInst::new(AArch64Opcode::AddRR, vec![vreg(21), vreg(12), vreg(20)]),
+            ),
+            (
+                BlockId(1),
+                5,
+                MachInst::new(
+                    AArch64Opcode::Csel,
+                    vec![vreg(22), vreg(20), vreg(1), cc_imm(CondCode::NE)],
+                ),
+            ),
+            (
+                BlockId(1),
+                3,
+                MachInst::new(
+                    AArch64Opcode::Csel,
+                    vec![vreg(23), vreg(20), vreg(1), cc_imm(CondCode::EQ)],
+                ),
+            ),
+        ];
+        for (block, position, reader) in readers {
+            let mut func = make_copy_counted_loop(0, 1, 4);
+            let id = func.push_inst(reader);
+            func.block_mut(block).insts.insert(position, id);
+            let mut pass = LoopUnroll::default();
+            assert!(
+                !pass.run(&mut func),
+                "a trip-test reader at {block:?}[{position}] must fail closed"
+            );
+            assert!(func.block(BlockId(3)).succs.contains(&BlockId(1)));
+        }
+    }
+
+    /// `loop_contract::DeadWork` judges an instruction whose register effects
+    /// it does not model (here a raw `Copy` into a physical register, or a
+    /// `RET` with an implicit use) by what it names: it reads a virtual
+    /// register only if it names it, and reads NZCV unless it is a return
+    /// (OD-LOOP-COVERAGE-PRECISION-20261010). Each arm is pinned here: the
+    /// modeled readers above never consult it.
+    #[test]
+    fn test_copy_based_unmodeled_readers_are_judged_by_what_they_name() {
+        use trust_cg_ir::aarch64_regs::{LR, X0};
+        // After a compare that survives the unroll, the deleted compares' NZCV
+        // is dead, so only what an unmodeled copy names decides. A named
+        // virtual register counts as read whatever role the operand table
+        // gives it (here the destination of a copy from X0, which the table
+        // calls a definition). Naming the deleted CSET result, through either
+        // register view, refuses; naming another register unrolls.
+        let after_a_surviving_compare = |named: MachOperand| {
+            let mut func = make_copy_counted_loop(0, 1, 4);
+            let compare =
+                func.push_inst(MachInst::new(AArch64Opcode::CmpRI, vec![vreg(0), imm(0)]));
+            let copy = func.push_inst(MachInst::new(
+                AArch64Opcode::Copy,
+                vec![named, MachOperand::PReg(X0)],
+            ));
+            func.block_mut(BlockId(2)).insts.insert(0, compare);
+            func.block_mut(BlockId(2)).insts.insert(1, copy);
+            func
+        };
+        for class in [RegClass::Gpr64, RegClass::Gpr32] {
+            let mut func = after_a_surviving_compare(vreg_class(12, class));
+            let before = format!("{func:?}");
+            assert!(!LoopUnroll::default().run(&mut func), "{class:?}");
+            assert_eq!(format!("{func:?}"), before);
+        }
+        let mut func = after_a_surviving_compare(vreg(30));
+        assert!(LoopUnroll::default().run(&mut func));
+        assert_eq!(count_body_work(&func), 4);
+        // Naming no deleted register but with the deleted compares' NZCV still
+        // live, a non-return one is taken to read it.
+        let mut func = make_copy_counted_loop(0, 1, 4);
+        let copy = func.push_inst(MachInst::new(
+            AArch64Opcode::Copy,
+            vec![MachOperand::PReg(X0), vreg(20)],
+        ));
+        func.block_mut(BlockId(2)).insts.insert(0, copy);
+        assert!(!LoopUnroll::default().run(&mut func));
+        // A return that names nothing deleted reads neither: the loop unrolls.
+        let mut func = make_copy_counted_loop(0, 1, 4);
+        let exit = func.block(BlockId(2)).insts[0];
+        func.inst_mut(exit).implicit_uses = &[LR];
+        assert!(LoopUnroll::default().run(&mut func));
+        assert_eq!(count_body_work(&func), 4);
+        assert!(!func.block(BlockId(3)).succs.contains(&BlockId(1)));
+    }
+
+    #[test]
+    fn test_copy_based_refuses_a_successor_reader_of_the_deleted_branch_compare() {
+        let mut func = make_copy_counted_loop(0, 1, 4);
+        // Give the preheader Z=1. On the last original trip CSET produces 1,
+        // then CMP v12,#0 gives Z=0. Deleting both comparisons would strand
+        // this exit reader on the preheader's flags: it would select 0, not 4.
+        let seed = func.push_inst(MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(0)]));
+        let before_branch = func.block(func.entry).insts.len() - 1;
+        func.block_mut(func.entry).insts.insert(before_branch, seed);
+        let reader = func.push_inst(MachInst::new(
+            AArch64Opcode::Csel,
+            vec![vreg(21), vreg(0), vreg(11), cc_imm(CondCode::EQ)],
+        ));
+        func.block_mut(BlockId(2)).insts.insert(0, reader);
+        let before = format!("{func:?}");
+
+        assert!(!LoopUnroll::default().run(&mut func));
+        assert_eq!(format!("{func:?}"), before);
+        assert_eq!(count_body_work(&func), 1);
+        assert!(func.block(BlockId(3)).succs.contains(&BlockId(1)));
+    }
+
+    /// The same stranded exit, read by the `Bcc` alias and by an `Mrs` that
+    /// selects NZCV (0xDA10). Both are flag readers to the flag-liveness walk
+    /// (`effects::reads_nzcv`, `effects::nzcv_unknown`), so DeadWork must see
+    /// them too: unrolled, the `Bcc` would branch on Z=1 and the `Mrs` would
+    /// read the preheader's NZCV.
+    #[test]
+    fn test_copy_based_refuses_bcc_and_nzcv_mrs_readers_of_the_deleted_branch_compare() {
+        for bcc in [false, true] {
+            let mut func = make_copy_counted_loop(0, 1, 4);
+            let seed = func.push_inst(MachInst::new(AArch64Opcode::CmpRR, vec![vreg(0), vreg(0)]));
+            let before_branch = func.block(func.entry).insts.len() - 1;
+            func.block_mut(func.entry).insts.insert(before_branch, seed);
+            let exit = BlockId(2);
+            if bcc {
+                // exit: B.EQ taken ; B not_taken ; taken: the old RET ; not_taken: RET
+                let taken = func.create_block();
+                let not_taken = func.create_block();
+                let ret = func.block(exit).insts[0];
+                func.block_mut(exit).insts.clear();
+                let reader = func.push_inst(MachInst::new(
+                    AArch64Opcode::Bcc,
+                    vec![cc_imm(CondCode::EQ), MachOperand::Block(taken)],
+                ));
+                func.append_inst(exit, reader);
+                let jump = func.push_inst(MachInst::new(
+                    AArch64Opcode::B,
+                    vec![MachOperand::Block(not_taken)],
+                ));
+                func.append_inst(exit, jump);
+                func.append_inst(taken, ret);
+                let second_ret = func.push_inst(MachInst::new(AArch64Opcode::Ret, vec![]));
+                func.append_inst(not_taken, second_ret);
+                func.add_edge(exit, taken);
+                func.add_edge(exit, not_taken);
+            } else {
+                let reader = func.push_inst(MachInst::new(
+                    AArch64Opcode::Mrs,
+                    vec![vreg(21), imm(0xDA10)],
+                ));
+                func.block_mut(exit).insts.insert(0, reader);
+            }
+            let before = format!("{func:?}");
+
+            assert!(!LoopUnroll::default().run(&mut func), "bcc={bcc}");
+            assert_eq!(format!("{func:?}"), before, "bcc={bcc}");
+            assert_eq!(count_body_work(&func), 1, "bcc={bcc}");
+        }
+    }
+
+    #[test]
+    fn test_copy_based_refuses_a_call_between_the_compare_and_its_boolean() {
+        let mut func = make_copy_counted_loop(0, 1, 4);
+        let call = func.push_inst(MachInst::new(
+            AArch64Opcode::Bl,
+            vec![MachOperand::Symbol("callee".into())],
+        ));
+        func.block_mut(BlockId(1)).insts.insert(3, call);
+        let before = format!("{func:?}");
+
+        assert!(!LoopUnroll::default().run(&mut func));
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn test_copy_based_unrolls_across_a_flag_transparent_nop() {
+        let mut func = make_copy_counted_loop(0, 1, 4);
+        let nop = func.push_inst(MachInst::new(AArch64Opcode::Nop, vec![]));
+        func.block_mut(BlockId(1)).insts.insert(3, nop);
+
+        assert!(LoopUnroll::default().run(&mut func));
+        assert_eq!(count_body_work(&func), 4);
+        assert!(!func.block(BlockId(3)).succs.contains(&BlockId(1)));
+    }
+
+    #[test]
+    fn test_copy_based_unrolls_when_a_surviving_compare_precedes_the_exit_reader() {
+        let mut func = make_copy_counted_loop(0, 1, 4);
+        let compare = func.push_inst(MachInst::new(AArch64Opcode::CmpRI, vec![vreg(0), imm(0)]));
+        let reader = func.push_inst(MachInst::new(
+            AArch64Opcode::Csel,
+            vec![vreg(21), vreg(0), vreg(11), cc_imm(CondCode::EQ)],
+        ));
+        func.block_mut(BlockId(2)).insts.insert(0, compare);
+        func.block_mut(BlockId(2)).insts.insert(1, reader);
+
+        assert!(LoopUnroll::default().run(&mut func));
+        assert_eq!(count_body_work(&func), 4);
+        assert!(!func.block(BlockId(3)).succs.contains(&BlockId(1)));
+        assert_eq!(func.block(BlockId(2)).insts[..2], [compare, reader]);
     }
 
     #[test]
@@ -7728,7 +9015,7 @@ mod tests {
 
         // Each rewritten address vreg is single-def (fresh per clone): the
         // SROA tracer's requirement.
-        let mut def_counts: HashMap<VReg, usize> = HashMap::new();
+        let mut def_counts: HashMap<VReg, usize> = HashMap::default();
         for &b in &func.block_order {
             for &iid in &func.block(b).insts {
                 let inst = func.inst(iid);
@@ -8040,7 +9327,7 @@ mod tests {
         let mut func = make_diamond_const_trip_loop(15, true);
         let mut pass = LoopUnroll::default();
         assert!(pass.run(&mut func));
-        let mut ldr_dst_defs: HashMap<VReg, usize> = HashMap::new();
+        let mut ldr_dst_defs: HashMap<VReg, usize> = HashMap::default();
         let mut v7_defs = 0usize;
         for &blk in &func.block_order {
             for &iid in &func.block(blk).insts {
@@ -8135,6 +9422,35 @@ mod tests {
         let mut pass = LoopUnroll::default();
         assert!(!pass.run(&mut func), "vcond reuse must fail closed");
         assert!(func.block(BlockId(5)).succs.contains(&BlockId(1)));
+    }
+
+    /// The unroll drops the trip-test tail from every clone, so an exit that
+    /// reads the flags the loop's last compare set would see an earlier
+    /// writer's in the last clone (the BEE tier's `e6dbb93df` defect, which
+    /// this tier's private `vcond` scan never covered). Measured before the
+    /// deletion rule: both fixtures unrolled with the reader in place.
+    #[test]
+    fn test_diamond_unrolls_refuse_an_exit_reader_of_the_dropped_trip_flags() {
+        const NE: i64 = 1;
+        let cases: [(MachFunction, BlockId); 2] = [
+            (make_diamond_const_trip_loop(15, true), BlockId(6)),
+            (
+                make_diamond_bounded_trip_loop(BTripShape::Sound),
+                BlockId(8),
+            ),
+        ];
+        for (mut func, exit) in cases {
+            let reader =
+                func.push_inst(MachInst::new(AArch64Opcode::CSet, vec![vreg(21), imm(NE)]));
+            func.block_mut(exit).insts.insert(0, reader);
+            let before = format!("{func:?}");
+            assert!(
+                !LoopUnroll::default().run(&mut func),
+                "{}: an exit reader of the trip test's flags must fail closed",
+                func.name
+            );
+            assert_eq!(format!("{func:?}"), before);
+        }
     }
 
     // ---- BOUNDED-trip diamond unroll (ReedSolomon's Chien search) ----------
@@ -8502,6 +9818,41 @@ mod tests {
             paired, 7,
             "every retained test must branch to the exit block"
         );
+    }
+
+    /// The source leaves both diamond fixtures from `T` straight to the exit,
+    /// so their latch copy `v1 = v9` runs once per taken back edge: `M - 1`
+    /// times. A copy after the last iteration would hand the exit the next
+    /// iteration's `v1`; that clone's latch keeps only its exit branch.
+    #[test]
+    fn test_diamond_unroll_runs_no_back_edge_copy_after_the_last_iteration() {
+        for (name, mut func, trips) in [
+            ("exact", make_diamond_const_trip_loop(15, true), 15),
+            (
+                "bounded",
+                make_diamond_bounded_trip_loop(BTripShape::Sound),
+                8,
+            ),
+        ] {
+            assert!(
+                LoopUnroll::default().run(&mut func),
+                "{name} diamond loop should fully unroll"
+            );
+            let back_edge_copies = func
+                .block_order
+                .iter()
+                .flat_map(|&b| func.block(b).insts.iter().copied())
+                .filter(|&iid| {
+                    let inst = func.inst(iid);
+                    inst.opcode == AArch64Opcode::MovR && inst.operands == vec![vreg(1), vreg(9)]
+                })
+                .count();
+            assert_eq!(
+                back_edge_copies,
+                trips - 1,
+                "{name}: one back-edge copy per taken back edge"
+            );
+        }
     }
 
     #[test]
@@ -8936,8 +10287,8 @@ mod tests {
     }
 
     /// The partial tier only ever ADDS clones: it must not remove the loop's
-    /// control, its back edge or its exit, so a wrong trip model can only
-    /// refuse to fire — never drop or duplicate iterations.
+    /// control, its back edge or its exit. (The clones still assume the
+    /// modeled trip count; this test pins only the additive shape.)
     #[test]
     fn test_partial_unroll_is_purely_additive() {
         let mut func = make_copy_counted_loop(0, 1, 188);
@@ -9124,7 +10475,8 @@ mod tests {
     /// iteration).
     #[test]
     fn second_run_is_a_no_op_for_every_firing_shape() {
-        let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+        type Case = (&'static str, Box<dyn Fn() -> MachFunction>);
+        let cases: Vec<Case> = vec![
             ("counting-2", Box::new(|| make_counting_loop(2))),
             ("counting-4", Box::new(|| make_counting_loop(4))),
             (
@@ -9155,5 +10507,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Replace `block`'s trailing `n_branches` branch instructions with a
+    /// jump-table dispatch `Adr v{scratch}, JumpTableIndex(k); Br v{scratch}`
+    /// over `targets`. The block's recorded successors are left as they are,
+    /// which is the set `targets` names in the callers.
+    fn dispatch_through_a_jump_table(
+        func: &mut MachFunction,
+        block: BlockId,
+        n_branches: usize,
+        targets: Vec<BlockId>,
+        scratch: u32,
+    ) {
+        let k = u32::try_from(func.jump_tables.len()).expect("table index");
+        func.jump_tables.push(trust_cg_ir::function::JumpTableData {
+            min_val: 0,
+            targets,
+        });
+        let keep = func.block(block).insts.len() - n_branches;
+        func.block_mut(block).insts.truncate(keep);
+        for inst in [
+            MachInst::new(
+                AArch64Opcode::Adr,
+                vec![vreg(scratch), MachOperand::JumpTableIndex(k)],
+            ),
+            MachInst::new(AArch64Opcode::Br, vec![vreg(scratch)]),
+        ] {
+            let id = func.push_inst(inst);
+            func.append_inst(block, id);
+        }
+    }
+
+    /// A body block that dispatches through a jump table: every iteration copy
+    /// would share `jump_tables[0]` and so branch into iteration 1's `T`
+    /// (which then backs into iteration 2 forever). The tier must decline.
+    #[test]
+    fn test_bounded_early_exit_refuses_a_jump_table_dispatch_in_the_body() {
+        let mut func = make_bounded_early_exit_loop(3);
+        // bb2 (mid) ends `B bb3`; dispatch to bb3 through a table instead.
+        dispatch_through_a_jump_table(&mut func, BlockId(2), 1, vec![BlockId(3)], 40);
+        assert_eq!(func.block(BlockId(2)).succs, vec![BlockId(3)]);
+        let before = format!("{func:?}");
+        assert!(
+            !LoopUnroll::default().run(&mut func),
+            "a jump-table body must not be cloned"
+        );
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    /// An out-edge no `Block` operand names (here a second exit from bb2):
+    /// the operand-wired copies would drop it. The tier must decline.
+    #[test]
+    fn test_bounded_early_exit_refuses_an_out_edge_no_operand_names() {
+        let mut func = make_bounded_early_exit_loop(3);
+        func.add_edge(BlockId(2), BlockId(5));
+        assert!(
+            !LoopUnroll::default().run(&mut func),
+            "an unnamed out-edge must not be cloned"
+        );
+        assert!(func.block(BlockId(4)).succs.contains(&BlockId(1)));
+    }
+
+    /// The diamond header dispatches to its two arms through a jump table
+    /// instead of `BCond; B`: every iteration copy would land in iteration 1's
+    /// arms. The tier must decline.
+    #[test]
+    fn test_diamond_const_trip_refuses_a_jump_table_dispatch_in_the_body() {
+        let mut func = make_diamond_const_trip_loop(15, true);
+        // bb1 (header) ends `BCond[EQ]->bb2 ; B bb3`.
+        dispatch_through_a_jump_table(&mut func, BlockId(1), 2, vec![BlockId(2), BlockId(3)], 41);
+        let before = format!("{func:?}");
+        assert!(
+            !LoopUnroll::default().run(&mut func),
+            "a jump-table body must not be cloned"
+        );
+        assert_eq!(format!("{func:?}"), before);
     }
 }

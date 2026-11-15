@@ -1,0 +1,280 @@
+{
+  "name": "array_splat",
+  "functions": [
+    {
+      "id": 0,
+      "name": "fill",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "ArraySplat": {
+                  "ty": {
+                    "Array": [
+                      3,
+                      1099511627776
+                    ]
+                  },
+                  "value": 0
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "pick",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": {
+                    "Array": [
+                      3,
+                      1099511627776
+                    ]
+                  },
+                  "value": {
+                    "Splat": {
+                      "elem": {
+                        "Int": -3
+                      },
+                      "len": 1099511627776
+                    }
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ExtractElement": {
+                  "ty": "I64",
+                  "array": 1,
+                  "index": 0
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [
+    {
+      "name": "ZEROS",
+      "ty": {
+        "Array": [
+          0,
+          4294967296
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Splat": {
+          "elem": {
+            "Int": 0
+          },
+          "len": 4294967296
+        }
+      },
+      "linkage": "External",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    },
+    {
+      "name": "GRID",
+      "ty": {
+        "Array": [
+          2,
+          1048576
+        ]
+      },
+      "mutable": false,
+      "initializer": {
+        "Splat": {
+          "elem": {
+            "Splat": {
+              "elem": {
+                "Int": 7
+              },
+              "len": 1048576
+            }
+          },
+          "len": 1048576
+        }
+      },
+      "linkage": "External",
+      "tls": null,
+      "align": null,
+      "section": null,
+      "visibility": "Default",
+      "retained": false
+    }
+  ],
+  "func_types": [
+    {
+      "params": [
+        "I64"
+      ],
+      "returns": [
+        {
+          "Array": [
+            3,
+            1099511627776
+          ]
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U64"
+      ],
+      "returns": [
+        "I64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [
+    "U8",
+    "I32",
+    {
+      "Array": [
+        1,
+        1048576
+      ]
+    },
+    "I64"
+  ],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

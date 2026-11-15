@@ -1,12 +1,13 @@
 # trust-types compatibility surface for Trust Codegen
 #
-# This crate intentionally uses the package name `trust-types` so feature-gated
-# Trust Codegen bridge code can depend on `trust_types` without resolving the full
-# tRust compiler workspace during ordinary Trust Codegen builds.
+# This crate intentionally uses the package name `trust-types`. No Trust Codegen
+# crate depends on it: its one remaining consumer is trust-wp's standalone P6
+# spike (spikes/trust-cg-tv-discharge), which path-depends on it. Remove the
+# crate once that spike vendors these types or is retired.
 
 [package]
 name = "trust-types"
-description = "Small trust-types compatibility surface used by Trust Codegen bridge tests"
+description = "Small trust-types compatibility surface kept for the trust-wp P6 spike"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

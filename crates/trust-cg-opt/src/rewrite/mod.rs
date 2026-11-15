@@ -11,8 +11,6 @@
 //! [`RewriteAction`]. A [`RewriteEngine`] drives the rule set to a fixed
 //! point over a [`trust_cg_ir::MachFunction`].
 //!
-//! See `designs/2026-04-18-rewrite-and-interfaces.md` for the design.
-//!
 //! ```text
 //! Engine → Rule → Matcher + Constraints + Rewriter
 //!            │

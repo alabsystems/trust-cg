@@ -37,31 +37,68 @@
 //!    flag input is not in the operand list; see [`is_invariance_movable`]).
 //!  * **Speculation / fault safety.** The pass fires only when the preheader
 //!    UNCONDITIONALLY enters the loop (sole successor is the header) and each
-//!    hoisted load's block DOMINATES the latch and every loop-exiting block —
-//!    i.e. the address is already dereferenced on iteration 1, so hoisting it
-//!    to the (guaranteed-reached) fast preheader introduces no new fault. This
-//!    also means the loop cannot be zero-trip, so no zero-trip path can reach
-//!    the speculated loads.
+//!    hoisted load passes LICM's must-execute test
+//!    (`licm::load_guaranteed_to_execute`): its block DOMINATES every latch
+//!    and every loop-exiting block, nothing iteration 1 runs before it can
+//!    stop it (an earlier branch in its block, or an in-loop guard carrier,
+//!    `BRK` or call on the way to it), and iteration 1 cannot spin before it
+//!    (no inner loop, reducible or not, between the header and the load's
+//!    block) — i.e. iteration 1 dereferences the address unless an earlier
+//!    access of that iteration faults first, so hoisting it to the
+//!    (guaranteed-reached) fast preheader introduces no new fault. This also
+//!    means the loop cannot be zero-trip, so no zero-trip path can reach the
+//!    speculated loads.
 //!  * **Store-range boundedness.** Every memory writer in the body must be a
 //!    boundable store: a fixed `Str*RI base,#imm` (single-element range) or an
 //!    indexed `StrRO base, iv, <<scale` whose index is a counted induction
-//!    variable starting at 0, stepping by a positive constant, and bounded
-//!    above by an invariant `B` via `cmp iv+step, B; b.eq/ge/hs exit` — giving
-//!    `iv ∈ [0, B)` and store range `[base, base + B*scale)`. Any call,
-//!    barrier, atomic, or unrecognized writer fails the loop closed.
+//!    variable starting at 0, stepping by a positive constant (exactly 1 under
+//!    `b.eq`), and bounded above by an invariant `B` via `cmp iv+step, B;
+//!    b.eq/ge/hs exit`. The machine IR is not SSA (a phi copy writes its
+//!    register once per incoming edge), so the initial 0, the step and `B` are
+//!    each the ONE definition reaching their use ([`crate::reaching_const`],
+//!    through copies), never the last one in layout: a phi of two constants
+//!    or a `B` redefined on the back edge is not a counted bound. Iteration 0
+//!    stores before any test reads `B`, so this gives `iv ∈ [0, B)` only for
+//!    `B >= 1`: a constant `B` is required to be, and a register `B` is
+//!    checked at run time (`1 <= B`, `B*scale` and `base + B*scale` without
+//!    wrap) ahead of the disjointness checks, failing to the original loop.
+//!    The store range is then `[base, base + B*scale)`.
+//!    That range holds only if the store addresses the counted value itself:
+//!    it reads `iv` before the in-body `iv = step` copy, and its extend option
+//!    reads `iv` unchanged — `lsl` (a 64-bit `iv`) under either bound, and
+//!    `sxtw`/`uxtw` (a 32-bit `iv` whose 32-bit step and compare the 64-bit
+//!    run-time guard cannot size) only under a compile-time constant `B`.
+//!    Any call, barrier, atomic, or unrecognized writer fails the loop closed.
+//!  * **No in-loop synchronization.** Bounding the loop's own stores shows only
+//!    that THIS thread does not change a hoisted address. A load-acquire
+//!    ([`is_load_acquire`]: `Ldar*`/`Ldaxr`, effect class `Load`, so the
+//!    writer scan above does not see it) lets the thread observe what another
+//!    thread published before the matching release, and every read after it
+//!    must see that. The fast preheader reads the hoisted address once, before
+//!    every in-loop acquire, so a loop containing one fails closed wherever it
+//!    sits: before the load it reorders iteration 1's read, after it the
+//!    reads of the later iterations. Release stores, LSE/LL-SC atomics and
+//!    barriers are writers and already fail store bounding.
 //!  * **Clone integrity.** The fast path is a full clone of the loop body.
 //!    Values defined only inside the body are renamed to fresh vregs; the
 //!    loop-carried "phi" vregs (defined both inside and outside the body) are
 //!    SHARED with the original because the original preheader — which still runs
 //!    on both paths — initializes them, and only one of the two loops ever runs.
 //!    A body-internal value that is LIVE-OUT of the loop fails the loop closed
-//!    (its renamed clone value would not reach the outside use).
+//!    (its renamed clone value would not reach the outside use). The clone
+//!    branches through its `Block` operands mapped through the clone map, so
+//!    every body block's out-edges must be exactly those operands, with no
+//!    jump-table read (`mach_util::clone_reproduces_out_edges`): a cloned
+//!    switch dispatch would index the shared `MachFunction::jump_tables` entry
+//!    and land in the ORIGINAL loop's case blocks, and a fall-through edge
+//!    would follow the clone's different layout position.
 //!
 //! Runs at O2/O3 AFTER `scalar-unroll` + `ext-addr` (so it sees the folded
 //! `ldr [base,#imm]` invariant loads the full-unroll exposes) and BEFORE the
 //! scheduler. Kill switch: `TRUST_CG_DISABLE_PASSES=aliashoist`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::mach_util::{body_clone_reproduces_out_edges, branch_targets};
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, ProvenanceMap, RegClass,
@@ -70,9 +107,10 @@ use trust_cg_ir::{
 
 use crate::dom::DomTree;
 use crate::effects::{
-    aarch64_for_each_use_position, for_each_inst_def, inst_defines_vreg, opcode_effect,
-    reads_flags, single_inst_def,
+    aarch64_for_each_use_position, for_each_inst_def, is_load_acquire, opcode_effect, reads_flags,
+    single_inst_def,
 };
+use crate::licm::load_guaranteed_to_execute;
 use crate::loops::{LoopAnalysis, NaturalLoop};
 use crate::pass_manager::{AnalysisCache, MachinePass};
 
@@ -80,14 +118,8 @@ use crate::pass_manager::{AnalysisCache, MachinePass};
 const CC_EQ: i64 = 0;
 const CC_HS: i64 = 2;
 const CC_GE: i64 = 10;
+const CC_HI: i64 = 8; // unsigned higher
 const CC_LS: i64 = 9; // unsigned lower-or-same
-
-/// Dev trace hook (`TRUST_CG_TRACE_ALIASHOIST`).
-fn trace(msg: &str) {
-    if std::env::var_os("TRUST_CG_TRACE_ALIASHOIST").is_some() {
-        eprintln!("[aliashoist] {msg}");
-    }
-}
 
 /// Alias-versioned loop-invariant load hoisting pass.
 pub struct AliasVersionedLoadHoist;
@@ -212,6 +244,11 @@ enum Bound {
 /// committed transform.
 fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -> bool {
     let header = lp.header;
+    // CFG membership does not imply layout membership: cloning and insertion
+    // both need the header in the layout before any fresh blocks are created.
+    if !lp.body.contains(&header) || !func.block_order.contains(&header) {
+        return false;
+    }
 
     // (G1) Natural preheader that UNCONDITIONALLY enters the loop. This gives
     // both the zero-trip fault guarantee and a single clean redirect point.
@@ -221,9 +258,6 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
     {
         let succs = &func.block(preheader).succs;
         if succs.len() != 1 || succs[0] != header {
-            trace(&format!(
-                "hdr {header:?}: preheader not unconditional-entry"
-            ));
             return false;
         }
     }
@@ -239,13 +273,26 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
         return false;
     };
 
+    // (G1b) Clone integrity, control flow: the fast clone reproduces only the
+    // edges its `Block` operands name (module docs, "Clone integrity").
+    if !body_clone_reproduces_out_edges(func, &lp.body) {
+        return false;
+    }
+
     // Cheap early-out: the transform needs at least one plain load AND one
     // memory writer in the body. Skip the heavy invariance analysis otherwise.
+    // The same scan fails the loop closed on a load-acquire anywhere in the
+    // body: the hoisted value is read once in the fast preheader, before every
+    // in-loop acquire, yet each read that follows an acquire must see what the
+    // matching release published (module docs, "No in-loop synchronization").
     let mut has_plain_load = false;
     let mut has_writer = false;
     for &block_id in &lp.body {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
+            if is_load_acquire(inst.opcode) {
+                return false;
+            }
             if load_access_size(inst).is_some() {
                 has_plain_load = true;
             }
@@ -270,7 +317,7 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
         if !lp.body.contains(&block_id) {
             continue;
         }
-        for &inst_id in &func.block(block_id).insts {
+        for (pos, &inst_id) in func.block(block_id).insts.iter().enumerate() {
             let inst = func.inst(inst_id);
             let Some(size) = load_access_size(inst) else {
                 continue;
@@ -288,7 +335,7 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
             let Some(&MachOperand::VReg(base)) = inst.operands.get(1) else {
                 continue;
             };
-            let Some(off) = inst.operands.get(2).and_then(imm_of) else {
+            let Some(off) = inst.operands.get(2).and_then(MachOperand::as_imm) else {
                 continue;
             };
             // Address invariance: the base must be loop-invariant.
@@ -296,7 +343,7 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
                 continue;
             }
             // Speculation safety: the load must be guaranteed to execute.
-            if !load_guaranteed_to_execute(func, dom, lp, block_id) {
+            if !load_guaranteed_to_execute(func, dom, lp, (block_id, pos)) {
                 continue;
             }
             hoisted.push(HoistLoad {
@@ -308,10 +355,6 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
             });
         }
     }
-    trace(&format!(
-        "hdr {header:?}: {} hoistable loads",
-        hoisted.len()
-    ));
     if hoisted.is_empty() {
         return false;
     }
@@ -334,18 +377,15 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
                 func,
                 dom,
                 lp,
-                inst,
+                inst_id,
                 preheader,
+                preheader_term,
                 &loop_defs,
                 &invariant,
                 &def_counts,
             ) {
                 Some(range) => stores.push(range),
                 None => {
-                    trace(&format!(
-                        "hdr {header:?}: unbounded writer {:?}",
-                        inst.opcode
-                    ));
                     return false; // opaque / unboundable writer
                 }
             }
@@ -360,14 +400,8 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
     // live-out of the loop. Loop-carried (shared) values are exempt.
     let (body_defs, outside_defs) = body_and_outside_defs(func, &lp.body);
     if body_internal_value_is_live_out(func, &lp.body, &body_defs, &outside_defs) {
-        trace(&format!("hdr {header:?}: body-internal value live-out"));
         return false;
     }
-    trace(&format!(
-        "hdr {header:?}: FIRING ({} loads, {} stores)",
-        hoisted.len(),
-        stores.len()
-    ));
 
     // Group hoisted loads by base to minimize the number of checks. A bounding
     // range per base is a sound over-approximation.
@@ -408,7 +442,6 @@ fn try_version_hoist(func: &mut MachFunction, dom: &DomTree, lp: &NaturalLoop) -
         }
     }
     let Some(slice) = collect_invariant_slice(func, &roots, &lp.body, &invariant) else {
-        trace(&format!("hdr {header:?}: base slice not hoistable"));
         return false;
     };
 
@@ -437,10 +470,10 @@ fn collect_invariant_slice(
     body: &HashSet<BlockId>,
     invariant: &HashSet<VReg>,
 ) -> Option<Vec<InstId>> {
-    let def_map = build_def_map(func);
+    let def_map = crate::effects::build_reaching_def_map_by_vreg(func);
     let mut order: Vec<InstId> = Vec::new();
-    let mut done: HashSet<VReg> = HashSet::new();
-    let mut on_stack: HashSet<VReg> = HashSet::new();
+    let mut done: HashSet<VReg> = HashSet::default();
+    let mut on_stack: HashSet<VReg> = HashSet::default();
     for &r in roots {
         visit_slice(
             func,
@@ -520,20 +553,22 @@ fn bound_store(
     func: &MachFunction,
     dom: &DomTree,
     lp: &NaturalLoop,
-    inst: &MachInst,
+    store: InstId,
     preheader: BlockId,
+    preheader_term: InstId,
     loop_defs: &HashMap<VReg, InstId>,
     invariant: &HashSet<VReg>,
     def_counts: &HashMap<VReg, usize>,
 ) -> Option<StoreRange> {
+    let inst = func.inst(store);
     match inst.opcode {
         // Fixed base+immediate store: a single element at `base + imm`.
         AArch64Opcode::StrRI | AArch64Opcode::StrbRI | AArch64Opcode::StrhRI => {
-            let base = vreg_of(inst.operands.get(1)?)?;
+            let base = inst.operands.get(1)?.as_vreg()?;
             if !is_vreg_invariant(base, loop_defs, invariant, def_counts) {
                 return None;
             }
-            let off = imm_of(inst.operands.get(2)?)?;
+            let off = inst.operands.get(2)?.as_imm()?;
             let elem = store_access_size(inst)?;
             Some(StoreRange::Fixed {
                 base,
@@ -542,21 +577,44 @@ fn bound_store(
             })
         }
         // Indexed store: `base + extend(idx) << log2(scale)`. The index must be
-        // a counted IV in `[0, bound)` and the scale must equal the transfer
-        // size (S=1), so the whole written region is `[base, base+bound*scale)`.
+        // a counted IV in `[0, bound)` that the extend option reads unchanged,
+        // and the scale must equal the transfer size (S=1), so the whole
+        // written region is `[base, base+bound*scale)`.
         AArch64Opcode::StrRO => {
-            let base = vreg_of(inst.operands.get(1)?)?;
+            let base = inst.operands.get(1)?.as_vreg()?;
             if !is_vreg_invariant(base, loop_defs, invariant, def_counts) {
                 return None;
             }
-            let idx = vreg_of(inst.operands.get(2)?)?;
-            let packed = imm_of(inst.operands.get(3)?)?;
+            let idx = inst.operands.get(2)?.as_vreg()?;
+            let packed = inst.operands.get(3)?.as_imm()?;
             // S bit must be set: index is scaled by log2(transfer size).
             if packed & 1 == 0 {
                 return None;
             }
+            let read = index_read(packed >> 1)?;
             let scale = store_access_size(inst)?;
-            let bound = recognize_counted_index(func, dom, lp, idx, preheader, def_counts)?;
+            // A low-word index is a 32-bit induction variable whose step and
+            // exit compare wrap at 2^32, and SXTW maps 2^31.. below `base`. The
+            // 64-bit run-time guard `commit` emits for a register bound rules
+            // out neither (nor does it encode: its `cmp` pairs an X shift result
+            // with the bound's W register). Only a compile-time bound is
+            // admitted -- a compare immediate, or the one constant that reaches
+            // the compare's bound register (the selector's `movz w, #k`): with
+            // `k * scale <= 0xFFFF` (below) and an `AddRI` imm12 step, every
+            // index and step stays below 2^14, where both extensions read the
+            // index unchanged.
+            let bound = recognize_counted_index(
+                func,
+                dom,
+                lp,
+                CountedStore {
+                    idx,
+                    store,
+                    preheader,
+                    preheader_term,
+                    register_bound: read == IndexRead::Whole,
+                },
+            )?;
             // A constant bound is materialized as `Movz #(bound*scale)`, which
             // only encodes a 16-bit immediate; reject an out-of-range product
             // (a register bound is fine — it is shifted, not materialized).
@@ -573,76 +631,153 @@ fn bound_store(
     }
 }
 
+/// How a register-offset store reads its index register.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexRead {
+    /// `LSL`: the whole X register (the encoder admits no W index here): the
+    /// 64-bit induction variable of a `u64`/`i64` index, whose 64-bit step and
+    /// exit compare [`commit`]'s register-bound guard sizes.
+    Whole,
+    /// `UXTW`/`SXTW`: the low word, zero- or sign-extended.
+    LowWord,
+}
+
+/// The [`IndexRead`] of the packed operand's extend `option` (the
+/// [`crate::ext_addr`] encoding); `None` for any other option.
+fn index_read(option: i64) -> Option<IndexRead> {
+    use crate::ext_addr::{OPTION_LSL, OPTION_SXTW, OPTION_UXTW};
+    match option {
+        OPTION_LSL => Some(IndexRead::Whole),
+        OPTION_UXTW | OPTION_SXTW => Some(IndexRead::LowWord),
+        _ => None,
+    }
+}
+
+/// The indexed store [`recognize_counted_index`] sizes, and where its loop is
+/// entered.
+#[derive(Clone, Copy)]
+struct CountedStore {
+    /// The store's index register.
+    idx: VReg,
+    /// The `StrRO` itself.
+    store: InstId,
+    /// The natural preheader, which enters the loop unconditionally (G1).
+    preheader: BlockId,
+    /// The preheader's branch to the header: where the value `idx` enters the
+    /// loop with is read.
+    preheader_term: InstId,
+    /// Whether a run-time register bound may be returned (an
+    /// [`IndexRead::Whole`] index); otherwise only a compile-time one is.
+    register_bound: bool,
+}
+
 /// Recognize `idx` as a counted induction variable of `lp` that provably takes
-/// values in `[0, bound)` at every store, and return `bound`.
+/// values in `[0, bound)` at every execution of `store`, and return `bound`.
+///
+/// The machine IR is not SSA: the selector's phi copies write a register once
+/// per incoming edge (`n = flag ? 100 : 4` writes `n` in both arms; a value
+/// carried around the loop is written in the preheader AND on the back edge).
+/// Every value below is therefore read at its use through the
+/// reaching-definitions engine ([`crate::reaching_const`]). A last-def-in-layout
+/// map would pick ONE of those writes and size the range from a value the loop
+/// need not see.
 ///
 /// Requires (fail-closed on any deviation):
-///  * `idx` is initialized to the constant 0 by a def OUTSIDE the loop body
-///    (the preheader/dominating init).
-///  * `idx` has exactly ONE in-body def, a copy of a step value `step`.
-///  * `step = AddRI(idx, #c)` with `c >= 1` (monotone increasing).
+///  * `idx` holds the constant 0 at the preheader's branch into the loop
+///    ([`const_at`]: one reaching def, a `movz #0` or a copy of a register that
+///    is 0 by the same rule where it is copied).
+///  * `idx` has exactly ONE in-body def, a copy of a step value `step`, and
+///    `store` cannot run after that copy within an iteration, so it reads the
+///    value `idx` entered the iteration with (after the copy it would store
+///    element `idx + c`, one step past the walk described below).
+///  * the one def of `step` reaching that copy is `step = AddRI(idx, #c)` with
+///    `c >= 1` (monotone increasing), and `c == 1` under `b.eq` (a larger
+///    stride can step over the bound).
 ///  * a body block ends `CmpRR/CmpRI(step, bound); BCond(EQ|GE|HS) -> <exit>`
-///    (the compare immediately before the branch, comparing the STEP value),
-///    with the branch leaving the loop body — so the loop continues only while
-///    `step` has not reached `bound`, pinning `idx < bound`.
+///    (the compare immediately before the branch, comparing the STEP value of
+///    that same `AddRI`, the one def of `step` reaching the compare), with the
+///    branch leaving the loop body — so the loop continues only while `step`
+///    has not reached `bound`, pinning `idx < bound` on every iteration AFTER
+///    the first.
+///  * `bound` is the same value at every execution of that compare: an
+///    immediate; a register whose one reaching def lies outside the body, in a
+///    block dominating the preheader (a [`Bound::Reg`], only when
+///    `register_bound`); or a register that one constant reaches
+///    ([`Bound::Const`]). A bound two defs reach (a phi of two constants, or a
+///    value redefined on the back edge) is none of these.
+///
+/// Iteration 0 runs unconditionally (G1), so `idx == 0` is stored before any
+/// test reads `bound`: the index set is `[0, bound)` only for `1 <= bound`
+/// (unsigned, and signed under `b.ge`). A constant bound is returned only when
+/// `k >= 1`; a [`Bound::Reg`] is NOT range-checked here, and [`commit`] guards
+/// it at run time (`1 <= bound`, `bound*scale` without wrap) before the clone
+/// can be entered.
 fn recognize_counted_index(
     func: &MachFunction,
     dom: &DomTree,
     lp: &NaturalLoop,
-    idx: VReg,
-    preheader: BlockId,
-    def_counts: &HashMap<VReg, usize>,
+    at: CountedStore,
 ) -> Option<Bound> {
-    let def_map = build_def_map(func);
+    use crate::reaching_const::unique_reaching_def;
+    let CountedStore {
+        idx,
+        store,
+        preheader,
+        preheader_term,
+        register_bound,
+    } = at;
 
-    // The single in-body def of `idx`, and any out-of-body defs (the init).
+    // The single in-body def of `idx`, matched by id as the reaching-defs
+    // engine matches (a write through the other register class is a write).
     let mut in_body_def: Option<InstId> = None;
-    let mut has_outside_def = false;
     for &block_id in &func.block_order {
+        if !lp.body.contains(&block_id) {
+            continue;
+        }
         for &inst_id in &func.block(block_id).insts {
-            let inst = func.inst(inst_id);
-            if !inst_defines_vreg(inst, idx) {
-                continue;
-            }
-            if lp.body.contains(&block_id) {
-                if in_body_def.is_some() {
-                    return None; // more than one in-body def
-                }
-                in_body_def = Some(inst_id);
-            } else {
-                has_outside_def = true;
-                // The init must be a dominating, non-negative constant 0.
-                if !dom.dominates(block_id, preheader) {
-                    return None;
-                }
-                if resolve_const(func, &def_map, idx, inst_id) != Some(0) {
-                    return None;
-                }
+            let mut writes_idx = false;
+            for_each_inst_def(func.inst(inst_id), |def| writes_idx |= def.id == idx.id);
+            if writes_idx && in_body_def.replace(inst_id).is_some() {
+                return None; // more than one in-body def
             }
         }
     }
-    if !has_outside_def {
+    let body_def = in_body_def?;
+    // Iteration 0 indexes with the value `idx` enters the loop with.
+    if const_at(func, preheader_term, idx, MAX_COPY_DEPTH) != Some(0) {
         return None;
     }
-    let body_def = in_body_def?;
+    if runs_after_in_iteration(func, lp, body_def, store) {
+        return None;
+    }
 
     // `idx <- copy(step)`  (the loop-carried write in the latch).
     let step = copy_src(func.inst(body_def))?;
-    // `step = AddRI(idx, #c)`, c >= 1.
-    let step_def = func.inst(*def_map.get(&step)?);
+    // `step = AddRI(idx, #c)`, c >= 1: the def of `step` the copy reads.
+    let step_def_id = unique_reaching_def(func, body_def, step.id)?;
+    let step_def = func.inst(step_def_id);
     if step_def.opcode != AArch64Opcode::AddRI {
         return None;
     }
-    if vreg_of(step_def.operands.first()?)? != step {
+    if step_def.operands.first()?.as_vreg()? != step {
         return None;
     }
-    if vreg_of(step_def.operands.get(1)?)? != idx {
+    if step_def.operands.get(1)?.as_vreg()? != idx {
         return None;
     }
-    let c = imm_of(step_def.operands.get(2)?)?;
+    let c = step_def.operands.get(2)?.as_imm()?;
     if c < 1 {
         return None;
     }
+    // The exit compare reads `step` as that same `AddRI` wrote it.
+    let compares_step = |cmp_id: InstId| {
+        func.inst(cmp_id)
+            .operands
+            .first()
+            .and_then(MachOperand::as_vreg)
+            == Some(step)
+            && unique_reaching_def(func, cmp_id, step.id) == Some(step_def_id)
+    };
 
     // The exit test: a BCond leaving the body, preceded immediately by a
     // compare of `step` against the bound.
@@ -654,12 +789,18 @@ fn recognize_counted_index(
         let Some(p) = insts.iter().position(|&id| {
             let i = func.inst(id);
             i.opcode == AArch64Opcode::BCond
-                && matches!(imm_of(&i.operands[0]), Some(CC_EQ | CC_GE | CC_HS))
+                && matches!(i.operands[0].as_imm(), Some(CC_EQ | CC_GE | CC_HS))
                 && branch_targets(i).iter().any(|t| !lp.body.contains(t))
         }) else {
             continue;
         };
         if p == 0 {
+            continue;
+        }
+        // `b.eq` stops the walk only if `step` LANDS on the bound: with a stride
+        // above 1 an index of 0, c, 2c, ... can step over it and keep storing
+        // past `bound` (stride 2 against 5 never exits through this test).
+        if func.inst(insts[p]).operands[0].as_imm() == Some(CC_EQ) && c != 1 {
             continue;
         }
         // The test must gate every loop continuation, i.e. dominate every
@@ -673,33 +814,35 @@ fn recognize_counted_index(
         if !gates_backedges {
             continue;
         }
-        let cmp = func.inst(insts[p - 1]);
+        let cmp_id = insts[p - 1];
+        let cmp = func.inst(cmp_id);
         match cmp.opcode {
             AArch64Opcode::CmpRR => {
-                if vreg_of(cmp.operands.first()?)? != step {
+                if !compares_step(cmp_id) {
                     continue;
                 }
-                let b = vreg_of(cmp.operands.get(1)?)?;
-                // Bound must be invariant and dominate the preheader, or a const.
-                if let Some(&bdef) = def_map.get(&b)
-                    && def_counts.get(&b).copied().unwrap_or(0) == 1
+                let b = cmp.operands.get(1)?.as_vreg()?;
+                // An invariant register: its one reaching def runs before the
+                // loop, where the run-time guard reads the same value.
+                if register_bound
+                    && let Some(bdef) = unique_reaching_def(func, cmp_id, b.id)
                     && let Some(bblk) = block_of_inst(func, bdef)
                     && !lp.body.contains(&bblk)
                     && dom.dominates(bblk, preheader)
                 {
                     return Some(Bound::Reg(b));
                 }
-                if let Some(k) = resolve_const_vreg(func, &def_map, b)
+                if let Some(k) = const_at(func, cmp_id, b, MAX_COPY_DEPTH)
                     && k >= 1
                 {
                     return Some(Bound::Const(k));
                 }
             }
             AArch64Opcode::CmpRI => {
-                if vreg_of(cmp.operands.first()?)? != step {
+                if !compares_step(cmp_id) {
                     continue;
                 }
-                let k = imm_of(cmp.operands.get(1)?)?;
+                let k = cmp.operands.get(1)?.as_imm()?;
                 if k >= 1 {
                     return Some(Bound::Const(k));
                 }
@@ -752,6 +895,10 @@ fn commit(
     // --- Preamble, part 2: materialize the store and group range endpoints. ---
     // Each store's [lo, hi).
     let mut store_ep: Vec<(MachOperand, MachOperand)> = Vec::new();
+    // Range-validity guards `(lhs, rhs, cc)`: control reaches the disjointness
+    // checks only when every `cmp lhs, rhs` satisfies its `cc`, else it takes
+    // the original loop.
+    let mut guards: Vec<(MachOperand, MachOperand, i64)> = Vec::new();
     for s in stores {
         let (lo, hi) = match s {
             StoreRange::Fixed {
@@ -779,6 +926,33 @@ fn commit(
                     AArch64Opcode::AddRR,
                     vec![vreg(hi), vreg(base), vreg(nbytes)],
                 );
+                // A register bound is unchecked at compile time, and the
+                // do-while stores `idx == 0` before its test reads it, so
+                // `[base, hi)` covers the stores only for `1 <= bound` with
+                // `bound*scale` and `base + bound*scale` free of wrap. A 0
+                // bound makes the range empty (and is never met by `b.eq`); a
+                // negative or huge one wraps `hi` (a negative `b.ge` bound
+                // still runs iteration 0). Both pass the disjointness test, so
+                // they must be sent to the original loop first:
+                //  * `(nbytes >> sh) == bound`: the shift dropped no bits;
+                //  * `hi >u base`: the add did not carry and `nbytes != 0`.
+                // Then `1 <= bound < 2^(64-sh)`, which with `scale >= 8`
+                // (`class_bytes`) is also a positive signed `b.ge` bound, and
+                // `idx + c` (an add immediate, below 2^24) cannot overflow.
+                if let Bound::Reg(v) = bound {
+                    let sh = scale.trailing_zeros() as i64;
+                    if sh != 0 {
+                        let back = alloc(func, RegClass::Gpr64);
+                        emit(
+                            func,
+                            pre,
+                            AArch64Opcode::LsrRI,
+                            vec![vreg(back), vreg(nbytes), imm(sh)],
+                        );
+                        guards.push((vreg(back), vreg(v), CC_EQ));
+                    }
+                    guards.push((vreg(hi), vreg(base), CC_HI));
+                }
                 (vreg(base), vreg(hi))
             }
         };
@@ -792,8 +966,26 @@ fn commit(
         let hi = add_const(func, pre, base, g.max_end);
         group_ep.push((lo, hi));
     }
-    emit(func, pre, AArch64Opcode::B, vec![block(checks[0].0)]);
-    func.add_edge(pre, checks[0].0);
+
+    // --- Guard chain: an unsized store range takes the slow loop. ---
+    let guard_blocks: Vec<BlockId> = guards.iter().map(|_| func.create_block()).collect();
+    let first = guard_blocks.first().copied().unwrap_or(checks[0].0);
+    emit(func, pre, AArch64Opcode::B, vec![block(first)]);
+    func.add_edge(pre, first);
+    for (k, (lhs, rhs, cc)) in guards.iter().enumerate() {
+        let g = guard_blocks[k];
+        let ok = guard_blocks.get(k + 1).copied().unwrap_or(checks[0].0);
+        emit(
+            func,
+            g,
+            AArch64Opcode::CmpRR,
+            vec![lhs.clone(), rhs.clone()],
+        );
+        emit(func, g, AArch64Opcode::BCond, vec![imm(*cc), block(ok)]);
+        emit(func, g, AArch64Opcode::B, vec![block(header)]); // unsized => slow loop
+        func.add_edge(g, ok);
+        func.add_edge(g, header);
+    }
 
     // --- Check chain: for each (store, group) pair, prove disjointness. ---
     let mut pair = 0usize;
@@ -844,6 +1036,7 @@ fn commit(
 
     // --- Layout: place fresh blocks just before the header. ---
     let mut fresh: Vec<BlockId> = vec![pre];
+    fresh.extend(&guard_blocks);
     for (c1, c2) in &checks {
         fresh.push(*c1);
         fresh.push(*c2);
@@ -865,7 +1058,7 @@ struct BlockMap {
 impl BlockMap {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: HashMap::default(),
             order: Vec::new(),
         }
     }
@@ -913,8 +1106,8 @@ fn clone_body(
 
     // Build the vreg rename map.
     let hoisted_insts: HashSet<InstId> = hoisted.iter().map(|h| h.inst).collect();
-    let mut rename: HashMap<u32, VReg> = HashMap::new();
-    let mut hoist_values: HashMap<u32, VReg> = HashMap::new();
+    let mut rename: HashMap<u32, VReg> = HashMap::default();
+    let mut hoist_values: HashMap<u32, VReg> = HashMap::default();
     // Hoisted-load dsts map to fresh preheader values.
     for h in hoisted {
         let hv = alloc(func, h.dst.class);
@@ -1018,7 +1211,7 @@ fn compute_invariants(
     loop_defs: &HashMap<VReg, InstId>,
     def_counts: &HashMap<VReg, usize>,
 ) -> HashSet<VReg> {
-    let mut invariant: HashSet<VReg> = HashSet::new();
+    let mut invariant: HashSet<VReg> = HashSet::default();
     let mut changed = true;
     while changed {
         changed = false;
@@ -1069,7 +1262,10 @@ fn is_operand_invariant(
 ) -> bool {
     match op {
         MachOperand::VReg(v) => is_vreg_invariant(*v, loop_defs, invariant, def_counts),
-        MachOperand::Imm(_) | MachOperand::FImm(_) | MachOperand::Symbol(_) => true,
+        MachOperand::Imm(_)
+        | MachOperand::FImm(_)
+        | MachOperand::Symbol(_)
+        | MachOperand::ExactModuleSymbol(_) => true,
         _ => false,
     }
 }
@@ -1090,26 +1286,38 @@ fn is_vreg_invariant(
     }
 }
 
-/// LICM must-execute test: the load block dominates EVERY back-edge source (all
-/// latches, not just `lp.latch` — a merged multi-latch body can have several)
-/// AND every loop-exiting block. Together with the caller's unconditional-entry
-/// gate this guarantees the load ran on iteration 1 in the original, so
-/// hoisting it into the fast preheader introduces no new fault.
-fn load_guaranteed_to_execute(
+/// Whether `later` can execute after `earlier` within one iteration of `lp`:
+/// further down the same block, or in a body block reachable from `earlier`'s
+/// block without passing back through the header. An instruction found in no
+/// block counts as reachable (fail closed).
+fn runs_after_in_iteration(
     func: &MachFunction,
-    dom: &DomTree,
     lp: &NaturalLoop,
-    load_block: BlockId,
+    earlier: InstId,
+    later: InstId,
 ) -> bool {
-    for &b in &lp.body {
-        let succs = &func.block(b).succs;
-        let is_latch = succs.contains(&lp.header);
-        let is_exiting = succs.iter().any(|s| !lp.body.contains(s));
-        if (is_latch || is_exiting) && !dom.dominates(load_block, b) {
-            return false;
+    let (Some(from), Some(to)) = (block_of_inst(func, earlier), block_of_inst(func, later)) else {
+        return true;
+    };
+    if from == to {
+        let insts = &func.block(from).insts;
+        let at = |id: InstId| insts.iter().position(|&i| i == id);
+        if at(later) > at(earlier) {
+            return true;
         }
     }
-    true
+    let mut seen: HashSet<BlockId> = HashSet::default();
+    let mut work: Vec<BlockId> = func.block(from).succs.clone();
+    while let Some(b) = work.pop() {
+        if b == lp.header || !lp.body.contains(&b) || !seen.insert(b) {
+            continue;
+        }
+        if b == to {
+            return true;
+        }
+        work.extend(func.block(b).succs.iter().copied());
+    }
+    false
 }
 
 /// (body_defs, outside_defs) over value-producing definitions.
@@ -1117,8 +1325,8 @@ fn body_and_outside_defs(
     func: &MachFunction,
     body: &HashSet<BlockId>,
 ) -> (HashSet<VReg>, HashSet<VReg>) {
-    let mut body_defs = HashSet::new();
-    let mut outside_defs = HashSet::new();
+    let mut body_defs = HashSet::default();
+    let mut outside_defs = HashSet::default();
     for &block_id in &func.block_order {
         let in_body = body.contains(&block_id);
         for &inst_id in &func.block(block_id).insts {
@@ -1196,18 +1404,6 @@ fn imm(v: i64) -> MachOperand {
 fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
 }
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
 
 fn emit(
     func: &mut MachFunction,
@@ -1227,7 +1423,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
         .insts
         .iter()
         .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
+        .filter_map(MachOperand::as_vreg)
         .map(|v| v.id)
         .max()
         .unwrap_or(0);
@@ -1242,7 +1438,7 @@ fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
 /// each defined value to a fresh vreg. Operands defined outside the slice keep
 /// their original vreg. Returns the rename map (orig vreg id -> fresh vreg).
 fn emit_slice(func: &mut MachFunction, b: BlockId, slice: &[InstId]) -> HashMap<u32, VReg> {
-    let mut rename: HashMap<u32, VReg> = HashMap::new();
+    let mut rename: HashMap<u32, VReg> = HashMap::default();
     for &id in slice {
         let src = func.inst(id);
         let opcode = src.opcode;
@@ -1357,56 +1553,50 @@ fn off_encodable(off: i64) -> bool {
 fn copy_src(inst: &MachInst) -> Option<VReg> {
     match inst.opcode {
         AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            vreg_of(&inst.operands[1])
+            inst.operands[1].as_vreg()
         }
         AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
+            if inst.operands.len() == 3 && inst.operands[2].as_imm() == Some(0) =>
         {
-            vreg_of(&inst.operands[1])
+            inst.operands[1].as_vreg()
         }
         _ => None,
     }
 }
 
-/// Resolve the constant value defined by `inst_id` for vreg `v`, following copy
-/// idioms and `Movz`.
-fn resolve_const(
-    func: &MachFunction,
-    def_map: &HashMap<VReg, InstId>,
-    v: VReg,
-    inst_id: InstId,
-) -> Option<i64> {
-    let inst = func.inst(inst_id);
-    if let Some((dst, value)) = crate::reaching_const::movz_value(inst)
-        && dst == v
-        && let Ok(value) = i64::try_from(value)
-    {
-        return Some(value);
-    }
-    if let Some(src) = copy_src(inst) {
-        let src_def = *def_map.get(&src)?;
-        return resolve_const(func, def_map, src, src_def);
-    }
-    None
-}
+/// Register copies [`const_at`] follows: the selector's phi copy into an
+/// induction variable or bound, and copies above it.
+const MAX_COPY_DEPTH: u32 = 4;
 
-fn resolve_const_vreg(
-    func: &MachFunction,
-    def_map: &HashMap<VReg, InstId>,
-    v: VReg,
-) -> Option<i64> {
-    let def = *def_map.get(&v)?;
-    resolve_const(func, def_map, v, def)
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|op| match op {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
+/// The compile-time constant `v` holds at EVERY execution of `use_inst`, or
+/// `None`.
+///
+/// Read through the reaching-definitions engine ([`crate::reaching_const`]):
+/// exactly one def of `v`'s id reaches `use_inst`, with no uninitialized path,
+/// and it is a `Movz`/`Movn`/`Movk` materialization or a register copy whose
+/// source resolves, by the same rule, at the copy. A phi of two constants (a
+/// copy in each arm) or a value redefined on the back edge reaches with two
+/// defs and gives `None`, as does a copy chain deeper than `depth`. Each copy
+/// keeps the low 32 bits for a 32-bit destination, and so does the result for
+/// a 32-bit `v` (a W write zeroes the upper half).
+fn const_at(func: &MachFunction, use_inst: InstId, v: VReg, depth: u32) -> Option<i64> {
+    if let Some(k) = crate::reaching_const::unique_reaching_const(func, use_inst, v) {
+        return Some(k);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let def = crate::reaching_const::unique_reaching_def(func, use_inst, v.id)?;
+    let copy = func.inst(def);
+    let src = copy_src(copy)?;
+    let dst = copy.operands.first()?.as_vreg()?;
+    let mut value = const_at(func, def, src, depth - 1)?;
+    for class in [dst.class, v.class] {
+        if class.size_bits() <= 32 {
+            value &= 0xFFFF_FFFF;
+        }
+    }
+    Some(value)
 }
 
 fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) {
@@ -1445,7 +1635,7 @@ fn insert_new_blocks_before(func: &mut MachFunction, before: BlockId, new_blocks
 }
 
 fn build_def_counts(func: &MachFunction) -> HashMap<VReg, usize> {
-    let mut counts: HashMap<VReg, usize> = HashMap::new();
+    let mut counts: HashMap<VReg, usize> = HashMap::default();
     for &block_id in &func.block_order {
         for &inst_id in &func.block(block_id).insts {
             let inst = func.inst(inst_id);
@@ -1457,12 +1647,8 @@ fn build_def_counts(func: &MachFunction) -> HashMap<VReg, usize> {
     counts
 }
 
-fn build_def_map(func: &MachFunction) -> HashMap<VReg, InstId> {
-    crate::effects::build_reaching_def_map_by_vreg(func)
-}
-
 fn build_loop_defs(func: &MachFunction, body: &HashSet<BlockId>) -> HashMap<VReg, InstId> {
-    let mut defs: HashMap<VReg, InstId> = HashMap::new();
+    let mut defs: HashMap<VReg, InstId> = HashMap::default();
     for &block_id in &func.block_order {
         if !body.contains(&block_id) {
             continue;

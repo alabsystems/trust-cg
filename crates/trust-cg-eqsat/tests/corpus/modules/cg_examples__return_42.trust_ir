@@ -1,0 +1,10 @@
+; TrustIr text format v1
+module "trust_cg_quickstart"
+
+functy.0 = () -> (i64)
+
+fn @_return_42(functy.0) {
+bb0:
+    %0 = const i64 42
+    ret %0
+}

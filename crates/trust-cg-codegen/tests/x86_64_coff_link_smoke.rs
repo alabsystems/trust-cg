@@ -3,6 +3,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
+#[path = "common/fresh_dir.rs"]
+mod fresh_dir;
+
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -348,16 +351,8 @@ fn link_object(linker: &WindowsLinker, entry: &str, obj_path: &Path, exe_path: &
     );
 }
 
-fn unique_temp_dir() -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock should be after UNIX epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "trust_cg_x86_64_coff_link_smoke_{}_{}",
-        std::process::id(),
-        stamp
-    ))
+fn unique_temp_dir() -> fresh_dir::ScratchDir {
+    fresh_dir::create("trust_cg_x86_64_coff_link_smoke_")
 }
 
 #[test]
@@ -380,8 +375,6 @@ fn windows_x86_64_coff_objects_link_with_system_linker() {
     );
 
     let temp_dir = unique_temp_dir();
-    std::fs::create_dir_all(&temp_dir)
-        .unwrap_or_else(|error| panic!("failed to create {}: {error}", temp_dir.display()));
 
     let cases = [
         ("answer", "answer_leaf", frameless_leaf_object()),

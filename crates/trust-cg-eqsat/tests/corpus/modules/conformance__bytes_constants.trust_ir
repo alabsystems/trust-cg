@@ -1,0 +1,24 @@
+; TrustIr text format v1
+module "bytes_constants"
+
+functy.0 = () -> ([ty.3 x 2])
+
+type ty.0 = u8
+
+type ty.1 = u8
+
+type ty.2 = u8
+
+type ty.3 = u8
+
+global @RAW_BYTES [ty.0 x 4] = bytes<00deadff>
+
+global @UTF8_BYTES [ty.1 x 6] = utf8bytes<68c3a96c6c6f>
+
+global @EMPTY_BYTES [ty.2 x 0] = bytes<>
+
+fn @ret_bytes(functy.0) {
+bb0:
+    %0 = const [ty.3 x 2] utf8bytes<6f6b>
+    ret %0
+}

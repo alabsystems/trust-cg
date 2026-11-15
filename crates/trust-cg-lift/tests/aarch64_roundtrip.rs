@@ -4,10 +4,11 @@
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
 use trust_cg_lift::disasm::aarch64::{
-    AddSubCarry, AddSubImm, AddSubShiftedReg, BitfieldMove, BranchReg, Brk, CompareAndSwap,
-    CompareBranch, CondBranch, ConditionalSelect, DataProcessing2Source, DataProcessing3Source,
-    DecodeError, FpArith, FpCompare, FpImmediate, FpIntConversion, FpPrecisionConvert, FpUnary,
-    Instruction, LoadLiteral, LoadStoreAcquireRelease, LoadStoreExclusiveAcquireRelease,
+    AddSubCarry, AddSubImm, AddSubShiftedReg, BitfieldMove, BranchReg, Brk, ClearExclusive,
+    CompareAndSwap, CompareBranch, CondBranch, ConditionalSelect, DataProcessing2Source,
+    DataProcessing3Source, DecodeError, FpArith, FpCompare, FpImmediate, FpIntConversion,
+    FpPrecisionConvert, FpUnary, Instruction, LoadLiteral, LoadStoreAcquireRelease,
+    LoadStoreExclusive, LoadStoreExclusiveAcquireRelease, LoadStoreExclusivePair,
     LoadStoreIndexMode, LoadStoreIndexed, LoadStorePair, LoadStorePairAddressMode,
     LoadStoreRegister, LoadStoreUnscaled, LoadStoreUnsignedImm, LogicalImm, LogicalShiftedReg,
     LseAtomicRmw, LseAtomicRmwOp, MoveWide, NeonAcrossLanes, NeonDupElement, NeonDupGeneral,
@@ -1075,28 +1076,172 @@ fn decodes_load_store_exclusive_acquire_release_round_trips() {
 }
 
 #[test]
-fn unsupported_load_store_exclusive_without_ordering_neighbors_fail_closed() {
-    let words = [
-        encode_load_acquire_exclusive(0b11, 5, 4) & !(1 << 15),
-        encode_store_release_exclusive(0b10, 3, 2, 1) & !(1 << 15),
+fn load_store_exclusive_without_ordering_decodes_with_ordered_clear() {
+    let cases = [
+        (
+            encode_load_acquire_exclusive(0b11, 5, 4) & !(1 << 15),
+            0b11,
+            true,
+            31,
+            5,
+            4,
+        ),
+        (
+            encode_store_release_exclusive(0b10, 3, 2, 1) & !(1 << 15),
+            0b10,
+            false,
+            3,
+            2,
+            1,
+        ),
     ];
 
-    for word in words {
-        assert_eq!(decode(word), Err(DecodeError::Unsupported { word }));
+    for (word, size, load, rs, rn, rt) in cases {
+        assert_eq!(
+            decode(word),
+            Ok(Instruction::LoadStoreExclusive(LoadStoreExclusive {
+                size,
+                load,
+                ordered: false,
+                rs,
+                rn,
+                rt,
+            }))
+        );
     }
 }
 
 #[test]
-fn unsupported_load_store_exclusive_byte_half_neighbors_fail_closed() {
-    let words = [
-        encode_load_acquire_exclusive(0b00, 1, 2),
-        encode_load_acquire_exclusive(0b01, 3, 4),
-        encode_store_release_exclusive(0b00, 5, 6, 7),
-        encode_store_release_exclusive(0b01, 8, 9, 10),
+fn load_store_exclusive_byte_half_forms_decode_with_their_size() {
+    let cases = [
+        (
+            encode_load_acquire_exclusive(0b00, 1, 2),
+            0b00,
+            true,
+            31,
+            1,
+            2,
+        ),
+        (
+            encode_load_acquire_exclusive(0b01, 3, 4),
+            0b01,
+            true,
+            31,
+            3,
+            4,
+        ),
+        (
+            encode_store_release_exclusive(0b00, 5, 6, 7),
+            0b00,
+            false,
+            5,
+            6,
+            7,
+        ),
+        (
+            encode_store_release_exclusive(0b01, 8, 9, 10),
+            0b01,
+            false,
+            8,
+            9,
+            10,
+        ),
     ];
 
-    for word in words {
-        assert_eq!(decode(word), Err(DecodeError::Unsupported { word }));
+    for (word, size, load, rs, rn, rt) in cases {
+        assert_eq!(
+            decode(word),
+            Ok(Instruction::LoadStoreExclusive(LoadStoreExclusive {
+                size,
+                load,
+                ordered: true,
+                rs,
+                rn,
+                rt,
+            }))
+        );
+    }
+}
+
+#[test]
+fn load_store_exclusive_near_misses_still_fail_closed() {
+    // A load-exclusive must carry Rs = 11111; a store-exclusive status may not
+    // alias its data register or a non-SP base.
+    let load_with_status = encode_load_acquire_exclusive(0b00, 1, 2) & !(0b11111 << 16);
+    assert_eq!(
+        decode(load_with_status),
+        Err(DecodeError::Unsupported {
+            word: load_with_status
+        })
+    );
+    for word in [
+        encode_store_release_exclusive(0b00, 3, 4, 3),
+        encode_store_release_exclusive(0b01, 3, 3, 4) & !(1 << 15),
+    ] {
+        assert!(matches!(
+            decode(word),
+            Err(DecodeError::ConstrainedUnpredictable { .. })
+        ));
+    }
+}
+
+#[test]
+fn load_store_exclusive_pairs_decode_with_their_constraints() {
+    // LLVM-assembled words (clang -target aarch64-apple-darwin -c).
+    let cases = [
+        (0xc87f_0440, true, false, 31, 1, 2, 0), // ldxp x0, x1, [x2]
+        (0xc87f_90a3, true, true, 31, 4, 5, 3),  // ldaxp x3, x4, [x5]
+        (0xc87f_7ffe, true, false, 31, 31, 31, 30), // ldxp x30, xzr, [sp]
+        (0xc820_0861, false, false, 0, 2, 3, 1), // stxp w0, x1, x2, [x3]
+        (0xc824_98e5, false, true, 4, 6, 7, 5),  // stlxp w4, x5, x6, [x7]
+        (0xc82d_39ce, false, false, 13, 14, 14, 14), // stxp w13, x14, x14, [x14]
+    ];
+    for (word, load, ordered, rs, rt2, rn, rt) in cases {
+        assert_eq!(
+            decode(word),
+            Ok(Instruction::LoadStoreExclusivePair(
+                LoadStoreExclusivePair {
+                    wide: true,
+                    load,
+                    ordered,
+                    rs,
+                    rt2,
+                    rn,
+                    rt,
+                }
+            )),
+            "{word:#010x}"
+        );
+    }
+    // ldxp x0, x0, [x1]; stxp w1, x1, x2, [x3]; stxp w2, x1, x2, [x3];
+    // stxp w3, x1, x2, [x3] are all constrained unpredictable.
+    for word in [0xc87f_0020_u32, 0xc821_0861, 0xc822_0861, 0xc823_0861] {
+        assert!(
+            matches!(
+                decode(word),
+                Err(DecodeError::ConstrainedUnpredictable { .. })
+            ),
+            "{word:#010x}"
+        );
+    }
+}
+
+#[test]
+fn clear_exclusive_decodes_and_its_neighbors_do_not() {
+    assert_eq!(
+        decode(0xd503_3f5f),
+        Ok(Instruction::ClearExclusive(ClearExclusive { crm: 15 }))
+    );
+    assert_eq!(
+        decode(0xd503_305f),
+        Ok(Instruction::ClearExclusive(ClearExclusive { crm: 0 }))
+    );
+    // op2 = 0b011 is not CLREX; Rt must be 11111.
+    for word in [0xd503_3f7f_u32, 0xd503_3f5e] {
+        assert!(
+            !matches!(decode(word), Ok(Instruction::ClearExclusive(_))),
+            "{word:#010x}"
+        );
     }
 }
 
@@ -3217,8 +3362,11 @@ fn rejects_unallocated_neon_dup_element_zero_imm5() {
 
 #[test]
 fn rejects_unallocated_neon_dup_element_d_q0() {
-    let word =
-        encoding_neon::encode_dup_element(0, encoding_neon::ElementSize::D, 1, 2, 1).unwrap();
+    // The encoder rejects 1D vector DUP. Construct the reserved word by
+    // clearing Q in an otherwise valid 2D encoding to test decoder admission.
+    let word = encoding_neon::encode_dup_element(1, encoding_neon::ElementSize::D, 1, 2, 1)
+        .unwrap()
+        & !(1 << 30);
 
     assert_eq!(
         decode(word),
@@ -3253,7 +3401,9 @@ fn rejects_unallocated_neon_dup_general_zero_imm5() {
 
 #[test]
 fn rejects_unallocated_neon_dup_general_d_q0() {
-    let word = encoding_neon::encode_dup_general(0, encoding_neon::ElementSize::D, 2, 1).unwrap();
+    // As above, generate the invalid encoding independently of encoder admission.
+    let word = encoding_neon::encode_dup_general(1, encoding_neon::ElementSize::D, 2, 1).unwrap()
+        & !(1 << 30);
 
     assert_eq!(
         decode(word),

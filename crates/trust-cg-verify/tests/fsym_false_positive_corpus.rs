@@ -23,9 +23,18 @@ use trust_ir::{
 const EXPECTED_FUNCTIONS: usize = 25;
 const EXPECTED_SCANNED: usize = 23;
 const EXPECTED_SKIPPED: usize = 2;
-const EXPECTED_UNKNOWN: usize = 3;
+// fsym-r3: 5 -> 9. `public_buffer_read_symbolic_ptr` loads through a `Ptr`
+// PARAMETER, whose object belongs to the caller: besides the null Unknown it
+// now owes Unknowns for bounds, lifetime and initialization (the scanner
+// tracks none of the caller's object) and alignment (the parameter's address
+// is a free input; escalated with a typed candidate). Before, a NotNull
+// annotation on that load would have made it clean with none of them checked.
+const EXPECTED_UNKNOWN: usize = 9;
 const MAX_FALSE_POSITIVE_BASIS_POINTS: usize = 500;
 const EXPECTED_UNKNOWN_REASON: &str = "no witness found in evaluator; escalate to SMT";
+const EXPECTED_UNMODELED_OPERAND_REASON: &str =
+    "operand value is not modeled; cannot prove the side condition";
+const EXPECTED_PARAMETER_OBJECT_REASON: &str = "the pointer has no tracked provenance (a parameter, or an address computed from inputs): the object it points into is not tracked";
 
 #[derive(Debug, Clone, Copy)]
 struct ExpectedUnknown {
@@ -172,6 +181,7 @@ fn add_function(
     module.func_types.push(FuncTy {
         params: params.iter().map(|(_, ty)| ty.clone()).collect(),
         returns,
+        abi: None,
         is_vararg: false,
     });
 
@@ -803,6 +813,11 @@ fn expected_unknowns() -> Vec<ExpectedUnknown> {
             reason: EXPECTED_UNKNOWN_REASON,
         },
         ExpectedUnknown {
+            function: "public_buffer_read_symbolic_ptr",
+            kind: FsymTrustIrDiagnosticKind::Misaligned,
+            reason: EXPECTED_UNKNOWN_REASON,
+        },
+        ExpectedUnknown {
             function: "runtime_ratio_symbolic_divisor",
             kind: FsymTrustIrDiagnosticKind::Arithmetic,
             reason: EXPECTED_UNKNOWN_REASON,
@@ -812,6 +827,46 @@ fn expected_unknowns() -> Vec<ExpectedUnknown> {
             kind: FsymTrustIrDiagnosticKind::Arithmetic,
             reason: EXPECTED_UNKNOWN_REASON,
         },
+    ]
+}
+
+/// Signed adds of two values LOADED from memory. The scanner does not model
+/// memory contents, so it cannot prove `i64` addition of them does not
+/// overflow: an Unknown by name (no solver candidate — the operands are not
+/// modeled inputs). Before trust-cg fsym-r2 these sites recorded no verdict at
+/// all, a silent pass.
+fn expected_unmodeled_operand_unknowns() -> Vec<ExpectedUnknown> {
+    vec![
+        ExpectedUnknown {
+            function: "ary3_unrolled_update4",
+            kind: FsymTrustIrDiagnosticKind::Arithmetic,
+            reason: EXPECTED_UNMODELED_OPERAND_REASON,
+        },
+        ExpectedUnknown {
+            function: "stack_record_sum4",
+            kind: FsymTrustIrDiagnosticKind::Arithmetic,
+            reason: EXPECTED_UNMODELED_OPERAND_REASON,
+        },
+    ]
+}
+
+/// The load through a `Ptr` parameter: the caller's object is not tracked,
+/// so its extent, lifetime and contents are Unknowns (no solver candidate: no
+/// modeled quantity decides them).
+fn expected_parameter_object_unknowns() -> Vec<(FsymTrustIrDiagnosticKind, String)> {
+    vec![
+        (
+            FsymTrustIrDiagnosticKind::OutOfBounds,
+            EXPECTED_PARAMETER_OBJECT_REASON.to_string(),
+        ),
+        (
+            FsymTrustIrDiagnosticKind::UseAfterFree,
+            format!("{EXPECTED_PARAMETER_OBJECT_REASON}; the lifetime of its object is unknown"),
+        ),
+        (
+            FsymTrustIrDiagnosticKind::Uninitialized,
+            format!("{EXPECTED_PARAMETER_OBJECT_REASON}; the contents of its object are unknown"),
+        ),
     ]
 }
 
@@ -920,6 +975,33 @@ fn fsym_false_positive_corpus_reports_no_concrete_ub_with_typed_accounting() {
             unknown.solver_candidate.is_some(),
             "{counters_text}\nexpected typed solver candidate for {expected:?}"
         );
+    }
+
+    for expected in expected_unmodeled_operand_unknowns() {
+        let unknown = summary
+            .functions
+            .iter()
+            .flat_map(|function| function.unknown_obligations.iter())
+            .find(|unknown| unknown.function == expected.function && unknown.kind == expected.kind)
+            .unwrap_or_else(|| panic!("{counters_text}\nmissing expected unknown: {expected:?}"));
+        assert_eq!(unknown.reason, expected.reason, "{counters_text}");
+        assert!(
+            unknown.solver_candidate.is_none(),
+            "{counters_text}\nan unmodeled operand is not a solver input: {expected:?}"
+        );
+    }
+
+    for (kind, reason) in expected_parameter_object_unknowns() {
+        let unknown = summary
+            .functions
+            .iter()
+            .flat_map(|function| function.unknown_obligations.iter())
+            .find(|unknown| {
+                unknown.function == "public_buffer_read_symbolic_ptr" && unknown.kind == kind
+            })
+            .unwrap_or_else(|| panic!("{counters_text}\nmissing expected unknown: {kind:?}"));
+        assert_eq!(unknown.reason, reason, "{counters_text}");
+        assert!(unknown.solver_candidate.is_none(), "{counters_text}");
     }
 
     for expected in expected_skips() {

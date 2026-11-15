@@ -43,19 +43,24 @@
 // integer constants — terminated by a single scalar typed `Load` (or `Store`).
 // ANY other instruction in the captured slice (a runtime index `Mul` by a
 // non-constant, a second pointer base, an aggregate op, a call, ...) bails the
-// fold to `None`: the statement is SKIPPED, never guessed at (sound: less
-// coverage, never a wrong verdict).
+// fold to `None`: the statement is never guessed at and no obligation is
+// stated. Every lane's `None` (a fold miss, or an obligation builder refusing
+// the reconstructed shape) reaches `crate::refinement_job_unmodeled`: the
+// strict `p3c-refine` lane refuses the queued job (`[TCG-REFINE-SHAPE]`) and
+// the default lanes skip it uncredited (less coverage, never a wrong verdict).
 
 use std::collections::HashMap;
 
 use trust_cg_verify::mir_semantics::{
-    range_next_spec, range_next_spec_w, slice_first_last_spec, slice_iter_next_spec, split_at_spec,
-    split_first_last_spec, step_by_next_packed_spec, step_by_next_slice_spec, step_by_next_spec,
-    stride_iter_ctor_spec, vec_index_spec, vec_range_subslice_spec, MemAddr, MirMemOp,
-    OptionRefSpec, RangeForm, RangeNextSpec, SliceEndKind, SliceIterNextSpec, SplitAtSpec,
-    SplitEndsSpec, StepByNextPackedSpec, StepByNextSliceSpec, StepByNextSpec, StrideIterCtorSpec,
-    VecIndexSpec, VecRangeSubsliceSpec,
+    MemAddr, MirMemOp, OptionRefSpec, RangeForm, RangeNextSpec, SliceEndKind, SliceIterNextSpec,
+    SplitAtSpec, SplitEndsSpec, StepByCountdownNextSpec, StepByNextSliceSpec, StepByNextSpec,
+    StrideIterCtorKind, StrideIterCtorSpec, VecIndexSpec, VecRangeSubsliceSpec, range_next_spec,
+    range_next_spec_w, slice_first_last_spec, slice_iter_next_spec, split_at_spec,
+    split_first_last_spec, step_by_countdown_next_spec, step_by_next_slice_spec, step_by_next_spec,
+    stride_iter_ctor_spec, vec_index_spec, vec_range_subslice_spec,
 };
+#[cfg(test)]
+use trust_cg_verify::mir_semantics::{StepByNextPackedSpec, step_by_next_packed_spec};
 use trust_cg_verify::{MachineSideProvenance, ProofObligation, SmtExpr, TransvalCheckKind};
 use trust_ir::{
     BinOp as TrustIrBinOp, CastOp, Constant, ICmpOp, Inst, InstrNode, Ty as TrustIrTy, ValueId,
@@ -65,6 +70,33 @@ use trust_ir::{
 /// (`emit_element_addr` does its address arithmetic at `I64`). Used to size
 /// pointer-like scalar leaves.
 const PTR_BITS: u32 = 64;
+
+/// The pointer width, in bytes, of the WORD MODEL the pointer-word VALUE lanes
+/// below are written in: `split_at`, the slice-to-Vec header, the stride
+/// iterator constructor, the checked index and range subslice, `first`/`last`,
+/// slice `Iter::next`, the three `StepBy::next` shapes and `split_first`/
+/// `split_last`. Each models a pointer and a `usize` as one 64-bit bit-vector,
+/// states its written cells as 8-byte cells (a `Ptr` store folds to
+/// [`scalar_byte_width`]'s 8 bytes) and compares formulas whose address and
+/// length arithmetic wraps at 2^64.
+///
+/// A session whose pointers have another width (wasm32: 4 bytes) lays those
+/// cells out at 4-byte offsets and executes that arithmetic at 32 bits, so an
+/// obligation in this model would be a statement about a different machine:
+/// its store-set shape check could not see an 8-byte access over a 4-byte
+/// neighbour, and a formula proven at 64 bits does not transfer through a
+/// 32-bit wrap or compare. The builders therefore state no obligation in such
+/// a session ([`word_model_describes`]); the statement is skipped, never
+/// credited. `Range::next` is not a pointer-word lane: its cells and
+/// arithmetic are the range element's own width at rustc's layout offsets, so
+/// it states the same obligation in every session.
+pub(crate) const WORD_MODEL_POINTER_BYTES: u64 = 8;
+
+/// Whether the pointer-word value lanes' model ([`WORD_MODEL_POINTER_BYTES`])
+/// describes a session whose pointers are `pointer_bytes` wide.
+pub(crate) fn word_model_describes(pointer_bytes: u64) -> bool {
+    pointer_bytes == WORD_MODEL_POINTER_BYTES
+}
 
 /// Canonical symbolic 64-bit base-pointer name for a slot/base `ValueId`.
 ///
@@ -111,6 +143,23 @@ pub(crate) fn scalar_byte_width(ty: &TrustIrTy) -> Option<u32> {
         return None;
     }
     let bits = ty.bit_width_with(PTR_BITS)?;
+    if bits == 0 {
+        return None;
+    }
+    Some(bits.div_ceil(8))
+}
+
+/// Byte width of the MEMORY ACCESS a typed `Load`/`Store` of the scalar leaf
+/// `ty` performs in this session: a pointer-like leaf is one session pointer
+/// (8 bytes on a 64-bit target, 4 on wasm32, as rustc's layout sizes it);
+/// every other leaf is its [`scalar_byte_width`]. Address arithmetic keeps the
+/// 64-bit word model of [`scalar_byte_width`] — only the access footprint of a
+/// pointer differs by target.
+pub(crate) fn memory_access_byte_width(ty: &TrustIrTy) -> Option<u32> {
+    if ty.is_vector() {
+        return None;
+    }
+    let bits = ty.bit_width_with(crate::session_pointer_bits())?;
     if bits == 0 {
         return None;
     }
@@ -333,7 +382,7 @@ pub(crate) fn fold_emitted_mem_ops(nodes: &[InstrNode]) -> Option<Vec<MirMemOp>>
                 let AddrVal::Ptr { base, off } = lookup(&env, *ptr) else {
                     return None;
                 };
-                let width = scalar_byte_width(ty)?;
+                let width = memory_access_byte_width(ty)?;
                 let offset = u64::try_from(off).ok()?;
                 ops.push(MirMemOp::Load {
                     addr: MemAddr {
@@ -353,13 +402,11 @@ pub(crate) fn fold_emitted_mem_ops(nodes: &[InstrNode]) -> Option<Vec<MirMemOp>>
             // the stored value is the lowered SSA value, named (with its width)
             // so the SAME var can be driven on the spec side (a real
             // store-disjointness VC).
-            Inst::Store {
-                ty, ptr, value, ..
-            } => {
+            Inst::Store { ty, ptr, value, .. } => {
                 let AddrVal::Ptr { base, off } = lookup(&env, *ptr) else {
                     return None;
                 };
-                let width = scalar_byte_width(ty)?;
+                let width = memory_access_byte_width(ty)?;
                 let offset = u64::try_from(off).ok()?;
                 ops.push(MirMemOp::Store {
                     addr: MemAddr {
@@ -382,7 +429,8 @@ pub(crate) fn fold_emitted_mem_ops(nodes: &[InstrNode]) -> Option<Vec<MirMemOp>>
 
 /// Fold ONE address-arithmetic instruction into `env`. The fold's keystone (it
 /// reconstructs `base + const_offset` from the REAL emitted `Const`/`Copy`/
-/// `PtrToInt`/`IntToPtr`/`Add`/`Mul` chain, never a layout query). Returns:
+/// `PtrToInt`/`IntToPtr`/`Add`/`Mul` chain or byte `GEP`, never a layout
+/// query). Returns:
 ///   * `Some(true)`  — handled (an address-arith node, bound into `env`);
 ///   * `Some(false)` — NOT an address-arith node (caller handles `Load`/`Store`
 ///                     or treats it as out of slice);
@@ -401,7 +449,9 @@ fn fold_addr_step(env: &mut HashMap<ValueId, AddrVal>, node: &InstrNode) -> Opti
         }
 
         // A pointer/int reinterpreting move (`coerce_to_plain_ptr` /
-        // `coerce_to_i64` both emit a `Copy`): propagate the operand value.
+        // `coerce_to_i64` emit a `Copy`; `coerce_to_i64` passes an
+        // `emit_i64_const` result through, which the `Const` arm binds):
+        // propagate the operand value.
         Inst::Copy { operand, .. } => {
             let val = lookup(env, *operand);
             bind(env, node, val)?;
@@ -451,6 +501,35 @@ fn fold_addr_step(env: &mut HashMap<ValueId, AddrVal>, node: &InstrNode) -> Opti
             };
             bind(env, node, combined)?;
             Some(true)
+        }
+
+        // `gep u8 base, [k]` with a constant `k >= 0` (the wasm32 lowering's
+        // in-bounds addresses, `wasm32_inbounds`): a defined byte GEP is
+        // `base + k`. Any other GEP (a wider element, several indices, a
+        // runtime or negative index) is out of the fixed-offset slice.
+        Inst::GEP {
+            pointee_ty: TrustIrTy::U8 | TrustIrTy::I8,
+            base,
+            indices,
+            ..
+        } => {
+            let [index] = indices.as_slice() else {
+                return None;
+            };
+            match (lookup(env, *base), lookup(env, *index)) {
+                (AddrVal::Ptr { base, off }, AddrVal::Int(k)) if k >= 0 => {
+                    bind(
+                        env,
+                        node,
+                        AddrVal::Ptr {
+                            base,
+                            off: off.checked_add(k)?,
+                        },
+                    )?;
+                    Some(true)
+                }
+                _ => None,
+            }
         }
 
         // `index * stride` — BOTH operands must be constants (a fixed offset). A
@@ -530,9 +609,7 @@ pub(crate) fn fold_emitted_copy_ops(nodes: &[InstrNode]) -> Option<Vec<MirMemOp>
             // A lane store: its value MUST be a value loaded earlier in the slice
             // (a pure copy). Name the stored value by its SOURCE cell so the dst
             // cell is proven to hold the original src contents.
-            Inst::Store {
-                ty, ptr, value, ..
-            } => {
+            Inst::Store { ty, ptr, value, .. } => {
                 let AddrVal::Ptr {
                     base: dst_base,
                     off: dst_off,
@@ -575,19 +652,20 @@ pub(crate) fn fold_emitted_copy_ops(nodes: &[InstrNode]) -> Option<Vec<MirMemOp>
 //
 // Unlike the field LOAD/STORE/COPY lanes above (which model the emitted MEMORY
 // op SEQUENCE against a layout spec), `split_at` writes its two `{data,len}`
-// halves through `InsertField`s into the destination tuple slot — there is no
-// byte-addressed load/store sequence to fold. Instead this lane reconstructs the
+// halves as 8-byte lane `Store`s into the destination tuple slot, and what matters
+// is the VALUES stored, not a layout-spec memory op sequence. This lane reconstructs the
 // two halves' VALUES (and the bounds-check trap predicate) SYMBOLICALLY from the
 // exact trust-ir the bridge EMITTED (`ICmp` + `emit_element_addr`'s Mul/Add +
-// the `Sub` + the `InsertField` value operands), naming the receiver's
+// the `Sub` + the lane `Store` addresses and values), naming the receiver's
 // `ptr`/`len`/`mid` (external values the slice never defines) by their `ValueId`.
 // The SPEC side (`mir_semantics::split_at_spec`) re-derives the SAME halves from
 // the Rust definition over the SAME symbolic names. The two meet only on those
 // names — so a bridge that swaps `mid`/`len`, scales by the wrong element size,
 // computes `mid - len`, or inverts the bounds `ICmp` folds to a genuinely
 // different formula and REFUTES. A shape the fold does not recognise (a missing
-// bounds check, an unexpected instruction) returns `None` — the statement is
-// SKIPPED, never guessed at (sound: less coverage, never a wrong verdict).
+// bounds check, an unexpected instruction) returns `None` and is never guessed
+// at: the strict lane refuses the job, the default lanes skip it (see the module
+// header).
 
 /// Canonical symbolic 64-bit name for a `ValueId` the split_at slice reads but
 /// never defines (the receiver `ptr`/`len`/`mid`, the destination slot pointer).
@@ -626,7 +704,7 @@ pub(crate) fn ld_value_name_w(base: ValueId, off: u64, width: u32) -> String {
 
 /// A folded value in the split_at symbolic evaluator. `Int`/`Ptr` keep the
 /// base-plus-constant-offset structure the address arithmetic needs (so the
-/// `InsertField` destination OFFSET into the tuple slot is recoverable exactly);
+/// lane `Store`'s destination OFFSET into the tuple slot is recoverable exactly);
 /// `Expr`/`Bool` carry a general reconstructed formula (a right-half data/len
 /// value, or the bounds predicate).
 #[derive(Clone)]
@@ -805,31 +883,43 @@ pub(crate) struct SplitAtFolded {
     /// bounds `ICmp`'s comparison over the symbolic `mid`/`len`. The bridge
     /// branches to the split's normal target when this holds and TRAPS otherwise.
     ok: SmtExpr,
-    /// The emitted fat-ptr field stores as `(dest byte offset, lane, value)` — one
-    /// per `InsertField` the bridge performed into the destination tuple slot
-    /// (lane 0 = data, lane 1 = len). All share the one destination base.
-    stores: Vec<(u64, u32, SmtExpr)>,
+    /// The emitted fat-ptr lane stores as `(absolute dest byte offset, value)` —
+    /// one per 8-byte `Store` the bridge performed into the destination tuple
+    /// slot (lane 0 = data at the half's offset, lane 1 = len 8 bytes on). All
+    /// share the one destination base.
+    stores: Vec<(u64, SmtExpr)>,
     /// Symbolic 64-bit inputs the reconstruction references.
     inputs: Vec<(String, u32)>,
 }
 
 impl SplitAtFolded {
-    /// The value stored into the tuple slot at byte `offset`, lane `lane`.
+    /// The value of the ONE store into the tuple slot at byte `offset`, lane
+    /// `lane`: `None` when no store or more than one store writes that cell (a
+    /// later write would leave a value the obligation never reads).
     fn store_value(&self, offset: u64, lane: u32) -> Option<SmtExpr> {
-        self.stores
-            .iter()
-            .find(|(o, l, _)| *o == offset && *l == lane)
-            .map(|(_, _, v)| v.clone())
+        fat_ptr_lane_store(&self.stores, offset, lane)
     }
+}
+
+/// The value the ONE 8-byte lane `Store` wrote at `offset + 8*lane` (a
+/// `{data,len}` fat-ptr half is two 8-byte words): `None` when no store or more
+/// than one store writes that cell, since a later write would leave a value the
+/// obligation never reads (strict shape-miss policy, OD-172). Shared by the
+/// fat-ptr folds.
+fn fat_ptr_lane_store(stores: &[(u64, SmtExpr)], offset: u64, lane: u32) -> Option<SmtExpr> {
+    let at = offset.checked_add(8 * u64::from(lane))?;
+    let mut writes = stores.iter().filter(|(o, _)| *o == at);
+    let (_, value) = writes.next()?;
+    writes.next().is_none().then(|| value.clone())
 }
 
 /// Fold the EMITTED trust-ir of a `split_at` lowering (the bounds `ICmp`, the
 /// `emit_element_addr` Mul/Add for the right half's data pointer, the `Sub` for
-/// its length, and the four `InsertField`s that write the two `{data,len}` halves
+/// its length, and the four lane `Store`s that write the two `{data,len}` halves
 /// into the destination tuple slot) into a [`SplitAtFolded`].
 ///
 /// Reconstructs each value from the REAL emitted `Const`/`Copy`/`PtrToInt`/
-/// `IntToPtr`/`Add`/`Sub`/`Mul`/`ICmp`/`InsertField` — never a re-derivation from
+/// `IntToPtr`/`Add`/`Sub`/`Mul`/`ICmp`/`Store` — never a re-derivation from
 /// the spec — so a wrong emitted formula produces a wrong folded value here and
 /// the obligation against the layout-independent spec REFUTES (the anti-tautology
 /// guarantee). Returns `None` (skip the statement, sound) for ANY instruction
@@ -839,8 +929,8 @@ pub(crate) fn fold_emitted_split_at(nodes: &[InstrNode]) -> Option<SplitAtFolded
     let mut env: HashMap<ValueId, Sv> = HashMap::new();
     let mut inputs: Vec<(String, u32)> = Vec::new();
     let mut ok: Option<SmtExpr> = None;
-    // (dest base, byte offset, lane, value).
-    let mut stores: Vec<(ValueId, u64, u32, SmtExpr)> = Vec::new();
+    // (dest base, absolute byte offset, value).
+    let mut stores: Vec<(ValueId, u64, SmtExpr)> = Vec::new();
 
     for node in nodes {
         match &node.inst {
@@ -925,7 +1015,9 @@ pub(crate) fn fold_emitted_split_at(nodes: &[InstrNode]) -> Option<SplitAtFolded
             // `Bool` so that a (malformed) shape flowing an `ICmp` result into
             // arithmetic / a store value bails the fold (`sv_bv`/`Cast` reject a
             // `Bool`), never mis-folding it as an external pointer.
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -938,21 +1030,21 @@ pub(crate) fn fold_emitted_split_at(nodes: &[InstrNode]) -> Option<SplitAtFolded
                 bind_sv(&mut env, node, Sv::Bool)?;
             }
 
-            // A fat-ptr field store into the destination tuple slot. The aggregate
-            // operand is `dest_base + const_offset`; the value is a reconstructed
-            // 64-bit half field. The `InsertField` result is not read further.
-            Inst::InsertField {
-                aggregate,
-                field,
-                value,
-                ..
-            } => {
-                let Sv::Ptr { base, off } = lookup_sv(&env, *aggregate) else {
+            // A fat-ptr lane store into the destination tuple slot: the lane's
+            // byte address (`slot_byte_ptr`'s arithmetic, folded above to
+            // `dest_base + absolute byte offset`) and a typed 8-byte `Store` —
+            // the valid trust-ir spelling of the write (WS7.1 (b); it used to be
+            // the store form of `InsertField`). The `Store` has no result.
+            Inst::Store { ty, ptr, value, .. } => {
+                if scalar_byte_width(ty) != Some(8) {
+                    return None; // a fat-ptr lane is one 64-bit word
+                }
+                let Sv::Ptr { base, off } = lookup_sv(&env, *ptr) else {
                     return None;
                 };
                 let off = u64::try_from(off).ok()?;
                 let val = sv_bv(&mut inputs, lookup_sv(&env, *value))?;
-                stores.push((base, off, *field, val));
+                stores.push((base, off, val));
             }
 
             // Anything else is out of the split_at fold slice.
@@ -966,7 +1058,7 @@ pub(crate) fn fold_emitted_split_at(nodes: &[InstrNode]) -> Option<SplitAtFolded
     if !stores.iter().all(|(b, ..)| *b == base0) {
         return None;
     }
-    let stores = stores.into_iter().map(|(_, o, f, v)| (o, f, v)).collect();
+    let stores = stores.into_iter().map(|(_, o, v)| (o, v)).collect();
     Some(SplitAtFolded { ok, stores, inputs })
 }
 
@@ -978,7 +1070,8 @@ pub(crate) struct SliceToVecHeaderFolded {
     pub(crate) alloc_bytes: SmtExpr,
     /// The alignment the bridge ACTUALLY passed as `__rust_alloc`'s second arg.
     pub(crate) alloc_align: SmtExpr,
-    /// `(field, value)` for each `InsertField` into the header slot.
+    /// `(field, value)` for each 8-byte field `Store` into the header slot
+    /// (field `k` is the word at byte `8*k`).
     pub(crate) stores: Vec<(u32, SmtExpr)>,
     /// The `ValueId` `__rust_alloc` defined, so the `ptr` field store can be
     /// checked to hold THAT result and not some other pointer.
@@ -997,10 +1090,23 @@ impl SliceToVecHeaderFolded {
     }
 }
 
-/// The exact node count of `lower_slice_to_vec`'s header window
-/// (`Alloca`, `Const 1`, `ICmp Ugt`, `Select`, `Const size`, `Mul`,
-/// `Const align`, `Call __rust_alloc`, and three `InsertField`s).
-pub(crate) const SLICE_TO_VEC_HEADER_NODES: usize = 11;
+/// The exact node count of the straight-line slice-to-Vec header window this
+/// fold models (`Alloca`, `Const 1`, `ICmp Ugt`, `Select`, `Const size`, `Mul`,
+/// `Const align`, `Call __rust_alloc`, then three field writes of
+/// [`SLICE_TO_VEC_FIELD_STORE_NODES`] nodes each).
+pub(crate) const SLICE_TO_VEC_HEADER_NODES: usize = 8 + 3 * SLICE_TO_VEC_FIELD_STORE_NODES;
+
+/// The nodes of ONE header field write in the legacy window this fold models:
+/// the field address `slot_byte_ptr(slot, 8*field)` (`Const offset`, `Copy` to
+/// `Ptr`, `PtrToInt`, `Copy` to `I64`, `Add`, `IntToPtr`) and the typed
+/// `Store`. It was a single store-form `InsertField` before WS7.1 (b) made the
+/// lane spell the write as valid trust-ir. `emit_vec_field_store` now writes
+/// six: `coerce_to_i64` returns the offset `Const` itself, so there is no
+/// `Copy` to `I64`. The real `lower_slice_to_vec` window was already outside
+/// this shape (its capacity guard, dangling pointer and resize replace the
+/// legacy 8-node prefix), so the lane reports it unmodeled, SKIPPED or a strict
+/// refusal, with either spelling.
+pub(crate) const SLICE_TO_VEC_FIELD_STORE_NODES: usize = 7;
 
 /// Fold the EMITTED trust-ir of a slice-to-Vec header into a
 /// [`SliceToVecHeaderFolded`] (TV lane 14).
@@ -1023,19 +1129,16 @@ pub(crate) const SLICE_TO_VEC_HEADER_NODES: usize = 11;
 /// # Anti-tautology
 ///
 /// Every value here is reconstructed from the REAL emitted
-/// `Const`/`ICmp`/`Select`/`Mul`/`Call`/`InsertField` — never re-derived from
-/// the spec. The capacity comes from the emitted `Select`, the alloc size and
-/// alignment from the ACTUAL `__rust_alloc` argument list, and the header fields
-/// from the ACTUAL `InsertField`s. The spec states capacity in a deliberately
-/// different canonical form, so the two meet only on the shared name for `n`.
-///
-/// # Trusted-model boundary
-///
-/// The `InsertField`s are read with the ADAPTER's store semantics (an
-/// `InsertField` over a `Ptr` aggregate writes the field lane of the pointed-to
-/// slot). trust-ir's REFERENCE interpreter rejects that form as ill-typed, so
-/// this lane's soundness is relative to the adapter's interpretation — stated
-/// here rather than left implicit.
+/// `Const`/`ICmp`/`Select`/`Mul`/`Call`/`Copy`/`PtrToInt`/`Add`/`IntToPtr`/`Store`
+/// — never re-derived from the spec. The capacity comes from the emitted
+/// `Select`, the alloc size and alignment from the ACTUAL `__rust_alloc`
+/// argument list, and the header fields from the ACTUAL `Store`s, each at the
+/// byte offset its ACTUAL address arithmetic computes. The spec states capacity
+/// in a deliberately different canonical form, so the two meet only on the
+/// shared name for `n`. Every instruction read here is valid trust-ir with its
+/// reference-interpreter meaning (the header used to be written through
+/// store-form `InsertField`s, which only the adapter's interpretation gave a
+/// meaning — WS7.1 (b) removed that trusted-model boundary).
 pub(crate) fn fold_emitted_slice_to_vec_header(
     nodes: &[InstrNode],
 ) -> Option<SliceToVecHeaderFolded> {
@@ -1054,7 +1157,7 @@ pub(crate) fn fold_emitted_slice_to_vec_header(
     for node in nodes {
         match &node.inst {
             // The header slot. `Alloca` defines a FRESH base the slice itself
-            // owns; bind it at offset 0 so the `InsertField`s resolve to it.
+            // owns; bind it at offset 0 so the field `Store`s resolve to it.
             Inst::Alloca { .. } => {
                 let result = node.results.first().copied()?;
                 if slot_base.is_some() {
@@ -1078,7 +1181,9 @@ pub(crate) fn fold_emitted_slice_to_vec_header(
 
             // The `cap = n >u 1 ? n : 1` guard compare. Captured as `Bool` so it
             // can only be consumed by the Select.
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (lane-9 width class)
                 }
@@ -1152,20 +1257,55 @@ pub(crate) fn fold_emitted_slice_to_vec_header(
                 )?;
             }
 
-            Inst::InsertField {
-                aggregate,
-                field,
-                value,
+            // The field address arithmetic (`slot_byte_ptr`): a reinterpreting
+            // `Copy`, the 8-byte `PtrToInt`/`IntToPtr` image, and the offset
+            // `Add`, all keeping the `slot + const` structure.
+            Inst::Copy { operand, .. } => {
+                let val = lookup_sv(&env, *operand);
+                bind_sv(&mut env, node, val)?;
+            }
+            Inst::Cast {
+                op: CastOp::PtrToInt | CastOp::IntToPtr,
+                src_ty,
+                dst_ty,
+                operand,
+            } => {
+                if scalar_byte_width(src_ty) != Some(8) || scalar_byte_width(dst_ty) != Some(8) {
+                    return None; // a narrow cast truncates the address
+                }
+                match lookup_sv(&env, *operand) {
+                    Sv::Bool => return None,
+                    v => bind_sv(&mut env, node, v)?,
+                }
+            }
+            Inst::BinOp {
+                op: TrustIrBinOp::Add,
+                ty,
+                lhs,
+                rhs,
                 ..
             } => {
-                let Sv::Ptr { base, off } = lookup_sv(&env, *aggregate) else {
+                if scalar_byte_width(ty) != Some(8) {
+                    return None; // narrow arithmetic truncates
+                }
+                let v = sv_add(&mut inputs, lookup_sv(&env, *lhs), lookup_sv(&env, *rhs))?;
+                bind_sv(&mut env, node, v)?;
+            }
+
+            // One header field: an 8-byte `Store` at `slot + 8*field`.
+            Inst::Store { ty, ptr, value, .. } => {
+                if scalar_byte_width(ty) != Some(8) {
+                    return None; // every header field is one 64-bit word
+                }
+                let Sv::Ptr { base, off } = lookup_sv(&env, *ptr) else {
                     return None;
                 };
-                if off != 0 {
-                    return None; // the header is written at the slot base
+                if off < 0 || off % 8 != 0 {
+                    return None; // not a header word
                 }
+                let field = u32::try_from(off / 8).ok()?;
                 let val = sv_bv(&mut inputs, lookup_sv(&env, *value))?;
-                stores.push((base, *field, val));
+                stores.push((base, field, val));
             }
 
             // Anything else is out of the to_vec header slice.
@@ -1228,13 +1368,18 @@ fn emitted_ugt_guard(env: &HashMap<ValueId, Sv>, nodes: &[InstrNode]) -> Option<
 ///
 /// `cap`, `alloc_bytes`, `alloc_align` and the `cap`/`len` field stores ARE
 /// obligations, because their spec sides are built independently: capacity from
-/// the canonical `ITE(n == 0, 1, n)`, size/align from the LAYOUT ORACLE, and
+/// the source count `n`, size/align from the LAYOUT ORACLE, and
 /// length from the shared symbol for `n`. An emission that stores capacity into
 /// the length field (or vice versa) yields a different folded formula and
 /// REFUTES.
 ///
-/// Returns `None` (skip, sound) if any header field is missing or the `ptr`
-/// field does not hold the allocation result.
+/// Returns `None` if any header field is missing or the `ptr` field does not
+/// hold the allocation result. Strict refinement refuses this miss; diagnostic
+/// mode records SKIPPED and grants no proof credit.
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 pub(crate) fn slice_to_vec_header_obligations(
     name: &str,
     folded: &SliceToVecHeaderFolded,
@@ -1244,7 +1389,11 @@ pub(crate) fn slice_to_vec_header_obligations(
     field_ptr: u32,
     field_cap: u32,
     field_len: u32,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec = trust_cg_verify::mir_semantics::slice_to_vec_header_spec(
         &sa_value_name(n),
         elem_size,
@@ -1324,8 +1473,13 @@ fn split_at_obligation(
 /// `off0`/`off1` are the destination tuple's two `{data,len}` field byte offsets
 /// (the layout the bridge stored through); `ptr`/`len`/`mid` are the receiver's
 /// data-pointer / length / split-index `ValueId`s (named via [`sa_value_name`],
-/// matching the fold). Returns `None` when the reconstructed stores do not cover
-/// the two halves' lanes (a shape mismatch — fail closed, never a wrong verdict).
+/// matching the fold). Returns `None` when the reconstructed stores are not
+/// exactly the two halves' four lanes, each written once (a shape mismatch — never
+/// a wrong verdict; the strict lane refuses it).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn split_at_obligations(
     name: &str,
@@ -1336,7 +1490,11 @@ pub(crate) fn split_at_obligations(
     len: ValueId,
     mid: ValueId,
     elem_size: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: SplitAtSpec = split_at_spec(
         &sa_value_name(ptr),
         &sa_value_name(len),
@@ -1344,6 +1502,11 @@ pub(crate) fn split_at_obligations(
         elem_size,
     );
 
+    // EXACT store set: the four `{data,len}` cells, each written once, and no
+    // other store into the tuple slot.
+    if folded.stores.len() != 4 {
+        return None;
+    }
     let fst_data = folded.store_value(off0, 0)?;
     let fst_len = folded.store_value(off0, 1)?;
     let snd_data = folded.store_value(off1, 0)?;
@@ -1385,35 +1548,37 @@ pub(crate) fn split_at_obligations(
 // ===========================================================================
 //
 // The bridge lowers `v.chunks(n)` (and the four siblings) over a `&[T]` receiver
-// into a `{ ptr@0 = data, end@8 = data + len*elem_size, n@16 = n }` cursor written
-// through THREE typed `Store`s into the destination slot, guarded by an `ICmp
-// Ne(n, 0)` (std's "chunk/window size must be non-zero" panic — the class the
-// `chunks(0)` infinite-loop bug lived in). This lane reconstructs the trap
-// predicate + the three cursor field VALUES SYMBOLICALLY from the exact trust-ir
-// the bridge EMITTED (`emit_element_addr`'s Mul/Add for `end`, the `ICmp`, and the
-// three `emit_typed_store`s), naming the receiver's `data`/`len`/`n` (external
-// values the slice never defines) by their `ValueId`. The SPEC side
-// (`mir_semantics::stride_iter_ctor_spec`) re-derives the SAME cursor from the Rust
-// definition over the SAME symbolic names. The two meet only on those names — so a
-// bridge that drops/inverts the `n != 0` check, scales `end` by the wrong element
-// size, computes `end` off the wrong base, or swaps the cursor fields folds to a
-// genuinely different formula and REFUTES. A shape the fold does not recognise (a
-// MISSING `n != 0` check, an unexpected instruction) returns `None` — the statement
-// is SKIPPED, never guessed at (sound: less coverage, never a wrong verdict).
+// into std's own iterator state, written at rustc's field offsets through typed
+// `Store`s into the destination slot: `v: &[T]` (data, length), the size `n`, and
+// for `chunks_exact`/`rchunks_exact` the fixed `rem: &[T]` split off by
+// `len % n` (a `URem`), all guarded by an `ICmp Ne(n, 0)` (std's "chunk/window
+// size must be non-zero" panic — the class the `chunks(0)` infinite-loop bug
+// lived in). This lane reconstructs the trap predicate + every stored state
+// VALUE SYMBOLICALLY from the exact trust-ir the bridge EMITTED (the `ICmp`, the
+// `URem`/`Sub` split, `emit_element_addr`'s Mul/Add for a split-off data
+// pointer, and the typed stores), naming the receiver's `data`/`len`/`n`
+// (external values the slice never defines) by their `ValueId`. The SPEC side
+// (`mir_semantics::stride_iter_ctor_spec`) re-derives the SAME state from std's
+// `new` over the SAME symbolic names. The two meet only on those names — so a
+// bridge that drops/inverts the `n != 0` check, scales a split-off pointer by the
+// wrong element size, splits at the wrong index, or swaps two state fields folds
+// to a genuinely different formula and REFUTES. A shape the fold does not
+// recognise (a MISSING `n != 0` check, an unexpected instruction) returns `None` —
+// the statement is SKIPPED, never guessed at (sound: less coverage, never a wrong
+// verdict).
 //
 // This reuses the `split_at` `Sv`/`sv_*`/`sa_value_name`/`icmp_bool` machinery
-// verbatim; the only structural difference is that the cursor is written through
-// typed `Store`s (not `InsertField`s), so the fold reconstructs `(dest offset,
-// value)` pairs from the emitted `Store` address arithmetic.
+// verbatim, and, like it, reconstructs `(dest offset, value)` pairs from the
+// emitted `Store` address arithmetic.
 
 /// The bridge's reconstructed stride-iterator constructor: the `n != 0` "continue"
-/// (no-trap) predicate and the emitted `{ ptr, end, n }` cursor field stores.
+/// (no-trap) predicate and the emitted state field stores.
 pub(crate) struct StrideIterCtorFolded {
     /// The reconstructed "continue" (no-trap) predicate — the emitted `n != 0`
     /// `ICmp`'s comparison. The bridge branches to the constructor's normal target
     /// when this holds and TRAPS (the non-zero-stride panic) otherwise.
     ok: SmtExpr,
-    /// The emitted cursor field stores as `(dest byte offset, value)` — one per
+    /// The emitted state field stores as `(dest byte offset, value)` — one per
     /// `emit_typed_store` into the destination slot. All share the one dest base.
     stores: Vec<(u64, SmtExpr)>,
     /// Symbolic 64-bit inputs the reconstruction references.
@@ -1421,26 +1586,26 @@ pub(crate) struct StrideIterCtorFolded {
 }
 
 impl StrideIterCtorFolded {
-    /// The value stored into the cursor slot at byte `offset`.
+    /// The value stored into the state slot at byte `offset`, when exactly one
+    /// store wrote it (a lane written twice is out of shape: `None`).
     fn store_value(&self, offset: u64) -> Option<SmtExpr> {
-        self.stores
-            .iter()
-            .find(|(o, _)| *o == offset)
-            .map(|(_, v)| v.clone())
+        let mut hits = self.stores.iter().filter(|(o, _)| *o == offset);
+        let (_, value) = hits.next()?;
+        hits.next().is_none().then(|| value.clone())
     }
 }
 
 /// Fold the EMITTED trust-ir of a stride-iterator constructor lowering (the
-/// `emit_element_addr` Mul/Add for `end`, the `ICmp Ne(n, 0)`, and the three
-/// `emit_typed_store`s that write `{ ptr, end, n }` into the destination cursor
-/// slot) into a [`StrideIterCtorFolded`].
+/// `ICmp Ne(n, 0)`, the `*_exact` `URem`/`Sub` split with `emit_element_addr`'s
+/// Mul/Add for a split-off data pointer, and the `emit_typed_store`s that write
+/// std's state into the destination slot) into a [`StrideIterCtorFolded`].
 ///
 /// Reconstructs each value from the REAL emitted `Const`/`Copy`/`PtrToInt`/
-/// `IntToPtr`/`Add`/`Sub`/`Mul`/`ICmp`/`Store` — never a re-derivation from the
+/// `IntToPtr`/`Add`/`Sub`/`Mul`/`URem`/`ICmp`/`Store` — never a re-derivation from the
 /// spec — so a wrong emitted formula produces a wrong folded value here and the
 /// obligation against the layout-independent spec REFUTES (the anti-tautology
 /// guarantee). Returns `None` (skip the statement, sound) for ANY instruction
-/// outside this slice, a MISSING non-zero check (`ok` never set), or cursor stores
+/// outside this slice, a MISSING non-zero check (`ok` never set), or state stores
 /// that do not all share the one destination-slot base.
 pub(crate) fn fold_emitted_stride_iter_ctor(nodes: &[InstrNode]) -> Option<StrideIterCtorFolded> {
     let mut env: HashMap<ValueId, Sv> = HashMap::new();
@@ -1526,13 +1691,30 @@ pub(crate) fn fold_emitted_stride_iter_ctor(nodes: &[InstrNode]) -> Option<Strid
                 let v = sv_mul(&mut inputs, lookup_sv(&env, *lhs), lookup_sv(&env, *rhs))?;
                 bind_sv(&mut env, node, v)?;
             }
+            // The `*_exact` remainder length `len % n` (unsigned: `usize`).
+            Inst::BinOp {
+                op: TrustIrBinOp::URem,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } => {
+                if scalar_byte_width(ty) != Some(8) {
+                    return None; // narrow arithmetic truncates (the lane-9 width class)
+                }
+                let l = sv_bv(&mut inputs, lookup_sv(&env, *lhs))?;
+                let r = sv_bv(&mut inputs, lookup_sv(&env, *rhs))?;
+                bind_sv(&mut env, node, Sv::Expr(l.bvurem(r)))?;
+            }
 
             // The (single) `n != 0` `ICmp` -> the continue predicate. Its result
             // feeds a `CondBr` outside the folded slice; it is bound as a `Bool` so
             // a (malformed) shape flowing an `ICmp` result into arithmetic / a store
             // value bails the fold (`sv_bv`/`Cast` reject a `Bool`), never
             // mis-folding it as an external pointer.
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -1545,7 +1727,7 @@ pub(crate) fn fold_emitted_stride_iter_ctor(nodes: &[InstrNode]) -> Option<Strid
                 bind_sv(&mut env, node, Sv::Bool)?;
             }
 
-            // A cursor field store into the destination slot. The address is
+            // A state field store into the destination slot. The address is
             // `dest_base + const_offset`; the value is a reconstructed 64-bit field.
             // The `Store` has no result to bind.
             Inst::Store { ptr, value, .. } => {
@@ -1563,7 +1745,7 @@ pub(crate) fn fold_emitted_stride_iter_ctor(nodes: &[InstrNode]) -> Option<Strid
     }
 
     let ok = ok?; // a MISSING non-zero check -> None (fail-closed skip)
-    // Every store must target the SAME destination base (the cursor slot).
+    // Every store must target the SAME destination base (the state slot).
     let base0 = stores.first()?.0;
     if !stores.iter().all(|(b, ..)| *b == base0) {
         return None;
@@ -1572,47 +1754,81 @@ pub(crate) fn fold_emitted_stride_iter_ctor(nodes: &[InstrNode]) -> Option<Strid
     Some(StrideIterCtorFolded { ok, stores, inputs })
 }
 
+/// Byte offsets of the state lanes a stride-iterator constructor stores (rustc's
+/// layout of std's iterator: `v`'s data and length, the size, and for the
+/// `*_exact` kinds `rem`'s data and length).
+#[derive(Clone, Copy)]
+pub(crate) struct StrideIterStateOffsets {
+    pub(crate) v_data: u64,
+    pub(crate) v_len: u64,
+    pub(crate) size: u64,
+    pub(crate) rem: Option<(u64, u64)>,
+}
+
 /// Pair the reconstructed bridge stride-iter constructor (`folded`) with the Rust
-/// [`stride_iter_ctor_spec`] over the SAME symbolic `data`/`len`/`n` names and
-/// build the four CORE refinement obligations:
-///   * `trap` — the bridge traps (takes the non-`ok` edge) IFF `n == 0`;
-///   * `ptr`  — the value stored at `ptr_off` equals `data`;
-///   * `end`  — the value stored at `end_off` equals `data + len*elem_size`;
-///   * `n`    — the value stored at `n_off` equals `n`.
+/// [`stride_iter_ctor_spec`] for `kind` over the SAME symbolic `data`/`len`/`n`
+/// names and build the refinement obligations:
+///   * `trap`   — the bridge traps (takes the non-`ok` edge) IFF `n == 0`;
+///   * `v_data` / `v_len` — the values stored at `offsets.v_data` / `v_len` equal
+///     the spec's `v`;
+///   * `size`   — the value stored at `offsets.size` equals `n`;
+///   * `rem_data` / `rem_len` (the `*_exact` kinds) — the values stored at
+///     `offsets.rem` equal the spec's `rem`.
 ///
-/// `ptr_off`/`end_off`/`n_off` are the cursor's three field byte offsets (the
-/// layout the bridge stored through — `0` / `SLICE_ITER_END_OFFSET` /
-/// `WINDOWS_SIZE_OFFSET`); `data`/`len`/`n` are the receiver's data-pointer /
-/// length / stride `ValueId`s (named via [`sa_value_name`], matching the fold).
-/// Returns `None` when the reconstructed stores do not cover the three cursor
-/// fields (a shape mismatch — fail closed, never a wrong verdict).
+/// `data`/`len`/`n` are the receiver's data-pointer / length / stride `ValueId`s
+/// (named via [`sa_value_name`], matching the fold). Returns `None` when a state
+/// lane the spec defines was not stored exactly once, a lane was stored that the
+/// state does not have, or `offsets.rem` disagrees with `kind` (a shape mismatch —
+/// fail closed, never a wrong verdict).
 ///
-/// The `*_exact` remainder fields (offsets 24/32) are OUT OF SCOPE: the fold's
-/// slice ends at the third cursor store, so a `*_exact` construction is refined on
-/// its CORE cursor + trap exactly like the non-exact variants, ABSTAINING on the
-/// remainder (never claimed, never falsely Refined).
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stride_iter_ctor_obligations(
     name: &str,
     folded: &StrideIterCtorFolded,
-    ptr_off: u64,
-    end_off: u64,
-    n_off: u64,
+    kind: StrideIterCtorKind,
+    offsets: StrideIterStateOffsets,
     data: ValueId,
     len: ValueId,
     n: ValueId,
     elem_size: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: StrideIterCtorSpec = stride_iter_ctor_spec(
+        kind,
         &sa_value_name(data),
         &sa_value_name(len),
         &sa_value_name(n),
         elem_size,
     );
 
-    let cur_ptr = folded.store_value(ptr_off)?;
-    let cur_end = folded.store_value(end_off)?;
-    let cur_n = folded.store_value(n_off)?;
+    let mut lanes = vec![
+        ("v_data", offsets.v_data, spec.v_data.clone()),
+        ("v_len", offsets.v_len, spec.v_len.clone()),
+        ("size", offsets.size, spec.size.clone()),
+    ];
+    match (offsets.rem, spec.rem.clone()) {
+        (Some((rem_data_off, rem_len_off)), Some((rem_data, rem_len))) => {
+            lanes.push(("rem_data", rem_data_off, rem_data));
+            lanes.push(("rem_len", rem_len_off, rem_len));
+        }
+        (None, None) => {}
+        _ => return None,
+    }
+    // Every store must be one of the state lanes (a store elsewhere in the slot
+    // is a write the spec does not describe).
+    if !folded
+        .stores
+        .iter()
+        .all(|(off, _)| lanes.iter().any(|(_, lane, _)| lane == off))
+    {
+        return None;
+    }
 
     // Declare every symbolic name either side references: the fold names
     // `data`/`len`/`n` identically to the spec, so `folded.inputs` normally already
@@ -1635,12 +1851,18 @@ pub(crate) fn stride_iter_ctor_obligations(
     let bridge_trap = SmtExpr::ite(folded.ok.clone(), zero.clone(), one.clone());
     let spec_trap = SmtExpr::ite(spec.trap.clone(), one, zero);
 
-    Some(vec![
-        split_at_obligation(name, "trap", bridge_trap, spec_trap, inputs),
-        split_at_obligation(name, "ptr", cur_ptr, spec.ptr, inputs),
-        split_at_obligation(name, "end", cur_end, spec.end, inputs),
-        split_at_obligation(name, "n", cur_n, spec.n, inputs),
-    ])
+    let mut obligations = vec![split_at_obligation(
+        name,
+        "trap",
+        bridge_trap,
+        spec_trap,
+        inputs,
+    )];
+    for (sub, offset, spec_value) in lanes {
+        let stored = folded.store_value(offset)?;
+        obligations.push(split_at_obligation(name, sub, stored, spec_value, inputs));
+    }
+    Some(obligations)
 }
 
 // ===========================================================================
@@ -1663,8 +1885,9 @@ pub(crate) fn stride_iter_ctor_obligations(
 // check (the real O0 `v[oob]`-reads-silently soundness bug class), scales the
 // address by the wrong element size, or computes it off the wrong base folds to a
 // genuinely different formula and REFUTES. A shape the fold does not recognise (a
-// MISSING bounds check, an unexpected instruction) returns `None` — the statement
-// is SKIPPED, never guessed at (sound: less coverage, never a wrong verdict). The
+// MISSING bounds check, an unexpected instruction) returns `None` and is never
+// guessed at: the strict lane refuses the job, the default lanes skip it (see the
+// module header). The
 // `unsafe` UNCHECKED variants (`get_unchecked*`) are NEVER captured (the lowering
 // gates the capture on `checked`), so they can be neither falsely refuted nor
 // falsely refined.
@@ -1791,7 +2014,9 @@ pub(crate) fn fold_emitted_vec_index(nodes: &[InstrNode]) -> Option<VecIndexFold
             // (malformed) shape flowing an `ICmp` result into arithmetic bails the
             // fold (`sv_bv`/`Cast` reject a `Bool`), never mis-folding it as an
             // external pointer.
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -1837,6 +2062,10 @@ pub(crate) fn fold_emitted_vec_index(nodes: &[InstrNode]) -> Option<VecIndexFold
 /// stride in bytes. This lane covers the checked (`index`/`index_mut`) path only —
 /// the caller must never queue an `unsafe` `get_unchecked*` (there is no trap to
 /// refine against). Always returns `Some` (both obligations are unconditional).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 pub(crate) fn vec_index_obligations(
     name: &str,
     folded: &VecIndexFolded,
@@ -1844,7 +2073,11 @@ pub(crate) fn vec_index_obligations(
     len: ValueId,
     i: ValueId,
     elem_size: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: VecIndexSpec = vec_index_spec(
         &sa_value_name(data),
         &sa_value_name(len),
@@ -1875,7 +2108,13 @@ pub(crate) fn vec_index_obligations(
 
     Some(vec![
         split_at_obligation(name, "trap", bridge_trap, spec_trap, inputs),
-        split_at_obligation(name, "elem_addr", folded.elem_addr.clone(), spec.elem_addr, inputs),
+        split_at_obligation(
+            name,
+            "elem_addr",
+            folded.elem_addr.clone(),
+            spec.elem_addr,
+            inputs,
+        ),
     ])
 }
 
@@ -1886,8 +2125,8 @@ pub(crate) fn vec_index_obligations(
 //
 // The bridge lowers a checked Vec range subslice over a receiver decomposed into a
 // data pointer `data` + a length `len` into: the subslice `{ data + start*elem_size,
-// end - start }` written through TWO `InsertField`s (lane 0 = data ptr, lane 1 =
-// len) into the destination `{data,len}` slot, then a COMBINED bounds check
+// end - start }` written through TWO 8-byte lane `Store`s (lane 0 = data ptr, lane
+// 1 = len) into the destination `{data,len}` slot, then a COMBINED bounds check
 // `ok = (start <=u end) AND (end <=u len)` — TWO `ICmp Ule`s combined by a Bool
 // `And` — guarding a `CondBr` (the `range end index out of range` panic on the
 // out-of-range edge). The endpoints depend on the range form (`a..b`: start=a,
@@ -1895,7 +2134,7 @@ pub(crate) fn vec_index_obligations(
 // this SAME shape. This lane reconstructs the combined no-trap predicate + the two
 // `{ptr,len}` field VALUES SYMBOLICALLY from the exact trust-ir the bridge EMITTED
 // (`emit_element_addr`'s Mul/Add for the pointer, the `Sub` for the length, the two
-// `InsertField`s, and the two `ICmp`s + `And`), naming the receiver's
+// lane `Store`s, and the two `ICmp`s + `And`), naming the receiver's
 // `data`/`len`/`start`/`end` (external values the folded slice never defines) by
 // their `ValueId`. The SPEC side (`mir_semantics::vec_range_subslice_spec`)
 // re-derives the SAME subslice from the Rust definition over the SAME symbolic
@@ -1904,8 +2143,9 @@ pub(crate) fn vec_index_obligations(
 // scales the pointer by the wrong element size, computes the length off the wrong
 // `Sub` direction, or computes the pointer off the wrong base folds to a genuinely
 // different formula and REFUTES. A shape the fold does not recognise (a MISSING
-// bounds check, an unexpected instruction) returns `None` — the statement is
-// SKIPPED, never guessed at (sound: less coverage, never a wrong verdict). The
+// bounds check, an unexpected instruction) returns `None` and is never guessed
+// at: the strict lane refuses the job, the default lanes skip it (see the module
+// header). The
 // `str` range subslice (which adds `is_char_boundary` checks) is a DIFFERENT
 // lowering and is never captured on this path.
 //
@@ -1923,32 +2163,32 @@ pub(crate) struct VecRangeSubsliceFolded {
     /// an INCOMPLETE emission). The bridge branches to the subslice's normal target
     /// when this holds and TRAPS (the out-of-range panic) otherwise.
     ok: SmtExpr,
-    /// The emitted fat-ptr field stores as `(dest byte offset, lane, value)` — one
-    /// per `InsertField` the bridge performed into the destination `{data,len}` slot
-    /// (lane 0 = data ptr, lane 1 = len). All share the one destination base.
-    stores: Vec<(u64, u32, SmtExpr)>,
+    /// The emitted fat-ptr lane stores as `(absolute dest byte offset, value)` —
+    /// one per 8-byte `Store` the bridge performed into the destination
+    /// `{data,len}` slot (lane 0 = data ptr, lane 1 = len 8 bytes on). All share
+    /// the one destination base.
+    stores: Vec<(u64, SmtExpr)>,
     /// Symbolic 64-bit inputs the reconstruction references.
     inputs: Vec<(String, u32)>,
 }
 
 impl VecRangeSubsliceFolded {
-    /// The value stored into the fat-ptr slot at byte `offset`, lane `lane`.
+    /// The value of the ONE store into the fat-ptr slot at byte `offset`, lane
+    /// `lane`: `None` when no store or more than one store writes that cell (a
+    /// later write would leave a value the obligation never reads).
     fn store_value(&self, offset: u64, lane: u32) -> Option<SmtExpr> {
-        self.stores
-            .iter()
-            .find(|(o, l, _)| *o == offset && *l == lane)
-            .map(|(_, _, v)| v.clone())
+        fat_ptr_lane_store(&self.stores, offset, lane)
     }
 }
 
 /// Fold the EMITTED trust-ir of a Vec range-subslice lowering (the
 /// `emit_element_addr` Mul/Add for the result pointer, the `Sub` for the result
-/// length, the two `InsertField`s that write `{data,len}` into the destination slot,
+/// length, the two lane `Store`s that write `{data,len}` into the destination slot,
 /// and the two `ICmp Ule`s + Bool `And` combined bounds check) into a
 /// [`VecRangeSubsliceFolded`].
 ///
 /// Reconstructs each value from the REAL emitted `Const`/`Copy`/`PtrToInt`/
-/// `IntToPtr`/`Add`/`Sub`/`Mul`/`ICmp`/`And`/`InsertField` — never a re-derivation
+/// `IntToPtr`/`Add`/`Sub`/`Mul`/`ICmp`/`And`/`Store` — never a re-derivation
 /// from the spec — so a wrong emitted formula produces a wrong folded value here and
 /// the obligation against the layout-independent spec REFUTES (the anti-tautology
 /// guarantee). Each `ICmp`/`And` boolean's predicate is tracked; the `ok` continue
@@ -1957,7 +2197,9 @@ impl VecRangeSubsliceFolded {
 /// for ANY instruction outside this slice, a MISSING bounds check (no boolean
 /// produced), an `And` whose operands are not both reconstructed comparisons, or
 /// destination stores that do not all share the one slot base.
-pub(crate) fn fold_emitted_vec_range_subslice(nodes: &[InstrNode]) -> Option<VecRangeSubsliceFolded> {
+pub(crate) fn fold_emitted_vec_range_subslice(
+    nodes: &[InstrNode],
+) -> Option<VecRangeSubsliceFolded> {
     let mut env: HashMap<ValueId, Sv> = HashMap::new();
     let mut inputs: Vec<(String, u32)> = Vec::new();
     // Reconstructed predicate of each boolean `ValueId` (an `ICmp`/`And` result).
@@ -1965,8 +2207,8 @@ pub(crate) fn fold_emitted_vec_range_subslice(nodes: &[InstrNode]) -> Option<Vec
     // The predicate of the most recently produced boolean = the `ok` continue
     // predicate (the `And` in a well-formed emission; a lone `ICmp` if incomplete).
     let mut last_bool: Option<SmtExpr> = None;
-    // (dest base, byte offset, lane, value).
-    let mut stores: Vec<(ValueId, u64, u32, SmtExpr)> = Vec::new();
+    // (dest base, absolute byte offset, value).
+    let mut stores: Vec<(ValueId, u64, SmtExpr)> = Vec::new();
 
     for node in nodes {
         match &node.inst {
@@ -2055,7 +2297,8 @@ pub(crate) fn fold_emitted_vec_range_subslice(nodes: &[InstrNode]) -> Option<Vec
                 rhs,
                 ..
             } => {
-                let (Some(l), Some(r)) = (bool_preds.get(lhs).cloned(), bool_preds.get(rhs).cloned())
+                let (Some(l), Some(r)) =
+                    (bool_preds.get(lhs).cloned(), bool_preds.get(rhs).cloned())
                 else {
                     return None;
                 };
@@ -2074,7 +2317,9 @@ pub(crate) fn fold_emitted_vec_range_subslice(nodes: &[InstrNode]) -> Option<Vec
             // `ICmp` result into arithmetic / a store value bails the fold
             // (`sv_bv`/`Cast` reject a `Bool`), never mis-folding it as an external
             // pointer. Its reconstructed predicate is recorded for the `And`.
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -2089,22 +2334,20 @@ pub(crate) fn fold_emitted_vec_range_subslice(nodes: &[InstrNode]) -> Option<Vec
                 env.insert(*result, Sv::Bool);
             }
 
-            // A fat-ptr field store into the destination `{data,len}` slot. The
-            // aggregate operand is `dest_base + const_offset`; the value is a
-            // reconstructed 64-bit half field. The `InsertField` result is not read
-            // further.
-            Inst::InsertField {
-                aggregate,
-                field,
-                value,
-                ..
-            } => {
-                let Sv::Ptr { base, off } = lookup_sv(&env, *aggregate) else {
+            // A fat-ptr lane store into the destination `{data,len}` slot: the
+            // lane's byte address (`slot_byte_ptr`, folded to `dest_base +
+            // absolute byte offset`) and a typed 8-byte `Store` (WS7.1 (b); it
+            // used to be the store form of `InsertField`).
+            Inst::Store { ty, ptr, value, .. } => {
+                if scalar_byte_width(ty) != Some(8) {
+                    return None; // a fat-ptr lane is one 64-bit word
+                }
+                let Sv::Ptr { base, off } = lookup_sv(&env, *ptr) else {
                     return None;
                 };
                 let off = u64::try_from(off).ok()?;
                 let val = sv_bv(&mut inputs, lookup_sv(&env, *value))?;
-                stores.push((base, off, *field, val));
+                stores.push((base, off, val));
             }
 
             // Anything else is out of the range-subslice fold slice.
@@ -2118,7 +2361,7 @@ pub(crate) fn fold_emitted_vec_range_subslice(nodes: &[InstrNode]) -> Option<Vec
     if !stores.iter().all(|(b, ..)| *b == base0) {
         return None;
     }
-    let stores = stores.into_iter().map(|(_, o, f, v)| (o, f, v)).collect();
+    let stores = stores.into_iter().map(|(_, o, v)| (o, v)).collect();
     Some(VecRangeSubsliceFolded { ok, stores, inputs })
 }
 
@@ -2136,8 +2379,12 @@ pub(crate) fn fold_emitted_vec_range_subslice(nodes: &[InstrNode]) -> Option<Vec
 /// how the endpoints bind (`RangeFrom` anchors `end` to `len`); `data`/`len`/`a`/`b`
 /// are the receiver's data-pointer / length / start / end `ValueId`s (named via
 /// [`sa_value_name`], matching the fold). Returns `None` when the reconstructed
-/// stores do not cover the two fat-ptr lanes (a shape mismatch — fail closed, never
-/// a wrong verdict).
+/// stores are not exactly the two fat-ptr lanes, each written once (a shape
+/// mismatch — never a wrong verdict; the strict lane refuses it).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vec_range_subslice_obligations(
     name: &str,
@@ -2149,7 +2396,11 @@ pub(crate) fn vec_range_subslice_obligations(
     a: ValueId,
     b: ValueId,
     elem_size: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: VecRangeSubsliceSpec = vec_range_subslice_spec(
         form,
         &sa_value_name(data),
@@ -2159,6 +2410,11 @@ pub(crate) fn vec_range_subslice_obligations(
         elem_size,
     );
 
+    // EXACT store set: the two `{data,len}` cells, each written once, and no
+    // other store into the result slot.
+    if folded.stores.len() != 2 {
+        return None;
+    }
     let result_ptr = folded.store_value(data_off, 0)?;
     let result_len = folded.store_value(data_off, 1)?;
 
@@ -2307,7 +2563,9 @@ pub(crate) fn fold_emitted_slice_first_last(nodes: &[InstrNode]) -> Option<Optio
             // The emptiness `ICmp Ne(len, 0)` -> a comparison predicate. Bound as a
             // `Bool` so a shape flowing an `ICmp` result into arithmetic / a store
             // value bails the fold (`sv_bv`/`Cast` reject a `Bool`).
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -2354,7 +2612,11 @@ pub(crate) fn fold_emitted_slice_first_last(nodes: &[InstrNode]) -> Option<Optio
                 };
                 let then_bv = sv_bv(&mut inputs, lookup_sv(&env, *then_val))?;
                 let else_bv = sv_bv(&mut inputs, lookup_sv(&env, *else_val))?;
-                bind_sv(&mut env, node, Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)))?;
+                bind_sv(
+                    &mut env,
+                    node,
+                    Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)),
+                )?;
             }
 
             // The single niche `Store` into the `Option<&T>` slot. Capture the chosen
@@ -2387,6 +2649,10 @@ pub(crate) fn fold_emitted_slice_first_last(nodes: &[InstrNode]) -> Option<Optio
 /// [`sa_value_name`], matching the fold). Structurally distinct (non-vacuous):
 /// equal only when the emitted emptiness test, element index, element scale, and
 /// null `None` all match the Rust semantics.
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 pub(crate) fn slice_first_last_obligations(
     name: &str,
     folded: &OptionRefFolded,
@@ -2394,7 +2660,11 @@ pub(crate) fn slice_first_last_obligations(
     data: ValueId,
     len: ValueId,
     elem_size: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: OptionRefSpec =
         slice_first_last_spec(kind, &sa_value_name(data), &sa_value_name(len), elem_size);
 
@@ -2435,8 +2705,8 @@ pub(crate) fn slice_first_last_obligations(
 // (post-increment yield) folds to a genuinely different formula and REFUTES. A
 // shape the fold does not recognise (a non-8-byte load, an unexpected
 // instruction, a store set that is not EXACTLY the three expected cells)
-// returns `None` — the statement is SKIPPED, never guessed at (sound: less
-// coverage, never a wrong verdict).
+// returns `None` and is never guessed at: the strict lane refuses the job, the
+// default lanes skip it (see the module header).
 
 /// The bridge's reconstructed `Range::next`: every emitted typed `Store` (the
 /// `self.start` write-back + the `Option<T>` tag and payload stores), each with
@@ -2517,7 +2787,8 @@ pub(crate) fn fold_emitted_range_next(nodes: &[InstrNode]) -> Option<RangeNextFo
             // value exactly).
             Inst::Copy { operand, .. } => {
                 let val = lookup_sv(&env, *operand);
-                if let (Some(w), [result]) = (narrow_w.get(operand).copied(), node.results.as_slice())
+                if let (Some(w), [result]) =
+                    (narrow_w.get(operand).copied(), node.results.as_slice())
                 {
                     narrow_w.insert(*result, w);
                 }
@@ -2602,7 +2873,9 @@ pub(crate) fn fold_emitted_range_next(nodes: &[InstrNode]) -> Option<RangeNextFo
             // modeling `interpret.rs::eval_int_icmp`'s `as_signed` decode) over
             // operands vetted `w`-masked by `narrow_masked_operand` (anything
             // else bails — skip, sound).
-            Inst::ICmp { op, ty, lhs, rhs, .. } => match scalar_byte_width(ty)? {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => match scalar_byte_width(ty)? {
                 8 => {
                     let l = sv_bv(&mut inputs, lookup_sv(&env, *lhs))?;
                     let r = sv_bv(&mut inputs, lookup_sv(&env, *rhs))?;
@@ -2681,7 +2954,11 @@ pub(crate) fn fold_emitted_range_next(nodes: &[InstrNode]) -> Option<RangeNextFo
                 };
                 let then_bv = sv_bv(&mut inputs, lookup_sv(&env, *then_val))?;
                 let else_bv = sv_bv(&mut inputs, lookup_sv(&env, *else_val))?;
-                bind_sv(&mut env, node, Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)))?;
+                bind_sv(
+                    &mut env,
+                    node,
+                    Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)),
+                )?;
             }
 
             // THE PRE-STATE LOAD: a typed `Load` from a reconstructed
@@ -2959,9 +3236,9 @@ pub(crate) fn range_next_obligations(
 // non-null `None`, an end-clobbering write-back, or an `Eq`-for-`Ne` inverted
 // exhaustion test folds to a genuinely different formula and REFUTES. A shape
 // the fold does not recognise (a non-8-byte load, an unexpected instruction, a
-// store set that is not EXACTLY the two expected cells) returns `None` — the
-// statement is SKIPPED, never guessed at (sound: less coverage, never a wrong
-// verdict).
+// store set that is not EXACTLY the two expected cells) returns `None` and is
+// never guessed at: the strict lane refuses the job, the default lanes skip it
+// (see the module header).
 
 /// The bridge's reconstructed slice `Iter::next`: every emitted typed `Store`
 /// (the `self.ptr` write-back + the niche-`Option<&T>` store), each with its
@@ -3099,7 +3376,9 @@ pub(crate) fn fold_emitted_slice_iter_next(nodes: &[InstrNode]) -> Option<SliceI
             // The `ptr != end` `ICmp` -> a comparison predicate. Bound as a `Bool`
             // so a shape flowing an `ICmp` result into arithmetic / a store value
             // bails the fold (`sv_bv`/`Cast` reject a `Bool`).
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -3147,7 +3426,11 @@ pub(crate) fn fold_emitted_slice_iter_next(nodes: &[InstrNode]) -> Option<SliceI
                 };
                 let then_bv = sv_bv(&mut inputs, lookup_sv(&env, *then_val))?;
                 let else_bv = sv_bv(&mut inputs, lookup_sv(&env, *else_val))?;
-                bind_sv(&mut env, node, Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)))?;
+                bind_sv(
+                    &mut env,
+                    node,
+                    Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)),
+                )?;
             }
 
             // THE PRE-STATE LOAD: a typed `Load` from a reconstructed
@@ -3232,6 +3515,10 @@ pub(crate) fn fold_emitted_slice_iter_next(nodes: &[InstrNode]) -> Option<SliceI
 /// would let one store satisfy two expectations and leave another store
 /// unvalidated. Any deviation returns `None` (skip, sound — the drain's
 /// shape-miss trace makes it visible).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 pub(crate) fn slice_iter_next_obligations(
     name: &str,
     folded: &SliceIterNextFolded,
@@ -3240,7 +3527,11 @@ pub(crate) fn slice_iter_next_obligations(
     elem_size: u64,
     end_off: u64,
     tag_off: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: SliceIterNextSpec = slice_iter_next_spec(
         &ld_value_name(self_base, 0),
         &ld_value_name(self_base, end_off),
@@ -3370,12 +3661,16 @@ fn low_bytes_mask(width: u32) -> u64 {
 }
 
 /// Fold the EMITTED trust-ir of a `StepBy::next` lowering
-/// (`lower_step_by_next` — ONE fold serves all three shapes: the v1
-/// SIGNED-Range-i64 std-layout path, the lane-12 PACKED-UNSIGNED Range path
-/// (whose `And`/`LShr`/`Shl`/`Or` prelude folds through the 8-byte arithmetic
-/// arms), and the lane-12 STD-LAYOUT SLICE-source path (whose
-/// `emit_element_addr` stride arithmetic and niche-`Option<&T>` dest reuse the
-/// lane-9 patterns)). For the v1 shape that is — the `Const 0`,
+/// (`lower_step_by_next` — ONE fold serves every shape: the v1
+/// SIGNED-Range-i64 std-layout path, the lane-12b STD-LAYOUT SLICE-source path
+/// (whose `emit_element_addr` stride arithmetic and niche-`Option<&T>` dest
+/// reuse the lane-9 patterns), the lane-12c COUNTDOWN unsigned 64-bit Range
+/// path (`lower_step_by_countdown_next`: the `step_minus_one` load and `+ 1`,
+/// the `end != 0` `ICmp Ne`, the `Add`/`Sub` and two `Select`s at the
+/// element type `U64`, and the `start`/`end` write-backs), and the test-only
+/// PACKED-UNSIGNED shape no lowering emits any more (whose
+/// `And`/`LShr`/`Shl`/`Or` prelude folds through the 8-byte arithmetic arms)).
+/// For the v1 shape that is — the `Const 0`,
 /// the `iter_field_addr` chains, the `step_minus_one` (I64) + `first_take`
 /// (I8, NARROW) pre-state `Load`s, the `ZExt(I8 -> I64)`, the `first_take != 0`
 /// `ICmp Ne`, the countdown `Select`, the `start`/`end` (I64) pre-state
@@ -3641,7 +3936,9 @@ pub(crate) fn fold_emitted_step_by_next(nodes: &[InstrNode]) -> Option<StepByNex
             // arithmetic / a store value bails the fold (`sv_bv`/`Cast` reject a
             // `Bool`). The emission does ALL comparisons at I64 — narrow compares
             // stay out of slice (the lane-10 hard gate).
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -3688,7 +3985,11 @@ pub(crate) fn fold_emitted_step_by_next(nodes: &[InstrNode]) -> Option<StepByNex
                 };
                 let then_bv = sv_bv(&mut inputs, lookup_sv(&env, *then_val))?;
                 let else_bv = sv_bv(&mut inputs, lookup_sv(&env, *else_val))?;
-                bind_sv(&mut env, node, Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)))?;
+                bind_sv(
+                    &mut env,
+                    node,
+                    Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)),
+                )?;
             }
 
             // THE PRE-STATE LOAD: a typed `Load` from a reconstructed
@@ -3800,6 +4101,10 @@ pub(crate) fn fold_emitted_step_by_next(nodes: &[InstrNode]) -> Option<StepByNex
 /// neighbouring bytes — or a narrow cursor/payload store truncating the
 /// value) fails the width-exact check. Any deviation returns `None` (skip,
 /// sound — the drain's shape-miss trace makes it visible).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_by_next_obligations(
     name: &str,
@@ -3814,7 +4119,11 @@ pub(crate) fn step_by_next_obligations(
     payload_off: u64,
     some_discr: u64,
     none_discr: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: StepByNextSpec = step_by_next_spec(
         &ld_value_name(self_base, sm_off),
         &ld_value_name_w(self_base, ft_off, 1),
@@ -3838,7 +4147,9 @@ pub(crate) fn step_by_next_obligations(
         for j in (i + 1)..expected.len() {
             let (bi, oi, wi) = expected[i];
             let (bj, oj, wj) = expected[j];
-            if bi == bj && oi < oj.checked_add(u64::from(wj))? && oj < oi.checked_add(u64::from(wi))?
+            if bi == bj
+                && oi < oj.checked_add(u64::from(wj))?
+                && oj < oi.checked_add(u64::from(wi))?
             {
                 return None; // degenerate layout: expected cells overlap
             }
@@ -3888,6 +4199,12 @@ pub(crate) fn step_by_next_obligations(
     ])
 }
 
+/// No bridge lowering emits the packed StepBy state any more (the StepBy slot
+/// holds std's layout for every source), so nothing in the compiler queues these
+/// obligations; the builder stays as the test-only refutation suite of
+/// [`step_by_next_packed_spec`] and of [`fold_emitted_step_by_next`]'s 8-byte
+/// arithmetic arms.
+///
 /// Pair the reconstructed bridge PACKED-UNSIGNED `StepBy<Range<u64|usize>>::next`
 /// (`folded` — the SAME [`fold_emitted_step_by_next`] serves all three StepBy
 /// shapes) with the Rust [`step_by_next_packed_spec`] over the SAME pre-state
@@ -3916,6 +4233,11 @@ pub(crate) fn step_by_next_obligations(
 /// clobber the `end` cell; a WIDTH LIE (a narrow packed-state store truncating
 /// the high `k-1` half) fails the width-exact check. Any deviation returns
 /// `None` (skip, sound — the drain's shape-miss trace makes it visible).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_by_next_packed_obligations(
     name: &str,
@@ -3929,7 +4251,11 @@ pub(crate) fn step_by_next_packed_obligations(
     payload_off: u64,
     some_discr: u64,
     none_discr: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: StepByNextPackedSpec = step_by_next_packed_spec(
         &ld_value_name(self_base, sm_off),
         &ld_value_name(self_base, src_off),
@@ -3952,7 +4278,9 @@ pub(crate) fn step_by_next_packed_obligations(
         for j in (i + 1)..expected.len() {
             let (bi, oi, wi) = expected[i];
             let (bj, oj, wj) = expected[j];
-            if bi == bj && oi < oj.checked_add(u64::from(wj))? && oj < oi.checked_add(u64::from(wi))?
+            if bi == bj
+                && oi < oj.checked_add(u64::from(wj))?
+                && oj < oi.checked_add(u64::from(wi))?
             {
                 return None; // degenerate layout: expected cells overlap
             }
@@ -3993,6 +4321,132 @@ pub(crate) fn step_by_next_packed_obligations(
     ])
 }
 
+/// Pair the reconstructed bridge COUNTDOWN `StepBy<Range<u64|usize>>::next`
+/// (`lower_step_by_countdown_next`; `folded` from [`fold_emitted_step_by_next`])
+/// with the Rust [`step_by_countdown_next_spec`] over the SAME pre-state load
+/// symbols and build the four refinement obligations:
+///   * `state_new_start` — the value written back to `(self_base, src_off)`
+///                         equals `ITE(end != 0, start + (sm + 1), start)`;
+///   * `state_new_end`   — the value written back to `(self_base, src_off + 8)`
+///                         (core's items-left count) equals
+///                         `ITE(end != 0, end - 1, end)`;
+///   * `option_tag`      — `(dest_base, tag_off)` equals
+///                         `ITE(end != 0, some_discr, none_discr)`;
+///   * `option_payload`  — `(dest_base, payload_off)` equals the PRE-state
+///                         `start`.
+///
+/// `sm`/`start`/`end` are the pre-state symbols
+/// [`ld_value_name`]`(self_base, sm_off)` / `(self_base, src_off)` /
+/// `(self_base, src_off + 8)` (matching the fold's `Load` bindings, so a
+/// swapped, wrong-field or wrong-width load names a different symbol and
+/// REFUTES).
+///
+/// SOUNDNESS SHAPE CHECK (mandatory, the lane-11 discipline with per-cell
+/// widths): the folded store set must be EXACTLY `{ (self_base, src_off, 8),
+/// (self_base, src_off + 8, 8), (dest_base, tag_off, tag_width),
+/// (dest_base, payload_off, 8) }`: one store each AT THE EXPECTED WIDTH, no
+/// extras and no duplicates. The stored cells' byte ranges, and the read-only
+/// `step_minus_one` cell's, must be pairwise disjoint per base. core's
+/// countdown `spec_next` writes neither `step_minus_one` nor `first_take`, so a
+/// store to either is an extra store. A MISSING `end` store hides a dropped
+/// count-down; a store to the wrong cell or a narrow store fails the
+/// width-exact check. Any deviation returns `None` (skip, sound: the drain's
+/// shape-miss trace makes it visible).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_by_countdown_next_obligations(
+    name: &str,
+    folded: &StepByNextFolded,
+    self_base: ValueId,
+    dest_base: ValueId,
+    sm_off: u64,
+    src_off: u64,
+    tag_off: u64,
+    tag_width: u32,
+    payload_off: u64,
+    some_discr: u64,
+    none_discr: u64,
+    pointer_bytes: u64,
+) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
+    let end_off = src_off.checked_add(8)?;
+    let spec: StepByCountdownNextSpec = step_by_countdown_next_spec(
+        &ld_value_name(self_base, sm_off),
+        &ld_value_name(self_base, src_off),
+        &ld_value_name(self_base, end_off),
+        some_discr,
+        none_discr,
+        tag_width,
+    );
+
+    // The mandatory shape check: exactly one store per expected (cell,
+    // width), exactly four stores overall, and same-base cells' byte ranges
+    // (the read-only `step_minus_one` cell included) pairwise disjoint.
+    let expected = [
+        (self_base, src_off, 8u32),
+        (self_base, end_off, 8u32),
+        (dest_base, tag_off, tag_width),
+        (dest_base, payload_off, 8u32),
+    ];
+    let cells = [
+        expected[0],
+        expected[1],
+        expected[2],
+        expected[3],
+        (self_base, sm_off, 8u32),
+    ];
+    for i in 0..cells.len() {
+        for j in (i + 1)..cells.len() {
+            let (bi, oi, wi) = cells[i];
+            let (bj, oj, wj) = cells[j];
+            if bi == bj
+                && oi < oj.checked_add(u64::from(wj))?
+                && oj < oi.checked_add(u64::from(wi))?
+            {
+                return None; // degenerate layout: cells overlap
+            }
+        }
+    }
+    if folded.stores.len() != expected.len() {
+        return None;
+    }
+    for (b, o, w) in expected {
+        let hits = folded
+            .stores
+            .iter()
+            .filter(|(sb, so, sw, _)| *sb == b && *so == o && *sw == w)
+            .count();
+        if hits != 1 {
+            return None;
+        }
+    }
+    let new_start = folded.store_value(self_base, src_off)?;
+    let new_end = folded.store_value(self_base, end_off)?;
+    let tag = folded.store_value(dest_base, tag_off)?;
+    let payload = folded.store_value(dest_base, payload_off)?;
+
+    // Declare every symbolic name either side references.
+    let mut inputs = folded.inputs.clone();
+    for si in &spec.inputs {
+        if !inputs.iter().any(|(nm, _)| nm == &si.0) {
+            inputs.push(si.clone());
+        }
+    }
+    let inputs = &inputs;
+
+    Some(vec![
+        split_at_obligation(name, "state_new_start", new_start, spec.new_start, inputs),
+        split_at_obligation(name, "state_new_end", new_end, spec.new_end, inputs),
+        split_at_obligation(name, "option_tag", tag, spec.tag, inputs),
+        split_at_obligation(name, "option_payload", payload, spec.payload, inputs),
+    ])
+}
+
 /// Pair the reconstructed bridge SLICE-source `StepBy<slice::Iter<T>>::next`
 /// (`folded` — the SAME [`fold_emitted_step_by_next`] serves all three StepBy
 /// shapes) with the Rust [`step_by_next_slice_spec`] over the SAME pre-state
@@ -4024,6 +4478,10 @@ pub(crate) fn step_by_next_packed_obligations(
 /// `first_take` store clobbering 7 neighbouring bytes, or a narrow
 /// cursor/niche store truncating the pointer) fails the width-exact check.
 /// Any deviation returns `None` (skip, sound).
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_by_next_slice_obligations(
     name: &str,
@@ -4035,7 +4493,11 @@ pub(crate) fn step_by_next_slice_obligations(
     src_off: u64,
     elem_size: u64,
     tag_off: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: StepByNextSliceSpec = step_by_next_slice_spec(
         &ld_value_name(self_base, sm_off),
         &ld_value_name_w(self_base, ft_off, 1),
@@ -4056,7 +4518,9 @@ pub(crate) fn step_by_next_slice_obligations(
         for j in (i + 1)..expected.len() {
             let (bi, oi, wi) = expected[i];
             let (bj, oj, wj) = expected[j];
-            if bi == bj && oi < oj.checked_add(u64::from(wj))? && oj < oi.checked_add(u64::from(wi))?
+            if bi == bj
+                && oi < oj.checked_add(u64::from(wj))?
+                && oj < oi.checked_add(u64::from(wi))?
             {
                 return None; // degenerate layout: expected cells overlap
             }
@@ -4250,7 +4714,9 @@ pub(crate) fn fold_emitted_split_ends(nodes: &[InstrNode]) -> Option<SplitEndsFo
             // The emptiness `ICmp Ne(len, 0)` -> a comparison predicate. Bound as a
             // `Bool` so a shape flowing an `ICmp` result into arithmetic / a store
             // value bails the fold (`sv_bv`/`Cast` reject a `Bool`).
-            Inst::ICmp { op, ty, lhs, rhs, .. } => {
+            Inst::ICmp {
+                op, ty, lhs, rhs, ..
+            } => {
                 if scalar_byte_width(ty) != Some(8) {
                     return None; // narrow compare truncates (the lane-9 width class)
                 }
@@ -4297,7 +4763,11 @@ pub(crate) fn fold_emitted_split_ends(nodes: &[InstrNode]) -> Option<SplitEndsFo
                 };
                 let then_bv = sv_bv(&mut inputs, lookup_sv(&env, *then_val))?;
                 let else_bv = sv_bv(&mut inputs, lookup_sv(&env, *else_val))?;
-                bind_sv(&mut env, node, Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)))?;
+                bind_sv(
+                    &mut env,
+                    node,
+                    Sv::Expr(SmtExpr::ite(pred, then_bv, else_bv)),
+                )?;
             }
 
             // A typed `Store` to a reconstructed `base + const_off` cell: capture
@@ -4334,7 +4804,9 @@ pub(crate) fn fold_emitted_split_ends(nodes: &[InstrNode]) -> Option<SplitEndsFo
 ///                        layout put the niche at `f0`, else the raw pointer);
 ///   * `split_f1`       — `(dest_base, f1)` equals the spec's tail data-pointer
 ///                        cell (the ITE when the niche is at `f1`, else raw);
-///   * `split_tail_len` — `(dest_base, f1+8)` equals `len - 1` (wrapping).
+///   * `split_tail_len` — `(dest_base, tail_len_off)` equals `len - 1`
+///                        (wrapping); `tail_len_off` is `f1` plus the tail
+///                        `&[T]`'s rustc metadata offset.
 ///
 /// `data`/`len` are the receiver's data-pointer / length `ValueId`s (named via
 /// [`sa_value_name`], matching the fold). `niche_at_f0` is the LAYOUT-designated
@@ -4342,13 +4814,20 @@ pub(crate) fn fold_emitted_split_ends(nodes: &[InstrNode]) -> Option<SplitEndsFo
 /// cell carries the ITE, so a dropped/misplaced emitted `Select` REFUTES.
 ///
 /// SOUNDNESS SHAPE CHECK (lane-7-hardened, mandatory): the folded store set must
-/// be EXACTLY `{ (dest_base, f0, 8), (dest_base, f1, 8), (dest_base, f1+8, 8) }`
-/// — one store each AT WIDTH 8 (a NARROW store would truncate the pointer/length
+/// be EXACTLY `{ (dest_base, f0, 8), (dest_base, f1, 8), (dest_base,
+/// tail_len_off, 8) }` — one store each AT WIDTH 8, the width of a 64-bit
+/// session's pointer and length (a NARROW store would truncate the pointer/length
 /// at runtime while folding to the full-width formula), no extras, no
 /// duplicates, and the three cells pairwise DISTINCT (non-distinct expected
 /// cells would let one store satisfy two expectations and leave a third store
 /// unvalidated). Any deviation returns `None` (skip, sound — the drain's
-/// shape-miss trace makes it visible).
+/// shape-miss trace makes it visible). The widths and the distinctness check
+/// describe a 64-bit session only: the bridge dispatches these obligations only
+/// when the session pointer is 8 bytes.
+///
+/// `pointer_bytes` is the session's pointer width: in a session the word
+/// model does not describe ([`word_model_describes`]) no obligation is
+/// stated (`None`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn split_ends_obligations(
     name: &str,
@@ -4358,10 +4837,15 @@ pub(crate) fn split_ends_obligations(
     dest_base: ValueId,
     f0: u64,
     f1: u64,
+    tail_len_off: u64,
     data: ValueId,
     len: ValueId,
     elem_size: u64,
+    pointer_bytes: u64,
 ) -> Option<Vec<ProofObligation>> {
+    if !word_model_describes(pointer_bytes) {
+        return None;
+    }
     let spec: SplitEndsSpec = split_first_last_spec(
         kind,
         niche_at_f0,
@@ -4376,7 +4860,7 @@ pub(crate) fn split_ends_obligations(
     let expected = [
         (dest_base, f0, 8u32),
         (dest_base, f1, 8u32),
-        (dest_base, f1 + 8, 8u32),
+        (dest_base, tail_len_off, 8u32),
     ];
     for i in 0..expected.len() {
         for j in (i + 1)..expected.len() {
@@ -4400,7 +4884,7 @@ pub(crate) fn split_ends_obligations(
     }
     let f0_val = folded.store_value(dest_base, f0)?;
     let f1_val = folded.store_value(dest_base, f1)?;
-    let tail_len_val = folded.store_value(dest_base, f1 + 8)?;
+    let tail_len_val = folded.store_value(dest_base, tail_len_off)?;
 
     // Declare every symbolic name either side references (the fold names
     // `data`/`len` identically to the spec; union defensively).
@@ -4432,7 +4916,9 @@ pub(crate) fn split_ends_obligations(
 mod tests {
     use super::*;
     use trust_cg_verify::ay_bridge::AYConfig;
-    use trust_cg_verify::mir_semantics::{check_memory_sequence, MemCheckConfig, RefinementOutcome};
+    use trust_cg_verify::mir_semantics::{
+        MemCheckConfig, RefinementOutcome, discharge_memory_sequence,
+    };
 
     // The slot base pointer (an external value the per-statement slice never
     // defines), and the fresh SSA values the emitted address arithmetic mints.
@@ -4451,63 +4937,54 @@ mod tests {
         InstrNode::new(inst).with_result(result)
     }
 
-    /// True while clean's Alethe reconstruction cannot yet verify ay v0.9.0's
-    /// and_pos-bridged strict surface (ay c74bc60bd1), or while a v0.9.0-era
-    /// authority answers the obligation VERDICTLESS under its strict
-    /// self-certification envelope: the cross-check lane fail-closes to
-    /// Inconclusive instead of confirming the refutation. When clean's
-    /// checker learns the surface — and once the installed authority upgrades
-    /// to ay main build.7534+, which publishes `unsat` with the hole
-    /// disclosure again (accepted by the established `incomplete AY proof
-    /// certificate:` shape) — this stops matching and every guarded test
-    /// resumes its original refutation/discharge assertion automatically —
-    /// the exemption cannot rot.
+    /// True while AY answers this obligation with the one tracked gap a test
+    /// may skip on, so the cross-check lane fail-closed to Inconclusive: `unsat`
+    /// whose own certificate discloses an unproved hole step
+    /// (`crate::solver_test_support`), or the solver-absent lane. A working
+    /// checker rejecting the proof, a bare `unknown` and AY's self-check
+    /// rejection never match and fail the test. When AY can certify the
+    /// obligation this stops matching and every guarded test resumes its
+    /// refutation/discharge assertion.
     fn alethe_crosscheck_gap(outcome: &RefinementOutcome) -> bool {
-        match outcome {
-            RefinementOutcome::Inconclusive { reason } => {
-                // Shape 1: solver present, but clean's Alethe reconstruction
-                // cannot yet verify ay v0.9.0's and_pos-bridged strict
-                // surface (ay c74bc60bd1).
-                (reason.contains("AY reported UNSAT but")
-                    && reason
-                        .contains("rejected or could not fully verify the exact Alethe proof"))
-                // Shape 2: no solver discoverable at all (the release gate's
-                // anonymous clone) — the lane refuses to credit a wide
-                // obligation on a statistical verdict, the same "verified
-                // MODULO solver" doctrine run_public_release_checks.sh
-                // applies to its other solver lanes.
-                    || (reason.contains("no solver available")
-                        && reason.contains("statistical"))
-                // Shape 3: v0.9.0-era authorities answer the larger blasts
-                // VERDICTLESS — AY COMPUTES UNSAT and then its mandatory
-                // strict self-certification declines the proof on a resource
-                // envelope (RUP expansion work limit), publishing
-                // `unknown (:reason-unknown (incomplete self-check-rejected))`
-                // instead of the verdict (ay 3cb091d23c). Matched ONLY on the
-                // reason-bearing transcript, NEVER on a bare
-                // "unknown: unknown": the resident ay server discards stderr
-                // and truncates this shape, and a bare unknown must keep
-                // failing. Delegates the canonical phrase to
-                // `trust_cg_verify::gap_classify` so this copy cannot drift.
-                    || reason.strip_prefix("unknown: ").is_some_and(|s| {
-                        s.contains("(:reason-unknown")
-                            && trust_cg_verify::gap_classify::ay_reason_is_self_check_rejection(s)
-                    })
-            }
-            _ => false,
-        }
+        crate::solver_test_support::refinement_is_certification_gap(outcome)
     }
 
     /// The skip notice printed by every test parked behind
     /// `alethe_crosscheck_gap`.
-    const ALETHE_GAP_SKIP_NOTICE: &str =
-        "skipping assertion: clean's Alethe reconstruction cannot yet verify ay \
-         v0.9.0's and_pos-bridged strict surface (ay c74bc60bd1); the \
-         cross-check lane fail-closed to Inconclusive";
+    const ALETHE_GAP_SKIP_NOTICE: &str = crate::solver_test_support::CERTIFICATION_GAP_SKIP_NOTICE;
 
-    /// The EXACT instruction sequence the bridge emits for a fixed-offset scalar
-    /// field load `*(I64*)(slot + offset)` (mirrors `memory_place_address` ->
-    /// `emit_i64_const` + `emit_element_addr` + `emit_typed_load`).
+    /// `check_memory_sequence` as a test must read it: every obligation is
+    /// discharged (`discharge_memory_sequence`) and the verdicts are folded by
+    /// `crate::solver_test_support::test_outcome`, so a gap on one obligation
+    /// hides neither a refutation nor a failure of another. The unknown-alias
+    /// refusal (nothing discharged) is `Inconclusive`, as in production. Same
+    /// signature as `check_memory_sequence`.
+    fn memory_sequence_test_outcome(
+        name: &str,
+        source_ops: &[MirMemOp],
+        bridge_ops: &[MirMemOp],
+        cfg: &MemCheckConfig,
+        config: &AYConfig,
+    ) -> Result<RefinementOutcome, String> {
+        use trust_cg_verify::mir_semantics::MemorySequenceDischarge;
+        Ok(
+            match discharge_memory_sequence(name, source_ops, bridge_ops, cfg, config)? {
+                MemorySequenceDischarge::Refused { reason } => {
+                    RefinementOutcome::Inconclusive { reason }
+                }
+                MemorySequenceDischarge::Discharged(verdicts) => {
+                    crate::solver_test_support::test_outcome(name, &verdicts)
+                }
+            },
+        )
+    }
+
+    /// The `Copy` spelling of a fixed-offset scalar field load
+    /// `*(I64*)(slot + offset)` (`emit_element_addr` + `emit_typed_load` with the
+    /// offset behind `coerce_to_i64`'s `Copy` and an explicit stride). The bridge
+    /// emits a `Copy` for every index that is not an `emit_i64_const` result;
+    /// `emitted_field_load_no_copy` is its constant-offset spelling. Both must
+    /// fold to the same `slot + offset`.
     fn emitted_field_load(offset: i128) -> Vec<InstrNode> {
         vec![
             // idx = const offset
@@ -4595,12 +5072,83 @@ mod tests {
         ]
     }
 
+    /// The EXACT instruction sequence the bridge emits for a fixed-offset scalar
+    /// field load `*(I64*)(slot + offset)` (`memory_place_address` /
+    /// `slot_byte_ptr` -> `emit_i64_const` + `emit_element_addr` +
+    /// `emit_typed_load`): `coerce_to_i64` returns the offset `Const` itself, and a
+    /// unit stride adds it to the base with no `Mul`.
+    fn emitted_field_load_no_copy(offset: i128) -> Vec<InstrNode> {
+        vec![
+            // off = const offset               (emit_i64_const)
+            node(
+                Inst::Const {
+                    ty: TrustIrTy::I64,
+                    value: Constant::Int(offset),
+                },
+                V_OFF,
+            ),
+            // base_ptr = Copy(slot)            (coerce_to_plain_ptr)
+            node(
+                Inst::Copy {
+                    ty: TrustIrTy::Ptr,
+                    operand: SLOT,
+                },
+                V_BASEPTR,
+            ),
+            // base_int = PtrToInt(base_ptr)
+            node(
+                Inst::Cast {
+                    op: CastOp::PtrToInt,
+                    src_ty: TrustIrTy::Ptr,
+                    dst_ty: TrustIrTy::I64,
+                    operand: V_BASEPTR,
+                },
+                V_BASEINT,
+            ),
+            // addr_int = base_int + off        (no `Copy`, no unit `Mul`)
+            node(
+                Inst::BinOp {
+                    op: TrustIrBinOp::Add,
+                    ty: TrustIrTy::I64,
+                    lhs: V_BASEINT,
+                    rhs: V_OFF,
+                },
+                V_ADDRINT,
+            ),
+            // addr = IntToPtr(addr_int)
+            node(
+                Inst::Cast {
+                    op: CastOp::IntToPtr,
+                    src_ty: TrustIrTy::I64,
+                    dst_ty: TrustIrTy::Ptr,
+                    operand: V_ADDRINT,
+                },
+                V_ADDR,
+            ),
+            // loaded = *addr : i64
+            node(
+                Inst::Load {
+                    ty: TrustIrTy::I64,
+                    ptr: V_ADDR,
+                    volatile: false,
+                    align: None,
+                },
+                V_LOADED,
+            ),
+        ]
+    }
+
     /// Build the (spec, bridge) sequences a drain would discharge: the layout
     /// SPEC designates `slot + spec_offset` (width 8); the bridge side is the
     /// FOLDED emitted load (at `emit_offset`) with the SHARED harness prepended.
     fn obligation(spec_offset: u64, emit_offset: i128) -> (Vec<MirMemOp>, Vec<MirMemOp>) {
+        obligation_for(spec_offset, &emitted_field_load(emit_offset))
+    }
+
+    /// `obligation` over an explicit emitted field-load sequence.
+    fn obligation_for(spec_offset: u64, emitted: &[InstrNode]) -> (Vec<MirMemOp>, Vec<MirMemOp>) {
         let (harness, spec_ops) = field_load_obligation(mem_base_name(SLOT), spec_offset, 8);
-        let folded = fold_emitted_mem_ops(&emitted_field_load(emit_offset)).expect("in slice");
+        let folded = fold_emitted_mem_ops(emitted).expect("in slice");
         let mut bridge = harness;
         bridge.extend(folded);
         (spec_ops, bridge)
@@ -4612,7 +5160,11 @@ mod tests {
         assert_eq!(ops.len(), 1, "exactly one load reconstructed, got {ops:?}");
         match &ops[0] {
             MirMemOp::Load { addr, width, .. } => {
-                assert_eq!(addr.base, mem_base_name(SLOT), "base reconstructed as the slot");
+                assert_eq!(
+                    addr.base,
+                    mem_base_name(SLOT),
+                    "base reconstructed as the slot"
+                );
                 assert_eq!(addr.offset, 16, "offset folded from Const*1 + base");
                 assert_eq!(*width, 8, "width from the emitted I64 Load");
             }
@@ -4627,7 +5179,7 @@ mod tests {
     #[test]
     fn correct_field_load_is_not_refuted() {
         let (spec, bridge) = obligation(16, 16);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_load_correct",
             &spec,
             &bridge,
@@ -4662,7 +5214,7 @@ mod tests {
         // Layout designates offset 16; the bridge EMITS offset 8 (a distinct
         // 8-byte cell). The fold reconstructs offset 8 from the emitted Const.
         let (spec, bridge) = obligation(16, 8);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_load_wrong_offset",
             &spec,
             &bridge,
@@ -4695,7 +5247,7 @@ mod tests {
             width: 8,
             dst: "impl_load0".into(),
         });
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_load_swapped_base",
             &spec,
             &bridge,
@@ -4731,6 +5283,190 @@ mod tests {
         );
     }
 
+    /// The no-`Copy` spelling folds to the same single load at `slot + offset`
+    /// as the `Copy` spelling (`fold_reconstructs_base_plus_offset`).
+    #[test]
+    fn fold_reconstructs_base_plus_offset_no_copy() {
+        let ops = fold_emitted_mem_ops(&emitted_field_load_no_copy(16)).expect("in slice");
+        assert_eq!(ops.len(), 1, "exactly one load reconstructed, got {ops:?}");
+        match &ops[0] {
+            MirMemOp::Load { addr, width, .. } => {
+                assert_eq!(
+                    addr.base,
+                    mem_base_name(SLOT),
+                    "base reconstructed as the slot"
+                );
+                assert_eq!(addr.offset, 16, "offset folded from base + Const");
+                assert_eq!(*width, 8, "width from the emitted I64 Load");
+            }
+            other => panic!("expected a Load, got {other:?}"),
+        }
+        let chain = fold_emitted_mem_ops(&emitted_field_load(16)).expect("in slice");
+        assert_eq!(
+            format!("{ops:?}"),
+            format!("{chain:?}"),
+            "the no-Copy spelling folds to the Copy spelling's `slot + 16`"
+        );
+    }
+
+    /// POSITIVE control for the no-`Copy` spelling: the correct offset is not
+    /// refuted, and Refines when a solver is present.
+    #[test]
+    fn correct_field_load_no_copy_is_not_refuted() {
+        let (spec, bridge) = obligation_for(16, &emitted_field_load_no_copy(16));
+        let outcome = memory_sequence_test_outcome(
+            "p1_field_load_no_copy_correct",
+            &spec,
+            &bridge,
+            &MemCheckConfig::default(),
+            &AYConfig::default(),
+        )
+        .expect("no structural error");
+        assert!(
+            !matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "correct no-Copy field load must not be refuted, got {outcome:?}"
+        );
+        if trust_cg_verify::ay_bridge::z3_available() {
+            if alethe_crosscheck_gap(&outcome) {
+                eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
+                return;
+            }
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "with a solver the correct no-Copy field load must Refine, got {outcome:?}"
+            );
+        }
+    }
+
+    /// ANTI-TAUTOLOGY for the no-`Copy` spelling: the `Const` the `Add` reads
+    /// directly carries the wrong offset (8 instead of 16) -> REFUTED.
+    #[test]
+    fn wrong_offset_field_load_no_copy_is_refuted() {
+        let (spec, bridge) = obligation_for(16, &emitted_field_load_no_copy(8));
+        let outcome = memory_sequence_test_outcome(
+            "p1_field_load_no_copy_wrong_offset",
+            &spec,
+            &bridge,
+            &MemCheckConfig::default(),
+            &AYConfig::default(),
+        )
+        .expect("no structural error");
+        assert!(
+            matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "a wrong no-Copy EMITTED offset must be REFUTED, got {outcome:?}"
+        );
+    }
+
+    /// The sequence the wasm32 lowering emits for the same load on its GEP
+    /// lane (`wasm32_inbounds::projection_addr`): `coerce_to_plain_ptr`, the
+    /// offset constant, `gep inbounds <pointee> base, [index]`, the load.
+    fn emitted_gep_field_load(pointee_ty: TrustIrTy, index: Inst) -> Vec<InstrNode> {
+        vec![
+            node(
+                Inst::Copy {
+                    ty: TrustIrTy::Ptr,
+                    operand: SLOT,
+                },
+                V_BASEPTR,
+            ),
+            node(index, V_OFF),
+            node(
+                Inst::GEP {
+                    pointee_ty,
+                    base: V_BASEPTR,
+                    indices: vec![V_OFF],
+                    inbounds: true,
+                },
+                V_ADDR,
+            ),
+            node(
+                Inst::Load {
+                    ty: TrustIrTy::I64,
+                    ptr: V_ADDR,
+                    volatile: false,
+                    align: None,
+                },
+                V_LOADED,
+            ),
+        ]
+    }
+
+    fn i64_const(v: i128) -> Inst {
+        Inst::Const {
+            ty: TrustIrTy::I64,
+            value: Constant::Int(v),
+        }
+    }
+
+    #[test]
+    fn fold_reconstructs_base_plus_offset_through_a_byte_gep() {
+        let ops = fold_emitted_mem_ops(&emitted_gep_field_load(TrustIrTy::U8, i64_const(16)))
+            .expect("in slice");
+        let chain = fold_emitted_mem_ops(&emitted_field_load(16)).expect("in slice");
+        assert_eq!(
+            format!("{ops:?}"),
+            format!("{chain:?}"),
+            "a byte GEP by 16 folds to the integer chain's `slot + 16`"
+        );
+    }
+
+    /// Only a byte GEP by a non-negative constant is `base + k`: a wider
+    /// element (the index would be scaled), a negative or runtime index, and a
+    /// GEP of two indices each take the fold out of slice.
+    #[test]
+    fn other_geps_are_out_of_slice() {
+        let wide = emitted_gep_field_load(TrustIrTy::I64, i64_const(2));
+        let negative = emitted_gep_field_load(TrustIrTy::U8, i64_const(-8));
+        let runtime = emitted_gep_field_load(
+            TrustIrTy::U8,
+            Inst::Load {
+                ty: TrustIrTy::I64,
+                ptr: SLOT,
+                volatile: false,
+                align: None,
+            },
+        );
+        let mut two = emitted_gep_field_load(TrustIrTy::U8, i64_const(16));
+        if let Inst::GEP { indices, .. } = &mut two[2].inst {
+            indices.push(V_OFF);
+        }
+        for (label, nodes) in [
+            ("wide", wide),
+            ("negative", negative),
+            ("runtime", runtime),
+            ("two indices", two),
+        ] {
+            assert!(
+                fold_emitted_mem_ops(&nodes).is_none(),
+                "{label}: must take the fold out of slice"
+            );
+        }
+    }
+
+    /// ANTI-TAUTOLOGY on the GEP lane: a byte GEP at the wrong offset (8, the
+    /// layout designating 16) folds to a different cell and is REFUTED.
+    #[test]
+    fn wrong_offset_byte_gep_field_load_is_refuted() {
+        let (harness, spec) = field_load_obligation(mem_base_name(SLOT), 16, 8);
+        let mut bridge = harness;
+        bridge.extend(
+            fold_emitted_mem_ops(&emitted_gep_field_load(TrustIrTy::U8, i64_const(8)))
+                .expect("in slice"),
+        );
+        let outcome = memory_sequence_test_outcome(
+            "p1_field_load_gep_wrong_offset",
+            &spec,
+            &bridge,
+            &MemCheckConfig::default(),
+            &AYConfig::default(),
+        )
+        .expect("no structural error");
+        assert!(
+            matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "a wrong GEP offset must be REFUTED, got {outcome:?}"
+        );
+    }
+
     // =======================================================================
     // FIELD STORE (`o.b.x = v`): the EMITTED store must write `v` to exactly the
     // layout-designated byte range and leave the sibling cells unchanged. The
@@ -4742,10 +5478,11 @@ mod tests {
     /// The lowered SSA value the emitted store writes (an external value).
     const V_STOREVAL: ValueId = ValueId::new(40);
 
-    /// The EXACT instruction sequence the bridge emits for a fixed-offset scalar
-    /// field STORE `*(T*)(slot + offset) = v` (mirrors `memory_place_address` ->
-    /// `emit_i64_const` + `emit_element_addr` + `emit_typed_store`): the SAME
-    /// address arithmetic as the load path, terminated by a typed `Store`.
+    /// A fixed-offset scalar field STORE `*(T*)(slot + offset) = v`: the SAME
+    /// address arithmetic as the load path (`emitted_field_load`, its `Copy`
+    /// spelling), terminated by a typed `Store`. The bridge's own constant
+    /// offset reaches the `Add` with no `Copy` (`emitted_field_load_no_copy`),
+    /// which folds to the same address.
     fn emitted_field_store(offset: i128, store_ty: TrustIrTy) -> Vec<InstrNode> {
         let mut nodes = emitted_field_load(offset);
         // Swap the trailing typed Load for the typed Store of `V_STOREVAL`.
@@ -4772,9 +5509,15 @@ mod tests {
         store_ty: TrustIrTy,
         siblings: &[(u64, u32)],
     ) -> (Vec<MirMemOp>, Vec<MirMemOp>) {
-        let (harness, spec_ops) =
-            field_store_obligation(mem_base_name(SLOT), spec_offset, spec_width, V_STOREVAL, siblings);
-        let folded = fold_emitted_mem_ops(&emitted_field_store(emit_offset, store_ty)).expect("in slice");
+        let (harness, spec_ops) = field_store_obligation(
+            mem_base_name(SLOT),
+            spec_offset,
+            spec_width,
+            V_STOREVAL,
+            siblings,
+        );
+        let folded =
+            fold_emitted_mem_ops(&emitted_field_store(emit_offset, store_ty)).expect("in slice");
         let mut bridge = harness;
         bridge.extend(folded);
         (spec_ops, bridge)
@@ -4786,7 +5529,11 @@ mod tests {
         assert_eq!(ops.len(), 1, "exactly one store reconstructed, got {ops:?}");
         match &ops[0] {
             MirMemOp::Store { addr, width, value } => {
-                assert_eq!(addr.base, mem_base_name(SLOT), "base reconstructed as the slot");
+                assert_eq!(
+                    addr.base,
+                    mem_base_name(SLOT),
+                    "base reconstructed as the slot"
+                );
                 assert_eq!(addr.offset, 16, "offset folded from Const*1 + base");
                 assert_eq!(*width, 8, "width from the emitted I64 Store");
                 assert_eq!(
@@ -4805,7 +5552,7 @@ mod tests {
     #[test]
     fn correct_field_store_is_not_refuted() {
         let (spec, bridge) = store_obligation(16, 8, 16, TrustIrTy::I64, &[(24, 8)]);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_store_correct",
             &spec,
             &bridge,
@@ -4836,7 +5583,7 @@ mod tests {
     #[test]
     fn wrong_offset_field_store_is_refuted() {
         let (spec, bridge) = store_obligation(16, 8, 8, TrustIrTy::I64, &[(24, 8)]);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_store_wrong_offset",
             &spec,
             &bridge,
@@ -4844,10 +5591,6 @@ mod tests {
             &AYConfig::default(),
         )
         .expect("no structural error");
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong EMITTED store offset must be REFUTED, got {outcome:?}"
@@ -4860,7 +5603,7 @@ mod tests {
     #[test]
     fn wrong_width_field_store_is_refuted() {
         let (spec, bridge) = store_obligation(16, 8, 16, TrustIrTy::I32, &[(24, 8)]);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_store_wrong_width",
             &spec,
             &bridge,
@@ -4868,10 +5611,6 @@ mod tests {
             &AYConfig::default(),
         )
         .expect("no structural error");
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong EMITTED store width must be REFUTED, got {outcome:?}"
@@ -4895,7 +5634,7 @@ mod tests {
             value: SmtExpr::var(mem_store_value_name(ValueId::new(999), 8), 64),
             width: 8,
         });
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_store_swapped_value",
             &spec,
             &bridge,
@@ -4903,10 +5642,6 @@ mod tests {
             &AYConfig::default(),
         )
         .expect("no structural error");
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a swapped stored value must be REFUTED, got {outcome:?}"
@@ -4940,7 +5675,7 @@ mod tests {
             value: SmtExpr::var(mem_store_value_name(ValueId::new(777), 8), 64),
             width: 8,
         });
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_field_store_sibling_clobber",
             &spec,
             &bridge,
@@ -4996,7 +5731,13 @@ mod tests {
                 },
                 idx,
             ),
-            node(Inst::Copy { ty: TrustIrTy::Ptr, operand: base }, bp),
+            node(
+                Inst::Copy {
+                    ty: TrustIrTy::Ptr,
+                    operand: base,
+                },
+                bp,
+            ),
             node(
                 Inst::Cast {
                     op: CastOp::PtrToInt,
@@ -5006,7 +5747,13 @@ mod tests {
                 },
                 bi,
             ),
-            node(Inst::Copy { ty: TrustIrTy::I64, operand: idx }, idx64),
+            node(
+                Inst::Copy {
+                    ty: TrustIrTy::I64,
+                    operand: idx,
+                },
+                idx64,
+            ),
             node(
                 Inst::Const {
                     ty: TrustIrTy::I64,
@@ -5049,7 +5796,12 @@ mod tests {
     /// lane LOADS from, or `None` to DROP the lane entirely; `lane_dst(lane)` the
     /// (base, byte offset) it STORES to. The correct copy uses `(SRC, lane*w)` and
     /// `(DST, lane*w)`; perturbations vary these.
-    fn emitted_copy<F, G>(width: u32, lanes: u64, mut lane_src: F, mut lane_dst: G) -> Vec<InstrNode>
+    fn emitted_copy<F, G>(
+        width: u32,
+        lanes: u64,
+        mut lane_src: F,
+        mut lane_dst: G,
+    ) -> Vec<InstrNode>
     where
         F: FnMut(u64) -> Option<(ValueId, i128)>,
         G: FnMut(u64) -> (ValueId, i128),
@@ -5088,11 +5840,22 @@ mod tests {
         nodes
     }
 
-    fn copy_discharge(name: &str, bridge_emitted: &[InstrNode], width: u32, lanes: u64) -> RefinementOutcome {
+    fn copy_discharge(
+        name: &str,
+        bridge_emitted: &[InstrNode],
+        width: u32,
+        lanes: u64,
+    ) -> RefinementOutcome {
         let spec = aggregate_copy_spec(SLOT_SRC, SLOT_DST, width, lanes);
         let folded = fold_emitted_copy_ops(bridge_emitted).expect("copy in slice");
-        check_memory_sequence(name, &spec, &folded, &MemCheckConfig::default(), &AYConfig::default())
-            .expect("no structural error")
+        memory_sequence_test_outcome(
+            name,
+            &spec,
+            &folded,
+            &MemCheckConfig::default(),
+            &AYConfig::default(),
+        )
+        .expect("no structural error")
     }
 
     #[test]
@@ -5104,7 +5867,11 @@ mod tests {
             |l| (SLOT_DST, (l * 8) as i128),
         );
         let ops = fold_emitted_copy_ops(&emitted).expect("copy in slice");
-        assert_eq!(ops.len(), 3, "one dst store per lane (loads dropped), got {ops:?}");
+        assert_eq!(
+            ops.len(),
+            3,
+            "one dst store per lane (loads dropped), got {ops:?}"
+        );
         for (lane, op) in ops.iter().enumerate() {
             let off = (lane * 8) as u64;
             match op {
@@ -5120,6 +5887,93 @@ mod tests {
                 }
                 other => panic!("expected a Store, got {other:?}"),
             }
+        }
+    }
+
+    /// The hidden-obligation defect, for the exact discharges
+    /// `correct_field_store_is_not_refuted`,
+    /// `correct_deref_field_store_is_not_refuted` and `correct_copy_is_not_refuted`
+    /// run: AY discloses a proof hole on the FIRST obligation and rejects its
+    /// own proof of every later one. When `check_memory_sequence` stopped at the
+    /// first undecided obligation, each test saw only the hole, the one gap a
+    /// test may skip on, so all three skipped. Each check builds several
+    /// obligations, and the fold this crate's tests assert on must report the
+    /// rejection, not the hole.
+    ///
+    /// That every obligation reaches the solver through the production route is
+    /// measured with a fake AY in trust-cg-verify
+    /// (`mir_semantics::tests::a_hole_on_the_first_obligation_does_not_hide_a_later_rejection`,
+    /// the same `discharge_memory_sequence` these tests call): `ay_identity`
+    /// admits a fixture AY only in that crate's own `cfg(test)` build, never
+    /// from this crate.
+    #[test]
+    fn a_hole_on_the_first_obligation_does_not_hide_a_later_rejection() {
+        const HOLE: &str = "unknown: incomplete AY proof certificate: c ay.proof.certificate \
+             path=/tmp/q.alethe unproved_steps=1 foreign_assumes=no trust_free=no \
+             ay_self_checkable=yes";
+        const REJECTED: &str = "unknown: (:reason-unknown (incomplete self-check-rejected))";
+        let copy_emitted = emitted_copy(
+            8,
+            3,
+            |l| Some((SLOT_SRC, (l * 8) as i128)),
+            |l| (SLOT_DST, (l * 8) as i128),
+        );
+        let (store_spec, store_bridge) = store_obligation(16, 8, 16, TrustIrTy::I64, &[(24, 8)]);
+        let (deref_spec, deref_bridge) = deref_store_obligation(
+            R_PTR,
+            16,
+            8,
+            R_PTR,
+            16,
+            TrustIrTy::I64,
+            V_STOREVAL,
+            &[(24, 8)],
+        );
+        let copy_spec = aggregate_copy_spec(SLOT_SRC, SLOT_DST, 8, 3);
+        let copy_bridge = fold_emitted_copy_ops(&copy_emitted).expect("copy in slice");
+        for (name, spec, bridge) in [
+            ("p1_field_store_correct", &store_spec, &store_bridge),
+            ("p1_deref_store_correct", &deref_spec, &deref_bridge),
+            ("p1_copy_correct", &copy_spec, &copy_bridge),
+        ] {
+            let obligations = trust_cg_verify::mir_semantics::build_memory_obligations(
+                name,
+                spec,
+                bridge,
+                &MemCheckConfig::default(),
+            )
+            .expect("no structural error")
+            .expect("a provably-distinct sequence is discharged");
+            assert!(
+                obligations.len() >= 2,
+                "{name}: {} obligation(s)",
+                obligations.len()
+            );
+            let verdicts: Vec<_> = obligations
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, obligation)| trust_cg_verify::mir_semantics::ObligationVerdict {
+                        obligation: obligation.name.clone(),
+                        outcome: RefinementOutcome::Inconclusive {
+                            reason: if index == 0 { HOLE } else { REJECTED }.to_string(),
+                        },
+                    },
+                )
+                .collect();
+            assert!(
+                alethe_crosscheck_gap(&verdicts[0].outcome),
+                "{name}: the first verdict is the disclosed hole"
+            );
+            let outcome = crate::solver_test_support::fold_verdicts(name, &verdicts, true);
+            assert!(
+                !alethe_crosscheck_gap(&outcome),
+                "{name}: the test must fail on the rejection, not skip on the hole: {outcome:?}"
+            );
+            assert!(
+                matches!(&outcome, RefinementOutcome::Inconclusive { reason } if reason == REJECTED),
+                "{name}: {outcome:?}"
+            );
         }
     }
 
@@ -5158,14 +6012,16 @@ mod tests {
         let emitted = emitted_copy(
             8,
             3,
-            |l| if l == 1 { None } else { Some((SLOT_SRC, (l * 8) as i128)) },
+            |l| {
+                if l == 1 {
+                    None
+                } else {
+                    Some((SLOT_SRC, (l * 8) as i128))
+                }
+            },
             |l| (SLOT_DST, (l * 8) as i128),
         );
         let outcome = copy_discharge("p1_copy_dropped_lane", &emitted, 8, 3);
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a dropped lane must be REFUTED, got {outcome:?}"
@@ -5183,10 +6039,6 @@ mod tests {
             |l| (SLOT_DST, if l == 1 { 16 } else { (l * 8) as i128 }),
         );
         let outcome = copy_discharge("p1_copy_wrong_offset", &emitted, 8, 3);
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong lane offset must be REFUTED, got {outcome:?}"
@@ -5205,10 +6057,6 @@ mod tests {
             |l| (SLOT_DST, (l * 8) as i128),
         );
         let outcome = copy_discharge("p1_copy_wrong_source", &emitted, 8, 3);
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong source lane must be REFUTED, got {outcome:?}"
@@ -5309,10 +6157,20 @@ mod tests {
         emit_val: ValueId,
         siblings: &[(u64, u32)],
     ) -> (Vec<MirMemOp>, Vec<MirMemOp>) {
-        let (harness, spec_ops) =
-            field_store_obligation(mem_base_name(spec_base), spec_offset, spec_width, V_STOREVAL, siblings);
-        let folded = fold_emitted_mem_ops(&emitted_deref_store(emit_base, emit_offset, store_ty, emit_val))
-            .expect("in slice");
+        let (harness, spec_ops) = field_store_obligation(
+            mem_base_name(spec_base),
+            spec_offset,
+            spec_width,
+            V_STOREVAL,
+            siblings,
+        );
+        let folded = fold_emitted_mem_ops(&emitted_deref_store(
+            emit_base,
+            emit_offset,
+            store_ty,
+            emit_val,
+        ))
+        .expect("in slice");
         let mut bridge = harness;
         bridge.extend(folded);
         (spec_ops, bridge)
@@ -5334,7 +6192,10 @@ mod tests {
                 );
                 assert_eq!(addr.offset, 16, "offset folded from Const*1 + r_ptr");
                 assert_eq!(*width, 8, "width from the emitted I64 Store");
-                assert_eq!(value, &SmtExpr::var(mem_store_value_name(V_STOREVAL, 8), 64));
+                assert_eq!(
+                    value,
+                    &SmtExpr::var(mem_store_value_name(V_STOREVAL, 8), 64)
+                );
             }
             other => panic!("expected a Store, got {other:?}"),
         }
@@ -5345,9 +6206,17 @@ mod tests {
     /// sibling (offset 24) unchanged -> NOT refuted (Refines with a solver).
     #[test]
     fn correct_deref_field_store_is_not_refuted() {
-        let (spec, bridge) =
-            deref_store_obligation(R_PTR, 16, 8, R_PTR, 16, TrustIrTy::I64, V_STOREVAL, &[(24, 8)]);
-        let outcome = check_memory_sequence(
+        let (spec, bridge) = deref_store_obligation(
+            R_PTR,
+            16,
+            8,
+            R_PTR,
+            16,
+            TrustIrTy::I64,
+            V_STOREVAL,
+            &[(24, 8)],
+        );
+        let outcome = memory_sequence_test_outcome(
             "p1_deref_store_correct",
             &spec,
             &bridge,
@@ -5376,9 +6245,17 @@ mod tests {
     /// a non-target cell is corrupted -> REFUTED.
     #[test]
     fn wrong_offset_deref_store_is_refuted() {
-        let (spec, bridge) =
-            deref_store_obligation(R_PTR, 16, 8, R_PTR, 8, TrustIrTy::I64, V_STOREVAL, &[(24, 8)]);
-        let outcome = check_memory_sequence(
+        let (spec, bridge) = deref_store_obligation(
+            R_PTR,
+            16,
+            8,
+            R_PTR,
+            8,
+            TrustIrTy::I64,
+            V_STOREVAL,
+            &[(24, 8)],
+        );
+        let outcome = memory_sequence_test_outcome(
             "p1_deref_store_wrong_offset",
             &spec,
             &bridge,
@@ -5386,10 +6263,6 @@ mod tests {
             &AYConfig::default(),
         )
         .expect("no structural error");
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong EMITTED deref-store offset must be REFUTED, got {outcome:?}"
@@ -5400,9 +6273,17 @@ mod tests {
     /// layout leaf is 8) -> a different byte range / value var -> REFUTED.
     #[test]
     fn wrong_width_deref_store_is_refuted() {
-        let (spec, bridge) =
-            deref_store_obligation(R_PTR, 16, 8, R_PTR, 16, TrustIrTy::I32, V_STOREVAL, &[(24, 8)]);
-        let outcome = check_memory_sequence(
+        let (spec, bridge) = deref_store_obligation(
+            R_PTR,
+            16,
+            8,
+            R_PTR,
+            16,
+            TrustIrTy::I32,
+            V_STOREVAL,
+            &[(24, 8)],
+        );
+        let outcome = memory_sequence_test_outcome(
             "p1_deref_store_wrong_width",
             &spec,
             &bridge,
@@ -5410,10 +6291,6 @@ mod tests {
             &AYConfig::default(),
         )
         .expect("no structural error");
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong EMITTED deref-store width must be REFUTED, got {outcome:?}"
@@ -5436,7 +6313,7 @@ mod tests {
             ValueId::new(888),
             &[(24, 8)],
         );
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_deref_store_swapped_value",
             &spec,
             &bridge,
@@ -5444,10 +6321,6 @@ mod tests {
             &AYConfig::default(),
         )
         .expect("no structural error");
-        if alethe_crosscheck_gap(&outcome) {
-            eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-            return;
-        }
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a swapped deref-store value must be REFUTED, got {outcome:?}"
@@ -5462,9 +6335,17 @@ mod tests {
     /// in `r`'s pointee, not some other pointer's.
     #[test]
     fn swapped_base_deref_store_is_refuted() {
-        let (spec, bridge) =
-            deref_store_obligation(R_PTR, 16, 8, D_PTR, 16, TrustIrTy::I64, V_STOREVAL, &[(24, 8)]);
-        let outcome = check_memory_sequence(
+        let (spec, bridge) = deref_store_obligation(
+            R_PTR,
+            16,
+            8,
+            D_PTR,
+            16,
+            TrustIrTy::I64,
+            V_STOREVAL,
+            &[(24, 8)],
+        );
+        let outcome = memory_sequence_test_outcome(
             "p1_deref_store_swapped_base",
             &spec,
             &bridge,
@@ -5507,7 +6388,7 @@ mod tests {
             value: SmtExpr::var(mem_store_value_name(ValueId::new(777), 8), 64),
             width: 8,
         });
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_deref_store_sibling_clobber",
             &spec,
             &bridge,
@@ -5524,7 +6405,11 @@ mod tests {
     /// The DEGENERATE `*r = v` (off=0 scalar store through a reference): the emitted
     /// store addresses `r`'s pointer directly (no address arithmetic), so the fold
     /// reconstructs base = `R_PTR` + offset 0 + width from the store type.
-    fn emitted_scalar_deref_store(base: ValueId, store_ty: TrustIrTy, store_val: ValueId) -> Vec<InstrNode> {
+    fn emitted_scalar_deref_store(
+        base: ValueId,
+        store_ty: TrustIrTy,
+        store_val: ValueId,
+    ) -> Vec<InstrNode> {
         vec![InstrNode::new(Inst::Store {
             ty: store_ty,
             ptr: base,
@@ -5539,11 +6424,15 @@ mod tests {
     #[test]
     fn correct_scalar_deref_store_is_not_refuted() {
         let (harness, spec) = field_store_obligation(mem_base_name(R_PTR), 0, 8, V_STOREVAL, &[]);
-        let folded = fold_emitted_mem_ops(&emitted_scalar_deref_store(R_PTR, TrustIrTy::I64, V_STOREVAL))
-            .expect("in slice");
+        let folded = fold_emitted_mem_ops(&emitted_scalar_deref_store(
+            R_PTR,
+            TrustIrTy::I64,
+            V_STOREVAL,
+        ))
+        .expect("in slice");
         let mut bridge = harness;
         bridge.extend(folded);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_scalar_deref_store_correct",
             &spec,
             &bridge,
@@ -5573,11 +6462,15 @@ mod tests {
     #[test]
     fn wrong_width_scalar_deref_store_is_refuted() {
         let (harness, spec) = field_store_obligation(mem_base_name(R_PTR), 0, 8, V_STOREVAL, &[]);
-        let folded = fold_emitted_mem_ops(&emitted_scalar_deref_store(R_PTR, TrustIrTy::I32, V_STOREVAL))
-            .expect("in slice");
+        let folded = fold_emitted_mem_ops(&emitted_scalar_deref_store(
+            R_PTR,
+            TrustIrTy::I32,
+            V_STOREVAL,
+        ))
+        .expect("in slice");
         let mut bridge = harness;
         bridge.extend(folded);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_scalar_deref_store_wrong_width",
             &spec,
             &bridge,
@@ -5596,11 +6489,15 @@ mod tests {
     #[test]
     fn swapped_base_scalar_deref_store_is_refuted() {
         let (harness, spec) = field_store_obligation(mem_base_name(R_PTR), 0, 8, V_STOREVAL, &[]);
-        let folded = fold_emitted_mem_ops(&emitted_scalar_deref_store(D_PTR, TrustIrTy::I64, V_STOREVAL))
-            .expect("in slice");
+        let folded = fold_emitted_mem_ops(&emitted_scalar_deref_store(
+            D_PTR,
+            TrustIrTy::I64,
+            V_STOREVAL,
+        ))
+        .expect("in slice");
         let mut bridge = harness;
         bridge.extend(folded);
-        let outcome = check_memory_sequence(
+        let outcome = memory_sequence_test_outcome(
             "p1_scalar_deref_store_swapped_base",
             &spec,
             &bridge,
@@ -5617,7 +6514,7 @@ mod tests {
     // =======================================================================
     // `split_at` VALUE-level refinement. Each test HAND-BUILDS the exact trust-ir
     // the bridge emits for `s.split_at(mid)` (`ICmp`; `store_fat_ptr` of the two
-    // halves via `InsertField`; `emit_element_addr`'s Mul/Add for the right data
+    // halves as lane `Store`s; `emit_element_addr`'s Mul/Add for the right data
     // pointer; the `Sub` for the right length), folds it, and discharges the
     // reconstructed obligations against the layout-independent `split_at_spec`.
     // A CORRECT emission must NOT refute; a swapped `mid`/`len` in the `Sub`, a
@@ -5675,7 +6572,13 @@ mod tests {
         scale: Option<i128>,
     ) -> ValueId {
         let base_ptr = sa_fresh(next);
-        nodes.push(node(Inst::Copy { ty: TrustIrTy::Ptr, operand: base }, base_ptr));
+        nodes.push(node(
+            Inst::Copy {
+                ty: TrustIrTy::Ptr,
+                operand: base,
+            },
+            base_ptr,
+        ));
         let base_int = sa_fresh(next);
         nodes.push(node(
             Inst::Cast {
@@ -5687,7 +6590,13 @@ mod tests {
             base_int,
         ));
         let index_i64 = sa_fresh(next);
-        nodes.push(node(Inst::Copy { ty: TrustIrTy::I64, operand: index }, index_i64));
+        nodes.push(node(
+            Inst::Copy {
+                ty: TrustIrTy::I64,
+                operand: index,
+            },
+            index_i64,
+        ));
         let offset = match scale {
             None => index_i64,
             Some(k) => {
@@ -5736,7 +6645,12 @@ mod tests {
     }
 
     /// Mirror `iter_field_addr(base, offset)`: offset 0 IS the base (no nodes).
-    fn sa_field_addr(next: &mut u32, nodes: &mut Vec<InstrNode>, base: ValueId, offset: u64) -> ValueId {
+    fn sa_field_addr(
+        next: &mut u32,
+        nodes: &mut Vec<InstrNode>,
+        base: ValueId,
+        offset: u64,
+    ) -> ValueId {
         if offset == 0 {
             return base;
         }
@@ -5751,8 +6665,36 @@ mod tests {
         sa_element_addr(next, nodes, base, idx, None)
     }
 
+    /// Mirror `emit_slot_word_store(slot, word, I64, value)`:
+    /// `slot_byte_ptr(slot, 8*word)` (`Const`, then `emit_element_addr` at scale
+    /// 1) and a typed 8-byte `Store`.
+    fn sa_slot_word_store(
+        next: &mut u32,
+        nodes: &mut Vec<InstrNode>,
+        slot: ValueId,
+        word: u32,
+        value: ValueId,
+    ) {
+        let off = sa_fresh(next);
+        nodes.push(node(
+            Inst::Const {
+                ty: TrustIrTy::I64,
+                value: Constant::Int(8 * i128::from(word)),
+            },
+            off,
+        ));
+        let addr = sa_element_addr(next, nodes, slot, off, None);
+        nodes.push(InstrNode::new(Inst::Store {
+            ty: TrustIrTy::I64,
+            ptr: addr,
+            value,
+            volatile: false,
+            align: None,
+        }));
+    }
+
     /// Mirror `store_fat_ptr_slot_into(field_ptr, data, meta)`: `Copy`/`PtrToInt`
-    /// the data pointer, `Copy` the meta, then `InsertField` lane 0 (data) + 1 (len).
+    /// the data pointer, `Copy` the meta, then store lane 0 (data) + 1 (len).
     fn sa_store_fat_ptr(
         next: &mut u32,
         nodes: &mut Vec<InstrNode>,
@@ -5761,7 +6703,13 @@ mod tests {
         meta: ValueId,
     ) {
         let data_ptr = sa_fresh(next);
-        nodes.push(node(Inst::Copy { ty: TrustIrTy::Ptr, operand: data }, data_ptr));
+        nodes.push(node(
+            Inst::Copy {
+                ty: TrustIrTy::Ptr,
+                operand: data,
+            },
+            data_ptr,
+        ));
         let data_int = sa_fresh(next);
         nodes.push(node(
             Inst::Cast {
@@ -5773,27 +6721,15 @@ mod tests {
             data_int,
         ));
         let meta_i64 = sa_fresh(next);
-        nodes.push(node(Inst::Copy { ty: TrustIrTy::I64, operand: meta }, meta_i64));
-        let r0 = sa_fresh(next);
         nodes.push(node(
-            Inst::InsertField {
+            Inst::Copy {
                 ty: TrustIrTy::I64,
-                aggregate: field_ptr,
-                field: 0,
-                value: data_int,
+                operand: meta,
             },
-            r0,
+            meta_i64,
         ));
-        let r1 = sa_fresh(next);
-        nodes.push(node(
-            Inst::InsertField {
-                ty: TrustIrTy::I64,
-                aggregate: field_ptr,
-                field: 1,
-                value: meta_i64,
-            },
-            r1,
-        ));
+        sa_slot_word_store(next, nodes, field_ptr, 0, data_int);
+        sa_slot_word_store(next, nodes, field_ptr, 1, meta_i64);
     }
 
     /// Build the exact emitted trust-ir slice `lower_slice_split_at_call` produces
@@ -5844,30 +6780,28 @@ mod tests {
 
     /// Discharge every split_at obligation, prioritizing a `Refuted` over any
     /// `Inconclusive` (so a wrong half REFUTES even when the correct halves are
-    /// solver-undecidable without a solver). Returns `Refuted` if ANY refutes,
-    /// else `Inconclusive` if any is undecided, else `Refined`.
+    /// solver-undecidable without a solver). Every obligation is discharged and
+    /// the verdicts are folded by `crate::solver_test_support::test_outcome`.
     fn sa_discharge(name: &str, emitted: &[InstrNode], elem_size: u64) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let folded = fold_emitted_split_at(emitted).expect("split_at in slice");
         let obligations = split_at_obligations(
-            name, &folded, SA_OFF0, SA_OFF1, SA_PTR, SA_LEN, SA_MID, elem_size,
+            name,
+            &folded,
+            SA_OFF0,
+            SA_OFF1,
+            SA_PTR,
+            SA_LEN,
+            SA_MID,
+            elem_size,
+            WORD_MODEL_POINTER_BYTES,
         )
         .expect("split_at obligations built");
-        let cfg = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &cfg) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     #[test]
@@ -5936,7 +6870,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -5961,7 +6898,11 @@ mod tests {
     #[test]
     fn wrong_scale_split_at_is_refuted() {
         // Emit a *2 scale but tell the obligation the element is 4 bytes.
-        let outcome = sa_discharge("split_at_wrong_scale", &sa_emit(&SaCfg::correct(Some(2))), 4);
+        let outcome = sa_discharge(
+            "split_at_wrong_scale",
+            &sa_emit(&SaCfg::correct(Some(2))),
+            4,
+        );
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong element scale must be REFUTED, got {outcome:?}"
@@ -6016,13 +6957,15 @@ mod tests {
     // =======================================================================
     // STRIDE-ITERATOR CONSTRUCTOR (`chunks`/`windows`/`chunks_exact`/`rchunks`/
     // `rchunks_exact`) VALUE-level refinement. Each test HAND-BUILDS the exact
-    // trust-ir the bridge emits for `v.chunks(n)` (`emit_element_addr`'s Mul/Add
-    // for `end`, the `ICmp Ne(n, 0)`, and the three `emit_typed_store`s of
-    // `{ ptr@0, end@8, n@16 }`), folds it, and discharges the reconstructed
-    // obligations against the layout-independent `stride_iter_ctor_spec`. A CORRECT
-    // emission must NOT refute; a dropped `n != 0` check folds to `None` (skip); a
-    // wrong element scale on `end`, an `end` off the wrong base, an inverted check,
-    // or a swapped ptr/end store MUST refute (the anti-tautology keystone).
+    // trust-ir `lower_slice_stride_iter_ctor` emits (the `ICmp Ne(n, 0)`, for the
+    // `*_exact` kinds the `URem`/`Sub` split and `emit_element_addr`'s Mul/Add for
+    // the split-off data pointer, then the typed stores of std's state at the
+    // given offsets), folds it, and discharges the reconstructed obligations
+    // against the layout-independent `stride_iter_ctor_spec`. A CORRECT emission
+    // must NOT refute; a dropped `n != 0` check folds to `None` (skip); a wrong
+    // element scale, a split-off pointer off the wrong base, an inverted check, an
+    // unsplit `v`, or swapped state stores MUST refute (the anti-tautology
+    // keystone); a missing state store states no obligation.
     // =======================================================================
 
     const ST_DATA: ValueId = ValueId::new(70);
@@ -6030,36 +6973,64 @@ mod tests {
     const ST_N: ValueId = ValueId::new(72);
     const ST_DEST: ValueId = ValueId::new(73);
     const ST_WRONGBASE: ValueId = ValueId::new(74);
-    const ST_PTR_OFF: u64 = 0;
-    const ST_END_OFF: u64 = 8; // SLICE_ITER_END_OFFSET
-    const ST_N_OFF: u64 = 16; // WINDOWS_SIZE_OFFSET
+
+    /// The state lanes as rustc lays out `Chunks<u32>` (`v@0`, `chunk_size@16`) and
+    /// `ChunksExact<u32>` (`v@0`, `rem@16`, `chunk_size@32`) on a 64-bit host.
+    fn st_offsets(kind: StrideIterCtorKind) -> StrideIterStateOffsets {
+        match kind {
+            StrideIterCtorKind::Whole => StrideIterStateOffsets {
+                v_data: 0,
+                v_len: 8,
+                size: 16,
+                rem: None,
+            },
+            StrideIterCtorKind::ChunksExact | StrideIterCtorKind::RChunksExact => {
+                StrideIterStateOffsets {
+                    v_data: 0,
+                    v_len: 8,
+                    size: 32,
+                    rem: Some((16, 24)),
+                }
+            }
+        }
+    }
 
     /// Knobs to perturb the emitted constructor into a specific miscompile shape.
     struct StCfg {
+        kind: StrideIterCtorKind,
         /// The non-zero-check comparison (correct = `Ne`, i.e. continue iff n != 0).
         icmp_op: ICmpOp,
         /// Whether to emit the `n != 0` check at all (`false` DROPS it — a
         /// chunks(0)-class infinite-loop bug, which must take the fold out of slice).
         emit_check: bool,
-        /// The element scale the bridge multiplies `len` by for `end`: `None` = the
-        /// `size == 1` skip path (the offset IS the length).
-        end_scale: Option<i128>,
-        /// The base `end` is computed from (correct = `ST_DATA`).
-        end_base: ValueId,
-        /// `true`: store the ptr/end halves at SWAPPED cursor offsets.
-        swap_ptr_end: bool,
+        /// The element scale of the split-off data pointer: `None` = the
+        /// `size == 1` skip path (the offset IS the index).
+        scale: Option<i128>,
+        /// The base the split-off data pointer is computed from (correct =
+        /// `ST_DATA`).
+        split_base: ValueId,
+        /// `true`: store `v`'s data and length at SWAPPED offsets.
+        swap_v: bool,
+        /// `true`: the `*_exact` `v` keeps the whole length (the remainder is not
+        /// split off).
+        unsplit: bool,
+        /// `true`: omit the `rem` length store.
+        drop_rem_len: bool,
     }
 
     impl StCfg {
-        /// The correct emission for an `elem_size`-byte element (`scale` = the
-        /// stride, or `None` for the `size == 1` skip path).
-        fn correct(scale: Option<i128>) -> Self {
+        /// The correct emission for `kind` over an `elem_size`-byte element
+        /// (`scale` = the stride, or `None` for the `size == 1` skip path).
+        fn correct(kind: StrideIterCtorKind, scale: Option<i128>) -> Self {
             StCfg {
+                kind,
                 icmp_op: ICmpOp::Ne,
                 emit_check: true,
-                end_scale: scale,
-                end_base: ST_DATA,
-                swap_ptr_end: false,
+                scale,
+                split_base: ST_DATA,
+                swap_v: false,
+                unsplit: false,
+                drop_rem_len: false,
             }
         }
     }
@@ -6085,15 +7056,34 @@ mod tests {
         }));
     }
 
+    /// An `I64` `BinOp` node.
+    fn st_binop(
+        next: &mut u32,
+        nodes: &mut Vec<InstrNode>,
+        op: TrustIrBinOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> ValueId {
+        let result = sa_fresh(next);
+        nodes.push(node(
+            Inst::BinOp {
+                op,
+                ty: TrustIrTy::I64,
+                lhs,
+                rhs,
+            },
+            result,
+        ));
+        result
+    }
+
     /// Build the exact emitted trust-ir slice `lower_slice_stride_iter_ctor`
-    /// produces for `ST_DEST = ST_DATA/ST_LEN slice . chunks(ST_N)`, perturbed by
-    /// `cfg`: the `end` element address, the (optional) `n != 0` `ICmp`, then the
-    /// three `{ ptr@0, end@8, n@16 }` cursor stores.
+    /// produces for `ST_DEST = ST_DATA/ST_LEN slice . <kind>(ST_N)`, perturbed by
+    /// `cfg`: the (optional) `n != 0` `ICmp`, the `*_exact` split, then the state
+    /// stores at [`st_offsets`].
     fn st_emit(cfg: &StCfg) -> Vec<InstrNode> {
         let mut next = 300u32;
         let mut nodes = Vec::new();
-        // end = element_addr(end_base, len, scale)   (data + len*elem_size)
-        let end = sa_element_addr(&mut next, &mut nodes, cfg.end_base, ST_LEN, cfg.end_scale);
         // n_zero = Const 0 ; ok = ICmp op(n, n_zero)
         if cfg.emit_check {
             let n_zero = sa_fresh(&mut next);
@@ -6115,79 +7105,127 @@ mod tests {
                 ok,
             ));
         }
-        // cursor stores: ptr@0 = data, end@8 = end, n@16 = n.
-        let (ptr_val, end_val) = if cfg.swap_ptr_end {
-            (end, ST_DATA)
-        } else {
-            (ST_DATA, end)
+        let (v_data, v_len, rem) = match cfg.kind {
+            StrideIterCtorKind::Whole => (ST_DATA, ST_LEN, None),
+            StrideIterCtorKind::ChunksExact => {
+                let r = st_binop(&mut next, &mut nodes, TrustIrBinOp::URem, ST_LEN, ST_N);
+                let fst = st_binop(&mut next, &mut nodes, TrustIrBinOp::Sub, ST_LEN, r);
+                let rem_data =
+                    sa_element_addr(&mut next, &mut nodes, cfg.split_base, fst, cfg.scale);
+                let v_len = if cfg.unsplit { ST_LEN } else { fst };
+                (ST_DATA, v_len, Some((rem_data, r)))
+            }
+            StrideIterCtorKind::RChunksExact => {
+                let r = st_binop(&mut next, &mut nodes, TrustIrBinOp::URem, ST_LEN, ST_N);
+                let snd = sa_element_addr(&mut next, &mut nodes, cfg.split_base, r, cfg.scale);
+                let snd_len = st_binop(&mut next, &mut nodes, TrustIrBinOp::Sub, ST_LEN, r);
+                let (v_data, v_len) = if cfg.unsplit {
+                    (ST_DATA, ST_LEN)
+                } else {
+                    (snd, snd_len)
+                };
+                (v_data, v_len, Some((ST_DATA, r)))
+            }
         };
-        st_store(&mut next, &mut nodes, ST_DEST, ST_PTR_OFF, TrustIrTy::Ptr, ptr_val);
-        st_store(&mut next, &mut nodes, ST_DEST, ST_END_OFF, TrustIrTy::Ptr, end_val);
-        st_store(&mut next, &mut nodes, ST_DEST, ST_N_OFF, TrustIrTy::I64, ST_N);
+        let offsets = st_offsets(cfg.kind);
+        let (data_off, len_off) = if cfg.swap_v {
+            (offsets.v_len, offsets.v_data)
+        } else {
+            (offsets.v_data, offsets.v_len)
+        };
+        st_store(
+            &mut next,
+            &mut nodes,
+            ST_DEST,
+            data_off,
+            TrustIrTy::Ptr,
+            v_data,
+        );
+        st_store(
+            &mut next,
+            &mut nodes,
+            ST_DEST,
+            len_off,
+            TrustIrTy::I64,
+            v_len,
+        );
+        st_store(
+            &mut next,
+            &mut nodes,
+            ST_DEST,
+            offsets.size,
+            TrustIrTy::I64,
+            ST_N,
+        );
+        if let (Some((rem_data, rem_len)), Some((rem_data_off, rem_len_off))) = (rem, offsets.rem) {
+            st_store(
+                &mut next,
+                &mut nodes,
+                ST_DEST,
+                rem_data_off,
+                TrustIrTy::Ptr,
+                rem_data,
+            );
+            if !cfg.drop_rem_len {
+                st_store(
+                    &mut next,
+                    &mut nodes,
+                    ST_DEST,
+                    rem_len_off,
+                    TrustIrTy::I64,
+                    rem_len,
+                );
+            }
+        }
         nodes
+    }
+
+    /// The obligations for `emitted`, checked as a `kind` constructor over an
+    /// `elem_size`-byte element (`None` when the fold or the pairing is out of
+    /// shape).
+    fn st_obligations(
+        name: &str,
+        emitted: &[InstrNode],
+        kind: StrideIterCtorKind,
+        elem_size: u64,
+    ) -> Option<Vec<ProofObligation>> {
+        let folded = fold_emitted_stride_iter_ctor(emitted).expect("stride ctor in slice");
+        stride_iter_ctor_obligations(
+            name,
+            &folded,
+            kind,
+            st_offsets(kind),
+            ST_DATA,
+            ST_LEN,
+            ST_N,
+            elem_size,
+            WORD_MODEL_POINTER_BYTES,
+        )
     }
 
     /// Discharge every stride-iter obligation, prioritizing a `Refuted` over any
     /// `Inconclusive` (so a wrong field REFUTES even when the correct fields are
-    /// solver-undecidable without a solver). Returns `Refuted` if ANY refutes, else
-    /// `Inconclusive` if any is undecided, else `Refined`.
-    fn st_discharge(name: &str, emitted: &[InstrNode], elem_size: u64) -> RefinementOutcome {
+    /// solver-undecidable without a solver). Every obligation is discharged and the
+    /// verdicts are folded by `crate::solver_test_support::test_outcome`.
+    fn st_discharge(
+        name: &str,
+        emitted: &[InstrNode],
+        kind: StrideIterCtorKind,
+        elem_size: u64,
+    ) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
-        let folded = fold_emitted_stride_iter_ctor(emitted).expect("stride ctor in slice");
-        let obligations = stride_iter_ctor_obligations(
-            name, &folded, ST_PTR_OFF, ST_END_OFF, ST_N_OFF, ST_DATA, ST_LEN, ST_N, elem_size,
+        use trust_cg_verify::mir_semantics::discharge_each;
+        let obligations =
+            st_obligations(name, emitted, kind, elem_size).expect("stride ctor obligations built");
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
         )
-        .expect("stride ctor obligations built");
-        let cfg = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &cfg) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
     }
 
-    #[test]
-    fn fold_reconstructs_stride_iter_ctor() {
-        let folded = fold_emitted_stride_iter_ctor(&st_emit(&StCfg::correct(Some(4)))).expect("in slice");
-        // The three cursor lanes are reconstructed at their field offsets.
-        assert!(folded.store_value(ST_PTR_OFF).is_some(), "ptr present");
-        assert!(folded.store_value(ST_END_OFF).is_some(), "end present");
-        assert!(folded.store_value(ST_N_OFF).is_some(), "n present");
-        // ptr is the receiver data pointer verbatim; n is the stride verbatim.
-        assert_eq!(
-            folded.store_value(ST_PTR_OFF).unwrap(),
-            SmtExpr::var(sa_value_name(ST_DATA), 64),
-            "cursor.ptr reconstructed as the receiver data pointer"
-        );
-        assert_eq!(
-            folded.store_value(ST_N_OFF).unwrap(),
-            SmtExpr::var(sa_value_name(ST_N), 64),
-            "cursor.n reconstructed as n"
-        );
-        // end == data + len*4, matching the spec.
-        let spec = stride_iter_ctor_spec(
-            &sa_value_name(ST_DATA),
-            &sa_value_name(ST_LEN),
-            &sa_value_name(ST_N),
-            4,
-        );
-        assert_eq!(folded.store_value(ST_END_OFF).unwrap(), spec.end);
-    }
-
-    /// POSITIVE control (multi-byte element): the CORRECT emission is NOT refuted
-    /// (Refines with a solver; Inconclusive without, since the fields are 64-bit).
-    #[test]
-    fn correct_stride_iter_ctor_is_not_refuted() {
-        let outcome = st_discharge("stride_correct", &st_emit(&StCfg::correct(Some(4))), 4);
+    /// A correct emission is not refuted, and Refines when a solver is present.
+    fn st_assert_correct(name: &str, cfg: &StCfg, elem_size: u64) {
+        let outcome = st_discharge(name, &st_emit(cfg), cfg.kind, elem_size);
         assert!(
             !matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a correct stride-iter ctor must not be refuted, got {outcome:?}"
@@ -6204,22 +7242,95 @@ mod tests {
         }
     }
 
-    /// POSITIVE control (`size == 1` skip path, e.g. `&[u8]`): `end` is `data + len`
-    /// with no `Mul`; NOT refuted against `elem_size == 1`.
+    #[test]
+    fn fold_reconstructs_stride_iter_ctor() {
+        let cfg = StCfg::correct(StrideIterCtorKind::Whole, Some(4));
+        let folded = fold_emitted_stride_iter_ctor(&st_emit(&cfg)).expect("in slice");
+        let offsets = st_offsets(StrideIterCtorKind::Whole);
+        // `v` is the receiver verbatim and the size is `n` verbatim.
+        assert_eq!(
+            folded.store_value(offsets.v_data).unwrap(),
+            SmtExpr::var(sa_value_name(ST_DATA), 64),
+            "v.data reconstructed as the receiver data pointer"
+        );
+        assert_eq!(
+            folded.store_value(offsets.v_len).unwrap(),
+            SmtExpr::var(sa_value_name(ST_LEN), 64),
+            "v.len reconstructed as the receiver length"
+        );
+        assert_eq!(
+            folded.store_value(offsets.size).unwrap(),
+            SmtExpr::var(sa_value_name(ST_N), 64),
+            "size reconstructed as n"
+        );
+    }
+
+    /// The `*_exact` split folds to exactly the spec's formulas (the `URem` is
+    /// reconstructed, not skipped).
+    #[test]
+    fn fold_reconstructs_chunks_exact_split() {
+        for kind in [
+            StrideIterCtorKind::ChunksExact,
+            StrideIterCtorKind::RChunksExact,
+        ] {
+            let folded = fold_emitted_stride_iter_ctor(&st_emit(&StCfg::correct(kind, Some(4))))
+                .expect("in slice");
+            let spec = stride_iter_ctor_spec(
+                kind,
+                &sa_value_name(ST_DATA),
+                &sa_value_name(ST_LEN),
+                &sa_value_name(ST_N),
+                4,
+            );
+            let offsets = st_offsets(kind);
+            let (rem_data_off, rem_len_off) = offsets.rem.unwrap();
+            let (rem_data, rem_len) = spec.rem.unwrap();
+            assert_eq!(folded.store_value(offsets.v_data).unwrap(), spec.v_data);
+            assert_eq!(folded.store_value(offsets.v_len).unwrap(), spec.v_len);
+            assert_eq!(folded.store_value(rem_data_off).unwrap(), rem_data);
+            assert_eq!(folded.store_value(rem_len_off).unwrap(), rem_len);
+        }
+    }
+
+    /// POSITIVE controls (multi-byte element): the CORRECT emission of each kind is
+    /// NOT refuted (Refines with a solver; Inconclusive without, since the fields
+    /// are 64-bit).
+    #[test]
+    fn correct_stride_iter_ctor_is_not_refuted() {
+        st_assert_correct(
+            "stride_correct",
+            &StCfg::correct(StrideIterCtorKind::Whole, Some(4)),
+            4,
+        );
+    }
+
+    #[test]
+    fn correct_chunks_exact_ctor_is_not_refuted() {
+        st_assert_correct(
+            "stride_chunks_exact",
+            &StCfg::correct(StrideIterCtorKind::ChunksExact, Some(4)),
+            4,
+        );
+    }
+
+    #[test]
+    fn correct_rchunks_exact_ctor_is_not_refuted() {
+        st_assert_correct(
+            "stride_rchunks_exact",
+            &StCfg::correct(StrideIterCtorKind::RChunksExact, Some(4)),
+            4,
+        );
+    }
+
+    /// POSITIVE control (`size == 1` skip path, e.g. `&[u8]`): the split-off
+    /// pointer is `data + k` with no `Mul`; NOT refuted against `elem_size == 1`.
     #[test]
     fn correct_stride_iter_ctor_size1_is_not_refuted() {
-        let outcome = st_discharge("stride_size1", &st_emit(&StCfg::correct(None)), 1);
-        assert!(
-            !matches!(outcome, RefinementOutcome::Refuted { .. }),
-            "a correct size-1 stride-iter ctor must not be refuted, got {outcome:?}"
+        st_assert_correct(
+            "stride_size1",
+            &StCfg::correct(StrideIterCtorKind::ChunksExact, None),
+            1,
         );
-        if trust_cg_verify::ay_bridge::z3_available() {
-            if alethe_crosscheck_gap(&outcome) {
-                eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
-                return;
-            }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
-        }
     }
 
     /// A DROPPED `n != 0` check (no `ICmp` emitted) takes the fold OUT OF SLICE:
@@ -6229,7 +7340,7 @@ mod tests {
     fn dropped_nonzero_check_stride_iter_ctor_is_out_of_slice() {
         let cfg = StCfg {
             emit_check: false,
-            ..StCfg::correct(Some(4))
+            ..StCfg::correct(StrideIterCtorKind::Whole, Some(4))
         };
         assert!(
             fold_emitted_stride_iter_ctor(&st_emit(&cfg)).is_none(),
@@ -6237,32 +7348,96 @@ mod tests {
         );
     }
 
-    /// ANTI-TAUTOLOGY: `end` is scaled by the WRONG element size (bridge multiplies
-    /// `len` by 2, the element is 4 bytes). `cursor.end` folds to `data + len*2`
-    /// where the spec has `data + len*4` -> REFUTED.
+    /// A state lane the spec defines but the bridge never stored (`rem.len`)
+    /// states no obligation (`None`): the pairing never guesses a missing store.
     #[test]
-    fn wrong_scale_stride_iter_ctor_is_refuted() {
-        // Emit a *2 scale but tell the obligation the element is 4 bytes.
-        let outcome = st_discharge("stride_wrong_scale", &st_emit(&StCfg::correct(Some(2))), 4);
+    fn missing_rem_store_stride_iter_ctor_is_out_of_shape() {
+        let cfg = StCfg {
+            drop_rem_len: true,
+            ..StCfg::correct(StrideIterCtorKind::ChunksExact, Some(4))
+        };
         assert!(
-            matches!(outcome, RefinementOutcome::Refuted { .. }),
-            "a wrong element scale on end must be REFUTED, got {outcome:?}"
+            st_obligations(
+                "stride_missing_rem",
+                &st_emit(&cfg),
+                StrideIterCtorKind::ChunksExact,
+                4
+            )
+            .is_none(),
+            "a constructor that never stores rem.len must state no obligation"
         );
     }
 
-    /// ANTI-TAUTOLOGY: `end` is computed off a DIFFERENT base than the slice data
-    /// (`ST_WRONGBASE`). `cursor.end` folds to `wrongbase + len*4` where the spec
-    /// has `data + len*4` -> REFUTED.
+    /// ANTI-TAUTOLOGY: the split-off `rem` pointer is scaled by the WRONG element
+    /// size (bridge multiplies by 2, the element is 4 bytes) -> REFUTED.
+    #[test]
+    fn wrong_scale_stride_iter_ctor_is_refuted() {
+        let outcome = st_discharge(
+            "stride_wrong_scale",
+            &st_emit(&StCfg::correct(StrideIterCtorKind::ChunksExact, Some(2))),
+            StrideIterCtorKind::ChunksExact,
+            4,
+        );
+        assert!(
+            matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "a wrong element scale on the split-off pointer must be REFUTED, got {outcome:?}"
+        );
+    }
+
+    /// ANTI-TAUTOLOGY: `v`'s data pointer is computed off a DIFFERENT base than the
+    /// slice data (`ST_WRONGBASE`) -> REFUTED.
     #[test]
     fn wrong_base_end_stride_iter_ctor_is_refuted() {
         let cfg = StCfg {
-            end_base: ST_WRONGBASE,
-            ..StCfg::correct(Some(4))
+            split_base: ST_WRONGBASE,
+            ..StCfg::correct(StrideIterCtorKind::RChunksExact, Some(4))
         };
-        let outcome = st_discharge("stride_wrong_base", &st_emit(&cfg), 4);
+        let outcome = st_discharge(
+            "stride_wrong_base",
+            &st_emit(&cfg),
+            StrideIterCtorKind::RChunksExact,
+            4,
+        );
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
-            "an end computed off the wrong base must be REFUTED, got {outcome:?}"
+            "a split-off pointer computed off the wrong base must be REFUTED, got {outcome:?}"
+        );
+    }
+
+    /// ANTI-TAUTOLOGY: the `*_exact` `v` keeps the WHOLE slice (the remainder is
+    /// not split off, the private-cursor shape that read `len` where std reads
+    /// `len - len % n`) -> REFUTED.
+    #[test]
+    fn unsplit_exact_stride_iter_ctor_is_refuted() {
+        for kind in [
+            StrideIterCtorKind::ChunksExact,
+            StrideIterCtorKind::RChunksExact,
+        ] {
+            let cfg = StCfg {
+                unsplit: true,
+                ..StCfg::correct(kind, Some(4))
+            };
+            let outcome = st_discharge("stride_unsplit", &st_emit(&cfg), kind, 4);
+            assert!(
+                matches!(outcome, RefinementOutcome::Refuted { .. }),
+                "an unsplit {kind:?} v must be REFUTED, got {outcome:?}"
+            );
+        }
+    }
+
+    /// ANTI-TAUTOLOGY: a correct `ChunksExact` emission checked as an
+    /// `RChunksExact` (the remainder split off the wrong END) -> REFUTED.
+    #[test]
+    fn wrong_end_exact_stride_iter_ctor_is_refuted() {
+        let outcome = st_discharge(
+            "stride_wrong_end",
+            &st_emit(&StCfg::correct(StrideIterCtorKind::ChunksExact, Some(4))),
+            StrideIterCtorKind::RChunksExact,
+            4,
+        );
+        assert!(
+            matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "a remainder split off the wrong end must be REFUTED, got {outcome:?}"
         );
     }
 
@@ -6273,28 +7448,37 @@ mod tests {
     fn inverted_nonzero_check_stride_iter_ctor_is_refuted() {
         let cfg = StCfg {
             icmp_op: ICmpOp::Eq,
-            ..StCfg::correct(Some(4))
+            ..StCfg::correct(StrideIterCtorKind::Whole, Some(4))
         };
-        let outcome = st_discharge("stride_inverted_check", &st_emit(&cfg), 4);
+        let outcome = st_discharge(
+            "stride_inverted_check",
+            &st_emit(&cfg),
+            StrideIterCtorKind::Whole,
+            4,
+        );
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "an inverted non-zero check must be REFUTED, got {outcome:?}"
         );
     }
 
-    /// ANTI-TAUTOLOGY: the ptr and end halves are stored at SWAPPED cursor offsets
-    /// (`data + len*size` lands at `ptr@0` where the spec's `cursor.ptr` is `data`)
+    /// ANTI-TAUTOLOGY: `v`'s data pointer and length are stored at SWAPPED offsets
     /// -> REFUTED.
     #[test]
     fn swapped_ptr_end_stride_iter_ctor_is_refuted() {
         let cfg = StCfg {
-            swap_ptr_end: true,
-            ..StCfg::correct(Some(4))
+            swap_v: true,
+            ..StCfg::correct(StrideIterCtorKind::Whole, Some(4))
         };
-        let outcome = st_discharge("stride_swapped_ptr_end", &st_emit(&cfg), 4);
+        let outcome = st_discharge(
+            "stride_swapped_v",
+            &st_emit(&cfg),
+            StrideIterCtorKind::Whole,
+            4,
+        );
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
-            "swapped ptr/end cursor stores must be REFUTED, got {outcome:?}"
+            "swapped v.data/v.len stores must be REFUTED, got {outcome:?}"
         );
     }
 
@@ -6372,29 +7556,26 @@ mod tests {
 
     /// Discharge every vec-index obligation, prioritizing a `Refuted` over any
     /// `Inconclusive` (so a wrong field REFUTES even when the correct fields are
-    /// solver-undecidable without a solver). Returns `Refuted` if ANY refutes, else
-    /// `Inconclusive` if any is undecided, else `Refined`.
+    /// solver-undecidable without a solver). Every obligation is discharged and the
+    /// verdicts are folded by `crate::solver_test_support::test_outcome`.
     fn vi_discharge(name: &str, emitted: &[InstrNode], elem_size: u64) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let folded = fold_emitted_vec_index(emitted).expect("vec-index in slice");
-        let obligations =
-            vec_index_obligations(name, &folded, VI_DATA, VI_LEN, VI_IDX, elem_size)
-                .expect("vec-index obligations built");
-        let cfg = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &cfg) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        let obligations = vec_index_obligations(
+            name,
+            &folded,
+            VI_DATA,
+            VI_LEN,
+            VI_IDX,
+            elem_size,
+            WORD_MODEL_POINTER_BYTES,
+        )
+        .expect("vec-index obligations built");
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     #[test]
@@ -6453,7 +7634,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -6495,7 +7679,11 @@ mod tests {
     #[test]
     fn wrong_scale_vec_index_is_refuted() {
         // Emit a *2 scale but tell the obligation the element is 4 bytes.
-        let outcome = vi_discharge("vec_index_wrong_scale", &vi_emit(&ViCfg::correct(Some(2))), 4);
+        let outcome = vi_discharge(
+            "vec_index_wrong_scale",
+            &vi_emit(&ViCfg::correct(Some(2))),
+            4,
+        );
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong element scale must be REFUTED, got {outcome:?}"
@@ -6524,7 +7712,7 @@ mod tests {
     // VALUE-level refinement. Each test HAND-BUILDS the exact trust-ir the bridge
     // emits for `lower_vec_range_subslice_index_call` (`emit_element_addr`'s
     // Copy/PtrToInt/Copy/[Const,Mul]/Add/IntToPtr for `data + start*elem_size`, the
-    // `Sub` for `end - start`, the two `InsertField`s of `{ data@0/0, len@0/1 }`, and
+    // `Sub` for `end - start`, the two lane `Store`s of `{ data@0, len@8 }`, and
     // the COMBINED bounds check — two `ICmp Ule`s + a Bool `And`), folds it, and
     // discharges the reconstructed obligations against the layout-independent
     // `vec_range_subslice_spec`. A CORRECT emission (each of the three forms, and the
@@ -6598,7 +7786,7 @@ mod tests {
     /// Build the exact emitted trust-ir slice `lower_vec_range_subslice_index_call`
     /// produces for `VR_DEST = &(VR_DATA/VR_LEN)[range]`, perturbed by `cfg`: the
     /// result-pointer element address, the length `Sub`, the two `{data,len}`
-    /// `InsertField` stores, then the COMBINED bounds check (EXCLUDING the `CondBr`).
+    /// lane stores, then the COMBINED bounds check (EXCLUDING the `CondBr`).
     fn vr_emit(cfg: &VrCfg) -> Vec<InstrNode> {
         let mut next = 500u32;
         let mut nodes = Vec::new();
@@ -6621,7 +7809,7 @@ mod tests {
             },
             sub_len,
         ));
-        // store_fat_ptr_slot_into(VR_DEST, sub_data, sub_len): InsertField 0/1.
+        // store_fat_ptr_slot_into(VR_DEST, sub_data, sub_len): lanes 0/1.
         sa_store_fat_ptr(&mut next, &mut nodes, VR_DEST, sub_data, sub_len);
         // Combined bounds check.
         match cfg.bounds {
@@ -6682,31 +7870,30 @@ mod tests {
 
     /// Discharge every range-subslice obligation, prioritizing a `Refuted` over any
     /// `Inconclusive` (so a wrong field REFUTES even when the correct fields are
-    /// solver-undecidable without a solver). Returns `Refuted` if ANY refutes, else
-    /// `Inconclusive` if any is undecided, else `Refined`.
+    /// solver-undecidable without a solver). Every obligation is discharged and the
+    /// verdicts are folded by `crate::solver_test_support::test_outcome`.
     fn vr_discharge(name: &str, cfg: &VrCfg, elem_size: u64) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let folded = fold_emitted_vec_range_subslice(&vr_emit(cfg)).expect("vec-subslice in slice");
         let (_start, _end, a, b) = vr_start_end(cfg.form);
         let obligations = vec_range_subslice_obligations(
-            name, &folded, cfg.form, VR_OFF, VR_DATA, VR_LEN, a, b, elem_size,
+            name,
+            &folded,
+            cfg.form,
+            VR_OFF,
+            VR_DATA,
+            VR_LEN,
+            a,
+            b,
+            elem_size,
+            WORD_MODEL_POINTER_BYTES,
         )
         .expect("vec-subslice obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     #[test]
@@ -6787,7 +7974,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -6808,7 +7998,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -6816,11 +8009,7 @@ mod tests {
     /// `data + start` with no `Mul`; NOT refuted against `elem_size == 1`.
     #[test]
     fn correct_vec_range_subslice_size1_is_not_refuted() {
-        let outcome = vr_discharge(
-            "vr_range_size1",
-            &VrCfg::correct(RangeForm::Range, None),
-            1,
-        );
+        let outcome = vr_discharge("vr_range_size1", &VrCfg::correct(RangeForm::Range, None), 1);
         assert!(
             !matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a correct size-1 subslice must not be refuted, got {outcome:?}"
@@ -6830,7 +8019,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -7142,25 +8334,22 @@ mod tests {
 
     fn fl_discharge(name: &str, cfg: &FlCfg, elem_size: u64) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let folded = fold_emitted_slice_first_last(&fl_emit(cfg)).expect("first/last in slice");
-        let obligations =
-            slice_first_last_obligations(name, &folded, cfg.kind, FL_DATA, FL_LEN, elem_size)
-                .expect("first/last obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        let obligations = slice_first_last_obligations(
+            name,
+            &folded,
+            cfg.kind,
+            FL_DATA,
+            FL_LEN,
+            elem_size,
+            WORD_MODEL_POINTER_BYTES,
+        )
+        .expect("first/last obligations built");
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     /// The fold reconstructs `first` as `ITE(len != 0, data, 0)`.
@@ -7190,7 +8379,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -7207,7 +8399,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -7219,6 +8414,16 @@ mod tests {
             !matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a correct size-1 last must not be refuted, got {outcome:?}"
         );
+        if trust_cg_verify::ay_bridge::z3_available() {
+            if alethe_crosscheck_gap(&outcome) {
+                eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
+                return;
+            }
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
+        }
     }
 
     /// ANTI-TAUTOLOGY: the emptiness test is INVERTED (`Eq(len,0)` instead of `Ne`),
@@ -7715,22 +8920,12 @@ mod tests {
 
     fn rn_discharge(name: &str, cfg: &RnCfg) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let obligations = rn_obligations(name, cfg).expect("Range::next obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     /// The fold reconstructs the three stored values as EXACTLY the spec formulas
@@ -7767,7 +8962,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -7784,7 +8982,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -7929,8 +9130,7 @@ mod tests {
     #[test]
     fn narrow_fold_reconstructs_range_next_w4() {
         let cfg = RnCfg::correct_w(true, TrustIrTy::I32);
-        let folded =
-            fold_emitted_range_next(&rn_emit(&cfg)).expect("narrow Range::next in slice");
+        let folded = fold_emitted_range_next(&rn_emit(&cfg)).expect("narrow Range::next in slice");
         let spec = range_next_spec_w(
             true,
             4,
@@ -7959,7 +9159,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -7977,7 +9180,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -7995,7 +9201,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8013,7 +9222,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8146,7 +9358,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8241,7 +9456,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8640,6 +9858,15 @@ mod tests {
     }
 
     fn se_obligations(name: &str, cfg: &SeCfg, elem_size: u64) -> Option<Vec<ProofObligation>> {
+        se_obligations_w(name, cfg, elem_size, WORD_MODEL_POINTER_BYTES)
+    }
+
+    fn se_obligations_w(
+        name: &str,
+        cfg: &SeCfg,
+        elem_size: u64,
+        pointer_bytes: u64,
+    ) -> Option<Vec<ProofObligation>> {
         let folded = fold_emitted_split_ends(&se_emit(cfg)).expect("split ends in slice");
         split_ends_obligations(
             name,
@@ -8649,30 +9876,23 @@ mod tests {
             SE_DEST,
             SE_F0,
             SE_F1,
+            SE_F1 + 8,
             SE_DATA,
             SE_LEN,
             elem_size,
+            pointer_bytes,
         )
     }
 
     fn se_discharge(name: &str, cfg: &SeCfg, elem_size: u64) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
-        let obligations = se_obligations(name, cfg, elem_size).expect("split ends obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        use trust_cg_verify::mir_semantics::discharge_each;
+        let obligations =
+            se_obligations(name, cfg, elem_size).expect("split ends obligations built");
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     /// The fold reconstructs the two pointer cells as EXACTLY the spec formulas
@@ -8708,7 +9928,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8726,7 +9949,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8734,8 +9960,11 @@ mod tests {
     /// pointer (`f1`), the emitted `Select` there too — is NOT refuted.
     #[test]
     fn correct_split_first_niche_at_f1_is_not_refuted() {
-        let outcome =
-            se_discharge("se_first_f1", &SeCfg::correct(SliceEndKind::First, false, 8), 8);
+        let outcome = se_discharge(
+            "se_first_f1",
+            &SeCfg::correct(SliceEndKind::First, false, 8),
+            8,
+        );
         assert!(
             !matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a correct f1-niche split_first must not be refuted, got {outcome:?}"
@@ -8745,7 +9974,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8753,7 +9985,11 @@ mod tests {
     /// identity Mul-skip — the tail data is `data + (1)*1` with NO `Mul` emitted.
     #[test]
     fn correct_split_last_size1_is_not_refuted() {
-        let outcome = se_discharge("se_last_s1", &SeCfg::correct(SliceEndKind::Last, true, 1), 1);
+        let outcome = se_discharge(
+            "se_last_s1",
+            &SeCfg::correct(SliceEndKind::Last, true, 1),
+            1,
+        );
         assert!(
             !matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a correct size-1 split_last must not be refuted, got {outcome:?}"
@@ -8763,7 +9999,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -8834,8 +10073,11 @@ mod tests {
     /// size (bridge multiplies by 2, the element is 4 bytes) -> REFUTED.
     #[test]
     fn wrong_scale_split_last_is_refuted() {
-        let outcome =
-            se_discharge("se_wrong_scale", &SeCfg::correct(SliceEndKind::Last, true, 2), 4);
+        let outcome = se_discharge(
+            "se_wrong_scale",
+            &SeCfg::correct(SliceEndKind::Last, true, 2),
+            4,
+        );
         assert!(
             matches!(outcome, RefinementOutcome::Refuted { .. }),
             "a wrong element scale must be REFUTED, got {outcome:?}"
@@ -8948,7 +10190,7 @@ mod tests {
     const SI_SELF: ValueId = ValueId::new(90);
     const SI_DEST: ValueId = ValueId::new(91);
     /// `slice::Iter`'s cursor layout in the bridge's own model: `ptr` at slot
-    /// offset 0, `end` at 8 (`SLICE_ITER_END_OFFSET`).
+    /// offset 0, `end` at 8 (`slice_iter_end_offset()`).
     const SI_END_OFF: u64 = 8;
     /// `Option<&T>`'s single niche field is the whole 8-byte Option at offset 0.
     const SI_TAG_OFF: u64 = 0;
@@ -9210,7 +10452,16 @@ mod tests {
     }
 
     fn si_obligations(name: &str, cfg: &SiCfg) -> Option<Vec<ProofObligation>> {
-        let folded = fold_emitted_slice_iter_next(&si_emit(cfg)).expect("slice Iter::next in slice");
+        si_obligations_w(name, cfg, WORD_MODEL_POINTER_BYTES)
+    }
+
+    fn si_obligations_w(
+        name: &str,
+        cfg: &SiCfg,
+        pointer_bytes: u64,
+    ) -> Option<Vec<ProofObligation>> {
+        let folded =
+            fold_emitted_slice_iter_next(&si_emit(cfg)).expect("slice Iter::next in slice");
         slice_iter_next_obligations(
             name,
             &folded,
@@ -9219,27 +10470,18 @@ mod tests {
             cfg.elem_size,
             SI_END_OFF,
             SI_TAG_OFF,
+            pointer_bytes,
         )
     }
 
     fn si_discharge(name: &str, cfg: &SiCfg) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let obligations = si_obligations(name, cfg).expect("slice Iter::next obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     /// The fold reconstructs the two stored values as EXACTLY the spec formulas
@@ -9271,7 +10513,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -9290,7 +10535,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -9511,7 +10759,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(narrowed >= 3, "expected to narrow the ptr/end casts + the compare");
+        assert!(
+            narrowed >= 3,
+            "expected to narrow the ptr/end casts + the compare"
+        );
         assert!(
             fold_emitted_slice_iter_next(&nodes).is_none(),
             "a truncating I8 exhaustion compare must be out of the fold slice \
@@ -9834,7 +11085,11 @@ mod tests {
             })
             .with_result(new_start),
         );
-        let wb_addr = if cfg.writeback_to_end { end_addr } else { start_addr };
+        let wb_addr = if cfg.writeback_to_end {
+            end_addr
+        } else {
+            start_addr
+        };
         nodes.push(InstrNode::new(Inst::Store {
             ty: TrustIrTy::I64,
             ptr: wb_addr,
@@ -9933,8 +11188,7 @@ mod tests {
             volatile: false,
             align: None,
         }));
-        let payload_addr =
-            rn_field_addr(&mut nodes, &mut next, SB_DEST, SB_PAYLOAD_OFF as i128);
+        let payload_addr = rn_field_addr(&mut nodes, &mut next, SB_DEST, SB_PAYLOAD_OFF as i128);
         // Defect-1 shape: RELOAD the just-written cursor cell and yield THAT.
         let payload = if cfg.payload_reloads_state {
             let reloaded = fresh(&mut next);
@@ -9975,6 +11229,14 @@ mod tests {
     }
 
     fn sb_obligations(name: &str, cfg: &SbCfg) -> Option<Vec<ProofObligation>> {
+        sb_obligations_w(name, cfg, WORD_MODEL_POINTER_BYTES)
+    }
+
+    fn sb_obligations_w(
+        name: &str,
+        cfg: &SbCfg,
+        pointer_bytes: u64,
+    ) -> Option<Vec<ProofObligation>> {
         let folded = fold_emitted_step_by_next(&sb_emit(cfg)).expect("StepBy::next in slice");
         step_by_next_obligations(
             name,
@@ -9989,27 +11251,18 @@ mod tests {
             SB_PAYLOAD_OFF,
             SB_SOME as u64,
             SB_NONE as u64,
+            pointer_bytes,
         )
     }
 
     fn sb_discharge(name: &str, cfg: &SbCfg) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let obligations = sb_obligations(name, cfg).expect("StepBy::next obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     /// The fold reconstructs the four stored values as EXACTLY the spec
@@ -10032,7 +11285,10 @@ mod tests {
             folded.store_value(SB_SELF, cfg.src_off).unwrap(),
             spec.new_start
         );
-        assert_eq!(folded.store_value(SB_SELF, cfg.ft_off).unwrap(), spec.new_ft);
+        assert_eq!(
+            folded.store_value(SB_SELF, cfg.ft_off).unwrap(),
+            spec.new_ft
+        );
         assert_eq!(folded.store_value(SB_DEST, SB_TAG_OFF).unwrap(), spec.tag);
         assert_eq!(
             folded.store_value(SB_DEST, SB_PAYLOAD_OFF).unwrap(),
@@ -10055,7 +11311,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -10080,7 +11339,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -10661,8 +11923,7 @@ mod tests {
             volatile: false,
             align: None,
         }));
-        let payload_addr =
-            rn_field_addr(&mut nodes, &mut next, SBP_DEST, SBP_PAYLOAD_OFF as i128);
+        let payload_addr = rn_field_addr(&mut nodes, &mut next, SBP_DEST, SBP_PAYLOAD_OFF as i128);
         let payload = if cfg.payload_is_y { y } else { y_plus1 };
         nodes.push(InstrNode::new(Inst::Store {
             ty: TrustIrTy::U64,
@@ -10686,6 +11947,14 @@ mod tests {
     }
 
     fn sbp_obligations(name: &str, cfg: &SbpCfg) -> Option<Vec<ProofObligation>> {
+        sbp_obligations_w(name, cfg, WORD_MODEL_POINTER_BYTES)
+    }
+
+    fn sbp_obligations_w(
+        name: &str,
+        cfg: &SbpCfg,
+        pointer_bytes: u64,
+    ) -> Option<Vec<ProofObligation>> {
         let folded =
             fold_emitted_step_by_next(&sbp_emit(cfg)).expect("packed StepBy::next in slice");
         step_by_next_packed_obligations(
@@ -10700,28 +11969,19 @@ mod tests {
             SBP_PAYLOAD_OFF,
             SBP_SOME as u64,
             SBP_NONE as u64,
+            pointer_bytes,
         )
     }
 
     fn sbp_discharge(name: &str, cfg: &SbpCfg) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
+        use trust_cg_verify::mir_semantics::discharge_each;
         let obligations =
             sbp_obligations(name, cfg).expect("packed StepBy::next obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     /// The fold reconstructs the four stored values as EXACTLY the packed
@@ -10769,7 +12029,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -10794,7 +12057,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -11388,6 +12654,14 @@ mod tests {
     }
 
     fn sbs_obligations(name: &str, cfg: &SbsCfg) -> Option<Vec<ProofObligation>> {
+        sbs_obligations_w(name, cfg, WORD_MODEL_POINTER_BYTES)
+    }
+
+    fn sbs_obligations_w(
+        name: &str,
+        cfg: &SbsCfg,
+        pointer_bytes: u64,
+    ) -> Option<Vec<ProofObligation>> {
         let folded =
             fold_emitted_step_by_next(&sbs_emit(cfg)).expect("slice StepBy::next in slice");
         step_by_next_slice_obligations(
@@ -11400,28 +12674,18 @@ mod tests {
             cfg.src_off,
             cfg.spec_elem_size,
             SBS_TAG_OFF,
+            pointer_bytes,
         )
     }
 
     fn sbs_discharge(name: &str, cfg: &SbsCfg) -> RefinementOutcome {
         use trust_cg_verify::ay_bridge::AYConfig;
-        use trust_cg_verify::mir_semantics::discharge_refinement;
-        let obligations =
-            sbs_obligations(name, cfg).expect("slice StepBy::next obligations built");
-        let config = AYConfig::default();
-        let mut inconclusive = None;
-        for ob in &obligations {
-            match discharge_refinement(ob, &config) {
-                RefinementOutcome::Refined => {}
-                r @ RefinementOutcome::Refuted { .. } => return r,
-                i @ RefinementOutcome::Inconclusive { .. } => {
-                    if inconclusive.is_none() {
-                        inconclusive = Some(i);
-                    }
-                }
-            }
-        }
-        inconclusive.unwrap_or(RefinementOutcome::Refined)
+        use trust_cg_verify::mir_semantics::discharge_each;
+        let obligations = sbs_obligations(name, cfg).expect("slice StepBy::next obligations built");
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
     }
 
     /// The fold reconstructs the three stored values as EXACTLY the slice
@@ -11445,8 +12709,14 @@ mod tests {
         );
         // The ft store folds to the Trunc-masked value; the spec's `new_ft`
         // carries the same explicit mask.
-        assert_eq!(folded.store_value(SBS_SELF, cfg.ft_off).unwrap(), spec.new_ft);
-        assert_eq!(folded.store_value(SBS_DEST, SBS_TAG_OFF).unwrap(), spec.niche);
+        assert_eq!(
+            folded.store_value(SBS_SELF, cfg.ft_off).unwrap(),
+            spec.new_ft
+        );
+        assert_eq!(
+            folded.store_value(SBS_DEST, SBS_TAG_OFF).unwrap(),
+            spec.niche
+        );
     }
 
     /// POSITIVE: a correct stride-8 slice `StepBy::next` is NOT refuted.
@@ -11462,7 +12732,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -11486,7 +12759,10 @@ mod tests {
                 eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
                 return;
             }
-            assert!(matches!(outcome, RefinementOutcome::Refined), "got {outcome:?}");
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "got {outcome:?}"
+            );
         }
     }
 
@@ -11617,6 +12893,1073 @@ mod tests {
         );
     }
 
+    // =======================================================================
+    // Lane 12c — core's COUNTDOWN `StepBy<Range<u64|usize>>::next`
+    // (`lower_step_by_countdown_next`) fixture: hand-builds the EXACT shape
+    // that lowering emits on a 64-bit target. In order: the `step_minus_one`
+    // address chain, its I64 (`usize_field_ty`) load, `Const 1` and the `Add`
+    // of `emit_step_by_range_step` (a 64-bit element needs no `T::MAX` clamp,
+    // and the u64 extend/trunc helpers emit NOTHING); the `start`/`end`
+    // address chains and U64 loads; `emit_step_by_countdown_advance`'s U64
+    // `Const 0`/`Const 1`, `ICmp Ne(end, 0)`, `Add(start, step)`,
+    // `Sub(end, 1)` and two `Select`s; the `start` and `end` write-backs; and
+    // `store_option_some_value`'s Direct arm with the PRE-state `start` as the
+    // payload. Each mutant changes one step of that emission. Besides the
+    // solver verdict, every refuted mutant has a CONCRETE pre-state on which
+    // the folded emission and core's `spec_next` disagree, and the correct
+    // emission agrees with it on a whole grid, so the mutation evidence does
+    // not rest on the solver alone.
+    // =======================================================================
+    const SBC_SELF: ValueId = ValueId::new(110);
+    const SBC_DEST: ValueId = ValueId::new(111);
+    /// `Option<u64>`: Some=1 / None=0, tag at slot offset 0, payload at 8.
+    const SBC_SOME: i128 = 1;
+    const SBC_NONE: i128 = 0;
+    const SBC_TAG_OFF: u64 = 0;
+    const SBC_PAYLOAD_OFF: u64 = 8;
+
+    #[derive(Clone)]
+    struct SbcCfg {
+        /// Byte offsets of `step_minus_one` / `first_take` / the inner Range.
+        sm_off: u64,
+        ft_off: u64,
+        src_off: u64,
+        /// The `Option` tag scalar (`I8`, or a word-sized `I64` tag).
+        tag_ty: TrustIrTy,
+        /// `step = sm + 1` (`false` = `step = sm`: every later yield `k - 1`
+        /// past the previous one).
+        step_adds_one: bool,
+        /// The yield predicate is `end >u 1` instead of `end != 0` (the
+        /// countdown stops one item early).
+        cond_stops_early: bool,
+        /// The constant the count decrements by (1 correct; 2 = the countdown
+        /// skips a count).
+        end_decrement: i128,
+        /// `new_start = Select(cond, start + step, start)` (`false` = arms
+        /// swapped: advance-when-done).
+        advance_on_yield: bool,
+        /// `new_end = Select(cond, end - 1, end)` (`false` = `end - 1` stored
+        /// unconditionally: an exhausted count wraps to `u64::MAX`).
+        end_select: bool,
+        /// Tag `Select(cond, some, none)` arm order (`false` = swapped).
+        tag_some_on_yield: bool,
+        /// The payload is `start + step` (yielded after the step).
+        payload_after_step: bool,
+        /// The payload is `start + (first_take ? 0 : sm)`, the default
+        /// `spec_next`'s element mixed into the countdown.
+        payload_consults_first_take: bool,
+        /// `new_start` is stored to the `end` cell and `new_end` to `start`.
+        swap_writebacks: bool,
+        /// A 1-byte `first_take = 0` store (core's countdown never writes it).
+        store_first_take: bool,
+        /// Emit the `end` write-back at all.
+        emit_end_store: bool,
+        /// The `end` write-back's store type (`U64` correct; `U32` truncates).
+        end_store_ty: TrustIrTy,
+        /// The `end` write-back targets the `step_minus_one` cell.
+        end_store_to_sm: bool,
+        /// The payload RELOADS `start` after its write-back (load-after-store).
+        payload_reloads_start: bool,
+    }
+
+    impl SbcCfg {
+        /// The correct emission with the layout
+        /// `{ step_minus_one @ 0, first_take @ 8, Range { start @ 16, end @ 24 } }`.
+        fn correct() -> Self {
+            Self {
+                sm_off: 0,
+                ft_off: 8,
+                src_off: 16,
+                tag_ty: TrustIrTy::I8,
+                step_adds_one: true,
+                cond_stops_early: false,
+                end_decrement: 1,
+                advance_on_yield: true,
+                end_select: true,
+                tag_some_on_yield: true,
+                payload_after_step: false,
+                payload_consults_first_take: false,
+                swap_writebacks: false,
+                store_first_take: false,
+                emit_end_store: true,
+                end_store_ty: TrustIrTy::U64,
+                end_store_to_sm: false,
+                payload_reloads_start: false,
+            }
+        }
+    }
+
+    fn sbc_emit(cfg: &SbcCfg) -> Vec<InstrNode> {
+        let mut nodes = Vec::new();
+        let mut next = 300u32;
+        let fresh = |next: &mut u32| {
+            let v = ValueId::new(*next);
+            *next += 1;
+            v
+        };
+        let load = |nodes: &mut Vec<InstrNode>, ty: TrustIrTy, ptr: ValueId, result: ValueId| {
+            nodes.push(node(
+                Inst::Load {
+                    ty,
+                    ptr,
+                    volatile: false,
+                    align: None,
+                },
+                result,
+            ));
+        };
+        let store = |nodes: &mut Vec<InstrNode>, ty: TrustIrTy, ptr: ValueId, value: ValueId| {
+            nodes.push(InstrNode::new(Inst::Store {
+                ty,
+                ptr,
+                value,
+                volatile: false,
+                align: None,
+            }));
+        };
+        let konst = |nodes: &mut Vec<InstrNode>, ty: TrustIrTy, v: i128, result: ValueId| {
+            nodes.push(node(
+                Inst::Const {
+                    ty,
+                    value: Constant::Int(v),
+                },
+                result,
+            ));
+        };
+        let binop = |nodes: &mut Vec<InstrNode>,
+                     op: TrustIrBinOp,
+                     ty: TrustIrTy,
+                     lhs: ValueId,
+                     rhs: ValueId,
+                     result: ValueId| {
+            nodes.push(InstrNode::new(Inst::BinOp { op, ty, lhs, rhs }).with_result(result));
+        };
+        let select = |nodes: &mut Vec<InstrNode>,
+                      ty: TrustIrTy,
+                      cond: ValueId,
+                      then_val: ValueId,
+                      else_val: ValueId,
+                      result: ValueId| {
+            nodes.push(
+                InstrNode::new(Inst::Select {
+                    ty,
+                    cond,
+                    then_val,
+                    else_val,
+                })
+                .with_result(result),
+            );
+        };
+
+        // 1. `emit_step_by_range_step`: step = sm + 1.
+        let sm_addr = sb_field_addr(&mut nodes, &mut next, SBC_SELF, cfg.sm_off);
+        let sm = fresh(&mut next);
+        load(&mut nodes, TrustIrTy::I64, sm_addr, sm);
+        let one_i64 = fresh(&mut next);
+        konst(&mut nodes, TrustIrTy::I64, 1, one_i64);
+        let step = if cfg.step_adds_one {
+            let step = fresh(&mut next);
+            binop(
+                &mut nodes,
+                TrustIrBinOp::Add,
+                TrustIrTy::I64,
+                sm,
+                one_i64,
+                step,
+            );
+            step
+        } else {
+            sm
+        };
+        // 2. The `start` / `end` address chains, then their U64 loads.
+        let start_addr = sb_field_addr(&mut nodes, &mut next, SBC_SELF, cfg.src_off);
+        let end_addr = sb_field_addr(&mut nodes, &mut next, SBC_SELF, cfg.src_off + 8);
+        let start = fresh(&mut next);
+        load(&mut nodes, TrustIrTy::U64, start_addr, start);
+        let end = fresh(&mut next);
+        load(&mut nodes, TrustIrTy::U64, end_addr, end);
+        // Mutant: the default `spec_next` element `start + (ft ? 0 : sm)`
+        // (all of its loads precede every store).
+        let yielded = if cfg.payload_consults_first_take {
+            let ft_addr = sb_field_addr(&mut nodes, &mut next, SBC_SELF, cfg.ft_off);
+            let ft_i8 = fresh(&mut next);
+            load(&mut nodes, TrustIrTy::I8, ft_addr, ft_i8);
+            let ft = fresh(&mut next);
+            nodes.push(node(
+                Inst::Cast {
+                    op: CastOp::ZExt,
+                    src_ty: TrustIrTy::I8,
+                    dst_ty: TrustIrTy::I64,
+                    operand: ft_i8,
+                },
+                ft,
+            ));
+            let zero_i64 = fresh(&mut next);
+            konst(&mut nodes, TrustIrTy::I64, 0, zero_i64);
+            let ft_nz = fresh(&mut next);
+            nodes.push(
+                InstrNode::new(Inst::ICmp {
+                    op: ICmpOp::Ne,
+                    ty: TrustIrTy::I64,
+                    lhs: ft,
+                    rhs: zero_i64,
+                })
+                .with_result(ft_nz),
+            );
+            let countdown = fresh(&mut next);
+            select(&mut nodes, TrustIrTy::I64, ft_nz, zero_i64, sm, countdown);
+            let y = fresh(&mut next);
+            binop(
+                &mut nodes,
+                TrustIrBinOp::Add,
+                TrustIrTy::U64,
+                start,
+                countdown,
+                y,
+            );
+            y
+        } else {
+            start
+        };
+        // 3. `emit_step_by_countdown_advance`.
+        let zero = fresh(&mut next);
+        konst(&mut nodes, TrustIrTy::U64, 0, zero);
+        let dec = fresh(&mut next);
+        konst(&mut nodes, TrustIrTy::U64, cfg.end_decrement, dec);
+        let cond = fresh(&mut next);
+        let (cmp_op, cmp_rhs) = if cfg.cond_stops_early {
+            (ICmpOp::Ugt, dec)
+        } else {
+            (ICmpOp::Ne, zero)
+        };
+        nodes.push(
+            InstrNode::new(Inst::ICmp {
+                op: cmp_op,
+                ty: TrustIrTy::U64,
+                lhs: end,
+                rhs: cmp_rhs,
+            })
+            .with_result(cond),
+        );
+        let stepped = fresh(&mut next);
+        binop(
+            &mut nodes,
+            TrustIrBinOp::Add,
+            TrustIrTy::U64,
+            start,
+            step,
+            stepped,
+        );
+        let left = fresh(&mut next);
+        binop(
+            &mut nodes,
+            TrustIrBinOp::Sub,
+            TrustIrTy::U64,
+            end,
+            dec,
+            left,
+        );
+        let new_start = fresh(&mut next);
+        let (ns_t, ns_e) = if cfg.advance_on_yield {
+            (stepped, start)
+        } else {
+            (start, stepped)
+        };
+        select(&mut nodes, TrustIrTy::U64, cond, ns_t, ns_e, new_start);
+        let new_end = if cfg.end_select {
+            let new_end = fresh(&mut next);
+            select(&mut nodes, TrustIrTy::U64, cond, left, end, new_end);
+            new_end
+        } else {
+            left
+        };
+        // 4. The `start` / `end` write-backs.
+        let (start_cell, end_cell) = if cfg.swap_writebacks {
+            (end_addr, start_addr)
+        } else {
+            (start_addr, end_addr)
+        };
+        store(&mut nodes, TrustIrTy::U64, start_cell, new_start);
+        if cfg.emit_end_store {
+            let cell = if cfg.end_store_to_sm {
+                sm_addr
+            } else {
+                end_cell
+            };
+            store(&mut nodes, cfg.end_store_ty.clone(), cell, new_end);
+        }
+        if cfg.store_first_take {
+            let ft_addr = sb_field_addr(&mut nodes, &mut next, SBC_SELF, cfg.ft_off);
+            let zero_i64 = fresh(&mut next);
+            konst(&mut nodes, TrustIrTy::I64, 0, zero_i64);
+            let zero_i8 = fresh(&mut next);
+            nodes.push(node(
+                Inst::Cast {
+                    op: CastOp::Trunc,
+                    src_ty: TrustIrTy::I64,
+                    dst_ty: TrustIrTy::I8,
+                    operand: zero_i64,
+                },
+                zero_i8,
+            ));
+            store(&mut nodes, TrustIrTy::I8, ft_addr, zero_i8);
+        }
+        // 5. `store_option_some_value`'s Direct arm: tag Consts + Select +
+        //    Store at (dest, 0) (offset-0 shortcut); payload Store at (dest, 8).
+        let some_tag = fresh(&mut next);
+        konst(&mut nodes, cfg.tag_ty.clone(), SBC_SOME, some_tag);
+        let none_tag = fresh(&mut next);
+        konst(&mut nodes, cfg.tag_ty.clone(), SBC_NONE, none_tag);
+        let (tt, te) = if cfg.tag_some_on_yield {
+            (some_tag, none_tag)
+        } else {
+            (none_tag, some_tag)
+        };
+        let chosen_tag = fresh(&mut next);
+        select(&mut nodes, cfg.tag_ty.clone(), cond, tt, te, chosen_tag);
+        store(&mut nodes, cfg.tag_ty.clone(), SBC_DEST, chosen_tag);
+        let payload_addr = rn_field_addr(&mut nodes, &mut next, SBC_DEST, SBC_PAYLOAD_OFF as i128);
+        let payload = if cfg.payload_reloads_start {
+            let reloaded = fresh(&mut next);
+            load(&mut nodes, TrustIrTy::U64, start_addr, reloaded);
+            reloaded
+        } else if cfg.payload_after_step {
+            stepped
+        } else {
+            yielded
+        };
+        store(&mut nodes, TrustIrTy::U64, payload_addr, payload);
+        nodes
+    }
+
+    fn sbc_obligations(name: &str, cfg: &SbcCfg) -> Option<Vec<ProofObligation>> {
+        sbc_obligations_w(name, cfg, WORD_MODEL_POINTER_BYTES)
+    }
+
+    fn sbc_obligations_w(
+        name: &str,
+        cfg: &SbcCfg,
+        pointer_bytes: u64,
+    ) -> Option<Vec<ProofObligation>> {
+        let folded =
+            fold_emitted_step_by_next(&sbc_emit(cfg)).expect("countdown StepBy::next in slice");
+        step_by_countdown_next_obligations(
+            name,
+            &folded,
+            SBC_SELF,
+            SBC_DEST,
+            cfg.sm_off,
+            cfg.src_off,
+            SBC_TAG_OFF,
+            scalar_byte_width(&cfg.tag_ty).expect("scalar tag"),
+            SBC_PAYLOAD_OFF,
+            SBC_SOME as u64,
+            SBC_NONE as u64,
+            pointer_bytes,
+        )
+    }
+
+    fn sbc_discharge(name: &str, cfg: &SbcCfg) -> RefinementOutcome {
+        use trust_cg_verify::ay_bridge::AYConfig;
+        use trust_cg_verify::mir_semantics::discharge_each;
+        let obligations =
+            sbc_obligations(name, cfg).expect("countdown StepBy::next obligations built");
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(&obligations, &AYConfig::default()),
+        )
+    }
+
+    /// The pre-states the concrete checks evaluate: `(sm, ft, start, end)`
+    /// over an exhausted count, the last item, a `start` the step wraps, and
+    /// the largest `step_minus_one` StepBy's invariant admits.
+    fn sbc_grid() -> Vec<(u64, u64, u64, u64)> {
+        let mut grid = Vec::new();
+        for sm in [0, 1, 2, u64::MAX - 1] {
+            for ft in [0, 1] {
+                for start in [0, 5, u64::MAX - 1] {
+                    for end in [0, 1, 2, u64::MAX] {
+                        grid.push((sm, ft, start, end));
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// The obligations whose two sides (the folded emission and core's
+    /// `spec_next`) evaluate to different values at one concrete pre-state.
+    fn sbc_disagreements(
+        obligations: &[ProofObligation],
+        cfg: &SbcCfg,
+        (sm, ft, start, end): (u64, u64, u64, u64),
+    ) -> Vec<String> {
+        let mut env: HashMap<String, u64> = HashMap::new();
+        env.insert(ld_value_name(SBC_SELF, cfg.sm_off), sm);
+        env.insert(ld_value_name_w(SBC_SELF, cfg.ft_off, 1), ft);
+        env.insert(ld_value_name(SBC_SELF, cfg.src_off), start);
+        env.insert(ld_value_name(SBC_SELF, cfg.src_off + 8), end);
+        obligations
+            .iter()
+            .filter(|ob| {
+                for (input, _) in &ob.inputs {
+                    assert!(env.contains_key(input), "unbound input {input}");
+                }
+                let bridge = ob
+                    .trust_ir_expr
+                    .try_eval(&env)
+                    .expect("bridge side evaluates");
+                let spec = ob.aarch64_expr.try_eval(&env).expect("spec side evaluates");
+                !bridge.semantically_equal(&spec)
+            })
+            .map(|ob| ob.name.clone())
+            .collect()
+    }
+
+    /// A concrete pre-state of the grid on which a mutant's emission and
+    /// core's `spec_next` disagree, with the disagreeing obligations.
+    fn sbc_concrete_witness(cfg: &SbcCfg) -> Option<((u64, u64, u64, u64), Vec<String>)> {
+        let obligations = sbc_obligations("sbc_witness", cfg).expect("in shape");
+        sbc_grid().into_iter().find_map(|state| {
+            let wrong = sbc_disagreements(&obligations, cfg, state);
+            (!wrong.is_empty()).then_some((state, wrong))
+        })
+    }
+
+    /// A mutant the obligations must REFUTE: by the solver, and on a
+    /// concrete pre-state whose disagreeing obligation is `cell`.
+    fn assert_sbc_refuted(name: &str, cfg: &SbcCfg, cell: &str) {
+        let (state, wrong) = sbc_concrete_witness(cfg)
+            .unwrap_or_else(|| panic!("{name}: no concrete pre-state separates the mutant"));
+        assert!(
+            wrong.iter().any(|ob| ob.ends_with(cell)),
+            "{name}: expected {cell} to disagree at {state:?}, got {wrong:?}"
+        );
+        let outcome = sbc_discharge(name, cfg);
+        assert!(
+            matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "{name}: the mutant must be REFUTED, got {outcome:?}"
+        );
+    }
+
+    /// The fold reconstructs the four stored values as EXACTLY the spec
+    /// formulas over the same pre-state load symbols.
+    #[test]
+    fn fold_reconstructs_step_by_countdown_next() {
+        let cfg = SbcCfg::correct();
+        let folded = fold_emitted_step_by_next(&sbc_emit(&cfg)).expect("in slice");
+        let spec = step_by_countdown_next_spec(
+            &ld_value_name(SBC_SELF, cfg.sm_off),
+            &ld_value_name(SBC_SELF, cfg.src_off),
+            &ld_value_name(SBC_SELF, cfg.src_off + 8),
+            SBC_SOME as u64,
+            SBC_NONE as u64,
+            1,
+        );
+        assert_eq!(
+            folded.store_value(SBC_SELF, cfg.src_off).unwrap(),
+            spec.new_start
+        );
+        assert_eq!(
+            folded.store_value(SBC_SELF, cfg.src_off + 8).unwrap(),
+            spec.new_end
+        );
+        assert_eq!(folded.store_value(SBC_DEST, SBC_TAG_OFF).unwrap(), spec.tag);
+        assert_eq!(
+            folded.store_value(SBC_DEST, SBC_PAYLOAD_OFF).unwrap(),
+            spec.payload
+        );
+    }
+
+    /// POSITIVE: the correct emission, at the canonical layout, with the
+    /// Range first, and with a word-sized tag, agrees with core's `spec_next`
+    /// on every grid pre-state and is NOT refuted (REFINED when a solver is
+    /// present).
+    #[test]
+    fn correct_step_by_countdown_next_is_not_refuted() {
+        let layouts = [
+            SbcCfg::correct(),
+            SbcCfg {
+                sm_off: 16,
+                ft_off: 24,
+                src_off: 0,
+                ..SbcCfg::correct()
+            },
+            SbcCfg {
+                tag_ty: TrustIrTy::I64,
+                ..SbcCfg::correct()
+            },
+        ];
+        for (index, cfg) in layouts.iter().enumerate() {
+            let obligations = sbc_obligations("sbc_correct", cfg).expect("in shape");
+            for state in sbc_grid() {
+                let wrong = sbc_disagreements(&obligations, cfg, state);
+                assert!(
+                    wrong.is_empty(),
+                    "layout {index}: the correct emission disagrees at {state:?}: {wrong:?}"
+                );
+            }
+            let outcome = sbc_discharge(&format!("sbc_correct_{index}"), cfg);
+            assert!(
+                !matches!(outcome, RefinementOutcome::Refuted { .. }),
+                "layout {index}: a correct countdown StepBy::next must not be refuted, got {outcome:?}"
+            );
+            if trust_cg_verify::ay_bridge::z3_available() {
+                if alethe_crosscheck_gap(&outcome) {
+                    eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
+                    continue;
+                }
+                assert!(
+                    matches!(outcome, RefinementOutcome::Refined),
+                    "layout {index}: got {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// MUTANT (off-by-one countdown): the yield predicate is `end >u 1`, so
+    /// the last item is never yielded -> REFUTED on the tag at `end == 1`.
+    #[test]
+    fn countdown_stops_early_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            cond_stops_early: true,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_stops_early", &cfg, "option_tag");
+    }
+
+    /// MUTANT (off-by-one countdown): the count decrements by 2, so every
+    /// other item is lost -> REFUTED on the `end` write-back.
+    #[test]
+    fn countdown_decrement_by_two_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            end_decrement: 2,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_dec_two", &cfg, "state_new_end");
+    }
+
+    /// MUTANT (wrong reset of the stride): `start` advances by
+    /// `step_minus_one` instead of `step_minus_one + 1` -> REFUTED.
+    #[test]
+    fn step_minus_one_stride_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            step_adds_one: false,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_stride_k_minus_one", &cfg, "state_new_start");
+    }
+
+    /// MUTANT: the `start` `Select` arms are swapped (an exhausted iterator
+    /// keeps advancing, a live one never does) -> REFUTED.
+    #[test]
+    fn advance_when_done_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            advance_on_yield: false,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_advance_done", &cfg, "state_new_start");
+    }
+
+    /// MUTANT (wrong `end` write-back): `end - 1` is stored even on the
+    /// exhausted edge, so the count wraps to `u64::MAX` and the iterator
+    /// restarts -> REFUTED.
+    #[test]
+    fn unconditional_end_decrement_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            end_select: false,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_end_wraps", &cfg, "state_new_end");
+    }
+
+    /// MUTANT (wrong `end` write-back): the two write-backs trade cells ->
+    /// REFUTED on both.
+    #[test]
+    fn swapped_writebacks_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            swap_writebacks: true,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_swapped_writebacks", &cfg, "state_new_end");
+    }
+
+    /// MUTANT: tag arms swapped (`None` on a yield, `Some` when exhausted)
+    /// -> REFUTED.
+    #[test]
+    fn swapped_tag_arms_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            tag_some_on_yield: false,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_tag_swap", &cfg, "option_tag");
+    }
+
+    /// MUTANT: the payload is the stepped `start + step` -> REFUTED.
+    #[test]
+    fn payload_after_step_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            payload_after_step: true,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_payload_after_step", &cfg, "option_payload");
+    }
+
+    /// MUTANT (`first_take` consulted): the payload is the default
+    /// `spec_next`'s `start + (first_take ? 0 : step_minus_one)`. core's
+    /// countdown `spec_next` never reads `first_take`, so the folded payload
+    /// names the `first_take` symbol the spec lacks -> REFUTED.
+    #[test]
+    fn first_take_consulted_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            payload_consults_first_take: true,
+            ..SbcCfg::correct()
+        };
+        assert_sbc_refuted("sbc_first_take_read", &cfg, "option_payload");
+    }
+
+    /// SHAPE (`first_take` written): a `first_take = false` store after a
+    /// yield, as the default `spec_next` does. core's countdown `spec_next`
+    /// never writes `first_take`, so the fifth store fails the exact store
+    /// set -> obligations `None` (skip, sound).
+    #[test]
+    fn first_take_store_step_by_countdown_next_is_out_of_shape() {
+        let cfg = SbcCfg {
+            store_first_take: true,
+            ..SbcCfg::correct()
+        };
+        assert!(
+            sbc_obligations("sbc_ft_store", &cfg).is_none(),
+            "a first_take store must fail the exact-store-set shape check"
+        );
+    }
+
+    /// SHAPE: the `end` write-back is dropped (the count never moves) ->
+    /// obligations `None`.
+    #[test]
+    fn missing_end_store_step_by_countdown_next_is_out_of_shape() {
+        let cfg = SbcCfg {
+            emit_end_store: false,
+            ..SbcCfg::correct()
+        };
+        assert!(
+            sbc_obligations("sbc_no_end", &cfg).is_none(),
+            "a dropped end write-back must fail the exact-store-set shape check"
+        );
+    }
+
+    /// SHAPE: the `end` write-back is a 4-byte store (truncating the count)
+    /// -> obligations `None`.
+    #[test]
+    fn narrow_end_store_step_by_countdown_next_is_out_of_shape() {
+        let cfg = SbcCfg {
+            end_store_ty: TrustIrTy::U32,
+            ..SbcCfg::correct()
+        };
+        assert!(
+            sbc_obligations("sbc_narrow_end", &cfg).is_none(),
+            "a 4-byte end write-back must fail the width-exact shape check"
+        );
+    }
+
+    /// SHAPE: the `end` write-back lands in the `step_minus_one` cell ->
+    /// obligations `None`.
+    #[test]
+    fn end_store_to_step_minus_one_step_by_countdown_next_is_out_of_shape() {
+        let cfg = SbcCfg {
+            end_store_to_sm: true,
+            ..SbcCfg::correct()
+        };
+        assert!(
+            sbc_obligations("sbc_end_to_sm", &cfg).is_none(),
+            "an end write-back into step_minus_one must fail the exact-store-set shape check"
+        );
+    }
+
+    /// LOAD-AFTER-STORE: the payload reloads `start` after its write-back
+    /// (the stepped value would be yielded); the fold must bail, never bind
+    /// the reload to the pre-state symbol.
+    #[test]
+    fn reload_after_writeback_payload_step_by_countdown_next_is_out_of_slice() {
+        let cfg = SbcCfg {
+            payload_reloads_start: true,
+            ..SbcCfg::correct()
+        };
+        assert!(
+            fold_emitted_step_by_next(&sbc_emit(&cfg)).is_none(),
+            "a payload reloading the written-back start cell must be out of slice"
+        );
+    }
+
+    // Lane 12c: rewrites of the fixture emission. Each test changes
+    // `sbc_emit`'s correct output in one place. The obligations compare
+    // VALUES, so a rewrite that computes the same four cells must still be
+    // accepted, and one that computes a different cell must be refuted.
+
+    /// The position of the `n`-th (0-based) node of `nodes` whose instruction
+    /// satisfies `pred`.
+    fn sbc_find(nodes: &[InstrNode], n: usize, pred: impl Fn(&Inst) -> bool) -> usize {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, nd)| pred(&nd.inst))
+            .nth(n)
+            .map(|(index, _)| index)
+            .expect("the node is in the fixture emission")
+    }
+
+    /// The single result of `nodes[index]`.
+    fn sbc_result(nodes: &[InstrNode], index: usize) -> ValueId {
+        let [result] = nodes[index].results.as_slice() else {
+            panic!("node {index} has one result");
+        };
+        *result
+    }
+
+    /// The position of the `n`-th `Store` of `nodes` (0 = the `start`
+    /// write-back, 1 = the `end` write-back, 2 = the tag, 3 = the payload).
+    fn sbc_store(nodes: &[InstrNode], n: usize) -> usize {
+        sbc_find(nodes, n, |inst| matches!(inst, Inst::Store { .. }))
+    }
+
+    /// The pre-state `start` (n = 0) or `end` (n = 1) `Load` result.
+    fn sbc_range_load(nodes: &[InstrNode], n: usize) -> ValueId {
+        let index = sbc_find(nodes, n, |inst| {
+            matches!(
+                inst,
+                Inst::Load {
+                    ty: TrustIrTy::U64,
+                    ..
+                }
+            )
+        });
+        sbc_result(nodes, index)
+    }
+
+    /// The `start + step` `Add`, the one `Add` at the element type (`sm + 1`
+    /// and the address chains add at `I64`).
+    fn sbc_stepped_add(nodes: &[InstrNode]) -> usize {
+        sbc_find(nodes, 0, |inst| {
+            matches!(
+                inst,
+                Inst::BinOp {
+                    op: TrustIrBinOp::Add,
+                    ty: TrustIrTy::U64,
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Replace the value a `Store` writes.
+    fn sbc_set_store_value(nodes: &mut [InstrNode], index: usize, new_value: ValueId) {
+        let Inst::Store { value, .. } = &mut nodes[index].inst else {
+            panic!("node {index} is a Store");
+        };
+        *value = new_value;
+    }
+
+    /// The obligations for an edited emission (`cfg` gives the layout).
+    fn sbc_obligations_of(
+        name: &str,
+        nodes: &[InstrNode],
+        cfg: &SbcCfg,
+    ) -> Option<Vec<ProofObligation>> {
+        let folded = fold_emitted_step_by_next(nodes)?;
+        step_by_countdown_next_obligations(
+            name,
+            &folded,
+            SBC_SELF,
+            SBC_DEST,
+            cfg.sm_off,
+            cfg.src_off,
+            SBC_TAG_OFF,
+            scalar_byte_width(&cfg.tag_ty).expect("scalar tag"),
+            SBC_PAYLOAD_OFF,
+            SBC_SOME as u64,
+            SBC_NONE as u64,
+            WORD_MODEL_POINTER_BYTES,
+        )
+    }
+
+    fn sbc_outcome_of(name: &str, obligations: &[ProofObligation]) -> RefinementOutcome {
+        use trust_cg_verify::mir_semantics::discharge_each;
+        crate::solver_test_support::test_outcome(
+            name,
+            &discharge_each(obligations, &AYConfig::default()),
+        )
+    }
+
+    /// An edited emission that must be REFUTED: on a concrete grid
+    /// pre-state through `cell`, and by the solver.
+    fn assert_sbc_edit_refuted(name: &str, nodes: &[InstrNode], cfg: &SbcCfg, cell: &str) {
+        let obligations = sbc_obligations_of(name, nodes, cfg).expect("the edit stays in shape");
+        let witness = sbc_grid().into_iter().find_map(|state| {
+            let wrong = sbc_disagreements(&obligations, cfg, state);
+            wrong
+                .iter()
+                .any(|ob| ob.ends_with(cell))
+                .then_some((state, wrong))
+        });
+        assert!(
+            witness.is_some(),
+            "{name}: no grid pre-state makes {cell} disagree"
+        );
+        let outcome = sbc_outcome_of(name, &obligations);
+        assert!(
+            matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "{name}: the edit must be REFUTED, got {outcome:?}"
+        );
+    }
+
+    /// An edited emission that computes the same four cells: it agrees with
+    /// core's `spec_next` on the grid and is REFINED when a solver is present.
+    fn assert_sbc_edit_accepted(name: &str, nodes: &[InstrNode], cfg: &SbcCfg) {
+        let obligations = sbc_obligations_of(name, nodes, cfg).expect("the edit stays in shape");
+        for state in sbc_grid() {
+            let wrong = sbc_disagreements(&obligations, cfg, state);
+            assert!(
+                wrong.is_empty(),
+                "{name}: an equivalent emission disagrees at {state:?}: {wrong:?}"
+            );
+        }
+        let outcome = sbc_outcome_of(name, &obligations);
+        assert!(
+            !matches!(outcome, RefinementOutcome::Refuted { .. }),
+            "{name}: an equivalent emission must not be refuted, got {outcome:?}"
+        );
+        if trust_cg_verify::ay_bridge::z3_available() {
+            if alethe_crosscheck_gap(&outcome) {
+                eprintln!("{ALETHE_GAP_SKIP_NOTICE}");
+                return;
+            }
+            assert!(
+                matches!(outcome, RefinementOutcome::Refined),
+                "{name}: got {outcome:?}"
+            );
+        }
+    }
+
+    /// MUTANT: the payload is the pre-state `end` (the items-left count), not
+    /// `start` -> REFUTED.
+    #[test]
+    fn payload_is_count_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let end = sbc_range_load(&nodes, 1);
+        let payload_store = sbc_store(&nodes, 3);
+        sbc_set_store_value(&mut nodes, payload_store, end);
+        assert_sbc_edit_refuted("sbc_payload_is_count", &nodes, &cfg, "option_payload");
+    }
+
+    /// MUTANT: the yield predicate is `start <u end`, reading `end` as the
+    /// exclusive bound of a plain `Range` instead of `SpecRangeSetup`'s count
+    /// -> REFUTED.
+    #[test]
+    fn range_bound_predicate_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let start = sbc_range_load(&nodes, 0);
+        let end = sbc_range_load(&nodes, 1);
+        let cmp = sbc_find(&nodes, 0, |inst| matches!(inst, Inst::ICmp { .. }));
+        let Inst::ICmp { op, lhs, rhs, .. } = &mut nodes[cmp].inst else {
+            unreachable!()
+        };
+        *op = ICmpOp::Ult;
+        *lhs = start;
+        *rhs = end;
+        assert_sbc_edit_refuted("sbc_range_bound", &nodes, &cfg, "option_tag");
+    }
+
+    /// MUTANT: the step is truncated to 32 bits before `start` advances (the
+    /// narrow-`T` arithmetic applied to a 64-bit range) -> REFUTED.
+    #[test]
+    fn step_truncated_to_32_bits_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let add = sbc_stepped_add(&nodes);
+        let Inst::BinOp { rhs: step, .. } = nodes[add].inst.clone() else {
+            unreachable!()
+        };
+        let (narrow, wide) = (ValueId::new(900), ValueId::new(901));
+        nodes.insert(
+            add,
+            node(
+                Inst::Cast {
+                    op: CastOp::ZExt,
+                    src_ty: TrustIrTy::U32,
+                    dst_ty: TrustIrTy::U64,
+                    operand: narrow,
+                },
+                wide,
+            ),
+        );
+        nodes.insert(
+            add,
+            node(
+                Inst::Cast {
+                    op: CastOp::Trunc,
+                    src_ty: TrustIrTy::I64,
+                    dst_ty: TrustIrTy::U32,
+                    operand: step,
+                },
+                narrow,
+            ),
+        );
+        let Inst::BinOp { rhs, .. } = &mut nodes[add + 2].inst else {
+            unreachable!()
+        };
+        *rhs = wide;
+        assert_sbc_edit_refuted("sbc_step_trunc32", &nodes, &cfg, "state_new_start");
+    }
+
+    /// MUTANT: the `T::MAX` step clamp of a `u32` range applied to a 64-bit
+    /// range (`step = min(sm + 1, u32::MAX)`) -> REFUTED.
+    #[test]
+    fn u32_step_clamp_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let add = sbc_stepped_add(&nodes);
+        let Inst::BinOp { rhs: step, .. } = nodes[add].inst.clone() else {
+            unreachable!()
+        };
+        let (max, over, clamped) = (ValueId::new(910), ValueId::new(911), ValueId::new(912));
+        let clamp = vec![
+            node(
+                Inst::Const {
+                    ty: TrustIrTy::I64,
+                    value: Constant::Int(i128::from(u32::MAX)),
+                },
+                max,
+            ),
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Ugt,
+                ty: TrustIrTy::I64,
+                lhs: step,
+                rhs: max,
+            })
+            .with_result(over),
+            InstrNode::new(Inst::Select {
+                ty: TrustIrTy::I64,
+                cond: over,
+                then_val: max,
+                else_val: step,
+            })
+            .with_result(clamped),
+        ];
+        let inserted = clamp.len();
+        for (offset, clamp_node) in clamp.into_iter().enumerate() {
+            nodes.insert(add + offset, clamp_node);
+        }
+        let Inst::BinOp { rhs, .. } = &mut nodes[add + inserted].inst else {
+            unreachable!()
+        };
+        *rhs = clamped;
+        assert_sbc_edit_refuted("sbc_u32_clamp", &nodes, &cfg, "state_new_start");
+    }
+
+    /// MUTANT: with a word-sized tag the tag and payload stores trade cells;
+    /// both are 8 bytes, so the store set is in shape and the VALUES must
+    /// refute it.
+    #[test]
+    fn swapped_option_cells_step_by_countdown_next_is_refuted() {
+        let cfg = SbcCfg {
+            tag_ty: TrustIrTy::I64,
+            ..SbcCfg::correct()
+        };
+        let mut nodes = sbc_emit(&cfg);
+        // The tag store precedes the payload address chain. Move it next to
+        // the payload store so both pointers are defined, then trade them.
+        let tag_store_node = nodes.remove(sbc_store(&nodes, 2));
+        let payload_store = sbc_store(&nodes, 2);
+        nodes.insert(payload_store, tag_store_node);
+        let (tag_store, payload_store) = (payload_store, payload_store + 1);
+        let Inst::Store { ptr: tag_ptr, .. } = nodes[tag_store].inst.clone() else {
+            unreachable!()
+        };
+        let Inst::Store {
+            ptr: payload_ptr, ..
+        } = nodes[payload_store].inst.clone()
+        else {
+            unreachable!()
+        };
+        let Inst::Store { ptr, .. } = &mut nodes[tag_store].inst else {
+            unreachable!()
+        };
+        *ptr = payload_ptr;
+        let Inst::Store { ptr, .. } = &mut nodes[payload_store].inst else {
+            unreachable!()
+        };
+        *ptr = tag_ptr;
+        assert_sbc_edit_refuted("sbc_swapped_option_cells", &nodes, &cfg, "option_tag");
+    }
+
+    /// ACCEPTED: the yield predicate `end >u 0` is `end != 0` for an unsigned
+    /// count.
+    #[test]
+    fn unsigned_greater_than_zero_step_by_countdown_next_is_accepted() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let cmp = sbc_find(&nodes, 0, |inst| matches!(inst, Inst::ICmp { .. }));
+        let Inst::ICmp { op, .. } = &mut nodes[cmp].inst else {
+            unreachable!()
+        };
+        *op = ICmpOp::Ugt;
+        assert_sbc_edit_accepted("sbc_ugt_zero", &nodes, &cfg);
+    }
+
+    /// ACCEPTED: the `Option` is written before the `start`/`end` write-backs
+    /// (the four cells are disjoint and every load precedes every store).
+    #[test]
+    fn option_before_writebacks_step_by_countdown_next_is_accepted() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let end_store = nodes.remove(sbc_store(&nodes, 1));
+        let start_store = nodes.remove(sbc_store(&nodes, 0));
+        nodes.push(end_store);
+        nodes.push(start_store);
+        assert_sbc_edit_accepted("sbc_option_first", &nodes, &cfg);
+    }
+
+    /// SHAPE: the `end` write-back lands on the `start` cell, so `start` is
+    /// stored twice and `end` never. There are still four stores, and the
+    /// exact store set (one store per cell) refuses to state the obligation
+    /// over the last write alone.
+    #[test]
+    fn duplicate_start_store_step_by_countdown_next_is_out_of_shape() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let Inst::Store { ptr: start_ptr, .. } = nodes[sbc_store(&nodes, 0)].inst.clone() else {
+            unreachable!()
+        };
+        let end_store = sbc_store(&nodes, 1);
+        let Inst::Store { ptr, .. } = &mut nodes[end_store].inst else {
+            unreachable!()
+        };
+        *ptr = start_ptr;
+        assert!(
+            sbc_obligations_of("sbc_dup_start", &nodes, &cfg).is_none(),
+            "a doubly-stored start cell must fail the exact-store-set shape check"
+        );
+    }
+
+    /// SHAPE: the tag is stored as 8 bytes where the layout tag is 1 byte (the
+    /// store also writes the 7 padding bytes after it) -> obligations `None`.
+    #[test]
+    fn wide_tag_store_step_by_countdown_next_is_out_of_shape() {
+        let cfg = SbcCfg::correct();
+        let mut nodes = sbc_emit(&cfg);
+        let tag_store = sbc_store(&nodes, 2);
+        let Inst::Store { ty, .. } = &mut nodes[tag_store].inst else {
+            unreachable!()
+        };
+        *ty = TrustIrTy::I64;
+        assert!(
+            sbc_obligations_of("sbc_wide_tag", &nodes, &cfg).is_none(),
+            "an 8-byte store into a 1-byte tag must fail the width-exact shape check"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // TV lane 14 — slice-to-Vec `{ptr, cap, len}` header fold
     // -----------------------------------------------------------------------
@@ -11637,8 +13980,84 @@ mod tests {
     const VEC_LEN: u32 = 2;
 
     /// The EXACT 11-node header window `lower_slice_to_vec` emits.
-    fn tv_header(elem_size: i128, elem_align: i128) -> Vec<InstrNode> {
+    /// Index of node `k` (0..SLICE_TO_VEC_FIELD_STORE_NODES) of header field
+    /// write `i` (0 = ptr, 1 = cap, 2 = len) in [`tv_header`].
+    fn tv_field_node(i: usize, k: usize) -> usize {
+        8 + i * SLICE_TO_VEC_FIELD_STORE_NODES + k
+    }
+
+    /// The legacy spelling of `emit_vec_field_store(slot, field, value)`:
+    /// `slot_byte_ptr(slot, 8*field)` — `Const`, `Copy` to `Ptr`, `PtrToInt`,
+    /// `Copy` to `I64`, `Add`, `IntToPtr` — then a typed `Store` (`Ptr` for the
+    /// ptr field, `I64` else). The bridge now emits no `Copy` to `I64` here
+    /// ([`SLICE_TO_VEC_FIELD_STORE_NODES`]).
+    fn tv_field_store(first_id: u32, field: u32, value: ValueId) -> Vec<InstrNode> {
+        let id = |k: u32| ValueId::new(first_id + k);
         vec![
+            node(
+                Inst::Const {
+                    ty: TrustIrTy::I64,
+                    value: Constant::Int(8 * i128::from(field)),
+                },
+                id(0),
+            ),
+            node(
+                Inst::Copy {
+                    ty: TrustIrTy::Ptr,
+                    operand: TV_SLOT,
+                },
+                id(1),
+            ),
+            node(
+                Inst::Cast {
+                    op: CastOp::PtrToInt,
+                    src_ty: TrustIrTy::Ptr,
+                    dst_ty: TrustIrTy::I64,
+                    operand: id(1),
+                },
+                id(2),
+            ),
+            node(
+                Inst::Copy {
+                    ty: TrustIrTy::I64,
+                    operand: id(0),
+                },
+                id(3),
+            ),
+            node(
+                Inst::BinOp {
+                    op: TrustIrBinOp::Add,
+                    ty: TrustIrTy::I64,
+                    lhs: id(2),
+                    rhs: id(3),
+                },
+                id(4),
+            ),
+            node(
+                Inst::Cast {
+                    op: CastOp::IntToPtr,
+                    src_ty: TrustIrTy::I64,
+                    dst_ty: TrustIrTy::Ptr,
+                    operand: id(4),
+                },
+                id(5),
+            ),
+            InstrNode::new(Inst::Store {
+                ty: if field == VEC_PTR {
+                    TrustIrTy::Ptr
+                } else {
+                    TrustIrTy::I64
+                },
+                ptr: id(5),
+                value,
+                volatile: false,
+                align: None,
+            }),
+        ]
+    }
+
+    fn tv_header(elem_size: i128, elem_align: i128) -> Vec<InstrNode> {
+        let mut nodes = vec![
             node(
                 Inst::Alloca {
                     ty: TrustIrTy::I64,
@@ -11702,40 +14121,18 @@ mod tests {
                 },
                 TV_DATA,
             ),
-            node(
-                Inst::InsertField {
-                    ty: TrustIrTy::I64,
-                    aggregate: TV_SLOT,
-                    field: VEC_PTR,
-                    value: TV_DATA,
-                },
-                ValueId::new(210),
-            ),
-            node(
-                Inst::InsertField {
-                    ty: TrustIrTy::I64,
-                    aggregate: TV_SLOT,
-                    field: VEC_CAP,
-                    value: TV_CAP,
-                },
-                ValueId::new(211),
-            ),
-            node(
-                Inst::InsertField {
-                    ty: TrustIrTy::I64,
-                    aggregate: TV_SLOT,
-                    field: VEC_LEN,
-                    value: TV_N,
-                },
-                ValueId::new(212),
-            ),
-        ]
+        ];
+        nodes.extend(tv_field_store(210, VEC_PTR, TV_DATA));
+        nodes.extend(tv_field_store(220, VEC_CAP, TV_CAP));
+        nodes.extend(tv_field_store(230, VEC_LEN, TV_N));
+        assert_eq!(nodes.len(), SLICE_TO_VEC_HEADER_NODES);
+        nodes
     }
 
     #[test]
-    fn tv14_folds_the_real_header_window() {
+    fn tv14_folds_the_legacy_header_window() {
         let folded = fold_emitted_slice_to_vec_header(&tv_header(4, 4))
-            .expect("the real 11-node header window must fold");
+            .expect("the legacy straight-line header fixture must fold");
         assert_eq!(folded.alloc_result, TV_DATA);
         // The ptr field must record the ALLOCATION's result, not some other
         // pointer — this is the "header stored to a stale base" mutant's target.
@@ -11749,7 +14146,7 @@ mod tests {
     /// to_vec". Dropping any node must be refused by the length pin.
     #[test]
     fn tv14_shape_drift_is_refused_not_silently_skipped() {
-        for drop_idx in [0usize, 3, 7, 10] {
+        for drop_idx in [0usize, 3, 7, tv_field_node(1, 0), tv_field_node(2, 6)] {
             let mut nodes = tv_header(4, 4);
             nodes.remove(drop_idx);
             assert!(
@@ -11765,10 +14162,11 @@ mod tests {
     #[test]
     fn tv14_store_to_stale_base_is_refused() {
         let mut nodes = tv_header(4, 4);
-        if let Inst::InsertField { aggregate, .. } = &mut nodes[9].inst {
-            *aggregate = TV_OTHER;
+        // The cap field's address is computed off a FOREIGN base.
+        if let Inst::Copy { operand, .. } = &mut nodes[tv_field_node(1, 1)].inst {
+            *operand = TV_OTHER;
         } else {
-            panic!("node 9 must be the cap InsertField");
+            panic!("the cap field's base Copy is out of place");
         }
         assert!(
             fold_emitted_slice_to_vec_header(&nodes).is_none(),
@@ -11781,10 +14179,11 @@ mod tests {
     #[test]
     fn tv14_duplicate_field_store_is_refused() {
         let mut nodes = tv_header(4, 4);
-        if let Inst::InsertField { field, .. } = &mut nodes[10].inst {
-            *field = VEC_CAP; // len store overwrites cap; len never written
+        // The len store's offset is cap's: len overwrites cap, len never written.
+        if let Inst::Const { value, .. } = &mut nodes[tv_field_node(2, 0)].inst {
+            *value = Constant::Int(8 * i128::from(VEC_CAP));
         } else {
-            panic!("node 10 must be the len InsertField");
+            panic!("the len field's offset Const is out of place");
         }
         assert!(
             fold_emitted_slice_to_vec_header(&nodes).is_none(),
@@ -11811,5 +14210,993 @@ mod tests {
             format!("{:?}", c.alloc_align),
             "a different emitted alignment must fold to a different align value"
         );
+    }
+
+    // --- The pointer-word lanes in a 32-bit session ---------------------------
+    //
+    // The same correct emissions the lanes refine at 8 bytes state NO
+    // obligation when the session's pointers are 4 bytes wide: the 8-byte
+    // cells and 64-bit address arithmetic of the word model describe a
+    // different machine there, so nothing may be credited.
+
+    const WASM32_POINTER_BYTES: u64 = 4;
+
+    #[test]
+    fn the_word_model_describes_only_an_eight_byte_pointer_session() {
+        assert!(word_model_describes(8));
+        assert!(!word_model_describes(WASM32_POINTER_BYTES));
+        assert!(!word_model_describes(2));
+        assert!(!word_model_describes(16));
+    }
+
+    #[test]
+    fn slice_iterator_and_step_by_lanes_state_nothing_in_a_32_bit_session() {
+        let si = SiCfg::correct(8);
+        assert!(si_obligations_w("si64", &si, WORD_MODEL_POINTER_BYTES).is_some());
+        assert!(si_obligations_w("si32", &si, WASM32_POINTER_BYTES).is_none());
+
+        let sb = SbCfg::correct();
+        assert!(sb_obligations_w("sb64", &sb, WORD_MODEL_POINTER_BYTES).is_some());
+        assert!(sb_obligations_w("sb32", &sb, WASM32_POINTER_BYTES).is_none());
+
+        let sbp = SbpCfg::correct();
+        assert!(sbp_obligations_w("sbp64", &sbp, WORD_MODEL_POINTER_BYTES).is_some());
+        assert!(sbp_obligations_w("sbp32", &sbp, WASM32_POINTER_BYTES).is_none());
+
+        let sbs = SbsCfg::correct();
+        assert!(sbs_obligations_w("sbs64", &sbs, WORD_MODEL_POINTER_BYTES).is_some());
+        assert!(sbs_obligations_w("sbs32", &sbs, WASM32_POINTER_BYTES).is_none());
+
+        let sbc = SbcCfg::correct();
+        assert!(sbc_obligations_w("sbc64", &sbc, WORD_MODEL_POINTER_BYTES).is_some());
+        assert!(sbc_obligations_w("sbc32", &sbc, WASM32_POINTER_BYTES).is_none());
+    }
+
+    #[test]
+    fn split_and_subslice_lanes_state_nothing_in_a_32_bit_session() {
+        for kind in [SliceEndKind::First, SliceEndKind::Last] {
+            let se = SeCfg::correct(kind, true, 8);
+            assert!(se_obligations_w("se64", &se, 8, WORD_MODEL_POINTER_BYTES).is_some());
+            assert!(se_obligations_w("se32", &se, 8, WASM32_POINTER_BYTES).is_none());
+        }
+
+        let sa = fold_emitted_split_at(&sa_emit(&SaCfg::correct(Some(4)))).expect("in slice");
+        for (bytes, built) in [
+            (WORD_MODEL_POINTER_BYTES, true),
+            (WASM32_POINTER_BYTES, false),
+        ] {
+            let obligations = split_at_obligations(
+                "sa", &sa, SA_OFF0, SA_OFF1, SA_PTR, SA_LEN, SA_MID, 4, bytes,
+            );
+            assert_eq!(
+                obligations.is_some(),
+                built,
+                "split_at at {bytes}-byte pointers"
+            );
+        }
+
+        let kind = StrideIterCtorKind::ChunksExact;
+        let st = fold_emitted_stride_iter_ctor(&st_emit(&StCfg::correct(kind, Some(4))))
+            .expect("in slice");
+        for (bytes, built) in [
+            (WORD_MODEL_POINTER_BYTES, true),
+            (WASM32_POINTER_BYTES, false),
+        ] {
+            let obligations = stride_iter_ctor_obligations(
+                "st",
+                &st,
+                kind,
+                st_offsets(kind),
+                ST_DATA,
+                ST_LEN,
+                ST_N,
+                4,
+                bytes,
+            );
+            assert_eq!(
+                obligations.is_some(),
+                built,
+                "stride ctor at {bytes}-byte pointers"
+            );
+        }
+
+        let vi = fold_emitted_vec_index(&vi_emit(&ViCfg::correct(Some(8)))).expect("in slice");
+        for (bytes, built) in [
+            (WORD_MODEL_POINTER_BYTES, true),
+            (WASM32_POINTER_BYTES, false),
+        ] {
+            let obligations = vec_index_obligations("vi", &vi, VI_DATA, VI_LEN, VI_IDX, 8, bytes);
+            assert_eq!(
+                obligations.is_some(),
+                built,
+                "vec index at {bytes}-byte pointers"
+            );
+        }
+
+        let vr_cfg = VrCfg::correct(RangeForm::Range, Some(8));
+        let vr = fold_emitted_vec_range_subslice(&vr_emit(&vr_cfg)).expect("in slice");
+        let (_start, _end, a, b) = vr_start_end(vr_cfg.form);
+        for (bytes, built) in [
+            (WORD_MODEL_POINTER_BYTES, true),
+            (WASM32_POINTER_BYTES, false),
+        ] {
+            let obligations = vec_range_subslice_obligations(
+                "vr",
+                &vr,
+                vr_cfg.form,
+                VR_OFF,
+                VR_DATA,
+                VR_LEN,
+                a,
+                b,
+                8,
+                bytes,
+            );
+            assert_eq!(
+                obligations.is_some(),
+                built,
+                "range subslice at {bytes}-byte pointers"
+            );
+        }
+
+        let fl_cfg = FlCfg::correct(SliceEndKind::Last, 8);
+        let fl = fold_emitted_slice_first_last(&fl_emit(&fl_cfg)).expect("in slice");
+        for (bytes, built) in [
+            (WORD_MODEL_POINTER_BYTES, true),
+            (WASM32_POINTER_BYTES, false),
+        ] {
+            let obligations =
+                slice_first_last_obligations("fl", &fl, fl_cfg.kind, FL_DATA, FL_LEN, 8, bytes);
+            assert_eq!(
+                obligations.is_some(),
+                built,
+                "first/last at {bytes}-byte pointers"
+            );
+        }
+    }
+
+    /// `Range::next` is modeled at its element's own width, with the `end` cell
+    /// one element past `start`: a 4-byte element states its obligation over
+    /// 4-byte cells. The lane takes no pointer width, which is why it stays
+    /// dispatched in every session.
+    #[test]
+    fn range_next_states_a_four_byte_element_obligation() {
+        let cfg = RnCfg::correct_w(false, TrustIrTy::U32);
+        assert_eq!(cfg.elem_size(), 4);
+        assert!(rn_obligations("rn_u32", &cfg).is_some());
+    }
+
+    // =======================================================================
+    // STRICT-LANE SHAPE-MISS POLICY. A queued job whose emission is outside its
+    // lane's fold, or whose reconstructed store set the obligation builder
+    // refuses, states no obligation. Every drain sends such a job through
+    // `crate::refinement_job_unmodeled` (the value lanes through
+    // `crate::tv_value_job_obligations`): the strict `p3c-refine` lane refuses
+    // it with `[TCG-REFINE-SHAPE]` and the default lanes skip it. Each lane's
+    // correct fixture emission, queued as a job, states exactly the obligations
+    // its fixture helper builds, so the job carries the lane's layout facts to
+    // the builder's arguments. The edits are the review's mutant classes: an
+    // op the fold does not model, and one extra store into a state cell.
+    // =======================================================================
+
+    const TV_SYMBOL: &str = "tv_strict_probe";
+
+    /// The exact-store-set reasons the iterator lanes give.
+    const TWO_CELL: &str = "reconstructed store set does not match the exact two-cell shape";
+    const THREE_CELL: &str = "reconstructed store set does not match the exact three-cell shape";
+    const FOUR_CELL: &str = "reconstructed store set does not match the exact four-cell shape";
+
+    /// An in-shape job states the fixture helper's obligations in both lanes.
+    fn assert_job_states<J: crate::TvValueJob>(job: &J, expected: Option<Vec<ProofObligation>>) {
+        let expected = expected.expect("the fixture emission states obligations");
+        assert!(!expected.is_empty());
+        for strict in [true, false] {
+            let stated = crate::tv_value_job_obligations(
+                job,
+                strict,
+                false,
+                TV_SYMBOL,
+                WORD_MODEL_POINTER_BYTES,
+            )
+            .unwrap_or_else(|err| panic!("{}: an in-shape job was refused: {err}", J::LANE))
+            .unwrap_or_else(|| panic!("{}: an in-shape job stated nothing", J::LANE));
+            assert_eq!(
+                stated,
+                expected,
+                "{}: the job must state its fixture's obligations",
+                J::LANE
+            );
+        }
+    }
+
+    /// An out-of-shape job: the strict lane refuses it, naming the lane, the
+    /// symbol, the job and `what`; the default lanes skip it, traced or not.
+    fn assert_strict_refuses<J: crate::TvValueJob>(job: &J, what: &str) {
+        let err =
+            crate::tv_value_job_obligations(job, true, false, TV_SYMBOL, WORD_MODEL_POINTER_BYTES)
+                .expect_err("the strict lane must not skip a queued job it cannot state");
+        let names = format!("{TV_SYMBOL}: {} refinement job {}", J::LANE, job.name());
+        for needle in ["[TCG-REFINE-SHAPE]", names.as_str(), what] {
+            assert!(err.contains(needle), "{needle:?} missing from {err}");
+        }
+        for trace in [false, true] {
+            let skipped = crate::tv_value_job_obligations(
+                job,
+                false,
+                trace,
+                TV_SYMBOL,
+                WORD_MODEL_POINTER_BYTES,
+            )
+            .unwrap_or_else(|err| panic!("{}: the default lanes never refuse: {err}", J::LANE));
+            assert!(
+                skipped.is_none(),
+                "{}: the default lanes state nothing for an out-of-shape job",
+                J::LANE
+            );
+        }
+    }
+
+    /// Append an op no value-lane fold models.
+    fn tv_with_unmodeled_op(mut nodes: Vec<InstrNode>) -> Vec<InstrNode> {
+        nodes.push(node(
+            Inst::Alloca {
+                ty: TrustIrTy::I64,
+                count: None,
+                align: None,
+            },
+            ValueId::new(9_999),
+        ));
+        nodes
+    }
+
+    /// The result of the emission's first `Load` (a pre-state value).
+    fn tv_first_load(nodes: &[InstrNode]) -> ValueId {
+        nodes
+            .iter()
+            .find(|nd| matches!(nd.inst, Inst::Load { .. }))
+            .and_then(|nd| nd.results.first().copied())
+            .expect("the emission loads its pre-state")
+    }
+
+    /// Append one more typed `Store` of `value` into `(base, off)`: the review's
+    /// mutant, an extra write into a cell the lowering leaves to its own
+    /// write-back (or does not write at all).
+    fn tv_with_extra_store(
+        mut nodes: Vec<InstrNode>,
+        base: ValueId,
+        off: u64,
+        ty: TrustIrTy,
+        value: ValueId,
+    ) -> Vec<InstrNode> {
+        let mut next = 9_000u32;
+        let ptr = sb_field_addr(&mut nodes, &mut next, base, off);
+        nodes.push(InstrNode::new(Inst::Store {
+            ty,
+            ptr,
+            value,
+            volatile: false,
+            align: None,
+        }));
+        nodes
+    }
+
+    /// Repeat the emission's last field write (`InsertField` or `Store`) with
+    /// `value`: the cell is written twice and holds `value`.
+    fn tv_with_rewritten_last_field(mut nodes: Vec<InstrNode>, value: ValueId) -> Vec<InstrNode> {
+        let index = nodes
+            .iter()
+            .rposition(|nd| matches!(nd.inst, Inst::InsertField { .. } | Inst::Store { .. }))
+            .expect("the emission writes a field");
+        let mut again = nodes[index].clone();
+        match &mut again.inst {
+            Inst::InsertField { value: v, .. } | Inst::Store { value: v, .. } => *v = value,
+            _ => unreachable!(),
+        }
+        if let Some(result) = again.results.first_mut() {
+            *result = ValueId::new(9_100);
+        }
+        nodes.push(again);
+        nodes
+    }
+
+    fn sa_job(name: &str, emitted: Vec<InstrNode>) -> crate::SplitAtRefinementJob {
+        crate::SplitAtRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            ptr: SA_PTR,
+            len: SA_LEN,
+            mid: SA_MID,
+            off0: SA_OFF0,
+            off1: SA_OFF1,
+            elem_size: 4,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_split_at_shape_misses() {
+        let emitted = sa_emit(&SaCfg::correct(Some(4)));
+        let folded = fold_emitted_split_at(&emitted).expect("in slice");
+        assert_job_states(
+            &sa_job("sa", emitted.clone()),
+            split_at_obligations(
+                "sa",
+                &folded,
+                SA_OFF0,
+                SA_OFF1,
+                SA_PTR,
+                SA_LEN,
+                SA_MID,
+                4,
+                WORD_MODEL_POINTER_BYTES,
+            ),
+        );
+        let mut no_bounds = emitted.clone();
+        no_bounds.remove(0);
+        assert_strict_refuses(&sa_job("sa_no_bounds", no_bounds), crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &sa_job("sa_unmodeled", tv_with_unmodeled_op(emitted.clone())),
+            crate::TV_FOLD_MISS,
+        );
+        assert_strict_refuses(
+            &sa_job("sa_rewrite", tv_with_rewritten_last_field(emitted, SA_PTR)),
+            "reconstructed stores do not match the tuple layout",
+        );
+    }
+
+    /// A cell written twice leaves the SECOND value in memory, so an obligation
+    /// over the first write would accept a wrong final value: each of the
+    /// split_at, stride-iter and range-subslice builders requires its exact
+    /// store set, each cell written once.
+    #[test]
+    fn rewritten_cell_is_out_of_shape_in_the_fat_pointer_lanes() {
+        let sa = tv_with_rewritten_last_field(sa_emit(&SaCfg::correct(Some(4))), SA_PTR);
+        let sa = fold_emitted_split_at(&sa).expect("a rewrite stays in the fold");
+        assert!(
+            split_at_obligations(
+                "sa_rewrite",
+                &sa,
+                SA_OFF0,
+                SA_OFF1,
+                SA_PTR,
+                SA_LEN,
+                SA_MID,
+                4,
+                WORD_MODEL_POINTER_BYTES,
+            )
+            .is_none(),
+            "a split_at half written twice must fail the exact store set"
+        );
+
+        let kind = StrideIterCtorKind::Whole;
+        let st = tv_with_rewritten_last_field(st_emit(&StCfg::correct(kind, Some(4))), ST_LEN);
+        let st = fold_emitted_stride_iter_ctor(&st).expect("a rewrite stays in the fold");
+        assert!(
+            stride_iter_ctor_obligations(
+                "st_rewrite",
+                &st,
+                kind,
+                st_offsets(kind),
+                ST_DATA,
+                ST_LEN,
+                ST_N,
+                4,
+                WORD_MODEL_POINTER_BYTES,
+            )
+            .is_none(),
+            "a stride-iterator field written twice must fail the exact store set"
+        );
+
+        let vr_cfg = VrCfg::correct(RangeForm::Range, Some(4));
+        let vr = tv_with_rewritten_last_field(vr_emit(&vr_cfg), VR_LEN);
+        let vr = fold_emitted_vec_range_subslice(&vr).expect("a rewrite stays in the fold");
+        let (_start, _end, a, b) = vr_start_end(vr_cfg.form);
+        assert!(
+            vec_range_subslice_obligations(
+                "vr_rewrite",
+                &vr,
+                vr_cfg.form,
+                VR_OFF,
+                VR_DATA,
+                VR_LEN,
+                a,
+                b,
+                4,
+                WORD_MODEL_POINTER_BYTES,
+            )
+            .is_none(),
+            "a subslice lane written twice must fail the exact store set"
+        );
+    }
+
+    fn st_job(
+        name: &str,
+        kind: StrideIterCtorKind,
+        emitted: Vec<InstrNode>,
+    ) -> crate::StrideIterRefinementJob {
+        crate::StrideIterRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            kind,
+            data: ST_DATA,
+            len: ST_LEN,
+            n: ST_N,
+            offsets: st_offsets(kind),
+            elem_size: 4,
+        }
+    }
+
+    /// Every stride-iterator state shape (std's fields at rustc's offsets, the
+    /// `*_exact` remainder included): the correct emission states its
+    /// obligations in both lanes; a dropped `n != 0` check and an unmodeled op
+    /// are fold misses; a field written twice is out of the exact store set.
+    #[test]
+    fn strict_lane_refuses_stride_iter_shape_misses() {
+        for kind in [
+            StrideIterCtorKind::Whole,
+            StrideIterCtorKind::ChunksExact,
+            StrideIterCtorKind::RChunksExact,
+        ] {
+            let emitted = st_emit(&StCfg::correct(kind, Some(4)));
+            let folded = fold_emitted_stride_iter_ctor(&emitted).expect("in slice");
+            assert_job_states(
+                &st_job("st", kind, emitted.clone()),
+                stride_iter_ctor_obligations(
+                    "st",
+                    &folded,
+                    kind,
+                    st_offsets(kind),
+                    ST_DATA,
+                    ST_LEN,
+                    ST_N,
+                    4,
+                    WORD_MODEL_POINTER_BYTES,
+                ),
+            );
+            let no_check = st_emit(&StCfg {
+                emit_check: false,
+                ..StCfg::correct(kind, Some(4))
+            });
+            assert_strict_refuses(&st_job("st_no_check", kind, no_check), crate::TV_FOLD_MISS);
+            assert_strict_refuses(
+                &st_job("st_unmodeled", kind, tv_with_unmodeled_op(emitted.clone())),
+                crate::TV_FOLD_MISS,
+            );
+            assert_strict_refuses(
+                &st_job(
+                    "st_rewrite",
+                    kind,
+                    tv_with_rewritten_last_field(emitted, ST_LEN),
+                ),
+                "reconstructed stores are not exactly std's fields",
+            );
+        }
+    }
+
+    fn vi_job(name: &str, emitted: Vec<InstrNode>) -> crate::VecIndexRefinementJob {
+        crate::VecIndexRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            data: VI_DATA,
+            len: VI_LEN,
+            index: VI_IDX,
+            elem_size: 4,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_vec_index_shape_misses() {
+        let emitted = vi_emit(&ViCfg::correct(Some(4)));
+        let folded = fold_emitted_vec_index(&emitted).expect("in slice");
+        assert_job_states(
+            &vi_job("vi", emitted.clone()),
+            vec_index_obligations(
+                "vi",
+                &folded,
+                VI_DATA,
+                VI_LEN,
+                VI_IDX,
+                4,
+                WORD_MODEL_POINTER_BYTES,
+            ),
+        );
+        let no_check = vi_emit(&ViCfg {
+            emit_check: false,
+            ..ViCfg::correct(Some(4))
+        });
+        assert_strict_refuses(&vi_job("vi_no_check", no_check), crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &vi_job("vi_unmodeled", tv_with_unmodeled_op(emitted)),
+            crate::TV_FOLD_MISS,
+        );
+    }
+
+    fn vr_job(name: &str, emitted: Vec<InstrNode>) -> crate::VecRangeSubsliceRefinementJob {
+        let (_start, _end, a, b) = vr_start_end(RangeForm::Range);
+        crate::VecRangeSubsliceRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            form: RangeForm::Range,
+            data: VR_DATA,
+            len: VR_LEN,
+            a,
+            b,
+            elem_size: 4,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_vec_range_subslice_shape_misses() {
+        let cfg = VrCfg::correct(RangeForm::Range, Some(4));
+        let emitted = vr_emit(&cfg);
+        let folded = fold_emitted_vec_range_subslice(&emitted).expect("in slice");
+        let (_start, _end, a, b) = vr_start_end(cfg.form);
+        assert_job_states(
+            &vr_job("vr", emitted.clone()),
+            vec_range_subslice_obligations(
+                "vr",
+                &folded,
+                cfg.form,
+                VR_OFF,
+                VR_DATA,
+                VR_LEN,
+                a,
+                b,
+                4,
+                WORD_MODEL_POINTER_BYTES,
+            ),
+        );
+        let dropped = vr_emit(&VrCfg {
+            bounds: VrBounds::Dropped,
+            ..VrCfg::correct(RangeForm::Range, Some(4))
+        });
+        assert_strict_refuses(&vr_job("vr_dropped", dropped), crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &vr_job("vr_unmodeled", tv_with_unmodeled_op(emitted.clone())),
+            crate::TV_FOLD_MISS,
+        );
+        assert_strict_refuses(
+            &vr_job("vr_rewrite", tv_with_rewritten_last_field(emitted, VR_LEN)),
+            "reconstructed shape does not match the fat-ptr layout",
+        );
+    }
+
+    fn fl_job(name: &str, emitted: Vec<InstrNode>) -> crate::SliceFirstLastRefinementJob {
+        crate::SliceFirstLastRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            kind: SliceEndKind::Last,
+            data: FL_DATA,
+            len: FL_LEN,
+            elem_size: 8,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_slice_first_last_shape_misses() {
+        let emitted = fl_emit(&FlCfg::correct(SliceEndKind::Last, 8));
+        let folded = fold_emitted_slice_first_last(&emitted).expect("in slice");
+        assert_job_states(
+            &fl_job("fl", emitted.clone()),
+            slice_first_last_obligations(
+                "fl",
+                &folded,
+                SliceEndKind::Last,
+                FL_DATA,
+                FL_LEN,
+                8,
+                WORD_MODEL_POINTER_BYTES,
+            ),
+        );
+        let mut no_store = emitted.clone();
+        no_store.pop();
+        assert_strict_refuses(&fl_job("fl_no_store", no_store), crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &fl_job("fl_unmodeled", tv_with_unmodeled_op(emitted.clone())),
+            crate::TV_FOLD_MISS,
+        );
+        // A second niche store: the fold models exactly one.
+        assert_strict_refuses(
+            &fl_job("fl_rewrite", tv_with_rewritten_last_field(emitted, FL_DATA)),
+            crate::TV_FOLD_MISS,
+        );
+    }
+
+    fn rn_job(name: &str, cfg: &RnCfg) -> crate::RangeNextRefinementJob {
+        crate::RangeNextRefinementJob {
+            name: name.to_owned(),
+            emitted: rn_emit(cfg),
+            signed: cfg.signed,
+            self_base: RN_SELF,
+            dest_base: RN_DEST,
+            elem_size: cfg.elem_size(),
+            tag_off: RN_TAG_OFF,
+            payload_off: cfg.payload_off,
+            tag_width: scalar_byte_width(&cfg.tag_ty).expect("scalar tag ty"),
+            some_discr: RN_SOME as u64,
+            none_discr: RN_NONE as u64,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_range_next_shape_misses() {
+        let cfg = RnCfg::correct(true);
+        assert_job_states(&rn_job("rn", &cfg), rn_obligations("rn", &cfg));
+        assert_strict_refuses(
+            &rn_job(
+                "rn_reload",
+                &RnCfg {
+                    payload_reloads_state: true,
+                    ..RnCfg::correct(true)
+                },
+            ),
+            crate::TV_FOLD_MISS,
+        );
+        let mut unmodeled = rn_job("rn_unmodeled", &cfg);
+        unmodeled.emitted = tv_with_unmodeled_op(unmodeled.emitted);
+        assert_strict_refuses(&unmodeled, crate::TV_FOLD_MISS);
+        // An extra write into the `end` cell after the step.
+        let mut extra = rn_job("rn_extra_end_store", &cfg);
+        let start = tv_first_load(&extra.emitted);
+        extra.emitted = tv_with_extra_store(extra.emitted, RN_SELF, 8, TrustIrTy::I64, start);
+        assert_strict_refuses(&extra, THREE_CELL);
+        assert_strict_refuses(
+            &rn_job(
+                "rn_wb_end",
+                &RnCfg {
+                    writeback_off: 8,
+                    ..RnCfg::correct(true)
+                },
+            ),
+            THREE_CELL,
+        );
+    }
+
+    fn si_job(name: &str, emitted: Vec<InstrNode>) -> crate::SliceIterNextRefinementJob {
+        crate::SliceIterNextRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            self_base: SI_SELF,
+            dest_base: SI_DEST,
+            elem_size: 8,
+            end_off: SI_END_OFF,
+            tag_off: SI_TAG_OFF,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_slice_iter_next_shape_misses() {
+        let cfg = SiCfg::correct(8);
+        let emitted = si_emit(&cfg);
+        assert_job_states(&si_job("si", emitted.clone()), si_obligations("si", &cfg));
+        let reload = si_emit(&SiCfg {
+            niche_reloads_state: true,
+            ..SiCfg::correct(8)
+        });
+        assert_strict_refuses(&si_job("si_reload", reload), crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &si_job("si_unmodeled", tv_with_unmodeled_op(emitted.clone())),
+            crate::TV_FOLD_MISS,
+        );
+        // An extra write into the `end` cell of the cursor.
+        let ptr = tv_first_load(&emitted);
+        assert_strict_refuses(
+            &si_job(
+                "si_extra_end_store",
+                tv_with_extra_store(emitted, SI_SELF, SI_END_OFF, TrustIrTy::Ptr, ptr),
+            ),
+            TWO_CELL,
+        );
+        let extra = si_emit(&SiCfg {
+            extra_store: true,
+            ..SiCfg::correct(8)
+        });
+        assert_strict_refuses(&si_job("si_extra", extra), TWO_CELL);
+    }
+
+    fn sb_job(name: &str, cfg: &SbCfg, emitted: Vec<InstrNode>) -> crate::StepByNextRefinementJob {
+        crate::StepByNextRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            self_base: SB_SELF,
+            dest_base: SB_DEST,
+            sm_off: cfg.sm_off,
+            ft_off: cfg.ft_off,
+            src_off: cfg.src_off,
+            tag_off: SB_TAG_OFF,
+            payload_off: SB_PAYLOAD_OFF,
+            tag_width: 1,
+            some_discr: SB_SOME as u64,
+            none_discr: SB_NONE as u64,
+        }
+    }
+
+    /// Lane 11, and the review's mutant: one extra `I64` store into the
+    /// `step_minus_one` cell (which the step only reads) is out of the exact
+    /// four-cell shape, so the strict lane must refuse it, not skip it.
+    #[test]
+    fn strict_lane_refuses_step_by_next_shape_misses() {
+        let cfg = SbCfg::correct();
+        let emitted = sb_emit(&cfg);
+        assert_job_states(
+            &sb_job("sb", &cfg, emitted.clone()),
+            sb_obligations("sb", &cfg),
+        );
+        let reload = sb_emit(&SbCfg {
+            payload_reloads_state: true,
+            ..SbCfg::correct()
+        });
+        assert_strict_refuses(&sb_job("sb_reload", &cfg, reload), crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &sb_job("sb_unmodeled", &cfg, tv_with_unmodeled_op(emitted.clone())),
+            crate::TV_FOLD_MISS,
+        );
+        let sm = tv_first_load(&emitted);
+        let sm_store = tv_with_extra_store(emitted, SB_SELF, cfg.sm_off, TrustIrTy::I64, sm);
+        assert_strict_refuses(&sb_job("sb_sm_store", &cfg, sm_store), FOUR_CELL);
+        let extra = sb_emit(&SbCfg {
+            emit_extra_store: true,
+            ..SbCfg::correct()
+        });
+        assert_strict_refuses(&sb_job("sb_extra", &cfg, extra), FOUR_CELL);
+    }
+
+    fn sbc_job(
+        name: &str,
+        cfg: &SbcCfg,
+        emitted: Vec<InstrNode>,
+    ) -> crate::StepByCountdownNextRefinementJob {
+        crate::StepByCountdownNextRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            self_base: SBC_SELF,
+            dest_base: SBC_DEST,
+            sm_off: cfg.sm_off,
+            src_off: cfg.src_off,
+            tag_off: SBC_TAG_OFF,
+            payload_off: SBC_PAYLOAD_OFF,
+            tag_width: scalar_byte_width(&cfg.tag_ty).expect("scalar tag"),
+            some_discr: SBC_SOME as u64,
+            none_discr: SBC_NONE as u64,
+        }
+    }
+
+    /// Lane 12c (core's countdown `spec_next`), and the lane-12c review's
+    /// `sm_store` mutant: one extra `I64` store into the `step_minus_one` cell
+    /// (which the step only reads) is out of the exact four-cell shape, so the
+    /// strict lane must refuse it and the default lanes skip it. A `first_take`
+    /// store (core's countdown never writes that cell) is out of shape too, and
+    /// an unmodeled op is a fold miss.
+    #[test]
+    fn strict_lane_refuses_step_by_countdown_next_shape_misses() {
+        let cfg = SbcCfg::correct();
+        let emitted = sbc_emit(&cfg);
+        assert_job_states(
+            &sbc_job("sbc", &cfg, emitted.clone()),
+            sbc_obligations("sbc", &cfg),
+        );
+        assert_strict_refuses(
+            &sbc_job("sbc_unmodeled", &cfg, tv_with_unmodeled_op(emitted.clone())),
+            crate::TV_FOLD_MISS,
+        );
+        let sm = tv_first_load(&emitted);
+        let sm_store = tv_with_extra_store(emitted, SBC_SELF, cfg.sm_off, TrustIrTy::I64, sm);
+        assert_strict_refuses(&sbc_job("sbc_sm_store", &cfg, sm_store), FOUR_CELL);
+        let ft_store = sbc_emit(&SbcCfg {
+            store_first_take: true,
+            ..SbcCfg::correct()
+        });
+        assert_strict_refuses(&sbc_job("sbc_ft_store", &cfg, ft_store), FOUR_CELL);
+    }
+
+    fn sbs_job(
+        name: &str,
+        cfg: &SbsCfg,
+        emitted: Vec<InstrNode>,
+    ) -> crate::StepByNextSliceRefinementJob {
+        crate::StepByNextSliceRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            self_base: SBS_SELF,
+            dest_base: SBS_DEST,
+            sm_off: cfg.sm_off,
+            ft_off: cfg.ft_off,
+            src_off: cfg.src_off,
+            elem_size: cfg.spec_elem_size,
+            tag_off: SBS_TAG_OFF,
+        }
+    }
+
+    /// Lane 12b: an extra store into the `step_minus_one` cell is out of the
+    /// exact three-cell shape.
+    #[test]
+    fn strict_lane_refuses_step_by_next_slice_shape_misses() {
+        let cfg = SbsCfg::correct();
+        let emitted = sbs_emit(&cfg);
+        assert_job_states(
+            &sbs_job("sbs", &cfg, emitted.clone()),
+            sbs_obligations("sbs", &cfg),
+        );
+        let reload = sbs_emit(&SbsCfg {
+            niche_reloads_ptr: true,
+            ..SbsCfg::correct()
+        });
+        assert_strict_refuses(&sbs_job("sbs_reload", &cfg, reload), crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &sbs_job("sbs_unmodeled", &cfg, tv_with_unmodeled_op(emitted.clone())),
+            crate::TV_FOLD_MISS,
+        );
+        let sm = tv_first_load(&emitted);
+        let sm_store = tv_with_extra_store(emitted, SBS_SELF, cfg.sm_off, TrustIrTy::I64, sm);
+        assert_strict_refuses(&sbs_job("sbs_sm_store", &cfg, sm_store), THREE_CELL);
+        let no_ft = sbs_emit(&SbsCfg {
+            emit_ft_store: false,
+            ..SbsCfg::correct()
+        });
+        assert_strict_refuses(&sbs_job("sbs_no_ft", &cfg, no_ft), THREE_CELL);
+    }
+
+    fn se_job(name: &str, cfg: &SeCfg) -> crate::SplitEndsRefinementJob {
+        crate::SplitEndsRefinementJob {
+            name: name.to_owned(),
+            emitted: se_emit(cfg),
+            kind: cfg.kind,
+            niche_at_f0: cfg.niche_at_f0,
+            dest_base: SE_DEST,
+            f0: SE_F0,
+            f1: SE_F1,
+            tail_len_off: SE_F1 + 8,
+            data: SE_DATA,
+            len: SE_LEN,
+            elem_size: 8,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_split_ends_shape_misses() {
+        let cfg = SeCfg::correct(SliceEndKind::First, true, 8);
+        assert_job_states(&se_job("se", &cfg), se_obligations("se", &cfg, 8));
+        let mut unmodeled = se_job("se_unmodeled", &cfg);
+        unmodeled.emitted = tv_with_unmodeled_op(unmodeled.emitted);
+        assert_strict_refuses(&unmodeled, crate::TV_FOLD_MISS);
+        assert_strict_refuses(
+            &se_job(
+                "se_extra",
+                &SeCfg {
+                    extra_store: true,
+                    ..SeCfg::correct(SliceEndKind::First, true, 8)
+                },
+            ),
+            THREE_CELL,
+        );
+        assert_strict_refuses(
+            &se_job(
+                "se_no_tail_len",
+                &SeCfg {
+                    emit_tail_len: false,
+                    ..SeCfg::correct(SliceEndKind::First, true, 8)
+                },
+            ),
+            THREE_CELL,
+        );
+    }
+
+    /// `tv_header` with the header fields stored at the bridge's `Vec` field
+    /// offsets (`8 * field`, the offset `Const` that opens each field store).
+    fn tv_header_at_bridge_fields() -> Vec<InstrNode> {
+        let mut nodes = tv_header(4, 4);
+        for (write, bridge_field) in [
+            (0, crate::VEC_FIELD_PTR),
+            (1, crate::VEC_FIELD_CAP),
+            (2, crate::VEC_FIELD_LEN),
+        ] {
+            let index = tv_field_node(write, 0);
+            let Inst::Const { value, .. } = &mut nodes[index].inst else {
+                panic!("node {index} is a header field's offset Const");
+            };
+            *value = Constant::Int(8 * i128::from(bridge_field));
+        }
+        nodes
+    }
+
+    fn tovec_job(name: &str, emitted: Vec<InstrNode>) -> crate::SliceToVecHeaderRefinementJob {
+        crate::SliceToVecHeaderRefinementJob {
+            name: name.to_owned(),
+            emitted,
+            n: TV_N,
+            elem_size: 4,
+            elem_align: 4,
+        }
+    }
+
+    #[test]
+    fn strict_lane_refuses_slice_to_vec_header_shape_misses() {
+        let emitted = tv_header_at_bridge_fields();
+        let folded = fold_emitted_slice_to_vec_header(&emitted).expect("in slice");
+        assert_job_states(
+            &tovec_job("tovec", emitted.clone()),
+            slice_to_vec_header_obligations(
+                "tovec",
+                &folded,
+                TV_N,
+                4,
+                4,
+                crate::VEC_FIELD_PTR,
+                crate::VEC_FIELD_CAP,
+                crate::VEC_FIELD_LEN,
+                WORD_MODEL_POINTER_BYTES,
+            ),
+        );
+        let mut drifted = emitted.clone();
+        drifted.remove(3);
+        assert_strict_refuses(
+            &tovec_job("tovec_drift", drifted),
+            "emitted window out of the fold slice",
+        );
+        let mut foreign_ptr = emitted;
+        let ptr_store = tv_field_node(0, SLICE_TO_VEC_FIELD_STORE_NODES - 1);
+        let Inst::Store { value, .. } = &mut foreign_ptr[ptr_store].inst else {
+            panic!("node {ptr_store} is the ptr field's Store");
+        };
+        *value = TV_CAP;
+        assert_strict_refuses(
+            &tovec_job("tovec_foreign_ptr", foreign_ptr),
+            "ptr field does not hold the allocation result",
+        );
+    }
+
+    fn mem_job(name: &str, emitted: Vec<InstrNode>) -> crate::MemRefinementJob {
+        let (harness, spec_ops) = field_load_obligation(mem_base_name(SLOT), 16, 8);
+        crate::MemRefinementJob {
+            name: name.to_owned(),
+            harness,
+            spec_ops,
+            emitted,
+            place_shape: "Field",
+            kind: trust_cg_verify::bridge_coverage::MemRefineKind::FieldLoad,
+        }
+    }
+
+    /// The memory lane's two ways to state nothing for a queued job, a fold miss
+    /// and a structural mismatch the verifier rejects before any solver call,
+    /// are refused by the strict lane and skipped by the default lanes.
+    #[test]
+    fn strict_lane_refuses_memory_shape_misses() {
+        let in_shape = mem_job("memload_in_shape", emitted_field_load(16));
+        let bridge_ops = in_shape.bridge_ops().expect("a field load folds");
+        assert_eq!(bridge_ops.len(), in_shape.harness.len() + 1);
+
+        let unmodeled = mem_job(
+            "memload_unmodeled",
+            tv_with_unmodeled_op(emitted_field_load(16)),
+        );
+        // A field STORE where the spec reads the field: no load to pair.
+        let load_count = mem_job("memload_as_store", emitted_field_store(16, TrustIrTy::I64));
+        for (job, what) in [
+            (&unmodeled, crate::TV_FOLD_MISS),
+            (
+                &load_count,
+                "verifier: memload_as_store: load-count mismatch",
+            ),
+        ] {
+            let stated = job
+                .check(&AYConfig::default())
+                .expect_err("states no obligation");
+            assert!(stated.contains(what), "{what:?} missing from {stated}");
+            let err = crate::refinement_job_unmodeled(
+                true, false, TV_SYMBOL, "memory", &job.name, &stated,
+            )
+            .expect_err("the strict lane must not skip the job");
+            let names = format!(
+                "[TCG-REFINE-SHAPE] {TV_SYMBOL}: memory refinement job {}",
+                job.name
+            );
+            assert!(err.starts_with(&names), "{names:?} does not start {err}");
+            for trace in [false, true] {
+                crate::refinement_job_unmodeled(
+                    false, trace, TV_SYMBOL, "memory", &job.name, &stated,
+                )
+                .expect("the default lanes skip it");
+            }
+        }
     }
 }

@@ -47,9 +47,12 @@ fn add_variable_shift_function(module: &mut TrustIrModule, func_id: u32, name: &
     let ft = FuncTy {
         params: vec![TrustIrTy::Ptr, TrustIrTy::Ptr, TrustIrTy::Ptr],
         returns: vec![],
+        abi: None,
         is_vararg: false,
     };
-    let ft_id: FuncTyId = module.add_func_type(ft);
+    let ft_id: FuncTyId = module
+        .add_func_type(ft)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(func_id), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -90,7 +93,9 @@ fn add_variable_shift_function(module: &mut TrustIrModule, func_id: u32, name: &
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 fn build_variable_shift_module(name: &str, op: BinOp) -> TrustIrModule {
@@ -105,8 +110,10 @@ fn select_aarch64(module: &TrustIrModule) -> ISelFunction {
         .first()
         .expect("variable-shift module has one function");
     let (lir_func, _) =
-        trust_cg_lower::translate_function(func, module).expect("adapter must lower shift module");
+        trust_cg_lower::translate_function_with_license(func, module, &permit_unlicensed())
+            .expect("adapter must lower shift module");
     let mut isel = InstructionSelector::new(lir_func.name.clone(), lir_func.signature.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.seed_value_types(&lir_func.value_types);
     isel.lower_formal_arguments(&lir_func.signature, lir_func.entry_block)
         .expect("formal arguments must lower");
@@ -134,9 +141,12 @@ fn build_uniform_const_shift_module(name: &str, op: BinOp, count: i128) -> Trust
     let ft = FuncTy {
         params: vec![TrustIrTy::Ptr, TrustIrTy::Ptr],
         returns: vec![],
+        abi: None,
         is_vararg: false,
     };
-    let ft_id: FuncTyId = module.add_func_type(ft);
+    let ft_id: FuncTyId = module
+        .add_func_type(ft)
+        .expect("Module::add_func_type: test fixture");
     let mut func = TrustIrFunction::new(FuncId::new(0), name, ft_id, BlockId::new(0));
     func.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -175,7 +185,9 @@ fn build_uniform_const_shift_module(name: &str, op: BinOp, count: i128) -> Trust
             InstrNode::new(Inst::Return { values: vec![] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -211,7 +223,8 @@ fn aarch64_uniform_const_v4i32_shifts_emit_verified_neon_simd_immediates() {
             opt_level: OptLevel::O0,
             target: Target::Aarch64,
             ..CompilerConfig::default()
-        });
+        })
+        .with_codegen_license(permit_unlicensed());
         let result = compiler.compile(&module).unwrap_or_else(|e| {
             panic!("AArch64 uniform-const {op:?} #{count} must compile end-to-end: {e:?}")
         });
@@ -278,8 +291,13 @@ fn aarch64_variable_v4i32_shifts_preserve_lane_and_result_flow() {
     }
 }
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O) with a working `cc`:
+/// `Compiler::new` derives the host's object format and ABI.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
         && Command::new("cc")
             .arg("--version")
             .output()
@@ -287,8 +305,8 @@ fn can_link_and_run_aarch64_macho() -> bool {
 }
 
 fn link_and_run_aarch64_object(test_name: &str, object: &[u8], driver: &str) {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: AArch64 Mach-O link/run requires Apple silicon and cc");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: AArch64 link/run requires a Linux GNU or macOS AArch64 host and cc");
         return;
     }
 
@@ -310,6 +328,7 @@ fn link_and_run_aarch64_object(test_name: &str, object: &[u8], driver: &str) {
         .arg(&binary_path)
         .arg(&driver_path)
         .arg(&object_path)
+        .args(native_host::c_math_library_args())
         .output()
         .expect("start cc");
     assert!(
@@ -336,6 +355,7 @@ fn compile_aarch64_module(module: &TrustIrModule, opt_level: OptLevel) -> Vec<u8
         target: Target::Aarch64,
         ..CompilerConfig::default()
     })
+    .with_codegen_license(permit_unlicensed())
     .compile(module)
     .expect("variable packed shifts must compile through AArch64 codegen")
     .object_code
@@ -412,4 +432,13 @@ fn aarch64_variable_v4i32_shifts_match_c_at_runtime() {
             VARIABLE_SHIFT_DRIVER,
         );
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

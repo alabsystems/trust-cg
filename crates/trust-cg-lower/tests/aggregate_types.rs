@@ -10,8 +10,6 @@
 //! The adapter resolves array `TyId`s via the module's `types` table, flattens
 //! tuples to anonymous LIR structs, and resolves enums via the module enum
 //! table into the tagged-union representation chosen in #398.
-//!
-//! Design: `designs/2026-04-18-aggregate-lowering.md`.
 
 use trust_cg_ir::function::EnumTagWidth;
 use trust_cg_lower::adapter::{
@@ -23,6 +21,10 @@ use trust_ir::{
     EnumTagEncoding, EnumTagRepr, EnumVariant, FieldDef, FuncId, FuncTy, Function, Inst, InstrNode,
     Linkage, Module, StructDef, StructId, Ty, TyId, ValueId,
 };
+
+#[path = "common/typed_refusal.rs"]
+mod typed_refusal;
+use typed_refusal::assert_typed_const_refusal;
 
 // ---------------------------------------------------------------------------
 // translate_type_with_tables — direct unit tests
@@ -97,6 +99,7 @@ fn array_length_exceeding_u32_max_is_rejected() {
 fn array_of_struct_resolves_recursively() {
     // types[0] = Struct(Point{x:F64, y:F64}); array of 3 points.
     let structs = vec![StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "Point".to_string(),
         fields: vec![
@@ -197,6 +200,7 @@ fn struct_containing_array_field_resolves() {
     // Regression for design-doc Gap B: struct fields that contain arrays
     // previously failed to lower because the adapter rejected Ty::Array.
     let structs = vec![StructDef {
+        origin: None,
         id: StructId::new(0),
         name: "Buf".to_string(),
         fields: vec![
@@ -256,9 +260,12 @@ fn make_identity_function(params: Vec<Ty>, returns: Vec<Ty>) -> Module {
     let ft = FuncTy {
         params: params.clone(),
         returns,
+        abi: None,
         is_vararg: false,
     };
-    let ft_id = module.add_func_type(ft);
+    let ft_id = module
+        .add_func_type(ft)
+        .expect("Module::add_func_type: test fixture");
 
     // One block with params matching the function params, returning the first
     // param unchanged. We use `Ty::Ptr` for inputs to avoid needing an aggregate
@@ -286,7 +293,9 @@ fn make_identity_function(params: Vec<Ty>, returns: Vec<Ty>) -> Module {
     func.linkage = Linkage::External;
     func.calling_conv = CallingConv::C;
     func.blocks = vec![block];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -300,7 +309,7 @@ fn function_with_array_param_translates_through_signature() {
     // Register the element type in the module's types table.
     module.types.push(Ty::I32);
 
-    let results = trust_cg_lower::adapter::translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     assert_eq!(results.len(), 1);
     let (func, _proofs) = &results[0];
     let expected = Type::Array(Box::new(Type::I32), 4);
@@ -313,7 +322,7 @@ fn function_with_tuple_param_translates_through_signature() {
     // fn f((i32, f64)) -> (i32, f64).
     let tup = Ty::Tuple(vec![Ty::I32, Ty::F64]);
     let module = make_identity_function(vec![tup.clone()], vec![tup]);
-    let results = trust_cg_lower::adapter::translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     let (func, _proofs) = &results[0];
     let expected = Type::Struct(vec![Type::I32, Type::F64]);
     assert_eq!(func.signature.params, vec![expected.clone()]);
@@ -329,7 +338,7 @@ fn function_with_tuple_of_array_param_translates() {
     );
     module.types.push(Ty::U8);
 
-    let results = trust_cg_lower::adapter::translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     let (func, _proofs) = &results[0];
     let expected = Type::Struct(vec![Type::I32, Type::Array(Box::new(Type::I8), 8)]);
     assert_eq!(func.signature.params, vec![expected]);
@@ -349,6 +358,7 @@ fn typed_record_state_pointer_params_preserve_pointee_metadata() {
         vec![Ty::Ptr],
     );
     module.structs = vec![StructDef {
+        origin: None,
         id: state_struct_id,
         name: "RecordState".to_string(),
         fields: vec![
@@ -373,7 +383,7 @@ fn typed_record_state_pointer_params_preserve_pointee_metadata() {
         repr: Default::default(),
     }];
 
-    let results = trust_cg_lower::adapter::translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     let (func, _proofs) = &results[0];
     let record_state = Type::Struct(vec![Type::I64, Type::I64, Type::I64]);
 
@@ -400,6 +410,7 @@ fn function_with_enum_param_translates_through_signature() {
     let enum_ty = Ty::Enum(EnumId::new(0));
     let mut module = make_identity_function(vec![enum_ty.clone()], vec![enum_ty]);
     module.enums = vec![EnumDef {
+        origin: None,
         id: EnumId::new(0),
         name: "OptionI64".to_string(),
         variants: vec![
@@ -419,7 +430,7 @@ fn function_with_enum_param_translates_through_signature() {
         layout: None,
     }];
 
-    let results = trust_cg_lower::adapter::translate_module(&module).unwrap();
+    let results = permit_translate_module(&module).unwrap();
     let (func, _proofs) = &results[0];
     let expected = Type::Enum {
         tag_width: EnumTagWidth::U8,
@@ -430,10 +441,11 @@ fn function_with_enum_param_translates_through_signature() {
 }
 
 #[test]
-fn enum_with_producer_layout_fails_closed() {
+fn enum_with_producer_layout_is_carried_at_its_declared_bytes() {
     let enum_ty = Ty::Enum(EnumId::new(0));
     let mut module = make_identity_function(vec![enum_ty.clone()], vec![enum_ty]);
     module.enums = vec![EnumDef {
+        origin: None,
         id: EnumId::new(0),
         name: "LayoutOptionI64".to_string(),
         variants: vec![
@@ -458,46 +470,76 @@ fn enum_with_producer_layout_fails_closed() {
         }),
     }];
 
-    // THIS FIXTURE AGREES WITH THE CANONICAL LAYOUT, and is therefore ACCEPTED.
-    // Canonical for 2 variants: tag U8 at offset 0, payload aligned to 8 (the
-    // I64 field), so payload starts at byte 8, size rounds to 16, align 8 —
-    // exactly what the descriptor above declares. Emitting the canonical shape
-    // IS emitting the declared one, so refusing would cost coverage and buy
-    // nothing.
-    //
-    // This assertion used to require a REFUSAL. That pinned the blanket
-    // "any producer layout is unsupported" behaviour rather than the fail-closed
-    // property, which is about DISAGREEMENT and is exercised by
-    // `enum_semantics_that_canonical_lowering_does_not_honor_fail_closed` below
-    // (tag_offset 4) and by the divergent case immediately following.
-    trust_cg_lower::adapter::translate_module(&module)
+    // THIS FIXTURE AGREES WITH THE CANONICAL LAYOUT: tag U8 at offset 0, the
+    // I64 payload at byte 8, size 16, align 8 — exactly what the descriptor
+    // declares. Emitting the canonical shape IS emitting the declared one, so
+    // the carrier stays `Type::Enum`, the encoding every canonical projection
+    // reads.
+    let results = permit_translate_module(&module)
         .expect("a producer layout that AGREES with the canonical one must be accepted");
+    assert_eq!(
+        results[0].0.signature.params[0],
+        Type::Enum {
+            tag_width: EnumTagWidth::U8,
+            variants: vec![vec![], vec![Type::I64]],
+        }
+    );
 
-    // ...and the same enum with ONE byte moved is still refused, naming the axis.
+    // A DIFFERENT producer layout is no longer refused (L05-P5): the enum is
+    // carried at exactly the declared size and alignment, addressed from the
+    // descriptor at every access site, and never as the canonical `Type::Enum`
+    // whose bytes it does not have.
+    let mut padded = module.clone();
+    if let Some(layout) = padded.enums[0].layout.as_mut() {
+        layout.size = 24;
+        layout.variant_field_offsets = vec![vec![], vec![16]];
+    }
+    let results = permit_translate_module(&padded)
+        .expect("a producer layout the canonical shape does not reproduce is carried as declared");
+    let carrier = &results[0].0.signature.params[0];
+    assert_eq!(
+        *carrier,
+        Type::Struct(vec![Type::Array(Box::new(Type::I64), 3)]),
+        "the byte-image carrier of the declared 24/8"
+    );
+    assert_eq!((carrier.bytes(), carrier.align()), (24, 8));
+
+    // ...and a descriptor that places a field OUTSIDE its own image is still
+    // refused by TrustIR's typed admission, naming the enum, the field and the
+    // offending offset.
     let mut divergent = module.clone();
     if let Some(layout) = divergent.enums[0].layout.as_mut() {
         layout.variant_field_offsets = vec![vec![], vec![12]];
     }
-    match trust_cg_lower::adapter::translate_module(&divergent)
-        .expect_err("a producer layout that DISAGREES must not be synthesized away")
-    {
-        AdapterError::UnsupportedType(msg) => {
-            assert!(msg.contains("EnumDef.layout"), "must name the field: {msg}");
-            assert!(msg.contains("LayoutOptionI64"), "must name the enum: {msg}");
-            assert!(
-                msg.contains("variant 1 field 0 at byte 12"),
-                "must name the offending offset: {msg}"
-            );
-        }
-        other => panic!("expected UnsupportedType, got {other:?}"),
-    }
+    let err = permit_translate_module(&divergent)
+        .expect_err("a field past the declared size must not be synthesized away");
+    assert_typed_const_refusal(
+        &err,
+        "enum.0 (LayoutOptionI64) layout",
+        "variant 1 field 0 entirely within size 16",
+        "offset 12, field size 8",
+    );
 }
 
+/// A v37 tag-free image must NEVER become TrustCg's tag-CARRYING `Type::Enum`.
+/// That invariant is unchanged; what changed is the ALTERNATIVE.
+///
+/// CORRECTION, kept rather than silently replaced: this test used to require a
+/// REFUSAL, and its own name said why — "until LIR has a tag-free carrier".
+/// That was the honest answer while TrustCg had none, but refusing the TYPE
+/// killed every signature, alloca, load, store and constant mentioning the
+/// enum, which is not fail-closed so much as lost coverage. There is now a
+/// carrier (`untagged_enum_carrier`, pinned end-to-end in
+/// `tests/untagged_enum_carrier.rs`): an untagged enum IS its sole variant's
+/// payload, admitted only by EQUALITY against the producer's own declared
+/// size, align and offsets. The assertion moves with the behaviour, and the
+/// invariant it was really about is asserted directly below.
 #[test]
-fn untagged_enum_layout_fails_closed_until_lir_has_a_tag_free_carrier() {
+fn an_untagged_layout_lowers_to_its_payload_never_to_a_tag_carrying_enum() {
     let enum_ty = Ty::Enum(EnumId::new(0));
     let mut module = make_identity_function(vec![enum_ty.clone()], vec![enum_ty]);
     module.enums = vec![EnumDef {
+        origin: None,
         id: EnumId::new(0),
         name: "TagFreeI64".to_string(),
         variants: vec![EnumVariant {
@@ -515,31 +557,53 @@ fn untagged_enum_layout_fails_closed_until_lir_has_a_tag_free_carrier() {
         }),
     }];
 
-    match trust_cg_lower::adapter::translate_module(&module)
-        .expect_err("a tag-free image must not become CG's tag-carrying Type::Enum")
+    let results = permit_translate_module(&module)
+        .expect("an untagged descriptor whose payload reproduces it must be admitted");
+    let param = &results[0].0.signature.params[0];
+    assert!(
+        !matches!(param, Type::Enum { .. }),
+        "a tag-free image must not become CG's tag-carrying Type::Enum: {param:?}"
+    );
+    assert_eq!(
+        *param,
+        Type::Struct(vec![Type::I64]),
+        "it is the sole variant's payload, at the producer's declared 8/8"
+    );
+    assert_eq!((param.bytes(), param.align()), (8, 8));
+
+    // ...and the same descriptor with the SIZE moved is still refused, naming
+    // its own encoding rather than borrowing the canonical-layout message.
+    let mut divergent = module.clone();
+    if let Some(layout) = divergent.enums[0].layout.as_mut() {
+        layout.size = 16;
+    }
+    match permit_translate_module(&divergent)
+        .expect_err("a carrier that misses the declared size must not be synthesized away")
     {
         AdapterError::UnsupportedType(msg) => {
             assert!(
                 msg.contains("EnumDef.layout"),
                 "must name the authority: {msg}"
             );
+            assert!(msg.contains("UNTAGGED"), "must name the encoding: {msg}");
             assert!(
-                msg.contains("untagged encoding"),
-                "must name the encoding: {msg}"
-            );
-            assert!(
-                msg.contains("no tag-free representation"),
-                "must name the missing capability: {msg}"
+                msg.contains("has size 8, the descriptor declares size 16"),
+                "must name the axis and both numbers: {msg}"
             );
         }
         other => panic!("expected UnsupportedType, got {other:?}"),
     }
 }
 
+/// Richer enum semantics lower through trust-ir's own tables (L05-P5):
+/// explicit discriminants that are not the variant index, a SIGNED repr, and a
+/// producer layout the canonical shape does not reproduce. What trust-ir itself
+/// cannot name still fails closed, naming the field.
 #[test]
-fn enum_semantics_that_canonical_lowering_does_not_honor_fail_closed() {
+fn richer_enum_semantics_lower_through_trust_ir_tables() {
     let enum_ty = Ty::Enum(EnumId::new(0));
     let canonical = EnumDef {
+        origin: None,
         id: EnumId::new(0),
         name: "ExplicitOptionI64".to_string(),
         variants: vec![
@@ -558,7 +622,18 @@ fn enum_semantics_that_canonical_lowering_does_not_honor_fail_closed() {
         repr: None,
         layout: None,
     };
+    let lower = |enum_def: EnumDef| {
+        let mut module = make_identity_function(vec![enum_ty.clone()], vec![enum_ty.clone()]);
+        module.enums = vec![enum_def];
+        permit_translate_module(&module).map(|results| results[0].0.signature.params[0].clone())
+    };
+    let canonical_carrier = Type::Enum {
+        tag_width: EnumTagWidth::U8,
+        variants: vec![vec![], vec![Type::I64]],
+    };
 
+    // A tag at byte 4 (a u8, 1-aligned) with the payload at 8: a valid 16/8
+    // producer image the canonical shape (tag at 0) does not reproduce.
     let mut with_layout = canonical.clone();
     with_layout.layout = Some(EnumLayoutDescriptor {
         encoding: EnumTagEncoding::Direct { tag_offset: 4 },
@@ -566,35 +641,78 @@ fn enum_semantics_that_canonical_lowering_does_not_honor_fail_closed() {
         align: 8,
         variant_field_offsets: vec![vec![], vec![8]],
     });
+    assert_eq!(
+        lower(with_layout).expect("a producer layout is carried at its declared bytes"),
+        Type::Struct(vec![Type::Array(Box::new(Type::I64), 2)])
+    );
+
+    // Explicit discriminants 7 and 11: the lane still fits a u8, and the VALUES
+    // are what the tag word carries (`Constant::Aggregate` writes them, `Switch`
+    // cases compare against them), never the index.
     let mut with_discriminants = canonical.clone();
     with_discriminants.discriminants = vec![Some(7), Some(11)];
-    // A SIGNED repr. `U16` used to belong here, but a wider-than-minimum
-    // UNSIGNED tag is no longer an unsupported semantic — it is the ordinary
-    // shape rustc produces when it pads an enum's tag out to the payload's
-    // alignment (a two-variant `Option<Box<T>>` declares an eight-byte tag), and
-    // the adapter now takes the producer's width instead of deriving one. What
-    // remains genuinely unsupported is SIGNEDNESS: the canonical tag lane is
-    // unsigned, so an `iN` repr states an intent it would silently mis-serve.
-    let mut with_repr = canonical;
+    assert_eq!(
+        lower(with_discriminants).expect("explicit discriminants lower"),
+        canonical_carrier
+    );
+
+    // A SIGNED repr takes the same-width lane; signedness belongs to the reads
+    // and compares that consume the tag, exactly as for any other `i8` value.
+    let mut with_repr = canonical.clone();
     with_repr.repr = Some(EnumTagRepr::I8);
+    with_repr.discriminants = vec![Some(-1), Some(1)];
+    assert_eq!(
+        lower(with_repr).expect("a signed repr lowers"),
+        canonical_carrier
+    );
 
-    for (unsupported_field, enum_def) in [
-        ("EnumDef.layout", with_layout),
-        ("EnumDef.discriminants", with_discriminants),
-        ("EnumDef.repr", with_repr),
+    // Still refused, naming what trust-ir cannot resolve: duplicate
+    // discriminants, a repr too narrow for its values and a descriptor whose
+    // field overlaps its tag word are refused by TrustIR's typed admission; a
+    // 128-bit lane passes that admission and is refused by the adapter.
+    let mut duplicate = canonical.clone();
+    duplicate.discriminants = vec![Some(7), Some(7)];
+    let mut narrow = canonical.clone();
+    narrow.repr = Some(EnumTagRepr::U8);
+    narrow.discriminants = vec![Some(0), Some(300)];
+    let mut wide = canonical.clone();
+    wide.repr = Some(EnumTagRepr::I128);
+    let mut overlapping = canonical.clone();
+    overlapping.layout = Some(EnumLayoutDescriptor {
+        encoding: EnumTagEncoding::Direct { tag_offset: 8 },
+        size: 16,
+        align: 8,
+        variant_field_offsets: vec![vec![], vec![8]],
+    });
+    for (location, expected, actual, enum_def) in [
+        (
+            "enum.0 (ExplicitOptionI64)",
+            "resolvable, duplicate-free discriminant assignment",
+            "ill-formed discriminants",
+            duplicate,
+        ),
+        (
+            "enum.0 (ExplicitOptionI64)",
+            "a canonical tag repr (non-empty, values fit the hint and the 64-bit cap)",
+            "no canonical tag",
+            narrow,
+        ),
+        (
+            "enum.0 (ExplicitOptionI64) layout",
+            "a direct tag disjoint from every non-ZST field",
+            "tag overlaps variant 1 field 0",
+            overlapping,
+        ),
     ] {
-        let mut module = make_identity_function(vec![enum_ty.clone()], vec![enum_ty.clone()]);
-        module.enums = vec![enum_def];
-
-        match trust_cg_lower::adapter::translate_module(&module).unwrap_err() {
-            AdapterError::UnsupportedType(msg) => assert!(
-                msg.contains(unsupported_field),
-                "{unsupported_field} rejection must name the unsupported semantic field: {msg}"
-            ),
-            other => {
-                panic!("{unsupported_field} must fail closed as UnsupportedType, got {other:?}")
-            }
-        }
+        let err = lower(enum_def).expect_err("must fail closed");
+        assert_typed_const_refusal(&err, location, expected, actual);
+    }
+    match lower(wide).expect_err("a 128-bit tag lane must fail closed") {
+        AdapterError::UnsupportedType(msg) => assert!(
+            msg.contains("128-bit") && msg.contains("ExplicitOptionI64"),
+            "the rejection must name the semantic and the enum: {msg}"
+        ),
+        other => panic!("a 128-bit tag lane must fail closed as UnsupportedType, got {other:?}"),
     }
 }
 
@@ -607,7 +725,7 @@ fn function_with_array_returns_error_when_types_table_missing() {
         vec![Ty::Array(TyId::new(0), 4)],
     );
     // Intentionally don't push to module.types — leave it empty.
-    let result = trust_cg_lower::adapter::translate_module(&module);
+    let result = permit_translate_module(&module);
     assert!(result.is_err(), "expected error for unresolvable TyId");
     match result.unwrap_err() {
         AdapterError::UnsupportedType(msg) => {
@@ -615,4 +733,28 @@ fn function_with_array_returns_error_when_types_table_missing() {
         }
         other => panic!("expected UnsupportedType, got {:?}", other),
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

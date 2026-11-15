@@ -136,7 +136,7 @@ fn fixture_path() -> PathBuf {
 }
 
 fn ensure_fixture() -> trust_ir::Module {
-    let module = build_bcp_propagate_module();
+    let module = build_bcp_propagate_module().expect("the kernel module builds");
     let text = encode_trust_ir_text(&module);
 
     let path = fixture_path();
@@ -165,6 +165,7 @@ fn run_jit_propagate(num_vars: usize, clauses: &[Vec<i32>]) -> (u64, Vec<(usize,
     let config = CompilerConfig::for_host_jit();
     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &extern_symbols)
         .unwrap_or_else(|err| panic!("JIT compilation failed: {err}"));
 
@@ -292,6 +293,7 @@ fn run_jit_with_implied_buffer(
     let config = CompilerConfig::for_host_jit();
     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &extern_symbols)
         .unwrap_or_else(|err| panic!("JIT compilation failed: {err}"));
 
@@ -412,6 +414,7 @@ fn run_jit_with_reasons_buffer(
     let config = CompilerConfig::for_host_jit();
     let extern_symbols: HashMap<String, *const u8> = HashMap::new();
     let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &extern_symbols)
         .unwrap_or_else(|err| panic!("JIT compilation failed: {err}"));
 
@@ -527,4 +530,13 @@ fn scan_handles_no_reason_buffer() {
     assert_eq!(len, 4);
     assert!(!present);
     assert_eq!(&lits[..4], &[1, 2, 3, 4]);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_codegen::CodegenLicensePolicy {
+    trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit)
 }

@@ -1,0 +1,1162 @@
+{
+  "name": "inst_arithmetic",
+  "functions": [
+    {
+      "id": 0,
+      "name": "int_ops",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I64"
+            ],
+            [
+              1,
+              "I64"
+            ],
+            [
+              2,
+              "I32"
+            ],
+            [
+              3,
+              "U32"
+            ],
+            [
+              4,
+              "F32"
+            ],
+            [
+              5,
+              "F64"
+            ],
+            [
+              6,
+              "Bool"
+            ],
+            [
+              7,
+              "Ptr"
+            ],
+            [
+              8,
+              {
+                "FatPtr": "Str"
+              }
+            ],
+            [
+              9,
+              "U64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                10
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Sub",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                11
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Mul",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                12
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "UDiv",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                13
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SDiv",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                14
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "URem",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                15
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "SRem",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                16
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "And",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                17
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Or",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                18
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Xor",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                19
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Shl",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                20
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "LShr",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                21
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "AShr",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                22
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FAdd",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                23
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FSub",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                24
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FMul",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                25
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FDiv",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                26
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FRem",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                27
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "Neg",
+                  "ty": "I64",
+                  "operand": 0
+                }
+              },
+              "results": [
+                28
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "FNeg",
+                  "ty": "F64",
+                  "operand": 5
+                }
+              },
+              "results": [
+                29
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "Not",
+                  "ty": "I64",
+                  "operand": 0
+                }
+              },
+              "results": [
+                30
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "CtPop",
+                  "ty": "I64",
+                  "operand": 0
+                }
+              },
+              "results": [
+                31
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Overflow": {
+                  "op": "AddOverflow",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                32,
+                33
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Overflow": {
+                  "op": "SubOverflow",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                34,
+                35
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Overflow": {
+                  "op": "MulOverflow",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                36,
+                37
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Eq",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                38
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ne",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                39
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ult",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                40
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ule",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                41
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Ugt",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                42
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Uge",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                43
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Slt",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                44
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sle",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                45
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sgt",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                46
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "ICmp": {
+                  "op": "Sge",
+                  "ty": "I64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                47
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "OEq",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                48
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "ONe",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                49
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "OLt",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                50
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "OLe",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                51
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "OGt",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                52
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "OGe",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                53
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "UEq",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                54
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "UNe",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                55
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "ULt",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                56
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "ULe",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                57
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "UGt",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                58
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "FCmp": {
+                  "op": "UGe",
+                  "ty": "F64",
+                  "lhs": 5,
+                  "rhs": 5
+                }
+              },
+              "results": [
+                59
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "Trunc",
+                  "src_ty": "I64",
+                  "dst_ty": "I32",
+                  "operand": 0
+                }
+              },
+              "results": [
+                60
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "ZExt",
+                  "src_ty": "I32",
+                  "dst_ty": "I64",
+                  "operand": 2
+                }
+              },
+              "results": [
+                61
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "SExt",
+                  "src_ty": "I32",
+                  "dst_ty": "I64",
+                  "operand": 2
+                }
+              },
+              "results": [
+                62
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "FPTrunc",
+                  "src_ty": "F64",
+                  "dst_ty": "F32",
+                  "operand": 5
+                }
+              },
+              "results": [
+                63
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "FPExt",
+                  "src_ty": "F32",
+                  "dst_ty": "F64",
+                  "operand": 4
+                }
+              },
+              "results": [
+                64
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "FPToUI",
+                  "src_ty": "F64",
+                  "dst_ty": "U32",
+                  "operand": 5
+                }
+              },
+              "results": [
+                65
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "FPToSI",
+                  "src_ty": "F64",
+                  "dst_ty": "I32",
+                  "operand": 5
+                }
+              },
+              "results": [
+                66
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "UIToFP",
+                  "src_ty": "U32",
+                  "dst_ty": "F32",
+                  "operand": 3
+                }
+              },
+              "results": [
+                67
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "SIToFP",
+                  "src_ty": "I32",
+                  "dst_ty": "F64",
+                  "operand": 2
+                }
+              },
+              "results": [
+                68
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "PtrToInt",
+                  "src_ty": "Ptr",
+                  "dst_ty": "U64",
+                  "operand": 7
+                }
+              },
+              "results": [
+                69
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "IntToPtr",
+                  "src_ty": "U64",
+                  "dst_ty": "Ptr",
+                  "operand": 9
+                }
+              },
+              "results": [
+                70
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Cast": {
+                  "op": "Bitcast",
+                  "src_ty": "F32",
+                  "dst_ty": "I32",
+                  "operand": 4
+                }
+              },
+              "results": [
+                71
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "PtrData": {
+                  "ptr_ty": {
+                    "FatPtr": "Str"
+                  },
+                  "ptr": 8
+                }
+              },
+              "results": [
+                72
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "PtrMetadata": {
+                  "ptr_ty": {
+                    "FatPtr": "Str"
+                  },
+                  "metadata_ty": "U64",
+                  "ptr": 8
+                }
+              },
+              "results": [
+                73
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "PtrFromParts": {
+                  "ptr_ty": {
+                    "FatPtr": "Str"
+                  },
+                  "metadata_ty": "U64",
+                  "data": 7,
+                  "metadata": 9
+                }
+              },
+              "results": [
+                74
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Copy": {
+                  "ty": "I64",
+                  "operand": 0
+                }
+              },
+              "results": [
+                75
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Select": {
+                  "ty": "I64",
+                  "cond": 6,
+                  "then_val": 0,
+                  "else_val": 1
+                }
+              },
+              "results": [
+                76
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I64",
+        "I64",
+        "I32",
+        "U32",
+        "F32",
+        "F64",
+        "Bool",
+        "Ptr",
+        {
+          "FatPtr": "Str"
+        },
+        "U64"
+      ],
+      "returns": [
+        "I64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

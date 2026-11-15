@@ -14,8 +14,8 @@
 //   2. encodes them with the REAL encoder (X86Encoder::encode_instruction),
 //   3. packs the bytes into a minimal ELF64 relocatable object,
 //   4. disassembles that object with an EXTERNAL disassembler — the
-//      llvm-objdump shipped inside the PINNED rustc toolchain
-//      (nightly-2026-04-20; see PINNED_* consts below), and
+//      llvm-objdump shipped inside the installed Trust package's sysroot
+//      (see PINNED_* consts below), and
 //   5. structurally compares mnemonic + operands against an independently
 //      derived expected rendering of the INTENDED instruction.
 //
@@ -27,15 +27,17 @@
 //
 // PINNING
 // -------
-// The disassembler is pinned to the nightly-2026-04-20 toolchain's own
-// llvm-objdump (the only external disassembler present on the dev hosts —
-// llvm-mc is NOT shipped; /usr/bin/otool is not pinned). Exact recorded
-// version at pin time (x86_64-apple-darwin host):
+// The disassembler is pinned to the Trust package's own llvm-objdump
+// (`<trustc --print sysroot>/lib/rustlib/<host>/bin/llvm-objdump`; llvm-mc is
+// NOT shipped; /usr/bin/otool is not pinned). Exact recorded version at pin
+// time (aarch64-apple-darwin, atpkg store/trust/9192, 2026-09-28):
 //
-//     LLVM version 22.1.2-rust-1.97.0-nightly
+//     LLVM version 22.1.2-rust-1.96.0-trust
 //
-// If the toolchain-resolved objdump reports a DIFFERENT version the test
-// fails (the pin was violated). `TCG_LLVM_OBJDUMP=<path>` overrides the
+// (The retired stock nightly-2026-04-20 pin recorded
+// 22.1.2-rust-1.97.0-nightly.) If the toolchain-resolved objdump reports a
+// DIFFERENT version the test fails (the pin was violated).
+// `TCG_LLVM_OBJDUMP=<path>` overrides the
 // resolution for externally provisioned disassemblers (warn-only on version
 // drift in that case). If no objdump can be found at all the suite SKIPS
 // GRACEFULLY with an eprintln (a missing external tool must not turn this
@@ -75,10 +77,15 @@ use trust_cg_ir::x86_64_regs::{
 // Pinned external disassembler
 // ---------------------------------------------------------------------------
 
-const PINNED_TOOLCHAIN: &str = "nightly-2026-04-20";
-/// Exact `llvm-objdump --version` "LLVM version" line content recorded when
-/// this lane was pinned (2026-07-02, x86_64-apple-darwin host).
-const PINNED_OBJDUMP_VERSION: &str = "22.1.2-rust-1.97.0-nightly";
+/// The toolchain whose `llvm-objdump` this lane pins: the installed Trust
+/// package (the repository builds with `channel = "trust"`; the retired stock
+/// `nightly-2026-04-20` is no longer the source).
+const PINNED_TOOLCHAIN: &str = "the installed Trust package";
+/// Exact `llvm-objdump --version` "LLVM version" line content of the Trust
+/// package's llvm-tools, recorded 2026-09-28 from atpkg store/trust/9192
+/// (trustc 321aaeda7). Its llvm-tools come from an older Trust build than the
+/// compiler; the LLVM release (22.1.2) is the same.
+const PINNED_OBJDUMP_VERSION: &str = "22.1.2-rust-1.96.0-trust";
 
 struct Disasm {
     path: PathBuf,
@@ -86,11 +93,28 @@ struct Disasm {
     from_pinned_toolchain: bool,
 }
 
+/// The Trust package's sysroot, from the `trustc` on PATH. trustc refuses to
+/// run while any TRUST_CG_*/TCG_* control is set, and a gate may export them
+/// to this test, so they are removed from the probe's environment.
+fn trust_sysroot() -> Option<PathBuf> {
+    let mut command = Command::new("trustc");
+    for (key, _) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("TRUST_CG_") || key_text.starts_with("TCG_") {
+            command.env_remove(&key);
+        }
+    }
+    let out = command.args(["--print", "sysroot"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    sysroot.is_dir().then_some(sysroot)
+}
+
 /// Resolve the pinned llvm-objdump. Order:
 ///   1. TCG_LLVM_OBJDUMP env override (externally provisioned; warn-only pin).
-///   2. `rustup which --toolchain nightly-2026-04-20 rustc` -> sibling
-///      lib/rustlib/<triple>/bin/llvm-objdump.
-///   3. Direct scan of ~/.rustup/toolchains/nightly-2026-04-20-*/....
+///   2. The Trust package's `<trustc --print sysroot>/lib/rustlib/<triple>/bin/llvm-objdump`.
 fn find_pinned_objdump() -> Option<Disasm> {
     if let Ok(p) = std::env::var("TCG_LLVM_OBJDUMP") {
         let p = PathBuf::from(p);
@@ -102,49 +126,20 @@ fn find_pinned_objdump() -> Option<Disasm> {
                 from_pinned_toolchain: false,
             });
         }
-        eprintln!("ENC-2: TCG_LLVM_OBJDUMP set but not a file; falling back to pinned toolchain");
+        eprintln!("ENC-2: TCG_LLVM_OBJDUMP set but not a file; falling back to the Trust package");
     }
 
-    // rustup which -> toolchain root
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Ok(out) = Command::new("rustup")
-        .args(["which", "--toolchain", PINNED_TOOLCHAIN, "rustc"])
-        .output()
-        && out.status.success()
-    {
-        let rustc = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-        // <root>/bin/rustc -> <root>
-        if let Some(root) = rustc.parent().and_then(Path::parent) {
-            roots.push(root.to_path_buf());
-        }
-    }
-    // Fallback: scan ~/.rustup/toolchains for the pinned toolchain dir.
-    if let Some(home) = std::env::var_os("HOME") {
-        let tc_dir = PathBuf::from(home).join(".rustup/toolchains");
-        if let Ok(rd) = std::fs::read_dir(&tc_dir) {
-            for e in rd.flatten() {
-                if e.file_name()
-                    .to_string_lossy()
-                    .starts_with(PINNED_TOOLCHAIN)
-                {
-                    roots.push(e.path());
-                }
-            }
-        }
-    }
-    for root in roots {
-        let rustlib = root.join("lib/rustlib");
-        if let Ok(rd) = std::fs::read_dir(&rustlib) {
-            for e in rd.flatten() {
-                let cand = e.path().join("bin/llvm-objdump");
-                if cand.is_file() {
-                    let v = objdump_version_line(&cand)?;
-                    return Some(Disasm {
-                        path: cand,
-                        version_line: v,
-                        from_pinned_toolchain: true,
-                    });
-                }
+    let rustlib = trust_sysroot()?.join("lib/rustlib");
+    if let Ok(rd) = std::fs::read_dir(&rustlib) {
+        for e in rd.flatten() {
+            let cand = e.path().join("bin/llvm-objdump");
+            if cand.is_file() {
+                let v = objdump_version_line(&cand)?;
+                return Some(Disasm {
+                    path: cand,
+                    version_line: v,
+                    from_pinned_toolchain: true,
+                });
             }
         }
     }
@@ -172,7 +167,7 @@ fn objdump_or_skip(test_name: &str) -> Option<Disasm> {
                     "ENC-2 [{test_name}]: pinned-toolchain llvm-objdump version drift.\n  \
                      expected to contain: {PINNED_OBJDUMP_VERSION}\n  got: {}\n  path: {}\n\
                      The pin ({PINNED_TOOLCHAIN}) was violated — re-record the version \
-                     deliberately or restore the toolchain.",
+                     deliberately when the Trust package changes.",
                     d.version_line,
                     d.path.display()
                 );
@@ -188,8 +183,8 @@ fn objdump_or_skip(test_name: &str) -> Option<Disasm> {
         }
         None => {
             eprintln!(
-                "ENC-2 [{test_name}]: SKIP — llvm-objdump not found (toolchain \
-                 {PINNED_TOOLCHAIN} not installed and TCG_LLVM_OBJDUMP unset). \
+                "ENC-2 [{test_name}]: SKIP — llvm-objdump not found ({PINNED_TOOLCHAIN} \
+                 ships none and TCG_LLVM_OBJDUMP is unset). \
                  The external-disassembler differential lane did not run."
             );
             None
@@ -267,8 +262,12 @@ fn elf64_x86_object(text: &[u8]) -> Vec<u8> {
 
 /// Disassembled row: (offset, byte_len, instruction text).
 fn run_objdump(objdump: &Path, object: &[u8], tag: &str) -> Vec<(usize, usize, String)> {
-    let dir = std::env::temp_dir().join(format!("tcg_enc2_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // Removed when this function returns (or unwinds).
+    let scratch = tempfile::Builder::new()
+        .prefix("tcg_enc2_")
+        .tempdir()
+        .expect("create temp dir");
+    let dir = scratch.path();
     let obj_path = dir.join(format!("{tag}.o"));
     std::fs::write(&obj_path, object).expect("write object");
 
@@ -496,6 +495,10 @@ enum Expect {
     Fixed(Vec<String>),
     /// PC-relative: rendered target = offset_of_next_instruction + disp.
     Branch { mnem: String, disp: i64 },
+    /// A pseudo that expands to several architectural instructions: exactly
+    /// these renderings, one objdump row each, consecutive, covering the whole
+    /// case and nothing else.
+    Sequence(Vec<String>),
 }
 
 struct Case {
@@ -519,6 +522,14 @@ impl Case {
             op,
             ops,
             expect: Expect::Branch { mnem, disp },
+            desc,
+        }
+    }
+    fn sequence(op: X86Opcode, ops: X86InstOperands, rows: Vec<String>, desc: String) -> Self {
+        Case {
+            op,
+            ops,
+            expect: Expect::Sequence(rows),
             desc,
         }
     }
@@ -565,6 +576,40 @@ fn run_family(
         rows.into_iter().map(|(off, n, t)| (off, (n, t))).collect();
 
     for (offset, len, case) in &placed {
+        if let Expect::Sequence(renderings) = &case.expect {
+            let mut at = *offset;
+            for (k, want) in renderings.iter().enumerate() {
+                let Some((dec_len, dec_text)) = by_offset.get(&at) else {
+                    disagreements.push(format!(
+                        "[{family}] off=0x{offset:x} {}: component {k} (`{want}`): NO \
+                         instruction decoded at 0x{at:x} — bytes {}",
+                        case.desc,
+                        hex_at(&text, *offset, *len)
+                    ));
+                    break;
+                };
+                if canon(dec_text) != canon(want) {
+                    disagreements.push(format!(
+                        "[{family}] off=0x{offset:x} {}: component {k}:\n    intended: {want}\n    \
+                         objdump : '{dec_text}'\n    bytes   : {}",
+                        case.desc,
+                        hex_at(&text, *offset, *len)
+                    ));
+                }
+                at += dec_len;
+            }
+            if at != offset + len {
+                disagreements.push(format!(
+                    "[{family}] off=0x{offset:x} {}: LENGTH drift — the {} expected rows cover \
+                     {} bytes, the encoder emitted {len} — bytes {}",
+                    case.desc,
+                    renderings.len(),
+                    at - offset,
+                    hex_at(&text, *offset, *len)
+                ));
+            }
+            continue;
+        }
         let Some((dec_len, dec_text)) = by_offset.get(offset) else {
             disagreements.push(format!(
                 "[{family}] off=0x{offset:x} {}: NO instruction decoded at this offset \
@@ -593,6 +638,7 @@ fn run_family(
                 let target = (*offset as i64 + *len as i64).wrapping_add(*disp) as u64;
                 vec![canon(&format!("{mnem} 0x{target:x}"))]
             }
+            Expect::Sequence(_) => unreachable!("sequence cases are checked above"),
         };
         if !accepted.contains(&actual) {
             disagreements.push(format!(
@@ -1046,6 +1092,28 @@ fn enc2_family_mov() {
             n64,
         ),
     ];
+    // The zero-extending loads `movzx r32, byte/word ptr [m]`, plain and
+    // volatile: the register operand is passed as a GPR64 and must render as
+    // its 32-bit alias (the encoder emits no REX.W and no forced REX).
+    for (ld, ptr) in [
+        (X86Opcode::MovzxRM8, "byte ptr"),
+        (X86Opcode::MovzxRM16, "word ptr"),
+        (X86Opcode::VolatileMovzxRM8, "byte ptr"),
+        (X86Opcode::VolatileMovzxRM16, "word ptr"),
+    ] {
+        for reg in mem_regs {
+            for base in G64 {
+                for disp in [0i64, 8, -8, 0x100] {
+                    cases.push(Case::fixed(
+                        ld,
+                        X86InstOperands::rm(reg, base, disp),
+                        vec![format!("movzx {}, {ptr} {}", n32(reg), mem(base, disp))],
+                        format!("{ld:?} {},{}", n32(reg), mem(base, disp)),
+                    ));
+                }
+            }
+        }
+    }
     for (ld, st, ptr, name) in ldst {
         for reg in mem_regs {
             for base in G64 {
@@ -1131,6 +1199,20 @@ fn enc2_family_mov() {
             for index in [RCX, R9, R14] {
                 for scale in [1u8, 4] {
                     for disp in [0i64, -8, 0x100] {
+                        cases.push(Case::fixed(
+                            X86Opcode::MovzxRM8Sib,
+                            X86InstOperands::rm_sib(reg, base, index, scale, disp),
+                            vec![format!(
+                                "movzx {}, byte ptr {}",
+                                n32(reg),
+                                mem_sib(base, index, scale, disp)
+                            )],
+                            format!(
+                                "MovzxRM8Sib {},{}",
+                                n32(reg),
+                                mem_sib(base, index, scale, disp)
+                            ),
+                        ));
                         cases.push(Case::fixed(
                             X86Opcode::MovRM8Sib,
                             X86InstOperands::rm_sib(reg, base, index, scale, disp),
@@ -1875,6 +1957,29 @@ fn enc2_family_sync() {
             }
         }
     }
+    // The 128-bit atomic-load pseudo: the four zeroing XORs and
+    // LOCK CMPXCHG16B [base + disp], five objdump rows. No RAX/RBX/RCX/RDX
+    // base: the encoder refuses one.
+    for base in [RSI, RDI, RBP, RSP, R8, R12, R13, R15] {
+        for disp in [0i64, 8, -8, 16, -129] {
+            cases.push(Case::sequence(
+                X86Opcode::AtomicLoadCmpxchg16b,
+                X86InstOperands {
+                    base: Some(base),
+                    disp,
+                    ..X86InstOperands::none()
+                },
+                vec![
+                    "xor eax, eax".to_string(),
+                    "xor edx, edx".to_string(),
+                    "xor ebx, ebx".to_string(),
+                    "xor ecx, ecx".to_string(),
+                    format!("lock cmpxchg16b xmmword ptr {}", mem(base, disp)),
+                ],
+                format!("AtomicLoadCmpxchg16b {}", mem(base, disp)),
+            ));
+        }
+    }
     cases.push(Case::fixed(
         X86Opcode::Mfence,
         X86InstOperands::none(),
@@ -2063,6 +2168,11 @@ fn lane_status(op: X86Opcode) -> LaneStatus {
         | O::Movsx
         | O::MovRMSib
         | O::MovRM8Sib
+        | O::MovzxRM8
+        | O::MovzxRM16
+        | O::MovzxRM8Sib
+        | O::VolatileMovzxRM8
+        | O::VolatileMovzxRM16
         | O::MovsxdRMSib
         | O::MovMRSib
         | O::MovMR8Sib
@@ -2090,7 +2200,13 @@ fn lane_status(op: X86Opcode) -> LaneStatus {
             Covered("bitmanip")
         }
         // sync / misc
-        O::Xchg | O::Cmpxchg | O::Cmpxchg8 | O::Cmpxchg16 | O::Mfence | O::Ud2 => Covered("sync"),
+        O::Xchg
+        | O::Cmpxchg
+        | O::Cmpxchg8
+        | O::Cmpxchg16
+        | O::AtomicLoadCmpxchg16b
+        | O::Mfence
+        | O::Ud2 => Covered("sync"),
 
         // ---- skip-listed with reasons ----
         O::Addsd
@@ -2109,6 +2225,10 @@ fn lane_status(op: X86Opcode) -> LaneStatus {
         | O::Ucomisd
         | O::MovdquRM
         | O::MovdquMR
+        // Scaled-index 128-bit MOVDQU: same SSE_FP follow-up lane as the plain
+        // MovdquRM/MovdquMR forms they extend.
+        | O::MovdquRMSib
+        | O::MovdquMRSib
         | O::Addss
         | O::Subss
         | O::Mulss

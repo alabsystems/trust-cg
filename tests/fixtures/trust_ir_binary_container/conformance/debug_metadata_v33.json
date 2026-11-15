@@ -1,0 +1,164 @@
+{
+  "name": "debug_metadata_v33",
+  "functions": [
+    {
+      "id": 0,
+      "name": "named_increment",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              9,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Const": {
+                  "ty": "I32",
+                  "value": {
+                    "Int": 1
+                  }
+                }
+              },
+              "results": [
+                41
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 2,
+                "col": 8
+              },
+              "proof_context": null,
+              "scope": 1
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "Add",
+                  "ty": "I32",
+                  "lhs": 9,
+                  "rhs": 41
+                }
+              },
+              "results": [
+                42
+              ],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 2,
+                "col": 4
+              },
+              "proof_context": null,
+              "scope": 1
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    42
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": {
+                "file": 0,
+                "line": 3,
+                "col": 0
+              },
+              "proof_context": null,
+              "scope": 0
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": "Trust",
+      "value_names": [
+        [
+          9,
+          "input"
+        ],
+        [
+          42,
+          "incremented, value"
+        ]
+      ],
+      "scopes": [
+        {
+          "parent": null,
+          "span": {
+            "file": 0,
+            "line": 1,
+            "col": 0
+          }
+        },
+        {
+          "parent": 0,
+          "span": {
+            "file": 0,
+            "line": 2,
+            "col": 4
+          }
+        }
+      ],
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [
+    "src/debug.rs"
+  ],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

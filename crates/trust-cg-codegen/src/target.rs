@@ -12,57 +12,15 @@
 
 use std::{error::Error, fmt, str::FromStr};
 
-pub use trust_cg_ir::{
-    AdmittedTargetFeatures, CallingConvention, OutputTargetFeatures, Target, TargetFeature,
-    TargetFeatureSet, TargetFeatureSetError, TargetIdentity, TargetMachine, TargetMachineError,
+use crate::apple_deployment::{
+    AppleDeploymentTargetError, AppleDeploymentTargetSource, AppleOsVersion, MachOBuildVersion,
 };
 
-/// One optional AArch64 instruction-set capability understood by codegen.
-///
-/// The explicit bit assignments are part of the persistent artifact identity;
-/// append new features without renumbering existing ones. `ALL` is kept in
-/// canonical lexical-name order for deterministic manifests and diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum AArch64IsaFeature {
-    /// FEAT_DotProd vector dot-product instructions.
-    DotProd = 1,
-    /// FEAT_FP16 scalar half-precision data-processing instructions.
-    Fp16 = 2,
-    /// FEAT_LSE atomic read-modify-write instructions.
-    Lse = 0,
-}
-
-impl AArch64IsaFeature {
-    /// Complete compiler feature domain in canonical manifest order.
-    pub const ALL: [Self; 3] = [Self::DotProd, Self::Fp16, Self::Lse];
-
-    /// Stable feature name used by target manifests and PGO identities.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::DotProd => "dotprod",
-            Self::Fp16 => "fp16",
-            Self::Lse => "lse",
-        }
-    }
-
-    const fn mask(self) -> u32 {
-        1_u32 << (self as u8)
-    }
-}
-
-impl TargetFeature for AArch64IsaFeature {
-    const ARCHITECTURE: Target = Target::Aarch64;
-    const ALL: &'static [Self] = &AArch64IsaFeature::ALL;
-
-    fn stable_bit(self) -> u64 {
-        u64::from(self.mask())
-    }
-
-    fn name(self) -> &'static str {
-        AArch64IsaFeature::name(self)
-    }
-}
+pub use trust_cg_ir::{
+    AArch64IsaFeature, AdmittedTargetFeatures, CallingConvention, OutputTargetFeatures, Target,
+    TargetFeature, TargetFeatureSet, TargetFeatureSetError, TargetIdentity, TargetMachine,
+    TargetMachineError,
+};
 
 /// Optional RISC-V instruction-set capabilities understood by codegen today.
 ///
@@ -113,7 +71,21 @@ impl AArch64IsaProfile {
     /// Profile admitting LSE and DotProd, but not FP16.
     pub const LSE_DOTPROD: Self = Self::LSE.with_feature(AArch64IsaFeature::DotProd, true);
     /// Capabilities guaranteed by Trust Codegen's Apple arm64 target contract.
-    pub const APPLE_ARM64: Self = Self::LSE_DOTPROD.with_feature(AArch64IsaFeature::Fp16, true);
+    ///
+    /// Includes FEAT_LSE2 (ARMv8.4-A atomicity rules): every Apple arm64 part
+    /// this target contract covers is ARMv8.4-A or later — rustc reports
+    /// `target_feature="lse2"` and `v8.4a` for `aarch64-apple-darwin`, whose
+    /// spec sets `cpu: "apple-m1"`. That guarantee is what lets an aligned
+    /// 128-bit atomic load lower to ONE paired access.
+    ///
+    /// NOTE — this ADMISSION MOVES THIS PROFILE'S IDENTITY: `feature_bits`
+    /// 7 -> 15 and `canonical_name` gains `+lse2`. `feature_bits` is bound into
+    /// cache and provenance identity, so artifacts recorded under the old
+    /// identity are distinct from new ones. The pinned assertions in this file's
+    /// tests exist to make exactly that visible, and are updated with it.
+    pub const APPLE_ARM64: Self = Self::LSE_DOTPROD
+        .with_feature(AArch64IsaFeature::Fp16, true)
+        .with_feature(AArch64IsaFeature::Lse2, true);
 
     /// Return a copy with one optional capability admitted or removed.
     pub const fn with_feature(mut self, feature: AArch64IsaFeature, enabled: bool) -> Self {
@@ -141,6 +113,15 @@ impl AArch64IsaProfile {
         self.permits(AArch64IsaFeature::Lse)
     }
 
+    /// Whether this profile authorizes the FEAT_LSE2 atomicity rules — i.e.
+    /// whether an ALIGNED `LDP`/`STP` may be relied on as SINGLE-COPY ATOMIC.
+    ///
+    /// Distinct from [`Self::permits_lse`]: that is the ARMv8.1-A RMW
+    /// instruction set, this is the ARMv8.4-A atomicity guarantee.
+    pub const fn permits_lse2(self) -> bool {
+        self.permits(AArch64IsaFeature::Lse2)
+    }
+
     /// Whether this profile authorizes FEAT_DotProd instructions.
     pub const fn permits_dotprod(self) -> bool {
         self.permits(AArch64IsaFeature::DotProd)
@@ -162,12 +143,13 @@ impl AArch64IsaProfile {
 
     /// Convert this compatibility profile into the shared typed admission set.
     pub fn admitted_target_features(self) -> AdmittedTargetFeatures<AArch64IsaFeature> {
-        AdmittedTargetFeatures::try_from_features(
-            AArch64IsaFeature::ALL
-                .into_iter()
-                .filter(move |feature| self.permits(*feature)),
-        )
-        .expect("the static AArch64 target-feature domain must remain valid")
+        AArch64IsaFeature::ALL
+            .into_iter()
+            .filter(move |feature| self.permits(*feature))
+            .fold(
+                AdmittedTargetFeatures::NONE,
+                AdmittedTargetFeatures::with_aarch64_feature,
+            )
     }
 
     /// Reconstruct the compatibility profile from shared typed admission.
@@ -201,6 +183,7 @@ impl AArch64IsaProfile {
             host_has_aarch64_lse(),
             host_has_aarch64_dotprod(),
             host_has_aarch64_fp16(),
+            host_has_aarch64_lse2(),
         )
     }
 
@@ -221,12 +204,32 @@ impl AArch64IsaProfile {
         }
     }
 
-    /// Whether the current process can execute code requiring this profile.
+    /// Whether the current process can execute code requiring this profile:
+    /// every admitted feature is one the executing CPU implements
+    /// ([`crate::aarch64_dispatch::aarch64_host_features`]).
     pub fn is_supported_by_host(self) -> bool {
         cfg!(target_arch = "aarch64")
-            && (!self.permits_lse() || host_has_aarch64_lse())
-            && (!self.permits_dotprod() || host_has_aarch64_dotprod())
-            && (!self.permits_fp16() || host_has_aarch64_fp16())
+            && crate::aarch64_dispatch::aarch64_host_features()
+                .implements_all(self.admitted_target_features().as_set())
+    }
+
+    /// The features a function's own target-feature attribute may add to the
+    /// profile of `target`: every modeled feature for an AArch64 identity,
+    /// nothing for another architecture.
+    ///
+    /// A per-function feature is the producer's run-time contract (the caller
+    /// dispatches on the executing CPU, as rustc's `#[target_feature]`
+    /// requires), so the ceiling is what the architecture can have, not what a
+    /// deployment guarantees. An in-process JIT additionally refuses, at
+    /// install, a function whose features the executing CPU lacks.
+    pub const fn function_feature_ceiling(
+        target: TargetSpec,
+    ) -> AdmittedTargetFeatures<AArch64IsaFeature> {
+        if matches!(target.architecture, Target::Aarch64) {
+            AdmittedTargetFeatures::ALL_AARCH64
+        } else {
+            AdmittedTargetFeatures::NONE
+        }
     }
 }
 
@@ -253,6 +256,72 @@ impl fmt::Debug for AArch64IsaProfile {
 impl fmt::Display for AArch64IsaProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.canonical_name())
+    }
+}
+
+/// Why an explicit AArch64 feature list did not name a profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AArch64IsaProfileParseError {
+    /// A list entry names no [`AArch64IsaFeature`].
+    UnknownFeature(String),
+    /// A feature appears twice.
+    DuplicateFeature(&'static str),
+    /// The list has an empty entry (`"fp16,,lse"`, or an empty string, which
+    /// must be spelled `none`).
+    EmptyEntry,
+}
+
+impl fmt::Display for AArch64IsaProfileParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let known = AArch64IsaFeature::ALL
+            .map(AArch64IsaFeature::name)
+            .join(", ");
+        match self {
+            Self::UnknownFeature(name) => write!(
+                f,
+                "unknown AArch64 ISA feature `{name}` (known: {known}; `none` for the baseline)"
+            ),
+            Self::DuplicateFeature(name) => {
+                write!(f, "AArch64 ISA feature `{name}` is listed twice")
+            }
+            Self::EmptyEntry => write!(
+                f,
+                "empty AArch64 ISA feature entry (spell the baseline profile `none`)"
+            ),
+        }
+    }
+}
+
+impl Error for AArch64IsaProfileParseError {}
+
+impl FromStr for AArch64IsaProfile {
+    type Err = AArch64IsaProfileParseError;
+
+    /// Parse an explicit profile as a comma-separated list of exactly the
+    /// admitted feature names (`fp16`, `lse,dotprod`), or `none` for the
+    /// baseline. The list is the whole admission, never added to a target
+    /// contract.
+    fn from_str(list: &str) -> Result<Self, Self::Err> {
+        if list == "none" {
+            return Ok(Self::BASELINE);
+        }
+        let mut profile = Self::BASELINE;
+        for entry in list.split(',') {
+            if entry.is_empty() {
+                return Err(AArch64IsaProfileParseError::EmptyEntry);
+            }
+            let feature = AArch64IsaFeature::ALL
+                .into_iter()
+                .find(|feature| feature.name() == entry)
+                .ok_or_else(|| AArch64IsaProfileParseError::UnknownFeature(entry.to_owned()))?;
+            if profile.permits(feature) {
+                return Err(AArch64IsaProfileParseError::DuplicateFeature(
+                    feature.name(),
+                ));
+            }
+            profile = profile.with_feature(feature, true);
+        }
+        Ok(profile)
     }
 }
 
@@ -283,6 +352,24 @@ pub fn host_has_aarch64_dotprod() -> bool {
     }
 }
 
+/// Runtime admission check for AArch64 FEAT_LSE2 on the current host.
+///
+/// LSE2 is what makes a 16-byte-aligned `LDP`/`STP` single-copy atomic, so the
+/// 128-bit atomic lowering is gated on it. It must be OBSERVED, never inferred
+/// from the presence of LSE: FEAT_LSE is ARMv8.1 (the RMW instructions) and
+/// FEAT_LSE2 is ARMv8.4 (the atomicity rules), and a CPU can have the first
+/// without the second.
+pub fn host_has_aarch64_lse2() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("lse2")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
 /// Runtime admission check for AArch64 FEAT_FP16 scalar data processing.
 pub fn host_has_aarch64_fp16() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -300,6 +387,7 @@ const fn resolve_aarch64_host_jit_profile(
     host_has_lse: bool,
     host_has_dotprod: bool,
     host_has_fp16: bool,
+    host_has_lse2: bool,
 ) -> AArch64IsaProfile {
     if !host_is_aarch64 {
         return AArch64IsaProfile::BASELINE;
@@ -308,6 +396,7 @@ const fn resolve_aarch64_host_jit_profile(
         .with_feature(AArch64IsaFeature::Lse, host_has_lse)
         .with_feature(AArch64IsaFeature::DotProd, host_has_dotprod)
         .with_feature(AArch64IsaFeature::Fp16, host_has_fp16)
+        .with_feature(AArch64IsaFeature::Lse2, host_has_lse2)
 }
 
 /// Target triple vendor component for targets Trust Codegen understands today.
@@ -411,6 +500,13 @@ pub struct TargetSpec {
     /// were explicitly supplied by the caller. This is authority metadata:
     /// only aliases may inherit the host OS/ABI compatibility default.
     origin: TargetSpecOrigin,
+    /// macOS deployment target (the minimum OS every Mach-O object for this
+    /// target records), from the triple's OS version (`macos12.0`) or
+    /// attached by a driver from `MACOSX_DEPLOYMENT_TARGET`. `None` on every
+    /// non-Apple target and when neither was given; Mach-O emission then
+    /// records [`AppleOsVersion::DEFAULT_MACOS_MINIMUM`]. Part of the spec's
+    /// identity: it renders into [`Self::triple`] and the compile policy.
+    apple_deployment_target: Option<AppleOsVersion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -433,6 +529,7 @@ impl TargetSpec {
             operating_system,
             environment,
             origin: TargetSpecOrigin::ExplicitComponents,
+            apple_deployment_target: None,
         }
     }
 
@@ -444,6 +541,7 @@ impl TargetSpec {
             operating_system: TargetOperatingSystem::Unknown,
             environment: TargetEnvironment::Unknown,
             origin: TargetSpecOrigin::ArchitectureAlias,
+            apple_deployment_target: None,
         }
     }
 
@@ -492,12 +590,27 @@ impl TargetSpec {
     }
 
     /// Applies Trust Codegen compatibility defaults when OS/ABI was not explicit.
+    ///
+    /// A macOS deployment target attached to an architecture alias (see
+    /// [`Self::with_apple_deployment_target`]) carries over to the resolved
+    /// spec when that spec is Apple Darwin.
     pub fn with_default_os_abi(self) -> Self {
         if self.has_explicit_os_abi() {
-            self
-        } else {
-            Self::default_for_architecture(self.architecture)
+            return self;
         }
+        let resolved = Self::default_for_architecture(self.architecture);
+        if resolved.is_apple_darwin() {
+            Self {
+                apple_deployment_target: self.apple_deployment_target,
+                ..resolved
+            }
+        } else {
+            resolved
+        }
+    }
+
+    fn is_apple_darwin(self) -> bool {
+        self.operating_system == TargetOperatingSystem::Darwin && self.vendor == TargetVendor::Apple
     }
 
     /// Whether the caller provided OS/ABI/vendor information beyond an arch alias.
@@ -505,11 +618,87 @@ impl TargetSpec {
         self.origin == TargetSpecOrigin::ExplicitComponents
     }
 
+    /// macOS deployment target this spec carries, if any (see the field).
+    pub const fn apple_deployment_target(self) -> Option<AppleOsVersion> {
+        self.apple_deployment_target
+    }
+
+    /// Attach a macOS deployment target to a spec that resolves to Apple
+    /// Darwin: an explicit Apple triple, or an architecture alias whose
+    /// compatibility default is the Apple host (the alias keeps its
+    /// host-derived origin).
+    ///
+    /// Refused for any other target, and for a version older than the
+    /// architecture's first macOS release (`[TCG-MACHO-DEPLOYMENT]`). The
+    /// version becomes part of the spec's identity and canonical triple
+    /// (`aarch64-apple-macos12.0`).
+    pub fn with_apple_deployment_target(
+        self,
+        version: AppleOsVersion,
+        origin: AppleDeploymentTargetSource,
+    ) -> Result<Self, AppleDeploymentTargetError> {
+        let resolved = self.with_default_os_abi();
+        if !resolved.is_apple_darwin() {
+            return Err(AppleDeploymentTargetError::NotAnAppleTarget {
+                triple: resolved.triple(),
+            });
+        }
+        MachOBuildVersion::macos(self.architecture.name(), version, origin)?;
+        Ok(Self {
+            apple_deployment_target: Some(version),
+            ..self
+        })
+    }
+
+    /// Capture `MACOSX_DEPLOYMENT_TARGET` into an Apple spec that names no
+    /// deployment target, the way Apple's compiler drivers do.
+    ///
+    /// Returns the spec unchanged when it is not an Apple Darwin spec, when
+    /// its triple already names a version (the explicit triple wins, as in
+    /// clang) or when the variable is unset. A set value that is malformed or
+    /// below the architecture floor is refused, never replaced by the
+    /// default. Drivers call this once at their boundary; the compiler
+    /// library never reads the process environment for it.
+    pub fn with_macos_deployment_target_from_environment(
+        self,
+    ) -> Result<Self, AppleDeploymentTargetError> {
+        if !self.with_default_os_abi().is_apple_darwin() || self.apple_deployment_target.is_some() {
+            return Ok(self);
+        }
+        match crate::apple_deployment::capture_macosx_deployment_target()? {
+            Some(version) => {
+                self.with_apple_deployment_target(version, AppleDeploymentTargetSource::Environment)
+            }
+            None => Ok(self),
+        }
+    }
+
+    /// This spec without its macOS deployment target.
+    ///
+    /// For comparisons that concern only architecture, OS and ABI -- a
+    /// host-JIT admission check, for example -- where the Mach-O minimum OS
+    /// of an object never emitted does not apply.
+    pub const fn without_apple_deployment_target(self) -> Self {
+        Self {
+            apple_deployment_target: None,
+            ..self
+        }
+    }
+
     /// Canonical target triple for this spec.
+    ///
+    /// An Apple spec with a deployment target spells its OS as
+    /// `macos<version>`, so the triple round-trips through [`Self::parse`]
+    /// and every triple-keyed identity binds the version.
     pub fn triple(self) -> String {
         let arch = self.architecture.name();
         let vendor = self.vendor.triple_component();
-        let os = self.operating_system.triple_component();
+        let os = match self.apple_deployment_target {
+            Some(version) if self.operating_system == TargetOperatingSystem::Darwin => {
+                format!("macos{version}")
+            }
+            _ => self.operating_system.triple_component().to_owned(),
+        };
         let env = self.environment.triple_component();
 
         if self.environment == TargetEnvironment::Unknown {
@@ -602,6 +791,9 @@ pub enum TargetSpecParseErrorKind {
     UnsupportedEnvironment,
     /// The individual triple components are known, but the combination is unsupported.
     UnsupportedTargetCombination,
+    /// The operating-system version component is malformed or predates the
+    /// architecture's first release on that OS.
+    InvalidOperatingSystemVersion,
 }
 
 /// Error returned when parsing a target spec fails.
@@ -641,7 +833,8 @@ impl fmt::Display for TargetSpecParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self.kind {
             TargetSpecParseErrorKind::UnsupportedX86ThirtyTwo
-            | TargetSpecParseErrorKind::UnsupportedTargetCombination => "unsupported target",
+            | TargetSpecParseErrorKind::UnsupportedTargetCombination
+            | TargetSpecParseErrorKind::InvalidOperatingSystemVersion => "unsupported target",
             TargetSpecParseErrorKind::Empty
             | TargetSpecParseErrorKind::InvalidShape
             | TargetSpecParseErrorKind::UnsupportedArchitecture
@@ -705,7 +898,7 @@ impl FromStr for TargetSpec {
 
         let architecture = parse_target_architecture(parts[0], input)?;
         let vendor = parse_target_vendor(parts[1], input)?;
-        let operating_system = parse_target_operating_system(parts[2], input)?;
+        let (operating_system, os_version) = parse_target_operating_system(parts[2], input)?;
         let environment = if parts.len() == 4 {
             parse_target_environment(parts[3], input)?
         } else {
@@ -713,7 +906,19 @@ impl FromStr for TargetSpec {
         };
         let spec = Self::new(architecture, vendor, operating_system, environment);
         validate_target_spec(spec, input)?;
-        Ok(spec)
+        match os_version {
+            None => Ok(spec),
+            Some(version) => spec
+                .with_apple_deployment_target(version, AppleDeploymentTargetSource::TargetTriple)
+                .map_err(|_| {
+                    TargetSpecParseError::new(
+                        input,
+                        TargetSpecParseErrorKind::InvalidOperatingSystemVersion,
+                        "the macOS version predates the architecture's first macOS release \
+                         (arm64 requires 11.0 or later)",
+                    )
+                }),
+        }
     }
 }
 
@@ -754,21 +959,51 @@ fn parse_target_vendor(component: &str, input: &str) -> Result<TargetVendor, Tar
     }
 }
 
+/// The OS component and, for `macos<version>`/`macosx<version>`, its
+/// deployment-target version.
 fn parse_target_operating_system(
     component: &str,
     input: &str,
-) -> Result<TargetOperatingSystem, TargetSpecParseError> {
+) -> Result<(TargetOperatingSystem, Option<AppleOsVersion>), TargetSpecParseError> {
     match component {
-        "unknown" => Ok(TargetOperatingSystem::Unknown),
-        "linux" => Ok(TargetOperatingSystem::Linux),
-        "darwin" | "macos" => Ok(TargetOperatingSystem::Darwin),
-        "windows" => Ok(TargetOperatingSystem::Windows),
-        _ => Err(TargetSpecParseError::new(
+        "unknown" => return Ok((TargetOperatingSystem::Unknown, None)),
+        "linux" => return Ok((TargetOperatingSystem::Linux, None)),
+        "darwin" | "macos" | "macosx" => return Ok((TargetOperatingSystem::Darwin, None)),
+        "windows" => return Ok((TargetOperatingSystem::Windows, None)),
+        _ => {}
+    }
+    if let Some(version) = component
+        .strip_prefix("macosx")
+        .or_else(|| component.strip_prefix("macos"))
+    {
+        return AppleOsVersion::parse(version)
+            .map(|version| (TargetOperatingSystem::Darwin, Some(version)))
+            .map_err(|_| {
+                TargetSpecParseError::new(
+                    input,
+                    TargetSpecParseErrorKind::InvalidOperatingSystemVersion,
+                    "malformed macOS version; expected macos<major>[.<minor>[.<patch>]] with \
+                     decimal components",
+                )
+            });
+    }
+    if component
+        .strip_prefix("darwin")
+        .is_some_and(|version| !version.is_empty())
+    {
+        return Err(TargetSpecParseError::new(
             input,
             TargetSpecParseErrorKind::UnsupportedOperatingSystem,
-            "unsupported operating system; supported OS values are unknown, linux, darwin, windows",
-        )),
+            "a Darwin kernel version is not mapped to a macOS deployment target; spell the \
+             target as <arch>-apple-macos<version>",
+        ));
     }
+    Err(TargetSpecParseError::new(
+        input,
+        TargetSpecParseErrorKind::UnsupportedOperatingSystem,
+        "unsupported operating system; supported OS values are unknown, linux, darwin, \
+         macos[<version>], windows",
+    ))
 }
 
 fn parse_target_environment(
@@ -856,7 +1091,253 @@ fn validate_target_spec(spec: TargetSpec, input: &str) -> Result<(), TargetSpecP
 
 #[cfg(test)]
 mod tests {
+    use crate::apple_deployment::{
+        AppleDeploymentTargetError, AppleDeploymentTargetSource, AppleOsVersion,
+        MACOSX_DEPLOYMENT_TARGET,
+    };
+
+    #[test]
+    fn versioned_macos_triples_round_trip_with_their_deployment_target() {
+        for (input, canonical, version) in [
+            (
+                "aarch64-apple-macos12.0",
+                "aarch64-apple-macos12.0",
+                AppleOsVersion::new(12, 0, 0),
+            ),
+            (
+                "arm64-apple-macosx13.3.1",
+                "aarch64-apple-macos13.3.1",
+                AppleOsVersion::new(13, 3, 1),
+            ),
+            (
+                "aarch64-apple-macos15",
+                "aarch64-apple-macos15.0",
+                AppleOsVersion::new(15, 0, 0),
+            ),
+            (
+                "x86_64-apple-macos10.15",
+                "x86_64-apple-macos10.15",
+                AppleOsVersion::new(10, 15, 0),
+            ),
+        ] {
+            let spec = TargetSpec::parse(input).unwrap();
+            assert_eq!(
+                spec.operating_system,
+                TargetOperatingSystem::Darwin,
+                "{input}"
+            );
+            assert_eq!(spec.vendor, TargetVendor::Apple, "{input}");
+            assert_eq!(spec.apple_deployment_target(), Some(version), "{input}");
+            assert_eq!(spec.triple(), canonical, "{input}");
+            assert_eq!(TargetSpec::parse(&spec.triple()).unwrap(), spec, "{input}");
+            assert!(spec.has_explicit_os_abi());
+            assert_ne!(spec, spec.without_apple_deployment_target());
+        }
+        for unversioned in [
+            "aarch64-apple-darwin",
+            "aarch64-apple-macos",
+            "arm64-apple-macosx",
+        ] {
+            let spec = TargetSpec::parse(unversioned).unwrap();
+            assert_eq!(spec.apple_deployment_target(), None, "{unversioned}");
+            assert_eq!(spec.triple(), "aarch64-apple-darwin");
+        }
+    }
+
+    #[test]
+    fn malformed_or_unmodeled_macos_versions_are_refused() {
+        for (input, kind) in [
+            (
+                "aarch64-apple-macos14..0",
+                TargetSpecParseErrorKind::InvalidOperatingSystemVersion,
+            ),
+            (
+                "aarch64-apple-macos1x",
+                TargetSpecParseErrorKind::InvalidOperatingSystemVersion,
+            ),
+            (
+                "aarch64-apple-macos0",
+                TargetSpecParseErrorKind::InvalidOperatingSystemVersion,
+            ),
+            (
+                "aarch64-apple-macos14.256",
+                TargetSpecParseErrorKind::InvalidOperatingSystemVersion,
+            ),
+            (
+                "aarch64-apple-macos10.15",
+                TargetSpecParseErrorKind::InvalidOperatingSystemVersion,
+            ),
+            (
+                "aarch64-apple-darwin23",
+                TargetSpecParseErrorKind::UnsupportedOperatingSystem,
+            ),
+            (
+                "aarch64-apple-darwin23.1.0",
+                TargetSpecParseErrorKind::UnsupportedOperatingSystem,
+            ),
+            (
+                "aarch64-apple-ios17.0",
+                TargetSpecParseErrorKind::UnsupportedOperatingSystem,
+            ),
+            (
+                "aarch64-unknown-macos12.0",
+                TargetSpecParseErrorKind::UnsupportedTargetCombination,
+            ),
+        ] {
+            let error = TargetSpec::parse(input).unwrap_err();
+            assert_eq!(error.kind(), kind, "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn deployment_targets_attach_only_to_apple_specs() {
+        let linux = TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap();
+        assert!(matches!(
+            linux.with_apple_deployment_target(
+                AppleOsVersion::new(12, 0, 0),
+                AppleDeploymentTargetSource::Environment,
+            ),
+            Err(AppleDeploymentTargetError::NotAnAppleTarget { .. })
+        ));
+        let darwin = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        assert!(matches!(
+            darwin.with_apple_deployment_target(
+                AppleOsVersion::new(10, 15, 0),
+                AppleDeploymentTargetSource::Environment,
+            ),
+            Err(AppleDeploymentTargetError::BelowArchitectureFloor { .. })
+        ));
+        let twelve = darwin
+            .with_apple_deployment_target(
+                AppleOsVersion::new(12, 0, 0),
+                AppleDeploymentTargetSource::Environment,
+            )
+            .unwrap();
+        assert_eq!(
+            twelve,
+            TargetSpec::parse("aarch64-apple-macos12.0").unwrap()
+        );
+    }
+
+    #[test]
+    fn environment_capture_is_explicit_and_refuses_malformed_values() {
+        let darwin = TargetSpec::parse("aarch64-apple-darwin").unwrap();
+        let linux = TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap();
+        let versioned = TargetSpec::parse("aarch64-apple-macos13.0").unwrap();
+        trust_cg_process_env::with_env_overrides(&[(MACOSX_DEPLOYMENT_TARGET, "12.4")], || {
+            let captured = darwin
+                .with_macos_deployment_target_from_environment()
+                .unwrap();
+            assert_eq!(
+                captured.apple_deployment_target(),
+                Some(AppleOsVersion::new(12, 4, 0))
+            );
+            assert_eq!(captured.triple(), "aarch64-apple-macos12.4");
+            // The explicit triple version wins; a non-Apple target is untouched.
+            assert_eq!(
+                versioned
+                    .with_macos_deployment_target_from_environment()
+                    .unwrap(),
+                versioned
+            );
+            assert_eq!(
+                linux
+                    .with_macos_deployment_target_from_environment()
+                    .unwrap(),
+                linux
+            );
+        });
+        for malformed in ["", "12.", "twelve", "10.15"] {
+            trust_cg_process_env::with_env_overrides(
+                &[(MACOSX_DEPLOYMENT_TARGET, malformed)],
+                || {
+                    assert!(
+                        darwin
+                            .with_macos_deployment_target_from_environment()
+                            .is_err(),
+                        "{malformed:?} must be refused"
+                    );
+                },
+            );
+        }
+        trust_cg_process_env::with_env_overrides_removed(&[MACOSX_DEPLOYMENT_TARGET], || {
+            assert_eq!(
+                darwin
+                    .with_macos_deployment_target_from_environment()
+                    .unwrap(),
+                darwin
+            );
+        });
+    }
+
+    /// An architecture alias resolved to the Apple host keeps its host-derived
+    /// origin and carries the captured version through the default.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn alias_capture_carries_the_version_to_the_resolved_host_spec() {
+        let alias = TargetSpec::parse("aarch64").unwrap();
+        trust_cg_process_env::with_env_overrides(&[(MACOSX_DEPLOYMENT_TARGET, "13.1")], || {
+            let captured = alias
+                .with_macos_deployment_target_from_environment()
+                .unwrap();
+            assert!(!captured.has_explicit_os_abi());
+            let resolved = captured.with_default_os_abi();
+            assert_eq!(resolved.triple(), "aarch64-apple-macos13.1");
+            assert_eq!(
+                resolved.apple_deployment_target(),
+                Some(AppleOsVersion::new(13, 1, 0))
+            );
+        });
+    }
     use super::*;
+
+    /// An explicit feature list names exactly its profile; `none` is the
+    /// baseline; unknown, duplicate and empty entries are refused by name.
+    #[test]
+    fn explicit_isa_feature_lists_parse_exactly() {
+        let parse = |list: &str| list.parse::<AArch64IsaProfile>();
+        assert_eq!(parse("none"), Ok(AArch64IsaProfile::BASELINE));
+        assert_eq!(parse("fp16"), Ok(AArch64IsaProfile::FP16));
+        assert_eq!(parse("lse"), Ok(AArch64IsaProfile::LSE));
+        // `APPLE_ARM64` admits FEAT_LSE2 (see its doc), so its explicit list
+        // names `lse2`; the same three without it are LSE_DOTPROD plus FP16.
+        assert_eq!(
+            parse("fp16,lse,lse2,dotprod"),
+            Ok(AArch64IsaProfile::APPLE_ARM64)
+        );
+        assert_ne!(
+            parse("fp16,lse,dotprod"),
+            Ok(AArch64IsaProfile::APPLE_ARM64)
+        );
+        for profile in [
+            AArch64IsaProfile::BASELINE,
+            AArch64IsaProfile::FP16,
+            AArch64IsaProfile::LSE_DOTPROD,
+            AArch64IsaProfile::APPLE_ARM64,
+        ] {
+            let names: Vec<_> = profile.enabled_feature_names().collect();
+            let list = if names.is_empty() {
+                "none".to_owned()
+            } else {
+                names.join(",")
+            };
+            assert_eq!(parse(&list), Ok(profile), "{list}");
+        }
+        assert_eq!(
+            parse("fp17"),
+            Err(AArch64IsaProfileParseError::UnknownFeature("fp17".into()))
+        );
+        assert_eq!(
+            parse("fp16,fp16"),
+            Err(AArch64IsaProfileParseError::DuplicateFeature("fp16"))
+        );
+        assert_eq!(parse(""), Err(AArch64IsaProfileParseError::EmptyEntry));
+        assert_eq!(
+            parse("lse,,fp16"),
+            Err(AArch64IsaProfileParseError::EmptyEntry)
+        );
+        assert!(parse("FP16").is_err(), "feature names are exact");
+    }
 
     #[test]
     fn test_target_names() {
@@ -1004,7 +1485,9 @@ mod tests {
         assert_eq!(AArch64IsaProfile::DOTPROD.feature_bits(), 2);
         assert_eq!(AArch64IsaProfile::FP16.feature_bits(), 4);
         assert_eq!(AArch64IsaProfile::LSE_DOTPROD.feature_bits(), 3);
-        assert_eq!(AArch64IsaProfile::APPLE_ARM64.feature_bits(), 7);
+        // 15 = LSE|DotProd|FP16|LSE2. Was 7 before LSE2 was admitted; this pin is
+        // what makes that identity move deliberate rather than silent.
+        assert_eq!(AArch64IsaProfile::APPLE_ARM64.feature_bits(), 15);
         assert_eq!(
             AArch64IsaProfile::BASELINE.canonical_name(),
             "aarch64-isa-v1"
@@ -1015,7 +1498,7 @@ mod tests {
         );
         assert_eq!(
             AArch64IsaProfile::APPLE_ARM64.canonical_name(),
-            "aarch64-isa-v1+dotprod+fp16+lse"
+            "aarch64-isa-v1+dotprod+fp16+lse+lse2"
         );
         assert!(!AArch64IsaProfile::BASELINE.permits_lse());
         assert!(AArch64IsaProfile::LSE.permits_lse());
@@ -1026,7 +1509,7 @@ mod tests {
             AArch64IsaProfile::APPLE_ARM64
                 .enabled_feature_names()
                 .collect::<Vec<_>>(),
-            vec!["dotprod", "fp16", "lse"]
+            vec!["dotprod", "fp16", "lse", "lse2"]
         );
     }
 
@@ -1111,34 +1594,44 @@ mod tests {
     #[test]
     fn aarch64_host_profile_never_invents_features() {
         assert_eq!(
-            resolve_aarch64_host_jit_profile(false, false, false, false),
+            resolve_aarch64_host_jit_profile(false, false, false, false, false),
             AArch64IsaProfile::BASELINE
         );
         assert_eq!(
-            resolve_aarch64_host_jit_profile(false, true, true, true),
+            resolve_aarch64_host_jit_profile(false, true, true, true, true),
             AArch64IsaProfile::BASELINE,
             "feature observations cannot authorize AArch64 code on a non-AArch64 host"
         );
         assert_eq!(
-            resolve_aarch64_host_jit_profile(true, false, false, false),
+            resolve_aarch64_host_jit_profile(true, false, false, false, false),
             AArch64IsaProfile::BASELINE
         );
         assert_eq!(
-            resolve_aarch64_host_jit_profile(true, true, false, false),
+            resolve_aarch64_host_jit_profile(true, true, false, false, false),
             AArch64IsaProfile::LSE
         );
         assert_eq!(
-            resolve_aarch64_host_jit_profile(true, false, true, false),
+            resolve_aarch64_host_jit_profile(true, false, true, false, false),
             AArch64IsaProfile::DOTPROD
         );
         assert_eq!(
-            resolve_aarch64_host_jit_profile(true, true, true, false),
+            resolve_aarch64_host_jit_profile(true, true, true, false, false),
             AArch64IsaProfile::LSE_DOTPROD
         );
         assert_eq!(
-            resolve_aarch64_host_jit_profile(true, true, true, true),
+            resolve_aarch64_host_jit_profile(true, true, true, true, true),
             AArch64IsaProfile::APPLE_ARM64
         );
+        // LSE without LSE2 is a REAL configuration (FEAT_LSE is ARMv8.1, FEAT_LSE2
+        // is ARMv8.4), and the profile must not promote one to the other: with
+        // lse2 unobserved the result is NOT APPLE_ARM64, so the 128-bit atomic
+        // lowering stays unadmitted on such a host.
+        assert_ne!(
+            resolve_aarch64_host_jit_profile(true, true, true, true, false),
+            AArch64IsaProfile::APPLE_ARM64,
+            "an unobserved FEAT_LSE2 must never be invented from FEAT_LSE"
+        );
+        assert!(!resolve_aarch64_host_jit_profile(true, true, true, true, false).permits_lse2());
     }
 
     #[test]
@@ -1151,6 +1644,7 @@ mod tests {
                 host_has_aarch64_lse(),
                 host_has_aarch64_dotprod(),
                 host_has_aarch64_fp16(),
+                host_has_aarch64_lse2(),
             )
         );
         assert!(!cfg!(target_arch = "aarch64") || profile.is_supported_by_host());

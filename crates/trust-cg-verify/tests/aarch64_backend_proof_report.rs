@@ -89,8 +89,12 @@ fn report_has_required_schema_target_policy_and_row_counts() {
     // scheduler (6), addr_mode (8), frame (12), call_lowering (98), regalloc (12).
     // call_lowering = 5 structural + 2 memory-model aggregate placement proofs
     // (scalar-pair eightbyte + 4xF32 HFA lane) = 7.
+    // atomic = 36 + 4 added by the 2026-09-14 integration lane:
+    // `proof_swp_updates_mem_i64` (in the RMW family),
+    // `proof_atomic_load_single_copy_i128`, and the two load-ordering barriers
+    // `proof_dmb_ish_orders_loads` / `proof_dmb_ishld_orders_loads` = 40.
     assert_eq!(ldp_count, 3);
-    assert_eq!(atomic_count, 36);
+    assert_eq!(atomic_count, 40);
     assert_eq!(scheduler_count, 24);
     assert_eq!(switch_count, 9);
     assert_eq!(addr_mode_count, 10);

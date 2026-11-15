@@ -1,0 +1,139 @@
+; TrustIr text format v1
+module "ty_primitives"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+
+functy.0 = (i8) -> (i8)
+
+functy.1 = (i16) -> (i16)
+
+functy.2 = (i32) -> (i32)
+
+functy.3 = (i64) -> (i64)
+
+functy.4 = (i128) -> (i128)
+
+functy.5 = (u8) -> (u8)
+
+functy.6 = (u16) -> (u16)
+
+functy.7 = (u32) -> (u32)
+
+functy.8 = (u64) -> (u64)
+
+functy.9 = (u128) -> (u128)
+
+functy.10 = (f16) -> (f16)
+
+functy.11 = (f32) -> (f32)
+
+functy.12 = (f64) -> (f64)
+
+functy.13 = (bool) -> (bool)
+
+functy.14 = (ptr) -> (ptr)
+
+functy.15 = () -> (())
+
+functy.16 = () -> (!)
+
+fn @i8_id(functy.0) {
+bb0(%0: i8):
+    ret %0
+}
+
+fn @i16_id(functy.1) {
+bb0(%0: i16):
+    ret %0
+}
+
+fn @i32_id(functy.2) {
+bb0(%0: i32):
+    ret %0
+}
+
+fn @i64_id(functy.3) {
+bb0(%0: i64):
+    ret %0
+}
+
+fn @i128_id(functy.4) {
+bb0(%0: i128):
+    ret %0
+}
+
+fn @u8_id(functy.5) {
+bb0(%0: u8):
+    %1 = const u8 0
+    %2 = add u8 %0, %1
+    ret %2
+}
+
+fn @u16_id(functy.6) {
+bb0(%0: u16):
+    %1 = const u16 0
+    %2 = add u16 %0, %1
+    ret %2
+}
+
+fn @u32_id(functy.7) {
+bb0(%0: u32):
+    %1 = const u32 0
+    %2 = add u32 %0, %1
+    ret %2
+}
+
+fn @u64_id(functy.8) {
+bb0(%0: u64):
+    %1 = const u64 0
+    %2 = add u64 %0, %1
+    ret %2
+}
+
+fn @u128_id(functy.9) {
+bb0(%0: u128):
+    %1 = const u128 0
+    %2 = add u128 %0, %1
+    ret %2
+}
+
+fn @f16_id(functy.10) {
+bb0(%0: f16):
+    %1 = const f16 0.0
+    %2 = fadd f16 %0, %1
+    ret %2
+}
+
+fn @f32_id(functy.11) {
+bb0(%0: f32):
+    %1 = const f32 0.0
+    %2 = fadd f32 %0, %1
+    ret %2
+}
+
+fn @f64_id(functy.12) {
+bb0(%0: f64):
+    %1 = const f64 0.0
+    %2 = fadd f64 %0, %1
+    ret %2
+}
+
+fn @bool_id(functy.13) {
+bb0(%0: bool):
+    ret %0
+}
+
+fn @ptr_id(functy.14) {
+bb0(%0: ptr):
+    ret %0
+}
+
+fn @unit_value(functy.15) {
+bb0:
+    %0 = undef ()
+    ret %0
+}
+
+fn @diverge(functy.16) {
+bb0:
+    unreachable
+}

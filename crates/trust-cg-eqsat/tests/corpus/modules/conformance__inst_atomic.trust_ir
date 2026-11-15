@@ -1,0 +1,34 @@
+; TrustIr text format v1
+module "inst_atomic"
+
+functy.0 = (ptr, i64) -> (i64)
+
+fn @atomic_ops(functy.0) {
+bb0(%0: ptr, %1: i64):
+    fence relaxed
+    fence acquire
+    fence release
+    fence acq_rel
+    fence seq_cst
+    %2 = atomic_load relaxed i64, ptr %0
+    %3 = atomic_load acquire i64, ptr %0
+    %4 = atomic_load seq_cst i64, ptr %0
+    atomic_store relaxed i64 %1, ptr %0
+    atomic_store release i64 %1, ptr %0
+    atomic_store seq_cst i64 %1, ptr %0
+    %5 = atomicrmw xchg seq_cst i64 ptr %0, %1
+    %6 = atomicrmw add seq_cst i64 ptr %0, %1
+    %7 = atomicrmw sub seq_cst i64 ptr %0, %1
+    %8 = atomicrmw and seq_cst i64 ptr %0, %1
+    %9 = atomicrmw or seq_cst i64 ptr %0, %1
+    %10 = atomicrmw xor seq_cst i64 ptr %0, %1
+    %11 = atomicrmw max seq_cst i64 ptr %0, %1
+    %12 = atomicrmw min seq_cst i64 ptr %0, %1
+    %13 = atomicrmw umax seq_cst i64 ptr %0, %1
+    %14 = atomicrmw umin seq_cst i64 ptr %0, %1
+    %15 = const i64 0
+    %16 = const i64 1
+    %17, %18 = cmpxchg i64 ptr %0, %15, %16 acq_rel acquire
+    %19 = const i64 0
+    ret %19
+}

@@ -26,13 +26,19 @@
 //!   an intra-object local branch. FuncIds are then dense (`functions[i].id ==
 //!   FuncId(i)`), and every `FuncId` reference in a body is rewritten to its new
 //!   dense id (the backend adapter resolves callees by the `.id` field —
-//!   `trust-cg-lower/src/adapter.rs`).
+//!   `trust-cg-lower/src/adapter.rs`). The merged function carries the most
+//!   constraining v45 visibility any input states for its name, which is the
+//!   visibility the static linker would give the symbol (gABI).
 //! * **`FuncTyId`** — the per-module `func_types` tables are concatenated
-//!   (no dedup; duplicate signatures are harmless) and every reference
-//!   (`Function.ty`, `Inst::CallIndirect.sig`, an embedded `Ty::Func`, a
-//!   `ClosureTy::func`) is shifted by that module's base offset. Every shift is
-//!   bounds-checked against the SOURCE module's table so a dangling input id can
-//!   never silently alias another module's entry.
+//!   and every reference (`Function.ty`, `Inst::CallIndirect.sig`, an embedded
+//!   `Ty::Func`, a `ClosureTy::func`) is shifted by that module's base offset.
+//!   Every shift is bounds-checked against the SOURCE module's table so a
+//!   dangling input id can never silently alias another module's entry. ONE
+//!   exception: a declaration's signature and the signature of the definition
+//!   that upgrades it, when name-resolved equal, become ONE id (the smallest of
+//!   their class), because trust-ir compares `Ty::Func` nominally — a caller's
+//!   `FnDef(f) : Ty::Func(own id)` must name `f`'s merged `ty`
+//!   (`ConstTypeMismatch` otherwise; WS7.3). The table is not compacted.
 //! * **`StructId` / `EnumId` / `RecordId`** (the NAMED type tables) — assigned
 //!   dense merged ids keyed by NAME (first-encounter order), with the embedded
 //!   `def.id` field rewritten to match its table position. Two modules that
@@ -63,13 +69,18 @@
 //! * **`globals` / `GlobalId` / global-address stubs** (design Step 4 — the
 //!   soundness-sensitive one: a missed or mis-remapped reference is a silent
 //!   WRONG DATA ADDRESS). The per-module `globals` tables are merged
-//!   name-keyed: byte-identical same-name entries DEDUPLICATE to one; an
+//!   name-keyed: same-name entries with identical content and name-resolved
+//!   types DEDUPLICATE to one; each winner's type is remapped from its OWN
+//!   source module after type interning. An
 //!   initializer-less external IMPORT (how the bridge references a
 //!   `static mut` / thread-local defined in another object) is UPGRADED by a
 //!   same-name definition exactly like a function declaration (guarded: type /
 //!   mutability / TLS-model must match and the definition must itself be
 //!   externally linkable, else separate compilation would not have linked);
-//!   any other same-name disagreement is REJECTED. Global references in
+//!   any other same-name disagreement is REJECTED. As for functions, the
+//!   merged global carries the most constraining v45 visibility any input
+//!   states for its name, so a hidden or protected import still restricts the
+//!   definition that satisfies it. Global references in
 //!   bodies are then remapped BOTH ways they occur:
 //!   - `Inst::GlobalAddr { global: GlobalId }` — a plain index remap;
 //!   - the `0xFADE`-tagged **global-address stubs**: opaque
@@ -148,19 +159,25 @@
 //!   `FuncId` rewritten through the same name-keyed map direct calls use;
 //!   `Inst::CallIndirect` carries only a runtime callee VALUE (its static
 //!   identity, when any, is a `FnDef` constant — covered above) plus a
-//!   remapped `sig: FuncTyId`. `Constant::SymbolAddr` is name-relative
-//!   (nothing module-scoped to remap; symbol names are preserved verbatim by
-//!   the merge): zero-addend body constants and initializer uses are allowed,
-//!   while non-zero-addend body constants remain ineligible because the
-//!   adapter fails closed on that form. For the same batch-quality reason a
+//!   remapped `sig: FuncTyId`. `Constant::SymbolAddr` is name-relative, and
+//!   a name is NOT merge-invariant: within one input it binds to that input's
+//!   own module-local definition, which separate compilation keeps out of
+//!   every other object's reach. Such a definition, when another input names
+//!   it, is therefore renamed apart before merging (`<name>.merge.<input>`),
+//!   and its own input's `SymbolAddr` constants follow it (see
+//!   `plan_local_function_renames`); every other symbol is preserved
+//!   verbatim. Body constants with any addend and initializer uses are
+//!   allowed (the adapter lowers a non-zero addend as an explicit add of the
+//!   displacement). For batch quality a
 //!   `Constant::Closure` with CAPTURES (the adapter lowers only capture-free
-//!   closures as bare fn pointers) and the `Inst::SeqMap*` sequence ops (not
-//!   yet lowered by the adapter; the `SeqMap.fwd` `FuncId` remap is
-//!   implemented and unit-tested for the day they are) stay ineligible.
-//!   `Constant::Bytes` is batchable only as a complete top-level `[u8; N]`
-//!   body constant with a checked element type, length, and UTF-8 claim;
-//!   nested Bytes fields and Bytes initializers remain adapter/object-writer
-//!   gaps and are deferred.
+//!   closures as bare fn pointers) and the `Inst::SeqMap*` sequence ops stay
+//!   ineligible: the adapter lowers them per module (L05-P8), but no merged
+//!   module carrying one has native evidence yet (the `SeqMap.fwd` `FuncId`
+//!   remap itself is implemented and unit-tested).
+//!   `Constant::Bytes` is batchable only at a checked `[u8; N]` leaf with an
+//!   exact element type, length, and UTF-8 claim. Its typed containing path
+//!   may use Struct/Tuple/Array, plus Record/direct-tag Enum in bodies only.
+//!   Switch cases and legacy untyped raw global blobs do not gain admission.
 //!   Function-identity preservation is proven per merge by
 //!   [`verify_function_identity_preservation`] — a name-keyed lockstep walk
 //!   (independent of the remap bookkeeping) requiring every `FuncId` in a
@@ -169,6 +186,21 @@
 //!   named in its source module, every `CallIndirect.sig`/`Function.ty` to a
 //!   name-resolved-structurally-IDENTICAL signature, and every non-identity
 //!   constant leaf to ride through bit-identical.
+//! * **Import tables are RE-INTERNED** (WS7.9): `Module::imports` is a
+//!   content-interned table addressed by `ImportId`, so every input's rows are
+//!   re-interned by whole-row content (`name`, `digest`, `producer`, `scheme`)
+//!   into the merged table — two inputs recording the same dependency edge
+//!   share one merged row — and every `ImportId` the merge keeps is remapped:
+//!   `FunctionSummary::backed_by` on a winner function. (The other carrier,
+//!   `ProofEvidence::InheritedFromCallee { external }`, lives in
+//!   `proof_certificates`, which stay refused below, so no certificate needs a
+//!   remap.) A row whose digest equals a merge PEER's `stable_digest` (under
+//!   the row's scheme) is refused as `ImportSatisfiedByMergePeer`: the merged
+//!   module's digest differs from the peer's, so the row would name a module
+//!   that no longer exists as a separate artifact. trust-ir has no library
+//!   merge yet (WS4.11, F-069); this is the fail-closed stand-in until it
+//!   lands. Merging authenticates nothing: an import is authenticated only by
+//!   a linked compile of the merged module (`--link`).
 //! * **Dialect ops are rejected**: `Inst::DialectOp` is namespaced and opaque —
 //!   its attributes may encode module-scoped ids in dialect-defined payloads
 //!   (`AttrValue::Bytes`/`Str`/ints) that no structural remap can see. (This
@@ -178,6 +210,15 @@
 //!   no module-level trait table for it to index (nothing to remap and nothing
 //!   that can dangle); producers own cross-module trait-id agreement exactly as
 //!   they do under separate compilation.
+//! * `FatPtrKind::ContainerLen` and `FatPtrKind::ContainerVtable` (trust-ir
+//!   v38 / v40) are ID-LESS like `Str`: neither carries a `TyId` or a trait id,
+//!   so there is nothing to remap and nothing that can dangle, and two
+//!   occurrences of the same kind are equal by construction. `ContainerVtable`
+//!   lays out exactly like `TraitObject` (two pointer words; its metadata is an
+//!   OPAQUE VTABLE WORD, never a length) and is kept a distinct kind because
+//!   its data pointer addresses a CONTAINER header, not the dispatched object —
+//!   the merge preserves that distinction bit-for-bit and never rewrites one
+//!   kind into another.
 //!
 //! After assembling the module a structural self-check (`structural_self_check`)
 //! re-derives the invariants directly (dense ids in every table, no
@@ -192,11 +233,17 @@ use trust_ir::ty::FatPtrKind;
 use trust_ir::value::GlobalId;
 use trust_ir::{
     ClosureTy, Constant, EnumDef, FieldDef, FuncId, FuncTy, FuncTyId, Function, Global, Inst,
-    Linkage, Module, RecordDef, StructDef, Ty,
+    Linkage, Module, PanicLocation, RecordDef, StructDef, Ty,
 };
 use trust_ir::{ClosureTyId, EnumId, EnumVariant, RecordId, StructId, TyId};
 
 use crate::global_stub::{decode_global_addr_stub, encode_global_addr_stub};
+
+#[path = "module_merge_signature_abi.rs"]
+mod signature_abi_custody;
+#[cfg(test)]
+#[path = "module_merge_signature_abi_tests.rs"]
+mod signature_abi_tests;
 
 /// Return the first `max` `copy` instructions whose declared result type does
 /// not match the operand type, rendered for gated bridge diagnostics.
@@ -297,11 +344,43 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
         }
     }
 
+    // --- 2a. Import tables (WS7.9): refuse a peer-satisfied row, re-intern
+    // the rest. Decided on the ORIGINAL inputs, whose digests are what the
+    // rows record (the rename pass below changes an input's digest).
+    let (merged_imports, import_maps) = plan_merged_imports(modules)?;
+
+    // --- 2b. Module-local function names never bind across inputs. ----------
+    // A module-local definition another input names is renamed apart (with
+    // every reference in its own input), so the merged module resolves each
+    // name exactly as separate compilation would. The pass is proven by an
+    // independent completeness check and an exact inverse.
+    let renames = plan_local_function_renames(modules)?;
+    let renamed_inputs: Option<Vec<Module>> = if renames.iter().any(|map| !map.is_empty()) {
+        let mut renamed_inputs = Vec::with_capacity(modules.len());
+        for (i, (m, map)) in modules.iter().zip(&renames).enumerate() {
+            let renamed = apply_symbol_renames(m, map);
+            verify_local_renames(i, m, &renamed, map)?;
+            renamed_inputs.push(renamed);
+        }
+        Some(renamed_inputs)
+    } else {
+        None
+    };
+    let modules: &[Module] = renamed_inputs.as_deref().unwrap_or(modules);
+
+    // --- 2c. One EH personality serves every input's frames. ----------------
+    check_merged_eh_personality(modules)?;
+    // --- 2d. No input's typed catches bind through another input's table. --
+    check_merged_eh_type_table(modules)?;
+
     // --- 3. Assign dense FuncIds by symbol; a definition upgrades a decl. -----
     let mut name_to_dense: HashMap<String, u32> = HashMap::new();
     let mut dense_names: Vec<String> = Vec::new();
     // winners[dense] = (module_index, &Function) chosen for that symbol.
     let mut winners: Vec<Option<(usize, &Function)>> = Vec::new();
+    // visibilities[dense] = the most constraining v45 visibility any input
+    // states for that symbol (see `most_constraining_visibility`).
+    let mut visibilities: Vec<trust_ir::Visibility> = Vec::new();
     for (i, m) in modules.iter().enumerate() {
         for f in &m.functions {
             let dense = if let Some(&d) = name_to_dense.get(&f.name) {
@@ -313,12 +392,46 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
                 name_to_dense.insert(f.name.clone(), d);
                 dense_names.push(f.name.clone());
                 winners.push(None);
+                visibilities.push(trust_ir::Visibility::Default);
                 d
             };
+            visibilities[dense as usize] =
+                most_constraining_visibility(visibilities[dense as usize], f.visibility);
             let slot = &mut winners[dense as usize];
             match slot {
                 None => *slot = Some((i, f)),
                 Some((prev_mod, prev_fn)) => {
+                    // Every input's calls bind the one merged function, so the
+                    // inputs must agree on how many values it takes and returns
+                    // and which of them are aggregates: two `extern` items
+                    // sharing a `#[link_name]` may lower to signatures that do
+                    // not, and keeping either would hand the other's callers a
+                    // value of another shape. Scalars of different types in one
+                    // position are one machine value and stay admitted.
+                    let previous = signature_value_shape(&modules[*prev_mod], prev_fn);
+                    let incoming = signature_value_shape(m, f);
+                    if previous.is_none() || previous != incoming {
+                        return Err(format!(
+                            "merge_modules: function `{}` has signatures of different shapes in \
+                             module {prev_mod} ({:?}) and module {i} ({:?}); a call through \
+                             one would pass values of another shape than the merged function \
+                             takes (fail-closed)",
+                            f.name,
+                            modules[*prev_mod].func_type(prev_fn.ty),
+                            m.func_type(f.ty)
+                        ));
+                    }
+                    signature_abi_custody::require_same(
+                        modules[*prev_mod].func_type(prev_fn.ty),
+                        m.func_type(f.ty),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "merge_modules: function `{}` signature ABI in modules \
+                             {prev_mod} and {i}: {error} (fail-closed)",
+                            f.name
+                        )
+                    })?;
                     let incoming_def = f.has_body();
                     let existing_def = prev_fn.has_body();
                     if incoming_def && existing_def {
@@ -327,6 +440,36 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
                              (defined in both module {prev_mod} and module {i}); \
                              batching requires at most one definition per symbol",
                             f.name
+                        ));
+                    }
+                    // A definition upgrades a declaration only when separate
+                    // compilation would have linked them: the declaration's
+                    // undefined reference resolves to an externally visible
+                    // definition. A module-local (Internal/Private) definition
+                    // is invisible to the linker, so under separate
+                    // compilation the declaration binds to some OTHER object's
+                    // definition; unifying them would silently retarget every
+                    // call and address through the declaration. The rename
+                    // pass (step 2b) already moves every module-local
+                    // definition another input names out of this namespace;
+                    // this backstop fails closed, mirroring
+                    // `global_upgrade_compatible` for data, if one remains.
+                    let (definition, definition_mod) = if incoming_def {
+                        (f, i)
+                    } else {
+                        (*prev_fn, *prev_mod)
+                    };
+                    if incoming_def != existing_def
+                        && trust_cg_lower::is_module_local_function_definition(definition)
+                    {
+                        let declaration_mod = if incoming_def { *prev_mod } else { i };
+                        return Err(format!(
+                            "merge_modules: function `{}` is declared by module {declaration_mod} \
+                             but defined {} by module {definition_mod}; a module-local \
+                             definition cannot satisfy another module's declaration, since \
+                             separate compilation would bind that declaration to an external \
+                             definition instead (fail-closed)",
+                            f.name, definition.linkage
                         ));
                     }
                     // A definition upgrades a declaration; two declarations keep
@@ -378,6 +521,10 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
     // --- 5. Base offsets for the CONCATENATED (unnamed, no-dedup) tables. ----
     let func_ty_base = concat_bases(modules, "func_types", |m| m.func_types.len())?;
     let closure_base = concat_bases(modules, "closure_types", |m| m.closure_types.len())?;
+    // A declaration and the definition that upgrades it share ONE signature
+    // id (trust-ir compares `Ty::Func` nominally).
+    let mut func_ty_canon =
+        unify_upgraded_signatures(modules, &winners, &name_to_dense, &func_ty_base)?;
 
     // --- 6. Per-module remap contexts. ----------------------------------------
     let mut s_maps = structs_nt.per_module;
@@ -389,6 +536,7 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
         maps.push(ModMaps {
             func_ty_base: func_ty_base[i],
             func_ty_len: m.func_types.len(),
+            func_ty_canon: std::mem::take(&mut func_ty_canon[i]),
             closure_base: closure_base[i],
             closure_len: m.closure_types.len(),
             struct_map: std::mem::take(&mut s_maps[i]),
@@ -455,6 +603,8 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
                 params,
                 returns,
                 is_vararg: ft.is_vararg,
+                // ABI bindings name carrier slots, not module-local type ids.
+                abi: ft.abi.clone(),
             });
         }
     }
@@ -465,10 +615,9 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
         let mm = &maps[i];
         for ct in &m.closure_types {
             merged_closure_types.push(ClosureTy {
-                func: FuncTyId::new(shifted(
+                func: FuncTyId::new(func_ty_id(
                     ct.func.index(),
-                    mm.func_ty_base,
-                    mm.func_ty_len,
+                    mm,
                     "ClosureTy::func func_type",
                 )?),
                 captures: ct
@@ -476,6 +625,30 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
                     .iter()
                     .map(|t| remap_ty_final(t, mm))
                     .collect::<Result<Vec<_>, _>>()?,
+            });
+        }
+    }
+    // Declared capture offsets are source data, not a canonical C-layout
+    // recomputation. Preserve every descriptor and remap only its table key.
+    let mut merged_closure_layouts = Vec::new();
+    let mut expected_closure_layouts = 0usize;
+    for (i, m) in modules.iter().enumerate() {
+        let mm = &maps[i];
+        expected_closure_layouts = expected_closure_layouts
+            .checked_add(m.closure_layouts.len())
+            .ok_or("merge_modules: closure layout count overflow")?;
+        for descriptor in &m.closure_layouts {
+            merged_closure_layouts.push(trust_ir::ClosureLayoutDescriptor {
+                origin: descriptor.origin.clone(),
+                closure: ClosureTyId::new(shifted(
+                    descriptor.closure.index(),
+                    mm.closure_base,
+                    mm.closure_len,
+                    "closure layout closure type",
+                )?),
+                size: descriptor.size,
+                align: descriptor.align,
+                capture_offsets: descriptor.capture_offsets.clone(),
             });
         }
     }
@@ -503,6 +676,14 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
         |d: &RecordDef| d.name.as_str(),
     )?;
 
+    // Globals were selected before type interning. Their local TyIds and
+    // named/signature ids must be remapped through the actual winner's module,
+    // including when a later definition upgraded an earlier import.
+    let mut merged_globals = globals_merge.merged;
+    for (global, source_module) in merged_globals.iter_mut().zip(&globals_merge.winner_mod) {
+        global.ty = remap_ty_final(&global.ty, &maps[*source_module])?;
+    }
+
     // --- 12. Materialize the merged functions in dense order. -----------------
     // DEFENSE (i), the stub COUNT tooth: pre-count every global-address stub in
     // every winner body (an INDEPENDENT walk, before any rewrite); the remap
@@ -526,12 +707,23 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
         let mm = &maps[mod_idx];
         let mut f = orig.clone();
         f.id = FuncId::new(u32::try_from(dense).expect("dense fits u32 (bounded above)"));
-        f.ty = FuncTyId::new(shifted(
-            orig.ty.index(),
-            mm.func_ty_base,
-            mm.func_ty_len,
-            "Function.ty func_type",
-        )?);
+        // A declaration's visibility survives its upgrade: separately
+        // compiled, the linker would give the definition it.
+        f.visibility = visibilities[dense];
+        // WS7.9: the summary's cross-crate backing names a row of its OWN
+        // input's import table; follow the re-interning.
+        if let Some(backed_by) = f
+            .summary
+            .as_mut()
+            .and_then(|summary| summary.backed_by.as_mut())
+        {
+            backed_by.module = trust_ir::ImportId::new(mapped(
+                &import_maps[mod_idx],
+                backed_by.module.index(),
+                "FunctionSummary.backed_by import",
+            )?);
+        }
+        f.ty = FuncTyId::new(func_ty_id(orig.ty.index(), mm, "Function.ty func_type")?);
         if let Some(scopes) = &mut f.scopes {
             for scope in scopes {
                 if let Some(span) = &mut scope.span {
@@ -549,6 +741,28 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
                         // line/col-only by convention — carried unchanged.
                     } else {
                         span.file = mapped(&mm.file_map, span.file, "debug-info scope file")?;
+                    }
+                }
+                // WS4.19: an inlining link carries the CALL SITE's span, so its
+                // file index is remapped — and fails closed — exactly like the
+                // scope's own span. The callee display path needs no remap.
+                if let Some(inlined_at) = &mut scope.inlined_at {
+                    if mm.files_len == 0 {
+                        if any_files {
+                            return Err(format!(
+                                "merge_modules: function `{}` (module {mod_idx}) carries an \
+                                 inlining link with a call-site span but its module has no debug \
+                                 file table, while another input defines one; its file index \
+                                 would mis-resolve after merging — fail-closed",
+                                f.name
+                            ));
+                        }
+                    } else {
+                        inlined_at.span.file = mapped(
+                            &mm.file_map,
+                            inlined_at.span.file,
+                            "debug-info inlined-at call-site file",
+                        )?;
                     }
                 }
             }
@@ -607,7 +821,7 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
         closure_types: merged_closure_types.len(),
         types: merged_types.len(),
         files: merged_files.len(),
-        globals: globals_merge.merged.len(),
+        globals: merged_globals.len(),
         global_addr_stubs: expected_stub_count,
     };
     let mut merged = Module::new(modules[0].name.clone());
@@ -617,13 +831,22 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
     merged.enums = merged_enums;
     merged.records = merged_records;
     merged.closure_types = merged_closure_types;
+    merged.closure_layouts = merged_closure_layouts;
     merged.types = merged_types;
     merged.files = merged_files;
-    merged.globals = globals_merge.merged;
+    merged.globals = merged_globals;
     merged.target_info = target_info;
+    merged.imports = merged_imports;
+    if merged.closure_layouts.len() != expected_closure_layouts {
+        return Err("merge_modules: a declared closure layout was dropped or duplicated".into());
+    }
 
     // --- 14. Fail-closed structural self-check + canonical validator backstop.
     structural_self_check(&merged, &expected)?;
+
+    // Independent of the winner/remap bookkeeping: every contributor's
+    // global type must still resolve to the same type in the merged module.
+    verify_global_type_preservation(modules, &merged)?;
 
     // DEFENSE (iii): lockstep source-vs-merged walk proving every global
     // reference resolves to the SAME-NAMED global at the SAME offset it did in
@@ -639,6 +862,11 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
     // function-pointer VALUE is a call to the WRONG function — the worst
     // class; this check is independent of the remap bookkeeping.
     verify_function_identity_preservation(modules, &winners, &merged)?;
+
+    // WS7.9: every kept `backed_by` names, in the merged table, a row equal
+    // in content to the one it named in its source input (independent of the
+    // re-interning bookkeeping).
+    verify_import_reference_preservation(modules, &winners, &merged)?;
 
     // Independent, comprehensive cross-check: if every INPUT validated clean,
     // the merge (a pure id-remap + concat) must also validate clean. This
@@ -672,6 +900,141 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
     Ok(merged)
 }
 
+/// WS7.9: refuse an import row a merge peer satisfies
+/// (`ImportSatisfiedByMergePeer`), then re-intern every input's rows into one
+/// merged table. Returns the merged table and, per input, `old ImportId ->
+/// merged ImportId`.
+fn plan_merged_imports(
+    modules: &[Module],
+) -> Result<(Vec<trust_ir::ModuleImport>, Vec<HashMap<u32, u32>>), String> {
+    let mut maps: Vec<HashMap<u32, u32>> = vec![HashMap::new(); modules.len()];
+    if modules.iter().all(|m| m.imports.is_empty()) {
+        return Ok((Vec::new(), maps));
+    }
+    // A peer's digest under each scheme a row uses, computed at most once per
+    // (peer, scheme). A peer without a wire identity has no digest, so no row
+    // can name it.
+    let mut peer_digests: HashMap<(usize, trust_ir::IdentityScheme), trust_ir::proof::ProofDigest> =
+        HashMap::new();
+    for (i, m) in modules.iter().enumerate() {
+        for (row_index, row) in m.imports.iter().enumerate() {
+            // Re-interning would silently collapse an input's own duplicate
+            // rows, turning a malformed table into a well-formed one: refuse
+            // it as trust-ir's validator does.
+            if let Some(first) = m.imports[..row_index]
+                .iter()
+                .position(|earlier| earlier == row)
+            {
+                return Err(format!(
+                    "merge_modules: module {i} (`{}`) import rows {first} and {row_index} are \
+                     equal (ImportTableNotInterned); the merge never repairs a malformed import \
+                     table — fail-closed",
+                    m.name
+                ));
+            }
+            for (j, peer) in modules.iter().enumerate() {
+                if j == i || trust_ir_build::wire_identity_blocker(peer).is_some() {
+                    continue;
+                }
+                let digest = *peer_digests
+                    .entry((j, row.scheme))
+                    .or_insert_with(|| peer.stable_digest_under(row.scheme));
+                if digest == row.digest {
+                    return Err(format!(
+                        "merge_modules: ImportSatisfiedByMergePeer: module {i} (`{}`) import row \
+                         {row_index} (`{}`) names merge peer module {j} (`{}`) by digest; the \
+                         merged module's digest differs from the peer's, so the row would name \
+                         an artifact the merge destroys — compile them separately (or link them) \
+                         until trust-ir ships a library module merge (WS4.11) — fail-closed",
+                        m.name, row.name, peer.name
+                    ));
+                }
+            }
+        }
+    }
+    let mut merged: Vec<trust_ir::ModuleImport> = Vec::new();
+    for (i, m) in modules.iter().enumerate() {
+        for (old, row) in m.imports.iter().enumerate() {
+            let new = match merged.iter().position(|existing| existing == row) {
+                Some(position) => position,
+                None => {
+                    merged.push(row.clone());
+                    merged.len() - 1
+                }
+            };
+            let old = u32::try_from(old).map_err(|_| {
+                format!("merge_modules: module {i} import table exceeds u32 id space")
+            })?;
+            let new = u32::try_from(new).map_err(|_| {
+                "merge_modules: merged import table exceeds u32 id space".to_string()
+            })?;
+            maps[i].insert(old, new);
+        }
+    }
+    Ok((merged, maps))
+}
+
+/// WS7.9: a lockstep check, independent of [`plan_merged_imports`]'s maps,
+/// that every winner's `FunctionSummary::backed_by` resolves in the merged
+/// table to a row whose content equals the row it named in its source input.
+fn verify_import_reference_preservation(
+    modules: &[Module],
+    winners: &[Option<(usize, &Function)>],
+    merged: &Module,
+) -> Result<(), String> {
+    for (winner, merged_function) in winners.iter().zip(&merged.functions) {
+        let Some((mod_idx, source)) = winner else {
+            continue;
+        };
+        let source_ref = source
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.backed_by.as_ref());
+        let merged_ref = merged_function
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.backed_by.as_ref());
+        match (source_ref, merged_ref) {
+            (None, None) => {}
+            (Some(source_ref), Some(merged_ref)) => {
+                let source_row = modules[*mod_idx].import(source_ref.module);
+                let merged_row = merged.import(merged_ref.module);
+                if source_row.is_none()
+                    || source_row != merged_row
+                    || source_ref.symbol != merged_ref.symbol
+                    || source_ref.obligation != merged_ref.obligation
+                {
+                    return Err(format!(
+                        "merge_modules: function `{}`: its summary's `backed_by` does not name \
+                         the same dependency row after merging — fail-closed",
+                        merged_function.name
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "merge_modules: function `{}`: a summary `backed_by` was gained or lost by \
+                     the merge — fail-closed",
+                    merged_function.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The value shape of `f`'s signature in its module: whether each parameter
+/// and each return value is an aggregate, and whether it is variadic. `None`
+/// when the signature does not resolve.
+fn signature_value_shape(m: &Module, f: &Function) -> Option<(Vec<bool>, Vec<bool>, bool)> {
+    let ty = m.func_type(f.ty)?;
+    Some((
+        ty.params.iter().map(Ty::is_aggregate).collect(),
+        ty.returns.iter().map(Ty::is_aggregate).collect(),
+        ty.is_vararg,
+    ))
+}
+
 /// Whether `m` satisfies every PER-MODULE batching precondition
 /// ([`precheck_module`]) — i.e. it carries none of the constructs the merge
 /// fails closed on (opaque proof/refinement tables, unsupported constant and
@@ -686,14 +1049,93 @@ pub fn module_batch_eligible(m: &Module) -> Result<(), String> {
     precheck_module(m, 0)
 }
 
+/// The more constraining of two v45 symbol visibilities, as the gABI has the
+/// static linker merge every reference to and definition of one name:
+/// `STV_HIDDEN` over `STV_PROTECTED` over `STV_DEFAULT`. `merge_modules`
+/// gives each merged function and global the visibility its inputs' symbols
+/// would get from the linker under separate compilation, so a hidden or
+/// protected declaration or import another input defines still restricts
+/// that definition.
+fn most_constraining_visibility(
+    a: trust_ir::Visibility,
+    b: trust_ir::Visibility,
+) -> trust_ir::Visibility {
+    use trust_ir::Visibility::{Default, Hidden, Protected};
+    match (a, b) {
+        (Hidden, _) | (_, Hidden) => Hidden,
+        (Protected, _) | (_, Protected) => Protected,
+        (Default, Default) => Default,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Precheck (fail-closed input gate)
 // ---------------------------------------------------------------------------
+
+/// trust-ir v41 linkage the name-keyed merge cannot classify. `WeakOdr` /
+/// `LinkOnceOdr` are `Weak` / `LinkOnce` under the one-definition rule and
+/// classify with them everywhere below. `AvailableExternally` is a
+/// never-emitted definition-with-body (the merge's import notion is
+/// "initializer-less", so it would be filed as a definition) and
+/// `ExternalWeak` is a null-on-missing reference; neither has a merge rule, so
+/// both are refused rather than classified by the nearest pre-v41 arm.
+/// Exhaustive on purpose.
+fn reject_unmergeable_linkage(
+    m: &Module,
+    idx: usize,
+    what: &str,
+    name: &str,
+    linkage: Linkage,
+) -> Result<(), String> {
+    match linkage {
+        Linkage::External
+        | Linkage::Internal
+        | Linkage::Private
+        | Linkage::Weak
+        | Linkage::LinkOnce
+        | Linkage::WeakOdr
+        | Linkage::LinkOnceOdr => Ok(()),
+        Linkage::AvailableExternally | Linkage::ExternalWeak => Err(format!(
+            "merge_modules: module {idx} (`{}`) {what} `{name}` has linkage `{linkage}` \
+             (trust-ir v41); the name-keyed merge has no rule for a never-emitted or \
+             null-on-missing symbol — fail-closed",
+            m.name
+        )),
+    }
+}
 
 /// Reject any input module carrying a construct this slice does not remap.
 /// Sound by construction: refusing what it cannot remap means it can never
 /// silently mis-remap.
 fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
+    // Check original source rows BEFORE name-keyed interning can collapse
+    // identical claims and hide a producer's duplicate nominal identity.
+    if let Some((first, second)) = m.duplicate_type_origins().into_iter().next() {
+        let error = trust_ir_build::ValidationError::TypeOriginConflict {
+            origin: first.origin.to_string(),
+            first_module: None,
+            first_table: first.table,
+            first: first.name.to_string(),
+            second_module: None,
+            second_table: second.table,
+            second: second.name.to_string(),
+        };
+        return Err(format!(
+            "merge_modules: module {idx} (`{}`): {error}",
+            m.name
+        ));
+    }
+    // The output is rebuilt with `Module::new`. Until completeness has a
+    // native wire identity and a merge rule, do not erase or restamp any
+    // producer claim, even `Complete` or a structurally valid `Partial`.
+    if m.completeness.is_some() {
+        return Err(format!(
+            "merge_modules: module {idx}: {}",
+            trust_cg_lower::AdapterError::ModuleCompletenessUnsupported {
+                module: m.name.clone(),
+            }
+        ));
+    }
     let reject_nonempty = |what: &str, len: usize, why: &str| -> Result<(), String> {
         if len != 0 {
             Err(format!(
@@ -704,6 +1146,39 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
             Ok(())
         }
     };
+    reject_nonempty(
+        "tuple layout descriptor(s)",
+        m.tuple_layouts.len(),
+        "the structural type interner cannot preserve distinct producer layouts; compile separately",
+    )?;
+    // trust-ir v41: both tables below are module-scoped and the merged module
+    // is rebuilt from `Module::new`, so concatenating would silently DROP them.
+    reject_nonempty(
+        "`global_asm!` block(s)",
+        m.global_asm.len(),
+        "module-level assembly is opaque text no consumer downstream can honor, and a \
+         structural merge would silently drop it from the merged module (trust-ir v41)",
+    )?;
+    // Module imports (trust-ir v41) are re-interned by `merge_modules` step 2a
+    // (WS7.9); a row a merge peer satisfies is refused there by name.
+    // trust-ir v55 (amendment D): the drop-glue table keys inline types and
+    // names glue by `FuncId`; the merged module is rebuilt from `Module::new`,
+    // so concatenating would silently DROP it and leave every drop at a
+    // registered type unresolved.
+    reject_nonempty(
+        "drop-glue row(s)",
+        m.drop_glue.len(),
+        "the drop-glue table names glue by FuncId and keys types the structural interner \
+         re-ids; this slice remaps neither, and the merged module would lose it (trust-ir v55)",
+    )?;
+    reject_nonempty(
+        // trust-ir v70: the merged module is rebuilt from `Module::new`, so
+        // concatenating would DROP the table and leave every
+        // `Constant::TensorBlob` naming bytes the merged module does not carry.
+        "Module::blobs row(s)",
+        m.blobs.len(),
+        "content-addressed tensor inputs have no native input/provider or merge contract; rebuilding a module must not drop its blob table",
+    )?;
     // Globals: the table itself is merged (Step 4), so it is validated rather
     // than rejected. Name-keyed identity requires unique names per module; an
     // initializer-less global is only meaningful as a linkable external
@@ -714,6 +1189,7 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
     // never decodes as a stub; see the module docs on tag ambiguity).
     let mut global_names: HashSet<&str> = HashSet::new();
     for g in &m.globals {
+        reject_unmergeable_linkage(m, idx, "global", &g.name, g.linkage)?;
         if !global_names.insert(g.name.as_str()) {
             return Err(format!(
                 "merge_modules: module {idx} (`{}`) declares global `{}` more than once; \
@@ -724,7 +1200,11 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
         if g.initializer.is_none()
             && !matches!(
                 g.linkage,
-                Linkage::External | Linkage::Weak | Linkage::LinkOnce
+                Linkage::External
+                    | Linkage::Weak
+                    | Linkage::LinkOnce
+                    | Linkage::WeakOdr
+                    | Linkage::LinkOnceOdr
             )
         {
             return Err(format!(
@@ -734,7 +1214,7 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
             ));
         }
         if let Some(init) = &g.initializer {
-            check_global_initializer_constant(init, &m.name, idx, &g.name)?;
+            check_typed_global_initializer_constant(m, &g.ty, init, idx, &g.name)?;
         }
     }
     reject_nonempty(
@@ -781,10 +1261,27 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
     // lifted. Aggregate/table types are likewise supported.
 
     // Bodies: no dangling references, no backend-fail-closed constant forms
-    // (non-zero-addend body `SymbolAddr`, captured closure constants), no
+    // (captured closure constants), no
     // sequence ops, no opaque dialect ops, no proof-context obligation
     // references.
     for f in &m.functions {
+        reject_unmergeable_linkage(m, idx, "function", &f.name, f.linkage)?;
+        // A body-less function whose linkage names a definition is refused
+        // by the backend's shared rule before the name-keyed upgrade can bind
+        // it to another input's definition (which made the verdict depend on
+        // input order).
+        if f.blocks.is_empty()
+            && !trust_cg_lower::function_declaration_linkage_is_admitted(f.linkage)
+        {
+            return Err(format!(
+                "merge_modules: module {idx} (`{}`): {}",
+                m.name,
+                trust_cg_lower::AdapterError::BodylessDefinition {
+                    function: f.name.clone(),
+                    linkage: f.linkage,
+                }
+            ));
+        }
         if f.summary.as_ref().is_some_and(|s| !s.is_empty()) {
             return Err(format!(
                 "merge_modules: module {idx} (`{}`) function `{}` carries a non-empty \
@@ -831,10 +1328,10 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
                     Inst::SeqMap { .. } | Inst::SeqMapAddK { .. } | Inst::SeqMapNot { .. } => {
                         return Err(format!(
                             "merge_modules: module {idx} (`{}`) function `{}` uses a sequence op \
-                             (Inst::SeqMap*); the backend adapter fails closed on SeqMap*, so \
-                             batching it would only trade a per-fn fail-closed for a whole-batch \
-                             fallback (the SeqMap.fwd FuncId remap itself is implemented and \
-                             unit-tested for when the adapter lowers these)",
+                             (Inst::SeqMap*); the adapter lowers it per module, but no merged \
+                             module carrying one has native evidence yet, so it stays out of \
+                             batch merges (the SeqMap.fwd FuncId remap itself is implemented and \
+                             unit-tested)",
                             m.name, f.name
                         ));
                     }
@@ -953,13 +1450,14 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
 /// convert that function's per-fn fail-closed into a whole-batch fallback.
 /// NOT a remap-soundness restriction — nothing here is module-scoped:
 ///
-/// * `Constant::SymbolAddr` is name-relative (merge-invariant). The adapter
-///   lowers addend-zero body constants, while non-zero addends remain
-///   unsupported;
+/// * `Constant::SymbolAddr` is name-relative and the adapter lowers every
+///   addend (a non-zero one as an explicit add), so it is never deferred; a
+///   name bound to a module-local definition is renamed apart before
+///   merging when another input names it (`plan_local_function_renames`);
 /// * a `Constant::Closure` WITH captures has no adapter lowering (only the
 ///   capture-free form lowers, as a bare function pointer);
-/// * `Constant::Bytes` lowers as a complete top-level `[u8; N]` body constant,
-///   but not yet as a field nested inside another aggregate constant.
+/// * `Constant::Bytes` requires a checked `[u8; N]` leaf and a supported typed
+///   containing path; this permission does not apply to switch cases.
 ///
 /// `FnDef` and capture-free `Closure` constants — at any depth, including
 /// inside aggregate/record constants and `Switch` case values — are BATCHABLE:
@@ -967,37 +1465,21 @@ fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
 /// [`check_constant_in_range`], and name-identity-verified by
 /// [`verify_function_identity_preservation`]. Exhaustive over `Constant`.
 fn body_constant_batch_deferred(module: &Module, ty: &Ty, c: &Constant) -> Option<&'static str> {
-    if let Constant::Bytes { data, utf8 } = c {
-        let Ty::Array(element, len) = ty else {
-            return Some(
-                "Constant::Bytes requires a top-level [u8; N] declared type in the adapter",
-            );
-        };
-        if module.types.get(element.as_usize()) != Some(&Ty::U8) {
-            return Some(
-                "Constant::Bytes requires a top-level [u8; N] declared type whose element TyId resolves to U8",
-            );
-        }
-        if u64::try_from(data.len()).ok() != Some(*len) {
-            return Some(
-                "Constant::Bytes payload length does not match its top-level [u8; N] declared type",
-            );
-        }
-        if *utf8 && std::str::from_utf8(data).is_err() {
-            return Some("Constant::Bytes carries a false UTF-8 validity claim");
-        }
-        return None;
-    }
-    constant_batch_deferred(c)
+    constant_batch_deferred_impl(c, true)
+        .or_else(|| validate_bytes_constant_path(module, ty, c, false, 0).err())
 }
 
 fn constant_batch_deferred(c: &Constant) -> Option<&'static str> {
+    constant_batch_deferred_impl(c, false)
+}
+
+fn constant_batch_deferred_impl(c: &Constant, typed_bytes: bool) -> Option<&'static str> {
     match c {
-        Constant::SymbolAddr { addend: 0, .. } => None,
-        Constant::SymbolAddr { .. } => Some(
-            "Constant::SymbolAddr with a non-zero addend in a function body — the adapter \
-                  lowers only the bare-symbol (addend zero) form",
-        ),
+        Constant::Ext(e) => e.unreachable(),
+        Constant::TensorBlob { .. } => {
+            Some("Constant::TensorBlob has no native input/provider contract")
+        }
+        Constant::SymbolAddr { .. } => None,
         Constant::Closure { captures, .. } => {
             if captures.is_empty() {
                 None
@@ -1009,22 +1491,187 @@ fn constant_batch_deferred(c: &Constant) -> Option<&'static str> {
             }
         }
         Constant::FnDef(_) => None,
-        // A canonical U128 scalar has faithful field materialization. Bytes is
-        // supported only as the complete top-level body constant checked by
-        // `body_constant_batch_deferred`; the aggregate filler cannot yet
-        // materialize it as a nested array field.
+        // U128 retains its body-only support. Bytes requires the separate
+        // typed walk, never merely the absence of identity-bearing children.
         Constant::U128(_) => None,
-        Constant::Bytes { .. } => Some(
-            "nested Constant::Bytes — only a complete top-level [u8; N] body constant is lowered",
-        ),
+        Constant::Bytes { .. } if typed_bytes => None,
+        Constant::Bytes { .. } => Some("Constant::Bytes has no typed admission in switch cases"),
         Constant::Aggregate(v)
         | Constant::Array(v)
         | Constant::Vector(v)
         | Constant::Sequence(v)
-        | Constant::Set(v) => v.iter().find_map(constant_batch_deferred),
-        Constant::Record(fields) => fields.iter().find_map(|(_, e)| constant_batch_deferred(e)),
+        | Constant::Set(v) => v
+            .iter()
+            .find_map(|c| constant_batch_deferred_impl(c, typed_bytes)),
+        // trust-ir v50: every lane is the one element, checked once.
+        Constant::Splat { elem, .. } => constant_batch_deferred_impl(elem, typed_bytes),
+        Constant::Record(fields) => fields
+            .iter()
+            .find_map(|(_, c)| constant_batch_deferred_impl(c, typed_bytes)),
         Constant::Int(_) | Constant::Float(_) | Constant::Bool(_) | Constant::PhantomData => None,
+        // v49: the adapter refuses an unwritten lane on every lane.
+        Constant::Uninit => {
+            Some("Constant::Uninit (an unwritten aggregate lane) — the adapter refuses it")
+        }
     }
+}
+
+fn constant_contains_bytes(c: &Constant) -> bool {
+    c.try_visit_constants(|constant| {
+        if matches!(constant, Constant::Bytes { .. }) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+/// Local admission, not a replacement for canonical validation or the
+/// adapter/object writer's layout checks. Only Bytes-containing paths gain
+/// new support; non-Bytes constants retain their existing admission policy.
+/// Each descent consumes a constant child, and the new path is depth-bounded.
+fn validate_bytes_constant_path(
+    module: &Module,
+    ty: &Ty,
+    c: &Constant,
+    global: bool,
+    depth: usize,
+) -> Result<(), &'static str> {
+    if !constant_contains_bytes(c) {
+        return Ok(());
+    }
+    if depth >= 128 {
+        return Err("Constant::Bytes containing path exceeds 128 levels");
+    }
+    let child = |ty, c| validate_bytes_constant_path(module, ty, c, global, depth + 1);
+    match (c, ty) {
+        (Constant::Bytes { data, utf8 }, Ty::Array(element, len)) => {
+            if module.ty(*element) != Some(&Ty::U8) {
+                return Err(
+                    "Constant::Bytes requires an array element TyId resolving exactly to U8",
+                );
+            }
+            if u64::try_from(data.len()).ok() != Some(*len) {
+                return Err(
+                    "Constant::Bytes payload length does not match its declared [u8; N] type",
+                );
+            }
+            if *utf8 && std::str::from_utf8(data).is_err() {
+                return Err("Constant::Bytes carries a false UTF-8 validity claim");
+            }
+        }
+        (Constant::Aggregate(values) | Constant::Array(values), Ty::Array(element, len)) => {
+            if u64::try_from(values.len()).ok() != Some(*len) {
+                return Err("Constant::Bytes containing array has mismatched arity");
+            }
+            let element = module
+                .ty(*element)
+                .ok_or("Constant::Bytes containing array has a missing element type")?;
+            for value in values {
+                child(element, value)?;
+            }
+        }
+        // trust-ir v50: a uniform array's lanes are its one element, walked
+        // once whatever the length.
+        (Constant::Splat { elem, len: lanes }, Ty::Array(element, len)) => {
+            if lanes != len {
+                return Err("Constant::Bytes containing splat has mismatched arity");
+            }
+            let element = module
+                .ty(*element)
+                .ok_or("Constant::Bytes containing splat has a missing element type")?;
+            child(element, elem)?;
+        }
+        (Constant::Aggregate(values), Ty::Tuple(types)) => {
+            if values.len() != types.len() {
+                return Err("Constant::Bytes containing tuple has mismatched arity");
+            }
+            for (ty, value) in types.iter().zip(values) {
+                child(ty, value)?;
+            }
+        }
+        (Constant::Aggregate(values), Ty::Struct(id)) => {
+            let def = module
+                .struct_def(*id)
+                .ok_or("Constant::Bytes containing struct is missing")?;
+            if values.len() != def.fields.len() {
+                return Err("Constant::Bytes containing struct has mismatched arity");
+            }
+            for (field, value) in def.fields.iter().zip(values) {
+                child(&field.ty, value)?;
+            }
+        }
+        (Constant::Aggregate(values), Ty::Record(id)) if !global => {
+            let def = module
+                .record_def(*id)
+                .ok_or("Constant::Bytes containing record is missing")?;
+            if values.len() != def.fields.len() {
+                return Err("Constant::Bytes containing record has mismatched arity");
+            }
+            for (field, value) in def.fields.iter().zip(values) {
+                child(&field.ty, value)?;
+            }
+        }
+        (Constant::Record(values), Ty::Record(id)) if !global => {
+            let def = module
+                .record_def(*id)
+                .ok_or("Constant::Bytes containing record is missing")?;
+            if values.len() != def.fields.len() {
+                return Err("Constant::Bytes containing record has mismatched arity");
+            }
+            for (field, (name, value)) in def.fields.iter().zip(values) {
+                if *name != field.name {
+                    return Err(
+                        "Constant::Bytes containing record names differ from declaration order",
+                    );
+                }
+                child(&field.ty, value)?;
+            }
+        }
+        (Constant::Aggregate(values), Ty::Enum(id)) if !global => {
+            let def = module
+                .enum_def(*id)
+                .ok_or("Constant::Bytes containing enum is missing")?;
+            if def.layout.as_ref().is_some_and(|layout| {
+                !matches!(layout.encoding, trust_ir::EnumTagEncoding::Direct { .. })
+            }) {
+                return Err("Constant::Bytes requires a direct-tag containing enum");
+            }
+            let discriminants = def
+                .effective_discriminants()
+                .ok_or("Constant::Bytes containing enum has invalid discriminants")?;
+            if discriminants
+                .iter()
+                .enumerate()
+                .any(|(index, value)| *value != index as i128)
+            {
+                return Err(
+                    "Constant::Bytes containing enum requires the supported index-tag assignment",
+                );
+            }
+            let Some((Constant::Int(tag), payload)) = values.split_first() else {
+                return Err("Constant::Bytes containing enum requires an integer discriminant");
+            };
+            let index = discriminants
+                .iter()
+                .position(|value| value == tag)
+                .ok_or("Constant::Bytes containing enum names no declared discriminant")?;
+            let fields = &def.variants[index].fields;
+            if payload.len() != fields.len() {
+                return Err("Constant::Bytes containing enum has mismatched payload arity");
+            }
+            for (ty, value) in fields.iter().zip(payload) {
+                child(ty, value)?;
+            }
+        }
+        _ => {
+            return Err(
+                "Constant::Bytes requires a typed [u8; N] leaf through supported containing layouts",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Decode the importer's in-band body stub only at its exact typed carriers.
@@ -1034,7 +1681,7 @@ fn constant_batch_deferred(c: &Constant) -> Option<&'static str> {
 /// excluded because its ownership ABI is unsupported, and `Func` because these
 /// are data-global rather than code-pointer stubs. This predicate must stay
 /// identical to the lower adapter's gate.
-fn decode_body_global_addr_stub(ty: &Ty, value: &Constant) -> Option<(u64, u32)> {
+pub(crate) fn decode_body_global_addr_stub(ty: &Ty, value: &Constant) -> Option<(u64, u32)> {
     if !matches!(
         ty,
         Ty::I64 | Ty::Ptr | Ty::Ref(_) | Ty::RefMut(_) | Ty::PtrConst(_) | Ty::PtrMut(_)
@@ -1061,6 +1708,7 @@ fn constant_dangling_funcid(c: &Constant, m: &Module) -> Option<FuncId> {
         }
     };
     match c {
+        Constant::Ext(e) => e.unreachable(),
         Constant::FnDef(fid) => dangling(*fid),
         Constant::Closure { func, captures } => {
             dangling(*func).or_else(|| captures.iter().find_map(|e| constant_dangling_funcid(e, m)))
@@ -1070,17 +1718,21 @@ fn constant_dangling_funcid(c: &Constant, m: &Module) -> Option<FuncId> {
         | Constant::Vector(v)
         | Constant::Sequence(v)
         | Constant::Set(v) => v.iter().find_map(|e| constant_dangling_funcid(e, m)),
+        Constant::Splat { elem, .. } => constant_dangling_funcid(elem, m),
         Constant::Record(fields) => fields
             .iter()
             .find_map(|(_, e)| constant_dangling_funcid(e, m)),
-        // v24 U128 / v25 Bytes: FuncId-free scalar leaves.
+        // v24 U128 / v25 Bytes: FuncId-free scalar leaves; v49 Uninit holds
+        // no value at all; a v70 weight blob names bytes by digest, no FuncId.
         Constant::Int(_)
         | Constant::U128(_)
         | Constant::Bytes { .. }
         | Constant::Float(_)
         | Constant::Bool(_)
         | Constant::SymbolAddr { .. }
-        | Constant::PhantomData => None,
+        | Constant::TensorBlob { .. }
+        | Constant::PhantomData
+        | Constant::Uninit => None,
     }
 }
 
@@ -1091,12 +1743,14 @@ fn constant_dangling_funcid(c: &Constant, m: &Module) -> Option<FuncId> {
 /// see the module docs on in-band tag ambiguity. Exhaustive over `Constant`.
 fn constant_tagged_int_anywhere(c: &Constant) -> Option<i128> {
     match c {
+        Constant::Ext(e) => e.unreachable(),
         Constant::Int(v) => decode_global_addr_stub(*v).map(|_| *v),
         Constant::Aggregate(v)
         | Constant::Array(v)
         | Constant::Vector(v)
         | Constant::Sequence(v)
         | Constant::Set(v) => v.iter().find_map(constant_tagged_int_anywhere),
+        Constant::Splat { elem, .. } => constant_tagged_int_anywhere(elem),
         Constant::Record(fields) => fields
             .iter()
             .find_map(|(_, e)| constant_tagged_int_anywhere(e)),
@@ -1104,14 +1758,17 @@ fn constant_tagged_int_anywhere(c: &Constant) -> Option<i128> {
             captures.iter().find_map(constant_tagged_int_anywhere)
         }
         // v24 U128 / v25 Bytes: a stub is a tagged u64 packed in i128 —
-        // neither carrier can be stub-shaped.
+        // neither carrier can be stub-shaped, and a v49 Uninit lane has no bits;
+        // a v70 weight blob is a digest and extents, never a stub word.
         Constant::U128(_)
         | Constant::Bytes { .. }
         | Constant::FnDef(_)
         | Constant::Float(_)
         | Constant::Bool(_)
         | Constant::SymbolAddr { .. }
-        | Constant::PhantomData => None,
+        | Constant::TensorBlob { .. }
+        | Constant::PhantomData
+        | Constant::Uninit => None,
     }
 }
 
@@ -1120,13 +1777,44 @@ fn constant_tagged_int_anywhere(c: &Constant) -> Option<i128> {
 /// `SymbolAddr` in initializers, which needs no remap) and no stub-shaped
 /// integer may appear (initializer elements are raw data bytes the backend
 /// never decodes as stubs).
+fn check_typed_global_initializer_constant(
+    module: &Module,
+    ty: &Ty,
+    init: &Constant,
+    idx: usize,
+    global_name: &str,
+) -> Result<(), String> {
+    if !constant_contains_bytes(init) {
+        return check_global_initializer_constant(init, &module.name, idx, global_name);
+    }
+    let reason = unsupported_initializer_constant_reason_impl(init, true)
+        .or_else(|| validate_bytes_constant_path(module, ty, init, true, 0).err());
+    check_global_initializer_reason(init, &module.name, idx, global_name, reason)
+}
+
 fn check_global_initializer_constant(
     init: &Constant,
     module_name: &str,
     idx: usize,
     global_name: &str,
 ) -> Result<(), String> {
-    if let Some(reason) = unsupported_initializer_constant_reason(init) {
+    check_global_initializer_reason(
+        init,
+        module_name,
+        idx,
+        global_name,
+        unsupported_initializer_constant_reason(init),
+    )
+}
+
+fn check_global_initializer_reason(
+    init: &Constant,
+    module_name: &str,
+    idx: usize,
+    global_name: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    if let Some(reason) = reason {
         return Err(format!(
             "merge_modules: module {idx} (`{module_name}`) global `{global_name}` initializer \
              contains {reason} — fail-closed"
@@ -1148,7 +1836,15 @@ fn check_global_initializer_constant(
 /// here: it is name-relative (nothing to remap) and is exactly how producers
 /// place function/data addresses into initializers (vtable slots, fn tables).
 fn unsupported_initializer_constant_reason(c: &Constant) -> Option<&'static str> {
+    unsupported_initializer_constant_reason_impl(c, false)
+}
+
+fn unsupported_initializer_constant_reason_impl(
+    c: &Constant,
+    typed_bytes: bool,
+) -> Option<&'static str> {
     match c {
+        Constant::Ext(e) => e.unreachable(),
         Constant::FnDef(_) | Constant::Closure { .. } => Some(
             "a module-scoped function constant (FnDef/Closure); initializers must use \
              name-relative SymbolAddr",
@@ -1157,16 +1853,25 @@ fn unsupported_initializer_constant_reason(c: &Constant) -> Option<&'static str>
         | Constant::Array(v)
         | Constant::Vector(v)
         | Constant::Sequence(v)
-        | Constant::Set(v) => v.iter().find_map(unsupported_initializer_constant_reason),
+        | Constant::Set(v) => v
+            .iter()
+            .find_map(|c| unsupported_initializer_constant_reason_impl(c, typed_bytes)),
+        // trust-ir v50: the object writer renders the one element once
+        // (`render_global_splat_initializer`); it is checked once here.
+        Constant::Splat { elem, .. } => {
+            unsupported_initializer_constant_reason_impl(elem, typed_bytes)
+        }
         Constant::Record(fields) => fields
             .iter()
-            .find_map(|(_, e)| unsupported_initializer_constant_reason(e)),
+            .find_map(|(_, c)| unsupported_initializer_constant_reason_impl(c, typed_bytes)),
         // v24 U128: the object writer's initializer emission has no verified
         // 16-byte unsigned path yet — fail closed until the B1 adoption wave.
         Constant::U128(_) => Some(
             "a U128 constant; verified 16-byte unsigned initializer emission is not implemented",
         ),
-        // v25 Bytes: same — the byte-array initializer path lands with B7.
+        // Only the typed entry above can grant this exception. Legacy raw
+        // blobs and the untyped helper retain their original refusal.
+        Constant::Bytes { .. } if typed_bytes => None,
         Constant::Bytes { .. } => {
             Some("a Bytes constant; verified byte-sequence initializer emission is not implemented")
         }
@@ -1175,6 +1880,12 @@ fn unsupported_initializer_constant_reason(c: &Constant) -> Option<&'static str>
         | Constant::Bool(_)
         | Constant::SymbolAddr { .. }
         | Constant::PhantomData => None,
+        // Content addresses need a separate native input/provider contract.
+        Constant::TensorBlob { .. } => Some(
+            "content-addressed tensor input (Constant::TensorBlob) has no native input/provider contract",
+        ),
+        // v49: a global's bytes ARE its initializer; an unwritten lane has none.
+        Constant::Uninit => Some("an unwritten aggregate lane (Constant::Uninit)"),
     }
 }
 
@@ -1203,7 +1914,414 @@ fn count_global_addr_stubs(f: &Function) -> usize {
 /// The merged globals table plus per-module old-index -> merged-index maps.
 struct GlobalsAssign {
     merged: Vec<Global>,
+    winner_mod: Vec<usize>,
     per_module: Vec<HashMap<u32, u32>>,
+}
+
+// ---------------------------------------------------------------------------
+// Module-local names across inputs
+// ---------------------------------------------------------------------------
+
+/// Visit every constant `m` stores, in its bodies (`Inst::Const` values and
+/// `Switch` case values) and its global initializers, with TrustIR's own
+/// stack-safe walk over nested constants. The rename completeness check reads
+/// this walk, never the rewriting walker it checks.
+fn visit_module_constants<'m>(m: &'m Module, mut visit: impl FnMut(&'m Constant)) {
+    for function in &m.functions {
+        for node in function.blocks.iter().flat_map(|block| &block.body) {
+            match &node.inst {
+                Inst::Const { value, .. } => value.visit_constants(&mut visit),
+                Inst::Switch { cases, .. } => {
+                    for case in cases {
+                        case.value.visit_constants(&mut visit);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for global in &m.globals {
+        if let Some(initializer) = &global.initializer {
+            initializer.visit_constants(&mut visit);
+        }
+    }
+}
+
+/// Every name separate compilation would resolve BY SYMBOL for `m`: its
+/// functions' names (definitions and declarations), its globals' names, and
+/// every `SymbolAddr` symbol it stores.
+fn names_mentioned(m: &Module) -> HashSet<&str> {
+    let mut names: HashSet<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();
+    names.extend(m.globals.iter().map(|g| g.name.as_str()));
+    visit_module_constants(m, |constant| {
+        if let Constant::SymbolAddr { symbol, .. } = constant {
+            names.insert(symbol.as_str());
+        }
+    });
+    names
+}
+
+/// Plan merge-unique names for the module-local function definitions another
+/// input can name.
+///
+/// Under separate compilation a bodied Internal/Private function is an
+/// `STB_LOCAL` symbol: only its own object's references reach it, and a
+/// same-spelled name in any other object (a declaration, a definition, a
+/// global, a `SymbolAddr` constant) resolves elsewhere. The merged module
+/// resolves every name in one namespace, so such a definition is renamed to
+/// a name no input mentions (`<name>.merge.<input>`, suffixed further on a
+/// collision) and every reference inside its own input follows it; the
+/// other inputs keep binding the original name to whatever defines it
+/// outside, exactly as they would have. A definition no other input names
+/// keeps its name.
+///
+/// Two cases fail closed instead:
+/// * an EH personality name ([`trust_cg_lower::EH_PERSONALITY_CANDIDATES`]):
+///   lowering selects the personality by name, so renaming a module-local
+///   personality would change its own input's frames;
+/// * a `SymbolAddr` naming a module-local GLOBAL another input defines, from
+///   an input with no global of that name: data definitions are merged by
+///   name, not renamed, so that reference would bind to the other input's
+///   local storage.
+fn plan_local_function_renames(modules: &[Module]) -> Result<Vec<HashMap<String, String>>, String> {
+    let mentioned: Vec<HashSet<&str>> = modules.iter().map(names_mentioned).collect();
+    let mut taken: HashSet<String> = mentioned
+        .iter()
+        .flat_map(|names| names.iter().map(|name| name.to_string()))
+        .collect();
+    let mut renames: Vec<HashMap<String, String>> = vec![HashMap::new(); modules.len()];
+    for (i, m) in modules.iter().enumerate() {
+        for f in &m.functions {
+            if !trust_cg_lower::is_module_local_function_definition(f) {
+                continue;
+            }
+            let Some(other) = mentioned
+                .iter()
+                .enumerate()
+                .find(|(j, names)| *j != i && names.contains(f.name.as_str()))
+                .map(|(j, _)| j)
+            else {
+                continue;
+            };
+            if trust_cg_lower::EH_PERSONALITY_CANDIDATES.contains(&f.name.as_str()) {
+                return Err(format!(
+                    "merge_modules: module {i} (`{}`) defines the module-local personality \
+                     `{}`, which module {other} (`{}`) also names; lowering selects the \
+                     personality by name, so it cannot be renamed apart — fail-closed",
+                    m.name, f.name, modules[other].name
+                ));
+            }
+            let mut fresh = format!("{}.merge.{i}", f.name);
+            let mut suffix = 0usize;
+            while taken.contains(&fresh) {
+                suffix += 1;
+                fresh = format!("{}.merge.{i}.{suffix}", f.name);
+            }
+            taken.insert(fresh.clone());
+            renames[i].insert(f.name.clone(), fresh);
+        }
+    }
+    for (j, m) in modules.iter().enumerate() {
+        let own_globals: HashSet<&str> = m.globals.iter().map(|g| g.name.as_str()).collect();
+        let mut refusal = None;
+        visit_module_constants(m, |constant| {
+            let Constant::SymbolAddr { symbol, .. } = constant else {
+                return;
+            };
+            if refusal.is_some() || own_globals.contains(symbol.as_str()) {
+                return;
+            }
+            if let Some((i, owner)) = modules.iter().enumerate().find(|(i, other)| {
+                *i != j
+                    && other
+                        .globals
+                        .iter()
+                        .any(|g| g.name == *symbol && g.linkage.is_module_local())
+            }) {
+                refusal = Some(format!(
+                    "merge_modules: module {j} (`{}`) names `{symbol}` by `SymbolAddr`, which \
+                     module {i} (`{}`) defines as module-local data; under separate compilation \
+                     that reference binds elsewhere, and module-local data is merged by name, \
+                     not renamed — fail-closed",
+                    m.name, owner.name
+                ));
+            }
+        });
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
+    }
+    Ok(renames)
+}
+
+/// Rewrite every `SymbolAddr` symbol in `c` that `renames` maps. Exhaustive
+/// over `Constant`, like [`remap_constant`].
+fn rename_symbol_addrs(c: &mut Constant, renames: &HashMap<String, String>) {
+    match c {
+        Constant::Ext(e) => e.unreachable(),
+        Constant::SymbolAddr { symbol, .. } => {
+            if let Some(renamed) = renames.get(symbol.as_str()) {
+                *symbol = renamed.clone();
+            }
+        }
+        Constant::Closure { captures, .. } => {
+            for capture in captures {
+                rename_symbol_addrs(capture, renames);
+            }
+        }
+        Constant::Aggregate(v)
+        | Constant::Array(v)
+        | Constant::Vector(v)
+        | Constant::Sequence(v)
+        | Constant::Set(v) => {
+            for e in v {
+                rename_symbol_addrs(e, renames);
+            }
+        }
+        // trust-ir v50: renaming the one element renames every lane.
+        Constant::Splat { elem, .. } => rename_symbol_addrs(elem, renames),
+        Constant::Record(fields) => {
+            for (_, e) in fields {
+                rename_symbol_addrs(e, renames);
+            }
+        }
+        Constant::FnDef(_)
+        | Constant::Int(_)
+        | Constant::U128(_)
+        | Constant::Bytes { .. }
+        | Constant::Float(_)
+        | Constant::Bool(_)
+        | Constant::TensorBlob { .. }
+        | Constant::PhantomData
+        | Constant::Uninit => {}
+    }
+}
+
+/// `m` with every function and `SymbolAddr` symbol `renames` maps renamed.
+/// Calls, invokes, `FnDef` and `Closure` constants name functions by `FuncId`
+/// and follow the renamed function unchanged.
+fn apply_symbol_renames(m: &Module, renames: &HashMap<String, String>) -> Module {
+    let mut renamed = m.clone();
+    for function in &mut renamed.functions {
+        if let Some(name) = renames.get(function.name.as_str()) {
+            function.name = name.clone();
+        }
+        for node in function.blocks.iter_mut().flat_map(|block| &mut block.body) {
+            match &mut node.inst {
+                Inst::Const { value, .. } => rename_symbol_addrs(value, renames),
+                Inst::Switch { cases, .. } => {
+                    for case in cases {
+                        rename_symbol_addrs(&mut case.value, renames);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for global in &mut renamed.globals {
+        if let Some(initializer) = &mut global.initializer {
+            rename_symbol_addrs(initializer, renames);
+        }
+    }
+    renamed
+}
+
+/// Prove a rename pass did exactly its job on one input: no function and no
+/// stored `SymbolAddr` (read by TrustIR's own constant walk) still spells a
+/// renamed name, every new name is a module-local definition, and undoing
+/// the renames restores the input exactly (nothing else changed).
+fn verify_local_renames(
+    index: usize,
+    original: &Module,
+    renamed: &Module,
+    renames: &HashMap<String, String>,
+) -> Result<(), String> {
+    let fail = |what: String| {
+        format!(
+            "merge_modules rename check: module {index} (`{}`): {what} — fail-closed",
+            original.name
+        )
+    };
+    for function in &renamed.functions {
+        if renames.contains_key(function.name.as_str()) {
+            return Err(fail(format!(
+                "function `{}` kept a name the merge renamed",
+                function.name
+            )));
+        }
+    }
+    for (old, new) in renames {
+        if !renamed
+            .functions
+            .iter()
+            .any(|f| f.name == *new && trust_cg_lower::is_module_local_function_definition(f))
+        {
+            return Err(fail(format!(
+                "`{old}` was not renamed to a module-local definition `{new}`"
+            )));
+        }
+    }
+    let mut stale = None;
+    visit_module_constants(renamed, |constant| {
+        if let Constant::SymbolAddr { symbol, .. } = constant
+            && renames.contains_key(symbol.as_str())
+        {
+            stale.get_or_insert_with(|| symbol.clone());
+        }
+    });
+    if let Some(symbol) = stale {
+        return Err(fail(format!(
+            "a `SymbolAddr` still names `{symbol}`, which the merge renamed"
+        )));
+    }
+    let inverse: HashMap<String, String> = renames
+        .iter()
+        .map(|(old, new)| (new.clone(), old.clone()))
+        .collect();
+    if apply_symbol_renames(renamed, &inverse) != *original {
+        return Err(fail(
+            "undoing the renames does not restore the input; the pass changed something else"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `m` has exception-handling structure, whose frames lowering gives
+/// the module's personality. Normative call boundaries are not EH structure:
+/// the native admission floor refuses them, even without a personality.
+fn module_has_eh(m: &Module) -> bool {
+    m.functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|block| &block.body)
+        .any(|node| {
+            matches!(
+                node.inst,
+                Inst::Invoke { .. } | Inst::LandingPad { .. } | Inst::Resume { .. }
+            )
+        })
+}
+
+/// Refuse a merge that would run, for some input's frames, a personality
+/// other than the one that input's own object runs.
+///
+/// Lowering picks a module-default personality by name
+/// ([`trust_cg_lower::eh_personality_for_function_names`]); a function whose
+/// provenance selects its own ([`trust_cg_lower::eh_personality_override`],
+/// `Producer::TRust`) keeps it in every module, so a merge cannot change it.
+/// When a module has exception-handling structure the AArch64 ELF unwind
+/// emitter gives EVERY function of it an FDE under the one personality CIE (a
+/// function without landing pads gets a filler LSDA with one no-landing-pad
+/// call-site entry; a module whose functions select two personalities is
+/// refused there by name). After a merge with exception-handling structure,
+/// every input's frames therefore run the merged module's personality during
+/// unwinding:
+///
+/// * an input with exception-handling structure must select, on its own, the
+///   same personality name as the merged module;
+/// * when some input defines that personality module-locally, it is that
+///   input's own routine, which no other input's frames run when compiled
+///   separately: no other input with a bodied function may join it;
+/// * an input without exception-handling structure whose frames, compiled
+///   separately, carry no personality at all, gets an EXTERNAL merged
+///   personality with the filler LSDA. That personality is then called once
+///   per such frame an exception unwinds through and finds no landing pad and
+///   no action; this extra call is accepted (see LIMITATIONS.md).
+///
+/// Exception-handling structure here is any `invoke`, `landingpad` or
+/// `resume`, a superset of what lowering gives a personality (an invoke or a
+/// landing pad).
+fn check_merged_eh_personality(modules: &[Module]) -> Result<(), String> {
+    if !modules.iter().any(module_has_eh) {
+        return Ok(());
+    }
+    let merged = trust_cg_lower::eh_personality_for_function_names(
+        modules
+            .iter()
+            .flat_map(|m| m.functions.iter().map(|f| f.name.as_str())),
+    );
+    let local_owner = modules.iter().position(|m| {
+        m.functions
+            .iter()
+            .any(|f| f.name == merged && trust_cg_lower::is_module_local_function_definition(f))
+    });
+    for (i, m) in modules.iter().enumerate() {
+        if let Some(owner) = local_owner
+            && owner != i
+            && m.functions.iter().any(Function::has_body)
+        {
+            return Err(format!(
+                "merge_modules: module {i} (`{}`) defines functions whose frames the merged \
+                 module would unwind with module {owner} (`{}`)'s module-local personality \
+                 `{merged}` (every function of a module with exception-handling structure gets \
+                 the module's personality); compiled separately they never run it — \
+                 fail-closed",
+                m.name, modules[owner].name
+            ));
+        }
+        if !module_has_eh(m) {
+            continue;
+        }
+        let own = trust_cg_lower::eh_personality_for_function_names(
+            m.functions.iter().map(|f| f.name.as_str()),
+        );
+        if own != merged {
+            return Err(format!(
+                "merge_modules: module {i} (`{}`) has exception-handling structure whose \
+                 frames use the personality `{own}`, but the merged module selects `{merged}` \
+                 for every frame — fail-closed",
+                m.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a merge that would bind an input's typed catches through another
+/// input's EH type table.
+///
+/// The lowering adapter binds a typed catch index through the module's
+/// reserved [`trust_cg_lower::function::EH_TYPE_TABLE_GLOBAL`] and refuses a
+/// typed catch in a module that declares none. [`assign_globals`] refuses two
+/// inputs whose tables differ; this refuses the remaining shape, an input
+/// with a typed catch and no table of its own merged beside an input that has
+/// one: its catch type indices would bind to that input's typeinfo symbols,
+/// where compiled separately it is refused. A catch-all or cleanup pad never
+/// consults the table (a function without a typed catch loads none), so an
+/// input without typed catches merges beside a table unchanged.
+fn check_merged_eh_type_table(modules: &[Module]) -> Result<(), String> {
+    let table = trust_cg_lower::function::EH_TYPE_TABLE_GLOBAL;
+    let declares_table = |m: &Module| m.globals.iter().any(|g| g.name == table);
+    let Some(owner) = modules.iter().position(declares_table) else {
+        return Ok(());
+    };
+    for (i, m) in modules.iter().enumerate() {
+        if declares_table(m) {
+            continue;
+        }
+        let typed_catcher = m.functions.iter().find(|f| {
+            f.blocks.iter().flat_map(|block| &block.body).any(|node| {
+                matches!(
+                    &node.inst,
+                    Inst::LandingPad { catch_type_indices, .. }
+                        if catch_type_indices.iter().any(|&index| {
+                            index != 0 && index != trust_cg_lower::function::RUST_EH_EMPTY_FILTER
+                        })
+                )
+            })
+        });
+        if let Some(function) = typed_catcher {
+            return Err(format!(
+                "merge_modules: module {i} (`{}`) function `{}` catches a typed exception but \
+                 the module declares no `{table}` global; merged beside module {owner} (`{}`), \
+                 its catch type indices would bind to that module's typeinfo symbols, while \
+                 compiled separately it is refused [TCG-EH-TTYPE] — fail-closed",
+                m.name, function.name, modules[owner].name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `g` is a cross-object IMPORT declaration (no initializer). The
@@ -1227,21 +2345,38 @@ fn global_upgrade_compatible(import: &Global, def: &Global) -> bool {
         && import.tls == def.tls
         && matches!(
             def.linkage,
-            Linkage::External | Linkage::Weak | Linkage::LinkOnce
+            Linkage::External
+                | Linkage::Weak
+                | Linkage::LinkOnce
+                | Linkage::WeakOdr
+                | Linkage::LinkOnceOdr
         )
 }
 
 /// Merge the per-module `globals` tables name-keyed (first-encounter order,
-/// deterministic): byte-identical same-name entries dedup to one merged entry;
+/// deterministic): same-name entries with identical non-type content and
+/// name-resolved-equal types dedup to one merged entry;
 /// an import is upgraded by a compatible same-name definition (and vice-versa
 /// order); ANY other same-name disagreement fails closed — a wrong
 /// identification would alias two distinct objects or change initializer
 /// bytes, i.e. read/write the wrong data.
+///
+/// Visibility is not content: every input's stated v45 visibility restricts
+/// the one merged symbol. The merged global carries the most constraining
+/// visibility any input states for its name ([`most_constraining_visibility`],
+/// `STV_HIDDEN` over `STV_PROTECTED` over `STV_DEFAULT`), which is what the
+/// static linker gives the symbol under separate compilation (gABI), exactly
+/// as for functions. A hidden or protected import that another input's
+/// default definition satisfies therefore keeps that definition out of
+/// `.dynsym` (hidden) or bound to itself (protected), in either input order.
 fn assign_globals(modules: &[Module]) -> Result<GlobalsAssign, String> {
     let mut name_to_dense: HashMap<String, u32> = HashMap::new();
     let mut merged: Vec<Global> = Vec::new();
     // Which module contributed the current winner (for error messages).
     let mut winner_mod: Vec<usize> = Vec::new();
+    // visibilities[dense] = the most constraining visibility any input states
+    // for that name; written onto the winner once every input is read.
+    let mut visibilities: Vec<trust_ir::Visibility> = Vec::new();
     let mut per_module: Vec<HashMap<u32, u32>> = Vec::with_capacity(modules.len());
     for (i, m) in modules.iter().enumerate() {
         let mut map = HashMap::new();
@@ -1257,11 +2392,26 @@ fn assign_globals(modules: &[Module]) -> Result<GlobalsAssign, String> {
                     name_to_dense.insert(g.name.clone(), d);
                     merged.push(g.clone());
                     winner_mod.push(i);
+                    visibilities.push(g.visibility);
                     d
                 }
                 Some(&d) => {
                     let w = &merged[d as usize];
-                    if g == w {
+                    tys_equal_name_resolved(
+                        m, &g.ty, &modules[winner_mod[d as usize]], &w.ty, TY_CMP_DEPTH_LIMIT,
+                    ).map_err(|reason| format!(
+                        "merge_modules: global `{}` has DIFFERENT content (type) in module {} and module {i}: {reason}",
+                        g.name, winner_mod[d as usize],
+                    ))?;
+                    // Compare every other Global field using its complete
+                    // equality implementation, not an incomplete field list.
+                    // Only this comparison copy has its raw local type ids
+                    // normalized; the winner keeps its real source type.
+                    // Visibility is merged, not compared (see above).
+                    let mut comparable = g.clone();
+                    comparable.ty = w.ty.clone();
+                    comparable.visibility = w.visibility;
+                    if &comparable == w {
                         // Byte-identical redeclaration. Two IMPORTS of one
                         // external object trivially denote the same storage —
                         // dedup. Two byte-identical DEFINITIONS dedup only
@@ -1282,6 +2432,8 @@ fn assign_globals(modules: &[Module]) -> Result<GlobalsAssign, String> {
                                     | Linkage::Private
                                     | Linkage::Weak
                                     | Linkage::LinkOnce
+                                    | Linkage::WeakOdr
+                                    | Linkage::LinkOnceOdr
                             );
                         if !(both_imports || dedupable_defs) {
                             return Err(format!(
@@ -1302,14 +2454,14 @@ fn assign_globals(modules: &[Module]) -> Result<GlobalsAssign, String> {
                         }
                     } else if global_is_import(w)
                         && !global_is_import(g)
-                        && global_upgrade_compatible(w, g)
+                        && global_upgrade_compatible(w, &comparable)
                     {
                         // decl -> def upgrade.
                         merged[d as usize] = g.clone();
                         winner_mod[d as usize] = i;
                     } else if !global_is_import(w)
                         && global_is_import(g)
-                        && global_upgrade_compatible(g, w)
+                        && global_upgrade_compatible(&comparable, w)
                     {
                         // Existing definition already satisfies this import.
                     } else {
@@ -1325,6 +2477,8 @@ fn assign_globals(modules: &[Module]) -> Result<GlobalsAssign, String> {
                             m.name
                         ));
                     }
+                    visibilities[d as usize] =
+                        most_constraining_visibility(visibilities[d as usize], g.visibility);
                     d
                 }
             };
@@ -1332,7 +2486,14 @@ fn assign_globals(modules: &[Module]) -> Result<GlobalsAssign, String> {
         }
         per_module.push(map);
     }
-    Ok(GlobalsAssign { merged, per_module })
+    for (global, visibility) in merged.iter_mut().zip(visibilities) {
+        global.visibility = visibility;
+    }
+    Ok(GlobalsAssign {
+        merged,
+        winner_mod,
+        per_module,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,6 +2507,10 @@ struct ModMaps {
     func_ty_base: u32,
     /// Source module's `func_types` length (bounds check before shifting).
     func_ty_len: usize,
+    /// Old `FuncTyId` index -> merged id, for the signatures a declaration
+    /// shares with the definition that upgrades it (see
+    /// [`unify_upgraded_signatures`]); every other id is base-shifted.
+    func_ty_canon: HashMap<u32, u32>,
     /// `ClosureTyId` shift (concatenated `closure_types`).
     closure_base: u32,
     /// Source module's `closure_types` length.
@@ -1381,6 +2546,105 @@ fn shifted(idx: u32, base: u32, len: usize, what: &str) -> Result<u32, String> {
     }
     idx.checked_add(base)
         .ok_or_else(|| format!("merge_modules: remapped {what} exceeds u32 id space"))
+}
+
+/// The merged `FuncTyId` of source id `idx`: the base-shifted id, redirected
+/// through [`ModMaps::func_ty_canon`] when that signature was unified with an
+/// upgrading definition's.
+fn func_ty_id(idx: u32, m: &ModMaps, what: &str) -> Result<u32, String> {
+    let shifted_id = shifted(idx, m.func_ty_base, m.func_ty_len, what)?;
+    Ok(m.func_ty_canon.get(&idx).copied().unwrap_or(shifted_id))
+}
+
+/// Unify the signature of every declaration with the signature of the
+/// definition that upgrades it (and, transitively, every signature joined to
+/// it that way), when the two are name-resolved structurally equal.
+///
+/// `func_types` is concatenated, so a declaration in module A and its
+/// definition in module B keep DIFFERENT merged `FuncTyId`s even when the
+/// signatures are equal. trust-ir compares `Ty::Func` NOMINALLY: a caller's
+/// `Const FnDef(f) : Ty::Func(t_A)` (its own signature id, the one its
+/// declaration carried) no longer names `f`'s merged `ty` (`t_B`), which the
+/// validator refuses (`ConstTypeMismatch`), and since WS7.3 every ingestion
+/// entry refuses what it refuses. Each class of equal signatures maps to its
+/// smallest merged id; the table itself is not compacted (no id moves; an
+/// entry no reference names is harmless). Signatures that differ are left
+/// apart (and the identity self-check reports the upgrade as before).
+fn unify_upgraded_signatures(
+    modules: &[Module],
+    winners: &[Option<(usize, &Function)>],
+    name_to_dense: &HashMap<String, u32>,
+    func_ty_base: &[u32],
+) -> Result<Vec<HashMap<u32, u32>>, String> {
+    fn find(parent: &mut HashMap<u32, u32>, x: u32) -> u32 {
+        let mut root = x;
+        while let Some(&p) = parent.get(&root) {
+            if p == root {
+                break;
+            }
+            root = p;
+        }
+        let mut node = x;
+        while node != root {
+            let next = parent.get(&node).copied().unwrap_or(root);
+            parent.insert(node, root);
+            node = next;
+        }
+        root
+    }
+    let mut parent: HashMap<u32, u32> = HashMap::new();
+    for (i, m) in modules.iter().enumerate() {
+        for f in &m.functions {
+            let Some(&dense) = name_to_dense.get(&f.name) else {
+                continue;
+            };
+            let Some((wm, wf)) = winners.get(dense as usize).copied().flatten() else {
+                continue;
+            };
+            if wm == i && wf.ty == f.ty {
+                continue;
+            }
+            if func_tys_equal_name_resolved(m, f.ty, &modules[wm], wf.ty, TY_CMP_DEPTH_LIMIT)
+                .is_err()
+            {
+                continue;
+            }
+            let a = shifted(
+                f.ty.index(),
+                func_ty_base[i],
+                m.func_types.len(),
+                "Function.ty func_type",
+            )?;
+            let b = shifted(
+                wf.ty.index(),
+                func_ty_base[wm],
+                modules[wm].func_types.len(),
+                "Function.ty func_type",
+            )?;
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                let (keep, drop) = if ra < rb { (ra, rb) } else { (rb, ra) };
+                parent.insert(drop, keep);
+                parent.entry(keep).or_insert(keep);
+            }
+        }
+    }
+    let mut per_module: Vec<HashMap<u32, u32>> = vec![HashMap::new(); modules.len()];
+    for (i, m) in modules.iter().enumerate() {
+        for local in 0..m.func_types.len() {
+            let local = u32::try_from(local).map_err(|_| {
+                format!("merge_modules: module {i} func_types exceeds u32 id space")
+            })?;
+            let concat = shifted(local, func_ty_base[i], m.func_types.len(), "func_type")?;
+            if parent.contains_key(&concat) {
+                let root = find(&mut parent, concat);
+                if root != concat {
+                    per_module[i].insert(local, root);
+                }
+            }
+        }
+    }
+    Ok(per_module)
 }
 
 /// Resolve an old id through a per-module map; a missing entry is a dangling
@@ -1427,10 +2691,18 @@ fn remap_ty(
     resolve_tyid: &mut dyn FnMut(u32) -> Result<u32, String>,
 ) -> Result<Ty, String> {
     Ok(match ty {
-        Ty::Func(ftid) => Ty::Func(FuncTyId::new(shifted(
+        Ty::Ext(e) => e.unreachable(),
+        // Nominal dialect types carry no module-local IDs. Preserve their
+        // complete identity here; only semantic legalization may erase them.
+        Ty::Dialect(_) => ty.clone(),
+        // A v43 opaque runtime handle carries no module-local IDs either, and
+        // its `(name, runtime)` pair IS its identity: two runtimes' handles
+        // are distinct types and never interchangeable, so the merge preserves
+        // the pair exactly rather than remapping or unifying anything.
+        Ty::Handle(_) | Ty::Storage(_) => ty.clone(),
+        Ty::Func(ftid) => Ty::Func(FuncTyId::new(func_ty_id(
             ftid.index(),
-            m.func_ty_base,
-            m.func_ty_len,
+            m,
             "Ty::Func func_type",
         )?)),
         Ty::Closure(cid) => Ty::Closure(ClosureTyId::new(shifted(
@@ -1463,13 +2735,17 @@ fn remap_ty(
         Ty::FatPtr(FatPtrKind::Slice(tid)) => {
             Ty::FatPtr(FatPtrKind::Slice(TyId::new(resolve_tyid(tid.index())?)))
         }
-        // `Str` and `ContainerLen` carry nothing; `TraitObject::trait_id`
-        // indexes no module table (nothing to remap, nothing that can dangle)
-        // — pass through.
+        // `Str`, `ContainerLen` and `ContainerVtable` carry nothing;
+        // `TraitObject::trait_id` indexes no module table (nothing to remap,
+        // nothing that can dangle) — pass through, kind preserved verbatim.
         Ty::FatPtr(
-            k @ (FatPtrKind::Str | FatPtrKind::ContainerLen | FatPtrKind::TraitObject { .. }),
+            k @ (FatPtrKind::Str
+            | FatPtrKind::ContainerLen
+            | FatPtrKind::ContainerVtable
+            | FatPtrKind::TraitObject { .. }),
         ) => Ty::FatPtr(*k),
         Ty::Vector(inner, n) => Ty::Vector(Box::new(remap_ty(inner, m, resolve_tyid)?), *n),
+        Ty::Tensor(inner, rank) => Ty::Tensor(Box::new(remap_ty(inner, m, resolve_tyid)?), *rank),
         Ty::Ref(inner) => Ty::Ref(Box::new(remap_ty(inner, m, resolve_tyid)?)),
         Ty::RefMut(inner) => Ty::RefMut(Box::new(remap_ty(inner, m, resolve_tyid)?)),
         Ty::PtrConst(inner) => Ty::PtrConst(Box::new(remap_ty(inner, m, resolve_tyid)?)),
@@ -1680,6 +2956,7 @@ fn remap_struct_def(sd: &StructDef, dense: u32, mm: &ModMaps) -> Result<StructDe
         size: sd.size,
         align: sd.align,
         repr: sd.repr,
+        origin: sd.origin.clone(),
     })
 }
 
@@ -1705,6 +2982,7 @@ fn remap_enum_def(ed: &EnumDef, dense: u32, mm: &ModMaps) -> Result<EnumDef, Str
         discriminants: ed.discriminants.clone(),
         repr: ed.repr,
         layout: ed.layout.clone(),
+        origin: ed.origin.clone(),
     })
 }
 
@@ -1753,8 +3031,23 @@ fn remap_inst(
         Ok(())
     };
     match inst {
-        // One embedded value/pointee type.
-        Inst::BinOp { ty, .. }
+        Inst::TensorMap { .. }
+        | Inst::TensorReduce { .. }
+        | Inst::TensorView { .. }
+        | Inst::TensorGather { .. }
+        | Inst::TensorScatter { .. } => {
+            return Err(
+                "merge_modules: tensor map/reduce/view/gather/scatter requires native tensor lowering"
+                    .into(),
+            );
+        }
+        // One embedded value/pointee type. `MakeAggregate` (trust-ir WS3.5)
+        // and `ArraySplat` (v50) carry the aggregate type they build, so they
+        // remap like the rest.
+        Inst::MakeAggregate { ty, .. }
+        | Inst::TensorContract { ty, .. }
+        | Inst::ArraySplat { ty, .. }
+        | Inst::BinOp { ty, .. }
         | Inst::UnOp { ty, .. }
         | Inst::Overflow { ty, .. }
         | Inst::ICmp { ty, .. }
@@ -1767,6 +3060,8 @@ fn remap_inst(
         | Inst::AtomicStore { ty, .. }
         | Inst::AtomicRMW { ty, .. }
         | Inst::CmpXchg { ty, .. }
+        | Inst::Drop { ty, .. }
+        | Inst::DropInvoke { ty, .. }
         | Inst::ExtractField { ty, .. }
         | Inst::InsertField { ty, .. }
         | Inst::ExtractElement { ty, .. }
@@ -1779,6 +3074,20 @@ fn remap_inst(
         | Inst::SeqMapNot { ty, .. }
         | Inst::GEP { pointee_ty: ty, .. }
         | Inst::PtrData { ptr_ty: ty, .. } => rt(ty)?,
+        Inst::MakeClosure { ty, func, .. } => {
+            let closure = shifted(
+                ty.index(),
+                mm.closure_base,
+                mm.closure_len,
+                "Inst::MakeClosure closure type",
+            )?;
+            let mut target = *func;
+            remap_fid(&mut target)?;
+            // Commit both validated module references together. Captures are
+            // function-local SSA IDs and retain their order and multiplicity.
+            *ty = ClosureTyId::new(closure);
+            *func = target;
+        }
         // Two embedded types.
         Inst::Cast { src_ty, dst_ty, .. } => {
             rt(src_ty)?;
@@ -1833,24 +3142,38 @@ fn remap_inst(
             }
         }
         // Direct function references.
-        Inst::Call { callee, .. } | Inst::Invoke { callee, .. } => remap_fid(callee)?,
+        // v53: the non-propagating boundary twins carry the same references.
+        Inst::Call { callee, .. }
+        | Inst::CallCannotUnwind { callee, .. }
+        | Inst::Invoke { callee, .. } => remap_fid(callee)?,
         Inst::SeqMap { ty, fwd, .. } => {
             rt(ty)?;
             remap_fid(fwd)?;
         }
-        Inst::CallIndirect { sig, .. } => {
-            *sig = FuncTyId::new(shifted(
-                sig.index(),
-                mm.func_ty_base,
-                mm.func_ty_len,
-                "CallIndirect.sig func_type",
-            )?);
+        // v56: `InvokeIndirect` carries `CallIndirect`'s signature reference.
+        Inst::CallIndirect { sig, .. }
+        | Inst::CallIndirectCannotUnwind { sig, .. }
+        | Inst::InvokeIndirect { sig, .. } => {
+            *sig = FuncTyId::new(func_ty_id(sig.index(), mm, "CallIndirect.sig func_type")?);
         }
         // Direct global reference by id: a plain index remap through the
         // name-unified merged globals table.
         Inst::GlobalAddr { global } => {
             let new = mapped(&mm.global_map, global.index(), "Inst::GlobalAddr global")?;
             *global = GlobalId::new(new);
+        }
+        // v54 (amendment P): a panic site's `entry` is a direct call edge and
+        // a `Global` location a global reference; a splice remaps both (a
+        // `Value` location is function-local).
+        Inst::Assert {
+            site: Some(site), ..
+        }
+        | Inst::AssertInvoke { site, .. } => {
+            remap_fid(&mut site.entry)?;
+            if let PanicLocation::Global(global) = &mut site.location {
+                let new = mapped(&mm.global_map, global.index(), "panic-site location global")?;
+                *global = GlobalId::new(new);
+            }
         }
         // Rejected by the precheck; hitting it here is a gate bypass.
         Inst::DialectOp(_) => {
@@ -1867,7 +3190,7 @@ fn remap_inst(
         | Inst::Return { .. }
         | Inst::NullPtr
         | Inst::Assume { .. }
-        | Inst::Assert { .. }
+        | Inst::Assert { site: None, .. }
         | Inst::Unreachable
         | Inst::Borrow { .. }
         | Inst::BorrowMut { .. }
@@ -1876,6 +3199,10 @@ fn remap_inst(
         | Inst::Release { .. }
         | Inst::IsUnique { .. }
         | Inst::Dealloc { .. }
+        // trust-ir WS3.20 bulk memory: pointers, fill byte and count are all
+        // function-local values.
+        | Inst::MemCopy { .. }
+        | Inst::MemSet { .. }
         | Inst::BindSlot { .. }
         | Inst::CloseFrame { .. }
         | Inst::CoroSuspend { .. }
@@ -1900,6 +3227,7 @@ fn remap_constant(c: &mut Constant, fid_map: &HashMap<u32, u32>) -> Result<(), S
         Ok(())
     };
     match c {
+        Constant::Ext(e) => e.unreachable(),
         Constant::FnDef(fid) => remap_fid(fid)?,
         Constant::Closure { func, captures } => {
             remap_fid(func)?;
@@ -1916,6 +3244,8 @@ fn remap_constant(c: &mut Constant, fid_map: &HashMap<u32, u32>) -> Result<(), S
                 remap_constant(e, fid_map)?;
             }
         }
+        // trust-ir v50: the one element stands for every lane.
+        Constant::Splat { elem, .. } => remap_constant(elem, fid_map)?,
         Constant::Record(fields) => {
             for (_, e) in fields {
                 remap_constant(e, fid_map)?;
@@ -1937,13 +3267,16 @@ fn remap_constant(c: &mut Constant, fid_map: &HashMap<u32, u32>) -> Result<(), S
             }
         }
         // v24 U128 / v25 Bytes: FuncId-free and never stub-shaped — nothing
-        // to remap.
+        // to remap; a v49 Uninit lane holds no value; a v70 weight blob names
+        // content-addressed bytes, which no merge renumbers.
         Constant::U128(_)
         | Constant::Bytes { .. }
         | Constant::Float(_)
         | Constant::Bool(_)
         | Constant::SymbolAddr { .. }
-        | Constant::PhantomData => {}
+        | Constant::TensorBlob { .. }
+        | Constant::PhantomData
+        | Constant::Uninit => {}
     }
     Ok(())
 }
@@ -2032,6 +3365,7 @@ pub(crate) fn structural_self_check(
     // external import (mirrors the precheck, re-derived on the OUTPUT).
     let mut global_names: HashSet<&str> = HashSet::new();
     for g in &merged.globals {
+        check_ty_resolvable(&g.ty, &counts, &format!("global `{}`", g.name))?;
         if !global_names.insert(g.name.as_str()) {
             return Err(format!(
                 "merge_modules self-check: duplicate global name `{}`",
@@ -2041,7 +3375,11 @@ pub(crate) fn structural_self_check(
         if g.initializer.is_none()
             && !matches!(
                 g.linkage,
-                Linkage::External | Linkage::Weak | Linkage::LinkOnce
+                Linkage::External
+                    | Linkage::Weak
+                    | Linkage::LinkOnce
+                    | Linkage::WeakOdr
+                    | Linkage::LinkOnceOdr
             )
         {
             return Err(format!(
@@ -2245,6 +3583,18 @@ pub(crate) fn structural_self_check(
                         merged.files.len()
                     ));
                 }
+                if let Some(inlined_at) = &scope.inlined_at
+                    && !merged.files.is_empty()
+                    && inlined_at.span.file as usize >= merged.files.len()
+                {
+                    return Err(format!(
+                        "merge_modules self-check: function `{}` has an inlining link whose \
+                         call-site span file index {} is out of range (only {} file(s))",
+                        f.name,
+                        inlined_at.span.file,
+                        merged.files.len()
+                    ));
+                }
             }
         }
         for b in &f.blocks {
@@ -2309,7 +3659,20 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
         }
     };
     match inst {
-        Inst::BinOp { ty, .. }
+        Inst::TensorMap { .. }
+        | Inst::TensorReduce { .. }
+        | Inst::TensorView { .. }
+        | Inst::TensorGather { .. }
+        | Inst::TensorScatter { .. } => {
+            return Err(
+                "merge_modules self-check: tensor map/reduce/view/gather/scatter has no native tensor lowering"
+                    .into(),
+            );
+        }
+        Inst::MakeAggregate { ty, .. }
+        | Inst::TensorContract { ty, .. }
+        | Inst::ArraySplat { ty, .. }
+        | Inst::BinOp { ty, .. }
         | Inst::UnOp { ty, .. }
         | Inst::Overflow { ty, .. }
         | Inst::ICmp { ty, .. }
@@ -2322,6 +3685,8 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
         | Inst::AtomicStore { ty, .. }
         | Inst::AtomicRMW { ty, .. }
         | Inst::CmpXchg { ty, .. }
+        | Inst::Drop { ty, .. }
+        | Inst::DropInvoke { ty, .. }
         | Inst::ExtractField { ty, .. }
         | Inst::InsertField { ty, .. }
         | Inst::ExtractElement { ty, .. }
@@ -2334,6 +3699,10 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
         | Inst::SeqMapNot { ty, .. }
         | Inst::GEP { pointee_ty: ty, .. }
         | Inst::PtrData { ptr_ty: ty, .. } => check_ty_resolvable(ty, c, fname)?,
+        Inst::MakeClosure { ty, func, .. } => {
+            check_ty_resolvable(&Ty::Closure(*ty), c, fname)?;
+            check_fid(*func)?;
+        }
         Inst::Cast { src_ty, dst_ty, .. } => {
             check_ty_resolvable(src_ty, c, fname)?;
             check_ty_resolvable(dst_ty, c, fname)?;
@@ -2395,12 +3764,16 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
                 check_constant_in_range(&case.value, c.functions, fname)?;
             }
         }
-        Inst::Call { callee, .. } | Inst::Invoke { callee, .. } => check_fid(*callee)?,
+        Inst::Call { callee, .. }
+        | Inst::CallCannotUnwind { callee, .. }
+        | Inst::Invoke { callee, .. } => check_fid(*callee)?,
         Inst::SeqMap { ty, fwd, .. } => {
             check_ty_resolvable(ty, c, fname)?;
             check_fid(*fwd)?;
         }
-        Inst::CallIndirect { sig, .. } => {
+        Inst::CallIndirect { sig, .. }
+        | Inst::CallIndirectCannotUnwind { sig, .. }
+        | Inst::InvokeIndirect { sig, .. } => {
             if sig.index() as usize >= c.func_types {
                 return Err(format!(
                     "merge_modules self-check: function `{fname}` CallIndirect.sig FuncTyId({}) out \
@@ -2420,6 +3793,22 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
                 ));
             }
         }
+        Inst::Assert {
+            site: Some(site), ..
+        }
+        | Inst::AssertInvoke { site, .. } => {
+            check_fid(site.entry)?;
+            if let Some(global) = site.location_global()
+                && global.index() as usize >= c.globals
+            {
+                return Err(format!(
+                    "merge_modules self-check: function `{fname}` panic site references global \
+                     id {} out of range (only {} global(s))",
+                    global.index(),
+                    c.globals
+                ));
+            }
+        }
         // A merged module from this pass must be dialect-free.
         Inst::DialectOp(_) => {
             return Err(format!(
@@ -2433,7 +3822,7 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
         | Inst::Return { .. }
         | Inst::NullPtr
         | Inst::Assume { .. }
-        | Inst::Assert { .. }
+        | Inst::Assert { site: None, .. }
         | Inst::Unreachable
         | Inst::Borrow { .. }
         | Inst::BorrowMut { .. }
@@ -2442,6 +3831,10 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
         | Inst::Release { .. }
         | Inst::IsUnique { .. }
         | Inst::Dealloc { .. }
+        // trust-ir WS3.20 bulk memory: pointers, fill byte and count are all
+        // function-local values.
+        | Inst::MemCopy { .. }
+        | Inst::MemSet { .. }
         | Inst::BindSlot { .. }
         | Inst::CloseFrame { .. }
         | Inst::CoroSuspend { .. }
@@ -2454,6 +3847,7 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
 /// Read-only constant reference check (exhaustive over `Constant`).
 fn check_constant_in_range(c: &Constant, func_count: u32, fname: &str) -> Result<(), String> {
     match c {
+        Constant::Ext(e) => e.unreachable(),
         Constant::FnDef(fid) => {
             if fid.index() >= func_count {
                 return Err(format!(
@@ -2484,6 +3878,7 @@ fn check_constant_in_range(c: &Constant, func_count: u32, fname: &str) -> Result
                 check_constant_in_range(e, func_count, fname)?;
             }
         }
+        Constant::Splat { elem, .. } => check_constant_in_range(elem, func_count, fname)?,
         Constant::Record(fields) => {
             for (_, e) in fields {
                 check_constant_in_range(e, func_count, fname)?;
@@ -2503,13 +3898,16 @@ fn check_constant_in_range(c: &Constant, func_count: u32, fname: &str) -> Result
             }
         }
         // v24 U128: FuncId-free and never stub-shaped (a stub is u64-sized,
-        // canonically spelled Int) — nothing to remap.
+        // canonically spelled Int) — nothing to remap; nor a v49 Uninit lane,
+        // nor a v70 weight blob (a digest and extents).
         Constant::U128(_)
         | Constant::Bytes { .. }
         | Constant::Float(_)
         | Constant::Bool(_)
         | Constant::SymbolAddr { .. }
-        | Constant::PhantomData => {}
+        | Constant::TensorBlob { .. }
+        | Constant::PhantomData
+        | Constant::Uninit => {}
     }
     Ok(())
 }
@@ -2527,6 +3925,26 @@ fn check_ty_resolvable(ty: &Ty, c: &TableCounts, loc: &str) -> Result<(), String
         )
     };
     match ty {
+        Ty::Ext(e) => e.unreachable(),
+        Ty::Dialect(ty) => ty
+            .validate()
+            .map_err(|error| format!("merge_modules self-check: {loc}: {error}"))?,
+        // A handle references no module table, but its identity is LEXICAL
+        // (`HandleTy::validate`), exactly as a dialect type's is, and the
+        // merged module is re-serialized: a malformed pair would be written
+        // out as if this backend had vouched for it.
+        Ty::Handle(ty) => ty
+            .validate()
+            .map_err(|error| format!("merge_modules self-check: {loc}: {error}"))?,
+        Ty::Storage(layout) => {
+            // No table IDs; whole-module policy later checks target width and
+            // every typed use. Do not treat dimensions as initialized bytes.
+            if !layout.is_well_formed(64) {
+                return Err(format!(
+                    "merge_modules self-check: {loc}: invalid Storage geometry {layout:?}"
+                ));
+            }
+        }
         Ty::Func(id) => {
             if id.index() as usize >= c.func_types {
                 return Err(oob("func_type", id.index(), c.func_types));
@@ -2568,9 +3986,14 @@ fn check_ty_resolvable(ty: &Ty, c: &TableCounts, loc: &str) -> Result<(), String
                 return Err(oob("types-table", tid.index(), c.types));
             }
         }
-        Ty::FatPtr(FatPtrKind::Str | FatPtrKind::ContainerLen | FatPtrKind::TraitObject { .. }) => {
-        }
+        Ty::FatPtr(
+            FatPtrKind::Str
+            | FatPtrKind::ContainerLen
+            | FatPtrKind::ContainerVtable
+            | FatPtrKind::TraitObject { .. },
+        ) => {}
         Ty::Vector(inner, _)
+        | Ty::Tensor(inner, _)
         | Ty::Ref(inner)
         | Ty::RefMut(inner)
         | Ty::PtrConst(inner)
@@ -2609,6 +4032,32 @@ fn check_ty_resolvable(ty: &Ty, c: &TableCounts, loc: &str) -> Result<(), String
 // ---------------------------------------------------------------------------
 // Lockstep global-reference preservation check (DEFENSE (iii))
 // ---------------------------------------------------------------------------
+
+/// Check actual source and output tables, without consulting the remap maps or
+/// winner indices. This also covers imports/deduplicated contributors that did
+/// not win, and catches wrong-but-in-range global type ids.
+fn verify_global_type_preservation(modules: &[Module], merged: &Module) -> Result<(), String> {
+    for module in modules {
+        for source in &module.globals {
+            let actual = merged
+                .globals
+                .iter()
+                .find(|global| global.name == source.name)
+                .ok_or_else(|| {
+                    format!(
+                        "merge_modules global-type preservation: missing global `{}`",
+                        source.name
+                    )
+                })?;
+            tys_equal_name_resolved(module, &source.ty, merged, &actual.ty, TY_CMP_DEPTH_LIMIT)
+                .map_err(|reason| format!(
+                    "merge_modules global-type preservation: global `{}` from module `{}` changed type: {reason}",
+                    source.name, module.name,
+                ))?;
+        }
+    }
+    Ok(())
+}
 
 /// Re-walk every merged function body IN LOCKSTEP with its source (winner)
 /// body and prove, position by position, that the merge preserved the MEANING
@@ -2891,10 +4340,59 @@ fn verify_function_identity_preservation(
                         &mf.name,
                     ));
                 }
+                // Function-local SSA IDs never change in a module merge.
+                // Check the borrowed call shape independently of remapping:
+                // in particular, a normative boundary cannot erase operands
+                // or become an ordinary call. This grants no target admission.
+                if let (Some(source), Some(actual)) = (sn.inst.call_shape(), mn.inst.call_shape()) {
+                    if source.unwind != actual.unwind || source.args != actual.args {
+                        return Err(ierr("call operands or unwind boundary changed", &mf.name));
+                    }
+                    if let (
+                        trust_ir::CallTarget::Indirect { callee: sc, .. },
+                        trust_ir::CallTarget::Indirect { callee: mc, .. },
+                    ) = (source.target, actual.target)
+                        && sc != mc
+                    {
+                        return Err(ierr("indirect call value operand changed", &mf.name));
+                    }
+                }
+                if let (
+                    Inst::MakeClosure {
+                        ty: source_ty,
+                        captures: source,
+                        ..
+                    },
+                    Inst::MakeClosure {
+                        ty: actual_ty,
+                        captures: actual,
+                        ..
+                    },
+                ) = (&sn.inst, &mn.inst)
+                {
+                    if source != actual {
+                        return Err(ierr("MakeClosure capture operands changed", &mf.name));
+                    }
+                    tys_equal_name_resolved(
+                        src_mod,
+                        &Ty::Closure(*source_ty),
+                        merged,
+                        &Ty::Closure(*actual_ty),
+                        TY_CMP_DEPTH_LIMIT,
+                    )
+                    .map_err(|error| {
+                        ierr(&format!("MakeClosure type diverged: {error}"), &mf.name)
+                    })?;
+                }
                 match (&sn.inst, &mn.inst) {
                     (Inst::Call { callee: sc, .. }, Inst::Call { callee: mc, .. })
+                    | (
+                        Inst::CallCannotUnwind { callee: sc, .. },
+                        Inst::CallCannotUnwind { callee: mc, .. },
+                    )
                     | (Inst::Invoke { callee: sc, .. }, Inst::Invoke { callee: mc, .. })
-                    | (Inst::SeqMap { fwd: sc, .. }, Inst::SeqMap { fwd: mc, .. }) => {
+                    | (Inst::SeqMap { fwd: sc, .. }, Inst::SeqMap { fwd: mc, .. })
+                    | (Inst::MakeClosure { func: sc, .. }, Inst::MakeClosure { func: mc, .. }) => {
                         let sname = func_name_by_id(src_mod, *sc)
                             .map_err(|e| ierr(&format!("source callee: {e}"), &mf.name))?;
                         let mname = func_name_by_id(merged, *mc)
@@ -2919,6 +4417,18 @@ fn verify_function_identity_preservation(
                             ..
                         },
                         Inst::CallIndirect {
+                            sig: ms,
+                            calling_conv: mcc,
+                            ..
+                        },
+                    )
+                    | (
+                        Inst::CallIndirectCannotUnwind {
+                            sig: ss,
+                            calling_conv: scc,
+                            ..
+                        },
+                        Inst::CallIndirectCannotUnwind {
                             sig: ms,
                             calling_conv: mcc,
                             ..
@@ -3114,7 +4624,29 @@ fn constants_identity_preserved(
                 Ok(())
             }
         }
-        (Constant::PhantomData, Constant::PhantomData) => Ok(()),
+        (Constant::PhantomData, Constant::PhantomData) | (Constant::Uninit, Constant::Uninit) => {
+            Ok(())
+        }
+        // trust-ir v70: a weight-blob constant names its bytes by digest and
+        // extents, with nothing to remap. The precheck refuses every input
+        // carrying a blob table, so none reaches here from a merge; the
+        // comparison stays exact regardless.
+        (
+            Constant::TensorBlob {
+                digest: sd,
+                dims: sm,
+            },
+            Constant::TensorBlob {
+                digest: md,
+                dims: mm,
+            },
+        ) => {
+            if sd != md || sm != mm {
+                Err("TensorBlob constant digest or extents changed".to_string())
+            } else {
+                Ok(())
+            }
+        }
         // Different variants: the merge never changes a constant's shape.
         // (This arm is the fail-closed catch-all — a NEW Constant variant
         // still breaks compilation in the exhaustive `remap_constant` /
@@ -3131,7 +4663,7 @@ fn constants_identity_preserved(
 const TY_CMP_DEPTH_LIMIT: u32 = 64;
 
 /// Name-resolved structural equality of two `FuncTy`s living in DIFFERENT
-/// modules' tables: arity, varargness, and each param/return compared via
+/// modules' tables: recorded ABI custody, arity, varargness, and each param/return compared via
 /// [`tys_equal_name_resolved`].
 fn func_tys_equal_name_resolved(
     sm: &Module,
@@ -3148,6 +4680,8 @@ fn func_tys_equal_name_resolved(
         .func_types
         .get(m_ftid.index() as usize)
         .ok_or_else(|| format!("merged FuncTyId({}) out of range", m_ftid.index()))?;
+    signature_abi_custody::require_same(Some(sft), Some(mft))
+        .map_err(|error| format!("signature ABI changed across the merge: {error}"))?;
     if sft.params.len() != mft.params.len()
         || sft.returns.len() != mft.returns.len()
         || sft.is_vararg != mft.is_vararg
@@ -3313,6 +4847,14 @@ fn tys_equal_name_resolved(
         // compiler cannot catch, because a catch-all makes every match
         // exhaustive.
         (Ty::FatPtr(FatPtrKind::ContainerLen), Ty::FatPtr(FatPtrKind::ContainerLen)) => Ok(()),
+        // Same rule, same reason, for the `dyn`-tail container kind (trust-ir
+        // v40). It is deliberately NOT paired with `TraitObject`: the two lay
+        // out identically but mean different things (container header vs
+        // dispatched object), so a `ContainerVtable` against a `TraitObject`
+        // falls to the catch-all and is reported INCOMPATIBLE.
+        (Ty::FatPtr(FatPtrKind::ContainerVtable), Ty::FatPtr(FatPtrKind::ContainerVtable)) => {
+            Ok(())
+        }
         (
             Ty::FatPtr(FatPtrKind::TraitObject { trait_id: st }),
             Ty::FatPtr(FatPtrKind::TraitObject { trait_id: mt }),
@@ -3343,6 +4885,31 @@ fn tys_equal_name_resolved(
             }
             Ok(())
         }
+        (Ty::Dialect(source), Ty::Dialect(merged)) => {
+            if source != merged {
+                return Err(mismatch("dialect nominal identity"));
+            }
+            Ok(())
+        }
+        // Same rule, same reason as `ContainerLen` above, for the v43 opaque
+        // runtime handle: without this arm two IDENTICAL `handle<Nat,
+        // trust_bignum::Nat>` types fall to `_ => Err(mismatch("variant"))` and
+        // every merge of a handle-bearing module is reported incompatible —
+        // the defect a catch-all hides. Identity is the exact `(name, runtime)`
+        // pair and nothing else; two runtimes' handles must NEVER compare
+        // equal, or a merge could hand one runtime the other's words.
+        (Ty::Storage(source), Ty::Storage(merged)) => {
+            if source != merged {
+                return Err(mismatch("addressable storage geometry"));
+            }
+            Ok(())
+        }
+        (Ty::Handle(source), Ty::Handle(merged)) => {
+            if source != merged {
+                return Err(mismatch("opaque runtime handle nominal identity"));
+            }
+            Ok(())
+        }
         (Ty::I8, Ty::I8)
         | (Ty::I16, Ty::I16)
         | (Ty::I32, Ty::I32)
@@ -3369,12 +4936,35 @@ fn tys_equal_name_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This file's fixtures are hand-built and carry no codegen license
+    /// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+    /// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+    /// them passes because it was silently refused.
+    fn permit_unlicensed() -> crate::CodegenLicensePolicy {
+        crate::CodegenLicensePolicy::default().with_unlicensed(crate::UnlicensedBodyPolicy::Permit)
+    }
+
+    /// `translate_module` under [`permit_unlicensed`].
+    fn permit_translate_module(
+        module: &trust_ir::Module,
+    ) -> Result<
+        Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+        trust_cg_lower::AdapterError,
+    > {
+        trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+            module,
+            trust_cg_lower::GuardCarrierArch::default(),
+            trust_cg_lower::TlsDialect::default(),
+            &permit_unlicensed(),
+        )
+    }
     use trust_ir::proof::ProofContext;
     use trust_ir::{
         BinOp, Block, BlockId, CallingConv, DialectInst, EnumLayoutDescriptor, EnumTagEncoding,
-        FunctionSummary, Global, ICmpOp, InstrNode, InterpretValue, Interpreter, Linkage,
-        ObligationKind, ProofFormula, ProofId, ProofObligation, ProofStatus, ScopeData, SourceSpan,
-        SwitchCase, ValueId,
+        FunctionSummary, Global, ICmpOp, InlinedAt, InstrNode, InterpretValue, Interpreter,
+        Linkage, ObligationKind, ProofFormula, ProofId, ProofObligation, ProofStatus, ScopeData,
+        SourceSpan, SwitchCase, ValueId,
     };
     use trust_ir_build::ModuleBuilder;
 
@@ -3388,17 +4978,28 @@ mod tests {
     /// sibling `identity_fn` through an extern DECLARATION (FuncId 1) — exactly
     /// the shape the bridge emits per function today.
     fn build_caller_module() -> Module {
+        build_caller_module_of(Ty::I64)
+    }
+
+    /// [`build_caller_module`] over integer type `ty`.
+    fn build_caller_module_of(ty: Ty) -> Module {
+        build_caller_module_with(ty, BinOp::Add)
+    }
+
+    /// [`build_caller_module_of`] with `op` in place of the add:
+    /// `call_add_fn(a, b) = identity_fn(a) op b`.
+    fn build_caller_module_with(ty: Ty, op: BinOp) -> Module {
         let mut mb = ModuleBuilder::new("mod_caller");
-        let ft_call = mb.add_func_type(vec![Ty::I64, Ty::I64], vec![Ty::I64]); // FuncTyId 0
-        let ft_ident = mb.add_func_type(vec![Ty::I64], vec![Ty::I64]); // FuncTyId 1
+        let ft_call = mb.add_func_type(vec![ty.clone(), ty.clone()], vec![ty.clone()]); // FuncTyId 0
+        let ft_ident = mb.add_func_type(vec![ty.clone()], vec![ty.clone()]); // FuncTyId 1
         {
             let mut fb = mb.function("call_add_fn", ft_call); // FuncId 0
             let entry = fb.create_block();
-            let a = fb.add_block_param(entry, Ty::I64);
-            let b = fb.add_block_param(entry, Ty::I64);
+            let a = fb.add_block_param(entry, ty.clone());
+            let b = fb.add_block_param(entry, ty.clone());
             fb.switch_to_block(entry);
             let called = fb.call(FuncId::new(1), vec![a]); // -> sibling identity_fn (extern decl)
-            let result = fb.add(Ty::I64, called, b);
+            let result = fb.binop(op, ty, called, b);
             fb.ret(vec![result]);
             fb.build();
         }
@@ -3407,22 +5008,106 @@ mod tests {
             let fb = mb.function("identity_fn", ft_ident);
             fb.build();
         }
-        mb.build()
+        mb.build().expect("ModuleBuilder::build: test fixture")
     }
 
     /// Module B: defines `identity_fn(a) = a` (FuncId 0).
     fn build_callee_module() -> Module {
+        build_callee_module_of(Ty::I64)
+    }
+
+    /// [`build_callee_module`] over integer type `ty`.
+    fn build_callee_module_of(ty: Ty) -> Module {
         let mut mb = ModuleBuilder::new("mod_callee");
-        let ft_ident = mb.add_func_type(vec![Ty::I64], vec![Ty::I64]); // FuncTyId 0
+        let ft_ident = mb.add_func_type(vec![ty.clone()], vec![ty.clone()]); // FuncTyId 0
         {
             let mut fb = mb.function("identity_fn", ft_ident); // FuncId 0
             let entry = fb.create_block();
-            let a = fb.add_block_param(entry, Ty::I64);
+            let a = fb.add_block_param(entry, ty);
             fb.switch_to_block(entry);
             fb.ret(vec![a]);
             fb.build();
         }
-        mb.build()
+        mb.build().expect("ModuleBuilder::build: test fixture")
+    }
+
+    /// WS7.3: a caller's `FnDef` constant typed with its OWN copy of a
+    /// sibling's signature names the definition's merged signature id after
+    /// the merge, because the declaration and the definition that upgrades it
+    /// share one id (trust-ir compares `Ty::Func` nominally; without the
+    /// unification the constant is `ConstTypeMismatch`).
+    #[test]
+    fn upgraded_declaration_shares_the_definitions_signature_id() {
+        let mut caller = Module::new("mod_fnptr_caller");
+        let ident = caller
+            .add_func_type(FuncTy {
+                params: vec![Ty::I64],
+                returns: vec![Ty::I64],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let getter = caller
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::Func(ident)],
+                is_vararg: false,
+                abi: None,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let mut get = Function::new(FuncId::new(0), "ptr_of_identity", getter, BlockId::new(0));
+        get.blocks = vec![Block {
+            id: BlockId::new(0),
+            params: vec![],
+            body: vec![
+                InstrNode::new(Inst::Const {
+                    ty: Ty::Func(ident),
+                    value: Constant::FnDef(FuncId::new(1)),
+                })
+                .with_result(v(0)),
+                InstrNode::new(Inst::Return { values: vec![v(0)] }),
+            ],
+        }];
+        caller
+            .try_add_function(get)
+            .expect("Module::try_add_function: test fixture");
+        caller
+            .try_add_function(Function::new(
+                FuncId::new(1),
+                "identity_fn",
+                ident,
+                BlockId::new(0),
+            ))
+            .expect("Module::try_add_function: test fixture");
+        // The definition comes FIRST, so its signature is the smaller id.
+        let merged = merge_modules(&[build_callee_module(), caller]).expect("merge");
+        let definition = merged
+            .functions
+            .iter()
+            .find(|f| f.name == "identity_fn")
+            .expect("identity_fn");
+        let get = merged
+            .functions
+            .iter()
+            .find(|f| f.name == "ptr_of_identity")
+            .expect("ptr_of_identity");
+        let Inst::Const { ty, .. } = &get.blocks[0].body[0].inst else {
+            panic!("the getter starts with its FnDef constant");
+        };
+        assert_eq!(ty, &Ty::Func(definition.ty));
+        assert_eq!(
+            merged.func_types[get.ty.index() as usize].returns,
+            vec![Ty::Func(definition.ty)],
+            "an embedded `Ty::Func` names the unified id too"
+        );
+        let errors = trust_ir_build::validate_module(&merged);
+        assert!(
+            !errors.iter().any(|error| matches!(
+                error,
+                trust_ir_build::ValidationError::ConstTypeMismatch { .. }
+            )),
+            "{errors:?}"
+        );
     }
 
     fn find_call_callee(f: &Function) -> Option<FuncId> {
@@ -3472,6 +5157,8 @@ mod tests {
 
     fn tfunc(id: u32, name: &str, ty: u32, blocks: Vec<Block>) -> Function {
         Function {
+            body_gate: None,
+            display_path: None,
             id: FuncId::new(id),
             name: name.to_string(),
             ty: FuncTyId::new(ty),
@@ -3486,6 +5173,9 @@ mod tests {
             value_names: None,
             scopes: None,
             source_provenance: None,
+            section: None,
+            visibility: Default::default(),
+            retained: false,
         }
     }
 
@@ -3505,6 +5195,7 @@ mod tests {
             size: None,
             align: None,
             repr: Default::default(),
+            origin: None,
         }
     }
 
@@ -3539,6 +5230,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn merge_v58_preserves_nominal_origins_and_refuses_conflicting_contributors() {
+        let origin = |decl: &str| trust_ir::ty::TypeOrigin::Clean {
+            decl: decl.to_string(),
+            env_digest: trust_ir::proof::ProofDigest {
+                algorithm: trust_ir::proof::ProofDigestAlgorithm::Sha256,
+                bytes: [7; 32],
+            },
+        };
+        let mut left = build_caller_module();
+        let mut right = build_callee_module();
+        for module in [&mut left, &mut right] {
+            let mut structure = tsdef(0, "NominalStruct", vec![Ty::I64]);
+            structure.origin = Some(origin("Original.Struct"));
+            module.add_struct(structure);
+            let mut enumeration = tedef(0, "NominalEnum", vec![("Only", vec![Ty::I64])]);
+            enumeration.origin = Some(origin("Original.Enum"));
+            module.add_enum(enumeration);
+        }
+        let original = [left, right];
+        let preserved = original.clone();
+        let merged = merge_modules(&original).unwrap();
+        assert_eq!(merged.structs.len(), 1);
+        assert_eq!(merged.enums.len(), 1);
+        assert_eq!(merged.structs[0].origin, original[0].structs[0].origin);
+        assert_eq!(merged.enums[0].origin, original[0].enums[0].origin);
+        assert_eq!(original, preserved);
+        for mutation in 0..5 {
+            let mut changed = original.clone();
+            match mutation {
+                0 => changed[1].structs[0].origin = Some(origin("Other.Struct")),
+                1 => changed[1].structs[0].origin = None,
+                2 => changed[1].enums[0].origin = Some(origin("Other.Enum")),
+                3 => changed[1].enums[0].origin = None,
+                4 => changed[1].structs[0].fields[0].ty = Ty::U32,
+                _ => unreachable!(),
+            }
+            let before = changed.clone();
+            assert!(
+                merge_modules(&changed).is_err(),
+                "nominal mutation {mutation}"
+            );
+            assert_eq!(changed, before, "refusal mutates no source definition");
+        }
+    }
+
+    #[test]
+    fn merge_v58_remaps_closure_layout_keys_without_recomputing_capture_offsets() {
+        let mut original = [build_caller_module(), build_callee_module()];
+        for (index, module) in original.iter_mut().enumerate() {
+            module.target_info = Some(trust_ir::TargetInfo {
+                triple: "aarch64-apple-darwin".into(),
+                pointer_size: 8,
+                endianness: trust_ir::Endianness::Little,
+                abi: None,
+                struct_passing: trust_ir::StructPassingPolicy::NativeC,
+            });
+            module.closure_types.push(ClosureTy {
+                func: FuncTyId::new(0),
+                captures: vec![Ty::U64, Ty::U8],
+            });
+            module
+                .closure_layouts
+                .push(trust_ir::ClosureLayoutDescriptor {
+                    origin: Some(trust_ir::ty::TypeOrigin::Clean {
+                        decl: format!("StoredClosure.{index}"),
+                        env_digest: trust_ir::proof::ProofDigest::sha256([index as u8; 32]),
+                    }),
+                    closure: ClosureTyId::new(0),
+                    size: 16,
+                    align: 8,
+                    capture_offsets: if index == 0 { vec![0, 8] } else { vec![8, 0] },
+                });
+            module.validate_closure_layouts().unwrap();
+        }
+        let preserved = original.clone();
+        let merged = merge_modules(&original).unwrap();
+        assert_eq!(merged.closure_types.len(), 2);
+        assert_eq!(merged.closure_layouts.len(), 2);
+        let first = original[0].closure_layouts[0].clone();
+        let mut second = original[1].closure_layouts[0].clone();
+        second.closure = ClosureTyId::new(1);
+        assert_eq!(merged.closure_layouts, [first, second]);
+        merged.validate_closure_layouts().unwrap();
+        assert_eq!(original, preserved);
+        let mut dangling = original;
+        dangling[1].closure_layouts[0].closure = ClosureTyId::new(1);
+        let before = dangling.clone();
+        assert!(merge_modules(&dangling).is_err());
+        assert_eq!(dangling, before);
+    }
+
+    #[test]
+    fn merge_v58_refuses_duplicate_source_origins_before_same_name_deduplication() {
+        let origin = trust_ir::ty::TypeOrigin::Clean {
+            decl: "Original.Nominal".into(),
+            env_digest: trust_ir::proof::ProofDigest::sha256([7; 32]),
+        };
+        for mutation in 0..3 {
+            let mut source = build_callee_module();
+            match mutation {
+                0 => {
+                    let mut first = tsdef(0, "SameName", vec![Ty::I64]);
+                    first.origin = Some(origin.clone());
+                    let mut second = first.clone();
+                    second.id = StructId::new(1);
+                    source.structs = vec![first, second];
+                }
+                1 => {
+                    let mut first = tedef(0, "SameName", vec![("Value", vec![Ty::I64])]);
+                    first.origin = Some(origin.clone());
+                    let mut second = first.clone();
+                    second.id = EnumId::new(1);
+                    source.enums = vec![first, second];
+                }
+                2 => {
+                    let mut structure = tsdef(0, "SameName", vec![Ty::I64]);
+                    structure.origin = Some(origin.clone());
+                    source.structs.push(structure);
+                    let mut enumeration = tedef(0, "SameName", vec![("Value", vec![Ty::I64])]);
+                    enumeration.origin = Some(origin.clone());
+                    source.enums.push(enumeration);
+                }
+                _ => unreachable!(),
+            }
+            let before = source.clone();
+            let error = merge_modules(std::slice::from_ref(&source)).unwrap_err();
+            assert!(error.contains(&origin.to_string()));
+            assert!(error.contains("SameName"));
+            assert_eq!(
+                source, before,
+                "mutation {mutation} must not be normalized away"
+            );
+        }
+        // The prior positive proves the same key in separate source modules
+        // is preserved and deduplicated when its complete images agree.
+    }
+
     /// A module with one struct (local `StructId(0)`) and one function
     /// `fn_name(x: i64) -> i64` that round-trips `x` through field 0 of that
     /// struct (Undef + InsertField + ExtractField).
@@ -3549,6 +5378,7 @@ mod tests {
         m.func_types = vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }];
         m.functions = vec![tfunc(
@@ -3608,6 +5438,213 @@ mod tests {
     // ---- unit tests: FuncId/FuncTyId remap + decl->def dedup --------------
 
     #[test]
+    fn completeness_absent_remains_absent_for_single_and_multiple_merges() {
+        let callee = build_callee_module();
+        let caller = build_caller_module();
+        assert_eq!(callee.completeness, None);
+        assert_eq!(caller.completeness, None);
+        module_batch_eligible(&callee).expect("claim-less module remains eligible");
+        let single = merge_modules(std::slice::from_ref(&callee))
+            .expect("claim-less single module remains mergeable");
+        assert_eq!(single.completeness, None, "no implicit completeness claim");
+        let multiple =
+            merge_modules(&[caller, callee]).expect("claim-less multiple modules remain mergeable");
+        assert_eq!(
+            multiple.completeness, None,
+            "no implicit completeness claim"
+        );
+    }
+
+    #[test]
+    fn completeness_claims_are_refused_before_single_or_multiple_module_merge() {
+        use trust_ir::{ModuleCompleteness, UnloweredRow};
+
+        fn assert_refused(modules: &[Module], index: usize) {
+            let claims_before: Vec<_> = modules.iter().map(|m| m.completeness.clone()).collect();
+            assert!(modules[index].completeness.is_some());
+            let diagnostic = trust_cg_lower::AdapterError::ModuleCompletenessUnsupported {
+                module: modules[index].name.clone(),
+            }
+            .to_string();
+            assert_eq!(
+                module_batch_eligible(&modules[index])
+                    .expect_err("a completeness claim is not eligible for batching"),
+                format!("merge_modules: module 0: {diagnostic}")
+            );
+            assert_eq!(
+                merge_modules(modules).expect_err("no completeness claim may be erased"),
+                format!("merge_modules: module {index}: {diagnostic}")
+            );
+            let claims_after: Vec<_> = modules.iter().map(|m| m.completeness.clone()).collect();
+            assert_eq!(claims_after, claims_before, "input claims remain verbatim");
+        }
+
+        let missing = UnloweredRow {
+            symbol: "missing".into(),
+            display_path: Some("example::missing".into()),
+            reason: "producer did not lower this body".into(),
+        };
+        let claims = [
+            ModuleCompleteness::Complete,
+            ModuleCompleteness::Partial(vec![missing.clone()]),
+            ModuleCompleteness::Partial(vec![]),
+            ModuleCompleteness::Partial(vec![UnloweredRow {
+                symbol: "identity_fn".into(),
+                display_path: None,
+                reason: "invalid: this symbol already has a body".into(),
+            }]),
+            ModuleCompleteness::Partial(vec![missing.clone(), missing]),
+        ];
+        for (case, claim) in claims.into_iter().enumerate() {
+            let mut claimed = build_callee_module();
+            claimed.completeness = Some(claim);
+            // The first two claims are well formed; the rest deliberately
+            // exercise empty, definition-conflicting, and duplicate rows.
+            assert_eq!(
+                trust_ir_build::validate_module(&claimed).is_empty(),
+                case < 2,
+                "the control must distinguish valid and invalid claims"
+            );
+            assert_refused(std::slice::from_ref(&claimed), 0);
+            assert_refused(&[claimed.clone(), build_caller_module()], 0);
+            assert_refused(&[build_caller_module(), claimed.clone()], 1);
+
+            let mut other = build_caller_module();
+            other.completeness = Some(ModuleCompleteness::Complete);
+            assert_refused(&[claimed.clone(), other.clone()], 0);
+            assert_refused(&[other, claimed], 0);
+        }
+    }
+
+    /// trust-ir v55 (amendment D): a module carrying a drop-glue table is
+    /// refused before merge or batching. The merged module is rebuilt from
+    /// `Module::new`, so a merge would silently DROP the table (every drop at
+    /// a registered type unresolved); refusing is the only sound answer until
+    /// the merge remaps glue ids and re-keys types.
+    #[test]
+    fn drop_glue_tables_are_refused_before_single_or_multiple_module_merge() {
+        let mut carrying = build_callee_module();
+        carrying.add_struct(trust_ir::StructDef {
+            id: trust_ir::StructId::new(0),
+            name: "Owner".to_string(),
+            fields: vec![trust_ir::FieldDef {
+                name: "handle".to_string(),
+                ty: Ty::I64,
+                offset: None,
+            }],
+            size: None,
+            align: None,
+            repr: trust_ir::StructRepr::default(),
+            origin: None,
+        });
+        let glue_ty = carrying
+            .add_func_type(trust_ir::FuncTy {
+                params: vec![Ty::Ptr],
+                returns: vec![],
+                abi: None,
+                is_vararg: false,
+            })
+            .expect("Module::add_func_type: test fixture");
+        let mut glue = Function::new(
+            FuncId::new(1),
+            "owner_drop",
+            glue_ty,
+            trust_ir::BlockId::new(0),
+        );
+        let mut block = trust_ir::Block::new(trust_ir::BlockId::new(0));
+        block.params.push((trust_ir::ValueId::new(0), Ty::Ptr));
+        block
+            .body
+            .push(trust_ir::InstrNode::new(Inst::Return { values: vec![] }));
+        glue.blocks.push(block);
+        carrying
+            .try_add_function(glue)
+            .expect("Module::try_add_function: test fixture");
+        carrying
+            .set_drop_glue(Ty::Struct(trust_ir::StructId::new(0)), FuncId::new(1))
+            .expect("one row for one type and one glue");
+        assert!(
+            trust_ir_build::validate_module(&carrying).is_empty(),
+            "the table is well-formed"
+        );
+        let refused = |result: Result<_, String>, index: usize| {
+            let error = result.expect_err("a drop-glue table may not be dropped by a merge");
+            assert!(
+                error.starts_with(&format!("merge_modules: module {index} "))
+                    && error.contains("1 drop-glue row(s)")
+                    && error.contains("fail-closed"),
+                "{error}"
+            );
+        };
+        refused(module_batch_eligible(&carrying), 0);
+        refused(merge_modules(std::slice::from_ref(&carrying)).map(drop), 0);
+        refused(
+            merge_modules(&[build_caller_module(), carrying.clone()]).map(drop),
+            1,
+        );
+        assert_eq!(carrying.drop_glue.len(), 1, "the input keeps its table");
+    }
+
+    /// trust-ir v70 (PKG-U13e): an input carrying a weight blob table is
+    /// refused by name, referenced or not. The merged module is rebuilt from
+    /// `Module::new`, so concatenating would drop the table and leave every
+    /// `Constant::TensorBlob` naming bytes the merged module does not carry.
+    #[test]
+    fn merge_refuses_an_input_carrying_a_weight_blob_table() {
+        let mut carrying = build_caller_module();
+        carrying.intern_blob(vec![1, 0, 0, 0]);
+        let refused = |result: Result<_, String>, index: usize| {
+            let error = result.expect_err("a weight blob table may not be dropped by a merge");
+            assert!(
+                error.starts_with(&format!("merge_modules: module {index} "))
+                    && error.contains("1 Module::blobs row(s)")
+                    && error.contains("fail-closed"),
+                "{error}"
+            );
+        };
+        refused(module_batch_eligible(&carrying), 0);
+        refused(merge_modules(std::slice::from_ref(&carrying)).map(drop), 0);
+        refused(
+            merge_modules(&[build_caller_module(), carrying.clone()]).map(drop),
+            1,
+        );
+        assert_eq!(carrying.blobs.len(), 1, "the input keeps its table");
+    }
+
+    /// Two inputs naming one function with signatures whose value SHAPES
+    /// differ (one passes a one-element aggregate where the other passes the
+    /// scalar, as two `extern` items sharing a `#[link_name]` can lower) are
+    /// refused; scalars of different types in one position are admitted.
+    #[test]
+    fn merge_refuses_one_symbol_with_signatures_of_different_shapes() {
+        let mut mb = ModuleBuilder::new("mod_tuple_decl");
+        let ft_unit = mb.add_func_type(vec![], vec![]);
+        let ft_tuple = mb.add_func_type(vec![Ty::Tuple(vec![Ty::I64])], vec![Ty::I64]);
+        {
+            let mut fb = mb.function("other_fn", ft_unit);
+            let entry = fb.create_block();
+            fb.switch_to_block(entry);
+            fb.ret(vec![]);
+            fb.build();
+        }
+        {
+            let fb = mb.function("identity_fn", ft_tuple);
+            fb.build();
+        }
+        let tuple_decl = mb.build().expect("ModuleBuilder::build: test fixture");
+        let err = merge_modules(&[build_caller_module(), tuple_decl])
+            .expect_err("a scalar and an aggregate signature for one symbol must not merge");
+        assert!(err.contains("different shapes"), "{err}");
+
+        if let Err(err) = merge_modules(&[
+            build_caller_module_of(Ty::I64),
+            build_callee_module_of(Ty::U64),
+        ]) {
+            assert!(!err.contains("different shapes"), "{err}");
+        }
+    }
+
+    #[test]
     fn merge_remaps_funcid_and_functyid_and_dedups_decl_into_def() {
         let a = build_caller_module();
         let b = build_callee_module();
@@ -3639,19 +5676,133 @@ mod tests {
             FuncTyId::new(0),
             "call_add_fn keeps module A's base-0 signature"
         );
-        assert_eq!(
-            merged.functions[1].ty,
-            FuncTyId::new(2),
-            "identity_fn (from module B) is shifted by B's base offset (2)"
-        );
+        // B's signature lands at B's base offset (2), and it equals the
+        // signature A's upgraded declaration carried (1), so the merge unifies
+        // the two to the smallest merged id (`unify_upgraded_signatures`,
+        // WS7.3): a caller's `FnDef(identity_fn) : Ty::Func(1)` must keep
+        // naming identity_fn's own `ty`. A missed shift would give B's local 0
+        // (call_add_fn's signature); a shift without the unification, 2.
         assert_eq!(merged.func_types[2].params, vec![Ty::I64]);
         assert_eq!(merged.func_types[2].returns, vec![Ty::I64]);
+        assert_eq!(merged.func_types[1].params, merged.func_types[2].params);
+        assert_eq!(merged.func_types[1].returns, merged.func_types[2].returns);
+        assert_eq!(
+            merged.functions[1].ty,
+            FuncTyId::new(1),
+            "identity_fn (from module B, base offset 2) is unified with A's equal declaration \
+             signature (1)"
+        );
 
         // The merged module validates cleanly under the canonical walker.
         assert!(
             trust_ir_build::validate_module(&merged).is_empty(),
             "merged module must validate cleanly: {:?}",
             trust_ir_build::validate_module(&merged)
+        );
+    }
+
+    /// trust-ir v54 (amendment P): a sited check's `entry` is a direct call
+    /// edge and its `Global` location a global reference. A merge that shifts
+    /// the check's module must remap both, or the failure would call another
+    /// function and report another global's bytes.
+    #[test]
+    fn merge_remaps_panic_site_entry_and_location_global() {
+        let scalar_global = |name: &str| Global {
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            name: name.to_string(),
+            ty: Ty::U64,
+            mutable: false,
+            initializer: Some(Constant::Int(7)),
+            linkage: Linkage::Internal,
+            tls: None,
+            align: None,
+        };
+        // Module A contributes a function and a global first, so module B's
+        // ids shift in the merge.
+        let mut a = build_callee_module();
+        a.globals.push(scalar_global("A_TABLE"));
+        let mut b = Module::new("mod_sited");
+        b.func_types = vec![
+            FuncTy {
+                params: vec![Ty::Bool],
+                returns: vec![],
+                abi: None,
+                is_vararg: false,
+            },
+            FuncTy {
+                params: vec![Ty::Ptr],
+                returns: vec![],
+                abi: None,
+                is_vararg: false,
+            },
+        ];
+        b.functions.push(tfunc(
+            0,
+            "checked",
+            0,
+            vec![tblock(
+                0,
+                vec![(0, Ty::Bool)],
+                vec![
+                    tnode(
+                        Inst::Assert {
+                            cond: v(0),
+                            kind: trust_ir::AssertKind::DivByZero,
+                            site: Some(trust_ir::PanicSite {
+                                entry: FuncId::new(1),
+                                location: PanicLocation::Global(GlobalId::new(0)),
+                            }),
+                        },
+                        vec![],
+                    ),
+                    tnode(Inst::Return { values: vec![] }, vec![]),
+                ],
+            )],
+        ));
+        b.functions.push(tfunc(
+            1,
+            "panic_const_div_by_zero",
+            1,
+            vec![tblock(
+                0,
+                vec![(0, Ty::Ptr)],
+                vec![tnode(Inst::Unreachable, vec![])],
+            )],
+        ));
+        b.globals.push(scalar_global("loc"));
+
+        let merged = merge_modules(&[a, b]).expect("a sited check merges");
+        let entry = merged
+            .functions
+            .iter()
+            .find(|function| function.name == "panic_const_div_by_zero")
+            .expect("the panic entry is merged")
+            .id;
+        let location = merged
+            .globals
+            .iter()
+            .position(|global| global.name == "loc")
+            .expect("the location global is merged");
+        assert_eq!(entry, FuncId::new(2), "B's functions follow A's one");
+        assert_eq!(location, 1, "B's global follows A's one");
+        let checked = merged
+            .functions
+            .iter()
+            .find(|function| function.name == "checked")
+            .expect("the checked function is merged");
+        let Inst::Assert {
+            site: Some(site), ..
+        } = &checked.blocks[0].body[0].inst
+        else {
+            panic!("the sited check survives the merge");
+        };
+        assert_eq!(site.entry, entry, "the site's entry is remapped");
+        assert_eq!(
+            site.location,
+            PanicLocation::Global(GlobalId::new(location as u32)),
+            "the site's location global is remapped"
         );
     }
 
@@ -3697,6 +5848,7 @@ mod tests {
         a.func_types = vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }];
         a.functions = vec![tfunc(
@@ -3733,6 +5885,7 @@ mod tests {
         b.func_types = vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }];
         b.functions = vec![tfunc(
@@ -3843,6 +5996,194 @@ mod tests {
     }
 
     #[test]
+    fn merge_dedups_same_name_struct_with_container_vtable_fat_pointer() {
+        // ContainerVtable (trust-ir v40) is the `dyn`-tail sibling of
+        // ContainerLen: id-less, so it must ride the same three paths —
+        // remap (verbatim), resolvability (nothing to check) and same-name
+        // dedup equality — without ever being rewritten into TraitObject.
+        let container_vtable = Ty::FatPtr(FatPtrKind::ContainerVtable);
+        let mut a = Module::new("mod_container_vtable_a");
+        a.structs = vec![tsdef(0, "ArcDyn", vec![container_vtable.clone()])];
+        let mut b = Module::new("mod_container_vtable_b");
+        b.structs = vec![tsdef(0, "ArcDyn", vec![container_vtable.clone()])];
+
+        let merged = merge_modules(&[a, b])
+            .expect("identical ContainerVtable-bearing structs must deduplicate");
+        assert_eq!(merged.structs.len(), 1);
+        assert_eq!(
+            merged.structs[0].fields[0].ty, container_vtable,
+            "the kind must survive the merge verbatim (never spelled TraitObject)"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_container_vtable_against_trait_object_of_same_name() {
+        // Same layout, different meaning: a ContainerVtable field against a
+        // TraitObject field in a same-name struct is a STRUCTURAL conflict,
+        // not a dedup. The dedup compares the remapped defs field-for-field
+        // and the identity matcher ends in a catch-all; this pin keeps a
+        // future "they lay out the same" shortcut out of both.
+        let mut a = Module::new("mod_cv_vs_dyn_a");
+        a.structs = vec![tsdef(
+            0,
+            "Holder",
+            vec![Ty::FatPtr(FatPtrKind::ContainerVtable)],
+        )];
+        let mut b = Module::new("mod_cv_vs_dyn_b");
+        b.structs = vec![tsdef(
+            0,
+            "Holder",
+            vec![Ty::FatPtr(FatPtrKind::TraitObject { trait_id: 7 })],
+        )];
+        let err = merge_modules(&[a, b])
+            .expect_err("ContainerVtable vs TraitObject must not deduplicate");
+        assert!(
+            err.contains("DIFFERENT structure"),
+            "rejection must name the structural conflict: {err}"
+        );
+        assert!(
+            err.contains("Holder"),
+            "rejection must name the type: {err}"
+        );
+    }
+
+    fn container_vtable_identity_module(name: &str) -> Module {
+        let ty = Ty::FatPtr(FatPtrKind::ContainerVtable);
+        let mut builder = ModuleBuilder::new(name);
+        let signature = builder.add_func_type(vec![ty.clone()], vec![ty.clone()]);
+        let mut function = builder.function(name, signature);
+        let entry = function.create_block();
+        let argument = function.add_block_param(entry, ty);
+        function.switch_to_block(entry);
+        function.ret(vec![argument]);
+        function.build();
+        builder.build().expect("ModuleBuilder::build: test fixture")
+    }
+
+    #[test]
+    fn merge_preserves_container_vtable_function_signatures() {
+        // Unlike struct-only dedup fixtures, these real Function.ty signatures
+        // reach verify_function_identity_preservation -> func_tys_equal_name_resolved
+        // -> tys_equal_name_resolved for BOTH the parameter and return type.
+        let modules = [
+            container_vtable_identity_module("cv_identity_a"),
+            container_vtable_identity_module("cv_identity_b"),
+        ];
+        for module in &modules {
+            let errors = trust_ir_build::validate_module(module);
+            assert!(
+                errors.is_empty(),
+                "source fixture must validate: {errors:?}"
+            );
+        }
+        let merged = merge_modules(&modules)
+            .expect("same-kind ContainerVtable signatures must survive the actual merge");
+        assert_eq!(merged.functions.len(), 2);
+        assert_eq!(merged.func_types.len(), 2);
+        for (index, function) in merged.functions.iter().enumerate() {
+            assert_eq!(function.name, modules[index].functions[0].name);
+            assert_eq!(function.ty.index() as usize, index);
+            let signature = &merged.func_types[function.ty.index() as usize];
+            assert_eq!(
+                signature.params,
+                vec![Ty::FatPtr(FatPtrKind::ContainerVtable)]
+            );
+            assert_eq!(
+                signature.returns,
+                vec![Ty::FatPtr(FatPtrKind::ContainerVtable)]
+            );
+            assert!(!signature.is_vararg);
+        }
+        let errors = trust_ir_build::validate_module(&merged);
+        assert!(
+            errors.is_empty(),
+            "merged fixture must validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn container_vtable_signature_preservation_rejects_changed_kinds() {
+        let modules = [
+            container_vtable_identity_module("cv_identity_a"),
+            container_vtable_identity_module("cv_identity_b"),
+        ];
+        let merged = merge_modules(&modules).unwrap();
+        let winners = [
+            Some((0, &modules[0].functions[0])),
+            Some((1, &modules[1].functions[0])),
+        ];
+        verify_function_identity_preservation(&modules, &winners, &merged)
+            .expect("the actual unmodified function-preservation walk must pass");
+        assert_eq!(merged.functions[1].ty, FuncTyId::new(1));
+        let expected = MergeExpectations {
+            functions: 2,
+            func_types: 2,
+            ..Default::default()
+        };
+        for kind in [
+            FatPtrKind::ContainerLen,
+            FatPtrKind::TraitObject { trait_id: 7 },
+        ] {
+            for mutate_return in [false, true] {
+                let mut corrupted = merged.clone();
+                let signature = &mut corrupted.func_types[1];
+                let slot = if mutate_return {
+                    &mut signature.returns[0]
+                } else {
+                    &mut signature.params[0]
+                };
+                *slot = Ty::FatPtr(kind);
+                // Neither alternative references a module-local table; counts,
+                // ids and signature arities remain in range. Refusal must come
+                // from comparing this actual stored signature with its source.
+                structural_self_check(&corrupted, &expected)
+                    .expect("the kind mutation does not violate structural bounds");
+                let error = verify_function_identity_preservation(&modules, &winners, &corrupted)
+                    .expect_err("changing either signature position must be rejected");
+                assert!(error.contains("cv_identity_b"), "reason: {error}");
+                assert!(
+                    error.contains("Function.ty signature diverged"),
+                    "reason: {error}"
+                );
+                assert!(
+                    error.contains("type diverged across the merge (variant:"),
+                    "reason: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn container_vtable_type_comparator_keeps_fat_pointer_kinds_distinct() {
+        let source = Module::new("source_kind_comparison");
+        let merged = Module::new("merged_kind_comparison");
+        let kinds = [
+            FatPtrKind::ContainerVtable,
+            FatPtrKind::ContainerLen,
+            FatPtrKind::TraitObject { trait_id: 7 },
+        ];
+        // Nine ordered comparisons include both mismatch directions, not just
+        // the four source-ContainerVtable signature mutations above.
+        for source_kind in kinds {
+            for merged_kind in kinds {
+                let result = tys_equal_name_resolved(
+                    &source,
+                    &Ty::FatPtr(source_kind),
+                    &merged,
+                    &Ty::FatPtr(merged_kind),
+                    TY_CMP_DEPTH_LIMIT,
+                );
+                if source_kind == merged_kind {
+                    result.expect("each exact kind must equal itself");
+                } else {
+                    let error = result.expect_err("distinct kinds must never compare equal");
+                    assert!(error.contains("(variant:"), "reason: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn merge_rejects_same_name_different_structure() {
         let a = one_struct_module("mod_ca", "Pair", "ca_fn");
         let mut b = one_struct_module("mod_cb", "Pair", "cb_fn");
@@ -3865,6 +6206,7 @@ mod tests {
         a.func_types = vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }];
         a.functions = vec![tfunc(
@@ -3909,6 +6251,7 @@ mod tests {
         b.func_types = vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }];
         b.functions = vec![tfunc(
@@ -3992,6 +6335,9 @@ mod tests {
         // definition — malformed, ineligible.
         let mut bad = build_callee_module();
         bad.globals.push(Global {
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
             name: "G_BAD".to_string(),
             ty: Ty::I64,
             mutable: false,
@@ -4002,6 +6348,41 @@ mod tests {
         });
         let err = module_batch_eligible(&bad).expect_err("malformed global is ineligible");
         assert!(err.contains("import"), "reason should say why: {err}");
+    }
+
+    #[test]
+    fn merge_refuses_a_bodyless_definition_in_either_input_order() {
+        // A body-less function whose linkage names a definition is refused
+        // by name, whether or not another input declares or defines the same
+        // symbol, and in both input orders.
+        for linkage in [
+            Linkage::Internal,
+            Linkage::Private,
+            Linkage::Weak,
+            Linkage::LinkOnce,
+            Linkage::WeakOdr,
+            Linkage::LinkOnceOdr,
+        ] {
+            let mut stub = build_caller_module();
+            let callee = stub
+                .functions
+                .iter_mut()
+                .find(|f| f.blocks.is_empty())
+                .expect("the caller fixture declares its callee");
+            callee.linkage = linkage;
+            let name = callee.name.clone();
+            for inputs in [
+                vec![stub.clone(), build_callee_module()],
+                vec![build_callee_module(), stub.clone()],
+            ] {
+                let err =
+                    merge_modules(&inputs).expect_err("a body-less definition must not merge");
+                assert!(
+                    err.contains(&format!("[TCG-DECLARATION-LINKAGE] function `{name}`")),
+                    "{linkage}: {err}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4046,6 +6427,9 @@ mod tests {
     /// string-literal shape: `{owner}.const.allocN`, Internal, bytes).
     fn byte_global(name: &str, bytes: &[u8]) -> Global {
         Global {
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
             name: name.to_string(),
             ty: Ty::Ptr,
             mutable: false,
@@ -4064,6 +6448,9 @@ mod tests {
     /// A cross-object data import (the bridge's `static mut` reader shape).
     fn import_global(name: &str, mutable: bool) -> Global {
         Global {
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
             name: name.to_string(),
             ty: Ty::Ptr,
             mutable,
@@ -4133,6 +6520,7 @@ mod tests {
         m.func_types = vec![FuncTy {
             params: vec![Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }];
         let mut body = Vec::new();
@@ -4174,6 +6562,7 @@ mod tests {
         module.func_types = vec![FuncTy {
             params: vec![],
             returns: vec![result_ty.clone()],
+            abi: None,
             is_vararg: false,
         }];
         module.functions = vec![tfunc(
@@ -4272,12 +6661,12 @@ mod tests {
             trust_ir_build::validate_module(&top_level).is_empty(),
             "top-level Bytes fixture must be valid TrustIr"
         );
-        trust_cg_lower::translate_module(&top_level)
+        permit_translate_module(&top_level)
             .expect("the adapter supports a complete top-level [u8; N] Bytes constant");
         module_batch_eligible(&top_level)
             .expect("a genuinely lowerable top-level Bytes constant should batch");
         let merged = merge_modules(&[top_level]).expect("top-level Bytes module should merge");
-        trust_cg_lower::translate_module(&merged)
+        permit_translate_module(&merged)
             .expect("batching must preserve top-level Bytes lowerability");
 
         let nested = bytes_body_module("nested_bytes", true);
@@ -4285,14 +6674,12 @@ mod tests {
             trust_ir_build::validate_module(&nested).is_empty(),
             "nested Bytes fixture must be valid TrustIr"
         );
-        trust_cg_lower::translate_module(&nested)
-            .expect_err("the aggregate filler does not yet lower a nested Bytes field");
-        let reason = module_batch_eligible(&nested)
-            .expect_err("batching must defer nested Bytes exactly like the adapter");
-        assert!(
-            reason.contains("nested Constant::Bytes"),
-            "deferral must name the unsupported depth: {reason}"
-        );
+        permit_translate_module(&nested)
+            .expect("the aggregate filler must lower a typed nested Bytes field");
+        module_batch_eligible(&nested)
+            .expect("batching must admit the supported typed nested Bytes field");
+        let merged = merge_modules(&[nested]).expect("nested Bytes module should merge");
+        permit_translate_module(&merged).expect("batching must preserve nested Bytes lowerability");
 
         let mut invalid_utf8 = bytes_body_module("invalid_utf8_bytes", false);
         let Inst::Const {
@@ -4304,7 +6691,7 @@ mod tests {
         };
         *data = vec![0xff, 0xfe, 0xfd];
         *utf8 = true;
-        trust_cg_lower::translate_module(&invalid_utf8)
+        permit_translate_module(&invalid_utf8)
             .expect_err("the adapter rejects a false UTF-8 claim");
         let reason = module_batch_eligible(&invalid_utf8)
             .expect_err("batching must reject the same false UTF-8 claim");
@@ -4319,11 +6706,530 @@ mod tests {
             panic!("Bytes fixture changed shape")
         };
         data.pop();
-        trust_cg_lower::translate_module(&wrong_len)
+        permit_translate_module(&wrong_len)
             .expect_err("the adapter rejects a Bytes length mismatch");
         let reason = module_batch_eligible(&wrong_len)
             .expect_err("batching must reject the same Bytes length mismatch");
         assert!(reason.contains("length"), "reason: {reason}");
+    }
+
+    /// Eight authored layouts, with no backend layout/encoding oracle. Globals
+    /// use only cases 0..=4; records and enums remain body-only capabilities.
+    fn typed_bytes_batch_fixture(
+        name: &str,
+        shape: usize,
+        global: bool,
+        data: &[u8],
+        utf8: bool,
+    ) -> Module {
+        let mut module = Module::new(name);
+        let array = Ty::Array(trust_ir::TyId::new(0), data.len() as u64);
+        module.types = vec![Ty::U8, array.clone()];
+        let bytes = Constant::Bytes {
+            data: data.to_vec(),
+            utf8,
+        };
+        let (ty, value) = match shape {
+            0 => (array.clone(), bytes),
+            1 => (
+                Ty::Tuple(vec![array.clone()]),
+                Constant::Aggregate(vec![bytes]),
+            ),
+            2 => {
+                module
+                    .structs
+                    .push(tsdef(0, &format!("{name}_struct"), vec![array.clone()]));
+                (
+                    Ty::Struct(StructId::new(0)),
+                    Constant::Aggregate(vec![bytes]),
+                )
+            }
+            3 | 4 => {
+                // Two DISTINCT rows: equal rows are the uniform array, whose
+                // one spelling is `splat` since trust-ir v50 (§3.1), and these
+                // shapes exercise the two LIST spellings. The second row is the
+                // payload reversed; an empty row differs from its twin by its
+                // UTF-8 claim instead.
+                let mut reversed = data.to_vec();
+                reversed.reverse();
+                let second = Constant::Bytes {
+                    data: reversed,
+                    utf8: if data.is_empty() { !utf8 } else { utf8 },
+                };
+                let values = vec![bytes, second];
+                (
+                    Ty::Array(trust_ir::TyId::new(1), 2),
+                    if shape == 3 {
+                        Constant::Aggregate(values)
+                    } else {
+                        Constant::Array(values)
+                    },
+                )
+            }
+            5 | 6 => {
+                module
+                    .records
+                    .push(trdef(0, &format!("{name}_record"), vec![array.clone()]));
+                (
+                    Ty::Record(RecordId::new(0)),
+                    if shape == 5 {
+                        Constant::Aggregate(vec![bytes])
+                    } else {
+                        Constant::Record(vec![("f0".into(), bytes)])
+                    },
+                )
+            }
+            7 => {
+                module.enums.push(tedef(
+                    0,
+                    &format!("{name}_enum"),
+                    vec![("Empty", vec![]), ("Payload", vec![array.clone()])],
+                ));
+                (
+                    Ty::Enum(EnumId::new(0)),
+                    Constant::Aggregate(vec![Constant::Int(1), bytes]),
+                )
+            }
+            _ => panic!("unknown authored Bytes layout"),
+        };
+        if global {
+            module.globals.push(Global {
+                section: None,
+                visibility: trust_ir::Visibility::Default,
+                retained: false,
+                name: format!("{name}_global"),
+                ty,
+                mutable: false,
+                initializer: Some(value),
+                linkage: Linkage::Internal,
+                tls: None,
+                align: None,
+            });
+        } else {
+            module.func_types.push(FuncTy {
+                params: vec![],
+                returns: vec![ty.clone()],
+                abi: None,
+                is_vararg: false,
+            });
+            module.functions.push(tfunc(
+                0,
+                name,
+                0,
+                vec![tblock(
+                    0,
+                    vec![],
+                    vec![
+                        tnode(Inst::Const { ty, value }, vec![0]),
+                        tnode(Inst::Return { values: vec![v(0)] }, vec![]),
+                    ],
+                )],
+            ));
+        }
+        module
+    }
+
+    fn typed_bytes_batch_root(module: &mut Module, global: bool) -> (&mut Ty, &mut Constant) {
+        if global {
+            let global = &mut module.globals[0];
+            (&mut global.ty, global.initializer.as_mut().unwrap())
+        } else {
+            let Inst::Const { ty, value } = &mut module.functions[0].blocks[0].body[0].inst else {
+                panic!("authored Bytes constant missing")
+            };
+            (ty, value)
+        }
+    }
+
+    fn assert_bytes_batch_refused(module: Module) {
+        let name = module.name.clone();
+        assert!(
+            module_batch_eligible(&module).is_err(),
+            "{name}: eligibility admitted"
+        );
+        assert!(merge_modules(&[module]).is_err(), "{name}: merge admitted");
+    }
+
+    fn global_type_fixture(name: &str, shifted: bool, definition: bool) -> Module {
+        let mut module = Module::new(name);
+        module.types = if shifted {
+            vec![Ty::U16, Ty::U8]
+        } else {
+            vec![Ty::U8]
+        };
+        module.globals.push(Global {
+            section: None,
+            visibility: trust_ir::Visibility::Default,
+            retained: false,
+            name: "typed_global".into(),
+            ty: Ty::Array(TyId::new(u32::from(shifted)), 3),
+            mutable: false,
+            initializer: definition.then(|| {
+                Constant::Aggregate(vec![Constant::Int(1), Constant::Int(2), Constant::Int(3)])
+            }),
+            linkage: Linkage::Weak,
+            tls: None,
+            align: None,
+        });
+        module
+    }
+
+    #[test]
+    fn global_type_remap_preserves_every_import_definition_order() {
+        for (left_def, right_def) in [(false, false), (false, true), (true, false), (true, true)] {
+            let left = global_type_fixture("left", false, left_def);
+            let right = global_type_fixture("right", true, right_def);
+            assert!(trust_ir_build::validate_module(&left).is_empty());
+            assert!(trust_ir_build::validate_module(&right).is_empty());
+            let merged = merge_modules(&[left.clone(), right.clone()])
+                .expect("equivalent source-relative types");
+            assert_eq!(merged.globals.len(), 1);
+            assert_eq!(
+                merged.globals[0].initializer.is_some(),
+                left_def || right_def
+            );
+            verify_global_type_preservation(&[left, right], &merged).unwrap();
+            let Ty::Array(element, 3) = merged.globals[0].ty else {
+                panic!("array type lost")
+            };
+            assert_eq!(merged.ty(element), Some(&Ty::U8));
+        }
+        // Named ids also move: a different StructId(0) precedes this winner.
+        let mut prefix = Module::new("prefix");
+        prefix.structs.push(tsdef(0, "decoy", vec![Ty::I64]));
+        let source = typed_bytes_batch_fixture("named_global", 2, true, b"abc", true);
+        let merged = merge_modules(&[prefix, source.clone()]).unwrap();
+        assert_eq!(merged.globals[0].ty, Ty::Struct(StructId::new(1)));
+        assert_eq!(
+            crate::compiler::module_object_globals(&merged).unwrap(),
+            crate::compiler::module_object_globals(&source).unwrap()
+        );
+    }
+
+    #[test]
+    fn global_type_identity_rejects_equal_raw_ids_with_different_meanings() {
+        let left = global_type_fixture("u8_source", false, true);
+        let mut right = global_type_fixture("u16_source", false, true);
+        right.types[0] = Ty::U16;
+        assert_eq!(
+            left.globals[0], right.globals[0],
+            "raw globals intentionally collide"
+        );
+        assert!(trust_ir_build::validate_module(&left).is_empty());
+        assert!(trust_ir_build::validate_module(&right).is_empty());
+        let error =
+            merge_modules(&[left, right]).expect_err("U8 and U16 objects cannot be deduplicated");
+        assert!(
+            error.contains("DIFFERENT content") && error.contains("type"),
+            "{error}"
+        );
+
+        let mut left = global_type_fixture("named_a", false, false);
+        let mut right = global_type_fixture("named_b", false, false);
+        left.structs.push(tsdef(0, "A", vec![Ty::I64]));
+        right.structs.push(tsdef(0, "B", vec![Ty::I64]));
+        left.globals[0].ty = Ty::Struct(StructId::new(0));
+        right.globals[0].ty = Ty::Struct(StructId::new(0));
+        assert_eq!(left.globals[0], right.globals[0]);
+        assert!(
+            merge_modules(&[left, right]).is_err(),
+            "different named types cannot share the global"
+        );
+    }
+
+    #[test]
+    fn global_type_preservation_rejects_in_range_and_dangling_corruption() {
+        let mut prefix = Module::new("prefix");
+        prefix.types.push(Ty::U16);
+        let source = global_type_fixture("source", false, true);
+        let modules = [prefix, source];
+        let merged = merge_modules(&modules).unwrap();
+        verify_global_type_preservation(&modules, &merged).unwrap();
+        assert_eq!(merged.globals[0].ty, Ty::Array(TyId::new(1), 3));
+        let mut wrong = merged.clone();
+        wrong.globals[0].ty = Ty::Array(TyId::new(0), 3);
+        // Int(1/2/3) also validates as U16. Canonical validity alone cannot
+        // detect the changed byte width; the independent source check must.
+        assert!(trust_ir_build::validate_module(&wrong).is_empty());
+        assert!(verify_global_type_preservation(&modules, &wrong).is_err());
+        wrong.globals[0].ty = Ty::Array(TyId::new(999), 3);
+        let expected = MergeExpectations {
+            types: merged.types.len(),
+            globals: 1,
+            ..Default::default()
+        };
+        assert!(structural_self_check(&wrong, &expected).is_err());
+        assert!(verify_global_type_preservation(&modules, &wrong).is_err());
+    }
+
+    #[test]
+    fn nested_bytes_batch_body_layouts_preserve_payload_and_type_identity() {
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for shape in 0..8 {
+            for (data, utf8) in [
+                (b"A\0z".as_slice(), true),
+                (&[0xff, 0, 0x80][..], false),
+                (&[][..], true),
+            ] {
+                attempted += 1;
+                let name = format!("bytes_body_{shape}_{attempted}");
+                let source = typed_bytes_batch_fixture(&name, shape, false, data, utf8);
+                assert!(
+                    trust_ir_build::validate_module(&source).is_empty(),
+                    "{name}: invalid fixture"
+                );
+                if let Err(error) = trust_cg_lower::translate_function_with_license(
+                    &source.functions[0],
+                    &source,
+                    &permit_unlicensed(),
+                ) {
+                    failures.push(format!("{name}: source adapter {error}"));
+                }
+                let mut sibling = build_callee_module();
+                sibling.types.push(Ty::U16); // Force nonzero TyId remapping.
+                if let Err(error) = module_batch_eligible(&source) {
+                    failures.push(format!("{name}: {error}"));
+                }
+                match merge_modules(&[sibling, source.clone()]) {
+                    Err(error) => failures.push(format!("{name}: merge {error}")),
+                    Ok(merged) => {
+                        assert!(
+                            trust_ir_build::validate_module(&merged).is_empty(),
+                            "{name}: merged types"
+                        );
+                        let actual = merged.functions.iter().find(|f| f.name == name).unwrap();
+                        if let Err(error) = trust_cg_lower::translate_function_with_license(
+                            actual,
+                            &merged,
+                            &permit_unlicensed(),
+                        ) {
+                            failures.push(format!("{name}: merged adapter {error}"));
+                        }
+                        let Inst::Const {
+                            value: expected, ..
+                        } = &source.functions[0].blocks[0].body[0].inst
+                        else {
+                            unreachable!()
+                        };
+                        let Inst::Const { value: actual, .. } = &actual.blocks[0].body[0].inst
+                        else {
+                            panic!("constant lost")
+                        };
+                        assert_eq!(actual, expected, "{name}: authored bytes/claim changed");
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 24);
+        assert!(
+            failures.is_empty(),
+            "24 body cases attempted:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn nested_bytes_batch_global_layouts_preserve_payload_and_type_identity() {
+        let mut failures = Vec::new();
+        let mut attempted = 0;
+        for shape in 0..5 {
+            for (data, utf8) in [
+                (b"A\0z".as_slice(), true),
+                (&[0xff, 0, 0x80][..], false),
+                (&[][..], true),
+            ] {
+                attempted += 1;
+                let name = format!("bytes_global_{shape}_{attempted}");
+                let source = typed_bytes_batch_fixture(&name, shape, true, data, utf8);
+                assert!(
+                    trust_ir_build::validate_module(&source).is_empty(),
+                    "{name}: invalid fixture"
+                );
+                let expected_objects = crate::compiler::module_object_globals(&source);
+                if let Err(error) = &expected_objects {
+                    failures.push(format!("{name}: source object globals {error}"));
+                }
+                let mut sibling = build_callee_module();
+                sibling.types.push(Ty::U16);
+                if let Err(error) = module_batch_eligible(&source) {
+                    failures.push(format!("{name}: {error}"));
+                }
+                match merge_modules(&[sibling, source.clone()]) {
+                    Err(error) => failures.push(format!("{name}: merge {error}")),
+                    Ok(merged) => {
+                        assert!(
+                            trust_ir_build::validate_module(&merged).is_empty(),
+                            "{name}: merged types"
+                        );
+                        assert_eq!(merged.globals.len(), 1);
+                        assert_eq!(merged.globals[0].initializer, source.globals[0].initializer);
+                        assert_eq!(merged.globals[0].name, source.globals[0].name);
+                        match crate::compiler::module_object_globals(&merged) {
+                            Ok(actual) => {
+                                if let Ok(expected) = &expected_objects {
+                                    assert_eq!(
+                                        &actual, expected,
+                                        "{name}: full global image/metadata changed"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                failures.push(format!("{name}: merged object globals {error}"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(attempted, 15);
+        assert!(
+            failures.is_empty(),
+            "15 global cases attempted:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn nested_bytes_batch_rejects_locally_malformed_typed_leaves() {
+        let mut attempted = 0;
+        for global in [false, true] {
+            for mutation in 0..10 {
+                let name = format!("bytes_bad_{global}_{mutation}");
+                let mut module = typed_bytes_batch_fixture(&name, 1, global, b"abc", true);
+                match mutation {
+                    0 => module.types[0] = Ty::I8,
+                    1 => module.types[0] = Ty::U16,
+                    _ => {
+                        let (Ty::Tuple(types), Constant::Aggregate(values)) =
+                            typed_bytes_batch_root(&mut module, global)
+                        else {
+                            unreachable!()
+                        };
+                        match mutation {
+                            2 => types[0] = Ty::Array(trust_ir::TyId::new(999), 3),
+                            3 => types[0] = Ty::I64,
+                            4 => types[0] = Ty::Array(trust_ir::TyId::new(0), 2),
+                            5 => types[0] = Ty::Array(trust_ir::TyId::new(0), 4),
+                            6 => {
+                                values[0] = Constant::Bytes {
+                                    data: vec![0xff; 3],
+                                    utf8: true,
+                                }
+                            }
+                            7 => values.push(values[0].clone()),
+                            8 => types.push(Ty::U8),
+                            9 => values[0] = Constant::Aggregate(vec![values[0].clone()]),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert!(
+                    !trust_ir_build::validate_module(&module).is_empty(),
+                    "{name}: malformed control not witnessed"
+                );
+                assert_bytes_batch_refused(module);
+                attempted += 1;
+            }
+        }
+        assert_eq!(attempted, 20);
+    }
+
+    #[test]
+    fn nested_bytes_batch_keeps_context_and_identity_guards() {
+        // Raw top-level Bytes globals are legacy renderer input, not typed
+        // batch capability. A well-formed typed body cannot authorize them.
+        let mut raw = typed_bytes_batch_fixture("bytes_legacy_raw", 0, true, b"abc", true);
+        raw.globals[0].ty = Ty::Ptr;
+        assert_bytes_batch_refused(raw);
+        for shape in [5, 6, 7] {
+            assert_bytes_batch_refused(typed_bytes_batch_fixture(
+                "bytes_body_only",
+                shape,
+                true,
+                b"abc",
+                true,
+            ));
+        }
+        for global in [false, true] {
+            let mut module = typed_bytes_batch_fixture("bytes_sequence", 0, global, b"abc", true);
+            let (ty, value) = typed_bytes_batch_root(&mut module, global);
+            *ty = Ty::Sequence(trust_ir::TyId::new(1));
+            *value = Constant::Sequence(vec![value.clone()]);
+            assert_bytes_batch_refused(module);
+        }
+        let mut global = typed_bytes_batch_fixture("bytes_and_u128", 1, true, b"abc", true);
+        let (Ty::Tuple(types), Constant::Aggregate(values)) =
+            typed_bytes_batch_root(&mut global, true)
+        else {
+            unreachable!()
+        };
+        types.push(Ty::U128);
+        values.push(Constant::U128(u128::MAX));
+        assert_bytes_batch_refused(global);
+
+        for (value, ty, diagnostic) in [
+            (
+                Constant::Closure {
+                    func: FuncId::new(0),
+                    captures: vec![Constant::Int(1)],
+                },
+                Ty::Ptr,
+                "captures",
+            ),
+            (
+                Constant::FnDef(FuncId::new(999)),
+                Ty::Func(FuncTyId::new(0)),
+                "FuncId",
+            ),
+            (
+                Constant::Int(encode_global_addr_stub(0, 0).unwrap()),
+                Ty::I64,
+                "stub-tagged",
+            ),
+        ] {
+            let mut module =
+                typed_bytes_batch_fixture("bytes_and_identity", 1, false, b"abc", true);
+            let (Ty::Tuple(types), Constant::Aggregate(values)) =
+                typed_bytes_batch_root(&mut module, false)
+            else {
+                unreachable!()
+            };
+            types.push(ty);
+            values.push(value);
+            let error = module_batch_eligible(&module)
+                .expect_err("Bytes must not hide later restricted constants");
+            assert!(error.contains(diagnostic), "expected {diagnostic}: {error}");
+            assert!(merge_modules(&[module]).is_err());
+        }
+        let mut proof = typed_bytes_batch_fixture("bytes_and_proof", 1, false, b"abc", true);
+        proof.proof_obligations.push(ProofObligation::new(
+            ProofId::new(0),
+            ObligationKind::MemorySafety,
+            ProofStatus::Pending,
+            "vc",
+        ));
+        assert_bytes_batch_refused(proof);
+        let mut refine = typed_bytes_batch_fixture("bytes_and_refinement", 1, false, b"abc", true);
+        refine.predicates.push(trust_ir::pred::Pred::Top);
+        assert_bytes_batch_refused(refine);
+
+        let mut switch = build_callee_module();
+        switch.functions[0].blocks[0].body[0].inst = Inst::Switch {
+            value: v(0),
+            cases: vec![SwitchCase {
+                value: Constant::Bytes {
+                    data: b"abc".to_vec(),
+                    utf8: true,
+                },
+                target: BlockId::new(0),
+                args: vec![v(0)],
+            }],
+            default: BlockId::new(0),
+            default_args: vec![v(0)],
+            exhaustive_enum_unreachable: false,
+        };
+        assert_bytes_batch_refused(switch);
     }
 
     /// Decode every stub in `f` against `m.globals` -> `(global name, offset)`
@@ -4477,6 +7383,144 @@ mod tests {
                 decoded_stub_names(&merged, &merged.functions[1]),
                 vec![("SHARED_TBL".to_string(), 0)]
             );
+        }
+    }
+
+    /// L02-P6: a data import's stated visibility restricts the definition
+    /// that satisfies it, as a function declaration's does. The merged global
+    /// carries the most constraining visibility any input states (hidden over
+    /// protected over default), whichever input comes first, for an
+    /// import/definition pair (a hidden or protected definition included:
+    /// a hidden import over a protected definition is hidden), for several
+    /// imports of one definition, for imports alone and for identical
+    /// immutable weak definitions (which dedup). A definition that differs in
+    /// anything but visibility still fails closed.
+    #[test]
+    fn merge_gives_a_global_the_most_constraining_visibility_of_its_inputs() {
+        use trust_ir::Visibility::{Default as D, Hidden as H, Protected as P};
+        let mut def = byte_global("SHARED_TBL", &[7, 7, 7, 7]);
+        def.linkage = Linkage::External;
+        def.mutable = true;
+        let with = |global: &Global, visibility| Global {
+            visibility,
+            ..global.clone()
+        };
+        let import = Global {
+            initializer: None,
+            ..def.clone()
+        };
+        let mut weak_def = byte_global("SHARED_TBL", &[7, 7, 7, 7]);
+        weak_def.linkage = Linkage::Weak;
+        // (inputs, expected visibility, whether the merged global is defined)
+        let cases: Vec<(Vec<Global>, trust_ir::Visibility, bool)> = vec![
+            (vec![with(&import, H), with(&def, D)], H, true),
+            (vec![with(&import, P), with(&def, D)], P, true),
+            (vec![with(&import, D), with(&def, D)], D, true),
+            (vec![with(&import, D), with(&def, P)], P, true),
+            (vec![with(&import, P), with(&def, H)], H, true),
+            // A non-default definition does not keep its own visibility over
+            // a more constraining import (L02-P6 closure audit 2 verifier).
+            (vec![with(&import, H), with(&def, P)], H, true),
+            (vec![with(&import, P), with(&def, P)], P, true),
+            (vec![with(&import, D), with(&def, H)], H, true),
+            (
+                vec![with(&import, H), with(&import, P), with(&def, D)],
+                H,
+                true,
+            ),
+            (
+                vec![with(&import, D), with(&import, P), with(&def, D)],
+                P,
+                true,
+            ),
+            (vec![with(&import, H), with(&import, D)], H, false),
+            (vec![with(&weak_def, P), with(&weak_def, D)], P, true),
+            (vec![with(&weak_def, H), with(&weak_def, P)], H, true),
+        ];
+        for (inputs, expected, defined) in cases {
+            // Every rotation of the inputs, so each one comes first once.
+            for first in 0..inputs.len() {
+                let order: Vec<&Global> = inputs[first..].iter().chain(&inputs[..first]).collect();
+                let label = format!(
+                    "{:?}",
+                    order
+                        .iter()
+                        .map(|g| (g.initializer.is_some(), g.visibility))
+                        .collect::<Vec<_>>()
+                );
+                let modules: Vec<Module> = order
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &global)| {
+                        globals_module(
+                            &format!("m{index}"),
+                            &format!("f{index}"),
+                            vec![global.clone()],
+                            &[(0, 0)],
+                        )
+                    })
+                    .collect();
+                let merged =
+                    merge_modules(&modules).unwrap_or_else(|e| panic!("{label} must merge: {e}"));
+                assert_eq!(merged.globals.len(), 1, "{label}: one unified global");
+                assert_eq!(merged.globals[0].visibility, expected, "{label}");
+                assert_eq!(merged.globals[0].initializer.is_some(), defined, "{label}");
+            }
+        }
+        // Anything but visibility still has to agree.
+        let mut other = with(&def, H);
+        other.initializer = None;
+        other.mutable = false;
+        let a = globals_module("ma", "fa", vec![other], &[(0, 0)]);
+        let b = globals_module("mb", "fb", vec![with(&def, D)], &[(0, 0)]);
+        let err = merge_modules(&[a, b]).expect_err("a mutability mismatch fails closed");
+        assert!(err.contains("DIFFERENT content"), "reason: {err}");
+    }
+
+    /// L02-P6 (closure audit 2 verifier): a function declaration's stated
+    /// visibility restricts the definition that upgrades it, whatever the
+    /// definition's own visibility. For every (declaration, definition)
+    /// visibility pair, in both input orders, the merged definition carries
+    /// the more constraining of the two (hidden over protected over
+    /// default): a hidden declaration of a protected definition is hidden.
+    #[test]
+    fn merge_gives_a_function_the_most_constraining_visibility_of_its_declaration_and_definition() {
+        use trust_ir::Visibility::{Default as D, Hidden as H, Protected as P};
+        for (declared, defined, expected) in [
+            (D, D, D),
+            (D, P, P),
+            (D, H, H),
+            (P, D, P),
+            (P, P, P),
+            (P, H, H),
+            (H, D, H),
+            (H, P, H),
+            (H, H, H),
+        ] {
+            let mut caller = build_caller_module();
+            let declaration = caller
+                .functions
+                .iter_mut()
+                .find(|f| f.name == "identity_fn")
+                .expect("the caller declares identity_fn");
+            assert!(!declaration.has_body());
+            declaration.visibility = declared;
+            let mut callee = build_callee_module();
+            callee.functions[0].visibility = defined;
+            for definition_first in [false, true] {
+                let label = format!(
+                    "declared {declared:?}, defined {defined:?}, definition_first={definition_first}"
+                );
+                let inputs = if definition_first {
+                    [callee.clone(), caller.clone()]
+                } else {
+                    [caller.clone(), callee.clone()]
+                };
+                let merged = merge_modules(&inputs).unwrap_or_else(|e| panic!("{label}: {e}"));
+                let merged_fn = function(&merged, "identity_fn");
+                assert!(merged_fn.has_body(), "{label}: the definition wins");
+                assert_eq!(merged_fn.visibility, expected, "{label}");
+            }
         }
     }
 
@@ -4764,6 +7808,407 @@ mod tests {
         );
     }
 
+    fn parse(text: &str) -> Module {
+        trust_ir::parser::parse_module(text).unwrap_or_else(|error| panic!("{error:?}\n{text}"))
+    }
+
+    /// Every `SymbolAddr` symbol of `f`'s bodies, in order.
+    fn symbol_addrs_of(f: &Function) -> Vec<String> {
+        let mut names = Vec::new();
+        for node in f.blocks.iter().flat_map(|b| &b.body) {
+            if let Inst::Const { value, .. } = &node.inst {
+                value.visit_constants(|c| {
+                    if let Constant::SymbolAddr { symbol, .. } = c {
+                        names.push(symbol.clone());
+                    }
+                });
+            }
+        }
+        names
+    }
+
+    fn function<'m>(m: &'m Module, name: &str) -> &'m Function {
+        m.functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("function `{name}`"))
+    }
+
+    const LOCAL_HELPER_A: &str = "\
+module \"a\"
+functy.0 = (i64) -> (i64)
+functy.1 = () -> (ptr)
+LINKAGE fn @helper(functy.0) {
+bb0(%0: i64):
+    %1 = const i64 200
+    %2 = add i64 %0, %1
+    ret %2
+}
+fn @a_call(functy.0) {
+bb0(%0: i64):
+    %1 = call @func.0(%0)
+    ret %1
+}
+fn @a_ptr(functy.1) {
+bb0:
+    %0 = const ptr symaddr<helper>
+    ret %0
+}
+";
+
+    const NAMES_HELPER_B: &str = "\
+module \"b\"
+functy.0 = (i64) -> (i64)
+functy.1 = () -> (ptr)
+global @b_tbl ptr = symaddr<helper>
+fn @b_ptr(functy.1) {
+bb0:
+    %0 = const ptr symaddr<helper>
+    ret %0
+}
+";
+
+    /// A module-local definition another input names is renamed apart,
+    /// with every reference in its own input (the call through its `FuncId`,
+    /// its own `SymbolAddr`), so the other input's `SymbolAddr` constants in
+    /// bodies and in a global initializer keep naming the EXTERNAL `helper`,
+    /// as under separate compilation. Both local linkages, both input orders.
+    #[test]
+    fn merge_renames_a_module_local_definition_another_input_names() {
+        for linkage in ["internal", "private"] {
+            let a = parse(&LOCAL_HELPER_A.replace("LINKAGE", linkage));
+            let b = parse(NAMES_HELPER_B);
+            for (inputs, a_index) in [([a.clone(), b.clone()], 0), ([b.clone(), a.clone()], 1)] {
+                let merged = merge_modules(&inputs).unwrap_or_else(|e| panic!("{linkage}: {e}"));
+                let renamed = format!("helper.merge.{a_index}");
+                assert!(
+                    merged.functions.iter().all(|f| f.name != "helper"),
+                    "{linkage}: no merged function may still be named `helper`"
+                );
+                let local = function(&merged, &renamed);
+                assert!(
+                    trust_cg_lower::is_module_local_function_definition(local),
+                    "{linkage}: `{renamed}` stays module-local"
+                );
+                let call = function(&merged, "a_call").blocks[0]
+                    .body
+                    .iter()
+                    .find_map(|n| match n.inst {
+                        Inst::Call { callee, .. } => Some(callee),
+                        _ => None,
+                    })
+                    .expect("a_call's call");
+                assert_eq!(merged.functions[call.index() as usize].name, renamed);
+                assert_eq!(
+                    symbol_addrs_of(function(&merged, "a_ptr")),
+                    std::slice::from_ref(&renamed)
+                );
+                assert_eq!(symbol_addrs_of(function(&merged, "b_ptr")), ["helper"]);
+                let table = merged
+                    .globals
+                    .iter()
+                    .find(|g| g.name == "b_tbl")
+                    .and_then(|g| g.initializer.clone());
+                assert!(
+                    matches!(table, Some(Constant::SymbolAddr { ref symbol, .. }) if symbol == "helper"),
+                    "{linkage}: {table:?}"
+                );
+            }
+            // Named by no other input: the local definition keeps its name.
+            let merged = merge_modules(&[
+                parse(&LOCAL_HELPER_A.replace("LINKAGE", linkage)),
+                build_callee_module(),
+            ])
+            .expect("an unnamed local merges as itself");
+            function(&merged, "helper");
+        }
+    }
+
+    /// A module-local definition never satisfies another input's declaration:
+    /// it is renamed apart, and the declaration stays an undefined external
+    /// that the caller keeps calling (separate compilation binds it outside).
+    /// Two module-local definitions of one name both merge, each renamed; an
+    /// External definition still upgrades the declaration.
+    #[test]
+    fn merge_keeps_a_module_local_definition_apart_from_a_declaration() {
+        for linkage in [Linkage::Internal, Linkage::Private] {
+            let mut callee = build_callee_module();
+            callee.functions[0].linkage = linkage;
+            for (inputs, local_index) in [
+                ([build_caller_module(), callee.clone()], 1),
+                ([callee.clone(), build_caller_module()], 0),
+            ] {
+                let merged = merge_modules(&inputs).unwrap_or_else(|e| panic!("{linkage}: {e}"));
+                let declaration = function(&merged, "identity_fn");
+                assert!(
+                    !declaration.has_body(),
+                    "{linkage}: the declaration stays bodyless"
+                );
+                let local = function(&merged, &format!("identity_fn.merge.{local_index}"));
+                assert!(local.has_body() && local.linkage == linkage);
+                let caller = function(&merged, "call_add_fn");
+                let callee_id = find_call_callee(caller).expect("call");
+                assert_eq!(
+                    merged.functions[callee_id.index() as usize].name,
+                    "identity_fn",
+                    "{linkage}: the caller keeps calling the declaration"
+                );
+            }
+            let mut other = callee.clone();
+            other.name = "mod_callee_2".into();
+            let merged = merge_modules(&[callee.clone(), other])
+                .expect("two module-local definitions of one name both merge");
+            function(&merged, "identity_fn.merge.0");
+            function(&merged, "identity_fn.merge.1");
+        }
+        let merged = merge_modules(&[build_caller_module(), build_callee_module()])
+            .expect("an External definition upgrades the declaration");
+        assert!(function(&merged, "identity_fn").has_body());
+    }
+
+    /// The two fail-closed cases of the rename planner: a module-local
+    /// personality another input names, and a `SymbolAddr` naming another
+    /// input's module-local data from an input with no global of that name.
+    #[test]
+    fn merge_refuses_what_it_cannot_rename_apart() {
+        let personality = parse(
+            "\
+module \"p\"
+functy.0 = () -> ()
+internal fn @rust_eh_personality(functy.0) {
+bb0:
+    ret
+}
+",
+        );
+        let marker = parse(
+            "\
+module \"m\"
+functy.0 = () -> ()
+fn @rust_eh_personality(functy.0) {
+}
+",
+        );
+        let error = merge_modules(&[personality, marker]).expect_err("personality refused");
+        assert!(
+            error.contains("module-local personality `rust_eh_personality`"),
+            "{error}"
+        );
+
+        let data = parse(
+            "\
+module \"d\"
+global internal @tbl i64 = 7
+",
+        );
+        let reader = parse(
+            "\
+module \"r\"
+functy.0 = () -> (ptr)
+fn @r_ptr(functy.0) {
+bb0:
+    %0 = const ptr symaddr<tbl>
+    ret %0
+}
+",
+        );
+        let error = merge_modules(&[data, reader]).expect_err("local data refused");
+        assert!(error.contains("defines as module-local data"), "{error}");
+    }
+
+    const EH_INPUT: &str = "\
+module \"NAME\"
+functy.0 = (i32) -> (i32)
+functy.1 = () -> ()
+fn @thrower(functy.0) {
+}
+PERSONALITY
+fn @NAME_run(functy.0) {
+bb0(%0: i32):
+    br bb3
+bb3:
+    %2 = invoke @func.0(%0) to bb1() unwind bb2
+bb1:
+    ret %2
+bb2:
+    %20, %21 = landingpad cleanup
+    resume %20
+}
+";
+
+    fn eh_input(name: &str, personality: &str) -> Module {
+        parse(
+            &EH_INPUT
+                .replace("NAME", name)
+                .replace("PERSONALITY", personality),
+        )
+    }
+
+    /// Every frame of a merged module with exception-handling structure runs
+    /// the one personality its names select, so a merge is refused when some
+    /// input's frames would run a personality they do not run separately: an
+    /// input selecting the C++ default merged with one declaring or locally
+    /// defining `rust_eh_personality`, an input using the external Rust
+    /// personality merged with one defining it module-locally, and ANY input
+    /// with a bodied function merged with one defining its personality
+    /// module-locally, even without exception-handling structure of its own
+    /// (its frames would get that personality and a filler LSDA). Inputs that
+    /// agree merge. So do an input without exception-handling structure and
+    /// one using an external personality (the accepted extra personality
+    /// call), an input defining a module-local personality merged with
+    /// declarations only, and inputs none of which has exception-handling
+    /// structure.
+    #[test]
+    fn merge_refuses_a_personality_some_inputs_frames_would_not_use() {
+        let rust_decl = "fn @rust_eh_personality(functy.1) {\n}";
+        let rust_local = "internal fn @rust_eh_personality(functy.1) {\nbb0:\n    ret\n}";
+        let cases = [
+            (
+                eh_input("g", ""),
+                eh_input("a", rust_local),
+                "the personality `__gxx_personality_v0`",
+            ),
+            (
+                eh_input("g", ""),
+                eh_input("a", rust_decl),
+                "the personality `__gxx_personality_v0`",
+            ),
+            (
+                eh_input("g", rust_decl),
+                eh_input("a", rust_local),
+                "defines a module-local `rust_eh_personality`",
+            ),
+        ];
+        for (first, second, needle) in cases {
+            for inputs in [
+                [first.clone(), second.clone()],
+                [second.clone(), first.clone()],
+            ] {
+                let error = merge_modules(&inputs).expect_err("differing personalities");
+                assert!(
+                    error.contains(needle) || error.contains("module-local personality"),
+                    "{needle}: {error}"
+                );
+            }
+        }
+        merge_modules(&[eh_input("g", rust_decl), eh_input("a", rust_decl)])
+            .expect("two inputs using the external Rust personality merge");
+        merge_modules(&[eh_input("g", ""), eh_input("a", "")])
+            .expect("two inputs using the C++ default merge");
+        // The verifier's shape: `b` has no exception-handling structure but
+        // its frames are unwound through; merged, they would run `a`'s
+        // counting personality.
+        for (first, second) in [
+            (eh_input("a", rust_local), build_callee_module()),
+            (build_callee_module(), eh_input("a", rust_local)),
+        ] {
+            let error = merge_modules(&[first, second]).expect_err("a non-EH input refused");
+            assert!(
+                error.contains("module-local personality `rust_eh_personality`")
+                    && error.contains("compiled separately they never run it"),
+                "{error}"
+            );
+        }
+        merge_modules(&[eh_input("a", rust_decl), build_callee_module()])
+            .expect("a non-EH input beside an external personality merges");
+        merge_modules(&[eh_input("g", ""), build_callee_module()])
+            .expect("a non-EH input beside the C++ default merges");
+        let mut declarations_only = build_callee_module();
+        declarations_only
+            .functions
+            .iter_mut()
+            .for_each(|f| f.blocks.clear());
+        merge_modules(&[eh_input("a", rust_local), declarations_only])
+            .expect("an input with no bodied function never runs a personality");
+        let local_without_eh = parse(
+            "\
+module \"p\"
+functy.0 = () -> ()
+internal fn @rust_eh_personality(functy.0) {
+bb0:
+    ret
+}
+",
+        );
+        merge_modules(&[local_without_eh, build_callee_module()])
+            .expect("without exception-handling structure no personality is emitted");
+    }
+
+    /// `eh_input` with a pad catching `catch` (C++ default personality),
+    /// optionally declaring the reserved EH type table `table`.
+    fn typed_eh_input(name: &str, catch: &str, table: Option<&[&str]>) -> Module {
+        let mut module = parse(
+            &EH_INPUT
+                .replace("NAME", name)
+                .replace("PERSONALITY", "")
+                .replace("landingpad cleanup", &format!("landingpad catch {catch}")),
+        );
+        if let Some(symbols) = table {
+            let pointer = module
+                .add_type(trust_ir::Ty::Ptr)
+                .expect("Module::add_type: test fixture");
+            module.globals.push(trust_ir::Global {
+                name: trust_cg_lower::function::EH_TYPE_TABLE_GLOBAL.to_string(),
+                ty: trust_ir::Ty::Array(pointer, symbols.len() as u64),
+                mutable: false,
+                initializer: Some(trust_ir::Constant::Array(
+                    symbols
+                        .iter()
+                        .map(|symbol| trust_ir::Constant::SymbolAddr {
+                            symbol: (*symbol).to_string(),
+                            addend: 0,
+                        })
+                        .collect(),
+                )),
+                linkage: Linkage::Internal,
+                tls: None,
+                align: None,
+                section: None,
+                visibility: Default::default(),
+                retained: false,
+            });
+        }
+        module
+    }
+
+    /// An input whose typed catch has no EH type table of its own is refused
+    /// beside an input that declares one, in either order (its index would
+    /// bind to the other input's typeinfo symbols; compiled alone it is
+    /// refused). Two inputs sharing an identical table merge, differing
+    /// tables stay refused, and inputs whose pads only catch all (no table
+    /// consulted) merge beside a table.
+    #[test]
+    fn merge_refuses_binding_a_typed_catch_through_another_inputs_type_table() {
+        let with_table = typed_eh_input("a", "1", Some(&["_ZTId"]));
+        let without_table = typed_eh_input("b", "1", None);
+        for inputs in [
+            [with_table.clone(), without_table.clone()],
+            [without_table.clone(), with_table.clone()],
+        ] {
+            let error = merge_modules(&inputs).expect_err("a table-less typed catch refused");
+            assert!(
+                error.contains("`b_run` catches a typed exception")
+                    && error.contains("[TCG-EH-TTYPE]"),
+                "{error}"
+            );
+        }
+        merge_modules(&[
+            with_table.clone(),
+            typed_eh_input("c", "1", Some(&["_ZTId"])),
+        ])
+        .expect("identical tables merge");
+        let error = merge_modules(&[
+            with_table.clone(),
+            typed_eh_input("c", "1", Some(&["_ZTIi"])),
+        ])
+        .expect_err("differing tables refused");
+        assert!(error.contains("DIFFERENT content"), "{error}");
+        merge_modules(&[with_table.clone(), typed_eh_input("d", "0", None)])
+            .expect("a catch-all-only input consults no table");
+        merge_modules(&[with_table, eh_input("e", "")])
+            .expect("a cleanup-only input consults no table");
+    }
+
     #[test]
     fn merge_rejects_proof_obligation_bearing_module() {
         let mut a = build_caller_module();
@@ -4783,6 +8228,41 @@ mod tests {
     }
 
     #[test]
+    fn merge_refuses_nonempty_tensor_blob_tables_before_rebuild() {
+        let plain = build_callee_module();
+        merge_modules(&[plain.clone()]).expect("the original empty-table scalar remains eligible");
+        let duplicate = merge_modules(&[plain.clone(), plain.clone()])
+            .expect_err("duplicate definitions remain refused");
+        assert!(
+            duplicate.contains("duplicate definition of function `identity_fn`"),
+            "{duplicate}"
+        );
+        let caller = build_caller_module();
+        merge_modules(&[caller.clone(), plain.clone()]).expect("ordinary scalar peers still merge");
+        merge_modules(&[plain.clone(), caller.clone()])
+            .expect("ordinary scalar peers still merge in reverse order");
+        let mut weighted = plain.clone();
+        weighted
+            .blobs
+            .push(trust_ir::blob::Blob::new(vec![1, 2, 3, 4]));
+        let before = weighted.blobs.clone();
+        for inputs in [
+            vec![weighted.clone()],
+            vec![weighted.clone(), caller.clone()],
+            vec![caller.clone(), weighted.clone()],
+        ] {
+            let refusal =
+                merge_modules(&inputs).expect_err("a rebuild must not erase the blob table");
+            assert!(
+                refusal.contains("Module::blobs")
+                    && refusal.contains("no native input/provider or merge contract"),
+                "{refusal}"
+            );
+        }
+        assert_eq!(weighted.blobs, before);
+    }
+
+    #[test]
     fn merge_rejects_refinement_predicate_table_instead_of_erasing_provenance() {
         let mut a = build_caller_module();
         a.predicates.push(trust_ir::pred::Pred::Top);
@@ -4793,6 +8273,166 @@ mod tests {
             err.contains("refinement predicate"),
             "reason should name refinement predicate provenance: {err}"
         );
+    }
+
+    #[test]
+    fn merge_preserves_tuple_layout_authority_by_declining_the_batch() {
+        let mut module = build_callee_module();
+        assert!(module_batch_eligible(&module).is_ok());
+        let tuple = module
+            .add_type(Ty::Tuple(vec![Ty::U8, Ty::U64]))
+            .expect("Module::add_type: test fixture");
+        module.tuple_layouts.push(trust_ir::TupleLayoutDescriptor {
+            tuple_type: tuple,
+            size: 16,
+            align: 8,
+            field_offsets: vec![8, 0],
+        });
+        let original = module.clone();
+        assert!(
+            module_batch_eligible(&module)
+                .unwrap_err()
+                .contains("tuple layout")
+        );
+        let error = merge_modules(&[module.clone(), build_caller_module()]).unwrap_err();
+        assert!(error.contains("tuple layout"), "{error}");
+        assert_eq!(module, original);
+    }
+
+    /// A row naming a module that no input is: `name`'s empty module digest.
+    fn foreign_import(name: &str) -> trust_ir::ModuleImport {
+        trust_ir::ModuleImport::new(name, Module::new(name).stable_digest())
+            .with_producer(trust_ir::Producer::TRust)
+    }
+
+    /// WS7.9 (b): every input's import rows are re-interned by content into
+    /// one merged table, and a kept `backed_by` follows its row.
+    #[test]
+    fn scout_f1_9_merge_modules_honours_imports_and_remaps_backed_by() {
+        let mut a = build_caller_module();
+        a.intern_import(foreign_import("dep_x")).expect("id space");
+        a.intern_import(foreign_import("dep_y")).expect("id space");
+        let mut b = build_callee_module();
+        b.intern_import(foreign_import("dep_y")).expect("id space");
+        let z = b.intern_import(foreign_import("dep_z")).expect("id space");
+        let ext_ty = b.functions[0].ty;
+        let mut ext = Function::declaration(
+            FuncId::new(1),
+            "ext_from_z",
+            ext_ty,
+            FunctionSummary::new().backed_by(trust_ir::ExternRef::new(z, "ext_from_z")),
+        );
+        ext.producer = Some(trust_ir::Producer::TRust);
+        b.try_add_function(ext).expect("fresh function");
+
+        let merged = merge_modules(&[a, b]).expect("import rows merge");
+        let names: Vec<&str> = merged.imports.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["dep_x", "dep_y", "dep_z"], "dep_y is interned once");
+        let ext = merged
+            .functions
+            .iter()
+            .find(|f| f.name == "ext_from_z")
+            .expect("declaration kept");
+        let backed_by = ext
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.backed_by.as_ref())
+            .expect("backed_by kept");
+        assert_eq!(
+            backed_by.module.index(),
+            2,
+            "remapped from b's #1 to merged #2"
+        );
+        assert_eq!(
+            merged.import(backed_by.module),
+            Some(&foreign_import("dep_z"))
+        );
+    }
+
+    /// Review (WS7.9): a `backed_by` whose row is DEDUPLICATED against an
+    /// earlier input's equal row lands on that shared merged row, not on its
+    /// own input's index (b's #0 `dep_y` is a's #1), and a row equal in name
+    /// and digest but recorded under another producer stays a separate row.
+    #[test]
+    fn merge_remaps_backed_by_onto_a_deduplicated_row() {
+        let mut a = build_caller_module();
+        a.intern_import(foreign_import("dep_x")).expect("id space");
+        a.intern_import(foreign_import("dep_y")).expect("id space");
+        let mut b = build_callee_module();
+        let y = b.intern_import(foreign_import("dep_y")).expect("id space");
+        b.intern_import(foreign_import("dep_x").with_producer(trust_ir::Producer::Clean))
+            .expect("id space");
+        let ext_ty = b.functions[0].ty;
+        let mut ext = Function::declaration(
+            FuncId::new(1),
+            "ext_from_y",
+            ext_ty,
+            FunctionSummary::new().backed_by(trust_ir::ExternRef::new(y, "ext_from_y")),
+        );
+        ext.producer = Some(trust_ir::Producer::TRust);
+        b.try_add_function(ext).expect("fresh function");
+
+        let merged = merge_modules(&[a, b]).expect("import rows merge");
+        assert_eq!(merged.imports.len(), 3, "{:?}", merged.imports);
+        let ext = merged
+            .functions
+            .iter()
+            .find(|f| f.name == "ext_from_y")
+            .expect("declaration kept");
+        let backed_by = ext
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.backed_by.as_ref())
+            .expect("backed_by kept");
+        assert_eq!(backed_by.module.index(), 1, "b's #0 is a's #1");
+        assert_eq!(
+            merged.import(backed_by.module),
+            Some(&foreign_import("dep_y"))
+        );
+    }
+
+    /// WS7.9 (b): a row whose digest is a merge PEER's is refused by name,
+    /// since the merged module's digest is not the peer's.
+    #[test]
+    fn merge_refuses_an_import_satisfied_by_a_merge_peer() {
+        let b = build_callee_module();
+        let mut a = build_caller_module();
+        a.intern_import(
+            trust_ir::ModuleImport::new(b.name.clone(), b.stable_digest())
+                .with_producer(trust_ir::Producer::TRust),
+        )
+        .expect("id space");
+        let err = merge_modules(&[a, b]).expect_err("peer-satisfied import must be refused");
+        assert!(err.contains("ImportSatisfiedByMergePeer"), "{err}");
+    }
+
+    /// Mutation control for the peer rule: the same row naming a module that
+    /// is NOT in the merge is carried, so the refusal above comes from the
+    /// peer comparison.
+    #[test]
+    fn merge_carries_the_same_row_when_its_module_is_not_a_peer() {
+        let b = build_callee_module();
+        let mut other = build_callee_module();
+        other.name = "mod_callee_elsewhere".into();
+        let mut a = build_caller_module();
+        a.intern_import(
+            trust_ir::ModuleImport::new(other.name.clone(), other.stable_digest())
+                .with_producer(trust_ir::Producer::TRust),
+        )
+        .expect("id space");
+        let merged = merge_modules(&[a, b]).expect("a non-peer row merges");
+        assert_eq!(merged.imports.len(), 1);
+    }
+
+    /// WS7.9 (b): re-interning never repairs an input's own duplicate rows.
+    #[test]
+    fn merge_refuses_an_input_with_a_duplicate_import_row() {
+        let mut a = build_caller_module();
+        a.imports.push(foreign_import("dep_x"));
+        a.imports.push(foreign_import("dep_x"));
+        let err = merge_modules(&[a, build_callee_module()])
+            .expect_err("a non-interned import table must be refused");
+        assert!(err.contains("ImportTableNotInterned"), "{err}");
     }
 
     #[test]
@@ -4897,7 +8537,7 @@ mod tests {
             fb.ret(vec![r]);
             fb.build();
         }
-        mb.build()
+        mb.build().expect("ModuleBuilder::build: test fixture")
     }
 
     /// Caller module: `fnptr_caller(x)` materializes `FnDef(fnptr_target)`
@@ -4909,6 +8549,7 @@ mod tests {
         m.func_types.push(FuncTy {
             params: vec![Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }); // FuncTyId 0
         let sig = FuncTyId::new(0);
@@ -5007,16 +8648,30 @@ mod tests {
             "FnDef constant must resolve to fnptr_target's DEFINITION (dense 0)"
         );
         // The caller's FuncTyId 0 is shifted by the targets module's table
-        // length (1) — and the block param's Ty::Func must agree.
+        // length (1) into a signature EQUAL to fnptr_target's (0), which the
+        // caller's declaration of it carried; the merge unifies upgraded
+        // signatures to the smallest merged id (`unify_upgraded_signatures`,
+        // WS7.3), so the FnDef constant keeps naming its callee's own `ty`
+        // (trust-ir compares `Ty::Func` nominally). The block param's Ty::Func
+        // and the CallIndirect sig must agree with it.
+        assert_eq!(merged.func_types.len(), 2, "func_types concatenated");
+        assert_eq!(merged.func_types[1].params, merged.func_types[0].params);
+        assert_eq!(merged.func_types[1].returns, merged.func_types[0].returns);
+        assert_eq!(merged.functions[0].ty, FuncTyId::new(0));
         assert_eq!(
             sig,
-            Some(FuncTyId::new(1)),
-            "CallIndirect.sig must be base-shifted into the merged table"
+            Some(FuncTyId::new(0)),
+            "CallIndirect.sig must name the unified signature of its FnDef's callee"
         );
         assert_eq!(
             merged.functions[2].blocks[1].params[0].1,
-            Ty::Func(FuncTyId::new(1)),
+            Ty::Func(FuncTyId::new(0)),
             "fn-pointer BLOCK PARAM type must be remapped in lockstep with the sig"
+        );
+        assert!(
+            trust_ir_build::validate_module(&merged).is_empty(),
+            "the merged fn-pointer surface validates: {:?}",
+            trust_ir_build::validate_module(&merged)
         );
     }
 
@@ -5120,8 +8775,8 @@ mod tests {
             } if symbol == "some_sym"
         ));
 
-        // A non-zero addend is still adapter-fail-closed and therefore remains
-        // ineligible, avoiding a whole-batch fallback.
+        // A non-zero addend is name-relative too and the adapter lowers it
+        // as an explicit add, so it batches like the bare form.
         if let Inst::Const {
             value: Constant::SymbolAddr { addend, .. },
             ..
@@ -5129,9 +8784,15 @@ mod tests {
         {
             *addend = 1;
         }
-        let err =
-            module_batch_eligible(&sa).expect_err("non-zero-addend body SymbolAddr stays deferred");
-        assert!(err.contains("non-zero addend"), "reason: {err}");
+        assert!(module_batch_eligible(&sa).is_ok());
+        let merged = merge_modules(&[sa.clone()]).expect("addend SymbolAddr should batch");
+        assert!(matches!(
+            &merged.functions[0].blocks[0].body[0].inst,
+            Inst::Const {
+                value: Constant::SymbolAddr { symbol, addend: 1 },
+                ..
+            } if symbol == "some_sym"
+        ));
 
         // Dangling FnDef (no matching function): cannot be remapped.
         let mut dangling = build_fnptr_caller_module();
@@ -5141,7 +8802,7 @@ mod tests {
         let err = module_batch_eligible(&dangling).expect_err("dangling FnDef must fail closed");
         assert!(err.contains("no matching function"), "reason: {err}");
 
-        // SeqMap*: adapter-fail-closed, stays deferred.
+        // SeqMap*: lowered per module, still kept out of batch merges.
         let mut seq = build_fnptr_caller_module();
         seq.functions[0].blocks[0].body.insert(
             0,
@@ -5233,6 +8894,7 @@ mod tests {
         sig_targets.func_types.push(FuncTy {
             params: vec![Ty::I64, Ty::I64],
             returns: vec![Ty::I64],
+            abi: None,
             is_vararg: false,
         }); // FuncTyId 1 in the targets module — different arity
         let smods = [sig_targets.clone(), caller.clone()];
@@ -5266,6 +8928,7 @@ mod tests {
         let mut a = build_caller_module();
         a.files = vec!["a.rs".to_string()];
         a.functions[0].scopes = Some(vec![ScopeData {
+            inlined_at: None,
             parent: None,
             span: Some(SourceSpan {
                 file: 0,
@@ -5282,6 +8945,16 @@ mod tests {
         let mut b = build_callee_module();
         b.files = vec!["b.rs".to_string(), "a.rs".to_string()];
         b.functions[0].scopes = Some(vec![ScopeData {
+            // An inlining link's call-site span names "b.rs" too; its file
+            // index is remapped with the scope's own span.
+            inlined_at: Some(InlinedAt {
+                span: SourceSpan {
+                    file: 0,
+                    line: 9,
+                    col: 9,
+                },
+                callee: "callee".to_string(),
+            }),
             parent: None,
             span: Some(SourceSpan {
                 file: 0,
@@ -5323,6 +8996,7 @@ mod tests {
         assert_eq!(
             merged.functions[0].scopes,
             Some(vec![ScopeData {
+                inlined_at: None,
                 parent: None,
                 span: Some(SourceSpan {
                     file: 0,
@@ -5335,6 +9009,14 @@ mod tests {
         assert_eq!(
             merged.functions[1].scopes,
             Some(vec![ScopeData {
+                inlined_at: Some(InlinedAt {
+                    span: SourceSpan {
+                        file: 1,
+                        line: 9,
+                        col: 9,
+                    },
+                    callee: "callee".to_string(),
+                }),
                 parent: None,
                 span: Some(SourceSpan {
                     file: 1,
@@ -5342,10 +9024,39 @@ mod tests {
                     col: 0,
                 }),
             }]),
-            "module B's lexical scope span must be remapped with instruction spans"
+            "module B's lexical scope span and inlining call-site span must be remapped \
+             with instruction spans"
         );
         assert_eq!(merged.functions[0].blocks[0].body[0].scope, Some(0));
         assert_eq!(merged.functions[1].blocks[0].body[0].scope, Some(0));
+    }
+
+    #[test]
+    fn merge_rejects_inlining_links_without_file_table_in_mixed_merge() {
+        let mut a = build_caller_module();
+        a.files = vec!["a.rs".to_string()];
+        let mut b = build_callee_module(); // b.files stays EMPTY...
+        b.functions[0].scopes = Some(vec![ScopeData {
+            // ...but b's scope carries an inlining link whose call-site file
+            // index would mis-resolve against a's table.
+            inlined_at: Some(InlinedAt {
+                span: SourceSpan {
+                    file: 0,
+                    line: 2,
+                    col: 2,
+                },
+                callee: "callee".to_string(),
+            }),
+            parent: None,
+            span: None,
+        }]);
+        b.functions[0].blocks[0].body[0].scope = Some(0);
+        let err = merge_modules(&[a, b])
+            .expect_err("inlining-link-without-file-table in a mixed merge must fail closed");
+        assert!(
+            err.contains("inlining link") && err.contains("no debug file table"),
+            "reason should name the link and the mis-resolution hazard: {err}"
+        );
     }
 
     #[test]
@@ -5372,6 +9083,7 @@ mod tests {
         a.files = vec!["a.rs".to_string()];
         let mut b = build_callee_module(); // b.files stays EMPTY...
         b.functions[0].scopes = Some(vec![ScopeData {
+            inlined_at: None,
             parent: None,
             span: Some(SourceSpan {
                 file: 0,
@@ -5433,6 +9145,7 @@ mod tests {
     fn structural_self_check_catches_malformed_scope_tree_and_dangling_scope_use() {
         let mut merged = merge_modules(&[build_caller_module(), build_callee_module()]).unwrap();
         merged.functions[0].scopes = Some(vec![ScopeData {
+            inlined_at: None,
             parent: Some(0),
             span: None,
         }]);
@@ -5442,10 +9155,12 @@ mod tests {
 
         merged.functions[0].scopes = Some(vec![
             ScopeData {
+                inlined_at: None,
                 parent: None,
                 span: None,
             },
             ScopeData {
+                inlined_at: None,
                 parent: None,
                 span: None,
             },
@@ -5455,6 +9170,7 @@ mod tests {
         assert!(err.contains("second root"), "reason: {err}");
 
         merged.functions[0].scopes = Some(vec![ScopeData {
+            inlined_at: None,
             parent: None,
             span: None,
         }]);
@@ -5462,6 +9178,38 @@ mod tests {
         let err = structural_self_check(&merged, &scalar_expectations())
             .expect_err("a dangling instruction scope must fail closed");
         assert!(err.contains("scope index 1 out of range"), "reason: {err}");
+
+        // (v) an inlining link whose call-site file index escapes the merged
+        // file table (both inputs share one file, so the merged table has
+        // exactly one entry and the range check is live).
+        let mut a = build_caller_module();
+        a.files = vec!["a.rs".to_string()];
+        let mut b = build_callee_module();
+        b.files = vec!["a.rs".to_string()];
+        let mut merged = merge_modules(&[a, b]).unwrap();
+        assert_eq!(merged.files, vec!["a.rs".to_string()]);
+        merged.functions[0].scopes = Some(vec![ScopeData {
+            inlined_at: Some(InlinedAt {
+                span: SourceSpan {
+                    file: 7,
+                    line: 1,
+                    col: 1,
+                },
+                callee: "callee".to_string(),
+            }),
+            parent: None,
+            span: None,
+        }]);
+        let expectations = MergeExpectations {
+            files: 1,
+            ..scalar_expectations()
+        };
+        let err = structural_self_check(&merged, &expectations)
+            .expect_err("an out-of-range inlining call-site file index must fail closed");
+        assert!(
+            err.contains("inlining link") && err.contains("out of range"),
+            "reason: {err}"
+        );
     }
 
     #[test]
@@ -5509,6 +9257,7 @@ mod tests {
         ModMaps {
             func_ty_base,
             func_ty_len,
+            func_ty_canon: HashMap::new(),
             closure_base: 0,
             closure_len: 0,
             struct_map: HashMap::new(),
@@ -5518,6 +9267,417 @@ mod tests {
             ty_map: HashMap::new(),
             file_map: HashMap::new(),
             files_len: 0,
+        }
+    }
+
+    #[test]
+    fn runtime_closure_remap_keeps_captures_and_checks_both_source_references() {
+        let mut maps = test_maps(0, 0);
+        maps.closure_base = 5;
+        maps.closure_len = 2;
+        let funcs = HashMap::from([(3, 7)]);
+        let original = Inst::MakeClosure {
+            ty: ClosureTyId::new(1),
+            func: FuncId::new(3),
+            captures: vec![v(4), v(2), v(4)],
+        };
+        let mut remapped = original.clone();
+        remap_inst(&mut remapped, &maps, &funcs, &mut 0).unwrap();
+        assert_eq!(
+            remapped,
+            Inst::MakeClosure {
+                ty: ClosureTyId::new(6),
+                func: FuncId::new(7),
+                captures: vec![v(4), v(2), v(4)],
+            }
+        );
+        for (ty, func) in [(1, 99), (2, 3)] {
+            let mut invalid = Inst::MakeClosure {
+                ty: ClosureTyId::new(ty),
+                func: FuncId::new(func),
+                captures: vec![v(4), v(2), v(4)],
+            };
+            let before = invalid.clone();
+            assert!(remap_inst(&mut invalid, &maps, &funcs, &mut 0).is_err());
+            assert_eq!(
+                invalid, before,
+                "a rejected source reference must not partially remap"
+            );
+        }
+        let counts = TableCounts {
+            functions: 8,
+            func_types: 0,
+            structs: 0,
+            enums: 0,
+            records: 0,
+            closure_types: 7,
+            globals: 0,
+            types: 0,
+        };
+        check_inst_in_range(&remapped, &counts, "runtime_closure").unwrap();
+        for (ty, func) in [(7, 7), (6, 8)] {
+            let invalid = Inst::MakeClosure {
+                ty: ClosureTyId::new(ty),
+                func: FuncId::new(func),
+                captures: vec![],
+            };
+            assert!(check_inst_in_range(&invalid, &counts, "runtime_closure").is_err());
+        }
+    }
+
+    mod runtime_closure_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../trust-cg-lower/tests/common/runtime_closure.rs"
+        ));
+    }
+
+    #[test]
+    fn runtime_closure_identity_lockstep_rejects_in_range_target_type_and_capture_corruption() {
+        let mut source = runtime_closure_fixture::runtime_closure_module(true);
+        source.func_types[0].params.push(Ty::I64);
+        source.functions[0].blocks[0].params.push((v(1), Ty::I64));
+        let constructor = &mut source.functions[0].blocks[0].body[0];
+        constructor.results = vec![v(2)];
+        let Inst::MakeClosure { captures, .. } = &mut constructor.inst else {
+            panic!("runtime constructor fixture");
+        };
+        *captures = vec![v(0), v(1), v(0)];
+        let mut decoy = source.functions[1].clone();
+        decoy.id = FuncId::new(2);
+        decoy.name = "decoy".into();
+        source.functions.push(decoy);
+        source.closure_types.push(ClosureTy {
+            func: source.closure_types[0].func,
+            captures: vec![Ty::I32; 3],
+        });
+        let different_apparent = source
+            .add_func_type(FuncTy {
+                params: vec![],
+                returns: vec![Ty::I32],
+                abi: None,
+                is_vararg: false,
+            })
+            .unwrap();
+        source.closure_types.push(ClosureTy {
+            func: different_apparent,
+            captures: vec![Ty::I64; 3],
+        });
+        assert!(trust_ir_build::validate_module(&source).is_empty());
+        let modules = [source];
+        let winners: Vec<_> = modules[0]
+            .functions
+            .iter()
+            .map(|function| Some((0, function)))
+            .collect();
+        verify_function_identity_preservation(&modules, &winners, &modules[0]).unwrap();
+        for case in 0..6 {
+            let mut corrupted = modules[0].clone();
+            let Inst::MakeClosure { ty, func, captures } =
+                &mut corrupted.functions[0].blocks[0].body[0].inst
+            else {
+                panic!("runtime constructor fixture");
+            };
+            match case {
+                0 => *func = FuncId::new(2),
+                1 => *ty = ClosureTyId::new(1),
+                2 => captures[0] = v(99),
+                3 => captures.swap(0, 1),
+                4 => {
+                    captures.pop();
+                }
+                5 => *ty = ClosureTyId::new(2),
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_function_identity_preservation(&modules, &winners, &corrupted).is_err(),
+                "a valid numeric reference must not substitute another identity, case {case}"
+            );
+        }
+    }
+
+    fn call_boundary_direct_module() -> Module {
+        let mut module = build_caller_module();
+        for node in module.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.body)
+        {
+            if let Inst::Call { callee, args } = &node.inst {
+                node.inst = Inst::CallCannotUnwind {
+                    callee: *callee,
+                    args: args.clone(),
+                };
+            }
+        }
+        module
+    }
+
+    fn call_boundary_indirect_module() -> Module {
+        let mut module = build_fnptr_caller_module();
+        for node in module.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.body)
+        {
+            if let Inst::CallIndirect {
+                callee,
+                sig,
+                args,
+                calling_conv,
+            } = &node.inst
+            {
+                node.inst = Inst::CallIndirectCannotUnwind {
+                    callee: *callee,
+                    sig: *sig,
+                    args: args.clone(),
+                    calling_conv: *calling_conv,
+                };
+            }
+        }
+        module
+    }
+
+    #[test]
+    fn call_boundary_merge_preserves_direct_identity_and_no_eh() {
+        let caller = call_boundary_direct_module();
+        let callee = build_callee_module();
+        assert!(!module_has_eh(&caller), "a boundary is not an EH handler");
+        let modules = [caller.clone(), callee.clone()];
+        let merged = merge_modules(&modules).unwrap();
+        assert!(!module_has_eh(&merged));
+        assert!(merged.functions[0].blocks[0].body.iter().any(|node| {
+            matches!(
+                &node.inst,
+                Inst::CallCannotUnwind { callee, args }
+                    if *callee == FuncId::new(1) && args.as_slice() == [v(0)]
+            )
+        }));
+        let winners = [
+            Some((0, &caller.functions[0])),
+            Some((1, &callee.functions[0])),
+        ];
+        verify_function_identity_preservation(&modules, &winners, &merged).unwrap();
+        let mut corrupted = merged.clone();
+        for node in &mut corrupted.functions[0].blocks[0].body {
+            if let Inst::CallCannotUnwind { callee, .. } = &mut node.inst {
+                *callee = FuncId::new(0);
+            }
+        }
+        let error = verify_function_identity_preservation(&modules, &winners, &corrupted)
+            .expect_err("an in-range wrong target is still the wrong function");
+        assert!(error.contains("DIFFERENT FUNCTION"), "{error}");
+    }
+
+    #[test]
+    fn call_boundary_merge_preserves_indirect_signature_convention_and_operands() {
+        let targets = build_fnptr_target_module();
+        let caller = call_boundary_indirect_module();
+        let modules = [targets.clone(), caller.clone()];
+        let merged = merge_modules(&modules).unwrap();
+        assert!(!module_has_eh(&caller));
+        assert!(!module_has_eh(&merged));
+        assert!(
+            matches!(
+                &merged.functions[2].blocks[1].body[0].inst,
+                Inst::CallIndirectCannotUnwind { callee, sig, args, calling_conv }
+                    if *callee == v(2) && *sig == FuncTyId::new(0)
+                        && args.as_slice() == [v(3)] && *calling_conv == CallingConv::C
+            ),
+            "the boundary's sig names the unified signature of fnptr_target (0): the caller's \
+            shifted id (1) is equal to it (`unify_upgraded_signatures`, WS7.3)"
+        );
+        let winners = [
+            Some((0, &targets.functions[0])),
+            Some((0, &targets.functions[1])),
+            Some((1, &caller.functions[0])),
+        ];
+        verify_function_identity_preservation(&modules, &winners, &merged).unwrap();
+        for mutation in 0..3 {
+            let mut corrupted = merged.clone();
+            let Inst::CallIndirectCannotUnwind {
+                callee,
+                args,
+                calling_conv,
+                ..
+            } = &mut corrupted.functions[2].blocks[1].body[0].inst
+            else {
+                panic!("missing boundary call")
+            };
+            let reason = match mutation {
+                0 => {
+                    *callee = v(3);
+                    "value operand changed"
+                }
+                1 => {
+                    args.clear();
+                    "operands or unwind boundary changed"
+                }
+                _ => {
+                    *calling_conv = CallingConv::Fast;
+                    "calling convention changed"
+                }
+            };
+            let error = verify_function_identity_preservation(&modules, &winners, &corrupted)
+                .expect_err("the lockstep must refuse a changed call contract");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
+    #[test]
+    fn call_boundary_identity_lockstep_refuses_erasure_to_ordinary_calls() {
+        let caller = call_boundary_direct_module();
+        let callee = build_callee_module();
+        let modules = [caller.clone(), callee.clone()];
+        let mut merged = merge_modules(&modules).unwrap();
+        let winners = [
+            Some((0, &caller.functions[0])),
+            Some((1, &callee.functions[0])),
+        ];
+        for node in &mut merged.functions[0].blocks[0].body {
+            if let Inst::CallCannotUnwind { callee, args } = &node.inst {
+                node.inst = Inst::Call {
+                    callee: *callee,
+                    args: args.clone(),
+                };
+            }
+        }
+        let error = verify_function_identity_preservation(&modules, &winners, &merged)
+            .expect_err("normal return equivalence cannot erase a normative boundary");
+        assert!(error.contains("changed variant"), "{error}");
+
+        let targets = build_fnptr_target_module();
+        let caller = call_boundary_indirect_module();
+        let modules = [targets.clone(), caller.clone()];
+        let mut merged = merge_modules(&modules).unwrap();
+        let winners = [
+            Some((0, &targets.functions[0])),
+            Some((0, &targets.functions[1])),
+            Some((1, &caller.functions[0])),
+        ];
+        let Inst::CallIndirectCannotUnwind {
+            callee,
+            sig,
+            args,
+            calling_conv,
+        } = &merged.functions[2].blocks[1].body[0].inst
+        else {
+            panic!("missing indirect boundary call")
+        };
+        merged.functions[2].blocks[1].body[0].inst = Inst::CallIndirect {
+            callee: *callee,
+            sig: *sig,
+            args: args.clone(),
+            calling_conv: *calling_conv,
+        };
+        let error = verify_function_identity_preservation(&modules, &winners, &merged)
+            .expect_err("the indirect boundary must also survive");
+        assert!(error.contains("changed variant"), "{error}");
+    }
+
+    #[test]
+    fn call_boundary_indirect_lockstep_refuses_wrong_in_range_signature() {
+        let mut targets = build_fnptr_target_module();
+        targets.func_types.push(FuncTy {
+            params: vec![Ty::I64, Ty::I64],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        });
+        let caller = call_boundary_indirect_module();
+        let modules = [targets.clone(), caller.clone()];
+        let mut merged = merge_modules(&modules).unwrap();
+        let winners = [
+            Some((0, &targets.functions[0])),
+            Some((0, &targets.functions[1])),
+            Some((1, &caller.functions[0])),
+        ];
+        verify_function_identity_preservation(&modules, &winners, &merged).unwrap();
+        let Inst::CallIndirectCannotUnwind { sig, .. } =
+            &mut merged.functions[2].blocks[1].body[0].inst
+        else {
+            panic!("missing indirect boundary call")
+        };
+        *sig = FuncTyId::new(1); // In range, but the two-argument signature.
+        let error = verify_function_identity_preservation(&modules, &winners, &merged)
+            .expect_err("in-range signature IDs do not establish ABI identity");
+        assert!(error.contains("signature diverged"), "{error}");
+    }
+
+    #[test]
+    fn call_boundary_remappers_preserve_modes_and_refuse_dangling_ids() {
+        let fid_map = HashMap::from([(3u32, 7u32)]);
+        let mut direct = Inst::CallCannotUnwind {
+            callee: FuncId::new(3),
+            args: vec![v(2), v(5)],
+        };
+        remap_inst(&mut direct, &test_maps(5, 2), &fid_map, &mut 0).unwrap();
+        assert_eq!(
+            direct,
+            Inst::CallCannotUnwind {
+                callee: FuncId::new(7),
+                args: vec![v(2), v(5)],
+            }
+        );
+        let mut indirect = Inst::CallIndirectCannotUnwind {
+            callee: v(9),
+            sig: FuncTyId::new(1),
+            args: vec![v(2), v(5)],
+            calling_conv: CallingConv::Cold,
+        };
+        remap_inst(&mut indirect, &test_maps(5, 2), &fid_map, &mut 0).unwrap();
+        assert_eq!(
+            indirect,
+            Inst::CallIndirectCannotUnwind {
+                callee: v(9),
+                sig: FuncTyId::new(6),
+                args: vec![v(2), v(5)],
+                calling_conv: CallingConv::Cold,
+            }
+        );
+        let mut dangling = Inst::CallCannotUnwind {
+            callee: FuncId::new(99),
+            args: vec![],
+        };
+        let error = remap_inst(&mut dangling, &test_maps(5, 2), &fid_map, &mut 0)
+            .expect_err("a boundary cannot capture another module's function ID");
+        assert!(error.contains("no matching function"), "{error}");
+        let mut dangling = Inst::CallIndirectCannotUnwind {
+            callee: v(9),
+            sig: FuncTyId::new(2),
+            args: vec![],
+            calling_conv: CallingConv::C,
+        };
+        assert!(remap_inst(&mut dangling, &test_maps(5, 2), &fid_map, &mut 0).is_err());
+    }
+
+    #[test]
+    fn call_boundary_structural_bounds_refuse_bad_function_and_signature_ids() {
+        let counts = TableCounts {
+            functions: 2,
+            func_types: 2,
+            structs: 0,
+            enums: 0,
+            records: 0,
+            closure_types: 0,
+            globals: 0,
+            types: 0,
+        };
+        for inst in [
+            Inst::CallCannotUnwind {
+                callee: FuncId::new(2),
+                args: vec![],
+            },
+            Inst::CallIndirectCannotUnwind {
+                callee: v(0),
+                sig: FuncTyId::new(2),
+                args: vec![],
+                calling_conv: CallingConv::C,
+            },
+        ] {
+            let error = check_inst_in_range(&inst, &counts, "boundary")
+                .expect_err("new constructors must not bypass structural bounds");
+            assert!(error.contains("out of range"), "{error}");
         }
     }
 
@@ -5586,6 +9746,77 @@ mod tests {
             }
             other => panic!("unexpected inst: {other:?}"),
         }
+    }
+
+    #[test]
+    fn dialect_type_remapping_preserves_complete_nominal_identity() {
+        let nominal = Ty::Dialect(Box::new(trust_ir::DialectTy::new("tla", "Value", 1)));
+        let nested = Ty::PtrConst(Box::new(Ty::Tuple(vec![nominal.clone()])));
+        assert_eq!(remap_ty_final(&nested, &test_maps(0, 0)).unwrap(), nested);
+        let module = Module::new("nominal-type-equality");
+        tys_equal_name_resolved(&module, &nominal, &module, &nominal, 8).unwrap();
+        for different in [
+            trust_ir::DialectTy::new("other", "Value", 1),
+            trust_ir::DialectTy::new("tla", "Int", 1),
+            trust_ir::DialectTy::new("tla", "Value", 2),
+        ] {
+            assert!(
+                tys_equal_name_resolved(
+                    &module,
+                    &nominal,
+                    &module,
+                    &Ty::Dialect(Box::new(different)),
+                    8
+                )
+                .is_err()
+            );
+        }
+        assert!(tys_equal_name_resolved(&module, &nominal, &module, &Ty::I64, 8).is_err());
+    }
+
+    #[test]
+    fn opaque_handle_remapping_preserves_complete_nominal_identity() {
+        // A v43 handle carries no module-table id, and its `(name, runtime)`
+        // pair IS its identity: merging must reproduce it byte for byte, and
+        // two runtimes' handles must never compare equal — a merge that
+        // unified them would let one runtime receive the other's words.
+        let handle = Ty::handle("Nat", "trust_bignum::Nat");
+        let nested = Ty::PtrConst(Box::new(Ty::Tuple(vec![handle.clone()])));
+        assert_eq!(remap_ty_final(&nested, &test_maps(0, 0)).unwrap(), nested);
+        let module = Module::new("handle-type-equality");
+        tys_equal_name_resolved(&module, &handle, &module, &handle, 8).unwrap();
+        for different in [
+            Ty::handle("Nat", "other_bignum::Nat"),
+            Ty::handle("Int", "trust_bignum::Nat"),
+            Ty::Ptr,
+        ] {
+            assert!(
+                tys_equal_name_resolved(&module, &handle, &module, &different, 8).is_err(),
+                "{different:?} must not compare equal to a Nat handle"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_self_check_rejects_a_lexically_malformed_handle_identity() {
+        // The merged module is re-serialized, so a malformed pair would be
+        // written out as if this backend had vouched for it. Same clause the
+        // self-check applies to a dialect identity.
+        let empty = TableCounts {
+            functions: 0,
+            func_types: 0,
+            structs: 0,
+            enums: 0,
+            records: 0,
+            closure_types: 0,
+            globals: 0,
+            types: 0,
+        };
+        let error = check_ty_resolvable(&Ty::handle("Nat", "trust_bignum::"), &empty, "type 0")
+            .expect_err("a malformed handle identity must not survive a merge");
+        assert!(error.contains("handle runtime"), "{error}");
+        check_ty_resolvable(&Ty::handle("Nat", "trust_bignum::Nat"), &empty, "type 0")
+            .expect("the pinned identity is well-formed");
     }
 
     #[test]
@@ -5703,11 +9934,13 @@ mod tests {
         name == target || name == format!("_{target}")
     }
 
-    /// STEP 0 (de-risk): merge two global-free functions (A calls sibling B),
-    /// compile the MERGED module ONCE for x86-64, and prove the batching glue is
-    /// sound end-to-end: one object with both symbols, B resolved INTRA-OBJECT
-    /// (defined, not an undefined external), every proof cert verified, and the
-    /// compile byte-for-byte deterministic.
+    /// Merge two global-free functions (A calls sibling B) and check one x86-64
+    /// object defines both symbols, with deterministic bytes. The object is
+    /// compiled without proof promotion: its sampled and registry-name evidence
+    /// is uncredited, so a proof-promoted compile is refused (pinned by
+    /// `merged_object_promotion_rejects_uncredited_evidence`), and proof-bundle
+    /// determinism for a merged object is pinned by
+    /// `step0_merged_call_relocation_promotes_through_value_proof_and_reparse_binding`.
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn step0_merged_two_function_module_compiles_to_one_object() {
@@ -5720,9 +9953,10 @@ mod tests {
         let compile = || {
             Compiler::new(CompilerConfig {
                 target: Target::X86_64,
-                emit_proofs: true,
+                emit_proofs: false,
                 ..CompilerConfig::default()
             })
+            .with_codegen_license(permit_unlicensed())
             .compile(&merged)
             .expect("merged multi-function module should compile for x86-64")
         };
@@ -5736,25 +9970,18 @@ mod tests {
             "merged object must contain both functions"
         );
 
-        // (c) every proof certificate verified (emit_proofs fails closed on any
-        // unverified entry, so a successful compile already implies this — assert
-        // it explicitly as the gate).
-        let proofs = r1.proofs.as_ref().expect("emit_proofs must yield a bundle");
-        assert!(!proofs.is_empty(), "proof bundle must be non-empty");
-        assert!(
-            proofs.iter().all(|c| c.verified),
-            "every proof certificate for the merged module must be verified"
-        );
+        assert!(r1.proofs.is_none());
 
-        // (d) deterministic: identical object + identical proof bundle.
+        // (d) deterministic: identical object.
         assert_eq!(
             r1.object_code, r2.object_code,
             "merged compile must be byte-identical across runs (determinism gate)"
         );
-        assert_eq!(r1.proofs, r2.proofs, "proof bundle must be deterministic");
 
         // (b) B resolves INTRA-OBJECT LOCAL, not as an undefined external.
-        if let Some(syms) = object_symbols(&r1.object_code) {
+        {
+            let syms = object_symbols(&r1.object_code)
+                .expect("expected a parseable Mach-O or ELF symbol table");
             let identity: Vec<&(String, bool)> = syms
                 .iter()
                 .filter(|(n, _)| sym_matches(n, "identity_fn"))
@@ -5777,13 +10004,34 @@ mod tests {
             // Contrast: compile module A ALONE — identity_fn is only an extern
             // declaration there, so it MUST be an undefined external. This proves
             // the merge is what turned an extern into an intra-object definition.
-            if let Ok(a_only) = Compiler::new(CompilerConfig {
+            let a_only = Compiler::new(CompilerConfig {
                 target: Target::X86_64,
                 emit_proofs: false,
                 ..CompilerConfig::default()
             })
-            .compile(&build_caller_module())
-                && let Some(a_syms) = object_symbols(&a_only.object_code)
+            .with_codegen_license(permit_unlicensed())
+            .compile(&{
+                // Alone, the caller has an FFI boundary (`identity_fn` is a
+                // bodyless declaration), which needs a pinned target
+                // (`TargetInfoRequired`, WS7.3).
+                let mut caller = build_caller_module();
+                caller.target_info = Some(trust_ir::TargetInfo {
+                    triple: if cfg!(target_os = "macos") {
+                        "x86_64-apple-darwin"
+                    } else {
+                        "x86_64-unknown-linux-gnu"
+                    }
+                    .into(),
+                    pointer_size: 8,
+                    endianness: trust_ir::Endianness::Little,
+                    abi: None,
+                    struct_passing: trust_ir::StructPassingPolicy::NativeC,
+                });
+                caller
+            })
+            .expect("separate caller object must compile");
+            let a_syms = object_symbols(&a_only.object_code)
+                .expect("separate object must have a parseable symbol table");
             {
                 let a_identity: Vec<&(String, bool)> = a_syms
                     .iter()
@@ -5800,6 +10048,205 @@ mod tests {
 
     // ---- Step-0 (aggregate): struct arg/return + enum match --------------
 
+    /// E0.2: with no admitted statistical tier, promotion of the merged object
+    /// is refused by default, deterministically, and the refusal names the
+    /// uncredited evidence class rather than a generic failure.
+    ///
+    /// The subject is a 128-bit merge whose caller shifts the call result by
+    /// a variable amount: the x86-64 source-bound body lane refuses that
+    /// shift by name, so the caller's rows remain sampled evidence whatever
+    /// proof tools the host has. The 64-bit merge
+    /// (the inlined `a + b` and the identity) is inside that lane; with its
+    /// replay refused it is refused just as deterministically, naming the
+    /// missing replayed proof. (With an admitted AY and Clean it promotes or
+    /// not by what AY proves, which is not this test's subject.)
+    #[cfg(all(feature = "verify", not(target_os = "windows")))]
+    #[test]
+    fn merged_object_promotion_rejects_uncredited_evidence() {
+        use crate::compiler::{CompileError, Compiler, CompilerConfig};
+        use crate::target::Target;
+        use trust_cg_verify::function_verifier::{
+            REGISTRY_NAME_LOOKUP_IS_NOT_CREDIT, STATISTICAL_EVIDENCE_IS_NOT_CREDIT,
+        };
+        use trust_cg_verify::x86_source_bound_body::X86_BODY_NEEDS_REPLAY;
+
+        let refuse = |merged: &Module| {
+            Compiler::new(CompilerConfig {
+                target: Target::X86_64,
+                emit_proofs: true,
+                ..CompilerConfig::default()
+            })
+            .with_codegen_license(permit_unlicensed())
+            .compile(merged)
+            .expect_err("object promotion must reject uncredited evidence")
+        };
+
+        let paired = merge_modules(&[
+            build_caller_module_with(Ty::I128, BinOp::Shl),
+            build_callee_module_of(Ty::I128),
+        ])
+        .unwrap();
+        let first = refuse(&paired);
+        assert!(
+            matches!(&first, CompileError::ProofPromotionRejected { target: Target::X86_64, reason }
+                if reason.contains(STATISTICAL_EVIDENCE_IS_NOT_CREDIT)
+                    || reason.contains(REGISTRY_NAME_LOOKUP_IS_NOT_CREDIT)),
+            "{first}"
+        );
+        assert_eq!(first.to_string(), refuse(&paired).to_string());
+
+        let wide = merge_modules(&[build_caller_module(), build_callee_module()]).unwrap();
+        crate::env_lock::with_env_overrides(&[("TCG_REFINE_SOLVER", "0")], || {
+            let first = refuse(&wide);
+            assert!(
+                matches!(&first, CompileError::ProofPromotionRejected { target: Target::X86_64, reason }
+                    if reason.contains(X86_BODY_NEEDS_REPLAY)),
+                "{first}"
+            );
+            assert_eq!(first.to_string(), refuse(&wide).to_string());
+        });
+    }
+
+    /// The end-to-end relocation authority the step-0 merged tests lost under
+    /// E0.2, restored on a merged module that still promotes. Their x86-64
+    /// objects are refused on uncredited instruction rows (sampled 64-bit
+    /// copies, registry-named loads and stores) before any certificate bundle
+    /// reaches the caller, so they can no longer show what the production
+    /// proof lane attaches to a merged object's call relocation, nor that
+    /// proof emission leaves the object bytes unchanged.
+    ///
+    /// Here a trap-only `void_caller` makes a zero-argument direct call to its
+    /// merged, trap-only sibling `void_callee` (the `-> !` shim shape
+    /// `x86_trap_only_body_certifies_and_argument_shims_are_judged_by_their_body_theorem`
+    /// admits). The one call relocation must promote only through the
+    /// production composition: a solver-backed value proof for its kind plus
+    /// the per-object reparse binding (ENC-9 on Mach-O). Proof emission must
+    /// not change the merged object bytes, the bundle must be deterministic,
+    /// and the callee must be an intra-object definition.
+    #[cfg(all(feature = "verify", not(target_os = "windows")))]
+    #[test]
+    fn step0_merged_call_relocation_promotes_through_value_proof_and_reparse_binding() {
+        use crate::compiler::{Compiler, CompilerConfig};
+        use crate::pipeline::OptLevel;
+        use crate::target::{Target, TargetSpec};
+
+        let caller = {
+            let mut mb = ModuleBuilder::new("diverging_caller_mod");
+            let ft = mb.add_func_type(vec![], vec![]);
+            {
+                let mut fb = mb.function("void_caller", ft); // FuncId 0
+                let entry = fb.create_block();
+                fb.switch_to_block(entry);
+                fb.call_void(FuncId::new(1), vec![]); // -> sibling (extern decl)
+                fb.unreachable();
+                fb.build();
+            }
+            {
+                // Bodyless external DECLARATION of the sibling (FuncId 1).
+                let fb = mb.function("void_callee", ft);
+                fb.build();
+            }
+            mb.build().expect("ModuleBuilder::build: test fixture")
+        };
+        let callee = {
+            let mut mb = ModuleBuilder::new("diverging_callee_mod");
+            let ft = mb.add_func_type(vec![], vec![]);
+            let mut fb = mb.function("void_callee", ft);
+            let entry = fb.create_block();
+            fb.switch_to_block(entry);
+            fb.unreachable();
+            fb.build();
+            mb.build().expect("ModuleBuilder::build: test fixture")
+        };
+        let merged = merge_modules(&[caller, callee]).expect("diverging merge should succeed");
+
+        for (triple, kind, value_lane, binding) in [
+            (
+                "x86_64-apple-darwin",
+                "x86-64 Mach-O X86_64_RELOC_BRANCH",
+                "solver-backed value proof (trust_cg_verify::macho_call_reloc_proofs)",
+                "ENC-9 reparse-enforced object",
+            ),
+            (
+                "x86_64-unknown-linux-gnu",
+                "x86-64 ELF R_X86_64_PLT32",
+                "solver-backed value proof (trust_cg_verify::elf_call_reloc_proofs)",
+                "ELF reparse-enforced object",
+            ),
+        ] {
+            let compile = |emit_proofs: bool| {
+                Compiler::new_for_target_spec(
+                    CompilerConfig {
+                        opt_level: OptLevel::O0,
+                        target: Target::X86_64,
+                        emit_proofs,
+                        ..CompilerConfig::default()
+                    },
+                    TargetSpec::parse(triple).expect("x86-64 target spec"),
+                )
+                .with_codegen_license(permit_unlicensed())
+                .compile(&merged)
+                .unwrap_or_else(|error| {
+                    panic!("{triple} (emit_proofs={emit_proofs}) must compile: {error}")
+                })
+            };
+            let plain = compile(false);
+            let proved = compile(true);
+            let proved_again = compile(true);
+
+            assert!(plain.proofs.is_none(), "{triple}");
+            assert_eq!(proved.metrics.function_count, 2, "{triple}");
+            let proofs = proved
+                .proofs
+                .as_deref()
+                .expect("emit_proofs must yield a bundle");
+            assert!(
+                proofs.iter().all(|cert| cert.verified),
+                "{triple}: a promoted bundle carries no failed entry: {proofs:?}"
+            );
+            let inventories: Vec<_> = proofs
+                .iter()
+                .filter(|cert| cert.category == "relocation_inventory")
+                .collect();
+            let [inventory] = inventories.as_slice() else {
+                panic!("{triple}: exactly one relocation inventory: {proofs:?}");
+            };
+            assert!(
+                inventory
+                    .strength
+                    .contains("1 emitted relocation row(s) covered")
+                    && inventory
+                        .strength
+                        .contains(&format!("{kind}:Verified:{value_lane} + {binding}")),
+                "{triple}: relocation authority must name the kind and both proof layers: \
+                 {inventory:?}"
+            );
+
+            assert_eq!(
+                proved.object_code, plain.object_code,
+                "{triple}: proof emission must not change the merged object bytes"
+            );
+            assert_eq!(
+                proved.object_code, proved_again.object_code,
+                "{triple}: merged compile must be byte-identical across runs"
+            );
+            assert_eq!(
+                proved.proofs, proved_again.proofs,
+                "{triple}: proof bundle must be deterministic"
+            );
+
+            let syms = object_symbols(&proved.object_code)
+                .unwrap_or_else(|| panic!("{triple}: object symbol table must parse"));
+            for name in ["void_caller", "void_callee"] {
+                let hits: Vec<_> = syms.iter().filter(|(n, _)| sym_matches(n, name)).collect();
+                assert!(
+                    !hits.is_empty() && hits.iter().all(|(_, defined)| *defined),
+                    "{triple}: {name} must be a DEFINED (intra-object) symbol: {hits:?}"
+                );
+            }
+        }
+    }
+
     /// Module A: `agg_caller(x) = pair_sum(make_pair(x+1, x*3))`, with BOTH
     /// callees as extern DECLARATIONS whose signatures carry the struct by
     /// value (arg AND return) — the real bridge per-function shape for
@@ -5812,16 +10259,19 @@ mod tests {
             FuncTy {
                 params: vec![Ty::I64],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             }, // 0: agg_caller
             FuncTy {
                 params: vec![pair.clone()],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             }, // 1: pair_sum (struct ARG)
             FuncTy {
                 params: vec![Ty::I64, Ty::I64],
                 returns: vec![pair.clone()],
+                abi: None,
                 is_vararg: false,
             }, // 2: make_pair (struct RETURN)
         ];
@@ -5911,11 +10361,13 @@ mod tests {
             FuncTy {
                 params: vec![pair.clone()],
                 returns: vec![Ty::I64],
+                abi: None,
                 is_vararg: false,
             }, // 0: pair_sum
             FuncTy {
                 params: vec![Ty::I64, Ty::I64],
                 returns: vec![pair.clone()],
+                abi: None,
                 is_vararg: false,
             }, // 1: make_pair
         ];
@@ -6182,13 +10634,12 @@ mod tests {
         use crate::compiler::{Compiler, CompilerConfig};
         use crate::target::{Target, TargetSpec};
 
-        // Backend-adapter convention: ExtractField declares the AGGREGATE type
-        // (the shape the e2e x86-64 aggregate-ABI corpus uses).
-        let merged = merge_modules(&[
-            build_agg_caller_module(),
-            build_agg_callee_module(Ty::Struct(StructId::new(0))),
-        ])
-        .expect("aggregate merge should succeed");
+        // trust-ir's convention: ExtractField declares the FIELD type (the
+        // result). The adapter also reads the legacy aggregate-type spelling,
+        // but trust-ir refuses it (`OperandTypeMismatch`), and every ingestion
+        // entry refuses what the validator refuses (WS7.3).
+        let merged = merge_modules(&[build_agg_caller_module(), build_agg_callee_module(Ty::I64)])
+            .expect("aggregate merge should succeed");
         let target_spec =
             TargetSpec::parse("x86_64-apple-darwin").expect("x86-64 Mach-O target spec");
 
@@ -6201,6 +10652,7 @@ mod tests {
                 },
                 target_spec,
             )
+            .with_codegen_license(permit_unlicensed())
             .compile(&merged)
             .expect("merged aggregate module should compile for x86-64")
         };
@@ -6214,12 +10666,17 @@ mod tests {
             "merged object must contain the caller and both aggregate callees"
         );
 
-        // (b) Proof-required production certification accepts the non-empty
-        // relocation inventory only because the standing solver-backed BRANCH
-        // proof is composed with the exact-object ENC-9 reparse binding. The
-        // missing-binding and unproved-kind complements remain fail-closed in
-        // object_inventory's unit tests.
-        let proof_result = Compiler::new_for_target_spec(
+        // (b) Proof-required production certification promotes the merged
+        // object: every function's instruction evidence is credited by the
+        // source-bound body theorem, and its call relocations only through the
+        // production composition, the solver-backed BRANCH value proof plus the
+        // exact-object ENC-9 reparse binding. Until `549d8147b`
+        // (OD-BODY-ADMIT-BIT-TEST-20261022) admitted `bt r, imm8` as a CF-only
+        // flag writer, the body theorem refused `pair_sum` on its `BtRI`, and
+        // E0.2 refused the object on the 23 rows left to sampled or
+        // registry-named evidence (`TCG_TRACE_OPCODE_INVENTORY`: `pair_sum`
+        // blocking=23 at `2ae1116b2`, 0 at `cd1bffb0b`).
+        let proved = Compiler::new_for_target_spec(
             CompilerConfig {
                 target: Target::X86_64,
                 emit_proofs: true,
@@ -6227,32 +10684,35 @@ mod tests {
             },
             target_spec,
         )
+        .with_codegen_license(permit_unlicensed())
         .compile(&merged)
-        .expect("proved and reparse-bound call relocations must promote");
-        let relocation_inventory = proof_result
+        .unwrap_or_else(|error| {
+            panic!("credited instructions and proved, reparse-bound call relocations must promote: {error}")
+        });
+        let proofs = proved
             .proofs
-            .as_ref()
-            .and_then(|proofs| {
-                proofs
-                    .iter()
-                    .find(|proof| proof.category == "relocation_inventory")
-            })
-            .expect("proof-required compile must carry relocation inventory authority");
-        assert!(relocation_inventory.verified, "{relocation_inventory:?}");
+            .as_deref()
+            .expect("emit_proofs must yield a bundle");
         assert!(
-            relocation_inventory
-                .strength
-                .contains("X86_64_RELOC_BRANCH")
-                && relocation_inventory
-                    .strength
-                    .contains("solver-backed value proof")
-                && relocation_inventory
-                    .strength
-                    .contains("ENC-9 reparse-enforced object"),
-            "relocation authority must name both proof layers: {relocation_inventory:?}"
+            proofs.iter().all(|cert| cert.verified),
+            "a promoted bundle carries no failed entry: {proofs:?}"
+        );
+        let inventories: Vec<_> = proofs
+            .iter()
+            .filter(|cert| cert.category == "relocation_inventory")
+            .collect();
+        let [inventory] = inventories.as_slice() else {
+            panic!("exactly one relocation inventory: {proofs:?}");
+        };
+        assert!(
+            inventory.strength.contains(
+                "x86-64 Mach-O X86_64_RELOC_BRANCH:Verified:solver-backed value proof \
+                 (trust_cg_verify::macho_call_reloc_proofs) + ENC-9 reparse-enforced object"
+            ),
+            "relocation authority must name the kind and both proof layers: {inventory:?}"
         );
         assert_eq!(
-            proof_result.object_code, r1.object_code,
+            proved.object_code, r1.object_code,
             "proof emission must not change the merged object bytes"
         );
 
@@ -6292,6 +10752,7 @@ mod tests {
                 emit_proofs: false,
                 ..CompilerConfig::default()
             })
+            .with_codegen_license(permit_unlicensed())
             .compile(&build_agg_caller_module())
                 && let Some(a_syms) = object_symbols(&a_only.object_code)
             {
@@ -6307,6 +10768,28 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn storage_geometry_merge_preserves_dimensions_without_inventing_a_value_type() {
+        let mut source = Module::new("storage_identity");
+        let storage = Ty::Storage(trust_ir::StorageLayout::new(80, 8));
+        source.types.push(storage.clone());
+        let merged =
+            merge_modules(&[source.clone()]).expect("unused storage declaration is geometry only");
+        assert!(merged.types.contains(&storage));
+        assert!(tys_equal_name_resolved(&source, &storage, &merged, &storage, 0).is_err());
+        tys_equal_name_resolved(&source, &storage, &merged, &storage, TY_CMP_DEPTH_LIMIT).unwrap();
+        for wrong in [
+            Ty::Storage(trust_ir::StorageLayout::new(88, 8)),
+            Ty::Storage(trust_ir::StorageLayout::new(80, 16)),
+            Ty::Array(TyId::new(0), 80),
+        ] {
+            assert!(
+                tys_equal_name_resolved(&source, &storage, &merged, &wrong, TY_CMP_DEPTH_LIMIT)
+                    .is_err()
+            );
         }
     }
 }

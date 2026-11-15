@@ -295,15 +295,21 @@ pub unsafe extern "C" fn ay_sat_watch_bcp_specialized(ctx: *mut PropagationConte
         }
     }
 
-    // Drive the JIT-compiled watched-literal BCP kernel.
-    let provider =
-        match JitBcpWatchedLiteralKernelProvider::compile(num_vars, clauses, num_vars.max(1)) {
-            Ok(p) => p,
-            Err(_) => {
-                write_status(ctx, AY_SAT_BCP_STATUS_DECODE_ERROR);
-                return AY_SAT_BCP_STATUS_DECODE_ERROR;
-            }
-        };
+    // Drive the JIT-compiled watched-literal BCP kernel. Its code does not
+    // depend on the formula, so every call shares the one compiled copy and
+    // builds only this call's arena; compiling here made every call pay a
+    // full JIT compile.
+    let provider = match JitBcpWatchedLiteralKernelProvider::bind_shared_kernel(
+        num_vars,
+        clauses,
+        num_vars.max(1),
+    ) {
+        Ok(p) => p,
+        Err(_) => {
+            write_status(ctx, AY_SAT_BCP_STATUS_DECODE_ERROR);
+            return AY_SAT_BCP_STATUS_DECODE_ERROR;
+        }
+    };
     let mut handle = SolverKernelHandle::from_provider(&provider);
     let buf = (num_vars * 2).max(8);
     let mut implied_buf = vec![0i32; buf];
@@ -644,7 +650,7 @@ mod tests {
 
     /// Per-call BCP throughput: JIT-compiled-cached kernel vs the BcpState
     /// reference, both reconstruct-per-call (the PropagationContext ABI model).
-    /// Run: `TRUST_CG_RUN_MEASUREMENT_TESTS=1 cargo test
+    /// Run: `TRUST_CG_RUN_MEASUREMENT_TESTS=1 scripts/trust_cargo.sh test
     /// -p trust-cg-jit-matrix --lib perf_jit_cached_vs_bcpstate -- --nocapture`.
     #[test]
     fn perf_jit_cached_vs_bcpstate() {

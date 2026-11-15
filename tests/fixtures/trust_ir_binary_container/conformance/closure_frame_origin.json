@@ -1,0 +1,109 @@
+{
+  "name": "closure_frame_origin",
+  "functions": [],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [
+    {
+      "func": 0,
+      "captures": []
+    }
+  ],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [],
+      "returns": [],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": {
+    "triple": "aarch64-apple-darwin",
+    "pointer_size": 8,
+    "endianness": "Little",
+    "abi": null,
+    "struct_passing": "NativeC"
+  },
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": [
+    {
+      "closure": 0,
+      "size": 0,
+      "align": 1,
+      "capture_offsets": [],
+      "origin": {
+        "Rust": {
+          "stable_crate_id": 7,
+          "def_path_hash": [
+            7,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            11,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "args_digest": {
+            "algorithm": "Sha256",
+            "bytes": [
+              65,
+              238,
+              121,
+              30,
+              234,
+              189,
+              66,
+              221,
+              10,
+              234,
+              100,
+              239,
+              249,
+              37,
+              233,
+              194,
+              131,
+              42,
+              5,
+              41,
+              247,
+              70,
+              28,
+              161,
+              188,
+              15,
+              193,
+              226,
+              207,
+              36,
+              2,
+              173
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

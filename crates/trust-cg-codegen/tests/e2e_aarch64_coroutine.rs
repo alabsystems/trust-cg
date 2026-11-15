@@ -1,6 +1,7 @@
 // E2E: AArch64 coroutine FOUNDATION — a 2-state generator built on the
 // `Inst::CoroSuspend` terminator, verified at two levels: the trust-ir
-// interpreter AND a linked-and-run aarch64-apple-darwin Mach-O binary.
+// interpreter AND a linked-and-run native binary (Mach-O on AArch64 macOS, ELF
+// on AArch64 Linux GNU).
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -50,11 +51,33 @@ use trust_ir::{
 fn macho_compiler(config: CompilerConfig) -> Compiler {
     let spec = trust_cg_codegen::target::TargetSpec::parse("aarch64-apple-darwin")
         .expect("aarch64-apple-darwin parses");
-    Compiler::new_for_target_spec(config, spec)
+    Compiler::new_for_target_spec(config, spec).with_codegen_license(permit_unlicensed())
 }
 
-fn can_link_and_run_aarch64_macho() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+#[path = "common/native_host.rs"]
+mod native_host;
+
+/// AArch64 Linux GNU (ELF) or macOS (Mach-O) can link and run the object.
+fn can_link_and_run_aarch64_native() -> bool {
+    native_host::NATIVE
+}
+
+/// Compile for the host's own object format and ABI at O0.
+fn compile_to_native_obj(module: &TrustIrModule) -> Vec<u8> {
+    let spec = trust_cg_codegen::target::TargetSpec::parse(native_host::TRIPLE)
+        .expect("native triple parses");
+    let result = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: OptLevel::O0,
+            ..CompilerConfig::default()
+        },
+        spec,
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(module)
+    .expect("generator compilation should succeed");
+    native_host::assert_native_object(&result.object_code);
+    result.object_code
 }
 
 // ----------------------------------------------------------------------------
@@ -65,11 +88,14 @@ fn can_link_and_run_aarch64_macho() -> bool {
 // must record `next_state = 1` into `frame[0]` and return the yielded `42`.
 // ----------------------------------------------------------------------------
 fn build_gen_step(module: &mut TrustIrModule, func_id: u32, name: &str) {
-    let ft = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr],  // frame pointer
-        returns: vec![Ty::I64], // yielded value (or -1 sentinel when done)
-        is_vararg: false,
-    });
+    let ft = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr],  // frame pointer
+            returns: vec![Ty::I64], // yielded value (or -1 sentinel when done)
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let mut func = TrustIrFunction::new(FuncId::new(func_id), name, ft, BlockId::new(0));
     func.blocks = vec![
@@ -160,7 +186,9 @@ fn build_gen_step(module: &mut TrustIrModule, func_id: u32, name: &str) {
             ],
         },
     ];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
 }
 
 /// Module containing only `_gen_step` — the backend compilation target.
@@ -186,11 +214,14 @@ fn build_interpreter_drive_module() -> TrustIrModule {
     // gen_step is FuncId 1; drive (the entry we execute) is FuncId 0.
     build_gen_step(&mut module, 1, "_gen_step");
 
-    let drive_ft = module.add_func_type(FuncTy {
-        params: vec![],
-        returns: vec![Ty::I64],
-        is_vararg: false,
-    });
+    let drive_ft = module
+        .add_func_type(FuncTy {
+            params: vec![],
+            returns: vec![Ty::I64],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
     let mut drive = TrustIrFunction::new(FuncId::new(0), "_drive", drive_ft, BlockId::new(0));
     drive.blocks = vec![TrustIrBlock {
         id: BlockId::new(0),
@@ -293,7 +324,9 @@ fn build_interpreter_drive_module() -> TrustIrModule {
             }),
         ],
     }];
-    module.add_function(drive);
+    module
+        .try_add_function(drive)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -358,13 +391,13 @@ fn coroutine_generator_compiles_to_valid_macho() {
 
 #[test]
 fn coroutine_generator_links_runs_and_yields_sequence() {
-    if !can_link_and_run_aarch64_macho() {
-        eprintln!("SKIP: requires an aarch64-apple-darwin host");
+    if !can_link_and_run_aarch64_native() {
+        eprintln!("SKIP: requires an AArch64 Linux GNU or macOS host");
         return;
     }
 
     let module = build_generator_module();
-    let obj_bytes = compile_to_obj(&module);
+    let obj_bytes = compile_to_native_obj(&module);
 
     let test_dir = std::env::temp_dir().join("trust_cg_e2e_coroutine");
     let _ = fs::remove_dir_all(&test_dir);
@@ -417,6 +450,7 @@ int main(void) {
             "-o",
             binary_path.to_str().unwrap(),
         ])
+        .args(native_host::c_math_library_args())
         .output()
         .expect("cc should be available");
 
@@ -449,4 +483,31 @@ int main(void) {
     );
 
     let _ = fs::remove_dir_all(&test_dir);
+}
+
+/// The Linux GNU native lane's object, checked at object level on every host.
+#[test]
+fn coroutine_generator_linux_object_is_elf_aarch64() {
+    let object = Compiler::new_for_target_spec(
+        CompilerConfig {
+            opt_level: OptLevel::O0,
+            ..CompilerConfig::default()
+        },
+        trust_cg_codegen::target::TargetSpec::parse("aarch64-unknown-linux-gnu").unwrap(),
+    )
+    .with_codegen_license(permit_unlicensed())
+    .compile(&build_generator_module())
+    .expect("the Linux GNU generator object must compile")
+    .object_code;
+    native_host::assert_elf_aarch64_object(&object);
+    assert!(!native_host::text_words(&object).is_empty());
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

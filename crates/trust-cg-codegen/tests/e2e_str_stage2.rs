@@ -82,7 +82,7 @@
 //! HANG SAFETY: every JIT compile+execute runs on a WATCHDOG worker thread
 //! (180s bound; a hung worker leaks the buffer, never frees machine code
 //! under execution). COVERAGE: aarch64-gated. Run ONE TEST PER PROCESS:
-//!   perl -e 'alarm 300; exec @ARGV' -- cargo test -p trust-cg-codegen \
+//!   perl -e 'alarm 300; exec @ARGV' -- scripts/trust_cargo.sh test -p trust-cg-codegen \
 //!     --test e2e_str_stage2 -- --exact <name> --test-threads=1
 
 #![cfg(target_arch = "aarch64")]
@@ -111,6 +111,7 @@ fn jit_module(
     );
     let config = CompilerConfig::jit_fast(Target::Aarch64);
     Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, externs)
         .unwrap_or_else(|e| panic!("trust-cg JIT compile of MIR-emitted `{what}` failed: {e:?}"))
         .buffer
@@ -243,16 +244,15 @@ fn native_murmur_hash_64a(data: &[u8], seed: u64) -> u64 {
     const R: u32 = 47;
     let len = data.len();
     let mut h: u64 = seed ^ (len as u64).wrapping_mul(M);
-    let mut chunks = data.chunks_exact(8);
-    for block in &mut chunks {
-        let mut k = u64::from_le_bytes(block.try_into().expect("8-byte chunk"));
+    let (blocks, tail) = data.as_chunks::<8>();
+    for block in blocks {
+        let mut k = u64::from_le_bytes(*block);
         k = k.wrapping_mul(M);
         k ^= k >> (R & 63);
         k = k.wrapping_mul(M);
         h ^= k;
         h = h.wrapping_mul(M);
     }
-    let tail = chunks.remainder();
     for (i, &b) in tail.iter().enumerate() {
         h ^= (b as u64) << (i.wrapping_mul(8) & 63);
     }
@@ -263,6 +263,68 @@ fn native_murmur_hash_64a(data: &[u8], seed: u64) -> u64 {
     h = h.wrapping_mul(M);
     h ^= h >> (R & 63);
     h
+}
+
+/// TAIL PIN for the block form above: the ragged remainder must be MIXED, not
+/// dropped. `chunks_exact(8)` and `as_chunks::<8>().0` both discard the last
+/// `len % 8` bytes, so a rewrite that keeps only `.0` and loses the `tail`
+/// binding silently stops hashing them.
+///
+/// The obvious check — hash(x) against hash(x truncated to a multiple of 8) —
+/// does NOT pin this. `h` is seeded with `seed ^ (len as u64).wrapping_mul(M)`,
+/// so two inputs of DIFFERENT length disagree even when the tail is ignored,
+/// and a tail-dropping murmur passes that check. The length is therefore held
+/// FIXED below and only the tail bytes vary: a tail-dropping murmur returns the
+/// IDENTICAL value for both members of every pair here and fails.
+#[test]
+fn str2_murmur_ragged_tail_is_mixed_not_dropped() {
+    let mut pairs = 0;
+    for blocks in 0..3usize {
+        for residue in 1..8usize {
+            let base = blocks * 8;
+            let mut a = vec![0x5a_u8; base + residue];
+            // Identical length, identical whole 8-byte blocks, ONE differing
+            // tail byte.
+            let mut b = a.clone();
+            b[base] = 0xa5;
+            assert_ne!(
+                native_murmur_hash_64a(&a, 11),
+                native_murmur_hash_64a(&b, 11),
+                "blocks={blocks} residue={residue}: a differing TAIL byte must change the hash \
+                 — equal values mean the ragged remainder was dropped"
+            );
+            pairs += 1;
+            if residue >= 2 {
+                // The tail is index-weighted (`h ^= b << (i * 8)`), so SWAPPING
+                // two tail bytes must change the hash too: this pins the tail
+                // `.enumerate()`, not merely that some tail byte was read.
+                a[base] = 0x01;
+                a[base + 1] = 0x02;
+                let mut swapped = a.clone();
+                swapped.swap(base, base + 1);
+                assert_ne!(
+                    native_murmur_hash_64a(&a, 11),
+                    native_murmur_hash_64a(&swapped, 11),
+                    "blocks={blocks} residue={residue}: swapped TAIL bytes must change the hash"
+                );
+                pairs += 1;
+            }
+        }
+    }
+    assert_eq!(
+        pairs, 39,
+        "the pin must cover every residue 1..8 over 0, 1 and 2 whole blocks"
+    );
+    // CONTROL: the whole 8-byte BLOCKS must still be consumed as well — same
+    // length, one changed byte inside the first block.
+    let block_bytes = vec![0x5a_u8; 19];
+    let mut changed = block_bytes.clone();
+    changed[3] = 0xa5;
+    assert_ne!(
+        native_murmur_hash_64a(&block_bytes, 11),
+        native_murmur_hash_64a(&changed, 11),
+        "a differing BLOCK byte must change the hash"
+    );
 }
 
 /// A decoded Name component, leaf-to-root.
@@ -523,7 +585,7 @@ bb2:
     br bb3
 bb3:
     %118 = const u64 11
-    %119 = call @func.6(%38, %118)
+    %119 = call @func.5(%38, %118)
     br bb42(%119)
 bb4(%3: u64, %4: u64):
     %120 = const u64 1
@@ -703,7 +765,7 @@ bb33:
     %226 = gep i8, ptr %52, %225
     %227 = const u64 4
     store u64 %227, ptr %226
-    %228 = call @func.7(%51, %52)
+    %228 = call @func.6(%51, %52)
     br bb39(%228)
 bb34(%33: u64):
     %229 = const u64 1
@@ -720,7 +782,7 @@ bb35:
     %235 = gep i8, ptr %54, %234
     %236 = const u64 4
     store u64 %236, ptr %235
-    %237 = call @func.7(%53, %54)
+    %237 = call @func.6(%53, %54)
     br bb39(%237)
 bb36(%34: u64):
     %238 = const u64 2
@@ -737,7 +799,7 @@ bb37:
     %244 = gep i8, ptr %56, %243
     %245 = const u64 3
     store u64 %245, ptr %244
-    %246 = call @func.7(%55, %56)
+    %246 = call @func.6(%55, %56)
     br bb39(%246)
 bb38:
     store ptr %105, ptr %57
@@ -750,7 +812,7 @@ bb38:
     %251 = gep i8, ptr %58, %250
     %252 = const u64 0
     store u64 %252, ptr %251
-    %253 = call @func.7(%57, %58)
+    %253 = call @func.6(%57, %58)
     br bb39(%253)
 bb39(%35: bool):
     condbr %35, bb40, bb41
@@ -1065,9 +1127,6 @@ bb9:
     ret
 }
 
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.4) {
-}
-
 fn @_RNvMs9_NtCs2EYQwhfuABO_4core3numj12wrapping_mul(functy.5) {
 }
 
@@ -1085,7 +1144,7 @@ bb0(%0: ptr, %1: u64):
     %160 = gep i8, ptr %0, %159
     %161 = load u64, ptr %160
     %162 = const u64 14313749767032793493
-    %163 = call @func.4(%161, %162)
+    %163 = call @func.0(%161, %162)
     br bb1(%1, %161, %163)
 bb1(%2: u64, %3: u64, %4: u64):
     %164 = xor u64 %2, %4
@@ -1188,7 +1247,7 @@ bb12(%65: u64, %66: u64, %67: u64, %68: u64, %69: u64, %70: u64):
     br bb6(%65, %66, %67, %68, %69, %70, %234)
 bb13(%71: u64, %72: u64, %73: u64, %74: u64, %75: u64):
     %235 = const u64 14313749767032793493
-    %236 = call @func.4(%75, %235)
+    %236 = call @func.0(%75, %235)
     br bb14(%71, %72, %73, %74, %236)
 bb14(%76: u64, %77: u64, %78: u64, %79: u64, %80: u64):
     %237 = const u32 47
@@ -1202,12 +1261,12 @@ bb15(%81: u64, %82: u64, %83: u64, %84: u64, %85: u64, %86: u64, %87: u32):
     %243 = lshr u64 %86, %242
     %244 = xor u64 %85, %243
     %245 = const u64 14313749767032793493
-    %246 = call @func.4(%244, %245)
+    %246 = call @func.0(%244, %245)
     br bb16(%81, %82, %83, %84, %246)
 bb16(%88: u64, %89: u64, %90: u64, %91: u64, %92: u64):
     %247 = xor u64 %89, %92
     %248 = const u64 14313749767032793493
-    %249 = call @func.4(%247, %248)
+    %249 = call @func.0(%247, %248)
     br bb17(%88, %90, %91, %249)
 bb17(%93: u64, %94: u64, %95: u64, %96: u64):
     %250 = const u64 1
@@ -1269,7 +1328,7 @@ bb23(%113: u64, %114: u64, %115: u64, %116: u64, %117: u64):
 bb24(%118: u64, %119: u64, %120: u64, %121: u64, %122: u64):
     %290 = load u64, ptr %157
     %291 = const u64 8
-    %292 = call @func.5(%290, %291)
+    %292 = call @func.4(%290, %291)
     br bb25(%118, %119, %120, %121, %122, %292)
 bb25(%123: u64, %124: u64, %125: u64, %126: u64, %127: u64, %128: u64):
     %293 = const u64 63
@@ -1300,7 +1359,7 @@ bb28(%138: u64, %139: u64, %140: u64):
     condbr %310, bb29(%139), bb31(%139)
 bb29(%141: u64):
     %311 = const u64 14313749767032793493
-    %312 = call @func.4(%141, %311)
+    %312 = call @func.0(%141, %311)
     br bb30(%312)
 bb30(%142: u64):
     br bb31(%142)
@@ -1316,7 +1375,7 @@ bb32(%144: u64, %145: u64, %146: u32):
     %319 = lshr u64 %145, %318
     %320 = xor u64 %144, %319
     %321 = const u64 14313749767032793493
-    %322 = call @func.4(%320, %321)
+    %322 = call @func.0(%320, %321)
     br bb33(%322)
 bb33(%147: u64):
     %323 = const u32 47
@@ -2233,7 +2292,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     br bb1
 bb1:
     %20 = const u64 11
-    %21 = call @func.11(%7, %20)
+    %21 = call @func.10(%7, %20)
     br bb2(%21)
 bb2(%3: u64):
     %22 = const i64 32
@@ -2383,9 +2442,6 @@ bb4:
     unreachable
 }
 
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.9) {
-}
-
 fn @_RNvMs9_NtCs2EYQwhfuABO_4core3numj12wrapping_mul(functy.10) {
 }
 
@@ -2403,7 +2459,7 @@ bb0(%0: ptr, %1: u64):
     %160 = gep i8, ptr %0, %159
     %161 = load u64, ptr %160
     %162 = const u64 14313749767032793493
-    %163 = call @func.9(%161, %162)
+    %163 = call @func.7(%161, %162)
     br bb1(%1, %161, %163)
 bb1(%2: u64, %3: u64, %4: u64):
     %164 = xor u64 %2, %4
@@ -2506,7 +2562,7 @@ bb12(%65: u64, %66: u64, %67: u64, %68: u64, %69: u64, %70: u64):
     br bb6(%65, %66, %67, %68, %69, %70, %234)
 bb13(%71: u64, %72: u64, %73: u64, %74: u64, %75: u64):
     %235 = const u64 14313749767032793493
-    %236 = call @func.9(%75, %235)
+    %236 = call @func.7(%75, %235)
     br bb14(%71, %72, %73, %74, %236)
 bb14(%76: u64, %77: u64, %78: u64, %79: u64, %80: u64):
     %237 = const u32 47
@@ -2520,12 +2576,12 @@ bb15(%81: u64, %82: u64, %83: u64, %84: u64, %85: u64, %86: u64, %87: u32):
     %243 = lshr u64 %86, %242
     %244 = xor u64 %85, %243
     %245 = const u64 14313749767032793493
-    %246 = call @func.9(%244, %245)
+    %246 = call @func.7(%244, %245)
     br bb16(%81, %82, %83, %84, %246)
 bb16(%88: u64, %89: u64, %90: u64, %91: u64, %92: u64):
     %247 = xor u64 %89, %92
     %248 = const u64 14313749767032793493
-    %249 = call @func.9(%247, %248)
+    %249 = call @func.7(%247, %248)
     br bb17(%88, %90, %91, %249)
 bb17(%93: u64, %94: u64, %95: u64, %96: u64):
     %250 = const u64 1
@@ -2587,7 +2643,7 @@ bb23(%113: u64, %114: u64, %115: u64, %116: u64, %117: u64):
 bb24(%118: u64, %119: u64, %120: u64, %121: u64, %122: u64):
     %290 = load u64, ptr %157
     %291 = const u64 8
-    %292 = call @func.10(%290, %291)
+    %292 = call @func.9(%290, %291)
     br bb25(%118, %119, %120, %121, %122, %292)
 bb25(%123: u64, %124: u64, %125: u64, %126: u64, %127: u64, %128: u64):
     %293 = const u64 63
@@ -2618,7 +2674,7 @@ bb28(%138: u64, %139: u64, %140: u64):
     condbr %310, bb29(%139), bb31(%139)
 bb29(%141: u64):
     %311 = const u64 14313749767032793493
-    %312 = call @func.9(%141, %311)
+    %312 = call @func.7(%141, %311)
     br bb30(%312)
 bb30(%142: u64):
     br bb31(%142)
@@ -2634,7 +2690,7 @@ bb32(%144: u64, %145: u64, %146: u32):
     %319 = lshr u64 %145, %318
     %320 = xor u64 %144, %319
     %321 = const u64 14313749767032793493
-    %322 = call @func.9(%320, %321)
+    %322 = call @func.7(%320, %321)
     br bb33(%322)
 bb33(%147: u64):
     %323 = const u32 47
@@ -3667,7 +3723,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     br bb1
 bb1:
     %20 = const u64 11
-    %21 = call @func.14(%7, %20)
+    %21 = call @func.13(%7, %20)
     br bb2(%21)
 bb2(%3: u64):
     %22 = const i64 32
@@ -3911,9 +3967,6 @@ bb4:
     unreachable
 }
 
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.12) {
-}
-
 fn @_RNvMs9_NtCs2EYQwhfuABO_4core3numj12wrapping_mul(functy.13) {
 }
 
@@ -3931,7 +3984,7 @@ bb0(%0: ptr, %1: u64):
     %160 = gep i8, ptr %0, %159
     %161 = load u64, ptr %160
     %162 = const u64 14313749767032793493
-    %163 = call @func.12(%161, %162)
+    %163 = call @func.10(%161, %162)
     br bb1(%1, %161, %163)
 bb1(%2: u64, %3: u64, %4: u64):
     %164 = xor u64 %2, %4
@@ -4034,7 +4087,7 @@ bb12(%65: u64, %66: u64, %67: u64, %68: u64, %69: u64, %70: u64):
     br bb6(%65, %66, %67, %68, %69, %70, %234)
 bb13(%71: u64, %72: u64, %73: u64, %74: u64, %75: u64):
     %235 = const u64 14313749767032793493
-    %236 = call @func.12(%75, %235)
+    %236 = call @func.10(%75, %235)
     br bb14(%71, %72, %73, %74, %236)
 bb14(%76: u64, %77: u64, %78: u64, %79: u64, %80: u64):
     %237 = const u32 47
@@ -4048,12 +4101,12 @@ bb15(%81: u64, %82: u64, %83: u64, %84: u64, %85: u64, %86: u64, %87: u32):
     %243 = lshr u64 %86, %242
     %244 = xor u64 %85, %243
     %245 = const u64 14313749767032793493
-    %246 = call @func.12(%244, %245)
+    %246 = call @func.10(%244, %245)
     br bb16(%81, %82, %83, %84, %246)
 bb16(%88: u64, %89: u64, %90: u64, %91: u64, %92: u64):
     %247 = xor u64 %89, %92
     %248 = const u64 14313749767032793493
-    %249 = call @func.12(%247, %248)
+    %249 = call @func.10(%247, %248)
     br bb17(%88, %90, %91, %249)
 bb17(%93: u64, %94: u64, %95: u64, %96: u64):
     %250 = const u64 1
@@ -4115,7 +4168,7 @@ bb23(%113: u64, %114: u64, %115: u64, %116: u64, %117: u64):
 bb24(%118: u64, %119: u64, %120: u64, %121: u64, %122: u64):
     %290 = load u64, ptr %157
     %291 = const u64 8
-    %292 = call @func.13(%290, %291)
+    %292 = call @func.12(%290, %291)
     br bb25(%118, %119, %120, %121, %122, %292)
 bb25(%123: u64, %124: u64, %125: u64, %126: u64, %127: u64, %128: u64):
     %293 = const u64 63
@@ -4146,7 +4199,7 @@ bb28(%138: u64, %139: u64, %140: u64):
     condbr %310, bb29(%139), bb31(%139)
 bb29(%141: u64):
     %311 = const u64 14313749767032793493
-    %312 = call @func.12(%141, %311)
+    %312 = call @func.10(%141, %311)
     br bb30(%312)
 bb30(%142: u64):
     br bb31(%142)
@@ -4162,7 +4215,7 @@ bb32(%144: u64, %145: u64, %146: u32):
     %319 = lshr u64 %145, %318
     %320 = xor u64 %144, %319
     %321 = const u64 14313749767032793493
-    %322 = call @func.12(%320, %321)
+    %322 = call @func.10(%320, %321)
     br bb33(%322)
 bb33(%147: u64):
     %323 = const u32 47
@@ -5010,7 +5063,7 @@ bb0(%0: ptr, %1: ptr, %2: ptr):
     br bb1
 bb1:
     %20 = const u64 11
-    %21 = call @func.14(%7, %20)
+    %21 = call @func.13(%7, %20)
     br bb2(%21)
 bb2(%3: u64):
     %22 = const i64 32
@@ -5257,7 +5310,7 @@ bb11(%4: ptr, %5: ptr, %6: ptr):
     call @func.8(%27, %6)
     br bb12(%4, %5)
 bb12(%7: ptr, %8: ptr):
-    %107 = call @func.15(%26, %27)
+    %107 = call @func.14(%26, %27)
     br bb13(%7, %8, %107)
 bb13(%9: ptr, %10: ptr, %11: bool):
     condbr %11, bb14(%9, %10), bb15
@@ -5331,9 +5384,6 @@ bb4:
     unreachable
 }
 
-fn @_RNvMs7_NtCs2EYQwhfuABO_4core3numy12wrapping_mul(functy.12) {
-}
-
 fn @_RNvMs9_NtCs2EYQwhfuABO_4core3numj12wrapping_mul(functy.13) {
 }
 
@@ -5351,7 +5401,7 @@ bb0(%0: ptr, %1: u64):
     %160 = gep i8, ptr %0, %159
     %161 = load u64, ptr %160
     %162 = const u64 14313749767032793493
-    %163 = call @func.12(%161, %162)
+    %163 = call @func.10(%161, %162)
     br bb1(%1, %161, %163)
 bb1(%2: u64, %3: u64, %4: u64):
     %164 = xor u64 %2, %4
@@ -5454,7 +5504,7 @@ bb12(%65: u64, %66: u64, %67: u64, %68: u64, %69: u64, %70: u64):
     br bb6(%65, %66, %67, %68, %69, %70, %234)
 bb13(%71: u64, %72: u64, %73: u64, %74: u64, %75: u64):
     %235 = const u64 14313749767032793493
-    %236 = call @func.12(%75, %235)
+    %236 = call @func.10(%75, %235)
     br bb14(%71, %72, %73, %74, %236)
 bb14(%76: u64, %77: u64, %78: u64, %79: u64, %80: u64):
     %237 = const u32 47
@@ -5468,12 +5518,12 @@ bb15(%81: u64, %82: u64, %83: u64, %84: u64, %85: u64, %86: u64, %87: u32):
     %243 = lshr u64 %86, %242
     %244 = xor u64 %85, %243
     %245 = const u64 14313749767032793493
-    %246 = call @func.12(%244, %245)
+    %246 = call @func.10(%244, %245)
     br bb16(%81, %82, %83, %84, %246)
 bb16(%88: u64, %89: u64, %90: u64, %91: u64, %92: u64):
     %247 = xor u64 %89, %92
     %248 = const u64 14313749767032793493
-    %249 = call @func.12(%247, %248)
+    %249 = call @func.10(%247, %248)
     br bb17(%88, %90, %91, %249)
 bb17(%93: u64, %94: u64, %95: u64, %96: u64):
     %250 = const u64 1
@@ -5535,7 +5585,7 @@ bb23(%113: u64, %114: u64, %115: u64, %116: u64, %117: u64):
 bb24(%118: u64, %119: u64, %120: u64, %121: u64, %122: u64):
     %290 = load u64, ptr %157
     %291 = const u64 8
-    %292 = call @func.13(%290, %291)
+    %292 = call @func.12(%290, %291)
     br bb25(%118, %119, %120, %121, %122, %292)
 bb25(%123: u64, %124: u64, %125: u64, %126: u64, %127: u64, %128: u64):
     %293 = const u64 63
@@ -5566,7 +5616,7 @@ bb28(%138: u64, %139: u64, %140: u64):
     condbr %310, bb29(%139), bb31(%139)
 bb29(%141: u64):
     %311 = const u64 14313749767032793493
-    %312 = call @func.12(%141, %311)
+    %312 = call @func.10(%141, %311)
     br bb30(%312)
 bb30(%142: u64):
     br bb31(%142)
@@ -5582,7 +5632,7 @@ bb32(%144: u64, %145: u64, %146: u32):
     %319 = lshr u64 %145, %318
     %320 = xor u64 %144, %319
     %321 = const u64 14313749767032793493
-    %322 = call @func.12(%320, %321)
+    %322 = call @func.10(%320, %321)
     br bb33(%322)
 bb33(%147: u64):
     %323 = const u32 47
@@ -6030,4 +6080,13 @@ fn str2_rec_scenario_native_eq_jit() {
         results[1].1, dead_hash,
         "head=Forest must not hit the dead fallback"
     );
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

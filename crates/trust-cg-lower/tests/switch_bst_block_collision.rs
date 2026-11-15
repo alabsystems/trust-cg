@@ -104,6 +104,7 @@ fn build_collision_isel() -> ISelFunction {
     ];
 
     let mut isel = InstructionSelector::new("bst_collision".to_string(), sig.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.lower_formal_arguments(&sig, Block(0)).unwrap();
     for (block, insts) in &blocks {
         isel.select_block_with_source_locs(*block, insts, &[])
@@ -271,6 +272,7 @@ fn selecting_an_already_populated_block_fails_closed() {
         returns: vec![Type::I64],
     };
     let mut isel = InstructionSelector::new("double_select".to_string(), sig.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.lower_formal_arguments(&sig, Block(0)).unwrap();
     let body = vec![iconst(10, 7), ret(10)];
     isel.select_block_with_source_locs(Block(1), &body, &[])
@@ -293,6 +295,7 @@ fn lir_block_id_in_synthetic_range_fails_closed() {
         returns: vec![Type::I64],
     };
     let mut isel = InstructionSelector::new("synthetic_range".to_string(), sig.clone());
+    isel.set_abi_variant(trust_cg_lower::abi::AArch64AbiVariant::Darwin);
     isel.lower_formal_arguments(&sig, Block(0)).unwrap();
     let err = isel
         .select_block_with_source_locs(Block(1 << 31), &[], &[])

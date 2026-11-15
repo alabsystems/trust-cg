@@ -4,9 +4,9 @@ expression: "help_of(&[\"ratchet\", \"lint-linux\"])"
 ---
 Cross-compile check for Linux-only `trust-cg-codegen` paths.
 
-Runs `cargo check --target <linux-triple> -p trust-cg-codegen` through the shared `trust-cg-test`
-shell boundary. Missing Rust targets are reported as `skipped`, so the command is safe on macOS-only
-developer boxes.
+Runs `targo --unverified check --target <linux-triple> -p trust-cg-codegen` through the shared
+`trust-cg-test` shell boundary. Missing Rust targets are reported as `skipped`, so the command is
+safe on macOS-only developer boxes.
 
 Equivalent to top-level `trust-cg-test lint-linux`; kept under `ratchet` so CI can sweep every
 invariant through one dispatcher.
@@ -42,20 +42,11 @@ Options:
       --package <PACKAGE>
           Package(s) to check. Defaults to `trust-cg-codegen`. Repeatable
 
-      --timeout <SECS>
-          Per-unit timeout in seconds. Subcommands may apply per-unit defaults when this is unset
-
-      --parallel <N>
-          Worker count (honors cargo-serialization lock). Default: auto
-
   -q, --quiet
-          Suppress progress bars; errors still go to stderr
+          Log errors only (sets the stderr log level to `error`)
 
   -v, --verbose...
           Show debug-level events. Repeat for more: -vv, -vvv
-
-      --no-cache
-          Ignore proof / corpus caches
 
       --dry-run
           Print what would run without executing external tools

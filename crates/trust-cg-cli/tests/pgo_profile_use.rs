@@ -136,18 +136,12 @@ fn make_test_module() -> TrustIrModule {
     let r = fb.iconst(Ty::I64, 42);
     fb.ret(vec![r]);
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
-fn scratch_dir(test_name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "trust_cg_cli_pgo_{}_{}",
-        test_name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+/// A new scratch directory, removed when the returned guard is dropped.
+fn scratch_dir(test_name: &str) -> scratch::ScratchDir {
+    scratch::create(&format!("trust_cg_cli_pgo_{test_name}_"))
 }
 
 fn trust_cg_bin() -> PathBuf {
@@ -244,7 +238,7 @@ fn make_canary_module() -> TrustIrModule {
     fb.ret(vec![v11]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -377,7 +371,7 @@ fn make_ty_parent_loop_module() -> TrustIrModule {
     fb.ret(vec![done_status]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -404,7 +398,7 @@ fn make_x86_constant_conditional_module() -> TrustIrModule {
     fb.ret(vec![v9]);
 
     fb.build();
-    mb.build()
+    mb.build().expect("ModuleBuilder::build: test fixture")
 }
 
 #[test]
@@ -428,6 +422,7 @@ fn cli_profile_use_reaches_o2_pass_manager() {
 
     let out_path = dir.join("module.o");
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env("TRUST_CG_TIME_PASSES", "1")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
@@ -478,6 +473,7 @@ fn cli_profile_use_o1_warns_and_does_not_schedule_profile_use() {
 
     let out_path = dir.join("module.o");
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env("TRUST_CG_TIME_PASSES", "1")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
@@ -544,6 +540,7 @@ fn cli_profile_use_rejects_multiple_inputs() {
     write_to_path(&profile, &profile_path).expect("write profdata");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("-O2")
@@ -588,6 +585,7 @@ fn cli_profile_generate_canary_dump_reloads_with_profile_use() {
     let profile_path = dir.join("canary.profdata");
     let generate_obj = dir.join("canary-generate.o");
     let generate = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("-O2")
@@ -645,6 +643,7 @@ fn cli_profile_generate_canary_dump_reloads_with_profile_use() {
 
     let out_path = dir.join("canary.o");
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env("TRUST_CG_TIME_PASSES", "1")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
@@ -685,6 +684,7 @@ fn cli_profile_generate_ty_parent_loop_dump_reloads_with_profile_use() {
     let profile_path = dir.join("ty-parent-loop.profdata");
     let generate_obj = dir.join("ty-parent-loop-generate.o");
     let mut generate_cmd = Command::new(trust_cg_bin());
+    generate_cmd.arg("--permit-unlicensed"); // Claim-less fixtures: refused by default since WS7.5 (DG-73).
     generate_cmd
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
@@ -816,6 +816,7 @@ fn cli_profile_generate_ty_parent_loop_dump_reloads_with_profile_use() {
 
     let out_path = dir.join("ty-parent-loop.o");
     let mut profile_use_cmd = Command::new(trust_cg_bin());
+    profile_use_cmd.arg("--permit-unlicensed"); // Claim-less fixtures: refused by default since WS7.5 (DG-73).
     profile_use_cmd
         .env("TRUST_CG_TIME_PASSES", "1")
         .env_remove("TRUST_CG_DISABLE_PASSES")
@@ -906,6 +907,7 @@ fn cli_profile_generate_ty_parent_loop_uses_supplied_inputs() {
     let profile_path = dir.join("ty-parent-loop-custom-inputs.profdata");
     let generate_obj = dir.join("ty-parent-loop-custom-inputs-generate.o");
     let mut generate_cmd = Command::new(trust_cg_bin());
+    generate_cmd.arg("--permit-unlicensed"); // Claim-less fixtures: refused by default since WS7.5 (DG-73).
     generate_cmd
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
@@ -959,6 +961,7 @@ fn cli_profile_generate_ty_parent_loop_uses_supplied_inputs() {
 
     let out_path = dir.join("ty-parent-loop-custom-inputs.o");
     let mut profile_use_cmd = Command::new(trust_cg_bin());
+    profile_use_cmd.arg("--permit-unlicensed"); // Claim-less fixtures: refused by default since WS7.5 (DG-73).
     profile_use_cmd
         .env("TRUST_CG_TIME_PASSES", "1")
         .env_remove("TRUST_CG_DISABLE_PASSES")
@@ -1007,6 +1010,7 @@ fn cli_profile_use_rejects_ty_parent_loop_opt_level_mismatch() {
 
     let stale_obj = dir.join("ty-parent-loop-o2-use.o");
     let stale = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("-O2")
@@ -1074,6 +1078,7 @@ fn cli_profile_use_rejects_ty_parent_loop_target_triple_mismatch() {
 
     let stale_obj = dir.join("ty-parent-loop-explicit-target-use.o");
     let stale = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("-O3")
@@ -1147,6 +1152,7 @@ fn cli_profile_use_rejects_ty_parent_loop_target_cpu_mismatch() {
 
     let stale_obj = dir.join("ty-parent-loop-cpu-mismatch-use.o");
     let stale = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("-O3")
@@ -1220,6 +1226,7 @@ fn cli_profile_use_rejects_ty_parent_loop_target_feature_mismatch() {
 
     let stale_obj = dir.join("ty-parent-loop-feature-mismatch-use.o");
     let stale = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("-O3")
@@ -1262,6 +1269,7 @@ fn cli_profile_generate_x86_writes_branch_block_counts() {
     let profile_path = dir.join("module.profdata");
     let out_path = dir.join("module.o");
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("--target")
@@ -1339,6 +1347,7 @@ fn cli_profile_use_o1_still_rejects_stale_module_hash() {
     let out_path = dir.join("module.o");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env("TRUST_CG_TIME_PASSES", "1")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
@@ -1387,6 +1396,7 @@ fn cli_profile_use_rejects_stale_module_hash() {
     let out_path = dir.join("module.o");
 
     let output = Command::new(trust_cg_bin())
+        .arg("--permit-unlicensed")
         .env_remove("TRUST_CG_DISABLE_PASSES")
         .arg("-c")
         .arg("-O2")
@@ -1416,3 +1426,6 @@ fn cli_profile_use_rejects_stale_module_hash() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[path = "common/scratch.rs"]
+mod scratch;

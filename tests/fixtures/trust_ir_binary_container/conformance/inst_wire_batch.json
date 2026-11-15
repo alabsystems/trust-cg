@@ -1,0 +1,546 @@
+{
+  "name": "inst_wire_batch",
+  "functions": [
+    {
+      "id": 0,
+      "name": "make",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ],
+            [
+              1,
+              "Bool"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "MakeAggregate": {
+                  "ty": {
+                    "Enum": 0
+                  },
+                  "variant": 0,
+                  "fields": [
+                    0,
+                    1
+                  ]
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "MakeAggregate": {
+                  "ty": {
+                    "Tuple": [
+                      "I32",
+                      "Bool"
+                    ]
+                  },
+                  "variant": null,
+                  "fields": [
+                    0,
+                    1
+                  ]
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "MakeAggregate": {
+                  "ty": {
+                    "Enum": 0
+                  },
+                  "variant": 1,
+                  "fields": []
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2,
+                    3,
+                    4
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 1,
+      "name": "copy",
+      "ty": 1,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Ptr"
+            ],
+            [
+              1,
+              "Ptr"
+            ],
+            [
+              2,
+              "U64"
+            ],
+            [
+              3,
+              "U8"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "MemCopy": {
+                  "dst": 0,
+                  "src": 1,
+                  "bytes": 2,
+                  "overlap": false
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "MemCopy": {
+                  "dst": 0,
+                  "src": 1,
+                  "bytes": 2,
+                  "overlap": true
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "MemSet": {
+                  "dst": 0,
+                  "byte": 3,
+                  "bytes": 2
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": []
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 2,
+      "name": "bits",
+      "ty": 2,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "U32"
+            ],
+            [
+              1,
+              "U32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "CtLz",
+                  "ty": "U32",
+                  "operand": 0
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "CtTz",
+                  "ty": "U32",
+                  "operand": 2
+                }
+              },
+              "results": [
+                3
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "BSwap",
+                  "ty": "U32",
+                  "operand": 3
+                }
+              },
+              "results": [
+                4
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "UnOp": {
+                  "op": "BitReverse",
+                  "ty": "U32",
+                  "operand": 4
+                }
+              },
+              "results": [
+                5
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "RotL",
+                  "ty": "U32",
+                  "lhs": 5,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                6
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "RotR",
+                  "ty": "U32",
+                  "lhs": 6,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                7
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    7
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    },
+    {
+      "id": 3,
+      "name": "sign",
+      "ty": 3,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "F64"
+            ],
+            [
+              1,
+              "F64"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BinOp": {
+                  "op": "FCopySign",
+                  "ty": "F64",
+                  "lhs": 0,
+                  "rhs": 1
+                }
+              },
+              "results": [
+                2
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    2
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": "Ungated",
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [
+    {
+      "id": 0,
+      "name": "E",
+      "variants": [
+        {
+          "name": "A",
+          "fields": [
+            "I32",
+            "Bool"
+          ],
+          "field_names": []
+        },
+        {
+          "name": "B",
+          "fields": [],
+          "field_names": []
+        }
+      ],
+      "discriminants": [],
+      "repr": null,
+      "layout": null
+    }
+  ],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32",
+        "Bool"
+      ],
+      "returns": [
+        {
+          "Enum": 0
+        },
+        {
+          "Tuple": [
+            "I32",
+            "Bool"
+          ]
+        },
+        {
+          "Enum": 0
+        }
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "Ptr",
+        "Ptr",
+        "U64",
+        "U8"
+      ],
+      "returns": [],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "U32",
+        "U32"
+      ],
+      "returns": [
+        "U32"
+      ],
+      "is_vararg": false
+    },
+    {
+      "params": [
+        "F64",
+        "F64"
+      ],
+      "returns": [
+        "F64"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

@@ -69,7 +69,7 @@ pub const PARENT_LOOP_RESULT_INVARIANT_VIOLATION: u32 = 2;
 /// Build the trust-ir module for the JIT'd parent-loop kernel. The
 /// resulting `Module` exports one function named `PARENT_LOOP_ENTRY_NAME`
 /// with the standard `KernelEntry` signature `(ctx, _input, max_steps) -> u64`.
-pub fn build_parent_loop_module() -> trust_ir::Module {
+pub fn build_parent_loop_module() -> Result<trust_ir::Module, trust_ir_build::BuildError> {
     let mut mb = ModuleBuilder::new("parent_loop_explore_steps");
 
     let entry_ty = mb.add_func_type(vec![Ty::Ptr, Ty::Ptr, Ty::I64], vec![Ty::I64]);
@@ -131,7 +131,7 @@ pub fn build_parent_loop_module() -> trust_ir::Module {
         let k63_i64 = fb.iconst(Ty::I64, 63);
         // Action record stride is 4 u64s -> offset = idx << 2 (log2 = 2).
         let k_action_stride_log2 = k2_i64;
-        let k_golden_ratio_i64 = fb.iconst(Ty::I64, 0x9e3779b97f4a7c15_u64 as i128);
+        let k_golden_ratio_i64 = fb.iconst(Ty::I64, i128::from(0x9e3779b97f4a7c15_u64 as i64));
 
         // ctx[0] -> arena_ptr; then walk arena slots.
         let arena_slot_off = fb.iconst(Ty::I64, CTX_SLOT_ARENA_PTR);

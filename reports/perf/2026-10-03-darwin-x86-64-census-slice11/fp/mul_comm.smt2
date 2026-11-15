@@ -1,0 +1,5 @@
+(set-logic QF_FP)
+(declare-const a (_ FloatingPoint 8 24))
+(declare-const b (_ FloatingPoint 8 24))
+(assert (not (= (fp.mul RNE a b) (fp.mul RNE b a))))
+(check-sat)

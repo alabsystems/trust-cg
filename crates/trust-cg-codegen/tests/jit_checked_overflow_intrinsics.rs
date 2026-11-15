@@ -46,11 +46,14 @@ fn build_checked_overflow_module_with_proof(
     proof: Option<ProofAnnotation>,
 ) -> TrustIrModule {
     let mut module = TrustIrModule::new(name);
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![ty.clone(), ty.clone(), Ty::Ptr, Ty::Ptr],
-        returns: vec![ty.clone()],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![ty.clone(), ty.clone(), Ty::Ptr, Ty::Ptr],
+            returns: vec![ty.clone()],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry = b(0);
     let mut func = TrustIrFunction::new(f(0), name, func_ty_id, entry);
@@ -112,7 +115,9 @@ fn build_checked_overflow_module_with_proof(
             InstrNode::new(Inst::Return { values: vec![v(7)] }),
         ],
     }];
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -202,13 +207,12 @@ fn has_adjacent_cset_condition(
 fn prepare_checked_overflow_module(
     module: &TrustIrModule,
 ) -> (Vec<AArch64Opcode>, Vec<MachInst>, MachFunction) {
-    let lowered =
-        trust_cg_lower::translate_module(module).expect("checked-overflow trust_ir lowers");
+    let lowered = permit_translate_module(module).expect("checked-overflow trust_ir lowers");
     assert_eq!(lowered.len(), 1, "expected one lowered function");
 
     let pipeline_config = PipelineConfig {
         opt_level: OptLevel::O2,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     let mach = pipeline
@@ -459,4 +463,28 @@ fn checked_unsigned_overflow_intrinsics_return_wrapped_value_and_flag() {
     assert!(cmp_idx < cset_idx, "CMP #0 must precede CSET NE");
     run_unsigned_case(checked_mul, u64::MAX, 2, u64::MAX.wrapping_mul(2), 1);
     run_unsigned_case(checked_mul, 21, 2, 42, 0);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

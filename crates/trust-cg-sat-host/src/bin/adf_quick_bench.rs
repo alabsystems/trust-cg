@@ -5,50 +5,32 @@
 // This is purposely a *fast* benchmark for the candidate iteration
 // loop: it skips the disk/in-memory-cache columns of `satlib_bench_table`
 // and only times native + PRIMARY_JIT_MODE+ADF on the named fixtures.
-// It also dumps the JIT_ANALYZE_DRIVER_CLAUSE_AGREEMENTS and
-// JIT_ANALYZE_DRIVER_NATIVE_SKIPS counters so the operator can see
-// how often each F1-v2 optimization fired.
+// It also reports legacy telemetry: clause agreements count shortcut-predicate
+// admissions, not independent comparison with the skipped native walk. The
+// native-skips counter is reserved and is not incremented by current dispatch.
 //
 // Usage:
-//   cargo run -p trust-cg-sat-host --bin adf_quick_bench --release -- \
+//   scripts/trust_cargo.sh run -p trust-cg-sat-host --bin adf_quick_bench --release -- \
 //       --reps 5 php-10-9 uuf100-04
 //
 // If no fixtures are listed the default pair (php-10-9, uuf100-04) is
 // used. Repetitions default to 5.
 
-use std::error::Error;
 use std::ffi::CString;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use trust_cg_jit_matrix::jit_compile_cache::reset_jit_compile_caches_for_tests;
 use trust_cg_sat_host::propagate::{
-    JIT_ANALYZE_DRIVEN, JIT_ANALYZE_DRIVER_CLAUSE_AGREEMENTS, JIT_ANALYZE_DRIVER_FORCE,
-    JIT_ANALYZE_DRIVER_NATIVE_SKIPS, JIT_DIVERGENCE_COUNT, JIT_INIT_COUNT, JIT_KERNEL_CHOICE,
-    JIT_KERNEL_WATCHED_LITERAL, JIT_PRIMARY_RETURNS, PRIMARY_JIT_MODE, PROPAGATE_CALL_COUNT,
-    SHADOW_MODE, reset_jit_shadow_for_tests,
+    JIT_KERNEL_CHOICE, JIT_KERNEL_WATCHED_LITERAL, reset_jit_shadow_for_tests,
 };
 use trust_cg_sat_host::{OwnedMicroSatSolver, sys};
 
-type AnyError = Box<dyn Error + Send + Sync + 'static>;
-
-#[derive(Debug)]
-struct BenchError(String);
-
-impl fmt::Display for BenchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Error for BenchError {}
-
-fn bench_err<S: Into<String>>(msg: S) -> AnyError {
-    Box::new(BenchError(msg.into()))
-}
+#[path = "common/sat_measurement.rs"]
+pub mod sat_measurement;
+use sat_measurement::{AnyError, DiskBackingGuard, SolveMode, SolveTelemetry, bench_err, measure};
 
 fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -82,34 +64,30 @@ fn mean_ms(samples: &[Duration]) -> f64 {
 }
 
 fn measure_native(path: &Path, reps: usize) -> Result<(Vec<Duration>, i32), AnyError> {
-    SHADOW_MODE.store(false, Ordering::SeqCst);
-    PRIMARY_JIT_MODE.store(false, Ordering::SeqCst);
-    let mut last_rc = 0;
-    let mut samples = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let t0 = Instant::now();
-        last_rc = solve_path(path)?;
-        samples.push(t0.elapsed());
-    }
-    Ok((samples, last_rc))
+    let (samples, rc, _) = measure(
+        SolveMode::Native,
+        reps,
+        false,
+        || Ok(()),
+        || solve_path(path),
+    )?;
+    Ok((samples, rc))
 }
 
-fn measure_adf(path: &Path, reps: usize) -> Result<(Vec<Duration>, i32), AnyError> {
-    let prior_force = JIT_ANALYZE_DRIVER_FORCE.swap(true, Ordering::SeqCst);
-    let mut last_rc = 0;
-    let mut samples = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        reset_jit_compile_caches_for_tests();
-        reset_jit_shadow_for_tests();
-        PRIMARY_JIT_MODE.store(true, Ordering::SeqCst);
-        let t0 = Instant::now();
-        last_rc = solve_path(path)?;
-        let elapsed = t0.elapsed();
-        PRIMARY_JIT_MODE.store(false, Ordering::SeqCst);
-        samples.push(elapsed);
-    }
-    JIT_ANALYZE_DRIVER_FORCE.store(prior_force, Ordering::SeqCst);
-    Ok((samples, last_rc))
+fn measure_adf(path: &Path, reps: usize) -> Result<(Vec<Duration>, i32, SolveTelemetry), AnyError> {
+    measure(
+        SolveMode::Primary {
+            analyze_driver: true,
+        },
+        reps,
+        false,
+        || {
+            reset_jit_compile_caches_for_tests();
+            reset_jit_shadow_for_tests();
+            Ok(())
+        },
+        || solve_path(path),
+    )
 }
 
 fn parse_args() -> Result<(usize, Vec<String>), AnyError> {
@@ -146,12 +124,16 @@ fn parse_args() -> Result<(usize, Vec<String>), AnyError> {
 
 fn run() -> Result<(), AnyError> {
     let (reps, labels) = parse_args()?;
+    let _memory_only = DiskBackingGuard::enter(false);
     let dir = corpus_dir();
     JIT_KERNEL_CHOICE.store(JIT_KERNEL_WATCHED_LITERAL, Ordering::SeqCst);
 
     eprintln!("adf_quick_bench: {} fixtures x {} reps", labels.len(), reps);
     println!(
-        "| fixture | native (ms) | adf (ms) | delta (%) | calls/solve | jit_prim/solve | adf_driven/solve | clause_agree/solve | native_skips/solve | divergences |"
+        "Saturated or regressing telemetry rejects the measurement. Primary events are kernel attempts plus mapped comparisons, not authoritative returns; clause shortcuts are predicate admissions, not checked agreements. Native skips are reserved and remain zero."
+    );
+    println!(
+        "| fixture | native (ms) | adf (ms) | delta (%) | calls/solve | primary_events/solve | adf_driven/solve | clause_shortcuts/solve | reserved_native_skips/solve | divergences |"
     );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
@@ -168,24 +150,7 @@ fn run() -> Result<(), AnyError> {
         // Native baseline first.
         let (native_samples, native_rc) = measure_native(&path, reps)?;
 
-        // ADF run; snapshot counters before / after to attribute the
-        // primary returns and clause-agreement counters to this run.
-        let calls_before = PROPAGATE_CALL_COUNT.load(Ordering::SeqCst);
-        let prim_before = JIT_PRIMARY_RETURNS.load(Ordering::SeqCst);
-        let driven_before = JIT_ANALYZE_DRIVEN.load(Ordering::SeqCst);
-        let agree_before = JIT_ANALYZE_DRIVER_CLAUSE_AGREEMENTS.load(Ordering::SeqCst);
-        let skips_before = JIT_ANALYZE_DRIVER_NATIVE_SKIPS.load(Ordering::SeqCst);
-        let div_before = JIT_DIVERGENCE_COUNT.load(Ordering::SeqCst);
-        let _inits_before = JIT_INIT_COUNT.load(Ordering::SeqCst);
-
-        let (adf_samples, adf_rc) = measure_adf(&path, reps)?;
-
-        let calls_after = PROPAGATE_CALL_COUNT.load(Ordering::SeqCst);
-        let prim_after = JIT_PRIMARY_RETURNS.load(Ordering::SeqCst);
-        let driven_after = JIT_ANALYZE_DRIVEN.load(Ordering::SeqCst);
-        let agree_after = JIT_ANALYZE_DRIVER_CLAUSE_AGREEMENTS.load(Ordering::SeqCst);
-        let skips_after = JIT_ANALYZE_DRIVER_NATIVE_SKIPS.load(Ordering::SeqCst);
-        let div_after = JIT_DIVERGENCE_COUNT.load(Ordering::SeqCst);
+        let (adf_samples, adf_rc, telemetry) = measure_adf(&path, reps)?;
 
         if native_rc != adf_rc {
             return Err(bench_err(format!(
@@ -201,12 +166,12 @@ fn run() -> Result<(), AnyError> {
             f64::NAN
         };
         let reps_f = reps as f64;
-        let calls_per = (calls_after - calls_before) as f64 / reps_f;
-        let prim_per = (prim_after - prim_before) as f64 / reps_f;
-        let driven_per = (driven_after - driven_before) as f64 / reps_f;
-        let agree_per = (agree_after - agree_before) as f64 / reps_f;
-        let skips_per = (skips_after - skips_before) as f64 / reps_f;
-        let div = div_after - div_before;
+        let calls_per = telemetry.propagate_calls as f64 / reps_f;
+        let prim_per = telemetry.jit_primary_events as f64 / reps_f;
+        let driven_per = telemetry.jit_analyze_driven as f64 / reps_f;
+        let agree_per = telemetry.jit_clause_shortcuts as f64 / reps_f;
+        let skips_per = telemetry.jit_reserved_native_skips as f64 / reps_f;
+        let div = telemetry.jit_divergences;
 
         println!(
             "| {label} | {native_ms:.3} | {adf_ms:.3} | {delta_pct:+.1} | {calls_per:.0} | {prim_per:.0} | {driven_per:.0} | {agree_per:.0} | {skips_per:.0} | {div} |"

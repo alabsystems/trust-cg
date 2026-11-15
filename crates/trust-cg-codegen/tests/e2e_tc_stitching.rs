@@ -50,20 +50,37 @@
 //!
 //! RUN ONE TEST AT A TIME (JIT module-accumulation SIGTRAPs a full-suite
 //! single process; see jit-parallel-race-2026-06-29.md):
-//!   cargo test -p trust-cg-codegen --test e2e_tc_stitching -- --exact \
+//!   scripts/trust_cargo.sh test -p trust-cg-codegen --test e2e_tc_stitching -- --exact \
 //!     mir_tc_infer_proj_gate_err_propagation_roundtrip --test-threads=1
 
 #![cfg(target_arch = "aarch64")]
 #![allow(clippy::all)]
-// Two-fixture identity gate: on exact Rust 1.95 the frozen proj const and sret
+// Fixture identity gate: on exact Rust 1.95 the frozen proj const and sret
 // shims are used; on pinned Rust 1.97 the regenerated fixture and register-
-// return shims are used. The opposite lane's definitions are intentionally dead.
+// return shims are used. Linux Trust ae9 uses both freshly emitted closures.
+// The other lanes' definitions are intentionally dead.
 #![allow(dead_code)]
 
-#[cfg(kernel_fixture_layout_unknown)]
+// A lint driver (`clippy-driver`/`tippy-driver`) links no test binary, so
+// under `kernel_fixture_layout_lint_only` this target is compiled only to BE
+// LINTED; the fixtures still cannot run, because every JIT entry point below
+// refuses at runtime under that same cfg. The ae9 Linux compiler selects its
+// own separately generated fixtures.
+#[cfg(all(
+    kernel_fixture_layout_unknown,
+    not(kernel_fixture_ae9_linux),
+    not(kernel_fixture_layout_lint_only)
+))]
 compile_error!(
-    "kernel JIT fixtures require exact Rust 1.95.0, Rust 1.97.1, or the certified Trust compiler"
+    "TC stitching requires an exact fixture compiler and target (see fixture_toolchain.rs)"
 );
+
+#[cfg(kernel_fixture_layout_lint_only)]
+#[path = "common/kernel_fixture_guard.rs"]
+mod kernel_fixture_guard;
+
+#[path = "common/emitted_fixture.rs"]
+mod emitted_fixture;
 
 use std::collections::HashMap;
 
@@ -37729,21 +37746,35 @@ impl OracleTables {
 //     Box<Level>::clone; the only other deltas are drop_glue leaves + drifted v0
 //     disambiguators, both absorbed by `bind_stitch_externs` (drop_glue -> no-op,
 //     shim ABI chosen per leaf from its emitted functy, content-substring binding).
-// The tc_whnf_route fixture does NOT drift (its closure never touches those
-// niches) and stays a single frozen const used on both lanes. Both lanes RUN all
-// five tests — nothing is layout-gated to `ignore`.
+// The two older lanes share the frozen tc_whnf_route const. The ae9 Linux lane
+// uses two fixtures emitted for aarch64-unknown-linux-gnu by the exact pinned
+// frontend; see fixtures/ae9-linux/README.md for identities and reproduction.
+// Every admitted lane runs all five tests, including the corrupted controls.
 #[cfg(kernel_fixture_layout_matches)]
 const PROJ_TIR: &str = MIR_TC_PROJ_CLOSURE_TRUST_IR;
-#[cfg(not(kernel_fixture_layout_matches))]
+#[cfg(all(not(kernel_fixture_layout_matches), not(kernel_fixture_ae9_linux)))]
 const PROJ_TIR: &str = include_str!("clean_tc_stitch.trust.tir");
+#[cfg(kernel_fixture_ae9_linux)]
+const PROJ_TIR: &str = include_str!("fixtures/ae9-linux/clean_tc_stitch_proj.tir");
+
+#[cfg(not(kernel_fixture_ae9_linux))]
+const WHNF_TIR: &str = MIR_TC_WHNF_ROUTE_CLOSURE_TRUST_IR;
+#[cfg(kernel_fixture_ae9_linux)]
+const WHNF_TIR: &str = include_str!("fixtures/ae9-linux/clean_tc_stitch_whnf.tir");
 
 /// ABI of the MIR-emitted tc_proj_root: (out, err_payload_out, lens, scenario, entry) -> i32.
 type ProjFn = extern "C" fn(*mut nslice::Expr, *mut u64, *mut u64, u32, u32) -> i32;
 /// ABI of the MIR-emitted tc_whnf_route_root: (out, lens, scenario) -> i32.
 type WhnfFn = extern "C" fn(*mut nslice::Expr, *mut u64, u32) -> i32;
 
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_proj_module() -> (trust_cg_codegen::jit::ExecutableBuffer, ProjFn) {
-    let module = trust_ir::parser::parse_module(PROJ_TIR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_proj_module");
+    let module = emitted_fixture::parse_emitted(PROJ_TIR)
         .expect("MIR-emitted tc_proj closure trust-ir text must parse");
 
     // CONFIRM the stitched machinery is genuinely IN-MODULE (real bodies).
@@ -37820,6 +37851,7 @@ fn jit_proj_module() -> (trust_cg_codegen::jit::ExecutableBuffer, ProjFn) {
 
     let externs = bind_stitch_externs(PROJ_TIR);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted tc_proj closure failed")
         .buffer;
@@ -37832,8 +37864,14 @@ fn jit_proj_module() -> (trust_cg_codegen::jit::ExecutableBuffer, ProjFn) {
     (buffer, f)
 }
 
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn jit_whnf_module() -> (trust_cg_codegen::jit::ExecutableBuffer, WhnfFn) {
-    let module = trust_ir::parser::parse_module(MIR_TC_WHNF_ROUTE_CLOSURE_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution("jit_whnf_module");
+    let module = emitted_fixture::parse_emitted(WHNF_TIR)
         .expect("MIR-emitted tc_whnf_route closure trust-ir text must parse");
 
     let bodied = |sym: &str| {
@@ -37901,12 +37939,13 @@ fn jit_whnf_module() -> (trust_cg_codegen::jit::ExecutableBuffer, WhnfFn) {
         "instantiate_rev (multi-arg beta substitution) must be in-module"
     );
     assert!(
-        MIR_TC_WHNF_ROUTE_CLOSURE_TRUST_IR.contains("heap_alloc rust_heap"),
+        WHNF_TIR.contains("heap_alloc rust_heap"),
         "Arc::new must lower to heap_alloc (not stubbed)"
     );
 
-    let externs = bind_stitch_externs(MIR_TC_WHNF_ROUTE_CLOSURE_TRUST_IR);
+    let externs = bind_stitch_externs(WHNF_TIR);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("trust-cg JIT compile of MIR-emitted tc_whnf_route closure failed")
         .buffer;
@@ -38613,12 +38652,21 @@ extern "C" fn repro_ext_add(a: u64, b: u64) -> u64 {
 }
 
 #[test]
+#[cfg_attr(
+    kernel_fixture_layout_lint_only,
+    allow(unreachable_code, unused_variables)
+)]
 fn mir_tc_whnf_reduce_proj_iota_zext_load_callarg_roundtrip() {
-    let module = trust_ir::parser::parse_module(REPRO_ZEXT_LOAD_CALLARG_TRUST_IR)
+    #[cfg(kernel_fixture_layout_lint_only)]
+    kernel_fixture_guard::refuse_uncertified_execution(
+        "mir_tc_whnf_reduce_proj_iota_zext_load_callarg_roundtrip",
+    );
+    let module = emitted_fixture::parse_emitted(REPRO_ZEXT_LOAD_CALLARG_TRUST_IR)
         .expect("repro module must parse");
     let mut externs: HashMap<String, *const u8> = HashMap::new();
     externs.insert("ext_add".to_string(), repro_ext_add as *const u8);
     let buffer = Compiler::new(CompilerConfig::jit_fast(Target::Aarch64))
+        .with_codegen_license(permit_unlicensed())
         .compile_module_to_jit(&module, &externs)
         .expect("repro compile")
         .buffer;
@@ -38639,4 +38687,13 @@ fn mir_tc_whnf_reduce_proj_iota_zext_load_callarg_roundtrip() {
         );
     }
     drop(buffer);
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
 }

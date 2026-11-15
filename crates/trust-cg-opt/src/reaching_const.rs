@@ -63,11 +63,13 @@
 //!   class width — bit-exact hardware semantics.
 //!
 //! `None` always means "not provably a unique constant" and callers MUST
-//! fail closed (keep the scalar loop / skip the fold). O(defs x blocks) per
-//! query — trivial at machine-function sizes, and only consulted on the rare
-//! recognition paths where the cheap single-def map came up empty.
+//! fail closed (keep the scalar loop / skip the fold). One-shot queries scan
+//! the function; a shared context amortizes indexing and cross-block dataflow
+//! over an immutable recognition phase. Large graphs and definition sets can
+//! still make either path expensive.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 use trust_cg_ir::{
     AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
@@ -130,7 +132,7 @@ fn block_of(func: &MachFunction, inst: InstId) -> Option<BlockId> {
 /// participate in the dataflow; instructions parked in unreachable blocks (or
 /// unlinked from every block) cannot execute and must not contribute defs.
 fn reachable_blocks(func: &MachFunction) -> HashSet<BlockId> {
-    let mut seen: HashSet<BlockId> = HashSet::new();
+    let mut seen: HashSet<BlockId> = HashSet::default();
     let mut work = vec![func.entry];
     while let Some(b) = work.pop() {
         if !seen.insert(b) {
@@ -155,21 +157,16 @@ fn reachable_blocks(func: &MachFunction) -> HashSet<BlockId> {
 /// a linear `insts.iter().position(..)` to find the use's index. All three are
 /// invariant across a batch of queries against an unmutated function.
 ///
-/// A pass that resolves one constant per candidate therefore paid O(n) per site
-/// with O(n) sites. Measured on a 3200-statement function, `mul-shift-reduce` —
-/// which calls `unique_reaching_const` for every multiply — cost 253ms and
-/// scaled 4.07x for a 2x input, i.e. cleanly quadratic, making it 59% of the
-/// optimization budget once the scheduler quadratics were fixed.
-///
-/// Building this once and reusing it across the batch makes each query O(log k)
-/// in the number of defs of the queried vreg, plus the (unchanged) cross-block
-/// fixpoint.
+/// Building the index once removes repeated whole-function location scans.
+/// In-block lookup uses a binary search in the queried id's definition list;
+/// cross-block lookup initializes the product solution once, then projects
+/// that solution for each query. Folding can make further bounded chain queries.
 ///
 /// # Validity
 ///
 /// The indexes describe ONE function state. A caller must rebuild after any
-/// mutation. `unique_reaching_const` keeps the old signature by building a fresh
-/// context per call, so existing callers are bit-for-bit unaffected.
+/// mutation. `unique_reaching_const` uses the one-shot scan path without
+/// constructing this index.
 pub(crate) struct ReachingCtx {
     reachable: HashSet<BlockId>,
     /// Whether the two redundant CFG edge views agree over executable blocks.
@@ -193,16 +190,13 @@ pub(crate) struct ReachingCtx {
 ///
 /// # Why all ids at once
 ///
-/// The per-id fixpoint is O(blocks) per queried id, so a recognition sweep that
-/// resolves one constant per candidate — with a DISTINCT id per candidate, the
-/// `many_fns` shape — pays O(ids x blocks): measured at 1000 fixpoint solves /
-/// 123.3ms for one compile, scaling 3.98x for a 2x input, the backend's last
-/// quadratic. Per-id memoization cannot help (no id repeats), and an
-/// adversarially-reviewed single-def dominance shortcut turned out never to
-/// apply (every hot query is multi-def). What removes the quadratic is solving
-/// the PRODUCT LATTICE once: one bitvector fixpoint whose universe is every GEN
-/// site plus every id's Uninit marker, then answering each query by projecting
-/// `IN[use_block]` onto the queried id's bits.
+/// A per-id fixpoint visits the graph for each queried id, so a recognition
+/// sweep resolving a different id per candidate repeats that graph work. Per-id
+/// memoization cannot share work between distinct ids. This implementation
+/// instead solves one product lattice: a bitvector fixpoint whose universe is
+/// every GEN site plus the Uninit markers, then answers each query by
+/// projecting `IN[use_block]` onto the queried id's bits. Its cost still depends
+/// on graph size, universe size, and the number of fixpoint iterations.
 ///
 /// # Exactness
 ///
@@ -212,7 +206,7 @@ pub(crate) struct ReachingCtx {
 /// and the seed (entry carries every Uninit bit) all commute with restriction
 /// to one id's coordinates. The differential harness
 /// (`reaching_const_differential`) enforces this against the retained per-id
-/// path and an independent oracle over 13,603 queries, including asymmetric
+/// path and an independent oracle, including asymmetric
 /// and irreducible CFGs; the one-shot `ctx = None` path still runs the per-id
 /// fixpoint verbatim, so the two formulations police each other in every run
 /// of the suite.
@@ -245,9 +239,9 @@ impl AllIdsReaching {
         reachable_sorted.sort_by_key(|b| b.0);
 
         let mut site_insts: Vec<InstId> = Vec::new();
-        let mut per_id: HashMap<u32, (usize, Vec<usize>)> = HashMap::new();
+        let mut per_id: HashMap<u32, (usize, Vec<usize>)> = HashMap::default();
         // (block -> its gen (site_bit, id) pairs), for transfer construction.
-        let mut block_gens: HashMap<BlockId, Vec<(usize, u32)>> = HashMap::new();
+        let mut block_gens: HashMap<BlockId, Vec<(usize, u32)>> = HashMap::default();
 
         let mut ids_in_block: Vec<u32> = Vec::new();
         for &b in &reachable_sorted {
@@ -292,8 +286,8 @@ impl AllIdsReaching {
 
         // ---- Per-block transfer masks ----
         let set_bit = |v: &mut [u64], bit: usize| v[bit / 64] |= 1u64 << (bit % 64);
-        let mut kill: HashMap<BlockId, Vec<u64>> = HashMap::new();
-        let mut gen_masks: HashMap<BlockId, Vec<u64>> = HashMap::new();
+        let mut kill: HashMap<BlockId, Vec<u64>> = HashMap::default();
+        let mut gen_masks: HashMap<BlockId, Vec<u64>> = HashMap::default();
         for (&b, gens) in &block_gens {
             let k = kill.entry(b).or_insert_with(|| vec![0; words]);
             for &(_, id) in gens {
@@ -313,7 +307,7 @@ impl AllIdsReaching {
         // IN[entry] seeds every Uninit bit (per-id and shared); everything else
         // starts empty. Iterate reachable blocks in a fixed order until stable;
         // sets only grow, so termination is bounded by the lattice height.
-        let mut in_sets: HashMap<BlockId, Vec<u64>> = HashMap::new();
+        let mut in_sets: HashMap<BlockId, Vec<u64>> = HashMap::default();
         for &b in &reachable_sorted {
             in_sets.insert(b, vec![0; words]);
         }
@@ -323,7 +317,7 @@ impl AllIdsReaching {
             // starts its worklist at `func.entry` and inserts every popped
             // block — so the entry is in the set unconditionally.
             let entry_in = in_sets.get_mut(&func.entry).expect("entry is reachable");
-            for (_, &(uninit_bit, _)) in per_id.iter() {
+            for &(uninit_bit, _) in per_id.values() {
                 entry_in[uninit_bit / 64] |= 1u64 << (uninit_bit % 64);
             }
             entry_in[shared_uninit / 64] |= 1u64 << (shared_uninit % 64);
@@ -386,7 +380,7 @@ impl AllIdsReaching {
 
     /// Project `IN[use_block]` onto one id — exactly `assemble_in`'s answer.
     fn project(&self, use_block: BlockId, id: u32) -> HashSet<DefSite> {
-        let mut result = HashSet::new();
+        let mut result = HashSet::default();
         let Some(inb) = self.in_sets.get(&use_block) else {
             return result;
         };
@@ -416,8 +410,8 @@ impl ReachingCtx {
     pub(crate) fn new(func: &MachFunction) -> Self {
         let reachable = reachable_blocks(func);
         let cfg_symmetric = reachable_cfg_is_symmetric(func, &reachable);
-        let mut loc: HashMap<InstId, (BlockId, usize)> = HashMap::new();
-        let mut defs: HashMap<BlockId, HashMap<u32, Vec<usize>>> = HashMap::new();
+        let mut loc: HashMap<InstId, (BlockId, usize)> = HashMap::default();
+        let mut defs: HashMap<BlockId, HashMap<u32, Vec<usize>>> = HashMap::default();
         for (idx, block) in func.blocks.iter().enumerate() {
             let bid = BlockId(idx as u32);
             let per_block = defs.entry(bid).or_default();
@@ -470,16 +464,9 @@ pub(crate) static RD_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 /// `ctx = Some(..)` uses the shared index; `None` uses the original scans.
 ///
-/// BOTH PATHS ARE REQUIRED. The index amortizes beautifully across many queries
-/// against one function state, but building it to answer a SINGLE query is
-/// strictly more expensive than the scans it replaces — it materializes two
-/// nested hash maps over every instruction. Routing one-shot callers through it
-/// regressed `mul-shift-reduce` on block-dense code from 49.4ms to 88.4ms
-/// (branchy, 200 blocks), an 18-24% whole-compile loss, because every query
-/// after the first mutation rebuilt the whole index.
-///
-/// So the one-shot path keeps the scans, and only a caller that can hold a
-/// context across many queries pays for the index. The def model is shared via
+/// One-shot callers avoid constructing nested definition maps over the whole
+/// function. Batch callers can share that indexing work while the function is
+/// unchanged. The def model is shared via
 /// [`defined_ids`], so the two paths cannot disagree about what a definition is.
 fn reaching_defs_at(
     func: &MachFunction,
@@ -531,7 +518,7 @@ fn reaching_defs_at(
             );
             RD_INBLOCK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        return Some(HashSet::from([DefSite::Inst(d)]));
+        return Some(HashSet::from_iter([DefSite::Inst(d)]));
     }
 
     // `preds` and `succs` are redundant public metadata and can temporarily
@@ -550,13 +537,8 @@ fn reaching_defs_at(
     }
 
     // Cross-block. The GEN map and the OUT fixpoint depend ONLY on `id` and the
-    // function state — NOT on the use site — so with a context they are computed
-    // once per vreg id and reused by every later query for that id.
-    //
-    // Measured on `branchy`: the in-block fast path essentially never hits (1 hit
-    // across the whole compile) and every query ran this fixpoint —
-    // 199 hits/31.3ms at 200 rungs, 399 hits/134.0ms at 400. Hits grow linearly
-    // while per-hit cost doubles with block count, i.e. O(candidates x blocks).
+    // function state — NOT on the use site. A context solves every id together
+    // once; without one, the retained per-id path computes a fresh fixpoint.
     let timing = crate::neon_array::boi_timing_enabled();
     let out = match ctx {
         Some(ctx) => {
@@ -626,13 +608,6 @@ pub(crate) fn unique_reaching_def(
     unique_reaching_def_with(func, None, use_inst, id)
 }
 
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
 /// Parse a move-wide `[dst, imm16(, lsl)]` operand list into
 /// `(dst, imm, shift)` with hardware-valid ranges; anything malformed ⇒ `None`.
 ///
@@ -646,13 +621,13 @@ pub(crate) fn parse_move_wide_inst(inst: &MachInst) -> Option<(VReg, u64, u32)> 
         MachOperand::VReg(v) => *v,
         _ => return None,
     };
-    let imm = imm_of(inst.operands.get(1)?)?;
+    let imm = inst.operands.get(1)?.as_imm()?;
     if !(0..=0xFFFF).contains(&imm) {
         return None;
     }
     let shift = match inst.operands.get(2) {
         None => 0,
-        Some(op) => imm_of(op)?,
+        Some(op) => op.as_imm()?,
     };
     if !matches!(shift, 0 | 16 | 32 | 48) {
         return None;
@@ -790,10 +765,9 @@ pub fn unique_reaching_const(func: &MachFunction, use_inst: InstId, v: VReg) -> 
 
 /// [`unique_reaching_const`] against a caller-owned [`ReachingCtx`].
 ///
-/// Identical results; the context just hoists the three whole-function walks out
-/// of the query so a pass resolving one constant per candidate is linear in the
-/// function rather than quadratic. The caller is responsible for rebuilding the
-/// context after any mutation — see [`ReachingCtx`].
+/// Identical results for the indexed function state. The context shares indexing
+/// and the product fixpoint across queries; it does not promise linear total
+/// cost. The caller must rebuild after any mutation — see [`ReachingCtx`].
 pub(crate) fn unique_reaching_const_with(
     func: &MachFunction,
     ctx: &ReachingCtx,
@@ -824,6 +798,174 @@ fn resolve_const(
 #[cfg(test)]
 #[path = "reaching_const_differential.rs"]
 mod differential;
+
+/// True when `preds` and `succs` are exact inverses over the executable CFG.
+///
+/// Edges wholly outside successor-reachability cannot execute and therefore do
+/// not invalidate live analysis. Any one-sided edge between reachable blocks
+/// does: using only `preds` could miss a succ-only bypass path, while using only
+/// `succs` could miss a declared dataflow predecessor.
+fn reachable_cfg_is_symmetric(func: &MachFunction, reachable: &HashSet<BlockId>) -> bool {
+    let mut from_succs: HashSet<(BlockId, BlockId)> = HashSet::default();
+    let mut from_preds: HashSet<(BlockId, BlockId)> = HashSet::default();
+    for &b in reachable {
+        from_succs.extend(
+            func.block(b)
+                .succs
+                .iter()
+                .filter(|s| reachable.contains(s))
+                .map(|&s| (b, s)),
+        );
+        from_preds.extend(
+            func.block(b)
+                .preds
+                .iter()
+                .filter(|p| reachable.contains(p))
+                .map(|&p| (p, b)),
+        );
+    }
+    from_succs == from_preds
+}
+
+/// GEN + the OUT fixpoint for one vreg id, retained as the independent one-shot
+/// path against which the all-ids product solution is checked.
+///
+/// Depends only on `id` and the function state — NOT on the use site — which is
+/// what lets a single solve serve every use of that id.
+fn compute_out(
+    func: &MachFunction,
+    ctx: Option<&ReachingCtx>,
+    reachable: &HashSet<BlockId>,
+    id: u32,
+) -> HashMap<BlockId, HashSet<DefSite>> {
+    // HashSet iteration is deliberately not part of the solver's observable
+    // behaviour. A stable seed order makes diagnostics and regressions
+    // reproducible; correctness is independent of it (tested above).
+    let mut initial_work: Vec<BlockId> = reachable.iter().copied().collect();
+    initial_work.sort_unstable();
+    compute_out_from_worklist(func, ctx, reachable, id, initial_work)
+}
+
+/// Compute one reaching-definitions fixpoint from an explicit seed order.
+///
+/// The separate entry point makes order independence directly testable. Every
+/// reachable block must occur in `initial_work`; duplicates are harmless.
+fn compute_out_from_worklist(
+    func: &MachFunction,
+    ctx: Option<&ReachingCtx>,
+    reachable: &HashSet<BlockId>,
+    id: u32,
+    initial_work: impl IntoIterator<Item = BlockId>,
+) -> HashMap<BlockId, HashSet<DefSite>> {
+    let mut gens: HashMap<BlockId, InstId> = HashMap::default();
+    for &b in reachable {
+        let last = match ctx {
+            Some(ctx) => ctx
+                .def_positions(b, id)
+                .and_then(|p| p.last())
+                .map(|&pos| func.block(b).insts[pos]),
+            None => func
+                .block(b)
+                .insts
+                .iter()
+                .rev()
+                .copied()
+                .find(|&i| defines_id(func, i, id)),
+        };
+        if let Some(d) = last {
+            gens.insert(b, d);
+        }
+    }
+
+    // OUT[b] is consumed by exactly those blocks that name b in `preds`.
+    // Derive that inverse relation from the same metadata the transfer reads.
+    // Requeuing `b.succs` instead is unsound when the two redundant CFG views
+    // temporarily disagree: a consumer can retain a pre-fixpoint OUT value.
+    let mut dependents: HashMap<BlockId, Vec<BlockId>> = HashMap::default();
+    for &consumer in reachable {
+        for &predecessor in &func.block(consumer).preds {
+            if reachable.contains(&predecessor) {
+                dependents.entry(predecessor).or_default().push(consumer);
+            }
+        }
+    }
+    for consumers in dependents.values_mut() {
+        consumers.sort_unstable();
+        consumers.dedup();
+    }
+
+    let mut out: HashMap<BlockId, HashSet<DefSite>> = HashMap::default();
+    // Worklist to a fixpoint. Sets only grow, so termination is guaranteed
+    // (each block's OUT is bounded by the def count + 1).
+    let mut work: VecDeque<BlockId> = VecDeque::new();
+    let mut queued: HashSet<BlockId> = HashSet::default();
+    for b in initial_work {
+        if reachable.contains(&b) && queued.insert(b) {
+            work.push_back(b);
+        }
+    }
+    debug_assert_eq!(queued.len(), reachable.len());
+
+    while let Some(b) = work.pop_front() {
+        queued.remove(&b);
+        let mut inb: HashSet<DefSite> = HashSet::default();
+        if b == func.entry {
+            inb.insert(DefSite::Uninit);
+        }
+        for &p in &func.block(b).preds {
+            if !reachable.contains(&p) {
+                continue; // edge can never be traversed
+            }
+            if let Some(po) = out.get(&p) {
+                inb.extend(po.iter().copied());
+            }
+        }
+        let outb: HashSet<DefSite> = match gens.get(&b) {
+            Some(&d) => HashSet::from_iter([DefSite::Inst(d)]),
+            None => inb,
+        };
+        let changed = match out.get(&b) {
+            Some(prev) => *prev != outb,
+            None => true,
+        };
+        if changed {
+            out.insert(b, outb);
+            if let Some(consumers) = dependents.get(&b) {
+                for &consumer in consumers {
+                    if queued.insert(consumer) {
+                        work.push_back(consumer);
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// `IN[use_block]` assembled from a completed one-id OUT fixpoint. Cheap: one
+/// pass over the block's predecessors, which is why sharing the fixpoint across
+/// use sites is worth doing.
+fn assemble_in(
+    func: &MachFunction,
+    reachable: &HashSet<BlockId>,
+    out: &HashMap<BlockId, HashSet<DefSite>>,
+    use_block: BlockId,
+) -> HashSet<DefSite> {
+    let mut inb: HashSet<DefSite> = HashSet::default();
+    if use_block == func.entry {
+        inb.insert(DefSite::Uninit);
+    }
+    for &p in &func.block(use_block).preds {
+        if !reachable.contains(&p) {
+            continue;
+        }
+        if let Some(po) = out.get(&p) {
+            inb.extend(po.iter().copied());
+        }
+    }
+    inb
+}
 
 #[cfg(test)]
 mod tests {
@@ -1249,7 +1391,7 @@ mod tests {
         let x = v32(0);
         let def = emit(&mut f, producer, AArch64Opcode::Movz, vec![vr(x), im(37)]);
         let reachable = reachable_blocks(&f);
-        let expected = HashSet::from([DefSite::Inst(def)]);
+        let expected = HashSet::from_iter([DefSite::Inst(def)]);
 
         for initial in [
             vec![entry, relay, use_block, producer],
@@ -1312,172 +1454,4 @@ mod tests {
             Some(9)
         );
     }
-}
-
-/// True when `preds` and `succs` are exact inverses over the executable CFG.
-///
-/// Edges wholly outside successor-reachability cannot execute and therefore do
-/// not invalidate live analysis. Any one-sided edge between reachable blocks
-/// does: using only `preds` could miss a succ-only bypass path, while using only
-/// `succs` could miss a declared dataflow predecessor.
-fn reachable_cfg_is_symmetric(func: &MachFunction, reachable: &HashSet<BlockId>) -> bool {
-    let mut from_succs: HashSet<(BlockId, BlockId)> = HashSet::new();
-    let mut from_preds: HashSet<(BlockId, BlockId)> = HashSet::new();
-    for &b in reachable {
-        from_succs.extend(
-            func.block(b)
-                .succs
-                .iter()
-                .filter(|s| reachable.contains(s))
-                .map(|&s| (b, s)),
-        );
-        from_preds.extend(
-            func.block(b)
-                .preds
-                .iter()
-                .filter(|p| reachable.contains(p))
-                .map(|&p| (p, b)),
-        );
-    }
-    from_succs == from_preds
-}
-
-/// GEN + the OUT fixpoint for one vreg id, retained as the independent one-shot
-/// path against which the all-ids product solution is checked.
-///
-/// Depends only on `id` and the function state — NOT on the use site — which is
-/// what lets a single solve serve every use of that id.
-fn compute_out(
-    func: &MachFunction,
-    ctx: Option<&ReachingCtx>,
-    reachable: &HashSet<BlockId>,
-    id: u32,
-) -> HashMap<BlockId, HashSet<DefSite>> {
-    // HashSet iteration is deliberately not part of the solver's observable
-    // behaviour. A stable seed order makes diagnostics and regressions
-    // reproducible; correctness is independent of it (tested above).
-    let mut initial_work: Vec<BlockId> = reachable.iter().copied().collect();
-    initial_work.sort_unstable();
-    compute_out_from_worklist(func, ctx, reachable, id, initial_work)
-}
-
-/// Compute one reaching-definitions fixpoint from an explicit seed order.
-///
-/// The separate entry point makes order independence directly testable. Every
-/// reachable block must occur in `initial_work`; duplicates are harmless.
-fn compute_out_from_worklist(
-    func: &MachFunction,
-    ctx: Option<&ReachingCtx>,
-    reachable: &HashSet<BlockId>,
-    id: u32,
-    initial_work: impl IntoIterator<Item = BlockId>,
-) -> HashMap<BlockId, HashSet<DefSite>> {
-    let mut gens: HashMap<BlockId, InstId> = HashMap::new();
-    for &b in reachable {
-        let last = match ctx {
-            Some(ctx) => ctx
-                .def_positions(b, id)
-                .and_then(|p| p.last())
-                .map(|&pos| func.block(b).insts[pos]),
-            None => func
-                .block(b)
-                .insts
-                .iter()
-                .rev()
-                .copied()
-                .find(|&i| defines_id(func, i, id)),
-        };
-        if let Some(d) = last {
-            gens.insert(b, d);
-        }
-    }
-
-    // OUT[b] is consumed by exactly those blocks that name b in `preds`.
-    // Derive that inverse relation from the same metadata the transfer reads.
-    // Requeuing `b.succs` instead is unsound when the two redundant CFG views
-    // temporarily disagree: a consumer can retain a pre-fixpoint OUT value.
-    let mut dependents: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for &consumer in reachable {
-        for &predecessor in &func.block(consumer).preds {
-            if reachable.contains(&predecessor) {
-                dependents.entry(predecessor).or_default().push(consumer);
-            }
-        }
-    }
-    for consumers in dependents.values_mut() {
-        consumers.sort_unstable();
-        consumers.dedup();
-    }
-
-    let mut out: HashMap<BlockId, HashSet<DefSite>> = HashMap::new();
-    // Worklist to a fixpoint. Sets only grow, so termination is guaranteed
-    // (each block's OUT is bounded by the def count + 1).
-    let mut work: VecDeque<BlockId> = VecDeque::new();
-    let mut queued: HashSet<BlockId> = HashSet::new();
-    for b in initial_work {
-        if reachable.contains(&b) && queued.insert(b) {
-            work.push_back(b);
-        }
-    }
-    debug_assert_eq!(queued.len(), reachable.len());
-
-    while let Some(b) = work.pop_front() {
-        queued.remove(&b);
-        let mut inb: HashSet<DefSite> = HashSet::new();
-        if b == func.entry {
-            inb.insert(DefSite::Uninit);
-        }
-        for &p in &func.block(b).preds {
-            if !reachable.contains(&p) {
-                continue; // edge can never be traversed
-            }
-            if let Some(po) = out.get(&p) {
-                inb.extend(po.iter().copied());
-            }
-        }
-        let outb: HashSet<DefSite> = match gens.get(&b) {
-            Some(&d) => HashSet::from([DefSite::Inst(d)]),
-            None => inb,
-        };
-        let changed = match out.get(&b) {
-            Some(prev) => *prev != outb,
-            None => true,
-        };
-        if changed {
-            out.insert(b, outb);
-            if let Some(consumers) = dependents.get(&b) {
-                for &consumer in consumers {
-                    if queued.insert(consumer) {
-                        work.push_back(consumer);
-                    }
-                }
-            }
-        }
-    }
-
-    out
-}
-
-/// `IN[use_block]` assembled from a completed one-id OUT fixpoint. Cheap: one
-/// pass over the block's predecessors, which is why sharing the fixpoint across
-/// use sites is worth doing.
-fn assemble_in(
-    func: &MachFunction,
-    reachable: &HashSet<BlockId>,
-    out: &HashMap<BlockId, HashSet<DefSite>>,
-    use_block: BlockId,
-) -> HashSet<DefSite> {
-    let mut inb: HashSet<DefSite> = HashSet::new();
-    if use_block == func.entry {
-        inb.insert(DefSite::Uninit);
-    }
-    for &p in &func.block(use_block).preds {
-        if !reachable.contains(&p) {
-            continue;
-        }
-        if let Some(po) = out.get(&p) {
-            inb.extend(po.iter().copied());
-        }
-    }
-    inb
 }

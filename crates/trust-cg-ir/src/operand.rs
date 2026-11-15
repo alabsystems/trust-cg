@@ -33,6 +33,12 @@ pub enum MachOperand {
     /// Carries the symbol name through the pipeline so the relocation
     /// collector can emit proper linker entries.
     Symbol(String),
+    /// Exact retained module-function name, not an interposable symbol.
+    ///
+    /// Kept distinct in equality and optimizer keys. Consumers must either
+    /// preserve exact relocation semantics or reject this operand; `as_symbol`
+    /// intentionally does not erase the binding.
+    ExactModuleSymbol(String),
     /// Jump table reference (for ADR used in switch lowering). The `u32`
     /// indexes into `MachFunction::jump_tables`. The codegen pipeline
     /// resolves this to a PC-relative byte offset once block layout and
@@ -45,13 +51,10 @@ pub enum MachOperand {
     ///
     /// ISel emits this form when a formal parameter is classified by the
     /// AArch64 ABI as stack-passed (arg 9+ for typical integer signatures).
-    /// Frame lowering resolves it to `MemOp { base: FP, offset: callee_saved_area_size + N }`
-    /// once the callee-saved area size is known.
-    ///
-    /// This indirection is necessary because the ISel emits loads before
-    /// regalloc has decided which callee-saved registers to preserve; the
-    /// CSA size (and therefore the FP-to-incoming-arg distance) is only
-    /// known after regalloc, during frame lowering.
+    /// Frame lowering resolves offset N to FP + 16 + N: FP points at the saved
+    /// FP/LR pair, independently of how many other callee-saved registers are
+    /// preserved. Keeping this distinct from a local frame index lets frame
+    /// lowering apply the incoming-argument convention after allocation.
     IncomingArg(i64),
 }
 
@@ -118,6 +121,14 @@ impl MachOperand {
         }
     }
 
+    /// Returns an exact module-function name without erasing its binding.
+    pub fn as_exact_module_symbol(&self) -> Option<&str> {
+        match self {
+            Self::ExactModuleSymbol(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
     /// Returns true if this operand is a JumpTableIndex reference.
     pub fn is_jump_table_index(&self) -> bool {
         matches!(self, Self::JumpTableIndex(_))
@@ -139,6 +150,20 @@ mod tests {
     use crate::types::{BlockId, FrameIdx, StackSlotId};
 
     // ---- Construction tests ----
+
+    #[test]
+    fn exact_symbols_cannot_be_erased_by_ordinary_symbol_accessors() {
+        let exact = MachOperand::ExactModuleSymbol("same".into());
+        assert_ne!(exact, MachOperand::Symbol("same".into()));
+        assert_eq!(exact.clone(), exact);
+        assert!(!exact.is_symbol());
+        assert_eq!(exact.as_symbol(), None);
+        assert_eq!(exact.as_exact_module_symbol(), Some("same"));
+        assert_eq!(
+            MachOperand::Symbol("same".into()).as_exact_module_symbol(),
+            None
+        );
+    }
 
     #[test]
     fn construct_vreg_operand() {

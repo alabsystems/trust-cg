@@ -16,10 +16,23 @@
 // (they target the same heap storage either way); the `RefCell` only
 // gates the few Rust-level call sites that need `&mut` for `reset`
 // or for slice views.
+//
+// # One compiled kernel serves every formula
+//
+// No `build_bcp_propagate*_module()` builder takes a formula: each kernel
+// reads the clauses, assignment, trail and watch tables through the arena
+// pointer in its `KernelCtx`, and none of the modules declares a global or
+// imports a symbol. The code a compile emits is therefore the same for every
+// formula, and only the arena is per-formula. `compile` still compiles on
+// every call, because the compile-time benchmarks and the formula-keyed caches
+// in `jit_compile_cache` measure and store exactly that. `bind_shared_kernel`
+// is the constructor for callers that only need a kernel for the formula in
+// hand: it compiles each kernel at most once per process (`SharedKernel`) and
+// builds a fresh arena around the shared code.
 
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use thiserror::Error;
 
@@ -48,6 +61,16 @@ pub enum JitCompileError {
     Codegen(#[source] Box<CompileError>),
     #[error("JIT buffer is missing required entry symbol `{0}`")]
     MissingEntry(&'static str),
+    /// The kernel's module builder refused (`ModuleBuilder::build` reports
+    /// the first fault a builder door recorded); nothing was compiled.
+    #[error("the kernel module builder refused: {0}")]
+    Build(#[source] trust_ir_build::BuildError),
+}
+
+impl From<trust_ir_build::BuildError> for JitCompileError {
+    fn from(error: trust_ir_build::BuildError) -> Self {
+        Self::Build(error)
+    }
 }
 
 impl From<CompileError> for JitCompileError {
@@ -66,13 +89,16 @@ impl From<CompileError> for JitCompileError {
 ///
 /// If `disk_text` is `None`, call `build_fresh` and encode the result
 /// to text for persistence.
-fn load_or_build_module<F>(disk_text: Option<String>, build_fresh: F) -> (trust_ir::Module, String)
+fn load_or_build_module<F>(
+    disk_text: Option<String>,
+    build_fresh: F,
+) -> Result<(trust_ir::Module, String), trust_ir_build::BuildError>
 where
-    F: FnOnce() -> trust_ir::Module,
+    F: FnOnce() -> Result<trust_ir::Module, trust_ir_build::BuildError>,
 {
     if let Some(text) = disk_text {
         match parse_trust_ir_text(&text) {
-            Ok(module) => return (module, text),
+            Ok(module) => return Ok((module, text)),
             Err(err) => {
                 eprintln!(
                     "trust-cg jit disk cache: cached IR failed to parse ({err}); rebuilding from scratch"
@@ -80,20 +106,92 @@ where
             }
         }
     }
-    let module = build_fresh();
+    let module = build_fresh()?;
     let text = encode_trust_ir_text(&module);
-    (module, text)
+    Ok((module, text))
 }
 
+/// The process's one compiled copy of a formula-independent BCP kernel (see
+/// the module header), for the `bind_shared_kernel` constructors.
+///
+/// The slot is filled only by a successful compile. A failed compile returns
+/// its error to that caller and leaves the slot empty, so the next caller
+/// compiles again; a failure is never shared.
+struct SharedKernel {
+    entry_name: &'static str,
+    build_module: fn() -> Result<trust_ir::Module, trust_ir_build::BuildError>,
+    code: Mutex<Option<(Arc<ExecutableBuffer>, KernelEntry)>>,
+}
+
+impl SharedKernel {
+    const fn new(
+        entry_name: &'static str,
+        build_module: fn() -> Result<trust_ir::Module, trust_ir_build::BuildError>,
+    ) -> Self {
+        Self {
+            entry_name,
+            build_module,
+            code: Mutex::new(None),
+        }
+    }
+
+    /// The shared code and its entry point, compiled on first use. Callers
+    /// arriving during the first compile wait for it rather than compiling
+    /// their own copy.
+    fn code(&self) -> Result<(Arc<ExecutableBuffer>, KernelEntry), JitCompileError> {
+        // The slot is written only after a compile succeeds, so a panic while
+        // the lock was held cannot have left a partial value in it.
+        let mut code = self.code.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((buffer, entry)) = code.as_ref() {
+            return Ok((Arc::clone(buffer), *entry));
+        }
+        let config = CompilerConfig::for_host_jit();
+        let extern_symbols: HashMap<String, *const u8> = HashMap::new();
+        let buffer = Compiler::new(config)
+            .with_codegen_license(crate::in_process_kernel_license())
+            .compile_module_to_jit(&(self.build_module)()?, &extern_symbols)?
+            .buffer;
+        let entry: KernelEntry = {
+            // SAFETY: every entry a `build_bcp_propagate*_module()` builder
+            // defines has the shared `KernelEntry` ABI (the per-provider
+            // `compile_from_module`s rely on the same fact), and each static
+            // below pairs its builder with the entry name that builder
+            // defines. The buffer outlives every call through the pointer:
+            // this slot keeps one `Arc` of it for the life of the process,
+            // and every provider built from it holds another.
+            let jit_fn = unsafe { buffer.get_fn_bound::<KernelEntry>(self.entry_name) }
+                .ok_or(JitCompileError::MissingEntry(self.entry_name))?;
+            jit_fn.into_inner()
+        };
+        let buffer = Arc::new(buffer);
+        *code = Some((Arc::clone(&buffer), entry));
+        Ok((buffer, entry))
+    }
+}
+
+static SCAN_KERNEL: SharedKernel = SharedKernel::new(ENTRY_NAME, build_bcp_propagate_module);
+static WITH_DECISIONS_KERNEL: SharedKernel = SharedKernel::new(
+    ENTRY_NAME_WITH_DECISIONS,
+    build_bcp_propagate_with_decisions_module,
+);
+static WATCHED_LITERAL_KERNEL: SharedKernel = SharedKernel::new(
+    ENTRY_NAME_WATCHED_LITERAL,
+    build_bcp_propagate_watched_literal_module,
+);
+static WATCHED_LITERAL_CHUNKED_KERNEL: SharedKernel = SharedKernel::new(
+    ENTRY_NAME_WATCHED_LITERAL_CHUNKED,
+    build_bcp_propagate_watched_literal_chunked_module,
+);
+
 pub struct JitBcpKernelProvider {
-    buffer: ExecutableBuffer,
+    buffer: Arc<ExecutableBuffer>,
     entry: KernelEntry,
     arena: RefCell<BcpArena>,
 }
 
 impl JitBcpKernelProvider {
     pub fn compile(num_vars: usize, clauses: Vec<Vec<i32>>) -> Result<Self, JitCompileError> {
-        let module = build_bcp_propagate_module();
+        let module = build_bcp_propagate_module()?;
         Self::compile_from_module(&module, num_vars, clauses)
     }
 
@@ -108,7 +206,9 @@ impl JitBcpKernelProvider {
     ) -> Result<Self, JitCompileError> {
         let config = CompilerConfig::for_host_jit();
         let extern_symbols: HashMap<String, *const u8> = HashMap::new();
-        let result = Compiler::new(config).compile_module_to_jit(module, &extern_symbols)?;
+        let result = Compiler::new(config)
+            .with_codegen_license(crate::in_process_kernel_license())
+            .compile_module_to_jit(module, &extern_symbols)?;
         let buffer = result.buffer;
 
         let entry: KernelEntry = {
@@ -124,14 +224,35 @@ impl JitBcpKernelProvider {
             jit_fn.into_inner()
         };
 
-        let trail_capacity = (num_vars + 1).max(8);
-        let arena = BcpArena::build(num_vars, &clauses, trail_capacity);
+        Ok(Self::with_code(Arc::new(buffer), entry, num_vars, &clauses))
+    }
 
-        Ok(Self {
+    /// [`Self::compile`] without the compile: this formula's arena around
+    /// the process's one compiled scan kernel, which the first call compiles.
+    /// See the module header for why one compile serves every formula.
+    pub fn bind_shared_kernel(
+        num_vars: usize,
+        clauses: Vec<Vec<i32>>,
+    ) -> Result<Self, JitCompileError> {
+        let (buffer, entry) = SCAN_KERNEL.code()?;
+        Ok(Self::with_code(buffer, entry, num_vars, &clauses))
+    }
+
+    /// The one place a provider's arena is built, whichever way its code
+    /// was obtained.
+    fn with_code(
+        buffer: Arc<ExecutableBuffer>,
+        entry: KernelEntry,
+        num_vars: usize,
+        clauses: &[Vec<i32>],
+    ) -> Self {
+        let trail_capacity = (num_vars + 1).max(8);
+        let arena = BcpArena::build(num_vars, clauses, trail_capacity);
+        Self {
             buffer,
             entry,
             arena: RefCell::new(arena),
-        })
+        }
     }
 
     /// Borrow the assignment values vector. The returned `Ref` derefs
@@ -178,12 +299,12 @@ impl JitBcpKernelProvider {
                 move |buffer: ExecutableBuffer| -> Result<Self, JitCompileError> {
                     Self::from_replayed_buffer(buffer, l2_num_vars, l2_clauses)
                 },
-                |disk_text: Option<String>| -> Result<(Self, Vec<u8>, String), JitCompileError> {
+                |disk_text: Option<String>| -> Result<(Self, Option<Vec<u8>>, String), JitCompileError> {
                     let (module, ir_text) =
-                        load_or_build_module(disk_text, build_bcp_propagate_module);
+                        load_or_build_module(disk_text, build_bcp_propagate_module)?;
                     let provider = Self::compile_from_module(&module, num_vars, clauses)?;
                     let buffer_bytes =
-                        crate::executable_buffer_cache::serialize_buffer(provider.buffer());
+                        crate::executable_buffer_cache::serialize_buffer_for_cache(provider.buffer());
                     Ok((provider, buffer_bytes, ir_text))
                 },
             )
@@ -209,13 +330,7 @@ impl JitBcpKernelProvider {
                 .ok_or(JitCompileError::MissingEntry(ENTRY_NAME))?;
             jit_fn.into_inner()
         };
-        let trail_capacity = (num_vars + 1).max(8);
-        let arena = BcpArena::build(num_vars, &clauses, trail_capacity);
-        Ok(Self {
-            buffer,
-            entry,
-            arena: RefCell::new(arena),
-        })
+        Ok(Self::with_code(Arc::new(buffer), entry, num_vars, &clauses))
     }
 }
 
@@ -257,7 +372,7 @@ impl SolverKernelProvider for JitBcpKernelProvider {
 }
 
 pub struct JitBcpWithDecisionsProvider {
-    buffer: ExecutableBuffer,
+    buffer: Arc<ExecutableBuffer>,
     entry: KernelEntry,
     arena: RefCell<BcpArena>,
 }
@@ -268,7 +383,7 @@ impl JitBcpWithDecisionsProvider {
         clauses: Vec<Vec<i32>>,
         trail_capacity_hint: usize,
     ) -> Result<Self, JitCompileError> {
-        let module = build_bcp_propagate_with_decisions_module();
+        let module = build_bcp_propagate_with_decisions_module()?;
         Self::compile_from_module(&module, num_vars, clauses, trail_capacity_hint)
     }
 
@@ -280,7 +395,9 @@ impl JitBcpWithDecisionsProvider {
     ) -> Result<Self, JitCompileError> {
         let config = CompilerConfig::for_host_jit();
         let extern_symbols: HashMap<String, *const u8> = HashMap::new();
-        let result = Compiler::new(config).compile_module_to_jit(module, &extern_symbols)?;
+        let result = Compiler::new(config)
+            .with_codegen_license(crate::in_process_kernel_license())
+            .compile_module_to_jit(module, &extern_symbols)?;
         let buffer = result.buffer;
 
         let entry: KernelEntry = {
@@ -294,14 +411,50 @@ impl JitBcpWithDecisionsProvider {
             jit_fn.into_inner()
         };
 
-        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
-        let arena = BcpArena::build(num_vars, &clauses, trail_capacity);
+        Ok(Self::with_code(
+            Arc::new(buffer),
+            entry,
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
+    }
 
-        Ok(Self {
+    /// [`Self::compile`] without the compile: this formula's arena around
+    /// the process's one compiled with-decisions kernel, which the first call
+    /// compiles. See the module header for why one compile serves every
+    /// formula.
+    pub fn bind_shared_kernel(
+        num_vars: usize,
+        clauses: Vec<Vec<i32>>,
+        trail_capacity_hint: usize,
+    ) -> Result<Self, JitCompileError> {
+        let (buffer, entry) = WITH_DECISIONS_KERNEL.code()?;
+        Ok(Self::with_code(
+            buffer,
+            entry,
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
+    }
+
+    /// The one place a provider's arena is built, whichever way its code
+    /// was obtained.
+    fn with_code(
+        buffer: Arc<ExecutableBuffer>,
+        entry: KernelEntry,
+        num_vars: usize,
+        clauses: &[Vec<i32>],
+        trail_capacity_hint: usize,
+    ) -> Self {
+        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
+        let arena = BcpArena::build(num_vars, clauses, trail_capacity);
+        Self {
             buffer,
             entry,
             arena: RefCell::new(arena),
-        })
+        }
     }
 
     /// Borrow the assignment values vector. Returns a `Ref` that
@@ -355,14 +508,14 @@ impl JitBcpWithDecisionsProvider {
                 move |buffer: ExecutableBuffer| -> Result<Self, JitCompileError> {
                     Self::from_replayed_buffer(buffer, l2_num_vars, l2_clauses, l2_trail)
                 },
-                |disk_text: Option<String>| -> Result<(Self, Vec<u8>, String), JitCompileError> {
+                |disk_text: Option<String>| -> Result<(Self, Option<Vec<u8>>, String), JitCompileError> {
                     let (module, ir_text) = load_or_build_module(disk_text, || {
                         build_bcp_propagate_with_decisions_module()
-                    });
+                    })?;
                     let provider =
                         Self::compile_from_module(&module, num_vars, clauses, trail_capacity_hint)?;
                     let buffer_bytes =
-                        crate::executable_buffer_cache::serialize_buffer(provider.buffer());
+                        crate::executable_buffer_cache::serialize_buffer_for_cache(provider.buffer());
                     Ok((provider, buffer_bytes, ir_text))
                 },
             )
@@ -385,13 +538,13 @@ impl JitBcpWithDecisionsProvider {
                 .ok_or(JitCompileError::MissingEntry(ENTRY_NAME_WITH_DECISIONS))?;
             jit_fn.into_inner()
         };
-        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
-        let arena = BcpArena::build(num_vars, &clauses, trail_capacity);
-        Ok(Self {
-            buffer,
+        Ok(Self::with_code(
+            Arc::new(buffer),
             entry,
-            arena: RefCell::new(arena),
-        })
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
     }
 }
 
@@ -403,7 +556,7 @@ impl JitBcpWithDecisionsProvider {
 /// invocation when running back-to-back calls so the watch lists and the
 /// clause-literal swap state start from a known baseline.
 pub struct JitBcpWatchedLiteralKernelProvider {
-    buffer: ExecutableBuffer,
+    buffer: Arc<ExecutableBuffer>,
     entry: KernelEntry,
     arena: RefCell<BcpWatchedArena>,
 }
@@ -414,7 +567,7 @@ impl JitBcpWatchedLiteralKernelProvider {
         clauses: Vec<Vec<i32>>,
         trail_capacity_hint: usize,
     ) -> Result<Self, JitCompileError> {
-        let module = build_bcp_propagate_watched_literal_module();
+        let module = build_bcp_propagate_watched_literal_module()?;
         Self::compile_from_module(&module, num_vars, clauses, trail_capacity_hint)
     }
 
@@ -426,7 +579,9 @@ impl JitBcpWatchedLiteralKernelProvider {
     ) -> Result<Self, JitCompileError> {
         let config = CompilerConfig::for_host_jit();
         let extern_symbols: HashMap<String, *const u8> = HashMap::new();
-        let result = Compiler::new(config).compile_module_to_jit(module, &extern_symbols)?;
+        let result = Compiler::new(config)
+            .with_codegen_license(crate::in_process_kernel_license())
+            .compile_module_to_jit(module, &extern_symbols)?;
         let buffer = result.buffer;
 
         let entry: KernelEntry = {
@@ -440,14 +595,50 @@ impl JitBcpWatchedLiteralKernelProvider {
             jit_fn.into_inner()
         };
 
-        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
-        let arena = BcpWatchedArena::build(num_vars, &clauses, trail_capacity);
+        Ok(Self::with_code(
+            Arc::new(buffer),
+            entry,
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
+    }
 
-        Ok(Self {
+    /// [`Self::compile`] without the compile: this formula's arena around
+    /// the process's one compiled watched-literal kernel, which the first call
+    /// compiles. See the module header for why one compile serves every
+    /// formula.
+    pub fn bind_shared_kernel(
+        num_vars: usize,
+        clauses: Vec<Vec<i32>>,
+        trail_capacity_hint: usize,
+    ) -> Result<Self, JitCompileError> {
+        let (buffer, entry) = WATCHED_LITERAL_KERNEL.code()?;
+        Ok(Self::with_code(
+            buffer,
+            entry,
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
+    }
+
+    /// The one place a provider's arena is built, whichever way its code
+    /// was obtained.
+    fn with_code(
+        buffer: Arc<ExecutableBuffer>,
+        entry: KernelEntry,
+        num_vars: usize,
+        clauses: &[Vec<i32>],
+        trail_capacity_hint: usize,
+    ) -> Self {
+        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
+        let arena = BcpWatchedArena::build(num_vars, clauses, trail_capacity);
+        Self {
             buffer,
             entry,
             arena: RefCell::new(arena),
-        })
+        }
     }
 
     /// Borrow the assignment values vector. Returns a `Ref` that
@@ -502,14 +693,14 @@ impl JitBcpWatchedLiteralKernelProvider {
                 move |buffer: ExecutableBuffer| -> Result<Self, JitCompileError> {
                     Self::from_replayed_buffer(buffer, l2_num_vars, l2_clauses, l2_trail)
                 },
-                |disk_text: Option<String>| -> Result<(Self, Vec<u8>, String), JitCompileError> {
+                |disk_text: Option<String>| -> Result<(Self, Option<Vec<u8>>, String), JitCompileError> {
                     let (module, ir_text) = load_or_build_module(disk_text, || {
                         build_bcp_propagate_watched_literal_module()
-                    });
+                    })?;
                     let provider =
                         Self::compile_from_module(&module, num_vars, clauses, trail_capacity_hint)?;
                     let buffer_bytes =
-                        crate::executable_buffer_cache::serialize_buffer(provider.buffer());
+                        crate::executable_buffer_cache::serialize_buffer_for_cache(provider.buffer());
                     Ok((provider, buffer_bytes, ir_text))
                 },
             )
@@ -533,13 +724,13 @@ impl JitBcpWatchedLiteralKernelProvider {
                 .ok_or(JitCompileError::MissingEntry(ENTRY_NAME_WATCHED_LITERAL))?;
             jit_fn.into_inner()
         };
-        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
-        let arena = BcpWatchedArena::build(num_vars, &clauses, trail_capacity);
-        Ok(Self {
-            buffer,
+        Ok(Self::with_code(
+            Arc::new(buffer),
             entry,
-            arena: RefCell::new(arena),
-        })
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
     }
 }
 
@@ -629,7 +820,7 @@ impl SolverKernelProvider for JitBcpWithDecisionsProvider {
 /// compiled with -O3" vs "trust-cg JIT'd from trust-ir" — i.e. the
 /// chunked layout closes the data-layout-vs-codegen attribution gap.
 pub struct JitBcpWatchedLiteralChunkedKernelProvider {
-    buffer: ExecutableBuffer,
+    buffer: Arc<ExecutableBuffer>,
     entry: KernelEntry,
     arena: RefCell<BcpWatchedChunkedArena>,
 }
@@ -640,7 +831,7 @@ impl JitBcpWatchedLiteralChunkedKernelProvider {
         clauses: Vec<Vec<i32>>,
         trail_capacity_hint: usize,
     ) -> Result<Self, JitCompileError> {
-        let module = build_bcp_propagate_watched_literal_chunked_module();
+        let module = build_bcp_propagate_watched_literal_chunked_module()?;
         Self::compile_from_module(&module, num_vars, clauses, trail_capacity_hint)
     }
 
@@ -652,7 +843,9 @@ impl JitBcpWatchedLiteralChunkedKernelProvider {
     ) -> Result<Self, JitCompileError> {
         let config = CompilerConfig::for_host_jit();
         let extern_symbols: HashMap<String, *const u8> = HashMap::new();
-        let result = Compiler::new(config).compile_module_to_jit(module, &extern_symbols)?;
+        let result = Compiler::new(config)
+            .with_codegen_license(crate::in_process_kernel_license())
+            .compile_module_to_jit(module, &extern_symbols)?;
         let buffer = result.buffer;
 
         let entry: KernelEntry = {
@@ -672,14 +865,50 @@ impl JitBcpWatchedLiteralChunkedKernelProvider {
             jit_fn.into_inner()
         };
 
-        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
-        let arena = BcpWatchedChunkedArena::build(num_vars, &clauses, trail_capacity);
+        Ok(Self::with_code(
+            Arc::new(buffer),
+            entry,
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
+    }
 
-        Ok(Self {
+    /// [`Self::compile`] without the compile: this formula's arena around
+    /// the process's one compiled chunked watched-literal kernel, which the first call
+    /// compiles. See the module header for why one compile serves every
+    /// formula.
+    pub fn bind_shared_kernel(
+        num_vars: usize,
+        clauses: Vec<Vec<i32>>,
+        trail_capacity_hint: usize,
+    ) -> Result<Self, JitCompileError> {
+        let (buffer, entry) = WATCHED_LITERAL_CHUNKED_KERNEL.code()?;
+        Ok(Self::with_code(
+            buffer,
+            entry,
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
+    }
+
+    /// The one place a provider's arena is built, whichever way its code
+    /// was obtained.
+    fn with_code(
+        buffer: Arc<ExecutableBuffer>,
+        entry: KernelEntry,
+        num_vars: usize,
+        clauses: &[Vec<i32>],
+        trail_capacity_hint: usize,
+    ) -> Self {
+        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
+        let arena = BcpWatchedChunkedArena::build(num_vars, clauses, trail_capacity);
+        Self {
             buffer,
             entry,
             arena: RefCell::new(arena),
-        })
+        }
     }
 
     /// Borrow the assignment values vector. Returns a `Ref` that
@@ -739,14 +968,14 @@ impl JitBcpWatchedLiteralChunkedKernelProvider {
                 move |buffer: ExecutableBuffer| -> Result<Self, JitCompileError> {
                     Self::from_replayed_buffer(buffer, l2_num_vars, l2_clauses, l2_trail)
                 },
-                |disk_text: Option<String>| -> Result<(Self, Vec<u8>, String), JitCompileError> {
+                |disk_text: Option<String>| -> Result<(Self, Option<Vec<u8>>, String), JitCompileError> {
                     let (module, ir_text) = load_or_build_module(disk_text, || {
                         build_bcp_propagate_watched_literal_chunked_module()
-                    });
+                    })?;
                     let provider =
                         Self::compile_from_module(&module, num_vars, clauses, trail_capacity_hint)?;
                     let buffer_bytes =
-                        crate::executable_buffer_cache::serialize_buffer(provider.buffer());
+                        crate::executable_buffer_cache::serialize_buffer_for_cache(provider.buffer());
                     Ok((provider, buffer_bytes, ir_text))
                 },
             )
@@ -773,13 +1002,13 @@ impl JitBcpWatchedLiteralChunkedKernelProvider {
                 ))?;
             jit_fn.into_inner()
         };
-        let trail_capacity = (num_vars + 1 + trail_capacity_hint).max(8);
-        let arena = BcpWatchedChunkedArena::build(num_vars, &clauses, trail_capacity);
-        Ok(Self {
-            buffer,
+        Ok(Self::with_code(
+            Arc::new(buffer),
             entry,
-            arena: RefCell::new(arena),
-        })
+            num_vars,
+            &clauses,
+            trail_capacity_hint,
+        ))
     }
 }
 

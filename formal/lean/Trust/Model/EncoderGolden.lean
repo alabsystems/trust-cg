@@ -6,15 +6,16 @@
 
   ─────────────────────────────────────────────────────────────────────────────────────────────
   WHAT THIS IS.  `Model.Encoder.encode` is the Lean model's byte-level x86-64 emitter; the
-  `x86Step_decode` keystone axiom is only end-to-end meaningful if those model bytes are the bytes
-  the REAL backend (`crates/trust-cg-codegen/src/x86_64/encode.rs`) actually writes.  Nothing
+  `x86Step_decode` keystone (a theorem of the model's fetch/decode/execute `x86Step`) is only
+  end-to-end meaningful if those model bytes are the bytes the REAL backend
+  (`crates/trust-cg-codegen/src/x86_64/encode.rs`) actually writes.  Nothing
   forces the two to stay in step — the model could drift and keep proving things about an encoding
   the backend no longer emits.  This module is the ANCHOR that stops that drift:
 
     * Each `g_<op>_<pair>` theorem below pins `encode <Instr>` to an EXACT, human-auditable byte
       list, KERNEL-CHECKED by `decide` (`lake build` fails closed if the model's `encode` ever
       produces different bytes).  These are the keystone-reachable b64 reg/reg ALU forms — exactly
-      the set `decode`/`x86Step_decode` vouches for.
+      the set on which the model `x86Step` executes `execInstr`.
     * The Rust test `crates/trust-cg-codegen/tests/lean_encode_golden_binding.rs` PARSES this very
       file, and asserts the real `encode.rs` emits byte-for-byte the SAME lists.
 
@@ -79,6 +80,35 @@ theorem g_testRR_r15_r8 : encode (.testRR .b64 .r15 .r8) = ([0x4D, 0x85, 0xC7] :
 theorem g_andRR_r15_r8 : encode (.andRR .b64 .r15 .r8) = ([0x4D, 0x21, 0xC7] : List UInt8) := by decide
 theorem g_orRR_r15_r8 : encode (.orRR .b64 .r15 .r8) = ([0x4D, 0x09, 0xC7] : List UInt8) := by decide
 theorem g_xorRR_r15_r8 : encode (.xorRR .b64 .r15 .r8) = ([0x4D, 0x31, 0xC7] : List UInt8) := by decide
+
+/-! Near-branch golden vectors; the backend binding checks every key and byte. -/
+theorem branch_jcc_o_zero : encode (.jcc .o 0) = ([0x0F, 0x80, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_no_zero : encode (.jcc .no 0) = ([0x0F, 0x81, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_b_zero : encode (.jcc .b 0) = ([0x0F, 0x82, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_ae_zero : encode (.jcc .ae 0) = ([0x0F, 0x83, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_e_zero : encode (.jcc .e 0) = ([0x0F, 0x84, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_ne_zero : encode (.jcc .ne 0) = ([0x0F, 0x85, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_be_zero : encode (.jcc .be 0) = ([0x0F, 0x86, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_a_zero : encode (.jcc .a 0) = ([0x0F, 0x87, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_s_zero : encode (.jcc .s 0) = ([0x0F, 0x88, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_ns_zero : encode (.jcc .ns 0) = ([0x0F, 0x89, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_p_zero : encode (.jcc .p 0) = ([0x0F, 0x8A, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_np_zero : encode (.jcc .np 0) = ([0x0F, 0x8B, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_l_zero : encode (.jcc .l 0) = ([0x0F, 0x8C, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_ge_zero : encode (.jcc .ge 0) = ([0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_le_zero : encode (.jcc .le 0) = ([0x0F, 0x8E, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_g_zero : encode (.jcc .g 0) = ([0x0F, 0x8F, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_e_one : encode (.jcc .e 0x00000001) = ([0x0F, 0x84, 0x01, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jcc_e_minus_one : encode (.jcc .e 0xFFFFFFFF) = ([0x0F, 0x84, 0xFF, 0xFF, 0xFF, 0xFF] : List UInt8) := by decide
+theorem branch_jcc_e_min : encode (.jcc .e 0x80000000) = ([0x0F, 0x84, 0x00, 0x00, 0x00, 0x80] : List UInt8) := by decide
+theorem branch_jcc_e_max : encode (.jcc .e 0x7FFFFFFF) = ([0x0F, 0x84, 0xFF, 0xFF, 0xFF, 0x7F] : List UInt8) := by decide
+theorem branch_jcc_e_bytes : encode (.jcc .e 0x12345678) = ([0x0F, 0x84, 0x78, 0x56, 0x34, 0x12] : List UInt8) := by decide
+theorem branch_jmp_zero : encode (.jmp 0x00000000) = ([0xE9, 0x00, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jmp_one : encode (.jmp 0x00000001) = ([0xE9, 0x01, 0x00, 0x00, 0x00] : List UInt8) := by decide
+theorem branch_jmp_minus_one : encode (.jmp 0xFFFFFFFF) = ([0xE9, 0xFF, 0xFF, 0xFF, 0xFF] : List UInt8) := by decide
+theorem branch_jmp_min : encode (.jmp 0x80000000) = ([0xE9, 0x00, 0x00, 0x00, 0x80] : List UInt8) := by decide
+theorem branch_jmp_max : encode (.jmp 0x7FFFFFFF) = ([0xE9, 0xFF, 0xFF, 0xFF, 0x7F] : List UInt8) := by decide
+theorem branch_jmp_bytes : encode (.jmp 0x12345678) = ([0xE9, 0x78, 0x56, 0x34, 0x12] : List UInt8) := by decide
 
 end Encoder
 end Model

@@ -27,7 +27,6 @@
 // | LD1/ST1 roundtrip      | Store then load preserves vector value             |
 //
 // Reference: ARM Architecture Reference Manual (DDI 0487), Sections C7.2
-// Reference: designs/2026-04-13-verification-architecture.md
 
 //! NEON encoding correctness proofs.
 //!

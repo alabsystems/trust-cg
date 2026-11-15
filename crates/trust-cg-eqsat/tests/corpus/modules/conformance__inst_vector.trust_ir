@@ -1,0 +1,19 @@
+; TrustIr text format v1
+module "inst_vector"
+
+functy.0 = (ptr, <4 x i32>, <4 x i32>) -> (<4 x i32>, <4 x bool>)
+
+fn @batch_i32(functy.0) {
+bb0(%0: ptr, %1: <4 x i32>, %2: <4 x i32>):
+    %3 = load <4 x i32>, ptr %0, align 16
+    %4 = add <4 x i32> %1, %2
+    %5 = sub <4 x i32> %4, %3
+    %6 = mul <4 x i32> %5, %2
+    %7 = and <4 x i32> %6, %1
+    %8 = or <4 x i32> %7, %2
+    %9 = xor <4 x i32> %8, %3
+    %10 = icmp eq <4 x i32> %9, %3
+    %11 = select <4 x i32> %10, %9, %3
+    store <4 x i32> %11, ptr %0, align 16
+    ret %11, %10
+}

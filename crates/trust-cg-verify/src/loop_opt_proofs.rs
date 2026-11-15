@@ -168,7 +168,7 @@ pub fn proof_unroll_preserves_iteration_count_8bit() -> ProofObligation {
 pub fn proof_unroll_preserves_body_semantics() -> ProofObligation {
     let width = 64;
     let init = SmtExpr::var("init", width);
-    let step = SmtExpr::var("step", width);
+    let step = SmtExpr::var("iv_step", width);
 
     // IV at iteration 2: init + 2 * step
     let two = SmtExpr::bv_const(2, width);
@@ -187,7 +187,7 @@ pub fn proof_unroll_preserves_body_semantics() -> ProofObligation {
         name: "LoopUnroll: unrolled body(iv, c) == original body(iv, c)".to_string(),
         trust_ir_expr: trust_ir,
         aarch64_expr: aarch64,
-        inputs: vec![("init".to_string(), width), ("step".to_string(), width)],
+        inputs: vec![("init".to_string(), width), ("iv_step".to_string(), width)],
         preconditions: vec![],
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::DataFlow),
@@ -198,7 +198,7 @@ pub fn proof_unroll_preserves_body_semantics() -> ProofObligation {
 pub fn proof_unroll_preserves_body_semantics_8bit() -> ProofObligation {
     let width = 8;
     let init = SmtExpr::var("init", width);
-    let step = SmtExpr::var("step", width);
+    let step = SmtExpr::var("iv_step", width);
 
     let two = SmtExpr::bv_const(2, width);
     let iv_at_2 = init.clone().bvadd(two.bvmul(step.clone()));
@@ -213,7 +213,7 @@ pub fn proof_unroll_preserves_body_semantics_8bit() -> ProofObligation {
         name: "LoopUnroll: unrolled body(iv, c) == original body(iv, c) (8-bit)".to_string(),
         trust_ir_expr: trust_ir,
         aarch64_expr: aarch64,
-        inputs: vec![("init".to_string(), width), ("step".to_string(), width)],
+        inputs: vec![("init".to_string(), width), ("iv_step".to_string(), width)],
         preconditions: vec![],
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::DataFlow),
@@ -233,7 +233,7 @@ pub fn proof_unroll_preserves_body_semantics_8bit() -> ProofObligation {
 pub fn proof_unroll_iv_final_value() -> ProofObligation {
     let width = 64;
     let init = SmtExpr::var("init", width);
-    let step = SmtExpr::var("step", width);
+    let step = SmtExpr::var("iv_step", width);
 
     // Loop: final IV = init + N * step
     let trust_ir = encode_final_iv(init.clone(), 4, step.clone(), width);
@@ -245,7 +245,7 @@ pub fn proof_unroll_iv_final_value() -> ProofObligation {
         name: "LoopUnroll: final IV (init + 4*step) matches unrolled".to_string(),
         trust_ir_expr: trust_ir,
         aarch64_expr: aarch64,
-        inputs: vec![("init".to_string(), width), ("step".to_string(), width)],
+        inputs: vec![("init".to_string(), width), ("iv_step".to_string(), width)],
         preconditions: vec![],
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::DataFlow),
@@ -256,7 +256,7 @@ pub fn proof_unroll_iv_final_value() -> ProofObligation {
 pub fn proof_unroll_iv_final_value_8bit() -> ProofObligation {
     let width = 8;
     let init = SmtExpr::var("init", width);
-    let step = SmtExpr::var("step", width);
+    let step = SmtExpr::var("iv_step", width);
 
     let trust_ir = encode_final_iv(init.clone(), 4, step.clone(), width);
     let aarch64 = encode_add_chain(init, step, 4);
@@ -266,7 +266,7 @@ pub fn proof_unroll_iv_final_value_8bit() -> ProofObligation {
         name: "LoopUnroll: final IV (init + 4*step) matches unrolled (8-bit)".to_string(),
         trust_ir_expr: trust_ir,
         aarch64_expr: aarch64,
-        inputs: vec![("init".to_string(), width), ("step".to_string(), width)],
+        inputs: vec![("init".to_string(), width), ("iv_step".to_string(), width)],
         preconditions: vec![],
         fp_inputs: vec![],
         category: Some(crate::lowering_proof::TransvalCheckKind::DataFlow),

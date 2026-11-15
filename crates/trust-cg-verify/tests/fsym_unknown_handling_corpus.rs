@@ -7,8 +7,19 @@
 //!
 //! This corpus starts from trust_ir scanner-produced unknown obligations, then runs
 //! the bounded local solver escalation path. It covers resolved null,
-//! arithmetic, and bounds obligations, plus the scanner-side no-free UAF
-//! classification that keeps unrelated handoffs out of solver escalation.
+//! arithmetic, GEP and bounds obligations, plus the obligations the scanner
+//! records BY NAME for a pointer with no tracked provenance (an `inttoptr`
+//! address): its object's extent, lifetime and contents, which no modeled
+//! quantity decides, so they carry no solver candidate and stay Unknown.
+//!
+//! fsym-r3 re-pin: before, `guarded_inttoptr_nonnull_load` escalated to
+//! ProvenSafe and the function counted as clean — a load through a raw
+//! address that names no allocation (the reference interpreter faults it: no
+//! provenance). Its null verdict is still proven; its three by-name Unknowns
+//! now remain. The two stack-read fixtures read an alloca nothing had
+//! written (returning that poison is UB in trust-ir), so they now initialize
+//! it first; their symbolic GEP index owes a GEP-arithmetic obligation the
+//! solver proves.
 
 use trust_cg_verify::fsym_summary::{FsymSolverEscalationConfig, FsymSolverStatus, FsymSummary};
 use trust_cg_verify::fsym_trust_ir::FsymTrustIrDiagnosticKind;
@@ -19,10 +30,11 @@ use trust_ir::{
 
 const EXPECTED_FUNCTIONS: usize = 7;
 const EXPECTED_SCANNED: usize = 7;
-const EXPECTED_INITIAL_UNKNOWNS: usize = 7;
-const EXPECTED_PROVEN_SAFE: usize = 4;
+const EXPECTED_INITIAL_UNKNOWNS: usize = 15;
+const EXPECTED_BY_NAME_UNKNOWNS: usize = 6;
+const EXPECTED_PROVEN_SAFE: usize = 6;
 const EXPECTED_CONCRETE_UB: usize = 3;
-const EXPECTED_REMAINING_UNKNOWN: usize = 0;
+const EXPECTED_REMAINING_UNKNOWN: usize = EXPECTED_BY_NAME_UNKNOWNS;
 
 #[derive(Debug, Clone, Copy)]
 struct ExpectedStatus {
@@ -114,6 +126,19 @@ fn load(result: u32, ty: Ty, ptr: u32) -> InstrNode {
     .with_result(v(result))
 }
 
+/// `memset(ptr, 0, 8)`: every byte of an 8-byte slot written.
+fn zero_fill_8(ptr: u32, fill: u32, bytes: u32) -> [InstrNode; 3] {
+    [
+        const_int(fill, Ty::U8, 0),
+        const_int(bytes, Ty::U64, 8),
+        InstrNode::new(Inst::MemSet {
+            dst: v(ptr),
+            byte: v(fill),
+            bytes: v(bytes),
+        }),
+    ]
+}
+
 fn ret(value: u32) -> InstrNode {
     InstrNode::new(Inst::Return {
         values: vec![v(value)],
@@ -131,6 +156,7 @@ fn add_function(
     module.func_types.push(FuncTy {
         params: params.iter().map(|(_, ty)| ty.clone()).collect(),
         returns,
+        abi: None,
         is_vararg: false,
     });
 
@@ -243,6 +269,9 @@ fn add_guarded_stack_read_in_bounds(module: &mut Module) {
         vec![
             const_int(1, Ty::I8, 8),
             alloca(2, Ty::I8, Some(1)),
+            zero_fill_8(2, 20, 21)[0].clone(),
+            zero_fill_8(2, 20, 21)[1].clone(),
+            zero_fill_8(2, 20, 21)[2].clone(),
             const_int(3, Ty::I8, 0),
             icmp(4, ICmpOp::Sge, Ty::I8, 0, 3),
             assume(4),
@@ -265,6 +294,9 @@ fn add_guarded_stack_read_oob(module: &mut Module) {
         vec![
             const_int(1, Ty::I8, 8),
             alloca(2, Ty::I8, Some(1)),
+            zero_fill_8(2, 20, 21)[0].clone(),
+            zero_fill_8(2, 20, 21)[1].clone(),
+            zero_fill_8(2, 20, 21)[2].clone(),
             icmp(3, ICmpOp::Eq, Ty::I8, 0, 1),
             assume(3),
             gep(4, Ty::I8, 2, 0),
@@ -288,7 +320,7 @@ fn unknown_handling_corpus() -> Module {
     module
 }
 
-fn expected_statuses() -> [ExpectedStatus; EXPECTED_INITIAL_UNKNOWNS] {
+fn expected_statuses() -> [ExpectedStatus; EXPECTED_INITIAL_UNKNOWNS - EXPECTED_BY_NAME_UNKNOWNS] {
     [
         ExpectedStatus {
             function: "guarded_inttoptr_nonnull_load",
@@ -317,7 +349,17 @@ fn expected_statuses() -> [ExpectedStatus; EXPECTED_INITIAL_UNKNOWNS] {
         },
         ExpectedStatus {
             function: "guarded_stack_read_in_bounds",
+            kind: FsymTrustIrDiagnosticKind::PointerArithmetic,
+            status: FsymSolverStatus::ProvenSafe,
+        },
+        ExpectedStatus {
+            function: "guarded_stack_read_in_bounds",
             kind: FsymTrustIrDiagnosticKind::OutOfBounds,
+            status: FsymSolverStatus::ProvenSafe,
+        },
+        ExpectedStatus {
+            function: "guarded_stack_read_oob",
+            kind: FsymTrustIrDiagnosticKind::PointerArithmetic,
             status: FsymSolverStatus::ProvenSafe,
         },
         ExpectedStatus {
@@ -357,6 +399,7 @@ fn fsym_local_solver_resolves_scanner_unknown_obligations() {
     assert_eq!(before.unknown, EXPECTED_INITIAL_UNKNOWNS);
     assert_eq!(before.concrete_ub, 0);
 
+    let mut by_name = Vec::new();
     for function in &summary.functions {
         assert!(
             !function.unknown_obligations.is_empty(),
@@ -364,6 +407,12 @@ fn fsym_local_solver_resolves_scanner_unknown_obligations() {
             function.function
         );
         for unknown in &function.unknown_obligations {
+            if unknown.reason.contains("no tracked provenance") {
+                // The inttoptr address's object: nothing to hand a solver.
+                assert!(unknown.solver_candidate.is_none(), "{unknown:?}");
+                by_name.push((unknown.function.clone(), unknown.kind));
+                continue;
+            }
             assert!(
                 unknown.candidate_expression.is_some(),
                 "missing candidate text for {}",
@@ -371,7 +420,7 @@ fn fsym_local_solver_resolves_scanner_unknown_obligations() {
             );
             assert!(
                 unknown.kind != FsymTrustIrDiagnosticKind::UseAfterFree,
-                "no-free UAF handoff should be classified safe before solver escalation"
+                "a lifetime handoff of a tracked object should be classified safe before solver escalation"
             );
             assert!(
                 unknown.solver_candidate.is_some(),
@@ -380,6 +429,23 @@ fn fsym_local_solver_resolves_scanner_unknown_obligations() {
             );
         }
     }
+    by_name.sort_by_key(|(function, kind)| (function.clone(), format!("{kind:?}")));
+    let expected_by_name = [
+        "guarded_inttoptr_nonnull_load",
+        "guarded_inttoptr_null_load",
+    ]
+    .into_iter()
+    .flat_map(|function| {
+        [
+            FsymTrustIrDiagnosticKind::OutOfBounds,
+            FsymTrustIrDiagnosticKind::Uninitialized,
+            FsymTrustIrDiagnosticKind::UseAfterFree,
+        ]
+        .map(|kind| (function.to_string(), kind))
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(by_name, expected_by_name);
+    assert_eq!(by_name.len(), EXPECTED_BY_NAME_UNKNOWNS);
 
     let solver_report =
         summary.escalate_unknown_obligations_locally(&FsymSolverEscalationConfig::enabled());

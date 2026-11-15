@@ -1,0 +1,336 @@
+{
+  "name": "spec_carrier",
+  "functions": [
+    {
+      "id": 0,
+      "name": "identity",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "I32"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    0
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": null,
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "I32"
+      ],
+      "returns": [
+        "I32"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [
+    {
+      "id": 0,
+      "kind": "Liveness",
+      "status": "Pending",
+      "description": "eventually the ring is full",
+      "formula": {
+        "schema": "smtlib2",
+        "payload": "(= seq 7)",
+        "smtlib": "(= seq 7)",
+        "sort": "Bool",
+        "bindings": [
+          [
+            "seq",
+            {
+              "sort": "Int",
+              "place": {
+                "SpecVar": {
+                  "index": 0
+                }
+              }
+            }
+          ]
+        ]
+      },
+      "function": null,
+      "source": null,
+      "site": null,
+      "spec": {
+        "machine": "ring",
+        "temporal": "EventuallyFull"
+      }
+    }
+  ],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [
+    {
+      "name": "ring",
+      "vars": [
+        {
+          "name": "seq",
+          "ty": "0..7",
+          "sort": "Int"
+        },
+        {
+          "name": "empty",
+          "ty": "Bool",
+          "sort": "Bool"
+        }
+      ],
+      "actions": [
+        "Push",
+        "Pop"
+      ],
+      "invariants": [
+        {
+          "name": "BoundedSeq",
+          "formula": "(<= seq 7)",
+          "typed": {
+            "schema": "smtlib2",
+            "payload": "(<= seq 7)",
+            "smtlib": "(<= seq 7)",
+            "sort": "Bool",
+            "bindings": [
+              [
+                "seq",
+                {
+                  "sort": "Int",
+                  "place": {
+                    "SpecVar": {
+                      "index": 0
+                    }
+                  }
+                }
+              ]
+            ]
+          }
+        },
+        {
+          "name": "Untyped",
+          "formula": "(>= seq 0)",
+          "typed": null
+        }
+      ],
+      "anchors": [],
+      "waivers": [],
+      "proofs": [
+        {
+          "machine": "ring",
+          "action": "Push",
+          "proof_name": "ring_push_refines",
+          "kind": {
+            "CleanTheorem": {
+              "name": "Ring.push_refines"
+            }
+          }
+        },
+        {
+          "machine": "ring",
+          "action": "Pop",
+          "proof_name": "ring_pop_refines",
+          "kind": "Kani"
+        }
+      ],
+      "origin": "Embedded",
+      "enforcement": "DesignOnly",
+      "temporal": [
+        {
+          "name": "AlwaysBounded",
+          "form": {
+            "Always": {
+              "schema": "smtlib2",
+              "payload": "(<= seq 7)",
+              "smtlib": "(<= seq 7)",
+              "sort": "Bool",
+              "bindings": [
+                [
+                  "seq",
+                  {
+                    "sort": "Int",
+                    "place": {
+                      "SpecVar": {
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "name": "EventuallyFull",
+          "form": {
+            "Eventually": {
+              "schema": "smtlib2",
+              "payload": "(= seq 7)",
+              "smtlib": "(= seq 7)",
+              "sort": "Bool",
+              "bindings": [
+                [
+                  "seq",
+                  {
+                    "sort": "Int",
+                    "place": {
+                      "SpecVar": {
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "name": "NonEmptyLeadsToFull",
+          "form": {
+            "LeadsTo": [
+              {
+                "schema": "smtlib2",
+                "payload": "(not empty)",
+                "smtlib": "(not empty)",
+                "sort": "Bool",
+                "bindings": [
+                  [
+                    "empty",
+                    {
+                      "sort": "Bool",
+                      "place": {
+                        "SpecVar": {
+                          "index": 1
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              {
+                "schema": "smtlib2",
+                "payload": "(= seq 7)",
+                "smtlib": "(= seq 7)",
+                "sort": "Bool",
+                "bindings": [
+                  [
+                    "seq",
+                    {
+                      "sort": "Int",
+                      "place": {
+                        "SpecVar": {
+                          "index": 0
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "PushFair",
+          "form": {
+            "WeakFair": {
+              "action": "Push",
+              "relation": {
+                "schema": "smtlib2",
+                "payload": "(= seq_next (+ seq 1))",
+                "smtlib": "(= seq_next (+ seq 1))",
+                "sort": "Bool",
+                "bindings": [
+                  [
+                    "seq",
+                    {
+                      "sort": "Int",
+                      "place": {
+                        "SpecVar": {
+                          "index": 0
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    "seq_next",
+                    {
+                      "sort": "Int",
+                      "place": {
+                        "SpecVarNext": {
+                          "index": 0
+                        }
+                      }
+                    }
+                  ]
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "PopFair",
+          "form": {
+            "StrongFair": {
+              "action": "Pop",
+              "relation": null
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

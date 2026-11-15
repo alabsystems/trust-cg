@@ -40,6 +40,18 @@
 //       filler `landing_pad == 0` over an Invoke PC is exactly the
 //       cleanup-PC-terminate bug; the explicit throwing region must win.
 //
+// Scope: (1) is the invariant of the DEFAULT propagation policy
+// (`EhPropagation::Filler`). A non-unwinding frame
+// (`EhPropagation::NounwindFrame`, a `panic=abort` Rust compile) follows the
+// region rule of LLVM's call-site table for a `nounwind` function: a region
+// between explicit Invoke ranges gets a filler entry only if it holds a call
+// that may unwind (an indirect call, or a direct call to a symbol the
+// frontend did not declare `nounwind`); a region of `nounwind` calls only is
+// a gap, where the Rust personality fails phase one. So (1) is not claimed
+// for it, and nothing here models which regions it covers. (2) holds under
+// both policies. Exception tables remain trusted base TB-12; no emitted
+// object is certified by these models.
+//
 // ===========================================================================
 // Grounding: this mirrors the REAL `resolve_eh_offsets` output shape
 // ===========================================================================
@@ -465,19 +477,88 @@ pub fn aarch64_eh_coverage_negative_controls() -> Vec<ProofObligation> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lowering_proof::verify_by_evaluation;
     use crate::smt::EvalEnv;
-    use crate::verify::VerificationResult;
 
+    /// The exact-call precondition `region_len == 4` holds at no edge value of
+    /// a 32-bit input (0, 1, max, max-1 and the sign-bit midpoints) and at
+    /// 2^-32 per uniform draw, so only the sweep's precondition-directed
+    /// trials (the preconditions' own constants) compare points for these
+    /// proofs; they must be `Valid` on that evidence. The exhaustive concrete
+    /// evidence is
+    /// `all_aarch64_eh_coverage_proofs_hold_at_every_in_invariant_placement`;
+    /// a formal claim can only come from the AY CLI gate
+    /// `proof_gate_strict::aarch64_eh_coverage_proofs_are_formally_verified`.
     #[test]
-    fn all_aarch64_eh_coverage_proofs_verify() {
+    fn aarch64_eh_coverage_proofs_have_directed_sampled_evidence() {
         for obligation in aarch64_eh_coverage_proofs() {
-            let result = verify_by_evaluation(&obligation);
-            assert!(
-                matches!(result, VerificationResult::Valid),
-                "LSDA EH coverage proof '{}' failed: {:?}",
-                obligation.name,
-                result
+            crate::lowering_proof::assert_directed_sampling_valid(&obligation);
+        }
+    }
+
+    /// Both positive proofs hold at EVERY region placement the layout
+    /// invariant admits for the modeled `CODE_LEN`: each `region_start` in
+    /// `[0, CODE_LEN]`, candidate widths around the exact call (only `4` may
+    /// pass the preconditions), each `pc` in `[0, CODE_LEN]` and a spread of
+    /// landing pads. Every point satisfying all preconditions must evaluate
+    /// both sides without error and agree; every admitted `region_start`
+    /// (`0..=CODE_LEN - 4`) must be reached.
+    #[test]
+    fn all_aarch64_eh_coverage_proofs_hold_at_every_in_invariant_placement() {
+        for obligation in aarch64_eh_coverage_proofs() {
+            let binds_pc = obligation.inputs.iter().any(|(name, _)| name == "pc");
+            let mut reached = std::collections::BTreeSet::new();
+            let mut compared = 0u32;
+            for region_start in 0..=CODE_LEN {
+                for region_len in [0, 3, 4, 5, 8] {
+                    for landing_pad in [0, 1, 8, 0xFFFF_FFFF] {
+                        for pc in 0..=CODE_LEN {
+                            let mut env = EvalEnv::default();
+                            env.insert("region_start".to_string(), region_start);
+                            env.insert("region_len".to_string(), region_len);
+                            env.insert("landing_pad".to_string(), landing_pad);
+                            if binds_pc {
+                                env.insert("pc".to_string(), pc);
+                            }
+                            let holds = obligation.preconditions.iter().all(|pre| {
+                                pre.try_eval(&env)
+                                    .unwrap_or_else(|e| panic!("precondition: {e}"))
+                                    .as_bool()
+                            });
+                            if !holds {
+                                continue;
+                            }
+                            assert_eq!(
+                                region_len, 4,
+                                "'{}': only the exact call width may pass the preconditions",
+                                obligation.name
+                            );
+                            let spec = obligation
+                                .trust_ir_expr
+                                .try_eval(&env)
+                                .unwrap_or_else(|e| panic!("spec side: {e}"));
+                            let emitted = obligation
+                                .aarch64_expr
+                                .try_eval(&env)
+                                .unwrap_or_else(|e| panic!("emitted side: {e}"));
+                            assert!(
+                                spec.semantically_equal(&emitted),
+                                "'{}' disagrees at region_start={region_start} \
+                                 landing_pad={landing_pad} pc={pc}: spec={spec:?}, \
+                                 emitted={emitted:?}",
+                                obligation.name
+                            );
+                            reached.insert(region_start);
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+            assert!(compared > 0, "'{}' compared no point", obligation.name);
+            assert_eq!(
+                reached,
+                (0..=CODE_LEN - 4).collect(),
+                "'{}' must be checked at every admitted region placement",
+                obligation.name
             );
         }
     }

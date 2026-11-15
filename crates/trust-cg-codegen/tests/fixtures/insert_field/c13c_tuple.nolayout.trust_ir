@@ -1,0 +1,37 @@
+; TrustIr text format v1
+module "c13c"
+target "arm64-apple-macosx" 8 little structpass=unclassified
+file 0 "c13c.rs"
+
+functy.0 = (u64, u64) -> (u64)
+
+type ty.0 = (u64, u64)
+
+
+fn @c13_tuple(functy.0) {
+    ; #producer: trust
+    ; #body-gate: gated "trust-direct-lane-structural"
+    ; #names: %0="a", %1="b"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 6 4
+    ; #scope: 2 parent=1 at 0 7 4
+    ; #scope: 3 parent=2 at 0 8 4
+bb0(%0: u64, %1: u64):
+    %2 = const u64 0  ; #loc: 0 6 13  ; #scope: 0
+    %3 = const u64 5  ; #loc: 0 6 19  ; #scope: 0
+    %4 = const (u64, u64) { 0, 0 }  ; #loc: 0 6 12  ; #scope: 0
+    %5 = insertfield (u64, u64) %4, 0, %2  ; #loc: 0 6 12  ; #scope: 0
+    %6 = insertfield (u64, u64) %5, 1, %3  ; #loc: 0 6 12  ; #scope: 0
+    %7 = insertfield (u64, u64) %6, 0, %0  ; #loc: 0 9 4  ; #scope: 3
+    %8 = insertfield (u64, u64) %6, 0, %1  ; #loc: 0 10 4  ; #scope: 3
+    %9 = extractfield u64 %7, 0  ; #loc: 0 11 5  ; #scope: 3
+    %10 = const u64 1000  ; #loc: 0 11 11  ; #scope: 3
+    %11 = mul u64 %9, %10  ; #loc: 0 11 4  ; #scope: 3
+    %12 = extractfield u64 %8, 0  ; #loc: 0 11 19  ; #scope: 3
+    %13 = add u64 %11, %12  ; #loc: 0 11 4  ; #scope: 3
+    %14 = extractfield u64 %6, 0  ; #loc: 0 11 26  ; #scope: 3
+    %15 = const u64 1000000  ; #loc: 0 11 32  ; #scope: 3
+    %16 = mul u64 %14, %15  ; #loc: 0 11 25  ; #scope: 3
+    %17 = add u64 %13, %16  ; #loc: 0 11 4  ; #scope: 3
+    ret %17  ; #loc: 0 12 1  ; #scope: 0
+}

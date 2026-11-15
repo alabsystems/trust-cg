@@ -1,0 +1,18 @@
+; TrustIr text format v1
+module "nominal_type_origin"
+target "aarch64-apple-darwin" 8 little abi="aapcs64"
+
+struct @Span { u32, u32 } size=8 align=4 origin=rust(crate=0x0123456789abcdef, path=00112233445566778899aabbccddeeff, args=sha256:6262626262626262626262626262626262626262626262626262626262626262) id=0
+
+struct @Unkeyed { u8 } size=1 align=1 id=1
+
+enum @Nat { Zero, Succ(u64) } origin=clean(decl="Trust.Nat", env=sha256:5151515151515151515151515151515151515151515151515151515151515151) id=0
+
+functy.0 = () -> (u32)
+
+fn @span_lo(functy.0) {
+    ; #body-gate: gated "conformance-fixture"
+bb0:
+    %0 = const u32 7
+    ret %0
+}

@@ -1,0 +1,236 @@
+; TrustIr text format v1
+module "ws7_1-review"
+
+struct @Pt { u64, u64 } id=0
+
+struct @Outer { struct.0, u64 } id=1
+
+struct @Tri { u64, u64, u64 } id=2
+
+functy.0 = (u64) -> (u64)
+
+functy.1 = (u64, u64) -> (u64)
+
+functy.2 = (struct.2, u64) -> (struct.2)
+
+functy.3 = (struct.2, u64) -> (u64)
+
+type ty.0 = u64
+
+type ty.1 = struct.0
+
+fn @nested_interior_insert(functy.0) {
+bb0(%0: u64):
+    %1 = const struct.1 { { 1, 2 }, 3 }
+    %2 = extractfield struct.0 %1, 0
+    %3 = insertfield struct.0 %2, 0, %0
+    %4 = insertfield struct.1 %1, 0, %3
+    %5 = extractfield u64 %2, 0
+    %6 = extractfield struct.0 %1, 0
+    %7 = extractfield u64 %6, 0
+    %8 = extractfield struct.0 %4, 0
+    %9 = extractfield u64 %8, 0
+    %10 = extractfield u64 %3, 1
+    %11 = const u64 1000000
+    %12 = mul u64 %7, %11
+    %13 = const u64 1000
+    %14 = mul u64 %5, %13
+    %15 = const u64 100
+    %16 = mul u64 %10, %15
+    %17 = add u64 %12, %14
+    %18 = add u64 %17, %16
+    %19 = add u64 %18, %9
+    ret %19
+}
+
+fn @interior_swap_loop(functy.0) {
+bb0(%0: u64):
+    %1 = const struct.1 { { 1, 10 }, 7 }
+    %2 = const struct.0 { 2, 20 }
+    %3 = const u64 0
+    br bb1(%1, %2, %3, %3)
+bb1(%4: struct.1, %5: struct.0, %6: u64, %7: u64):
+    %8 = extractfield struct.0 %4, 0
+    %9 = insertfield struct.1 %4, 0, %5
+    %10 = extractfield u64 %8, 0
+    %11 = extractfield u64 %5, 1
+    %12 = add u64 %7, %10
+    %13 = add u64 %12, %11
+    %14 = const u64 1
+    %15 = add u64 %6, %14
+    %16 = icmp ult u64 %15, %0
+    condbr %16, bb1(%9, %8, %15, %13), bb2(%9, %8, %13)
+bb2(%17: struct.1, %18: struct.0, %19: u64):
+    %20 = extractfield struct.0 %17, 0
+    %21 = extractfield u64 %20, 0
+    %22 = extractfield u64 %18, 0
+    %23 = extractfield u64 %17, 1
+    %24 = const u64 10000
+    %25 = mul u64 %19, %24
+    %26 = const u64 1000
+    %27 = mul u64 %21, %26
+    %28 = const u64 100
+    %29 = mul u64 %22, %28
+    %30 = add u64 %25, %27
+    %31 = add u64 %30, %29
+    %32 = add u64 %31, %23
+    ret %32
+}
+
+fn @select_rotate_loop(functy.0) {
+bb0(%0: u64):
+    %1 = const struct.0 { 1, 0 }
+    %2 = const struct.0 { 2, 0 }
+    %3 = const u64 0
+    br bb1(%1, %2, %3, %3)
+bb1(%4: struct.0, %5: struct.0, %6: u64, %7: u64):
+    %8 = const u64 1
+    %9 = and u64 %6, %8
+    %10 = icmp ne u64 %9, %3
+    %11 = select struct.0 %10, %4, %5
+    %12 = insertfield struct.0 %11, 1, %6
+    %13 = extractfield u64 %4, 0
+    %14 = const u64 3
+    %15 = mul u64 %7, %14
+    %16 = add u64 %15, %13
+    %17 = add u64 %6, %8
+    %18 = icmp ult u64 %17, %0
+    condbr %18, bb1(%5, %11, %17, %16), bb2(%12, %5, %16)
+bb2(%19: struct.0, %20: struct.0, %21: u64):
+    %22 = extractfield u64 %19, 0
+    %23 = extractfield u64 %19, 1
+    %24 = extractfield u64 %20, 0
+    %25 = const u64 1000
+    %26 = mul u64 %21, %25
+    %27 = const u64 100
+    %28 = mul u64 %22, %27
+    %29 = const u64 10
+    %30 = mul u64 %23, %29
+    %31 = add u64 %26, %28
+    %32 = add u64 %31, %30
+    %33 = add u64 %32, %24
+    ret %33
+}
+
+rustcc fn @bump_tri(functy.2) {
+bb0(%0: struct.2, %1: u64):
+    %2 = extractfield u64 %0, 0
+    %3 = add u64 %2, %1
+    %4 = insertfield struct.2 %0, 0, %3
+    %5 = extractfield u64 %0, 2
+    %6 = insertfield struct.2 %4, 1, %5
+    ret %6
+}
+
+rustcc fn @call_result_loop(functy.0) {
+bb0(%0: u64):
+    %1 = const struct.2 { 1, 2, 3 }
+    %2 = const u64 0
+    br bb1(%1, %1, %2, %2)
+bb1(%3: struct.2, %4: struct.2, %5: u64, %6: u64):
+    %7 = call @func.3(%3, %5)
+    %8 = extractfield u64 %3, 1
+    %9 = add u64 %6, %8
+    %10 = const u64 1
+    %11 = add u64 %5, %10
+    %12 = icmp ult u64 %11, %0
+    condbr %12, bb1(%7, %3, %11, %9), bb2(%7, %3, %9)
+bb2(%13: struct.2, %14: struct.2, %15: u64):
+    %16 = extractfield u64 %13, 0
+    %17 = extractfield u64 %14, 0
+    %18 = extractfield u64 %14, 1
+    %19 = const u64 1000000
+    %20 = mul u64 %15, %19
+    %21 = const u64 10000
+    %22 = mul u64 %16, %21
+    %23 = const u64 100
+    %24 = mul u64 %17, %23
+    %25 = add u64 %20, %22
+    %26 = add u64 %25, %24
+    %27 = add u64 %26, %18
+    ret %27
+}
+
+fn @array_struct_insert(functy.1) {
+bb0(%0: u64, %1: u64):
+    %2 = const [ty.1 x 2] array[ { 1, 2 }, { 3, 4 } ]
+    %3 = const struct.0 { 0, 9 }
+    %4 = insertfield struct.0 %3, 0, %0
+    %5 = insertelement [ty.1 x 2] %2, %1, %4
+    %6 = extractelement struct.0 %2, %1
+    %7 = extractelement struct.0 %5, %1
+    %8 = extractfield u64 %6, 0
+    %9 = extractfield u64 %6, 1
+    %10 = extractfield u64 %7, 0
+    %11 = extractfield u64 %7, 1
+    %12 = const u64 1000
+    %13 = mul u64 %8, %12
+    %14 = const u64 100
+    %15 = mul u64 %9, %14
+    %16 = const u64 10
+    %17 = mul u64 %10, %16
+    %18 = add u64 %13, %15
+    %19 = add u64 %18, %17
+    %20 = add u64 %19, %11
+    ret %20
+}
+
+fn @diamond_param_read(functy.1) {
+bb0(%0: u64, %1: u64):
+    %2 = const struct.0 { 5, 6 }
+    %3 = const u64 0
+    br bb1(%2, %3, %3)
+bb1(%4: struct.0, %5: u64, %6: u64):
+    %7 = const u64 1
+    %8 = and u64 %5, %7
+    %9 = icmp ne u64 %8, %3
+    condbr %9, bb2, bb3
+bb2:
+    %10 = insertfield struct.0 %4, 0, %1
+    br bb4(%10)
+bb3:
+    %11 = insertfield struct.0 %4, 1, %5
+    br bb4(%11)
+bb4(%12: struct.0):
+    %13 = extractfield u64 %4, 0
+    %14 = extractfield u64 %4, 1
+    %15 = extractfield u64 %12, 0
+    %16 = extractfield u64 %12, 1
+    %17 = const u64 7
+    %18 = mul u64 %6, %17
+    %19 = add u64 %18, %13
+    %20 = add u64 %19, %14
+    %21 = add u64 %20, %15
+    %22 = add u64 %21, %16
+    %23 = add u64 %5, %7
+    %24 = icmp ult u64 %23, %0
+    condbr %24, bb1(%12, %23, %22), bb5(%22)
+bb5(%25: u64):
+    ret %25
+}
+
+rustcc fn @tri_param_read_back_callee(functy.3) {
+bb0(%0: struct.2, %1: u64):
+    %2 = insertfield struct.2 %0, 0, %1
+    %3 = extractfield u64 %2, 0
+    %4 = extractfield u64 %0, 0
+    %5 = extractfield u64 %2, 2
+    %6 = const u64 10000
+    %7 = mul u64 %3, %6
+    %8 = const u64 100
+    %9 = mul u64 %4, %8
+    %10 = add u64 %7, %9
+    %11 = add u64 %10, %5
+    ret %11
+}
+
+rustcc fn @tri_param_read_back(functy.0) {
+bb0(%0: u64):
+    %1 = const struct.2 { 1, 2, 3 }
+    %2 = call @func.7(%1, %0)
+    %3 = extractfield u64 %1, 0
+    %4 = const u64 1000000
+    %5 = mul u64 %3, %4
+    %6 = add u64 %5, %2
+    ret %6
+}

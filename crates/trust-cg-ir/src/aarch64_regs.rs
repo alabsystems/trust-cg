@@ -803,10 +803,31 @@ pub fn regs_overlap(a: PReg, b: PReg) -> bool {
 
 /// Return the root register number and class group (0=GPR, 1=FPR).
 ///
-/// Two registers overlap exactly when their roots are equal, so this doubles as
-/// a HASH KEY for "the same physical register at any width" -- which callers
-/// that bucket registers in a map or set need, and which [`regs_overlap`] alone
-/// cannot give them.
+/// Equal roots mean the two registers overlap, so this doubles as a HASH KEY
+/// for "the same physical register at any width" -- which callers that bucket
+/// registers in a map or set need, and which [`regs_overlap`] alone cannot give
+/// them.
+///
+/// The CONVERSE does not hold, in exactly one class: SP, WSP, XZR and WZR all
+/// key to `(31, 0)`. In A64 the value 31 in a register field selects either the
+/// stack pointer or the zero register depending on the instruction, so those are
+/// architecturally DISTINCT storage that this key deliberately conflates. The
+/// relation is therefore an OVER-approximation of overlap -- it can claim an
+/// overlap that is not there, never miss one.
+///
+/// That direction is the safe one for an interference or alias test (an extra
+/// interference costs a spill; a missed one double-books a register), and both
+/// in-tree consumers already handle the class BY NAME:
+/// `GreedyAllocator::direct_alias_lookup` keeps its slower predicate scan for
+/// root `(31, 0)`, and its test
+/// `alias_closure_equals_overlap_relation_except_sp_xzr_class` pins that this is
+/// the ONLY place overlap and the alias closure disagree, over the whole
+/// encoding space.
+///
+/// It is NOT the safe direction for a caller that reads equal roots as "the
+/// same register at another width". Such a caller must REFUSE this root rather
+/// than resolve it -- see `conflated_sp_or_zero_root` in trust-cg-opt's
+/// `tail_call.rs`, where resolving it would delete a real write to SP.
 pub fn reg_root(reg: PReg) -> Option<(u8, u8)> {
     let e = reg.encoding();
     match e {
@@ -865,7 +886,7 @@ pub enum CondCode {
     LE = 0b1101,
     /// Always (unconditional)
     AL = 0b1110,
-    /// Never (reserved, behaves as AL in most contexts)
+    /// Alternate always condition (same truth value as AL under A64 ConditionHolds).
     NV = 0b1111,
 }
 
@@ -890,10 +911,12 @@ impl CondCode {
         self as u8
     }
 
-    /// Invert the condition (logical negation).
+    /// Toggle bit zero of the condition's encoding.
     ///
-    /// The ARM architecture defines inverted conditions by flipping bit 0
-    /// of the encoding, except for AL/NV which are unconditional.
+    /// This is logical negation only for EQ through LE. AL and NV both hold
+    /// unconditionally, so toggling between them does NOT negate the condition.
+    /// Transformations requiring a complement must use [`Self::logical_complement`].
+    /// This encoding operation retains its historical AL/NV behavior.
     ///
     /// | Original | Inverted |
     /// |----------|----------|
@@ -912,6 +935,18 @@ impl CondCode {
         let inv = (self as u8) ^ 1;
         // SAFETY: all 16 values 0b0000..=0b1111 are valid CondCode variants.
         unsafe { core::mem::transmute::<u8, CondCode>(inv) }
+    }
+
+    /// Return a condition holding exactly when this condition does not.
+    ///
+    /// Arm's `ConditionHolds` treats both AL and NV as true for every NZCV
+    /// state; no condition code represents their always-false complement.
+    #[inline]
+    pub const fn logical_complement(self) -> Option<Self> {
+        match self {
+            Self::AL | Self::NV => None,
+            _ => Some(self.invert()),
+        }
     }
 
     /// Return the assembly mnemonic suffix (e.g., `"eq"`, `"ne"`, `"hs"`).
@@ -1289,6 +1324,80 @@ mod tests {
         assert_eq!(CondCode::LE.invert(), CondCode::GT);
         assert_eq!(CondCode::AL.invert(), CondCode::NV);
         assert_eq!(CondCode::NV.invert(), CondCode::AL);
+    }
+
+    #[test]
+    fn test_logical_complement_all_conditions_and_nzcv() {
+        // Independent condition truth table, Arm DDI0602 ID062025 p5947.
+        fn holds(cc: CondCode, flags: u8) -> bool {
+            let (n, z, c, v) = (
+                flags & 8 != 0,
+                flags & 4 != 0,
+                flags & 2 != 0,
+                flags & 1 != 0,
+            );
+            match cc {
+                CondCode::EQ => z,
+                CondCode::NE => !z,
+                CondCode::HS => c,
+                CondCode::LO => !c,
+                CondCode::MI => n,
+                CondCode::PL => !n,
+                CondCode::VS => v,
+                CondCode::VC => !v,
+                CondCode::HI => c && !z,
+                CondCode::LS => !c || z,
+                CondCode::GE => n == v,
+                CondCode::LT => n != v,
+                CondCode::GT => !z && n == v,
+                CondCode::LE => z || n != v,
+                CondCode::AL | CondCode::NV => true,
+            }
+        }
+        let all = [
+            CondCode::EQ,
+            CondCode::NE,
+            CondCode::HS,
+            CondCode::LO,
+            CondCode::MI,
+            CondCode::PL,
+            CondCode::VS,
+            CondCode::VC,
+            CondCode::HI,
+            CondCode::LS,
+            CondCode::GE,
+            CondCode::LT,
+            CondCode::GT,
+            CondCode::LE,
+            CondCode::AL,
+            CondCode::NV,
+        ];
+        let mut complement_checks = 0;
+        for cc in all {
+            if let Some(complement) = cc.logical_complement() {
+                assert_eq!(complement.logical_complement(), Some(cc));
+                for nzcv in 0..16 {
+                    assert_ne!(
+                        holds(cc, nzcv),
+                        holds(complement, nzcv),
+                        "{cc:?}/{nzcv:04b}"
+                    );
+                    complement_checks += 1;
+                }
+            } else {
+                assert!(matches!(cc, CondCode::AL | CondCode::NV));
+                for nzcv in 0..16 {
+                    assert!(holds(cc, nzcv));
+                    assert!(holds(cc.invert(), nzcv));
+                }
+                // No alternative encoding is an always-false complement.
+                assert!(
+                    all.into_iter()
+                        .all(|candidate| (0..16).any(|nzcv| holds(candidate, nzcv)))
+                );
+            }
+        }
+        assert_eq!(complement_checks, 224);
     }
 
     #[test]

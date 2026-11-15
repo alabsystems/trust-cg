@@ -1,0 +1,47 @@
+; TrustIr text format v1
+module "unwind_twins"
+target "aarch64-apple-darwin" 8 little
+
+functy.0 = () -> (i64)
+
+fn @seven(functy.0) {
+    ; #body-gate: ungated
+bb0:
+    %0 = const i64 7
+    ret %0
+}
+
+fn @boom(functy.0) {
+    ; #body-gate: ungated
+bb0:
+    %0 = const bool false
+    assert %0, div_by_zero
+    %1 = const i64 0
+    ret %1
+}
+
+fn @run_ok(functy.0) {
+    ; #body-gate: ungated
+bb0:
+    %0 = const functy.0 fndef<func.0>
+    %1 = invoke_indirect %0(functy.0)() to bb1() unwind bb2
+bb1:
+    ret %1
+bb2:
+    %2, %3 = landingpad catch 0
+    %4 = const i64 -1
+    ret %4
+}
+
+fn @run_boom(functy.0) {
+    ; #body-gate: ungated
+bb0:
+    %0 = const functy.0 fndef<func.1>
+    %1 = invoke_indirect %0(functy.0)() to bb1() unwind bb2
+bb1:
+    ret %1
+bb2:
+    %2, %3 = landingpad catch 0
+    %4 = const i64 -1
+    ret %4
+}

@@ -130,11 +130,12 @@
 //! sign-extension provides but `i64` lacks, mirroring [`crate::neon_array`] /
 //! [`crate::neon_map`]. (`.4S` handles 32-bit lanes only here.)
 
-use std::collections::{HashMap, HashSet};
+use crate::candidate::{alloc, commit, emit, emit_before, insert_new_blocks_before, splice_edge};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use crate::loop_contract::{ExitPlan, Handoff, LoopLocality, exit_of_test};
+use crate::mach_util::{branch_targets, const_value, copy_like};
 
-use trust_cg_ir::{
-    AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand, RegClass, VReg,
-};
+use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, MachOperand, RegClass, VReg};
 
 use crate::dom::DomTree;
 use crate::loops::LoopAnalysis;
@@ -251,9 +252,6 @@ impl NeonStencilPass {
                 changed = true;
             }
         }
-        if changed && std::env::var("TRUST_CG_DUMP_NEONSTENCIL").is_ok() {
-            eprintln!("[neon-stencil] fn={} vectorized={}", func.name, self.fired);
-        }
         changed
     }
 }
@@ -295,6 +293,9 @@ struct Recognized {
     /// Distinct `(base, K)` read streams referenced by `term`, first-seen order
     /// (deterministic emission).
     streams: Vec<Stream>,
+    /// The loop-state contract (`crate::loop_contract`) passed for
+    /// `[iv]`. The plan cannot be built without it.
+    _locality: LoopLocality,
 }
 
 /// Opcodes permitted anywhere in the loop body. Anything else => BAIL (rules out
@@ -335,49 +336,6 @@ fn allowed_loop_op(op: AArch64Opcode) -> bool {
     )
 }
 
-fn vreg_of(op: &MachOperand) -> Option<VReg> {
-    match op {
-        MachOperand::VReg(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn imm_of(op: &MachOperand) -> Option<i64> {
-    match op {
-        MachOperand::Imm(v) => Some(*v),
-        _ => None,
-    }
-}
-
-/// `AddRI(d, s, 0)` / `MovR(d, s)` / `Copy(d, s)` copy idioms => `(d, s)`.
-fn copy_like(inst: &MachInst) -> Option<(VReg, VReg)> {
-    match inst.opcode {
-        AArch64Opcode::MovR | AArch64Opcode::Copy if inst.operands.len() == 2 => {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        AArch64Opcode::AddRI
-            if inst.operands.len() == 3 && imm_of(&inst.operands[2]) == Some(0) =>
-        {
-            Some((vreg_of(&inst.operands[0])?, vreg_of(&inst.operands[1])?))
-        }
-        _ => None,
-    }
-}
-
-/// 16-bit `Movz` constant value of `val`, if any (may be defined anywhere the
-/// global def map can see, e.g. the preheader).
-fn const_value(func: &MachFunction, def: &HashMap<u32, InstId>, val: VReg) -> Option<i64> {
-    let inst = func.inst(*def.get(&val.id)?);
-    if inst.opcode == AArch64Opcode::Movz
-        && inst.operands.len() == 2
-        && let Some(v) = imm_of(&inst.operands[1])
-        && (0..=0xFFFF).contains(&v)
-    {
-        return Some(v);
-    }
-    None
-}
-
 impl Recognized {
     fn recognize(
         func: &MachFunction,
@@ -393,7 +351,7 @@ impl Recognized {
 
         // Whitelist every opcode in the loop body — no call/div/atomic/second
         // store/etc.
-        let mut loop_insts = HashSet::new();
+        let mut loop_insts = HashSet::default();
         for &b in [header, latch].iter() {
             for &id in &func.block(b).insts {
                 if !allowed_loop_op(func.inst(id).opcode) {
@@ -403,7 +361,7 @@ impl Recognized {
             }
         }
 
-        let def = build_def_map(func);
+        let def = crate::effects::build_reaching_def_map(func);
 
         // (R6) header preds are exactly {latch, guard}; guard has one pred.
         let hpreds = &func.block(header).preds;
@@ -429,7 +387,7 @@ impl Recognized {
             .iter()
             .map(|&id| func.inst(id))
             .find(|i| i.opcode == AArch64Opcode::BCond && branch_targets(i).contains(&header))?;
-        if imm_of(&bcond.operands[0]) != Some(CC_LT) {
+        if bcond.operands[0].as_imm() != Some(CC_LT) {
             return None; // only signed `<` counted loops
         }
         let cmp = latch_insts
@@ -437,8 +395,8 @@ impl Recognized {
             .map(|&id| func.inst(id))
             .rev()
             .find(|i| i.opcode == AArch64Opcode::CmpRR)?;
-        let iv = vreg_of(&cmp.operands[0])?;
-        let bound = vreg_of(&cmp.operands[1])?;
+        let iv = cmp.operands[0].as_vreg()?;
+        let bound = cmp.operands[1].as_vreg()?;
 
         // Loop-carried writebacks in the latch: exactly ONE (the induction). A
         // stencil map carries no accumulator — a second writeback means this is a
@@ -483,17 +441,34 @@ impl Recognized {
             return None;
         }
         let store = func.inst(stores.pop()?);
-        if store.operands.len() != 3 || imm_of(&store.operands[2]) != Some(0) {
+        if store.operands.len() != 3 || store.operands[2].as_imm() != Some(0) {
             return None;
         }
-        let term = vreg_of(&store.operands[0])?; // stored value (stencil term)
-        let store_addr = vreg_of(&store.operands[1])?;
+        let term = store.operands[0].as_vreg()?; // stored value (stencil term)
+        let store_addr = store.operands[1].as_vreg()?;
         // The stored value must be i32 (a `.4S` lane) and defined in the loop.
         if term.class != RegClass::Gpr32 {
             return None;
         }
 
+        // LOOP STATE (`crate::loop_contract`): the vector loop runs only
+        // iterations the latch's `iv < bound` test continues, and reproduces
+        // only `iv`; the loop may leave by no other exit, and no other register
+        // the loop carries or leaves live may be skipped.
+        let exit = exit_of_test(func, body.iter().copied(), latch)?;
+        let locality = match LoopLocality::check(
+            func,
+            body.iter().copied(),
+            header,
+            &ExitPlan::loop_test(latch, exit),
+            Handoff::HeaderOrExit,
+            &[iv],
+        ) {
+            Ok(locality) => locality,
+            Err(_escape) => return None,
+        };
         let mut rec = Recognized {
+            _locality: locality,
             guard,
             preheader,
             preheader_term,
@@ -503,7 +478,7 @@ impl Recognized {
             store_base: VReg::new(0, RegClass::Gpr64), // filled below
             def,
             loop_insts,
-            loads: HashMap::new(),
+            loads: HashMap::default(),
             streams: Vec::new(),
         };
 
@@ -518,7 +493,7 @@ impl Recognized {
         // (R_term) The stored value must be lowerable per-lane: every reachable
         // leaf is a recognized `i32` shifted array load `base[i+K]` or a 16-bit
         // constant — NOT the induction. Populates `rec.loads` / `rec.streams`.
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         if !rec.node_ok(func, dom, term, &mut seen) {
             return None;
         }
@@ -590,9 +565,9 @@ impl Recognized {
         if madd.opcode != AArch64Opcode::Madd || madd.operands.len() != 4 {
             return None;
         }
-        let f1 = vreg_of(&madd.operands[1])?;
-        let f2 = vreg_of(&madd.operands[2])?;
-        let base = vreg_of(&madd.operands[3])?;
+        let f1 = madd.operands[1].as_vreg()?;
+        let f2 = madd.operands[2].as_vreg()?;
+        let base = madd.operands[3].as_vreg()?;
         let es_ok = |factor: VReg| const_value(func, &self.def, factor) == Some(ELEM_BYTES);
         // One factor is the (sign-extended) shifted index, the other is `4`.
         let (idx_factor, es_factor) = if es_ok(f2) {
@@ -624,7 +599,7 @@ impl Recognized {
         if inst.opcode != AArch64Opcode::Sxtw || inst.operands.len() != 2 {
             return None;
         }
-        let shift = vreg_of(&inst.operands[1])?;
+        let shift = inst.operands[1].as_vreg()?;
         self.index_offset(func, shift)
     }
 
@@ -643,8 +618,8 @@ impl Recognized {
         let small = |c: i64| (1..=MAX_OFFSET).contains(&c);
         match inst.opcode {
             AddRR => {
-                let a = vreg_of(&inst.operands[1])?;
-                let b = vreg_of(&inst.operands[2])?;
+                let a = inst.operands[1].as_vreg()?;
+                let b = inst.operands[2].as_vreg()?;
                 if a == self.iv {
                     let c = const_value(func, &self.def, b)?;
                     if small(c) {
@@ -660,8 +635,8 @@ impl Recognized {
             }
             SubRR => {
                 // Only `iv - c` is a stencil offset (`c - iv` is not affine in iv).
-                let a = vreg_of(&inst.operands[1])?;
-                let b = vreg_of(&inst.operands[2])?;
+                let a = inst.operands[1].as_vreg()?;
+                let b = inst.operands[2].as_vreg()?;
                 if a == self.iv {
                     let c = const_value(func, &self.def, b)?;
                     if small(c) {
@@ -671,16 +646,16 @@ impl Recognized {
                 None
             }
             AddRI => {
-                let a = vreg_of(&inst.operands[1])?;
-                let c = imm_of(&inst.operands[2])?;
+                let a = inst.operands[1].as_vreg()?;
+                let c = inst.operands[2].as_imm()?;
                 if a == self.iv && small(c) {
                     return Some(c);
                 }
                 None
             }
             SubRI => {
-                let a = vreg_of(&inst.operands[1])?;
-                let c = imm_of(&inst.operands[2])?;
+                let a = inst.operands[1].as_vreg()?;
+                let c = inst.operands[2].as_imm()?;
                 if a == self.iv && small(c) {
                     return Some(-c);
                 }
@@ -697,11 +672,11 @@ impl Recognized {
         if load.opcode != AArch64Opcode::LdrRI
             || load.operands.len() != 3
             || dst.class != RegClass::Gpr32
-            || imm_of(&load.operands[2]) != Some(0)
+            || load.operands[2].as_imm() != Some(0)
         {
             return None;
         }
-        let addr = vreg_of(&load.operands[1])?;
+        let addr = load.operands[1].as_vreg()?;
         let (base, k) = self.resolve_shifted_base(func, dom, addr)?;
         Some(Stream { base, k })
     }
@@ -747,28 +722,28 @@ impl Recognized {
         let ops = func.inst(def_id).operands.clone();
         match opcode {
             MulRR | AddRR | SubRR | AndRR | OrrRR | EorRR => {
-                let (Some(a), Some(b)) = (vreg_of(&ops[1]), vreg_of(&ops[2])) else {
+                let (Some(a), Some(b)) = (ops[1].as_vreg(), ops[2].as_vreg()) else {
                     return false;
                 };
                 self.node_ok(func, dom, a, seen) && self.node_ok(func, dom, b, seen)
             }
             AddRI | SubRI | AndRI | OrrRI | EorRI => {
-                let Some(a) = vreg_of(&ops[1]) else {
+                let Some(a) = ops[1].as_vreg() else {
                     return false;
                 };
-                let ok_imm = matches!(imm_of(&ops[2]), Some(v) if (0..=0xFFFF).contains(&v));
+                let ok_imm = matches!(ops[2].as_imm(), Some(v) if (0..=0xFFFF).contains(&v));
                 ok_imm && self.node_ok(func, dom, a, seen)
             }
             LslRI | LsrRI | AsrRI => {
-                let Some(a) = vreg_of(&ops[1]) else {
+                let Some(a) = ops[1].as_vreg() else {
                     return false;
                 };
-                let ok_sh = matches!(imm_of(&ops[2]), Some(v) if (0..=31).contains(&v));
+                let ok_sh = matches!(ops[2].as_imm(), Some(v) if (0..=31).contains(&v));
                 ok_sh && self.node_ok(func, dom, a, seen)
             }
             Madd if ops.len() == 4 => {
                 let (Some(a), Some(b), Some(c)) =
-                    (vreg_of(&ops[1]), vreg_of(&ops[2]), vreg_of(&ops[3]))
+                    (ops[1].as_vreg(), ops[2].as_vreg(), ops[3].as_vreg())
                 else {
                     return false;
                 };
@@ -793,11 +768,11 @@ fn is_increment_by_one(
     let inst = func.inst(id);
     match inst.opcode {
         AArch64Opcode::AddRI => {
-            vreg_of(&inst.operands[1]) == Some(iv) && imm_of(&inst.operands[2]) == Some(1)
+            inst.operands[1].as_vreg() == Some(iv) && inst.operands[2].as_imm() == Some(1)
         }
         AArch64Opcode::AddRR => {
-            let a = vreg_of(&inst.operands[1]);
-            let b = vreg_of(&inst.operands[2]);
+            let a = inst.operands[1].as_vreg();
+            let b = inst.operands[2].as_vreg();
             (a == Some(iv) && const_value(func, def, b.unwrap_or(iv)) == Some(1))
                 || (b == Some(iv) && const_value(func, def, a.unwrap_or(iv)) == Some(1))
         }
@@ -837,12 +812,12 @@ struct LowerCtx {
 /// formation; the plan is empty otherwise (and when `STENCIL_EXT_ENABLED` is
 /// retracted).
 fn plan_ext_windows(streams: &[Stream]) -> HashMap<(u32, i64), (i64, i64)> {
-    let mut derived = HashMap::new();
+    let mut derived = HashMap::default();
     if !STENCIL_EXT_ENABLED || UNROLL < 2 {
         return derived;
     }
     // Per base: the lowest and highest constant offset K (the END streams).
-    let mut ends: HashMap<u32, (i64, i64)> = HashMap::new();
+    let mut ends: HashMap<u32, (i64, i64)> = HashMap::default();
     for s in streams {
         let e = ends.entry(s.base.id).or_insert((s.k, s.k));
         e.0 = e.0.min(s.k);
@@ -863,6 +838,10 @@ fn plan_ext_windows(streams: &[Stream]) -> HashMap<(u32, i64), (i64, i64)> {
 }
 
 fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
+    commit(func, |candidate| apply_candidate(candidate, rec))
+}
+
+fn apply_candidate(func: &mut MachFunction, rec: &Recognized) -> Option<()> {
     // IDEMPOTENCE: never vectorize the remainder loop of a loop this pass
     // already vectorized (see `crate::vector_remainder`).
     if crate::vector_remainder::iv_is_vector_advanced_upstream(
@@ -871,14 +850,14 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
         rec.preheader,
         rec.iv,
     ) {
-        return false;
+        return None;
     }
     let width = UNROLL as i64 * VF; // lanes per vector iteration (16)
-    let vh = func.create_block();
-    let vb = func.create_block();
-    let vl = func.create_block();
-    let vx = func.create_block();
-    insert_new_blocks_before(func, rec.guard, &[vh, vb, vl, vx]);
+    let vh = func.try_create_block()?;
+    let vb = func.try_create_block()?;
+    let vl = func.try_create_block()?;
+    let vx = func.try_create_block()?;
+    insert_new_blocks_before(func, rec.guard, &[vh, vb, vl, vx])?;
 
     // Internal edges among fresh blocks only — touching the original loop's
     // entry is deferred to the COMMIT below so a lowering failure cannot leave a
@@ -891,42 +870,42 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     let pre = rec.preheader_term;
 
     // --- Preheader: sign-extend the loop bound once, materialize element size.
-    let nb64 = alloc(func, RegClass::Gpr64);
+    let nb64 = alloc(func, RegClass::Gpr64)?;
     emit_before(
         func,
         pre,
         AArch64Opcode::Sxtw,
         vec![vreg(nb64), vreg(rec.bound)],
-    );
-    let c_es = alloc(func, RegClass::Gpr64);
+    )?;
+    let c_es = alloc(func, RegClass::Gpr64)?;
     emit_before(
         func,
         pre,
         AArch64Opcode::Movz,
         vec![vreg(c_es), imm(ELEM_BYTES)],
-    );
+    )?;
 
     // --- Vector header: guard `sxtw(iv) + (width-1) < sxtw(bound)` (i64, no
     // overflow). Since the store is at offset 0, this makes the write range and
     // (by the index-correspondence argument) every halo read stay inside the
     // scalar loop's access set — enough for a full `width`-lane block.
-    let gi = alloc(func, RegClass::Gpr64);
-    let gilast = alloc(func, RegClass::Gpr64);
-    emit(func, vh, AArch64Opcode::Sxtw, vec![vreg(gi), vreg(rec.iv)]);
+    let gi = alloc(func, RegClass::Gpr64)?;
+    let gilast = alloc(func, RegClass::Gpr64)?;
+    emit(func, vh, AArch64Opcode::Sxtw, vec![vreg(gi), vreg(rec.iv)])?;
     emit(
         func,
         vh,
         AArch64Opcode::AddRI,
         vec![vreg(gilast), vreg(gi), imm(width - 1)],
-    );
+    )?;
     emit(
         func,
         vh,
         AArch64Opcode::CmpRR,
         vec![vreg(gilast), vreg(nb64)],
-    );
-    emit(func, vh, AArch64Opcode::BCond, vec![imm(CC_LT), block(vb)]);
-    emit(func, vh, AArch64Opcode::B, vec![block(vx)]);
+    )?;
+    emit(func, vh, AArch64Opcode::BCond, vec![imm(CC_LT), block(vb)])?;
+    emit(func, vh, AArch64Opcode::B, vec![block(vx)])?;
 
     // --- Window-formation plan (module docs, *Window formation*): per base the
     // END streams (lowest / highest `K`) get their own load stream; a MIDDLE
@@ -946,41 +925,41 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     // base), so no store can clobber a not-yet-read element. Derived middle
     // streams add NO loads: the loaded byte range is a SUBSET of the
     // all-streams-loaded shape (the OOB argument above is unchanged).
-    let si = alloc(func, RegClass::Gpr64);
-    emit(func, vb, AArch64Opcode::Sxtw, vec![vreg(si), vreg(rec.iv)]);
-    let mut loaded: HashMap<(u32, i64, usize), VReg> = HashMap::new();
+    let si = alloc(func, RegClass::Gpr64)?;
+    emit(func, vb, AArch64Opcode::Sxtw, vec![vreg(si), vreg(rec.iv)])?;
+    let mut loaded: HashMap<(u32, i64, usize), VReg> = HashMap::default();
     for stream in &rec.streams {
         if derived.contains_key(&(stream.base.id, stream.k)) {
             continue; // formed in-register below — no load stream of its own
         }
         // p0 = base + si*4   (Madd d, n, m, a = a + n*m).
-        let p0 = alloc(func, RegClass::Gpr64);
+        let p0 = alloc(func, RegClass::Gpr64)?;
         emit(
             func,
             vb,
             AArch64Opcode::Madd,
             vec![vreg(p0), vreg(si), vreg(c_es), vreg(stream.base)],
-        );
+        )?;
         // Apply the constant byte offset K*4 (may be negative).
         let p = if stream.k == 0 {
             p0
         } else {
             let off = stream.k * ELEM_BYTES;
-            let pk = alloc(func, RegClass::Gpr64);
+            let pk = alloc(func, RegClass::Gpr64)?;
             if off > 0 {
                 emit(
                     func,
                     vb,
                     AArch64Opcode::AddRI,
                     vec![vreg(pk), vreg(p0), imm(off)],
-                );
+                )?;
             } else {
                 emit(
                     func,
                     vb,
                     AArch64Opcode::SubRI,
                     vec![vreg(pk), vreg(p0), imm(-off)],
-                );
+                )?;
             }
             pk
         };
@@ -990,14 +969,14 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
         // `Qt2 = [p+16]`, `p += 32`, twice), so sub-block `k` still reads
         // elements `[iv+K+4k, iv+K+4k+4)`.
         for pair in 0..UNROLL / 2 {
-            let q0 = alloc(func, RegClass::Fpr128);
-            let q1 = alloc(func, RegClass::Fpr128);
+            let q0 = alloc(func, RegClass::Fpr128)?;
+            let q1 = alloc(func, RegClass::Fpr128)?;
             emit(
                 func,
                 vb,
                 AArch64Opcode::NeonLdpQPost,
                 vec![vreg(q0), vreg(q1), vreg(p), imm(32)],
-            );
+            )?;
             loaded.insert((stream.base.id, stream.k, 2 * pair), q0);
             loaded.insert((stream.base.id, stream.k, 2 * pair + 1), q1);
         }
@@ -1034,15 +1013,15 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
             // The END streams are always loaded (plan invariant); bail without
             // committing if that were ever violated.
             let (Some(&lo_src), Some(&hi_src)) = (lo_src, hi_src) else {
-                return false;
+                return None;
             };
-            let dst = alloc(func, RegClass::Fpr128);
+            let dst = alloc(func, RegClass::Fpr128)?;
             emit(
                 func,
                 vb,
                 AArch64Opcode::NeonExtV,
                 vec![vreg(dst), vreg(lo_src), vreg(hi_src), imm(shift)],
-            );
+            )?;
             loaded.insert((stream.base.id, stream.k, j), dst);
         }
     }
@@ -1050,13 +1029,13 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
     // --- Vector body: a SEPARATE post-index pointer for the output store,
     // computed as `store_base + si*4` (offset 0). For each sub-block: lower TERM
     // over that sub-block's loaded lanes and ST1.4S it back, advancing by 16 bytes.
-    let sp = alloc(func, RegClass::Gpr64);
+    let sp = alloc(func, RegClass::Gpr64)?;
     emit(
         func,
         vb,
         AArch64Opcode::Madd,
         vec![vreg(sp), vreg(si), vreg(c_es), vreg(rec.store_base)],
-    );
+    )?;
     let mut ctx = LowerCtx {
         iv: rec.iv,
         accum: 0,
@@ -1066,23 +1045,19 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
         loop_insts: rec.loop_insts.clone(),
         loads: rec.loads.clone(),
         loaded,
-        const_cache: HashMap::new(),
-        memo: HashMap::new(),
+        const_cache: HashMap::default(),
+        memo: HashMap::default(),
     };
     // Lower every sub-block's term first, then store them in PAIRS with
-    // post-index `STP Qk, Qk+1, [sp], #32` — one instruction per 32 bytes, like
-    // clang's `stp q, q` stencil-store shape. Byte-identical to the prior
-    // per-block `ST1 {V.4S}, [sp], #16` sequence: a full-width vector term is a
-    // 16-byte Q register, so the paired store writes the SAME 32 bytes in the
+    // post-index `STP Qk, Qk+1, [sp], #32` — one instruction per 32 bytes.
+    // Each term is a 16-byte Q register, so the pair writes the same bytes in the
     // SAME order to the SAME running pointer. Any odd trailing block (UNROLL not
     // even) keeps a single ST1.
     let mut vterms: Vec<VReg> = Vec::with_capacity(UNROLL);
     for k in 0..UNROLL {
         ctx.accum = k;
         ctx.memo.clear();
-        let Some(vterm) = lower(func, &mut ctx, rec.term) else {
-            return false;
-        };
+        let vterm = lower(func, &mut ctx, rec.term)?;
         vterms.push(vterm);
     }
     let mut k = 0;
@@ -1092,7 +1067,7 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
             vb,
             AArch64Opcode::NeonStpQPost,
             vec![vreg(vterms[k]), vreg(vterms[k + 1]), vreg(sp), imm(32)],
-        );
+        )?;
         k += 2;
     }
     if k < UNROLL {
@@ -1101,9 +1076,9 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
             vb,
             AArch64Opcode::NeonSt1Post,
             vec![vreg(vterms[k]), vreg(sp), imm(ARR_S4)],
-        );
+        )?;
     }
-    emit(func, vb, AArch64Opcode::B, vec![block(vl)]);
+    emit(func, vb, AArch64Opcode::B, vec![block(vl)])?;
 
     // --- Vector latch: advance the scalar induction by `width`.
     emit(
@@ -1111,25 +1086,19 @@ fn apply(func: &mut MachFunction, rec: &Recognized) -> bool {
         vl,
         AArch64Opcode::AddRI,
         vec![vreg(rec.iv), vreg(rec.iv), imm(width)],
-    );
-    emit(func, vl, AArch64Opcode::B, vec![block(vh)]);
+    )?;
+    emit(func, vl, AArch64Opcode::B, vec![block(vh)])?;
 
     // --- Vector exit: nothing to reduce (a map has no accumulator). Fall through
     // to the original scalar loop, which writes the disjoint tail `out[V..hi)`.
-    emit(func, vx, AArch64Opcode::B, vec![block(rec.guard)]);
+    emit(func, vx, AArch64Opcode::B, vec![block(rec.guard)])?;
 
-    // --- COMMIT: everything above only added fresh, unreachable blocks. Splice
-    // them in front of the scalar loop by redirecting the single preheader->guard
-    // edge through the vector loop. This is the point of no return; it runs only
-    // after all lowering succeeded.
-    if !rewrite_block_target(func.inst_mut(rec.preheader_term), rec.guard, vh) {
-        return false;
-    }
-    remove_cfg_edge(func, rec.preheader, rec.guard);
-    func.add_edge(rec.preheader, vh);
+    // Finish the private candidate's preheader->guard edge. Setup instructions
+    // and new blocks remain unpublished until commit accepts the whole result.
+    splice_edge(func, rec.preheader, rec.preheader_term, rec.guard, vh)?;
     func.add_edge(vx, rec.guard);
 
-    true
+    Some(())
 }
 
 fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg> {
@@ -1146,7 +1115,7 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
         return Some(v);
     }
     if let Some(imm_v) = const_value(func, &ctx.def, val) {
-        let v = const_vec(func, ctx, imm_v);
+        let v = const_vec(func, ctx, imm_v)?;
         ctx.memo.insert(val.id, v);
         return Some(v);
     }
@@ -1161,31 +1130,31 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
     let result = match opcode {
         MulRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            bin(func, ctx, NeonMulV, a, b, true)
+            bin(func, ctx, NeonMulV, a, b, true)?
         }
         AddRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            bin(func, ctx, NeonAddV, a, b, true)
+            bin(func, ctx, NeonAddV, a, b, true)?
         }
         SubRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            bin(func, ctx, NeonSubV, a, b, true)
+            bin(func, ctx, NeonSubV, a, b, true)?
         }
         AndRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            bin(func, ctx, NeonAndV, a, b, false)
+            bin(func, ctx, NeonAndV, a, b, false)?
         }
         OrrRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            bin(func, ctx, NeonOrrV, a, b, false)
+            bin(func, ctx, NeonOrrV, a, b, false)?
         }
         EorRR => {
             let (a, b) = lower_two(func, ctx, &ops)?;
-            bin(func, ctx, NeonEorV, a, b, false)
+            bin(func, ctx, NeonEorV, a, b, false)?
         }
         AddRI | SubRI | AndRI | OrrRI | EorRI => {
-            let a = lower(func, ctx, vreg_of(&ops[1])?)?;
-            let cvec = const_vec(func, ctx, imm_of(&ops[2])?);
+            let a = lower(func, ctx, ops[1].as_vreg()?)?;
+            let cvec = const_vec(func, ctx, ops[2].as_imm()?)?;
             let (nop, arr) = match opcode {
                 AddRI => (NeonAddV, true),
                 SubRI => (NeonSubV, true),
@@ -1193,31 +1162,31 @@ fn lower(func: &mut MachFunction, ctx: &mut LowerCtx, val: VReg) -> Option<VReg>
                 OrrRI => (NeonOrrV, false),
                 _ => (NeonEorV, false),
             };
-            bin(func, ctx, nop, a, cvec, arr)
+            bin(func, ctx, nop, a, cvec, arr)?
         }
         LslRI | LsrRI | AsrRI => {
-            let a = lower(func, ctx, vreg_of(&ops[1])?)?;
-            let sh = imm_of(&ops[2])?;
+            let a = lower(func, ctx, ops[1].as_vreg()?)?;
+            let sh = ops[2].as_imm()?;
             let nop = match opcode {
                 LslRI => NeonShlVImm,
                 LsrRI => NeonUshrVImm,
                 _ => NeonSshrVImm,
             };
-            let d = alloc(func, RegClass::Fpr128);
+            let d = alloc(func, RegClass::Fpr128)?;
             emit(
                 func,
                 ctx.vbody,
                 nop,
                 vec![vreg(d), vreg(a), imm(sh), imm(ARR_S4)],
-            );
+            )?;
             d
         }
         Madd => {
-            let a = lower(func, ctx, vreg_of(&ops[1])?)?;
-            let b = lower(func, ctx, vreg_of(&ops[2])?)?;
-            let c = lower(func, ctx, vreg_of(&ops[3])?)?;
-            let m = bin(func, ctx, NeonMulV, a, b, true);
-            bin(func, ctx, NeonAddV, m, c, true)
+            let a = lower(func, ctx, ops[1].as_vreg()?)?;
+            let b = lower(func, ctx, ops[2].as_vreg()?)?;
+            let c = lower(func, ctx, ops[3].as_vreg()?)?;
+            let m = bin(func, ctx, NeonMulV, a, b, true)?;
+            bin(func, ctx, NeonAddV, m, c, true)?
         }
         _ => return None,
     };
@@ -1230,8 +1199,8 @@ fn lower_two(
     ctx: &mut LowerCtx,
     ops: &[MachOperand],
 ) -> Option<(VReg, VReg)> {
-    let a = lower(func, ctx, vreg_of(ops.get(1)?)?)?;
-    let b = lower(func, ctx, vreg_of(ops.get(2)?)?)?;
+    let a = lower(func, ctx, ops.get(1)?.as_vreg()?)?;
+    let b = lower(func, ctx, ops.get(2)?.as_vreg()?)?;
     Some((a, b))
 }
 
@@ -1245,41 +1214,41 @@ fn bin(
     a: VReg,
     b: VReg,
     arr: bool,
-) -> VReg {
-    let d = alloc(func, RegClass::Fpr128);
+) -> Option<VReg> {
+    let d = alloc(func, RegClass::Fpr128)?;
     let mut operands = vec![vreg(d), vreg(a), vreg(b)];
     if arr {
         operands.push(imm(ARR_S4));
     }
-    emit(func, ctx.vbody, op, operands);
-    d
+    emit(func, ctx.vbody, op, operands)?;
+    Some(d)
 }
 
 /// Materialize (once) a broadcast `4 x i32` constant vector in the preheader.
-fn const_vec(func: &mut MachFunction, ctx: &mut LowerCtx, value: i64) -> VReg {
+fn const_vec(func: &mut MachFunction, ctx: &mut LowerCtx, value: i64) -> Option<VReg> {
     if let Some(&v) = ctx.const_cache.get(&value) {
-        return v;
+        return Some(v);
     }
-    let w = alloc(func, RegClass::Gpr32);
-    let v = alloc(func, RegClass::Fpr128);
+    let w = alloc(func, RegClass::Gpr32)?;
+    let v = alloc(func, RegClass::Fpr128)?;
     emit_before(
         func,
         ctx.preheader_term,
         AArch64Opcode::Movz,
         vec![vreg(w), imm(value)],
-    );
+    )?;
     emit_before(
         func,
         ctx.preheader_term,
         AArch64Opcode::NeonDupGen,
         vec![vreg(v), vreg(w), imm(ELEM_S)],
-    );
+    )?;
     ctx.const_cache.insert(value, v);
-    v
+    Some(v)
 }
 
 // ---------------------------------------------------------------------------
-// Small local IR helpers (kept independent of neon_map.rs / neon_array.rs)
+// Local operand/recognition helpers; checked mutation lives in candidate.rs
 // ---------------------------------------------------------------------------
 
 fn vreg(v: VReg) -> MachOperand {
@@ -1292,108 +1261,13 @@ fn block(b: BlockId) -> MachOperand {
     MachOperand::Block(b)
 }
 
-fn emit(
-    func: &mut MachFunction,
-    b: BlockId,
-    op: AArch64Opcode,
-    operands: Vec<MachOperand>,
-) -> InstId {
-    let id = func.push_inst(MachInst::new(op, operands));
-    func.append_inst(b, id);
-    id
-}
-
-fn emit_before(
-    func: &mut MachFunction,
-    before: InstId,
-    op: AArch64Opcode,
-    operands: Vec<MachOperand>,
-) -> InstId {
-    let id = func.push_inst(MachInst::new(op, operands));
-    insert_before_inst(func, before, &[id]);
-    id
-}
-
-fn alloc(func: &mut MachFunction, class: RegClass) -> VReg {
-    // Allocate a vreg id strictly greater than every id currently in use so we
-    // never alias an existing value.
-    let max_existing = func
-        .insts
-        .iter()
-        .flat_map(|inst| inst.operands.iter())
-        .filter_map(vreg_of)
-        .map(|v| v.id)
-        .max()
-        .unwrap_or(0);
-    let mut id = func.alloc_vreg();
-    while id <= max_existing {
-        id = func.alloc_vreg();
-    }
-    VReg::new(id, class)
-}
-
-fn build_def_map(func: &MachFunction) -> HashMap<u32, InstId> {
-    crate::effects::build_reaching_def_map(func)
-}
-
 fn block_of_inst(func: &MachFunction, target: InstId) -> Option<BlockId> {
     for (idx, block) in func.blocks.iter().enumerate() {
         if block.insts.contains(&target) {
-            return Some(BlockId(idx as u32));
+            return u32::try_from(idx).ok().map(BlockId);
         }
     }
     None
-}
-
-fn branch_targets(inst: &MachInst) -> Vec<BlockId> {
-    inst.operands
-        .iter()
-        .filter_map(|op| match op {
-            MachOperand::Block(b) => Some(*b),
-            _ => None,
-        })
-        .collect()
-}
-
-fn rewrite_block_target(inst: &mut MachInst, old: BlockId, new: BlockId) -> bool {
-    let mut changed = false;
-    for op in &mut inst.operands {
-        if matches!(op, MachOperand::Block(b) if *b == old) {
-            *op = MachOperand::Block(new);
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn remove_cfg_edge(func: &mut MachFunction, from: BlockId, to: BlockId) {
-    func.block_mut(from).succs.retain(|&s| s != to);
-    func.block_mut(to).preds.retain(|&p| p != from);
-}
-
-fn insert_new_blocks_before(func: &mut MachFunction, before: BlockId, new_blocks: &[BlockId]) {
-    let mut reordered = Vec::with_capacity(func.block_order.len() + new_blocks.len());
-    for &b in &func.block_order {
-        if b == before {
-            reordered.extend(new_blocks.iter().copied());
-        }
-        if !new_blocks.contains(&b) {
-            reordered.push(b);
-        }
-    }
-    func.block_order = reordered;
-}
-
-fn insert_before_inst(func: &mut MachFunction, before: InstId, new_insts: &[InstId]) -> bool {
-    for block in &mut func.blocks {
-        if let Some(pos) = block.insts.iter().position(|&id| id == before) {
-            for (off, &id) in new_insts.iter().enumerate() {
-                block.insts.insert(pos + off, id);
-            }
-            return true;
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,6 +1277,7 @@ fn insert_before_inst(func: &mut MachFunction, before: InstId, new_insts: &[Inst
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trust_cg_ir::MachInst;
     use trust_cg_ir::Signature;
 
     fn v(id: u32) -> MachOperand {
@@ -1446,7 +1321,7 @@ mod tests {
             .flat_map(|blk| blk.insts.iter().copied())
             .map(|id| func.inst(id))
             .filter(|inst| {
-                inst.opcode == AArch64Opcode::NeonExtV && imm_of(&inst.operands[3]) == Some(shift)
+                inst.opcode == AArch64Opcode::NeonExtV && inst.operands[3].as_imm() == Some(shift)
             })
             .count()
     }
@@ -1495,8 +1370,8 @@ mod tests {
         push(&mut func, guard, BCond, vec![i(CC_LT), b(header)]);
         push(&mut func, guard, B, vec![b(exit)]);
         // Header: shifted indices + loads + term + store + step.
-        let term_val: u32;
-        match kind {
+
+        let term_val: u32 = match kind {
             4 | 5 => {
                 // 4: 5-point out[i] = a[i-2]+a[i-1]+a[i]+a[i+1]+a[i+2]
                 // 5: wide 3-point out[i] = a[i-8]+a[i]+a[i+8]
@@ -1548,7 +1423,7 @@ mod tests {
                     push(&mut func, header, AddRR, vec![v(70 + s), v(acc), v(l)]);
                     acc = 70 + s;
                 }
-                term_val = acc;
+                acc
             }
             3 => {
                 // pure map out[i] = a[i]*2 (K=0 only).
@@ -1561,7 +1436,7 @@ mod tests {
                 );
                 push(&mut func, header, LdrRI, vec![v(22), v64(21), i(0)]); // a[i]
                 push(&mut func, header, MulRR, vec![v(30), v(22), v(5)]); // a[i]*2
-                term_val = 30;
+                30
             }
             2 => {
                 // out[i] = a[i-1] + b[i+1]
@@ -1584,7 +1459,7 @@ mod tests {
                 );
                 push(&mut func, header, LdrRI, vec![v(25), v64(24), i(0)]); // b[i+1]
                 push(&mut func, header, AddRR, vec![v(30), v(22), v(25)]);
-                term_val = 30;
+                30
             }
             _ => {
                 // 3-point out[i] = a[i-1] + a[i] + a[i+1]  (kind 0 and in-place 1)
@@ -1616,9 +1491,9 @@ mod tests {
                 push(&mut func, header, LdrRI, vec![v(28), v64(27), i(0)]); // a[i+1]
                 push(&mut func, header, AddRR, vec![v(29), v(22), v(25)]);
                 push(&mut func, header, AddRR, vec![v(30), v(29), v(28)]);
-                term_val = 30;
+                30
             }
-        }
+        };
         // store address out[i] (K=0) and the store.
         push(&mut func, header, Sxtw, vec![v64(31), v(6)]);
         push(
@@ -1644,6 +1519,169 @@ mod tests {
         func.add_edge(latch, exit);
         func.next_vreg = 512;
         func
+    }
+
+    fn candidate_boundary_fixture() -> MachFunction {
+        {
+            let mut func = build_stencil_loop(0);
+            func.noalias_params = vec![0, 1];
+            func
+        }
+    }
+
+    fn candidate_boundary_plan(func: &MachFunction) -> Recognized {
+        let dom = DomTree::compute(func);
+        let loops = LoopAnalysis::compute(func, &dom);
+        loops
+            .all_loops()
+            .find_map(|lp| Recognized::recognize(func, &dom, lp.header, lp.latch, &lp.body))
+            .expect("unmodified control must be recognized")
+    }
+
+    fn candidate_boundary_refusal(func: &mut MachFunction, rec: &Recognized) {
+        let before = format!("{func:?}");
+        assert!(!apply(func, rec));
+        assert_eq!(
+            format!("{func:?}"),
+            before,
+            "refusal must preserve the whole function"
+        );
+    }
+
+    #[test]
+    fn candidate_boundary_early_exhaustion() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        // Arm the boundary after immutable recognition; not a frontend repro.
+        func.next_vreg = u32::MAX;
+        candidate_boundary_refusal(&mut func, &rec);
+    }
+
+    #[test]
+    fn candidate_boundary_late_exhaustion() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        // Arm the boundary after immutable recognition; not a frontend repro.
+        func.next_vreg = u32::MAX - 4;
+        candidate_boundary_refusal(&mut func, &rec);
+    }
+
+    #[test]
+    fn candidate_boundary_metadata_exhaustion() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        // Arm the boundary after immutable recognition; not a frontend repro.
+        func.noalias_params.push(u32::MAX);
+        candidate_boundary_refusal(&mut func, &rec);
+    }
+
+    #[test]
+    fn candidate_boundary_splice_refusal() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        // Arm the boundary after immutable recognition; not a frontend repro.
+        func.inst_mut(rec.preheader_term).operands.clear();
+        candidate_boundary_refusal(&mut func, &rec);
+    }
+
+    #[test]
+    fn candidate_boundary_missing_setup() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        // Arm the boundary after immutable recognition; not a frontend repro.
+        for block in &mut func.blocks {
+            block.insts.retain(|id| *id != rec.preheader_term);
+        }
+        candidate_boundary_refusal(&mut func, &rec);
+    }
+
+    #[test]
+    fn candidate_boundary_missing_layout() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        // Arm the boundary after immutable recognition; not a frontend repro.
+        func.block_order.retain(|id| *id != rec.guard);
+        candidate_boundary_refusal(&mut func, &rec);
+    }
+
+    #[test]
+    fn candidate_boundary_success_snapshot() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        assert!(apply(&mut func, &rec));
+        println!("CANDIDATE_SNAPSHOT: {func:?}");
+    }
+
+    #[test]
+    fn candidate_boundary_public_entry_points_preserve_refusal() {
+        let mut control = candidate_boundary_fixture();
+        assert!(NeonStencilPass::new().run(&mut control));
+        let mut func = candidate_boundary_fixture();
+        func.next_vreg = u32::MAX;
+        let before = format!("{func:?}");
+        let mut pass = NeonStencilPass::new();
+        let mut analyses = AnalysisCache::new();
+        assert!(!pass.run(&mut func));
+        assert!(!pass.run_with_analyses(&mut func, &mut analyses));
+        assert_eq!(pass.fired(), 0);
+        assert_eq!(format!("{func:?}"), before);
+    }
+
+    #[test]
+    fn candidate_boundary_sparse_ids_include_detached_and_noalias() {
+        let mut func = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&func);
+        let old_ids: HashSet<_> = func
+            .insts
+            .iter()
+            .flat_map(|inst| &inst.operands)
+            .filter_map(|op| op.as_vreg().map(|reg| reg.id))
+            .collect();
+        func.push_inst(MachInst::new(
+            AArch64Opcode::MovR,
+            vec![MachOperand::VReg(VReg::new(1_000_000_000, RegClass::Gpr64))],
+        ));
+        func.noalias_params.push(1_000_000_007);
+        func.next_vreg = 0;
+        let old_len = func.insts.len();
+        assert!(apply(&mut func, &rec));
+        let fresh: Vec<_> = func.insts[old_len..]
+            .iter()
+            .flat_map(|inst| &inst.operands)
+            .filter_map(|op| op.as_vreg().map(|reg| reg.id))
+            .filter(|id| !old_ids.contains(id))
+            .collect();
+        assert!(!fresh.is_empty());
+        assert!(fresh.iter().all(|id| *id > 1_000_000_007));
+        assert!(func.next_vreg > 1_000_000_007);
+    }
+
+    #[test]
+    fn candidate_boundary_last_representable_range_preserves_construction() {
+        let original = candidate_boundary_fixture();
+        let rec = candidate_boundary_plan(&original);
+        let mut ordinary = original.clone();
+        ordinary.try_sync_vreg_counter().unwrap();
+        let first = ordinary.next_vreg;
+        assert!(apply(&mut ordinary, &rec));
+        let count = ordinary.next_vreg - first;
+        assert!(count > 1);
+        let mut boundary = original.clone();
+        let boundary_first = u32::MAX - count;
+        boundary.next_vreg = boundary_first;
+        assert!(apply(&mut boundary, &rec));
+        assert_eq!(boundary.next_vreg, u32::MAX);
+        for inst in &mut boundary.insts[original.insts.len()..] {
+            for operand in &mut inst.operands {
+                if let MachOperand::VReg(reg) = operand
+                    && reg.id >= boundary_first
+                {
+                    reg.id = first + (reg.id - boundary_first);
+                }
+            }
+        }
+        boundary.next_vreg = ordinary.next_vreg;
+        assert_eq!(format!("{boundary:?}"), format!("{ordinary:?}"));
     }
 
     #[test]
@@ -1866,7 +1904,8 @@ mod tests {
     /// the primary test did not exercise).
     #[test]
     fn second_run_is_a_no_op_for_every_firing_variant() {
-        let cases: Vec<(&str, Box<dyn Fn() -> MachFunction>)> = vec![
+        type Build = Box<dyn Fn() -> MachFunction>;
+        let cases: Vec<(&str, Build)> = vec![
             (
                 "3point",
                 Box::new(|| {
@@ -1916,5 +1955,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Loop-state contract (`crate::loop_contract`): the vector loop reproduces
+    /// only `iv`, so a second carried register and a live-out-only register
+    /// must each refuse, while the plain fixture still fires.
+    #[test]
+    fn refuses_skipped_register_state() {
+        let iv = VReg::new(6, RegClass::Gpr32);
+        let good = || {
+            let mut func = build_stencil_loop(0);
+            func.noalias_params = vec![0, 1];
+            func
+        };
+        assert!(
+            NeonStencilPass::new().run(&mut good()),
+            "plain fixture fires"
+        );
+        let mut wrong = Vec::new();
+        let mut carried = good();
+        crate::loop_contract::test_support::add_second_accumulator(&mut carried, iv);
+        if NeonStencilPass::new().run(&mut carried) {
+            wrong.push("fired with a second accumulator");
+        }
+        let mut live_out = good();
+        crate::loop_contract::test_support::add_live_out(&mut live_out, iv);
+        if NeonStencilPass::new().run(&mut live_out) {
+            wrong.push("fired with a live-out-only register");
+        }
+        assert!(wrong.is_empty(), "skipped register state: {wrong:?}");
     }
 }

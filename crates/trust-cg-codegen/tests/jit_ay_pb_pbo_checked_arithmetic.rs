@@ -245,11 +245,14 @@ fn return_void(b: &mut TrustIrBuilder) {
 
 fn build_pb_pbo_checked_objective_module() -> TrustIrModule {
     let mut module = TrustIrModule::new("jit_ay_pb_pbo_checked_arithmetic");
-    let func_ty_id = module.add_func_type(FuncTy {
-        params: vec![Ty::Ptr, Ty::Ptr, Ty::I64, Ty::Ptr],
-        returns: vec![],
-        is_vararg: false,
-    });
+    let func_ty_id = module
+        .add_func_type(FuncTy {
+            params: vec![Ty::Ptr, Ty::Ptr, Ty::I64, Ty::Ptr],
+            returns: vec![],
+            abi: None,
+            is_vararg: false,
+        })
+        .expect("Module::add_func_type: test fixture");
 
     let entry_id = b(0);
     let loop_header_id = b(1);
@@ -375,7 +378,9 @@ fn build_pb_pbo_checked_objective_module() -> TrustIrModule {
         entry_id,
     );
     func.blocks = b.blocks;
-    module.add_function(func);
+    module
+        .try_add_function(func)
+        .expect("Module::try_add_function: test fixture");
     module
 }
 
@@ -383,13 +388,12 @@ fn compile_objective(
     opt_level: OptLevel,
 ) -> (trust_cg_codegen::ExecutableBuffer, AYPbPboObjectiveFn) {
     let module = build_pb_pbo_checked_objective_module();
-    let lowered =
-        trust_cg_lower::translate_module(&module).expect("ay PB/PBO objective module lowers");
+    let lowered = permit_translate_module(&module).expect("ay PB/PBO objective module lowers");
     assert_eq!(lowered.len(), 1, "expected one lowered objective function");
 
     let pipeline_config = PipelineConfig {
         opt_level,
-        ..PipelineConfig::default()
+        ..PipelineConfig::for_host_aarch64()
     };
     let pipeline = Pipeline::new(pipeline_config);
     let mach = pipeline
@@ -571,4 +575,28 @@ fn ay_pb_pbo_checked_objective_matches_i128_reference_oracle_o0_o2() {
         run_oracle_case(f, &[11, i64::MAX], &[2, 2]);
         run_oracle_case(f, &[i64::MIN, i64::MIN], &[-1, 1]);
     }
+}
+
+/// This file's fixtures are hand-built and carry no codegen license
+/// (`body_gate: None`), which trust-cg REFUSES by default (roadmap WS7.5,
+/// decision gate DG-73). Its compiles state `Permit` explicitly, so none of
+/// them passes because it was silently refused.
+fn permit_unlicensed() -> trust_cg_lower::CodegenLicensePolicy {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .with_unlicensed(trust_cg_lower::UnlicensedBodyPolicy::Permit)
+}
+
+/// `translate_module` under [`permit_unlicensed`].
+fn permit_translate_module(
+    module: &trust_ir::Module,
+) -> Result<
+    Vec<(trust_cg_lower::Function, trust_cg_lower::ProofContext)>,
+    trust_cg_lower::AdapterError,
+> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        module,
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed(),
+    )
 }

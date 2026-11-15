@@ -144,7 +144,7 @@ def run_one(tcg, tir_text, c_text, w, wd, idx):
     res = {}
     for o in ("O0","O2","O3"):
         obj = os.path.join(wd, f"k{idx}_{o}.o")
-        r = subprocess.run([tcg,"--format=text","--target","aarch64",f"-{o}","-c",tir,"-o",obj],
+        r = subprocess.run([tcg,"--format=text","--permit-unlicensed","--target","aarch64",f"-{o}","-c",tir,"-o",obj],
                            capture_output=True, text=True)
         if r.returncode != 0:
             return ("COMPILE_ERR", o, (r.stderr or r.stdout).strip().splitlines()[-1][:150] if (r.stderr or r.stdout).strip() else "")

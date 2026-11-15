@@ -595,7 +595,13 @@ pub fn all_fp_convert_proofs() -> Vec<ProofObligation> {
 /// 4. **Concrete** (both empty): evaluate directly
 ///
 /// For int->FP proofs with preconditions, the preconditions are checked before
-/// comparing results. Values that violate preconditions are skipped.
+/// comparing results. Values that violate preconditions are skipped, and a
+/// precondition the evaluator cannot interpret leaves the check `Unknown`.
+///
+/// A sweep that compared no test point — every one excluded by the
+/// preconditions or failing to evaluate on a side — has no evidence, so it is
+/// an explicit `Unknown`, never `Valid` (the rule of the sampled lowering
+/// sweep, TRUSTCG-02).
 pub fn verify_fp_convert_by_evaluation(obligation: &ProofObligation) -> VerificationResult {
     let has_fp_inputs = !obligation.fp_inputs.is_empty();
     let has_bv_inputs = !obligation.inputs.is_empty();
@@ -662,6 +668,7 @@ fn verify_fp_input(obligation: &ProofObligation, is_f32: bool) -> VerificationRe
         f64_convert_test_values()
     };
 
+    let mut compared = 0usize;
     for &a_val in &test_values {
         let trust_ir_expr = build_fp_convert_expr(&obligation.trust_ir_expr, a_val, is_f32);
         let aarch64_expr = build_fp_convert_expr(&obligation.aarch64_expr, a_val, is_f32);
@@ -669,15 +676,32 @@ fn verify_fp_input(obligation: &ProofObligation, is_f32: bool) -> VerificationRe
         let trust_ir_result = trust_ir_expr.try_eval(&env);
         let aarch64_result = aarch64_expr.try_eval(&env);
 
-        if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-            && !convert_results_equal(t, a)
-        {
-            return VerificationResult::Invalid {
-                counterexample: format!("a={}, trust_ir={:?}, aarch64={:?}", a_val, t, a),
-            };
+        if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result) {
+            if !convert_results_equal(t, a) {
+                return VerificationResult::Invalid {
+                    counterexample: format!("a={}, trust_ir={:?}, aarch64={:?}", a_val, t, a),
+                };
+            }
+            compared += 1;
         }
     }
 
+    conversion_sweep_verdict(compared, test_values.len())
+}
+
+/// Fold a conversion sweep into its verdict. `compared` counts the test points
+/// at which every precondition held and both sides evaluated and agreed; a
+/// sweep that compared none of its `attempted` points has no evidence, so it
+/// is an explicit `Unknown` rather than a `Valid` for nothing.
+fn conversion_sweep_verdict(compared: usize, attempted: usize) -> VerificationResult {
+    if compared == 0 {
+        return VerificationResult::Unknown {
+            reason: format!(
+                "vacuous sample: none of the {attempted} test inputs both satisfied the \
+                 preconditions and evaluated on both sides, so the sweep compared nothing"
+            ),
+        };
+    }
     VerificationResult::Valid
 }
 
@@ -698,20 +722,29 @@ fn verify_bv_input(obligation: &ProofObligation) -> VerificationResult {
         i64_convert_test_values()
     };
 
+    let mut compared = 0usize;
     for &a_val in &test_values {
         let mut env = HashMap::new();
         for (name, width) in &obligation.inputs {
             env.insert(name.clone(), crate::smt::mask(a_val, *width));
         }
 
-        // Check preconditions
+        // Check preconditions: every one is evaluated, and one the evaluator
+        // cannot interpret is named rather than read as a false guard, so
+        // whether it is noticed does not depend on its position.
         let mut precond_met = true;
-        for pre in &obligation.preconditions {
+        for (index, pre) in obligation.preconditions.iter().enumerate() {
             match pre.try_eval(&env) {
-                Ok(EvalResult::Bool(true)) => {}
-                _ => {
-                    precond_met = false;
-                    break;
+                Ok(EvalResult::Bool(held)) => precond_met &= held,
+                Ok(other) => {
+                    return VerificationResult::Unknown {
+                        reason: format!("precondition {index} is not boolean: {other:?}"),
+                    };
+                }
+                Err(error) => {
+                    return VerificationResult::Unknown {
+                        reason: format!("cannot concretely evaluate precondition {index}: {error}"),
+                    };
                 }
             }
         }
@@ -722,16 +755,17 @@ fn verify_bv_input(obligation: &ProofObligation) -> VerificationResult {
         let trust_ir_result = obligation.trust_ir_expr.try_eval(&env);
         let aarch64_result = obligation.aarch64_expr.try_eval(&env);
 
-        if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result)
-            && !convert_results_equal(t, a)
-        {
-            return VerificationResult::Invalid {
-                counterexample: format!("a=0x{:x}, trust_ir={:?}, aarch64={:?}", a_val, t, a),
-            };
+        if let (Ok(t), Ok(a)) = (&trust_ir_result, &aarch64_result) {
+            if !convert_results_equal(t, a) {
+                return VerificationResult::Invalid {
+                    counterexample: format!("a=0x{:x}, trust_ir={:?}, aarch64={:?}", a_val, t, a),
+                };
+            }
+            compared += 1;
         }
     }
 
-    VerificationResult::Valid
+    conversion_sweep_verdict(compared, test_values.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,5 +1299,78 @@ mod tests {
         let expr = SmtExpr::fp_to_fp(RoundingMode::RNE, SmtExpr::fp32_const(val), 11, 53);
         let result = expr.try_eval(&env).unwrap();
         assert_eq!(result, EvalResult::Float(val as f64));
+    }
+
+    // =======================================================================
+    // Vacuous sweeps (TRUSTCG-02): no compared point is no evidence
+    // =======================================================================
+
+    fn is_vacuous(result: &VerificationResult) -> bool {
+        matches!(result, VerificationResult::Unknown { reason } if reason.contains("vacuous sample"))
+    }
+
+    /// An int->FP sweep whose precondition no test input satisfies compared
+    /// nothing, whether the precondition is unsatisfiable or merely misses
+    /// every test value; it used to report `Valid`. One satisfying test value
+    /// (`a == 42`) is enough evidence to keep `Valid`.
+    #[test]
+    fn int_to_fp_sweep_with_no_satisfying_input_is_unknown_not_valid() {
+        let a = SmtExpr::var("a", 32);
+        for (label, precondition) in [
+            ("unsatisfiable", a.clone().eq_expr(a.clone()).not_expr()),
+            (
+                "no test value",
+                a.clone().eq_expr(SmtExpr::bv_const(0x1234_5679, 32)),
+            ),
+        ] {
+            let mut obligation = proof_scvtf_f32_i32();
+            obligation.preconditions = vec![precondition];
+            let result = verify_fp_convert_by_evaluation(&obligation);
+            assert!(
+                is_vacuous(&result),
+                "{label}: no test input satisfies the precondition, so the sweep compared \
+                 nothing and must say so, got {result:?}"
+            );
+        }
+        let mut control = proof_scvtf_f32_i32();
+        control.preconditions = vec![a.eq_expr(SmtExpr::bv_const(42, 32))];
+        assert!(matches!(
+            verify_fp_convert_by_evaluation(&control),
+            VerificationResult::Valid
+        ));
+    }
+
+    /// A precondition the evaluator cannot interpret is named even when an
+    /// earlier precondition is false at every test input; it used to be read
+    /// as one more false guard, and the sweep then reported `Valid`.
+    #[test]
+    fn int_to_fp_unsupported_precondition_is_named_after_a_false_one() {
+        let a = SmtExpr::var("a", 32);
+        let mut obligation = proof_scvtf_f32_i32();
+        obligation.preconditions = vec![
+            a.clone().eq_expr(a).not_expr(),
+            SmtExpr::uf("late_unsupported_guard", vec![], crate::smt::SmtSort::Bool),
+        ];
+        let result = verify_fp_convert_by_evaluation(&obligation);
+        assert!(
+            matches!(&result, VerificationResult::Unknown { reason }
+                if reason.contains("precondition 1") && reason.contains("late_unsupported_guard")),
+            "{result:?}"
+        );
+    }
+
+    /// An FP-input sweep whose machine side evaluates at no test value (here an
+    /// uninterpreted stand-in the substitution cannot bind) compared nothing;
+    /// it used to skip every failing point and report `Valid`.
+    #[test]
+    fn fp_input_sweep_that_evaluates_nowhere_is_unknown_not_valid() {
+        let mut obligation = proof_fcvtzs_i32_f32();
+        obligation.aarch64_expr =
+            SmtExpr::uf("unmodeled_fcvtzs", vec![], crate::smt::SmtSort::BitVec(32));
+        let result = verify_fp_convert_by_evaluation(&obligation);
+        assert!(
+            is_vacuous(&result),
+            "no test value evaluates the machine side, so nothing was compared: {result:?}"
+        );
     }
 }
